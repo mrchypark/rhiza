@@ -13,6 +13,8 @@ import (
 	"github.com/thanos-io/objstore"
 )
 
+const FrozenSourceManualTerminalEvidenceKind = "manual-terminal-v1"
+
 // FrozenSourceIdentity is the stable identity used to arbitrate one target
 // from a closed source generation. It deliberately excludes recovery and
 // fence operation IDs, which can differ between competing requests.
@@ -68,25 +70,29 @@ type FrozenCheckpoint struct {
 	StateHash string `json:"stateHash"`
 }
 
-// FrozenSourceBinding binds a recovery copy to the already-validated
-// IndependentV2 proof. The recovery package records these digests; the
-// operator remains responsible for authenticating and validating the proof.
+// FrozenSourceBinding binds a recovery copy to the terminal-evidence kind and
+// digest. The operator authenticates either IndependentV2 or the typed manual
+// terminal attestation before constructing this binding.
 type FrozenSourceBinding struct {
-	Identity         FrozenSourceIdentity `json:"identity"`
-	FenceProofDigest string               `json:"fenceProofDigest"`
-	ClosedRootDigest string               `json:"closedRootDigest"`
-	Frontier         FrozenSourceFrontier `json:"frontier"`
+	Identity                FrozenSourceIdentity `json:"identity"`
+	EvidenceKind            string               `json:"evidenceKind,omitempty"`
+	FenceProofDigest        string               `json:"fenceProofDigest,omitempty"`
+	ManualAttestationDigest string               `json:"manualAttestationDigest,omitempty"`
+	ClosedRootDigest        string               `json:"closedRootDigest"`
+	Frontier                FrozenSourceFrontier `json:"frontier"`
 }
 
 // FrozenForkOptions selects the same anchored target materialization as
 // ForkOptions while requiring a validated closed-source binding.
 type FrozenForkOptions struct {
 	ForkOptions
-	SourceIdentity    FrozenSourceIdentity            `json:"sourceIdentity"`
-	FenceProofDigest  string                          `json:"fenceProofDigest"`
-	ClosedRootDigest  string                          `json:"closedRootDigest"`
-	BucketEnvironment FrozenBucketEnvironment         `json:"bucketEnvironment"`
-	VerifyEnvironment FrozenBucketEnvironmentVerifier `json:"-"`
+	SourceIdentity          FrozenSourceIdentity            `json:"sourceIdentity"`
+	EvidenceKind            string                          `json:"evidenceKind,omitempty"`
+	FenceProofDigest        string                          `json:"fenceProofDigest,omitempty"`
+	ManualAttestationDigest string                          `json:"manualAttestationDigest,omitempty"`
+	ClosedRootDigest        string                          `json:"closedRootDigest"`
+	BucketEnvironment       FrozenBucketEnvironment         `json:"bucketEnvironment"`
+	VerifyEnvironment       FrozenBucketEnvironmentVerifier `json:"-"`
 }
 
 // FrozenForkResult is the ordinary fork result plus the exact source frontier
@@ -132,8 +138,10 @@ func ForkFrozenSource(ctx context.Context, bucket objstore.Bucket, options Froze
 	if options.TargetMembership.Cluster != targetID || targetPrefix != path.Join(path.Dir(sourcePrefix), targetID) {
 		return empty, fmt.Errorf("recovery: frozen fork target is not deterministic for source identity")
 	}
+	manualTerminal := options.EvidenceKind == FrozenSourceManualTerminalEvidenceKind && options.FenceProofDigest == "" && validForkHash(options.ManualAttestationDigest)
+	independent := options.EvidenceKind == "" && options.ManualAttestationDigest == "" && validForkHash(options.FenceProofDigest)
 	if options.OperationID == "" || !validForkMemberIDs(forkMemberIDs(options.SourceBootstrap.Members)) ||
-		!validForkHash(options.FenceProofDigest) || !validForkHash(options.ClosedRootDigest) ||
+		(!manualTerminal && !independent) || !validForkHash(options.ClosedRootDigest) ||
 		options.BucketEnvironment.Metageneration == "" || !validForkHash(options.BucketEnvironment.LifecycleDigest) || options.VerifyEnvironment == nil {
 		return empty, fmt.Errorf("recovery: frozen fork operation and proof bindings are required")
 	}
@@ -150,8 +158,8 @@ func ForkFrozenSource(ctx context.Context, bucket objstore.Bucket, options Froze
 	frontier.BucketMetageneration = options.BucketEnvironment.Metageneration
 	frontier.LifecyclePolicyDigest = options.BucketEnvironment.LifecycleDigest
 	binding := FrozenSourceBinding{
-		Identity: identity, FenceProofDigest: options.FenceProofDigest,
-		ClosedRootDigest: options.ClosedRootDigest, Frontier: frontier,
+		Identity: identity, EvidenceKind: options.EvidenceKind, FenceProofDigest: options.FenceProofDigest,
+		ManualAttestationDigest: options.ManualAttestationDigest, ClosedRootDigest: options.ClosedRootDigest, Frontier: frontier,
 	}
 	bootstrap, err := bootstrapHash(options.SourceBootstrap)
 	if err != nil {
@@ -355,7 +363,9 @@ func validateFrozenAnchorSource(anchor GenerationAnchor) error {
 func validateFrozenBinding(binding FrozenSourceBinding) error {
 	targetID, err := FrozenTargetID(binding.Identity)
 	frontier := binding.Frontier
-	if err != nil || binding.FenceProofDigest == "" || !validForkHash(binding.FenceProofDigest) || !validForkHash(binding.ClosedRootDigest) || frontier.ConfigID != ArchiveConfigID || frontier.Tip == 0 || frontier.Tip < frontier.Base || frontier.HeadVersion.Value == "" || (frontier.HeadVersion.Type != objstore.Generation && frontier.HeadVersion.Type != objstore.ETag) || !validForkHash(frontier.HeadDigest) || frontier.BucketMetageneration == "" || !validForkHash(frontier.LifecyclePolicyDigest) || !validForkHash(frontier.ManifestHash) || targetID == "" {
+	manualTerminal := binding.EvidenceKind == FrozenSourceManualTerminalEvidenceKind && binding.FenceProofDigest == "" && validForkHash(binding.ManualAttestationDigest)
+	independent := binding.EvidenceKind == "" && binding.ManualAttestationDigest == "" && binding.FenceProofDigest != "" && validForkHash(binding.FenceProofDigest)
+	if err != nil || (!manualTerminal && !independent) || !validForkHash(binding.ClosedRootDigest) || frontier.ConfigID != ArchiveConfigID || frontier.Tip == 0 || frontier.Tip < frontier.Base || frontier.HeadVersion.Value == "" || (frontier.HeadVersion.Type != objstore.Generation && frontier.HeadVersion.Type != objstore.ETag) || !validForkHash(frontier.HeadDigest) || frontier.BucketMetageneration == "" || !validForkHash(frontier.LifecyclePolicyDigest) || !validForkHash(frontier.ManifestHash) || targetID == "" {
 		return fmt.Errorf("recovery: invalid frozen source binding")
 	}
 	if frontier.ManifestHash != frontier.HeadDigest || frontier.Tip > frontier.Base && (!validForkHash(frontier.TailHash) || frontier.TailObject == 0) || frontier.Tip == frontier.Base && frontier.TailHash != "" {
@@ -389,7 +399,8 @@ func sameFrozenForkIntent(a, b forkIntent) bool {
 }
 
 func sameFrozenSourceBinding(a, b FrozenSourceBinding) bool {
-	return a.Identity == b.Identity && a.FenceProofDigest == b.FenceProofDigest && a.ClosedRootDigest == b.ClosedRootDigest && sameFrozenFrontier(a.Frontier, b.Frontier)
+	return a.Identity == b.Identity && a.EvidenceKind == b.EvidenceKind && a.FenceProofDigest == b.FenceProofDigest &&
+		a.ManualAttestationDigest == b.ManualAttestationDigest && a.ClosedRootDigest == b.ClosedRootDigest && sameFrozenFrontier(a.Frontier, b.Frontier)
 }
 
 func sameForkResult(a, b ForkResult) bool {

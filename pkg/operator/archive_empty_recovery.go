@@ -151,8 +151,8 @@ func (e *FencingExecutor) registerArchiveEmptyRecovery(ctx context.Context, requ
 				return ArchiveEmptyRecoveryResponse{}, err
 			}
 		}
-		if err := e.verifySourceSuccessorClaim(ctx, claimScope, request.StatefulSetUID, uid, request.OperationID,
-			request.SourceFenceOperationID, request.TargetClusterID, "empty", mode, reservationDigest, request.ManualMembershipBindingDigest); err != nil {
+		if err := e.verifySourceSuccessorClaim(ctx, claimScope, request.StatefulSetUID, uid, resourceName(&stored), request.OperationID,
+			request.SourceFenceOperationID, request.TargetClusterID, "empty", mode, reservationDigest, request.ManualMembershipBindingDigest, "", "", ""); err != nil {
 			return ArchiveEmptyRecoveryResponse{}, err
 		}
 		return response, nil
@@ -236,8 +236,8 @@ func (e *FencingExecutor) registerArchiveEmptyRecovery(ctx context.Context, requ
 		if strings.TrimSpace(env["RHIZA_CLUSTER_ID"]) != request.TargetClusterID {
 			return ArchiveEmptyRecoveryResponse{}, fmt.Errorf("fencing: frozen empty recovery runtime is neither its source nor target identity")
 		}
-		expected, err := e.sourceSuccessorClaim(ctx, claimScope, request.StatefulSetUID, uid, request.OperationID,
-			request.SourceFenceOperationID, request.TargetClusterID, "empty", RecoveryModeFrozenSource, "", request.ManualMembershipBindingDigest)
+		expected, err := e.sourceSuccessorClaim(ctx, claimScope, request.StatefulSetUID, uid, resourceName(&stored), request.OperationID,
+			request.SourceFenceOperationID, request.TargetClusterID, "empty", RecoveryModeFrozenSource, "", request.ManualMembershipBindingDigest, "", "", "")
 		if err != nil {
 			return ArchiveEmptyRecoveryResponse{}, err
 		}
@@ -262,8 +262,8 @@ func (e *FencingExecutor) registerArchiveEmptyRecovery(ctx context.Context, requ
 			return ArchiveEmptyRecoveryResponse{}, err
 		}
 	}
-	if err := e.claimSourceSuccessor(ctx, claimScope, request.StatefulSetUID, uid, request.OperationID, request.SourceFenceOperationID,
-		request.TargetClusterID, "empty", claimMode, reservationDigest, request.ManualMembershipBindingDigest); err != nil {
+	if err := e.claimSourceSuccessor(ctx, claimScope, request.StatefulSetUID, uid, resourceName(&stored), request.OperationID, request.SourceFenceOperationID,
+		request.TargetClusterID, "empty", claimMode, reservationDigest, request.ManualMembershipBindingDigest, "", "", ""); err != nil {
 		return ArchiveEmptyRecoveryResponse{}, err
 	}
 	targetMembership, err := readBoundedArchiveObject(ctx, e.ArchiveBucket, path.Join(targetPrefix, "voters/membership.json"), 64<<10)

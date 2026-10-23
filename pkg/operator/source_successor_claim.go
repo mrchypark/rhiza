@@ -22,20 +22,23 @@ const sourceSuccessorModeLegacy = "sealed-source-v1"
 // closed source generation. It lives under the protected authority prefix,
 // never under the source archive data prefix.
 type sourceSuccessorClaim struct {
-	Version                       int    `json:"version"`
-	SourceScopeHash               string `json:"sourceScopeHash"`
-	SourceClusterID               string `json:"sourceClusterID"`
-	StatefulSetUID                string `json:"statefulSetUID"`
-	RecoveryResourceUID           string `json:"recoveryResourceUID"`
-	RecoveryMode                  string `json:"recoveryMode"`
-	TargetBaseKind                string `json:"targetBaseKind"`
-	TargetClusterID               string `json:"targetClusterID"`
-	OperationID                   string `json:"operationID"`
-	FenceOperationID              string `json:"fenceOperationID"`
-	ClosedRootDigest              string `json:"closedRootDigest"`
-	FenceDigest                   string `json:"fenceDigest"`
-	ReservationDigest             string `json:"reservationDigest,omitempty"`
-	ManualMembershipBindingDigest string `json:"manualMembershipBindingDigest,omitempty"`
+	Version                         int    `json:"version"`
+	SourceScopeHash                 string `json:"sourceScopeHash"`
+	SourceClusterID                 string `json:"sourceClusterID"`
+	StatefulSetUID                  string `json:"statefulSetUID"`
+	RecoveryResourceUID             string `json:"recoveryResourceUID"`
+	RecoveryMode                    string `json:"recoveryMode"`
+	TargetBaseKind                  string `json:"targetBaseKind"`
+	TargetClusterID                 string `json:"targetClusterID"`
+	OperationID                     string `json:"operationID"`
+	FenceOperationID                string `json:"fenceOperationID"`
+	ClosedRootDigest                string `json:"closedRootDigest"`
+	FenceDigest                     string `json:"fenceDigest"`
+	ReservationDigest               string `json:"reservationDigest,omitempty"`
+	ManualMembershipBindingDigest   string `json:"manualMembershipBindingDigest,omitempty"`
+	EvidenceKind                    string `json:"evidenceKind,omitempty"`
+	ManualRecoveryChallengeDigest   string `json:"manualRecoveryChallengeDigest,omitempty"`
+	ManualTerminalAttestationDigest string `json:"manualTerminalAttestationDigest,omitempty"`
 }
 
 func (c sourceSuccessorClaim) validate(scope fencing.ArchiveScope) error {
@@ -65,12 +68,19 @@ func (c sourceSuccessorClaim) validate(scope fencing.ArchiveScope) error {
 		if c.ManualMembershipBindingDigest != "" && !validEvidenceDigest(c.ManualMembershipBindingDigest) {
 			return fmt.Errorf("fencing: invalid manual source membership binding")
 		}
+		if c.EvidenceKind == ManualTerminalEvidenceKind {
+			if c.ManualMembershipBindingDigest != "" || !validEvidenceDigest(c.ManualRecoveryChallengeDigest) || !validEvidenceDigest(c.ManualTerminalAttestationDigest) {
+				return fmt.Errorf("fencing: invalid manual terminal successor evidence")
+			}
+		} else if c.EvidenceKind != "" || c.ManualRecoveryChallengeDigest != "" || c.ManualTerminalAttestationDigest != "" {
+			return fmt.Errorf("fencing: unsupported frozen successor evidence kind")
+		}
 	} else if !validEvidenceDigest(c.ReservationDigest) {
 		return fmt.Errorf("fencing: legacy successor claim does not bind its exact reservation")
 	} else if c.TargetClusterID != "rhiza-r-"+shortID(c.OperationID) {
 		return fmt.Errorf("fencing: legacy successor claim target differs from its operation")
 	}
-	if c.RecoveryMode != RecoveryModeFrozenSource && c.ManualMembershipBindingDigest != "" {
+	if c.RecoveryMode != RecoveryModeFrozenSource && (c.ManualMembershipBindingDigest != "" || c.EvidenceKind != "" || c.ManualRecoveryChallengeDigest != "" || c.ManualTerminalAttestationDigest != "") {
 		return fmt.Errorf("fencing: legacy successor claim cannot bind manual frozen-source membership")
 	}
 	return nil
@@ -130,7 +140,7 @@ func (s *AuthorityStateStore) claimSourceSuccessor(ctx context.Context, scope fe
 	return errors.Join(readErr, errAuthorityStateConflict, fmt.Errorf("fencing: source generation already chose a different successor"))
 }
 
-func (e *FencingExecutor) sourceSuccessorClaim(ctx context.Context, scope fencing.ArchiveScope, ownerUID, recoveryUID, operationID, fenceOperationID, target, targetBaseKind, mode, reservationDigest, manualBindingDigest string) (sourceSuccessorClaim, error) {
+func (e *FencingExecutor) sourceSuccessorClaim(ctx context.Context, scope fencing.ArchiveScope, ownerUID, recoveryUID, recoveryName, operationID, fenceOperationID, target, targetBaseKind, mode, reservationDigest, manualBindingDigest, evidenceKind, manualChallengeDigest, manualTerminalDigest string) (sourceSuccessorClaim, error) {
 	var empty sourceSuccessorClaim
 	if e == nil || e.Kube == nil || e.AuthorityState == nil || ctx == nil || ownerUID == "" || recoveryUID == "" || operationID != recoveryUID+":"+fenceOperationID {
 		return empty, fmt.Errorf("fencing: source successor claim identity is unavailable")
@@ -161,10 +171,19 @@ func (e *FencingExecutor) sourceSuccessorClaim(ctx context.Context, scope fencin
 	if err != nil || requestHash != state.Ledger.ClosedHash {
 		return empty, fmt.Errorf("fencing: source successor claim fence does not close the canonical root")
 	}
-	if err := validateFenceProof(fence.Spec, fence.Status.Proof); err != nil {
-		return empty, err
+	if fence.Status.Proof != nil {
+		if err := validateFenceProof(fence.Spec, fence.Status.Proof); err != nil {
+			return empty, err
+		}
 	}
-	if proof := fence.Status.Proof.IndependentV2; proof != nil {
+	var independentProof *IndependentEvidenceV2
+	if fence.Status.Proof != nil {
+		independentProof = fence.Status.Proof.IndependentV2
+	}
+	if proof := independentProof; proof != nil {
+		if evidenceKind != "" || manualChallengeDigest != "" || manualTerminalDigest != "" {
+			return empty, fmt.Errorf("fencing: independent proof cannot be mixed with manual terminal evidence")
+		}
 		if err := validateIndependentV2(fence.Spec, proof); err != nil || proof.LedgerHash != e.ledgerHash(state) {
 			return empty, errors.Join(err, fmt.Errorf("fencing: source successor claim proof differs from the closed root"))
 		}
@@ -179,8 +198,25 @@ func (e *FencingExecutor) sourceSuccessorClaim(ctx context.Context, scope fencin
 		if err != nil || proof.StorageScope != storageScope {
 			return empty, errors.Join(err, fmt.Errorf("fencing: source successor claim proof names another ObjectStorage scope"))
 		}
+	} else if mode == RecoveryModeFrozenSource && evidenceKind == ManualTerminalEvidenceKind {
+		var stored Resource
+		if err := e.Kube.Get(ctx, e.controller().resourcePath(recoveryName), &stored); err != nil {
+			return empty, err
+		}
+		request := ArchiveForkGenesisRequest{
+			RecoveryName: recoveryName, StatefulSetUID: ownerUID, TargetClusterID: target, OperationID: operationID,
+			SourceFenceOperationID: fenceOperationID, RecoveryMode: mode, EvidenceKind: evidenceKind,
+			BucketEnvironment:             stored.Status.FrozenBucketEnvironment,
+			ManualRecoveryChallengeDigest: manualChallengeDigest, ManualTerminalAttestationDigest: manualTerminalDigest,
+		}
+		if fence.Status.Proof != nil && fence.Status.Proof.IndependentV2 != nil {
+			return empty, fmt.Errorf("fencing: manual terminal evidence cannot replace present IndependentV2 proof")
+		}
+		if err := e.validateManualTerminalEvidenceForRegistration(ctx, request, scope, state, fence); err != nil {
+			return empty, err
+		}
 	} else if mode == RecoveryModeFrozenSource {
-		return empty, fmt.Errorf("fencing: frozen source successor requires independent v2 proof")
+		return empty, fmt.Errorf("fencing: frozen source successor requires independent v2 or manual terminal evidence")
 	} else if err := e.verifyCooperativeArchiveForkSource(ctx, request, scope.ClusterID, state); err != nil {
 		return empty, err
 	}
@@ -197,6 +233,7 @@ func (e *FencingExecutor) sourceSuccessorClaim(ctx context.Context, scope fencin
 		TargetBaseKind: targetBaseKind, TargetClusterID: target, OperationID: operationID,
 		FenceOperationID: fenceOperationID, ClosedRootDigest: e.ledgerHash(state),
 		FenceDigest: stableSourceFenceEvidenceDigest(fence), ReservationDigest: reservationDigest, ManualMembershipBindingDigest: manualBindingDigest,
+		EvidenceKind: evidenceKind, ManualRecoveryChallengeDigest: manualChallengeDigest, ManualTerminalAttestationDigest: manualTerminalDigest,
 	}
 	if err := claim.validate(scope); err != nil {
 		return empty, err
@@ -204,16 +241,16 @@ func (e *FencingExecutor) sourceSuccessorClaim(ctx context.Context, scope fencin
 	return claim, nil
 }
 
-func (e *FencingExecutor) claimSourceSuccessor(ctx context.Context, scope fencing.ArchiveScope, ownerUID, recoveryUID, operationID, fenceOperationID, target, targetBaseKind, mode, reservationDigest, manualBindingDigest string) error {
-	claim, err := e.sourceSuccessorClaim(ctx, scope, ownerUID, recoveryUID, operationID, fenceOperationID, target, targetBaseKind, mode, reservationDigest, manualBindingDigest)
+func (e *FencingExecutor) claimSourceSuccessor(ctx context.Context, scope fencing.ArchiveScope, ownerUID, recoveryUID, recoveryName, operationID, fenceOperationID, target, targetBaseKind, mode, reservationDigest, manualBindingDigest, evidenceKind, manualChallengeDigest, manualTerminalDigest string) error {
+	claim, err := e.sourceSuccessorClaim(ctx, scope, ownerUID, recoveryUID, recoveryName, operationID, fenceOperationID, target, targetBaseKind, mode, reservationDigest, manualBindingDigest, evidenceKind, manualChallengeDigest, manualTerminalDigest)
 	if err != nil {
 		return err
 	}
 	return e.AuthorityState.claimSourceSuccessor(ctx, scope, claim)
 }
 
-func (e *FencingExecutor) verifySourceSuccessorClaim(ctx context.Context, scope fencing.ArchiveScope, ownerUID, recoveryUID, operationID, fenceOperationID, target, targetBaseKind, mode, reservationDigest, manualBindingDigest string) error {
-	expected, err := e.sourceSuccessorClaim(ctx, scope, ownerUID, recoveryUID, operationID, fenceOperationID, target, targetBaseKind, mode, reservationDigest, manualBindingDigest)
+func (e *FencingExecutor) verifySourceSuccessorClaim(ctx context.Context, scope fencing.ArchiveScope, ownerUID, recoveryUID, recoveryName, operationID, fenceOperationID, target, targetBaseKind, mode, reservationDigest, manualBindingDigest, evidenceKind, manualChallengeDigest, manualTerminalDigest string) error {
+	expected, err := e.sourceSuccessorClaim(ctx, scope, ownerUID, recoveryUID, recoveryName, operationID, fenceOperationID, target, targetBaseKind, mode, reservationDigest, manualBindingDigest, evidenceKind, manualChallengeDigest, manualTerminalDigest)
 	if err != nil {
 		return err
 	}

@@ -35,7 +35,10 @@ func (c *Controller) frozenSourcePreflight(ctx context.Context, r *Resource) (Fr
 	if resourceName(r) == "" || uid == "" || r.Status.StatefulSetUID == "" || r.Status.RecoveryMode != RecoveryModeFrozenSource {
 		return FrozenSourcePreflightResponse{}, fmt.Errorf("fencing: frozen-source recovery identity is not persisted")
 	}
-	response, err := preflight.FrozenSourcePreflight(ctx, FrozenSourcePreflightRequest{RecoveryName: resourceName(r), RecoveryUID: uid})
+	response, err := preflight.FrozenSourcePreflight(ctx, FrozenSourcePreflightRequest{
+		RecoveryName: resourceName(r), RecoveryUID: uid,
+		ManualRecoveryChallengeDigest: r.Status.ManualRecoveryChallengeDigest,
+	})
 	if err != nil {
 		return FrozenSourcePreflightResponse{}, err
 	}
@@ -45,22 +48,22 @@ func (c *Controller) frozenSourcePreflight(ctx context.Context, r *Resource) (Fr
 	return response, nil
 }
 
-func (c *Controller) frozenSourceClosure(ctx context.Context, r *Resource, source sourceState) (recovery.FrozenSourceIdentity, string, string, error) {
+func (c *Controller) frozenSourceClosure(ctx context.Context, r *Resource, source sourceState) (recovery.FrozenSourceIdentity, string, string, string, string, error) {
 	response, err := c.frozenSourcePreflight(ctx, r)
 	if err != nil {
-		return recovery.FrozenSourceIdentity{}, "", "", err
+		return recovery.FrozenSourceIdentity{}, "", "", "", "", err
 	}
 	if !response.ClosureReady {
-		return response.Identity, "", "", ErrFencePending
+		return response.Identity, "", "", "", "", ErrFencePending
 	}
 	if r.Status.FrozenEmptyGenesisPending && !response.EmptyGenesisEligible {
-		return response.Identity, "", "", fmt.Errorf("fencing: canonical empty genesis eligibility changed after closure")
+		return response.Identity, "", "", "", "", fmt.Errorf("fencing: canonical empty genesis eligibility changed after closure")
 	}
 	identity, err := c.frozenSourceIdentity(r, source)
 	if err != nil || identity != response.Identity {
-		return response.Identity, "", "", fmt.Errorf("fencing: configured archive scope differs from canonical frozen-source identity")
+		return response.Identity, "", "", "", "", fmt.Errorf("fencing: configured archive scope differs from canonical frozen-source identity")
 	}
-	return response.Identity, response.ProofDigest, response.ClosedRootDigest, nil
+	return response.Identity, response.EvidenceKind, response.ProofDigest, response.ManualTerminalAttestationDigest, response.ClosedRootDigest, nil
 }
 
 func (c *Controller) validatePendingFrozenEmptyGenesis(ctx context.Context, r *Resource, source sourceState, closedRootDigest string) error {

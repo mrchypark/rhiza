@@ -94,6 +94,9 @@ type Status struct {
 	RecoveryID                    string                            `json:"recoveryID,omitempty"`
 	SpecHash                      string                            `json:"specHash,omitempty"`
 	ManualMembershipBindingDigest string                            `json:"manualMembershipBindingDigest,omitempty"`
+	ManualRecoveryChallenge       *ManualRecoveryChallenge          `json:"manualRecoveryChallenge,omitempty"`
+	ManualRecoveryChallengeDigest string                            `json:"manualRecoveryChallengeDigest,omitempty"`
+	ManualAttestationDigest       string                            `json:"manualAttestationDigest,omitempty"`
 	StatefulSetUID                string                            `json:"statefulSetUID,omitempty"`
 	SourceDurability              string                            `json:"sourceDurability,omitempty"`
 	SourceMembership              string                            `json:"sourceMembership,omitempty"`
