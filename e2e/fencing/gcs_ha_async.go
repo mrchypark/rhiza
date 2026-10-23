@@ -27,6 +27,8 @@ const (
 	gcsAsyncEmptySyncInterval       = 24 * time.Hour
 	gcsAsyncEmptyCheckpointInterval = 24 * time.Hour
 	gcsAsyncEmptyMaxAckToSeal       = 30 * time.Minute
+	gcsAsyncNonemptyMaxSyncInterval = 30 * time.Second
+	gcsAsyncNonemptyMaxHeadWait     = 2 * time.Minute
 	gcsArchiveHeadReadLimit         = 1 << 20
 )
 
@@ -59,6 +61,145 @@ func qualifyGCSAsyncEmpty(ctx context.Context) (resultErr error) {
 
 func qualifyGCSAsyncEmptyExplicit(ctx context.Context) error {
 	return qualifyGCSAsyncEmptyWithMode(ctx, true)
+}
+
+// qualifyGCSAsyncNonempty exercises full-quorum loss after the asynchronous
+// source has persisted a nonempty archive tip. Async recovery is explicitly
+// authorized by the source's predeclared allowDataLoss policy.
+func qualifyGCSAsyncNonempty(ctx context.Context) (resultErr error) {
+	out := os.Getenv("FENCING_E2E_OUT")
+	if out == "" {
+		out = "gcs-async-nonempty-results"
+	}
+	if err := os.MkdirAll(out, 0700); err != nil {
+		return err
+	}
+	events, err := os.OpenFile(filepath.Join(out, "gcs-async-nonempty-events.jsonl"), os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0600)
+	if err != nil {
+		return err
+	}
+	defer events.Close()
+	event := func(name string, data any) {
+		_ = json.NewEncoder(events).Encode(obj{"event": name, "time": time.Now().UTC(), "data": data})
+	}
+
+	var faults []*gcsChaosFault
+	defer func() {
+		cleanupCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cancel()
+		for i := len(faults) - 1; i >= 0; i-- {
+			if err := faults[i].Restore(cleanupCtx); err != nil {
+				resultErr = errors.Join(resultErr, fmt.Errorf("restore owned async-nonempty GCS fault: %w", err))
+			}
+			event("chaos_cleanup", gcsChaosEvidence(faults[i]))
+		}
+	}()
+
+	source, err := captureGCSRecoverySource(ctx, out)
+	if err != nil {
+		return err
+	}
+	if err := requireGCSAsyncNonemptyProfile(ctx, source); err != nil {
+		return err
+	}
+	adminToken, err := sourceAdminToken(ctx, source.StatefulSet, source.Container)
+	if err != nil {
+		return err
+	}
+	archive, err := newGCSArchiveReader(source)
+	if err != nil {
+		return err
+	}
+	forward, err := startForward(ctx, source.Targets[0].Pod, out)
+	if err != nil {
+		return err
+	}
+	if _, err := call(ctx, forward, "/sql/execute", obj{"request_id": "gcs-async-nonempty-create-table", "sql": "CREATE TABLE fencing_items (id INTEGER PRIMARY KEY, value TEXT)"}, adminToken); err != nil {
+		forward.close()
+		return fmt.Errorf("create async-nonempty source table: %w", err)
+	}
+	var sourceAcks []gcsAcknowledgement
+	var rows []string
+	for id := 1; id <= 3; id++ {
+		value := fmt.Sprintf("gcs-async-archive-%d", id)
+		ack, err := writeGCSAcknowledgedRow(ctx, forward, adminToken, id, value)
+		if err != nil {
+			forward.close()
+			return fmt.Errorf("acknowledge source archive row %d: %w", id, err)
+		}
+		sourceAcks = append(sourceAcks, ack)
+		rows = append(rows, fmt.Sprintf("[%d,%q]", id, value))
+	}
+	forward.close()
+	expectedRows := "[" + strings.Join(rows, ",") + "]"
+	lastAckSlot := sourceAcks[len(sourceAcks)-1].Slot
+	var beforeFence gcsArchiveHeadEvidence
+	archiveCtx, cancelArchive := context.WithTimeout(ctx, gcsAsyncNonemptyMaxHeadWait)
+	err = wait(archiveCtx, "nonempty async GCS archive tip", func() (bool, error) {
+		head, err := readGCSArchiveHead(archiveCtx, archive, source.Prefix, false)
+		if err != nil {
+			return false, err
+		}
+		if head.Sealed {
+			return false, fmt.Errorf("source archive was sealed before the generation fence")
+		}
+		if head.Tip < lastAckSlot {
+			return false, nil
+		}
+		beforeFence = head
+		return true, nil
+	})
+	cancelArchive()
+	if err != nil {
+		return fmt.Errorf("wait for acknowledged rows to reach the async source archive: %w", err)
+	}
+	if beforeFence.Tip == 0 || beforeFence.Version == "" || beforeFence.HeadSHA256 == "" {
+		return fmt.Errorf("captured async source archive is not a versioned nonempty tip")
+	}
+	event("source_nonempty_head_before_fence", obj{"head": beforeFence, "rows": expectedRows, "acks": sourceAcks})
+
+	outcome, err := gcsLoseQuorumAndRecover(ctx, source, adminToken, expectedRows, "async-nonempty", false, out, event, &faults)
+	if err != nil {
+		return err
+	}
+	defer outcome.Forward.close()
+	sealedHead, err := readGCSArchiveHead(ctx, archive, source.Prefix, false)
+	if err != nil {
+		return fmt.Errorf("read sealed nonempty source archive HEAD: %w", err)
+	}
+	if err := validateSealedNonemptyHead(beforeFence, sealedHead); err != nil {
+		return err
+	}
+	recovery := outcome.Recovery
+	if recovery.Spec.Durability != "async" || !recovery.Spec.AllowDataLoss || recovery.Status.SourceDurability != "async" ||
+		recovery.Status.TargetBaseKind != "fork" || recovery.Status.RecoveredTip != beforeFence.Tip || recovery.Status.ManifestHash == "" {
+		return fmt.Errorf("recovery did not adopt the exact nonempty sealed async source tip with its explicit data-loss gate")
+	}
+	recovered, err := call(ctx, outcome.Forward, "/sql/query", obj{"sql": "SELECT id,value FROM fencing_items ORDER BY id", "consistency": "linearizable"}, outcome.Admin)
+	if err != nil || string(encoded(recovered["rows"])) != expectedRows {
+		return fmt.Errorf("recovered target rows differ from the captured nonempty archive rows: %v", err)
+	}
+	recoveredRows := string(encoded(recovered["rows"]))
+	targetAck, err := writeGCSAcknowledgedRow(ctx, outcome.Forward, outcome.Admin, 4, "gcs-async-target-ack")
+	if err != nil {
+		return fmt.Errorf("acknowledge and read back a target row after async fork recovery: %w", err)
+	}
+	evidence := obj{
+		"qualification":          "gcs-async-nonempty-tip-recovery",
+		"profile":                obj{"provider": "gcs", "bucket": source.Bucket, "noPVC": true, "sourceDurability": "async", "allowDataLoss": true},
+		"sourceAcknowledgements": sourceAcks, "sourceRows": expectedRows,
+		"sourceHeadBeforeFence": beforeFence, "sealedSourceHead": sealedHead,
+		"fence": outcome.Fence, "proof": outcome.Proof, "recovery": recovery,
+		"recoveredRows": recoveredRows, "recoveredTip": recovery.Status.RecoveredTip,
+		"targetQuorumVerified": true,
+		"targetAck":            targetAck,
+		"proofSource":          "RhizaFence status plus direct versioned GCS HEAD reads; recovered rows were read linearly from the promoted target",
+	}
+	if err := os.WriteFile(filepath.Join(out, "gcs-async-nonempty-evidence.json"), encoded(evidence), 0600); err != nil {
+		return err
+	}
+	event("async_nonempty_tip_recovery_qualified", obj{"source": source.ClusterID, "target": recovery.Status.Target, "tip": sealedHead.Tip})
+	return nil
 }
 
 func qualifyGCSAsyncEmptyWithMode(ctx context.Context, explicit bool) (resultErr error) {
@@ -231,6 +372,75 @@ func requireGCSAsyncEmptyExplicitProfile(ctx context.Context, source gcsRecovery
 		return err
 	}
 	return requireExplicitGCSRecoveryProfile(ctx, source, true)
+}
+
+func requireGCSAsyncNonemptyProfile(ctx context.Context, source gcsRecoverySource) error {
+	if err := requireGCSAsyncNonemptySourceProfile(ctx, source); err != nil {
+		return err
+	}
+	binding, err := get(ctx, "rhizacluster", source.BindingName)
+	if err != nil {
+		return err
+	}
+	if !gcsAsyncEmptyPolicyEnabled(nested(binding, "spec")) {
+		return fmt.Errorf("async nonempty recovery requires predeclared allowDataLoss policy")
+	}
+	operatorDeployment, err := get(ctx, "deployment", "rhiza-operator")
+	if err != nil {
+		return err
+	}
+	opContainer, err := boundContainer(operatorDeployment, "operator")
+	if err != nil {
+		return err
+	}
+	automatic, err := effectiveGCSSetting(ctx, opContainer, "RHIZA_AUTOMATIC_RECOVERY")
+	if err != nil || automatic != "true" {
+		return fmt.Errorf("async nonempty qualification requires the automatic recovery controller to be enabled")
+	}
+	return nil
+}
+
+func requireGCSAsyncNonemptySourceProfile(ctx context.Context, source gcsRecoverySource) error {
+	sts, err := get(ctx, "statefulset", source.StatefulSet)
+	if err != nil {
+		return err
+	}
+	container, err := boundContainer(sts, source.Container)
+	if err != nil {
+		return err
+	}
+	durability, err := effectiveGCSSetting(ctx, container, "RHIZA_OBJSTORE_DURABILITY")
+	if err != nil || durability != "async" {
+		return fmt.Errorf("async nonempty qualification requires a verified async source durability setting")
+	}
+	syncText, err := effectiveGCSSetting(ctx, container, "RHIZA_OBJSTORE_SYNC_INTERVAL")
+	if err != nil {
+		return fmt.Errorf("read source object-store sync interval: %w", err)
+	}
+	checkpointText, err := effectiveGCSSetting(ctx, container, "RHIZA_CHECKPOINT_INTERVAL")
+	if err != nil {
+		return fmt.Errorf("read source checkpoint interval: %w", err)
+	}
+	tailText, err := effectiveGCSOptionalSetting(ctx, container, "RHIZA_CHECKPOINT_TAIL_BYTES")
+	if err != nil {
+		return fmt.Errorf("read source checkpoint tail limit: %w", err)
+	}
+	if tailText == "" {
+		tailText = "536870912"
+	}
+	syncInterval, err := time.ParseDuration(syncText)
+	if err != nil || syncInterval <= 0 || syncInterval > gcsAsyncNonemptyMaxSyncInterval {
+		return fmt.Errorf("async nonempty qualification requires a positive bounded object-store sync interval")
+	}
+	checkpointInterval, err := time.ParseDuration(checkpointText)
+	if err != nil || checkpointInterval <= 0 || checkpointInterval > gcsAsyncNonemptyMaxHeadWait {
+		return fmt.Errorf("async nonempty qualification requires a positive bounded checkpoint interval")
+	}
+	tailBytes, err := strconv.ParseInt(tailText, 10, 64)
+	if err != nil || tailBytes <= 0 || tailBytes > 2<<30 {
+		return fmt.Errorf("async nonempty qualification requires an explicit valid checkpoint tail limit")
+	}
+	return nil
 }
 
 func requireGCSAsyncEmptySourceProfile(ctx context.Context, source gcsRecoverySource) error {
@@ -437,6 +647,14 @@ func validateSealedZeroHead(before, after gcsArchiveHeadEvidence) error {
 	if before.Version == "" || before.VersionType != int(objstore.Generation) || before.Tip != 0 || before.Sealed || before.HeadSHA256 == "" ||
 		after.Version == "" || after.VersionType != int(objstore.Generation) || after.Version == before.Version || after.Tip != 0 || !after.Sealed || after.HeadSHA256 == "" || after.HeadSHA256 == before.HeadSHA256 {
 		return fmt.Errorf("source generation was not sealed at a new persisted zero-tip GCS HEAD version")
+	}
+	return nil
+}
+
+func validateSealedNonemptyHead(before, after gcsArchiveHeadEvidence) error {
+	if before.Version == "" || before.VersionType != int(objstore.Generation) || before.Tip == 0 || before.Sealed || before.HeadSHA256 == "" ||
+		after.Version == "" || after.VersionType != int(objstore.Generation) || after.Version == before.Version || after.Tip != before.Tip || !after.Sealed || after.HeadSHA256 == "" || after.HeadSHA256 == before.HeadSHA256 {
+		return fmt.Errorf("source generation did not seal the captured nonempty persisted GCS HEAD tip")
 	}
 	return nil
 }
