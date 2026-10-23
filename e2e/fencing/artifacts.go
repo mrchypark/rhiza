@@ -580,17 +580,23 @@ type gcsMissingMembershipPublicSummary struct {
 }
 
 func projectGCSMissingMembershipEvidence(raw, public, qualification string, failedRun bool) (bool, error) {
+	entries, err := os.ReadDir(raw)
+	if err != nil {
+		return false, err
+	}
+	if qualification != gcsMissingMembershipNegativeQualification && qualification != gcsMissingMembershipPositiveQualification {
+		for _, entry := range entries {
+			if strings.HasPrefix(entry.Name(), "gcs-missing-membership-") {
+				return false, fmt.Errorf("missing-membership evidence requires its explicit case selector")
+			}
+		}
+		return false, nil
+	}
 	caseName := "negative"
 	evidenceName := gcsMissingMembershipNegativeEvidenceName
 	if qualification == gcsMissingMembershipPositiveQualification {
 		caseName = "positive"
 		evidenceName = gcsMissingMembershipPositiveEvidenceName
-	} else if qualification != gcsMissingMembershipNegativeQualification {
-		return false, fmt.Errorf("missing-membership evidence selector is unsupported")
-	}
-	entries, err := os.ReadDir(raw)
-	if err != nil {
-		return false, err
 	}
 	seenEvidence, seenEvents := false, false
 	for _, entry := range entries {

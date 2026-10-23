@@ -1076,6 +1076,27 @@ func TestMissingMembershipArtifactProjectionIsCaseBoundAndRedacted(t *testing.T)
 	}
 }
 
+func TestMissingMembershipProjectorIsInactiveOutsideItsSelector(t *testing.T) {
+	for _, selector := range []string{"", "gcs-async-nonempty", gcsManualTerminalQualification} {
+		t.Run(selector, func(t *testing.T) {
+			raw, public := t.TempDir(), t.TempDir()
+			if err := os.Mkdir(filepath.Join(public, "public"), 0700); err != nil {
+				t.Fatal(err)
+			}
+			seen, err := projectGCSMissingMembershipEvidence(raw, filepath.Join(public, "public"), selector, false)
+			if err != nil || seen {
+				t.Fatalf("unselected missing-membership projector ran without matching evidence: seen=%t err=%v", seen, err)
+			}
+			if err := os.WriteFile(filepath.Join(raw, gcsMissingMembershipNegativeEvidenceName), []byte(`{}`), 0600); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := projectGCSMissingMembershipEvidence(raw, filepath.Join(public, "public"), selector, false); err == nil {
+				t.Fatal("accepted missing-membership evidence without its explicit selector")
+			}
+		})
+	}
+}
+
 func TestMissingMembershipPositiveProjectorBindsFreshTargetSecretAndProof(t *testing.T) {
 	data := missingMembershipPositiveEvidenceFixture()
 	if err := validateGCSMissingMembershipPositiveEvidence(data); err != nil {
@@ -1149,6 +1170,7 @@ func missingMembershipPositiveEvidenceFixture() []byte {
 		binding   = "fixture-binding-uid"
 		requestID = "fixture-missing-membership"
 	)
+	sourceRows := `[[1,"gcs-missing-membership-source-1"],[2,"gcs-missing-membership-source-2"],[3,"gcs-missing-membership-source-3"]]`
 	var sourceMembers, targetMembers []quepaxa.Member
 	var targets []operator.FenceTarget
 	for i := 0; i < 3; i++ {
@@ -1198,14 +1220,14 @@ func missingMembershipPositiveEvidenceFixture() []byte {
 		"profile": obj{"provider": "gcs", "noPVC": true, "sourceDurability": "async", "allowDataLoss": true, "allowMissingSourceMembership": true},
 		"sourceAcknowledgements": []gcsAcknowledgement{{RequestID: "gcs-ha-ack-1", Slot: 1, Rows: `[[1,"gcs-missing-membership-source-1"]]`},
 			{RequestID: "gcs-ha-ack-2", Slot: 2, Rows: `[[2,"gcs-missing-membership-source-2"]]`}, {RequestID: "gcs-ha-ack-3", Slot: 3, Rows: `[[3,"gcs-missing-membership-source-3"]]`}},
-		"sourceRows":            `[[1,"gcs-missing-membership-source-1"],[2,"gcs-missing-membership-source-2"],[3,"gcs-missing-membership-source-3"]]`,
+		"sourceRows":            sourceRows,
 		"sourceHeadBeforeFence": gcsArchiveHeadEvidence{VersionType: int(objstore.Generation), Version: "generation-before", Tip: 5, HeadSHA256: strings.Repeat("3", 64)},
 		"sealedSourceHead":      gcsArchiveHeadEvidence{VersionType: int(objstore.Generation), Version: "generation-sealed", Tip: 5, Sealed: true, HeadSHA256: strings.Repeat("4", 64)},
 		"fence":                 fence, "proof": proof, "sourceIdentity": source, "recovery": resource, "sourceMembershipAbsent": true,
 		"sourceMembers": sourceMembers, "targetCredentials": obj{"secretName": secretName, "secretUID": "fixture-secret-uid", "resourceVersion": "17",
 			"ownerOperationID": ownerOperationID, "immutable": true, "membersSHA256": fmt.Sprintf("%x", credentialHash), "members": targetMembers},
 		"targetMembership": recovery.NewMembershipRecord(targetID, targetMembers, "async"), "manualMembershipBindingDigest": bindingDigest,
-		"targetMembershipVerified": true, "recoveredRows": `[[1,"a"],[2,"b"],[3,"c"]]`, "targetQuorumVerified": true,
+		"targetMembershipVerified": true, "recoveredRows": sourceRows, "targetQuorumVerified": true,
 		"targetAck": gcsAcknowledgement{RequestID: "gcs-ha-ack-4", Slot: 6, Rows: `[[4,"gcs-missing-membership-target"]]`},
 	})
 }
