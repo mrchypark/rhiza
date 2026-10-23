@@ -338,15 +338,33 @@ func (c *Controller) saveAuto(ctx context.Context, r *ClusterResource, state *au
 	return c.Bucket.Upload(ctx, c.autoKey(r), bytes.NewReader(jsonBytes(state)), option)
 }
 func (c *Controller) reconcileClusters(ctx context.Context) error {
+	return c.reconcileClusterList(ctx, false)
+}
+
+func (c *Controller) reconcileInitialSupervisedRoots(ctx context.Context) error {
+	return c.reconcileClusterList(ctx, true)
+}
+
+func (c *Controller) reconcileClusterList(ctx context.Context, initialRootOnly bool) error {
 	var clusters struct {
 		Items []ClusterResource `json:"items"`
 	}
 	if err := c.Kube.Get(ctx, c.clusterPath(""), &clusters); err != nil {
+		var apiErr *APIError
+		if initialRootOnly && errors.As(err, &apiErr) && apiErr.StatusCode == http.StatusNotFound {
+			return nil
+		}
 		return err
 	}
 	var failures []error
 	for i := range clusters.Items {
-		if err := c.reconcileCluster(ctx, &clusters.Items[i]); err != nil {
+		var err error
+		if initialRootOnly {
+			err = c.reconcileClusterMode(ctx, &clusters.Items[i], true)
+		} else {
+			err = c.reconcileCluster(ctx, &clusters.Items[i])
+		}
+		if err != nil {
 			failures = append(failures, err)
 		}
 	}
@@ -357,19 +375,32 @@ func (c *Controller) reconcileClusters(ctx context.Context) error {
 // observation. Derived node IDs are checked for a new binding and for an
 // established binding whose frozen inventory already follows the derived shape.
 func voterCountContract(r *ClusterResource, sts object, members []quepaxa.Member, adopted, checkIDs bool, allowed map[string]bool) error {
-	count := r.Spec.VoterCount
 	replicas := int(number(nested(sts, "spec", "replicas")))
+	return voterInventoryContract(r, members, adopted, checkIDs, allowed, &replicas)
+}
+
+// voterInventoryContract validates the declared cohort independently of the
+// current replica count. It is used only while pinning the root UID onto an
+// empty supervised source template, before the driver scales that workload.
+func voterInventoryContract(r *ClusterResource, members []quepaxa.Member, adopted, checkIDs bool, allowed map[string]bool, desiredReplicas *int) error {
+	count := r.Spec.VoterCount
 	if count < 3 {
 		if count == 0 {
-			return fmt.Errorf("spec.voterCount is required and must equal the StatefulSet desired replicas and exported RHIZA_CLUSTER_MEMBERS count (%d)", replicas)
+			if desiredReplicas != nil {
+				return fmt.Errorf("spec.voterCount is required and must equal the StatefulSet desired replicas and exported RHIZA_CLUSTER_MEMBERS count (%d)", *desiredReplicas)
+			}
+			return fmt.Errorf("spec.voterCount is required and must be at least 3")
 		}
-		return fmt.Errorf("spec.voterCount=%d is below the minimum 3; set it to the StatefulSet desired replicas and exported RHIZA_CLUSTER_MEMBERS count (%d)", count, replicas)
+		if desiredReplicas != nil {
+			return fmt.Errorf("spec.voterCount=%d is below the minimum 3; set it to the StatefulSet desired replicas and exported RHIZA_CLUSTER_MEMBERS count (%d)", count, *desiredReplicas)
+		}
+		return fmt.Errorf("spec.voterCount=%d is below the minimum 3", count)
 	}
 	if count > fenceTargetCapacity {
 		return fmt.Errorf("spec.voterCount=%d exceeds the maximum %d", count, fenceTargetCapacity)
 	}
-	if replicas != count {
-		return fmt.Errorf("StatefulSet has %d desired replicas but voterCount is %d", replicas, count)
+	if desiredReplicas != nil && *desiredReplicas != count {
+		return fmt.Errorf("StatefulSet has %d desired replicas but voterCount is %d", *desiredReplicas, count)
 	}
 	if adopted && len(members) != count {
 		return fmt.Errorf("RHIZA_CLUSTER_MEMBERS lists %d voters but voterCount is %d", len(members), count)
@@ -379,6 +410,199 @@ func voterCountContract(r *ClusterResource, sts object, members []quepaxa.Member
 			if !allowed[string(member.ID)] {
 				return fmt.Errorf("RHIZA_CLUSTER_MEMBERS node ID %q is neither a derived voter nor a journaled learner", member.ID)
 			}
+		}
+	}
+	return nil
+}
+
+// bindInitialSupervisedRoot pins the canonical RhizaCluster UID before an
+// opted-in supervised workload is first scaled. It is deliberately limited to
+// an empty, zero-replica StatefulSet; it never mutates a live Pod or repairs a
+// conflicting/previously unbound workload.
+func (c *Controller) bindInitialSupervisedRoot(ctx context.Context, r *ClusterResource, sts object, env map[string]string, members []quepaxa.Member, adopted, checkIDs bool, allowed map[string]bool, state *autoControl) (bool, error) {
+	if str(nested(sts, "spec", "template", "metadata", "annotations", fencingProtocolAnnotation)) != "1" {
+		return false, nil
+	}
+	rootUID := str(r.Metadata["uid"])
+	statefulSetUID := str(nested(sts, "metadata", "uid"))
+	if rootUID == "" || statefulSetUID == "" || r.Metadata["deletionTimestamp"] != nil ||
+		str(r.Metadata["namespace"]) != "" && str(r.Metadata["namespace"]) != c.Kube.Namespace {
+		return false, fmt.Errorf("automatic supervised source root or workload identity is unavailable")
+	}
+	if env["RHIZA_CLUSTER_ID"] != r.Spec.AdoptClusterID || env["RHIZA_ENABLE_RECONFIGURATION"] != "true" {
+		return false, fmt.Errorf("automatic supervised source contract differs from RhizaCluster")
+	}
+	ctr, err := container(sts, r.Spec.Container)
+	if err != nil {
+		return false, err
+	}
+	if err := validateClusterRuntime(r, ctr, env); err != nil {
+		return false, err
+	}
+	if err := noPVC(sts, ctr, env); err != nil {
+		return false, err
+	}
+	if err := c.storeConfigMatches(env); err != nil {
+		return false, err
+	}
+	if err := voterInventoryContract(r, members, adopted, checkIDs, allowed, nil); err != nil {
+		return false, err
+	}
+	if state != nil {
+		if state.BindingUID != rootUID || state.StatefulSetUID != statefulSetUID || state.ActiveClusterID != r.Spec.AdoptClusterID {
+			return false, fmt.Errorf("durable automatic source binding differs from RhizaCluster")
+		}
+		if state.BindingVersion == 0 {
+			if err := c.verifyLegacyBindingRecord(ctx, r, state, statefulSetUID); err != nil {
+				return false, err
+			}
+		} else if state.BindingHash != autoBinding(r) {
+			return false, fmt.Errorf("durable automatic source binding hash differs from RhizaCluster")
+		}
+	} else {
+		bindingKey := path.Join(c.Prefix, "automatic-workloads", c.Kube.Namespace, statefulSetUID, "binding.json")
+		exists, err := c.Bucket.Exists(ctx, bindingKey)
+		if err != nil {
+			return false, fmt.Errorf("durable automatic workload binding is unavailable")
+		}
+		if exists {
+			return false, fmt.Errorf("durable automatic workload binding exists without its control record")
+		}
+	}
+	return c.pinInitialSupervisedRoot(ctx, r, sts, rootUID, statefulSetUID, env)
+}
+
+func (c *Controller) pinInitialSupervisedRoot(ctx context.Context, r *ClusterResource, observedSTS object, rootUID, statefulSetUID string, observedEnv map[string]string) (bool, error) {
+	var currentRoot ClusterResource
+	if err := c.Kube.Get(ctx, c.clusterPath(str(r.Metadata["name"])), &currentRoot); err != nil {
+		return false, fmt.Errorf("automatic source root identity could not be revalidated")
+	}
+	normalizeClusterSpec(&currentRoot)
+	if str(currentRoot.Metadata["name"]) != str(r.Metadata["name"]) || str(currentRoot.Metadata["uid"]) != rootUID ||
+		currentRoot.Metadata["deletionTimestamp"] != nil || hashJSON(currentRoot.Spec) != hashJSON(r.Spec) {
+		return false, fmt.Errorf("automatic source root identity or contract changed")
+	}
+	if str(nested(observedSTS, "metadata", "uid")) != statefulSetUID {
+		return false, fmt.Errorf("automatic source StatefulSet identity changed")
+	}
+	observedVersion := str(nested(observedSTS, "metadata", "resourceVersion"))
+	if observedVersion == "" {
+		return false, fmt.Errorf("automatic source StatefulSet resource version is unavailable")
+	}
+	var current object
+	if err := c.Kube.Get(ctx, c.stsPath(r.Spec.StatefulSet), &current); err != nil {
+		return false, fmt.Errorf("automatic source StatefulSet could not be revalidated")
+	}
+	if str(nested(current, "metadata", "uid")) != statefulSetUID || str(nested(current, "metadata", "resourceVersion")) != observedVersion || nested(current, "metadata", "deletionTimestamp") != nil {
+		return false, fmt.Errorf("automatic source StatefulSet identity or resource version changed")
+	}
+	if str(nested(current, "spec", "template", "metadata", "annotations", fencingProtocolAnnotation)) != "1" {
+		return false, fmt.Errorf("automatic source no longer has the supervised workload contract")
+	}
+	template := asObject(nested(current, "spec", "template"))
+	if err := validateSupervisedPod(object{"metadata": template["metadata"], "spec": template["spec"]}); err != nil {
+		return false, err
+	}
+	root := str(nested(current, "spec", "template", "metadata", "annotations", fencingRootAnnotation))
+	if root != "" && root != rootUID {
+		return false, fmt.Errorf("automatic source template is bound to another root UID")
+	}
+	needsPin := root == ""
+	if needsPin {
+		if int(number(nested(current, "spec", "replicas"))) != 0 {
+			return false, fmt.Errorf("automatic source root can only be pinned before the StatefulSet is scaled")
+		}
+		if err := c.validateInitialSourcePods(ctx, current, statefulSetUID, rootUID, true); err != nil {
+			return false, err
+		}
+	}
+	ctr, err := container(current, r.Spec.Container)
+	if err != nil {
+		return false, err
+	}
+	currentEnv, err := c.environment(ctx, ctr)
+	if err != nil {
+		return false, fmt.Errorf("automatic source environment could not be revalidated")
+	}
+	if hashJSON(currentEnv) != hashJSON(observedEnv) || currentEnv["RHIZA_CLUSTER_ID"] != r.Spec.AdoptClusterID || currentEnv["RHIZA_ENABLE_RECONFIGURATION"] != "true" {
+		return false, fmt.Errorf("automatic source contract changed before root pin")
+	}
+	if !needsPin {
+		if err := c.validateInitialSourcePods(ctx, current, statefulSetUID, rootUID, false); err != nil {
+			return false, err
+		}
+		if int(number(nested(current, "spec", "replicas"))) == 0 {
+			return true, nil
+		}
+		return false, nil
+	}
+	metadata := asObject(nested(current, "spec", "template", "metadata"))
+	if metadata == nil {
+		metadata = object{}
+		asObject(nested(current, "spec", "template"))["metadata"] = metadata
+	}
+	annotations := asObject(metadata["annotations"])
+	if annotations == nil {
+		annotations = object{}
+		metadata["annotations"] = annotations
+	}
+	annotations[fencingRootAnnotation] = rootUID
+	var updated object
+	if err := c.Kube.Put(ctx, c.stsPath(r.Spec.StatefulSet), current, &updated); err != nil {
+		return false, fmt.Errorf("automatic source root pin conflicted; retry after revalidation")
+	}
+	if str(nested(updated, "metadata", "uid")) != statefulSetUID || str(nested(updated, "spec", "template", "metadata", "annotations", fencingRootAnnotation)) != rootUID {
+		return false, fmt.Errorf("automatic source root pin response did not preserve the verified binding")
+	}
+	return true, nil
+}
+
+func (c *Controller) validateInitialSourcePods(ctx context.Context, sts object, statefulSetUID, rootUID string, requireEmpty bool) error {
+	selector := asObject(nested(sts, "spec", "selector", "matchLabels"))
+	if len(selector) == 0 || len(list(nested(sts, "spec", "selector", "matchExpressions"))) != 0 {
+		return fmt.Errorf("automatic source requires a nonempty, explicit matchLabels selector")
+	}
+	var pods podList
+	if err := c.Kube.Get(ctx, c.corePath("pods", ""), &pods); err != nil {
+		return fmt.Errorf("automatic source Pod inventory could not be verified")
+	}
+	name := str(nested(sts, "metadata", "name"))
+	for _, pod := range pods.Items {
+		matched := true
+		for key, value := range selector {
+			if nested(pod, "metadata", "labels", key) != value {
+				matched = false
+				break
+			}
+		}
+		owned := false
+		for _, raw := range list(nested(pod, "metadata", "ownerReferences")) {
+			owner := asObject(raw)
+			if str(owner["kind"]) == "StatefulSet" && str(owner["uid"]) == statefulSetUID {
+				owned = true
+			}
+		}
+		if !matched && !owned {
+			continue
+		}
+		if nested(pod, "metadata", "deletionTimestamp") != nil {
+			return fmt.Errorf("automatic source has a terminating matching or StatefulSet-owned Pod")
+		}
+		if requireEmpty {
+			return fmt.Errorf("automatic source root pin requires no matching or StatefulSet-owned Pods")
+		}
+		if !matched || !owned || str(nested(pod, "metadata", "annotations", fencingRootAnnotation)) != rootUID {
+			return fmt.Errorf("automatic source Pod ownership or root binding differs")
+		}
+		ownerCount := 0
+		for _, raw := range list(nested(pod, "metadata", "ownerReferences")) {
+			owner := asObject(raw)
+			if str(owner["apiVersion"]) == "apps/v1" && str(owner["kind"]) == "StatefulSet" && str(owner["name"]) == name && str(owner["uid"]) == statefulSetUID && owner["controller"] == true {
+				ownerCount++
+			}
+		}
+		if ownerCount != 1 {
+			return fmt.Errorf("automatic source Pod controller ownership is ambiguous")
 		}
 	}
 	return nil
@@ -835,7 +1059,16 @@ func bootstrapSecretName(r *ClusterResource) string {
 }
 
 func (c *Controller) reconcileCluster(ctx context.Context, r *ClusterResource) error {
-	block := func(state *autoControl, message string) error { return c.autoStatus(ctx, r, state, "Blocked", message) }
+	return c.reconcileClusterMode(ctx, r, false)
+}
+
+func (c *Controller) reconcileClusterMode(ctx context.Context, r *ClusterResource, initialRootOnly bool) error {
+	block := func(state *autoControl, message string) error {
+		if initialRootOnly {
+			return fmt.Errorf("%s", message)
+		}
+		return c.autoStatus(ctx, r, state, "Blocked", message)
+	}
 	normalizeClusterSpec(r)
 	for _, id := range []string{str(r.Metadata["name"]), r.Spec.LogicalID, r.Spec.StatefulSet, r.Spec.AdoptClusterID} {
 		if !identifier.MatchString(id) {
@@ -852,6 +1085,9 @@ func (c *Controller) reconcileCluster(ctx context.Context, r *ClusterResource) e
 	uid := str(nested(sts, "metadata", "uid"))
 	if uid == "" {
 		return block(nil, "workload UID is unavailable")
+	}
+	if initialRootOnly && str(nested(sts, "spec", "template", "metadata", "annotations", fencingProtocolAnnotation)) != "1" {
+		return nil
 	}
 	if number(nested(sts, "spec", "ordinals", "start")) != 0 {
 		return block(nil, "StatefulSet spec.ordinals.start=0 is required; nonzero starting ordinals are not supported")
@@ -877,12 +1113,49 @@ func (c *Controller) reconcileCluster(ctx context.Context, r *ClusterResource) e
 	if err != nil && !c.Bucket.IsObjNotFoundErr(err) {
 		return block(nil, "durable automatic control record is unavailable")
 	}
-	if err := validateAutomaticPolicyForNewIncident(state, r.Spec.Automatic, r.Spec.Policy); err != nil {
-		return block(state, err.Error())
+	if !initialRootOnly {
+		if err := validateAutomaticPolicyForNewIncident(state, r.Spec.Automatic, r.Spec.Policy); err != nil {
+			return block(state, err.Error())
+		}
 	}
 	members, adopted, err := clusterMembers(env["RHIZA_CLUSTER_MEMBERS"])
 	if err != nil {
 		return block(nil, err.Error())
+	}
+	if str(nested(sts, "spec", "template", "metadata", "annotations", fencingProtocolAnnotation)) == "1" {
+		allowed, err := allowedGenerationVoterIDs(r, sts, state)
+		if err != nil {
+			return block(nil, err.Error())
+		}
+		checkIDs := state == nil
+		if !checkIDs {
+			checkIDs = len(state.Voters) == r.Spec.VoterCount
+			for _, voter := range state.Voters {
+				if !allowed[string(voter.NodeID)] {
+					checkIDs = false
+					break
+				}
+			}
+		}
+		if err := voterInventoryContract(r, members, adopted, checkIDs, allowed, nil); err != nil {
+			return block(state, err.Error())
+		}
+		if err := c.validateBootstrappedMembers(ctx, r, sts, adopted, members, allowed); err != nil {
+			return block(state, err.Error())
+		}
+		deferReconcile, err := c.bindInitialSupervisedRoot(ctx, r, sts, env, members, adopted, checkIDs, allowed, state)
+		if err != nil {
+			return block(state, err.Error())
+		}
+		if initialRootOnly {
+			return nil
+		}
+		if deferReconcile {
+			return c.autoStatus(ctx, r, state, "Observing", "supervised source root is pinned; continue after initial StatefulSet scale")
+		}
+	}
+	if initialRootOnly {
+		return nil
 	}
 	if state == nil || state.BootstrapGenesis != nil {
 		handled, message, err := c.reconcileAutomaticBootstrapGenesis(ctx, r, sts, ctr, env, state, version, members, adopted)

@@ -99,6 +99,10 @@ func (c *Controller) reconcileAll(ctx context.Context) error {
 		if err := c.reconcileClusters(ctx); err != nil {
 			failures = append(failures, err)
 		}
+	} else {
+		if err := c.reconcileInitialSupervisedRoots(ctx); err != nil {
+			failures = append(failures, err)
+		}
 	}
 	return errors.Join(failures...)
 }
