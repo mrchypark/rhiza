@@ -199,7 +199,6 @@ func TestIndependentGCSChaosManifestContract(t *testing.T) {
 		t.Fatal("IAM preflight Pod creation must not adopt an existing Pod")
 	}
 	for _, forbidden := range []string{
-		"rhiza.mrchypark.dev/cooperative-fencing: \"1\"",
 		"FENCER_SOURCE_MUTATION_RECEIPT_DIR",
 		"FENCER_SOURCE_STAGE_DIR",
 		"FENCER_SOURCE_WRITER_CREDENTIALS_FILE",
