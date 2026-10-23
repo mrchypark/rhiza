@@ -343,11 +343,27 @@ func waitForGCSVoterRemoveAckBeforeAdd(ctx context.Context, source gcsRecoverySo
 		if matches != 1 {
 			return false, nil
 		}
+		// Resolve the deterministic automatic-child name directly as a second
+		// API read. The UID returned for that exact, owner-bound object is the
+		// expected identity for the checkpoint matcher; a nonempty UID from a
+		// list item is not sufficient.
+		identity, err := get(ctx, "rhizarecovery", request.OperationID)
+		if err != nil {
+			return false, err
+		}
+		expectedRecoveryUID := text(nested(identity, "metadata", "uid"))
+		if text(nested(identity, "metadata", "name")) != request.OperationID ||
+			text(nested(identity, "metadata", "namespace")) != source.Namespace || expectedRecoveryUID == "" ||
+			nested(identity, "metadata", "annotations", "rhiza.mrchypark.dev/automatic-owner") != source.BindingUID ||
+			nested(identity, "metadata", "annotations", "rhiza.mrchypark.dev/automatic-logical") != source.LogicalID ||
+			text(checkpoint.Metadata["uid"]) != expectedRecoveryUID {
+			return false, fmt.Errorf("Recovery checkpoint UID differs from the exact owner-bound automatic child")
+		}
 		membership, err := readMembershipWithToken(ctx, forward, token)
 		if err != nil {
 			return false, nil
 		}
-		if gcsVoterRemoveAckCheckpointMatches(checkpoint, source, target, request, proof, source.Targets[1], membership) {
+		if gcsVoterRemoveAckCheckpointMatches(checkpoint, expectedRecoveryUID, source, target, request, proof, source.Targets[1], membership) {
 			return true, nil
 		}
 		if checkpoint.Status.Membership != nil && (checkpoint.Status.Membership.Add != nil || checkpoint.Status.Membership.Phase == "Adding" || checkpoint.Status.Membership.Phase == "Complete") {
@@ -358,9 +374,9 @@ func waitForGCSVoterRemoveAckBeforeAdd(ctx context.Context, source gcsRecoverySo
 	return checkpoint, err
 }
 
-func gcsVoterRemoveAckCheckpointMatches(recovery operator.Resource, source gcsRecoverySource, target operator.FenceTarget,
+func gcsVoterRemoveAckCheckpointMatches(recovery operator.Resource, expectedRecoveryUID string, source gcsRecoverySource, target operator.FenceTarget,
 	request operator.FenceRequest, proof operator.FenceProof, observer operator.FenceTarget, membership network.MembershipStatus) bool {
-	if text(recovery.Metadata["uid"]) == "" || recovery.Spec.SourceClusterID != source.ClusterID || recovery.Spec.RecoveryID != request.OperationID ||
+	if expectedRecoveryUID == "" || text(recovery.Metadata["uid"]) != expectedRecoveryUID || recovery.Spec.SourceClusterID != source.ClusterID || recovery.Spec.RecoveryID != request.OperationID ||
 		recovery.Spec.StatefulSet != source.StatefulSet || recovery.Status.StatefulSetUID != source.StatefulSetUID || recovery.Status.Source != source.ClusterID ||
 		recovery.Status.Phase != "Removing" || recovery.Status.Message != gcsVoterRemoveAcceptedMessage || recovery.Status.Membership == nil ||
 		recovery.Status.Membership.Phase != "Removing" || recovery.Status.Membership.Add != nil || recovery.Status.Membership.RemoveRequest == nil {
