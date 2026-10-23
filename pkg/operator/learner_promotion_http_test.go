@@ -348,10 +348,22 @@ func TestAuthenticatedLearnerPromotionRetriesExactCanonicalCompletion(t *testing
 	if err != nil {
 		t.Fatal(err)
 	}
+	role, err := f.e.resolveStartupRole(ctx, f.runtime.StatefulSetUID, walID)
+	if err != nil || role != fencing.StartupRoleVoterActive {
+		t.Fatalf("completed canonical learner is not eligible before fault injection: role=%q err=%v", role, err)
+	}
+	promotion, err := f.e.verifiedLearnerPromotionHash(ctx, f.runtime.StatefulSetUID, walID)
+	if err != nil || promotion.operationID != request.OperationID || promotion.digest == "" {
+		t.Fatalf("completed canonical learner promotion proof is unavailable before fault injection: proof=%+v err=%v", promotion, err)
+	}
 	faultBucket := &mutationCASReplyFaultBucket{Bucket: f.e.AuthorityState.bucket, loseCASAfter: 3, failReadAfterReply: true}
 	f.e.AuthorityState.bucket = faultBucket
-	if _, err := client.PromoteLearner(ctx, walID); err == nil {
-		t.Fatal("injected post-promotion producer-pin response loss was not surfaced")
+	_, promotionErr := client.PromoteLearner(ctx, walID)
+	if promotionErr == nil {
+		t.Fatalf("post-promotion producer-pin response loss was not surfaced (remaining conditional writes=%d, readback pending=%t)", faultBucket.loseCASAfter, faultBucket.failNextRead)
+	}
+	if faultBucket.loseCASAfter != 0 || faultBucket.failNextRead {
+		t.Fatalf("promotion failed before the configured lost-response/readback fault was consumed: err=%v remaining conditional writes=%d readback pending=%t", promotionErr, faultBucket.loseCASAfter, faultBucket.failNextRead)
 	}
 	rootAfterFault, _, err := f.e.AuthorityState.ReadRoot(ctx, f.runtime.StatefulSetUID, f.runtime.SourceClusterID)
 	if err != nil {
