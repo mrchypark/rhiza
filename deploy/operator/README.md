@@ -33,14 +33,28 @@ selected by `--namespace`. The Deployment supplies that flag from
 `POD_NAMESPACE`; if it is omitted, the command reads the mounted service
 account namespace. `--poll-interval` defaults to `10s` and must be positive.
 
-The manual terminal-attestation schema is installed separately with
-`manual-recovery-attestation-crd.yaml`; its fencer read Role and the unbound
-approver Role are in `fencing/manual-attestation-rbac.yaml`. Bind the approver
-Role only to the independently authenticated incident-admin principal for the
-installation. Do not bind it to the operator, fencer, application, or workload
-service accounts. Installing these manifests alone does not enable manual
-recovery: use this path only with a fencer release that issues and validates the
-typed, expiring canonical challenge described below.
+The manual terminal-attestation schema is installed separately. Set the
+installation namespace and the exact incident-admin group supplied by your
+cluster's authentication provider, then apply the schema and namespaced roles:
+
+```sh
+: "${RHIZA_OPERATOR_NAMESPACE:?set the operator/fencer namespace}"
+: "${RHIZA_INCIDENT_ADMIN_GROUP:?set the authenticated incident-admin group}"
+kubectl apply -f deploy/operator/manual-recovery-attestation-crd.yaml
+kubectl -n "$RHIZA_OPERATOR_NAMESPACE" apply -f deploy/operator/fencing/manual-attestation-rbac.yaml
+kubectl -n "$RHIZA_OPERATOR_NAMESPACE" create rolebinding rhiza-manual-recovery-approver \
+  --role=rhiza-manual-recovery-approver \
+  --group="$RHIZA_INCIDENT_ADMIN_GROUP"
+```
+
+The RoleBinding command intentionally takes an authentication-provider group
+instead of guessing a person or group name. Bind the approver Role only to the
+independently authenticated incident-admin group for this installation. Do not
+bind it to the operator, fencer, application, or workload service accounts.
+The reader RoleBinding grants the fencer `get` only. Installing these manifests
+alone does not enable manual recovery: use this path only with a fencer release
+that issues and validates the typed, expiring canonical challenge described
+below.
 
 Post-fence standalone learner cleanup uses `--delete-namespaces`, defaulted from
 `RHIZA_OPERATOR_DELETE_NAMESPACES`. Empty means the actual operator Pod namespace

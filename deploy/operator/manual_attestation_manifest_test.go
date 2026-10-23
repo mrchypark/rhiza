@@ -80,6 +80,10 @@ func TestManualRecoveryAttestationRBACSeparatesCreationFromReading(t *testing.T)
 		metadata, _ := doc["metadata"].(map[string]any)
 		name, _ := metadata["name"].(string)
 		if doc["kind"] == "Role" {
+			metadata, _ := doc["metadata"].(map[string]any)
+			if _, namespaced := metadata["namespace"]; namespaced {
+				t.Fatalf("Role %q hardcodes a namespace; install must use the selected operator namespace", metadata["name"])
+			}
 			rules, _ := doc["rules"].([]any)
 			for _, rawRule := range rules {
 				rule, _ := rawRule.(map[string]any)
@@ -95,6 +99,10 @@ func TestManualRecoveryAttestationRBACSeparatesCreationFromReading(t *testing.T)
 			}
 		}
 		if doc["kind"] == "RoleBinding" {
+			metadata, _ := doc["metadata"].(map[string]any)
+			if _, namespaced := metadata["namespace"]; namespaced {
+				t.Fatalf("RoleBinding %q hardcodes a namespace; install must use the selected operator namespace", metadata["name"])
+			}
 			bindings[name] = doc
 		}
 	}
@@ -119,12 +127,29 @@ func TestManualRecoveryAttestationRBACSeparatesCreationFromReading(t *testing.T)
 		t.Fatalf("fencer reader subjects=%d, want only rhiza-fencer", len(subjects))
 	}
 	subject, _ := subjects[0].(map[string]any)
-	if subject["kind"] != "ServiceAccount" || subject["name"] != "rhiza-fencer" || subject["namespace"] != "rhiza" {
+	if subject["kind"] != "ServiceAccount" || subject["name"] != "rhiza-fencer" || subject["namespace"] != nil {
 		t.Fatalf("unexpected fencer reader subject: %#v", subject)
 	}
 	roleRef, _ := binding["roleRef"].(map[string]any)
 	if roleRef["name"] != "rhiza-fencer-manual-attestation-reader" {
 		t.Fatalf("fencer RoleBinding references %v", roleRef["name"])
+	}
+}
+
+func TestManualAttestationInstallInstructionsAreNamespaceScopedAndExplicit(t *testing.T) {
+	data, err := os.ReadFile("README.md")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, required := range []string{
+		"kubectl apply -f deploy/operator/manual-recovery-attestation-crd.yaml",
+		"kubectl -n \"$RHIZA_OPERATOR_NAMESPACE\" apply -f deploy/operator/fencing/manual-attestation-rbac.yaml",
+		"kubectl -n \"$RHIZA_OPERATOR_NAMESPACE\" create rolebinding rhiza-manual-recovery-approver",
+		"--group=\"$RHIZA_INCIDENT_ADMIN_GROUP\"",
+	} {
+		if !strings.Contains(string(data), required) {
+			t.Errorf("manual-attestation install instructions are missing %q", required)
+		}
 	}
 }
 
