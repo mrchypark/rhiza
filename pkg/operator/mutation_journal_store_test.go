@@ -80,7 +80,11 @@ func (f *mutationStoreFixture) serve(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if r.Method == http.MethodGet && r.URL.Path == "/apis/apps/v1/namespaces/test/statefulsets/rhiza" && f.authStatefulSet != nil {
-		_ = json.NewEncoder(w).Encode(f.authStatefulSet)
+		if current := f.objects[r.URL.Path]; current != nil {
+			_ = json.NewEncoder(w).Encode(current)
+		} else {
+			_ = json.NewEncoder(w).Encode(f.authStatefulSet)
+		}
 		return
 	}
 	current := f.objects[r.URL.Path]
