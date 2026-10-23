@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net/http"
 	"net/http/httptest"
 	"path"
 	"strconv"
@@ -159,6 +160,8 @@ func runManualTerminalFrozenForkRegistration(t *testing.T, durability string, al
 
 	server := httptest.NewTLSServer(f.e.Handler())
 	t.Cleanup(server.Close)
+	f.e.ControllerServiceAccount = "default"
+	assertFrozenSourcePreflightRejectsWrongController(t, ctx, f.e, resourceName(&resource), str(resource.Metadata["uid"]))
 	client := &FencingClient{URL: server.URL, TokenFile: f.e.Kube.TokenFile, Client: server.Client()}
 	sts, err := f.e.archiveForkStatefulSet(ctx, f.runtime.StatefulSetUID)
 	if err != nil {
@@ -345,6 +348,41 @@ func runManualTerminalFrozenForkRegistration(t *testing.T, durability string, al
 	if err != nil || claim.EvidenceKind != ManualTerminalEvidenceKind || claim.ManualRecoveryChallengeDigest != approved.ManualRecoveryChallengeDigest ||
 		claim.ManualTerminalAttestationDigest != approved.ManualTerminalAttestationDigest {
 		t.Fatalf("canonical successor claim omitted manual terminal evidence: claim=%+v err=%v", claim, err)
+	}
+}
+
+func assertFrozenSourcePreflightRejectsWrongController(t *testing.T, ctx context.Context, executor *FencingExecutor, recoveryName, recoveryUID string) {
+	t.Helper()
+	api := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost || r.URL.Path != "/apis/authentication.k8s.io/v1/tokenreviews" {
+			t.Errorf("unauthorized preflight made unexpected Kubernetes request %s %s", r.Method, r.URL.Path)
+			http.NotFound(w, r)
+			return
+		}
+		var review object
+		if err := json.NewDecoder(r.Body).Decode(&review); err != nil {
+			t.Errorf("decode TokenReview: %v", err)
+			http.Error(w, "invalid TokenReview", http.StatusBadRequest)
+			return
+		}
+		if got := list(nested(review, "spec", "audiences")); len(got) != 1 || str(got[0]) != "rhiza-fencer" {
+			t.Errorf("TokenReview audiences=%v, want only rhiza-fencer", got)
+		}
+		_ = json.NewEncoder(w).Encode(object{"status": object{
+			"authenticated": true,
+			"audiences":     []string{"rhiza-fencer"},
+			"user":          object{"username": "system:serviceaccount:test:untrusted"},
+		}})
+	}))
+	t.Cleanup(api.Close)
+	unauthorizedExecutor := *executor
+	unauthorizedExecutor.Kube = &Kubernetes{BaseURL: api.URL, Namespace: executor.Kube.Namespace,
+		TokenFile: executor.Kube.TokenFile, Client: api.Client()}
+	server := httptest.NewTLSServer(unauthorizedExecutor.Handler())
+	t.Cleanup(server.Close)
+	client := &FencingClient{URL: server.URL, TokenFile: executor.Kube.TokenFile, Client: server.Client()}
+	if _, err := client.FrozenSourcePreflight(ctx, FrozenSourcePreflightRequest{RecoveryName: recoveryName, RecoveryUID: recoveryUID}); err == nil || !strings.Contains(err.Error(), "HTTP 403") {
+		t.Fatalf("preflight accepted a non-controller TokenReview identity: %v", err)
 	}
 }
 

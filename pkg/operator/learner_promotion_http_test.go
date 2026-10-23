@@ -139,6 +139,13 @@ func TestAuthenticatedLearnerPromotionRetriesExactCanonicalCompletion(t *testing
 	status["name"], status["containerID"], status["image"], status["imageID"] = "rhiza", containerID, replacementContainer["image"], imageID
 	status["ready"], status["restartCount"] = true, float64(0)
 	status["state"] = object{"running": object{"startedAt": "2026-10-23T17:00:00Z"}}
+	nodeName := str(nested(replacement, "spec", "nodeName"))
+	node := asObject(f.api.objects["/api/v1/nodes/"+nodeName])
+	if node == nil || nodeName == "" {
+		f.api.mu.Unlock()
+		t.Fatal("replacement Pod node fixture is missing")
+	}
+	node["status"] = object{"addresses": []any{object{"type": "InternalIP", "address": "127.0.0.1"}}}
 	f.api.objects[f.e.controller().corePath("pods", physicalPod)] = replacement
 	f.api.authPod, f.api.authPodName, f.api.authPodUID = replacement, physicalPod, replacementUID
 	f.api.mu.Unlock()
