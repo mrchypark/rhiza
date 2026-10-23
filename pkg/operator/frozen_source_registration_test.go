@@ -157,7 +157,7 @@ func runManualTerminalFrozenForkRegistration(t *testing.T, durability string, al
 	}
 	persistRecovery()
 
-	server := httptest.NewServer(f.e.Handler())
+	server := httptest.NewTLSServer(f.e.Handler())
 	t.Cleanup(server.Close)
 	client := &FencingClient{URL: server.URL, TokenFile: f.e.Kube.TokenFile, Client: server.Client()}
 	sts, err := f.e.archiveForkStatefulSet(ctx, f.runtime.StatefulSetUID)
