@@ -11,6 +11,7 @@ import (
 	"strconv"
 	"strings"
 	"testing"
+	"time"
 
 	"cloud.google.com/go/storage"
 	internalobjstore "github.com/mrchypark/rhiza/internal/objstore"
@@ -26,9 +27,257 @@ type frozenRegistrarTrackingBucket struct {
 	objstore.Bucket
 	sourcePrefix string
 	writes       []string
+	failGetName  string
+	failGetCount int
 }
 
-func configureManualFrozenForkCohort(t *testing.T, f archiveGenesisFixture, members []quepaxa.Member) []FenceTarget {
+func TestManualTerminalFrozenForkRegistersWithoutIndependentV2(t *testing.T) {
+	for _, tc := range []struct {
+		name       string
+		durability string
+		allowLoss  bool
+	}{
+		{name: "async requires explicit data-loss consent", durability: "async", allowLoss: true},
+		{name: "before-ack needs no data-loss claim", durability: "before-ack", allowLoss: false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			runManualTerminalFrozenForkRegistration(t, tc.durability, tc.allowLoss)
+		})
+	}
+}
+
+func runManualTerminalFrozenForkRegistration(t *testing.T, durability string, allowLoss bool) {
+	f := newArchiveGenesisFixture(t)
+	ctx := t.Context()
+	now := time.Date(2026, 10, 24, 0, 0, 0, 0, time.UTC)
+	f.e.manualRecoveryNow = func() time.Time { return now }
+	const sourceID, sourcePrefix, fenceOperation = "source", "root/source", "manual-terminal-fence"
+	sourceMembers := []quepaxa.Member{forkTestMember(t, f.id.NodeID), forkTestMember(t, "manual-terminal-voter-1"), forkTestMember(t, "manual-terminal-voter-2")}
+	targets := configureManualFrozenForkCohort(t, f, sourceMembers, durability)
+	commitArchiveGenesisFixture(t, f)
+	if err := f.e.ArchiveBucket.Upload(ctx, path.Join(sourcePrefix, "voters/membership.json"), bytes.NewReader(jsonBytes(recovery.NewMembershipRecord(sourceID, sourceMembers, durability))), objstore.WithIfNotExists()); err != nil {
+		t.Fatal(err)
+	}
+
+	wal, err := qlog.Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = wal.Close() })
+	core, err := quepaxa.New(quepaxa.Config{NodeID: sourceMembers[0].ID,
+		Cluster: quepaxa.Cluster{ConfigID: recovery.ArchiveConfigID, Members: sourceMembers}, WAL: wal, Transport: testTransport{}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	decision, err := types.EncodeSQLBatch([]types.SQLCommand{{RequestID: "manual-terminal-source-data", SQL: "CREATE TABLE manual_terminal (value TEXT)"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := core.Propose(ctx, decision); err != nil {
+		t.Fatal(err)
+	}
+	manager := recovery.NewManager(f.e.ArchiveBucket, sourcePrefix, recovery.ArchiveConfigID)
+	if err := manager.SyncThrough(ctx, core, core.Tip()); err != nil {
+		manager.Close()
+		t.Fatal(err)
+	}
+	manager.Close()
+
+	f.e.CollectRuntimeEvidence = func(context.Context, fencing.RuntimeBinding, fencing.StopRequest) ([]byte, error) {
+		return []byte("manual-terminal-stop"), nil
+	}
+	f.e.VerifyRuntimeEvidence = func(_ context.Context, _ fencing.RuntimeBinding, _ fencing.StopRequest, receipt []byte) error {
+		if string(receipt) != "manual-terminal-stop" {
+			return errors.New("unexpected test runtime evidence")
+		}
+		return nil
+	}
+	fenceRequest := FenceRequest{LogicalID: "manual-terminal", BindingUID: f.runtime.BindingUID, Namespace: "test", StatefulSet: "rhiza",
+		StatefulSetUID: f.runtime.StatefulSetUID, SourceClusterID: sourceID, OperationID: fenceOperation, Scope: ScopeGeneration, Targets: targets}
+	fenceName := "fence-" + hashJSON([]string{f.runtime.BindingUID, fenceOperation})[:40]
+	fence := &fenceResource{APIVersion: "rhiza.mrchypark.dev/v1alpha1", Kind: "RhizaFence",
+		Metadata: object{"name": fenceName, "namespace": "test", "uid": "manual-terminal-fence-uid", "resourceVersion": "1"}, Spec: fenceRequest}
+	fenceCollection := "/apis/rhiza.mrchypark.dev/v1alpha1/namespaces/test/rhizafences"
+	if err := f.e.reconcileFence(ctx, fenceCollection, fence); err != nil {
+		t.Fatalf("close source CONTROL generation: %v", err)
+	}
+	if fence.Status.Proof == nil || fence.Status.Proof.IndependentV2 == nil {
+		t.Fatal("fixture did not create the independent proof that will be removed for this test")
+	}
+	// Model an unavailable/pruned terminal receipt while retaining the canonical
+	// fence request and the closed CONTROL run/stop history.
+	fence.Status.Proof = nil
+	fenceData := jsonBytes(fence)
+	var fenceObject object
+	if err := json.Unmarshal(fenceData, &fenceObject); err != nil {
+		t.Fatal(err)
+	}
+	f.f.mu.Lock()
+	f.f.objects[fenceCollection+"/"+fenceName] = fenceObject
+	f.f.objects[fenceCollection] = object{"items": []any{fenceObject}}
+	f.f.mu.Unlock()
+
+	sourceScope := fencing.ArchiveScope{Provider: "gcs", Bucket: "archive", Prefix: sourcePrefix, ClusterID: sourceID}
+	scopeHash, err := sourceScope.Hash()
+	if err != nil {
+		t.Fatal(err)
+	}
+	targetID, err := recovery.FrozenTargetID(recovery.FrozenSourceIdentity{ScopeHash: scopeHash, ClusterID: sourceID, StatefulSetUID: f.runtime.StatefulSetUID})
+	if err != nil {
+		t.Fatal(err)
+	}
+	tracked := &frozenRegistrarTrackingBucket{Bucket: f.e.ArchiveBucket, sourcePrefix: sourcePrefix}
+	f.e.ArchiveBucket = tracked
+	var attrsReader internalobjstore.BucketAttrsReader = tracked
+	environment, err := captureFrozenBucketEnvironment(ctx, attrsReader, "archive", sourcePrefix)
+	if err != nil {
+		t.Fatal(err)
+	}
+	recoveryOperation := "manual-recovery-uid:" + fenceOperation
+	resourceSpec := Spec{StatefulSet: "rhiza", SourceClusterID: sourceID, RecoveryID: fenceOperation, Durability: durability, AllowDataLoss: allowLoss}
+	resource := Resource{APIVersion: "rhiza.mrchypark.dev/v1alpha1", Kind: "RhizaRecovery",
+		Metadata: object{"name": "manual-terminal-recovery", "uid": "manual-recovery-uid", "namespace": "test"}, Spec: resourceSpec,
+		Status: Status{RecoveryID: fenceOperation, SpecHash: immutableSpecHash(resourceSpec), Source: sourceID, SourceDurability: durability,
+			StatefulSetUID: f.runtime.StatefulSetUID, Target: targetID, TargetBaseKind: "fork", RecoveryMode: RecoveryModeFrozenSource,
+			Stage: "FrozenForked", FrozenBucketEnvironment: &environment}}
+	persistRecovery := func() {
+		data := jsonBytes(resource)
+		var encoded object
+		if err := json.Unmarshal(data, &encoded); err != nil {
+			t.Fatal(err)
+		}
+		f.f.mu.Lock()
+		f.f.objects[f.e.controller().resourcePath(resourceName(&resource))] = encoded
+		f.f.mu.Unlock()
+	}
+	persistRecovery()
+
+	preflightRequest := FrozenSourcePreflightRequest{RecoveryName: resourceName(&resource), RecoveryUID: str(resource.Metadata["uid"])}
+	challengeResponse, err := f.e.frozenSourcePreflight(ctx, preflightRequest)
+	if err != nil || challengeResponse.ClosureReady || challengeResponse.ManualRecoveryChallenge == nil ||
+		!validEvidenceDigest(challengeResponse.ManualRecoveryChallengeDigest) || challengeResponse.ProofDigest != "" {
+		t.Fatalf("manual terminal challenge response=%+v err=%v", challengeResponse, err)
+	}
+	challenge := *challengeResponse.ManualRecoveryChallenge
+	attestationName, err := ManualRecoveryAttestationName(challenge.RecoveryUID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	approval := ManualRecoveryAttestationObject{
+		Namespace: challenge.RecoveryNamespace, Name: attestationName, UID: "manual-approval-object-uid", CreatedAt: challenge.IssuedAt,
+		Spec: ManualRecoveryAttestationSpec{Version: manualAttestationVersion, ChallengeDigest: challengeResponse.ManualRecoveryChallengeDigest,
+			ManualRecoveryBinding: challenge.ManualRecoveryBinding,
+			Assertions: ManualRecoveryAssertions{AllHistoricalRunsTerminated: true, RecreationBlocked: true,
+				OldPeerAndClientWriteAccessBlocked: true, OldArchiveWriterAccessRevoked: true, StorageQuiesced: true},
+			Attester: "incident-review", EvidenceRefs: []string{"runbook://manual-terminal"}},
+	}
+	f.f.mu.Lock()
+	f.f.objects[manualRecoveryAttestationPath(approval.Namespace, approval.Name)] = manualAttestationAPIObject(approval)
+	f.f.mu.Unlock()
+
+	preflightRequest.ManualRecoveryChallengeDigest = challengeResponse.ManualRecoveryChallengeDigest
+	approved, err := f.e.frozenSourcePreflight(ctx, preflightRequest)
+	if err != nil || !approved.ClosureReady || approved.EvidenceKind != ManualTerminalEvidenceKind || approved.ProofDigest != "" ||
+		approved.ManualRecoveryChallengeDigest != challengeResponse.ManualRecoveryChallengeDigest || !validEvidenceDigest(approved.ManualTerminalAttestationDigest) {
+		t.Fatalf("manual terminal approval response=%+v err=%v", approved, err)
+	}
+	resource.Status.ManualRecoveryChallenge = &challenge
+	resource.Status.ManualRecoveryChallengeDigest = approved.ManualRecoveryChallengeDigest
+	resource.Status.ManualAttestationDigest = approved.ManualTerminalAttestationDigest
+	persistRecovery()
+
+	targetMembers := []quepaxa.Member{forkTestMember(t, string(sourceMembers[0].ID)), forkTestMember(t, string(sourceMembers[1].ID)), forkTestMember(t, string(sourceMembers[2].ID))}
+	targetMembership := recovery.NewMembershipRecord(targetID, targetMembers, durability)
+	options := recovery.FrozenForkOptions{
+		ForkOptions: recovery.ForkOptions{SourcePrefix: sourcePrefix, TargetPrefix: path.Join("root", targetID),
+			SourceBootstrap: quepaxa.Cluster{ConfigID: recovery.ArchiveConfigID, Members: sourceMembers},
+			TargetMembers:   targetMembers, TargetMembership: targetMembership, OperationID: recoveryOperation},
+		SourceIdentity: recovery.FrozenSourceIdentity{ScopeHash: scopeHash, ClusterID: sourceID, StatefulSetUID: f.runtime.StatefulSetUID},
+		EvidenceKind:   ManualTerminalEvidenceKind, ManualAttestationDigest: approved.ManualTerminalAttestationDigest,
+		ClosedRootDigest: approved.ClosedRootDigest, BucketEnvironment: environment,
+		VerifyEnvironment: func(ctx context.Context, expected recovery.FrozenBucketEnvironment) error {
+			return f.e.verifyFrozenBucketEnvironment(ctx, "archive", sourcePrefix, expected)
+		},
+	}
+	fork, err := recovery.ForkFrozenSource(ctx, tracked, options)
+	if err != nil {
+		t.Fatalf("manual frozen-source fork failed without an IndependentV2 proof: %v", err)
+	}
+	if err := tracked.Upload(ctx, path.Join("root", targetID, "voters/membership.json"), bytes.NewReader(jsonBytes(targetMembership)), objstore.WithIfNotExists()); err != nil {
+		t.Fatal(err)
+	}
+	lineage := archiveForkLineageRecord{Version: 1, OperationID: recoveryOperation, Source: sourceID, SourceDurability: durability,
+		SourceMembership: sourceFingerprint(sourceID, durability, sourceMembers, sourcePrefix), TargetMembership: targetMembership, Fork: fork.ForkResult}
+	if err := tracked.Upload(ctx, path.Join("root", targetID, "recovery/generation.json"), bytes.NewReader(jsonBytes(lineage)), objstore.WithIfNotExists()); err != nil {
+		t.Fatal(err)
+	}
+	request := ArchiveForkGenesisRequest{RecoveryName: resourceName(&resource), StatefulSetUID: f.runtime.StatefulSetUID,
+		TargetClusterID: targetID, OperationID: recoveryOperation, SourceFenceOperationID: fenceOperation,
+		RecoveryMode: RecoveryModeFrozenSource, BucketEnvironment: &environment, EvidenceKind: ManualTerminalEvidenceKind,
+		ManualRecoveryChallengeDigest: approved.ManualRecoveryChallengeDigest, ManualTerminalAttestationDigest: approved.ManualTerminalAttestationDigest}
+	tracked.failGetName = recovery.GenerationAnchorKey(path.Join("root", targetID))
+	tracked.failGetCount = 1
+	if err := f.e.RegisterArchiveForkGenesis(ctx, request); err == nil || !strings.Contains(err.Error(), "injected post-claim") {
+		t.Fatalf("expected an injected artifact failure after the successor claim, got %v", err)
+	}
+	claim, err := f.e.AuthorityState.readSourceSuccessorClaim(ctx, sourceScope, f.runtime.StatefulSetUID)
+	if err != nil || claim.EvidenceKind != ManualTerminalEvidenceKind || claim.ManualRecoveryChallengeDigest != approved.ManualRecoveryChallengeDigest ||
+		claim.ManualTerminalAttestationDigest != approved.ManualTerminalAttestationDigest {
+		t.Fatalf("post-claim failure did not retain exact manual evidence: claim=%+v err=%v", claim, err)
+	}
+	closedRoot, _, err := f.e.AuthorityState.ReadRoot(ctx, f.runtime.StatefulSetUID, sourceID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	changedRoot := closedRoot
+	changedRoot.Ledger.ClosedHash += "-changed"
+	if matches, err := f.e.exactManualTerminalSuccessorClaim(ctx, request, sourceScope, changedRoot, *fence, "manual-recovery-uid"); err != nil || matches {
+		t.Fatalf("post-claim expiry replay matched a changed canonical root: matches=%t err=%v", matches, err)
+	}
+	now = challenge.ExpiresAt.Add(time.Second)
+	wrongApproval := request
+	wrongApproval.ManualTerminalAttestationDigest = strings.Repeat("0", 64)
+	if err := f.e.RegisterArchiveForkGenesis(ctx, wrongApproval); err == nil {
+		t.Fatal("expired manual approval accepted a different attestation digest")
+	}
+	wrongRecovery := request
+	wrongRecovery.OperationID = "different-recovery-uid:" + fenceOperation
+	if err := f.e.RegisterArchiveForkGenesis(ctx, wrongRecovery); err == nil {
+		t.Fatal("expired manual approval accepted a different Recovery UID")
+	}
+	resource.Spec.AllowDataLoss = !allowLoss
+	persistRecovery()
+	if err := f.e.RegisterArchiveForkGenesis(ctx, request); err == nil {
+		t.Fatal("expired manual approval accepted a changed Recovery spec")
+	}
+	resource.Spec.AllowDataLoss = allowLoss
+	persistRecovery()
+	if err := f.e.RegisterArchiveForkGenesis(ctx, request); err != nil {
+		t.Fatalf("exact claimed manual registration did not resume after challenge expiry: %v", err)
+	}
+	targetRoot, err := f.e.read(ctx, f.runtime.StatefulSetUID, targetID)
+	if err != nil || targetRoot.Ledger.ArchiveGenesisState != fencing.ArchiveGenesisCommitted || targetRoot.Ledger.ArchiveGenesisRef == nil || targetRoot.Ledger.ArchiveGenesisRef.Fork == nil ||
+		targetRoot.Ledger.ArchiveGenesisRef.Fork.IntentDigest == "" {
+		t.Fatalf("manual registration did not commit the verified fork reference: root=%+v err=%v", targetRoot.Ledger, err)
+	}
+	intentData, err := readBoundedArchiveObject(ctx, tracked, path.Join("root", targetID, "fork/intent.json"), 64<<10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var intent archiveForkIntentRecord
+	if err := decodeCanonicalArchiveJSON(intentData, &intent); err != nil || intent.FrozenSource == nil ||
+		intent.FrozenSource.EvidenceKind != ManualTerminalEvidenceKind || intent.FrozenSource.FenceProofDigest != "" ||
+		intent.FrozenSource.ManualAttestationDigest != approved.ManualTerminalAttestationDigest {
+		t.Fatalf("fork intent did not persist the distinct manual terminal binding: intent=%+v err=%v", intent, err)
+	}
+	claim, err = f.e.AuthorityState.readSourceSuccessorClaim(ctx, sourceScope, f.runtime.StatefulSetUID)
+	if err != nil || claim.EvidenceKind != ManualTerminalEvidenceKind || claim.ManualRecoveryChallengeDigest != approved.ManualRecoveryChallengeDigest ||
+		claim.ManualTerminalAttestationDigest != approved.ManualTerminalAttestationDigest {
+		t.Fatalf("canonical successor claim omitted manual terminal evidence: claim=%+v err=%v", claim, err)
+	}
+}
+
+func configureManualFrozenForkCohort(t *testing.T, f archiveGenesisFixture, members []quepaxa.Member, durability string) []FenceTarget {
 	t.Helper()
 	if len(members) < 3 || string(members[0].ID) != f.id.NodeID {
 		t.Fatal("manual fork fixture must include the enrolled source runtime and at least two additional voters")
@@ -40,7 +289,7 @@ func configureManualFrozenForkCohort(t *testing.T, f archiveGenesisFixture, memb
 		object{"name": "RHIZA_OBJSTORE_PROVIDER", "value": "gcs"},
 		object{"name": "RHIZA_OBJSTORE_BUCKET", "value": "archive"},
 		object{"name": "RHIZA_OBJSTORE_PREFIX", "value": "root"},
-		object{"name": "RHIZA_OBJSTORE_DURABILITY", "value": "async"},
+		object{"name": "RHIZA_OBJSTORE_DURABILITY", "value": durability},
 		object{"name": "RHIZA_ENABLE_RECONFIGURATION", "value": "true"},
 		object{"name": "RHIZA_CLUSTER_MEMBERS", "value": string(jsonBytes(members))},
 	}
@@ -130,6 +379,14 @@ func (b *frozenRegistrarTrackingBucket) BucketAttrs(context.Context) (*storage.B
 	return &storage.BucketAttrs{Name: "archive", MetaGeneration: 1}, nil
 }
 
+func (b *frozenRegistrarTrackingBucket) Get(ctx context.Context, name string) (io.ReadCloser, error) {
+	if name == b.failGetName && b.failGetCount > 0 {
+		b.failGetCount--
+		return nil, errors.New("injected post-claim artifact failure")
+	}
+	return b.Bucket.Get(ctx, name)
+}
+
 func (b *frozenRegistrarTrackingBucket) Upload(ctx context.Context, name string, body io.Reader, options ...objstore.ObjectUploadOption) error {
 	if strings.HasPrefix(name, b.sourcePrefix+"/") {
 		b.writes = append(b.writes, "upload:"+name)
@@ -169,7 +426,7 @@ func TestFrozenArchiveForkRegistrationCommitsAndRetriesWithoutSourceWrites(t *te
 	}
 	sourceMembers := []quepaxa.Member{forkTestMember(t, f.id.NodeID), forkTestMember(t, "frozen-source-voter-1"), forkTestMember(t, "frozen-source-voter-2")}
 	targetMembers := []quepaxa.Member{forkTestMember(t, "frozen-target-voter")}
-	targets := configureManualFrozenForkCohort(t, f, sourceMembers)
+	targets := configureManualFrozenForkCohort(t, f, sourceMembers, "async")
 	commitArchiveGenesisFixture(t, f)
 	wal, err := qlog.Open(t.TempDir())
 	if err != nil {

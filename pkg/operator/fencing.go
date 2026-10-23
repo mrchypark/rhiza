@@ -447,6 +447,14 @@ func (fc *FencingClient) RegisterArchiveForkGenesis(ctx context.Context, request
 	if request.StatefulSetUID == "" || request.TargetClusterID == "" || request.OperationID == "" || request.SourceFenceOperationID == "" {
 		return fmt.Errorf("fencing: archive fork genesis identifiers are required")
 	}
+	if request.EvidenceKind == ManualTerminalEvidenceKind {
+		if request.RecoveryMode != RecoveryModeFrozenSource || request.ManualMembershipBindingDigest != "" ||
+			!validEvidenceDigest(request.ManualRecoveryChallengeDigest) || !validEvidenceDigest(request.ManualTerminalAttestationDigest) {
+			return fmt.Errorf("fencing: manual terminal archive fork bindings are incomplete")
+		}
+	} else if request.EvidenceKind != "" || request.ManualRecoveryChallengeDigest != "" || request.ManualTerminalAttestationDigest != "" {
+		return fmt.Errorf("fencing: archive fork carries an unsupported terminal evidence binding")
+	}
 	body, err := json.Marshal(request)
 	if err != nil {
 		return fmt.Errorf("fencing: marshal archive fork genesis request: %w", err)

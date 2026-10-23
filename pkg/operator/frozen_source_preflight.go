@@ -615,17 +615,23 @@ type bootstrapGenesisRunBinding struct {
 }
 
 type FrozenSourcePreflightRequest struct {
-	RecoveryName string `json:"recoveryName"`
-	RecoveryUID  string `json:"recoveryUID"`
+	RecoveryName                  string `json:"recoveryName"`
+	RecoveryUID                   string `json:"recoveryUID"`
+	TargetMembershipHash          string `json:"targetMembershipHash,omitempty"`
+	ManualRecoveryChallengeDigest string `json:"manualRecoveryChallengeDigest,omitempty"`
 }
 
 type FrozenSourcePreflightResponse struct {
-	Identity                      recovery.FrozenSourceIdentity `json:"identity"`
-	ClosureReady                  bool                          `json:"closureReady"`
-	ProofDigest                   string                        `json:"proofDigest,omitempty"`
-	ClosedRootDigest              string                        `json:"closedRootDigest,omitempty"`
-	EmptyGenesisEligible          bool                          `json:"emptyGenesisEligible,omitempty"`
-	ManualMembershipBindingDigest string                        `json:"manualMembershipBindingDigest,omitempty"`
+	Identity                        recovery.FrozenSourceIdentity `json:"identity"`
+	ClosureReady                    bool                          `json:"closureReady"`
+	EvidenceKind                    string                        `json:"evidenceKind,omitempty"`
+	ProofDigest                     string                        `json:"proofDigest,omitempty"`
+	ClosedRootDigest                string                        `json:"closedRootDigest,omitempty"`
+	EmptyGenesisEligible            bool                          `json:"emptyGenesisEligible,omitempty"`
+	ManualMembershipBindingDigest   string                        `json:"manualMembershipBindingDigest,omitempty"`
+	ManualRecoveryChallenge         *ManualRecoveryChallenge      `json:"manualRecoveryChallenge,omitempty"`
+	ManualRecoveryChallengeDigest   string                        `json:"manualRecoveryChallengeDigest,omitempty"`
+	ManualTerminalAttestationDigest string                        `json:"manualTerminalAttestationDigest,omitempty"`
 }
 
 type FrozenSourcePreflighter interface {
@@ -638,6 +644,10 @@ func (fc *FencingClient) FrozenSourcePreflight(ctx context.Context, request Froz
 	}
 	if request.RecoveryName == "" || request.RecoveryUID == "" {
 		return FrozenSourcePreflightResponse{}, fmt.Errorf("fencing: frozen source recovery identity is required")
+	}
+	if (request.TargetMembershipHash != "" && !validEvidenceDigest(request.TargetMembershipHash)) ||
+		(request.ManualRecoveryChallengeDigest != "" && !validEvidenceDigest(request.ManualRecoveryChallengeDigest)) {
+		return FrozenSourcePreflightResponse{}, fmt.Errorf("fencing: invalid manual recovery preflight binding")
 	}
 	body, err := json.Marshal(request)
 	if err != nil {
@@ -664,7 +674,27 @@ func (fc *FencingClient) FrozenSourcePreflight(ctx context.Context, request Froz
 		return FrozenSourcePreflightResponse{}, fmt.Errorf("fencing: frozen source preflight request failed")
 	}
 	defer resp.Body.Close()
-	if resp.StatusCode == http.StatusAccepted || resp.StatusCode == http.StatusServiceUnavailable {
+	if resp.StatusCode == http.StatusAccepted {
+		responseBody, readErr := io.ReadAll(io.LimitReader(resp.Body, maxResponseBytes+1))
+		if readErr != nil || len(responseBody) > maxResponseBytes {
+			return FrozenSourcePreflightResponse{}, errors.Join(readErr, fmt.Errorf("fencing: invalid manual challenge response size"))
+		}
+		if len(responseBody) == 0 {
+			return FrozenSourcePreflightResponse{}, ErrFencePending
+		}
+		result, decodeErr := decodeFrozenSourcePreflightResponse(responseBody)
+		if decodeErr != nil || result.ManualRecoveryChallenge == nil || !validEvidenceDigest(result.ManualRecoveryChallengeDigest) {
+			return FrozenSourcePreflightResponse{}, errors.Join(decodeErr, fmt.Errorf("fencing: invalid manual recovery challenge response"))
+		}
+		challengeDigest, digestErr := ManualRecoveryChallengeDigest(*result.ManualRecoveryChallenge)
+		if digestErr != nil || challengeDigest != result.ManualRecoveryChallengeDigest ||
+			result.ManualRecoveryChallenge.RecoveryName != request.RecoveryName || result.ManualRecoveryChallenge.RecoveryUID != request.RecoveryUID ||
+			(request.TargetMembershipHash != "" && result.ManualRecoveryChallenge.TargetMembershipHash != request.TargetMembershipHash) {
+			return FrozenSourcePreflightResponse{}, errors.Join(digestErr, fmt.Errorf("fencing: inconsistent manual recovery challenge binding"))
+		}
+		return result, nil
+	}
+	if resp.StatusCode == http.StatusServiceUnavailable {
 		return FrozenSourcePreflightResponse{}, ErrFencePending
 	}
 	if resp.StatusCode != http.StatusOK {
@@ -674,16 +704,28 @@ func (fc *FencingClient) FrozenSourcePreflight(ctx context.Context, request Froz
 	if err != nil || len(responseBody) > maxResponseBytes {
 		return FrozenSourcePreflightResponse{}, errors.Join(err, fmt.Errorf("fencing: invalid frozen source preflight response size"))
 	}
+	result, err := decodeFrozenSourcePreflightResponse(responseBody)
+	if err != nil {
+		return FrozenSourcePreflightResponse{}, err
+	}
+	manualTerminal := result.EvidenceKind == ManualTerminalEvidenceKind
+	if _, err := recovery.FrozenTargetID(result.Identity); err != nil ||
+		(result.ClosureReady && ((!manualTerminal && !validEvidenceDigest(result.ProofDigest)) || (manualTerminal && !validEvidenceDigest(result.ManualTerminalAttestationDigest)) || !validEvidenceDigest(result.ClosedRootDigest))) ||
+		(!result.ClosureReady && (result.ProofDigest != "" || result.ClosedRootDigest != "")) ||
+		(result.ManualRecoveryChallenge == nil && result.ManualRecoveryChallengeDigest != "" && !validEvidenceDigest(result.ManualRecoveryChallengeDigest)) ||
+		(result.ManualTerminalAttestationDigest != "" && !validEvidenceDigest(result.ManualTerminalAttestationDigest)) ||
+		(result.EvidenceKind != "" && !manualTerminal) {
+		return FrozenSourcePreflightResponse{}, fmt.Errorf("fencing: inconsistent frozen source preflight response")
+	}
+	return result, nil
+}
+
+func decodeFrozenSourcePreflightResponse(responseBody []byte) (FrozenSourcePreflightResponse, error) {
 	var result FrozenSourcePreflightResponse
 	decoder := json.NewDecoder(bytes.NewReader(responseBody))
 	decoder.DisallowUnknownFields()
 	if err := decoder.Decode(&result); err != nil || decoder.Decode(new(any)) != io.EOF {
 		return FrozenSourcePreflightResponse{}, fmt.Errorf("fencing: invalid frozen source preflight response")
-	}
-	if _, err := recovery.FrozenTargetID(result.Identity); err != nil ||
-		(result.ClosureReady && (!validEvidenceDigest(result.ProofDigest) || !validEvidenceDigest(result.ClosedRootDigest))) ||
-		(!result.ClosureReady && (result.ProofDigest != "" || result.ClosedRootDigest != "")) {
-		return FrozenSourcePreflightResponse{}, fmt.Errorf("fencing: inconsistent frozen source preflight response")
 	}
 	return result, nil
 }
@@ -718,6 +760,9 @@ func (e *FencingExecutor) handleFrozenSourcePreflight(w http.ResponseWriter, r *
 		return
 	}
 	w.Header().Set("Content-Type", "application/json")
+	if result.ManualRecoveryChallenge != nil {
+		w.WriteHeader(http.StatusAccepted)
+	}
 	_ = json.NewEncoder(w).Encode(result)
 }
 
@@ -793,12 +838,15 @@ func (e *FencingExecutor) frozenSourcePreflight(ctx context.Context, request Fro
 	if err != nil {
 		return FrozenSourcePreflightResponse{}, err
 	}
-	if fence.Spec.OperationID != operationID || fence.Spec.SourceClusterID != sourceID || fence.Spec.StatefulSetUID != uid || fence.Spec.Scope != ScopeGeneration || fence.Status.Proof == nil || fence.Status.Proof.IndependentV2 == nil {
+	if fence.Spec.OperationID != operationID || fence.Spec.SourceClusterID != sourceID || fence.Spec.StatefulSetUID != uid || fence.Spec.Scope != ScopeGeneration {
 		return FrozenSourcePreflightResponse{}, fencing.ErrPending
 	}
 	requestDigest, err := requestHash(&fence.Spec)
 	if err != nil || state.Ledger.ClosedHash != requestDigest {
 		return FrozenSourcePreflightResponse{}, fmt.Errorf("fencing: source fence does not match the closed root")
+	}
+	if fence.Status.Proof == nil || fence.Status.Proof.IndependentV2 == nil {
+		return e.manualTerminalPreflight(ctx, request, persisted, sts, archiveScope, scopeHash, state, fence, result)
 	}
 	if err := validateFenceProof(fence.Spec, fence.Status.Proof); err != nil {
 		return FrozenSourcePreflightResponse{}, err
@@ -844,6 +892,64 @@ func (e *FencingExecutor) frozenSourcePreflight(ctx context.Context, request Fro
 		if err := e.validatePendingFrozenEmptyGenesis(ctx, state, archiveScope, uid, sourceID, operationID, result.ClosedRootDigest); err != nil {
 			return FrozenSourcePreflightResponse{}, err
 		}
+	}
+	return result, nil
+}
+
+func (e *FencingExecutor) manualTerminalPreflight(
+	ctx context.Context,
+	request FrozenSourcePreflightRequest,
+	persisted Resource,
+	sts object,
+	scope fencing.ArchiveScope,
+	scopeHash string,
+	state fenceLedger,
+	fence fenceResource,
+	result FrozenSourcePreflightResponse,
+) (FrozenSourcePreflightResponse, error) {
+	ctr, err := container(sts, persisted.Spec.Container)
+	if err != nil {
+		return FrozenSourcePreflightResponse{}, err
+	}
+	env, err := e.controller().environment(ctx, ctr)
+	if err != nil || noPVC(sts, ctr, env) != nil || e.archiveStoreConfigMatches(env) != nil {
+		return FrozenSourcePreflightResponse{}, errors.Join(err, fmt.Errorf("fencing: manual terminal recovery source workload is unavailable or unsafe"))
+	}
+	currentUIDs, err := e.currentInventory(ctx, persisted.Status.StatefulSetUID, nil)
+	if err != nil {
+		return FrozenSourcePreflightResponse{}, err
+	}
+	sort.Strings(currentUIDs)
+	challenge, challengeDigest, current, err := e.manualRecoveryChallengeForPreflight(ctx, persisted, env, scope, state, fence, scopeHash, currentUIDs)
+	if err != nil {
+		return FrozenSourcePreflightResponse{}, err
+	}
+	if request.ManualRecoveryChallengeDigest != "" && request.ManualRecoveryChallengeDigest != challengeDigest {
+		return FrozenSourcePreflightResponse{}, errors.Join(fencing.ErrClosed, fmt.Errorf("manual recovery challenge digest differs from canonical CONTROL"))
+	}
+	result.ManualRecoveryChallengeDigest = challengeDigest
+	recoveryUID := str(persisted.Metadata["uid"])
+	registration := ArchiveForkGenesisRequest{
+		RecoveryName: resourceName(&persisted), StatefulSetUID: persisted.Status.StatefulSetUID,
+		TargetClusterID: persisted.Status.Target, OperationID: recoveryUID + ":" + persisted.Spec.RecoveryID,
+		SourceFenceOperationID: persisted.Spec.RecoveryID, RecoveryMode: RecoveryModeFrozenSource,
+		BucketEnvironment: persisted.Status.FrozenBucketEnvironment, EvidenceKind: ManualTerminalEvidenceKind,
+		ManualRecoveryChallengeDigest: challengeDigest, ManualTerminalAttestationDigest: persisted.Status.ManualAttestationDigest,
+	}
+	approvalDigest, err := e.manualTerminalApprovalDigestForRecovery(ctx, registration, scope, state, fence, recoveryUID, challenge, challengeDigest, current)
+	if errors.Is(err, fencing.ErrPending) {
+		result.ManualRecoveryChallenge = &challenge
+		return result, nil
+	}
+	if err != nil {
+		return FrozenSourcePreflightResponse{}, err
+	}
+	result.EvidenceKind = ManualTerminalEvidenceKind
+	result.ManualTerminalAttestationDigest = approvalDigest
+	result.ClosureReady = true
+	result.ClosedRootDigest = e.ledgerHash(state)
+	if persisted.Status.TargetBaseKind == "empty" {
+		return FrozenSourcePreflightResponse{}, fmt.Errorf("fencing: manual terminal recovery is not supported for an empty archive")
 	}
 	return result, nil
 }

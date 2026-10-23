@@ -1,0 +1,96 @@
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  name: rhizamanualrecoveryattestations.rhiza.mrchypark.dev
+spec:
+  group: rhiza.mrchypark.dev
+  scope: Namespaced
+  names:
+    plural: rhizamanualrecoveryattestations
+    singular: rhizamanualrecoveryattestation
+    kind: RhizaManualRecoveryAttestation
+    shortNames: [rhmra]
+  versions:
+    - name: v1alpha1
+      served: true
+      storage: true
+      schema:
+        openAPIV3Schema:
+          type: object
+          required: [spec]
+          properties:
+            spec:
+              type: object
+              x-kubernetes-validations:
+                - rule: self == oldSelf
+                  message: manual recovery attestations are immutable
+              required:
+                - version
+                - challengeDigest
+                - recoveryNamespace
+                - recoveryName
+                - recoveryUID
+                - recoveryID
+                - operationID
+                - sourceClusterID
+                - statefulSetName
+                - statefulSetUID
+                - fenceRequestHash
+                - policyDigest
+                - rootDigest
+                - ledgerDigest
+                - cohortDigest
+                - storageScopeDigest
+                - sourceArchiveDigest
+                - targetClusterID
+                - currentPodUIDs
+                - evidenceKind
+                - assertions
+                - attester
+                - evidenceRefs
+              properties:
+                version: {type: integer, enum: [1]}
+                evidenceKind: {type: string, enum: [manual-terminal-v1]}
+                challengeDigest: {type: string, pattern: '^[a-f0-9]{64}$'}
+                recoveryNamespace: {type: string, minLength: 1, maxLength: 63}
+                recoveryName: {type: string, minLength: 1, maxLength: 253}
+                recoveryUID: {type: string, minLength: 1, maxLength: 128}
+                recoveryID: {type: string, minLength: 1, maxLength: 256}
+                operationID: {type: string, minLength: 1, maxLength: 256}
+                sourceClusterID: {type: string, minLength: 1, maxLength: 256}
+                statefulSetName: {type: string, minLength: 1, maxLength: 253}
+                statefulSetUID: {type: string, minLength: 1, maxLength: 128}
+                fenceRequestHash: {type: string, pattern: '^[a-f0-9]{64}$'}
+                policyDigest: {type: string, pattern: '^[a-f0-9]{64}$'}
+                rootDigest: {type: string, pattern: '^[a-f0-9]{64}$'}
+                ledgerDigest: {type: string, pattern: '^[a-f0-9]{64}$'}
+                cohortDigest: {type: string, pattern: '^[a-f0-9]{64}$'}
+                storageScopeDigest: {type: string, pattern: '^[a-f0-9]{64}$'}
+                sourceArchiveDigest: {type: string, pattern: '^[a-f0-9]{64}$'}
+                targetClusterID: {type: string, minLength: 1, maxLength: 256}
+                targetMembershipHash: {type: string, pattern: '^[a-f0-9]{64}$'}
+                currentPodUIDs:
+                  type: array
+                  maxItems: 64
+                  uniqueItems: true
+                  items: {type: string, minLength: 1, maxLength: 128}
+                assertions:
+                  type: object
+                  required:
+                    - allHistoricalRunsTerminated
+                    - recreationBlocked
+                    - oldPeerAndClientWriteAccessBlocked
+                    - oldArchiveWriterAccessRevoked
+                    - storageQuiesced
+                  properties:
+                    allHistoricalRunsTerminated: {type: boolean, enum: [true]}
+                    recreationBlocked: {type: boolean, enum: [true]}
+                    oldPeerAndClientWriteAccessBlocked: {type: boolean, enum: [true]}
+                    oldArchiveWriterAccessRevoked: {type: boolean, enum: [true]}
+                    storageQuiesced: {type: boolean, enum: [true]}
+                attester: {type: string, minLength: 1, maxLength: 256}
+                evidenceRefs:
+                  type: array
+                  minItems: 1
+                  maxItems: 32
+                  items: {type: string, minLength: 1, maxLength: 512}

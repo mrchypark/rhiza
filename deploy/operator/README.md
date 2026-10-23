@@ -27,11 +27,20 @@ not include operator RBAC/Deployment or a Namespace, so rendering it cannot
 silently widen permissions or select a different namespace. The Kustomize
 input preserves `OnDelete`, parallel bootstrap, and the PDB.
 
-Apply the namespace, CRD, RBAC, and Deployment in that order. The controller
+Apply the namespace, CRDs, RBAC, and Deployment in that order. The controller
 uses its service account and the Kubernetes JSON API; it polls the namespace
 selected by `--namespace`. The Deployment supplies that flag from
 `POD_NAMESPACE`; if it is omitted, the command reads the mounted service
 account namespace. `--poll-interval` defaults to `10s` and must be positive.
+
+The manual terminal-attestation schema is installed separately with
+`manual-recovery-attestation-crd.yaml`; its fencer read Role and the unbound
+approver Role are in `fencing/manual-attestation-rbac.yaml`. Bind the approver
+Role only to the independently authenticated incident-admin principal for the
+installation. Do not bind it to the operator, fencer, application, or workload
+service accounts. Installing these manifests alone does not enable manual
+recovery: use this path only with a fencer release that issues and validates the
+typed, expiring canonical challenge described below.
 
 Post-fence standalone learner cleanup uses `--delete-namespaces`, defaulted from
 `RHIZA_OPERATOR_DELETE_NAMESPACES`. Empty means the actual operator Pod namespace
@@ -121,25 +130,53 @@ available, immutable to late writers, and protected from rollback for the
 entire recovery. A bucket copy or an apparently quiet pod is not proof that
 the source is safe.
 
-## Fence requirement
+## Fence requirement and manual terminal evidence
 
-Only a trusted fencing authority may create or update recovery resource specs.
-Grant that permission separately to your incident administrator or fencing
-automation; do not grant it to ordinary application service accounts. The CR
-attestation is an authorization boundary, not an independently verified power
-or network fence.
+Normal recovery requires the canonical fencer proof and all existing source,
+storage, quorum, and read-barrier checks. Kubernetes Pod absence, failed probes,
+StatefulSet scale-down, and a `spec.fence.confirmed` boolean are not terminal
+proof.
 
-For manual requests, `spec.fence` is a trusted out-of-band administrator attestation. It must bind
-the same `recoveryID`, `sourceClusterID`, and live StatefulSet UID, set
-`confirmed: true`, and contain concrete evidence. The operator never infers a
-fence from missing pods, failed probes, or Kubernetes deletion state.
+For the explicitly selected human-recovery exception, the approval is a
+separate immutable `RhizaManualRecoveryAttestation`, not a field in
+`RhizaRecovery.spec`, status, or an operator request. Its authorization comes
+from Kubernetes RBAC and API audit: the installation binds
+`rhiza-manual-recovery-approver` only to its incident-admin identity; the
+operator has no approval write access; the fencer has namespace-scoped `get`
+only (no list or write verbs), and its implementation must fetch the exact
+deterministic object name and verify its UID and spec. The `attester` text field
+is descriptive and is not proof of identity.
 
-Before confirming it, fence **all** old voters, every client that can write,
-and read replicas or learners that can reconnect with credentials. Prevent
-late object-store writes from the old generation as well. This normally means
-revoking old peer and client credentials, stopping external supervisors, and
-blocking old workload identity or bucket access. Do not rely on scale-down
-alone: a partitioned old voter can still retain voting authority.
+The fencer must first establish canonical CONTROL closure, the complete
+historical cohort, exact archive/provider scope, target binding, and current
+Pod UID inventory. Only then may it return a typed, expiring challenge bound to
+the Recovery name and UID, operation, full policy (including
+`allowDataLoss`), closed root/ledger/cohort, storage scope, archive, target,
+and current Pod inventory. The administrator must independently verify every
+old run is terminated, recreation is blocked, old peer/client write access is
+blocked, old archive-writer access is revoked, and storage is quiescent. The
+fencer rechecks those bindings and challenge expiry both when accepting the
+immutable approval and when consuming its proof. Any drift, expired challenge,
+or changed approval object fails closed. Before a canonical source-successor
+claim exists, an expired challenge requires a new Recovery operation. After
+that exact claim has consumed the accepted immutable approval, the same
+Recovery may resume after expiry only while its current source, root, workload,
+inventory, challenge, approval UID/spec, and claim still match exactly.
+
+This exception is an explicit external-administrator trust decision, not
+IndependentV2 runtime evidence and not a guarantee from Kubernetes object
+absence. It cannot synthesize a missing ACK or archive HEAD; an async source
+still requires the existing `allowDataLoss: true` gate and recovers only the
+canonical sealed tip. For a `before-ack` source, the same canonical archive-tip
+and closure checks apply, but manual recovery does not assert data loss and does
+not require `allowDataLoss`. A surviving source quorum should use normal membership
+recovery unless an authorized operator deliberately chooses full-generation
+recovery.
+
+The schema and RBAC manifests do not enable the route by themselves: deploy a
+matching controller and fencer that implement the typed challenge and canonical
+attestation-consumption protocol. Do not create an attestation or treat existing
+`spec.fence` fields as equivalent.
 
 ## Deployment contract
 

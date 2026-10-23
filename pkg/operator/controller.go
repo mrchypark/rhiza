@@ -319,7 +319,47 @@ func (c *Controller) reconcile(ctx context.Context, r *Resource) error {
 				return reject("canonical source root has no exact eligible empty genesis")
 			}
 			if !preflight.ClosureReady {
+				if preflight.ManualRecoveryChallenge != nil {
+					challengeDigest, digestErr := ManualRecoveryChallengeDigest(*preflight.ManualRecoveryChallenge)
+					if digestErr != nil || challengeDigest != preflight.ManualRecoveryChallengeDigest {
+						return reject("manual terminal recovery challenge is inconsistent")
+					}
+					if r.Status.ManualRecoveryChallengeDigest != "" && r.Status.ManualRecoveryChallengeDigest != challengeDigest {
+						return reject("manual terminal recovery challenge changed during recovery")
+					}
+					if r.Status.ManualRecoveryChallenge != nil && hashJSON(r.Status.ManualRecoveryChallenge) != hashJSON(preflight.ManualRecoveryChallenge) {
+						return reject("manual terminal recovery challenge object changed during recovery")
+					}
+					if r.Status.ManualRecoveryChallengeDigest == "" || r.Status.ManualRecoveryChallenge == nil {
+						r.Status.ManualRecoveryChallenge = preflight.ManualRecoveryChallenge
+						r.Status.ManualRecoveryChallengeDigest = challengeDigest
+						return c.record(ctx, r, "Recovering", "manual terminal recovery challenge persisted; administrator attestation is required")
+					}
+				}
 				return c.record(ctx, r, "Recovering", "frozen-source closure proof is pending")
+			}
+			if preflight.EvidenceKind == ManualTerminalEvidenceKind {
+				if !validEvidenceDigest(preflight.ManualRecoveryChallengeDigest) || !validEvidenceDigest(preflight.ManualTerminalAttestationDigest) || preflight.ProofDigest != "" {
+					return reject("manual terminal recovery evidence is incomplete or mixed with independent proof")
+				}
+				changed := false
+				if r.Status.ManualRecoveryChallengeDigest == "" {
+					r.Status.ManualRecoveryChallengeDigest = preflight.ManualRecoveryChallengeDigest
+					changed = true
+				} else if r.Status.ManualRecoveryChallengeDigest != preflight.ManualRecoveryChallengeDigest {
+					return reject("manual terminal recovery challenge changed during recovery")
+				}
+				if r.Status.ManualAttestationDigest == "" {
+					r.Status.ManualAttestationDigest = preflight.ManualTerminalAttestationDigest
+					changed = true
+				} else if r.Status.ManualAttestationDigest != preflight.ManualTerminalAttestationDigest {
+					return reject("manual terminal recovery attestation changed during recovery")
+				}
+				if changed {
+					return c.record(ctx, r, "Recovering", "manual terminal attestation persisted before target authorization")
+				}
+			} else if r.Status.ManualRecoveryChallengeDigest != "" || r.Status.ManualAttestationDigest != "" {
+				return reject("manual terminal evidence disappeared or changed kind during recovery")
 			}
 			if membershipMissing {
 				if bootstrapConfirmation != nil {
@@ -481,13 +521,14 @@ func (c *Controller) advance(ctx context.Context, r *Resource, s sourceState) er
 			if r.Status.FrozenBucketEnvironment == nil {
 				return c.record(ctx, r, "Blocked", "frozen-source bucket lifecycle snapshot is missing")
 			}
-			identity, proofDigest, rootDigest, err := c.frozenSourceClosure(ctx, r, s)
+			identity, evidenceKind, proofDigest, manualAttestationDigest, rootDigest, err := c.frozenSourceClosure(ctx, r, s)
 			if err != nil {
 				return c.record(ctx, r, "Blocked", "frozen source closure changed or is unavailable: "+err.Error())
 			}
 			options := c.forkOptions(r, s.prefix, s.members, true, targetMembers)
 			frozen, err := recovery.ForkFrozenSource(ctx, c.Bucket, recovery.FrozenForkOptions{
-				ForkOptions: options, SourceIdentity: identity, FenceProofDigest: proofDigest, ClosedRootDigest: rootDigest,
+				ForkOptions: options, SourceIdentity: identity, EvidenceKind: evidenceKind, FenceProofDigest: proofDigest,
+				ManualAttestationDigest: manualAttestationDigest, ClosedRootDigest: rootDigest,
 				BucketEnvironment: *r.Status.FrozenBucketEnvironment,
 				VerifyEnvironment: c.frozenBucketEnvironmentVerifier(StoreIdentity(s.env)["RHIZA_OBJSTORE_BUCKET"], s.prefix),
 			})
@@ -553,6 +594,11 @@ func (c *Controller) advance(ctx context.Context, r *Resource, s sourceState) er
 					StatefulSetUID: r.Status.StatefulSetUID, TargetClusterID: r.Status.Target,
 					OperationID: c.operationID(r), SourceFenceOperationID: r.Spec.RecoveryID, RecoveryMode: r.Status.RecoveryMode,
 					BucketEnvironment: r.Status.FrozenBucketEnvironment, ManualMembershipBindingDigest: r.Status.ManualMembershipBindingDigest,
+					ManualRecoveryChallengeDigest: r.Status.ManualRecoveryChallengeDigest,
+					ManualTerminalAttestationDigest: r.Status.ManualAttestationDigest,
+				}
+				if r.Status.ManualAttestationDigest != "" {
+					request.EvidenceKind = ManualTerminalEvidenceKind
 				}
 				if r.Status.RecoveryMode == RecoveryModeFrozenSource {
 					request.RecoveryName = resourceName(r)

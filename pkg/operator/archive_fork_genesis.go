@@ -23,14 +23,17 @@ import (
 // service account. OperationID is the recovery/anchor operation; the source
 // fence operation is a distinct immutable RhizaFence identity.
 type ArchiveForkGenesisRequest struct {
-	RecoveryName                  string                            `json:"recoveryName,omitempty"`
-	StatefulSetUID                string                            `json:"statefulSetUID"`
-	TargetClusterID               string                            `json:"targetClusterID"`
-	OperationID                   string                            `json:"operationID"`
-	SourceFenceOperationID        string                            `json:"sourceFenceOperationID"`
-	RecoveryMode                  string                            `json:"recoveryMode,omitempty"`
-	BucketEnvironment             *recovery.FrozenBucketEnvironment `json:"bucketEnvironment,omitempty"`
-	ManualMembershipBindingDigest string                            `json:"manualMembershipBindingDigest,omitempty"`
+	RecoveryName                    string                            `json:"recoveryName,omitempty"`
+	StatefulSetUID                  string                            `json:"statefulSetUID"`
+	TargetClusterID                 string                            `json:"targetClusterID"`
+	OperationID                     string                            `json:"operationID"`
+	SourceFenceOperationID          string                            `json:"sourceFenceOperationID"`
+	RecoveryMode                    string                            `json:"recoveryMode,omitempty"`
+	BucketEnvironment               *recovery.FrozenBucketEnvironment `json:"bucketEnvironment,omitempty"`
+	ManualMembershipBindingDigest   string                            `json:"manualMembershipBindingDigest,omitempty"`
+	EvidenceKind                    string                            `json:"evidenceKind,omitempty"`
+	ManualRecoveryChallengeDigest   string                            `json:"manualRecoveryChallengeDigest,omitempty"`
+	ManualTerminalAttestationDigest string                            `json:"manualTerminalAttestationDigest,omitempty"`
 }
 
 // ArchiveForkGenesisResponse makes the persisted source profile explicit to
@@ -139,35 +142,53 @@ func (e *FencingExecutor) registerArchiveForkGenesis(ctx context.Context, reques
 	if fence.Spec.OperationID != request.SourceFenceOperationID || fence.Spec.StatefulSetUID != request.StatefulSetUID || fence.Spec.SourceClusterID != sourceID {
 		return ArchiveForkGenesisResponse{}, fmt.Errorf("fencing: canonical source fence identity differs")
 	}
-	if fence.Spec.Scope != ScopeGeneration || fence.Status.Proof == nil || fence.Status.Proof.IndependentV2 == nil {
-		return ArchiveForkGenesisResponse{}, fmt.Errorf("fencing: source generation fence lacks independent terminal evidence")
+	manualTerminal := request.EvidenceKind == ManualTerminalEvidenceKind
+	if fence.Spec.Scope != ScopeGeneration {
+		return ArchiveForkGenesisResponse{}, fmt.Errorf("fencing: source generation fence scope differs")
 	}
 	hash, err := requestHash(&fence.Spec)
 	if err != nil || state.Ledger.ClosedHash != hash {
 		return ArchiveForkGenesisResponse{}, fmt.Errorf("fencing: canonical source fence hash differs")
 	}
-	if err := validateFenceProof(fence.Spec, fence.Status.Proof); err != nil {
-		return ArchiveForkGenesisResponse{}, err
-	}
-	if err := validateIndependentV2(fence.Spec, fence.Status.Proof.IndependentV2); err != nil || fence.Status.Proof.IndependentV2.LedgerHash != e.ledgerHash(state) {
-		return ArchiveForkGenesisResponse{}, errors.Join(err, fmt.Errorf("fencing: source independent proof is not bound to the canonical closed root"))
-	}
-	storageScope, err := e.storageScope(ctx, sts, sourceID)
-	if err != nil || fence.Status.Proof.IndependentV2.StorageScope != storageScope {
-		return ArchiveForkGenesisResponse{}, errors.Join(err, fmt.Errorf("fencing: source independent proof names a different ObjectStorage scope"))
-	}
-	if err := verifyIndependentProofCoverage(state, fence.Spec, fence.Status.Proof.IndependentV2); err != nil {
-		return ArchiveForkGenesisResponse{}, err
-	}
-	currentUIDs, err := e.currentInventory(ctx, request.StatefulSetUID, nil)
-	if err != nil {
-		return ArchiveForkGenesisResponse{}, err
-	}
-	sort.Strings(currentUIDs)
-	proofUIDs := append([]string(nil), fence.Status.Proof.IndependentV2.CurrentPodUIDs...)
-	sort.Strings(proofUIDs)
-	if !sameStrings(currentUIDs, proofUIDs) {
-		return ArchiveForkGenesisResponse{}, fmt.Errorf("fencing: source Pod inventory changed since the canonical fence proof")
+	if manualTerminal {
+		if request.RecoveryMode != RecoveryModeFrozenSource || request.ManualMembershipBindingDigest != "" ||
+			!validEvidenceDigest(request.ManualRecoveryChallengeDigest) || !validEvidenceDigest(request.ManualTerminalAttestationDigest) ||
+			(fence.Status.Proof != nil && fence.Status.Proof.IndependentV2 != nil) {
+			return ArchiveForkGenesisResponse{}, fmt.Errorf("fencing: manual terminal evidence is incomplete or mixed with independent proof")
+		}
+		if fence.Status.Proof != nil {
+			if err := validateFenceProof(fence.Spec, fence.Status.Proof); err != nil {
+				return ArchiveForkGenesisResponse{}, err
+			}
+		}
+	} else {
+		if request.EvidenceKind != "" || request.ManualRecoveryChallengeDigest != "" || request.ManualTerminalAttestationDigest != "" ||
+			fence.Status.Proof == nil || fence.Status.Proof.IndependentV2 == nil {
+			return ArchiveForkGenesisResponse{}, fmt.Errorf("fencing: source generation fence lacks independent terminal evidence")
+		}
+		if err := validateFenceProof(fence.Spec, fence.Status.Proof); err != nil {
+			return ArchiveForkGenesisResponse{}, err
+		}
+		if err := validateIndependentV2(fence.Spec, fence.Status.Proof.IndependentV2); err != nil || fence.Status.Proof.IndependentV2.LedgerHash != e.ledgerHash(state) {
+			return ArchiveForkGenesisResponse{}, errors.Join(err, fmt.Errorf("fencing: source independent proof is not bound to the canonical closed root"))
+		}
+		storageScope, err := e.storageScope(ctx, sts, sourceID)
+		if err != nil || fence.Status.Proof.IndependentV2.StorageScope != storageScope {
+			return ArchiveForkGenesisResponse{}, errors.Join(err, fmt.Errorf("fencing: source independent proof names a different ObjectStorage scope"))
+		}
+		if err := verifyIndependentProofCoverage(state, fence.Spec, fence.Status.Proof.IndependentV2); err != nil {
+			return ArchiveForkGenesisResponse{}, err
+		}
+		currentUIDs, err := e.currentInventory(ctx, request.StatefulSetUID, nil)
+		if err != nil {
+			return ArchiveForkGenesisResponse{}, err
+		}
+		sort.Strings(currentUIDs)
+		proofUIDs := append([]string(nil), fence.Status.Proof.IndependentV2.CurrentPodUIDs...)
+		sort.Strings(proofUIDs)
+		if !sameStrings(currentUIDs, proofUIDs) {
+			return ArchiveForkGenesisResponse{}, fmt.Errorf("fencing: source Pod inventory changed since the canonical fence proof")
+		}
 	}
 
 	scopeProvider := strings.ToLower(identity["RHIZA_OBJSTORE_PROVIDER"])
@@ -192,7 +213,12 @@ func (e *FencingExecutor) registerArchiveForkGenesis(ctx context.Context, reques
 		if err != nil || request.TargetClusterID != expected {
 			return ArchiveForkGenesisResponse{}, errors.Join(err, fmt.Errorf("fencing: frozen-source target differs from stable source identity"))
 		}
-		frozenBinding = &recovery.FrozenSourceBinding{Identity: sourceIdentity, FenceProofDigest: hashJSON(fence.Status.Proof), ClosedRootDigest: e.ledgerHash(state)}
+		if manualTerminal {
+			frozenBinding = &recovery.FrozenSourceBinding{Identity: sourceIdentity, EvidenceKind: ManualTerminalEvidenceKind,
+				ManualAttestationDigest: request.ManualTerminalAttestationDigest, ClosedRootDigest: e.ledgerHash(state)}
+		} else {
+			frozenBinding = &recovery.FrozenSourceBinding{Identity: sourceIdentity, FenceProofDigest: hashJSON(fence.Status.Proof), ClosedRootDigest: e.ledgerHash(state)}
+		}
 	} else if request.BucketEnvironment != nil {
 		return ArchiveForkGenesisResponse{}, fmt.Errorf("fencing: legacy fork cannot carry a frozen-source bucket environment")
 	}
@@ -205,6 +231,11 @@ func (e *FencingExecutor) registerArchiveForkGenesis(ctx context.Context, reques
 		claimMode = sourceSuccessorModeLegacy
 	}
 	sourceScope := fencing.ArchiveScope{Provider: scopeProvider, Bucket: scopeBucket, Prefix: sourcePrefix, ClusterID: sourceID}
+	if manualTerminal {
+		if err := e.validateManualTerminalEvidenceForRegistration(ctx, request, sourceScope, state, fence); err != nil {
+			return ArchiveForkGenesisResponse{}, err
+		}
+	}
 	reservationDigest := ""
 	sourceMembers, err := recoveryMembers(env["RHIZA_CLUSTER_MEMBERS"])
 	if err != nil {
@@ -255,8 +286,9 @@ func (e *FencingExecutor) registerArchiveForkGenesis(ctx context.Context, reques
 			return ArchiveForkGenesisResponse{}, errors.Join(err, fmt.Errorf("fencing: frozen-source registration cannot join a legacy successor reservation"))
 		}
 	}
-	if err := e.claimSourceSuccessor(ctx, sourceScope, request.StatefulSetUID, recoveryUID, request.OperationID, request.SourceFenceOperationID,
-		request.TargetClusterID, "fork", claimMode, reservationDigest, request.ManualMembershipBindingDigest); err != nil {
+	if err := e.claimSourceSuccessor(ctx, sourceScope, request.StatefulSetUID, recoveryUID, request.RecoveryName, request.OperationID, request.SourceFenceOperationID,
+		request.TargetClusterID, "fork", claimMode, reservationDigest, request.ManualMembershipBindingDigest,
+		request.EvidenceKind, request.ManualRecoveryChallengeDigest, request.ManualTerminalAttestationDigest); err != nil {
 		return ArchiveForkGenesisResponse{}, err
 	}
 	scope := fencing.ArchiveScope{Provider: scopeProvider, Bucket: scopeBucket, Prefix: targetPrefix, ClusterID: request.TargetClusterID}

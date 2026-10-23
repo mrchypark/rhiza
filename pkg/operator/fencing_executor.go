@@ -18,6 +18,7 @@ import (
 	"path/filepath"
 	"slices"
 	"strings"
+	"time"
 
 	"cloud.google.com/go/storage"
 	"github.com/mrchypark/rhiza/pkg/fencing"
@@ -93,6 +94,9 @@ type FencingExecutor struct {
 	// RuntimeAgent captures the exact containerd/cgroup incarnation before
 	// RegisterEnrolled is durably persisted and before supervisor child startup.
 	RuntimeAgent *RuntimeAgentClient
+	// manualRecoveryNow is a deterministic clock seam for manual-attestation
+	// lifecycle tests. Production leaves it nil and uses wall-clock UTC.
+	manualRecoveryNow func() time.Time
 }
 
 type fenceLedger struct {
