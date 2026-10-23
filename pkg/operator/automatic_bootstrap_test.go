@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net/http"
 	"net/http/httptest"
 	"path"
 	"strings"
@@ -556,7 +557,25 @@ func automaticBootstrapController(t *testing.T, f automaticBootstrapGenesisFixtu
 	f.e.ArchiveStoreIdentity = StoreIdentity(map[string]string{
 		"RHIZA_OBJSTORE_PROVIDER": "gcs", "RHIZA_OBJSTORE_BUCKET": f.scope.Bucket, "RHIZA_OBJSTORE_PREFIX": "root",
 	})
-	server := httptest.NewTLSServer(f.e.Handler())
+	handler := f.e.Handler()
+	server := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/v1/archive-genesis/empty-recovery/register" {
+			handler.ServeHTTP(w, r)
+			return
+		}
+		recorded := httptest.NewRecorder()
+		handler.ServeHTTP(recorded, r)
+		f.api.mu.Lock()
+		f.api.lastEmptyRecoveryHTTP = fmt.Sprintf("POST %s -> %d %q", r.URL.Path, recorded.Code, strings.TrimSpace(recorded.Body.String()))
+		f.api.mu.Unlock()
+		for key, values := range recorded.Header() {
+			for _, value := range values {
+				w.Header().Add(key, value)
+			}
+		}
+		w.WriteHeader(recorded.Code)
+		_, _ = w.Write(recorded.Body.Bytes())
+	}))
 	t.Cleanup(server.Close)
 	client := &FencingClient{URL: server.URL, TokenFile: f.e.Kube.TokenFile, Client: server.Client()}
 	cluster := automaticBootstrapCluster(t, f)
@@ -682,7 +701,7 @@ func TestAutomaticRecoveryChildReconcilesMissingMembershipFromCanonicalBootstrap
 		child.Status.SourceDurability != "async" || child.Status.TargetBaseKind != "empty" ||
 		child.Status.FrozenEmptyGenesisPending || child.Status.Stage != "Stopping" || child.Status.Target == "" ||
 		child.Status.SecretName == "" || child.Status.RecoveredTip != 0 {
-		t.Fatalf("controller did not progress the confirmed missing-membership recovery through canonical empty-target authorization: %+v", child.Status)
+		t.Fatalf("controller did not progress the confirmed missing-membership recovery through canonical empty-target authorization: status=%+v diagnostics={%s}", child.Status, automaticBootstrapEmptyRecoveryDiagnostic(t, f, request, child.Status.Target))
 	}
 	if child.Status.SourceMembership != sourceFingerprint(request.SourceClusterID, "async", bootstrapMembersFromCluster(t, f), "root/source") {
 		t.Fatal("controller did not derive the target membership fingerprint from the declared bootstrap cohort")
@@ -715,6 +734,29 @@ func TestAutomaticRecoveryChildReconcilesMissingMembershipFromCanonicalBootstrap
 	if err != nil || hashJSON(rootBefore) != hashJSON(rootAfterConfirm) || rootVersionAfterConfirm == nil || *rootVersion != *rootVersionAfterConfirm {
 		t.Fatalf("historical proof confirmation mutated source CONTROL state: err=%v", err)
 	}
+}
+
+func automaticBootstrapEmptyRecoveryDiagnostic(t *testing.T, f automaticBootstrapGenesisFixture, request FenceRequest, targetID string) string {
+	t.Helper()
+	f.api.mu.Lock()
+	httpResponse := f.api.lastEmptyRecoveryHTTP
+	f.api.mu.Unlock()
+	rootSummary := func(uid, clusterID string) string {
+		root, _, err := f.e.AuthorityState.ReadRoot(t.Context(), uid, clusterID)
+		if err != nil {
+			return fmt.Sprintf("unavailable(%v)", err)
+		}
+		return fmt.Sprintf("closedBy=%q genesisState=%q genesisRef=%t emptyAuthorization=%t", root.Ledger.ClosedBy,
+			root.Ledger.ArchiveGenesisState, root.Ledger.ArchiveGenesisRef != nil, root.Ledger.EmptyRecoveryAuthorization != nil)
+	}
+	targetScope := fencing.ArchiveScope{Provider: "gcs", Bucket: f.scope.Bucket, Prefix: path.Join("root", targetID), ClusterID: targetID}
+	claim, _, claimErr := f.e.AuthorityState.ReadArchiveScopeClaim(t.Context(), targetScope)
+	claimSummary := fmt.Sprintf("unavailable(%v)", claimErr)
+	if claimErr == nil {
+		claimSummary = fmt.Sprintf("genesisRef=%t emptyAuthorization=%t", claim.GenesisRef != nil, claim.EmptyRecoveryAuthorization != nil)
+	}
+	return fmt.Sprintf("emptyRecoveryHTTP=%q sourceRoot={%s} targetRoot={%s} targetClaim={%s}", httpResponse,
+		rootSummary(request.StatefulSetUID, request.SourceClusterID), rootSummary(request.StatefulSetUID, targetID), claimSummary)
 }
 
 func TestAutomaticRecoveryChildRejectsMissingControlCohortChangesAndMalformedMembership(t *testing.T) {

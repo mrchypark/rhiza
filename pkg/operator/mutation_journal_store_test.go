@@ -35,19 +35,20 @@ func completeStoreIntent(intent fencing.MutationIntent) fencing.MutationIntent {
 }
 
 type mutationStoreFixture struct {
-	mu                   sync.Mutex
-	objects              map[string]object
-	version              int
-	conflicts            int
-	lostResponse         bool
-	lostArchiveResponse  bool
-	lostTerminalResponse bool
-	lostLedgerResponse   bool
-	archiveReads         int
-	archivePosts         int
-	archiveReadError     string
-	statusWrites         int
-	authorityBucket      objstore.Bucket
+	mu                    sync.Mutex
+	objects               map[string]object
+	version               int
+	conflicts             int
+	lostResponse          bool
+	lostArchiveResponse   bool
+	lostTerminalResponse  bool
+	lostLedgerResponse    bool
+	archiveReads          int
+	archivePosts          int
+	archiveReadError      string
+	statusWrites          int
+	lastEmptyRecoveryHTTP string
+	authorityBucket       objstore.Bucket
 	// Optional Kubernetes auth fixtures for testing the bound-token HTTP route.
 	authPod         object
 	authPodName     string
