@@ -574,8 +574,8 @@ func TestAsyncNonemptyLauncherRequiresDedicatedNativeScenarioAndProjection(t *te
 	source := string(launcher)
 	for _, required := range []string{
 		"async_nonempty=${RHIZA_GCS_ASYNC_NONEMPTY:-no}",
-		"[ \"$initial_head_ack_loss\" != yes ] || [ \"$async_nonempty\" != yes ]",
-		"[ \"$initial_head_ack_loss\" = yes ] || [ \"$async_nonempty\" = yes ]; then",
+		"for selected in \"$initial_head_ack_loss\" \"$async_nonempty\" \"$manual_terminal\"",
+		"[ \"$scenario_count\" -le 1 ]",
 		"run-gcs-ha-async-nonempty",
 		"FENCING_E2E_QUALIFICATION=gcs-async-nonempty",
 		"actual-exit.txt",

@@ -140,11 +140,11 @@ func runManualTerminalFrozenForkRegistration(t *testing.T, durability string, al
 	}
 	recoveryOperation := "manual-recovery-uid:" + fenceOperation
 	resourceSpec := Spec{StatefulSet: "rhiza", SourceClusterID: sourceID, RecoveryID: fenceOperation, Durability: durability, AllowDataLoss: allowLoss,
-		Fence: Fence{RecoveryID: fenceOperation, ClusterID: sourceID, StatefulSetUID: f.runtime.StatefulSetUID}}
+		Fence: Fence{RecoveryID: fenceOperation, ClusterID: sourceID, StatefulSetUID: f.runtime.StatefulSetUID, Confirmed: true,
+			Evidence: "manual-terminal-administrator-approval-required"}}
 	resource := Resource{APIVersion: "rhiza.mrchypark.dev/v1alpha1", Kind: "RhizaRecovery",
 		Metadata: object{"name": "manual-terminal-recovery", "uid": "manual-recovery-uid", "namespace": "test"}, Spec: resourceSpec,
-		Status: Status{RecoveryID: fenceOperation, SpecHash: immutableSpecHash(resourceSpec), Source: sourceID, SourceDurability: durability,
-			StatefulSetUID: f.runtime.StatefulSetUID, RecoveryMode: RecoveryModeFrozenSource}}
+		Status: Status{}}
 	persistRecovery := func() {
 		data := jsonBytes(resource)
 		var encoded object
