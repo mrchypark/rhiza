@@ -532,17 +532,46 @@ func deleteProbeObject(ctx context.Context, kind, name, uid string) error {
 // deleteObjectWithUID uses Kubernetes DeleteOptions rather than a kubectl
 // delete flag: kubectl does not support --preconditions on all pinned versions.
 func deleteObjectWithUID(ctx context.Context, resource, name, uid string) error {
-	return deleteObjectWithPreconditions(ctx, resource, name, uid, "")
+	return deleteObjectWithPreconditions(ctx, resource, name, uid, "", nil)
 }
 
 func deleteObjectWithUIDAndResourceVersion(ctx context.Context, resource, name, uid, resourceVersion string) error {
 	if resourceVersion == "" {
 		return fmt.Errorf("refusing resourceVersion-preconditioned delete without resourceVersion")
 	}
-	return deleteObjectWithPreconditions(ctx, resource, name, uid, resourceVersion)
+	return deleteObjectWithPreconditions(ctx, resource, name, uid, resourceVersion, nil)
 }
 
-func deleteObjectWithPreconditions(ctx context.Context, resource, name, uid, resourceVersion string) error {
+func deleteObjectWithUIDAndGracePeriod(ctx context.Context, resource, name, uid string, gracePeriodSeconds int64) error {
+	if gracePeriodSeconds < 0 {
+		return fmt.Errorf("refusing UID-preconditioned delete with negative grace period")
+	}
+	return deleteObjectWithPreconditions(ctx, resource, name, uid, "", &gracePeriodSeconds)
+}
+
+type kubernetesDeleteOptions struct {
+	APIVersion         string `json:"apiVersion"`
+	Kind               string `json:"kind"`
+	GracePeriodSeconds *int64 `json:"gracePeriodSeconds,omitempty"`
+	Preconditions      struct {
+		UID             string  `json:"uid"`
+		ResourceVersion *string `json:"resourceVersion,omitempty"`
+	} `json:"preconditions"`
+}
+
+func buildKubernetesDeleteOptions(uid, resourceVersion string, gracePeriodSeconds *int64) (kubernetesDeleteOptions, error) {
+	if uid == "" || (gracePeriodSeconds != nil && *gracePeriodSeconds < 0) {
+		return kubernetesDeleteOptions{}, fmt.Errorf("invalid UID-preconditioned delete options")
+	}
+	options := kubernetesDeleteOptions{APIVersion: "v1", Kind: "DeleteOptions", GracePeriodSeconds: gracePeriodSeconds}
+	options.Preconditions.UID = uid
+	if resourceVersion != "" {
+		options.Preconditions.ResourceVersion = &resourceVersion
+	}
+	return options, nil
+}
+
+func deleteObjectWithPreconditions(ctx context.Context, resource, name, uid, resourceVersion string, gracePeriodSeconds *int64) error {
 	if name == "" || uid == "" {
 		return fmt.Errorf("refusing UID-preconditioned delete without name and UID")
 	}
@@ -610,17 +639,9 @@ func deleteObjectWithPreconditions(ctx context.Context, resource, name, uid, res
 		}
 	}
 
-	deleteOptions := struct {
-		APIVersion    string `json:"apiVersion"`
-		Kind          string `json:"kind"`
-		Preconditions struct {
-			UID             string  `json:"uid"`
-			ResourceVersion *string `json:"resourceVersion,omitempty"`
-		} `json:"preconditions"`
-	}{APIVersion: "v1", Kind: "DeleteOptions"}
-	deleteOptions.Preconditions.UID = uid
-	if resourceVersion != "" {
-		deleteOptions.Preconditions.ResourceVersion = &resourceVersion
+	deleteOptions, err := buildKubernetesDeleteOptions(uid, resourceVersion, gracePeriodSeconds)
+	if err != nil {
+		return err
 	}
 	body, err := json.Marshal(deleteOptions)
 	if err != nil {

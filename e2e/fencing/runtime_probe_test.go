@@ -9,6 +9,33 @@ import (
 	"testing"
 )
 
+func TestKubernetesDeleteOptionsBindUIDAndZeroGrace(t *testing.T) {
+	zero := int64(0)
+	options, err := buildKubernetesDeleteOptions("captured-pod-uid", "", &zero)
+	if err != nil {
+		t.Fatal(err)
+	}
+	body, err := json.Marshal(options)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var decoded struct {
+		APIVersion         string `json:"apiVersion"`
+		Kind               string `json:"kind"`
+		GracePeriodSeconds *int64 `json:"gracePeriodSeconds"`
+		Preconditions      struct {
+			UID string `json:"uid"`
+		} `json:"preconditions"`
+	}
+	if err := json.Unmarshal(body, &decoded); err != nil || decoded.APIVersion != "v1" || decoded.Kind != "DeleteOptions" ||
+		decoded.GracePeriodSeconds == nil || *decoded.GracePeriodSeconds != 0 || decoded.Preconditions.UID != "captured-pod-uid" {
+		t.Fatalf("delete options lost captured UID or zero grace: %s (%v)", body, err)
+	}
+	if _, err := buildKubernetesDeleteOptions("", "", &zero); err == nil {
+		t.Fatal("delete options accepted a missing UID precondition")
+	}
+}
+
 func TestRuntimeProbeRecordsEnrollmentAndSafeStopStageBeforePending(t *testing.T) {
 	progress := &runtimeProbeProgress{EnrollmentCaptured: true, StopStage: "pre_container_scope", StopCode: "process_scope_unverified", Pending: true}
 	data, err := json.Marshal(progress)
