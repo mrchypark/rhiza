@@ -508,3 +508,30 @@ func TestFrozenEmptyGenesisPreflightRejectsMissingReferenceAndExtraHistory(t *te
 		}
 	})
 }
+
+func TestVerifyFrozenEmptyArchiveNamespaceRejectsNestedArchiveObjects(t *testing.T) {
+	ctx := t.Context()
+	bucket := objstore.NewInMemBucket()
+	t.Cleanup(func() { _ = bucket.Close() })
+	prefix := "root/source"
+	head, err := recovery.EmptyArchiveHeadBytes()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := bucket.Upload(ctx, path.Join(prefix, "archive/head.bin"), bytes.NewReader(head)); err != nil {
+		t.Fatal(err)
+	}
+	if err := verifyFrozenEmptyArchiveNamespace(ctx, bucket, prefix); err != nil {
+		t.Fatalf("canonical empty HEAD should be the only allowed archive object: %v", err)
+	}
+
+	// This is an actual nested object, not merely an admitted journal entry.
+	// Recursive iteration must expose it even when the object store represents
+	// archive/blocks as a virtual directory prefix.
+	if err := bucket.Upload(ctx, path.Join(prefix, "archive/blocks/extra.bin"), bytes.NewReader([]byte("unexpected extent"))); err != nil {
+		t.Fatal(err)
+	}
+	if err := verifyFrozenEmptyArchiveNamespace(ctx, bucket, prefix); err == nil || !strings.Contains(err.Error(), "additional archive history") {
+		t.Fatalf("recursive namespace validation did not reject the nested archive object: %v", err)
+	}
+}

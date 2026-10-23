@@ -20,11 +20,14 @@ func TestFrozenSourcePreflightUsesReadOnlyControlAuthority(t *testing.T) {
 	f := newHeldProfileFixture(t)
 	ctx := t.Context()
 	if _, err := f.e.change(ctx, f.runtime.StatefulSetUID, f.runtime.SourceClusterID, func(ledger *fencing.Ledger) error {
+		ledger.RequireRuntimeBinding = true
+		ledger.RequireMutationJournal = true
 		ledger.ArchiveGenesisState = fencing.ArchiveGenesisRegistrationPending
 		return nil
 	}); err != nil {
 		t.Fatal(err)
 	}
+	f.e.RequireMutationJournal = true
 	if err := f.e.claimArchiveScopeForRegistration(ctx, f.runtime.StatefulSetUID, f.id, f.runtime); err != nil {
 		t.Fatal(err)
 	}

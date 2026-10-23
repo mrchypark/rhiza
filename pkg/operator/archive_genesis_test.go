@@ -121,6 +121,25 @@ func TestEmptyRecoveryClosedRootBindingIsExactAndScopeBound(t *testing.T) {
 	}
 }
 
+func TestLegacySuccessorReservationAcceptsControllerMapEncodingOnly(t *testing.T) {
+	want := archiveForkReservation{Version: 1, OperationID: "recovery-uid:fence-op", Target: "rhiza-r-target",
+		Source: "source", SourceMembership: strings.Repeat("a", 64), StatefulSetUID: "sts-uid", SpecHash: strings.Repeat("b", 64), TargetBaseKind: "empty"}
+	wire := jsonBytes(object{"version": want.Version, "operation_id": want.OperationID, "target": want.Target,
+		"source": want.Source, "source_membership": want.SourceMembership, "statefulset_uid": want.StatefulSetUID,
+		"spec_hash": want.SpecHash, "target_base_kind": want.TargetBaseKind})
+	var got archiveForkReservation
+	if err := decodeLegacySuccessorReservation(wire, &got); err != nil || got != want {
+		t.Fatalf("controller map-encoded reservation did not round-trip: got=%+v err=%v", got, err)
+	}
+
+	unknown := object{"version": want.Version, "operation_id": want.OperationID, "target": want.Target,
+		"source": want.Source, "source_membership": want.SourceMembership, "statefulset_uid": want.StatefulSetUID,
+		"spec_hash": want.SpecHash, "target_base_kind": want.TargetBaseKind, "unexpected": true}
+	if err := decodeLegacySuccessorReservation(jsonBytes(unknown), &got); err == nil {
+		t.Fatal("accepted a legacy successor reservation with an unknown field")
+	}
+}
+
 func TestEmptyRecoveryVerifiesRealSealedSourceAndClosedRoot(t *testing.T) {
 	f := newArchiveGenesisFixture(t)
 	e, ctx := f.e, t.Context()

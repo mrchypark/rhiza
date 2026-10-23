@@ -188,7 +188,7 @@ func TestArchiveForkRegistrarRejectsCompetingSuccessorBeforeTargetAuthority(t *t
 		t.Fatal(err)
 	}
 	var competitor archiveForkReservation
-	if err := decodeCanonicalArchiveJSON(reservationData, &competitor); err != nil {
+	if err := decodeLegacySuccessorReservation(reservationData, &competitor); err != nil {
 		t.Fatal(err)
 	}
 	competitor.OperationID = "other-recovery:" + f.request.SourceFenceOperationID

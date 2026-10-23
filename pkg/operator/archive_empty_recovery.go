@@ -494,7 +494,7 @@ func verifyFrozenEmptyArchiveNamespace(ctx context.Context, bucket objstore.Buck
 			return fmt.Errorf("fencing: guarded empty source contains checkpoint history")
 		}
 		return nil
-	}); err != nil {
+	}, objstore.WithRecursiveIter()); err != nil {
 		return fmt.Errorf("fencing: cannot enumerate guarded empty source history: %w", err)
 	}
 	return nil
