@@ -38,6 +38,21 @@ func TestIndependentGCSChaosManifestContract(t *testing.T) {
 	fencingLauncher := readContractFile(t, "../../../e2e/fencing/run.sh")
 	bootstrapNamespace := readContractFile(t, "../gcs-postrelease-auth.yaml.in")
 	probe := readContractFile(t, "gcs_reader_probe.go")
+	statefulSet := manifestDocumentForKind(manifest, "StatefulSet")
+	rhizaCluster := manifestDocumentForKind(manifest, "RhizaCluster")
+	if !strings.Contains(statefulSet, "replicas: 0") ||
+		!strings.Contains(statefulSet, "rhiza.mrchypark.dev/cooperative-fencing: \"1\"") {
+		t.Fatal("GCS supervised bootstrap must start at zero replicas with the cooperative fencing template annotation")
+	}
+	if !strings.Contains(rhizaCluster, "bootstrap: true") || !strings.Contains(rhizaCluster, "automatic: true") {
+		t.Fatal("GCS supervised bootstrap must explicitly opt in to bootstrap and automatic recovery")
+	}
+	operatorRollout := strings.Index(launcher, "step 20-operator kubectl")
+	clusterApply := strings.Index(launcher, "step 25-apply-rhiza-cluster")
+	if operatorRollout < 0 || clusterApply < 0 || operatorRollout > clusterApply ||
+		strings.Contains(launcher, "scale statefulset rhiza-voter") {
+		t.Fatal("GCS bootstrap must pin and bootstrap through the operator before any external scale")
+	}
 	guardDefinition := strings.Index(launcher, "require_fresh_runtime_agent_daemonset() {")
 	guardCall := strings.Index(launcher, "  require_fresh_runtime_agent_daemonset\n")
 	runtimeAgentApply := strings.Index(launcher, "  step 20-runtime-agent-apply kubectl --context \"$RHIZA_KUBE_CONTEXT\" apply -f \"$out/runtime-agent.yaml\"")
