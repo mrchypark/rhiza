@@ -640,8 +640,18 @@ func prepareAutomaticInitialRootPin(t *testing.T, f *automaticBootstrapGenesisFi
 		templateMetadata = object{"labels": object{"app": "rhiza"}}
 		template["metadata"] = templateMetadata
 	}
+	templateMetadata["labels"] = object{"app": "rhiza"}
 	templateMetadata["annotations"] = object{fencingProtocolAnnotation: "1"}
+	containers := list(nested(sts, "spec", "template", "spec", "containers"))
+	if len(containers) != 1 || asObject(containers[0]) == nil {
+		f.api.mu.Unlock()
+		t.Fatal("supervised initial-root fixture container is missing or ambiguous")
+	}
+	asObject(containers[0])["securityContext"] = object{"allowPrivilegeEscalation": false, "readOnlyRootFilesystem": true, "capabilities": object{"drop": []any{"ALL"}}}
 	originalPods := list(asObject(f.api.objects[podsPath])["items"])
+	for _, raw := range originalPods {
+		asObject(asObject(raw)["metadata"])["labels"] = object{"app": "rhiza"}
+	}
 	f.api.objects[stsPath] = sts
 	f.api.authStatefulSet = sts
 	f.api.objects[podsPath] = object{"items": []any{}}
@@ -742,7 +752,12 @@ func TestAutomaticSupervisedSourcePinsRootBeforeInitialScale(t *testing.T) {
 			gotRoot := str(nested(f.api.objects[stsPath], "spec", "template", "metadata", "annotations", fencingRootAnnotation))
 			if name == "valid" || name == "manual-supervised" {
 				if gotRoot != automaticBootstrapClusterUID || int(number(nested(f.api.objects[stsPath], "spec", "replicas"))) != 0 {
-					t.Fatalf("automatic source was not pinned while still empty: root=%q StatefulSet=%v", gotRoot, f.api.objects[stsPath])
+					f.api.mu.Lock()
+					clusterObject := asObject(f.api.objects[controller.clusterPath(automaticBootstrapClusterName)])
+					phase := str(nested(clusterObject, "status", "phase"))
+					message := str(nested(clusterObject, "status", "message"))
+					f.api.mu.Unlock()
+					t.Fatalf("supervised source was not pinned while still empty: root=%q phase=%q status=%q", gotRoot, phase, message)
 				}
 				if state, _, err := controller.loadAuto(t.Context(), controller.autoKey(&cluster)); err == nil || state != nil {
 					t.Fatalf("controller advanced durable recovery state before initial scale: state=%+v err=%v", state, err)
@@ -763,6 +778,28 @@ func TestAutomaticSupervisedSourcePinsRootBeforeInitialScale(t *testing.T) {
 			}
 			if gotRoot == automaticBootstrapClusterUID {
 				t.Fatalf("%s precondition failure was accepted and the root pin was written", name)
+			}
+			expectedBlock := map[string]string{
+				"conflicting-root":      "template is bound to another root UID",
+				"scaled":                "only be pinned before the StatefulSet is scaled",
+				"matching-pod":          "requires no matching or StatefulSet-owned Pods",
+				"matching-unowned-pod":  "requires no matching or StatefulSet-owned Pods",
+				"terminating-pod":       "has a terminating matching or StatefulSet-owned Pod",
+				"stale-cluster-uid":     "root identity or contract changed",
+				"existing-binding":      "binding exists without its control record",
+				"empty-selector":        "requires a nonempty, explicit matchLabels selector",
+				"wrong-source":          "supervised source contract differs from RhizaCluster",
+				"resource-version-race": "root pin conflicted; retry after revalidation",
+			}
+			if fragment, ok := expectedBlock[name]; ok {
+				f.api.mu.Lock()
+				clusterObject := asObject(f.api.objects[controller.clusterPath(automaticBootstrapClusterName)])
+				phase := str(nested(clusterObject, "status", "phase"))
+				message := str(nested(clusterObject, "status", "message"))
+				f.api.mu.Unlock()
+				if phase != "Blocked" || !strings.Contains(message, fragment) {
+					t.Fatalf("%s did not reach its intended fail-closed guard: phase=%q status=%q; want %q", name, phase, message, fragment)
+				}
 			}
 		})
 	}
