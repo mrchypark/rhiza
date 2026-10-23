@@ -15,7 +15,19 @@ func TestMembershipSupervisedInventoryOwnership(t *testing.T) {
 	for _, scenario := range []string{"bound", "controller", "omitted-controller", "forged-owner", "missing-owner", "unbound-root", "wrong-operation", "wrong-credential", "mutable-credential", "missing-root", "unwrapped"} {
 		t.Run(scenario, func(t *testing.T) {
 			ctx, r, api, c := membershipFixture(t)
-			r.Metadata["annotations"] = object{automaticOwner: "root-uid"}
+			r.Metadata["annotations"] = object{automaticOwner: "root-uid", automaticLogical: "logical"}
+			root := autoClusterResource("cluster", "root-uid", "logical")
+			root.Spec.Automatic = true
+			root.Spec.AdoptClusterID = "source"
+			root.Spec.StatefulSet = "rhiza"
+			state := validAutoControl()
+			state.BindingUID = "root-uid"
+			state.BindingHash = autoBinding(root)
+			state.StatefulSetUID = str(nested(api.sts, "metadata", "uid"))
+			state.ActiveClusterID = "source"
+			if err := c.saveAuto(ctx, root, state, nil); err != nil {
+				t.Fatal(err)
+			}
 			asObject(nested(api.sts, "spec", "template"))["metadata"] = object{"annotations": object{fencingProtocolAnnotation: "1"}}
 			pod := supervisedTestPod()
 			pod["status"] = api.replacement["status"]
@@ -52,7 +64,7 @@ func TestMembershipSupervisedInventoryOwnership(t *testing.T) {
 			}
 			server := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
 				if req.URL.Path == "/apis/rhiza.mrchypark.dev/v1alpha1/namespaces/default/rhizaclusters" {
-					roots := []ClusterResource{{Metadata: object{"uid": "root-uid"}, Spec: ClusterSpec{StatefulSet: "rhiza"}}}
+					roots := []ClusterResource{*root}
 					if scenario == "missing-root" {
 						roots = nil
 					}

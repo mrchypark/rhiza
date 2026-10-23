@@ -9,6 +9,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -34,6 +35,58 @@ func TestFenceStartupPartialConfigurationRejectsBeforeCreatingState(t *testing.T
 			}
 			if _, err := os.Stat(dir); !os.IsNotExist(err) {
 				t.Fatalf("startup gate created state: %v", err)
+			}
+		})
+	}
+}
+
+func TestFenceStartupRejectsLegacyAndRolelessAssignedResponses(t *testing.T) {
+	physical := "rhiza-2"
+	assigned := fencing.Identity{
+		SourceClusterID: "cluster",
+		NodeID:          "logical-incarnation",
+		PodName:         physical,
+		PodUID:          "pod-uid",
+		RunID:           "run-id",
+		AssignmentID:    strings.Repeat("a", 64),
+	}
+	assignedGrant := fencing.StartupGrant{
+		Identity: assigned,
+		Environment: map[string]string{
+			"RHIZA_NODE_ID":     assigned.NodeID,
+			"RHIZA_LEARNER":     `{"id":"logical-incarnation"}`,
+			"RHIZA_PEER_TOKEN":  "private-token",
+			"RHIZA_PEER_TOKENS": "",
+		},
+	}
+	legacy, err := json.Marshal(assigned)
+	if err != nil {
+		t.Fatal(err)
+	}
+	roleless, err := json.Marshal(assignedGrant)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for name, body := range map[string][]byte{"legacy identity": legacy, "assigned envelope without role": roleless} {
+		t.Run(name, func(t *testing.T) {
+			t.Setenv("RHIZA_POD_NAME", physical)
+			socket := filepath.Join(t.TempDir(), "startup.sock")
+			listener, err := net.Listen("unix", socket)
+			if err != nil {
+				t.Fatal(err)
+			}
+			server := &http.Server{Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if r.URL.Path != "/v1/startup" {
+					http.NotFound(w, r)
+					return
+				}
+				w.Header().Set("Content-Type", "application/json")
+				_, _ = w.Write(body)
+			})}
+			go func() { _ = server.Serve(listener) }()
+			t.Cleanup(func() { _ = server.Close(); _ = listener.Close() })
+			if _, err := fencing.Connect(t.Context(), socket, "ticket", assigned.SourceClusterID, assigned.NodeID); err == nil {
+				t.Fatal("legacy or role-less assigned startup response was accepted")
 			}
 		})
 	}
@@ -71,7 +124,7 @@ func TestFenceWatcherKeepsEngineAliveAcrossActualSessionOutage(t *testing.T) {
 			handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 				switch r.URL.Path {
 				case "/v1/startup":
-					_ = json.NewEncoder(w).Encode(identity)
+					_ = json.NewEncoder(w).Encode(fencing.StartupGrant{Identity: identity, Role: fencing.StartupRoleVoterActive})
 				case "/v1/bind":
 					var bound fencing.Identity
 					if err := json.NewDecoder(r.Body).Decode(&bound); err != nil {

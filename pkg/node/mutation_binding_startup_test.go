@@ -40,7 +40,7 @@ func TestIndependentBindingCannotFallThroughToDirectBootstrapWrites(t *testing.T
 	server := &http.Server{Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
 		case "/v1/startup":
-			_ = json.NewEncoder(w).Encode(id)
+			_ = json.NewEncoder(w).Encode(fencing.StartupGrant{Identity: id, Role: fencing.StartupRoleVoterActive})
 		case "/v1/bind":
 			var bound fencing.Identity
 			if err := json.NewDecoder(r.Body).Decode(&bound); err != nil {
@@ -188,7 +188,7 @@ func newFenceBindTestNode(t *testing.T, ctx context.Context, status int, badID b
 	server := &http.Server{Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
 		case "/v1/startup":
-			_ = json.NewEncoder(w).Encode(baseID)
+			_ = json.NewEncoder(w).Encode(fencing.StartupGrant{Identity: baseID, Role: fencing.StartupRoleVoterActive})
 		case "/v1/bind":
 			var bound fencing.Identity
 			if err := json.NewDecoder(r.Body).Decode(&bound); err != nil {

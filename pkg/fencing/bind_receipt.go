@@ -36,13 +36,11 @@ func (r BindReceipt) Validate(expected Identity) error {
 	if r.Identity != expected || expected.SourceClusterID == "" || expected.NodeID == "" || expected.PodUID == "" || expected.RunID == "" || expected.WALIdentity == "" {
 		return fmt.Errorf("fencing: bind receipt identity differs")
 	}
-	if r.Role == "" {
-		r.Role = StartupRoleVoterActive // historical receipts predate role binding
-	}
-	if !r.Role.Valid() {
+	role, ok := r.normalizedRole()
+	if !ok {
 		return fmt.Errorf("fencing: bind receipt role is invalid")
 	}
-	if r.Role == StartupRoleLearnerPendingRemove && r.Producer != nil {
+	if role == StartupRoleLearnerPendingRemove && r.Producer != nil {
 		return fmt.Errorf("fencing: pending learner cannot receive a mutation producer")
 	}
 	if p := r.Producer; p != nil {
@@ -92,14 +90,22 @@ func (l *Ledger) BindMutationStage(id Identity, incarnation string) error {
 }
 
 func (r BindReceipt) SameBinding(other BindReceipt) bool {
-	if r.Role == "" {
-		r.Role = StartupRoleVoterActive
-	}
-	if other.Role == "" {
-		other.Role = StartupRoleVoterActive
-	}
-	return r.Identity == other.Identity && r.Role == other.Role && ((r.Producer == nil && other.Producer == nil) ||
+	rRole, rOK := r.normalizedRole()
+	otherRole, otherOK := other.normalizedRole()
+	return rOK && otherOK && r.Identity == other.Identity && rRole == otherRole && ((r.Producer == nil && other.Producer == nil) ||
 		(r.Producer != nil && other.Producer != nil && *r.Producer == *other.Producer))
+}
+
+func (r BindReceipt) normalizedRole() (StartupRole, bool) {
+	if r.Role == "" {
+		// Empty role is the historical static-voter wire format only. A
+		// supervisor-assigned logical identity must carry its authority role.
+		if r.Identity.AssignmentID != "" || (r.Identity.PodName != "" && r.Identity.PodName != r.Identity.NodeID) {
+			return "", false
+		}
+		return StartupRoleVoterActive, true
+	}
+	return r.Role, r.Role.Valid()
 }
 
 func (r BindReceipt) clone() BindReceipt {
