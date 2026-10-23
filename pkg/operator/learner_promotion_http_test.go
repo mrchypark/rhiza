@@ -150,7 +150,23 @@ func TestAuthenticatedLearnerPromotionRetriesExactCanonicalCompletion(t *testing
 	if ok, err := controller.prepareSameOrdinalLearner(ctx, state, sts, "rhiza"); err != nil || !ok {
 		t.Fatalf("prepare exact replacement assignment: ok=%t err=%v", ok, err)
 	}
+	secretPath := f.e.controller().corePath("secrets", state.Intent.LearnerSecretName)
 	intent := state.Intent
+	f.api.mu.Lock()
+	secret := asObject(f.api.objects[secretPath])
+	if secret == nil {
+		f.api.mu.Unlock()
+		t.Fatal("same-ordinal learner Secret was not persisted by Kubernetes fixture")
+	}
+	secretMetadata := asObject(secret["metadata"])
+	if secret["type"] != "Opaque" || secret["immutable"] != true || str(secretMetadata["name"]) != intent.LearnerSecretName ||
+		str(secretMetadata["namespace"]) != f.e.Kube.Namespace || str(secretMetadata["uid"]) != intent.LearnerSecretUID ||
+		str(secretMetadata["resourceVersion"]) != intent.LearnerSecretRV || str(nested(secret, "metadata", "annotations", ownerAnnotation)) != intent.Request.OperationID ||
+		hashJSON(secret["data"]) != intent.LearnerSecretHash {
+		f.api.mu.Unlock()
+		t.Fatal("same-ordinal learner Secret fixture does not match its captured immutable identity")
+	}
+	f.api.mu.Unlock()
 	childSpec := automaticRecoveryChildSpec(&cluster, state, intent)
 	funcMetadata := object{"name": intent.RecoveryName, "namespace": "test", "uid": "promotion-child-uid", "generation": float64(1),
 		"annotations": object{automaticOwner: state.BindingUID, automaticLogical: cluster.Spec.LogicalID}}
