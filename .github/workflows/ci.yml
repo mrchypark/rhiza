@@ -67,6 +67,23 @@ jobs:
         with:
           go-version-file: go.mod
           cache: true
+      - name: Select GNU coreutils timeout for bounded shell tests
+        run: |
+          set -eu
+          package_dir="$RUNNER_TEMP/gnu-coreutils-package"
+          install_dir="$RUNNER_TEMP/gnu-coreutils"
+          mkdir -p "$package_dir" "$install_dir"
+          (
+            cd "$package_dir"
+            apt-get download coreutils
+            package=$(find . -maxdepth 1 -type f -name 'coreutils_*.deb' -print -quit)
+            test -n "$package"
+            dpkg-deb -x "$package" "$install_dir"
+          )
+          timeout_bin="$install_dir/usr/bin/timeout"
+          test -x "$timeout_bin"
+          "$timeout_bin" --version | grep -Fq 'GNU coreutils'
+          printf '%s\n' "$install_dir/usr/bin" >>"$GITHUB_PATH"
       - name: Check focused durability, rollback, IAM, manifest, and recovery fixtures
         run: |
           go test ./pkg/node -run '^(TestMembershipRetryDurablyPublishesCommittedConfiguration|TestMembershipAdditionAbortAllowsNextRevision)$' -count=1 -timeout=5m
@@ -87,6 +104,23 @@ jobs:
         with:
           go-version-file: go.mod
           cache: true
+      - name: Select GNU coreutils timeout for bounded shell tests
+        run: |
+          set -eu
+          package_dir="$RUNNER_TEMP/gnu-coreutils-package"
+          install_dir="$RUNNER_TEMP/gnu-coreutils"
+          mkdir -p "$package_dir" "$install_dir"
+          (
+            cd "$package_dir"
+            apt-get download coreutils
+            package=$(find . -maxdepth 1 -type f -name 'coreutils_*.deb' -print -quit)
+            test -n "$package"
+            dpkg-deb -x "$package" "$install_dir"
+          )
+          timeout_bin="$install_dir/usr/bin/timeout"
+          test -x "$timeout_bin"
+          "$timeout_bin" --version | grep -Fq 'GNU coreutils'
+          printf '%s\n' "$install_dir/usr/bin" >>"$GITHUB_PATH"
       - name: Compile all Go tests with local hooks (do not execute)
         id: compile_go_tests
         run: |
@@ -458,6 +492,23 @@ jobs:
         with:
           go-version-file: go.mod
           cache: true
+      - name: Select GNU coreutils timeout for bounded shell tests
+        run: |
+          set -eu
+          package_dir="$RUNNER_TEMP/gnu-coreutils-package"
+          install_dir="$RUNNER_TEMP/gnu-coreutils"
+          mkdir -p "$package_dir" "$install_dir"
+          (
+            cd "$package_dir"
+            apt-get download coreutils
+            package=$(find . -maxdepth 1 -type f -name 'coreutils_*.deb' -print -quit)
+            test -n "$package"
+            dpkg-deb -x "$package" "$install_dir"
+          )
+          timeout_bin="$install_dir/usr/bin/timeout"
+          test -x "$timeout_bin"
+          "$timeout_bin" --version | grep -Fq 'GNU coreutils'
+          printf '%s\n' "$install_dir/usr/bin" >>"$GITHUB_PATH"
       - name: Test
         env:
           CGO_ENABLED: 0
