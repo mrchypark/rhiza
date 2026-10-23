@@ -49,6 +49,7 @@ type fakeRuntime struct {
 	metadataGone            bool
 	blockStop               bool
 	changeHostAfterStop     bool
+	afterContainerStop      func()
 	directory               string
 	scopeEventsFile         string
 	stopEntered             chan struct{}
@@ -154,6 +155,10 @@ func (f *fakeRuntime) StopContainer(ctx context.Context, request *runtimeapi.Sto
 	if f.changeVersionAfterStop {
 		f.version.RuntimeVersion = "changed-version"
 	}
+	if f.afterContainerStop != nil {
+		f.afterContainerStop()
+		f.afterContainerStop = nil
+	}
 	if f.stopError != codes.OK {
 		return nil, status.Error(f.stopError, "test stop result unknown")
 	}
@@ -241,6 +246,9 @@ func newRuntimeFixture(t *testing.T) (*Provider, *fakeRuntime, fencing.RuntimeBi
 	if err != nil {
 		t.Fatal(err)
 	}
+	p.pinStop = func(_ string, root string, scope CgroupScope) (stopCgroupPin, error) {
+		return openTestStopCgroupPin(root, scope)
+	}
 	t.Cleanup(func() {
 		if err := p.Close(); err != nil {
 			t.Error(err)
@@ -264,6 +272,62 @@ func writeCgroupProcs(t *testing.T, dir string, pids ...uint32) {
 	}
 	if err := os.WriteFile(filepath.Join(dir, "cgroup.procs"), []byte(contents.String()), 0600); err != nil {
 		t.Fatal(err)
+	}
+}
+
+type testStopCgroupPin struct {
+	dir  *os.File
+	path string
+	dev  uint64
+	ino  uint64
+}
+
+func openTestStopCgroupPin(root string, scope CgroupScope) (stopCgroupPin, error) {
+	path := filepath.Join(root, scope.Path)
+	dir, err := os.Open(path)
+	if err != nil {
+		return nil, err
+	}
+	info, err := dir.Stat()
+	if err != nil {
+		_ = dir.Close()
+		return nil, err
+	}
+	dev, ino, ok := fileIdentity(info)
+	if !ok || dev != scope.Dev || ino != scope.Ino {
+		_ = dir.Close()
+		return nil, ErrUnverified
+	}
+	return &testStopCgroupPin{dir: dir, path: path, dev: dev, ino: ino}, nil
+}
+
+func (p *testStopCgroupPin) verifyEmpty() error {
+	if p == nil || p.dir == nil {
+		return ErrUnverified
+	}
+	info, err := p.dir.Stat()
+	if err != nil || !info.IsDir() {
+		return ErrUnverified
+	}
+	dev, ino, ok := fileIdentity(info)
+	if !ok || dev != p.dev || ino != p.ino {
+		return ErrUnverified
+	}
+	path := p.path
+	if runtime.GOOS == "linux" {
+		path = filepath.Join("/proc/self/fd", strconv.Itoa(int(p.dir.Fd())))
+	}
+	populated, err := cgroupPopulated(path)
+	if err != nil || populated {
+		return ErrUnverified
+	}
+	return nil
+}
+
+func (p *testStopCgroupPin) close() {
+	if p != nil && p.dir != nil {
+		_ = p.dir.Close()
+		p.dir = nil
 	}
 }
 
@@ -464,6 +528,97 @@ func TestCRIIdentityMismatchesIssueZeroStopCommands(t *testing.T) {
 			defer f.mu.Unlock()
 			if f.stopContainers != 0 || f.stopSandboxes != 0 {
 				t.Fatal("mismatched incarnation received a termination command")
+			}
+		})
+	}
+}
+
+func newStopCgroupFixture(t *testing.T) (*Provider, *fakeRuntime, fencing.RuntimeBinding, fencing.StopRequest, string, string, CgroupScope) {
+	t.Helper()
+	p, f, binding, request := newRuntimeFixture(t)
+	f.verboseInfo = map[string]string{"info": containerdInfoFixture}
+	root := t.TempDir()
+	proc, cgroupRoot := filepath.Join(root, "proc"), filepath.Join(root, "cgroup")
+	cgroup := filepath.Join(cgroupRoot, "kubepods", "pod-0", "container-0")
+	if err := os.MkdirAll(cgroup, 0700); err != nil {
+		t.Fatal(err)
+	}
+	writeProcIdentity(t, proc, 123, 789, "kubepods/pod-0")
+	events := filepath.Join(cgroup, "cgroup.events")
+	if err := os.WriteFile(events, []byte("populated 1\nfrozen 0\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	writeCgroupProcs(t, cgroup, 123)
+	scope, err := captureCgroupScope(proc, cgroupRoot, 123, "/kubepods/pod-0/container-0", binding, p.profile.CgroupProfileID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	f.scopeEventsFile = events
+	return p, f, binding, request, proc, cgroupRoot, scope
+}
+
+func TestCRIStopKeepsExactCgroupPinAcrossPathDisappearance(t *testing.T) {
+	if runtime.GOOS != "linux" {
+		t.Skip("/proc fd pin semantics are Linux-specific")
+	}
+	p, f, binding, request, proc, cgroupRoot, scope := newStopCgroupFixture(t)
+	cgroup := filepath.Join(cgroupRoot, scope.Path)
+	original := cgroup + "-renamed"
+	var renameErr error
+	f.afterContainerStop = func() { renameErr = os.Rename(cgroup, original) }
+	observation, err := p.StopInCgroup(t.Context(), binding, request, proc, cgroupRoot, scope)
+	if renameErr != nil || err != nil || !observation.ContainerExited || !observation.SandboxNotReady || !observation.CgroupEmpty {
+		t.Fatalf("captured cgroup pin did not survive pathname disappearance: %+v %v (rename %v)", observation, err, renameErr)
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.stopContainers != 1 || f.stopSandboxes != 1 {
+		t.Fatalf("exact stop sequence changed: container=%d sandbox=%d", f.stopContainers, f.stopSandboxes)
+	}
+}
+
+func TestCRIStopDoesNotSubstituteReplacementCgroupAtCapturedPath(t *testing.T) {
+	if runtime.GOOS != "linux" {
+		t.Skip("/proc fd pin semantics are Linux-specific")
+	}
+	for _, leaveOriginalPopulated := range []bool{false, true} {
+		name := "empty captured inode"
+		if leaveOriginalPopulated {
+			name = "populated captured inode"
+		}
+		t.Run(name, func(t *testing.T) {
+			p, f, binding, request, proc, cgroupRoot, scope := newStopCgroupFixture(t)
+			cgroup := filepath.Join(cgroupRoot, scope.Path)
+			original := cgroup + "-renamed"
+			var mutationErr error
+			f.afterContainerStop = func() {
+				if leaveOriginalPopulated {
+					mutationErr = os.WriteFile(filepath.Join(cgroup, "cgroup.events"), []byte("populated 1\nfrozen 0\n"), 0600)
+				}
+				if err := os.Rename(cgroup, original); err != nil {
+					mutationErr = err
+					return
+				}
+				if err := os.MkdirAll(cgroup, 0700); err != nil {
+					mutationErr = err
+					return
+				}
+				mutationErr = os.WriteFile(filepath.Join(cgroup, "cgroup.events"), []byte("populated 0\nfrozen 0\n"), 0600)
+			}
+			observation, err := p.StopInCgroup(t.Context(), binding, request, proc, cgroupRoot, scope)
+			if mutationErr != nil {
+				t.Fatal(mutationErr)
+			}
+			f.mu.Lock()
+			defer f.mu.Unlock()
+			if leaveOriginalPopulated {
+				if !errors.Is(err, ErrUnverified) || !observation.ContainerStopAcknowledged || observation.SandboxStopAcknowledged || f.stopSandboxes != 0 {
+					t.Fatalf("populated captured inode was replaced by path occupant: %+v %v sandboxStops=%d", observation, err, f.stopSandboxes)
+				}
+				return
+			}
+			if err != nil || !observation.CgroupEmpty || f.stopSandboxes != 1 {
+				t.Fatalf("path replacement obscured the captured empty inode: %+v %v sandboxStops=%d", observation, err, f.stopSandboxes)
 			}
 		})
 	}
