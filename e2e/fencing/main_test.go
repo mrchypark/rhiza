@@ -210,7 +210,7 @@ func TestFixtureOnlyWorkflowIsExclusiveAndRunsFixedGoSelectors(t *testing.T) {
 		}
 		return false
 	}
-	wantEmbeddedSelector := "embedded_tests='^(TestIndependentRollbackReconcilesInterruptedCreateMarkers|TestRollbackMarkerGateCoversEveryIndependentAndCIWrite|TestIndependentGCSChaosManifestContract|TestVoterCountLauncherRunRequiresPrivilegedInstallCredential|TestGCSIAM.*)$'"
+	wantEmbeddedSelector := "embedded_tests='^(TestIndependentRollbackReconcilesInterruptedCreateMarkers|TestRollbackMarkerGateCoversEveryIndependentAndCIWrite|TestIndependentGCSChaosManifestContract|TestNamespaceExpiryRendersUIDResourceVersionDelete|TestQualificationHostContainsPinnedKubectlTools|TestRuntimeAgentRenderPinsNodesAndNamespaceOwnerReferences|TestVoterCountLauncherRunRequiresPrivilegedInstallCredential|TestGCSIAM.*)$'"
 	if !hasLine(wantEmbeddedSelector) || strings.Contains(run, "operator_tests=") {
 		t.Fatal("fixture-only job must retain only the fixed embedded rollback/IAM/manifest/launcher selector")
 	}
@@ -502,6 +502,7 @@ tls_tmp=
 remove_admin_token=true
 mode=install
 initial_head_ack_loss=yes
+cleanup_namespace=false
 FENCING_E2E_BIN=$TEST_DRIVER
 export FENCING_E2E_OUT=$out
 export RHIZA_KUBE_CONTEXT=test-context RHIZA_NAMESPACE=test-namespace RHIZA_RUN_ID=a1b2c3d4
