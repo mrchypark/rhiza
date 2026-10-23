@@ -706,6 +706,9 @@ func TestAutomaticRecoveryChildReconcilesMissingMembershipFromCanonicalBootstrap
 	if child.Status.SourceMembership != sourceFingerprint(request.SourceClusterID, "async", bootstrapMembersFromCluster(t, f), "root/source") {
 		t.Fatal("controller did not derive the target membership fingerprint from the declared bootstrap cohort")
 	}
+	if child.Status.ManualMembershipBindingDigest != "" {
+		t.Fatal("automatic bootstrap recovery was incorrectly converted to the separate manual membership authorization")
+	}
 	if exists, err := f.archive.Exists(ctx, "root/source/voters/membership.json"); err != nil || exists {
 		t.Fatalf("controller wrote or exposed synthetic source membership: exists=%t err=%v", exists, err)
 	}
@@ -751,11 +754,20 @@ func TestManualMissingSourceMembershipReconcilesCanonicalEmptyRecovery(t *testin
 		t.Fatal("empty authorization fixture is not a default-off manual-only recovery child")
 	}
 	persistTestRecovery(t, f, child)
+	manualPreflight, err := f.e.frozenSourcePreflight(ctx, FrozenSourcePreflightRequest{
+		RecoveryName: resourceName(&child), RecoveryUID: str(child.Metadata["uid"]),
+	})
+	if err != nil || manualPreflight.ManualMembershipBindingDigest == "" {
+		t.Fatalf("direct manual canonical preflight rejected the controlled fixture: response=%+v err=%v", manualPreflight, err)
+	}
 	manualController := *controller
 	manualController.Automatic = false
 	for step := 0; step < 5; step++ {
 		if err := manualController.reconcile(ctx, &child); err != nil {
-			t.Fatalf("manual recovery reconcile step %d: %v", step, err)
+			direct, directErr := f.e.frozenSourcePreflight(ctx, FrozenSourcePreflightRequest{
+				RecoveryName: resourceName(&child), RecoveryUID: str(child.Metadata["uid"]),
+			})
+			t.Fatalf("manual recovery reconcile step %d: %v; direct canonical preflight response=%+v err=%v", step, err, direct, directErr)
 		}
 		persistTestRecovery(t, f, child)
 		if child.Status.Stage == "Stopping" {
