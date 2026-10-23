@@ -143,9 +143,15 @@ func newForkAuthorityRegistrarFixture(t *testing.T) forkAuthorityRegistrarFixtur
 	lineage := archiveForkLineageRecord{Version: 1, OperationID: recoveryOperation, Source: "source", SourceDurability: "async",
 		SourceMembership: sourceFingerprint("source", "async", sourceMembers, sourcePrefix), TargetMembership: targetMembership, Fork: result}
 	putForkJSON(t, bucket, path.Join(targetPrefix, "recovery/generation.json"), lineage)
-	reservation := archiveForkReservation{Version: 1, OperationID: recoveryOperation, Target: targetID, Source: "source",
-		SourceMembership: sourceFingerprint("source", "async", sourceMembers, sourcePrefix), StatefulSetUID: f.runtime.StatefulSetUID, SpecHash: strings.Repeat("a", 64)}
-	putForkJSON(t, bucket, path.Join(sourcePrefix, "recovery/successor.json"), reservation)
+	reservationResource := &Resource{
+		Metadata: object{"uid": "recovery-uid"},
+		Spec:     Spec{RecoveryID: "source-fence-op", SourceClusterID: "source"},
+		Status: Status{
+			Target: targetID, SourceMembership: sourceFingerprint("source", "async", sourceMembers, sourcePrefix),
+			StatefulSetUID: f.runtime.StatefulSetUID, SpecHash: strings.Repeat("a", 64),
+		},
+	}
+	putForkJSON(t, bucket, path.Join(sourcePrefix, "recovery/successor.json"), (&Controller{}).reservation(reservationResource))
 
 	fenceRequest := FenceRequest{LogicalID: "fork-test", BindingUID: f.runtime.BindingUID, Namespace: "test", StatefulSet: "rhiza",
 		StatefulSetUID: f.runtime.StatefulSetUID, SourceClusterID: "source", OperationID: fenceOperation, Scope: ScopeGeneration}

@@ -2,6 +2,7 @@ package operator
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"io"
 	"strings"
@@ -187,19 +188,19 @@ func TestArchiveForkRegistrarRejectsCompetingSuccessorBeforeTargetAuthority(t *t
 	if err != nil {
 		t.Fatal(err)
 	}
-	var competitor archiveForkReservation
-	if err := decodeLegacySuccessorReservation(reservationData, &competitor); err != nil {
+	var competitor object
+	if err := json.Unmarshal(reservationData, &competitor); err != nil {
 		t.Fatal(err)
 	}
-	competitor.OperationID = "other-recovery:" + f.request.SourceFenceOperationID
-	competitor.Target = "other-target"
-	competitor.SpecHash = strings.Repeat("b", 64)
-	competitor.TargetBaseKind = "fork"
+	competitor["operation_id"] = "other-recovery:" + f.request.SourceFenceOperationID
+	competitor["target"] = "other-target"
+	competitor["spec_hash"] = strings.Repeat("b", 64)
+	competitor["target_base_kind"] = "fork"
 	putForkJSON(t, f.e.ArchiveBucket, "root/source/recovery/successor.json", competitor)
 
 	loser := f.request
-	loser.OperationID = competitor.OperationID
-	loser.TargetClusterID = competitor.Target
+	loser.OperationID = str(competitor["operation_id"])
+	loser.TargetClusterID = str(competitor["target"])
 	if _, err := f.e.registerArchiveForkGenesis(ctx, loser); err == nil {
 		t.Fatal("competing successor registration unexpectedly succeeded")
 	}

@@ -294,13 +294,21 @@ func (e *FencingExecutor) readExistingEmptyRecovery(ctx context.Context, request
 		Prefix: path.Join(basePrefix, stored.Spec.SourceClusterID), ClusterID: stored.Spec.SourceClusterID}
 	sourceScopeHash, sourceErr := sourceScope.Hash()
 	targetScopeHash, targetErr := targetScope.Hash()
+	expectedSourcePrefix, expectedBucketName := "", ""
+	expectedMetageneration, expectedLifecycleDigest := "", ""
+	if request.RecoveryMode == RecoveryModeFrozenSource {
+		expectedSourcePrefix, expectedBucketName = sourceScope.Prefix, targetScope.Bucket
+		expectedMetageneration = frozenBucketMetageneration(request.BucketEnvironment)
+		expectedLifecycleDigest = frozenBucketLifecycleDigest(request.BucketEnvironment)
+	}
 	if err := authorization.Validate(); err != nil || sourceErr != nil || targetErr != nil ||
 		authorization.StatefulSetUID != request.StatefulSetUID || authorization.TargetClusterID != request.TargetClusterID ||
 		authorization.OperationID != request.OperationID || authorization.SourceFenceOperationID != request.SourceFenceOperationID ||
 		authorization.SourceScopeHash != sourceScopeHash || authorization.TargetScopeHash != targetScopeHash ||
 		authorization.TargetMembershipHash != request.TargetMembershipHash || authorization.TargetDurability != request.TargetDurability ||
 		authorization.AllowDataLoss != request.AllowDataLoss || authorization.PolicyDigest != hashJSON(stored.Spec) ||
-		authorization.RecoveryMode != request.RecoveryMode || authorization.SourcePrefix != sourceScope.Prefix || authorization.BucketMetageneration != frozenBucketMetageneration(request.BucketEnvironment) || authorization.LifecyclePolicyDigest != frozenBucketLifecycleDigest(request.BucketEnvironment) ||
+		authorization.RecoveryMode != request.RecoveryMode || authorization.SourcePrefix != expectedSourcePrefix || authorization.BucketName != expectedBucketName ||
+		authorization.BucketMetageneration != expectedMetageneration || authorization.LifecyclePolicyDigest != expectedLifecycleDigest ||
 		stored.Spec.RecoveryID != request.SourceFenceOperationID || stored.Status.StatefulSetUID != request.StatefulSetUID {
 		return ArchiveEmptyRecoveryResponse{}, true, errors.Join(err, sourceErr, targetErr, fmt.Errorf("fencing: persisted empty recovery authorization differs from request"))
 	}
@@ -553,11 +561,13 @@ func (e *FencingExecutor) makeEmptyRecoveryAuthorization(request ArchiveEmptyRec
 		SourceMembershipHash: authorityStateDigest(jsonBytes(sourceMembership)), SourceDurability: sourceDurability,
 		TargetMembershipHash: request.TargetMembershipHash, TargetDurability: request.TargetDurability,
 		AllowDataLoss: request.AllowDataLoss, PolicyDigest: request.PolicyDigest,
-		RecoveryMode:          request.RecoveryMode,
-		SourcePrefix:          sourcePrefix,
-		BucketName:            targetScope.Bucket,
-		BucketMetageneration:  frozenBucketMetageneration(request.BucketEnvironment),
-		LifecyclePolicyDigest: frozenBucketLifecycleDigest(request.BucketEnvironment),
+	}
+	if request.RecoveryMode == RecoveryModeFrozenSource {
+		auth.RecoveryMode = RecoveryModeFrozenSource
+		auth.SourcePrefix = sourcePrefix
+		auth.BucketName = targetScope.Bucket
+		auth.BucketMetageneration = frozenBucketMetageneration(request.BucketEnvironment)
+		auth.LifecyclePolicyDigest = frozenBucketLifecycleDigest(request.BucketEnvironment)
 	}
 	if err := auth.Validate(); err != nil {
 		return fencing.ArchiveEmptyRecoveryAuthorization{}, err
