@@ -422,10 +422,42 @@ func TestFrozenEmptyRecoverySettlesUnknownHeldGenesisAfterClosure(t *testing.T) 
 		closedPreflight.Identity != preflight.Identity || closedPreflight.ProofDigest == "" || closedPreflight.ClosedRootDigest == "" {
 		t.Fatalf("authenticated controller preflight did not verify the closed source proof: response=%+v err=%v", closedPreflight, err)
 	}
+	targetScope := fencing.ArchiveScope{Provider: "gcs", Bucket: "archive", Prefix: targetPrefix, ClusterID: targetID}
+	wrongRequest := request
+	wrongRequest.PolicyDigest = hashJSON("different-persisted-spec")
+	if _, err := f.e.RegisterArchiveEmptyRecovery(ctx, wrongRequest); err == nil || !strings.Contains(err.Error(), "request differs from persisted recovery resource") {
+		t.Fatalf("initial registration accepted a raw request digest that differs from the stored spec: %v", err)
+	}
+	if _, _, err := f.e.AuthorityState.ReadArchiveScopeClaim(ctx, targetScope); !errors.Is(err, errAuthorityStateNotFound) {
+		t.Fatalf("rejected initial request created a target archive claim: %v", err)
+	}
+	if _, _, err := f.e.AuthorityState.ReadRoot(ctx, f.runtime.StatefulSetUID, targetID); !errors.Is(err, errAuthorityStateNotFound) {
+		t.Fatalf("rejected initial request created a target CONTROL root: %v", err)
+	}
 
 	registered, err := f.e.RegisterArchiveEmptyRecovery(ctx, request)
 	if err != nil || registered.State != fencing.EmptyRecoveryAuthorized {
 		t.Fatalf("guarded zero-tip source did not authorize a fresh target: response=%+v err=%v", registered, err)
+	}
+	wantPolicyDigest := emptyRecoveryPolicyDigest(request.PolicyDigest, "async", request.TargetDurability, request.AllowDataLoss)
+	if registered.Authorization.PolicyDigest != wantPolicyDigest {
+		t.Fatalf("empty recovery authorization policy digest=%q, want derived digest %q", registered.Authorization.PolicyDigest, wantPolicyDigest)
+	}
+	claimBeforeBadReplay, _, err := f.e.AuthorityState.ReadArchiveScopeClaim(ctx, targetScope)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rootBeforeBadReplay, _, err := f.e.AuthorityState.ReadRoot(ctx, f.runtime.StatefulSetUID, targetID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.e.RegisterArchiveEmptyRecovery(ctx, wrongRequest); err == nil || !strings.Contains(err.Error(), "request differs from persisted recovery resource") {
+		t.Fatalf("replay accepted a raw request digest that differs from the unchanged stored spec: %v", err)
+	}
+	claimAfterBadReplay, _, claimErr := f.e.AuthorityState.ReadArchiveScopeClaim(ctx, targetScope)
+	rootAfterBadReplay, _, rootErr := f.e.AuthorityState.ReadRoot(ctx, f.runtime.StatefulSetUID, targetID)
+	if claimErr != nil || rootErr != nil || hashJSON(claimBeforeBadReplay) != hashJSON(claimAfterBadReplay) || hashJSON(rootBeforeBadReplay) != hashJSON(rootAfterBadReplay) {
+		t.Fatalf("rejected request replay rewrote persisted authorization: claimErr=%v rootErr=%v", claimErr, rootErr)
 	}
 	producer, _, _, err = f.e.AuthorityState.ReadProducer(ctx, f.runtime)
 	if err != nil {
@@ -435,7 +467,6 @@ func TestFrozenEmptyRecoverySettlesUnknownHeldGenesisAfterClosure(t *testing.T) 
 	if entry.GuardedLogicalResolution == nil || entry.Resolution == nil || entry.Resolution.AllCopiesTerminal {
 		t.Fatalf("empty recovery fabricated terminal physical evidence: %+v", entry)
 	}
-	targetScope := fencing.ArchiveScope{Provider: "gcs", Bucket: "archive", Prefix: targetPrefix, ClusterID: targetID}
 	targetClaim, _, err := f.e.AuthorityState.ReadArchiveScopeClaim(ctx, targetScope)
 	if err != nil || targetClaim.EmptyRecoveryAuthorization == nil || targetClaim.GenesisRef != nil {
 		t.Fatalf("authorization was not separately persisted before target genesis: claim=%+v err=%v", targetClaim, err)
@@ -451,6 +482,45 @@ func TestFrozenEmptyRecoverySettlesUnknownHeldGenesisAfterClosure(t *testing.T) 
 	gcs.mu.Unlock()
 	if postsAfterAuthorization != postsAtClose || !finalHead.temporaryHold || !bytes.Equal(finalHead.payload, payload) {
 		t.Fatalf("authorization changed or released source held object: posts=%d->%d head=%+v", postsAtClose, postsAfterAuthorization, finalHead)
+	}
+
+	// A coherent authorization using the obsolete raw spec digest is invalid,
+	// and exact replay must not migrate or rewrite it.
+	claimBeforeLegacyReplay, claimVersion, err := f.e.AuthorityState.ReadArchiveScopeClaim(ctx, targetScope)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rootBeforeLegacyReplay, rootVersion, err := f.e.AuthorityState.ReadRoot(ctx, f.runtime.StatefulSetUID, targetID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	claimBeforeLegacyReplay.EmptyRecoveryAuthorization.PolicyDigest = request.PolicyDigest
+	rootBeforeLegacyReplay.Ledger.EmptyRecoveryAuthorization.PolicyDigest = request.PolicyDigest
+	claimKey, claimIdentity, err := f.e.AuthorityState.archiveScopeClaimKey(targetScope)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := f.e.AuthorityState.write(ctx, claimKey, claimIdentity, claimBeforeLegacyReplay, claimVersion); err != nil {
+		t.Fatalf("seed coherent legacy raw-digest archive claim: %v", err)
+	}
+	if err := f.e.AuthorityState.WriteRoot(ctx, f.runtime.StatefulSetUID, targetID, rootBeforeLegacyReplay, rootVersion); err != nil {
+		t.Fatalf("seed coherent legacy raw-digest target root: %v", err)
+	}
+	legacyClaim, _, err := f.e.AuthorityState.ReadArchiveScopeClaim(ctx, targetScope)
+	if err != nil {
+		t.Fatal(err)
+	}
+	legacyRoot, _, err := f.e.AuthorityState.ReadRoot(ctx, f.runtime.StatefulSetUID, targetID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.e.RegisterArchiveEmptyRecovery(ctx, request); err == nil || !strings.Contains(err.Error(), "persisted empty recovery authorization differs from request") {
+		t.Fatalf("replay silently upgraded a coherent legacy raw-digest authorization: %v", err)
+	}
+	claimAfterLegacyReplay, _, claimErr := f.e.AuthorityState.ReadArchiveScopeClaim(ctx, targetScope)
+	rootAfterLegacyReplay, _, rootErr := f.e.AuthorityState.ReadRoot(ctx, f.runtime.StatefulSetUID, targetID)
+	if claimErr != nil || rootErr != nil || hashJSON(legacyClaim) != hashJSON(claimAfterLegacyReplay) || hashJSON(legacyRoot) != hashJSON(rootAfterLegacyReplay) {
+		t.Fatalf("rejected legacy authorization replay rewrote canonical state: claimErr=%v rootErr=%v", claimErr, rootErr)
 	}
 }
 
