@@ -70,7 +70,7 @@ jobs:
       - name: Check focused durability, rollback, IAM, manifest, and recovery fixtures
         run: |
           go test ./pkg/node -run '^(TestMembershipRetryDurablyPublishesCommittedConfiguration|TestMembershipAdditionAbortAllowsNextRevision)$' -count=1 -timeout=5m
-          embedded_tests='^(TestIndependentRollbackReconcilesInterruptedCreateMarkers|TestRollbackMarkerGateCoversEveryIndependentAndCIWrite|TestIndependentGCSChaosManifestContract|TestVoterCountLauncherRunRequiresPrivilegedInstallCredential|TestGCSIAM.*)$'
+          embedded_tests='^(TestIndependentRollbackReconcilesInterruptedCreateMarkers|TestRollbackMarkerGateCoversEveryIndependentAndCIWrite|TestIndependentGCSChaosManifestContract|TestNamespaceExpiryRendersUIDResourceVersionDelete|TestQualificationHostContainsPinnedKubectlTools|TestRuntimeAgentRenderPinsNodesAndNamespaceOwnerReferences|TestVoterCountLauncherRunRequiresPrivilegedInstallCredential|TestGCSIAM.*)$'
           go test ./e2e/chaos/embedded-go -run "$embedded_tests" -count=1 -timeout=5m
           go test ./pkg/fencing ./pkg/fencing/cri ./pkg/fencing/runtimeagent ./pkg/operator ./pkg/recovery ./internal/objstore ./e2e/fencing -count=1 -timeout=5m
           go test -race ./pkg/node -run '^(TestMembershipRetryDurablyPublishesCommittedConfiguration|TestMembershipAdditionAbortAllowsNextRevision)$' -count=1 -timeout=5m
@@ -661,6 +661,7 @@ jobs:
           docker build -f e2e/chaos/Dockerfile --build-arg BINARY=rhiza "${labels[@]}" -t rhiza-chaos:local "$RUNNER_TEMP/chaos-images"
           docker build -f e2e/chaos/Dockerfile --build-arg BINARY=operator -t rhiza-operator-chaos:local "$RUNNER_TEMP/chaos-images"
           docker build -f e2e/chaos/Dockerfile --build-arg BINARY=anchor-service -t rhiza-anchor-service:local "$RUNNER_TEMP/chaos-images"
+          docker run --rm --entrypoint /bin/sh rhiza-chaos:local -ec 'command -v kubectl >/dev/null && command -v date >/dev/null && command -v sleep >/dev/null && kubectl version --client --output=yaml'
           kind create cluster --name rhiza-anchor-chaos --wait 120s
           kind load docker-image rhiza-chaos:local rhiza-operator-chaos:local rhiza-anchor-service:local --name rhiza-anchor-chaos
       - name: Fencing executor regression checks
