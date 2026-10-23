@@ -3,6 +3,7 @@ package operator
 import (
 	"bytes"
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -198,7 +199,7 @@ func configureAutomaticBootstrapKubernetes(t *testing.T, f *heldProfileFixture, 
 	}
 	cluster := ClusterResource{APIVersion: "rhiza.mrchypark.dev/v1alpha1", Kind: "RhizaCluster",
 		Metadata: object{"name": automaticBootstrapClusterName, "namespace": "test", "uid": automaticBootstrapClusterUID},
-		Spec: ClusterSpec{LogicalID: "bootstrap-logical", StatefulSet: "rhiza", Container: "rhiza", AdoptClusterID: f.runtime.SourceClusterID,
+		Spec: ClusterSpec{LogicalID: "bootstrap-logical", StatefulSet: "rhiza", Container: "rhiza", ClusterDomain: "cluster.local", AdoptClusterID: f.runtime.SourceClusterID,
 			VoterCount: len(cohort), HTTPPort: 8080, PeerPort: 9090, Bootstrap: true, Automatic: true,
 			Policy: func() *AutoPolicy { p := goodPolicy; p.AllowDataLoss = true; return &p }()},
 	}
@@ -206,8 +207,30 @@ func configureAutomaticBootstrapKubernetes(t *testing.T, f *heldProfileFixture, 
 	if err != nil {
 		t.Fatal(err)
 	}
+	// This fixture models an adopted source whose immutable membership was
+	// already published, not a fresh bootstrap with keyless member sources.
+	// Give each declared voter its existing deterministic public identity.
+	for i := range members {
+		members[i] = voterMember(f.runtime.SourceClusterID, string(members[i].ID), "bootstrap-token-"+string(members[i].ID))
+		members[i].URL = fmt.Sprintf("http://%s.rhiza-headless.test.svc.cluster.local:8080", members[i].ID)
+		members[i].PeerURL = fmt.Sprintf("quic://%s.rhiza-headless.test.svc.cluster.local:9090", members[i].ID)
+	}
 	container := asObject(list(nested(sts, "spec", "template", "spec", "containers"))[0])
-	container["env"] = append(list(container["env"]), object{"name": "RHIZA_CLUSTER_MEMBERS", "value": string(jsonBytes(members))})
+	peerTokens := make(map[string]string, len(members))
+	for _, member := range members {
+		peerTokens[string(member.ID)] = "bootstrap-token-" + string(member.ID)
+	}
+	secretName := bootstrapSecretName(&cluster)
+	f.api.objects["/api/v1/namespaces/test/secrets/"+secretName] = object{
+		"apiVersion": "v1", "kind": "Secret", "type": "Opaque", "immutable": true,
+		"metadata": object{"name": secretName, "namespace": "test", "annotations": object{ownerAnnotation: automaticBootstrapClusterUID + ":bootstrap-logical"}},
+		"data": object{
+			"members":     base64.StdEncoding.EncodeToString(jsonBytes(members)),
+			"admin":       base64.StdEncoding.EncodeToString([]byte(strings.Repeat("a", 32))),
+			"peer_tokens": base64.StdEncoding.EncodeToString(jsonBytes(peerTokens)),
+		},
+	}
+	applyTargetCredentials(container, secretName)
 	clusterPath := f.e.controller().clusterPath(automaticBootstrapClusterName)
 	podList := make([]any, 0, len(cohort))
 	for i, runtime := range cohort {
@@ -337,13 +360,14 @@ func TestBootstrapGenesisPreflightUsesCanonicalControlAndCompleteLiveCohort(t *t
 }
 
 func TestBootstrapGenesisPreflightRequiresExplicitEligiblePolicyAndExactInventory(t *testing.T) {
-	for _, name := range []string{"automatic-off", "bootstrap-off", "policy-absent", "loss-not-allowed", "PVC", "missing-pod", "ready-pod", "malformed-owner-reference", "malformed-condition", "malformed-container-status"} {
+	for _, name := range []string{"automatic-off", "bootstrap-off", "policy-absent", "loss-not-allowed", "PVC", "missing-members-reference", "changed-members-reference", "wrong-members-key", "peer-token-not-cleared", "mutable-secret", "wrong-secret-owner", "missing-pod", "ready-pod", "malformed-owner-reference", "malformed-condition", "malformed-container-status"} {
 		t.Run(name, func(t *testing.T) {
 			f := newAutomaticBootstrapGenesisFixture(t)
 			f.e.ControllerServiceAccount = "default"
+			cluster := automaticBootstrapCluster(t, f)
+			secretName := bootstrapSecretName(&cluster)
 			switch name {
 			case "automatic-off", "bootstrap-off", "policy-absent", "loss-not-allowed":
-				cluster := automaticBootstrapCluster(t, f)
 				switch name {
 				case "automatic-off":
 					cluster.Spec.Automatic = false
@@ -358,6 +382,29 @@ func TestBootstrapGenesisPreflightRequiresExplicitEligiblePolicyAndExactInventor
 			case "PVC":
 				f.api.mu.Lock()
 				asObject(f.api.authStatefulSet["spec"])["volumeClaimTemplates"] = []any{object{"metadata": object{"name": "data"}}}
+				f.api.mu.Unlock()
+			case "missing-members-reference", "changed-members-reference", "wrong-members-key", "peer-token-not-cleared":
+				f.api.mu.Lock()
+				ctr := asObject(list(nested(f.api.authStatefulSet, "spec", "template", "spec", "containers"))[0])
+				switch name {
+				case "missing-members-reference":
+					ctr["env"] = removeEnv(list(ctr["env"]), "RHIZA_CLUSTER_MEMBERS")
+				case "changed-members-reference":
+					ctr["env"] = replaceEnv(list(ctr["env"]), "RHIZA_CLUSTER_MEMBERS", object{"valueFrom": object{"secretKeyRef": object{"name": "unexpected-bootstrap-secret", "key": "members"}}})
+				case "wrong-members-key":
+					ctr["env"] = replaceEnv(list(ctr["env"]), "RHIZA_CLUSTER_MEMBERS", object{"valueFrom": object{"secretKeyRef": object{"name": secretName, "key": "peer_tokens"}}})
+				case "peer-token-not-cleared":
+					ctr["env"] = replaceEnv(list(ctr["env"]), "RHIZA_PEER_TOKEN", object{"value": "not-cleared"})
+				}
+				f.api.mu.Unlock()
+			case "mutable-secret", "wrong-secret-owner":
+				f.api.mu.Lock()
+				secret := asObject(f.api.objects[f.e.controller().corePath("secrets", secretName)])
+				if name == "mutable-secret" {
+					secret["immutable"] = false
+				} else {
+					asObject(nested(secret, "metadata", "annotations"))[ownerAnnotation] = "other-cluster:other-logical"
+				}
 				f.api.mu.Unlock()
 			case "missing-pod", "ready-pod", "malformed-owner-reference", "malformed-condition", "malformed-container-status":
 				f.api.mu.Lock()
@@ -383,7 +430,7 @@ func TestBootstrapGenesisPreflightRequiresExplicitEligiblePolicyAndExactInventor
 			if _, err := f.e.bootstrapGenesisPreflight(t.Context(), BootstrapGenesisPreflightRequest{
 				ClusterName: automaticBootstrapClusterName, ClusterUID: automaticBootstrapClusterUID, StatefulSetUID: f.runtime.StatefulSetUID,
 			}); err == nil {
-				t.Fatal("bootstrap preflight accepted an ineligible policy or incomplete live inventory")
+				t.Fatal("bootstrap preflight accepted an ineligible policy, unsupported credential template, or incomplete live inventory")
 			}
 		})
 	}
@@ -410,7 +457,7 @@ func TestBootstrapGenesisPreflightRequiresTheCanonicalControlRoot(t *testing.T) 
 }
 
 func TestBootstrapGenesisFenceRejectsCandidateChangesBeforeClosingRoot(t *testing.T) {
-	for _, name := range []string{"policy", "inventory", "root"} {
+	for _, name := range []string{"policy", "inventory", "root", "template", "wrong-members-key", "mutable-secret", "wrong-secret-owner"} {
 		t.Run(name, func(t *testing.T) {
 			f := newAutomaticBootstrapGenesisFixture(t)
 			response, err := f.e.bootstrapGenesisPreflight(t.Context(), BootstrapGenesisPreflightRequest{
@@ -420,6 +467,7 @@ func TestBootstrapGenesisFenceRejectsCandidateChangesBeforeClosingRoot(t *testin
 				t.Fatalf("bootstrap candidate preflight failed: %v", err)
 			}
 			cluster := automaticBootstrapCluster(t, f)
+			secretName := bootstrapSecretName(&cluster)
 			switch name {
 			case "policy":
 				cluster.Spec.Policy.CooldownSeconds++
@@ -436,6 +484,25 @@ func TestBootstrapGenesisFenceRejectsCandidateChangesBeforeClosingRoot(t *testin
 				}); err != nil {
 					t.Fatal(err)
 				}
+			case "template":
+				f.api.mu.Lock()
+				ctr := asObject(list(nested(f.api.authStatefulSet, "spec", "template", "spec", "containers"))[0])
+				ctr["env"] = replaceEnv(list(ctr["env"]), "RHIZA_PEER_TOKEN", object{"value": "not-cleared"})
+				f.api.mu.Unlock()
+			case "wrong-members-key":
+				f.api.mu.Lock()
+				ctr := asObject(list(nested(f.api.authStatefulSet, "spec", "template", "spec", "containers"))[0])
+				ctr["env"] = replaceEnv(list(ctr["env"]), "RHIZA_CLUSTER_MEMBERS", object{"valueFrom": object{"secretKeyRef": object{"name": secretName, "key": "peer_tokens"}}})
+				f.api.mu.Unlock()
+			case "mutable-secret", "wrong-secret-owner":
+				f.api.mu.Lock()
+				secret := asObject(f.api.objects[f.e.controller().corePath("secrets", secretName)])
+				if name == "mutable-secret" {
+					secret["immutable"] = false
+				} else {
+					asObject(nested(secret, "metadata", "annotations"))[ownerAnnotation] = "other-cluster:other-logical"
+				}
+				f.api.mu.Unlock()
 			}
 			request := FenceRequest{LogicalID: cluster.Spec.LogicalID, BindingUID: automaticBootstrapClusterUID, Namespace: "test",
 				StatefulSet: cluster.Spec.StatefulSet, StatefulSetUID: f.runtime.StatefulSetUID, SourceClusterID: f.runtime.SourceClusterID,
