@@ -27,24 +27,26 @@ import (
 const gcsInitialHeadInstallStateName = "gcs-initial-head-install-state.json"
 
 type gcsInitialHeadInstallState struct {
-	Version       int    `json:"version"`
-	DeploymentUID string `json:"deploymentUID"`
-	ConfigMapUID  string `json:"configMapUID"`
-	ConfigDigest  string `json:"configDigest"`
-	FencerPod     string `json:"fencerPod"`
-	FencerPodUID  string `json:"fencerPodUID"`
-	NamespaceUID  string `json:"namespaceUID"`
-	SourceCluster string `json:"sourceClusterID"`
-	Bucket        string `json:"bucket"`
-	Prefix        string `json:"prefix"`
-	ControlPrefix string `json:"controlPrefix"`
-	Container     int    `json:"container"`
-	Args          []any  `json:"args"`
-	Mounts        []any  `json:"mounts"`
-	Volumes       []any  `json:"volumes"`
-	PatchedArgs   []any  `json:"patchedArgs"`
-	PatchedMounts []any  `json:"patchedMounts"`
-	PatchedVolume []any  `json:"patchedVolumes"`
+	Version         int    `json:"version"`
+	DeploymentUID   string `json:"deploymentUID"`
+	ConfigMapUID    string `json:"configMapUID"`
+	ConfigDigest    string `json:"configDigest"`
+	FencerPod       string `json:"fencerPod"`
+	FencerPodUID    string `json:"fencerPodUID"`
+	NamespaceUID    string `json:"namespaceUID"`
+	SourceCluster   string `json:"sourceClusterID"`
+	Bucket          string `json:"bucket"`
+	Prefix          string `json:"prefix"`
+	ControlPrefix   string `json:"controlPrefix"`
+	Container       int    `json:"container"`
+	Args            []any  `json:"args"`
+	Mounts          []any  `json:"mounts"`
+	Volumes         []any  `json:"volumes"`
+	PatchedArgs     []any  `json:"patchedArgs"`
+	PatchedMounts   []any  `json:"patchedMounts"`
+	PatchedVolume   []any  `json:"patchedVolumes"`
+	PodTemplate     obj    `json:"podTemplate"`
+	PatchedTemplate obj    `json:"patchedPodTemplate"`
 }
 
 // prepareGCSInitialHeadAckLoss arms the fencer while the StatefulSet is not
@@ -131,14 +133,23 @@ func prepareGCSInitialHeadAckLoss(ctx context.Context) (resultErr error) {
 	patchedArgs := append(append([]any(nil), args...), "--gcs-ack-loss-config-file="+gcsAckLossConfigPath)
 	patchedMounts := append(append([]any(nil), mounts...), obj{"name": gcsAckLossVolumeName, "mountPath": "/var/run/rhiza/gcs-ack-loss", "readOnly": true})
 	patchedVolumes := append(append([]any(nil), volumes...), obj{"name": gcsAckLossVolumeName, "configMap": obj{"name": gcsAckLossConfigMapName, "items": []any{obj{"key": "config.json", "path": "config.json"}}}})
+	originalTemplate, err := ackLossPodTemplate(deployment)
+	if err != nil {
+		return err
+	}
+	patchedTemplate, err := patchAckLossPodTemplate(originalTemplate, containerIndex, patchedArgs, patchedMounts, patchedVolumes)
+	if err != nil {
+		return err
+	}
 	configBytes, err := json.Marshal(config)
 	if err != nil {
 		return err
 	}
-	state := gcsInitialHeadInstallState{Version: 1, DeploymentUID: deploymentUID, ConfigDigest: gcsInitialHeadDigest(configBytes),
+	state := gcsInitialHeadInstallState{Version: 2, DeploymentUID: deploymentUID, ConfigDigest: gcsInitialHeadDigest(configBytes),
 		NamespaceUID: namespaceUID, SourceCluster: clusterID, Bucket: bucket, Prefix: sourcePrefix, ControlPrefix: controlPrefix,
 		Container: containerIndex, Args: args, Mounts: mounts, Volumes: volumes,
-		PatchedArgs: patchedArgs, PatchedMounts: patchedMounts, PatchedVolume: patchedVolumes}
+		PatchedArgs: patchedArgs, PatchedMounts: patchedMounts, PatchedVolume: patchedVolumes,
+		PodTemplate: originalTemplate, PatchedTemplate: patchedTemplate}
 	statePath := path.Join(out, gcsInitialHeadInstallStateName)
 	encodedState, err := json.Marshal(state)
 	if err != nil {
@@ -147,7 +158,7 @@ func prepareGCSInitialHeadAckLoss(ctx context.Context) (resultErr error) {
 	if err := writeNewPrivateAckLossFile(statePath, encodedState); err != nil {
 		return fmt.Errorf("persist private fencer restore state before mutation: %w", err)
 	}
-	fencerPod, cleanup, err := installGCSAckLossConfig(ctx, source, config, out)
+	fencerPod, cleanup, err := installGCSAckLossConfig(ctx, source, config, out, originalTemplate)
 	if err != nil {
 		cleanupCtx, cancel := context.WithTimeout(context.Background(), 150*time.Second)
 		defer cancel()
@@ -204,8 +215,17 @@ func readGCSInitialHeadInstallState(out string) (gcsInitialHeadInstallState, err
 	}
 	decoder := json.NewDecoder(bytes.NewReader(data))
 	decoder.DisallowUnknownFields()
-	if err := decoder.Decode(&state); err != nil || decoder.Decode(new(any)) != io.EOF || state.Version != 1 || state.DeploymentUID == "" || state.ConfigDigest == "" || state.NamespaceUID == "" || state.SourceCluster == "" || state.Bucket == "" || state.Prefix == "" || state.ControlPrefix == "" {
+	if err := decoder.Decode(&state); err != nil || decoder.Decode(new(any)) != io.EOF || state.Version != 2 || state.DeploymentUID == "" || state.ConfigDigest == "" || state.NamespaceUID == "" || state.SourceCluster == "" || state.Bucket == "" || state.Prefix == "" || state.ControlPrefix == "" || state.PodTemplate == nil || state.PatchedTemplate == nil {
 		return gcsInitialHeadInstallState{}, fmt.Errorf("private initial-HEAD fencer restore state is malformed")
+	}
+	index, args, mounts, volumes, err := ackLossDeploymentTemplate(obj{"spec": obj{"template": state.PodTemplate}})
+	expectedArgs := append(append([]any(nil), state.Args...), "--gcs-ack-loss-config-file="+gcsAckLossConfigPath)
+	expectedMounts := append(append([]any(nil), state.Mounts...), obj{"name": gcsAckLossVolumeName, "mountPath": filepath.Dir(gcsAckLossConfigPath), "readOnly": true})
+	expectedVolumes := append(append([]any(nil), state.Volumes...), obj{"name": gcsAckLossVolumeName, "configMap": obj{"name": gcsAckLossConfigMapName, "items": []any{obj{"key": "config.json", "path": "config.json"}}}})
+	expectedPatched, patchErr := patchAckLossPodTemplate(state.PodTemplate, state.Container, expectedArgs, expectedMounts, expectedVolumes)
+	if err != nil || patchErr != nil || index != state.Container || !sameJSON(args, state.Args) || !sameJSON(mounts, state.Mounts) || !sameJSON(volumes, state.Volumes) ||
+		!sameJSON(expectedArgs, state.PatchedArgs) || !sameJSON(expectedMounts, state.PatchedMounts) || !sameJSON(expectedVolumes, state.PatchedVolume) || !sameJSON(expectedPatched, state.PatchedTemplate) {
+		return gcsInitialHeadInstallState{}, fmt.Errorf("private initial-HEAD fencer restore snapshots are inconsistent")
 	}
 	return state, nil
 }
@@ -223,17 +243,23 @@ func restoreGCSInitialHeadAckLoss(ctx context.Context) error {
 	if err != nil || text(nested(deployment, "metadata", "uid")) != state.DeploymentUID || text(nested(deployment, "metadata", "labels", "chaos.rhiza.io/run")) != qualificationRunID {
 		return fmt.Errorf("initial-HEAD fencer Deployment identity changed before cleanup")
 	}
-	currentIndex, currentArgs, currentMounts, currentVolumes, templateErr := ackLossDeploymentTemplate(deployment)
-	if templateErr != nil || currentIndex != state.Container {
+	if !sameJSON(nested(deployment, "spec", "template"), state.PodTemplate) && !sameJSON(nested(deployment, "spec", "template"), state.PatchedTemplate) {
+		return fmt.Errorf("fencer Pod template differs from the saved original and qualification snapshots")
+	}
+	currentIndex, currentArgs, currentMounts, currentVolumes, templateErr := readAckLossDeploymentTemplate(deployment)
+	if templateErr != nil {
 		return fmt.Errorf("read current initial-HEAD fencer template: %w", templateErr)
 	}
+	if currentIndex != state.Container {
+		return fmt.Errorf("current initial-HEAD fencer container index differs from the saved template")
+	}
 	switch {
-	case sameJSON(currentArgs, state.PatchedArgs) && sameJSON(currentMounts, state.PatchedMounts) && sameJSON(currentVolumes, state.PatchedVolume):
+	case sameJSON(nested(deployment, "spec", "template"), state.PatchedTemplate) && sameJSON(currentArgs, state.PatchedArgs) && sameJSON(currentMounts, state.PatchedMounts) && sameJSON(currentVolumes, state.PatchedVolume):
 		if err := restoreAckLossDeployment(ctx, state.DeploymentUID, state.Container, state.Args, state.Mounts, state.Volumes,
-			state.PatchedArgs, state.PatchedMounts, state.PatchedVolume); err != nil {
+			state.PatchedArgs, state.PatchedMounts, state.PatchedVolume, state.PodTemplate, state.PatchedTemplate); err != nil {
 			return fmt.Errorf("restore pre-bootstrap fencer template: %w", err)
 		}
-	case sameJSON(currentArgs, state.Args) && sameJSON(currentMounts, state.Mounts) && sameJSON(currentVolumes, state.Volumes):
+	case sameJSON(nested(deployment, "spec", "template"), state.PodTemplate) && sameJSON(currentArgs, state.Args) && sameJSON(currentMounts, state.Mounts) && sameJSON(currentVolumes, state.Volumes):
 		// Crash before the patch left the original template in place.
 	default:
 		return fmt.Errorf("fencer template differs from both the saved original and qualification versions")

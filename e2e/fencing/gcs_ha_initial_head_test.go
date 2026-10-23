@@ -5,6 +5,8 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -12,6 +14,7 @@ import (
 	"strconv"
 	"strings"
 	"testing"
+	"time"
 
 	"cloud.google.com/go/storage"
 	internalobjstore "github.com/mrchypark/rhiza/internal/objstore"
@@ -108,7 +111,7 @@ if [ "$5" != "get" ]; then echo "unexpected kubectl operation" >&2; exit 90; fi
 kind=$6
 name=${7:-}
 case "$kind:$name" in
-  namespace:) cat %q ;;
+  namespace:rhiza-ha-run-a1b2c3d4) cat %q ;;
   deployment:rhiza-fencer) cat %q ;;
   pods:)
     if [ -f %q ]; then cat %q; else : > %q; cat %q; fi
@@ -182,6 +185,9 @@ esac
 	}
 	if !strings.Contains(log, `"op":"test","path":"/metadata/uid","value":"fencer-deployment-uid"`) {
 		t.Fatalf("pre-apply fencer mutation was not guarded by the captured Deployment UID: %s", log)
+	}
+	if !strings.Contains(log, `"op":"test","path":"/metadata/labels/chaos.rhiza.io~1run","value":"a1b2c3d4"`) {
+		t.Fatalf("pre-apply fencer mutation was not guarded by the exact run label: %s", log)
 	}
 	container := nested(deployment, "spec", "template", "spec", "containers").([]any)[0].(map[string]any)
 	for _, entry := range container["env"].([]any) {
@@ -331,7 +337,7 @@ set -eu
 printf '%%s\n' "$*" >> %q
 if [ "$5" != "get" ]; then echo "unexpected Kubernetes mutation" >&2; exit 91; fi
 case "$6:$7" in
-  namespace:*) cat %q ;;
+  namespace:rhiza-ha-run-a1b2c3d4) cat %q ;;
   deployment:rhiza-fencer) cat %q ;;
   pods:) cat %q ;;
   replicaset:rhiza-fencer-rs) cat %q ;;
@@ -424,12 +430,16 @@ func TestInitialHeadCleanupRestoresOnlyCapturedTemplateAndUIDs(t *testing.T) {
 	patchedArgs := []any{"serve", "--gcs-ack-loss-config-file=" + gcsAckLossConfigPath}
 	patchedMounts := []any{map[string]any{"name": gcsAckLossVolumeName, "mountPath": "/var/run/rhiza/gcs-ack-loss", "readOnly": true}}
 	patchedVolumes := []any{map[string]any{"name": gcsAckLossVolumeName, "configMap": map[string]any{"name": gcsAckLossConfigMapName, "items": []any{map[string]any{"key": "config.json", "path": "config.json"}}}}}
+	originalTemplate := initialHeadCleanupPodTemplate(originalArgs, originalMounts, originalVolumes, "metrics:v1")
+	patchedTemplate := initialHeadCleanupPodTemplate(patchedArgs, patchedMounts, patchedVolumes, "metrics:v1")
+	configBytes := []byte(`{"version":1,"selector":"initial-archive-head"}`)
 	state := gcsInitialHeadInstallState{
-		Version: 1, DeploymentUID: "original-deployment-uid", ConfigMapUID: "original-configmap-uid", ConfigDigest: "digest",
+		Version: 2, DeploymentUID: "original-deployment-uid", ConfigMapUID: "original-configmap-uid", ConfigDigest: gcsInitialHeadDigest(configBytes),
 		NamespaceUID: "namespace-uid", SourceCluster: "source-cluster", Bucket: "qualification-bucket",
 		Prefix: "runs/a1b2c3d4/data/source-cluster", ControlPrefix: "runs/a1b2c3d4/control", Container: 0,
 		Args: originalArgs, Mounts: originalMounts, Volumes: originalVolumes,
 		PatchedArgs: patchedArgs, PatchedMounts: patchedMounts, PatchedVolume: patchedVolumes,
+		PodTemplate: originalTemplate, PatchedTemplate: patchedTemplate,
 	}
 	stateBytes, err := json.Marshal(state)
 	if err != nil {
@@ -440,16 +450,10 @@ func TestInitialHeadCleanupRestoresOnlyCapturedTemplateAndUIDs(t *testing.T) {
 		t.Fatal(err)
 	}
 	deploymentPath, configMapPath := filepath.Join(tmp, "deployment.json"), filepath.Join(tmp, "configmap.json")
-	deployment := map[string]any{
-		"metadata": map[string]any{"name": "rhiza-fencer", "namespace": namespace, "uid": "original-deployment-uid",
-			"labels": map[string]any{"chaos.rhiza.io/run": qualificationRunID}},
-		"spec": map[string]any{"template": map[string]any{"spec": map[string]any{
-			"containers": []any{map[string]any{"name": "authority", "args": patchedArgs, "volumeMounts": patchedMounts}},
-			"volumes":    patchedVolumes,
-		}}},
-	}
-	configMap := map[string]any{"metadata": map[string]any{"namespace": namespace, "uid": "original-configmap-uid",
-		"labels": map[string]any{"chaos.rhiza.io/run": qualificationRunID}}}
+	deployment := initialHeadCleanupDeployment(namespace, "original-deployment-uid", qualificationRunID, patchedTemplate)
+	configMap := map[string]any{"metadata": map[string]any{"name": gcsAckLossConfigMapName, "namespace": namespace, "uid": "original-configmap-uid", "resourceVersion": "17",
+		"labels": map[string]any{"chaos.rhiza.io/run": qualificationRunID}}, "immutable": true,
+		"data": map[string]any{"config.json": string(configBytes)}}
 	for name, value := range map[string]any{deploymentPath: deployment, configMapPath: configMap} {
 		data, err := json.Marshal(value)
 		if err != nil {
@@ -461,21 +465,11 @@ func TestInitialHeadCleanupRestoresOnlyCapturedTemplateAndUIDs(t *testing.T) {
 	}
 	logPath := filepath.Join(tmp, "kubectl.log")
 	deletedPath := filepath.Join(tmp, "configmap-deleted")
-	script := fmt.Sprintf(`#!/bin/sh
-set -eu
-printf '%%s\n' "$*" >> %q
-if [ "$5" = "get" ] && [ "$6" = "deployment" ]; then cat %q; exit 0; fi
-if [ "$5" = "get" ] && [ "$6" = "configmap" ]; then cat %q; exit 0; fi
-if [ "$5" = "patch" ] && [ "$6" = "deployment" ]; then exit 0; fi
-if [ "$5" = "rollout" ] && [ "$6" = "status" ]; then exit 0; fi
-if [ "$5" = "delete" ] && [ "$6" = "configmap" ] && [ "$9" = "--preconditions=uid=original-configmap-uid" ]; then : > %q; exit 0; fi
-echo "unexpected kubectl command" >&2
-exit 90
-`, logPath, deploymentPath, configMapPath, deletedPath)
-	kubectlPath := filepath.Join(tmp, "kubectl")
-	if err := os.WriteFile(kubectlPath, []byte(script), 0700); err != nil {
-		t.Fatal(err)
-	}
+	deleteBodyPath := filepath.Join(tmp, "delete-options.jsonl")
+	writeInitialHeadCleanupKubectl(t, tmp, logPath, deploymentPath, configMapPath, "original-configmap-uid")
+	t.Setenv("RHIZA_TEST_KUBE_PROXY_DELETE_BODY", deleteBodyPath)
+	t.Setenv("RHIZA_TEST_KUBE_PROXY_EXPECTED_RV", "17")
+	t.Setenv("RHIZA_TEST_KUBE_PROXY_DELETE_MARKER", deletedPath)
 	t.Setenv("PATH", tmp+string(os.PathListSeparator)+os.Getenv("PATH"))
 	t.Setenv("FENCING_E2E_OUT", out)
 
@@ -494,6 +488,8 @@ exit 90
 	}
 	log := string(logBytes)
 	if !strings.Contains(log, `"op":"test","path":"/metadata/uid","value":"original-deployment-uid"`) ||
+		!strings.Contains(log, `"op":"test","path":"/metadata/labels/chaos.rhiza.io~1run","value":"a1b2c3d4"`) ||
+		!strings.Contains(log, `"op":"test","path":"/spec/template","value":`) ||
 		!strings.Contains(log, `"op":"replace","path":"/spec/template/spec/containers/0/args","value":["serve"]`) ||
 		!strings.Contains(log, `"op":"replace","path":"/spec/template/spec/containers/0/volumeMounts","value":[]`) ||
 		!strings.Contains(log, `"op":"replace","path":"/spec/template/spec/volumes","value":[]`) ||
@@ -516,13 +512,16 @@ func TestInitialHeadCleanupRetainsRestoreRecordUntilAbsentConfigAndTemplateAreVe
 	patchedArgs := []any{"serve", "--gcs-ack-loss-config-file=" + gcsAckLossConfigPath}
 	patchedMounts := []any{map[string]any{"name": gcsAckLossVolumeName, "mountPath": filepath.Dir(gcsAckLossConfigPath), "readOnly": true}}
 	patchedVolumes := []any{map[string]any{"name": gcsAckLossVolumeName, "configMap": map[string]any{"name": gcsAckLossConfigMapName, "items": []any{map[string]any{"key": "config.json", "path": "config.json"}}}}}
+	originalTemplate := initialHeadCleanupPodTemplate(originalArgs, originalMounts, originalVolumes, "metrics:v1")
+	patchedTemplate := initialHeadCleanupPodTemplate(patchedArgs, patchedMounts, patchedVolumes, "metrics:v1")
 	configBytes := []byte(`{"version":1,"selector":"initial-archive-head"}`)
 	state := gcsInitialHeadInstallState{
-		Version: 1, DeploymentUID: "deployment-uid", ConfigDigest: gcsInitialHeadDigest(configBytes),
+		Version: 2, DeploymentUID: "deployment-uid", ConfigMapUID: "matching-run-configmap-uid", ConfigDigest: gcsInitialHeadDigest(configBytes),
 		NamespaceUID: "namespace-uid", SourceCluster: "source-cluster", Bucket: "qualification-bucket",
 		Prefix: "runs/a1b2c3d4/data/source-cluster", ControlPrefix: "runs/a1b2c3d4/control", Container: 0,
 		Args: originalArgs, Mounts: originalMounts, Volumes: originalVolumes,
 		PatchedArgs: patchedArgs, PatchedMounts: patchedMounts, PatchedVolume: patchedVolumes,
+		PodTemplate: originalTemplate, PatchedTemplate: patchedTemplate,
 	}
 	stateBytes, err := json.Marshal(state)
 	if err != nil {
@@ -533,15 +532,9 @@ func TestInitialHeadCleanupRetainsRestoreRecordUntilAbsentConfigAndTemplateAreVe
 		t.Fatal(err)
 	}
 	deploymentPath := filepath.Join(tmp, "deployment.json")
-	writeDeployment := func(args, mounts, volumes []any) {
+	writeDeployment := func(template obj) {
 		t.Helper()
-		deployment := map[string]any{
-			"metadata": map[string]any{"name": "rhiza-fencer", "namespace": namespace, "uid": state.DeploymentUID,
-				"labels": map[string]any{"chaos.rhiza.io/run": qualificationRunID}},
-			"spec": map[string]any{"template": map[string]any{"spec": map[string]any{
-				"containers": []any{map[string]any{"name": "authority", "args": args, "volumeMounts": mounts}}, "volumes": volumes,
-			}}},
-		}
+		deployment := initialHeadCleanupDeployment(namespace, state.DeploymentUID, qualificationRunID, template)
 		data, err := json.Marshal(deployment)
 		if err != nil {
 			t.Fatal(err)
@@ -571,26 +564,14 @@ func TestInitialHeadCleanupRetainsRestoreRecordUntilAbsentConfigAndTemplateAreVe
 	}
 	// Simulate an interrupted/ambiguous patch with a template matching neither
 	// the saved original nor the exact qualification template.
-	writeDeployment([]any{"serve", "unexpected-arg"}, patchedMounts, patchedVolumes)
+	writeDeployment(initialHeadCleanupPodTemplate([]any{"serve", "unexpected-arg"}, patchedMounts, patchedVolumes, "metrics:v1"))
 	logPath := filepath.Join(tmp, "kubectl.log")
-	kubectlPath := filepath.Join(tmp, "kubectl")
-	script := fmt.Sprintf(`#!/bin/sh
-set -eu
-printf '%%s\n' "$*" >> %q
-if [ "$5" = "get" ] && [ "$6" = "deployment" ]; then cat %q; exit 0; fi
-if [ "$5" = "get" ] && [ "$6" = "configmap" ]; then
-  if [ -f %q ]; then cat %q; exit 0; fi
-  echo 'Error from server (NotFound)' >&2
-  exit 1
-fi
-if [ "$5" = "rollout" ] && [ "$6" = "status" ]; then exit 0; fi
-if [ "$5" = "delete" ] && [ "$6" = "configmap" ]; then : > %q; exit 0; fi
-echo "unexpected kubectl operation" >&2
-exit 90
-`, logPath, deploymentPath, configMapPath, configMapPath, filepath.Join(tmp, "configmap-deleted"))
-	if err := os.WriteFile(kubectlPath, []byte(script), 0700); err != nil {
-		t.Fatal(err)
-	}
+	deleteBodyPath := filepath.Join(tmp, "delete-options.jsonl")
+	deletedPath := filepath.Join(tmp, "configmap-deleted")
+	writeInitialHeadCleanupKubectl(t, tmp, logPath, deploymentPath, configMapPath, state.ConfigMapUID)
+	t.Setenv("RHIZA_TEST_KUBE_PROXY_DELETE_BODY", deleteBodyPath)
+	t.Setenv("RHIZA_TEST_KUBE_PROXY_EXPECTED_RV", "18")
+	t.Setenv("RHIZA_TEST_KUBE_PROXY_DELETE_MARKER", deletedPath)
 	t.Setenv("PATH", tmp+string(os.PathListSeparator)+os.Getenv("PATH"))
 	t.Setenv("FENCING_E2E_OUT", out)
 
@@ -608,8 +589,44 @@ exit 90
 		t.Fatalf("ambiguous cleanup mutated Kubernetes resources: %s", logBytes)
 	}
 
+	// An unrelated sidecar change must not be overwritten by cleanup, even
+	// when the fencer's own args, mounts, and volumes still match the patch.
+	ownedConfigMap := map[string]any{
+		"metadata": map[string]any{
+			"name": gcsAckLossConfigMapName, "namespace": namespace, "uid": state.ConfigMapUID,
+			"labels": map[string]any{"chaos.rhiza.io/run": qualificationRunID},
+		},
+		"immutable": true,
+		"data":      map[string]any{"config.json": string(configBytes)},
+	}
+	ownedData, err := json.Marshal(ownedConfigMap)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(configMapPath, ownedData, 0600); err != nil {
+		t.Fatal(err)
+	}
+	driftedTemplate := initialHeadCleanupPodTemplate(patchedArgs, patchedMounts, patchedVolumes, "metrics:v2")
+	writeDeployment(driftedTemplate)
+	if err := restoreGCSInitialHeadAckLoss(context.Background()); err == nil {
+		t.Fatal("cleanup accepted unrelated PodTemplate sidecar drift")
+	}
+	if _, err := os.Stat(statePath); err != nil {
+		t.Fatalf("sidecar drift discarded its private restore record: %v", err)
+	}
+	logBytes, err = os.ReadFile(logPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(logBytes), "patch deployment") || strings.Contains(string(logBytes), "delete configmap") {
+		t.Fatalf("sidecar drift caused mutation or ConfigMap deletion: %s", logBytes)
+	}
+	if _, err := os.Stat(filepath.Join(tmp, "configmap-deleted")); !os.IsNotExist(err) {
+		t.Fatalf("sidecar drift deleted the owned ConfigMap: %v", err)
+	}
+
 	// Mutable matching contents must not be adopted as cleanup ownership.
-	writeDeployment(originalArgs, originalMounts, originalVolumes)
+	writeDeployment(state.PodTemplate)
 	writeMutableConfigMap()
 	if err := restoreGCSInitialHeadAckLoss(context.Background()); err == nil {
 		t.Fatal("cleanup adopted a mutable same-run ConfigMap with matching contents")
@@ -627,14 +644,184 @@ exit 90
 	if _, err := os.Stat(filepath.Join(tmp, "configmap-deleted")); !os.IsNotExist(err) {
 		t.Fatalf("mutable ConfigMap was deleted despite lacking immutable ownership proof: %v", err)
 	}
-	if err := os.Remove(configMapPath); err != nil {
-		t.Fatal(err)
+	writeOwnedConfigMapVersion := func(resourceVersion string) {
+		t.Helper()
+		configMap := map[string]any{
+			"metadata": map[string]any{
+				"name": gcsAckLossConfigMapName, "namespace": namespace, "uid": state.ConfigMapUID,
+				"resourceVersion": resourceVersion, "labels": map[string]any{"chaos.rhiza.io/run": qualificationRunID},
+			},
+			"immutable": true,
+			"data":      map[string]any{"config.json": string(configBytes)},
+		}
+		data, err := json.Marshal(configMap)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(configMapPath, data, 0600); err != nil {
+			t.Fatal(err)
+		}
 	}
+	writeOwnedConfigMapVersion("17")
+	if err := restoreGCSInitialHeadAckLoss(context.Background()); err == nil || !strings.Contains(err.Error(), "HTTP 409") {
+		t.Fatalf("cleanup did not fail closed on a stale ConfigMap resourceVersion: %v", err)
+	}
+	if _, err := os.Stat(statePath); err != nil {
+		t.Fatalf("stale-version rejection discarded the private restore record: %v", err)
+	}
+	if _, err := os.Stat(deletedPath); !os.IsNotExist(err) {
+		t.Fatalf("stale-version rejection marked ConfigMap deleted: %v", err)
+	}
+
+	writeOwnedConfigMapVersion("18")
 	if err := restoreGCSInitialHeadAckLoss(context.Background()); err != nil {
-		t.Fatalf("retry with verified original template and absent ConfigMap failed: %v", err)
+		t.Fatalf("retry with freshly read resourceVersion failed: %v", err)
 	}
 	if _, err := os.Stat(statePath); !os.IsNotExist(err) {
-		t.Fatalf("verified cleanup did not remove its private restore record: %v", err)
+		t.Fatalf("verified cleanup did not remove its private restore state: %v", err)
+	}
+	if _, err := os.Stat(deletedPath); err != nil {
+		t.Fatalf("resourceVersion-bound cleanup did not record ConfigMap deletion: %v", err)
+	}
+	deleteBodies, err := os.ReadFile(deleteBodyPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var requests []map[string]any
+	for _, line := range strings.Split(strings.TrimSpace(string(deleteBodies)), "\n") {
+		var request map[string]any
+		if err := json.Unmarshal([]byte(line), &request); err != nil {
+			t.Fatal(err)
+		}
+		requests = append(requests, request)
+	}
+	if len(requests) != 2 {
+		t.Fatalf("cleanup sent %d delete requests, want stale attempt plus retry: %s", len(requests), deleteBodies)
+	}
+	for i, wantVersion := range []string{"17", "18"} {
+		preconditions := nested(requests[i], "preconditions")
+		if requests[i]["apiVersion"] != "v1" || requests[i]["kind"] != "DeleteOptions" ||
+			nested(preconditions, "uid") != state.ConfigMapUID || nested(preconditions, "resourceVersion") != wantVersion {
+			t.Fatalf("delete request %d lacks exact UID/resourceVersion preconditions: %#v", i, requests[i])
+		}
+	}
+}
+
+func initialHeadCleanupPodTemplate(args, mounts, volumes []any, metricsImage string) obj {
+	return obj{
+		"metadata": obj{
+			"labels":      obj{"app": "rhiza-fencer"},
+			"annotations": obj{"fixture.rhiza.io/owner": "initial-head-test"},
+		},
+		"spec": obj{
+			"serviceAccountName": "rhiza-fencer",
+			"containers": []any{
+				obj{"name": "authority", "image": "rhiza-fencer:test", "args": args, "volumeMounts": mounts},
+				obj{"name": "metrics", "image": metricsImage, "args": []any{"serve-metrics"}, "ports": []any{obj{"name": "metrics", "containerPort": 9090}}},
+			},
+			"volumes":      volumes,
+			"nodeSelector": obj{"rhiza.io/role": "control"},
+		},
+	}
+}
+
+func initialHeadCleanupDeployment(namespace, uid, runID string, template obj) obj {
+	return obj{
+		"metadata": obj{"name": "rhiza-fencer", "namespace": namespace, "uid": uid,
+			"labels": obj{"chaos.rhiza.io/run": runID}},
+		"spec": obj{"template": template},
+	}
+}
+
+func writeInitialHeadCleanupKubectl(t *testing.T, dir, logPath, deploymentPath, configMapPath, expectedConfigMapUID string) {
+	t.Helper()
+	t.Setenv("RHIZA_TEST_KUBE_PROXY_BINARY", os.Args[0])
+	t.Setenv("RHIZA_TEST_KUBE_PROXY_NAMESPACE", namespace)
+	t.Setenv("RHIZA_TEST_KUBE_PROXY_EXPECTED_UID", expectedConfigMapUID)
+	script := fmt.Sprintf(`#!/bin/sh
+set -eu
+printf '%%s\n' "$*" >> %q
+if [ "$5" = "get" ] && [ "$6" = "deployment" ]; then cat %q; exit 0; fi
+if [ "$5" = "get" ] && [ "$6" = "configmap" ]; then
+  if [ -f %q ]; then cat %q; exit 0; fi
+  echo 'Error from server (NotFound)' >&2
+  exit 1
+fi
+if [ "$5" = "rollout" ] && [ "$6" = "status" ]; then exit 0; fi
+if [ "$3" = "proxy" ]; then
+  export RHIZA_TEST_KUBE_PROXY_HELPER=1
+  export RHIZA_TEST_KUBE_PROXY_SOCKET="$5"
+  exec "$RHIZA_TEST_KUBE_PROXY_BINARY" -test.run='^TestInitialHeadCleanupKubectlProxyHelper$'
+fi
+echo "unexpected kubectl operation" >&2
+exit 90
+`, logPath, deploymentPath, configMapPath, configMapPath)
+	if err := os.WriteFile(filepath.Join(dir, "kubectl"), []byte(script), 0700); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestInitialHeadCleanupKubectlProxyHelper(t *testing.T) {
+	if os.Getenv("RHIZA_TEST_KUBE_PROXY_HELPER") != "1" {
+		return
+	}
+	listener, err := net.Listen("unix", os.Getenv("RHIZA_TEST_KUBE_PROXY_SOCKET"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	mux := http.NewServeMux()
+	mux.HandleFunc("/version", func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	})
+	deletePath := "/api/v1/namespaces/" + os.Getenv("RHIZA_TEST_KUBE_PROXY_NAMESPACE") + "/configmaps/" + gcsAckLossConfigMapName
+	mux.HandleFunc(deletePath, func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodDelete {
+			http.Error(w, "unexpected method", http.StatusMethodNotAllowed)
+			return
+		}
+		body, err := io.ReadAll(r.Body)
+		if err != nil {
+			http.Error(w, "read DeleteOptions", http.StatusBadRequest)
+			return
+		}
+		bodyFile, err := os.OpenFile(os.Getenv("RHIZA_TEST_KUBE_PROXY_DELETE_BODY"), os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0600)
+		if err != nil {
+			http.Error(w, "record DeleteOptions", http.StatusInternalServerError)
+			return
+		}
+		_, writeErr := bodyFile.Write(append(body, '\n'))
+		closeErr := bodyFile.Close()
+		if writeErr != nil || closeErr != nil {
+			http.Error(w, "record DeleteOptions", http.StatusInternalServerError)
+			return
+		}
+		var options struct {
+			APIVersion    string `json:"apiVersion"`
+			Kind          string `json:"kind"`
+			Preconditions struct {
+				UID             string  `json:"uid"`
+				ResourceVersion *string `json:"resourceVersion"`
+			} `json:"preconditions"`
+		}
+		if err := json.Unmarshal(body, &options); err != nil || options.APIVersion != "v1" || options.Kind != "DeleteOptions" ||
+			options.Preconditions.UID != os.Getenv("RHIZA_TEST_KUBE_PROXY_EXPECTED_UID") || options.Preconditions.ResourceVersion == nil {
+			http.Error(w, "missing exact delete preconditions", http.StatusBadRequest)
+			return
+		}
+		if *options.Preconditions.ResourceVersion != os.Getenv("RHIZA_TEST_KUBE_PROXY_EXPECTED_RV") {
+			http.Error(w, "stale resourceVersion", http.StatusConflict)
+			return
+		}
+		if marker := os.Getenv("RHIZA_TEST_KUBE_PROXY_DELETE_MARKER"); marker != "" {
+			if err := os.WriteFile(marker, []byte("deleted"), 0600); err != nil {
+				http.Error(w, "record delete", http.StatusInternalServerError)
+				return
+			}
+		}
+		w.WriteHeader(http.StatusOK)
+	})
+	if err := http.Serve(listener, mux); err != nil && !errors.Is(err, http.ErrServerClosed) {
+		t.Fatal(err)
 	}
 }
 
@@ -682,8 +869,9 @@ func TestVerifyGCSInitialHeadClosedControlRequiresExactRequestAndProof(t *testin
 		"closedBy": request.OperationID, "closedHash": requestDigest,
 	}}
 	proof := operator.FenceProof{OperationID: request.OperationID, SourceClusterID: source.ClusterID, BindingUID: source.BindingUID,
+		RequestHash: requestDigest, ProofID: "initial-head-proof", ProcessesTerminated: true, RecreationBlocked: true, StorageQuiesced: true,
 		IndependentV2: &operator.IndependentEvidenceV2{
-			RequestHash: requestDigest, LedgerHash: gcsInitialHeadDigest(encoded([]any{source.Namespace, state})),
+			Version: 2, RequestHash: requestDigest, LedgerHash: gcsInitialHeadDigest(encoded([]any{source.Namespace, state})),
 		}}
 	if _, err := verifyGCSInitialHeadClosedControl(state, source, request, proof); err != nil {
 		t.Fatalf("exact closed CONTROL root and proof were rejected: %v", err)
@@ -853,11 +1041,11 @@ func TestWaitForGCSInitialHeadRecoveryDoesNotAcceptPendingFence(t *testing.T) {
 		t.Fatal(err)
 	}
 	t.Setenv("PATH", tmp+string(os.PathListSeparator)+os.Getenv("PATH"))
-	ctx, cancel := context.WithCancel(context.Background())
-	cancel()
+	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	defer cancel()
 	source := gcsRecoverySource{Namespace: namespace, ClusterID: "source", StatefulSet: "rhiza", StatefulSetUID: "sts-uid", BindingUID: "binding-uid", LogicalID: "logical"}
 	gotRequest, gotProof, gotRecovery, _, err := waitForGCSInitialHeadRecovery(ctx, source, obj{"metadata": obj{"name": "cluster", "uid": "cluster-uid"}}, nil)
-	if err == nil || gotRequest.OperationID != request.OperationID || gotProof.OperationID != "" || gotRecovery.Status.Phase != "" {
+	if !errors.Is(err, context.DeadlineExceeded) || gotRequest.OperationID != request.OperationID || gotProof.OperationID != "" || gotRecovery.Status.Phase != "" {
 		t.Fatalf("pending fence was treated as completed recovery: request=%+v proof=%+v recovery=%+v err=%v", gotRequest, gotProof, gotRecovery, err)
 	}
 	logBytes, err := os.ReadFile(logPath)

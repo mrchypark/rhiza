@@ -254,6 +254,9 @@ func configureAutomaticBootstrapKubernetes(t *testing.T, f *heldProfileFixture, 
 	f.api.mu.Lock()
 	sts["spec"].(object)["template"].(object)["metadata"] = object{"labels": object{"app": "rhiza"}}
 	f.api.authStatefulSet = sts
+	// Registration derives the archive scope from the live StatefulSet
+	// collection, not only from the named object used by pod authentication.
+	f.api.objects["/apis/apps/v1/namespaces/test/statefulsets"] = object{"items": []any{sts}}
 	f.api.objects[clusterPath] = jsonObjectForPreflight(t, cluster)
 	f.api.objects["/apis/rhiza.mrchypark.dev/v1alpha1/namespaces/test/rhizaclusters"] = object{"items": []any{jsonObjectForPreflight(t, cluster)}}
 	f.api.objects["/api/v1/namespaces/test"] = object{"metadata": object{"name": "test", "uid": automaticBootstrapNamespaceUID}}

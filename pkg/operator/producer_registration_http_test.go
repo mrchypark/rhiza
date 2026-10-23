@@ -120,13 +120,17 @@ func newSupervisorRegistrationFixture(t *testing.T, required bool) supervisorReg
 		MutationProfile: fencing.MutationHeldExecutionProfile,
 	}
 	if required {
+		runtimeStateDir := filepath.Join(t.TempDir(), "runtime-agent-state")
+		if err := os.Mkdir(runtimeStateDir, 0700); err != nil {
+			t.Fatal(err)
+		}
 		listener, err := net.Listen("tcp", "127.0.0.1:0")
 		if err != nil {
 			t.Fatal(err)
 		}
 		runtimeService, err := runtimeagent.New(runtimeagent.Config{
 			AuthorityID: "authority", AuthorityNamespace: "test", AuthorityServiceAccount: "runtime-agent",
-			AuthorityWorkloadUID: "runtime-agent-workload", Audience: "rhiza-runtime-agent", Directory: t.TempDir(),
+			AuthorityWorkloadUID: "runtime-agent-workload", Audience: "rhiza-runtime-agent", Directory: runtimeStateDir,
 			Auth: supervisorRegistrationAgentAuth{}, Backend: supervisorRegistrationAgentBackend{},
 		})
 		if err != nil {
@@ -151,7 +155,11 @@ func newSupervisorRegistrationFixture(t *testing.T, required bool) supervisorReg
 		e.RuntimeAgent = &RuntimeAgentClient{Kube: e.Kube, AuthorityID: "authority", TokenFile: tokenFile, CA: ca, ServerName: serverName,
 			Port: strconv.Itoa(listener.Addr().(*net.TCPAddr).Port)}
 	}
-	return supervisorRegistrationFixture{e: e, state: state, identity: identity, token: tokenFile, server: apiServer}
+	// The supervisor client talks to the real executor handler. Kubernetes
+	// discovery/authentication performed by that handler still uses apiServer.
+	authorityServer := httptest.NewTLSServer(e.Handler())
+	t.Cleanup(authorityServer.Close)
+	return supervisorRegistrationFixture{e: e, state: state, identity: identity, token: tokenFile, server: authorityServer}
 }
 
 func TestRequiredMutationProducerIsReservedByAuthenticatedRegistrationBeforeWALBind(t *testing.T) {
