@@ -129,6 +129,91 @@ func TestPublicPacketExcludesRawDiagnosticsAndSecretFields(t *testing.T) {
 	}
 }
 
+func TestVoterStartupDiagnosticsAreIdentityBoundAndRedacted(t *testing.T) {
+	const canary = "private-condition-message-token-canary"
+	raw := t.TempDir()
+	diagnostics := filepath.Join(raw, "private-voter-diagnostics")
+	if err := os.Mkdir(diagnostics, 0700); err != nil {
+		t.Fatal(err)
+	}
+	voters := []obj{}
+	for ordinal := 0; ordinal < 3; ordinal++ {
+		name := fmt.Sprintf("rhiza-%d", ordinal)
+		dir := filepath.Join(diagnostics, name)
+		if err := os.Mkdir(dir, 0700); err != nil {
+			t.Fatal(err)
+		}
+		identity, captured := "verified", true
+		log := "rhiza: open WAL: private path and token=" + canary + "\n"
+		phase, ready := "Running", false
+		if ordinal == 1 {
+			identity, captured = "identity_drift", false
+			log = canary
+		}
+		if ordinal == 2 {
+			log = "rhiza: unexpected startup failure " + canary + "\n"
+		}
+		for _, suffix := range []string{"current", "previous"} {
+			if err := os.WriteFile(filepath.Join(dir, suffix+".log"), []byte(log), 0600); err != nil {
+				t.Fatal(err)
+			}
+			if captured {
+				if err := os.WriteFile(filepath.Join(dir, suffix+".captured"), []byte("true\n"), 0600); err != nil {
+					t.Fatal(err)
+				}
+			}
+		}
+		if ordinal == 1 {
+			ready = true
+		}
+		conditionStatus := "False"
+		if ready {
+			conditionStatus = "True"
+		}
+		voters = append(voters, obj{
+			"ordinal": fmt.Sprint(ordinal), "podUID": "private-pod-uid-" + fmt.Sprint(ordinal), "identity": identity, "logsCaptured": captured,
+			"status": obj{"phase": phase, "conditions": []obj{{"type": "Ready", "status": conditionStatus, "reason": "ContainersNotReady", "message": canary}},
+				"containers": []obj{{"ready": ready, "restartCount": 3, "state": obj{"waiting": obj{"reason": "CrashLoopBackOff", "message": canary}},
+					"lastState": obj{"terminated": obj{"reason": "Error", "exitCode": 2, "signal": 9}}}}},
+		})
+	}
+	projected, err := projectVoterStartupDiagnostics(raw, encoded(obj{"statefulSetIdentity": "pinned", "statefulSetUID": "private-sts-uid", "voters": voters}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if bytes.Contains(projected, []byte(canary)) || bytes.Contains(projected, []byte("private-pod-uid")) || bytes.Contains(projected, []byte("private-sts-uid")) {
+		t.Fatal("public voter diagnostics leaked private message or identity")
+	}
+	var view voterStartupPublicView
+	if err := json.Unmarshal(projected, &view); err != nil {
+		t.Fatal(err)
+	}
+	if !view.StatefulSetPinned || len(view.Voters) != 3 {
+		t.Fatalf("pinned voter diagnostics are incomplete: %+v", view)
+	}
+	if !view.Voters[0].CurrentLog.Captured || !contains(view.Voters[0].CurrentLog.Startup, "wal_open_failed") {
+		t.Fatalf("known startup prefix was not classified: %+v", view.Voters[0].CurrentLog)
+	}
+	if !view.Voters[0].PreviousLog.Captured || view.Voters[0].Containers[0].RestartCount != 3 || view.Voters[0].Containers[0].LastExitCode == nil || *view.Voters[0].Containers[0].LastExitCode != 2 {
+		t.Fatalf("bounded previous log/container state was not projected: %+v", view.Voters[0])
+	}
+	if view.Voters[1].CurrentLog.Captured || view.Voters[1].Identity != "identity_drift" {
+		t.Fatalf("identity-drift logs were not discarded: %+v", view.Voters[1])
+	}
+	if !contains(view.Voters[2].CurrentLog.Startup, "unknown_startup_error") {
+		t.Fatalf("unknown startup failure was not safely categorized: %+v", view.Voters[2].CurrentLog)
+	}
+}
+
+func contains(values []string, want string) bool {
+	for _, value := range values {
+		if value == want {
+			return true
+		}
+	}
+	return false
+}
+
 func TestRuntimeAgentDiagnosticsRejectUnallowlistedOrExcessivePairs(t *testing.T) {
 	base := fencerDiagnosticsView{}
 	base.RuntimeAgent.PodName = "rhiza-runtime-agent-abc"
@@ -262,6 +347,48 @@ func TestRunScriptCapturesBoundedOwnedDiagnosticsBeforeDeletingKind(t *testing.T
 	} {
 		if !strings.Contains(source, required) {
 			t.Fatalf("bounded owned diagnostic capture missing %q", required)
+		}
+	}
+}
+
+func TestRunScriptPinsVoterStartupEvidenceAcrossScaleAndLogFetch(t *testing.T) {
+	script, err := os.ReadFile("run.sh")
+	if err != nil {
+		t.Fatal(err)
+	}
+	source := string(script)
+	pin := strings.Index(source, "fencing_source_sts_uid=$(k --request-timeout=10s get statefulset rhiza")
+	scale := strings.Index(source, "k scale statefulset rhiza --replicas=3")
+	if pin < 0 || scale < 0 || pin > scale {
+		t.Fatal("source StatefulSet UID must be pinned before scaling")
+	}
+	collectorStart := strings.Index(source, "capture_voter_startup_diagnostics() (\n")
+	if collectorStart < 0 {
+		t.Fatal("voter diagnostic collector boundary is missing")
+	}
+	collectorEnd := strings.Index(source[collectorStart:], "\ncapture_fencer_diagnostics() {")
+	if collectorEnd < 0 {
+		t.Fatal("voter diagnostic collector boundary is missing")
+	}
+	collector := source[collectorStart : collectorStart+collectorEnd]
+	umask := strings.Index(collector, "\n  umask 077\n")
+	privateOutput := strings.Index(collector, `>"$FENCING_E2E_OUT/voter-startup-private.json"`)
+	if umask < 0 || privateOutput < 0 || umask > privateOutput {
+		t.Fatal("private voter diagnostic umask must be set before any private output is created")
+	}
+	for _, required := range []string{
+		"for ordinal in 0 1 2",
+		"--arg owner \"$pinned_uid\"",
+		".controller == true and .kind == \"StatefulSet\" and .name == \"rhiza\" and .uid == $owner",
+		"--tail=80 --limit-bytes=16384",
+		"after_container=",
+		"after_restarts=",
+		"identity_drift",
+		"private-voter-diagnostics",
+		"chmod 600 \"$FENCING_E2E_OUT/voter-startup-private.json\"",
+	} {
+		if !strings.Contains(source, required) {
+			t.Fatalf("voter startup collector is missing identity/bounds guard %q", required)
 		}
 	}
 }

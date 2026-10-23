@@ -83,10 +83,92 @@ if kind get clusters | grep -Fx "$fencing_cluster" >/dev/null; then
 fi
 fencing_tmp=$(mktemp -d)
 fencing_owned=false
+fencing_source_sts_uid=''
 k() { kubectl --context "$fencing_context" -n "$fencing_namespace" "$@"; }
+capture_voter_startup_diagnostics() (
+  umask 077
+  voter_diagnostics_dir="$FENCING_E2E_OUT/private-voter-diagnostics"
+  (umask 077 && mkdir -m 700 "$voter_diagnostics_dir") || return 1
+  pinned_uid=$fencing_source_sts_uid
+  if [ -z "$pinned_uid" ]; then
+    printf '%s\n' '{"statefulSetIdentity":"unavailable","voters":[]}' >"$FENCING_E2E_OUT/voter-startup-private.json"
+    chmod 600 "$FENCING_E2E_OUT/voter-startup-private.json"
+    return 0
+  fi
+  for ordinal in 0 1 2; do
+    pod="rhiza-$ordinal"
+    pod_dir="$voter_diagnostics_dir/$pod"
+    (umask 077 && mkdir -m 700 "$pod_dir") || return 1
+    printf '%s\n' '{}' >"$pod_dir/status.json"
+    before_sts=$(k --request-timeout=10s get statefulset rhiza -o json 2>"$pod_dir/sts-before.stderr" || true)
+    before_pod=$(k --request-timeout=10s get pod "$pod" -o json 2>"$pod_dir/pod-before.stderr" || true)
+    identity_status=unavailable
+    pod_uid=''
+    container_id=''
+    restart_count=''
+    if [ -n "$before_sts" ] && [ -n "$before_pod" ] &&
+      printf '%s\n' "$before_sts" | jq -e --arg uid "$pinned_uid" '.metadata.uid == $uid' >/dev/null 2>&1 &&
+      pod_uid=$(printf '%s\n' "$before_pod" | jq -er --arg name "$pod" --arg ns "$fencing_namespace" --arg owner "$pinned_uid" \
+        'select(.metadata.name == $name and .metadata.namespace == $ns) | select(any(.metadata.ownerReferences[]?; .controller == true and .kind == "StatefulSet" and .name == "rhiza" and .uid == $owner)) | .metadata.uid | select(type == "string" and length > 0)' 2>/dev/null) &&
+      container_id=$(printf '%s\n' "$before_pod" | jq -er '[.status.containerStatuses[]? | select(.name == "rhiza")] | if length == 1 then .[0].containerID // "" else "" end' 2>/dev/null) &&
+      restart_count=$(printf '%s\n' "$before_pod" | jq -er '[.status.containerStatuses[]? | select(.name == "rhiza")] | if length == 1 then (.[0].restartCount | tostring) else "" end' 2>/dev/null); then
+      identity_status=verified
+      printf '%s\n' "$before_pod" | jq -ce --arg name "$pod" --arg ns "$fencing_namespace" --arg owner "$pinned_uid" \
+        '[select(.metadata.name == $name and .metadata.namespace == $ns) | select(any(.metadata.ownerReferences[]?; .controller == true and .kind == "StatefulSet" and .name == "rhiza" and .uid == $owner)) | {
+          phase:(.status.phase // "Unknown"),
+          conditions:[.status.conditions[]? | {type,status,reason}],
+          containers:[.status.containerStatuses[]? | select(.name == "rhiza") | {ready,restartCount,
+            state:{waiting:{reason:.state.waiting.reason},terminated:{reason:.state.terminated.reason,exitCode:.state.terminated.exitCode,signal:.state.terminated.signal}},
+            lastState:{terminated:{reason:.lastState.terminated.reason,exitCode:.lastState.terminated.exitCode,signal:.lastState.terminated.signal}}}]
+        }] | if length == 1 then .[0] else error("identity mismatch") end' >"$pod_dir/status.json" 2>"$pod_dir/status.stderr" || identity_status=unavailable
+    fi
+    logs_ok=false
+    if [ "$identity_status" = verified ] && [ -n "$container_id" ]; then
+      if k --request-timeout=10s logs "$pod" -c rhiza --tail=80 --limit-bytes=16384 >"$pod_dir/current.log" 2>"$pod_dir/current.stderr"; then current_ok=true; else current_ok=false; fi
+      if k --request-timeout=10s logs "$pod" -c rhiza --previous --tail=80 --limit-bytes=16384 >"$pod_dir/previous.log" 2>"$pod_dir/previous.stderr"; then previous_ok=true; else previous_ok=false; fi
+      after_sts=$(k --request-timeout=10s get statefulset rhiza -o json 2>"$pod_dir/sts-after.stderr" || true)
+      after_pod=$(k --request-timeout=10s get pod "$pod" -o json 2>"$pod_dir/pod-after.stderr" || true)
+      after_container=''
+      after_restarts=''
+      if [ -n "$after_pod" ]; then
+        after_container=$(printf '%s\n' "$after_pod" | jq -er '[.status.containerStatuses[]? | select(.name == "rhiza")] | if length == 1 then .[0].containerID // "" else "" end' 2>/dev/null || true)
+        after_restarts=$(printf '%s\n' "$after_pod" | jq -er '[.status.containerStatuses[]? | select(.name == "rhiza")] | if length == 1 then (.[0].restartCount | tostring) else "" end' 2>/dev/null || true)
+      fi
+      if [ "$after_container" = "$container_id" ] && [ "$after_restarts" = "$restart_count" ] &&
+        printf '%s\n' "$after_sts" | jq -e --arg uid "$pinned_uid" '.metadata.uid == $uid' >/dev/null 2>&1 &&
+        printf '%s\n' "$after_pod" | jq -e --arg poduid "$pod_uid" --arg name "$pod" --arg ns "$fencing_namespace" --arg owner "$pinned_uid" \
+          '.metadata.uid == $poduid and .metadata.name == $name and .metadata.namespace == $ns and any(.metadata.ownerReferences[]?; .controller == true and .kind == "StatefulSet" and .name == "rhiza" and .uid == $owner)' >/dev/null 2>&1; then
+        logs_ok=true
+        printf '%s\n' "$current_ok" >"$pod_dir/current.captured"
+        printf '%s\n' "$previous_ok" >"$pod_dir/previous.captured"
+      else
+        identity_status=identity_drift
+        : >"$pod_dir/current.log"
+        : >"$pod_dir/previous.log"
+      fi
+    else
+      : >"$pod_dir/current.log"
+      : >"$pod_dir/previous.log"
+    fi
+    if [ "$identity_status" = unavailable ]; then
+      printf '%s\n' '{}' >"$pod_dir/status.json"
+    fi
+    jq -cn --arg ordinal "$ordinal" --arg uid "$pod_uid" --arg identity "$identity_status" --argjson logs "$logs_ok" \
+      --slurpfile status "$pod_dir/status.json" \
+      '{ordinal:$ordinal,podUID:$uid,identity:$identity,logsCaptured:$logs,status:($status[0] // {})}' >"$pod_dir/record.json"
+    chmod 600 "$pod_dir"/* 2>/dev/null || true
+    unset before_sts before_pod after_sts after_pod
+  done
+  jq -s --arg pinned "$pinned_uid" '{statefulSetIdentity:"pinned",statefulSetUID:$pinned,voters:.}' \
+    "$voter_diagnostics_dir"/rhiza-*/record.json >"$FENCING_E2E_OUT/voter-startup-private.json" 2>"$voter_diagnostics_dir/records.stderr" || \
+    printf '%s\n' '{"statefulSetIdentity":"unavailable","voters":[]}' >"$FENCING_E2E_OUT/voter-startup-private.json"
+  chmod 600 "$FENCING_E2E_OUT/voter-startup-private.json"
+  find "$voter_diagnostics_dir" -type f -exec chmod 600 {} +
+)
 capture_fencer_diagnostics() {
   diagnostics_dir="$FENCING_E2E_OUT/private-fencer-diagnostics"
   (umask 077 && mkdir -m 700 "$diagnostics_dir") || return 1
+  capture_voter_startup_diagnostics || true
 
   # Never persist a Pod spec (which may contain literal env values) or kube auth.
   # Project only runtime status and Warning event identity/reason into the public packet.
@@ -285,6 +367,8 @@ k patch job rhiza-create-bucket --type=merge -p '{"spec":{"suspend":false}}'
 k wait --for=condition=Complete job/rhiza-create-bucket --timeout=180s
 k rollout status deployment/rhiza-fencer --timeout=180s
 "$FENCING_E2E_BIN" runtime-probe
+fencing_source_sts_uid=$(k --request-timeout=10s get statefulset rhiza -o jsonpath='{.metadata.uid}')
+case "$fencing_source_sts_uid" in ''|*[!A-Za-z0-9_-]*) echo 'source StatefulSet identity is unavailable' >&2; exit 2 ;; esac
 k scale statefulset rhiza --replicas=3
 "$FENCING_E2E_BIN" wait-source
 k scale deployment rhiza-operator --replicas=1
