@@ -129,10 +129,12 @@ type fencerDiagnosticsView struct {
 	EventsCaptured     bool   `json:"eventsCaptured"`
 	DeploymentCaptured bool   `json:"deploymentCaptured"`
 	Logs               struct {
-		Captured bool   `json:"captured"`
-		SHA256   string `json:"sha256"`
-		Bytes    int64  `json:"bytes"`
-		Lines    int64  `json:"lines"`
+		Captured            bool                            `json:"captured"`
+		SHA256              string                          `json:"sha256"`
+		Bytes               int64                           `json:"bytes"`
+		Lines               int64                           `json:"lines"`
+		Rejections          []supervisorRejectionDiagnostic `json:"rejections,omitempty"`
+		RejectionsTruncated bool                            `json:"rejectionsTruncated,omitempty"`
 	} `json:"logs"`
 	RuntimeAgent struct {
 		PodName string `json:"podName"`
@@ -153,7 +155,14 @@ type runtimeAgentEnrollmentDiagnostic struct {
 	Code  string `json:"code"`
 }
 
+type supervisorRejectionDiagnostic struct {
+	Stage  string `json:"stage"`
+	Action string `json:"action"`
+	Code   string `json:"code"`
+}
+
 const maxRuntimeAgentDiagnostics = 20
+const maxSupervisorRejectionDiagnostics = 20
 
 var allowedRuntimeAgentDiagnosticPairs = map[string]struct{}{
 	"authorization/token_missing":                              {},
@@ -241,6 +250,133 @@ var allowedRuntimeAgentDiagnosticPairs = map[string]struct{}{
 	"backend_result_validation/scope_digest_mismatch":          {},
 	"state_persist/state_write_failed":                         {},
 }
+
+// These are fixed source errors emitted by the register transition path. The
+// raw error remains private; only an exact known prefix is projected.
+var supervisorRejectionPrefixes = []struct {
+	message string
+	code    string
+}{
+	{"fencing: startup physical identity is incomplete", "startup_physical_identity_incomplete"},
+	{"fencing: startup Pod incarnation changed", "startup_pod_incarnation_changed"},
+	{"fencing: startup root binding is ambiguous", "startup_root_ambiguous"},
+	{"fencing: startup root binding is unavailable", "startup_root_unavailable"},
+	{"fencing: startup StatefulSet ownership is ambiguous", "startup_statefulset_owner_ambiguous"},
+	{"fencing: startup StatefulSet owner differs", "startup_statefulset_owner_mismatch"},
+	{"fencing: startup workload binding differs", "startup_workload_binding_mismatch"},
+	{"fencing: workload is not enrolled", "workload_not_enrolled"},
+	{"fencing: dedicated private PID namespace required", "workload_pid_namespace_invalid"},
+	{"fencing: untracked lifecycle processes are unsupported", "workload_lifecycle_unsupported"},
+	{"fencing: exec probes may create untracked processes", "workload_exec_probe_unsupported"},
+	{"fencing: procfs must remain kernel-provided", "workload_procfs_invalid"},
+	{"fencing: supervised launch required", "workload_supervised_launch_missing"},
+	{"fencing: default procfs required", "workload_procfs_profile_invalid"},
+	{"fencing: unprivileged supervisor required", "workload_privilege_profile_invalid"},
+	{"fencing: capabilities must be dropped", "workload_capability_profile_invalid"},
+	{"fencing: host mounts unsupported", "workload_host_mount_unsupported"},
+	{"fencing: canonical startup control unavailable:", "startup_control_unavailable"},
+	{"fencing: canonical startup binding differs", "startup_control_binding_mismatch"},
+	{"fencing: completed replacement request is ambiguous", "replacement_request_ambiguous"},
+	{"fencing: same-ordinal closed identity is absent from canonical control", "replacement_closed_identity_missing"},
+	{"fencing: same-ordinal assignment no longer matches its closed identity", "replacement_closed_identity_mismatch"},
+	{"fencing: startup logical identity differs from assignment", "replacement_logical_identity_mismatch"},
+	{"fencing: startup removal proof differs from canonical cohort", "replacement_removal_proof_mismatch"},
+	{"fencing: startup assignment digest differs", "replacement_assignment_digest_mismatch"},
+	{"fencing: startup StatefulSet identity changed", "replacement_statefulset_identity_changed"},
+	{"fencing: startup recovery child differs from assignment", "replacement_recovery_child_mismatch"},
+	{"fencing: completed startup assignment is not canonical:", "replacement_completion_not_canonical"},
+	{"fencing: completed same-ordinal assignment receipt differs", "replacement_completion_receipt_mismatch"},
+	{"fencing: startup learner credential differs from assignment", "replacement_credential_mismatch"},
+	{"fencing: startup learner credential payload differs", "replacement_credential_payload_mismatch"},
+	{"fencing: startup member credential encoding is invalid", "replacement_member_encoding_invalid"},
+	{"fencing: startup member credential differs", "replacement_member_mismatch"},
+	{"fencing: startup peer credential differs", "replacement_peer_credential_mismatch"},
+	{"fencing: startup member endpoint differs from the assigned Pod", "replacement_member_endpoint_mismatch"},
+	{"fencing: replacement identity already appears in template membership", "replacement_identity_in_template"},
+	{"fencing: committed replacement cohort differs from source template", "replacement_cohort_mismatch"},
+	{"fencing: authority root does not require mutation journal", "registration_journal_policy_mismatch"},
+	{"fencing: authority root requires mutation journal without runtime binding", "registration_runtime_binding_policy_mismatch"},
+	{"fencing: runtime agent is required for mutation-journal registration", "registration_runtime_agent_required"},
+	{"fencing: runtime agent is required", "registration_runtime_agent_required"},
+	{"fencing: required archive genesis registration lacks runtime binding", "registration_archive_runtime_binding_missing"},
+}
+
+var authenticationErrorPrefixes = []struct {
+	message string
+	code    string
+}{
+	{"fencing: bound token required", "authentication_token_missing"},
+	{"fencing: unauthenticated token", "authentication_token_unauthenticated"},
+	{"fencing: token audience differs", "authentication_audience_mismatch"},
+	{"fencing: token Pod UID differs", "authentication_pod_uid_mismatch"},
+	{"fencing: authenticated physical Pod name differs", "authentication_pod_name_mismatch"},
+	{"fencing: Pod incarnation differs", "authentication_pod_incarnation_mismatch"},
+	{"fencing: token namespace differs", "authentication_namespace_mismatch"},
+	{"fencing: StatefulSet controller required", "authentication_statefulset_controller_missing"},
+	{"fencing: workload UID differs", "authentication_workload_uid_mismatch"},
+	{"fencing: learner binding missing", "authentication_learner_binding_invalid"},
+	{"fencing: learner root binding differs", "authentication_learner_binding_invalid"},
+	{"fencing: learner credentials changed", "authentication_learner_binding_invalid"},
+	{"fencing: learner member differs", "authentication_learner_binding_invalid"},
+	{"fencing: Pod source differs", "authentication_source_mismatch"},
+	{"fencing: workload is not enrolled", "workload_not_enrolled"},
+	{"fencing: dedicated private PID namespace required", "workload_pid_namespace_invalid"},
+	{"fencing: untracked lifecycle processes are unsupported", "workload_lifecycle_unsupported"},
+	{"fencing: exec probes may create untracked processes", "workload_exec_probe_unsupported"},
+	{"fencing: procfs must remain kernel-provided", "workload_procfs_invalid"},
+	{"fencing: supervised launch required", "workload_supervised_launch_missing"},
+	{"fencing: default procfs required", "workload_procfs_profile_invalid"},
+	{"fencing: unprivileged supervisor required", "workload_privilege_profile_invalid"},
+	{"fencing: capabilities must be dropped", "workload_capability_profile_invalid"},
+	{"fencing: host mounts unsupported", "workload_host_mount_unsupported"},
+}
+
+var runtimeEnrollmentErrorPrefixes = []struct {
+	message string
+	code    string
+}{
+	{"fencing: runtime enrollment authority unavailable", "runtime_enrollment_authority_unavailable"},
+	{"fencing: runtime enrollment Pod incarnation or root binding differs", "runtime_enrollment_pod_binding_mismatch"},
+	{"fencing: one live CRI container is required", "runtime_enrollment_container_unavailable"},
+	{"fencing: Kubernetes container/image identity is incomplete", "runtime_enrollment_container_image_identity_incomplete"},
+	{"fencing: namespace UID is unavailable", "runtime_enrollment_namespace_uid_unavailable"},
+	{"fencing: workload is not enrolled", "workload_not_enrolled"},
+	{"fencing: dedicated private PID namespace required", "workload_pid_namespace_invalid"},
+	{"fencing: untracked lifecycle processes are unsupported", "workload_lifecycle_unsupported"},
+	{"fencing: exec probes may create untracked processes", "workload_exec_probe_unsupported"},
+	{"fencing: procfs must remain kernel-provided", "workload_procfs_invalid"},
+	{"fencing: supervised launch required", "workload_supervised_launch_missing"},
+	{"fencing: default procfs required", "workload_procfs_profile_invalid"},
+	{"fencing: unprivileged supervisor required", "workload_privilege_profile_invalid"},
+	{"fencing: capabilities must be dropped", "workload_capability_profile_invalid"},
+	{"fencing: host mounts unsupported", "workload_host_mount_unsupported"},
+}
+
+var allowedSupervisorRejectionCodes = func() map[string]struct{} {
+	codes := make(map[string]struct{}, len(supervisorRejectionPrefixes)+len(allowedRuntimeAgentDiagnosticPairs)+16)
+	for _, item := range supervisorRejectionPrefixes {
+		codes[item.code] = struct{}{}
+	}
+	for pair := range allowedRuntimeAgentDiagnosticPairs {
+		codes["runtimeagent_"+strings.ReplaceAll(pair, "/", "_")] = struct{}{}
+	}
+	for _, code := range []string{
+		"authentication_guard_unknown", "authentication_token_missing", "authentication_token_unauthenticated",
+		"authentication_audience_mismatch", "authentication_pod_uid_mismatch", "authentication_pod_name_mismatch",
+		"authentication_pod_incarnation_mismatch", "authentication_namespace_mismatch", "authentication_statefulset_controller_missing",
+		"authentication_workload_uid_mismatch", "authentication_learner_binding_invalid", "authentication_source_mismatch",
+		"runtime_enrollment_guard_unknown", "runtime_enrollment_authority_unavailable", "runtime_enrollment_pod_binding_mismatch",
+		"runtime_enrollment_container_unavailable", "runtime_enrollment_container_image_identity_incomplete",
+		"runtime_enrollment_namespace_uid_unavailable", "workload_not_enrolled", "workload_pid_namespace_invalid",
+		"workload_lifecycle_unsupported", "workload_exec_probe_unsupported", "workload_procfs_invalid",
+		"workload_supervised_launch_missing", "workload_procfs_profile_invalid", "workload_privilege_profile_invalid",
+		"workload_capability_profile_invalid", "workload_host_mount_unsupported",
+	} {
+		codes[code] = struct{}{}
+	}
+	codes["register_guard_unknown"] = struct{}{}
+	return codes
+}()
 
 type fencerPodsView struct {
 	Pods []struct {
@@ -497,6 +633,9 @@ func safeJSON(name string, data []byte) ([]byte, error) {
 		if err := json.Unmarshal(data, &view); err != nil {
 			return nil, err
 		}
+		if err := validateSupervisorRejections(view); err != nil {
+			return nil, err
+		}
 		if err := validateRuntimeAgentDiagnostics(view); err != nil {
 			return nil, err
 		}
@@ -686,13 +825,166 @@ func validateRuntimeAgentDiagnostics(view fencerDiagnosticsView) error {
 	return nil
 }
 
+func validateSupervisorRejections(view fencerDiagnosticsView) error {
+	logs := view.Logs
+	if len(logs.Rejections) > maxSupervisorRejectionDiagnostics {
+		return fmt.Errorf("supervisor rejection diagnostics exceed bounds")
+	}
+	if logs.RejectionsTruncated && len(logs.Rejections) != maxSupervisorRejectionDiagnostics {
+		return fmt.Errorf("supervisor rejection truncation marker is inconsistent")
+	}
+	if !logs.Captured && len(logs.Rejections) != 0 {
+		return fmt.Errorf("supervisor rejection diagnostics lack captured logs")
+	}
+	for _, diagnostic := range logs.Rejections {
+		if diagnostic.Action != "register" {
+			return fmt.Errorf("supervisor rejection action is not allowlisted")
+		}
+		if diagnostic.Stage != "authentication" && diagnostic.Stage != "runtime_enrollment" && diagnostic.Stage != "transition" {
+			return fmt.Errorf("supervisor rejection stage is not allowlisted")
+		}
+		if _, ok := allowedSupervisorRejectionCodes[diagnostic.Code]; !ok {
+			return fmt.Errorf("supervisor rejection code is not allowlisted")
+		}
+	}
+	return nil
+}
+
+func classifySupervisorRejection(line string) (supervisorRejectionDiagnostic, bool) {
+	markers := []struct {
+		marker string
+		stage  string
+	}{
+		{"fencing supervisor authentication rejected:", "authentication"},
+		{"runtime enrollment pending:", "runtime_enrollment"},
+		{"fencing supervisor transition rejected:", "transition"},
+	}
+	for _, marker := range markers {
+		at := strings.Index(line, marker.marker)
+		if at < 0 || !validSupervisorLogPrefix(line[:at]) {
+			continue
+		}
+		rest := line[at+len(marker.marker):]
+		header, message, ok := strings.Cut(rest, " error=")
+		if !ok {
+			return supervisorRejectionDiagnostic{}, false
+		}
+		fields := strings.Fields(header)
+		action := "register"
+		if marker.stage == "runtime_enrollment" {
+			// This marker is emitted only in the authenticated register branch.
+			if len(fields) != 2 || !strings.HasPrefix(fields[0], "podUID=") || strings.TrimPrefix(fields[0], "podUID=") == "" || !strings.HasPrefix(fields[1], "runID=") || strings.TrimPrefix(fields[1], "runID=") == "" {
+				return supervisorRejectionDiagnostic{}, false
+			}
+		} else if len(fields) != 2 || fields[0] != "action=register" || !strings.HasPrefix(fields[1], "podUID=") || strings.TrimPrefix(fields[1], "podUID=") == "" {
+			return supervisorRejectionDiagnostic{}, false
+		}
+		code := classifySupervisorRejectionCode(marker.stage, message)
+		return supervisorRejectionDiagnostic{Stage: marker.stage, Action: action, Code: code}, true
+	}
+	return supervisorRejectionDiagnostic{}, false
+}
+
+func classifySupervisorRejectionCode(stage, message string) string {
+	if stage == "runtime_enrollment" {
+		const typed = "fencing: runtime enrollment rejected at "
+		if strings.HasPrefix(message, typed) {
+			pair := strings.TrimPrefix(message, typed)
+			pair = strings.TrimSpace(pair)
+			diagnosticStage, diagnosticCode, ok := strings.Cut(pair, "/")
+			if ok && runtimeagent.ValidEnrollmentDiagnostic(diagnosticStage, diagnosticCode) {
+				return "runtimeagent_" + diagnosticStage + "_" + diagnosticCode
+			}
+		}
+		for _, item := range runtimeEnrollmentErrorPrefixes {
+			if strings.HasPrefix(message, item.message) {
+				return item.code
+			}
+		}
+		return "runtime_enrollment_guard_unknown"
+	}
+	if stage == "authentication" {
+		for _, item := range authenticationErrorPrefixes {
+			if strings.HasPrefix(message, item.message) {
+				return item.code
+			}
+		}
+		return "authentication_guard_unknown"
+	}
+	for _, item := range supervisorRejectionPrefixes {
+		if strings.HasPrefix(message, item.message) {
+			return item.code
+		}
+	}
+	return "register_guard_unknown"
+}
+
+func validSupervisorLogPrefix(prefix string) bool {
+	if strings.HasPrefix(prefix, "[") {
+		end := strings.Index(prefix, "] ")
+		if end < 0 {
+			return false
+		}
+		prefix = prefix[end+2:]
+	}
+	_, err := time.Parse("2006/01/02 15:04:05 ", prefix)
+	return err == nil
+}
+
+func projectSupervisorRejections(raw string, view *fencerDiagnosticsView) error {
+	view.Logs.Rejections = []supervisorRejectionDiagnostic{}
+	view.Logs.RejectionsTruncated = false
+	if !view.Logs.Captured {
+		return nil
+	}
+	path := filepath.Join(raw, "private-fencer-diagnostics", "authority-current.log")
+	info, err := os.Lstat(path)
+	if err != nil {
+		return err
+	}
+	if !info.Mode().IsRegular() || info.Mode()&os.ModeSymlink != 0 || info.Size() > 65536 {
+		return fmt.Errorf("fencer private log is unsafe or oversized")
+	}
+	file, err := os.Open(path)
+	if err != nil {
+		return err
+	}
+	defer file.Close()
+	logData, err := io.ReadAll(io.LimitReader(file, 65537))
+	if err != nil || len(logData) > 65536 || bytes.Count(logData, []byte("\n")) > 200 {
+		return fmt.Errorf("fencer private log exceeds bounds")
+	}
+	digest := sha256.Sum256(logData)
+	if int64(len(logData)) != view.Logs.Bytes || int64(bytes.Count(logData, []byte("\n"))) != view.Logs.Lines || hex.EncodeToString(digest[:]) != view.Logs.SHA256 {
+		return fmt.Errorf("fencer private log does not match its public receipt")
+	}
+	for _, line := range strings.Split(string(logData), "\n") {
+		diagnostic, ok := classifySupervisorRejection(line)
+		if !ok {
+			continue
+		}
+		if len(view.Logs.Rejections) < maxSupervisorRejectionDiagnostics {
+			view.Logs.Rejections = append(view.Logs.Rejections, diagnostic)
+		} else {
+			view.Logs.RejectionsTruncated = true
+		}
+	}
+	return nil
+}
+
 func projectRuntimeAgentDiagnostics(raw string, data []byte) ([]byte, error) {
 	var view fencerDiagnosticsView
 	if err := json.Unmarshal(data, &view); err != nil {
 		return nil, err
 	}
+	if err := projectSupervisorRejections(raw, &view); err != nil {
+		return nil, err
+	}
 	view.RuntimeAgent.Diagnostics = []runtimeAgentEnrollmentDiagnostic{}
 	if !view.RuntimeAgent.Logs.Captured {
+		if err := validateSupervisorRejections(view); err != nil {
+			return nil, err
+		}
 		return json.Marshal(view)
 	}
 	path := filepath.Join(raw, "private-fencer-diagnostics", "runtime-agent-current.log")
@@ -735,6 +1027,9 @@ func projectRuntimeAgentDiagnostics(raw string, data []byte) ([]byte, error) {
 			continue
 		}
 		view.RuntimeAgent.Diagnostics = append(view.RuntimeAgent.Diagnostics, diagnostic)
+	}
+	if err := validateSupervisorRejections(view); err != nil {
+		return nil, err
 	}
 	return json.Marshal(view)
 }
