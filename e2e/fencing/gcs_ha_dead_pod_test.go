@@ -26,7 +26,7 @@ func TestGCSVoterRemoveAckCheckpointRequiresCommittedRemoveAndNoAdd(t *testing.T
 	proof := operator.FenceProof{ProofID: "proof-id"}
 	remove := network.MembershipChange{OperationID: request.OperationID, ClusterID: source.ClusterID, ExpectedConfigID: 1, Remove: quepaxa.NodeID(target.NodeID),
 		Fence: &network.MembershipFence{NodeID: quepaxa.NodeID(target.NodeID), WALIdentity: target.WALIdentity, WorkloadUID: target.PodUID, Confirmed: true, Evidence: proof.ProofID}}
-	recovery := operator.Resource{Metadata: map[string]any{"uid": "recovery-uid"},
+	recovery := operator.Resource{Metadata: map[string]any{"name": request.OperationID, "namespace": source.Namespace, "uid": "recovery-uid"},
 		Spec: operator.Spec{StatefulSet: source.StatefulSet, SourceClusterID: source.ClusterID, RecoveryID: request.OperationID,
 			Fence: operator.Fence{RecoveryID: request.OperationID, ClusterID: source.ClusterID, StatefulSetUID: source.StatefulSetUID, Confirmed: true, Evidence: proof.ProofID},
 			Membership: &operator.MembershipSpec{OperationID: request.OperationID, Remove: quepaxa.NodeID(target.NodeID), RemovedPod: target.Pod,
@@ -37,7 +37,7 @@ func TestGCSVoterRemoveAckCheckpointRequiresCommittedRemoveAndNoAdd(t *testing.T
 			Membership: &operator.MembershipStatus{Phase: "Removing", RemoveRequest: &remove}}}
 	status := network.MembershipStatus{NodeID: quepaxa.NodeID(observer.NodeID), ClusterID: source.ClusterID, ConfigID: 2,
 		Voters: []quepaxa.NodeID{"n1", "n2"}, WALIdentity: observer.WALIdentity, Voting: true}
-	if !gcsVoterRemoveAckCheckpointMatches(recovery, source, target, request, proof, observer, status) {
+	if !gcsVoterRemoveAckCheckpointMatches(recovery, "recovery-uid", source, target, request, proof, observer, status) {
 		t.Fatal("rejected canonical post-REMOVE, pre-ADD checkpoint")
 	}
 	tests := []struct {
@@ -74,10 +74,13 @@ func TestGCSVoterRemoveAckCheckpointRequiresCommittedRemoveAndNoAdd(t *testing.T
 			changedStatus := status
 			changedStatus.Voters = append([]quepaxa.NodeID(nil), status.Voters...)
 			test.mutate(&changed, &changedStatus)
-			if gcsVoterRemoveAckCheckpointMatches(changed, source, target, request, proof, observer, changedStatus) {
+			if gcsVoterRemoveAckCheckpointMatches(changed, "recovery-uid", source, target, request, proof, observer, changedStatus) {
 				t.Fatal("accepted an incomplete or advanced REMOVE checkpoint")
 			}
 		})
+	}
+	if gcsVoterRemoveAckCheckpointMatches(recovery, "", source, target, request, proof, observer, status) {
+		t.Fatal("accepted a checkpoint without an externally captured Recovery UID")
 	}
 }
 
