@@ -36,7 +36,7 @@ func (n *Node) changeMembership(ctx context.Context, request network.MembershipC
 	if err != nil {
 		return err
 	}
-	operation := membershipOperation{Request: request}
+	var operation membershipOperation
 	current := n.core.CurrentCluster()
 	if stored != nil {
 		if err := json.Unmarshal(stored, &operation); err != nil {
@@ -52,6 +52,7 @@ func (n *Node) changeMembership(ctx context.Context, request network.MembershipC
 		if revision, _, _ := n.core.LastReconfigurationAbort(); revision != request.ExpectedAbortSlot {
 			return network.ErrRequestConflict
 		}
+		operation.Request = request
 		operation.Target = quepaxa.Cluster{ConfigID: current.ConfigID + 1}
 		found := false
 		for _, member := range current.Members {

@@ -2,8 +2,11 @@ package node
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/json"
 	"errors"
 	"io"
+	"reflect"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -75,6 +78,25 @@ func TestMembershipRetryDurablyPublishesCommittedConfiguration(t *testing.T) {
 	if committed.ConfigID != 2 || len(committed.Members) != 2 || containsMember(committed.Members, "c") {
 		t.Fatalf("configuration did not commit before persistence failure: %+v", committed)
 	}
+	changedPayload := request
+	changedFence := *request.Fence
+	changedFence.Evidence = "different-fence"
+	changedPayload.Fence = &changedFence
+	journalKey := n.membershipOperationKey(request)
+	journalData, err := readVoterRegistration(ctx, n.bucket, journalKey)
+	if err != nil || journalData == nil {
+		t.Fatalf("post-commit membership journal key=%q missing after failed persistence: present=%t err=%v", journalKey, journalData != nil, err)
+	}
+	var journal membershipOperation
+	if err := json.Unmarshal(journalData, &journal); err != nil {
+		t.Fatalf("post-commit membership journal key=%q sha256=%x is invalid: %v", journalKey, sha256.Sum256(journalData), err)
+	}
+	if !reflect.DeepEqual(journal.Request, request) || !reflect.DeepEqual(journal.Target, committed) {
+		t.Fatalf("post-commit membership journal key=%q sha256=%x does not match exact request/committed target", journalKey, sha256.Sum256(journalData))
+	}
+	if reflect.DeepEqual(journal.Request, changedPayload) {
+		t.Fatalf("changed replay unexpectedly matches persisted request at key=%q sha256=%x", journalKey, sha256.Sum256(journalData))
+	}
 	through := n.core.Tip()
 	if through <= baselineTip {
 		t.Fatalf("membership decision did not advance beyond published archive baseline: baseline=%d tip=%d", baselineTip, through)
@@ -99,12 +121,11 @@ func TestMembershipRetryDurablyPublishesCommittedConfiguration(t *testing.T) {
 
 	// Conflicting payloads and operation IDs must not adopt the committed
 	// configuration or publish a different request as its acknowledgement.
-	changedPayload := request
-	changedFence := *request.Fence
-	changedFence.Evidence = "different-fence"
-	changedPayload.Fence = &changedFence
 	if err := n.changeMembership(ctx, changedPayload); !errors.Is(err, network.ErrRequestConflict) {
 		t.Fatalf("changed payload replay error=%v, want request conflict", err)
+	}
+	if changedPayload.Fence.Evidence != "different-fence" || request.Fence.Evidence != "external-fence" {
+		t.Fatalf("changed payload replay mutated caller fence: changed=%q original=%q", changedPayload.Fence.Evidence, request.Fence.Evidence)
 	}
 	changedOperation := request
 	changedOperation.OperationID += "-other"
