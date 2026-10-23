@@ -94,6 +94,12 @@ func newSupervisorRegistrationFixture(t *testing.T, required bool) supervisorReg
 	apiState.objects["/apis/apps/v1/namespaces/test/statefulsets"] = object{"items": []any{statefulSet}}
 	apiServer := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.Method + " " + r.URL.Path {
+		case "GET /apis/rhiza.mrchypark.dev/v1alpha1/namespaces/test/rhizaclusters":
+			root := ClusterResource{Metadata: object{"name": "cluster", "namespace": "test", "uid": "binding-uid"}, Spec: ClusterSpec{
+				LogicalID: "logical", StatefulSet: "rhiza", AdoptClusterID: identity.SourceClusterID,
+			}}
+			_ = json.NewEncoder(w).Encode(object{"items": []any{root}})
+			return
 		case "GET /api/v1/nodes/node":
 			_ = json.NewEncoder(w).Encode(object{"status": object{"addresses": []any{object{"type": "InternalIP", "address": "127.0.0.1"}}}})
 			return

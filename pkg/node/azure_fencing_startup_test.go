@@ -54,7 +54,7 @@ func TestOpenSupervisedAzureRejectsBindWithoutProvisioningStorage(t *testing.T) 
 	supervisor := &http.Server{Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
 		case "/v1/startup":
-			_ = json.NewEncoder(w).Encode(fencing.Identity{SourceClusterID: "cluster", NodeID: "a", PodUID: "pod", RunID: "run"})
+			_ = json.NewEncoder(w).Encode(fencing.StartupGrant{Identity: fencing.Identity{SourceClusterID: "cluster", NodeID: "a", PodUID: "pod", RunID: "run"}, Role: fencing.StartupRoleVoterActive})
 		case "/v1/bind":
 			binds.Add(1)
 			w.WriteHeader(http.StatusForbidden)

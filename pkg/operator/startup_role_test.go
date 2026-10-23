@@ -86,9 +86,20 @@ func TestResolveStartupRoleRequiresCanonicalPendingLearnerAssignment(t *testing.
 		t.Fatalf("completed recovery was promoted: role=%q err=%v", role, err)
 	}
 
-	// Ordinary enrolled Pods retain the active-voter path. A learner label only
-	// selects canonical recovery validation; it does not itself grant a role.
-	delete(asObject(asObject(pod["metadata"])["labels"]), "rhiza.mrchypark.dev/automatic-learner")
+	// Ordinary enrolled Pods retain the active-voter path only after the same
+	// authenticated live-Pod lookup used by registration. This is a separate
+	// ordinary voter fixture, not the previously assigned learner Pod.
+	ordinaryPod := supervisedTestPod()
+	ordinaryMetadata := asObject(ordinaryPod["metadata"])
+	ordinaryMetadata["name"], ordinaryMetadata["uid"] = learnerName, learnerUID
+	ordinaryMetadata["labels"] = object{}
+	ordinaryMetadata["annotations"] = object{fencingProtocolAnnotation: "1"}
+	ordinaryMetadata["ownerReferences"] = []any{object{"apiVersion": "apps/v1", "kind": "StatefulSet", "name": "rhiza", "uid": "sts-uid", "controller": true}}
+	ordinarySpec := asObject(ordinaryPod["spec"])
+	ordinarySpec["serviceAccountName"] = "default"
+	ordinaryContainer := asObject(list(ordinarySpec["containers"])[0])
+	ordinaryContainer["env"] = []any{object{"name": "RHIZA_CLUSTER_ID", "value": "source"}}
+	pod = ordinaryPod
 	if role, err := e.resolveStartupRole(ctx, "sts-uid", id); err != nil || role != fencing.StartupRoleVoterActive {
 		t.Fatalf("ordinary voter role=%q err=%v", role, err)
 	}

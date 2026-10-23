@@ -83,11 +83,15 @@ func (s *Session) BindWAL(ctx context.Context, walIdentity string) error {
 	if err := receipt.Validate(bound); err != nil {
 		return err
 	}
-	receiptRole := receipt.Role
-	if receiptRole == "" {
-		receiptRole = StartupRoleVoterActive
+	startupRole := s.role
+	if startupRole == "" && s.identity.AssignmentID == "" {
+		// Package-local legacy sessions used by static-voter integrations may
+		// predate the startup-grant field. Assigned identities never inherit
+		// this default; their grant and bind receipt must both carry a role.
+		startupRole = StartupRoleVoterActive
 	}
-	if receiptRole != s.role {
+	receiptRole, roleOK := receipt.normalizedRole()
+	if startupRole == "" || !roleOK || receiptRole != startupRole {
 		return fmt.Errorf("fencing: bind role differs from startup grant")
 	}
 	if s.binding != nil && !s.binding.SameBinding(receipt) {
@@ -95,6 +99,7 @@ func (s *Session) BindWAL(ctx context.Context, walIdentity string) error {
 	}
 	copy := receipt.clone()
 	s.binding = &copy
+	s.role = startupRole
 	s.identity = bound
 	return nil
 }

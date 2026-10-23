@@ -89,6 +89,7 @@ func TestSessionTransient503AndConnectionFailureRemainDistinctFromIdentity(t *te
 	}
 }
 
+
 type sessionRoundTrip func(*http.Request) (*http.Response, error)
 
 func (f sessionRoundTrip) RoundTrip(r *http.Request) (*http.Response, error) { return f(r) }
@@ -156,6 +157,7 @@ func (a *sessionAuthority) NeverBoundExit(context.Context, StopRequest) error { 
 
 func TestSupervisorSessionBindsExactRunAndStop(t *testing.T) {
 	id := testIdentity()
+	id.PodName = id.NodeID
 	authority := &sessionAuthority{id: id}
 	s := &Supervisor{Authority: authority, Identity: id, bound: id, grant: StartupGrant{Identity: id, Role: StartupRoleVoterActive}, ticket: "private-ticket"}
 	socket := filepath.Join(t.TempDir(), "control.sock")

@@ -101,6 +101,7 @@ var _ sourceRelayAuthority = (*relayConditionAuthority)(nil)
 func TestSourceMutationRuntimeReplansAcrossSupervisorRelayAfterConditionalRejection(t *testing.T) {
 	authority := &relayConditionAuthority{}
 	id := testIdentity()
+	id.PodName = id.NodeID
 	supervisor := &Supervisor{Authority: authority, Identity: id, bound: id, ticket: "private-ticket"}
 	socket := filepath.Join(t.TempDir(), "source-relay.sock")
 	listener, err := net.Listen("unix", socket)

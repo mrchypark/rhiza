@@ -75,9 +75,12 @@ func TestPendingLearnerCanBindWALButCannotAcquireMutationAuthority(t *testing.T)
 
 func TestLearnerPromotionRequiresCanonicalEvidenceAndBoundIdentity(t *testing.T) {
 	id := testIdentity()
+	id.NodeID = "logical-incarnation-2"
 	id.PodName = "physical-ordinal-2"
+	id.AssignmentID = strings.Repeat("a", 64)
 	runtime := enrolledRuntime(id, "container")
 	runtime.PodName = id.PodName
+	runtime.AssignmentID = id.AssignmentID
 	l := Ledger{SourceClusterID: id.SourceClusterID, RequireRuntimeBinding: true, RequireMutationJournal: true}
 	if err := l.RegisterEnrolledWithRole(id, runtime, StartupRoleLearnerPendingRemove); err != nil {
 		t.Fatal(err)
@@ -111,8 +114,13 @@ func TestLearnerPromotionRequiresCanonicalEvidenceAndBoundIdentity(t *testing.T)
 
 func TestRuntimeEnrollmentRequiresEveryIdentityFieldBeforeMutation(t *testing.T) {
 	id := testIdentity()
+	id.NodeID = "logical-incarnation-3"
+	id.PodName = "physical-ordinal-3"
+	id.AssignmentID = strings.Repeat("b", 64)
 	id.WALIdentity = ""
 	complete := enrolledRuntime(id, "container")
+	complete.PodName = id.PodName
+	complete.AssignmentID = id.AssignmentID
 	for field := 0; field < reflect.TypeOf(complete).NumField(); field++ {
 		t.Run(reflect.TypeOf(complete).Field(field).Name, func(t *testing.T) {
 			missing := complete

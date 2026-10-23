@@ -11,7 +11,8 @@ func testIdentity() Identity {
 
 func TestStartupGrantRoleIsAuthorityOwnedAndPhysicalPodBound(t *testing.T) {
 	request := testIdentity()
-	request.PodName = "physical-ordinal-0"
+	request.NodeID = "physical-ordinal-0"
+	request.PodName = request.NodeID
 	grant := StartupGrant{Identity: request, Role: StartupRoleLearnerPendingRemove}
 	if err := grant.Validate(request); err != nil {
 		t.Fatal(err)

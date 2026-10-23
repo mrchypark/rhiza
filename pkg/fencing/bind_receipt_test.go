@@ -42,6 +42,26 @@ func TestProducerBindReceiptRejectsIncompleteOrDifferentIdentity(t *testing.T) {
 	mustJournal(t, original.Validate(original.Identity))
 }
 
+func TestBindReceiptRoleOmissionIsLegacyStaticOnly(t *testing.T) {
+	legacy := testProducerReceipt()
+	if err := legacy.Validate(legacy.Identity); err != nil {
+		t.Fatalf("historical unassigned static receipt without a role was rejected: %v", err)
+	}
+
+	assigned := legacy.clone()
+	assigned.Identity.NodeID = "logical-incarnation"
+	assigned.Identity.PodName = "physical-ordinal-0"
+	assigned.Identity.AssignmentID = strings.Repeat("a", 64)
+	if err := assigned.Validate(assigned.Identity); err == nil {
+		t.Fatal("assigned logical identity accepted a role-less bind receipt")
+	}
+	explicit := assigned
+	explicit.Role = StartupRoleVoterActive
+	if assigned.SameBinding(explicit) {
+		t.Fatal("role-less assigned receipt compared equal to an explicit active grant")
+	}
+}
+
 func TestSessionBindingLostResponseAndChangedProducer(t *testing.T) {
 	original := testProducerReceipt()
 	start := original.Identity
