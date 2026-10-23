@@ -33,6 +33,10 @@ spec:
               valueFrom:
                 fieldRef:
                   fieldPath: metadata.uid
+            - name: RHIZA_POD_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
             - name: FENCER_AUTHORITY_URL
               value: https://rhiza-fencer:9444/v1/supervisor
             - name: FENCER_CA_FILE

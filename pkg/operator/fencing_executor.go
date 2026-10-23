@@ -1,8 +1,11 @@
 package operator
 
 import (
+	"bytes"
 	"context"
+	"crypto/sha256"
 	"encoding/base64"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -13,11 +16,13 @@ import (
 	"net/url"
 	"path"
 	"path/filepath"
+	"slices"
 	"strings"
 
 	"cloud.google.com/go/storage"
 	"github.com/mrchypark/rhiza/pkg/fencing"
 	"github.com/mrchypark/rhiza/pkg/quepaxa"
+	"github.com/mrchypark/rhiza/pkg/recovery"
 	"github.com/thanos-io/objstore"
 )
 
@@ -40,6 +45,9 @@ type FencingExecutor struct {
 	// ArchiveBucket is the configured shared object store used to independently
 	// verify fork evidence before target-root registration.
 	ArchiveBucket objstore.Bucket
+	// AutomaticControlPrefix matches the operator's canonical automatic-control
+	// object prefix. Learner grants require reading that durable control record.
+	AutomaticControlPrefix string
 	// ArchiveStoreIdentity is the non-secret identity derived from the
 	// fencer's configured archive bucket, not from workload environment.
 	ArchiveStoreIdentity map[string]string
@@ -399,13 +407,20 @@ func (e *FencingExecutor) handle(w http.ResponseWriter, r *http.Request) {
 		// side effect. A failed enrollment leaves a required, retryable root.
 		err = e.initializeRoot(r.Context(), uid, message.Identity.SourceClusterID)
 	}
+	startupGrant := fencing.StartupGrant{Identity: message.Identity, Role: fencing.StartupRoleVoterActive}
+	if startupGrant.Identity.PodName == "" {
+		startupGrant.Identity.PodName = message.Identity.NodeID
+	}
+	if err == nil && message.Action == "register" {
+		startupGrant, err = e.resolveStartupGrant(r.Context(), uid, message.Identity)
+	}
 	var enrolled *fencing.RuntimeBinding
 	if err == nil && message.Action == "register" && e.RuntimeAgent != nil {
 		if message.Drain != nil || message.Request != nil || message.MutationLookup != nil {
 			http.Error(w, "malformed runtime registration", http.StatusBadRequest)
 			return
 		}
-		base, enrollErr := e.RuntimeAgent.enrollmentBase(r.Context(), e.Kube.Namespace, uid, message.Identity)
+		base, enrollErr := e.RuntimeAgent.enrollmentBase(r.Context(), e.Kube.Namespace, uid, startupGrant.Identity)
 		if enrollErr == nil {
 			var binding fencing.RuntimeBinding
 			binding, enrollErr = e.RuntimeAgent.Enroll(r.Context(), base)
@@ -418,6 +433,35 @@ func (e *FencingExecutor) handle(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, "runtime enrollment unavailable", http.StatusServiceUnavailable)
 			return
 		}
+	}
+	if message.Action == "learner-identity" {
+		if message.Drain != nil || message.Request != nil || message.MutationLookup != nil || message.ArchiveGenesis != nil || message.LearnerIdentity == nil {
+			http.Error(w, "malformed learner identity registration", http.StatusBadRequest)
+			return
+		}
+		if err == nil {
+			err = e.registerPendingLearnerIdentity(r.Context(), uid, message.Identity, *message.LearnerIdentity)
+		}
+		if errors.Is(err, fencing.ErrPending) || errors.Is(err, ErrFencePending) {
+			w.WriteHeader(http.StatusAccepted)
+			return
+		}
+		if errors.Is(err, fencing.ErrClosed) {
+			http.Error(w, "learner identity registration closed", http.StatusGone)
+			return
+		}
+		if err != nil {
+			if transientFenceAuthority(err) {
+				http.Error(w, "authority unavailable", http.StatusServiceUnavailable)
+				return
+			}
+			log.Printf("fencing learner identity registration rejected: podUID=%s error=%v", message.Identity.PodUID, err)
+			http.Error(w, "learner identity registration rejected", http.StatusConflict)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte("{}\n"))
+		return
 	}
 	var stop fencing.StopRequest
 	var binding fencing.BindReceipt
@@ -432,6 +476,12 @@ func (e *FencingExecutor) handle(w http.ResponseWriter, r *http.Request) {
 		err = fmt.Errorf("fencing: unexpected mutation lookup request")
 	} else if message.Action == "bind" {
 		binding, err = e.bindSupervisorWAL(r.Context(), uid, message.Identity)
+	} else if message.Action == "promote-learner" {
+		if message.Drain != nil || message.Request != nil || message.MutationLookup != nil || message.ArchiveGenesis != nil || message.LearnerIdentity != nil {
+			err = fmt.Errorf("fencing: malformed learner promotion request")
+		} else {
+			binding, err = e.promoteSupervisorLearner(r.Context(), uid, message.Identity)
+		}
 	} else if message.Action == "stop" {
 		var state fenceLedger
 		state, err = e.read(r.Context(), uid, message.Identity.SourceClusterID)
@@ -464,12 +514,12 @@ func (e *FencingExecutor) handle(w http.ResponseWriter, r *http.Request) {
 					}
 					if enrolled != nil {
 						l.RequireRuntimeBinding = true
-						return l.RegisterEnrolled(message.Identity, *enrolled)
+						return l.RegisterEnrolledWithRole(startupGrant.Identity, *enrolled, startupGrant.Role)
 					}
 					if l.RequireRuntimeBinding {
 						return fmt.Errorf("fencing: runtime agent is required")
 					}
-					return l.Register(message.Identity)
+					return l.RegisterWithRole(startupGrant.Identity, startupGrant.Role)
 				case "drain":
 					if message.Drain == nil || message.Drain.Request.Identity != message.Identity {
 						return fmt.Errorf("fencing: drain binding differs")
@@ -489,13 +539,13 @@ func (e *FencingExecutor) handle(w http.ResponseWriter, r *http.Request) {
 					return fmt.Errorf("fencing: unknown action")
 				}
 			})
-			if err == nil && message.Action == "register" && changed.Ledger.RequireMutationJournal {
+			if err == nil && message.Action == "register" && changed.Ledger.RequireMutationJournal && startupGrant.Role == fencing.StartupRoleVoterActive {
 				if enrolled == nil {
 					err = fmt.Errorf("fencing: required archive genesis registration lacks runtime binding")
 				} else {
 					_, err = e.reserveMutationProducer(r.Context(), *enrolled)
 					if err == nil {
-						err = e.claimArchiveScopeForRegistration(r.Context(), uid, message.Identity, *enrolled)
+						err = e.claimArchiveScopeForRegistration(r.Context(), uid, startupGrant.Identity, *enrolled)
 					}
 				}
 			}
@@ -521,7 +571,9 @@ func (e *FencingExecutor) handle(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 	if message.Action == "stop" {
 		_ = json.NewEncoder(w).Encode(stop)
-	} else if message.Action == "bind" {
+	} else if message.Action == "register" {
+		_ = json.NewEncoder(w).Encode(startupGrant)
+	} else if message.Action == "bind" || message.Action == "promote-learner" {
 		_ = json.NewEncoder(w).Encode(binding)
 	} else if message.Action == "mutation-lookup" {
 		_ = json.NewEncoder(w).Encode(mutationLookup)
@@ -576,14 +628,18 @@ func (e *FencingExecutor) authenticate(ctx context.Context, authorization string
 		return "", fmt.Errorf("fencing: token Pod UID differs")
 	}
 	name := first("authentication.kubernetes.io/pod-name")
-	if name == "" || id.NodeID != name {
-		return "", fmt.Errorf("fencing: stable Pod name required as node ID")
+	claimedPodName := id.PodName
+	if claimedPodName == "" {
+		claimedPodName = id.NodeID
+	}
+	if name == "" || claimedPodName != name {
+		return "", fmt.Errorf("fencing: authenticated physical Pod name differs")
 	}
 	var pod object
 	if err := e.Kube.Get(ctx, e.controller().corePath("pods", name), &pod); err != nil {
 		return "", err
 	}
-	if str(nested(pod, "metadata", "uid")) != id.PodUID || nested(pod, "metadata", "deletionTimestamp") != nil {
+	if str(nested(pod, "metadata", "uid")) != id.PodUID || str(nested(pod, "metadata", "name")) != name || nested(pod, "metadata", "deletionTimestamp") != nil {
 		return "", fmt.Errorf("fencing: Pod incarnation differs")
 	}
 	sa := str(nested(pod, "spec", "serviceAccountName"))
@@ -662,6 +718,321 @@ func (e *FencingExecutor) validateLearnerBinding(ctx context.Context, pod object
 	var member quepaxa.Member
 	if err := json.Unmarshal(data, &member); err != nil || string(member.ID) != name || member.PublicKey == (quepaxa.PublicKey{}) {
 		return fmt.Errorf("fencing: learner member differs")
+	}
+	return nil
+}
+
+type learnerVoterIdentityRecord struct {
+	Version          int    `json:"version"`
+	Cluster          string `json:"cluster"`
+	Node             string `json:"node"`
+	Membership       string `json:"membership"`
+	Store            string `json:"store"`
+	Nonce            string `json:"nonce"`
+	Registered       bool   `json:"registered"`
+	LearnerPublicKey string `json:"learner_public_key,omitempty"`
+}
+
+// registerPendingLearnerIdentity is deliberately not a general mutation API.
+// It permits exactly the immutable per-node voter identity object, after the
+// authenticated pending learner has bound its WAL, and only if its bytes agree
+// with the live Pod configuration and immutable credential.
+func (e *FencingExecutor) registerPendingLearnerIdentity(ctx context.Context, statefulSetUID string, id fencing.Identity, registration fencing.LearnerIdentityRegistration) error {
+	if e.ArchiveBucket == nil || !slices.Contains(e.ArchiveBucket.SupportedObjectUploadOptions(), objstore.IfNotExists) ||
+		id.NodeID == "" || id.PodName == "" || id.PodUID == "" || id.RunID == "" || id.WALIdentity == "" ||
+		len(registration.Data) == 0 || len(registration.Data) > 64<<10 {
+		return fmt.Errorf("fencing: pending learner identity registration is incomplete")
+	}
+	role, err := e.resolveStartupRole(ctx, statefulSetUID, id)
+	if err != nil || role != fencing.StartupRoleLearnerPendingRemove {
+		return errors.Join(err, fmt.Errorf("fencing: canonical pending learner assignment is unavailable"))
+	}
+	state, err := e.read(ctx, statefulSetUID, id.SourceClusterID)
+	if err != nil {
+		return err
+	}
+	run, ok := state.Ledger.Runs[id.RunID]
+	if !ok || run.Identity != id || run.Stop != nil || run.Runtime == nil || run.Runtime.Validate(id) != nil ||
+		fencing.RunRole(run) != fencing.StartupRoleLearnerPendingRemove {
+		return fmt.Errorf("fencing: learner run is not pending and WAL-bound")
+	}
+	var pod object
+	if err := e.Kube.Get(ctx, e.controller().corePath("pods", id.PodName), &pod); err != nil {
+		return err
+	}
+	ctr := asObject(list(nested(pod, "spec", "containers"))[0])
+	env, err := e.controller().environment(ctx, ctr)
+	if err != nil {
+		return err
+	}
+	members, err := recoveryMembers(env["RHIZA_CLUSTER_MEMBERS"])
+	if err != nil || len(members) < 2 {
+		return fmt.Errorf("fencing: learner source membership is unavailable")
+	}
+	durability := env["RHIZA_OBJSTORE_DURABILITY"]
+	if durability == "" {
+		durability = "async"
+	}
+	memberRecord := recovery.NewMembershipRecord(id.SourceClusterID, members, durability)
+	provider := env["RHIZA_OBJSTORE_PROVIDER"]
+	if provider == "" {
+		provider = "filesystem"
+	}
+	storeData, _ := json.Marshal([]string{provider, env["RHIZA_OBJSTORE_ENDPOINT"], env["RHIZA_OBJSTORE_BUCKET"], path.Clean(env["RHIZA_OBJSTORE_PREFIX"]), env["RHIZA_OBJSTORE_AZURE_STORAGE_ACCOUNT"]})
+	storeDigest := sha256.Sum256(storeData)
+	secretName := id.PodName + "-credentials"
+	var assignedGrant *fencing.StartupGrant
+	if id.AssignmentID != "" {
+		grant, assigned, grantErr := e.resolveSameOrdinalStartupGrant(ctx, statefulSetUID, id)
+		if grantErr != nil || !assigned || grant.Identity.AssignmentID != id.AssignmentID {
+			return errors.Join(grantErr, fmt.Errorf("fencing: same-ordinal credential assignment is unavailable"))
+		}
+		secretName = sameOrdinalSecretName(str(nested(pod, "metadata", "annotations", fencingRootAnnotation)), id.PodUID)
+		assignedGrant = &grant
+	}
+	var secret object
+	if err := e.Kube.Get(ctx, e.controller().corePath("secrets", secretName), &secret); err != nil {
+		return err
+	}
+	if secret["immutable"] != true || id.AssignmentID == "" && str(nested(secret, "metadata", "annotations", ownerAnnotation)) != str(nested(pod, "metadata", "annotations", ownerAnnotation)) ||
+		id.AssignmentID == "" && str(nested(secret, "metadata", "uid")) != str(nested(pod, "metadata", "annotations", fencingCredentialAnnotation)) ||
+		id.AssignmentID != "" && (str(nested(secret, "metadata", "uid")) == "" || str(nested(secret, "metadata", "resourceVersion")) == "") {
+		return fmt.Errorf("fencing: learner credential identity changed")
+	}
+	memberBytes, err := base64.StdEncoding.DecodeString(str(nested(secret, "data", "member")))
+	if err != nil {
+		return fmt.Errorf("fencing: learner credential is invalid")
+	}
+	var member quepaxa.Member
+	decoder := json.NewDecoder(bytes.NewReader(memberBytes))
+	decoder.DisallowUnknownFields()
+	if decoder.Decode(&member) != nil || member.ID != quepaxa.NodeID(id.NodeID) || member.PublicKey == (quepaxa.PublicKey{}) {
+		return fmt.Errorf("fencing: learner credential differs from its identity")
+	}
+	if assignedGrant != nil {
+		canonicalGrant, assigned, grantErr := e.resolveSameOrdinalStartupGrant(ctx, statefulSetUID, id)
+		if grantErr != nil || !assigned || canonicalGrant.Identity.AssignmentID != id.AssignmentID ||
+			string(memberBytes) != canonicalGrant.Environment["RHIZA_LEARNER"] ||
+			str(nested(secret, "data", "RHIZA_PEER_TOKEN")) != base64.StdEncoding.EncodeToString([]byte(canonicalGrant.Environment["RHIZA_PEER_TOKEN"])) {
+			return errors.Join(grantErr, fmt.Errorf("fencing: same-ordinal credential changed during identity registration"))
+		}
+	}
+	want := learnerVoterIdentityRecord{Version: 2, Cluster: id.SourceClusterID, Node: id.NodeID,
+		Membership: memberRecord.Membership, Store: hex.EncodeToString(storeDigest[:]), Nonce: id.WALIdentity,
+		Registered: true, LearnerPublicKey: fmt.Sprintf("%x", member.PublicKey[:])}
+	var got learnerVoterIdentityRecord
+	decoder = json.NewDecoder(bytes.NewReader(registration.Data))
+	decoder.DisallowUnknownFields()
+	if decoder.Decode(&got) != nil || decoder.Decode(new(any)) != io.EOF || got != want {
+		return fmt.Errorf("fencing: learner identity payload differs from canonical configuration")
+	}
+	canonical, _ := json.Marshal(want)
+	if !bytes.Equal(canonical, registration.Data) {
+		return fmt.Errorf("fencing: learner identity payload is not canonical")
+	}
+	key := path.Join(env["RHIZA_OBJSTORE_PREFIX"], id.SourceClusterID, "voters", fmt.Sprintf("%x.json", sha256.Sum256([]byte(id.NodeID))))
+	if registration.Key != key {
+		return fmt.Errorf("fencing: learner identity key differs")
+	}
+	if existing, readErr := readAuthorityObject(ctx, e.ArchiveBucket, key); readErr == nil {
+		if !bytes.Equal(existing, registration.Data) {
+			return fmt.Errorf("fencing: immutable learner identity already differs")
+		}
+		return nil
+	} else if !e.ArchiveBucket.IsObjNotFoundErr(readErr) {
+		return readErr
+	}
+	writeErr := e.ArchiveBucket.Upload(ctx, key, bytes.NewReader(registration.Data), objstore.WithIfNotExists())
+	if writeErr != nil && !e.ArchiveBucket.IsConditionNotMetErr(writeErr) {
+		return writeErr
+	}
+	readback, readErr := readAuthorityObject(ctx, e.ArchiveBucket, key)
+	if readErr != nil || !bytes.Equal(readback, registration.Data) {
+		return errors.Join(readErr, fmt.Errorf("fencing: learner identity conditional-write readback differs"))
+	}
+	return nil
+}
+
+func readAuthorityObject(ctx context.Context, bucket objstore.Bucket, key string) ([]byte, error) {
+	r, err := bucket.Get(ctx, key)
+	if err != nil {
+		return nil, err
+	}
+	data, readErr := io.ReadAll(io.LimitReader(r, (64<<10)+1))
+	closeErr := r.Close()
+	if err := errors.Join(readErr, closeErr); err != nil {
+		return nil, err
+	}
+	if len(data) > 64<<10 {
+		return nil, fmt.Errorf("fencing: learner identity object exceeds capacity")
+	}
+	return data, nil
+}
+
+// resolveStartupRole grants the non-voting learner role only from the
+// authenticated Pod plus the operator's versioned canonical automatic-control
+// record and its exact persisted recovery child. Any ambiguous/missing record
+// remains unavailable; metadata labels and annotations are never authority.
+func (e *FencingExecutor) resolveStartupRole(ctx context.Context, statefulSetUID string, id fencing.Identity) (fencing.StartupRole, error) {
+	grant, err := e.resolveStartupGrant(ctx, statefulSetUID, id)
+	return grant.Role, err
+}
+
+func (e *FencingExecutor) resolveLegacyStartupRole(ctx context.Context, statefulSetUID string, id fencing.Identity) (fencing.StartupRole, error) {
+	role := fencing.StartupRoleVoterActive
+	if e == nil || e.Kube == nil {
+		return "", fmt.Errorf("fencing: startup authority unavailable")
+	}
+	podName := id.PodName
+	if podName == "" {
+		podName = id.NodeID
+	}
+	var pod object
+	if err := e.Kube.Get(ctx, e.controller().corePath("pods", podName), &pod); err != nil {
+		return "", err
+	}
+	if str(nested(pod, "metadata", "uid")) != id.PodUID || str(nested(pod, "metadata", "name")) != podName || nested(pod, "metadata", "deletionTimestamp") != nil {
+		return "", fmt.Errorf("fencing: startup Pod incarnation changed")
+	}
+	if str(nested(pod, "metadata", "labels", "rhiza.mrchypark.dev/automatic-learner")) == "" {
+		return role, nil
+	}
+	if str(nested(pod, "metadata", "labels", "rhiza.mrchypark.dev/automatic-learner")) != podName {
+		return "", fmt.Errorf("fencing: learner identity label differs")
+	}
+	if id.NodeID != podName {
+		return "", fmt.Errorf("fencing: learner logical identity is not yet assigned by canonical authority")
+	}
+	if e.ArchiveBucket == nil {
+		return "", fmt.Errorf("fencing: canonical automatic control store is unavailable")
+	}
+	ownerName := ""
+	for _, ref := range list(nested(pod, "metadata", "ownerReferences")) {
+		owner := asObject(ref)
+		if str(owner["kind"]) == "StatefulSet" && str(owner["uid"]) == statefulSetUID && owner["controller"] == false {
+			ownerName = str(owner["name"])
+		}
+	}
+	if ownerName == "" {
+		return "", fmt.Errorf("fencing: learner StatefulSet owner differs")
+	}
+	if err := e.validateLearnerBinding(ctx, pod, ownerName); err != nil {
+		return "", err
+	}
+	var roots struct {
+		Items []ClusterResource `json:"items"`
+	}
+	if err := e.Kube.Get(ctx, "/apis/rhiza.mrchypark.dev/v1alpha1/namespaces/"+url.PathEscape(e.Kube.Namespace)+"/rhizaclusters", &roots); err != nil {
+		return "", err
+	}
+	var root *ClusterResource
+	for i := range roots.Items {
+		candidate := &roots.Items[i]
+		if str(candidate.Metadata["uid"]) == str(nested(pod, "metadata", "annotations", fencingRootAnnotation)) &&
+			candidate.Spec.StatefulSet == ownerName && candidate.Spec.Automatic && candidate.Spec.AdoptClusterID == id.SourceClusterID && candidate.Spec.LogicalID != "" && candidate.Metadata["deletionTimestamp"] == nil {
+			if root != nil {
+				return "", fmt.Errorf("fencing: learner root identity is ambiguous")
+			}
+			root = candidate
+		}
+	}
+	if root == nil {
+		return "", fmt.Errorf("fencing: learner automatic root is unavailable")
+	}
+	c := &Controller{Kube: e.Kube, Bucket: e.ArchiveBucket, Prefix: e.AutomaticControlPrefix}
+	state, _, err := c.loadAuto(ctx, c.autoKey(root))
+	if err != nil {
+		return "", fmt.Errorf("fencing: canonical learner control record unavailable: %w", err)
+	}
+	currentBinding := autoBinding(root)
+	if state.BindingHash != currentBinding && (state.LegacyBindingHash == "" || state.LegacyBindingHash != currentBinding) {
+		return "", fmt.Errorf("fencing: automatic learner binding hash differs")
+	}
+	intent := state.Intent
+	if state.BindingUID != str(root.Metadata["uid"]) || state.StatefulSetUID != statefulSetUID || state.ActiveClusterID != id.SourceClusterID || intent == nil || intent.Aborting || intent.Proof == nil || intent.Failed == "" || intent.LearnerName != podName || intent.LearnerUID != id.PodUID || intent.RecoveryName == "" || ((intent.RecoveryUID == "") != (intent.SpecHash == "")) {
+		return "", fmt.Errorf("fencing: learner is not in a durable pending-removal assignment")
+	}
+	failedTarget, targetKnown := state.Identities[intent.Failed]
+	if !targetKnown || failedTarget.NodeID != string(intent.Failed) || intent.Request.BindingUID != state.BindingUID || intent.Request.SourceClusterID != state.ActiveClusterID || intent.Request.StatefulSetUID != state.StatefulSetUID || intent.Request.Scope != ScopeVoter || len(intent.Request.Targets) != 1 || intent.Request.Targets[0] != failedTarget || validateFenceProof(intent.Request, intent.Proof) != nil {
+		return "", fmt.Errorf("fencing: learner removal proof is not bound to the canonical cohort")
+	}
+	if err := e.validateCanonicalLearnerFence(ctx, intent.Request, intent.Proof, failedTarget); err != nil {
+		return "", err
+	}
+	var child Resource
+	err = e.Kube.Get(ctx, c.resourcePath(intent.RecoveryName), &child)
+	if intent.RecoveryUID == "" {
+		if err == nil || !apiNotFound(err) {
+			return "", fmt.Errorf("fencing: unjournaled learner recovery child is ambiguous")
+		}
+	} else {
+		if err != nil {
+			return "", err
+		}
+		if str(child.Metadata["uid"]) != intent.RecoveryUID || hashJSON(child.Spec) != intent.SpecHash || child.Spec.Membership == nil || child.Spec.Membership.AbortAddition || child.Spec.Membership.OperationID != intent.RecoveryName || child.Spec.Membership.Remove != intent.Failed || child.Spec.Membership.ReplacementPod != podName || child.Spec.Membership.ReplacementSecret != podName+"-credentials" || string(child.Spec.Membership.Fence.NodeID) != string(intent.Failed) || child.Spec.Membership.Fence.WALIdentity != failedTarget.WALIdentity || child.Spec.Membership.Fence.WorkloadUID != failedTarget.PodUID || !child.Spec.Membership.Fence.Confirmed || child.Spec.Membership.Fence.Evidence != intent.Proof.ProofID || child.Spec.Fence.Evidence != intent.Proof.ProofID {
+			return "", fmt.Errorf("fencing: learner recovery child differs from canonical intent")
+		}
+		if child.Status.Phase == "Complete" || (child.Status.Membership != nil && child.Status.Membership.Phase == "Complete") {
+			var sts object
+			if err := e.Kube.Get(ctx, c.stsPath(root.Spec.StatefulSet), &sts); err != nil {
+				return "", err
+			}
+			var installed installedGeneration
+			if err := c.verifyAutomaticCompletion(ctx, root, state, &child, sts, &installed); err != nil {
+				return "", fmt.Errorf("fencing: completed learner membership is not canonical: %w", err)
+			}
+			return fencing.StartupRoleVoterActive, nil
+		}
+	}
+	if str(nested(pod, "metadata", "annotations", ownerAnnotation)) != intent.Request.OperationID {
+		return "", fmt.Errorf("fencing: learner operation ownership differs")
+	}
+	return fencing.StartupRoleLearnerPendingRemove, nil
+}
+
+func (e *FencingExecutor) validateCanonicalLearnerFence(ctx context.Context, request FenceRequest, proof *FenceProof, target FenceTarget) error {
+	if e == nil || e.AuthorityState == nil || proof == nil || proof.IndependentV2 == nil {
+		return fmt.Errorf("fencing: canonical terminal authority is unavailable")
+	}
+	requestDigest, err := requestHash(&request)
+	if err != nil {
+		return err
+	}
+	canonical, _, err := e.AuthorityState.ReadRoot(ctx, request.StatefulSetUID, request.SourceClusterID)
+	if err != nil {
+		return fmt.Errorf("fencing: canonical terminal authority is unavailable: %w", err)
+	}
+	closed, ok := canonical.Ledger.ClosedNodes[target.NodeID]
+	if !ok || closed.OperationID != request.OperationID || closed.RequestHash != requestDigest ||
+		canonical.StatefulSetUID != request.StatefulSetUID || canonical.Ledger.SourceClusterID != request.SourceClusterID {
+		return fmt.Errorf("fencing: canonical old-voter closure differs")
+	}
+	if err := validateIndependentV2(request, proof.IndependentV2); err != nil {
+		return fmt.Errorf("fencing: canonical old-voter terminal proof differs: %w", err)
+	}
+	if err := verifyIndependentProofCoverage(canonical, request, proof.IndependentV2); err != nil {
+		return fmt.Errorf("fencing: canonical old-voter terminal coverage differs: %w", err)
+	}
+	storage := proof.IndependentV2.StorageScope
+	found := false
+	for _, run := range canonical.Ledger.Runs {
+		if run.Identity.NodeID != target.NodeID {
+			continue
+		}
+		if run.Identity.PodUID == target.PodUID && run.Identity.WALIdentity == target.WALIdentity {
+			if run.Stop == nil || run.Stop.OperationID != request.OperationID || run.Stop.RequestHash != requestDigest || run.IndependentTerminal == nil {
+				return fmt.Errorf("fencing: canonical old-voter run is not terminally closed")
+			}
+			verificationID := hashJSON([]any{"compose-independent-terminal", requestDigest, storage, run.Identity.RunID})
+			_, ref, err := e.readIndependentTerminal(ctx, *run.Runtime, storage, verificationID)
+			if err != nil || ref != *run.IndependentTerminal {
+				return errors.Join(err, fmt.Errorf("fencing: canonical old-voter terminal evidence is unavailable"))
+			}
+			found = true
+		}
+	}
+	if !found {
+		return fmt.Errorf("fencing: canonical old-voter terminal run is missing")
 	}
 	return nil
 }

@@ -28,12 +28,22 @@ type ProducerBinding struct {
 // A nil Producer must never enable the source mutation client.
 type BindReceipt struct {
 	Identity Identity         `json:"identity"`
+	Role     StartupRole      `json:"role,omitempty"`
 	Producer *ProducerBinding `json:"producer,omitempty"`
 }
 
 func (r BindReceipt) Validate(expected Identity) error {
 	if r.Identity != expected || expected.SourceClusterID == "" || expected.NodeID == "" || expected.PodUID == "" || expected.RunID == "" || expected.WALIdentity == "" {
 		return fmt.Errorf("fencing: bind receipt identity differs")
+	}
+	if r.Role == "" {
+		r.Role = StartupRoleVoterActive // historical receipts predate role binding
+	}
+	if !r.Role.Valid() {
+		return fmt.Errorf("fencing: bind receipt role is invalid")
+	}
+	if r.Role == StartupRoleLearnerPendingRemove && r.Producer != nil {
+		return fmt.Errorf("fencing: pending learner cannot receive a mutation producer")
 	}
 	if p := r.Producer; p != nil {
 		if p.ContractVersion != MutationIntentVersion || p.ProducerUID == "" || len(p.ProducerUID) > 128 || !mutationDigestValid(p.StoreScopeHash) || !MutationProfileSupported(p.ExecutionProfile) || (p.StageIncarnation != "" && !mutationDigestValid(p.StageIncarnation)) {
@@ -55,7 +65,7 @@ func (l *Ledger) BindMutationStage(id Identity, incarnation string) error {
 	if ok {
 		before.WALIdentity = run.Identity.WALIdentity
 	}
-	if !ok || !l.RequireMutationJournal || run.Runtime == nil || run.MutationProducerUID == "" || !mutationDigestValid(incarnation) || before != run.Identity || id.WALIdentity == "" || (run.Identity.WALIdentity != "" && run.Identity.WALIdentity != id.WALIdentity) || run.MutationScopeHash == "" || !MutationProfileSupported(run.MutationProfile) {
+	if !ok || runRole(run) != StartupRoleVoterActive || !l.RequireMutationJournal || run.Runtime == nil || run.MutationProducerUID == "" || !mutationDigestValid(incarnation) || before != run.Identity || id.WALIdentity == "" || (run.Identity.WALIdentity != "" && run.Identity.WALIdentity != id.WALIdentity) || run.MutationScopeHash == "" || !MutationProfileSupported(run.MutationProfile) {
 		return fmt.Errorf("fencing: invalid mutation stage enrollment")
 	}
 	if l.ClosedBy != "" || run.Stop != nil {
@@ -82,7 +92,13 @@ func (l *Ledger) BindMutationStage(id Identity, incarnation string) error {
 }
 
 func (r BindReceipt) SameBinding(other BindReceipt) bool {
-	return r.Identity == other.Identity && ((r.Producer == nil && other.Producer == nil) ||
+	if r.Role == "" {
+		r.Role = StartupRoleVoterActive
+	}
+	if other.Role == "" {
+		other.Role = StartupRoleVoterActive
+	}
+	return r.Identity == other.Identity && r.Role == other.Role && ((r.Producer == nil && other.Producer == nil) ||
 		(r.Producer != nil && other.Producer != nil && *r.Producer == *other.Producer))
 }
 
@@ -100,7 +116,7 @@ func (l *Ledger) BindMutationScope(id Identity, scope, profile string) error {
 	run, ok := l.Runs[id.RunID]
 	before := id
 	before.WALIdentity = run.Identity.WALIdentity
-	if !ok || !l.RequireMutationJournal || run.Runtime == nil || run.MutationProducerUID == "" || before != run.Identity || id.WALIdentity == "" || (run.Identity.WALIdentity != "" && run.Identity.WALIdentity != id.WALIdentity) || !mutationDigestValid(scope) || !MutationProfileSupported(profile) {
+	if !ok || runRole(run) != StartupRoleVoterActive || !l.RequireMutationJournal || run.Runtime == nil || run.MutationProducerUID == "" || before != run.Identity || id.WALIdentity == "" || (run.Identity.WALIdentity != "" && run.Identity.WALIdentity != id.WALIdentity) || !mutationDigestValid(scope) || !MutationProfileSupported(profile) {
 		return fmt.Errorf("fencing: invalid mutation scope enrollment")
 	}
 	if l.ClosedBy != "" || run.Stop != nil {

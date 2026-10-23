@@ -23,7 +23,7 @@ func (e *FencingExecutor) enrolledMutationRun(ctx context.Context, runtime fenci
 		return fencing.Run{}, err
 	}
 	run, ok := state.Ledger.Runs[runtime.RunID]
-	if !ok || (!state.Ledger.RequireRuntimeBinding && !state.Ledger.RequireMutationJournal) || run.Runtime == nil || *run.Runtime != runtime {
+	if !ok || fencing.RunRole(run) != fencing.StartupRoleVoterActive || (!state.Ledger.RequireRuntimeBinding && !state.Ledger.RequireMutationJournal) || run.Runtime == nil || *run.Runtime != runtime {
 		return fencing.Run{}, fmt.Errorf("fencing: mutation producer lacks trusted root enrollment")
 	}
 	if err := runtime.Validate(run.Identity); err != nil {
@@ -47,7 +47,7 @@ func (e *FencingExecutor) lookupMutation(ctx context.Context, statefulSetUID str
 		return fencing.MutationLookupResult{}, err
 	}
 	run, ok := state.Ledger.Runs[id.RunID]
-	if !ok || run.Identity != id || run.Runtime == nil || run.Runtime.StatefulSetUID != statefulSetUID || run.MutationProducerUID == "" ||
+	if !ok || fencing.RunRole(run) != fencing.StartupRoleVoterActive || run.Identity != id || run.Runtime == nil || run.Runtime.StatefulSetUID != statefulSetUID || run.MutationProducerUID == "" ||
 		request.ProducerUID != run.MutationProducerUID || request.Sequence == 0 ||
 		request.Intent.OperationID != fencing.MutationRequestID(request.ProducerUID, request.Sequence) ||
 		run.MutationScopeHash == "" || request.Intent.StoreScopeHash != run.MutationScopeHash {
@@ -112,7 +112,8 @@ func (e *FencingExecutor) mutateProducer(ctx context.Context, runtime fencing.Ru
 			return fencing.MutationProducer{}, err
 		}
 		if creating {
-			if !allowCreate || run.Identity.WALIdentity != "" || run.MutationProducerUID != "" {
+			promotedBoundLearner := run.Promotion != nil && fencing.RunRole(run) == fencing.StartupRoleVoterActive && run.Identity.WALIdentity != ""
+			if !allowCreate || (run.Identity.WALIdentity != "" && !promotedBoundLearner) || run.MutationProducerUID != "" {
 				return producer, fmt.Errorf("fencing: missing bound producer cannot be recreated")
 			}
 			initial, err := fencing.NewMutationProducer(run.Identity, runtime)

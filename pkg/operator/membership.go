@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"path"
 	"strings"
 	"time"
 
@@ -289,6 +290,57 @@ func (c *Controller) membershipPods(ctx context.Context, refs []VoterPod) (map[q
 func (c *Controller) validateMembershipReplacement(ctx context.Context, r *Resource, sts, pod object) error {
 	if str(nested(pod, "metadata", "uid")) == "" || nested(pod, "metadata", "deletionTimestamp") != nil {
 		return fmt.Errorf("replacement learner workload is unavailable")
+	}
+	if binding := str(nested(r.Metadata, "annotations", automaticOwner)); binding != "" {
+		logical := str(nested(r.Metadata, "annotations", automaticLogical))
+		if !identifier.MatchString(logical) {
+			return fmt.Errorf("automatic same-ordinal replacement owner is invalid")
+		}
+		state, _, err := c.loadAuto(ctx, path.Join(c.Prefix, "automatic", c.Kube.Namespace, logical, "control.json"))
+		if err != nil {
+			return err
+		}
+		i := state.Intent
+		if i != nil && i.LearnerPodName != "" && i.LearnerPodName == r.Spec.Membership.ReplacementPod {
+			if state.BindingUID != binding || i.RecoveryName != resourceName(r) || i.RecoveryUID != str(r.Metadata["uid"]) || i.SpecHash != hashJSON(r.Spec) || i.LearnerUID != str(nested(pod, "metadata", "uid")) || i.LearnerPodName != str(nested(pod, "metadata", "name")) || i.LearnerSecretName != r.Spec.Membership.ReplacementSecret || i.LearnerSecretUID == "" || i.LearnerSecretRV == "" || i.LearnerSecretHash == "" || i.LearnerAssignmentID == "" || i.LearnerName == "" || i.Failed != r.Spec.Membership.Remove || i.Aborting {
+				return fmt.Errorf("same-ordinal replacement differs from its canonical assignment")
+			}
+			assignment, err := sameOrdinalAssignmentDigest(state, i)
+			if err != nil || assignment != i.LearnerAssignmentID {
+				return fmt.Errorf("same-ordinal replacement assignment digest differs")
+			}
+			if str(nested(sts, "metadata", "uid")) != state.StatefulSetUID || state.StatefulSetUID != i.Request.StatefulSetUID || str(nested(pod, "metadata", "annotations", fencingRootAnnotation)) != state.BindingUID {
+				return fmt.Errorf("same-ordinal replacement workload binding differs")
+			}
+			controllerOwned := false
+			for _, raw := range list(nested(pod, "metadata", "ownerReferences")) {
+				owner := asObject(raw)
+				if owner["controller"] == true && owner["kind"] == "StatefulSet" && owner["name"] == r.Spec.StatefulSet && owner["uid"] == state.StatefulSetUID {
+					if controllerOwned {
+						return fmt.Errorf("same-ordinal replacement has ambiguous workload ownership")
+					}
+					controllerOwned = true
+				}
+			}
+			if !controllerOwned {
+				return fmt.Errorf("same-ordinal replacement is not owned by the source StatefulSet")
+			}
+			if err := validateSupervisedPod(pod); err != nil {
+				return err
+			}
+			member, uid, rv, err := c.replacementMember(ctx, i.LearnerSecretName)
+			if err != nil || string(member.ID) != i.LearnerName || uid != i.LearnerSecretUID || rv != i.LearnerSecretRV {
+				return fmt.Errorf("same-ordinal replacement credential differs from canonical assignment")
+			}
+			var secret object
+			if err := c.Kube.Get(ctx, c.corePath("secrets", i.LearnerSecretName), &secret); err != nil {
+				return err
+			}
+			if secret["immutable"] != true || str(nested(secret, "metadata", "annotations", ownerAnnotation)) != i.Request.OperationID || hashJSON(secret["data"]) != i.LearnerSecretHash {
+				return fmt.Errorf("same-ordinal replacement Secret changed")
+			}
+			return nil
+		}
 	}
 	uid := str(nested(sts, "metadata", "uid"))
 	if !ownedBy(pod, uid) && str(nested(pod, "metadata", "annotations", fencingRootAnnotation)) == "" {

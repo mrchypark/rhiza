@@ -160,7 +160,7 @@ func (e *FencingExecutor) sourceMutationProducer(ctx context.Context, uid string
 		return fencing.RuntimeBinding{}, "", err
 	}
 	run, ok := state.Ledger.Runs[id.RunID]
-	if !ok || run.Identity != id || run.Runtime == nil || run.Runtime.StatefulSetUID != uid || run.MutationProducerUID == "" ||
+	if !ok || fencing.RunRole(run) != fencing.StartupRoleVoterActive || run.Identity != id || run.Runtime == nil || run.Runtime.StatefulSetUID != uid || run.MutationProducerUID == "" ||
 		run.MutationScopeHash == "" || !fencing.MutationProfileSupported(run.MutationProfile) || run.MutationStageIncarnation == "" {
 		return fencing.RuntimeBinding{}, "", fmt.Errorf("fencing: source mutation is outside enrolled producer")
 	}

@@ -40,6 +40,29 @@ func TestLearnerFenceTargetCarriesTheJournaledIdentity(t *testing.T) {
 	}
 }
 
+func TestLearnerHistoryAllowsFreshLogicalIncarnationAtSamePhysicalOrdinal(t *testing.T) {
+	state := validAutoControl()
+	state.Learners = []learnerIncarnation{
+		{SourceClusterID: state.ActiveClusterID, OperationID: "op-old", CredentialName: "old-credentials", CredentialUID: "secret-old", Target: FenceTarget{NodeID: "rhiza-0", Pod: "rhiza-0", PodUID: "pod-old", WALIdentity: "wal-old"}},
+		{SourceClusterID: state.ActiveClusterID, OperationID: "op-new", CredentialName: "inc-credentials", CredentialUID: "secret-new", Target: FenceTarget{NodeID: "inc-abc123", Pod: "rhiza-0", PodUID: "pod-new", WALIdentity: "wal-new"}},
+	}
+	if err := validateLearnerHistory(state.Learners); err != nil {
+		t.Fatalf("fresh logical identity on a new Pod UID at the same ordinal was rejected: %v", err)
+	}
+	got := learnerFenceTarget(state, "inc-abc123", "pod-new", "wal-new")
+	want := FenceTarget{NodeID: "inc-abc123", Pod: "rhiza-0", PodUID: "pod-new", WALIdentity: "wal-new"}
+	if got != want {
+		t.Fatalf("journaled physical/logical mapping=%+v, want %+v", got, want)
+	}
+	request := FenceRequest{SourceClusterID: state.ActiveClusterID, Scope: ScopeGeneration, Targets: []FenceTarget{{NodeID: "inc-abc123", Pod: "rhiza-0", PodUID: "pod-new", WALIdentity: "wal-new"}}}
+	if err := includeLearnerHistory(state, &request); err != nil {
+		t.Fatalf("generation history did not add the old incarnation at the same physical ordinal: %v", err)
+	}
+	if len(request.Targets) != 2 || request.Targets[1] != state.Learners[0].Target {
+		t.Fatalf("generation scope omitted captured old incarnation: %+v", request.Targets)
+	}
+}
+
 func TestLearnerCreatedBeforeControlCASIsRecoveredBeforeEscalation(t *testing.T) {
 	for _, scenario := range []string{"recover", "wrong-root", "wrong-operation", "wrong-credential", "wrong-owner"} {
 		t.Run(scenario, func(t *testing.T) {

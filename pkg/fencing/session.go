@@ -8,6 +8,7 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"os"
 	"sync"
 	"time"
 )
@@ -19,6 +20,7 @@ type Session struct {
 	ticket   string
 	mu       sync.Mutex
 	identity Identity
+	role     StartupRole
 	binding  *BindReceipt
 }
 
@@ -34,14 +36,22 @@ func Connect(ctx context.Context, socketPath, ticket, sourceClusterID, nodeID st
 		}},
 		CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse },
 	}}
-	var identity Identity
-	if err := s.call(ctx, "/v1/startup", Identity{SourceClusterID: sourceClusterID, NodeID: nodeID}, &identity); err != nil {
+	physical := os.Getenv("RHIZA_POD_NAME")
+	if physical == "" {
+		physical = nodeID
+	}
+	request := Identity{SourceClusterID: sourceClusterID, NodeID: physical, PodName: physical}
+	var grant StartupGrant
+	if err := s.call(ctx, "/v1/startup", request, &grant); err != nil {
 		return nil, err
 	}
-	if identity.SourceClusterID != sourceClusterID || identity.NodeID != nodeID || identity.PodUID == "" || identity.RunID == "" || identity.WALIdentity != "" {
-		return nil, fmt.Errorf("fencing: invalid startup identity")
+	if err := grant.Validate(Identity{SourceClusterID: sourceClusterID, NodeID: physical, PodName: request.PodName, PodUID: grant.Identity.PodUID, RunID: grant.Identity.RunID}); err != nil {
+		return nil, fmt.Errorf("fencing: invalid startup grant: %w", err)
 	}
-	s.identity = identity
+	if grant.Identity.NodeID != nodeID {
+		return nil, fmt.Errorf("fencing: startup grant logical identity differs from child configuration")
+	}
+	s.identity, s.role = grant.Identity, grant.Role
 	return s, nil
 }
 
@@ -49,6 +59,12 @@ func (s *Session) Identity() Identity {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return s.identity
+}
+
+func (s *Session) StartupRole() StartupRole {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.role
 }
 
 // BindWAL binds once, after opening the WAL but before starting any writer.
@@ -67,6 +83,13 @@ func (s *Session) BindWAL(ctx context.Context, walIdentity string) error {
 	if err := receipt.Validate(bound); err != nil {
 		return err
 	}
+	receiptRole := receipt.Role
+	if receiptRole == "" {
+		receiptRole = StartupRoleVoterActive
+	}
+	if receiptRole != s.role {
+		return fmt.Errorf("fencing: bind role differs from startup grant")
+	}
 	if s.binding != nil && !s.binding.SameBinding(receipt) {
 		return fmt.Errorf("fencing: source producer binding changed")
 	}
@@ -76,12 +99,49 @@ func (s *Session) BindWAL(ctx context.Context, walIdentity string) error {
 	return nil
 }
 
+// RegisterLearnerIdentity requests only the exact immutable per-node identity
+// object. The authority rejects any other key or payload for a pending learner.
+func (s *Session) RegisterLearnerIdentity(ctx context.Context, key string, data []byte) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.role != StartupRoleLearnerPendingRemove || s.identity.WALIdentity == "" || key == "" || len(data) == 0 || len(data) > 64<<10 {
+		return fmt.Errorf("fencing: pending learner identity registration is unavailable")
+	}
+	request := struct {
+		Identity Identity                    `json:"identity"`
+		Object   LearnerIdentityRegistration `json:"object"`
+	}{s.identity, LearnerIdentityRegistration{Key: key, Data: append([]byte(nil), data...)}}
+	return s.call(ctx, "/v1/learner-identity", request, nil)
+}
+
+// PromoteLearner changes the local role only after the authenticated authority
+// returns an active receipt for this exact bound WAL. The server independently
+// verifies the durable remove/add journal and its post-commit barrier.
+func (s *Session) PromoteLearner(ctx context.Context) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.role != StartupRoleLearnerPendingRemove || s.identity.WALIdentity == "" {
+		return fmt.Errorf("fencing: learner promotion is unavailable")
+	}
+	var receipt BindReceipt
+	if err := s.call(ctx, "/v1/promote-learner", s.identity, &receipt); err != nil {
+		return err
+	}
+	if err := receipt.Validate(s.identity); err != nil || receipt.Role != StartupRoleVoterActive {
+		return fmt.Errorf("fencing: learner promotion receipt is invalid")
+	}
+	s.role = StartupRoleVoterActive
+	copy := receipt.clone()
+	s.binding = &copy
+	return nil
+}
+
 // MutationBinding returns an immutable copy of the validated journal binding.
 // Presence is not a dispatch right or proof that a source retry file is durable.
 func (s *Session) MutationBinding() (ProducerBinding, bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if s.binding == nil || s.binding.Producer == nil {
+	if s.role != StartupRoleVoterActive || s.binding == nil || s.binding.Producer == nil {
 		return ProducerBinding{}, false
 	}
 	return *s.binding.Producer, true

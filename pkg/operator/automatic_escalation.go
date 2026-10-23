@@ -51,9 +51,9 @@ func (c *Controller) assessAutomaticEscalation(ctx context.Context, r *ClusterRe
 		}
 	}
 	if intent.LearnerName != "" {
-		voters = append(voters, VoterPod{NodeID: quepaxa.NodeID(intent.LearnerName), Pod: intent.LearnerName})
+		voters = append(voters, VoterPod{NodeID: quepaxa.NodeID(intent.LearnerName), Pod: learnerPhysicalPod(intent)})
 		if intent.LearnerUID != "" && intent.LearnerWAL != "" {
-			fencePods[quepaxa.NodeID(intent.LearnerName)] = intent.LearnerName
+			fencePods[quepaxa.NodeID(intent.LearnerName)] = learnerPhysicalPod(intent)
 		}
 	}
 	for _, ref := range voters {

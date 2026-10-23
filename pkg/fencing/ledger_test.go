@@ -1,9 +1,77 @@
 package fencing
 
-import "testing"
+import (
+	"strings"
+	"testing"
+)
 
 func testIdentity() Identity {
 	return Identity{SourceClusterID: "source", NodeID: "n1", PodUID: "pod-uid", RunID: "run-1"}
+}
+
+func TestStartupGrantRoleIsAuthorityOwnedAndPhysicalPodBound(t *testing.T) {
+	request := testIdentity()
+	request.PodName = "physical-ordinal-0"
+	grant := StartupGrant{Identity: request, Role: StartupRoleLearnerPendingRemove}
+	if err := grant.Validate(request); err != nil {
+		t.Fatal(err)
+	}
+	grant.Role = StartupRole("voter-active")
+	grant.Identity.NodeID = "replacement-logical-id"
+	if err := grant.Validate(request); err == nil {
+		t.Fatal("active voter grant changed logical identity away from physical Pod")
+	}
+	grant.Role = StartupRoleLearnerPendingRemove
+	grant.Identity.PodName = "another-pod"
+	if err := grant.Validate(request); err == nil {
+		t.Fatal("learner grant escaped authenticated physical Pod binding")
+	}
+}
+
+func TestStartupGrantAllowsOnlyBoundPendingLogicalAssignment(t *testing.T) {
+	request := testIdentity()
+	request.PodName = "rhiza-2"
+	grant := StartupGrant{Identity: request, Role: StartupRoleLearnerPendingRemove}
+	grant.Identity.NodeID = "logical-incarnation-7f3a"
+	grant.Identity.AssignmentID = strings.Repeat("a", 64)
+	grant.Environment = map[string]string{"RHIZA_NODE_ID": grant.Identity.NodeID, "RHIZA_LEARNER": `{"id":"logical-incarnation-7f3a"}`, "RHIZA_PEER_TOKEN": "private-token", "RHIZA_PEER_TOKENS": ""}
+	if err := grant.Validate(request); err != nil {
+		t.Fatal(err)
+	}
+	for name, mutate := range map[string]func(*StartupGrant){
+		"changed physical Pod":    func(g *StartupGrant) { g.Identity.PodName = "rhiza-3" },
+		"missing assignment":      func(g *StartupGrant) { g.Identity.AssignmentID = "" },
+		"unsupported environment": func(g *StartupGrant) { g.Environment["RHIZA_ADMIN_TOKEN"] = "secret" },
+		"learner role omitted":    func(g *StartupGrant) { delete(g.Environment, "RHIZA_LEARNER") },
+	} {
+		t.Run(name, func(t *testing.T) {
+			candidate := grant
+			candidate.Environment = make(map[string]string, len(grant.Environment))
+			for key, value := range grant.Environment {
+				candidate.Environment[key] = value
+			}
+			mutate(&candidate)
+			if err := candidate.Validate(request); err == nil {
+				t.Fatal("invalid logical assignment accepted")
+			}
+		})
+	}
+	active := grant
+	active.Role = StartupRoleVoterActive
+	active.Environment = map[string]string{
+		"RHIZA_NODE_ID":         active.Identity.NodeID,
+		"RHIZA_LEARNER":         "",
+		"RHIZA_PEER_TOKEN":      "private-token",
+		"RHIZA_PEER_TOKENS":     "",
+		"RHIZA_CLUSTER_MEMBERS": "[{\"id\":\"existing-voter\"},{\"id\":\"logical-incarnation-7f3a\"}]",
+	}
+	if err := active.Validate(request); err != nil {
+		t.Fatalf("authority-issued assigned identity could not restart as active after canonical completion: %v", err)
+	}
+	active.Environment["RHIZA_LEARNER"] = "{\"id\":\"logical-incarnation-7f3a\"}"
+	if err := active.Validate(request); err == nil {
+		t.Fatal("active assigned restart retained learner mode")
+	}
 }
 
 func TestLedgerRequiresSeparateDrainAndExit(t *testing.T) {

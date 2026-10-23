@@ -12,8 +12,10 @@ type RuntimeBinding struct {
 	StatefulSetUID      string `json:"statefulSetUID"`
 	SourceClusterID     string `json:"sourceClusterID"`
 	NodeID              string `json:"nodeID"`
+	PodName             string `json:"podName,omitempty"`
 	PodUID              string `json:"podUID"`
 	RunID               string `json:"runID"`
+	AssignmentID        string `json:"assignmentID,omitempty"`
 	NodeName            string `json:"nodeName"`
 	NodeUID             string `json:"nodeUID"`
 	MachineID           string `json:"machineID"`
@@ -26,7 +28,7 @@ type RuntimeBinding struct {
 }
 
 func (b RuntimeBinding) Validate(id Identity) error {
-	if b.SourceClusterID != id.SourceClusterID || b.NodeID != id.NodeID || b.PodUID != id.PodUID || b.RunID != id.RunID {
+	if b.SourceClusterID != id.SourceClusterID || b.NodeID != id.NodeID || b.PodUID != id.PodUID || b.RunID != id.RunID || b.AssignmentID != id.AssignmentID || (id.PodName != "" && b.PodName != id.PodName) {
 		return fmt.Errorf("fencing: runtime enrollment identity differs")
 	}
 	for _, value := range []string{
@@ -48,13 +50,24 @@ func (b RuntimeBinding) Validate(id Identity) error {
 // never application-supplied metadata. The caller persists this pure transition
 // with the same CAS used for closure and WAL binding.
 func (l *Ledger) RegisterEnrolled(id Identity, runtime RuntimeBinding) error {
+	return l.RegisterEnrolledWithRole(id, runtime, StartupRoleVoterActive)
+}
+
+// RegisterEnrolledWithRole persists the authority-resolved startup role with
+// the runtime enrollment in the same ledger CAS.
+func (l *Ledger) RegisterEnrolledWithRole(id Identity, runtime RuntimeBinding, role StartupRole) error {
 	if err := runtime.Validate(id); err != nil {
 		return err
 	}
-	if old, exists := l.Runs[id.RunID]; exists && old.Runtime != nil && *old.Runtime != runtime {
-		return fmt.Errorf("fencing: runtime enrollment is immutable")
+	if old, exists := l.Runs[id.RunID]; exists {
+		if old.Runtime != nil && *old.Runtime != runtime {
+			return fmt.Errorf("fencing: runtime enrollment is immutable")
+		}
+		if runRole(old) != role {
+			return fmt.Errorf("fencing: startup role is immutable")
+		}
 	}
-	if err := l.Register(id); err != nil {
+	if err := l.RegisterWithRole(id, role); err != nil {
 		return err
 	}
 	run := l.Runs[id.RunID]
@@ -69,7 +82,7 @@ func (l *Ledger) RegisterEnrolled(id Identity, runtime RuntimeBinding) error {
 // is allowed for an unbound run: it cannot reopen WAL or mutation admission.
 func (l *Ledger) BindMutationProducer(id Identity, runtime RuntimeBinding, producerUID string) error {
 	run, exists := l.Runs[id.RunID]
-	if !exists || producerUID == "" || run.Runtime == nil || *run.Runtime != runtime {
+	if !exists || runRole(run) != StartupRoleVoterActive || producerUID == "" || run.Runtime == nil || *run.Runtime != runtime {
 		return fmt.Errorf("fencing: mutation producer has no matching runtime enrollment")
 	}
 	if err := runtime.Validate(id); err != nil {
@@ -86,7 +99,7 @@ func (l *Ledger) BindMutationProducer(id Identity, runtime RuntimeBinding, produ
 		}
 		return fmt.Errorf("fencing: mutation producer UID is immutable")
 	}
-	if run.Identity.WALIdentity != "" {
+	if run.Identity.WALIdentity != "" && run.Promotion == nil {
 		return fmt.Errorf("fencing: cannot enroll a mutation producer after WAL admission")
 	}
 	run.MutationProducerUID = producerUID

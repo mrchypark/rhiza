@@ -171,7 +171,7 @@ func (e *FencingExecutor) sourceStageProducer(r *http.Request, id fencing.Identi
 	}
 	run, ok := state.Ledger.Runs[id.RunID]
 	_, closed := state.Ledger.ClosedNodes[id.NodeID]
-	if !ok || run.Identity != id || run.Stop != nil || closed || state.Ledger.ClosedBy != "" || !state.Ledger.RequireMutationJournal || run.Runtime == nil || run.Runtime.StatefulSetUID != uid || run.MutationProducerUID == "" || run.MutationScopeHash == "" || !fencing.MutationProfileSupported(run.MutationProfile) {
+	if !ok || fencing.RunRole(run) != fencing.StartupRoleVoterActive || run.Identity != id || run.Stop != nil || closed || state.Ledger.ClosedBy != "" || !state.Ledger.RequireMutationJournal || run.Runtime == nil || run.Runtime.StatefulSetUID != uid || run.MutationProducerUID == "" || run.MutationScopeHash == "" || !fencing.MutationProfileSupported(run.MutationProfile) {
 		return "", "", nil, fencing.RuntimeBinding{}, fmt.Errorf("fencing: source stage is outside the active enrolled producer")
 	}
 	if err := run.Runtime.Validate(id); err != nil {

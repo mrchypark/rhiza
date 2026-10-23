@@ -60,6 +60,7 @@ type Node struct {
 	localRestoreSuffixPending bool
 	recoveryPhases            nodeRecoveryPhases
 	ready                     atomic.Bool
+	fenceWriterActive         atomic.Bool
 	membershipMu              sync.Mutex
 	opened                    atomic.Bool
 	cancel                    context.CancelFunc
@@ -275,6 +276,10 @@ func (n *Node) open(ctx context.Context, enroll bool) (err error) {
 	if err := n.connectFenceSession(ctx); err != nil {
 		return err
 	}
+	if n.fenceSession != nil && n.fenceSession.StartupRole() == fencing.StartupRoleLearnerPendingRemove &&
+		(n.config.Learner == nil || n.config.Learner.ID != n.config.NodeID || len(n.config.Members) < 2) {
+		return fmt.Errorf("fencing: pending-removal startup requires an explicit nonvoting learner configuration")
+	}
 	supervised = n.fenceSession != nil
 	ctx, n.cancel = context.WithCancel(ctx)
 
@@ -427,10 +432,15 @@ func (n *Node) open(ctx context.Context, enroll bool) (err error) {
 		}
 		n.bucket = runtimeBucket
 		var beforeWrite []func(context.Context, string) error
+		var pendingIdentityWrite []func(context.Context, string, []byte) error
 		if n.fenceSession != nil {
 			beforeWrite = append(beforeWrite, n.bindFenceWAL)
+			if n.fenceSession.StartupRole() == fencing.StartupRoleLearnerPendingRemove {
+				pendingIdentityWrite = append(pendingIdentityWrite, n.registerLearnerIdentity)
+			}
 		}
-		if err := ensureVoterIdentity(ctx, n.config, runtimeBucket, n.wal, localVoter, enroll, beforeWrite...); err != nil {
+		assignedRestart := n.fenceSession != nil && n.fenceSession.StartupRole() == fencing.StartupRoleVoterActive && n.fenceSession.Identity().AssignmentID != ""
+		if err := ensureVoterIdentityWithHooks(ctx, n.config, runtimeBucket, n.wal, localVoter, enroll, beforeWrite, pendingIdentityWrite, assignedRestart); err != nil {
 			return err
 		}
 		if n.fenceSession != nil && n.fenceSession.Identity().WALIdentity == "" {
@@ -631,7 +641,7 @@ func (n *Node) open(ctx context.Context, enroll bool) (err error) {
 	}
 	// Record RPCs must be available while every replica is recovering. Public
 	// proposals and learned decisions remain gated by ready=false.
-	server := network.NewServer(core, material, n.config.ClusterID, true, transport, n.ready.Load)
+	server := network.NewServer(core, material, n.config.ClusterID, true, transport, n.apiReady)
 	server.SetTerminalDrain(func(ctx context.Context, expected network.TerminalDrainRequest) (any, error) {
 		return n.TerminalDrain(ctx, expected)
 	})
@@ -1022,6 +1032,13 @@ func (n *Node) open(ctx context.Context, enroll bool) (err error) {
 	}
 	n.startFenceWatcher(ctx)
 	return nil
+}
+
+func (n *Node) registerLearnerIdentity(ctx context.Context, key string, data []byte) error {
+	if n.fenceSession == nil || n.fenceSession.StartupRole() != fencing.StartupRoleLearnerPendingRemove {
+		return fmt.Errorf("fencing: learner identity registration is unavailable")
+	}
+	return n.fenceSession.RegisterLearnerIdentity(ctx, key, data)
 }
 
 func voterReadDurabilityBarrier(isVoter func() bool, barrier func(context.Context, quepaxa.Slot) error) func(context.Context, quepaxa.Slot) error {
@@ -1902,7 +1919,22 @@ func (n *Node) observeCatchUp(err error) {
 		log.Printf("quorum catch-up failed: %v", err)
 		return
 	}
+	if n.fenceSession != nil && n.core != nil && n.core.IsVoter() &&
+		(n.fenceSession.StartupRole() == fencing.StartupRoleLearnerPendingRemove || !n.fenceWriterActive.Load()) {
+		// The ADD may be locally applied before its canonical journal is durably
+		// acknowledged. Keep client writes unavailable until the authority changes
+		// the startup role and returns the active producer receipt.
+		n.ready.Store(false)
+		return
+	}
 	n.ready.Store(true)
+}
+
+func (n *Node) apiReady() bool {
+	if !n.ready.Load() {
+		return false
+	}
+	return n.fenceSession == nil || n.fenceSession.StartupRole() != fencing.StartupRoleVoterActive || n.fenceWriterActive.Load()
 }
 
 func hasUsablePeerSuffix(applied quepaxa.Slot, successes, quorum int, best *network.DecisionsResponse) bool {

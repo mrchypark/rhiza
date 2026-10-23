@@ -3,8 +3,11 @@ package node
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"errors"
+	"fmt"
 	"os"
+	"path"
 	"path/filepath"
 	"testing"
 
@@ -134,6 +137,49 @@ func TestVoterIdentityRequiresExplicitLegacyEnrollment(t *testing.T) {
 	if err := registerTestVoter(t, config, bucket, false); err != nil {
 		t.Fatalf("registered restart: %v", err)
 	}
+}
+
+func TestPendingLearnerIdentityUsesOnlyAuthorityCreateOnlyHook(t *testing.T) {
+	ctx := context.Background()
+	bucket := objstore.NewInMemBucket()
+	base := voterTestConfig(t)
+	if err := registerTestVoter(t, base, bucket, false); err != nil {
+		t.Fatal(err)
+	}
+	learner := *base
+	learner.DataDir = t.TempDir()
+	learner.NodeID = "learner-new"
+	learnerMember := peerMember("cluster", learner.NodeID, "learner-token")
+	learner.Learner = &learnerMember
+	local, err := loadVoterIdentity(&learner)
+	if err != nil {
+		t.Fatal(err)
+	}
+	wal, err := qlog.Open(filepath.Join(learner.DataDir, "qlog"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer wal.Close()
+	var registeredKey string
+	bind := func(_ context.Context, _ string) error { return nil }
+	write := func(ctx context.Context, key string, data []byte) error {
+		registeredKey = key
+		return bucket.Upload(ctx, key, bytes.NewReader(data), objstore.WithIfNotExists())
+	}
+	if err := ensureVoterIdentityWithHooks(ctx, &learner, bucket, wal, local, false, []func(context.Context, string) error{bind}, []func(context.Context, string, []byte) error{write}); err != nil {
+		t.Fatal(err)
+	}
+	wantKey := path.Join("cluster", "voters", voterIdentityKey(string(learner.NodeID)))
+	if registeredKey != wantKey {
+		t.Fatalf("authority hook key=%q want=%q", registeredKey, wantKey)
+	}
+	if _, bound := wal.Identity(); !bound {
+		t.Fatal("pending learner identity registration preceded WAL binding")
+	}
+}
+
+func voterIdentityKey(nodeID string) string {
+	return fmt.Sprintf("%x.json", sha256.Sum256([]byte(nodeID)))
 }
 
 func TestVoterIdentityResumesInterruptedRegistration(t *testing.T) {
