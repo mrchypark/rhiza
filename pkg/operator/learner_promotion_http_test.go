@@ -151,14 +151,19 @@ func TestAuthenticatedLearnerPromotionRetriesExactCanonicalCompletion(t *testing
 		t.Fatalf("prepare exact replacement assignment: ok=%t err=%v", ok, err)
 	}
 	intent := state.Intent
-	childSpec := Spec{StatefulSet: "rhiza", Container: "rhiza", SourceClusterID: f.runtime.SourceClusterID, Durability: "async",
-		Membership: &MembershipSpec{OperationID: intent.RecoveryName, Remove: quepaxa.NodeID(oldTarget.NodeID), ReplacementPod: physicalPod,
-			ReplacementSecret: intent.LearnerSecretName, Fence: MembershipFence{NodeID: quepaxa.NodeID(oldTarget.NodeID), WALIdentity: oldTarget.WALIdentity,
-				WorkloadUID: oldTarget.PodUID, Confirmed: true, Evidence: fence.Status.Proof.ProofID}}}
+	childSpec := automaticRecoveryChildSpec(&cluster, state, intent)
 	funcMetadata := object{"name": intent.RecoveryName, "namespace": "test", "uid": "promotion-child-uid", "generation": float64(1),
 		"annotations": object{automaticOwner: state.BindingUID, automaticLogical: cluster.Spec.LogicalID}}
 	child := Resource{APIVersion: "rhiza.mrchypark.dev/v1alpha1", Kind: "RhizaRecovery", Metadata: funcMetadata, Spec: childSpec}
 	intent.RecoveryUID, intent.SpecHash = str(funcMetadata["uid"]), hashJSON(childSpec)
+	if child.Spec.Membership == nil || str(child.Metadata["uid"]) != intent.RecoveryUID || hashJSON(child.Spec) != intent.SpecHash ||
+		child.Spec.Membership.AbortAddition || child.Spec.Membership.OperationID != intent.RecoveryName || child.Spec.Membership.Remove != intent.Failed ||
+		child.Spec.Membership.ReplacementPod != physicalPod || child.Spec.Membership.ReplacementSecret != intent.LearnerSecretName ||
+		string(child.Spec.Membership.Fence.NodeID) != string(intent.Failed) || child.Spec.Membership.Fence.WALIdentity != oldTarget.WALIdentity ||
+		child.Spec.Membership.Fence.WorkloadUID != oldTarget.PodUID || !child.Spec.Membership.Fence.Confirmed ||
+		child.Spec.Membership.Fence.Evidence != intent.Proof.ProofID || child.Spec.Fence != (Fence{}) {
+		t.Fatal("production-built child does not satisfy the complete canonical startup assignment contract")
+	}
 	assignment, err := sameOrdinalAssignmentDigest(state, intent)
 	if err != nil {
 		t.Fatalf("derive same-ordinal assignment digest: %v", err)
@@ -213,6 +218,44 @@ func TestAuthenticatedLearnerPromotionRetriesExactCanonicalCompletion(t *testing
 	client := fencing.AuthorityClient{URL: authorityServer.URL + "/v1/supervisor", TokenFile: tokenFile, Client: authorityServer.Client()}
 	physicalID := fencing.Identity{SourceClusterID: f.runtime.SourceClusterID, NodeID: intent.LearnerName, PodName: physicalPod,
 		PodUID: replacementUID, RunID: "promotion-run", AssignmentID: intent.LearnerAssignmentID}
+	canonicalChildSpec, canonicalSpecHash, canonicalAssignment := child.Spec, intent.SpecHash, intent.LearnerAssignmentID
+	canonicalMembershipFenceEvidence := child.Spec.Membership.Fence.Evidence
+	child.Spec.Membership.Fence.Evidence = strings.Repeat("e", 64)
+	intent.SpecHash = hashJSON(child.Spec)
+	wrongAssignment, err := sameOrdinalAssignmentDigest(state, intent)
+	if err != nil {
+		t.Fatalf("bind deliberately wrong membership fence to its changed child spec: %v", err)
+	}
+	intent.LearnerAssignmentID = wrongAssignment
+	if err := controller.saveAuto(ctx, &cluster, state, mustAutoVersion(t, controller, &cluster)); err != nil {
+		t.Fatalf("persist mismatched membership-fence fixture: %v", err)
+	}
+	persistTestRecovery(t, f, child)
+	wrongPhysicalID := physicalID
+	wrongPhysicalID.AssignmentID = wrongAssignment
+	if _, assigned, err := f.e.resolveSameOrdinalStartupGrant(ctx, f.runtime.StatefulSetUID, wrongPhysicalID); !assigned || err == nil || !strings.Contains(err.Error(), "startup recovery child differs from assignment") {
+		t.Fatalf("mismatched membership-fence evidence did not reach the canonical proof guard: assigned=%t err=%v", assigned, err)
+	}
+	rootBeforeWrongProof, _, err := f.e.AuthorityState.ReadRoot(ctx, f.runtime.StatefulSetUID, f.runtime.SourceClusterID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := client.RegisterStartup(ctx, wrongPhysicalID); err == nil || !strings.Contains(err.Error(), "HTTP 409") {
+		t.Fatalf("startup accepted mismatched membership fence evidence: %v", err)
+	}
+	rootAfterWrongProof, _, err := f.e.AuthorityState.ReadRoot(ctx, f.runtime.StatefulSetUID, f.runtime.SourceClusterID)
+	if err != nil || hashJSON(rootBeforeWrongProof) != hashJSON(rootAfterWrongProof) {
+		t.Fatalf("rejected wrong-proof startup mutated CONTROL: before=%+v after=%+v err=%v", rootBeforeWrongProof, rootAfterWrongProof, err)
+	}
+	intent.SpecHash, intent.LearnerAssignmentID = canonicalSpecHash, canonicalAssignment
+	// Resource.Spec contains a pointer for Membership, so the saved spec above
+	// shares that nested value. Restore the original evidence before reusing it.
+	canonicalChildSpec.Membership.Fence.Evidence = canonicalMembershipFenceEvidence
+	child.Spec = canonicalChildSpec
+	if err := controller.saveAuto(ctx, &cluster, state, mustAutoVersion(t, controller, &cluster)); err != nil {
+		t.Fatalf("restore canonical membership-fence assignment: %v", err)
+	}
+	persistTestRecovery(t, f, child)
 	grant, err := client.RegisterStartup(ctx, physicalID)
 	if err != nil || grant.Role != fencing.StartupRoleLearnerPendingRemove || grant.Identity != physicalID {
 		t.Fatalf("authenticated registration did not retain the pending logical identity: grant=%+v err=%v", grant, err)

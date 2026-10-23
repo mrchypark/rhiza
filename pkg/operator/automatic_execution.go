@@ -106,19 +106,7 @@ func (c *Controller) advanceAutomatic(ctx context.Context, r *ClusterResource, s
 			}
 		}
 	}
-	desired := Spec{StatefulSet: r.Spec.StatefulSet, Container: r.Spec.Container, SourceClusterID: state.ActiveClusterID, Durability: intent.Durability, RecoveryID: intent.RecoveryName, AllowDataLoss: intent.Policy.AllowDataLoss, AnchorID: r.Spec.AnchorID, Fence: Fence{RecoveryID: intent.RecoveryName, ClusterID: state.ActiveClusterID, StatefulSetUID: state.StatefulSetUID, Confirmed: true, Evidence: intent.Proof.ProofID}}
-	if intent.Failed != "" {
-		var voters []VoterPod
-		for _, ref := range intent.Voters {
-			if ref.NodeID != intent.Failed {
-				voters = append(voters, ref)
-			}
-		}
-		target := intent.Request.Targets[0]
-		desired.RecoveryID = ""
-		desired.Fence = Fence{}
-		desired.Membership = &MembershipSpec{AbortAddition: intent.Aborting, OperationID: intent.RecoveryName, Remove: intent.Failed, RemovedPod: target.Pod, VoterPods: voters, ReplacementPod: learnerPhysicalPod(intent), ReplacementSecret: learnerCredentialName(intent), Fence: MembershipFence{NodeID: intent.Failed, WALIdentity: target.WALIdentity, WorkloadUID: target.PodUID, Confirmed: true, Evidence: intent.Proof.ProofID}}
-	}
+	desired := automaticRecoveryChildSpec(r, state, intent)
 	var child Resource
 	err := c.Kube.Get(ctx, c.resourcePath(intent.RecoveryName), &child)
 	if err != nil {
@@ -245,6 +233,28 @@ func (c *Controller) advanceAutomatic(ctx context.Context, r *ClusterResource, s
 		return err
 	}
 	return c.autoStatus(ctx, r, state, "Stabilizing", "recovery completed; verifying the active quorum")
+}
+
+// automaticRecoveryChildSpec is the single production builder for the exact
+// child spec pinned into automatic CONTROL. Membership children bind fencing
+// evidence in Membership.Fence; the top-level Fence is intentionally empty for
+// that distinct recovery mode.
+func automaticRecoveryChildSpec(r *ClusterResource, state *autoControl, intent *autoIntent) Spec {
+	desired := Spec{StatefulSet: r.Spec.StatefulSet, Container: r.Spec.Container, SourceClusterID: state.ActiveClusterID, Durability: intent.Durability, RecoveryID: intent.RecoveryName, AllowDataLoss: intent.Policy.AllowDataLoss, AnchorID: r.Spec.AnchorID, Fence: Fence{RecoveryID: intent.RecoveryName, ClusterID: state.ActiveClusterID, StatefulSetUID: state.StatefulSetUID, Confirmed: true, Evidence: intent.Proof.ProofID}}
+	if intent.Failed == "" {
+		return desired
+	}
+	var voters []VoterPod
+	for _, ref := range intent.Voters {
+		if ref.NodeID != intent.Failed {
+			voters = append(voters, ref)
+		}
+	}
+	target := intent.Request.Targets[0]
+	desired.RecoveryID = ""
+	desired.Fence = Fence{}
+	desired.Membership = &MembershipSpec{AbortAddition: intent.Aborting, OperationID: intent.RecoveryName, Remove: intent.Failed, RemovedPod: target.Pod, VoterPods: voters, ReplacementPod: learnerPhysicalPod(intent), ReplacementSecret: learnerCredentialName(intent), Fence: MembershipFence{NodeID: intent.Failed, WALIdentity: target.WALIdentity, WorkloadUID: target.PodUID, Confirmed: true, Evidence: intent.Proof.ProofID}}
+	return desired
 }
 
 // authorizeAutomaticChild is checked by the existing executor before any side
