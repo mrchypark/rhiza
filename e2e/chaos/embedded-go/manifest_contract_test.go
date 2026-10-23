@@ -19,6 +19,15 @@ func readContractFile(t *testing.T, path string) string {
 	return string(data)
 }
 
+func manifestDocumentForKind(manifest, kind string) string {
+	for _, document := range strings.Split(manifest, "\n---\n") {
+		if strings.Contains(document, "kind: "+kind) {
+			return document
+		}
+	}
+	return ""
+}
+
 func TestIndependentGCSChaosManifestContract(t *testing.T) {
 	manifest := readContractFile(t, "../votercount_gcs_chaos.yaml.in")
 	launcher := readContractFile(t, "../run-votercount-gcs-chaos.sh")
@@ -42,6 +51,38 @@ func TestIndependentGCSChaosManifestContract(t *testing.T) {
 		if !strings.Contains(manifest, want) {
 			t.Errorf("manifest missing %q", want)
 		}
+	}
+	fencerRole := manifestDocumentForKind(manifest, "ClusterRole")
+	fencerBinding := manifestDocumentForKind(manifest, "ClusterRoleBinding")
+	for _, want := range []string{
+		"name: '__NAMESPACE__-fencer-tokenreview'",
+		"chaos.rhiza.io/run: '__RUN_ID__'",
+		"resources: [namespaces]",
+		"resourceNames: [__NAMESPACE__]",
+		"verbs: [get]",
+	} {
+		if !strings.Contains(fencerRole, want) {
+			t.Errorf("run-scoped fencer ClusterRole missing %q", want)
+		}
+	}
+	if strings.Contains(fencerRole, "resources: [namespaces], verbs: [get, list]") ||
+		strings.Contains(fencerRole, "resources: [namespaces], verbs: [get, list, watch]") ||
+		strings.Contains(fencerRole, "resourceNames: [*]") {
+		t.Fatal("fencer namespace permission must be get-only and pinned to the rendered run namespace")
+	}
+	for _, want := range []string{
+		"name: '__NAMESPACE__-fencer-tokenreview'",
+		"chaos.rhiza.io/run: '__RUN_ID__'",
+		"namespace: __NAMESPACE__",
+		"name: rhiza-fencer",
+		"kind: ClusterRole, name: '__NAMESPACE__-fencer-tokenreview'",
+	} {
+		if !strings.Contains(fencerBinding, want) {
+			t.Errorf("run-scoped fencer ClusterRoleBinding missing %q", want)
+		}
+	}
+	if strings.Contains(fencerRole, "name: rhiza-fencer-tokenreview") || strings.Contains(fencerBinding, "name: rhiza-fencer-tokenreview") {
+		t.Fatal("fencer RBAC must not bind a shared, non-run-unique ClusterRole")
 	}
 	for _, want := range []string{
 		"GOOGLE_APPLICATION_CREDENTIALS",

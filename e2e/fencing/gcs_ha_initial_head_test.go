@@ -113,7 +113,7 @@ name=${7:-}
 case "$kind:$name" in
   namespace:rhiza-ha-run-a1b2c3d4) cat %q ;;
   deployment:rhiza-fencer) cat %q ;;
-  pods:)
+  pods:-o)
     if [ -f %q ]; then cat %q; else : > %q; cat %q; fi
     ;;
   pod:rhiza-fencer-old) cat %q ;;
@@ -339,7 +339,7 @@ if [ "$5" != "get" ]; then echo "unexpected Kubernetes mutation" >&2; exit 91; f
 case "$6:$7" in
   namespace:rhiza-ha-run-a1b2c3d4) cat %q ;;
   deployment:rhiza-fencer) cat %q ;;
-  pods:) cat %q ;;
+  pods:-o) cat %q ;;
   replicaset:rhiza-fencer-rs) cat %q ;;
   configmap:rhiza-config) cat %q ;;
   *) echo "unexpected Kubernetes read" >&2; exit 92 ;;
@@ -430,17 +430,10 @@ func TestInitialHeadCleanupRestoresOnlyCapturedTemplateAndUIDs(t *testing.T) {
 	patchedArgs := []any{"serve", "--gcs-ack-loss-config-file=" + gcsAckLossConfigPath}
 	patchedMounts := []any{map[string]any{"name": gcsAckLossVolumeName, "mountPath": "/var/run/rhiza/gcs-ack-loss", "readOnly": true}}
 	patchedVolumes := []any{map[string]any{"name": gcsAckLossVolumeName, "configMap": map[string]any{"name": gcsAckLossConfigMapName, "items": []any{map[string]any{"key": "config.json", "path": "config.json"}}}}}
-	originalTemplate := initialHeadCleanupPodTemplate(originalArgs, originalMounts, originalVolumes, "metrics:v1")
-	patchedTemplate := initialHeadCleanupPodTemplate(patchedArgs, patchedMounts, patchedVolumes, "metrics:v1")
 	configBytes := []byte(`{"version":1,"selector":"initial-archive-head"}`)
-	state := gcsInitialHeadInstallState{
-		Version: 2, DeploymentUID: "original-deployment-uid", ConfigMapUID: "original-configmap-uid", ConfigDigest: gcsInitialHeadDigest(configBytes),
-		NamespaceUID: "namespace-uid", SourceCluster: "source-cluster", Bucket: "qualification-bucket",
-		Prefix: "runs/a1b2c3d4/data/source-cluster", ControlPrefix: "runs/a1b2c3d4/control", Container: 0,
-		Args: originalArgs, Mounts: originalMounts, Volumes: originalVolumes,
-		PatchedArgs: patchedArgs, PatchedMounts: patchedMounts, PatchedVolume: patchedVolumes,
-		PodTemplate: originalTemplate, PatchedTemplate: patchedTemplate,
-	}
+	state := initialHeadCleanupState(t, "original-deployment-uid", "original-configmap-uid", configBytes,
+		originalArgs, originalMounts, originalVolumes, patchedArgs, patchedMounts, patchedVolumes)
+	patchedTemplate := state.PatchedTemplate
 	stateBytes, err := json.Marshal(state)
 	if err != nil {
 		t.Fatal(err)
@@ -512,17 +505,9 @@ func TestInitialHeadCleanupRetainsRestoreRecordUntilAbsentConfigAndTemplateAreVe
 	patchedArgs := []any{"serve", "--gcs-ack-loss-config-file=" + gcsAckLossConfigPath}
 	patchedMounts := []any{map[string]any{"name": gcsAckLossVolumeName, "mountPath": filepath.Dir(gcsAckLossConfigPath), "readOnly": true}}
 	patchedVolumes := []any{map[string]any{"name": gcsAckLossVolumeName, "configMap": map[string]any{"name": gcsAckLossConfigMapName, "items": []any{map[string]any{"key": "config.json", "path": "config.json"}}}}}
-	originalTemplate := initialHeadCleanupPodTemplate(originalArgs, originalMounts, originalVolumes, "metrics:v1")
-	patchedTemplate := initialHeadCleanupPodTemplate(patchedArgs, patchedMounts, patchedVolumes, "metrics:v1")
 	configBytes := []byte(`{"version":1,"selector":"initial-archive-head"}`)
-	state := gcsInitialHeadInstallState{
-		Version: 2, DeploymentUID: "deployment-uid", ConfigMapUID: "matching-run-configmap-uid", ConfigDigest: gcsInitialHeadDigest(configBytes),
-		NamespaceUID: "namespace-uid", SourceCluster: "source-cluster", Bucket: "qualification-bucket",
-		Prefix: "runs/a1b2c3d4/data/source-cluster", ControlPrefix: "runs/a1b2c3d4/control", Container: 0,
-		Args: originalArgs, Mounts: originalMounts, Volumes: originalVolumes,
-		PatchedArgs: patchedArgs, PatchedMounts: patchedMounts, PatchedVolume: patchedVolumes,
-		PodTemplate: originalTemplate, PatchedTemplate: patchedTemplate,
-	}
+	state := initialHeadCleanupState(t, "deployment-uid", "matching-run-configmap-uid", configBytes,
+		originalArgs, originalMounts, originalVolumes, patchedArgs, patchedMounts, patchedVolumes)
 	stateBytes, err := json.Marshal(state)
 	if err != nil {
 		t.Fatal(err)
@@ -722,6 +707,31 @@ func initialHeadCleanupPodTemplate(args, mounts, volumes []any, metricsImage str
 			"volumes":      volumes,
 			"nodeSelector": obj{"rhiza.io/role": "control"},
 		},
+	}
+}
+
+func initialHeadCleanupState(t *testing.T, deploymentUID, configMapUID string, configBytes []byte, args, mounts, volumes, patchedArgs, patchedMounts, patchedVolumes []any) gcsInitialHeadInstallState {
+	t.Helper()
+	original := initialHeadCleanupPodTemplate(args, mounts, volumes, "metrics:v1")
+	index, capturedArgs, capturedMounts, capturedVolumes, err := ackLossDeploymentTemplate(obj{"spec": obj{"template": original}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	capturedTemplate, err := ackLossPodTemplate(obj{"spec": obj{"template": original}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	patched, err := patchAckLossPodTemplate(capturedTemplate, index, patchedArgs, patchedMounts, patchedVolumes)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return gcsInitialHeadInstallState{
+		Version: 2, DeploymentUID: deploymentUID, ConfigMapUID: configMapUID, ConfigDigest: gcsInitialHeadDigest(configBytes),
+		NamespaceUID: "namespace-uid", SourceCluster: "source-cluster", Bucket: "qualification-bucket",
+		Prefix: "runs/a1b2c3d4/data/source-cluster", ControlPrefix: "runs/a1b2c3d4/control", Container: index,
+		Args: capturedArgs, Mounts: capturedMounts, Volumes: capturedVolumes,
+		PatchedArgs: patchedArgs, PatchedMounts: patchedMounts, PatchedVolume: patchedVolumes,
+		PodTemplate: capturedTemplate, PatchedTemplate: patched,
 	}
 }
 

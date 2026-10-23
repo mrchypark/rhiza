@@ -264,6 +264,8 @@ func configureAutomaticBootstrapKubernetes(t *testing.T, f *heldProfileFixture, 
 		"clusterIP": "None", "publishNotReadyAddresses": true, "selector": object{"app": "rhiza"},
 	}}
 	f.api.objects[f.e.controller().corePath("pods", "")] = object{"items": podList}
+	f.api.authPod = asObject(podList[0])
+	f.api.authPodName, f.api.authPodUID = cohort[0].NodeID, cohort[0].PodUID
 	f.api.mu.Unlock()
 	if len(cohort) > 0 && cohort[0].StatefulSetUID != f.runtime.StatefulSetUID {
 		t.Fatal("bootstrap cohort StatefulSet UID differs from canonical runtime")

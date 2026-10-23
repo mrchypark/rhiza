@@ -258,6 +258,7 @@ kind: ClusterRole
 metadata: {name: '__NAMESPACE__-fencer-tokenreview', labels: {chaos.rhiza.io/run: '__RUN_ID__'}}
 rules:
   - {apiGroups: [authentication.k8s.io], resources: [tokenreviews], verbs: [create]}
+  - {apiGroups: [''], resources: [namespaces], resourceNames: [__NAMESPACE__], verbs: [get]}
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRoleBinding
