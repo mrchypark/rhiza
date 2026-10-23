@@ -55,6 +55,8 @@ func (r BindReceipt) Validate(expected Identity) error {
 }
 
 // BindMutationStage pins an explicitly provisioned source spool before WAL
+// activation. A canonically promoted learner is the sole exception: its WAL
+// was bound while it had no producer, and stage pinning still precedes producer
 // activation. The value is immutable for the producer's lifetime; an absent
 // stage store is not a bootstrap signal and cannot clear a prior pin.
 func (l *Ledger) BindMutationStage(id Identity, incarnation string) error {
@@ -81,8 +83,11 @@ func (l *Ledger) BindMutationStage(id Identity, incarnation string) error {
 		}
 		return nil
 	}
-	if run.Identity.WALIdentity != "" {
+	if run.Identity.WALIdentity != "" && run.Promotion == nil {
 		return fmt.Errorf("fencing: mutation stage pin must precede WAL activation")
+	}
+	if run.Promotion != nil && run.Identity.WALIdentity != id.WALIdentity {
+		return fmt.Errorf("fencing: promoted mutation stage identity differs")
 	}
 	run.MutationStageIncarnation = incarnation
 	l.Runs[id.RunID] = run
@@ -117,7 +122,9 @@ func (r BindReceipt) clone() BindReceipt {
 }
 
 // BindMutationScope must be persisted in the root before returning a producer
-// binding. It cannot retrofit a new scope onto an already-bound old WAL.
+// binding. Ordinary voters bind before WAL activation. A canonically promoted
+// learner may bind its first scope after WAL binding because it had no producer
+// while pending; its producer is not activated until this scope is persisted.
 func (l *Ledger) BindMutationScope(id Identity, scope, profile string) error {
 	run, ok := l.Runs[id.RunID]
 	before := id
@@ -140,7 +147,10 @@ func (l *Ledger) BindMutationScope(id Identity, scope, profile string) error {
 		}
 		return nil
 	}
-	if run.Identity.WALIdentity != "" || run.MutationProfile != "" {
+	if run.MutationProfile != "" {
+		return fmt.Errorf("fencing: mutation scope must precede WAL activation")
+	}
+	if run.Identity.WALIdentity != "" && (run.Promotion == nil || run.Identity.WALIdentity != id.WALIdentity) {
 		return fmt.Errorf("fencing: mutation scope must precede WAL activation")
 	}
 	run.MutationScopeHash, run.MutationProfile = scope, profile

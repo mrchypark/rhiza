@@ -138,7 +138,8 @@ func (e *FencingExecutor) mutateProducer(ctx context.Context, runtime fencing.Ru
 			return producer, fmt.Errorf("fencing: canonical mutation producer identity differs from root")
 		}
 		if run.MutationProducerUID == "" {
-			if !allowCreate || run.Identity.WALIdentity != "" || producer.LastAdmitted != 0 || (producer.Phase != fencing.MutationReserved && producer.Phase != fencing.MutationClosed) {
+			promotedBoundLearner := run.Promotion != nil && fencing.RunRole(run) == fencing.StartupRoleVoterActive && run.Identity.WALIdentity != ""
+			if !allowCreate || (run.Identity.WALIdentity != "" && !promotedBoundLearner) || producer.LastAdmitted != 0 || (producer.Phase != fencing.MutationReserved && producer.Phase != fencing.MutationClosed) {
 				return producer, fmt.Errorf("fencing: producer identity must be pinned before activation")
 			}
 			_, err := e.change(ctx, runtime.StatefulSetUID, runtime.SourceClusterID, func(l *fencing.Ledger) error {
