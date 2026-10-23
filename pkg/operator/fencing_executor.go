@@ -1014,7 +1014,7 @@ func (e *FencingExecutor) validateCanonicalLearnerFence(ctx context.Context, req
 	if err := validateIndependentV2(request, proof.IndependentV2); err != nil {
 		return fmt.Errorf("fencing: canonical old-voter terminal proof differs: %w", err)
 	}
-	if err := verifyIndependentProofCoverage(canonical, request, proof.IndependentV2); err != nil {
+	if err := verifyIndependentVoterProofCoverage(canonical, request, proof.IndependentV2); err != nil {
 		return fmt.Errorf("fencing: canonical old-voter terminal coverage differs: %w", err)
 	}
 	storage := proof.IndependentV2.StorageScope

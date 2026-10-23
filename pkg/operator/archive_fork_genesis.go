@@ -593,28 +593,7 @@ func sameArchiveForkResult(a, b recovery.ForkResult) bool {
 }
 
 func verifyIndependentProofCoverage(state fenceLedger, request FenceRequest, evidence *IndependentEvidenceV2) error {
-	runs, err := independentClosedRuns(state, request, nil)
-	if err != nil || evidence == nil || len(evidence.Terminals) != len(runs) {
-		return errors.Join(err, fmt.Errorf("fencing: source proof does not cover the complete canonical run history"))
-	}
-	byRun := make(map[string]fencing.TerminalReference, len(evidence.Terminals))
-	for _, ref := range evidence.Terminals {
-		runID := ref.Request.Identity.RunID
-		if _, exists := byRun[runID]; exists {
-			return fmt.Errorf("fencing: source proof duplicates a terminal run")
-		}
-		byRun[runID] = ref
-	}
-	for _, run := range runs {
-		ref, exists := byRun[run.Identity.RunID]
-		if !exists || run.IndependentTerminal == nil || ref != *run.IndependentTerminal || run.Stop == nil || ref.Request != *run.Stop {
-			return fmt.Errorf("fencing: source proof terminal reference differs from canonical run history")
-		}
-		if _, err := state.Ledger.IndependentTerminal(run.Identity.RunID, hashJSON(evidence.StorageScope)); err != nil {
-			return err
-		}
-	}
-	return nil
+	return verifyIndependentProofCoverageForNodes(state, request, evidence, nil)
 }
 
 func readBoundedArchiveObject(ctx context.Context, bucket objstore.Bucket, key string, limit int64) ([]byte, error) {

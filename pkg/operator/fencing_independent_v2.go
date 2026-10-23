@@ -2,6 +2,7 @@ package operator
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net/url"
 	"slices"
@@ -195,4 +196,48 @@ func (e *FencingExecutor) independentFence(ctx context.Context, endpoint string,
 	}
 	record.Status.Proof = proof
 	return e.Kube.Put(ctx, endpoint+"/"+url.PathEscape(str(record.Metadata["name"]))+"/status", record, nil)
+}
+
+// verifyIndependentVoterProofCoverage validates the complete retained history
+// for each voter slot closed by this request. A voter-scoped close records
+// ClosedNodes, not a generation-wide ClosedBy marker.
+func verifyIndependentVoterProofCoverage(state fenceLedger, request FenceRequest, evidence *IndependentEvidenceV2) error {
+	if request.Scope != ScopeVoter || len(request.Targets) == 0 || len(request.Targets) > fenceTargetCapacity {
+		return fmt.Errorf("fencing: voter terminal coverage request is invalid")
+	}
+	nodes := make([]string, 0, len(request.Targets))
+	seen := make(map[string]bool, len(request.Targets))
+	for _, target := range request.Targets {
+		if target.NodeID == "" || seen[target.NodeID] {
+			return fmt.Errorf("fencing: voter terminal coverage targets are incomplete or duplicated")
+		}
+		seen[target.NodeID] = true
+		nodes = append(nodes, target.NodeID)
+	}
+	return verifyIndependentProofCoverageForNodes(state, request, evidence, nodes)
+}
+
+func verifyIndependentProofCoverageForNodes(state fenceLedger, request FenceRequest, evidence *IndependentEvidenceV2, nodes []string) error {
+	runs, err := independentClosedRuns(state, request, nodes)
+	if err != nil || evidence == nil || len(evidence.Terminals) != len(runs) {
+		return errors.Join(err, fmt.Errorf("fencing: source proof does not cover the complete canonical run history"))
+	}
+	byRun := make(map[string]fencing.TerminalReference, len(evidence.Terminals))
+	for _, ref := range evidence.Terminals {
+		runID := ref.Request.Identity.RunID
+		if _, exists := byRun[runID]; exists {
+			return fmt.Errorf("fencing: source proof duplicates a terminal run")
+		}
+		byRun[runID] = ref
+	}
+	for _, run := range runs {
+		ref, exists := byRun[run.Identity.RunID]
+		if !exists || run.IndependentTerminal == nil || ref != *run.IndependentTerminal || run.Stop == nil || ref.Request != *run.Stop {
+			return fmt.Errorf("fencing: source proof terminal reference differs from canonical run history")
+		}
+		if _, err := state.Ledger.IndependentTerminal(run.Identity.RunID, hashJSON(evidence.StorageScope)); err != nil {
+			return err
+		}
+	}
+	return nil
 }
