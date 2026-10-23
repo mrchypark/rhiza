@@ -196,6 +196,34 @@ type archiveSyncAdmissionBucket struct {
 	busyOnce                 sync.Once
 }
 
+type coveredBatchHeadGateBucket struct {
+	objstore.Bucket
+	headReads      atomic.Uint64
+	headUploads    atomic.Uint64
+	refreshStarted chan struct{}
+	releaseRefresh chan struct{}
+	refreshOnce    sync.Once
+}
+
+func (b *coveredBatchHeadGateBucket) Attributes(ctx context.Context, name string) (objstore.ObjectAttributes, error) {
+	if strings.HasSuffix(name, "/archive/head.bin") && b.headReads.Add(1) == 2 {
+		b.refreshOnce.Do(func() { close(b.refreshStarted) })
+		select {
+		case <-ctx.Done():
+			return objstore.ObjectAttributes{}, ctx.Err()
+		case <-b.releaseRefresh:
+		}
+	}
+	return b.Bucket.Attributes(ctx, name)
+}
+
+func (b *coveredBatchHeadGateBucket) Upload(ctx context.Context, name string, data io.Reader, options ...objstore.ObjectUploadOption) error {
+	if strings.HasSuffix(name, "/archive/head.bin") {
+		b.headUploads.Add(1)
+	}
+	return b.Bucket.Upload(ctx, name, data, options...)
+}
+
 func (b *archiveSyncAdmissionBucket) Attributes(ctx context.Context, name string) (objstore.ObjectAttributes, error) {
 	if strings.HasSuffix(name, "/archive/head.bin") {
 		read := b.headReads.Add(1)
@@ -955,23 +983,35 @@ func TestArchiveSyncThroughCoveredBatchRetriesLateHigherWaiter(t *testing.T) {
 	if _, _, err := core.Propose(ctx, []byte("covered lower target")); err != nil {
 		t.Fatal(err)
 	}
-	if err := writer.SyncThrough(ctx, core, core.Tip()); err != nil {
-		t.Fatal(err)
+	observed := &coveredBatchHeadGateBucket{
+		Bucket:         base,
+		refreshStarted: make(chan struct{}),
+		releaseRefresh: make(chan struct{}),
 	}
-	observed := &archiveSyncAdmissionBucket{
-		Bucket:           base,
-		firstHead:        make(chan struct{}),
-		releaseFirstHead: make(chan struct{}),
-	}
-	var releaseFirstHeadOnce sync.Once
-	defer releaseFirstHeadOnce.Do(func() { close(observed.releaseFirstHead) })
+	var releaseRefreshOnce sync.Once
+	defer releaseRefreshOnce.Do(func() { close(observed.releaseRefresh) })
 	stale.bucket = observed
 	lowDone := make(chan error, 1)
 	go func() { lowDone <- stale.SyncThrough(ctx, core, 1) }()
 	select {
-	case <-observed.firstHead:
+	case <-observed.refreshStarted:
 	case <-ctx.Done():
 		t.Fatal(ctx.Err())
+	}
+	stale.batchMu.Lock()
+	coveredBatch := stale.batch
+	initialTarget := quepaxa.Slot(0)
+	if coveredBatch != nil {
+		initialTarget = coveredBatch.target
+	}
+	stale.batchMu.Unlock()
+	if coveredBatch == nil || initialTarget != 1 {
+		t.Fatalf("low target batch was not held at flush-time HEAD refresh: batch=%p target=%d", coveredBatch, initialTarget)
+	}
+	// The low caller has already created its batch but has not yet refreshed
+	// HEAD. Another writer makes slot 1 durable while the low HEAD read is held.
+	if err := writer.SyncThrough(ctx, core, 1); err != nil {
+		t.Fatalf("publish covered lower target: %v", err)
 	}
 	if _, _, err := core.Propose(ctx, []byte("late higher target")); err != nil {
 		t.Fatal(err)
@@ -982,7 +1022,7 @@ func TestArchiveSyncThroughCoveredBatchRetriesLateHigherWaiter(t *testing.T) {
 	deadline := time.After(5 * time.Second)
 	for {
 		stale.batchMu.Lock()
-		joined := stale.batch != nil && stale.batch.target >= highTarget
+		joined := stale.batch == coveredBatch && stale.batch.target == highTarget
 		stale.batchMu.Unlock()
 		if joined {
 			break
@@ -994,7 +1034,7 @@ func TestArchiveSyncThroughCoveredBatchRetriesLateHigherWaiter(t *testing.T) {
 			time.Sleep(time.Millisecond)
 		}
 	}
-	releaseFirstHeadOnce.Do(func() { close(observed.releaseFirstHead) })
+	releaseRefreshOnce.Do(func() { close(observed.releaseRefresh) })
 	if err := <-lowDone; err != nil {
 		t.Fatalf("covered lower target: %v", err)
 	}
@@ -1010,6 +1050,9 @@ func TestArchiveSyncThroughCoveredBatchRetriesLateHigherWaiter(t *testing.T) {
 	defer reader.Close()
 	if err := reader.Load(ctx); err != nil || reader.Tip() < highTarget {
 		t.Fatalf("durable tip=%d want at least %d err=%v", reader.Tip(), highTarget, err)
+	}
+	if observed.headUploads.Load() != 1 {
+		t.Fatalf("stale manager published %d HEAD objects, want only the higher target retry", observed.headUploads.Load())
 	}
 }
 
