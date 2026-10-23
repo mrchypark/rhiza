@@ -198,6 +198,52 @@ or credential files. Follow the fresh namespace/prefix, cost-cap, and cleanup
 requirements in the GCS runbook. This is a launch path, not a claim that a real
 GCS/Chaos qualification has run.
 
+### Manual-terminal and missing-membership selectors
+
+These voter-count scenarios are default-off and run only after the normal
+`install` phase. Keep all standard GCS run inputs above configured, use a
+source-matched executable `FENCING_E2E_BIN`, and invoke exactly one selector
+for a `run`. The launcher rejects combinations with initial-HEAD ACK-loss,
+async-nonempty, or each other. Use a fresh namespace and object prefix for each
+run; in particular, the missing-membership `negative` and `positive` cases are
+separate executions because each test removes source membership in its own
+scope.
+
+```sh
+RHIZA_GCS_MANUAL_TERMINAL=yes FENCING_E2E_BIN="$FENCING_E2E_BIN" \
+  sh e2e/chaos/run-votercount-gcs-chaos.sh run
+
+RHIZA_GCS_MISSING_MEMBERSHIP=yes RHIZA_GCS_MISSING_MEMBERSHIP_CASE=negative \
+  FENCING_E2E_BIN="$FENCING_E2E_BIN" sh e2e/chaos/run-votercount-gcs-chaos.sh run
+
+RHIZA_GCS_MISSING_MEMBERSHIP=yes RHIZA_GCS_MISSING_MEMBERSHIP_CASE=positive \
+  FENCING_E2E_BIN="$FENCING_E2E_BIN" sh e2e/chaos/run-votercount-gcs-chaos.sh run
+```
+
+The negative missing-membership case verifies that absent source membership
+without the explicit opt-in remains blocked and leaves the target unclaimed.
+The positive case exercises an explicit async `RhizaRecovery` with
+`allowMissingSourceMembership` and the existing `allowDataLoss` acknowledgment;
+it is not an automatic-policy fallback.
+
+For manual-terminal, install the separate attestation CRD and namespace RBAC as
+described in the operator [manual-attestation setup](../../deploy/operator/README.md#fence-requirement-and-manual-terminal-evidence),
+binding approver `create` only to the independently authenticated incident-admin
+group. The collector creates the Recovery and waits for the typed challenge,
+writing `gcs-manual-terminal-challenge.json` in the private
+`FENCING_E2E_OUT` directory. A separately authenticated incident administrator
+must independently verify the challenge-bound termination, recreation block,
+old peer/client and archive-writer revocation, and storage quiescence, then
+create the deterministic-name `RhizaManualRecoveryAttestation` with the exact
+challenge digest and binding fields. Use `kubectl -n "$RHIZA_NAMESPACE" create
+-f "$APPROVAL_MANIFEST"`; do not have the launcher, operator, or fencer create
+the approval. The `attester` string and evidence references are descriptive,
+not authorization. The run waits only until challenge expiry (bounded by the
+collector deadline), and fails closed on missing approval or changed bindings.
+For an async source, `allowDataLoss: true` remains required; a `before-ack`
+source does not imply data loss. Keep the challenge and approval manifest
+private, and publish only the validated `safe-artifacts` projection.
+
 ### Initial canonical HEAD fault pre-arm
 
 The voter-count GCS launcher has a separate, default-off pre-arm option for
