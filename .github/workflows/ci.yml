@@ -89,6 +89,7 @@ jobs:
           printf '%s\n' "$install_dir/usr/bin" >>"$GITHUB_PATH"
       - name: Check focused durability, rollback, IAM, manifest, and recovery fixtures
         run: |
+          go test ./pkg/operator -run '^(TestManualTerminalFrozenForkRegistersWithoutIndependentV2|TestAuthenticatedLearnerPromotionRetriesExactCanonicalCompletion)$' -count=1 -timeout=5m
           go test ./pkg/node -run '^(TestMembershipRetryDurablyPublishesCommittedConfiguration|TestMembershipAdditionAbortAllowsNextRevision)$' -count=1 -timeout=5m
           embedded_tests='^(TestIndependentRollbackReconcilesInterruptedCreateMarkers|TestRollbackMarkerGateCoversEveryIndependentAndCIWrite|TestIndependentGCSChaosManifestContract|TestNamespaceExpiryRendersUIDResourceVersionDelete|TestQualificationHostContainsPinnedKubectlTools|TestRuntimeAgentRenderPinsNodesAndNamespaceOwnerReferences|TestVoterCountLauncherRunRequiresPrivilegedInstallCredential|TestGCSIAM.*)$'
           go test ./e2e/chaos/embedded-go -run "$embedded_tests" -count=1 -timeout=5m
