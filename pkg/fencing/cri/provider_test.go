@@ -1030,8 +1030,11 @@ func TestCRIEnrollmentBuildsFullBindingAndCapturesBeforeReturn(t *testing.T) {
 }
 
 func TestCRICaptureCgroupScopeAcceptsExactLearnerAssignment(t *testing.T) {
-	p, _, binding, _ := newRuntimeFixture(t)
+	p, f, binding, _ := newRuntimeFixture(t)
 	binding.AssignmentID = "learner-assignment"
+	f.mu.Lock()
+	f.verboseInfo = map[string]string{"info": containerdInfoFixture}
+	f.mu.Unlock()
 	root := t.TempDir()
 	proc, cgroupRoot := filepath.Join(root, "proc"), filepath.Join(root, "cgroup")
 	cgroup := filepath.Join(cgroupRoot, "kubepods", "pod-0", "container-0")
