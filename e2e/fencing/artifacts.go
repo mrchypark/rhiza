@@ -19,6 +19,7 @@ import (
 	"github.com/mrchypark/rhiza/pkg/network"
 	"github.com/mrchypark/rhiza/pkg/operator"
 	"github.com/mrchypark/rhiza/pkg/quepaxa"
+	"github.com/mrchypark/rhiza/pkg/recovery"
 )
 
 func publicRuntime(runtime obj) obj {
@@ -551,6 +552,296 @@ const (
 	gcsManualTerminalEventsName    = "gcs-manual-terminal-events.jsonl"
 	gcsManualTerminalSummaryName   = "gcs-manual-terminal-summary.json"
 )
+
+const (
+	gcsMissingMembershipNegativeQualification = "gcs-missing-membership-negative"
+	gcsMissingMembershipPositiveQualification = "gcs-missing-membership-positive"
+	gcsMissingMembershipNegativeEvidenceName  = "gcs-missing-membership-negative-evidence.json"
+	gcsMissingMembershipPositiveEvidenceName  = "gcs-missing-membership-positive-evidence.json"
+	gcsMissingMembershipEventsName            = "gcs-missing-membership-events.jsonl"
+	gcsMissingMembershipSummaryName           = "gcs-missing-membership-summary.json"
+)
+
+type gcsMissingMembershipPublicSummary struct {
+	Qualification                string `json:"qualification"`
+	Outcome                      string `json:"outcome"`
+	Provider                     string `json:"provider"`
+	Case                         string `json:"case"`
+	NoPVC                        bool   `json:"noPVC,omitempty"`
+	SourceDurability             string `json:"sourceDurability,omitempty"`
+	AllowDataLoss                bool   `json:"allowDataLoss,omitempty"`
+	AllowMissingSourceMembership bool   `json:"allowMissingSourceMembership,omitempty"`
+	SourceMembershipAbsent       bool   `json:"sourceMembershipAbsent"`
+	TargetMembershipVerified     bool   `json:"targetMembershipVerified,omitempty"`
+	RecoveredRowsVerified        bool   `json:"recoveredRowsVerified,omitempty"`
+	TargetQuorumVerified         bool   `json:"targetQuorumVerified,omitempty"`
+	PrivateEvidenceSHA256        string `json:"privateEvidenceSHA256,omitempty"`
+	PrivateEventsSHA256          string `json:"privateEventsSHA256,omitempty"`
+}
+
+func projectGCSMissingMembershipEvidence(raw, public, qualification string, failedRun bool) (bool, error) {
+	caseName := "negative"
+	evidenceName := gcsMissingMembershipNegativeEvidenceName
+	if qualification == gcsMissingMembershipPositiveQualification {
+		caseName = "positive"
+		evidenceName = gcsMissingMembershipPositiveEvidenceName
+	} else if qualification != gcsMissingMembershipNegativeQualification {
+		return false, fmt.Errorf("missing-membership evidence selector is unsupported")
+	}
+	entries, err := os.ReadDir(raw)
+	if err != nil {
+		return false, err
+	}
+	seenEvidence, seenEvents := false, false
+	for _, entry := range entries {
+		name := entry.Name()
+		if !strings.HasPrefix(name, "gcs-missing-membership-") {
+			continue
+		}
+		if name == evidenceName && !entry.IsDir() {
+			seenEvidence = true
+		} else if name == gcsMissingMembershipEventsName && !entry.IsDir() {
+			seenEvents = true
+		} else {
+			return false, fmt.Errorf("missing-membership private artifact name is not allowlisted")
+		}
+	}
+	if !seenEvidence && !seenEvents {
+		return false, nil
+	}
+	if !seenEvents {
+		return false, fmt.Errorf("missing-membership evidence exists without its private event record")
+	}
+	events, err := readBoundedPrivateArtifact(filepath.Join(raw, gcsMissingMembershipEventsName), true)
+	if err != nil {
+		return false, err
+	}
+	eventsHash := sha256.Sum256(events)
+	summary := gcsMissingMembershipPublicSummary{Qualification: qualification, Outcome: "failed", Provider: "gcs", Case: caseName,
+		PrivateEventsSHA256: hex.EncodeToString(eventsHash[:])}
+	if !seenEvidence {
+		if !failedRun {
+			return false, fmt.Errorf("successful missing-membership run is missing its private evidence record")
+		}
+		return true, os.WriteFile(filepath.Join(public, gcsMissingMembershipSummaryName), encoded(summary), 0600)
+	}
+	evidence, err := readBoundedPrivateArtifact(filepath.Join(raw, evidenceName), false)
+	if err != nil {
+		return false, err
+	}
+	if caseName == "negative" {
+		if err := validateGCSMissingMembershipNegativeEvidence(evidence); err != nil {
+			return false, err
+		}
+		summary.SourceMembershipAbsent = true
+	} else {
+		if err := validateGCSMissingMembershipPositiveEvidence(evidence); err != nil {
+			return false, err
+		}
+		summary.NoPVC, summary.SourceMembershipAbsent = true, true
+		summary.SourceDurability, summary.AllowDataLoss, summary.AllowMissingSourceMembership = "async", true, true
+		summary.TargetMembershipVerified, summary.RecoveredRowsVerified, summary.TargetQuorumVerified = true, true, true
+	}
+	evidenceHash := sha256.Sum256(evidence)
+	summary.PrivateEvidenceSHA256 = hex.EncodeToString(evidenceHash[:])
+	if !failedRun {
+		summary.Outcome = "passed"
+	}
+	return true, os.WriteFile(filepath.Join(public, gcsMissingMembershipSummaryName), encoded(summary), 0600)
+}
+
+func validateGCSMissingMembershipNegativeEvidence(data []byte) error {
+	fields, err := exactJSONFields(data, "qualification", "case", "sourceClusterID", "statefulSetUID", "recoveryUID", "phase", "sourceMembershipAbsent", "sourceSuccessorAbsent", "targetScopeUnclaimed", "missingMembershipOptInAbsent")
+	if err != nil {
+		return err
+	}
+	var got struct {
+		Qualification   string `json:"qualification"`
+		Case            string `json:"case"`
+		RecoveryUID     string `json:"recoveryUID"`
+		Phase           string `json:"phase"`
+		SourceAbsent    bool   `json:"sourceMembershipAbsent"`
+		SuccessorAbsent bool   `json:"sourceSuccessorAbsent"`
+		TargetUnclaimed bool   `json:"targetScopeUnclaimed"`
+		OptInAbsent     bool   `json:"missingMembershipOptInAbsent"`
+	}
+	if json.Unmarshal(data, &got) != nil || got.Qualification != "gcs-missing-membership-no-opt-in-rejection" || got.Case != "negative" || got.RecoveryUID == "" || got.Phase != "Blocked" || !got.SourceAbsent || !got.SuccessorAbsent || !got.TargetUnclaimed || !got.OptInAbsent {
+		return fmt.Errorf("private missing-membership negative evidence is invalid")
+	}
+	for _, key := range []string{"sourceClusterID", "statefulSetUID"} {
+		var value string
+		if json.Unmarshal(fields[key], &value) != nil || value == "" {
+			return fmt.Errorf("private missing-membership source identity is incomplete")
+		}
+	}
+	return nil
+}
+
+func validateGCSMissingMembershipPositiveEvidence(data []byte) error {
+	fields, err := exactJSONFields(data, "qualification", "case", "profile", "sourceAcknowledgements", "sourceRows", "sourceHeadBeforeFence", "sealedSourceHead", "fence", "proof", "sourceIdentity", "recovery", "sourceMembershipAbsent", "sourceMembers", "targetCredentials", "targetMembership", "manualMembershipBindingDigest", "targetMembershipVerified", "recoveredRows", "targetQuorumVerified", "targetAck")
+	if err != nil {
+		return err
+	}
+	var qualification, caseName, sourceRows, recoveredRows, bindingDigest string
+	var profile struct {
+		Provider      string `json:"provider"`
+		NoPVC         bool   `json:"noPVC"`
+		Durability    string `json:"sourceDurability"`
+		AllowDataLoss bool   `json:"allowDataLoss"`
+		AllowMissing  bool   `json:"allowMissingSourceMembership"`
+	}
+	if json.Unmarshal(fields["qualification"], &qualification) != nil || qualification != "gcs-manual-missing-membership-nonempty-fork" ||
+		json.Unmarshal(fields["case"], &caseName) != nil || caseName != "positive" ||
+		json.Unmarshal(fields["profile"], &profile) != nil || profile.Provider != "gcs" || !profile.NoPVC || profile.Durability != "async" || !profile.AllowDataLoss || !profile.AllowMissing ||
+		json.Unmarshal(fields["sourceRows"], &sourceRows) != nil || json.Unmarshal(fields["recoveredRows"], &recoveredRows) != nil || sourceRows == "" || sourceRows != recoveredRows ||
+		json.Unmarshal(fields["manualMembershipBindingDigest"], &bindingDigest) != nil || len(bindingDigest) != 64 {
+		return fmt.Errorf("private missing-membership positive evidence is invalid")
+	}
+	if _, err := hex.DecodeString(bindingDigest); err != nil {
+		return fmt.Errorf("private missing-membership binding digest is invalid")
+	}
+	var sourceAcks []gcsAcknowledgement
+	if json.Unmarshal(fields["sourceAcknowledgements"], &sourceAcks) != nil || len(sourceAcks) != 3 {
+		return fmt.Errorf("private missing-membership source ACK set is incomplete")
+	}
+	lastSlot := uint64(0)
+	for i, ack := range sourceAcks {
+		wantRow := fmt.Sprintf("[[%d,%q]]", i+1, fmt.Sprintf("gcs-missing-membership-source-%d", i+1))
+		if ack.RequestID != fmt.Sprintf("gcs-ha-ack-%d", i+1) || ack.Slot <= lastSlot || ack.Rows != wantRow {
+			return fmt.Errorf("private missing-membership source ACK differs from expected rows")
+		}
+		lastSlot = ack.Slot
+	}
+	var before, sealed gcsArchiveHeadEvidence
+	if json.Unmarshal(fields["sourceHeadBeforeFence"], &before) != nil || json.Unmarshal(fields["sealedSourceHead"], &sealed) != nil || validateSealedNonemptyHead(before, sealed) != nil || before.Tip < lastSlot {
+		return fmt.Errorf("private missing-membership archived source tip is invalid")
+	}
+	var sourceIdentity struct {
+		Namespace      string                 `json:"namespace"`
+		StatefulSet    string                 `json:"statefulSet"`
+		Container      string                 `json:"container"`
+		StatefulSetUID string                 `json:"statefulSetUID"`
+		BindingUID     string                 `json:"bindingUID"`
+		LogicalID      string                 `json:"logicalID"`
+		ClusterID      string                 `json:"clusterID"`
+		Bucket         string                 `json:"bucket"`
+		Prefix         string                 `json:"prefix"`
+		Targets        []operator.FenceTarget `json:"targets"`
+	}
+	if _, err := exactJSONFields(fields["sourceIdentity"], "namespace", "statefulSet", "container", "statefulSetUID", "bindingUID", "logicalID", "clusterID", "bucket", "prefix", "targets"); err != nil ||
+		json.Unmarshal(fields["sourceIdentity"], &sourceIdentity) != nil || sourceIdentity.Namespace == "" || sourceIdentity.StatefulSet == "" || sourceIdentity.Container == "" || sourceIdentity.StatefulSetUID == "" || sourceIdentity.BindingUID == "" || sourceIdentity.LogicalID == "" || sourceIdentity.ClusterID == "" || sourceIdentity.Bucket == "" || sourceIdentity.Prefix == "" || len(sourceIdentity.Targets) != 3 {
+		return fmt.Errorf("private missing-membership source identity is incomplete")
+	}
+	scope := fencing.ArchiveScope{Provider: "gcs", Bucket: sourceIdentity.Bucket, Prefix: sourceIdentity.Prefix, ClusterID: sourceIdentity.ClusterID}
+	scopeHash, err := scope.Hash()
+	if err != nil {
+		return fmt.Errorf("private missing-membership archive scope is invalid")
+	}
+	targetID, err := recovery.FrozenTargetID(recovery.FrozenSourceIdentity{ScopeHash: scopeHash, ClusterID: sourceIdentity.ClusterID, StatefulSetUID: sourceIdentity.StatefulSetUID})
+	if err != nil {
+		return fmt.Errorf("private missing-membership target identity is invalid")
+	}
+	var fence operator.FenceRequest
+	if json.Unmarshal(fields["fence"], &fence) != nil || fence.Scope != operator.ScopeGeneration || fence.OperationID == "" || fence.Namespace != sourceIdentity.Namespace ||
+		fence.StatefulSet != sourceIdentity.StatefulSet || fence.StatefulSetUID != sourceIdentity.StatefulSetUID || fence.BindingUID != sourceIdentity.BindingUID ||
+		fence.LogicalID != sourceIdentity.LogicalID || fence.SourceClusterID != sourceIdentity.ClusterID || !sameTargets(fence.Targets, sourceIdentity.Targets) {
+		return fmt.Errorf("private missing-membership fence is not bound to the captured source cohort")
+	}
+	var proof operator.FenceProof
+	if json.Unmarshal(fields["proof"], &proof) != nil || proof.IndependentV2 == nil || proof.Independent != nil {
+		return fmt.Errorf("private missing-membership independent generation proof is incomplete")
+	}
+	fenceItem := obj{"spec": fence, "status": obj{"proof": proof}}
+	if _, _, err := verifyIndependentGenerationProof(fenceItem, sourceIdentity.ClusterID, sourceIdentity.StatefulSetUID,
+		sourceIdentity.BindingUID, sourceIdentity.Targets, sourceIdentity.Bucket, sourceIdentity.Prefix,
+		sourceIdentity.Namespace, sourceIdentity.StatefulSet, sourceIdentity.LogicalID); err != nil {
+		return fmt.Errorf("private missing-membership IndependentV2 proof is invalid: %w", err)
+	}
+	var recoveryResource operator.Resource
+	if json.Unmarshal(fields["recovery"], &recoveryResource) != nil || recoveryResource.Metadata["uid"] == nil || text(recoveryResource.Metadata["uid"]) == "" ||
+		text(recoveryResource.Metadata["namespace"]) != sourceIdentity.Namespace || text(nested(recoveryResource.Metadata, "labels", "chaos.rhiza.io/run")) != qualificationRunID ||
+		recoveryResource.Spec.Durability != "async" || !recoveryResource.Spec.AllowDataLoss || !recoveryResource.Spec.AllowMissingSourceMembership ||
+		recoveryResource.Spec.SourceClusterID != sourceIdentity.ClusterID || recoveryResource.Spec.StatefulSet != sourceIdentity.StatefulSet || recoveryResource.Spec.Container != sourceIdentity.Container ||
+		recoveryResource.Spec.RecoveryID != fence.OperationID || recoveryResource.Status.Phase != "Complete" || recoveryResource.Status.Stage != "Complete" ||
+		recoveryResource.Status.Source != sourceIdentity.ClusterID || recoveryResource.Status.SourceDurability != "async" || recoveryResource.Status.StatefulSetUID != sourceIdentity.StatefulSetUID ||
+		recoveryResource.Status.Target != targetID || recoveryResource.Status.TargetBaseKind != "fork" || recoveryResource.Status.RecoveredTip != before.Tip || recoveryResource.Status.ManifestHash == "" ||
+		recoveryResource.Status.ManualMembershipBindingDigest != bindingDigest || recoveryFenceMatchesProof(recoveryResource, fence, proof) != nil {
+		return fmt.Errorf("private missing-membership recovery does not match its canonical fork binding")
+	}
+	var sourceMembers []quepaxa.Member
+	var targetMembership recovery.MembershipRecord
+	if json.Unmarshal(fields["sourceMembers"], &sourceMembers) != nil || len(sourceMembers) != 3 || json.Unmarshal(fields["targetMembership"], &targetMembership) != nil {
+		return fmt.Errorf("private missing-membership membership evidence is incomplete")
+	}
+	wantMembers := make(map[string]string, len(sourceIdentity.Targets))
+	for _, target := range sourceIdentity.Targets {
+		if target.NodeID == "" || target.Pod == "" || target.PodUID == "" || target.WALIdentity == "" || wantMembers[target.NodeID] != "" {
+			return fmt.Errorf("private missing-membership captured target identities are invalid")
+		}
+		wantMembers[target.NodeID] = target.WALIdentity
+	}
+	seenMembers := make(map[string]bool, len(sourceMembers))
+	for _, member := range sourceMembers {
+		id := string(member.ID)
+		if id == "" || seenMembers[id] || wantMembers[id] == "" || member.WALIdentity != wantMembers[id] || member.URL == "" || member.LogURL == "" {
+			return fmt.Errorf("private missing-membership source cohort differs from captured identities")
+		}
+		seenMembers[id] = true
+	}
+	if len(seenMembers) != len(wantMembers) {
+		return fmt.Errorf("private missing-membership source membership omits a captured voter")
+	}
+	var targetCredentials struct {
+		SecretName       string           `json:"secretName"`
+		SecretUID        string           `json:"secretUID"`
+		ResourceVersion  string           `json:"resourceVersion"`
+		OwnerOperationID string           `json:"ownerOperationID"`
+		Immutable        bool             `json:"immutable"`
+		MembersSHA256    string           `json:"membersSHA256"`
+		Members          []quepaxa.Member `json:"members"`
+	}
+	if _, err := exactJSONFields(fields["targetCredentials"], "secretName", "secretUID", "resourceVersion", "ownerOperationID", "immutable", "membersSHA256", "members"); err != nil ||
+		json.Unmarshal(fields["targetCredentials"], &targetCredentials) != nil || targetCredentials.SecretUID == "" || targetCredentials.ResourceVersion == "" ||
+		targetCredentials.OwnerOperationID != text(recoveryResource.Metadata["uid"])+":"+recoveryResource.Spec.RecoveryID ||
+		targetCredentials.SecretName != recoveryResource.Status.SecretName || targetCredentials.SecretName != "rhiza-recovery-"+gcsShortID(targetID) ||
+		!targetCredentials.Immutable || len(targetCredentials.Members) != 3 {
+		return fmt.Errorf("private missing-membership target credential identity is incomplete")
+	}
+	canonicalTargetMembers := encoded(targetCredentials.Members)
+	targetMembersHash := sha256.Sum256(canonicalTargetMembers)
+	if targetCredentials.MembersSHA256 != hex.EncodeToString(targetMembersHash[:]) {
+		return fmt.Errorf("private missing-membership target credential membership digest is invalid")
+	}
+	targetSeen := make(map[string]bool, len(targetCredentials.Members))
+	for _, member := range targetCredentials.Members {
+		id := string(member.ID)
+		var sourceMember *quepaxa.Member
+		for i := range sourceMembers {
+			if string(sourceMembers[i].ID) == id {
+				sourceMember = &sourceMembers[i]
+				break
+			}
+		}
+		if sourceMember == nil || targetSeen[id] || member.WALIdentity != sourceMember.WALIdentity || member.URL != sourceMember.URL ||
+			member.PeerURL != sourceMember.PeerURL || member.LogURL != sourceMember.LogURL || member.PublicKey == (quepaxa.PublicKey{}) || member.PublicKey == sourceMember.PublicKey {
+			return fmt.Errorf("private missing-membership target credentials are not fresh keys for the exact source cohort")
+		}
+		targetSeen[id] = true
+	}
+	if len(targetSeen) != 3 || targetMembership != recovery.NewMembershipRecord(targetID, targetCredentials.Members, "async") {
+		return fmt.Errorf("private missing-membership target membership is not bound to the exact fresh credential cohort")
+	}
+	var absent, targetMembershipVerified, targetQuorum bool
+	if json.Unmarshal(fields["sourceMembershipAbsent"], &absent) != nil || !absent || json.Unmarshal(fields["targetMembershipVerified"], &targetMembershipVerified) != nil || !targetMembershipVerified ||
+		json.Unmarshal(fields["targetQuorumVerified"], &targetQuorum) != nil || !targetQuorum {
+		return fmt.Errorf("private missing-membership source/target assertions are incomplete")
+	}
+	var targetAck gcsAcknowledgement
+	if json.Unmarshal(fields["targetAck"], &targetAck) != nil || targetAck.RequestID != "gcs-ha-ack-4" || targetAck.Slot <= before.Tip || targetAck.Rows != `[[4,"gcs-missing-membership-target"]]` {
+		return fmt.Errorf("private missing-membership target ACK is invalid")
+	}
+	return nil
+}
 
 func projectGCSAsyncNonemptyEvidence(raw, public string, failedRun bool) (bool, error) {
 	entries, err := os.ReadDir(raw)
@@ -1365,7 +1656,8 @@ func safeArtifacts(raw string) error {
 		return fmt.Errorf("FENCING_E2E_OUT is required")
 	}
 	qualification := os.Getenv("FENCING_E2E_QUALIFICATION")
-	if qualification != "" && qualification != "gcs-async-nonempty" && qualification != gcsManualTerminalQualification {
+	if qualification != "" && qualification != "gcs-async-nonempty" && qualification != gcsManualTerminalQualification &&
+		qualification != gcsMissingMembershipNegativeQualification && qualification != gcsMissingMembershipPositiveQualification {
 		return fmt.Errorf("artifact qualification selector is unsupported")
 	}
 	exitData, err := os.ReadFile(filepath.Join(raw, "actual-exit.txt"))
@@ -1391,7 +1683,9 @@ func safeArtifacts(raw string) error {
 		if entry.IsDir() {
 			continue
 		}
-		if (qualification == "gcs-async-nonempty" || qualification == gcsManualTerminalQualification) && (name == "runtime-profile.json" || name == "runtime-component-probe.json") {
+		if (qualification == "gcs-async-nonempty" || qualification == gcsManualTerminalQualification ||
+			qualification == gcsMissingMembershipNegativeQualification || qualification == gcsMissingMembershipPositiveQualification) &&
+			(name == "runtime-profile.json" || name == "runtime-component-probe.json") {
 			// These receipts describe the disposable Kind component probe, not
 			// the independently qualified GCS scenario.
 			continue
@@ -1512,13 +1806,24 @@ func safeArtifacts(raw string) error {
 	if qualification == gcsManualTerminalQualification && !failedRun && !manualTerminalSeen {
 		return fmt.Errorf("successful manual-terminal artifact set is missing its required scenario evidence")
 	}
+	missingMembershipSeen, err := projectGCSMissingMembershipEvidence(raw, public, qualification, failedRun)
+	if err != nil {
+		return err
+	}
+	if missingMembershipSeen && qualification != gcsMissingMembershipNegativeQualification && qualification != gcsMissingMembershipPositiveQualification {
+		return fmt.Errorf("missing-membership evidence requires its explicit case selector")
+	}
+	if (qualification == gcsMissingMembershipNegativeQualification || qualification == gcsMissingMembershipPositiveQualification) && !failedRun && !missingMembershipSeen {
+		return fmt.Errorf("successful missing-membership artifact set is missing its required case evidence")
+	}
 	ackLossSeen, err := projectGCSAckLossEvidence(raw, public, failedRun)
 	if err != nil {
 		return err
 	}
 	required := []string{"actual-exit.txt", "source-head.txt", "image-ids.txt"}
 	if !failedRun {
-		if qualification != "gcs-async-nonempty" && qualification != gcsManualTerminalQualification {
+		if qualification != "gcs-async-nonempty" && qualification != gcsManualTerminalQualification &&
+			qualification != gcsMissingMembershipNegativeQualification && qualification != gcsMissingMembershipPositiveQualification {
 			required = append(required, "runtime-profile.json", "runtime-component-probe.json")
 		}
 		if asyncEmptySeen {
@@ -1529,6 +1834,9 @@ func safeArtifacts(raw string) error {
 		}
 		if manualTerminalSeen {
 			required = append(required, gcsManualTerminalSummaryName)
+		}
+		if missingMembershipSeen {
+			required = append(required, gcsMissingMembershipSummaryName)
 		}
 		if ackLossSeen {
 			required = append(required, gcsAckLossSummaryName)
