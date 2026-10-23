@@ -308,6 +308,15 @@ func (c *Controller) reconcile(ctx context.Context, r *Resource) error {
 				r.Status.StatefulSetUID, r.Status.Source = uid, r.Spec.SourceClusterID
 				return c.record(ctx, r, "Recovering", "frozen-source target base persisted before authenticated preflight")
 			}
+			if r.Status.FrozenBucketEnvironment == nil {
+				bucketName := StoreIdentity(source.env)["RHIZA_OBJSTORE_BUCKET"]
+				bucketEnvironment, err := c.captureFrozenBucketEnvironment(ctx, bucketName, prefix)
+				if err != nil {
+					return reject("source bucket lifecycle is not safely observable: " + err.Error())
+				}
+				r.Status.FrozenBucketEnvironment = &bucketEnvironment
+				return c.record(ctx, r, "Recovering", "frozen-source bucket lifecycle snapshot persisted before authenticated preflight")
+			}
 			preflight, err := c.frozenSourcePreflight(ctx, r)
 			if err != nil {
 				if errors.Is(err, ErrFencePending) {
@@ -318,8 +327,15 @@ func (c *Controller) reconcile(ctx context.Context, r *Resource) error {
 			if headlessGenesisCandidate && !preflight.EmptyGenesisEligible {
 				return reject("canonical source root has no exact eligible empty genesis")
 			}
+			proposedTarget, targetErr := recovery.FrozenTargetID(preflight.Identity)
+			if targetErr != nil || (r.Status.Target != "" && r.Status.Target != proposedTarget) {
+				return reject("frozen-source proposed target differs from the canonical source identity")
+			}
 			if !preflight.ClosureReady {
 				if preflight.ManualRecoveryChallenge != nil {
+					if preflight.ManualRecoveryChallenge.TargetClusterID != proposedTarget || preflight.ManualRecoveryChallenge.TargetBaseKind != r.Status.TargetBaseKind {
+						return reject("manual terminal recovery challenge target differs from the canonical proposal")
+					}
 					challengeDigest, digestErr := ManualRecoveryChallengeDigest(*preflight.ManualRecoveryChallenge)
 					if digestErr != nil || challengeDigest != preflight.ManualRecoveryChallengeDigest {
 						return reject("manual terminal recovery challenge is inconsistent")
@@ -389,17 +405,20 @@ func (c *Controller) reconcile(ctx context.Context, r *Resource) error {
 				return reject("configured archive scope differs from canonical frozen-source identity")
 			}
 			target, err := recovery.FrozenTargetID(preflight.Identity)
-			if err != nil {
-				return reject("frozen source identity is invalid: " + err.Error())
+			if err != nil || target != proposedTarget {
+				return reject("frozen source identity is invalid or its proposed target changed")
+			}
+			if preflight.EvidenceKind == ManualTerminalEvidenceKind && r.Status.ManualRecoveryChallenge != nil &&
+				r.Status.ManualRecoveryChallenge.TargetClusterID != target {
+				return reject("approved manual recovery target differs from its immutable challenge")
 			}
 			bucketName := StoreIdentity(source.env)["RHIZA_OBJSTORE_BUCKET"]
-			bucketEnvironment, err := c.captureFrozenBucketEnvironment(ctx, bucketName, prefix)
-			if err != nil {
-				return reject("source bucket lifecycle is not safely observable: " + err.Error())
+			bucketEnvironment := *r.Status.FrozenBucketEnvironment
+			if err := c.frozenBucketEnvironmentVerifier(bucketName, prefix)(ctx, bucketEnvironment); err != nil {
+				return reject("source bucket lifecycle changed or is unavailable: " + err.Error())
 			}
 			r.Status.Target = target
 			r.Status.RecoveryMode = RecoveryModeFrozenSource
-			r.Status.FrozenBucketEnvironment = &bucketEnvironment
 			r.Status.RecoveryID, r.Status.SpecHash = r.Spec.RecoveryID, immutableSpecHash(r.Spec)
 			if r.Status.TargetBaseKind == "empty" {
 				r.Status.Stage = "FrozenEmpty"
@@ -594,7 +613,7 @@ func (c *Controller) advance(ctx context.Context, r *Resource, s sourceState) er
 					StatefulSetUID: r.Status.StatefulSetUID, TargetClusterID: r.Status.Target,
 					OperationID: c.operationID(r), SourceFenceOperationID: r.Spec.RecoveryID, RecoveryMode: r.Status.RecoveryMode,
 					BucketEnvironment: r.Status.FrozenBucketEnvironment, ManualMembershipBindingDigest: r.Status.ManualMembershipBindingDigest,
-					ManualRecoveryChallengeDigest: r.Status.ManualRecoveryChallengeDigest,
+					ManualRecoveryChallengeDigest:   r.Status.ManualRecoveryChallengeDigest,
 					ManualTerminalAttestationDigest: r.Status.ManualAttestationDigest,
 				}
 				if r.Status.ManualAttestationDigest != "" {

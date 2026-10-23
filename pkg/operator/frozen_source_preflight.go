@@ -931,7 +931,7 @@ func (e *FencingExecutor) manualTerminalPreflight(
 	recoveryUID := str(persisted.Metadata["uid"])
 	registration := ArchiveForkGenesisRequest{
 		RecoveryName: resourceName(&persisted), StatefulSetUID: persisted.Status.StatefulSetUID,
-		TargetClusterID: persisted.Status.Target, OperationID: recoveryUID + ":" + persisted.Spec.RecoveryID,
+		TargetClusterID: challenge.TargetClusterID, OperationID: recoveryUID + ":" + persisted.Spec.RecoveryID,
 		SourceFenceOperationID: persisted.Spec.RecoveryID, RecoveryMode: RecoveryModeFrozenSource,
 		BucketEnvironment: persisted.Status.FrozenBucketEnvironment, EvidenceKind: ManualTerminalEvidenceKind,
 		ManualRecoveryChallengeDigest: challengeDigest, ManualTerminalAttestationDigest: persisted.Status.ManualAttestationDigest,

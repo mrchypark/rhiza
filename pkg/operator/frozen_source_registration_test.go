@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net/http/httptest"
 	"path"
 	"strconv"
 	"strings"
@@ -25,10 +26,14 @@ import (
 
 type frozenRegistrarTrackingBucket struct {
 	objstore.Bucket
-	sourcePrefix string
-	writes       []string
-	failGetName  string
-	failGetCount int
+	sourcePrefix                 string
+	writes                       []string
+	failGetName                  string
+	failGetCount                 int
+	failSourceGetAfterForkIntent bool
+	forkIntentName               string
+	forkIntentWritten            bool
+	failSourceGetInjected        bool
 }
 
 func TestManualTerminalFrozenForkRegistersWithoutIndependentV2(t *testing.T) {
@@ -139,8 +144,7 @@ func runManualTerminalFrozenForkRegistration(t *testing.T, durability string, al
 	resource := Resource{APIVersion: "rhiza.mrchypark.dev/v1alpha1", Kind: "RhizaRecovery",
 		Metadata: object{"name": "manual-terminal-recovery", "uid": "manual-recovery-uid", "namespace": "test"}, Spec: resourceSpec,
 		Status: Status{RecoveryID: fenceOperation, SpecHash: immutableSpecHash(resourceSpec), Source: sourceID, SourceDurability: durability,
-			StatefulSetUID: f.runtime.StatefulSetUID, Target: targetID, TargetBaseKind: "fork", RecoveryMode: RecoveryModeFrozenSource,
-			Stage: "FrozenForked", FrozenBucketEnvironment: &environment}}
+			StatefulSetUID: f.runtime.StatefulSetUID, RecoveryMode: RecoveryModeFrozenSource}}
 	persistRecovery := func() {
 		data := jsonBytes(resource)
 		var encoded object
@@ -154,20 +158,50 @@ func runManualTerminalFrozenForkRegistration(t *testing.T, durability string, al
 	persistRecovery()
 	assertManualTerminalSourceWorkload(t, ctx, f.e, resource)
 
-	preflightRequest := FrozenSourcePreflightRequest{RecoveryName: resourceName(&resource), RecoveryUID: str(resource.Metadata["uid"])}
-	challengeResponse, err := f.e.frozenSourcePreflight(ctx, preflightRequest)
-	if err != nil || challengeResponse.ClosureReady || challengeResponse.ManualRecoveryChallenge == nil ||
-		!validEvidenceDigest(challengeResponse.ManualRecoveryChallengeDigest) || challengeResponse.ProofDigest != "" {
-		t.Fatalf("manual terminal challenge response=%+v err=%v", challengeResponse, err)
+	server := httptest.NewServer(f.e.Handler())
+	t.Cleanup(server.Close)
+	client := &FencingClient{URL: server.URL, TokenFile: f.e.Kube.TokenFile, Client: server.Client()}
+	sts, err := f.e.archiveForkStatefulSet(ctx, f.runtime.StatefulSetUID)
+	if err != nil {
+		t.Fatal(err)
 	}
-	challenge := *challengeResponse.ManualRecoveryChallenge
+	ctr, err := container(sts, resource.Spec.Container)
+	if err != nil {
+		t.Fatal(err)
+	}
+	env, err := f.e.controller().environment(ctx, ctr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	controller := &Controller{Fencer: client, Kube: f.e.Kube, Bucket: tracked, Prefix: "root", StoreIdentity: StoreIdentity(env)}
+	for step := 0; step < 5 && resource.Status.ManualRecoveryChallenge == nil; step++ {
+		if err := controller.reconcile(ctx, &resource); err != nil {
+			t.Fatalf("controller manual preflight step %d: %v", step, err)
+		}
+	}
+	if resource.Status.ManualRecoveryChallenge == nil || resource.Status.ManualRecoveryChallengeDigest == "" ||
+		resource.Status.Target != "" || resource.Status.Stage != "" || resource.Status.FrozenBucketEnvironment == nil {
+		t.Fatalf("controller must persist a challenge and lifecycle snapshot without claiming/creating the target: status=%+v", resource.Status)
+	}
+	challenge := *resource.Status.ManualRecoveryChallenge
+	if challenge.TargetClusterID != targetID || challenge.TargetBaseKind != "fork" {
+		t.Fatalf("challenge did not bind the deterministic proposed target: challenge=%+v expected=%q", challenge, targetID)
+	}
+	if exists, err := tracked.Exists(ctx, path.Join("root", targetID, "voters/membership.json")); err != nil || exists {
+		t.Fatalf("target resources appeared before independent approval: exists=%t err=%v", exists, err)
+	}
+	if _, err := f.e.AuthorityState.readSourceSuccessorClaim(ctx, sourceScope, f.runtime.StatefulSetUID); !errors.Is(err, errAuthorityStateNotFound) {
+		t.Fatalf("target successor claim must be absent before independent approval: %v", err)
+	}
+	preflightRequest := FrozenSourcePreflightRequest{RecoveryName: resourceName(&resource), RecoveryUID: str(resource.Metadata["uid"]),
+		ManualRecoveryChallengeDigest: resource.Status.ManualRecoveryChallengeDigest}
 	attestationName, err := ManualRecoveryAttestationName(challenge.RecoveryUID)
 	if err != nil {
 		t.Fatal(err)
 	}
 	approval := ManualRecoveryAttestationObject{
 		Namespace: challenge.RecoveryNamespace, Name: attestationName, UID: "manual-approval-object-uid", CreatedAt: challenge.IssuedAt,
-		Spec: ManualRecoveryAttestationSpec{Version: manualAttestationVersion, ChallengeDigest: challengeResponse.ManualRecoveryChallengeDigest,
+		Spec: ManualRecoveryAttestationSpec{Version: manualAttestationVersion, ChallengeDigest: resource.Status.ManualRecoveryChallengeDigest,
 			ManualRecoveryBinding: challenge.ManualRecoveryBinding,
 			Assertions: ManualRecoveryAssertions{AllHistoricalRunsTerminated: true, RecreationBlocked: true,
 				OldPeerAndClientWriteAccessBlocked: true, OldArchiveWriterAccessRevoked: true, StorageQuiesced: true},
@@ -177,15 +211,24 @@ func runManualTerminalFrozenForkRegistration(t *testing.T, durability string, al
 	f.f.objects[manualRecoveryAttestationPath(approval.Namespace, approval.Name)] = manualAttestationAPIObject(approval)
 	f.f.mu.Unlock()
 
-	preflightRequest.ManualRecoveryChallengeDigest = challengeResponse.ManualRecoveryChallengeDigest
+	for step := 0; step < 5 && resource.Status.Target == ""; step++ {
+		if err := controller.reconcile(ctx, &resource); err != nil {
+			t.Fatalf("controller approved manual preflight step %d: %v", step, err)
+		}
+	}
+	if resource.Status.Target != targetID || resource.Status.ManualRecoveryChallengeDigest == "" || resource.Status.ManualAttestationDigest == "" || resource.Status.Stage != "FrozenForked" {
+		t.Fatalf("controller did not claim exactly the approved canonical proposal: status=%+v", resource.Status)
+	}
 	approved, err := f.e.frozenSourcePreflight(ctx, preflightRequest)
 	if err != nil || !approved.ClosureReady || approved.EvidenceKind != ManualTerminalEvidenceKind || approved.ProofDigest != "" ||
-		approved.ManualRecoveryChallengeDigest != challengeResponse.ManualRecoveryChallengeDigest || !validEvidenceDigest(approved.ManualTerminalAttestationDigest) {
+		approved.ManualRecoveryChallengeDigest != resource.Status.ManualRecoveryChallengeDigest || !validEvidenceDigest(approved.ManualTerminalAttestationDigest) ||
+		approved.ManualTerminalAttestationDigest != resource.Status.ManualAttestationDigest {
 		t.Fatalf("manual terminal approval response=%+v err=%v", approved, err)
 	}
-	resource.Status.ManualRecoveryChallenge = &challenge
-	resource.Status.ManualRecoveryChallengeDigest = approved.ManualRecoveryChallengeDigest
-	resource.Status.ManualAttestationDigest = approved.ManualTerminalAttestationDigest
+	acceptedRecord, err := f.e.readManualRecoveryApproval(ctx, challenge.RecoveryUID)
+	if err != nil || acceptedRecord.AcceptedAt.IsZero() || acceptedRecord.AcceptedAt.Before(challenge.IssuedAt) || !acceptedRecord.AcceptedAt.Before(challenge.ExpiresAt) {
+		t.Fatalf("independent approval was not durably accepted before materialization: record=%+v err=%v", acceptedRecord, err)
+	}
 	persistRecovery()
 
 	targetMembers := []quepaxa.Member{forkTestMember(t, string(sourceMembers[0].ID)), forkTestMember(t, string(sourceMembers[1].ID)), forkTestMember(t, string(sourceMembers[2].ID))}
@@ -201,9 +244,26 @@ func runManualTerminalFrozenForkRegistration(t *testing.T, durability string, al
 			return f.e.verifyFrozenBucketEnvironment(ctx, "archive", sourcePrefix, expected)
 		},
 	}
+	tracked.forkIntentName = path.Join("root", targetID, "fork/intent.json")
+	tracked.failSourceGetAfterForkIntent = true
 	fork, err := recovery.ForkFrozenSource(ctx, tracked, options)
+	if err == nil {
+		t.Fatal("injected pre-claim frozen-source materialization failure was not surfaced")
+	}
+	if exists, err := tracked.Exists(ctx, path.Join("root", targetID, "fork/intent.json")); err != nil || !exists {
+		t.Fatalf("failed materialization did not retain its exact target intent: exists=%t err=%v", exists, err)
+	}
+	if _, err := f.e.AuthorityState.readSourceSuccessorClaim(ctx, sourceScope, f.runtime.StatefulSetUID); !errors.Is(err, errAuthorityStateNotFound) {
+		t.Fatalf("pre-claim materialization failure unexpectedly consumed the source successor claim: %v", err)
+	}
+	now = challenge.ExpiresAt.Add(time.Second)
+	approvedAfterExpiry, err := f.e.frozenSourcePreflight(ctx, preflightRequest)
+	if err != nil || !approvedAfterExpiry.ClosureReady || approvedAfterExpiry.ManualTerminalAttestationDigest != approved.ManualTerminalAttestationDigest {
+		t.Fatalf("exact accepted approval did not resume after expiry before source claim: response=%+v err=%v", approvedAfterExpiry, err)
+	}
+	fork, err = recovery.ForkFrozenSource(ctx, tracked, options)
 	if err != nil {
-		t.Fatalf("manual frozen-source fork failed without an IndependentV2 proof: %v", err)
+		t.Fatalf("manual frozen-source fork retry failed after approval expiry: %v", err)
 	}
 	if err := tracked.Upload(ctx, path.Join("root", targetID, "voters/membership.json"), bytes.NewReader(jsonBytes(targetMembership)), objstore.WithIfNotExists()); err != nil {
 		t.Fatal(err)
@@ -236,7 +296,6 @@ func runManualTerminalFrozenForkRegistration(t *testing.T, durability string, al
 	if matches, err := f.e.exactManualTerminalSuccessorClaim(ctx, request, sourceScope, changedRoot, *fence, "manual-recovery-uid"); err != nil || matches {
 		t.Fatalf("post-claim expiry replay matched a changed canonical root: matches=%t err=%v", matches, err)
 	}
-	now = challenge.ExpiresAt.Add(time.Second)
 	wrongApproval := request
 	wrongApproval.ManualTerminalAttestationDigest = strings.Repeat("0", 64)
 	if err := f.e.RegisterArchiveForkGenesis(ctx, wrongApproval); err == nil {
@@ -422,6 +481,10 @@ func (b *frozenRegistrarTrackingBucket) Get(ctx context.Context, name string) (i
 		b.failGetCount--
 		return nil, errors.New("injected post-claim artifact failure")
 	}
+	if b.failSourceGetAfterForkIntent && b.forkIntentWritten && !b.failSourceGetInjected && strings.HasPrefix(name, b.sourcePrefix+"/") {
+		b.failSourceGetInjected = true
+		return nil, errors.New("injected frozen-source materialization read failure")
+	}
 	return b.Bucket.Get(ctx, name)
 }
 
@@ -430,7 +493,13 @@ func (b *frozenRegistrarTrackingBucket) Upload(ctx context.Context, name string,
 		b.writes = append(b.writes, "upload:"+name)
 		return fmt.Errorf("frozen source upload attempted")
 	}
-	return b.Bucket.Upload(ctx, name, body, options...)
+	if err := b.Bucket.Upload(ctx, name, body, options...); err != nil {
+		return err
+	}
+	if name == b.forkIntentName {
+		b.forkIntentWritten = true
+	}
+	return nil
 }
 
 func (b *frozenRegistrarTrackingBucket) Delete(ctx context.Context, name string) error {
