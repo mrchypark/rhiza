@@ -131,6 +131,26 @@ the existing command directly with the binary for your host:
 ./fencing-e2e-linux-amd64 run-gcs-ha-ack-loss
 ```
 
+The separate, still-unqualified single-voter dead-Pod scenario uses the same
+configured GCS and read-only authority observer inputs:
+
+```sh
+./fencing-e2e-darwin-arm64 run-gcs-ha-dead-pod
+# or on Linux/amd64:
+./fencing-e2e-linux-amd64 run-gcs-ha-dead-pod
+```
+
+It requires a three-voter, no-PVC workload using `before-ack` durability and
+safe automatic recovery. It kills only one captured voter with the admitted
+10-second PodChaos profile; then it requires an exact single-target
+IndependentV2 `Voter` proof, completed same-cluster membership replacement,
+authenticated three-voter status, committed/read-back ACKs, and a new-UID
+natural ordinal return refused before readiness. The replacement may be a
+separately named learner; this does not claim the original ordinal was promoted.
+The event/evidence files are private driver output. The code path is not
+qualification evidence until it completes in an actual GCS and Chaos Mesh run,
+and it does not claim the broader D1-D4 matrix.
+
 This requires the GCS run inputs in [`../chaos/README.md`](../chaos/README.md),
 including `RHIZA_KUBE_CONTEXT`, `RHIZA_NAMESPACE`, `RHIZA_RUN_ID`,
 `RHIZA_APP_IMAGE`, `RHIZA_OPERATOR_IMAGE`, `RHIZA_GCP_PROJECT_ID`, and

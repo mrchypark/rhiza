@@ -503,6 +503,7 @@ func TestCRIAcknowledgementAloneIsNotTerminalEvidence(t *testing.T) {
 
 func TestCRIQualifiedStopRequiresSameCgroupToBecomeEmpty(t *testing.T) {
 	p, f, binding, request := newRuntimeFixture(t)
+	f.verboseInfo = map[string]string{"info": containerdInfoFixture}
 	root := t.TempDir()
 	proc := filepath.Join(root, "proc")
 	cgroupRoot := filepath.Join(root, "cgroup")
@@ -643,6 +644,7 @@ func TestCRIQualifiedStopRejectsVerboseCgroupPathChangeBeforeStop(t *testing.T) 
 
 func TestCRIResumeCompletesExactContainerStoppedSandboxReadyCrashWindow(t *testing.T) {
 	p, f, binding, request := newRuntimeFixture(t)
+	f.verboseInfo = map[string]string{"info": containerdInfoFixture}
 	root := t.TempDir()
 	proc, cgroupRoot := filepath.Join(root, "proc"), filepath.Join(root, "cgroup")
 	cgroup := filepath.Join(cgroupRoot, "kubepods", "pod-0", "container-0")

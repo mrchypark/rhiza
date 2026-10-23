@@ -126,6 +126,26 @@ func TestGCSAckLossQualificationHasDedicatedCommand(t *testing.T) {
 	}
 }
 
+func TestGCSDeadPodQualificationHasDedicatedCommand(t *testing.T) {
+	data, err := os.ReadFile("main.go")
+	if err != nil {
+		t.Fatal(err)
+	}
+	mainSource := string(data)
+	start := strings.Index(mainSource, `if os.Args[1] == "run-gcs-ha-dead-pod" {`)
+	if start < 0 {
+		t.Fatal("dedicated dead-Pod qualification command is missing")
+	}
+	end := strings.Index(mainSource[start:], "\n\tif os.Args[1] == ")
+	if end < 0 {
+		t.Fatal("dedicated dead-Pod command block is not bounded")
+	}
+	block := mainSource[start : start+end]
+	if !strings.Contains(block, "fatal(configureGCSHA(ctx))") || !strings.Contains(block, "fatal(qualifyGCSDeadPod(ctx))") {
+		t.Fatal("dead-Pod command does not validate the GCS profile before running its driver")
+	}
+}
+
 func TestFixtureOnlyWorkflowIsExclusiveAndRunsFixedGoSelectors(t *testing.T) {
 	data, err := os.ReadFile("../../.github/workflows/ci.yml")
 	if err != nil {

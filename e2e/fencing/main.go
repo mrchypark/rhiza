@@ -41,7 +41,7 @@ type obj = map[string]any
 
 func main() {
 	if len(os.Args) != 2 {
-		fatal(fmt.Errorf("usage: fencing-e2e manifests|local-cooperative-store-secret|wait-source|run|run-gcs-ha|run-gcs-ha-explicit|run-gcs-ha-async-empty|run-gcs-ha-async-empty-explicit|run-gcs-ha-ack-loss|prepare-gcs-ha-initial-head-ack-loss|cleanup-gcs-ha-initial-head-ack-loss|run-gcs-ha-initial-head-ack-loss|runtime-probe|runtime-agent-request"))
+		fatal(fmt.Errorf("usage: fencing-e2e manifests|local-cooperative-store-secret|wait-source|run|run-gcs-ha|run-gcs-ha-explicit|run-gcs-ha-async-empty|run-gcs-ha-async-empty-explicit|run-gcs-ha-ack-loss|run-gcs-ha-dead-pod|prepare-gcs-ha-initial-head-ack-loss|cleanup-gcs-ha-initial-head-ack-loss|run-gcs-ha-initial-head-ack-loss|runtime-probe|runtime-agent-request"))
 	}
 	if os.Args[1] == "prepare-gcs-ha-initial-head-ack-loss" {
 		ctx, cancel := context.WithTimeout(context.Background(), 6*time.Minute)
@@ -127,6 +127,13 @@ func main() {
 		defer cancel()
 		fatal(configureGCSHA(ctx))
 		fatal(qualifyGCSHAAckLoss(ctx))
+		return
+	}
+	if os.Args[1] == "run-gcs-ha-dead-pod" {
+		ctx, cancel := context.WithTimeout(context.Background(), 45*time.Minute)
+		defer cancel()
+		fatal(configureGCSHA(ctx))
+		fatal(qualifyGCSDeadPod(ctx))
 		return
 	}
 	if os.Args[1] == "safe-artifacts" {
@@ -1220,6 +1227,9 @@ func membershipMatches(status network.MembershipStatus, refs []operator.VoterPod
 }
 
 func verifyLearnerBinding(ctx context.Context, pod obj, child operator.Resource, status network.MembershipStatus, stsUID, bindingUID, operation, out string) error {
+	if child.Spec.Membership == nil || child.Status.Membership == nil || child.Status.Membership.Add == nil {
+		return fmt.Errorf("promoted learner lacks a durable membership addition record")
+	}
 	m, add := child.Spec.Membership, child.Status.Membership.Add
 	name := text(nested(pod, "metadata", "name"))
 	if name != m.ReplacementPod || string(add.MemberID) != name || status.WALIdentity != add.WALIdentity || text(nested(pod, "metadata", "uid")) == "" || nested(pod, "metadata", "labels", "rhiza.mrchypark.dev/automatic-learner") != name || nested(pod, "metadata", "annotations", "rhiza.mrchypark.dev/fencing-root-uid") != bindingUID || nested(pod, "metadata", "annotations", "rhiza.mrchypark.dev/recovery-owner") != operation {
@@ -1249,7 +1259,7 @@ func verifyLearnerBinding(ctx context.Context, pod obj, child operator.Resource,
 		return err
 	}
 	member.WALIdentity = status.WALIdentity
-	request := network.MembershipChange{OperationID: add.OperationID, ClusterID: "chaos-source", ExpectedConfigID: add.ExpectedConfigID, ExpectedAbortSlot: add.ExpectedAbortSlot, Add: &member}
+	request := network.MembershipChange{OperationID: add.OperationID, ClusterID: child.Spec.SourceClusterID, ExpectedConfigID: add.ExpectedConfigID, ExpectedAbortSlot: add.ExpectedAbortSlot, Add: &member}
 	if member.ID != status.NodeID || member.PublicKey == (quepaxa.PublicKey{}) || fmt.Sprintf("%x", sha256.Sum256(encoded(request))) != add.RequestHash {
 		return fmt.Errorf("promoted learner member differs from committed addition")
 	}

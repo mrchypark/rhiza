@@ -229,9 +229,15 @@ The harness is split behind `--scenarios` (launcher: `RHIZA_SCENARIOS`):
 - `positive` (default): bootstrap opt-in and adoption, `voterCount == replicas`,
   intact-WAL restart, online replacement and generation recovery. This is the set
   that supports the "cooperative recovery on real GCS" claim.
-- `dead-pod` (DEFERRED): D1-D4. Not executed by default; they run only after the
-  production fencing executor lands (separate implementation project), so the
-  dead-Pod claim is unqualified until then.
+- `dead-pod` (narrow native Go scenario available, not part of this Python
+  selector): `run-gcs-ha-dead-pod` kills one captured voter Pod, requires the
+  exact authenticated GCS IndependentV2 `Voter` proof, verifies automatic
+  single-voter membership replacement and ACK/read-barrier durability, then
+  observes the natural StatefulSet ordinal return with a new Pod UID refused
+  before readiness. A separately named learner is a valid replacement; this
+  does not claim the old ordinal became a voter. The scenario has not been
+  qualified against a live GCS/Chaos Mesh run yet, and does not complete the
+  broader D1-D4 matrix or establish other dead-Pod failure modes.
 - `all`: both sets.
 
 Both images must be digest-pinned (`name@sha256:<digest>`); the launcher rejects a

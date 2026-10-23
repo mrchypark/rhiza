@@ -261,7 +261,7 @@ func (f *gcsChaosFault) Restore(ctx context.Context) error {
 	if f == nil || f.uid == "" || f.contextName == "" || f.namespace == "" || f.name == "" {
 		return fmt.Errorf("refusing to restore an unpinned GCS NetworkChaos")
 	}
-	deleteErr := deleteGCSNetworkChaosUID(ctx, f.contextName, f.namespace, f.name, f.uid)
+	deleteErr := deleteGCSChaosUID(ctx, f.contextName, f.namespace, "networkchaos", f.name, f.uid)
 	waitCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
 	defer cancel()
 	if err := wait(waitCtx, "GCS NetworkChaos UID cleanup", func() (bool, error) {
@@ -766,9 +766,9 @@ func verifyGCSChaosControlOwner(ctx context.Context, contextName, namespace, rol
 	return fmt.Errorf("operator Pod %s Deployment owner identity changed", identity.Name)
 }
 
-func deleteGCSNetworkChaosUID(ctx context.Context, contextName, namespace, name, uid string) error {
-	if uid == "" || !validGCSChaosPodName(namespace) || !validGCSChaosPodName(name) {
-		return fmt.Errorf("refusing NetworkChaos cleanup without exact name and UID")
+func deleteGCSChaosUID(ctx context.Context, contextName, namespace, resource, name, uid string) error {
+	if (resource != "networkchaos" && resource != "podchaos") || uid == "" || !validGCSChaosPodName(namespace) || !validGCSChaosPodName(name) {
+		return fmt.Errorf("refusing Chaos cleanup without exact resource, name and UID")
 	}
 	dir, err := os.MkdirTemp("/tmp", "rhiza-chaos-proxy-")
 	if err != nil {
@@ -816,7 +816,7 @@ func deleteGCSNetworkChaosUID(ctx context.Context, contextName, namespace, name,
 		}
 	}
 	options, _ := json.Marshal(obj{"apiVersion": "v1", "kind": "DeleteOptions", "preconditions": obj{"uid": uid}})
-	path := fmt.Sprintf("%s/apis/chaos-mesh.org/v1alpha1/namespaces/%s/networkchaos/%s", base, namespace, name)
+	path := fmt.Sprintf("%s/apis/chaos-mesh.org/v1alpha1/namespaces/%s/%s/%s", base, namespace, resource, name)
 	request, err := http.NewRequestWithContext(ctx, http.MethodDelete, path, bytes.NewReader(options))
 	if err != nil {
 		return err
@@ -824,11 +824,11 @@ func deleteGCSNetworkChaosUID(ctx context.Context, contextName, namespace, name,
 	request.Header.Set("Content-Type", "application/json")
 	response, err := client.Do(request)
 	if err != nil {
-		return fmt.Errorf("delete exact NetworkChaos UID: %w", err)
+		return fmt.Errorf("delete exact Chaos UID: %w", err)
 	}
 	defer response.Body.Close()
 	if response.StatusCode != http.StatusOK && response.StatusCode != http.StatusAccepted && response.StatusCode != http.StatusNotFound && response.StatusCode != http.StatusConflict {
-		return fmt.Errorf("delete exact NetworkChaos UID returned HTTP %d", response.StatusCode)
+		return fmt.Errorf("delete exact Chaos UID returned HTTP %d", response.StatusCode)
 	}
 	return nil
 }
