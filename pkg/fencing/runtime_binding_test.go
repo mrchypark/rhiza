@@ -12,7 +12,7 @@ func enrolledRuntime(id Identity, container string) RuntimeBinding {
 	return RuntimeBinding{
 		AuthorityID: "authority", NamespaceUID: "namespace", BindingUID: "root",
 		StatefulSetUID: "statefulset", SourceClusterID: id.SourceClusterID,
-		NodeID: id.NodeID, PodUID: id.PodUID, RunID: id.RunID,
+		NodeID: id.NodeID, PodUID: id.PodUID, RunID: id.RunID, AssignmentID: id.AssignmentID,
 		NodeName: "node", NodeUID: "node-uid", MachineID: "machine", BootID: "boot",
 		RuntimeID: "containerd", SandboxID: "sandbox", ContainerID: container, ImageID: "image",
 		CapturedScopeDigest: strings.Repeat("a", 64),

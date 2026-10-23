@@ -15,7 +15,12 @@ func newJournalProducer(t *testing.T, run string) *MutationProducer {
 	id := testIdentity()
 	id.RunID = run
 	id.WALIdentity = "wal-" + run
-	p, err := NewMutationProducer(id, enrolledRuntime(id, "container-"+run))
+	return newJournalProducerForIdentity(t, id)
+}
+
+func newJournalProducerForIdentity(t *testing.T, id Identity) *MutationProducer {
+	t.Helper()
+	p, err := NewMutationProducer(id, enrolledRuntime(id, "container-"+id.RunID))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -154,6 +159,16 @@ func TestMutationJournalCreateZeroCannotHideDelayedCopy(t *testing.T) {
 func guardedCreateProducer(t *testing.T, profile string) (*MutationProducer, MutationGuardedLogicalResolution) {
 	t.Helper()
 	p := newJournalProducer(t, "guarded-create")
+	return guardedCreateProducerWithProducer(t, p, profile)
+}
+
+func guardedCreateProducerForIdentity(t *testing.T, profile string, id Identity) (*MutationProducer, MutationGuardedLogicalResolution) {
+	t.Helper()
+	return guardedCreateProducerWithProducer(t, newJournalProducerForIdentity(t, id), profile)
+}
+
+func guardedCreateProducerWithProducer(t *testing.T, p *MutationProducer, profile string) (*MutationProducer, MutationGuardedLogicalResolution) {
+	t.Helper()
 	intent := journalUpload("guarded-create")
 	intent.Condition = MutationCondition{Mode: MutationCreateOnly}
 	mustJournal(t, p.Admit(1, intent))
@@ -279,9 +294,9 @@ func TestMutationJournalGuardedLogicalResolutionRejectsMismatchedEvidence(t *tes
 }
 
 func TestMutationJournalAssignedLearnerRuntimeAndGuardedResolution(t *testing.T) {
-	p, evidence := guardedCreateProducer(t, MutationHeldExecutionProfile)
-	p.Runtime.AssignmentID = "learner-assignment"
-	evidence.Runtime = p.Runtime
+	id := testIdentity()
+	id.RunID, id.WALIdentity, id.AssignmentID = "guarded-create", "wal-guarded-create", "learner-assignment"
+	p, evidence := guardedCreateProducerForIdentity(t, MutationHeldExecutionProfile, id)
 	if err := p.Validate(); err != nil {
 		t.Fatalf("assigned learner producer did not validate: %v", err)
 	}
