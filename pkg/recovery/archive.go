@@ -51,9 +51,10 @@ var (
 	ErrActiveGCLock error = activeGCLockError{}
 	// ErrActiveRecoveryPin identifies only the trim guard's live-pin refusal.
 	// It retains ErrArchiveBusy compatibility without conflating lock failures.
-	ErrActiveRecoveryPin   error = activeRecoveryPinError{}
-	ErrArchiveSealed             = errors.New("archive is sealed for recovery")
-	errArchiveStateChanged       = errors.New("archive state changed during I/O")
+	ErrActiveRecoveryPin         error = activeRecoveryPinError{}
+	ErrArchiveSealed                   = errors.New("archive is sealed for recovery")
+	errArchiveStateChanged             = errors.New("archive state changed during I/O")
+	errArchivePublicationPending       = errors.New("archive first publication is still in progress")
 )
 
 type activeRecoveryPinError struct{}
@@ -278,15 +279,56 @@ func (m *Manager) Load(ctx context.Context) error {
 	// Keep validated immutable references across HEAD retries. A live writer
 	// must not force each retry to download the entire historical chain again.
 	verified := make(map[extentObject]Extent)
-	for range maxPublishRetries {
+	stateRetries := 0
+	for {
 		if err := ctx.Err(); err != nil {
 			return err
 		}
-		if err := m.loadLocked(ctx, verified); !errors.Is(err, errArchiveStateChanged) {
+		err := m.loadLocked(ctx, verified)
+		switch {
+		case err == nil:
+			return nil
+		case errors.Is(err, errArchiveStateChanged):
+			stateRetries++
+			if stateRetries >= maxPublishRetries {
+				return fmt.Errorf("shared archive state changed too often")
+			}
+		case errors.Is(err, errArchivePublicationPending):
+			// The current HEAD read may have preceded a valid concurrent first
+			// publication's block upload. Re-enter Load after a short bounded poll;
+			// the caller context, not an arbitrary internal deadline, bounds waits.
+			timer := time.NewTimer(50 * time.Millisecond)
+			select {
+			case <-ctx.Done():
+				timer.Stop()
+				return ctx.Err()
+			case <-timer.C:
+			}
+		default:
 			return err
 		}
 	}
-	return fmt.Errorf("shared archive state changed too often")
+}
+
+// firstPublicationPending distinguishes a live first-HEAD publication from
+// abandoned immutable blocks. A caller already holding the observed lease
+// cannot use its own lock to disguise a failed publication as transient.
+func (m *Manager) firstPublicationPending(ctx context.Context) (bool, error) {
+	lock, err := m.readArchiveLock(ctx, m.publicationLockKey())
+	if err != nil {
+		if m.bucket.IsObjNotFoundErr(err) {
+			return false, nil
+		}
+		return false, err
+	}
+	if lock.LeaseUntilMS <= time.Now().UnixMilli() {
+		return false, nil
+	}
+	if held, ok := ctx.Value(publicationLeaseContextKey{}).(archiveGCLock); ok &&
+		held.OwnerID == lock.OwnerID && held.Generation == lock.Generation {
+		return false, nil
+	}
+	return true, nil
 }
 
 func (m *Manager) loadLocked(ctx context.Context, verified map[extentObject]Extent) error {
@@ -311,6 +353,23 @@ func (m *Manager) loadLocked(ctx context.Context, verified map[extentObject]Exte
 			return err
 		}
 		if orphanedBlocks {
+			pending, err := m.firstPublicationPending(ctx)
+			if err != nil {
+				return err
+			}
+			if pending {
+				return errArchivePublicationPending
+			}
+			// The first HEAD read predates the block scan. A publisher may have
+			// completed HEAD and released its lease during that scan; re-read HEAD
+			// before treating the remaining blocks as abandoned.
+			_, _, _, err = m.readStableObject(ctx, name, oldCAS, true, maxArchiveHeadSize)
+			if err == nil {
+				return errArchiveStateChanged
+			}
+			if !m.bucket.IsObjNotFoundErr(err) {
+				return err
+			}
 			return fmt.Errorf("shared archive head is missing but immutable blocks remain")
 		}
 		if oldHead.Tip != 0 {

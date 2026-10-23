@@ -176,6 +176,253 @@ type blockingHeadUploadBucket struct {
 	release chan struct{}
 }
 
+// firstExtentPublicationWindowBucket stores the first immutable extent but
+// holds its caller before HEAD publication. The caller still owns PUBLISH_LOCK
+// while the test examines the externally visible first-publication window.
+type firstExtentPublicationWindowBucket struct {
+	objstore.Bucket
+	started chan struct{}
+	release chan struct{}
+	blocked atomic.Bool
+}
+
+func (b *firstExtentPublicationWindowBucket) Upload(ctx context.Context, name string, r io.Reader, options ...objstore.ObjectUploadOption) error {
+	if strings.Contains(name, "/archive/blocks/") && b.blocked.CompareAndSwap(false, true) {
+		if err := b.Bucket.Upload(ctx, name, r, options...); err != nil {
+			return err
+		}
+		close(b.started)
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-b.release:
+			return nil
+		}
+	}
+	return b.Bucket.Upload(ctx, name, r, options...)
+}
+
+type observedPublicationLockBucket struct {
+	objstore.Bucket
+	observed chan struct{}
+	once     sync.Once
+}
+
+type waitAfterBlockScanBucket struct {
+	objstore.Bucket
+	scanned chan struct{}
+	release chan struct{}
+	once    sync.Once
+}
+
+func (b *waitAfterBlockScanBucket) Iter(ctx context.Context, dir string, f func(string) error, options ...objstore.IterOption) error {
+	if err := b.Bucket.Iter(ctx, dir, f, options...); err != nil {
+		return err
+	}
+	if strings.HasSuffix(dir, "/archive/blocks") {
+		b.once.Do(func() { close(b.scanned) })
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-b.release:
+		}
+	}
+	return nil
+}
+
+func (b *observedPublicationLockBucket) Get(ctx context.Context, name string) (io.ReadCloser, error) {
+	r, err := b.Bucket.Get(ctx, name)
+	if strings.HasSuffix(name, "/archive/PUBLISH_LOCK") {
+		b.once.Do(func() { close(b.observed) })
+	}
+	return r, err
+}
+
+func TestArchiveLoadWaitsForFirstPublicationHead(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	wal, err := qlog.Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer wal.Close()
+	core, err := quepaxa.New(quepaxa.Config{
+		NodeID:  "n1",
+		Cluster: quepaxa.Cluster{ConfigID: 1, Members: []quepaxa.Member{{ID: "n1"}}},
+		WAL:     wal,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := core.Propose(ctx, []byte("first certified decision")); err != nil {
+		t.Fatal(err)
+	}
+
+	base := objstore.NewInMemBucket()
+	writerBucket := &firstExtentPublicationWindowBucket{
+		Bucket: base, started: make(chan struct{}), release: make(chan struct{}),
+	}
+	writer := NewManager(writerBucket, "cluster", 1)
+	readerBucket := &observedPublicationLockBucket{Bucket: base, observed: make(chan struct{})}
+	reader := NewManager(readerBucket, "cluster", 1)
+	defer writer.Close()
+	defer reader.Close()
+	var releaseOnce sync.Once
+	releaseWriter := func() { releaseOnce.Do(func() { close(writerBucket.release) }) }
+	defer releaseWriter()
+
+	writerDone := make(chan error, 1)
+	go func() { writerDone <- writer.SyncThrough(ctx, core, core.Tip()) }()
+	select {
+	case <-writerBucket.started:
+	case err := <-writerDone:
+		t.Fatalf("writer completed before exposing first-publication window: %v", err)
+	case <-ctx.Done():
+		t.Fatal("writer did not upload its first immutable block")
+	}
+	if _, err := base.Attributes(ctx, writer.key("archive/head.bin")); !base.IsObjNotFoundErr(err) {
+		t.Fatalf("HEAD during blocked first publication: err=%v", err)
+	}
+
+	canceledCtx, cancelReader := context.WithCancel(ctx)
+	canceledBucket := &observedPublicationLockBucket{Bucket: base, observed: make(chan struct{})}
+	canceledReader := NewManager(canceledBucket, "cluster", 1)
+	defer canceledReader.Close()
+	canceledDone := make(chan error, 1)
+	go func() { canceledDone <- canceledReader.Load(canceledCtx) }()
+	select {
+	case <-canceledBucket.observed:
+		cancelReader()
+	case err := <-canceledDone:
+		t.Fatalf("canceled reader returned before checking the live lease: %v", err)
+	case <-ctx.Done():
+		t.Fatal("canceled reader did not inspect the publication lease")
+	}
+	select {
+	case err := <-canceledDone:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("canceled load error=%v, want context cancellation", err)
+		}
+	case <-ctx.Done():
+		t.Fatal("load did not stop after caller cancellation")
+	}
+
+	readerDone := make(chan error, 1)
+	go func() { readerDone <- reader.Load(ctx) }()
+	select {
+	case <-readerBucket.observed:
+		// Load recognized the live cross-manager publication lease. Releasing
+		// the writer lets the reader retry against the now-published HEAD.
+		releaseWriter()
+	case err := <-readerDone:
+		t.Fatalf("reader returned before the live publisher completed: %v", err)
+	case <-ctx.Done():
+		t.Fatal("reader did not observe the live publication lease")
+	}
+	select {
+	case err := <-writerDone:
+		if err != nil {
+			t.Fatalf("complete first publication: %v", err)
+		}
+	case <-ctx.Done():
+		t.Fatal("writer did not finish after release")
+	}
+	select {
+	case err := <-readerDone:
+		if err != nil {
+			t.Fatalf("load after first publication completed: %v", err)
+		}
+	case <-ctx.Done():
+		t.Fatal("reader did not retry after the first publication completed")
+	}
+	if got, want := reader.Tip(), core.Tip(); got != want {
+		t.Fatalf("reader tip=%d, want validated published tip=%d", got, want)
+	}
+}
+
+func TestArchiveLoadRechecksHeadAfterFirstPublicationLeaseEnds(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	wal, err := qlog.Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer wal.Close()
+	core, err := quepaxa.New(quepaxa.Config{
+		NodeID:  "n1",
+		Cluster: quepaxa.Cluster{ConfigID: 1, Members: []quepaxa.Member{{ID: "n1"}}},
+		WAL:     wal,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := core.Propose(ctx, []byte("first certified decision")); err != nil {
+		t.Fatal(err)
+	}
+
+	base := objstore.NewInMemBucket()
+	writerBucket := &firstExtentPublicationWindowBucket{
+		Bucket: base, started: make(chan struct{}), release: make(chan struct{}),
+	}
+	writer := NewManager(writerBucket, "cluster", 1)
+	readerBucket := &waitAfterBlockScanBucket{
+		Bucket: base, scanned: make(chan struct{}), release: make(chan struct{}),
+	}
+	reader := NewManager(readerBucket, "cluster", 1)
+	defer writer.Close()
+	defer reader.Close()
+	var releaseOnce sync.Once
+	releaseWriter := func() { releaseOnce.Do(func() { close(writerBucket.release) }) }
+	defer releaseWriter()
+	var releaseScanOnce sync.Once
+	releaseScan := func() { releaseScanOnce.Do(func() { close(readerBucket.release) }) }
+	defer releaseScan()
+
+	writerDone := make(chan error, 1)
+	go func() { writerDone <- writer.SyncThrough(ctx, core, core.Tip()) }()
+	select {
+	case <-writerBucket.started:
+	case err := <-writerDone:
+		t.Fatalf("writer completed before exposing first-publication window: %v", err)
+	case <-ctx.Done():
+		t.Fatal("writer did not upload its first immutable block")
+	}
+
+	readerDone := make(chan error, 1)
+	go func() { readerDone <- reader.Load(ctx) }()
+	select {
+	case <-readerBucket.scanned:
+		// The reader has observed the immutable block while HEAD is still absent.
+	case err := <-readerDone:
+		t.Fatalf("reader returned before completing its block scan: %v", err)
+	case <-ctx.Done():
+		t.Fatal("reader did not scan the first immutable block")
+	}
+
+	// Publish HEAD and release PUBLISH_LOCK before the reader checks that lock.
+	releaseWriter()
+	select {
+	case err := <-writerDone:
+		if err != nil {
+			t.Fatalf("complete first publication: %v", err)
+		}
+	case <-ctx.Done():
+		t.Fatal("writer did not finish after release")
+	}
+	releaseScan()
+	select {
+	case err := <-readerDone:
+		if err != nil {
+			t.Fatalf("load after HEAD publication completed: %v", err)
+		}
+	case <-ctx.Done():
+		t.Fatal("reader did not retry after rechecking HEAD")
+	}
+	if reader.Tip() != core.Tip() {
+		t.Fatalf("reader tip=%d, want %d", reader.Tip(), core.Tip())
+	}
+}
+
 type archiveSyncAdmissionBucket struct {
 	objstore.Bucket
 	headReads                atomic.Uint64
@@ -670,6 +917,58 @@ func TestMissingArchiveHeadRejectsOrphanedArchiveObjects(t *testing.T) {
 		defer reader.Close()
 		if err := reader.Load(ctx); err == nil || !strings.Contains(err.Error(), "immutable blocks remain") {
 			t.Fatalf("load with orphaned current block: %v", err)
+		}
+	})
+
+	t.Run("expired publisher lease does not hide orphan", func(t *testing.T) {
+		ctx, bucket, _, writer := newSealableArchive(t)
+		defer writer.Close()
+		if err := bucket.Delete(ctx, writer.key("archive/head.bin")); err != nil {
+			t.Fatal(err)
+		}
+		expired := archiveGCLock{OwnerID: "abandoned-publisher", Generation: 2, LeaseUntilMS: time.Now().Add(-time.Second).UnixMilli()}
+		if err := writer.writeArchiveLock(ctx, writer.publicationLockKey(), expired); err != nil {
+			t.Fatal(err)
+		}
+
+		reader := NewManager(bucket, "cluster", 1)
+		defer reader.Close()
+		if err := reader.Load(ctx); err == nil || !strings.Contains(err.Error(), "immutable blocks remain") {
+			t.Fatalf("load with orphaned block and expired publisher lease: %v", err)
+		}
+	})
+
+	t.Run("malformed publisher lease does not hide orphan", func(t *testing.T) {
+		ctx, bucket, _, writer := newSealableArchive(t)
+		defer writer.Close()
+		if err := bucket.Delete(ctx, writer.key("archive/head.bin")); err != nil {
+			t.Fatal(err)
+		}
+		if err := bucket.Upload(ctx, writer.publicationLockKey(), bytes.NewReader([]byte("{"))); err != nil {
+			t.Fatal(err)
+		}
+		reader := NewManager(bucket, "cluster", 1)
+		defer reader.Close()
+		if err := reader.Load(ctx); err == nil {
+			t.Fatal("load accepted orphaned blocks under malformed publication lease")
+		}
+	})
+
+	t.Run("own publisher lease does not hide orphan", func(t *testing.T) {
+		ctx, bucket, _, writer := newSealableArchive(t)
+		defer writer.Close()
+		if err := bucket.Delete(ctx, writer.key("archive/head.bin")); err != nil {
+			t.Fatal(err)
+		}
+		lease := archiveGCLock{OwnerID: "current-publisher", Generation: 2, LeaseUntilMS: time.Now().Add(time.Minute).UnixMilli()}
+		if err := writer.writeArchiveLock(ctx, writer.publicationLockKey(), lease); err != nil {
+			t.Fatal(err)
+		}
+		reader := NewManager(bucket, "cluster", 1)
+		defer reader.Close()
+		ownLeaseCtx := context.WithValue(ctx, publicationLeaseContextKey{}, lease)
+		if err := reader.Load(ownLeaseCtx); err == nil || !strings.Contains(err.Error(), "immutable blocks remain") {
+			t.Fatalf("load with caller-owned lease and orphaned block: %v", err)
 		}
 	})
 
