@@ -814,7 +814,8 @@ func TestAutomaticSupervisedSourcePinsRootBeforeInitialScale(t *testing.T) {
 }
 
 func TestSupervisedBootstrapContinuesOnlyAfterVerifiedRootPin(t *testing.T) {
-	t.Run("bootstrap installs credentials then scales on later adopted reconcile", func(t *testing.T) {
+	prepareCredentialInstalled := func(t *testing.T) (automaticBootstrapGenesisFixture, *Controller, ClusterResource, string, string) {
+		t.Helper()
 		f := newAutomaticBootstrapGenesisFixture(t)
 		controller, cluster, _ := prepareAutomaticInitialRootPin(t, &f)
 		stsPath := controller.stsPath(cluster.Spec.StatefulSet)
@@ -826,22 +827,69 @@ func TestSupervisedBootstrapContinuesOnlyAfterVerifiedRootPin(t *testing.T) {
 		}
 		delete(f.api.objects, secretPath)
 		f.api.mu.Unlock()
+		if err := controller.reconcileCluster(t.Context(), &cluster); err != nil {
+			t.Fatalf("root-pin reconcile: %v", err)
+		}
+		if err := controller.reconcileCluster(t.Context(), &cluster); err != nil {
+			t.Fatalf("credential-install reconcile: %v", err)
+		}
+		if str(nested(f.api.objects[stsPath], "spec", "template", "metadata", "annotations", fencingRootAnnotation)) != automaticBootstrapClusterUID || f.api.objects[secretPath] == nil || int(number(nested(f.api.objects[stsPath], "spec", "replicas"))) != 0 {
+			t.Fatalf("fixture did not reach pinned, credential-installed, zero-replica state: root=%q secret=%t replicas=%d", nested(f.api.objects[stsPath], "spec", "template", "metadata", "annotations", fencingRootAnnotation), f.api.objects[secretPath] != nil, int(number(nested(f.api.objects[stsPath], "spec", "replicas"))))
+		}
+		return f, controller, cluster, stsPath, controller.corePath("pods", "")
+	}
+
+	t.Run("bootstrap installs credentials then scales on later adopted reconcile", func(t *testing.T) {
+		f := newAutomaticBootstrapGenesisFixture(t)
+		controller, cluster, _ := prepareAutomaticInitialRootPin(t, &f)
+		stsPath := controller.stsPath(cluster.Spec.StatefulSet)
+		secretPath := controller.corePath("secrets", bootstrapSecretName(&cluster))
+		bootstrapDiagnostics := func(stage string) string {
+			f.api.mu.Lock()
+			clusterObject := asObject(f.api.objects[controller.clusterPath(automaticBootstrapClusterName)])
+			sts := f.api.objects[stsPath]
+			phase := str(nested(clusterObject, "status", "phase"))
+			message := str(nested(clusterObject, "status", "message"))
+			rootPinned := str(nested(sts, "spec", "template", "metadata", "annotations", fencingRootAnnotation)) == automaticBootstrapClusterUID
+			replicas := int(number(nested(sts, "spec", "replicas")))
+			secretInstalled := f.api.objects[secretPath] != nil
+			f.api.mu.Unlock()
+			state, _, stateErr := controller.loadAuto(t.Context(), controller.autoKey(&cluster))
+			candidateExists, candidateErr := controller.Bucket.Exists(t.Context(), controller.bootstrapCandidateKey(&cluster))
+			membershipMissing, membershipErr := controller.archiveMembershipMissing(t.Context(), cluster.Spec.AdoptClusterID)
+			return fmt.Sprintf("stage=%s phase=%q message=%q rootPinned=%t replicas=%d secretInstalled=%t candidateExists=%t candidateCheckFailed=%t controlStatePresent=%t controlStateLoadFailed=%t bootstrapGenesisPresent=%t intentPresent=%t voterCount=%d membershipMissing=%t membershipCheckFailed=%t",
+				stage, phase, message, rootPinned, replicas, secretInstalled, candidateExists, candidateErr != nil,
+				state != nil, stateErr != nil, state != nil && state.BootstrapGenesis != nil, state != nil && state.Intent != nil,
+				func() int {
+					if state == nil {
+						return 0
+					}
+					return len(state.Voters)
+				}(), membershipMissing, membershipErr != nil)
+		}
+		f.api.mu.Lock()
+		ctr := asObject(list(nested(f.api.objects[stsPath], "spec", "template", "spec", "containers"))[0])
+		for _, name := range []string{"RHIZA_CLUSTER_MEMBERS", "RHIZA_ADMIN_TOKEN", "RHIZA_PEER_TOKENS", "RHIZA_PEER_TOKEN"} {
+			ctr["env"] = removeEnv(list(ctr["env"]), name)
+		}
+		delete(f.api.objects, secretPath)
+		f.api.mu.Unlock()
 
 		if err := controller.reconcileCluster(t.Context(), &cluster); err != nil {
-			t.Fatal(err)
+			t.Fatalf("first root-pin reconcile: %v; %s", err, bootstrapDiagnostics("first-reconcile"))
 		}
 		if got := str(nested(f.api.objects[stsPath], "spec", "template", "metadata", "annotations", fencingRootAnnotation)); got != automaticBootstrapClusterUID {
-			t.Fatalf("first reconcile did not pin the exact root before bootstrap: %q", got)
+			t.Fatalf("first reconcile did not pin the exact root before bootstrap: %q; %s", got, bootstrapDiagnostics("first-reconcile"))
 		}
 		if int(number(nested(f.api.objects[stsPath], "spec", "replicas"))) != 0 || f.api.objects[secretPath] != nil {
-			t.Fatal("first root-pin reconcile installed credentials or scaled the workload")
+			t.Fatalf("first root-pin reconcile installed credentials or scaled the workload; %s", bootstrapDiagnostics("first-reconcile"))
 		}
 
 		if err := controller.reconcileCluster(t.Context(), &cluster); err != nil {
-			t.Fatal(err)
+			t.Fatalf("credential-install reconcile: %v; %s", err, bootstrapDiagnostics("credential-install-reconcile"))
 		}
 		if f.api.objects[secretPath] == nil || int(number(nested(f.api.objects[stsPath], "spec", "replicas"))) != 0 {
-			t.Fatal("verified-root bootstrap did not install credentials while remaining writer-free")
+			t.Fatalf("verified-root bootstrap did not install credentials while remaining writer-free; %s", bootstrapDiagnostics("credential-install-reconcile"))
 		}
 		ctr = asObject(list(nested(f.api.objects[stsPath], "spec", "template", "spec", "containers"))[0])
 		if str(nested(envEntry(ctr, "RHIZA_CLUSTER_MEMBERS"), "valueFrom", "secretKeyRef", "name")) != bootstrapSecretName(&cluster) {
@@ -849,15 +897,78 @@ func TestSupervisedBootstrapContinuesOnlyAfterVerifiedRootPin(t *testing.T) {
 		}
 
 		if err := controller.reconcileCluster(t.Context(), &cluster); err != nil {
-			t.Fatal(err)
+			t.Fatalf("scale reconcile: %v; %s", err, bootstrapDiagnostics("scale-reconcile"))
 		}
 		if int(number(nested(f.api.objects[stsPath], "spec", "replicas"))) != cluster.Spec.VoterCount {
-			t.Fatalf("adopted bootstrap did not scale after credentials were installed: replicas=%v", nested(f.api.objects[stsPath], "spec", "replicas"))
+			t.Fatalf("adopted bootstrap did not scale after credentials were installed: replicas=%v; %s", nested(f.api.objects[stsPath], "spec", "replicas"), bootstrapDiagnostics("scale-reconcile"))
 		}
 		if got := str(nested(f.api.objects[stsPath], "spec", "template", "metadata", "annotations", fencingRootAnnotation)); got != automaticBootstrapClusterUID {
 			t.Fatalf("bootstrap scale changed the verified root binding: %q", got)
 		}
 	})
+
+	t.Run("intermediate replica count remains rejected", func(t *testing.T) {
+		f, controller, cluster, stsPath, _ := prepareCredentialInstalled(t)
+		f.api.mu.Lock()
+		asObject(f.api.objects[stsPath]["spec"])["replicas"] = float64(1)
+		f.api.mu.Unlock()
+
+		if err := controller.reconcileCluster(t.Context(), &cluster); err != nil {
+			t.Fatalf("intermediate replica reconcile returned transport error: %v", err)
+		}
+		f.api.mu.Lock()
+		phase := str(nested(f.api.objects[controller.clusterPath(automaticBootstrapClusterName)], "status", "phase"))
+		message := str(nested(f.api.objects[controller.clusterPath(automaticBootstrapClusterName)], "status", "message"))
+		replicas := int(number(nested(f.api.objects[stsPath], "spec", "replicas")))
+		f.api.mu.Unlock()
+		if phase != "Blocked" || !strings.Contains(message, "StatefulSet has 1 desired replicas but voterCount is 3") || replicas != 1 {
+			t.Fatalf("intermediate replica count was not rejected by the ordinary voter-count contract: phase=%q status=%q replicas=%d", phase, message, replicas)
+		}
+		if state, _, err := controller.loadAuto(t.Context(), controller.autoKey(&cluster)); err == nil && state != nil && state.Intent != nil {
+			t.Fatalf("intermediate replica count created a fence intent: %+v", state.Intent)
+		}
+	})
+
+	for _, podCase := range []struct {
+		name           string
+		labels         object
+		owner          bool
+		rootAnnotation bool
+		wantMessage    string
+	}{
+		{name: "matching unowned Pod", labels: object{"app": "rhiza"}, wantMessage: "automatic source Pod ownership or root binding differs"},
+		{name: "owned nonmatching Pod", labels: object{"app": "other"}, owner: true, wantMessage: "automatic source Pod ownership or root binding differs"},
+		{name: "matching owned Pod", labels: object{"app": "rhiza"}, owner: true, rootAnnotation: true, wantMessage: "automatic source root pin requires no matching or StatefulSet-owned Pods"},
+	} {
+		t.Run("zero replicas reject "+podCase.name, func(t *testing.T) {
+			f, controller, cluster, stsPath, podsPath := prepareCredentialInstalled(t)
+			podMetadata := object{"name": "rhiza-0", "uid": "bootstrap-pod-0", "labels": podCase.labels}
+			if podCase.owner {
+				podMetadata["ownerReferences"] = []any{object{"apiVersion": "apps/v1", "kind": "StatefulSet", "name": "rhiza", "uid": str(nested(f.api.objects[stsPath], "metadata", "uid")), "controller": true}}
+			}
+			if podCase.rootAnnotation {
+				podMetadata["annotations"] = object{fencingRootAnnotation: automaticBootstrapClusterUID}
+			}
+			f.api.mu.Lock()
+			f.api.objects[podsPath] = object{"items": []any{object{"metadata": podMetadata}}}
+			f.api.mu.Unlock()
+
+			if err := controller.reconcileCluster(t.Context(), &cluster); err != nil {
+				t.Fatalf("Pod-inventory reconcile returned transport error: %v", err)
+			}
+			f.api.mu.Lock()
+			phase := str(nested(f.api.objects[controller.clusterPath(automaticBootstrapClusterName)], "status", "phase"))
+			message := str(nested(f.api.objects[controller.clusterPath(automaticBootstrapClusterName)], "status", "message"))
+			replicas := int(number(nested(f.api.objects[stsPath], "spec", "replicas")))
+			f.api.mu.Unlock()
+			if phase != "Blocked" || !strings.Contains(message, podCase.wantMessage) || replicas != 0 {
+				t.Fatalf("zero-replica bootstrap did not reject %s: phase=%q status=%q replicas=%d", podCase.name, phase, message, replicas)
+			}
+			if state, _, err := controller.loadAuto(t.Context(), controller.autoKey(&cluster)); err == nil && state != nil && state.Intent != nil {
+				t.Fatalf("zero-replica bootstrap with %s created a fence intent: %+v", podCase.name, state.Intent)
+			}
+		})
+	}
 
 	t.Run("nonbootstrap supervised source remains deferred", func(t *testing.T) {
 		f := newAutomaticBootstrapGenesisFixture(t)
