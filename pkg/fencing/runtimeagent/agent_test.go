@@ -38,6 +38,16 @@ type testBackend struct {
 	onStop                  func()
 }
 
+type cgroupNamespaceDiagnosticTestError struct{}
+
+func (cgroupNamespaceDiagnosticTestError) Error() string {
+	return "unified cgroup path is unsafe (traversal)"
+}
+func (cgroupNamespaceDiagnosticTestError) Unwrap() error { return cri.ErrUnverified }
+func (cgroupNamespaceDiagnosticTestError) CgroupNamespaceDiagnosticCode() string {
+	return "cgroup_namespace_all_different"
+}
+
 func (b *testBackend) Enroll(_ context.Context, base fencing.RuntimeBinding) (fencing.RuntimeBinding, json.RawMessage, error) {
 	b.enrolls++
 	if b.enrollErr != nil {
@@ -85,6 +95,43 @@ func TestEnrollmentFailureReturnsGenericConflictAndOnlyAllowlistedDiagnostic(t *
 	}
 	if gotStage != "cri_enroll" || gotCode != "containerd_verbose_schema_mismatch" {
 		t.Fatalf("unexpected private enrollment diagnostic stage=%q code=%q", gotStage, gotCode)
+	}
+}
+
+func TestTraversalEnrollmentEmitsBoundedNamespaceDiagnosticWithoutChangingRejection(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.Chmod(dir, 0700); err != nil {
+		t.Fatal(err)
+	}
+	backend := &testBackend{enrollErr: cgroupNamespaceDiagnosticTestError{}}
+	var diagnostics []string
+	cfg := Config{AuthorityID: "authority", AuthorityNamespace: "rhiza", AuthorityServiceAccount: "rhiza-fencer", AuthorityWorkloadUID: "authority-deployment-uid",
+		Audience: "rhiza-runtime-agent", Directory: dir,
+		Auth:    testAuth{principal: Principal{Username: "system:serviceaccount:rhiza:rhiza-fencer", PodUID: "authority-pod", WorkloadUID: "authority-deployment-uid", Audiences: []string{"rhiza-runtime-agent"}}},
+		Backend: backend, Diagnostic: func(stage, code string) {
+			diagnostics = append(diagnostics, stage+"/"+code)
+		}}
+	service, err := New(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	requestBody, err := json.Marshal(enrollRequest{Binding: testBaseBinding()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	request := httptest.NewRequest(http.MethodPost, "/v1/enroll", bytes.NewReader(requestBody))
+	request.Header.Set("Authorization", "Bearer trusted-test-token")
+	response := httptest.NewRecorder()
+	service.Handler().ServeHTTP(response, request)
+	if response.Code != http.StatusConflict || response.Body.String() != "runtime enrollment unavailable\n" {
+		t.Fatalf("traversal enrollment was not rejected generically: %d %q", response.Code, response.Body.String())
+	}
+	want := []string{
+		"cri_enroll/process_cgroup_path_traversal",
+		"cri_enroll/cgroup_namespace_all_different",
+	}
+	if strings.Join(diagnostics, ",") != strings.Join(want, ",") {
+		t.Fatalf("diagnostics = %#v, want %#v", diagnostics, want)
 	}
 }
 

@@ -177,11 +177,77 @@ func processCgroupPath(procRoot string, pid uint32) (string, error) {
 		}
 		relative := strings.TrimPrefix(line, "0::/")
 		if reason := cgroupPathRejection(relative); reason != "" {
+			if reason == cgroupPathTraversal {
+				return "", &cgroupPathTraversalError{namespaceRelation: cgroupNamespaceRelation(procRoot, pid)}
+			}
 			return "", fmt.Errorf("%w: unified cgroup path is unsafe (%s)", ErrUnverified, reason)
 		}
 		return relative, nil
 	}
 	return "", fmt.Errorf("%w: unified cgroup path missing", ErrUnverified)
+}
+
+// cgroupPathTraversalError preserves the fail-closed path rejection while
+// exposing only a bounded namespace-relationship category to diagnostics.
+type cgroupPathTraversalError struct {
+	namespaceRelation string
+}
+
+func (e *cgroupPathTraversalError) Error() string {
+	return "fencing: runtime state unverified: unified cgroup path is unsafe (traversal)"
+}
+
+func (e *cgroupPathTraversalError) Unwrap() error { return ErrUnverified }
+
+func (e *cgroupPathTraversalError) CgroupNamespaceDiagnosticCode() string {
+	return e.namespaceRelation
+}
+
+func cgroupNamespaceRelation(procRoot string, pid uint32) string {
+	agent, _ := os.Stat("/proc/self/ns/cgroup")
+	host, _ := os.Stat(filepath.Join(procRoot, "1", "ns", "cgroup"))
+	target, _ := os.Stat(filepath.Join(procRoot, strconv.FormatUint(uint64(pid), 10), "ns", "cgroup"))
+	return classifyCgroupNamespaceRelation(agent, host, target)
+}
+
+func classifyCgroupNamespaceRelation(agent, host, target os.FileInfo) string {
+	missing := 0
+	if agent == nil {
+		missing++
+	}
+	if host == nil {
+		missing++
+	}
+	if target == nil {
+		missing++
+	}
+	if missing == 1 {
+		if agent == nil {
+			return "cgroup_namespace_agent_unavailable"
+		}
+		if host == nil {
+			return "cgroup_namespace_host_unavailable"
+		}
+		return "cgroup_namespace_target_unavailable"
+	}
+	if missing > 1 {
+		return "cgroup_namespace_multiple_unavailable"
+	}
+	agentHost := os.SameFile(agent, host)
+	agentTarget := os.SameFile(agent, target)
+	hostTarget := os.SameFile(host, target)
+	switch {
+	case agentHost && agentTarget:
+		return "cgroup_namespace_all_same"
+	case agentHost:
+		return "cgroup_namespace_agent_host_same_target_other"
+	case agentTarget:
+		return "cgroup_namespace_agent_target_same_host_other"
+	case hostTarget:
+		return "cgroup_namespace_host_target_same_agent_other"
+	default:
+		return "cgroup_namespace_all_different"
+	}
 }
 
 // cgroupPathRejection returns a non-sensitive category for a rejected unified
