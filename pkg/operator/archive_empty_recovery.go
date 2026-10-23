@@ -135,8 +135,9 @@ func (e *FencingExecutor) registerArchiveEmptyRecovery(ctx context.Context, requ
 			}
 		} else {
 			mode = sourceSuccessorModeLegacy
-			reservationDigest, err = readLegacySuccessorReservation(ctx, e.ArchiveBucket, sourcePrefix, archiveForkReservation{
-				Version: 1, OperationID: request.OperationID, Target: request.TargetClusterID, Source: sourceID,
+			legacySourcePrefix := path.Join(basePrefix, stored.Spec.SourceClusterID)
+			reservationDigest, err = readLegacySuccessorReservation(ctx, e.ArchiveBucket, legacySourcePrefix, archiveForkReservation{
+				Version: 1, OperationID: request.OperationID, Target: request.TargetClusterID, Source: stored.Spec.SourceClusterID,
 				SourceMembership: stored.Status.SourceMembership, StatefulSetUID: request.StatefulSetUID,
 				SpecHash: stored.Status.SpecHash, TargetBaseKind: "empty",
 			})

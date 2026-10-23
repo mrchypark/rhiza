@@ -22,6 +22,7 @@ func TestFrozenSourcePreflightUsesReadOnlyControlAuthority(t *testing.T) {
 	dataBucket := objstore.NewInMemBucket()
 	t.Cleanup(func() { _ = dataBucket.Close() })
 	f.e.ArchiveBucket = dataBucket
+	newFrozenEmptyNoEffectServer(t, f)
 	if _, err := f.e.change(ctx, f.runtime.StatefulSetUID, f.runtime.SourceClusterID, func(ledger *fencing.Ledger) error {
 		ledger.RequireRuntimeBinding = true
 		ledger.RequireMutationJournal = true
