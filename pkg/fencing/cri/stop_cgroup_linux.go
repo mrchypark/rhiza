@@ -3,6 +3,7 @@
 package cri
 
 import (
+	"errors"
 	"fmt"
 	"strconv"
 
@@ -30,16 +31,62 @@ type stopCgroupKernel interface {
 	close(int) error
 }
 
-type linuxStopCgroupKernel struct{}
+type linuxStopCgroupKernel struct {
+	fstat   func(int, *unix.Stat_t) error
+	fstatfs func(int, *unix.Statfs_t) error
+}
 
-func (linuxStopCgroupKernel) identity(fd int) (uint64, uint64, uint64, uint64, error) {
+// cgroupObservationError records only a fixed operation and errno class. Its
+// cause is retained for trusted in-process inspection but never serialized.
+type cgroupObservationError struct {
+	operation string
+	class     string
+	cause     error
+}
+
+func (e *cgroupObservationError) Error() string { return "fencing: cgroup observation failed" }
+func (e *cgroupObservationError) Unwrap() error { return e.cause }
+
+func cgroupObservationFailure(operation string, err error) error {
+	class := "other"
+	switch {
+	case errors.Is(err, unix.EBADF):
+		class = "bad_fd"
+	case errors.Is(err, unix.EACCES), errors.Is(err, unix.EPERM):
+		class = "denied"
+	case errors.Is(err, unix.ENOENT):
+		class = "not_found"
+	case errors.Is(err, unix.ENODEV):
+		class = "no_device"
+	case errors.Is(err, unix.EIO):
+		class = "io"
+	}
+	return &cgroupObservationError{operation: operation, class: class, cause: err}
+}
+
+func cgroupObservationCode(err error) (string, bool) {
+	var observation *cgroupObservationError
+	if !errors.As(err, &observation) || observation == nil {
+		return "", false
+	}
+	return "cgroup_" + observation.operation + "_" + observation.class, true
+}
+
+func (k linuxStopCgroupKernel) identity(fd int) (uint64, uint64, uint64, uint64, error) {
+	fstat, fstatfs := k.fstat, k.fstatfs
+	if fstat == nil {
+		fstat = unix.Fstat
+	}
+	if fstatfs == nil {
+		fstatfs = unix.Fstatfs
+	}
 	var stat unix.Stat_t
 	var fs unix.Statfs_t
-	if err := unix.Fstat(fd, &stat); err != nil {
-		return 0, 0, 0, 0, err
+	if err := fstat(fd, &stat); err != nil {
+		return 0, 0, 0, 0, cgroupObservationFailure("fstat", err)
 	}
-	if err := unix.Fstatfs(fd, &fs); err != nil {
-		return 0, 0, 0, 0, err
+	if err := fstatfs(fd, &fs); err != nil {
+		return 0, 0, 0, 0, cgroupObservationFailure("fstatfs", err)
 	}
 	return uint64(stat.Dev), stat.Ino, uint64(fs.Type), uint64(stat.Nlink), nil
 }
@@ -47,7 +94,11 @@ func (linuxStopCgroupKernel) identity(fd int) (uint64, uint64, uint64, uint64, e
 func (linuxStopCgroupKernel) pidExited(fd int) error { return verifyPIDFDExited(fd) }
 
 func (linuxStopCgroupKernel) populated(fd int) (bool, error) {
-	return cgroupPopulated("/proc/self/fd/" + strconv.Itoa(fd))
+	populated, err := cgroupPopulated("/proc/self/fd/" + strconv.Itoa(fd))
+	if err != nil {
+		return false, cgroupObservationFailure("events", err)
+	}
+	return populated, nil
 }
 
 func (linuxStopCgroupKernel) close(fd int) error { return unix.Close(fd) }
@@ -75,7 +126,11 @@ func (p *pinnedStopCgroup) verifyEmpty() error {
 	}
 	dev, ino, fsType, links, err := kernel.identity(p.cgroupFD)
 	if err != nil {
-		return stopCgroupFailure("cgroup_observation_unavailable", fmt.Errorf("%w: pinned cgroup identity cannot be read", ErrUnverified))
+		code, ok := cgroupObservationCode(err)
+		if !ok {
+			code = "cgroup_observation_unavailable"
+		}
+		return stopCgroupFailure(code, fmt.Errorf("%w: pinned cgroup identity cannot be read", ErrUnverified))
 	}
 	if fsType != uint64(unix.CGROUP2_SUPER_MAGIC) || dev != p.dev || ino != p.ino {
 		return stopCgroupFailure("cgroup_identity_changed", fmt.Errorf("%w: pinned cgroup identity changed", ErrUnverified))
@@ -94,7 +149,11 @@ func (p *pinnedStopCgroup) verifyEmpty() error {
 	}
 	populated, err := kernel.populated(p.cgroupFD)
 	if err != nil {
-		return stopCgroupFailure("cgroup_observation_unavailable", fmt.Errorf("%w: pinned cgroup population cannot be read", ErrUnverified))
+		code, ok := cgroupObservationCode(err)
+		if !ok {
+			code = "cgroup_observation_unavailable"
+		}
+		return stopCgroupFailure(code, fmt.Errorf("%w: pinned cgroup population cannot be read", ErrUnverified))
 	}
 	if populated {
 		return stopCgroupFailure("cgroup_populated", fmt.Errorf("%w: pinned cgroup or descendant remains populated", ErrUnverified))
