@@ -223,12 +223,15 @@ func TestIndependentGCSChaosManifestContract(t *testing.T) {
 	for _, want := range []string{
 		"kind: ClusterRole", "resources: [namespaces]", "resourceNames: [__NAMESPACE__]",
 		"verbs: [get, delete]", "kind: ClusterRoleBinding", "kind: Job",
-		"activeDeadlineSeconds: 10800", "sleep 7200", "__NAMESPACE_UID__",
-		"resourceVersion=", "__NODE_A__", "__NODE_B__", "__NODE_C__", "__KUBECTL_IMAGE__",
+		"activeDeadlineSeconds: 10800", "deadline=__EXPIRY_DEADLINE__", "__NAMESPACE_UID__",
+		`preconditions":{"uid":"%s","resourceVersion":"%s"}`, "__NODE_A__", "__NODE_B__", "__NODE_C__", "__KUBECTL_IMAGE__",
 	} {
 		if !strings.Contains(expiry, want) {
 			t.Errorf("run-owned namespace expiry contract missing %q", want)
 		}
+	}
+	if strings.Contains(expiry, "deadline=$(($(date +%s) + 7200))") {
+		t.Fatal("namespace expiry must use the fixed render-time deadline across Pod restarts")
 	}
 	for _, want := range []string{
 		"workload_prefix=${RHIZA_GCS_PREFIX}data/",
