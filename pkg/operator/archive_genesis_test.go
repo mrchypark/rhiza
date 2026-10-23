@@ -266,9 +266,9 @@ func TestEmptyRecoveryVerifiesRealSealedSourceAndClosedRoot(t *testing.T) {
 		registered.Authorization.BucketMetageneration != "" || registered.Authorization.LifecyclePolicyDigest != "" {
 		t.Fatalf("legacy empty authorization unexpectedly contains frozen-source environment: %+v", registered.Authorization)
 	}
-	// ResourceVersion and annotations may change after source closure. The
-	// legacy exact retry must join the immutable auth/root/claim rather
-	// than hashing mutable Kubernetes metadata into the proof identity.
+	// ResourceVersion and annotations may change after source closure. Exact
+	// retries use the derived policy digest; the earlier raw spec-digest form is
+	// intentionally not upgraded because its authorization failed client validation.
 	fence.Metadata["resourceVersion"] = "2"
 	fence.Metadata["annotations"] = object{"benign": "updated after close"}
 	fenceData, err = json.Marshal(fence)

@@ -352,7 +352,7 @@ func (e *FencingExecutor) readExistingEmptyRecovery(ctx context.Context, request
 		authorization.OperationID != request.OperationID || authorization.SourceFenceOperationID != request.SourceFenceOperationID ||
 		authorization.SourceScopeHash != sourceScopeHash || authorization.TargetScopeHash != targetScopeHash ||
 		authorization.TargetMembershipHash != request.TargetMembershipHash || authorization.TargetDurability != request.TargetDurability ||
-		authorization.AllowDataLoss != request.AllowDataLoss || authorization.PolicyDigest != hashJSON(stored.Spec) ||
+		authorization.AllowDataLoss != request.AllowDataLoss || authorization.PolicyDigest != emptyRecoveryPolicyDigest(request.PolicyDigest, authorization.SourceDurability, request.TargetDurability, request.AllowDataLoss) ||
 		authorization.RecoveryMode != request.RecoveryMode || authorization.SourcePrefix != expectedSourcePrefix || authorization.BucketName != expectedBucketName ||
 		authorization.BucketMetageneration != expectedMetageneration || authorization.LifecyclePolicyDigest != expectedLifecycleDigest ||
 		stored.Spec.RecoveryID != request.SourceFenceOperationID || stored.Status.StatefulSetUID != request.StatefulSetUID {
@@ -606,7 +606,8 @@ func (e *FencingExecutor) makeEmptyRecoveryAuthorization(request ArchiveEmptyRec
 		SourceRootDigest: emptyRecoveryClosedRootDigest(e.Kube.Namespace, sourceState), SourceFenceDigest: stableSourceFenceEvidenceDigest(fence),
 		SourceMembershipHash: authorityStateDigest(jsonBytes(sourceMembership)), SourceDurability: sourceDurability,
 		TargetMembershipHash: request.TargetMembershipHash, TargetDurability: request.TargetDurability,
-		AllowDataLoss: request.AllowDataLoss, PolicyDigest: request.PolicyDigest,
+		AllowDataLoss: request.AllowDataLoss,
+		PolicyDigest:  emptyRecoveryPolicyDigest(request.PolicyDigest, sourceDurability, request.TargetDurability, request.AllowDataLoss),
 	}
 	if request.RecoveryMode == RecoveryModeFrozenSource {
 		auth.RecoveryMode = RecoveryModeFrozenSource

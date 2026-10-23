@@ -9,6 +9,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"testing"
 
 	"github.com/mrchypark/rhiza/pkg/fencing"
@@ -25,6 +26,7 @@ func TestHTTPEmptyRecoveryRegistrationRequiresExactCanonicalResponse(t *testing.
 		PolicyDigest: hashJSON("persisted-spec"),
 	}
 	digest := hashJSON("source-proof")
+	var wrongPolicy atomic.Bool
 	emptyHead, err := recovery.EmptyArchiveHeadBytes()
 	if err != nil {
 		t.Fatal(err)
@@ -52,6 +54,9 @@ func TestHTTPEmptyRecoveryRegistrationRequiresExactCanonicalResponse(t *testing.
 			TargetDurability: request.TargetDurability,
 			PolicyDigest:     emptyRecoveryPolicyDigest(request.PolicyDigest, "before-ack", request.TargetDurability, request.AllowDataLoss),
 		}
+		if wrongPolicy.Load() {
+			authorization.PolicyDigest = request.PolicyDigest
+		}
 		w.Header().Set("Content-Type", "application/json")
 		_ = json.NewEncoder(w).Encode(ArchiveEmptyRecoveryResponse{State: fencing.EmptyRecoveryAuthorized, Authorization: authorization})
 	}))
@@ -60,6 +65,10 @@ func TestHTTPEmptyRecoveryRegistrationRequiresExactCanonicalResponse(t *testing.
 	response, err := client.RegisterArchiveEmptyRecovery(t.Context(), request)
 	if err != nil || response.State != fencing.EmptyRecoveryAuthorized {
 		t.Fatalf("registration response=%+v err=%v", response, err)
+	}
+	wrongPolicy.Store(true)
+	if _, err := client.RegisterArchiveEmptyRecovery(t.Context(), request); err == nil || !strings.Contains(err.Error(), "empty recovery authorization differs from request") {
+		t.Fatalf("client accepted an authorization with the un-derived policy digest: err=%v", err)
 	}
 }
 
