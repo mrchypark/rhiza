@@ -188,6 +188,46 @@ func TestIndependentGCSChaosManifestContract(t *testing.T) {
 	}
 }
 
+func TestVoterCountLauncherRunRequiresPrivilegedInstallCredential(t *testing.T) {
+	out := t.TempDir()
+	authState := filepath.Join(t.TempDir(), "bootstrap-state")
+	command := exec.Command("/bin/sh", "../run-votercount-gcs-chaos.sh", "run")
+	command.Env = []string{
+		"PATH=" + os.Getenv("PATH"),
+		"RHIZA_GCS_INDEPENDENT_LAYOUT=yes",
+		"RHIZA_GCS_INDEPENDENT_CONSUMER=run-votercount-gcs-chaos/v2",
+		"RHIZA_RUN_ID=abc12345",
+		"RHIZA_NAMESPACE=rhiza-chaos-abc12345",
+		"RHIZA_KUBE_CONTEXT=test-context",
+		"RHIZA_GCS_BUCKET=test-bucket",
+		"RHIZA_GCS_PREFIX=test/abc12345/",
+		"RHIZA_AUTH_STATE=" + authState,
+		"RHIZA_CLUSTER_ID=test-cluster",
+		"RHIZA_GCP_PROJECT_ID=test-project",
+		"RHIZA_DATA_GSA_ID=rhiza-writer",
+		"RHIZA_READONLY_WORKLOAD_GSA_ID=rhiza-reader",
+		"RHIZA_RUNTIME_AGENT_CA_SECRET=runtime-agent-ca",
+		"RHIZA_RUNTIME_AGENT_TLS_SECRET=runtime-agent-tls",
+		"RHIZA_CONTAINERD_VERSION=containerd-1.7.1",
+		"RHIZA_CONTAINERD_RUNTIME_TYPE=io.containerd.runc.v2",
+		"RHIZA_CGROUP_PROFILE_ID=cgroup-v2-default",
+		"RHIZA_KERNEL_RELEASE=6.1.0",
+		"RHIZA_APP_IMAGE=repo/app@sha256:" + strings.Repeat("a", 64),
+		"RHIZA_OPERATOR_IMAGE=repo/operator@sha256:" + strings.Repeat("b", 64),
+		"RHIZA_OUT=" + out,
+	}
+	output, err := command.CombinedOutput()
+	if err == nil {
+		t.Fatalf("run phase accepted a missing privileged-install credential: %s", output)
+	}
+	if exit, ok := err.(*exec.ExitError); !ok || exit.ExitCode() != 2 {
+		t.Fatalf("run phase exit = %v, want status 2; output: %s", err, output)
+	}
+	if !strings.Contains(string(output), "missing privileged-install credential") {
+		t.Fatalf("run phase failed before the privileged-install credential gate: %s", output)
+	}
+}
+
 func TestIAMProbePodIdentityRejectsPrivilegeMutation(t *testing.T) {
 	jq, err := exec.LookPath("jq")
 	if err != nil {

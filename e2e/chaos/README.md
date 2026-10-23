@@ -63,6 +63,21 @@ The CI workflow contains the exact image and cluster setup commands. The harness
 creates namespace `rhiza-chaos`; delete the disposable cluster after collecting
 results. Do not run it against a shared cluster.
 
+## Anchor Kind contract scope
+
+The `anchor-operator-chaos` Kind job currently reports only
+`SUPPORTED-NEGATIVE`. Its valid anchor ConfigMap and anchor service are paired
+with the fixture's MinIO/S3 archive and Kubernetes cooperative fencer. That
+fencer does not implement canonical archive-fork registration, so the Operator
+must block before anchor activation, target reservation, StatefulSet mutation,
+or source-archive mutation. The harness checks those invariants and does not
+emit a recovery `PASS` event.
+
+This negative contract is not anchor recovery qualification. A positive anchor
+recovery scenario remains a follow-up for a real-GCS path that supplies the
+canonical authority store and verified archive-fork evidence; the current S3
+Kind fixture cannot claim that result.
+
 ## GCS post-release qualification
 
 The GCS/Chaos harness has no cloud defaults. Keep project, cluster, bucket,

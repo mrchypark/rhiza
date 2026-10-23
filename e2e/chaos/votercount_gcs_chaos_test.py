@@ -572,15 +572,5 @@ class LauncherDigestTest(unittest.TestCase):
                                 capture_output=True, text=True, timeout=30)
         self.assertEqual(result.returncode, 0, result.stderr)
 
-    def test_runtime_phase_requires_the_privileged_install_credential(self):
-        output = tempfile.mkdtemp()
-        env = dict(os.environ, **self.BASE, RHIZA_OUT=output,
-                   RHIZA_APP_IMAGE="repo@sha256:" + "a" * 64)
-        result = subprocess.run(["sh", str(HERE / "run-votercount-gcs-chaos.sh"), "run"],
-                                env=env, capture_output=True, text=True, timeout=30)
-        self.assertEqual(result.returncode, 2)
-        self.assertIn("missing privileged-install credential", result.stderr)
-
-
 if __name__ == "__main__":
     unittest.main()

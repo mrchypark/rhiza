@@ -95,11 +95,11 @@ jobs:
           cache: true
       - name: Check focused rollback, IAM, manifest, and recovery fixtures
         run: |
-          embedded_tests='^(TestIndependentRollbackReconcilesInterruptedCreateMarkers|TestRollbackMarkerGateCoversEveryIndependentAndCIWrite|TestIndependentGCSChaosManifestContract|TestGCSIAM.*)$'
+          embedded_tests='^(TestIndependentRollbackReconcilesInterruptedCreateMarkers|TestRollbackMarkerGateCoversEveryIndependentAndCIWrite|TestIndependentGCSChaosManifestContract|TestVoterCountLauncherRunRequiresPrivilegedInstallCredential|TestGCSIAM.*)$'
           go test ./e2e/chaos/embedded-go -run "$embedded_tests" -count=1 -timeout=5m
-          go test ./pkg/fencing ./pkg/operator ./pkg/recovery ./internal/objstore ./e2e/fencing -count=1 -timeout=5m
+          go test ./pkg/fencing ./pkg/fencing/cri ./pkg/operator ./pkg/recovery ./internal/objstore ./e2e/fencing -count=1 -timeout=5m
           go test -race ./e2e/chaos/embedded-go -run "$embedded_tests" -count=1 -timeout=5m
-          go test -race ./pkg/fencing ./pkg/operator ./pkg/recovery ./internal/objstore ./e2e/fencing -count=1 -timeout=5m
+          go test -race ./pkg/fencing ./pkg/fencing/cri ./pkg/operator ./pkg/recovery ./internal/objstore ./e2e/fencing -count=1 -timeout=5m
 
   cooperative-fencing:
     if: github.event_name != 'workflow_dispatch' || !inputs.fixture_only
@@ -705,7 +705,9 @@ jobs:
           kind load docker-image rhiza-chaos:local rhiza-operator-chaos:local rhiza-anchor-service:local --name rhiza-anchor-chaos
       - name: Fencing executor regression checks
         run: python3 e2e/chaos/kind_fencer_test.py
-      - name: Inject faults and verify anchor-gated recovery
+      - name: Check anchored cooperative profile contract
+        run: go test ./pkg/operator -run '^TestAnchoredCooperativeRecoveryBlocksBeforeArchiveOrAnchorEffects$' -count=1 -timeout=5m
+      - name: Verify supported-negative S3/Kubernetes anchor behavior
         run: python3 -u e2e/chaos/anchor_recovery.py --embedded-host go
       - name: Collect cluster diagnostics
         if: always()
