@@ -2,7 +2,15 @@ package operator
 
 import (
 	"context"
+	"encoding/base64"
+	"encoding/json"
+	"net/http"
+	"net/http/httptest"
+	"os"
+	"strings"
 	"testing"
+
+	"gopkg.in/yaml.v3"
 )
 
 func TestNoPVCUsesEffectiveDataMount(t *testing.T) {
@@ -62,5 +70,82 @@ func TestEnvironmentReadsNameOnlyClearingOverride(t *testing.T) {
 	// An unresolved dynamic source is still an error for any other key.
 	if _, err := c.environment(context.Background(), object{"env": []any{object{"name": "RHIZA_OBJSTORE_PREFIX", "valueFrom": object{"fieldRef": object{"fieldPath": "metadata.labels[archive]"}}}}}); err == nil {
 		t.Fatal("unresolved archive namespace accepted")
+	}
+}
+
+func TestEnvironmentResolvesAppliedSupervisedPatch(t *testing.T) {
+	data, err := os.ReadFile("../../deploy/operator/fencing/supervised-statefulset.patch.yaml")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var patch object
+	if err := yaml.NewDecoder(strings.NewReader(string(data))).Decode(&patch); err != nil {
+		t.Fatal(err)
+	}
+	ctr, err := container(patch, "rhiza")
+	if err != nil {
+		t.Fatal(err)
+	}
+	api := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		var body object
+		switch r.URL.Path {
+		case "/api/v1/namespaces/test/configmaps/rhiza-config":
+			body = object{"data": object{"RHIZA_CLUSTER_ID": "chaos-source"}}
+		case "/api/v1/namespaces/test/secrets/rhiza-peer-credentials":
+			body = object{"data": object{"RHIZA_PEER_TOKENS": base64.StdEncoding.EncodeToString([]byte("{}"))}}
+		default:
+			http.NotFound(w, r)
+			return
+		}
+		_ = json.NewEncoder(w).Encode(body)
+	}))
+	defer api.Close()
+
+	token := t.TempDir() + "/token"
+	if err := os.WriteFile(token, []byte("test-token"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	c := &Controller{Kube: &Kubernetes{BaseURL: api.URL, Namespace: "test", TokenFile: token, Client: api.Client()}}
+	env, err := c.environment(context.Background(), ctr)
+	if err != nil {
+		t.Fatalf("applied supervised patch environment was rejected: %v", err)
+	}
+	if env["RHIZA_CLUSTER_ID"] != "chaos-source" {
+		t.Fatalf("resolved source cluster ID = %q", env["RHIZA_CLUSTER_ID"])
+	}
+	if _, ok := env["RHIZA_POD_NAME"]; ok {
+		t.Fatal("Pod-name downward API value must remain kubelet-resolved, not enter static configuration")
+	}
+}
+
+func TestEnvironmentOnlyAllowsValidatedPodNameFieldRef(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		field   object
+		wantErr bool
+	}{
+		{name: "omitted API version", field: object{"fieldPath": "metadata.name"}},
+		{name: "core v1 API version", field: object{"apiVersion": "v1", "fieldPath": "metadata.name"}},
+		{name: "other field", field: object{"fieldPath": "metadata.namespace"}, wantErr: true},
+		{name: "unsupported API version", field: object{"apiVersion": "v2", "fieldPath": "metadata.name"}, wantErr: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			c := &Controller{}
+			ctr := object{"env": []any{object{"name": "RHIZA_POD_NAME", "valueFrom": object{"fieldRef": tc.field}}}}
+			env, err := c.environment(context.Background(), ctr)
+			if tc.wantErr {
+				if err == nil {
+					t.Fatal("invalid Pod-name fieldRef accepted")
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("valid Pod-name fieldRef rejected: %v", err)
+			}
+			if _, ok := env["RHIZA_POD_NAME"]; ok {
+				t.Fatal("Pod-name fieldRef should be left for kubelet resolution")
+			}
+		})
 	}
 }

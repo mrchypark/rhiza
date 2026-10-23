@@ -103,6 +103,12 @@ func (c *Controller) environment(ctx context.Context, container object) (map[str
 			if name == "RHIZA_NODE_ID" && str(nested(from, "fieldRef", "fieldPath")) == "metadata.name" {
 				continue
 			}
+			if name == "RHIZA_POD_NAME" && str(nested(from, "fieldRef", "fieldPath")) == "metadata.name" {
+				apiVersion := str(nested(from, "fieldRef", "apiVersion"))
+				if apiVersion == "" || apiVersion == "v1" {
+					continue
+				}
+			}
 			return nil, fmt.Errorf("unsupported dynamic Rhiza environment source")
 		}
 		for _, kind := range []string{"secretKeyRef", "configMapKeyRef"} {
