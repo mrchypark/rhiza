@@ -214,6 +214,7 @@ func (e *FencingExecutor) registerArchiveEmptyRecovery(ctx context.Context, requ
 				return ArchiveEmptyRecoveryResponse{}, errors.Join(bindErr, fmt.Errorf("fencing: absent source membership lacks its exact manual CONTROL binding"))
 			}
 			sourceRecord = recovery.NewMembershipRecord(sourceID, sourceVoters, sourceDurability)
+			err = nil // The missing source record is expected after the exact manual binding succeeds.
 		} else if request.ManualMembershipBindingDigest != "" {
 			return ArchiveEmptyRecoveryResponse{}, fmt.Errorf("fencing: manual binding supplied without persisted opt-in")
 		} else {
