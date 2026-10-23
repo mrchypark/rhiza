@@ -843,18 +843,35 @@ func TestManualMissingSourceMembershipRejectsMalformedOrUnavailableRecord(t *tes
 			child.Spec.AllowMissingSourceMembership = true
 			child.Status.SpecHash = immutableSpecHash(child.Spec)
 			persistTestRecovery(t, f, child)
+			readErrorHits := 0
 			if name == "malformed-record" {
 				if err := f.archive.Upload(t.Context(), "root/source/voters/membership.json", strings.NewReader("{")); err != nil {
 					t.Fatal(err)
 				}
 			} else {
-				f.e.ArchiveBucket = membershipReadErrorBucket{Bucket: f.archive, key: "root/source/voters/membership.json"}
+				controller.Bucket = membershipReadErrorBucket{Bucket: f.archive, key: "root/source/voters/membership.json", readErrorHits: &readErrorHits}
 			}
 			manualController := *controller
 			manualController.Automatic = false
-			err := manualController.reconcile(t.Context(), &child)
-			if err == nil && child.Status.Phase != "Blocked" {
-				t.Fatalf("manual recovery accepted %s as definitive membership absence: status=%+v", name, child.Status)
+			for step := 0; step < 6 && child.Status.Phase != "Blocked"; step++ {
+				if err := manualController.reconcile(t.Context(), &child); err != nil {
+					t.Fatalf("manual recovery step %d for %s: %v", step+1, name, err)
+				}
+				if child.Status.Phase != "Blocked" && child.Status.Phase != "Recovering" {
+					t.Fatalf("manual recovery left the expected preflight lifecycle while checking %s: status=%+v", name, child.Status)
+				}
+			}
+			if child.Status.Phase != "Blocked" {
+				t.Fatalf("manual recovery did not reach the membership preflight rejection for %s: status=%+v", name, child.Status)
+			}
+			wantMessage := "source membership history unavailable"
+			if name == "malformed-record" {
+				wantMessage = "source membership or durability history is invalid"
+			} else if readErrorHits == 0 {
+				t.Fatalf("membership read-error fixture never intercepted the controller's source-membership read: status=%+v", child.Status)
+			}
+			if !strings.Contains(child.Status.Message, wantMessage) {
+				t.Fatalf("manual recovery blocked before the expected %s membership guard: message=%q status=%+v", name, child.Status.Message, child.Status)
 			}
 			if child.Status.ManualMembershipBindingDigest != "" || child.Status.Target != "" || child.Status.Stage != "" {
 				t.Fatalf("invalid membership evidence advanced or bound manual recovery: %+v", child.Status)
@@ -1117,11 +1134,15 @@ func activateBootstrapTargetFixture(t *testing.T, f automaticBootstrapGenesisFix
 
 type membershipReadErrorBucket struct {
 	objstore.Bucket
-	key string
+	key           string
+	readErrorHits *int
 }
 
 func (b membershipReadErrorBucket) Get(ctx context.Context, name string) (io.ReadCloser, error) {
 	if name == b.key {
+		if b.readErrorHits != nil {
+			*b.readErrorHits++
+		}
 		return nil, errors.New("injected membership read failure")
 	}
 	return b.Bucket.Get(ctx, name)
