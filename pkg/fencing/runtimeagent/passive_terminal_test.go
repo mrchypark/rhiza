@@ -99,6 +99,17 @@ func TestPassiveTerminalObservationIsDurableBeforeFreshRequestReceipt(t *testing
 	if err := service.verify(binding, request, receipt); err != nil {
 		t.Fatalf("persisted passive receipt did not verify: %v", err)
 	}
+	changed := request
+	changed.RequestHash = strings.Repeat("e", 64)
+	if _, err := service.stop(t.Context(), binding, changed); err == nil {
+		t.Fatal("different request reused the persisted passive receipt")
+	}
+	if err := service.verify(binding, changed, receipt); err == nil {
+		t.Fatal("passive receipt verified for a different request hash")
+	}
+	if err := service.verify(binding, request, receipt); err != nil {
+		t.Fatalf("conflicting request invalidated the original durable receipt: %v", err)
+	}
 }
 
 func TestInvalidPassiveObservationCannotBecomeReceiptOrSkipNormalStop(t *testing.T) {
@@ -142,10 +153,6 @@ func TestPassiveObservationWriteFailureRetainsProofUntilDurableRetry(t *testing.
 	}
 	defer service.Close()
 	backend.service = service
-	binding, err := service.enroll(t.Context(), testBaseBinding())
-	if err != nil {
-		t.Fatal(err)
-	}
 	var attempts atomic.Int32
 	var failedBeforeComplete atomic.Bool
 	service.writeRecord = func(key string, state record) error {
@@ -154,6 +161,10 @@ func TestPassiveObservationWriteFailureRetainsProofUntilDurableRetry(t *testing.
 			return errors.New("injected durable-write failure")
 		}
 		return service.write(key, state)
+	}
+	binding, err := service.enroll(t.Context(), testBaseBinding())
+	if err != nil {
+		t.Fatal(err)
 	}
 	deadline := time.Now().Add(5 * time.Second)
 	for time.Now().Before(deadline) {
@@ -181,14 +192,14 @@ func TestPassiveObservationExhaustedWriteRetriesRemainRecoverable(t *testing.T) 
 	}
 	defer service.Close()
 	backend.service = service
-	binding, err := service.enroll(t.Context(), testBaseBinding())
-	if err != nil {
-		t.Fatal(err)
-	}
 	var attempts atomic.Int32
 	service.writeRecord = func(string, record) error {
 		attempts.Add(1)
 		return errors.New("injected persistent durable-write failure")
+	}
+	binding, err := service.enroll(t.Context(), testBaseBinding())
+	if err != nil {
+		t.Fatal(err)
 	}
 	deadline := time.Now().Add(5 * time.Second)
 	watchStopped := false
@@ -211,7 +222,14 @@ func TestPassiveObservationExhaustedWriteRetriesRemainRecoverable(t *testing.T) 
 	if err != nil || state.PassiveObservation != nil || state.Stop != nil || len(state.Receipt) != 0 {
 		t.Fatalf("failed persistence altered durable stop state: %+v err=%v", state, err)
 	}
+	key := enrollmentKey(binding)
+	service.mu.Lock()
+	if service.watching[key] {
+		service.mu.Unlock()
+		t.Fatal("passive watcher was still active before restoring durable writes")
+	}
 	service.writeRecord = service.write
+	service.mu.Unlock()
 	request := fencing.StopRequest{OperationID: "fresh-stop-after-retry", RequestHash: strings.Repeat("d", 64), Identity: fencing.Identity{SourceClusterID: binding.SourceClusterID, NodeID: binding.NodeID, PodUID: binding.PodUID, RunID: binding.RunID}}
 	if _, err := service.stop(t.Context(), binding, request); err != nil {
 		t.Fatalf("retained passive session was not recoverable through a fresh stop: %v", err)

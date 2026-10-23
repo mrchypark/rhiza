@@ -826,7 +826,7 @@ func (e *FencingExecutor) frozenSourcePreflight(ctx context.Context, request Fro
 			return FrozenSourcePreflightResponse{}, err
 		}
 		env, err := e.controller().environment(ctx, ctr)
-		if err != nil || noPVC(sts, ctr, env) != nil || e.controller().storeConfigMatches(env) != nil {
+		if err != nil || noPVC(sts, ctr, env) != nil || e.archiveStoreConfigMatches(env) != nil {
 			return FrozenSourcePreflightResponse{}, errors.Join(err, fmt.Errorf("fencing: manual source workload configuration is unavailable or unsafe"))
 		}
 		manualDigest, missing, err := e.manualMissingSourceMembershipBinding(ctx, persisted, env, archiveScope, state, fence)
