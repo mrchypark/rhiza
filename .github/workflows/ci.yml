@@ -706,6 +706,12 @@ jobs:
           docker run --rm --entrypoint /bin/sh rhiza-chaos:local -ec 'command -v kubectl >/dev/null && command -v date >/dev/null && command -v sleep >/dev/null && kubectl version --client --output=yaml'
           kind create cluster --name rhiza-anchor-chaos --wait 120s
           kind load docker-image rhiza-chaos:local rhiza-operator-chaos:local rhiza-anchor-service:local --name rhiza-anchor-chaos
+      - name: Exercise namespace expiry and owned RBAC garbage collection
+        env:
+          RHIZA_NAMESPACE_EXPIRY_KIND_TEST: "1"
+          RHIZA_NAMESPACE_EXPIRY_KIND_CONTEXT: kind-rhiza-anchor-chaos
+          RHIZA_NAMESPACE_EXPIRY_KIND_IMAGE: rhiza-chaos:local
+        run: go test ./e2e/chaos/embedded-go -run '^TestNamespaceExpiryDeletesOwnedNamespaceInKind$' -count=1 -timeout=4m
       - name: Fencing executor regression checks
         run: python3 e2e/chaos/kind_fencer_test.py
       - name: Check anchored cooperative profile contract
