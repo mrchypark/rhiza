@@ -25,17 +25,24 @@ import (
 
 func TestArchiveForkRegistrationRequiresConfiguredControllerToken(t *testing.T) {
 	for _, tc := range []struct {
-		name     string
-		username string
-		want     int
+		name                  string
+		username              string
+		authenticated         bool
+		responseAudiences     []string
+		want                  int
+		wantNoDownstreamCalls bool
 	}{
-		{name: "controller principal", username: "system:serviceaccount:test:rhiza-operator", want: http.StatusConflict},
-		{name: "source workload principal", username: "system:serviceaccount:test:rhiza-fencer", want: http.StatusForbidden},
-		{name: "other controller", username: "system:serviceaccount:test:other", want: http.StatusForbidden},
+		{name: "controller principal", username: "system:serviceaccount:test:rhiza-operator", authenticated: true, responseAudiences: []string{"rhiza-fencer"}, want: http.StatusConflict},
+		{name: "source workload principal", username: "system:serviceaccount:test:rhiza-fencer", authenticated: true, responseAudiences: []string{"rhiza-fencer"}, want: http.StatusForbidden, wantNoDownstreamCalls: true},
+		{name: "other controller", username: "system:serviceaccount:test:other", authenticated: true, responseAudiences: []string{"rhiza-fencer"}, want: http.StatusForbidden, wantNoDownstreamCalls: true},
+		{name: "unauthenticated token review", username: "system:serviceaccount:test:rhiza-operator", authenticated: false, responseAudiences: []string{"rhiza-fencer"}, want: http.StatusForbidden, wantNoDownstreamCalls: true},
+		{name: "wrong token review audience", username: "system:serviceaccount:test:rhiza-operator", authenticated: true, responseAudiences: []string{"other-audience"}, want: http.StatusForbidden, wantNoDownstreamCalls: true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
+			downstreamRequests := 0
 			api := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 				if r.URL.Path != "/apis/authentication.k8s.io/v1/tokenreviews" || r.Method != http.MethodPost {
+					downstreamRequests++
 					http.NotFound(w, r)
 					return
 				}
@@ -46,8 +53,8 @@ func TestArchiveForkRegistrationRequiresConfiguredControllerToken(t *testing.T) 
 					t.Errorf("TokenReview audience = %v, want rhiza-fencer", audiences)
 				}
 				_ = json.NewEncoder(w).Encode(object{"status": object{
-					"authenticated": true,
-					"audiences":     []string{"rhiza-fencer"},
+					"authenticated": tc.authenticated,
+					"audiences":     tc.responseAudiences,
 					"user":          object{"username": tc.username},
 				}})
 			}))
@@ -67,6 +74,9 @@ func TestArchiveForkRegistrationRequiresConfiguredControllerToken(t *testing.T) 
 			e.Handler().ServeHTTP(recorder, req)
 			if recorder.Code != tc.want {
 				t.Fatalf("HTTP status = %d, want %d; body=%q", recorder.Code, tc.want, recorder.Body.String())
+			}
+			if tc.wantNoDownstreamCalls && downstreamRequests != 0 {
+				t.Fatalf("rejected TokenReview reached %d downstream Kubernetes requests", downstreamRequests)
 			}
 		})
 	}
