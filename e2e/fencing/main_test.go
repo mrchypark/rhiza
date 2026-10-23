@@ -590,10 +590,11 @@ func TestAsyncNonemptyLauncherRequiresDedicatedNativeScenarioAndProjection(t *te
 	asyncStart := strings.Index(source, "if [ \"$async_nonempty\" = yes ]; then\n  : \"${FENCING_E2E_BIN:?async-nonempty qualification requires the fencing-e2e driver}\"\n")
 	nativeDispatch := strings.Index(source, "step 30-async-nonempty-collector env")
 	nativeInvocation := strings.Index(source, `"$FENCING_E2E_BIN" run-gcs-ha-async-nonempty`)
+	manualStart := strings.Index(source, "if [ \"$manual_terminal\" = yes ]; then\n  : \"${FENCING_E2E_BIN:?manual-terminal qualification requires the fencing-e2e driver}\"")
 	legacyPython := strings.Index(source, "step 30-driver python3 -u")
-	branchExit := strings.Index(source, "echo 'nonempty async GCS quorum-loss and exact archived-tip recovery collector completed'\n  exit 0\nfi\nstep 30-driver python3 -u")
+	branchExit := strings.Index(source, "echo 'nonempty async GCS quorum-loss and exact archived-tip recovery collector completed'\n  exit 0\nfi")
 	if asyncStart < 0 || nativeDispatch < asyncStart || nativeInvocation < nativeDispatch ||
-		branchExit < nativeInvocation || legacyPython < branchExit {
+		branchExit < nativeInvocation || manualStart < branchExit || legacyPython < manualStart {
 		t.Fatal("async-nonempty scenario must dispatch through the native driver before the legacy Python scenario path")
 	}
 }
