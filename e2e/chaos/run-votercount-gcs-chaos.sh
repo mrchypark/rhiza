@@ -76,6 +76,15 @@ case "$initial_head_ack_loss" in
   no|yes) ;;
   *) echo 'RHIZA_GCS_INITIAL_HEAD_ACK_LOSS must be yes or no' >&2; exit 2 ;;
 esac
+async_nonempty=${RHIZA_GCS_ASYNC_NONEMPTY:-no}
+case "$async_nonempty" in
+  no|yes) ;;
+  *) echo 'RHIZA_GCS_ASYNC_NONEMPTY must be yes or no' >&2; exit 2 ;;
+esac
+[ "$initial_head_ack_loss" != yes ] || [ "$async_nonempty" != yes ] || {
+  echo 'initial-HEAD ACK-loss and async-nonempty qualifications require separate run scopes' >&2
+  exit 2
+}
 
 require_digest() {
   value=$2
@@ -102,6 +111,17 @@ if [ -n "$RHIZA_QUALIFIED_SANDBOX_EXECUTABLE_SHA256" ]; then
 fi
 
 here=$(cd -- "$(dirname -- "$0")" && pwd)
+source_head=
+if [ "$async_nonempty" = yes ]; then
+  source_head=$(git -C "$here/../.." rev-parse --verify HEAD) || {
+    echo 'async-nonempty qualification requires a readable source revision' >&2
+    exit 2
+  }
+  printf '%s\n' "$source_head" | LC_ALL=C grep -Eq '^[a-f0-9]{40}$' || {
+    echo 'async-nonempty source revision is not a full lowercase Git SHA' >&2
+    exit 2
+  }
+fi
 out=${RHIZA_OUT:-$PWD/votercount-gcs-chaos-results}
 gcs_service_account=$RHIZA_DATA_GSA_ID@$RHIZA_GCP_PROJECT_ID.iam.gserviceaccount.com
 readonly_workload_gsa=$RHIZA_READONLY_WORKLOAD_GSA_ID@$RHIZA_GCP_PROJECT_ID.iam.gserviceaccount.com
@@ -341,6 +361,26 @@ cleanup() {
       [ "$exit_status" -ne 0 ] || exit_status=1
     fi
   fi
+  if [ "$mode" = run ] && [ "$async_nonempty" = yes ]; then
+    artifact_error=
+    if [ -z "${FENCING_E2E_BIN:-}" ] || [ ! -x "$FENCING_E2E_BIN" ]; then
+      artifact_error='fencing-e2e driver is unavailable'
+    elif [ -z "$source_head" ]; then
+      artifact_error='source revision was not captured'
+    else
+      printf '%s\n' "$exit_status" > "$out/actual-exit.txt" || artifact_error='actual exit receipt could not be written'
+      printf '%s\n' "$source_head" > "$out/source-head.txt" || artifact_error='source revision receipt could not be written'
+      printf '%s\n%s\n' "$RHIZA_APP_IMAGE" "$RHIZA_OPERATOR_IMAGE" > "$out/image-ids.txt" || artifact_error='immutable image receipt could not be written'
+      if [ -z "$artifact_error" ] && ! FENCING_E2E_OUT="$out" FENCING_E2E_QUALIFICATION=gcs-async-nonempty \
+        "$FENCING_E2E_BIN" safe-artifacts; then
+        artifact_error='strict async-nonempty artifact projection failed'
+      fi
+    fi
+    if [ -n "$artifact_error" ]; then
+      echo "async-nonempty artifact finalization failed: $artifact_error" >&2
+      [ "$exit_status" -ne 0 ] || exit_status=1
+    fi
+  fi
   rm -f "$out/.admin-token.tmp"
   if [ "$remove_admin_token" = true ]; then rm -f "$admin_token_file"; fi
   if [ -n "$tls_tmp" ]; then
@@ -379,14 +419,14 @@ render() {
       -e "s|__HOST_IMAGE__|$RHIZA_APP_IMAGE|g" \
       -e "s|__OPERATOR_IMAGE__|$RHIZA_OPERATOR_IMAGE|g" \
       "$here/votercount_gcs_chaos.yaml.in" > "$out/rendered.yaml"
-  if [ "$initial_head_ack_loss" = yes ]; then
+  if [ "$initial_head_ack_loss" = yes ] || [ "$async_nonempty" = yes ]; then
     initial_render="$out/rendered.initial-head.tmp"
     sed -e 's/RHIZA_OBJSTORE_DURABILITY: before-ack/RHIZA_OBJSTORE_DURABILITY: async/' \
       -e 's/allowDataLoss: false/allowDataLoss: true/' \
       "$out/rendered.yaml" > "$initial_render"
     [ "$(grep -c 'RHIZA_OBJSTORE_DURABILITY: async' "$initial_render")" -eq 1 ] &&
       [ "$(grep -c 'allowDataLoss: true' "$initial_render")" -eq 1 ] || {
-        echo 'initial-HEAD mode did not render explicit async data-loss policy' >&2
+        echo 'async GCS qualification did not render its explicit async data-loss policy' >&2
         exit 2
       }
     mv "$initial_render" "$out/rendered.yaml"
@@ -1025,6 +1065,16 @@ if [ "$initial_head_ack_loss" = yes ]; then
     RHIZA_GCS_PREFIX="$RHIZA_GCS_PREFIX" RHIZA_CLUSTER_ID="$RHIZA_CLUSTER_ID" \
     RHIZA_GCS_INITIAL_HEAD_ACK_LOSS=yes "$FENCING_E2E_BIN" run-gcs-ha-initial-head-ack-loss
   echo 'initial canonical HEAD GCS/Chaos qualification collector completed'
+  exit 0
+fi
+if [ "$async_nonempty" = yes ]; then
+  : "${FENCING_E2E_BIN:?async-nonempty qualification requires the fencing-e2e driver}"
+  [ -x "$FENCING_E2E_BIN" ] || { echo 'FENCING_E2E_BIN is not executable' >&2; exit 2; }
+  step 30-async-nonempty-collector env FENCING_E2E_OUT="$out" RHIZA_KUBE_CONTEXT="$RHIZA_KUBE_CONTEXT" \
+    RHIZA_NAMESPACE="$RHIZA_NAMESPACE" RHIZA_RUN_ID="$RHIZA_RUN_ID" RHIZA_GCS_BUCKET="$RHIZA_GCS_BUCKET" \
+    RHIZA_GCS_PREFIX="$RHIZA_GCS_PREFIX" RHIZA_CLUSTER_ID="$RHIZA_CLUSTER_ID" \
+    "$FENCING_E2E_BIN" run-gcs-ha-async-nonempty
+  echo 'nonempty async GCS quorum-loss and exact archived-tip recovery collector completed'
   exit 0
 fi
 step 30-driver python3 -u "$here/votercount_gcs_chaos.py" \

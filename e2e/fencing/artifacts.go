@@ -1129,11 +1129,20 @@ func safeArtifacts(raw string) error {
 	if raw == "" {
 		return fmt.Errorf("FENCING_E2E_OUT is required")
 	}
+	qualification := os.Getenv("FENCING_E2E_QUALIFICATION")
+	if qualification != "" && qualification != "gcs-async-nonempty" {
+		return fmt.Errorf("artifact qualification selector is unsupported")
+	}
 	exitData, err := os.ReadFile(filepath.Join(raw, "actual-exit.txt"))
 	if err != nil {
 		return err
 	}
-	failedRun := strings.TrimSpace(string(exitData)) != "0"
+	exitText := strings.TrimSpace(string(exitData))
+	exitCode, err := strconv.ParseUint(exitText, 10, 8)
+	if err != nil || strconv.FormatUint(exitCode, 10) != exitText {
+		return fmt.Errorf("invalid public exit receipt")
+	}
+	failedRun := exitCode != 0
 	public := filepath.Join(raw, "public")
 	if err := os.Mkdir(public, 0700); err != nil {
 		return err
@@ -1145,6 +1154,11 @@ func safeArtifacts(raw string) error {
 	for _, entry := range entries {
 		name := entry.Name()
 		if entry.IsDir() {
+			continue
+		}
+		if qualification == "gcs-async-nonempty" && (name == "runtime-profile.json" || name == "runtime-component-probe.json") {
+			// These receipts describe the disposable Kind component probe, not
+			// the independently qualified GCS scenario.
 			continue
 		}
 		if entry.Type()&os.ModeSymlink != 0 {
@@ -1208,15 +1222,15 @@ func safeArtifacts(raw string) error {
 			if len(lines) == 0 || name != "image-ids.txt" && len(lines) != 1 {
 				return fmt.Errorf("missing or ambiguous public identity receipt")
 			}
+			if name == "image-ids.txt" && qualification == "gcs-async-nonempty" && len(lines) != 2 {
+				return fmt.Errorf("async-nonempty qualification requires both immutable workload image references")
+			}
 			for i, line := range lines {
 				if name == "actual-exit.txt" {
-					if line != "0" && line != "1" && line != "130" && line != "143" {
-						return fmt.Errorf("invalid public exit receipt")
-					}
 					continue
 				}
 				if name == "source-head.txt" {
-					if len(line) != 40 {
+					if len(line) != 40 || strings.ToLower(line) != line {
 						return fmt.Errorf("invalid public source SHA")
 					}
 					if _, e := hex.DecodeString(line); e != nil {
@@ -1247,13 +1261,21 @@ func safeArtifacts(raw string) error {
 	if err != nil {
 		return err
 	}
+	if asyncNonemptySeen && qualification != "gcs-async-nonempty" {
+		return fmt.Errorf("async-nonempty evidence requires its explicit artifact qualification selector")
+	}
+	if qualification == "gcs-async-nonempty" && !failedRun && !asyncNonemptySeen {
+		return fmt.Errorf("successful async-nonempty artifact set is missing its required scenario evidence")
+	}
 	ackLossSeen, err := projectGCSAckLossEvidence(raw, public, failedRun)
 	if err != nil {
 		return err
 	}
 	required := []string{"actual-exit.txt", "source-head.txt", "image-ids.txt"}
 	if !failedRun {
-		required = append(required, "runtime-profile.json", "runtime-component-probe.json")
+		if qualification != "gcs-async-nonempty" {
+			required = append(required, "runtime-profile.json", "runtime-component-probe.json")
+		}
 		if asyncEmptySeen {
 			required = append(required, gcsAsyncEmptySummaryName)
 		}

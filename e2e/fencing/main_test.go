@@ -553,6 +553,34 @@ exit 23
 	}
 }
 
+func TestAsyncNonemptyLauncherRequiresDedicatedNativeScenarioAndProjection(t *testing.T) {
+	launcher, err := os.ReadFile("../chaos/run-votercount-gcs-chaos.sh")
+	if err != nil {
+		t.Fatal(err)
+	}
+	source := string(launcher)
+	for _, required := range []string{
+		"async_nonempty=${RHIZA_GCS_ASYNC_NONEMPTY:-no}",
+		"[ \"$initial_head_ack_loss\" != yes ] || [ \"$async_nonempty\" != yes ]",
+		"[ \"$initial_head_ack_loss\" = yes ] || [ \"$async_nonempty\" = yes ]; then",
+		"run-gcs-ha-async-nonempty",
+		"FENCING_E2E_QUALIFICATION=gcs-async-nonempty",
+		"actual-exit.txt",
+		"source-head.txt",
+		"image-ids.txt",
+		"strict async-nonempty artifact projection failed",
+	} {
+		if !strings.Contains(source, required) {
+			t.Fatalf("async-nonempty launcher contract is missing %q", required)
+		}
+	}
+	asyncStart := strings.Index(source, "if [ \"$async_nonempty\" = yes ]; then\n    : \"${FENCING_E2E_BIN:?async-nonempty")
+	pythonStart := strings.Index(source, "step 30-driver python3 -u")
+	if asyncStart < 0 || pythonStart < 0 || asyncStart >= pythonStart {
+		t.Fatal("async-nonempty scenario must dispatch through the native driver before the legacy Python scenario path")
+	}
+}
+
 func TestScratchAcceptsAPIOmittedFalsePIDOptionsOnly(t *testing.T) {
 	// Matches API serialization: default-false hostPID is omitted, not emitted
 	// as false; all nondefault security and scratch-volume fields are retained.

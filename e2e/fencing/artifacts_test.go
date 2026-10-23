@@ -543,16 +543,15 @@ func decodeAckLossRecovery(data obj, target any) error {
 }
 
 func TestAsyncNonemptyPublicProjectionHashesPrivateEvidenceWithoutScopeIdentifiers(t *testing.T) {
+	t.Setenv("FENCING_E2E_QUALIFICATION", "gcs-async-nonempty")
 	const privateCanary = "private-project-bucket-prefix-endpoint-poduid-token-canary"
 	raw := t.TempDir()
 	for name, data := range map[string][]byte{
-		"actual-exit.txt":              []byte("0\n"),
-		"source-head.txt":              []byte(strings.Repeat("a", 40) + "\n"),
-		"image-ids.txt":                []byte("sha256:" + strings.Repeat("b", 64) + "\n"),
-		"runtime-profile.json":         encoded(runtimeProfileEvidence{}),
-		"runtime-component-probe.json": encoded(runtimeComponentEvidence{}),
-		gcsAsyncNonemptyEventsName:     []byte(`{"event":"private","value":"` + privateCanary + `"}` + "\n"),
-		gcsAsyncNonemptyEvidenceName:   asyncNonemptyPrivateEvidenceFixture(privateCanary),
+		"actual-exit.txt":            []byte("0\n"),
+		"source-head.txt":            []byte(strings.Repeat("a", 40) + "\n"),
+		"image-ids.txt":              []byte("registry.example/app@sha256:" + strings.Repeat("b", 64) + "\nregistry.example/operator@sha256:" + strings.Repeat("c", 64) + "\n"),
+		gcsAsyncNonemptyEventsName:   []byte(`{"event":"private","value":"` + privateCanary + `"}` + "\n"),
+		gcsAsyncNonemptyEvidenceName: asyncNonemptyPrivateEvidenceFixture(privateCanary),
 	} {
 		if err := os.WriteFile(filepath.Join(raw, name), data, 0600); err != nil {
 			t.Fatal(err)
@@ -581,6 +580,7 @@ func TestAsyncNonemptyPublicProjectionHashesPrivateEvidenceWithoutScopeIdentifie
 }
 
 func TestAsyncNonemptyArtifactAcceptsDistinctLowerGCSGeneration(t *testing.T) {
+	t.Setenv("FENCING_E2E_QUALIFICATION", "gcs-async-nonempty")
 	raw := t.TempDir()
 	var evidence obj
 	if err := json.Unmarshal(asyncNonemptyPrivateEvidenceFixture("private-scope"), &evidence); err != nil {
@@ -589,13 +589,11 @@ func TestAsyncNonemptyArtifactAcceptsDistinctLowerGCSGeneration(t *testing.T) {
 	sealed := evidence["sealedSourceHead"].(map[string]any)
 	sealed["version"] = "1000" // GCS generations are unique, not monotonic.
 	for name, data := range map[string][]byte{
-		"actual-exit.txt":              []byte("0\n"),
-		"source-head.txt":              []byte(strings.Repeat("a", 40) + "\n"),
-		"image-ids.txt":                []byte("sha256:" + strings.Repeat("b", 64) + "\n"),
-		"runtime-profile.json":         encoded(runtimeProfileEvidence{}),
-		"runtime-component-probe.json": encoded(runtimeComponentEvidence{}),
-		gcsAsyncNonemptyEventsName:     []byte("{}\n"),
-		gcsAsyncNonemptyEvidenceName:   encoded(evidence),
+		"actual-exit.txt":            []byte("0\n"),
+		"source-head.txt":            []byte(strings.Repeat("a", 40) + "\n"),
+		"image-ids.txt":              []byte("registry.example/app@sha256:" + strings.Repeat("b", 64) + "\nregistry.example/operator@sha256:" + strings.Repeat("c", 64) + "\n"),
+		gcsAsyncNonemptyEventsName:   []byte("{}\n"),
+		gcsAsyncNonemptyEvidenceName: encoded(evidence),
 	} {
 		if err := os.WriteFile(filepath.Join(raw, name), data, 0600); err != nil {
 			t.Fatal(err)
@@ -680,12 +678,13 @@ func TestAsyncNonemptyArtifactProjectionRejectsInvalidEvidenceAndUnknownFiles(t 
 }
 
 func TestFailedAsyncNonemptyRunPublishesOnlyHashOfPartialPrivateEvents(t *testing.T) {
+	t.Setenv("FENCING_E2E_QUALIFICATION", "gcs-async-nonempty")
 	const privateCanary = "private-partial-async-nonempty-scope"
 	raw := t.TempDir()
 	for name, data := range map[string][]byte{
-		"actual-exit.txt":          []byte("1\n"),
+		"actual-exit.txt":          []byte("124\n"),
 		"source-head.txt":          []byte(strings.Repeat("a", 40) + "\n"),
-		"image-ids.txt":            []byte("sha256:" + strings.Repeat("b", 64) + "\n"),
+		"image-ids.txt":            []byte("registry.example/app@sha256:" + strings.Repeat("b", 64) + "\nregistry.example/operator@sha256:" + strings.Repeat("c", 64) + "\n"),
 		gcsAsyncNonemptyEventsName: []byte(`{"event":"partial","private":"` + privateCanary + `"}` + "\n"),
 	} {
 		if err := os.WriteFile(filepath.Join(raw, name), data, 0600); err != nil {
@@ -702,6 +701,40 @@ func TestFailedAsyncNonemptyRunPublishesOnlyHashOfPartialPrivateEvents(t *testin
 	var summary gcsAsyncNonemptyPublicSummary
 	if err := json.Unmarshal(public, &summary); err != nil || summary.Outcome != "failed" || len(summary.PrivateEventsSHA256) != 64 {
 		t.Fatalf("failed-run async-nonempty summary is incomplete: %+v, %v", summary, err)
+	}
+}
+
+func TestAsyncNonemptySafeArtifactsRequiresExplicitSelectorAndEvidence(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		selector string
+		evidence bool
+	}{
+		{name: "evidence without selector", evidence: true},
+		{name: "successful selected run without scenario evidence", selector: "gcs-async-nonempty"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Setenv("FENCING_E2E_QUALIFICATION", tc.selector)
+			raw := t.TempDir()
+			files := map[string][]byte{
+				"actual-exit.txt": []byte("0\n"),
+				"source-head.txt": []byte(strings.Repeat("a", 40) + "\n"),
+				"image-ids.txt": []byte("registry.example/app@sha256:" + strings.Repeat("b", 64) + "\n" +
+					"registry.example/operator@sha256:" + strings.Repeat("c", 64) + "\n"),
+			}
+			if tc.evidence {
+				files[gcsAsyncNonemptyEventsName] = []byte("{}\n")
+				files[gcsAsyncNonemptyEvidenceName] = asyncNonemptyPrivateEvidenceFixture("private-scope")
+			}
+			for name, data := range files {
+				if err := os.WriteFile(filepath.Join(raw, name), data, 0600); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if err := safeArtifacts(raw); err == nil {
+				t.Fatal("accepted an unselected or evidence-free async-nonempty success")
+			}
+		})
 	}
 }
 
