@@ -152,6 +152,7 @@ func runManualTerminalFrozenForkRegistration(t *testing.T, durability string, al
 		f.f.mu.Unlock()
 	}
 	persistRecovery()
+	assertManualTerminalSourceWorkload(t, ctx, f.e, resource)
 
 	preflightRequest := FrozenSourcePreflightRequest{RecoveryName: resourceName(&resource), RecoveryUID: str(resource.Metadata["uid"])}
 	challengeResponse, err := f.e.frozenSourcePreflight(ctx, preflightRequest)
@@ -304,6 +305,7 @@ func configureManualFrozenForkCohort(t *testing.T, f archiveGenesisFixture, memb
 	}
 	container := asObject(list(nested(sts, "spec", "template", "spec", "containers"))[0])
 	container["env"] = env
+	container["volumeMounts"] = []any{object{"name": "data", "mountPath": "/data"}}
 	var targets []FenceTarget
 	pods := make([]any, 0, len(members))
 	for i, member := range members {
@@ -361,6 +363,7 @@ func configureManualFrozenForkCohort(t *testing.T, f archiveGenesisFixture, memb
 	}
 	asObject(nested(sts, "spec"))["replicas"] = float64(len(members))
 	asObject(nested(sts, "spec"))["volumeClaimTemplates"] = []any{}
+	asObject(nested(sts, "spec", "template", "spec"))["volumes"] = []any{object{"name": "data", "emptyDir": object{}}}
 	f.f.authStatefulSet = sts
 	f.f.mu.Lock()
 	f.f.objects["/apis/apps/v1/namespaces/test/statefulsets"] = object{"items": []any{sts}}
@@ -377,6 +380,37 @@ func configureManualFrozenForkCohort(t *testing.T, f archiveGenesisFixture, memb
 	f.f.authPod, f.f.authPodName, f.f.authPodUID = asObject(pods[0]), f.runtime.NodeID, f.runtime.PodUID
 	f.f.mu.Unlock()
 	return targets
+}
+
+// Assert the same live API lookup and source-workload predicates used by
+// manualTerminalPreflight before testing its challenge/approval lifecycle.
+// Error labels are synthetic; do not print workload environment values.
+func assertManualTerminalSourceWorkload(t *testing.T, ctx context.Context, e *FencingExecutor, resource Resource) {
+	t.Helper()
+	if e == nil || e.Kube == nil {
+		t.Fatal("manual terminal fixture source workload API client is unavailable")
+	}
+	sts, err := e.archiveForkStatefulSet(ctx, resource.Status.StatefulSetUID)
+	if err != nil {
+		t.Fatalf("manual terminal fixture API StatefulSet lookup failed: %v", err)
+	}
+	ctr, err := container(sts, resource.Spec.Container)
+	if err != nil {
+		t.Fatalf("manual terminal fixture database-container selection failed: %v", err)
+	}
+	env, err := e.controller().environment(ctx, ctr)
+	if err != nil {
+		t.Fatalf("manual terminal fixture environment resolution failed: %v", err)
+	}
+	if err := noPVC(sts, ctr, env); err != nil {
+		t.Fatalf("manual terminal fixture no-PVC/data-volume contract failed: %v", err)
+	}
+	if err := e.archiveStoreConfigMatches(env); err != nil {
+		t.Fatalf("manual terminal fixture archive identity contract failed: %v", err)
+	}
+	if resource.Status.FrozenBucketEnvironment == nil {
+		t.Fatal("manual terminal fixture persisted frozen archive environment is missing")
+	}
 }
 
 func (b *frozenRegistrarTrackingBucket) BucketAttrs(context.Context) (*storage.BucketAttrs, error) {
