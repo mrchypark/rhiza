@@ -254,6 +254,55 @@ func TestFrozenArchiveForkRegistrationCommitsAndRetriesWithoutSourceWrites(t *te
 	if err := tracked.Upload(ctx, lineageKey, bytes.NewReader(lineageData), objstore.WithIfNotExists()); err != nil {
 		t.Fatal(err)
 	}
+	// The fork result and lineage are decoded from separate canonical objects.
+	// Their FrozenSource pointers must therefore differ even when every field
+	// is identical; registration must compare the binding value, not addresses.
+	resultData, err := readBoundedArchiveObject(ctx, tracked, path.Join(targetPrefix, "fork/result.json"), 64<<10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var decodedResult recovery.ForkResult
+	if err := decodeCanonicalArchiveJSON(resultData, &decodedResult); err != nil {
+		t.Fatal(err)
+	}
+	decodedLineageData, err := readBoundedArchiveObject(ctx, tracked, lineageKey, 64<<10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var decodedLineage archiveForkLineageRecord
+	if err := decodeCanonicalArchiveJSON(decodedLineageData, &decodedLineage); err != nil {
+		t.Fatal(err)
+	}
+	if decodedResult.FrozenSource == nil || decodedLineage.Fork.FrozenSource == nil || decodedResult.FrozenSource == decodedLineage.Fork.FrozenSource {
+		t.Fatal("fork result and lineage must contain separately allocated frozen bindings")
+	}
+	if hashJSON(decodedResult.FrozenSource) != hashJSON(decodedLineage.Fork.FrozenSource) {
+		t.Fatal("independently decoded frozen bindings should have equal values")
+	}
+
+	// A separately allocated but tampered binding must be rejected by the real
+	// registration path, while the original exact lineage remains retryable.
+	tamperedBinding := *decodedLineage.Fork.FrozenSource
+	tamperedBinding.FenceProofDigest = strings.Repeat("0", 64)
+	decodedLineage.Fork.FrozenSource = &tamperedBinding
+	tamperedLineageData := jsonBytes(decodedLineage)
+	lineageAttrs, err := tracked.Attributes(ctx, lineageKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := tracked.Upload(ctx, lineageKey, bytes.NewReader(tamperedLineageData), objstore.WithIfMatch(lineageAttrs.Version)); err != nil {
+		t.Fatal(err)
+	}
+	if err := f.e.RegisterArchiveForkGenesis(ctx, request); err == nil || !strings.Contains(err.Error(), "fork lineage differs from verified artifacts") {
+		t.Fatalf("registration accepted a lineage with a different frozen binding: %v", err)
+	}
+	lineageAttrs, err = tracked.Attributes(ctx, lineageKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := tracked.Upload(ctx, lineageKey, bytes.NewReader(lineageData), objstore.WithIfMatch(lineageAttrs.Version)); err != nil {
+		t.Fatal(err)
+	}
 	targetScopeClaimKey := fencing.ArchiveScope{Provider: "gcs", Bucket: "archive", Prefix: targetPrefix, ClusterID: targetID}
 	wantRef, err := f.e.verifyArchiveForkArtifacts(ctx, request, sourceID, sourcePrefix, targetPrefix, targetScopeClaimKey, sourceMembers, "async", &fork.Source)
 	if err != nil {

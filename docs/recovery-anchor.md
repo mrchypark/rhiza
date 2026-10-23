@@ -127,6 +127,13 @@ Workload Pods must also set:
 The CRD fields `spec.anchorID` on `RhizaCluster` and `RhizaRecovery` link a
 recovery operation to a specific anchor.
 
+Anchored recovery requires a configured fencer that performs canonical archive
+fork registration before activation. The cooperative `KubernetesFencer` does not
+provide that registrar; with that backend the operator rejects anchored recovery
+before source or target archive side effects. Enabling reconfiguration or
+configuring the anchor service does not replace the canonical CONTROL
+successor-arbitration step.
+
 
 ### ServiceAccount and RBAC
 

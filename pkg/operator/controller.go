@@ -210,6 +210,11 @@ func (c *Controller) reconcile(ctx context.Context, r *Resource) error {
 		r.Status.Peers = peers
 		return c.record(ctx, r, "Observed", "observation only; missing peers never authorize recovery")
 	}
+	if r.Spec.AnchorID != "" {
+		if _, ok := c.Fencer.(ArchiveForkGenesisRegistrar); !ok {
+			return reject("anchored recovery requires a configured fencer with canonical archive fork registration")
+		}
+	}
 	if mode == "async" && !r.Spec.AllowDataLoss {
 		return reject("async source requires explicit allowDataLoss, regardless of target mode")
 	}
@@ -319,17 +324,16 @@ func (c *Controller) reconcile(ctx context.Context, r *Resource) error {
 		r.Status.Target = "rhiza-r-" + shortID(c.operationID(r))
 		r.Status.RecoveryID, r.Status.SpecHash = r.Spec.RecoveryID, immutableSpecHash(r.Spec)
 		reservation := c.reservation(r)
-		reserved, reservationDigest, err := c.verifyOrFindSuccessorReservation(ctx, prefix, reservation)
+		reserved, _, err := c.verifyOrFindSuccessorReservation(ctx, prefix, reservation)
 		if err != nil {
 			return reject("legacy successor reservation is inconsistent or unavailable: " + err.Error())
 		}
-		if err := c.claimSourceSuccessor(ctx, r, source, r.Status.Target, r.Status.TargetBaseKind, sourceSuccessorModeLegacy, reservationDigest); err != nil {
-			return reject("source generation already chose a different successor: " + err.Error())
-		}
-		if reserved {
-			// Exact retries join the winner recorded above.
-		} else if err := c.immutable(ctx, path.Join(prefix, "recovery/successor.json"), jsonBytes(reservation)); err != nil {
-			return reject("source generation already reserved or reservation unavailable")
+		// DATA keeps the legacy retry reservation; the trusted archive registrar
+		// arbitrates canonical successors in CONTROL.
+		if !reserved {
+			if err := c.immutable(ctx, path.Join(prefix, "recovery/successor.json"), jsonBytes(reservation)); err != nil {
+				return reject("source generation already reserved or reservation unavailable")
+			}
 		}
 		r.Status.Stage = "Reserved"
 		return c.record(ctx, r, "Recovering", "unique successor reserved; original generation must remain fenced")

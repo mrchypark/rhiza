@@ -39,6 +39,7 @@ func newFrozenEmptyHeldFixture(t *testing.T) heldProfileFixture {
 	}
 	e.AuthorityState = authority
 	e.MutationProfile = fencing.MutationHeldExecutionProfile
+	e.RequireMutationJournal = true
 	if err := e.initializeRoot(t.Context(), runtime.StatefulSetUID, runtime.SourceClusterID); err != nil {
 		t.Fatal(err)
 	}

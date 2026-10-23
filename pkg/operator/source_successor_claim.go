@@ -6,7 +6,6 @@ import (
 	"errors"
 	"fmt"
 	"path"
-	"strings"
 
 	"github.com/mrchypark/rhiza/pkg/fencing"
 	"github.com/mrchypark/rhiza/pkg/recovery"
@@ -219,28 +218,6 @@ func (e *FencingExecutor) verifySourceSuccessorClaim(ctx context.Context, scope 
 	return nil
 }
 
-func (c *Controller) claimSourceSuccessor(ctx context.Context, r *Resource, source sourceState, target, targetBaseKind, mode, reservationDigest string) error {
-	if c == nil || r == nil || c.Kube == nil || c.Bucket == nil {
-		return fmt.Errorf("fencing: source successor authority is unavailable")
-	}
-	scope, err := sourceScopeFromEnvironment(source.env, r.Spec.SourceClusterID)
-	if err != nil {
-		return err
-	}
-	prefix := strings.Trim(StoreIdentity(source.env)["RHIZA_OBJSTORE_PREFIX"], "/")
-	store, err := NewAuthorityStateStore(c.Bucket, prefix)
-	if err != nil {
-		return err
-	}
-	recoveryUID := str(r.Metadata["uid"])
-	executor := &FencingExecutor{Kube: c.Kube, AuthorityState: store}
-	claim, err := executor.sourceSuccessorClaim(ctx, scope, r.Status.StatefulSetUID, recoveryUID, c.operationID(r), r.Spec.RecoveryID, target, targetBaseKind, mode, reservationDigest)
-	if err != nil {
-		return err
-	}
-	return store.claimSourceSuccessor(ctx, scope, claim)
-}
-
 func (c *Controller) verifyOrFindSuccessorReservation(ctx context.Context, sourcePrefix string, want object) (bool, string, error) {
 	key := path.Join(sourcePrefix, "recovery/successor.json")
 	exists, err := c.Bucket.Exists(ctx, key)
@@ -293,17 +270,4 @@ func readLegacySuccessorReservation(ctx context.Context, bucket objstore.Bucket,
 		return "", fmt.Errorf("fencing: legacy successor reservation differs from the source generation claim")
 	}
 	return authorityStateDigest(data), nil
-}
-
-func sourceScopeFromEnvironment(env map[string]string, sourceID string) (fencing.ArchiveScope, error) {
-	identity := StoreIdentity(env)
-	basePrefix := strings.Trim(identity["RHIZA_OBJSTORE_PREFIX"], "/")
-	if basePrefix == "." || identity["RHIZA_OBJSTORE_PROVIDER"] == "" || identity["RHIZA_OBJSTORE_BUCKET"] == "" || sourceID == "" {
-		return fencing.ArchiveScope{}, fmt.Errorf("fencing: source successor requires an exact configured storage scope")
-	}
-	scope := fencing.ArchiveScope{Provider: identity["RHIZA_OBJSTORE_PROVIDER"], Bucket: identity["RHIZA_OBJSTORE_BUCKET"], Prefix: path.Join(basePrefix, sourceID), ClusterID: sourceID}
-	if err := scope.Validate(); err != nil {
-		return fencing.ArchiveScope{}, err
-	}
-	return scope, nil
 }

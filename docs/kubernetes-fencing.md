@@ -87,6 +87,14 @@ authority store is configured but unavailable, the fencer fails closed; it does
 not fall back to the Kubernetes ledger. Source-mutation endpoints always require
 canonical remote authority state, even when the cooperative-only option is set.
 
+Anchored recovery additionally requires a configured fencer that implements
+canonical archive-fork registration. The cooperative `KubernetesFencer` does not
+provide this registrar, so the operator rejects an anchored recovery before it
+reserves a successor or mutates source/target archive state. Unanchored
+cooperative recovery retains its legacy immutable DATA reservation; it is not a
+canonical CONTROL successor claim and does not qualify the workload for
+independent NoPVC recovery.
+
 Voter fencing permanently closes that stable slot in the source generation but
 does not stop surviving voters. A later generation fence preserves immutable
 prior stop receipts and may reuse completed proof. A prior pending stop still
