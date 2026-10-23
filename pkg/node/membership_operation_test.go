@@ -170,6 +170,16 @@ func TestMembershipAdditionAbortAllowsNextRevision(t *testing.T) {
 	if err := n.abortMembership(ctx, addition); err != nil {
 		t.Fatalf("abort retry: %v", err)
 	}
+	changedAddition := addition
+	changedMember := *addition.Add
+	changedMember.PeerURL = "https://different-candidate"
+	changedAddition.Add = &changedMember
+	if err := n.changeMembership(ctx, changedAddition); !errors.Is(err, network.ErrRequestConflict) {
+		t.Fatalf("changed learner payload replay error=%v, want request conflict", err)
+	}
+	if changedAddition.Add.PeerURL != "https://different-candidate" || addition.Add.PeerURL != learner.PeerURL {
+		t.Fatalf("changed learner payload replay mutated caller request: changed=%q original=%q", changedAddition.Add.PeerURL, addition.Add.PeerURL)
+	}
 	if err := n.changeMembership(ctx, addition); !errors.Is(err, network.ErrRequestConflict) {
 		t.Fatalf("stale addition error=%v, want request conflict", err)
 	}
