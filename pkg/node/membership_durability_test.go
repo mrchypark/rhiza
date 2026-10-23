@@ -3,11 +3,30 @@ package node
 import (
 	"context"
 	"errors"
+	"io"
+	"strings"
+	"sync/atomic"
 	"testing"
 
 	"github.com/mrchypark/rhiza/pkg/network"
+	"github.com/mrchypark/rhiza/pkg/quepaxa"
 	"github.com/mrchypark/rhiza/pkg/recovery"
+	"github.com/thanos-io/objstore"
 )
+
+type failArchiveHeadUploadsBucket struct {
+	objstore.Bucket
+	enabled atomic.Bool
+	failed  atomic.Bool
+}
+
+func (b *failArchiveHeadUploadsBucket) Upload(ctx context.Context, name string, reader io.Reader, options ...objstore.ObjectUploadOption) error {
+	if b.enabled.Load() && strings.HasSuffix(name, "/archive/head.bin") {
+		b.failed.Store(true)
+		return errors.New("injected archive head persistence failure")
+	}
+	return b.Bucket.Upload(ctx, name, reader, options...)
+}
 
 func TestMembershipRetryDurablyPublishesCommittedConfiguration(t *testing.T) {
 	ctx := context.Background()
@@ -30,7 +49,8 @@ func TestMembershipRetryDurablyPublishesCommittedConfiguration(t *testing.T) {
 		t.Fatalf("preexisting archive tip=%d, want certified baseline %d", got, baselineTip)
 	}
 
-	faults := &failFirstArchiveHeadUploadBucket{Bucket: bucket}
+	faults := &failArchiveHeadUploadsBucket{Bucket: bucket}
+	faults.enabled.Store(true)
 	n.archive.Close()
 	n.archive = recovery.NewManager(faults, "cluster", 1)
 	if err := n.archive.Load(ctx); err != nil {
@@ -56,6 +76,20 @@ func TestMembershipRetryDurablyPublishesCommittedConfiguration(t *testing.T) {
 		t.Fatalf("configuration did not commit before persistence failure: %+v", committed)
 	}
 	through := n.core.Tip()
+	if through <= baselineTip {
+		t.Fatalf("membership decision did not advance beyond published archive baseline: baseline=%d tip=%d", baselineTip, through)
+	}
+	terminal, ok := n.core.CertifiedValue(through)
+	if !ok {
+		t.Fatalf("membership terminal slot %d is not certified", through)
+	}
+	control, err := quepaxa.DecodeReconfiguration(terminal.Value)
+	if err != nil || !control {
+		t.Fatalf("slot %d is not the certified membership terminal: control=%t err=%v", through, control, err)
+	}
+	if got := n.archive.Tip(); got != baselineTip {
+		t.Fatalf("archive tip=%d advanced past failed membership publication baseline %d", got, baselineTip)
+	}
 	if err := n.core.EnsureDurableThrough(ctx, through); err != nil {
 		t.Fatalf("committed decision was not durable in the local WAL: %v", err)
 	}
@@ -89,6 +123,7 @@ func TestMembershipRetryDurablyPublishesCommittedConfiguration(t *testing.T) {
 
 	// Only the exact journaled request may retry persistence. It must not
 	// commit another config decision or advance the consensus tip.
+	faults.enabled.Store(false)
 	if err := n.changeMembership(ctx, request); err != nil {
 		t.Fatalf("persist committed configuration on exact replay: %v", err)
 	}
@@ -101,7 +136,7 @@ func TestMembershipRetryDurablyPublishesCommittedConfiguration(t *testing.T) {
 	}
 	assertDurableArchivedMembership(t, ctx, n, bucket, through)
 
-	terminal, ok := n.core.CertifiedValue(through)
+	terminal, ok = n.core.CertifiedValue(through)
 	if !ok {
 		t.Fatalf("committed terminal slot %d is not certified", through)
 	}

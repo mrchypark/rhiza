@@ -215,8 +215,10 @@ func TestFixtureOnlyWorkflowIsExclusiveAndRunsFixedGoSelectors(t *testing.T) {
 		t.Fatal("fixture-only job must retain only the fixed embedded rollback/IAM/manifest/launcher selector")
 	}
 	wantCommands := []string{
+		`go test ./pkg/node -run '^TestMembershipRetryDurablyPublishesCommittedConfiguration$' -count=1 -timeout=5m`,
 		`go test ./e2e/chaos/embedded-go -run "$embedded_tests" -count=1 -timeout=5m`,
 		`go test ./pkg/fencing ./pkg/fencing/cri ./pkg/operator ./pkg/recovery ./internal/objstore ./e2e/fencing -count=1 -timeout=5m`,
+		`go test -race ./pkg/node -run '^TestMembershipRetryDurablyPublishesCommittedConfiguration$' -count=1 -timeout=5m`,
 		`go test -race ./e2e/chaos/embedded-go -run "$embedded_tests" -count=1 -timeout=5m`,
 		`go test -race ./pkg/fencing ./pkg/fencing/cri ./pkg/operator ./pkg/recovery ./internal/objstore ./e2e/fencing -count=1 -timeout=5m`,
 	}
@@ -226,7 +228,7 @@ func TestFixtureOnlyWorkflowIsExclusiveAndRunsFixedGoSelectors(t *testing.T) {
 		}
 	}
 	if strings.Count(run, "go test ") != len(wantCommands) {
-		t.Fatal("fixture-only job must contain only the four asserted focused test commands")
+		t.Fatal("fixture-only job must contain only the six asserted focused test commands")
 	}
 	if strings.Contains(run, "go test ./...") || strings.Contains(run, "kind ") || strings.Contains(run, "docker ") {
 		t.Fatal("fixture-only job must remain a focused Go feedback path without cluster/image work")
