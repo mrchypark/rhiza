@@ -11,6 +11,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 
@@ -518,6 +519,226 @@ func projectGCSAsyncEmptyEvidence(raw, public string, failedRun bool) (bool, err
 	return true, writeGCSAsyncEmptySummary(public, summary)
 }
 
+type gcsAsyncNonemptyPublicSummary struct {
+	Qualification             string `json:"qualification"`
+	Outcome                   string `json:"outcome"`
+	Provider                  string `json:"provider"`
+	NoPVC                     bool   `json:"noPVC"`
+	SourceDurability          string `json:"sourceDurability"`
+	AllowDataLoss             bool   `json:"allowDataLoss"`
+	SourceAckCount            int    `json:"sourceAckCount"`
+	LastSourceAckSlot         uint64 `json:"lastSourceAckSlot"`
+	PersistedNonemptyTip      bool   `json:"persistedNonemptyTip"`
+	SealedNonemptyTip         bool   `json:"sealedNonemptyTip"`
+	RecoveredArchivedTip      uint64 `json:"recoveredArchivedTip"`
+	RecoveredRowsVerified     bool   `json:"recoveredRowsVerified"`
+	TargetQuorumVerified      bool   `json:"targetQuorumVerified"`
+	TargetAckReadbackVerified bool   `json:"targetAckReadbackVerified"`
+	PrivateEvidenceSHA256     string `json:"privateEvidenceSHA256,omitempty"`
+	PrivateEventsSHA256       string `json:"privateEventsSHA256,omitempty"`
+}
+
+const (
+	gcsAsyncNonemptyEvidenceName = "gcs-async-nonempty-evidence.json"
+	gcsAsyncNonemptyEventsName   = "gcs-async-nonempty-events.jsonl"
+	gcsAsyncNonemptySummaryName  = "gcs-async-nonempty-summary.json"
+)
+
+func projectGCSAsyncNonemptyEvidence(raw, public string, failedRun bool) (bool, error) {
+	entries, err := os.ReadDir(raw)
+	if err != nil {
+		return false, err
+	}
+	known := map[string]bool{gcsAsyncNonemptyEvidenceName: false, gcsAsyncNonemptyEventsName: false}
+	for _, entry := range entries {
+		name := entry.Name()
+		if strings.HasPrefix(name, "gcs-async-nonempty-") {
+			if _, ok := known[name]; !ok {
+				return false, fmt.Errorf("async-nonempty private artifact name is not allowlisted")
+			}
+			known[name] = true
+		}
+	}
+	if !known[gcsAsyncNonemptyEvidenceName] && !known[gcsAsyncNonemptyEventsName] {
+		return false, nil
+	}
+	if !known[gcsAsyncNonemptyEventsName] {
+		return false, fmt.Errorf("async-nonempty evidence exists without its private event record")
+	}
+	events, err := readBoundedPrivateArtifact(filepath.Join(raw, gcsAsyncNonemptyEventsName), true)
+	if err != nil {
+		return false, err
+	}
+	eventsHash := sha256.Sum256(events)
+	summary := gcsAsyncNonemptyPublicSummary{
+		Qualification:       "gcs-async-nonempty-tip-recovery",
+		Outcome:             "failed",
+		PrivateEventsSHA256: hex.EncodeToString(eventsHash[:]),
+	}
+	if !known[gcsAsyncNonemptyEvidenceName] {
+		if !failedRun {
+			return false, fmt.Errorf("successful async-nonempty run is missing its private evidence record")
+		}
+		return true, writeGCSAsyncNonemptySummary(public, summary)
+	}
+	evidence, err := readBoundedPrivateArtifact(filepath.Join(raw, gcsAsyncNonemptyEvidenceName), false)
+	if err != nil {
+		return false, err
+	}
+	if err := validateGCSAsyncNonemptyPrivateEvidence(evidence, &summary); err != nil {
+		return false, err
+	}
+	evidenceHash := sha256.Sum256(evidence)
+	summary.PrivateEvidenceSHA256 = hex.EncodeToString(evidenceHash[:])
+	if !failedRun {
+		summary.Outcome = "passed"
+	}
+	return true, writeGCSAsyncNonemptySummary(public, summary)
+}
+
+func validateGCSAsyncNonemptyPrivateEvidence(data []byte, summary *gcsAsyncNonemptyPublicSummary) error {
+	fields, err := exactJSONFields(data,
+		"qualification", "profile", "sourceAcknowledgements", "sourceRows", "sourceHeadBeforeFence", "sealedSourceHead",
+		"fence", "proof", "recovery", "recoveredRows", "recoveredTip", "targetQuorumVerified", "targetAck", "proofSource")
+	if err != nil {
+		return err
+	}
+	var qualification string
+	var profile struct {
+		Provider         string `json:"provider"`
+		Bucket           string `json:"bucket"`
+		NoPVC            bool   `json:"noPVC"`
+		SourceDurability string `json:"sourceDurability"`
+		AllowDataLoss    bool   `json:"allowDataLoss"`
+	}
+	if err := json.Unmarshal(fields["qualification"], &qualification); err != nil || qualification != "gcs-async-nonempty-tip-recovery" {
+		return fmt.Errorf("private async-nonempty evidence has an unknown qualification")
+	}
+	if _, err := exactJSONFields(fields["profile"], "provider", "bucket", "noPVC", "sourceDurability", "allowDataLoss"); err != nil {
+		return err
+	}
+	if err := json.Unmarshal(fields["profile"], &profile); err != nil || profile.Provider != "gcs" || profile.Bucket == "" || !profile.NoPVC || profile.SourceDurability != "async" || !profile.AllowDataLoss {
+		return fmt.Errorf("private async-nonempty evidence profile is incomplete")
+	}
+	var sourceAckFields []json.RawMessage
+	if err := json.Unmarshal(fields["sourceAcknowledgements"], &sourceAckFields); err != nil || len(sourceAckFields) != 3 {
+		return fmt.Errorf("private async-nonempty source ACK receipts are incomplete")
+	}
+	rows := make([]string, 0, len(sourceAckFields))
+	var lastAckSlot uint64
+	for i, rawAck := range sourceAckFields {
+		if _, err := exactJSONFields(rawAck, "requestID", "slot", "rows"); err != nil {
+			return err
+		}
+		var ack gcsAcknowledgement
+		if err := json.Unmarshal(rawAck, &ack); err != nil {
+			return fmt.Errorf("private async-nonempty source ACK receipt is invalid")
+		}
+		row := fmt.Sprintf("[%d,\"gcs-async-archive-%d\"]", i+1, i+1)
+		if ack.RequestID != fmt.Sprintf("gcs-ha-ack-%d", i+1) || ack.Slot == 0 || ack.Slot <= lastAckSlot || ack.Rows != "["+row+"]" {
+			return fmt.Errorf("private async-nonempty source ACK receipt differs from the captured rows")
+		}
+		lastAckSlot = ack.Slot
+		rows = append(rows, row)
+	}
+	expectedRows := "[" + strings.Join(rows, ",") + "]"
+	var sourceRows, recoveredRows string
+	if err := json.Unmarshal(fields["sourceRows"], &sourceRows); err != nil || sourceRows != expectedRows {
+		return fmt.Errorf("private async-nonempty source row set is invalid")
+	}
+	if err := json.Unmarshal(fields["recoveredRows"], &recoveredRows); err != nil || recoveredRows != sourceRows {
+		return fmt.Errorf("private async-nonempty recovered rows differ from source ACKs")
+	}
+	var before, sealed gcsArchiveHeadEvidence
+	for name, head := range map[string]*gcsArchiveHeadEvidence{"sourceHeadBeforeFence": &before, "sealedSourceHead": &sealed} {
+		if _, err := exactJSONFields(fields[name], "versionType", "version", "tip", "sealed", "headSHA256"); err != nil {
+			return err
+		}
+		if err := json.Unmarshal(fields[name], head); err != nil {
+			return fmt.Errorf("private async-nonempty source HEAD evidence is invalid")
+		}
+		if len(head.HeadSHA256) != 64 || strings.ToLower(head.HeadSHA256) != head.HeadSHA256 {
+			return fmt.Errorf("private async-nonempty source HEAD digest is invalid")
+		}
+		if _, err := hex.DecodeString(head.HeadSHA256); err != nil {
+			return fmt.Errorf("private async-nonempty source HEAD digest is invalid")
+		}
+		generation, err := strconv.ParseUint(head.Version, 10, 64)
+		if err != nil || generation == 0 {
+			return fmt.Errorf("private async-nonempty GCS generation is invalid")
+		}
+	}
+	if before.Tip < lastAckSlot {
+		return fmt.Errorf("private async-nonempty HEAD does not contain the acknowledged source rows")
+	}
+	if err := validateSealedNonemptyHead(before, sealed); err != nil {
+		return err
+	}
+	var fence operator.FenceRequest
+	var proof operator.FenceProof
+	var recovery operator.Resource
+	if err := json.Unmarshal(fields["fence"], &fence); err != nil {
+		return fmt.Errorf("private async-nonempty generation fence is invalid")
+	}
+	if err := json.Unmarshal(fields["proof"], &proof); err != nil {
+		return fmt.Errorf("private async-nonempty generation proof is invalid")
+	}
+	if proof.IndependentV2 == nil {
+		return fmt.Errorf("private async-nonempty generation proof is not IndependentV2")
+	}
+	if _, _, err := verifyIndependentGenerationProof(obj{"spec": fence, "status": obj{"proof": proof}}, fence.SourceClusterID, fence.StatefulSetUID,
+		fence.BindingUID, fence.Targets, profile.Bucket, proof.IndependentV2.StorageScope.Prefix, fence.Namespace, fence.StatefulSet, fence.LogicalID); err != nil {
+		return fmt.Errorf("private async-nonempty generation proof is invalid: %w", err)
+	}
+	if err := json.Unmarshal(fields["recovery"], &recovery); err != nil || recovery.Spec.Durability != "async" || !recovery.Spec.AllowDataLoss ||
+		recovery.Status.Phase != "Complete" || recovery.Status.Stage != "Complete" || recovery.Status.TargetBaseKind != "fork" ||
+		recovery.Status.Source != fence.SourceClusterID || recovery.Status.StatefulSetUID != fence.StatefulSetUID || recovery.Status.Target == "" ||
+		recovery.Status.SourceDurability != "async" || recovery.Status.RecoveredTip != before.Tip || recovery.Status.ManifestHash == "" {
+		return fmt.Errorf("private async-nonempty recovery differs from the exact sealed archived tip")
+	}
+	if err := recoveryFenceMatchesProof(recovery, fence, proof); err != nil {
+		return err
+	}
+	var recoveredTip uint64
+	if err := json.Unmarshal(fields["recoveredTip"], &recoveredTip); err != nil || recoveredTip != sealed.Tip {
+		return fmt.Errorf("private async-nonempty recovered tip differs from the sealed source")
+	}
+	var targetQuorum bool
+	if err := json.Unmarshal(fields["targetQuorumVerified"], &targetQuorum); err != nil || !targetQuorum {
+		return fmt.Errorf("private async-nonempty evidence does not prove target quorum")
+	}
+	var targetAck gcsAcknowledgement
+	if _, err := exactJSONFields(fields["targetAck"], "requestID", "slot", "rows"); err != nil {
+		return err
+	}
+	if err := json.Unmarshal(fields["targetAck"], &targetAck); err != nil || targetAck.RequestID != "gcs-ha-ack-4" || targetAck.Slot <= recoveredTip || targetAck.Rows != `[[4,"gcs-async-target-ack"]]` {
+		return fmt.Errorf("private async-nonempty target ACK readback is incomplete")
+	}
+	var proofSource string
+	if err := json.Unmarshal(fields["proofSource"], &proofSource); err != nil || proofSource != "RhizaFence status plus direct versioned GCS HEAD reads; recovered rows were read linearly from the promoted target" {
+		return fmt.Errorf("private async-nonempty proof source is not recognized")
+	}
+
+	summary.Qualification = qualification
+	summary.Provider = profile.Provider
+	summary.NoPVC = profile.NoPVC
+	summary.SourceDurability = profile.SourceDurability
+	summary.AllowDataLoss = profile.AllowDataLoss
+	summary.SourceAckCount = len(sourceAckFields)
+	summary.LastSourceAckSlot = lastAckSlot
+	summary.PersistedNonemptyTip = true
+	summary.SealedNonemptyTip = true
+	summary.RecoveredArchivedTip = recoveredTip
+	summary.RecoveredRowsVerified = true
+	summary.TargetQuorumVerified = targetQuorum
+	summary.TargetAckReadbackVerified = true
+	return nil
+}
+
+func writeGCSAsyncNonemptySummary(public string, summary gcsAsyncNonemptyPublicSummary) error {
+	return os.WriteFile(filepath.Join(public, gcsAsyncNonemptySummaryName), encoded(summary), 0600)
+}
+
 func readBoundedPrivateArtifact(name string, allowEmpty bool) ([]byte, error) {
 	info, err := os.Lstat(name)
 	if err != nil {
@@ -1022,6 +1243,10 @@ func safeArtifacts(raw string) error {
 	if err != nil {
 		return err
 	}
+	asyncNonemptySeen, err := projectGCSAsyncNonemptyEvidence(raw, public, failedRun)
+	if err != nil {
+		return err
+	}
 	ackLossSeen, err := projectGCSAckLossEvidence(raw, public, failedRun)
 	if err != nil {
 		return err
@@ -1031,6 +1256,9 @@ func safeArtifacts(raw string) error {
 		required = append(required, "runtime-profile.json", "runtime-component-probe.json")
 		if asyncEmptySeen {
 			required = append(required, gcsAsyncEmptySummaryName)
+		}
+		if asyncNonemptySeen {
+			required = append(required, gcsAsyncNonemptySummaryName)
 		}
 		if ackLossSeen {
 			required = append(required, gcsAckLossSummaryName)

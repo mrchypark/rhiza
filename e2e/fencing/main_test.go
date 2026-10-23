@@ -126,6 +126,26 @@ func TestGCSAckLossQualificationHasDedicatedCommand(t *testing.T) {
 	}
 }
 
+func TestGCSAsyncNonemptyQualificationHasDedicatedCommand(t *testing.T) {
+	data, err := os.ReadFile("main.go")
+	if err != nil {
+		t.Fatal(err)
+	}
+	mainSource := string(data)
+	start := strings.Index(mainSource, `if os.Args[1] == "run-gcs-ha-async-nonempty" {`)
+	if start < 0 {
+		t.Fatal("dedicated async-nonempty qualification command is missing")
+	}
+	end := strings.Index(mainSource[start:], "\n\tif os.Args[1] == ")
+	if end < 0 {
+		t.Fatal("dedicated async-nonempty command block is not bounded")
+	}
+	block := mainSource[start : start+end]
+	if !strings.Contains(block, "fatal(configureGCSHA(ctx))") || !strings.Contains(block, "fatal(qualifyGCSAsyncNonempty(ctx))") {
+		t.Fatal("async-nonempty command does not validate the GCS profile before running its driver")
+	}
+}
+
 func TestGCSDeadPodQualificationHasDedicatedCommand(t *testing.T) {
 	data, err := os.ReadFile("main.go")
 	if err != nil {

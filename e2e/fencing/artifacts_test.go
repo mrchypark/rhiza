@@ -542,6 +542,210 @@ func decodeAckLossRecovery(data obj, target any) error {
 	return json.Unmarshal(encoded, target)
 }
 
+func TestAsyncNonemptyPublicProjectionHashesPrivateEvidenceWithoutScopeIdentifiers(t *testing.T) {
+	const privateCanary = "private-project-bucket-prefix-endpoint-poduid-token-canary"
+	raw := t.TempDir()
+	for name, data := range map[string][]byte{
+		"actual-exit.txt":              []byte("0\n"),
+		"source-head.txt":              []byte(strings.Repeat("a", 40) + "\n"),
+		"image-ids.txt":                []byte("sha256:" + strings.Repeat("b", 64) + "\n"),
+		"runtime-profile.json":         encoded(runtimeProfileEvidence{}),
+		"runtime-component-probe.json": encoded(runtimeComponentEvidence{}),
+		gcsAsyncNonemptyEventsName:     []byte(`{"event":"private","value":"` + privateCanary + `"}` + "\n"),
+		gcsAsyncNonemptyEvidenceName:   asyncNonemptyPrivateEvidenceFixture(privateCanary),
+	} {
+		if err := os.WriteFile(filepath.Join(raw, name), data, 0600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := safeArtifacts(raw); err != nil {
+		t.Fatalf("strict async-nonempty public projection failed: %v", err)
+	}
+	public, err := os.ReadFile(filepath.Join(raw, "public", gcsAsyncNonemptySummaryName))
+	if err != nil || bytes.Contains(public, []byte(privateCanary)) || bytes.Contains(public, []byte("bucket")) ||
+		bytes.Contains(public, []byte("prefix")) || bytes.Contains(public, []byte("endpoint")) {
+		t.Fatalf("public async-nonempty summary leaked a private identifier: %s (%v)", public, err)
+	}
+	var summary gcsAsyncNonemptyPublicSummary
+	if err := json.Unmarshal(public, &summary); err != nil || summary.Outcome != "passed" || summary.SourceAckCount != 3 ||
+		!summary.PersistedNonemptyTip || !summary.SealedNonemptyTip || summary.RecoveredArchivedTip != 5 ||
+		!summary.RecoveredRowsVerified || !summary.TargetQuorumVerified || !summary.TargetAckReadbackVerified ||
+		len(summary.PrivateEvidenceSHA256) != 64 || len(summary.PrivateEventsSHA256) != 64 {
+		t.Fatalf("public async-nonempty summary is incomplete: %+v, %v", summary, err)
+	}
+	for _, name := range []string{gcsAsyncNonemptyEvidenceName, gcsAsyncNonemptyEventsName} {
+		if _, err := os.Stat(filepath.Join(raw, "public", name)); !os.IsNotExist(err) {
+			t.Fatalf("private async-nonempty artifact %s was copied publicly", name)
+		}
+	}
+}
+
+func TestAsyncNonemptyArtifactAcceptsDistinctLowerGCSGeneration(t *testing.T) {
+	raw := t.TempDir()
+	var evidence obj
+	if err := json.Unmarshal(asyncNonemptyPrivateEvidenceFixture("private-scope"), &evidence); err != nil {
+		t.Fatal(err)
+	}
+	sealed := evidence["sealedSourceHead"].(map[string]any)
+	sealed["version"] = "1000" // GCS generations are unique, not monotonic.
+	for name, data := range map[string][]byte{
+		"actual-exit.txt":              []byte("0\n"),
+		"source-head.txt":              []byte(strings.Repeat("a", 40) + "\n"),
+		"image-ids.txt":                []byte("sha256:" + strings.Repeat("b", 64) + "\n"),
+		"runtime-profile.json":         encoded(runtimeProfileEvidence{}),
+		"runtime-component-probe.json": encoded(runtimeComponentEvidence{}),
+		gcsAsyncNonemptyEventsName:     []byte("{}\n"),
+		gcsAsyncNonemptyEvidenceName:   encoded(evidence),
+	} {
+		if err := os.WriteFile(filepath.Join(raw, name), data, 0600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := safeArtifacts(raw); err != nil {
+		t.Fatalf("rejected distinct lower GCS generation with valid sealed-head evidence: %v", err)
+	}
+}
+
+func TestAsyncNonemptyArtifactProjectionRejectsInvalidEvidenceAndUnknownFiles(t *testing.T) {
+	const privateCanary = "private-scope-value"
+	for _, tc := range []struct {
+		name   string
+		mutate func(obj) obj
+		file   string
+	}{
+		{name: "unknown evidence key", mutate: func(value obj) obj { value["unreviewed"] = privateCanary; return value }},
+		{name: "unknown nested ACK key", mutate: func(value obj) obj {
+			acks := value["sourceAcknowledgements"].([]any)
+			acks[0].(map[string]any)["private"] = privateCanary
+			return value
+		}},
+		{name: "wrong ACK rows", mutate: func(value obj) obj {
+			value["sourceRows"] = `[[1,"other"],[2,"gcs-async-archive-2"],[3,"gcs-async-archive-3"]]`
+			return value
+		}},
+		{name: "archive tip regressed after sealing", mutate: func(value obj) obj {
+			sealed := value["sealedSourceHead"].(map[string]any)
+			sealed["tip"] = float64(4)
+			return value
+		}},
+		{name: "recovery changed proof", mutate: func(value obj) obj {
+			recovery := value["recovery"].(map[string]any)
+			spec := recovery["spec"].(map[string]any)
+			fence := spec["fence"].(map[string]any)
+			fence["evidence"] = "different-proof"
+			return value
+		}},
+		{name: "recovery omitted loss gate", mutate: func(value obj) obj {
+			recovery := value["recovery"].(map[string]any)
+			recovery["spec"].(map[string]any)["allowDataLoss"] = false
+			return value
+		}},
+		{name: "recovered tip differs", mutate: func(value obj) obj { value["recoveredTip"] = float64(4); return value }},
+		{name: "target ACK rows differ", mutate: func(value obj) obj {
+			value["targetAck"].(map[string]any)["rows"] = `[[4,"other"]]`
+			return value
+		}},
+		{name: "target ACK does not advance recovered tip", mutate: func(value obj) obj {
+			value["targetAck"].(map[string]any)["slot"] = float64(5)
+			return value
+		}},
+		{name: "unknown async artifact file", file: "gcs-async-nonempty-extra.json"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			raw := t.TempDir()
+			if err := os.Mkdir(filepath.Join(raw, "public"), 0700); err != nil {
+				t.Fatal(err)
+			}
+			if tc.file != "" {
+				if err := os.WriteFile(filepath.Join(raw, tc.file), []byte(privateCanary), 0600); err != nil {
+					t.Fatal(err)
+				}
+			} else {
+				var evidence obj
+				if err := json.Unmarshal(asyncNonemptyPrivateEvidenceFixture(privateCanary), &evidence); err != nil {
+					t.Fatal(err)
+				}
+				if err := os.WriteFile(filepath.Join(raw, gcsAsyncNonemptyEvidenceName), encoded(tc.mutate(evidence)), 0600); err != nil {
+					t.Fatal(err)
+				}
+				if err := os.WriteFile(filepath.Join(raw, gcsAsyncNonemptyEventsName), []byte("{}\n"), 0600); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if _, err := projectGCSAsyncNonemptyEvidence(raw, filepath.Join(raw, "public"), false); err == nil {
+				t.Fatal("accepted unreviewed async-nonempty artifact content")
+			}
+		})
+	}
+}
+
+func TestFailedAsyncNonemptyRunPublishesOnlyHashOfPartialPrivateEvents(t *testing.T) {
+	const privateCanary = "private-partial-async-nonempty-scope"
+	raw := t.TempDir()
+	for name, data := range map[string][]byte{
+		"actual-exit.txt":          []byte("1\n"),
+		"source-head.txt":          []byte(strings.Repeat("a", 40) + "\n"),
+		"image-ids.txt":            []byte("sha256:" + strings.Repeat("b", 64) + "\n"),
+		gcsAsyncNonemptyEventsName: []byte(`{"event":"partial","private":"` + privateCanary + `"}` + "\n"),
+	} {
+		if err := os.WriteFile(filepath.Join(raw, name), data, 0600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := safeArtifacts(raw); err != nil {
+		t.Fatalf("failed async-nonempty run did not preserve safe failure artifacts: %v", err)
+	}
+	public, err := os.ReadFile(filepath.Join(raw, "public", gcsAsyncNonemptySummaryName))
+	if err != nil || bytes.Contains(public, []byte(privateCanary)) {
+		t.Fatalf("failed-run async-nonempty projection leaked partial private events: %v", err)
+	}
+	var summary gcsAsyncNonemptyPublicSummary
+	if err := json.Unmarshal(public, &summary); err != nil || summary.Outcome != "failed" || len(summary.PrivateEventsSHA256) != 64 {
+		t.Fatalf("failed-run async-nonempty summary is incomplete: %+v, %v", summary, err)
+	}
+}
+
+func asyncNonemptyPrivateEvidenceFixture(privateValue string) []byte {
+	target := operator.FenceTarget{NodeID: "rhiza-0", Pod: "rhiza-0", PodUID: privateValue, WALIdentity: "source-wal"}
+	fence := operator.FenceRequest{LogicalID: privateValue, BindingUID: privateValue, Namespace: "qualification",
+		StatefulSet: "rhiza", StatefulSetUID: privateValue, SourceClusterID: privateValue, OperationID: "async-nonempty-fence",
+		Scope: operator.ScopeGeneration, Targets: []operator.FenceTarget{target}}
+	scope := operator.AttestationStoreScope{Provider: "gcs", Bucket: privateValue, Prefix: privateValue, Endpoint: privateValue}
+	scopeDigest := fmt.Sprintf("%x", sha256.Sum256(encoded(scope)))
+	evidence := &operator.IndependentEvidenceV2{Version: 2, RequestHash: fmt.Sprintf("%x", sha256.Sum256(encoded(fence))),
+		LedgerHash: strings.Repeat("a", 64), StorageScope: scope,
+		Terminals: []fencing.TerminalReference{{EvidenceVersion: 2,
+			Request: fencing.StopRequest{OperationID: "source-stop", RequestHash: strings.Repeat("b", 64), Identity: fencing.Identity{
+				SourceClusterID: privateValue, NodeID: target.NodeID, PodUID: target.PodUID, RunID: "source-run", WALIdentity: target.WALIdentity}},
+			RuntimeHash: strings.Repeat("c", 64), ProducerUID: "producer", ProofName: "proof", ProofUID: privateValue,
+			ProofDigest: strings.Repeat("d", 64), RuntimeReceiptDigest: strings.Repeat("e", 64), MutationReceiptDigest: strings.Repeat("f", 64), StorageScopeDigest: scopeDigest}},
+	}
+	proof := operator.FenceProof{OperationID: fence.OperationID, SourceClusterID: fence.SourceClusterID, BindingUID: fence.BindingUID,
+		RequestHash: evidence.RequestHash, ProcessesTerminated: true, RecreationBlocked: true, StorageQuiesced: true, IndependentV2: evidence}
+	proof.ProofID = "independent-v2-" + fmt.Sprintf("%x", sha256.Sum256(encoded(evidence)))
+	recovery := operator.Resource{Metadata: map[string]any{"uid": privateValue},
+		Spec: operator.Spec{SourceClusterID: fence.SourceClusterID, RecoveryID: fence.OperationID, Durability: "async", AllowDataLoss: true,
+			Fence: operator.Fence{RecoveryID: fence.OperationID, ClusterID: fence.SourceClusterID, StatefulSetUID: fence.StatefulSetUID, Confirmed: true, Evidence: proof.ProofID}},
+		Status: operator.Status{Phase: "Complete", Stage: "Complete", StatefulSetUID: fence.StatefulSetUID, Source: fence.SourceClusterID,
+			Target: "private-target", TargetBaseKind: "fork", SourceDurability: "async", RecoveredTip: 5, ManifestHash: strings.Repeat("9", 64)}}
+	before := gcsArchiveHeadEvidence{VersionType: int(objstore.Generation), Version: "1001", Tip: 5, HeadSHA256: strings.Repeat("1", 64)}
+	sealed := gcsArchiveHeadEvidence{VersionType: int(objstore.Generation), Version: "1002", Tip: 5, Sealed: true, HeadSHA256: strings.Repeat("2", 64)}
+	sourceAcks := []gcsAcknowledgement{
+		{RequestID: "gcs-ha-ack-1", Slot: 1, Rows: `[[1,"gcs-async-archive-1"]]`},
+		{RequestID: "gcs-ha-ack-2", Slot: 2, Rows: `[[2,"gcs-async-archive-2"]]`},
+		{RequestID: "gcs-ha-ack-3", Slot: 4, Rows: `[[3,"gcs-async-archive-3"]]`},
+	}
+	rows := `[[1,"gcs-async-archive-1"],[2,"gcs-async-archive-2"],[3,"gcs-async-archive-3"]]`
+	return encoded(obj{
+		"qualification":          "gcs-async-nonempty-tip-recovery",
+		"profile":                obj{"provider": "gcs", "bucket": privateValue, "noPVC": true, "sourceDurability": "async", "allowDataLoss": true},
+		"sourceAcknowledgements": sourceAcks, "sourceRows": rows, "sourceHeadBeforeFence": before, "sealedSourceHead": sealed,
+		"fence": fence, "proof": proof, "recovery": recovery, "recoveredRows": rows, "recoveredTip": uint64(5),
+		"targetQuorumVerified": true, "targetAck": gcsAcknowledgement{RequestID: "gcs-ha-ack-4", Slot: 6, Rows: `[[4,"gcs-async-target-ack"]]`},
+		"proofSource": "RhizaFence status plus direct versioned GCS HEAD reads; recovered rows were read linearly from the promoted target",
+	})
+}
+
 func asyncEmptyPrivateEvidenceFixture(privateValue string) []byte {
 	before := gcsArchiveHeadEvidence{VersionType: int(objstore.Generation), Version: "1001", Tip: 0, Sealed: false, HeadSHA256: strings.Repeat("a", 64)}
 	sealed := gcsArchiveHeadEvidence{VersionType: int(objstore.Generation), Version: "1002", Tip: 0, Sealed: true, HeadSHA256: strings.Repeat("b", 64)}
