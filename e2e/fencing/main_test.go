@@ -578,10 +578,12 @@ func TestAsyncNonemptyLauncherRequiresDedicatedNativeScenarioAndProjection(t *te
 	nativeDispatch := strings.Index(source, "step 30-async-nonempty-collector env")
 	nativeInvocation := strings.Index(source, `"$FENCING_E2E_BIN" run-gcs-ha-async-nonempty`)
 	manualStart := strings.Index(source, "if [ \"$manual_terminal\" = yes ]; then\n  : \"${FENCING_E2E_BIN:?manual-terminal qualification requires the fencing-e2e driver}\"")
-	legacyPython := strings.Index(source, "step 30-driver python3 -u")
 	branchExit := strings.Index(source, "echo 'nonempty async GCS quorum-loss and exact archived-tip recovery collector completed'\n  exit 0\nfi")
+	missingMembershipStart := strings.Index(source, "if [ \"$missing_membership\" = yes ]; then\n  : \"${FENCING_E2E_BIN:?missing-membership qualification requires the fencing-e2e driver}\"")
+	legacyPython := strings.Index(source, "step 30-driver python3 -u")
 	if asyncStart < 0 || nativeDispatch < asyncStart || nativeInvocation < nativeDispatch ||
-		branchExit < nativeInvocation || manualStart < branchExit || legacyPython < manualStart {
+		branchExit < nativeInvocation || manualStart < branchExit || missingMembershipStart < manualStart ||
+		legacyPython < missingMembershipStart {
 		t.Fatal("async-nonempty scenario must dispatch through the native driver before the legacy Python scenario path")
 	}
 }
@@ -607,10 +609,11 @@ func TestManualTerminalLauncherIsExplicitAndUsesNativeApprovalCollector(t *testi
 	manualStart := strings.Index(source, "if [ \"$manual_terminal\" = yes ]; then\n  : \"${FENCING_E2E_BIN:?manual-terminal qualification requires the fencing-e2e driver}\"")
 	nativeDispatch := strings.Index(source, "step 30-manual-terminal-collector env")
 	nativeInvocation := strings.Index(source, `"$FENCING_E2E_BIN" run-gcs-ha-manual-terminal`)
+	branchExit := strings.Index(source, "echo 'manual-terminal GCS challenge, independent approval, recovery, and readback collector completed'\n  exit 0\nfi")
+	missingMembershipStart := strings.Index(source, "if [ \"$missing_membership\" = yes ]; then\n  : \"${FENCING_E2E_BIN:?missing-membership qualification requires the fencing-e2e driver}\"")
 	legacyPython := strings.Index(source, "step 30-driver python3 -u")
-	branchExit := strings.Index(source, "echo 'manual-terminal GCS challenge, independent approval, recovery, and readback collector completed'\n  exit 0\nfi\nstep 30-driver python3 -u")
 	if manualStart < 0 || nativeDispatch < manualStart || nativeInvocation < nativeDispatch ||
-		branchExit < nativeInvocation || legacyPython < branchExit {
+		branchExit < nativeInvocation || missingMembershipStart < branchExit || legacyPython < missingMembershipStart {
 		t.Fatal("manual-terminal qualification must use the dedicated native collector and return before the legacy Python path")
 	}
 }
