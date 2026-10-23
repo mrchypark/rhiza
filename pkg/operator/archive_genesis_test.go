@@ -193,6 +193,15 @@ func TestEmptyRecoveryVerifiesRealSealedSourceAndClosedRoot(t *testing.T) {
 	request.OperationID = "recovery-uid:source-fence"
 	request.TargetClusterID = "rhiza-r-" + shortID(request.OperationID)
 	request.PolicyDigest = hashJSON(recoveryResource.Spec)
+	recoveryResource.Status.Target = request.TargetClusterID
+	recoveryResource.Status.SourceMembership = sourceFingerprint("source", "async", sourceMembers, "root/source")
+	recoveryResource.Status.SpecHash = immutableSpecHash(recoveryResource.Spec)
+	// Legacy empty recovery requires the same immutable reservation written by
+	// the controller before it admits recovery side effects.
+	reservation := e.controller().reservation(&recoveryResource)
+	if err := e.ArchiveBucket.Upload(ctx, path.Join("root/source", "recovery/successor.json"), bytes.NewReader(jsonBytes(reservation)), objstore.WithIfNotExists()); err != nil {
+		t.Fatalf("seed the controller's exact source successor reservation: %v", err)
+	}
 	targetMembers := []quepaxa.Member{forkTestMember(t, "empty-target")}
 	targetMembership := recovery.NewMembershipRecord(request.TargetClusterID, targetMembers, "async")
 	targetMembershipBytes := jsonBytes(targetMembership)

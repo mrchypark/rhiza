@@ -487,7 +487,7 @@ func (e *FencingExecutor) verifyArchiveForkArtifacts(ctx context.Context, reques
 		return fencing.ArchiveGenesisRef{}, err
 	}
 	var lineage archiveForkLineageRecord
-	if err := decodeCanonicalArchiveJSON(lineageData, &lineage); err != nil || lineage.Version != 1 || lineage.OperationID != request.OperationID || lineage.Source != sourceID || lineage.SourceDurability != sourceDurability || lineage.SourceMembership != sourceFingerprint(sourceID, sourceDurability, sourceMembers, sourcePrefix) || lineage.TargetMembership != membership || lineage.Fork != result {
+	if err := decodeCanonicalArchiveJSON(lineageData, &lineage); err != nil || lineage.Version != 1 || lineage.OperationID != request.OperationID || lineage.Source != sourceID || lineage.SourceDurability != sourceDurability || lineage.SourceMembership != sourceFingerprint(sourceID, sourceDurability, sourceMembers, sourcePrefix) || lineage.TargetMembership != membership || !sameArchiveForkResult(lineage.Fork, result) {
 		return fencing.ArchiveGenesisRef{}, errors.Join(err, fmt.Errorf("fencing: fork lineage differs from verified artifacts"))
 	}
 	manager := recovery.NewManager(e.ArchiveBucket, targetPrefix, recovery.ArchiveConfigID)
@@ -535,6 +535,13 @@ func (e *FencingExecutor) verifyArchiveForkArtifacts(ctx context.Context, reques
 	}
 	ref.ScopeHash = scopeHash
 	return ref, ref.ValidateForScope(scope)
+}
+
+func sameArchiveForkResult(a, b recovery.ForkResult) bool {
+	if a.Tip != b.Tip || a.PrefixHash != b.PrefixHash || a.ManifestHash != b.ManifestHash || (a.FrozenSource == nil) != (b.FrozenSource == nil) {
+		return false
+	}
+	return a.FrozenSource == nil || hashJSON(a.FrozenSource) == hashJSON(b.FrozenSource)
 }
 
 func verifyIndependentProofCoverage(state fenceLedger, request FenceRequest, evidence *IndependentEvidenceV2) error {
