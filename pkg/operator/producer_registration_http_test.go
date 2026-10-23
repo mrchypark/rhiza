@@ -66,7 +66,7 @@ type supervisorRegistrationFixture struct {
 func newSupervisorRegistrationFixture(t *testing.T, required bool) supervisorRegistrationFixture {
 	t.Helper()
 	apiState := &mutationStoreFixture{objects: make(map[string]object)}
-	identity := fencing.Identity{SourceClusterID: "source", NodeID: "n0", PodUID: "pod-0", RunID: "run-0"}
+	identity := fencing.Identity{SourceClusterID: "source", NodeID: "n0", PodName: "n0", PodUID: "pod-0", RunID: "run-0"}
 	env := []any{
 		object{"name": "RHIZA_CLUSTER_ID", "value": identity.SourceClusterID},
 		object{"name": "RHIZA_OBJSTORE_PROVIDER", "value": "gcs"},
