@@ -1430,7 +1430,14 @@ func (c *Controller) reconcileAutomaticBootstrapGenesis(ctx context.Context, r *
 	if err != nil {
 		return false, "", err
 	}
-	if err := voterCountContract(r, sts, members, adopted, true, allowed); err != nil {
+	if replicas := int(number(nested(sts, "spec", "replicas"))); replicas == 0 {
+		if err := c.validateInitialSourcePods(ctx, sts, str(nested(sts, "metadata", "uid")), str(r.Metadata["uid"]), true); err != nil {
+			return false, "", err
+		}
+		if err := voterInventoryContract(r, members, adopted, true, allowed, nil); err != nil {
+			return false, "", err
+		}
+	} else if err := voterCountContract(r, sts, members, adopted, true, allowed); err != nil {
 		return false, "", err
 	}
 	if err := c.validateBootstrappedMembers(ctx, r, sts, adopted, members, allowed); err != nil {
