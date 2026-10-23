@@ -178,7 +178,7 @@ func (e *FencingExecutor) resolveSameOrdinalStartupGrant(ctx context.Context, st
 	if err := e.Kube.Get(ctx, c.resourcePath(i.RecoveryName), &child); err != nil {
 		return fencing.StartupGrant{}, true, err
 	}
-	if str(child.Metadata["uid"]) != i.RecoveryUID || hashJSON(child.Spec) != i.SpecHash || child.Spec.Membership == nil || child.Spec.Membership.AbortAddition || child.Spec.Membership.OperationID != i.RecoveryName || child.Spec.Membership.Remove != i.Failed || child.Spec.Membership.ReplacementPod != physical || child.Spec.Membership.ReplacementSecret != i.LearnerSecretName || string(child.Spec.Membership.Fence.NodeID) != string(i.Failed) || child.Spec.Membership.Fence.WALIdentity != failed.WALIdentity || child.Spec.Membership.Fence.WorkloadUID != failed.PodUID || !child.Spec.Membership.Fence.Confirmed || child.Spec.Membership.Fence.Evidence != i.Proof.ProofID || child.Spec.Fence.Evidence != i.Proof.ProofID {
+	if str(child.Metadata["uid"]) != i.RecoveryUID || hashJSON(child.Spec) != i.SpecHash || child.Spec.Membership == nil || child.Spec.Membership.AbortAddition || child.Spec.Membership.OperationID != i.RecoveryName || child.Spec.Membership.Remove != i.Failed || child.Spec.Membership.ReplacementPod != physical || child.Spec.Membership.ReplacementSecret != i.LearnerSecretName || string(child.Spec.Membership.Fence.NodeID) != string(i.Failed) || child.Spec.Membership.Fence.WALIdentity != failed.WALIdentity || child.Spec.Membership.Fence.WorkloadUID != failed.PodUID || !child.Spec.Membership.Fence.Confirmed || child.Spec.Membership.Fence.Evidence != i.Proof.ProofID {
 		return fencing.StartupGrant{}, true, fmt.Errorf("fencing: startup recovery child differs from assignment")
 	}
 	role := fencing.StartupRoleLearnerPendingRemove
