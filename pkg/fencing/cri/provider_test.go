@@ -22,12 +22,16 @@ import (
 
 type fakeRuntime struct {
 	runtimeapi.UnimplementedRuntimeServiceServer
+	runtimeapi.UnimplementedImageServiceServer
 	mu                      sync.Mutex
 	version                 *runtimeapi.VersionResponse
 	sandbox                 *runtimeapi.PodSandboxStatus
 	container               *runtimeapi.ContainerStatus
 	verboseInfo             map[string]string
 	containers              []*runtimeapi.Container
+	imageStatus             *runtimeapi.ImageStatusResponse
+	imageStatusError        codes.Code
+	imageStatusRequests     []string
 	host                    HostIdentity
 	stopContainers          int
 	stopSandboxes           int
@@ -105,6 +109,22 @@ func (f *fakeRuntime) ListContainers(_ context.Context, request *runtimeapi.List
 	return result, nil
 }
 
+func (f *fakeRuntime) ImageStatus(_ context.Context, request *runtimeapi.ImageStatusRequest) (*runtimeapi.ImageStatusResponse, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if request.Image == nil || request.Image.Image == "" {
+		return nil, status.Error(codes.InvalidArgument, "unqualified image lookup")
+	}
+	f.imageStatusRequests = append(f.imageStatusRequests, request.Image.Image)
+	if f.imageStatusError != codes.OK {
+		return nil, status.Error(f.imageStatusError, "test image status unavailable")
+	}
+	if f.imageStatus == nil {
+		return &runtimeapi.ImageStatusResponse{}, nil
+	}
+	return proto.Clone(f.imageStatus).(*runtimeapi.ImageStatusResponse), nil
+}
+
 func (f *fakeRuntime) StopContainer(ctx context.Context, request *runtimeapi.StopContainerRequest) (*runtimeapi.StopContainerResponse, error) {
 	f.mu.Lock()
 	f.stopContainers++
@@ -172,6 +192,8 @@ func newRuntimeFixture(t *testing.T) (*Provider, *fakeRuntime, fencing.RuntimeBi
 	if runtime.GOOS == "windows" {
 		t.Skip("local CRI profile requires a Unix socket")
 	}
+	nodeImageID := "sha256:" + strings.Repeat("a", 64)
+	boundImageRef := "registry.example/app@sha256:" + strings.Repeat("b", 64)
 	f := &fakeRuntime{
 		stopEntered: make(chan struct{}),
 		version:     &runtimeapi.VersionResponse{RuntimeName: "containerd", RuntimeVersion: "test-version", RuntimeApiVersion: "v1"},
@@ -179,8 +201,9 @@ func newRuntimeFixture(t *testing.T) (*Provider, *fakeRuntime, fencing.RuntimeBi
 		sandbox: &runtimeapi.PodSandboxStatus{Id: "sandbox-0", CreatedAt: 1, State: runtimeapi.PodSandboxState_SANDBOX_READY,
 			Metadata: &runtimeapi.PodSandboxMetadata{Name: "database", Namespace: "test", Uid: "pod-uid"},
 			Linux:    &runtimeapi.LinuxPodSandboxStatus{Namespaces: &runtimeapi.Namespace{Options: &runtimeapi.NamespaceOption{Pid: runtimeapi.NamespaceMode_CONTAINER, Network: runtimeapi.NamespaceMode_POD, Ipc: runtimeapi.NamespaceMode_POD}}}},
-		container:  &runtimeapi.ContainerStatus{Id: "container-0", CreatedAt: 2, State: runtimeapi.ContainerState_CONTAINER_RUNNING, ImageRef: "image-digest", Metadata: &runtimeapi.ContainerMetadata{Name: "database"}},
-		containers: []*runtimeapi.Container{{Id: "container-0", PodSandboxId: "sandbox-0", State: runtimeapi.ContainerState_CONTAINER_RUNNING, ImageRef: "image-digest", Metadata: &runtimeapi.ContainerMetadata{Name: "database"}}},
+		container:   &runtimeapi.ContainerStatus{Id: "container-0", CreatedAt: 2, State: runtimeapi.ContainerState_CONTAINER_RUNNING, ImageRef: boundImageRef, ImageId: nodeImageID, Metadata: &runtimeapi.ContainerMetadata{Name: "database"}},
+		containers:  []*runtimeapi.Container{{Id: "container-0", PodSandboxId: "sandbox-0", State: runtimeapi.ContainerState_CONTAINER_RUNNING, ImageRef: nodeImageID, ImageId: nodeImageID, Metadata: &runtimeapi.ContainerMetadata{Name: "database"}}},
+		imageStatus: &runtimeapi.ImageStatusResponse{Image: &runtimeapi.Image{Id: nodeImageID, RepoDigests: []string{boundImageRef}}},
 	}
 	// Keep Unix paths short on macOS; cleanup owns this exact new directory.
 	directory, err := os.MkdirTemp("/tmp", "rhiza-cri-")
@@ -200,6 +223,7 @@ func newRuntimeFixture(t *testing.T) (*Provider, *fakeRuntime, fencing.RuntimeBi
 	}
 	server := grpc.NewServer()
 	runtimeapi.RegisterRuntimeServiceServer(server, f)
+	runtimeapi.RegisterImageServiceServer(server, f)
 	done := make(chan struct{})
 	go func() { defer close(done); _ = server.Serve(listener) }()
 	t.Cleanup(func() { server.Stop(); _ = listener.Close(); <-done })
@@ -224,7 +248,7 @@ func newRuntimeFixture(t *testing.T) (*Provider, *fakeRuntime, fencing.RuntimeBi
 	binding := fencing.RuntimeBinding{AuthorityID: "authority", NamespaceUID: "namespace-uid", BindingUID: "binding-uid", StatefulSetUID: "sts-uid",
 		SourceClusterID: "source", NodeID: "voter-0", PodUID: "pod-uid", RunID: "run-0", NodeName: f.host.NodeName, NodeUID: f.host.NodeUID,
 		MachineID: f.host.MachineID, BootID: f.host.BootID, RuntimeID: RuntimeIdentity(profile.RuntimeName, profile.RuntimeVersion, profile.RuntimeAPIVersion),
-		SandboxID: "sandbox-0", ContainerID: "containerd://container-0", ImageID: "image-digest"}
+		SandboxID: "sandbox-0", ContainerID: "containerd://container-0", ImageID: boundImageRef}
 	request := fencing.StopRequest{OperationID: "closed-operation", RequestHash: strings.Repeat("a", 64), Identity: fencing.Identity{
 		SourceClusterID: binding.SourceClusterID, NodeID: binding.NodeID, PodUID: binding.PodUID, RunID: binding.RunID, WALIdentity: "wal"}}
 	return p, f, binding, request
@@ -240,6 +264,122 @@ func TestCRIExactStopUsesRealUnixGRPCAndVerifiesScope(t *testing.T) {
 	defer f.mu.Unlock()
 	if f.stopContainers != 1 || f.stopSandboxes != 1 || f.versionCalls != 3 {
 		t.Fatalf("unexpected execution scope: container=%d sandbox=%d versions=%d", f.stopContainers, f.stopSandboxes, f.versionCalls)
+	}
+}
+
+func TestCRIInventoryAcceptsDifferentImageRefDomainsWithMatchingImageID(t *testing.T) {
+	p, _, binding, request := newRuntimeFixture(t)
+	// containerd 2.3 reports the config digest in ListContainers.ImageRef and
+	// the manifest-list digest in ContainerStatus.ImageRef, with matching IDs.
+
+	observation, err := p.Stop(t.Context(), binding, request)
+	if err != nil || !observation.ContainerExited || !observation.SandboxNotReady {
+		t.Fatalf("different ImageRef domains with equal ImageId were rejected: %+v %v", observation, err)
+	}
+}
+
+func TestCRIImageStatusFallbackMapsPlatformDigestToBoundRepoDigest(t *testing.T) {
+	p, f, binding, request := newRuntimeFixture(t)
+	f.mu.Lock()
+	f.containers[0].ImageId, f.container.ImageId = "", ""
+	listImageRef := f.containers[0].ImageRef
+	f.mu.Unlock()
+
+	observation, err := p.Stop(t.Context(), binding, request)
+	if err != nil || !observation.ContainerExited || !observation.SandboxNotReady {
+		t.Fatalf("containerd 2.2 ImageStatus mapping was rejected: %+v %v", observation, err)
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if len(f.imageStatusRequests) == 0 {
+		t.Fatal("ImageStatus fallback was not used when both ImageId fields were absent")
+	}
+	for _, requested := range f.imageStatusRequests {
+		if requested != listImageRef {
+			t.Fatal("ImageStatus fallback did not use the exact inventory digest")
+		}
+	}
+}
+
+func TestCRIInventoryRequiresConsistentImageIDPresenceAndValue(t *testing.T) {
+	for _, change := range []string{"list mismatch", "status mismatch", "list missing", "status missing"} {
+		t.Run(change, func(t *testing.T) {
+			p, f, binding, request := newRuntimeFixture(t)
+			f.mu.Lock()
+			switch change {
+			case "list mismatch":
+				f.containers[0].ImageId = "sha256:other-config"
+			case "status mismatch":
+				f.container.ImageId = "sha256:other-config"
+			case "list missing":
+				f.containers[0].ImageId = ""
+			case "status missing":
+				f.container.ImageId = ""
+			}
+			f.mu.Unlock()
+
+			observation, err := p.Stop(t.Context(), binding, request)
+			if !errors.Is(err, ErrUnverified) || observation.ContainerStopAcknowledged || observation.SandboxStopAcknowledged {
+				t.Fatalf("invalid inventory ImageId was not rejected before stop: %+v %v", observation, err)
+			}
+			f.mu.Lock()
+			defer f.mu.Unlock()
+			if f.stopContainers != 0 || f.stopSandboxes != 0 {
+				t.Fatal("invalid inventory ImageId received a termination command")
+			}
+			if len(f.imageStatusRequests) != 0 {
+				t.Fatal("mixed or mismatched ImageId fields incorrectly used the fallback")
+			}
+		})
+	}
+}
+
+func TestCRIImageStatusFallbackRejectsUnverifiedMappings(t *testing.T) {
+	for _, change := range []string{"tag reference", "malformed digest", "unsupported algorithm", "tag-bound status", "ImageStatus error", "unresolved image", "wrong image ID", "missing exact repo digest"} {
+		t.Run(change, func(t *testing.T) {
+			p, f, binding, request := newRuntimeFixture(t)
+			f.mu.Lock()
+			f.containers[0].ImageId, f.container.ImageId = "", ""
+			imageRef := f.containers[0].ImageRef
+			switch change {
+			case "tag reference":
+				f.containers[0].ImageRef = "registry.example/app:latest"
+			case "malformed digest":
+				f.containers[0].ImageRef = "sha256:bad"
+			case "unsupported algorithm":
+				f.containers[0].ImageRef = "sha1:" + strings.Repeat("d", 40)
+			case "tag-bound status":
+				binding.ImageID = "registry.example/app:latest"
+				f.container.ImageRef = binding.ImageID
+				f.imageStatus.Image.RepoDigests = []string{binding.ImageID}
+			case "ImageStatus error":
+				f.imageStatusError = codes.Unavailable
+			case "unresolved image":
+				f.imageStatus = &runtimeapi.ImageStatusResponse{}
+			case "wrong image ID":
+				f.imageStatus.Image.Id = "sha256:" + strings.Repeat("c", 64)
+			case "missing exact repo digest":
+				f.imageStatus.Image.RepoDigests = []string{"registry.other/app@sha256:" + strings.Repeat("b", 64)}
+			}
+			f.mu.Unlock()
+
+			observation, err := p.Stop(t.Context(), binding, request)
+			if !errors.Is(err, ErrUnverified) || observation.ContainerStopAcknowledged || observation.SandboxStopAcknowledged {
+				t.Fatalf("unverified ImageStatus mapping was accepted: %+v %v", observation, err)
+			}
+			f.mu.Lock()
+			defer f.mu.Unlock()
+			if f.stopContainers != 0 || f.stopSandboxes != 0 {
+				t.Fatal("unverified ImageStatus mapping received a termination command")
+			}
+			if change == "tag reference" || change == "malformed digest" || change == "unsupported algorithm" || change == "tag-bound status" {
+				if len(f.imageStatusRequests) != 0 {
+					t.Fatal("tag-like reference reached ImageStatus fallback")
+				}
+			} else if len(f.imageStatusRequests) != 1 || f.imageStatusRequests[0] != imageRef {
+				t.Fatal("ImageStatus fallback did not use the exact inventory digest")
+			}
+		})
 	}
 }
 
@@ -260,7 +400,7 @@ func TestCRIStopRejectsRuntimeVersionChangeBeforeSandboxStop(t *testing.T) {
 }
 
 func TestCRIIdentityMismatchesIssueZeroStopCommands(t *testing.T) {
-	for _, change := range []string{"node UID", "machine", "boot", "kernel", "runtime", "runtime version", "sandbox", "pod", "namespace", "image", "container", "host PID", "unknown namespace mode", "unknown container state", "other application", "wrong membership", "bad request"} {
+	for _, change := range []string{"node UID", "machine", "boot", "kernel", "runtime", "runtime version", "sandbox", "pod", "namespace", "image", "binding image", "container", "host PID", "unknown namespace mode", "unknown container state", "other application", "wrong membership", "bad request"} {
 		t.Run(change, func(t *testing.T) {
 			p, f, binding, request := newRuntimeFixture(t)
 			f.mu.Lock()
@@ -285,6 +425,8 @@ func TestCRIIdentityMismatchesIssueZeroStopCommands(t *testing.T) {
 				f.sandbox.Metadata.Namespace = "other"
 			case "image":
 				f.container.ImageRef = "other-image"
+			case "binding image":
+				binding.ImageID = "other-image"
 			case "container":
 				f.container.Id = "other-container"
 			case "host PID":
