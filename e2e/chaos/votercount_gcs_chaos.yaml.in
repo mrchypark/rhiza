@@ -54,6 +54,8 @@ metadata:
 spec:
   serviceName: rhiza-headless
   replicas: 0
+  # The operator first pins the empty workload to the RhizaCluster UID. With
+  # bootstrap enabled it installs credentials and then performs the initial scale.
   podManagementPolicy: Parallel
   updateStrategy: {type: OnDelete}
   ordinals: {start: 0}
@@ -65,6 +67,7 @@ spec:
         app: 'rhiza-voter'
         app.kubernetes.io/part-of: 'rhiza-chaos'
         chaos.rhiza.io/run: '__RUN_ID__'
+      annotations: {rhiza.mrchypark.dev/cooperative-fencing: "1"}
     spec:
       serviceAccountName: rhiza-workload
       automountServiceAccountToken: false

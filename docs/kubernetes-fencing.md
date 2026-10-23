@@ -195,7 +195,17 @@ integration; unwrapped or unsupported hosts cannot produce this proof.
    strategic-merge patch and a separate application ServiceAccount document;
    split these documents in your manifest renderer. The application account has
    no Kubernetes RoleBinding. The token is audience-bound and rotates every ten
-   minutes; the client rereads the token file for each request.
+   minutes; the client rereads the token file for each request. For a fresh
+   supervised generation, keep the StatefulSet at `replicas: 0` while installing
+   the operator and applying the matching `RhizaCluster`; set the StatefulSet
+   Pod-template annotation `rhiza.mrchypark.dev/cooperative-fencing: "1"`.
+   The operator pins the empty StatefulSet template to that exact RhizaCluster
+   UID before any voter Pod can start. With `spec.bootstrap: true`, reconciliation
+   then installs immutable membership
+   credentials and performs the initial scale; do not manually scale or wait
+   for voter readiness before applying the RhizaCluster. Without bootstrap
+   opt-in, the operator leaves the workload deferred after pinning, and an
+   initial scale remains a separate explicit operator action.
 5. Set `RHIZA_AUTOMATIC_RECOVERY=true` on the operator. Leave
    `RHIZA_FENCER_BACKEND` empty (default) or use `kubernetes`. For compatibility,
    an empty backend with existing HTTP URL/token/CA configuration still selects

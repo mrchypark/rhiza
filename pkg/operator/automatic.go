@@ -531,9 +531,6 @@ func (c *Controller) pinInitialSupervisedRoot(ctx context.Context, r *ClusterRes
 		if err := c.validateInitialSourcePods(ctx, current, statefulSetUID, rootUID, false); err != nil {
 			return false, err
 		}
-		if int(number(nested(current, "spec", "replicas"))) == 0 {
-			return true, nil
-		}
 		return false, nil
 	}
 	metadata := asObject(nested(current, "spec", "template", "metadata"))
@@ -1150,8 +1147,8 @@ func (c *Controller) reconcileClusterMode(ctx context.Context, r *ClusterResourc
 		if initialRootOnly {
 			return nil
 		}
-		if deferReconcile {
-			return c.autoStatus(ctx, r, state, "Observing", "supervised source root is pinned; continue after initial StatefulSet scale")
+		if deferReconcile || (int(number(nested(sts, "spec", "replicas"))) == 0 && !r.Spec.Bootstrap) {
+			return c.autoStatus(ctx, r, state, "Observing", "supervised source root is pinned; waiting for the authorized initial bootstrap or scale")
 		}
 	}
 	if initialRootOnly {

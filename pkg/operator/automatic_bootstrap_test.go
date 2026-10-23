@@ -764,7 +764,7 @@ func TestAutomaticSupervisedSourcePinsRootBeforeInitialScale(t *testing.T) {
 				phase := str(nested(clusterObject, "status", "phase"))
 				message := str(nested(clusterObject, "status", "message"))
 				f.api.mu.Unlock()
-				if phase != "Observing" || message != "supervised source root is pinned; continue after initial StatefulSet scale" {
+				if phase != "Observing" || message != "supervised source root is pinned; waiting for the authorized initial bootstrap or scale" {
 					t.Fatalf("successful root pin did not report the expected observing status: phase=%q status=%q", phase, message)
 				}
 				if state, _, err := controller.loadAuto(t.Context(), controller.autoKey(&cluster)); err == nil || state != nil {
@@ -811,6 +811,85 @@ func TestAutomaticSupervisedSourcePinsRootBeforeInitialScale(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestSupervisedBootstrapContinuesOnlyAfterVerifiedRootPin(t *testing.T) {
+	t.Run("bootstrap installs credentials then scales on later adopted reconcile", func(t *testing.T) {
+		f := newAutomaticBootstrapGenesisFixture(t)
+		controller, cluster, _ := prepareAutomaticInitialRootPin(t, &f)
+		stsPath := controller.stsPath(cluster.Spec.StatefulSet)
+		secretPath := controller.corePath("secrets", bootstrapSecretName(&cluster))
+		f.api.mu.Lock()
+		ctr := asObject(list(nested(f.api.objects[stsPath], "spec", "template", "spec", "containers"))[0])
+		for _, name := range []string{"RHIZA_CLUSTER_MEMBERS", "RHIZA_ADMIN_TOKEN", "RHIZA_PEER_TOKENS", "RHIZA_PEER_TOKEN"} {
+			ctr["env"] = removeEnv(list(ctr["env"]), name)
+		}
+		delete(f.api.objects, secretPath)
+		f.api.mu.Unlock()
+
+		if err := controller.reconcileCluster(t.Context(), &cluster); err != nil {
+			t.Fatal(err)
+		}
+		if got := str(nested(f.api.objects[stsPath], "spec", "template", "metadata", "annotations", fencingRootAnnotation)); got != automaticBootstrapClusterUID {
+			t.Fatalf("first reconcile did not pin the exact root before bootstrap: %q", got)
+		}
+		if int(number(nested(f.api.objects[stsPath], "spec", "replicas"))) != 0 || f.api.objects[secretPath] != nil {
+			t.Fatal("first root-pin reconcile installed credentials or scaled the workload")
+		}
+
+		if err := controller.reconcileCluster(t.Context(), &cluster); err != nil {
+			t.Fatal(err)
+		}
+		if f.api.objects[secretPath] == nil || int(number(nested(f.api.objects[stsPath], "spec", "replicas"))) != 0 {
+			t.Fatal("verified-root bootstrap did not install credentials while remaining writer-free")
+		}
+		ctr = asObject(list(nested(f.api.objects[stsPath], "spec", "template", "spec", "containers"))[0])
+		if str(nested(envEntry(ctr, "RHIZA_CLUSTER_MEMBERS"), "valueFrom", "secretKeyRef", "name")) != bootstrapSecretName(&cluster) {
+			t.Fatal("bootstrap did not install the expected immutable membership Secret reference")
+		}
+
+		if err := controller.reconcileCluster(t.Context(), &cluster); err != nil {
+			t.Fatal(err)
+		}
+		if int(number(nested(f.api.objects[stsPath], "spec", "replicas"))) != cluster.Spec.VoterCount {
+			t.Fatalf("adopted bootstrap did not scale after credentials were installed: replicas=%v", nested(f.api.objects[stsPath], "spec", "replicas"))
+		}
+		if got := str(nested(f.api.objects[stsPath], "spec", "template", "metadata", "annotations", fencingRootAnnotation)); got != automaticBootstrapClusterUID {
+			t.Fatalf("bootstrap scale changed the verified root binding: %q", got)
+		}
+	})
+
+	t.Run("nonbootstrap supervised source remains deferred", func(t *testing.T) {
+		f := newAutomaticBootstrapGenesisFixture(t)
+		controller, cluster, _ := prepareAutomaticInitialRootPin(t, &f)
+		cluster.Spec.Bootstrap = false
+		storeAutomaticBootstrapCluster(t, f, cluster)
+		stsPath := controller.stsPath(cluster.Spec.StatefulSet)
+		secretPath := controller.corePath("secrets", bootstrapSecretName(&cluster))
+		candidateKey := controller.bootstrapCandidateKey(&cluster)
+		if err := controller.Bucket.Delete(t.Context(), candidateKey); err != nil {
+			t.Fatal(err)
+		}
+		f.api.mu.Lock()
+		ctr := asObject(list(nested(f.api.objects[stsPath], "spec", "template", "spec", "containers"))[0])
+		for _, name := range []string{"RHIZA_CLUSTER_MEMBERS", "RHIZA_ADMIN_TOKEN", "RHIZA_PEER_TOKENS", "RHIZA_PEER_TOKEN"} {
+			ctr["env"] = removeEnv(list(ctr["env"]), name)
+		}
+		delete(f.api.objects, secretPath)
+		f.api.mu.Unlock()
+
+		for i := 0; i < 2; i++ {
+			if err := controller.reconcileCluster(t.Context(), &cluster); err != nil {
+				t.Fatal(err)
+			}
+		}
+		if got := str(nested(f.api.objects[stsPath], "spec", "template", "metadata", "annotations", fencingRootAnnotation)); got != automaticBootstrapClusterUID {
+			t.Fatalf("nonbootstrap source lost its initial root pin: %q", got)
+		}
+		if int(number(nested(f.api.objects[stsPath], "spec", "replicas"))) != 0 || f.api.objects[secretPath] != nil {
+			t.Fatal("nonbootstrap supervised source was bootstrapped or scaled without opt-in")
+		}
+	})
 }
 
 func TestReconcileAllPinsSupervisedRootWithAutomaticRecoveryDisabled(t *testing.T) {
