@@ -236,6 +236,7 @@ func TestFixtureOnlyWorkflowIsExclusiveAndRunsFixedGoSelectors(t *testing.T) {
 		t.Fatal("fixture-only job must retain only the fixed embedded rollback/IAM/manifest/launcher selector")
 	}
 	wantCommands := []string{
+		`go test ./pkg/operator -run '^(TestManualTerminalFrozenForkRegistersWithoutIndependentV2|TestAuthenticatedLearnerPromotionRetriesExactCanonicalCompletion)$' -count=1 -timeout=5m`,
 		`go test ./pkg/node -run '^(TestMembershipRetryDurablyPublishesCommittedConfiguration|TestMembershipAdditionAbortAllowsNextRevision)$' -count=1 -timeout=5m`,
 		`go test ./e2e/chaos/embedded-go -run "$embedded_tests" -count=1 -timeout=5m`,
 		`go test ./pkg/fencing ./pkg/fencing/cri ./pkg/fencing/runtimeagent ./pkg/operator ./pkg/recovery ./internal/objstore ./e2e/fencing -count=1 -timeout=5m`,
@@ -248,8 +249,16 @@ func TestFixtureOnlyWorkflowIsExclusiveAndRunsFixedGoSelectors(t *testing.T) {
 			t.Errorf("fixture-only job omits exact package/selector command %q", command)
 		}
 	}
+	previousCommand := -1
+	for _, command := range wantCommands {
+		position := strings.Index(run, command)
+		if position <= previousCommand {
+			t.Fatalf("fixture-only commands are not in the required order: %q", command)
+		}
+		previousCommand = position
+	}
 	if strings.Count(run, "go test ") != len(wantCommands) {
-		t.Fatal("fixture-only job must contain only the six asserted focused test commands")
+		t.Fatal("fixture-only job must contain only the seven asserted focused test commands")
 	}
 	if strings.Contains(run, "go test ./...") || strings.Contains(run, "kind ") || strings.Contains(run, "docker ") {
 		t.Fatal("fixture-only job must remain a focused Go feedback path without cluster/image work")
