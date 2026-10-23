@@ -369,8 +369,29 @@ k rollout status deployment/rhiza-fencer --timeout=180s
 "$FENCING_E2E_BIN" runtime-probe
 fencing_source_sts_uid=$(k --request-timeout=10s get statefulset rhiza -o jsonpath='{.metadata.uid}')
 case "$fencing_source_sts_uid" in ''|*[!A-Za-z0-9_-]*) echo 'source StatefulSet identity is unavailable' >&2; exit 2 ;; esac
-k scale statefulset rhiza --replicas=3
-"$FENCING_E2E_BIN" wait-source
+# The automatic controller must pin the API-assigned RhizaCluster UID onto the
+# supervised source template before any voter Pod can enroll. Start it while
+# the StatefulSet is still empty, then require that exact binding before scale.
+fencing_source_root_uid=$(k --request-timeout=10s get rhizaclusters rhiza -o jsonpath='{.metadata.uid}')
+case "$fencing_source_root_uid" in ''|*[!A-Za-z0-9_-]*) echo 'source RhizaCluster identity is unavailable' >&2; exit 2 ;; esac
 k scale deployment rhiza-operator --replicas=1
 k rollout status deployment/rhiza-operator --timeout=120s
+fencing_root_pin_attempt=0
+while [ "$fencing_root_pin_attempt" -lt 120 ]; do
+  fencing_root_pin_state=$(k --request-timeout=10s get statefulset rhiza -o json 2>/dev/null || true)
+  if printf '%s\n' "$fencing_root_pin_state" | jq -e --arg uid "$fencing_source_root_uid" --arg sts_uid "$fencing_source_sts_uid" \
+    '.metadata.uid == $sts_uid and .spec.replicas == 0 and .spec.template.metadata.annotations["rhiza.mrchypark.dev/fencing-root-uid"] == $uid' >/dev/null 2>&1; then
+    break
+  fi
+  sleep 1
+  fencing_root_pin_attempt=$((fencing_root_pin_attempt + 1))
+done
+if [ "$fencing_root_pin_attempt" -ge 120 ]; then
+  echo 'automatic controller did not pin the verified source root before initial scale' >&2
+  exit 2
+fi
+fencing_current_root_uid=$(k --request-timeout=10s get rhizaclusters rhiza -o jsonpath='{.metadata.uid}')
+[ "$fencing_current_root_uid" = "$fencing_source_root_uid" ] || { echo 'source RhizaCluster identity changed before initial scale' >&2; exit 2; }
+k scale statefulset rhiza --replicas=3
+"$FENCING_E2E_BIN" wait-source
 "$FENCING_E2E_BIN" run

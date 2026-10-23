@@ -620,6 +620,186 @@ func automaticBootstrapController(t *testing.T, f automaticBootstrapGenesisFixtu
 	return controller, server, cluster
 }
 
+func prepareAutomaticInitialRootPin(t *testing.T, f *automaticBootstrapGenesisFixture) (*Controller, ClusterResource, []any) {
+	t.Helper()
+	stsPath := f.e.controller().stsPath("rhiza")
+	podsPath := f.e.controller().corePath("pods", "")
+	f.api.mu.Lock()
+	sts := f.api.objects[stsPath]
+	if sts == nil {
+		sts = f.api.authStatefulSet
+	}
+	spec := asObject(sts["spec"])
+	spec["replicas"] = float64(0)
+	spec["selector"] = object{"matchLabels": object{"app": "rhiza"}}
+	metadata := asObject(sts["metadata"])
+	metadata["resourceVersion"] = "1"
+	template := asObject(spec["template"])
+	templateMetadata := asObject(template["metadata"])
+	if templateMetadata == nil {
+		templateMetadata = object{"labels": object{"app": "rhiza"}}
+		template["metadata"] = templateMetadata
+	}
+	templateMetadata["annotations"] = object{fencingProtocolAnnotation: "1"}
+	originalPods := list(asObject(f.api.objects[podsPath])["items"])
+	f.api.objects[stsPath] = sts
+	f.api.authStatefulSet = sts
+	f.api.objects[podsPath] = object{"items": []any{}}
+	f.api.mu.Unlock()
+	controller, _, cluster := automaticBootstrapController(t, *f)
+	return controller, cluster, originalPods
+}
+
+type initialRootPinRaceTransport struct {
+	api   *mutationStoreFixture
+	next  http.RoundTripper
+	path  string
+	fired bool
+}
+
+func (t *initialRootPinRaceTransport) RoundTrip(request *http.Request) (*http.Response, error) {
+	if request.Method == http.MethodPut && request.URL.Path == t.path && !t.fired {
+		t.api.mu.Lock()
+		current := t.api.objects[t.path]
+		if current != nil {
+			asObject(current["metadata"])["resourceVersion"] = "2"
+			t.fired = true
+		}
+		t.api.mu.Unlock()
+	}
+	return t.next.RoundTrip(request)
+}
+
+func TestAutomaticSupervisedSourcePinsRootBeforeInitialScale(t *testing.T) {
+	for _, name := range []string{"valid", "manual-supervised", "conflicting-root", "scaled", "matching-pod", "matching-unowned-pod", "terminating-pod", "stale-cluster-uid", "existing-binding", "empty-selector", "wrong-source", "resource-version-race", "not-supervised"} {
+		t.Run(name, func(t *testing.T) {
+			f := newAutomaticBootstrapGenesisFixture(t)
+			controller, cluster, originalPods := prepareAutomaticInitialRootPin(t, &f)
+			stsPath := f.e.controller().stsPath("rhiza")
+			podsPath := f.e.controller().corePath("pods", "")
+			switch name {
+			case "conflicting-root":
+				f.api.mu.Lock()
+				asObject(nested(f.api.objects[stsPath], "spec", "template", "metadata"))["annotations"] = object{fencingProtocolAnnotation: "1", fencingRootAnnotation: "another-root"}
+				f.api.mu.Unlock()
+			case "scaled":
+				f.api.mu.Lock()
+				asObject(f.api.objects[stsPath]["spec"])["replicas"] = float64(3)
+				f.api.mu.Unlock()
+			case "matching-pod":
+				f.api.mu.Lock()
+				f.api.objects[podsPath] = object{"items": originalPods}
+				f.api.mu.Unlock()
+			case "matching-unowned-pod":
+				f.api.mu.Lock()
+				pod := asObject(originalPods[0])
+				asObject(pod["metadata"])["ownerReferences"] = []any{object{"apiVersion": "apps/v1", "kind": "StatefulSet", "name": "rhiza", "uid": "other-sts-uid", "controller": true}}
+				f.api.objects[podsPath] = object{"items": originalPods[:1]}
+				f.api.mu.Unlock()
+			case "terminating-pod":
+				f.api.mu.Lock()
+				pod := asObject(originalPods[0])
+				asObject(pod["metadata"])["deletionTimestamp"] = "2026-10-24T00:00:00Z"
+				f.api.objects[podsPath] = object{"items": originalPods[:1]}
+				f.api.mu.Unlock()
+			case "stale-cluster-uid":
+				f.api.mu.Lock()
+				clusterObject := asObject(f.api.objects[controller.clusterPath(automaticBootstrapClusterName)])
+				asObject(clusterObject["metadata"])["uid"] = "recreated-cluster-uid"
+				f.api.mu.Unlock()
+			case "existing-binding":
+				key := path.Join(controller.Prefix, "automatic-workloads", controller.Kube.Namespace, f.runtime.StatefulSetUID, "binding.json")
+				if err := controller.immutable(t.Context(), key, jsonBytes(object{"bindingUID": automaticBootstrapClusterUID})); err != nil {
+					t.Fatal(err)
+				}
+			case "empty-selector":
+				f.api.mu.Lock()
+				asObject(f.api.objects[stsPath]["spec"])["selector"] = object{"matchLabels": object{}}
+				f.api.mu.Unlock()
+			case "wrong-source":
+				f.api.mu.Lock()
+				ctr := asObject(list(nested(f.api.objects[stsPath], "spec", "template", "spec", "containers"))[0])
+				ctr["env"] = replaceEnv(list(ctr["env"]), "RHIZA_CLUSTER_ID", object{"value": "wrong-source"})
+				f.api.mu.Unlock()
+			case "manual-supervised":
+				cluster.Spec.Automatic = false
+				cluster.Spec.Policy = nil
+				storeAutomaticBootstrapCluster(t, f, cluster)
+			case "resource-version-race":
+				tracer := &initialRootPinRaceTransport{api: f.api, next: controller.Kube.Client.Transport, path: stsPath}
+				controller.Kube.Client.Transport = tracer
+				t.Cleanup(func() { controller.Kube.Client.Transport = tracer.next })
+			case "not-supervised":
+				f.api.mu.Lock()
+				asObject(nested(f.api.objects[stsPath], "spec", "template", "metadata"))["annotations"] = object{}
+				f.api.mu.Unlock()
+			}
+
+			err := controller.reconcileCluster(t.Context(), &cluster)
+			if err != nil {
+				t.Fatalf("controller reconcile returned an unexpected transport error: %v", err)
+			}
+			gotRoot := str(nested(f.api.objects[stsPath], "spec", "template", "metadata", "annotations", fencingRootAnnotation))
+			if name == "valid" || name == "manual-supervised" {
+				if gotRoot != automaticBootstrapClusterUID || int(number(nested(f.api.objects[stsPath], "spec", "replicas"))) != 0 {
+					t.Fatalf("automatic source was not pinned while still empty: root=%q StatefulSet=%v", gotRoot, f.api.objects[stsPath])
+				}
+				if state, _, err := controller.loadAuto(t.Context(), controller.autoKey(&cluster)); err == nil || state != nil {
+					t.Fatalf("controller advanced durable recovery state before initial scale: state=%+v err=%v", state, err)
+				}
+				if len(list(asObject(f.api.objects[podsPath])["items"])) != 0 {
+					t.Fatal("root pin created or retained a source Pod")
+				}
+				return
+			}
+			if name == "resource-version-race" {
+				transport := controller.Kube.Client.Transport.(*initialRootPinRaceTransport)
+				if !transport.fired {
+					t.Fatal("resourceVersion race was not injected before the root-pin PUT")
+				}
+				if str(nested(f.api.objects[stsPath], "metadata", "resourceVersion")) != "2" {
+					t.Fatalf("concurrent StatefulSet update was not retained: %v", f.api.objects[stsPath])
+				}
+			}
+			if gotRoot == automaticBootstrapClusterUID {
+				t.Fatalf("%s precondition failure was accepted and the root pin was written", name)
+			}
+		})
+	}
+}
+
+func TestReconcileAllPinsSupervisedRootWithAutomaticRecoveryDisabled(t *testing.T) {
+	for _, mode := range []string{"manual-cluster", "global-recovery-disabled"} {
+		t.Run(mode, func(t *testing.T) {
+			f := newAutomaticBootstrapGenesisFixture(t)
+			controller, cluster, _ := prepareAutomaticInitialRootPin(t, &f)
+			controller.Automatic = false
+			if mode == "manual-cluster" {
+				cluster.Spec.Automatic = false
+				cluster.Spec.Policy = nil
+			}
+			storeAutomaticBootstrapCluster(t, f, cluster)
+			f.api.mu.Lock()
+			f.api.objects[controller.resourcePath("")] = object{"items": []any{}}
+			f.api.mu.Unlock()
+
+			if err := controller.reconcileAll(t.Context()); err != nil {
+				t.Fatalf("global-off reconcile failed to perform supervised root initialization: %v", err)
+			}
+			stsPath := controller.stsPath("rhiza")
+			if got := str(nested(f.api.objects[stsPath], "spec", "template", "metadata", "annotations", fencingRootAnnotation)); got != automaticBootstrapClusterUID {
+				t.Fatalf("global-off reconcile did not pin the supervised root: got %q", got)
+			}
+			if state, _, err := controller.loadAuto(t.Context(), controller.autoKey(&cluster)); err == nil || state != nil {
+				t.Fatalf("global-off initialization advanced automatic recovery: state=%+v err=%v", state, err)
+			}
+			if len(list(asObject(f.api.objects[controller.resourcePath("")])["items"])) != 0 {
+				t.Fatal("global-off initialization created a recovery child")
+			}
+		})
+	}
+}
+
 func TestAutomaticControllerRecognizesMissingMembershipOnlyWithCanonicalBootstrapEvidence(t *testing.T) {
 	t.Run("valid control preflight creates protected fence intent", func(t *testing.T) {
 		f := newAutomaticBootstrapGenesisFixture(t)
