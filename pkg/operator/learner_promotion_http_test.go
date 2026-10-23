@@ -41,6 +41,15 @@ func TestAuthenticatedLearnerPromotionRetriesExactCanonicalCompletion(t *testing
 		template["metadata"] = metadata
 	}
 	metadata["annotations"] = annotations
+	containers := list(nested(supervisedSTS, "spec", "template", "spec", "containers"))
+	if len(containers) != 1 || asObject(containers[0]) == nil {
+		f.api.mu.Unlock()
+		t.Fatal("supervised StatefulSet fixture container is missing or ambiguous")
+	}
+	asObject(containers[0])["ports"] = []any{
+		object{"name": "http", "containerPort": float64(8080)},
+		object{"name": "peer-quic", "containerPort": float64(9090), "protocol": "UDP"},
+	}
 	if f.api.authStatefulSet != nil {
 		f.api.authStatefulSet = supervisedSTS
 	}
