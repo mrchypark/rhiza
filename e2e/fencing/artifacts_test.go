@@ -299,6 +299,70 @@ func TestVoterStartupDiagnosticsAreIdentityBoundAndRedacted(t *testing.T) {
 	}
 }
 
+func TestVoterStartupStageProjectionUsesExactWrappersAndFixedCodes(t *testing.T) {
+	const canary = "private-startup-error-canary"
+	logs := strings.Join([]string{
+		"2026/10/24 10:00:00 open rhiza: connect fencing startup gate: fencing: invalid startup grant: " + canary,
+		"2026/10/24 10:00:01 open rhiza: open WAL: /private/path/" + canary,
+		"2026/10/24 10:00:02 open rhiza: prepare source retry directory: /private/path/" + canary,
+		"2026/10/24 10:00:03 open rhiza: read canonical archive genesis: " + canary,
+		"2026/10/24 10:00:04 open rhiza: create QuePaxa core: " + canary,
+		"2026/10/24 10:00:05 open rhiza: " + canary,
+		"not-a-timestamp open rhiza: open WAL: " + canary,
+	}, "\n") + "\n"
+	logPath := filepath.Join(t.TempDir(), "current.log")
+	if err := os.WriteFile(logPath, []byte(logs), 0600); err != nil {
+		t.Fatal(err)
+	}
+	view := readVoterLog(filepath.Dir(logPath), "current", true)
+	if !view.Captured || len(view.StartupStages) != 6 || view.StartupStagesTruncated {
+		t.Fatalf("startup stage projection is incomplete: %+v", view)
+	}
+	want := []string{
+		"startup_grant/response_invalid",
+		"wal/open_failed",
+		"source_mutation/retry_directory_failed",
+		"archive_genesis/read_failed",
+		"consensus/core_create_failed",
+		"node_open/unknown",
+	}
+	for i := range want {
+		if view.StartupStages[i] != want[i] {
+			t.Fatalf("startup stage %d = %q, want %q", i, view.StartupStages[i], want[i])
+		}
+	}
+	public, err := json.Marshal(view)
+	if err != nil || bytes.Contains(public, []byte(canary)) || bytes.Contains(public, []byte("/private/path")) {
+		t.Fatalf("startup stage projection leaked private error text: %v", err)
+	}
+	if got := classifyVoterStartupLog([]byte(logs)); !contains(got, "supervisor_admission_failed") || !contains(got, "node_open_failed") {
+		t.Fatalf("legacy categories no longer preserve overlapping wrapper classifications: %v", got)
+	}
+}
+
+func TestVoterStartupStageProjectionIsBounded(t *testing.T) {
+	prefixes := []string{
+		"connect fencing startup gate: fencing: invalid startup grant:",
+		"fencing: pending-removal startup requires an explicit nonvoting learner configuration",
+		"fencing: bind receipt identity differs",
+		"fencing: bind role differs from startup grant",
+		"fencing: WAL identity cannot change",
+		"fencing: authenticated WAL binding differs",
+		"fencing: source producer binding changed",
+		"fencing: supervisor returned HTTP 403",
+		"open WAL:",
+		"open object store:",
+	}
+	var lines []string
+	for i, prefix := range prefixes {
+		lines = append(lines, fmt.Sprintf("2026/10/24 10:00:%02d open rhiza: %s private", i, prefix))
+	}
+	stages, truncated := classifyVoterStartupStages([]byte(strings.Join(lines, "\n")))
+	if len(stages) != maxVoterStartupStages || !truncated {
+		t.Fatalf("startup stage projection was not bounded: stages=%v truncated=%v", stages, truncated)
+	}
+}
+
 func contains(values []string, want string) bool {
 	for _, value := range values {
 		if value == want {

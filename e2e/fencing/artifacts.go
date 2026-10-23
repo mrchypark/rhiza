@@ -522,11 +522,15 @@ type voterContainerView struct {
 }
 
 type voterLogView struct {
-	Captured bool     `json:"captured"`
-	Bytes    int      `json:"bytes"`
-	SHA256   string   `json:"sha256,omitempty"`
-	Startup  []string `json:"startupCategories,omitempty"`
+	Captured               bool     `json:"captured"`
+	Bytes                  int      `json:"bytes"`
+	SHA256                 string   `json:"sha256,omitempty"`
+	Startup                []string `json:"startupCategories,omitempty"`
+	StartupStages          []string `json:"startupStages,omitempty"`
+	StartupStagesTruncated bool     `json:"startupStagesTruncated,omitempty"`
 }
+
+const maxVoterStartupStages = 8
 
 var allowedVoterPhases = map[string]struct{}{"Pending": {}, "Running": {}, "Succeeded": {}, "Failed": {}, "Unknown": {}}
 var allowedVoterConditionTypes = map[string]struct{}{"Ready": {}, "PodScheduled": {}, "Initialized": {}, "ContainersReady": {}}
@@ -567,6 +571,46 @@ var voterStartupPrefixes = []struct{ prefix, category string }{
 	{"configure learner:", "role_config_failed"},
 	{"configure object-store:", "role_config_failed"},
 	{"listen on ", "http_listener_failed"},
+}
+
+// These fixed source wrappers identify where Node.Open failed without
+// publishing the nested error, which may contain private paths or credentials.
+var voterStartupStagePrefixes = []struct{ prefix, stageCode string }{
+	{"fencing: pending-removal startup requires an explicit nonvoting learner configuration", "startup_grant/role_rejected"},
+	{"fencing: bind receipt", "wal_binding/receipt_rejected"},
+	{"fencing: bind role differs from startup grant", "wal_binding/role_mismatch"},
+	{"fencing: WAL identity cannot change", "wal_binding/identity_changed"},
+	{"fencing: authenticated WAL binding differs", "wal_binding/identity_mismatch"},
+	{"fencing: source producer binding changed", "wal_binding/producer_changed"},
+	{"supervised WAL binding requires an authenticated fencing session", "wal_binding/session_missing"},
+	{"fencing: supervisor returned HTTP ", "supervisor_call/rejected"},
+	{"open WAL:", "wal/open_failed"},
+	{"open object store:", "object_store/open_failed"},
+	{"register voter:", "voter_registration/failed"},
+	{"prepare source retry directory:", "source_mutation/retry_directory_failed"},
+	{"open source mutation client:", "source_mutation/client_open_failed"},
+	{"supervised source mutations currently require GCS", "source_mutation/provider_unsupported"},
+	{"fencing: validated mutation binding disappeared", "source_mutation/binding_missing"},
+	{"read canonical archive genesis:", "archive_genesis/read_failed"},
+	{"confirm canonical archive genesis:", "archive_genesis/confirmation_failed"},
+	{"create canonical archive genesis:", "archive_genesis/create_failed"},
+	{"load canonical archive genesis HEAD:", "archive_genesis/head_load_failed"},
+	{"fencing: archive genesis", "archive_genesis/validation_failed"},
+	{"fencing: canonical archive", "archive_genesis/validation_failed"},
+	{"acquire lock:", "node_open/lock_failed"},
+	{"load checkpoint manifest:", "recovery/checkpoint_manifest_failed"},
+	{"pin startup recovery evidence:", "recovery/evidence_pin_failed"},
+	{"recover shared archive:", "recovery/archive_failed"},
+	{"open materializer:", "materializer/open_failed"},
+	{"rebuild materializer:", "materializer/rebuild_failed"},
+	{"configure local graph indexes:", "materializer/configure_failed"},
+	{"create QuePaxa core:", "consensus/core_create_failed"},
+	{"restore generation anchor:", "recovery/generation_anchor_failed"},
+	{"restore checkpoint recovery base:", "recovery/checkpoint_base_failed"},
+	{"recover certified log through ", "recovery/replay_failed"},
+	{"replay local decisions:", "recovery/replay_failed"},
+	{"renew startup recovery evidence:", "recovery/evidence_renew_failed"},
+	{"listen peer QUIC:", "peer_listener/open_failed"},
 }
 
 func safeJSON(name string, data []byte) ([]byte, error) {
@@ -775,8 +819,12 @@ func readVoterLog(dir, name string, startupFailure bool) voterLogView {
 	view.Bytes = len(data)
 	view.SHA256 = hex.EncodeToString(digest[:])
 	view.Startup = classifyVoterStartupLog(data)
+	view.StartupStages, view.StartupStagesTruncated = classifyVoterStartupStages(data)
 	if startupFailure && len(view.Startup) == 0 && len(bytes.TrimSpace(data)) != 0 {
 		view.Startup = []string{"unknown_startup_error"}
+	}
+	if startupFailure && len(view.StartupStages) == 0 && len(bytes.TrimSpace(data)) != 0 {
+		view.StartupStages = []string{"node_open/unknown"}
 	}
 	return view
 }
@@ -797,6 +845,72 @@ func classifyVoterStartupLog(data []byte) []string {
 		}
 	}
 	return categories
+}
+
+func classifyVoterStartupStages(data []byte) ([]string, bool) {
+	seen := map[string]bool{}
+	var stages []string
+	truncated := false
+	for _, line := range strings.Split(string(data), "\n") {
+		if len(line) < 20+len("open rhiza: ") {
+			continue
+		}
+		if _, err := time.Parse("2006/01/02 15:04:05 ", line[:20]); err != nil || !strings.HasPrefix(line[20:], "open rhiza: ") {
+			continue
+		}
+		errText := strings.TrimPrefix(line[20:], "open rhiza: ")
+		if strings.HasPrefix(errText, "connect fencing startup gate: ") {
+			errText = strings.TrimPrefix(errText, "connect fencing startup gate: ")
+			stageCode := "startup_grant/connect_failed"
+			switch {
+			case strings.HasPrefix(errText, "fencing: invalid startup grant:"):
+				stageCode = "startup_grant/response_invalid"
+			case strings.HasPrefix(errText, "fencing: startup grant logical identity differs from child configuration"):
+				stageCode = "startup_grant/identity_mismatch"
+			case strings.HasPrefix(errText, "fencing: supervisor returned HTTP "):
+				stageCode = "startup_grant/rejected"
+			}
+			if !seen[stageCode] {
+				seen[stageCode] = true
+				if len(stages) < maxVoterStartupStages {
+					stages = append(stages, stageCode)
+				} else {
+					truncated = true
+				}
+			}
+			continue
+		}
+		matched := false
+		for _, item := range voterStartupStagePrefixes {
+			if !strings.HasPrefix(errText, item.prefix) {
+				continue
+			}
+			matched = true
+			if seen[item.stageCode] {
+				break
+			}
+			seen[item.stageCode] = true
+			if len(stages) < maxVoterStartupStages {
+				stages = append(stages, item.stageCode)
+			} else {
+				truncated = true
+			}
+			break
+		}
+		if !matched {
+			// A valid outer wrapper with an unknown nested error is useful to
+			// distinguish from a pre-Node.Open supervisor registration failure.
+			if !seen["node_open/unknown"] {
+				seen["node_open/unknown"] = true
+				if len(stages) < maxVoterStartupStages {
+					stages = append(stages, "node_open/unknown")
+				} else {
+					truncated = true
+				}
+			}
+		}
+	}
+	return stages, truncated
 }
 
 func validateRuntimeAgentDiagnostics(view fencerDiagnosticsView) error {
