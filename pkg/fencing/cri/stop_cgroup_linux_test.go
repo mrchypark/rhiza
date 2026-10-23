@@ -15,6 +15,7 @@ import (
 
 type fakeStopCgroupKernel struct {
 	dev, ino, fsType, links uint64
+	identityErr             error
 	pidErr                  error
 	populatedFlag           bool
 	populatedErr            error
@@ -22,7 +23,7 @@ type fakeStopCgroupKernel struct {
 }
 
 func (k *fakeStopCgroupKernel) identity(int) (uint64, uint64, uint64, uint64, error) {
-	return k.dev, k.ino, k.fsType, k.links, nil
+	return k.dev, k.ino, k.fsType, k.links, k.identityErr
 }
 func (k *fakeStopCgroupKernel) pidExited(int) error { return k.pidErr }
 func (k *fakeStopCgroupKernel) populated(int) (bool, error) {
@@ -44,31 +45,57 @@ func TestStopCgroupPinRejectsLiveTargetPID(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer func() { _ = unix.Close(fd) }()
-	if err := verifyPIDFDExited(fd); !errors.Is(err, ErrUnverified) {
+	if err := verifyPIDFDExited(fd); !errors.Is(err, ErrUnverified) || stopCgroupFailureCode(err) != "target_process_live" {
 		t.Fatalf("live process was accepted as exited: %v", err)
+	}
+}
+
+func TestVerifyPIDFDRejectsInvalidDescriptorAsUnavailable(t *testing.T) {
+	if err := verifyPIDFDExited(1 << 20); !errors.Is(err, ErrUnverified) || stopCgroupFailureCode(err) != "target_process_state_unavailable" {
+		t.Fatalf("invalid pidfd was not classified as unavailable: %v", err)
 	}
 }
 
 func TestPinnedStopCgroupVerifyEmptyUsesExactKernelState(t *testing.T) {
 	tests := []struct {
-		name      string
-		links     uint64
-		pidErr    error
-		populated bool
-		wantErr   bool
+		name        string
+		links       uint64
+		pidErr      error
+		populated   bool
+		popErr      error
+		identityErr error
+		dev         uint64
+		wantCode    string
+		wantErr     bool
 	}{
-		{name: "live pid despite detached inode", links: 0, pidErr: ErrUnverified, wantErr: true},
+		{name: "live pid despite detached inode", links: 0, pidErr: stopCgroupFailure("target_process_live", ErrUnverified), wantCode: "target_process_live", wantErr: true},
+		{name: "unreadable pid state", links: 0, pidErr: ErrUnverified, wantCode: "target_process_state_unavailable", wantErr: true},
 		{name: "exited pid and detached exact inode", links: 0},
-		{name: "exited pid but linked populated cgroup", links: 1, populated: true, wantErr: true},
+		{name: "changed cgroup identity", links: 1, dev: 6, wantCode: "cgroup_identity_changed", wantErr: true},
+		{name: "unreadable cgroup identity", links: 1, identityErr: errors.New("private kernel error"), wantCode: "cgroup_observation_unavailable", wantErr: true},
+		{name: "exited pid but linked populated cgroup", links: 1, populated: true, wantCode: "cgroup_populated", wantErr: true},
+		{name: "unreadable cgroup population", links: 1, popErr: errors.New("private kernel error"), wantCode: "cgroup_observation_unavailable", wantErr: true},
 		{name: "exited pid and linked empty cgroup", links: 1},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
-			kernel := &fakeStopCgroupKernel{dev: 4, ino: 5, fsType: uint64(unix.CGROUP2_SUPER_MAGIC), links: test.links, pidErr: test.pidErr, populatedFlag: test.populated}
+			dev := test.dev
+			if dev == 0 {
+				dev = 4
+			}
+			kernel := &fakeStopCgroupKernel{dev: dev, ino: 5, fsType: uint64(unix.CGROUP2_SUPER_MAGIC), links: test.links, identityErr: test.identityErr,
+				pidErr: test.pidErr, populatedFlag: test.populated, populatedErr: test.popErr}
 			pin := &pinnedStopCgroup{cgroupFD: 10, pidFD: 11, dev: 4, ino: 5, kernel: kernel}
 			err := pin.verifyEmpty()
 			if test.wantErr != errors.Is(err, ErrUnverified) {
 				t.Fatalf("verifyEmpty error=%v, wantErr=%v", err, test.wantErr)
+			}
+			if test.wantCode != "" {
+				diagnostic := preSandboxScopeDiagnostic(err)
+				got, ok := StopDiagnosticFrom(diagnostic)
+				if !ok || got.Stage != "pre_sandbox_scope" || got.Code != test.wantCode || !errors.Is(diagnostic, ErrUnverified) {
+					t.Fatalf("bounded diagnostic=%+v, want pre_sandbox_scope/%s, err=%v", got, test.wantCode, err)
+				}
 			}
 			pin.close()
 			if len(kernel.closed) != 2 || kernel.closed[0] != 10 || kernel.closed[1] != 11 {

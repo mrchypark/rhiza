@@ -67,17 +67,23 @@ func pinStopCgroup(procRoot, cgroupRoot string, scope CgroupScope) (stopCgroupPi
 
 func (p *pinnedStopCgroup) verifyEmpty() error {
 	if p == nil || p.cgroupFD < 0 || p.pidFD < 0 {
-		return fmt.Errorf("%w: enrolled cgroup pin is unavailable", ErrUnverified)
+		return stopCgroupFailure("cgroup_observation_unavailable", fmt.Errorf("%w: enrolled cgroup pin is unavailable", ErrUnverified))
 	}
 	kernel := p.kernel
 	if kernel == nil {
 		kernel = linuxStopCgroupKernel{}
 	}
 	dev, ino, fsType, links, err := kernel.identity(p.cgroupFD)
-	if err != nil || fsType != uint64(unix.CGROUP2_SUPER_MAGIC) || dev != p.dev || ino != p.ino {
-		return fmt.Errorf("%w: pinned cgroup identity changed", ErrUnverified)
+	if err != nil {
+		return stopCgroupFailure("cgroup_observation_unavailable", fmt.Errorf("%w: pinned cgroup identity cannot be read", ErrUnverified))
+	}
+	if fsType != uint64(unix.CGROUP2_SUPER_MAGIC) || dev != p.dev || ino != p.ino {
+		return stopCgroupFailure("cgroup_identity_changed", fmt.Errorf("%w: pinned cgroup identity changed", ErrUnverified))
 	}
 	if err := kernel.pidExited(p.pidFD); err != nil {
+		if stopCgroupFailureCode(err) == "cgroup_scope_unverified" {
+			return stopCgroupFailure("target_process_state_unavailable", fmt.Errorf("%w: enrolled process exit state cannot be verified", ErrUnverified))
+		}
 		return err
 	}
 	if links == 0 {
@@ -86,8 +92,12 @@ func (p *pinnedStopCgroup) verifyEmpty() error {
 		// scope, even though its former name no longer resolves.
 		return nil
 	}
-	if populated, err := kernel.populated(p.cgroupFD); err != nil || populated {
-		return fmt.Errorf("%w: pinned cgroup or descendant remains populated", ErrUnverified)
+	populated, err := kernel.populated(p.cgroupFD)
+	if err != nil {
+		return stopCgroupFailure("cgroup_observation_unavailable", fmt.Errorf("%w: pinned cgroup population cannot be read", ErrUnverified))
+	}
+	if populated {
+		return stopCgroupFailure("cgroup_populated", fmt.Errorf("%w: pinned cgroup or descendant remains populated", ErrUnverified))
 	}
 	return nil
 }
@@ -95,8 +105,14 @@ func (p *pinnedStopCgroup) verifyEmpty() error {
 func verifyPIDFDExited(pidFD int) error {
 	process := []unix.PollFd{{Fd: int32(pidFD), Events: unix.POLLIN}}
 	ready, err := unix.Poll(process, 0)
-	if err != nil || ready == 0 || process[0].Revents&(unix.POLLIN|unix.POLLHUP|unix.POLLERR) == 0 {
-		return fmt.Errorf("%w: enrolled process has not exited", ErrUnverified)
+	if err != nil {
+		return stopCgroupFailure("target_process_state_unavailable", fmt.Errorf("%w: enrolled process exit state cannot be read", ErrUnverified))
+	}
+	if process[0].Revents&unix.POLLNVAL != 0 {
+		return stopCgroupFailure("target_process_state_unavailable", fmt.Errorf("%w: enrolled process exit state cannot be read", ErrUnverified))
+	}
+	if ready == 0 || process[0].Revents&(unix.POLLIN|unix.POLLHUP|unix.POLLERR) == 0 {
+		return stopCgroupFailure("target_process_live", fmt.Errorf("%w: enrolled process has not exited", ErrUnverified))
 	}
 	return nil
 }

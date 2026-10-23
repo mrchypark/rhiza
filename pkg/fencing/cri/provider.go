@@ -593,7 +593,7 @@ func (p *Provider) stop(ctx context.Context, binding fencing.RuntimeBinding, req
 	}
 	if beforeSandboxStop != nil {
 		if err := beforeSandboxStop(ctx); err != nil {
-			return observation, stopDiagnostic("pre_sandbox_scope", "cgroup_scope_unverified", err)
+			return observation, preSandboxScopeDiagnostic(err)
 		}
 	}
 	if err := p.verifyVersion(ctx, binding); err != nil {
