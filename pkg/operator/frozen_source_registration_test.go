@@ -176,7 +176,7 @@ func TestFrozenArchiveForkRegistrationCommitsAndRetriesWithoutSourceWrites(t *te
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = wal.Close() })
-	core, err := quepaxa.New(quepaxa.Config{NodeID: sourceMembers[0].ID, Cluster: quepaxa.Cluster{ConfigID: recovery.ArchiveConfigID, Members: sourceMembers}, WAL: wal})
+	core, err := quepaxa.New(quepaxa.Config{NodeID: sourceMembers[0].ID, Cluster: quepaxa.Cluster{ConfigID: recovery.ArchiveConfigID, Members: sourceMembers}, WAL: wal, Transport: testTransport{}})
 	if err != nil {
 		t.Fatal(err)
 	}

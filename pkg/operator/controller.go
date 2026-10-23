@@ -197,8 +197,10 @@ func (c *Controller) reconcile(ctx context.Context, r *Resource) error {
 	if err != nil {
 		return reject(err.Error())
 	}
+	manualMissingMembership := membershipMissing && bootstrapConfirmation == nil &&
+		manualMissingSourceMembershipAllowed(r) && c.useFrozenSourceFork(source) && mode == "async" && r.Spec.AllowDataLoss
 	if membershipMissing {
-		if bootstrapConfirmation == nil && manualMissingSourceMembershipAllowed(r) && c.useFrozenSourceFork(source) && mode == "async" && r.Spec.AllowDataLoss {
+		if manualMissingMembership {
 			// This is only a provisional target input. The canonical fencer must
 			// independently bind the complete declared cohort to the closed root
 			// before any source-stop or target authorization side effect.
@@ -320,15 +322,24 @@ func (c *Controller) reconcile(ctx context.Context, r *Resource) error {
 				return c.record(ctx, r, "Recovering", "frozen-source closure proof is pending")
 			}
 			if membershipMissing {
-				if !manualMissingSourceMembershipAllowed(r) || mode != "async" || !r.Spec.AllowDataLoss || preflight.ManualMembershipBindingDigest == "" {
-					return reject("manual missing-membership authorization is not bound to a closed canonical source cohort")
-				}
-				if r.Status.ManualMembershipBindingDigest == "" {
-					r.Status.ManualMembershipBindingDigest = preflight.ManualMembershipBindingDigest
-					return c.record(ctx, r, "Recovering", "manual source-cohort binding persisted before target authorization")
-				}
-				if r.Status.ManualMembershipBindingDigest != preflight.ManualMembershipBindingDigest {
-					return reject("manual source-cohort binding changed during recovery")
+				if bootstrapConfirmation != nil {
+					// Existing automatic bootstrap recovery is authorized by its
+					// independently re-derived canonical CONTROL confirmation, not
+					// by the separate manual missing-membership opt-in.
+					if r.Status.ManualMembershipBindingDigest != "" || preflight.ManualMembershipBindingDigest != "" {
+						return reject("automatic bootstrap recovery carries a manual membership binding")
+					}
+				} else {
+					if !manualMissingSourceMembershipAllowed(r) || mode != "async" || !r.Spec.AllowDataLoss || preflight.ManualMembershipBindingDigest == "" {
+						return reject("manual missing-membership authorization is not bound to a closed canonical source cohort")
+					}
+					if r.Status.ManualMembershipBindingDigest == "" {
+						r.Status.ManualMembershipBindingDigest = preflight.ManualMembershipBindingDigest
+						return c.record(ctx, r, "Recovering", "manual source-cohort binding persisted before target authorization")
+					}
+					if r.Status.ManualMembershipBindingDigest != preflight.ManualMembershipBindingDigest {
+						return reject("manual source-cohort binding changed during recovery")
+					}
 				}
 			} else if r.Status.ManualMembershipBindingDigest != "" {
 				return reject("manual source-cohort binding exists without a missing source membership")
