@@ -195,9 +195,50 @@ func qualifyGCSDeadPod(ctx context.Context) (resultErr error) {
 	event("passive_terminal_receipt_verified", passiveReceipt)
 	event("voter_fence_proven", obj{"fence": fenceObject, "request": request, "proof": proof})
 
+	checkpoint, err := waitForGCSVoterRemoveAckBeforeAdd(ctx, source, target, request, proof, forward, adminToken)
+	if err != nil {
+		return err
+	}
+	// Re-read immediately before deleting the captured Pod. The controller may
+	// advance while this driver polls; if ADD is already journaled, fail rather
+	// than claiming an operator restart in the REMOVE-before-ADD window.
+	latestCheckpoint, err := waitForGCSVoterRemoveAckBeforeAdd(ctx, source, target, request, proof, forward, adminToken)
+	if err != nil {
+		return err
+	}
+	if text(latestCheckpoint.Metadata["uid"]) != text(checkpoint.Metadata["uid"]) || latestCheckpoint.Status.Membership == nil ||
+		checkpoint.Status.Membership == nil || latestCheckpoint.Status.Membership.RemoveRequest == nil || checkpoint.Status.Membership.RemoveRequest == nil ||
+		!bytes.Equal(encoded(latestCheckpoint.Status.Membership.RemoveRequest), encoded(checkpoint.Status.Membership.RemoveRequest)) {
+		return fmt.Errorf("canonical REMOVE checkpoint changed before operator restart")
+	}
+	checkpoint = latestCheckpoint
+	event("durable_remove_before_add_checkpoint", obj{"recoveryUID": text(checkpoint.Metadata["uid"]),
+		"removeRequest": checkpoint.Status.Membership.RemoveRequest, "operatorUID": source.OperatorIdentity.UID})
+	if err := restartGCSOperatorAtRemoveCheckpoint(ctx, source); err != nil {
+		return fmt.Errorf("restart exact operator Pod between durable REMOVE and ADD: %w", err)
+	}
+	event("operator_restarted_between_remove_and_add", obj{"recoveryUID": text(checkpoint.Metadata["uid"]),
+		"previousOperatorUID": source.OperatorIdentity.UID})
+	postRestartCheckpoint, err := waitForGCSVoterRemoveAckBeforeAdd(ctx, source, target, request, proof, forward, adminToken)
+	if err != nil {
+		return fmt.Errorf("operator restart did not preserve the REMOVE-before-ADD checkpoint: %w", err)
+	}
+	if text(postRestartCheckpoint.Metadata["uid"]) != text(checkpoint.Metadata["uid"]) || postRestartCheckpoint.Status.Membership == nil ||
+		postRestartCheckpoint.Status.Membership.Add != nil || postRestartCheckpoint.Status.Membership.Phase != "Removing" ||
+		postRestartCheckpoint.Status.Membership.RemoveRequest == nil || checkpoint.Status.Membership == nil || checkpoint.Status.Membership.RemoveRequest == nil ||
+		!bytes.Equal(encoded(postRestartCheckpoint.Status.Membership.RemoveRequest), encoded(checkpoint.Status.Membership.RemoveRequest)) {
+		return fmt.Errorf("operator restart changed the canonical Recovery or advanced beyond exact durable REMOVE")
+	}
+	// Re-read the same Recovery after restart. Its durable REMOVE request must
+	// survive unchanged; only then may the controller publish and dispatch ADD.
 	recovery, err := waitForGCSVoterRecovery(ctx, source, target, request, proof)
 	if err != nil {
 		return err
+	}
+	if text(checkpoint.Metadata["uid"]) == "" || text(recovery.Metadata["uid"]) != text(checkpoint.Metadata["uid"]) ||
+		checkpoint.Status.Membership == nil || checkpoint.Status.Membership.RemoveRequest == nil || recovery.Status.Membership == nil ||
+		recovery.Status.Membership.RemoveRequest == nil || !bytes.Equal(encoded(checkpoint.Status.Membership.RemoveRequest), encoded(recovery.Status.Membership.RemoveRequest)) {
+		return fmt.Errorf("operator restart changed the canonical Recovery or its exact durable REMOVE request")
 	}
 	event("single_voter_recovery_complete", recovery)
 	if err := fault.Restore(ctx); err != nil {
@@ -271,6 +312,156 @@ func qualifyGCSDeadPod(ctx context.Context) (resultErr error) {
 		"postRestartAck": ackAfterRestart, "postRestartRows": rows["rows"]}
 	if err := os.WriteFile(filepath.Join(out, "gcs-dead-pod-evidence.json"), encoded(evidence), 0600); err != nil {
 		return err
+	}
+	return nil
+}
+
+const gcsVoterRemoveAcceptedMessage = "remove request accepted; waiting for configuration confirmation"
+
+func waitForGCSVoterRemoveAckBeforeAdd(ctx context.Context, source gcsRecoverySource, target operator.FenceTarget,
+	request operator.FenceRequest, proof operator.FenceProof, forward *forward, token string) (operator.Resource, error) {
+	var checkpoint operator.Resource
+	err := wait(ctx, "durable voter REMOVE acknowledged before ADD journal", func() (bool, error) {
+		list, err := get(ctx, "rhizarecoveries", "")
+		if err != nil {
+			return false, err
+		}
+		items, _ := list["items"].([]any)
+		matches := 0
+		for _, item := range items {
+			if nested(item, "spec", "sourceClusterID") != source.ClusterID || nested(item, "spec", "recoveryID") != request.OperationID {
+				continue
+			}
+			matches++
+			if err := json.Unmarshal(encoded(item), &checkpoint); err != nil {
+				return false, err
+			}
+		}
+		if matches > 1 {
+			return false, fmt.Errorf("multiple Recovery objects match the exact voter operation")
+		}
+		if matches != 1 {
+			return false, nil
+		}
+		membership, err := readMembershipWithToken(ctx, forward, token)
+		if err != nil {
+			return false, nil
+		}
+		if gcsVoterRemoveAckCheckpointMatches(checkpoint, source, target, request, proof, source.Targets[1], membership) {
+			return true, nil
+		}
+		if checkpoint.Status.Membership != nil && (checkpoint.Status.Membership.Add != nil || checkpoint.Status.Membership.Phase == "Adding" || checkpoint.Status.Membership.Phase == "Complete") {
+			return false, fmt.Errorf("durable REMOVE-before-ADD checkpoint was missed; ADD is already journaled")
+		}
+		return false, nil
+	})
+	return checkpoint, err
+}
+
+func gcsVoterRemoveAckCheckpointMatches(recovery operator.Resource, source gcsRecoverySource, target operator.FenceTarget,
+	request operator.FenceRequest, proof operator.FenceProof, observer operator.FenceTarget, membership network.MembershipStatus) bool {
+	if text(recovery.Metadata["uid"]) == "" || recovery.Spec.SourceClusterID != source.ClusterID || recovery.Spec.RecoveryID != request.OperationID ||
+		recovery.Spec.StatefulSet != source.StatefulSet || recovery.Status.StatefulSetUID != source.StatefulSetUID || recovery.Status.Source != source.ClusterID ||
+		recovery.Status.Phase != "Removing" || recovery.Status.Message != gcsVoterRemoveAcceptedMessage || recovery.Status.Membership == nil ||
+		recovery.Status.Membership.Phase != "Removing" || recovery.Status.Membership.Add != nil || recovery.Status.Membership.RemoveRequest == nil {
+		return false
+	}
+	if recovery.Spec.Fence.RecoveryID != request.OperationID || recovery.Spec.Fence.ClusterID != source.ClusterID ||
+		recovery.Spec.Fence.StatefulSetUID != source.StatefulSetUID || !recovery.Spec.Fence.Confirmed || recovery.Spec.Fence.Evidence != proof.ProofID {
+		return false
+	}
+	specMembership := recovery.Spec.Membership
+	if specMembership == nil || specMembership.OperationID != request.OperationID || specMembership.Remove != quepaxa.NodeID(target.NodeID) ||
+		specMembership.RemovedPod != target.Pod || specMembership.ReplacementPod != target.Pod || specMembership.ReplacementSecret == "" ||
+		specMembership.Fence.NodeID != quepaxa.NodeID(target.NodeID) || specMembership.Fence.WALIdentity != target.WALIdentity ||
+		specMembership.Fence.WorkloadUID != target.PodUID || !specMembership.Fence.Confirmed || specMembership.Fence.Evidence != proof.ProofID ||
+		len(specMembership.VoterPods) != 2 {
+		return false
+	}
+	wantPods := map[string]string{}
+	for _, captured := range source.Targets {
+		if captured.PodUID != target.PodUID {
+			wantPods[captured.NodeID] = captured.Pod
+		}
+	}
+	if len(wantPods) != 2 {
+		return false
+	}
+	for _, voter := range specMembership.VoterPods {
+		if wantPods[string(voter.NodeID)] != voter.Pod {
+			return false
+		}
+		delete(wantPods, string(voter.NodeID))
+	}
+	if len(wantPods) != 0 {
+		return false
+	}
+	remove := recovery.Status.Membership.RemoveRequest
+	if remove.OperationID != request.OperationID || remove.ClusterID != source.ClusterID || remove.ExpectedConfigID == 0 || remove.Remove != quepaxa.NodeID(target.NodeID) ||
+		remove.Fence == nil || string(remove.Fence.NodeID) != target.NodeID || remove.Fence.WALIdentity != target.WALIdentity ||
+		remove.Fence.WorkloadUID != target.PodUID || !remove.Fence.Confirmed || remove.Fence.Evidence != proof.ProofID {
+		return false
+	}
+	if membership.ClusterID != source.ClusterID || membership.NodeID != quepaxa.NodeID(observer.NodeID) || membership.WALIdentity != observer.WALIdentity ||
+		!membership.Voting || membership.Pending || membership.AbortSlot != 0 || membership.ConfigID != remove.ExpectedConfigID+1 || len(membership.Voters) != 2 {
+		return false
+	}
+	want := map[string]bool{}
+	for _, captured := range source.Targets {
+		if captured.PodUID != target.PodUID {
+			want[captured.NodeID] = true
+		}
+	}
+	if len(want) != 2 {
+		return false
+	}
+	for _, voter := range membership.Voters {
+		if !want[string(voter)] {
+			return false
+		}
+		delete(want, string(voter))
+	}
+	return len(want) == 0
+}
+
+func restartGCSOperatorAtRemoveCheckpoint(ctx context.Context, source gcsRecoverySource) error {
+	if source.OperatorPod == "" || source.OperatorIdentity.Name != source.OperatorPod || source.OperatorIdentity.UID == "" ||
+		source.OperatorIdentity.ParentOwnerUID == "" {
+		return fmt.Errorf("captured run-owned operator Pod identity is incomplete")
+	}
+	if err := verifyGCSControlPodSnapshots(ctx, []gcsControlPodIdentity{source.OperatorIdentity}); err != nil {
+		return fmt.Errorf("operator Pod changed before restart: %w", err)
+	}
+	if err := deleteObjectWithUIDAndGracePeriod(ctx, "pods", source.OperatorIdentity.Name, source.OperatorIdentity.UID, 0); err != nil {
+		return fmt.Errorf("delete captured test operator Pod: %w", err)
+	}
+	var restarted gcsControlPodIdentity
+	err := wait(ctx, "replacement run-owned operator Pod after exact deletion", func() (bool, error) {
+		current, err := captureGCSOperatorPodIdentity(ctx)
+		if err != nil {
+			return false, nil
+		}
+		if current.ParentOwnerUID != source.OperatorIdentity.ParentOwnerUID {
+			return false, fmt.Errorf("operator replacement escaped the captured Deployment")
+		}
+		if current.UID == source.OperatorIdentity.UID {
+			return false, nil
+		}
+		pod, err := get(ctx, "pod", current.Name)
+		if err != nil || !podReady(pod) {
+			return false, nil
+		}
+		if err := verifyGCSOperatorHTTPFencer(ctx, current.Name); err != nil {
+			return false, err
+		}
+		restarted = current
+		return true, nil
+	})
+	if err != nil {
+		return err
+	}
+	if restarted.UID == "" || restarted.UID == source.OperatorIdentity.UID {
+		return fmt.Errorf("operator restart did not produce a fresh Pod UID")
 	}
 	return nil
 }

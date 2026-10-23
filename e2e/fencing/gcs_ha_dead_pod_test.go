@@ -10,8 +10,76 @@ import (
 
 	"github.com/mrchypark/rhiza/pkg/fencing"
 	"github.com/mrchypark/rhiza/pkg/fencing/cri"
+	"github.com/mrchypark/rhiza/pkg/network"
 	"github.com/mrchypark/rhiza/pkg/operator"
+	"github.com/mrchypark/rhiza/pkg/quepaxa"
 )
+
+func TestGCSVoterRemoveAckCheckpointRequiresCommittedRemoveAndNoAdd(t *testing.T) {
+	source := gcsRecoverySource{ClusterID: "cluster", StatefulSet: "rhiza", StatefulSetUID: "sts-uid", Targets: []operator.FenceTarget{
+		{NodeID: "n0", Pod: "rhiza-0", PodUID: "old-pod", WALIdentity: "old-wal"},
+		{NodeID: "n1", Pod: "rhiza-1", PodUID: "pod-1", WALIdentity: "wal-1"},
+		{NodeID: "n2", Pod: "rhiza-2", PodUID: "pod-2", WALIdentity: "wal-2"},
+	}}
+	target, observer := source.Targets[0], source.Targets[1]
+	request := operator.FenceRequest{OperationID: "recovery-op", SourceClusterID: source.ClusterID}
+	proof := operator.FenceProof{ProofID: "proof-id"}
+	remove := network.MembershipChange{OperationID: request.OperationID, ClusterID: source.ClusterID, ExpectedConfigID: 1, Remove: quepaxa.NodeID(target.NodeID),
+		Fence: &network.MembershipFence{NodeID: quepaxa.NodeID(target.NodeID), WALIdentity: target.WALIdentity, WorkloadUID: target.PodUID, Confirmed: true, Evidence: proof.ProofID}}
+	recovery := operator.Resource{Metadata: map[string]any{"uid": "recovery-uid"},
+		Spec: operator.Spec{StatefulSet: source.StatefulSet, SourceClusterID: source.ClusterID, RecoveryID: request.OperationID,
+			Fence: operator.Fence{RecoveryID: request.OperationID, ClusterID: source.ClusterID, StatefulSetUID: source.StatefulSetUID, Confirmed: true, Evidence: proof.ProofID},
+			Membership: &operator.MembershipSpec{OperationID: request.OperationID, Remove: quepaxa.NodeID(target.NodeID), RemovedPod: target.Pod,
+				ReplacementPod: target.Pod, ReplacementSecret: "replacement-secret", Fence: operator.MembershipFence{NodeID: quepaxa.NodeID(target.NodeID),
+					WALIdentity: target.WALIdentity, WorkloadUID: target.PodUID, Confirmed: true, Evidence: proof.ProofID},
+				VoterPods: []operator.VoterPod{{NodeID: quepaxa.NodeID("n1"), Pod: "rhiza-1"}, {NodeID: quepaxa.NodeID("n2"), Pod: "rhiza-2"}}}},
+		Status: operator.Status{Phase: "Removing", Message: gcsVoterRemoveAcceptedMessage, Source: source.ClusterID, StatefulSetUID: source.StatefulSetUID,
+			Membership: &operator.MembershipStatus{Phase: "Removing", RemoveRequest: &remove}}}
+	status := network.MembershipStatus{NodeID: quepaxa.NodeID(observer.NodeID), ClusterID: source.ClusterID, ConfigID: 2,
+		Voters: []quepaxa.NodeID{"n1", "n2"}, WALIdentity: observer.WALIdentity, Voting: true}
+	if !gcsVoterRemoveAckCheckpointMatches(recovery, source, target, request, proof, observer, status) {
+		t.Fatal("rejected canonical post-REMOVE, pre-ADD checkpoint")
+	}
+	tests := []struct {
+		name   string
+		mutate func(*operator.Resource, *network.MembershipStatus)
+	}{
+		{"ADD already journaled", func(r *operator.Resource, _ *network.MembershipStatus) {
+			r.Status.Membership.Add = &operator.MembershipAddJournal{OperationID: "add-op"}
+		}},
+		{"wrong status message", func(r *operator.Resource, _ *network.MembershipStatus) {
+			r.Status.Message = "remove request journaled before dispatch"
+		}},
+		{"wrong recovery phase", func(r *operator.Resource, _ *network.MembershipStatus) { r.Status.Phase = "Adding" }},
+		{"wrong recovery identity", func(r *operator.Resource, _ *network.MembershipStatus) { r.Metadata["uid"] = "other-recovery" }},
+		{"wrong Recovery membership binding", func(r *operator.Resource, _ *network.MembershipStatus) { r.Spec.Membership.Remove = "other-node" }},
+		{"wrong captured survivor set", func(r *operator.Resource, _ *network.MembershipStatus) {
+			r.Spec.Membership.VoterPods[0].Pod = "other-pod"
+		}},
+		{"wrong Recovery fence binding", func(r *operator.Resource, _ *network.MembershipStatus) { r.Spec.Fence.Evidence = "other-proof" }},
+		{"remove not committed", func(_ *operator.Resource, s *network.MembershipStatus) { s.ConfigID = 1 }},
+		{"membership still pending", func(_ *operator.Resource, s *network.MembershipStatus) { s.Pending = true }},
+		{"old voter still present", func(_ *operator.Resource, s *network.MembershipStatus) { s.Voters = []quepaxa.NodeID{"n0", "n1"} }},
+		{"wrong remove proof", func(r *operator.Resource, _ *network.MembershipStatus) {
+			r.Status.Membership.RemoveRequest.Fence.Evidence = "other-proof"
+		}},
+		{"wrong observer identity", func(_ *operator.Resource, s *network.MembershipStatus) { s.WALIdentity = "other-wal" }},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			var changed operator.Resource
+			if err := json.Unmarshal(encoded(recovery), &changed); err != nil {
+				t.Fatal(err)
+			}
+			changedStatus := status
+			changedStatus.Voters = append([]quepaxa.NodeID(nil), status.Voters...)
+			test.mutate(&changed, &changedStatus)
+			if gcsVoterRemoveAckCheckpointMatches(changed, source, target, request, proof, observer, changedStatus) {
+				t.Fatal("accepted an incomplete or advanced REMOVE checkpoint")
+			}
+		})
+	}
+}
 
 func TestGCSDeadPodQualificationRequiresExactPassiveTerminalReceipt(t *testing.T) {
 	runtime := fencing.RuntimeBinding{AuthorityID: "authority", NamespaceUID: "namespace-uid", BindingUID: "binding-uid",
