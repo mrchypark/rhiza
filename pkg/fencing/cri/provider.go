@@ -78,6 +78,8 @@ type Provider struct {
 	host        func(context.Context) (HostIdentity, error)
 	passiveMu   sync.Mutex
 	passive     map[string]*passiveSession
+	stopPins    map[string]stopCgroupPin
+	pinStop     func(string, string, CgroupScope) (stopCgroupPin, error)
 }
 
 // RuntimeIdentity binds enrollment to the exact CRI runtime/API versions, not
@@ -106,7 +108,7 @@ func Open(socket string, profile Profile, host func(context.Context) (HostIdenti
 	if err != nil {
 		return nil, err
 	}
-	return &Provider{client: runtimeapi.NewRuntimeServiceClient(conn), imageClient: runtimeapi.NewImageServiceClient(conn), conn: conn, profile: profile, host: host}, nil
+	return &Provider{client: runtimeapi.NewRuntimeServiceClient(conn), imageClient: runtimeapi.NewImageServiceClient(conn), conn: conn, profile: profile, host: host, pinStop: pinStopCgroup}, nil
 }
 
 func validOCIDigest(value string) bool {
@@ -155,11 +157,77 @@ func (p *Provider) Close() error {
 		session.close()
 		delete(p.passive, key)
 	}
+	for key, pin := range p.stopPins {
+		pin.close()
+		delete(p.stopPins, key)
+	}
 	p.passiveMu.Unlock()
 	if p.conn == nil {
 		return nil
 	}
 	return p.conn.Close()
+}
+
+func (p *Provider) stopScopeKey(scope CgroupScope) (string, error) {
+	return passiveScopeDigest(scope)
+}
+
+func (p *Provider) stopScopePin(scope CgroupScope) (string, stopCgroupPin) {
+	key, err := p.stopScopeKey(scope)
+	if err != nil {
+		return "", nil
+	}
+	p.passiveMu.Lock()
+	defer p.passiveMu.Unlock()
+	return key, p.stopPins[key]
+}
+
+func (p *Provider) getOrPinStopScope(procRoot, cgroupRoot string, scope CgroupScope) (string, stopCgroupPin, error) {
+	key, err := p.stopScopeKey(scope)
+	if err != nil {
+		return "", nil, err
+	}
+	p.passiveMu.Lock()
+	if existing := p.stopPins[key]; existing != nil {
+		p.passiveMu.Unlock()
+		return key, existing, nil
+	}
+	p.passiveMu.Unlock()
+	if p.pinStop == nil {
+		return "", nil, fmt.Errorf("%w: target cgroup pinning is unavailable", ErrUnverified)
+	}
+	pin, err := p.pinStop(procRoot, cgroupRoot, scope)
+	if err != nil {
+		return "", nil, err
+	}
+	p.passiveMu.Lock()
+	defer p.passiveMu.Unlock()
+	if existing := p.stopPins[key]; existing != nil {
+		pin.close()
+		return key, existing, nil
+	}
+	if len(p.stopPins) >= 128 {
+		pin.close()
+		return "", nil, fmt.Errorf("%w: pinned stop scope capacity reached", ErrUnverified)
+	}
+	if p.stopPins == nil {
+		p.stopPins = make(map[string]stopCgroupPin)
+	}
+	p.stopPins[key] = pin
+	return key, pin, nil
+}
+
+func (p *Provider) releaseStopScope(key string) {
+	if key == "" {
+		return
+	}
+	p.passiveMu.Lock()
+	pin := p.stopPins[key]
+	delete(p.stopPins, key)
+	p.passiveMu.Unlock()
+	if pin != nil {
+		pin.close()
+	}
 }
 
 func (p *Provider) verifyHost(ctx context.Context, binding fencing.RuntimeBinding) error {
@@ -565,6 +633,8 @@ func (p *Provider) StopInCgroup(ctx context.Context, binding fencing.RuntimeBind
 	if p == nil || p.profile.CgroupProfileID == "" || binding.Validate(request.Identity) != nil || scope.RuntimeHash != fencing.RuntimeScopeBindingDigest(binding) || scope.ProfileID != p.profile.CgroupProfileID {
 		return observation, stopDiagnostic("stop_request", "invalid_request", fmt.Errorf("%w: enrolled cgroup belongs to another runtime binding", ErrUnverified))
 	}
+	var pin stopCgroupPin
+	var pinKey string
 	beforeContainerStop := func(ctx context.Context) error {
 		containerID := strings.TrimPrefix(binding.ContainerID, p.profile.RuntimeName+"://")
 		pid, cgroupsPath, err := p.containerdPID(ctx, binding, containerID)
@@ -575,17 +645,30 @@ func (p *Provider) StopInCgroup(ctx context.Context, binding fencing.RuntimeBind
 		if err != nil || mappedPath != scope.Path {
 			return fmt.Errorf("%w: CRI cgroups path differs from captured scope", ErrUnverified)
 		}
-		return scope.VerifyProcess(procRoot, cgroupRoot)
+		if err := scope.VerifyProcess(procRoot, cgroupRoot); err != nil {
+			return err
+		}
+		pinKey, pin, err = p.getOrPinStopScope(procRoot, cgroupRoot, scope)
+		return err
 	}
-	observation, err := p.stop(ctx, binding, request, beforeContainerStop, func(context.Context) error { return scope.VerifyEmpty(cgroupRoot) })
+	observation, err := p.stop(ctx, binding, request, beforeContainerStop, func(context.Context) error {
+		if pin == nil {
+			return fmt.Errorf("%w: target cgroup was not pinned before CRI stop", ErrUnverified)
+		}
+		return pin.verifyEmpty()
+	})
 	if err != nil {
 		return observation, err
 	}
-	if err := scope.VerifyEmpty(cgroupRoot); err != nil {
+	if pin == nil {
+		return observation, stopDiagnostic("post_stop_cgroup", "cgroup_empty_unverified", fmt.Errorf("%w: target cgroup pin is unavailable", ErrUnverified))
+	}
+	if err := pin.verifyEmpty(); err != nil {
 		return observation, stopDiagnostic("post_stop_cgroup", "cgroup_empty_unverified", err)
 	}
 	observation.CgroupScope, observation.CgroupEmpty = scope, true
 	observation.ObservedAt = time.Now().UTC().Format(time.RFC3339Nano)
+	p.releaseStopScope(pinKey)
 	return observation, nil
 }
 
@@ -613,7 +696,14 @@ func (p *Provider) ResumeStopInCgroup(ctx context.Context, binding fencing.Runti
 	if containerID == "" || strings.Contains(containerID, "://") {
 		return observation, fmt.Errorf("%w: runtime container ID differs", ErrUnverified)
 	}
-	if p.inspect(ctx, binding, containerID, true) == nil && scope.VerifyEmpty(cgroupRoot) == nil {
+	pinKey, pin := p.stopScopePin(scope)
+	verifyEmpty := func() error {
+		if pin != nil {
+			return pin.verifyEmpty()
+		}
+		return scope.VerifyEmpty(cgroupRoot)
+	}
+	if p.inspect(ctx, binding, containerID, true) == nil && verifyEmpty() == nil {
 		if err := p.verifyHost(ctx, binding); err != nil {
 			return observation, err
 		}
@@ -623,12 +713,13 @@ func (p *Provider) ResumeStopInCgroup(ctx context.Context, binding fencing.Runti
 		observation.ContainerExited, observation.SandboxNotReady = true, true
 		observation.CgroupEmpty, observation.RecoveredTerminalState = true, true
 		observation.ObservedAt = time.Now().UTC().Format(time.RFC3339Nano)
+		p.releaseStopScope(pinKey)
 		return observation, nil
 	}
 	// A durable exact intent may have stopped this container before a crash
 	// interrupted the second CRI effect. Finish only that enrolled sandbox after
 	// rechecking its UID, container inventory, runtime and captured empty cgroup.
-	if p.inspectState(ctx, binding, containerID, true, runtimeapi.PodSandboxState_SANDBOX_READY, true) == nil && scope.VerifyEmpty(cgroupRoot) == nil {
+	if p.inspectState(ctx, binding, containerID, true, runtimeapi.PodSandboxState_SANDBOX_READY, true) == nil && verifyEmpty() == nil {
 		if err := p.verifyVersion(ctx, binding); err != nil {
 			return observation, err
 		}
@@ -642,7 +733,7 @@ func (p *Provider) ResumeStopInCgroup(ctx context.Context, binding fencing.Runti
 		if err := p.inspect(ctx, binding, containerID, true); err != nil {
 			return observation, err
 		}
-		if err := scope.VerifyEmpty(cgroupRoot); err != nil {
+		if err := verifyEmpty(); err != nil {
 			return observation, err
 		}
 		if err := p.verifyVersion(ctx, binding); err != nil {
@@ -654,6 +745,7 @@ func (p *Provider) ResumeStopInCgroup(ctx context.Context, binding fencing.Runti
 		observation.ContainerExited, observation.SandboxNotReady = true, true
 		observation.CgroupEmpty, observation.RecoveredTerminalState = true, true
 		observation.ObservedAt = time.Now().UTC().Format(time.RFC3339Nano)
+		p.releaseStopScope(pinKey)
 		return observation, nil
 	}
 	// A nonterminal retry may reissue the exact CRI operation only while the
