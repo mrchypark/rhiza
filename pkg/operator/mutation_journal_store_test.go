@@ -115,6 +115,24 @@ func (f *mutationStoreFixture) serve(w http.ResponseWriter, r *http.Request) {
 	}
 	if r.Method == http.MethodPut && strings.HasSuffix(r.URL.Path, "/status") {
 		f.objects[r.URL.Path] = next
+		resourcePath := strings.TrimSuffix(r.URL.Path, "/status")
+		if resource := f.objects[resourcePath]; resource != nil {
+			// Kubernetes status-subresource writes persist status on the primary
+			// object; a later GET of that object must observe the updated status
+			// without replacing its spec or metadata with the submitted copy.
+			resource["status"] = next["status"]
+			if nextMetadata := asObject(next["metadata"]); nextMetadata != nil {
+				if resourceMetadata := asObject(resource["metadata"]); resourceMetadata != nil {
+					if resourceVersion := str(nextMetadata["resourceVersion"]); resourceVersion != "" {
+						resourceMetadata["resourceVersion"] = resourceVersion
+					}
+				}
+			}
+			f.objects[resourcePath] = resource
+			_ = json.NewEncoder(w).Encode(resource)
+			f.statusWrites++
+			return
+		}
 		f.statusWrites++
 		w.WriteHeader(200)
 		return
@@ -172,6 +190,59 @@ func (f *mutationStoreFixture) serve(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	w.WriteHeader(200)
+}
+
+func TestMutationStoreStatusWriteUpdatesPrimaryResource(t *testing.T) {
+	const resourcePath = "/apis/rhiza.mrchypark.dev/v1alpha1/namespaces/test/rhizarecoveries/recovery-a"
+	initial := object{
+		"apiVersion": "rhiza.mrchypark.dev/v1alpha1",
+		"kind":       "RhizaRecovery",
+		"metadata": object{
+			"name": "recovery-a", "namespace": "test", "uid": "recovery-uid",
+			"resourceVersion": "fixture-rv", "labels": object{"fixture": "primary"},
+		},
+		"spec":   object{"recoveryID": "original-operation", "marker": "original-spec"},
+		"status": object{"phase": "Pending", "marker": "old-status"},
+	}
+	fixture := &mutationStoreFixture{objects: map[string]object{resourcePath: initial}}
+	api := httptest.NewTLSServer(http.HandlerFunc(fixture.serve))
+	t.Cleanup(api.Close)
+	tokenFile := filepath.Join(t.TempDir(), "token")
+	if err := os.WriteFile(tokenFile, []byte("test"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	kube := &Kubernetes{BaseURL: api.URL, Namespace: "test", TokenFile: tokenFile, Client: api.Client()}
+
+	// Deliberately distinguish the submitted body from the primary object's
+	// spec/labels: a status-subresource write changes status, not those fields.
+	// resourceVersion here is just fixture data; this fake does not model API
+	// server version increments or optimistic-concurrency behavior.
+	update := object{
+		"apiVersion": "rhiza.mrchypark.dev/v1alpha1",
+		"kind":       "RhizaRecovery",
+		"metadata": object{
+			"name": "recovery-a", "namespace": "test", "uid": "recovery-uid",
+			"resourceVersion": "fixture-rv", "labels": object{"fixture": "submitted"},
+		},
+		"spec":   object{"recoveryID": "wrong-operation", "marker": "submitted-spec"},
+		"status": object{"phase": "Recovering", "marker": "new-status"},
+	}
+	var response object
+	if err := kube.Put(t.Context(), resourcePath+"/status", update, &response); err != nil {
+		t.Fatalf("PUT status subresource: %v", err)
+	}
+	var got object
+	if err := kube.Get(t.Context(), resourcePath, &got); err != nil {
+		t.Fatalf("GET primary resource after status update: %v", err)
+	}
+	wantMetadata := asObject(initial["metadata"])
+	if hashJSON(got["spec"]) != hashJSON(initial["spec"]) || hashJSON(got["metadata"]) != hashJSON(wantMetadata) {
+		t.Fatalf("status write replaced primary spec or metadata: got spec=%v metadata=%v", got["spec"], got["metadata"])
+	}
+	wantStatus := update["status"]
+	if hashJSON(got["status"]) != hashJSON(wantStatus) || hashJSON(response["status"]) != hashJSON(wantStatus) {
+		t.Fatalf("status write was not visible on primary resource and response: GET=%v PUT=%v", got["status"], response["status"])
+	}
 }
 
 func newMutationStoreFixture(t *testing.T) (*FencingExecutor, *mutationStoreFixture, fencing.Identity, fencing.RuntimeBinding) {
