@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"path"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -805,10 +806,14 @@ func TestManualTerminalProjectionRejectsChallengeFileForDifferentEvidence(t *tes
 	if err != nil {
 		t.Fatal(err)
 	}
+	var fence operator.FenceRequest
+	if err := json.Unmarshal(encoded(evidence["fence"]), &fence); err != nil {
+		t.Fatal(err)
+	}
 	for file, data := range map[string][]byte{
 		gcsManualTerminalEvidenceName: evidenceData,
-		gcsManualTerminalChallengeName: encoded(obj{"challenge": challenge, "challengeDigest": digest,
-			"attestationName": name}),
+		gcsManualTerminalChallengeName: encoded(gcsManualTerminalChallengeRecord{Challenge: challenge, ChallengeDigest: digest,
+			AttestationName: name, VerifiedContext: manualTerminalVerifiedContextFixture(challenge, fence)}),
 		gcsManualTerminalEventsName: []byte("{}\n"),
 	} {
 		if err := os.WriteFile(filepath.Join(raw, file), data, 0600); err != nil {
@@ -817,6 +822,100 @@ func TestManualTerminalProjectionRejectsChallengeFileForDifferentEvidence(t *tes
 	}
 	if _, err := projectGCSManualTerminalEvidence(raw, filepath.Join(raw, "public"), false); err == nil {
 		t.Fatal("accepted a valid but unrelated challenge file beside the evidence")
+	}
+}
+
+func TestManualTerminalChallengeWaitsForVerifiedReviewContext(t *testing.T) {
+	source, err := os.ReadFile("gcs_ha_manual_terminal.go")
+	if err != nil {
+		t.Fatal(err)
+	}
+	text := string(source)
+	rootCheck := strings.Index(text, "sourceRoot, _, err := stateStore.ReadRoot(ctx, source.StatefulSetUID, source.ClusterID)")
+	requestCheck := strings.Index(text, "if hex.EncodeToString(fenceDigest[:]) != challenge.FenceRequestHash")
+	unclaimedCheck := strings.Index(text, "verifyManualTerminalUnclaimed(ctx, archive, controlBucket, source, challenge, successorClaimKey, targetPrefix, controlPrefix)")
+	writePacket := strings.Index(text, "writeNewPrivateAckLossFile(challengePath, challengeBytes)")
+	notify := strings.Index(text, `event("independent_manual_approval_required"`)
+	approvalWait := strings.Index(text, "waitForManualTerminalApproval(ctx, challenge")
+	if rootCheck < 0 || requestCheck < rootCheck || unclaimedCheck < requestCheck || writePacket < unclaimedCheck || notify < writePacket || approvalWait < notify {
+		t.Fatal("manual approval must be notified only after the closed root, exact request, and unclaimed scopes are verified")
+	}
+	challenge := manualTerminalChallengeFixture("private-scope")
+	var evidence obj
+	if err := json.Unmarshal(manualTerminalPrivateEvidenceFixture("private-scope"), &evidence); err != nil {
+		t.Fatal(err)
+	}
+	var fence operator.FenceRequest
+	if err := json.Unmarshal(encoded(evidence["fence"]), &fence); err != nil {
+		t.Fatal(err)
+	}
+	record := gcsManualTerminalChallengeRecord{Challenge: challenge, VerifiedContext: manualTerminalVerifiedContextFixture(challenge, fence)}
+	record.ChallengeDigest, _ = operator.ManualRecoveryChallengeDigest(challenge)
+	record.AttestationName, _ = operator.ManualRecoveryAttestationName(challenge.RecoveryUID)
+	data := encoded(record)
+	if !bytes.Contains(data, []byte(`"runtime":null`)) || bytes.Contains(data, []byte("sessionRef")) || bytes.Contains(data, []byte("mutationPayload")) {
+		t.Fatal("manual approver context must include absent runtime explicitly and exclude private mutation/session data")
+	}
+	if err := validateGCSManualTerminalVerifiedContext(record); err != nil {
+		t.Fatalf("valid private review context was rejected: %v", err)
+	}
+	for _, mutate := range []func(*gcsManualTerminalVerifiedContext){
+		func(context *gcsManualTerminalVerifiedContext) { context.RootDigest = strings.Repeat("b", 64) },
+		func(context *gcsManualTerminalVerifiedContext) {
+			context.FenceRequest.Targets[0].PodUID = "changed-pod"
+		},
+		func(context *gcsManualTerminalVerifiedContext) { context.HistoricalRunCount++ },
+		func(context *gcsManualTerminalVerifiedContext) { context.SourceDataScope.Bucket = "other-bucket" },
+	} {
+		changed := record
+		changed.VerifiedContext = record.VerifiedContext
+		changed.VerifiedContext.FenceRequest = record.VerifiedContext.FenceRequest
+		changed.VerifiedContext.FenceRequest.Targets = append([]operator.FenceTarget(nil), record.VerifiedContext.FenceRequest.Targets...)
+		mutate(&changed.VerifiedContext)
+		if err := validateGCSManualTerminalVerifiedContext(changed); err == nil {
+			t.Fatal("accepted changed root, request, inventory count, or storage scope context")
+		}
+	}
+}
+
+func TestManualTerminalHistoricalRunRequiresExplicitRuntimeAndMatchingIdentity(t *testing.T) {
+	valid := manualTerminalVerifiedContextFixture(manualTerminalChallengeFixture("private-scope"), manualTerminalFenceFixture("private-scope"))
+	if err := validateGCSManualTerminalVerifiedContext(gcsManualTerminalChallengeRecord{
+		Challenge: manualTerminalChallengeFixture("private-scope"), VerifiedContext: valid,
+	}); err != nil {
+		t.Fatalf("explicit null runtime should represent an unknown historical runtime: %v", err)
+	}
+	incompleteIdentity := valid
+	incompleteIdentity.HistoricalRunInventory = append([]gcsManualTerminalHistoricalRun(nil), valid.HistoricalRunInventory...)
+	incompleteIdentity.HistoricalRunInventory[0].Identity.PodUID = ""
+	if err := validateGCSManualTerminalVerifiedContext(gcsManualTerminalChallengeRecord{
+		Challenge: manualTerminalChallengeFixture("private-scope"), VerifiedContext: incompleteIdentity,
+	}); err == nil {
+		t.Fatal("accepted historical run with incomplete identity")
+	}
+
+	var omitted gcsManualTerminalHistoricalRun
+	if err := json.Unmarshal([]byte(`{"identity":{"sourceClusterID":"source","nodeID":"node","podUID":"pod","runID":"run","walIdentity":"wal"}}`), &omitted); err == nil {
+		t.Fatal("accepted historical run with omitted runtime field")
+	}
+
+	valid.HistoricalRunInventory[0].Runtime = &fencing.RuntimeBinding{
+		AuthorityID: "authority", NamespaceUID: "namespace", BindingUID: "binding", StatefulSetUID: "sts",
+		SourceClusterID: "source", NodeID: "other-node", PodUID: "pod-0", RunID: "run-1", NodeName: "worker",
+		NodeUID: "node-uid", MachineID: "machine", BootID: "boot", RuntimeID: "runtime", SandboxID: "sandbox",
+		ContainerID: "container", ImageID: "image",
+	}
+	if err := validateGCSManualTerminalVerifiedContext(gcsManualTerminalChallengeRecord{
+		Challenge: manualTerminalChallengeFixture("private-scope"), VerifiedContext: valid,
+	}); err == nil {
+		t.Fatal("accepted historical runtime bound to a different identity")
+	}
+	valid.HistoricalRunInventory[0].Runtime.NodeID = "rhiza-0"
+	valid.HistoricalRunInventory[0].Runtime.SourceClusterID = "private-scope"
+	if err := validateGCSManualTerminalVerifiedContext(gcsManualTerminalChallengeRecord{
+		Challenge: manualTerminalChallengeFixture("private-scope"), VerifiedContext: valid,
+	}); err != nil {
+		t.Fatalf("accepted complete matching historical runtime: %v", err)
 	}
 }
 
@@ -907,7 +1006,31 @@ func manualTerminalChallengeRecord(evidenceData []byte) []byte {
 	}
 	digest, _ := operator.ManualRecoveryChallengeDigest(challenge)
 	name, _ := operator.ManualRecoveryAttestationName(challenge.RecoveryUID)
-	return encoded(obj{"challenge": challenge, "challengeDigest": digest, "attestationName": name})
+	var fence operator.FenceRequest
+	if err := json.Unmarshal(encoded(evidence["fence"]), &fence); err != nil {
+		panic("invalid manual terminal fence fixture: " + err.Error())
+	}
+	return encoded(gcsManualTerminalChallengeRecord{Challenge: challenge, ChallengeDigest: digest,
+		AttestationName: name, VerifiedContext: manualTerminalVerifiedContextFixture(challenge, fence)})
+}
+
+func manualTerminalVerifiedContextFixture(challenge operator.ManualRecoveryChallenge, fence operator.FenceRequest) gcsManualTerminalVerifiedContext {
+	scope := fencing.ArchiveScope{Provider: "gcs", Bucket: "private-bucket", Prefix: path.Join("runs", challenge.SourceClusterID), ClusterID: challenge.SourceClusterID}
+	controlPrefix := path.Join(path.Dir(scope.Prefix), "control")
+	targetPrefix := path.Join(path.Dir(scope.Prefix), challenge.TargetClusterID)
+	source := gcsRecoverySource{Bucket: scope.Bucket, Prefix: scope.Prefix, ClusterID: scope.ClusterID, StatefulSetUID: challenge.StatefulSetUID}
+	claimKey, _ := manualTerminalSuccessorClaimKey(source, controlPrefix)
+	targetKeys, _ := manualTerminalTargetControlKeys(source, controlPrefix, targetPrefix, challenge.TargetClusterID)
+	fenceDigest := sha256.Sum256(encoded(fence))
+	return gcsManualTerminalVerifiedContext{
+		RootDigest: challenge.RootDigest, FenceRequest: fence, FenceRequestHash: hex.EncodeToString(fenceDigest[:]),
+		SourceDataScope: scope, SourceControlPrefix: controlPrefix, SuccessorClaimKey: claimKey,
+		TargetDataScope:   fencing.ArchiveScope{Provider: "gcs", Bucket: scope.Bucket, Prefix: targetPrefix, ClusterID: challenge.TargetClusterID},
+		TargetControlKeys: targetKeys, UnclaimedObservedAt: challenge.IssuedAt.Add(time.Minute),
+		HistoricalRunInventory: []gcsManualTerminalHistoricalRun{{Identity: fencing.Identity{
+			SourceClusterID: challenge.SourceClusterID, NodeID: "rhiza-0", PodUID: "pod-0", RunID: "run-1", WALIdentity: "wal-0",
+		}, runtimePresent: true}}, HistoricalRunCount: 1,
+	}
 }
 
 func manualTerminalPrivateEvidenceFixture(privateValue string) []byte {
@@ -951,12 +1074,14 @@ func manualTerminalChallengeFixture(privateValue string) operator.ManualRecovery
 	stamp := strings.Repeat("a", 64)
 	fence := manualTerminalFenceFixture(privateValue)
 	fenceHash := sha256.Sum256(encoded(fence))
+	scope := fencing.ArchiveScope{Provider: "gcs", Bucket: "private-bucket", Prefix: path.Join("runs", privateValue), ClusterID: privateValue}
+	scopeDigest, _ := scope.Hash()
 	return operator.ManualRecoveryChallenge{Version: 1,
 		ManualRecoveryBinding: operator.ManualRecoveryBinding{EvidenceKind: operator.ManualTerminalEvidenceKind,
 			RecoveryNamespace: "qualification", RecoveryName: "manual-terminal-recovery", RecoveryUID: "manual-recovery-uid",
 			RecoveryID: fence.OperationID, OperationID: fence.OperationID, SourceClusterID: privateValue,
 			StatefulSetName: fence.StatefulSet, StatefulSetUID: fence.StatefulSetUID, FenceRequestHash: hex.EncodeToString(fenceHash[:]), PolicyDigest: stamp, RootDigest: stamp,
-			LedgerDigest: stamp, CohortDigest: stamp, StorageScopeDigest: stamp, SourceArchiveDigest: stamp,
+			LedgerDigest: stamp, CohortDigest: stamp, StorageScopeDigest: scopeDigest, SourceArchiveDigest: stamp,
 			TargetClusterID: "manual-target", TargetBaseKind: "fork", CurrentPodUIDs: []string{"pod-1", "pod-2", "pod-3"}},
 		IssuedAt: time.Now().UTC().Truncate(time.Second), ExpiresAt: time.Now().UTC().Truncate(time.Second).Add(30 * time.Minute)}
 }
