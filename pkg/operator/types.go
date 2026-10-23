@@ -3,8 +3,11 @@ package operator
 import (
 	"github.com/mrchypark/rhiza/pkg/network"
 	"github.com/mrchypark/rhiza/pkg/quepaxa"
+	"github.com/mrchypark/rhiza/pkg/recovery"
 	"github.com/mrchypark/rhiza/pkg/recoveryanchor"
 )
+
+const RecoveryModeFrozenSource = "frozen-source-v1"
 
 type Resource struct {
 	APIVersion string         `json:"apiVersion"`
@@ -69,25 +72,32 @@ type Fence struct {
 }
 
 type Status struct {
-	Phase              string                        `json:"phase"`
-	Message            string                        `json:"message"`
-	ObservedGeneration int64                         `json:"observedGeneration"`
-	Source             string                        `json:"source"`
-	Target             string                        `json:"target,omitempty"`
+	Phase              string `json:"phase"`
+	Message            string `json:"message"`
+	ObservedGeneration int64  `json:"observedGeneration"`
+	Source             string `json:"source"`
+	Target             string `json:"target,omitempty"`
 	// TargetBaseKind distinguishes an authorized empty recovery from a fork.
 	// Empty means tip zero was explicitly observed and authorized, not absent.
-	TargetBaseKind     string                        `json:"targetBaseKind,omitempty"`
-	RecoveryID         string                        `json:"recoveryID,omitempty"`
-	SpecHash           string                        `json:"specHash,omitempty"`
-	StatefulSetUID     string                        `json:"statefulSetUID,omitempty"`
-	SourceDurability   string                        `json:"sourceDurability,omitempty"`
-	SourceMembership   string                        `json:"sourceMembership,omitempty"`
-	ManifestHash       string                        `json:"manifestHash,omitempty"`
-	RecoveredTip       uint64                        `json:"recoveredTip,omitempty"`
-	SecretName         string                        `json:"secretName,omitempty"`
-	Stage              string                        `json:"stage,omitempty"`
-	ArchiveCapture     string                        `json:"archiveCapture,omitempty"`
-	Peers              []network.VoterRecoveryStatus `json:"peers,omitempty"`
+	TargetBaseKind string `json:"targetBaseKind,omitempty"`
+	// FrozenEmptyGenesisPending selects the narrow headless-bootstrap check for
+	// a frozen recovery; it is persisted before the fencer preflight RPC.
+	FrozenEmptyGenesisPending bool `json:"frozenEmptyGenesisPending,omitempty"`
+	// RecoveryMode is selected before recovery side effects and is immutable for
+	// the operation. Empty preserves the legacy path for already-running entries.
+	RecoveryMode            string                            `json:"recoveryMode,omitempty"`
+	FrozenBucketEnvironment *recovery.FrozenBucketEnvironment `json:"frozenBucketEnvironment,omitempty"`
+	RecoveryID              string                            `json:"recoveryID,omitempty"`
+	SpecHash                string                            `json:"specHash,omitempty"`
+	StatefulSetUID          string                            `json:"statefulSetUID,omitempty"`
+	SourceDurability        string                            `json:"sourceDurability,omitempty"`
+	SourceMembership        string                            `json:"sourceMembership,omitempty"`
+	ManifestHash            string                            `json:"manifestHash,omitempty"`
+	RecoveredTip            uint64                            `json:"recoveredTip,omitempty"`
+	SecretName              string                            `json:"secretName,omitempty"`
+	Stage                   string                            `json:"stage,omitempty"`
+	ArchiveCapture          string                            `json:"archiveCapture,omitempty"`
+	Peers                   []network.VoterRecoveryStatus     `json:"peers,omitempty"`
 	// Automatic installation retains authenticated identities for a new incident
 	// even when a target voter fails before the parent adopts this generation.
 	// Missing observations never authorize single-voter fencing or invented WALs.

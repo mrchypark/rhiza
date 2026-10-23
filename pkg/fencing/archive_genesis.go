@@ -86,6 +86,11 @@ type ArchiveEmptyRecoveryAuthorization struct {
 	TargetDurability       string                 `json:"targetDurability"`
 	AllowDataLoss          bool                   `json:"allowDataLoss"`
 	PolicyDigest           string                 `json:"policyDigest"`
+	RecoveryMode           string                 `json:"recoveryMode,omitempty"`
+	SourcePrefix           string                 `json:"sourcePrefix,omitempty"`
+	BucketName             string                 `json:"bucketName,omitempty"`
+	BucketMetageneration   string                 `json:"bucketMetageneration,omitempty"`
+	LifecyclePolicyDigest  string                 `json:"lifecyclePolicyDigest,omitempty"`
 }
 
 func (a ArchiveEmptyRecoveryAuthorization) Validate() error {
@@ -100,6 +105,15 @@ func (a ArchiveEmptyRecoveryAuthorization) Validate() error {
 		(a.TargetDurability != "async" && a.TargetDurability != "before-ack") ||
 		(a.SourceDurability == "async" && !a.AllowDataLoss) {
 		return fmt.Errorf("fencing: invalid empty recovery authorization")
+	}
+	if a.RecoveryMode == "" {
+		if a.SourcePrefix != "" || a.BucketName != "" || a.BucketMetageneration != "" || a.LifecyclePolicyDigest != "" {
+			return fmt.Errorf("fencing: legacy empty authorization carries frozen-source environment")
+		}
+	} else if a.RecoveryMode != "frozen-source-v1" || a.SourceDurability != "async" || !a.AllowDataLoss ||
+		a.SourcePrefix == "" || a.SourcePrefix == "." || path.Clean(a.SourcePrefix) != a.SourcePrefix || strings.HasPrefix(a.SourcePrefix, "/") || strings.HasSuffix(a.SourcePrefix, "/") || a.BucketName == "" ||
+		a.BucketMetageneration == "" || !mutationDigestValid(a.LifecyclePolicyDigest) {
+		return fmt.Errorf("fencing: invalid frozen-source empty authorization")
 	}
 	return nil
 }

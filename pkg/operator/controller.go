@@ -213,19 +213,43 @@ func (c *Controller) reconcile(ctx context.Context, r *Resource) error {
 	if mode == "async" && !r.Spec.AllowDataLoss {
 		return reject("async source requires explicit allowDataLoss, regardless of target mode")
 	}
-	if r.Status.Stage == "" {
-		r.Status.ArchiveCapture = c.captureArchive(ctx, r, sts, env["RHIZA_ADMIN_TOKEN"])
+	if r.Status.RecoveryMode != "" && r.Status.RecoveryMode != RecoveryModeFrozenSource {
+		return reject("recovery journal contains an unsupported immutable mode")
 	}
+	if r.Status.RecoveryMode == "" && r.Status.Stage == "" && r.Status.RecoveryID == "" && r.Status.Target == "" && c.useFrozenSourceFork(source) {
+		r.Status.RecoveryMode = RecoveryModeFrozenSource
+		r.Status.RecoveryID, r.Status.SpecHash = r.Spec.RecoveryID, immutableSpecHash(r.Spec)
+		r.Status.StatefulSetUID, r.Status.Source = uid, r.Spec.SourceClusterID
+		return c.record(ctx, r, "Recovering", "frozen-source mode selected before authenticated fencer preflight")
+	}
+	frozen := r.Status.RecoveryMode == RecoveryModeFrozenSource
 	if err := validateFence(r.Spec.Fence, r.Spec.RecoveryID, r.Spec.SourceClusterID, uid); err != nil {
 		return c.record(ctx, r, "AwaitingFence", err.Error())
 	}
 	if r.Status.Stage == "" {
+		persistedTargetBaseKind := r.Status.TargetBaseKind
+		persistedHeadlessGenesis := r.Status.FrozenEmptyGenesisPending
 		archive := recovery.NewManager(c.Bucket, prefix, recovery.ArchiveConfigID)
 		defer archive.Close()
+		headlessGenesisCandidate := false
 		if err := archive.Load(ctx); err != nil {
-			return reject("source archive is unavailable")
-		}
-		if archive.Tip() == 0 {
+			if !frozen || mode != "async" || !r.Spec.AllowDataLoss || r.Spec.MaxArchiveAgeSeconds != 0 {
+				return reject("source archive is unavailable")
+			}
+			headKey := path.Join(prefix, "archive/head.bin")
+			if exists, existsErr := c.Bucket.Exists(ctx, headKey); existsErr != nil || exists {
+				return reject("source archive HEAD is present or its absence cannot be verified")
+			}
+			if _, ok := c.Fencer.(ArchiveEmptyRecoveryRegistrar); !ok {
+				return reject("frozen empty recovery registrar is unavailable")
+			}
+			if err := verifyFrozenEmptyArchiveNamespace(ctx, c.Bucket, prefix); err != nil {
+				return reject("headless source contains archive history or cannot be enumerated")
+			}
+			r.Status.FrozenEmptyGenesisPending = true
+			headlessGenesisCandidate = true
+			r.Status.TargetBaseKind = "empty"
+		} else if archive.Tip() == 0 {
 			if _, exists := archive.HeadVersion(); !exists {
 				return reject("source archive has no initialized empty HEAD")
 			}
@@ -242,19 +266,108 @@ func (c *Controller) reconcile(ctx context.Context, r *Resource) error {
 				return reject("archive evidence exceeds maxArchiveAgeSeconds; this is not a loss-window bound")
 			}
 		}
+		if frozen {
+			if persistedTargetBaseKind != "" && persistedTargetBaseKind != r.Status.TargetBaseKind {
+				return reject("frozen-source target base changed during recovery")
+			}
+			if persistedTargetBaseKind != "" && persistedHeadlessGenesis != headlessGenesisCandidate {
+				return reject("frozen-source empty-genesis mode changed during recovery")
+			}
+			if persistedTargetBaseKind == "" {
+				r.Status.FrozenEmptyGenesisPending = headlessGenesisCandidate
+				r.Status.RecoveryID, r.Status.SpecHash = r.Spec.RecoveryID, immutableSpecHash(r.Spec)
+				r.Status.StatefulSetUID, r.Status.Source = uid, r.Spec.SourceClusterID
+				return c.record(ctx, r, "Recovering", "frozen-source target base persisted before authenticated preflight")
+			}
+			preflight, err := c.frozenSourcePreflight(ctx, r)
+			if err != nil {
+				if errors.Is(err, ErrFencePending) {
+					return c.record(ctx, r, "Recovering", "frozen-source closure is pending")
+				}
+				return reject("frozen-source canonical preflight failed: " + err.Error())
+			}
+			if headlessGenesisCandidate && !preflight.EmptyGenesisEligible {
+				return reject("canonical source root has no exact eligible empty genesis")
+			}
+			if !preflight.ClosureReady {
+				return c.record(ctx, r, "Recovering", "frozen-source closure proof is pending")
+			}
+			configuredIdentity, err := c.frozenSourceIdentity(r, source)
+			if err != nil || configuredIdentity != preflight.Identity {
+				return reject("configured archive scope differs from canonical frozen-source identity")
+			}
+			target, err := recovery.FrozenTargetID(preflight.Identity)
+			if err != nil {
+				return reject("frozen source identity is invalid: " + err.Error())
+			}
+			bucketName := StoreIdentity(source.env)["RHIZA_OBJSTORE_BUCKET"]
+			bucketEnvironment, err := c.captureFrozenBucketEnvironment(ctx, bucketName, prefix)
+			if err != nil {
+				return reject("source bucket lifecycle is not safely observable: " + err.Error())
+			}
+			r.Status.Target = target
+			r.Status.RecoveryMode = RecoveryModeFrozenSource
+			r.Status.FrozenBucketEnvironment = &bucketEnvironment
+			r.Status.RecoveryID, r.Status.SpecHash = r.Spec.RecoveryID, immutableSpecHash(r.Spec)
+			if r.Status.TargetBaseKind == "empty" {
+				r.Status.Stage = "FrozenEmpty"
+			} else {
+				r.Status.Stage = "FrozenForked"
+			}
+			return c.record(ctx, r, "Recovering", "stable source-derived target claimed before recovery side effects")
+		}
 		r.Status.Target = "rhiza-r-" + shortID(c.operationID(r))
 		r.Status.RecoveryID, r.Status.SpecHash = r.Spec.RecoveryID, immutableSpecHash(r.Spec)
 		reservation := c.reservation(r)
-		if err := c.immutable(ctx, path.Join(prefix, "recovery/successor.json"), jsonBytes(reservation)); err != nil {
+		reserved, reservationDigest, err := c.verifyOrFindSuccessorReservation(ctx, prefix, reservation)
+		if err != nil {
+			return reject("legacy successor reservation is inconsistent or unavailable: " + err.Error())
+		}
+		if err := c.claimSourceSuccessor(ctx, r, source, r.Status.Target, r.Status.TargetBaseKind, sourceSuccessorModeLegacy, reservationDigest); err != nil {
+			return reject("source generation already chose a different successor: " + err.Error())
+		}
+		if reserved {
+			// Exact retries join the winner recorded above.
+		} else if err := c.immutable(ctx, path.Join(prefix, "recovery/successor.json"), jsonBytes(reservation)); err != nil {
 			return reject("source generation already reserved or reservation unavailable")
 		}
 		r.Status.Stage = "Reserved"
 		return c.record(ctx, r, "Recovering", "unique successor reserved; original generation must remain fenced")
 	}
-	if err := c.verifyReservation(ctx, r); err != nil {
-		return reject("reserved source successor changed or disappeared")
+	if r.Status.RecoveryMode == RecoveryModeFrozenSource {
+		if (r.Status.TargetBaseKind != "fork" || r.Status.Stage != "FrozenForked") && (r.Status.TargetBaseKind != "empty" || r.Status.Stage != "FrozenEmpty") {
+			return reject("frozen-source recovery mode is inconsistent with its immutable stage")
+		}
+		if r.Status.FrozenBucketEnvironment == nil {
+			return reject("frozen-source recovery has no persisted bucket lifecycle snapshot")
+		}
+		if err := c.frozenBucketEnvironmentVerifier(StoreIdentity(source.env)["RHIZA_OBJSTORE_BUCKET"], source.prefix)(ctx, *r.Status.FrozenBucketEnvironment); err != nil {
+			return reject("source bucket lifecycle changed or is unavailable: " + err.Error())
+		}
+		target, err := c.frozenTargetFor(r, source)
+		if err != nil || target != r.Status.Target {
+			return reject("frozen-source target differs from the stable source identity")
+		}
+	} else {
+		if r.Status.Stage == "FrozenForked" || r.Status.Stage == "FrozenEmpty" {
+			return reject("frozen-source stage has no immutable recovery mode")
+		}
+		if err := c.verifyReservation(ctx, r); err != nil {
+			return reject("reserved source successor changed or disappeared")
+		}
 	}
 	return c.advance(ctx, r, source)
+}
+
+func (c *Controller) useFrozenSourceFork(source sourceState) bool {
+	return source.reconfiguration && StoreIdentity(source.env)["RHIZA_OBJSTORE_PROVIDER"] == "gcs" &&
+		c.Fencer != nil && func() bool {
+		if _, ok := c.Fencer.(ArchiveForkGenesisRegistrar); !ok {
+			return false
+		}
+		_, cooperative := c.Fencer.(*KubernetesFencer)
+		return !cooperative
+	}()
 }
 
 func (c *Controller) advance(ctx context.Context, r *Resource, s sourceState) error {
@@ -290,8 +403,8 @@ func (c *Controller) advance(ctx context.Context, r *Resource, s sourceState) er
 		}
 		r.Status.Stage = "Starting"
 		return c.record(ctx, r, "Recovering", "source StatefulSet Pods terminated; externally fenced target may start")
-	case "Sealed":
-		secret := "rhiza-recovery-" + shortID(c.operationID(r))
+	case "FrozenForked", "FrozenEmpty", "Sealed":
+		secret := c.recoverySecretName(r)
 		var targetMembers []quepaxa.Member
 		if s.reconfiguration {
 			var err error
@@ -311,9 +424,31 @@ func (c *Controller) advance(ctx context.Context, r *Resource, s sourceState) er
 		if targetBaseKind != "fork" {
 			return c.record(ctx, r, "Blocked", "recovery target base kind is missing or invalid")
 		}
-		result, err := recovery.Fork(ctx, c.Bucket, c.forkOptions(r, s.prefix, s.members, s.reconfiguration, targetMembers))
-		if err != nil {
-			return c.record(ctx, r, "Blocked", "certified archive fork failed: "+err.Error())
+		var result recovery.ForkResult
+		var err error
+		if r.Status.RecoveryMode == RecoveryModeFrozenSource {
+			if r.Status.FrozenBucketEnvironment == nil {
+				return c.record(ctx, r, "Blocked", "frozen-source bucket lifecycle snapshot is missing")
+			}
+			identity, proofDigest, rootDigest, err := c.frozenSourceClosure(ctx, r, s)
+			if err != nil {
+				return c.record(ctx, r, "Blocked", "frozen source closure changed or is unavailable: "+err.Error())
+			}
+			options := c.forkOptions(r, s.prefix, s.members, true, targetMembers)
+			frozen, err := recovery.ForkFrozenSource(ctx, c.Bucket, recovery.FrozenForkOptions{
+				ForkOptions: options, SourceIdentity: identity, FenceProofDigest: proofDigest, ClosedRootDigest: rootDigest,
+				BucketEnvironment: *r.Status.FrozenBucketEnvironment,
+				VerifyEnvironment: c.frozenBucketEnvironmentVerifier(StoreIdentity(s.env)["RHIZA_OBJSTORE_BUCKET"], s.prefix),
+			})
+			if err != nil {
+				return c.record(ctx, r, "Blocked", "verified frozen-source fork failed: "+err.Error())
+			}
+			result = frozen.ForkResult
+		} else {
+			result, err = recovery.Fork(ctx, c.Bucket, c.forkOptions(r, s.prefix, s.members, s.reconfiguration, targetMembers))
+			if err != nil {
+				return c.record(ctx, r, "Blocked", "certified archive fork failed: "+err.Error())
+			}
 		}
 		if !s.reconfiguration {
 			targetMembers, err = c.targetCredentials(ctx, r, secret, s.members)
@@ -365,7 +500,11 @@ func (c *Controller) advance(ctx context.Context, r *Resource, s sourceState) er
 			if requiresArchiveGenesis {
 				request := ArchiveForkGenesisRequest{
 					StatefulSetUID: r.Status.StatefulSetUID, TargetClusterID: r.Status.Target,
-					OperationID: c.operationID(r), SourceFenceOperationID: r.Spec.RecoveryID,
+					OperationID: c.operationID(r), SourceFenceOperationID: r.Spec.RecoveryID, RecoveryMode: r.Status.RecoveryMode,
+					BucketEnvironment: r.Status.FrozenBucketEnvironment,
+				}
+				if r.Status.RecoveryMode == RecoveryModeFrozenSource {
+					request.RecoveryName = resourceName(r)
 				}
 				if err := registrar.RegisterArchiveForkGenesis(ctx, request); err != nil {
 					return c.record(ctx, r, "Blocked", "canonical archive fork genesis registration failed: "+err.Error())
@@ -438,7 +577,7 @@ func (c *Controller) registerEmptyRecovery(ctx context.Context, r *Resource, mem
 		SourceFenceOperationID: r.Spec.RecoveryID,
 		TargetMembershipHash:   authorityStateDigest(jsonBytes(membership)),
 		TargetDurability:       r.Spec.Durability, AllowDataLoss: r.Spec.AllowDataLoss,
-		PolicyDigest: hashJSON(r.Spec),
+		PolicyDigest: hashJSON(r.Spec), RecoveryMode: r.Status.RecoveryMode, BucketEnvironment: r.Status.FrozenBucketEnvironment,
 	}
 	if request.RecoveryName == "" || request.StatefulSetUID == "" || request.TargetClusterID == "" || request.OperationID == "" ||
 		request.SourceFenceOperationID == "" || request.TargetMembershipHash == "" || request.PolicyDigest == "" {
@@ -452,19 +591,27 @@ func (c *Controller) registerEmptyRecovery(ctx context.Context, r *Resource, mem
 		return ArchiveEmptyRecoveryResponse{}, fmt.Errorf("invalid canonical empty recovery state")
 	}
 	authorization := response.Authorization
+	expectedSourcePrefix := ""
+	if request.RecoveryMode == RecoveryModeFrozenSource {
+		expectedSourcePrefix = path.Join(strings.Trim(c.Prefix, "/"), r.Status.Source)
+	}
 	if err := authorization.Validate(); err != nil || authorization.StatefulSetUID != request.StatefulSetUID ||
 		authorization.TargetClusterID != request.TargetClusterID || authorization.OperationID != request.OperationID ||
 		authorization.SourceFenceOperationID != request.SourceFenceOperationID || authorization.SourceTip != 0 ||
 		authorization.TargetMembershipHash != request.TargetMembershipHash || authorization.TargetDurability != request.TargetDurability ||
-		authorization.AllowDataLoss != request.AllowDataLoss || authorization.PolicyDigest != emptyRecoveryPolicyDigest(request.PolicyDigest, authorization.SourceDurability, request.TargetDurability, request.AllowDataLoss) {
+		authorization.AllowDataLoss != request.AllowDataLoss || authorization.PolicyDigest != emptyRecoveryPolicyDigest(request.PolicyDigest, authorization.SourceDurability, request.TargetDurability, request.AllowDataLoss) ||
+		authorization.RecoveryMode != request.RecoveryMode || authorization.SourcePrefix != expectedSourcePrefix ||
+		authorization.BucketMetageneration != frozenBucketMetageneration(request.BucketEnvironment) || authorization.LifecyclePolicyDigest != frozenBucketLifecycleDigest(request.BucketEnvironment) {
 		return ArchiveEmptyRecoveryResponse{}, fmt.Errorf("canonical empty recovery authorization differs from the requested operation")
 	}
 	return response, nil
 }
 
 func (c *Controller) startAndObserve(ctx context.Context, r *Resource, sts object) error {
-	if err := c.verifyReservation(ctx, r); err != nil {
-		return c.record(ctx, r, "Blocked", "reserved source successor changed or disappeared")
+	if r.Status.RecoveryMode != RecoveryModeFrozenSource {
+		if err := c.verifyReservation(ctx, r); err != nil {
+			return c.record(ctx, r, "Blocked", "reserved source successor changed or disappeared")
+		}
 	}
 	if err := validateFence(r.Spec.Fence, r.Spec.RecoveryID, r.Spec.SourceClusterID, r.Status.StatefulSetUID); err != nil {
 		return c.record(ctx, r, "AwaitingFence", err.Error())
@@ -477,7 +624,7 @@ func (c *Controller) startAndObserve(ctx context.Context, r *Resource, sts objec
 		// Prior journal entries were only created for nonzero certified forks.
 		targetBaseKind = "fork"
 	}
-	if r.Status.Target != "rhiza-r-"+shortID(c.operationID(r)) || r.Status.SecretName != "rhiza-recovery-"+shortID(c.operationID(r)) ||
+	if r.Status.Target != c.recoveryTargetID(r) || r.Status.SecretName != c.recoverySecretName(r) ||
 		(targetBaseKind == "fork" && r.Status.RecoveredTip == 0) ||
 		(targetBaseKind == "empty" && (r.Status.RecoveredTip != 0 || r.Status.ManifestHash != "")) ||
 		(targetBaseKind != "fork" && targetBaseKind != "empty") {
@@ -493,6 +640,13 @@ func (c *Controller) startAndObserve(ctx context.Context, r *Resource, sts objec
 	env, err := c.environment(ctx, ctr)
 	if err != nil {
 		return err
+	}
+	if r.Status.RecoveryMode == RecoveryModeFrozenSource {
+		prefix := path.Join(strings.Trim(StoreIdentity(env)["RHIZA_OBJSTORE_PREFIX"], "/"), r.Spec.SourceClusterID)
+		target, err := c.frozenTargetFor(r, sourceState{prefix: prefix, env: env})
+		if err != nil || target != r.Status.Target {
+			return c.record(ctx, r, "Blocked", "stable frozen-source target identity changed")
+		}
 	}
 	if err := c.storeConfigMatches(env); err != nil {
 		return c.record(ctx, r, "Blocked", err.Error())
@@ -780,6 +934,20 @@ func (c *Controller) reservation(r *Resource) object {
 		reservation["target_base_kind"] = r.Status.TargetBaseKind
 	}
 	return reservation
+}
+
+func (c *Controller) recoveryTargetID(r *Resource) string {
+	if r.Status.RecoveryMode == RecoveryModeFrozenSource {
+		return r.Status.Target
+	}
+	return "rhiza-r-" + shortID(c.operationID(r))
+}
+
+func (c *Controller) recoverySecretName(r *Resource) string {
+	if r.Status.RecoveryMode == RecoveryModeFrozenSource {
+		return "rhiza-recovery-" + shortID(r.Status.Target)
+	}
+	return "rhiza-recovery-" + shortID(c.operationID(r))
 }
 func reconfigurationEnabled(env map[string]string) (bool, error) {
 	raw := env["RHIZA_ENABLE_RECONFIGURATION"]

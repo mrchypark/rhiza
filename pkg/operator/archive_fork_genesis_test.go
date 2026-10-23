@@ -102,7 +102,8 @@ func newForkAuthorityRegistrarFixture(t *testing.T) forkAuthorityRegistrarFixtur
 	f.f.objects["/api/v1/namespaces/test/pods"] = object{"items": []any{}}
 	f.f.mu.Unlock()
 
-	const sourcePrefix, targetID, recoveryOperation, fenceOperation = "root/source", "target", "recovery-op", "source-fence-op"
+	const sourcePrefix, recoveryOperation, fenceOperation = "root/source", "recovery-uid:source-fence-op", "source-fence-op"
+	targetID := "rhiza-r-" + shortID(recoveryOperation)
 	putForkJSON(t, bucket, path.Join(sourcePrefix, "voters/membership.json"), recovery.NewMembershipRecord("source", sourceMembers, "async"))
 	wal, err := qlog.Open(t.TempDir())
 	if err != nil {
@@ -184,7 +185,7 @@ func newForkAuthorityRegistrarFixture(t *testing.T) forkAuthorityRegistrarFixtur
 	request := ArchiveForkGenesisRequest{StatefulSetUID: f.runtime.StatefulSetUID, TargetClusterID: targetID,
 		OperationID: recoveryOperation, SourceFenceOperationID: fenceOperation}
 	scope := fencing.ArchiveScope{Provider: "gcs", Bucket: "archive", Prefix: targetPrefix, ClusterID: targetID}
-	ref, err := e.verifyArchiveForkArtifacts(t.Context(), request, "source", sourcePrefix, targetPrefix, scope, sourceMembers, "async")
+	ref, err := e.verifyArchiveForkArtifacts(t.Context(), request, "source", sourcePrefix, targetPrefix, scope, sourceMembers, "async", nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -286,7 +287,7 @@ func TestArchiveForkRegistrarRejectsMismatchesAndMissingArtifacts(t *testing.T) 
 		{name: "recovery operation mismatch", change: func(f *forkAuthorityRegistrarFixture) { f.request.OperationID = "other-recovery" }},
 		{name: "source fence mismatch", change: func(f *forkAuthorityRegistrarFixture) { f.request.SourceFenceOperationID = "other-fence" }},
 		{name: "missing fork result", change: func(f *forkAuthorityRegistrarFixture) {
-			_ = f.e.ArchiveBucket.Delete(t.Context(), "root/target/fork/result.json")
+			_ = f.e.ArchiveBucket.Delete(t.Context(), path.Join("root", f.request.TargetClusterID, "fork/result.json"))
 		}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
