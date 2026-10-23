@@ -574,7 +574,7 @@ func automaticBootstrapController(t *testing.T, f automaticBootstrapGenesisFixtu
 	if err != nil {
 		t.Fatal(err)
 	}
-	controller := &Controller{Fencer: client, Automatic: true, Kube: f.e.Kube, Bucket: f.archive, Prefix: "root", StoreIdentity: StoreIdentity(env)}
+	controller := &Controller{Fencer: client, Automatic: true, Kube: f.e.Kube, Bucket: frozenSourceEmptyTestBucket{Bucket: f.archive}, Prefix: "root", StoreIdentity: StoreIdentity(env)}
 	return controller, server, cluster
 }
 
