@@ -203,7 +203,15 @@ func (f *mutationStoreFixture) serve(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(500)
 		return
 	}
-	w.WriteHeader(200)
+	if r.Method == http.MethodPut {
+		// Kubernetes returns the persisted object for a successful update. Keep
+		// this fake response faithful for callers that verify UID/resourceVersion.
+		w.Header().Set("Content-Type", "application/json")
+	}
+	w.WriteHeader(http.StatusOK)
+	if r.Method == http.MethodPut {
+		_ = json.NewEncoder(w).Encode(next)
+	}
 }
 
 func TestMutationStoreStatusWriteUpdatesPrimaryResource(t *testing.T) {

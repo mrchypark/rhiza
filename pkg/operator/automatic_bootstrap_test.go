@@ -759,6 +759,14 @@ func TestAutomaticSupervisedSourcePinsRootBeforeInitialScale(t *testing.T) {
 					f.api.mu.Unlock()
 					t.Fatalf("supervised source was not pinned while still empty: root=%q phase=%q status=%q", gotRoot, phase, message)
 				}
+				f.api.mu.Lock()
+				clusterObject := asObject(f.api.objects[controller.clusterPath(automaticBootstrapClusterName)])
+				phase := str(nested(clusterObject, "status", "phase"))
+				message := str(nested(clusterObject, "status", "message"))
+				f.api.mu.Unlock()
+				if phase != "Observing" || message != "supervised source root is pinned; continue after initial StatefulSet scale" {
+					t.Fatalf("successful root pin did not report the expected observing status: phase=%q status=%q", phase, message)
+				}
 				if state, _, err := controller.loadAuto(t.Context(), controller.autoKey(&cluster)); err == nil || state != nil {
 					t.Fatalf("controller advanced durable recovery state before initial scale: state=%+v err=%v", state, err)
 				}
@@ -826,6 +834,12 @@ func TestReconcileAllPinsSupervisedRootWithAutomaticRecoveryDisabled(t *testing.
 			stsPath := controller.stsPath("rhiza")
 			if got := str(nested(f.api.objects[stsPath], "spec", "template", "metadata", "annotations", fencingRootAnnotation)); got != automaticBootstrapClusterUID {
 				t.Fatalf("global-off reconcile did not pin the supervised root: got %q", got)
+			}
+			f.api.mu.Lock()
+			phase := str(nested(f.api.objects[controller.clusterPath(automaticBootstrapClusterName)], "status", "phase"))
+			f.api.mu.Unlock()
+			if phase == "Blocked" {
+				t.Fatal("global-off initialization persisted a Blocked status after pinning the supervised root")
 			}
 			if state, _, err := controller.loadAuto(t.Context(), controller.autoKey(&cluster)); err == nil || state != nil {
 				t.Fatalf("global-off initialization advanced automatic recovery: state=%+v err=%v", state, err)
