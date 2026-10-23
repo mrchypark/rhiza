@@ -22,6 +22,34 @@ import (
 func TestAuthenticatedLearnerPromotionRetriesExactCanonicalCompletion(t *testing.T) {
 	ctx := t.Context()
 	f := newAutomaticBootstrapGenesisFixture(t)
+	// Model the actual supervised workload before the fixture computes its
+	// canonical bootstrap candidate. The same root binding must be present on
+	// the StatefulSet template and each existing Pod; the replacement below
+	// keeps those annotations while changing only its physical incarnation.
+	f.api.mu.Lock()
+	stsPath := f.e.controller().stsPath("rhiza")
+	supervisedSTS := asObject(f.api.objects[stsPath])
+	if supervisedSTS == nil {
+		f.api.mu.Unlock()
+		t.Fatal("supervised StatefulSet fixture is missing")
+	}
+	annotations := object{fencingProtocolAnnotation: "1", fencingRootAnnotation: automaticBootstrapClusterUID}
+	template := asObject(nested(supervisedSTS, "spec", "template"))
+	metadata := asObject(template["metadata"])
+	if metadata == nil {
+		metadata = object{}
+		template["metadata"] = metadata
+	}
+	metadata["annotations"] = annotations
+	if f.api.authStatefulSet != nil {
+		f.api.authStatefulSet = supervisedSTS
+	}
+	podsPath := f.e.controller().corePath("pods", "")
+	for _, raw := range list(asObject(f.api.objects[podsPath])["items"]) {
+		podMetadata := asObject(asObject(raw)["metadata"])
+		podMetadata["annotations"] = object{fencingProtocolAnnotation: "1", fencingRootAnnotation: automaticBootstrapClusterUID}
+	}
+	f.api.mu.Unlock()
 	f.e.ControllerServiceAccount = "default"
 	controller, _, cluster := automaticBootstrapController(t, f)
 	clusterPath := controller.clusterPath(automaticBootstrapClusterName)
