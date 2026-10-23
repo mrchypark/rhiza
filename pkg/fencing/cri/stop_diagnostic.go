@@ -54,7 +54,7 @@ func ValidStopDiagnostic(stage, code string) bool {
 		return code == "container_state_unverified"
 	case "pre_sandbox_scope":
 		switch code {
-		case "cgroup_scope_unverified", "cgroup_identity_changed", "cgroup_observation_unavailable", "target_process_live", "target_process_state_unavailable", "cgroup_populated":
+		case "cgroup_scope_unverified", "cgroup_identity_changed", "cgroup_observation_unavailable", "cgroup_scope_not_removed", "target_process_live", "target_process_state_unavailable", "cgroup_populated":
 			return true
 		default:
 			return validCgroupObservationCode(code)
@@ -81,7 +81,7 @@ func ValidStopDiagnostic(stage, code string) bool {
 }
 
 func validCgroupObservationCode(code string) bool {
-	for _, operation := range []string{"fstat", "fstatfs", "events"} {
+	for _, operation := range []string{"fstat", "fstatfs", "events", "scope_path"} {
 		for _, class := range []string{"bad_fd", "denied", "not_found", "no_device", "io", "other"} {
 			if code == "cgroup_"+operation+"_"+class {
 				return true
