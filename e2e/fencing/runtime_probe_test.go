@@ -7,6 +7,9 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"github.com/mrchypark/rhiza/pkg/fencing"
+	"github.com/mrchypark/rhiza/pkg/fencing/cri"
 )
 
 func TestKubernetesDeleteOptionsBindUIDAndZeroGrace(t *testing.T) {
@@ -48,6 +51,38 @@ func TestRuntimeProbeRecordsEnrollmentAndSafeStopStageBeforePending(t *testing.T
 	}
 	if !evidence.EnrollmentCaptured || evidence.StopDiagnosticStage != progress.StopStage || evidence.StopDiagnosticCode != progress.StopCode {
 		t.Fatalf("progress was not preserved in probe evidence: %+v", evidence)
+	}
+}
+
+func TestRuntimeProbeMatchesCapturedScopeDigestNotFullBindingDigest(t *testing.T) {
+	binding := fencing.RuntimeBinding{
+		SourceClusterID: "source", NodeID: "node", PodUID: "pod", RunID: "run",
+		CapturedScopeDigest: strings.Repeat("a", 64),
+	}
+	scopeDigest := fencing.RuntimeScopeBindingDigest(binding)
+	fullBindingDigest := fencing.RuntimeBindingDigest(binding)
+	if scopeDigest == fullBindingDigest {
+		t.Fatal("test binding must distinguish scope and full-binding digests")
+	}
+	scope := cri.CgroupScope{
+		Path: "kubepods/pod", Ino: 12, PID: 34, StartTime: 56,
+		RuntimeHash: scopeDigest, ProfileID: "qualified-profile",
+	}
+	if !runtimeProbeCgroupScopeMatches(binding, scope, "qualified-profile") {
+		t.Fatal("valid captured-scope digest was rejected")
+	}
+	scope.RuntimeHash = fullBindingDigest
+	if runtimeProbeCgroupScopeMatches(binding, scope, "qualified-profile") {
+		t.Fatal("full-binding digest was accepted as a captured-scope digest")
+	}
+	scope.RuntimeHash = scopeDigest
+	otherBinding := binding
+	otherBinding.NodeName = "other-node"
+	if runtimeProbeCgroupScopeMatches(otherBinding, scope, "qualified-profile") {
+		t.Fatal("scope digest for another runtime binding was accepted")
+	}
+	if runtimeProbeCgroupScopeMatches(binding, scope, "other-profile") {
+		t.Fatal("scope with another cgroup profile was accepted")
 	}
 }
 
