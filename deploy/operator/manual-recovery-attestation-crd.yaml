@@ -43,6 +43,7 @@ spec:
                 - storageScopeDigest
                 - sourceArchiveDigest
                 - targetClusterID
+                - targetBaseKind
                 - currentPodUIDs
                 - evidenceKind
                 - assertions
@@ -68,6 +69,7 @@ spec:
                 storageScopeDigest: {type: string, pattern: '^[a-f0-9]{64}$'}
                 sourceArchiveDigest: {type: string, pattern: '^[a-f0-9]{64}$'}
                 targetClusterID: {type: string, minLength: 1, maxLength: 256}
+                targetBaseKind: {type: string, enum: [fork]}
                 targetMembershipHash: {type: string, pattern: '^[a-f0-9]{64}$'}
                 currentPodUIDs:
                   type: array

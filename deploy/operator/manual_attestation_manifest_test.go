@@ -2,10 +2,12 @@ package operator_test
 
 import (
 	"bytes"
+	"encoding/json"
 	"os"
 	"strings"
 	"testing"
 
+	"github.com/mrchypark/rhiza/pkg/operator"
 	"gopkg.in/yaml.v3"
 )
 
@@ -47,7 +49,7 @@ func TestManualRecoveryAttestationCRDIsNamespacedStrictAndImmutable(t *testing.T
 		"challengeDigest", "recoveryNamespace", "recoveryName", "recoveryUID",
 		"recoveryID", "operationID", "sourceClusterID", "statefulSetName", "statefulSetUID", "fenceRequestHash",
 		"policyDigest", "rootDigest", "ledgerDigest",
-		"cohortDigest", "storageScopeDigest", "sourceArchiveDigest", "targetClusterID",
+		"cohortDigest", "storageScopeDigest", "sourceArchiveDigest", "targetClusterID", "targetBaseKind",
 		"targetMembershipHash", "currentPodUIDs", "assertions", "attester", "evidenceRefs",
 	} {
 		if _, ok := properties[field]; !ok {
@@ -66,6 +68,163 @@ func TestManualRecoveryAttestationCRDIsNamespacedStrictAndImmutable(t *testing.T
 			t.Errorf("assertion %q must accept only true, got %v", field, assertion["enum"])
 		}
 	}
+}
+
+func TestManualRecoveryAttestationCRDMatchesSerializedSpecAndPreservesChallengeStatus(t *testing.T) {
+	data, err := os.ReadFile("manual-recovery-attestation-crd.yaml")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var attestationCRD map[string]any
+	if err := yaml.Unmarshal(data, &attestationCRD); err != nil {
+		t.Fatal(err)
+	}
+	attestationSpecSchema := crdVersionSpecSchema(t, attestationCRD)
+	attestationProperties, _ := nestedManifestMap(attestationSpecSchema, "properties")
+	attestationRequired := manifestStringSet(t, attestationSpecSchema["required"], "attestation spec required")
+
+	serializedSpec, err := json.Marshal(operator.ManualRecoveryAttestationSpec{
+		Version:         1,
+		ChallengeDigest: strings.Repeat("a", 64),
+		ManualRecoveryBinding: operator.ManualRecoveryBinding{
+			EvidenceKind:         operator.ManualTerminalEvidenceKind,
+			RecoveryNamespace:    "recovery-ns",
+			RecoveryName:         "recovery",
+			RecoveryUID:          "recovery-uid",
+			RecoveryID:           "recovery-id",
+			OperationID:          "operation-id",
+			SourceClusterID:      "source-cluster",
+			StatefulSetName:      "db",
+			StatefulSetUID:       "sts-uid",
+			FenceRequestHash:     strings.Repeat("b", 64),
+			PolicyDigest:         strings.Repeat("c", 64),
+			RootDigest:           strings.Repeat("d", 64),
+			LedgerDigest:         strings.Repeat("e", 64),
+			CohortDigest:         strings.Repeat("f", 64),
+			StorageScopeDigest:   strings.Repeat("1", 64),
+			SourceArchiveDigest:  strings.Repeat("2", 64),
+			TargetClusterID:      "target-cluster",
+			TargetBaseKind:       "fork",
+			TargetMembershipHash: strings.Repeat("3", 64),
+			CurrentPodUIDs:       []string{"pod-uid"},
+		},
+		Assertions: operator.ManualRecoveryAssertions{
+			AllHistoricalRunsTerminated:        true,
+			RecreationBlocked:                  true,
+			OldPeerAndClientWriteAccessBlocked: true,
+			OldArchiveWriterAccessRevoked:      true,
+			StorageQuiesced:                    true,
+		},
+		Attester:     "incident-admin",
+		EvidenceRefs: []string{"incident-record"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var serializedFields map[string]json.RawMessage
+	if err := json.Unmarshal(serializedSpec, &serializedFields); err != nil {
+		t.Fatal(err)
+	}
+	for field := range serializedFields {
+		if _, ok := attestationProperties[field]; !ok {
+			t.Errorf("serialized attestation field %q is pruned by the CRD schema", field)
+		}
+		if field != "targetMembershipHash" && !attestationRequired[field] {
+			t.Errorf("serialized required attestation field %q is not required by the CRD", field)
+		}
+	}
+	if attestationRequired["targetMembershipHash"] {
+		t.Error("optional targetMembershipHash must not become a required CRD field")
+	}
+	targetBaseKind, _ := attestationProperties["targetBaseKind"].(map[string]any)
+	allowedBaseKinds, _ := targetBaseKind["enum"].([]any)
+	if targetBaseKind["type"] != "string" || len(allowedBaseKinds) != 1 || allowedBaseKinds[0] != "fork" {
+		t.Errorf("targetBaseKind schema=%#v, want string enum [fork]", targetBaseKind)
+	}
+
+	assertionSchema, _ := attestationProperties["assertions"].(map[string]any)
+	assertionProperties, _ := nestedManifestMap(assertionSchema, "properties")
+	assertionRequired := manifestStringSet(t, assertionSchema["required"], "attestation assertions required")
+	var serializedAssertions map[string]json.RawMessage
+	if err := json.Unmarshal(serializedFields["assertions"], &serializedAssertions); err != nil {
+		t.Fatal(err)
+	}
+	for field := range serializedAssertions {
+		if _, ok := assertionProperties[field]; !ok || !assertionRequired[field] {
+			t.Errorf("serialized assertion field %q is not both declared and required", field)
+		}
+	}
+
+	recoveryCRD, err := os.ReadFile("crd.yaml")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var recoveryDefinition map[string]any
+	if err := yaml.Unmarshal(recoveryCRD, &recoveryDefinition); err != nil {
+		t.Fatal(err)
+	}
+	recoveryRoot := crdVersionRootSchema(t, recoveryDefinition)
+	recoveryProperties, _ := nestedManifestMap(recoveryRoot, "properties")
+	statusSchema, _ := recoveryProperties["status"].(map[string]any)
+	if statusSchema["x-kubernetes-preserve-unknown-fields"] != true {
+		t.Fatalf("RhizaRecovery status schema does not preserve the typed challenge fields: %#v", statusSchema)
+	}
+}
+
+func crdVersionSpecSchema(t *testing.T, crd map[string]any) map[string]any {
+	t.Helper()
+	root := crdVersionRootSchema(t, crd)
+	rootProperties, ok := nestedManifestMap(root, "properties")
+	if !ok {
+		t.Fatal("CRD root has no properties")
+	}
+	specSchema, ok := nestedManifestMap(rootProperties, "spec")
+	if !ok {
+		t.Fatal("CRD root has no spec schema")
+	}
+	return specSchema
+}
+
+func crdVersionRootSchema(t *testing.T, crd map[string]any) map[string]any {
+	t.Helper()
+	spec, ok := nestedManifestMap(crd, "spec")
+	if !ok {
+		t.Fatal("CRD has no spec")
+	}
+	versions, ok := spec["versions"].([]any)
+	if !ok || len(versions) != 1 {
+		t.Fatalf("CRD versions=%#v, want one", spec["versions"])
+	}
+	version, ok := versions[0].(map[string]any)
+	if !ok {
+		t.Fatal("CRD version is not a mapping")
+	}
+	schema, ok := nestedManifestMap(version, "schema")
+	if !ok {
+		t.Fatal("CRD version has no schema")
+	}
+	openAPI, ok := nestedManifestMap(schema, "openAPIV3Schema")
+	if !ok {
+		t.Fatal("CRD version has no openAPIV3Schema")
+	}
+	return openAPI
+}
+
+func manifestStringSet(t *testing.T, raw any, label string) map[string]bool {
+	t.Helper()
+	values, ok := raw.([]any)
+	if !ok {
+		t.Fatalf("%s=%#v, want string list", label, raw)
+	}
+	result := make(map[string]bool, len(values))
+	for _, value := range values {
+		field, ok := value.(string)
+		if !ok {
+			t.Fatalf("%s contains non-string %T", label, value)
+		}
+		result[field] = true
+	}
+	return result
 }
 
 func TestManualRecoveryAttestationRBACSeparatesCreationFromReading(t *testing.T) {
