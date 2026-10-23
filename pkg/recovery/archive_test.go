@@ -894,6 +894,62 @@ func TestArchiveSyncThroughBusyRecheckDoesNotFalseSucceed(t *testing.T) {
 	}
 }
 
+func TestArchiveSyncThroughDiagnosticReportsBusyLockAndValidatedTip(t *testing.T) {
+	ctx, base, core, waiter, writer := newArchiveSyncAdmissionManagers(t)
+	if _, _, err := core.Propose(ctx, []byte("already archived")); err != nil {
+		t.Fatal(err)
+	}
+	if err := writer.SyncThrough(ctx, core, core.Tip()); err != nil {
+		t.Fatal(err)
+	}
+	archiveTip := core.Tip()
+	if _, _, err := core.Propose(ctx, []byte("required but not archived")); err != nil {
+		t.Fatal(err)
+	}
+	required := core.Tip()
+
+	holder := NewManager(base, "cluster", 1)
+	defer holder.Close()
+	lease, err := holder.acquireArchiveLock(ctx, holder.publicationLockKey(), "diagnostic-test-holder", archivePinLease)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() {
+		if err := holder.releaseArchiveLock(ctx, holder.publicationLockKey(), lease); err != nil {
+			t.Errorf("release publication lock: %v", err)
+		}
+	}()
+
+	observed := &archiveSyncAdmissionBucket{Bucket: base, busyObserved: make(chan struct{})}
+	waiter.bucket = observed
+	waitCtx, cancel := context.WithTimeout(ctx, 250*time.Millisecond)
+	err = waiter.SyncThrough(waitCtx, core, required)
+	cancel()
+	waiter.Close() // Stop its manager-owned batch before releasing the held lock.
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("SyncThrough() error = %v, want deadline exceeded", err)
+	}
+	select {
+	case <-observed.busyObserved:
+	default:
+		t.Fatal("test did not observe publication-lock contention")
+	}
+	var diagnostic interface {
+		ReadDurabilityDiagnostic() (required, archiveTip uint64, stage, lockState string)
+	}
+	if !errors.As(err, &diagnostic) {
+		t.Fatalf("SyncThrough() error %T lacks bounded diagnostic", err)
+	}
+	gotRequired, gotTip, stage, lockState := diagnostic.ReadDurabilityDiagnostic()
+	if gotRequired != uint64(required) || gotTip != uint64(archiveTip) || lockState != "busy" {
+		t.Fatalf("diagnostic required=%d tip=%d stage=%q lock=%q; want required=%d tip=%d lock=busy",
+			gotRequired, gotTip, stage, lockState, required, archiveTip)
+	}
+	if stage != "publication-lock" && stage != "lock-recheck-head-refresh" {
+		t.Fatalf("diagnostic stage=%q, want publication-lock wait/recheck", stage)
+	}
+}
+
 func TestArchiveSyncThroughCoveredBatchRetriesLateHigherWaiter(t *testing.T) {
 	ctx, base, core, stale, writer := newArchiveSyncAdmissionManagers(t)
 	if _, _, err := core.Propose(ctx, []byte("covered lower target")); err != nil {

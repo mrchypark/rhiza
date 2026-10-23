@@ -74,13 +74,81 @@ func TestReadDurabilityFailureLogsReadDurabilityPhase(t *testing.T) {
 		t.Fatal("Query succeeded despite controlled durability failure")
 	}
 	message := output.String()
-	for _, want := range []string{"phase=read-durability", "node=n1", "read_index=0", "core_tip=0", "applied_tip=0", "elapsed=", "error_class=durability-unavailable"} {
+	for _, want := range []string{"phase=read-durability", "node=n1", "applied_slot=0", "core_tip=0", "applied_tip=0", "elapsed=", "error_class=durability-unavailable"} {
 		if !strings.Contains(message, want) {
 			t.Fatalf("failure log %q does not contain %q", message, want)
 		}
 	}
 	if strings.Contains(message, "controlled durability failure") {
 		t.Fatalf("failure log leaked backend error text: %q", message)
+	}
+}
+
+type boundedArchiveDiagnosticError struct {
+	stage     string
+	lockState string
+}
+
+func (boundedArchiveDiagnosticError) Error() string { return "private archive backend detail" }
+func (e boundedArchiveDiagnosticError) ReadDurabilityDiagnostic() (uint64, uint64, string, string) {
+	return 2, 1, e.stage, e.lockState
+}
+
+func TestReadDurabilityFailureLogsBoundedArchiveWaitDiagnostic(t *testing.T) {
+	core := mustCore(t, "n1", []quepaxa.Member{{ID: "n1"}}, nil, nil)
+	material, err := materializer.Open(t.TempDir()+"/db.sqlite", 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = material.Close() })
+	server := NewServer(core, material, types.ClusterID("cluster"), true, nil)
+	t.Cleanup(func() { server.Close() })
+	server.SetReadDurabilityBarrier(func(context.Context, quepaxa.Slot) error {
+		return boundedArchiveDiagnosticError{stage: "publication-lock", lockState: "busy"}
+	})
+
+	var output bytes.Buffer
+	previous := log.Writer()
+	log.SetOutput(&output)
+	t.Cleanup(func() { log.SetOutput(previous) })
+	if _, err := server.Query(context.Background(), QueryRequest{SQL: "SELECT 1", Consistency: "local"}); err == nil {
+		t.Fatal("Query succeeded despite controlled durability failure")
+	}
+	message := output.String()
+	for _, want := range []string{
+		"phase=read-durability", "applied_slot=0", "archive_required_slot=2", "archive_tip=1",
+		"archive_wait_stage=publication-lock", "archive_lock_state=busy",
+	} {
+		if !strings.Contains(message, want) {
+			t.Fatalf("failure log %q does not contain %q", message, want)
+		}
+	}
+	for _, secret := range []string{"private archive backend detail", "PUBLISH_LOCK", "object/path"} {
+		if strings.Contains(message, secret) {
+			t.Fatalf("failure log leaked %q: %q", secret, message)
+		}
+	}
+	if strings.Contains(message, "read_index=0") {
+		t.Fatalf("durability log labeled the applied slot as a read index: %q", message)
+	}
+
+	output.Reset()
+	server.SetReadDurabilityBarrier(func(context.Context, quepaxa.Slot) error {
+		return boundedArchiveDiagnosticError{stage: "private/object/path", lockState: "owner-secret"}
+	})
+	if _, err := server.Query(context.Background(), QueryRequest{SQL: "SELECT 1", Consistency: "local"}); err == nil {
+		t.Fatal("Query succeeded despite controlled durability failure")
+	}
+	message = output.String()
+	for _, want := range []string{"archive_wait_stage=unknown", "archive_lock_state=unknown"} {
+		if !strings.Contains(message, want) {
+			t.Fatalf("failure log %q does not contain %q", message, want)
+		}
+	}
+	for _, secret := range []string{"private/object/path", "owner-secret"} {
+		if strings.Contains(message, secret) {
+			t.Fatalf("failure log leaked %q: %q", secret, message)
+		}
 	}
 }
 

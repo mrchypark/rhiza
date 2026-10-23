@@ -134,9 +134,84 @@ type source interface {
 }
 
 type syncBatch struct {
-	target quepaxa.Slot
-	done   chan struct{}
-	err    error
+	target   quepaxa.Slot
+	done     chan struct{}
+	err      error
+	progress archiveSyncProgress
+}
+
+// archiveSyncDiagnostic contains only fixed categories and numeric slots.
+type archiveSyncDiagnostic struct {
+	requiredSlot quepaxa.Slot
+	// archiveTip is the last locally validated remote HEAD tip observed by this
+	// manager; it is not a claim that the remote HEAD cannot have since changed.
+	archiveTip quepaxa.Slot
+	stage      string
+	lockState  string
+}
+
+type archiveSyncProgress struct {
+	mu        sync.Mutex
+	stage     string
+	lockState string
+}
+
+func (p *archiveSyncProgress) set(stage, lockState string) {
+	if p == nil {
+		return
+	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.stage = stage
+	if lockState != "" {
+		p.lockState = lockState
+	}
+}
+
+func (p *archiveSyncProgress) setLockState(lockState string) {
+	if p == nil {
+		return
+	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.lockState = lockState
+}
+
+func (p *archiveSyncProgress) snapshot(required, tip quepaxa.Slot) archiveSyncDiagnostic {
+	diagnostic := archiveSyncDiagnostic{requiredSlot: required, archiveTip: tip, stage: "unknown", lockState: "not-observed"}
+	if p == nil {
+		return diagnostic
+	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.stage != "" {
+		diagnostic.stage = p.stage
+	}
+	if p.lockState != "" {
+		diagnostic.lockState = p.lockState
+	}
+	return diagnostic
+}
+
+type archiveSyncError struct {
+	diagnostic archiveSyncDiagnostic
+	cause      error
+}
+
+func (e archiveSyncError) Error() string { return e.cause.Error() }
+func (e archiveSyncError) Unwrap() error { return e.cause }
+
+// ReadDurabilityDiagnostic exposes only bounded fields for callers that log
+// failed read barriers. It deliberately excludes the underlying error text.
+func (e archiveSyncError) ReadDurabilityDiagnostic() (required, archiveTip uint64, stage, lockState string) {
+	return uint64(e.diagnostic.requiredSlot), uint64(e.diagnostic.archiveTip), e.diagnostic.stage, e.diagnostic.lockState
+}
+
+func (m *Manager) archiveSyncError(progress *archiveSyncProgress, required quepaxa.Slot, err error) error {
+	if err == nil {
+		return nil
+	}
+	return archiveSyncError{diagnostic: progress.snapshot(required, m.Tip()), cause: err}
 }
 
 type extentObject struct {
@@ -824,12 +899,14 @@ func (m *Manager) SyncThrough(ctx context.Context, core source, through quepaxa.
 	if through == 0 {
 		return nil
 	}
+	progress := &archiveSyncProgress{}
 	// Refresh even when the local tip already covers the slot: a different
 	// recovery manager may have permanently sealed the source archive since
 	// this manager last loaded HEAD. A cached tip cannot authorize an ACK after
 	// that revocation.
+	progress.set("entry-head-refresh", "not-observed")
 	if err := m.Load(ctx); err != nil {
-		return err
+		return m.archiveSyncError(progress, through, err)
 	}
 	m.mu.Lock()
 	tip, sealed := m.tip, m.head.Sealed
@@ -843,33 +920,35 @@ func (m *Manager) SyncThrough(ctx context.Context, core source, through quepaxa.
 	m.batchMu.Lock()
 	if m.closed {
 		m.batchMu.Unlock()
-		return ErrArchiveClosed
+		return m.archiveSyncError(progress, through, ErrArchiveClosed)
 	}
 	if batch := m.batch; batch != nil {
 		if through > batch.target {
 			batch.target = through
 		}
+		progress = &batch.progress
 		m.batchMu.Unlock()
 		select {
 		case <-ctx.Done():
-			return ctx.Err()
+			return m.archiveSyncError(progress, through, ctx.Err())
 		case <-batch.done:
 			if batch.err != nil {
-				return batch.err
+				return m.archiveSyncError(progress, through, batch.err)
 			}
 			return m.SyncThrough(ctx, core, through)
 		}
 	}
-	batch := &syncBatch{target: through, done: make(chan struct{})}
+	batch := &syncBatch{target: through, done: make(chan struct{}), progress: archiveSyncProgress{stage: "batch-coalesce", lockState: "not-held"}}
+	progress = &batch.progress
 	m.batch = batch
 	m.batchWG.Add(1)
 	m.batchMu.Unlock()
 	go m.flushBatch(batch, core)
 	select {
 	case <-ctx.Done():
-		return ctx.Err()
+		return m.archiveSyncError(progress, through, ctx.Err())
 	case <-batch.done:
-		return batch.err
+		return m.archiveSyncError(progress, through, batch.err)
 	}
 }
 
@@ -887,6 +966,7 @@ func (m *Manager) flushBatch(batch *syncBatch, core source) {
 		if tip := core.Tip(); tip > target {
 			target = tip
 		}
+		batch.progress.set("archive-sync", "not-held")
 		ctx, cancel := context.WithTimeout(m.ctx, archiveSyncTimeout)
 		batch.err = m.syncNowBatch(ctx, core, target, batch)
 		cancel()
@@ -904,6 +984,12 @@ func (m *Manager) syncNow(ctx context.Context, core source, through quepaxa.Slot
 }
 
 func (m *Manager) syncNowBatch(ctx context.Context, core source, through quepaxa.Slot, batch *syncBatch) error {
+	var progress *archiveSyncProgress
+	if batch != nil {
+		progress = &batch.progress
+	} else {
+		progress = &archiveSyncProgress{}
+	}
 	if m.Tip() >= through {
 		return nil
 	}
@@ -915,6 +1001,7 @@ func (m *Manager) syncNowBatch(ctx context.Context, core source, through quepaxa
 	}
 	// Another manager may already have durably published this batch's effective
 	// target. Only a validated, non-sealed remote HEAD can skip admission.
+	progress.set("archive-head-refresh", "not-held")
 	if err := m.Load(ctx); err == nil {
 		m.mu.Lock()
 		tip, sealed := m.tip, m.head.Sealed
@@ -925,8 +1012,12 @@ func (m *Manager) syncNowBatch(ctx context.Context, core source, through quepaxa
 		if tip >= through {
 			return nil
 		}
+	} else if ctx.Err() != nil {
+		return ctx.Err()
 	}
-	return m.withPublicationLockRecheck(ctx, "archive-sync", func(ctx context.Context) (bool, error) {
+	progress.set("publication-lock", "not-held")
+	err := m.withPublicationLockRecheckProgress(ctx, "archive-sync", func(ctx context.Context) (bool, error) {
+		progress.set("lock-recheck-head-refresh", "busy")
 		if err := m.Load(ctx); err != nil {
 			if ctxErr := ctx.Err(); ctxErr != nil {
 				return false, ctxErr
@@ -941,6 +1032,7 @@ func (m *Manager) syncNowBatch(ctx context.Context, core source, through quepaxa
 		}
 		return tip >= through, nil
 	}, func(ctx context.Context) error {
+		progress.set("head-refresh-under-lock", "held")
 		m.transitionMu.Lock()
 		defer m.transitionMu.Unlock()
 		if err := m.Load(ctx); err != nil {
@@ -958,11 +1050,19 @@ func (m *Manager) syncNowBatch(ctx context.Context, core source, through quepaxa
 				through = tip
 			}
 		}
-		return m.syncNowLocked(ctx, core, through)
-	})
+		return m.syncNowLockedWithProgress(ctx, core, through, progress)
+	}, progress)
+	if batch == nil {
+		return err
+	}
+	return m.archiveSyncError(progress, through, err)
 }
 
 func (m *Manager) syncNowLocked(ctx context.Context, core source, through quepaxa.Slot) error {
+	return m.syncNowLockedWithProgress(ctx, core, through, nil)
+}
+
+func (m *Manager) syncNowLockedWithProgress(ctx context.Context, core source, through quepaxa.Slot, progress *archiveSyncProgress) error {
 	for attempt := 0; attempt < maxPublishRetries; attempt++ {
 		m.mu.Lock()
 		tip, head, refs, headCAS := m.tip, m.head, slices.Clone(m.extents), m.headCAS
@@ -983,6 +1083,7 @@ func (m *Manager) syncNowLocked(ctx context.Context, core source, through quepax
 		nextGeneration := head.Generation + 1
 		previous, previousObject := head.TailHash, head.TailObject
 		from := tip + 1
+		progress.set("extent-build-upload", "held")
 		for from <= through {
 			extent, data, sourceTip, err := m.buildExtent(core, from, through, previous, previousObject)
 			if err != nil {
@@ -1013,11 +1114,14 @@ func (m *Manager) syncNowLocked(ctx context.Context, core source, through quepax
 			from = extent.End + 1
 		}
 		head.Generation = nextGeneration
+		progress.set("head-publish", "held")
 		if err := m.publishHead(ctx, head, headCAS); err == nil {
+			progress.set("head-readback", "held")
 			return m.refreshPublishedHead(ctx, head, headCAS, append(refs, added...), cacheTail[:cacheTailCount]...)
 		} else if !m.cas {
 			return err
 		}
+		progress.set("publish-conflict-refresh", "held")
 		if err := m.Load(ctx); err != nil {
 			return err
 		}
@@ -1804,6 +1908,10 @@ func (m *Manager) withPublicationLock(ctx context.Context, owner string, work fu
 // withPublicationLockRecheck may acknowledge completed work only after a busy,
 // unentered admission attempt. Other publication paths keep their old behavior.
 func (m *Manager) withPublicationLockRecheck(ctx context.Context, owner string, recheck func(context.Context) (bool, error), work func(context.Context) error) error {
+	return m.withPublicationLockRecheckProgress(ctx, owner, recheck, work, nil)
+}
+
+func (m *Manager) withPublicationLockRecheckProgress(ctx context.Context, owner string, recheck func(context.Context) (bool, error), work func(context.Context) error, progress *archiveSyncProgress) error {
 	if err := ctx.Err(); err != nil {
 		return err
 	}
@@ -1811,9 +1919,17 @@ func (m *Manager) withPublicationLockRecheck(ctx context.Context, owner string, 
 		entered := false
 		err := m.withArchiveLock(ctx, m.publicationLockKey(), owner, false, func(workCtx context.Context) error {
 			entered = true
+			progress.set("publication-lock", "held")
 			return work(workCtx)
 		})
 		if entered || !errors.Is(err, ErrArchiveBusy) {
+			if entered {
+				if err == nil {
+					progress.set("publication-lock-release", "released")
+				} else {
+					progress.setLockState("unknown")
+				}
+			}
 			if errors.Is(err, ErrArchiveBusy) {
 				m.traceArchiveBusy(ctx, owner, m.publicationLockKey(), "returned", "terminal", entered)
 			}
@@ -1823,6 +1939,7 @@ func (m *Manager) withPublicationLockRecheck(ctx context.Context, owner string, 
 			m.traceArchiveBusy(ctx, owner, m.publicationLockKey(), "returned", "terminal", false)
 			return err
 		}
+		progress.set("publication-lock", "busy")
 		timer := time.NewTimer(50 * time.Millisecond)
 		select {
 		case <-ctx.Done():
