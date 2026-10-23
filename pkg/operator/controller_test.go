@@ -549,7 +549,7 @@ func TestControllerMembershipRetryUsesExactJournaledPayloads(t *testing.T) {
 	if err := c.reconcileAll(ctx); err != nil {
 		t.Fatal(err)
 	}
-	if r.Status.Phase != "Blocked" || len(api.changes) != 2 {
+	if r.Status.Phase != "Blocked" || len(api.changes) != 3 {
 		t.Fatalf("credential drift=%+v changes=%d", r.Status, len(api.changes))
 	}
 	api.membershipSecret["metadata"].(object)["resourceVersion"] = "1"
@@ -560,7 +560,7 @@ func TestControllerMembershipRetryUsesExactJournaledPayloads(t *testing.T) {
 	if err := c.reconcileAll(ctx); err != nil {
 		t.Fatal(err)
 	}
-	if len(api.changes) != 4 || !bytes.Equal(jsonBytes(api.changes[2]), jsonBytes(api.changes[3])) {
+	if len(api.changes) != 5 || !bytes.Equal(jsonBytes(api.changes[3]), jsonBytes(api.changes[4])) {
 		t.Fatalf("add retries differ: %+v", api.changes)
 	}
 	api.membership["n1"] = network.MembershipStatus{NodeID: "n1", ClusterID: "source", ConfigID: 3, Voters: []quepaxa.NodeID{"n1", "n2", "n4"}, Voting: true}
@@ -583,6 +583,7 @@ func TestControllerMembershipRetryUsesExactJournaledPayloads(t *testing.T) {
 		t.Fatal("credential drift bypassed completion validation")
 	}
 	api.membershipSecret["metadata"].(object)["resourceVersion"] = "1"
+	api.changeStatus = 0
 	if err := c.reconcileAll(ctx); err != nil {
 		t.Fatal(err)
 	}

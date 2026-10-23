@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"path"
 	"path/filepath"
 	"slices"
@@ -104,6 +105,27 @@ func TestMembershipOperationJournalAndFence(t *testing.T) {
 		t.Fatalf("retired add error=%v, want invalid request", err)
 	}
 	assertNoMembershipOperation(t, ctx, n, bucket, 2)
+}
+
+type failFirstArchiveHeadUploadBucket struct {
+	thanosobjstore.Bucket
+	failed atomic.Bool
+}
+
+func (b *failFirstArchiveHeadUploadBucket) Upload(ctx context.Context, name string, reader io.Reader, options ...thanosobjstore.ObjectUploadOption) error {
+	if strings.HasSuffix(name, "/archive/head.bin") && b.failed.CompareAndSwap(false, true) {
+		return errors.New("injected archive head persistence failure")
+	}
+	return b.Bucket.Upload(ctx, name, reader, options...)
+}
+
+func containsMember(members []quepaxa.Member, id quepaxa.NodeID) bool {
+	for _, member := range members {
+		if member.ID == id {
+			return true
+		}
+	}
+	return false
 }
 
 func TestMembershipOperationRejectsDifferentPendingTargetBeforeJournal(t *testing.T) {
