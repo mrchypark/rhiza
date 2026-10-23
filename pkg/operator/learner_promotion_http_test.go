@@ -1,23 +1,98 @@
 package operator
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
 	"encoding/pem"
 	"errors"
 	"fmt"
+	"io"
 	"net"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"testing"
 
 	"github.com/mrchypark/rhiza/pkg/fencing"
 	"github.com/mrchypark/rhiza/pkg/fencing/runtimeagent"
 	"github.com/mrchypark/rhiza/pkg/network"
 	"github.com/mrchypark/rhiza/pkg/quepaxa"
+	"github.com/thanos-io/objstore"
 )
+
+type learnerPromotionPinFaultBucket struct {
+	objstore.Bucket
+	mu           sync.Mutex
+	rootKey      string
+	runID        string
+	operationID  string
+	fired        bool
+	failNextRead bool
+}
+
+func (b *learnerPromotionPinFaultBucket) Upload(ctx context.Context, name string, reader io.Reader, options ...objstore.ObjectUploadOption) error {
+	params := objstore.ApplyObjectUploadOptions(options...)
+	b.mu.Lock()
+	fired := b.fired
+	b.mu.Unlock()
+	if name != b.rootKey || params.Condition == nil || fired {
+		return b.Bucket.Upload(ctx, name, reader, options...)
+	}
+	data, err := io.ReadAll(reader)
+	if err != nil {
+		return err
+	}
+	var envelope authorityStateEnvelope
+	if err := json.Unmarshal(data, &envelope); err != nil {
+		return err
+	}
+	var state fenceLedger
+	if err := json.Unmarshal(envelope.Value, &state); err != nil {
+		return err
+	}
+	run, ok := state.Ledger.Runs[b.runID]
+	loseResponse := ok && run.Promotion != nil && run.Promotion.OperationID == b.operationID && run.MutationProducerUID != ""
+	if !loseResponse {
+		return b.Bucket.Upload(ctx, name, bytes.NewReader(data), options...)
+	}
+
+	// Serialize only matching root writes so one successful semantic transition
+	// consumes the fault and its following readback outage exactly once.
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if b.fired {
+		return b.Bucket.Upload(ctx, name, bytes.NewReader(data), options...)
+	}
+	if err := b.Bucket.Upload(ctx, name, bytes.NewReader(data), options...); err != nil {
+		return err
+	}
+	b.fired = true
+	b.failNextRead = true
+	return errors.New("injected lost durable learner producer-pin response")
+}
+
+func (b *learnerPromotionPinFaultBucket) Get(ctx context.Context, name string) (io.ReadCloser, error) {
+	b.mu.Lock()
+	fail := name == b.rootKey && b.failNextRead
+	if fail {
+		b.failNextRead = false
+	}
+	b.mu.Unlock()
+	if fail {
+		return nil, errors.New("injected learner producer-pin readback outage")
+	}
+	return b.Bucket.Get(ctx, name)
+}
+
+func (b *learnerPromotionPinFaultBucket) faultState() (fired, failNextRead bool) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.fired, b.failNextRead
+}
 
 func TestAuthenticatedLearnerPromotionRetriesExactCanonicalCompletion(t *testing.T) {
 	ctx := t.Context()
@@ -356,14 +431,20 @@ func TestAuthenticatedLearnerPromotionRetriesExactCanonicalCompletion(t *testing
 	if err != nil || promotion.operationID != request.OperationID || promotion.digest == "" {
 		t.Fatalf("completed canonical learner promotion proof is unavailable before fault injection: proof=%+v err=%v", promotion, err)
 	}
-	faultBucket := &mutationCASReplyFaultBucket{Bucket: f.e.AuthorityState.bucket, loseCASAfter: 3, failReadAfterReply: true}
+	rootKey, _, err := f.e.AuthorityState.rootKey(f.runtime.StatefulSetUID, f.runtime.SourceClusterID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	faultBucket := &learnerPromotionPinFaultBucket{Bucket: f.e.AuthorityState.bucket, rootKey: rootKey,
+		runID: walID.RunID, operationID: request.OperationID}
 	f.e.AuthorityState.bucket = faultBucket
 	_, promotionErr := client.PromoteLearner(ctx, walID)
+	faultFired, readbackPending := faultBucket.faultState()
 	if promotionErr == nil {
-		t.Fatalf("post-promotion producer-pin response loss was not surfaced (remaining conditional writes=%d, readback pending=%t)", faultBucket.loseCASAfter, faultBucket.failNextRead)
+		t.Fatalf("post-promotion producer-pin response loss was not surfaced (semantic fault fired=%t, readback pending=%t)", faultFired, readbackPending)
 	}
-	if faultBucket.loseCASAfter != 0 || faultBucket.failNextRead {
-		t.Fatalf("promotion failed before the configured lost-response/readback fault was consumed: err=%v remaining conditional writes=%d readback pending=%t", promotionErr, faultBucket.loseCASAfter, faultBucket.failNextRead)
+	if !faultFired || readbackPending {
+		t.Fatalf("promotion failed before the exact durable producer-pin response-loss fault was consumed: err=%v semantic fault fired=%t readback pending=%t", promotionErr, faultFired, readbackPending)
 	}
 	rootAfterFault, _, err := f.e.AuthorityState.ReadRoot(ctx, f.runtime.StatefulSetUID, f.runtime.SourceClusterID)
 	if err != nil {
@@ -371,7 +452,7 @@ func TestAuthenticatedLearnerPromotionRetriesExactCanonicalCompletion(t *testing
 	}
 	run := rootAfterFault.Ledger.Runs[walID.RunID]
 	if run.Promotion == nil || run.Promotion.OperationID != request.OperationID || run.MutationProducerUID == "" || rootBefore.Ledger.Runs[walID.RunID].Promotion != nil {
-		t.Fatalf("fault did not preserve the exact durable promotion and partial producer pin: before=%+v after=%+v", rootBefore.Ledger.Runs[walID.RunID], run)
+		t.Fatalf("fault did not preserve the exact durable promotion and partial producer pin: err=%v before=%+v after=%+v", promotionErr, rootBefore.Ledger.Runs[walID.RunID], run)
 	}
 
 	receipt, err := client.PromoteLearner(ctx, walID)
