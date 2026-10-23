@@ -5,6 +5,7 @@ package cri
 import (
 	"context"
 	"crypto/sha256"
+	"crypto/sha512"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -64,10 +65,11 @@ type StopObservation struct {
 }
 
 type Provider struct {
-	client  runtimeapi.RuntimeServiceClient
-	conn    *grpc.ClientConn
-	profile Profile
-	host    func(context.Context) (HostIdentity, error)
+	client      runtimeapi.RuntimeServiceClient
+	imageClient runtimeapi.ImageServiceClient
+	conn        *grpc.ClientConn
+	profile     Profile
+	host        func(context.Context) (HostIdentity, error)
 }
 
 // RuntimeIdentity binds enrollment to the exact CRI runtime/API versions, not
@@ -96,7 +98,44 @@ func Open(socket string, profile Profile, host func(context.Context) (HostIdenti
 	if err != nil {
 		return nil, err
 	}
-	return &Provider{client: runtimeapi.NewRuntimeServiceClient(conn), conn: conn, profile: profile, host: host}, nil
+	return &Provider{client: runtimeapi.NewRuntimeServiceClient(conn), imageClient: runtimeapi.NewImageServiceClient(conn), conn: conn, profile: profile, host: host}, nil
+}
+
+func validOCIDigest(value string) bool {
+	algorithm, encoded, ok := strings.Cut(value, ":")
+	if !ok {
+		return false
+	}
+	wantLength := 0
+	switch algorithm {
+	case "sha256":
+		wantLength = sha256.Size * 2
+	case "sha384":
+		wantLength = sha512.Size384 * 2
+	case "sha512":
+		wantLength = sha512.Size * 2
+	default:
+		return false
+	}
+	if len(encoded) != wantLength {
+		return false
+	}
+	for _, char := range encoded {
+		if !('0' <= char && char <= '9') && !('a' <= char && char <= 'f') {
+			return false
+		}
+	}
+	return true
+}
+
+func validOCIRepoDigest(value string) bool {
+	repository, digest, ok := strings.Cut(value, "@")
+	if !ok || repository == "" || strings.Contains(digest, "@") || !validOCIDigest(digest) || strings.ContainsAny(repository, " \t\r\n") {
+		return false
+	}
+	lastSlash := strings.LastIndexByte(repository, '/')
+	lastComponent := repository[lastSlash+1:]
+	return lastComponent != "" && !strings.Contains(lastComponent, ":")
 }
 
 func (p *Provider) Close() error {
@@ -288,7 +327,8 @@ func (p *Provider) inspectState(ctx context.Context, binding fencing.RuntimeBind
 		return fmt.Errorf("%w: container status: %w", ErrUnverified, err)
 	}
 	if container == nil || container.Status == nil || container.Status.Id != containerID || container.Status.Metadata == nil ||
-		container.Status.Metadata.Name != p.profile.ContainerName || container.Status.ImageRef != binding.ImageID || container.Status.CreatedAt <= 0 || !knownContainerState(container.Status.State) {
+		container.Status.Metadata.Name != p.profile.ContainerName || container.Status.ImageRef != binding.ImageID ||
+		container.Status.CreatedAt <= 0 || !knownContainerState(container.Status.State) {
 		return fmt.Errorf("%w: container enrollment differs", ErrUnverified)
 	}
 	containers, err := p.client.ListContainers(ctx, &runtimeapi.ListContainersRequest{Filter: &runtimeapi.ContainerFilter{PodSandboxId: binding.SandboxID}})
@@ -307,7 +347,7 @@ func (p *Provider) inspectState(ctx context.Context, binding fencing.RuntimeBind
 		seen[entry.Id] = true
 		if entry.Id == containerID {
 			found = true
-			if entry.ImageRef != binding.ImageID {
+			if err := p.verifyInventoryImage(ctx, entry, container.Status, binding.ImageID); err != nil {
 				return fmt.Errorf("%w: target container inventory differs", ErrUnverified)
 			}
 		}
@@ -326,6 +366,30 @@ func (p *Provider) inspectState(ctx context.Context, binding fencing.RuntimeBind
 		return fmt.Errorf("%w: sandbox is not in the expected partial-stop state", ErrUnverified)
 	}
 	return nil
+}
+
+// verifyInventoryImage keeps the Pod-bound digest check on ContainerStatus
+// while handling CRI implementations that omit ImageId in both responses.
+func (p *Provider) verifyInventoryImage(ctx context.Context, listed *runtimeapi.Container, status *runtimeapi.ContainerStatus, boundImageRef string) error {
+	if listed.ImageId != "" && status.ImageId != "" {
+		if listed.ImageId != status.ImageId {
+			return ErrUnverified
+		}
+		return nil
+	}
+	if listed.ImageId != "" || status.ImageId != "" || !validOCIDigest(listed.ImageRef) || !validOCIRepoDigest(boundImageRef) || p.imageClient == nil {
+		return ErrUnverified
+	}
+	response, err := p.imageClient.ImageStatus(ctx, &runtimeapi.ImageStatusRequest{Image: &runtimeapi.ImageSpec{Image: listed.ImageRef}})
+	if err != nil || response == nil || response.Image == nil || response.Image.Id != listed.ImageRef {
+		return ErrUnverified
+	}
+	for _, repoDigest := range response.Image.RepoDigests {
+		if repoDigest == boundImageRef {
+			return nil
+		}
+	}
+	return ErrUnverified
 }
 
 func knownContainerState(state runtimeapi.ContainerState) bool {
