@@ -113,6 +113,20 @@ func (f *mutationStoreFixture) serve(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(400)
 		return
 	}
+	if r.Method == http.MethodPost {
+		// Kubernetes populates metadata.namespace from a namespaced collection
+		// endpoint when the submitted object omits it. Preserve that API behavior
+		// before assigning UID/resourceVersion and returning the created object.
+		parts := strings.Split(r.URL.Path, "/")
+		for i := 0; i+1 < len(parts); i++ {
+			if parts[i] == "namespaces" && parts[i+1] != "" {
+				if metadata := asObject(next["metadata"]); metadata != nil && str(metadata["namespace"]) == "" {
+					metadata["namespace"] = parts[i+1]
+				}
+				break
+			}
+		}
+	}
 	if r.Method == http.MethodPut && strings.HasSuffix(r.URL.Path, "/status") {
 		f.objects[r.URL.Path] = next
 		resourcePath := strings.TrimSuffix(r.URL.Path, "/status")
