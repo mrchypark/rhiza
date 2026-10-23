@@ -16,6 +16,7 @@ import (
 type fakeStopCgroupKernel struct {
 	dev, ino, fsType, links uint64
 	identityErr             error
+	identityOperation       string
 	pidErr                  error
 	populatedFlag           bool
 	populatedErr            error
@@ -23,11 +24,21 @@ type fakeStopCgroupKernel struct {
 }
 
 func (k *fakeStopCgroupKernel) identity(int) (uint64, uint64, uint64, uint64, error) {
-	return k.dev, k.ino, k.fsType, k.links, k.identityErr
+	if k.identityErr != nil {
+		operation := k.identityOperation
+		if operation == "" {
+			operation = "fstat"
+		}
+		return 0, 0, 0, 0, cgroupObservationFailure(operation, k.identityErr)
+	}
+	return k.dev, k.ino, k.fsType, k.links, nil
 }
 func (k *fakeStopCgroupKernel) pidExited(int) error { return k.pidErr }
 func (k *fakeStopCgroupKernel) populated(int) (bool, error) {
-	return k.populatedFlag, k.populatedErr
+	if k.populatedErr != nil {
+		return false, cgroupObservationFailure("events", k.populatedErr)
+	}
+	return k.populatedFlag, nil
 }
 func (k *fakeStopCgroupKernel) close(fd int) error {
 	k.closed = append(k.closed, fd)
@@ -58,23 +69,25 @@ func TestVerifyPIDFDRejectsInvalidDescriptorAsUnavailable(t *testing.T) {
 
 func TestPinnedStopCgroupVerifyEmptyUsesExactKernelState(t *testing.T) {
 	tests := []struct {
-		name        string
-		links       uint64
-		pidErr      error
-		populated   bool
-		popErr      error
-		identityErr error
-		dev         uint64
-		wantCode    string
-		wantErr     bool
+		name              string
+		links             uint64
+		pidErr            error
+		populated         bool
+		popErr            error
+		identityErr       error
+		identityOperation string
+		dev               uint64
+		wantCode          string
+		wantErr           bool
 	}{
 		{name: "live pid despite detached inode", links: 0, pidErr: stopCgroupFailure("target_process_live", ErrUnverified), wantCode: "target_process_live", wantErr: true},
 		{name: "unreadable pid state", links: 0, pidErr: ErrUnverified, wantCode: "target_process_state_unavailable", wantErr: true},
 		{name: "exited pid and detached exact inode", links: 0},
 		{name: "changed cgroup identity", links: 1, dev: 6, wantCode: "cgroup_identity_changed", wantErr: true},
-		{name: "unreadable cgroup identity", links: 1, identityErr: errors.New("private kernel error"), wantCode: "cgroup_observation_unavailable", wantErr: true},
+		{name: "unreadable cgroup stat identity", links: 1, identityErr: errors.New("private kernel error"), wantCode: "cgroup_fstat_other", wantErr: true},
+		{name: "unavailable cgroup statfs identity", links: 1, identityErr: unix.ENODEV, identityOperation: "fstatfs", wantCode: "cgroup_fstatfs_no_device", wantErr: true},
 		{name: "exited pid but linked populated cgroup", links: 1, populated: true, wantCode: "cgroup_populated", wantErr: true},
-		{name: "unreadable cgroup population", links: 1, popErr: errors.New("private kernel error"), wantCode: "cgroup_observation_unavailable", wantErr: true},
+		{name: "unreadable cgroup population", links: 1, popErr: errors.New("private kernel error"), wantCode: "cgroup_events_other", wantErr: true},
 		{name: "exited pid and linked empty cgroup", links: 1},
 	}
 	for _, test := range tests {
@@ -83,7 +96,7 @@ func TestPinnedStopCgroupVerifyEmptyUsesExactKernelState(t *testing.T) {
 			if dev == 0 {
 				dev = 4
 			}
-			kernel := &fakeStopCgroupKernel{dev: dev, ino: 5, fsType: uint64(unix.CGROUP2_SUPER_MAGIC), links: test.links, identityErr: test.identityErr,
+			kernel := &fakeStopCgroupKernel{dev: dev, ino: 5, fsType: uint64(unix.CGROUP2_SUPER_MAGIC), links: test.links, identityErr: test.identityErr, identityOperation: test.identityOperation,
 				pidErr: test.pidErr, populatedFlag: test.populated, populatedErr: test.popErr}
 			pin := &pinnedStopCgroup{cgroupFD: 10, pidFD: 11, dev: 4, ino: 5, kernel: kernel}
 			err := pin.verifyEmpty()
@@ -102,6 +115,33 @@ func TestPinnedStopCgroupVerifyEmptyUsesExactKernelState(t *testing.T) {
 				t.Fatalf("production pin did not close exact descriptors: %v", kernel.closed)
 			}
 		})
+	}
+}
+
+func TestLinuxStopCgroupIdentityClassifiesActualFstatFailure(t *testing.T) {
+	_, _, _, _, err := (linuxStopCgroupKernel{}).identity(-1)
+	code, ok := cgroupObservationCode(err)
+	if !ok || code != "cgroup_fstat_bad_fd" {
+		t.Fatalf("Fstat failure diagnostic=%q, ok=%t, err=%v", code, ok, err)
+	}
+	diagnostic := preSandboxScopeDiagnostic(stopCgroupFailure(code, err))
+	got, ok := StopDiagnosticFrom(diagnostic)
+	if !ok || got.Stage != "pre_sandbox_scope" || got.Code != "cgroup_fstat_bad_fd" {
+		t.Fatalf("Fstat diagnostic was not safely projected: %+v, ok=%t", got, ok)
+	}
+}
+
+func TestLinuxStopCgroupIdentityClassifiesFstatfsFailure(t *testing.T) {
+	kernel := linuxStopCgroupKernel{
+		fstat: func(int, *unix.Stat_t) error { return nil },
+		fstatfs: func(int, *unix.Statfs_t) error {
+			return unix.ENODEV
+		},
+	}
+	_, _, _, _, err := kernel.identity(10)
+	code, ok := cgroupObservationCode(err)
+	if !ok || code != "cgroup_fstatfs_no_device" {
+		t.Fatalf("Fstatfs failure diagnostic=%q, ok=%t, err=%v", code, ok, err)
 	}
 }
 

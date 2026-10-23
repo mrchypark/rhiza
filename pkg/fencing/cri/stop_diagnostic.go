@@ -57,7 +57,7 @@ func ValidStopDiagnostic(stage, code string) bool {
 		case "cgroup_scope_unverified", "cgroup_identity_changed", "cgroup_observation_unavailable", "target_process_live", "target_process_state_unavailable", "cgroup_populated":
 			return true
 		default:
-			return false
+			return validCgroupObservationCode(code)
 		}
 	case "pre_sandbox_identity":
 		return code == "runtime_identity_unverified"
@@ -78,6 +78,17 @@ func ValidStopDiagnostic(stage, code string) bool {
 	default:
 		return false
 	}
+}
+
+func validCgroupObservationCode(code string) bool {
+	for _, operation := range []string{"fstat", "fstatfs", "events"} {
+		for _, class := range []string{"bad_fd", "denied", "not_found", "no_device", "io", "other"} {
+			if code == "cgroup_"+operation+"_"+class {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 func stopDiagnosticFrom(err error) (*StopDiagnosticError, bool) {
