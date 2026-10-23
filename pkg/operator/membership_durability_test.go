@@ -1,6 +1,9 @@
 package operator
 
 import (
+	"bytes"
+	"encoding/json"
+	"io"
 	"net/http"
 	"strings"
 	"testing"
@@ -22,6 +25,27 @@ func TestControllerMembershipCompletionWaitsForDurabilityAck(t *testing.T) {
 	if r.Status.Membership.Add == nil || r.Status.Membership.Phase != "Adding" {
 		t.Fatalf("add was not journaled before dispatch: %+v", r.Status.Membership)
 	}
+	var observedConfig uint
+	var staleRemoveCalls int
+	c.HTTP = &http.Client{Transport: retirementTransport(func(req *http.Request) (*http.Response, error) {
+		if req.URL.Path != "/membership/change" {
+			return http.DefaultTransport.RoundTrip(req)
+		}
+		data, err := io.ReadAll(req.Body)
+		if err != nil {
+			return nil, err
+		}
+		var change network.MembershipChange
+		if err := json.Unmarshal(data, &change); err != nil {
+			return nil, err
+		}
+		req.Body = io.NopCloser(bytes.NewReader(data))
+		if observedConfig > change.ExpectedConfigID+1 && change.Remove != "" {
+			staleRemoveCalls++
+			return &http.Response{StatusCode: http.StatusConflict, Body: io.NopCloser(strings.NewReader("")), Header: make(http.Header)}, nil
+		}
+		return http.DefaultTransport.RoundTrip(req)
+	})}
 
 	committed := func(config uint) {
 		voters := []quepaxa.NodeID{"n1", "n2", "n4"}
@@ -30,6 +54,7 @@ func TestControllerMembershipCompletionWaitsForDurabilityAck(t *testing.T) {
 		api.membership["n4"] = network.MembershipStatus{NodeID: "n4", ClusterID: "source", ConfigID: config, Voters: voters, WALIdentity: strings.Repeat("a", 64), Voting: true}
 	}
 	committed(3)
+	observedConfig = 3
 	api.changeStatus = http.StatusInternalServerError
 	if err := c.reconcileAll(ctx); err != nil {
 		t.Fatal(err)
@@ -47,19 +72,29 @@ func TestControllerMembershipCompletionWaitsForDurabilityAck(t *testing.T) {
 	// A later, different configuration is not evidence that this journaled add
 	// received its durability acknowledgement.
 	committed(4)
+	observedConfig = 4
 	api.changeStatus = 0
 	if err := c.reconcileAll(ctx); err != nil {
 		t.Fatal(err)
 	}
-	if r.Status.Membership.Phase == "Complete" || len(api.changes) != 2 {
+	if r.Status.Membership.Phase == "Complete" || len(api.changes) != 2 || staleRemoveCalls != 0 {
 		t.Fatalf("different config bypassed completion guard: status=%+v changes=%d", r.Status, len(api.changes))
 	}
 
 	committed(3)
+	observedConfig = 3
+	api.membership["n4"] = network.MembershipStatus{NodeID: "n4", ClusterID: "source", ConfigID: 3, Voters: []quepaxa.NodeID{"n1", "n2", "n4"}, WALIdentity: strings.Repeat("b", 64), Voting: true}
 	if err := c.reconcileAll(ctx); err != nil {
 		t.Fatal(err)
 	}
-	if r.Status.Membership.Phase != "Complete" || len(api.changes) != 3 || !sameJSON(api.changes[1], api.changes[2]) {
+	if r.Status.Membership.Phase == "Complete" || staleRemoveCalls != 0 || len(api.changes) != 2 {
+		t.Fatalf("wrong learner identity bypassed completion guard: status=%+v changes=%d stale-removes=%d", r.Status, len(api.changes), staleRemoveCalls)
+	}
+	committed(3)
+	if err := c.reconcileAll(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if r.Status.Membership.Phase != "Complete" || len(api.changes) != 3 || !sameJSON(api.changes[1], api.changes[2]) || staleRemoveCalls != 0 {
 		t.Fatalf("exact committed request did not complete after persistence acknowledgement: status=%+v changes=%+v", r.Status, api.changes)
 	}
 }

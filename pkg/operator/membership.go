@@ -117,12 +117,14 @@ func (c *Controller) reconcileMembership(ctx context.Context, r *Resource) error
 		return blocked("persisted remove request differs from immutable membership specification")
 	}
 	if !containsID(expected.Voters, m.Remove) {
-		// The removed voter disappearing from the observed configuration only
-		// proves that the membership change committed. Replay the exact journaled
-		// request so the surviving node can finish persistMembership before the
-		// replacement add is journaled or dispatched.
-		if err := c.changeMembership(ctx, survivorPod(pods, statuses, "", expected), r.Spec.Container, admin, *journal.RemoveRequest); err != nil {
-			return c.recordMembership(ctx, r, "Removing", "committed removal durability confirmation remains pending: "+err.Error())
+		if journal.Add != nil && expected.ConfigID == journal.Add.ExpectedConfigID+1 && expected.AbortSlot == 0 && !expected.Pending && containsID(expected.Voters, journal.Add.MemberID) {
+			// The add may have committed after the removal was acknowledged. In
+			// that case the node correctly rejects replay of the older removal
+			// request; validate and durably replay the exact add instead.
+			return c.reconcileMembershipAdd(ctx, r, sts, pods, statuses, admin, expected)
+		}
+		if expected.ConfigID != journal.RemoveRequest.ExpectedConfigID+1 {
+			return blocked("live membership advanced beyond the journaled removal without matching the journaled addition")
 		}
 		return c.reconcileMembershipAdd(ctx, r, sts, pods, statuses, admin, expected)
 	}
@@ -181,6 +183,16 @@ func (c *Controller) reconcileMembershipAdd(ctx context.Context, r *Resource, st
 	if journal.Add == nil {
 		if current.Pending || learner.Voting || learner.Pending || containsID(current.Voters, member.ID) {
 			return c.recordMembership(ctx, r, "Blocked", "replacement learner or surviving quorum has a pending membership transition")
+		}
+		// Do not make a membership request until the replacement's complete
+		// workload and credential bindings have been validated. The remove may
+		// already be visible in status while its archive acknowledgement is still
+		// pending, so replay it now, immediately before first add journaling.
+		if journal.RemoveRequest == nil {
+			return c.recordMembership(ctx, r, "Blocked", "journaled remove request is unavailable before replacement dispatch")
+		}
+		if err := c.changeMembership(ctx, survivorPod(pods, statuses, "", current), r.Spec.Container, admin, *journal.RemoveRequest); err != nil {
+			return c.recordMembership(ctx, r, "Removing", "committed removal durability confirmation remains pending: "+err.Error())
 		}
 		journal.Add = &MembershipAddJournal{OperationID: request.OperationID, ExpectedConfigID: request.ExpectedConfigID, ExpectedAbortSlot: request.ExpectedAbortSlot, MemberID: member.ID, WALIdentity: member.WALIdentity, RequestHash: hashJSON(request), SecretUID: secretUID, SecretResourceVer: secretResourceVer}
 		journal.Phase = "Adding"
