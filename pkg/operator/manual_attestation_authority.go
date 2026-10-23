@@ -17,6 +17,7 @@ import (
 type manualRecoveryApprovalRecord struct {
 	Version         int                             `json:"version"`
 	ChallengeDigest string                          `json:"challengeDigest"`
+	AcceptedAt      time.Time                       `json:"acceptedAt,omitempty"`
 	Object          ManualRecoveryAttestationObject `json:"object"`
 }
 
@@ -46,7 +47,7 @@ func (e *FencingExecutor) manualRecoveryChallengeForPreflight(
 	currentUIDs []string,
 ) (ManualRecoveryChallenge, string, ManualRecoveryBinding, error) {
 	var zero ManualRecoveryChallenge
-	if e == nil || e.Kube == nil || stored.Status.Target == "" || stored.Status.TargetBaseKind != "fork" || stored.Status.FrozenBucketEnvironment == nil {
+	if e == nil || e.Kube == nil || stored.Status.TargetBaseKind != "fork" || stored.Status.FrozenBucketEnvironment == nil {
 		return zero, "", ManualRecoveryBinding{}, fencing.ErrPending
 	}
 	actualScopeHash, err := scope.Hash()
@@ -55,7 +56,7 @@ func (e *FencingExecutor) manualRecoveryChallengeForPreflight(
 	}
 	identity := recovery.FrozenSourceIdentity{ScopeHash: scopeHash, ClusterID: stored.Spec.SourceClusterID, StatefulSetUID: stored.Status.StatefulSetUID}
 	targetID, targetErr := recovery.FrozenTargetID(identity)
-	if targetErr != nil || targetID != stored.Status.Target {
+	if targetErr != nil || (stored.Status.Target != "" && targetID != stored.Status.Target) {
 		return zero, "", ManualRecoveryBinding{}, errors.Join(targetErr, fencing.ErrClosed)
 	}
 	if err := e.verifyFrozenBucketEnvironment(ctx, scope.Bucket, scope.Prefix, *stored.Status.FrozenBucketEnvironment); err != nil {
@@ -122,7 +123,7 @@ func (e *FencingExecutor) manualRecoveryChallengeForPreflight(
 		StatefulSetName: stored.Spec.StatefulSet, StatefulSetUID: stored.Status.StatefulSetUID,
 		FenceRequestHash: requestHash, PolicyDigest: hashJSON(stored.Spec), RootDigest: e.ledgerHash(state), LedgerDigest: hashJSON(state.Ledger),
 		CohortDigest: cohortDigest, StorageScopeDigest: scopeHash, SourceArchiveDigest: sourceArchiveDigest,
-		TargetClusterID: stored.Status.Target, TargetBaseKind: stored.Status.TargetBaseKind, CurrentPodUIDs: currentUIDs,
+		TargetClusterID: targetID, TargetBaseKind: stored.Status.TargetBaseKind, CurrentPodUIDs: currentUIDs,
 	}
 	if err := validateManualRecoveryBinding(current); err != nil {
 		return zero, "", ManualRecoveryBinding{}, err
@@ -232,7 +233,7 @@ func (e *FencingExecutor) validateAndPersistManualRecoveryAttestation(
 		return ManualRecoveryAttestationObject{}, errors.Join(fencing.ErrClosed, err)
 	}
 
-	record := manualRecoveryApprovalRecord{Version: manualAttestationVersion, ChallengeDigest: challengeDigest, Object: approval}
+	record := manualRecoveryApprovalRecord{Version: manualAttestationVersion, ChallengeDigest: challengeDigest, AcceptedAt: now.UTC(), Object: approval}
 	identity := manualRecoveryApprovalIdentity(challenge.RecoveryUID)
 	key := e.AuthorityState.key("manual-recovery-approvals", identity)
 	if err := e.AuthorityState.write(ctx, key, identity, record, nil); err != nil {
@@ -281,6 +282,27 @@ func (e *FencingExecutor) manualTerminalApprovalDigestForRecovery(
 	if err == nil || now.Before(challenge.ExpiresAt) {
 		return digest, err
 	}
+	// A valid approval is durably accepted before the controller begins the
+	// potentially long frozen-source copy. That exact acceptance may resume
+	// after challenge expiry, but only while every live binding still matches.
+	record, recordErr := e.readManualRecoveryApproval(ctx, recoveryUID)
+	acceptedAt := record.AcceptedAt
+	if recordErr == nil && acceptedAt.IsZero() {
+		// Legacy create-only approval records were written only after the old
+		// validator accepted the object inside the challenge window.
+		acceptedAt = record.Object.CreatedAt
+	}
+	if recordErr == nil && record.Version == manualAttestationVersion && record.ChallengeDigest == challengeDigest &&
+		!acceptedAt.Before(challenge.IssuedAt) && acceptedAt.Before(challenge.ExpiresAt) && !acceptedAt.After(now) &&
+		hashJSON(record.Object) == request.ManualTerminalAttestationDigest {
+		acceptedDigest, acceptedErr := e.manualRecoveryApprovalDigest(ctx, challenge, current, acceptedAt)
+		if acceptedErr == nil && acceptedDigest == request.ManualTerminalAttestationDigest {
+			return acceptedDigest, nil
+		}
+	}
+	if recordErr != nil && !errors.Is(recordErr, errAuthorityStateNotFound) {
+		return "", errors.Join(err, recordErr)
+	}
 	// Expiry may not strand a registration after its exact source claim has
 	// consumed the accepted approval. A fresh or changed claim still requires a
 	// currently valid challenge and approval.
@@ -288,7 +310,7 @@ func (e *FencingExecutor) manualTerminalApprovalDigestForRecovery(
 	if claimErr != nil || !exactClaim {
 		return "", errors.Join(err, claimErr)
 	}
-	record, recordErr := e.readManualRecoveryApproval(ctx, recoveryUID)
+	record, recordErr = e.readManualRecoveryApproval(ctx, recoveryUID)
 	if recordErr != nil {
 		return "", errors.Join(err, recordErr)
 	}

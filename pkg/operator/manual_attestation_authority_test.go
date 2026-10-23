@@ -53,6 +53,35 @@ func TestManualRecoveryApprovalRequiresCanonicalChallengeAndStableObject(t *test
 	}
 }
 
+func TestExpiredManualRecoveryApprovalCannotBeAcceptedForTheFirstTime(t *testing.T) {
+	e, fixture, _, _ := newMutationStoreFixture(t)
+	now := time.Now().UTC().Truncate(time.Second)
+	challenge, approval, current, _ := validManualAttestationFixture(t)
+	challenge.IssuedAt, challenge.ExpiresAt = now.Add(-2*time.Hour), now.Add(-time.Hour)
+	digest, err := ManualRecoveryChallengeDigest(challenge)
+	if err != nil {
+		t.Fatal(err)
+	}
+	approval.CreatedAt = challenge.IssuedAt.Add(time.Minute)
+	approval.Spec.ChallengeDigest = digest
+	if _, err := e.persistManualRecoveryChallenge(t.Context(), challenge); err != nil {
+		t.Fatal(err)
+	}
+	name, err := ManualRecoveryAttestationName(challenge.RecoveryUID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	fixture.mu.Lock()
+	fixture.objects[manualRecoveryAttestationPath(challenge.RecoveryNamespace, name)] = manualAttestationAPIObject(approval)
+	fixture.mu.Unlock()
+	if _, err := e.validateAndPersistManualRecoveryAttestation(t.Context(), challenge, current, now); !errors.Is(err, fencing.ErrClosed) {
+		t.Fatalf("first acceptance after challenge expiry = %v, want closed", err)
+	}
+	if _, err := e.readManualRecoveryApproval(t.Context(), challenge.RecoveryUID); !errors.Is(err, errAuthorityStateNotFound) {
+		t.Fatalf("expired approval was persisted as accepted: %v", err)
+	}
+}
+
 func TestManualRecoveryChallengeIsCreateOnly(t *testing.T) {
 	e, _, _, _ := newMutationStoreFixture(t)
 	challenge, _, _, _ := validManualAttestationFixture(t)
