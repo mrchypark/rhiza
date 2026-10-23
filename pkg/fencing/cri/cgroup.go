@@ -176,12 +176,46 @@ func processCgroupPath(procRoot string, pid uint32) (string, error) {
 			continue
 		}
 		relative := strings.TrimPrefix(line, "0::/")
-		if relative == "" || filepath.IsAbs(relative) || filepath.Clean(relative) != relative || relative == "." || relative == ".." || strings.HasPrefix(relative, ".."+string(filepath.Separator)) {
-			return "", fmt.Errorf("%w: unified cgroup path is unsafe", ErrUnverified)
+		if reason := cgroupPathRejection(relative); reason != "" {
+			return "", fmt.Errorf("%w: unified cgroup path is unsafe (%s)", ErrUnverified, reason)
 		}
 		return relative, nil
 	}
 	return "", fmt.Errorf("%w: unified cgroup path missing", ErrUnverified)
+}
+
+// cgroupPathRejection returns a non-sensitive category for a rejected unified
+// path. Keep these checks fail-closed: callers use the accepted value beneath
+// the configured host cgroup root.
+type cgroupPathRejectionReason string
+
+const (
+	cgroupPathRoot         cgroupPathRejectionReason = "root"
+	cgroupPathAbsolute     cgroupPathRejectionReason = "absolute"
+	cgroupPathDot          cgroupPathRejectionReason = "dot"
+	cgroupPathNoncanonical cgroupPathRejectionReason = "noncanonical"
+	cgroupPathTraversal    cgroupPathRejectionReason = "traversal"
+)
+
+func cgroupPathRejection(path string) cgroupPathRejectionReason {
+	if path == "" {
+		return cgroupPathRoot
+	}
+	if filepath.IsAbs(path) {
+		return cgroupPathAbsolute
+	}
+	for _, component := range strings.Split(path, string(filepath.Separator)) {
+		switch component {
+		case "..":
+			return cgroupPathTraversal
+		case ".":
+			return cgroupPathDot
+		}
+	}
+	if filepath.Clean(path) != path {
+		return cgroupPathNoncanonical
+	}
+	return ""
 }
 
 func fileIdentity(info os.FileInfo) (uint64, uint64, bool) {

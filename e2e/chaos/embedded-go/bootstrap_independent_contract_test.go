@@ -52,6 +52,10 @@ func TestIndependentBootstrapKeepsReaderAtDataChildAndPreservesCleanupReceipts(t
 	if err != nil {
 		t.Fatal(err)
 	}
+	launcher, err := os.ReadFile("../run-votercount-gcs-chaos.sh")
+	if err != nil {
+		t.Fatal(err)
+	}
 	text := string(source)
 	for _, want := range []string{
 		"${RHIZA_GCS_INDEPENDENT_LAYOUT:=no}",
@@ -65,8 +69,12 @@ func TestIndependentBootstrapKeepsReaderAtDataChildAndPreservesCleanupReceipts(t
 		"record data-wi-grant g iam service-accounts add-iam-policy-binding \"$readonly_email\" --member=\"$workload_member\"",
 		"record operator-wi-grant g iam service-accounts add-iam-policy-binding \"$data\" --member=\"$operator_member\"",
 		"record fencer-wi-grant g iam service-accounts add-iam-policy-binding \"$data\" --member=\"$fencer_member\"",
+		"record data-writer-folder-grant folder_iam_writer_data add",
+		"record control-writer-folder-grant folder_iam_writer_control add",
 		"record data-folder-grant folder_iam_data add",
 		"record control-folder-after folder_iam_control get",
+		"managedFolders:[$data_prefix,$control_prefix]",
+		"Writer IAM grant escaped the DATA/CONTROL child folders",
 		"check_readonly_inherited_access",
 		"wait_deleted_sa readonly",
 		"record data-folder-delete g storage managed-folders delete \"$data_folder\"",
@@ -77,11 +85,12 @@ func TestIndependentBootstrapKeepsReaderAtDataChildAndPreservesCleanupReceipts(t
 		}
 	}
 	dataIAM := strings.Index(text, "folder_iam_data() (")
+	writerDataStart := strings.Index(text, "folder_iam_writer_data() (")
 	controlIAM := strings.Index(text, "folder_iam_control() (")
-	if dataIAM < 0 || controlIAM < dataIAM {
+	if dataIAM < 0 || writerDataStart < dataIAM || controlIAM < writerDataStart {
 		t.Fatal("independent managed-folder IAM scopes missing")
 	}
-	dataScope := text[dataIAM:controlIAM]
+	dataScope := text[dataIAM:writerDataStart]
 	if !strings.Contains(dataScope, "folder=$data_folder") || !strings.Contains(dataScope, "prefix=$data_prefix") || !strings.Contains(dataScope, "data=$readonly_email") {
 		t.Fatal("viewer IAM helper does not bind the read-only GSA to the data child only")
 	}
@@ -95,6 +104,54 @@ func TestIndependentBootstrapKeepsReaderAtDataChildAndPreservesCleanupReceipts(t
 	}
 	if strings.Contains(controlScope, "folder_iam add") {
 		t.Fatal("control-folder IAM helper may grant application access")
+	}
+	writerDataStart = strings.Index(text, "folder_iam_writer_data() (")
+	writerControlStart := strings.Index(text, "folder_iam_writer_control() (")
+	if writerDataStart < 0 || writerControlStart < writerDataStart {
+		t.Fatal("writer child-folder IAM helpers missing")
+	}
+	writerDataScope := text[writerDataStart:writerControlStart]
+	if !strings.Contains(writerDataScope, "folder=$data_folder") || !strings.Contains(writerDataScope, "prefix=$data_prefix") || !strings.Contains(writerDataScope, "folder_role_resource=projects/$project/roles/$folder_role") {
+		t.Fatal("writer IAM helper does not bind its role to the data child folder")
+	}
+	writerControlEnd := strings.Index(text[writerControlStart:], "folder_iam_control() (")
+	if writerControlEnd < 0 {
+		t.Fatal("writer control-folder IAM helper is not bounded")
+	}
+	writerControlScope := text[writerControlStart : writerControlStart+writerControlEnd]
+	if !strings.Contains(writerControlScope, "folder=$control_folder") || !strings.Contains(writerControlScope, "prefix=$control_prefix") || !strings.Contains(writerControlScope, "folder_role_resource=projects/$project/roles/$folder_role") {
+		t.Fatal("writer IAM helper does not bind its role to the control child folder")
+	}
+	grantStart := strings.Index(text, "record data-writer-folder-grant folder_iam_writer_data add")
+	legacyElseOffset := -1
+	if grantStart >= 0 {
+		legacyElseOffset = strings.Index(text[grantStart:], "\n    else\n        record data-wi-grant")
+	}
+	if grantStart < 0 || legacyElseOffset < 0 {
+		t.Fatal("independent and legacy writer IAM branches are not explicit")
+	}
+	independentBranch := text[grantStart : grantStart+legacyElseOffset]
+	if strings.Contains(independentBranch, "record folder-grant folder_iam add") {
+		t.Fatal("independent writer IAM is still bound to the parent run folder")
+	}
+	legacyBranchStart := grantStart + legacyElseOffset
+	legacyBranchEnd := strings.Index(text[legacyBranchStart:], "\n    fi\n    record project-after")
+	if legacyBranchEnd < 0 || !strings.Contains(text[legacyBranchStart:legacyBranchStart+legacyBranchEnd], "record folder-grant folder_iam add") {
+		t.Fatal("non-independent compatibility path lost its legacy parent-folder grant")
+	}
+	launcherText := string(launcher)
+	for _, want := range []string{
+		".writer.gsa.role==$writer_role",
+		".writer.gsa.managedFolders|sort",
+		"([$prefix+\"data/\",$prefix+\"control/\"]|sort)",
+		"(.writer.gsa|has(\"managedFolder\")|not)",
+	} {
+		if !strings.Contains(launcherText, want) {
+			t.Errorf("launcher receipt consumer missing exact child-folder check %q", want)
+		}
+	}
+	if strings.Contains(launcherText, ".writer.gsa.managedFolder==$prefix") {
+		t.Fatal("launcher still accepts a misleading parent-folder writer receipt")
 	}
 }
 
@@ -342,11 +399,12 @@ func TestRollbackMarkerGateCoversEveryIndependentAndCIWrite(t *testing.T) {
 	for _, pair := range []string{
 		"data-create:data", "folder-role-create:folder-role", "folder-create:folder", "kubernetes-create:kubernetes",
 		"fixture-secret-create:fixture-secret",
-		"data-wi-grant:data-wi-grant", "operator-wi-grant:operator-wi-grant", "folder-grant:folder-grant",
+		"data-wi-grant:data-wi-grant", "operator-wi-grant:operator-wi-grant",
 		"ci-create:ci", "cluster-role-create:cluster-role", "pool-create:pool", "provider-create:provider",
 		"ci-project-grant:ci-project-grant", "ci-wi-grant:ci-wi-grant", "readonly-create:readonly",
 		"data-folder-create:data-folder", "control-folder-create:control-folder", "fencer-wi-grant:fencer-wi-grant",
-		"data-folder-grant:data-folder-grant",
+		"data-folder-grant:data-folder-grant", "data-writer-folder-grant:data-writer-folder-grant",
+		"control-writer-folder-grant:control-writer-folder-grant",
 	} {
 		if !strings.Contains(string(source), pair) {
 			t.Errorf("rollback marker gate omits side-effect mapping %q", pair)

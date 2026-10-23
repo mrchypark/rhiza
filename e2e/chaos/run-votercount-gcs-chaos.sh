@@ -110,13 +110,17 @@ verify_bootstrap_receipt() {
   command -v jq >/dev/null 2>&1 || { echo 'jq is required to validate bootstrap receipt' >&2; return 1; }
   jq -e --arg run "$RHIZA_RUN_ID" --arg ns "$RHIZA_NAMESPACE" \
     --arg prefix "$RHIZA_GCS_PREFIX" --arg writer "$gcs_service_account" \
-    --arg reader "$readonly_workload_gsa" '
+    --arg reader "$readonly_workload_gsa" \
+    --arg writer_role "projects/$RHIZA_GCP_PROJECT_ID/roles/rhiza19_${RHIZA_RUN_ID}_objects" '
       type=="object" and .run==$run and .namespace==$ns and .parentPrefix==$prefix and
       .controlPrefix==($prefix+"control") and
       .workload.ksa.name=="rhiza-workload" and
       .workload.gsa.email==$reader and .workload.gsa.role=="roles/storage.objectViewer" and
       .workload.gsa.managedFolder==($prefix+"data/") and
-      .writer.gsa.email==$writer and .writer.gsa.managedFolder==$prefix and
+      .writer.gsa.email==$writer and .writer.gsa.role==$writer_role and
+      (.writer.gsa.managedFolders|type)=="array" and
+      (.writer.gsa.managedFolders|sort)==([$prefix+"data/",$prefix+"control/"]|sort) and
+      (.writer.gsa|has("managedFolder")|not) and
       ([.writer.ksas[].name]|sort)==["rhiza-fencer","rhiza-operator"] and
       (.writer.workloadIdentityBinding.members|length)==2 and
       (.workload.workloadIdentityBinding.members|length)==1
