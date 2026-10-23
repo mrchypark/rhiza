@@ -6,6 +6,8 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"testing"
 
 	"github.com/mrchypark/rhiza/pkg/fencing"
@@ -67,7 +69,11 @@ func TestResolveStartupRoleRequiresCanonicalPendingLearnerAssignment(t *testing.
 		}
 	}))
 	defer api.Close()
-	e := &FencingExecutor{Kube: &Kubernetes{BaseURL: api.URL, Namespace: "default", Client: api.Client()}, ArchiveBucket: bucket, AutomaticControlPrefix: "rhiza"}
+	tokenFile := filepath.Join(t.TempDir(), "service-account-token")
+	if err := os.WriteFile(tokenFile, []byte("test-service-account-token\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	e := &FencingExecutor{Kube: &Kubernetes{BaseURL: api.URL, Namespace: "default", TokenFile: tokenFile, Client: api.Client()}, ArchiveBucket: bucket, AutomaticControlPrefix: "rhiza"}
 	id := fencing.Identity{SourceClusterID: "source", NodeID: learnerName, PodName: learnerName, PodUID: learnerUID, RunID: "run-1"}
 	role, err := e.resolveStartupRole(ctx, "sts-uid", id)
 	if err == nil || role != "" {

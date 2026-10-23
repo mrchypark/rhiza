@@ -103,7 +103,8 @@ func TestSourceMutationRuntimeReplansAcrossSupervisorRelayAfterConditionalReject
 	id := testIdentity()
 	id.PodName = id.NodeID
 	t.Setenv("RHIZA_POD_NAME", id.PodName)
-	supervisor := &Supervisor{Authority: authority, Identity: id, requested: id, bound: id, ticket: "private-ticket"}
+	supervisor := &Supervisor{Authority: authority, Identity: id, requested: id, bound: id,
+		grant: StartupGrant{Identity: id, Role: StartupRoleVoterActive}, ticket: "private-ticket"}
 	socket := filepath.Join(t.TempDir(), "source-relay.sock")
 	listener, err := net.Listen("unix", socket)
 	if err != nil {
