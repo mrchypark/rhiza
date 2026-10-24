@@ -722,6 +722,45 @@ func TestLearnerProvisioningReservesWorstCaseGenerationScope(t *testing.T) {
 	}
 }
 
+func TestAbortedLearnerRetirementPreservesCredentialIdentity(t *testing.T) {
+	f := newRetirementEscalationFixture(t)
+	state, version := f.load(t)
+	created, err := f.c.learnerInventoryEntry(t.Context(), state, f.api.sts, f.learnerPod)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if created.CredentialName == "" || created.CredentialUID == "" {
+		t.Fatalf("learner creation history omitted credential identity: %+v", created)
+	}
+	state.Learners = append(state.Learners, created)
+	state.Intent.Aborting = true
+	f.child.Spec.Membership.AbortAddition = true
+	f.child.Spec.Membership.ReplacementPod = learnerPhysicalPod(state.Intent)
+	f.child.Status.Membership.Phase = "Aborted"
+	state.Intent.SpecHash = hashJSON(f.child.Spec)
+	f.fencePending = false
+	if err := f.c.saveAuto(t.Context(), f.r, state, version); err != nil {
+		t.Fatal(err)
+	}
+	state, version = f.load(t)
+
+	handled, err := f.c.handleAutomaticLearner(t.Context(), f.r, state, version, f.api.sts, f.child)
+	if err != nil || !handled {
+		t.Fatalf("verified abort was not handled: handled=%t err=%v", handled, err)
+	}
+	retired, _ := f.load(t)
+	if retired.Intent.Aborting || retired.Intent.LearnerAttempt != 1 || retired.Intent.LearnerUID != "" {
+		t.Fatalf("verified abort did not advance to a fresh learner: intent=%+v status=%+v", retired.Intent, f.r.Status)
+	}
+	if len(retired.Learners) != 1 {
+		t.Fatalf("retirement changed learner history cardinality: %+v", retired.Learners)
+	}
+	got := retired.Learners[0]
+	if got.CredentialName != created.CredentialName || got.CredentialUID != created.CredentialUID || got.Target != created.Target || got.Retirement == nil {
+		t.Fatalf("retirement did not preserve exact credential and workload identity: got=%+v want=%+v", got, created)
+	}
+}
+
 func TestLearnerRetirementReceiptCompactsWithoutCooperativeLedger(t *testing.T) {
 	ctx := t.Context()
 	f := newCompactionFixture(t)
