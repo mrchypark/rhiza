@@ -1350,6 +1350,215 @@ const (
 	gcsMissingMembershipSummaryName           = "gcs-missing-membership-summary.json"
 )
 
+const (
+	gcsDeadPodQualification = "gcs-dead-pod"
+	gcsDeadPodEvidenceName  = "gcs-dead-pod-evidence.json"
+	gcsDeadPodEventsName    = "gcs-dead-pod-events.jsonl"
+	gcsDeadPodSummaryName   = "gcs-dead-pod-summary.json"
+)
+
+type gcsDeadPodPublicSummary struct {
+	Qualification                   string `json:"qualification"`
+	Outcome                         string `json:"outcome"`
+	Provider                        string `json:"provider"`
+	SourceDurability                string `json:"sourceDurability"`
+	CapturedVoterCount              int    `json:"capturedVoterCount"`
+	SameOrdinalReplacementVerified  bool   `json:"sameOrdinalReplacementVerified"`
+	ClosedIdentityExcluded          bool   `json:"closedIdentityExcluded"`
+	PostRecoveryAckReadbackVerified bool   `json:"postRecoveryAckReadbackVerified"`
+	ActiveChildRestartVerified      bool   `json:"activeChildRestartVerified"`
+	PostRestartAckReadbackVerified  bool   `json:"postRestartAckReadbackVerified"`
+	PrivateEvidenceSHA256           string `json:"privateEvidenceSHA256,omitempty"`
+	PrivateEventsSHA256             string `json:"privateEventsSHA256,omitempty"`
+}
+
+type gcsDeadPodPrivateEvidence struct {
+	Qualification   string                `json:"qualification"`
+	Status          string                `json:"status"`
+	Source          gcsRecoverySource     `json:"source"`
+	OldIncarnation  operator.FenceTarget  `json:"oldIncarnation"`
+	FenceRequest    operator.FenceRequest `json:"fenceRequest"`
+	FenceProof      operator.FenceProof   `json:"independentV2Proof"`
+	Recovery        operator.Resource     `json:"recovery"`
+	Replacement     operator.FenceTarget  `json:"replacement"`
+	BaselineAck     gcsAcknowledgement    `json:"baselineAck"`
+	PostRecoveryAck gcsAcknowledgement    `json:"postRecoveryAck"`
+	ActiveRestart   gcsDeadPodRestartView `json:"activeRestart"`
+	PostRestartAck  gcsAcknowledgement    `json:"postRestartAck"`
+	PostRestartRows json.RawMessage       `json:"postRestartRows"`
+}
+
+type gcsDeadPodRestartView struct {
+	PodUID            string                   `json:"podUID"`
+	NodeID            string                   `json:"nodeID"`
+	WALIdentity       string                   `json:"walIdentity"`
+	PreviousContainer string                   `json:"previousContainerID"`
+	CurrentContainer  string                   `json:"currentContainerID"`
+	PreviousRun       string                   `json:"previousRunID"`
+	CurrentRun        string                   `json:"currentRunID"`
+	Membership        network.MembershipStatus `json:"membership"`
+}
+
+func projectGCSDeadPodEvidence(raw, public, qualification string, failedRun bool) (bool, error) {
+	entries, err := os.ReadDir(raw)
+	if err != nil {
+		return false, err
+	}
+	known := map[string]bool{gcsDeadPodEvidenceName: false, gcsDeadPodEventsName: false}
+	for _, entry := range entries {
+		name := entry.Name()
+		if strings.HasPrefix(name, "gcs-dead-pod-") {
+			if _, ok := known[name]; !ok {
+				return false, fmt.Errorf("dead-Pod private artifact name is not allowlisted")
+			}
+			known[name] = true
+		}
+	}
+	if !known[gcsDeadPodEvidenceName] && !known[gcsDeadPodEventsName] {
+		return false, nil
+	}
+	if qualification != gcsDeadPodQualification {
+		return false, fmt.Errorf("dead-Pod evidence requires its explicit artifact qualification selector")
+	}
+	if !known[gcsDeadPodEventsName] {
+		return false, fmt.Errorf("dead-Pod evidence exists without its private event record")
+	}
+	events, err := readBoundedPrivateArtifact(filepath.Join(raw, gcsDeadPodEventsName), false)
+	if err != nil {
+		return false, err
+	}
+	eventNames := map[string]bool{}
+	scan := bufio.NewScanner(bytes.NewReader(events))
+	scan.Buffer(make([]byte, 4096), 1<<20)
+	for scan.Scan() {
+		var event struct {
+			Event string `json:"event"`
+		}
+		if err := json.Unmarshal(scan.Bytes(), &event); err != nil || event.Event == "" {
+			return false, fmt.Errorf("private dead-Pod event record is invalid")
+		}
+		eventNames[event.Event] = true
+	}
+	if err := scan.Err(); err != nil {
+		return false, fmt.Errorf("private dead-Pod event record exceeds its scan limit")
+	}
+	eventsHash := sha256.Sum256(events)
+	summary := gcsDeadPodPublicSummary{
+		Qualification:       "gcs-single-voter-dead-pod",
+		Outcome:             "failed",
+		Provider:            "gcs",
+		SourceDurability:    "before-ack",
+		PrivateEventsSHA256: hex.EncodeToString(eventsHash[:]),
+	}
+	if !known[gcsDeadPodEvidenceName] {
+		if !failedRun {
+			return false, fmt.Errorf("successful dead-Pod run is missing its private evidence")
+		}
+		return true, writeGCSDeadPodSummary(public, summary)
+	}
+	evidenceBytes, err := readBoundedPrivateArtifact(filepath.Join(raw, gcsDeadPodEvidenceName), false)
+	if err != nil {
+		return false, err
+	}
+	var evidence gcsDeadPodPrivateEvidence
+	decoder := json.NewDecoder(bytes.NewReader(evidenceBytes))
+	if err := decoder.Decode(&evidence); err != nil || decoder.Decode(new(any)) != io.EOF {
+		return false, fmt.Errorf("private dead-Pod evidence is invalid")
+	}
+	if err := validateGCSDeadPodPrivateEvidence(evidence, eventNames); err != nil {
+		return false, err
+	}
+	evidenceHash := sha256.Sum256(evidenceBytes)
+	summary.CapturedVoterCount = len(evidence.Source.Targets)
+	summary.SameOrdinalReplacementVerified = true
+	summary.ClosedIdentityExcluded = true
+	summary.PostRecoveryAckReadbackVerified = true
+	summary.ActiveChildRestartVerified = true
+	summary.PostRestartAckReadbackVerified = true
+	summary.PrivateEvidenceSHA256 = hex.EncodeToString(evidenceHash[:])
+	if !failedRun {
+		summary.Outcome = "passed"
+	}
+	return true, writeGCSDeadPodSummary(public, summary)
+}
+
+func validateGCSDeadPodPrivateEvidence(e gcsDeadPodPrivateEvidence, eventNames map[string]bool) error {
+	old, replacement := e.OldIncarnation, e.Replacement
+	if e.Qualification != "gcs-noPVC-single-voter-dead-pod" || e.Status != "qualified" ||
+		e.Source.Bucket == "" || e.Source.Prefix == "" || e.Source.StatefulSetUID == "" || e.Source.ClusterID == "" ||
+		e.Source.Durability != "before-ack" || len(e.Source.Targets) != 3 ||
+		old.Pod == "" || old.PodUID == "" || old.NodeID == "" || old.WALIdentity == "" ||
+		replacement.Pod != old.Pod || replacement.PodUID == "" || replacement.PodUID == old.PodUID ||
+		replacement.NodeID == "" || replacement.NodeID == old.NodeID || replacement.WALIdentity == "" || replacement.WALIdentity == old.WALIdentity {
+		return fmt.Errorf("private dead-Pod replacement evidence is incomplete")
+	}
+	if !gcsDeadPodAckMatches(e.BaselineAck, 1, "gcs-dead-pod-baseline") ||
+		!gcsDeadPodAckMatches(e.PostRecoveryAck, 2, "gcs-dead-pod-post-recovery") ||
+		!gcsDeadPodAckMatches(e.PostRestartAck, 3, "gcs-dead-pod-post-restart") ||
+		string(e.PostRestartRows) != `[[1,"gcs-dead-pod-baseline"],[2,"gcs-dead-pod-post-recovery"],[3,"gcs-dead-pod-post-restart"]]` {
+		return fmt.Errorf("private dead-Pod ACK/readback evidence differs from the expected rows")
+	}
+	if !gcsVoterFenceRequestMatches(e.FenceRequest, e.Source, old) ||
+		recoveryFenceMatchesProof(e.Recovery, e.FenceRequest, e.FenceProof) != nil ||
+		e.Recovery.Status.Source != e.Source.ClusterID || e.Recovery.Status.Target != e.Source.ClusterID ||
+		e.Recovery.Status.StatefulSetUID != e.Source.StatefulSetUID || e.Recovery.Status.Phase != "Complete" || e.Recovery.Status.Stage != "Complete" ||
+		e.Recovery.Spec.Membership == nil || e.Recovery.Spec.Membership.ReplacementPod != old.Pod ||
+		e.Recovery.Status.Membership == nil || e.Recovery.Status.Membership.Phase != "Complete" ||
+		e.Recovery.Status.Membership.Add == nil || e.Recovery.Status.Membership.Add.MemberID != quepaxa.NodeID(replacement.NodeID) ||
+		e.Recovery.Status.Membership.Add.WALIdentity != replacement.WALIdentity ||
+		e.ActiveRestart.PodUID != replacement.PodUID || e.ActiveRestart.NodeID != replacement.NodeID ||
+		e.ActiveRestart.WALIdentity != replacement.WALIdentity || e.ActiveRestart.PreviousContainer == "" ||
+		e.ActiveRestart.CurrentContainer == "" || e.ActiveRestart.CurrentContainer == e.ActiveRestart.PreviousContainer ||
+		e.ActiveRestart.PreviousRun == "" || e.ActiveRestart.CurrentRun == "" || e.ActiveRestart.CurrentRun == e.ActiveRestart.PreviousRun {
+		return fmt.Errorf("private dead-Pod fence or active-restart evidence is incomplete")
+	}
+	membership := e.ActiveRestart.Membership
+	if membership.ClusterID != e.Source.ClusterID || string(membership.NodeID) != replacement.NodeID ||
+		membership.WALIdentity != replacement.WALIdentity || membership.Pending || !membership.Voting || len(membership.Voters) != 3 {
+		return fmt.Errorf("private dead-Pod restarted membership differs from the committed replacement")
+	}
+	oldIncluded := false
+	newIncluded := false
+	for _, voter := range membership.Voters {
+		oldIncluded = oldIncluded || string(voter) == old.NodeID
+		newIncluded = newIncluded || string(voter) == replacement.NodeID
+	}
+	if oldIncluded || !newIncluded || !eventNames["old_logical_identity_closed"] ||
+		!eventNames["post_recovery_ack_durable"] || !eventNames["same_ordinal_active_restart_verified"] {
+		return fmt.Errorf("private dead-Pod event or old-identity exclusion evidence is incomplete")
+	}
+	oldCaptured := false
+	for _, sourceTarget := range e.Source.Targets {
+		if sourceTarget.PodUID == old.PodUID {
+			if sourceTarget.Pod != old.Pod || sourceTarget.NodeID != old.NodeID || sourceTarget.WALIdentity != old.WALIdentity {
+				return fmt.Errorf("private dead-Pod old incarnation differs from captured source")
+			}
+			oldCaptured = true
+			continue
+		}
+		found := false
+		for _, voter := range membership.Voters {
+			found = found || string(voter) == sourceTarget.NodeID
+		}
+		if !found {
+			return fmt.Errorf("private dead-Pod membership omits a surviving captured voter")
+		}
+	}
+	if !oldCaptured {
+		return fmt.Errorf("private dead-Pod source omits the captured old incarnation")
+	}
+	return nil
+}
+
+func gcsDeadPodAckMatches(ack gcsAcknowledgement, id int, value string) bool {
+	return ack.RequestID == fmt.Sprintf("gcs-ha-ack-%d", id) && ack.Slot != 0 &&
+		ack.Rows == fmt.Sprintf("[[%d,%q]]", id, value)
+}
+
+func writeGCSDeadPodSummary(public string, summary gcsDeadPodPublicSummary) error {
+	return os.WriteFile(filepath.Join(public, gcsDeadPodSummaryName), encoded(summary), 0600)
+}
+
 type gcsMissingMembershipPublicSummary struct {
 	Qualification                string `json:"qualification"`
 	Outcome                      string `json:"outcome"`
@@ -2564,7 +2773,8 @@ func safeArtifacts(raw string) error {
 	}
 	qualification := os.Getenv("FENCING_E2E_QUALIFICATION")
 	if qualification != "" && qualification != "gcs-async-nonempty" && qualification != gcsManualTerminalQualification &&
-		qualification != gcsMissingMembershipNegativeQualification && qualification != gcsMissingMembershipPositiveQualification {
+		qualification != gcsMissingMembershipNegativeQualification && qualification != gcsMissingMembershipPositiveQualification &&
+		qualification != gcsDeadPodQualification {
 		return fmt.Errorf("artifact qualification selector is unsupported")
 	}
 	exitData, err := os.ReadFile(filepath.Join(raw, "actual-exit.txt"))
@@ -2590,7 +2800,7 @@ func safeArtifacts(raw string) error {
 		if entry.IsDir() {
 			continue
 		}
-		if (qualification == "gcs-async-nonempty" || qualification == gcsManualTerminalQualification ||
+		if (qualification == "gcs-async-nonempty" || qualification == gcsManualTerminalQualification || qualification == gcsDeadPodQualification ||
 			qualification == gcsMissingMembershipNegativeQualification || qualification == gcsMissingMembershipPositiveQualification) &&
 			(name == "runtime-profile.json" || name == "runtime-component-probe.json") {
 			// These receipts describe the disposable Kind component probe, not
@@ -2658,8 +2868,8 @@ func safeArtifacts(raw string) error {
 			if len(lines) == 0 || name != "image-ids.txt" && len(lines) != 1 {
 				return fmt.Errorf("missing or ambiguous public identity receipt")
 			}
-			if name == "image-ids.txt" && qualification == "gcs-async-nonempty" && len(lines) != 2 {
-				return fmt.Errorf("async-nonempty qualification requires both immutable workload image references")
+			if name == "image-ids.txt" && (qualification == "gcs-async-nonempty" || qualification == gcsDeadPodQualification) && len(lines) != 2 {
+				return fmt.Errorf("selected GCS qualification requires both immutable workload image references")
 			}
 			for i, line := range lines {
 				if name == "actual-exit.txt" {
@@ -2723,6 +2933,16 @@ func safeArtifacts(raw string) error {
 	if (qualification == gcsMissingMembershipNegativeQualification || qualification == gcsMissingMembershipPositiveQualification) && !failedRun && !missingMembershipSeen {
 		return fmt.Errorf("successful missing-membership artifact set is missing its required case evidence")
 	}
+	deadPodSeen, err := projectGCSDeadPodEvidence(raw, public, qualification, failedRun)
+	if err != nil {
+		return err
+	}
+	if deadPodSeen && qualification != gcsDeadPodQualification {
+		return fmt.Errorf("dead-Pod evidence requires its explicit artifact qualification selector")
+	}
+	if qualification == gcsDeadPodQualification && !failedRun && !deadPodSeen {
+		return fmt.Errorf("successful dead-Pod artifact set is missing its required scenario evidence")
+	}
 	if privateData, readErr := os.ReadFile(filepath.Join(raw, "voter-startup-private.json")); readErr == nil {
 		projected, projectErr := projectVoterStartupDiagnostics(raw, privateData)
 		if projectErr != nil {
@@ -2740,7 +2960,7 @@ func safeArtifacts(raw string) error {
 	}
 	required := []string{"actual-exit.txt", "source-head.txt", "image-ids.txt"}
 	if !failedRun {
-		if qualification != "gcs-async-nonempty" && qualification != gcsManualTerminalQualification &&
+		if qualification != "gcs-async-nonempty" && qualification != gcsManualTerminalQualification && qualification != gcsDeadPodQualification &&
 			qualification != gcsMissingMembershipNegativeQualification && qualification != gcsMissingMembershipPositiveQualification {
 			required = append(required, "runtime-profile.json", "runtime-component-probe.json")
 		}
@@ -2755,6 +2975,9 @@ func safeArtifacts(raw string) error {
 		}
 		if missingMembershipSeen {
 			required = append(required, gcsMissingMembershipSummaryName)
+		}
+		if deadPodSeen {
+			required = append(required, gcsDeadPodSummaryName)
 		}
 		if ackLossSeen {
 			required = append(required, gcsAckLossSummaryName)

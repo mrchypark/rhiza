@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/json"
@@ -670,6 +671,187 @@ func TestManualTerminalLauncherIsExplicitAndUsesNativeApprovalCollector(t *testi
 	if manualStart < 0 || nativeDispatch < manualStart || nativeInvocation < nativeDispatch ||
 		branchExit < nativeInvocation || missingMembershipStart < branchExit || legacyPython < missingMembershipStart {
 		t.Fatal("manual-terminal qualification must use the dedicated native collector and return before the legacy Python path")
+	}
+}
+
+func TestDeadPodLauncherIsExplicitAndUsesNativeCollector(t *testing.T) {
+	launcher, err := os.ReadFile("../chaos/run-votercount-gcs-chaos.sh")
+	if err != nil {
+		t.Fatal(err)
+	}
+	source := string(launcher)
+	for _, required := range []string{
+		"dead_pod=${RHIZA_GCS_DEAD_POD:-no}",
+		"if [ \"$async_nonempty\" = yes ] || [ \"$missing_membership\" = yes ] || [ \"$dead_pod\" = yes ]; then",
+		"RHIZA_GCS_DEAD_POD must be yes or no",
+		"\"$missing_membership\" \"$dead_pod\"",
+		"run-gcs-ha-dead-pod",
+		"FENCING_E2E_QUALIFICATION=gcs-dead-pod",
+		"strict dead-Pod artifact projection failed",
+		"actual-exit.txt",
+		"source-head.txt",
+		"image-ids.txt",
+	} {
+		if !strings.Contains(source, required) {
+			t.Fatalf("dead-Pod launcher contract is missing %q", required)
+		}
+	}
+	deadPodStart := strings.Index(source, "if [ \"$dead_pod\" = yes ]; then\n  : \"${FENCING_E2E_BIN:?dead-Pod qualification requires the source-matched fencing-e2e driver}\"")
+	nativeDispatch := strings.Index(source, "step 30-dead-pod-collector env")
+	nativeInvocation := strings.Index(source, `"$FENCING_E2E_BIN" run-gcs-ha-dead-pod`)
+	branchExit := strings.Index(source, "echo 'GCS same-ordinal dead-Pod recovery collector completed'\n  exit 0\nfi")
+	legacyPython := strings.Index(source, "step 30-driver python3 -u")
+	if deadPodStart < 0 || nativeDispatch < deadPodStart || nativeInvocation < nativeDispatch ||
+		branchExit < nativeInvocation || legacyPython < branchExit {
+		t.Fatal("dead-Pod qualification must dispatch through the native collector before the legacy Python path")
+	}
+	finalizeStart := strings.Index(source, `if [ "$mode" = run ] && [ "$dead_pod" = yes ]; then`)
+	if finalizeStart < 0 {
+		t.Fatal("dead-Pod collector has no dedicated EXIT finalizer")
+	}
+	finalizeEnd := strings.Index(source[finalizeStart:], `rm -f "$out/.admin-token.tmp"`)
+	if finalizeEnd < 0 {
+		t.Fatal("dead-Pod collector has no bounded EXIT finalizer")
+	}
+	finalizer := source[finalizeStart : finalizeStart+finalizeEnd]
+	for _, receipt := range []string{
+		`> "$out/actual-exit.txt"`,
+		`> "$out/source-head.txt"`,
+		`> "$out/image-ids.txt"`,
+		`FENCING_E2E_QUALIFICATION=gcs-dead-pod`,
+		`"$FENCING_E2E_BIN" safe-artifacts`,
+	} {
+		if !strings.Contains(finalizer, receipt) {
+			t.Fatalf("dead-Pod finalizer is missing %q", receipt)
+		}
+	}
+}
+
+func TestGCSDeadPodSafeArtifactsProjectOnlyRedactedEvidence(t *testing.T) {
+	t.Setenv("FENCING_E2E_QUALIFICATION", gcsDeadPodQualification)
+	const canary = "private-gcs-dead-pod-identity-canary"
+	raw := t.TempDir()
+	write := func(name string, data []byte) {
+		t.Helper()
+		if err := os.WriteFile(filepath.Join(raw, name), data, 0600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	write("actual-exit.txt", []byte("0\n"))
+	write("source-head.txt", []byte(strings.Repeat("a", 40)+"\n"))
+	write("image-ids.txt", []byte("ghcr.io/example/app@sha256:"+strings.Repeat("b", 64)+"\nghcr.io/example/operator@sha256:"+strings.Repeat("c", 64)+"\n"))
+	evidence := gcsDeadPodPrivateEvidence{
+		Qualification: "gcs-noPVC-single-voter-dead-pod", Status: "qualified",
+		Source: gcsRecoverySource{Bucket: canary, Prefix: "private-prefix", ClusterID: canary, StatefulSet: "rhiza", StatefulSetUID: canary,
+			Namespace: canary, BindingUID: canary, LogicalID: canary,
+			Durability: "before-ack", Targets: []operator.FenceTarget{
+				{Pod: "rhiza-0", PodUID: "old-pod", NodeID: "old-node", WALIdentity: "old-wal"},
+				{Pod: "rhiza-1", PodUID: "survivor-1", NodeID: "node-1", WALIdentity: "wal-1"},
+				{Pod: "rhiza-2", PodUID: "survivor-2", NodeID: "node-2", WALIdentity: "wal-2"},
+			}},
+		OldIncarnation: operator.FenceTarget{Pod: "rhiza-0", PodUID: "old-pod", NodeID: "old-node", WALIdentity: "old-wal"},
+		FenceRequest: operator.FenceRequest{OperationID: "operation", SourceClusterID: canary, StatefulSet: "rhiza", Namespace: canary,
+			LogicalID: canary, BindingUID: canary, Scope: operator.ScopeVoter, StatefulSetUID: canary,
+			Targets: []operator.FenceTarget{{Pod: "rhiza-0", PodUID: "old-pod", NodeID: "old-node", WALIdentity: "old-wal"}}},
+		FenceProof: operator.FenceProof{ProofID: "proof", OperationID: "operation", SourceClusterID: canary, BindingUID: canary,
+			IndependentV2: &operator.IndependentEvidenceV2{Version: 2, RequestHash: strings.Repeat("d", 64), LedgerHash: strings.Repeat("e", 64),
+				StorageScope:   operator.AttestationStoreScope{Provider: "gcs", Bucket: canary, Prefix: "private-prefix"},
+				CurrentPodUIDs: []string{"survivor-1", "survivor-2", "new-pod"}}},
+		Recovery: operator.Resource{Spec: operator.Spec{SourceClusterID: canary, RecoveryID: "operation",
+			Fence:      operator.Fence{Confirmed: true, RecoveryID: "operation", ClusterID: canary, StatefulSetUID: canary, Evidence: "proof"},
+			Membership: &operator.MembershipSpec{ReplacementPod: "rhiza-0"}},
+			Status: operator.Status{Phase: "Complete", Stage: "Complete", Source: canary, Target: canary,
+				StatefulSetUID: canary, Membership: &operator.MembershipStatus{Phase: "Complete",
+					Add: &operator.MembershipAddJournal{MemberID: "new-node", WALIdentity: "new-wal"}}}},
+		Replacement:     operator.FenceTarget{Pod: "rhiza-0", PodUID: "new-pod", NodeID: "new-node", WALIdentity: "new-wal"},
+		BaselineAck:     gcsAcknowledgement{RequestID: "gcs-ha-ack-1", Slot: 1, Rows: `[[1,"gcs-dead-pod-baseline"]]`},
+		PostRecoveryAck: gcsAcknowledgement{RequestID: "gcs-ha-ack-2", Slot: 2, Rows: `[[2,"gcs-dead-pod-post-recovery"]]`},
+		ActiveRestart: gcsDeadPodRestartView{PodUID: "new-pod", NodeID: "new-node", WALIdentity: "new-wal",
+			PreviousContainer: "old-container", CurrentContainer: "new-container", PreviousRun: "old-run", CurrentRun: "new-run",
+			Membership: network.MembershipStatus{ClusterID: canary, NodeID: "new-node", WALIdentity: "new-wal", Voting: true,
+				Voters: []quepaxa.NodeID{"new-node", "node-1", "node-2"}}},
+		PostRestartAck:  gcsAcknowledgement{RequestID: "gcs-ha-ack-3", Slot: 3, Rows: `[[3,"gcs-dead-pod-post-restart"]]`},
+		PostRestartRows: json.RawMessage(`[[1,"gcs-dead-pod-baseline"],[2,"gcs-dead-pod-post-recovery"],[3,"gcs-dead-pod-post-restart"]]`),
+	}
+	eventNames := map[string]bool{"old_logical_identity_closed": true, "post_recovery_ack_durable": true, "same_ordinal_active_restart_verified": true}
+	if err := validateGCSDeadPodPrivateEvidence(evidence, eventNames); err != nil {
+		t.Fatalf("actual collector-shaped evidence was rejected: %v", err)
+	}
+	wrongFence := evidence
+	wrongFence.FenceRequest.SourceClusterID = "other-source"
+	if validateGCSDeadPodPrivateEvidence(wrongFence, eventNames) == nil {
+		t.Fatal("accepted a fence request bound to a different source")
+	}
+	otherVoterRequest := evidence
+	otherVoterRequest.FenceRequest.Targets = []operator.FenceTarget{{Pod: "rhiza-1", PodUID: "survivor-1", NodeID: "node-1", WALIdentity: "wal-1"}}
+	if validateGCSDeadPodPrivateEvidence(otherVoterRequest, eventNames) == nil {
+		t.Fatal("accepted a voter fence request for an incarnation other than the dead Pod")
+	}
+	missingOldTarget := evidence
+	missingOldTarget.Source.Targets = []operator.FenceTarget{
+		{Pod: "rhiza-0", PodUID: "new-pod", NodeID: "new-node", WALIdentity: "new-wal"},
+		evidence.Source.Targets[1], evidence.Source.Targets[2],
+	}
+	if validateGCSDeadPodPrivateEvidence(missingOldTarget, eventNames) == nil {
+		t.Fatal("accepted source targets that omit the captured old incarnation")
+	}
+	missingAdd := evidence
+	missingAdd.Recovery.Status.Membership = nil
+	if validateGCSDeadPodPrivateEvidence(missingAdd, eventNames) == nil {
+		t.Fatal("accepted recovery evidence without the durable replacement ADD")
+	}
+	write(gcsDeadPodEvidenceName, encoded(evidence))
+	write(gcsDeadPodEventsName, []byte(
+		`{"event":"old_logical_identity_closed","data":{"identity":"`+canary+`"}}`+"\n"+
+			`{"event":"post_recovery_ack_durable","data":{"bucket":"`+canary+`"}}`+"\n"+
+			`{"event":"same_ordinal_active_restart_verified","data":{"podUID":"`+canary+`"}}`+"\n"))
+	write("same-ordinal-authenticated-binding.json", []byte(canary))
+
+	if err := safeArtifacts(raw); err != nil {
+		t.Fatalf("dead-Pod safe artifact projection failed: %v", err)
+	}
+	public := filepath.Join(raw, "public")
+	summaryBytes, err := os.ReadFile(filepath.Join(public, gcsDeadPodSummaryName))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var summary gcsDeadPodPublicSummary
+	if err := json.Unmarshal(summaryBytes, &summary); err != nil {
+		t.Fatal(err)
+	}
+	if summary.Outcome != "passed" || summary.Qualification != "gcs-single-voter-dead-pod" || !summary.SameOrdinalReplacementVerified ||
+		!summary.ClosedIdentityExcluded || !summary.PostRecoveryAckReadbackVerified ||
+		!summary.ActiveChildRestartVerified || !summary.PostRestartAckReadbackVerified ||
+		summary.CapturedVoterCount != 3 || summary.Provider != "gcs" {
+		t.Fatalf("public dead-Pod summary omitted validated assertions: %+v", summary)
+	}
+	if summary.PrivateEvidenceSHA256 == "" || summary.PrivateEventsSHA256 == "" {
+		t.Fatal("public dead-Pod summary omitted private evidence checksums")
+	}
+	for _, receipt := range []string{"actual-exit.txt", "source-head.txt", "image-ids.txt"} {
+		if _, err := os.Stat(filepath.Join(public, receipt)); err != nil {
+			t.Fatalf("public packet omitted source/image/exit receipt %s: %v", receipt, err)
+		}
+	}
+	imageIDs, err := os.ReadFile(filepath.Join(public, "image-ids.txt"))
+	if err != nil || string(imageIDs) != "sha256:"+strings.Repeat("b", 64)+"\nsha256:"+strings.Repeat("c", 64)+"\n" {
+		t.Fatalf("public immutable image receipt differs from source selection: %q, %v", imageIDs, err)
+	}
+	if _, err := os.Stat(filepath.Join(public, gcsDeadPodEvidenceName)); !os.IsNotExist(err) {
+		t.Fatalf("private dead-Pod evidence was copied into public packet: %v", err)
+	}
+	publicEntries, err := os.ReadDir(public)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, entry := range publicEntries {
+		data, err := os.ReadFile(filepath.Join(public, entry.Name()))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if bytes.Contains(data, []byte(canary)) {
+			t.Fatalf("public artifact %s leaked a private identity canary", entry.Name())
+		}
 	}
 }
 
