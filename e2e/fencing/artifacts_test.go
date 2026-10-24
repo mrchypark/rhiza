@@ -145,6 +145,13 @@ func TestFencerRejectionProjectionUsesFixedCodesOnly(t *testing.T) {
 		"2026/10/24 10:00:06 fencing supervisor transition rejected: action=register podUID=private-pod-uid error=fencing: register archive-scope rejected: backend failure " + canary,
 		"2026/10/24 10:00:07 fencing supervisor transition rejected: action=register podUID=private-pod-uid error=fencing: register startup-grant rejected: fencing: standalone learner incarnation is not current in canonical history",
 		"2026/10/24 10:00:08 fencing supervisor transition rejected: action=register podUID=private-pod-uid error=fencing: static startup peer token is missing",
+		"2026/10/24 10:00:09 fencing supervisor transition rejected: action=register podUID=private-pod-uid error=fencing: register root-init rejected: fencing: root-init phase=create cause=permission: backend failure " + canary,
+		"2026/10/24 10:00:10 fencing supervisor transition rejected: action=register podUID=private-pod-uid error=fencing: register root-init rejected: fencing: root-init phase=untrusted cause=private: " + canary,
+		// These handler lines are copied from the actual capture emitted by
+		// TestTransientRootInitRegistrationLogsDiagnosisAndReturns503.
+		"2026/10/24 18:46:31 fencing supervisor transition rejected: action=register podUID=pod-0 error=fencing: register root-init rejected: fencing: root-init phase=load cause=timeout: context deadline exceeded",
+		"2026/10/24 18:46:31 fencing supervisor transition rejected: action=register podUID=pod-0 error=fencing: register root-init rejected: fencing: root-init phase=legacy_check cause=legacy_check_unavailable: cannot verify legacy cooperative ledger before canonical root bootstrap\nkubernetes API returned HTTP 503",
+		"2026/10/24 10:00:13 fencing supervisor transition rejected: action=register podUID=private-pod-uid error=fencing: register root-init rejected: fencing: root-init phase=legacy_check cause=legacy_exists: legacy cooperative ledger exists; refusing canonical root bootstrap " + canary,
 		"2026/10/24 10:00:02 fencing supervisor transition rejected: action=bind podUID=private-pod-uid error=fencing: startup recovery child differs from assignment",
 		"2026/10/24 10:00:02 fencing supervisor authentication rejected: action=bind podUID=private-pod-uid error=fencing: Pod source differs",
 		"2026/10/24 10:00:03 unrelated log fencing supervisor transition rejected: action=register podUID=private-pod-uid error=fencing: startup root binding is unavailable",
@@ -171,7 +178,7 @@ func TestFencerRejectionProjectionUsesFixedCodesOnly(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if bytes.Contains(projected, []byte(canary)) || bytes.Contains(projected, []byte("private-pod-uid")) || bytes.Contains(projected, []byte("startup recovery child differs")) {
+	if bytes.Contains(projected, []byte(canary)) || bytes.Contains(projected, []byte("private-pod-uid")) || bytes.Contains(projected, []byte("pod-0")) || bytes.Contains(projected, []byte("context deadline exceeded")) || bytes.Contains(projected, []byte("kubernetes API returned HTTP 503")) || bytes.Contains(projected, []byte("startup recovery child differs")) {
 		t.Fatal("public supervisor diagnostics leaked private log contents")
 	}
 	var got fencerDiagnosticsView
@@ -190,6 +197,11 @@ func TestFencerRejectionProjectionUsesFixedCodesOnly(t *testing.T) {
 		{Stage: "transition", Action: "register", Code: "register_archive_scope_rejected"},
 		{Stage: "transition", Action: "register", Code: "standalone_learner_history_not_current"},
 		{Stage: "transition", Action: "register", Code: "static_startup_credential_rejected"},
+		{Stage: "transition", Action: "register", Code: "register_root_init_create_permission"},
+		{Stage: "transition", Action: "register", Code: "register_root_init_rejected"},
+		{Stage: "transition", Action: "register", Code: "register_root_init_load_timeout"},
+		{Stage: "transition", Action: "register", Code: "register_root_init_legacy_check_legacy_check_unavailable"},
+		{Stage: "transition", Action: "register", Code: "register_root_init_legacy_check_legacy_exists"},
 	}
 	if len(got.Logs.Rejections) != len(want) {
 		t.Fatalf("unexpected projected supervisor rejections: %+v", got.Logs.Rejections)

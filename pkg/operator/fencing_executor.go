@@ -179,6 +179,16 @@ func (e *FencingExecutor) initializeRoot(ctx context.Context, uid, source string
 	} else if !errors.Is(err, errAuthorityStateNotFound) {
 		return err
 	}
+	// A missing canonical root is not permission to forget an older
+	// cooperative ledger for the same StatefulSet/source identity. Check the
+	// existing Kubernetes ledger before creating genesis; only an authoritative
+	// NotFound permits a genuinely new canonical root. In particular, unreadable
+	// or malformed legacy state must fail closed rather than be treated as empty.
+	if _, legacyErr := e.readLegacyCooperative(ctx, uid, source); legacyErr == nil {
+		return fmt.Errorf("fencing: root-init phase=legacy_check cause=legacy_exists: legacy cooperative ledger exists; refusing canonical root bootstrap")
+	} else if !apiNotFound(legacyErr) {
+		return errors.Join(fmt.Errorf("fencing: root-init phase=legacy_check cause=legacy_check_unavailable: cannot verify legacy cooperative ledger before canonical root bootstrap"), legacyErr)
+	}
 	initial := fenceLedger{StatefulSetUID: uid, Ledger: fencing.Ledger{
 		SourceClusterID: source, RequireRuntimeBinding: e != nil && e.RequireMutationJournal,
 		RequireMutationJournal: e != nil && e.RequireMutationJournal,
@@ -574,6 +584,9 @@ func (e *FencingExecutor) handle(w http.ResponseWriter, r *http.Request) {
 	}
 	if err != nil {
 		if transientFenceAuthority(err) {
+			if message.Action == "register" && strings.HasPrefix(err.Error(), "fencing: register root-init rejected: fencing: root-init phase=") {
+				log.Printf("fencing supervisor transition rejected: action=%s podUID=%s error=%v", message.Action, message.Identity.PodUID, err)
+			}
 			http.Error(w, "authority unavailable", http.StatusServiceUnavailable)
 			return
 		}

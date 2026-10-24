@@ -8,6 +8,10 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net/http"
+	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"reflect"
 	"strings"
 	"testing"
@@ -18,6 +22,19 @@ import (
 
 var errOpaqueETagCondition = errors.New("opaque ETag condition failed")
 var errInjectedAuthorityCASBeforeWrite = errors.New("injected authority CAS failure before write")
+
+func newMissingLegacyLedgerKube(t *testing.T) *Kubernetes {
+	t.Helper()
+	server := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.NotFound(w, r)
+	}))
+	t.Cleanup(server.Close)
+	token := filepath.Join(t.TempDir(), "token")
+	if err := os.WriteFile(token, []byte("test"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	return &Kubernetes{BaseURL: server.URL, Namespace: "test", TokenFile: token, Client: server.Client()}
+}
 
 // etagAuthorityBucket models content-derived opaque ETags, which can return to
 // an earlier value after A-to-B-to-A. It delegates atomicity to InMemBucket.
@@ -143,6 +160,223 @@ func TestAuthorityStateReopensFromObjectStorageWithoutLocalOrKubeIndex(t *testin
 	}
 }
 
+func TestInitializeRootDoesNotSilentlyReplaceLegacyCooperativeHistory(t *testing.T) {
+	e, fixture, _, _ := newMutationStoreFixture(t)
+	ctx := t.Context()
+	const uid, source = "sts", "source"
+
+	store := e.AuthorityState
+	rootKey, identity, err := store.rootKey(uid, source)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := fixture.authorityBucket.Delete(ctx, rootKey); err != nil {
+		t.Fatal(err)
+	}
+	if err := fixture.authorityBucket.Delete(ctx, store.genesisKey(identity)); err != nil {
+		t.Fatal(err)
+	}
+
+	e.AuthorityState = nil
+	e.LegacyCooperativeControlState = true
+	oldRun := fencing.Identity{SourceClusterID: source, NodeID: "old-node", PodUID: "old-pod", RunID: "old-run"}
+	if _, err := e.change(ctx, uid, source, func(ledger *fencing.Ledger) error {
+		if err := ledger.Register(oldRun); err != nil {
+			return err
+		}
+		return ledger.Close("old-fence", "old-request")
+	}); err != nil {
+		t.Fatal(err)
+	}
+	legacy, err := e.readLegacyCooperative(ctx, uid, source)
+	if err != nil || legacy.Ledger.ClosedBy != "old-fence" || len(legacy.Ledger.Runs) != 1 {
+		t.Fatalf("failed to seed legacy cooperative history: state=%+v err=%v", legacy.Ledger, err)
+	}
+
+	e.AuthorityState = store
+	err = e.initializeRoot(ctx, uid, source)
+	remote, _, remoteErr := store.ReadRoot(ctx, uid, source)
+	if err == nil && remoteErr == nil && len(remote.Ledger.Runs) == 0 && remote.Ledger.ClosedBy == "" {
+		t.Errorf("initializeRoot created an empty canonical root while the same root has closed legacy history")
+	}
+	if err == nil {
+		t.Errorf("initializeRoot accepted a backend switch without reconciling legacy cooperative history")
+	}
+	if remoteErr == nil {
+		t.Errorf("canonical root exists after refusing legacy-to-remote initialization: state=%+v", remote.Ledger)
+	} else if !errors.Is(remoteErr, errAuthorityStateNotFound) {
+		t.Errorf("canonical root read error = %v, want missing root after fail-closed rejection", remoteErr)
+	}
+	legacyAfter, legacyErr := e.readLegacyCooperative(ctx, uid, source)
+	if legacyErr != nil || legacyAfter.Ledger.ClosedBy != "old-fence" || len(legacyAfter.Ledger.Runs) != 1 {
+		t.Errorf("legacy history changed during backend switch: state=%+v err=%v", legacyAfter.Ledger, legacyErr)
+	}
+}
+
+func TestInitializeRootAllowsNewCanonicalRootWithoutLegacyHistory(t *testing.T) {
+	e, fixture, _, _ := newMutationStoreFixture(t)
+	ctx := t.Context()
+	const uid, source = "sts", "source"
+
+	store := e.AuthorityState
+	rootKey, identity, err := store.rootKey(uid, source)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := fixture.authorityBucket.Delete(ctx, rootKey); err != nil {
+		t.Fatal(err)
+	}
+	if err := fixture.authorityBucket.Delete(ctx, store.genesisKey(identity)); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := e.initializeRoot(ctx, uid, source); err != nil {
+		t.Fatalf("new canonical root without legacy history was rejected: %v", err)
+	}
+	root, _, err := store.ReadRoot(ctx, uid, source)
+	if err != nil || root.StatefulSetUID != uid || root.Ledger.SourceClusterID != source || len(root.Ledger.Runs) != 0 {
+		t.Fatalf("new canonical root was not initialized as empty: state=%+v err=%v", root, err)
+	}
+	if _, _, err := store.read(ctx, store.genesisKey(identity), identity); err != nil {
+		t.Fatalf("new canonical root genesis was not initialized: %v", err)
+	}
+}
+
+func TestInitializeRootFailsClosedWhenLegacyLedgerCannotBeVerified(t *testing.T) {
+	tests := []struct {
+		name      string
+		configure func(*testing.T, *FencingExecutor, *mutationStoreFixture, string, string)
+	}{
+		{
+			name: "malformed ledger",
+			configure: func(_ *testing.T, e *FencingExecutor, fixture *mutationStoreFixture, uid, source string) {
+				fixture.objects[e.ledgerPath(uid, source)] = object{
+					"metadata": object{"name": "legacy-ledger"},
+					"data":     object{"ledger.json": "{"},
+				}
+			},
+		},
+		{
+			name: "Kubernetes read error",
+			configure: func(t *testing.T, e *FencingExecutor, _ *mutationStoreFixture, _, _ string) {
+				server := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+					if r.Method != http.MethodGet {
+						http.Error(w, "unexpected method", http.StatusMethodNotAllowed)
+						return
+					}
+					w.WriteHeader(http.StatusServiceUnavailable)
+				}))
+				t.Cleanup(server.Close)
+				e.Kube.BaseURL = server.URL
+				e.Kube.Client = server.Client()
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			e, fixture, _, _ := newMutationStoreFixture(t)
+			ctx := t.Context()
+			const uid, source = "sts", "source"
+
+			store := e.AuthorityState
+			rootKey, identity, err := store.rootKey(uid, source)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := fixture.authorityBucket.Delete(ctx, rootKey); err != nil {
+				t.Fatal(err)
+			}
+			if err := fixture.authorityBucket.Delete(ctx, store.genesisKey(identity)); err != nil {
+				t.Fatal(err)
+			}
+			tt.configure(t, e, fixture, uid, source)
+
+			if err := e.initializeRoot(ctx, uid, source); err == nil {
+				t.Fatal("initializeRoot accepted an unverifiable legacy ledger")
+			}
+			if _, _, err := store.ReadRoot(ctx, uid, source); !errors.Is(err, errAuthorityStateNotFound) {
+				t.Errorf("canonical root read error = %v, want missing root after fail-closed rejection", err)
+			}
+			if _, _, err := store.read(ctx, store.genesisKey(identity), identity); !errors.Is(err, errAuthorityStateNotFound) {
+				t.Errorf("canonical genesis read error = %v, want missing genesis after fail-closed rejection", err)
+			}
+		})
+	}
+}
+
+func TestInitializeRootRequiresKubeToVerifyFreshCanonicalRoot(t *testing.T) {
+	e, fixture, _, _ := newMutationStoreFixture(t)
+	ctx := t.Context()
+	const uid, source = "sts", "source"
+
+	store := e.AuthorityState
+	rootKey, identity, err := store.rootKey(uid, source)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := fixture.authorityBucket.Delete(ctx, rootKey); err != nil {
+		t.Fatal(err)
+	}
+	if err := fixture.authorityBucket.Delete(ctx, store.genesisKey(identity)); err != nil {
+		t.Fatal(err)
+	}
+	e.Kube = nil
+
+	if err := e.initializeRoot(ctx, uid, source); err == nil {
+		t.Fatal("fresh canonical root initialized without verifying legacy Kubernetes state")
+	}
+	if _, _, err := store.read(ctx, rootKey, identity); !errors.Is(err, errAuthorityStateNotFound) {
+		t.Errorf("canonical root read error = %v, want no root after failed verification", err)
+	}
+	if _, _, err := store.read(ctx, store.genesisKey(identity), identity); !errors.Is(err, errAuthorityStateNotFound) {
+		t.Errorf("canonical genesis read error = %v, want no genesis after failed verification", err)
+	}
+}
+
+func TestInitializeRootResumesCanonicalStateWithoutKube(t *testing.T) {
+	e, _, id, runtime := newMutationStoreFixture(t)
+	ctx := t.Context()
+	const uid, source = "sts", "source"
+	_, identity, err := e.AuthorityState.rootKey(uid, source)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := e.AuthorityState.ensureRootGenesis(ctx, identity); err != nil {
+		t.Fatalf("seed canonical genesis: %v", err)
+	}
+	if _, err := e.change(ctx, uid, source, func(ledger *fencing.Ledger) error {
+		ledger.RequireRuntimeBinding = true
+		ledger.RequireMutationJournal = true
+		ledger.ArchiveGenesisState = fencing.ArchiveGenesisRegistrationPending
+		if err := ledger.RegisterEnrolled(id, runtime); err != nil {
+			return err
+		}
+		return ledger.Close("resume-fence", "resume-request")
+	}); err != nil {
+		t.Fatal(err)
+	}
+	before, beforeVersion, err := e.AuthorityState.ReadRoot(ctx, uid, source)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if before.Ledger.ClosedBy != "resume-fence" || len(before.Ledger.Runs) != 1 || !before.Ledger.RequireMutationJournal || !before.Ledger.RequireRuntimeBinding {
+		t.Fatalf("resume fixture lacks closed run/profile state: %+v", before.Ledger)
+	}
+	e.Kube = nil
+
+	if err := e.initializeRoot(ctx, uid, source); err != nil {
+		t.Fatalf("existing canonical root could not resume without legacy Kubernetes lookup: %v", err)
+	}
+	after, afterVersion, err := e.AuthorityState.ReadRoot(ctx, uid, source)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if hashJSON(after) != hashJSON(before) || !reflect.DeepEqual(afterVersion, beforeVersion) {
+		t.Fatalf("canonical resume changed root state or version: before=%+v after=%+v", before.Ledger, after.Ledger)
+	}
+}
+
 func TestArchiveGenesisRefCASRetryUsesDecodedStructuralEquality(t *testing.T) {
 	store, _ := newAuthorityStateStoreForTest(t)
 	ctx := context.Background()
@@ -230,7 +464,7 @@ func TestAuthorityRootCannotReinitializeAfterRegisteredRootLoss(t *testing.T) {
 	store, bucket := newAuthorityStateStoreForTest(t)
 	ctx := context.Background()
 	const uid, source = "statefulset-uid", "source-id"
-	executor := &FencingExecutor{AuthorityState: store}
+	executor := &FencingExecutor{AuthorityState: store, Kube: newMissingLegacyLedgerKube(t)}
 	if err := executor.initializeRoot(ctx, uid, source); err != nil {
 		t.Fatal(err)
 	}
@@ -255,7 +489,7 @@ func TestMutationJournalProfileIsPinnedBeforeRootRegistration(t *testing.T) {
 
 	t.Run("new required root persists both requirements", func(t *testing.T) {
 		store, _ := newAuthorityStateStoreForTest(t)
-		executor := &FencingExecutor{AuthorityState: store, RequireMutationJournal: true}
+		executor := &FencingExecutor{AuthorityState: store, RequireMutationJournal: true, Kube: newMissingLegacyLedgerKube(t)}
 		if err := executor.initializeRoot(ctx, uid, source); err != nil {
 			t.Fatal(err)
 		}
@@ -270,7 +504,7 @@ func TestMutationJournalProfileIsPinnedBeforeRootRegistration(t *testing.T) {
 
 	t.Run("cooperative root cannot be upgraded in place", func(t *testing.T) {
 		store, _ := newAuthorityStateStoreForTest(t)
-		cooperative := &FencingExecutor{AuthorityState: store}
+		cooperative := &FencingExecutor{AuthorityState: store, Kube: newMissingLegacyLedgerKube(t)}
 		if err := cooperative.initializeRoot(ctx, uid, source); err != nil {
 			t.Fatal(err)
 		}
@@ -293,11 +527,11 @@ func TestMutationJournalProfileIsPinnedBeforeRootRegistration(t *testing.T) {
 
 	t.Run("nonrequired executor cannot downgrade required root", func(t *testing.T) {
 		store, _ := newAuthorityStateStoreForTest(t)
-		required := &FencingExecutor{AuthorityState: store, RequireMutationJournal: true}
+		required := &FencingExecutor{AuthorityState: store, RequireMutationJournal: true, Kube: newMissingLegacyLedgerKube(t)}
 		if err := required.initializeRoot(ctx, uid, source); err != nil {
 			t.Fatal(err)
 		}
-		cooperative := &FencingExecutor{AuthorityState: store}
+		cooperative := &FencingExecutor{AuthorityState: store, Kube: newMissingLegacyLedgerKube(t)}
 		if err := cooperative.initializeRoot(ctx, uid, source); err != nil {
 			t.Fatal(err)
 		}
@@ -571,7 +805,7 @@ func TestAuthorityProducerETagCASAndRootGenesisLossAreFailClosed(t *testing.T) {
 	if err != nil || got.Phase != fencing.MutationClosed {
 		t.Fatalf("closed producer did not survive ETag store reopen: %+v %v", got, err)
 	}
-	executor := &FencingExecutor{AuthorityState: reopened}
+	executor := &FencingExecutor{AuthorityState: reopened, Kube: newMissingLegacyLedgerKube(t)}
 	const rootUID, sourceID = "genesis-sts", "genesis-source"
 	if err := executor.initializeRoot(ctx, rootUID, sourceID); err != nil {
 		t.Fatal(err)
