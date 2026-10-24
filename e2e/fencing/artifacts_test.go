@@ -138,6 +138,13 @@ func TestFencerRejectionProjectionUsesFixedCodesOnly(t *testing.T) {
 		"2026/10/24 10:00:00 runtime enrollment pending: podUID=private-pod-uid runID=private-run-id error=fencing: runtime enrollment rejected at client/node_lookup_failed",
 		"2026/10/24 10:00:00 fencing supervisor transition rejected: action=register podUID=private-pod-uid error=fencing: startup recovery child differs from assignment",
 		"2026/10/24 10:00:01 fencing supervisor transition rejected: action=register podUID=private-pod-uid error=unrecognized private failure " + canary,
+		"2026/10/24 10:00:02 fencing supervisor transition rejected: action=register podUID=private-pod-uid error=fencing: register root-init rejected: backend failure " + canary,
+		"2026/10/24 10:00:03 fencing supervisor transition rejected: action=register podUID=private-pod-uid error=fencing: register startup-grant rejected: backend failure " + canary,
+		"2026/10/24 10:00:04 fencing supervisor transition rejected: action=register podUID=private-pod-uid error=fencing: register ledger-register rejected: backend failure " + canary,
+		"2026/10/24 10:00:05 fencing supervisor transition rejected: action=register podUID=private-pod-uid error=fencing: register producer-reserve rejected: backend failure " + canary,
+		"2026/10/24 10:00:06 fencing supervisor transition rejected: action=register podUID=private-pod-uid error=fencing: register archive-scope rejected: backend failure " + canary,
+		"2026/10/24 10:00:07 fencing supervisor transition rejected: action=register podUID=private-pod-uid error=fencing: register startup-grant rejected: fencing: standalone learner incarnation is not current in canonical history",
+		"2026/10/24 10:00:08 fencing supervisor transition rejected: action=register podUID=private-pod-uid error=fencing: static startup peer token is missing",
 		"2026/10/24 10:00:02 fencing supervisor transition rejected: action=bind podUID=private-pod-uid error=fencing: startup recovery child differs from assignment",
 		"2026/10/24 10:00:02 fencing supervisor authentication rejected: action=bind podUID=private-pod-uid error=fencing: Pod source differs",
 		"2026/10/24 10:00:03 unrelated log fencing supervisor transition rejected: action=register podUID=private-pod-uid error=fencing: startup root binding is unavailable",
@@ -176,6 +183,13 @@ func TestFencerRejectionProjectionUsesFixedCodesOnly(t *testing.T) {
 		{Stage: "runtime_enrollment", Action: "register", Code: "runtimeagent_client_node_lookup_failed"},
 		{Stage: "transition", Action: "register", Code: "replacement_recovery_child_mismatch"},
 		{Stage: "transition", Action: "register", Code: "register_guard_unknown"},
+		{Stage: "transition", Action: "register", Code: "register_root_init_rejected"},
+		{Stage: "transition", Action: "register", Code: "register_startup_grant_rejected"},
+		{Stage: "transition", Action: "register", Code: "register_ledger_register_rejected"},
+		{Stage: "transition", Action: "register", Code: "register_producer_reserve_rejected"},
+		{Stage: "transition", Action: "register", Code: "register_archive_scope_rejected"},
+		{Stage: "transition", Action: "register", Code: "standalone_learner_history_not_current"},
+		{Stage: "transition", Action: "register", Code: "static_startup_credential_rejected"},
 	}
 	if len(got.Logs.Rejections) != len(want) {
 		t.Fatalf("unexpected projected supervisor rejections: %+v", got.Logs.Rejections)
