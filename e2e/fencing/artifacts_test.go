@@ -307,7 +307,9 @@ func TestVoterStartupStageProjectionUsesExactWrappersAndFixedCodes(t *testing.T)
 		"2026/10/24 10:00:02 open rhiza: prepare source retry directory: /private/path/" + canary,
 		"2026/10/24 10:00:03 open rhiza: read canonical archive genesis: " + canary,
 		"2026/10/24 10:00:04 open rhiza: create QuePaxa core: " + canary,
-		"2026/10/24 10:00:05 open rhiza: " + canary,
+		"2026/10/24 10:00:05 open rhiza: ensure voter identity: fencing: runtime enrollment identity differs: " + canary,
+		"2026/10/24 10:00:06 open rhiza: ensure voter identity: read voter registration: " + canary,
+		"2026/10/24 10:00:07 open rhiza: ensure voter identity: " + canary,
 		"not-a-timestamp open rhiza: open WAL: " + canary,
 	}, "\n") + "\n"
 	logPath := filepath.Join(t.TempDir(), "current.log")
@@ -318,7 +320,7 @@ func TestVoterStartupStageProjectionUsesExactWrappersAndFixedCodes(t *testing.T)
 		t.Fatal(err)
 	}
 	view := readVoterLog(filepath.Dir(logPath), "current", true)
-	if !view.Captured || len(view.StartupStages) != 6 || view.StartupStagesTruncated {
+	if !view.Captured || len(view.StartupStages) != 8 || view.StartupStagesTruncated {
 		t.Fatalf("startup stage projection is incomplete: %+v", view)
 	}
 	want := []string{
@@ -327,7 +329,9 @@ func TestVoterStartupStageProjectionUsesExactWrappersAndFixedCodes(t *testing.T)
 		"source_mutation/retry_directory_failed",
 		"archive_genesis/read_failed",
 		"consensus/core_create_failed",
-		"node_open/unknown",
+		"wal_binding/runtime_identity_mismatch",
+		"voter_identity/remote_read_failed",
+		"voter_identity/guard_unknown",
 	}
 	for i := range want {
 		if view.StartupStages[i] != want[i] {
@@ -340,6 +344,47 @@ func TestVoterStartupStageProjectionUsesExactWrappersAndFixedCodes(t *testing.T)
 	}
 	if got := classifyVoterStartupLog([]byte(logs)); !contains(got, "supervisor_admission_failed") || !contains(got, "node_open_failed") {
 		t.Fatalf("legacy categories no longer preserve overlapping wrapper classifications: %v", got)
+	}
+}
+
+func TestVoterStartupStageProjectionDistinguishesUnparsedOuterWrapper(t *testing.T) {
+	logPath := filepath.Join(t.TempDir(), "current.log")
+	if err := os.WriteFile(logPath, []byte("not-a-timestamp open rhiza: open WAL: private\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(filepath.Dir(logPath), "current.captured"), []byte("true\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	view := readVoterLog(filepath.Dir(logPath), "current", true)
+	if len(view.StartupStages) != 1 || view.StartupStages[0] != "node_open/outer_wrapper_unparsed" {
+		t.Fatalf("unparsed outer log wrapper was not distinguished: %+v", view.StartupStages)
+	}
+}
+
+func TestVoterStartupStageProjectionClassifiesIdentityAndArchiveBoundaries(t *testing.T) {
+	const private = "private-node-identity-canary"
+	logs := strings.Join([]string{
+		"2026/10/24 10:00:00 open rhiza: load voter identity: voter state continuity cannot be established: invalid local identity: " + private,
+		"2026/10/24 10:00:01 open rhiza: ensure voter identity: voter state continuity cannot be established: voter " + private + " is registered but its local identity is absent",
+		"2026/10/24 10:00:02 open rhiza: load shared decision archive: load shared decision archive: " + private,
+	}, "\n") + "\n"
+	stages, truncated := classifyVoterStartupStages([]byte(logs))
+	want := []string{
+		"voter_identity/local_identity_invalid",
+		"voter_identity/registration_without_local_identity",
+		"archive/load_failed",
+	}
+	if truncated || len(stages) != len(want) {
+		t.Fatalf("identity/archive stage set = %v (truncated=%v), want %v", stages, truncated, want)
+	}
+	for i := range want {
+		if stages[i] != want[i] {
+			t.Fatalf("stage %d = %q, want %q", i, stages[i], want[i])
+		}
+	}
+	public, err := json.Marshal(stages)
+	if err != nil || bytes.Contains(public, []byte(private)) {
+		t.Fatalf("fixed stage codes leaked nested error text: %v", err)
 	}
 }
 
