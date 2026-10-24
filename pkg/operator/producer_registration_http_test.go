@@ -14,9 +14,12 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/mrchypark/rhiza/internal/types"
 	"github.com/mrchypark/rhiza/pkg/fencing"
 	"github.com/mrchypark/rhiza/pkg/fencing/cri"
 	"github.com/mrchypark/rhiza/pkg/fencing/runtimeagent"
+	"github.com/mrchypark/rhiza/pkg/network"
+	"github.com/mrchypark/rhiza/pkg/quepaxa"
 	"github.com/thanos-io/objstore"
 )
 
@@ -67,12 +70,27 @@ func newSupervisorRegistrationFixture(t *testing.T, required bool) supervisorReg
 	t.Helper()
 	apiState := &mutationStoreFixture{objects: make(map[string]object)}
 	identity := fencing.Identity{SourceClusterID: "source", NodeID: "n0", PodName: "n0", PodUID: "pod-0", RunID: "run-0"}
+	peerToken := "private-token-n0"
+	members, err := json.Marshal([]quepaxa.Member{{
+		ID: quepaxa.NodeID(identity.NodeID),
+		PublicKey: quepaxa.PublicKey(network.PeerPublicKey(
+			types.ClusterID(identity.SourceClusterID), quepaxa.NodeID(identity.NodeID), peerToken)),
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	peerTokens, err := json.Marshal(map[string]string{identity.NodeID: peerToken})
+	if err != nil {
+		t.Fatal(err)
+	}
 	env := []any{
 		object{"name": "RHIZA_CLUSTER_ID", "value": identity.SourceClusterID},
+		object{"name": "RHIZA_CLUSTER_MEMBERS", "value": string(members)},
 		object{"name": "RHIZA_OBJSTORE_PROVIDER", "value": "gcs"},
 		object{"name": "RHIZA_OBJSTORE_BUCKET", "value": "archive"},
 		object{"name": "RHIZA_OBJSTORE_PREFIX", "value": "root"},
 	}
+	envFrom := []any{object{"secretRef": object{"name": "peer-credentials"}}}
 	pod := supervisedTestPod()
 	metadata := asObject(pod["metadata"])
 	metadata["name"], metadata["namespace"], metadata["uid"] = identity.NodeID, "test", identity.PodUID
@@ -81,17 +99,24 @@ func newSupervisorRegistrationFixture(t *testing.T, required bool) supervisorReg
 	spec := asObject(pod["spec"])
 	spec["nodeName"], spec["serviceAccountName"] = "node", "default"
 	container := asObject(list(spec["containers"])[0])
-	container["name"], container["env"] = "rhiza", env
+	container["name"], container["env"], container["envFrom"] = "rhiza", env, envFrom
 	pod["status"] = object{"containerStatuses": []any{object{
 		"name": "rhiza", "containerID": "containerd://0123456789abcdef0123456789abcdef",
 		"imageID": "registry.example/rhiza@sha256:" + strings.Repeat("a", 64),
 	}}}
 	statefulSet := object{
 		"metadata": object{"name": "rhiza", "namespace": "test", "uid": "sts-uid"},
-		"spec":     object{"template": object{"spec": object{"containers": []any{object{"name": "rhiza", "env": env}}}}},
+		"spec": object{"template": object{
+			"metadata": object{"annotations": object{fencingProtocolAnnotation: "1", fencingRootAnnotation: "binding-uid"}},
+			"spec":     object{"containers": []any{object{"name": "rhiza", "env": env, "envFrom": envFrom}}},
+		}},
 	}
 	apiState.authPod, apiState.authStatefulSet = pod, statefulSet
 	apiState.objects["/apis/apps/v1/namespaces/test/statefulsets"] = object{"items": []any{statefulSet}}
+	apiState.objects["/api/v1/namespaces/test/secrets/peer-credentials"] = object{
+		"metadata": object{"name": "peer-credentials", "namespace": "test", "uid": "secret-uid"},
+		"data":     object{"RHIZA_PEER_TOKENS": base64.StdEncoding.EncodeToString(peerTokens)},
+	}
 	apiServer := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.Method + " " + r.URL.Path {
 		case "GET /apis/rhiza.mrchypark.dev/v1alpha1/namespaces/test/rhizaclusters":

@@ -3,11 +3,14 @@ package main
 import (
 	"bytes"
 	"encoding/json"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"gopkg.in/yaml.v3"
 )
 
 func readContractFile(t *testing.T, path string) string {
@@ -17,6 +20,78 @@ func readContractFile(t *testing.T, path string) string {
 		t.Fatalf("read %s: %v", path, err)
 	}
 	return string(data)
+}
+
+func assertNodeNameORTerms(t *testing.T, name, manifest string, wantSets int) {
+	t.Helper()
+	decoder := yaml.NewDecoder(strings.NewReader(manifest))
+	affinityCount := 0
+	var inspect func(any)
+	inspect = func(value any) {
+		switch value := value.(type) {
+		case map[string]any:
+			for key, child := range value {
+				if key == "nodeAffinity" {
+					affinityCount++
+					assertCapturedNodeNameAffinity(t, name, child)
+				}
+				inspect(child)
+			}
+		case []any:
+			for _, child := range value {
+				inspect(child)
+			}
+		}
+	}
+	for {
+		var document map[string]any
+		err := decoder.Decode(&document)
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			t.Fatalf("%s manifest is not valid YAML: %v", name, err)
+		}
+		inspect(document)
+	}
+	if affinityCount != wantSets {
+		t.Fatalf("%s has %d node affinity selectors, want %d", name, affinityCount, wantSets)
+	}
+}
+
+func assertCapturedNodeNameAffinity(t *testing.T, name string, value any) {
+	t.Helper()
+	affinity, ok := value.(map[string]any)
+	if !ok {
+		t.Fatalf("%s nodeAffinity has type %T, want mapping", name, value)
+	}
+	required, ok := affinity["requiredDuringSchedulingIgnoredDuringExecution"].(map[string]any)
+	if !ok {
+		t.Fatalf("%s nodeAffinity lacks required scheduling rules", name)
+	}
+	terms, ok := required["nodeSelectorTerms"].([]any)
+	if !ok || len(terms) != 3 {
+		t.Fatalf("%s has %d nodeSelectorTerms, want three captured-node OR terms", name, len(terms))
+	}
+	want := []string{"__NODE_A__", "__NODE_B__", "__NODE_C__"}
+	for i, term := range terms {
+		termMap, ok := term.(map[string]any)
+		if !ok || len(termMap) != 1 {
+			t.Fatalf("%s nodeSelectorTerm %d must contain only matchFields, got %#v", name, i, term)
+		}
+		matchFields, ok := termMap["matchFields"].([]any)
+		if !ok || len(matchFields) != 1 {
+			t.Fatalf("%s nodeSelectorTerm %d has %d matchFields, want exactly one", name, i, len(matchFields))
+		}
+		field, ok := matchFields[0].(map[string]any)
+		if !ok || len(field) != 3 || field["key"] != "metadata.name" || field["operator"] != "In" {
+			t.Fatalf("%s nodeSelectorTerm %d must be exactly metadata.name In, got %#v", name, i, matchFields[0])
+		}
+		values, ok := field["values"].([]any)
+		if !ok || len(values) != 1 || values[0] != want[i] {
+			t.Fatalf("%s nodeSelectorTerm %d values = %#v, want only %s", name, i, field["values"], want[i])
+		}
+	}
 }
 
 func manifestDocumentForKind(manifest, kind string) string {
@@ -38,6 +113,9 @@ func TestIndependentGCSChaosManifestContract(t *testing.T) {
 	fencingLauncher := readContractFile(t, "../../../e2e/fencing/run.sh")
 	bootstrapNamespace := readContractFile(t, "../gcs-postrelease-auth.yaml.in")
 	probe := readContractFile(t, "gcs_reader_probe.go")
+	assertNodeNameORTerms(t, "expiry Job", expiry, 1)
+	assertNodeNameORTerms(t, "IAM preflight Pod", preflight, 1)
+	assertNodeNameORTerms(t, "voterCount workloads", manifest, 5)
 	statefulSet := manifestDocumentForKind(manifest, "StatefulSet")
 	rhizaCluster := manifestDocumentForKind(manifest, "RhizaCluster")
 	if !strings.Contains(statefulSet, "replicas: 0") ||

@@ -80,7 +80,15 @@ spec:
               - matchFields:
                   - key: metadata.name
                     operator: In
-                    values: [__NODE_A__, __NODE_B__, __NODE_C__]
+                    values: [__NODE_A__]
+              - matchFields:
+                  - key: metadata.name
+                    operator: In
+                    values: [__NODE_B__]
+              - matchFields:
+                  - key: metadata.name
+                    operator: In
+                    values: [__NODE_C__]
         podAntiAffinity:
           requiredDuringSchedulingIgnoredDuringExecution:
             - labelSelector:
@@ -200,7 +208,15 @@ spec:
               - matchFields:
                   - key: metadata.name
                     operator: In
-                    values: [__NODE_A__, __NODE_B__, __NODE_C__]
+                    values: [__NODE_A__]
+              - matchFields:
+                  - key: metadata.name
+                    operator: In
+                    values: [__NODE_B__]
+              - matchFields:
+                  - key: metadata.name
+                    operator: In
+                    values: [__NODE_C__]
       securityContext: {runAsNonRoot: true, fsGroup: 65532, seccompProfile: {type: RuntimeDefault}}
       containers:
         - name: operator
@@ -316,7 +332,15 @@ spec:
               - matchFields:
                   - key: metadata.name
                     operator: In
-                    values: [__NODE_A__, __NODE_B__, __NODE_C__]
+                    values: [__NODE_A__]
+              - matchFields:
+                  - key: metadata.name
+                    operator: In
+                    values: [__NODE_B__]
+              - matchFields:
+                  - key: metadata.name
+                    operator: In
+                    values: [__NODE_C__]
       securityContext: {runAsNonRoot: true, fsGroup: 65532, seccompProfile: {type: RuntimeDefault}}
       containers:
         - name: authority
@@ -374,7 +398,15 @@ spec:
           - matchFields:
               - key: metadata.name
                 operator: In
-                values: [__NODE_A__, __NODE_B__, __NODE_C__]
+                values: [__NODE_A__]
+          - matchFields:
+              - key: metadata.name
+                operator: In
+                values: [__NODE_B__]
+          - matchFields:
+              - key: metadata.name
+                operator: In
+                values: [__NODE_C__]
   securityContext: {runAsNonRoot: true, runAsUser: 65532, runAsGroup: 65532, fsGroup: 65532, seccompProfile: {type: RuntimeDefault}}
   containers:
     - name: inspector
@@ -404,7 +436,15 @@ spec:
           - matchFields:
               - key: metadata.name
                 operator: In
-                values: [__NODE_A__, __NODE_B__, __NODE_C__]
+                values: [__NODE_A__]
+          - matchFields:
+              - key: metadata.name
+                operator: In
+                values: [__NODE_B__]
+          - matchFields:
+              - key: metadata.name
+                operator: In
+                values: [__NODE_C__]
     podAffinity:
       requiredDuringSchedulingIgnoredDuringExecution:
         - labelSelector: {matchLabels: {chaos.rhiza.io/run: '__RUN_ID__', app: 'rhiza-inspector'}}

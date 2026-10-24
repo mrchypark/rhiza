@@ -10,7 +10,9 @@ import (
 	"path/filepath"
 	"testing"
 
+	"github.com/mrchypark/rhiza/internal/types"
 	"github.com/mrchypark/rhiza/pkg/fencing"
+	"github.com/mrchypark/rhiza/pkg/network"
 	"github.com/mrchypark/rhiza/pkg/quepaxa"
 	"github.com/thanos-io/objstore"
 )
@@ -49,6 +51,7 @@ func TestResolveStartupRoleRequiresCanonicalPendingLearnerAssignment(t *testing.
 		"annotations":     object{fencingRootAnnotation: "root-uid", fencingCredentialAnnotation: "credential-uid", ownerAnnotation: operation},
 		"ownerReferences": []any{object{"kind": "StatefulSet", "name": "rhiza", "uid": "sts-uid", "controller": false}}}}
 	var child *Resource
+	var ordinarySTS, ordinarySecret object
 	api := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		switch r.URL.Path {
@@ -56,6 +59,10 @@ func TestResolveStartupRoleRequiresCanonicalPendingLearnerAssignment(t *testing.
 			_ = json.NewEncoder(w).Encode(pod)
 		case "/api/v1/namespaces/default/secrets/" + learnerName + "-credentials":
 			_ = json.NewEncoder(w).Encode(secret)
+		case "/api/v1/namespaces/default/secrets/ordinary-credentials":
+			_ = json.NewEncoder(w).Encode(ordinarySecret)
+		case "/apis/apps/v1/namespaces/default/statefulsets/rhiza":
+			_ = json.NewEncoder(w).Encode(ordinarySTS)
 		case "/apis/rhiza.mrchypark.dev/v1alpha1/namespaces/default/rhizaclusters":
 			_ = json.NewEncoder(w).Encode(object{"items": []any{root}})
 		case "/apis/rhiza.mrchypark.dev/v1alpha1/namespaces/default/rhizarecoveries/" + state.Intent.RecoveryName:
@@ -104,7 +111,32 @@ func TestResolveStartupRoleRequiresCanonicalPendingLearnerAssignment(t *testing.
 	ordinarySpec := asObject(ordinaryPod["spec"])
 	ordinarySpec["serviceAccountName"] = "default"
 	ordinaryContainer := asObject(list(ordinarySpec["containers"])[0])
-	ordinaryContainer["env"] = []any{object{"name": "RHIZA_CLUSTER_ID", "value": "source"}}
+	ordinaryContainer["name"] = "rhiza"
+	peerToken := "private-token-" + learnerName
+	ordinaryMembers, err := json.Marshal([]quepaxa.Member{{
+		ID: quepaxa.NodeID(learnerName),
+		PublicKey: quepaxa.PublicKey(network.PeerPublicKey(
+			types.ClusterID("source"), quepaxa.NodeID(learnerName), peerToken)),
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ordinaryPeerTokens, err := json.Marshal(map[string]string{learnerName: peerToken})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ordinaryEnv := []any{
+		object{"name": "RHIZA_CLUSTER_ID", "value": "source"},
+		object{"name": "RHIZA_CLUSTER_MEMBERS", "value": string(ordinaryMembers)},
+	}
+	ordinaryEnvFrom := []any{object{"secretRef": object{"name": "ordinary-credentials"}}}
+	ordinaryContainer["env"], ordinaryContainer["envFrom"] = ordinaryEnv, ordinaryEnvFrom
+	ordinarySTS = object{"metadata": object{"name": "rhiza", "uid": "sts-uid"}, "spec": object{"template": object{
+		"metadata": object{"annotations": object{fencingProtocolAnnotation: "1"}},
+		"spec":     object{"containers": []any{object{"name": "rhiza", "env": ordinaryEnv, "envFrom": ordinaryEnvFrom}}},
+	}}}
+	ordinarySecret = object{"metadata": object{"name": "ordinary-credentials", "namespace": "default", "uid": "ordinary-secret-uid"},
+		"data": object{"RHIZA_PEER_TOKENS": base64.StdEncoding.EncodeToString(ordinaryPeerTokens)}}
 	pod = ordinaryPod
 	if role, err := e.resolveStartupRole(ctx, "sts-uid", id); err != nil || role != fencing.StartupRoleVoterActive {
 		t.Fatalf("ordinary voter role=%q err=%v", role, err)

@@ -789,15 +789,16 @@ func TestPipelineCrossesLeaderScheduleWithPreferredReplicaDown(t *testing.T) {
 		slot    Slot
 	}
 	type workerResult struct {
-		worker      int
-		request     int
-		phase       string
-		slot        Slot
-		tipBefore   Slot
-		orderBefore []NodeID
-		elapsed     time.Duration
-		err         error
-		completed   []completedProposal
+		worker            int
+		request           int
+		phase             string
+		slot              Slot
+		tipBefore         Slot
+		orderBefore       []NodeID
+		elapsed           time.Duration
+		err               string
+		quorumUnavailable bool
+		completed         []completedProposal
 	}
 	jobs := make(chan int, 400)
 	results := make(chan workerResult, 8)
@@ -817,10 +818,13 @@ func TestPipelineCrossesLeaderScheduleWithPreferredReplicaDown(t *testing.T) {
 				}
 				started := time.Now()
 				proposalCtx, stop := context.WithTimeout(ctx, 30*time.Second)
-				last.slot, _, last.err = cores["n2"].Propose(proposalCtx, value)
+				slot, _, err := cores["n2"].Propose(proposalCtx, value)
+				last.slot = slot
 				stop()
 				last.elapsed = time.Since(started)
-				if last.err != nil {
+				if err != nil {
+					last.err = err.Error()
+					last.quorumUnavailable = errors.Is(err, ErrQuorumUnavailable)
 					results <- last
 					return
 				}
@@ -840,7 +844,7 @@ func TestPipelineCrossesLeaderScheduleWithPreferredReplicaDown(t *testing.T) {
 	for range 8 {
 		result := <-results
 		completed = append(completed, result.completed...)
-		if result.err != nil {
+		if result.err != "" {
 			failures = append(failures, result)
 		}
 	}
