@@ -459,6 +459,10 @@ func encoded(value any) []byte {
 	}
 	return data
 }
+func digestJSON(value any) string {
+	sum := sha256.Sum256(encoded(value))
+	return fmt.Sprintf("%x", sum)
+}
 func metadata(name string) obj { return obj{"name": name, "namespace": namespace} }
 func resource(api, kind, name string, spec obj) obj {
 	return obj{"apiVersion": api, "kind": kind, "metadata": metadata(name), "spec": spec}
