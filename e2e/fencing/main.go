@@ -1340,6 +1340,10 @@ func digest(value string) string {
 	return value
 }
 
+func imageConfigMatches(criConfigID, builtConfigID string) bool {
+	return criConfigID != "" && builtConfigID != "" && digest(criConfigID) == digest(builtConfigID)
+}
+
 func immutableDigest(value string) (string, error) {
 	d := digest(value)
 	if !strings.HasPrefix(d, "sha256:") || len(d) != len("sha256:")+64 {
@@ -1590,15 +1594,20 @@ func verifyImages(ctx context.Context, out, phase string, current ...operator.Fe
 		cri, chain, resolveErr := imageConfig(ctx, podImage, platform)
 		configID := text(nested(cri, "status", "id"))
 		builtID := text(built[0]["Id"])
+		builtCRI, builtChain, builtResolveErr := imageConfig(ctx, builtID, platform)
+		builtConfigID := text(nested(builtCRI, "status", "id"))
 		repos, _ := nested(cri, "status", "repoDigests").([]any)
-		evidence = append(evidence, obj{"pod": nested(pod, "metadata", "name"), "uid": nested(pod, "metadata", "uid"), "role": role, "podImageID": podImage, "container": publicRuntime(runtime), "resolution": chain, "builtConfigID": builtID, "criConfigID": configID, "criRepoDigests": repos})
+		evidence = append(evidence, obj{"pod": nested(pod, "metadata", "name"), "uid": nested(pod, "metadata", "uid"), "role": role, "podImageID": podImage, "container": publicRuntime(runtime), "resolution": chain, "builtImageID": builtID, "builtResolution": builtChain, "builtConfigID": builtConfigID, "criConfigID": configID, "criRepoDigests": repos})
 		if err := os.WriteFile(filepath.Join(out, phase+"-image-evidence.json"), encoded(evidence), 0600); err != nil {
 			return err
 		}
 		if resolveErr != nil {
 			return resolveErr
 		}
-		if configID == "" || digest(configID) != digest(builtID) {
+		if builtResolveErr != nil {
+			return builtResolveErr
+		}
+		if !imageConfigMatches(configID, builtConfigID) {
 			return fmt.Errorf("%s running image configuration differs from built image", role)
 		}
 		counts[role]++
