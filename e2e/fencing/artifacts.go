@@ -578,15 +578,43 @@ var voterStartupPrefixes = []struct{ prefix, category string }{
 var voterStartupStagePrefixes = []struct{ prefix, stageCode string }{
 	{"fencing: pending-removal startup requires an explicit nonvoting learner configuration", "startup_grant/role_rejected"},
 	{"fencing: bind receipt", "wal_binding/receipt_rejected"},
+	{"fencing: incomplete mutation producer binding", "wal_binding/producer_incomplete"},
 	{"fencing: bind role differs from startup grant", "wal_binding/role_mismatch"},
 	{"fencing: WAL identity cannot change", "wal_binding/identity_changed"},
 	{"fencing: authenticated WAL binding differs", "wal_binding/identity_mismatch"},
 	{"fencing: source producer binding changed", "wal_binding/producer_changed"},
+	{"fencing: runtime enrollment identity differs", "wal_binding/runtime_identity_mismatch"},
+	{"fencing: runtime enrollment is incomplete", "wal_binding/runtime_incomplete"},
+	{"fencing: runtime cgroup scope digest is invalid", "wal_binding/runtime_scope_invalid"},
 	{"supervised WAL binding requires an authenticated fencing session", "wal_binding/session_missing"},
 	{"fencing: supervisor returned HTTP ", "supervisor_call/rejected"},
+	{"fencing: authority temporarily unavailable", "supervisor_call/unavailable"},
+	{"fencing: evidence pending", "supervisor_call/pending"},
+	{"fencing: incarnation terminally fenced", "supervisor_call/closed"},
+	{"fencing: supervisor response too large", "supervisor_call/response_too_large"},
+	{"fencing: trailing supervisor response", "supervisor_call/response_trailing_data"},
+	{"voter state continuity cannot be established: invalid local identity", "voter_identity/local_identity_invalid"},
+	{"voter state continuity cannot be established: local identity or WAL manifest", "voter_identity/local_state_invalid"},
+	{"voter state continuity cannot be established: authority-assigned restart", "voter_identity/assigned_restart_invalid"},
+	{"voter state continuity cannot be established: WAL identity differs", "voter_identity/wal_identity_mismatch"},
+	{"voter state continuity cannot be established: bound WAL has no local identity", "voter_identity/local_identity_missing"},
+	{"voter state continuity cannot be established: voter configuration changed", "voter_identity/configuration_mismatch"},
+	{"voter state continuity cannot be established: registered voter requires its shared object store", "voter_identity/object_store_missing"},
+	{"voter state continuity cannot be established: membership cannot be changed during startup", "voter_identity/membership_changed"},
+	{"voter state continuity cannot be established: registered WAL binding is absent", "voter_identity/wal_binding_missing"},
+	{"voter state continuity cannot be established: immutable remote registration is missing", "voter_identity/remote_registration_missing"},
+	{"voter state continuity cannot be established: enrollment requires the original WAL", "voter_identity/original_wal_missing"},
+	{"voter state continuity cannot be established: immutable voter registration differs", "voter_identity/registration_mismatch"},
+	{"voter state continuity cannot be established: invalid remote registration", "voter_identity/remote_registration_invalid"},
+	{"voter state continuity cannot be established", "voter_identity/state_lost"},
+	{"existing voter requires offline enrollment", "voter_identity/offline_enrollment_required"},
+	{"read voter registration:", "voter_identity/remote_read_failed"},
+	{"register voter:", "voter_identity/remote_write_failed"},
+	{"voter registration requires conditional object writes", "voter_identity/conditional_write_unsupported"},
+	{"fencing: pending learner identity registration is unavailable", "voter_identity/learner_registration_unavailable"},
+	{"load shared decision archive:", "archive/load_failed"},
 	{"open WAL:", "wal/open_failed"},
 	{"open object store:", "object_store/open_failed"},
-	{"register voter:", "voter_registration/failed"},
 	{"prepare source retry directory:", "source_mutation/retry_directory_failed"},
 	{"open source mutation client:", "source_mutation/client_open_failed"},
 	{"supervised source mutations currently require GCS", "source_mutation/provider_unsupported"},
@@ -597,6 +625,10 @@ var voterStartupStagePrefixes = []struct{ prefix, stageCode string }{
 	{"load canonical archive genesis HEAD:", "archive_genesis/head_load_failed"},
 	{"fencing: archive genesis", "archive_genesis/validation_failed"},
 	{"fencing: canonical archive", "archive_genesis/validation_failed"},
+	{"fencing: canonical empty recovery", "archive_genesis/empty_recovery_validation_failed"},
+	{"fencing: verified archive fork", "archive_genesis/fork_validation_failed"},
+	{"fencing: invalid archive fork lineage", "archive_genesis/fork_lineage_invalid"},
+	{"fencing: archive fork", "archive_genesis/fork_validation_failed"},
 	{"acquire lock:", "node_open/lock_failed"},
 	{"load checkpoint manifest:", "recovery/checkpoint_manifest_failed"},
 	{"pin startup recovery evidence:", "recovery/evidence_pin_failed"},
@@ -824,7 +856,7 @@ func readVoterLog(dir, name string, startupFailure bool) voterLogView {
 		view.Startup = []string{"unknown_startup_error"}
 	}
 	if startupFailure && len(view.StartupStages) == 0 && len(bytes.TrimSpace(data)) != 0 {
-		view.StartupStages = []string{"node_open/unknown"}
+		view.StartupStages = []string{"node_open/outer_wrapper_unparsed"}
 	}
 	return view
 }
@@ -859,6 +891,7 @@ func classifyVoterStartupStages(data []byte) ([]string, bool) {
 			continue
 		}
 		errText := strings.TrimPrefix(line[20:], "open rhiza: ")
+		unknownStage := "node_open/inner_error_unknown"
 		if strings.HasPrefix(errText, "connect fencing startup gate: ") {
 			errText = strings.TrimPrefix(errText, "connect fencing startup gate: ")
 			stageCode := "startup_grant/connect_failed"
@@ -870,6 +903,31 @@ func classifyVoterStartupStages(data []byte) ([]string, bool) {
 			case strings.HasPrefix(errText, "fencing: supervisor returned HTTP "):
 				stageCode = "startup_grant/rejected"
 			}
+			if !seen[stageCode] {
+				seen[stageCode] = true
+				if len(stages) < maxVoterStartupStages {
+					stages = append(stages, stageCode)
+				} else {
+					truncated = true
+				}
+			}
+			continue
+		}
+		if strings.HasPrefix(errText, "ensure voter identity: ") {
+			errText = strings.TrimPrefix(errText, "ensure voter identity: ")
+			unknownStage = "voter_identity/guard_unknown"
+		}
+		if strings.HasPrefix(errText, "load voter identity: ") {
+			errText = strings.TrimPrefix(errText, "load voter identity: ")
+			unknownStage = "voter_identity/load_unknown"
+		}
+		if strings.HasPrefix(errText, "load shared decision archive: ") {
+			errText = strings.TrimPrefix(errText, "load shared decision archive: ")
+			unknownStage = "archive/guard_unknown"
+		}
+		if strings.HasPrefix(errText, "voter state continuity cannot be established: voter ") &&
+			strings.HasSuffix(errText, " is registered but its local identity is absent") {
+			const stageCode = "voter_identity/registration_without_local_identity"
 			if !seen[stageCode] {
 				seen[stageCode] = true
 				if len(stages) < maxVoterStartupStages {
@@ -900,10 +958,10 @@ func classifyVoterStartupStages(data []byte) ([]string, bool) {
 		if !matched {
 			// A valid outer wrapper with an unknown nested error is useful to
 			// distinguish from a pre-Node.Open supervisor registration failure.
-			if !seen["node_open/unknown"] {
-				seen["node_open/unknown"] = true
+			if !seen[unknownStage] {
+				seen[unknownStage] = true
 				if len(stages) < maxVoterStartupStages {
-					stages = append(stages, "node_open/unknown")
+					stages = append(stages, unknownStage)
 				} else {
 					truncated = true
 				}

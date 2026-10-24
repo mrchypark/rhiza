@@ -309,7 +309,7 @@ func (n *Node) open(ctx context.Context, enroll bool) (err error) {
 	n.lock = lock
 	localVoter, err := loadVoterIdentity(n.config)
 	if err != nil {
-		return err
+		return fmt.Errorf("load voter identity: %w", err)
 	}
 	if n.config.Local && localVoter.identity != nil {
 		return fmt.Errorf("%w: registered voter cannot be reopened as standalone Local data", ErrVoterStateLost)
@@ -468,7 +468,7 @@ func (n *Node) open(ctx context.Context, enroll bool) (err error) {
 		}
 		assignedRestart := n.fenceSession != nil && n.fenceSession.StartupRole() == fencing.StartupRoleVoterActive && n.fenceSession.Identity().AssignmentID != ""
 		if err := ensureVoterIdentityWithHooks(ctx, n.config, runtimeBucket, n.wal, localVoter, enroll, beforeWrite, pendingIdentityWrite, assignedRestart); err != nil {
-			return err
+			return fmt.Errorf("ensure voter identity: %w", err)
 		}
 		if n.fenceSession != nil && n.fenceSession.Identity().WALIdentity == "" {
 			return fmt.Errorf("supervised fencing requires registered voter WAL identity")
@@ -487,7 +487,7 @@ func (n *Node) open(ctx context.Context, enroll bool) (err error) {
 			return fmt.Errorf("multi-node shared archive requires conditional object writes")
 		}
 		if err := loadNodeArchive(ctx, n.archive, n.config.ObjStoreDurability, supervised); err != nil {
-			return err
+			return fmt.Errorf("load shared decision archive: %w", err)
 		}
 	}
 	if !objectStoreConfigured && !n.config.Local {
