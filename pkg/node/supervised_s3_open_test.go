@@ -98,7 +98,16 @@ func TestNodeOpenCooperativeS3WithBeforeAckProfile(t *testing.T) {
 		PodUID:          "kind-rhiza-0-pod-uid",
 		RunID:           "kind-rhiza-0-run",
 	}
-	socket := filepath.Join(t.TempDir(), "fence.sock")
+	socketDir, err := os.MkdirTemp("", "rhiza-s3-open-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		if err := os.RemoveAll(socketDir); err != nil {
+			t.Errorf("remove startup socket directory: %v", err)
+		}
+	})
+	socket := filepath.Join(socketDir, "fence.sock")
 	var startupCalls, bindCalls atomic.Int32
 	startCooperativeOpenSupervisor(t, socket, identity, &startupCalls, &bindCalls)
 	t.Setenv("RHIZA_FENCE_SOCKET", socket)
