@@ -519,6 +519,11 @@ jobs:
           test -x "$timeout_bin"
           "$timeout_bin" --version | grep -Fq 'GNU coreutils'
           printf '%s\n' "$install_dir/usr/bin" >>"$GITHUB_PATH"
+      - name: Diagnose pipeline leader-schedule regression
+        timeout-minutes: 3
+        env:
+          CGO_ENABLED: "0"
+        run: go test -v ./pkg/quepaxa -run '^TestPipelineCrossesLeaderScheduleWithPreferredReplicaDown$' -count=20 -failfast -timeout=90s
       - name: Test
         env:
           CGO_ENABLED: 0
