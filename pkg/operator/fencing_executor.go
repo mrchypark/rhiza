@@ -106,6 +106,13 @@ type fenceLedger struct {
 
 func (e *FencingExecutor) controller() *Controller { return &Controller{Kube: e.Kube} }
 
+func registerStageError(stage string, err error) error {
+	if err == nil {
+		return nil
+	}
+	return fmt.Errorf("fencing: register %s rejected: %w", stage, err)
+}
+
 func (e *FencingExecutor) ledgerPath(uid, source string) string {
 	return e.controller().corePath("configmaps", "rhiza-fence-ledger-"+hashJSON([]string{uid, source})[:40])
 }
@@ -409,7 +416,7 @@ func (e *FencingExecutor) handle(w http.ResponseWriter, r *http.Request) {
 	if message.Action == "register" {
 		// Persist the immutable profile claim before enrollment or any admission
 		// side effect. A failed enrollment leaves a required, retryable root.
-		err = e.initializeRoot(r.Context(), uid, message.Identity.SourceClusterID)
+		err = registerStageError("root-init", e.initializeRoot(r.Context(), uid, message.Identity.SourceClusterID))
 	}
 	startupGrant := fencing.StartupGrant{Identity: message.Identity, Role: fencing.StartupRoleVoterActive}
 	if startupGrant.Identity.PodName == "" {
@@ -417,6 +424,7 @@ func (e *FencingExecutor) handle(w http.ResponseWriter, r *http.Request) {
 	}
 	if err == nil && message.Action == "register" {
 		startupGrant, err = e.resolveStartupGrant(r.Context(), uid, message.Identity)
+		err = registerStageError("startup-grant", err)
 	}
 	var enrolled *fencing.RuntimeBinding
 	if err == nil && message.Action == "register" && e.RuntimeAgent != nil {
@@ -518,12 +526,12 @@ func (e *FencingExecutor) handle(w http.ResponseWriter, r *http.Request) {
 					}
 					if enrolled != nil {
 						l.RequireRuntimeBinding = true
-						return l.RegisterEnrolledWithRole(startupGrant.Identity, *enrolled, startupGrant.Role)
+						return registerStageError("ledger-register", l.RegisterEnrolledWithRole(startupGrant.Identity, *enrolled, startupGrant.Role))
 					}
 					if l.RequireRuntimeBinding {
 						return fmt.Errorf("fencing: runtime agent is required")
 					}
-					return l.RegisterWithRole(startupGrant.Identity, startupGrant.Role)
+					return registerStageError("ledger-register", l.RegisterWithRole(startupGrant.Identity, startupGrant.Role))
 				case "drain":
 					if message.Drain == nil || message.Drain.Request.Identity != message.Identity {
 						return fmt.Errorf("fencing: drain binding differs")
@@ -548,8 +556,9 @@ func (e *FencingExecutor) handle(w http.ResponseWriter, r *http.Request) {
 					err = fmt.Errorf("fencing: required archive genesis registration lacks runtime binding")
 				} else {
 					_, err = e.reserveMutationProducer(r.Context(), *enrolled)
+					err = registerStageError("producer-reserve", err)
 					if err == nil {
-						err = e.claimArchiveScopeForRegistration(r.Context(), uid, startupGrant.Identity, *enrolled)
+						err = registerStageError("archive-scope", e.claimArchiveScopeForRegistration(r.Context(), uid, startupGrant.Identity, *enrolled))
 					}
 				}
 			}

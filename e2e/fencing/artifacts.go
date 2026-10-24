@@ -617,6 +617,22 @@ var supervisorRejectionPrefixes = []struct {
 	message string
 	code    string
 }{
+	{"fencing: standalone learner Pod incarnation changed", "standalone_learner_pod_incarnation_changed"},
+	{"fencing: standalone learner workload binding differs", "standalone_learner_workload_binding_mismatch"},
+	{"fencing: standalone learner incarnation is not current in canonical history", "standalone_learner_history_not_current"},
+	{"fencing: standalone learner incarnation is being replaced", "standalone_learner_being_replaced"},
+	{"fencing: static startup Pod incarnation changed", "static_startup_pod_incarnation_changed"},
+	{"fencing: static startup root binding", "static_startup_root_binding_rejected"},
+	{"fencing: static startup StatefulSet", "static_startup_statefulset_binding_rejected"},
+	{"fencing: static startup template binding", "static_startup_template_binding_rejected"},
+	{"fencing: static startup template environment", "static_startup_environment_rejected"},
+	{"fencing: static startup Pod environment", "static_startup_environment_rejected"},
+	{"fencing: static startup Pod differs", "static_startup_environment_rejected"},
+	{"fencing: static startup source cluster", "static_startup_source_mismatch"},
+	{"fencing: static startup peer token", "static_startup_credential_rejected"},
+	{"fencing: static startup token ConfigMap", "static_startup_credential_rejected"},
+	{"fencing: static startup membership", "static_startup_membership_rejected"},
+	{"fencing: static startup Pod container", "static_startup_container_rejected"},
 	{"fencing: startup physical identity is incomplete", "startup_physical_identity_incomplete"},
 	{"fencing: startup Pod incarnation changed", "startup_pod_incarnation_changed"},
 	{"fencing: startup root binding is ambiguous", "startup_root_ambiguous"},
@@ -659,6 +675,17 @@ var supervisorRejectionPrefixes = []struct {
 	{"fencing: runtime agent is required for mutation-journal registration", "registration_runtime_agent_required"},
 	{"fencing: runtime agent is required", "registration_runtime_agent_required"},
 	{"fencing: required archive genesis registration lacks runtime binding", "registration_archive_runtime_binding_missing"},
+}
+
+var registerStageRejectionPrefixes = []struct {
+	message string
+	code    string
+}{
+	{"fencing: register root-init rejected:", "register_root_init_rejected"},
+	{"fencing: register startup-grant rejected:", "register_startup_grant_rejected"},
+	{"fencing: register ledger-register rejected:", "register_ledger_register_rejected"},
+	{"fencing: register producer-reserve rejected:", "register_producer_reserve_rejected"},
+	{"fencing: register archive-scope rejected:", "register_archive_scope_rejected"},
 }
 
 var authenticationErrorPrefixes = []struct {
@@ -713,8 +740,11 @@ var runtimeEnrollmentErrorPrefixes = []struct {
 }
 
 var allowedSupervisorRejectionCodes = func() map[string]struct{} {
-	codes := make(map[string]struct{}, len(supervisorRejectionPrefixes)+len(allowedRuntimeAgentDiagnosticPairs)+16)
+	codes := make(map[string]struct{}, len(supervisorRejectionPrefixes)+len(registerStageRejectionPrefixes)+len(allowedRuntimeAgentDiagnosticPairs)+16)
 	for _, item := range supervisorRejectionPrefixes {
+		codes[item.code] = struct{}{}
+	}
+	for _, item := range registerStageRejectionPrefixes {
 		codes[item.code] = struct{}{}
 	}
 	for pair := range allowedRuntimeAgentDiagnosticPairs {
@@ -1583,6 +1613,17 @@ func classifySupervisorRejectionCode(stage, message string) string {
 			}
 		}
 		return "authentication_guard_unknown"
+	}
+	for _, item := range registerStageRejectionPrefixes {
+		if strings.HasPrefix(message, item.message) {
+			reason := strings.TrimSpace(strings.TrimPrefix(message, item.message))
+			for _, known := range supervisorRejectionPrefixes {
+				if strings.HasPrefix(reason, known.message) {
+					return known.code
+				}
+			}
+			return item.code
+		}
 	}
 	for _, item := range supervisorRejectionPrefixes {
 		if strings.HasPrefix(message, item.message) {

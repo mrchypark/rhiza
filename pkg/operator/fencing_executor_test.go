@@ -1,13 +1,16 @@
 package operator
 
 import (
+	"bytes"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
 
@@ -84,6 +87,45 @@ func TestCooperativeLedgerCASRegistrationRacesClosure(t *testing.T) {
 	}
 	if err := state.Ledger.Register(fencing.Identity{SourceClusterID: "source", NodeID: "n2", PodUID: "p2", RunID: "r2"}); err != fencing.ErrClosed {
 		t.Fatalf("restart gate reopened: %v", err)
+	}
+}
+
+func TestRegisterStageErrorPreservesCause(t *testing.T) {
+	cause := fmt.Errorf("private backend failure: %w", fencing.ErrPending)
+	for _, stage := range []string{"root-init", "startup-grant", "ledger-register", "producer-reserve", "archive-scope"} {
+		t.Run(stage, func(t *testing.T) {
+			err := registerStageError(stage, cause)
+			if !errors.Is(err, cause) {
+				t.Fatalf("stage wrapper lost cause: %v", err)
+			}
+			if !errors.Is(err, fencing.ErrPending) {
+				t.Fatalf("stage wrapper lost sentinel semantics: %v", err)
+			}
+			if !strings.HasPrefix(err.Error(), "fencing: register "+stage+" rejected:") {
+				t.Fatalf("stage wrapper has no fixed diagnostic prefix: %v", err)
+			}
+		})
+	}
+}
+
+func TestRegisterRootInitRejectionEmitsStageDiagnostic(t *testing.T) {
+	f := newSupervisorRegistrationFixture(t, false)
+	ctx := t.Context()
+	if err := f.e.initializeRoot(ctx, "sts-uid", f.identity.SourceClusterID); err != nil {
+		t.Fatal(err)
+	}
+	f.e.RequireMutationJournal = true
+	client := fencing.AuthorityClient{URL: f.server.URL + "/v1/supervisor", TokenFile: f.token, Client: f.server.Client()}
+
+	var captured bytes.Buffer
+	previous := log.Writer()
+	log.SetOutput(&captured)
+	t.Cleanup(func() { log.SetOutput(previous) })
+	if err := client.Register(ctx, f.identity); err == nil {
+		t.Fatal("required executor accepted an existing cooperative root")
+	}
+	if !strings.Contains(captured.String(), "fencing supervisor transition rejected: action=register podUID=pod-0 error=fencing: register root-init rejected:") {
+		t.Fatalf("actual handler rejection omitted the fixed register diagnostic: %s", captured.String())
 	}
 }
 
