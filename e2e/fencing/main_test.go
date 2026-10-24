@@ -321,43 +321,81 @@ func TestImmutableImageResolutionDescriptors(t *testing.T) {
 	}
 	manifest := `{"digest":"` + config + `","size":708,"mediaType":"application/vnd.oci.image.manifest.v1+json","annotations":{"tag":"host"}}`
 	alias := strings.Replace(manifest, `"host"`, `"operator"`, 1)
+	platformAlias := strings.Replace(manifest, `,"annotations"`, `,"platform":{"os":"linux","architecture":"amd64"},"annotations"`, 1)
+	platformAliasOtherTag := strings.Replace(platformAlias, `"host"`, `"operator"`, 1)
 	index := func(second string) string { return `{"manifests":[` + manifest + `,` + second + `]}` }
-	attestation := `{"digest":"sha256:` + strings.Repeat("c", 64) + `","size":600,"mediaType":"application/vnd.oci.image.manifest.v1+json","platform":{"os":"unknown","architecture":"unknown"},"annotations":{"vnd.docker.reference.type":"attestation-manifest","vnd.docker.reference.digest":"` + config + `"}}`
+	amd64 := `sha256:` + strings.Repeat("b", 64)
+	arm64 := `sha256:` + strings.Repeat("c", 64)
+	attestationDigest := `sha256:` + strings.Repeat("d", 64)
+	platformManifest := func(digest string, size int, os, architecture string, variants ...string) string {
+		variant := ""
+		if len(variants) > 0 {
+			variant = fmt.Sprintf(`,"variant":%q`, variants[0])
+		}
+		return fmt.Sprintf(`{"digest":%q,"size":%d,"mediaType":"application/vnd.oci.image.manifest.v1+json","platform":{"os":%q,"architecture":%q%s}}`, digest, size, os, architecture, variant)
+	}
+	platformIndex := func(entries ...string) string { return `{"manifests":[` + strings.Join(entries, ",") + `]}` }
+	linuxAMD64 := imagePlatform{OS: "linux", Architecture: "amd64"}
+	linuxARM64 := imagePlatform{OS: "linux", Architecture: "arm64"}
+	linuxARMv6 := imagePlatform{OS: "linux", Architecture: "arm", Variant: "v6"}
+	linuxARMv7 := imagePlatform{OS: "linux", Architecture: "arm", Variant: "v7"}
+	attestationDescriptor := `{"digest":"` + attestationDigest + `","size":600,"mediaType":"application/vnd.oci.image.manifest.v1+json","platform":{"os":"unknown","architecture":"unknown"},"annotations":{"vnd.docker.reference.type":"attestation-manifest","vnd.docker.reference.digest":"` + config + `"}}`
+	runnableAMD64 := platformManifest(config, 708, "linux", "amd64")
+	attestationIndex := func(descriptor string) string { return platformIndex(runnableAMD64, descriptor) }
 	for _, tc := range []struct {
-		body  string
-		valid bool
+		name     string
+		body     string
+		platform imagePlatform
+		want     string
+		valid    bool
 	}{
-		{`{"config":{"digest":"` + config + `"}}`, true},
-		{`{"manifests":[{"digest":"` + config + `"}]}`, true},
-		{`{"manifests":[{"digest":"` + config + `"},{"digest":"` + config + `"}]}`, false},
-		{index(alias), true},
-		{index(attestation), true},
-		{`{"manifests":[` + attestation + `,` + manifest + `]}`, true},
-		{`{"manifests":[` + attestation + `]}`, false},
-		{index(strings.Replace(attestation, `"attestation-manifest"`, `"other"`, 1)), false},
-		{index(strings.Replace(attestation, `"os":"unknown"`, `"os":"linux"`, 1)), false},
-		{index(strings.Replace(attestation, "application/vnd.oci.image.manifest.v1+json", "application/vnd.oci.image.index.v1+json", 1)), false},
-		{index(strings.Replace(attestation, config, "sha256:"+strings.Repeat("b", 64), 1)), false},
-		{index(strings.Replace(attestation, `"size":600`, `"size":0`, 1)), false},
-		{index(strings.Replace(attestation, `"vnd.docker.reference.type":"attestation-manifest",`, ``, 1)), false},
-		{index(strings.Replace(attestation, "sha256:"+strings.Repeat("c", 64), "sha256:invalid", 1)), false},
-		{`{"manifests":[` + manifest + `,` + attestation + `,` + strings.Replace(alias, config, "sha256:"+strings.Repeat("b", 64), 1) + `]}`, false},
-		{index(strings.Replace(alias, config, "sha256:"+strings.Repeat("b", 64), 1)), false},
-		{index(strings.Replace(alias, `"size":708`, `"size":709`, 1)), false},
-		{index(strings.Replace(alias, "application/vnd.oci.image.manifest.v1+json", "application/vnd.docker.distribution.manifest.v2+json", 1)), false},
-		{index(strings.Replace(alias, `"size":708`, `"size":708,"platform":{"architecture":"arm64","os":"linux"}`, 1)), false},
-		{`{"config":{"digest":"image:local"}}`, false},
-		{`{}`, false},
+		{name: "config manifest", body: `{"config":{"digest":"` + config + `"}}`, want: config, valid: true},
+		{name: "single child without platform is rejected", body: `{"manifests":[{"digest":"` + config + `"}]}`, valid: false},
+		{name: "duplicate incomplete children", body: `{"manifests":[{"digest":"` + config + `"},{"digest":"` + config + `"}]}`, valid: false},
+		{name: "duplicate tag aliases without platform are rejected", body: index(alias), valid: false},
+		{name: "duplicate tag aliases with exact platform", body: platformIndex(platformAlias, platformAliasOtherTag), platform: linuxAMD64, want: config, valid: true},
+		{name: "conflicting aliases without platform", body: index(strings.Replace(alias, config, amd64, 1)), valid: false},
+		{name: "alias size conflict", body: index(strings.Replace(alias, `"size":708`, `"size":709`, 1)), valid: false},
+		{name: "alias media type conflict", body: index(strings.Replace(alias, "application/vnd.oci.image.manifest.v1+json", "application/vnd.docker.distribution.manifest.v2+json", 1)), valid: false},
+		{name: "nonmatching platform", body: index(strings.Replace(alias, `"size":708`, `"size":708,"platform":{"architecture":"arm64","os":"linux"}`, 1)), valid: false},
+		{name: "valid build attestation", body: attestationIndex(attestationDescriptor), platform: linuxAMD64, want: config, valid: true},
+		{name: "attestation without runnable descriptor", body: platformIndex(attestationDescriptor), platform: linuxAMD64, valid: false},
+		{name: "rejects wrong attestation type", body: attestationIndex(strings.Replace(attestationDescriptor, `"attestation-manifest"`, `"other"`, 1)), platform: linuxAMD64, valid: false},
+		{name: "rejects malformed attestation platform", body: attestationIndex(strings.Replace(attestationDescriptor, `"os":"unknown"`, `"os":"linux"`, 1)), platform: linuxAMD64, valid: false},
+		{name: "rejects malformed attestation media type", body: attestationIndex(strings.Replace(attestationDescriptor, "application/vnd.oci.image.manifest.v1+json", "application/vnd.oci.image.index.v1+json", 1)), platform: linuxAMD64, valid: false},
+		{name: "rejects attestation for another image", body: attestationIndex(strings.Replace(attestationDescriptor, config, arm64, 1)), platform: linuxAMD64, valid: false},
+		{name: "rejects zero-sized attestation", body: attestationIndex(strings.Replace(attestationDescriptor, `"size":600`, `"size":0`, 1)), platform: linuxAMD64, valid: false},
+		{name: "rejects missing attestation type", body: attestationIndex(strings.Replace(attestationDescriptor, `"vnd.docker.reference.type":"attestation-manifest",`, ``, 1)), platform: linuxAMD64, valid: false},
+		{name: "rejects invalid attestation digest", body: attestationIndex(strings.Replace(attestationDescriptor, attestationDigest, "sha256:invalid", 1)), platform: linuxAMD64, valid: false},
+		{name: "selects exact host platform among other descriptors", body: platformIndex(platformManifest(arm64, 101, "linux", "arm64"), platformManifest(amd64, 202, "linux", "amd64")), platform: linuxAMD64, want: amd64, valid: true},
+		{name: "selects exact host platform independent of descriptor order", body: platformIndex(platformManifest(arm64, 303, "linux", "arm64"), platformManifest(amd64, 202, "linux", "amd64")), platform: linuxAMD64, want: amd64, valid: true},
+		{name: "selects exact arm64 platform without inferred variant", body: platformIndex(platformManifest(arm64, 303, "linux", "arm64")), platform: linuxARM64, want: arm64, valid: true},
+		{name: "rejects unreported arm64 variant", body: platformIndex(platformManifest(arm64, 303, "linux", "arm64", "v8")), platform: linuxARM64, valid: false},
+		{name: "selects exact arm v6 variant", body: platformIndex(platformManifest(arm64, 303, "linux", "arm", "v7"), platformManifest(amd64, 202, "linux", "arm", "v6")), platform: linuxARMv6, want: amd64, valid: true},
+		{name: "rejects arm v7 variant for v6 host", body: platformIndex(platformManifest(arm64, 303, "linux", "arm", "v7")), platform: linuxARMv6, valid: false},
+		{name: "selects exact arm v7 variant", body: platformIndex(platformManifest(arm64, 303, "linux", "arm", "v6"), platformManifest(amd64, 202, "linux", "arm", "v7")), platform: linuxARMv7, want: amd64, valid: true},
+		{name: "rejects arm v6 variant for v7 host", body: platformIndex(platformManifest(arm64, 303, "linux", "arm", "v6")), platform: linuxARMv7, valid: false},
+		{name: "rejects missing host platform", body: platformIndex(platformManifest(arm64, 303, "linux", "arm64")), platform: linuxAMD64, valid: false},
+		{name: "rejects index child with missing platform", body: platformIndex(`{"digest":` + fmt.Sprintf("%q", amd64) + `,"size":202,"mediaType":"application/vnd.oci.image.manifest.v1+json"}`), platform: linuxAMD64, valid: false},
+		{name: "rejects multiple host platform matches", body: platformIndex(platformManifest(amd64, 202, "linux", "amd64"), platformManifest(attestationDigest, 101, "linux", "amd64")), platform: linuxAMD64, valid: false},
+		{name: "invalid mutable config digest", body: `{"config":{"digest":"image:local"}}`, valid: false},
+		{name: "empty descriptor", body: `{}`, valid: false},
 	} {
-		body := []byte(tc.body)
-		d := fmt.Sprintf("sha256:%x", sha256.Sum256(body))
-		got, err := imageDescriptor(d, body)
-		if tc.valid && (err != nil || got != config) || !tc.valid && err == nil {
-			t.Fatalf("descriptor %s: %q, %v", tc.body, got, err)
-		}
-		if _, err := imageDescriptor(config, body); err == nil {
-			t.Fatal("accepted content that did not hash to the requested digest")
-		}
+		t.Run(tc.name, func(t *testing.T) {
+			platform := tc.platform
+			if platform.OS == "" {
+				platform = linuxAMD64
+			}
+			body := []byte(tc.body)
+			d := fmt.Sprintf("sha256:%x", sha256.Sum256(body))
+			got, err := imageDescriptor(d, body, platform)
+			if tc.valid && (err != nil || got != tc.want) || !tc.valid && err == nil {
+				t.Fatalf("descriptor %s: %q, %v", tc.body, got, err)
+			}
+			if _, err := imageDescriptor(config, body, platform); err == nil {
+				t.Fatal("accepted content that did not hash to the requested digest")
+			}
+		})
 	}
 }
 
@@ -860,12 +898,14 @@ func TestDocker29ImageConfigGraph(t *testing.T) {
 			}
 			manifest := store(`{"config":{"digest":"` + config + `"}}`)
 			runnable := `{"digest":"` + manifest + `","size":866,"mediaType":"application/vnd.oci.image.manifest.v1+json","platform":{"os":"linux","architecture":"amd64"}}`
+			linuxAMD64 := imagePlatform{OS: "linux", Architecture: "amd64"}
 			attestation := `{"digest":"sha256:531ca7d0ffd5ffce13835fcef138be1e7794b9a9931aef3bb234336a56dad845","size":564,"mediaType":"application/vnd.oci.image.manifest.v1+json","platform":{"os":"unknown","architecture":"unknown"},"annotations":{"vnd.docker.reference.type":"attestation-manifest","vnd.docker.reference.digest":"` + manifest + `"}}`
 			if tc.ambiguous {
-				attestation = strings.Replace(runnable, "amd64", "arm64", 1)
+				otherManifest := store(`{"config":{"digest":"` + foreign + `"}}`)
+				attestation = `{"digest":"` + otherManifest + `","size":866,"mediaType":"application/vnd.oci.image.manifest.v1+json","platform":{"os":"linux","architecture":"amd64"}}`
 			}
 			builtID := store(`{"manifests":[` + runnable + `,` + attestation + `]}`)
-			alias := `{"digest":"` + builtID + `","size":855,"mediaType":"application/vnd.oci.image.index.v1+json"}`
+			alias := `{"digest":"` + builtID + `","size":855,"mediaType":"application/vnd.oci.image.index.v1+json","platform":{"os":"linux","architecture":"amd64"}}`
 			importID := store(`{"manifests":[` + alias + `,` + alias + `]}`)
 			if tc.corrupt {
 				content[builtID] = []byte(`{}`)
@@ -889,24 +929,24 @@ func TestDocker29ImageConfigGraph(t *testing.T) {
 				}
 				return nil, fmt.Errorf("content unavailable")
 			}
-			running, _, runningErr := resolveImageConfig(context.Background(), "docker.io/library/import-2026-10-26@"+importID, run)
+			running, _, runningErr := resolveImageConfig(context.Background(), "docker.io/library/import-2026-10-26@"+importID, linuxAMD64, run)
 			if tc.foreign {
 				builtID = store(`{"config":{"digest":"` + foreign + `"}}`)
 			}
-			built, _, builtErr := resolveImageConfig(context.Background(), builtID, run)
+			built, _, builtErr := resolveImageConfig(context.Background(), builtID, linuxAMD64, run)
 			matches := runningErr == nil && builtErr == nil && nested(running, "status", "id") == nested(built, "status", "id")
 			if matches != (!tc.foreign && !tc.ambiguous && !tc.corrupt && !tc.missing) {
 				t.Fatalf("matches=%v; running=%v (%v), built=%v (%v)", matches, running, runningErr, built, builtErr)
 			}
 			if matches {
 				for _, reference := range []string{manifest, config} {
-					cri, _, err := resolveImageConfig(context.Background(), reference, run)
+					cri, _, err := resolveImageConfig(context.Background(), reference, linuxAMD64, run)
 					if err != nil || nested(cri, "status", "id") != config {
 						t.Fatalf("manifest/config ID %s: %v, %v", reference, cri, err)
 					}
 				}
 				for _, reference := range []string{"rhiza-fencing-host:local", "sha256:" + strings.Repeat("d", 64)} {
-					if _, _, err := resolveImageConfig(context.Background(), reference, run); err == nil {
+					if _, _, err := resolveImageConfig(context.Background(), reference, linuxAMD64, run); err == nil {
 						t.Fatalf("accepted reference without authoritative immutable content: %s", reference)
 					}
 				}

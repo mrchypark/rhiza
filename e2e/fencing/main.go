@@ -1351,13 +1351,53 @@ func immutableDigest(value string) (string, error) {
 	return d, nil
 }
 
-// Kind can discard the archive's import repository name while retaining its
-// immutable content. Follow only hash-verified descriptors, never a mutable tag.
-func imageConfig(ctx context.Context, reference string) (obj, []obj, error) {
-	return resolveImageConfig(ctx, reference, command)
+type imagePlatform struct {
+	OS           string
+	Architecture string
+	Variant      string
 }
 
-func resolveImageConfig(ctx context.Context, reference string, run func(context.Context, string, ...string) ([]byte, error)) (obj, []obj, error) {
+func kindNodePlatform(ctx context.Context) (imagePlatform, error) {
+	data, err := command(ctx, "docker", "exec", kindNode, "uname", "-s", "-m")
+	if err != nil {
+		return imagePlatform{}, fmt.Errorf("read Kind node platform: %w", err)
+	}
+	fields := strings.Fields(string(data))
+	if len(fields) != 2 {
+		return imagePlatform{}, fmt.Errorf("invalid Kind node platform")
+	}
+	platform := imagePlatform{OS: strings.ToLower(fields[0])}
+	switch strings.ToLower(fields[1]) {
+	case "x86_64", "x64":
+		platform.Architecture = "amd64"
+	case "aarch64", "arm64":
+		platform.Architecture = "arm64"
+	case "armv7l":
+		platform.Architecture = "arm"
+		platform.Variant = "v7"
+	case "armv6l":
+		platform.Architecture = "arm"
+		platform.Variant = "v6"
+	case "i386", "i486", "i586", "i686", "x86":
+		platform.Architecture = "386"
+	case "ppc64le", "s390x", "riscv64":
+		platform.Architecture = strings.ToLower(fields[1])
+	default:
+		return imagePlatform{}, fmt.Errorf("unsupported Kind node architecture %q", fields[1])
+	}
+	if platform.OS == "" {
+		return imagePlatform{}, fmt.Errorf("invalid Kind node operating system")
+	}
+	return platform, nil
+}
+
+// Kind can discard the archive's import repository name while retaining its
+// immutable content. Follow only hash-verified descriptors, never a mutable tag.
+func imageConfig(ctx context.Context, reference string, platform imagePlatform) (obj, []obj, error) {
+	return resolveImageConfig(ctx, reference, platform, command)
+}
+
+func resolveImageConfig(ctx context.Context, reference string, platform imagePlatform, run func(context.Context, string, ...string) ([]byte, error)) (obj, []obj, error) {
 	d, err := immutableDigest(reference)
 	if err != nil {
 		return nil, nil, err
@@ -1380,7 +1420,7 @@ func resolveImageConfig(ctx context.Context, reference string, run func(context.
 		if err != nil {
 			return nil, chain, fmt.Errorf("resolve immutable image %s: CRI: %v; content: %w", d, lookupErr, err)
 		}
-		next, err := imageDescriptor(d, content)
+		next, err := imageDescriptor(d, content, platform)
 		chain = append(chain, obj{"digest": d, "criLookupFailed": true, "contentSHA256": fmt.Sprintf("%x", sha256.Sum256(content)), "descriptor": publicDescriptor(content)})
 		if err != nil {
 			return nil, chain, err
@@ -1390,7 +1430,7 @@ func resolveImageConfig(ctx context.Context, reference string, run func(context.
 	return nil, chain, fmt.Errorf("image descriptor chain exceeds qualification bound")
 }
 
-func imageDescriptor(d string, content []byte) (string, error) {
+func imageDescriptor(d string, content []byte, target imagePlatform) (string, error) {
 	if "sha256:"+fmt.Sprintf("%x", sha256.Sum256(content)) != d {
 		return "", fmt.Errorf("image content digest differs from %s", d)
 	}
@@ -1431,26 +1471,62 @@ func imageDescriptor(d string, content []byte) (string, error) {
 		if len(runnable) == 0 {
 			return "", fmt.Errorf("no runnable manifest in immutable image index %s", d)
 		}
-		descriptor.Manifests = runnable
-		first := descriptor.Manifests[0]
-		resolved, err := immutableDigest(first.Digest)
-		if err != nil {
-			return "", err
+		knownMediaType := func(mediaType string) bool {
+			return mediaType == "application/vnd.oci.image.manifest.v1+json" || mediaType == "application/vnd.oci.image.index.v1+json" || mediaType == "application/vnd.docker.distribution.manifest.v2+json" || mediaType == "application/vnd.docker.distribution.manifest.list.v2+json"
 		}
-		for _, reference := range attestations {
-			if reference != resolved {
-				return "", fmt.Errorf("attestation references another immutable image in %s", d)
+		for _, manifest := range runnable {
+			if _, err := immutableDigest(manifest.Digest); err != nil {
+				return "", err
 			}
-		}
-		knownMediaType := first.MediaType == "application/vnd.oci.image.manifest.v1+json" || first.MediaType == "application/vnd.oci.image.index.v1+json" || first.MediaType == "application/vnd.docker.distribution.manifest.v2+json" || first.MediaType == "application/vnd.docker.distribution.manifest.list.v2+json"
-		for _, alias := range descriptor.Manifests[1:] {
-			// Docker archives may index two tag aliases of the same manifest.
-			// Ignore only annotations, not conflicting content or platform metadata.
-			if first.Size <= 0 || !knownMediaType || alias.Digest != resolved || alias.Size != first.Size || alias.MediaType != first.MediaType || !bytes.Equal(encoded(alias.Platform), encoded(first.Platform)) {
+			if len(descriptor.Manifests) > 1 && (manifest.Size <= 0 || !knownMediaType(manifest.MediaType)) {
 				return "", fmt.Errorf("ambiguous immutable image index %s", d)
 			}
 		}
-		return resolved, nil
+		for _, reference := range attestations {
+			matched := false
+			for _, manifest := range runnable {
+				if reference == manifest.Digest {
+					matched = true
+					break
+				}
+			}
+			if !matched {
+				return "", fmt.Errorf("attestation references another immutable image in %s", d)
+			}
+		}
+		if target.OS == "" || target.Architecture == "" {
+			return "", fmt.Errorf("target platform is required to resolve immutable image index %s", d)
+		}
+		platformMatches := func(platform obj) bool {
+			platformOS, _ := platform["os"].(string)
+			platformArchitecture, _ := platform["architecture"].(string)
+			platformVariant, _ := platform["variant"].(string)
+			return strings.EqualFold(platformOS, target.OS) && strings.EqualFold(platformArchitecture, target.Architecture) && strings.EqualFold(platformVariant, target.Variant)
+		}
+		first := runnable[0]
+		aliases := true
+		for _, alias := range runnable[1:] {
+			if alias.Digest != first.Digest || alias.Size != first.Size || alias.MediaType != first.MediaType || !bytes.Equal(encoded(alias.Platform), encoded(first.Platform)) {
+				aliases = false
+				break
+			}
+		}
+		if aliases && len(first.Platform) > 0 && platformMatches(first.Platform) {
+			return immutableDigest(first.Digest)
+		}
+		var selected string
+		for _, manifest := range runnable {
+			if platformMatches(manifest.Platform) {
+				if selected != "" {
+					return "", fmt.Errorf("ambiguous immutable image index %s for platform %s/%s/%s", d, target.OS, target.Architecture, target.Variant)
+				}
+				selected = manifest.Digest
+			}
+		}
+		if selected == "" {
+			return "", fmt.Errorf("immutable image index %s has no manifest for platform %s/%s/%s", d, target.OS, target.Architecture, target.Variant)
+		}
+		return immutableDigest(selected)
 	}
 	return "", fmt.Errorf("ambiguous or unsupported immutable image descriptor %s", d)
 }
@@ -1470,6 +1546,10 @@ func verifyImages(ctx context.Context, out, phase string, current ...operator.Fe
 		return err
 	}
 	items, _ := pods["items"].([]any)
+	platform, err := kindNodePlatform(ctx)
+	if err != nil {
+		return err
+	}
 	counts := map[string]int{}
 	wanted := map[string]string{}
 	for _, target := range current {
@@ -1530,10 +1610,10 @@ func verifyImages(ctx context.Context, out, phase string, current ...operator.Fe
 		if text(nested(runtime, "status", "id")) != containerID || nested(runtime, "status", "labels", "io.kubernetes.pod.uid") != nested(pod, "metadata", "uid") || digest(text(nested(runtime, "status", "imageRef"))) != digest(podImage) {
 			return fmt.Errorf("%s runtime image does not bind the observed Pod incarnation", role)
 		}
-		cri, chain, resolveErr := imageConfig(ctx, podImage)
+		cri, chain, resolveErr := imageConfig(ctx, podImage, platform)
 		configID := text(nested(cri, "status", "id"))
 		builtID := text(built[0]["Id"])
-		builtCRI, builtChain, builtErr := imageConfig(ctx, builtID)
+		builtCRI, builtChain, builtErr := imageConfig(ctx, builtID, platform)
 		builtConfigID := text(nested(builtCRI, "status", "id"))
 		repos, _ := nested(cri, "status", "repoDigests").([]any)
 		evidence = append(evidence, obj{"pod": nested(pod, "metadata", "name"), "uid": nested(pod, "metadata", "uid"), "role": role, "podImageID": podImage, "container": publicRuntime(runtime), "resolution": chain, "builtImageID": builtID, "builtResolution": builtChain, "builtConfigID": builtConfigID, "criConfigID": configID, "criRepoDigests": repos})
