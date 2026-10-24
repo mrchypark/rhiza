@@ -774,6 +774,14 @@ var allowedSupervisorRejectionCodes = func() map[string]struct{} {
 	for _, item := range registerStageRejectionPrefixes {
 		codes[item.code] = struct{}{}
 	}
+	for _, phase := range []string{"load", "validate", "create", "genesis", "legacy_check"} {
+		for _, cause := range []string{"not_found", "precondition", "permission", "unsupported", "timeout", "http_429", "http_500", "http_502", "http_503", "root_lost", "identity_mismatch", "genesis_mismatch", "version_unsupported", "capacity_exceeded", "unknown"} {
+			codes["register_root_init_"+phase+"_"+cause] = struct{}{}
+		}
+	}
+	for _, cause := range []string{"legacy_exists", "legacy_check_unavailable"} {
+		codes["register_root_init_legacy_check_"+cause] = struct{}{}
+	}
 	for pair := range allowedRuntimeAgentDiagnosticPairs {
 		codes["runtimeagent_"+strings.ReplaceAll(pair, "/", "_")] = struct{}{}
 	}
@@ -1644,6 +1652,21 @@ func classifySupervisorRejectionCode(stage, message string) string {
 	for _, item := range registerStageRejectionPrefixes {
 		if strings.HasPrefix(message, item.message) {
 			reason := strings.TrimSpace(strings.TrimPrefix(message, item.message))
+			if item.code == "register_root_init_rejected" {
+				const marker = "fencing: root-init phase="
+				if strings.HasPrefix(reason, marker) {
+					fields := strings.SplitN(strings.TrimPrefix(reason, marker), " ", 2)
+					if len(fields) == 2 && strings.HasPrefix(fields[1], "cause=") {
+						phase := fields[0]
+						causeField := strings.TrimPrefix(fields[1], "cause=")
+						cause, _, _ := strings.Cut(causeField, ":")
+						code := "register_root_init_" + phase + "_" + cause
+						if _, ok := allowedSupervisorRejectionCodes[code]; ok {
+							return code
+						}
+					}
+				}
+			}
 			for _, known := range supervisorRejectionPrefixes {
 				if strings.HasPrefix(reason, known.message) {
 					return known.code

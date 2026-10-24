@@ -9,11 +9,14 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"path"
 	"strings"
 
+	"github.com/minio/minio-go/v7"
 	"github.com/mrchypark/rhiza/pkg/fencing"
 	"github.com/thanos-io/objstore"
+	"google.golang.org/api/googleapi"
 )
 
 var (
@@ -30,6 +33,25 @@ const maxAuthorityStateBytes = 1 << 20
 type AuthorityStateStore struct {
 	bucket objstore.Bucket
 	prefix string
+}
+
+// authorityConditionalWriteError keeps a failed conditional upload distinct
+// from its confirmation read. Both errors remain in the chain, but diagnostics
+// classify the write failure as primary when the read cannot confirm it.
+type authorityConditionalWriteError struct {
+	primary      error
+	confirmation error
+}
+
+func (e *authorityConditionalWriteError) Error() string {
+	return errors.Join(e.primary, e.confirmation).Error()
+}
+
+func (e *authorityConditionalWriteError) Unwrap() []error {
+	if e.confirmation == nil {
+		return []error{e.primary}
+	}
+	return []error{e.primary, e.confirmation}
 }
 
 type authorityStateEnvelope struct {
@@ -252,12 +274,12 @@ func (s *AuthorityStateStore) ensureRootGenesis(ctx context.Context, identity st
 			RootIdentity string `json:"rootIdentity"`
 		}
 		if err := decodeAuthorityValue(data, &saved); err != nil || saved != value || version == nil {
-			return errors.Join(err, fmt.Errorf("fencing: authority root genesis differs"))
+			return s.rootDiagnostic("genesis", errors.Join(err, fmt.Errorf("fencing: authority root genesis differs")))
 		}
 		return nil
 	}
 	if !errors.Is(err, errAuthorityStateNotFound) {
-		return err
+		return s.rootDiagnostic("genesis", err)
 	}
 	if err := s.write(ctx, key, identity, value, nil); err != nil && !errors.Is(err, errAuthorityStateConflict) {
 		stored, _, readErr := s.read(ctx, key, identity)
@@ -267,17 +289,17 @@ func (s *AuthorityStateStore) ensureRootGenesis(ctx context.Context, identity st
 		if readErr == nil && decodeAuthorityValue(stored, &saved) == nil && saved == value {
 			return nil
 		}
-		return errors.Join(err, readErr)
+		return errors.Join(s.rootDiagnostic("genesis", err), readErr)
 	}
 	stored, _, err := s.read(ctx, key, identity)
 	if err != nil {
-		return err
+		return s.rootDiagnostic("genesis", err)
 	}
 	var saved struct {
 		RootIdentity string `json:"rootIdentity"`
 	}
 	if err := decodeAuthorityValue(stored, &saved); err != nil || saved != value {
-		return errors.Join(err, fmt.Errorf("fencing: authority root genesis differs"))
+		return s.rootDiagnostic("genesis", errors.Join(err, fmt.Errorf("fencing: authority root genesis differs")))
 	}
 	return nil
 }
@@ -389,7 +411,7 @@ func (s *AuthorityStateStore) write(ctx context.Context, key, identity string, v
 		if readErr == nil && validAuthorityObjectVersion(readVersion) && readVersion.Type == expected.Type && storedRevision == revision && bytes.Equal(stored, encoded) {
 			return nil
 		}
-		return errors.Join(err, readErr)
+		return &authorityConditionalWriteError{primary: err, confirmation: readErr}
 	}
 	return err
 }
@@ -406,22 +428,22 @@ func authorityStateEnvelopeDigest(value []byte, revision string) string {
 func (s *AuthorityStateStore) ReadRoot(ctx context.Context, uid, source string) (fenceLedger, *objstore.ObjectVersion, error) {
 	key, identity, err := s.rootKey(uid, source)
 	if err != nil {
-		return fenceLedger{}, nil, err
+		return fenceLedger{}, nil, s.rootDiagnostic("load", err)
 	}
 	data, version, err := s.read(ctx, key, identity)
 	if err != nil {
 		if errors.Is(err, errAuthorityStateNotFound) {
 			if _, _, genesisErr := s.read(ctx, s.genesisKey(identity), identity); genesisErr == nil {
-				return fenceLedger{}, nil, errAuthorityRootLost
+				return fenceLedger{}, nil, s.rootDiagnostic("load", errAuthorityRootLost)
 			} else if !errors.Is(genesisErr, errAuthorityStateNotFound) {
-				return fenceLedger{}, nil, genesisErr
+				return fenceLedger{}, nil, s.rootDiagnostic("load", genesisErr)
 			}
 		}
-		return fenceLedger{}, nil, err
+		return fenceLedger{}, nil, s.rootDiagnostic("load", err)
 	}
 	var state fenceLedger
 	if err := decodeAuthorityValue(data, &state); err != nil || state.StatefulSetUID != uid || state.Ledger.SourceClusterID != source {
-		return fenceLedger{}, nil, errors.Join(err, fmt.Errorf("fencing: canonical authority root identity differs"))
+		return fenceLedger{}, nil, s.rootDiagnostic("validate", errors.Join(err, fmt.Errorf("fencing: canonical authority root identity differs")))
 	}
 	return state, version, nil
 }
@@ -429,12 +451,107 @@ func (s *AuthorityStateStore) ReadRoot(ctx context.Context, uid, source string) 
 func (s *AuthorityStateStore) WriteRoot(ctx context.Context, uid, source string, state fenceLedger, expected *objstore.ObjectVersion) error {
 	key, identity, err := s.rootKey(uid, source)
 	if err != nil {
-		return err
+		return s.rootDiagnostic("create", err)
 	}
 	if state.StatefulSetUID != uid || state.Ledger.SourceClusterID != source {
-		return fmt.Errorf("fencing: canonical authority root identity differs")
+		return s.rootDiagnostic("validate", fmt.Errorf("fencing: canonical authority root identity differs"))
 	}
-	return s.write(ctx, key, identity, state, expected)
+	if err := s.write(ctx, key, identity, state, expected); err != nil {
+		return s.rootDiagnostic("create", err)
+	}
+	return nil
+}
+
+// rootDiagnostic adds fixed, non-sensitive phase/cause metadata while
+// preserving the underlying error chain for errors.Is and errors.As callers.
+func (s *AuthorityStateStore) rootDiagnostic(phase string, err error) error {
+	if err == nil {
+		return nil
+	}
+	return fmt.Errorf("fencing: root-init phase=%s cause=%s: %w", phase, s.rootCause(err), err)
+}
+
+func rootHTTPStatusCause(status int) string {
+	switch status {
+	case 401, 403:
+		return "permission"
+	case 404:
+		return "not_found"
+	case 408, 504:
+		return "timeout"
+	case 409, 412:
+		return "precondition"
+	case 501:
+		return "unsupported"
+	case 429:
+		return "http_429"
+	case 500:
+		return "http_500"
+	case 502:
+		return "http_502"
+	case 503:
+		return "http_503"
+	default:
+		return ""
+	}
+}
+
+func (s *AuthorityStateStore) rootCause(err error) string {
+	var writeErr *authorityConditionalWriteError
+	if errors.As(err, &writeErr) && writeErr != nil {
+		return s.rootCause(writeErr.primary)
+	}
+	switch {
+	case errors.Is(err, errAuthorityStateNotFound):
+		return "not_found"
+	case errors.Is(err, errAuthorityStateConflict), s != nil && s.bucket != nil && s.bucket.IsConditionNotMetErr(err):
+		return "precondition"
+	case errors.Is(err, context.DeadlineExceeded):
+		return "timeout"
+	}
+	var netErr net.Error
+	if errors.As(err, &netErr) && netErr.Timeout() {
+		return "timeout"
+	}
+	var googleErr *googleapi.Error
+	if errors.As(err, &googleErr) && googleErr != nil {
+		if cause := rootHTTPStatusCause(googleErr.Code); cause != "" {
+			return cause
+		}
+	}
+	var minioValue minio.ErrorResponse
+	if errors.As(err, &minioValue) {
+		if cause := rootHTTPStatusCause(minioValue.StatusCode); cause != "" {
+			return cause
+		}
+	}
+	var minioPointer *minio.ErrorResponse
+	if errors.As(err, &minioPointer) && minioPointer != nil {
+		if cause := rootHTTPStatusCause(minioPointer.StatusCode); cause != "" {
+			return cause
+		}
+	}
+	var statusErr interface{ HTTPStatusCode() int }
+	if errors.As(err, &statusErr) {
+		if cause := rootHTTPStatusCause(statusErr.HTTPStatusCode()); cause != "" {
+			return cause
+		}
+	}
+	if s != nil && s.bucket != nil && s.bucket.IsObjNotFoundErr(err) {
+		return "not_found"
+	}
+	for _, item := range []struct{ message, cause string }{
+		{"fencing: initialized authority root is missing", "root_lost"},
+		{"fencing: canonical authority root identity differs", "identity_mismatch"},
+		{"fencing: authority root genesis differs", "genesis_mismatch"},
+		{"fencing: authority state requires an exact generation or ETag version", "version_unsupported"},
+		{"fencing: canonical authority state exceeds capacity", "capacity_exceeded"},
+	} {
+		if strings.Contains(err.Error(), item.message) {
+			return item.cause
+		}
+	}
+	return "unknown"
 }
 
 func (s *AuthorityStateStore) ReadProducer(ctx context.Context, runtime fencing.RuntimeBinding) (fencing.MutationProducer, string, *objstore.ObjectVersion, error) {

@@ -95,7 +95,7 @@ func TestProducerBindingRecoversLostRootOrActivationResponse(t *testing.T) {
 func TestMutationJournalBindingRejectsCooperativeRootAndPreservesCooperativeBinding(t *testing.T) {
 	t.Run("required executor rejects stale cooperative root without mutation", func(t *testing.T) {
 		store, _ := newAuthorityStateStoreForTest(t)
-		cooperative := &FencingExecutor{AuthorityState: store}
+		cooperative := &FencingExecutor{AuthorityState: store, Kube: newMissingLegacyLedgerKube(t)}
 		id := fencing.Identity{SourceClusterID: "source", NodeID: "node", PodUID: "pod", RunID: "run"}
 		if err := cooperative.initializeRoot(t.Context(), "sts", "source"); err != nil {
 			t.Fatal(err)
@@ -120,7 +120,7 @@ func TestMutationJournalBindingRejectsCooperativeRootAndPreservesCooperativeBind
 
 	t.Run("explicit cooperative root may bind without producer", func(t *testing.T) {
 		store, _ := newAuthorityStateStoreForTest(t)
-		executor := &FencingExecutor{AuthorityState: store}
+		executor := &FencingExecutor{AuthorityState: store, Kube: newMissingLegacyLedgerKube(t)}
 		id := fencing.Identity{SourceClusterID: "source", NodeID: "node", PodUID: "pod", RunID: "run"}
 		if err := executor.initializeRoot(t.Context(), "sts", "source"); err != nil {
 			t.Fatal(err)
