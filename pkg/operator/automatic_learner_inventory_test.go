@@ -151,7 +151,14 @@ func TestRetiredLearnerSurvivesRotationAndGenerationRequest(t *testing.T) {
 			state.Intent.Aborting = true
 			f.child.Spec.Membership.AbortAddition = true
 			f.child.Spec.Membership.ReplacementPod = "learner"
-			f.child.Status.Membership.Phase = "Aborted"
+			if f.child.Status.Membership == nil || f.child.Status.Membership.Add == nil || f.child.Status.Membership.RemoveRequest == nil {
+				t.Fatalf("fixture must retain both completed membership journals before abort acknowledgment: %+v", f.child.Status.Membership)
+			}
+			addBefore, removeBefore := hashJSON(f.child.Status.Membership.Add), hashJSON(f.child.Status.Membership.RemoveRequest)
+			acknowledgeCanonicalLearnerAbort(f.child)
+			if hashJSON(f.child.Status.Membership.Add) != addBefore || hashJSON(f.child.Status.Membership.RemoveRequest) != removeBefore {
+				t.Fatalf("abort acknowledgment changed membership journals: before add=%s remove=%s after=%+v", addBefore, removeBefore, f.child.Status.Membership)
+			}
 			state.Intent.SpecHash = hashJSON(f.child.Spec)
 			f.fencePending = false
 			if err := f.c.saveAuto(t.Context(), f.r, state, version); err != nil {
@@ -732,11 +739,20 @@ func TestAbortedLearnerRetirementPreservesCredentialIdentity(t *testing.T) {
 	if created.CredentialName == "" || created.CredentialUID == "" {
 		t.Fatalf("learner creation history omitted credential identity: %+v", created)
 	}
-	state.Learners = append(state.Learners, created)
+	if err := rememberLearner(state, created); err != nil {
+		t.Fatalf("refresh fixture learner creation history: %v", err)
+	}
 	state.Intent.Aborting = true
 	f.child.Spec.Membership.AbortAddition = true
 	f.child.Spec.Membership.ReplacementPod = learnerPhysicalPod(state.Intent)
-	f.child.Status.Membership.Phase = "Aborted"
+	if f.child.Status.Membership == nil || f.child.Status.Membership.Add == nil || f.child.Status.Membership.RemoveRequest == nil {
+		t.Fatalf("fixture must retain both completed membership journals before abort acknowledgment: %+v", f.child.Status.Membership)
+	}
+	addBefore, removeBefore := hashJSON(f.child.Status.Membership.Add), hashJSON(f.child.Status.Membership.RemoveRequest)
+	acknowledgeCanonicalLearnerAbort(f.child)
+	if hashJSON(f.child.Status.Membership.Add) != addBefore || hashJSON(f.child.Status.Membership.RemoveRequest) != removeBefore {
+		t.Fatalf("abort acknowledgment changed membership journals: before add=%s remove=%s after=%+v", addBefore, removeBefore, f.child.Status.Membership)
+	}
 	state.Intent.SpecHash = hashJSON(f.child.Spec)
 	f.fencePending = false
 	if err := f.c.saveAuto(t.Context(), f.r, state, version); err != nil {
@@ -758,6 +774,56 @@ func TestAbortedLearnerRetirementPreservesCredentialIdentity(t *testing.T) {
 	got := retired.Learners[0]
 	if got.CredentialName != created.CredentialName || got.CredentialUID != created.CredentialUID || got.Target != created.Target || got.Retirement == nil {
 		t.Fatalf("retirement did not preserve exact credential and workload identity: got=%+v want=%+v", got, created)
+	}
+}
+
+func acknowledgeCanonicalLearnerAbort(child *Resource) {
+	child.Status.Phase = "Aborted"
+	child.Status.ObservedGeneration = number(child.Metadata["generation"])
+	if child.Status.Membership == nil {
+		child.Status.Membership = &MembershipStatus{}
+	}
+	child.Status.Membership.Phase = "Aborted"
+}
+
+func TestAbortedLearnerRetirementRejectsMutatedADDJournal(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		mutate func(*MembershipAddJournal)
+	}{
+		{name: "request hash", mutate: func(add *MembershipAddJournal) { add.RequestHash = strings.Repeat("f", 64) }},
+		{name: "secret UID", mutate: func(add *MembershipAddJournal) { add.SecretUID = "different-secret-uid" }},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			f := newRetirementEscalationFixture(t)
+			state, version := f.load(t)
+			if f.child.Status.Membership == nil || f.child.Status.Membership.Add == nil {
+				t.Fatal("fixture is missing the ADD journal under test")
+			}
+			state.Intent.Aborting = true
+			f.child.Spec.Membership.AbortAddition = true
+			f.child.Spec.Membership.ReplacementPod = learnerPhysicalPod(state.Intent)
+			tc.mutate(f.child.Status.Membership.Add)
+			acknowledgeCanonicalLearnerAbort(f.child)
+			state.Intent.SpecHash = hashJSON(f.child.Spec)
+			if err := f.c.saveAuto(t.Context(), f.r, state, version); err != nil {
+				t.Fatal(err)
+			}
+			state, version = f.load(t)
+			before := *state.Intent
+			fenceCount := len(f.fences)
+			handled, err := f.c.handleAutomaticLearner(t.Context(), f.r, state, version, f.api.sts, f.child)
+			if err != nil || !handled || f.r.Status.Phase != "Blocked" {
+				t.Fatalf("mutated ADD journal was not fail-closed: handled=%t err=%v status=%+v", handled, err, f.r.Status)
+			}
+			if len(f.fences) != fenceCount {
+				t.Fatalf("mutated ADD journal reached the learner fencer: before=%d after=%d", fenceCount, len(f.fences))
+			}
+			if state.Intent.LearnerAttempt != before.LearnerAttempt || state.Intent.LearnerName != before.LearnerName ||
+				state.Intent.LearnerUID != before.LearnerUID || !state.Intent.Aborting {
+				t.Fatalf("mutated ADD journal rotated the learner candidate: before=%+v after=%+v", before, state.Intent)
+			}
+		})
 	}
 }
 

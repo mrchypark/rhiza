@@ -100,7 +100,7 @@ func TestTransientRootInitRegistrationLogsDiagnosisAndReturns503(t *testing.T) {
 			}
 			logText := captured.String()
 			t.Logf("captured root-init transition diagnostic: %s", strings.TrimSpace(logText))
-			if !strings.Contains(logText, "fencing supervisor transition rejected: action=register podUID=pod-0 error=fencing: register root-init rejected:") || !strings.Contains(logText, tt.wantMessage) {
+			if !strings.Contains(logText, `fencing supervisor transition rejected: action="register" podUID="pod-0" error="fencing: register root-init rejected:`) || !strings.Contains(logText, tt.wantMessage) {
 				t.Fatalf("root-init failure log omitted fixed diagnosis: wanted %q in %q", tt.wantMessage, logText)
 			}
 

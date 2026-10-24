@@ -811,6 +811,23 @@ esac
 			if err := os.Chmod(kubectlPath, 0o700); err != nil {
 				t.Fatal(err)
 			}
+			gitPath := filepath.Join(fakeBin, "git")
+			expectedGitRoot, err := filepath.Abs("../../..")
+			if err != nil {
+				t.Fatal(err)
+			}
+			fakeGitCallReceipt := filepath.Join(root, "fake-git-call.txt")
+			gitShim := `#!/bin/sh
+[ "$#" -eq 5 ] && [ "$1" = -C ] && [ "$3" = rev-parse ] && [ "$4" = --verify ] && [ "$5" = HEAD ] || exit 64
+actual_root=$(CDPATH= cd -- "$2" 2>/dev/null && pwd -P) || exit 65
+[ "$actual_root" = "$FAKE_GIT_EXPECTED_ROOT" ] || exit 66
+printf '%s %s\n' "$actual_root" 0123456789abcdef0123456789abcdef01234567 > "$FAKE_GIT_CALL_RECEIPT"
+printf '%s\n' 0123456789abcdef0123456789abcdef01234567
+`
+			writePrivateTestFile(t, gitPath, []byte(gitShim))
+			if err := os.Chmod(gitPath, 0o700); err != nil {
+				t.Fatal(err)
+			}
 			collector := `#!/bin/sh
 printf '%s\n' "$$" > "$FAKE_COLLECTOR_PIDFILE"
 printf '%s\n' "$FENCING_E2E_MIXED_WORK_DEADLINE_UNIX $FENCING_E2E_MIXED_HARD_DEADLINE_UNIX" > "$FAKE_COLLECTOR_DEADLINES"
@@ -854,6 +871,7 @@ while :; do sleep 1; done
 				"FAKE_DELETE_ATTEMPT": kubectlDeleteAttempt, "FAKE_DELETE_ORDER": kubectlOrder,
 				"FAKE_COLLECTOR_STARTED": collectorStarted, "FAKE_COLLECTOR_TERM": collectorTerminated,
 				"FAKE_COLLECTOR_DEADLINES": collectorDeadline, "FAKE_COLLECTOR_PIDFILE": collectorPID,
+				"FAKE_GIT_EXPECTED_ROOT": expectedGitRoot, "FAKE_GIT_CALL_RECEIPT": fakeGitCallReceipt,
 				"FAKE_HUNG_CHILD":  map[bool]string{true: "yes", false: "no"}[scenario.hung],
 				"FAKE_UID_DRIFT":   map[bool]string{true: "yes", false: "no"}[scenario.uidDrift],
 				"FAKE_DELETE_FAIL": map[bool]string{true: "yes", false: "no"}[scenario.deleteFail],
@@ -900,6 +918,13 @@ while :; do sleep 1; done
 			}
 			if runErr == nil {
 				t.Fatalf("canceled launcher unexpectedly passed: %s", output.String())
+			}
+			if !scenario.unsafeOut {
+				gitCallReceipt, err := os.ReadFile(fakeGitCallReceipt)
+				wantGitCall := expectedGitRoot + " 0123456789abcdef0123456789abcdef01234567\n"
+				if err != nil || string(gitCallReceipt) != wantGitCall {
+					t.Fatalf("fake git call receipt = %q, err %v; want exact repository root and pinned HEAD", gitCallReceipt, err)
+				}
 			}
 			if exit, ok := runErr.(*exec.ExitError); !ok || exit.ExitCode() == 0 {
 				t.Fatalf("canceled launcher exit = %v; output: %s", runErr, output.String())

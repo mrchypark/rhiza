@@ -1213,7 +1213,7 @@ func TestDeadPodLauncherIsExplicitAndUsesNativeCollector(t *testing.T) {
 	source := string(launcher)
 	for _, required := range []string{
 		"dead_pod=${RHIZA_GCS_DEAD_POD:-no}",
-		"if [ \"$async_nonempty\" = yes ] || [ \"$missing_membership\" = yes ] || [ \"$dead_pod\" = yes ]; then",
+		"if [ \"$async_nonempty\" = yes ] || [ \"$missing_membership\" = yes ] || [ \"$dead_pod\" = yes ] || [ \"$mixed_pending\" = yes ]; then",
 		"RHIZA_GCS_DEAD_POD must be yes or no",
 		"\"$missing_membership\" \"$dead_pod\"",
 		"run-gcs-ha-dead-pod",
