@@ -20,6 +20,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"sort"
 	"strings"
 	"time"
 
@@ -1110,6 +1111,7 @@ func qualifyOnline(ctx context.Context, survivor *forward, stsUID, bindingUID, o
 		}
 		return nested(root, "status", "phase") == "Healthy" && nested(root, "status", "activeClusterID") == "chaos-source", nil
 	}); err != nil {
+		captureOnlineVoterDiagnostics(voterRequest.OperationID, fault, out)
 		return nil, err
 	}
 	m := child.Spec.Membership
@@ -1174,6 +1176,310 @@ func qualifyOnline(ctx context.Context, survivor *forward, stsUID, bindingUID, o
 	}
 	event("online_operator_observation_fault_removed", obj{"fault": fault})
 	return targets, os.WriteFile(filepath.Join(out, "online-completed-membership.json"), encoded(obj{"recovery": child, "targets": targets, "observations": observations}), 0600)
+}
+
+// captureOnlineVoterDiagnostics preserves bounded private state for the exact
+// automatic learner involved in a failed online promotion. It is diagnostic
+// only: it does not change readiness or retry behavior.
+func captureOnlineVoterDiagnostics(operationID string, fault *observationFault, out string) {
+	if operationID == "" || out == "" {
+		return
+	}
+	dir := filepath.Join(out, "private-online-voter-diagnostics")
+	if os.MkdirAll(dir, 0700) != nil {
+		return
+	}
+	_ = os.Chmod(dir, 0700)
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	pods, err := get(ctx, "pods", "")
+	var items []any
+	if err == nil {
+		items, _ = pods["items"].([]any)
+	}
+	var learner any
+	for _, pod := range items {
+		name := text(nested(pod, "metadata", "name"))
+		owner := text(nested(pod, "metadata", "annotations", "rhiza.mrchypark.dev/recovery-owner"))
+		if owner == operationID || name == operationID+"-learner" {
+			if learner == nil || nested(pod, "metadata", "deletionTimestamp") == nil {
+				learner = pod
+			}
+		}
+	}
+	var events any
+	eventsQuerySucceeded := false
+	if allEvents, eventErr := get(ctx, "events", ""); eventErr == nil {
+		eventsQuerySucceeded = true
+		items, _ := allEvents["items"].([]any)
+		learnerUID := text(nested(learner, "metadata", "uid"))
+		events = eventsForLearnerUID(items, learnerUID)
+	}
+	recoveries, recoveryErr := get(ctx, "rhizarecoveries", "")
+	var recovery any
+	if recoveryErr == nil {
+		items, _ := recoveries["items"].([]any)
+		for _, item := range items {
+			if nested(item, "metadata", "name") == operationID {
+				recovery = item
+				break
+			}
+		}
+	}
+	secretObservations, secretObservationsTruncated := learnerSecretObservations(ctx, learner, recovery, operationID)
+	parent, parentErr := get(ctx, "rhizacluster", "rhiza")
+	if parentErr != nil {
+		parent = nil
+	}
+	private := obj{
+		"operationID": operationID, "learner": privateLearnerDiagnosticView(learner), "events": events,
+		"podsQuerySucceeded": err == nil, "eventsQuerySucceeded": eventsQuerySucceeded, "recoveryQuerySucceeded": recoveryErr == nil,
+		"secretObservations": secretObservations, "secretObservationsTruncated": secretObservationsTruncated,
+		"membershipObservation": inspectLearnerMembership(ctx, learner, recovery, parent, out),
+		"recoveryFound":         recovery != nil, "recovery": privateRecoveryDiagnosticView(recovery), "parent": privateParentDiagnosticView(parent),
+		"parentQuerySucceeded":           parentErr == nil,
+		"parentRecoveryMatchesOperation": parentErr == nil && nested(parent, "status", "activeRecovery") == operationID,
+		"faultTargetPodUID": func() string {
+			if fault == nil {
+				return ""
+			}
+			return fault.Target.PodUID
+		}(),
+		"faultTargetIP": func() string {
+			if fault == nil {
+				return ""
+			}
+			return fault.TargetIP
+		}(),
+		"learnerIP": nested(learner, "status", "podIP"),
+	}
+	if os.WriteFile(filepath.Join(dir, "online-voter-diagnostics.json"), encoded(private), 0600) != nil {
+		return
+	}
+	if learner == nil {
+		return
+	}
+	containers, _ := nested(learner, "spec", "containers").([]any)
+	for _, container := range containers {
+		name := text(nested(container, "name"))
+		if name == "" || strings.ContainsAny(name, "/\\\n\x00") {
+			continue
+		}
+		for _, previous := range []bool{false, true} {
+			args := []string{"logs", text(nested(learner, "metadata", "name")), "-c", name, "--tail=100", "--limit-bytes=32768"}
+			if previous {
+				args = append(args, "--previous")
+			}
+			data, logErr := kubectl(ctx, args...)
+			if logErr != nil {
+				continue
+			}
+			label := "current"
+			if previous {
+				label = "previous"
+			}
+			_ = os.WriteFile(filepath.Join(dir, "learner-"+label+"-"+name+".log"), data, 0600)
+		}
+	}
+}
+
+func inspectLearnerMembership(ctx context.Context, learner, recovery, parent any, out string) obj {
+	result := obj{"checked": false, "available": false, "authRejected": false, "nodeMatchesAdd": false, "walMatchesAdd": false,
+		"clusterMatchesActive": false, "voting": false, "pending": false}
+	if !learnerPodReady(learner) {
+		return result
+	}
+	name := text(nested(learner, "metadata", "name"))
+	if name == "" {
+		return result
+	}
+	result["checked"] = true
+	checkCtx, cancel := context.WithTimeout(ctx, 4*time.Second)
+	defer cancel()
+	forward, err := startForward(checkCtx, name, out)
+	if err != nil {
+		return result
+	}
+	status, err := readMembership(checkCtx, forward)
+	logPath := forward.log.Name()
+	forward.close()
+	_ = os.Remove(logPath)
+	if err != nil {
+		unauthorized := strings.Contains(err.Error(), "HTTP 401") || strings.Contains(err.Error(), "HTTP 403")
+		result["authRejected"] = unauthorized
+		return result
+	}
+	add := nested(recovery, "status", "membership", "add")
+	result["available"] = true
+	result["nodeMatchesAdd"] = add != nil && string(status.NodeID) == text(nested(add, "memberID"))
+	result["walMatchesAdd"] = add != nil && status.WALIdentity == text(nested(add, "walIdentity"))
+	result["clusterMatchesActive"] = text(nested(parent, "status", "activeClusterID")) != "" && status.ClusterID == text(nested(parent, "status", "activeClusterID"))
+	result["voting"], result["pending"], result["status"] = status.Voting, status.Pending, status
+	return result
+}
+
+func learnerPodReady(pod any) bool {
+	statuses := anySlice(nested(pod, "status", "containerStatuses"))
+	if len(statuses) == 0 {
+		return false
+	}
+	for _, status := range statuses {
+		if nested(status, "ready") != true {
+			return false
+		}
+	}
+	for _, condition := range anySlice(nested(pod, "status", "conditions")) {
+		if nested(condition, "type") == "Ready" {
+			return nested(condition, "status") == "True"
+		}
+	}
+	return false
+}
+
+func privateLearnerDiagnosticView(pod any) any {
+	if pod == nil {
+		return nil
+	}
+	var conditions, statuses, containers []any
+	for _, item := range anySlice(nested(pod, "status", "conditions")) {
+		conditions = append(conditions, obj{"type": nested(item, "type"), "status": nested(item, "status"), "reason": nested(item, "reason")})
+	}
+	for _, item := range anySlice(nested(pod, "status", "containerStatuses")) {
+		statuses = append(statuses, obj{
+			"ready": nested(item, "ready"), "restartCount": nested(item, "restartCount"),
+			"state":     obj{"waiting": obj{"reason": nested(item, "state", "waiting", "reason")}, "terminated": obj{"reason": nested(item, "state", "terminated", "reason"), "exitCode": nested(item, "state", "terminated", "exitCode")}},
+			"lastState": obj{"terminated": obj{"reason": nested(item, "lastState", "terminated", "reason"), "exitCode": nested(item, "lastState", "terminated", "exitCode")}},
+		})
+	}
+	for _, item := range anySlice(nested(pod, "spec", "containers")) {
+		var secretRefs []any
+		for _, env := range anySlice(nested(item, "env")) {
+			ref := nested(env, "valueFrom", "secretKeyRef")
+			if text(nested(ref, "name")) != "" {
+				secretRefs = append(secretRefs, obj{"name": nested(ref, "name"), "key": nested(ref, "key")})
+			}
+		}
+		containers = append(containers, obj{"name": nested(item, "name"), "secretRefs": secretRefs})
+	}
+	return obj{
+		"metadata": obj{"name": nested(pod, "metadata", "name"), "uid": nested(pod, "metadata", "uid"), "annotations": obj{"recoveryOwner": nested(pod, "metadata", "annotations", "rhiza.mrchypark.dev/recovery-owner")}},
+		"status":   obj{"phase": nested(pod, "status", "phase"), "podIP": nested(pod, "status", "podIP"), "conditions": conditions, "containerStatuses": statuses},
+		"spec":     obj{"containers": containers},
+	}
+}
+
+func privateRecoveryDiagnosticView(recovery any) any {
+	if recovery == nil {
+		return nil
+	}
+	return obj{
+		"metadata": obj{"name": nested(recovery, "metadata", "name"), "uid": nested(recovery, "metadata", "uid")},
+		"spec":     obj{"membership": obj{"replacementPod": nested(recovery, "spec", "membership", "replacementPod"), "replacementSecret": nested(recovery, "spec", "membership", "replacementSecret")}},
+		"status":   obj{"phase": nested(recovery, "status", "phase"), "stage": nested(recovery, "status", "stage"), "message": nested(recovery, "status", "message"), "membership": obj{"phase": nested(recovery, "status", "membership", "phase"), "reason": nested(recovery, "status", "membership", "reason"), "add": obj{"memberID": nested(recovery, "status", "membership", "add", "memberID"), "walIdentity": nested(recovery, "status", "membership", "add", "walIdentity")}}},
+	}
+}
+
+func privateParentDiagnosticView(parent any) any {
+	if parent == nil {
+		return nil
+	}
+	return obj{"status": obj{"phase": nested(parent, "status", "phase"), "message": nested(parent, "status", "message"), "activeRecovery": nested(parent, "status", "activeRecovery"), "activeClusterID": nested(parent, "status", "activeClusterID")}}
+}
+
+func learnerSecretObservations(ctx context.Context, pod, recovery any, operationID string) ([]any, bool) {
+	refs := map[string]map[string]bool{}
+	for _, container := range anySlice(nested(pod, "spec", "containers")) {
+		for _, env := range anySlice(nested(container, "env")) {
+			ref := nested(env, "valueFrom", "secretKeyRef")
+			name := text(nested(ref, "name"))
+			if name != "" {
+				if refs[name] == nil {
+					refs[name] = map[string]bool{}
+				}
+				if key := text(nested(ref, "key")); key != "" {
+					refs[name][key] = true
+				}
+			}
+		}
+	}
+	for _, volume := range anySlice(nested(pod, "spec", "volumes")) {
+		secret := nested(volume, "secret")
+		name := text(nested(secret, "secretName"))
+		if name == "" {
+			continue
+		}
+		if refs[name] == nil {
+			refs[name] = map[string]bool{}
+		}
+		for _, item := range anySlice(nested(secret, "items")) {
+			if key := text(nested(item, "key")); key != "" {
+				refs[name][key] = true
+			}
+		}
+	}
+	if name := text(nested(recovery, "spec", "membership", "replacementSecret")); name != "" {
+		if refs[name] == nil {
+			refs[name] = map[string]bool{}
+		}
+	}
+	names := make([]string, 0, len(refs))
+	for name := range refs {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	truncated := len(names) > 8
+	if truncated {
+		names = names[:8]
+	}
+	var observations []any
+	for _, name := range names {
+		required := refs[name]
+		secret, err := get(ctx, "secret", name)
+		if err != nil {
+			observations = append(observations, obj{"name": name, "found": false, "querySucceeded": isKubeNotFound(err), "keysPresent": false})
+			continue
+		}
+		data, _ := nested(secret, "data").(map[string]any)
+		keysPresent := len(data) > 0
+		for key := range required {
+			if _, ok := data[key]; !ok {
+				keysPresent = false
+			}
+		}
+		observations = append(observations, obj{"name": name, "uid": nested(secret, "metadata", "uid"), "found": true,
+			"querySucceeded":        true,
+			"immutable":             nested(secret, "immutable") == true,
+			"ownerMatchesOperation": nested(secret, "metadata", "annotations", "rhiza.mrchypark.dev/recovery-owner") == operationID,
+			"keysPresent":           keysPresent,
+		})
+	}
+	return observations, truncated
+}
+
+func isKubeNotFound(err error) bool {
+	if err == nil {
+		return false
+	}
+	message := strings.ToLower(err.Error())
+	return strings.Contains(message, "(notfound)") || strings.Contains(message, "not found")
+}
+
+func anySlice(value any) []any {
+	items, _ := value.([]any)
+	return items
+}
+
+func eventsForLearnerUID(events []any, learnerUID string) []any {
+	if learnerUID == "" {
+		return []any{}
+	}
+	matched := make([]any, 0)
+	for _, event := range events {
+		if nested(event, "involvedObject", "uid") == learnerUID {
+			matched = append(matched, event)
+		}
+	}
+	return matched
 }
 
 func checkRows(ctx context.Context, f *forward, token, expected string) error {
