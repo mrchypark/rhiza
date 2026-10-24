@@ -204,6 +204,61 @@ func TestFencerRejectionProjectionUsesFixedCodesOnly(t *testing.T) {
 	}
 }
 
+func TestFencerStartupGrantRejectionProjectionUsesFixedCodes(t *testing.T) {
+	const canary = "private-backend-detail-canary"
+	tests := []struct {
+		name      string
+		sourceErr string
+		wantCode  string
+	}{
+		{"startup authority unavailable", "fencing: startup authority unavailable", "startup_authority_unavailable"},
+		{"learner identity label differs", "fencing: learner identity label differs", "learner_identity_label_mismatch"},
+		{"learner logical identity unassigned", "fencing: learner logical identity is not yet assigned by canonical authority", "learner_logical_identity_unassigned"},
+		{"automatic control store unavailable", "fencing: canonical automatic control store is unavailable", "automatic_control_store_unavailable"},
+		{"learner StatefulSet owner differs", "fencing: learner StatefulSet owner differs", "learner_statefulset_owner_mismatch"},
+		{"learner root identity ambiguous", "fencing: learner root identity is ambiguous", "learner_root_identity_ambiguous"},
+		{"automatic learner root unavailable", "fencing: learner automatic root is unavailable", "learner_automatic_root_unavailable"},
+		{"learner control record unavailable", "fencing: canonical learner control record unavailable: " + canary, "learner_control_record_unavailable"},
+		{"automatic learner binding hash differs", "fencing: automatic learner binding hash differs", "automatic_learner_binding_hash_mismatch"},
+		{"pending-removal assignment missing", "fencing: learner is not in a durable pending-removal assignment", "learner_pending_removal_assignment_missing"},
+		{"learner removal proof cohort mismatch", "fencing: learner removal proof is not bound to the canonical cohort", "learner_removal_proof_cohort_mismatch"},
+		{"unjournaled learner recovery child ambiguous", "fencing: unjournaled learner recovery child is ambiguous", "learner_recovery_child_ambiguous"},
+		{"learner recovery child intent mismatch", "fencing: learner recovery child differs from canonical intent", "learner_recovery_child_intent_mismatch"},
+		{"completed learner membership not canonical", "fencing: completed learner membership is not canonical: " + canary, "learner_membership_not_canonical"},
+		{"learner operation ownership differs", "fencing: learner operation ownership differs", "learner_operation_ownership_mismatch"},
+		{"learner binding missing", "fencing: learner binding missing", "learner_binding_missing"},
+		{"learner root binding differs", "fencing: learner root binding differs", "learner_root_binding_mismatch"},
+		{"learner credentials changed", "fencing: learner credentials changed", "learner_credentials_changed"},
+		{"learner member differs", "fencing: learner member differs", "learner_member_mismatch"},
+		{"static startup workload not enrolled", "fencing: static startup workload is not enrolled", "static_startup_workload_not_enrolled"},
+		{"canonical terminal authority unavailable", "fencing: canonical terminal authority is unavailable", "canonical_terminal_authority_unavailable"},
+		{"canonical terminal authority unavailable with cause", "fencing: canonical terminal authority is unavailable: " + canary, "canonical_terminal_authority_unavailable"},
+		{"canonical old-voter closure differs", "fencing: canonical old-voter closure differs", "canonical_old_voter_closure_mismatch"},
+		{"canonical old-voter terminal proof differs", "fencing: canonical old-voter terminal proof differs: " + canary, "canonical_old_voter_terminal_proof_mismatch"},
+		{"canonical old-voter terminal coverage differs", "fencing: canonical old-voter terminal coverage differs: " + canary, "canonical_old_voter_terminal_coverage_mismatch"},
+		{"canonical old-voter run not terminally closed", "fencing: canonical old-voter run is not terminally closed", "canonical_old_voter_run_not_terminally_closed"},
+		{"canonical old-voter terminal evidence unavailable", "fencing: canonical old-voter terminal evidence is unavailable", "canonical_old_voter_terminal_evidence_unavailable"},
+		{"canonical old-voter terminal run missing", "fencing: canonical old-voter terminal run is missing", "canonical_old_voter_terminal_run_missing"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			line := "2026/10/24 10:00:00 fencing supervisor transition rejected: action=register podUID=private-pod-uid error=fencing: register startup-grant rejected: " + tt.sourceErr
+			got, ok := classifySupervisorRejection(line)
+			want := supervisorRejectionDiagnostic{Stage: "transition", Action: "register", Code: tt.wantCode}
+			if !ok || got != want {
+				t.Fatalf("classified rejection = %+v, %t; want %+v", got, ok, want)
+			}
+			view := fencerDiagnosticsView{}
+			view.Logs.Captured = true
+			view.Logs.Rejections = []supervisorRejectionDiagnostic{got}
+			public, err := safeJSON("fencer-diagnostics.json", encoded(view))
+			if err != nil || bytes.Contains(public, []byte(canary)) || bytes.Contains(public, []byte("private-pod-uid")) {
+				t.Fatalf("safe rejection projection failed or leaked private values: %v", err)
+			}
+		})
+	}
+}
+
 func TestFencerRejectionProjectionIsBounded(t *testing.T) {
 	var lines []string
 	for i := 0; i < maxSupervisorRejectionDiagnostics+2; i++ {
