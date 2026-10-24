@@ -408,6 +408,53 @@ func TestImmutableImageResolutionDescriptors(t *testing.T) {
 			}
 		})
 	}
+	withoutTarget := []byte(platformIndex(platformManifest(amd64, 202, "linux", "amd64")))
+	withoutTargetID := fmt.Sprintf("sha256:%x", sha256.Sum256(withoutTarget))
+	if _, err := imageDescriptor(withoutTargetID, withoutTarget, imagePlatform{}); err == nil {
+		t.Fatal("accepted index resolution without target platform")
+	}
+
+	// The run's built image Id may be an OCI index rather than a config digest.
+	// Model the produced artifact's platform index, target manifest, and config
+	// descriptor, all keyed by their actual content hashes.
+	hashContent := func(content string) string {
+		return fmt.Sprintf("sha256:%x", sha256.Sum256([]byte(content)))
+	}
+	configID := "sha256:" + strings.Repeat("e", 64)
+	leaf := fmt.Sprintf(`{"config":{"digest":%q}}`, configID)
+	leafID := hashContent(leaf)
+	attestationID := "sha256:" + strings.Repeat("f", 64)
+	builtPlatformIndex := fmt.Sprintf(`{"manifests":[{"digest":%q,"size":%d,"mediaType":"application/vnd.oci.image.manifest.v1+json","platform":{"os":"linux","architecture":"amd64"}},{"digest":%q,"size":564,"mediaType":"application/vnd.oci.image.manifest.v1+json","platform":{"os":"unknown","architecture":"unknown"}}]}`, leafID, len(leaf), attestationID)
+	platformIndexID := hashContent(builtPlatformIndex)
+	builtIndexID := platformIndexID
+	contents := map[string][]byte{platformIndexID: []byte(builtPlatformIndex), leafID: []byte(leaf)}
+	resolved := builtIndexID
+	for range 2 {
+		content := contents[resolved]
+		next, err := imageDescriptor(resolved, content, linuxAMD64)
+		if err != nil {
+			t.Fatalf("resolve built descriptor %s: %v", resolved, err)
+		}
+		if resolved == leafID {
+			if builtIndexID == configID || next != configID {
+				t.Fatalf("built index/config identity: index=%s config=%s resolved=%s", builtIndexID, configID, next)
+			}
+			break
+		}
+		resolved = next
+	}
+	if resolved != leafID {
+		t.Fatalf("built target-platform chain did not reach leaf manifest: %s", resolved)
+	}
+	if !imageConfigMatches(configID, configID) {
+		t.Fatal("rejected the existing built config-digest identity path")
+	}
+	if imageConfigMatches(configID, builtIndexID) {
+		t.Fatal("accepted the OCI index digest as a config identity")
+	}
+	if imageConfigMatches(configID, amd64) {
+		t.Fatal("accepted a different built target-platform config identity")
+	}
 }
 
 func TestFixtureHoldsWritersUntilSupervisorAndStoreReady(t *testing.T) {
