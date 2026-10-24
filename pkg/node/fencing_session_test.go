@@ -70,7 +70,18 @@ func TestFenceStartupRejectsLegacyAndRolelessAssignedResponses(t *testing.T) {
 	for name, body := range map[string][]byte{"legacy identity": legacy, "assigned envelope without role": roleless} {
 		t.Run(name, func(t *testing.T) {
 			t.Setenv("RHIZA_POD_NAME", physical)
-			socket := filepath.Join(t.TempDir(), "startup.sock")
+			// Keep the AF_UNIX path below macOS sockaddr_un limits; t.TempDir
+			// includes this long test and subtest name in its path.
+			socketDir, err := os.MkdirTemp("", "rhiza-bind-")
+			if err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(func() {
+				if err := os.RemoveAll(socketDir); err != nil {
+					t.Error(err)
+				}
+			})
+			socket := filepath.Join(socketDir, "s")
 			listener, err := net.Listen("unix", socket)
 			if err != nil {
 				t.Fatal(err)
