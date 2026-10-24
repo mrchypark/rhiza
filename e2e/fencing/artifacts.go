@@ -32,6 +32,366 @@ func publicCRIImage(cri obj) obj {
 	return obj{"status": obj{"id": nested(cri, "status", "id"), "repoDigests": nested(cri, "status", "repoDigests")}}
 }
 
+func publicOnlineVoterDiagnostics(data []byte) ([]byte, error) {
+	var source obj
+	if err := json.Unmarshal(data, &source); err != nil {
+		return nil, err
+	}
+	view := onlineVoterDiagnosticsView{
+		RecoveryFound:                  source["recoveryFound"] == true,
+		PodsQuerySucceeded:             source["podsQuerySucceeded"] == true,
+		EventsQuerySucceeded:           source["eventsQuerySucceeded"] == true,
+		RecoveryQuerySucceeded:         source["recoveryQuerySucceeded"] == true,
+		ParentQuerySucceeded:           source["parentQuerySucceeded"] == true,
+		ParentRecoveryMatchesOperation: source["parentRecoveryMatchesOperation"] == true,
+		Conditions:                     []onlineLearnerConditionView{},
+		Containers:                     []onlineLearnerContainerView{}, Events: []onlineLearnerEventView{}, Secrets: []onlineLearnerSecretView{},
+	}
+	if source["recoveryFound"] != true && source["recoveryFound"] != false {
+		return nil, fmt.Errorf("online voter recovery observation is invalid")
+	}
+	if source["parentQuerySucceeded"] != true && source["parentQuerySucceeded"] != false {
+		return nil, fmt.Errorf("online voter parent observation is invalid")
+	}
+	for _, key := range []string{"podsQuerySucceeded", "eventsQuerySucceeded", "recoveryQuerySucceeded"} {
+		if source[key] != true && source[key] != false {
+			return nil, fmt.Errorf("online voter %s observation is invalid", key)
+		}
+	}
+	view.PodsQuerySucceeded = source["podsQuerySucceeded"] == true
+	view.EventsQuerySucceeded = source["eventsQuerySucceeded"] == true
+	view.RecoveryQuerySucceeded = source["recoveryQuerySucceeded"] == true
+	recovery := source["recovery"]
+	if view.RecoveryFound {
+		if recovery == nil {
+			return nil, fmt.Errorf("online voter recovery observation is incomplete")
+		}
+		view.RecoveryPhase = safeKubePhase(text(nested(recovery, "status", "phase")))
+		view.RecoveryStage = safeKubePhase(text(nested(recovery, "status", "stage")))
+		view.MembershipPhase = safeKubePhase(text(nested(recovery, "status", "membership", "phase")))
+	} else if recovery != nil {
+		return nil, fmt.Errorf("online voter recovery observation contradicts its presence flag")
+	}
+	parent := source["parent"]
+	if view.ParentQuerySucceeded && parent == nil {
+		return nil, fmt.Errorf("online voter parent observation is incomplete")
+	}
+	if view.ParentQuerySucceeded {
+		view.ParentPhase = safeKubePhase(text(nested(parent, "status", "phase")))
+	}
+	membership := source["membershipObservation"]
+	if membership != nil {
+		for _, key := range []string{"checked", "available", "authRejected", "nodeMatchesAdd", "walMatchesAdd", "clusterMatchesActive", "voting", "pending"} {
+			if nested(membership, key) != true && nested(membership, key) != false {
+				return nil, fmt.Errorf("online voter membership observation is invalid")
+			}
+		}
+		view.MembershipChecked = nested(membership, "checked") == true
+		view.MembershipAvailable = nested(membership, "available") == true
+		view.MembershipAuthRejected = nested(membership, "authRejected") == true
+		view.MembershipNodeMatchesAdd = nested(membership, "nodeMatchesAdd") == true
+		view.MembershipWALMatchesAdd = nested(membership, "walMatchesAdd") == true
+		view.MembershipClusterMatchesActive = nested(membership, "clusterMatchesActive") == true
+		view.MembershipVoting = nested(membership, "voting") == true
+		view.MembershipPending = nested(membership, "pending") == true
+	}
+	secretObservations, _ := source["secretObservations"].([]any)
+	if source["secretObservationsTruncated"] != true && source["secretObservationsTruncated"] != false {
+		return nil, fmt.Errorf("online voter secret observation completeness is invalid")
+	}
+	view.SecretObservationsTruncated = source["secretObservationsTruncated"] == true
+	view.SecretReferences = len(secretObservations)
+	view.SecretKeysPresent = len(secretObservations) > 0
+	for _, secret := range secretObservations {
+		if nested(secret, "querySucceeded") != true {
+			view.SecretQueryFailures++
+		}
+		if nested(secret, "found") == true {
+			view.SecretsFound++
+			view.Secrets = append(view.Secrets, onlineLearnerSecretView{
+				UID: safeKubernetesUID(text(nested(secret, "uid"))), Found: true,
+				QuerySucceeded: nested(secret, "querySucceeded") == true,
+				Immutable:      nested(secret, "immutable") == true, KeysPresent: nested(secret, "keysPresent") == true,
+			})
+		} else {
+			view.SecretKeysPresent = false
+			view.Secrets = append(view.Secrets, onlineLearnerSecretView{Found: false, QuerySucceeded: nested(secret, "querySucceeded") == true})
+			continue
+		}
+		if nested(secret, "immutable") == true && nested(secret, "ownerMatchesOperation") == true {
+			view.ImmutableSecrets++
+		} else {
+			view.SecretKeysPresent = false
+		}
+		if nested(secret, "keysPresent") != true {
+			view.SecretKeysPresent = false
+		}
+	}
+	learner := source["learner"]
+	view.LearnerFound = learner != nil
+	if learner != nil {
+		view.LearnerMatchesFaultTargetUID = text(nested(learner, "metadata", "uid")) != "" && nested(learner, "metadata", "uid") == source["faultTargetPodUID"]
+		view.LearnerMatchesFaultTargetIP = text(nested(learner, "status", "podIP")) != "" && nested(learner, "status", "podIP") == source["faultTargetIP"]
+		view.LearnerPhase = safePodPhase(text(nested(learner, "status", "phase")))
+		conditions, _ := nested(learner, "status", "conditions").([]any)
+		if len(conditions) > 12 {
+			conditions = conditions[:12]
+		}
+		for _, condition := range conditions {
+			typ := text(nested(condition, "type"))
+			if typ != "Ready" && typ != "ContainersReady" && typ != "Initialized" && typ != "PodScheduled" {
+				continue
+			}
+			status := text(nested(condition, "status"))
+			if status != "True" && status != "False" && status != "Unknown" {
+				status = "Other"
+			}
+			view.Conditions = append(view.Conditions, onlineLearnerConditionView{Type: typ, Status: status, Reason: safeContainerReason(text(nested(condition, "reason")))})
+		}
+		statuses, _ := nested(learner, "status", "containerStatuses").([]any)
+		if len(statuses) > 8 {
+			statuses = statuses[:8]
+		}
+		for _, status := range statuses {
+			view.Containers = append(view.Containers, onlineLearnerContainerView{
+				Ready:                nested(status, "ready") == true,
+				RestartCount:         boundedRestartCount(nested(status, "restartCount")),
+				WaitingReason:        safeContainerReason(text(nested(status, "state", "waiting", "reason"))),
+				TerminatedReason:     safeContainerReason(text(nested(status, "state", "terminated", "reason"))),
+				ExitCode:             safeExitCode(nested(status, "state", "terminated", "exitCode")),
+				LastTerminatedReason: safeContainerReason(text(nested(status, "lastState", "terminated", "reason"))),
+				LastExitCode:         safeExitCode(nested(status, "lastState", "terminated", "exitCode")),
+			})
+		}
+	}
+	events, _ := source["events"].([]any)
+	for _, event := range events {
+		if text(nested(event, "type")) != "Warning" {
+			continue
+		}
+		reason := safeEventReason(text(nested(event, "reason")))
+		if reason == "" {
+			continue
+		}
+		view.Events = append(view.Events, onlineLearnerEventView{
+			Reason:  reason,
+			Message: classifyLearnerEventMessage(reason, text(nested(event, "message"))),
+			Count:   boundedRestartCount(nested(event, "count")),
+		})
+	}
+	if len(view.Events) > 30 {
+		view.Events = view.Events[len(view.Events)-30:]
+	}
+	return json.Marshal(view)
+}
+
+func projectOnlineVoterDiagnostics(raw string, data []byte) ([]byte, error) {
+	projected, err := publicOnlineVoterDiagnostics(data)
+	if err != nil {
+		return nil, err
+	}
+	var view onlineVoterDiagnosticsView
+	if err := json.Unmarshal(projected, &view); err != nil {
+		return nil, err
+	}
+	dir := filepath.Join(raw, "private-online-voter-diagnostics")
+	entries, err := os.ReadDir(dir)
+	if os.IsNotExist(err) {
+		return projected, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	for _, entry := range entries {
+		name := entry.Name()
+		period := ""
+		switch {
+		case strings.HasPrefix(name, "learner-current-") && strings.HasSuffix(name, ".log"):
+			period = "current"
+		case strings.HasPrefix(name, "learner-previous-") && strings.HasSuffix(name, ".log"):
+			period = "previous"
+		default:
+			continue
+		}
+		info, err := entry.Info()
+		if err != nil || !info.Mode().IsRegular() || entry.Type()&os.ModeSymlink != 0 || info.Size() > 32<<10 {
+			continue
+		}
+		file, err := os.Open(filepath.Join(dir, name))
+		if err != nil {
+			continue
+		}
+		contents, readErr := io.ReadAll(io.LimitReader(file, (32<<10)+1))
+		closeErr := file.Close()
+		if readErr != nil || closeErr != nil || len(contents) > 32<<10 {
+			continue
+		}
+		digest := sha256.Sum256(contents)
+		failures := classifyVoterStartupLog(contents)
+		stages, stagesTruncated := classifyVoterStartupStages(contents)
+		lower := strings.ToLower(string(contents))
+		if strings.Contains(lower, "fatal") && !hasString(failures, "fatal_error") {
+			failures = append(failures, "fatal_error")
+		}
+		if strings.Contains(lower, "panic:") && !hasString(failures, "panic") {
+			failures = append(failures, "panic")
+		}
+		startupFailure := view.LearnerPhase != "Running"
+		for _, container := range view.Containers {
+			startupFailure = startupFailure || !container.Ready || container.WaitingReason != "" || container.TerminatedReason != ""
+		}
+		if startupFailure && len(failures) == 0 && len(bytes.TrimSpace(contents)) > 0 {
+			failures = []string{"unknown_startup_error"}
+		}
+		if startupFailure && len(stages) == 0 && len(bytes.TrimSpace(contents)) > 0 {
+			stages = []string{"node_open/outer_wrapper_unparsed"}
+		}
+		view.Logs = append(view.Logs, onlineLearnerLogView{
+			Period: period, Captured: true, Bytes: len(contents), SHA256: hex.EncodeToString(digest[:]),
+			Failures: failures, Stages: stages, Truncated: stagesTruncated,
+		})
+	}
+	return json.Marshal(view)
+}
+
+func hasString(values []string, target string) bool {
+	for _, value := range values {
+		if value == target {
+			return true
+		}
+	}
+	return false
+}
+
+func safeKubePhase(value string) string {
+	switch value {
+	case "Pending", "Running", "Succeeded", "Failed", "Blocked", "Healthy", "Degraded", "Complete", "Completed", "Fencing", "Recovering", "Stabilizing", "Creating", "Adding", "Removing", "Aborting", "Aborted":
+		return value
+	default:
+		if value == "" {
+			return ""
+		}
+		return "Other"
+	}
+}
+
+func safePodPhase(value string) string {
+	switch value {
+	case "Pending", "Running", "Succeeded", "Failed":
+		return value
+	default:
+		if value == "" {
+			return ""
+		}
+		return "Other"
+	}
+}
+
+func safeKubernetesUID(value string) string {
+	if len(value) != 36 {
+		return ""
+	}
+	for i, c := range value {
+		if i == 8 || i == 13 || i == 18 || i == 23 {
+			if c != '-' {
+				return ""
+			}
+			continue
+		}
+		if !strings.ContainsRune("0123456789abcdef", c) {
+			return ""
+		}
+	}
+	return value
+}
+
+func safeContainerReason(value string) string {
+	switch value {
+	case "CrashLoopBackOff", "ImagePullBackOff", "ErrImagePull", "CreateContainerConfigError", "CreateContainerError", "ContainerCreating", "RunContainerError", "OOMKilled", "Error", "Completed", "ContainerCannotRun", "DeadlineExceeded", "StartError":
+		return value
+	default:
+		if value == "" {
+			return ""
+		}
+		return "Other"
+	}
+}
+
+func safeEventReason(value string) string {
+	switch value {
+	case "BackOff", "Unhealthy", "Failed", "FailedMount", "FailedCreate", "FailedScheduling", "NetworkNotReady", "Killing", "Pulled", "Started":
+		return value
+	default:
+		return ""
+	}
+}
+
+func classifyLearnerEventMessage(reason, message string) string {
+	message = strings.ToLower(message)
+	switch {
+	case reason == "BackOff" && strings.Contains(message, "back-off restarting failed container"):
+		return "container restart backoff"
+	case reason == "Unhealthy" && strings.Contains(message, "connection refused"):
+		return "probe connection refused"
+	case reason == "Unhealthy" && strings.Contains(message, "http probe failed with statuscode:"):
+		if code := eventHTTPStatusCode(message); code != "" {
+			return "HTTP probe failed, status " + code
+		}
+		return "readiness probe failed"
+	case reason == "Unhealthy" && strings.Contains(message, "context deadline exceeded"):
+		return "probe deadline exceeded"
+	case reason == "Unhealthy" && strings.Contains(message, "readiness probe failed"):
+		return "readiness probe failed"
+	case reason == "Unhealthy" && strings.Contains(message, "liveness probe failed"):
+		return "liveness probe failed"
+	case reason == "Unhealthy" && strings.Contains(message, "startup probe failed"):
+		return "startup probe failed"
+	case reason == "Failed" && strings.Contains(message, "failed to pull image"):
+		return "image pull failed"
+	case reason == "Failed" && strings.Contains(message, "failed to create pod sandbox"):
+		return "pod sandbox creation failed"
+	default:
+		return ""
+	}
+}
+
+func eventHTTPStatusCode(message string) string {
+	return safeHTTPStatusCode(message, "http probe failed with statuscode:")
+}
+
+func safeHTTPStatusCode(message, marker string) string {
+	index := strings.Index(strings.ToLower(message), strings.ToLower(marker))
+	if index < 0 {
+		return ""
+	}
+	value := strings.TrimSpace(message[index+len(marker):])
+	if len(value) > 3 {
+		value = value[:3]
+	}
+	code, err := strconv.Atoi(value)
+	if err != nil || code < 100 || code > 599 {
+		return ""
+	}
+	return strconv.Itoa(code)
+}
+
+func boundedRestartCount(value any) int32 {
+	count, ok := value.(float64)
+	if !ok || count < 0 || count > 1_000_000 {
+		return 0
+	}
+	return int32(count)
+}
+
+func safeExitCode(value any) *int32 {
+	code, ok := value.(float64)
+	if !ok || code < -255 || code > 255 {
+		return nil
+	}
+	result := int32(code)
+	return &result
+}
+
 type descriptorView struct {
 	Config struct {
 		Digest string `json:"digest"`
@@ -429,6 +789,85 @@ type fencerEventsView struct {
 	} `json:"warnings"`
 }
 
+// onlineVoterDiagnosticsView is an allowlist projection of the private
+// operation-bound learner snapshot. It intentionally excludes names, UIDs,
+// addresses, resource specs, event messages, and raw container logs.
+type onlineVoterDiagnosticsView struct {
+	RecoveryFound                  bool                         `json:"recoveryFound"`
+	PodsQuerySucceeded             bool                         `json:"podsQuerySucceeded"`
+	EventsQuerySucceeded           bool                         `json:"eventsQuerySucceeded"`
+	RecoveryQuerySucceeded         bool                         `json:"recoveryQuerySucceeded"`
+	RecoveryPhase                  string                       `json:"recoveryPhase,omitempty"`
+	RecoveryStage                  string                       `json:"recoveryStage,omitempty"`
+	MembershipPhase                string                       `json:"membershipPhase,omitempty"`
+	ParentQuerySucceeded           bool                         `json:"parentQuerySucceeded"`
+	ParentPhase                    string                       `json:"parentPhase,omitempty"`
+	ParentRecoveryMatchesOperation bool                         `json:"parentRecoveryMatchesOperation"`
+	LearnerMatchesFaultTargetUID   bool                         `json:"learnerMatchesFaultTargetUID"`
+	LearnerMatchesFaultTargetIP    bool                         `json:"learnerMatchesFaultTargetIP"`
+	LearnerFound                   bool                         `json:"learnerFound"`
+	LearnerPhase                   string                       `json:"learnerPhase,omitempty"`
+	SecretReferences               int                          `json:"secretReferences"`
+	SecretObservationsTruncated    bool                         `json:"secretObservationsTruncated"`
+	SecretQueryFailures            int                          `json:"secretQueryFailures"`
+	SecretsFound                   int                          `json:"secretsFound"`
+	ImmutableSecrets               int                          `json:"immutableSecrets"`
+	SecretKeysPresent              bool                         `json:"secretKeysPresent"`
+	Secrets                        []onlineLearnerSecretView    `json:"secrets"`
+	MembershipChecked              bool                         `json:"membershipChecked"`
+	MembershipAvailable            bool                         `json:"membershipAvailable"`
+	MembershipAuthRejected         bool                         `json:"membershipAuthRejected"`
+	MembershipNodeMatchesAdd       bool                         `json:"membershipNodeMatchesAdd"`
+	MembershipWALMatchesAdd        bool                         `json:"membershipWALMatchesAdd"`
+	MembershipClusterMatchesActive bool                         `json:"membershipClusterMatchesActive"`
+	MembershipVoting               bool                         `json:"membershipVoting"`
+	MembershipPending              bool                         `json:"membershipPending"`
+	Conditions                     []onlineLearnerConditionView `json:"conditions"`
+	Containers                     []onlineLearnerContainerView `json:"containers"`
+	Events                         []onlineLearnerEventView     `json:"events"`
+	Logs                           []onlineLearnerLogView       `json:"logs"`
+}
+
+type onlineLearnerSecretView struct {
+	UID            string `json:"uid,omitempty"`
+	Found          bool   `json:"found"`
+	QuerySucceeded bool   `json:"querySucceeded"`
+	Immutable      bool   `json:"immutable"`
+	KeysPresent    bool   `json:"keysPresent"`
+}
+
+type onlineLearnerConditionView struct {
+	Type   string `json:"type"`
+	Status string `json:"status"`
+	Reason string `json:"reason,omitempty"`
+}
+
+type onlineLearnerContainerView struct {
+	Ready                bool   `json:"ready"`
+	RestartCount         int32  `json:"restartCount"`
+	WaitingReason        string `json:"waitingReason,omitempty"`
+	TerminatedReason     string `json:"terminatedReason,omitempty"`
+	ExitCode             *int32 `json:"exitCode,omitempty"`
+	LastTerminatedReason string `json:"lastTerminatedReason,omitempty"`
+	LastExitCode         *int32 `json:"lastExitCode,omitempty"`
+}
+
+type onlineLearnerEventView struct {
+	Reason  string `json:"reason"`
+	Message string `json:"message,omitempty"`
+	Count   int32  `json:"count,omitempty"`
+}
+
+type onlineLearnerLogView struct {
+	Period    string   `json:"period"`
+	Captured  bool     `json:"captured"`
+	Bytes     int      `json:"bytes"`
+	SHA256    string   `json:"sha256,omitempty"`
+	Failures  []string `json:"failures,omitempty"`
+	Stages    []string `json:"stages,omitempty"`
+	Truncated bool     `json:"truncated,omitempty"`
+}
+
 type fencerDeploymentView struct {
 	Name                string `json:"name"`
 	UID                 string `json:"uid"`
@@ -544,6 +983,11 @@ var allowedVoterReasons = map[string]struct{}{
 }
 
 var voterStartupPrefixes = []struct{ prefix, category string }{
+	{"fencing: supervisor must be PID 1 in a private process namespace", "supervisor_pid_namespace_invalid"},
+	{"fencing: incomplete supervisor configuration", "supervisor_config_incomplete"},
+	{"fencing: child exited without a terminal receipt:", "supervisor_child_exit_unreceipted"},
+	{"fork/exec ", "supervisor_child_exec_failed"},
+	{"exec: ", "supervisor_child_exec_failed"},
 	{"invalid RHIZA_", "config_invalid"},
 	{"conflicting RHIZA_", "config_conflict"},
 	{"fencing:", "supervisor_admission_failed"},
@@ -720,6 +1164,8 @@ func safeJSON(name string, data []byte) ([]byte, error) {
 		value = &fencerPodsView{}
 	case name == "fencer-events.json":
 		value = &fencerEventsView{}
+	case name == "online-voter-diagnostics.json":
+		return publicOnlineVoterDiagnostics(data)
 	case name == "fencer-deployment.json":
 		value = &fencerDeploymentView{}
 	case name == "voter-startup-private.json":
@@ -884,13 +1330,44 @@ func classifyVoterStartupStages(data []byte) ([]string, bool) {
 	var stages []string
 	truncated := false
 	for _, line := range strings.Split(string(data), "\n") {
-		if len(line) < 20+len("open rhiza: ") {
+		if len(line) < 20 {
 			continue
 		}
-		if _, err := time.Parse("2006/01/02 15:04:05 ", line[:20]); err != nil || !strings.HasPrefix(line[20:], "open rhiza: ") {
+		if _, err := time.Parse("2006/01/02 15:04:05 ", line[:20]); err != nil {
 			continue
 		}
-		errText := strings.TrimPrefix(line[20:], "open rhiza: ")
+		logText := line[20:]
+		var supervisorStage string
+		switch {
+		case strings.HasPrefix(logText, "fencing: supervisor must be PID 1 in a private process namespace"):
+			supervisorStage = "supervisor/pid_namespace_invalid"
+		case strings.HasPrefix(logText, "fencing: incomplete supervisor configuration"):
+			supervisorStage = "supervisor/config_incomplete"
+		case strings.HasPrefix(logText, "fencing: supervisor returned HTTP "):
+			supervisorStage = "supervisor/authority_rejected"
+			if code := safeHTTPStatusCode(logText, "fencing: supervisor returned HTTP "); code != "" {
+				supervisorStage += "_" + code
+			}
+		case strings.HasPrefix(logText, "fencing: child exited without a terminal receipt:"):
+			supervisorStage = "supervisor/child_exit_unreceipted"
+		case strings.HasPrefix(logText, "fork/exec ") || strings.HasPrefix(logText, "exec: "):
+			supervisorStage = "supervisor/child_exec_failed"
+		}
+		if supervisorStage != "" {
+			if !seen[supervisorStage] {
+				seen[supervisorStage] = true
+				if len(stages) < maxVoterStartupStages {
+					stages = append(stages, supervisorStage)
+				} else {
+					truncated = true
+				}
+			}
+			continue
+		}
+		if !strings.HasPrefix(logText, "open rhiza: ") {
+			continue
+		}
+		errText := strings.TrimPrefix(logText, "open rhiza: ")
 		unknownStage := "node_open/inner_error_unknown"
 		if strings.HasPrefix(errText, "node open phase ") {
 			phase, nested, ok := strings.Cut(strings.TrimPrefix(errText, "node open phase "), ": ")
@@ -923,6 +1400,9 @@ func classifyVoterStartupStages(data []byte) ([]string, bool) {
 				stageCode = "startup_grant/identity_mismatch"
 			case strings.HasPrefix(errText, "fencing: supervisor returned HTTP "):
 				stageCode = "startup_grant/rejected"
+				if code := safeHTTPStatusCode(errText, "fencing: supervisor returned HTTP "); code != "" {
+					stageCode += "_" + code
+				}
 			}
 			if !seen[stageCode] {
 				seen[stageCode] = true
@@ -2953,6 +3433,33 @@ func safeArtifacts(raw string) error {
 		}
 	} else if !os.IsNotExist(readErr) {
 		return fmt.Errorf("private voter diagnostics are unavailable")
+	}
+	privateOnlineDir := filepath.Join(raw, "private-online-voter-diagnostics")
+	if info, statErr := os.Lstat(privateOnlineDir); statErr == nil {
+		if !info.IsDir() || info.Mode()&os.ModeSymlink != 0 {
+			return fmt.Errorf("private online voter diagnostics directory is unsafe")
+		}
+		privatePath := filepath.Join(privateOnlineDir, "online-voter-diagnostics.json")
+		if info, statErr = os.Lstat(privatePath); statErr == nil {
+			if !info.Mode().IsRegular() || info.Mode()&os.ModeSymlink != 0 || info.Size() > 16<<20 {
+				return fmt.Errorf("private online voter diagnostics are unsafe or oversized")
+			}
+			privateData, readErr := os.ReadFile(privatePath)
+			if readErr != nil {
+				return fmt.Errorf("private online voter diagnostics are unavailable")
+			}
+			projected, projectErr := projectOnlineVoterDiagnostics(raw, privateData)
+			if projectErr != nil {
+				return projectErr
+			}
+			if err := os.WriteFile(filepath.Join(public, "online-voter-diagnostics.json"), projected, 0600); err != nil {
+				return err
+			}
+		} else if !os.IsNotExist(statErr) {
+			return fmt.Errorf("private online voter diagnostics are unavailable")
+		}
+	} else if !os.IsNotExist(statErr) {
+		return fmt.Errorf("private online voter diagnostics are unavailable")
 	}
 	ackLossSeen, err := projectGCSAckLossEvidence(raw, public, failedRun)
 	if err != nil {

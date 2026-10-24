@@ -51,6 +51,162 @@ func TestWorkflowExcludesRawKindArtifacts(t *testing.T) {
 	}
 }
 
+func TestOnlineVoterDiagnosticsProjectionIsBoundedAndSanitized(t *testing.T) {
+	privateCanary := "private-namespace-token-123"
+	input := obj{
+		"operationID":                    privateCanary,
+		"recoveryFound":                  true,
+		"podsQuerySucceeded":             true,
+		"eventsQuerySucceeded":           true,
+		"recoveryQuerySucceeded":         true,
+		"recovery":                       obj{"metadata": obj{"name": privateCanary}, "status": obj{"phase": "Blocked", "stage": "Adding", "membership": obj{"phase": "Adding"}}},
+		"parentQuerySucceeded":           true,
+		"parentRecoveryMatchesOperation": true,
+		"parent":                         obj{"status": obj{"phase": "Blocked", "activeClusterID": privateCanary}},
+		"secretObservations":             []any{obj{"name": privateCanary, "uid": "123e4567-e89b-12d3-a456-426614174000", "found": true, "querySucceeded": true, "immutable": true, "ownerMatchesOperation": true, "keysPresent": true}},
+		"secretObservationsTruncated":    false,
+		"membershipObservation":          obj{"checked": true, "available": true, "authRejected": false, "nodeMatchesAdd": true, "walMatchesAdd": true, "clusterMatchesActive": true, "voting": true, "pending": false, "status": obj{"nodeID": privateCanary, "clusterID": privateCanary, "walIdentity": privateCanary}},
+		"learner": obj{
+			"metadata": obj{"name": privateCanary, "uid": privateCanary},
+			"status": obj{"phase": "Running", "podIP": "10.0.0.1", "conditions": []any{obj{"type": "Ready", "status": "False", "reason": "ContainersNotReady", "message": privateCanary}}, "containerStatuses": []any{
+				obj{"ready": false, "restartCount": float64(7), "state": obj{"waiting": obj{"reason": "CrashLoopBackOff"}}, "lastState": obj{"terminated": obj{"reason": "Error", "exitCode": float64(23)}}},
+			}},
+		},
+		"events":            []any{obj{"type": "Warning", "reason": "BackOff", "message": "Back-off restarting failed container private-namespace-token-123", "count": float64(15)}},
+		"faultTargetPodUID": privateCanary, "faultTargetIP": "10.0.0.2", "learnerIP": "10.0.0.1",
+	}
+	data, err := json.Marshal(input)
+	if err != nil {
+		t.Fatal(err)
+	}
+	public, err := safeJSON("online-voter-diagnostics.json", data)
+	if err != nil {
+		t.Fatalf("strict online-voter diagnostic projection failed: %v", err)
+	}
+	if bytes.Contains(public, []byte(privateCanary)) || bytes.Contains(public, []byte("10.0.0.")) || bytes.Contains(public, []byte("back-off restarting failed container")) {
+		t.Fatalf("public online-voter diagnostics leaked a private identity, address or raw message: %s", public)
+	}
+	var got onlineVoterDiagnosticsView
+	if err := json.Unmarshal(public, &got); err != nil {
+		t.Fatal(err)
+	}
+	if !got.RecoveryFound || got.RecoveryPhase != "Blocked" || got.MembershipPhase != "Adding" || got.ParentPhase != "Blocked" || !got.ParentRecoveryMatchesOperation ||
+		!got.LearnerFound || got.LearnerPhase != "Running" || len(got.Conditions) != 1 || got.Conditions[0].Type != "Ready" || got.Conditions[0].Status != "False" || got.Conditions[0].Reason != "Other" || len(got.Containers) != 1 || got.Containers[0].Ready ||
+		got.SecretReferences != 1 || got.SecretsFound != 1 || got.ImmutableSecrets != 1 || !got.SecretKeysPresent || len(got.Secrets) != 1 || got.Secrets[0].UID != "123e4567-e89b-12d3-a456-426614174000" || !got.Secrets[0].Immutable || !got.Secrets[0].KeysPresent ||
+		!got.MembershipChecked || !got.MembershipAvailable || got.MembershipAuthRejected || !got.MembershipNodeMatchesAdd || !got.MembershipWALMatchesAdd || !got.MembershipClusterMatchesActive || !got.MembershipVoting || got.MembershipPending ||
+		got.Containers[0].RestartCount != 7 || got.Containers[0].WaitingReason != "CrashLoopBackOff" ||
+		got.Containers[0].LastTerminatedReason != "Error" || got.Containers[0].LastExitCode == nil || *got.Containers[0].LastExitCode != 23 ||
+		len(got.Events) != 1 || got.Events[0].Reason != "BackOff" || got.Events[0].Message != "container restart backoff" || got.Events[0].Count != 15 {
+		t.Fatalf("public online-voter diagnostics omitted bounded learner failure state: %+v", got)
+	}
+	if !got.LearnerMatchesFaultTargetUID || got.LearnerMatchesFaultTargetIP {
+		t.Fatalf("learner identity/IP reuse comparison was not reduced to safe booleans: %+v", got)
+	}
+	events := make([]any, 150)
+	for i := range events {
+		events[i] = obj{"type": "Warning", "reason": "Unhealthy", "message": "Readiness probe failed: connection refused; private=secret", "count": float64(i + 1)}
+	}
+	input["events"] = events
+	large, _ := json.Marshal(input)
+	bounded, err := publicOnlineVoterDiagnostics(large)
+	if err != nil {
+		t.Fatalf("large event set discarded otherwise useful diagnostics: %v", err)
+	}
+	if err := json.Unmarshal(bounded, &got); err != nil || len(got.Events) != 30 || got.Events[29].Message != "probe connection refused" {
+		t.Fatalf("public diagnostic event cut was not bounded to the newest usable causes: %d (%v)", len(got.Events), err)
+	}
+	input["unapproved"] = privateCanary
+	input["recoveryFound"] = "not-a-boolean"
+	data, _ = json.Marshal(input)
+	if _, err := safeJSON("online-voter-diagnostics.json", data); err == nil {
+		t.Fatal("accepted malformed online-voter diagnostic input")
+	}
+}
+
+func TestOnlineLearnerEventMessagesAreClassifiedWithoutPublishingRawText(t *testing.T) {
+	for _, test := range []struct{ message, want string }{
+		{"Readiness probe failed: Get https://private.example: connection refused; token=private-secret", "probe connection refused"},
+		{"Readiness probe failed: HTTP probe failed with statuscode: 503 private response", "HTTP probe failed, status 503"},
+		{"Liveness probe failed: context deadline exceeded private detail", "probe deadline exceeded"},
+		{"Readiness probe failed: private detail", "readiness probe failed"},
+	} {
+		got := classifyLearnerEventMessage("Unhealthy", test.message)
+		if got != test.want || strings.Contains(got, "private") || strings.Contains(got, "token") {
+			t.Fatalf("unsafe or imprecise sanitized probe message %q: %q", test.message, got)
+		}
+	}
+	stages, _ := classifyVoterStartupStages([]byte("2026/10/24 12:00:00 fencing: supervisor returned HTTP 403\n2026/10/24 12:00:01 open rhiza: connect fencing startup gate: fencing: supervisor returned HTTP 403\n"))
+	if !contains(stages, "supervisor/authority_rejected_403") || !contains(stages, "startup_grant/rejected_403") {
+		t.Fatalf("supervisor grant rejection status was not retained safely: %v", stages)
+	}
+}
+
+func TestOnlineVoterDiagnosticsArtifactKeepsOnlyUIDBoundAllowlistedProjection(t *testing.T) {
+	const learnerUID = "learner-uid-exact"
+	events := []any{
+		obj{"involvedObject": obj{"name": "learner", "uid": learnerUID}, "reason": "BackOff"},
+		obj{"involvedObject": obj{"name": "learner", "uid": "stale-learner-uid"}, "reason": "Unhealthy"},
+	}
+	matched := eventsForLearnerUID(events, learnerUID)
+	if len(matched) != 1 || nested(matched[0], "reason") != "BackOff" || len(eventsForLearnerUID(events, "")) != 0 {
+		t.Fatal("online learner diagnostics admitted a stale same-name Pod event")
+	}
+	raw := t.TempDir()
+	write := func(name string, data []byte) {
+		t.Helper()
+		if err := os.WriteFile(filepath.Join(raw, name), data, 0600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	write("actual-exit.txt", []byte("1\n"))
+	write("source-head.txt", []byte(strings.Repeat("a", 40)+"\n"))
+	write("image-ids.txt", []byte("ghcr.io/example/app@sha256:"+strings.Repeat("b", 64)+"\n"))
+	privateDir := filepath.Join(raw, "private-online-voter-diagnostics")
+	if err := os.Mkdir(privateDir, 0700); err != nil {
+		t.Fatal(err)
+	}
+	privateJSON := []byte(`{"recoveryFound":false,"podsQuerySucceeded":true,"eventsQuerySucceeded":true,"recoveryQuerySucceeded":true,"parentQuerySucceeded":true,"secretObservationsTruncated":false,"parent":{"status":{"phase":"Blocked"}},"learner":{"metadata":{"uid":"` + learnerUID + `"},"status":{"phase":"Running","podIP":"10.0.0.1","containerStatuses":[{"ready":false,"restartCount":2,"lastState":{"terminated":{"reason":"Error","exitCode":9}}}]}},"events":[{"type":"Warning","reason":"Unhealthy","message":"Readiness probe failed for ` + learnerUID + `","count":3}],"faultTargetPodUID":"private","faultTargetIP":"10.0.0.1","learnerIP":"10.0.0.1"}`)
+	if err := os.WriteFile(filepath.Join(privateDir, "online-voter-diagnostics.json"), privateJSON, 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(privateDir, "learner-current-rhiza.log"), []byte("open learner: fatal private-namespace-token-123\n2026/10/24 12:00:00 fork/exec /usr/local/bin/rhiza: private-path-no-such-file\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(privateDir, "learner-previous-rhiza.log"), []byte("configure learner: private-namespace-token-123\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("FENCING_E2E_OUT", raw)
+	if err := safeArtifacts(raw); err != nil {
+		t.Fatalf("online-voter failure artifact projection failed: %v", err)
+	}
+	public, err := os.ReadFile(filepath.Join(raw, "public", "online-voter-diagnostics.json"))
+	if err != nil || bytes.Contains(public, []byte(learnerUID)) || bytes.Contains(public, []byte("10.0.0.1")) || bytes.Contains(public, []byte("private-namespace-token-123")) || bytes.Contains(public, []byte("open learner:")) {
+		t.Fatalf("public online-voter artifact leaked identity, address or raw logs: %s (%v)", public, err)
+	}
+	var projected onlineVoterDiagnosticsView
+	if err := json.Unmarshal(public, &projected); err != nil || len(projected.Logs) != 2 || projected.Logs[0].SHA256 == "" || projected.Logs[1].SHA256 == "" {
+		t.Fatalf("sanitized current/previous learner log evidence was not preserved: %+v (%v)", projected.Logs, err)
+	}
+	knownFailures := map[string]bool{}
+	for _, log := range projected.Logs {
+		for _, failure := range log.Failures {
+			knownFailures[failure] = true
+		}
+	}
+	if !knownFailures["replica_open_failed"] || !knownFailures["role_config_failed"] || !knownFailures["fatal_error"] || !knownFailures["supervisor_child_exec_failed"] {
+		t.Fatalf("sanitized startup/fatal classifications were not preserved: %+v", projected.Logs)
+	}
+	if !contains(projected.Logs[0].Stages, "supervisor/child_exec_failed") || bytes.Contains(public, []byte("/usr/local/bin/rhiza")) {
+		t.Fatalf("supervisor failure stage was lost or raw executable path leaked: %+v", projected.Logs[0])
+	}
+	if _, err := os.Stat(filepath.Join(raw, "public", "private-online-voter-diagnostics")); !os.IsNotExist(err) {
+		t.Fatalf("private online-voter diagnostics were included publicly: %v", err)
+	}
+	if !projected.PodsQuerySucceeded || !projected.EventsQuerySucceeded || !projected.RecoveryQuerySucceeded {
+		t.Fatalf("private production query outcomes did not reach the public projection: %+v", projected)
+	}
+}
+
 func TestWorkflowPublishesOnlyPreKindFailureReceiptWhenQualificationIsSkipped(t *testing.T) {
 	data, err := os.ReadFile("../../.github/workflows/ci.yml")
 	if err != nil {
