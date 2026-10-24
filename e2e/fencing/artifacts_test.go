@@ -388,6 +388,28 @@ func TestVoterStartupStageProjectionClassifiesIdentityAndArchiveBoundaries(t *te
 	}
 }
 
+func TestVoterStartupStageProjectionPreservesPhaseAndNestedStage(t *testing.T) {
+	const canary = "private-phase-error-canary"
+	logs := strings.Join([]string{
+		"2026/10/24 10:00:00 open rhiza: node open phase identity_storage: ensure voter identity: fencing: runtime enrollment identity differs: " + canary,
+		"2026/10/24 10:00:01 open rhiza: node open phase network: " + canary,
+	}, "\n") + "\n"
+	stages, truncated := classifyVoterStartupStages([]byte(logs))
+	want := []string{"node_open/phase_identity_storage", "wal_binding/runtime_identity_mismatch", "node_open/phase_network", "node_open/inner_error_unknown"}
+	if truncated || len(stages) != len(want) {
+		t.Fatalf("phase/nested stage set = %v (truncated=%v), want %v", stages, truncated, want)
+	}
+	for i := range want {
+		if stages[i] != want[i] {
+			t.Fatalf("stage %d = %q, want %q", i, stages[i], want[i])
+		}
+	}
+	public, err := json.Marshal(stages)
+	if err != nil || bytes.Contains(public, []byte(canary)) {
+		t.Fatalf("fixed phase projection leaked nested error text: %v", err)
+	}
+}
+
 func TestVoterStartupStageProjectionIsBounded(t *testing.T) {
 	prefixes := []string{
 		"connect fencing startup gate: fencing: invalid startup grant:",

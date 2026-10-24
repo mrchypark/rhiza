@@ -39,6 +39,20 @@ type nodeObjectBucket interface {
 	Close() error
 }
 
+const (
+	nodeOpenPhaseConfiguration = "configuration"
+	nodeOpenPhaseFencing       = "fencing"
+	nodeOpenPhaseLocalState    = "local_state"
+	nodeOpenPhaseWAL           = "wal"
+	nodeOpenPhaseIdentityStore = "identity_storage"
+	nodeOpenPhaseArchive       = "archive"
+	nodeOpenPhaseMaterializer  = "materializer"
+	nodeOpenPhaseConsensus     = "consensus"
+	nodeOpenPhaseRecovery      = "recovery"
+	nodeOpenPhaseNetwork       = "network"
+	nodeOpenPhaseServices      = "services"
+)
+
 // Node is the main runtime container.
 type Node struct {
 	config                    *types.ExecutionConfig
@@ -184,6 +198,12 @@ func (n *Node) EnrollExistingVoter(ctx context.Context) error {
 }
 
 func (n *Node) open(ctx context.Context, enroll bool) (err error) {
+	phase := nodeOpenPhaseConfiguration
+	defer func() {
+		if err != nil {
+			err = fmt.Errorf("node open phase %s: %w", phase, err)
+		}
+	}()
 	if n.terminalRequested.Load() {
 		return fmt.Errorf("terminally drained node cannot reopen")
 	}
@@ -273,6 +293,7 @@ func (n *Node) open(ctx context.Context, enroll bool) (err error) {
 	}()
 	// Do not durably enroll a process until all pure configuration and
 	// admission checks have passed and failure cleanup is installed.
+	phase = nodeOpenPhaseFencing
 	if err := n.connectFenceSession(ctx); err != nil {
 		return err
 	}
@@ -284,6 +305,7 @@ func (n *Node) open(ctx context.Context, enroll bool) (err error) {
 	ctx, n.cancel = context.WithCancel(ctx)
 
 	// 1. Acquire lock file
+	phase = nodeOpenPhaseLocalState
 	cleanStart, lock, err := qlog.Acquire(n.config.DataDir + "/qlog")
 	if err != nil {
 		return fmt.Errorf("acquire lock: %w", err)
@@ -378,6 +400,7 @@ func (n *Node) open(ctx context.Context, enroll bool) (err error) {
 	}
 
 	// 2. Open WAL
+	phase = nodeOpenPhaseWAL
 	var wal *qlog.WAL
 	if n.config.Local {
 		wal, err = qlog.OpenLocalDeferredCleanup(n.config.DataDir + "/qlog")
@@ -398,6 +421,7 @@ func (n *Node) open(ctx context.Context, enroll bool) (err error) {
 		}
 	}
 	if objectStoreConfigured {
+		phase = nodeOpenPhaseIdentityStore
 		provider := objectstore.Provider(n.config.ObjStoreProvider)
 		if provider == "" {
 			provider = objectstore.ProviderS3
@@ -449,6 +473,7 @@ func (n *Node) open(ctx context.Context, enroll bool) (err error) {
 		if enroll {
 			return n.Shutdown()
 		}
+		phase = nodeOpenPhaseArchive
 		clusterPrefix := path.Join(n.config.ObjStorePrefix, string(n.config.ClusterID))
 		n.checkpoints = checkpoint.NewManager(runtimeBucket, clusterPrefix, n.config.DataDir, 1)
 		if loadErr := n.checkpoints.Load(ctx); loadErr != nil {
@@ -463,11 +488,13 @@ func (n *Node) open(ctx context.Context, enroll bool) (err error) {
 			return fmt.Errorf("load shared decision archive: %w", err)
 		}
 	}
+	phase = nodeOpenPhaseIdentityStore
 	if !objectStoreConfigured {
 		if err := ensureVoterIdentity(ctx, n.config, nil, n.wal, localVoter, enroll); err != nil {
 			return err
 		}
 	}
+	phase = nodeOpenPhaseRecovery
 	startupRecovery := &startupRecoveryGuard{ctx: ctx}
 	if n.checkpoints != nil {
 		owner, ownerErr := startupRecoveryOwner(string(n.config.NodeID))
@@ -486,6 +513,7 @@ func (n *Node) open(ctx context.Context, enroll bool) (err error) {
 		log.Println("non-clean start detected, recovering from WAL...")
 	}
 
+	phase = nodeOpenPhaseMaterializer
 	var material *materializer.Materializer
 	if localRestoreAuthority == nil {
 		material, err = materializer.Open(filepath.Join(n.config.DataDir, "sqlite.db"), 4)
@@ -511,6 +539,7 @@ func (n *Node) open(ctx context.Context, enroll bool) (err error) {
 	}
 
 	// 5. Create consensus core through the same public API available to external users.
+	phase = nodeOpenPhaseConsensus
 	cluster := n.loadClusterConfig()
 	var transport *network.Transport
 	var coreTransport quepaxa.Transport
@@ -603,6 +632,7 @@ func (n *Node) open(ctx context.Context, enroll bool) (err error) {
 			return n.checkpoints.Verify(ctx, uint64(seal.Index), seal.RootHash, seal.StateHash)
 		})
 	}
+	phase = nodeOpenPhaseRecovery
 	generationCheckpoint, err := n.installGenerationAnchor(startupRecovery)
 	if err != nil {
 		return fmt.Errorf("restore generation anchor: %w", startupRecovery.Check(err))
@@ -720,6 +750,7 @@ func (n *Node) open(ctx context.Context, enroll bool) (err error) {
 			return archive.SyncThrough(ctx, core, core.Tip())
 		})
 	}
+	phase = nodeOpenPhaseNetwork
 	if err := installArchiveDurabilityBarriers(server, core, n.archive, n.config.ObjStoreDurability, n.config.EnableReconfiguration, supervised); err != nil {
 		return err
 	}
@@ -736,6 +767,7 @@ func (n *Node) open(ctx context.Context, enroll bool) (err error) {
 	}
 	n.peer = peer
 
+	phase = nodeOpenPhaseRecovery
 	certifiedCheckpoint := generationCheckpoint
 	if n.checkpoints != nil {
 		seal, sealed, sealErr := core.LatestCheckpointSeal()
@@ -853,6 +885,7 @@ func (n *Node) open(ctx context.Context, enroll bool) (err error) {
 			return fmt.Errorf("publish certified checkpoint: %w", err)
 		}
 	}
+	phase = nodeOpenPhaseServices
 	if n.config.Local {
 		if err := wal.FinalizeDeferredCleanup(); err != nil {
 			log.Printf("Local WAL committed-file cleanup deferred: %v", err)
