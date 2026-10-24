@@ -362,6 +362,8 @@ k apply -f "$fencing_tmp/local-cooperative-store-secret.json"
 local_store_ref='[{"op":"add","path":"/spec/template/spec/containers/0/envFrom/-","value":{"secretRef":{"name":"rhiza-object-store"}}}]'
 k patch statefulset rhiza --type=json -p "$local_store_ref"
 k patch deployment rhiza-operator --type=json -p "$local_store_ref"
+local_fencer_store_ref='[{"op":"add","path":"/spec/template/spec/containers/0/envFrom","value":[{"configMapRef":{"name":"rhiza-config"}},{"secretRef":{"name":"rhiza-object-store"}}]}]'
+k patch deployment rhiza-fencer --type=json -p "$local_fencer_store_ref"
 k rollout status deployment/rhiza-minio --timeout=180s
 k patch job rhiza-create-bucket --type=merge -p '{"spec":{"suspend":false}}'
 k wait --for=condition=Complete job/rhiza-create-bucket --timeout=180s

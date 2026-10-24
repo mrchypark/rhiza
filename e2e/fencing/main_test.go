@@ -717,7 +717,10 @@ func TestFixtureKeepsStoreCoordinatesPublicAndWriterKeysLocalOnly(t *testing.T) 
 	localSecret := strings.Index(run, `"$FENCING_E2E_BIN" local-cooperative-store-secret`)
 	statefulOverlay := strings.Index(run, `k patch statefulset rhiza --type=json -p "$local_store_ref"`)
 	operatorOverlay := strings.Index(run, `k patch deployment rhiza-operator --type=json -p "$local_store_ref"`)
-	if productionPatch < 0 || localSecret <= productionPatch || statefulOverlay <= localSecret || operatorOverlay <= statefulOverlay {
+	fencerOverlay := strings.Index(run, `local_fencer_store_ref='[{"op":"add","path":"/spec/template/spec/containers/0/envFrom","value":[{"configMapRef":{"name":"rhiza-config"}},{"secretRef":{"name":"rhiza-object-store"}}]}]'`)
+	fencerPatch := strings.Index(run, `k patch deployment rhiza-fencer --type=json -p "$local_fencer_store_ref"`)
+	fencerRollout := strings.Index(run, `k rollout status deployment/rhiza-fencer --timeout=180s`)
+	if productionPatch < 0 || localSecret <= productionPatch || statefulOverlay <= localSecret || operatorOverlay <= statefulOverlay || fencerOverlay <= operatorOverlay || fencerPatch <= fencerOverlay || fencerRollout <= fencerPatch {
 		t.Fatal("local fake writer credential overlay must be applied after the shipped production patch")
 	}
 }

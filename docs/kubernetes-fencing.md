@@ -87,6 +87,29 @@ authority store is configured but unavailable, the fencer fails closed; it does
 not fall back to the Kubernetes ledger. Source-mutation endpoints always require
 canonical remote authority state, even when the cooperative-only option is set.
 
+The base `deploy/operator/fencing/authority.yaml` intentionally remains
+provider-neutral and does not inject `rhiza-config` or `rhiza-object-store` into
+the fencer. For automatic learner startup and canonical recovery, configure the
+fencer explicitly with the same canonical ObjectStorage provider, bucket, and
+data prefix as the operator, and with credentials accepted by that store. Use
+the deployment's existing overlay/configuration convention; do not infer that
+the operator's `RHIZA_OBJSTORE_*` configuration is inherited by the fencer.
+Where the selected profile uses a separate canonical authority/control prefix,
+configure and verify that prefix separately from the archive data prefix.
+Cooperative use of the legacy Kubernetes control ledger does not qualify or
+enable automatic learners or canonical recovery.
+
+The GCS HA launcher is a separate deployment path: its dedicated rendered
+manifest imports `rhiza-config` into its fencer and sets the authority-state
+prefix explicitly; its GCS credentials use the launcher's configured ADC / Workload
+Identity path. It does not inherit configuration from the base authority
+manifest. For either path, verify the fencer's effective provider, bucket, data
+prefix, and control prefix by checking only those named non-secret settings.
+Do not print the full container environment or Secret contents. Then exercise
+the existing automatic startup-grant/recovery path to verify that the fencer
+can use the configured authority. These checks establish wiring and path
+behavior only; they do not qualify GCS fencing or recovery.
+
 Anchored recovery additionally requires a configured fencer that implements
 canonical archive-fork registration. The cooperative `KubernetesFencer` does not
 provide this registrar, so the operator rejects an anchored recovery before it
