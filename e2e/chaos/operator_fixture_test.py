@@ -10,6 +10,14 @@ from operator_fixture import resources
 
 
 class BucketJobTest(unittest.TestCase):
+    def test_voter_statefulset_template_opts_into_cooperative_fencing(self):
+        stateful_set = next(
+            item for item in resources("test", "db", "operator")
+            if item["kind"] == "StatefulSet" and item["metadata"]["name"] == "rhiza"
+        )
+        annotations = stateful_set["spec"]["template"]["metadata"].get("annotations", {})
+        self.assertEqual("1", annotations.get("rhiza.mrchypark.dev/cooperative-fencing"))
+
     def test_bucket_creation_is_idempotent_and_rejects_bad_credentials(self):
         job = next(
             item for item in resources("test", "db", "operator")

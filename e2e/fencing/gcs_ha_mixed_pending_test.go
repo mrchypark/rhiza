@@ -1395,8 +1395,3 @@ func mixedTerminal(version int, request operator.FenceRequest, id fencing.Identi
 	}
 	return ref
 }
-
-func digestJSON(value any) string {
-	sum := sha256.Sum256(encoded(value))
-	return fmt.Sprintf("%x", sum)
-}

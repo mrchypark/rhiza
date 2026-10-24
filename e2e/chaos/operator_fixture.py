@@ -154,7 +154,10 @@ def resources(namespace: str, db_image: str, operator_image: str) -> list[dict]:
             },
             "template": {
                 "metadata": {
-                    "labels": {"app.kubernetes.io/name": "rhiza"}
+                    "labels": {"app.kubernetes.io/name": "rhiza"},
+                    "annotations": {
+                        "rhiza.mrchypark.dev/cooperative-fencing": "1"
+                    },
                 },
                 "spec": {
                     "securityContext": {
