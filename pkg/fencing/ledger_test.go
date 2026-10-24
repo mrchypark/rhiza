@@ -75,6 +75,54 @@ func TestStartupGrantAllowsOnlyBoundPendingLogicalAssignment(t *testing.T) {
 	}
 }
 
+func TestStartupGrantAllowsOnlyStaticActiveMembershipEnvironment(t *testing.T) {
+	request := testIdentity()
+	request.NodeID = "rhiza-0"
+	request.PodName = request.NodeID
+	grant := StartupGrant{
+		Identity: request,
+		Role:     StartupRoleVoterActive,
+		Environment: map[string]string{
+			"RHIZA_CLUSTER_MEMBERS": `[{"id":"rhiza-0"},{"id":"rhiza-1"}]`,
+			"RHIZA_PEER_TOKEN":      "private-peer-token",
+		},
+	}
+	if err := grant.Validate(request); err != nil {
+		t.Fatalf("valid authority-issued static active grant rejected: %v", err)
+	}
+
+	for name, mutate := range map[string]func(*StartupGrant){
+		"admin token":        func(g *StartupGrant) { g.Environment["RHIZA_ADMIN_TOKEN"] = "private-admin-token" },
+		"per-node token map": func(g *StartupGrant) { g.Environment["RHIZA_PEER_TOKENS"] = `{"rhiza-0":"token"}` },
+		"node id override":   func(g *StartupGrant) { g.Environment["RHIZA_NODE_ID"] = "rhiza-0" },
+		"arbitrary override": func(g *StartupGrant) { g.Environment["RHIZA_EXTRA"] = "value" },
+		"missing members":    func(g *StartupGrant) { delete(g.Environment, "RHIZA_CLUSTER_MEMBERS") },
+		"empty members":      func(g *StartupGrant) { g.Environment["RHIZA_CLUSTER_MEMBERS"] = "" },
+		"missing own token":  func(g *StartupGrant) { delete(g.Environment, "RHIZA_PEER_TOKEN") },
+		"empty own token":    func(g *StartupGrant) { g.Environment["RHIZA_PEER_TOKEN"] = "" },
+		"wrong role":         func(g *StartupGrant) { g.Role = StartupRoleLearnerPendingRemove },
+		"logical identity": func(g *StartupGrant) {
+			g.Identity.NodeID = "logical-incarnation"
+		},
+		"assigned active without assignment environment": func(g *StartupGrant) {
+			g.Identity.NodeID = "logical-incarnation"
+			g.Identity.AssignmentID = strings.Repeat("b", 64)
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			candidate := grant
+			candidate.Environment = make(map[string]string, len(grant.Environment)+1)
+			for key, value := range grant.Environment {
+				candidate.Environment[key] = value
+			}
+			mutate(&candidate)
+			if err := candidate.Validate(request); err == nil {
+				t.Fatal("invalid static startup grant environment accepted")
+			}
+		})
+	}
+}
+
 func TestLedgerRequiresSeparateDrainAndExit(t *testing.T) {
 	l := Ledger{SourceClusterID: "source"}
 	id := testIdentity()

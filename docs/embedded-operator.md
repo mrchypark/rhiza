@@ -108,6 +108,10 @@ ConfigMap/Secret 참조를 사용할 수 있다. `RHIZA_NODE_ID=metadata.name` �
 설정 오류나 `ErrVoterStateLost`가 나면 시작을 실패시켜야 한다. 빈 새 DB로
 fallback하거나 peer 상태를 지우고 기존 세대로 재가입하면 안 된다.
 
+정적 active voter 시작 grant에는 인증된 workload의 멤버 목록과 해당 Pod의
+Secret peer token만 포함된다. 이 grant는 부모 프로세스 환경 전체나
+`RHIZA_PEER_TOKENS` 전체 map을 복원하는 수단이 아니다.
+
 ## 3. StatefulSet 연결
 
 아래는 기존 애플리케이션 StatefulSet에 반영할 핵심 설정이다. `application`

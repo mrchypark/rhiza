@@ -4,8 +4,10 @@ import (
 	"bytes"
 	"context"
 	"crypto/sha256"
+	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"path"
 	"path/filepath"
@@ -16,6 +18,7 @@ import (
 	"github.com/mrchypark/rhiza/pkg/network"
 	"github.com/mrchypark/rhiza/pkg/qlog"
 	"github.com/mrchypark/rhiza/pkg/quepaxa"
+	"github.com/mrchypark/rhiza/pkg/recovery"
 	"github.com/thanos-io/objstore"
 )
 
@@ -42,6 +45,41 @@ func registerTestVoter(t *testing.T, config *types.ExecutionConfig, bucket objst
 	}
 	defer wal.Close()
 	return ensureVoterIdentity(context.Background(), config, bucket, wal, state, enroll)
+}
+
+type voterIdentityRaceBucket struct {
+	objstore.Bucket
+	membershipKey        string
+	beforeIter           func()
+	iterErr              error
+	failMembershipReadAt int
+	membershipReads      int
+	iterKeys             []string
+}
+
+func (b *voterIdentityRaceBucket) Get(ctx context.Context, name string) (io.ReadCloser, error) {
+	if name == b.membershipKey {
+		b.membershipReads++
+		if b.failMembershipReadAt == b.membershipReads {
+			return nil, errors.New("injected canonical membership read failure")
+		}
+	}
+	return b.Bucket.Get(ctx, name)
+}
+
+func (b *voterIdentityRaceBucket) Iter(ctx context.Context, dir string, f func(string) error, options ...objstore.IterOption) error {
+	if b.beforeIter != nil {
+		beforeIter := b.beforeIter
+		b.beforeIter = nil
+		beforeIter()
+	}
+	if b.iterErr != nil {
+		return b.iterErr
+	}
+	return b.Bucket.Iter(ctx, dir, func(key string) error {
+		b.iterKeys = append(b.iterKeys, key)
+		return f(key)
+	}, options...)
 }
 
 func TestVoterIdentityRejectsLostWALBeforeVoting(t *testing.T) {
@@ -117,6 +155,406 @@ func TestVoterIdentityRejectsMissingManifestAndConfigurationChanges(t *testing.T
 	}
 	if _, err := loadVoterIdentity(config); !errors.Is(err, ErrVoterStateLost) {
 		t.Fatalf("missing manifest: %v", err)
+	}
+}
+
+func TestMissingCanonicalMembershipRejectsDifferentRegisteredVoter(t *testing.T) {
+	ctx := context.Background()
+	original, bucket := voterTestConfig(t), objstore.NewInMemBucket()
+	if err := registerTestVoter(t, original, bucket, false); err != nil {
+		t.Fatal(err)
+	}
+
+	prefix := path.Join(string(original.ClusterID), "voters")
+	oldIdentityKey := path.Join(prefix, voterIdentityKey(string(original.NodeID)))
+	oldIdentity, err := readVoterRegistration(ctx, bucket, oldIdentityKey)
+	if err != nil || oldIdentity == nil {
+		t.Fatalf("seeded voter identity missing: present=%t err=%v", oldIdentity != nil, err)
+	}
+	membershipKey := path.Join(prefix, "membership.json")
+	if err := bucket.Delete(ctx, membershipKey); err != nil {
+		t.Fatal(err)
+	}
+	if data, err := readVoterRegistration(ctx, bucket, membershipKey); err != nil || data != nil {
+		t.Fatalf("canonical membership was not removed from fixture: present=%t err=%v", data != nil, err)
+	}
+
+	fresh := *original
+	fresh.DataDir = t.TempDir()
+	fresh.NodeID = "fresh-node"
+	fresh.Members = append(append([]quepaxa.Member(nil), original.Members...), peerMember("cluster", "fresh-node", "fresh-token"))
+	if err := registerTestVoter(t, &fresh, bucket, false); !errors.Is(err, ErrVoterStateLost) {
+		newMembership, membershipErr := readVoterRegistration(ctx, bucket, membershipKey)
+		newIdentity, identityErr := readVoterRegistration(ctx, bucket, path.Join(prefix, voterIdentityKey(string(fresh.NodeID))))
+		t.Fatalf("missing canonical membership error=%v, want ErrVoterStateLost; new_membership=%t membership_read_err=%v new_identity=%t identity_read_err=%v",
+			err,
+			newMembership != nil, membershipErr, newIdentity != nil, identityErr)
+	}
+	if got, err := readVoterRegistration(ctx, bucket, membershipKey); err != nil || got != nil {
+		t.Fatalf("orphaned voter identity caused canonical membership write: present=%t err=%v", got != nil, err)
+	}
+	if got, err := readVoterRegistration(ctx, bucket, path.Join(prefix, voterIdentityKey(string(fresh.NodeID)))); err != nil || got != nil {
+		t.Fatalf("orphaned voter identity caused new remote identity write: present=%t err=%v", got != nil, err)
+	}
+}
+
+func TestOfflineEnrollmentRejectsOrphanedVoterIdentity(t *testing.T) {
+	ctx := context.Background()
+	original, bucket := voterTestConfig(t), objstore.NewInMemBucket()
+	if err := registerTestVoter(t, original, bucket, false); err != nil {
+		t.Fatal(err)
+	}
+	prefix := path.Join(string(original.ClusterID), "voters")
+	membershipKey := path.Join(prefix, "membership.json")
+	if err := bucket.Delete(ctx, membershipKey); err != nil {
+		t.Fatal(err)
+	}
+
+	fresh := *original
+	fresh.DataDir = t.TempDir()
+	fresh.NodeID = "fresh-node"
+	fresh.Members = append(append([]quepaxa.Member(nil), original.Members...), peerMember("cluster", "fresh-node", "fresh-token"))
+	wal, err := qlog.Open(filepath.Join(fresh.DataDir, "qlog"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := wal.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := registerTestVoter(t, &fresh, bucket, true); !errors.Is(err, ErrVoterStateLost) {
+		t.Fatalf("offline enrollment with orphaned voter identity error=%v, want ErrVoterStateLost", err)
+	}
+	state, stateErr := loadVoterIdentity(&fresh)
+	if stateErr != nil || state.identity != nil {
+		t.Fatalf("rejected offline enrollment wrote local identity: state=%+v err=%v", state.identity, stateErr)
+	}
+	for _, key := range []string{membershipKey, path.Join(prefix, voterIdentityKey(string(fresh.NodeID)))} {
+		data, readErr := readVoterRegistration(ctx, bucket, key)
+		if readErr != nil || data != nil {
+			t.Fatalf("rejected offline enrollment wrote %q: present=%t err=%v", key, data != nil, readErr)
+		}
+	}
+}
+
+func TestSingleVoterRecoveryRejectsOrphanedMultiVoterIdentity(t *testing.T) {
+	ctx := context.Background()
+	original, bucket := voterTestConfig(t), objstore.NewInMemBucket()
+	if err := registerTestVoter(t, original, bucket, false); err != nil {
+		t.Fatal(err)
+	}
+	prefix := path.Join(string(original.ClusterID), "voters")
+	membershipKey := path.Join(prefix, "membership.json")
+	if err := bucket.Delete(ctx, membershipKey); err != nil {
+		t.Fatal(err)
+	}
+
+	single := *original
+	single.DataDir = t.TempDir()
+	single.NodeID = "single"
+	single.Members = []quepaxa.Member{peerMember("cluster", single.NodeID, "single-token")}
+	if err := registerTestVoter(t, &single, bucket, false); !errors.Is(err, ErrVoterStateLost) {
+		t.Fatalf("single-voter recovery with orphaned multi-voter identity error=%v, want ErrVoterStateLost", err)
+	}
+	for _, key := range []string{membershipKey, path.Join(prefix, voterIdentityKey(string(single.NodeID)))} {
+		data, readErr := readVoterRegistration(ctx, bucket, key)
+		if readErr != nil || data != nil {
+			t.Fatalf("single-voter recovery wrote %q despite orphaned identity: present=%t err=%v", key, data != nil, readErr)
+		}
+	}
+}
+
+func TestSingleVoterRecoveryStillAllowsEmptyUnregisteredNamespace(t *testing.T) {
+	ctx := context.Background()
+	bucket := objstore.NewInMemBucket()
+	config := voterTestConfig(t)
+	config.NodeID = "single"
+	config.Members = []quepaxa.Member{peerMember("cluster", config.NodeID, "single-token")}
+	if err := registerTestVoter(t, config, bucket, false); err != nil {
+		t.Fatalf("empty single-voter archive recovery: %v", err)
+	}
+	prefix := path.Join(string(config.ClusterID), "voters")
+	for _, key := range []string{path.Join(prefix, "membership.json"), path.Join(prefix, voterIdentityKey(string(config.NodeID)))} {
+		data, readErr := readVoterRegistration(ctx, bucket, key)
+		if readErr != nil || data != nil {
+			t.Fatalf("single-voter archive recovery wrote %q: present=%t err=%v", key, data != nil, readErr)
+		}
+	}
+}
+
+func TestSingleVoterRecoveryDoesNotIgnoreConcurrentMembershipOnly(t *testing.T) {
+	ctx := context.Background()
+	bucket := objstore.NewInMemBucket()
+	config := voterTestConfig(t)
+	config.NodeID = "single"
+	config.Members = []quepaxa.Member{peerMember("cluster", config.NodeID, "single-token")}
+	prefix := path.Join(string(config.ClusterID), "voters")
+	membershipKey := path.Join(prefix, "membership.json")
+	membership, err := json.Marshal(recovery.NewMembershipRecord(string(config.ClusterID), config.Members, string(config.ObjStoreDurability)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	interleaved := &voterIdentityRaceBucket{
+		Bucket: bucket, membershipKey: membershipKey,
+		beforeIter: func() {
+			if err := bucket.Upload(ctx, membershipKey, bytes.NewReader(membership), objstore.WithIfNotExists()); err != nil {
+				t.Fatalf("publish concurrent canonical membership: %v", err)
+			}
+		},
+	}
+	if err := registerTestVoter(t, config, interleaved, false); !errors.Is(err, ErrVoterStateLost) {
+		t.Fatalf("single-voter recovery ignored membership published during scan: %v", err)
+	}
+	if got, readErr := readVoterRegistration(ctx, bucket, membershipKey); readErr != nil || !bytes.Equal(got, membership) {
+		t.Fatalf("concurrent canonical membership changed: equal=%t err=%v", bytes.Equal(got, membership), readErr)
+	}
+	if got, readErr := readVoterRegistration(ctx, bucket, path.Join(prefix, voterIdentityKey(string(config.NodeID)))); readErr != nil || got != nil {
+		t.Fatalf("single-voter recovery wrote remote identity: present=%t err=%v", got != nil, readErr)
+	}
+}
+
+func TestAssignedRestartAcceptsRereadOfPreservedGenesis(t *testing.T) {
+	ctx := context.Background()
+	original, bucket := voterTestConfig(t), objstore.NewInMemBucket()
+	original.ObjStoreDurability = types.ObjectStoreDurabilityAsync
+	if err := registerTestVoter(t, original, bucket, false); err != nil {
+		t.Fatal(err)
+	}
+	prefix := path.Join(string(original.ClusterID), "voters")
+	membershipKey := path.Join(prefix, "membership.json")
+	genesis, err := readVoterRegistration(ctx, bucket, membershipKey)
+	if err != nil || genesis == nil {
+		t.Fatalf("seeded canonical genesis missing: present=%t err=%v", genesis != nil, err)
+	}
+	if err := bucket.Delete(ctx, membershipKey); err != nil {
+		t.Fatal(err)
+	}
+
+	current := *original
+	current.Members = []quepaxa.Member{
+		peerMember("cluster", "a", "a-token"),
+		peerMember("cluster", "b", "b-token"),
+		peerMember("cluster", "d", "d-token"),
+	}
+	interleaved := &voterIdentityRaceBucket{
+		Bucket: bucket, membershipKey: membershipKey,
+		beforeIter: func() {
+			if err := bucket.Upload(ctx, membershipKey, bytes.NewReader(genesis), objstore.WithIfNotExists()); err != nil {
+				t.Fatalf("restore concurrent immutable genesis: %v", err)
+			}
+		},
+	}
+	local, err := loadVoterIdentity(&current)
+	if err != nil {
+		t.Fatal(err)
+	}
+	wal, err := qlog.Open(filepath.Join(current.DataDir, "qlog"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer wal.Close()
+	if err := ensureVoterIdentityWithHooks(ctx, &current, interleaved, wal, local, false, nil, nil, true); err != nil {
+		t.Fatalf("assigned restart rejected reread of preserved genesis: %v", err)
+	}
+}
+
+func TestMissingMembershipConcurrentRegistrationRechecksCanonicalWinner(t *testing.T) {
+	ctx := context.Background()
+	winner, bucket := voterTestConfig(t), objstore.NewInMemBucket()
+	candidate := *winner
+	candidate.NodeID = "b"
+	candidate.DataDir = t.TempDir()
+	prefix := path.Join(string(winner.ClusterID), "voters")
+	membershipKey := path.Join(prefix, "membership.json")
+	tracingBucket := &voterIdentityRaceBucket{
+		Bucket: bucket, membershipKey: membershipKey,
+		beforeIter: func() {
+			if err := registerTestVoter(t, &candidate, bucket, false); err != nil {
+				t.Fatalf("concurrent first registration: %v", err)
+			}
+		},
+	}
+	if err := registerTestVoter(t, winner, tracingBucket, false); err != nil {
+		t.Fatalf("matching concurrent canonical registration rejected: %v", err)
+	}
+	if tracingBucket.membershipReads != 2 {
+		t.Fatalf("membership read count after registration=%d, want initial read plus canonical re-read", tracingBucket.membershipReads)
+	}
+	for _, nodeID := range []string{"a", "b"} {
+		data, err := readVoterRegistration(ctx, bucket, path.Join(prefix, voterIdentityKey(nodeID)))
+		if err != nil || data == nil {
+			t.Fatalf("concurrent voter %s identity missing: present=%t err=%v", nodeID, data != nil, err)
+		}
+	}
+}
+
+func TestMissingMembershipConcurrentRegistrationWithArchiveObject(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		publish  bool
+		conflict bool
+		wantErr  error
+	}{
+		{name: "matching canonical winner", publish: true},
+		{name: "canonical still absent", wantErr: ErrVoterEnrollmentRequired},
+		{name: "conflicting canonical winner", publish: true, conflict: true, wantErr: ErrVoterStateLost},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx := context.Background()
+			candidate, bucket := voterTestConfig(t), objstore.NewInMemBucket()
+			prefix := path.Join(string(candidate.ClusterID), "voters")
+			membershipKey := path.Join(prefix, "membership.json")
+			archiveKey := path.Join(string(candidate.ClusterID), "archive", "head.bin")
+			var winnerMembership []byte
+			tracingBucket := &voterIdentityRaceBucket{
+				Bucket: bucket, membershipKey: membershipKey,
+				beforeIter: func() {
+					if tc.publish {
+						winner := *candidate
+						winner.NodeID = "b"
+						winner.DataDir = t.TempDir()
+						if tc.conflict {
+							winner.Members = append([]quepaxa.Member(nil), candidate.Members[:2]...)
+						}
+						if err := registerTestVoter(t, &winner, bucket, false); err != nil {
+							t.Fatalf("concurrent canonical registration: %v", err)
+						}
+						var readErr error
+						winnerMembership, readErr = readVoterRegistration(ctx, bucket, membershipKey)
+						if readErr != nil || winnerMembership == nil {
+							t.Fatalf("concurrent canonical membership missing: present=%t err=%v", winnerMembership != nil, readErr)
+						}
+					}
+					if err := bucket.Upload(ctx, archiveKey, bytes.NewReader([]byte("archive head")), objstore.WithIfNotExists()); err != nil {
+						t.Fatalf("publish concurrent archive object: %v", err)
+					}
+				},
+			}
+
+			err := registerTestVoter(t, candidate, tracingBucket, false)
+			if tc.wantErr == nil {
+				if err != nil {
+					t.Fatalf("matching concurrent canonical registration with archive rejected: %v", err)
+				}
+			} else if !errors.Is(err, tc.wantErr) {
+				t.Fatalf("registration error=%v, want %v", err, tc.wantErr)
+			}
+			if len(tracingBucket.iterKeys) != 1 || tracingBucket.iterKeys[0] != path.Join(string(candidate.ClusterID), "archive")+"/" {
+				t.Fatalf("prefix scan keys=%v, want early stop at archive directory", tracingBucket.iterKeys)
+			}
+			archiveData, archiveErr := readVoterRegistration(ctx, bucket, archiveKey)
+			if archiveErr != nil || string(archiveData) != "archive head" {
+				t.Fatalf("archive object changed: data=%q err=%v", archiveData, archiveErr)
+			}
+			membershipData, membershipErr := readVoterRegistration(ctx, bucket, membershipKey)
+			identityData, identityErr := readVoterRegistration(ctx, bucket, path.Join(prefix, voterIdentityKey(string(candidate.NodeID))))
+			if tc.wantErr == nil {
+				if membershipErr != nil || !bytes.Equal(membershipData, winnerMembership) {
+					t.Fatalf("matching canonical membership changed: equal=%t err=%v", bytes.Equal(membershipData, winnerMembership), membershipErr)
+				}
+				if identityErr != nil || identityData == nil {
+					t.Fatalf("candidate identity missing after matching winner: present=%t err=%v", identityData != nil, identityErr)
+				}
+				return
+			}
+			if tc.publish {
+				if membershipErr != nil || !bytes.Equal(membershipData, winnerMembership) {
+					t.Fatalf("conflicting canonical membership changed: equal=%t err=%v", bytes.Equal(membershipData, winnerMembership), membershipErr)
+				}
+			} else if membershipErr != nil || membershipData != nil {
+				t.Fatalf("rejected archive-only namespace gained membership: present=%t err=%v", membershipData != nil, membershipErr)
+			}
+			if identityErr != nil || identityData != nil {
+				t.Fatalf("rejected registration wrote candidate identity: present=%t err=%v", identityData != nil, identityErr)
+			}
+		})
+	}
+}
+
+func TestMissingMembershipRejectsDifferentConcurrentCanonicalWinner(t *testing.T) {
+	ctx := context.Background()
+	candidate, bucket := voterTestConfig(t), objstore.NewInMemBucket()
+	candidate.ObjStoreDurability = types.ObjectStoreDurabilityAsync
+	concurrent := *candidate
+	concurrent.NodeID = "b"
+	concurrent.DataDir = t.TempDir()
+	concurrent.Members = append([]quepaxa.Member(nil), candidate.Members[:2]...)
+	prefix := path.Join(string(candidate.ClusterID), "voters")
+	membershipKey := path.Join(prefix, "membership.json")
+	var concurrentMembership []byte
+	tracingBucket := &voterIdentityRaceBucket{
+		Bucket: bucket, membershipKey: membershipKey,
+		beforeIter: func() {
+			if err := registerTestVoter(t, &concurrent, bucket, false); err != nil {
+				t.Fatalf("concurrent conflicting registration: %v", err)
+			}
+			var err error
+			concurrentMembership, err = readVoterRegistration(ctx, bucket, membershipKey)
+			if err != nil || concurrentMembership == nil {
+				t.Fatalf("concurrent canonical membership missing: present=%t err=%v", concurrentMembership != nil, err)
+			}
+		},
+	}
+	err := registerTestVoter(t, candidate, tracingBucket, false)
+	if !errors.Is(err, ErrVoterStateLost) {
+		t.Fatalf("different concurrent canonical membership error=%v, want ErrVoterStateLost", err)
+	}
+	state, stateErr := loadVoterIdentity(candidate)
+	if stateErr != nil || state.identity != nil {
+		t.Fatalf("conflicting canonical winner wrote local voter identity: state=%+v err=%v", state.identity, stateErr)
+	}
+	data, readErr := readVoterRegistration(ctx, bucket, path.Join(prefix, voterIdentityKey("a")))
+	if readErr != nil || data != nil {
+		t.Fatalf("conflicting canonical winner wrote candidate identity: present=%t err=%v", data != nil, readErr)
+	}
+	data, readErr = readVoterRegistration(ctx, bucket, membershipKey)
+	if readErr != nil || !bytes.Equal(data, concurrentMembership) {
+		t.Fatalf("conflicting canonical winner changed: equal=%t err=%v", bytes.Equal(data, concurrentMembership), readErr)
+	}
+}
+
+func TestMissingMembershipRecheckAndPrefixScanErrorsDoNotRegister(t *testing.T) {
+	for _, failure := range []string{"canonical reread", "prefix scan"} {
+		t.Run(failure, func(t *testing.T) {
+			ctx := context.Background()
+			original, base := voterTestConfig(t), objstore.NewInMemBucket()
+			if err := registerTestVoter(t, original, base, false); err != nil {
+				t.Fatal(err)
+			}
+			prefix := path.Join(string(original.ClusterID), "voters")
+			membershipKey := path.Join(prefix, "membership.json")
+			if err := base.Delete(ctx, membershipKey); err != nil {
+				t.Fatal(err)
+			}
+
+			fresh := *original
+			fresh.NodeID = "fresh-node"
+			fresh.DataDir = t.TempDir()
+			fresh.Members = append(append([]quepaxa.Member(nil), original.Members...), peerMember("cluster", "fresh-node", "fresh-token"))
+			injected := errors.New("injected prefix scan failure")
+			tracingBucket := &voterIdentityRaceBucket{Bucket: base, membershipKey: membershipKey}
+			if failure == "canonical reread" {
+				tracingBucket.failMembershipReadAt = 2
+			} else {
+				tracingBucket.iterErr = injected
+			}
+			err := registerTestVoter(t, &fresh, tracingBucket, false)
+			if err == nil {
+				t.Fatal("missing canonical membership failure was accepted")
+			}
+			if failure == "prefix scan" && !errors.Is(err, injected) {
+				t.Fatalf("prefix scan error=%v, want injected scan error", err)
+			}
+			state, stateErr := loadVoterIdentity(&fresh)
+			if stateErr != nil || state.identity != nil {
+				t.Fatalf("failed recheck wrote local voter identity: state=%+v err=%v", state.identity, stateErr)
+			}
+			for _, key := range []string{membershipKey, path.Join(prefix, voterIdentityKey(string(fresh.NodeID)))} {
+				data, readErr := readVoterRegistration(ctx, base, key)
+				if readErr != nil || data != nil {
+					t.Fatalf("failed recheck wrote %q: present=%t err=%v", key, data != nil, readErr)
+				}
+			}
+		})
 	}
 }
 
