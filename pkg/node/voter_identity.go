@@ -26,6 +26,7 @@ import (
 var (
 	ErrVoterStateLost          = errors.New("voter state continuity cannot be established")
 	ErrVoterEnrollmentRequired = errors.New("existing voter requires offline enrollment")
+	errStopVoterPrefixScan     = errors.New("stop voter prefix scan after legacy object")
 )
 
 // voterIdentityVersion 2 records the learner's public key instead of a hash of
@@ -134,10 +135,58 @@ func ensureVoterIdentityWithHooks(ctx context.Context, config *types.ExecutionCo
 	if err != nil {
 		return err
 	}
-	// Single-voter archive recovery remains supported, but must never bypass
-	// a namespace that was registered for a multi-voter cluster.
+	clusterWant, _ := json.Marshal(recovery.NewMembershipRecord(want.Cluster, config.Members, string(config.ObjStoreDurability)))
+	if clusterData == nil {
+		// A voter namespace with identity records but no canonical membership is
+		// ambiguous, including during offline enrollment. For the legacy
+		// multi-voter non-enrollment path, also preserve the older-database guard.
+		scanRoot := prefix + "/"
+		if len(config.Members) > 1 && !enroll {
+			scanRoot = path.Join(config.ObjStorePrefix, string(config.ClusterID)) + "/"
+		}
+		priorVoterRecord := false
+		legacyObjectFound := false
+		if err := bucket.Iter(ctx, scanRoot, func(key string) error {
+			if !strings.HasPrefix(key, prefix+"/") {
+				if len(config.Members) > 1 && !enroll {
+					legacyObjectFound = true
+					return errStopVoterPrefixScan
+				}
+				return nil
+			}
+			if key != clusterKey {
+				priorVoterRecord = true
+			}
+			return nil
+		}); err != nil && !errors.Is(err, errStopVoterPrefixScan) {
+			return err
+		}
+		// Always reread after the scan: a concurrent first registrant may have
+		// published membership without its identity yet, or just after Iter saw
+		// an empty prefix. Single-voter recovery must not bypass that publication.
+		clusterData, err = readVoterRegistration(ctx, bucket, clusterKey)
+		if err != nil {
+			return err
+		}
+		if clusterData == nil && priorVoterRecord {
+			return fmt.Errorf("%w: voter records exist without canonical membership", ErrVoterStateLost)
+		}
+		if clusterData == nil && legacyObjectFound {
+			return ErrVoterEnrollmentRequired
+		}
+		if clusterData != nil && !assignedRestart {
+			if err := matchVoterRegistration(ctx, bucket, clusterKey, clusterWant, clusterData); err != nil {
+				return err
+			}
+		}
+	}
+	// Single-voter archive recovery remains supported only when the scan and
+	// reread establish that this is still an unregistered namespace.
 	if len(config.Members) <= 1 && clusterData == nil && local.identity == nil && !enroll {
 		return nil
+	}
+	if assignedRestart && clusterData == nil {
+		return fmt.Errorf("%w: assigned restart lacks its immutable voter genesis", ErrVoterStateLost)
 	}
 	if len(config.Members) <= 1 {
 		return fmt.Errorf("%w: membership cannot be changed during startup", ErrVoterStateLost)
@@ -165,18 +214,6 @@ func ensureVoterIdentityWithHooks(ctx context.Context, config *types.ExecutionCo
 	if enroll && !local.hadWAL {
 		return fmt.Errorf("%w: enrollment requires the original WAL", ErrVoterStateLost)
 	}
-	if clusterData == nil && !enroll {
-		// A namespace containing older database state cannot be auto-adopted.
-		if err := bucket.Iter(ctx, path.Join(config.ObjStorePrefix, string(config.ClusterID))+"/", func(key string) error {
-			if !strings.HasPrefix(key, prefix+"/") {
-				return ErrVoterEnrollmentRequired
-			}
-			return nil
-		}); err != nil {
-			return err
-		}
-	}
-	clusterWant, _ := json.Marshal(recovery.NewMembershipRecord(want.Cluster, config.Members, string(config.ObjStoreDurability)))
 	if assignedRestart && clusterData != nil {
 		var genesis recovery.MembershipRecord
 		decoder := json.NewDecoder(bytes.NewReader(clusterData))

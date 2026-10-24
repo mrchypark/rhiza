@@ -64,8 +64,13 @@ The guard does not establish exclusive execution for cloned complete disks or
 detect an intentional rollback of both disk and shared storage. Original-disk
 exclusivity, prevention of old-instance reconnection (fencing), and durable,
 non-rollback storage remain deployment requirements. Single-voter archive
-restoration retains its existing behavior and requires the old instance to be
-stopped permanently; it is not a multi-voter replacement protocol.
+restoration retains its existing behavior only for a namespace with no prior
+voter records and requires the old instance to be stopped permanently; it is
+not a multi-voter replacement protocol. If canonical membership is absent while
+voter records remain, normal startup, single-voter recovery, and offline
+enrollment must not create a replacement membership. Offline enrollment remains
+the one-time upgrade path for intact original WALs; it cannot repair missing
+canonical membership around existing voter records.
 
 Manual frozen-source recovery may set
 `RhizaRecovery.spec.allowMissingSourceMembership: true` only when the source

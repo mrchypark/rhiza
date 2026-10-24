@@ -42,9 +42,10 @@ func (r StartupRole) Valid() bool {
 type StartupGrant struct {
 	Identity Identity    `json:"identity"`
 	Role     StartupRole `json:"role"`
-	// Environment contains only the bounded, fencer-derived overrides needed
-	// to start an assigned same-ordinal learner. It is returned over the
-	// authenticated TLS supervisor channel and is never persisted or logged.
+	// Environment contains only bounded, fencer-derived overrides needed to
+	// start an assigned learner or initialize a static active voter. It is
+	// returned over the authenticated TLS supervisor channel and is never
+	// persisted or logged.
 	Environment map[string]string `json:"environment,omitempty"`
 }
 
@@ -85,8 +86,15 @@ func (g StartupGrant) Validate(request Identity) error {
 			return errors.New("fencing: startup grant environment exceeds capacity")
 		}
 	}
-	if len(g.Environment) != 0 && (g.Identity.AssignmentID == "" || g.Identity.NodeID == physical || (g.Role != StartupRoleLearnerPendingRemove && g.Role != StartupRoleVoterActive)) {
-		return errors.New("fencing: startup environment is restricted to assigned identities")
+	if len(g.Environment) != 0 {
+		staticActive := g.Identity.AssignmentID == "" && g.Identity.NodeID == physical && g.Role == StartupRoleVoterActive
+		if staticActive {
+			if len(g.Environment) != 2 || g.Environment["RHIZA_CLUSTER_MEMBERS"] == "" || g.Environment["RHIZA_PEER_TOKEN"] == "" {
+				return errors.New("fencing: static voter startup environment is incomplete")
+			}
+		} else if g.Identity.AssignmentID == "" || g.Identity.NodeID == physical || (g.Role != StartupRoleLearnerPendingRemove && g.Role != StartupRoleVoterActive) {
+			return errors.New("fencing: startup environment is restricted to assigned identities")
+		}
 	}
 	return nil
 }

@@ -38,6 +38,15 @@ func (e *FencingExecutor) resolveStartupGrant(ctx context.Context, statefulSetUI
 	if err != nil {
 		return fencing.StartupGrant{}, err
 	}
+	if role == fencing.StartupRoleVoterActive {
+		grant, static, err := e.resolveStaticVoterStartupGrant(ctx, statefulSetUID, request)
+		if err != nil {
+			return fencing.StartupGrant{}, err
+		}
+		if static {
+			return grant, nil
+		}
+	}
 	return fencing.StartupGrant{Identity: request, Role: role}, nil
 }
 
