@@ -69,6 +69,23 @@ the bucket endpoint and credentials appropriate for the selected provider.
 Generation-specific peer credentials are distinct secrets created by the
 controller; they must not reuse the source voters' credentials.
 
+The base fencing authority manifest is provider-neutral and does not reference
+these objects. If automatic learner startup or canonical recovery is required,
+configure the fencer explicitly with the same canonical ObjectStorage provider,
+bucket, and data prefix used by the operator, plus credentials valid for that
+store. Reuse the installation's existing overlay or deployment configuration
+to wire the `RHIZA_OBJSTORE_*` values into the fencer; do not assume that
+configuring the operator also configures the fencer. Keep the canonical
+authority/control prefix explicitly configured and separate from the archive
+data prefix where the selected profile requires it. A cooperative legacy
+Kubernetes control ledger can support cooperative fencing without remote
+canonical state, but it does not enable automatic learner startup or canonical
+recovery. Before relying on these paths, verify the effective provider,
+bucket, data prefix, and control prefix by inspecting only those named
+non-secret settings (never dump the complete environment or Secret), then use
+the existing automatic-startup-grant/recovery harness to verify the real
+fencer path. This wiring check is not evidence of GCS or recovery qualification.
+
 The independent NoPVC mutation profile requires a configured remote canonical
 authority store whose constructor accepts the selected ObjectStorage
 provider's conditional create and compare-and-swap capabilities; operations
