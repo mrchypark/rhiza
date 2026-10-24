@@ -385,7 +385,7 @@ func TestRetiredSameOrdinalLearnerFallsBackOnlyWithExactRetirementProof(t *testi
 			if err != nil {
 				t.Fatal(err)
 			}
-			child.Status.Membership = &MembershipStatus{Phase: "Aborted"}
+			acknowledgeCanonicalLearnerAbort(child)
 			observed := false
 			c.Fencer = membershipRegressionFencer(func(ctx context.Context, request FenceRequest) (*FenceProof, error) {
 				want := FenceTarget{NodeID: state.Intent.LearnerName, Pod: "learner", PodUID: "learner-uid", WALIdentity: "old-learner-wal"}
@@ -442,6 +442,10 @@ func TestRetiredSameOrdinalLearnerFallsBackOnlyWithExactRetirementProof(t *testi
 				oldMeta["ownerReferences"] = []any{object{"apiVersion": "apps/v1", "kind": "StatefulSet", "name": "rhiza", "uid": state.StatefulSetUID, "controller": true}}
 				stsWrites, statusWrites := 0, 0
 				server := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+					if req.Method == http.MethodGet && req.URL.Path == c.resourcePath(state.Intent.RecoveryName) {
+						_ = json.NewEncoder(w).Encode(child)
+						return
+					}
 					if req.Method == http.MethodGet && req.URL.Path == "/api/v1/namespaces/default/pods/learner" {
 						_ = json.NewEncoder(w).Encode(oldPod)
 						return

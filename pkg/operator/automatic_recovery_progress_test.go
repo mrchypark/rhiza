@@ -226,6 +226,12 @@ func TestAutomaticRecoveryProgressReplacesCommittedFailedLearner(t *testing.T) {
 	var nextChild *Resource
 	var nextLearner string
 	server := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, q *http.Request) {
+		if q.Method == http.MethodGet && q.URL.Path == "/apis/rhiza.mrchypark.dev/v1alpha1/namespaces/default/rhizaclusters" {
+			_ = json.NewEncoder(w).Encode(struct {
+				Items []ClusterResource `json:"items"`
+			}{Items: []ClusterResource{*r}})
+			return
+		}
 		if q.Method == http.MethodGet && q.URL.Path == c.resourcePath("recover") {
 			_ = json.NewEncoder(w).Encode(child)
 			return
@@ -318,8 +324,19 @@ func TestAutomaticRecoveryProgressReplacesCommittedFailedLearner(t *testing.T) {
 	// resulting frozen child/learner identities and exercise the real executor.
 	nextLearner = state.Intent.LearnerName
 	newWal := strings.Repeat("d", 64)
-	api.replacement2 = object{}
-	api.replacement2["metadata"] = object{"name": nextLearner, "uid": "new-learner-uid"}
+	i := state.Intent
+	i.LearnerUID, i.LearnerWAL = "new-learner-uid", newWal
+	i.LearnerSecretName, i.LearnerSecretUID, i.LearnerSecretRV = nextLearner+"-credentials", "new-secret-uid", "1"
+	member := voterMember("source", nextLearner, "next-token")
+	secretData := object{"member": base64.StdEncoding.EncodeToString(jsonBytes(member))}
+	i.LearnerSecretHash = hashJSON(secretData)
+	api.replacement2 = supervisedTestPod()
+	podMetadata := asObject(api.replacement2["metadata"])
+	podMetadata["name"], podMetadata["uid"] = nextLearner, i.LearnerUID
+	podMetadata["ownerReferences"] = []any{object{"apiVersion": "apps/v1", "kind": "StatefulSet", "name": "rhiza", "uid": state.StatefulSetUID, "controller": false}}
+	podMetadata["annotations"] = object{fencingProtocolAnnotation: "1", fencingRootAnnotation: state.BindingUID,
+		fencingCredentialAnnotation: i.LearnerSecretUID, ownerAnnotation: i.Request.OperationID}
+	podMetadata["labels"] = object{"rhiza.mrchypark.dev/automatic-learner": nextLearner}
 	api.replacement2["status"] = object{"podIP": "127.0.0.1"}
 	// Reuse the live learner test endpoint, not a StatefulSet peer endpoint.
 	_, port, err := net.SplitHostPort(api.learner.Listener.Addr().String())
@@ -330,14 +347,21 @@ func TestAutomaticRecoveryProgressReplacesCommittedFailedLearner(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	api.replacement2["spec"] = object{"containers": []any{object{"name": "rhiza", "ports": []any{object{"name": "http", "containerPort": float64(n)}}}}}
-	member := voterMember("source", nextLearner, "next-token")
-	api.membershipSecrets[nextLearner+"-credentials"] = object{"immutable": true, "metadata": object{"uid": "new-secret-uid", "resourceVersion": "1"}, "data": object{"member": base64.StdEncoding.EncodeToString(jsonBytes(member))}}
+	replacementContainer := asObject(list(nested(api.replacement2, "spec", "containers"))[0])
+	replacementContainer["name"] = "rhiza"
+	replacementContainer["ports"] = []any{object{"name": "http", "containerPort": float64(n)}}
+	api.membershipSecrets[i.LearnerSecretName] = object{"immutable": true, "metadata": object{"name": i.LearnerSecretName, "uid": i.LearnerSecretUID, "resourceVersion": i.LearnerSecretRV, "annotations": object{ownerAnnotation: i.Request.OperationID}}, "data": secretData}
 	api.learnerID = nextLearner
 	api.membership[nextLearner] = network.MembershipStatus{NodeID: quepaxa.NodeID(nextLearner), ClusterID: "source", ConfigID: 3, Voters: []quepaxa.NodeID{"n1", "n2", "learner"}, WALIdentity: newWal}
-	i := state.Intent
+	if err := rememberLearner(state, learnerIncarnation{SourceClusterID: state.ActiveClusterID, OperationID: i.Request.OperationID,
+		CredentialName: i.LearnerSecretName, CredentialUID: i.LearnerSecretUID,
+		Target: FenceTarget{NodeID: i.LearnerName, Pod: learnerPhysicalPod(i), PodUID: i.LearnerUID, WALIdentity: i.LearnerWAL}}); err != nil {
+		t.Fatalf("persist the provisioned standalone learner identity: %v", err)
+	}
+	templateMetadata := asObject(nested(api.sts, "spec", "template", "metadata"))
+	templateMetadata["annotations"] = object{fencingProtocolAnnotation: "1"}
 	nextChild = &Resource{Metadata: object{"name": i.RecoveryName, "uid": "next-child-uid", "resourceVersion": "1", "annotations": object{automaticOwner: state.BindingUID, automaticLogical: r.Spec.LogicalID}}, Spec: Spec{StatefulSet: "rhiza", Container: "rhiza", SourceClusterID: "source", Durability: i.Durability, Membership: &MembershipSpec{OperationID: i.RecoveryName, Remove: "learner", RemovedPod: "learner", VoterPods: []VoterPod{{NodeID: "n1", Pod: "n1"}, {NodeID: "n2", Pod: "n2"}}, ReplacementPod: nextLearner, ReplacementSecret: nextLearner + "-credentials", Fence: MembershipFence{NodeID: "learner", WALIdentity: wal, WorkloadUID: "learner-uid", Confirmed: true, Evidence: i.Proof.ProofID}}}}
-	i.LearnerUID, i.LearnerWAL, i.RecoveryUID, i.SpecHash = "new-learner-uid", newWal, "next-child-uid", hashJSON(nextChild.Spec)
+	i.RecoveryUID, i.SpecHash = "next-child-uid", hashJSON(nextChild.Spec)
 	if err := c.saveAuto(ctx, r, state, version); err != nil {
 		t.Fatal(err)
 	}
@@ -351,6 +375,10 @@ func TestAutomaticRecoveryProgressReplacesCommittedFailedLearner(t *testing.T) {
 	api.membership["n2"] = membershipStatus("n2", 4, "n1", "n2")
 	if err := c.reconcile(ctx, nextChild); err != nil {
 		t.Fatal(err)
+	}
+	if nextChild.Status.Membership == nil || nextChild.Status.Membership.Add == nil || string(nextChild.Status.Membership.Add.MemberID) != nextLearner ||
+		nextChild.Status.Membership.Add.ExpectedConfigID != 4 {
+		t.Fatalf("replacement ADD was not journaled against the confirmed removal before simulating its commit: phase=%q message=%q membership=%+v", nextChild.Status.Phase, nextChild.Status.Message, nextChild.Status.Membership)
 	}
 	for _, id := range []string{"n1", "n2", nextLearner} {
 		status := membershipStatus(id, 5, "n1", "n2", nextLearner)
