@@ -95,7 +95,9 @@ func (e *FencingExecutor) resolveSameOrdinalStartupGrant(ctx context.Context, st
 		return fencing.StartupGrant{}, false, nil
 	}
 	ownerFound := false
-	for _, ref := range list(nested(pod, "metadata", "ownerReferences")) {
+	standaloneOwner := false
+	ownerRefs := list(nested(pod, "metadata", "ownerReferences"))
+	for _, ref := range ownerRefs {
 		owner := asObject(ref)
 		if owner["kind"] == "StatefulSet" && owner["controller"] == true && owner["name"] == root.Spec.StatefulSet && owner["uid"] == statefulSetUID {
 			if ownerFound {
@@ -103,9 +105,20 @@ func (e *FencingExecutor) resolveSameOrdinalStartupGrant(ctx context.Context, st
 			}
 			ownerFound = true
 		}
+		if owner["apiVersion"] == "apps/v1" && owner["kind"] == "StatefulSet" && owner["controller"] == false && owner["name"] == root.Spec.StatefulSet && owner["uid"] == statefulSetUID {
+			standaloneOwner = true
+		}
+	}
+	if ownerFound && len(ownerRefs) != 1 {
+		return fencing.StartupGrant{}, false, fmt.Errorf("fencing: startup StatefulSet ownership is ambiguous")
 	}
 	if !ownerFound {
-		return fencing.StartupGrant{}, false, fmt.Errorf("fencing: startup StatefulSet owner differs")
+		// Standalone learners are non-controller-owned children of the
+		// StatefulSet. Their exact canonical incarnation is checked separately;
+		// arbitrary controller:false ownership is never a same-ordinal grant.
+		if !standaloneOwner || len(ownerRefs) != 1 || str(nested(pod, "metadata", "labels", "rhiza.mrchypark.dev/automatic-learner")) != physical {
+			return fencing.StartupGrant{}, false, fmt.Errorf("fencing: startup StatefulSet owner differs")
+		}
 	}
 	if str(nested(pod, "metadata", "annotations", fencingProtocolAnnotation)) != "1" || str(nested(pod, "metadata", "annotations", fencingRootAnnotation)) != rootUID {
 		return fencing.StartupGrant{}, false, fmt.Errorf("fencing: startup workload binding differs")
@@ -120,6 +133,9 @@ func (e *FencingExecutor) resolveSameOrdinalStartupGrant(ctx context.Context, st
 	}
 	if state.BindingUID != rootUID || state.BindingHash != autoBinding(root) || state.StatefulSetUID != statefulSetUID || state.ActiveClusterID != request.SourceClusterID {
 		return fencing.StartupGrant{}, false, fmt.Errorf("fencing: canonical startup binding differs")
+	}
+	if !ownerFound {
+		return e.resolveStandaloneLearnerStartupGrant(ctx, request, root, pod, state)
 	}
 	i := state.Intent
 	completed := false
@@ -281,4 +297,98 @@ func (e *FencingExecutor) resolveSameOrdinalStartupGrant(ctx context.Context, st
 		env["RHIZA_CLUSTER_MEMBERS"] = string(membersJSON)
 	}
 	return fencing.StartupGrant{Identity: identity, Role: role, Environment: env}, true, nil
+}
+
+// resolveStandaloneLearnerStartupGrant first binds the controller:false Pod to
+// canonical incarnation history. Pending additions continue through the
+// existing recovery-child verifier; only an installed current voter is
+// promoted directly to its active startup role.
+func (e *FencingExecutor) resolveStandaloneLearnerStartupGrant(ctx context.Context, request fencing.Identity, root *ClusterResource, pod object, state *autoControl) (fencing.StartupGrant, bool, error) {
+	physical := request.PodName
+	if physical == "" {
+		physical = request.NodeID
+	}
+	fail := func(err error) (fencing.StartupGrant, bool, error) {
+		return fencing.StartupGrant{}, true, err
+	}
+	if request.NodeID != physical || str(nested(pod, "metadata", "name")) != physical || str(nested(pod, "metadata", "uid")) != request.PodUID ||
+		nested(pod, "metadata", "deletionTimestamp") != nil || str(nested(pod, "metadata", "labels", "rhiza.mrchypark.dev/automatic-learner")) != physical {
+		return fail(fmt.Errorf("fencing: standalone learner Pod incarnation changed"))
+	}
+	if str(nested(pod, "metadata", "annotations", fencingRootAnnotation)) != str(root.Metadata["uid"]) ||
+		str(nested(pod, "metadata", "annotations", fencingCredentialAnnotation)) == "" {
+		return fail(fmt.Errorf("fencing: standalone learner workload binding differs"))
+	}
+	if err := e.validateLearnerBinding(ctx, pod, root.Spec.StatefulSet); err != nil {
+		return fail(err)
+	}
+	entry, ok := standaloneLearnerIncarnation(state, request.SourceClusterID, physical, request.PodUID,
+		str(nested(pod, "metadata", "annotations", fencingCredentialAnnotation)))
+	if !ok || entry.OperationID != str(nested(pod, "metadata", "annotations", ownerAnnotation)) || entry.CredentialName != physical+"-credentials" {
+		return fail(fmt.Errorf("fencing: standalone learner incarnation is not current in canonical history"))
+	}
+	if state.Intent != nil && automaticIntentTargets(state.Intent, entry.Target) {
+		return fail(fmt.Errorf("fencing: standalone learner incarnation is being replaced"))
+	}
+	active := state.Completed != nil && state.Completed.ClusterID == state.ActiveClusterID &&
+		completedVoterMatches(state.Completed.Voters, entry.Target) && completedVoterMatches(state.Voters, entry.Target) &&
+		currentIdentityMatches(state.Identities, entry.Target)
+	if !active && state.Intent != nil {
+		return fencing.StartupGrant{}, false, nil
+	}
+	if !active {
+		return fencing.StartupGrant{}, true, fencing.ErrPending
+	}
+	identity := request
+	identity.NodeID = entry.Target.NodeID
+	identity.PodName = physical
+	identity.WALIdentity = entry.Target.WALIdentity
+	return fencing.StartupGrant{Identity: identity, Role: fencing.StartupRoleVoterActive}, true, nil
+}
+
+func standaloneLearnerIncarnation(state *autoControl, source, pod, podUID, credentialUID string) (learnerIncarnation, bool) {
+	if state == nil || validateLearnerHistory(state.Learners) != nil {
+		return learnerIncarnation{}, false
+	}
+	var found learnerIncarnation
+	for _, entry := range state.Learners {
+		if entry.SourceClusterID != source || entry.Target.NodeID != pod || entry.Target.Pod != pod || entry.Target.PodUID != podUID {
+			continue
+		}
+		if found.Target.PodUID != "" || entry.Retirement != nil || entry.CredentialUID == "" || entry.CredentialUID != credentialUID {
+			return learnerIncarnation{}, false
+		}
+		found = entry
+	}
+	return found, found.Target.PodUID != ""
+}
+
+func automaticIntentTargets(intent *autoIntent, target FenceTarget) bool {
+	if intent == nil {
+		return false
+	}
+	if string(intent.Failed) == target.NodeID {
+		return true
+	}
+	for _, requested := range intent.Request.Targets {
+		if requested.NodeID == target.NodeID || requested.Pod == target.Pod || requested.PodUID == target.PodUID {
+			return true
+		}
+	}
+	return false
+}
+
+func completedVoterMatches(voters []VoterPod, target FenceTarget) bool {
+	for _, voter := range voters {
+		if string(voter.NodeID) == target.NodeID && voter.Pod == target.Pod {
+			return true
+		}
+	}
+	return false
+}
+
+func currentIdentityMatches(identities map[quepaxa.NodeID]FenceTarget, target FenceTarget) bool {
+	current, ok := identities[quepaxa.NodeID(target.NodeID)]
+	return ok && current.NodeID == target.NodeID && current.Pod == target.Pod && current.PodUID == target.PodUID &&
+		(target.WALIdentity == "" || current.WALIdentity == target.WALIdentity)
 }

@@ -384,6 +384,128 @@ func TestAuthenticatedLearnerPromotionRetriesExactCanonicalCompletion(t *testing
 	if err != nil || grant.Role != fencing.StartupRoleLearnerPendingRemove || grant.Identity != physicalID {
 		t.Fatalf("authenticated registration did not retain the pending logical identity: grant=%+v err=%v", grant, err)
 	}
+
+	// Exercise the same canonical terminal-authority fixture with a standalone
+	// learner. It has no StatefulSet controller owner or same-ordinal assignment;
+	// startup must still be bound to the exact Pod and immutable credential.
+	const standaloneName = "promotion-standalone-learner"
+	if _, err := controller.ensureAutomaticLearner(ctx, sts, "rhiza", intent.Request.OperationID, state.ActiveClusterID, standaloneName, state.BindingUID); err != nil {
+		t.Fatalf("provision standalone learner fixture: %v", err)
+	}
+	var standalonePod, standaloneSecret object
+	if err := f.e.Kube.Get(ctx, f.e.controller().corePath("pods", standaloneName), &standalonePod); err != nil {
+		t.Fatal(err)
+	}
+	if err := f.e.Kube.Get(ctx, f.e.controller().corePath("secrets", standaloneName+"-credentials"), &standaloneSecret); err != nil {
+		t.Fatal(err)
+	}
+	standaloneStateBytes, err := json.Marshal(state)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var standaloneState autoControl
+	if err := json.Unmarshal(standaloneStateBytes, &standaloneState); err != nil {
+		t.Fatal(err)
+	}
+	standaloneIntent := *standaloneState.Intent
+	standaloneIntent.LearnerName = standaloneName
+	standaloneIntent.LearnerUID = str(nested(standalonePod, "metadata", "uid"))
+	standaloneIntent.LearnerPodName = ""
+	standaloneIntent.LearnerSecretName = standaloneName + "-credentials"
+	standaloneIntent.LearnerSecretUID = str(nested(standaloneSecret, "metadata", "uid"))
+	standaloneIntent.LearnerSecretRV = str(nested(standaloneSecret, "metadata", "resourceVersion"))
+	standaloneIntent.LearnerSecretHash = hashJSON(standaloneSecret["data"])
+	standaloneIntent.LearnerAssignmentID = ""
+	standaloneIntent.RecoveryName = "promotion-recovery-standalone"
+	standaloneIntent.RecoveryUID, standaloneIntent.SpecHash = "", ""
+	standaloneState.Intent = &standaloneIntent
+	standaloneEntry, err := controller.learnerInventoryEntry(ctx, &standaloneState, sts, standalonePod)
+	if err != nil {
+		t.Fatalf("capture standalone learner incarnation: %v", err)
+	}
+	if err := rememberLearner(&standaloneState, standaloneEntry); err != nil {
+		t.Fatal(err)
+	}
+	standaloneChildSpec := automaticRecoveryChildSpec(&cluster, &standaloneState, &standaloneIntent)
+	standaloneChild := Resource{APIVersion: "rhiza.mrchypark.dev/v1alpha1", Kind: "RhizaRecovery",
+		Metadata: object{"name": standaloneIntent.RecoveryName, "namespace": "test", "uid": "promotion-standalone-child-uid", "generation": float64(1),
+			"annotations": object{automaticOwner: standaloneState.BindingUID, automaticLogical: cluster.Spec.LogicalID}}, Spec: standaloneChildSpec}
+	standaloneIntent.RecoveryUID = str(standaloneChild.Metadata["uid"])
+	standaloneIntent.SpecHash = hashJSON(standaloneChild.Spec)
+	if err := controller.saveAuto(ctx, &cluster, &standaloneState, mustAutoVersion(t, controller, &cluster)); err != nil {
+		t.Fatalf("persist standalone canonical learner assignment: %v", err)
+	}
+	persistTestRecovery(t, f, standaloneChild)
+	standaloneID := fencing.Identity{SourceClusterID: f.runtime.SourceClusterID, NodeID: standaloneName, PodName: standaloneName,
+		PodUID: standaloneIntent.LearnerUID, RunID: "standalone-promotion-run"}
+	standaloneGrant, err := f.e.resolveStartupGrant(ctx, f.runtime.StatefulSetUID, standaloneID)
+	if err != nil || standaloneGrant.Role != fencing.StartupRoleLearnerPendingRemove || standaloneGrant.Identity != standaloneID {
+		t.Fatalf("canonical standalone pending startup grant=%+v err=%v", standaloneGrant, err)
+	}
+	assertRejectedStandalone := func(name string, id fencing.Identity, mutatePod func(object), retire bool) {
+		t.Run("standalone-reject-"+name, func(t *testing.T) {
+			defer func() {
+				_, version, loadErr := controller.loadAuto(ctx, controller.autoKey(&cluster))
+				if loadErr != nil {
+					t.Errorf("load standalone control for fixture restoration: %v", loadErr)
+				} else if saveErr := controller.saveAuto(ctx, &cluster, &standaloneState, version); saveErr != nil {
+					t.Errorf("restore standalone control fixture: %v", saveErr)
+				}
+				f.api.mu.Lock()
+				f.api.objects[f.e.controller().corePath("pods", standaloneName)] = standalonePod
+				f.api.mu.Unlock()
+			}()
+			if mutatePod != nil {
+				podBytes, marshalErr := json.Marshal(standalonePod)
+				if marshalErr != nil {
+					t.Fatal(marshalErr)
+				}
+				var candidate object
+				if unmarshalErr := json.Unmarshal(podBytes, &candidate); unmarshalErr != nil {
+					t.Fatal(unmarshalErr)
+				}
+				mutatePod(candidate)
+				f.api.mu.Lock()
+				f.api.objects[f.e.controller().corePath("pods", standaloneName)] = candidate
+				f.api.mu.Unlock()
+			}
+			if retire {
+				retiredBytes, marshalErr := json.Marshal(standaloneState)
+				if marshalErr != nil {
+					t.Fatal(marshalErr)
+				}
+				var retired autoControl
+				if unmarshalErr := json.Unmarshal(retiredBytes, &retired); unmarshalErr != nil {
+					t.Fatal(unmarshalErr)
+				}
+				retired.Learners[0].Retirement = &learnerRetirement{Request: intent.Request, Proof: *intent.Proof}
+				if saveErr := controller.saveAuto(ctx, &cluster, &retired, mustAutoVersion(t, controller, &cluster)); saveErr != nil {
+					t.Fatal(saveErr)
+				}
+			}
+			if grant, grantErr := f.e.resolveStartupGrant(ctx, f.runtime.StatefulSetUID, id); grantErr == nil || grant.Role == fencing.StartupRoleLearnerPendingRemove {
+				t.Fatalf("unsafe standalone pending startup accepted: grant=%+v err=%v", grant, grantErr)
+			}
+		})
+	}
+	wrongPodUID := standaloneID
+	wrongPodUID.PodUID = "different-standalone-pod-uid"
+	assertRejectedStandalone("different-pod-uid", wrongPodUID, nil, false)
+	assertRejectedStandalone("wrong-owner", standaloneID, func(p object) {
+		asObject(list(nested(p, "metadata", "ownerReferences"))[0])["controller"] = true
+	}, false)
+	assertRejectedStandalone("wrong-credential", standaloneID, func(p object) {
+		asObject(nested(p, "metadata", "annotations"))[fencingCredentialAnnotation] = "different-credential-uid"
+	}, false)
+	assertRejectedStandalone("wrong-root", standaloneID, func(p object) {
+		asObject(nested(p, "metadata", "annotations"))[fencingRootAnnotation] = "different-root-uid"
+	}, false)
+	assertRejectedStandalone("retired-incarnation", standaloneID, nil, true)
+	if err := controller.saveAuto(ctx, &cluster, state, mustAutoVersion(t, controller, &cluster)); err != nil {
+		t.Fatalf("restore same-ordinal canonical assignment: %v", err)
+	}
+	persistTestRecovery(t, f, child)
+
 	walID := grant.Identity
 	walID.WALIdentity = intent.LearnerWAL
 	if _, err := client.Bind(ctx, walID); err != nil {
