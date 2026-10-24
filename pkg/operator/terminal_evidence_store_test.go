@@ -3,6 +3,8 @@ package operator
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"io"
@@ -105,6 +107,11 @@ func TestTerminalStoreRetainsEvidenceAcrossGenerationAndRestart(t *testing.T) {
 	e, _, runtime := terminalStoreFixture(t)
 	closeTerminalTestRun(t, e, runtime)
 	ref := retainTerminalTestRun(t, e, runtime)
+	canonicalBytesDigest := sha256.Sum256(terminalArtifactBytes(t, e, runtime, ref))
+	const wantV2CanonicalDigest = "46ab333fce993c8454c5d7ace2865ddb314584e633a6d0444826fe746fb78dff"
+	if got := hex.EncodeToString(canonicalBytesDigest[:]); got != wantV2CanonicalDigest || ref.ProofDigest != wantV2CanonicalDigest {
+		t.Fatalf("V2 canonical evidence bytes/ref digest drifted: bytes=%s ref=%s want=%s", got, ref.ProofDigest, wantV2CanonicalDigest)
+	}
 	state, err := e.change(t.Context(), runtime.StatefulSetUID, runtime.SourceClusterID, func(l *fencing.Ledger) error {
 		return l.Close("generation-fence", strings.Repeat("b", 64))
 	})
@@ -123,9 +130,17 @@ func TestTerminalStoreRetainsEvidenceAcrossGenerationAndRestart(t *testing.T) {
 		t.Fatal(err)
 	}
 	restarted := &FencingExecutor{AuthorityState: reopenedStore, VerifyRuntimeEvidence: e.VerifyRuntimeEvidence}
-	evidence, got, err := restarted.readIndependentTerminal(t.Context(), runtime, terminalTestStorage, hashJSON(state))
-	if err != nil || got != ref || !bytes.Equal(evidence.RuntimeReceipt, []byte("test-provider-terminal")) {
+	got, err := restarted.readIndependentTerminal(t.Context(), runtime, terminalTestStorage, hashJSON(state))
+	if err != nil || got != ref {
 		t.Fatalf("retained original evidence not reusable: %+v %v", got, err)
+	}
+	store, err := restarted.authorityEvidenceFor(runtime)
+	if err != nil {
+		t.Fatal(err)
+	}
+	evidence, err := readTerminalEvidence(t.Context(), store, got)
+	if err != nil || !bytes.Equal(evidence.RuntimeReceipt, []byte("test-provider-terminal")) {
+		t.Fatalf("retained original evidence receipt changed: %v", err)
 	}
 	if evidence.Request.OperationID != "voter-fence" || evidence.Producer.LastAdmitted != 1 {
 		t.Fatal("generation composition rewrote the original terminal interval")
@@ -296,7 +311,7 @@ func TestTerminalStoreRevalidatesRetainedArtifactAndTrust(t *testing.T) {
 					return errors.New("provider evidence invalid")
 				}
 			}
-			if _, _, err := e.readIndependentTerminal(t.Context(), runtime, storage, strings.Repeat("b", 64)); err == nil {
+			if _, err := e.readIndependentTerminal(t.Context(), runtime, storage, strings.Repeat("b", 64)); err == nil {
 				t.Fatal("invalid retained evidence authorized historical composition")
 			}
 		})
@@ -351,7 +366,7 @@ func TestTerminalStoreBoundedArchiveVerificationSurvivesRestart(t *testing.T) {
 	if err := e.AuthorityState.bucket.Delete(t.Context(), path); err != nil {
 		t.Fatal(err)
 	}
-	if _, _, err := e.readIndependentTerminal(t.Context(), runtime, terminalTestStorage, strings.Repeat("f", 64)); !errors.Is(err, errMutationArchiveEvidence) {
+	if _, err := e.readIndependentTerminal(t.Context(), runtime, terminalTestStorage, strings.Repeat("f", 64)); !errors.Is(err, errMutationArchiveEvidence) {
 		t.Fatalf("new generation reused unverified history: %v", err)
 	}
 }
@@ -399,16 +414,20 @@ func TestTerminalStoreRequiresPreparedMutationReceiptVerification(t *testing.T) 
 		return nil
 	}
 	ref := retainTerminalTestRun(t, e, runtime)
-	evidence, _, err := e.readIndependentTerminal(t.Context(), runtime, terminalTestStorage, strings.Repeat("c", 64))
-	if err != nil || verified == 0 || evidence.Producer.Entries[1].Resolution.Outcome != fencing.MutationExcluded {
+	if _, err := e.readIndependentTerminal(t.Context(), runtime, terminalTestStorage, strings.Repeat("c", 64)); err != nil || verified == 0 {
 		t.Fatalf("verified exclusion was lost or relabelled: %v", err)
 	}
-	if ref.MutationReceiptDigest != hashJSON(evidence.Producer) {
+	store, err := e.authorityEvidenceFor(runtime)
+	if err != nil {
+		t.Fatal(err)
+	}
+	evidence, err := readTerminalEvidence(t.Context(), store, ref)
+	if err != nil || evidence.Producer.Entries[1].Resolution.Outcome != fencing.MutationExcluded || ref.MutationReceiptDigest != hashJSON(evidence.Producer) {
 		t.Fatal("reference did not bind the retained mutation outcomes")
 	}
 	// The current executor must still have the verifier after restart.
 	restarted := &FencingExecutor{Kube: e.Kube, AuthorityState: e.AuthorityState, VerifyRuntimeEvidence: e.VerifyRuntimeEvidence}
-	if _, _, err := restarted.readIndependentTerminal(t.Context(), runtime, terminalTestStorage, strings.Repeat("d", 64)); err == nil {
+	if _, err := restarted.readIndependentTerminal(t.Context(), runtime, terminalTestStorage, strings.Repeat("d", 64)); err == nil {
 		t.Fatal("restart accepted prepared work without its receipt verifier")
 	}
 }

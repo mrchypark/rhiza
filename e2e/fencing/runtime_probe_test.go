@@ -39,6 +39,38 @@ func TestKubernetesDeleteOptionsBindUIDAndZeroGrace(t *testing.T) {
 	}
 }
 
+func TestOwnedSchemaNamespaceDeletePathRequiresExactRunNameAndUID(t *testing.T) {
+	const runID, name, uid = "deadbeef", "rhiza-fence-schema-deadbeef", "captured-namespace-uid"
+	valid := obj{"metadata": obj{"name": name, "uid": uid, "labels": obj{"chaos.rhiza.io/run": runID}}}
+	path, err := ownedSchemaNamespaceDeletePath(valid, name, runID, uid)
+	if err != nil || path != "/api/v1/namespaces/rhiza-fence-schema-deadbeef" {
+		t.Fatalf("valid owned namespace path=%q err=%v", path, err)
+	}
+	for _, tc := range []struct {
+		name   string
+		object obj
+		arg    string
+		runID  string
+		uid    string
+	}{
+		{name: "wrong live UID", object: obj{"metadata": obj{"name": name, "uid": "replacement-uid", "labels": obj{"chaos.rhiza.io/run": runID}}}, arg: name, runID: runID, uid: uid},
+		{name: "wrong run label", object: obj{"metadata": obj{"name": name, "uid": uid, "labels": obj{"chaos.rhiza.io/run": "feedface"}}}, arg: name, runID: runID, uid: uid},
+		{name: "wrong namespace name", object: valid, arg: "other", runID: runID, uid: uid},
+		{name: "invalid run ID", object: valid, arg: name, runID: "DEADBEEF", uid: uid},
+		{name: "missing UID", object: valid, arg: name, runID: runID, uid: ""},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			path, err := ownedSchemaNamespaceDeletePath(tc.object, tc.arg, tc.runID, tc.uid)
+			if err == nil || path != "" {
+				t.Fatalf("invalid namespace identity produced a delete path %q: %v", path, err)
+			}
+		})
+	}
+	if _, err := probeDeletePath("default", "namespaces", name); err == nil {
+		t.Fatal("cluster-scoped namespace delete broadened namespaced delete allowlist")
+	}
+}
+
 func TestRuntimeProbeRecordsEnrollmentAndSafeStopStageBeforePending(t *testing.T) {
 	progress := &runtimeProbeProgress{EnrollmentCaptured: true, StopStage: "pre_container_scope", StopCode: "process_scope_unverified", Pending: true}
 	data, err := json.Marshal(progress)

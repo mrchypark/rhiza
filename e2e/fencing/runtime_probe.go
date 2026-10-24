@@ -601,32 +601,56 @@ func deleteObjectWithPreconditions(ctx context.Context, resource, name, uid, res
 	if err != nil {
 		return err
 	}
+	return deleteObjectAtPathWithPreconditions(ctx, path, uid, resourceVersion, gracePeriodSeconds)
+}
 
+func deleteObjectAtPathWithPreconditions(ctx context.Context, path, uid, resourceVersion string, gracePeriodSeconds *int64) error {
+	if path == "" || uid == "" || (!strings.HasPrefix(path, "/api/v1/") && !strings.HasPrefix(path, "/apis/")) {
+		return fmt.Errorf("refusing UID-preconditioned delete without an API path and UID")
+	}
+	deleteOptions, err := buildKubernetesDeleteOptions(uid, resourceVersion, gracePeriodSeconds)
+	if err != nil {
+		return err
+	}
+	body, err := json.Marshal(deleteOptions)
+	if err != nil {
+		return fmt.Errorf("encode Kubernetes UID delete options: %w", err)
+	}
+	statusCode, _, err := kubernetesAPIRequest(ctx, http.MethodDelete, path, "application/json", body)
+	if err != nil {
+		return fmt.Errorf("send Kubernetes UID-preconditioned delete: %w", err)
+	}
+	if statusCode < 200 || statusCode >= 300 {
+		return fmt.Errorf("Kubernetes UID-preconditioned delete returned HTTP %d", statusCode)
+	}
+	return nil
+}
+
+func kubernetesAPIRequest(ctx context.Context, method, path, contentType string, body []byte) (int, []byte, error) {
+	if path == "" || (!strings.HasPrefix(path, "/api/v1/") && !strings.HasPrefix(path, "/apis/")) ||
+		(method != http.MethodDelete && method != http.MethodPatch) {
+		return 0, nil, fmt.Errorf("unsupported Kubernetes API request")
+	}
 	proxyDir, err := os.MkdirTemp("/tmp", "rhiza-kube-proxy-")
 	if err != nil {
-		return fmt.Errorf("create private Kubernetes proxy directory: %w", err)
+		return 0, nil, fmt.Errorf("create private Kubernetes proxy directory: %w", err)
 	}
 	defer os.RemoveAll(proxyDir)
 	socketPath := filepath.Join(proxyDir, "proxy.sock")
 	cmd := exec.CommandContext(ctx, "kubectl", "--context", kubeContext, "proxy", "--unix-socket", socketPath, "--api-prefix=/")
-	cmd.Stdout = io.Discard
-	cmd.Stderr = io.Discard
+	cmd.Stdout, cmd.Stderr = io.Discard, io.Discard
 	if err := cmd.Start(); err != nil {
-		return fmt.Errorf("start Kubernetes API proxy: %w", err)
+		return 0, nil, fmt.Errorf("start Kubernetes API proxy: %w", err)
 	}
 	proxyDone := make(chan struct{})
 	var proxyErr error
-	go func() {
-		proxyErr = cmd.Wait()
-		close(proxyDone)
-	}()
+	go func() { proxyErr = cmd.Wait(); close(proxyDone) }()
 	defer func() {
 		if cmd.Process != nil {
 			_ = cmd.Process.Kill()
 		}
 		<-proxyDone
 	}()
-
 	transport := &http.Transport{DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
 		return (&net.Dialer{}).DialContext(ctx, "unix", socketPath)
 	}}
@@ -638,12 +662,12 @@ func deleteObjectWithPreconditions(ctx context.Context, resource, name, uid, res
 	for {
 		select {
 		case <-proxyDone:
-			return fmt.Errorf("Kubernetes API proxy exited before readiness: %v", proxyErr)
+			return 0, nil, fmt.Errorf("Kubernetes API proxy exited before readiness: %v", proxyErr)
 		default:
 		}
 		request, err := http.NewRequestWithContext(ctx, http.MethodGet, baseURL+"/version", nil)
 		if err != nil {
-			return err
+			return 0, nil, err
 		}
 		response, requestErr := client.Do(request)
 		if requestErr == nil {
@@ -654,36 +678,28 @@ func deleteObjectWithPreconditions(ctx context.Context, resource, name, uid, res
 		}
 		select {
 		case <-ctx.Done():
-			return fmt.Errorf("wait for Kubernetes API proxy: %w", ctx.Err())
+			return 0, nil, fmt.Errorf("wait for Kubernetes API proxy: %w", ctx.Err())
 		case <-readyDeadline.C:
-			return fmt.Errorf("Kubernetes API proxy did not become ready")
+			return 0, nil, fmt.Errorf("Kubernetes API proxy did not become ready")
 		case <-time.After(50 * time.Millisecond):
 		}
 	}
-
-	deleteOptions, err := buildKubernetesDeleteOptions(uid, resourceVersion, gracePeriodSeconds)
+	request, err := http.NewRequestWithContext(ctx, method, baseURL+path, bytes.NewReader(body))
 	if err != nil {
-		return err
+		return 0, nil, fmt.Errorf("construct Kubernetes API request: %w", err)
 	}
-	body, err := json.Marshal(deleteOptions)
-	if err != nil {
-		return fmt.Errorf("encode Kubernetes UID delete options: %w", err)
-	}
-	request, err := http.NewRequestWithContext(ctx, http.MethodDelete, baseURL+path, bytes.NewReader(body))
-	if err != nil {
-		return fmt.Errorf("construct Kubernetes UID delete request: %w", err)
-	}
-	request.Header.Set("Content-Type", "application/json")
+	request.Header.Set("Content-Type", contentType)
 	request.Header.Set("Origin", baseURL)
 	response, err := client.Do(request)
 	if err != nil {
-		return fmt.Errorf("send Kubernetes UID-preconditioned delete: %w", err)
+		return 0, nil, err
 	}
 	defer response.Body.Close()
-	if response.StatusCode < 200 || response.StatusCode >= 300 {
-		return fmt.Errorf("Kubernetes UID-preconditioned delete returned HTTP %d", response.StatusCode)
+	responseBody, err := io.ReadAll(io.LimitReader(response.Body, 8192))
+	if err != nil {
+		return response.StatusCode, nil, err
 	}
-	return nil
+	return response.StatusCode, responseBody, nil
 }
 
 func probeDeletePath(namespace, resource, name string) (string, error) {
@@ -692,6 +708,58 @@ func probeDeletePath(namespace, resource, name string) (string, error) {
 		return "", fmt.Errorf("unsupported UID-preconditioned delete resource %q", resource)
 	}
 	return apiPrefix + "/namespaces/" + url.PathEscape(namespace) + "/" + resource + "/" + url.PathEscape(name), nil
+}
+
+func ownedSchemaNamespaceDeletePath(namespaceObject obj, name, runID, uid string) (string, error) {
+	if len(runID) != 8 || name != "rhiza-fence-schema-"+runID || uid == "" ||
+		text(nested(namespaceObject, "metadata", "name")) != name || text(nested(namespaceObject, "metadata", "uid")) != uid ||
+		nested(namespaceObject, "metadata", "labels", "chaos.rhiza.io/run") != runID {
+		return "", fmt.Errorf("schema namespace is not the exact run-owned UID")
+	}
+	for _, r := range runID {
+		if !(r >= 'a' && r <= 'f' || r >= '0' && r <= '9') {
+			return "", fmt.Errorf("schema namespace run ID is invalid")
+		}
+	}
+	return "/api/v1/namespaces/" + url.PathEscape(name), nil
+}
+
+func deleteOwnedSchemaNamespace(ctx context.Context, name, runID, uid string) error {
+	if len(runID) != 8 || name != "rhiza-fence-schema-"+runID || uid == "" {
+		return fmt.Errorf("refusing schema namespace cleanup without exact run name and UID")
+	}
+	data, err := command(ctx, "kubectl", "--context", kubeContext, "get", "namespace", name, "-o", "json")
+	if err != nil {
+		if strings.Contains(err.Error(), "(NotFound)") {
+			return nil
+		}
+		return fmt.Errorf("read schema namespace before UID-preconditioned cleanup: %w", err)
+	}
+	var namespaceObject obj
+	if err := json.Unmarshal(data, &namespaceObject); err != nil {
+		return fmt.Errorf("decode schema namespace before cleanup: %w", err)
+	}
+	apiPath, err := ownedSchemaNamespaceDeletePath(namespaceObject, name, runID, uid)
+	if err != nil {
+		return err
+	}
+	if err := deleteObjectAtPathWithPreconditions(ctx, apiPath, uid, "", nil); err != nil {
+		return fmt.Errorf("delete exact run-owned schema namespace: %w", err)
+	}
+	return wait(ctx, "UID-preconditioned schema namespace deletion", func() (bool, error) {
+		current, err := command(ctx, "kubectl", "--context", kubeContext, "get", "namespace", name, "-o", "json")
+		if err != nil {
+			if strings.Contains(err.Error(), "(NotFound)") {
+				return true, nil
+			}
+			return false, err
+		}
+		var currentObject obj
+		if err := json.Unmarshal(current, &currentObject); err != nil {
+			return false, err
+		}
+		return text(nested(currentObject, "metadata", "uid")) != uid, nil
+	})
 }
 
 func probeUIDGone(uid string, current obj) bool {

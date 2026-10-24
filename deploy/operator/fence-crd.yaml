@@ -80,10 +80,12 @@ spec:
                     storageQuiesced: {type: boolean}
                     independentV2:
                       description: >-
-                        Authority-verified per-run runtime termination and settled
+                        Authority-verified per-run runtime termination. V2 active
+                        references include settled producer mutation evidence; V3
+                        is reserved for closed pending learners with no producer
                         mutation evidence. Every historical run in the closed
-                        cohort is included through immutable retained references;
-                        quiet storage observations alone cannot authorize recovery.
+                        cohort is retained; quiet storage observations alone
+                        cannot authorize recovery.
                       type: object
                       required: [version, requestHash, ledgerHash, storageScope, currentPodUIDs, terminals]
                       properties:
@@ -111,8 +113,11 @@ spec:
                           items:
                             type: object
                             required: [evidenceVersion, request, runtimeHash, producerUID, proofName, proofUID, proofDigest, runtimeReceiptDigest, mutationReceiptDigest, storageScopeDigest]
+                            x-kubernetes-validations:
+                              - rule: "(self.evidenceVersion == 2 && size(self.producerUID) > 0 && self.mutationReceiptDigest.matches('^[a-f0-9]{64}$')) || (self.evidenceVersion == 3 && self.producerUID == '' && self.mutationReceiptDigest == '')"
+                                message: evidenceVersion 2 requires producer mutation evidence; version 3 is reserved for closed pending learners without a producer
                             properties:
-                              evidenceVersion: {type: integer, enum: [2]}
+                              evidenceVersion: {type: integer, enum: [2, 3]}
                               request:
                                 type: object
                                 required: [operationID, requestHash, identity]
@@ -125,16 +130,18 @@ spec:
                                     properties:
                                       sourceClusterID: {type: string, maxLength: 256, minLength: 1}
                                       nodeID: {type: string, maxLength: 256, minLength: 1}
+                                      podName: {type: string, maxLength: 256}
                                       podUID: {type: string, maxLength: 256, minLength: 1}
                                       runID: {type: string, maxLength: 128, minLength: 1}
                                       walIdentity: {type: string, maxLength: 128}
+                                      assignmentID: {type: string, pattern: '^[a-f0-9]{64}$'}
                               runtimeHash: {type: string, pattern: '^[a-f0-9]{64}$'}
-                              producerUID: {type: string, maxLength: 128, minLength: 1}
+                              producerUID: {type: string, maxLength: 128}
                               proofName: {type: string, maxLength: 63, minLength: 1}
                               proofUID: {type: string, maxLength: 128, minLength: 1}
                               proofDigest: {type: string, pattern: '^[a-f0-9]{64}$'}
                               runtimeReceiptDigest: {type: string, pattern: '^[a-f0-9]{64}$'}
-                              mutationReceiptDigest: {type: string, pattern: '^[a-f0-9]{64}$'}
+                              mutationReceiptDigest: {type: string, maxLength: 64, pattern: '^([a-f0-9]{64})?$'}
                               storageScopeDigest: {type: string, pattern: '^[a-f0-9]{64}$'}
                     independent:
                       description: >-

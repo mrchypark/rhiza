@@ -10,8 +10,11 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
+	"syscall"
 	"testing"
+	"time"
 
 	"github.com/mrchypark/rhiza/pkg/fencing"
 	"github.com/mrchypark/rhiza/pkg/network"
@@ -48,6 +51,313 @@ func TestWorkflowExcludesRawKindArtifacts(t *testing.T) {
 		if !found {
 			t.Fatalf("%s upload must exclude the entire raw Kind subtree", job)
 		}
+	}
+}
+
+func TestCommandPreservesExecutionAndContextErrors(t *testing.T) {
+	t.Run("canceled process preserves exit and context errors", func(t *testing.T) {
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+		readyPath := filepath.Join(t.TempDir(), "command-ready")
+		t.Setenv("FENCING_TEST_COMMAND_READY", readyPath)
+		result := make(chan error, 1)
+		go func() {
+			_, err := command(ctx, "sh", "-c", `printf ready > "$FENCING_TEST_COMMAND_READY"; exec sleep 30`)
+			result <- err
+		}()
+
+		watchdog := time.NewTimer(5 * time.Second)
+		defer watchdog.Stop()
+		poll := time.NewTicker(10 * time.Millisecond)
+		defer poll.Stop()
+		ready := false
+		for !ready {
+			select {
+			case err := <-result:
+				t.Fatalf("subprocess exited before its readiness marker: %v", err)
+			case <-poll.C:
+				if _, err := os.Stat(readyPath); err == nil {
+					ready = true
+				}
+			case <-watchdog.C:
+				cancel()
+				err := <-result
+				t.Fatalf("subprocess did not reach its readiness marker before watchdog: %v", err)
+			}
+		}
+		cancel()
+		err := <-result
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("command error did not preserve the explicit cancellation cause: %v", err)
+		}
+		var exitErr *exec.ExitError
+		if !errors.As(err, &exitErr) {
+			t.Fatalf("command error did not preserve the subprocess exit error: %v", err)
+		}
+	})
+
+	t.Run("live subprocess failure preserves exit error", func(t *testing.T) {
+		_, err := command(context.Background(), "sh", "-c", "exit 7")
+		var exitErr *exec.ExitError
+		if !errors.As(err, &exitErr) || exitErr.ExitCode() != 7 {
+			t.Fatalf("command error did not preserve the live subprocess failure: %v", err)
+		}
+		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+			t.Fatalf("live subprocess failure was misclassified as context cancellation: %v", err)
+		}
+	})
+}
+
+func TestForwardCloseReportsEveryCleanupFailureAndIsIdempotent(t *testing.T) {
+	logFile, err := os.CreateTemp(t.TempDir(), "closed-port-forward-log-*")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := logFile.Close(); err != nil {
+		t.Fatal(err)
+	}
+	waitFailure := errors.New("injected wait failure")
+	forward := &forward{cmd: &exec.Cmd{Process: &os.Process{Pid: -1}}, done: make(chan error, 1), log: logFile}
+	forward.done <- waitFailure
+
+	first := forward.close()
+	if first == nil || !strings.Contains(first.Error(), "kill port-forward process") ||
+		!errors.Is(first, waitFailure) || !strings.Contains(first.Error(), "close port-forward log file") {
+		t.Fatalf("close did not report kill, wait, and log-close failures: %v", first)
+	}
+	if second := forward.close(); second != first {
+		t.Fatalf("repeat close did not return the retained cleanup result: first=%v second=%v", first, second)
+	}
+}
+
+func TestForwardCloseTreatsItsSuccessfulKillAsExpected(t *testing.T) {
+	logFile, err := os.CreateTemp(t.TempDir(), "port-forward-log-*")
+	if err != nil {
+		t.Fatal(err)
+	}
+	cmd := exec.Command("sh", "-c", "sleep 30")
+	cmd.Stdout, cmd.Stderr = logFile, logFile
+	if err := cmd.Start(); err != nil {
+		_ = logFile.Close()
+		t.Fatal(err)
+	}
+	forward := &forward{cmd: cmd, done: make(chan error, 1), log: logFile}
+	go func() { forward.done <- cmd.Wait() }()
+	if err := forward.close(); err != nil {
+		t.Fatalf("expected successful owned-process cleanup, got %v", err)
+	}
+}
+
+func TestQualificationLedgerCleanupPreservesBucketAndForwardErrors(t *testing.T) {
+	logFile, err := os.CreateTemp(t.TempDir(), "closed-qualification-forward-log-*")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := logFile.Close(); err != nil {
+		t.Fatal(err)
+	}
+	bucketErr := errors.New("injected bucket close failure")
+	forwardErr := errors.New("injected port-forward wait failure")
+	f := &forward{cmd: &exec.Cmd{Process: &os.Process{Pid: -1}}, done: make(chan error, 1), log: logFile}
+	f.done <- forwardErr
+
+	err = closeQualificationLedgerResources(func() error { return bucketErr }, f)
+	if !errors.Is(err, bucketErr) || !errors.Is(err, forwardErr) ||
+		!strings.Contains(err.Error(), "close canonical authority bucket") ||
+		!strings.Contains(err.Error(), "kill port-forward process") ||
+		!strings.Contains(err.Error(), "close port-forward log file") {
+		t.Fatalf("qualification cleanup did not preserve bucket and forward errors: %v", err)
+	}
+}
+
+func TestGCSMixedSelectorUsesOneDeadlineBoundedCommand(t *testing.T) {
+	now := time.Now().Truncate(time.Second)
+	work, hard, err := gcsMixedDeadlines(now, "", "")
+	if err != nil || !work.Equal(hard.Add(-gcsMixedDefaultCleanupReserve)) || !hard.Equal(now.Add(gcsMixedHardLimit)) {
+		t.Fatalf("default mixed deadlines differ: work=%s hard=%s err=%v", work, hard, err)
+	}
+	for _, selector := range []struct {
+		command  string
+		scenario string
+		want     bool
+	}{
+		{command: "run-gcs-ha-mixed-pending", want: true},
+		{command: "run", scenario: gcsHAMixedPendingScenario, want: true},
+		{command: "run", want: false},
+		{command: "run-gcs-ha", scenario: gcsHAMixedPendingScenario, want: false},
+	} {
+		if got := isGCSMixedPendingSelected(selector.command, selector.scenario); got != selector.want {
+			t.Errorf("selector command=%q scenario=%q: got %v, want %v", selector.command, selector.scenario, got, selector.want)
+		}
+	}
+}
+
+func TestGCSMixedDeadlinesRejectUnsafeContract(t *testing.T) {
+	now := time.Now()
+	valid := func(workOffset, hardOffset time.Duration) (string, string) {
+		return strconv.FormatInt(now.Add(workOffset).Unix(), 10), strconv.FormatInt(now.Add(hardOffset).Unix(), 10)
+	}
+	validWork, validHard := valid(40*time.Minute, 50*time.Minute)
+	expiredWork, expiredHard := valid(-time.Second, time.Minute)
+	wrongOrderWork, wrongOrderHard := valid(2*time.Minute, time.Minute)
+	overLimitWork, overLimitHard := valid(50*time.Minute, 56*time.Minute)
+	for name, pair := range map[string][2]string{
+		"partial":         {validWork, ""},
+		"malformed":       {"nope", validHard},
+		"expired":         {expiredWork, expiredHard},
+		"wrong-order":     {wrongOrderWork, wrongOrderHard},
+		"over-hard-limit": {overLimitWork, overLimitHard},
+	} {
+		t.Run(name, func(t *testing.T) {
+			if _, _, err := gcsMixedDeadlines(now, pair[0], pair[1]); err == nil {
+				t.Fatal("unsafe deadline contract was accepted")
+			}
+		})
+	}
+}
+
+func TestGCSMixedCleanupDeadlineSurvivesWorkCancellationButNotHardHorizon(t *testing.T) {
+	hard := time.Now().Add(100 * time.Millisecond)
+	workCtx, cancelWork := context.WithCancel(context.Background())
+	workCtx = context.WithValue(workCtx, gcsMixedHardDeadlineKey{}, hard)
+	cancelWork()
+	cleanupCtx, cancelCleanup := gcsMixedCleanupContext(workCtx, time.Minute)
+	defer cancelCleanup()
+	if cleanupCtx.Err() != nil {
+		t.Fatalf("cleanup inherited work cancellation: %v", cleanupCtx.Err())
+	}
+	deadline, ok := cleanupCtx.Deadline()
+	if !ok || deadline.After(hard) {
+		t.Fatalf("cleanup deadline exceeds hard horizon: deadline=%s hard=%s", deadline, hard)
+	}
+	select {
+	case <-cleanupCtx.Done():
+	case <-time.After(time.Second):
+		t.Fatal("cleanup context did not stop at the hard horizon")
+	}
+	if !errors.Is(cleanupCtx.Err(), context.DeadlineExceeded) {
+		t.Fatalf("cleanup ended for the wrong reason: %v", cleanupCtx.Err())
+	}
+}
+
+func TestGCSMixedCommandSignalSubprocess(t *testing.T) {
+	if os.Getenv("FENCING_E2E_MIXED_SIGNAL_CHILD") != "1" {
+		return
+	}
+	command := os.Getenv("FENCING_E2E_MIXED_SIGNAL_SELECTOR")
+	scenario := os.Getenv(gcsHAScenarioEnv)
+	if !isGCSMixedPendingSelected(command, scenario) {
+		t.Fatalf("subprocess selector was not routed to mixed command: command=%q scenario=%q", command, scenario)
+	}
+	readyPath := os.Getenv("FENCING_E2E_MIXED_SIGNAL_READY")
+	cleanupPath := os.Getenv("FENCING_E2E_MIXED_SIGNAL_CLEANUP")
+	if readyPath == "" || cleanupPath == "" {
+		t.Fatal("signal subprocess marker paths are required")
+	}
+	err := runGCSMixedPendingCommand(func(context.Context) error { return nil }, func(ctx context.Context) (resultErr error) {
+		defer func() {
+			cleanupErr := os.WriteFile(cleanupPath, []byte("deferred-cleanup\n"), 0600)
+			resultErr = errors.Join(resultErr, cleanupErr)
+			if os.Getenv("FENCING_E2E_MIXED_SIGNAL_CLEANUP_ERROR") == "1" {
+				resultErr = errors.Join(resultErr, errors.New("injected deferred cleanup failure"))
+			}
+		}()
+		if err := os.WriteFile(readyPath, []byte("cleanup-installed\n"), 0600); err != nil {
+			return err
+		}
+		<-ctx.Done()
+		return ctx.Err()
+	})
+	if err == nil {
+		t.Fatal("signal cancellation returned success")
+	}
+	t.Fatalf("mixed subprocess canceled and completed deferred cleanup: %v", err)
+}
+
+func TestGCSMixedSelectorsHandleSIGINTAndSIGTERMThroughDeferredCleanup(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		selector string
+		signal   os.Signal
+	}{
+		{name: "explicit-sigint", selector: "run-gcs-ha-mixed-pending", signal: os.Interrupt},
+		{name: "explicit-sigterm", selector: "run-gcs-ha-mixed-pending", signal: syscall.SIGTERM},
+		{name: "environment-sigint", selector: "run", signal: os.Interrupt},
+		{name: "environment-sigterm", selector: "run", signal: syscall.SIGTERM},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			dir := t.TempDir()
+			readyPath := filepath.Join(dir, "ready")
+			cleanupPath := filepath.Join(dir, "cleanup")
+			cmd := exec.Command(os.Args[0], "-test.run=^TestGCSMixedCommandSignalSubprocess$")
+			for _, entry := range os.Environ() {
+				if strings.HasPrefix(entry, "FENCING_E2E_MIXED_SIGNAL_") || strings.HasPrefix(entry, gcsHAScenarioEnv+"=") ||
+					strings.HasPrefix(entry, gcsMixedWorkDeadlineEnv+"=") || strings.HasPrefix(entry, gcsMixedHardDeadlineEnv+"=") {
+					continue
+				}
+				cmd.Env = append(cmd.Env, entry)
+			}
+			cmd.Env = append(cmd.Env,
+				"FENCING_E2E_MIXED_SIGNAL_CHILD=1",
+				"FENCING_E2E_MIXED_SIGNAL_SELECTOR="+tc.selector,
+				"FENCING_E2E_MIXED_SIGNAL_READY="+readyPath,
+				"FENCING_E2E_MIXED_SIGNAL_CLEANUP="+cleanupPath,
+			)
+			if tc.name == "explicit-sigterm" {
+				cmd.Env = append(cmd.Env, "FENCING_E2E_MIXED_SIGNAL_CLEANUP_ERROR=1")
+			}
+			if tc.selector == "run" {
+				cmd.Env = append(cmd.Env, gcsHAScenarioEnv+"="+gcsHAMixedPendingScenario)
+			} else {
+				cmd.Env = append(cmd.Env, gcsHAScenarioEnv+"=")
+			}
+			output := &bytes.Buffer{}
+			cmd.Stdout, cmd.Stderr = output, output
+			if err := cmd.Start(); err != nil {
+				t.Fatal(err)
+			}
+			waitForFile := func(path string) bool {
+				deadline := time.Now().Add(5 * time.Second)
+				for time.Now().Before(deadline) {
+					if _, err := os.Stat(path); err == nil {
+						return true
+					}
+					time.Sleep(10 * time.Millisecond)
+				}
+				return false
+			}
+			if !waitForFile(readyPath) {
+				_ = cmd.Process.Kill()
+				_ = cmd.Wait()
+				t.Fatalf("subprocess did not reach configured readiness: %s", output.String())
+			}
+			if err := cmd.Process.Signal(tc.signal); err != nil {
+				_ = cmd.Process.Kill()
+				_ = cmd.Wait()
+				t.Fatal(err)
+			}
+			waited := make(chan error, 1)
+			go func() { waited <- cmd.Wait() }()
+			select {
+			case err := <-waited:
+				if err == nil {
+					t.Fatalf("canceled selector exited successfully; output=%s", output.String())
+				}
+			case <-time.After(5 * time.Second):
+				_ = cmd.Process.Kill()
+				<-waited
+				t.Fatalf("subprocess did not finish after cancellation; output=%s", output.String())
+			}
+			if _, err := os.Stat(cleanupPath); err != nil {
+				t.Fatalf("deferred cleanup did not complete: %v; output=%s", err, output.String())
+			}
+			if !strings.Contains(output.String(), "context canceled") {
+				t.Fatalf("cancellation cause was not reported: %s", output.String())
+			}
+			if tc.name == "explicit-sigterm" && !strings.Contains(output.String(), "injected deferred cleanup failure") {
+				t.Fatalf("cleanup error was not preserved: %s", output.String())
+			}
+		})
 	}
 }
 

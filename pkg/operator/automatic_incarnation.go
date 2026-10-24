@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 
@@ -12,6 +13,8 @@ import (
 	"github.com/mrchypark/rhiza/pkg/network"
 	"github.com/mrchypark/rhiza/pkg/quepaxa"
 )
+
+var errSameOrdinalLearnerCapacity = errors.New("same-ordinal learner capacity unavailable")
 
 // prepareSameOrdinalLearner reserves a new logical identity for the exact
 // StatefulSet Pod incarnation that replaced a fenced voter. The Pod remains
@@ -66,9 +69,31 @@ func (c *Controller) prepareSameOrdinalLearner(ctx context.Context, state *autoC
 		}
 	}
 	for _, entry := range state.Learners {
-		if entry.Target.NodeID == logicalID || entry.Target.PodUID == uid {
+		if entry.Target.NodeID != logicalID && entry.Target.PodUID != uid {
+			continue
+		}
+		if entry.SourceClusterID != state.ActiveClusterID || entry.OperationID != i.Request.OperationID ||
+			entry.Target.NodeID != logicalID || entry.Target.Pod != old.Pod || entry.Target.PodUID != uid || entry.Retirement == nil || i.LearnerAttempt == 0 {
 			return false, fmt.Errorf("fresh logical identity collides with retained learner history")
 		}
+		retirementRequest := entry.Retirement.Request
+		retirementProof := &entry.Retirement.Proof
+		retirementOperationMatches := false
+		for priorAttempt := 0; priorAttempt < i.LearnerAttempt && priorAttempt < 3; priorAttempt++ {
+			if retirementRequest.OperationID == fmt.Sprintf("%s-learner-fence-%d", i.RecoveryName, priorAttempt) {
+				retirementOperationMatches = true
+				break
+			}
+		}
+		if retirementRequest.LogicalID != i.Request.LogicalID || retirementRequest.BindingUID != state.BindingUID ||
+			retirementRequest.Namespace != c.Kube.Namespace || retirementRequest.StatefulSet != i.Request.StatefulSet ||
+			retirementRequest.StatefulSetUID != state.StatefulSetUID || retirementRequest.SourceClusterID != entry.SourceClusterID ||
+			!retirementOperationMatches ||
+			retirementRequest.Scope != ScopeVoter || len(retirementRequest.Targets) != 1 || retirementRequest.Targets[0] != entry.Target ||
+			validateFenceProof(retirementRequest, retirementProof) != nil || proofCoversLearner(retirementRequest, retirementProof, entry.Target) != nil {
+			return false, fmt.Errorf("fresh logical identity collides with unproven learner retirement history")
+		}
+		return false, nil
 	}
 	if i.LearnerName != "" && i.LearnerName != old.Pod && i.LearnerPodName == "" {
 		var standalone object
@@ -94,6 +119,16 @@ func (c *Controller) prepareSameOrdinalLearner(ctx context.Context, state *autoC
 	httpPort, peerPort, err := validateLearnerPorts(ctr)
 	if err != nil {
 		return false, err
+	}
+	candidate := *state
+	candidateIntent := *i
+	candidateIntent.LearnerName = logicalID
+	candidate.Intent = &candidateIntent
+	if err := fenceCapacityError(worstCaseGenerationTargets(&candidate)); err != nil {
+		return false, fmt.Errorf("%w: %v", errSameOrdinalLearnerCapacity, err)
+	}
+	if len(state.Learners) >= maxLearnerHistory {
+		return false, fmt.Errorf("%w: learner history is full (%d) and canonical fencing status cannot compact it", errSameOrdinalLearnerCapacity, maxLearnerHistory)
 	}
 	secretName := sameOrdinalSecretName(state.BindingUID, uid)
 	httpURL := fmt.Sprintf("http://%s:%d", old.Pod, httpPort)

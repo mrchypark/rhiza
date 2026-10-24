@@ -721,7 +721,7 @@ func findGCSDeadPodTerminalRef(proof operator.FenceProof, source gcsRecoverySour
 	for i := range proof.IndependentV2.Terminals {
 		ref := &proof.IndependentV2.Terminals[i]
 		id := ref.Request.Identity
-		if id.SourceClusterID != source.ClusterID || id.NodeID != target.NodeID || id.PodUID != target.PodUID ||
+		if ref.EvidenceVersion != 2 || id.SourceClusterID != source.ClusterID || id.NodeID != target.NodeID || id.PodUID != target.PodUID ||
 			id.RunID != runtime.RunID || id.WALIdentity != target.WALIdentity || ref.RuntimeHash != fencing.RuntimeBindingDigest(runtime) || ref.ProducerUID != producerUID {
 			continue
 		}
@@ -1095,17 +1095,11 @@ func verifyIndependentVoterProof(item any, source gcsRecoverySource, target oper
 	terminal := false
 	for _, ref := range evidence.Terminals {
 		id := ref.Request.Identity
-		if ref.EvidenceVersion != 2 || ref.Request.OperationID == "" || id.SourceClusterID == "" || id.NodeID == "" || id.PodUID == "" ||
-			id.RunID == "" || id.WALIdentity == "" || ref.ProducerUID == "" || ref.ProofName == "" || ref.ProofUID == "" || ref.StorageScopeDigest != scopeDigest {
+		if err := validateGCSGenerationTerminalReference(ref, source.ClusterID, scopeDigest); err != nil {
 			return request, proof, fmt.Errorf("IndependentV2 voter terminal reference is incomplete")
 		}
-		for _, digest := range []string{ref.Request.RequestHash, ref.RuntimeHash, ref.ProofDigest, ref.RuntimeReceiptDigest, ref.MutationReceiptDigest} {
-			if _, err := immutableDigest("sha256:" + digest); err != nil {
-				return request, proof, fmt.Errorf("IndependentV2 voter terminal digest is invalid")
-			}
-		}
 		if id.SourceClusterID == source.ClusterID && id.NodeID == target.NodeID && id.PodUID == target.PodUID &&
-			id.WALIdentity == target.WALIdentity && id.RunID == runtime.RunID &&
+			id.WALIdentity == target.WALIdentity && id.RunID == runtime.RunID && ref.EvidenceVersion == 2 &&
 			ref.RuntimeHash == fencing.RuntimeBindingDigest(runtime) && ref.ProducerUID == producerUID {
 			terminal = true
 		}

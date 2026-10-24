@@ -2,17 +2,22 @@ package main
 
 import (
 	"context"
+	"crypto/rand"
 	"crypto/sha256"
 	"encoding/base64"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net/http"
+	"net/url"
 	"os"
 	"path"
 	"path/filepath"
 	"strings"
 	"time"
 
+	"github.com/mrchypark/rhiza/pkg/fencing"
 	"github.com/mrchypark/rhiza/pkg/network"
 	"github.com/mrchypark/rhiza/pkg/operator"
 	"github.com/thanos-io/objstore"
@@ -45,6 +50,7 @@ type gcsRecoverySource struct {
 type gcsControlPodIdentity struct {
 	Name           string `json:"name"`
 	UID            string `json:"uid"`
+	OwnerName      string `json:"ownerName,omitempty"`
 	OwnerUID       string `json:"ownerUID"`
 	ParentOwnerUID string `json:"parentOwnerUID,omitempty"`
 }
@@ -83,9 +89,13 @@ func qualifyGCSHAWithMode(ctx context.Context, explicit bool) (resultErr error) 
 	event := func(name string, data any) {
 		_ = json.NewEncoder(events).Encode(obj{"event": name, "time": time.Now().UTC(), "data": data})
 	}
+	if err := verifyGCSIndependentReferenceAPIServerRoundTrip(ctx); err != nil {
+		return fmt.Errorf("fence CRD terminal reference API-server roundtrip: %w", err)
+	}
+	event("terminal_reference_schema_roundtrip", obj{"proofOrigin": "synthetic schema-only fixture", "outerVersion": 2, "terminalVersions": []int{2, 3}, "status": "preserved-and-invalid-combinations-rejected"})
 	var faults []*gcsChaosFault
 	defer func() {
-		cleanupCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		cleanupCtx, cancel := context.WithTimeout(context.Background(), schemaNamespaceCleanupTimeout)
 		defer cancel()
 		for i := len(faults) - 1; i >= 0; i-- {
 			if err := faults[i].Restore(cleanupCtx); err != nil {
@@ -178,6 +188,276 @@ func qualifyGCSHAWithMode(ctx context.Context, explicit bool) (resultErr error) 
 	}
 	event("old_pod_return_qualified", oldReturn)
 	return nil
+}
+
+// verifyGCSIndependentReferenceAPIServerRoundTrip exercises the installed
+// CRD's real pruning and conditional validation with synthetic schema-only
+// data, without placing a request in the operator's watched namespace. The
+// authority-generated proof is separately read back and checked in
+// waitForGCSRecovery.
+func verifyGCSIndependentReferenceAPIServerRoundTrip(ctx context.Context) (resultErr error) {
+	if len(qualificationRunID) != 8 {
+		return fmt.Errorf("run identity is unavailable")
+	}
+	ns := "rhiza-fence-schema-" + qualificationRunID
+	var createMarkerBytes [16]byte
+	if _, err := rand.Read(createMarkerBytes[:]); err != nil {
+		return fmt.Errorf("generate isolated roundtrip namespace ownership marker: %w", err)
+	}
+	createMarker := hex.EncodeToString(createMarkerBytes[:])
+	namespaceBody := obj{"apiVersion": "v1", "kind": "Namespace", "metadata": obj{"name": ns, "labels": obj{
+		"chaos.rhiza.io/run": qualificationRunID, schemaNamespaceCreateTokenLabel: createMarker,
+	}}}
+	created, err := commandWithInput(ctx, encoded(namespaceBody), "kubectl", "--context", kubeContext, "create", "-f", "-", "-o", "json")
+	if err != nil {
+		readback := func(readCtx context.Context, name string) (obj, error) {
+			data, readErr := command(readCtx, "kubectl", "--context", kubeContext, "get", "namespace", name, "-o", "json")
+			if readErr != nil {
+				return nil, readErr
+			}
+			var namespaceObject obj
+			if decodeErr := json.Unmarshal(data, &namespaceObject); decodeErr != nil {
+				return nil, fmt.Errorf("decode isolated roundtrip namespace readback: %w", decodeErr)
+			}
+			return namespaceObject, nil
+		}
+		cleanup := func(cleanupCtx context.Context, name, runID, uid string) error {
+			return deleteOwnedSchemaNamespace(cleanupCtx, name, runID, uid)
+		}
+		return cleanupUncertainSchemaNamespaceCreate(ctx, ns, qualificationRunID, createMarker, err, readback, cleanup)
+	}
+	namespaceUID := ""
+	defer func() {
+		cleanupCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cancel()
+		if namespaceUID == "" {
+			identity, err := command(cleanupCtx, "kubectl", "--context", kubeContext, "get", "namespace", ns, "-o", "json")
+			var recovered obj
+			if err != nil || json.Unmarshal(identity, &recovered) != nil || text(nested(recovered, "metadata", "name")) != ns ||
+				nested(recovered, "metadata", "labels", "chaos.rhiza.io/run") != qualificationRunID ||
+				nested(recovered, "metadata", "labels", schemaNamespaceCreateTokenLabel) != createMarker {
+				resultErr = errors.Join(resultErr, fmt.Errorf("isolated roundtrip namespace %q may remain; exact UID and run ownership could not be verified", ns))
+				return
+			}
+			namespaceUID = text(nested(recovered, "metadata", "uid"))
+			if namespaceUID == "" {
+				resultErr = errors.Join(resultErr, fmt.Errorf("isolated roundtrip namespace %q may remain; exact UID is unavailable", ns))
+				return
+			}
+		}
+		if err := deleteOwnedSchemaNamespace(cleanupCtx, ns, qualificationRunID, namespaceUID); err != nil {
+			resultErr = errors.Join(resultErr, fmt.Errorf("cleanup isolated roundtrip namespace %q failed; it may remain: %w", ns, err))
+		}
+	}()
+	var namespaceObject obj
+	if err := json.Unmarshal(created, &namespaceObject); err != nil {
+		return fmt.Errorf("decode isolated roundtrip namespace identity: %w", err)
+	}
+	createdUID := text(nested(namespaceObject, "metadata", "uid"))
+	if createdUID == "" || text(nested(namespaceObject, "metadata", "name")) != ns ||
+		nested(namespaceObject, "metadata", "labels", "chaos.rhiza.io/run") != qualificationRunID ||
+		nested(namespaceObject, "metadata", "labels", schemaNamespaceCreateTokenLabel) != createMarker {
+		return fmt.Errorf("isolated roundtrip namespace identity is incomplete")
+	}
+	namespaceUID = createdUID
+
+	requestHash := strings.Repeat("a", 64)
+	proofHash := strings.Repeat("b", 64)
+	scopeDigest := strings.Repeat("c", 64)
+	identity := func(nodeID, podUID, runID, walIdentity string) obj {
+		return obj{"sourceClusterID": "schema-roundtrip-source", "nodeID": nodeID, "podName": nodeID + "-pod", "podUID": podUID,
+			"runID": runID, "walIdentity": walIdentity, "assignmentID": strings.Repeat("d", 64)}
+	}
+	terminal := func(version int, requestIdentity obj) obj {
+		ref := obj{"evidenceVersion": version, "request": obj{"operationID": "source-stop-" + text(requestIdentity["runID"]), "requestHash": requestHash, "identity": requestIdentity},
+			"runtimeHash": proofHash, "producerUID": "", "proofName": "terminal-proof", "proofUID": "proof-uid", "proofDigest": proofHash,
+			"runtimeReceiptDigest": proofHash, "mutationReceiptDigest": "", "storageScopeDigest": scopeDigest}
+		if version == 2 {
+			ref["producerUID"], ref["mutationReceiptDigest"] = "producer-uid", proofHash
+		}
+		return ref
+	}
+	v2 := terminal(2, identity("rhiza-voter-0", "voter-pod-uid", "voter-run", "voter-wal"))
+	v3 := terminal(3, identity("rhiza-learner-0", "learner-pod-uid", "learner-run", ""))
+	proof := obj{"operationID": "schema-roundtrip", "sourceClusterID": "schema-roundtrip-source", "bindingUID": "schema-roundtrip-binding",
+		"requestHash": requestHash, "proofID": "schema-roundtrip-proof", "processesTerminated": true, "recreationBlocked": true, "storageQuiesced": true,
+		"independentV2": obj{"version": 2, "requestHash": requestHash, "ledgerHash": proofHash,
+			"storageScope":   obj{"provider": "gcs", "bucket": "roundtrip-bucket", "prefix": "roundtrip-prefix"},
+			"currentPodUIDs": []string{"voter-pod-uid"}, "terminals": []obj{v2, v3}}}
+	resource := obj{"apiVersion": "rhiza.mrchypark.dev/v1alpha1", "kind": "RhizaFence",
+		"metadata": obj{"name": "terminal-schema-roundtrip", "namespace": ns},
+		"spec": obj{"logicalID": "schema-roundtrip", "bindingUID": "schema-roundtrip-binding", "namespace": ns, "statefulSet": "unbound",
+			"statefulSetUID": "unbound-sts", "sourceClusterID": "schema-roundtrip-source", "operationID": "schema-roundtrip", "scope": "Generation", "targets": []obj{}},
+		"status": obj{"proof": proof}}
+	created, err = commandWithInput(ctx, encoded(resource), "kubectl", "--context", kubeContext, "-n", ns, "create", "-f", "-", "-o", "json")
+	if err != nil {
+		return fmt.Errorf("create terminal schema roundtrip fixture: %w", err)
+	}
+	var createdFence obj
+	if err := json.Unmarshal(created, &createdFence); err != nil {
+		return fmt.Errorf("decode terminal schema fixture identity: %w", err)
+	}
+	fenceUID := text(nested(createdFence, "metadata", "uid"))
+	if fenceUID == "" {
+		return fmt.Errorf("terminal schema fixture UID is missing")
+	}
+	if _, err := command(ctx, "kubectl", "--context", kubeContext, "-n", ns, "patch", "rhizafence", "terminal-schema-roundtrip", "--subresource=status", "--type=merge", "-p", string(encoded(obj{"status": obj{"proof": proof}}))); err != nil {
+		return fmt.Errorf("write mixed terminal references through status subresource: %w", err)
+	}
+	readback, err := command(ctx, "kubectl", "--context", kubeContext, "-n", ns, "get", "rhizafence", "terminal-schema-roundtrip", "-o", "json")
+	if err != nil {
+		return fmt.Errorf("read back mixed terminal references: %w", err)
+	}
+	var got obj
+	if err := json.Unmarshal(readback, &got); err != nil {
+		return fmt.Errorf("decode mixed terminal references: %w", err)
+	}
+	if text(nested(got, "metadata", "uid")) != fenceUID || string(encoded(nested(got, "status", "proof"))) != string(encoded(proof)) {
+		return fmt.Errorf("API server pruned or changed terminal identity/reference fields")
+	}
+	mutateReference := func(candidate obj, index int, mutate func(obj)) error {
+		refs, ok := nested(candidate, "independentV2", "terminals").([]any)
+		if !ok || len(refs) <= index {
+			return fmt.Errorf("terminal list is malformed")
+		}
+		ref, ok := refs[index].(map[string]any)
+		if !ok {
+			return fmt.Errorf("terminal reference is malformed")
+		}
+		mutate(ref)
+		return nil
+	}
+	for _, tc := range []struct {
+		name string
+		edit func(obj) error
+	}{
+		{name: "V2 without producer evidence", edit: func(candidate obj) error {
+			return mutateReference(candidate, 0, func(ref obj) { ref["producerUID"], ref["mutationReceiptDigest"] = "", "" })
+		}},
+		{name: "V3 with producer UID", edit: func(candidate obj) error {
+			return mutateReference(candidate, 1, func(ref obj) { ref["producerUID"] = "producer-uid" })
+		}},
+		{name: "V3 with mutation digest", edit: func(candidate obj) error {
+			return mutateReference(candidate, 1, func(ref obj) { ref["mutationReceiptDigest"] = proofHash })
+		}},
+		{name: "unsupported reference version", edit: func(candidate obj) error {
+			return mutateReference(candidate, 1, func(ref obj) { ref["evidenceVersion"] = 4 })
+		}},
+	} {
+		candidate := obj{}
+		if err := json.Unmarshal(encoded(proof), &candidate); err != nil {
+			return fmt.Errorf("copy proof for %s: %w", tc.name, err)
+		}
+		if err := tc.edit(candidate); err != nil {
+			return fmt.Errorf("prepare invalid %s case: %w", tc.name, err)
+		}
+		statusCode, statusBody, err := patchGCSRoundTripFenceStatus(ctx, ns, candidate)
+		if err != nil {
+			return fmt.Errorf("patch %s returned without an API validation response: %w", tc.name, err)
+		}
+		diagnostic, invalid := gcsAPIServerValidationRejection(statusCode, statusBody)
+		if !invalid {
+			return fmt.Errorf("patch %s was not rejected by API validation (HTTP %d): %s", tc.name, statusCode, diagnostic)
+		}
+		readback, err = command(ctx, "kubectl", "--context", kubeContext, "-n", ns, "get", "rhizafence", "terminal-schema-roundtrip", "-o", "json")
+		if err != nil {
+			return fmt.Errorf("read proof after rejecting %s: %w", tc.name, err)
+		}
+		if err := json.Unmarshal(readback, &got); err != nil || text(nested(got, "metadata", "uid")) != fenceUID || string(encoded(nested(got, "status", "proof"))) != string(encoded(proof)) {
+			return fmt.Errorf("rejected %s changed the valid stored proof", tc.name)
+		}
+	}
+	return nil
+}
+
+const (
+	schemaNamespaceCreateTokenLabel = "chaos.rhiza.io/schema-create-token"
+	schemaNamespaceCleanupTimeout   = 30 * time.Second
+)
+
+func cleanupUncertainSchemaNamespaceCreate(
+	ctx context.Context,
+	name, runID, createMarker string,
+	createErr error,
+	readback func(context.Context, string) (obj, error),
+	cleanup func(context.Context, string, string, string) error,
+) error {
+	if createErr == nil {
+		return fmt.Errorf("uncertain namespace cleanup requires the original create error")
+	}
+	createFailure := fmt.Errorf("create isolated CRD roundtrip namespace: %w", createErr)
+	lowerCreateErr := strings.ToLower(createErr.Error())
+	if strings.Contains(lowerCreateErr, "alreadyexists") || strings.Contains(lowerCreateErr, "already exists") {
+		return fmt.Errorf("namespace already existed and was not adopted or deleted: %w", createFailure)
+	}
+	if len(runID) != 8 || name != "rhiza-fence-schema-"+runID || createMarker == "" || readback == nil || cleanup == nil {
+		return errors.Join(createFailure, fmt.Errorf("isolated roundtrip namespace may remain; ownership could not be verified"))
+	}
+	cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), schemaNamespaceCleanupTimeout)
+	defer cancel()
+	current, err := readback(cleanupCtx, name)
+	if err != nil {
+		if strings.Contains(err.Error(), "(NotFound)") {
+			return createFailure
+		}
+		return errors.Join(createFailure, fmt.Errorf("isolated roundtrip namespace may remain; ownership readback failed: %w", err))
+	}
+	uid := text(nested(current, "metadata", "uid"))
+	if text(nested(current, "metadata", "name")) != name ||
+		nested(current, "metadata", "labels", "chaos.rhiza.io/run") != runID ||
+		nested(current, "metadata", "labels", schemaNamespaceCreateTokenLabel) != createMarker || uid == "" {
+		return errors.Join(createFailure, fmt.Errorf("isolated roundtrip namespace may remain; exact name, run ownership, marker, and UID could not be verified"))
+	}
+	if err := cleanup(cleanupCtx, name, runID, uid); err != nil {
+		return errors.Join(createFailure, fmt.Errorf("cleanup isolated roundtrip namespace failed; it may remain: %w", err))
+	}
+	return createFailure
+}
+
+func patchGCSRoundTripFenceStatus(ctx context.Context, namespace string, proof obj) (int, []byte, error) {
+	body, err := json.Marshal(obj{"status": obj{"proof": proof}})
+	if err != nil {
+		return 0, nil, fmt.Errorf("encode roundtrip proof patch: %w", err)
+	}
+	endpoint := "/apis/rhiza.mrchypark.dev/v1alpha1/namespaces/" + url.PathEscape(namespace) + "/rhizafences/terminal-schema-roundtrip/status"
+	return kubernetesAPIRequest(ctx, http.MethodPatch, endpoint, "application/merge-patch+json", body)
+}
+
+func gcsAPIServerValidationRejection(statusCode int, body []byte) (string, bool) {
+	var status struct {
+		Code    int    `json:"code"`
+		Reason  string `json:"reason"`
+		Message string `json:"message"`
+		Details struct {
+			Causes []struct {
+				Reason  string `json:"reason"`
+				Message string `json:"message"`
+				Field   string `json:"field"`
+			} `json:"causes"`
+		} `json:"details"`
+	}
+	if json.Unmarshal(body, &status) != nil {
+		return "API response was not a Kubernetes Status object", false
+	}
+	diagnostic := status.Reason
+	if status.Message != "" {
+		diagnostic += ": " + status.Message
+	}
+	for _, cause := range status.Details.Causes {
+		if cause.Field != "" || cause.Message != "" {
+			diagnostic += fmt.Sprintf("; %s %s: %s", cause.Reason, cause.Field, cause.Message)
+		}
+	}
+	diagnostic = strings.Map(func(r rune) rune {
+		if r < 0x20 || r == 0x7f {
+			return ' '
+		}
+		return r
+	}, diagnostic)
+	if len(diagnostic) > 512 {
+		diagnostic = diagnostic[:512]
+	}
+	return diagnostic, statusCode == http.StatusUnprocessableEntity && status.Code == http.StatusUnprocessableEntity && status.Reason == "Invalid"
 }
 
 func prepareExplicitGCSRecoverySource(ctx context.Context, source gcsRecoverySource, out string, async bool) (gcsRecoverySource, error) {
@@ -551,6 +831,9 @@ func confirmExplicitGCSRecoveryFence(ctx context.Context, source gcsRecoverySour
 	if err != nil {
 		return err
 	}
+	if err := verifyGCSGenerationProofAgainstCanonicalRoot(ctx, item, source); err != nil {
+		return fmt.Errorf("explicit recovery proof differs from canonical generation authority: %w", err)
+	}
 	request, proof, err := verifyIndependentGenerationProof(item, source.ClusterID, source.StatefulSetUID, source.BindingUID, source.Targets, source.Bucket, source.Prefix, source.Namespace, source.StatefulSet, source.LogicalID)
 	if err != nil || !sameFenceRequest(request, pending.Request) || proof.OperationID != pending.Request.OperationID {
 		return fmt.Errorf("explicit recovery proof is not the exact captured generation fence")
@@ -880,7 +1163,7 @@ func waitForGCSFenceProof(ctx context.Context, source gcsRecoverySource, pending
 		if nested(item, "status", "proof") == nil {
 			return false, nil
 		}
-		_, _, err = verifyIndependentGenerationProof(item, source.ClusterID, source.StatefulSetUID, source.BindingUID, source.Targets, source.Bucket, source.Prefix, source.Namespace, source.StatefulSet, source.LogicalID)
+		err = verifyGCSGenerationProofAgainstCanonicalRoot(ctx, item, source)
 		return err == nil, err
 	})
 }
@@ -1143,9 +1426,21 @@ func gcsFaultSourceMatches(fault *gcsChaosFault, expected []gcsControlPodIdentit
 	return true
 }
 
-func gcsControlPodSnapshotMatches(expected gcsControlPodIdentity, currentName, currentUID, currentOwnerUID, currentParentOwnerUID string) bool {
+func gcsControlPodSnapshotMatches(expected gcsControlPodIdentity, currentName, currentUID, currentOwnerName, currentOwnerUID, currentParentOwnerUID string) bool {
 	return expected.Name == currentName && expected.UID != "" && expected.UID == currentUID && expected.OwnerUID != "" &&
-		expected.OwnerUID == currentOwnerUID && expected.ParentOwnerUID == currentParentOwnerUID
+		(expected.OwnerName == "" || expected.OwnerName == currentOwnerName) && expected.OwnerUID == currentOwnerUID &&
+		expected.ParentOwnerUID == currentParentOwnerUID
+}
+
+func validateGCSOperatorRestartIdentity(previous, current gcsControlPodIdentity) error {
+	if previous.Name == "" || previous.UID == "" || previous.OwnerName == "" || previous.OwnerUID == "" || previous.ParentOwnerUID == "" ||
+		current.Name == "" || current.UID == "" || current.OwnerName == "" || current.OwnerUID == "" || current.ParentOwnerUID == "" {
+		return fmt.Errorf("operator restart identity is incomplete")
+	}
+	if current.UID == previous.UID || current.ParentOwnerUID != previous.ParentOwnerUID {
+		return fmt.Errorf("operator restart did not produce a new Pod under the captured Deployment")
+	}
+	return nil
 }
 
 func verifyGCSControlPodSnapshots(ctx context.Context, expected []gcsControlPodIdentity) error {
@@ -1160,32 +1455,48 @@ func verifyGCSControlPodSnapshots(ctx context.Context, expected []gcsControlPodI
 		if text(nested(pod, "metadata", "uid")) != identity.UID || nested(pod, "metadata", "deletionTimestamp") != nil {
 			return fmt.Errorf("control Pod %s incarnation changed", identity.Name)
 		}
-		ownerUID, ownerKind := "", ""
+		ownerName, ownerUID, ownerKind := "", "", ""
 		for _, owner := range ownerRefs(pod) {
 			if nested(owner, "controller") == true {
-				ownerUID, ownerKind = text(nested(owner, "uid")), text(nested(owner, "kind"))
-				break
+				if ownerKind != "" {
+					return fmt.Errorf("control Pod %s has multiple controller owners", identity.Name)
+				}
+				ownerName, ownerUID, ownerKind = text(nested(owner, "name")), text(nested(owner, "uid")), text(nested(owner, "kind"))
 			}
 		}
 		parentUID := ""
 		if identity.ParentOwnerUID != "" {
-			if ownerKind != "ReplicaSet" {
+			if ownerKind != "ReplicaSet" || identity.OwnerName == "" || ownerName != identity.OwnerName {
 				return fmt.Errorf("operator Pod %s no longer has its captured ReplicaSet owner", identity.Name)
 			}
-			rs, err := get(ctx, "replicaset", identity.OwnerUID)
+			rs, err := get(ctx, "replicaset", identity.OwnerName)
 			if err != nil {
 				return err
 			}
-			if text(nested(rs, "metadata", "uid")) != identity.OwnerUID {
+			if text(nested(rs, "metadata", "name")) != identity.OwnerName || text(nested(rs, "metadata", "uid")) != identity.OwnerUID {
 				return fmt.Errorf("operator Pod %s ReplicaSet owner changed", identity.Name)
 			}
+			deploymentOwners := 0
 			for _, owner := range ownerRefs(rs) {
-				if nested(owner, "controller") == true && nested(owner, "kind") == "Deployment" {
-					parentUID = text(nested(owner, "uid"))
+				if nested(owner, "controller") == true {
+					deploymentOwners++
+					if nested(owner, "kind") == "Deployment" && nested(owner, "name") == "rhiza-operator" {
+						parentUID = text(nested(owner, "uid"))
+					}
 				}
 			}
+			if deploymentOwners != 1 || parentUID != identity.ParentOwnerUID {
+				return fmt.Errorf("operator ReplicaSet Deployment owner changed")
+			}
+			deployment, err := get(ctx, "deployment", "rhiza-operator")
+			if err != nil {
+				return err
+			}
+			if text(nested(deployment, "metadata", "name")) != "rhiza-operator" || text(nested(deployment, "metadata", "uid")) != identity.ParentOwnerUID {
+				return fmt.Errorf("operator Deployment owner changed")
+			}
 		}
-		if !gcsControlPodSnapshotMatches(identity, identity.Name, text(nested(pod, "metadata", "uid")), ownerUID, parentUID) {
+		if !gcsControlPodSnapshotMatches(identity, identity.Name, text(nested(pod, "metadata", "uid")), ownerName, ownerUID, parentUID) {
 			return fmt.Errorf("control Pod %s owner identity changed", identity.Name)
 		}
 	}
@@ -1208,11 +1519,15 @@ func captureGCSOperatorPodIdentity(ctx context.Context) (gcsControlPodIdentity, 
 		return result, err
 	}
 	items, _ := sets["items"].([]any)
-	ownedRS := map[string]bool{}
+	ownedRS := map[string]string{}
 	for _, rs := range items {
 		for _, owner := range ownerRefs(rs) {
-			if nested(owner, "kind") == "Deployment" && nested(owner, "uid") == deploymentUID && nested(owner, "controller") == true {
-				ownedRS[text(nested(rs, "metadata", "uid"))] = true
+			if nested(owner, "kind") == "Deployment" && nested(owner, "name") == "rhiza-operator" && nested(owner, "uid") == deploymentUID && nested(owner, "controller") == true {
+				rsName, rsUID := text(nested(rs, "metadata", "name")), text(nested(rs, "metadata", "uid"))
+				if rsName == "" || rsUID == "" || ownedRS[rsUID] != "" {
+					return result, fmt.Errorf("operator ReplicaSet identity is missing or ambiguous")
+				}
+				ownedRS[rsUID] = rsName
 			}
 		}
 	}
@@ -1227,8 +1542,9 @@ func captureGCSOperatorPodIdentity(ctx context.Context) (gcsControlPodIdentity, 
 			continue
 		}
 		for _, owner := range ownerRefs(pod) {
-			if nested(owner, "kind") == "ReplicaSet" && ownedRS[text(nested(owner, "uid"))] && nested(owner, "controller") == true {
-				found = append(found, gcsControlPodIdentity{Name: text(nested(pod, "metadata", "name")), UID: text(nested(pod, "metadata", "uid")), OwnerUID: text(nested(owner, "uid")), ParentOwnerUID: deploymentUID})
+			ownerUID, ownerName := text(nested(owner, "uid")), text(nested(owner, "name"))
+			if nested(owner, "kind") == "ReplicaSet" && ownedRS[ownerUID] != "" && ownedRS[ownerUID] == ownerName && nested(owner, "controller") == true {
+				found = append(found, gcsControlPodIdentity{Name: text(nested(pod, "metadata", "name")), UID: text(nested(pod, "metadata", "uid")), OwnerName: ownerName, OwnerUID: ownerUID, ParentOwnerUID: deploymentUID})
 			}
 		}
 	}
@@ -1236,6 +1552,33 @@ func captureGCSOperatorPodIdentity(ctx context.Context) (gcsControlPodIdentity, 
 		return result, fmt.Errorf("operator Pod is not uniquely bound to the run-owned Deployment")
 	}
 	return found[0], nil
+}
+
+func restartGCSOperatorAtRemoveCheckpointAndCapture(ctx context.Context, source gcsRecoverySource) (gcsControlPodIdentity, error) {
+	if err := restartGCSOperatorAtRemoveCheckpoint(ctx, source); err != nil {
+		return gcsControlPodIdentity{}, err
+	}
+	current, err := captureGCSOperatorPodIdentity(ctx)
+	if err != nil {
+		return gcsControlPodIdentity{}, fmt.Errorf("capture replacement operator Pod identity: %w", err)
+	}
+	if err := validateGCSOperatorRestartIdentity(source.OperatorIdentity, current); err != nil {
+		return gcsControlPodIdentity{}, err
+	}
+	if err := verifyGCSControlPodSnapshots(ctx, []gcsControlPodIdentity{current}); err != nil {
+		return gcsControlPodIdentity{}, fmt.Errorf("replacement operator Pod identity changed after restart: %w", err)
+	}
+	pod, err := get(ctx, "pod", current.Name)
+	if err != nil {
+		return gcsControlPodIdentity{}, err
+	}
+	if !podReady(pod) {
+		return gcsControlPodIdentity{}, fmt.Errorf("replacement operator Pod is not Ready")
+	}
+	if err := verifyGCSOperatorHTTPFencer(ctx, current.Name); err != nil {
+		return gcsControlPodIdentity{}, err
+	}
+	return current, nil
 }
 
 func verifyGCSOperatorHTTPFencer(ctx context.Context, podName string) error {
@@ -1852,6 +2195,16 @@ func waitForGCSRecovery(ctx context.Context, source gcsRecoverySource, pending p
 			if err != nil {
 				return false, err
 			}
+			readback, err := get(ctx, "rhizafence", pending.Name)
+			if err != nil {
+				return false, fmt.Errorf("read back authority generation proof through Kubernetes API: %w", err)
+			}
+			if err := verifyGCSFenceProofReadback(item, readback, pending, source); err != nil {
+				return false, err
+			}
+			if err := verifyGCSGenerationProofAgainstCanonicalRoot(ctx, readback, source); err != nil {
+				return false, err
+			}
 			outcome.Fence, outcome.Proof = request, proof
 			return true, nil
 		}
@@ -1859,6 +2212,19 @@ func waitForGCSRecovery(ctx context.Context, source gcsRecoverySource, pending p
 	}); err != nil {
 		return nil, err
 	}
+	return waitForGCSRecoveryAfterProof(ctx, source, pending, outcome.Fence, outcome.Proof, expectedBase, expectedRows, out, explicitRecovery)
+}
+
+// waitForGCSRecoveryAfterProof is the common completion/readback tail shared by
+// ordinary and mixed generation recovery. Callers must verify the generation
+// proof with their own exact target/terminal contract before entering here.
+func waitForGCSRecoveryAfterProof(ctx context.Context, source gcsRecoverySource, pending pendingGCSFence,
+	request operator.FenceRequest, proof operator.FenceProof, expectedBase, expectedRows, out string,
+	explicitRecovery *explicitGCSRecoveryRef) (*gcsRecoveryOutcome, error) {
+	if err := validateGCSRecoveryAfterProofInputs(source, pending, request, proof, expectedBase, expectedRows); err != nil {
+		return nil, err
+	}
+	outcome := &gcsRecoveryOutcome{Source: source, Fence: request, Proof: proof}
 	if err := wait(ctx, "committed recovered generation", func() (bool, error) {
 		list, err := get(ctx, "rhizarecoveries", "")
 		if err != nil {
@@ -1892,24 +2258,22 @@ func waitForGCSRecovery(ctx context.Context, source gcsRecoverySource, pending p
 			outcome.Recovery.Metadata["namespace"] != explicitRecovery.Namespace) {
 			return false, fmt.Errorf("completed recovery does not match the captured resource identity")
 		}
-		if outcome.Recovery.Spec.SourceClusterID != source.ClusterID || outcome.Recovery.Spec.RecoveryID != pending.Request.OperationID ||
+		if outcome.Recovery.Spec.SourceClusterID != source.ClusterID || outcome.Recovery.Spec.RecoveryID != request.OperationID ||
 			outcome.Recovery.Status.Source != source.ClusterID || outcome.Recovery.Status.StatefulSetUID != source.StatefulSetUID ||
-			outcome.Recovery.Status.TargetBaseKind != expectedBase || (expectedBase == "empty" && (outcome.Recovery.Status.RecoveredTip != 0 || outcome.Recovery.Status.ManifestHash != "")) {
+			outcome.Recovery.Status.TargetBaseKind != expectedBase ||
+			(expectedBase == "fork" && (outcome.Recovery.Spec.Durability != "before-ack" || outcome.Recovery.Status.SourceDurability != "before-ack")) ||
+			(expectedBase == "empty" && (outcome.Recovery.Status.RecoveredTip != 0 || outcome.Recovery.Status.ManifestHash != "")) {
 			return false, fmt.Errorf("completed recovery differs from the captured source or expected archive base")
 		}
-		if err := recoveryFenceMatchesProof(outcome.Recovery, outcome.Fence, outcome.Proof); err != nil {
+		if err := recoveryFenceMatchesProof(outcome.Recovery, request, proof); err != nil {
 			return false, err
 		}
 		return true, nil
 	}); err != nil {
 		return nil, err
 	}
-	root, err := get(ctx, "rhizacluster", source.BindingName)
-	if err != nil {
-		return nil, err
-	}
-	if nested(root, "status", "phase") != "Healthy" || nested(root, "status", "activeClusterID") != outcome.Recovery.Status.Target {
-		return nil, fmt.Errorf("controller root has not adopted the completed recovered target")
+	if err := waitForGCSRecoveryTargetAdoption(ctx, source, outcome.Recovery); err != nil {
+		return nil, fmt.Errorf("controller root did not adopt the completed recovered target: %w", err)
 	}
 	secretName := outcome.Recovery.Status.SecretName
 	if secretName == "" {
@@ -1927,21 +2291,174 @@ func waitForGCSRecovery(ctx context.Context, source gcsRecoverySource, pending p
 	if len(outcome.Recovery.Status.TargetIdentities) == 0 || outcome.Recovery.Status.TargetIdentities[0].Pod == "" {
 		return nil, fmt.Errorf("completed recovery has no concrete target voter identity")
 	}
-	outcome.Forward, err = startForward(ctx, outcome.Recovery.Status.TargetIdentities[0].Pod, out)
+	target := outcome.Recovery.Status.TargetIdentities[0]
+	if target.NodeID == "" || target.PodUID == "" || target.WALIdentity == "" {
+		return nil, fmt.Errorf("completed recovery target voter identity is incomplete")
+	}
+	targetPod, err := get(ctx, "pod", target.Pod)
+	if err != nil || text(nested(targetPod, "metadata", "uid")) != target.PodUID || !podReady(targetPod) {
+		return nil, fmt.Errorf("recovered target voter Pod is not the exact Ready incarnation: %v", err)
+	}
+	outcome.Forward, err = startForward(ctx, target.Pod, out)
 	if err != nil {
 		return nil, err
 	}
 	status, err := readMembershipWithToken(ctx, outcome.Forward, outcome.Admin)
-	if err != nil || status.ClusterID != outcome.Recovery.Status.Target || status.Pending || !status.Voting {
-		outcome.Forward.close()
-		return nil, fmt.Errorf("recovered voter did not pass authenticated membership and quorum read: %v", err)
+	if err != nil || !gcsRecoveryMembershipMatchesTargetIdentities(status, outcome.Recovery) {
+		return nil, joinForwardCloseError(outcome.Forward,
+			fmt.Errorf("recovered voter did not pass exact authenticated membership and quorum read: %v", err))
 	}
 	rows, err := call(ctx, outcome.Forward, "/sql/query", obj{"sql": "SELECT id,value FROM fencing_items ORDER BY id", "consistency": "linearizable"}, outcome.Admin)
-	if err != nil || string(encoded(rows["rows"])) != expectedRows {
-		outcome.Forward.close()
-		return nil, fmt.Errorf("recovered linearizable SQL readback differs: %v", err)
+	if err != nil || !gcsRecoveryRowsMatch(rows["rows"], expectedRows) {
+		return nil, joinForwardCloseError(outcome.Forward,
+			fmt.Errorf("recovered linearizable SQL readback differs: %v", err))
 	}
 	return outcome, nil
+}
+
+func validateGCSRecoveryAfterProofInputs(source gcsRecoverySource, pending pendingGCSFence, request operator.FenceRequest,
+	proof operator.FenceProof, expectedBase, expectedRows string) error {
+	if source.ClusterID == "" || source.StatefulSetUID == "" || source.BindingUID == "" || source.BindingName == "" ||
+		source.Bucket == "" || source.Prefix == "" || expectedBase != "fork" && expectedBase != "empty" || expectedRows == "" {
+		return fmt.Errorf("GCS recovery completion contract is incomplete")
+	}
+	if expectedBase == "fork" && source.Durability != "before-ack" {
+		return fmt.Errorf("fork recovery requires before-ACK source durability")
+	}
+	if pending.Name == "" || pending.UID == "" ||
+		pending.Request.OperationID == "" || !sameFenceRequest(pending.Request, request) ||
+		request.Scope != operator.ScopeGeneration || request.LogicalID != source.LogicalID || request.Namespace != source.Namespace ||
+		request.StatefulSet != source.StatefulSet || request.SourceClusterID != source.ClusterID ||
+		request.StatefulSetUID != source.StatefulSetUID || request.BindingUID != source.BindingUID ||
+		proof.OperationID != request.OperationID || proof.SourceClusterID != request.SourceClusterID ||
+		proof.BindingUID != request.BindingUID || proof.RequestHash != digestJSON(request) || proof.ProofID == "" ||
+		proof.IndependentV2 == nil || proof.IndependentV2.RequestHash != digestJSON(request) {
+		return fmt.Errorf("recovery completion inputs are not bound to the validated generation proof")
+	}
+	return nil
+}
+
+func gcsRecoveryRowsMatch(actual any, expected string) bool {
+	return expected != "" && string(encoded(actual)) == expected
+}
+
+func validateGCSRecoveryTargetAdoption(root any, recovery operator.Resource) error {
+	target := recovery.Status.Target
+	if target == "" || nested(root, "status", "phase") != "Healthy" || nested(root, "status", "activeClusterID") != target {
+		return fmt.Errorf("controller root has not adopted the completed recovered target")
+	}
+	return nil
+}
+
+func waitForGCSRecoveryTargetAdoption(ctx context.Context, source gcsRecoverySource, recovery operator.Resource) error {
+	if source.BindingName == "" || source.BindingUID == "" || source.Namespace == "" || source.ClusterID == "" || source.StatefulSet == "" || source.StatefulSetUID == "" ||
+		text(recovery.Metadata["name"]) == "" || text(recovery.Metadata["namespace"]) != source.Namespace || text(recovery.Metadata["uid"]) == "" || recovery.Spec.RecoveryID == "" ||
+		recovery.Spec.StatefulSet != source.StatefulSet || recovery.Spec.SourceClusterID != source.ClusterID || recovery.Status.Source != source.ClusterID ||
+		recovery.Status.StatefulSetUID != source.StatefulSetUID || recovery.Status.Target == "" || recovery.Status.Target == source.ClusterID {
+		return fmt.Errorf("completed recovery lineage is incomplete for root adoption")
+	}
+	targetObserved := false
+	return wait(ctx, "captured RhizaCluster adoption of completed recovery", func() (bool, error) {
+		root, err := get(ctx, "rhizacluster", source.BindingName)
+		if err != nil {
+			return false, err
+		}
+		var done bool
+		targetObserved, done, err = observeGCSRecoveryRoot(source, recovery, targetObserved, root)
+		if err != nil || !done {
+			return done, err
+		}
+		if err := validateGCSRecoveryTargetAdoption(root, recovery); err != nil {
+			return false, err
+		}
+		return true, nil
+	})
+}
+
+func observeGCSRecoveryRoot(source gcsRecoverySource, recovery operator.Resource, targetObserved bool, root any) (bool, bool, error) {
+	if text(nested(root, "metadata", "name")) != source.BindingName ||
+		text(nested(root, "metadata", "namespace")) != source.Namespace ||
+		text(nested(root, "metadata", "uid")) != source.BindingUID {
+		return targetObserved, false, fmt.Errorf("captured RhizaCluster name, namespace, or UID changed during recovery adoption")
+	}
+	phaseName := text(nested(root, "status", "phase"))
+	activeCluster := text(nested(root, "status", "activeClusterID"))
+	activeRecovery := text(nested(root, "status", "activeRecovery"))
+	operationID := recovery.Spec.RecoveryID
+	if phaseName == "Recovering" && activeCluster == source.ClusterID && activeRecovery == operationID {
+		if targetObserved {
+			return targetObserved, false, fmt.Errorf("controller root regressed to the source after observing the recovery target")
+		}
+		return false, false, nil
+	}
+	if activeCluster == recovery.Status.Target && activeRecovery == "" {
+		switch phaseName {
+		case "Stabilizing":
+			return true, false, nil
+		case "Healthy":
+			return true, true, nil
+		}
+	}
+	return targetObserved, false, fmt.Errorf("controller root changed to an unexpected recovery target, phase, or operation")
+}
+
+func gcsRecoveryMembershipMatchesTargetIdentities(status network.MembershipStatus, recovery operator.Resource) bool {
+	identities := recovery.Status.TargetIdentities
+	if status.ClusterID != recovery.Status.Target || status.Pending || !status.Voting || len(identities) == 0 || len(status.Voters) != len(identities) {
+		return false
+	}
+	want := make(map[string]bool, len(identities))
+	seenPods := make(map[string]bool, len(identities))
+	seenUIDs := make(map[string]bool, len(identities))
+	var first operator.FenceTarget
+	for i, identity := range identities {
+		if identity.NodeID == "" || identity.Pod == "" || identity.PodUID == "" || identity.WALIdentity == "" ||
+			want[identity.NodeID] || seenPods[identity.Pod] || seenUIDs[identity.PodUID] {
+			return false
+		}
+		want[identity.NodeID] = true
+		seenPods[identity.Pod], seenUIDs[identity.PodUID] = true, true
+		if i == 0 {
+			first = identity
+		}
+	}
+	if string(status.NodeID) != first.NodeID || status.WALIdentity != first.WALIdentity {
+		return false
+	}
+	for _, voter := range status.Voters {
+		id := string(voter)
+		if !want[id] {
+			return false
+		}
+		delete(want, id)
+	}
+	return len(want) == 0
+}
+
+// verifyGCSFenceProofReadback binds the API list result to a second, exact-name
+// API read. Comparing the complete stored proof preserves immutable terminal
+// identities, references, and hashes; the existing client verifier validates
+// the proof returned by that read rather than a synthetic fixture.
+func verifyGCSFenceProofReadback(observed, readback any, pending pendingGCSFence, source gcsRecoverySource) error {
+	if !pendingFenceIdentityMatches(observed, pending) || !pendingFenceIdentityMatches(readback, pending) {
+		return fmt.Errorf("generation proof API readback changed the pending fence resource identity")
+	}
+	if _, err := exactPendingGCSFenceRequest(observed, pending); err != nil {
+		return fmt.Errorf("generation proof list result changed the pending fence request: %w", err)
+	}
+	if _, err := exactPendingGCSFenceRequest(readback, pending); err != nil {
+		return fmt.Errorf("generation proof API readback changed the pending fence request: %w", err)
+	}
+	if string(encoded(nested(observed, "spec"))) != string(encoded(nested(readback, "spec"))) ||
+		string(encoded(nested(observed, "status", "proof"))) != string(encoded(nested(readback, "status", "proof"))) {
+		return fmt.Errorf("generation proof API readback changed immutable request or proof fields")
+	}
+	_, _, err := verifyIndependentGenerationProof(readback, source.ClusterID, source.StatefulSetUID, source.BindingUID,
+		source.Targets, source.Bucket, source.Prefix, source.Namespace, source.StatefulSet, source.LogicalID)
+	if err != nil {
+		return fmt.Errorf("generation proof API readback failed the existing client verifier: %w", err)
+	}
+	return nil
 }
 
 // recoveryFenceMatchesProof ties the persisted recovery fence to the exact
@@ -2006,6 +2523,12 @@ func verifyAsyncEmptyRecovery(resource operator.Resource, request operator.Fence
 // verifyIndependentGenerationProof validates the issuer-published V2 metadata
 // and its captured scope/target references; it does not fetch remote payloads.
 func verifyIndependentGenerationProof(item any, sourceID, stsUID, bindingUID string, targets []operator.FenceTarget, bucket, prefix string, requestScope ...string) (operator.FenceRequest, operator.FenceProof, error) {
+	return verifyIndependentGenerationProofWithV2Targets(item, sourceID, stsUID, bindingUID, targets, targets, bucket, prefix, requestScope...)
+}
+
+// verifyIndependentGenerationProofWithV2Targets keeps the complete generation
+// request separate from the active-voter set that must carry V2 terminals.
+func verifyIndependentGenerationProofWithV2Targets(item any, sourceID, stsUID, bindingUID string, requestTargets, v2Targets []operator.FenceTarget, bucket, prefix string, requestScope ...string) (operator.FenceRequest, operator.FenceProof, error) {
 	var request operator.FenceRequest
 	var proof operator.FenceProof
 	if err := json.Unmarshal(encoded(nested(item, "spec")), &request); err != nil {
@@ -2018,7 +2541,7 @@ func verifyIndependentGenerationProof(item any, sourceID, stsUID, bindingUID str
 	if len(requestScope) == 3 {
 		requestNamespace, statefulSet, logicalID = requestScope[0], requestScope[1], requestScope[2]
 	}
-	if request.SourceClusterID != sourceID || request.StatefulSet != statefulSet || request.StatefulSetUID != stsUID || request.BindingUID != bindingUID || request.Namespace != requestNamespace || request.LogicalID != logicalID || request.Scope != operator.ScopeGeneration || request.OperationID == "" || !sameTargets(request.Targets, targets) {
+	if request.SourceClusterID != sourceID || request.StatefulSet != statefulSet || request.StatefulSetUID != stsUID || request.BindingUID != bindingUID || request.Namespace != requestNamespace || request.LogicalID != logicalID || request.Scope != operator.ScopeGeneration || request.OperationID == "" || !sameTargets(request.Targets, requestTargets) {
 		return request, proof, fmt.Errorf("independent generation fence request differs from captured source cohort")
 	}
 	hash := fmt.Sprintf("%x", sha256.Sum256(encoded(request)))
@@ -2039,20 +2562,15 @@ func verifyIndependentGenerationProof(item any, sourceID, stsUID, bindingUID str
 		currentUIDs[uid] = true
 	}
 	for _, ref := range evidence.Terminals {
-		if ref.EvidenceVersion != 2 || ref.Request.OperationID == "" || ref.Request.Identity.SourceClusterID != sourceID || ref.Request.Identity.NodeID == "" || ref.Request.Identity.PodUID == "" || ref.Request.Identity.RunID == "" || ref.Request.Identity.WALIdentity == "" || ref.ProducerUID == "" || ref.ProofName == "" || ref.ProofUID == "" || ref.StorageScopeDigest != scopeDigest {
+		if err := validateGCSGenerationTerminalReference(ref, sourceID, scopeDigest); err != nil {
 			return request, proof, fmt.Errorf("IndependentV2 terminal reference is incomplete")
 		}
-		for _, digest := range []string{ref.Request.RequestHash, ref.RuntimeHash, ref.ProofDigest, ref.RuntimeReceiptDigest, ref.MutationReceiptDigest} {
-			if _, err := immutableDigest("sha256:" + digest); err != nil {
-				return request, proof, fmt.Errorf("IndependentV2 terminal digest is invalid")
-			}
-		}
 	}
-	for _, target := range targets {
+	for _, target := range v2Targets {
 		covered := false
 		for _, ref := range evidence.Terminals {
 			id := ref.Request.Identity
-			if ref.Request.OperationID != "" && id.SourceClusterID == sourceID && id.NodeID == target.NodeID && id.PodUID == target.PodUID && id.WALIdentity == target.WALIdentity && ref.EvidenceVersion == 2 && ref.StorageScopeDigest == scopeDigest {
+			if id.SourceClusterID == sourceID && id.NodeID == target.NodeID && id.PodUID == target.PodUID && id.WALIdentity == target.WALIdentity && ref.EvidenceVersion == 2 && ref.StorageScopeDigest == scopeDigest {
 				covered = true
 				break
 			}
@@ -2062,4 +2580,135 @@ func verifyIndependentGenerationProof(item any, sourceID, stsUID, bindingUID str
 		}
 	}
 	return request, proof, nil
+}
+
+// verifyIndependentGenerationProofAgainstRoot is the canonical-root-backed
+// verifier used by the live GCS qualification. The root is read-only evidence;
+// it is never repaired or mutated by the qualification.
+func verifyIndependentGenerationProofAgainstRoot(item any, sourceID, stsUID, bindingUID string, targets []operator.FenceTarget, bucket, prefix string, root fenceLedgerState, requestScope ...string) (operator.FenceRequest, operator.FenceProof, error) {
+	return verifyIndependentGenerationProofAgainstRootWithV2Targets(item, sourceID, stsUID, bindingUID, targets, targets, bucket, prefix, root, requestScope...)
+}
+
+func verifyIndependentGenerationProofAgainstRootWithV2Targets(item any, sourceID, stsUID, bindingUID string, requestTargets, v2Targets []operator.FenceTarget, bucket, prefix string, root fenceLedgerState, requestScope ...string) (operator.FenceRequest, operator.FenceProof, error) {
+	request, proof, err := verifyIndependentGenerationProofWithV2Targets(item, sourceID, stsUID, bindingUID, requestTargets, v2Targets, bucket, prefix, requestScope...)
+	if err != nil {
+		return request, proof, err
+	}
+	evidence := proof.IndependentV2
+	requestHash := fmt.Sprintf("%x", sha256.Sum256(encoded(request)))
+	if root.StatefulSetUID != request.StatefulSetUID || root.Ledger.SourceClusterID != request.SourceClusterID ||
+		root.Ledger.ClosedBy != request.OperationID || root.Ledger.ClosedHash != requestHash ||
+		!root.Ledger.RequireRuntimeBinding || !root.Ledger.RequireMutationJournal {
+		return request, proof, fmt.Errorf("canonical authority root does not identify the closed generation fence")
+	}
+	scopeDigest := fmt.Sprintf("%x", sha256.Sum256(encoded(evidence.StorageScope)))
+	if len(root.Ledger.Runs) == 0 || len(root.Ledger.Runs) > 64 {
+		return request, proof, fmt.Errorf("canonical authority root has an unsupported terminal run history")
+	}
+	canonical := make(map[string]fencing.TerminalReference, len(root.Ledger.Runs))
+	for runID, run := range root.Ledger.Runs {
+		ref := run.IndependentTerminal
+		if ref == nil || run.Runtime == nil || run.Runtime.Validate(run.Identity) != nil ||
+			run.Runtime.StatefulSetUID != request.StatefulSetUID || run.Runtime.BindingUID != request.BindingUID ||
+			run.Runtime.SourceClusterID != request.SourceClusterID {
+			return request, proof, fmt.Errorf("canonical authority root has a run without complete terminal enrollment")
+		}
+		id := ref.Request.Identity
+		role := fencing.RunRole(run)
+		_, duplicate := canonical[runID]
+		if runID == "" || id.RunID != runID || run.Identity != id || run.Stop == nil || *run.Stop != ref.Request ||
+			id.SourceClusterID != request.SourceClusterID || duplicate {
+			return request, proof, fmt.Errorf("canonical authority root has an inconsistent terminal reference")
+		}
+		validatedRef, err := root.Ledger.IndependentTerminal(runID, scopeDigest)
+		if err != nil || validatedRef != *ref {
+			return request, proof, fmt.Errorf("canonical authority root has an invalid independent terminal reference")
+		}
+		if ref.EvidenceVersion == 2 && role != fencing.StartupRoleVoterActive {
+			return request, proof, fmt.Errorf("canonical V2 terminal is not an active voter")
+		}
+		if ref.EvidenceVersion == 3 && (role != fencing.StartupRoleLearnerPendingRemove || run.Promotion != nil) {
+			return request, proof, fmt.Errorf("canonical V3 terminal is not a closed pending learner")
+		}
+		canonical[runID] = *ref
+	}
+	if len(canonical) != len(evidence.Terminals) {
+		return request, proof, fmt.Errorf("IndependentV2 terminal set differs from canonical run history")
+	}
+	seen := make(map[string]bool, len(evidence.Terminals))
+	for _, ref := range evidence.Terminals {
+		runID := ref.Request.Identity.RunID
+		canonicalRef, exists := canonical[runID]
+		if runID == "" || seen[runID] || !exists || canonicalRef != ref {
+			return request, proof, fmt.Errorf("IndependentV2 terminal reference differs from canonical run history")
+		}
+		seen[runID] = true
+	}
+	return request, proof, nil
+}
+
+func verifyGCSGenerationProofAgainstCanonicalRoot(ctx context.Context, item any, source gcsRecoverySource) error {
+	deployment, err := get(ctx, "deployment", "rhiza-fencer")
+	if err != nil {
+		return fmt.Errorf("read fencer configuration for canonical authority observer: %w", err)
+	}
+	readScope, err := newGCSAckLossReadScope(ctx, source, deployment)
+	if err != nil {
+		return fmt.Errorf("configure read-only canonical authority observer: %w", err)
+	}
+	stateStore, _, client, _, closeStores, err := openGCSAckLossAuthorityStores(ctx, source, readScope)
+	if err != nil {
+		return fmt.Errorf("open read-only canonical authority observer: %w", err)
+	}
+	if client != nil {
+		defer client.Close()
+	}
+	if closeStores != nil {
+		defer closeStores()
+	}
+	root, _, err := stateStore.ReadRoot(ctx, source.StatefulSetUID, source.ClusterID)
+	if err != nil {
+		return fmt.Errorf("read canonical authority root for generation proof: %w", err)
+	}
+	_, _, err = verifyIndependentGenerationProofAgainstRoot(item, source.ClusterID, source.StatefulSetUID, source.BindingUID,
+		source.Targets, source.Bucket, source.Prefix,
+		fenceLedgerState{StatefulSetUID: root.StatefulSetUID, Ledger: root.Ledger}, source.Namespace, source.StatefulSet, source.LogicalID)
+	return err
+}
+
+// validateGCSGenerationTerminalReference accepts only the two supported
+// per-run reference contracts. V2 remains producer-backed; V3 is the
+// closed-pending learner shape and must not claim producer mutation evidence.
+func validateGCSGenerationTerminalReference(ref fencing.TerminalReference, sourceID, scopeDigest string) error {
+	id := ref.Request.Identity
+	if (ref.EvidenceVersion != 2 && ref.EvidenceVersion != 3) || ref.Request.OperationID == "" || len(ref.Request.OperationID) > 256 ||
+		id.SourceClusterID != sourceID || len(id.SourceClusterID) > 256 || id.NodeID == "" || len(id.NodeID) > 256 || id.PodUID == "" || len(id.PodUID) > 256 ||
+		id.RunID == "" || len(id.RunID) > 128 || len(id.PodName) > 256 ||
+		id.AssignmentID != "" && len(id.AssignmentID) != 64 ||
+		ref.ProofName == "" || len(ref.ProofName) > 63 || ref.ProofUID == "" || len(ref.ProofUID) > 128 || ref.StorageScopeDigest != scopeDigest {
+		return fmt.Errorf("reference identity or storage scope is incomplete")
+	}
+	if id.AssignmentID != "" {
+		if _, err := immutableDigest("sha256:" + id.AssignmentID); err != nil {
+			return fmt.Errorf("assignment identity digest is invalid")
+		}
+	}
+	if ref.EvidenceVersion == 2 {
+		if id.WALIdentity == "" || len(id.WALIdentity) > 128 || ref.ProducerUID == "" || len(ref.ProducerUID) > 128 || len(ref.MutationReceiptDigest) != 64 {
+			return fmt.Errorf("V2 producer mutation evidence is incomplete")
+		}
+	} else if ref.ProducerUID != "" || ref.MutationReceiptDigest != "" || len(id.WALIdentity) > 128 {
+		return fmt.Errorf("V3 closed-pending reference claims producer evidence")
+	}
+	for _, digest := range []string{ref.Request.RequestHash, ref.RuntimeHash, ref.ProofDigest, ref.RuntimeReceiptDigest, ref.StorageScopeDigest} {
+		if _, err := immutableDigest("sha256:" + digest); err != nil {
+			return fmt.Errorf("reference digest is invalid")
+		}
+	}
+	if ref.EvidenceVersion == 2 {
+		if _, err := immutableDigest("sha256:" + ref.MutationReceiptDigest); err != nil {
+			return fmt.Errorf("V2 mutation digest is invalid")
+		}
+	}
+	return nil
 }

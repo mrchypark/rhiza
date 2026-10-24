@@ -218,6 +218,18 @@ func (e *FencingExecutor) closeMutationProducers(ctx context.Context, state fenc
 		if run.Runtime == nil || run.Stop == nil {
 			return false, ErrFencePending
 		}
+		if fencing.RunRole(run) == fencing.StartupRoleLearnerPendingRemove {
+			if err := validatePendingTerminalRun(state, run); err != nil {
+				return false, err
+			}
+			if err := e.requirePendingProducerAbsent(ctx, *run.Runtime); err != nil {
+				return false, err
+			}
+			continue
+		}
+		if fencing.RunRole(run) != fencing.StartupRoleVoterActive {
+			return false, fmt.Errorf("fencing: closed producer cohort has an unsupported run role")
+		}
 		producer, err := e.reserveMutationProducer(ctx, *run.Runtime)
 		if err != nil {
 			return false, err

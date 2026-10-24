@@ -69,7 +69,16 @@ func (c *Controller) assessAutomaticEscalation(ctx context.Context, r *ClusterRe
 			return automaticEscalationStop, err
 		}
 		if string(ref.NodeID) == intent.LearnerName && intent.LearnerUID != "" && str(nested(pod, "metadata", "uid")) != intent.LearnerUID {
-			return automaticEscalationStop, c.autoStatus(ctx, r, state, "Blocked", "learner Pod differs from the generation fencing scope")
+			if !intent.Aborting {
+				return automaticEscalationStop, c.autoStatus(ctx, r, state, "Blocked", "learner Pod differs from the generation fencing scope")
+			}
+			// The exact prior ADD still needs its abort revision propagated. A new
+			// Pod at the same ordinal is not that learner and cannot contribute a
+			// status or generation-fence target to this retirement round.
+			continue
+		}
+		if string(ref.NodeID) == intent.LearnerName && intent.Aborting && nested(pod, "metadata", "deletionTimestamp") != nil {
+			continue
 		}
 		endpoint, err := podEndpoint(pod, r.Spec.Container, "/membership/status")
 		if err != nil {

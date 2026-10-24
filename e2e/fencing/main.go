@@ -19,12 +19,17 @@ import (
 	"net/http"
 	"os"
 	"os/exec"
+	"os/signal"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
+	"sync"
+	"syscall"
 	"time"
 
 	"github.com/mrchypark/rhiza"
+	internalobjstore "github.com/mrchypark/rhiza/internal/objstore"
 	"github.com/mrchypark/rhiza/pkg/fencing"
 	"github.com/mrchypark/rhiza/pkg/network"
 	"github.com/mrchypark/rhiza/pkg/operator"
@@ -37,12 +42,29 @@ var qualificationRunID string
 
 const kindNode = "rhiza-generic-fencing-control-plane"
 const admin = "fencing-test-admin"
+const gcsHAScenarioEnv = "RHIZA_GCS_HA_SCENARIO"
+const gcsHAMixedPendingScenario = "mixed-pending"
+const gcsHAMixedPendingSource = "chaos-source"
+const gcsMixedWorkDeadlineEnv = "FENCING_E2E_MIXED_WORK_DEADLINE_UNIX"
+const gcsMixedHardDeadlineEnv = "FENCING_E2E_MIXED_HARD_DEADLINE_UNIX"
+
+const gcsMixedHardLimit = 55 * time.Minute
+const gcsMixedDefaultCleanupReserve = 3 * time.Minute
+
+type gcsMixedHardDeadlineKey struct{}
 
 type obj = map[string]any
 
 func main() {
 	if len(os.Args) != 2 {
-		fatal(fmt.Errorf("usage: fencing-e2e manifests|local-cooperative-store-secret|wait-source|run|run-gcs-ha|run-gcs-ha-explicit|run-gcs-ha-async-empty|run-gcs-ha-async-empty-explicit|run-gcs-ha-async-nonempty|run-gcs-ha-manual-terminal|run-gcs-ha-missing-membership|run-gcs-ha-ack-loss|run-gcs-ha-dead-pod|prepare-gcs-ha-initial-head-ack-loss|cleanup-gcs-ha-initial-head-ack-loss|run-gcs-ha-initial-head-ack-loss|runtime-probe|runtime-agent-request"))
+		fatal(fmt.Errorf("usage: fencing-e2e manifests|local-cooperative-store-secret|wait-source|run|run-gcs-ha|run-gcs-ha-explicit|run-gcs-ha-async-empty|run-gcs-ha-async-empty-explicit|run-gcs-ha-async-nonempty|run-gcs-ha-manual-terminal|run-gcs-ha-missing-membership|run-gcs-ha-ack-loss|run-gcs-ha-dead-pod|run-gcs-ha-mixed-pending|prepare-gcs-ha-initial-head-ack-loss|cleanup-gcs-ha-initial-head-ack-loss|run-gcs-ha-initial-head-ack-loss|runtime-probe|runtime-agent-request"))
+	}
+	if isGCSMixedPendingSelected(os.Args[1], strings.TrimSpace(os.Getenv(gcsHAScenarioEnv))) {
+		fatal(runGCSMixedPendingCommand(configureGCSMixedPending, qualifyGCSMixedPending))
+		return
+	}
+	if err := configureGCSMixedPendingSelection(); err != nil {
+		fatal(err)
 	}
 	if os.Args[1] == "prepare-gcs-ha-initial-head-ack-loss" {
 		ctx, cancel := context.WithTimeout(context.Background(), 6*time.Minute)
@@ -174,6 +196,114 @@ func main() {
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Minute)
 	defer cancel()
 	fatal(qualify(ctx))
+}
+
+func configureGCSMixedPending(ctx context.Context) error {
+	if err := configureGCSMixedPendingSelection(); err != nil {
+		return err
+	}
+	return configureGCSHA(ctx)
+}
+
+func isGCSMixedPendingSelected(command, scenario string) bool {
+	return command == "run-gcs-ha-mixed-pending" || (command == "run" && scenario != "")
+}
+
+// runGCSMixedPendingCommand owns the mixed scenario's complete signal and
+// deadline lifetime. Callers must decide whether to exit only after it returns
+// so qualification defers have completed before fatal/os.Exit is reached.
+func runGCSMixedPendingCommand(configure, qualify func(context.Context) error) error {
+	signalCtx, stopSignals := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stopSignals()
+
+	workDeadline, hardDeadline, err := gcsMixedDeadlines(time.Now(), os.Getenv(gcsMixedWorkDeadlineEnv), os.Getenv(gcsMixedHardDeadlineEnv))
+	if err != nil {
+		return err
+	}
+	rootCtx, cancelHard := context.WithDeadline(signalCtx, hardDeadline)
+	defer cancelHard()
+	rootCtx = context.WithValue(rootCtx, gcsMixedHardDeadlineKey{}, hardDeadline)
+	workCtx, cancelWork := context.WithDeadline(rootCtx, workDeadline)
+	defer cancelWork()
+
+	if configure == nil || qualify == nil {
+		return fmt.Errorf("mixed qualification callbacks are unavailable")
+	}
+	if err := configure(workCtx); err != nil {
+		return fmt.Errorf("configure mixed qualification: %w", err)
+	}
+	if err := workCtx.Err(); err != nil {
+		return fmt.Errorf("mixed qualification work window ended before qualification: %w", err)
+	}
+	if err := qualify(workCtx); err != nil {
+		return fmt.Errorf("mixed qualification failed: %w", err)
+	}
+	if err := signalCtx.Err(); err != nil {
+		return fmt.Errorf("mixed qualification interrupted: %w", err)
+	}
+	if err := workCtx.Err(); err != nil {
+		return fmt.Errorf("mixed qualification exceeded its work deadline: %w", err)
+	}
+	return nil
+}
+
+// gcsMixedDeadlines accepts the wrapper's single absolute work/hard horizon.
+// Direct invocations get the same bounded ceiling and an explicit cleanup
+// reserve; the shell may shorten either deadline but may never extend 55 min.
+func gcsMixedDeadlines(now time.Time, workValue, hardValue string) (time.Time, time.Time, error) {
+	if (workValue == "") != (hardValue == "") {
+		return time.Time{}, time.Time{}, fmt.Errorf("%s and %s must be set together", gcsMixedWorkDeadlineEnv, gcsMixedHardDeadlineEnv)
+	}
+	var workDeadline, hardDeadline time.Time
+	if workValue == "" {
+		hardDeadline = now.Add(gcsMixedHardLimit)
+		workDeadline = hardDeadline.Add(-gcsMixedDefaultCleanupReserve)
+	} else {
+		var err error
+		workEpoch, err := strconv.ParseInt(workValue, 10, 64)
+		if err != nil || workEpoch <= 0 {
+			return time.Time{}, time.Time{}, fmt.Errorf("%s must be a positive Unix epoch second", gcsMixedWorkDeadlineEnv)
+		}
+		hardEpoch, err := strconv.ParseInt(hardValue, 10, 64)
+		if err != nil || hardEpoch <= 0 {
+			return time.Time{}, time.Time{}, fmt.Errorf("%s must be a positive Unix epoch second", gcsMixedHardDeadlineEnv)
+		}
+		workDeadline = time.Unix(workEpoch, 0)
+		hardDeadline = time.Unix(hardEpoch, 0)
+	}
+	if !workDeadline.After(now) || !hardDeadline.After(workDeadline) {
+		return time.Time{}, time.Time{}, fmt.Errorf("mixed work and hard deadlines must be future times with work ending first")
+	}
+	if hardDeadline.Sub(now) > gcsMixedHardLimit {
+		return time.Time{}, time.Time{}, fmt.Errorf("mixed hard deadline exceeds the 55-minute maximum")
+	}
+	return workDeadline, hardDeadline, nil
+}
+
+// gcsMixedCleanupContext detaches fault restoration from canceled work while
+// retaining the command's absolute hard stop. Each existing 45-second restore
+// group can use this helper independently without extending the global horizon.
+func gcsMixedCleanupContext(workCtx context.Context, maximum time.Duration) (context.Context, context.CancelFunc) {
+	deadline := time.Now().Add(maximum)
+	if hardDeadline, ok := workCtx.Value(gcsMixedHardDeadlineKey{}).(time.Time); ok && hardDeadline.Before(deadline) {
+		deadline = hardDeadline
+	}
+	return context.WithDeadline(context.Background(), deadline)
+}
+
+func configureGCSMixedPendingSelection() error {
+	scenario := strings.TrimSpace(os.Getenv(gcsHAScenarioEnv))
+	if scenario == "" {
+		return nil
+	}
+	if scenario != gcsHAMixedPendingScenario {
+		return fmt.Errorf("unsupported %s %q", gcsHAScenarioEnv, scenario)
+	}
+	configuredSource := strings.TrimSpace(os.Getenv(gcsMixedRemoveGateSource))
+	if configuredSource != "" && configuredSource != gcsHAMixedPendingSource {
+		return fmt.Errorf("%s conflicts with the dedicated mixed fixture source", gcsMixedRemoveGateSource)
+	}
+	return os.Setenv(gcsMixedRemoveGateSource, gcsHAMixedPendingSource)
 }
 
 func configureGCSHA(ctx context.Context) error {
@@ -360,6 +490,13 @@ func manifests() obj {
 	workload := nested(sts, "spec", "template", "spec").(obj)
 	workload["hostPID"], workload["shareProcessNamespace"] = false, false
 	application := workload["containers"].([]obj)[0]
+	// The dedicated mixed REMOVE qualification opts in before the source
+	// StatefulSet is first applied. Keeping the source ID in the Pod template
+	// also makes the embedded fixture's gate self-disable on successor
+	// generations without a rollout or mutable runtime switch.
+	if source := os.Getenv("RHIZA_QUALIFICATION_REMOVE_GATE_SOURCE"); source != "" {
+		application["env"] = append(application["env"].([]obj), value("RHIZA_QUALIFICATION_REMOVE_GATE_SOURCE", source))
+	}
 	application["securityContext"] = obj{"allowPrivilegeEscalation": false, "readOnlyRootFilesystem": true, "capabilities": obj{"drop": []string{"ALL"}}}
 	opEnv := []obj{field("POD_NAMESPACE", "metadata.namespace"), value("RHIZA_AUTOMATIC_RECOVERY", "true"), value("RHIZA_FENCER_BACKEND", "kubernetes")}
 	op := resource("apps/v1", "Deployment", "rhiza-operator", obj{"replicas": 0, "selector": obj{"matchLabels": selector("rhiza-operator")}, "template": obj{"metadata": obj{"labels": selector("rhiza-operator")}, "spec": obj{"serviceAccountName": "rhiza-operator", "securityContext": obj{"runAsNonRoot": true, "fsGroup": 65532}, "containers": []obj{{"name": "operator", "image": "rhiza-fencing-operator:local", "args": []string{"--namespace=$(POD_NAMESPACE)", "--poll-interval=1s"}, "env": opEnv, "envFrom": []obj{envFrom[0]}, "volumeMounts": []obj{{"name": "tmp", "mountPath": "/tmp"}}}}, "volumes": []obj{{"name": "tmp", "emptyDir": obj{}}}}}})
@@ -376,6 +513,9 @@ func command(ctx context.Context, name string, args ...string) ([]byte, error) {
 	cmd := exec.CommandContext(ctx, name, args...)
 	data, err := cmd.CombinedOutput()
 	if err != nil {
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			err = errors.Join(err, ctxErr)
+		}
 		return nil, fmt.Errorf("%s command failed: %w: %s", name, err, data)
 	}
 	return data, nil
@@ -384,17 +524,21 @@ func command(ctx context.Context, name string, args ...string) ([]byte, error) {
 // startFencerForward opens only the run-owned fencer Service and keeps the
 // kubectl subprocess log separate from the short-lived controller token.
 func startFencerForward(ctx context.Context, out string) (*forward, error) {
+	return startServiceForward(ctx, out, "rhiza-fencer", 9444)
+}
+
+func startServiceForward(ctx context.Context, out, service string, servicePort int) (*forward, error) {
 	l, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		return nil, err
 	}
 	port := l.Addr().(*net.TCPAddr).Port
 	_ = l.Close()
-	log, err := os.CreateTemp(out, "rhiza-fencer-portforward-*.log")
+	log, err := os.CreateTemp(out, service+"-portforward-*.log")
 	if err != nil {
 		return nil, err
 	}
-	cmd := exec.CommandContext(ctx, "kubectl", "--context", kubeContext, "-n", namespace, "port-forward", "service/rhiza-fencer", fmt.Sprintf("%d:9444", port), "--address=127.0.0.1")
+	cmd := exec.CommandContext(ctx, "kubectl", "--context", kubeContext, "-n", namespace, "port-forward", "service/"+service, fmt.Sprintf("%d:%d", port, servicePort), "--address=127.0.0.1")
 	cmd.Stdout, cmd.Stderr = log, log
 	if err := cmd.Start(); err != nil {
 		_ = log.Close()
@@ -404,7 +548,7 @@ func startFencerForward(ctx context.Context, out string) (*forward, error) {
 	go func() { f.done <- cmd.Wait() }()
 	ready, cancel := context.WithTimeout(ctx, 30*time.Second)
 	defer cancel()
-	if err := wait(ready, "port-forward rhiza-fencer", func() (bool, error) {
+	if err := wait(ready, "port-forward "+service, func() (bool, error) {
 		conn, err := net.DialTimeout("tcp", fmt.Sprintf("127.0.0.1:%d", port), 100*time.Millisecond)
 		if err != nil {
 			return false, nil
@@ -412,8 +556,7 @@ func startFencerForward(ctx context.Context, out string) (*forward, error) {
 		_ = conn.Close()
 		return true, nil
 	}); err != nil {
-		f.close()
-		return nil, err
+		return nil, joinForwardCloseError(f, err)
 	}
 	return f, nil
 }
@@ -528,13 +671,252 @@ func wait(ctx context.Context, description string, check func() (bool, error)) e
 }
 
 type forward struct {
-	cmd  *exec.Cmd
-	port int
-	done chan error
-	log  *os.File
+	cmd      *exec.Cmd
+	port     int
+	done     chan error
+	log      *os.File
+	closeOne sync.Once
+	closeErr error
 }
 
-func (f *forward) close() { _ = f.cmd.Process.Kill(); <-f.done; _ = f.log.Close() }
+func (f *forward) close() error {
+	if f == nil {
+		return nil
+	}
+	f.closeOne.Do(func() {
+		var closeErrors []error
+		killed := false
+		if f.cmd == nil || f.cmd.Process == nil {
+			closeErrors = append(closeErrors, fmt.Errorf("port-forward process identity is unavailable"))
+		} else if err := f.cmd.Process.Kill(); err == nil {
+			killed = true
+		} else if !errors.Is(err, os.ErrProcessDone) {
+			closeErrors = append(closeErrors, fmt.Errorf("kill port-forward process: %w", err))
+		}
+		if f.done == nil {
+			closeErrors = append(closeErrors, fmt.Errorf("port-forward wait channel is unavailable"))
+		} else if waitErr, ok := <-f.done; !ok {
+			closeErrors = append(closeErrors, fmt.Errorf("port-forward wait channel closed without a result"))
+		} else if waitErr != nil {
+			var exitErr *exec.ExitError
+			if !killed || !errors.As(waitErr, &exitErr) || exitErr.ExitCode() != -1 {
+				closeErrors = append(closeErrors, fmt.Errorf("wait for port-forward process: %w", waitErr))
+			}
+		}
+		if f.log == nil {
+			closeErrors = append(closeErrors, fmt.Errorf("port-forward log file is unavailable"))
+		} else if err := f.log.Close(); err != nil {
+			closeErrors = append(closeErrors, fmt.Errorf("close port-forward log file: %w", err))
+		}
+		f.closeErr = errors.Join(closeErrors...)
+	})
+	return f.closeErr
+}
+
+const fencerDefaultAuthorityStatePrefix = "rhiza-authority-state"
+
+// openQualificationLedgerReader opens the disposable fixture's canonical S3
+// bucket through a run-owned loopback port-forward. The cluster DNS endpoint
+// from rhiza-config is only resolvable inside Kind, not by this driver process.
+func openQualificationLedgerReader(ctx context.Context, out string) (proofLedgerReader, func() error, error) {
+	config, err := localFixtureObjectStoreConfig()
+	if err != nil {
+		return nil, nil, err
+	}
+	prefix, err := qualificationAuthorityStatePrefix(ctx)
+	if err != nil {
+		return nil, nil, err
+	}
+	forward, err := startServiceForward(ctx, out, "rhiza-minio", 9000)
+	if err != nil {
+		return nil, nil, err
+	}
+	config.Endpoint = fmt.Sprintf("127.0.0.1:%d", forward.port)
+	bucket, err := internalobjstore.NewBucket(config)
+	if err != nil {
+		return nil, nil, joinForwardCloseError(forward, err)
+	}
+	store, err := operator.NewAuthorityStateStore(bucket, prefix)
+	if err != nil {
+		return nil, nil, errors.Join(err, closeQualificationLedgerResources(bucket.Close, forward))
+	}
+	// This fixture deploys the cooperative fencer with its legacy flag enabled,
+	// but its configured canonical ObjectStorage always takes precedence.
+	reader := configuredProofLedgerReader(store, true, readLegacyConfigMapLedger)
+	return reader, func() error {
+		return closeQualificationLedgerResources(bucket.Close, forward)
+	}, nil
+}
+
+func closeQualificationLedgerResources(closeBucket func() error, forward *forward) error {
+	var bucketErr error
+	if closeBucket != nil {
+		if err := closeBucket(); err != nil {
+			bucketErr = fmt.Errorf("close canonical authority bucket: %w", err)
+		}
+	}
+	return errors.Join(bucketErr, joinForwardCloseError(forward, nil))
+}
+
+func joinForwardCloseError(forward *forward, operationErr error) error {
+	if forward == nil {
+		return operationErr
+	}
+	return errors.Join(operationErr, forward.close())
+}
+
+func localFixtureObjectStoreConfig() (internalobjstore.Config, error) {
+	items, _ := manifests()["items"].([]obj)
+	var data obj
+	for _, item := range items {
+		if nested(item, "kind") == "ConfigMap" && nested(item, "metadata", "name") == "rhiza-config" {
+			data, _ = item["data"].(obj)
+			break
+		}
+	}
+	secret, _ := localCooperativeStoreSecret()["stringData"].(obj)
+	if len(data) == 0 || text(data["RHIZA_OBJSTORE_PROVIDER"]) != "s3" || text(data["RHIZA_OBJSTORE_BUCKET"]) == "" {
+		return internalobjstore.Config{}, fmt.Errorf("local qualification fixture has no canonical S3 configuration")
+	}
+	if text(secret["RHIZA_OBJSTORE_ACCESS_KEY"]) == "" || text(secret["RHIZA_OBJSTORE_SECRET_KEY"]) == "" {
+		return internalobjstore.Config{}, fmt.Errorf("local qualification fixture has incomplete S3 credentials")
+	}
+	return internalobjstore.Config{
+		Provider:     internalobjstore.Provider(text(data["RHIZA_OBJSTORE_PROVIDER"])),
+		Prefix:       text(data["RHIZA_OBJSTORE_PREFIX"]),
+		Endpoint:     text(data["RHIZA_OBJSTORE_ENDPOINT"]),
+		Bucket:       text(data["RHIZA_OBJSTORE_BUCKET"]),
+		Insecure:     text(data["RHIZA_OBJSTORE_INSECURE"]) == "true",
+		AccessKey:    text(secret["RHIZA_OBJSTORE_ACCESS_KEY"]),
+		SecretKey:    text(secret["RHIZA_OBJSTORE_SECRET_KEY"]),
+		SessionToken: text(secret["RHIZA_OBJSTORE_SESSION_TOKEN"]),
+	}, nil
+}
+
+func qualificationAuthorityStatePrefix(ctx context.Context) (string, error) {
+	deployment, err := get(ctx, "deployment", "rhiza-fencer")
+	if err != nil {
+		return "", err
+	}
+	return fencerAuthorityStatePrefix(deployment)
+}
+
+func fencerAuthorityStatePrefix(deployment obj) (string, error) {
+	containers, _ := nested(deployment, "spec", "template", "spec", "containers").([]any)
+	var args []any
+	var env []any
+	var envFrom []any
+	foundAuthority := false
+	for _, container := range containers {
+		if nested(container, "name") != "authority" {
+			continue
+		}
+		foundAuthority = true
+		args, _ = nested(container, "args").([]any)
+		env, _ = nested(container, "env").([]any)
+		envFrom, _ = nested(container, "envFrom").([]any)
+	}
+	if !foundAuthority {
+		return "", fmt.Errorf("fencer authority container is unavailable")
+	}
+	configMap, secret := false, false
+	for _, source := range envFrom {
+		if name := text(nested(source, "configMapRef", "name")); name != "" {
+			if name != "rhiza-config" {
+				return "", fmt.Errorf("fencer authority has an unexpected configuration source")
+			}
+			configMap = true
+		}
+		if name := text(nested(source, "secretRef", "name")); name != "" {
+			if name != "rhiza-object-store" {
+				return "", fmt.Errorf("fencer authority has an unexpected credential source")
+			}
+			secret = true
+		}
+	}
+	if !configMap || !secret {
+		return "", fmt.Errorf("fencer authority is not using the local canonical-store fixture")
+	}
+	envPrefix := ""
+	for _, entry := range env {
+		if nested(entry, "name") != "FENCER_AUTHORITY_STATE_PREFIX" {
+			continue
+		}
+		if nested(entry, "valueFrom") != nil {
+			return "", fmt.Errorf("fencer authority prefix uses an unresolved environment reference")
+		}
+		envPrefix = text(nested(entry, "value"))
+	}
+	flagPrefix := ""
+	flagSet := false
+	for i := 0; i < len(args); i++ {
+		arg := text(args[i])
+		if value, found := strings.CutPrefix(arg, "--authority-state-prefix="); found {
+			flagPrefix = value
+			flagSet = true
+		} else if arg == "--authority-state-prefix" {
+			if i+1 >= len(args) {
+				return "", fmt.Errorf("fencer authority prefix flag has no value")
+			}
+			i++
+			flagPrefix = text(args[i])
+			flagSet = true
+		}
+	}
+	if flagSet && flagPrefix != "" {
+		return flagPrefix, nil
+	}
+	if flagSet {
+		return fencerDefaultAuthorityStatePrefix, nil
+	}
+	if envPrefix != "" {
+		return envPrefix, nil
+	}
+	return fencerDefaultAuthorityStatePrefix, nil
+}
+
+type proofLedgerReader func(context.Context, string, string) (fenceLedgerState, error)
+
+func configuredProofLedgerReader(canonical *operator.AuthorityStateStore, legacyCooperative bool, legacy proofLedgerReader) proofLedgerReader {
+	if canonical != nil {
+		return func(ctx context.Context, stsUID, sourceID string) (fenceLedgerState, error) {
+			root, _, err := canonical.ReadRoot(ctx, stsUID, sourceID)
+			if err != nil {
+				return fenceLedgerState{}, err
+			}
+			return fenceLedgerState{StatefulSetUID: root.StatefulSetUID, Ledger: root.Ledger}, nil
+		}
+	}
+	if legacyCooperative && legacy != nil {
+		return legacy
+	}
+	return func(context.Context, string, string) (fenceLedgerState, error) {
+		return fenceLedgerState{}, fmt.Errorf("canonical authority state is not configured")
+	}
+}
+
+func readLegacyConfigMapLedger(ctx context.Context, stsUID, sourceID string) (fenceLedgerState, error) {
+	maps, err := get(ctx, "configmaps", "")
+	if err != nil {
+		return fenceLedgerState{}, err
+	}
+	items, _ := maps["items"].([]any)
+	for _, item := range items {
+		data := text(nested(item, "data", "ledger.json"))
+		if data == "" {
+			continue
+		}
+		var state fenceLedgerState
+		if err := json.Unmarshal([]byte(data), &state); err != nil {
+			return fenceLedgerState{}, err
+		}
+		if state.StatefulSetUID == stsUID && state.Ledger.SourceClusterID == sourceID {
+			return state, nil
+		}
+	}
+	return fenceLedgerState{}, fmt.Errorf("legacy cooperative source ledger unavailable")
+}
+
 func startForward(ctx context.Context, pod, out string) (*forward, error) {
 	l, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
@@ -565,8 +947,7 @@ func startForward(ctx context.Context, pod, out string) (*forward, error) {
 		return true, nil
 	})
 	if err != nil {
-		f.close()
-		return nil, err
+		return nil, joinForwardCloseError(f, err)
 	}
 	return f, nil
 }
@@ -645,6 +1026,11 @@ func qualify(ctx context.Context) (resultErr error) {
 	}); err != nil {
 		return err
 	}
+	ledgerReader, closeLedgerReader, err := openQualificationLedgerReader(ctx, out)
+	if err != nil {
+		return fmt.Errorf("open canonical fencing ledger reader: %w", err)
+	}
+	defer func() { resultErr = errors.Join(resultErr, closeLedgerReader()) }()
 	sts, err := get(ctx, "statefulset", "rhiza")
 	if err != nil {
 		return err
@@ -719,7 +1105,7 @@ func qualify(ctx context.Context) (resultErr error) {
 		return err
 	}
 	onlineCtx, onlineCancel := context.WithTimeout(ctx, 6*time.Minute)
-	current, err := qualifyOnline(onlineCtx, f, stsUID, bindingUID, out, event, &observationFaults)
+	current, err := qualifyOnline(onlineCtx, f, stsUID, bindingUID, out, event, &observationFaults, ledgerReader)
 	onlineCancel()
 	if err != nil {
 		return fmt.Errorf("online voter qualification: %w", err)
@@ -750,7 +1136,7 @@ func qualify(ctx context.Context) (resultErr error) {
 			if nested(item, "spec", "scope") != "Generation" || nested(item, "status", "proof") == nil {
 				continue
 			}
-			return true, verifyGenerationProof(ctx, item, stsUID, bindingUID, oldUIDs, out, current...)
+			return true, verifyGenerationProofWithReader(ctx, item, stsUID, bindingUID, oldUIDs, out, ledgerReader, current...)
 		}
 		return false, nil
 	}); err != nil {
@@ -1023,7 +1409,7 @@ func (f *observationFault) remove(ctx context.Context) error {
 	return nil
 }
 
-func qualifyOnline(ctx context.Context, survivor *forward, stsUID, bindingUID, out string, event func(string, obj), faults *[]*observationFault) ([]operator.FenceTarget, error) {
+func qualifyOnline(ctx context.Context, survivor *forward, stsUID, bindingUID, out string, event func(string, obj), faults *[]*observationFault, ledgerReader proofLedgerReader) ([]operator.FenceTarget, error) {
 	failedPod, err := get(ctx, "pod", "rhiza-2")
 	if err != nil {
 		return nil, err
@@ -1070,7 +1456,7 @@ func qualifyOnline(ctx context.Context, survivor *forward, stsUID, bindingUID, o
 			if nested(item, "spec", "scope") != "Voter" || nested(item, "status", "proof") == nil {
 				continue
 			}
-			if err := verifyScopedProof(ctx, item, stsUID, bindingUID, []string{failed.PodUID}, operator.ScopeVoter, []operator.FenceTarget{failed}, out); err != nil {
+			if err := verifyScopedProofWithReader(ctx, item, stsUID, bindingUID, []string{failed.PodUID}, operator.ScopeVoter, []operator.FenceTarget{failed}, out, ledgerReader); err != nil {
 				return false, err
 			}
 			if err := json.Unmarshal(encoded(nested(item, "spec")), &voterRequest); err != nil {
@@ -1153,7 +1539,7 @@ func qualifyOnline(ctx context.Context, survivor *forward, stsUID, bindingUID, o
 			}
 		}
 	}
-	if err := verifyRegisteredTargets(ctx, targets, stsUID, out); err != nil {
+	if err := verifyRegisteredTargets(ctx, targets, stsUID, out, ledgerReader); err != nil {
 		return nil, err
 	}
 	if err := verifyImages(ctx, out, "learner-promoted", targets...); err != nil {
@@ -1604,38 +1990,30 @@ type fenceLedgerState struct {
 	Ledger         fencing.Ledger `json:"ledger"`
 }
 
-func verifyRegisteredTargets(ctx context.Context, targets []operator.FenceTarget, stsUID, out string) error {
-	maps, err := get(ctx, "configmaps", "")
+func verifyRegisteredTargets(ctx context.Context, targets []operator.FenceTarget, stsUID, out string, ledgerReader proofLedgerReader) error {
+	state, err := ledgerReader(ctx, stsUID, "chaos-source")
 	if err != nil {
 		return err
 	}
-	items, _ := maps["items"].([]any)
-	for _, item := range items {
-		data := text(nested(item, "data", "ledger.json"))
-		if data == "" {
-			continue
-		}
-		var state fenceLedgerState
-		if err := json.Unmarshal([]byte(data), &state); err != nil {
-			return err
-		}
-		if state.StatefulSetUID != stsUID || state.Ledger.SourceClusterID != "chaos-source" {
-			continue
-		}
-		for _, target := range targets {
-			found := false
-			for _, run := range state.Ledger.Runs {
-				if run.Identity.NodeID == target.NodeID && run.Identity.PodUID == target.PodUID && run.Identity.WALIdentity == target.WALIdentity && run.Stop == nil && !run.Exited {
-					found = true
-				}
-			}
-			if !found {
-				return fmt.Errorf("promoted current voter lacks active WAL-bound startup registration: %s", target.NodeID)
-			}
-		}
-		return os.WriteFile(filepath.Join(out, "online-active-ledger.json"), encoded(state), 0600)
+	if state.StatefulSetUID != stsUID || state.Ledger.SourceClusterID != "chaos-source" {
+		return fmt.Errorf("active source ledger identity differs")
 	}
-	return fmt.Errorf("active source ledger unavailable")
+	for _, target := range targets {
+		if target.NodeID == "" || target.Pod == "" || target.PodUID == "" || target.WALIdentity == "" {
+			return fmt.Errorf("captured active voter identity is incomplete")
+		}
+		found := false
+		for _, run := range state.Ledger.Runs {
+			if run.Identity.NodeID == target.NodeID && run.Identity.PodUID == target.PodUID && run.Identity.WALIdentity == target.WALIdentity && run.Stop == nil && !run.Exited {
+				found = true
+				break
+			}
+		}
+		if !found {
+			return fmt.Errorf("promoted current voter lacks active WAL-bound startup registration: %s", target.NodeID)
+		}
+	}
+	return os.WriteFile(filepath.Join(out, "online-active-ledger.json"), encoded(state), 0600)
 }
 
 func digest(value string) string {
@@ -1928,7 +2306,15 @@ func verifyGenerationProof(ctx context.Context, item any, stsUID, bindingUID str
 	return verifyScopedProof(ctx, item, stsUID, bindingUID, oldUIDs, operator.ScopeGeneration, targets, out)
 }
 
+func verifyGenerationProofWithReader(ctx context.Context, item any, stsUID, bindingUID string, oldUIDs []string, out string, ledgerReader proofLedgerReader, targets ...operator.FenceTarget) error {
+	return verifyScopedProofWithReader(ctx, item, stsUID, bindingUID, oldUIDs, operator.ScopeGeneration, targets, out, ledgerReader)
+}
+
 func verifyScopedProof(ctx context.Context, item any, stsUID, bindingUID string, oldUIDs []string, scope operator.Scope, targets []operator.FenceTarget, out string, expectedSource ...string) error {
+	return verifyScopedProofWithReader(ctx, item, stsUID, bindingUID, oldUIDs, scope, targets, out, nil, expectedSource...)
+}
+
+func verifyScopedProofWithReader(ctx context.Context, item any, stsUID, bindingUID string, oldUIDs []string, scope operator.Scope, targets []operator.FenceTarget, out string, ledgerReader proofLedgerReader, expectedSource ...string) error {
 	var request operator.FenceRequest
 	var proof operator.FenceProof
 	if err := json.Unmarshal(encoded(nested(item, "spec")), &request); err != nil {
@@ -1957,50 +2343,41 @@ func verifyScopedProof(ctx context.Context, item any, stsUID, bindingUID string,
 	if proof.OperationID != request.OperationID || proof.SourceClusterID != request.SourceClusterID || proof.BindingUID != request.BindingUID || proof.RequestHash != hash || proof.ProofID == "" || !proof.ProcessesTerminated || !proof.RecreationBlocked || !proof.StorageQuiesced {
 		return fmt.Errorf("generation proof binding differs")
 	}
-	maps, err := get(ctx, "configmaps", "")
+	if ledgerReader == nil {
+		return fmt.Errorf("canonical proof ledger reader is unavailable")
+	}
+	state, err := ledgerReader(ctx, stsUID, request.SourceClusterID)
 	if err != nil {
 		return err
 	}
-	items, _ := maps["items"].([]any)
-	for _, item := range items {
-		data := text(nested(item, "data", "ledger.json"))
-		if data == "" {
-			continue
-		}
-		var state fenceLedgerState
-		if err := json.Unmarshal([]byte(data), &state); err != nil {
-			return err
-		}
-		if state.StatefulSetUID != stsUID || state.Ledger.SourceClusterID != request.SourceClusterID {
-			continue
-		}
-		if !state.Ledger.CompleteNodes(request.OperationID, hash, nodes, oldUIDs) {
-			return fmt.Errorf("generation ledger has no clean drain/exit for all source incarnations")
-		}
-		for _, run := range state.Ledger.Runs {
-			for _, uid := range oldUIDs {
-				if run.Identity.PodUID == uid && (run.Stop == nil || run.Stop.OperationID != request.OperationID || run.Stop.RequestHash != hash) {
-					return fmt.Errorf("source incarnation drained for a different operation")
-				}
-			}
-		}
-		if err := verifyLedgerProof(state, request, proof); err != nil {
-			return err
-		}
-		filename := "validated-voter-proof.json"
-		if scope == operator.ScopeGeneration {
-			filename = "validated-generation-proof.json"
-			if err := verifyPriorVoterStops(out, state.Ledger); err != nil {
-				return err
-			}
-		}
-		provenance := "exact-current-ledger-hash"
-		if scope == operator.ScopeVoter {
-			provenance = "historical-issuer-proof-id; current-ledger-exact-terminal-targets; issuance-snapshot-not-reconstructed"
-		}
-		return os.WriteFile(filepath.Join(out, filename), encoded(obj{"request": request, "proof": proof, "ledger": state, "oldUIDs": oldUIDs, "ledgerVerification": provenance}), 0600)
+	if state.StatefulSetUID != stsUID || state.Ledger.SourceClusterID != request.SourceClusterID {
+		return fmt.Errorf("generation ledger identity differs")
 	}
-	return fmt.Errorf("generation proof has no matching durable ledger")
+	if !state.Ledger.CompleteNodes(request.OperationID, hash, nodes, oldUIDs) {
+		return fmt.Errorf("generation ledger has no clean drain/exit for all source incarnations")
+	}
+	for _, run := range state.Ledger.Runs {
+		for _, uid := range oldUIDs {
+			if run.Identity.PodUID == uid && (run.Stop == nil || run.Stop.OperationID != request.OperationID || run.Stop.RequestHash != hash) {
+				return fmt.Errorf("source incarnation drained for a different operation")
+			}
+		}
+	}
+	if err := verifyLedgerProof(state, request, proof); err != nil {
+		return err
+	}
+	filename := "validated-voter-proof.json"
+	if scope == operator.ScopeGeneration {
+		filename = "validated-generation-proof.json"
+		if err := verifyPriorVoterStops(out, state.Ledger); err != nil {
+			return err
+		}
+	}
+	provenance := "exact-current-ledger-hash"
+	if scope == operator.ScopeVoter {
+		provenance = "historical-issuer-proof-id; current-ledger-exact-terminal-targets; issuance-snapshot-not-reconstructed"
+	}
+	return os.WriteFile(filepath.Join(out, filename), encoded(obj{"request": request, "proof": proof, "ledger": state, "oldUIDs": oldUIDs, "ledgerVerification": provenance}), 0600)
 }
 
 func verifyLedgerProof(state fenceLedgerState, request operator.FenceRequest, proof operator.FenceProof) error {

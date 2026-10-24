@@ -30,11 +30,16 @@ import (
 
 	"github.com/mrchypark/rhiza"
 	"github.com/mrchypark/rhiza/internal/sqlpolicy"
+	"github.com/mrchypark/rhiza/pkg/fencing"
 	"github.com/mrchypark/rhiza/pkg/operator"
 	"github.com/mrchypark/rhiza/pkg/quepaxa"
 	"github.com/mrchypark/rhiza/pkg/recoveryanchor"
 	"github.com/quic-go/quic-go"
 )
+
+func fixtureSupervisorStartupRole() fencing.StartupRole {
+	return fencing.StartupRole(os.Getenv("RHIZA_STARTUP_ROLE"))
+}
 
 var errAnchorBlocked = errors.New("anchor binding not verified")
 
@@ -248,11 +253,39 @@ func runApplication(ctx context.Context, config rhiza.Config) (result error) {
 		log.Printf("anchor guard active: id=%s cluster=%s", anchorID, config.ClusterID)
 	}
 
-	management := &http.Server{Addr: config.BindAddr, Handler: db.OperatorHandler(), ReadHeaderTimeout: 5 * time.Second}
+	operatorHandler := db.OperatorHandler()
+	var removeGate *fixtureRemoveGate
+	if source := os.Getenv(fixtureRemoveGateSourceEnv); source != "" {
+		startupRole := fixtureSupervisorStartupRole()
+		if source == config.ClusterID && !config.EnableReconfiguration {
+			return errors.New("fixture REMOVE gate requires reconfiguration-enabled source voters")
+		}
+		pendingLearnerID := ""
+		if config.Learner != nil {
+			pendingLearnerID = string(config.Learner.ID)
+		}
+		voterIDs := make([]string, len(config.Members))
+		for i, member := range config.Members {
+			voterIDs[i] = string(member.ID)
+		}
+		removeGate, err = newFixtureRemoveGate(source, config.ClusterID, config.NodeID, voterIDs, startupRole, pendingLearnerID, operatorHandler)
+		if err != nil {
+			return err
+		}
+		operatorHandler = removeGate
+	}
+	management := &http.Server{Addr: config.BindAddr, Handler: operatorHandler, ReadHeaderTimeout: 5 * time.Second}
 
 	app := http.NewServeMux()
 	// Test-harness telemetry only; never expose Config or credentials.
 	app.Handle("GET /qualification/object-store", objectStoreCounters(db.ObjectStoreStats))
+	app.HandleFunc("GET /qualification/remove-gate", func(w http.ResponseWriter, _ *http.Request) {
+		if removeGate == nil {
+			respond(w, fixtureRemoveGateSnapshot{}, nil)
+			return
+		}
+		respond(w, removeGate.snapshot(), nil)
+	})
 	app.HandleFunc("GET /host", func(w http.ResponseWriter, r *http.Request) {
 		respond(w, map[string]string{"host": "go-embedded"}, nil)
 	})
