@@ -204,7 +204,7 @@ func TestRegisterRootInitRejectionEmitsStageDiagnostic(t *testing.T) {
 	if err := client.Register(ctx, f.identity); err == nil {
 		t.Fatal("required executor accepted an existing cooperative root")
 	}
-	if !strings.Contains(captured.String(), "fencing supervisor transition rejected: action=register podUID=pod-0 error=fencing: register root-init rejected:") {
+	if !strings.Contains(captured.String(), `fencing supervisor transition rejected: action="register" podUID="pod-0" error="fencing: register root-init rejected:`) {
 		t.Fatalf("actual handler rejection omitted the fixed register diagnostic: %s", captured.String())
 	}
 }
