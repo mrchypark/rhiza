@@ -1473,15 +1473,27 @@ func imageDescriptor(d string, content []byte, target imagePlatform) (string, er
 			platformVariant, _ := platform["variant"].(string)
 			return target.OS != "" && target.Architecture != "" && strings.EqualFold(platformOS, target.OS) && strings.EqualFold(platformArchitecture, target.Architecture) && strings.EqualFold(platformVariant, target.Variant)
 		}
+		platformUnspecified := func(platform obj) bool {
+			if len(platform) == 0 {
+				return true
+			}
+			platformOS, osOK := platform["os"].(string)
+			platformArchitecture, architectureOK := platform["architecture"].(string)
+			platformVariant, variantOK := platform["variant"].(string)
+			if _, hasVariant := platform["variant"]; hasVariant && (!variantOK || platformVariant != "") {
+				return false
+			}
+			return osOK && architectureOK && platformOS == "" && platformArchitecture == ""
+		}
 		if target.OS == "" || target.Architecture == "" {
 			return "", fmt.Errorf("target platform is required to resolve immutable image index %s", d)
 		}
-		if aliases && len(first.Platform) > 0 && platformMatches(first.Platform) {
+		if aliases && (platformUnspecified(first.Platform) || platformMatches(first.Platform)) {
 			return immutableDigest(first.Digest)
 		}
 		var selected string
 		for _, manifest := range descriptor.Manifests {
-			if platformMatches(manifest.Platform) {
+			if platformMatches(manifest.Platform) || len(descriptor.Manifests) == 1 && platformUnspecified(manifest.Platform) {
 				if selected != "" {
 					return "", fmt.Errorf("ambiguous immutable image index %s for platform %s/%s/%s", d, target.OS, target.Architecture, target.Variant)
 				}

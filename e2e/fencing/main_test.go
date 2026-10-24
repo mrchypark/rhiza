@@ -333,7 +333,13 @@ func TestImmutableImageResolutionDescriptors(t *testing.T) {
 		}
 		return fmt.Sprintf(`{"digest":%q,"size":%d,"mediaType":"application/vnd.oci.image.manifest.v1+json","platform":{"os":%q,"architecture":%q%s}}`, digest, size, os, architecture, variant)
 	}
+	platformlessManifest := func(digest string) string {
+		return fmt.Sprintf(`{"digest":%q,"size":708,"mediaType":"application/vnd.oci.image.manifest.v1+json","platform":{"os":"","architecture":""}}`, digest)
+	}
 	platformIndex := func(entries ...string) string { return `{"manifests":[` + strings.Join(entries, ",") + `]}` }
+	artifactIndexDigest := "sha256:e8f067edb5526e727903d6ce55cfd151fddbd7c57336b5e35949a1a6336ebe6f"
+	artifactIndexChild := fmt.Sprintf(`{"digest":%q,"size":855,"mediaType":"application/vnd.oci.image.index.v1+json","platform":{"os":"","architecture":""}}`, artifactIndexDigest)
+	artifactIndex := `{"config":{"digest":""},"manifests":[` + artifactIndexChild + `,` + artifactIndexChild + `]}`
 	linuxAMD64 := imagePlatform{OS: "linux", Architecture: "amd64"}
 	linuxARM64 := imagePlatform{OS: "linux", Architecture: "arm64"}
 	linuxARMv6 := imagePlatform{OS: "linux", Architecture: "arm", Variant: "v6"}
@@ -346,11 +352,13 @@ func TestImmutableImageResolutionDescriptors(t *testing.T) {
 		valid    bool
 	}{
 		{name: "config manifest", body: `{"config":{"digest":"` + config + `"}}`, want: config, valid: true},
-		{name: "single child without platform is rejected", body: `{"manifests":[{"digest":"` + config + `"}]}`, valid: false},
+		{name: "single child without platform", body: platformIndex(platformlessManifest(config)), want: config, valid: true},
 		{name: "duplicate incomplete children", body: `{"manifests":[{"digest":"` + config + `"},{"digest":"` + config + `"}]}`, valid: false},
-		{name: "duplicate tag aliases without platform are rejected", body: index(alias), valid: false},
+		{name: "duplicate descriptor aliases without platform", body: index(alias), want: config, valid: true},
+		{name: "run artifact duplicate platformless OCI aliases", body: artifactIndex, platform: linuxAMD64, want: artifactIndexDigest, valid: true},
 		{name: "duplicate tag aliases with exact platform", body: platformIndex(platformAlias, platformAliasOtherTag), platform: linuxAMD64, want: config, valid: true},
 		{name: "conflicting aliases without platform", body: index(strings.Replace(alias, config, amd64, 1)), valid: false},
+		{name: "distinct platformless child digests are ambiguous", body: platformIndex(platformlessManifest(config), platformlessManifest(amd64)), valid: false},
 		{name: "alias size conflict", body: index(strings.Replace(alias, `"size":708`, `"size":709`, 1)), valid: false},
 		{name: "alias media type conflict", body: index(strings.Replace(alias, "application/vnd.oci.image.manifest.v1+json", "application/vnd.docker.distribution.manifest.v2+json", 1)), valid: false},
 		{name: "nonmatching platform", body: index(strings.Replace(alias, `"size":708`, `"size":708,"platform":{"architecture":"arm64","os":"linux"}`, 1)), valid: false},
@@ -363,7 +371,7 @@ func TestImmutableImageResolutionDescriptors(t *testing.T) {
 		{name: "selects exact arm v7 variant", body: platformIndex(platformManifest(arm64, 303, "linux", "arm", "v6"), platformManifest(amd64, 202, "linux", "arm", "v7")), platform: linuxARMv7, want: amd64, valid: true},
 		{name: "rejects arm v6 variant for v7 host", body: platformIndex(platformManifest(arm64, 303, "linux", "arm", "v6")), platform: linuxARMv7, valid: false},
 		{name: "rejects missing host platform", body: platformIndex(platformManifest(arm64, 303, "linux", "arm64"), platformManifest(attestation, 101, "unknown", "unknown")), platform: linuxAMD64, valid: false},
-		{name: "rejects index child with missing platform", body: platformIndex(`{"digest":` + fmt.Sprintf("%q", amd64) + `,"size":202,"mediaType":"application/vnd.oci.image.manifest.v1+json"}`), platform: linuxAMD64, valid: false},
+		{name: "selects sole child with missing platform", body: platformIndex(`{"digest":` + fmt.Sprintf("%q", amd64) + `,"size":202,"mediaType":"application/vnd.oci.image.manifest.v1+json"}`), platform: linuxAMD64, want: amd64, valid: true},
 		{name: "rejects multiple host platform matches", body: platformIndex(platformManifest(amd64, 202, "linux", "amd64"), platformManifest(attestation, 101, "linux", "amd64")), platform: linuxAMD64, valid: false},
 		{name: "invalid mutable config digest", body: `{"config":{"digest":"image:local"}}`, valid: false},
 		{name: "empty descriptor", body: `{}`, valid: false},
