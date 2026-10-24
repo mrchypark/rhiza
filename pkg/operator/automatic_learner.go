@@ -48,8 +48,10 @@ func (c *Controller) handleAutomaticLearner(ctx context.Context, r *ClusterResou
 		entry := learnerIncarnation{SourceClusterID: state.ActiveClusterID, OperationID: intent.Request.OperationID, Target: request.Targets[0]}
 		entry.Retirement = &learnerRetirement{Request: request, Proof: *proof}
 		for _, old := range state.Learners {
-			if old.SourceClusterID == entry.SourceClusterID && old.Target.Pod == entry.Target.Pod {
+			if old.SourceClusterID == entry.SourceClusterID && old.Target.NodeID == entry.Target.NodeID && old.Target.PodUID == entry.Target.PodUID {
+				entry.CredentialName = old.CredentialName
 				entry.CredentialUID = old.CredentialUID
+				break
 			}
 		}
 		if str(nested(sts, "spec", "template", "metadata", "annotations", fencingProtocolAnnotation)) == "1" && entry.CredentialUID == "" {
