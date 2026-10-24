@@ -256,6 +256,64 @@ func TestFenceCRDKeepsGenerationTargetBound(t *testing.T) {
 	}
 }
 
+func TestFenceCRDMixesStrictV2AndClosedPendingV3WithoutPruningIdentity(t *testing.T) {
+	data, err := os.ReadFile("fence-crd.yaml")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var crd map[string]any
+	if err := yaml.Unmarshal(data, &crd); err != nil {
+		t.Fatal(err)
+	}
+	versions, _ := nestedManifestMap(crd, "spec")
+	versionList, _ := versions["versions"].([]any)
+	if len(versionList) != 1 {
+		t.Fatalf("served CRD versions=%d, want one stable outer version", len(versionList))
+	}
+	version, _ := versionList[0].(map[string]any)
+	schema, _ := nestedManifestMap(version, "schema")
+	openAPI, _ := nestedManifestMap(schema, "openAPIV3Schema")
+	properties, _ := nestedManifestMap(openAPI, "properties")
+	status, _ := nestedManifestMap(properties, "status")
+	statusProperties, _ := nestedManifestMap(status, "properties")
+	proofProperties, _ := nestedManifestMap(statusProperties, "proof")
+	proofFields, _ := nestedManifestMap(proofProperties, "properties")
+	independent, _ := nestedManifestMap(proofFields, "independentV2")
+	independentFields, _ := nestedManifestMap(independent, "properties")
+	if independentFields["version"].(map[string]any)["enum"].([]any)[0] != 2 {
+		t.Fatal("outer independent evidence version changed from V2")
+	}
+	terminals, _ := nestedManifestMap(independentFields, "terminals")
+	terminalItems, _ := nestedManifestMap(terminals, "items")
+	terminalFields, _ := nestedManifestMap(terminalItems, "properties")
+	if got := terminalFields["evidenceVersion"].(map[string]any)["enum"].([]any); len(got) != 2 || got[0] != 2 || got[1] != 3 {
+		t.Fatalf("terminal evidence versions=%v, want [2, 3]", got)
+	}
+	validations, _ := terminalItems["x-kubernetes-validations"].([]any)
+	if len(validations) != 1 {
+		t.Fatalf("terminal conditional validations=%d, want exact V2/V3 producer relationship", len(validations))
+	}
+	rule, _ := validations[0].(map[string]any)["rule"].(string)
+	for _, fragment := range []string{"self.evidenceVersion == 2", "size(self.producerUID) > 0", "self.evidenceVersion == 3", "self.producerUID == ''", "self.mutationReceiptDigest == ''"} {
+		if !strings.Contains(rule, fragment) {
+			t.Fatalf("terminal conditional validation omits %q: %s", fragment, rule)
+		}
+	}
+	identity, _ := nestedManifestMap(terminalFields, "request")
+	requestFields, _ := nestedManifestMap(identity, "properties")
+	requestIdentity, _ := nestedManifestMap(requestFields, "identity")
+	identityFields, _ := nestedManifestMap(requestIdentity, "properties")
+	if podName, ok := identityFields["podName"].(map[string]any); !ok || podName["maxLength"] != 256 {
+		t.Fatalf("optional bounded podName identity field missing: %v", identityFields["podName"])
+	}
+	if assignment, ok := identityFields["assignmentID"].(map[string]any); !ok || assignment["pattern"] != "^[a-f0-9]{64}$" {
+		t.Fatalf("optional digest-form assignmentID identity field missing: %v", identityFields["assignmentID"])
+	}
+	if terminalFields["producerUID"].(map[string]any)["maxLength"] != 128 || terminalFields["mutationReceiptDigest"].(map[string]any)["maxLength"] != 64 || terminals["maxItems"] != 64 {
+		t.Fatal("mixed references lost existing proof or cohort bounds")
+	}
+}
+
 // The controller deletes the learner-credential Secrets it created
 // (retireLearnerCredential) and the Pods it created. A Role that omits either
 // verb makes learner retirement fail with HTTP 403 at runtime, so the release

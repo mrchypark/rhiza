@@ -31,10 +31,13 @@ func validateIndependentV2(request FenceRequest, evidence *IndependentEvidenceV2
 	}
 	for _, ref := range evidence.Terminals {
 		id := ref.Request.Identity
-		if ref.EvidenceVersion != 2 || id.SourceClusterID != request.SourceClusterID || id.NodeID == "" || id.PodUID == "" || id.RunID == "" ||
-			seen[id.RunID] || ref.Request.OperationID == "" || ref.ProducerUID == "" || ref.ProofName == "" || ref.ProofUID == "" ||
+		pending := ref.EvidenceVersion == 3
+		versionShapeValid := ref.EvidenceVersion == 2 && ref.ProducerUID != "" && validEvidenceDigest(ref.MutationReceiptDigest) ||
+			pending && ref.ProducerUID == "" && ref.MutationReceiptDigest == ""
+		if !versionShapeValid || id.SourceClusterID != request.SourceClusterID || id.NodeID == "" || id.PodUID == "" || id.RunID == "" ||
+			seen[id.RunID] || ref.Request.OperationID == "" || ref.ProofName == "" || ref.ProofUID == "" ||
 			!validEvidenceDigest(ref.Request.RequestHash) || !validEvidenceDigest(ref.RuntimeHash) || !validEvidenceDigest(ref.ProofDigest) ||
-			!validEvidenceDigest(ref.RuntimeReceiptDigest) || !validEvidenceDigest(ref.MutationReceiptDigest) || ref.StorageScopeDigest != hashJSON(evidence.StorageScope) {
+			!validEvidenceDigest(ref.RuntimeReceiptDigest) || ref.StorageScopeDigest != hashJSON(evidence.StorageScope) {
 			return fmt.Errorf("fencing: independent v2 terminal reference differs")
 		}
 		for _, value := range []string{id.SourceClusterID, id.NodeID, id.PodUID, ref.Request.OperationID} {
@@ -143,10 +146,21 @@ func (e *FencingExecutor) independentFence(ctx context.Context, endpoint string,
 		if e.CollectRuntimeEvidence == nil {
 			return ErrFencePending
 		}
-		// Producer admission must already be closed before the runtime provider
-		// acts. This also pins a missing never-bound producer's actual UID.
-		if _, err := e.reserveMutationProducer(ctx, *run.Runtime); err != nil {
-			return err
+		if fencing.RunRole(run) == fencing.StartupRoleLearnerPendingRemove {
+			if err := validatePendingTerminalRun(state, run); err != nil {
+				return err
+			}
+			if err := e.requirePendingProducerAbsent(ctx, *run.Runtime); err != nil {
+				return err
+			}
+		} else if fencing.RunRole(run) == fencing.StartupRoleVoterActive {
+			// Producer admission must already be closed before the runtime provider
+			// acts. This also pins a missing never-bound active producer's UID.
+			if _, err := e.reserveMutationProducer(ctx, *run.Runtime); err != nil {
+				return err
+			}
+		} else {
+			return fmt.Errorf("fencing: closed run role is unsupported for terminal evidence")
 		}
 		receipt, err := e.CollectRuntimeEvidence(ctx, *run.Runtime, *run.Stop)
 		if err != nil {
@@ -169,7 +183,7 @@ func (e *FencingExecutor) independentFence(ctx context.Context, endpoint string,
 	sort.Strings(evidence.CurrentPodUIDs)
 	for _, run := range runs {
 		verificationID := hashJSON([]any{"compose-independent-terminal", hash, storage, run.Identity.RunID})
-		_, ref, err := e.readIndependentTerminal(ctx, *run.Runtime, storage, verificationID)
+		ref, err := e.readIndependentTerminal(ctx, *run.Runtime, storage, verificationID)
 		if err != nil {
 			return err
 		}

@@ -43,20 +43,40 @@ func RuntimeScopeBindingDigest(runtime RuntimeBinding) string {
 	return hex.EncodeToString(digest[:])
 }
 
-func validateTerminalReference(run Run, reference TerminalReference) error {
+func validateTerminalReference(l Ledger, run Run, reference TerminalReference) error {
 	if run.Stop == nil || *run.Stop != reference.Request || reference.Request.Identity != run.Identity {
 		return fmt.Errorf("fencing: independent terminal reference has another closed run")
 	}
 	if run.Runtime == nil || run.Runtime.Validate(run.Identity) != nil || reference.RuntimeHash != RuntimeBindingDigest(*run.Runtime) {
 		return fmt.Errorf("fencing: independent terminal runtime enrollment differs")
 	}
-	if run.MutationProducerUID == "" || reference.ProducerUID != run.MutationProducerUID {
-		return fmt.Errorf("fencing: independent terminal producer enrollment differs")
-	}
-	if reference.EvidenceVersion != 2 || reference.ProofName == "" || len(reference.ProofName) > 63 || reference.ProofUID == "" || len(reference.ProofUID) > 128 {
+	if reference.ProofName == "" || len(reference.ProofName) > 63 || reference.ProofUID == "" || len(reference.ProofUID) > 128 {
 		return fmt.Errorf("fencing: independent terminal evidence identity is incomplete or unsupported")
 	}
-	for _, value := range []string{reference.Request.RequestHash, reference.RuntimeHash, reference.ProofDigest, reference.RuntimeReceiptDigest, reference.MutationReceiptDigest, reference.StorageScopeDigest} {
+	if !mutationDigestValid(reference.Request.RequestHash) || !mutationDigestValid(reference.RuntimeHash) || !mutationDigestValid(reference.ProofDigest) ||
+		!mutationDigestValid(reference.RuntimeReceiptDigest) || !mutationDigestValid(reference.StorageScopeDigest) {
+		return fmt.Errorf("fencing: independent terminal evidence digest is incomplete")
+	}
+	switch reference.EvidenceVersion {
+	case 2:
+		if RunRole(run) != StartupRoleVoterActive || run.MutationProducerUID == "" || reference.ProducerUID != run.MutationProducerUID ||
+			!mutationDigestValid(reference.MutationReceiptDigest) {
+			return fmt.Errorf("fencing: independent terminal producer enrollment differs")
+		}
+	case 3:
+		closed := l.ClosedBy != ""
+		if nodeClosure, ok := l.ClosedNodes[run.Identity.NodeID]; ok && nodeClosure.OperationID != "" && nodeClosure.RequestHash != "" {
+			closed = true
+		}
+		if RunRole(run) != StartupRoleLearnerPendingRemove || run.Promotion != nil || !l.RequireRuntimeBinding || !l.RequireMutationJournal || !closed ||
+			run.MutationProducerUID != "" || run.MutationScopeHash != "" || run.MutationProfile != "" || run.MutationStageIncarnation != "" ||
+			reference.ProducerUID != "" || reference.MutationReceiptDigest != "" {
+			return fmt.Errorf("fencing: pending terminal evidence is outside closed no-producer authority")
+		}
+	default:
+		return fmt.Errorf("fencing: independent terminal evidence version is unsupported")
+	}
+	for _, value := range []string{reference.Request.RequestHash, reference.RuntimeHash, reference.ProofDigest, reference.RuntimeReceiptDigest, reference.StorageScopeDigest} {
 		if !mutationDigestValid(value) {
 			return fmt.Errorf("fencing: independent terminal evidence digest is incomplete")
 		}
@@ -75,7 +95,7 @@ func (l *Ledger) RecordIndependentTerminal(reference TerminalReference) error {
 	if !exists || run.Identity.SourceClusterID != l.SourceClusterID {
 		return fmt.Errorf("fencing: independent terminal run is not enrolled")
 	}
-	if err := validateTerminalReference(run, reference); err != nil {
+	if err := validateTerminalReference(*l, run, reference); err != nil {
 		return err
 	}
 	if run.IndependentTerminal != nil && *run.IndependentTerminal != reference {
@@ -95,7 +115,7 @@ func (l *Ledger) IndependentTerminal(runID, storageScopeDigest string) (Terminal
 		return TerminalReference{}, fmt.Errorf("fencing: no retained independent terminal evidence")
 	}
 	reference := *run.IndependentTerminal
-	if err := validateTerminalReference(run, reference); err != nil {
+	if err := validateTerminalReference(*l, run, reference); err != nil {
 		return TerminalReference{}, err
 	}
 	if reference.StorageScopeDigest != storageScopeDigest {

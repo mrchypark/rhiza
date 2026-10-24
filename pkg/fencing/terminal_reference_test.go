@@ -145,3 +145,128 @@ func TestIndependentTerminalReferenceReloadRevalidatesEveryBinding(t *testing.T)
 		t.Fatal("exact reload changed evidence")
 	}
 }
+
+func pendingTerminalFixture(t *testing.T) (*Ledger, TerminalReference) {
+	t.Helper()
+	id := testIdentity()
+	id.WALIdentity = ""
+	l := &Ledger{SourceClusterID: id.SourceClusterID, RequireRuntimeBinding: true, RequireMutationJournal: true}
+	runtime := enrolledRuntime(id, "pending-container")
+	mustJournal(t, l.RegisterEnrolledWithRole(id, runtime, StartupRoleLearnerPendingRemove))
+	id.WALIdentity = "pending-wal"
+	mustJournal(t, l.Bind(id))
+	mustJournal(t, l.CloseNodes("pending-stop", journalTestDigest, []string{id.NodeID}))
+	return l, TerminalReference{
+		EvidenceVersion: 3, Request: *l.Runs[id.RunID].Stop, RuntimeHash: RuntimeBindingDigest(runtime),
+		ProofName: "rhiza-terminal-pending", ProofUID: "proof-uid", ProofDigest: journalTestDigest,
+		RuntimeReceiptDigest: journalTestDigest, StorageScopeDigest: journalTestDigest,
+	}
+}
+
+func TestPendingLearnerTerminalReferenceRequiresClosedNoProducerProfile(t *testing.T) {
+	l, reference := pendingTerminalFixture(t)
+	mustJournal(t, l.RecordIndependentTerminal(reference))
+	got, err := l.IndependentTerminal(reference.Request.Identity.RunID, journalTestDigest)
+	mustJournal(t, err)
+	if got != reference {
+		t.Fatal("pending terminal reference changed on read")
+	}
+	for name, mutate := range map[string]func(*Ledger, *TerminalReference){
+		"active role": func(v *Ledger, _ *TerminalReference) {
+			run := v.Runs[reference.Request.Identity.RunID]
+			run.Role = StartupRoleVoterActive
+			v.Runs[reference.Request.Identity.RunID] = run
+		},
+		"promotion": func(v *Ledger, _ *TerminalReference) {
+			run := v.Runs[reference.Request.Identity.RunID]
+			run.Promotion = &LearnerPromotion{OperationID: "promotion", EvidenceHash: journalTestDigest}
+			v.Runs[reference.Request.Identity.RunID] = run
+		},
+		"producer uid":          func(_ *Ledger, ref *TerminalReference) { ref.ProducerUID = "forged" },
+		"mutation digest":       func(_ *Ledger, ref *TerminalReference) { ref.MutationReceiptDigest = journalTestDigest },
+		"changed original stop": func(_ *Ledger, ref *TerminalReference) { ref.Request.OperationID = "replacement-stop" },
+		"runtime profile missing": func(v *Ledger, _ *TerminalReference) { v.RequireRuntimeBinding = false },
+		"scope profile missing": func(v *Ledger, _ *TerminalReference) { v.RequireMutationJournal = false },
+		"producer scope present": func(v *Ledger, _ *TerminalReference) {
+			run := v.Runs[reference.Request.Identity.RunID]
+			run.MutationScopeHash = journalTestDigest
+			v.Runs[reference.Request.Identity.RunID] = run
+		},
+		"producer execution profile present": func(v *Ledger, _ *TerminalReference) {
+			run := v.Runs[reference.Request.Identity.RunID]
+			run.MutationProfile = "unexpected"
+			v.Runs[reference.Request.Identity.RunID] = run
+		},
+		"producer stage incarnation present": func(v *Ledger, _ *TerminalReference) {
+			run := v.Runs[reference.Request.Identity.RunID]
+			run.MutationStageIncarnation = journalTestDigest
+			v.Runs[reference.Request.Identity.RunID] = run
+		},
+		"not closed":          func(v *Ledger, _ *TerminalReference) { v.ClosedBy = ""; v.ClosedNodes = nil },
+		"unsupported version": func(_ *Ledger, ref *TerminalReference) { ref.EvidenceVersion = 4 },
+	} {
+		t.Run(name, func(t *testing.T) {
+			candidate := *l
+			candidate.Runs = map[string]Run{}
+			for id, run := range l.Runs {
+				candidate.Runs[id] = run
+			}
+			candidate.ClosedNodes = map[string]StopRequest{}
+			for id, stop := range l.ClosedNodes {
+				candidate.ClosedNodes[id] = stop
+			}
+			ref := reference
+			mutate(&candidate, &ref)
+			run := candidate.Runs[reference.Request.Identity.RunID]
+			run.IndependentTerminal = &ref
+			candidate.Runs[reference.Request.Identity.RunID] = run
+			if _, err := candidate.IndependentTerminal(reference.Request.Identity.RunID, journalTestDigest); err == nil {
+				t.Fatal("invalid pending terminal reference was accepted")
+			}
+		})
+	}
+}
+
+func TestPendingLearnerTerminalPromotionClosureInterleavings(t *testing.T) {
+	// Promotion wins first: a stale pending V3 reference must no longer satisfy
+	// the V2/active-voter terminal contract or be attached to the promoted run.
+	identity := testIdentity()
+	identity.WALIdentity = "pending-wal"
+	active := &Ledger{SourceClusterID: identity.SourceClusterID, RequireRuntimeBinding: true, RequireMutationJournal: true}
+	runtime := enrolledRuntime(identity, "pending-container")
+	initial := identity
+	initial.WALIdentity = ""
+	mustJournal(t, active.RegisterEnrolledWithRole(initial, runtime, StartupRoleLearnerPendingRemove))
+	mustJournal(t, active.Bind(identity))
+	if err := active.PromoteLearner(identity, "promotion", journalTestDigest); err != nil {
+		t.Fatalf("promote before closure: %v", err)
+	}
+	if err := active.CloseNodes("pending-stop", journalTestDigest, []string{identity.NodeID}); err != nil {
+		t.Fatalf("close promoted active voter: %v", err)
+	}
+	run := active.Runs[identity.RunID]
+	stalePending := TerminalReference{EvidenceVersion: 3, Request: *run.Stop, RuntimeHash: RuntimeBindingDigest(runtime),
+		ProofName: "pending-proof", ProofUID: "proof-uid", ProofDigest: journalTestDigest,
+		RuntimeReceiptDigest: journalTestDigest, StorageScopeDigest: journalTestDigest}
+	if err := active.RecordIndependentTerminal(stalePending); err == nil {
+		t.Fatal("stale V3 pending reference accepted after promotion; active V2 obligations must remain")
+	}
+	if RunRole(run) != StartupRoleVoterActive || run.Promotion == nil {
+		// Producer enrollment is an operator obligation; the pure ledger test
+		// checks that V3 cannot substitute for active-voter V2 evidence.
+		t.Fatalf("promotion winner was not retained as active: %+v", run)
+	}
+
+	// Closure wins first: neither node-scoped nor generation-scoped closure
+	// admits promotion afterward.
+	closed, pending := pendingTerminalFixture(t)
+	if err := closed.PromoteLearner(pending.Request.Identity, "promotion", journalTestDigest); err == nil {
+		t.Fatal("promotion succeeded after node closure")
+	}
+	if err := closed.Close("generation-stop", strings.Repeat("c", 64)); err != nil {
+		t.Fatalf("generation closure after node closure: %v", err)
+	}
+	if err := closed.PromoteLearner(pending.Request.Identity, "promotion", journalTestDigest); err == nil {
+		t.Fatal("promotion succeeded after generation closure")
+	}
+}

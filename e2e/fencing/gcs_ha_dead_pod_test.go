@@ -308,12 +308,28 @@ func TestVerifyIndependentVoterProofBindsExactGCSIncarnation(t *testing.T) {
 			RuntimeHash: fencing.RuntimeBindingDigest(runtime), ProducerUID: producerUID, ProofName: "proof", ProofUID: "proof-uid",
 			ProofDigest: strings.Repeat("d", 64), RuntimeReceiptDigest: strings.Repeat("e", 64), MutationReceiptDigest: strings.Repeat("f", 64), StorageScopeDigest: scopeDigest}},
 	}
+	evidence.Terminals = append(evidence.Terminals, fencing.TerminalReference{EvidenceVersion: 3,
+		Request: fencing.StopRequest{OperationID: "stop-pending", RequestHash: strings.Repeat("1", 64), Identity: fencing.Identity{
+			SourceClusterID: source.ClusterID, NodeID: "learner-0", PodName: "rhiza-voter-0", PodUID: "learner-pod", RunID: "pending-run"}},
+		RuntimeHash: strings.Repeat("2", 64), ProofName: "pending-proof", ProofUID: "pending-proof-uid",
+		ProofDigest: strings.Repeat("3", 64), RuntimeReceiptDigest: strings.Repeat("4", 64), StorageScopeDigest: scopeDigest})
 	proof := operator.FenceProof{OperationID: request.OperationID, SourceClusterID: source.ClusterID, BindingUID: source.BindingUID,
 		RequestHash: evidence.RequestHash, ProcessesTerminated: true, RecreationBlocked: true, StorageQuiesced: true, IndependentV2: evidence}
 	proof.ProofID = "independent-v2-" + fmt.Sprintf("%x", sha256.Sum256(encoded(evidence)))
 	item := obj{"metadata": obj{"name": "fence", "uid": "fence-uid"}, "spec": request, "status": obj{"proof": proof}}
 	if _, _, err := verifyIndependentVoterProof(item, source, target, runtime, producerUID); err != nil {
-		t.Fatalf("valid exact voter proof rejected: %v", err)
+		t.Fatalf("valid active-voter V2 proof with historical pending V3 reference rejected: %v", err)
+	}
+	v3OnlyEvidence := *evidence
+	v3OnlyEvidence.Terminals = append([]fencing.TerminalReference(nil), evidence.Terminals...)
+	v3OnlyEvidence.Terminals[0].EvidenceVersion = 3
+	v3OnlyEvidence.Terminals[0].ProducerUID = ""
+	v3OnlyEvidence.Terminals[0].MutationReceiptDigest = ""
+	v3OnlyProof := proof
+	v3OnlyProof.IndependentV2 = &v3OnlyEvidence
+	v3OnlyProof.ProofID = "independent-v2-" + fmt.Sprintf("%x", sha256.Sum256(encoded(&v3OnlyEvidence)))
+	if _, _, err := verifyIndependentVoterProof(obj{"spec": request, "status": obj{"proof": v3OnlyProof}}, source, target, runtime, producerUID); err == nil {
+		t.Fatal("accepted a V3 pending learner reference as the captured active voter terminal")
 	}
 
 	badRequest := request

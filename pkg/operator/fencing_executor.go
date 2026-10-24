@@ -222,6 +222,33 @@ func (e *FencingExecutor) initializeRoot(ctx context.Context, uid, source string
 	return e.AuthorityState.ensureRootGenesis(ctx, identity)
 }
 
+// rejectClosedCanonicalStartup applies the global generation closure before a
+// register request resolves any learner or voter grant. It deliberately does
+// not treat per-node closure as generation-wide closure; the final ledger CAS
+// remains the admission boundary for races after this read.
+func (e *FencingExecutor) rejectClosedCanonicalStartup(ctx context.Context, uid, source string) error {
+	if e == nil || e.AuthorityState == nil {
+		// Explicit legacy cooperative mode has no canonical root to inspect. Its
+		// existing path remains unchanged; configured canonical stores never fall
+		// back here after a read error.
+		return nil
+	}
+	state, _, err := e.AuthorityState.ReadRoot(ctx, uid, source)
+	if err != nil {
+		return fmt.Errorf("fencing: canonical startup authority unavailable: %w", err)
+	}
+	if state.StatefulSetUID != uid || state.Ledger.SourceClusterID != source {
+		return fmt.Errorf("fencing: canonical startup authority identity differs")
+	}
+	if state.Ledger.ClosedBy == "" && state.Ledger.ClosedHash == "" {
+		return nil
+	}
+	if state.Ledger.ClosedBy == "" || !validEvidenceDigest(state.Ledger.ClosedHash) {
+		return fmt.Errorf("fencing: canonical generation closure is malformed")
+	}
+	return fencing.ErrClosed
+}
+
 func (e *FencingExecutor) validateMutationJournalProfile(state fenceLedger) error {
 	if e != nil && e.RequireMutationJournal && !fencing.MutationProfileSupported(e.sourceMutationProfile()) {
 		return fmt.Errorf("fencing: configured source mutation profile is unsupported")
@@ -419,11 +446,18 @@ func (e *FencingExecutor) handle(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, "authority unavailable", http.StatusServiceUnavailable)
 			return
 		}
-		log.Printf("fencing supervisor authentication rejected: action=%s podUID=%s error=%v", message.Action, message.Identity.PodUID, err)
+		log.Printf("fencing supervisor authentication rejected: action=%s podUID=%s error=%s", safeFenceLogField(message.Action, 128), safeFenceLogField(message.Identity.PodUID, 256), safeFenceLogField(err.Error(), 512))
 		http.Error(w, "supervisor identity rejected", http.StatusForbidden)
 		return
 	}
+	if message.Action == "register" && (message.Drain != nil || message.Request != nil || message.MutationLookup != nil || message.ArchiveGenesis != nil || message.LearnerIdentity != nil) {
+		http.Error(w, "malformed registration", http.StatusBadRequest)
+		return
+	}
+	registrationStage := ""
+	grantResolved := false
 	if message.Action == "register" {
+		registrationStage = startupRegistrationStageRootInit
 		// Persist the immutable profile claim before enrollment or any admission
 		// side effect. A failed enrollment leaves a required, retryable root.
 		err = registerStageError("root-init", e.initializeRoot(r.Context(), uid, message.Identity.SourceClusterID))
@@ -433,15 +467,16 @@ func (e *FencingExecutor) handle(w http.ResponseWriter, r *http.Request) {
 		startupGrant.Identity.PodName = message.Identity.NodeID
 	}
 	if err == nil && message.Action == "register" {
-		startupGrant, err = e.resolveStartupGrant(r.Context(), uid, message.Identity)
-		err = registerStageError("startup-grant", err)
+		registrationStage = startupRegistrationStageGrant
+		err = registerStageError("startup-grant", e.rejectClosedCanonicalStartup(r.Context(), uid, message.Identity.SourceClusterID))
+		if err == nil {
+			startupGrant, err = e.resolveStartupGrant(r.Context(), uid, message.Identity)
+			err = registerStageError("startup-grant", err)
+			grantResolved = err == nil
+		}
 	}
 	var enrolled *fencing.RuntimeBinding
 	if err == nil && message.Action == "register" && e.RuntimeAgent != nil {
-		if message.Drain != nil || message.Request != nil || message.MutationLookup != nil {
-			http.Error(w, "malformed runtime registration", http.StatusBadRequest)
-			return
-		}
 		base, enrollErr := e.RuntimeAgent.enrollmentBase(r.Context(), e.Kube.Namespace, uid, startupGrant.Identity)
 		if enrollErr == nil {
 			var binding fencing.RuntimeBinding
@@ -451,7 +486,7 @@ func (e *FencingExecutor) handle(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 		if enrollErr != nil {
-			log.Printf("runtime enrollment pending: podUID=%s runID=%s error=%v", message.Identity.PodUID, message.Identity.RunID, enrollErr)
+			log.Printf("runtime enrollment pending: podUID=%s runID=%s error=%s", safeFenceLogField(message.Identity.PodUID, 256), safeFenceLogField(message.Identity.RunID, 128), safeFenceLogField(enrollErr.Error(), 512))
 			http.Error(w, "runtime enrollment unavailable", http.StatusServiceUnavailable)
 			return
 		}
@@ -477,7 +512,7 @@ func (e *FencingExecutor) handle(w http.ResponseWriter, r *http.Request) {
 				http.Error(w, "authority unavailable", http.StatusServiceUnavailable)
 				return
 			}
-			log.Printf("fencing learner identity registration rejected: podUID=%s error=%v", message.Identity.PodUID, err)
+			log.Printf("fencing learner identity registration rejected: podUID=%s error=%s", safeFenceLogField(message.Identity.PodUID, 256), safeFenceLogField(err.Error(), 512))
 			http.Error(w, "learner identity registration rejected", http.StatusConflict)
 			return
 		}
@@ -519,6 +554,9 @@ func (e *FencingExecutor) handle(w http.ResponseWriter, r *http.Request) {
 		}
 	} else {
 		if err == nil {
+			if message.Action == "register" {
+				registrationStage = startupRegistrationStageLedgerRegister
+			}
 			var changed fenceLedger
 			changed, err = e.change(r.Context(), uid, message.Identity.SourceClusterID, func(l *fencing.Ledger) error {
 				switch message.Action {
@@ -565,9 +603,11 @@ func (e *FencingExecutor) handle(w http.ResponseWriter, r *http.Request) {
 				if enrolled == nil {
 					err = fmt.Errorf("fencing: required archive genesis registration lacks runtime binding")
 				} else {
+					registrationStage = startupRegistrationStageProducerReserve
 					_, err = e.reserveMutationProducer(r.Context(), *enrolled)
 					err = registerStageError("producer-reserve", err)
 					if err == nil {
+						registrationStage = startupRegistrationStageArchiveScope
 						err = registerStageError("archive-scope", e.claimArchiveScopeForRegistration(r.Context(), uid, startupGrant.Identity, *enrolled))
 					}
 				}
@@ -579,18 +619,43 @@ func (e *FencingExecutor) handle(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if errors.Is(err, fencing.ErrClosed) {
+		if message.Action == "register" {
+			var runtimeContainerID string
+			if enrolled != nil {
+				runtimeContainerID = enrolled.ContainerID
+			}
+			_ = emitStartupRegistrationDenial(startupRegistrationDenialEvent{
+				Event: startupRegistrationDenialEventName, Action: "register", Result: "closed", HTTPStatus: http.StatusGone,
+				Stage: registrationStage, Namespace: e.Kube.Namespace, StatefulSetUID: uid, PodUID: message.Identity.PodUID,
+				SourceClusterID: message.Identity.SourceClusterID, AttemptedRunID: message.Identity.RunID,
+				RequestedNodeID: message.Identity.NodeID, GrantResolved: grantResolved,
+				ResolvedNodeID: func() string {
+					if grantResolved {
+						return startupGrant.Identity.NodeID
+					}
+					return ""
+				}(),
+				AssignmentID: func() string {
+					if grantResolved {
+						return startupGrant.Identity.AssignmentID
+					}
+					return ""
+				}(),
+				RuntimeContainerID: runtimeContainerID,
+			})
+		}
 		w.WriteHeader(http.StatusGone)
 		return
 	}
 	if err != nil {
 		if transientFenceAuthority(err) {
 			if message.Action == "register" && strings.HasPrefix(err.Error(), "fencing: register root-init rejected: fencing: root-init phase=") {
-				log.Printf("fencing supervisor transition rejected: action=%s podUID=%s error=%v", message.Action, message.Identity.PodUID, err)
+				log.Printf("fencing supervisor transition rejected: action=%s podUID=%s error=%s", safeFenceLogField(message.Action, 128), safeFenceLogField(message.Identity.PodUID, 256), safeFenceLogField(err.Error(), 512))
 			}
 			http.Error(w, "authority unavailable", http.StatusServiceUnavailable)
 			return
 		}
-		log.Printf("fencing supervisor transition rejected: action=%s podUID=%s error=%v", message.Action, message.Identity.PodUID, err)
+		log.Printf("fencing supervisor transition rejected: action=%s podUID=%s error=%s", safeFenceLogField(message.Action, 128), safeFenceLogField(message.Identity.PodUID, 256), safeFenceLogField(err.Error(), 512))
 		http.Error(w, "fencing transition rejected", http.StatusConflict)
 		return
 	}
@@ -1050,7 +1115,7 @@ func (e *FencingExecutor) validateCanonicalLearnerFence(ctx context.Context, req
 				return fmt.Errorf("fencing: canonical old-voter run is not terminally closed")
 			}
 			verificationID := hashJSON([]any{"compose-independent-terminal", requestDigest, storage, run.Identity.RunID})
-			_, ref, err := e.readIndependentTerminal(ctx, *run.Runtime, storage, verificationID)
+			ref, err := e.readIndependentTerminal(ctx, *run.Runtime, storage, verificationID)
 			if err != nil || ref != *run.IndependentTerminal {
 				return errors.Join(err, fmt.Errorf("fencing: canonical old-voter terminal evidence is unavailable"))
 			}

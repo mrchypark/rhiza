@@ -1268,6 +1268,12 @@ func (c *Controller) reconcileClusterMode(ctx context.Context, r *ClusterResourc
 	if version == nil {
 		return c.autoStatus(ctx, r, state, "Observing", "durable cluster binding created")
 	}
+	if err := validateLearnerHistory(state.Learners); err != nil {
+		return block(state, err.Error())
+	}
+	if state.Intent != nil {
+		return c.advanceAutomatic(ctx, r, state, version, sts)
+	}
 	if compacted, err := c.compactLearnerHistory(ctx, r, state); err != nil {
 		return block(state, err.Error())
 	} else if compacted {
@@ -1275,9 +1281,6 @@ func (c *Controller) reconcileClusterMode(ctx context.Context, r *ClusterResourc
 			return err
 		}
 		return c.autoStatus(ctx, r, state, "Observing", "learner history compacted; continue with next reconcile")
-	}
-	if state.Intent != nil {
-		return c.advanceAutomatic(ctx, r, state, version, sts)
 	}
 	if state.BootstrapGenesis != nil {
 		handled, message, err := c.reconcileAutomaticBootstrapGenesis(ctx, r, sts, ctr, env, state, version, members, adopted)

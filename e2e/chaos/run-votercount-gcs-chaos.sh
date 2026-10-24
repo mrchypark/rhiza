@@ -96,6 +96,15 @@ case "$dead_pod" in
   no|yes) ;;
   *) echo 'RHIZA_GCS_DEAD_POD must be yes or no' >&2; exit 2 ;;
 esac
+mixed_pending=${RHIZA_GCS_MIXED_PENDING:-no}
+case "$mixed_pending" in
+  no|yes) ;;
+  *) echo 'RHIZA_GCS_MIXED_PENDING must be yes or no' >&2; exit 2 ;;
+esac
+if [ "$mixed_pending" = yes ] && [ "$RHIZA_CLUSTER_ID" != chaos-source ]; then
+  echo 'mixed-pending qualification requires RHIZA_CLUSTER_ID=chaos-source' >&2
+  exit 2
+fi
 missing_membership_case=${RHIZA_GCS_MISSING_MEMBERSHIP_CASE:-}
 if [ "$missing_membership" = yes ]; then
   case "$missing_membership_case" in
@@ -107,11 +116,11 @@ elif [ -n "$missing_membership_case" ]; then
   exit 2
 fi
 scenario_count=0
-for selected in "$initial_head_ack_loss" "$async_nonempty" "$manual_terminal" "$missing_membership" "$dead_pod"; do
+for selected in "$initial_head_ack_loss" "$async_nonempty" "$manual_terminal" "$missing_membership" "$dead_pod" "$mixed_pending"; do
   [ "$selected" != yes ] || scenario_count=$((scenario_count + 1))
 done
 [ "$scenario_count" -le 1 ] || {
-  echo 'initial-HEAD ACK-loss, async-nonempty, manual-terminal, missing-membership, and dead-Pod qualifications require separate run scopes' >&2
+  echo 'initial-HEAD ACK-loss, async-nonempty, manual-terminal, missing-membership, dead-Pod, and mixed-pending qualifications require separate run scopes' >&2
   exit 2
 }
 
@@ -141,7 +150,7 @@ fi
 
 here=$(cd -- "$(dirname -- "$0")" && pwd)
 source_head=
-if [ "$async_nonempty" = yes ] || [ "$missing_membership" = yes ] || [ "$dead_pod" = yes ]; then
+if [ "$async_nonempty" = yes ] || [ "$missing_membership" = yes ] || [ "$dead_pod" = yes ] || [ "$mixed_pending" = yes ]; then
   source_head=$(git -C "$here/../.." rev-parse --verify HEAD) || {
     echo 'selected GCS qualification requires a readable source revision' >&2
     exit 2
@@ -254,6 +263,38 @@ remove_admin_token=false
 scope_uid_file=$out/gcs-namespace-uid
 scope_nodes_file=$out/gcs-existing-nodes
 cleanup_namespace=false
+mixed_deadline_file=$out/gcs-mixed-deadlines.txt
+mixed_supervisor_pid=
+mixed_supervised_child=${RHIZA_GCS_MIXED_SUPERVISED_CHILD:-no}
+
+load_mixed_deadlines() {
+  [ -f "$mixed_deadline_file" ] && [ ! -L "$mixed_deadline_file" ] &&
+    [ -n "$(find "$mixed_deadline_file" -type f -user "$(id -u)" -perm 0600 -print 2>/dev/null)" ] || {
+      echo 'private mixed-run deadline receipt is missing or unsafe' >&2
+      return 1
+    }
+  mixed_work_deadline=$(sed -n '1p' "$mixed_deadline_file") || return 1
+  mixed_hard_deadline=$(sed -n '2p' "$mixed_deadline_file") || return 1
+  mixed_receipt_run=$(sed -n '3p' "$mixed_deadline_file") || return 1
+  mixed_receipt_namespace=$(sed -n '4p' "$mixed_deadline_file") || return 1
+  mixed_receipt_start=$(sed -n '5p' "$mixed_deadline_file") || return 1
+  [ "$(wc -l < "$mixed_deadline_file" | tr -d ' ')" = 5 ] || return 1
+  printf '%s\n' "$mixed_work_deadline" | LC_ALL=C grep -Eq '^[1-9][0-9]*$' || return 1
+  printf '%s\n' "$mixed_hard_deadline" | LC_ALL=C grep -Eq '^[1-9][0-9]*$' || return 1
+  printf '%s\n' "$mixed_receipt_start" | LC_ALL=C grep -Eq '^[1-9][0-9]*$' || return 1
+  [ "$mixed_receipt_run" = "$RHIZA_RUN_ID" ] && [ "$mixed_receipt_namespace" = "$RHIZA_NAMESPACE" ] || {
+    echo 'private mixed-run deadline receipt belongs to a different run or namespace' >&2
+    return 1
+  }
+  mixed_now=$(date +%s) || return 1
+  case "$mixed_now" in ''|*[!0-9]*) return 1 ;; esac
+  [ "$mixed_hard_deadline" -gt "$mixed_work_deadline" ] &&
+    [ "$mixed_hard_deadline" -le "$((mixed_receipt_start + 3300))" ] &&
+    [ "$((mixed_hard_deadline - mixed_now))" -le 3300 ] || {
+      echo 'private mixed-run deadline receipt is malformed or exceeds the 55-minute cap' >&2
+      return 1
+    }
+}
 
 capture_run_scope() {
   namespace_json=$out/gcs-namespace-current.json
@@ -309,11 +350,26 @@ capture_run_scope() {
   fi
 }
 
+run_cleanup_kubectl() {
+  if [ "$mixed_pending" = yes ] && [ "$mixed_supervised_child" != yes ]; then
+    cleanup_now=$(date +%s) || return 1
+    case "$cleanup_now" in ''|*[!0-9]*) return 1 ;; esac
+    printf '%s\n' "$mixed_hard_deadline" | LC_ALL=C grep -Eq '^[1-9][0-9]*$' || return 1
+    cleanup_remaining=$((mixed_hard_deadline - cleanup_now))
+    [ "$cleanup_remaining" -gt 1 ] || return 1
+    cleanup_request_limit=10
+    [ "$cleanup_remaining" -gt "$cleanup_request_limit" ] || cleanup_request_limit=$((cleanup_remaining - 1))
+    timeout --signal=TERM --kill-after=1s "${cleanup_request_limit}s" kubectl "$@"
+    return $?
+  fi
+  kubectl "$@"
+}
+
 cleanup_owned_namespace() {
   [ -f "$scope_uid_file" ] && [ ! -L "$scope_uid_file" ] || return 1
   expected_uid=$(cat "$scope_uid_file") || return 1
   current=$out/namespace-cleanup-current.json
-  kubectl --context "$RHIZA_KUBE_CONTEXT" get namespace "$RHIZA_NAMESPACE" --ignore-not-found -o json > "$current" 2>/dev/null || return 1
+  run_cleanup_kubectl --context "$RHIZA_KUBE_CONTEXT" get namespace "$RHIZA_NAMESPACE" --ignore-not-found -o json > "$current" 2>/dev/null || return 1
   if [ ! -s "$current" ]; then
     printf '%s\n' 'namespace-absence-observed; cluster-rbac-owner-gc-not-verified' > "$out/namespace-cleanup.status"
     return 0
@@ -327,14 +383,14 @@ cleanup_owned_namespace() {
   [ "$current_uid" = "$expected_uid" ] || return 1
   printf '{"apiVersion":"v1","kind":"DeleteOptions","preconditions":{"uid":"%s","resourceVersion":"%s"}}\n' \
     "$expected_uid" "$current_rv" > "$options" || return 1
-  kubectl --context "$RHIZA_KUBE_CONTEXT" delete --raw "/api/v1/namespaces/$RHIZA_NAMESPACE" \
+  run_cleanup_kubectl --context "$RHIZA_KUBE_CONTEXT" delete --raw "/api/v1/namespaces/$RHIZA_NAMESPACE" \
     -f "$options" >/dev/null 2>&1 || {
       jq -e '(.metadata.deletionTimestamp|type)=="string"' "$current" >/dev/null 2>&1 || return 1
     }
   attempts=0
   while [ "$attempts" -lt 120 ]; do
     observed=$out/namespace-cleanup-observed.txt
-    if kubectl --context "$RHIZA_KUBE_CONTEXT" get namespace "$RHIZA_NAMESPACE" \
+    if run_cleanup_kubectl --context "$RHIZA_KUBE_CONTEXT" get namespace "$RHIZA_NAMESPACE" \
       --ignore-not-found -o name > "$observed" 2>/dev/null; then
       if [ ! -s "$observed" ]; then
         printf '%s\n' 'namespace-absence-observed; cluster-rbac-owner-gc-not-verified' > "$out/namespace-cleanup.status"
@@ -342,6 +398,10 @@ cleanup_owned_namespace() {
       fi
     else
       return 1
+    fi
+    if [ "$mixed_pending" = yes ] && [ "$mixed_supervised_child" != yes ]; then
+      cleanup_now=$(date +%s) || return 1
+      [ "$((mixed_hard_deadline - cleanup_now))" -gt 1 ] || return 1
     fi
     attempts=$((attempts + 1))
     sleep 1
@@ -381,7 +441,8 @@ cleanup() {
       [ "$exit_status" -ne 0 ] || exit_status=1
     fi
   fi
-  if [ "$cleanup_namespace" = true ] && { [ "$mode" = run ] || [ "$exit_status" -ne 0 ]; }; then
+  if [ "$cleanup_namespace" = true ] && [ "$mixed_supervised_child" != yes ] &&
+    { [ "$mode" = run ] || [ "$exit_status" -ne 0 ]; }; then
     if cleanup_owned_namespace; then
       :
     else
@@ -481,8 +542,100 @@ cleanup() {
 trap cleanup EXIT
 trap 'exit 130' HUP INT TERM
 
+if [ "$mixed_pending" = yes ]; then
+  [ -n "$(find "$out" -prune -type d -user "$(id -u)" -perm 0700 -print 2>/dev/null)" ] || {
+    echo 'mixed-run output directory must be private to this user' >&2
+    exit 2
+  }
+  if [ "$mode" = run ] && [ "$mixed_supervised_child" != yes ]; then
+    cleanup_namespace=true
+    remove_admin_token=true
+  fi
+  if [ "$mode" = install ] && [ "$mixed_supervised_child" != yes ]; then
+    [ ! -e "$mixed_deadline_file" ] && [ ! -L "$mixed_deadline_file" ] || {
+      echo 'mixed-run deadline receipt already exists; refusing to reset its budget' >&2
+      exit 2
+    }
+    mixed_start=$(date +%s) || exit 2
+    case "$mixed_start" in ''|*[!0-9]*) echo 'current epoch time is invalid' >&2; exit 2 ;; esac
+    mixed_input_work=${FENCING_E2E_MIXED_WORK_DEADLINE_UNIX:-}
+    mixed_input_hard=${FENCING_E2E_MIXED_HARD_DEADLINE_UNIX:-}
+    [ -z "$mixed_input_work" ] && [ -z "$mixed_input_hard" ] || {
+      [ -n "$mixed_input_work" ] && [ -n "$mixed_input_hard" ] || {
+        echo 'mixed absolute work and hard deadlines must be supplied together' >&2
+        exit 2
+      }
+      printf '%s\n' "$mixed_input_work" | LC_ALL=C grep -Eq '^[1-9][0-9]*$' || exit 2
+      printf '%s\n' "$mixed_input_hard" | LC_ALL=C grep -Eq '^[1-9][0-9]*$' || exit 2
+      mixed_hard_deadline=$mixed_input_hard
+      mixed_work_deadline=$mixed_input_work
+      [ "$mixed_work_deadline" -gt "$mixed_start" ] &&
+        [ "$mixed_hard_deadline" -gt "$mixed_start" ] &&
+        [ "$mixed_hard_deadline" -gt "$mixed_work_deadline" ] &&
+        [ "$((mixed_hard_deadline - mixed_start))" -le 3300 ] || {
+          echo 'provided mixed deadlines are invalid or exceed the 55-minute cap' >&2
+          exit 2
+        }
+    }
+    if [ -z "$mixed_input_work" ]; then
+      mixed_hard_deadline=$((mixed_start + 3300))
+      mixed_work_deadline=$((mixed_hard_deadline - 300))
+    fi
+    mixed_deadline_tmp=$mixed_deadline_file.$$
+    [ ! -e "$mixed_deadline_tmp" ] && [ ! -L "$mixed_deadline_tmp" ] || {
+      echo 'mixed-run deadline receipt temporary path already exists' >&2
+      exit 2
+    }
+    (umask 077; set -C; printf '%s\n%s\n%s\n%s\n%s\n' "$mixed_work_deadline" "$mixed_hard_deadline" \
+      "$RHIZA_RUN_ID" "$RHIZA_NAMESPACE" "$mixed_start" > "$mixed_deadline_tmp") || exit 2
+    chmod 600 "$mixed_deadline_tmp" && ln "$mixed_deadline_tmp" "$mixed_deadline_file" && rm "$mixed_deadline_tmp" || {
+      rm -f "$mixed_deadline_tmp"
+      echo 'mixed-run deadline receipt could not be committed safely' >&2
+      exit 2
+    }
+  else
+    load_mixed_deadlines || exit 2
+  fi
+fi
+
 # GNU timeout is also used by the repository's GCS post-release launcher. The
 # trap is best-effort: SIGKILL, host loss, or an unavailable API can skip cleanup.
+if [ "$mixed_pending" = yes ] && [ "$mixed_supervised_child" != yes ] &&
+  [ "${RHIZA_GCS_DEADLINE_WRAPPED:-no}" != yes ]; then
+  command -v timeout >/dev/null 2>&1 || { echo 'GNU timeout is required for bounded host execution' >&2; exit 2; }
+  load_mixed_deadlines || exit 2
+  mixed_now=$(date +%s) || exit 2
+  mixed_work_remaining=$((mixed_work_deadline - mixed_now))
+  mixed_hard_remaining=$((mixed_hard_deadline - mixed_now))
+  if [ "$mode" = run ]; then
+    cleanup_namespace=true
+    remove_admin_token=true
+  fi
+  if [ "$mixed_hard_remaining" -le 0 ] || [ "$mixed_work_remaining" -le 0 ]; then
+    echo 'mixed work deadline has elapsed; qualification was not started' >&2
+    exit 124
+  fi
+  [ "$mode" = install ] && [ "$mixed_work_remaining" -gt 2100 ] && mixed_work_remaining=2100
+  [ "$mixed_work_remaining" -gt 0 ] || { echo 'mixed work deadline has elapsed' >&2; exit 2; }
+  mixed_term_grace=$((mixed_hard_remaining - mixed_work_remaining - 120))
+  [ "$mixed_term_grace" -gt 0 ] || { echo 'mixed cleanup reserve is exhausted before launch' >&2; exit 2; }
+  export RHIZA_GCS_DEADLINE_WRAPPED=yes
+  export RHIZA_GCS_MIXED_SUPERVISED_CHILD=yes
+  export FENCING_E2E_MIXED_WORK_DEADLINE_UNIX=$mixed_work_deadline
+  export FENCING_E2E_MIXED_HARD_DEADLINE_UNIX=$mixed_hard_deadline
+  mixed_supervisor_status=0
+  timeout --signal=TERM --kill-after="${mixed_term_grace}s" "${mixed_work_remaining}s" \
+    /bin/sh "$0" "$mode" &
+  mixed_supervisor_pid=$!
+  trap 'if [ -n "$mixed_supervisor_pid" ]; then kill -TERM "$mixed_supervisor_pid" 2>/dev/null || :; wait "$mixed_supervisor_pid" || :; fi; cleanup_namespace=true; [ "$mode" != run ] || remove_admin_token=true; exit 130' HUP INT TERM
+  wait "$mixed_supervisor_pid" || mixed_supervisor_status=$?
+  mixed_supervisor_pid=
+  if [ "$mode" = run ] || [ "$mixed_supervisor_status" -ne 0 ]; then
+    cleanup_namespace=true
+  fi
+  exit "$mixed_supervisor_status"
+fi
+
 if [ "${RHIZA_GCS_DEADLINE_WRAPPED:-no}" != yes ]; then
   command -v timeout >/dev/null 2>&1 || { echo 'GNU timeout is required for bounded host execution' >&2; exit 2; }
   case "$mode" in install) host_limit=2100 ;; run) host_limit=3600 ;; esac
@@ -508,6 +661,16 @@ render() {
       -e "s|__HOST_IMAGE__|$RHIZA_APP_IMAGE|g" \
       -e "s|__OPERATOR_IMAGE__|$RHIZA_OPERATOR_IMAGE|g" \
       "$here/votercount_gcs_chaos.yaml.in" > "$out/rendered.yaml"
+  if [ "$mixed_pending" = yes ]; then
+    mixed_gate_render="$out/rendered.mixed-gate.tmp"
+    sed -e 's|{name: RHIZA_QUALIFICATION_REMOVE_GATE_SOURCE, value: ""}|{name: RHIZA_QUALIFICATION_REMOVE_GATE_SOURCE, value: "chaos-source"}|' \
+      "$out/rendered.yaml" > "$mixed_gate_render"
+    [ "$(grep -Fc 'name: RHIZA_QUALIFICATION_REMOVE_GATE_SOURCE, value: "chaos-source"' "$mixed_gate_render")" -eq 1 ] || {
+      echo 'mixed-pending remove gate source did not render exactly once into the voter template' >&2
+      exit 2
+    }
+    mv "$mixed_gate_render" "$out/rendered.yaml"
+  fi
   if [ "$initial_head_ack_loss" = yes ] || [ "$async_nonempty" = yes ]; then
     initial_render="$out/rendered.initial-head.tmp"
     sed -e 's/RHIZA_OBJSTORE_DURABILITY: before-ack/RHIZA_OBJSTORE_DURABILITY: async/' \
@@ -1195,6 +1358,19 @@ if [ "$dead_pod" = yes ]; then
     RHIZA_GCS_PREFIX="$RHIZA_GCS_PREFIX" RHIZA_CLUSTER_ID="$RHIZA_CLUSTER_ID" \
     "$FENCING_E2E_BIN" run-gcs-ha-dead-pod
   echo 'GCS same-ordinal dead-Pod recovery collector completed'
+  exit 0
+fi
+if [ "$mixed_pending" = yes ]; then
+  : "${FENCING_E2E_BIN:?mixed-pending qualification requires the fencing-e2e driver}"
+  [ -x "$FENCING_E2E_BIN" ] || { echo 'FENCING_E2E_BIN is not executable' >&2; exit 2; }
+  step 30-mixed-pending-collector env FENCING_E2E_OUT="$out" RHIZA_KUBE_CONTEXT="$RHIZA_KUBE_CONTEXT" \
+    RHIZA_NAMESPACE="$RHIZA_NAMESPACE" RHIZA_RUN_ID="$RHIZA_RUN_ID" RHIZA_GCS_BUCKET="$RHIZA_GCS_BUCKET" \
+    RHIZA_GCS_PREFIX="$RHIZA_GCS_PREFIX" RHIZA_CLUSTER_ID="$RHIZA_CLUSTER_ID" \
+    RHIZA_GCS_HA_SCENARIO=mixed-pending \
+    FENCING_E2E_MIXED_WORK_DEADLINE_UNIX="$mixed_work_deadline" \
+    FENCING_E2E_MIXED_HARD_DEADLINE_UNIX="$mixed_hard_deadline" \
+    "$FENCING_E2E_BIN" run-gcs-ha-mixed-pending
+  echo 'mixed-pending GCS qualification collector completed'
   exit 0
 fi
 step 30-driver python3 -u "$here/votercount_gcs_chaos.py" \

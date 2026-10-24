@@ -79,12 +79,46 @@ func (c *Controller) advanceAutomatic(ctx context.Context, r *ClusterResource, s
 	if intent.RecoveryUID != "" && (existingErr != nil || str(existing.Metadata["uid"]) != intent.RecoveryUID) {
 		return block("journaled recovery resource was deleted or recreated")
 	}
+	desired := automaticRecoveryChildSpec(r, state, intent)
+	desiredHash := hashJSON(desired)
+	if intent.RecoveryUID == "" && existingErr == nil &&
+		(intent.SpecHash == "" || intent.SpecHash == desiredHash) &&
+		resourceName(&existing) == intent.RecoveryName && str(existing.Metadata["uid"]) != "" &&
+		str(nested(existing.Metadata, "annotations", automaticOwner)) == state.BindingUID &&
+		str(nested(existing.Metadata, "annotations", automaticLogical)) == r.Spec.LogicalID &&
+		hashJSON(existing.Spec) == desiredHash {
+		intent.RecoveryUID = str(existing.Metadata["uid"])
+		intent.SpecHash = desiredHash
+		if intent.LearnerPodName != "" {
+			assignment, err := sameOrdinalAssignmentDigest(state, intent)
+			if err != nil {
+				return block("same-ordinal assignment binding is incomplete")
+			}
+			intent.LearnerAssignmentID = assignment
+		}
+		if err := c.saveAuto(ctx, r, state, version); err != nil {
+			return err
+		}
+		return c.autoStatus(ctx, r, state, "Recovering", "existing exact recovery child authorized by durable UID and specification")
+	}
 	if intent.Failed != "" && existing.Status.Phase != "Complete" {
 		if handled, err := c.recoverLearnerInventory(ctx, r, state, version, sts); handled || err != nil {
 			return err
 		}
+		// A live learner with a reserved UID cannot pass startup until its exact
+		// child revision is persisted below. Keep quorum assessment ahead of child
+		// execution, but defer its health gate.
+		deferLearnerHealth := intent.LearnerUID != "" && !intent.Aborting && hashJSON(existing.Spec) != hashJSON(desired)
+		if deferLearnerHealth {
+			var learnerPod object
+			err := c.Kube.Get(ctx, c.corePath("pods", learnerPhysicalPod(intent)), &learnerPod)
+			if err != nil && !apiNotFound(err) {
+				return err
+			}
+			deferLearnerHealth = err == nil && str(nested(learnerPod, "metadata", "uid")) == intent.LearnerUID && nested(learnerPod, "metadata", "deletionTimestamp") == nil
+		}
 		handled := false
-		if intent.LearnerUID != "" {
+		if !deferLearnerHealth && intent.LearnerUID != "" {
 			before := hashJSON(state)
 			var err error
 			handled, err = c.handleAutomaticLearner(ctx, r, state, version, sts, &existing)
@@ -106,7 +140,6 @@ func (c *Controller) advanceAutomatic(ctx context.Context, r *ClusterResource, s
 			}
 		}
 	}
-	desired := automaticRecoveryChildSpec(r, state, intent)
 	var child Resource
 	err := c.Kube.Get(ctx, c.resourcePath(intent.RecoveryName), &child)
 	if err != nil {
@@ -124,15 +157,21 @@ func (c *Controller) advanceAutomatic(ctx context.Context, r *ClusterResource, s
 			return err
 		}
 	}
+	// The earlier read is only a preflight. The child can be deleted and
+	// recreated before this revision read, so re-check its durable UID before
+	// reserving or writing any specification revision.
+	if intent.RecoveryUID != "" && str(child.Metadata["uid"]) != intent.RecoveryUID {
+		return block("recovery resource UID changed")
+	}
 	if str(nested(child.Metadata, "annotations", automaticOwner)) != state.BindingUID || str(nested(child.Metadata, "annotations", automaticLogical)) != r.Spec.LogicalID {
 		return block("recovery resource differs from frozen automatic intent")
 	}
 	if intent.RecoveryUID == "" {
-		intent.RecoveryUID = str(child.Metadata["uid"])
-		intent.SpecHash = hashJSON(desired)
-		if intent.RecoveryUID == "" {
-			return block("recovery resource UID is unavailable")
+		if resourceName(&child) != intent.RecoveryName || str(child.Metadata["uid"]) == "" || hashJSON(child.Spec) != desiredHash {
+			return block("uncheckpointed recovery resource differs from the desired specification")
 		}
+		intent.RecoveryUID = str(child.Metadata["uid"])
+		intent.SpecHash = desiredHash
 		if intent.LearnerPodName != "" {
 			assignment, err := sameOrdinalAssignmentDigest(state, intent)
 			if err != nil {
@@ -175,6 +214,13 @@ func (c *Controller) advanceAutomatic(ctx context.Context, r *ClusterResource, s
 	}
 	if str(child.Metadata["uid"]) != intent.RecoveryUID {
 		return block("recovery resource UID changed")
+	}
+	if intent.Failed != "" && child.Status.Phase != "Complete" && intent.LearnerUID != "" && !intent.Aborting {
+		before := hashJSON(state)
+		handled, err := c.handleAutomaticLearner(ctx, r, state, version, sts, &child)
+		if err != nil || handled || hashJSON(state) != before {
+			return err
+		}
 	}
 	if child.Status.Phase != "Complete" {
 		return c.autoStatus(ctx, r, state, "Recovering", child.Status.Phase+": "+child.Status.Message)

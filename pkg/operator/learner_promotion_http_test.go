@@ -94,7 +94,30 @@ func (b *learnerPromotionPinFaultBucket) faultState() (fired, failNextRead bool)
 	return b.fired, b.failNextRead
 }
 
+type authenticatedPendingLearnerSetup struct {
+	ctx        context.Context
+	f          automaticBootstrapGenesisFixture
+	controller *Controller
+	cluster    ClusterResource
+	sts        object
+	state      *autoControl
+	intent     *autoIntent
+	child      Resource
+	client     fencing.AuthorityClient
+	physicalID fencing.Identity
+	grant      fencing.StartupGrant
+	oldTarget  FenceTarget
+	request    FenceRequest
+}
+
 func TestAuthenticatedLearnerPromotionRetriesExactCanonicalCompletion(t *testing.T) {
+	runAuthenticatedLearnerPromotionRetriesExactCanonicalCompletion(t, nil)
+}
+
+// The callback lets the late-upload regression exercise the same canonical,
+// authenticated open pending assignment without weakening this full promotion
+// test or introducing a production hook.
+func runAuthenticatedLearnerPromotionRetriesExactCanonicalCompletion(t *testing.T, onPending func(*testing.T, authenticatedPendingLearnerSetup)) {
 	ctx := t.Context()
 	f := newAutomaticBootstrapGenesisFixture(t)
 	// Model the actual supervised workload before the fixture computes its
@@ -383,6 +406,12 @@ func TestAuthenticatedLearnerPromotionRetriesExactCanonicalCompletion(t *testing
 	grant, err := client.RegisterStartup(ctx, physicalID)
 	if err != nil || grant.Role != fencing.StartupRoleLearnerPendingRemove || grant.Identity != physicalID {
 		t.Fatalf("authenticated registration did not retain the pending logical identity: grant=%+v err=%v", grant, err)
+	}
+	if onPending != nil {
+		onPending(t, authenticatedPendingLearnerSetup{ctx: ctx, f: f, controller: controller, cluster: cluster, sts: sts,
+			state: state, intent: intent, child: child, client: client, physicalID: physicalID, grant: grant,
+			oldTarget: oldTarget, request: request})
+		return
 	}
 
 	// Exercise the same canonical terminal-authority fixture with a standalone

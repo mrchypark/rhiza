@@ -104,6 +104,10 @@ func (c *Controller) compactLearnerHistory(ctx context.Context, r *ClusterResour
 	if err := validateLearnerHistory(state.Learners); err != nil {
 		return false, err
 	}
+	journalRefs, err := c.journalReferencedLearners(ctx, r, state)
+	if err != nil {
+		return false, err
+	}
 	protected := make(map[string]bool)
 	for _, voter := range state.Voters {
 		protected[string(voter.NodeID)] = true
@@ -123,7 +127,7 @@ func (c *Controller) compactLearnerHistory(ctx context.Context, r *ClusterResour
 	}
 	retained := make([]learnerIncarnation, 0, len(state.Learners))
 	for _, entry := range state.Learners {
-		if protected[string(entry.Target.NodeID)] || protected[entry.Target.Pod] {
+		if protected[string(entry.Target.NodeID)] || protected[entry.Target.Pod] || journalRefs[learnerHistoryKey(entry)] {
 			retained = append(retained, entry)
 			continue
 		}
@@ -154,6 +158,58 @@ func (c *Controller) compactLearnerHistory(ctx context.Context, r *ClusterResour
 		return changed, fmt.Errorf("learner history has %d entries and cannot be compacted; restore canonical fencing evidence for the affected generations or remove verified completed generation learners", len(state.Learners))
 	}
 	return changed, nil
+}
+
+func learnerHistoryKey(entry learnerIncarnation) string {
+	return hashJSON([]string{entry.SourceClusterID, entry.Target.PodUID})
+}
+
+// journalReferencedLearners retains the exact history entry needed to validate
+// a still-journaled ADD. An unresolved canonical child blocks compaction rather
+// than guessing which old credential the journal references.
+func (c *Controller) journalReferencedLearners(ctx context.Context, r *ClusterResource, state *autoControl) (map[string]bool, error) {
+	intent := state.Intent
+	if intent == nil || intent.RecoveryName == "" {
+		return nil, nil
+	}
+	var child Resource
+	err := c.Kube.Get(ctx, c.resourcePath(intent.RecoveryName), &child)
+	if intent.RecoveryUID == "" || intent.SpecHash == "" {
+		if apiNotFound(err) {
+			return nil, nil
+		}
+		return nil, fmt.Errorf("canonical recovery child checkpoint is incomplete; refusing learner-history compaction")
+	}
+	if err != nil {
+		return nil, fmt.Errorf("resolve canonical recovery child before learner-history compaction: %w", err)
+	}
+	if resourceName(&child) != intent.RecoveryName || str(child.Metadata["uid"]) != intent.RecoveryUID ||
+		hashJSON(child.Spec) != intent.SpecHash ||
+		str(nested(child.Metadata, "annotations", automaticOwner)) != state.BindingUID ||
+		str(nested(child.Metadata, "annotations", automaticLogical)) != r.Spec.LogicalID {
+		return nil, fmt.Errorf("canonical recovery child differs from intent; refusing learner-history compaction")
+	}
+	if child.Status.Membership == nil || child.Status.Membership.Add == nil {
+		return nil, nil
+	}
+	if child.Spec.Membership == nil {
+		return nil, fmt.Errorf("canonical recovery ADD has no membership specification; refusing learner-history compaction")
+	}
+	add := child.Status.Membership.Add
+	var match *learnerIncarnation
+	for i := range state.Learners {
+		entry := &state.Learners[i]
+		if entry.SourceClusterID == child.Spec.SourceClusterID && string(entry.Target.NodeID) == string(add.MemberID) && entry.CredentialUID == add.SecretUID {
+			if match != nil {
+				return nil, fmt.Errorf("canonical recovery ADD matches multiple learner histories; refusing compaction")
+			}
+			match = entry
+		}
+	}
+	if match == nil || add.OperationID != membershipOperationID(&child, "add") || add.RequestHash == "" || add.SecretResourceVer == "" {
+		return nil, fmt.Errorf("canonical recovery ADD does not resolve to one exact learner history; refusing compaction")
+	}
+	return map[string]bool{learnerHistoryKey(*match): true}, nil
 }
 
 func (c *Controller) learnerPodUIDGone(ctx context.Context, name, uid string) bool {
