@@ -320,31 +320,69 @@ func TestImmutableImageResolutionDescriptors(t *testing.T) {
 	}
 	manifest := `{"digest":"` + config + `","size":708,"mediaType":"application/vnd.oci.image.manifest.v1+json","annotations":{"tag":"host"}}`
 	alias := strings.Replace(manifest, `"host"`, `"operator"`, 1)
+	platformAlias := strings.Replace(manifest, `,"annotations"`, `,"platform":{"os":"linux","architecture":"amd64"},"annotations"`, 1)
+	platformAliasOtherTag := strings.Replace(platformAlias, `"host"`, `"operator"`, 1)
 	index := func(second string) string { return `{"manifests":[` + manifest + `,` + second + `]}` }
+	amd64 := `sha256:` + strings.Repeat("b", 64)
+	arm64 := `sha256:` + strings.Repeat("c", 64)
+	attestation := `sha256:` + strings.Repeat("d", 64)
+	platformManifest := func(digest string, size int, os, architecture string, variants ...string) string {
+		variant := ""
+		if len(variants) > 0 {
+			variant = fmt.Sprintf(`,"variant":%q`, variants[0])
+		}
+		return fmt.Sprintf(`{"digest":%q,"size":%d,"mediaType":"application/vnd.oci.image.manifest.v1+json","platform":{"os":%q,"architecture":%q%s}}`, digest, size, os, architecture, variant)
+	}
+	platformIndex := func(entries ...string) string { return `{"manifests":[` + strings.Join(entries, ",") + `]}` }
+	linuxAMD64 := imagePlatform{OS: "linux", Architecture: "amd64"}
+	linuxARM64 := imagePlatform{OS: "linux", Architecture: "arm64"}
+	linuxARMv6 := imagePlatform{OS: "linux", Architecture: "arm", Variant: "v6"}
+	linuxARMv7 := imagePlatform{OS: "linux", Architecture: "arm", Variant: "v7"}
 	for _, tc := range []struct {
-		body  string
-		valid bool
+		name     string
+		body     string
+		platform imagePlatform
+		want     string
+		valid    bool
 	}{
-		{`{"config":{"digest":"` + config + `"}}`, true},
-		{`{"manifests":[{"digest":"` + config + `"}]}`, true},
-		{`{"manifests":[{"digest":"` + config + `"},{"digest":"` + config + `"}]}`, false},
-		{index(alias), true},
-		{index(strings.Replace(alias, config, "sha256:"+strings.Repeat("b", 64), 1)), false},
-		{index(strings.Replace(alias, `"size":708`, `"size":709`, 1)), false},
-		{index(strings.Replace(alias, "application/vnd.oci.image.manifest.v1+json", "application/vnd.docker.distribution.manifest.v2+json", 1)), false},
-		{index(strings.Replace(alias, `"size":708`, `"size":708,"platform":{"architecture":"arm64","os":"linux"}`, 1)), false},
-		{`{"config":{"digest":"image:local"}}`, false},
-		{`{}`, false},
+		{name: "config manifest", body: `{"config":{"digest":"` + config + `"}}`, want: config, valid: true},
+		{name: "single child without platform is rejected", body: `{"manifests":[{"digest":"` + config + `"}]}`, valid: false},
+		{name: "duplicate incomplete children", body: `{"manifests":[{"digest":"` + config + `"},{"digest":"` + config + `"}]}`, valid: false},
+		{name: "duplicate tag aliases without platform are rejected", body: index(alias), valid: false},
+		{name: "duplicate tag aliases with exact platform", body: platformIndex(platformAlias, platformAliasOtherTag), platform: linuxAMD64, want: config, valid: true},
+		{name: "conflicting aliases without platform", body: index(strings.Replace(alias, config, amd64, 1)), valid: false},
+		{name: "alias size conflict", body: index(strings.Replace(alias, `"size":708`, `"size":709`, 1)), valid: false},
+		{name: "alias media type conflict", body: index(strings.Replace(alias, "application/vnd.oci.image.manifest.v1+json", "application/vnd.docker.distribution.manifest.v2+json", 1)), valid: false},
+		{name: "nonmatching platform", body: index(strings.Replace(alias, `"size":708`, `"size":708,"platform":{"architecture":"arm64","os":"linux"}`, 1)), valid: false},
+		{name: "selects exact host platform among other descriptors", body: platformIndex(platformManifest(attestation, 101, "unknown", "unknown"), platformManifest(amd64, 202, "linux", "amd64")), platform: linuxAMD64, want: amd64, valid: true},
+		{name: "selects exact host platform independent of descriptor order", body: platformIndex(platformManifest(arm64, 303, "linux", "arm64"), platformManifest(amd64, 202, "linux", "amd64")), platform: linuxAMD64, want: amd64, valid: true},
+		{name: "selects exact arm64 platform without inferred variant", body: platformIndex(platformManifest(arm64, 303, "linux", "arm64")), platform: linuxARM64, want: arm64, valid: true},
+		{name: "rejects unreported arm64 variant", body: platformIndex(platformManifest(arm64, 303, "linux", "arm64", "v8")), platform: linuxARM64, valid: false},
+		{name: "selects exact arm v6 variant", body: platformIndex(platformManifest(arm64, 303, "linux", "arm", "v7"), platformManifest(amd64, 202, "linux", "arm", "v6")), platform: linuxARMv6, want: amd64, valid: true},
+		{name: "rejects arm v7 variant for v6 host", body: platformIndex(platformManifest(arm64, 303, "linux", "arm", "v7")), platform: linuxARMv6, valid: false},
+		{name: "selects exact arm v7 variant", body: platformIndex(platformManifest(arm64, 303, "linux", "arm", "v6"), platformManifest(amd64, 202, "linux", "arm", "v7")), platform: linuxARMv7, want: amd64, valid: true},
+		{name: "rejects arm v6 variant for v7 host", body: platformIndex(platformManifest(arm64, 303, "linux", "arm", "v6")), platform: linuxARMv7, valid: false},
+		{name: "rejects missing host platform", body: platformIndex(platformManifest(arm64, 303, "linux", "arm64"), platformManifest(attestation, 101, "unknown", "unknown")), platform: linuxAMD64, valid: false},
+		{name: "rejects index child with missing platform", body: platformIndex(`{"digest":` + fmt.Sprintf("%q", amd64) + `,"size":202,"mediaType":"application/vnd.oci.image.manifest.v1+json"}`), platform: linuxAMD64, valid: false},
+		{name: "rejects multiple host platform matches", body: platformIndex(platformManifest(amd64, 202, "linux", "amd64"), platformManifest(attestation, 101, "linux", "amd64")), platform: linuxAMD64, valid: false},
+		{name: "invalid mutable config digest", body: `{"config":{"digest":"image:local"}}`, valid: false},
+		{name: "empty descriptor", body: `{}`, valid: false},
 	} {
-		body := []byte(tc.body)
-		d := fmt.Sprintf("sha256:%x", sha256.Sum256(body))
-		got, err := imageDescriptor(d, body)
-		if tc.valid && (err != nil || got != config) || !tc.valid && err == nil {
-			t.Fatalf("descriptor %s: %q, %v", tc.body, got, err)
-		}
-		if _, err := imageDescriptor(config, body); err == nil {
-			t.Fatal("accepted content that did not hash to the requested digest")
-		}
+		t.Run(tc.name, func(t *testing.T) {
+			platform := tc.platform
+			if platform.OS == "" {
+				platform = linuxAMD64
+			}
+			body := []byte(tc.body)
+			d := fmt.Sprintf("sha256:%x", sha256.Sum256(body))
+			got, err := imageDescriptor(d, body, platform)
+			if tc.valid && (err != nil || got != tc.want) || !tc.valid && err == nil {
+				t.Fatalf("descriptor %s: %q, %v", tc.body, got, err)
+			}
+			if _, err := imageDescriptor(config, body, platform); err == nil {
+				t.Fatal("accepted content that did not hash to the requested digest")
+			}
+		})
 	}
 }
 
