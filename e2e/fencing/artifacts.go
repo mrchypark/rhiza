@@ -892,6 +892,27 @@ func classifyVoterStartupStages(data []byte) ([]string, bool) {
 		}
 		errText := strings.TrimPrefix(line[20:], "open rhiza: ")
 		unknownStage := "node_open/inner_error_unknown"
+		if strings.HasPrefix(errText, "node open phase ") {
+			phase, nested, ok := strings.Cut(strings.TrimPrefix(errText, "node open phase "), ": ")
+			phaseCode := "node_open/phase_unknown"
+			if ok {
+				switch phase {
+				case "configuration", "fencing", "local_state", "wal", "identity_storage", "archive", "materializer", "consensus", "recovery", "network", "services":
+					phaseCode = "node_open/phase_" + phase
+				}
+				errText = nested
+			} else {
+				errText = ""
+			}
+			if !seen[phaseCode] {
+				seen[phaseCode] = true
+				if len(stages) < maxVoterStartupStages {
+					stages = append(stages, phaseCode)
+				} else {
+					truncated = true
+				}
+			}
+		}
 		if strings.HasPrefix(errText, "connect fencing startup gate: ") {
 			errText = strings.TrimPrefix(errText, "connect fencing startup gate: ")
 			stageCode := "startup_grant/connect_failed"

@@ -9,6 +9,7 @@ import (
 	"os"
 	"path"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/mrchypark/rhiza/internal/types"
@@ -307,9 +308,12 @@ func TestLocalModeCannotRebindRegisteredVoter(t *testing.T) {
 	}
 	local := &types.ExecutionConfig{Local: true, DataDir: config.DataDir, NodeID: config.NodeID, ClusterID: config.ClusterID}
 	n := New(local)
-	if err := n.Open(context.Background()); !errors.Is(err, ErrVoterStateLost) {
+	if err := n.Open(context.Background()); !errors.Is(err, ErrVoterStateLost) || !strings.Contains(err.Error(), "node open phase local_state:") {
 		n.Shutdown()
-		t.Fatalf("registered directory accepted: %v", err)
+		t.Fatalf("registered directory rejection lost its cause or phase: %v", err)
+	}
+	if n.opened.Load() {
+		t.Fatal("failed open did not run existing shutdown cleanup")
 	}
 	if err := registerTestVoter(t, config, bucket, false); err != nil {
 		t.Fatalf("rejection altered original voter: %v", err)
