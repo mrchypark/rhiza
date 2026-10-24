@@ -122,6 +122,21 @@ class Chaos:
         assert not result.get("error_code"), result
         return result
 
+    def verify_idempotent_write(self, pod, rid, sql, expected_row):
+        self.execute(pod, rid, sql)
+        self.execute(pod, rid, sql)
+        data = self.http(pod, "/sql/query", {
+            "sql": "SELECT id, value FROM chaos_items WHERE id = ?",
+            "args": [expected_row[0]],
+            "consistency": "linearizable",
+        })
+        rows = data["rows"]
+        expected = [list(expected_row)]
+        assert rows == expected and all(
+            type(actual) is type(want) for actual, want in zip(rows[0], expected[0])
+        ), f"idempotent write readback differs: got {rows!r}, want {expected!r}"
+        return rows
+
     def ready(self, pod):
         return self.status(pod).get("voting") and any(
             c.get("type") == "Ready" and c.get("status") == "True"
@@ -342,10 +357,13 @@ class Chaos:
         secret_name = self.cr("whole-generation")["status"]["secretName"]
         self.admin = base64.b64decode(self.get("secret", secret_name)["data"]["admin"]).decode()
         count = self.verify_data("rhiza-0")
-        self.execute("rhiza-0", "new-generation-write", "INSERT INTO chaos_items VALUES (10002, 'new-generation')")
+        new_write_rows = self.verify_idempotent_write(
+            "rhiza-0", "new-generation-write", "INSERT INTO chaos_items VALUES (10002, 'new-generation')",
+            (10002, "new-generation"))
         assert self.status("rhiza-0")["cluster_id"] == target
         self.event("whole_generation_recovery_pass", target=target, acknowledged_rows=len(self.acks), recovered_rows=count,
-                   old_pod_uids=old_uids, new_write=True, dedup_preserved=True)
+                   old_pod_uids=old_uids, request_replay_scope="one final new-generation write",
+                   request_replay="same-id-same-sql", new_write_readback=new_write_rows)
         self.event("PASS", scenarios=5)
 
     def cleanup(self):

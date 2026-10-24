@@ -202,10 +202,13 @@ class AutomaticChaos(Chaos):
         child = self.cr(operation)
         self.admin = base64.b64decode(self.get("secret",child["status"]["secretName"])["data"]["admin"]).decode()
         count = self.verify_data("rhiza-0")
-        self.execute("rhiza-0", "new-generation-write", "INSERT INTO chaos_items VALUES (10002, 'recovered')")
+        new_write_rows = self.verify_idempotent_write(
+            "rhiza-0", "new-generation-write", "INSERT INTO chaos_items VALUES (10002, 'recovered')",
+            (10002, "recovered"))
         assert all(self.runtime_gone(uid) for uid in old_uids)
         self.event("automatic_generation_recovery_pass", acknowledged_rows=len(self.acks), recovered_rows=count,
-                   target=child["status"]["target"], new_write=True, dedup_preserved=True)
+                   target=child["status"]["target"], request_replay_scope="one final new-generation write",
+                   request_replay="same-id-same-sql", new_write_readback=new_write_rows)
         self.event("PASS", scenarios=7, unattended=True)
 
     def cleanup(self):

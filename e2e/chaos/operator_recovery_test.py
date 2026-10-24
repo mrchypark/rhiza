@@ -44,5 +44,46 @@ class VerifyDataTest(unittest.TestCase):
         self.assertEqual(900, events[0][1]["consensus_tip"])
 
 
+class VerifyIdempotentWriteTest(unittest.TestCase):
+    def test_replays_same_request_and_requires_exact_linearizable_row(self):
+        chaos = object.__new__(Chaos)
+        calls = []
+        queries = []
+        chaos.execute = lambda *args: calls.append(args)
+        chaos.http = lambda pod, route, body: queries.append((pod, route, body)) or {
+            "rows": [[10002, "recovered"]],
+        }
+
+        rows = Chaos.verify_idempotent_write(
+            chaos, "rhiza-0", "new-generation-write",
+            "INSERT INTO chaos_items VALUES (10002, 'recovered')", (10002, "recovered"))
+
+        self.assertEqual([
+            ("rhiza-0", "new-generation-write", "INSERT INTO chaos_items VALUES (10002, 'recovered')"),
+            ("rhiza-0", "new-generation-write", "INSERT INTO chaos_items VALUES (10002, 'recovered')"),
+        ], calls)
+        self.assertEqual([("rhiza-0", "/sql/query", {
+            "sql": "SELECT id, value FROM chaos_items WHERE id = ?",
+            "args": [10002], "consistency": "linearizable",
+        })], queries)
+        self.assertEqual([[10002, "recovered"]], rows)
+
+    def test_rejects_missing_duplicate_or_wrong_payload_readback(self):
+        for rows in (
+            [],
+            [[10002, "recovered"], [10002, "recovered"]],
+            [[10002, "wrong"]],
+            [[10002.0, "recovered"]],
+        ):
+            with self.subTest(rows=rows):
+                chaos = object.__new__(Chaos)
+                chaos.execute = lambda *args: None
+                chaos.http = lambda pod, route, body: {"rows": rows}
+                with self.assertRaisesRegex(AssertionError, "idempotent write readback differs"):
+                    Chaos.verify_idempotent_write(
+                        chaos, "rhiza-0", "new-generation-write",
+                        "INSERT INTO chaos_items VALUES (10002, 'recovered')", (10002, "recovered"))
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
