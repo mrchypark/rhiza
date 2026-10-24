@@ -116,6 +116,7 @@ func TestIndependentGCSChaosManifestContract(t *testing.T) {
 	assertNodeNameORTerms(t, "expiry Job", expiry, 1)
 	assertNodeNameORTerms(t, "IAM preflight Pod", preflight, 1)
 	assertNodeNameORTerms(t, "voterCount workloads", manifest, 5)
+	assertProbePairPlacement(t, manifest)
 	statefulSet := manifestDocumentForKind(manifest, "StatefulSet")
 	rhizaCluster := manifestDocumentForKind(manifest, "RhizaCluster")
 	if !strings.Contains(statefulSet, "replicas: 0") ||
@@ -379,6 +380,69 @@ func TestIndependentGCSChaosManifestContract(t *testing.T) {
 		!strings.Contains(fencingLauncher, "if [ \"$fencing_passive_kernel\" = yes ]; then") ||
 		!strings.Contains(fencingLauncher, "runtime-agent-passive-kernel-patch.yaml") {
 		t.Fatal("native fencing installer must keep passive-kernel capability default-off and explicit")
+	}
+}
+
+func assertProbePairPlacement(t *testing.T, manifest string) {
+	t.Helper()
+	type podAffinityTerm struct {
+		LabelSelector struct {
+			MatchLabels map[string]string `yaml:"matchLabels"`
+		} `yaml:"labelSelector"`
+		TopologyKey string `yaml:"topologyKey"`
+	}
+	type podContract struct {
+		Kind     string `yaml:"kind"`
+		Metadata struct {
+			Name string `yaml:"name"`
+		} `yaml:"metadata"`
+		Spec struct {
+			Affinity struct {
+				NodeAffinity any `yaml:"nodeAffinity"`
+				PodAffinity  *struct {
+					Required []podAffinityTerm `yaml:"requiredDuringSchedulingIgnoredDuringExecution"`
+				} `yaml:"podAffinity"`
+			} `yaml:"affinity"`
+		} `yaml:"spec"`
+	}
+
+	pods := make(map[string]podContract, 2)
+	decoder := yaml.NewDecoder(strings.NewReader(manifest))
+	for {
+		var pod podContract
+		err := decoder.Decode(&pod)
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			t.Fatalf("decode inspector probe manifests: %v", err)
+		}
+		if pod.Kind == "Pod" && (pod.Metadata.Name == "rhiza-inspector" || pod.Metadata.Name == "rhiza-inspector-control") {
+			if _, exists := pods[pod.Metadata.Name]; exists {
+				t.Fatalf("duplicate probe Pod %q", pod.Metadata.Name)
+			}
+			pods[pod.Metadata.Name] = pod
+		}
+	}
+	inspector, haveInspector := pods["rhiza-inspector"]
+	control, haveControl := pods["rhiza-inspector-control"]
+	if !haveInspector || !haveControl {
+		t.Fatalf("inspector probe pair is incomplete: inspector=%t control=%t", haveInspector, haveControl)
+	}
+	assertCapturedNodeNameAffinity(t, "rhiza-inspector", inspector.Spec.Affinity.NodeAffinity)
+	assertCapturedNodeNameAffinity(t, "rhiza-inspector-control", control.Spec.Affinity.NodeAffinity)
+	if inspector.Spec.Affinity.PodAffinity != nil {
+		t.Fatal("inspector Pod must not carry the control's co-location affinity")
+	}
+	if control.Spec.Affinity.PodAffinity == nil || len(control.Spec.Affinity.PodAffinity.Required) != 1 {
+		t.Fatal("control Pod must require co-location with the inspector")
+	}
+	term := control.Spec.Affinity.PodAffinity.Required[0]
+	if term.TopologyKey != "kubernetes.io/hostname" ||
+		term.LabelSelector.MatchLabels["chaos.rhiza.io/run"] != "__RUN_ID__" ||
+		term.LabelSelector.MatchLabels["app"] != "rhiza-inspector" ||
+		len(term.LabelSelector.MatchLabels) != 2 {
+		t.Fatalf("control Pod co-location selector is not run-scoped to the inspector: %#v", term)
 	}
 }
 

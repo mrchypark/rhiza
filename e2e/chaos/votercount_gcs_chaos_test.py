@@ -114,15 +114,6 @@ class RunManifestTest(unittest.TestCase):
         self.assertEqual(derived(pods["rhiza-inspector"], "<container>"),
                          derived(pods["rhiza-inspector-control"], "<container>"))
 
-    def test_probe_pair_is_pinned_to_one_node(self):
-        pods = {d["metadata"]["name"]: d for d in self.docs() if d["kind"] == "Pod"}
-        self.assertNotIn("affinity", pods["rhiza-inspector"]["spec"])
-        self.assertEqual(pods["rhiza-inspector-control"]["spec"]["affinity"], {
-            "podAffinity": {"requiredDuringSchedulingIgnoredDuringExecution": [
-                {"labelSelector": {"matchLabels": {"chaos.rhiza.io/run": RUN["RUN_ID"],
-                                                     "app": "rhiza-inspector"}},
-                 "topologyKey": "kubernetes.io/hostname"}]}})
-
     def test_the_deny_all_policy_stays_bootstrap_owned(self):
         # Re-applying the bootstrap policy from this manifest would strip its
         # rhiza.dev/auth-owner annotation, so the run must only observe it.
