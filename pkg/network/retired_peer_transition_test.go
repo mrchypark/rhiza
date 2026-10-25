@@ -3,6 +3,7 @@ package network
 import (
 	"context"
 	"errors"
+	"fmt"
 	"net"
 	"path/filepath"
 	"strings"
@@ -14,7 +15,9 @@ import (
 	"github.com/mrchypark/rhiza/pkg/network/peerfb"
 	"github.com/mrchypark/rhiza/pkg/qlog"
 	"github.com/mrchypark/rhiza/pkg/quepaxa"
+	"github.com/mrchypark/rhiza/pkg/recovery"
 	"github.com/quic-go/quic-go"
+	"github.com/thanos-io/objstore"
 )
 
 func TestRetiredPeerTransitionRejectsCachedIdentityAndAdmitsNewIdentity(t *testing.T) {
@@ -46,6 +49,9 @@ func TestRetiredPeerTransitionRejectsCachedIdentityAndAdmitsNewIdentity(t *testi
 	cores := make(map[quepaxa.NodeID]*quepaxa.Core, len(ids))
 	servers := make(map[quepaxa.NodeID]*Server, len(ids))
 	transports := make(map[quepaxa.NodeID]*Transport, len(ids))
+	peerServers := make(map[quepaxa.NodeID]*PeerServer, len(ids)+1)
+	var dCore *quepaxa.Core
+	var learnerTransport *Transport
 	for _, member := range config.Members {
 		transport := NewTransport(clusterID, member.ID, &config, tokens[member.ID])
 		transports[member.ID] = transport
@@ -58,7 +64,35 @@ func TestRetiredPeerTransitionRejectsCachedIdentityAndAdmitsNewIdentity(t *testi
 		core, err := quepaxa.New(quepaxa.Config{
 			NodeID: member.ID, Cluster: config, WAL: wal, Transport: transport,
 			EnableReconfiguration: true,
-			ReconfigurationAdmission: func(context.Context, quepaxa.ReconfigurationAdmission) error {
+			ReconfigurationAdmission: func(admissionCtx context.Context, admission quepaxa.ReconfigurationAdmission) error {
+				if admission.Kind != quepaxa.ReconfigurationAdmissionLearner {
+					return nil
+				}
+				if dCore == nil || learnerTransport == nil {
+					return errors.New("learner admission ran before the test learner was ready")
+				}
+				page, err := learnerTransport.FetchDecisions(admissionCtx, "a", dCore.Tip()+1, 128)
+				if err != nil {
+					return fmt.Errorf("sync learner through admission prefix %d: %w", admission.Through, err)
+				}
+				if page.Tip < admission.Through {
+					return fmt.Errorf("learner source tip %d is below admission prefix %d", page.Tip, admission.Through)
+				}
+				if len(page.Decisions) > 0 {
+					if err := dCore.AcceptCertifiedValues(page.Decisions); err != nil {
+						return fmt.Errorf("apply certified learner prefix through %d: %w", admission.Through, err)
+					}
+				}
+				if dCore.Tip() < admission.Through {
+					return fmt.Errorf("learner durable tip %d is below admission prefix %d", dCore.Tip(), admission.Through)
+				}
+				durablePrefix, err := dCore.DurablePrefix(admission.Through)
+				if err != nil {
+					return fmt.Errorf("read learner durable prefix through %d: %w", admission.Through, err)
+				}
+				if durablePrefix != admission.PrefixHash {
+					return fmt.Errorf("learner durable prefix mismatch through %d: got %x, want %x", admission.Through, durablePrefix, admission.PrefixHash)
+				}
 				return nil
 			},
 		})
@@ -80,6 +114,7 @@ func TestRetiredPeerTransitionRejectsCachedIdentityAndAdmitsNewIdentity(t *testi
 		if err != nil {
 			t.Fatal(err)
 		}
+		peerServers[member.ID] = peer
 		t.Cleanup(func() { _ = peer.Close() })
 	}
 
@@ -150,14 +185,14 @@ func TestRetiredPeerTransitionRejectsCachedIdentityAndAdmitsNewIdentity(t *testi
 		}
 		peerIdentities = append(peerIdentities, identity)
 	}
-	learnerTransport := NewLearnerTransport(clusterID, "d", config.ConfigID, peerIdentities, "admin-token")
+	learnerTransport = NewLearnerTransport(clusterID, "d", config.ConfigID, peerIdentities, "admin-token")
 	t.Cleanup(func() { _ = learnerTransport.Close() })
 	dWal, err := qlog.Open(t.TempDir() + "/qlog")
 	if err != nil {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = dWal.Close() })
-	dCore, err := quepaxa.NewLearner(quepaxa.Config{NodeID: "d", Cluster: config, WAL: dWal, Transport: learnerTransport, EnableReconfiguration: true})
+	dCore, err = quepaxa.NewLearner(quepaxa.Config{NodeID: "d", Cluster: config, WAL: dWal, Transport: learnerTransport, EnableReconfiguration: true})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -174,21 +209,67 @@ func TestRetiredPeerTransitionRejectsCachedIdentityAndAdmitsNewIdentity(t *testi
 	if err != nil {
 		t.Fatal(err)
 	}
+	peerServers["d"] = dPeer
 	t.Cleanup(func() { _ = dPeer.Close() })
 	dBeforeAdd := NewTransport(clusterID, "d", &withoutC, dToken)
 	t.Cleanup(func() { _ = dBeforeAdd.Close() })
 	if _, err := dBeforeAdd.ReadTip(ctx, "a"); err == nil || !errors.Is(err, errPeerRejected) {
 		t.Fatalf("new identity before committed ADD error=%v, want rejection", err)
 	}
-	// The replacement must first learn the committed REMOVE through the
-	// authenticated, read-only sync path. Otherwise its history resolves the
-	// later ADD terminal under config 1 and correctly rejects the config-2
-	// envelope before it can apply that terminal.
-	if err := dServer.catchUpFrom(ctx, "a", cores["a"].Tip(), true); err != nil {
-		t.Fatalf("replacement learner catch-up through committed REMOVE: %v", err)
+	// A stale ConfigID cannot use peer Sync to learn a retired transition.
+	// The replacement obtains the exact committed REMOVE from the verified
+	// archive path, then its bound transport can Sync at the resulting current
+	// configuration.
+	if _, err := learnerTransport.FetchDecisions(ctx, "a", dCore.Tip()+1, 128); err == nil || !strings.Contains(err.Error(), "cluster identity mismatch") {
+		t.Fatalf("stale-config learner Sync error=%v, want rejection", err)
+	}
+	if dCore.Tip() != 0 || dCore.CurrentCluster().ConfigID != config.ConfigID {
+		t.Fatalf("rejected stale Sync advanced learner: tip=%d config=%d", dCore.Tip(), dCore.CurrentCluster().ConfigID)
+	}
+	archiveBucket := objstore.NewInMemBucket()
+	publisher := recovery.NewManager(archiveBucket, string(clusterID), recovery.ArchiveConfigID)
+	defer publisher.Close()
+	reader := recovery.NewManager(archiveBucket, string(clusterID), recovery.ArchiveConfigID)
+	defer reader.Close()
+	applyCertifiedArchive := func(target *quepaxa.Core) {
+		t.Helper()
+		through := cores["a"].Tip()
+		if err := publisher.SyncThrough(ctx, cores["a"], through); err != nil {
+			t.Fatalf("publish certified membership history through %d: %v", through, err)
+		}
+		if err := reader.Load(ctx); err != nil {
+			t.Fatalf("load certified membership history: %v", err)
+		}
+		values, tip, err := reader.DecisionsFrom(ctx, target.Tip()+1, 128)
+		if err != nil || tip < through {
+			t.Fatalf("read certified membership suffix: values=%d tip=%d want>=%d err=%v", len(values), tip, through, err)
+		}
+		if len(values) > 0 {
+			if err := target.AcceptCertifiedValues(values); err != nil {
+				t.Fatalf("apply certified membership suffix: %v", err)
+			}
+			if err := target.EnsureDurableThrough(ctx, through); err != nil {
+				t.Fatalf("persist certified membership suffix through %d: %v", through, err)
+			}
+		}
+	}
+	applyCertifiedArchive(cores["b"])
+	if got := cores["b"].CurrentCluster(); got.ConfigID != withoutC.ConfigID || !sameNetworkMembers(got, withoutC) || !cores["b"].IsVoter() {
+		t.Fatalf("remaining voter did not apply archived REMOVE: voter=%t cluster=%+v", cores["b"].IsVoter(), got)
+	}
+	applyCertifiedArchive(dCore)
+	if got := dCore.CurrentCluster(); got.ConfigID != withoutC.ConfigID || !sameNetworkMembers(got, withoutC) || dCore.IsVoter() {
+		t.Fatalf("replacement learner did not apply archived REMOVE and remain non-voting: voter=%t cluster=%+v", dCore.IsVoter(), got)
+	}
+	currentSync, err := learnerTransport.FetchDecisions(ctx, "a", dCore.Tip()+1, 128)
+	if err != nil || currentSync.ConfigID != withoutC.ConfigID || len(currentSync.Decisions) != 0 {
+		t.Fatalf("bound current-config Sync after archived REMOVE: response config=%d decisions=%d err=%v", currentSync.ConfigID, len(currentSync.Decisions), err)
 	}
 	if got := dCore.CurrentCluster(); got.ConfigID != withoutC.ConfigID || !sameNetworkMembers(got, withoutC) || dCore.IsVoter() {
 		t.Fatalf("replacement learner did not remain non-voting at post-REMOVE config: voter=%t cluster=%+v", dCore.IsVoter(), got)
+	}
+	if response, err := transports["b"].FetchDecisions(ctx, "a", cores["b"].Tip()+1, 128); err != nil || response.ConfigID != withoutC.ConfigID {
+		t.Fatalf("remaining voter current-config Sync after REMOVE: response config=%d err=%v", response.ConfigID, err)
 	}
 
 	withD := quepaxa.Cluster{ConfigID: 3, Members: append([]quepaxa.Member(nil), withoutC.Members...)}
@@ -196,14 +277,62 @@ func TestRetiredPeerTransitionRejectsCachedIdentityAndAdmitsNewIdentity(t *testi
 	if _, err := cores["a"].BeginReconfiguration(ctx, withD); err != nil {
 		t.Fatalf("begin ADD: %v", err)
 	}
+	terminalEvents := make(chan string, 32)
+	restoreHook := installRetiredPeerTestHook(func(event string) {
+		if !strings.Contains(event, "network:terminal-decision:") && !strings.Contains(event, "network:learned:phase=handler-result:") {
+			return
+		}
+		select {
+		case terminalEvents <- event:
+		default:
+		}
+	})
 	if err := cores["a"].FinishReconfigurationAt(ctx, withD, 0); err != nil {
-		t.Fatalf("commit durable ADD: %v", err)
+		restoreHook()
+		slot := cores["a"].Tip()
+		requestConfig := cores["a"].ClusterForSlot(slot)
+		request := &peerfb.RequestT{
+			Operation: peerfb.OperationLearned, ClusterId: string(clusterID), SenderId: "a",
+			ConfigId: uint64(requestConfig.ConfigID), Decision: &peerfb.DecisionT{Slot: uint64(slot)},
+		}
+		var peerDiagnostics []string
+		for _, id := range []quepaxa.NodeID{"b", "d"} {
+			peer := peerServers[id]
+			if peer == nil {
+				continue
+			}
+			received, configErr := peer.configurationFor(request)
+			current := peer.server.core.CurrentCluster()
+			historicalMember, historicalOK := peerMember(received, "a")
+			activeMember, activeOK := peerMember(current, "a")
+			key := quepaxa.PublicKey(PeerPublicKey(clusterID, "a", tokens["a"]))
+			peerDiagnostics = append(peerDiagnostics, fmt.Sprintf(
+				"peer=%s operation=%d request_config=%d slot=%d receiver_slot_config=%d receiver_current_config=%d config_error=%v sender_historical=%t sender_active=%t sender_key_historical=%t sender_key_active=%t",
+				id, request.Operation, request.ConfigId, slot, received.ConfigID, current.ConfigID, configErr,
+				historicalOK, activeOK, historicalOK && historicalMember.PublicKey == key, activeOK && activeMember.PublicKey == key,
+			))
+		}
+		var observedEvents []string
+		for {
+			select {
+			case event := <-terminalEvents:
+				observedEvents = append(observedEvents, event)
+			default:
+				t.Fatalf("commit durable ADD: %v; terminal RPC diagnostics: %v; per-peer events: %v", err, peerDiagnostics, observedEvents)
+			}
+		}
 	}
+	restoreHook()
 	if got := cores["a"].CurrentCluster(); got.ConfigID != withD.ConfigID || !sameNetworkMembers(got, withD) {
 		t.Fatalf("ADD did not activate at receiver A: %+v", got)
 	}
+	applyCertifiedArchive(dCore)
 	if !dCore.IsVoter() || dCore.CurrentCluster().ConfigID != withD.ConfigID {
 		t.Fatalf("new logical identity did not apply committed ADD: voter=%t cluster=%+v", dCore.IsVoter(), dCore.CurrentCluster())
+	}
+	currentSync, err = learnerTransport.FetchDecisions(ctx, "a", dCore.Tip()+1, 128)
+	if err != nil || currentSync.ConfigID != withD.ConfigID || len(currentSync.Decisions) != 0 {
+		t.Fatalf("bound current-config Sync after archived ADD: response config=%d decisions=%d err=%v", currentSync.ConfigID, len(currentSync.Decisions), err)
 	}
 	dAfterAdd := NewTransport(clusterID, "d", &withD, dToken)
 	t.Cleanup(func() { _ = dAfterAdd.Close() })
