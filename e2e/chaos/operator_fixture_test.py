@@ -70,7 +70,9 @@ class BucketJobTest(unittest.TestCase):
         }
 
     @staticmethod
-    def _capture_diagnostics(chaos, fixture, *, after_pod=None, log_error=False, log_payloads=None):
+    def _capture_diagnostics(chaos, fixture, *, supervised, after_pod=None, log_error=False, log_payloads=None):
+        chaos.supervised_bootstrap = supervised
+
         def fake_run(argv, **kwargs):
             if "logs" in argv:
                 if log_error and "--previous" not in argv:
@@ -259,7 +261,7 @@ class BucketJobTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             chaos = Chaos(argparse.Namespace(output=directory, cluster="fixture"))
             fixture = self._diagnostic_fixture()
-            errors = self._capture_diagnostics(chaos, fixture)
+            errors = self._capture_diagnostics(chaos, fixture, supervised=True)
 
             private = Path(directory, "private-startup-diagnostics")
             record = json.loads(Path(private, "record.json").read_text())
@@ -290,20 +292,24 @@ class BucketJobTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             chaos = Chaos(argparse.Namespace(output=directory, cluster="fixture"))
             fixture = self._diagnostic_fixture()
+            fixture["pod"]["metadata"]["name"] = "rhiza-2"
+            fixture["pod"]["metadata"]["labels"] = {"app.kubernetes.io/name": "rhiza"}
+            fixture["pod"]["metadata"]["ownerReferences"][0]["controller"] = True
+            fixture["pod"]["metadata"].pop("annotations")
             fixture["pod"]["status"]["containerStatuses"][0]["restartCount"] = 0
             fixture["pod"]["status"]["containerStatuses"][0].pop("lastState")
 
-            errors = self._capture_diagnostics(chaos, fixture)
+            errors = self._capture_diagnostics(chaos, fixture, supervised=False)
 
             private = Path(directory, "private-startup-diagnostics")
             record = json.loads(Path(private, "record.json").read_text())
             summary = json.loads(Path(directory, "startup-diagnostics-summary.json").read_text())
-            learner = next(item for item in record["captures"] if item["component"] == "learner")
+            voter = next(item for item in record["captures"] if item["component"] == "rhiza")
             self.assertEqual([], errors)
             self.assertEqual({"status": "not_applicable"}, record["root"])
             self.assertEqual("not_applicable", summary["rootStatus"])
             self.assertEqual({"captured": False, "status": "not_applicable"},
-                             learner["logs"]["previous"])
+                             voter["logs"]["previous"])
             self.assertEqual("complete", summary["status"])
             self.assertNotIn("root_status_read_failed", summary["captureErrors"])
             self.assertNotIn("container_incarnation_unavailable", summary["captureErrors"])
@@ -319,7 +325,7 @@ class BucketJobTest(unittest.TestCase):
                 else:
                     status.pop("containerID")
 
-                errors = self._capture_diagnostics(chaos, fixture)
+                errors = self._capture_diagnostics(chaos, fixture, supervised=True)
 
                 private = Path(directory, "private-startup-diagnostics")
                 record = json.loads(Path(private, "record.json").read_text())
@@ -375,7 +381,7 @@ class BucketJobTest(unittest.TestCase):
                 b"source= error_class=quorum-unavailable private=PRIVATE_READ_CANARY",
             ))
             errors = self._capture_diagnostics(
-                chaos, self._diagnostic_fixture(), log_payloads={"current": payload})
+                chaos, self._diagnostic_fixture(), supervised=True, log_payloads={"current": payload})
             self.assertEqual([], errors)
             summary = Path(directory, "startup-diagnostics-summary.json").read_text()
             capture = json.loads(summary)["captures"][0]
@@ -397,7 +403,8 @@ class BucketJobTest(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as directory:
             chaos = Chaos(argparse.Namespace(output=directory, cluster="fixture"))
-            errors = self._capture_diagnostics(chaos, self._diagnostic_fixture(), log_error=True)
+            errors = self._capture_diagnostics(
+                chaos, self._diagnostic_fixture(), supervised=True, log_error=True)
             private = Path(directory, "private-startup-diagnostics")
             record = json.loads(Path(private, "record.json").read_text())
             summary = Path(directory, "startup-diagnostics-summary.json").read_text()
@@ -412,7 +419,7 @@ class BucketJobTest(unittest.TestCase):
             with self.subTest(harness=harness.__name__), tempfile.TemporaryDirectory() as directory:
                 chaos = harness(argparse.Namespace(output=directory, cluster="fixture"))
                 errors = self._capture_diagnostics(
-                    chaos, self._diagnostic_fixture(), log_payloads={"current": payload})
+                    chaos, self._diagnostic_fixture(), supervised=True, log_payloads={"current": payload})
                 self.assertEqual([], errors)
                 summary = Path(directory, "startup-diagnostics-summary.json").read_text()
                 capture = json.loads(summary)["captures"][0]
@@ -425,7 +432,7 @@ class BucketJobTest(unittest.TestCase):
             fixture = self._diagnostic_fixture()
             fixture["statefulset"]["spec"]["template"]["metadata"]["annotations"][
                 "rhiza.mrchypark.dev/fencing-root-uid"] = "wrong-root"
-            errors = self._capture_diagnostics(chaos, fixture)
+            errors = self._capture_diagnostics(chaos, fixture, supervised=True)
             self.assertIn("active_recovery_binding_mismatch", errors)
             record = json.loads(Path(directory, "private-startup-diagnostics", "record.json").read_text())
             self.assertFalse(any(item.get("component") == "learner" for item in record["captures"]))
@@ -435,7 +442,7 @@ class BucketJobTest(unittest.TestCase):
             fixture = self._diagnostic_fixture()
             fixture["pod"]["metadata"]["annotations"][
                 "rhiza.mrchypark.dev/fencing-credential-uid"] = "wrong-credential"
-            errors = self._capture_diagnostics(chaos, fixture)
+            errors = self._capture_diagnostics(chaos, fixture, supervised=True)
             self.assertIn("learner_pod_binding_mismatch", errors)
             record = json.loads(Path(directory, "private-startup-diagnostics", "record.json").read_text())
             self.assertFalse(any(item.get("component") == "learner" for item in record["captures"]))
@@ -444,7 +451,7 @@ class BucketJobTest(unittest.TestCase):
             chaos = Chaos(argparse.Namespace(output=directory, cluster="fixture"))
             fixture = self._diagnostic_fixture()
             fixture["secret"]["metadata"]["uid"] = "different-nonempty-credential-uid"
-            errors = self._capture_diagnostics(chaos, fixture)
+            errors = self._capture_diagnostics(chaos, fixture, supervised=True)
             self.assertIn("learner_pod_binding_mismatch", errors)
             record = json.loads(Path(directory, "private-startup-diagnostics", "record.json").read_text())
             self.assertFalse(any(item.get("component") == "learner" for item in record["captures"]))
@@ -463,7 +470,8 @@ class BucketJobTest(unittest.TestCase):
                 else:
                     changed["status"]["containerStatuses"][0]["lastState"]["terminated"][
                         "containerID"] = "containerd://replacement-previous"
-                errors = self._capture_diagnostics(chaos, fixture, after_pod=changed)
+                errors = self._capture_diagnostics(
+                    chaos, fixture, supervised=True, after_pod=changed)
                 self.assertIn("pod_or_container_identity_changed", errors)
                 private = Path(directory, "private-startup-diagnostics")
                 record = json.loads(Path(private, "record.json").read_text())
