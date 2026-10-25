@@ -18,6 +18,48 @@ import urllib.request
 from operator_fixture import resources, learner_resources
 
 
+STARTUP_PHASE_CODES = frozenset({
+    "configuration", "fencing", "local_state", "wal", "identity_storage",
+    "archive", "materializer", "consensus", "recovery", "network", "services",
+})
+STARTUP_MARKER_CODES = (
+    ("fencing: engine repair preflight:", "engine_repair_preflight"),
+    ("fencing: child exited without a terminal receipt:", "supervisor_child_exit"),
+)
+GO_LOG_PREFIX = re.compile(r"^\d{4}/\d{2}/\d{2} \d{2}:\d{2}:\d{2} ")
+
+
+def safe_startup_findings(payload):
+    """Project private startup logs to fixed diagnostic enums only."""
+    text = payload.decode("utf-8", errors="replace") if isinstance(payload, bytes) else str(payload)
+    findings = set()
+    for line in text.splitlines():
+        if not GO_LOG_PREFIX.match(line):
+            continue
+        line = GO_LOG_PREFIX.sub("", line, count=1)
+        if line.startswith("open rhiza: "):
+            line = line[len("open rhiza: "):]
+        marker = "node open phase "
+        if line.startswith(marker):
+            phase, separator, detail = line[len(marker):].partition(":")
+            if separator and phase.strip() in STARTUP_PHASE_CODES:
+                phase = phase.strip()
+                findings.add(phase)
+                detail = detail.lstrip()
+                expected = {
+                    ("identity_storage", "ensure voter identity:"): "identity_enrollment",
+                    ("identity_storage", "open object store:"): "storage_initialization",
+                    ("wal", "open WAL:"): "wal_open",
+                }
+                for (expected_phase, prefix), code in expected.items():
+                    if phase == expected_phase and detail.startswith(prefix):
+                        findings.add(code)
+        for prefix, code in STARTUP_MARKER_CODES:
+            if line.startswith(prefix):
+                findings.add(code)
+    return sorted(findings)
+
+
 class Chaos:
     def __init__(self, args):
         self.args = args
@@ -195,25 +237,46 @@ class Chaos:
         assert not state["voting"] and state["wal_identity"], state
         return state
 
-    def replacement(self, name, removed, removed_uid, nonce, voters, learner):
+    def reject_legacy_replacement(self, name, removed, removed_uid, nonce, voters, learner):
+        """Prove the quorum-alive legacy operator membership route is rejected."""
+        reason = "new operator-managed membership changes are disabled; ordinary Pod recovery is engine-owned"
+        before_membership = {pod: self.status(pod) for pod in voters}
+        before_rows = self.http(voters[0], "/sql/query", {
+            "sql": "SELECT id, value FROM chaos_items ORDER BY id",
+            "consistency": "linearizable",
+        }).get("rows")
         spec = {"statefulSet": "rhiza", "container": "rhiza", "sourceClusterID": "chaos-source",
                 "durability": "before-ack", "membership": {"operationID": name, "remove": removed,
                 "removedPod": removed, "voterPods": [{"nodeID": p, "pod": p} for p in voters],
                 "replacementPod": learner, "replacementSecret": learner + "-credentials",
                 "fence": {"nodeID": removed, "walIdentity": nonce, "workloadUID": removed_uid,
-                          "confirmed": False, "evidence": "Awaiting explicit runtime fence verification"}}}
+                          "confirmed": True,
+                          "evidence": f"CRI confirms Pod UID {removed_uid} has no running container; StatefulSet is scaled below its ordinal"}}}
         self.apply({"apiVersion": "rhiza.mrchypark.dev/v1alpha1", "kind": "RhizaRecovery",
                     "metadata": {"name": name, "namespace": self.ns}, "spec": spec})
-        self.wait("unfenced request blocked", lambda: self.phase(name, "Blocked"))
-        before = self.status(voters[0])["config_id"]
-        time.sleep(3)
-        assert self.status(voters[0])["config_id"] == before
+        self.wait("legacy operator membership request rejected", lambda: self.phase(name, "Blocked"))
+        blocked = self.cr(name).get("status", {})
+        assert blocked.get("phase") == "Blocked" and blocked.get("message") == reason, blocked
+        journal = blocked.get("membership", {})
+        assert not journal.get("removeRequest") and not journal.get("add"), journal
         assert self.runtime_gone(removed_uid), "old voter still running"
-        self.patch("rhizarecovery", name, {"spec": {"membership": {"fence": {
-            "confirmed": True, "evidence": f"CRI confirms Pod UID {removed_uid} has no running container; StatefulSet scaled below its ordinal"}}}})
-        self.wait("addition journal", lambda: self.cr(name).get("status", {}).get("membership", {}).get("add"))
-        self.wait("certified addition freeze", lambda: self.status(voters[0])["pending"])
-        self.event("replacement_frozen", operation=name, config=self.status(voters[0])["config_id"])
+        time.sleep(3)
+        final_status = self.cr(name).get("status", {})
+        assert final_status.get("phase") == "Blocked" and final_status.get("message") == reason, final_status
+        final_journal = final_status.get("membership", {})
+        assert not final_journal.get("removeRequest") and not final_journal.get("add"), final_journal
+        after_membership = {pod: self.status(pod) for pod in voters}
+        assert after_membership == before_membership, (
+            f"membership changed: before={before_membership!r} after={after_membership!r}")
+        after_rows = self.http(voters[0], "/sql/query", {
+            "sql": "SELECT id, value FROM chaos_items ORDER BY id",
+            "consistency": "linearizable",
+        }).get("rows")
+        assert after_rows == before_rows, f"data changed: before={before_rows!r} after={after_rows!r}"
+        self.event("legacy_membership_request_rejected_only", operation=name,
+                   reason="ordinary_recovery_is_engine_owned", voters=voters,
+                   config_id=before_membership[voters[0]]["config_id"],
+                   unchanged_rows=len(after_rows or []))
 
     def start_writer(self):
         def write():
@@ -563,7 +626,7 @@ class Chaos:
                         "containerStatus": {"containerID": state.get("containerID"),
                             "restartCount": state.get("restartCount"),
                             "state": state.get("state"), "lastState": state.get("lastState")},
-                        "logs": {}}
+                        "logs": {}, "startupFindings": []}
 
                 def incarnation(pod_status, previous):
                     container_status = next((status for status in pod_status.get("status", {}).get("containerStatuses", [])
@@ -630,6 +693,9 @@ class Chaos:
                     capture_error("pod_or_container_identity_changed", f"{name}/{cname}")
                 for key, (payload, captured, detail) in pending_logs.items():
                     if after_ok:
+                        if captured:
+                            item["startupFindings"] = sorted(set(item["startupFindings"]) |
+                                                               set(safe_startup_findings(payload)))
                         path = private / f"{name}-{cname}-{key}.log"
                         path.write_bytes(payload)
                         path.chmod(0o600)
@@ -655,7 +721,8 @@ class Chaos:
                 logs[key] = {field: result[field] for field in ("captured", "bytes", "sha256", "truncated", "errorCode")
                              if field in result}
             summary["captures"].append({"component": item.get("component"),
-                                        "container": item.get("container"), "logs": logs})
+                                        "container": item.get("container"), "logs": logs,
+                                        "startupFindings": item.get("startupFindings", [])})
         public_path = self.out / "startup-diagnostics-summary.json"
         public_path.write_text(json.dumps(summary, indent=2))
         public_path.chmod(0o600)
@@ -685,46 +752,19 @@ class Chaos:
         self.wait("removed runtime fenced", lambda: self.runtime_gone(old_uid))
         self.k("wait", "--for=delete", "pod/rhiza-2", "--timeout=90s")
         self.event("lost_wal_refused", old_uid=old_uid)
-        self.create_learner("learner-a")
-        self.udp("learner-a", True)
-        self.replacement("replace-2", "rhiza-2", old_uid, lost["wal_identity"], ["rhiza-0", "rhiza-1"], "learner-a")
-        journal = self.cr("replace-2")["status"]["membership"]
-        self.operator_restart()
-        assert self.cr("replace-2")["status"]["membership"]["add"] == journal["add"]
-        self.udp("learner-a", False)
-        self.wait("first replacement complete", lambda: self.phase("replace-2", "Complete"), 240)
-        assert self.status("learner-a")["voting"]
-        assert self.get("statefulset", "rhiza")["spec"]["replicas"] == 2
-        self.execute("learner-a", "promoted-write", "INSERT INTO chaos_items VALUES (10001, 'promoted')")
-        self.acks.add(10001)
-        self.event("partition_and_operator_restart_pass", config=self.status("learner-a")["config_id"])
-
-        # A second replacement uses an already promoted standalone voter.
-        lost = self.status("rhiza-1")
-        old_uid, _, _ = self.runtime("rhiza-1")
-        self.patch("statefulset", "rhiza", {"spec": {"replicas": 1}})
-        self.k("wait", "--for=delete", "pod/rhiza-1", "--timeout=90s")
-        self.create_learner("learner-b")
-        self.udp("learner-b", True)
-        self.replacement("replace-1", "rhiza-1", old_uid, lost["wal_identity"], ["rhiza-0", "learner-a"], "learner-b")
-        self.k("delete", "pod", "learner-b", "--wait=true")
-        self.patch("rhizarecovery", "replace-1", {"spec": {"membership": {"abortAddition": True}}})
-        self.wait("failed learner addition aborted", lambda: self.phase("replace-1", "Aborted"), 240)
-        abort_slot = self.status("rhiza-0")["abort_slot"]
-        assert abort_slot > 0
-        self.create_learner("learner-c")
-        self.patch("rhizarecovery", "replace-1", {"spec": {"membership": {"abortAddition": False,
-            "replacementPod": "learner-c", "replacementSecret": "learner-c-credentials"}}})
-        self.wait("fresh incarnation promoted", lambda: self.phase("replace-1", "Complete"), 240)
-        assert self.status("learner-c")["voting"]
-        self.event("lost_learner_abort_resume_pass", abort_slot=abort_slot, config=self.status("learner-c")["config_id"])
+        # Freeze concurrent writes so the negative legacy-request assertion can
+        # compare exact data snapshots without racing the workload writer.
         self.stop.set()
-        self.writer.join(timeout=15)
-        assert not self.writer.is_alive()
+        if self.writer:
+            self.writer.join(timeout=15)
+            assert not self.writer.is_alive(), "workload writer did not stop before the legacy-route assertion"
+        self.reject_legacy_replacement(
+            "replace-2", "rhiza-2", old_uid, lost["wal_identity"], ["rhiza-0", "rhiza-1"], "learner-a")
+        self.stop.set()
         self.verify_data("rhiza-0")
 
         # External scheduling fence prevents old voters from being recreated.
-        old_uids = [self.runtime(p)[0] for p in ("rhiza-0", "learner-a", "learner-c")]
+        old_uids = [self.runtime(p)[0] for p in ("rhiza-0", "rhiza-1")] + [old_uid]
         self.patch("statefulset", "rhiza", {"spec": {"replicas": 3, "template": {"spec": {
             "nodeSelector": {"rhiza-chaos/fenced": "true"}}}}})
         self.k("delete", "pod", "rhiza-0", "rhiza-1", "rhiza-2", "learner-a", "learner-c", "--ignore-not-found", "--wait=true")
@@ -759,7 +799,8 @@ class Chaos:
         self.event("whole_generation_recovery_pass", target=target, acknowledged_rows=len(self.acks), recovered_rows=count,
                    old_pod_uids=old_uids, request_replay_scope="one final new-generation write",
                    request_replay="same-id-same-sql", new_write_readback=new_write_rows)
-        self.event("PASS", scenarios=5)
+        self.event("PASS", scenarios=["intact_wal_restart", "lost_wal_refused",
+                                       "legacy_membership_request_rejected_only", "whole_generation_recovery"])
 
     def cleanup(self):
         self.stop.set()

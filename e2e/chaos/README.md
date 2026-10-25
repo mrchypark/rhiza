@@ -32,15 +32,19 @@ The workload retries stable request IDs during faults. The test checks:
 
 - SIGKILL with the same Pod and WAL preserves voter identity.
 - Pod deletion destroys emptyDir; the old voter identity refuses to restart.
-- A fenced voter is replaced while the learner's QUIC ingress is dropped with
-  iptables. Restarting the Operator preserves its journal; restoring traffic
-  allows promotion and writes through the promoted voter.
-- A second replacement includes the previously promoted standalone voter.
-  Deleting the pending learner requires explicit abort; a fresh learner can
-  complete the same recovery operation.
+- With quorum still available, the legacy `RhizaRecovery` membership-replacement
+  request is rejected with the engine-owned-recovery reason. The harness checks
+  that membership and acknowledged data remain unchanged; this is a negative
+  check of the retired operator-managed route, not a successful ordinary Pod
+  replacement.
 - Stopping every current voter and preventing StatefulSet scheduling allows a
   fenced whole-generation recovery. All acknowledged rows and request deduplication
   survive, and the new generation accepts writes.
+
+This Kind/S3 scenario does not qualify ordinary engine-owned Pod replacement or
+the prior learner-abort/resume sequence. The separate real-GCS ordinary recovery
+gate (`run-gcs-ha-ordinary-recovery`) remains required before claiming that
+positive path; the legacy-route rejection above is not a substitute.
 
 Fence approval is explicit. The harness first verifies CRI process termination
 and prevents source workload recreation, then submits the administrator

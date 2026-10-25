@@ -1,4 +1,6 @@
 import unittest
+from copy import deepcopy
+from unittest import mock
 
 from operator_recovery import Chaos
 
@@ -83,6 +85,91 @@ class VerifyIdempotentWriteTest(unittest.TestCase):
                     Chaos.verify_idempotent_write(
                         chaos, "rhiza-0", "new-generation-write",
                         "INSERT INTO chaos_items VALUES (10002, 'recovered')", (10002, "recovered"))
+
+
+class LegacyMembershipRejectionTest(unittest.TestCase):
+    blocked_reason = "new operator-managed membership changes are disabled; ordinary Pod recovery is engine-owned"
+
+    def make_chaos(self, *, reason=None, after_status=None, after_rows=None, after_cr_status=None):
+        chaos = object.__new__(Chaos)
+        chaos.ns = "fixture"
+        membership = {
+            "rhiza-0": {"node_id": "rhiza-0", "cluster_id": "source", "config_id": 3,
+                        "voters": ["rhiza-0", "rhiza-1", "rhiza-2"], "wal_identity": "wal-0",
+                        "voting": True, "pending": False},
+            "rhiza-1": {"node_id": "rhiza-1", "cluster_id": "source", "config_id": 3,
+                        "voters": ["rhiza-0", "rhiza-1", "rhiza-2"], "wal_identity": "wal-1",
+                        "voting": True, "pending": False},
+        }
+        status_reads = {pod: 0 for pod in membership}
+        def status(pod):
+            status_reads[pod] += 1
+            source = after_status if after_status is not None and status_reads[pod] > 1 else membership
+            return deepcopy(source[pod])
+        chaos.status = status
+        rows = [[0, "seed"], [4, "acknowledged"]]
+        row_reads = 0
+        def http(*args):
+            nonlocal row_reads
+            row_reads += 1
+            result = after_rows if after_rows is not None and row_reads > 1 else rows
+            return {"rows": deepcopy(result)}
+        chaos.http = http
+        chaos.apply = lambda resource: setattr(chaos, "request", resource)
+        blocked = {"phase": "Blocked", "message": reason or self.blocked_reason, "membership": {}}
+        cr_reads = 0
+        def cr(name):
+            nonlocal cr_reads
+            cr_reads += 1
+            status = after_cr_status if after_cr_status is not None and cr_reads >= 3 else blocked
+            return {"status": deepcopy(status)}
+        chaos.cr = cr
+        chaos.wait = lambda label, predicate, *args, **kwargs: self.assertTrue(predicate(), label)
+        chaos.runtime_gone = lambda uid: True
+        chaos.event = lambda name, **fields: setattr(chaos, "last_event", (name, fields))
+        return chaos
+
+    def reject(self, chaos):
+        with mock.patch("operator_recovery.time.sleep"):
+            chaos.reject_legacy_replacement(
+                "replace-2", "rhiza-2", "old-pod-uid", "old-wal",
+                ["rhiza-0", "rhiza-1"], "learner-a")
+
+    def test_requires_exact_block_reason_and_preserves_membership_and_rows(self):
+        chaos = self.make_chaos()
+        self.reject(chaos)
+
+        membership = chaos.request["spec"]["membership"]
+        self.assertTrue(membership["fence"]["confirmed"])
+        self.assertEqual("legacy_membership_request_rejected_only", chaos.last_event[0])
+        self.assertEqual("ordinary_recovery_is_engine_owned", chaos.last_event[1]["reason"])
+
+    def test_rejects_other_block_reasons(self):
+        chaos = self.make_chaos(reason="confirmed membership fence must bind the removed voter")
+        with self.assertRaisesRegex(AssertionError, "confirmed membership fence"):
+            self.reject(chaos)
+
+    def test_rejects_membership_or_data_changes(self):
+        baseline = {
+            "rhiza-0": {"node_id": "rhiza-0", "cluster_id": "source", "config_id": 3,
+                        "voters": ["rhiza-0", "rhiza-1", "rhiza-2"], "wal_identity": "wal-0",
+                        "voting": True, "pending": False},
+            "rhiza-1": {"node_id": "rhiza-1", "cluster_id": "source", "config_id": 3,
+                        "voters": ["rhiza-0", "rhiza-1", "rhiza-2"], "wal_identity": "wal-1",
+                        "voting": True, "pending": False},
+        }
+        changed = deepcopy(baseline)
+        changed["rhiza-0"]["config_id"] = 4
+        with self.assertRaisesRegex(AssertionError, "membership changed"):
+            self.reject(self.make_chaos(after_status=changed))
+        with self.assertRaisesRegex(AssertionError, "data changed"):
+            self.reject(self.make_chaos(after_rows=[[0, "seed"]]))
+
+    def test_rejects_late_membership_journal_mutation(self):
+        changed = {"phase": "Blocked", "message": self.blocked_reason,
+                   "membership": {"removeRequest": {"operationID": "unexpected"}}}
+        with self.assertRaisesRegex(AssertionError, "removeRequest"):
+            self.reject(self.make_chaos(after_cr_status=changed))
 
 
 if __name__ == "__main__":
