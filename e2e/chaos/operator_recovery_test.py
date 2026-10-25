@@ -1,6 +1,8 @@
 import unittest
 import json
+import tempfile
 from copy import deepcopy
+from pathlib import Path
 from unittest import mock
 
 import operator_recovery
@@ -288,6 +290,83 @@ class LegacyMembershipRejectionTest(unittest.TestCase):
         self.assertEqual("changed", events[0][1]["survivors"][0]["cachedForwardUID"])
         self.assertFalse(events[0][1]["postFailureProbeRequested"])
         self.assertEqual(2, events[0][1]["pods"][0]["restartCount"])
+
+    def test_after_read_failure_persists_projection_when_snapshot_fails(self):
+        with tempfile.TemporaryDirectory() as directory:
+            chaos = self.make_chaos(lambda pod, route, body: {})[0]
+            chaos.out = Path(directory)
+            chaos.events = []
+            chaos.context = "fixture-context"
+            chaos.ns = "fixture"
+            chaos.args = mock.Mock(embedded_host="server")
+            chaos.forwards = {}
+            chaos.event = Chaos.event.__get__(chaos, Chaos)
+            original = TimeoutError("private SQL response canary")
+            query_count = 0
+
+            def http(pod, route, body):
+                nonlocal query_count
+                query_count += 1
+                if query_count == 1:
+                    return {"rows": [[0, "seed"], [4, "acknowledged"]]}
+                raise original
+
+            chaos.http = http
+            with mock.patch("operator_recovery.subprocess.run",
+                            side_effect=RuntimeError("private pod snapshot canary")) as run:
+                with self.assertRaises(TimeoutError) as caught:
+                    self.reject(chaos)
+
+            self.assertIs(original, caught.exception)
+            self.assertEqual(2, query_count)
+            run.assert_called_once()
+            evidence = json.loads(Path(directory, "evidence.json").read_text())
+            event = next(item for item in evidence
+                         if item["event"] == "linearizable_read_failure_diagnostics")
+            self.assertEqual("timeout", event["errorCategory"])
+            self.assertEqual("other_error", event["pods"][0]["errorCategory"])
+            self.assertEqual(2, event["survivors"][0]["membership"]["uniqueVoterCount"])
+            rendered = json.dumps(event, sort_keys=True)
+            self.assertNotIn("private SQL response canary", rendered)
+            self.assertNotIn("private pod snapshot canary", rendered)
+
+    def test_before_read_failure_persists_projection_without_changing_sql_error(self):
+        with tempfile.TemporaryDirectory() as directory:
+            chaos = self.make_chaos(lambda pod, route, body: {})[0]
+            chaos.out = Path(directory)
+            chaos.events = []
+            chaos.context = "fixture-context"
+            chaos.ns = "fixture"
+            chaos.args = mock.Mock(embedded_host="server")
+            chaos.forwards = {}
+            chaos.event = Chaos.event.__get__(chaos, Chaos)
+            original = TimeoutError("private baseline SQL response canary")
+            sql_calls = []
+
+            def http(pod, route, body):
+                sql_calls.append((pod, route, body))
+                raise original
+
+            chaos.http = http
+            with mock.patch("operator_recovery.subprocess.run",
+                            side_effect=RuntimeError("private pod snapshot canary")) as run:
+                with self.assertRaises(TimeoutError) as caught:
+                    self.reject(chaos)
+
+            self.assertIs(original, caught.exception)
+            self.assertEqual(1, len(sql_calls))
+            self.assertEqual("/sql/query", sql_calls[0][1])
+            self.assertEqual("linearizable", sql_calls[0][2]["consistency"])
+            run.assert_called_once()
+            evidence = json.loads(Path(directory, "evidence.json").read_text())
+            event = next(item for item in evidence
+                         if item["event"] == "linearizable_read_failure_diagnostics")
+            self.assertEqual("timeout", event["errorCategory"])
+            self.assertEqual(2, event["survivors"][0]["membership"]["uniqueVoterCount"])
+            self.assertEqual("other_error", event["pods"][0]["errorCategory"])
+            rendered = json.dumps(event, sort_keys=True)
+            self.assertNotIn("private baseline SQL response canary", rendered)
+            self.assertNotIn("private pod snapshot canary", rendered)
 
 
 if __name__ == "__main__":

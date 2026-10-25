@@ -286,6 +286,51 @@ class BucketJobTest(unittest.TestCase):
             self.assertEqual("complete", summary_json["status"])
             self.assertEqual(["learner"], [item["component"] for item in summary_json["captures"]])
 
+    def test_unmanaged_root_and_missing_previous_incarnation_are_not_applicable(self):
+        with tempfile.TemporaryDirectory() as directory:
+            chaos = Chaos(argparse.Namespace(output=directory, cluster="fixture"))
+            fixture = self._diagnostic_fixture()
+            fixture["pod"]["status"]["containerStatuses"][0]["restartCount"] = 0
+            fixture["pod"]["status"]["containerStatuses"][0].pop("lastState")
+
+            errors = self._capture_diagnostics(chaos, fixture)
+
+            private = Path(directory, "private-startup-diagnostics")
+            record = json.loads(Path(private, "record.json").read_text())
+            summary = json.loads(Path(directory, "startup-diagnostics-summary.json").read_text())
+            learner = next(item for item in record["captures"] if item["component"] == "learner")
+            self.assertEqual([], errors)
+            self.assertEqual({"status": "not_applicable"}, record["root"])
+            self.assertEqual("not_applicable", summary["rootStatus"])
+            self.assertEqual({"captured": False, "status": "not_applicable"},
+                             learner["logs"]["previous"])
+            self.assertEqual("complete", summary["status"])
+            self.assertNotIn("root_status_read_failed", summary["captureErrors"])
+            self.assertNotIn("container_incarnation_unavailable", summary["captureErrors"])
+
+    def test_missing_incarnation_with_restart_history_is_a_failure(self):
+        for missing in ("previous", "current"):
+            with self.subTest(missing=missing), tempfile.TemporaryDirectory() as directory:
+                chaos = Chaos(argparse.Namespace(output=directory, cluster="fixture"))
+                fixture = self._diagnostic_fixture()
+                status = fixture["pod"]["status"]["containerStatuses"][0]
+                if missing == "previous":
+                    status.pop("lastState")
+                else:
+                    status.pop("containerID")
+
+                errors = self._capture_diagnostics(chaos, fixture)
+
+                private = Path(directory, "private-startup-diagnostics")
+                record = json.loads(Path(private, "record.json").read_text())
+                summary = json.loads(Path(directory, "startup-diagnostics-summary.json").read_text())
+                learner = next(item for item in record["captures"] if item["component"] == "learner")
+                self.assertIn("container_incarnation_unavailable", errors)
+                self.assertIn("container_incarnation_unavailable", summary["captureErrors"])
+                self.assertEqual("failed", learner["logs"][missing]["status"])
+                self.assertEqual("container_incarnation_unavailable",
+                                 learner["logs"][missing]["errorCode"])
+
     def test_startup_findings_are_fixed_enums_only(self):
         self.assertEqual([], safe_startup_findings(
             "node open phase consensus: nested error says open WAL: PRIVATE_CANARY"))
