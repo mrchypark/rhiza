@@ -363,7 +363,7 @@ class LegacyMembershipRejectionTest(unittest.TestCase):
 
     def test_after_read_failure_persists_projection_when_snapshot_fails(self):
         with tempfile.TemporaryDirectory() as directory:
-            chaos = self.make_chaos(lambda pod, route, body: {})[0]
+            chaos = self.make_chaos()
             chaos.out = Path(directory)
             chaos.events = []
             chaos.context = "fixture-context"
@@ -402,7 +402,7 @@ class LegacyMembershipRejectionTest(unittest.TestCase):
 
     def test_before_read_failure_persists_projection_without_changing_sql_error(self):
         with tempfile.TemporaryDirectory() as directory:
-            chaos = self.make_chaos(lambda pod, route, body: {})[0]
+            chaos = self.make_chaos()
             chaos.out = Path(directory)
             chaos.events = []
             chaos.context = "fixture-context"
