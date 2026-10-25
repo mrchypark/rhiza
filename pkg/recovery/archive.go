@@ -1041,6 +1041,60 @@ func (m *Manager) SyncThrough(ctx context.Context, core source, through quepaxa.
 	}
 }
 
+// SyncPrefixThrough publishes only through the caller's fixed slot without
+// joining the ordinary coalescing batch. It retains the fresh HEAD/sealed
+// check from SyncThrough and the existing publication lease/CAS path. A
+// concurrent writer may publish a later HEAD independently; this call never
+// widens its own target to the live source tip.
+func (m *Manager) SyncPrefixThrough(ctx context.Context, core source, through quepaxa.Slot) error {
+	if through == 0 {
+		return nil
+	}
+	progress := &archiveSyncProgress{}
+	progress.set("fixed-prefix-head-refresh", "not-observed")
+
+	// Register this direct publication under the same close barrier used by
+	// batched work so Close cannot return while it is still publishing.
+	m.batchMu.Lock()
+	if m.closed {
+		m.batchMu.Unlock()
+		return m.archiveSyncError(progress, through, ErrArchiveClosed)
+	}
+	m.batchWG.Add(1)
+	m.batchMu.Unlock()
+	defer m.batchWG.Done()
+
+	workCtx, cancel := context.WithCancel(ctx)
+	stopClose := context.AfterFunc(m.ctx, cancel)
+	defer func() {
+		stopClose()
+		cancel()
+	}()
+	if err := m.ctx.Err(); err != nil {
+		return m.archiveSyncError(progress, through, ErrArchiveClosed)
+	}
+	if err := m.Load(workCtx); err != nil {
+		return m.archiveSyncError(progress, through, err)
+	}
+	if err := workCtx.Err(); err != nil {
+		return m.archiveSyncError(progress, through, err)
+	}
+	m.mu.Lock()
+	tip, sealed := m.tip, m.head.Sealed
+	m.mu.Unlock()
+	if sealed {
+		return ErrArchiveSealed
+	}
+	if tip >= through {
+		return nil
+	}
+	progress.set("fixed-prefix-publish", "not-held")
+	if err := m.syncNow(workCtx, core, through); err != nil {
+		return m.archiveSyncError(progress, through, err)
+	}
+	return nil
+}
+
 func (m *Manager) flushBatch(batch *syncBatch, core source) {
 	defer m.batchWG.Done()
 	timer := time.NewTimer(m.groupDelay)
