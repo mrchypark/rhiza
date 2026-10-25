@@ -163,6 +163,56 @@ func (p *gcsMutationProvider) uploadHeldCreate(ctx context.Context, key string, 
 		PayloadDigest: intent.PayloadDigest, AllCopiesTerminal: true}, nil
 }
 
+func (p *gcsMutationProvider) settleHeldRepairCreate(ctx context.Context, key string, intent fencing.MutationIntent, preparation fencing.MutationPreparation, payload io.Reader) (mutationProviderResult, error) {
+	if p.profile != fencing.MutationHeldExecutionProfile || !fencing.IsHeldCreateEligible(intent, preparation) || preparation.Generation != 0 || !p.matchesIntentScope(intent) || payload == nil {
+		return mutationProviderResult{}, fmt.Errorf("fencing: invalid generation-zero repair settlement")
+	}
+	result, err := p.uploadHeldCreate(ctx, key, intent, preparation, payload)
+	if err == nil && result.Outcome == fencing.MutationCommitted {
+		return result, nil
+	}
+	if err != nil && !gcsConditionFailed(err) {
+		// RetryNever disables SDK retries; it does not prove whether a request
+		// whose response was lost can still complete. Readback can identify the
+		// exact held bytes, but only a successful response makes this helper
+		// request terminal.
+		object := p.object(key)
+		if object == nil {
+			return mutationProviderResult{}, err
+		}
+		attrs, readErr := object.Retryer(storage.WithPolicy(storage.RetryNever)).Attrs(ctx)
+		if readErr != nil {
+			return mutationProviderResult{}, errors.Join(err, readErr)
+		}
+		result = mutationProviderResult{Outcome: fencing.MutationCommitted, Generation: attrs.Generation, Metageneration: attrs.Metageneration,
+			PayloadDigest: intent.PayloadDigest}
+	} else if err == nil && result.ConditionFailed {
+		// The conditional response is terminal for this exact helper request even
+		// though finding the already-created object does not terminalize the
+		// original producer dispatch.
+		helperRequestTerminal := result.AllCopiesTerminal
+		object := p.object(key)
+		if object == nil {
+			return mutationProviderResult{}, fmt.Errorf("fencing: GCS object key escapes the enrolled prefix")
+		}
+		attrs, readErr := object.Retryer(storage.WithPolicy(storage.RetryNever)).Attrs(ctx)
+		if readErr != nil {
+			return mutationProviderResult{}, readErr
+		}
+		result = mutationProviderResult{Outcome: fencing.MutationCommitted, Generation: attrs.Generation, Metageneration: attrs.Metageneration,
+			PayloadDigest: intent.PayloadDigest, AllCopiesTerminal: helperRequestTerminal}
+	} else if err != nil {
+		return mutationProviderResult{}, err
+	}
+	if result.Generation <= 0 || result.Metageneration <= 0 {
+		return mutationProviderResult{}, fmt.Errorf("fencing: generation-zero repair object lacks exact metadata")
+	}
+	if err := p.verifyHeldCreateGeneration(ctx, key, result.Generation, intent); err != nil {
+		return mutationProviderResult{}, err
+	}
+	return result, nil
+}
+
 // heldCreateAuthorization is assembled only after the canonical per-key guard
 // has been read back from protected authority state. The provider does not
 // create or infer that authorization itself.
@@ -293,6 +343,116 @@ func (p *gcsMutationProvider) verifyHeldCreateGeneration(ctx context.Context, ke
 		return fmt.Errorf("fencing: GCS generation is not the exact held mutation object")
 	}
 	return p.verifyHeldCreateBytes(ctx, target, intent)
+}
+
+func (p *gcsMutationProvider) verifyHeldCreateMetadata(ctx context.Context, key string, generation, metageneration, size int64, intent fencing.MutationIntent) error {
+	if generation <= 0 || metageneration <= 0 || size != intent.PayloadSize {
+		return fmt.Errorf("fencing: invalid held-create metadata reference")
+	}
+	object := p.object(key)
+	if object == nil {
+		return fmt.Errorf("fencing: GCS object key escapes the enrolled prefix")
+	}
+	attrs, err := object.Generation(generation).Retryer(storage.WithPolicy(storage.RetryNever)).Attrs(ctx)
+	if err != nil {
+		return err
+	}
+	if attrs.Generation != generation || attrs.Metageneration != metageneration || attrs.Size != size || !attrs.TemporaryHold ||
+		attrs.Metadata["rhiza-operation-id"] != intent.OperationID || attrs.Metadata["rhiza-payload-sha256"] != intent.PayloadDigest {
+		return fmt.Errorf("fencing: held-create metadata differs from its guard")
+	}
+	return p.verifyHeldCreateBytes(ctx, object.Generation(generation).Retryer(storage.WithPolicy(storage.RetryNever)), intent)
+}
+
+func (p *gcsMutationProvider) verifyMutationGenerationZeroBarrier(ctx context.Context, barrier mutationGenerationZeroBarrier) error {
+	if p == nil || barrier.CurrentGeneration <= 0 || barrier.CurrentMetageneration <= 0 || barrier.CurrentOperationID == "" ||
+		!mutationDigestValidOperator(barrier.CurrentPayloadDigest) || barrier.CurrentPayloadSize < 0 {
+		return fmt.Errorf("fencing: incomplete generation-zero live-name barrier")
+	}
+	object := p.object(barrier.Key)
+	if object == nil {
+		return fmt.Errorf("fencing: generation-zero barrier key escapes the enrolled prefix")
+	}
+	attrs, err := object.Retryer(storage.WithPolicy(storage.RetryNever)).Attrs(ctx)
+	if err != nil {
+		return err
+	}
+	wantHold := !barrier.InitialHoldReleased && barrier.CurrentGeneration == barrier.OriginGeneration
+	if attrs.Generation != barrier.CurrentGeneration || attrs.Metageneration != barrier.CurrentMetageneration || attrs.Size != barrier.CurrentPayloadSize ||
+		attrs.Metadata["rhiza-operation-id"] != barrier.CurrentOperationID || attrs.Metadata["rhiza-payload-sha256"] != barrier.CurrentPayloadDigest || attrs.TemporaryHold != wantHold {
+		return fmt.Errorf("fencing: generation-zero barrier live object differs from its durable lineage")
+	}
+	return nil
+}
+
+func (p *gcsMutationProvider) verifyGenerationZeroOrigin(ctx context.Context, barrier mutationGenerationZeroBarrier) error {
+	object := p.object(barrier.Key)
+	if object == nil {
+		return fmt.Errorf("fencing: generation-zero origin key escapes the enrolled prefix")
+	}
+	target := object.Generation(barrier.OriginGeneration).Retryer(storage.WithPolicy(storage.RetryNever))
+	attrs, err := target.Attrs(ctx)
+	if err != nil {
+		return err
+	}
+	wantMeta := barrier.OriginMetageneration
+	wantHold := true
+	if barrier.InitialHoldReleased {
+		wantMeta++
+		wantHold = false
+	}
+	if attrs.Generation != barrier.OriginGeneration || attrs.Metageneration != wantMeta || attrs.Size != barrier.OriginPayloadSize || attrs.TemporaryHold != wantHold ||
+		attrs.Metadata["rhiza-operation-id"] != barrier.OriginOperationID || attrs.Metadata["rhiza-payload-sha256"] != barrier.OriginPayloadDigest {
+		return fmt.Errorf("fencing: generation-zero origin differs from its immutable barrier")
+	}
+	intent := fencing.MutationIntent{Kind: "upload", Key: barrier.Key, OperationID: barrier.OriginOperationID, PayloadDigest: barrier.OriginPayloadDigest,
+		PayloadSize: barrier.OriginPayloadSize}
+	return p.verifyHeldCreateBytes(ctx, target, intent)
+}
+
+// releaseGenerationZeroOriginHold clears only the original exact held
+// generation. A lost metadata-update response is accepted only as the one
+// metageneration increment for that same generation and immutable payload.
+func (p *gcsMutationProvider) releaseGenerationZeroOriginHold(ctx context.Context, barrier mutationGenerationZeroBarrier) (int64, error) {
+	if p == nil || barrier.OriginGeneration <= 0 || barrier.OriginMetageneration <= 0 {
+		return 0, fmt.Errorf("fencing: incomplete generation-zero origin hold")
+	}
+	object := p.object(barrier.Key)
+	if object == nil {
+		return 0, fmt.Errorf("fencing: generation-zero barrier key escapes the enrolled prefix")
+	}
+	target := object.Generation(barrier.OriginGeneration).Retryer(storage.WithPolicy(storage.RetryNever))
+	attrs, err := target.Attrs(ctx)
+	if err != nil {
+		return 0, err
+	}
+	if attrs.Generation != barrier.OriginGeneration || attrs.Size != barrier.OriginPayloadSize ||
+		attrs.Metadata["rhiza-operation-id"] != barrier.OriginOperationID || attrs.Metadata["rhiza-payload-sha256"] != barrier.OriginPayloadDigest {
+		return 0, fmt.Errorf("fencing: generation-zero origin differs before hold release")
+	}
+	if !attrs.TemporaryHold {
+		if attrs.Metageneration != barrier.OriginMetageneration+1 {
+			return 0, fmt.Errorf("fencing: generation-zero origin hold changed outside exact release")
+		}
+		return attrs.Metageneration, nil
+	}
+	if barrier.InitialHoldReleased || attrs.Metageneration != barrier.OriginMetageneration {
+		return 0, fmt.Errorf("fencing: generation-zero origin hold is not the exact initial hold")
+	}
+	if _, err := target.If(storage.Conditions{GenerationMatch: barrier.OriginGeneration, MetagenerationMatch: barrier.OriginMetageneration}).Update(ctx, storage.ObjectAttrsToUpdate{TemporaryHold: false}); err != nil {
+		attrs, readErr := target.Attrs(ctx)
+		if readErr == nil && attrs.Generation == barrier.OriginGeneration && attrs.Metageneration == barrier.OriginMetageneration+1 && !attrs.TemporaryHold &&
+			attrs.Size == barrier.OriginPayloadSize && attrs.Metadata["rhiza-operation-id"] == barrier.OriginOperationID && attrs.Metadata["rhiza-payload-sha256"] == barrier.OriginPayloadDigest {
+			return attrs.Metageneration, nil
+		}
+		return 0, errors.Join(err, readErr)
+	}
+	attrs, err = target.Attrs(ctx)
+	if err != nil || attrs.Generation != barrier.OriginGeneration || attrs.Metageneration != barrier.OriginMetageneration+1 || attrs.TemporaryHold ||
+		attrs.Size != barrier.OriginPayloadSize || attrs.Metadata["rhiza-operation-id"] != barrier.OriginOperationID || attrs.Metadata["rhiza-payload-sha256"] != barrier.OriginPayloadDigest {
+		return 0, errors.Join(err, fmt.Errorf("fencing: generation-zero origin hold release readback differs"))
+	}
+	return attrs.Metageneration, nil
 }
 
 func (p *gcsMutationProvider) verifyHeldCreateBytes(ctx context.Context, target *storage.ObjectHandle, intent fencing.MutationIntent) error {
@@ -489,10 +649,45 @@ func (p *gcsMutationProvider) committed(ctx context.Context, key string, intent 
 		return mutationProviderResult{}, false, err
 	}
 	if attrs.Generation <= 0 || attrs.Size != intent.PayloadSize || attrs.Metadata["rhiza-operation-id"] != intent.OperationID || attrs.Metadata["rhiza-payload-sha256"] != intent.PayloadDigest ||
-		(preparation.Generation == 0 && attrs.Generation <= 0) || (preparation.Generation > 0 && attrs.Generation <= preparation.Generation) {
+		(preparation.Generation == 0 && attrs.Generation <= 0) || (preparation.Generation > 0 && attrs.Generation == preparation.Generation) {
 		return mutationProviderResult{}, false, nil
 	}
 	return mutationProviderResult{Outcome: fencing.MutationCommitted, Generation: attrs.Generation, Metageneration: attrs.Metageneration, PayloadDigest: intent.PayloadDigest, AllCopiesTerminal: true}, true, nil
+}
+
+func (p *gcsMutationProvider) verifyRepairCommit(ctx context.Context, key string, intent fencing.MutationIntent, preparation fencing.MutationPreparation, result mutationProviderResult) error {
+	if p.profile != fencing.MutationHeldExecutionProfile || !p.matchesIntentScope(intent) || intent.Kind != "upload" || preparation.Generation <= 0 ||
+		result.Outcome != fencing.MutationCommitted || result.Generation <= 0 || result.Generation == preparation.Generation || result.Metageneration <= 0 ||
+		result.PayloadDigest != intent.PayloadDigest {
+		return fmt.Errorf("fencing: repair commit proof is outside the exact positive-generation held mutation")
+	}
+	object := p.object(key)
+	if object == nil {
+		return fmt.Errorf("fencing: GCS object key escapes the enrolled prefix")
+	}
+	target := object.Generation(result.Generation).Retryer(storage.WithPolicy(storage.RetryNever))
+	attrs, err := target.Attrs(ctx)
+	if err != nil {
+		return err
+	}
+	if attrs.Generation != result.Generation || attrs.Metageneration != result.Metageneration || attrs.Size != intent.PayloadSize ||
+		attrs.Metadata["rhiza-operation-id"] != intent.OperationID || attrs.Metadata["rhiza-payload-sha256"] != intent.PayloadDigest {
+		return fmt.Errorf("fencing: repair commit object metadata differs from the admitted tuple")
+	}
+	reader, err := target.NewReader(ctx)
+	if err != nil {
+		return err
+	}
+	hash := sha256.New()
+	n, readErr := io.CopyN(hash, reader, intent.PayloadSize+1)
+	closeErr := reader.Close()
+	if readErr != nil && !errors.Is(readErr, io.EOF) {
+		return errors.Join(readErr, closeErr)
+	}
+	if closeErr != nil || n != intent.PayloadSize || hex.EncodeToString(hash.Sum(nil)) != intent.PayloadDigest {
+		return errors.Join(closeErr, fmt.Errorf("fencing: repair commit bytes differ from the sealed payload"))
+	}
+	return nil
 }
 
 func (p *gcsMutationProvider) matchesIntentScope(intent fencing.MutationIntent) bool {

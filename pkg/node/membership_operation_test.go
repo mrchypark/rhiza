@@ -213,7 +213,7 @@ func TestMembershipAdmissionUsesDrainConfigurationAfterTerminal(t *testing.T) {
 		t.Cleanup(func() { _ = wal.Close() })
 		core, err := quepaxa.New(quepaxa.Config{
 			NodeID: member.ID, Cluster: quepaxa.Cluster{ConfigID: 1, Members: initial}, WAL: wal, Transport: transport, EnableReconfiguration: true,
-			ReconfigurationAdmission: func(context.Context, quepaxa.Cluster, quepaxa.Slot, [32]byte) error { admitted.Store(true); return nil },
+			ReconfigurationAdmission: func(context.Context, quepaxa.ReconfigurationAdmission) error { admitted.Store(true); return nil },
 		})
 		if err != nil {
 			t.Fatal(err)
@@ -238,8 +238,19 @@ func TestMembershipAdmissionUsesDrainConfigurationAfterTerminal(t *testing.T) {
 	canceled, cancel := context.WithCancel(ctx)
 	cancel()
 	through := core.Tip() - 1
-	if err := n.verifyMembershipAdmission(canceled, target, through, quepaxa.ValueHash{}); !errors.Is(err, context.Canceled) {
+	if err := n.verifyMembershipAdmission(canceled, quepaxa.ReconfigurationAdmission{Kind: quepaxa.ReconfigurationAdmissionLearner, Target: target, Through: through}); !errors.Is(err, context.Canceled) {
 		t.Fatalf("admission after terminal error=%v, want canceled learner verification", err)
+	}
+}
+
+func TestEngineRemovalAdmissionFailsClosedWithoutStorageVerifier(t *testing.T) {
+	n := &Node{}
+	operation := quepaxa.EngineRemoval{OperationID: "remove-c"}
+	err := n.verifyMembershipAdmission(context.Background(), quepaxa.ReconfigurationAdmission{
+		Kind: quepaxa.ReconfigurationAdmissionEngineRemoval, EngineRemoval: &operation,
+	})
+	if !errors.Is(err, network.ErrNotReady) {
+		t.Fatalf("engine removal admission without verifier=%v, want not ready", err)
 	}
 }
 

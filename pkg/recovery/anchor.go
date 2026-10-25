@@ -372,7 +372,8 @@ func materializeGeneration(ctx context.Context, bucket objstore.Bucket, result F
 	// A base-zero source has no seal from which to infer membership mode, so
 	// enable transition verification. A checkpointed fixed-membership source
 	// retains legacy fixed verification unless its seal carries a history.
-	core, err := quepaxa.NewObserver(quepaxa.Config{NodeID: "rhiza-generation-verifier", Cluster: sourceBootstrap, WAL: wal, EnableReconfiguration: !hasCheckpoint || seal.Membership != nil})
+	verifyMembership := !hasCheckpoint || seal.Membership != nil
+	core, err := quepaxa.NewObserver(quepaxa.Config{NodeID: "rhiza-generation-verifier", Cluster: sourceBootstrap, WAL: wal, EnableReconfiguration: verifyMembership, EngineOwnedRemovals: verifyMembership})
 	if err != nil {
 		return GenerationAnchor{}, err
 	}

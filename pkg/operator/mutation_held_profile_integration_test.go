@@ -139,6 +139,14 @@ type heldGCSObject struct {
 	temporaryHold  bool
 }
 
+type heldGCSRequest struct {
+	Method                string
+	Path                  string
+	IfGenerationMatch     string
+	IfMetagenerationMatch string
+	Status                int
+}
+
 type heldGCSServer struct {
 	mu             sync.Mutex
 	objects        map[string]heldGCSObject
@@ -149,12 +157,37 @@ type heldGCSServer struct {
 	loseCreate     bool
 	failPatch      int
 	onPatch        func()
+	requests       []heldGCSRequest
+}
+
+type heldGCSResponseWriter struct {
+	http.ResponseWriter
+	status int
+}
+
+func (w *heldGCSResponseWriter) WriteHeader(status int) {
+	w.status = status
+	w.ResponseWriter.WriteHeader(status)
+}
+
+func (w *heldGCSResponseWriter) Write(body []byte) (int, error) {
+	if w.status == 0 {
+		w.status = http.StatusOK
+	}
+	return w.ResponseWriter.Write(body)
 }
 
 func newHeldGCSServer(t *testing.T, fixture heldProfileFixture) (*heldGCSServer, *storage.Client) {
 	t.Helper()
 	state := &heldGCSServer{objects: make(map[string]heldGCSObject), nextGeneration: 100, loseCreate: true}
 	server := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		response := &heldGCSResponseWriter{ResponseWriter: w}
+		w = response
+		if r.Method == http.MethodGet && r.URL.EscapedPath() == "/storage/v1/b/archive" {
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = io.WriteString(w, `{"kind":"storage#bucket","name":"archive","metageneration":"1","lifecycle":{"rule":[]}}`)
+			return
+		}
 		name := r.URL.Query().Get("name")
 		if name == "" {
 			escapedPath := r.URL.EscapedPath()
@@ -167,6 +200,13 @@ func newHeldGCSServer(t *testing.T, fixture heldProfileFixture) (*heldGCSServer,
 		}
 		state.mu.Lock()
 		defer state.mu.Unlock()
+		if r.Method == http.MethodPost || r.Method == http.MethodPatch || r.Method == http.MethodDelete {
+			defer func() {
+				state.requests = append(state.requests, heldGCSRequest{Method: r.Method, Path: r.URL.EscapedPath(),
+					IfGenerationMatch: r.URL.Query().Get("ifGenerationMatch"), IfMetagenerationMatch: r.URL.Query().Get("ifMetagenerationMatch"),
+					Status: response.status})
+			}()
+		}
 		switch r.Method {
 		case http.MethodPost:
 			state.posts++
@@ -261,6 +301,15 @@ func newHeldGCSServer(t *testing.T, fixture heldProfileFixture) (*heldGCSServer,
 	t.Cleanup(func() { _ = client.Close() })
 	fixture.e.SourceMutationStorage = client
 	return state, client
+}
+
+func (s *heldGCSServer) diagnostic(name string) string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	object, exists := s.objects[name]
+	return fmt.Sprintf("requests=%+v currentObjectExists=%t generation=%d metageneration=%d temporaryHold=%t operationID=%q payloadDigest=%q nextGeneration=%d",
+		s.requests, exists, object.generation, object.metageneration, object.temporaryHold,
+		object.metadata["rhiza-operation-id"], object.metadata["rhiza-payload-sha256"], s.nextGeneration)
 }
 
 func readHeldGCSUpload(r *http.Request) (map[string]any, []byte, error) {

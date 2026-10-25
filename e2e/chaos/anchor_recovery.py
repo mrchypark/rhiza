@@ -13,14 +13,13 @@ import subprocess
 import time
 
 from automatic_recovery import AutomaticChaos
-from kind_fencer import KindFencer
 from operator_fixture import AWS_CLI_IMAGE
 
 ANCHOR_ID = "chaos-anchor"
 ANCHOR_CM = "rhiza-anchor-chaos-anchor"
 SOURCE_CLUSTER = "chaos-source"
 ANCHOR_SA = "anchor-service"
-STORE_CFG = ["s3", "rhiza-minio:9000", "rhiza", "rhiza", SOURCE_CLUSTER]
+STORE_CFG = ["s3", "rhiza-versitygw:9000", "rhiza", "rhiza", SOURCE_CLUSTER]
 ANCHOR_ENV = [
     {"name": "RHIZA_RECOVERY_ANCHOR_ID", "value": ANCHOR_ID},
     {"name": "RHIZA_NAMESPACE", "value": "__NS__"},
@@ -58,6 +57,14 @@ def make_anchor_record(src_cluster):
 
 class AnchorChaos(AutomaticChaos):
 
+    def before_supervised_root(self):
+        self.wait("anchor pod running", self._anchor_running, 120)
+
+    def supervised_root_resource(self):
+        resource = super().supervised_root_resource()
+        resource["spec"]["anchorID"] = ANCHOR_ID
+        return resource
+
     def apply(self, objs):
         ns = self.ns
         items = objs if isinstance(objs, list) else [objs]
@@ -70,12 +77,35 @@ class AnchorChaos(AutomaticChaos):
                 obj["data"]["RHIZA_RECOVERY_ANCHOR_TOKEN_FILE"] = "/anchor/token"
                 obj["data"]["RHIZA_RECOVERY_ANCHOR_CA_FILE"] = "/anchor/ca.crt"
             if kind == "StatefulSet" and name == "rhiza":
+                podspec = obj["spec"]["template"]["spec"]
                 ctr = obj["spec"]["template"]["spec"]["containers"][0]
                 env = ctr.get("env", [])
                 for e in ANCHOR_ENV:
                     env.append({"name": e["name"],
                                 "value": e["value"].replace("__NS__", ns)})
                 ctr["env"] = env
+                podspec["serviceAccountName"] = "rhiza-supervised"
+                podspec["automountServiceAccountToken"] = False
+                podspec.setdefault("securityContext", {})["fsGroup"] = 65532
+                podspec.setdefault("volumes", []).append({
+                    "name": "anchor-api",
+                    "projected": {
+                        "defaultMode": 0o440,
+                        "sources": [
+                            {"serviceAccountToken": {"path": "token"}},
+                            {"configMap": {
+                                "name": "kube-root-ca.crt",
+                                "optional": False,
+                                "items": [{"key": "ca.crt", "path": "ca.crt"}],
+                            }},
+                        ],
+                    },
+                })
+                ctr.setdefault("volumeMounts", []).append({
+                    "name": "anchor-api",
+                    "mountPath": "/var/run/secrets/kubernetes.io/serviceaccount",
+                    "readOnly": True,
+                })
             if kind == "Deployment" and name == "rhiza-operator":
                 ctr = obj["spec"]["template"]["spec"]["containers"][0]
                 env = ctr.get("env", [])
@@ -138,7 +168,7 @@ class AnchorChaos(AutomaticChaos):
                         "verbs": ["get", "update"]}]},
             {"apiVersion": "rbac.authorization.k8s.io/v1", "kind": "RoleBinding",
              "metadata": {"name": "anchor-app-guard", "namespace": ns},
-             "subjects": [{"kind": "ServiceAccount", "name": "default",
+             "subjects": [{"kind": "ServiceAccount", "name": "rhiza-supervised",
                            "namespace": ns}],
              "roleRef": {"apiGroup": "rbac.authorization.k8s.io",
                          "kind": "Role", "name": "anchor-app-guard"}},
@@ -181,7 +211,7 @@ class AnchorChaos(AutomaticChaos):
         args = mc_args[1:]
         if service == "s3":
             args = ["s3://" + arg.removeprefix("local/") for arg in args]
-        full = ("aws --endpoint-url http://rhiza-minio:9000 " + service + " "
+        full = ("aws --endpoint-url http://rhiza-versitygw:9000 " + service + " "
                 + mc_args[0] + " " + " ".join(args))
         pod = f"mc-{time.time_ns()}"
         self.apply({
@@ -192,8 +222,8 @@ class AnchorChaos(AutomaticChaos):
                          "command": ["/bin/sh", "-c"],
                          "args": [full],
                          "env": [
-                             {"name": "AWS_ACCESS_KEY_ID", "value": "chaos-minio"},
-                             {"name": "AWS_SECRET_ACCESS_KEY", "value": "chaos-minio-secret"},
+                             {"name": "AWS_ACCESS_KEY_ID", "value": "chaos-versity"},
+                             {"name": "AWS_SECRET_ACCESS_KEY", "value": "chaos-versity-secret"},
                              {"name": "AWS_DEFAULT_REGION", "value": "us-east-1"},
                          ]}]}})
         self.wait(f"mc {mc_args[0]}", lambda: self._mc_done(pod), 120)
@@ -264,35 +294,17 @@ class AnchorChaos(AutomaticChaos):
         # Now setup (reapplies namespace idempotently, creates fixture).
         self.setup()
 
-        # Enable automatic recovery.
-        self.k("set", "env", "deployment/rhiza-operator",
-                "RHIZA_AUTOMATIC_RECOVERY=true",
-                "RHIZA_FENCER_BACKEND=kubernetes")
-        self.k("rollout", "status", "deployment/rhiza-operator",
-                "--timeout=120s")
-
-        self.wait("anchor pod running", self._anchor_running, 120)
-
-        # Create RhizaCluster WITH anchorID.
-        self.apply({"apiVersion": "rhiza.mrchypark.dev/v1alpha1",
-                    "kind": "RhizaCluster",
-                    "metadata": {"name": "rhiza", "namespace": self.ns},
-                    "spec": {"anchorID": ANCHOR_ID,
-                             "logicalID": "chaos",
-                             "statefulSet": "rhiza", "container": "rhiza",
-                             "adoptClusterID": SOURCE_CLUSTER,
-                             "automatic": True,
-                             "voterCount": 3,
-                             "policy": {"failureGraceSeconds": 15,
-                                        "cooldownSeconds": 3,
-                                        "maxRecoveriesPerDay": 10,
-                                        "allowDataLoss": False}}})
         self.wait("automatic cluster healthy", self.healthy, 180)
 
         # Stop writer before snapshotting the source archive.
         self.stop.set()
         self.writer.join(timeout=15)
         assert not self.writer.is_alive()
+
+        self.verify_idempotent_write(
+            "rhiza-0", "anchor-baseline-write",
+            "INSERT INTO chaos_items VALUES (10003, 'anchor-baseline')",
+            (10003, "anchor-baseline"))
 
         anchor_before = self.get("configmap", ANCHOR_CM)
         assert json.loads(anchor_before["data"]["anchor.json"]) == \
@@ -315,13 +327,9 @@ class AnchorChaos(AutomaticChaos):
         assert operator_env.get("RHIZA_RECOVERY_ANCHOR_CA_FILE") == "/anchor/ca.crt"
         archive_before = self._stable_source_archive_snapshot()
 
-        self.executor = KindFencer(self)
-        self.executor.start()
-
         current = ["rhiza-0", "rhiza-1", "rhiza-2"]
         for pod in current:
             self.udp(pod, True)
-        self.executor.enabled = True
         dr = self.wait("confirmed generation fence",
             lambda: next((f for f in self.fences()
                 if f["spec"]["scope"] == "Generation" and
@@ -429,7 +437,7 @@ class AnchorChaos(AutomaticChaos):
                                  {"name": "RHIZA_OBJSTORE_PROVIDER",
                                   "value": "s3"},
                                  {"name": "RHIZA_OBJSTORE_ENDPOINT",
-                                  "value": "rhiza-minio:9000"},
+                                  "value": "rhiza-versitygw:9000"},
                                  {"name": "RHIZA_OBJSTORE_BUCKET",
                                   "value": "rhiza"},
                                  {"name": "RHIZA_OBJSTORE_PREFIX",
@@ -437,9 +445,9 @@ class AnchorChaos(AutomaticChaos):
                                  {"name": "RHIZA_OBJSTORE_INSECURE",
                                   "value": "true"},
                                  {"name": "AWS_ACCESS_KEY_ID",
-                                  "value": "chaos-minio"},
+                                  "value": "chaos-versity"},
                                  {"name": "AWS_SECRET_ACCESS_KEY",
-                                  "value": "chaos-minio-secret"},
+                                  "value": "chaos-versity-secret"},
                                  {"name": "AWS_REGION",
                                   "value": "us-east-1"},
                              ],
@@ -493,8 +501,6 @@ class AnchorChaos(AutomaticChaos):
         except RuntimeError:
             pass
         super().cleanup()
-        if hasattr(self, "executor"):
-            self.executor.close()
 
 
 def main():
@@ -511,6 +517,14 @@ def main():
     chaos = AnchorChaos(parser.parse_args())
     try:
         chaos.run()
+    except Exception as original:
+        try:
+            errors = chaos.capture_failure_diagnostics()
+        except Exception:
+            errors = ["diagnostic_capture_failed"]
+        if errors:
+            raise RuntimeError(f"{original}; bounded diagnostic capture errors: {errors}") from original
+        raise
     finally:
         chaos.cleanup()
 

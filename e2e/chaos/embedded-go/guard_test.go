@@ -4,9 +4,13 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"net/http"
+	"net/http/httptest"
+	"strings"
 	"sync"
 	"testing"
 
+	"github.com/mrchypark/rhiza"
 	"github.com/mrchypark/rhiza/pkg/recoveryanchor"
 )
 
@@ -60,14 +64,16 @@ func (b *fakeBackend) CAS(_ context.Context, id string, version string, rec reco
 	return nil
 }
 
-func srcSID() string { return storageID("s3", "rhiza-minio:9000", "rhiza", "rhiza", "test-cluster") }
+func srcSID() string {
+	return storageID("s3", "rhiza-versitygw:9000", "rhiza", "rhiza", "test-cluster")
+}
 
 func TestGuardReserveClearCycle(t *testing.T) {
 	b := newFakeBackend()
 	const aid = "test-anchor"
 	b.seed(aid, recoveryanchor.Record{
 		Version: recoveryanchor.Version1, EvidenceFormat: "sql-epoch-token/v1",
-		Binding: recoveryanchor.Binding{ClusterID: "test-cluster", StorageID: srcSID()},
+		Binding:  recoveryanchor.Binding{ClusterID: "test-cluster", StorageID: srcSID()},
 		Evidence: []byte(`{"epoch":1,"token":"initial"}`), Generation: 0})
 	guard := newAnchorGuard(b, aid, "test-cluster")
 	ctx := context.Background()
@@ -99,7 +105,7 @@ func TestGuardRejectsStaleBinding(t *testing.T) {
 	const aid = "test-anchor"
 	b.seed(aid, recoveryanchor.Record{
 		Version: recoveryanchor.Version1, EvidenceFormat: "sql-epoch-token/v1",
-		Binding: recoveryanchor.Binding{ClusterID: "test-cluster", StorageID: srcSID()},
+		Binding:  recoveryanchor.Binding{ClusterID: "test-cluster", StorageID: srcSID()},
 		Evidence: []byte(`{"epoch":1,"token":"initial"}`), Generation: 0})
 	guard := newAnchorGuard(b, aid, "test-cluster")
 
@@ -109,7 +115,7 @@ func TestGuardRejectsStaleBinding(t *testing.T) {
 	b.mu.Lock()
 	raw, _ := json.Marshal(recoveryanchor.Record{
 		Version: recoveryanchor.Version1, EvidenceFormat: "sql-epoch-token/v1",
-		Binding: recoveryanchor.Binding{ClusterID: "other", StorageID: "other-sid"},
+		Binding:  recoveryanchor.Binding{ClusterID: "other", StorageID: "other-sid"},
 		Evidence: []byte(`{"epoch":1,"token":"initial"}`), PendingWrite: true, Generation: 0})
 	b.data[aid] = string(raw)
 	b.version[aid]++
@@ -125,7 +131,7 @@ func TestGuardRejectsPendingAlready(t *testing.T) {
 	const aid = "test-anchor"
 	b.seed(aid, recoveryanchor.Record{
 		Version: recoveryanchor.Version1, EvidenceFormat: "sql-epoch-token/v1",
-		Binding: recoveryanchor.Binding{ClusterID: "test-cluster", StorageID: srcSID()},
+		Binding:  recoveryanchor.Binding{ClusterID: "test-cluster", StorageID: srcSID()},
 		Evidence: []byte(`{"epoch":1,"token":"initial"}`), PendingWrite: true, Generation: 0})
 	guard := newAnchorGuard(b, aid, "test-cluster")
 	_, err := guard.reserve(context.Background())
@@ -139,7 +145,7 @@ func TestGuardRejectsWrongStorageID(t *testing.T) {
 	const aid = "test-anchor"
 	b.seed(aid, recoveryanchor.Record{
 		Version: recoveryanchor.Version1, EvidenceFormat: "sql-epoch-token/v1",
-		Binding: recoveryanchor.Binding{ClusterID: "test-cluster", StorageID: "wrong"},
+		Binding:  recoveryanchor.Binding{ClusterID: "test-cluster", StorageID: "wrong"},
 		Evidence: []byte(`{"epoch":1,"token":"initial"}`), Generation: 0})
 	guard := newAnchorGuard(b, aid, "test-cluster")
 	_, err := guard.reserve(context.Background())
@@ -153,12 +159,55 @@ func TestGuardRejectsTransition(t *testing.T) {
 	const aid = "test-anchor"
 	b.seed(aid, recoveryanchor.Record{
 		Version: recoveryanchor.Version1, EvidenceFormat: "sql-epoch-token/v1",
-		Binding: recoveryanchor.Binding{ClusterID: "test-cluster", StorageID: srcSID()},
+		Binding:  recoveryanchor.Binding{ClusterID: "test-cluster", StorageID: srcSID()},
 		Evidence: []byte(`{"epoch":1,"token":"initial"}`), Generation: 0,
 		Transition: &recoveryanchor.Transition{}})
 	guard := newAnchorGuard(b, aid, "test-cluster")
 	_, err := guard.reserve(context.Background())
 	if err == nil {
 		t.Fatal("should reject active transition")
+	}
+}
+
+func TestSQLExecuteHandlerRejectsWriteWhenAnchorReadFails(t *testing.T) {
+	ctx := context.Background()
+	store := t.TempDir()
+	db, err := rhiza.Open(ctx, rhiza.Config{
+		ClusterID: "anchor-guard-handler", NodeID: "voter",
+		DataDir: t.TempDir(), ObjStoreProvider: "filesystem", ObjStoreDir: store,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		if err := db.Close(); err != nil {
+			t.Error(err)
+		}
+	})
+	if _, err := db.Execute(ctx, rhiza.ExecuteRequest{
+		RequestID: "create-table",
+		SQL:       "CREATE TABLE guarded_writes (id INTEGER PRIMARY KEY)",
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	guard := newAnchorGuard(newFakeBackend(), "missing-anchor", "anchor-guard-handler")
+	handler := sqlExecuteHandler(db, guard)
+	response := httptest.NewRecorder()
+	request := httptest.NewRequest(http.MethodPost, "/sql/execute", strings.NewReader(
+		`{"request_id":"guarded-insert","sql":"INSERT INTO guarded_writes VALUES (1)"}`))
+	handler.ServeHTTP(response, request)
+	if response.Code != http.StatusServiceUnavailable {
+		t.Fatalf("guard rejection status=%d body=%s, want %d", response.Code, response.Body.String(), http.StatusServiceUnavailable)
+	}
+
+	readback, err := db.Query(ctx, rhiza.QueryRequest{
+		SQL: "SELECT id FROM guarded_writes WHERE id = 1",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(readback.Rows) != 0 {
+		t.Fatalf("guarded INSERT reached the database: rows=%v", readback.Rows)
 	}
 }

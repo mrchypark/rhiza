@@ -389,6 +389,50 @@ func TestIndependentGCSChaosManifestContract(t *testing.T) {
 	}
 }
 
+func TestEmbeddedProfilesKeepApplicationAndRecoveryPortsSeparate(t *testing.T) {
+	goHost := readContractFile(t, "main.go")
+	rustHost := readContractFile(t, "../../../sdk/rust/examples/operator_chaos.rs")
+	automatic := readContractFile(t, "../automatic_recovery.py")
+	operatorRecovery := readContractFile(t, "../operator_recovery.py")
+	fixture := readContractFile(t, "../operator_fixture.py")
+
+	for _, want := range []string{
+		`const recoveryAddr = "0.0.0.0:9091"`,
+		`Addr: recoveryAddr, Handler: operatorHandler`,
+		`Addr: ":8080", Handler: app`,
+	} {
+		if !strings.Contains(goHost, want) {
+			t.Errorf("embedded Go host missing separate recovery/app listener contract %q", want)
+		}
+	}
+	for _, want := range []string{
+		`const RECOVERY_ADDR: &str = "0.0.0.0:9091"`,
+		`db.start_operator(RECOVERY_ADDR)?`,
+		`TcpListener::bind("0.0.0.0:8080")?`,
+	} {
+		if !strings.Contains(rustHost, want) {
+			t.Errorf("embedded Rust host missing separate recovery/app listener contract %q", want)
+		}
+	}
+	if !strings.Contains(fixture, `"RHIZA_BIND_ADDR": "0.0.0.0:8080"`) {
+		t.Fatal("fixture RHIZA_BIND_ADDR must remain on the application HTTP port")
+	}
+	if strings.Contains(automatic, `obj["data"]["RHIZA_BIND_ADDR"] = "0.0.0.0:9091"`) {
+		t.Fatal("automatic fixture must not rewrite the application bind address to its recovery port")
+	}
+	for _, want := range []string{
+		`{"name": "recovery", "containerPort": 9091}`,
+		`("/membership/status", 8080), ("/sql/query", 9091)`,
+	} {
+		if !strings.Contains(automatic, want) {
+			t.Errorf("automatic fixture lost its distinct recovery-port contract %q", want)
+		}
+	}
+	if !strings.Contains(operatorRecovery, `remote_port = 9091 if embedded and route.startswith(("/membership/", "/recovery/")) else 8080`) {
+		t.Fatal("automatic fixture must route membership/recovery to 9091 and application HTTP to 8080")
+	}
+}
+
 func assertProbePairPlacement(t *testing.T, manifest string) {
 	t.Helper()
 	type podAffinityTerm struct {
@@ -1045,7 +1089,7 @@ func TestIAMProbePodIdentityRejectsPrivilegeMutation(t *testing.T) {
 					map[string]any{"name": "RHIZA_GCS_IAM_PROBE_MANIFEST_GENERATION", "value": "6"},
 					map[string]any{"name": "RHIZA_GCS_IAM_PROBE_CREATE_GENERATION", "value": "0"},
 					map[string]any{"name": "RHIZA_GCS_IAM_PROBE_UPDATE_GENERATION", "value": "0"},
-					map[string]any{"name": "RHIZA_GCS_IAM_PROBE_EXPECTED_GSA", "value": "rhiza-reader@project.iam.gserviceaccount.com"},
+					map[string]any{"name": "RHIZA_GCS_IAM_PROBE_EXPECTED_GSA", "value": "rhiza-probe@test-project.iam.gserviceaccount.com"},
 				},
 				"securityContext": map[string]any{
 					"runAsNonRoot": true, "readOnlyRootFilesystem": true,
@@ -1060,7 +1104,7 @@ func TestIAMProbePodIdentityRejectsPrivilegeMutation(t *testing.T) {
 		"--arg", "ksa", "rhiza-workload", "--arg", "image", "example.invalid/rhiza@sha256:abc",
 		"--arg", "mode", "reader", "--arg", "bucket", "bucket", "--arg", "prefix", "qual/1234abcd/data/",
 		"--arg", "nonce", strings.Repeat("b", 32), "--arg", "manifest", "6", "--arg", "create", "0",
-		"--arg", "update", "0", "--arg", "gsa", "rhiza-reader@project.iam.gserviceaccount.com", filter}
+		"--arg", "update", "0", "--arg", "gsa", "rhiza-probe@test-project.iam.gserviceaccount.com", filter}
 	runFilter := func(pod map[string]any) error {
 		data, err := json.Marshal(pod)
 		if err != nil {

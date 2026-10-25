@@ -77,6 +77,7 @@ type Server struct {
 	cluster              types.ClusterID
 	mux                  *http.ServeMux
 	ready                func() bool
+	peerLearnReady       func() bool
 	writable             bool
 	sqlBatcher           *mutationBatcher[types.SQLCommand]
 	graphBatcher         *mutationBatcher[types.GraphCommand]
@@ -376,6 +377,22 @@ func (s *Server) Ready() bool {
 	s.proposeMu.Lock()
 	defer s.proposeMu.Unlock()
 	return s.lifecycleFailure == nil
+}
+
+// PeerLearnReady gates authenticated peer decisions only. It is independent
+// of HTTP serving readiness for supervised engine-repair candidates that must
+// learn their ADD before receiving producer-backed serving authority.
+func (s *Server) PeerLearnReady() bool {
+	if s.peerLearnReady != nil {
+		return s.peerLearnReady()
+	}
+	return s.Ready()
+}
+
+// SetPeerLearnReady installs the private peer-decision admission predicate
+// before the server is exposed. Public API and ReadIndex still use Ready.
+func (s *Server) SetPeerLearnReady(ready func() bool) {
+	s.peerLearnReady = ready
 }
 
 func (s *Server) localFailure() error {

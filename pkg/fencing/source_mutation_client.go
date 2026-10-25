@@ -12,6 +12,10 @@ var (
 	errMutationExcluded        = errors.New("fencing: original mutation was excluded")
 	errMutationRejected        = errors.New("fencing: original mutation was rejected")
 	ErrMutationConditionFailed = errors.New("fencing: original storage condition failed")
+	// ErrMutationDeferred identifies an authority-authenticated terminal
+	// resolution that did not apply a storage effect. Callers may defer/retry
+	// their higher-level work, but must not count it as a successful mutation.
+	ErrMutationDeferred = errors.New("fencing: mutation was terminally deferred without storage effect")
 )
 
 // sourceMutationAuthority is deliberately narrow and internal. Implementations
@@ -224,6 +228,12 @@ func (c *sourceMutationClient) settle(ctx context.Context, step sourceRetryStep)
 }
 
 func (c *sourceMutationClient) finish(step sourceRetryStep) error {
+	if step.Entry.Resolution == nil {
+		return ErrPending
+	}
+	if err := validateMutationResolutionReason(step.Entry, *step.Entry.Resolution); err != nil {
+		return fmt.Errorf("fencing: authority returned an invalid terminal reason: %w", err)
+	}
 	if !step.Advanced {
 		if err := c.state.advance(step.Sequence, step.Entry.Intent); err != nil {
 			return err
@@ -235,6 +245,9 @@ func (c *sourceMutationClient) finish(step sourceRetryStep) error {
 	case MutationExcluded:
 		return errMutationExcluded
 	case MutationRejected:
+		if step.Entry.Resolution.Reason == MutationResolutionReasonGenerationZeroPinned {
+			return errors.Join(errMutationRejected, ErrMutationDeferred)
+		}
 		if step.Entry.Resolution.ConditionFailed {
 			return ErrMutationConditionFailed
 		}

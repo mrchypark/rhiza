@@ -404,6 +404,7 @@ func (c *Core) estimateLocalCompactionOwned(seal CheckpointSeal) (uint64, error)
 func (c *Core) verifyBaseSuffixLocked(base consensusBase) (*Core, error) {
 	v := newCore(c.nodeID, c.config, nil, nil)
 	v.reconfigEnabled = c.reconfigEnabled
+	v.engineOwnedRemovals = c.engineOwnedRemovals
 	v.generationAnchorHash = c.generationAnchorHash
 	if err := v.installGenerationAnchorBaseLocked(base.GenerationAnchorHash); err != nil {
 		return nil, err

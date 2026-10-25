@@ -12,15 +12,40 @@ import (
 
 func TestIndependentBootstrapRendersDistinctWorkloadAndControlIdentities(t *testing.T) {
 	run := "a1b2c3d4"
-	readonlyGSA := "rhiza-v0191-readonly-" + run
+	manifest, err := os.ReadFile("../../../sdk/rust/Cargo.toml")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var version string
+	for _, line := range strings.Split(string(manifest), "\n") {
+		if strings.HasPrefix(line, "version = \"") {
+			version = strings.TrimSuffix(strings.TrimPrefix(line, "version = \""), "\"")
+			break
+		}
+	}
+	if version == "" {
+		t.Fatal("SDK version missing from Cargo.toml")
+	}
+	versionPrefix := "v" + strings.ReplaceAll(version, ".", "")
+	readonlyGSA := "rhiza-" + versionPrefix + "-readonly-" + run
+	writerGSA := "rhiza-" + versionPrefix + "-gcs-" + run
+	namespace := "rhiza-" + versionPrefix + "-" + run
+	prefix := "postrelease/v" + version + "/" + run + "/"
 	cmd := exec.Command("/bin/sh", "../bootstrap-gcs-postrelease.sh", "render-local")
-	cmd.Env = append(cmd.Env, qualificationAssetEnv(run)...)
 	cmd.Env = append(cmd.Env,
 		"PATH="+os.Getenv("PATH"),
+		"RHIZA_GCP_PROJECT_ID=example-project",
+		"RHIZA_GCP_PROJECT_NUMBER=123456789012",
+		"RHIZA_GKE_CLUSTER=test-cluster",
+		"RHIZA_GKE_LOCATION=test-region1",
+		"RHIZA_KUBE_CONTEXT=gke_example-project_test-region1_test-cluster",
+		"RHIZA_GCS_BUCKET=rhiza-qualification-fixture",
+		"RHIZA_GCS_PREFIX="+prefix,
+		"RHIZA_DATA_GSA_ID="+writerGSA,
 		"RHIZA_GCS_INDEPENDENT_LAYOUT=yes",
 		"RHIZA_READONLY_WORKLOAD_GSA_ID="+readonlyGSA,
 		"RHIZA_RUN_ID="+run,
-		"RHIZA_NAMESPACE=rhiza-qualification-"+run,
+		"RHIZA_NAMESPACE="+namespace,
 		"RHIZA_HARNESS_SHA="+strings.Repeat("a", 40),
 		"RHIZA_AUTH_EXPIRES=2099-01-01T00:00:00Z",
 		"RHIZA_HOST_IMAGE=registry.example/rhiza@sha256:"+strings.Repeat("a", 64),
@@ -36,13 +61,13 @@ func TestIndependentBootstrapRendersDistinctWorkloadAndControlIdentities(t *test
 		"iam.gke.io/gcp-service-account: " + readonlyGSA + "@example-project.iam.gserviceaccount.com",
 		"name: rhiza-operator",
 		"name: rhiza-fencer",
-		"iam.gke.io/gcp-service-account: rhiza-v0191-gcs-" + run + "@example-project.iam.gserviceaccount.com",
+		"iam.gke.io/gcp-service-account: " + writerGSA + "@example-project.iam.gserviceaccount.com",
 	} {
 		if !bytes.Contains(output, []byte(want)) {
 			t.Errorf("independent render missing %q", want)
 		}
 	}
-	if strings.Contains(string(output), "name: rhiza-workload\n  namespace: rhiza-qualification-"+run+"\n  annotations:\n    iam.gke.io/gcp-service-account: rhiza-v0191-gcs-") {
+	if strings.Contains(string(output), "name: rhiza-workload\n  namespace: "+namespace+"\n  annotations:\n    iam.gke.io/gcp-service-account: "+writerGSA) {
 		t.Fatal("workload KSA was rendered with the writer identity")
 	}
 }

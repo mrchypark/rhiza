@@ -289,6 +289,32 @@ func TestNonMemberLearnerMayOnlyFetchCertifiedDecisions(t *testing.T) {
 	}
 }
 
+func TestSupervisedCandidateMayLearnWhilePublicAndReadIndexReadinessStayClosed(t *testing.T) {
+	member := testMember("cluster", "voter", "voter-token")
+	core := mustCore(t, member.ID, []quepaxa.Member{member}, nil, nil)
+	server := NewServer(core, nil, "cluster", true, nil, func() bool { return false })
+	defer server.Close()
+	peer := &PeerServer{server: server, members: map[quepaxa.NodeID]quepaxa.Member{member.ID: member}}
+	certificateKey := PeerPublicKey("cluster", member.ID, "voter-token")
+	request := &peerfb.RequestT{ClusterId: "cluster", SenderId: string(member.ID), ConfigId: uint64(core.ConfigID()), Operation: peerfb.OperationLearned}
+	server.SetPeerLearnReady(func() bool { return true })
+	if server.Ready() || !server.PeerLearnReady() {
+		t.Fatal("peer-learning readiness changed public serving readiness")
+	}
+	if _, err := peer.handle(context.Background(), certificateKey, request); err == nil || errors.Is(err, ErrNotReady) {
+		t.Fatalf("authenticated peer Learn was gated by public readiness instead of request validation: %v", err)
+	}
+	request.Operation = peerfb.OperationReadIndex
+	if _, err := peer.handle(context.Background(), certificateKey, request); !errors.Is(err, ErrNotReady) {
+		t.Fatalf("peer read-index crossed the closed serving-readiness boundary: %v", err)
+	}
+	server.SetPeerLearnReady(nil)
+	request.Operation = peerfb.OperationLearned
+	if _, err := peer.handle(context.Background(), certificateKey, request); !errors.Is(err, ErrNotReady) {
+		t.Fatalf("ordinary peer Learn did not retain public readiness gating: %v", err)
+	}
+}
+
 func TestPeerConnectionWaitHonorsContext(t *testing.T) {
 	member := quepaxa.Member{ID: "n1", PeerURL: "quic://127.0.0.1:1"}
 	transport := NewTransport("cluster", "n1", &quepaxa.Cluster{Members: []quepaxa.Member{member}}, "secret")

@@ -24,7 +24,7 @@ func TestPromotedLearnerVotesAfterMembershipBaseRestart(t *testing.T) {
 	}
 	transport.cores["d"] = learner
 	for _, core := range cores {
-		core.reconfigAdmission = func(context.Context, Cluster, Slot, [32]byte) error { return nil }
+		core.reconfigAdmission = func(context.Context, ReconfigurationAdmission) error { return nil }
 	}
 	target := Cluster{ConfigID: 2, Members: append(initial.Members, Member{ID: "d", WALIdentity: learner.WALIdentity()})}
 	if _, err := cores["a"].BeginReconfiguration(context.Background(), target); err != nil {

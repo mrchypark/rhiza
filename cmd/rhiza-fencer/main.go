@@ -18,6 +18,7 @@ import (
 	"time"
 
 	"cloud.google.com/go/storage"
+	"github.com/mrchypark/rhiza"
 	objectstore "github.com/mrchypark/rhiza/internal/objstore"
 	"github.com/mrchypark/rhiza/pkg/fencing"
 	"github.com/mrchypark/rhiza/pkg/operator"
@@ -82,7 +83,11 @@ func supervise(ctx context.Context, args []string) error {
 	if podName == "" {
 		podName = os.Getenv("RHIZA_NODE_ID")
 	}
-	s := &fencing.Supervisor{Authority: &fencing.AuthorityClient{URL: *endpoint, TokenFile: *token, Client: client}, SocketPath: *socket, Command: f.Args(), Identity: fencing.Identity{SourceClusterID: os.Getenv("RHIZA_CLUSTER_ID"), NodeID: os.Getenv("RHIZA_NODE_ID"), PodName: podName, PodUID: os.Getenv("POD_UID")}}
+	preflight, err := rhiza.EngineRepairPreflightFromEnv()
+	if err != nil {
+		return err
+	}
+	s := &fencing.Supervisor{Authority: &fencing.AuthorityClient{URL: *endpoint, TokenFile: *token, Client: client}, SocketPath: *socket, Command: f.Args(), Preflight: preflight, Identity: fencing.Identity{SourceClusterID: os.Getenv("RHIZA_CLUSTER_ID"), NodeID: os.Getenv("RHIZA_NODE_ID"), PodName: podName, PodUID: os.Getenv("POD_UID")}}
 	return s.Run(ctx)
 }
 

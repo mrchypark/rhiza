@@ -260,6 +260,14 @@ not evidence silently supplied by this cooperative default.
 
 ## Verification scope
 
+For quorum-preserving ordinary voter replacement, the engine-owned membership
+path is responsible for removing and activating the voter; the recovery
+controller is reserved for quorum-loss generation recovery. This division does
+not change the fencer's restricted authority. The current positive ordinary
+replacement scope is the three-voter GCS before-ACK profile only, and Kubernetes
+runtime qualification is pending. No-PVC operation and storage-effect exclusion
+for an old identity do not prove physical process death.
+
 ### Learner cleanup evidence
 
 The automatic control journal retains each learner's source generation, creation
@@ -296,6 +304,6 @@ exceeding the control-record read limit.
 Package tests cover identity, receipt ordering, CAS races, immutable evidence,
 restart uncertainty, and voter-to-generation escalation. Linux Kubernetes
 qualification must exercise the real supervisor/authority and physical storage
-drain without the test-only MinIO-restart fencer. Legacy Kind-fencer test success
+drain without the test-only S3 gateway-restart fencer. Legacy Kind-fencer test success
 is not evidence for this backend. No GCS, Chaos Mesh, cloud cost, release, or
 unreachable-node power-fencing qualification is implied by package tests.

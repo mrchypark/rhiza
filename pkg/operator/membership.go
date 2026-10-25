@@ -18,8 +18,8 @@ import (
 	"github.com/mrchypark/rhiza/pkg/quepaxa"
 )
 
-// reconcileMembership deliberately has no StatefulSet write. A healthy set
-// stays untouched; the replacement learner is provisioned out of band.
+// reconcileMembership drains journaled operations created by older operator
+// versions; new ordinary voter replacements are owned by the engine.
 func (c *Controller) reconcileMembership(ctx context.Context, r *Resource) error {
 	m := r.Spec.Membership
 	blocked := func(message string) error { return c.recordMembership(ctx, r, "Blocked", message) }
@@ -42,6 +42,10 @@ func (c *Controller) reconcileMembership(ctx context.Context, r *Resource) error
 	automaticState, err := c.validateAutomaticMembershipIncarnation(ctx, r, sts)
 	if err != nil {
 		return blocked("automatic membership child or StatefulSet identity differs from canonical intent")
+	}
+	if automaticState == nil && (r.Status.Membership == nil ||
+		(r.Status.Membership.RemoveRequest == nil && r.Status.Membership.Add == nil)) {
+		return blocked("new operator-managed membership changes are disabled; ordinary Pod recovery is engine-owned")
 	}
 	ctr, err := container(sts, r.Spec.Container)
 	if err != nil {

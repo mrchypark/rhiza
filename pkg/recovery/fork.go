@@ -366,7 +366,7 @@ func verifyForkSnapshotWithMode(ctx context.Context, snapshot *RecoverySnapshot,
 			return zero, fmt.Errorf("fork observer ID collides with member")
 		}
 	}
-	core, err := quepaxa.NewObserver(quepaxa.Config{NodeID: observerID, Cluster: bootstrap, WAL: wal, EnableReconfiguration: reconfiguration})
+	core, err := quepaxa.NewObserver(quepaxa.Config{NodeID: observerID, Cluster: bootstrap, WAL: wal, EnableReconfiguration: reconfiguration, EngineOwnedRemovals: reconfiguration})
 	if err != nil {
 		return zero, err
 	}

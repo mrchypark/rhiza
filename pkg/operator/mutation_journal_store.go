@@ -142,7 +142,24 @@ func (e *FencingExecutor) mutateProducer(ctx context.Context, runtime fencing.Ru
 			if !allowCreate || (run.Identity.WALIdentity != "" && !promotedBoundLearner) || producer.LastAdmitted != 0 || (producer.Phase != fencing.MutationReserved && producer.Phase != fencing.MutationClosed) {
 				return producer, fmt.Errorf("fencing: producer identity must be pinned before activation")
 			}
+			var repair fencing.EngineRepairRecord
+			var repairReference fencing.EngineRepairReference
+			repairKey := ""
+			var repairProof learnerPromotionHash
+			engineOwned := false
+			if run.Promotion != nil {
+				var verifyErr error
+				repair, repairReference, repairKey, repairProof, engineOwned, verifyErr = e.verifyEngineRepairPromotion(ctx, runtime.StatefulSetUID, run.Identity, run)
+				if verifyErr != nil {
+					return producer, verifyErr
+				}
+			}
 			_, err := e.change(ctx, runtime.StatefulSetUID, runtime.SourceClusterID, func(l *fencing.Ledger) error {
+				if engineOwned {
+					if err := validateEngineRepairCandidateCAS(l, repair, repairReference, repairKey, run.Identity, runtime, engineRepairProducerPinCAS, repairProof); err != nil {
+						return err
+					}
+				}
 				return l.BindMutationProducer(run.Identity, runtime, producerUID)
 			})
 			if err != nil {

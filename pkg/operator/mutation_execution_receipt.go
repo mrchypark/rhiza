@@ -218,12 +218,21 @@ func mutationExecutionReceiptName(receipt mutationExecutionReceipt) string {
 // VerifySourceMutationEvidence checks an archived producer entry against its
 // exact immutable receipt in the same root-bound store used during execution.
 func (e *FencingExecutor) VerifySourceMutationEvidence(ctx context.Context, runtime fencing.RuntimeBinding, sequence uint64, entry fencing.MutationEntry) error {
-	if ctx == nil || e == nil || entry.Preparation == nil || entry.Resolution == nil || sequence == 0 {
+	if ctx == nil || e == nil || entry.Resolution == nil || sequence == 0 {
 		return fmt.Errorf("fencing: prepared mutation receipt identity is incomplete")
 	}
 	run, err := e.enrolledMutationRun(ctx, runtime)
 	if err != nil {
 		return err
+	}
+	if isEngineRepairNoDispatchCancellation(runtime, run.Identity.WALIdentity, run.MutationProducerUID, sequence, entry) {
+		return nil
+	}
+	if entry.Preparation == nil {
+		return fmt.Errorf("fencing: prepared mutation receipt identity is incomplete")
+	}
+	if entry.GenerationZeroGuard != nil {
+		return e.verifyGenerationZeroGuard(ctx, runtime, run, run.MutationProducerUID, sequence, entry)
 	}
 	if entry.GuardedLogicalResolution != nil {
 		if run.MutationProfile != fencing.MutationHeldExecutionProfile || e.SourceMutationStorage == nil || e.Kube == nil {
@@ -270,6 +279,147 @@ func mutationReceiptMatchesDispatch(entry fencing.MutationEntry, receipt mutatio
 	}
 	_, exists := entry.Dispatches[receipt.DispatchID]
 	return exists
+}
+
+// verifyGenerationZeroLineageReceipt ties a successor receipt to the exact
+// enrolled producer entry that granted it. The origin guard remains bound to
+// its original runtime; each successor in the immutable lineage is separately
+// authenticated under that successor's canonical runtime identity.
+func (e *FencingExecutor) verifyGenerationZeroLineageReceipt(ctx context.Context, barrier mutationGenerationZeroBarrier,
+	record mutationGenerationZeroLineageRecord, receipt mutationExecutionReceipt) error {
+	runtime := record.Runtime
+	if runtime.StatefulSetUID != barrier.Runtime.StatefulSetUID ||
+		runtime.SourceClusterID != barrier.Runtime.SourceClusterID || receipt.Runtime != runtime ||
+		receipt.WALIdentity != record.WALIdentity || receipt.ProducerUID != record.ProducerUID ||
+		receipt.Sequence != record.Sequence || receipt.DispatchID != record.DispatchID ||
+		receipt.Intent.OperationID != record.OperationID {
+		return fmt.Errorf("fencing: generation-zero successor runtime or receipt identity differs")
+	}
+	run, err := e.enrolledMutationRun(ctx, runtime)
+	if err != nil || run.Identity.WALIdentity != record.WALIdentity || run.MutationProducerUID != record.ProducerUID {
+		return errors.Join(err, fmt.Errorf("fencing: generation-zero successor lacks its exact enrolled producer"))
+	}
+	producer, producerUID, _, err := e.AuthorityState.ReadProducer(ctx, runtime)
+	if err != nil || producerUID != record.ProducerUID || producer.Runtime != runtime || producer.WALIdentity != record.WALIdentity || producer.Validate() != nil {
+		return errors.Join(err, fmt.Errorf("fencing: generation-zero successor producer differs from its enrolled run"))
+	}
+	var entry fencing.MutationEntry
+	if record.Sequence <= producer.CompactedThrough {
+		entry, err = e.lookupGenerationZeroArchivedSuccessor(ctx, runtime, producer, record.Sequence)
+		if err != nil {
+			return err
+		}
+	} else {
+		var exists bool
+		entry, exists = producer.Entries[record.Sequence]
+		if !exists {
+			return fmt.Errorf("fencing: generation-zero successor journal entry is unavailable")
+		}
+	}
+	dispatch, dispatched := entry.Dispatches[record.DispatchID]
+	if entry.Intent != receipt.Intent || entry.Intent.OperationID != record.OperationID || entry.GenerationZeroGuard != nil ||
+		entry.Preparation == nil || *entry.Preparation != receipt.Preparation || entry.Resolution == nil ||
+		entry.Resolution.Outcome != receipt.Outcome || entry.Resolution.ReceiptDigest != receipt.ReceiptDigest ||
+		!entry.Resolution.AllCopiesTerminal || !entry.DispatchClosed || len(entry.Dispatches) != 1 || !dispatched ||
+		dispatch.ReceiptDigest != receipt.ReceiptDigest || !mutationReceiptMatchesDispatch(entry, receipt) {
+		return fmt.Errorf("fencing: generation-zero successor entry differs from its canonical receipt")
+	}
+	return e.VerifySourceMutationEvidence(ctx, runtime, record.Sequence, entry)
+}
+
+// lookupGenerationZeroArchivedSuccessor reads only the canonical archive
+// entry needed for this receipt. lookupArchivedMutation verifies every receipt
+// in each archive; doing that here would recursively re-enter the G0 lineage
+// verifier when the same producer's G0 entry and successor share an archive.
+// The producer head is root-authenticated, and every traversed archive is
+// immutable, digest-checked, identity-bound, and range-contiguous.
+func (e *FencingExecutor) lookupGenerationZeroArchivedSuccessor(ctx context.Context, runtime fencing.RuntimeBinding,
+	producer fencing.MutationProducer, sequence uint64) (fencing.MutationEntry, error) {
+	if sequence == 0 || sequence > producer.CompactedThrough || producer.ArchiveHead == nil {
+		return fencing.MutationEntry{}, fmt.Errorf("fencing: generation-zero successor is not in the canonical archive")
+	}
+	run, err := e.enrolledMutationRun(ctx, runtime)
+	if err != nil || run.MutationProducerUID == "" || producer.Runtime != runtime || producer.WALIdentity != run.Identity.WALIdentity {
+		return fencing.MutationEntry{}, errors.Join(err, fmt.Errorf("fencing: generation-zero successor archive identity differs"))
+	}
+	ref := *producer.ArchiveHead
+	expectedThrough := producer.CompactedThrough
+	for links := 0; links < 8192; links++ {
+		plan, err := e.readMutationArchive(ctx, ref, runtime, run.MutationProducerUID, producer.WALIdentity)
+		if err != nil {
+			return fencing.MutationEntry{}, err
+		}
+		if plan.Through != expectedThrough {
+			return fencing.MutationEntry{}, errMutationArchiveEvidence
+		}
+		if plan.PreviousThrough < sequence && sequence <= plan.Through {
+			entry, ok := plan.Entries[sequence]
+			if !ok || entry.Intent.OperationID != fencing.MutationRequestID(run.MutationProducerUID, sequence) {
+				return fencing.MutationEntry{}, errMutationArchiveEvidence
+			}
+			return entry, nil
+		}
+		if plan.Previous == nil || plan.PreviousThrough < sequence {
+			return fencing.MutationEntry{}, errMutationArchiveEvidence
+		}
+		expectedThrough = plan.PreviousThrough
+		ref = *plan.Previous
+	}
+	return fencing.MutationEntry{}, fmt.Errorf("fencing: generation-zero successor archive exceeds verification bound")
+}
+
+// verifyGenerationZeroOriginalDispatchReceipt authenticates the original G0
+// permission independently of its logical Resolution and the later helper
+// rights. A helper's terminal receipt cannot establish that this dispatch is
+// terminal, even when both refer to the same payload and object.
+func (e *FencingExecutor) verifyGenerationZeroOriginalDispatchReceipt(ctx context.Context, runtime fencing.RuntimeBinding, walIdentity, producerUID string,
+	sequence uint64, entry fencing.MutationEntry) error {
+	guard := entry.GenerationZeroGuard
+	if ctx == nil || guard == nil || entry.Preparation == nil || entry.Resolution == nil || entry.CopyCompletion == nil ||
+		entry.GenerationZeroRights == nil || !entry.DispatchClosed || len(entry.Dispatches) != 1 ||
+		guard.Runtime != runtime || guard.WALIdentity != walIdentity || guard.ProducerUID != producerUID || guard.Sequence != sequence ||
+		guard.Intent != entry.Intent || guard.Preparation != *entry.Preparation || guard.GuardDigest != guard.Digest() ||
+		entry.Resolution.Outcome != fencing.MutationCommitted || entry.Resolution.AllCopiesTerminal || entry.Resolution.PayloadDigest != entry.Intent.PayloadDigest ||
+		entry.CopyCompletion.PreparationHash != guard.PreparationHash ||
+		entry.CopyCompletion.GenerationZeroRightsDigest != entry.GenerationZeroRights.Digest() ||
+		!entry.GenerationZeroRights.Sealed || !entry.GenerationZeroRights.HelperRightsRetired || !generationZeroOperatorRightsTerminal(entry.GenerationZeroRights) {
+		return fmt.Errorf("fencing: generation-zero original receipt bindings are incomplete")
+	}
+	dispatch, ok := entry.Dispatches[guard.DispatchID]
+	if !ok || guard.DispatchID == "" {
+		return fmt.Errorf("fencing: generation-zero original dispatch grant is absent")
+	}
+	receipts, err := e.receiptsForRuntime(runtime)
+	if err != nil {
+		return err
+	}
+	name := mutationExecutionReceiptName(mutationExecutionReceipt{Runtime: runtime, WALIdentity: walIdentity, ProducerUID: producerUID,
+		Sequence: sequence, Intent: entry.Intent})
+	receipt, err := receipts.get(name)
+	if err != nil {
+		return fmt.Errorf("fencing: original generation-zero dispatch receipt is unavailable: %w", err)
+	}
+	if receipt.Runtime != runtime || receipt.WALIdentity != walIdentity || receipt.ProducerUID != producerUID || receipt.Sequence != sequence ||
+		receipt.Intent != entry.Intent || receipt.Preparation != *entry.Preparation || receipt.DispatchID != guard.DispatchID ||
+		!mutationReceiptMatchesDispatch(entry, receipt) || receipt.ReceiptDigest == "" || receipt.ReceiptDigest != receipt.digest() ||
+		dispatch.ReceiptDigest != receipt.ReceiptDigest || entry.CopyCompletion.ReceiptDigest != receipt.ReceiptDigest || !receipt.AllCopiesTerminal {
+		return fmt.Errorf("fencing: original generation-zero receipt does not match its canonical dispatch")
+	}
+	if receipt.Outcome == fencing.MutationCommitted {
+		if receipt.ConditionFailed || receipt.Generation != guard.ObjectGeneration || receipt.Metageneration != guard.ObjectMetageneration ||
+			receipt.PayloadDigest != guard.PayloadDigest {
+			return fmt.Errorf("fencing: committed original generation-zero receipt differs from its guarded object")
+		}
+		return nil
+	}
+	// A create-only 412 is terminal for the original request. The helper may
+	// independently prove the logical commit from the exact held object; keep
+	// that physical receipt separate from the unchanged logical Resolution.
+	if fencing.IsHeldCreateEligible(entry.Intent, *entry.Preparation) && receipt.Outcome == fencing.MutationRejected && receipt.ConditionFailed &&
+		receipt.Generation == 0 && receipt.Metageneration == 0 && receipt.PayloadDigest == "" {
+		return nil
+	}
+	return fmt.Errorf("fencing: original generation-zero receipt is not a supported terminal create result")
 }
 
 func (s *MutationExecutionReceiptStore) get(name string) (mutationExecutionReceipt, error) {

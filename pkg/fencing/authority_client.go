@@ -14,18 +14,22 @@ import (
 	"os"
 	"strings"
 	"time"
+
+	"github.com/mrchypark/rhiza/pkg/quepaxa"
 )
 
 // AuthorityMessage is sent only over authenticated TLS. The server authenticates
 // the bound service account token independently of the claimed identity.
 type AuthorityMessage struct {
-	Action          string                       `json:"action"`
-	Identity        Identity                     `json:"identity"`
-	Drain           *DrainReceipt                `json:"drain,omitempty"`
-	Request         *StopRequest                 `json:"request,omitempty"`
-	MutationLookup  *MutationLookupRequest       `json:"mutationLookup,omitempty"`
-	ArchiveGenesis  *ArchiveGenesisStatusRequest `json:"archiveGenesis,omitempty"`
-	LearnerIdentity *LearnerIdentityRegistration `json:"learnerIdentity,omitempty"`
+	Action            string                       `json:"action"`
+	Identity          Identity                     `json:"identity"`
+	EngineRepair      *EngineRepairRequest         `json:"engineRepair,omitempty"`
+	Drain             *DrainReceipt                `json:"drain,omitempty"`
+	Request           *StopRequest                 `json:"request,omitempty"`
+	MutationLookup    *MutationLookupRequest       `json:"mutationLookup,omitempty"`
+	ArchiveGenesis    *ArchiveGenesisStatusRequest `json:"archiveGenesis,omitempty"`
+	LearnerIdentity   *LearnerIdentityRegistration `json:"learnerIdentity,omitempty"`
+	PreflightProposal *PendingEngineRepairProposal `json:"preflightProposal,omitempty"`
 }
 
 // LearnerIdentityRegistration is the one create-only voter identity object a
@@ -152,6 +156,135 @@ func (a *AuthorityClient) RegisterStartup(ctx context.Context, id Identity) (Sta
 	}
 	a.role = grant.Role
 	return grant, nil
+}
+
+func (a *AuthorityClient) CreatePendingEngineRepair(ctx context.Context, id Identity, proposal PendingEngineRepairProposal) error {
+	if proposal.BootstrapIdentity != id || proposal.ValidatePreflight() != nil {
+		return fmt.Errorf("fencing: invalid physical engine repair preflight")
+	}
+	return a.call(ctx, AuthorityMessage{Action: "engine-repair-preflight", Identity: id, PreflightProposal: &proposal}, nil)
+}
+
+func (a *AuthorityClient) CurrentEngineRepair(ctx context.Context, id Identity) (EngineRepairRecord, bool, error) {
+	if a.role != StartupRoleVoterActive || id != a.boundIdentity || id.WALIdentity == "" {
+		return EngineRepairRecord{}, false, fmt.Errorf("fencing: engine repair requires an active bound voter")
+	}
+	var response EngineRepairResponse
+	request := EngineRepairRequest{Identity: id}
+	if err := a.call(ctx, AuthorityMessage{Action: "engine-repair-current", Identity: id, EngineRepair: &request}, &response); err != nil {
+		return EngineRepairRecord{}, false, err
+	}
+	if !response.Found {
+		if response.Record != nil || response.Proof != nil {
+			return EngineRepairRecord{}, false, fmt.Errorf("fencing: malformed empty engine repair response")
+		}
+		return EngineRepairRecord{}, false, nil
+	}
+	if response.Record == nil || response.Proof != nil || response.Record.Validate() != nil || response.Record.Binding.SourceClusterID != id.SourceClusterID {
+		return EngineRepairRecord{}, false, fmt.Errorf("fencing: invalid engine repair response")
+	}
+	return *response.Record, true, nil
+}
+
+func (a *AuthorityClient) CompareAndSwapEngineRepair(ctx context.Context, id Identity, expectedDigest string, next EngineRepairRecord) (EngineRepairRecord, error) {
+	if a.role != StartupRoleVoterActive || id != a.boundIdentity || id.WALIdentity == "" || expectedDigest == "" ||
+		next.Validate() != nil || next.Binding.SourceClusterID != id.SourceClusterID {
+		return EngineRepairRecord{}, fmt.Errorf("fencing: engine repair CAS is unavailable")
+	}
+	request := EngineRepairRequest{Identity: id, OperationID: next.Binding.OperationID, ExpectedDigest: expectedDigest, Record: &next}
+	var response EngineRepairResponse
+	if err := a.call(ctx, AuthorityMessage{Action: "engine-repair-cas", Identity: id, EngineRepair: &request}, &response); err != nil {
+		return EngineRepairRecord{}, err
+	}
+	if !response.Found || response.Record == nil || response.Proof != nil || response.Record.Validate() != nil ||
+		response.Record.IdentityDigest() != next.IdentityDigest() || response.Record.Binding.OperationID != next.Binding.OperationID {
+		return EngineRepairRecord{}, fmt.Errorf("fencing: invalid engine repair CAS response")
+	}
+	return *response.Record, nil
+}
+
+func (a *AuthorityClient) CloseEngineRepairStorageEffects(ctx context.Context, id Identity, operationID string) (StorageEffectsExcluded, error) {
+	if a.role != StartupRoleVoterActive || id != a.boundIdentity || id.WALIdentity == "" || operationID == "" {
+		return StorageEffectsExcluded{}, fmt.Errorf("fencing: engine repair storage closure is unavailable")
+	}
+	request := EngineRepairRequest{Identity: id, OperationID: operationID}
+	var response EngineRepairResponse
+	if err := a.call(ctx, AuthorityMessage{Action: "engine-repair-storage-effects", Identity: id, EngineRepair: &request}, &response); err != nil {
+		return StorageEffectsExcluded{}, err
+	}
+	if response.Found || response.Record != nil || response.Proof == nil || response.Proof.Binding.SourceClusterID != id.SourceClusterID || response.Proof.Binding.OperationID != operationID {
+		return StorageEffectsExcluded{}, fmt.Errorf("fencing: invalid engine repair storage-closure response")
+	}
+	return *response.Proof, nil
+}
+
+func (a *AuthorityClient) VerifyEngineRemovalStorageEffects(ctx context.Context, id Identity, operation quepaxa.EngineRemoval) error {
+	if a.role != StartupRoleVoterActive || id != a.boundIdentity || id.WALIdentity == "" || operation.OperationID == "" ||
+		operation.StorageEffectsExcludedHash == (quepaxa.ValueHash{}) {
+		return fmt.Errorf("fencing: engine removal storage-effects verification is unavailable")
+	}
+	request := EngineRepairRequest{Identity: id, OperationID: operation.OperationID, RemovalOperation: &operation}
+	var response EngineRepairResponse
+	if err := a.call(ctx, AuthorityMessage{Action: "engine-repair-storage-effects-verify", Identity: id, EngineRepair: &request}, &response); err != nil {
+		return err
+	}
+	if response.Found || response.Record != nil || response.Proof != nil || len(response.PendingRequests) != 0 {
+		return fmt.Errorf("fencing: malformed engine removal storage-effects verification response")
+	}
+	return nil
+}
+
+func (a *AuthorityClient) ConfirmEngineRepair(ctx context.Context, id Identity, operationID string) (EngineRepairRecord, error) {
+	if a.role != StartupRoleVoterActive || id != a.boundIdentity || id.WALIdentity == "" || operationID == "" {
+		return EngineRepairRecord{}, fmt.Errorf("fencing: engine repair confirmation is unavailable")
+	}
+	request := EngineRepairRequest{Identity: id, OperationID: operationID}
+	var response EngineRepairResponse
+	if err := a.call(ctx, AuthorityMessage{Action: "engine-repair-confirm", Identity: id, EngineRepair: &request}, &response); err != nil {
+		return EngineRepairRecord{}, err
+	}
+	if !response.Found || response.Record == nil || response.Proof != nil || response.Record.Validate() != nil ||
+		response.Record.Binding.SourceClusterID != id.SourceClusterID || response.Record.Binding.OperationID != operationID || response.Record.Phase != RepairActive {
+		return EngineRepairRecord{}, fmt.Errorf("fencing: invalid engine repair confirmation response")
+	}
+	return *response.Record, nil
+}
+
+func (a *AuthorityClient) ListPendingEngineRepairs(ctx context.Context, id Identity) ([]PendingEngineRepairRequest, error) {
+	if a.role != StartupRoleVoterActive || id != a.boundIdentity || id.WALIdentity == "" {
+		return nil, fmt.Errorf("fencing: pending engine repair lookup requires an active bound voter")
+	}
+	request := EngineRepairRequest{Identity: id}
+	var response EngineRepairResponse
+	if err := a.call(ctx, AuthorityMessage{Action: "engine-repair-pending", Identity: id, EngineRepair: &request}, &response); err != nil {
+		return nil, err
+	}
+	if response.Found || response.Record != nil || response.Proof != nil {
+		return nil, fmt.Errorf("fencing: malformed pending engine repair response")
+	}
+	for _, pending := range response.PendingRequests {
+		if pending.Validate() != nil || pending.SourceClusterID != id.SourceClusterID {
+			return nil, fmt.Errorf("fencing: invalid pending engine repair response")
+		}
+	}
+	return append([]PendingEngineRepairRequest(nil), response.PendingRequests...), nil
+}
+
+func (a *AuthorityClient) AdoptPendingEngineRepair(ctx context.Context, id Identity, pendingID, pendingDigest string, record EngineRepairRecord) (EngineRepairRecord, error) {
+	if a.role != StartupRoleVoterActive || id != a.boundIdentity || id.WALIdentity == "" || pendingID == "" || !mutationDigestValid(pendingDigest) ||
+		record.ValidateAdoptionProposal() != nil || record.Binding.SourceClusterID != id.SourceClusterID || record.BootstrapRequestDigest != pendingDigest {
+		return EngineRepairRecord{}, fmt.Errorf("fencing: pending engine repair adoption is unavailable")
+	}
+	request := EngineRepairRequest{Identity: id, PendingID: pendingID, PendingDigest: pendingDigest, Record: &record}
+	var response EngineRepairResponse
+	if err := a.call(ctx, AuthorityMessage{Action: "engine-repair-adopt", Identity: id, EngineRepair: &request}, &response); err != nil {
+		return EngineRepairRecord{}, err
+	}
+	if !response.Found || response.Record == nil || response.Proof != nil || len(response.PendingRequests) != 0 ||
+		response.Record.Validate() != nil || response.Record.Binding.SourceClusterID != id.SourceClusterID || response.Record.BootstrapRequestDigest != pendingDigest {
+		return EngineRepairRecord{}, fmt.Errorf("fencing: invalid pending engine repair adoption response")
+	}
+	return *response.Record, nil
 }
 
 func (a *AuthorityClient) RegisterLearnerIdentity(ctx context.Context, id Identity, registration LearnerIdentityRegistration) error {
@@ -469,8 +602,14 @@ func validateMutationLookupEntry(entry MutationEntry) error {
 	}
 	if entry.Resolution != nil {
 		r := entry.Resolution
-		if !mutationDigestValid(r.ReceiptDigest) || (r.AllCopiesTerminal && !allDispatchesTerminal(entry)) {
+		preparedCancellation := entry.Preparation != nil && entry.DispatchClosed && len(entry.Dispatches) == 0 &&
+			r.Outcome == MutationRejected && !r.ConditionFailed && r.PayloadDigest == ""
+		if !mutationDigestValid(r.ReceiptDigest) || (r.AllCopiesTerminal && !allDispatchesTerminal(entry)) ||
+			(r.AllCopiesTerminal && entry.Preparation != nil && len(entry.Dispatches) == 0 && !preparedCancellation && r.Reason != MutationResolutionReasonGenerationZeroPinned) {
 			return fmt.Errorf("fencing: malformed mutation lookup resolution")
+		}
+		if err := validateMutationResolutionReason(entry, *r); err != nil {
+			return fmt.Errorf("fencing: malformed mutation lookup terminal reason: %w", err)
 		}
 		if r.ConditionFailed && (r.Outcome != MutationRejected || entry.Intent.Condition.Mode == MutationUnconditional) {
 			return fmt.Errorf("fencing: malformed conditional mutation rejection")
@@ -501,7 +640,7 @@ func validateMutationLookupEntry(entry MutationEntry) error {
 			}
 		}
 	}
-	if entry.CopyCompletion != nil && (entry.Preparation == nil || entry.Resolution == nil || !mutationDigestValid(entry.CopyCompletion.PreparationHash) || !mutationDigestValid(entry.CopyCompletion.ReceiptDigest) || !allDispatchesTerminal(entry)) {
+	if entry.CopyCompletion != nil && (entry.Preparation == nil || entry.Resolution == nil || len(entry.Dispatches) == 0 || !mutationDigestValid(entry.CopyCompletion.PreparationHash) || !mutationDigestValid(entry.CopyCompletion.ReceiptDigest) || !allDispatchesTerminal(entry)) {
 		return fmt.Errorf("fencing: malformed mutation lookup copy completion")
 	}
 	return nil

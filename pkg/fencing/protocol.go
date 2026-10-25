@@ -1,7 +1,11 @@
 // Package fencing implements the cooperative process fencing protocol.
 package fencing
 
-import "errors"
+import (
+	"errors"
+
+	"github.com/mrchypark/rhiza/pkg/quepaxa"
+)
 
 const ProtocolVersion = 1
 
@@ -42,6 +46,12 @@ func (r StartupRole) Valid() bool {
 type StartupGrant struct {
 	Identity Identity    `json:"identity"`
 	Role     StartupRole `json:"role"`
+	// ExpectedWALIdentity and the replaced voter tuple are set only for an
+	// authority-enrolled engine-repair learner. The WAL identity remains empty
+	// in Identity until the candidate binds its newly opened WAL.
+	ExpectedWALIdentity string `json:"expectedWALIdentity,omitempty"`
+	ReplacedNodeID      string `json:"replacedNodeID,omitempty"`
+	ReplacedWALIdentity string `json:"replacedWALIdentity,omitempty"`
 	// Environment contains only bounded, fencer-derived overrides needed to
 	// start an assigned learner or initialize a static active voter. It is
 	// returned over the authenticated TLS supervisor channel and is never
@@ -63,6 +73,12 @@ func (g StartupGrant) Validate(request Identity) error {
 	}
 	if assignedPhysical != physical {
 		return errors.New("fencing: startup grant physical Pod differs")
+	}
+	bootstrapBinding := g.ExpectedWALIdentity != "" || g.ReplacedNodeID != "" || g.ReplacedWALIdentity != ""
+	if bootstrapBinding && (g.Role != StartupRoleLearnerPendingRemove || g.Identity.NodeID == physical ||
+		!mutationDigestValid(g.ExpectedWALIdentity) || g.ReplacedNodeID == "" || g.ReplacedNodeID == g.Identity.NodeID ||
+		!mutationDigestValid(g.ReplacedWALIdentity) || g.ReplacedWALIdentity == g.ExpectedWALIdentity) {
+		return errors.New("fencing: incomplete engine-repair learner binding")
 	}
 	if g.Identity.NodeID != physical {
 		if g.Identity.AssignmentID == "" || !mutationDigestValid(g.Identity.AssignmentID) {
@@ -97,6 +113,35 @@ func (g StartupGrant) Validate(request Identity) error {
 		}
 	}
 	return nil
+}
+
+type RecoveryBootstrapOutcome string
+
+const (
+	RecoveryBootstrapLostWAL      RecoveryBootstrapOutcome = "typed-lost-wal"
+	RecoveryBootstrapCandidateWAL RecoveryBootstrapOutcome = "reserved-candidate-wal-present"
+)
+
+// EngineRepairRequest carries only the operation selector and a proposed
+// immutable-record revision. The authority authenticates Identity, reloads
+// the root reference, and validates every compare-and-swap before persistence.
+type EngineRepairRequest struct {
+	Identity         Identity               `json:"identity"`
+	OperationID      string                 `json:"operationID,omitempty"`
+	ExpectedDigest   string                 `json:"expectedDigest,omitempty"`
+	Record           *EngineRepairRecord    `json:"record,omitempty"`
+	PendingID        string                 `json:"pendingID,omitempty"`
+	PendingDigest    string                 `json:"pendingDigest,omitempty"`
+	RemovalOperation *quepaxa.EngineRemoval `json:"removalOperation,omitempty"`
+}
+
+// EngineRepairResponse is the bounded result for canonical read, CAS, and
+// storage-closure operations. Only the field for the requested action is set.
+type EngineRepairResponse struct {
+	Found           bool                         `json:"found,omitempty"`
+	Record          *EngineRepairRecord          `json:"record,omitempty"`
+	Proof           *StorageEffectsExcluded      `json:"proof,omitempty"`
+	PendingRequests []PendingEngineRepairRequest `json:"pendingRequests"`
 }
 
 type StopRequest struct {

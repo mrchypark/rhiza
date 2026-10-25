@@ -46,6 +46,7 @@ func publicOnlineVoterDiagnostics(data []byte) ([]byte, error) {
 		ParentRecoveryMatchesOperation: source["parentRecoveryMatchesOperation"] == true,
 		Conditions:                     []onlineLearnerConditionView{},
 		Containers:                     []onlineLearnerContainerView{}, Events: []onlineLearnerEventView{}, Secrets: []onlineLearnerSecretView{},
+		Logs: []onlineLearnerLogView{},
 	}
 	if source["recoveryFound"] != true && source["recoveryFound"] != false {
 		return nil, fmt.Errorf("online voter recovery observation is invalid")
@@ -61,6 +62,52 @@ func publicOnlineVoterDiagnostics(data []byte) ([]byte, error) {
 	view.PodsQuerySucceeded = source["podsQuerySucceeded"] == true
 	view.EventsQuerySucceeded = source["eventsQuerySucceeded"] == true
 	view.RecoveryQuerySucceeded = source["recoveryQuerySucceeded"] == true
+	capture, _ := source["capture"].(map[string]any)
+	if capture != nil {
+		for _, key := range []string{"rootQuerySucceeded", "statefulSetQuerySucceeded", "podIdentityBound"} {
+			if capture[key] != true && capture[key] != false {
+				return nil, fmt.Errorf("online voter capture %s observation is invalid", key)
+			}
+		}
+		view.RootQuerySucceeded = capture["rootQuerySucceeded"] == true
+		view.StatefulSetQuerySucceeded = capture["statefulSetQuerySucceeded"] == true
+		view.LearnerIdentityBound = capture["podIdentityBound"] == true
+		root := capture["root"]
+		if root != nil && view.RootQuerySucceeded {
+			view.RootFound = true
+			view.RootPhase = safeKubePhase(text(nested(root, "status", "phase")))
+			view.RootGeneration = boundedGeneration(nested(root, "metadata", "generation"))
+			view.RootObservedGeneration = boundedGeneration(nested(root, "status", "observedGeneration"))
+		}
+		sts := capture["statefulSet"]
+		if sts != nil && view.StatefulSetQuerySucceeded {
+			view.StatefulSetFound = true
+			view.StatefulSetGeneration = boundedGeneration(nested(sts, "metadata", "generation"))
+			view.StatefulSetObservedGeneration = boundedGeneration(nested(sts, "status", "observedGeneration"))
+			view.StatefulSetReadyReplicas = boundedRestartCount(nested(sts, "status", "readyReplicas"))
+			rootUID := text(nested(root, "metadata", "uid"))
+			view.StatefulSetOwnedByRoot = rootUID != "" && ownerReferenceHasUID(nested(sts, "metadata", "ownerReferences"), rootUID)
+			for _, container := range anySlice(nested(sts, "spec", "template", "spec", "containers")) {
+				view.StatefulSetSupervisedLaunch = view.StatefulSetSupervisedLaunch || nested(container, "supervisedLaunchShape") == "expected"
+			}
+		}
+		logs, _ := capture["logs"].([]any)
+		for _, item := range logs {
+			period, container, status := text(nested(item, "period")), text(nested(item, "container")), text(nested(item, "status"))
+			if (period != "current" && period != "previous") || container == "" || !safeDiagnosticCaptureStatus(status) {
+				return nil, fmt.Errorf("online voter log capture metadata is invalid")
+			}
+			captured, capturedOK := nested(item, "captured").(bool)
+			truncated, truncatedOK := nested(item, "truncated").(bool)
+			byteCount := boundedRestartCount(nested(item, "bytes"))
+			if !capturedOK || !truncatedOK || byteCount < 0 || byteCount > 32<<10 || captured && (status != "captured" || safeSHA256(text(nested(item, "sha256"))) == "") {
+				return nil, fmt.Errorf("online voter log capture completeness is invalid")
+			}
+			entry := onlineLearnerLogView{Period: period, CaptureStatus: status, Captured: nested(item, "captured") == true,
+				Bytes: int(byteCount), SHA256: safeSHA256(text(nested(item, "sha256"))), Truncated: truncated}
+			view.Logs = append(view.Logs, entry)
+		}
+	}
 	recovery := source["recovery"]
 	if view.RecoveryFound {
 		if recovery == nil {
@@ -194,6 +241,19 @@ func projectOnlineVoterDiagnostics(raw string, data []byte) ([]byte, error) {
 	if err := json.Unmarshal(projected, &view); err != nil {
 		return nil, err
 	}
+	var privateSource obj
+	if err := json.Unmarshal(data, &privateSource); err != nil {
+		return nil, err
+	}
+	logIndices := map[string]int{}
+	if capture, ok := privateSource["capture"].(map[string]any); ok {
+		for index, entry := range anySlice(capture["logs"]) {
+			period, container := text(nested(entry, "period")), text(nested(entry, "container"))
+			if period != "" && container != "" {
+				logIndices["learner-"+period+"-"+container+".log"] = index
+			}
+		}
+	}
 	dir := filepath.Join(raw, "private-online-voter-diagnostics")
 	entries, err := os.ReadDir(dir)
 	if os.IsNotExist(err) {
@@ -243,15 +303,50 @@ func projectOnlineVoterDiagnostics(raw string, data []byte) ([]byte, error) {
 		if startupFailure && len(failures) == 0 && len(bytes.TrimSpace(contents)) > 0 {
 			failures = []string{"unknown_startup_error"}
 		}
-		if startupFailure && len(stages) == 0 && len(bytes.TrimSpace(contents)) > 0 {
-			stages = []string{"node_open/outer_wrapper_unparsed"}
-		}
-		view.Logs = append(view.Logs, onlineLearnerLogView{
+		logView := onlineLearnerLogView{
 			Period: period, Captured: true, Bytes: len(contents), SHA256: hex.EncodeToString(digest[:]),
 			Failures: failures, Stages: stages, Truncated: stagesTruncated,
-		})
+		}
+		if index, ok := logIndices[name]; ok && index < len(view.Logs) {
+			// Capture metadata contains container identity privately. The public
+			// entry remains period/status/count/hash/classification only.
+			view.Logs[index].Captured = true
+			view.Logs[index].Bytes = len(contents)
+			view.Logs[index].SHA256 = hex.EncodeToString(digest[:])
+			view.Logs[index].Failures = failures
+			view.Logs[index].Stages = stages
+			view.Logs[index].Truncated = view.Logs[index].Truncated || stagesTruncated
+		} else {
+			view.Logs = append(view.Logs, logView)
+		}
 	}
 	return json.Marshal(view)
+}
+
+func boundedGeneration(value any) int64 {
+	var generation int64
+	switch number := value.(type) {
+	case float64:
+		generation = int64(number)
+	case int64:
+		generation = number
+	case int:
+		generation = int64(number)
+	}
+	if generation < 0 || generation > 1<<53 {
+		return 0
+	}
+	return generation
+}
+
+func safeSHA256(value string) string {
+	if len(value) != 64 {
+		return ""
+	}
+	if _, err := hex.DecodeString(value); err != nil {
+		return ""
+	}
+	return strings.ToLower(value)
 }
 
 func hasString(values []string, target string) bool {
@@ -868,6 +963,19 @@ type onlineVoterDiagnosticsView struct {
 	ParentQuerySucceeded           bool                         `json:"parentQuerySucceeded"`
 	ParentPhase                    string                       `json:"parentPhase,omitempty"`
 	ParentRecoveryMatchesOperation bool                         `json:"parentRecoveryMatchesOperation"`
+	RootQuerySucceeded             bool                         `json:"rootQuerySucceeded"`
+	RootFound                      bool                         `json:"rootFound"`
+	RootPhase                      string                       `json:"rootPhase,omitempty"`
+	RootGeneration                 int64                        `json:"rootGeneration,omitempty"`
+	RootObservedGeneration         int64                        `json:"rootObservedGeneration,omitempty"`
+	StatefulSetQuerySucceeded      bool                         `json:"statefulSetQuerySucceeded"`
+	StatefulSetFound               bool                         `json:"statefulSetFound"`
+	StatefulSetOwnedByRoot         bool                         `json:"statefulSetOwnedByRoot"`
+	StatefulSetSupervisedLaunch    bool                         `json:"statefulSetSupervisedLaunch"`
+	StatefulSetGeneration          int64                        `json:"statefulSetGeneration,omitempty"`
+	StatefulSetObservedGeneration  int64                        `json:"statefulSetObservedGeneration,omitempty"`
+	StatefulSetReadyReplicas       int32                        `json:"statefulSetReadyReplicas,omitempty"`
+	LearnerIdentityBound           bool                         `json:"learnerIdentityBound"`
 	LearnerMatchesFaultTargetUID   bool                         `json:"learnerMatchesFaultTargetUID"`
 	LearnerMatchesFaultTargetIP    bool                         `json:"learnerMatchesFaultTargetIP"`
 	LearnerFound                   bool                         `json:"learnerFound"`
@@ -924,13 +1032,35 @@ type onlineLearnerEventView struct {
 }
 
 type onlineLearnerLogView struct {
-	Period    string   `json:"period"`
-	Captured  bool     `json:"captured"`
-	Bytes     int      `json:"bytes"`
-	SHA256    string   `json:"sha256,omitempty"`
-	Failures  []string `json:"failures,omitempty"`
-	Stages    []string `json:"stages,omitempty"`
-	Truncated bool     `json:"truncated,omitempty"`
+	Period        string   `json:"period"`
+	CaptureStatus string   `json:"captureStatus,omitempty"`
+	Captured      bool     `json:"captured"`
+	Bytes         int      `json:"bytes"`
+	SHA256        string   `json:"sha256,omitempty"`
+	Failures      []string `json:"failures,omitempty"`
+	Stages        []string `json:"stages,omitempty"`
+	Truncated     bool     `json:"truncated,omitempty"`
+}
+
+func safeDiagnosticCaptureStatus(value string) bool {
+	switch value {
+	case "captured", "not_available", "previous_missing", "api_not_found", "capture_failed", "write_failed", "deadline_exceeded", "canceled", "command_failed", "identity_changed":
+		return true
+	default:
+		return false
+	}
+}
+
+func ownerReferenceHasUID(value any, uid string) bool {
+	if uid == "" {
+		return false
+	}
+	for _, owner := range anySlice(value) {
+		if text(nested(owner, "uid")) == uid {
+			return true
+		}
+	}
+	return false
 }
 
 type fencerDeploymentView struct {
@@ -1365,9 +1495,6 @@ func readVoterLog(dir, name string, startupFailure bool) voterLogView {
 	view.StartupStages, view.StartupStagesTruncated = classifyVoterStartupStages(data)
 	if startupFailure && len(view.Startup) == 0 && len(bytes.TrimSpace(data)) != 0 {
 		view.Startup = []string{"unknown_startup_error"}
-	}
-	if startupFailure && len(view.StartupStages) == 0 && len(bytes.TrimSpace(data)) != 0 {
-		view.StartupStages = []string{"node_open/outer_wrapper_unparsed"}
 	}
 	return view
 }

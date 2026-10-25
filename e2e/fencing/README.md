@@ -41,7 +41,7 @@ This creates only the disposable `rhiza-generic-fencing` Kind cluster and
 The script uses the canonical authority manifest and supervised StatefulSet
 patch. Writers start only after the authority, projected token, TLS trust and
 dedicated Versity bucket are ready. No external cloud or existing bucket is used.
-Public archive coordinates stay in the fixture ConfigMap. Fake MinIO writer keys
+Public archive coordinates stay in the fixture ConfigMap. Fake Versity Gateway writer keys
 are a separate local-cooperative overlay applied only after the shipped
 supervised patch; they are not part of that production patch. This disposable
 S3-compatible fixture does not establish cloud identity separation or generic

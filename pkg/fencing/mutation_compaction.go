@@ -81,8 +81,8 @@ func (plan MutationCompactionPlan) Validate() error {
 	closeOperationID := ""
 	closeRequestHash := ""
 	for _, entry := range plan.Entries {
-		if entry.GuardedLogicalResolution != nil {
-			// Guarded logical evidence can only be produced after closure. Build
+		if entry.GuardedLogicalResolution != nil || entry.GenerationZeroGuard != nil {
+			// Guarded evidence can only be produced after closure. Build
 			// the archive validator as a closed prefix so its normal entry validator
 			// rechecks that invariant; this synthetic close tuple is not persisted.
 			phase = MutationClosed

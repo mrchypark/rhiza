@@ -428,17 +428,17 @@ func TestVoterStartupStageProjectionUsesExactWrappersAndFixedCodes(t *testing.T)
 	}
 }
 
-func TestVoterStartupStageProjectionDistinguishesUnparsedOuterWrapper(t *testing.T) {
+func TestVoterStartupStageProjectionDoesNotAttestUnparsedOuterText(t *testing.T) {
 	logPath := filepath.Join(t.TempDir(), "current.log")
-	if err := os.WriteFile(logPath, []byte("not-a-timestamp open rhiza: open WAL: private\n"), 0600); err != nil {
+	if err := os.WriteFile(logPath, []byte("private-canary ordinary text mentions open rhiza: but has no parsed wrapper\n"), 0600); err != nil {
 		t.Fatal(err)
 	}
 	if err := os.WriteFile(filepath.Join(filepath.Dir(logPath), "current.captured"), []byte("true\n"), 0600); err != nil {
 		t.Fatal(err)
 	}
 	view := readVoterLog(filepath.Dir(logPath), "current", true)
-	if len(view.StartupStages) != 1 || view.StartupStages[0] != "node_open/outer_wrapper_unparsed" {
-		t.Fatalf("unparsed outer log wrapper was not distinguished: %+v", view.StartupStages)
+	if len(view.StartupStages) != 0 {
+		t.Fatalf("unparsed ordinary text was incorrectly attested as a startup stage: %+v", view.StartupStages)
 	}
 }
 

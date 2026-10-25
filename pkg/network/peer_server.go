@@ -37,6 +37,7 @@ const (
 type PeerServer struct {
 	listener       *quic.EarlyListener
 	server         *Server
+	peerSigningKey ed25519.PrivateKey
 	members        map[quepaxa.NodeID]quepaxa.Member
 	adminToken     string
 	connections    chan struct{}
@@ -136,6 +137,13 @@ func startPeerServer(ctx context.Context, server *Server, members []quepaxa.Memb
 	peer := &PeerServer{
 		listener: listener, server: server, members: make(map[quepaxa.NodeID]quepaxa.Member, len(members)), adminToken: adminToken,
 		connections: make(chan struct{}, maxPeerConnections), streams: make(chan struct{}, maxPeerStreams), cancel: cancel,
+	}
+	if key, ok := certificate.PrivateKey.(ed25519.PrivateKey); ok {
+		peer.peerSigningKey = append(ed25519.PrivateKey(nil), key...)
+	} else {
+		_ = listener.Close()
+		cancel()
+		return nil, fmt.Errorf("peer identity signing key is unavailable")
 	}
 	for _, member := range members {
 		peer.members[member.ID] = member
@@ -348,7 +356,11 @@ func (s *PeerServer) handle(ctx context.Context, certificateKey ed25519.PublicKe
 	// Non-voting clients may only pull already-certified decisions. They use
 	// the cluster admin token and never enter the fixed voter membership.
 	admin := s.adminToken != "" && subtle.ConstantTimeCompare([]byte(request.AdminToken), []byte(s.adminToken)) == 1
-	if !voter && !(admin && request.Operation == peerfb.OperationSync) {
+	// The admin token remains read-only: in addition to pulling certified
+	// decisions, it may request the exact engine-removal freeze or committed
+	// terminal and its durable prefix. The response is independently signed by
+	// this voter and never changes local consensus state.
+	if !voter && !(admin && (request.Operation == peerfb.OperationSync || request.Operation == peerfb.OperationEngineRemovalFreeze)) {
 		return nil, fmt.Errorf("peer authentication failed")
 	}
 	switch request.Operation {
@@ -385,7 +397,7 @@ func (s *PeerServer) handle(ctx context.Context, certificateKey ed25519.PublicKe
 		}
 		return &peerfb.ResponseT{Summary: summaryToWire(summary)}, nil
 	case peerfb.OperationLearned:
-		if !s.server.Ready() {
+		if !s.server.PeerLearnReady() {
 			return nil, ErrNotReady
 		}
 		decision, err := decisionFromWire(request.Decision)
@@ -548,6 +560,46 @@ func (s *PeerServer) handle(ctx context.Context, certificateKey ed25519.PublicKe
 			return nil, fmt.Errorf("durable prefix mismatch")
 		}
 		return &peerfb.ResponseT{ClusterId: string(s.server.cluster), ProposerId: string(s.server.core.NodeID()), ConfigId: request.ConfigId, Tip: request.From}, nil
+	case peerfb.OperationEngineRemovalFreeze:
+		if request.From == 0 || len(request.Value) == 0 || len(request.Value) > 128<<10 || len(s.peerSigningKey) != ed25519.PrivateKeySize {
+			return nil, fmt.Errorf("invalid engine removal freeze request")
+		}
+		var proofRequest engineRemovalProofRequest
+		if err := decodeStrictPeerJSON(request.Value, &proofRequest); err != nil || proofRequest.Version != engineRemovalProofRequestVersion ||
+			proofRequest.Operation.ExpectedConfigID != uint(request.ConfigId) {
+			return nil, fmt.Errorf("engine removal freeze request binding is invalid")
+		}
+		operation := proofRequest.Operation
+		if proofRequest.Kind == engineRemovalProofFreeze {
+			if operation.Freeze != quepaxa.Slot(request.From) {
+				return nil, fmt.Errorf("engine removal freeze slot differs from request")
+			}
+			snapshot, err := s.server.core.EngineRemovalFreezeSnapshot(ctx, operation)
+			if err != nil {
+				return nil, err
+			}
+			attestation := EngineRemovalFreezeAttestationMessage(string(s.server.cluster), s.server.core.NodeID(), snapshot.ConfigID, operation, snapshot.Decision.Hash, snapshot.PrefixHash)
+			payload := make([]byte, 32+ed25519.SignatureSize)
+			copy(payload[:32], snapshot.PrefixHash[:])
+			copy(payload[32:], ed25519.Sign(s.peerSigningKey, attestation))
+			return &peerfb.ResponseT{ClusterId: string(s.server.cluster), ProposerId: string(s.server.core.NodeID()), ConfigId: uint64(snapshot.ConfigID), Tip: uint64(operation.Freeze), Decided: decidedToWire(snapshot.Decision), Value: payload}, nil
+		}
+		if proofRequest.Kind == engineRemovalProofTerminal {
+			terminalSlot := operation.Freeze + 16
+			if terminalSlot < operation.Freeze || terminalSlot != quepaxa.Slot(request.From) {
+				return nil, fmt.Errorf("engine removal terminal slot differs from request")
+			}
+			snapshot, err := s.server.core.EngineRemovalTerminalSnapshot(ctx, operation)
+			if err != nil {
+				return nil, err
+			}
+			attestation := EngineRemovalTerminalAttestationMessage(string(s.server.cluster), s.server.core.NodeID(), snapshot.ConfigID, operation, terminalSlot, snapshot.Decision.Hash, snapshot.PrefixHash)
+			payload := make([]byte, 32+ed25519.SignatureSize)
+			copy(payload[:32], snapshot.PrefixHash[:])
+			copy(payload[32:], ed25519.Sign(s.peerSigningKey, attestation))
+			return &peerfb.ResponseT{ClusterId: string(s.server.cluster), ProposerId: string(s.server.core.NodeID()), ConfigId: uint64(snapshot.ConfigID), Tip: uint64(terminalSlot), Decided: decidedToWire(snapshot.Decision), Value: payload}, nil
+		}
+		return nil, fmt.Errorf("unknown engine removal proof kind")
 	case peerfb.OperationPrepareCheckpoint:
 		seal, checkpoint, err := quepaxa.DecodeCheckpointSeal(request.Value)
 		if err != nil || !checkpoint {
@@ -580,6 +632,7 @@ func (s *PeerServer) configurationFor(request *peerfb.RequestT) (quepaxa.Cluster
 		if request.ConfigId == uint64(current.ConfigID) {
 			return current, nil
 		}
+	case peerfb.OperationEngineRemovalFreeze:
 		if request.From != 0 {
 			return s.server.core.ClusterForSlot(quepaxa.Slot(request.From)), nil
 		}

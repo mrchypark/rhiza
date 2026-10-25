@@ -1,9 +1,9 @@
 # Operator recovery chaos test
 
 The `operator-chaos` CI job builds both binaries from the candidate revision and
-runs them with MinIO in an ephemeral kind Kubernetes cluster. It applies the
-repository CRD and namespace-scoped RBAC and drives the running Operator through
-`RhizaRecovery` resources.
+runs them with the pinned Versity Gateway S3 fixture in an ephemeral Kind
+Kubernetes cluster. It applies the repository CRD and namespace-scoped RBAC and
+drives the running Operator through `RhizaRecovery` resources.
 
 The GCS post-release qualification installs admission policies only for its
 scoped Chaos Mesh fault resources. It intentionally excludes a runtime Pod
@@ -67,11 +67,11 @@ results. Do not run it against a shared cluster.
 
 The `anchor-operator-chaos` Kind job currently reports only
 `SUPPORTED-NEGATIVE`. Its valid anchor ConfigMap and anchor service are paired
-with the fixture's MinIO/S3 archive and Kubernetes cooperative fencer. That
-fencer does not implement canonical archive-fork registration, so the Operator
-must block before anchor activation, target reservation, StatefulSet mutation,
-or source-archive mutation. The harness checks those invariants and does not
-emit a recovery `PASS` event.
+with the fixture's Versity Gateway/S3 archive and Kubernetes cooperative
+fencer. That fencer does not implement canonical archive-fork registration, so
+the Operator must block before anchor activation, target reservation,
+StatefulSet mutation, or source-archive mutation. The harness checks those
+invariants and does not emit a recovery `PASS` event.
 
 This negative contract is not anchor recovery qualification. A positive anchor
 recovery scenario remains a follow-up for a real-GCS path that supplies the

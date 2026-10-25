@@ -1,6 +1,7 @@
 package main
 
 import (
+	"net"
 	"strings"
 	"testing"
 
@@ -128,6 +129,41 @@ func TestCanonicalStateSelectionIsProviderNeutralButMutationProfileIsNot(t *test
 		if err == nil || !strings.Contains(err.Error(), "source mutation proof profile for provider") || !strings.Contains(err.Error(), string(provider)) {
 			t.Errorf("provider %q source profile error = %v", provider, err)
 		}
+	}
+}
+
+func TestServeRejectsIndependentS3BeforeKubernetesOrAuthorityListener(t *testing.T) {
+	for _, key := range []string{"RHIZA_FENCE_ATTESTOR_URL", "RHIZA_FENCE_ATTESTOR_TOKEN_FILE", "RHIZA_FENCE_ATTESTOR_CA_FILE"} {
+		t.Setenv(key, "")
+	}
+	t.Setenv("RHIZA_OBJSTORE_PROVIDER", "s3")
+	t.Setenv("RHIZA_OBJSTORE_ENDPOINT", "127.0.0.1:19000")
+	t.Setenv("RHIZA_OBJSTORE_BUCKET", "rhiza")
+	t.Setenv("RHIZA_OBJSTORE_REGION", "us-east-1")
+	t.Setenv("RHIZA_OBJSTORE_ACCESS_KEY", "test-access")
+	t.Setenv("RHIZA_OBJSTORE_SECRET_KEY", "test-secret")
+	t.Setenv("RHIZA_OBJSTORE_INSECURE", "true")
+
+	reserved, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	listenAddr := reserved.Addr().String()
+	if err := reserved.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	err = serve(t.Context(), []string{"--tls-cert", "/unused/cert", "--tls-key", "/unused/key",
+		"--listen", listenAddr, "--independent-mutation-profile=true"})
+	if err == nil || !strings.Contains(err.Error(), `source mutation proof profile for provider "s3" not implemented`) {
+		t.Fatalf("independent S3 startup error=%v, want exact unsupported-provider refusal", err)
+	}
+	listener, err := net.Listen("tcp", listenAddr)
+	if err != nil {
+		t.Fatalf("unsupported S3 profile started an authority listener: %v", err)
+	}
+	if err := listener.Close(); err != nil {
+		t.Fatal(err)
 	}
 }
 

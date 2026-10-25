@@ -31,9 +31,14 @@ type Config struct {
 	// deliberately off by default while checkpoint snapshots lack certified
 	// membership state.
 	EnableReconfiguration bool
+	// EngineOwnedRemovals makes every newly proposed REMOVE use the versioned
+	// engine-owned operation contract. Historical legacy decisions remain
+	// replayable; new unmarked removals are rejected.
+	EngineOwnedRemovals bool
 	// ReconfigurationAdmission must approve every added voter after it has
-	// caught up durably. A nil callback rejects additions.
-	ReconfigurationAdmission func(context.Context, Cluster, Slot, [32]byte) error
+	// caught up durably and every engine-owned removal terminal after storage
+	// effects have been excluded. A nil callback rejects both transitions.
+	ReconfigurationAdmission func(context.Context, ReconfigurationAdmission) error
 }
 
 // New validates and creates a QuePaxa core.
@@ -52,6 +57,9 @@ func NewObserver(config Config) (*Core, error) {
 func NewLearner(config Config) (*Core, error) { return newCoreFromConfig(config, false, true) }
 
 func newCoreFromConfig(config Config, observer, learner bool) (*Core, error) {
+	if config.EngineOwnedRemovals && !config.EnableReconfiguration {
+		return nil, fmt.Errorf("%w: engine-owned removals require reconfiguration", ErrInvalidConfig)
+	}
 	if config.NodeID == "" {
 		return nil, fmt.Errorf("%w: node ID is required", ErrInvalidConfig)
 	}
@@ -146,6 +154,7 @@ func newCoreFromConfig(config Config, observer, learner bool) (*Core, error) {
 		core.walIdentity = localMember.WALIdentity
 	}
 	core.reconfigEnabled = config.EnableReconfiguration
+	core.engineOwnedRemovals = config.EngineOwnedRemovals
 	core.reconfigAdmission = config.ReconfigurationAdmission
 	core.configHistory = []configEpoch{{start: 1, cluster: cloneCluster(cluster)}}
 	core.retiredIDs = make(map[NodeID]struct{})

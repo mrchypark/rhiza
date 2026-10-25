@@ -15,6 +15,7 @@ import (
 
 	"github.com/mrchypark/rhiza/internal/objstore"
 	"github.com/mrchypark/rhiza/internal/types"
+	"github.com/mrchypark/rhiza/pkg/fencing"
 	"github.com/mrchypark/rhiza/pkg/materializer"
 	"github.com/mrchypark/rhiza/pkg/network"
 	"github.com/mrchypark/rhiza/pkg/node"
@@ -26,6 +27,24 @@ type Member = quepaxa.Member
 type NodeID = quepaxa.NodeID
 type PublicKey = quepaxa.PublicKey
 type ReplicaMember = network.PeerIdentity
+
+// EngineRepairPreflightFromEnv builds the local no-authority preflight used by
+// the PID-1 supervisor. Kubernetes credential references are resolved later
+// by the authority from its authenticated workload context.
+func EngineRepairPreflightFromEnv() (fencing.EngineRepairPreflight, error) {
+	config, err := ConfigFromEnv()
+	if err != nil {
+		return nil, err
+	}
+	execution, err := executionConfig(config)
+	if err != nil {
+		return nil, err
+	}
+	// The supervisor socket is injected only after this constructor runs.
+	// This override is scoped to the fencer-only preflight constructor.
+	execution.EngineOwnedRemovals = execution.EnableReconfiguration
+	return node.EngineRepairPreflight(execution), nil
+}
 
 // NewReplicaMember removes a voter's secret while retaining its pinned peer identity.
 func NewReplicaMember(clusterID string, member Member) (ReplicaMember, error) {
@@ -88,9 +107,13 @@ type Config struct {
 	// only public identity, so a replicated membership never holds a secret.
 	PeerToken string
 	Members   []Member
-	// EnableReconfiguration enables externally fenced voter replacement.
-	// All voters must opt in; workload fencing and learner provisioning are external.
+	// EnableReconfiguration is the single HA membership-recovery opt-in.
+	// All voters must opt in; REMOVE decisions use canonical engine authority.
 	EnableReconfiguration bool
+	// EngineOwnedRemovals is retained for direct Go configuration callers. The
+	// environment path derives it from EnableReconfiguration to avoid a second
+	// deployment switch that could split voter protocols.
+	EngineOwnedRemovals bool
 	// Learner supplies a new identity absent from the immutable bootstrap members.
 	Learner                        *Member
 	ObjStoreEndpoint               string
@@ -248,7 +271,10 @@ func executionConfig(config Config) (*types.ExecutionConfig, error) {
 		Local:     config.Local,
 		ClusterID: types.ClusterID(config.ClusterID), NodeID: types.NodeID(config.NodeID),
 		DataDir: config.DataDir, BindAddr: config.BindAddr, PeerAddr: config.PeerAddr,
-		AdminToken: config.AdminToken, PeerToken: config.PeerToken, Members: config.Members, EnableReconfiguration: config.EnableReconfiguration, Learner: config.Learner,
+		AdminToken: config.AdminToken, PeerToken: config.PeerToken, Members: config.Members, EnableReconfiguration: config.EnableReconfiguration,
+		// Reconfiguration remains available to ordinary embedded callers. The
+		// engine-owned REMOVE protocol is a separate supervised trust boundary.
+		EngineOwnedRemovals: config.EngineOwnedRemovals, Learner: config.Learner,
 		ObjStoreEndpoint: config.ObjStoreEndpoint, ObjStoreBucket: config.ObjStoreBucket,
 		ObjStoreProvider: config.ObjStoreProvider, ObjStoreDir: config.ObjStoreDir, ObjStorePrefix: config.ObjStorePrefix,
 		ObjStoreRegion: config.ObjStoreRegion, ObjStoreInsecure: config.ObjStoreInsecure, ObjStoreRetries: config.ObjStoreRetries,

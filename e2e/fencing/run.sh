@@ -72,6 +72,12 @@ fencing_cluster=rhiza-generic-fencing
 fencing_context=kind-rhiza-generic-fencing
 fencing_namespace=rhiza-fencing-e2e
 fencing_node_image='kindest/node:v1.36.1@sha256:3489c7674813ba5d8b1a9977baea8a6e553784dab7b84759d1014dbd78f7ebd5'
+if [ "${FENCING_GCS_ORDINARY_RECOVERY:-no}" = yes ]; then
+  : "${RHIZA_KUBE_CONTEXT:?ordinary GCS recovery requires a prepared GCS fixture context}"
+  : "${RHIZA_NAMESPACE:?ordinary GCS recovery requires a prepared fixture namespace}"
+  : "${RHIZA_RUN_ID:?ordinary GCS recovery requires the fixture run ID}"
+  exec "$FENCING_E2E_BIN" run-gcs-ha-ordinary-recovery
+fi
 FENCING_E2E_OUT=${FENCING_E2E_OUT:-generic-fencing-results}
 export FENCING_E2E_OUT
 mkdir -p "$FENCING_E2E_OUT"
@@ -364,7 +370,7 @@ k patch statefulset rhiza --type=json -p "$local_store_ref"
 k patch deployment rhiza-operator --type=json -p "$local_store_ref"
 local_fencer_store_ref='[{"op":"add","path":"/spec/template/spec/containers/0/envFrom","value":[{"configMapRef":{"name":"rhiza-config"}},{"secretRef":{"name":"rhiza-object-store"}}]}]'
 k patch deployment rhiza-fencer --type=json -p "$local_fencer_store_ref"
-k rollout status deployment/rhiza-minio --timeout=180s
+k rollout status deployment/rhiza-versitygw --timeout=180s
 k patch job rhiza-create-bucket --type=merge -p '{"spec":{"suspend":false}}'
 k wait --for=condition=Complete job/rhiza-create-bucket --timeout=180s
 k rollout status deployment/rhiza-fencer --timeout=180s

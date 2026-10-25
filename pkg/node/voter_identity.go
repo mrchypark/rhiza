@@ -25,6 +25,7 @@ import (
 
 var (
 	ErrVoterStateLost          = errors.New("voter state continuity cannot be established")
+	ErrVoterWALLost            = errors.New("registered voter WAL is absent")
 	ErrVoterEnrollmentRequired = errors.New("existing voter requires offline enrollment")
 	errStopVoterPrefixScan     = errors.New("stop voter prefix scan after legacy object")
 )
@@ -71,10 +72,24 @@ func loadVoterIdentity(config *types.ExecutionConfig) (localVoterState, error) {
 		return state, fmt.Errorf("%w: invalid local identity", ErrVoterStateLost)
 	}
 	nonce, err := hex.DecodeString(identity.Nonce)
-	if err != nil || len(nonce) != 32 || identity.Version != voterIdentityVersion || !state.hadWAL {
+	if err != nil || len(nonce) != 32 || identity.Version != voterIdentityVersion {
 		return state, fmt.Errorf("%w: local identity or WAL manifest is missing/invalid; preserve the original disk", ErrVoterStateLost)
 	}
 	state.identity = &identity
+	if !state.hadWAL {
+		if !identity.Registered {
+			return state, fmt.Errorf("%w: unregistered identity has no WAL manifest", ErrVoterStateLost)
+		}
+		inspection, inspectErr := qlog.OpenReadOnly(dir)
+		if inspectErr != nil {
+			return state, fmt.Errorf("%w: missing WAL manifest has other local data: %v", ErrVoterStateLost, inspectErr)
+		}
+		closeErr := inspection.Close()
+		if closeErr != nil {
+			return state, errors.Join(ErrVoterStateLost, closeErr)
+		}
+		return state, errors.Join(ErrVoterStateLost, ErrVoterWALLost)
+	}
 	return state, nil
 }
 
@@ -88,15 +103,26 @@ func voterIdentityFor(config *types.ExecutionConfig) voterIdentity {
 	return identity
 }
 
+func voterRegistrationPrefix(config *types.ExecutionConfig) string {
+	return path.Join(config.ObjStorePrefix, string(config.ClusterID), "voters")
+}
+
+func voterMembershipRegistrationKey(config *types.ExecutionConfig) string {
+	return path.Join(voterRegistrationPrefix(config), "membership.json")
+}
+
+func voterIdentityRegistrationKey(config *types.ExecutionConfig, nodeID string) string {
+	return path.Join(voterRegistrationPrefix(config), fmt.Sprintf("%x.json", sha256.Sum256([]byte(nodeID))))
+}
+
 // ensureVoterIdentity runs before any archive replay or peer listener. An
 // archive contains decided values, not the lost voter's outstanding promises.
 func ensureVoterIdentity(ctx context.Context, config *types.ExecutionConfig, bucket objstore.Bucket, wal *qlog.WAL, local localVoterState, enroll bool, beforeWrite ...func(context.Context, string) error) error {
-	return ensureVoterIdentityWithHooks(ctx, config, bucket, wal, local, enroll, beforeWrite, nil)
+	return ensureVoterIdentityWithHooks(ctx, config, bucket, wal, local, enroll, beforeWrite, nil, false, "")
 }
 
-func ensureVoterIdentityWithHooks(ctx context.Context, config *types.ExecutionConfig, bucket objstore.Bucket, wal *qlog.WAL, local localVoterState, enroll bool, beforeWrite []func(context.Context, string) error, pendingIdentityWrite []func(context.Context, string, []byte) error, authorityAssignedRestart ...bool) error {
+func ensureVoterIdentityWithHooks(ctx context.Context, config *types.ExecutionConfig, bucket objstore.Bucket, wal *qlog.WAL, local localVoterState, enroll bool, beforeWrite []func(context.Context, string) error, pendingIdentityWrite []func(context.Context, string, []byte) error, assignedRestart bool, assignedWALIdentity string) error {
 	want := voterIdentityFor(config)
-	assignedRestart := len(authorityAssignedRestart) != 0 && authorityAssignedRestart[0]
 	if assignedRestart {
 		if local.identity == nil || !local.identity.Registered || config.Learner != nil || local.identity.Node != string(config.NodeID) || local.identity.Cluster != string(config.ClusterID) {
 			return fmt.Errorf("%w: authority-assigned restart lacks its registered logical identity", ErrVoterStateLost)
@@ -106,6 +132,16 @@ func ensureVoterIdentityWithHooks(ctx context.Context, config *types.ExecutionCo
 		// retains the cohort under which its learner identity was first bound.
 		want.Membership = local.identity.Membership
 		want.LearnerPublicKey = local.identity.LearnerPublicKey
+	}
+	if assignedWALIdentity != "" {
+		if local.identity != nil || local.hadWAL || !assignedRestart && config.Learner == nil {
+			return fmt.Errorf("%w: fresh WAL assignment is restricted to an authority-assigned learner", ErrVoterStateLost)
+		}
+		nonce, err := hex.DecodeString(assignedWALIdentity)
+		if err != nil || len(nonce) != 32 {
+			return fmt.Errorf("%w: authority-assigned WAL identity is invalid", ErrVoterStateLost)
+		}
+		want.Nonce = assignedWALIdentity
 	}
 	bound, hasBinding := wal.Identity()
 	if local.identity != nil {
@@ -129,8 +165,8 @@ func ensureVoterIdentityWithHooks(ctx context.Context, config *types.ExecutionCo
 		}
 		return nil
 	}
-	prefix := path.Join(config.ObjStorePrefix, string(config.ClusterID), "voters")
-	clusterKey := path.Join(prefix, "membership.json")
+	prefix := voterRegistrationPrefix(config)
+	clusterKey := voterMembershipRegistrationKey(config)
 	clusterData, err := readVoterRegistration(ctx, bucket, clusterKey)
 	if err != nil {
 		return err
@@ -194,7 +230,7 @@ func ensureVoterIdentityWithHooks(ctx context.Context, config *types.ExecutionCo
 	if !slices.Contains(bucket.SupportedObjectUploadOptions(), objstore.IfNotExists) {
 		return fmt.Errorf("voter registration requires conditional object writes")
 	}
-	identityKey := path.Join(prefix, fmt.Sprintf("%x.json", sha256.Sum256([]byte(config.NodeID))))
+	identityKey := voterIdentityRegistrationKey(config, string(config.NodeID))
 	registered, err := readVoterRegistration(ctx, bucket, identityKey)
 	if err != nil {
 		return err
@@ -229,11 +265,13 @@ func ensureVoterIdentityWithHooks(ctx context.Context, config *types.ExecutionCo
 		clusterWant = append([]byte(nil), clusterData...)
 	}
 	if local.identity == nil {
-		var nonce [32]byte
-		if _, err := rand.Read(nonce[:]); err != nil {
-			return err
+		if want.Nonce == "" {
+			var nonce [32]byte
+			if _, err := rand.Read(nonce[:]); err != nil {
+				return err
+			}
+			want.Nonce = hex.EncodeToString(nonce[:])
 		}
-		want.Nonce = hex.EncodeToString(nonce[:])
 		local.identity = &want
 		if err := writeVoterIdentity(config.DataDir, want); err != nil {
 			return err

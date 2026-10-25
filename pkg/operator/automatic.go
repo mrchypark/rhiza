@@ -1297,7 +1297,7 @@ func (c *Controller) reconcileClusterMode(ctx context.Context, r *ClusterResourc
 	policy := *r.Spec.Policy
 	// The declared count, the workload environment, and the replica count are one
 	// contract; reconciling a mismatch as an outage would fence a live majority.
-	obs, statuses, err := c.observeAutomatic(ctx, r, state, sts)
+	obs, _, err := c.observeAutomatic(ctx, r, state, sts)
 	if err != nil {
 		return block(state, err.Error())
 	}
@@ -1308,64 +1308,32 @@ func (c *Controller) reconcileClusterMode(ctx context.Context, r *ClusterResourc
 	} else if (decision == AutoSuspect || decision == AutoDegraded) && state.SuspectedSince.IsZero() {
 		state.SuspectedSince = now
 	}
-	// Single-voter repair keeps the live quorum. The same grace/rate limits apply,
-	// but async ACK-loss permission is needed only for whole-generation DR.
-	var failed quepaxa.NodeID
-	if decision == AutoDegraded && len(statuses) == len(state.Voters)-1 {
-		for _, ref := range state.Voters {
-			if _, ok := statuses[ref.NodeID]; !ok {
-				failed = ref.NodeID
-			}
-		}
-		single := obs
-		single.QuorumVerified = false
-		single.Durability = "before-ack"
-		decision, message = DecideAutoRecovery(policy, single, now, state.SuspectedSince, state.Completions)
-	}
-	if decision == AutoRecover && failed != "" && (state.Identities[failed].WALIdentity == "" || state.Identities[failed].PodUID == "") {
-		// An unknown incarnation cannot authorize online removal. The existing
-		// generation fence covers all authority, including unobserved processes.
-		whole := obs
-		whole.QuorumVerified = false
-		decision, message = DecideAutoRecovery(policy, whole, now, state.SuspectedSince, state.Completions)
-		failed = ""
-	}
+	// Ordinary failed-Pod replacement belongs to the engine. The operator starts
+	// automatic recovery only when the current generation has lost quorum.
 	if decision == AutoRecover {
 		if c.Fencer == nil {
 			return block(state, "fencing backend is not configured")
 		}
-		if failed != "" && (state.Identities[failed].WALIdentity == "" || state.Identities[failed].PodUID == "") {
-			return block(state, "failed voter identity has not been authenticated")
-		}
-		if failed == "" {
-			if !automaticArchiveAllowsGenerationRecovery(ctx, c.Bucket, path.Join(c.Prefix, state.ActiveClusterID), obs.Durability, policy.AllowDataLoss) {
-				return block(state, "certified archive is unavailable; no destructive recovery will start")
-			}
-		}
-		if failed != "" && !c.automaticSurvivingQuorum(ctx, r, state, sts, failed) {
-			return block(state, "quorum excluding the failed voter is not verified; refusing online fencing")
+		if !automaticArchiveAllowsGenerationRecovery(ctx, c.Bucket, path.Join(c.Prefix, state.ActiveClusterID), obs.Durability, policy.AllowDataLoss) {
+			return block(state, "certified archive is unavailable; no destructive recovery will start")
 		}
 		state.Sequence++
 		name := "auto-" + shortID(state.BindingUID+":"+fmt.Sprint(state.Sequence))
 		request := FenceRequest{LogicalID: r.Spec.LogicalID, BindingUID: state.BindingUID, Namespace: c.Kube.Namespace, StatefulSet: r.Spec.StatefulSet, StatefulSetUID: uid, SourceClusterID: state.ActiveClusterID, OperationID: name, Scope: "Generation"}
 		for _, ref := range state.Voters {
-			if failed == "" || ref.NodeID == failed {
-				target := state.Identities[ref.NodeID]
-				target.NodeID = string(ref.NodeID)
-				target.Pod = ref.Pod
-				request.Targets = append(request.Targets, target)
-			}
+			target := state.Identities[ref.NodeID]
+			target.NodeID = string(ref.NodeID)
+			target.Pod = ref.Pod
+			request.Targets = append(request.Targets, target)
 		}
-		if failed != "" {
-			request.Scope = "Voter"
-		} else if err := includeLearnerHistory(state, &request); err != nil {
+		if err := includeLearnerHistory(state, &request); err != nil {
 			return block(state, err.Error())
 		}
 		// The scope is final only after the retained learner history is added.
 		if err := fenceCapacityError(len(request.Targets)); err != nil {
 			return block(state, err.Error())
 		}
-		state.Intent = &autoIntent{Request: request, Policy: policy, Durability: obs.Durability, Voters: append([]VoterPod(nil), state.Voters...), Failed: failed, RecoveryName: name, LearnerName: name + "-learner"}
+		state.Intent = &autoIntent{Request: request, Policy: policy, Durability: obs.Durability, Voters: append([]VoterPod(nil), state.Voters...), RecoveryName: name, LearnerName: name + "-learner"}
 	}
 	if err := c.saveAuto(ctx, r, state, version); err != nil {
 		return err

@@ -126,3 +126,18 @@ func TestMembershipSupervisedInventoryOwnership(t *testing.T) {
 		})
 	}
 }
+
+func TestNewManualMembershipRecoveryIsBlocked(t *testing.T) {
+	ctx, r, api, c := membershipFixture(t)
+	if err := c.reconcileMembership(ctx, r); err != nil {
+		t.Fatal(err)
+	}
+	if r.Status.Phase != "Blocked" || !strings.Contains(r.Status.Message, "ordinary Pod recovery is engine-owned") {
+		t.Fatalf("new manual membership request was not blocked: %+v", r.Status)
+	}
+	if r.Status.Membership == nil || r.Status.Membership.RemoveRequest != nil || r.Status.Membership.Add != nil ||
+		len(api.changes) != 0 || len(api.aborts) != 0 || api.stsPuts != 0 {
+		t.Fatalf("blocked manual membership request caused side effects: status=%+v changes=%d aborts=%d StatefulSetPuts=%d",
+			r.Status, len(api.changes), len(api.aborts), api.stsPuts)
+	}
+}

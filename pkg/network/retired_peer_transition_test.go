@@ -58,7 +58,7 @@ func TestRetiredPeerTransitionRejectsCachedIdentityAndAdmitsNewIdentity(t *testi
 		core, err := quepaxa.New(quepaxa.Config{
 			NodeID: member.ID, Cluster: config, WAL: wal, Transport: transport,
 			EnableReconfiguration: true,
-			ReconfigurationAdmission: func(context.Context, quepaxa.Cluster, quepaxa.Slot, [32]byte) error {
+			ReconfigurationAdmission: func(context.Context, quepaxa.ReconfigurationAdmission) error {
 				return nil
 			},
 		})

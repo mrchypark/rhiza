@@ -54,6 +54,107 @@ func TestWorkflowExcludesRawKindArtifacts(t *testing.T) {
 	}
 }
 
+func TestRunOwnedDeploymentScaleUsesUIDAndResourceVersionPreconditions(t *testing.T) {
+	dir := t.TempDir()
+	argsPath := filepath.Join(dir, "kubectl-args")
+	kubectlPath := filepath.Join(dir, "kubectl")
+	script := "#!/bin/sh\nprintf '%s\\n' \"$@\" > \"$FENCING_KUBECTL_ARGS\"\nexit 1\n"
+	if err := os.WriteFile(kubectlPath, []byte(script), 0700); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", dir)
+	t.Setenv("FENCING_KUBECTL_ARGS", argsPath)
+	owned := runOwnedOperator{Name: "rhiza-operator", UID: "deployment-uid", ResourceVersion: "resource-version", Replicas: 1}
+	if err := owned.setReplicas(context.Background(), 0); err == nil {
+		t.Fatal("failed Kubernetes precondition was treated as a successful scale")
+	}
+	args, err := os.ReadFile(argsPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	joined := string(args)
+	for _, required := range []string{"patch\ndeployment\nrhiza-operator", "metadata/uid", "deployment-uid", "metadata/resourceVersion", "resource-version", "spec/replicas"} {
+		if !strings.Contains(joined, required) {
+			t.Fatalf("fake kubectl did not receive required ownership precondition %q: %s", required, joined)
+		}
+	}
+	if strings.Count(joined, "patch") != 1 {
+		t.Fatalf("precondition failure issued more than the single owned patch: %s", joined)
+	}
+}
+
+func TestGCSOrdinaryRecoveryRequiresFreshSameOrdinalVoter(t *testing.T) {
+	source := gcsRecoverySource{ClusterID: "cluster", Namespace: "fixture", StatefulSetUID: "sts-uid", Targets: []operator.FenceTarget{
+		{NodeID: "old-0", Pod: "rhiza-0", PodUID: "old-pod", WALIdentity: "old-wal"},
+		{NodeID: "survivor-1", Pod: "rhiza-1", PodUID: "pod-1", WALIdentity: "wal-1"},
+		{NodeID: "survivor-2", Pod: "rhiza-2", PodUID: "pod-2", WALIdentity: "wal-2"},
+	}}
+	status := network.MembershipStatus{NodeID: "new-0", ClusterID: "cluster", ConfigID: 8,
+		Voters: []quepaxa.NodeID{"survivor-1", "survivor-2", "new-0"}, WALIdentity: "new-wal", Voting: true}
+	baseline := network.MembershipStatus{NodeID: "survivor-1", ClusterID: "cluster", ConfigID: 7,
+		Voters: []quepaxa.NodeID{"old-0", "survivor-1", "survivor-2"}, WALIdentity: "wal-1", Voting: true}
+	if !gcsOrdinaryBaselineMembershipReady(source, source.Targets[1], baseline) {
+		t.Fatal("rejected exact initial three-voter membership")
+	}
+	baseline.Voters = []quepaxa.NodeID{"old-0", "survivor-1", "unexpected"}
+	if gcsOrdinaryBaselineMembershipReady(source, source.Targets[1], baseline) {
+		t.Fatal("accepted an initial membership with an uncaptured voter")
+	}
+	if !gcsOrdinaryMembershipReady(source, source.Targets[0], 7, status) {
+		t.Fatal("rejected fresh same-ordinal voter with both original survivors")
+	}
+	tests := []struct {
+		name   string
+		mutate func(*network.MembershipStatus)
+	}{
+		{"old logical identity", func(s *network.MembershipStatus) { s.NodeID = "old-0"; s.Voters[2] = "old-0" }},
+		{"old WAL", func(s *network.MembershipStatus) { s.WALIdentity = "old-wal" }},
+		{"old voter remains", func(s *network.MembershipStatus) { s.Voters[2] = "old-0" }},
+		{"missing survivor", func(s *network.MembershipStatus) { s.Voters[0] = "newcomer" }},
+		{"duplicate voter", func(s *network.MembershipStatus) { s.Voters[2] = "survivor-1" }},
+		{"no configuration advance", func(s *network.MembershipStatus) { s.ConfigID = 7 }},
+		{"pending membership", func(s *network.MembershipStatus) { s.Pending = true }},
+		{"not yet voting", func(s *network.MembershipStatus) { s.Voting = false }},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			changed := status
+			changed.Voters = append([]quepaxa.NodeID(nil), status.Voters...)
+			test.mutate(&changed)
+			if gcsOrdinaryMembershipReady(source, source.Targets[0], 7, changed) {
+				t.Fatal("accepted stale or incomplete ordinary-recovery voter membership")
+			}
+		})
+	}
+}
+
+func TestGCSOrdinaryRecoveryHasExplicitRunnerMode(t *testing.T) {
+	mainSource, err := os.ReadFile("main.go")
+	if err != nil {
+		t.Fatal(err)
+	}
+	mainText := string(mainSource)
+	start := strings.Index(mainText, `if os.Args[1] == "run-gcs-ha-ordinary-recovery" {`)
+	if start < 0 {
+		t.Fatal("dedicated ordinary-recovery command is missing")
+	}
+	end := strings.Index(mainText[start:], "\n\tif os.Args[1] == ")
+	if end < 0 {
+		t.Fatal("ordinary-recovery command block is not bounded")
+	}
+	block := mainText[start : start+end]
+	if !strings.Contains(block, "fatal(configureGCSHA(ctx))") || !strings.Contains(block, "fatal(qualifyGCSOrdinaryRecovery(ctx))") {
+		t.Fatal("ordinary-recovery command does not validate the GCS fixture before running")
+	}
+	runScript, err := os.ReadFile("run.sh")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(runScript), `FENCING_GCS_ORDINARY_RECOVERY:-no`) || !strings.Contains(string(runScript), `exec "$FENCING_E2E_BIN" run-gcs-ha-ordinary-recovery`) {
+		t.Fatal("run.sh lacks the explicit ordinary-recovery mode dispatch")
+	}
+}
+
 func TestCommandPreservesExecutionAndContextErrors(t *testing.T) {
 	t.Run("canceled process preserves exit and context errors", func(t *testing.T) {
 		ctx, cancel := context.WithCancel(context.Background())
@@ -517,6 +618,182 @@ func TestOnlineVoterDiagnosticsArtifactKeepsOnlyUIDBoundAllowlistedProjection(t 
 	}
 }
 
+func TestBootstrapDiagnosticCapturesExactPodLogsBeforeOptionalProbes(t *testing.T) {
+	const podUID = "private-exact-pod-uid"
+	const rootUID = "private-exact-root-uid"
+	const stsUID = "private-exact-sts-uid"
+	logBody := "private-short-startup-canary-" + strings.Repeat("x", 59-len("private-short-startup-canary-"))
+	if len(logBody) != 59 {
+		t.Fatalf("test log length = %d, want 59", len(logBody))
+	}
+	for _, test := range []struct {
+		name                      string
+		replace                   string
+		restarts                  int
+		wantErr                   bool
+		wantCurrent, wantPrevious bool
+	}{
+		{name: "stable identity", restarts: 1, wantCurrent: true, wantPrevious: true},
+		{name: "current replaced during log read", replace: "current", restarts: 1, wantErr: true},
+		{name: "previous replaced during log read", replace: "previous", restarts: 1, wantErr: true, wantCurrent: true},
+		{name: "current container replaced during log read", replace: "current-container", restarts: 1, wantErr: true},
+		{name: "previous container replaced during log read", replace: "previous-container", restarts: 1, wantErr: true, wantCurrent: true},
+		{name: "current container restarted during log read", replace: "current-restart", restarts: 1, wantErr: true},
+		{name: "previous container restarted during log read", replace: "previous-restart", restarts: 1, wantErr: true, wantCurrent: true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			bin := t.TempDir()
+			callsPath := filepath.Join(t.TempDir(), "calls.log")
+			podGetCount := filepath.Join(t.TempDir(), "pod-get-count")
+			script := `#!/bin/sh
+printf '%s\n' "$*" >> "$CALLS"
+if [ "$5" = logs ]; then printf '%s' "$LOG_BODY"; exit 0; fi
+if [ "$5" = get ]; then
+  case "$6" in
+    pods) printf '%s' '{"items":[{"metadata":{"name":"rhiza-0","uid":"` + podUID + `","ownerReferences":[{"kind":"StatefulSet","name":"rhiza","uid":"` + stsUID + `"}]},"spec":{"containers":[{"name":"rhiza"}]},"status":{"phase":"Pending","containerStatuses":[{"name":"rhiza","containerID":"containerd://runtime-container-id","restartCount":'"$RESTARTS"',"ready":false}]}}]}';;
+    pod)
+      count=$(cat "$POD_GET_COUNT" 2>/dev/null || printf '0')
+      count=$((count + 1))
+      printf '%s' "$count" > "$POD_GET_COUNT"
+      uid='` + podUID + `'
+      if [ "$REPLACE_ON" = current ] && [ "$count" -ge 2 ]; then uid='replacement-pod-uid'; fi
+      if [ "$REPLACE_ON" = previous ] && [ "$count" -ge 4 ]; then uid='replacement-pod-uid'; fi
+      cid='containerd://runtime-container-id'
+      restart="$RESTARTS"
+      if [ "$REPLACE_ON" = current-container ] && [ "$count" -ge 2 ]; then cid='containerd://replacement-container-id'; fi
+      if [ "$REPLACE_ON" = previous-container ] && [ "$count" -ge 4 ]; then cid='containerd://replacement-container-id'; fi
+      if [ "$REPLACE_ON" = current-restart ] && [ "$count" -ge 2 ]; then restart=$((restart + 1)); fi
+      if [ "$REPLACE_ON" = previous-restart ] && [ "$count" -ge 4 ]; then restart=$((restart + 1)); fi
+      printf '{"metadata":{"name":"rhiza-0","uid":"%s"},"status":{"containerStatuses":[{"name":"rhiza","containerID":"%s","restartCount":%s}]}}' "$uid" "$cid" "$restart";;
+    rhizacluster) printf '%s' '{"metadata":{"uid":"` + rootUID + `","generation":7},"status":{"phase":"Degraded","observedGeneration":6,"message":"private root detail"}}';;
+    statefulset) printf '%s' '{"metadata":{"uid":"` + stsUID + `","generation":4,"ownerReferences":[{"kind":"RhizaCluster","uid":"` + rootUID + `"}]},"spec":{"template":{"spec":{"containers":[{"name":"rhiza","command":["/usr/local/bin/rhiza-fencer"],"args":["supervise","--","/bin/sh","-ec","if [ -n \"${RHIZA_LEARNER:-}\" ]; then while [ ! -f /data/.chaos-start ]; do sleep 0.2; done; fi; exec /usr/local/bin/rhiza-entrypoint"],"ports":[{"name":"http","containerPort":8080}]}]}}},"status":{"observedGeneration":4,"readyReplicas":0}}';;
+    events|rhizarecoveries) printf '%s' '{"items":[]}';;
+    *) exit 2;;
+  esac
+  exit 0
+fi
+exit 2
+`
+			kubectlPath := filepath.Join(bin, "kubectl")
+			if err := os.WriteFile(kubectlPath, []byte(script), 0700); err != nil {
+				t.Fatal(err)
+			}
+			t.Setenv("PATH", bin+string(os.PathListSeparator)+os.Getenv("PATH"))
+			t.Setenv("CALLS", callsPath)
+			t.Setenv("POD_GET_COUNT", podGetCount)
+			t.Setenv("REPLACE_ON", test.replace)
+			t.Setenv("RESTARTS", fmt.Sprint(test.restarts))
+			t.Setenv("LOG_BODY", logBody)
+			out := t.TempDir()
+			captureErr := captureVoterStartupDiagnostics("", nil, out, "bootstrap")
+			if (captureErr != nil) != test.wantErr {
+				t.Fatalf("capture error = %v, wantErr %t", captureErr, test.wantErr)
+			}
+			privateDir := filepath.Join(out, "private-online-voter-diagnostics")
+			data, err := os.ReadFile(filepath.Join(privateDir, "online-voter-diagnostics.json"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			var snapshot obj
+			if err := json.Unmarshal(data, &snapshot); err != nil {
+				t.Fatal(err)
+			}
+			if snapshot["operationID"] != "" || snapshot["mode"] != "bootstrap" || nested(snapshot, "learner", "metadata", "uid") != podUID || nested(snapshot, "capture", "root", "metadata", "uid") != rootUID || nested(snapshot, "capture", "statefulSet", "metadata", "uid") != stsUID || nested(snapshot, "capture", "podIdentityBound") != true {
+				t.Fatalf("bootstrap capture invented an operation or lost exact identity: %+v", snapshot)
+			}
+			_, currentErr := os.ReadFile(filepath.Join(privateDir, "learner-current-rhiza.log"))
+			_, previousErr := os.ReadFile(filepath.Join(privateDir, "learner-previous-rhiza.log"))
+			if (currentErr == nil) != test.wantCurrent || (previousErr == nil) != test.wantPrevious {
+				t.Fatalf("trusted logs current=%t previous=%t, want current=%t previous=%t", currentErr == nil, previousErr == nil, test.wantCurrent, test.wantPrevious)
+			}
+			calls, err := os.ReadFile(callsPath)
+			if err != nil {
+				t.Fatal(err)
+			}
+			order := string(calls)
+			firstLog := strings.Index(order, " logs rhiza-0 -c rhiza --tail=100 --limit-bytes=32768")
+			rootQuery := strings.Index(order, " get rhizacluster rhiza")
+			stsQuery := strings.Index(order, " get statefulset rhiza")
+			eventQuery := strings.Index(order, " get events")
+			if firstLog < 0 || rootQuery < 0 || stsQuery < 0 || eventQuery < 0 || firstLog > rootQuery || firstLog > stsQuery || firstLog > eventQuery {
+				t.Fatalf("log capture was not first, before optional probes: %s", order)
+			}
+			publicBytes, err := projectOnlineVoterDiagnostics(out, data)
+			if err != nil || bytes.Contains(publicBytes, []byte("private-short-startup-canary")) || bytes.Contains(publicBytes, []byte(podUID)) {
+				t.Fatalf("public projection leaked the short unknown log or exact Pod UID: %s (%v)", publicBytes, err)
+			}
+			var public onlineVoterDiagnosticsView
+			if err := json.Unmarshal(publicBytes, &public); err != nil {
+				t.Fatal(err)
+			}
+			if public.RootPhase != "Degraded" || public.RootGeneration != 7 || public.RootObservedGeneration != 6 || !public.StatefulSetOwnedByRoot || !public.StatefulSetSupervisedLaunch || !public.LearnerIdentityBound || len(public.Logs) != 2 {
+				t.Fatalf("bounded bootstrap identity/status projection incomplete: %+v", public)
+			}
+			if len(public.Logs[0].Stages) != 0 {
+				t.Fatalf("unparsed 59-byte canary was labeled as an attested startup stage: %+v", public.Logs[0])
+			}
+			if public.Logs[0].Captured != test.wantCurrent || public.Logs[1].Captured != test.wantPrevious ||
+				(test.wantCurrent && (public.Logs[0].Bytes != 59 || public.Logs[0].SHA256 == "" || public.Logs[0].Truncated)) ||
+				(test.wantPrevious && (public.Logs[1].Bytes != 59 || public.Logs[1].SHA256 == "" || public.Logs[1].Truncated)) {
+				t.Fatalf("capture completeness metadata mismatched trusted files: %+v", public.Logs)
+			}
+			if !test.wantCurrent && public.Logs[0].CaptureStatus != "identity_changed" || !test.wantPrevious && public.Logs[1].CaptureStatus != "identity_changed" {
+				t.Fatalf("replacement Pod logs were not discarded as identity changes: %+v", public.Logs)
+			}
+		})
+	}
+}
+
+func TestSupervisedLaunchShapeRecognizesOnlyKnownLaunchCommands(t *testing.T) {
+	const fixtureGate = `if [ -n "${RHIZA_LEARNER:-}" ]; then while [ ! -f /data/.chaos-start ]; do sleep 0.2; done; fi; exec /usr/local/bin/rhiza-entrypoint`
+	for _, test := range []struct {
+		name string
+		args []any
+		want string
+	}{
+		{name: "direct", args: []any{"supervise", "--", "/usr/local/bin/rhiza"}, want: "expected"},
+		{name: "fixture gate", args: []any{"supervise", "--", "/bin/sh", "-ec", fixtureGate}, want: "expected"},
+		{name: "unrecognized shell payload", args: []any{"supervise", "--", "/bin/sh", "-ec", "exec /usr/local/bin/rhiza"}, want: "mismatch"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			container := obj{"command": []any{"/usr/local/bin/rhiza-fencer"}, "args": test.args}
+			if got := supervisedLaunchShape(container); got != test.want {
+				t.Fatalf("supervised launch shape = %q, want %q", got, test.want)
+			}
+		})
+	}
+}
+
+func TestDiagnosticErrorCodeSeparatesMissingAPIAndContextFailures(t *testing.T) {
+	for _, test := range []struct {
+		name     string
+		ctx      context.Context
+		err      error
+		previous bool
+		want     string
+	}{
+		{name: "previous missing", ctx: context.Background(), err: errors.New("previous terminated container rhiza not found"), previous: true, want: "previous_missing"},
+		{name: "API not found", ctx: context.Background(), err: errors.New("Error from server (NotFound)"), want: "api_not_found"},
+		{name: "command failure", ctx: context.Background(), err: errors.New("private diagnostic text"), want: "command_failed"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			if got := diagnosticErrorCode(test.ctx, test.err, test.previous); got != test.want {
+				t.Fatalf("capture classification = %q, want %q", got, test.want)
+			}
+		})
+	}
+	canceled, cancel := context.WithCancel(context.Background())
+	cancel()
+	if got := diagnosticErrorCode(canceled, errors.New("private text"), false); got != "canceled" {
+		t.Fatalf("canceled capture classification = %q", got)
+	}
+	deadline, cancelDeadline := context.WithDeadline(context.Background(), time.Now().Add(-time.Second))
+	defer cancelDeadline()
+	if got := diagnosticErrorCode(deadline, errors.New("private text"), false); got != "deadline_exceeded" {
+		t.Fatalf("deadline capture classification = %q", got)
+	}
+}
+
 func TestWorkflowPublishesOnlyPreKindFailureReceiptWhenQualificationIsSkipped(t *testing.T) {
 	data, err := os.ReadFile("../../.github/workflows/ci.yml")
 	if err != nil {
@@ -943,6 +1220,47 @@ func TestFixtureHoldsWritersUntilSupervisorAndStoreReady(t *testing.T) {
 	}
 }
 
+func TestObjectStoreE2EManifestUsesPinnedVersityGateway(t *testing.T) {
+	manifest, err := os.ReadFile("../../deploy/k8s/object-store-e2e.yaml")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{
+		"name: rhiza-versitygw",
+		"app: rhiza-versitygw",
+		"name: versitygw",
+		"image: ghcr.io/versity/versitygw@sha256:30292fc2eeacc67a36993b01f7a7a5e3361a19cced0e80c1d71cfa2a4b0a2499",
+		"args: [\"--port\", \":9000\", \"--health\", \"/_/health\", \"posix\", \"/data\"]",
+		"name: ROOT_ACCESS_KEY",
+		"name: ROOT_SECRET_KEY",
+		"path: /_/health",
+		"image: amazon/aws-cli@sha256:83f8ffe939569070c5b66d22231862ab78718766d9d8e4c44ca84dd0be5569a5",
+		"aws --endpoint-url http://rhiza-versitygw:9000 s3 mb s3://rhiza",
+	} {
+		if !strings.Contains(string(manifest), want) {
+			t.Errorf("object-store fixture missing %q", want)
+		}
+	}
+	for _, forbidden := range []string{"quay.io/minio", "MINIO_ROOT_", "minio/mc", "mc alias", "mc mb"} {
+		if strings.Contains(string(manifest), forbidden) {
+			t.Errorf("object-store fixture still contains %q", forbidden)
+		}
+	}
+
+	for _, path := range []string{
+		"../../deploy/k8s/graph-server-3peer-e2e.yaml",
+		"../../deploy/k8s/sql-server-3peer-e2e.yaml",
+	} {
+		data, err := os.ReadFile(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !strings.Contains(string(data), "rhiza-versitygw.rhiza-objstore-e2e.svc.cluster.local:9000") {
+			t.Errorf("%s does not use the Versity Gateway service", path)
+		}
+	}
+}
+
 func TestFixtureKeepsStoreCoordinatesPublicAndWriterKeysLocalOnly(t *testing.T) {
 	items := manifests()["items"].([]obj)
 	var configMap, statefulSet, operator bool
@@ -952,7 +1270,7 @@ func TestFixtureKeepsStoreCoordinatesPublicAndWriterKeysLocalOnly(t *testing.T) 
 			configMap = true
 			data := item["data"].(obj)
 			for key, want := range map[string]string{
-				"RHIZA_OBJSTORE_ENDPOINT": "rhiza-minio:9000",
+				"RHIZA_OBJSTORE_ENDPOINT": "rhiza-versitygw:9000",
 				"RHIZA_OBJSTORE_BUCKET":   "rhiza",
 				"RHIZA_OBJSTORE_REGION":   "us-east-1",
 				"RHIZA_OBJSTORE_INSECURE": "true",
