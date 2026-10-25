@@ -14,14 +14,25 @@ import (
 
 func TestControllerMembershipCompletionWaitsForDurabilityAck(t *testing.T) {
 	ctx, r, api, c := membershipFixture(t)
+	seedLegacyRemoveMembershipJournal(r)
+	var seededRemove network.MembershipChange
+	if err := json.Unmarshal(jsonBytes(r.Status.Membership.RemoveRequest), &seededRemove); err != nil {
+		t.Fatal(err)
+	}
 	if err := c.reconcileAll(ctx); err != nil {
 		t.Fatal(err)
-	} // journal removal
+	} // replay journaled removal
+	if len(api.changes) != 1 || !sameJSON(api.changes[0], seededRemove) {
+		t.Fatalf("legacy REMOVE was not replayed verbatim: %+v", api.changes)
+	}
 	api.membership["n1"] = network.MembershipStatus{NodeID: "n1", ClusterID: "source", ConfigID: 2, Voters: []quepaxa.NodeID{"n1", "n2"}, Voting: true}
 	api.membership["n2"] = network.MembershipStatus{NodeID: "n2", ClusterID: "source", ConfigID: 2, Voters: []quepaxa.NodeID{"n1", "n2"}, Voting: true}
 	if err := c.reconcileAll(ctx); err != nil {
 		t.Fatal(err)
-	} // journal add before dispatch
+	} // confirm removal before journaling the add
+	if len(api.changes) != 2 || !sameJSON(api.changes[1], seededRemove) {
+		t.Fatalf("committed REMOVE persistence was not confirmed before ADD: %+v", api.changes)
+	}
 	if r.Status.Membership.Add == nil || r.Status.Membership.Phase != "Adding" {
 		t.Fatalf("add was not journaled before dispatch: %+v", r.Status.Membership)
 	}
@@ -59,14 +70,14 @@ func TestControllerMembershipCompletionWaitsForDurabilityAck(t *testing.T) {
 	if err := c.reconcileAll(ctx); err != nil {
 		t.Fatal(err)
 	}
-	if r.Status.Membership.Phase == "Complete" || r.Status.Phase == "Complete" || len(api.changes) != 2 {
+	if r.Status.Membership.Phase == "Complete" || r.Status.Phase == "Complete" || len(api.changes) != 3 {
 		t.Fatalf("voting membership completed without a successful persistence replay: status=%+v changes=%d", r.Status, len(api.changes))
 	}
 	member := voterMember("source", "n4", "new-token")
 	member.WALIdentity = strings.Repeat("a", 64)
 	want := network.MembershipChange{OperationID: membershipOperationID(r, "add"), ClusterID: "source", ExpectedConfigID: 2, Add: &member}
-	if !sameJSON(api.changes[1], want) {
-		t.Fatalf("persistence replay payload=%+v want exact journaled request %+v", api.changes[1], want)
+	if !sameJSON(api.changes[2], want) {
+		t.Fatalf("persistence replay payload=%+v want exact journaled request %+v", api.changes[2], want)
 	}
 
 	// A later, different configuration is not evidence that this journaled add
@@ -77,7 +88,7 @@ func TestControllerMembershipCompletionWaitsForDurabilityAck(t *testing.T) {
 	if err := c.reconcileAll(ctx); err != nil {
 		t.Fatal(err)
 	}
-	if r.Status.Membership.Phase == "Complete" || len(api.changes) != 2 || staleRemoveCalls != 0 {
+	if r.Status.Membership.Phase == "Complete" || len(api.changes) != 3 || staleRemoveCalls != 0 {
 		t.Fatalf("different config bypassed completion guard: status=%+v changes=%d", r.Status, len(api.changes))
 	}
 
@@ -87,14 +98,14 @@ func TestControllerMembershipCompletionWaitsForDurabilityAck(t *testing.T) {
 	if err := c.reconcileAll(ctx); err != nil {
 		t.Fatal(err)
 	}
-	if r.Status.Membership.Phase == "Complete" || staleRemoveCalls != 0 || len(api.changes) != 2 {
+	if r.Status.Membership.Phase == "Complete" || staleRemoveCalls != 0 || len(api.changes) != 3 {
 		t.Fatalf("wrong learner identity bypassed completion guard: status=%+v changes=%d stale-removes=%d", r.Status, len(api.changes), staleRemoveCalls)
 	}
 	committed(3)
 	if err := c.reconcileAll(ctx); err != nil {
 		t.Fatal(err)
 	}
-	if r.Status.Membership.Phase != "Complete" || len(api.changes) != 3 || !sameJSON(api.changes[1], api.changes[2]) || staleRemoveCalls != 0 {
+	if r.Status.Membership.Phase != "Complete" || len(api.changes) != 4 || !sameJSON(api.changes[2], api.changes[3]) || staleRemoveCalls != 0 {
 		t.Fatalf("exact committed request did not complete after persistence acknowledgement: status=%+v changes=%+v", r.Status, api.changes)
 	}
 }
