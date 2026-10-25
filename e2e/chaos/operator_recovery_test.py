@@ -1,6 +1,5 @@
 import unittest
 import json
-import hashlib
 from copy import deepcopy
 from unittest import mock
 
@@ -88,6 +87,45 @@ class VerifyIdempotentWriteTest(unittest.TestCase):
                     Chaos.verify_idempotent_write(
                         chaos, "rhiza-0", "new-generation-write",
                         "INSERT INTO chaos_items VALUES (10002, 'recovered')", (10002, "recovered"))
+
+
+class ReadFailureProjectionTest(unittest.TestCase):
+    def test_membership_counts_duplicates_and_self_only_when_inputs_are_valid(self):
+        projected = operator_recovery.diagnostic_membership({
+            "node_id": "rhiza-1", "voters": ["rhiza-0", "rhiza-1", "rhiza-1"]})
+        self.assertEqual(3, projected["voterCount"])
+        self.assertEqual(2, projected["uniqueVoterCount"])
+        self.assertEqual(1, projected["duplicateVoterCount"])
+        self.assertTrue(projected["selfIncluded"])
+
+        malformed = operator_recovery.diagnostic_membership({
+            "node_id": "rhiza-1", "voters": ["rhiza-0", {"private": "bad"}]})
+        self.assertIsNone(malformed["voterCount"])
+        self.assertIsNone(malformed["uniqueVoterCount"])
+        self.assertIsNone(malformed["duplicateVoterCount"])
+        self.assertIsNone(malformed["selfIncluded"])
+
+    def test_read_failure_log_projection_is_unattributed_and_allowlisted(self):
+        findings = operator_recovery.safe_read_failure_findings(
+            b"2026/10/26 12:34:56 read failed: phase=read-durability node=rhiza-0 "
+            b"applied_slot=8 error_class=durability-unavailable detail=PRIVATE_CANARY\n"
+            b"2026/10/26 12:34:56 read failed: phase=read-index phase=read-durability "
+            b"node=rhiza-0 error_class=backend\n"
+            b"2026/10/26 12:34:56 read failed: phase=unknown node=rhiza-0 error_class=backend\n"
+            b"2026/10/26 12:34:56 ordinary message phase=read-index error_class=deadline\n")
+        self.assertEqual([{"phase": "read-durability", "errorClass": "durability-unavailable",
+                           "attribution": "unattributed"}], findings)
+        self.assertNotIn("PRIVATE_CANARY", json.dumps(findings))
+
+    def test_cached_forward_uid_relation_and_deadline_are_not_reinitialized(self):
+        self.assertEqual("same", operator_recovery.diagnostic_uid_relation("uid-1", "uid-1"))
+        self.assertEqual("changed", operator_recovery.diagnostic_uid_relation("uid-1", "uid-2"))
+        self.assertEqual("unknown", operator_recovery.diagnostic_uid_relation(None, "uid-2"))
+        chaos = object.__new__(Chaos)
+        chaos.diagnostic_deadline = 100.0
+        with mock.patch("operator_recovery.time.monotonic", return_value=95.0):
+            self.assertEqual(5.0, chaos._diagnostic_remaining())
+        self.assertEqual(100.0, chaos.diagnostic_deadline)
 
 
 class LegacyMembershipRejectionTest(unittest.TestCase):
@@ -208,32 +246,24 @@ class LegacyMembershipRejectionTest(unittest.TestCase):
         }
         events = []
         chaos.event = lambda name, **fields: events.append((name, fields))
-        status_payload = {
-            "node_id": "rhiza-0", "cluster_id": "cluster-private-canary",
-            "ready": True, "quorum": False, "certified_tip": 10,
-            "applied_tip": 9, "archive_tip": 8,
-            "wal_identity": "wal-private-canary", "credential": "status-secret-canary",
-            "error": "status-error-canary", "unknown": {"private": "nested-secret-canary"},
-        }
-        response = mock.MagicMock()
-        response.__enter__.return_value = response
-        response.read.return_value = json.dumps(status_payload).encode()
         pod_columns = "rhiza-0\tpod-uid-secret-canary\tRunning\tTrue\t2\n"
         completed = mock.Mock(returncode=0, stdout=pod_columns, stderr="stderr-secret-canary")
-        with mock.patch("operator_recovery.urllib.request.urlopen", return_value=response) as urlopen, \
+        chaos.forward = mock.Mock(side_effect=AssertionError("diagnostic must reuse no forward"))
+        chaos.http = mock.Mock(side_effect=AssertionError("diagnostic must make no HTTP request"))
+        with mock.patch("operator_recovery.urllib.request.urlopen",
+                        side_effect=AssertionError("diagnostic must make no HTTP request")) as urlopen, \
              mock.patch("operator_recovery.subprocess.run", return_value=completed) as run:
+            sql_started = operator_recovery.time.monotonic() - 0.02
             chaos.capture_linearizable_read_failure(
                 ["rhiza-0"], {"rhiza-0": {
                     "node_id": "rhiza-0", "cluster_id": "cluster-private-canary",
                     "config_id": 7, "voters": ["rhiza-0", "rhiza-1"],
                     "wal_identity": "wal-private-canary", "voting": True, "pending": False,
-                }}, TimeoutError("row-private-canary"))
+                }}, TimeoutError("row-private-canary"), sql_started)
 
-        self.assertEqual(16 * 1024 + 1, response.read.call_args.args[0])
-        self.assertEqual(0.75, urlopen.call_args.kwargs["timeout"])
-        request = urlopen.call_args.args[0]
-        self.assertEqual("http://127.0.0.1:12345/recovery/status", request.full_url)
-        self.assertEqual("Bearer admin-secret-canary", request.get_header("Authorization"))
+        urlopen.assert_not_called()
+        chaos.forward.assert_not_called()
+        chaos.http.assert_not_called()
         command = run.call_args.args[0]
         self.assertIn("-o", command)
         self.assertIn(
@@ -249,18 +279,15 @@ class LegacyMembershipRejectionTest(unittest.TestCase):
         rendered = json.dumps(events[0][1], sort_keys=True)
         for canary in ("pod-uid-secret-canary", "cluster-private-canary",
                        "wal-private-canary", "row-private-canary", "secret-canary",
-                       "admin-secret-canary", "status-secret-canary", "status-error-canary",
-                       "nested-secret-canary", "stderr-secret-canary"):
+                       "admin-secret-canary", "stderr-secret-canary"):
             self.assertNotIn(canary, rendered)
         self.assertEqual("timeout", events[0][1]["errorCategory"])
+        self.assertGreaterEqual(events[0][1]["sqlElapsedMs"], 0)
+        self.assertGreaterEqual(events[0][1]["podSnapshotElapsedMs"], 0)
+        self.assertGreaterEqual(events[0][1]["podSnapshotOffsetMs"], 0)
+        self.assertEqual("changed", events[0][1]["survivors"][0]["cachedForwardUID"])
+        self.assertFalse(events[0][1]["postFailureProbeRequested"])
         self.assertEqual(2, events[0][1]["pods"][0]["restartCount"])
-        self.assertNotIn("recovery", events[0][1]["survivors"][0])
-        self.assertFalse(events[0][1]["survivors"][0]["postFailureProbe"]["quorum"])
-        recovery = events[0][1]["survivors"][0]["postFailureProbe"]
-        self.assertEqual({"nodeOrdinal", "nodeIDHash", "clusterIDHash", "ready", "quorum",
-                          "certified_tip", "applied_tip", "archive_tip"}, set(recovery))
-        self.assertEqual(hashlib.sha256(b"cluster-private-canary").hexdigest()[:16],
-                         recovery["clusterIDHash"])
 
 
 if __name__ == "__main__":
