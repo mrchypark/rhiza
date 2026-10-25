@@ -519,10 +519,16 @@ func TestControllerMembershipRetryUsesExactJournaledPayloads(t *testing.T) {
 	ctx, r, api, c := membershipFixture(t)
 	api.membership["n1"] = network.MembershipStatus{NodeID: "n1", ClusterID: "source", ConfigID: 1, Voters: []quepaxa.NodeID{"n1", "n2", "n3"}, Voting: true, AbortSlot: 7}
 	api.membership["n2"] = network.MembershipStatus{NodeID: "n2", ClusterID: "source", ConfigID: 1, Voters: []quepaxa.NodeID{"n1", "n2", "n3"}, Voting: true, AbortSlot: 7}
+	seedLegacyRemoveMembershipJournal(r)
+	r.Status.Membership.RemoveRequest.ExpectedAbortSlot = 7
+	var seededRemove network.MembershipChange
+	if err := json.Unmarshal(jsonBytes(r.Status.Membership.RemoveRequest), &seededRemove); err != nil {
+		t.Fatal(err)
+	}
 	if err := c.reconcileAll(ctx); err != nil {
 		t.Fatal(err)
 	}
-	if r.Status.Membership == nil || r.Status.Membership.RemoveRequest == nil || r.Status.Membership.RemoveRequest.ExpectedAbortSlot != 7 || len(api.changes) != 0 {
+	if r.Status.Membership == nil || r.Status.Membership.RemoveRequest == nil || r.Status.Membership.RemoveRequest.ExpectedAbortSlot != 7 || len(api.changes) != 1 || !sameJSON(api.changes[0], seededRemove) {
 		t.Fatalf("remove journal=%+v changes=%d", r.Status.Membership, len(api.changes))
 	}
 	api.changeStatus = http.StatusServiceUnavailable
@@ -532,7 +538,7 @@ func TestControllerMembershipRetryUsesExactJournaledPayloads(t *testing.T) {
 	if err := c.reconcileAll(ctx); err != nil {
 		t.Fatal(err)
 	}
-	if len(api.changes) != 2 || !bytes.Equal(jsonBytes(api.changes[0]), jsonBytes(api.changes[1])) {
+	if len(api.changes) != 3 || !sameJSON(api.changes[0], seededRemove) || !sameJSON(api.changes[1], seededRemove) || !sameJSON(api.changes[2], seededRemove) {
 		t.Fatalf("remove retries differ: %+v", api.changes)
 	}
 	api.changeStatus = 0
@@ -549,7 +555,7 @@ func TestControllerMembershipRetryUsesExactJournaledPayloads(t *testing.T) {
 	if err := c.reconcileAll(ctx); err != nil {
 		t.Fatal(err)
 	}
-	if r.Status.Phase != "Blocked" || len(api.changes) != 3 {
+	if r.Status.Phase != "Blocked" || len(api.changes) != 4 {
 		t.Fatalf("credential drift=%+v changes=%d", r.Status, len(api.changes))
 	}
 	api.membershipSecret["metadata"].(object)["resourceVersion"] = "1"
@@ -560,7 +566,7 @@ func TestControllerMembershipRetryUsesExactJournaledPayloads(t *testing.T) {
 	if err := c.reconcileAll(ctx); err != nil {
 		t.Fatal(err)
 	}
-	if len(api.changes) != 5 || !bytes.Equal(jsonBytes(api.changes[3]), jsonBytes(api.changes[4])) {
+	if len(api.changes) != 6 || !bytes.Equal(jsonBytes(api.changes[4]), jsonBytes(api.changes[5])) {
 		t.Fatalf("add retries differ: %+v", api.changes)
 	}
 	api.membership["n1"] = network.MembershipStatus{NodeID: "n1", ClusterID: "source", ConfigID: 3, Voters: []quepaxa.NodeID{"n1", "n2", "n4"}, Voting: true}
@@ -599,6 +605,7 @@ func TestControllerMembershipRejectsBadFenceAndWorkload(t *testing.T) {
 	} {
 		t.Run(name, func(t *testing.T) {
 			ctx, r, api, c := membershipFixture(t)
+			seedLegacyRemoveMembershipJournal(r)
 			change(&r.Spec.Membership.Fence)
 			if err := c.reconcileAll(ctx); err != nil {
 				t.Fatal(err)
@@ -612,6 +619,7 @@ func TestControllerMembershipRejectsBadFenceAndWorkload(t *testing.T) {
 
 func TestControllerMembershipFailsClosedWithoutQuorum(t *testing.T) {
 	ctx, r, api, c := membershipFixture(t)
+	seedLegacyRemoveMembershipJournal(r)
 	delete(api.membership, "n2")
 	if err := c.reconcileAll(ctx); err != nil {
 		t.Fatal(err)
@@ -623,6 +631,7 @@ func TestControllerMembershipFailsClosedWithoutQuorum(t *testing.T) {
 
 func TestControllerMembershipAbortThenResumeWithNewLearner(t *testing.T) {
 	ctx, r, api, c := membershipFixture(t)
+	seedLegacyRemoveMembershipJournal(r)
 	if err := c.reconcileAll(ctx); err != nil {
 		t.Fatal(err)
 	} // journal remove
@@ -685,6 +694,12 @@ func TestControllerMembershipAbortThenResumeWithNewLearner(t *testing.T) {
 func TestControllerMembershipSecondReplacementUsesStandaloneVoter(t *testing.T) {
 	ctx, r, api, c := membershipFixture(t)
 	r.Spec.Membership = &MembershipSpec{OperationID: "replace-n1", Remove: "n1", Fence: MembershipFence{NodeID: "n1", WALIdentity: strings.Repeat("c", 64), WorkloadUID: "pod-n1", Confirmed: true, Evidence: "external-fencer: incident-43"}, VoterPods: []VoterPod{{NodeID: "n2", Pod: "n2"}, {NodeID: "n4", Pod: "learner"}}, ReplacementPod: "learner2", ReplacementSecret: "learner-credentials"}
+	seedLegacyRemoveMembershipJournal(r)
+	r.Status.Membership.RemoveRequest.ExpectedConfigID = 3
+	var seededRemove network.MembershipChange
+	if err := json.Unmarshal(jsonBytes(r.Status.Membership.RemoveRequest), &seededRemove); err != nil {
+		t.Fatal(err)
+	}
 	api.replacement2 = object{"metadata": object{"name": "learner2", "uid": "learner2-uid"}, "status": object{"podIP": "127.0.0.1"}, "spec": object{"containers": []any{object{"name": "rhiza", "ports": []any{object{"name": "http", "containerPort": float64(8080)}}}}}}
 	api.membership["n1"] = membershipStatus("n1", 3, "n1", "n2", "n4")
 	api.membership["n2"] = membershipStatus("n2", 3, "n1", "n2", "n4")
@@ -693,14 +708,14 @@ func TestControllerMembershipSecondReplacementUsesStandaloneVoter(t *testing.T) 
 	if err := c.reconcileAll(ctx); err != nil {
 		t.Fatal(err)
 	}
-	if r.Status.Phase != "Blocked" || r.Status.Membership != nil {
+	if r.Status.Phase != "Blocked" || r.Status.Membership == nil || !sameJSON(r.Status.Membership.RemoveRequest, seededRemove) || len(api.changes) != 0 {
 		t.Fatalf("standalone voter was not required: %+v", r.Status)
 	}
 	api.membership["n4"] = network.MembershipStatus{NodeID: "n4", ClusterID: "source", ConfigID: 3, Voters: []quepaxa.NodeID{"n1", "n2", "n4"}, WALIdentity: strings.Repeat("a", 64), Voting: true}
 	if err := c.reconcileAll(ctx); err != nil {
 		t.Fatal(err)
 	}
-	if r.Status.Membership == nil || r.Status.Membership.RemoveRequest == nil || r.Status.Membership.RemoveRequest.ExpectedConfigID != 3 {
+	if r.Status.Membership == nil || r.Status.Membership.RemoveRequest == nil || r.Status.Membership.RemoveRequest.ExpectedConfigID != 3 || !sameJSON(r.Status.Membership.RemoveRequest, seededRemove) || len(api.changes) != 1 {
 		t.Fatalf("second replacement was not journaled from standalone-voter quorum: %+v", r.Status)
 	}
 }
