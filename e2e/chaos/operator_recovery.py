@@ -694,6 +694,8 @@ class Chaos:
                 text=True, timeout=min(3, remaining))
             if result.returncode:
                 raise RuntimeError(result.stderr[-500:])
+            if "--ignore-not-found" in args and not result.stdout.strip():
+                return None
             return json.loads(result.stdout)
 
         def read_secret_identity(name):
@@ -750,42 +752,67 @@ class Chaos:
         root_status = (root or {}).get("status", {})
         root_uid = root_meta.get("uid", "")
         active_recovery = root_status.get("activeRecovery", "")
+        active_recovery_child_status = "not_applicable"
         if active_recovery:
             try:
-                child = read_json(["get", "rhizarecovery", active_recovery, "-o", "json"])
-                child_meta = child.get("metadata", {})
-                child_spec = child.get("spec", {})
-                membership = child_spec.get("membership", {})
-                annotations = child_meta.get("annotations", {})
-                sts_annotations = sts.get("spec", {}).get("template", {}).get("metadata", {}).get("annotations", {})
-                operation = membership.get("operationID", "")
-                learner_name = membership.get("replacementPod", "")
-                credential_name = membership.get("replacementSecret", "")
-                child_owned = (root_uid and root_spec.get("automatic") is True and root_spec.get("statefulSet") == "rhiza" and
-                        root_spec.get("logicalID") and root_status.get("activeClusterID") and
+                child = read_json(["get", "rhizarecovery", active_recovery, "--ignore-not-found", "-o", "json"])
+                if child is None:
+                    fence_items = read_json(["get", "rhizafences", "-o", "json"]).get("items", [])
+                    pending_fence = [fence for fence in fence_items
+                        if fence.get("spec", {}).get("operationID") == active_recovery and
+                        fence.get("spec", {}).get("scope") == "Generation" and
+                        fence.get("spec", {}).get("sourceClusterID") == root_status.get("activeClusterID") and
+                        fence.get("spec", {}).get("bindingUID") == root_uid and
+                        fence.get("spec", {}).get("logicalID") == root_spec.get("logicalID") and
+                        fence.get("spec", {}).get("statefulSet") == root_spec.get("statefulSet") and
+                        fence.get("spec", {}).get("statefulSetUID") == sts_uid and
+                        sts.get("metadata", {}).get("name") == root_spec.get("statefulSet") and
+                        not fence.get("status", {}).get("proof")]
+                    pending = (root_status.get("phase") == "Fencing" and root_uid and sts_uid and
                         root_status.get("observedGeneration") == root_meta.get("generation") and
-                        sts_uid and sts.get("metadata", {}).get("name") == root_spec.get("statefulSet") and
-                        sts_annotations.get("rhiza.mrchypark.dev/cooperative-fencing") == "1" and
-                        sts_annotations.get("rhiza.mrchypark.dev/fencing-root-uid") == root_uid and
-                        child_meta.get("name") == active_recovery and child_meta.get("uid") and
-                        annotations.get("rhiza.mrchypark.dev/automatic-owner") == root_uid and
-                        annotations.get("rhiza.mrchypark.dev/automatic-logical") == root_spec.get("logicalID") and
-                        child_spec.get("statefulSet") == root_spec.get("statefulSet") and
-                        child_spec.get("sourceClusterID") == root_status.get("activeClusterID"))
-                if child_owned and membership:
-                    if operation != active_recovery or not learner_name or not credential_name:
-                        capture_error("active_recovery_binding_mismatch", active_recovery)
+                        root_status.get("activeClusterID") and len(pending_fence) == 1)
+                    if pending:
+                        active_recovery_child_status = "awaiting_fence_proof"
+                        record["activeRecoveryChild"] = {"status": active_recovery_child_status}
                     else:
-                        credential = read_secret_identity(credential_name)
-                        if (credential["name"] != credential_name or not credential["uid"] or
-                                not credential["immutable"] or credential["owner"] != operation):
+                        capture_error("active_recovery_binding_unavailable",
+                                      "recovery child is absent without a matching pending generation fence")
+                    child = None
+                if child is not None:
+                    child_meta = child.get("metadata", {})
+                    child_spec = child.get("spec", {})
+                    membership = child_spec.get("membership", {})
+                    annotations = child_meta.get("annotations", {})
+                    sts_annotations = sts.get("spec", {}).get("template", {}).get("metadata", {}).get("annotations", {})
+                    operation = membership.get("operationID", "")
+                    learner_name = membership.get("replacementPod", "")
+                    credential_name = membership.get("replacementSecret", "")
+                    child_owned = (root_uid and root_spec.get("automatic") is True and root_spec.get("statefulSet") == "rhiza" and
+                            root_spec.get("logicalID") and root_status.get("activeClusterID") and
+                            root_status.get("observedGeneration") == root_meta.get("generation") and
+                            sts_uid and sts.get("metadata", {}).get("name") == root_spec.get("statefulSet") and
+                            sts_annotations.get("rhiza.mrchypark.dev/cooperative-fencing") == "1" and
+                            sts_annotations.get("rhiza.mrchypark.dev/fencing-root-uid") == root_uid and
+                            child_meta.get("name") == active_recovery and child_meta.get("uid") and
+                            annotations.get("rhiza.mrchypark.dev/automatic-owner") == root_uid and
+                            annotations.get("rhiza.mrchypark.dev/automatic-logical") == root_spec.get("logicalID") and
+                            child_spec.get("statefulSet") == root_spec.get("statefulSet") and
+                            child_spec.get("sourceClusterID") == root_status.get("activeClusterID"))
+                    if child_owned and membership:
+                        if operation != active_recovery or not learner_name or not credential_name:
                             capture_error("active_recovery_binding_mismatch", active_recovery)
                         else:
-                            learner_binding = {"name": learner_name, "rootUID": root_uid,
-                                               "statefulSetUID": sts_uid, "operationID": operation,
-                                               "credentialUID": credential["uid"]}
-                elif not child_owned:
-                    capture_error("active_recovery_binding_mismatch", active_recovery)
+                            credential = read_secret_identity(credential_name)
+                            if (credential["name"] != credential_name or not credential["uid"] or
+                                    not credential["immutable"] or credential["owner"] != operation):
+                                capture_error("active_recovery_binding_mismatch", active_recovery)
+                            else:
+                                learner_binding = {"name": learner_name, "rootUID": root_uid,
+                                                   "statefulSetUID": sts_uid, "operationID": operation,
+                                                   "credentialUID": credential["uid"]}
+                                active_recovery_child_status = "bound"
+                    elif not child_owned:
+                        capture_error("active_recovery_binding_mismatch", active_recovery)
             except Exception as exc:
                 capture_error("active_recovery_binding_unavailable", f"{type(exc).__name__}: {exc}")
 
@@ -949,6 +976,7 @@ class Chaos:
 
         summary = {"version": 1, "status": "partial" if errors else "complete",
             "rootStatus": record.get("root", {}).get("status", "unknown"),
+            "activeRecoveryChildStatus": active_recovery_child_status,
             "captureErrors": sorted(set(errors)), "captures": []}
         for item in record["captures"]:
             logs = {}

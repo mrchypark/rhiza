@@ -11,6 +11,82 @@ import urllib.error
 from operator_recovery import Chaos
 
 
+def require_pending_generation_fence(root, fence, recoveries, stateful_set):
+    root_meta = root.get("metadata", {})
+    root_spec = root.get("spec", {})
+    root_status = root.get("status", {})
+    fence_spec = fence.get("spec", {})
+    sts_meta = stateful_set.get("metadata", {})
+    if (root_status.get("phase") != "Fencing" or
+            root_status.get("observedGeneration") != root_meta.get("generation") or
+            not root_status.get("activeClusterID") or
+            root_status.get("activeRecovery") != fence_spec.get("operationID") or
+            fence_spec.get("scope") != "Generation" or
+            fence_spec.get("sourceClusterID") != root_status.get("activeClusterID") or
+            not root_meta.get("uid") or fence_spec.get("bindingUID") != root_meta.get("uid") or
+            not root_spec.get("logicalID") or fence_spec.get("logicalID") != root_spec.get("logicalID") or
+            not root_spec.get("statefulSet") or sts_meta.get("name") != root_spec.get("statefulSet") or
+            fence_spec.get("statefulSet") != root_spec.get("statefulSet") or
+            not sts_meta.get("uid") or fence_spec.get("statefulSetUID") != sts_meta.get("uid")):
+        raise AssertionError("pending generation fence is not bound to the active recovery intent")
+    if fence.get("status", {}).get("proof"):
+        raise AssertionError("generation fence already has a completion proof")
+    items = recoveries.get("items")
+    if not isinstance(items, list) or items:
+        raise AssertionError("recovery child exists before the generation fence proof")
+
+
+def proof_authorized_generation_child(root, fence, child, stateful_set):
+    root_meta = root.get("metadata", {})
+    root_spec = root.get("spec", {})
+    root_status = root.get("status", {})
+    fence_spec = fence.get("spec", {})
+    proof = fence.get("status", {}).get("proof")
+    operation = fence_spec.get("operationID")
+    source = fence_spec.get("sourceClusterID")
+    binding_uid = fence_spec.get("bindingUID")
+    sts_meta = stateful_set.get("metadata", {})
+    if not isinstance(proof, dict):
+        return False
+    if (not operation or not source or not binding_uid or not root_meta.get("uid") or
+            binding_uid != root_meta.get("uid") or not root_spec.get("logicalID") or
+            fence_spec.get("logicalID") != root_spec.get("logicalID") or not root_spec.get("statefulSet") or
+            fence_spec.get("statefulSet") != root_spec.get("statefulSet") or
+            sts_meta.get("name") != root_spec.get("statefulSet") or not sts_meta.get("uid") or
+            fence_spec.get("statefulSetUID") != sts_meta.get("uid")):
+        raise AssertionError("generation fence is not bound to the current root and StatefulSet")
+    if (proof.get("operationID") != operation or proof.get("sourceClusterID") != source or
+            proof.get("bindingUID") != binding_uid or not proof.get("requestHash") or
+            not proof.get("proofID") or not all(proof.get(field) is True for field in
+                ("processesTerminated", "recreationBlocked", "storageQuiesced"))):
+        raise AssertionError("generation fence proof is not complete or exact")
+    if not isinstance(child, dict):
+        return False
+    child_spec = child.get("spec", {})
+    child_meta = child.get("metadata", {})
+    child_annotations = child_meta.get("annotations", {})
+    child_fence = child_spec.get("fence", {})
+    active = root_status.get("activeRecovery") == operation
+    completed_before_poll = (
+        not root_status.get("activeRecovery") and child.get("status", {}).get("phase") == "Complete" and
+        child.get("status", {}).get("target") == root_status.get("activeClusterID") and
+        root_status.get("activeClusterID") != source)
+    if (not (active or completed_before_poll) or
+            child.get("metadata", {}).get("name") != operation or
+            child_annotations.get("rhiza.mrchypark.dev/automatic-owner") != root_meta.get("uid") or
+            child_annotations.get("rhiza.mrchypark.dev/automatic-logical") != root_spec.get("logicalID") or
+            child_spec.get("statefulSet") != root_spec.get("statefulSet") or
+            child_spec.get("recoveryID") != operation or
+            child_spec.get("sourceClusterID") != source or
+            child_fence.get("recoveryID") != operation or
+            child_fence.get("clusterID") != source or
+            child_fence.get("statefulSetUID") != fence_spec.get("statefulSetUID") or
+            child_fence.get("confirmed") is not True or
+            child_fence.get("evidence") != proof.get("proofID")):
+        raise AssertionError("recovery child is not bound to the verified generation fence proof")
+    return child
+
+
 class AutomaticChaos(Chaos):
     def __init__(self, args):
         super().__init__(args)
@@ -209,13 +285,27 @@ class AutomaticChaos(Chaos):
         dr = self.wait("automatic generation fence", lambda: next((f for f in self.fences() if f["spec"]["scope"] == "Generation"), None), 180)
         time.sleep(5)
         assert all(not self.runtime_gone(uid) for uid in old_uids)
-        assert len(json.loads(self.k("get","rhizarecoveries","-o","json"))["items"]) == 1
-        self.event("automatic_partition_barrier_pass", operation=dr["spec"]["operationID"], old_uids=old_uids)
+        require_pending_generation_fence(
+            self.cluster(), dr, json.loads(self.k("get", "rhizarecoveries", "-o", "json")),
+            self.get("statefulset", "rhiza"))
+        self.event("automatic_partition_barrier_pass", operation=dr["spec"]["operationID"], old_uids=old_uids,
+                   recovery_children=0, recovery_dispatch="waiting_for_fence_proof")
         self.stop.set()
         self.writer.join(timeout=20)
         assert not self.writer.is_alive()
         self.executor_outage(False)
         operation = dr["spec"]["operationID"]
+        def proof_child_ready():
+            root = self.cluster()
+            fence = self.get("rhizafence", dr["metadata"]["name"])
+            proof = fence.get("status", {}).get("proof")
+            if not proof:
+                return None
+            child = self.cr(operation)
+            return proof_authorized_generation_child(
+                root, fence, child, self.get("statefulset", "rhiza"))
+
+        self.wait("proof-authorized generation recovery child", proof_child_ready, 240)
         self.wait("unattended generation recovery", lambda: self.healthy() and self.cluster()["status"]["activeClusterID"] != "chaos-source", 480)
         child = self.cr(operation)
         self.admin = base64.b64decode(self.get("secret",child["status"]["secretName"])["data"]["admin"]).decode()

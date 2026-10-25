@@ -10,7 +10,7 @@ import unittest
 from unittest import mock
 from pathlib import Path
 
-from automatic_recovery import AutomaticChaos
+from automatic_recovery import AutomaticChaos, proof_authorized_generation_child, require_pending_generation_fence
 from anchor_recovery import AnchorChaos, ANCHOR_CM
 from operator_recovery import Chaos, safe_startup_findings
 from operator_fixture import resources
@@ -96,9 +96,15 @@ class BucketJobTest(unittest.TestCase):
                 value = fixture["root"]
             elif argv[argv.index("get") + 1:argv.index("get") + 3] == ["statefulset", "rhiza"]:
                 value = fixture["statefulset"]
+            elif argv[argv.index("get") + 1:argv.index("get") + 2] == ["rhizafences"]:
+                value = fixture.get("fences", {"items": []})
+            elif argv[argv.index("get") + 1:argv.index("get") + 2] == ["rhizarecoveries"]:
+                value = fixture.get("recoveries", {"items": [fixture["recovery"]]})
             elif argv[argv.index("get") + 1:argv.index("get") + 2] == ["pods"]:
                 value = {"items": [fixture["pod"]]}
             elif argv[argv.index("get") + 1:argv.index("get") + 2] == ["rhizarecovery"]:
+                if fixture.get("recovery") is None:
+                    return subprocess.CompletedProcess(argv, 0, "", "")
                 value = fixture["recovery"]
             elif argv[argv.index("get") + 1:argv.index("get") + 2] == ["pod"]:
                 value = after_pod if after_pod is not None and fake_run.pod_reads == 1 else fixture["pod"]
@@ -173,6 +179,83 @@ class BucketJobTest(unittest.TestCase):
             o["data"]["RHIZA_BIND_ADDR"] for o in fixture if o["kind"] == "ConfigMap"))
         self.assertIn({"name": "recovery", "containerPort": 9091}, container["ports"])
         self.assertTrue(applied)
+
+    def test_generation_recovery_child_waits_for_exact_fence_proof(self):
+        operation = "auto-pending"
+        stateful_set = {"metadata": {"name": "rhiza", "uid": "sts-uid"}}
+        root = {"metadata": {"generation": 4, "uid": "root-uid"},
+                "spec": {"logicalID": "logical-test", "statefulSet": "rhiza"}, "status": {
+            "phase": "Fencing", "observedGeneration": 4, "activeClusterID": "source",
+            "activeRecovery": operation}}
+        fence = {"metadata": {"name": "fence-pending"}, "spec": {
+            "operationID": operation, "scope": "Generation", "sourceClusterID": "source",
+            "bindingUID": "root-uid", "logicalID": "logical-test",
+            "statefulSet": "rhiza", "statefulSetUID": "sts-uid"}, "status": {}}
+
+        # With the fencer unavailable the durable intent/fence is visible, but
+        # no child may be dispatched before a verified completion proof exists.
+        require_pending_generation_fence(root, fence, {"items": []}, stateful_set)
+        with self.assertRaisesRegex(AssertionError, "child exists before"):
+            require_pending_generation_fence(
+                root, fence, {"items": [{"metadata": {"name": operation}}]}, stateful_set)
+        with self.assertRaisesRegex(AssertionError, "active recovery intent"):
+            require_pending_generation_fence(
+                {**root, "status": {**root["status"], "activeRecovery": "other"}},
+                fence, {"items": []}, stateful_set)
+        for bad_fence, bad_sts in (
+                ({**fence, "spec": {**fence["spec"], "bindingUID": "other-root"}}, stateful_set),
+                ({**fence, "spec": {**fence["spec"], "bindingUID": ""}}, stateful_set),
+                ({**fence, "spec": {**fence["spec"], "logicalID": "other-logical"}}, stateful_set),
+                ({**fence, "spec": {**fence["spec"], "logicalID": ""}}, stateful_set),
+                ({**fence, "spec": {**fence["spec"], "statefulSet": "other"}}, stateful_set),
+                ({**fence, "spec": {**fence["spec"], "statefulSet": ""}}, stateful_set),
+                (fence, {"metadata": {"name": "rhiza", "uid": "other-sts"}}),
+                ({**fence, "spec": {**fence["spec"], "statefulSetUID": ""}}, stateful_set)):
+            with self.assertRaisesRegex(AssertionError, "not bound"):
+                require_pending_generation_fence(root, bad_fence, {"items": []}, bad_sts)
+
+        proof = {"operationID": operation, "sourceClusterID": "source", "bindingUID": "root-uid",
+                 "requestHash": "request-digest", "proofID": "proof-digest",
+                 "processesTerminated": True, "recreationBlocked": True, "storageQuiesced": True}
+        fence["status"]["proof"] = proof
+        child = {"metadata": {"name": operation, "annotations": {
+            "rhiza.mrchypark.dev/automatic-owner": "root-uid",
+            "rhiza.mrchypark.dev/automatic-logical": "logical-test"}, "uid": "child-uid"}, "spec": {
+            "statefulSet": "rhiza", "recoveryID": operation, "sourceClusterID": "source", "fence": {
+                "recoveryID": operation, "clusterID": "source", "statefulSetUID": "sts-uid",
+                "confirmed": True, "evidence": "proof-digest"}},
+            "status": {"phase": "Recovering"}}
+        self.assertIs(child, proof_authorized_generation_child(root, fence, child, stateful_set))
+        mismatched = {**child, "spec": {**child["spec"], "fence": {
+            **child["spec"]["fence"], "evidence": "other-proof"}}}
+        with self.assertRaisesRegex(AssertionError, "not bound to the verified"):
+            proof_authorized_generation_child(root, fence, mismatched, stateful_set)
+        for bad_root, bad_fence in (
+                ({**root, "metadata": {**root["metadata"], "uid": "wrong-root"}}, fence),
+                ({**root, "metadata": {**root["metadata"], "uid": ""}}, fence),
+                (root, {**fence, "spec": {**fence["spec"], "logicalID": "wrong-logical"}}),
+                (root, {**fence, "spec": {**fence["spec"], "statefulSet": "other"}}),
+                (root, {**fence, "spec": {**fence["spec"], "statefulSet": ""}}),
+                (root, {**fence, "spec": {**fence["spec"], "statefulSetUID": "wrong-sts"}})):
+            with self.assertRaisesRegex(AssertionError, "not bound"):
+                proof_authorized_generation_child(bad_root, bad_fence, child, stateful_set)
+        wrong_owner = {**child, "metadata": {**child["metadata"], "annotations": {
+            **child["metadata"]["annotations"], "rhiza.mrchypark.dev/automatic-owner": "other-root"}}}
+        with self.assertRaisesRegex(AssertionError, "not bound to the verified"):
+            proof_authorized_generation_child(root, fence, wrong_owner, stateful_set)
+
+        completed_root = {**root, "status": {
+            **root["status"], "phase": "Stabilizing", "activeRecovery": "",
+            "activeClusterID": "target"}}
+        completed_child = {**child, "status": {"phase": "Complete", "target": "target"}}
+        self.assertIs(completed_child, proof_authorized_generation_child(
+            completed_root, fence, completed_child, stateful_set))
+        with self.assertRaisesRegex(AssertionError, "not bound to the verified"):
+            proof_authorized_generation_child(completed_root, fence, child, stateful_set)
+        with self.assertRaisesRegex(AssertionError, "not bound to the verified"):
+            proof_authorized_generation_child(
+                {**completed_root, "status": {**completed_root["status"], "activeClusterID": "source"}},
+                fence, completed_child, stateful_set)
 
     def test_authority_env_patch_preserves_rendered_container_with_kubectl_local(self):
         kubectl = shutil.which("kubectl")
@@ -425,6 +508,40 @@ class BucketJobTest(unittest.TestCase):
                 capture = json.loads(summary)["captures"][0]
                 self.assertEqual(["network"], capture["startupFindings"])
                 self.assertNotIn("PRIVATE_EMBEDDED_CANARY", summary)
+
+    def test_absent_recovery_child_is_pending_only_for_exact_unproved_generation_fence(self):
+        with tempfile.TemporaryDirectory() as directory:
+            chaos = Chaos(argparse.Namespace(output=directory, cluster="fixture"))
+            fixture = self._diagnostic_fixture()
+            operation = "recovery-pending"
+            fixture["recovery"] = None
+            fixture["root"]["status"].update({
+                "phase": "Fencing", "activeRecovery": operation, "observedGeneration": 7})
+            fixture["fences"] = {"items": [{"spec": {
+                "operationID": operation, "scope": "Generation", "sourceClusterID": "source-test",
+                "bindingUID": "root-uid-test", "logicalID": "logical-test",
+                "statefulSet": "rhiza", "statefulSetUID": "sts-uid-test"},
+                "status": {}}]}
+
+            errors = self._capture_diagnostics(chaos, fixture, supervised=True)
+            record = json.loads(Path(directory, "private-startup-diagnostics", "record.json").read_text())
+            summary = json.loads(Path(directory, "startup-diagnostics-summary.json").read_text())
+            self.assertNotIn("active_recovery_binding_unavailable", errors)
+            self.assertEqual({"status": "awaiting_fence_proof"}, record["activeRecoveryChild"])
+            self.assertEqual("awaiting_fence_proof", summary["activeRecoveryChildStatus"])
+
+            for field, value in (("bindingUID", "other-root"), ("bindingUID", ""),
+                                 ("logicalID", "other-logical"), ("logicalID", ""),
+                                 ("statefulSet", "other-sts"), ("statefulSetUID", "")):
+                bad_fixture = json.loads(json.dumps(fixture))
+                bad_fixture["fences"]["items"][0]["spec"][field] = value
+                bad_dir = tempfile.TemporaryDirectory()
+                try:
+                    bad_chaos = Chaos(argparse.Namespace(output=bad_dir.name, cluster="fixture"))
+                    bad_errors = self._capture_diagnostics(bad_chaos, bad_fixture, supervised=True)
+                    self.assertIn("active_recovery_binding_unavailable", bad_errors)
+                finally:
+                    bad_dir.cleanup()
 
     def test_diagnostic_binding_and_incarnation_drift_fail_closed(self):
         with tempfile.TemporaryDirectory() as directory:
