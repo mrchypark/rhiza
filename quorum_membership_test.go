@@ -1,6 +1,7 @@
 package rhiza
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"errors"
@@ -586,5 +587,28 @@ func TestQuorumMembershipQUIC(t *testing.T) {
 	if !reachedCurrentPeer {
 		t.Fatalf("learner did not reach the sole current voter within the bounded sync stage: status=%+v cursor=%d",
 			checkpointLearner.Status(), checkpointLearner.peerCursor)
+	}
+	// The bounded operation context must not own the peer server lifetime. After
+	// cancelling it explicitly, use a new transport (no cached connection) to
+	// fetch the same fresh peer's restored history.
+	currentPeerCancel()
+	postCancelProbe := network.NewTransport(clusterID, members[0].ID, &replacement, tokens[0])
+	t.Cleanup(func() { _ = postCancelProbe.Close() })
+	postCancelCtx, postCancel := context.WithTimeout(ctx, time.Second)
+	defer postCancel()
+	expected, ok := peers[3].core.CertifiedValue(1)
+	if !ok {
+		t.Fatal("fresh peer lacks restored certified slot 1")
+	}
+	batch, err := postCancelProbe.FetchDecisions(postCancelCtx, members[3].ID, 1, 1)
+	if err != nil {
+		t.Fatalf("fresh peer stopped serving history after operation context cancellation: %v", err)
+	}
+	if len(batch.Decisions) != 1 {
+		t.Fatalf("fresh peer returned %d decisions after operation context cancellation, want 1", len(batch.Decisions))
+	}
+	got := batch.Decisions[0]
+	if got.Slot != expected.Slot || got.Hash != expected.Hash || !bytes.Equal(got.Value, expected.Value) {
+		t.Fatalf("fresh peer returned different history after operation context cancellation: got slot=%d hash=%x value=%q, want slot=%d hash=%x value=%q", got.Slot, got.Hash, got.Value, expected.Slot, expected.Hash, expected.Value)
 	}
 }
