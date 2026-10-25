@@ -126,6 +126,7 @@ type Server struct {
 	syncSources          map[quepaxa.NodeID]chan struct{}
 	checkpointPrepare    func(context.Context, quepaxa.NodeID, quepaxa.CheckpointSeal) error
 	compactedHandler     func()
+	archiveCatchUpHint   func(quepaxa.TerminalGapKey)
 	readAdmissionMu      sync.RWMutex
 	readAdmission        *readAdmission
 	statusLookupHook     func()
@@ -187,6 +188,25 @@ func (s *Server) SetCompactedHandler(handler func()) {
 	s.proposeMu.Lock()
 	s.compactedHandler = handler
 	s.proposeMu.Unlock()
+}
+
+// SetArchiveCatchUpHint installs an optional non-blocking signal for a
+// certified terminal whose exact local prefix catch-up failed. The callback
+// should only enqueue the key; it must not perform archive I/O in the peer
+// request path.
+func (s *Server) SetArchiveCatchUpHint(handler func(quepaxa.TerminalGapKey)) {
+	s.proposeMu.Lock()
+	s.archiveCatchUpHint = handler
+	s.proposeMu.Unlock()
+}
+
+func (s *Server) hintArchiveCatchUp(key quepaxa.TerminalGapKey) {
+	s.proposeMu.Lock()
+	handler := s.archiveCatchUpHint
+	s.proposeMu.Unlock()
+	if handler != nil {
+		handler(key)
+	}
 }
 
 func (s *Server) handleCompacted() {

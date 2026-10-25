@@ -195,9 +195,45 @@ func TestRetiredPeerNestedSyncDiagnostic(t *testing.T) {
 	}
 	request := transports["a"].request(peerfb.OperationLearned)
 	request.Decision = decisionToWire(decision)
+	gapKey, knownGap := staleCore.KnownTerminalGap(decision)
+	if !knownGap {
+		t.Fatal("stale B does not recognize the exact certified terminal gap")
+	}
+	var hintCalls atomic.Int32
+	hint := make(chan quepaxa.TerminalGapKey, 2)
+	staleServer.SetArchiveCatchUpHint(func(got quepaxa.TerminalGapKey) {
+		hintCalls.Add(1)
+		hint <- got
+	})
+
+	// Readiness and voter authentication remain admission gates: neither may
+	// trigger archive work before the real nested-Sync failure occurs.
+	certificateKey := PeerPublicKey(clusterID, "a", tokens["a"])
+	staleServer.SetPeerLearnReady(func() bool { return false })
+	if _, err := peerServers["b"].handle(ctx, certificateKey, request); err != ErrNotReady {
+		t.Fatalf("unready Learned error=%v, want ErrNotReady", err)
+	}
+	if _, err := peerServers["b"].handle(ctx, nil, request); err == nil || !strings.Contains(err.Error(), "peer authentication failed") {
+		t.Fatalf("unauthenticated Learned error=%v, want peer authentication failure", err)
+	}
+	if got := hintCalls.Load(); got != 0 {
+		t.Fatalf("hint invoked before admitted handler failure: calls=%d", got)
+	}
+	staleServer.SetPeerLearnReady(func() bool { return true })
 	_, outerErr := transports["a"].call(ctx, "b", request)
 	if outerErr == nil || !strings.Contains(outerErr.Error(), "cluster identity mismatch") {
 		t.Fatalf("stale B outer Learned result=%v, want nested Sync cluster mismatch", outerErr)
+	}
+	select {
+	case got := <-hint:
+		if got != gapKey {
+			t.Fatalf("archive hint key=%+v, want exact observed key %+v", got, gapKey)
+		}
+	case <-ctx.Done():
+		t.Fatalf("handler did not signal the known terminal gap: %v", ctx.Err())
+	}
+	if got := hintCalls.Load(); got != 1 {
+		t.Fatalf("archive hint calls=%d, want exactly one for the failed Learned request", got)
 	}
 	catchupStart := waitNestedSyncEvent(t, ctx, events, "network:learned-control:phase=catchup-start:node=b:sender=a:")
 	select {
