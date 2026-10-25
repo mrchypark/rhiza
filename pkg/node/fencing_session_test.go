@@ -16,6 +16,7 @@ import (
 
 	"github.com/mrchypark/rhiza/internal/types"
 	"github.com/mrchypark/rhiza/pkg/fencing"
+	"github.com/mrchypark/rhiza/pkg/quepaxa"
 )
 
 func TestFenceStartupPartialConfigurationRejectsBeforeCreatingState(t *testing.T) {
@@ -101,6 +102,132 @@ func TestFenceStartupRejectsLegacyAndRolelessAssignedResponses(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestSupervisedEngineRepairCandidateSeparatesPeerLearnFromServingReady(t *testing.T) {
+	const physical = "rhiza-2"
+	t.Setenv("RHIZA_POD_NAME", physical)
+	socket := shortFenceTestSocket(t)
+	identity := fencing.Identity{SourceClusterID: "cluster", NodeID: "fresh-candidate", PodName: physical, PodUID: "pod-uid", RunID: "run-id", AssignmentID: strings.Repeat("a", 64)}
+	grant := fencing.StartupGrant{Identity: identity, Role: fencing.StartupRoleLearnerPendingRemove, Environment: map[string]string{
+		"RHIZA_NODE_ID": identity.NodeID, "RHIZA_LEARNER": `{"id":"fresh-candidate"}`, "RHIZA_PEER_TOKEN": "peer-token",
+	}}
+	listener, err := net.Listen("unix", socket)
+	if err != nil {
+		t.Fatal(err)
+	}
+	server := &http.Server{Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/v1/startup" {
+			http.NotFound(w, r)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(grant)
+	})}
+	go func() { _ = server.Serve(listener) }()
+	t.Cleanup(func() { _ = server.Close(); _ = listener.Close() })
+	session, err := fencing.Connect(t.Context(), socket, "ticket", identity.SourceClusterID, identity.NodeID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	candidateConfig := &types.ExecutionConfig{ClusterID: "cluster", NodeID: "fresh-candidate", EngineOwnedRemovals: true,
+		EnableReconfiguration: true, Members: []quepaxa.Member{{ID: "voter-a"}, {ID: "voter-b"}},
+		Learner: &quepaxa.Member{ID: "fresh-candidate"}}
+	candidate := &Node{config: candidateConfig, fenceSession: session}
+	candidate.ready.Store(true)
+	if candidate.Ready() || candidate.apiReady() {
+		t.Fatal("pending supervised engine-repair candidate became publicly ready before producer activation")
+	}
+	if !candidate.peerLearnReady() {
+		t.Fatal("pending supervised engine-repair candidate cannot receive the ADD terminal")
+	}
+	ordinaryConfig := *candidateConfig
+	ordinaryConfig.EngineOwnedRemovals = false
+	ordinary := &Node{config: &ordinaryConfig, fenceSession: session}
+	ordinary.ready.Store(true)
+	if !ordinary.Ready() {
+		t.Fatal("engine-repair readiness gate leaked into unrelated supervised reconfiguration")
+	}
+}
+
+func TestEngineRepairBootstrapAcceptsNoPVCButRejectsIdentityOnlyLoss(t *testing.T) {
+	const physical = "rhiza-2"
+	t.Setenv("RHIZA_POD_NAME", physical)
+	for _, tc := range []struct {
+		name    string
+		local   localVoterState
+		loadErr error
+		wantErr bool
+	}{
+		{name: "no pvc identity or wal", local: localVoterState{}},
+		{name: "candidate identity without wal", local: localVoterState{identity: &voterIdentity{Node: "fresh-candidate", Registered: true}, hadWAL: false}, loadErr: ErrVoterWALLost, wantErr: true},
+		{name: "corrupt local identity", local: localVoterState{}, loadErr: errors.New("corrupt identity"), wantErr: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			socket := shortFenceTestSocket(t)
+			physicalIdentity := fencing.Identity{SourceClusterID: "cluster", NodeID: physical, PodName: physical, PodUID: "pod-uid", RunID: "run-id"}
+			candidateIdentity := fencing.Identity{SourceClusterID: "cluster", NodeID: "fresh-candidate", PodName: physical, PodUID: "pod-uid", RunID: "run-id", AssignmentID: strings.Repeat("a", 64)}
+			candidateMember := quepaxa.Member{ID: "fresh-candidate", PublicKey: quepaxa.PublicKey{1}}
+			candidateJSON, err := json.Marshal(candidateMember)
+			if err != nil {
+				t.Fatal(err)
+			}
+			grant := fencing.StartupGrant{Identity: candidateIdentity, Role: fencing.StartupRoleLearnerPendingRemove,
+				ExpectedWALIdentity: strings.Repeat("b", 64), ReplacedNodeID: physical, ReplacedWALIdentity: strings.Repeat("c", 64),
+				Environment: map[string]string{"RHIZA_NODE_ID": candidateIdentity.NodeID, "RHIZA_LEARNER": string(candidateJSON), "RHIZA_PEER_TOKEN": "peer-token"}}
+			listener, err := net.Listen("unix", socket)
+			if err != nil {
+				t.Fatal(err)
+			}
+			server := &http.Server{Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if r.URL.Path != "/v1/startup" {
+					http.NotFound(w, r)
+					return
+				}
+				w.Header().Set("Content-Type", "application/json")
+				_ = json.NewEncoder(w).Encode(grant)
+			})}
+			go func() { _ = server.Serve(listener) }()
+			t.Cleanup(func() { _ = server.Close(); _ = listener.Close() })
+			session, err := fencing.Connect(t.Context(), socket, "ticket", physicalIdentity.SourceClusterID, physicalIdentity.NodeID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			config := &types.ExecutionConfig{ClusterID: "cluster", NodeID: physical, AdminToken: "admin-token", PeerToken: "peer-token", EngineOwnedRemovals: true,
+				EnableReconfiguration: true, Members: []quepaxa.Member{{ID: physical}, {ID: "voter-b"}}}
+			n := &Node{config: config, fenceSession: session}
+			if err := n.applyFenceStartupEnvironment(); err != nil {
+				t.Fatalf("apply validated authority candidate configuration before voter identity checks: %v", err)
+			}
+			if n.config.NodeID != "fresh-candidate" || n.config.Learner == nil || n.config.Learner.ID != "fresh-candidate" {
+				t.Fatalf("authority candidate configuration was not applied: node=%q learner=%+v", n.config.NodeID, n.config.Learner)
+			}
+			got, err := n.prepareEngineRepairLearnerBootstrap(tc.local, tc.loadErr)
+			if tc.wantErr {
+				if err == nil {
+					t.Fatal("unsafe local recovery state was accepted")
+				}
+				return
+			}
+			if err != nil || got.identity != nil || got.hadWAL || n.recoveryWALIdentity != grant.ExpectedWALIdentity {
+				t.Fatalf("empty NoPVC bootstrap was not prepared: state=%+v nonce=%q err=%v", got, n.recoveryWALIdentity, err)
+			}
+		})
+	}
+}
+
+func shortFenceTestSocket(t *testing.T) string {
+	t.Helper()
+	dir, err := os.MkdirTemp("", "rhiza-fence-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		if err := os.RemoveAll(dir); err != nil {
+			t.Errorf("remove temporary fencing socket directory: %v", err)
+		}
+	})
+	return filepath.Join(dir, "fence.sock")
 }
 
 func TestFenceWatcherRetriesOnlyPendingAndTransportUncertainty(t *testing.T) {

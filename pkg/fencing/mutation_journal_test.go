@@ -130,6 +130,7 @@ func TestMutationJournalCreateZeroCannotHideDelayedCopy(t *testing.T) {
 				prepared.SessionRef = "private/session-A"
 			}
 			mustJournal(t, p.Prepare(1, prepared))
+			mustJournal(t, p.GrantDispatch(1, "create-copy"))
 			hash, err := p.PreparationHash(1)
 			mustJournal(t, err)
 			r := MutationResolution{Outcome: MutationCommitted, PreparationHash: hash, ReceiptDigest: journalTestDigest, PayloadDigest: journalTestDigest}
@@ -143,7 +144,7 @@ func TestMutationJournalCreateZeroCannotHideDelayedCopy(t *testing.T) {
 			// evidence only after the trusted executor settles all copies/sessions.
 			completion := MutationCopyCompletion{PreparationHash: hash, ReceiptDigest: strings.Repeat("b", 64)}
 			rejectJournalUnchanged(t, p, func() error { return p.ConfirmCopiesTerminal(1, completion) })
-			mustJournal(t, p.SealDispatch(1))
+			mustJournal(t, p.RecordDispatchTerminal(1, "create-copy", strings.Repeat("d", 64)))
 			mustJournal(t, p.ConfirmCopiesTerminal(1, completion))
 			mustJournal(t, p.ConfirmCopiesTerminal(1, completion))
 			p = reloadProducer(t, p)
@@ -153,6 +154,51 @@ func TestMutationJournalCreateZeroCannotHideDelayedCopy(t *testing.T) {
 			completion.ReceiptDigest = strings.Repeat("c", 64)
 			rejectJournalUnchanged(t, p, func() error { return p.ConfirmCopiesTerminal(1, completion) })
 		})
+	}
+}
+
+func TestMutationJournalCopyCompletionRequiresDispatch(t *testing.T) {
+	p := newJournalProducer(t, "copy-completion-without-dispatch")
+	mustJournal(t, p.Admit(1, journalUpload("create-only")))
+	prepared := journalPreparation(0)
+	mustJournal(t, p.Prepare(1, prepared))
+	hash, err := p.PreparationHash(1)
+	mustJournal(t, err)
+	mustJournal(t, p.Resolve(1, MutationResolution{Outcome: MutationCommitted, PreparationHash: hash,
+		ReceiptDigest: journalTestDigest, PayloadDigest: journalTestDigest}))
+	mustJournal(t, p.Close("fence", journalTestDigest))
+	completion := MutationCopyCompletion{PreparationHash: hash, ReceiptDigest: strings.Repeat("b", 64)}
+	rejectJournalUnchanged(t, p, func() error { return p.ConfirmCopiesTerminal(1, completion) })
+
+	entry := p.Entries[1]
+	entry.CopyCompletion = &completion
+	p.Entries[1] = entry
+	if err := p.Validate(); err == nil {
+		t.Fatal("persisted copy completion without a granted dispatch was accepted")
+	}
+	entry.CopyCompletion = nil
+	p.Entries[1] = entry
+	resolution := *entry.Resolution
+	resolution.AllCopiesTerminal = true
+	rejectJournalUnchanged(t, p, func() error { return p.Resolve(1, resolution) })
+}
+
+func TestPreparedNoDispatchCancellationIsValidLookup(t *testing.T) {
+	p := newJournalProducer(t, "prepared-no-dispatch-cancel")
+	mustJournal(t, p.Admit(1, journalUpload("prepared-unsent")))
+	mustJournal(t, p.Prepare(1, journalPreparation(12)))
+	mustJournal(t, p.Close("fence", journalTestDigest))
+	preparationHash, err := p.PreparationHash(1)
+	mustJournal(t, err)
+	mustJournal(t, p.CancelPreparedNoDispatch(1, preparationHash, journalTestDigest))
+	if err := p.Validate(); err != nil {
+		t.Fatalf("closed prepared cancellation failed producer validation: %v", err)
+	}
+	if err := validateMutationLookupEntry(p.Entries[1]); err != nil {
+		t.Fatalf("closed prepared cancellation failed authority lookup validation: %v", err)
+	}
+	if len(p.Entries[1].Dispatches) != 0 || p.Entries[1].CopyCompletion != nil || !p.BarrierComplete() {
+		t.Fatal("no-dispatch cancellation created physical completion evidence or left closure pending")
 	}
 }
 

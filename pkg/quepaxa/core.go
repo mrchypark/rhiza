@@ -72,8 +72,9 @@ type Core struct {
 	localRecordAttemptLimit int // private test seam; zero selects the production limit
 	walIdentity             string
 	reconfigEnabled         bool
+	engineOwnedRemovals     bool
 	reconfigWAL             bool
-	reconfigAdmission       func(context.Context, Cluster, Slot, [32]byte) error
+	reconfigAdmission       func(context.Context, ReconfigurationAdmission) error
 	configHistory           []configEpoch
 	retiredIDs              map[NodeID]struct{}
 	baseMembership          *MembershipRecord
@@ -135,6 +136,7 @@ type reconfigurationState struct {
 	id, freezePrefix ValueHash
 	target           Cluster
 	safe             map[NodeID]struct{}
+	engineRemoval    *EngineRemoval
 }
 
 func newCore(nodeID NodeID, config *Cluster, wal *qlog.WAL, transport Transport) *Core {
@@ -1033,6 +1035,22 @@ func (c *Core) runSlot(ctx context.Context, slot Slot, value []byte, allowLeader
 					return Decision{}, fmt.Errorf("freeze evidence lacks old quorum")
 				}
 				cluster.Members = safe
+			} else if control, ok, _ := decodeReconfiguration(candidate.Value); ok && control.EngineRemoval != nil {
+				// The removed voter must not contribute to the freeze that
+				// establishes its own exclusion. Keep the quorum threshold from
+				// the original configuration; recordQuorum derives it from the
+				// slot's canonical membership, not this filtered request map.
+				removed := control.EngineRemoval.Removed.ID
+				filtered := make([]Member, 0, len(cluster.Members)-1)
+				for _, member := range cluster.Members {
+					if member.ID != removed {
+						filtered = append(filtered, member)
+					}
+				}
+				if len(filtered) < cluster.QuorumSize() {
+					return Decision{}, fmt.Errorf("engine-owned removal freeze cannot reach the original voter quorum without the removed member")
+				}
+				cluster.Members = filtered
 			}
 		}
 		requests := make(map[NodeID]RecordRequest, len(cluster.Members))
@@ -1387,6 +1405,7 @@ func (c *Core) record(ctx context.Context, request RecordRequest) (Summary, erro
 		cluster := c.clusterForSlotLocked(request.Slot)
 		tip := c.tip
 		tipPrefix := c.prefixes[tip]
+		currentAbortSlot, currentAbortErr := c.abortRevisionLocked()
 		state := c.reconfiguration
 		eligible := c.voterForClusterLocked(cluster)
 		_, alreadyDecided := c.decided[request.Slot]
@@ -1414,19 +1433,51 @@ func (c *Core) record(ctx context.Context, request RecordRequest) (Summary, erro
 		}
 		if control, controlOK, err := decodeReconfiguration(controlValue); err != nil {
 			return Summary{}, err
-		} else if controlOK && control.Terminal && !alreadyDecided {
-			if state == nil || request.Slot != state.terminal || tip != state.terminal-1 || control.Freeze != state.freeze || control.TerminalSlot != state.terminal || control.PrefixHash != tipPrefix || !sameCluster(control.Target, state.target) {
-				return Summary{}, fmt.Errorf("invalid reconfiguration terminal record")
+		} else if controlOK && !alreadyDecided {
+			if c.engineOwnedRemovals && isRemovalControl(cluster, control) && control.EngineRemoval == nil {
+				return Summary{}, fmt.Errorf("new voter removal requires the engine-owned operation contract")
 			}
-			if control.Abort && !reconfigurationAdds(cluster, state.target) {
-				return Summary{}, fmt.Errorf("only a pending addition may be aborted")
-			}
-			if !control.Abort && reconfigurationAdds(cluster, state.target) {
-				if c.reconfigAdmission == nil {
-					return Summary{}, fmt.Errorf("reconfiguration admission is unavailable")
+			if control.EngineRemoval != nil {
+				if !c.engineOwnedRemovals {
+					return Summary{}, fmt.Errorf("engine-owned removal is not bound to the active frozen operation")
 				}
-				if err := c.reconfigAdmission(ctx, cloneCluster(state.target), state.terminal-1, tipPrefix); err != nil {
-					return Summary{}, err
+				if control.Terminal {
+					if state == nil || state.engineRemoval == nil || !sameEngineRemoval(*state.engineRemoval, *control.EngineRemoval, true) {
+						return Summary{}, fmt.Errorf("engine-owned removal is not bound to the active frozen operation")
+					}
+				} else {
+					removed, removeErr := engineRemovedMember(cluster, control.Target)
+					if state != nil || removeErr != nil || currentAbortErr != nil || control.EngineRemoval.Freeze != request.Slot ||
+						control.EngineRemoval.ExpectedConfigID != cluster.ConfigID || control.EngineRemoval.ExpectedAbortSlot != currentAbortSlot ||
+						control.EngineRemoval.Removed != removed || !sameCluster(control.EngineRemoval.Target, control.Target) ||
+						control.EngineRemoval.FreezeHash != (ValueHash{}) || control.EngineRemoval.StorageEffectsExcludedHash != (ValueHash{}) {
+						return Summary{}, fmt.Errorf("engine-owned removal freeze does not match the exact current configuration")
+					}
+				}
+			}
+			if control.Terminal {
+				if state == nil || request.Slot != state.terminal || tip != state.terminal-1 || control.Freeze != state.freeze || control.TerminalSlot != state.terminal || control.PrefixHash != tipPrefix || !sameCluster(control.Target, state.target) {
+					return Summary{}, fmt.Errorf("invalid reconfiguration terminal record")
+				}
+				if control.Abort && !reconfigurationAdds(cluster, state.target) {
+					return Summary{}, fmt.Errorf("only a pending addition may be aborted")
+				}
+				if state.engineRemoval != nil {
+					if control.Abort || control.EngineRemoval == nil || control.EngineRemoval.FreezeHash != state.id || control.EngineRemoval.StorageEffectsExcludedHash == (ValueHash{}) || c.reconfigAdmission == nil {
+						return Summary{}, fmt.Errorf("engine-owned removal terminal lacks exact storage-exclusion admission")
+					}
+					admission := ReconfigurationAdmission{Kind: ReconfigurationAdmissionEngineRemoval, Target: cloneCluster(state.target), Through: state.terminal - 1, PrefixHash: tipPrefix, EngineRemoval: cloneEngineRemoval(control.EngineRemoval)}
+					if err := c.reconfigAdmission(ctx, admission); err != nil {
+						return Summary{}, err
+					}
+				} else if !control.Abort && reconfigurationAdds(cluster, state.target) {
+					if c.reconfigAdmission == nil {
+						return Summary{}, fmt.Errorf("reconfiguration admission is unavailable")
+					}
+					admission := ReconfigurationAdmission{Kind: ReconfigurationAdmissionLearner, Target: cloneCluster(state.target), Through: state.terminal - 1, PrefixHash: tipPrefix}
+					if err := c.reconfigAdmission(ctx, admission); err != nil {
+						return Summary{}, err
+					}
 				}
 			}
 		} else if state != nil && request.Slot == state.terminal {

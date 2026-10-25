@@ -18,6 +18,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/mrchypark/rhiza/pkg/fencing"
 	"github.com/mrchypark/rhiza/pkg/qlog"
 	"github.com/mrchypark/rhiza/pkg/quepaxa"
 	"github.com/thanos-io/objstore"
@@ -1956,6 +1957,85 @@ func TestArchiveGCMarkerDeleteUsesSelectedGeneration(t *testing.T) {
 	closeErr := reader.Close()
 	if readErr != nil || closeErr != nil || string(data) != "replacement marker" {
 		t.Fatalf("replacement marker bytes=%q read=%v close=%v", data, readErr, closeErr)
+	}
+}
+
+func TestArchiveGCContinuesEligibleDeletesAfterAnotherDeleteFails(t *testing.T) {
+	ctx := context.Background()
+	bucket := newVersionedArchiveDeleteBucket()
+	manager := NewManager(bucket, "cluster", 1)
+	failedName := manager.key("archive/manifests/fails.json")
+	continuedName := manager.key("archive/manifests/continues.json")
+	for _, name := range []string{failedName, continuedName} {
+		if err := bucket.Upload(ctx, name, strings.NewReader(name)); err != nil {
+			t.Fatal(err)
+		}
+		if err := bucket.Upload(ctx, manager.gcMarkerKey(name), strings.NewReader(name)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	secondDeleteStarted := make(chan struct{})
+	releaseSecondDelete := make(chan struct{})
+	var markSecond sync.Once
+	bucket.beforeDelete = func(deleteCtx context.Context, key string) error {
+		switch key {
+		case failedName:
+			<-secondDeleteStarted
+			close(releaseSecondDelete)
+			return errArchiveGenerationChanged
+		case continuedName:
+			markSecond.Do(func() { close(secondDeleteStarted) })
+			<-releaseSecondDelete
+			return deleteCtx.Err()
+		default:
+			return nil
+		}
+	}
+	err := manager.cleanupDeletes(ctx, -time.Second, map[string]struct{}{}, 0)
+	if !errors.Is(err, errArchiveGenerationChanged) {
+		t.Fatalf("archive cleanup error=%v, want to preserve the failed selected delete", err)
+	}
+	failedExists, failedErr := bucket.Exists(ctx, failedName)
+	continuedExists, continuedErr := bucket.Exists(ctx, continuedName)
+	if failedErr != nil || !failedExists || continuedErr != nil || continuedExists {
+		t.Fatalf("eligible deletion progress was cancelled: failed=(%t,%v) continued=(%t,%v)", failedExists, failedErr, continuedExists, continuedErr)
+	}
+}
+
+func TestArchiveGCDefersPinnedDeleteAndContinuesOtherEligibleObjects(t *testing.T) {
+	ctx := context.Background()
+	bucket := newVersionedArchiveDeleteBucket()
+	manager := NewManager(bucket, "cluster", 1)
+	pinnedName := manager.key("archive/manifests/pinned.json")
+	otherName := manager.key("archive/manifests/other.json")
+	for _, name := range []string{pinnedName, otherName} {
+		if err := bucket.Upload(ctx, name, strings.NewReader(name)); err != nil {
+			t.Fatal(err)
+		}
+		if err := bucket.Upload(ctx, manager.gcMarkerKey(name), strings.NewReader(name)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	bucket.beforeDelete = func(_ context.Context, key string) error {
+		if key == pinnedName {
+			return fencing.ErrMutationDeferred
+		}
+		return nil
+	}
+	err := manager.cleanupDeletes(ctx, -time.Second, map[string]struct{}{}, 0)
+	if !errors.Is(err, ErrArchiveDeferredDeletion) {
+		t.Fatalf("cleanup error=%v, want a non-success deferred-deletion result", err)
+	}
+	pinnedExists, pinnedErr := bucket.Exists(ctx, pinnedName)
+	pinnedMarker := manager.gcMarkerKey(pinnedName)
+	markerExists, markerErr := bucket.Exists(ctx, pinnedMarker)
+	otherExists, otherErr := bucket.Exists(ctx, otherName)
+	otherMarkerExists, otherMarkerErr := bucket.Exists(ctx, manager.gcMarkerKey(otherName))
+	if pinnedErr != nil || !pinnedExists || markerErr != nil || !markerExists {
+		t.Fatalf("deferred object/marker not retained: object=(%t,%v) marker=(%t,%v)", pinnedExists, pinnedErr, markerExists, markerErr)
+	}
+	if otherErr != nil || otherExists || otherMarkerErr != nil || otherMarkerExists {
+		t.Fatalf("other eligible delete did not complete: object=(%t,%v) marker=(%t,%v)", otherExists, otherErr, otherMarkerExists, otherMarkerErr)
 	}
 }
 

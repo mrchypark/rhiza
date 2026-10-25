@@ -57,7 +57,7 @@ type obj = map[string]any
 
 func main() {
 	if len(os.Args) != 2 {
-		fatal(fmt.Errorf("usage: fencing-e2e manifests|local-cooperative-store-secret|wait-source|run|run-gcs-ha|run-gcs-ha-explicit|run-gcs-ha-async-empty|run-gcs-ha-async-empty-explicit|run-gcs-ha-async-nonempty|run-gcs-ha-manual-terminal|run-gcs-ha-missing-membership|run-gcs-ha-ack-loss|run-gcs-ha-dead-pod|run-gcs-ha-mixed-pending|prepare-gcs-ha-initial-head-ack-loss|cleanup-gcs-ha-initial-head-ack-loss|run-gcs-ha-initial-head-ack-loss|runtime-probe|runtime-agent-request"))
+		fatal(fmt.Errorf("usage: fencing-e2e manifests|local-cooperative-store-secret|wait-source|run|run-gcs-ha|run-gcs-ha-explicit|run-gcs-ha-ordinary-recovery|run-gcs-ha-async-empty|run-gcs-ha-async-empty-explicit|run-gcs-ha-async-nonempty|run-gcs-ha-manual-terminal|run-gcs-ha-missing-membership|run-gcs-ha-ack-loss|run-gcs-ha-dead-pod|run-gcs-ha-mixed-pending|prepare-gcs-ha-initial-head-ack-loss|cleanup-gcs-ha-initial-head-ack-loss|run-gcs-ha-initial-head-ack-loss|runtime-probe|runtime-agent-request"))
 	}
 	if isGCSMixedPendingSelected(os.Args[1], strings.TrimSpace(os.Getenv(gcsHAScenarioEnv))) {
 		fatal(runGCSMixedPendingCommand(configureGCSMixedPending, qualifyGCSMixedPending))
@@ -129,6 +129,13 @@ func main() {
 		defer cancel()
 		fatal(configureGCSHA(ctx))
 		fatal(qualifyGCSHAExplicit(ctx))
+		return
+	}
+	if os.Args[1] == "run-gcs-ha-ordinary-recovery" {
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Minute)
+		defer cancel()
+		fatal(configureGCSHA(ctx))
+		fatal(qualifyGCSOrdinaryRecovery(ctx))
 		return
 	}
 	if os.Args[1] == "run-gcs-ha-async-empty" {
@@ -482,12 +489,12 @@ func manifests() obj {
 		tokens[id] = token
 		members = append(members, obj{"node_id": id, "url": "http://" + id + ".rhiza-headless:8080", "peer_url": "quic://" + id + ".rhiza-headless:9090", "public_key": rhiza.PeerPublicKey("chaos-source", id, token)})
 	}
-	config := obj{"RHIZA_CLUSTER_ID": "chaos-source", "RHIZA_BIND_ADDR": "0.0.0.0:8080", "RHIZA_PEER_ADDR": "0.0.0.0:9090", "RHIZA_DATA_DIR": "/data", "RHIZA_ENABLE_RECONFIGURATION": "true", "RHIZA_CHECKPOINT_INTERVAL": "0", "RHIZA_OBJSTORE_SYNC_INTERVAL": "1s", "RHIZA_OBJSTORE_GC_INTERVAL": "0", "RHIZA_OBJSTORE_PROVIDER": "s3", "RHIZA_OBJSTORE_ENDPOINT": "rhiza-minio:9000", "RHIZA_OBJSTORE_BUCKET": "rhiza", "RHIZA_OBJSTORE_INSECURE": "true", "RHIZA_OBJSTORE_REGION": "us-east-1", "RHIZA_OBJSTORE_PREFIX": "rhiza", "RHIZA_OBJSTORE_DURABILITY": "before-ack", "RHIZA_CLUSTER_MEMBERS": string(encoded(members))}
+	config := obj{"RHIZA_CLUSTER_ID": "chaos-source", "RHIZA_BIND_ADDR": "0.0.0.0:8080", "RHIZA_PEER_ADDR": "0.0.0.0:9090", "RHIZA_DATA_DIR": "/data", "RHIZA_ENABLE_RECONFIGURATION": "true", "RHIZA_CHECKPOINT_INTERVAL": "0", "RHIZA_OBJSTORE_SYNC_INTERVAL": "1s", "RHIZA_OBJSTORE_GC_INTERVAL": "0", "RHIZA_OBJSTORE_PROVIDER": "s3", "RHIZA_OBJSTORE_ENDPOINT": "rhiza-versitygw:9000", "RHIZA_OBJSTORE_BUCKET": "rhiza", "RHIZA_OBJSTORE_INSECURE": "true", "RHIZA_OBJSTORE_REGION": "us-east-1", "RHIZA_OBJSTORE_PREFIX": "rhiza", "RHIZA_OBJSTORE_DURABILITY": "before-ack", "RHIZA_CLUSTER_MEMBERS": string(encoded(members))}
 	configMap := obj{"apiVersion": "v1", "kind": "ConfigMap", "metadata": metadata("rhiza-config"), "data": config}
 	credentials := obj{"apiVersion": "v1", "kind": "Secret", "metadata": metadata("rhiza-peer-credentials"), "stringData": obj{"RHIZA_ADMIN_TOKEN": admin, "RHIZA_PEER_TOKENS": string(encoded(tokens))}}
-	store := resource("apps/v1", "Deployment", "rhiza-minio", obj{"replicas": 1, "selector": obj{"matchLabels": selector("rhiza-minio")}, "template": obj{"metadata": obj{"labels": selector("rhiza-minio")}, "spec": obj{"containers": []obj{{"name": "minio", "image": "ghcr.io/versity/versitygw@sha256:30292fc2eeacc67a36993b01f7a7a5e3361a19cced0e80c1d71cfa2a4b0a2499", "args": []string{"--port", ":9000", "--health", "/_/health", "posix", "/data"}, "env": []obj{value("ROOT_ACCESS_KEY", "fencing-local"), value("ROOT_SECRET_KEY", "fencing-local-secret")}, "ports": []obj{{"name": "s3", "containerPort": 9000}}, "readinessProbe": obj{"httpGet": obj{"path": "/_/health", "port": "s3"}}, "volumeMounts": []obj{{"name": "data", "mountPath": "/data"}}}}, "volumes": []obj{{"name": "data", "emptyDir": obj{}}}}}})
-	storeService := resource("v1", "Service", "rhiza-minio", obj{"selector": selector("rhiza-minio"), "ports": []obj{{"port": 9000, "targetPort": "s3"}}})
-	bucketJob := resource("batch/v1", "Job", "rhiza-create-bucket", obj{"backoffLimit": 0, "activeDeadlineSeconds": 120, "template": obj{"spec": obj{"restartPolicy": "Never", "containers": []obj{{"name": "create", "image": "amazon/aws-cli@sha256:83f8ffe939569070c5b66d22231862ab78718766d9d8e4c44ca84dd0be5569a5", "args": []string{"--endpoint-url=http://rhiza-minio:9000", "s3api", "create-bucket", "--bucket", "rhiza"}, "env": []obj{value("AWS_ACCESS_KEY_ID", "fencing-local"), value("AWS_SECRET_ACCESS_KEY", "fencing-local-secret"), value("AWS_DEFAULT_REGION", "us-east-1"), value("AWS_EC2_METADATA_DISABLED", "true")}}}}}})
+	store := resource("apps/v1", "Deployment", "rhiza-versitygw", obj{"replicas": 1, "selector": obj{"matchLabels": selector("rhiza-versitygw")}, "template": obj{"metadata": obj{"labels": selector("rhiza-versitygw")}, "spec": obj{"containers": []obj{{"name": "versitygw", "image": "ghcr.io/versity/versitygw@sha256:30292fc2eeacc67a36993b01f7a7a5e3361a19cced0e80c1d71cfa2a4b0a2499", "args": []string{"--port", ":9000", "--health", "/_/health", "posix", "/data"}, "env": []obj{value("ROOT_ACCESS_KEY", "fencing-local"), value("ROOT_SECRET_KEY", "fencing-local-secret")}, "ports": []obj{{"name": "s3", "containerPort": 9000}}, "readinessProbe": obj{"httpGet": obj{"path": "/_/health", "port": "s3"}}, "volumeMounts": []obj{{"name": "data", "mountPath": "/data"}}}}, "volumes": []obj{{"name": "data", "emptyDir": obj{}}}}}})
+	storeService := resource("v1", "Service", "rhiza-versitygw", obj{"selector": selector("rhiza-versitygw"), "ports": []obj{{"port": 9000, "targetPort": "s3"}}})
+	bucketJob := resource("batch/v1", "Job", "rhiza-create-bucket", obj{"backoffLimit": 0, "activeDeadlineSeconds": 120, "template": obj{"spec": obj{"restartPolicy": "Never", "containers": []obj{{"name": "create", "image": "amazon/aws-cli@sha256:83f8ffe939569070c5b66d22231862ab78718766d9d8e4c44ca84dd0be5569a5", "args": []string{"--endpoint-url=http://rhiza-versitygw:9000", "s3api", "create-bucket", "--bucket", "rhiza"}, "env": []obj{value("AWS_ACCESS_KEY_ID", "fencing-local"), value("AWS_SECRET_ACCESS_KEY", "fencing-local-secret"), value("AWS_DEFAULT_REGION", "us-east-1"), value("AWS_EC2_METADATA_DISABLED", "true")}}}}}})
 	headless := resource("v1", "Service", "rhiza-headless", obj{"clusterIP": "None", "publishNotReadyAddresses": true, "selector": selector("rhiza"), "ports": []obj{{"name": "http", "port": 8080, "targetPort": "http"}, {"name": "peer-quic", "port": 9090, "targetPort": "peer-quic", "protocol": "UDP"}}})
 	envFrom := []obj{{"configMapRef": obj{"name": "rhiza-config"}}, {"secretRef": obj{"name": "rhiza-peer-credentials"}}}
 	sts := resource("apps/v1", "StatefulSet", "rhiza", obj{"replicas": 0, "serviceName": "rhiza-headless", "podManagementPolicy": "Parallel", "updateStrategy": obj{"type": "OnDelete"}, "selector": obj{"matchLabels": selector("rhiza")}, "template": obj{"metadata": obj{"labels": selector("rhiza")}, "spec": obj{"securityContext": obj{"runAsNonRoot": true, "fsGroup": 65532}, "containers": []obj{{"name": "rhiza", "image": "rhiza-fencing-host:local", "envFrom": envFrom, "env": []obj{field("RHIZA_NODE_ID", "metadata.name")}, "ports": []obj{{"name": "http", "containerPort": 8080}, {"name": "peer-quic", "containerPort": 9090, "protocol": "UDP"}}, "volumeMounts": []obj{{"name": "data", "mountPath": "/data"}}, "readinessProbe": obj{"httpGet": obj{"path": "/ready", "port": "http"}, "periodSeconds": 2}, "resources": obj{"requests": obj{"cpu": "250m", "memory": "256Mi"}, "limits": obj{"memory": "2Gi"}}}}, "volumes": []obj{{"name": "data", "emptyDir": obj{}}}}}})
@@ -674,6 +681,230 @@ func wait(ctx context.Context, description string, check func() (bool, error)) e
 	}
 }
 
+type runOwnedPod struct {
+	Name string
+	UID  string
+}
+
+type runOwnedOperator struct {
+	Name            string
+	UID             string
+	ResourceVersion string
+	Generation      int64
+	Replicas        int64
+	Selector        map[string]string
+	Pods            []runOwnedPod
+}
+
+func captureRunOwnedOperator(ctx context.Context) (runOwnedOperator, error) {
+	return captureRunOwnedDeployment(ctx, "rhiza-operator")
+}
+
+func captureRunOwnedDeployment(ctx context.Context, name string) (runOwnedOperator, error) {
+	var owned runOwnedOperator
+	deployment, err := get(ctx, "deployment", name)
+	if err != nil {
+		return owned, err
+	}
+	owned.Name = name
+	owned.UID = text(nested(deployment, "metadata", "uid"))
+	owned.ResourceVersion = text(nested(deployment, "metadata", "resourceVersion"))
+	owned.Generation = integer(nested(deployment, "metadata", "generation"))
+	owned.Replicas = integer(nested(deployment, "spec", "replicas"))
+	selector, _ := nested(deployment, "spec", "selector", "matchLabels").(map[string]any)
+	owned.Selector = make(map[string]string, len(selector))
+	for key, value := range selector {
+		label := text(value)
+		if key == "" || label == "" {
+			return owned, fmt.Errorf("run-owned operator Deployment selector is incomplete")
+		}
+		owned.Selector[key] = label
+	}
+	if owned.Name == "" || owned.UID == "" || owned.ResourceVersion == "" || owned.Generation < 1 || owned.Replicas < 1 || len(owned.Selector) == 0 {
+		return owned, fmt.Errorf("run-owned operator Deployment identity or desired state is incomplete")
+	}
+	pods, err := kubectl(ctx, "get", "pods", "-l", labelSelector(owned.Selector), "-o", "json")
+	if err != nil {
+		return owned, err
+	}
+	var list obj
+	if err := json.Unmarshal(pods, &list); err != nil {
+		return owned, err
+	}
+	items, _ := list["items"].([]any)
+	for _, item := range items {
+		podName := text(nested(item, "metadata", "name"))
+		uid := text(nested(item, "metadata", "uid"))
+		if podName == "" || uid == "" {
+			return owned, fmt.Errorf("selected %s Pod lacks identity", name)
+		}
+		owned.Pods = append(owned.Pods, runOwnedPod{Name: podName, UID: uid})
+	}
+	if int64(len(owned.Pods)) != owned.Replicas {
+		return owned, fmt.Errorf("%s Pod set differs from run-owned Deployment desired replicas", name)
+	}
+	return owned, nil
+}
+
+func (owned runOwnedOperator) setReplicas(ctx context.Context, replicas int64) error {
+	if owned.UID == "" || owned.ResourceVersion == "" || replicas < 0 {
+		return fmt.Errorf("run-owned operator scale identity is incomplete")
+	}
+	patch, _ := json.Marshal([]obj{
+		{"op": "test", "path": "/metadata/uid", "value": owned.UID},
+		{"op": "test", "path": "/metadata/resourceVersion", "value": owned.ResourceVersion},
+		{"op": "replace", "path": "/spec/replicas", "value": replicas},
+	})
+	_, err := kubectl(ctx, "patch", "deployment", owned.Name, "--type=json", "-p", string(patch))
+	return err
+}
+
+func refreshRunOwnedDeploymentResourceVersion(ctx context.Context, owned *runOwnedOperator) error {
+	current, err := get(ctx, "deployment", owned.Name)
+	if err != nil {
+		return err
+	}
+	if text(nested(current, "metadata", "uid")) != owned.UID || !deploymentSelectorMatches(current, owned.Selector) ||
+		integer(nested(current, "spec", "replicas")) != owned.Replicas {
+		return fmt.Errorf("run-owned %s Deployment changed before the UID/RV-guarded scale", owned.Name)
+	}
+	resourceVersion := text(nested(current, "metadata", "resourceVersion"))
+	if resourceVersion == "" {
+		return fmt.Errorf("run-owned %s Deployment resourceVersion is unavailable", owned.Name)
+	}
+	owned.ResourceVersion = resourceVersion
+	return nil
+}
+
+func labelSelector(labels map[string]string) string {
+	keys := make([]string, 0, len(labels))
+	for key := range labels {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+	parts := make([]string, 0, len(keys))
+	for _, key := range keys {
+		parts = append(parts, key+"="+labels[key])
+	}
+	return strings.Join(parts, ",")
+}
+
+func deploymentSelectorMatches(deployment obj, selector map[string]string) bool {
+	actual, _ := nested(deployment, "spec", "selector", "matchLabels").(map[string]any)
+	if len(actual) != len(selector) {
+		return false
+	}
+	for key, want := range selector {
+		if text(actual[key]) != want {
+			return false
+		}
+	}
+	return true
+}
+
+func waitRunOwnedOperatorAbsent(ctx context.Context, operator, fencer runOwnedOperator) error {
+	if operator.Name != "rhiza-operator" || fencer.Name != "rhiza-fencer" || operator.UID == "" || fencer.UID == "" {
+		return fmt.Errorf("controller-absent check lacks exact run-owned deployment identities")
+	}
+	if err := wait(ctx, "run-owned operator observed at zero replicas", func() (bool, error) {
+		current, err := get(ctx, "deployment", operator.Name)
+		if err != nil {
+			return false, err
+		}
+		if text(nested(current, "metadata", "uid")) != operator.UID || !deploymentSelectorMatches(current, operator.Selector) || integer(nested(current, "spec", "replicas")) != 0 ||
+			integer(nested(current, "status", "observedGeneration")) < integer(nested(current, "metadata", "generation")) {
+			return false, nil
+		}
+		fencerCurrent, err := get(ctx, "deployment", fencer.Name)
+		if err != nil {
+			return false, err
+		}
+		if text(nested(fencerCurrent, "metadata", "uid")) != fencer.UID || !deploymentSelectorMatches(fencerCurrent, fencer.Selector) || integer(nested(fencerCurrent, "spec", "replicas")) != fencer.Replicas ||
+			integer(nested(fencerCurrent, "status", "observedGeneration")) < integer(nested(fencerCurrent, "metadata", "generation")) ||
+			integer(nested(fencerCurrent, "status", "replicas")) != fencer.Replicas ||
+			integer(nested(fencerCurrent, "status", "readyReplicas")) != fencer.Replicas || integer(nested(fencerCurrent, "status", "unavailableReplicas")) != 0 {
+			return false, fmt.Errorf("fencer Deployment changed or is not Ready while operator is absent")
+		}
+		for _, pod := range fencer.Pods {
+			currentPod, err := get(ctx, "pod", pod.Name)
+			if err != nil || text(nested(currentPod, "metadata", "uid")) != pod.UID {
+				return false, fmt.Errorf("run-owned fencer Pod identity changed while operator is absent")
+			}
+		}
+		for _, pod := range operator.Pods {
+			_, err := get(ctx, "pod", pod.Name)
+			if err == nil {
+				return false, nil
+			}
+			if !strings.Contains(err.Error(), "NotFound") {
+				return false, fmt.Errorf("direct GET of operator Pod %s failed: %w", pod.Name, err)
+			}
+		}
+		return true, nil
+	}); err != nil {
+		return err
+	}
+	return nil
+}
+
+func restoreRunOwnedOperator(ctx context.Context, owned runOwnedOperator) error {
+	current, err := get(ctx, "deployment", owned.Name)
+	if err != nil {
+		return err
+	}
+	if text(nested(current, "metadata", "uid")) != owned.UID || !deploymentSelectorMatches(current, owned.Selector) {
+		return fmt.Errorf("operator Deployment changed; refusing to restore a non-owned resource")
+	}
+	currentReplicas := integer(nested(current, "spec", "replicas"))
+	if currentReplicas != 0 && currentReplicas != owned.Replicas {
+		return fmt.Errorf("operator Deployment replica count changed; refusing to overwrite another actor's update")
+	}
+	if currentReplicas == owned.Replicas {
+		return waitRunOwnedDeploymentReady(ctx, owned)
+	}
+	owned.ResourceVersion = text(nested(current, "metadata", "resourceVersion"))
+	if err := owned.setReplicas(ctx, owned.Replicas); err != nil {
+		return err
+	}
+	return waitRunOwnedDeploymentReady(ctx, owned)
+}
+
+func waitRunOwnedDeploymentReady(ctx context.Context, owned runOwnedOperator) error {
+	return wait(ctx, "run-owned operator Deployment restored and Ready", func() (bool, error) {
+		restored, err := get(ctx, "deployment", owned.Name)
+		if err != nil {
+			return false, err
+		}
+		if text(nested(restored, "metadata", "uid")) != owned.UID || !deploymentSelectorMatches(restored, owned.Selector) ||
+			integer(nested(restored, "spec", "replicas")) != owned.Replicas {
+			return false, fmt.Errorf("run-owned operator Deployment identity or replica count changed during restore")
+		}
+		return integer(nested(restored, "status", "observedGeneration")) >= integer(nested(restored, "metadata", "generation")) &&
+			integer(nested(restored, "status", "readyReplicas")) == owned.Replicas && integer(nested(restored, "status", "unavailableReplicas")) == 0, nil
+	})
+}
+
+func verifyRunOwnedDeploymentReady(ctx context.Context, owned runOwnedOperator) error {
+	current, err := get(ctx, "deployment", owned.Name)
+	if err != nil {
+		return err
+	}
+	replicas := integer(nested(current, "spec", "replicas"))
+	if text(nested(current, "metadata", "uid")) != owned.UID || !deploymentSelectorMatches(current, owned.Selector) || replicas != owned.Replicas ||
+		integer(nested(current, "status", "observedGeneration")) < integer(nested(current, "metadata", "generation")) ||
+		integer(nested(current, "status", "replicas")) != replicas || integer(nested(current, "status", "readyReplicas")) != replicas ||
+		integer(nested(current, "status", "unavailableReplicas")) != 0 {
+		return fmt.Errorf("run-owned %s Deployment is not Ready at its captured UID and replica count", owned.Name)
+	}
+	for _, pod := range owned.Pods {
+		currentPod, err := get(ctx, "pod", pod.Name)
+		if err != nil || text(nested(currentPod, "metadata", "uid")) != pod.UID || !podReady(currentPod) {
+			return fmt.Errorf("run-owned %s Pod %s is not Ready at its captured UID: %v", owned.Name, pod.Name, err)
+		}
+	}
+	return nil
+}
+
 type forward struct {
 	cmd      *exec.Cmd
 	port     int
@@ -731,7 +962,7 @@ func openQualificationLedgerReader(ctx context.Context, out string) (proofLedger
 	if err != nil {
 		return nil, nil, err
 	}
-	forward, err := startServiceForward(ctx, out, "rhiza-minio", 9000)
+	forward, err := startServiceForward(ctx, out, "rhiza-versitygw", 9000)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -1028,7 +1259,8 @@ func qualify(ctx context.Context) (resultErr error) {
 		}
 		return nested(c, "status", "phase") == "Healthy", nil
 	}); err != nil {
-		return err
+		captureErr := captureVoterStartupDiagnostics("", nil, out, "bootstrap")
+		return errors.Join(err, captureErr)
 	}
 	ledgerReader, closeLedgerReader, err := openQualificationLedgerReader(ctx, out)
 	if err != nil {
@@ -1501,8 +1733,8 @@ func qualifyOnline(ctx context.Context, survivor *forward, stsUID, bindingUID, o
 		}
 		return nested(root, "status", "phase") == "Healthy" && nested(root, "status", "activeClusterID") == "chaos-source", nil
 	}); err != nil {
-		captureOnlineVoterDiagnostics(voterRequest.OperationID, fault, out)
-		return nil, err
+		captureErr := captureOnlineVoterDiagnostics(voterRequest.OperationID, fault, out)
+		return nil, errors.Join(err, captureErr)
 	}
 	m := child.Spec.Membership
 	if m == nil || m.Remove != "rhiza-2" || m.RemovedPod != failed.Pod || m.Fence.WorkloadUID != failed.PodUID || m.Fence.WALIdentity != failed.WALIdentity || m.Fence.Evidence != voterProof.ProofID || !m.Fence.Confirmed || m.ReplacementPod == "" || child.Status.Membership.Add == nil || child.Status.Membership.RemoveRequest == nil || text(nested(child.Metadata, "uid")) == "" || text(nested(child.Metadata, "annotations", "rhiza.mrchypark.dev/automatic-owner")) != bindingUID || text(nested(child.Metadata, "annotations", "rhiza.mrchypark.dev/automatic-logical")) != "fencing-e2e" {
@@ -1571,15 +1803,25 @@ func qualifyOnline(ctx context.Context, survivor *forward, stsUID, bindingUID, o
 // captureOnlineVoterDiagnostics preserves bounded private state for the exact
 // automatic learner involved in a failed online promotion. It is diagnostic
 // only: it does not change readiness or retry behavior.
-func captureOnlineVoterDiagnostics(operationID string, fault *observationFault, out string) {
-	if operationID == "" || out == "" {
-		return
+func captureOnlineVoterDiagnostics(operationID string, fault *observationFault, out string) error {
+	return captureVoterStartupDiagnostics(operationID, fault, out, "online")
+}
+
+// captureVoterStartupDiagnostics is a bounded, read-only failure snapshot. It
+// captures logs before optional API and membership probes so a short-lived
+// failed container is not lost to later diagnostic work. An empty operationID
+// means bootstrap observation and is never replaced with a synthetic ID.
+func captureVoterStartupDiagnostics(operationID string, fault *observationFault, out, mode string) error {
+	if out == "" {
+		return nil
 	}
 	dir := filepath.Join(out, "private-online-voter-diagnostics")
-	if os.MkdirAll(dir, 0700) != nil {
-		return
+	if err := os.MkdirAll(dir, 0700); err != nil {
+		return fmt.Errorf("diagnostic directory creation failed")
 	}
-	_ = os.Chmod(dir, 0700)
+	if err := os.Chmod(dir, 0700); err != nil {
+		return fmt.Errorf("diagnostic directory protection failed")
+	}
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 	pods, err := get(ctx, "pods", "")
@@ -1591,12 +1833,39 @@ func captureOnlineVoterDiagnostics(operationID string, fault *observationFault, 
 	for _, pod := range items {
 		name := text(nested(pod, "metadata", "name"))
 		owner := text(nested(pod, "metadata", "annotations", "rhiza.mrchypark.dev/recovery-owner"))
-		if owner == operationID || name == operationID+"-learner" {
+		matches := false
+		if mode == "online" && operationID != "" {
+			matches = owner == operationID || name == operationID+"-learner"
+		} else if mode == "bootstrap" {
+			matches = podOwnedByName(pod, "rhiza")
+		}
+		if matches {
 			if learner == nil || nested(pod, "metadata", "deletionTimestamp") == nil {
 				learner = pod
 			}
 		}
 	}
+	logCaptures, logErr := captureVoterContainerLogs(ctx, dir, learner)
+	root, rootErr := get(ctx, "rhizacluster", "rhiza")
+	if rootErr != nil {
+		root = nil
+	}
+	sts, stsErr := get(ctx, "statefulset", "rhiza")
+	if stsErr != nil {
+		sts = nil
+	}
+	stsUID := text(nested(sts, "metadata", "uid"))
+	var captureErr error
+	if err != nil {
+		captureErr = errors.Join(captureErr, fmt.Errorf("Pod inventory diagnostic query failed"))
+	}
+	if rootErr != nil {
+		captureErr = errors.Join(captureErr, fmt.Errorf("root diagnostic query failed"))
+	}
+	if stsErr != nil {
+		captureErr = errors.Join(captureErr, fmt.Errorf("StatefulSet diagnostic query failed"))
+	}
+	captureErr = errors.Join(captureErr, logErr)
 	var events any
 	eventsQuerySucceeded := false
 	if allEvents, eventErr := get(ctx, "events", ""); eventErr == nil {
@@ -1604,6 +1873,8 @@ func captureOnlineVoterDiagnostics(operationID string, fault *observationFault, 
 		items, _ := allEvents["items"].([]any)
 		learnerUID := text(nested(learner, "metadata", "uid"))
 		events = eventsForLearnerUID(items, learnerUID)
+	} else {
+		captureErr = errors.Join(captureErr, fmt.Errorf("event diagnostic query failed"))
 	}
 	recoveries, recoveryErr := get(ctx, "rhizarecoveries", "")
 	var recovery any
@@ -1615,20 +1886,25 @@ func captureOnlineVoterDiagnostics(operationID string, fault *observationFault, 
 				break
 			}
 		}
+	} else {
+		captureErr = errors.Join(captureErr, fmt.Errorf("recovery diagnostic query failed"))
 	}
 	secretObservations, secretObservationsTruncated := learnerSecretObservations(ctx, learner, recovery, operationID)
-	parent, parentErr := get(ctx, "rhizacluster", "rhiza")
-	if parentErr != nil {
-		parent = nil
-	}
+	parent, parentErr := root, rootErr
 	private := obj{
-		"operationID": operationID, "learner": privateLearnerDiagnosticView(learner), "events": events,
+		"mode": mode, "operationID": operationID, "learner": privateLearnerDiagnosticView(learner), "events": events,
 		"podsQuerySucceeded": err == nil, "eventsQuerySucceeded": eventsQuerySucceeded, "recoveryQuerySucceeded": recoveryErr == nil,
 		"secretObservations": secretObservations, "secretObservationsTruncated": secretObservationsTruncated,
 		"membershipObservation": inspectLearnerMembership(ctx, learner, recovery, parent, out),
 		"recoveryFound":         recovery != nil, "recovery": privateRecoveryDiagnosticView(recovery), "parent": privateParentDiagnosticView(parent),
 		"parentQuerySucceeded":           parentErr == nil,
-		"parentRecoveryMatchesOperation": parentErr == nil && nested(parent, "status", "activeRecovery") == operationID,
+		"parentRecoveryMatchesOperation": operationID != "" && parentErr == nil && nested(parent, "status", "activeRecovery") == operationID,
+		"capture": obj{
+			"rootQuerySucceeded": rootErr == nil, "root": privateRootDiagnosticView(root),
+			"statefulSetQuerySucceeded": stsErr == nil, "statefulSet": privateStatefulSetDiagnosticView(sts),
+			"podIdentityBound": diagnosticPodIdentityBound(learner, mode, operationID, stsUID),
+			"logs":             logCaptures,
+		},
 		"faultTargetPodUID": func() string {
 			if fault == nil {
 				return ""
@@ -1643,34 +1919,162 @@ func captureOnlineVoterDiagnostics(operationID string, fault *observationFault, 
 		}(),
 		"learnerIP": nested(learner, "status", "podIP"),
 	}
-	if os.WriteFile(filepath.Join(dir, "online-voter-diagnostics.json"), encoded(private), 0600) != nil {
-		return
+	if writeErr := os.WriteFile(filepath.Join(dir, "online-voter-diagnostics.json"), encoded(private), 0600); writeErr != nil {
+		return errors.Join(captureErr, fmt.Errorf("diagnostic snapshot write failed"))
 	}
-	if learner == nil {
-		return
+	if ctxErr := ctx.Err(); ctxErr != nil {
+		return errors.Join(captureErr, ctxErr)
 	}
-	containers, _ := nested(learner, "spec", "containers").([]any)
-	for _, container := range containers {
-		name := text(nested(container, "name"))
-		if name == "" || strings.ContainsAny(name, "/\\\n\x00") {
+	return captureErr
+}
+
+func podOwnedByUID(pod any, uid string) bool {
+	if uid == "" {
+		return false
+	}
+	for _, owner := range anySlice(nested(pod, "metadata", "ownerReferences")) {
+		if nested(owner, "uid") == uid && nested(owner, "kind") == "StatefulSet" {
+			return true
+		}
+	}
+	return false
+}
+
+func podOwnedByName(pod any, name string) bool {
+	if name == "" {
+		return false
+	}
+	for _, owner := range anySlice(nested(pod, "metadata", "ownerReferences")) {
+		if nested(owner, "uid") != "" && nested(owner, "kind") == "StatefulSet" && nested(owner, "name") == name {
+			return true
+		}
+	}
+	return false
+}
+
+func diagnosticPodIdentityBound(pod any, mode, operationID, stsUID string) bool {
+	if pod == nil || text(nested(pod, "metadata", "uid")) == "" {
+		return false
+	}
+	if mode == "bootstrap" {
+		return podOwnedByUID(pod, stsUID)
+	}
+	name := text(nested(pod, "metadata", "name"))
+	owner := text(nested(pod, "metadata", "annotations", "rhiza.mrchypark.dev/recovery-owner"))
+	return operationID != "" && (owner == operationID || name == operationID+"-learner")
+}
+
+func captureVoterContainerLogs(ctx context.Context, dir string, pod any) ([]any, error) {
+	if pod == nil {
+		return []any{}, nil
+	}
+	name := text(nested(pod, "metadata", "name"))
+	uid := text(nested(pod, "metadata", "uid"))
+	if name == "" || uid == "" {
+		return []any{}, fmt.Errorf("diagnostic pod identity incomplete")
+	}
+	var records []any
+	var captureErr error
+	statuses := map[string]any{}
+	for _, status := range anySlice(nested(pod, "status", "containerStatuses")) {
+		statuses[text(nested(status, "name"))] = status
+	}
+	for _, container := range anySlice(nested(pod, "spec", "containers")) {
+		containerName := text(nested(container, "name"))
+		if containerName == "" || strings.ContainsAny(containerName, "/\\\n\x00") {
 			continue
 		}
 		for _, previous := range []bool{false, true} {
-			args := []string{"logs", text(nested(learner, "metadata", "name")), "-c", name, "--tail=100", "--limit-bytes=32768"}
+			period := "current"
+			statusCode, captured, truncated := "capture_failed", false, false
+			status := statuses[containerName]
+			containerID := text(nested(status, "containerID"))
+			restartCount := integer(nested(status, "restartCount"))
+			if previous {
+				period = "previous"
+				if status == nil || integer(nested(status, "restartCount")) == 0 {
+					statusCode = "not_available"
+					records = append(records, obj{"period": period, "container": containerName, "status": statusCode, "captured": false, "bytes": 0, "truncated": false})
+					continue
+				}
+			}
+			currentPod, queryErr := get(ctx, "pod", name)
+			if queryErr != nil || text(nested(currentPod, "metadata", "uid")) != uid || !diagnosticContainerIncarnationMatches(currentPod, containerName, containerID, restartCount) {
+				statusCode = "identity_changed"
+				if queryErr != nil {
+					statusCode = diagnosticErrorCode(ctx, queryErr, false)
+				}
+				captureErr = errors.Join(captureErr, fmt.Errorf("%s log target identity was not confirmed", period))
+				records = append(records, obj{"period": period, "container": containerName, "status": statusCode, "captured": false,
+					"bytes": 0, "podUID": uid, "truncated": false})
+				continue
+			}
+			args := []string{"logs", name, "-c", containerName, "--tail=100", "--limit-bytes=32768"}
 			if previous {
 				args = append(args, "--previous")
 			}
-			data, logErr := kubectl(ctx, args...)
-			if logErr != nil {
-				continue
+			data, err := kubectl(ctx, args...)
+			if err != nil {
+				statusCode = diagnosticErrorCode(ctx, err, previous)
+				captureErr = errors.Join(captureErr, fmt.Errorf("%s log capture %s failed", period, statusCode))
+			} else {
+				latestPod, identityErr := get(ctx, "pod", name)
+				if identityErr != nil || text(nested(latestPod, "metadata", "uid")) != uid || !diagnosticContainerIncarnationMatches(latestPod, containerName, containerID, restartCount) {
+					statusCode = "identity_changed"
+					if identityErr != nil {
+						statusCode = diagnosticErrorCode(ctx, identityErr, false)
+					}
+					captureErr = errors.Join(captureErr, fmt.Errorf("%s log target identity changed during capture", period))
+					records = append(records, obj{"period": period, "container": containerName, "status": statusCode, "captured": false,
+						"bytes": 0, "podUID": uid, "truncated": false})
+					continue
+				}
+				statusCode, captured = "captured", true
+				truncated = len(data) >= 32<<10
+				path := filepath.Join(dir, "learner-"+period+"-"+containerName+".log")
+				if err := os.WriteFile(path, data, 0600); err != nil {
+					statusCode, captured = "write_failed", false
+					captureErr = errors.Join(captureErr, fmt.Errorf("%s log evidence write failed", period))
+				}
 			}
-			label := "current"
-			if previous {
-				label = "previous"
-			}
-			_ = os.WriteFile(filepath.Join(dir, "learner-"+label+"-"+name+".log"), data, 0600)
+			digest := sha256.Sum256(data)
+			records = append(records, obj{"period": period, "container": containerName, "status": statusCode, "captured": captured,
+				"bytes": len(data), "sha256": hex.EncodeToString(digest[:]), "truncated": truncated,
+				"podUID": uid, "containerID": containerID, "restartCount": restartCount, "containerTerminationReason": nested(status, "state", "terminated", "reason"),
+				"containerExitCode":     nested(status, "state", "terminated", "exitCode"),
+				"lastTerminationReason": nested(status, "lastState", "terminated", "reason"), "lastExitCode": nested(status, "lastState", "terminated", "exitCode")})
 		}
 	}
+	return records, captureErr
+}
+
+func diagnosticContainerIncarnationMatches(pod any, name, containerID string, restartCount int64) bool {
+	if containerID == "" {
+		return false
+	}
+	for _, status := range anySlice(nested(pod, "status", "containerStatuses")) {
+		if text(nested(status, "name")) == name {
+			return text(nested(status, "containerID")) == containerID && integer(nested(status, "restartCount")) == restartCount
+		}
+	}
+	return false
+}
+
+func diagnosticErrorCode(ctx context.Context, err error, previous bool) string {
+	if errors.Is(ctx.Err(), context.DeadlineExceeded) || errors.Is(err, context.DeadlineExceeded) {
+		return "deadline_exceeded"
+	}
+	if errors.Is(ctx.Err(), context.Canceled) || errors.Is(err, context.Canceled) {
+		return "canceled"
+	}
+	lower := strings.ToLower(err.Error())
+	if previous && strings.Contains(lower, "previous terminated container") && strings.Contains(lower, "not found") {
+		return "previous_missing"
+	}
+	if strings.Contains(lower, "notfound") || strings.Contains(lower, "not found") {
+		return "api_not_found"
+	}
+	return "command_failed"
 }
 
 func inspectLearnerMembership(ctx context.Context, learner, recovery, parent any, out string) obj {
@@ -1752,9 +2156,69 @@ func privateLearnerDiagnosticView(pod any) any {
 		containers = append(containers, obj{"name": nested(item, "name"), "secretRefs": secretRefs})
 	}
 	return obj{
-		"metadata": obj{"name": nested(pod, "metadata", "name"), "uid": nested(pod, "metadata", "uid"), "annotations": obj{"recoveryOwner": nested(pod, "metadata", "annotations", "rhiza.mrchypark.dev/recovery-owner")}},
+		"metadata": obj{"name": nested(pod, "metadata", "name"), "uid": nested(pod, "metadata", "uid"), "ownerReferences": nested(pod, "metadata", "ownerReferences"), "annotations": obj{"recoveryOwner": nested(pod, "metadata", "annotations", "rhiza.mrchypark.dev/recovery-owner")}},
 		"status":   obj{"phase": nested(pod, "status", "phase"), "podIP": nested(pod, "status", "podIP"), "conditions": conditions, "containerStatuses": statuses},
 		"spec":     obj{"containers": containers},
+	}
+}
+
+func privateRootDiagnosticView(root any) any {
+	if root == nil {
+		return nil
+	}
+	return obj{"metadata": obj{"uid": nested(root, "metadata", "uid"), "generation": nested(root, "metadata", "generation")},
+		"status": obj{"observedGeneration": nested(root, "status", "observedGeneration"), "phase": nested(root, "status", "phase"), "message": nested(root, "status", "message")}}
+}
+
+func privateStatefulSetDiagnosticView(sts any) any {
+	if sts == nil {
+		return nil
+	}
+	return obj{"metadata": obj{"uid": nested(sts, "metadata", "uid"), "generation": nested(sts, "metadata", "generation"), "ownerReferences": nested(sts, "metadata", "ownerReferences")},
+		"spec":   obj{"template": obj{"spec": obj{"containers": statefulContainerShape(sts)}}},
+		"status": obj{"observedGeneration": nested(sts, "status", "observedGeneration"), "replicas": nested(sts, "status", "replicas"), "readyReplicas": nested(sts, "status", "readyReplicas"), "currentReplicas": nested(sts, "status", "currentReplicas"), "updatedReplicas": nested(sts, "status", "updatedReplicas")}}
+}
+
+func statefulContainerShape(sts any) []any {
+	var result []any
+	for _, container := range anySlice(nested(sts, "spec", "template", "spec", "containers")) {
+		var ports []any
+		for _, port := range anySlice(nested(container, "ports")) {
+			ports = append(ports, obj{"name": nested(port, "name"), "containerPort": nested(port, "containerPort"), "protocol": nested(port, "protocol")})
+		}
+		result = append(result, obj{"name": nested(container, "name"), "ports": ports, "image": nested(container, "image"), "supervisedLaunchShape": supervisedLaunchShape(container)})
+	}
+	return result
+}
+
+func supervisedLaunchShape(container any) string {
+	command, args := anySlice(nested(container, "command")), anySlice(nested(container, "args"))
+	if len(command) == 0 && len(args) == 0 {
+		return "missing"
+	}
+	if len(command) == 1 && command[0] == "/usr/local/bin/rhiza-fencer" && len(args) == 3 && args[0] == "supervise" && args[1] == "--" && args[2] == "/usr/local/bin/rhiza" {
+		return "expected"
+	}
+	const fixtureGate = `if [ -n "${RHIZA_LEARNER:-}" ]; then while [ ! -f /data/.chaos-start ]; do sleep 0.2; done; fi; exec /usr/local/bin/rhiza-entrypoint`
+	if len(command) == 1 && command[0] == "/usr/local/bin/rhiza-fencer" && len(args) == 5 &&
+		args[0] == "supervise" && args[1] == "--" && args[2] == "/bin/sh" && args[3] == "-ec" && args[4] == fixtureGate {
+		return "expected"
+	}
+	return "mismatch"
+}
+
+func integer(value any) int64 {
+	switch number := value.(type) {
+	case int:
+		return int64(number)
+	case int32:
+		return int64(number)
+	case int64:
+		return number
+	case float64:
+		return int64(number)
+	default:
+		return 0
 	}
 }
 

@@ -352,7 +352,7 @@ func TestAssignedRestartAcceptsRereadOfPreservedGenesis(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer wal.Close()
-	if err := ensureVoterIdentityWithHooks(ctx, &current, interleaved, wal, local, false, nil, nil, true); err != nil {
+	if err := ensureVoterIdentityWithHooks(ctx, &current, interleaved, wal, local, false, nil, nil, true, ""); err != nil {
 		t.Fatalf("assigned restart rejected reread of preserved genesis: %v", err)
 	}
 }
@@ -605,7 +605,7 @@ func TestPendingLearnerIdentityUsesOnlyAuthorityCreateOnlyHook(t *testing.T) {
 		registeredKey = key
 		return bucket.Upload(ctx, key, bytes.NewReader(data), objstore.WithIfNotExists())
 	}
-	if err := ensureVoterIdentityWithHooks(ctx, &learner, bucket, wal, local, false, []func(context.Context, string) error{bind}, []func(context.Context, string, []byte) error{write}); err != nil {
+	if err := ensureVoterIdentityWithHooks(ctx, &learner, bucket, wal, local, false, []func(context.Context, string) error{bind}, []func(context.Context, string, []byte) error{write}, false, ""); err != nil {
 		t.Fatal(err)
 	}
 	wantKey := path.Join("cluster", "voters", voterIdentityKey(string(learner.NodeID)))

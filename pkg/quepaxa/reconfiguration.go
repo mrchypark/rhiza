@@ -11,16 +11,52 @@ import (
 // next fifteen slots are drained under that same configuration; FinishReconfiguration
 // then commits the terminal control record and activates target at T+1.
 func (c *Core) BeginReconfiguration(ctx context.Context, target Cluster) (Slot, error) {
-	return c.beginReconfiguration(ctx, target, nil)
+	return c.beginReconfiguration(ctx, target, nil, nil)
 }
 
 // BeginReconfigurationAt starts a new operation only when the latest durable
 // abort terminal still matches expectedAbortSlot. Zero means no prior abort.
 func (c *Core) BeginReconfigurationAt(ctx context.Context, target Cluster, expectedAbortSlot Slot) (Slot, error) {
-	return c.beginReconfiguration(ctx, target, &expectedAbortSlot)
+	return c.beginReconfiguration(ctx, target, &expectedAbortSlot, nil)
 }
 
-func (c *Core) beginReconfiguration(ctx context.Context, target Cluster, expectedAbortSlot *Slot) (Slot, error) {
+// BeginEngineOwnedRemovalAt freezes an exact one-voter removal without asking
+// the removed voter to record the freeze. The original configuration's quorum
+// size remains authoritative. The returned tuple includes the decided freeze
+// hash needed by the later storage-exclusion proof.
+func (c *Core) BeginEngineOwnedRemovalAt(ctx context.Context, target Cluster, operationID string, expectedAbortSlot Slot) (EngineRemoval, error) {
+	if !c.engineOwnedRemovals {
+		return EngineRemoval{}, fmt.Errorf("engine-owned removals are not enabled")
+	}
+	if operationID == "" || len(operationID) > 256 {
+		return EngineRemoval{}, fmt.Errorf("engine-owned removal operation ID is required")
+	}
+	current := c.clusterForSlot(c.Tip() + 1)
+	removed, err := engineRemovedMember(current, target)
+	if err != nil {
+		return EngineRemoval{}, err
+	}
+	operation := &EngineRemoval{
+		Version: 1, Mode: engineRemovalMode, OperationID: operationID,
+		ExpectedConfigID: current.ConfigID, ExpectedAbortSlot: expectedAbortSlot,
+		Removed: removed, Target: cloneCluster(target),
+	}
+	if _, err := c.beginReconfiguration(ctx, target, &expectedAbortSlot, operation); err != nil {
+		return EngineRemoval{}, err
+	}
+	c.mu.RLock()
+	state := c.reconfiguration
+	if state == nil || state.engineRemoval == nil {
+		c.mu.RUnlock()
+		return EngineRemoval{}, fmt.Errorf("engine-owned removal freeze was not retained")
+	}
+	result := *state.engineRemoval
+	result.FreezeHash = state.id
+	c.mu.RUnlock()
+	return result, nil
+}
+
+func (c *Core) beginReconfiguration(ctx context.Context, target Cluster, expectedAbortSlot *Slot, engineRemoval *EngineRemoval) (Slot, error) {
 	if !c.reconfigEnabled || c.observer {
 		return 0, ErrQuorumUnavailable
 	}
@@ -33,6 +69,17 @@ func (c *Core) beginReconfiguration(ctx context.Context, target Cluster, expecte
 	for {
 		c.mu.RLock()
 		if c.reconfiguration != nil {
+			state := c.reconfiguration
+			if engineRemoval != nil && state.engineRemoval != nil &&
+				engineRemoval.OperationID == state.engineRemoval.OperationID &&
+				engineRemoval.ExpectedConfigID == state.engineRemoval.ExpectedConfigID &&
+				engineRemoval.ExpectedAbortSlot == state.engineRemoval.ExpectedAbortSlot &&
+				engineRemoval.Removed == state.engineRemoval.Removed &&
+				sameCluster(engineRemoval.Target, state.engineRemoval.Target) && sameCluster(target, state.target) {
+				freeze := state.freeze
+				c.mu.RUnlock()
+				return freeze, nil
+			}
 			c.mu.RUnlock()
 			return 0, fmt.Errorf("reconfiguration is already frozen")
 		}
@@ -68,6 +115,18 @@ func (c *Core) beginReconfiguration(ctx context.Context, target Cluster, expecte
 		if err := validateReconfigurationTarget(current, target, retired); err != nil {
 			return 0, err
 		}
+		if c.engineOwnedRemovals && engineRemoval == nil && isRemovalTarget(current, target) {
+			return 0, fmt.Errorf("new voter removal requires the engine-owned operation contract")
+		}
+		if engineRemoval != nil {
+			removed, err := engineRemovedMember(current, target)
+			if err != nil || expectedAbortSlot == nil || current.ConfigID != engineRemoval.ExpectedConfigID ||
+				*expectedAbortSlot != engineRemoval.ExpectedAbortSlot || removed != engineRemoval.Removed {
+				return 0, fmt.Errorf("engine-owned removal does not match the exact current voter identity")
+			}
+			engineRemoval.Freeze = freeze
+			engineRemoval.Target = cloneCluster(target)
+		}
 		if freezeSchedule || terminalSchedule {
 			if err := c.RecoverThrough(ctx, freeze); err != nil {
 				return 0, err
@@ -84,7 +143,7 @@ func (c *Core) beginReconfiguration(ctx context.Context, target Cluster, expecte
 			}
 			continue
 		}
-		value, err := encodeReconfiguration(reconfigurationValue{Freeze: freeze, TerminalSlot: freeze + 16, Target: cloneCluster(target), PrefixHash: prefix})
+		value, err := encodeReconfiguration(reconfigurationValue{Freeze: freeze, TerminalSlot: freeze + 16, Target: cloneCluster(target), PrefixHash: prefix, EngineRemoval: cloneEngineRemoval(engineRemoval)})
 		if err != nil {
 			return 0, err
 		}
@@ -103,6 +162,74 @@ func (c *Core) beginReconfiguration(ctx context.Context, target Cluster, expecte
 		}
 		return freeze, nil
 	}
+}
+
+func engineRemovedMember(current, target Cluster) (Member, error) {
+	if target.ConfigID != current.ConfigID+1 || len(target.Members) != len(current.Members)-1 {
+		return Member{}, fmt.Errorf("engine-owned removal must remove exactly one voter")
+	}
+	next := target.MemberSet()
+	var removed Member
+	for _, member := range current.Members {
+		if candidate, ok := next[member.ID]; !ok {
+			if removed.ID != "" {
+				return Member{}, fmt.Errorf("engine-owned removal removed multiple voters")
+			}
+			removed = member
+		} else if candidate != member {
+			return Member{}, fmt.Errorf("engine-owned removal changed a retained voter identity")
+		}
+	}
+	if removed.ID == "" || removed.WALIdentity == "" || validateReconfigurationTarget(current, target, nil) != nil {
+		return Member{}, fmt.Errorf("engine-owned removal target is invalid or old WAL identity is unavailable")
+	}
+	return removed, nil
+}
+
+func isRemovalTarget(current, target Cluster) bool {
+	if len(target.Members) != len(current.Members)-1 {
+		return false
+	}
+	old, next := current.MemberSet(), target.MemberSet()
+	for id, member := range old {
+		if candidate, ok := next[id]; ok {
+			if candidate != member {
+				return false
+			}
+		} else {
+			return true
+		}
+	}
+	return false
+}
+
+func isRemovalControl(current Cluster, control reconfigurationValue) bool {
+	return !control.Terminal && isRemovalTarget(current, control.Target) ||
+		control.Terminal && isRemovalTarget(current, control.Target)
+}
+
+func sameEngineRemoval(left, right EngineRemoval, terminal bool) bool {
+	if left.Version != right.Version || left.Mode != right.Mode || left.OperationID != right.OperationID ||
+		left.ExpectedConfigID != right.ExpectedConfigID || left.ExpectedAbortSlot != right.ExpectedAbortSlot ||
+		left.Removed != right.Removed || !sameCluster(left.Target, right.Target) || left.Freeze != right.Freeze {
+		return false
+	}
+	if terminal {
+		return right.FreezeHash != (ValueHash{}) && right.StorageEffectsExcludedHash != (ValueHash{}) &&
+			(left.FreezeHash == (ValueHash{}) || left.FreezeHash == right.FreezeHash) &&
+			(left.StorageEffectsExcludedHash == (ValueHash{}) || left.StorageEffectsExcludedHash == right.StorageEffectsExcludedHash)
+	}
+	return left.FreezeHash == (ValueHash{}) && right.FreezeHash == (ValueHash{}) &&
+		left.StorageEffectsExcludedHash == (ValueHash{}) && right.StorageEffectsExcludedHash == (ValueHash{})
+}
+
+func cloneEngineRemoval(removal *EngineRemoval) *EngineRemoval {
+	if removal == nil {
+		return nil
+	}
+	copy := *removal
+	copy.Target = cloneCluster(removal.Target)
+	return &copy
 }
 
 // abortRevisionLocked returns zero only when no abort revision exists. A
@@ -127,31 +254,41 @@ func (c *Core) abortRevisionLocked() (Slot, error) {
 // FinishReconfiguration fills the bounded old-configuration drain and commits
 // its terminal record. It never changes membership before that record is durable.
 func (c *Core) FinishReconfiguration(ctx context.Context) error {
-	return c.finishReconfiguration(ctx, false, nil, nil)
+	return c.finishReconfiguration(ctx, false, nil, nil, nil)
 }
 
 // FinishReconfigurationAt commits a terminal only for the frozen target and
 // abort revision that the caller previously recorded. Zero means no prior
 // abort revision.
 func (c *Core) FinishReconfigurationAt(ctx context.Context, target Cluster, expectedAbortSlot Slot) error {
-	return c.finishReconfiguration(ctx, false, &target, &expectedAbortSlot)
+	return c.finishReconfiguration(ctx, false, &target, &expectedAbortSlot, nil)
+}
+
+// FinishEngineOwnedRemovalAt records the removal terminal only when its
+// StorageEffectsExcluded hash is bound to the exact frozen operation. Every
+// terminal recorder independently validates that proof through admission.
+func (c *Core) FinishEngineOwnedRemovalAt(ctx context.Context, operation EngineRemoval) error {
+	if operation.FreezeHash == (ValueHash{}) || operation.StorageEffectsExcludedHash == (ValueHash{}) {
+		return fmt.Errorf("engine-owned removal requires the decided freeze and storage exclusion hashes")
+	}
+	return c.finishReconfiguration(ctx, false, &operation.Target, &operation.ExpectedAbortSlot, &operation)
 }
 
 // AbortReconfiguration certifies the frozen terminal under the old voter
 // quorum without activating an added learner. It is only available for a
 // pending addition; the original learner identity remains untouched.
 func (c *Core) AbortReconfiguration(ctx context.Context) error {
-	return c.finishReconfiguration(ctx, true, nil, nil)
+	return c.finishReconfiguration(ctx, true, nil, nil, nil)
 }
 
 // AbortReconfigurationAt certifies an abort only for the frozen target and
 // abort revision that the caller previously recorded. It rejects a stale
 // management round before draining or proposing a terminal control.
 func (c *Core) AbortReconfigurationAt(ctx context.Context, target Cluster, expectedAbortSlot Slot) error {
-	return c.finishReconfiguration(ctx, true, &target, &expectedAbortSlot)
+	return c.finishReconfiguration(ctx, true, &target, &expectedAbortSlot, nil)
 }
 
-func (c *Core) finishReconfiguration(ctx context.Context, abort bool, expectedTarget *Cluster, expectedAbortSlot *Slot) error {
+func (c *Core) finishReconfiguration(ctx context.Context, abort bool, expectedTarget *Cluster, expectedAbortSlot *Slot, engineRemoval *EngineRemoval) error {
 	if !c.reconfigEnabled || c.observer {
 		return ErrQuorumUnavailable
 	}
@@ -183,6 +320,20 @@ func (c *Core) finishReconfiguration(ctx context.Context, abort bool, expectedTa
 		c.mu.RUnlock()
 		c.releasePipeline()
 		return fmt.Errorf("reconfiguration target no longer matches the requested round")
+	}
+	if state != nil {
+		if state.engineRemoval != nil {
+			if abort || engineRemoval == nil || !sameEngineRemoval(*state.engineRemoval, *engineRemoval, true) ||
+				engineRemoval.FreezeHash != state.id || engineRemoval.StorageEffectsExcludedHash == (ValueHash{}) {
+				c.mu.RUnlock()
+				c.releasePipeline()
+				return fmt.Errorf("engine-owned removal terminal does not match the frozen operation and storage proof")
+			}
+		} else if engineRemoval != nil {
+			c.mu.RUnlock()
+			c.releasePipeline()
+			return fmt.Errorf("engine-owned removal operation is not frozen")
+		}
 	}
 	c.mu.RUnlock()
 	if state == nil {
@@ -230,7 +381,7 @@ func (c *Core) finishReconfiguration(ctx context.Context, abort bool, expectedTa
 	if !ok {
 		return fmt.Errorf("reconfiguration drain prefix is unavailable")
 	}
-	value, err := encodeReconfiguration(reconfigurationValue{Terminal: true, Abort: abort, Freeze: state.freeze, TerminalSlot: state.terminal, Target: cloneCluster(state.target), PrefixHash: prefix})
+	value, err := encodeReconfiguration(reconfigurationValue{Terminal: true, Abort: abort, Freeze: state.freeze, TerminalSlot: state.terminal, Target: cloneCluster(state.target), PrefixHash: prefix, EngineRemoval: cloneEngineRemoval(engineRemoval)})
 	if err != nil {
 		return err
 	}
@@ -360,16 +511,39 @@ func (c *Core) applyReconfigurationLocked(decision Decision) error {
 		if err := validateReconfigurationTarget(c.clusterForSlotLocked(decision.Slot), control.Target, c.retiredIDs); err != nil {
 			return err
 		}
+		current := c.clusterForSlotLocked(decision.Slot)
+		if control.EngineRemoval != nil {
+			removed, err := engineRemovedMember(current, control.Target)
+			abortSlot, abortErr := c.abortRevisionLocked()
+			if !c.engineOwnedRemovals || err != nil || control.EngineRemoval.Freeze != control.Freeze ||
+				control.EngineRemoval.ExpectedConfigID != current.ConfigID || control.EngineRemoval.Removed != removed ||
+				abortErr != nil || control.EngineRemoval.ExpectedAbortSlot != abortSlot {
+				return fmt.Errorf("invalid engine-owned removal freeze binding")
+			}
+		}
 		safe := make(map[NodeID]struct{}, len(decision.Summaries))
 		for _, summary := range decision.Summaries {
 			safe[summary.RecorderID] = struct{}{}
 		}
-		c.reconfiguration = &reconfigurationState{freeze: control.Freeze, terminal: control.TerminalSlot, id: decision.Proposal.Hash, freezePrefix: control.PrefixHash, target: cloneCluster(control.Target), safe: safe}
+		if control.EngineRemoval != nil {
+			if _, included := safe[control.EngineRemoval.Removed.ID]; included || len(safe) < current.QuorumSize() {
+				return fmt.Errorf("engine-owned removal freeze was not recorded by an original quorum excluding the removed voter")
+			}
+		}
+		c.reconfiguration = &reconfigurationState{freeze: control.Freeze, terminal: control.TerminalSlot, id: decision.Proposal.Hash, freezePrefix: control.PrefixHash, target: cloneCluster(control.Target), safe: safe, engineRemoval: cloneEngineRemoval(control.EngineRemoval)}
 		return nil
 	}
 	state := c.reconfiguration
 	if state == nil || decision.Slot != state.terminal || control.Freeze != state.freeze || control.TerminalSlot != state.terminal || control.PrefixHash != c.prefixes[c.tip] || !sameCluster(control.Target, state.target) || c.tip+1 != decision.Slot {
 		return fmt.Errorf("invalid reconfiguration terminal")
+	}
+	if state.engineRemoval != nil {
+		if control.Abort || control.EngineRemoval == nil || !sameEngineRemoval(*state.engineRemoval, *control.EngineRemoval, true) ||
+			control.EngineRemoval.FreezeHash != state.id || control.EngineRemoval.StorageEffectsExcludedHash == (ValueHash{}) {
+			return fmt.Errorf("invalid engine-owned removal terminal binding")
+		}
+	} else if control.EngineRemoval != nil {
+		return fmt.Errorf("engine-owned removal terminal has no matching freeze")
 	}
 	for _, summary := range decision.Summaries {
 		if summary.ReconfigurationID != state.id {

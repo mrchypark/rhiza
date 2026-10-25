@@ -142,18 +142,18 @@ class TestStorageFailureInReconcile(unittest.TestCase):
         chaos.k = fake_k
         chaos.get = lambda k, n: (
             {"metadata": {"uid": "sts-uid"}} if k == "statefulset"
-            else {"spec": {"selector": {"matchLabels": {"app": "rhiza-minio"}}},
-                  "metadata": {"name": "rhiza-minio", "uid": "mu"},
+            else {"spec": {"selector": {"matchLabels": {"app": "rhiza-versitygw"}}},
+                  "metadata": {"name": "rhiza-versitygw", "uid": "mu"},
                   "status": {"containerStatuses": []}})
         chaos.command = lambda a, d=None: json.dumps({"containers": []})
         chaos.runtime_gone = lambda uid: True
 
         fencer = KindFencer(chaos)
         fencer.enabled = True
-        with patch.object(fencer, "_verify_webhook_dryrun"),              patch("kind_fencer.KILL_TIMEOUT", 0.01),              patch("kind_fencer.MINIO_TIMEOUT", 0.01):
+        with patch.object(fencer, "_verify_webhook_dryrun"),              patch("kind_fencer.KILL_TIMEOUT", 0.01),              patch("kind_fencer.VERSITYGW_TIMEOUT", 0.01):
             with self.assertRaises(AssertionError) as cm:
                 fencer._reconcile_cr(CR)
-        self.assertIn("no MinIO", str(cm.exception))
+        self.assertIn("no Versity Gateway", str(cm.exception))
         barrier = fencer._barriers.get("op1")
         self.assertIsNotNone(barrier)
         self.assertIsNone(barrier.get("proof"))

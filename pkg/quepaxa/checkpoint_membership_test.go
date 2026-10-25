@@ -24,7 +24,7 @@ func checkpointMembershipSource(t *testing.T) (*Core, string, Cluster, Checkpoin
 		}
 		core := newCore(member.ID, &initial, wal, transport)
 		core.reconfigEnabled = true
-		core.reconfigAdmission = func(context.Context, Cluster, Slot, [32]byte) error { return nil }
+		core.reconfigAdmission = func(context.Context, ReconfigurationAdmission) error { return nil }
 		cores[member.ID] = core
 		transport.cores[member.ID] = core
 	}

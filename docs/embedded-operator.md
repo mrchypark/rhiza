@@ -198,6 +198,23 @@ NetworkPolicy로 Operator에서의 접근을 허용한다. HTTP이므로 신뢰�
 namespace를 맞춘다. Operator의 `rhiza-config`, `rhiza-object-store` 참조도
 애플리케이션과 동일한 저장소를 가리키도록 설정한다.
 
+### Pod 복구와 재해 복구의 역할 경계
+
+quorum이 유지되는 동안의 일반 voter Pod 교체는 Rhiza 엔진이 membership 변경과
+새 voter 활성화를 소유한다. Operator의 자동 복구는 quorum 상실로 기존 세대에서
+진행할 수 없는 재해 복구 경로다. 엔진 소유 REMOVE 경로는
+`RHIZA_ENABLE_RECONFIGURATION=true`이고 인증된 supervisor가 `RHIZA_FENCE_SOCKET`을
+제공하는 경우에 활성화된다. 이 설정은 별도의 공개 환경 변수가 아니다.
+Kubernetes fencer는 제한된 authority로 계속 사용되며, 이 경계가 fencer 권한을
+넓히지는 않는다.
+
+이 배포 경로는 no-PVC를 사용한다. PVC가 없거나 이전 Pod가 보이지 않는다는 사실은
+이전 프로세스의 물리적 종료 증거가 아니다. 이전 identity의 저장소 효과를 차단하고
+검증하는 계약과 프로세스가 실제로 죽었다는 증거는 구분한다. 현재 ordinary
+replacement 검증 범위는 3-voter GCS before-ACK 경로로 제한되며, 실제 Kubernetes
+런타임 qualification은 아직 완료되지 않았다. 다른 저장소나 장애 조합까지
+검증되었다고 해석하지 않는다.
+
 GitHub Release 발행 시 Operator 이미지를
 `ghcr.io/mrchypark/rhiza-operator:v0.14.1`처럼 릴리즈 태그로 게시한다.
 정식 릴리즈는 `latest`도 갱신하며 prerelease는 버전 태그만 게시한다.

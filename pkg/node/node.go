@@ -98,6 +98,7 @@ type Node struct {
 	terminalResult            TerminalDrainResult
 	terminalErr               error
 	fenceSession              *fencing.Session
+	recoveryWALIdentity       string
 }
 
 // nodeRecoveryPhases records the selected certified checkpoint restore path.
@@ -162,6 +163,9 @@ func validateReadAdmissionConfig(config *types.ExecutionConfig) error {
 // validateVoterMembership mirrors Core's fixed-membership checks before
 // offline enrollment can write a remote registration.
 func validateVoterMembership(config *types.ExecutionConfig) error {
+	if config.EngineOwnedRemovals && (!config.EnableReconfiguration || config.Local || len(config.Members) < 2) {
+		return fmt.Errorf("engine-owned removals require multi-voter non-Local reconfiguration")
+	}
 	if config.EnableReconfiguration && (len(config.Members) < 2 || config.AdminToken == "") {
 		return fmt.Errorf("managed membership requires bootstrap voters and an admin token")
 	}
@@ -309,6 +313,11 @@ func (n *Node) open(ctx context.Context, enroll bool) (err error) {
 	if err := n.connectFenceSession(ctx); err != nil {
 		return err
 	}
+	if n.fenceSession != nil {
+		if err := n.applyFenceStartupEnvironment(); err != nil {
+			return err
+		}
+	}
 	if n.fenceSession != nil && n.fenceSession.StartupRole() == fencing.StartupRoleLearnerPendingRemove &&
 		(n.config.Learner == nil || n.config.Learner.ID != n.config.NodeID || len(n.config.Members) < 2) {
 		return fmt.Errorf("fencing: pending-removal startup requires an explicit nonvoting learner configuration")
@@ -330,6 +339,10 @@ func (n *Node) open(ctx context.Context, enroll bool) (err error) {
 	}
 	n.lock = lock
 	localVoter, err := loadVoterIdentity(n.config)
+	localVoter, err = n.prepareEngineRepairLearnerBootstrap(localVoter, err)
+	if err == nil && localVoter.identity == nil && n.recoveryWALIdentity != "" {
+		err = validateVoterMembership(n.config)
+	}
 	if err != nil {
 		return fmt.Errorf("load voter identity: %w", err)
 	}
@@ -491,7 +504,7 @@ func (n *Node) open(ctx context.Context, enroll bool) (err error) {
 			}
 		}
 		assignedRestart := n.fenceSession != nil && n.fenceSession.StartupRole() == fencing.StartupRoleVoterActive && n.fenceSession.Identity().AssignmentID != ""
-		if err := ensureVoterIdentityWithHooks(ctx, n.config, runtimeBucket, n.wal, localVoter, enroll, beforeWrite, pendingIdentityWrite, assignedRestart); err != nil {
+		if err := ensureVoterIdentityWithHooks(ctx, n.config, runtimeBucket, n.wal, localVoter, enroll, beforeWrite, pendingIdentityWrite, assignedRestart, n.recoveryWALIdentity); err != nil {
 			return fmt.Errorf("ensure voter identity: %w", err)
 		}
 		if n.fenceSession != nil && n.fenceSession.Identity().WALIdentity == "" {
@@ -595,6 +608,7 @@ func (n *Node) open(ctx context.Context, enroll bool) (err error) {
 	core, err := makeCore(quepaxa.Config{
 		NodeID: n.config.NodeID, Cluster: *cluster, WAL: wal, Transport: coreTransport, LocalMode: n.config.Local,
 		EnableReconfiguration:    n.config.EnableReconfiguration,
+		EngineOwnedRemovals:      n.config.EngineOwnedRemovals,
 		ReconfigurationAdmission: n.verifyMembershipAdmission,
 	})
 	if err != nil {
@@ -705,6 +719,9 @@ func (n *Node) open(ctx context.Context, enroll bool) (err error) {
 	// Record RPCs must be available while every replica is recovering. Public
 	// proposals and learned decisions remain gated by ready=false.
 	server := network.NewServer(core, material, n.config.ClusterID, true, transport, n.apiReady)
+	if n.config.EngineOwnedRemovals && n.config.Learner != nil && n.fenceSession != nil {
+		server.SetPeerLearnReady(n.peerLearnReady)
+	}
 	server.SetTerminalDrain(func(ctx context.Context, expected network.TerminalDrainRequest) (any, error) {
 		return n.TerminalDrain(ctx, expected)
 	})
@@ -1114,6 +1131,7 @@ func (n *Node) open(ctx context.Context, enroll bool) (err error) {
 		}()
 	}
 	n.startFenceWatcher(ctx)
+	n.startEngineRepairRunner(ctx)
 	return nil
 }
 
@@ -1866,9 +1884,9 @@ func (n *Node) API() (*network.Server, error) {
 	return n.server, nil
 }
 
-// Ready reports whether local startup recovery and catch-up have completed.
-// It does not prove current quorum availability.
-func (n *Node) Ready() bool { return n.ready.Load() }
+// Ready reports public serving readiness, including supervised candidate
+// activation. It does not prove current quorum availability.
+func (n *Node) Ready() bool { return n.apiReady() }
 
 func quarantineSQLite(path string) error {
 	if _, err := os.Stat(path); os.IsNotExist(err) {
@@ -1928,6 +1946,28 @@ func (n *Node) catchUpMembership(ctx context.Context, transport *network.Transpo
 	if n.config.Learner == nil || n.core.IsVoter() {
 		return n.catchUpQuorum(ctx, transport, cluster)
 	}
+	peerErr := n.catchUpLearnerPeers(ctx, transport, cluster)
+	if peerErr == nil || !n.config.EnableReconfiguration || n.archive == nil {
+		return peerErr
+	}
+	// A stale learner configuration can be rejected before the peer returns
+	// any decisions, so peer catch-up alone cannot reveal the transition. Read
+	// the existing certified archive once per worker pass, then retry against
+	// the configuration it authenticated and applied.
+	if err := n.catchUpArchive(ctx); err != nil {
+		return fmt.Errorf("refresh learner membership from shared archive: %w", err)
+	}
+	current := n.core.CurrentCluster()
+	if current.ConfigID == cluster.ConfigID {
+		return peerErr
+	}
+	if n.core.IsVoter() {
+		return n.catchUpQuorum(ctx, transport, &current)
+	}
+	return n.catchUpLearnerPeers(ctx, transport, &current)
+}
+
+func (n *Node) catchUpLearnerPeers(ctx context.Context, transport *network.Transport, cluster *quepaxa.Cluster) error {
 	var last error = quepaxa.ErrQuorumUnavailable
 	for _, member := range cluster.Members {
 		if member.ID == n.core.NodeID() {
@@ -2050,10 +2090,25 @@ func (n *Node) observeCatchUp(err error) {
 }
 
 func (n *Node) apiReady() bool {
-	if !n.ready.Load() {
+	if n == nil || !n.ready.Load() || n.supervisedEngineRepairCandidatePending() {
 		return false
 	}
 	return n.fenceSession == nil || n.fenceSession.StartupRole() != fencing.StartupRoleVoterActive || n.fenceWriterActive.Load()
+}
+
+func (n *Node) supervisedEngineRepairCandidatePending() bool {
+	return n != nil && n.config != nil && n.config.EngineOwnedRemovals && n.config.Learner != nil && n.fenceSession != nil &&
+		n.fenceSession.StartupRole() == fencing.StartupRoleLearnerPendingRemove
+}
+
+func (n *Node) peerLearnReady() bool {
+	if n == nil || n.terminalRequested.Load() {
+		return false
+	}
+	if n.supervisedEngineRepairCandidatePending() {
+		return true
+	}
+	return n.apiReady()
 }
 
 func hasUsablePeerSuffix(applied quepaxa.Slot, successes, quorum int, best *network.DecisionsResponse) bool {

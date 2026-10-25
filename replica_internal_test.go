@@ -210,6 +210,9 @@ func TestLearnerPreservesPeerPolicyError(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer running.Close()
+	if status := running.Status(); status.Source != "peer:n1" {
+		t.Fatalf("fixed-membership learner did not sync through its pinned peer identity: %+v", status)
+	}
 	legacy, err := os.ReadFile("pkg/materializer/testdata/sql-policy-legacy/slot2.bin")
 	if err != nil {
 		t.Fatal(err)

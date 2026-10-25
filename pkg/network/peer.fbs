@@ -10,7 +10,8 @@ enum Operation:ubyte {
   StageValue = 6,
   FetchValue = 7,
   PrepareCheckpoint = 8,
-  VerifyPrefix = 9
+  VerifyPrefix = 9,
+  EngineRemovalFreeze = 10
 }
 
 table Proposal {

@@ -64,7 +64,7 @@ func TestManagedReadBarrierTracksCommittedCorePromotion(t *testing.T) {
 	defer sourceWAL.Close()
 	source, err := quepaxa.New(quepaxa.Config{
 		NodeID: "source", Cluster: initial, WAL: sourceWAL, EnableReconfiguration: true,
-		ReconfigurationAdmission: func(context.Context, quepaxa.Cluster, quepaxa.Slot, [32]byte) error { return nil },
+		ReconfigurationAdmission: func(context.Context, quepaxa.ReconfigurationAdmission) error { return nil },
 	})
 	if err != nil {
 		t.Fatal(err)

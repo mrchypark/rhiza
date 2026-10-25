@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"net/url"
+	"strings"
 
 	"github.com/mrchypark/rhiza/pkg/fencing"
 )
@@ -28,9 +29,27 @@ func (e *FencingExecutor) promoteSupervisorLearner(ctx context.Context, uid stri
 	if roleBeforeRetry != fencing.StartupRoleLearnerPendingRemove && !resumingPromotion {
 		return fencing.BindReceipt{}, fencing.ErrClosed
 	}
-	role, err := e.resolveStartupRole(ctx, uid, id)
-	if err != nil || role != fencing.StartupRoleVoterActive {
-		return fencing.BindReceipt{}, errors.Join(fencing.ErrPending, err)
+	repair, repairRef, repairKey, engineOwned, err := e.currentEngineRepairCandidate(ctx, uid, id)
+	if err != nil {
+		return fencing.BindReceipt{}, err
+	}
+	if run.EngineRepairProvenance != nil && !engineOwned {
+		// Engine-repair enrollment provenance is an authority-owned classifier.
+		// A missing root reference cannot turn that Run into a generic learner.
+		return fencing.BindReceipt{}, fencing.ErrClosed
+	}
+	if engineOwned {
+		if repair.Phase != fencing.RepairAdding && repair.Phase != fencing.RepairActive {
+			return fencing.BindReceipt{}, fencing.ErrClosed
+		}
+		if repair.Phase == fencing.RepairActive && !resumingPromotion {
+			return fencing.BindReceipt{}, fencing.ErrClosed
+		}
+	} else {
+		role, roleErr := e.resolveStartupRole(ctx, uid, id)
+		if roleErr != nil || role != fencing.StartupRoleVoterActive {
+			return fencing.BindReceipt{}, errors.Join(fencing.ErrPending, roleErr)
+		}
 	}
 	proofHash, err := e.verifiedLearnerPromotionHash(ctx, uid, id)
 	if err != nil {
@@ -40,6 +59,11 @@ func (e *FencingExecutor) promoteSupervisorLearner(ctx context.Context, uid stri
 		return fencing.BindReceipt{}, fencing.ErrClosed
 	}
 	if _, err := e.change(ctx, uid, id.SourceClusterID, func(l *fencing.Ledger) error {
+		if engineOwned {
+			if err := validateEngineRepairCandidateCAS(l, repair, repairRef, repairKey, id, *run.Runtime, engineRepairPromotionCAS, proofHash); err != nil {
+				return err
+			}
+		}
 		return l.PromoteLearner(id, proofHash.operationID, proofHash.digest)
 	}); err != nil {
 		return fencing.BindReceipt{}, err
@@ -75,6 +99,39 @@ func (e *FencingExecutor) finishPromotedSupervisorLearner(ctx context.Context, u
 type learnerPromotionHash struct{ operationID, digest string }
 
 func (e *FencingExecutor) verifiedLearnerPromotionHash(ctx context.Context, uid string, id fencing.Identity) (learnerPromotionHash, error) {
+	if repair, _, _, found, err := e.currentEngineRepairCandidate(ctx, uid, id); err != nil {
+		return learnerPromotionHash{}, err
+	} else if found {
+		if repair.Phase == fencing.RepairActive && repair.CurrentCandidateIdentity() != id && sameEngineRepairCandidateRun(repair.CurrentCandidateIdentity(), id) {
+			state, readErr := e.read(ctx, uid, id.SourceClusterID)
+			if readErr != nil {
+				return learnerPromotionHash{}, readErr
+			}
+			run, ok := state.Ledger.Runs[id.RunID]
+			if !ok || run.Identity != id || run.Runtime == nil || run.Promotion == nil ||
+				run.Promotion.OperationID != engineRepairAddOperationID(repair.Binding.OperationID) || !validEvidenceDigest(run.Promotion.EvidenceHash) {
+				return learnerPromotionHash{}, fencing.ErrClosed
+			}
+			if err := e.verifyEngineRepairActiveRestartCurrent(ctx, uid, repair, id, *run.Runtime); err != nil {
+				return learnerPromotionHash{}, err
+			}
+			return learnerPromotionHash{operationID: run.Promotion.OperationID, digest: run.Promotion.EvidenceHash}, nil
+		}
+		candidateRuntime := repair.CurrentCandidateRuntime()
+		if (repair.Phase != fencing.RepairAdding && repair.Phase != fencing.RepairActive) || candidateRuntime == nil || candidateRuntime.Validate(id) != nil || !engineRepairRuntimeMatches(repair, *candidateRuntime) {
+			return learnerPromotionHash{}, fmt.Errorf("fencing: engine repair candidate runtime differs from its canonical enrollment")
+		}
+		return e.engineRepairCandidateActivationEvidence(ctx, *candidateRuntime, repair)
+	}
+	state, err := e.read(ctx, uid, id.SourceClusterID)
+	if err != nil {
+		return learnerPromotionHash{}, err
+	}
+	if run, ok := state.Ledger.Runs[id.RunID]; ok {
+		if run.EngineRepairProvenance != nil || run.Promotion != nil && strings.HasPrefix(run.Promotion.OperationID, "engine-repair-add-") {
+			return learnerPromotionHash{}, fencing.ErrClosed
+		}
+	}
 	role, err := e.resolveStartupRole(ctx, uid, id)
 	if err != nil || role != fencing.StartupRoleVoterActive {
 		return learnerPromotionHash{}, errors.Join(fencing.ErrPending, err)
@@ -113,20 +170,20 @@ func (e *FencingExecutor) verifiedLearnerPromotionHash(ctx context.Context, uid 
 		return learnerPromotionHash{}, fmt.Errorf("fencing: automatic learner root is unavailable")
 	}
 	c := &Controller{Kube: e.Kube, Bucket: e.ArchiveBucket, Prefix: e.AutomaticControlPrefix}
-	state, _, err := c.loadAuto(ctx, c.autoKey(root))
-	if err != nil || state.Intent == nil || state.Intent.RecoveryName == "" {
+	autoState, _, err := c.loadAuto(ctx, c.autoKey(root))
+	if err != nil || autoState.Intent == nil || autoState.Intent.RecoveryName == "" {
 		return learnerPromotionHash{}, fmt.Errorf("fencing: automatic learner control is unavailable")
 	}
 	var child Resource
-	if err := e.Kube.Get(ctx, c.resourcePath(state.Intent.RecoveryName), &child); err != nil {
+	if err := e.Kube.Get(ctx, c.resourcePath(autoState.Intent.RecoveryName), &child); err != nil {
 		return learnerPromotionHash{}, err
 	}
 	if child.Status.Membership == nil || child.Status.Membership.Add == nil || child.Status.Membership.RemoveRequest == nil {
 		return learnerPromotionHash{}, fencing.ErrPending
 	}
-	return learnerPromotionHash{operationID: state.Intent.Request.OperationID, digest: hashJSON([]any{
-		state.BindingUID, state.BindingHash, state.StatefulSetUID, state.ActiveClusterID,
-		state.Intent.Request, state.Intent.Proof, state.Intent.RecoveryUID, state.Intent.SpecHash,
+	return learnerPromotionHash{operationID: autoState.Intent.Request.OperationID, digest: hashJSON([]any{
+		autoState.BindingUID, autoState.BindingHash, autoState.StatefulSetUID, autoState.ActiveClusterID,
+		autoState.Intent.Request, autoState.Intent.Proof, autoState.Intent.RecoveryUID, autoState.Intent.SpecHash,
 		str(child.Metadata["uid"]), hashJSON(child.Spec), child.Status.Membership,
 		child.Status.TargetIdentities,
 	})}, nil
@@ -156,61 +213,163 @@ func (e *FencingExecutor) bindSupervisorWAL(ctx context.Context, uid string, id 
 		return fencing.BindReceipt{Identity: id, Role: fencing.StartupRoleLearnerPendingRemove}, nil
 	}
 	scopeHash := ""
-	if state.Ledger.RequireMutationJournal {
-		podName := id.PodName
-		if podName == "" {
-			podName = id.NodeID
-		}
-		var pod object
-		if err := e.Kube.Get(ctx, e.controller().corePath("pods", podName), &pod); err != nil {
-			return fencing.BindReceipt{}, err
-		}
-		if str(nested(pod, "metadata", "uid")) != id.PodUID || nested(pod, "metadata", "deletionTimestamp") != nil {
-			return fencing.BindReceipt{}, fmt.Errorf("fencing: bind Pod incarnation differs")
-		}
-		ownerName := ""
-		for _, ref := range list(nested(pod, "metadata", "ownerReferences")) {
-			owner := asObject(ref)
-			if str(owner["kind"]) == "StatefulSet" && str(owner["uid"]) == uid {
-				ownerName = str(owner["name"])
-			}
-		}
-		if ownerName == "" {
-			return fencing.BindReceipt{}, fmt.Errorf("fencing: bind workload owner differs")
-		}
-		var sts object
-		if err := e.Kube.Get(ctx, e.controller().stsPath(ownerName), &sts); err != nil {
-			return fencing.BindReceipt{}, err
-		}
-		if str(nested(sts, "metadata", "uid")) != uid || nested(sts, "metadata", "deletionTimestamp") != nil {
-			return fencing.BindReceipt{}, fmt.Errorf("fencing: bind workload incarnation differs")
-		}
-		scope, err := e.storageScope(ctx, sts, id.SourceClusterID)
-		if err != nil {
-			return fencing.BindReceipt{}, err
-		}
-		// Compare actual Pod configuration too; a changed template cannot silently
-		// redirect a still-running source incarnation to a different store.
-		podView := object{"spec": object{"template": object{"spec": pod["spec"]}}}
-		podScope, err := e.storageScope(ctx, podView, id.SourceClusterID)
-		if err != nil || podScope != scope || scope.Provider != "gcs" {
-			return fencing.BindReceipt{}, fmt.Errorf("fencing: source/profile storage scope differs")
-		}
-		scopeHash = hashJSON(scope)
-	}
 	stageIncarnation := ""
 	if state.Ledger.RequireMutationJournal {
+		var err error
 		run := state.Ledger.Runs[id.RunID]
 		if run.Runtime == nil {
 			return fencing.BindReceipt{}, fmt.Errorf("fencing: enrolled runtime is missing")
 		}
-		stages, err := e.sourceStagesFor(ctx, *run.Runtime)
+		scopeHash, stageIncarnation, err = e.mutationJournalBindingInputs(ctx, uid, id, *run.Runtime)
 		if err != nil {
 			return fencing.BindReceipt{}, err
 		}
-		stageIncarnation = stages.incarnation
 	}
 	return e.bindWALAtScopeWithStage(ctx, uid, id, scopeHash, stageIncarnation)
+}
+
+// mutationJournalBindingInputs derives the immutable storage and stage
+// assignments from the authenticated Pod/StatefulSet and enrolled runtime.
+// The caller persists these values before producer activation.
+func (e *FencingExecutor) mutationJournalBindingInputs(ctx context.Context, uid string, id fencing.Identity, runtime fencing.RuntimeBinding) (string, string, error) {
+	if ctx == nil || e == nil || e.Kube == nil || uid == "" || id.SourceClusterID == "" || id.PodUID == "" || id.WALIdentity == "" {
+		return "", "", fmt.Errorf("fencing: mutation binding identity is incomplete")
+	}
+	if runtime.StatefulSetUID != uid || runtime.Validate(id) != nil {
+		return "", "", fmt.Errorf("fencing: mutation binding runtime differs from the exact active identity")
+	}
+	podName := id.PodName
+	if podName == "" {
+		podName = id.NodeID
+	}
+	var pod object
+	if err := e.Kube.Get(ctx, e.controller().corePath("pods", podName), &pod); err != nil {
+		return "", "", err
+	}
+	if str(nested(pod, "metadata", "uid")) != id.PodUID || nested(pod, "metadata", "deletionTimestamp") != nil {
+		return "", "", fmt.Errorf("fencing: bind Pod incarnation differs")
+	}
+	ownerName := ""
+	for _, ref := range list(nested(pod, "metadata", "ownerReferences")) {
+		owner := asObject(ref)
+		if str(owner["kind"]) == "StatefulSet" && str(owner["uid"]) == uid {
+			if ownerName != "" {
+				return "", "", fmt.Errorf("fencing: bind workload owner is ambiguous")
+			}
+			ownerName = str(owner["name"])
+		}
+	}
+	if ownerName == "" {
+		return "", "", fmt.Errorf("fencing: bind workload owner differs")
+	}
+	var sts object
+	if err := e.Kube.Get(ctx, e.controller().stsPath(ownerName), &sts); err != nil {
+		return "", "", err
+	}
+	if str(nested(sts, "metadata", "uid")) != uid || nested(sts, "metadata", "deletionTimestamp") != nil {
+		return "", "", fmt.Errorf("fencing: bind workload incarnation differs")
+	}
+	scope, err := e.storageScope(ctx, sts, id.SourceClusterID)
+	if err != nil {
+		return "", "", err
+	}
+	// Compare actual Pod configuration too; a changed template cannot silently
+	// redirect a still-running source incarnation to a different store.
+	podView := object{"spec": object{"template": object{"spec": pod["spec"]}}}
+	podScope, err := e.storageScope(ctx, podView, id.SourceClusterID)
+	if err != nil || podScope != scope || scope.Provider != "gcs" {
+		return "", "", fmt.Errorf("fencing: source/profile storage scope differs")
+	}
+	stages, err := e.sourceStagesFor(ctx, runtime)
+	if err != nil {
+		return "", "", err
+	}
+	return hashJSON(scope), stages.incarnation, nil
+}
+
+// pinMutationJournalBeforeGrant reserves the exact producer and binds the
+// root's storage, profile, stage, and known WAL before an active restart grant
+// is returned. The producer remains Reserved; only the later child WAL bind
+// activates admission.
+func (e *FencingExecutor) pinMutationJournalBeforeGrant(ctx context.Context, uid string, id fencing.Identity, runtime fencing.RuntimeBinding) error {
+	current, err := e.read(ctx, uid, id.SourceClusterID)
+	if err != nil {
+		return err
+	}
+	if err := e.validateMutationJournalProfile(current); err != nil {
+		return err
+	}
+	if !current.Ledger.RequireMutationJournal {
+		return nil
+	}
+	run, ok := current.Ledger.Runs[id.RunID]
+	if !ok || run.Identity != id || run.Runtime == nil || *run.Runtime != runtime ||
+		run.Promotion == nil || run.EngineRepairProvenance == nil || run.Stop != nil || current.Ledger.ClosedBy != "" {
+		return fencing.ErrClosed
+	}
+	if _, closed := current.Ledger.ClosedNodes[id.NodeID]; closed {
+		return fencing.ErrClosed
+	}
+	scopeHash, stageIncarnation, err := e.mutationJournalBindingInputs(ctx, uid, id, runtime)
+	if err != nil {
+		return err
+	}
+	if _, err := e.reserveMutationProducer(ctx, runtime); err != nil {
+		return err
+	}
+	if _, err := e.changeMutationProducer(ctx, runtime, func(producer *fencing.MutationProducer) error {
+		return producer.BindWAL(id)
+	}); err != nil {
+		return err
+	}
+	profile := e.sourceMutationProfile()
+	var repair fencing.EngineRepairRecord
+	var repairReference fencing.EngineRepairReference
+	repairKey := ""
+	var repairProof learnerPromotionHash
+	engineOwned := false
+	if run.Promotion != nil {
+		repair, repairReference, repairKey, repairProof, engineOwned, err = e.verifyEngineRepairPromotion(ctx, uid, id, run)
+		if err != nil {
+			return err
+		}
+	}
+	bound, err := e.change(ctx, uid, id.SourceClusterID, func(ledger *fencing.Ledger) error {
+		if engineOwned {
+			if err := validateEngineRepairCandidateCAS(ledger, repair, repairReference, repairKey, id, runtime, engineRepairBindCAS, repairProof); err != nil {
+				return err
+			}
+		}
+		if !ledger.RequireMutationJournal {
+			return fmt.Errorf("fencing: authority root no longer requires mutation journal")
+		}
+		if err := ledger.BindMutationScope(id, scopeHash, profile); err != nil {
+			return err
+		}
+		return ledger.BindMutationStage(id, stageIncarnation)
+	})
+	if err != nil {
+		return err
+	}
+	confirmed, err := e.read(ctx, uid, id.SourceClusterID)
+	if err != nil {
+		return err
+	}
+	confirmedRun, ok := confirmed.Ledger.Runs[id.RunID]
+	boundRun, boundOK := bound.Ledger.Runs[id.RunID]
+	producer, producerUID, _, producerErr := e.AuthorityState.ReadProducer(ctx, runtime)
+	if producerErr != nil {
+		return producerErr
+	}
+	if confirmed.Ledger.ClosedBy != "" || confirmed.Ledger.ClosedHash != "" || !ok || confirmedRun.Identity != id ||
+		confirmedRun.Runtime == nil || *confirmedRun.Runtime != runtime || confirmedRun.MutationProducerUID == "" ||
+		confirmedRun.MutationScopeHash != scopeHash || confirmedRun.MutationProfile != profile ||
+		confirmedRun.MutationStageIncarnation != stageIncarnation || producerUID != confirmedRun.MutationProducerUID ||
+		producer.Runtime != runtime || producer.WALIdentity != id.WALIdentity || producer.Phase != fencing.MutationReserved ||
+		producer.LastAdmitted != 0 || len(producer.Entries) != 0 || !boundOK || boundRun.Identity != id {
+		return fmt.Errorf("fencing: active restart producer binding was not durably pinned before grant")
+	}
+	return nil
 }
 
 // scopeHash is derived only by the authenticated server from the owned workload,
@@ -237,7 +396,32 @@ func (e *FencingExecutor) bindWALAtScopeWithStage(ctx context.Context, uid strin
 		}
 		profile = existing.MutationProfile
 	}
+	var repair fencing.EngineRepairRecord
+	var repairReference fencing.EngineRepairReference
+	repairKey := ""
+	var repairProof learnerPromotionHash
+	engineOwned := false
+	if run, ok := currentRoot.Ledger.Runs[id.RunID]; ok && run.Promotion != nil {
+		var verifyErr error
+		repair, repairReference, repairKey, repairProof, engineOwned, verifyErr = e.verifyEngineRepairPromotion(ctx, uid, id, run)
+		if verifyErr != nil {
+			return fencing.BindReceipt{}, verifyErr
+		}
+	}
 	state, err := e.change(ctx, uid, id.SourceClusterID, func(l *fencing.Ledger) error {
+		if engineOwned {
+			candidateRun, ok := l.Runs[id.RunID]
+			if !ok || candidateRun.Runtime == nil {
+				return fencing.ErrClosed
+			}
+			// Active restarts preserve the immutable original candidate runtime in
+			// the repair record. Bind authorization must use the current Run's
+			// runtime from this CAS snapshot, which the current root reference and
+			// Run provenance pin to the new incarnation.
+			if err := validateEngineRepairCandidateCAS(l, repair, repairReference, repairKey, id, *candidateRun.Runtime, engineRepairBindCAS, repairProof); err != nil {
+				return err
+			}
+		}
 		if e.RequireMutationJournal && !l.RequireMutationJournal {
 			return fmt.Errorf("fencing: authority root does not require mutation journal")
 		}

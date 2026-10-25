@@ -2,16 +2,21 @@ package node
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"log"
 	"net"
 	"os"
+	"strings"
 	"time"
 
 	objectstore "github.com/mrchypark/rhiza/internal/objstore"
+	"github.com/mrchypark/rhiza/internal/types"
 	"github.com/mrchypark/rhiza/pkg/fencing"
 	"github.com/mrchypark/rhiza/pkg/network"
+	"github.com/mrchypark/rhiza/pkg/quepaxa"
 	"github.com/mrchypark/rhiza/pkg/recovery"
 )
 
@@ -31,6 +36,60 @@ func (n *Node) connectFenceSession(ctx context.Context) error {
 		return fmt.Errorf("connect fencing startup gate: %w", err)
 	}
 	n.fenceSession = session
+	return nil
+}
+
+func (n *Node) applyFenceStartupEnvironment() error {
+	if n == nil || n.config == nil || n.fenceSession == nil {
+		return fmt.Errorf("fencing: authenticated startup configuration is unavailable")
+	}
+	identity := n.fenceSession.Identity()
+	if identity.SourceClusterID != string(n.config.ClusterID) {
+		return fmt.Errorf("fencing: startup grant source cluster differs from child configuration")
+	}
+	environment := n.fenceSession.StartupEnvironment()
+	if logicalID := environment["RHIZA_NODE_ID"]; logicalID != "" && logicalID != identity.NodeID {
+		return fmt.Errorf("fencing: startup grant environment differs from its assigned identity")
+	}
+	if membersJSON := environment["RHIZA_CLUSTER_MEMBERS"]; membersJSON != "" {
+		var members []types.NodeConfig
+		if err := decodeFenceStartupJSON(membersJSON, &members); err != nil || len(members) < 2 {
+			return fmt.Errorf("fencing: startup grant contains invalid voter membership")
+		}
+		n.config.Members = members
+	}
+	if token := environment["RHIZA_PEER_TOKEN"]; token != "" {
+		n.config.PeerToken = token
+	}
+	if n.fenceSession.StartupRole() == fencing.StartupRoleLearnerPendingRemove {
+		learnerJSON := environment["RHIZA_LEARNER"]
+		var learner quepaxa.Member
+		if learnerJSON == "" || decodeFenceStartupJSON(learnerJSON, &learner) != nil || learner.ID != quepaxa.NodeID(identity.NodeID) || learner.PublicKey == (quepaxa.PublicKey{}) {
+			return fmt.Errorf("fencing: pending learner grant contains invalid candidate membership")
+		}
+		n.config.Learner = &learner
+	} else {
+		n.config.Learner = nil
+	}
+	if identity.NodeID == "" {
+		return fmt.Errorf("fencing: startup grant has no logical identity")
+	}
+	n.config.NodeID = types.NodeID(identity.NodeID)
+	if err := validateVoterMembership(n.config); err != nil {
+		return fmt.Errorf("fencing: authority-pinned startup membership is invalid: %w", err)
+	}
+	return nil
+}
+
+func decodeFenceStartupJSON(raw string, target any) error {
+	decoder := json.NewDecoder(strings.NewReader(raw))
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(target); err != nil {
+		return err
+	}
+	if err := decoder.Decode(new(any)); err != io.EOF {
+		return fmt.Errorf("fencing: startup configuration has trailing JSON")
+	}
 	return nil
 }
 

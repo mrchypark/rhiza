@@ -450,9 +450,74 @@ func (e *FencingExecutor) handle(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "supervisor identity rejected", http.StatusForbidden)
 		return
 	}
-	if message.Action == "register" && (message.Drain != nil || message.Request != nil || message.MutationLookup != nil || message.ArchiveGenesis != nil || message.LearnerIdentity != nil) {
+	if message.PreflightProposal != nil && message.Action != "engine-repair-preflight" {
+		http.Error(w, "unexpected engine repair preflight payload", http.StatusBadRequest)
+		return
+	}
+	if message.Action == "engine-repair-preflight" {
+		if message.PreflightProposal == nil || message.EngineRepair != nil || message.Drain != nil ||
+			message.Request != nil || message.MutationLookup != nil || message.ArchiveGenesis != nil || message.LearnerIdentity != nil {
+			http.Error(w, "malformed engine repair preflight", http.StatusBadRequest)
+			return
+		}
+		if err := e.createPendingEngineRepairPreflight(r.Context(), uid, message.Identity, *message.PreflightProposal); err != nil {
+			writeEngineRepairStartupError(w, err)
+			return
+		}
+		w.WriteHeader(http.StatusOK)
+		return
+	}
+	if message.Action == "register" && (message.Drain != nil || message.Request != nil || message.MutationLookup != nil || message.ArchiveGenesis != nil || message.LearnerIdentity != nil || message.PreflightProposal != nil) {
 		http.Error(w, "malformed registration", http.StatusBadRequest)
 		return
+	}
+	if strings.HasPrefix(message.Action, "engine-repair-") {
+		if message.EngineRepair == nil || message.PreflightProposal != nil || message.Drain != nil || message.Request != nil || message.MutationLookup != nil || message.ArchiveGenesis != nil || message.LearnerIdentity != nil {
+			http.Error(w, "malformed engine repair request", http.StatusBadRequest)
+			return
+		}
+		response, requestErr := e.engineRepairRunnerRequest(r.Context(), r.Header.Get("Authorization"), uid, message.Identity, *message.EngineRepair, message.Action)
+		if requestErr != nil {
+			if transientFenceAuthority(requestErr) {
+				http.Error(w, "engine repair authority unavailable", http.StatusServiceUnavailable)
+			} else if errors.Is(requestErr, fencing.ErrPending) || errors.Is(requestErr, ErrFencePending) {
+				w.WriteHeader(http.StatusAccepted)
+			} else if errors.Is(requestErr, fencing.ErrClosed) {
+				http.Error(w, "engine repair operation closed", http.StatusGone)
+			} else {
+				http.Error(w, "engine repair request rejected", http.StatusConflict)
+			}
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(response)
+		return
+	}
+	if message.EngineRepair != nil {
+		http.Error(w, "unexpected engine repair request", http.StatusBadRequest)
+		return
+	}
+	var activeRestartGrant *fencing.StartupGrant
+	if message.Action == "register" {
+		grant, assigned, restartErr := e.resolveEngineRepairActiveRestartRegistration(r.Context(), uid, message.Identity)
+		if restartErr != nil {
+			writeEngineRepairStartupError(w, restartErr)
+			return
+		}
+		if assigned {
+			activeRestartGrant = &grant
+		} else {
+			grant, assigned, bootstrapErr := e.resolveEngineRepairBootstrapRegistration(r.Context(), uid, message.Identity)
+			if bootstrapErr != nil {
+				writeEngineRepairStartupError(w, bootstrapErr)
+				return
+			}
+			if assigned {
+				w.Header().Set("Content-Type", "application/json")
+				_ = json.NewEncoder(w).Encode(grant)
+				return
+			}
+		}
 	}
 	registrationStage := ""
 	grantResolved := false
@@ -470,8 +535,12 @@ func (e *FencingExecutor) handle(w http.ResponseWriter, r *http.Request) {
 		registrationStage = startupRegistrationStageGrant
 		err = registerStageError("startup-grant", e.rejectClosedCanonicalStartup(r.Context(), uid, message.Identity.SourceClusterID))
 		if err == nil {
-			startupGrant, err = e.resolveStartupGrant(r.Context(), uid, message.Identity)
-			err = registerStageError("startup-grant", err)
+			if activeRestartGrant != nil {
+				startupGrant = *activeRestartGrant
+			} else {
+				startupGrant, err = e.resolveStartupGrant(r.Context(), uid, message.Identity)
+				err = registerStageError("startup-grant", err)
+			}
 			grantResolved = err == nil
 		}
 	}
@@ -497,7 +566,11 @@ func (e *FencingExecutor) handle(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		if err == nil {
-			err = e.registerPendingLearnerIdentity(r.Context(), uid, message.Identity, *message.LearnerIdentity)
+			var engineOwned bool
+			engineOwned, err = e.registerEngineRepairLearnerIdentity(r.Context(), uid, message.Identity, *message.LearnerIdentity)
+			if err == nil && !engineOwned {
+				err = e.registerPendingLearnerIdentity(r.Context(), uid, message.Identity, *message.LearnerIdentity)
+			}
 		}
 		if errors.Is(err, fencing.ErrPending) || errors.Is(err, ErrFencePending) {
 			w.WriteHeader(http.StatusAccepted)
@@ -532,7 +605,11 @@ func (e *FencingExecutor) handle(w http.ResponseWriter, r *http.Request) {
 	} else if message.MutationLookup != nil {
 		err = fmt.Errorf("fencing: unexpected mutation lookup request")
 	} else if message.Action == "bind" {
-		binding, err = e.bindSupervisorWAL(r.Context(), uid, message.Identity)
+		var engineOwned bool
+		binding, engineOwned, err = e.bindEngineRepairCandidate(r.Context(), uid, message.Identity)
+		if err == nil && !engineOwned {
+			binding, err = e.bindSupervisorWAL(r.Context(), uid, message.Identity)
+		}
 	} else if message.Action == "promote-learner" {
 		if message.Drain != nil || message.Request != nil || message.MutationLookup != nil || message.ArchiveGenesis != nil || message.LearnerIdentity != nil {
 			err = fmt.Errorf("fencing: malformed learner promotion request")
@@ -572,6 +649,9 @@ func (e *FencingExecutor) handle(w http.ResponseWriter, r *http.Request) {
 							return fmt.Errorf("fencing: runtime agent is required for mutation-journal registration")
 						}
 					}
+					if activeRestartGrant != nil {
+						return nil
+					}
 					if enrolled != nil {
 						l.RequireRuntimeBinding = true
 						return registerStageError("ledger-register", l.RegisterEnrolledWithRole(startupGrant.Identity, *enrolled, startupGrant.Role))
@@ -609,6 +689,34 @@ func (e *FencingExecutor) handle(w http.ResponseWriter, r *http.Request) {
 					if err == nil {
 						registrationStage = startupRegistrationStageArchiveScope
 						err = registerStageError("archive-scope", e.claimArchiveScopeForRegistration(r.Context(), uid, startupGrant.Identity, *enrolled))
+					}
+				}
+			}
+		}
+	}
+	if err == nil && message.Action == "register" && activeRestartGrant != nil {
+		if enrolled == nil {
+			err = fmt.Errorf("fencing: active restart grant lacks trusted runtime enrollment")
+		} else {
+			finalState, finalErr := e.read(r.Context(), uid, message.Identity.SourceClusterID)
+			if finalErr != nil {
+				err = finalErr
+			} else {
+				run, exists := finalState.Ledger.Runs[startupGrant.Identity.RunID]
+				if finalState.Ledger.ClosedBy != "" || finalState.Ledger.ClosedHash != "" || !exists || run.Runtime == nil || run.EngineRepairProvenance == nil ||
+					run.Identity.RunID != startupGrant.Identity.RunID || *run.Runtime != *enrolled {
+					err = fencing.ErrClosed
+				} else {
+					store, storeErr := NewEngineRepairStore(e.AuthorityState, uid)
+					if storeErr != nil {
+						err = storeErr
+					} else {
+						record, current, currentRuntime, currentErr := store.ReadEngineRepairCurrentCandidate(r.Context(), message.Identity.SourceClusterID, run.EngineRepairProvenance.OperationID)
+						if currentErr != nil || current != run.Identity || currentRuntime != *enrolled {
+							err = errors.Join(currentErr, fencing.ErrClosed)
+						} else {
+							err = e.verifyEngineRepairActiveRestartCurrent(r.Context(), uid, record, current, currentRuntime)
+						}
 					}
 				}
 			}
@@ -965,6 +1073,27 @@ func readAuthorityObject(ctx context.Context, bucket objstore.Bucket, key string
 // record and its exact persisted recovery child. Any ambiguous/missing record
 // remains unavailable; metadata labels and annotations are never authority.
 func (e *FencingExecutor) resolveStartupRole(ctx context.Context, statefulSetUID string, id fencing.Identity) (fencing.StartupRole, error) {
+	if repair, found, err := e.engineRepairRecordForRuntime(ctx, statefulSetUID, id); err != nil {
+		return "", err
+	} else if found {
+		state, err := e.read(ctx, statefulSetUID, id.SourceClusterID)
+		if err != nil {
+			return "", err
+		}
+		candidate := repair.CurrentCandidateIdentity()
+		runtime := repair.CurrentCandidateRuntime()
+		run, ok := state.Ledger.Runs[id.RunID]
+		if !ok || id != candidate || run.Identity != id || run.Runtime == nil || runtime == nil ||
+			*run.Runtime != *runtime || run.Stop != nil {
+			return "", fencing.ErrClosed
+		}
+		role := fencing.RunRole(run)
+		if repair.Phase == fencing.RepairAdding && (role == fencing.StartupRoleLearnerPendingRemove || role == fencing.StartupRoleVoterActive) ||
+			repair.Phase == fencing.RepairActive && role == fencing.StartupRoleVoterActive {
+			return role, nil
+		}
+		return "", fencing.ErrClosed
+	}
 	grant, err := e.resolveStartupGrant(ctx, statefulSetUID, id)
 	return grant.Role, err
 }

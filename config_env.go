@@ -91,11 +91,17 @@ func ConfigFromEnv() (Config, error) {
 	if err != nil {
 		return Config{}, err
 	}
+	supervised := os.Getenv("RHIZA_FENCE_SOCKET") != ""
 
 	return Config{
 		ClusterID: configEnvOrDefault("RHIZA_CLUSTER_ID", "cluster-a"), NodeID: nodeID,
 		DataDir: configEnvOrDefault("RHIZA_DATA_DIR", "./rhiza-data"), BindAddr: configEnvOrDefault("RHIZA_BIND_ADDR", "127.0.0.1:8080"),
-		PeerAddr: configEnvOrDefault("RHIZA_PEER_ADDR", "127.0.0.1:9090"), AdminToken: os.Getenv("RHIZA_ADMIN_TOKEN"), PeerToken: peerToken, Members: members, EnableReconfiguration: enableReconfiguration, Learner: learner,
+		PeerAddr: configEnvOrDefault("RHIZA_PEER_ADDR", "127.0.0.1:9090"), AdminToken: os.Getenv("RHIZA_ADMIN_TOKEN"), PeerToken: peerToken, Members: members, EnableReconfiguration: enableReconfiguration,
+		// Reconfiguration remains backward-compatible for ordinary embedded
+		// callers. Only a process launched under the authenticated supervisor
+		// enters the engine-owned REMOVE path; the supervisor socket is injected
+		// by the PID-1 wrapper, never by the operator's public Config API.
+		EngineOwnedRemovals: enableReconfiguration && supervised, Learner: learner,
 		ObjStoreProvider: os.Getenv("RHIZA_OBJSTORE_PROVIDER"), ObjStoreDir: objStoreDir, ObjStorePrefix: os.Getenv("RHIZA_OBJSTORE_PREFIX"),
 		ObjStoreEndpoint: os.Getenv("RHIZA_OBJSTORE_ENDPOINT"), ObjStoreBucket: os.Getenv("RHIZA_OBJSTORE_BUCKET"), ObjStoreRegion: os.Getenv("RHIZA_OBJSTORE_REGION"),
 		ObjStoreInsecure: objStoreInsecure, ObjStoreRetries: objStoreRetries, ObjStoreAccessKey: os.Getenv("RHIZA_OBJSTORE_ACCESS_KEY"),

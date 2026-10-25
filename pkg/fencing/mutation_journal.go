@@ -32,6 +32,12 @@ const (
 	MutationExcluded  MutationOutcome = "FutureEffectExcluded"
 )
 
+type MutationResolutionReason string
+
+const (
+	MutationResolutionReasonGenerationZeroPinned MutationResolutionReason = "GenerationZeroPinned"
+)
+
 type MutationConditionMode string
 
 const (
@@ -92,11 +98,12 @@ func IsHeldCreateEligible(intent MutationIntent, preparation MutationPreparation
 // MutationResolution must be supplied only by the trusted provider worker after
 // recording its immutable provider evidence. Exclusion is never a client ACK.
 type MutationResolution struct {
-	Outcome         MutationOutcome `json:"outcome"`
-	PreparationHash string          `json:"preparationHash"`
-	ReceiptDigest   string          `json:"receiptDigest"`
-	PayloadDigest   string          `json:"payloadDigest,omitempty"`
-	ConditionFailed bool            `json:"conditionFailed,omitempty"`
+	Outcome         MutationOutcome          `json:"outcome"`
+	Reason          MutationResolutionReason `json:"reason,omitempty"`
+	PreparationHash string                   `json:"preparationHash"`
+	ReceiptDigest   string                   `json:"receiptDigest"`
+	PayloadDigest   string                   `json:"payloadDigest,omitempty"`
+	ConditionFailed bool                     `json:"conditionFailed,omitempty"`
 	// AllCopiesTerminal is a trusted provider-worker assertion backed by the
 	// receipt. In particular a successful create-if-absent response alone does
 	// not establish this: a delayed copy can succeed after a later deletion.
@@ -111,8 +118,40 @@ type MutationEntry struct {
 	Resolution               *MutationResolution               `json:"resolution,omitempty"`
 	CopyCompletion           *MutationCopyCompletion           `json:"copyCompletion,omitempty"`
 	GuardedLogicalResolution *MutationGuardedLogicalResolution `json:"guardedLogicalResolution,omitempty"`
+	GenerationZeroGuard      *MutationGenerationZeroGuard      `json:"generationZeroGuard,omitempty"`
+	GenerationZeroRights     *MutationGenerationZeroRights     `json:"generationZeroRights,omitempty"`
 	DispatchClosed           bool                              `json:"dispatchClosed,omitempty"`
 	Dispatches               map[string]MutationDispatch       `json:"dispatches,omitempty"`
+}
+
+// MutationGenerationZeroGuard is distinct from MutationGuardedLogicalResolution:
+// it proves the live positive-generation held object and the repair-scoped
+// future-effect fence for an uncertain generation-zero dispatch. It does not
+// assert that the old physical request has terminated or that every copy is
+// terminal. The storage authority must reload and verify GuardRef and the exact
+// object metadata before trusting this reference.
+type MutationGenerationZeroGuard struct {
+	Version              int                  `json:"version"`
+	RepairBinding        EngineRemovalBinding `json:"repairBinding"`
+	RepairRecordHash     string               `json:"repairRecordHash"`
+	StorageScopeHash     string               `json:"storageScopeHash"`
+	Key                  string               `json:"key"`
+	Runtime              RuntimeBinding       `json:"runtime"`
+	WALIdentity          string               `json:"walIdentity"`
+	ProducerUID          string               `json:"producerUID"`
+	Sequence             uint64               `json:"sequence"`
+	Intent               MutationIntent       `json:"intent"`
+	Preparation          MutationPreparation  `json:"preparation"`
+	PreparationHash      string               `json:"preparationHash"`
+	DispatchID           string               `json:"dispatchID"`
+	GuardRootIdentity    string               `json:"guardRootIdentity"`
+	GuardRef             string               `json:"guardRef"`
+	GuardUID             string               `json:"guardUID"`
+	GuardDigest          string               `json:"guardDigest"`
+	ObjectGeneration     int64                `json:"objectGeneration"`
+	ObjectMetageneration int64                `json:"objectMetageneration"`
+	ObjectSize           int64                `json:"objectSize"`
+	PayloadDigest        string               `json:"payloadDigest"`
 }
 
 // MutationGuardedLogicalResolution resolves only the logical value of an
@@ -152,8 +191,36 @@ type MutationDispatch struct {
 // MutationCopyCompletion adds terminal-attempt evidence without overwriting
 // the original commitment receipt or its earlier uncertainty.
 type MutationCopyCompletion struct {
-	PreparationHash string `json:"preparationHash"`
-	ReceiptDigest   string `json:"receiptDigest"`
+	PreparationHash            string `json:"preparationHash"`
+	ReceiptDigest              string `json:"receiptDigest"`
+	GenerationZeroRightsDigest string `json:"generationZeroRightsDigest,omitempty"`
+}
+
+// MutationGenerationZeroRights records every repair-helper create attempt
+// separately from the original dispatch permission. Each right is persisted
+// before its provider request. Sealed closes admission; it is not terminal
+// evidence. A completion is valid only after every right and the original
+// dispatch have exact terminal receipts.
+type MutationGenerationZeroRights struct {
+	RepairBinding    EngineRemovalBinding                  `json:"repairBinding"`
+	RepairRecordHash string                                `json:"repairRecordHash"`
+	Rights           []MutationGenerationZeroPhysicalRight `json:"rights"`
+	Sealed           bool                                  `json:"sealed,omitempty"`
+	// HelperRightsRetired closes only admission/use of this repair-helper
+	// permission set. Keep the JSON name for compatibility. It does not retire
+	// the original dispatch, its generation-zero guard, or the key barrier.
+	HelperRightsRetired bool `json:"retired,omitempty"`
+}
+
+type MutationGenerationZeroPhysicalRight struct {
+	Attempt               uint32 `json:"attempt"`
+	RequestDigest         string `json:"requestDigest"`
+	TerminalReceiptDigest string `json:"terminalReceiptDigest,omitempty"`
+}
+
+func (r MutationGenerationZeroRights) Digest() string {
+	r.Sealed = true
+	return hashJSONValue(r)
 }
 
 // MutationProducer is a pure CAS transition value. The service must persist
@@ -214,7 +281,7 @@ func (p *MutationProducer) Validate() error {
 	}
 	switch p.Phase {
 	case MutationReserved:
-		if p.WALIdentity != "" || p.LastAdmitted != 0 {
+		if p.LastAdmitted != 0 {
 			return fmt.Errorf("fencing: reserved mutation producer has admitted work")
 		}
 	case MutationOpen:
@@ -283,21 +350,45 @@ func (p *MutationProducer) validateEntry(sequence uint64, entry MutationEntry) e
 			return err
 		}
 	}
+	if entry.GenerationZeroRights != nil {
+		if err := p.validateGenerationZeroRights(sequence, entry, *entry.GenerationZeroRights); err != nil {
+			return err
+		}
+	}
 	if entry.Resolution != nil {
 		if err := p.validateResolution(sequence, entry, *entry.Resolution); err != nil {
 			return err
 		}
 	}
 	if entry.CopyCompletion != nil {
-		if entry.Preparation == nil || entry.Resolution == nil || entry.CopyCompletion.PreparationHash != p.preparationHash(sequence, entry) || !mutationDigestValid(entry.CopyCompletion.ReceiptDigest) || !allDispatchesTerminal(entry) {
+		if entry.Preparation == nil || entry.Resolution == nil || len(entry.Dispatches) == 0 || entry.CopyCompletion.PreparationHash != p.preparationHash(sequence, entry) || !mutationDigestValid(entry.CopyCompletion.ReceiptDigest) || !allDispatchesTerminal(entry) {
 			return fmt.Errorf("fencing: copy completion lacks matching prepared terminal work")
+		}
+		if entry.GenerationZeroGuard != nil {
+			if entry.CopyCompletion.GenerationZeroRightsDigest == "" || entry.GenerationZeroRights == nil ||
+				!generationZeroRightsTerminal(*entry.GenerationZeroRights) || entry.CopyCompletion.GenerationZeroRightsDigest != entry.GenerationZeroRights.Digest() {
+				return fmt.Errorf("fencing: guarded copy completion lacks its exact sealed physical-right set")
+			}
+		} else if entry.CopyCompletion.GenerationZeroRightsDigest != "" || entry.GenerationZeroRights != nil {
+			return fmt.Errorf("fencing: generation-zero physical rights lack their immutable storage guard")
 		}
 	}
 	if entry.GuardedLogicalResolution != nil {
 		if entry.Resolution == nil {
 			return fmt.Errorf("fencing: guarded logical evidence lacks a logical resolution")
 		}
+		if entry.GenerationZeroGuard != nil {
+			return fmt.Errorf("fencing: generation-zero storage guard cannot reuse guarded logical evidence")
+		}
 		if err := p.validateGuardedLogicalResolution(sequence, entry, *entry.GuardedLogicalResolution); err != nil {
+			return err
+		}
+	}
+	if entry.GenerationZeroGuard != nil {
+		if entry.GuardedLogicalResolution != nil || entry.Resolution == nil {
+			return fmt.Errorf("fencing: generation-zero storage guard has an incompatible resolution")
+		}
+		if err := p.validateGenerationZeroGuard(sequence, entry, *entry.GenerationZeroGuard); err != nil {
 			return err
 		}
 	}
@@ -330,6 +421,30 @@ func (p *MutationProducer) Activate(id Identity) error {
 		return fmt.Errorf("fencing: mutation producer WAL differs")
 	}
 	p.WALIdentity, p.Phase = id.WALIdentity, MutationOpen
+	return nil
+}
+
+// BindWAL pins the already-authorized WAL on a Reserved producer without
+// opening admission. It is used when the authority already knows the
+// candidate's immutable WAL before the child starts; Activate remains the
+// later startup bind that opens mutation admission.
+func (p *MutationProducer) BindWAL(id Identity) error {
+	if err := p.Validate(); err != nil {
+		return err
+	}
+	if p.EvidenceFault != "" {
+		return ErrUnavailable
+	}
+	if p.Phase != MutationReserved || p.LastAdmitted != 0 {
+		return ErrClosed
+	}
+	if err := p.Runtime.Validate(id); err != nil {
+		return err
+	}
+	if id.WALIdentity == "" || (p.WALIdentity != "" && p.WALIdentity != id.WALIdentity) {
+		return fmt.Errorf("fencing: mutation producer WAL differs")
+	}
+	p.WALIdentity = id.WALIdentity
 	return nil
 }
 
@@ -409,12 +524,22 @@ func (p *MutationProducer) Close(operationID, requestHash string) error {
 	}
 	if p.Phase == MutationClosed {
 		if p.CloseOperationID == operationID && p.CloseRequestHash == requestHash {
+			for sequence, entry := range p.Entries {
+				entry.DispatchClosed = true
+				p.Entries[sequence] = entry
+			}
 			return nil
 		}
 		return ErrClosed
 	}
 	p.Phase, p.ClosedThrough = MutationClosed, p.LastAdmitted
 	p.CloseOperationID, p.CloseRequestHash = operationID, requestHash
+	// Close seals every already-admitted entry against new dispatch rights.
+	// Existing grants remain obligations and can still be terminalized.
+	for sequence, entry := range p.Entries {
+		entry.DispatchClosed = true
+		p.Entries[sequence] = entry
+	}
 	return nil
 }
 
@@ -509,6 +634,236 @@ func (p *MutationProducer) ResolveGuardedLogical(producerUID string, sequence ui
 	return nil
 }
 
+// RecordGenerationZeroPhysicalRight durably accounts for one repair-helper
+// request before it is sent. An existing exact attempt is not a reusable
+// permission; callers must treat created=false as already consumed/ambiguous.
+func (p *MutationProducer) RecordGenerationZeroPhysicalRight(producerUID string, sequence uint64, repair EngineRepairRecord, attempt uint32, requestDigest string) (bool, error) {
+	if err := p.Validate(); err != nil {
+		return false, err
+	}
+	entry, exists := p.Entries[sequence]
+	if !exists || producerUID == "" || repair.Validate() != nil || repair.IdentityDigest() == "" ||
+		!repair.evidencePhase().atLeast(RepairStorageClosing) || p.Phase != MutationClosed || sequence == 0 || sequence > p.ClosedThrough ||
+		entry.Preparation == nil || !IsHeldCreateEligible(entry.Intent, *entry.Preparation) || !entry.DispatchClosed || len(entry.Dispatches) != 1 ||
+		!mutationDigestValid(requestDigest) {
+		return false, fmt.Errorf("fencing: generation-zero helper right is not bound to a closed held-create dispatch")
+	}
+	if entry.GenerationZeroGuard != nil && (entry.GenerationZeroGuard.RepairRecordHash != repair.IdentityDigest() || entry.GenerationZeroGuard.RepairBinding != repair.Binding) {
+		return false, fmt.Errorf("fencing: generation-zero helper right differs from its immutable guard")
+	}
+	if entry.GenerationZeroRights == nil {
+		entry.GenerationZeroRights = &MutationGenerationZeroRights{RepairBinding: repair.Binding, RepairRecordHash: repair.IdentityDigest()}
+	}
+	rights := entry.GenerationZeroRights
+	if rights.RepairBinding != repair.Binding || rights.RepairRecordHash != repair.IdentityDigest() || rights.Sealed {
+		return false, fmt.Errorf("fencing: generation-zero helper-right admission is sealed or belongs to another repair")
+	}
+	if attempt == 0 || int(attempt) > len(rights.Rights)+1 || int(attempt) > MaxMutationDispatches {
+		return false, fmt.Errorf("fencing: generation-zero helper-right attempt is not contiguous or exceeds capacity")
+	}
+	if int(attempt) <= len(rights.Rights) {
+		if rights.Rights[attempt-1].RequestDigest != requestDigest {
+			return false, fmt.Errorf("fencing: generation-zero helper-right attempt changed its request")
+		}
+		return false, nil
+	}
+	rights.Rights = append(rights.Rights, MutationGenerationZeroPhysicalRight{Attempt: attempt, RequestDigest: requestDigest})
+	p.Entries[sequence] = entry
+	if err := p.Validate(); err != nil {
+		return false, err
+	}
+	return true, nil
+}
+
+// RecordGenerationZeroPhysicalTerminal binds an actual provider terminal
+// receipt to exactly one pre-recorded helper request. Future-effect exclusion
+// or a live object readback alone is not a physical terminal receipt.
+func (p *MutationProducer) RecordGenerationZeroPhysicalTerminal(sequence uint64, attempt uint32, requestDigest, receiptDigest string) error {
+	if err := p.Validate(); err != nil {
+		return err
+	}
+	entry, exists := p.Entries[sequence]
+	if !exists || entry.GenerationZeroRights == nil || entry.GenerationZeroRights.HelperRightsRetired ||
+		attempt == 0 || int(attempt) > len(entry.GenerationZeroRights.Rights) || !mutationDigestValid(requestDigest) || !mutationDigestValid(receiptDigest) {
+		return fmt.Errorf("fencing: generation-zero terminal receipt lacks its pre-dispatch right")
+	}
+	right := &entry.GenerationZeroRights.Rights[attempt-1]
+	if right.Attempt != attempt || right.RequestDigest != requestDigest ||
+		(right.TerminalReceiptDigest != "" && right.TerminalReceiptDigest != receiptDigest) {
+		return fmt.Errorf("fencing: generation-zero terminal receipt differs from its exact request")
+	}
+	right.TerminalReceiptDigest = receiptDigest
+	p.Entries[sequence] = entry
+	return p.Validate()
+}
+
+// SealGenerationZeroRights closes helper-right admission after the permanent
+// guard is persisted. Sealing does not imply terminality; unresolved rights
+// continue to block CopyCompletion and compaction.
+func (p *MutationProducer) SealGenerationZeroRights(producerUID string, sequence uint64, repair EngineRepairRecord) error {
+	if err := p.Validate(); err != nil {
+		return err
+	}
+	entry, exists := p.Entries[sequence]
+	if !exists || producerUID == "" || entry.GenerationZeroGuard == nil || entry.GenerationZeroRights == nil ||
+		repair.Validate() != nil || entry.GenerationZeroGuard.ProducerUID != producerUID ||
+		entry.GenerationZeroGuard.RepairRecordHash != repair.IdentityDigest() || entry.GenerationZeroGuard.RepairBinding != repair.Binding ||
+		entry.GenerationZeroRights.RepairRecordHash != repair.IdentityDigest() || entry.GenerationZeroRights.RepairBinding != repair.Binding {
+		return fmt.Errorf("fencing: generation-zero helper-right seal is not bound to the exact guard")
+	}
+	entry.GenerationZeroRights.Sealed = true
+	p.Entries[sequence] = entry
+	return p.Validate()
+}
+
+// RetireGenerationZeroRights records that the sealed helper permission set is
+// fully terminal. It preserves the rights and receipts as journal evidence;
+// this retires helper rights only, not the original dispatch, G0 guard, or key
+// barrier. Those remain governed by their own terminal evidence.
+func (p *MutationProducer) RetireGenerationZeroRights(producerUID string, sequence uint64, repair EngineRepairRecord) error {
+	if err := p.Validate(); err != nil {
+		return err
+	}
+	entry, exists := p.Entries[sequence]
+	if !exists || producerUID == "" || entry.GenerationZeroGuard == nil || entry.GenerationZeroRights == nil ||
+		repair.Validate() != nil || entry.GenerationZeroGuard.ProducerUID != producerUID ||
+		entry.GenerationZeroGuard.RepairRecordHash != repair.IdentityDigest() || entry.GenerationZeroGuard.RepairBinding != repair.Binding ||
+		entry.GenerationZeroRights.RepairRecordHash != repair.IdentityDigest() || entry.GenerationZeroRights.RepairBinding != repair.Binding ||
+		!generationZeroRightsTerminal(*entry.GenerationZeroRights) {
+		return fmt.Errorf("fencing: generation-zero rights are not sealed and terminal for the exact guard")
+	}
+	if entry.GenerationZeroRights.HelperRightsRetired {
+		return nil
+	}
+	entry.GenerationZeroRights.HelperRightsRetired = true
+	p.Entries[sequence] = entry
+	return p.Validate()
+}
+
+// RecordGenerationZeroGuard records a distinct repair-scoped storage guard.
+// It preserves an existing exact committed receipt and never terminalizes the
+// original physical dispatch permission.
+func (p *MutationProducer) RecordGenerationZeroGuard(producerUID string, sequence uint64, repair EngineRepairRecord, guard MutationGenerationZeroGuard) error {
+	if err := p.Validate(); err != nil {
+		return err
+	}
+	entry, exists := p.Entries[sequence]
+	if !exists || producerUID == "" || guard.ProducerUID != producerUID || repair.Validate() != nil ||
+		repair.IdentityDigest() != guard.RepairRecordHash || repair.Binding != guard.RepairBinding || !repair.evidencePhase().atLeast(RepairStorageClosing) {
+		return fmt.Errorf("fencing: generation-zero guard producer identity differs")
+	}
+	candidate := entry
+	if candidate.Resolution == nil {
+		candidate.Resolution = &MutationResolution{Outcome: MutationCommitted, PreparationHash: guard.PreparationHash,
+			ReceiptDigest: guard.GuardDigest, PayloadDigest: guard.PayloadDigest}
+	}
+	if err := p.validateGenerationZeroGuard(sequence, candidate, guard); err != nil {
+		return err
+	}
+	if entry.GenerationZeroGuard != nil && *entry.GenerationZeroGuard != guard {
+		return fmt.Errorf("fencing: generation-zero storage guard is immutable")
+	}
+	if entry.Resolution != nil && (entry.Resolution.Outcome != MutationCommitted || entry.Resolution.AllCopiesTerminal || entry.Resolution.PayloadDigest != entry.Intent.PayloadDigest) {
+		return fmt.Errorf("fencing: generation-zero guard conflicts with the original mutation resolution")
+	}
+	entry.Resolution = candidate.Resolution
+	entry.GenerationZeroGuard = &guard
+	p.Entries[sequence] = entry
+	return p.Validate()
+}
+
+// ValidateGenerationZeroGuard rechecks the reference against an exact closed
+// producer entry. The caller must independently load GuardRef, verify its UID
+// and digest, and read back the held object's exact positive generation.
+func (p *MutationProducer) ValidateGenerationZeroGuard(producerUID string, sequence uint64, repair EngineRepairRecord, entry MutationEntry) error {
+	if p == nil || p.Phase != MutationClosed || p.WALIdentity == "" || producerUID == "" || entry.GenerationZeroGuard == nil || entry.GenerationZeroGuard.ProducerUID != producerUID ||
+		repair.Validate() != nil || repair.IdentityDigest() != entry.GenerationZeroGuard.RepairRecordHash || repair.Binding != entry.GenerationZeroGuard.RepairBinding || !repair.evidencePhase().atLeast(RepairStorageClosing) {
+		return fmt.Errorf("fencing: generation-zero guard producer identity differs")
+	}
+	id := Identity{SourceClusterID: p.Runtime.SourceClusterID, NodeID: p.Runtime.NodeID, PodUID: p.Runtime.PodUID, RunID: p.Runtime.RunID, AssignmentID: p.Runtime.AssignmentID, WALIdentity: p.WALIdentity}
+	if err := p.Runtime.Validate(id); err != nil {
+		return err
+	}
+	return p.validateGenerationZeroGuard(sequence, entry, *entry.GenerationZeroGuard)
+}
+
+func (p *MutationProducer) validateGenerationZeroGuard(sequence uint64, entry MutationEntry, guard MutationGenerationZeroGuard) error {
+	if p == nil || p.Phase != MutationClosed || sequence == 0 || sequence > p.ClosedThrough || entry.Preparation == nil ||
+		guard.Version != MutationGenerationZeroGuardVersion || guard.RepairBinding.Validate() != nil || guard.RepairBinding.FreezeSlot == 0 ||
+		guard.RepairBinding.SourceClusterID != p.Runtime.SourceClusterID || guard.RepairBinding.OldMemberID != p.Runtime.NodeID ||
+		guard.RepairBinding.OldWALIdentity != p.WALIdentity || guard.RepairBinding.StatefulSetUID != p.Runtime.StatefulSetUID ||
+		guard.Runtime != p.Runtime || guard.WALIdentity != p.WALIdentity || guard.ProducerUID == "" || guard.Sequence != sequence ||
+		guard.Intent != entry.Intent || guard.Preparation != *entry.Preparation || guard.StorageScopeHash != entry.Intent.StoreScopeHash ||
+		guard.Key != entry.Intent.Key || guard.PreparationHash != p.preparationHash(sequence, entry) || guard.DispatchID == "" ||
+		!mutationDigestValid(guard.RepairRecordHash) || !mutationDigestValid(guard.GuardRootIdentity) ||
+		guard.GuardRef == "" || len(guard.GuardRef) > 512 || !strings.HasPrefix(guard.GuardRef, "mutation-effect-guards/") ||
+		strings.HasPrefix(guard.GuardRef, "/") || path.Clean(guard.GuardRef) != guard.GuardRef || strings.HasPrefix(guard.GuardRef, "../") ||
+		guard.GuardUID == "" || len(guard.GuardUID) > 128 || !mutationDigestValid(guard.GuardDigest) ||
+		guard.GuardDigest != guard.Digest() ||
+		guard.ObjectGeneration <= 0 || guard.ObjectMetageneration <= 0 || guard.ObjectSize != entry.Intent.PayloadSize ||
+		guard.PayloadDigest != entry.Intent.PayloadDigest || !mutationDigestValid(guard.PayloadDigest) {
+		return fmt.Errorf("fencing: generation-zero guard is not bound to the exact prepared producer tuple")
+	}
+	if !IsHeldCreateEligible(entry.Intent, *entry.Preparation) || !entry.DispatchClosed || len(entry.Dispatches) != 1 ||
+		entry.Resolution == nil || entry.Resolution.Outcome != MutationCommitted || entry.Resolution.AllCopiesTerminal ||
+		entry.Resolution.PreparationHash != guard.PreparationHash || entry.Resolution.PayloadDigest != guard.PayloadDigest {
+		return fmt.Errorf("fencing: generation-zero guard requires one unresolved committed held create")
+	}
+	rights := entry.GenerationZeroRights
+	if rights == nil || rights.RepairRecordHash != guard.RepairRecordHash || rights.RepairBinding != guard.RepairBinding {
+		return fmt.Errorf("fencing: generation-zero guard lacks its repair-bound physical-right set")
+	}
+	_, exists := entry.Dispatches[guard.DispatchID]
+	if !exists {
+		return fmt.Errorf("fencing: generation-zero guard does not bind the original dispatch")
+	}
+	return nil
+}
+
+func (p *MutationProducer) validateGenerationZeroRights(sequence uint64, entry MutationEntry, rights MutationGenerationZeroRights) error {
+	if p == nil || p.Phase != MutationClosed || sequence == 0 || sequence > p.ClosedThrough || entry.Preparation == nil ||
+		!IsHeldCreateEligible(entry.Intent, *entry.Preparation) || !entry.DispatchClosed || len(entry.Dispatches) != 1 ||
+		rights.RepairBinding.Validate() != nil || rights.RepairBinding.SourceClusterID != p.Runtime.SourceClusterID ||
+		rights.RepairBinding.OldMemberID != p.Runtime.NodeID || rights.RepairBinding.OldWALIdentity != p.WALIdentity ||
+		rights.RepairBinding.StatefulSetUID != p.Runtime.StatefulSetUID || !mutationDigestValid(rights.RepairRecordHash) || len(rights.Rights) == 0 ||
+		len(rights.Rights) > MaxMutationDispatches {
+		return fmt.Errorf("fencing: generation-zero physical rights are not bound to the exact closed held create")
+	}
+	if entry.GenerationZeroGuard != nil && (entry.GenerationZeroGuard.RepairRecordHash != rights.RepairRecordHash || entry.GenerationZeroGuard.RepairBinding != rights.RepairBinding) {
+		return fmt.Errorf("fencing: generation-zero physical-right repair binding differs from its guard")
+	}
+	for index, right := range rights.Rights {
+		if right.Attempt != uint32(index+1) || !mutationDigestValid(right.RequestDigest) ||
+			(right.TerminalReceiptDigest != "" && !mutationDigestValid(right.TerminalReceiptDigest)) {
+			return fmt.Errorf("fencing: generation-zero physical-right order or evidence is invalid")
+		}
+	}
+	if rights.Sealed && entry.GenerationZeroGuard == nil {
+		return fmt.Errorf("fencing: generation-zero physical-right set sealed before its storage guard")
+	}
+	if rights.HelperRightsRetired && (entry.GenerationZeroGuard == nil || !generationZeroRightsTerminal(rights)) {
+		return fmt.Errorf("fencing: generation-zero physical-right set retired before exact terminal guard")
+	}
+	return nil
+}
+
+func generationZeroRightsTerminal(rights MutationGenerationZeroRights) bool {
+	if !rights.Sealed || len(rights.Rights) == 0 {
+		return false
+	}
+	for _, right := range rights.Rights {
+		if !mutationDigestValid(right.TerminalReceiptDigest) {
+			return false
+		}
+	}
+	return true
+}
+
+func (g MutationGenerationZeroGuard) Digest() string {
+	g.GuardDigest = ""
+	return hashJSONValue(g)
+}
+
 // ValidateGuardedLogicalResolution checks archived or separately persisted
 // evidence against an exact closed producer entry without changing that entry.
 func (p *MutationProducer) ValidateGuardedLogicalResolution(producerUID string, sequence uint64, entry MutationEntry) error {
@@ -584,11 +939,25 @@ func (p *MutationProducer) validateResolution(sequence uint64, entry MutationEnt
 	if !mutationDigestValid(resolution.ReceiptDigest) {
 		return fmt.Errorf("fencing: resolution requires durable evidence")
 	}
+	if err := validateMutationResolutionReason(entry, resolution); err != nil {
+		return err
+	}
 	if resolution.ConditionFailed && (resolution.Outcome != MutationRejected || entry.Intent.Condition.Mode == MutationUnconditional) {
 		return fmt.Errorf("fencing: condition failure must be a conditional terminal rejection")
 	}
 	if resolution.AllCopiesTerminal && !allDispatchesTerminal(entry) {
 		return fmt.Errorf("fencing: executable dispatch permissions remain unsealed or unresolved")
+	}
+	if resolution.AllCopiesTerminal && entry.Preparation != nil && len(entry.Dispatches) == 0 {
+		closedCancellation := p.Phase == MutationClosed && sequence <= p.ClosedThrough && entry.DispatchClosed &&
+			resolution.Outcome == MutationRejected && !resolution.ConditionFailed && resolution.PayloadDigest == ""
+		if !closedCancellation {
+			return fmt.Errorf("fencing: prepared terminal mutation lacks a granted dispatch or exact closed cancellation")
+		}
+	}
+	if resolution.AllCopiesTerminal && len(entry.Dispatches) == 0 && resolution.Reason == MutationResolutionReasonGenerationZeroPinned &&
+		(p.Phase != MutationClosed || sequence > p.ClosedThrough) {
+		return fmt.Errorf("fencing: pinned-generation cancellation requires a closed producer tuple")
 	}
 	if entry.Preparation == nil {
 		if resolution.Outcome != MutationRejected || resolution.PreparationHash != "" || resolution.PayloadDigest != "" || resolution.ConditionFailed || !resolution.AllCopiesTerminal {
@@ -619,6 +988,31 @@ func (p *MutationProducer) validateResolution(sequence uint64, entry MutationEnt
 		return fmt.Errorf("fencing: mutation outcome is unresolved")
 	}
 	return nil
+}
+
+func validateMutationResolutionReason(entry MutationEntry, resolution MutationResolution) error {
+	switch resolution.Reason {
+	case "":
+		return nil
+	case MutationResolutionReasonGenerationZeroPinned:
+		if resolution.Outcome != MutationRejected || resolution.ConditionFailed || !resolution.AllCopiesTerminal ||
+			entry.Intent.Kind != "delete" || entry.Intent.Condition.Mode != MutationMatchGeneration || !entry.DispatchClosed || len(entry.Dispatches) != 0 {
+			return fmt.Errorf("fencing: pinned-generation deferral is not a terminal no-dispatch delete")
+		}
+		if entry.Preparation == nil {
+			if resolution.PreparationHash != "" {
+				return fmt.Errorf("fencing: unprepared pinned-generation deferral has a preparation hash")
+			}
+			return nil
+		}
+		if !entry.Preparation.GenerationSet || entry.Preparation.Generation != entry.Intent.Condition.Generation ||
+			resolution.PreparationHash == "" {
+			return fmt.Errorf("fencing: prepared pinned-generation deferral differs from the exact selected generation")
+		}
+		return nil
+	default:
+		return fmt.Errorf("fencing: unknown mutation terminal resolution reason")
+	}
 }
 
 // AdmitAndCancel consumes an allocated sequence without granting execution. The
@@ -659,6 +1053,57 @@ func (p *MutationProducer) CancelUnprepared(sequence uint64, receiptDigest strin
 	return nil
 }
 
+// CancelPreparedNoDispatch settles a closed entry whose exact preparation was
+// recorded but for which no executable dispatch permission was ever granted.
+// The caller supplies a digest of the exact closed tuple; the journal CAS is
+// the evidence that no dispatch existed and races atomically with grant.
+func (p *MutationProducer) CancelPreparedNoDispatch(sequence uint64, preparationHash, receiptDigest string) error {
+	if err := p.Validate(); err != nil {
+		return err
+	}
+	entry, exists := p.Entries[sequence]
+	if p.Phase != MutationClosed || sequence == 0 || sequence > p.ClosedThrough || !exists || entry.Preparation == nil ||
+		entry.Resolution != nil || !entry.DispatchClosed || len(entry.Dispatches) != 0 || !mutationDigestValid(preparationHash) ||
+		preparationHash != p.preparationHash(sequence, entry) || !mutationDigestValid(receiptDigest) {
+		return fmt.Errorf("fencing: prepared mutation has dispatch rights or differs from closed cancellation")
+	}
+	entry.Resolution = &MutationResolution{Outcome: MutationRejected, PreparationHash: preparationHash, ReceiptDigest: receiptDigest, AllCopiesTerminal: true}
+	p.Entries[sequence] = entry
+	return nil
+}
+
+// CancelPinnedGenerationDelete records a distinct terminal result only after
+// the trusted executor verified the canonical live generation pin. The journal
+// method independently limits it to a closed no-dispatch delete of that exact
+// selected generation; it does not itself authenticate the storage barrier.
+func (p *MutationProducer) CancelPinnedGenerationDelete(sequence uint64, preparationHash, receiptDigest string) error {
+	if err := p.Validate(); err != nil {
+		return err
+	}
+	entry, exists := p.Entries[sequence]
+	if p.Phase != MutationClosed || sequence == 0 || sequence > p.ClosedThrough || !exists || entry.Resolution != nil ||
+		!entry.DispatchClosed || len(entry.Dispatches) != 0 || entry.Intent.Kind != "delete" ||
+		entry.Intent.Condition.Mode != MutationMatchGeneration || !mutationDigestValid(receiptDigest) {
+		return fmt.Errorf("fencing: pinned-generation delete cancellation differs from the closed no-dispatch tuple")
+	}
+	if entry.Preparation == nil {
+		if preparationHash != "" {
+			return fmt.Errorf("fencing: unprepared pinned-generation delete has a preparation hash")
+		}
+	} else if !entry.Preparation.GenerationSet || entry.Preparation.Generation != entry.Intent.Condition.Generation ||
+		!mutationDigestValid(preparationHash) || preparationHash != p.preparationHash(sequence, entry) {
+		return fmt.Errorf("fencing: prepared pinned-generation delete differs from the selected generation")
+	}
+	resolution := MutationResolution{Outcome: MutationRejected, PreparationHash: preparationHash, ReceiptDigest: receiptDigest,
+		AllCopiesTerminal: true, Reason: MutationResolutionReasonGenerationZeroPinned}
+	if err := validateMutationResolutionReason(entry, resolution); err != nil {
+		return err
+	}
+	entry.Resolution = &resolution
+	p.Entries[sequence] = entry
+	return p.Validate()
+}
+
 // ConfirmCopiesTerminal is called only after the trusted executor verifies all
 // copies/sessions AND every outstanding executable permission are terminal,
 // with dispatch admission sealed. A timeout, a single response, or absence
@@ -668,8 +1113,16 @@ func (p *MutationProducer) ConfirmCopiesTerminal(sequence uint64, completion Mut
 		return err
 	}
 	entry, exists := p.Entries[sequence]
-	if !exists || entry.Preparation == nil || entry.Resolution == nil || completion.PreparationHash != p.preparationHash(sequence, entry) || !mutationDigestValid(completion.ReceiptDigest) || !allDispatchesTerminal(entry) {
+	if !exists || entry.Preparation == nil || entry.Resolution == nil || len(entry.Dispatches) == 0 || completion.PreparationHash != p.preparationHash(sequence, entry) || !mutationDigestValid(completion.ReceiptDigest) || !allDispatchesTerminal(entry) {
 		return fmt.Errorf("fencing: copy completion lacks matching prepared terminal work")
+	}
+	if entry.GenerationZeroGuard != nil {
+		if entry.GenerationZeroRights == nil || !generationZeroRightsTerminal(*entry.GenerationZeroRights) ||
+			completion.GenerationZeroRightsDigest != entry.GenerationZeroRights.Digest() {
+			return fmt.Errorf("fencing: guarded copy completion lacks the exact terminal helper-right set")
+		}
+	} else if completion.GenerationZeroRightsDigest != "" || entry.GenerationZeroRights != nil {
+		return fmt.Errorf("fencing: non-guarded copy completion contains generation-zero rights")
 	}
 	if entry.CopyCompletion != nil && *entry.CopyCompletion != completion {
 		return fmt.Errorf("fencing: copy completion evidence is immutable")
@@ -777,7 +1230,11 @@ func mutationEntryTerminal(entry MutationEntry) bool {
 	if entry.Resolution == nil {
 		return false
 	}
-	return entry.Preparation == nil || entry.Preparation.Generation != 0 || entry.Resolution.AllCopiesTerminal || entry.CopyCompletion != nil || entry.GuardedLogicalResolution != nil
+	if entry.GenerationZeroGuard != nil {
+		return entry.CopyCompletion != nil && entry.GenerationZeroRights != nil && generationZeroRightsTerminal(*entry.GenerationZeroRights)
+	}
+	return entry.Preparation == nil || entry.Preparation.Generation != 0 || entry.Resolution.AllCopiesTerminal || entry.CopyCompletion != nil ||
+		entry.GuardedLogicalResolution != nil
 }
 
 func mutationDigestValid(value string) bool {

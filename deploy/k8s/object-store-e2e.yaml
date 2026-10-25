@@ -6,7 +6,7 @@ metadata:
 apiVersion: v1
 kind: Secret
 metadata:
-  name: rhiza-minio
+  name: rhiza-versitygw
   namespace: rhiza-objstore-e2e
 type: Opaque
 stringData:
@@ -16,11 +16,11 @@ stringData:
 apiVersion: v1
 kind: Service
 metadata:
-  name: rhiza-minio
+  name: rhiza-versitygw
   namespace: rhiza-objstore-e2e
 spec:
   selector:
-    app: rhiza-minio
+    app: rhiza-versitygw
   ports:
     - name: s3
       port: 9000
@@ -28,39 +28,39 @@ spec:
 apiVersion: apps/v1
 kind: Deployment
 metadata:
-  name: rhiza-minio
+  name: rhiza-versitygw
   namespace: rhiza-objstore-e2e
 spec:
   replicas: 1
   selector:
     matchLabels:
-      app: rhiza-minio
+      app: rhiza-versitygw
   template:
     metadata:
       labels:
-        app: rhiza-minio
+        app: rhiza-versitygw
     spec:
       containers:
-        - name: minio
-          image: quay.io/minio/minio@sha256:14cea493d9a34af32f524e538b8346cf79f3321eff8e708c1e2960462bd8936e
-          args: ["server", "/data"]
+        - name: versitygw
+          image: ghcr.io/versity/versitygw@sha256:30292fc2eeacc67a36993b01f7a7a5e3361a19cced0e80c1d71cfa2a4b0a2499
+          args: ["--port", ":9000", "--health", "/_/health", "posix", "/data"]
           env:
-            - name: MINIO_ROOT_USER
+            - name: ROOT_ACCESS_KEY
               valueFrom:
                 secretKeyRef:
-                  name: rhiza-minio
+                  name: rhiza-versitygw
                   key: access-key
-            - name: MINIO_ROOT_PASSWORD
+            - name: ROOT_SECRET_KEY
               valueFrom:
                 secretKeyRef:
-                  name: rhiza-minio
+                  name: rhiza-versitygw
                   key: secret-key
           ports:
             - name: s3
               containerPort: 9000
           readinessProbe:
             httpGet:
-              path: /minio/health/ready
+              path: /_/health
               port: s3
           volumeMounts:
             - name: data
@@ -79,21 +79,27 @@ spec:
     spec:
       restartPolicy: OnFailure
       containers:
-        - name: mc
-          image: quay.io/minio/mc@sha256:a7fe349ef4bd8521fb8497f55c6042871b2ae640607cf99d9bede5e9bdf11727
+        - name: aws-cli
+          image: amazon/aws-cli@sha256:83f8ffe939569070c5b66d22231862ab78718766d9d8e4c44ca84dd0be5569a5
           command: ["/bin/sh", "-c"]
           args:
             - >-
-              until mc alias set local http://rhiza-minio:9000 "$ACCESS_KEY" "$SECRET_KEY"; do sleep 1; done;
-              mc mb --ignore-existing local/rhiza
+              i=0; while [ "$i" -lt 120 ]; do
+              aws --endpoint-url http://rhiza-versitygw:9000 s3api head-bucket --bucket rhiza && exit 0;
+              aws --endpoint-url http://rhiza-versitygw:9000 s3 mb s3://rhiza && exit 0;
+              i=$((i+1)); sleep 1; done; exit 1
           env:
-            - name: ACCESS_KEY
+            - name: AWS_ACCESS_KEY_ID
               valueFrom:
                 secretKeyRef:
-                  name: rhiza-minio
+                  name: rhiza-versitygw
                   key: access-key
-            - name: SECRET_KEY
+            - name: AWS_SECRET_ACCESS_KEY
               valueFrom:
                 secretKeyRef:
-                  name: rhiza-minio
+                  name: rhiza-versitygw
                   key: secret-key
+            - name: AWS_DEFAULT_REGION
+              value: us-east-1
+            - name: AWS_EC2_METADATA_DISABLED
+              value: "true"

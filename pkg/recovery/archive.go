@@ -16,11 +16,13 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 
 	"github.com/mrchypark/rhiza/internal/localtesthooks"
 	objmetrics "github.com/mrchypark/rhiza/internal/objstore"
+	"github.com/mrchypark/rhiza/pkg/fencing"
 	"github.com/mrchypark/rhiza/pkg/quepaxa"
 	"github.com/thanos-io/objstore"
 	"golang.org/x/sync/errgroup"
@@ -46,6 +48,10 @@ const (
 var (
 	ErrArchiveClosed = errors.New("archive manager is closed")
 	ErrArchiveBusy   = errors.New("archive maintenance is active")
+	// ErrArchiveDeferredDeletion reports a cleanup pass that completed other
+	// eligible work but retained one or more markers for authority-deferred
+	// deletions. It is not a successful-GC result.
+	ErrArchiveDeferredDeletion = errors.New("archive cleanup deferred protected deletions")
 	// ErrActiveGCLock is only a pre-entry refusal by a live GC lease.
 	// Direct callers still observe ErrArchiveBusy through errors.Is.
 	ErrActiveGCLock error = activeGCLockError{}
@@ -1625,6 +1631,28 @@ func (m *Manager) cleanupDeletes(ctx context.Context, grace time.Duration, keep 
 		version  *objstore.ObjectVersion
 	}
 	versionedDelete := objmetrics.SupportsVersionedDelete(m.bucket)
+	var deferredDeletes atomic.Uint64
+	var deferredMarkerMu sync.Mutex
+	deferredMarkers := make(map[string]struct{})
+	markDeferredMarker := func(marker string) {
+		deferredMarkerMu.Lock()
+		deferredMarkers[marker] = struct{}{}
+		deferredMarkerMu.Unlock()
+	}
+	deleteSelected := func(deleteCtx context.Context, name string, version *objstore.ObjectVersion) (bool, error) {
+		err := objmetrics.DeleteSelectedVersion(deleteCtx, m.bucket, name, version)
+		if errors.Is(err, fencing.ErrMutationDeferred) {
+			deferredDeletes.Add(1)
+			deferredMarkerMu.Lock()
+			deferredMarkers[name] = struct{}{}
+			deferredMarkerMu.Unlock()
+			return true, nil
+		}
+		if err != nil && !m.bucket.IsObjNotFoundErr(err) {
+			return false, err
+		}
+		return false, nil
+	}
 	markers := make(map[string]gcMarker)
 	localtesthooks.HitArchiveGCPhase(ctx, "archive-gc:candidate-scan:begin")
 	err = m.bucket.IterWithAttributes(ctx, m.key("archive/gc-candidates"), func(attributes objstore.IterObjectAttributes) error {
@@ -1650,7 +1678,7 @@ func (m *Manager) cleanupDeletes(ctx context.Context, grace time.Duration, keep 
 	localtesthooks.HitArchiveGCPhase(ctx, "archive-gc:candidate-scan:success")
 	deleteCtx, cancelDeletes := context.WithCancel(ctx)
 	defer cancelDeletes()
-	deletes, deleteCtx := errgroup.WithContext(deleteCtx)
+	var deletes errgroup.Group
 	deletes.SetLimit(4)
 	for _, dir := range []string{"archive/manifests", "archive/blocks"} {
 		localtesthooks.HitArchiveGCPhase(deleteCtx, "archive-gc:object-scan:begin")
@@ -1668,20 +1696,22 @@ func (m *Manager) cleanupDeletes(ctx context.Context, grace time.Duration, keep 
 				}
 				if generation > gcGeneration {
 					if marked {
-						return objmetrics.DeleteSelectedVersion(ctx, m.bucket, marker, markerState.version)
+						_, err := deleteSelected(ctx, marker, markerState.version)
+						return err
 					}
 					return nil
 				}
 				if pinnedGeneration != 0 && generation <= pinnedGeneration {
 					if marked {
-						return objmetrics.DeleteSelectedVersion(ctx, m.bucket, marker, markerState.version)
+						_, err := deleteSelected(ctx, marker, markerState.version)
+						return err
 					}
 					return nil
 				}
 			}
 			if _, ok := keep[name]; ok {
 				if marked {
-					if err := objmetrics.DeleteSelectedVersion(ctx, m.bucket, marker, markerState.version); err != nil && !m.bucket.IsObjNotFoundErr(err) {
+					if _, err := deleteSelected(ctx, marker, markerState.version); err != nil {
 						return err
 					}
 				}
@@ -1702,7 +1732,8 @@ func (m *Manager) cleanupDeletes(ctx context.Context, grace time.Duration, keep 
 				objectAttributes, err := m.bucket.Attributes(deleteCtx, name)
 				if err != nil {
 					if m.bucket.IsObjNotFoundErr(err) {
-						return objmetrics.DeleteSelectedVersion(deleteCtx, m.bucket, marker, markerState.version)
+						_, deleteErr := deleteSelected(deleteCtx, marker, markerState.version)
+						return deleteErr
 					}
 					return err
 				}
@@ -1712,10 +1743,15 @@ func (m *Manager) cleanupDeletes(ctx context.Context, grace time.Duration, keep 
 				if err := deleteCtx.Err(); err != nil {
 					return err
 				}
-				if err := objmetrics.DeleteSelectedVersion(deleteCtx, m.bucket, name, objectVersion); err != nil && !m.bucket.IsObjNotFoundErr(err) {
+				deferred, err := deleteSelected(deleteCtx, name, objectVersion)
+				if deferred {
+					markDeferredMarker(marker)
+					return nil
+				}
+				if err != nil {
 					return err
 				}
-				if err := objmetrics.DeleteSelectedVersion(deleteCtx, m.bucket, marker, markerState.version); err != nil && !m.bucket.IsObjNotFoundErr(err) {
+				if _, err := deleteSelected(deleteCtx, marker, markerState.version); err != nil {
 					return err
 				}
 				return nil
@@ -1734,12 +1770,21 @@ func (m *Manager) cleanupDeletes(ctx context.Context, grace time.Duration, keep 
 	}
 	localtesthooks.HitArchiveGCPhase(ctx, "archive-gc:marker-cleanup:begin")
 	for marker, state := range markers {
-		if err := objmetrics.DeleteSelectedVersion(ctx, m.bucket, marker, state.version); err != nil && !m.bucket.IsObjNotFoundErr(err) {
+		deferredMarkerMu.Lock()
+		_, deferred := deferredMarkers[marker]
+		deferredMarkerMu.Unlock()
+		if deferred {
+			continue
+		}
+		if _, err := deleteSelected(ctx, marker, state.version); err != nil {
 			localtesthooks.HitArchiveGCPhase(ctx, "archive-gc:marker-cleanup:error")
 			return err
 		}
 	}
 	localtesthooks.HitArchiveGCPhase(ctx, "archive-gc:marker-cleanup:success")
+	if count := deferredDeletes.Load(); count != 0 {
+		return fmt.Errorf("%w: %d exact deletion(s) remain marked for a later cleanup", ErrArchiveDeferredDeletion, count)
+	}
 	return nil
 }
 

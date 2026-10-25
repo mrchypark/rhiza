@@ -120,6 +120,44 @@ jobs:
           go test -race ./e2e/chaos/embedded-go -run "$embedded_tests" -count=1 -timeout=5m
           go test -race ./pkg/fencing ./pkg/fencing/cri ./pkg/fencing/runtimeagent ./pkg/operator ./pkg/recovery ./internal/objstore ./e2e/fencing -count=1 -timeout=5m
 
+  object-store-provider-contracts:
+    if: github.event_name != 'workflow_dispatch' || (!inputs.fencing_only && !inputs.fixture_only)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    # The contract launcher uses fixed service DNS aliases, so run the test
+    # inside a job container on the same Actions network as its services.
+    container:
+      image: golang:1.27.3-bookworm@sha256:972b4110ba0f47539a975c31e52c64765e1ff19f2d74469ae4a595c6676e80a5
+    services:
+      floci-s3:
+        image: floci/floci:2.3.0@sha256:e0b292df4dc9559b7b1bf4f51bdda4bb8e269276236438cd03cae661260ea8a9
+      floci-gcs:
+        image: floci/floci-gcp:0.11.0@sha256:eae9683d806ceb643bcb36aee97cdb8cad13c3e2959cd053bf40e481994fde12
+      floci-az:
+        image: floci/floci-az:0.15.0@sha256:530635d603223e120adbf9221a97560cffc6991d65fa0c72d0f79d1097974c89
+    steps:
+      - uses: actions/checkout@v4
+      - name: Wait for Floci service ports
+        run: |
+          set -eu
+          for endpoint in floci-s3:4566 floci-gcs:4588 floci-az:4577; do
+            host=${endpoint%:*}
+            port=${endpoint##*:}
+            attempt=0
+            until bash -c "exec 3<>/dev/tcp/$host/$port" 2>/dev/null; do
+              attempt=$((attempt + 1))
+              if [ "$attempt" -ge 120 ]; then
+                printf 'Floci service did not open %s after 60 seconds\n' "$endpoint" >&2
+                exit 1
+              fi
+              sleep 0.5
+            done
+          done
+      - name: Run pinned Floci provider SDK contracts
+        env:
+          RHIZA_FLOCI_INTEGRATION: "1"
+        run: sh scripts/test-floci-objstore.sh
+
   cooperative-fencing:
     if: github.event_name != 'workflow_dispatch' || !inputs.fixture_only
     runs-on: ubuntu-latest
@@ -281,6 +319,8 @@ jobs:
           mkdir -p "$RUNNER_TEMP/chaos-images"
           go build -o "$RUNNER_TEMP/chaos-images/rhiza" ./cmd/rhiza
           go build -o "$RUNNER_TEMP/chaos-images/operator" ./cmd/rhiza-operator
+          go build -o "$RUNNER_TEMP/chaos-images/rhiza-fencer" ./cmd/rhiza-fencer
+          go build -o "$RUNNER_TEMP/chaos-images/rhiza-runtime-agent" ./cmd/rhiza-runtime-agent
           docker build -f e2e/chaos/Dockerfile --build-arg BINARY=rhiza -t rhiza-chaos:local "$RUNNER_TEMP/chaos-images"
           docker build -f e2e/chaos/Dockerfile --build-arg BINARY=operator -t rhiza-operator-chaos:local "$RUNNER_TEMP/chaos-images"
           kind create cluster --name rhiza-operator-chaos --wait 120s
@@ -297,6 +337,7 @@ jobs:
           path: |
             operator-chaos-results
             !operator-chaos-results/kind/**
+            !operator-chaos-results/private-startup-diagnostics/**
       - name: Remove test cluster
         if: always()
         run: kind delete cluster --name rhiza-operator-chaos
@@ -358,6 +399,8 @@ jobs:
           esac
           if [[ "${{ matrix.host }}" != go ]]; then
             go build -o "$RUNNER_TEMP/chaos-images/operator" ./cmd/rhiza-operator
+            go build -o "$RUNNER_TEMP/chaos-images/rhiza-fencer" ./cmd/rhiza-fencer
+            go build -o "$RUNNER_TEMP/chaos-images/rhiza-runtime-agent" ./cmd/rhiza-runtime-agent
             if [[ "${{ matrix.host }}" == rust ]]; then
               docker build -f e2e/chaos/Dockerfile.rust -t rhiza-chaos:local "$RUNNER_TEMP/chaos-images"
             else
@@ -379,6 +422,7 @@ jobs:
           path: |
             automatic-chaos-results
             !automatic-chaos-results/kind/**
+            !automatic-chaos-results/private-startup-diagnostics/**
       - name: Remove test cluster
         if: always()
         run: kind delete cluster --name rhiza-operator-chaos
@@ -392,7 +436,7 @@ jobs:
         with:
           go-version-file: go.mod
           cache: true
-      - name: Membership lifecycle with real QUIC and object storage
+      - name: S3 voter membership, recovery, and read-replica lifecycle with Versity
         env:
           CGO_ENABLED: 1
           RHIZA_E2E_S3_ENDPOINT: 127.0.0.1:19000
@@ -470,7 +514,7 @@ jobs:
 
             aws --endpoint-url http://127.0.0.1:19000 s3 mb s3://rhiza
           )
-          go test -race . -run '^TestS3(Membership|VoterIdentity)' -count=1 -timeout=8m
+          go test -race . -run '^TestS3(Membership|VoterIdentity|ReadReplica)' -count=1 -timeout=8m
 
   rust-sdk:
     if: github.event_name != 'workflow_dispatch' || (!inputs.fencing_only && !inputs.fixture_only)
@@ -542,6 +586,17 @@ jobs:
         env:
           CGO_ENABLED: 0
         run: go test ./...
+      - name: Install pinned kubectl for client-side fixture tests
+        run: |
+          image=registry.k8s.io/kubectl@sha256:9cd9070def4060229de73314aef753caff194eebe2ca1f04d21f22320932c0c0
+          container=$(docker create "$image")
+          trap 'docker rm -f "$container" >/dev/null 2>&1 || true' EXIT
+          mkdir -p "$RUNNER_TEMP/fixture-kubectl"
+          docker cp "$container:/bin/kubectl" "$RUNNER_TEMP/fixture-kubectl/kubectl"
+          docker rm "$container"
+          trap - EXIT
+          chmod 0755 "$RUNNER_TEMP/fixture-kubectl/kubectl"
+          echo "$RUNNER_TEMP/fixture-kubectl" >> "$GITHUB_PATH"
       - name: Bucket fixture retry regression
         run: |
           python3 e2e/chaos/operator_fixture_test.py
@@ -730,6 +785,8 @@ jobs:
           mkdir -p "$RUNNER_TEMP/chaos-images"
           go build -o "$RUNNER_TEMP/chaos-images/rhiza" ./e2e/chaos/embedded-go
           go build -o "$RUNNER_TEMP/chaos-images/operator" ./cmd/rhiza-operator
+          go build -o "$RUNNER_TEMP/chaos-images/rhiza-fencer" ./cmd/rhiza-fencer
+          go build -o "$RUNNER_TEMP/chaos-images/rhiza-runtime-agent" ./cmd/rhiza-runtime-agent
           go build -o "$RUNNER_TEMP/chaos-images/anchor-service" ./examples/recovery-anchor
           labels=()
           if [ "$PUBLISH_CHAOS_IMAGE" = true ]; then
@@ -766,6 +823,7 @@ jobs:
           path: |
             anchor-chaos-results
             !anchor-chaos-results/kind/**
+            !anchor-chaos-results/private-startup-diagnostics/**
       - name: Remove test cluster
         if: always()
         run: kind delete cluster --name rhiza-anchor-chaos

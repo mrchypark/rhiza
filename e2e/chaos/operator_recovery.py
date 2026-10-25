@@ -2,11 +2,14 @@
 """Real Kubernetes/CRI faults against the running Operator; no mocked APIs."""
 import argparse
 import base64
+import hashlib
 import json
 import http.client
+import re
 from pathlib import Path
 import socket
 import subprocess
+import tempfile
 import threading
 import time
 import urllib.error
@@ -29,6 +32,7 @@ class Chaos:
         self.stop = threading.Event()
         self.writer = None
         self.admin = "chaos-admin"
+        self.supervised_bootstrap = False
 
     def command(self, argv, data=None):
         result = subprocess.run(argv, input=data, text=True, capture_output=True, timeout=240)
@@ -49,6 +53,12 @@ class Chaos:
 
     def patch(self, kind, name, value):
         self.k("patch", kind, name, "--type=merge", "-p", json.dumps(value))
+
+    def private_diagnostics_dir(self):
+        private = self.out / "private-startup-diagnostics"
+        private.mkdir(mode=0o700, exist_ok=True)
+        private.chmod(0o700)
+        return private
 
     def event(self, name, **evidence):
         entry = {"event": name, "time": time.time(), **evidence}
@@ -82,7 +92,9 @@ class Chaos:
         with socket.socket() as sock:
             sock.bind(("127.0.0.1", 0))
             port = sock.getsockname()[1]
-        log = open(self.out / f"forward-{pod}-{key[0]}-{remote_port}.log", "a")
+        log_path = self.private_diagnostics_dir() / f"forward-{pod}-{key[0]}-{remote_port}.log"
+        log = log_path.open("a")
+        log_path.chmod(0o600)
         proc = subprocess.Popen(["kubectl", "--context", self.context, "-n", self.ns,
                                  "port-forward", "pod/" + pod, f"{port}:{remote_port}"], stdout=log, stderr=log)
         log.close()
@@ -251,20 +263,403 @@ class Chaos:
             for subject in obj.get("subjects", []):
                 subject["namespace"] = self.ns
         self.apply(rbac)
-        fixture = resources(self.ns, self.args.db_image, self.args.operator_image)
+        fixture = resources(self.ns, self.args.db_image, self.args.operator_image,
+                            supervised=self.supervised_bootstrap)
         workloads = [o for o in fixture if o["kind"] == "StatefulSet" or o["metadata"]["name"] == "rhiza-operator"]
         self.apply([o for o in fixture if o not in workloads])
         self.k("wait", "--for=condition=Complete", "job/rhiza-create-bucket", "--timeout=180s")
+        if self.supervised_bootstrap:
+            self.install_supervised_authority()
+            self.apply({"apiVersion": "v1", "kind": "ServiceAccount",
+                        "metadata": {"name": "rhiza-supervised", "namespace": self.ns},
+                        "automountServiceAccountToken": False})
+            operator = next(o for o in workloads if o["metadata"]["name"] == "rhiza-operator")
+            env = operator["spec"]["template"]["spec"]["containers"][0].setdefault("env", [])
+            env.extend([
+                {"name": "RHIZA_AUTOMATIC_RECOVERY", "value": "true"},
+                {"name": "RHIZA_FENCER_BACKEND", "value": "kubernetes"},
+            ])
         self.apply(workloads)
         config = self.get("configmap", "rhiza-config")["data"]
         self.members = json.loads(config["RHIZA_CLUSTER_MEMBERS"])
-        self.k("rollout", "status", "deployment/rhiza-operator", "--timeout=180s")
+        if self.supervised_bootstrap:
+            self.before_supervised_root()
+            if json.loads(self.k("get", "pods", "-l", "app.kubernetes.io/name=rhiza", "-o", "json"))["items"]:
+                raise RuntimeError("supervised root binding requires zero source Pods")
+            self.apply(self.supervised_root_resource())
+            self.k("scale", "deployment/rhiza-operator", "--replicas=1")
+            self.k("rollout", "status", "deployment/rhiza-operator", "--timeout=180s")
+            root_uid = self.get("rhizacluster", "rhiza")["metadata"]["uid"]
+            sts_uid = self.get("statefulset", "rhiza")["metadata"]["uid"]
+            self.wait("supervised root UID pinned before first Pod", lambda: self._root_pinned(root_uid, sts_uid), 120)
+            if self.get("rhizacluster", "rhiza")["metadata"].get("uid") != root_uid:
+                raise RuntimeError("supervised source root identity changed before initial scale")
+            if json.loads(self.k("get", "pods", "-l", "app.kubernetes.io/name=rhiza", "-o", "json"))["items"]:
+                raise RuntimeError("source Pod appeared before the root UID pin was verified")
+            self.event("supervised_root_pinned_before_scale", root_uid=root_uid, stateful_set_uid=sts_uid)
+            self.k("scale", "statefulset/rhiza", "--replicas=3")
+        else:
+            self.k("rollout", "status", "deployment/rhiza-operator", "--timeout=180s")
         for pod in ("rhiza-0", "rhiza-1", "rhiza-2"):
             self.wait("initial voter " + pod, lambda p=pod: self.ready(p), 240)
         self.execute("rhiza-0", "chaos-schema", "CREATE TABLE chaos_items (id INTEGER PRIMARY KEY, value TEXT NOT NULL)")
         self.execute("rhiza-0", "chaos-seed", "INSERT INTO chaos_items VALUES (0, 'seed')")
         self.start_writer()
         self.wait("workload began", lambda: len(self.acks) >= 5)
+
+    def before_supervised_root(self):
+        """Hook for scenario-specific dependencies that must precede the root."""
+
+    def supervised_root_resource(self):
+        raise RuntimeError("supervised bootstrap requires a root resource")
+
+    def _root_pinned(self, root_uid, sts_uid):
+        sts = self.get("statefulset", "rhiza")
+        return (sts["metadata"].get("uid") == sts_uid and
+                sts["spec"].get("replicas") == 0 and
+                sts["spec"]["template"].get("metadata", {}).get("annotations", {}).get(
+                    "rhiza.mrchypark.dev/fencing-root-uid") == root_uid)
+
+    def _runtime_profile(self):
+        version = self.command(["docker", "exec", self.node, "crictl", "version"])
+
+        def field(name):
+            values = [line.split(":", 1)[1].strip() for line in version.splitlines()
+                      if line.split(":", 1)[0].strip() == name]
+            if len(values) != 1 or not values[0]:
+                raise RuntimeError(f"runtime profile field {name} is unavailable or ambiguous")
+            return values[0]
+
+        info = json.loads(self.command(["docker", "exec", self.node, "crictl", "info", "-o", "json"]))
+        runtime = info.get("config", {}).get("containerd", {})
+        runtime_type = runtime.get("runtimes", {}).get(runtime.get("defaultRuntimeName"), {}).get("runtimeType", "")
+        kernel = self.command(["docker", "exec", self.node, "uname", "-r"]).strip()
+        cgroup = self.command(["docker", "exec", self.node, "stat", "-fc", "%T", "/sys/fs/cgroup"]).strip()
+        values = {"containerd-version": field("RuntimeVersion"),
+                  "containerd-runtime-type": runtime_type,
+                  "kernel-release": kernel,
+                  "cgroup-profile-id": "kind-ci-cgroup-v2-component-v1"}
+        if field("RuntimeName") != "containerd" or field("RuntimeApiVersion") != "v1" or cgroup != "cgroup2fs":
+            raise RuntimeError("supervised fixture requires the existing containerd CRI v1/cgroup-v2 profile")
+        if any(not re.fullmatch(r"[A-Za-z0-9._+-]+", value) for value in values.values()):
+            raise RuntimeError("runtime profile contains an unsafe or missing field")
+        return values
+
+    def install_supervised_authority(self):
+        root = Path(__file__).resolve().parents[2]
+        profile = self._runtime_profile()
+        with tempfile.TemporaryDirectory(prefix="rhiza-supervised-") as directory:
+            tls_config = Path(directory, "openssl.cnf")
+            tls_config.write_text(
+                "[req]\ndistinguished_name=dn\nx509_extensions=ext\nprompt=no\n[dn]\nCN=rhiza-fencer\n"
+                "[ext]\nbasicConstraints=critical,CA:TRUE\nkeyUsage=critical,digitalSignature,keyEncipherment,keyCertSign\n"
+                f"extendedKeyUsage=serverAuth\nsubjectAltName=DNS:rhiza-fencer,DNS:rhiza-fencer.{self.ns}.svc,DNS:runtime-agent\n")
+            subprocess.run(["openssl", "req", "-x509", "-newkey", "rsa:2048", "-nodes", "-days", "1",
+                            "-config", str(tls_config), "-keyout", f"{directory}/tls.key",
+                            "-out", f"{directory}/tls.crt"], check=True, capture_output=True, timeout=30)
+            for secret_name in ("rhiza-fencer-tls", "rhiza-runtime-agent-tls"):
+                self.k("create", "secret", "tls", secret_name, f"--cert={directory}/tls.crt",
+                       f"--key={directory}/tls.key")
+            self.k("create", "configmap", "rhiza-fencer-ca",
+                   f"--from-file=ca.crt={directory}/tls.crt")
+            self.k("create", "secret", "generic", "rhiza-runtime-agent-ca",
+                   f"--from-file=ca.crt={directory}/tls.crt")
+
+        authority = (root / "deploy/operator/fencing/authority.yaml").read_text()
+        replacements = {
+            "namespace: rhiza": f"namespace: {self.ns}",
+            "resourceNames: [rhiza]": f"resourceNames: [{self.ns}]",
+            "image: rhiza-operator:latest": f"image: {self.args.operator_image}",
+            "QUALIFIED_CONTAINERD_VERSION": profile["containerd-version"],
+            "QUALIFIED_CONTAINERD_RUNTIME_TYPE": profile["containerd-runtime-type"],
+            "QUALIFIED_PRIVATE_CGROUP_V2_PROFILE_ID": profile["cgroup-profile-id"],
+            "QUALIFIED_LINUX_KERNEL_RELEASE": profile["kernel-release"],
+            "QUALIFIED_SANDBOX_EXECUTABLE_SHA256": "",
+            "PINNED_RHIZA_FENCER_DEPLOYMENT_UID": "pending-authority-uid",
+        }
+        for old, new in replacements.items():
+            authority = authority.replace(old, new)
+        self.k("apply", "-f", "-", data=authority)
+        authority_uid = self.get("deployment", "rhiza-fencer")["metadata"]["uid"]
+        self.patch("configmap", "rhiza-runtime-agent-profile", {"data": {
+            **profile, "authority-deployment-uid": authority_uid,
+            "sandbox-executable-sha256": "", "sandbox-args-json": '["/pause"]'}})
+        self.k("patch", "deployment", "rhiza-fencer", "--type=strategic", "-p", json.dumps({"spec": {"template": {"spec": {"containers": [{
+            "name": "authority", "envFrom": [
+                {"configMapRef": {"name": "rhiza-config"}},
+                {"secretRef": {"name": "rhiza-object-store"}},
+            ]}]}}}}))
+        self.k("rollout", "status", "deployment/rhiza-fencer", "--timeout=180s")
+        self.k("rollout", "restart", "daemonset/rhiza-runtime-agent")
+        self.k("rollout", "status", "daemonset/rhiza-runtime-agent", "--timeout=180s")
+
+    def capture_failure_diagnostics(self):
+        """Capture identity-bound, bounded startup evidence before cleanup."""
+        private = self.private_diagnostics_dir()
+        deadline = time.monotonic() + 10
+        errors = []
+        error_details = []
+        record = {"namespace": self.ns, "context": self.context, "captures": []}
+
+        def capture_error(code, detail):
+            errors.append(code)
+            error_details.append({"code": code, "detail": detail})
+
+        def read_json(args):
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise TimeoutError("diagnostic deadline exhausted")
+            result = subprocess.run(
+                ["kubectl", "--context", self.context, "-n", self.ns,
+                 "--request-timeout=2s", *args], capture_output=True,
+                text=True, timeout=min(3, remaining))
+            if result.returncode:
+                raise RuntimeError(result.stderr[-500:])
+            return json.loads(result.stdout)
+
+        def read_secret_identity(name):
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise TimeoutError("diagnostic deadline exhausted")
+            fields = r'jsonpath={.metadata.name}{"\n"}{.metadata.uid}{"\n"}{.metadata.annotations.rhiza\.mrchypark\.dev/recovery-owner}{"\n"}{.immutable}'
+            result = subprocess.run(
+                ["kubectl", "--context", self.context, "-n", self.ns,
+                 "--request-timeout=2s", "get", "secret", name, "-o", fields],
+                capture_output=True, text=True, timeout=min(3, remaining))
+            if result.returncode:
+                raise RuntimeError(result.stderr[-500:])
+            values = result.stdout.splitlines()
+            if len(values) != 4:
+                raise ValueError("credential metadata is incomplete")
+            return {"name": values[0], "uid": values[1],
+                    "owner": values[2], "immutable": values[3] == "true"}
+
+        root = None
+        try:
+            root = read_json(["get", "rhizacluster", "rhiza", "-o", "json"])
+            status = root.get("status", {})
+            record["root"] = {"uid": root.get("metadata", {}).get("uid"),
+                "generation": root.get("metadata", {}).get("generation"),
+                "observedGeneration": status.get("observedGeneration"),
+                "phase": status.get("phase"), "message": status.get("message")}
+        except Exception as exc:
+            record["root"] = {"readError": f"{type(exc).__name__}: {exc}"}
+            capture_error("root_status_read_failed", f"{type(exc).__name__}: {exc}")
+
+        sts = {}
+        try:
+            sts = read_json(["get", "statefulset", "rhiza", "-o", "json"])
+            sts_uid = sts.get("metadata", {}).get("uid", "")
+            record["statefulSet"] = {"uid": sts_uid,
+                "generation": sts.get("metadata", {}).get("generation"),
+                "replicas": sts.get("spec", {}).get("replicas"),
+                "observedGeneration": sts.get("status", {}).get("observedGeneration"),
+                "template": {"annotations": sts.get("spec", {}).get("template", {}).get("metadata", {}).get("annotations", {}),
+                    "containers": [{k: c.get(k) for k in ("name", "image", "command", "args", "ports")}
+                                   for c in sts.get("spec", {}).get("template", {}).get("spec", {}).get("containers", [])]}}
+            pods = read_json(["get", "pods", "-o", "json"]).get("items", [])
+        except Exception as exc:
+            capture_error("source_identity_list_failed", f"{type(exc).__name__}: {exc}")
+            pods, sts_uid = [], ""
+
+        learner_binding = None
+        root_meta = (root or {}).get("metadata", {})
+        root_spec = (root or {}).get("spec", {})
+        root_status = (root or {}).get("status", {})
+        root_uid = root_meta.get("uid", "")
+        active_recovery = root_status.get("activeRecovery", "")
+        if active_recovery:
+            try:
+                child = read_json(["get", "rhizarecovery", active_recovery, "-o", "json"])
+                child_meta = child.get("metadata", {})
+                child_spec = child.get("spec", {})
+                membership = child_spec.get("membership", {})
+                annotations = child_meta.get("annotations", {})
+                sts_annotations = sts.get("spec", {}).get("template", {}).get("metadata", {}).get("annotations", {})
+                operation = membership.get("operationID", "")
+                learner_name = membership.get("replacementPod", "")
+                credential_name = membership.get("replacementSecret", "")
+                child_owned = (root_uid and root_spec.get("automatic") is True and root_spec.get("statefulSet") == "rhiza" and
+                        root_spec.get("logicalID") and root_status.get("activeClusterID") and
+                        root_status.get("observedGeneration") == root_meta.get("generation") and
+                        sts_uid and sts.get("metadata", {}).get("name") == root_spec.get("statefulSet") and
+                        sts_annotations.get("rhiza.mrchypark.dev/cooperative-fencing") == "1" and
+                        sts_annotations.get("rhiza.mrchypark.dev/fencing-root-uid") == root_uid and
+                        child_meta.get("name") == active_recovery and child_meta.get("uid") and
+                        annotations.get("rhiza.mrchypark.dev/automatic-owner") == root_uid and
+                        annotations.get("rhiza.mrchypark.dev/automatic-logical") == root_spec.get("logicalID") and
+                        child_spec.get("statefulSet") == root_spec.get("statefulSet") and
+                        child_spec.get("sourceClusterID") == root_status.get("activeClusterID"))
+                if child_owned and membership:
+                    if operation != active_recovery or not learner_name or not credential_name:
+                        capture_error("active_recovery_binding_mismatch", active_recovery)
+                    else:
+                        credential = read_secret_identity(credential_name)
+                        if (credential["name"] != credential_name or not credential["uid"] or
+                                not credential["immutable"] or credential["owner"] != operation):
+                            capture_error("active_recovery_binding_mismatch", active_recovery)
+                        else:
+                            learner_binding = {"name": learner_name, "rootUID": root_uid,
+                                               "statefulSetUID": sts_uid, "operationID": operation,
+                                               "credentialUID": credential["uid"]}
+                elif not child_owned:
+                    capture_error("active_recovery_binding_mismatch", active_recovery)
+            except Exception as exc:
+                capture_error("active_recovery_binding_unavailable", f"{type(exc).__name__}: {exc}")
+
+        candidates = []
+        learner_pod_seen = False
+        for pod in pods:
+            metadata = pod.get("metadata", {})
+            labels = metadata.get("labels", {})
+            name = metadata.get("name", "")
+            component = labels.get("app.kubernetes.io/name", "")
+            is_bound_learner = False
+            if learner_binding and name == learner_binding["name"]:
+                learner_pod_seen = True
+                refs = metadata.get("ownerReferences", [])
+                annotations = metadata.get("annotations", {})
+                is_bound_learner = (
+                    metadata.get("uid") and labels.get("rhiza.mrchypark.dev/automatic-learner") == name and
+                    len(refs) == 1 and refs[0].get("apiVersion") == "apps/v1" and
+                    refs[0].get("kind") == "StatefulSet" and refs[0].get("name") == "rhiza" and
+                    refs[0].get("uid") == sts_uid and refs[0].get("controller") is False and
+                    annotations.get("rhiza.mrchypark.dev/fencing-root-uid") == learner_binding["rootUID"] and
+                    annotations.get("rhiza.mrchypark.dev/recovery-owner") == learner_binding["operationID"] and
+                    annotations.get("rhiza.mrchypark.dev/cooperative-fencing") == "1" and
+                    annotations.get("rhiza.mrchypark.dev/fencing-credential-uid") == learner_binding["credentialUID"])
+                if not is_bound_learner:
+                    capture_error("learner_pod_binding_mismatch", name)
+            if component in ("rhiza", "rhiza-fencer", "rhiza-runtime-agent", "rhiza-operator") or is_bound_learner:
+                owner_ok = any(ref.get("controller") and ref.get("kind") == "StatefulSet" and
+                               ref.get("name") == "rhiza" and ref.get("uid") == sts_uid
+                               for ref in metadata.get("ownerReferences", []))
+                if component == "rhiza" and not owner_ok:
+                    record["captures"].append({"pod": name, "identity": "owner-mismatch"})
+                    continue
+                if is_bound_learner:
+                    component = "learner"
+                pod["_diagnostic_component"] = component
+                candidates.append(pod)
+        if learner_binding and not learner_pod_seen:
+            capture_error("bound_learner_pod_not_listed", learner_binding["name"])
+        candidates.sort(key=lambda pod: (pod.get("_diagnostic_component") != "learner",
+                                         pod.get("status", {}).get("phase") == "Running",
+                                         pod.get("metadata", {}).get("name", "")))
+        for pod in candidates[:5]:
+            metadata = pod.get("metadata", {})
+            name = metadata.get("name", "")
+            identity = {"name": name, "uid": metadata.get("uid"),
+                        "phase": pod.get("status", {}).get("phase"),
+                        "ownerUID": next((ref.get("uid") for ref in metadata.get("ownerReferences", [])
+                                          if ref.get("kind") == "StatefulSet"), None)}
+            for container in pod.get("spec", {}).get("containers", []):
+                cname = container.get("name", "")
+                if cname not in ("rhiza", "authority", "runtime-agent", "operator"):
+                    continue
+                state = next((status for status in pod.get("status", {}).get("containerStatuses", [])
+                              if status.get("name") == cname), {})
+                item = {"identity": identity, "component": pod.get("_diagnostic_component"), "container": cname,
+                        "containerStatus": {"containerID": state.get("containerID"),
+                            "restartCount": state.get("restartCount"),
+                            "state": state.get("state"), "lastState": state.get("lastState")},
+                        "logs": {}}
+
+                def incarnation(pod_status, previous):
+                    container_status = next((status for status in pod_status.get("status", {}).get("containerStatuses", [])
+                                             if status.get("name") == cname), {})
+                    restart_count = container_status.get("restartCount")
+                    if previous:
+                        terminated = container_status.get("lastState", {}).get("terminated", {})
+                        container_id = terminated.get("containerID")
+                    else:
+                        container_id = container_status.get("containerID")
+                    return (container_id, restart_count) if container_id else None
+
+                try:
+                    before_pod = read_json(["get", "pod", name, "-o", "json"])
+                    before_ok = (before_pod.get("metadata", {}).get("uid") == identity["uid"] and
+                                 all(incarnation(pod, previous) == incarnation(before_pod, previous)
+                                     for previous in (False, True)))
+                except Exception as exc:
+                    before_pod, before_ok = {}, False
+                    capture_error("pod_identity_precheck_failed", f"{name}/{cname}: {type(exc).__name__}: {exc}")
+                pending_logs = {}
+                for previous in (False, True):
+                    remaining = deadline - time.monotonic()
+                    key = "previous" if previous else "current"
+                    expected_incarnation = incarnation(before_pod, previous) if before_ok else None
+                    if not before_ok or expected_incarnation is None:
+                        code = "pod_identity_changed" if not before_ok else "container_incarnation_unavailable"
+                        item["logs"][key] = {"captured": False, "errorCode": code}
+                        capture_error(code, f"{name}/{cname}/{key}")
+                        continue
+                    if remaining <= 0:
+                        item["logs"][key] = {"captured": False, "errorCode": "diagnostic_deadline_exhausted"}
+                        capture_error("diagnostic_deadline_exhausted", f"{name}/{cname}/{key}")
+                        continue
+                    args = ["logs", name, "-c", cname, "--tail=100", "--limit-bytes=32768"]
+                    if previous:
+                        args.append("--previous")
+                    try:
+                        result = subprocess.run(
+                            ["kubectl", "--context", self.context, "-n", self.ns,
+                             "--request-timeout=2s", *args], capture_output=True,
+                            timeout=min(3, remaining))
+                        payload = result.stdout[:32768]
+                        captured = result.returncode == 0
+                        detail = result.stderr.decode(errors="replace")[-500:] if result.returncode else ""
+                    except Exception as exc:
+                        payload = b""
+                        captured = False
+                        detail = f"{type(exc).__name__}: {exc}"
+                    pending_logs[key] = (payload, captured, detail)
+
+                after_ok = False
+                if pending_logs:
+                    try:
+                        after_pod = read_json(["get", "pod", name, "-o", "json"])
+                        after_ok = (before_ok and after_pod.get("metadata", {}).get("uid") == identity["uid"] and
+                                    all(incarnation(before_pod, previous) == incarnation(after_pod, previous)
+                                        for previous in (False, True)))
+                    except Exception as exc:
+                        capture_error("pod_identity_postcheck_failed", f"{name}/{cname}: {type(exc).__name__}: {exc}")
+                if not after_ok:
+                    for key in pending_logs:
+                        item["logs"][key] = {"captured": False, "errorCode": "pod_or_container_identity_changed"}
+                    capture_error("pod_or_container_identity_changed", f"{name}/{cname}")
+                for key, (payload, captured, detail) in pending_logs.items():
+                    if after_ok:
+                        path = private / f"{name}-{cname}-{key}.log"
+                        path.write_bytes(payload)
+                        path.chmod(0o600)
+                        item["logs"][key] = {"captured": captured,
+                            "bytes": len(payload), "sha256": hashlib.sha256(payload).hexdigest(),
+                            "truncated": len(payload) == 32768}
+                    if not captured and after_ok:
+                        item["logs"].setdefault(key, {"captured": False})
+                        item["logs"][key]["errorCode"] = "pod_log_capture_failed"
+                        item["logs"][key]["error"] = detail
+                        capture_error("pod_log_capture_failed", f"{name}/{cname}/{key}: {detail}")
+                record["captures"].append(item)
+        record["captureErrors"] = error_details
+        path = private / "record.json"
+        path.write_text(json.dumps(record, indent=2))
+        path.chmod(0o600)
+
+        summary = {"version": 1, "status": "partial" if errors else "complete",
+            "captureErrors": sorted(set(errors)), "captures": []}
+        for item in record["captures"]:
+            logs = {}
+            for key, result in item.get("logs", {}).items():
+                logs[key] = {field: result[field] for field in ("captured", "bytes", "sha256", "truncated", "errorCode")
+                             if field in result}
+            summary["captures"].append({"component": item.get("component"),
+                                        "container": item.get("container"), "logs": logs})
+        public_path = self.out / "startup-diagnostics-summary.json"
+        public_path.write_text(json.dumps(summary, indent=2))
+        public_path.chmod(0o600)
+        return sorted(set(errors))
 
     def run(self):
         self.setup()
@@ -384,7 +779,9 @@ class Chaos:
                 for previous in (False, True):
                     try:
                         args = ["logs", name, "--all-containers", "--tail=500"] + (["--previous"] if previous else [])
-                        (self.out / f"{name}{'-previous' if previous else ''}.log").write_text(self.k(*args))
+                        path = self.private_diagnostics_dir() / f"{name}{'-previous' if previous else ''}.log"
+                        path.write_text(self.k(*args))
+                        path.chmod(0o600)
                     except RuntimeError:
                         pass
         except RuntimeError:
@@ -400,6 +797,14 @@ def main():
     chaos = Chaos(parser.parse_args())
     try:
         chaos.run()
+    except Exception as original:
+        try:
+            errors = chaos.capture_failure_diagnostics()
+        except Exception:
+            errors = ["diagnostic_capture_failed"]
+        if errors:
+            raise RuntimeError(f"{original}; bounded diagnostic capture errors: {errors}") from original
+        raise
     finally:
         chaos.cleanup()
 

@@ -44,9 +44,13 @@ type ExecutionConfig struct {
 	AdminToken string    `json:"admin_token"`
 	// PeerToken is this process's private peer identity secret. It is never
 	// replicated; Members carry only public identity.
-	PeerToken                     string                   `json:"peer_token"`
-	Members                       []NodeConfig             `json:"members"`
-	EnableReconfiguration         bool                     `json:"enable_reconfiguration,omitempty"`
+	PeerToken             string       `json:"peer_token"`
+	Members               []NodeConfig `json:"members"`
+	EnableReconfiguration bool         `json:"enable_reconfiguration,omitempty"`
+	// EngineOwnedRemovals opts this process into the versioned engine-owned
+	// REMOVE contract. Public HA configuration derives it from the existing
+	// EnableReconfiguration switch; direct internal callers may set it explicitly.
+	EngineOwnedRemovals           bool                     `json:"engine_owned_removals,omitempty"`
 	Learner                       *NodeConfig              `json:"learner,omitempty"`
 	LocalGraphNodePropertyIndexes []GraphNodePropertyIndex `json:"local_graph_node_property_indexes,omitempty"`
 

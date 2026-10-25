@@ -529,6 +529,9 @@ func TestSourceMutationClientNegativeResultsAreNotSuccessAndBootstrapOwnersDiffe
 			if !errors.Is(err, want) {
 				t.Fatalf("outcome %s returned %v", outcome, err)
 			}
+			if errors.Is(err, ErrMutationDeferred) {
+				t.Fatalf("untyped terminal outcome %s was mistaken for a pinned-generation deferral: %v", outcome, err)
+			}
 			if client.state.data.Steps[0].Entry.Resolution == nil || !client.state.data.Steps[0].Advanced {
 				t.Fatal("negative result was not durably retained")
 			}
@@ -548,5 +551,34 @@ func TestSourceMutationClientNegativeResultsAreNotSuccessAndBootstrapOwnersDiffe
 	}
 	if fake.admits != 2 || len(client.state.data.Steps) != 2 || client.state.data.Steps[0].Entry.Intent.OwnerStep == client.state.data.Steps[1].Entry.Intent.OwnerStep {
 		t.Fatal("distinct bootstrap registrations did not retain distinct owner tuples")
+	}
+}
+
+func TestSourceMutationClientOnlyTypedPinnedNoDispatchIsDeferred(t *testing.T) {
+	client, _, _, _ := newSourceMutationClientTest(t)
+	entry := MutationEntry{
+		Intent:         MutationIntent{Kind: "delete", Condition: MutationCondition{Mode: MutationMatchGeneration, Generation: 9}},
+		Preparation:    &MutationPreparation{GenerationSet: true, Generation: 9},
+		DispatchClosed: true,
+		Dispatches:     map[string]MutationDispatch{},
+		Resolution: &MutationResolution{Outcome: MutationRejected, Reason: MutationResolutionReasonGenerationZeroPinned,
+			PreparationHash: journalTestDigest, ReceiptDigest: journalTestDigest, AllCopiesTerminal: true},
+	}
+	err := client.finish(sourceRetryStep{Sequence: 1, Entry: entry, Advanced: true})
+	if !errors.Is(err, ErrMutationDeferred) || !errors.Is(err, errMutationRejected) || errors.Is(err, ErrMutationConditionFailed) {
+		t.Fatalf("typed pinned no-dispatch result=%v, want deferred rejected non-success", err)
+	}
+
+	entry.Resolution.Reason = ""
+	err = client.finish(sourceRetryStep{Sequence: 1, Entry: entry, Advanced: true})
+	if !errors.Is(err, errMutationRejected) || errors.Is(err, ErrMutationDeferred) {
+		t.Fatalf("ordinary rejection=%v, want non-deferred rejection", err)
+	}
+
+	entry.Resolution.Reason = MutationResolutionReasonGenerationZeroPinned
+	entry.Resolution.ConditionFailed = true
+	err = client.finish(sourceRetryStep{Sequence: 1, Entry: entry, Advanced: true})
+	if err == nil || errors.Is(err, ErrMutationDeferred) {
+		t.Fatalf("condition-failed result with pinned reason=%v, want invalid reason and no deferral", err)
 	}
 }

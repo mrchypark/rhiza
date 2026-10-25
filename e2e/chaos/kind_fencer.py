@@ -17,10 +17,10 @@ CR_GROUP, CR_VER, CR_PLURAL = "rhiza.mrchypark.dev", "v1alpha1", "rhizafences"
 WEBHOOK_NAME = "rhiza-chaos-fencing-webhook"
 WEBHOOK_PATH = "/fence"
 WEBHOOK_LABEL = "rhiza-chaos-fencing"
-MINIO_DEPLOY = "rhiza-minio"
+VERSITYGW_DEPLOY = "rhiza-versitygw"
 POLL_SEC = 2.0
 KILL_TIMEOUT = 30.0
-MINIO_TIMEOUT = 60.0
+VERSITYGW_TIMEOUT = 60.0
 MAX_BODY = 1 << 20
 PROXY_PORT = 18001
 WEBHOOK_PORT = 18443
@@ -758,41 +758,41 @@ class KindFencer:
 
     def _quiesce_storage(self):
         ns = self.chaos.ns
-        dep = self.chaos.get("deployment", MINIO_DEPLOY)
+        dep = self.chaos.get("deployment", VERSITYGW_DEPLOY)
         selector = dep["spec"]["selector"]["matchLabels"]
         sel = ",".join(f"{k}={v}" for k, v in selector.items())
         raw = self.chaos.k("get", "pods", "-n", ns, "-l", sel, "-o", "json")
         pods = json.loads(raw).get("items", [])
         if not pods:
-            raise AssertionError("no MinIO pod found")
+            raise AssertionError("no Versity Gateway pod found")
         pod = pods[0]
         pod_name = pod["metadata"]["name"]
         pod_uid = pod["metadata"]["uid"]
         statuses = pod["status"].get("containerStatuses", [])
-        minio_st = next(
+        gateway_st = next(
             (s for s in statuses
-             if s["name"] == "minio"
+             if s["name"] == "versitygw"
              and s.get("state", {}).get("running")),
             None)
-        if not minio_st:
-            raise AssertionError("MinIO container not running")
-        old_cid = minio_st["containerID"].split("://", 1)[1]
+        if not gateway_st:
+            raise AssertionError("Versity Gateway container not running")
+        old_cid = gateway_st["containerID"].split("://", 1)[1]
         self.chaos.command(
             ["docker", "exec", self.chaos.node,
              "crictl", "stop", old_cid])
-        _log(f"MinIO stopped: {old_cid}")
+        _log(f"Versity Gateway stopped: {old_cid}")
 
-        deadline = time.monotonic() + MINIO_TIMEOUT
+        deadline = time.monotonic() + VERSITYGW_TIMEOUT
         new_cid = None
         while time.monotonic() < deadline:
             if self._stop.is_set():
-                raise RuntimeError("stopped during MinIO restart wait")
+                raise RuntimeError("stopped during Versity Gateway restart wait")
             try:
                 p = self.chaos.get("pod", pod_name)
                 if p["metadata"]["uid"] != pod_uid:
-                    raise AssertionError("MinIO Pod UID changed")
+                    raise AssertionError("Versity Gateway Pod UID changed")
                 for s in p["status"].get("containerStatuses", []):
-                    if (s["name"] == "minio"
+                    if (s["name"] == "versitygw"
                             and s.get("state", {}).get("running")):
                         cid = s["containerID"].split("://", 1)[1]
                         if cid != old_cid:
@@ -806,18 +806,18 @@ class KindFencer:
                 break
             time.sleep(1.0)
         if not new_cid:
-            raise AssertionError("MinIO did not restart")
-        _log(f"MinIO restarted: {new_cid}")
+            raise AssertionError("Versity Gateway did not restart")
+        _log(f"Versity Gateway restarted: {new_cid}")
 
         deadline = time.monotonic() + 30
         while time.monotonic() < deadline:
             if self._stop.is_set():
-                raise RuntimeError("stopped during MinIO ready wait")
+                raise RuntimeError("stopped during Versity Gateway ready wait")
             p = self.chaos.get("pod", pod_name)
             conds = p["status"].get("conditions", [])
             if any(c["type"] == "Ready" and c["status"] == "True"
                    for c in conds):
-                _log("MinIO Pod Ready")
+                _log("Versity Gateway Pod Ready")
                 return
             time.sleep(1.0)
-        raise AssertionError("MinIO Pod not Ready after restart")
+        raise AssertionError("Versity Gateway Pod not Ready after restart")

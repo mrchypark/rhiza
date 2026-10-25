@@ -1,7 +1,6 @@
 use rhizadb::Db;
 use serde_json::{json, Value};
 use std::{
-    env,
     io::{Read, Write},
     net::{TcpListener, TcpStream},
     sync::Arc,
@@ -12,10 +11,11 @@ use std::{
 // Test-only chaos fixture; this intentionally minimal HTTP parser is not production code.
 const MAX_BODY: usize = 64 << 10;
 const MAX_HEADERS: usize = 16 << 10;
+const RECOVERY_ADDR: &str = "0.0.0.0:9091";
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut db = Db::open_from_env()?;
-    db.start_operator(&env::var("RHIZA_BIND_ADDR").unwrap_or_else(|_| "0.0.0.0:9091".into()))?;
+    db.start_operator(RECOVERY_ADDR)?;
     let listener = TcpListener::bind("0.0.0.0:8080")?;
     let db = Arc::new(db);
     for stream in listener.incoming() {

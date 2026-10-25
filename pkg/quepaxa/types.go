@@ -3,8 +3,8 @@ package quepaxa
 import (
 	"bytes"
 	"crypto/sha256"
-	"encoding/binary"
 	"encoding/base64"
+	"encoding/binary"
 	"encoding/json"
 	"fmt"
 )
@@ -84,13 +84,57 @@ type Cluster struct {
 	Members  []Member `json:"members"`
 }
 
+// EngineRemoval binds an ordinary, engine-owned voter removal to the exact
+// pre-transition configuration and the storage-effect exclusion evidence
+// required before its terminal can be recorded. FreezeHash and
+// StorageEffectsExcludedHash are zero in the freeze value; the terminal value
+// fills both after the freeze has been decided and storage closure is proven.
+type EngineRemoval struct {
+	Version           uint8  `json:"version"`
+	Mode              string `json:"mode"`
+	OperationID       string `json:"operation_id"`
+	ExpectedConfigID  uint   `json:"expected_config_id"`
+	ExpectedAbortSlot Slot   `json:"expected_abort_slot"`
+	Removed           Member `json:"removed"`
+	// Target is the post-REMOVE survivor cluster, not the fresh candidate
+	// identity named separately by the fencing repair binding.
+	Target                     Cluster   `json:"target"`
+	Freeze                     Slot      `json:"freeze"`
+	FreezeHash                 ValueHash `json:"freeze_hash"`
+	StorageEffectsExcludedHash ValueHash `json:"storage_effects_excluded_hash"`
+}
+
+const engineRemovalMode = "engine-owned-remove"
+
+// ReconfigurationAdmissionKind distinguishes the existing learner admission
+// check from the per-recorder storage-exclusion check for an engine-owned
+// REMOVE terminal.
+type ReconfigurationAdmissionKind uint8
+
+const (
+	ReconfigurationAdmissionLearner ReconfigurationAdmissionKind = iota + 1
+	ReconfigurationAdmissionEngineRemoval
+)
+
+// ReconfigurationAdmission carries the same exact operation tuple through the
+// existing admission boundary. EngineRemoval is non-nil only for an
+// engine-owned REMOVE terminal.
+type ReconfigurationAdmission struct {
+	Kind          ReconfigurationAdmissionKind
+	Target        Cluster
+	Through       Slot
+	PrefixHash    [32]byte
+	EngineRemoval *EngineRemoval
+}
+
 type reconfigurationValue struct {
-	Terminal     bool     `json:"terminal,omitempty"`
-	Abort        bool     `json:"abort,omitempty"`
-	Freeze       Slot     `json:"freeze"`
-	TerminalSlot Slot     `json:"terminal_slot"`
-	Target       Cluster  `json:"target"`
-	PrefixHash   [32]byte `json:"prefix_hash"`
+	Terminal      bool           `json:"terminal,omitempty"`
+	Abort         bool           `json:"abort,omitempty"`
+	Freeze        Slot           `json:"freeze"`
+	TerminalSlot  Slot           `json:"terminal_slot"`
+	Target        Cluster        `json:"target"`
+	PrefixHash    [32]byte       `json:"prefix_hash"`
+	EngineRemoval *EngineRemoval `json:"engine_removal,omitempty"`
 }
 
 func encodeReconfiguration(value reconfigurationValue) ([]byte, error) {
@@ -114,6 +158,24 @@ func decodeReconfiguration(value []byte) (reconfigurationValue, bool, error) {
 	}
 	if decoded.Freeze == 0 || decoded.TerminalSlot != decoded.Freeze+16 || decoded.Target.ConfigID == 0 || len(decoded.Target.Members) == 0 {
 		return reconfigurationValue{}, true, fmt.Errorf("invalid reconfiguration value")
+	}
+	if decoded.EngineRemoval != nil {
+		removal := decoded.EngineRemoval
+		if removal.Version != 1 || removal.Mode != engineRemovalMode || removal.OperationID == "" ||
+			removal.ExpectedConfigID == 0 || removal.Removed.ID == "" || removal.Removed.WALIdentity == "" ||
+			removal.Target.ConfigID == 0 || len(removal.Target.Members) == 0 || removal.Freeze != decoded.Freeze ||
+			removal.Target.ConfigID != removal.ExpectedConfigID+1 ||
+			!sameCluster(removal.Target, decoded.Target) ||
+			removal.Target.MemberSet()[removal.Removed.ID].ID != "" {
+			return reconfigurationValue{}, true, fmt.Errorf("invalid engine-owned removal binding")
+		}
+		if decoded.Terminal {
+			if decoded.Abort || removal.FreezeHash == (ValueHash{}) || removal.StorageEffectsExcludedHash == (ValueHash{}) {
+				return reconfigurationValue{}, true, fmt.Errorf("engine-owned removal terminal lacks storage exclusion binding")
+			}
+		} else if removal.FreezeHash != (ValueHash{}) || removal.StorageEffectsExcludedHash != (ValueHash{}) {
+			return reconfigurationValue{}, true, fmt.Errorf("engine-owned removal freeze carries terminal evidence")
+		}
 	}
 	return decoded, true, nil
 }

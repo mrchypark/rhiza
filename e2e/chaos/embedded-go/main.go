@@ -37,6 +37,8 @@ import (
 	"github.com/quic-go/quic-go"
 )
 
+const recoveryAddr = "0.0.0.0:9091"
+
 func fixtureSupervisorStartupRole() fencing.StartupRole {
 	return fencing.StartupRole(os.Getenv("RHIZA_STARTUP_ROLE"))
 }
@@ -274,7 +276,7 @@ func runApplication(ctx context.Context, config rhiza.Config) (result error) {
 		}
 		operatorHandler = removeGate
 	}
-	management := &http.Server{Addr: config.BindAddr, Handler: operatorHandler, ReadHeaderTimeout: 5 * time.Second}
+	management := &http.Server{Addr: recoveryAddr, Handler: operatorHandler, ReadHeaderTimeout: 5 * time.Second}
 
 	app := http.NewServeMux()
 	// Test-harness telemetry only; never expose Config or credentials.
@@ -300,7 +302,32 @@ func runApplication(ctx context.Context, config rhiza.Config) (result error) {
 		}
 		respond(w, map[string]bool{"ready": true}, nil)
 	})
-	app.HandleFunc("POST /sql/execute", func(w http.ResponseWriter, r *http.Request) {
+	app.HandleFunc("POST /sql/execute", sqlExecuteHandler(db, guard))
+	app.HandleFunc("POST /sql/query", func(w http.ResponseWriter, r *http.Request) {
+		var req rhiza.QueryRequest
+		if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 65536)).Decode(&req); err != nil {
+			http.Error(w, "invalid request", 400)
+			return
+		}
+		result, err := db.Query(r.Context(), req)
+		respond(w, result, err)
+	})
+	app.HandleFunc("POST /qualification/request-status", func(w http.ResponseWriter, r *http.Request) {
+		var req rhiza.RequestStatusRequest
+		if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 65536)).Decode(&req); err != nil {
+			http.Error(w, "invalid request", http.StatusBadRequest)
+			return
+		}
+		result, err := db.RequestStatus(r.Context(), req)
+		respond(w, result, err)
+	})
+	server := &http.Server{Addr: ":8080", Handler: app, ReadHeaderTimeout: 5 * time.Second}
+	servers = []*http.Server{server, management}
+	return serveHost(ctx, servers, identity, os.Stdout)
+}
+
+func sqlExecuteHandler(db *rhiza.DB, guard *anchorGuard) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
 		var req rhiza.ExecuteRequest
 		if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 65536)).Decode(&req); err != nil {
 			http.Error(w, "invalid request", 400)
@@ -327,28 +354,7 @@ func runApplication(ctx context.Context, config rhiza.Config) (result error) {
 		}
 		result, err := db.Execute(r.Context(), req)
 		respond(w, result, err)
-	})
-	app.HandleFunc("POST /sql/query", func(w http.ResponseWriter, r *http.Request) {
-		var req rhiza.QueryRequest
-		if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 65536)).Decode(&req); err != nil {
-			http.Error(w, "invalid request", 400)
-			return
-		}
-		result, err := db.Query(r.Context(), req)
-		respond(w, result, err)
-	})
-	app.HandleFunc("POST /qualification/request-status", func(w http.ResponseWriter, r *http.Request) {
-		var req rhiza.RequestStatusRequest
-		if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 65536)).Decode(&req); err != nil {
-			http.Error(w, "invalid request", http.StatusBadRequest)
-			return
-		}
-		result, err := db.RequestStatus(r.Context(), req)
-		respond(w, result, err)
-	})
-	server := &http.Server{Addr: ":8080", Handler: app, ReadHeaderTimeout: 5 * time.Second}
-	servers = []*http.Server{server, management}
-	return serveHost(ctx, servers, identity, os.Stdout)
+	}
 }
 
 func qualificationRole(role string) (string, error) {
@@ -668,7 +674,7 @@ func newAnchorGuard(b recoveryanchor.Backend, anchorID, clusterID string) *ancho
 		anchorID:          anchorID,
 		clusterID:         clusterID,
 		format:            "sql-epoch-token/v1",
-		expectedStorageID: storageID("s3", "rhiza-minio:9000", "rhiza", "rhiza", clusterID),
+		expectedStorageID: storageID("s3", "rhiza-versitygw:9000", "rhiza", "rhiza", clusterID),
 	}
 }
 
