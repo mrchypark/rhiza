@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"net"
 	"net/http"
+	"os"
 	"path/filepath"
 	"testing"
 )
@@ -107,7 +108,12 @@ func TestSourceMutationRuntimeReplansAcrossSupervisorRelayAfterConditionalReject
 	t.Setenv("RHIZA_POD_NAME", id.PodName)
 	supervisor := &Supervisor{Authority: authority, Identity: id, requested: id, bound: id,
 		grant: StartupGrant{Identity: id, Role: StartupRoleVoterActive}, ticket: "private-ticket"}
-	socket := filepath.Join(t.TempDir(), "source-relay.sock")
+	socketDir, err := os.MkdirTemp("", "rhiza-relay-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(socketDir) })
+	socket := filepath.Join(socketDir, "s.sock")
 	listener, err := net.Listen("unix", socket)
 	if err != nil {
 		t.Fatal(err)

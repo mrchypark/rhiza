@@ -44,7 +44,18 @@ func TestWorkflowExcludesRawKindArtifacts(t *testing.T) {
 	for job, root := range map[string]string{"operator-chaos": "operator-chaos-results", "automatic-operator-chaos": "automatic-chaos-results", "anchor-operator-chaos": "anchor-chaos-results"} {
 		found := false
 		for _, step := range workflow.Jobs[job].Steps {
-			if strings.HasPrefix(step.Uses, "actions/upload-artifact@") && strings.TrimSpace(step.With.Path) == root+"\n!"+root+"/kind/**" {
+			if !strings.HasPrefix(step.Uses, "actions/upload-artifact@") {
+				continue
+			}
+			paths := strings.Split(strings.TrimSpace(step.With.Path), "\n")
+			if len(paths) < 3 || strings.TrimSpace(paths[0]) != root {
+				continue
+			}
+			excluded := map[string]bool{}
+			for _, path := range paths[1:] {
+				excluded[strings.TrimSpace(path)] = true
+			}
+			if excluded["!"+root+"/kind/**"] && excluded["!"+root+"/private-startup-diagnostics/**"] {
 				found = true
 			}
 		}
@@ -941,18 +952,20 @@ func TestFixtureOnlyWorkflowIsExclusiveAndRunsFixedGoSelectors(t *testing.T) {
 		t.Fatal("fixture_only must be an opt-in boolean that defaults to the normal full workflow")
 	}
 	wantConditions := map[string]string{
+<<<<<<< HEAD
+		"fencing-only":                    "github.event_name == 'workflow_dispatch' && inputs.fencing_only && !inputs.fixture_only",
+		"fixture-only":                    "github.event_name == 'workflow_dispatch' && inputs.fixture_only",
+		"cooperative-fencing":             "github.event_name != 'workflow_dispatch' || !inputs.fixture_only",
+		"object-store-provider-contracts": "github.event_name != 'workflow_dispatch' || (!inputs.fencing_only && !inputs.fixture_only)",
 		"embedded-object-storage-providers": "github.event_name != 'workflow_dispatch' || (!inputs.fencing_only && !inputs.fixture_only)",
-		"fencing-only":             "github.event_name == 'workflow_dispatch' && inputs.fencing_only && !inputs.fixture_only",
-		"fixture-only":             "github.event_name == 'workflow_dispatch' && inputs.fixture_only",
-		"cooperative-fencing":      "github.event_name != 'workflow_dispatch' || !inputs.fixture_only",
-		"operator-chaos":           "github.event_name != 'workflow_dispatch' || (!inputs.fencing_only && !inputs.fixture_only)",
-		"automatic-operator-chaos": "github.event_name != 'workflow_dispatch' || (!inputs.fencing_only && !inputs.fixture_only)",
-		"membership-e2e":           "github.event_name != 'workflow_dispatch' || (!inputs.fencing_only && !inputs.fixture_only)",
-		"rust-sdk":                 "github.event_name != 'workflow_dispatch' || (!inputs.fencing_only && !inputs.fixture_only)",
-		"go":                       "github.event_name != 'workflow_dispatch' || (!inputs.fencing_only && !inputs.fixture_only)",
-		"containers":               "github.event_name != 'workflow_dispatch' || (!inputs.fencing_only && !inputs.fixture_only)",
-		"anchor-operator-chaos":    "github.event_name != 'workflow_dispatch' || (!inputs.fencing_only && !inputs.fixture_only)",
-		"publish-chaos-image":      "github.repository == 'mrchypark/rhiza' && github.event_name == 'workflow_dispatch' && inputs.publish_chaos_image && !inputs.fencing_only && !inputs.fixture_only",
+		"operator-chaos":                  "github.event_name != 'workflow_dispatch' || (!inputs.fencing_only && !inputs.fixture_only)",
+		"automatic-operator-chaos":        "github.event_name != 'workflow_dispatch' || (!inputs.fencing_only && !inputs.fixture_only)",
+		"membership-e2e":                  "github.event_name != 'workflow_dispatch' || (!inputs.fencing_only && !inputs.fixture_only)",
+		"rust-sdk":                        "github.event_name != 'workflow_dispatch' || (!inputs.fencing_only && !inputs.fixture_only)",
+		"go":                              "github.event_name != 'workflow_dispatch' || (!inputs.fencing_only && !inputs.fixture_only)",
+		"containers":                      "github.event_name != 'workflow_dispatch' || (!inputs.fencing_only && !inputs.fixture_only)",
+		"anchor-operator-chaos":           "github.event_name != 'workflow_dispatch' || (!inputs.fencing_only && !inputs.fixture_only)",
+		"publish-chaos-image":             "github.repository == 'mrchypark/rhiza' && github.event_name == 'workflow_dispatch' && inputs.publish_chaos_image && !inputs.fencing_only && !inputs.fixture_only",
 	}
 	if len(workflow.Jobs) != len(wantConditions) {
 		t.Fatalf("workflow job set changed: got %d jobs, contract covers %d", len(workflow.Jobs), len(wantConditions))
