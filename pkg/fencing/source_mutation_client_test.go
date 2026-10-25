@@ -120,7 +120,10 @@ func (f *sourceMutationFake) resolve(sequence uint64) (MutationEntry, error) {
 			return MutationEntry{}, err
 		}
 	}
-	if f.pendingDispatch {
+	// A terminal result for prepared work must be backed by an actual dispatch
+	// permission and its terminal receipt. The explicit pending-dispatch case
+	// below models work whose permission remains unresolved.
+	if f.pendingDispatch || (f.result != nil && f.result.AllCopiesTerminal && f.result.Reason != MutationResolutionReasonGenerationZeroPinned) {
 		if err := f.producer.GrantDispatch(sequence, "copy-1"); err != nil {
 			return MutationEntry{}, err
 		}
