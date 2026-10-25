@@ -12,7 +12,7 @@ from pathlib import Path
 
 from automatic_recovery import AutomaticChaos
 from anchor_recovery import AnchorChaos, ANCHOR_CM
-from operator_recovery import Chaos
+from operator_recovery import Chaos, safe_startup_findings
 from operator_fixture import resources
 
 
@@ -70,12 +70,15 @@ class BucketJobTest(unittest.TestCase):
         }
 
     @staticmethod
-    def _capture_diagnostics(chaos, fixture, *, after_pod=None, log_error=False):
+    def _capture_diagnostics(chaos, fixture, *, after_pod=None, log_error=False, log_payloads=None):
         def fake_run(argv, **kwargs):
             if "logs" in argv:
                 if log_error and "--previous" not in argv:
                     return subprocess.CompletedProcess(argv, 1, b"", b"PRIVATE_ERROR_CANARY")
-                payload = b"PRIVATE_PREVIOUS_CANARY" if "--previous" in argv else b"PRIVATE_CURRENT_CANARY"
+                key = "previous" if "--previous" in argv else "current"
+                payload = (log_payloads or {}).get(key)
+                if payload is None:
+                    payload = b"PRIVATE_PREVIOUS_CANARY" if key == "previous" else b"PRIVATE_CURRENT_CANARY"
                 return subprocess.CompletedProcess(argv, 0, payload, b"")
             if argv[argv.index("get") + 1:argv.index("get") + 2] == ["secret"]:
                 projection = argv[argv.index("-o") + 1]
@@ -282,6 +285,38 @@ class BucketJobTest(unittest.TestCase):
             self.assertEqual(0o600, summary_path.stat().st_mode & 0o777)
             self.assertEqual("complete", summary_json["status"])
             self.assertEqual(["learner"], [item["component"] for item in summary_json["captures"]])
+
+    def test_startup_findings_are_fixed_enums_only(self):
+        self.assertEqual([], safe_startup_findings(
+            "node open phase consensus: nested error says open WAL: PRIVATE_CANARY"))
+        self.assertEqual([], safe_startup_findings(
+            "2026/10/26 12:34:56 unrelated prefix: fencing: engine repair preflight: PRIVATE_CANARY"))
+        with tempfile.TemporaryDirectory() as directory:
+            chaos = Chaos(argparse.Namespace(output=directory, cluster="fixture"))
+            payload = b"\n".join((
+                b"2026/10/26 12:34:56 open rhiza: node open phase identity_storage: ensure voter identity: PRIVATE_CANARY_A",
+                b"2026/10/26 12:34:56 open rhiza: node open phase identity_storage: open object store: PRIVATE_CANARY_B",
+                b"2026/10/26 12:34:56 open rhiza: node open phase wal: open WAL: PRIVATE_CANARY_C",
+                b"2026/10/26 12:34:56 fencing: engine repair preflight: PRIVATE_CANARY_D",
+                b"2026/10/26 12:34:56 fencing: child exited without a terminal receipt: PRIVATE_CANARY_E",
+                b"2026/10/26 12:34:56 open rhiza: node open phase unknown_phase: PRIVATE_CANARY_F",
+                b"2026/10/26 12:34:56 unrecognized private failure PRIVATE_CANARY_G",
+                b"2026/10/26 12:34:56 open rhiza: node open phase consensus: nested open WAL: PRIVATE_CANARY_H",
+                b"2026/10/26 12:34:56 open rhiza: node open phase wal: nested ensure voter identity: PRIVATE_CANARY_I",
+            ))
+            errors = self._capture_diagnostics(
+                chaos, self._diagnostic_fixture(), log_payloads={"current": payload})
+            self.assertEqual([], errors)
+            summary = Path(directory, "startup-diagnostics-summary.json").read_text()
+            capture = json.loads(summary)["captures"][0]
+            self.assertEqual([
+                "engine_repair_preflight", "identity_enrollment", "identity_storage",
+                "storage_initialization", "supervisor_child_exit", "wal_open",
+            ], capture["startupFindings"])
+            for canary in ("PRIVATE_CANARY_A", "PRIVATE_CANARY_B", "PRIVATE_CANARY_C",
+                           "PRIVATE_CANARY_D", "PRIVATE_CANARY_E", "PRIVATE_CANARY_F",
+                           "PRIVATE_CANARY_G", "PRIVATE_CANARY_H", "PRIVATE_CANARY_I"):
+                self.assertNotIn(canary, summary)
 
         with tempfile.TemporaryDirectory() as directory:
             chaos = Chaos(argparse.Namespace(output=directory, cluster="fixture"))
