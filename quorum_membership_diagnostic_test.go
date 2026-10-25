@@ -1,6 +1,6 @@
 //go:build rhiza_local_testhooks
 
-package rhiza_test
+package rhiza
 
 import (
 	"fmt"
