@@ -114,10 +114,10 @@ func main() {
 		log.Fatal("QUIC probe expectation failed")
 	}
 	if len(os.Args) > 1 && os.Args[1] == "qualification-fixture" {
-		if len(os.Args) != 5 {
+		if len(os.Args) != 6 {
 			log.Fatal("invalid qualification fixture arguments")
 		}
-		fixture, err := qualificationFixture(os.Args[2], os.Args[3], os.Args[4], rand.Reader)
+		fixture, err := qualificationFixture(os.Args[2], os.Args[3], os.Args[4], os.Args[5], rand.Reader)
 		if err != nil {
 			log.Fatal("qualification fixture generation failed")
 		}
@@ -569,8 +569,9 @@ func probeQUICHandshake(ctx context.Context, address, nodeID string, expected rh
 }
 
 // qualificationFixture is test-host-only: no node opens and no remote calls.
-func qualificationFixture(namespace, run, owner string, entropy io.Reader) (map[string]any, error) {
-	if !regexp.MustCompile(`^[a-f0-9]{8}$`).MatchString(run) || namespace != "rhiza-v0191-"+run ||
+func qualificationFixture(namespace, run, versionPrefix, owner string, entropy io.Reader) (map[string]any, error) {
+	if !regexp.MustCompile(`^[a-f0-9]{8}$`).MatchString(run) ||
+		!regexp.MustCompile(`^v[0-9]+$`).MatchString(versionPrefix) || namespace != "rhiza-"+versionPrefix+"-"+run ||
 		!regexp.MustCompile(`^rhiza-postrelease-`+run+`-[a-f0-9]{40}$`).MatchString(owner) {
 		return nil, errors.New("invalid fixture identity")
 	}
