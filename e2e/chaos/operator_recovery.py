@@ -299,14 +299,12 @@ class Chaos:
     def capture_linearizable_read_failure(self, voters, before_membership, error, sql_started=None):
         """Best-effort status snapshot; never adds retries or masks the read error."""
         failed_at = time.monotonic()
-        self._diagnostic_remaining()
         captures = []
         for pod in voters[:3]:
             ordinal = diagnostic_ordinal(pod)
             entry = {"ordinal": ordinal, "membership": diagnostic_membership(before_membership.get(pod))}
             entry["cachedForwardUID"] = "unknown"
             captures.append(entry)
-
         pod_states = []
         snapshot_started = time.monotonic()
         try:
@@ -367,6 +365,14 @@ class Chaos:
                        sqlElapsedMs=(max(0, int((failed_at - sql_started) * 1000)) if sql_started is not None else None),
                        podSnapshotElapsedMs=snapshot_elapsed_ms,
                        podSnapshotOffsetMs=max(0, int((snapshot_started - failed_at) * 1000)))
+        except Exception:
+            pass
+
+    def capture_read_failure_without_masking(self, voters, membership, error, sql_started):
+        """Record passive diagnostics while preserving the original SQL failure."""
+        try:
+            self.diagnostic_deadline = time.monotonic() + 10
+            self.capture_linearizable_read_failure(voters, membership, error, sql_started)
         except Exception:
             pass
 
@@ -440,10 +446,15 @@ class Chaos:
         """Prove the quorum-alive legacy operator membership route is rejected."""
         reason = "new operator-managed membership changes are disabled; ordinary Pod recovery is engine-owned"
         before_membership = {pod: self.status(pod) for pod in voters}
-        before_rows = self.http(voters[0], "/sql/query", {
-            "sql": "SELECT id, value FROM chaos_items ORDER BY id",
-            "consistency": "linearizable",
-        }).get("rows")
+        sql_started = time.monotonic()
+        try:
+            before_rows = self.http(voters[0], "/sql/query", {
+                "sql": "SELECT id, value FROM chaos_items ORDER BY id",
+                "consistency": "linearizable",
+            }).get("rows")
+        except Exception as original:
+            self.capture_read_failure_without_masking(voters, before_membership, original, sql_started)
+            raise
         spec = {"statefulSet": "rhiza", "container": "rhiza", "sourceClusterID": "chaos-source",
                 "durability": "before-ack", "membership": {"operationID": name, "remove": removed,
                 "removedPod": removed, "voterPods": [{"nodeID": p, "pod": p} for p in voters],
@@ -474,11 +485,7 @@ class Chaos:
                 "consistency": "linearizable",
             }).get("rows")
         except Exception as original:
-            try:
-                self.diagnostic_deadline = time.monotonic() + 10
-                self.capture_linearizable_read_failure(voters, before_membership, original, sql_started)
-            except Exception:
-                pass
+            self.capture_read_failure_without_masking(voters, before_membership, original, sql_started)
             raise
         assert after_rows == before_rows, f"data changed: before={before_rows!r} after={after_rows!r}"
         self.event("legacy_membership_request_rejected_only", operation=name,
@@ -707,16 +714,19 @@ class Chaos:
                     "owner": values[2], "immutable": values[3] == "true"}
 
         root = None
-        try:
-            root = read_json(["get", "rhizacluster", "rhiza", "-o", "json"])
-            status = root.get("status", {})
-            record["root"] = {"uid": root.get("metadata", {}).get("uid"),
-                "generation": root.get("metadata", {}).get("generation"),
-                "observedGeneration": status.get("observedGeneration"),
-                "phase": status.get("phase"), "message": status.get("message")}
-        except Exception as exc:
-            record["root"] = {"readError": f"{type(exc).__name__}: {exc}"}
-            capture_error("root_status_read_failed", f"{type(exc).__name__}: {exc}")
+        if not self.supervised_bootstrap:
+            record["root"] = {"status": "not_applicable"}
+        else:
+            try:
+                root = read_json(["get", "rhizacluster", "rhiza", "-o", "json"])
+                status = root.get("status", {})
+                record["root"] = {"status": "captured", "uid": root.get("metadata", {}).get("uid"),
+                    "generation": root.get("metadata", {}).get("generation"),
+                    "observedGeneration": status.get("observedGeneration"),
+                    "phase": status.get("phase"), "message": status.get("message")}
+            except Exception as exc:
+                record["root"] = {"status": "failed", "readError": f"{type(exc).__name__}: {exc}"}
+                capture_error("root_status_read_failed", f"{type(exc).__name__}: {exc}")
 
         sts = {}
         try:
@@ -862,9 +872,17 @@ class Chaos:
                     key = "previous" if previous else "current"
                     expected_incarnation = incarnation(before_pod, previous) if before_ok else None
                     if not before_ok or expected_incarnation is None:
-                        code = "pod_identity_changed" if not before_ok else "container_incarnation_unavailable"
-                        item["logs"][key] = {"captured": False, "errorCode": code}
-                        capture_error(code, f"{name}/{cname}/{key}")
+                        if not before_ok:
+                            item["logs"][key] = {"captured": False, "status": "failed",
+                                                 "errorCode": "pod_identity_changed"}
+                            capture_error("pod_identity_changed", f"{name}/{cname}/{key}")
+                        elif (previous and state.get("restartCount") == 0 and
+                              not state.get("lastState", {}).get("terminated", {}).get("containerID")):
+                            item["logs"][key] = {"captured": False, "status": "not_applicable"}
+                        else:
+                            item["logs"][key] = {"captured": False, "status": "failed",
+                                                 "errorCode": "container_incarnation_unavailable"}
+                            capture_error("container_incarnation_unavailable", f"{name}/{cname}/{key}")
                         continue
                     if remaining <= 0:
                         item["logs"][key] = {"captured": False, "errorCode": "diagnostic_deadline_exhausted"}
@@ -930,11 +948,12 @@ class Chaos:
         path.chmod(0o600)
 
         summary = {"version": 1, "status": "partial" if errors else "complete",
+            "rootStatus": record.get("root", {}).get("status", "unknown"),
             "captureErrors": sorted(set(errors)), "captures": []}
         for item in record["captures"]:
             logs = {}
             for key, result in item.get("logs", {}).items():
-                logs[key] = {field: result[field] for field in ("captured", "bytes", "sha256", "truncated", "errorCode")
+                logs[key] = {field: result[field] for field in ("captured", "status", "bytes", "sha256", "truncated", "errorCode")
                              if field in result}
             summary["captures"].append({"component": item.get("component"),
                                         "container": item.get("container"), "logs": logs,
