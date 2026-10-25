@@ -3,6 +3,7 @@ package network
 import (
 	"context"
 	"errors"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -102,10 +103,10 @@ func TestQUICCancellationReleasesStreamAndPreservesConnection(t *testing.T) {
 			enteredB, enteredA := make(chan struct{}), make(chan struct{})
 			releaseB := make(chan struct{}, 1)
 			handlerDoneB, handlerDoneA := make(chan struct{}), make(chan struct{})
-			prepareCalls := 0
+			var prepareCalls atomic.Int32
 			server.SetCheckpointPrepare(func(ctx context.Context, _ quepaxa.NodeID, _ quepaxa.CheckpointSeal) error {
-				prepareCalls++ // B is started and observed before A is launched.
-				if prepareCalls == 1 {
+				call := prepareCalls.Add(1) // B is observed before A is launched.
+				if call == 1 {
 					close(enteredB)
 					defer close(handlerDoneB)
 					select {
@@ -115,7 +116,7 @@ func TestQUICCancellationReleasesStreamAndPreservesConnection(t *testing.T) {
 						return ctx.Err()
 					}
 				}
-				if prepareCalls == 2 {
+				if call == 2 {
 					close(enteredA)
 					defer close(handlerDoneA)
 					<-ctx.Done()
