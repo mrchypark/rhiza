@@ -681,7 +681,7 @@ jobs:
           CGO_ENABLED: 1
         run: >-
           go test -tags rhiza_local_testhooks ./pkg/network
-          -run '^(TestWarmCachedQUICReadIndexAfterPeerHardRestart|TestGenericMutationCallDoesNotRetryAfterStatelessReset|TestReadTipResetRetryDoesNotDialAfterTransportClose|TestReadTipResetRetryRequiresCachedTypedResetAndLiveContext|TestColdTransportReadIndexAfterPeerRestartControl|TestPeerStatelessResetKeyIsStableAndScoped|TestQUICCancellationReleasesStreamAndPreservesConnection)$'
+          -run '^(TestWarmCachedQUICReadIndexAfterPeerHardRestart|TestGenericMutationCallDoesNotRetryAfterStatelessReset|TestReadTipResetRetryDoesNotDialAfterTransportClose|TestReadTipResetRetryRequiresCachedTypedResetAndLiveContext|TestColdTransportReadIndexAfterPeerRestartControl|TestPeerStatelessResetKeyIsStableAndScoped|TestQUICCancellationReleasesStreamAndPreservesConnection|TestLearnedMutationAppliedOnceWhenResponseIsLost|TestRetiredPeerNestedSyncDiagnostic)$'
           -count=1 -timeout=2m
       - name: Cached QUIC restart and cancellation regressions (race)
         if: ${{ always() && !cancelled() }}
@@ -690,7 +690,7 @@ jobs:
           CGO_ENABLED: 1
         run: >-
           go test -race -tags rhiza_local_testhooks ./pkg/network
-          -run '^(TestWarmCachedQUICReadIndexAfterPeerHardRestart|TestGenericMutationCallDoesNotRetryAfterStatelessReset|TestReadTipResetRetryDoesNotDialAfterTransportClose|TestReadTipResetRetryRequiresCachedTypedResetAndLiveContext|TestColdTransportReadIndexAfterPeerRestartControl|TestPeerStatelessResetKeyIsStableAndScoped|TestQUICCancellationReleasesStreamAndPreservesConnection)$'
+          -run '^(TestWarmCachedQUICReadIndexAfterPeerHardRestart|TestGenericMutationCallDoesNotRetryAfterStatelessReset|TestReadTipResetRetryDoesNotDialAfterTransportClose|TestReadTipResetRetryRequiresCachedTypedResetAndLiveContext|TestColdTransportReadIndexAfterPeerRestartControl|TestPeerStatelessResetKeyIsStableAndScoped|TestQUICCancellationReleasesStreamAndPreservesConnection|TestLearnedMutationAppliedOnceWhenResponseIsLost|TestRetiredPeerNestedSyncDiagnostic)$'
           -count=1 -timeout=2m
       - name: Vet
         env:
