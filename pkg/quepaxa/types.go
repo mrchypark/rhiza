@@ -127,6 +127,13 @@ type ReconfigurationAdmission struct {
 	EngineRemoval *EngineRemoval
 }
 
+// ReconfigurationPrefix identifies the exact old-configuration prefix that
+// must be published before a new configuration terminal is proposed.
+type ReconfigurationPrefix struct {
+	Through    Slot
+	PrefixHash ValueHash
+}
+
 type reconfigurationValue struct {
 	Terminal      bool           `json:"terminal,omitempty"`
 	Abort         bool           `json:"abort,omitempty"`

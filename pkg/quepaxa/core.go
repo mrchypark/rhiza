@@ -59,32 +59,33 @@ type Transport interface {
 
 // Core runs one QuePaxa proposer and recorder per replica.
 type Core struct {
-	nodeID                  NodeID
-	config                  *Cluster
-	wal                     *qlog.WAL
-	transport               Transport
-	observer                bool
-	learner                 bool
-	localMode               bool
-	localCost               localCostModel
-	localUnloggedCount      uint64
-	localExecutionOwner     chan struct{}
-	localRecordAttemptLimit int // private test seam; zero selects the production limit
-	walIdentity             string
-	reconfigEnabled         bool
-	engineOwnedRemovals     bool
-	reconfigWAL             bool
-	reconfigAdmission       func(context.Context, ReconfigurationAdmission) error
-	configHistory           []configEpoch
-	retiredIDs              map[NodeID]struct{}
-	baseMembership          *MembershipRecord
-	membershipVersion       uint64
-	lastAbort               *ConfigTransition
-	generationAnchorHash    [32]byte
-	reconfiguration         *reconfigurationState
-	reconfigurationMu       sync.Mutex
-	priority                func() (Priority, error)
-	recordBeforeAppend      func()
+	nodeID                           NodeID
+	config                           *Cluster
+	wal                              *qlog.WAL
+	transport                        Transport
+	observer                         bool
+	learner                          bool
+	localMode                        bool
+	localCost                        localCostModel
+	localUnloggedCount               uint64
+	localExecutionOwner              chan struct{}
+	localRecordAttemptLimit          int // private test seam; zero selects the production limit
+	walIdentity                      string
+	reconfigEnabled                  bool
+	engineOwnedRemovals              bool
+	reconfigWAL                      bool
+	reconfigAdmission                func(context.Context, ReconfigurationAdmission) error
+	reconfigurationPrefixPublication func(context.Context, ReconfigurationPrefix) error
+	configHistory                    []configEpoch
+	retiredIDs                       map[NodeID]struct{}
+	baseMembership                   *MembershipRecord
+	membershipVersion                uint64
+	lastAbort                        *ConfigTransition
+	generationAnchorHash             [32]byte
+	reconfiguration                  *reconfigurationState
+	reconfigurationMu                sync.Mutex
+	priority                         func() (Priority, error)
+	recordBeforeAppend               func()
 
 	slotMu              sync.Mutex
 	nextSlot            Slot
