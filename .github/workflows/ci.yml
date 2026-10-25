@@ -578,6 +578,25 @@ jobs:
         env:
           CGO_ENABLED: 0
         run: go test ./...
+      - name: Capture retired-peer REMOVE rejection diagnostics
+        if: always()
+        env:
+          CGO_ENABLED: 1
+          DIAGNOSTIC_LOG: ${{ runner.temp }}/retired-peer-remove-diagnostic.log
+        run: |
+          set +e
+          go test -tags rhiza_local_testhooks ./pkg/network -run '^TestRetiredPeerTransitionRejectsCachedIdentityAndAdmitsNewIdentity$' -count=1 -timeout=30s >"$DIAGNOSTIC_LOG" 2>&1
+          test_status=$?
+          set -e
+          cat "$DIAGNOSTIC_LOG"
+          printf '\ngo_test_exit=%s\n' "$test_status" >>"$DIAGNOSTIC_LOG"
+          exit "$test_status"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: retired-peer-remove-diagnostic-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/retired-peer-remove-diagnostic.log
+          if-no-files-found: warn
       - name: Install pinned kubectl for client-side fixture tests
         run: |
           image=registry.k8s.io/kubectl@sha256:9cd9070def4060229de73314aef753caff194eebe2ca1f04d21f22320932c0c0
