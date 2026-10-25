@@ -99,22 +99,41 @@ func TestQUICCancellationReleasesStreamAndPreservesConnection(t *testing.T) {
 			defer material.Close()
 			server := NewServer(core, material, "cluster", true, nil)
 			defer server.Close()
-			entered, released, cleanup := make(chan struct{}), make(chan struct{}), make(chan struct{})
+			enteredB, enteredA := make(chan struct{}), make(chan struct{})
+			releaseB := make(chan struct{}, 1)
+			handlerDoneB, handlerDoneA := make(chan struct{}), make(chan struct{})
+			prepareCalls := 0
 			server.SetCheckpointPrepare(func(ctx context.Context, _ quepaxa.NodeID, _ quepaxa.CheckpointSeal) error {
-				close(entered)
-				select {
-				case <-cleanup:
-				case <-ctx.Done():
+				prepareCalls++ // B is started and observed before A is launched.
+				if prepareCalls == 1 {
+					close(enteredB)
+					defer close(handlerDoneB)
+					select {
+					case <-releaseB:
+						return nil
+					case <-ctx.Done():
+						return ctx.Err()
+					}
 				}
-				close(released)
-				return ctx.Err()
+				if prepareCalls == 2 {
+					close(enteredA)
+					defer close(handlerDoneA)
+					<-ctx.Done()
+					return ctx.Err()
+				}
+				return errors.New("unexpected checkpoint handler invocation")
 			})
 			peer, err := StartPeerServer(context.Background(), "127.0.0.1:0", server, members, "secret1", "admin")
 			if err != nil {
 				t.Fatal(err)
 			}
 			defer peer.Close()
-			defer close(cleanup)
+			defer func() {
+				select {
+				case releaseB <- struct{}{}:
+				default:
+				}
+			}()
 			members[0].PeerURL = "quic://" + peer.Addr()
 			transport := NewTransport("cluster", "n2", &quepaxa.Cluster{Members: members}, "secret2")
 			defer transport.Close()
@@ -130,38 +149,77 @@ func TestQUICCancellationReleasesStreamAndPreservesConnection(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			done := make(chan error, 1)
-			go func() {
+			runPrepare := func(callCtx context.Context) error {
 				if prepare {
-					done <- transport.PrepareCheckpoint(ctx, seal)
-					return
+					return transport.PrepareCheckpoint(callCtx, seal)
 				}
 				req := transport.request(peerfb.OperationPrepareCheckpoint)
 				req.Value = value
-				_, err := transport.callContext(ctx, "n1", req)
-				done <- err
-			}()
-			select {
-			case <-entered:
-			case <-time.After(5 * time.Second):
-				t.Fatal("checkpoint handler was not reached")
+				_, err := transport.callContext(callCtx, "n1", req)
+				return err
 			}
-			cancel()
+			bDone := make(chan error, 1)
+			go func() { bDone <- runPrepare(ctx) }()
 			select {
-			case err := <-done:
+			case <-enteredB:
+			case <-time.After(5 * time.Second):
+				t.Fatal("first checkpoint handler was not reached")
+			}
+			aCtx, cancelA := context.WithCancel(ctx)
+			aDone := make(chan error, 1)
+			go func() { aDone <- runPrepare(aCtx) }()
+			select {
+			case <-enteredA:
+			case <-time.After(5 * time.Second):
+				cancelA()
+				t.Fatal("second checkpoint handler was not reached")
+			}
+			cancelA()
+			select {
+			case err := <-aDone:
 				if !errors.Is(err, context.Canceled) {
-					t.Fatalf("cancellation: %v", err)
+					t.Fatalf("canceled caller A: %v", err)
 				}
 			case <-time.After(5 * time.Second):
-				t.Fatal("canceled call remained blocked")
+				t.Fatal("canceled caller A remained blocked")
 			}
 			select {
-			case <-released:
+			case <-handlerDoneA:
 			case <-time.After(5 * time.Second):
-				t.Fatal("peer stream remained active after cancellation")
+				t.Fatal("canceled handler A remained active")
+			}
+			select {
+			case <-handlerDoneB:
+				t.Fatal("healthy handler B ended before it was released")
+			default:
+			}
+			select {
+			case err := <-bDone:
+				t.Fatalf("healthy caller B completed before release: %v", err)
+			default:
 			}
 			if conn.Context().Err() != nil {
-				t.Fatal("cancellation closed the shared connection")
+				t.Fatal("canceling caller A closed the shared connection while caller B was active")
+			}
+			transport.peers["n1"].mu.Lock()
+			stillShared := transport.peers["n1"].conn == conn
+			transport.peers["n1"].mu.Unlock()
+			if !stillShared {
+				t.Fatal("canceling caller A discarded the connection used by caller B")
+			}
+			releaseB <- struct{}{}
+			select {
+			case err := <-bDone:
+				if err != nil {
+					t.Fatalf("healthy caller B after release: %v", err)
+				}
+			case <-time.After(5 * time.Second):
+				t.Fatal("healthy caller B remained blocked after release")
+			}
+			select {
+			case <-handlerDoneB:
+			case <-time.After(5 * time.Second):
+				t.Fatal("healthy handler B remained active after release")
 			}
 			if _, err := transport.ReadTip(context.Background(), "n1"); err != nil {
 				t.Fatalf("subsequent request: %v", err)
