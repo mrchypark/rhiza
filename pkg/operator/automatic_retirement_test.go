@@ -324,19 +324,26 @@ func TestLearnerRetirementReservesHandshakeWithoutSnapshotJournal(t *testing.T) 
 	}
 }
 
-func TestMembershipRetirementAcknowledgesNeverJournaledAddition(t *testing.T) {
+func TestMembershipRetirementBlocksNeverJournaledAddition(t *testing.T) {
 	ctx, r, api, c := membershipFixture(t)
 	r.Spec.Membership.AbortAddition = true
 	if err := c.reconcileAll(ctx); err != nil {
 		t.Fatal(err)
 	}
-	if r.Status.Membership == nil || r.Status.Membership.Phase != "Aborted" || len(api.changes) != 0 || len(api.aborts) != 0 {
-		t.Fatalf("never dispatched candidate did not retire: %+v", r.Status)
+	if r.Status.Phase != "Blocked" || !strings.Contains(r.Status.Message, "new operator-managed membership changes are disabled") {
+		t.Fatalf("never-journaled request was not rejected by the engine-owned policy: phase=%q message=%q", r.Status.Phase, r.Status.Message)
+	}
+	if r.Status.Membership != nil || len(api.changes) != 0 || len(api.aborts) != 0 || api.stsPuts != 0 {
+		t.Fatalf("never-journaled request created or mutated a membership operation: status=%+v changes=%d aborts=%d StatefulSetPuts=%d", r.Status.Membership, len(api.changes), len(api.aborts), api.stsPuts)
 	}
 }
 
 func TestMembershipRetirementRecognizesCommittedAdditionAfterLearnerLoss(t *testing.T) {
 	ctx, r, api, c := membershipFixture(t)
+	// This test covers a removal request journaled by the previous operator
+	// policy and then resumed by the current controller. New requests without
+	// persisted status are separately required to block above.
+	seedLegacyRemoveMembershipJournal(r)
 	if err := c.reconcileAll(ctx); err != nil {
 		t.Fatal(err)
 	}
