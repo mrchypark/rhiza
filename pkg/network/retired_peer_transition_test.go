@@ -131,11 +131,25 @@ func TestRetiredPeerTransitionRejectsCachedIdentityAndAdmitsNewIdentity(t *testi
 	}
 
 	withoutC := quepaxa.Cluster{ConfigID: 2, Members: append([]quepaxa.Member(nil), config.Members[:2]...)}
-	if _, err := cores["a"].BeginReconfiguration(ctx, withoutC); err != nil {
+	removeFreeze, err := cores["a"].BeginReconfiguration(ctx, withoutC)
+	if err != nil {
 		t.Fatalf("begin REMOVE: %v", err)
 	}
-	if err := cores["a"].FinishReconfigurationAt(ctx, withoutC, 0); err != nil {
-		t.Fatalf("commit durable REMOVE: %v", err)
+	removeEvents := make(chan string, 32)
+	removeHook := installRetiredPeerTestHook(func(event string) {
+		if !strings.Contains(event, "network:terminal-decision:") {
+			return
+		}
+		select {
+		case removeEvents <- event:
+		default:
+		}
+	})
+	removeErr := cores["a"].FinishReconfigurationAt(ctx, withoutC, 0)
+	removeHook()
+	if removeErr != nil {
+		t.Fatalf("commit durable REMOVE: %v; sender=a operation=OperationLearned target_peers=[b,c] freeze_slot=%d terminal_events=%v peer_states=%s",
+			removeErr, removeFreeze, drainRetiredPeerEvents(removeEvents), retiredPeerStateSnapshot(cores, []quepaxa.NodeID{"a", "b", "c"}, removeFreeze))
 	}
 	if got := cores["a"].CurrentCluster(); got.ConfigID != withoutC.ConfigID || !sameNetworkMembers(got, withoutC) {
 		t.Fatalf("REMOVE did not activate at receiver A: %+v", got)
@@ -261,9 +275,12 @@ func TestRetiredPeerTransitionRejectsCachedIdentityAndAdmitsNewIdentity(t *testi
 	if got := dCore.CurrentCluster(); got.ConfigID != withoutC.ConfigID || !sameNetworkMembers(got, withoutC) || dCore.IsVoter() {
 		t.Fatalf("replacement learner did not apply archived REMOVE and remain non-voting: voter=%t cluster=%+v", dCore.IsVoter(), got)
 	}
-	currentSync, err := learnerTransport.FetchDecisions(ctx, "a", dCore.Tip()+1, 128)
+	removeSyncFrom := dCore.Tip() + 1
+	currentSync, err := learnerTransport.FetchDecisions(ctx, "a", removeSyncFrom, 128)
 	if err != nil || currentSync.ConfigID != withoutC.ConfigID || len(currentSync.Decisions) != 0 {
-		t.Fatalf("bound current-config Sync after archived REMOVE: response config=%d decisions=%d err=%v", currentSync.ConfigID, len(currentSync.Decisions), err)
+		t.Fatalf("bound current-config Sync after archived REMOVE: sender=d operation=OperationSync target=a from=%d response config=%d decisions=%d err=%v peer_states=%s",
+			removeSyncFrom, currentSync.ConfigID, len(currentSync.Decisions), err,
+			retiredPeerStateSnapshot(map[quepaxa.NodeID]*quepaxa.Core{"a": cores["a"], "b": cores["b"], "c": cores["c"], "d": dCore}, []quepaxa.NodeID{"a", "b", "c", "d"}, removeSyncFrom))
 	}
 	if got := dCore.CurrentCluster(); got.ConfigID != withoutC.ConfigID || !sameNetworkMembers(got, withoutC) || dCore.IsVoter() {
 		t.Fatalf("replacement learner did not remain non-voting at post-REMOVE config: voter=%t cluster=%+v", dCore.IsVoter(), got)
@@ -330,9 +347,12 @@ func TestRetiredPeerTransitionRejectsCachedIdentityAndAdmitsNewIdentity(t *testi
 	if !dCore.IsVoter() || dCore.CurrentCluster().ConfigID != withD.ConfigID {
 		t.Fatalf("new logical identity did not apply committed ADD: voter=%t cluster=%+v", dCore.IsVoter(), dCore.CurrentCluster())
 	}
-	currentSync, err = learnerTransport.FetchDecisions(ctx, "a", dCore.Tip()+1, 128)
+	addSyncFrom := dCore.Tip() + 1
+	currentSync, err = learnerTransport.FetchDecisions(ctx, "a", addSyncFrom, 128)
 	if err != nil || currentSync.ConfigID != withD.ConfigID || len(currentSync.Decisions) != 0 {
-		t.Fatalf("bound current-config Sync after archived ADD: response config=%d decisions=%d err=%v", currentSync.ConfigID, len(currentSync.Decisions), err)
+		t.Fatalf("bound current-config Sync after archived ADD: sender=d operation=OperationSync target=a from=%d response config=%d decisions=%d err=%v peer_states=%s",
+			addSyncFrom, currentSync.ConfigID, len(currentSync.Decisions), err,
+			retiredPeerStateSnapshot(map[quepaxa.NodeID]*quepaxa.Core{"a": cores["a"], "b": cores["b"], "c": cores["c"], "d": dCore}, []quepaxa.NodeID{"a", "b", "c", "d"}, addSyncFrom))
 	}
 	dAfterAdd := NewTransport(clusterID, "d", &withD, dToken)
 	t.Cleanup(func() { _ = dAfterAdd.Close() })
@@ -364,4 +384,45 @@ func sameNetworkMembers(left, right quepaxa.Cluster) bool {
 		}
 	}
 	return true
+}
+
+func drainRetiredPeerEvents(events <-chan string) []string {
+	var drained []string
+	for {
+		select {
+		case event := <-events:
+			drained = append(drained, event)
+		default:
+			return drained
+		}
+	}
+}
+
+func retiredPeerStateSnapshot(cores map[quepaxa.NodeID]*quepaxa.Core, peerIDs []quepaxa.NodeID, slot quepaxa.Slot) string {
+	states := make([]string, 0, len(peerIDs))
+	for _, id := range peerIDs {
+		core := cores[id]
+		if core == nil {
+			states = append(states, fmt.Sprintf("peer=%s unavailable", id))
+			continue
+		}
+		current := core.CurrentCluster()
+		hasRetiredMember := false
+		for _, member := range current.Members {
+			if member.ID == "c" {
+				hasRetiredMember = true
+				break
+			}
+		}
+		pending, hasPending := core.PendingReconfiguration()
+		pendingConfigID := uint(0)
+		if hasPending {
+			pendingConfigID = pending.ConfigID
+		}
+		states = append(states, fmt.Sprintf(
+			"peer=%s tip=%d current_config=%d snapshot_slot_config=%d voter=%t pending=%t pending_config=%d c_member_active=%t",
+			id, core.Tip(), current.ConfigID, core.ConfigIDForSlot(slot), core.IsVoter(), hasPending, pendingConfigID, hasRetiredMember,
+		))
+	}
+	return strings.Join(states, "; ")
 }
