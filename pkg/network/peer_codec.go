@@ -17,8 +17,9 @@ const (
 
 func encodePeerRequest(request *peerfb.RequestT) []byte {
 	builder := flatbuffers.NewBuilder(512)
-	request.Magic = peerWireMagic
-	offset := request.Pack(builder)
+	wireRequest := *request
+	wireRequest.Magic = peerWireMagic
+	offset := wireRequest.Pack(builder)
 	peerfb.FinishRequestBuffer(builder, offset)
 	return append([]byte(nil), builder.FinishedBytes()...)
 }

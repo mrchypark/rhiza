@@ -374,8 +374,12 @@ func TestMembershipRetirementRecognizesCommittedAdditionAfterLearnerLoss(t *test
 
 func TestMembershipRetirementRejectsDelayedJournalAfterAcknowledgment(t *testing.T) {
 	ctx, r, api, c := membershipFixture(t)
+	seedLegacyRemoveMembershipJournal(r)
 	if err := c.reconcileAll(ctx); err != nil {
 		t.Fatal(err)
+	}
+	if len(api.changes) != 1 || api.changes[0].Remove != "n3" || api.changes[0].Add != nil {
+		t.Fatalf("legacy setup did not dispatch only the journaled REMOVE: %+v", api.changes)
 	}
 	api.membership["n1"] = membershipStatus("n1", 2, "n1", "n2")
 	api.membership["n2"] = membershipStatus("n2", 2, "n1", "n2")
@@ -443,7 +447,7 @@ func TestMembershipRetirementRejectsDelayedJournalAfterAcknowledgment(t *testing
 	if !errors.As(err, &conflict) || conflict.StatusCode != http.StatusConflict {
 		t.Fatalf("stale journal write error=%v", err)
 	}
-	if r.Status.Membership.Phase != "Aborted" || r.Status.Membership.Add != nil || len(api.changes) != 0 {
+	if r.Status.Membership.Phase != "Aborted" || r.Status.Membership.Add != nil || len(api.changes) != 1 {
 		t.Fatalf("delayed executor reopened retired candidate: %+v changes=%d", r.Status, len(api.changes))
 	}
 }
