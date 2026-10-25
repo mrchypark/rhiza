@@ -317,6 +317,62 @@ func peerMember(config quepaxa.Cluster, id quepaxa.NodeID) (quepaxa.Member, bool
 	return quepaxa.Member{}, false
 }
 
+func peerOperationName(operation peerfb.Operation) string {
+	switch operation {
+	case peerfb.OperationRecord:
+		return "record"
+	case peerfb.OperationReservedPropose:
+		return "reserved_propose"
+	case peerfb.OperationLearned:
+		return "learned"
+	case peerfb.OperationSync:
+		return "sync"
+	case peerfb.OperationReadIndex:
+		return "read_index"
+	case peerfb.OperationStageValue:
+		return "stage_value"
+	case peerfb.OperationFetchValue:
+		return "fetch_value"
+	case peerfb.OperationEngineRemovalFreeze:
+		return "engine_removal_freeze"
+	case peerfb.OperationPrepareCheckpoint:
+		return "prepare_checkpoint"
+	case peerfb.OperationVerifyPrefix:
+		return "verify_prefix"
+	default:
+		return "other"
+	}
+}
+
+// observeRejectedPeerRequest exposes only bounded request-selection metadata
+// to tagged local tests. It never records peer, cluster, endpoint, token, or
+// error contents.
+func observeRejectedPeerRequest(request *peerfb.RequestT, selected quepaxa.Cluster, lookupErr error,
+	clusterMatch, configMatch bool, rejection string) {
+	if !localtesthooks.Enabled || request == nil {
+		return
+	}
+	slot, from := uint64(0), request.From
+	switch request.Operation {
+	case peerfb.OperationRecord:
+		if request.Record != nil {
+			slot = request.Record.Slot
+		}
+	case peerfb.OperationLearned:
+		if request.Decision != nil {
+			slot = request.Decision.Slot
+		}
+	case peerfb.OperationPrepareCheckpoint:
+		if seal, checkpoint, err := quepaxa.DecodeCheckpointSeal(request.Value); err == nil && checkpoint {
+			slot = uint64(seal.Index)
+		}
+	}
+	localtesthooks.Hit(fmt.Sprintf(
+		"network:peer-request-rejected:operation=%s:request_config=%d:selected_config=%d:slot=%d:from=%d:lookup_ok=%t:cluster_match=%t:config_match=%t:rejection=%s",
+		peerOperationName(request.Operation), request.ConfigId, selected.ConfigID, slot, from,
+		lookupErr == nil, clusterMatch, configMatch, rejection))
+}
+
 // peerCertificateKey returns the Ed25519 public key of the certificate the
 // client presented during the TLS handshake. A client without a client
 // certificate yields nil and can only authenticate as a non-voter.
@@ -341,7 +397,10 @@ func peerCertificateKey(conn *quic.Conn) ed25519.PublicKey {
 // the cluster admin token for the read-only sync path.
 func (s *PeerServer) handle(ctx context.Context, certificateKey ed25519.PublicKey, request *peerfb.RequestT) (*peerfb.ResponseT, error) {
 	config, err := s.configurationFor(request)
-	if err != nil || request.ClusterId != string(s.server.cluster) || request.ConfigId != uint64(config.ConfigID) {
+	clusterMatch := request.ClusterId == string(s.server.cluster)
+	configMatch := request.ConfigId == uint64(config.ConfigID)
+	if err != nil || !clusterMatch || !configMatch {
+		observeRejectedPeerRequest(request, config, err, clusterMatch, configMatch, "cluster_or_config")
 		return nil, fmt.Errorf("cluster identity mismatch")
 	}
 	historical, historicalOK := peerMember(config, quepaxa.NodeID(request.SenderId))
@@ -361,6 +420,7 @@ func (s *PeerServer) handle(ctx context.Context, certificateKey ed25519.PublicKe
 	// terminal and its durable prefix. The response is independently signed by
 	// this voter and never changes local consensus state.
 	if !voter && !(admin && (request.Operation == peerfb.OperationSync || request.Operation == peerfb.OperationEngineRemovalFreeze)) {
+		observeRejectedPeerRequest(request, config, nil, clusterMatch, configMatch, "peer_authentication")
 		return nil, fmt.Errorf("peer authentication failed")
 	}
 	switch request.Operation {

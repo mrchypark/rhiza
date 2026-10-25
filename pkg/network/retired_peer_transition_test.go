@@ -10,6 +10,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/mrchypark/rhiza/internal/localtesthooks"
 	"github.com/mrchypark/rhiza/internal/types"
 	"github.com/mrchypark/rhiza/pkg/materializer"
 	"github.com/mrchypark/rhiza/pkg/network/peerfb"
@@ -137,11 +138,11 @@ func TestRetiredPeerTransitionRejectsCachedIdentityAndAdmitsNewIdentity(t *testi
 	}
 	removeEvents := make(chan string, 32)
 	removeHook := installRetiredPeerTestHook(func(event string) {
-		if !strings.Contains(event, "network:terminal-decision:") {
+		if !strings.Contains(event, "network:terminal-decision:") && !strings.HasPrefix(event, "network:peer-request-rejected:") {
 			return
 		}
 		select {
-		case removeEvents <- event:
+		case removeEvents <- "test_alias=retired-peer-transition-remove:" + event:
 		default:
 		}
 	})
@@ -234,8 +235,38 @@ func TestRetiredPeerTransitionRejectsCachedIdentityAndAdmitsNewIdentity(t *testi
 	// The replacement obtains the exact committed REMOVE from the verified
 	// archive path, then its bound transport can Sync at the resulting current
 	// configuration.
+	const testAlias = "retired-peer-transition"
+	staleSyncEvents := make(chan string, 8)
+	restoreStaleSyncHook := installRetiredPeerTestHook(func(event string) {
+		if strings.HasPrefix(event, "network:peer-request-rejected:operation=sync:") {
+			select {
+			case staleSyncEvents <- "test_alias=" + testAlias + ":" + event:
+			default:
+			}
+		}
+	})
 	if _, err := learnerTransport.FetchDecisions(ctx, "a", dCore.Tip()+1, 128); err == nil || !strings.Contains(err.Error(), "cluster identity mismatch") {
+		restoreStaleSyncHook()
 		t.Fatalf("stale-config learner Sync error=%v, want rejection", err)
+	}
+	restoreStaleSyncHook()
+	if localtesthooks.Enabled {
+		select {
+		case event := <-staleSyncEvents:
+			for _, field := range []string{
+				"test_alias=" + testAlias, "operation=sync", "request_config=1", "selected_config=2", "slot=0", "from=1",
+				"lookup_ok=true", "cluster_match=true", "config_match=false", "rejection=cluster_or_config",
+			} {
+				if !strings.Contains(event, field) {
+					t.Fatalf("test_alias=retired-peer-transition rejected Sync event missing %q", field)
+				}
+			}
+			if strings.Contains(event, "cluster=") || strings.Contains(event, "sender=") || strings.Contains(event, "error=") {
+				t.Fatalf("test_alias=retired-peer-transition rejected Sync event contains unbounded identity/error data")
+			}
+		default:
+			t.Fatal("test_alias=retired-peer-transition rejected Sync event was not observed")
+		}
 	}
 	if dCore.Tip() != 0 || dCore.CurrentCluster().ConfigID != config.ConfigID {
 		t.Fatalf("rejected stale Sync advanced learner: tip=%d config=%d", dCore.Tip(), dCore.CurrentCluster().ConfigID)
