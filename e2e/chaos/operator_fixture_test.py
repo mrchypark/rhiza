@@ -218,6 +218,9 @@ class BucketJobTest(unittest.TestCase):
                  "requestHash": "request-digest", "proofID": "proof-digest",
                  "processesTerminated": True, "recreationBlocked": True, "storageQuiesced": True}
         fence["status"]["proof"] = proof
+        with self.assertRaisesRegex(AssertionError, "already has a completion proof"):
+            require_pending_generation_fence(root, fence, {"items": []}, stateful_set)
+        self.assertFalse(proof_authorized_generation_child(root, fence, None, stateful_set))
         child = {"metadata": {"name": operation, "annotations": {
             "rhiza.mrchypark.dev/automatic-owner": "root-uid",
             "rhiza.mrchypark.dev/automatic-logical": "logical-test"}, "uid": "child-uid"}, "spec": {
