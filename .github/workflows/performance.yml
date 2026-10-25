@@ -421,6 +421,11 @@ jobs:
             RHIZA_VERSITYGW_BIN="$RHIZA_VERSITYGW_BIN" \
             go test -count=1 -v -timeout=2m ./pkg/node \
             -run '^TestNodeOpenCooperativeS3WithBeforeAckProfile$'
+          run_logged node-startup-archive-quorum-s3 env \
+            RHIZA_VERSITYGW_BIN="$RHIZA_VERSITYGW_BIN" \
+            RHIZA_VERSITY_EVIDENCE_DIR="$RHIZA_VERSITY_EVIDENCE_DIR" \
+            go test -count=1 -v -timeout=10m ./pkg/node \
+            -run '^(TestNodeOpenRefreshesFixedArchiveAfterInitialQuorumFailure|TestNodeOpenConsumesPendingTerminalArchiveGap|TestNodeOpenRemovedSingletonNeverBecomesReady|TestNodeOpenLiveQuorumServesUserWrites|TestNodeOpenRecoversClusteredDurableRecorderWithLiveQuorum)$'
           run_logged node-learn-gap-lifecycle-s3 env \
             RHIZA_VERSITYGW_BIN="$RHIZA_VERSITYGW_BIN" \
             go test -count=1 -v -tags rhiza_local_testhooks -timeout=3m ./pkg/node \

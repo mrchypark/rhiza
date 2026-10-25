@@ -721,6 +721,52 @@ jobs:
       - name: Vulnerability scan
         run: go run golang.org/x/vuln/cmd/govulncheck@v1.7.0 ./...
 
+  node-startup-versity:
+    if: github.event_name != 'workflow_dispatch' || (!inputs.fencing_only && !inputs.fixture_only)
+    runs-on: macos-15
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+          cache: true
+      - name: Download and verify pinned local Versity Gateway
+        env:
+          VERSITY_ARCHIVE_SHA256: 4953096f65a9c0d62ab184fb6b2ba7c2435229205cf00a56cb62cd4bf6b216ca
+        run: |
+          set -eu
+          archive="$RUNNER_TEMP/versitygw_v1.8.0_Darwin_arm64.tar.gz"
+          install_dir="$RUNNER_TEMP/rhiza-versitygw"
+          curl --fail --location --silent --show-error \
+            https://github.com/versity/versitygw/releases/download/v1.8.0/versitygw_v1.8.0_Darwin_arm64.tar.gz \
+            --output "$archive"
+          printf '%s  %s\n' "$VERSITY_ARCHIVE_SHA256" "$archive" | shasum -a 256 --check
+          test "$(uname -m)" = arm64
+          mkdir -p "$install_dir"
+          tar -xzf "$archive" -C "$install_dir"
+          binary="$install_dir/versitygw_v1.8.0_Darwin_arm64/versitygw"
+          test -x "$binary"
+          "$binary" --version | grep -F 'Version  : 1.8.0'
+          printf 'RHIZA_VERSITYGW_BIN=%s\n' "$binary" >>"$GITHUB_ENV"
+          evidence_dir="$RUNNER_TEMP/rhiza-node-startup-versity-evidence"
+          mkdir -p "$evidence_dir"
+          printf 'RHIZA_VERSITY_EVIDENCE_DIR=%s\n' "$evidence_dir" >>"$GITHUB_ENV"
+      - name: Verify Node startup archive recovery with live quorum
+        env:
+          CGO_ENABLED: "1"
+        run: >-
+          go test -count=1 -v -timeout=10m ./pkg/node
+          -run '^(TestNodeOpenRefreshesFixedArchiveAfterInitialQuorumFailure|TestNodeOpenConsumesPendingTerminalArchiveGap|TestNodeOpenRemovedSingletonNeverBecomesReady|TestNodeOpenLiveQuorumServesUserWrites|TestNodeOpenRecoversClusteredDurableRecorderWithLiveQuorum)$'
+      - name: Preserve Node startup Versity evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: node-startup-versity-${{ github.run_id }}
+          path: ${{ runner.temp }}/rhiza-node-startup-versity-evidence
+          if-no-files-found: error
+          retention-days: 7
+
   containers:
     if: github.event_name != 'workflow_dispatch' || (!inputs.fencing_only && !inputs.fixture_only)
     runs-on: ubuntu-latest

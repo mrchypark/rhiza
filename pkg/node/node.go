@@ -74,6 +74,8 @@ type Node struct {
 	localRestoreSuffixPending bool
 	recoveryPhases            nodeRecoveryPhases
 	ready                     atomic.Bool
+	readyClusterMu            sync.RWMutex
+	readyCluster              *quepaxa.Cluster
 	fenceWriterActive         atomic.Bool
 	membershipMu              sync.Mutex
 	opened                    atomic.Bool
@@ -83,6 +85,12 @@ type Node struct {
 	replayMu                  sync.Mutex
 	compactionMu              sync.Mutex
 	catchUpWake               chan struct{}
+	archiveHintMu             sync.Mutex
+	archiveHintWake           chan struct{}
+	archiveHintLatest         quepaxa.TerminalGapKey
+	archiveHintPending        quepaxa.TerminalGapKey
+	archiveHintLastAttempted  quepaxa.TerminalGapKey
+	archiveStartupCheck       archiveStartupCheck
 	shutdownMu                sync.Mutex
 	terminalMu                sync.Mutex
 	terminalIdentity          network.TerminalDrainRequest
@@ -582,11 +590,13 @@ func (n *Node) open(ctx context.Context, enroll bool) (err error) {
 		EnableReconfiguration:    n.config.EnableReconfiguration,
 		EngineOwnedRemovals:      n.config.EngineOwnedRemovals,
 		ReconfigurationAdmission: n.verifyMembershipAdmission,
+		ReconfigurationPrefixPublication: n.publishReconfigurationPrefix,
 	})
 	if err != nil {
 		return fmt.Errorf("create QuePaxa core: %w", err)
 	}
 	n.core = core
+	n.initArchiveCatchUpHints()
 	if n.config.Local {
 		recovered := core.CurrentCluster()
 		if len(recovered.Members) != 1 || recovered.Members[0].ID != n.config.NodeID {
@@ -686,6 +696,7 @@ func (n *Node) open(ctx context.Context, enroll bool) (err error) {
 	// Record RPCs must be available while every replica is recovering. Public
 	// proposals and learned decisions remain gated by ready=false.
 	server := network.NewServer(core, material, n.config.ClusterID, true, transport, n.apiReady)
+	n.installArchiveCatchUpHint(server, core)
 	if n.config.EngineOwnedRemovals && n.config.Learner != nil && n.fenceSession != nil {
 		server.SetPeerLearnReady(n.peerLearnReady)
 	}
@@ -752,7 +763,7 @@ func (n *Node) open(ctx context.Context, enroll bool) (err error) {
 			NodeID:       string(n.config.NodeID),
 			ClusterID:    string(n.config.ClusterID),
 			Durability:   string(n.config.ObjStoreDurability),
-			Ready:        n.ready.Load(),
+			Ready:        n.apiReady(),
 			Quorum:       quorumErr == nil,
 			CertifiedTip: uint64(core.Tip()),
 			AppliedTip:   material.Tip(),
@@ -908,7 +919,11 @@ func (n *Node) open(ctx context.Context, enroll bool) (err error) {
 			log.Printf("Local WAL committed-file cleanup deferred: %v", err)
 		}
 	}
-	if len(cluster.Members) == 1 {
+	currentCluster := core.CurrentCluster()
+	if n.maySkipCatchUp(currentCluster) {
+		if n.config.EnableReconfiguration {
+			n.rememberReadyCluster(&currentCluster)
+		}
 		n.ready.Store(true)
 	} else {
 		n.wg.Add(1)
@@ -921,33 +936,7 @@ func (n *Node) open(ctx context.Context, enroll bool) (err error) {
 	// 8. Start periodic WAL sync
 	core.StartPeriodicSync(ctx, 1*time.Second)
 	if n.archive != nil {
-		interval := n.config.ObjStoreSyncInterval
-		if interval == 0 {
-			interval = time.Minute
-		}
-		n.wg.Add(1)
-		go func() {
-			defer n.wg.Done()
-			ticker := time.NewTicker(interval)
-			defer ticker.Stop()
-			for {
-				select {
-				case <-ctx.Done():
-					return
-				case <-ticker.C:
-					if n.config.EnableReconfiguration && !core.IsVoter() {
-						continue
-					}
-					if err := n.catchUpArchive(ctx); err != nil {
-						log.Printf("shared archive catch-up error: %v", err)
-					} else if err := n.archive.SyncThrough(ctx, core, core.Tip()); err != nil {
-						log.Printf("shared archive sync error: %v", err)
-					} else if err := n.compactCertifiedCheckpoint(ctx); err != nil {
-						log.Printf("certified checkpoint compaction skipped: %v", err)
-					}
-				}
-			}
-		}()
+		n.startArchiveWorker(ctx, core)
 	}
 	if n.checkpoints != nil {
 		interval := n.config.CheckpointInterval
@@ -1083,6 +1072,13 @@ func (n *Node) open(ctx context.Context, enroll bool) (err error) {
 	n.startFenceWatcher(ctx)
 	n.startEngineRepairRunner(ctx)
 	return nil
+}
+
+func (n *Node) maySkipCatchUp(cluster quepaxa.Cluster) bool {
+	if len(cluster.Members) != 1 || (n.config.EngineOwnedRemovals && n.config.Learner != nil) {
+		return false
+	}
+	return !n.config.EnableReconfiguration || (n.core != nil && n.core.StartupCatchUpRoundEligible(cluster))
 }
 
 func (n *Node) registerLearnerIdentity(ctx context.Context, key string, data []byte) error {
@@ -1561,6 +1557,161 @@ func (n *Node) catchUpArchive(ctx context.Context) error {
 	return n.replayLocalDecisions(ctx)
 }
 
+func (n *Node) queueArchiveCatchUpHint(key quepaxa.TerminalGapKey) {
+	if key.ConfigID == 0 || key.Freeze == 0 || key.Terminal <= key.Freeze || key.FreezeHash == (quepaxa.ValueHash{}) {
+		return
+	}
+	n.archiveHintMu.Lock()
+	wake := n.archiveHintWake
+	if wake == nil || key == n.archiveHintLastAttempted || key == n.archiveHintPending {
+		n.archiveHintMu.Unlock()
+		return
+	}
+	if latest := n.archiveHintLatest; latest.Terminal != 0 && !newerArchiveCatchUpHint(key, latest) {
+		n.archiveHintMu.Unlock()
+		return
+	}
+	n.archiveHintLatest = key
+	n.archiveHintPending = key
+	n.archiveHintMu.Unlock()
+	select {
+	case wake <- struct{}{}:
+	default:
+	}
+}
+
+func (n *Node) initArchiveCatchUpHints() {
+	if n.archive == nil {
+		return
+	}
+	// Install the signal state before the peer listener can expose Learned.
+	// The one-slot channel coalesces concurrent hints without a retry queue.
+	n.archiveHintMu.Lock()
+	n.archiveHintWake = make(chan struct{}, 1)
+	n.archiveHintLatest = quepaxa.TerminalGapKey{}
+	n.archiveHintPending = quepaxa.TerminalGapKey{}
+	n.archiveHintLastAttempted = quepaxa.TerminalGapKey{}
+	n.archiveStartupCheck = archiveStartupCheck{}
+	n.archiveHintMu.Unlock()
+}
+
+func (n *Node) installArchiveCatchUpHint(server *network.Server, core *quepaxa.Core) {
+	if n.archive == nil || server == nil || core == nil {
+		return
+	}
+	server.SetArchiveCatchUpHint(func(key quepaxa.TerminalGapKey) {
+		if core.IsVoter() {
+			n.queueArchiveCatchUpHint(key)
+		}
+	})
+	server.SetArchiveCatchUpContinuation(func(ctx context.Context, key quepaxa.TerminalGapKey) error {
+		return n.catchUpArchivePrefix(ctx, core, key)
+	})
+}
+
+func newerArchiveCatchUpHint(candidate, current quepaxa.TerminalGapKey) bool {
+	if candidate.ConfigID < current.ConfigID || candidate.Terminal < current.Terminal {
+		return false
+	}
+	return candidate.ConfigID > current.ConfigID || candidate.Freeze > current.Freeze || candidate.Terminal > current.Terminal
+}
+
+func (n *Node) takeArchiveCatchUpHint() (quepaxa.TerminalGapKey, bool) {
+	n.archiveHintMu.Lock()
+	defer n.archiveHintMu.Unlock()
+	key := n.archiveHintPending
+	if key.Terminal == 0 {
+		return quepaxa.TerminalGapKey{}, false
+	}
+	n.archiveHintPending = quepaxa.TerminalGapKey{}
+	n.archiveHintLastAttempted = key
+	return key, true
+}
+
+func (n *Node) catchUpArchiveHint(ctx context.Context, key quepaxa.TerminalGapKey) error {
+	if n.archive == nil || n.core == nil || !n.core.IsVoter() || !n.core.PendingTerminalGap(key) {
+		return nil
+	}
+	if err := n.archive.LoadOnce(ctx); err != nil {
+		return err
+	}
+	if !n.core.PendingTerminalGap(key) {
+		return nil
+	}
+	archiveTip := n.archive.Tip()
+	if archiveTip < key.Terminal {
+		return nil
+	}
+	localTip := n.core.Tip()
+	if localTip >= key.Terminal {
+		return nil
+	}
+	if localTip < key.Freeze || key.Terminal-localTip > 16 {
+		return fmt.Errorf("pending archive terminal range is invalid")
+	}
+	values, readTip, err := n.archive.DecisionsFrom(ctx, localTip+1, int(key.Terminal-localTip))
+	if err != nil {
+		return err
+	}
+	count := int(key.Terminal - localTip)
+	if readTip < key.Terminal || len(values) != count {
+		return fmt.Errorf("shared archive omitted pending terminal range")
+	}
+	for i, value := range values {
+		if value.Slot != localTip+1+quepaxa.Slot(i) {
+			return fmt.Errorf("shared archive returned a non-contiguous pending terminal range")
+		}
+		if err := types.ValidateExecutionPolicy(value.Value); err != nil {
+			return err
+		}
+	}
+	if !n.core.PendingTerminalGap(key) {
+		return nil
+	}
+	return n.core.AcceptCertifiedValues(values)
+}
+
+func (n *Node) startArchiveWorker(ctx context.Context, core *quepaxa.Core) {
+	interval := n.config.ObjStoreSyncInterval
+	if interval == 0 {
+		interval = time.Minute
+	}
+	n.wg.Add(1)
+	go func() {
+		defer n.wg.Done()
+		ticker := time.NewTicker(interval)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-n.archiveHintWake:
+				if key, ok := n.takeArchiveCatchUpHint(); ok {
+					if err := n.catchUpArchiveHint(ctx, key); err != nil {
+						log.Printf("shared archive terminal catch-up deferred: %v", err)
+					}
+				}
+				if captured, ok := n.takeStartupArchiveCheck(); ok {
+					if err := n.catchUpStartupArchive(ctx, captured); err != nil {
+						log.Printf("shared archive startup catch-up deferred: %v", err)
+					}
+				}
+			case <-ticker.C:
+				if n.config.EnableReconfiguration && !core.IsVoter() {
+					continue
+				}
+				if err := n.catchUpArchive(ctx); err != nil {
+					log.Printf("shared archive catch-up error: %v", err)
+				} else if err := n.archive.SyncThrough(ctx, core, core.Tip()); err != nil {
+					log.Printf("shared archive sync error: %v", err)
+				} else if err := n.compactCertifiedCheckpoint(ctx); err != nil {
+					log.Printf("certified checkpoint compaction skipped: %v", err)
+				}
+			}
+		}
+	}()
+}
+
 func archiveRecoveryRequired(localTip, archiveBase quepaxa.Slot) bool {
 	return archiveBase != 0 && localTip < archiveBase
 }
@@ -1858,6 +2009,9 @@ func (n *Node) catchUpMembership(ctx context.Context, transport *network.Transpo
 		cluster = &current
 	}
 	if n.config.Learner == nil || n.core.IsVoter() {
+		if n.config.EnableReconfiguration {
+			return n.catchUpStartupVoterQuorum(ctx, transport)
+		}
 		return n.catchUpQuorum(ctx, transport, cluster)
 	}
 	peerErr := n.catchUpLearnerPeers(ctx, transport, cluster)
@@ -1898,7 +2052,16 @@ func (n *Node) catchUpLearnerPeers(ctx context.Context, transport *network.Trans
 }
 
 func (n *Node) startCatchUp(ctx context.Context, transport *network.Transport, cluster *quepaxa.Cluster) {
-	n.observeCatchUp(n.catchUpMembership(ctx, transport, cluster))
+	var initialCluster *quepaxa.Cluster
+	if n.config.EnableReconfiguration {
+		current := n.core.CurrentCluster()
+		cluster = &current
+		captured := cloneStartupCluster(current)
+		initialCluster = &captured
+	}
+	initialErr := n.catchUpMembership(ctx, transport, cluster)
+	n.observeCatchUpRound(initialErr, initialCluster)
+	n.queueInitialStartupArchiveCheck(initialErr)
 	var round uint64
 	for {
 		delay := syncInterval(n.config.NodeID, round)
@@ -1925,8 +2088,16 @@ func (n *Node) startCatchUp(ctx context.Context, transport *network.Transport, c
 			current := n.core.CurrentCluster()
 			cluster = &current
 		}
-		if !n.ready.Load() {
-			n.observeCatchUp(n.catchUpMembership(ctx, transport, cluster))
+		if n.ready.Load() && !n.readyForCurrentCluster() {
+			n.ready.Store(false)
+		}
+		if !n.apiReady() {
+			var captured *quepaxa.Cluster
+			if n.config.EnableReconfiguration {
+				current := cloneStartupCluster(*cluster)
+				captured = &current
+			}
+			n.observeCatchUpRound(n.catchUpMembership(ctx, transport, cluster), captured)
 		} else if sources := syncSources(n.config.NodeID, cluster.Members, round); len(sources) > 0 {
 			var syncErr error
 			for _, source := range sources {
@@ -1940,7 +2111,12 @@ func (n *Node) startCatchUp(ctx context.Context, transport *network.Transport, c
 			// A compacted peer can force checkpoint recovery from catchUpPeer.
 			// Only a fresh quorum round may make that node ready again.
 			if !n.ready.Load() {
-				n.observeCatchUp(n.catchUpMembership(ctx, transport, cluster))
+				var captured *quepaxa.Cluster
+				if n.config.EnableReconfiguration {
+					current := cloneStartupCluster(*cluster)
+					captured = &current
+				}
+				n.observeCatchUpRound(n.catchUpMembership(ctx, transport, cluster), captured)
 			}
 		}
 		round++
@@ -1986,6 +2162,10 @@ func syncSources(nodeID quepaxa.NodeID, members []quepaxa.Member, round uint64) 
 }
 
 func (n *Node) observeCatchUp(err error) {
+	n.observeCatchUpRound(err, nil)
+}
+
+func (n *Node) observeCatchUpRound(err error, captured *quepaxa.Cluster) {
 	if err != nil {
 		// A transient peer timeout must not make an already caught-up node
 		// reject traffic; quorum operations enforce their own availability.
@@ -2000,11 +2180,48 @@ func (n *Node) observeCatchUp(err error) {
 		n.ready.Store(false)
 		return
 	}
+	if n.config != nil && n.config.EnableReconfiguration && n.core != nil &&
+		(n.config.Learner == nil || n.core.IsVoter()) {
+		if captured == nil || !n.core.StartupCatchUpRoundEligible(*captured) {
+			n.ready.Store(false)
+			n.rememberReadyCluster(nil)
+			return
+		}
+		n.rememberReadyCluster(captured)
+	} else {
+		n.rememberReadyCluster(nil)
+	}
 	n.ready.Store(true)
 }
 
+func (n *Node) rememberReadyCluster(cluster *quepaxa.Cluster) {
+	n.readyClusterMu.Lock()
+	defer n.readyClusterMu.Unlock()
+	if cluster == nil || cluster.ConfigID == 0 {
+		n.readyCluster = nil
+		return
+	}
+	captured := cloneStartupCluster(*cluster)
+	n.readyCluster = &captured
+}
+
+func (n *Node) readyForCurrentCluster() bool {
+	if n == nil || n.config == nil || !n.config.EnableReconfiguration || n.core == nil ||
+		(n.config.Learner != nil && !n.core.IsVoter()) {
+		return true
+	}
+	n.readyClusterMu.RLock()
+	if n.readyCluster == nil {
+		n.readyClusterMu.RUnlock()
+		return false
+	}
+	captured := cloneStartupCluster(*n.readyCluster)
+	n.readyClusterMu.RUnlock()
+	return n.core.StartupCatchUpRoundEligible(captured)
+}
+
 func (n *Node) apiReady() bool {
-	if n == nil || !n.ready.Load() || n.supervisedEngineRepairCandidatePending() {
+	if n == nil || !n.ready.Load() || !n.readyForCurrentCluster() || n.supervisedEngineRepairCandidatePending() {
 		return false
 	}
 	return n.fenceSession == nil || n.fenceSession.StartupRole() != fencing.StartupRoleVoterActive || n.fenceWriterActive.Load()
@@ -2030,7 +2247,13 @@ func hasUsablePeerSuffix(applied quepaxa.Slot, successes, quorum int, best *netw
 }
 
 func (n *Node) catchUpQuorum(ctx context.Context, transport *network.Transport, cluster *quepaxa.Cluster) error {
+	startupRound := false
 	for {
+		if n.config.EnableReconfiguration && startupRound && !n.core.StartupCatchUpRoundEligible(*cluster) {
+			n.queueStartupTerminalGap()
+			return quepaxa.ErrQuorumUnavailable
+		}
+		startupRound = true
 		if err := n.replayLocalDecisions(ctx); err != nil {
 			return err
 		}
@@ -2118,6 +2341,10 @@ func (n *Node) catchUpQuorum(ctx context.Context, transport *network.Transport, 
 		}
 		if err := n.material.ApplyBatch(ctx, best.Decisions); err != nil {
 			return err
+		}
+		if n.config.EnableReconfiguration && !n.core.StartupCatchUpRoundEligible(*cluster) {
+			n.queueStartupTerminalGap()
+			return quepaxa.ErrQuorumUnavailable
 		}
 		if len(best.Decisions) == 0 {
 			return fmt.Errorf("catch-up source reported tip %d without slot %d", best.Tip, expected)
