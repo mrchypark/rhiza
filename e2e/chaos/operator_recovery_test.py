@@ -129,6 +129,76 @@ class ReadFailureProjectionTest(unittest.TestCase):
             self.assertEqual(5.0, chaos._diagnostic_remaining())
         self.assertEqual(100.0, chaos.diagnostic_deadline)
 
+    def test_collector_roundtrips_findings_without_replacing_log_keys(self):
+        with tempfile.TemporaryDirectory() as directory:
+            chaos = object.__new__(Chaos)
+            chaos.args = mock.Mock(embedded_host="server")
+            chaos.out = Path(directory)
+            chaos.ns = "fixture"
+            chaos.context = "fixture-context"
+            chaos.supervised_bootstrap = False
+
+            stateful_set = {
+                "metadata": {"name": "rhiza", "uid": "sts-uid"},
+                "spec": {"replicas": 1, "template": {"metadata": {"annotations": {}}}},
+                "status": {},
+            }
+            pod = {
+                "metadata": {
+                    "name": "rhiza-0", "uid": "pod-uid",
+                    "labels": {"app.kubernetes.io/name": "rhiza"},
+                    "ownerReferences": [{"controller": True, "kind": "StatefulSet",
+                                         "name": "rhiza", "uid": "sts-uid"}],
+                },
+                "spec": {"containers": [{"name": "rhiza"}]},
+                "status": {"containerStatuses": [{
+                    "name": "rhiza", "containerID": "containerd://current",
+                    "restartCount": 1,
+                    "lastState": {"terminated": {"containerID": "containerd://previous"}},
+                }]},
+            }
+            current_log = (
+                b"2026/10/26 12:34:56 read failed: phase=read-index "
+                b"error_class=quorum-unavailable detail=PRIVATE_READ_FAILURE_CANARY\n"
+            )
+            previous_log = b"previous container has no read failure\n"
+
+            def fake_run(argv, **kwargs):
+                if "logs" in argv:
+                    payload = previous_log if "--previous" in argv else current_log
+                    return mock.Mock(returncode=0, stdout=payload, stderr=b"")
+                args = argv[argv.index("get") + 1:]
+                if args[:2] == ["statefulset", "rhiza"]:
+                    value = stateful_set
+                elif args[:1] == ["pods"]:
+                    value = {"items": [pod]}
+                elif args[:2] == ["pod", "rhiza-0"]:
+                    value = pod
+                else:
+                    raise AssertionError(f"unexpected diagnostic command: {args}")
+                return mock.Mock(returncode=0, stdout=json.dumps(value), stderr="")
+
+            with mock.patch("operator_recovery.subprocess.run", side_effect=fake_run):
+                errors = chaos.capture_failure_diagnostics()
+
+            private = Path(directory, "private-startup-diagnostics")
+            record = json.loads(Path(private, "record.json").read_text())
+            capture = record["captures"][0]
+            self.assertEqual([], errors)
+            self.assertEqual({"current", "previous"}, set(capture["logs"]))
+            self.assertTrue(capture["logs"]["current"]["captured"])
+            self.assertTrue(capture["logs"]["previous"]["captured"])
+            self.assertEqual([{"phase": "read-index", "errorClass": "quorum-unavailable",
+                               "attribution": "unattributed"}], capture["readFailureFindings"])
+            summary_path = Path(directory, "startup-diagnostics-summary.json")
+            summary_text = summary_path.read_text()
+            summary = json.loads(summary_text)
+            self.assertEqual([{"phase": "read-index", "errorClass": "quorum-unavailable",
+                               "attribution": "unattributed"}],
+                             summary["captures"][0]["readFailureFindings"])
+            self.assertEqual({"current", "previous"}, set(summary["captures"][0]["logs"]))
+            self.assertNotIn("PRIVATE_READ_FAILURE_CANARY", summary_text)
+
 
 class LegacyMembershipRejectionTest(unittest.TestCase):
     blocked_reason = "new operator-managed membership changes are disabled; ordinary Pod recovery is engine-owned"

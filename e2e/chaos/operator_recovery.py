@@ -926,10 +926,10 @@ class Chaos:
                             known = {(finding["phase"], finding["errorClass"])
                                      for finding in item["readFailureFindings"]}
                             for finding in safe_read_failure_findings(payload):
-                                key = (finding["phase"], finding["errorClass"])
-                                if key not in known:
+                                finding_key = (finding["phase"], finding["errorClass"])
+                                if finding_key not in known:
                                     item["readFailureFindings"].append(finding)
-                                    known.add(key)
+                                    known.add(finding_key)
                         path = private / f"{name}-{cname}-{key}.log"
                         path.write_bytes(payload)
                         path.chmod(0o600)
