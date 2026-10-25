@@ -961,6 +961,7 @@ func TestFixtureOnlyWorkflowIsExclusiveAndRunsFixedGoSelectors(t *testing.T) {
 		"membership-e2e":                  "github.event_name != 'workflow_dispatch' || (!inputs.fencing_only && !inputs.fixture_only)",
 		"rust-sdk":                        "github.event_name != 'workflow_dispatch' || (!inputs.fencing_only && !inputs.fixture_only)",
 		"go":                              "github.event_name != 'workflow_dispatch' || (!inputs.fencing_only && !inputs.fixture_only)",
+		"node-startup-versity":            "github.event_name != 'workflow_dispatch' || (!inputs.fencing_only && !inputs.fixture_only)",
 		"containers":                      "github.event_name != 'workflow_dispatch' || (!inputs.fencing_only && !inputs.fixture_only)",
 		"anchor-operator-chaos":           "github.event_name != 'workflow_dispatch' || (!inputs.fencing_only && !inputs.fixture_only)",
 		"publish-chaos-image":             "github.repository == 'mrchypark/rhiza' && github.event_name == 'workflow_dispatch' && inputs.publish_chaos_image && !inputs.fencing_only && !inputs.fixture_only",
