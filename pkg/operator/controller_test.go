@@ -1080,6 +1080,7 @@ type operatorAPI struct {
 	peers                         []*httptest.Server
 	learner                       *httptest.Server
 	membership                    map[string]network.MembershipStatus
+	recoveryStatusClusterID       string
 	changes                       []network.MembershipChange
 	aborts                        []network.MembershipChange
 	changeStatus                  int
@@ -1198,6 +1199,9 @@ func newOperatorAPIVoters(t *testing.T, r *Resource, mode string, voters []quepa
 				tip = 0
 				durability = a.r.Spec.Durability
 				clusterID = "rhiza-r-" + shortID(str(a.r.Metadata["uid"])+":"+a.r.Spec.RecoveryID)
+			}
+			if a.recoveryStatusClusterID != "" {
+				clusterID = a.recoveryStatusClusterID
 			}
 			_ = json.NewEncoder(w).Encode(network.VoterRecoveryStatus{NodeID: string(member.ID), ClusterID: clusterID, Durability: durability, Ready: !a.unready[string(member.ID)], Quorum: !a.noQuorum, CertifiedTip: tip, AppliedTip: tip})
 		})))
