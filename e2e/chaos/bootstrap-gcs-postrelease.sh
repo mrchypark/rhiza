@@ -1751,7 +1751,7 @@ if [ "$mode" = apply ]; then
     }
     trap clear_fixture 0
     trap 'exit 130' HUP INT TERM
-    if ! "$RHIZA_FIXTURE_GENERATOR" qualification-fixture "$ns" "$RHIZA_RUN_ID" "$owner" > "$fixture_dir/secret.json" 2>/dev/null; then
+    if ! "$RHIZA_FIXTURE_GENERATOR" qualification-fixture "$ns" "$RHIZA_RUN_ID" "$version_prefix" "$owner" > "$fixture_dir/secret.json" 2>/dev/null; then
         die 'Trusted fixture generator failed (payload/diagnostics omitted)'
     fi
     chmod 600 "$fixture_dir/secret.json"
