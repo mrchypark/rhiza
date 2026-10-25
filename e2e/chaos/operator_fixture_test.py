@@ -303,6 +303,7 @@ class BucketJobTest(unittest.TestCase):
                 b"2026/10/26 12:34:56 unrecognized private failure PRIVATE_CANARY_G",
                 b"2026/10/26 12:34:56 open rhiza: node open phase consensus: nested open WAL: PRIVATE_CANARY_H",
                 b"2026/10/26 12:34:56 open rhiza: node open phase wal: nested ensure voter identity: PRIVATE_CANARY_I",
+                b"2026/10/26 12:34:56 node open phase network: peer transport setup failed: PRIVATE_CANARY_J",
             ))
             errors = self._capture_diagnostics(
                 chaos, self._diagnostic_fixture(), log_payloads={"current": payload})
@@ -310,11 +311,11 @@ class BucketJobTest(unittest.TestCase):
             summary = Path(directory, "startup-diagnostics-summary.json").read_text()
             capture = json.loads(summary)["captures"][0]
             self.assertEqual([
-                "engine_repair_preflight", "identity_enrollment", "identity_storage",
-                "storage_initialization", "supervisor_child_exit", "wal_open",
+                "consensus", "engine_repair_preflight", "identity_enrollment", "identity_storage",
+                "network", "storage_initialization", "supervisor_child_exit", "wal", "wal_open",
             ], capture["startupFindings"])
             for canary in ("PRIVATE_CANARY_A", "PRIVATE_CANARY_B", "PRIVATE_CANARY_C",
-                           "PRIVATE_CANARY_D", "PRIVATE_CANARY_E", "PRIVATE_CANARY_F",
+                           "PRIVATE_CANARY_D", "PRIVATE_CANARY_E", "PRIVATE_CANARY_F", "PRIVATE_CANARY_J",
                            "PRIVATE_CANARY_G", "PRIVATE_CANARY_H", "PRIVATE_CANARY_I"):
                 self.assertNotIn(canary, summary)
 
@@ -328,6 +329,19 @@ class BucketJobTest(unittest.TestCase):
             self.assertIn("PRIVATE_ERROR_CANARY", json.dumps(record))
             self.assertIn("pod_log_capture_failed", summary)
             self.assertNotIn("PRIVATE_ERROR_CANARY", summary)
+
+    def test_embedded_go_startup_findings_use_inherited_automatic_and_anchor_collectors(self):
+        payload = b"2026/10/26 12:34:56 node open phase network: peer transport setup failed: PRIVATE_EMBEDDED_CANARY"
+        for harness in (AutomaticChaos, AnchorChaos):
+            with self.subTest(harness=harness.__name__), tempfile.TemporaryDirectory() as directory:
+                chaos = harness(argparse.Namespace(output=directory, cluster="fixture"))
+                errors = self._capture_diagnostics(
+                    chaos, self._diagnostic_fixture(), log_payloads={"current": payload})
+                self.assertEqual([], errors)
+                summary = Path(directory, "startup-diagnostics-summary.json").read_text()
+                capture = json.loads(summary)["captures"][0]
+                self.assertEqual(["network"], capture["startupFindings"])
+                self.assertNotIn("PRIVATE_EMBEDDED_CANARY", summary)
 
     def test_diagnostic_binding_and_incarnation_drift_fail_closed(self):
         with tempfile.TemporaryDirectory() as directory:
