@@ -26,6 +26,11 @@ STARTUP_MARKER_CODES = (
     ("fencing: engine repair preflight:", "engine_repair_preflight"),
     ("fencing: child exited without a terminal receipt:", "supervisor_child_exit"),
 )
+ENGINE_REPAIR_PREFLIGHT_PREFIX = "fencing: engine repair preflight:"
+ENGINE_REPAIR_PREFLIGHT_CAUSES = (
+    ("voter state continuity cannot be established", "engine_repair_state_continuity_lost"),
+    ("registered voter WAL is absent", "engine_repair_wal_absent"),
+)
 GO_LOG_PREFIX = re.compile(r"^\d{4}/\d{2}/\d{2} \d{2}:\d{2}:\d{2} ")
 SAFE_DIAGNOSTIC_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}$")
 POD_ORDINAL = re.compile(r"^rhiza-(\d+)$")
@@ -107,8 +112,9 @@ def diagnostic_recovery_status(status):
 def safe_startup_findings(payload):
     """Project private startup logs to fixed diagnostic enums only."""
     text = payload.decode("utf-8", errors="replace") if isinstance(payload, bytes) else str(payload)
+    lines = text.splitlines()
     findings = set()
-    for line in text.splitlines():
+    for index, line in enumerate(lines):
         if not GO_LOG_PREFIX.match(line):
             continue
         line = GO_LOG_PREFIX.sub("", line, count=1)
@@ -132,6 +138,18 @@ def safe_startup_findings(payload):
         for prefix, code in STARTUP_MARKER_CODES:
             if line.startswith(prefix):
                 findings.add(code)
+                if prefix == ENGINE_REPAIR_PREFLIGHT_PREFIX:
+                    detail = line[len(prefix):].lstrip()
+                    for cause, cause_code in ENGINE_REPAIR_PREFLIGHT_CAUSES:
+                        if detail.startswith(cause):
+                            findings.add(cause_code)
+                    # errors.Join renders each fixed sentinel on its own line.
+                    # Only recognize the exact WAL sentinel immediately after
+                    # the exact state-loss sentinel; never copy log text out.
+                    if (detail.startswith(ENGINE_REPAIR_PREFLIGHT_CAUSES[0][0]) and
+                            index + 1 < len(lines) and
+                            lines[index + 1] == ENGINE_REPAIR_PREFLIGHT_CAUSES[1][0]):
+                        findings.add(ENGINE_REPAIR_PREFLIGHT_CAUSES[1][1])
     return sorted(findings)
 
 
