@@ -694,6 +694,43 @@ func TestControllerMembershipAbortThenResumeWithNewLearner(t *testing.T) {
 func TestControllerMembershipSecondReplacementUsesStandaloneVoter(t *testing.T) {
 	ctx, r, api, c := membershipFixture(t)
 	r.Spec.Membership = &MembershipSpec{OperationID: "replace-n1", Remove: "n1", Fence: MembershipFence{NodeID: "n1", WALIdentity: strings.Repeat("c", 64), WorkloadUID: "pod-n1", Confirmed: true, Evidence: "external-fencer: incident-43"}, VoterPods: []VoterPod{{NodeID: "n2", Pod: "n2"}, {NodeID: "n4", Pod: "learner"}}, ReplacementPod: "learner2", ReplacementSecret: "learner-credentials"}
+	standalone := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, q *http.Request) {
+		api.mu.Lock()
+		defer api.mu.Unlock()
+		switch q.URL.Path {
+		case "/membership/status":
+			status, ok := api.membership["n4"]
+			if !ok {
+				http.NotFound(w, q)
+				return
+			}
+			_ = json.NewEncoder(w).Encode(status)
+		case "/membership/change":
+			var change network.MembershipChange
+			if json.NewDecoder(q.Body).Decode(&change) != nil {
+				http.Error(w, "bad request", http.StatusBadRequest)
+				return
+			}
+			api.changes = append(api.changes, change)
+			if api.changeStatus != 0 {
+				w.WriteHeader(api.changeStatus)
+				return
+			}
+			_ = json.NewEncoder(w).Encode(map[string]string{"status": "completed"})
+		default:
+			http.NotFound(w, q)
+		}
+	}))
+	t.Cleanup(standalone.Close)
+	_, standalonePort, err := net.SplitHostPort(standalone.Listener.Addr().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	port, err := strconv.Atoi(standalonePort)
+	if err != nil {
+		t.Fatal(err)
+	}
+	api.replacement = object{"metadata": object{"name": "learner", "uid": "learner-uid"}, "status": object{"podIP": "127.0.0.1"}, "spec": object{"containers": []any{object{"name": "rhiza", "ports": []any{object{"name": "http", "containerPort": float64(port)}}}}}}
 	seedLegacyRemoveMembershipJournal(r)
 	r.Status.Membership.RemoveRequest.ExpectedConfigID = 3
 	var seededRemove network.MembershipChange
