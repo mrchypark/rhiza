@@ -7,6 +7,7 @@ import (
 	"net"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -136,21 +137,44 @@ func TestRetiredPeerTransitionRejectsCachedIdentityAndAdmitsNewIdentity(t *testi
 	if err != nil {
 		t.Fatalf("begin REMOVE: %v", err)
 	}
-	removeEvents := make(chan string, 32)
+	terminalSlot := removeFreeze + 16
+	removeEvents := make(chan string, 64)
+	var removeEventsMu sync.Mutex
+	bCatchupActive := false
+	removeAttempt := fmt.Sprintf("retired-peer-remove-a-to-b:%d", terminalSlot)
 	removeHook := installRetiredPeerTestHook(func(event string) {
-		if !strings.Contains(event, "network:terminal-decision:") && !strings.HasPrefix(event, "network:peer-request-rejected:") {
+		prefix := fmt.Sprintf("test_alias=retired-peer-transition-remove:attempt=%s:parent_operation=learned:terminal_slot=%d:target_contains_receiver=true:engine_owned=false:", removeAttempt, terminalSlot)
+		removeEventsMu.Lock()
+		defer removeEventsMu.Unlock()
+		switch {
+		case strings.HasPrefix(event, "network:learned-control:phase=catchup-start:node=b:sender=a:") && strings.HasSuffix(event, fmt.Sprintf(":slot=%d", terminalSlot)):
+			bCatchupActive = true
+		case strings.HasPrefix(event, "network:peer-request-rejected:operation=sync:") && bCatchupActive:
+			select {
+			case removeEvents <- prefix + "unattributed_sync_rejection_during_b_catchup_window:" + event:
+			default:
+			}
+			return
+		case strings.HasPrefix(event, "network:learned-control:phase=catchup-failed:node=b:sender=a:") && strings.HasSuffix(event, fmt.Sprintf(":slot=%d", terminalSlot)):
+			bCatchupActive = false
+		case strings.HasPrefix(event, "network:learned-control:phase=catchup-complete:node=b:sender=a:") && strings.HasSuffix(event, fmt.Sprintf(":slot=%d", terminalSlot)):
+			bCatchupActive = false
+		case strings.HasPrefix(event, "network:learned:phase=handler-result:node=b:sender=a:") && strings.HasSuffix(event, fmt.Sprintf(":slot=%d", terminalSlot)):
+			bCatchupActive = false
+		case strings.HasPrefix(event, "network:terminal-decision:") && strings.Contains(event, fmt.Sprintf(":slot=%d:", terminalSlot)):
+		default:
 			return
 		}
 		select {
-		case removeEvents <- "test_alias=retired-peer-transition-remove:" + event:
+		case removeEvents <- prefix + event:
 		default:
 		}
 	})
 	removeErr := cores["a"].FinishReconfigurationAt(ctx, withoutC, 0)
 	removeHook()
 	if removeErr != nil {
-		t.Fatalf("commit durable REMOVE: %v; sender=a operation=OperationLearned target_peers=[b,c] freeze_slot=%d terminal_events=%v peer_states=%s",
-			removeErr, removeFreeze, drainRetiredPeerEvents(removeEvents), retiredPeerStateSnapshot(cores, []quepaxa.NodeID{"a", "b", "c"}, removeFreeze))
+		t.Fatalf("commit durable REMOVE: %v; attempt=%s sender=a operation=OperationLearned target_peers=[b,c] terminal_slot=%d observed_events=%v peer_states=%s",
+			removeErr, removeAttempt, terminalSlot, drainRetiredPeerEvents(removeEvents), retiredPeerStateSnapshot(cores, []quepaxa.NodeID{"a", "b", "c"}, removeFreeze))
 	}
 	if got := cores["a"].CurrentCluster(); got.ConfigID != withoutC.ConfigID || !sameNetworkMembers(got, withoutC) {
 		t.Fatalf("REMOVE did not activate at receiver A: %+v", got)
