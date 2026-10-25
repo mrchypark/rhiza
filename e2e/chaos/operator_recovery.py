@@ -32,6 +32,9 @@ ENGINE_REPAIR_PREFLIGHT_CAUSES = (
     ("registered voter WAL is absent", "engine_repair_wal_absent"),
 )
 GO_LOG_PREFIX = re.compile(r"^\d{4}/\d{2}/\d{2} \d{2}:\d{2}:\d{2} ")
+READ_FAILURE_PHASES = frozenset({"read-index", "read-index-catch-up", "read-index-apply", "read-durability"})
+READ_FAILURE_CLASSES = frozenset({"backend", "canceled", "deadline", "quorum-unavailable",
+                                  "not-ready", "durability-unavailable"})
 SAFE_DIAGNOSTIC_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}$")
 POD_ORDINAL = re.compile(r"^rhiza-(\d+)$")
 
@@ -46,6 +49,13 @@ def diagnostic_id_hash(value):
 def diagnostic_ordinal(value):
     match = POD_ORDINAL.fullmatch(value) if isinstance(value, str) else None
     return int(match.group(1)) if match else None
+
+
+def diagnostic_uid_relation(cached, current):
+    if not isinstance(cached, str) or not SAFE_DIAGNOSTIC_ID.fullmatch(cached) or \
+            not isinstance(current, str) or not SAFE_DIAGNOSTIC_ID.fullmatch(current):
+        return "unknown"
+    return "same" if cached == current else "changed"
 
 
 def diagnostic_error_category(exc):
@@ -67,11 +77,18 @@ def diagnostic_membership(status):
         return {"errorCategory": "malformed_status"}
     voters = status.get("voters")
     voter_count = None
+    unique_voter_count = None
+    duplicate_voter_count = None
+    self_included = None
     voter_ordinals = None
     if isinstance(voters, list) and len(voters) <= 16 and all(
             isinstance(voter, str) and SAFE_DIAGNOSTIC_ID.fullmatch(voter) for voter in voters):
         voter_set = "\n".join(sorted(voters)).encode()
         voter_count = len(voters)
+        unique_voter_count = len(set(voters))
+        duplicate_voter_count = voter_count - unique_voter_count
+        node_id = status.get("node_id")
+        self_included = node_id in voters if isinstance(node_id, str) and SAFE_DIAGNOSTIC_ID.fullmatch(node_id) else None
         ordinals = [diagnostic_ordinal(voter) for voter in voters]
         voter_ordinals = sorted(ordinals) if all(value is not None for value in ordinals) else None
         voter_set_hash = hashlib.sha256(voter_set).hexdigest()[:16]
@@ -84,6 +101,9 @@ def diagnostic_membership(status):
         "clusterIDHash": diagnostic_id_hash(status.get("cluster_id")),
         "configID": config_id if type(config_id) is int and 0 <= config_id <= 2**64 - 1 else None,
         "voterCount": voter_count,
+        "uniqueVoterCount": unique_voter_count,
+        "duplicateVoterCount": duplicate_voter_count,
+        "selfIncluded": self_included,
         "voterOrdinals": voter_ordinals,
         "voterSetHash": voter_set_hash,
         "walIdentityHash": diagnostic_id_hash(status.get("wal_identity")),
@@ -92,21 +112,27 @@ def diagnostic_membership(status):
     }
 
 
-def diagnostic_recovery_status(status):
-    """Project the read-only recovery status without dynamic text fields."""
-    if not isinstance(status, dict):
-        return {"errorCategory": "malformed_status"}
-    projected = {
-        "nodeOrdinal": diagnostic_ordinal(status.get("node_id")),
-        "nodeIDHash": diagnostic_id_hash(status.get("node_id")),
-        "clusterIDHash": diagnostic_id_hash(status.get("cluster_id")),
-    }
-    for key in ("ready", "quorum"):
-        projected[key] = status.get(key) if type(status.get(key)) is bool else None
-    for key in ("certified_tip", "applied_tip", "archive_tip"):
-        value = status.get(key)
-        projected[key] = value if type(value) is int and 0 <= value <= 2**64 - 1 else None
-    return projected
+def safe_read_failure_findings(payload):
+    """Extract only the server's fixed read-failure fields; never infer causation."""
+    text = payload.decode("utf-8", errors="replace") if isinstance(payload, bytes) else str(payload)
+    findings = set()
+    for line in text.splitlines():
+        if not GO_LOG_PREFIX.match(line):
+            continue
+        line = GO_LOG_PREFIX.sub("", line, count=1)
+        marker = "read failed: "
+        if not line.startswith(marker):
+            continue
+        fields = {}
+        for token in line[len(marker):].split():
+            key, separator, value = token.partition("=")
+            if separator and key in ("phase", "error_class"):
+                fields[key] = value if key not in fields else None
+        phase, error_class = fields.get("phase"), fields.get("error_class")
+        if phase in READ_FAILURE_PHASES and error_class in READ_FAILURE_CLASSES:
+            findings.add((phase, error_class))
+    return [{"phase": phase, "errorClass": error_class, "attribution": "unattributed"}
+            for phase, error_class in sorted(findings)]
 
 
 def safe_startup_findings(payload):
@@ -168,6 +194,12 @@ class Chaos:
         self.writer = None
         self.admin = "chaos-admin"
         self.supervised_bootstrap = False
+        self.diagnostic_deadline = None
+
+    def _diagnostic_remaining(self):
+        if getattr(self, "diagnostic_deadline", None) is None:
+            self.diagnostic_deadline = time.monotonic() + 10
+        return self.diagnostic_deadline - time.monotonic()
 
     def command(self, argv, data=None):
         result = subprocess.run(argv, input=data, text=True, capture_output=True, timeout=240)
@@ -264,39 +296,23 @@ class Chaos:
     def status(self, pod):
         return self.http(pod, "/membership/status")
 
-    def _cached_recovery_status(self, pod):
-        """Run a post-failure ReadIndex probe and return only its safe projection."""
-        embedded = getattr(self.args, "embedded_host", "server") != "server"
-        remote_port = 9091 if embedded else 8080
-        key = (threading.get_ident(), pod, remote_port)
-        forward = self.forwards.get(key)
-        if not forward or forward[1].poll() is not None:
-            raise RuntimeError("cached_forward_unavailable")
-        request = urllib.request.Request(
-            f"http://127.0.0.1:{forward[2]}/recovery/status",
-            headers={"Authorization": "Bearer " + self.admin})
-        with urllib.request.urlopen(request, timeout=0.75) as response:
-            raw = response.read(16 * 1024 + 1)
-        if len(raw) > 16 * 1024:
-            raise ValueError("status_response_oversize")
-        return diagnostic_recovery_status(json.loads(raw) if raw else {})
-
-    def capture_linearizable_read_failure(self, voters, before_membership, error):
+    def capture_linearizable_read_failure(self, voters, before_membership, error, sql_started=None):
         """Best-effort status snapshot; never adds retries or masks the read error."""
+        failed_at = time.monotonic()
+        self._diagnostic_remaining()
         captures = []
         for pod in voters[:3]:
             ordinal = diagnostic_ordinal(pod)
             entry = {"ordinal": ordinal, "membership": diagnostic_membership(before_membership.get(pod))}
-            try:
-                # This active status read happens after the failed SQL read; it
-                # must not be interpreted as the quorum state at failure time.
-                entry["postFailureProbe"] = self._cached_recovery_status(pod)
-            except Exception as exc:
-                entry["recoveryError"] = diagnostic_error_category(exc)
+            entry["cachedForwardUID"] = "unknown"
             captures.append(entry)
 
         pod_states = []
+        snapshot_started = time.monotonic()
         try:
+            remaining = self._diagnostic_remaining()
+            if remaining <= 0:
+                raise TimeoutError("diagnostic_deadline_exhausted")
             result = subprocess.run(
                 ["kubectl", "--context", self.context, "-n", self.ns,
                  "--request-timeout=1s", "get", "pods", *voters[:3], "--ignore-not-found", "-o",
@@ -304,7 +320,7 @@ class Chaos:
                  'READY:.status.conditions[?(@.type=="Ready")].status,'
                  'RESTARTS:.status.containerStatuses[?(@.name=="rhiza")].restartCount',
                  "--no-headers"],
-                capture_output=True, text=True, timeout=1.5)
+                capture_output=True, text=True, timeout=min(1.5, remaining))
             if result.returncode:
                 raise RuntimeError("pod_snapshot_failed")
             requested = {pod: {"ordinal": diagnostic_ordinal(pod), "podPresent": False,
@@ -329,14 +345,28 @@ class Chaos:
                     "restartCount": int(restarts) if re.fullmatch(r"\d+", restarts) else None,
                 })
             pod_states = list(requested.values())
+            self._diagnostic_pod_uids = {name: next((line.split()[1] for line in result.stdout.splitlines()
+                if len(line.split()) == 5 and line.split()[0] == name), None) for name in requested}
+            for entry, pod in zip(captures, voters[:3]):
+                key = (threading.get_ident(), pod,
+                       9091 if getattr(self.args, "embedded_host", "server") != "server" else 8080)
+                cached = self.forwards.get(key) if pod else None
+                if cached and cached[1].poll() is None:
+                    current_uid = self._diagnostic_pod_uids.get(pod)
+                    entry["cachedForwardUID"] = diagnostic_uid_relation(cached[0], current_uid)
         except Exception as exc:
             pod_states = [{"errorCategory": diagnostic_error_category(exc)}]
+        snapshot_elapsed_ms = max(0, int((time.monotonic() - snapshot_started) * 1000))
 
         # event() writes evidence.json and stdout; every field here is projected.
         try:
             self.event("linearizable_read_failure_diagnostics",
                        errorCategory=diagnostic_error_category(error), survivors=captures,
-                       pods=pod_states)
+                       pods=pod_states,
+                       postFailureProbeRequested=False,
+                       sqlElapsedMs=(max(0, int((failed_at - sql_started) * 1000)) if sql_started is not None else None),
+                       podSnapshotElapsedMs=snapshot_elapsed_ms,
+                       podSnapshotOffsetMs=max(0, int((snapshot_started - failed_at) * 1000)))
         except Exception:
             pass
 
@@ -437,6 +467,7 @@ class Chaos:
         after_membership = {pod: self.status(pod) for pod in voters}
         assert after_membership == before_membership, (
             f"membership changed: before={before_membership!r} after={after_membership!r}")
+        sql_started = time.monotonic()
         try:
             after_rows = self.http(voters[0], "/sql/query", {
                 "sql": "SELECT id, value FROM chaos_items ORDER BY id",
@@ -444,7 +475,8 @@ class Chaos:
             }).get("rows")
         except Exception as original:
             try:
-                self.capture_linearizable_read_failure(voters, before_membership, original)
+                self.diagnostic_deadline = time.monotonic() + 10
+                self.capture_linearizable_read_failure(voters, before_membership, original, sql_started)
             except Exception:
                 pass
             raise
@@ -635,7 +667,8 @@ class Chaos:
     def capture_failure_diagnostics(self):
         """Capture identity-bound, bounded startup evidence before cleanup."""
         private = self.private_diagnostics_dir()
-        deadline = time.monotonic() + 10
+        self._diagnostic_remaining()
+        deadline = self.diagnostic_deadline
         errors = []
         error_details = []
         record = {"namespace": self.ns, "context": self.context, "captures": []}
@@ -802,7 +835,7 @@ class Chaos:
                         "containerStatus": {"containerID": state.get("containerID"),
                             "restartCount": state.get("restartCount"),
                             "state": state.get("state"), "lastState": state.get("lastState")},
-                        "logs": {}, "startupFindings": []}
+                        "logs": {}, "startupFindings": [], "readFailureFindings": []}
 
                 def incarnation(pod_status, previous):
                     container_status = next((status for status in pod_status.get("status", {}).get("containerStatuses", [])
@@ -872,6 +905,13 @@ class Chaos:
                         if captured:
                             item["startupFindings"] = sorted(set(item["startupFindings"]) |
                                                                set(safe_startup_findings(payload)))
+                            known = {(finding["phase"], finding["errorClass"])
+                                     for finding in item["readFailureFindings"]}
+                            for finding in safe_read_failure_findings(payload):
+                                key = (finding["phase"], finding["errorClass"])
+                                if key not in known:
+                                    item["readFailureFindings"].append(finding)
+                                    known.add(key)
                         path = private / f"{name}-{cname}-{key}.log"
                         path.write_bytes(payload)
                         path.chmod(0o600)
@@ -898,7 +938,8 @@ class Chaos:
                              if field in result}
             summary["captures"].append({"component": item.get("component"),
                                         "container": item.get("container"), "logs": logs,
-                                        "startupFindings": item.get("startupFindings", [])})
+                                        "startupFindings": item.get("startupFindings", []),
+                                        "readFailureFindings": item.get("readFailureFindings", [])})
         public_path = self.out / "startup-diagnostics-summary.json"
         public_path.write_text(json.dumps(summary, indent=2))
         public_path.chmod(0o600)

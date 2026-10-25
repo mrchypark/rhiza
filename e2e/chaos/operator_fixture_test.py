@@ -326,6 +326,8 @@ class BucketJobTest(unittest.TestCase):
                 b"2026/10/26 12:34:56 open rhiza: node open phase consensus: nested open WAL: PRIVATE_CANARY_H",
                 b"2026/10/26 12:34:56 open rhiza: node open phase wal: nested ensure voter identity: PRIVATE_CANARY_I",
                 b"2026/10/26 12:34:56 node open phase network: peer transport setup failed: PRIVATE_CANARY_J",
+                b"2026/10/26 12:34:56 read failed: phase=read-index-apply node=rhiza-0 read_index=7 "
+                b"source= error_class=quorum-unavailable private=PRIVATE_READ_CANARY",
             ))
             errors = self._capture_diagnostics(
                 chaos, self._diagnostic_fixture(), log_payloads={"current": payload})
@@ -337,10 +339,13 @@ class BucketJobTest(unittest.TestCase):
                 "engine_repair_wal_absent", "identity_enrollment", "identity_storage", "network",
                 "storage_initialization", "supervisor_child_exit", "wal", "wal_open",
             ], capture["startupFindings"])
+            self.assertEqual([{"phase": "read-index-apply", "errorClass": "quorum-unavailable",
+                               "attribution": "unattributed"}], capture["readFailureFindings"])
             for canary in ("PRIVATE_CANARY_A", "PRIVATE_CANARY_B", "PRIVATE_CANARY_C",
                            "PRIVATE_CANARY_D", "PRIVATE_CANARY_E", "PRIVATE_CANARY_F", "PRIVATE_CANARY_J",
                            "PRIVATE_CANARY_G", "PRIVATE_CANARY_H", "PRIVATE_CANARY_I"):
                 self.assertNotIn(canary, summary)
+            self.assertNotIn("PRIVATE_READ_CANARY", summary)
             for canary in ("PRIVATE_PREFLIGHT_STATE_CANARY", "PRIVATE_PREFLIGHT_UNKNOWN_CANARY",
                            "PRIVATE_UNMARKED_CANARY"):
                 self.assertNotIn(canary, summary)
