@@ -206,6 +206,12 @@ jobs:
           if [ "$compile_failed" -ne 0 ]; then
             exit 1
           fi
+      - name: Run bounded quorum membership cancellation diagnostics
+        timeout-minutes: 3
+        run: >-
+          go test -tags rhiza_local_testhooks .
+          -run '^(TestQuorumMembershipQUICDiagnosticNoHold|TestQuorumMembershipQUICDiagnostic)$'
+          -count=1 -timeout=90s
       - name: Check fencing runtime profile validator
         id: profile_selftest
         run: FENCING_PROFILE_SELFTEST=1 sh e2e/fencing/run.sh
