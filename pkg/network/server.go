@@ -72,64 +72,65 @@ func commitUnknown(slot quepaxa.Slot, requestID string, err error) error {
 
 // Server is the HTTP server for client API.
 type Server struct {
-	core                 *quepaxa.Core
-	material             *materializer.Materializer
-	cluster              types.ClusterID
-	mux                  *http.ServeMux
-	ready                func() bool
-	peerLearnReady       func() bool
-	writable             bool
-	sqlBatcher           *mutationBatcher[types.SQLCommand]
-	graphBatcher         *mutationBatcher[types.GraphCommand]
-	kvBatcher            *mutationBatcher[types.KVCommand]
-	transport            *Transport
-	applyMu              sync.Mutex
-	requestLocks         [4096]chan struct{}
-	mutationMu           sync.Mutex
-	mutationAdmission    mutationAdmission
-	durability           func(context.Context, quepaxa.Slot) error
-	readDurability       func(context.Context, quepaxa.Slot) error
-	proposeMu            sync.Mutex
-	admissionChanged     chan struct{}
-	admissionEpoch       uint64
-	admissionWaiters     int
-	inflight             map[[32]byte]*proposalCall
-	proposalCtx          context.Context
-	proposalStop         context.CancelFunc
-	proposalWG           sync.WaitGroup
-	logicalWG            sync.WaitGroup
-	closeOnce            sync.Once
-	closing              bool
-	quiescing            bool
-	localMode            bool
-	lifecycleFailure     error
-	localFailureHandler  func(error)
-	localReclaimHandler  func(context.Context) error
-	operationCap         chan struct{}
-	localCap             chan struct{}
-	operationB           int
-	localB               int
-	objectStats          func() (map[string]uint64, bool)
-	replicaStatus        func() ReplicaStatus
-	voterRecoveryStatus  func(context.Context) VoterRecoveryStatus
-	recoveryArchiveToken string
-	membershipToken      string
-	membershipChange     func(context.Context, MembershipChange) error
-	membershipAbort      func(context.Context, MembershipChange) error
-	recoveryArchive      func(context.Context) error
-	terminalDrain        func(context.Context, TerminalDrainRequest) (any, error)
-	handlerMu            sync.Mutex
-	handlerWG            sync.WaitGroup
-	handlerClosing       bool
-	syncLimit            chan struct{}
-	syncMu               sync.Mutex
-	syncSources          map[quepaxa.NodeID]chan struct{}
-	checkpointPrepare    func(context.Context, quepaxa.NodeID, quepaxa.CheckpointSeal) error
-	compactedHandler     func()
-	archiveCatchUpHint   func(quepaxa.TerminalGapKey)
-	readAdmissionMu      sync.RWMutex
-	readAdmission        *readAdmission
-	statusLookupHook     func()
+	core                       *quepaxa.Core
+	material                   *materializer.Materializer
+	cluster                    types.ClusterID
+	mux                        *http.ServeMux
+	ready                      func() bool
+	peerLearnReady             func() bool
+	writable                   bool
+	sqlBatcher                 *mutationBatcher[types.SQLCommand]
+	graphBatcher               *mutationBatcher[types.GraphCommand]
+	kvBatcher                  *mutationBatcher[types.KVCommand]
+	transport                  *Transport
+	applyMu                    sync.Mutex
+	requestLocks               [4096]chan struct{}
+	mutationMu                 sync.Mutex
+	mutationAdmission          mutationAdmission
+	durability                 func(context.Context, quepaxa.Slot) error
+	readDurability             func(context.Context, quepaxa.Slot) error
+	proposeMu                  sync.Mutex
+	admissionChanged           chan struct{}
+	admissionEpoch             uint64
+	admissionWaiters           int
+	inflight                   map[[32]byte]*proposalCall
+	proposalCtx                context.Context
+	proposalStop               context.CancelFunc
+	proposalWG                 sync.WaitGroup
+	logicalWG                  sync.WaitGroup
+	closeOnce                  sync.Once
+	closing                    bool
+	quiescing                  bool
+	localMode                  bool
+	lifecycleFailure           error
+	localFailureHandler        func(error)
+	localReclaimHandler        func(context.Context) error
+	operationCap               chan struct{}
+	localCap                   chan struct{}
+	operationB                 int
+	localB                     int
+	objectStats                func() (map[string]uint64, bool)
+	replicaStatus              func() ReplicaStatus
+	voterRecoveryStatus        func(context.Context) VoterRecoveryStatus
+	recoveryArchiveToken       string
+	membershipToken            string
+	membershipChange           func(context.Context, MembershipChange) error
+	membershipAbort            func(context.Context, MembershipChange) error
+	recoveryArchive            func(context.Context) error
+	terminalDrain              func(context.Context, TerminalDrainRequest) (any, error)
+	handlerMu                  sync.Mutex
+	handlerWG                  sync.WaitGroup
+	handlerClosing             bool
+	syncLimit                  chan struct{}
+	syncMu                     sync.Mutex
+	syncSources                map[quepaxa.NodeID]chan struct{}
+	checkpointPrepare          func(context.Context, quepaxa.NodeID, quepaxa.CheckpointSeal) error
+	compactedHandler           func()
+	archiveCatchUpHint         func(quepaxa.TerminalGapKey)
+	archiveCatchUpContinuation func(context.Context, quepaxa.TerminalGapKey) error
+	readAdmissionMu            sync.RWMutex
+	readAdmission              *readAdmission
+	statusLookupHook           func()
 }
 
 // ReadAdmissionLimits bounds concurrent read work in one Server. Long-poll
@@ -207,6 +208,32 @@ func (s *Server) hintArchiveCatchUp(key quepaxa.TerminalGapKey) {
 	if handler != nil {
 		handler(key)
 	}
+}
+
+// SetArchiveCatchUpContinuation installs a synchronous, request-scoped path
+// for an admitted terminal Learned whose exact prefix is unavailable from its
+// sender. The callback may apply only the already-published prefix through
+// T-1; this handler still performs AcceptDecision(T), durability, and ACK.
+func (s *Server) SetArchiveCatchUpContinuation(handler func(context.Context, quepaxa.TerminalGapKey) error) {
+	s.proposeMu.Lock()
+	s.archiveCatchUpContinuation = handler
+	s.proposeMu.Unlock()
+}
+
+func (s *Server) continueArchiveCatchUp(ctx context.Context, key quepaxa.TerminalGapKey, through quepaxa.Slot) (configured, complete bool) {
+	s.proposeMu.Lock()
+	handler := s.archiveCatchUpContinuation
+	s.proposeMu.Unlock()
+	if handler == nil {
+		return false, false
+	}
+	if s.core == nil || !s.core.PendingTerminalGap(key) {
+		return true, false
+	}
+	if handler(ctx, key) != nil {
+		return true, false
+	}
+	return true, s.core.PendingTerminalGap(key) && s.core.Tip() >= through
 }
 
 func (s *Server) handleCompacted() {

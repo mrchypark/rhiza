@@ -5,6 +5,7 @@ package network
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net"
 	"strconv"
@@ -199,6 +200,7 @@ func TestRetiredPeerNestedSyncDiagnostic(t *testing.T) {
 	if !knownGap {
 		t.Fatal("stale B does not recognize the exact certified terminal gap")
 	}
+	var continuationCalls atomic.Int32
 	var hintCalls atomic.Int32
 	hint := make(chan quepaxa.TerminalGapKey, 2)
 	staleServer.SetArchiveCatchUpHint(func(got quepaxa.TerminalGapKey) {
@@ -219,21 +221,55 @@ func TestRetiredPeerNestedSyncDiagnostic(t *testing.T) {
 	if got := hintCalls.Load(); got != 0 {
 		t.Fatalf("hint invoked before admitted handler failure: calls=%d", got)
 	}
+	if got := continuationCalls.Load(); got != 0 {
+		t.Fatalf("archive continuation invoked before readiness/auth admission: calls=%d", got)
+	}
 	staleServer.SetPeerLearnReady(func() bool { return true })
 	_, outerErr := transports["a"].call(ctx, "b", request)
 	if outerErr == nil || !strings.Contains(outerErr.Error(), "cluster identity mismatch") {
 		t.Fatalf("stale B outer Learned result=%v, want nested Sync cluster mismatch", outerErr)
 	}
+	if got := continuationCalls.Load(); got != 0 {
+		t.Fatalf("unconfigured continuation calls=%d, want 0", got)
+	}
 	select {
 	case got := <-hint:
 		if got != gapKey {
-			t.Fatalf("archive hint key=%+v, want exact observed key %+v", got, gapKey)
+			t.Fatalf("async hint key=%+v, want exact key %+v", got, gapKey)
 		}
 	case <-ctx.Done():
-		t.Fatalf("handler did not signal the known terminal gap: %v", ctx.Err())
+		t.Fatalf("default async hint was not called: %v", ctx.Err())
 	}
 	if got := hintCalls.Load(); got != 1 {
-		t.Fatalf("archive hint calls=%d, want exactly one for the failed Learned request", got)
+		t.Fatalf("unconfigured continuation hint calls=%d, want 1", got)
+	}
+	staleServer.SetArchiveCatchUpContinuation(func(callCtx context.Context, got quepaxa.TerminalGapKey) error {
+		continuationCalls.Add(1)
+		if got != gapKey {
+			return errors.New("continuation received a different terminal gap")
+		}
+		if callCtx.Err() != nil {
+			return errors.New("continuation received a canceled request context")
+		}
+		return errors.New("injected archive continuation failure")
+	})
+	_, continuationErr := transports["a"].call(ctx, "b", request)
+	if continuationErr == nil || !strings.Contains(continuationErr.Error(), "cluster identity mismatch") || strings.Contains(continuationErr.Error(), "injected archive continuation failure") {
+		t.Fatalf("continuation failure replaced original nested Sync error: %v", continuationErr)
+	}
+	if got := continuationCalls.Load(); got != 1 {
+		t.Fatalf("archive continuation calls=%d, want exactly once", got)
+	}
+	select {
+	case got := <-hint:
+		if got != gapKey {
+			t.Fatalf("configured continuation failure hint key=%+v, want exact key %+v", got, gapKey)
+		}
+	case <-ctx.Done():
+		t.Fatalf("configured continuation failure did not emit async hint: %v", ctx.Err())
+	}
+	if got := hintCalls.Load(); got != 2 {
+		t.Fatalf("unconfigured and failed configured continuation hint calls=%d, want 2", got)
 	}
 	catchupStart := waitNestedSyncEvent(t, ctx, events, "network:learned-control:phase=catchup-start:node=b:sender=a:")
 	select {
@@ -420,27 +456,101 @@ func TestRetiredPeerArchiveRecoveryAllowsRetainedVoterCurrentSync(t *testing.T) 
 	defer publisher.Close()
 	reader := recovery.NewManager(archiveBucket, string(clusterID), recovery.ArchiveConfigID)
 	defer reader.Close()
-	if err := publisher.SyncThrough(ctx, cores["a"], terminalSlot); err != nil {
-		t.Fatalf("publish certified archive through fixed terminal %d: %v", terminalSlot, err)
+	if err := publisher.SyncPrefixThrough(ctx, cores["a"], terminalSlot-1); err != nil {
+		t.Fatalf("publish certified archive only through fixed terminal prefix %d: %v", terminalSlot-1, err)
 	}
-	if err := reader.Load(ctx); err != nil {
+	if err := reader.LoadOnce(ctx); err != nil {
 		t.Fatalf("load certified archive: %v", err)
 	}
-	suffix, archiveTip, err := reader.DecisionsFrom(ctx, freeze+1, int(terminalSlot-freeze))
-	if err != nil || archiveTip < terminalSlot || len(suffix) != int(terminalSlot-freeze) || suffix[len(suffix)-1].Slot != terminalSlot {
-		t.Fatalf("read certified suffix through fixed terminal %d: decisions=%d tip=%d err=%v", terminalSlot, len(suffix), archiveTip, err)
+	prefixTip := terminalSlot - 1
+	if archiveTip := reader.Tip(); archiveTip != prefixTip {
+		t.Fatalf("archive tip=%d, want fixed unpublished-terminal prefix %d", archiveTip, prefixTip)
 	}
-	if err := staleCore.AcceptCertifiedValues(suffix); err != nil {
-		t.Fatalf("apply certified archive suffix through terminal %d: %v", terminalSlot, err)
+	terminal, ok = cores["a"].CertifiedValue(terminalSlot)
+	if !ok {
+		t.Fatalf("source lacks certified terminal at slot %d", terminalSlot)
 	}
-	if err := staleCore.EnsureDurableThrough(ctx, terminalSlot); err != nil {
-		t.Fatalf("persist certified archive suffix through terminal %d: %v", terminalSlot, err)
+	var decision quepaxa.Decision
+	if err := json.Unmarshal(terminal.Certificate, &decision); err != nil {
+		t.Fatalf("decode source terminal certificate: %v", err)
+	}
+	decision.Proposal.Value = terminal.Value
+	gapKey, knownGap := staleCore.KnownTerminalGap(decision)
+	if !knownGap || gapKey.Terminal != terminalSlot || gapKey.Freeze != freeze {
+		t.Fatalf("stale B did not identify exact pending terminal gap: key=%+v known=%t", gapKey, knownGap)
+	}
+	var continuationCalls atomic.Int32
+	continuationResult := make(chan error, 1)
+	recordContinuationResult := func(err error) error {
+		continuationResult <- err
+		return err
+	}
+	staleServer.SetArchiveCatchUpContinuation(func(callCtx context.Context, got quepaxa.TerminalGapKey) error {
+		continuationCalls.Add(1)
+		if got != gapKey {
+			return recordContinuationResult(fmt.Errorf("continuation gap changed: got=%+v want=%+v", got, gapKey))
+		}
+		if callCtx.Err() != nil {
+			return recordContinuationResult(errors.New("continuation received a canceled request context"))
+		}
+		through := got.Terminal - 1
+		localTip := staleCore.Tip()
+		if localTip >= through {
+			return recordContinuationResult(fmt.Errorf("unexpected local prefix tip %d for fixed target %d", localTip, through))
+		}
+		count := int(through - localTip)
+		values, readTip, err := reader.DecisionsFrom(callCtx, localTip+1, count)
+		if err != nil {
+			return recordContinuationResult(err)
+		}
+		if readTip < through || len(values) != count || values[len(values)-1].Slot != through {
+			return recordContinuationResult(fmt.Errorf("archive did not contain exact prefix through %d", through))
+		}
+		for i, value := range values {
+			if value.Slot != localTip+1+quepaxa.Slot(i) {
+				return recordContinuationResult(fmt.Errorf("archive prefix is not contiguous at index %d", i))
+			}
+			if err := types.ValidateExecutionPolicy(value.Value); err != nil {
+				return recordContinuationResult(err)
+			}
+		}
+		if !staleCore.PendingTerminalGap(got) {
+			return recordContinuationResult(errors.New("terminal gap changed before prefix application"))
+		}
+		if err := staleCore.AcceptCertifiedValues(values); err != nil {
+			return recordContinuationResult(err)
+		}
+		return recordContinuationResult(staleCore.EnsureDurableThrough(callCtx, through))
+	})
+	wrongGapKey := gapKey
+	wrongGapKey.Terminal++
+	configured, complete := staleServer.continueArchiveCatchUp(ctx, wrongGapKey, terminalSlot-1)
+	if !configured || complete || continuationCalls.Load() != 0 {
+		t.Fatalf("stale continuation key was not rejected before callback: configured=%t complete=%t calls=%d",
+			configured, complete, continuationCalls.Load())
+	}
+	request := transports["a"].request(peerfb.OperationLearned)
+	request.Decision = decisionToWire(decision)
+	if _, err := transports["a"].call(ctx, "b", request); err != nil {
+		var callbackErr error
+		select {
+		case callbackErr = <-continuationResult:
+		default:
+		}
+		t.Fatalf("same admitted Learned did not resume after fixed archive prefix: err=%v continuation_calls=%d continuation_err=%v local_tip=%d pending=%t",
+			err, continuationCalls.Load(), callbackErr, staleCore.Tip(), staleCore.PendingTerminalGap(gapKey))
+	}
+	if callbackErr := <-continuationResult; callbackErr != nil {
+		t.Fatalf("archive continuation failed: %v", callbackErr)
+	}
+	if got := continuationCalls.Load(); got != 1 {
+		t.Fatalf("continuation calls=%d, want exactly once", got)
 	}
 	if staleCore.Tip() != terminalSlot {
-		t.Fatalf("B durable tip=%d, want fixed terminal %d", staleCore.Tip(), terminalSlot)
+		t.Fatalf("B durable tip=%d, want terminal accepted at %d", staleCore.Tip(), terminalSlot)
 	}
 	if got := staleCore.CurrentCluster(); got.ConfigID != target.ConfigID || !sameNetworkMembers(got, target) || !staleCore.IsVoter() {
-		t.Fatalf("certified archive did not retain B in the REMOVE target: voter=%t cluster=%+v", staleCore.IsVoter(), got)
+		t.Fatalf("same Learned did not commit retained B target: voter=%t cluster=%+v", staleCore.IsVoter(), got)
 	}
 
 	// The same bound transport resolves B's now-current config and performs a
