@@ -59,10 +59,15 @@ func TestNodeLearnedTerminalGapAutomaticallyConsumesPublishedArchive(t *testing.
 	}
 	initial := quepaxa.Cluster{ConfigID: 1, Members: members}
 	base := &membershipOperationTransport{cores: make(map[quepaxa.NodeID]*quepaxa.Core), disabled: make(map[quepaxa.NodeID]bool)}
+	transport := &bridgeTerminalWithholdingTransport{
+		membershipOperationTransport: base,
+		withheld:                     make(map[quepaxa.NodeID]bool),
+		freezeRecordWithheld:         "b",
+	}
 	for _, member := range members {
 		core, err := quepaxa.New(quepaxa.Config{
 			NodeID: member.ID, Cluster: initial, WAL: wals[member.ID],
-			Transport:             base,
+			Transport:             transport,
 			EnableReconfiguration: true,
 		})
 		if err != nil {
@@ -78,6 +83,7 @@ func TestNodeLearnedTerminalGapAutomaticallyConsumesPublishedArchive(t *testing.
 	}
 
 	target := quepaxa.Cluster{ConfigID: 2, Members: append([]quepaxa.Member(nil), members[:2]...)}
+	transport.freezeRecordSlot = base.cores["a"].Tip() + 1
 	if _, err := base.cores["a"].BeginReconfiguration(ctx, target); err != nil {
 		t.Fatalf("begin removal: %v", err)
 	}
@@ -85,9 +91,11 @@ func TestNodeLearnedTerminalGapAutomaticallyConsumesPublishedArchive(t *testing.
 	if got := base.cores["b"].Tip(); got != freeze {
 		t.Fatalf("retained voter tip=%d after freeze, want %d", got, freeze)
 	}
-	base.disable("b")
+	base.mu.Lock()
+	transport.withheld["b"] = true
+	base.mu.Unlock()
 	if err := base.cores["a"].FinishReconfiguration(ctx); err != nil {
-		t.Fatalf("finish removal with the original quorum excluding stale retained voter: %v", err)
+		t.Fatalf("finish removal while retained voter misses terminal: %v", err)
 	}
 	terminal := base.cores["a"].Tip()
 	if terminal-freeze > 16 {
@@ -116,10 +124,6 @@ func TestNodeLearnedTerminalGapAutomaticallyConsumesPublishedArchive(t *testing.
 	if reader.Tip() >= terminal {
 		t.Fatalf("test reader was not stale before publication: tip=%d terminal=%d", reader.Tip(), terminal)
 	}
-	if err := publisher.SyncThrough(ctx, base.cores["a"], terminal); err != nil {
-		t.Fatalf("publish certified terminal: %v", err)
-	}
-
 	peerMembers := append([]quepaxa.Member(nil), members...)
 	deadA := "quic://" + archiveTerminalClosedAddress(t)
 	bFetchCluster := initial
@@ -168,13 +172,6 @@ func TestNodeLearnedTerminalGapAutomaticallyConsumesPublishedArchive(t *testing.
 		cServer.Close()
 		_ = bFetchTransport.Close()
 	}()
-	workerCtx, stopWorker := context.WithCancel(ctx)
-	node.startArchiveWorker(workerCtx, base.cores["b"])
-	defer func() {
-		stopWorker()
-		node.wg.Wait()
-	}()
-
 	var decision quepaxa.Decision
 	if err := json.Unmarshal(decided.Certificate, &decision); err != nil {
 		t.Fatalf("decode locally certified terminal for peer transport: %v", err)
@@ -190,6 +187,33 @@ func TestNodeLearnedTerminalGapAutomaticallyConsumesPublishedArchive(t *testing.
 	if sendErr == nil {
 		t.Fatal("stale retained voter unexpectedly acknowledged terminal without prefix catch-up")
 	}
+	if got := base.cores["b"].Tip(); got != freeze {
+		t.Fatalf("retained voter tip=%d after rejected terminal, want frozen prefix %d", got, freeze)
+	}
+	if key, ok := base.cores["b"].KnownTerminalGap(decision); !ok || key.Terminal != terminal {
+		t.Fatalf("retained voter terminal gap=%+v present=%t, want terminal %d", key, ok, terminal)
+	}
+	node.archiveHintMu.Lock()
+	pendingHint := node.archiveHintPending
+	node.archiveHintMu.Unlock()
+	if pendingHint.Terminal != terminal {
+		t.Fatalf("queued archive hint=%+v, want terminal %d", pendingHint, terminal)
+	}
+	if got := reader.Tip(); got >= terminal {
+		t.Fatalf("reader archive tip=%d before publication, want stale prefix below terminal %d", got, terminal)
+	}
+	if err := publisher.SyncThrough(ctx, base.cores["a"], terminal); err != nil {
+		t.Fatalf("publish certified terminal after rejected request: %v", err)
+	}
+	if got := reader.Tip(); got >= terminal {
+		t.Fatalf("reader archive tip=%d changed before asynchronous worker, want stale prefix below terminal %d", got, terminal)
+	}
+	workerCtx, stopWorker := context.WithCancel(ctx)
+	node.startArchiveWorker(workerCtx, base.cores["b"])
+	defer func() {
+		stopWorker()
+		node.wg.Wait()
+	}()
 
 	applyCtx, cancelApply := context.WithTimeout(ctx, 5*time.Second)
 	defer cancelApply()
