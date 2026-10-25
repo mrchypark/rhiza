@@ -61,6 +61,9 @@ fi
 for fixture in \
 	internal/types/value_benchmark_test.go \
 	pkg/quepaxa/durable_prefix_bench_test.go \
+	pkg/recovery/archive_memory_test.go \
+	pkg/recovery/archive_memory_native_cas_test.go \
+	pkg/recovery/archive_publication_reentry_test.go \
 	pkg/materializer/sql_authorizer_bench_test.go \
 	pkg/materializer/graph_prune_bench_test.go; do
 	git show "$head_sha:$fixture" >"$work_root/base/$fixture"

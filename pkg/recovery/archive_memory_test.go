@@ -1,10 +1,12 @@
 package recovery
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/binary"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"path/filepath"
@@ -133,14 +135,17 @@ func newArchiveMemoryBucket(t testing.TB, dir string) *objmetrics.MeteredBucket 
 
 type archiveMemoryCASConflictBucket struct {
 	objstore.Bucket
-	armed atomic.Bool
-	run   func() error
+	armed           atomic.Bool
+	winnerUploads   atomic.Uint64
+	nativeConflicts atomic.Uint64
+	violations      atomic.Uint64
 }
 
 type archiveMemoryMetricsBucket struct {
 	objstore.Bucket
 	puts          atomic.Uint64
 	gets          atomic.Uint64
+	headGets      atomic.Uint64
 	attributes    atomic.Uint64
 	uploadedBytes atomic.Uint64
 }
@@ -165,6 +170,9 @@ func (b *archiveMemoryMetricsBucket) Upload(ctx context.Context, name string, re
 
 func (b *archiveMemoryMetricsBucket) Get(ctx context.Context, name string) (io.ReadCloser, error) {
 	b.gets.Add(1)
+	if strings.HasSuffix(name, "archive/head.bin") {
+		b.headGets.Add(1)
+	}
 	return b.Bucket.Get(ctx, name)
 }
 
@@ -175,9 +183,36 @@ func (b *archiveMemoryMetricsBucket) Attributes(ctx context.Context, name string
 
 func (b *archiveMemoryCASConflictBucket) Upload(ctx context.Context, name string, reader io.Reader, options ...objstore.ObjectUploadOption) error {
 	if strings.HasSuffix(name, "archive/head.bin") && b.armed.CompareAndSwap(true, false) {
-		if err := b.run(); err != nil {
+		params := objstore.ApplyObjectUploadOptions(options...)
+		if !params.IfNotExists || params.Condition != nil || params.IfNotMatch {
+			b.violations.Add(1)
+			return errors.New("archive-memory fixture requires the original IfNotExists HEAD condition")
+		}
+		payload, err := io.ReadAll(io.LimitReader(reader, maxArchiveHeadSize+1))
+		if err != nil {
+			b.violations.Add(1)
 			return err
 		}
+		if len(payload) == 0 || len(payload) > maxArchiveHeadSize {
+			b.violations.Add(1)
+			return fmt.Errorf("archive-memory fixture received invalid HEAD size %d", len(payload))
+		}
+		if err := b.Bucket.Upload(ctx, name, bytes.NewReader(payload), options...); err != nil {
+			b.violations.Add(1)
+			return err
+		}
+		b.winnerUploads.Add(1)
+		err = b.Bucket.Upload(ctx, name, bytes.NewReader(payload), options...)
+		if err == nil {
+			b.violations.Add(1)
+			return errors.New("archive-memory fixture expected the backend to reject duplicate HEAD publication")
+		}
+		if !b.Bucket.IsConditionNotMetErr(err) {
+			b.violations.Add(1)
+			return err
+		}
+		b.nativeConflicts.Add(1)
+		return err
 	}
 	return b.Bucket.Upload(ctx, name, reader, options...)
 }
@@ -300,16 +335,14 @@ func BenchmarkArchiveMemoryPublication(b *testing.B) {
 			for i := 0; i < b.N; i++ {
 				counter.puts.Store(0)
 				counter.gets.Store(0)
+				counter.headGets.Store(0)
 				counter.attributes.Store(0)
 				counter.uploadedBytes.Store(0)
 				prefix := fmt.Sprintf("archive-memory-%s-%d", tc.name, i)
 				var bucket objstore.Bucket = counter
-				var competitor *Manager
+				var conflict *archiveMemoryCASConflictBucket
 				if tc.name == "cas-conflict-one-extent" {
-					competitor = NewManager(counter, prefix, 1)
-					conflict := &archiveMemoryCASConflictBucket{Bucket: counter, run: func() error {
-						return competitor.syncNow(ctx, source, source.Tip())
-					}}
+					conflict = &archiveMemoryCASConflictBucket{Bucket: counter}
 					conflict.armed.Store(true)
 					bucket = conflict
 				}
@@ -320,14 +353,20 @@ func BenchmarkArchiveMemoryPublication(b *testing.B) {
 				if err := manager.syncNow(ctx, source, source.Tip()); err != nil {
 					b.Fatal(err)
 				}
+				if conflict != nil && (conflict.winnerUploads.Load() != 1 || conflict.nativeConflicts.Load() != 1 || conflict.violations.Load() != 0) {
+					b.Fatalf("native CAS fixture winner uploads=%d conditional conflicts=%d violations=%d", conflict.winnerUploads.Load(), conflict.nativeConflicts.Load(), conflict.violations.Load())
+				}
+				if manager.Tip() != source.Tip() {
+					b.Fatalf("archive tip=%d want=%d", manager.Tip(), source.Tip())
+				}
 				manager.mu.Lock()
 				extentCount = len(manager.extents)
 				manager.mu.Unlock()
+				if conflict != nil && extentCount != 1 {
+					b.Fatalf("CAS-conflict extent count=%d, want=1", extentCount)
+				}
 				puts, gets, headAttrs, uploadedBytes = counter.puts.Load(), counter.gets.Load(), counter.attributes.Load(), counter.uploadedBytes.Load()
 				manager.Close()
-				if competitor != nil {
-					competitor.Close()
-				}
 				b.StopTimer()
 				removeArchiveMemoryPrefix(b, base, prefix)
 				b.StartTimer()
