@@ -60,7 +60,10 @@ func StartPeerServer(ctx context.Context, addr string, server *Server, members [
 		if err != nil {
 			return nil, err
 		}
-		transport = &quic.Transport{Conn: conn}
+		transport = &quic.Transport{
+			Conn:              conn,
+			StatelessResetKey: peerStatelessResetKey(server.cluster, server.core.NodeID(), peerToken),
+		}
 		return transport.ListenEarly(tlsConfig, config)
 	})
 	if err != nil {
@@ -722,6 +725,20 @@ func peerPrivateKey(clusterID types.ClusterID, nodeID quepaxa.NodeID, token stri
 	mac.Write([]byte{0})
 	mac.Write([]byte(nodeID))
 	return ed25519.NewKeyFromSeed(mac.Sum(nil))
+}
+
+func peerStatelessResetKey(clusterID types.ClusterID, nodeID quepaxa.NodeID, token string) *quic.StatelessResetKey {
+	if token == "" {
+		return nil
+	}
+	mac := hmac.New(sha256.New, []byte(token))
+	mac.Write([]byte("rhiza-peer-stateless-reset\x00"))
+	mac.Write([]byte(clusterID))
+	mac.Write([]byte{0})
+	mac.Write([]byte(nodeID))
+	var key quic.StatelessResetKey
+	copy(key[:], mac.Sum(nil))
+	return &key
 }
 
 func peerCertificate(clusterID types.ClusterID, nodeID quepaxa.NodeID, token string) (tls.Certificate, error) {

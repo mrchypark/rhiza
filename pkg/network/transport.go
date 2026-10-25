@@ -210,6 +210,12 @@ func (t *Transport) transportForCurrent() (*Transport, error) {
 	return t, nil
 }
 
+func (t *Transport) isClosed() bool {
+	t.dynamicMu.Lock()
+	defer t.dynamicMu.Unlock()
+	return t.closed
+}
+
 func (t *Transport) request(operation peerfb.Operation) *peerfb.RequestT {
 	return &peerfb.RequestT{Operation: operation, ClusterId: string(t.clusterID), SenderId: string(t.localID), ConfigId: uint64(t.configID), AdminToken: t.adminToken}
 }
@@ -233,34 +239,46 @@ func peerRPCPhaseError(phase string, started time.Time, err error) error {
 	return fmt.Errorf("peer RPC phase=%s elapsed=%s cause_type=%T: %w", phase, time.Since(started), err, err)
 }
 
-func (t *Transport) connection(ctx context.Context, to quepaxa.NodeID) (conn *quic.Conn, err error) {
+func (t *Transport) connection(ctx context.Context, to quepaxa.NodeID) (*quic.Conn, error) {
+	conn, _, err := t.connectionWithCacheState(ctx, to)
+	return conn, err
+}
+
+func (t *Transport) connectionWithCacheState(ctx context.Context, to quepaxa.NodeID) (conn *quic.Conn, usedCached bool, err error) {
 	started, phase := time.Now(), "connection-gate"
 	defer func() { err = peerRPCPhaseError(phase, started, err) }()
+	if t.isClosed() {
+		return nil, false, errTransportClosed
+	}
 	member, ok := t.members[to]
 	if !ok {
-		return nil, fmt.Errorf("unknown node: %s", to)
+		return nil, false, fmt.Errorf("unknown node: %s", to)
 	}
 	peer := t.peers[to]
 	select {
 	case peer.gate <- struct{}{}:
 		defer func() { <-peer.gate }()
 	case <-ctx.Done():
-		return nil, ctx.Err()
+		return nil, false, ctx.Err()
 	}
 	peer.mu.Lock()
 	defer peer.mu.Unlock()
-	if peer.conn == nil || peer.conn.Context().Err() != nil {
+	if t.isClosed() {
+		return nil, false, errTransportClosed
+	}
+	usedCached = peer.conn != nil && peer.conn.Context().Err() == nil
+	if !usedCached {
 		phase = "peer-identity"
 		addr, err := memberQUICAddr(member)
 		if err != nil {
-			return nil, err
+			return nil, false, err
 		}
 		tlsConfig := t.tls.Clone()
 		tlsConfig.ServerName = string(to)
 		expectedKey := t.peerKeys[to]
 		if len(expectedKey) == 0 {
 			if member.PublicKey == (quepaxa.PublicKey{}) {
-				return nil, fmt.Errorf("peer public key is required for %s", to)
+				return nil, false, fmt.Errorf("peer public key is required for %s", to)
 			}
 			expectedKey = ed25519.PublicKey(member.PublicKey[:])
 		}
@@ -269,7 +287,7 @@ func (t *Transport) connection(ctx context.Context, to quepaxa.NodeID) (conn *qu
 		if t.peerToken != "" {
 			certificate, err := peerCertificate(t.clusterID, t.localID, t.peerToken)
 			if err != nil {
-				return nil, err
+				return nil, false, err
 			}
 			tlsConfig.Certificates = []tls.Certificate{certificate}
 		}
@@ -288,18 +306,18 @@ func (t *Transport) connection(ctx context.Context, to quepaxa.NodeID) (conn *qu
 		peer.conn, err = quic.DialAddrEarly(ctx, addr, tlsConfig, t.quic)
 		if err != nil {
 			peer.conn = nil
-			return nil, err
+			return nil, false, err
 		}
 	}
 	phase = "handshake"
 	select {
 	case <-ctx.Done():
-		return nil, ctx.Err()
+		return nil, false, ctx.Err()
 	case <-peer.conn.HandshakeComplete():
 	}
 	conn = peer.conn
 	peer.active[conn]++
-	return conn, nil
+	return conn, usedCached, nil
 }
 
 func (t *Transport) call(ctx context.Context, to quepaxa.NodeID, request *peerfb.RequestT) (*peerfb.ResponseT, error) {
@@ -318,13 +336,22 @@ func (t *Transport) callQuorum(ctx context.Context, to quepaxa.NodeID, request *
 	return t.callContext(ctx, to, request)
 }
 
+func (t *Transport) callQuorumAttempt(ctx context.Context, to quepaxa.NodeID, request *peerfb.RequestT) (*peerfb.ResponseT, bool, error) {
+	return t.callContextWithCacheState(ctx, to, request)
+}
+
 // callContext always waits for the TLS handshake. Voting authorization is
 // bound to the certificate the peer presents during the handshake, so a
 // request must never be accepted (or sent) as replayable early data.
 func (t *Transport) callContext(ctx context.Context, to quepaxa.NodeID, request *peerfb.RequestT) (*peerfb.ResponseT, error) {
-	conn, err := t.connection(ctx, to)
+	response, _, err := t.callContextWithCacheState(ctx, to, request)
+	return response, err
+}
+
+func (t *Transport) callContextWithCacheState(ctx context.Context, to quepaxa.NodeID, request *peerfb.RequestT) (*peerfb.ResponseT, bool, error) {
+	conn, usedCached, err := t.connectionWithCacheState(ctx, to)
 	if err != nil {
-		return nil, err
+		return nil, false, err
 	}
 	response, err := t.callConnection(ctx, conn, request)
 	if err != nil && response == nil && ctx.Err() == nil {
@@ -334,20 +361,20 @@ func (t *Transport) callContext(ctx context.Context, to quepaxa.NodeID, request 
 	if response != nil {
 		switch response.ErrorCode {
 		case peerErrorQuorum:
-			return nil, quepaxa.ErrQuorumUnavailable
+			return nil, usedCached, quepaxa.ErrQuorumUnavailable
 		case peerErrorCompacted:
-			return nil, quepaxa.ErrCompacted
+			return nil, usedCached, quepaxa.ErrCompacted
 		case peerErrorRetryable:
-			return nil, err
+			return nil, usedCached, err
 		}
 	}
 	if err != nil {
 		if response != nil {
-			return nil, fmt.Errorf("%w: %v", errPeerRejected, err)
+			return nil, usedCached, fmt.Errorf("%w: %v", errPeerRejected, err)
 		}
-		return nil, err
+		return nil, usedCached, err
 	}
-	return response, nil
+	return response, usedCached, nil
 }
 
 func (t *Transport) callConnection(ctx context.Context, conn *quic.Conn, request *peerfb.RequestT) (response *peerfb.ResponseT, err error) {
@@ -878,9 +905,22 @@ func (t *Transport) ReadTip(ctx context.Context, to quepaxa.NodeID) (quepaxa.Slo
 		return 0, err
 	}
 	if peer != t {
-		return peer.ReadTip(ctx, to)
+		return peer.readTip(ctx, to)
 	}
-	response, err := t.callQuorum(ctx, to, t.request(peerfb.OperationReadIndex))
+	return t.readTip(ctx, to)
+}
+
+func (t *Transport) readTip(ctx context.Context, to quepaxa.NodeID) (quepaxa.Slot, error) {
+	request := t.request(peerfb.OperationReadIndex)
+	response, usedCached, err := t.callQuorumAttempt(ctx, to, request)
+	observeReadTipAttempt(1, usedCached, err)
+	if shouldRetryReadTipAfterReset(ctx, usedCached, err) {
+		if localtesthooks.Enabled {
+			localtesthooks.Hit("network:read-tip:phase=retry:reason=stateless-reset")
+		}
+		response, usedCached, err = t.callQuorumAttempt(ctx, to, request)
+		observeReadTipAttempt(2, usedCached, err)
+	}
 	if err != nil {
 		return 0, err
 	}
@@ -888,6 +928,34 @@ func (t *Transport) ReadTip(ctx context.Context, to quepaxa.NodeID) (quepaxa.Slo
 		return 0, fmt.Errorf("read-index source identity mismatch")
 	}
 	return quepaxa.Slot(response.Tip), nil
+}
+
+func shouldRetryReadTipAfterReset(ctx context.Context, usedCached bool, err error) bool {
+	if !usedCached || ctx.Err() != nil {
+		return false
+	}
+	var resetErr *quic.StatelessResetError
+	return errors.As(err, &resetErr)
+}
+
+func observeReadTipAttempt(number int, usedCached bool, err error) {
+	if !localtesthooks.Enabled {
+		return
+	}
+	result := "response"
+	var resetErr *quic.StatelessResetError
+	gotReset := errors.As(err, &resetErr)
+	if err != nil {
+		if gotReset {
+			result = "stateless-reset"
+		} else {
+			result = "error"
+		}
+	}
+	if number == 1 && !usedCached && !gotReset {
+		return
+	}
+	localtesthooks.Hit(fmt.Sprintf("network:read-tip:phase=attempt:number=%d:used-cached=%t:result=%s", number, usedCached, result))
 }
 
 func (t *Transport) StageValue(ctx context.Context, to quepaxa.NodeID, hash quepaxa.ValueHash, value []byte) error {
