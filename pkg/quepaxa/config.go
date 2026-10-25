@@ -39,6 +39,10 @@ type Config struct {
 	// caught up durably and every engine-owned removal terminal after storage
 	// effects have been excluded. A nil callback rejects both transitions.
 	ReconfigurationAdmission func(context.Context, ReconfigurationAdmission) error
+	// ReconfigurationPrefixPublication synchronously publishes the fixed
+	// old-configuration prefix after the drain and before a non-abort terminal
+	// is proposed. Production callers that require archive ordering must set it.
+	ReconfigurationPrefixPublication func(context.Context, ReconfigurationPrefix) error
 }
 
 // New validates and creates a QuePaxa core.
@@ -156,6 +160,7 @@ func newCoreFromConfig(config Config, observer, learner bool) (*Core, error) {
 	core.reconfigEnabled = config.EnableReconfiguration
 	core.engineOwnedRemovals = config.EngineOwnedRemovals
 	core.reconfigAdmission = config.ReconfigurationAdmission
+	core.reconfigurationPrefixPublication = config.ReconfigurationPrefixPublication
 	core.configHistory = []configEpoch{{start: 1, cluster: cloneCluster(cluster)}}
 	core.retiredIDs = make(map[NodeID]struct{})
 	if err := core.recover(); err != nil {

@@ -50,10 +50,10 @@ func (c *Core) BeginEngineOwnedRemovalAt(ctx context.Context, target Cluster, op
 		c.mu.RUnlock()
 		return EngineRemoval{}, fmt.Errorf("engine-owned removal freeze was not retained")
 	}
-	result := *state.engineRemoval
+	result := cloneEngineRemoval(state.engineRemoval)
 	result.FreezeHash = state.id
 	c.mu.RUnlock()
-	return result, nil
+	return *result, nil
 }
 
 func (c *Core) beginReconfiguration(ctx context.Context, target Cluster, expectedAbortSlot *Slot, engineRemoval *EngineRemoval) (Slot, error) {
@@ -292,6 +292,20 @@ func (c *Core) finishReconfiguration(ctx context.Context, abort bool, expectedTa
 	if !c.reconfigEnabled || c.observer {
 		return ErrQuorumUnavailable
 	}
+	// Snapshot caller-owned inputs before any callback or lock handoff. Cluster
+	// and EngineRemoval contain member slices, so copying only the outer structs
+	// would leave the terminal binding mutable by the caller.
+	if engineRemoval != nil {
+		engineRemoval = cloneEngineRemoval(engineRemoval)
+		expectedTarget = &engineRemoval.Target
+	} else if expectedTarget != nil {
+		target := cloneCluster(*expectedTarget)
+		expectedTarget = &target
+	}
+	if expectedAbortSlot != nil {
+		abortSlot := *expectedAbortSlot
+		expectedAbortSlot = &abortSlot
+	}
 	c.reconfigurationMu.Lock()
 	defer c.reconfigurationMu.Unlock()
 	if err := c.takePipeline(ctx); err != nil {
@@ -367,22 +381,79 @@ func (c *Core) finishReconfiguration(ctx context.Context, abort bool, expectedTa
 			return err
 		}
 	}
+	var publishedPrefix *ReconfigurationPrefix
+	if !abort && c.reconfigurationPrefixPublication != nil {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		c.mu.RLock()
+		unchanged := c.reconfiguration == state
+		prefixHash, prefixOK := c.prefixes[state.terminal-1]
+		abortSlot, abortErr := c.abortRevisionLocked()
+		c.mu.RUnlock()
+		if !unchanged {
+			return fmt.Errorf("reconfiguration changed before prefix publication")
+		}
+		if !prefixOK {
+			return fmt.Errorf("reconfiguration drain prefix is unavailable before publication")
+		}
+		if expectedAbortSlot != nil && (abortErr != nil || abortSlot != *expectedAbortSlot) {
+			if abortErr != nil {
+				return abortErr
+			}
+			return fmt.Errorf("reconfiguration abort revision %d changed before prefix publication", abortSlot)
+		}
+		request := ReconfigurationPrefix{Through: state.terminal - 1, PrefixHash: ValueHash(prefixHash)}
+		if err := c.reconfigurationPrefixPublication(ctx, request); err != nil {
+			return fmt.Errorf("publish reconfiguration prefix through %d: %w", request.Through, err)
+		}
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		publishedPrefix = &request
+	}
 	if err := c.takePipeline(ctx); err != nil {
 		return err
 	}
 	defer c.releasePipeline()
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	c.mu.RLock()
 	unchanged := c.reconfiguration == state
+	prefixHash, prefixOK := c.prefixes[state.terminal-1]
+	abortSlot, abortErr := c.abortRevisionLocked()
+	targetMatches := expectedTarget == nil || sameCluster(state.target, *expectedTarget)
+	removalMatches := state.engineRemoval == nil && engineRemoval == nil ||
+		state.engineRemoval != nil && engineRemoval != nil && sameEngineRemoval(*state.engineRemoval, *engineRemoval, true)
 	c.mu.RUnlock()
 	if !unchanged {
 		return fmt.Errorf("reconfiguration changed while draining")
 	}
-	prefix, ok := c.PrefixHash(state.terminal - 1)
-	if !ok {
+	if !targetMatches {
+		return fmt.Errorf("reconfiguration target changed while draining")
+	}
+	if !removalMatches {
+		return fmt.Errorf("engine-owned removal changed while draining")
+	}
+	if !prefixOK {
 		return fmt.Errorf("reconfiguration drain prefix is unavailable")
+	}
+	if expectedAbortSlot != nil && (abortErr != nil || abortSlot != *expectedAbortSlot) {
+		if abortErr != nil {
+			return abortErr
+		}
+		return fmt.Errorf("reconfiguration abort revision %d changed while draining", abortSlot)
+	}
+	prefix := ValueHash(prefixHash)
+	if publishedPrefix != nil && (publishedPrefix.Through != state.terminal-1 || publishedPrefix.PrefixHash != prefix) {
+		return fmt.Errorf("reconfiguration drain prefix changed after publication")
 	}
 	value, err := encodeReconfiguration(reconfigurationValue{Terminal: true, Abort: abort, Freeze: state.freeze, TerminalSlot: state.terminal, Target: cloneCluster(state.target), PrefixHash: prefix, EngineRemoval: cloneEngineRemoval(engineRemoval)})
 	if err != nil {
+		return err
+	}
+	if err := ctx.Err(); err != nil {
 		return err
 	}
 	decision, err := c.runSlot(ctx, state.terminal, value, false)
