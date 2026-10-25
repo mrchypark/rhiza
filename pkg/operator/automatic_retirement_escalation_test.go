@@ -30,6 +30,7 @@ func newRetirementEscalationFixture(t *testing.T) *retirementEscalationFixture {
 	child.Spec.Container = "rhiza"
 	child.Spec.Membership.OperationID = "recover"
 	child.Spec.Membership.RemovedPod = "n3"
+	seedLegacyRemoveMembershipJournal(child)
 	api.learnerID = "learner"
 	api.membership["learner"] = network.MembershipStatus{NodeID: "learner", ClusterID: "source", WALIdentity: strings.Repeat("a", 64)}
 	api.membershipSecret["data"].(object)["member"] = base64.StdEncoding.EncodeToString(jsonBytes(voterMember("source", "learner", "new-token")))

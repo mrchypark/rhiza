@@ -22,6 +22,19 @@ import (
 	"github.com/mrchypark/rhiza/pkg/quepaxa"
 )
 
+// seedLegacyRemoveMembershipJournal models status persisted by an older
+// operator before engine-owned ordinary replacement became the policy. The
+// current controller may drain this exact request, but must not invent it.
+func seedLegacyRemoveMembershipJournal(r *Resource) {
+	m := r.Spec.Membership
+	r.Status.Membership = &MembershipStatus{Phase: "Removing", RemoveRequest: &network.MembershipChange{
+		OperationID: membershipOperationID(r, "remove"), ClusterID: r.Spec.SourceClusterID,
+		ExpectedConfigID: 1, Remove: m.Remove,
+		Fence: &network.MembershipFence{NodeID: m.Fence.NodeID, WALIdentity: m.Fence.WALIdentity,
+			WorkloadUID: m.Fence.WorkloadUID, Confirmed: m.Fence.Confirmed, Evidence: m.Fence.Evidence},
+	}}
+}
+
 type retirementTransport func(*http.Request) (*http.Response, error)
 
 func (f retirementTransport) RoundTrip(r *http.Request) (*http.Response, error) { return f(r) }
@@ -630,6 +643,7 @@ func TestMembershipRetirementCommittedEvidenceFailsClosed(t *testing.T) {
 
 func TestMembershipRetirementRestartKeepsRoundUntilAbortRevisionObserved(t *testing.T) {
 	ctx, r, api, c := membershipFixture(t)
+	seedLegacyRemoveMembershipJournal(r)
 	if err := c.reconcileAll(ctx); err != nil {
 		t.Fatal(err)
 	}
