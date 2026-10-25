@@ -132,12 +132,24 @@ func TestAutomaticExecutorOutageWaitsForCapturedAuthorityIdentity(t *testing.T) 
 	if outage < 0 || partition < outage {
 		t.Fatal("automatic scenario no longer uses the verified executor outage")
 	}
-	deleteLostPod := strings.Index(automatic[partition:], `self.k("delete","pod","rhiza-2"`)
-	if deleteLostPod < 0 {
-		t.Fatal("lost-voter deletion is missing after executor outage observation")
-	}
 	observed := strings.Index(automatic[outage:], `self.wait("captured authority Deployment and Pods stopped"`)
 	if observed < 0 || observed > partition-outage {
-		t.Fatal("lost-voter fault can begin before the captured authority outage is observed")
+		t.Fatal("automatic partition can begin before the captured authority outage is observed")
+	}
+	partitionFlow := automatic[partition:]
+	orderedFlow := []string{
+		`current = ["rhiza-0", "rhiza-1", "rhiza-2"]`,
+		`for pod in current:`,
+		`self.udp(pod, True)`,
+		`self.wait("automatic generation fence"`,
+		`assert all(not self.runtime_gone(uid) for uid in old_uids)`,
+	}
+	position := -1
+	for _, want := range orderedFlow {
+		next := strings.Index(partitionFlow, want)
+		if next <= position {
+			t.Errorf("automatic executor-outage scenario is missing or reorders generation-fence contract %q", want)
+		}
+		position = next
 	}
 }
