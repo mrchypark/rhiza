@@ -1,7 +1,10 @@
 import unittest
+import json
+import hashlib
 from copy import deepcopy
 from unittest import mock
 
+import operator_recovery
 from operator_recovery import Chaos
 
 
@@ -170,6 +173,94 @@ class LegacyMembershipRejectionTest(unittest.TestCase):
                    "membership": {"removeRequest": {"operationID": "unexpected"}}}
         with self.assertRaisesRegex(AssertionError, "removeRequest"):
             self.reject(self.make_chaos(after_cr_status=changed))
+
+    def test_read_diagnostic_failure_preserves_original_timeout(self):
+        chaos = self.make_chaos()
+        original = TimeoutError("original read timeout with private response text")
+        query_count = 0
+
+        def http(pod, route, body):
+            nonlocal query_count
+            query_count += 1
+            if query_count == 1:
+                return {"rows": [[0, "seed"], [4, "acknowledged"]]}
+            raise original
+
+        chaos.http = http
+        chaos.capture_linearizable_read_failure = lambda *args: (_ for _ in ()).throw(
+            RuntimeError("diagnostic failure must not replace read failure"))
+        with self.assertRaises(TimeoutError) as caught:
+            self.reject(chaos)
+        self.assertIs(original, caught.exception)
+        self.assertEqual(2, query_count)
+
+    def test_failure_diagnostic_uses_allowlisted_projection(self):
+        chaos = object.__new__(Chaos)
+        chaos.args = mock.Mock(embedded_host="server")
+        chaos.context = "fixture-context"
+        chaos.ns = "fixture"
+        chaos.admin = "admin-secret-canary"
+        forward_process = mock.Mock()
+        forward_process.poll.return_value = None
+        chaos.forwards = {
+            (operator_recovery.threading.get_ident(), "rhiza-0", 8080):
+                ("forward", forward_process, 12345),
+        }
+        events = []
+        chaos.event = lambda name, **fields: events.append((name, fields))
+        status_payload = {
+            "node_id": "rhiza-0", "cluster_id": "cluster-private-canary",
+            "ready": True, "quorum": False, "certified_tip": 10,
+            "applied_tip": 9, "archive_tip": 8,
+            "wal_identity": "wal-private-canary", "credential": "status-secret-canary",
+            "error": "status-error-canary", "unknown": {"private": "nested-secret-canary"},
+        }
+        response = mock.MagicMock()
+        response.__enter__.return_value = response
+        response.read.return_value = json.dumps(status_payload).encode()
+        pod_columns = "rhiza-0\tpod-uid-secret-canary\tRunning\tTrue\t2\n"
+        completed = mock.Mock(returncode=0, stdout=pod_columns, stderr="stderr-secret-canary")
+        with mock.patch("operator_recovery.urllib.request.urlopen", return_value=response) as urlopen, \
+             mock.patch("operator_recovery.subprocess.run", return_value=completed) as run:
+            chaos.capture_linearizable_read_failure(
+                ["rhiza-0"], {"rhiza-0": {
+                    "node_id": "rhiza-0", "cluster_id": "cluster-private-canary",
+                    "config_id": 7, "voters": ["rhiza-0", "rhiza-1"],
+                    "wal_identity": "wal-private-canary", "voting": True, "pending": False,
+                }}, TimeoutError("row-private-canary"))
+
+        self.assertEqual(16 * 1024 + 1, response.read.call_args.args[0])
+        self.assertEqual(0.75, urlopen.call_args.kwargs["timeout"])
+        request = urlopen.call_args.args[0]
+        self.assertEqual("http://127.0.0.1:12345/recovery/status", request.full_url)
+        self.assertEqual("Bearer admin-secret-canary", request.get_header("Authorization"))
+        command = run.call_args.args[0]
+        self.assertIn("-o", command)
+        self.assertIn(
+            'custom-columns=NAME:.metadata.name,UID:.metadata.uid,PHASE:.status.phase,'
+            'READY:.status.conditions[?(@.type=="Ready")].status,'
+            'RESTARTS:.status.containerStatuses[?(@.name=="rhiza")].restartCount',
+            command)
+        pods_index = command.index("pods")
+        self.assertEqual(["rhiza-0"], command[pods_index + 1:pods_index + 2])
+        self.assertIn("--ignore-not-found", command)
+        self.assertNotIn("json", command)
+        self.assertEqual("linearizable_read_failure_diagnostics", events[0][0])
+        rendered = json.dumps(events[0][1], sort_keys=True)
+        for canary in ("pod-uid-secret-canary", "cluster-private-canary",
+                       "wal-private-canary", "row-private-canary", "secret-canary",
+                       "admin-secret-canary", "status-secret-canary", "status-error-canary",
+                       "nested-secret-canary", "stderr-secret-canary"):
+            self.assertNotIn(canary, rendered)
+        self.assertEqual("timeout", events[0][1]["errorCategory"])
+        self.assertEqual(2, events[0][1]["pods"][0]["restartCount"])
+        self.assertNotIn("recovery", events[0][1]["survivors"][0])
+        self.assertFalse(events[0][1]["survivors"][0]["postFailureProbe"]["quorum"])
+        recovery = events[0][1]["survivors"][0]["postFailureProbe"]
+        self.assertEqual({"nodeOrdinal", "nodeIDHash", "clusterIDHash", "ready", "quorum",
+                          "certified_tip", "applied_tip", "archive_tip"}, set(recovery))
+        self.assertEqual(hashlib.sha256(b"cluster-private-canary").hexdigest()[:16],
+                         recovery["clusterIDHash"])
 
 
 if __name__ == "__main__":

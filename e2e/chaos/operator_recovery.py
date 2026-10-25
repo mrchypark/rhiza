@@ -27,6 +27,81 @@ STARTUP_MARKER_CODES = (
     ("fencing: child exited without a terminal receipt:", "supervisor_child_exit"),
 )
 GO_LOG_PREFIX = re.compile(r"^\d{4}/\d{2}/\d{2} \d{2}:\d{2}:\d{2} ")
+SAFE_DIAGNOSTIC_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}$")
+POD_ORDINAL = re.compile(r"^rhiza-(\d+)$")
+
+
+def diagnostic_id_hash(value):
+    """Hash bounded identifier-shaped values; never copy arbitrary API text."""
+    if not isinstance(value, str) or not SAFE_DIAGNOSTIC_ID.fullmatch(value):
+        return None
+    return hashlib.sha256(value.encode()).hexdigest()[:16]
+
+
+def diagnostic_ordinal(value):
+    match = POD_ORDINAL.fullmatch(value) if isinstance(value, str) else None
+    return int(match.group(1)) if match else None
+
+
+def diagnostic_error_category(exc):
+    """Return a fixed category without persisting exception text or URLs."""
+    if isinstance(exc, urllib.error.HTTPError):
+        return "http_error"
+    if isinstance(exc, urllib.error.URLError):
+        return "timeout" if isinstance(exc.reason, (TimeoutError, socket.timeout)) else "transport_error"
+    if isinstance(exc, (TimeoutError, socket.timeout)):
+        return "timeout"
+    if isinstance(exc, (OSError, http.client.HTTPException)):
+        return "transport_error"
+    return "other_error"
+
+
+def diagnostic_membership(status):
+    """Project membership status to bounded, non-secret comparison fields."""
+    if not isinstance(status, dict):
+        return {"errorCategory": "malformed_status"}
+    voters = status.get("voters")
+    voter_count = None
+    voter_ordinals = None
+    if isinstance(voters, list) and len(voters) <= 16 and all(
+            isinstance(voter, str) and SAFE_DIAGNOSTIC_ID.fullmatch(voter) for voter in voters):
+        voter_set = "\n".join(sorted(voters)).encode()
+        voter_count = len(voters)
+        ordinals = [diagnostic_ordinal(voter) for voter in voters]
+        voter_ordinals = sorted(ordinals) if all(value is not None for value in ordinals) else None
+        voter_set_hash = hashlib.sha256(voter_set).hexdigest()[:16]
+    else:
+        voter_set_hash = None
+    config_id = status.get("config_id")
+    return {
+        "nodeOrdinal": diagnostic_ordinal(status.get("node_id")),
+        "nodeIDHash": diagnostic_id_hash(status.get("node_id")),
+        "clusterIDHash": diagnostic_id_hash(status.get("cluster_id")),
+        "configID": config_id if type(config_id) is int and 0 <= config_id <= 2**64 - 1 else None,
+        "voterCount": voter_count,
+        "voterOrdinals": voter_ordinals,
+        "voterSetHash": voter_set_hash,
+        "walIdentityHash": diagnostic_id_hash(status.get("wal_identity")),
+        "voting": status.get("voting") if type(status.get("voting")) is bool else None,
+        "pending": status.get("pending") if type(status.get("pending")) is bool else None,
+    }
+
+
+def diagnostic_recovery_status(status):
+    """Project the read-only recovery status without dynamic text fields."""
+    if not isinstance(status, dict):
+        return {"errorCategory": "malformed_status"}
+    projected = {
+        "nodeOrdinal": diagnostic_ordinal(status.get("node_id")),
+        "nodeIDHash": diagnostic_id_hash(status.get("node_id")),
+        "clusterIDHash": diagnostic_id_hash(status.get("cluster_id")),
+    }
+    for key in ("ready", "quorum"):
+        projected[key] = status.get(key) if type(status.get(key)) is bool else None
+    for key in ("certified_tip", "applied_tip", "archive_tip"):
+        value = status.get(key)
+        projected[key] = value if type(value) is int and 0 <= value <= 2**64 - 1 else None
+    return projected
 
 
 def safe_startup_findings(payload):
@@ -171,6 +246,82 @@ class Chaos:
     def status(self, pod):
         return self.http(pod, "/membership/status")
 
+    def _cached_recovery_status(self, pod):
+        """Run a post-failure ReadIndex probe and return only its safe projection."""
+        embedded = getattr(self.args, "embedded_host", "server") != "server"
+        remote_port = 9091 if embedded else 8080
+        key = (threading.get_ident(), pod, remote_port)
+        forward = self.forwards.get(key)
+        if not forward or forward[1].poll() is not None:
+            raise RuntimeError("cached_forward_unavailable")
+        request = urllib.request.Request(
+            f"http://127.0.0.1:{forward[2]}/recovery/status",
+            headers={"Authorization": "Bearer " + self.admin})
+        with urllib.request.urlopen(request, timeout=0.75) as response:
+            raw = response.read(16 * 1024 + 1)
+        if len(raw) > 16 * 1024:
+            raise ValueError("status_response_oversize")
+        return diagnostic_recovery_status(json.loads(raw) if raw else {})
+
+    def capture_linearizable_read_failure(self, voters, before_membership, error):
+        """Best-effort status snapshot; never adds retries or masks the read error."""
+        captures = []
+        for pod in voters[:3]:
+            ordinal = diagnostic_ordinal(pod)
+            entry = {"ordinal": ordinal, "membership": diagnostic_membership(before_membership.get(pod))}
+            try:
+                # This active status read happens after the failed SQL read; it
+                # must not be interpreted as the quorum state at failure time.
+                entry["postFailureProbe"] = self._cached_recovery_status(pod)
+            except Exception as exc:
+                entry["recoveryError"] = diagnostic_error_category(exc)
+            captures.append(entry)
+
+        pod_states = []
+        try:
+            result = subprocess.run(
+                ["kubectl", "--context", self.context, "-n", self.ns,
+                 "--request-timeout=1s", "get", "pods", *voters[:3], "--ignore-not-found", "-o",
+                 'custom-columns=NAME:.metadata.name,UID:.metadata.uid,PHASE:.status.phase,'
+                 'READY:.status.conditions[?(@.type=="Ready")].status,'
+                 'RESTARTS:.status.containerStatuses[?(@.name=="rhiza")].restartCount',
+                 "--no-headers"],
+                capture_output=True, text=True, timeout=1.5)
+            if result.returncode:
+                raise RuntimeError("pod_snapshot_failed")
+            requested = {pod: {"ordinal": diagnostic_ordinal(pod), "podPresent": False,
+                               "uidHash": None, "phase": None, "ready": None,
+                               "restartCount": None} for pod in voters[:3]}
+            seen = set()
+            for line in result.stdout.splitlines():
+                fields = line.split()
+                if len(fields) != 5:
+                    raise ValueError("pod_snapshot_invalid")
+                name, uid, phase, ready, restarts = fields
+                if name not in requested:
+                    continue
+                if name in seen:
+                    raise ValueError("pod_snapshot_duplicate")
+                seen.add(name)
+                requested[name].update({
+                    "podPresent": True,
+                    "uidHash": diagnostic_id_hash(uid),
+                    "phase": phase if phase in ("Pending", "Running", "Succeeded", "Failed", "Unknown") else None,
+                    "ready": True if ready == "True" else False if ready == "False" else None,
+                    "restartCount": int(restarts) if re.fullmatch(r"\d+", restarts) else None,
+                })
+            pod_states = list(requested.values())
+        except Exception as exc:
+            pod_states = [{"errorCategory": diagnostic_error_category(exc)}]
+
+        # event() writes evidence.json and stdout; every field here is projected.
+        try:
+            self.event("linearizable_read_failure_diagnostics",
+                       errorCategory=diagnostic_error_category(error), survivors=captures,
+                       pods=pod_states)
+        except Exception:
+            pass
+
     def execute(self, pod, rid, sql):
         result = self.http(pod, "/sql/execute", {"request_id": rid, "sql": sql})
         assert not result.get("error_code"), result
@@ -268,10 +419,17 @@ class Chaos:
         after_membership = {pod: self.status(pod) for pod in voters}
         assert after_membership == before_membership, (
             f"membership changed: before={before_membership!r} after={after_membership!r}")
-        after_rows = self.http(voters[0], "/sql/query", {
-            "sql": "SELECT id, value FROM chaos_items ORDER BY id",
-            "consistency": "linearizable",
-        }).get("rows")
+        try:
+            after_rows = self.http(voters[0], "/sql/query", {
+                "sql": "SELECT id, value FROM chaos_items ORDER BY id",
+                "consistency": "linearizable",
+            }).get("rows")
+        except Exception as original:
+            try:
+                self.capture_linearizable_read_failure(voters, before_membership, original)
+            except Exception:
+                pass
+            raise
         assert after_rows == before_rows, f"data changed: before={before_rows!r} after={after_rows!r}"
         self.event("legacy_membership_request_rejected_only", operation=name,
                    reason="ordinary_recovery_is_engine_owned", voters=voters,
