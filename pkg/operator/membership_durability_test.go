@@ -112,37 +112,55 @@ func TestControllerMembershipCompletionWaitsForDurabilityAck(t *testing.T) {
 
 func TestControllerRemovalDurabilityAckPrecedesReplacementAdd(t *testing.T) {
 	ctx, r, api, c := membershipFixture(t)
+	seedLegacyRemoveMembershipJournal(r)
+	var seededRemove network.MembershipChange
+	if err := json.Unmarshal(jsonBytes(r.Status.Membership.RemoveRequest), &seededRemove); err != nil {
+		t.Fatal(err)
+	}
 	if err := c.reconcileAll(ctx); err != nil {
 		t.Fatal(err)
 	}
-	remove := *r.Status.Membership.RemoveRequest
+	if len(api.changes) != 1 || !sameJSON(api.changes[0], seededRemove) {
+		t.Fatalf("legacy REMOVE was not replayed verbatim: %+v", api.changes)
+	}
 	api.membership["n1"] = membershipStatus("n1", 2, "n1", "n2")
 	api.membership["n2"] = membershipStatus("n2", 2, "n1", "n2")
 	api.changeStatus = http.StatusInternalServerError
 	if err := c.reconcileAll(ctx); err != nil {
 		t.Fatal(err)
 	}
-	if r.Status.Membership.Phase != "Removing" || r.Status.Membership.Add != nil || len(api.changes) != 1 || !sameJSON(api.changes[0], remove) {
+	if r.Status.Membership.Phase != "Removing" || r.Status.Membership.Add != nil || len(api.changes) != 2 || !sameJSON(api.changes[1], seededRemove) {
 		t.Fatalf("replacement advanced before removal persistence acknowledgement: membership=%+v changes=%+v", r.Status.Membership, api.changes)
 	}
 	api.changeStatus = 0
 	if err := c.reconcileAll(ctx); err != nil {
 		t.Fatal(err)
 	}
-	if r.Status.Membership.Phase != "Adding" || r.Status.Membership.Add == nil || len(api.changes) != 2 || !sameJSON(api.changes[0], api.changes[1]) {
+	if r.Status.Membership.Phase != "Adding" || r.Status.Membership.Add == nil || len(api.changes) != 3 || !sameJSON(api.changes[0], seededRemove) || !sameJSON(api.changes[1], seededRemove) || !sameJSON(api.changes[2], seededRemove) {
 		t.Fatalf("exact removal replay did not unlock replacement journaling: membership=%+v changes=%+v", r.Status.Membership, api.changes)
 	}
 }
 
 func TestControllerAbortedCommittedAdditionWaitsForDurabilityAck(t *testing.T) {
 	ctx, r, api, c := membershipFixture(t)
+	seedLegacyRemoveMembershipJournal(r)
+	var seededRemove network.MembershipChange
+	if err := json.Unmarshal(jsonBytes(r.Status.Membership.RemoveRequest), &seededRemove); err != nil {
+		t.Fatal(err)
+	}
 	if err := c.reconcileAll(ctx); err != nil {
 		t.Fatal(err)
+	}
+	if len(api.changes) != 1 || !sameJSON(api.changes[0], seededRemove) {
+		t.Fatalf("legacy REMOVE was not replayed verbatim: %+v", api.changes)
 	}
 	api.membership["n1"] = membershipStatus("n1", 2, "n1", "n2")
 	api.membership["n2"] = membershipStatus("n2", 2, "n1", "n2")
 	if err := c.reconcileAll(ctx); err != nil {
 		t.Fatal(err)
+	}
+	if len(api.changes) != 2 || !sameJSON(api.changes[1], seededRemove) || r.Status.Membership.Add == nil {
+		t.Fatalf("REMOVE durability was not confirmed before ADD journaling: membership=%+v changes=%+v", r.Status.Membership, api.changes)
 	}
 	api.membership["n1"] = membershipStatus("n1", 3, "n1", "n2", "n4")
 	api.membership["n2"] = membershipStatus("n2", 3, "n1", "n2", "n4")
@@ -155,21 +173,21 @@ func TestControllerAbortedCommittedAdditionWaitsForDurabilityAck(t *testing.T) {
 	if err := c.reconcileAll(ctx); err != nil {
 		t.Fatal(err)
 	}
-	if r.Status.Membership.Phase != "Aborting" || r.Status.Phase == "Complete" || len(api.changes) != 2 {
+	if r.Status.Membership.Phase != "Aborting" || r.Status.Phase == "Complete" || len(api.changes) != 3 {
 		t.Fatalf("committed addition completed without persistence acknowledgement: status=%+v changes=%+v", r.Status, api.changes)
 	}
 	want, err := c.retiringMembershipRequest(ctx, r)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !sameJSON(api.changes[1], want) {
-		t.Fatalf("committed add replay=%+v want exact request %+v", api.changes[1], want)
+	if !sameJSON(api.changes[2], want) {
+		t.Fatalf("committed add replay=%+v want exact request %+v", api.changes[2], want)
 	}
 	api.changeStatus = 0
 	if err := c.reconcileAll(ctx); err != nil {
 		t.Fatal(err)
 	}
-	if r.Status.Membership.Phase != "Complete" || len(api.changes) != 3 || !sameJSON(api.changes[1], api.changes[2]) {
+	if r.Status.Membership.Phase != "Complete" || len(api.changes) != 4 || !sameJSON(api.changes[2], api.changes[3]) {
 		t.Fatalf("exact committed add replay did not complete abort: status=%+v changes=%+v", r.Status, api.changes)
 	}
 }
