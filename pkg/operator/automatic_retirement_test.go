@@ -454,6 +454,11 @@ func TestMembershipRetirementRejectsDelayedJournalAfterAcknowledgment(t *testing
 
 func TestMembershipRetirementReplaysJournalBeforeFirstDispatch(t *testing.T) {
 	ctx, r, api, c := membershipFixture(t)
+	seedLegacyRemoveMembershipJournal(r)
+	var seededRemove network.MembershipChange
+	if err := json.Unmarshal(jsonBytes(r.Status.Membership.RemoveRequest), &seededRemove); err != nil {
+		t.Fatal(err)
+	}
 	if err := c.reconcileAll(ctx); err != nil {
 		t.Fatal(err)
 	}
@@ -473,7 +478,8 @@ func TestMembershipRetirementReplaysJournalBeforeFirstDispatch(t *testing.T) {
 	if err := c.reconcileAll(ctx); err != nil {
 		t.Fatal(err)
 	}
-	if r.Status.Phase != "Aborting" || len(api.changes) != 2 || api.changes[0].Remove != "n3" || api.changes[0].Add != nil || api.changes[0].ExpectedConfigID != 1 || api.changes[1].ExpectedConfigID != 2 || hashJSON(api.changes[1]) != requestHash {
+	if r.Status.Phase != "Aborting" || len(api.changes) != 3 || api.changes[0].Remove != "n3" || api.changes[0].Add != nil || api.changes[0].ExpectedConfigID != 1 ||
+		!sameJSON(api.changes[0], seededRemove) || !sameJSON(api.changes[1], seededRemove) || api.changes[2].ExpectedConfigID != 2 || hashJSON(api.changes[2]) != requestHash {
 		t.Fatalf("journaled request was not replayed verbatim: %+v changes=%+v", r.Status, api.changes)
 	}
 	c.HTTP = nil
@@ -487,6 +493,7 @@ func TestMembershipRetirementReplaysJournalBeforeFirstDispatch(t *testing.T) {
 
 func TestMembershipRetirementDelayedDispatchCannotEscapeAbortedRound(t *testing.T) {
 	ctx, r, api, c := membershipFixture(t)
+	seedLegacyRemoveMembershipJournal(r)
 	if err := c.reconcileAll(ctx); err != nil {
 		t.Fatal(err)
 	}
@@ -578,6 +585,11 @@ func TestMembershipRetirementCommittedEvidenceFailsClosed(t *testing.T) {
 	for _, scenario := range []string{"missing-operation", "changed-operation-target", "changed-request", "changed-secret", "wrong-wal", "pending-survivor", "abort-revision", "unexpected-voter"} {
 		t.Run(scenario, func(t *testing.T) {
 			ctx, r, api, c := membershipFixture(t)
+			seedLegacyRemoveMembershipJournal(r)
+			var seededRemove network.MembershipChange
+			if err := json.Unmarshal(jsonBytes(r.Status.Membership.RemoveRequest), &seededRemove); err != nil {
+				t.Fatal(err)
+			}
 			if err := c.reconcileAll(ctx); err != nil {
 				t.Fatal(err)
 			}
@@ -586,7 +598,8 @@ func TestMembershipRetirementCommittedEvidenceFailsClosed(t *testing.T) {
 			if err := c.reconcileAll(ctx); err != nil {
 				t.Fatal(err)
 			}
-			if len(api.changes) != 1 || api.changes[0].Remove != "n3" || api.changes[0].Add != nil {
+			if len(api.changes) != 2 || api.changes[0].Remove != "n3" || api.changes[0].Add != nil ||
+				!sameJSON(api.changes[0], seededRemove) || !sameJSON(api.changes[1], seededRemove) {
 				t.Fatalf("valid replacement setup did not acknowledge only the removal: %+v", api.changes)
 			}
 			acknowledgedChanges := len(api.changes)
