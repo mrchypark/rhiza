@@ -479,6 +479,7 @@ func (s *PeerServer) handle(ctx context.Context, certificateKey ed25519.PublicKe
 		if controlErr != nil {
 			return nil, controlErr
 		} else if control && decision.Slot > 1 {
+			gapKey, knownGap := s.server.core.KnownTerminalGap(decision)
 			if localtesthooks.Enabled {
 				localtesthooks.Hit(fmt.Sprintf("network:learned-control:phase=catchup-start:node=%s:sender=%s:slot=%d", s.server.core.NodeID(), request.SenderId, decision.Slot))
 			}
@@ -487,11 +488,17 @@ func (s *PeerServer) handle(ctx context.Context, certificateKey ed25519.PublicKe
 					if localtesthooks.Enabled {
 						localtesthooks.Hit(fmt.Sprintf("network:learned-control:phase=catchup-failed:node=%s:sender=%s:slot=%d:error=%q", s.server.core.NodeID(), request.SenderId, decision.Slot, "transport unavailable"))
 					}
+					if knownGap {
+						s.server.hintArchiveCatchUp(gapKey)
+					}
 					return nil, fmt.Errorf("reconfiguration control prefix is unavailable")
 				}
 				if err := s.server.catchUpFrom(ctx, quepaxa.NodeID(request.SenderId), decision.Slot-1, true); err != nil {
 					if localtesthooks.Enabled {
 						localtesthooks.Hit(fmt.Sprintf("network:learned-control:phase=catchup-failed:node=%s:sender=%s:slot=%d:error=%q", s.server.core.NodeID(), request.SenderId, decision.Slot, err.Error()))
+					}
+					if knownGap {
+						s.server.hintArchiveCatchUp(gapKey)
 					}
 					return nil, err
 				}
@@ -499,6 +506,9 @@ func (s *PeerServer) handle(ctx context.Context, certificateKey ed25519.PublicKe
 			if err := s.server.core.WaitTip(ctx, decision.Slot-1); err != nil {
 				if localtesthooks.Enabled {
 					localtesthooks.Hit(fmt.Sprintf("network:learned-control:phase=catchup-failed:node=%s:sender=%s:slot=%d:error=%q", s.server.core.NodeID(), request.SenderId, decision.Slot, err.Error()))
+				}
+				if knownGap {
+					s.server.hintArchiveCatchUp(gapKey)
 				}
 				return nil, err
 			}
