@@ -15,6 +15,7 @@ import (
 	"path"
 	"strconv"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 
@@ -691,6 +692,11 @@ func TestArchiveGenesisStatusResumesAdmittedTupleAndCommitsRefsBeforeDispatch(t 
 	var executor *FencingExecutor
 	var runtime fencing.RuntimeBinding
 	var uploads atomic.Int32
+	providerStarted := make(chan struct{}, 1)
+	releaseProvider := make(chan struct{})
+	var releaseProviderOnce sync.Once
+	releaseProviderResponse := func() { releaseProviderOnce.Do(func() { close(releaseProvider) }) }
+	t.Cleanup(releaseProviderResponse)
 	payload := recoveryEmptyHeadBytes(t)
 	server := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method == http.MethodGet {
@@ -721,14 +727,24 @@ func TestArchiveGenesisStatusResumesAdmittedTupleAndCommitsRefsBeforeDispatch(t 
 			t.Errorf("provider dispatch occurred before matching root reference: %+v %v", root.Ledger.ArchiveGenesisRef, err)
 		}
 		producer, _, _, err := executor.AuthorityState.ReadProducer(r.Context(), runtime)
-		if err != nil || producer.Entries[claim.GenesisRef.Mutation.Sequence].Intent != claim.GenesisRef.Mutation.Intent {
-			t.Errorf("provider dispatch occurred without the exact admitted tuple: %+v %v", producer, err)
+		entry, exists := producer.Entries[claim.GenesisRef.Mutation.Sequence]
+		if err != nil || producer.Phase != fencing.MutationOpen || !exists || entry.Intent != claim.GenesisRef.Mutation.Intent || entry.Preparation == nil ||
+			!entry.DispatchClosed || len(entry.Dispatches) != 1 || entry.Resolution != nil {
+			t.Errorf("provider dispatch did not have exactly one unresolved sealed permission for the referenced tuple in an open producer: entry=%+v exists=%v err=%v", entry, exists, err)
+			http.Error(w, "dispatch permission unavailable", http.StatusInternalServerError)
+			return
 		}
 		body, err := io.ReadAll(r.Body)
 		if err != nil || !bytes.Contains(body, payload) {
 			t.Errorf("GCS body did not contain exact empty HEAD: %v", err)
 		}
 		uploads.Add(1)
+		providerStarted <- struct{}{}
+		select {
+		case <-releaseProvider:
+		case <-r.Context().Done():
+			return
+		}
 		w.Header().Set("Content-Type", "application/json")
 		_ = json.NewEncoder(w).Encode(map[string]any{
 			"kind": "storage#object", "bucket": "archive", "name": "root/source/archive/head.bin",
@@ -742,14 +758,44 @@ func TestArchiveGenesisStatusResumesAdmittedTupleAndCommitsRefsBeforeDispatch(t 
 	runtime = f.runtime
 	f.setStorage(t, server.URL, server.Client())
 	f.admit(t, 1, f.intent)
+	statusCh := make(chan struct {
+		status fencing.ArchiveGenesisStatus
+		code   int
+	}, 1)
+	go func() {
+		status, code := postArchiveGenesisStatus(t, f.e, f.id)
+		statusCh <- struct {
+			status fencing.ArchiveGenesisStatus
+			code   int
+		}{status, code}
+	}()
+	select {
+	case <-providerStarted:
+	case <-t.Context().Done():
+		t.Fatal("timed out waiting for provider dispatch after matching refs")
+	}
+	producer, _, _, err := f.e.AuthorityState.ReadProducer(t.Context(), f.runtime)
+	if err != nil {
+		t.Fatal(err)
+	}
+	entry := producer.Entries[1]
+	if producer.Phase != fencing.MutationOpen || entry.Intent != f.intent || entry.Preparation == nil || !entry.DispatchClosed || len(entry.Dispatches) != 1 || entry.Resolution != nil {
+		t.Fatalf("provider started without the exact durable pre-close dispatch grant in an open producer: %+v", entry)
+	}
 	if _, err := f.e.changeMutationProducer(t.Context(), f.runtime, func(p *fencing.MutationProducer) error {
-		return p.Close("test-closed-before-genesis-ref", strings.Repeat("c", 64))
+		return p.Close("closed-after-genesis-dispatch-grant", strings.Repeat("c", 64))
 	}); err != nil {
 		t.Fatal(err)
 	}
-	status, code := postArchiveGenesisStatus(t, f.e, f.id)
+	closedProducer, _, _, err := f.e.AuthorityState.ReadProducer(t.Context(), f.runtime)
+	if err != nil || closedProducer.Phase != fencing.MutationClosed {
+		t.Fatalf("producer did not retain closure after the granted provider request started: phase=%s err=%v", closedProducer.Phase, err)
+	}
+	releaseProviderResponse()
+	result := <-statusCh
+	status, code := result.status, result.code
 	if code != http.StatusOK || status.Ref == nil || status.Mutation == nil || status.Mutation.Entry == nil || status.Mutation.Entry.Resolution == nil || status.Mutation.Entry.Resolution.Outcome != fencing.MutationCommitted {
-		t.Fatalf("status did not resume and verify the admitted genesis tuple: code=%d status=%+v", code, status)
+		t.Fatalf("status did not finish the exact already-granted genesis request after closure: code=%d status=%+v", code, status)
 	}
 	if uploads.Load() != 1 {
 		t.Fatalf("status issued %d provider writes, want exactly one", uploads.Load())

@@ -43,6 +43,11 @@ func TestConcurrentArchiveGenesisCandidatesHaveOneCASWinnerAndTerminalLoser(t *t
 	var executor *FencingExecutor
 	var runtime fencing.RuntimeBinding
 	var uploads atomic.Int32
+	providerStarted := make(chan struct{}, 1)
+	releaseProvider := make(chan struct{})
+	var releaseProviderOnce sync.Once
+	releaseProviderResponse := func() { releaseProviderOnce.Do(func() { close(releaseProvider) }) }
+	t.Cleanup(releaseProviderResponse)
 	payload := recoveryEmptyHeadBytes(t)
 	server := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method == http.MethodGet {
@@ -74,9 +79,10 @@ func TestConcurrentArchiveGenesisCandidatesHaveOneCASWinnerAndTerminalLoser(t *t
 		}
 		producer, _, _, err := executor.AuthorityState.ReadProducer(r.Context(), runtime)
 		entry, exists := producer.Entries[claim.GenesisRef.Mutation.Sequence]
-		if err != nil || !exists || entry.Intent != claim.GenesisRef.Mutation.Intent {
-			t.Errorf("provider dispatch lacks exact admitted tuple: entry=%+v exists=%v err=%v", entry, exists, err)
-			http.Error(w, "admission unavailable", http.StatusInternalServerError)
+		if err != nil || producer.Phase != fencing.MutationOpen || !exists || entry.Intent != claim.GenesisRef.Mutation.Intent || entry.Preparation == nil ||
+			!entry.DispatchClosed || len(entry.Dispatches) != 1 || entry.Resolution != nil {
+			t.Errorf("provider dispatch lacks one exact unresolved sealed permission in an open producer: entry=%+v exists=%v err=%v", entry, exists, err)
+			http.Error(w, "dispatch permission unavailable", http.StatusInternalServerError)
 			return
 		}
 		body, err := io.ReadAll(r.Body)
@@ -86,6 +92,12 @@ func TestConcurrentArchiveGenesisCandidatesHaveOneCASWinnerAndTerminalLoser(t *t
 			return
 		}
 		uploads.Add(1)
+		providerStarted <- struct{}{}
+		select {
+		case <-releaseProvider:
+		case <-r.Context().Done():
+			return
+		}
 		w.Header().Set("Content-Type", "application/json")
 		_ = json.NewEncoder(w).Encode(map[string]any{
 			"kind": "storage#object", "bucket": "archive", "name": "root/source/archive/head.bin",
@@ -123,11 +135,6 @@ func TestConcurrentArchiveGenesisCandidatesHaveOneCASWinnerAndTerminalLoser(t *t
 	second.OperationID = fencing.MutationRequestID(f.producer, 2)
 	f.admit(t, 1, first)
 	f.admit(t, 2, second)
-	if _, err := f.e.changeMutationProducer(t.Context(), f.runtime, func(p *fencing.MutationProducer) error {
-		return p.Close("closed-before-concurrent-genesis-claim", strings.Repeat("d", 64))
-	}); err != nil {
-		t.Fatal(err)
-	}
 
 	start := make(chan struct{})
 	results := make(chan error, 2)
@@ -203,7 +210,30 @@ func TestConcurrentArchiveGenesisCandidatesHaveOneCASWinnerAndTerminalLoser(t *t
 		t.Fatalf("loser proof does not bind both exact candidates: %+v %v", proof, err)
 	}
 
-	status, code := postArchiveGenesisStatus(t, f.e, f.id)
+	type statusResult struct {
+		status fencing.ArchiveGenesisStatus
+		code   int
+	}
+	statusCh := make(chan statusResult, 1)
+	go func() {
+		status, code := postArchiveGenesisStatus(t, f.e, f.id)
+		statusCh <- statusResult{status: status, code: code}
+	}()
+	select {
+	case <-providerStarted:
+	case early := <-statusCh:
+		t.Fatalf("status returned without issuing the already-authorized provider request: code=%d status=%+v", early.code, early.status)
+	case <-t.Context().Done():
+		t.Fatal("timed out waiting for the authorized provider dispatch")
+	}
+	if _, err := f.e.changeMutationProducer(t.Context(), f.runtime, func(p *fencing.MutationProducer) error {
+		return p.Close("closed-after-genesis-dispatch-grant", strings.Repeat("d", 64))
+	}); err != nil {
+		t.Fatal(err)
+	}
+	releaseProviderResponse()
+	result := <-statusCh
+	status, code := result.status, result.code
 	if code != http.StatusOK || status.Mutation == nil || status.Mutation.Entry == nil || status.Mutation.Entry.Resolution == nil ||
 		status.Mutation.Entry.Resolution.Outcome != fencing.MutationCommitted {
 		t.Fatalf("closed producer could not resume the exact CAS winner: status=%+v code=%d", status, code)
@@ -340,19 +370,52 @@ func TestArchiveGenesisStatusCancelsLostLoserAfterClaimRootCASGapAndClosure(t *t
 	}
 
 	status, code := postArchiveGenesisStatus(t, f.e, f.id)
-	if code != http.StatusOK || status.Mutation == nil || status.Mutation.Entry == nil || status.Mutation.Entry.Resolution == nil ||
-		status.Mutation.Entry.Resolution.Outcome != fencing.MutationCommitted {
-		t.Fatalf("status failed to reconcile closed producer after lost loser response: code=%d status=%+v", code, status)
+	if code != http.StatusAccepted || status.Mutation != nil {
+		t.Fatalf("closed producer without a prior dispatch grant must remain pending: code=%d status=%+v", code, status)
+	}
+	scope, _, err = f.e.archiveGenesisScope(t.Context(), f.runtime)
+	if err != nil {
+		t.Fatal(err)
+	}
+	claim, _, err = f.e.AuthorityState.ReadArchiveScopeClaim(t.Context(), scope)
+	root, _, rootErr = f.e.AuthorityState.ReadRoot(t.Context(), f.runtime.StatefulSetUID, f.runtime.SourceClusterID)
+	if err != nil || rootErr != nil || claim.GenesisRef == nil || claim.GenesisRef.Mutation == nil ||
+		claim.GenesisRef.Mutation.Sequence != 1 || claim.GenesisRef.Mutation.Intent != first ||
+		root.Ledger.ArchiveGenesisRef == nil || !sameArchiveGenesisRef(claim.GenesisRef, root.Ledger.ArchiveGenesisRef) {
+		t.Fatalf("CAS winner reference was not durably committed before the pending status response: claim=%+v root=%+v errors=%v/%v", claim.GenesisRef, root.Ledger.ArchiveGenesisRef, err, rootErr)
 	}
 	producer, _, _, err := f.e.AuthorityState.ReadProducer(t.Context(), f.runtime)
 	if err != nil {
 		t.Fatal(err)
 	}
+	winner := producer.Entries[1]
+	if producer.Phase != fencing.MutationClosed || winner.Intent != first || winner.Preparation == nil ||
+		!winner.DispatchClosed || len(winner.Dispatches) != 0 || winner.Resolution != nil {
+		t.Fatalf("closed CAS winner escaped the prepared/no-dispatch pending state: producer=%+v entry=%+v", producer, winner)
+	}
 	loser := producer.Entries[2]
 	if loser.Preparation != nil || len(loser.Dispatches) != 0 || loser.Resolution == nil || loser.Resolution.Outcome != fencing.MutationRejected || !loser.Resolution.AllCopiesTerminal {
 		t.Fatalf("status did not terminally cancel the lost loser: %+v", loser)
 	}
-	if uploads.Load() != 1 {
-		t.Fatalf("status reconciliation caused %d provider effects, want one", uploads.Load())
+	evidence, err := f.e.authorityEvidenceFor(f.runtime)
+	if err != nil {
+		t.Fatal(err)
+	}
+	proofReader, _, err := evidence.Read(t.Context(), "archive-genesis-cancellations/"+loser.Resolution.ReceiptDigest)
+	if err != nil {
+		t.Fatalf("closed-gap loser lacks exact durable cancellation proof: %v", err)
+	}
+	proofBytes, readErr := io.ReadAll(proofReader)
+	closeErr := proofReader.Close()
+	if err := errors.Join(readErr, closeErr); err != nil {
+		t.Fatal(err)
+	}
+	var proof archiveGenesisCancellationProof
+	if err := json.Unmarshal(proofBytes, &proof); err != nil || proof.Sequence != 2 || proof.Intent != second ||
+		proof.WinningGenesis.Mutation == nil || proof.WinningGenesis.Mutation.Sequence != 1 || proof.WinningGenesis.Mutation.Intent != first {
+		t.Fatalf("closed-gap cancellation does not bind exact loser and winner: %+v %v", proof, err)
+	}
+	if uploads.Load() != 0 {
+		t.Fatalf("closed no-grant reconciliation caused %d provider effects, want none", uploads.Load())
 	}
 }
