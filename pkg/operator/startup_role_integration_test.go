@@ -62,6 +62,10 @@ func TestNodeOpenWaitsForAssignedLearnerStartupAuthority(t *testing.T) {
 func TestNodeOpenBindsAssignedLearnerWALBeforeWaitingForIdentityWrite(t *testing.T) {
 	physical, logical := "rhiza-2", "recovery-voter-7c41"
 	assignment := strings.Repeat("a", 64)
+	learnerJSON, err := json.Marshal(quepaxa.Member{ID: quepaxa.NodeID(logical), PublicKey: quepaxa.PublicKey{1}})
+	if err != nil {
+		t.Fatal(err)
+	}
 	grant := fencing.StartupGrant{
 		Identity: fencing.Identity{
 			SourceClusterID: "source-cluster", NodeID: logical, PodName: physical,
@@ -70,7 +74,7 @@ func TestNodeOpenBindsAssignedLearnerWALBeforeWaitingForIdentityWrite(t *testing
 		Role: fencing.StartupRoleLearnerPendingRemove,
 		Environment: map[string]string{
 			"RHIZA_NODE_ID":    logical,
-			"RHIZA_LEARNER":    `{"ID":"recovery-voter-7c41","PublicKey":"AQAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="}`,
+			"RHIZA_LEARNER":    string(learnerJSON),
 			"RHIZA_PEER_TOKEN": "fresh-assigned-peer-token",
 		},
 	}
@@ -78,7 +82,12 @@ func TestNodeOpenBindsAssignedLearnerWALBeforeWaitingForIdentityWrite(t *testing
 		t.Fatalf("test grant invalid: %v", err)
 	}
 	var bindSeen bool
-	socket := filepath.Join(t.TempDir(), "startup.sock")
+	socketDir, err := os.MkdirTemp("/tmp", "rh-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(socketDir) })
+	socket := filepath.Join(socketDir, "s")
 	startStartupAuthoritySocket(t, socket, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost {
 			http.NotFound(w, r)
@@ -136,7 +145,7 @@ func TestNodeOpenBindsAssignedLearnerWALBeforeWaitingForIdentityWrite(t *testing
 	config.ObjStoreEndpoint = strings.TrimPrefix(store.URL, "http://")
 	config.PeerToken = grant.Environment["RHIZA_PEER_TOKEN"]
 	config.Learner = &quepaxa.Member{ID: quepaxa.NodeID(logical), PublicKey: quepaxa.PublicKey{1}}
-	err := node.New(config).Open(context.Background())
+	err = node.New(config).Open(context.Background())
 	if !errors.Is(err, fencing.ErrPending) {
 		t.Fatalf("Node.Open error=%v, want pending WAL bind", err)
 	}

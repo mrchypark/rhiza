@@ -113,6 +113,22 @@ func registerStageError(stage string, err error) error {
 	return fmt.Errorf("fencing: register %s rejected: %w", stage, err)
 }
 
+// emitEarlyClosedRegistrationDenial keeps authenticated registration failures
+// from repair preflight resolvers on the same structured diagnostic path as
+// canonical-root closure discovered later in handle. The grant is unresolved
+// at this point by construction.
+func (e *FencingExecutor) emitEarlyClosedRegistrationDenial(uid string, identity fencing.Identity) {
+	if e == nil || e.Kube == nil {
+		return
+	}
+	_ = emitStartupRegistrationDenial(startupRegistrationDenialEvent{
+		Event: startupRegistrationDenialEventName, Action: "register", Result: "closed", HTTPStatus: http.StatusGone,
+		Stage: startupRegistrationStageGrant, Namespace: e.Kube.Namespace, StatefulSetUID: uid,
+		PodUID: identity.PodUID, SourceClusterID: identity.SourceClusterID,
+		AttemptedRunID: identity.RunID, RequestedNodeID: identity.NodeID,
+	})
+}
+
 func (e *FencingExecutor) ledgerPath(uid, source string) string {
 	return e.controller().corePath("configmaps", "rhiza-fence-ledger-"+hashJSON([]string{uid, source})[:40])
 }
@@ -501,6 +517,9 @@ func (e *FencingExecutor) handle(w http.ResponseWriter, r *http.Request) {
 	if message.Action == "register" {
 		grant, assigned, restartErr := e.resolveEngineRepairActiveRestartRegistration(r.Context(), uid, message.Identity)
 		if restartErr != nil {
+			if errors.Is(restartErr, fencing.ErrClosed) {
+				e.emitEarlyClosedRegistrationDenial(uid, message.Identity)
+			}
 			writeEngineRepairStartupError(w, restartErr)
 			return
 		}
@@ -509,6 +528,9 @@ func (e *FencingExecutor) handle(w http.ResponseWriter, r *http.Request) {
 		} else {
 			grant, assigned, bootstrapErr := e.resolveEngineRepairBootstrapRegistration(r.Context(), uid, message.Identity)
 			if bootstrapErr != nil {
+				if errors.Is(bootstrapErr, fencing.ErrClosed) {
+					e.emitEarlyClosedRegistrationDenial(uid, message.Identity)
+				}
 				writeEngineRepairStartupError(w, bootstrapErr)
 				return
 			}
