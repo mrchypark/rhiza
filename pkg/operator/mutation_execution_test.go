@@ -1387,6 +1387,10 @@ func TestHeldMutationDeleteOfVerifiedCurrentPinnedGenerationIsTerminallyCancelle
 	server, client := newHeldGCSServer(t, f)
 	server.mu.Lock()
 	server.nextGeneration = 0
+	// This positive barrier fixture needs a confirmed helper create. The shared
+	// fake server defaults to losing its first create response, which is tested
+	// separately as a pending, unguarded outcome.
+	server.loseCreate = false
 	server.mu.Unlock()
 	f.e.SourceMutationStorage = client
 	create := f.admitUpload(t, 1, "objects/current-pin", fencing.MutationCondition{Mode: fencing.MutationUnconditional}, []byte("pinned"))
