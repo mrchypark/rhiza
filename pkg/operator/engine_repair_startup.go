@@ -432,6 +432,13 @@ func (e *FencingExecutor) resolveEngineRepairBootstrapRegistration(ctx context.C
 			return fencing.StartupGrant{}, false, storeErr
 		}
 		pending, listErr := store.ListPendingEngineRepairs(ctx, request.SourceClusterID)
+		if errors.Is(listErr, errAuthorityStateNotFound) {
+			// A missing root has no canonical pending references. Let the
+			// registration path reach initializeRoot, which performs the legacy
+			// ledger check before creating any canonical state. Other read errors
+			// remain fail-closed.
+			return fencing.StartupGrant{}, false, nil
+		}
 		if listErr != nil {
 			return fencing.StartupGrant{}, false, listErr
 		}

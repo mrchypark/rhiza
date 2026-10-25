@@ -13,6 +13,7 @@ import (
 	"testing"
 
 	"github.com/mrchypark/rhiza/pkg/fencing"
+	"github.com/thanos-io/objstore"
 )
 
 type rootDiagnosticRoundTripper func(*http.Request) (*http.Response, error)
@@ -21,22 +22,45 @@ func (f rootDiagnosticRoundTripper) RoundTrip(request *http.Request) (*http.Resp
 	return f(request)
 }
 
+type rootInitNthFailingBucket struct {
+	objstore.Bucket
+	rootReads *int
+	failAt    int
+	err       error
+}
+
+func (b rootInitNthFailingBucket) Attributes(ctx context.Context, name string) (objstore.ObjectAttributes, error) {
+	if strings.Contains(name, "rhiza-authority/v1/roots/") {
+		*b.rootReads++
+		if *b.rootReads == b.failAt {
+			return objstore.ObjectAttributes{}, b.err
+		}
+	}
+	return b.Bucket.Attributes(ctx, name)
+}
+
 func TestTransientRootInitRegistrationLogsDiagnosisAndReturns503(t *testing.T) {
 	tests := []struct {
-		name        string
-		configure   func(*testing.T, supervisorRegistrationFixture)
-		wantMessage string
+		name           string
+		configure      func(*testing.T, supervisorRegistrationFixture)
+		wantMessage    string
+		rootReadFailAt int
+		wantRootReads  int
 	}{
 		{
-			name: "root read deadline",
-			configure: func(_ *testing.T, fixture supervisorRegistrationFixture) {
-				bucket := fixture.state.bucket
-				fixture.state.bucket = rootInitFailingBucket{Bucket: bucket, err: context.DeadlineExceeded}
-			},
-			wantMessage: "fencing: root-init phase=load cause=timeout:",
+			name:           "root read deadline",
+			rootReadFailAt: 4,
+			wantRootReads:  4,
+			wantMessage:    "fencing: root-init phase=load cause=timeout:",
 		},
 		{
-			name: "legacy read service unavailable",
+			name:           "bootstrap pending lookup deadline",
+			rootReadFailAt: 3,
+			wantRootReads:  3,
+		},
+		{
+			name:          "legacy read service unavailable",
+			wantRootReads: 4,
 			configure: func(t *testing.T, fixture supervisorRegistrationFixture) {
 				client := *fixture.e.Kube.Client
 				base := client.Transport
@@ -65,7 +89,15 @@ func TestTransientRootInitRegistrationLogsDiagnosisAndReturns503(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			fixture := newSupervisorRegistrationFixture(t, false)
 			baseBucket := fixture.state.bucket
-			tt.configure(t, fixture)
+			rootReads := 0
+			if tt.rootReadFailAt != 0 {
+				fixture.state.bucket = rootInitNthFailingBucket{Bucket: baseBucket, rootReads: &rootReads, failAt: tt.rootReadFailAt, err: context.DeadlineExceeded}
+			} else {
+				fixture.state.bucket = rootInitNthFailingBucket{Bucket: baseBucket, rootReads: &rootReads}
+			}
+			if tt.configure != nil {
+				tt.configure(t, fixture)
+			}
 
 			var captured bytes.Buffer
 			previous := log.Writer()
@@ -100,8 +132,15 @@ func TestTransientRootInitRegistrationLogsDiagnosisAndReturns503(t *testing.T) {
 			}
 			logText := captured.String()
 			t.Logf("captured root-init transition diagnostic: %s", strings.TrimSpace(logText))
-			if !strings.Contains(logText, `fencing supervisor transition rejected: action="register" podUID="pod-0" error="fencing: register root-init rejected:`) || !strings.Contains(logText, tt.wantMessage) {
-				t.Fatalf("root-init failure log omitted fixed diagnosis: wanted %q in %q", tt.wantMessage, logText)
+			if tt.wantMessage != "" {
+				if !strings.Contains(logText, `fencing supervisor transition rejected: action="register" podUID="pod-0" error="fencing: register root-init rejected:`) || !strings.Contains(logText, tt.wantMessage) {
+					t.Fatalf("root-init failure log omitted fixed diagnosis: wanted %q in %q", tt.wantMessage, logText)
+				}
+			} else if strings.Contains(logText, "root-init phase=") {
+				t.Fatalf("pre-root-init failure was mislabeled as root-init: %q", logText)
+			}
+			if rootReads != tt.wantRootReads {
+				t.Fatalf("request reached %d canonical-root reads, want %d", rootReads, tt.wantRootReads)
 			}
 
 			rootKey, identity, err := fixture.state.rootKey("sts-uid", fixture.identity.SourceClusterID)
