@@ -5,8 +5,11 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/hex"
+	"encoding/json"
 	"fmt"
 	"io"
+	"net/http"
+	"net/http/httptest"
 	"net/url"
 	"os"
 	"testing"
@@ -72,6 +75,9 @@ func runFlociProviderContract(t *testing.T, provider Provider) {
 	config, cleanup := flociBucketConfig(t, ctx, provider, bucketName)
 	t.Cleanup(cleanup)
 
+	if provider == ProviderGCS {
+		config.ServiceAccount = flociGCSLocalCredentials(t)
+	}
 	bucket, err := NewBucket(config)
 	if err != nil {
 		t.Fatalf("create Rhiza %s bucket client: %v", provider, err)
@@ -182,6 +188,46 @@ func runFlociProviderContract(t *testing.T, provider Provider) {
 	if _, err := bucket.Attributes(ctx, key); err == nil || !bucket.IsObjNotFoundErr(err) {
 		t.Fatalf("attributes after delete error=%v, want provider not-found", err)
 	}
+}
+
+// flociGCSLocalCredentials pins OAuth refreshes to a loopback stub because the
+// Thanos adapter does not apply the Storage SDK emulator's automatic no-auth mode.
+func flociGCSLocalCredentials(t *testing.T) string {
+	t.Helper()
+	const (
+		clientID     = "floci-test-client"
+		clientSecret = "floci-test-client-secret"
+		refreshToken = "floci-test-refresh-token"
+	)
+	tokenServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost || r.URL.Path != "/token" {
+			http.Error(w, "unexpected local token request", http.StatusBadRequest)
+			return
+		}
+		if err := r.ParseForm(); err != nil || r.Form.Get("grant_type") != "refresh_token" ||
+			r.Form.Get("client_id") != clientID || r.Form.Get("client_secret") != clientSecret ||
+			r.Form.Get("refresh_token") != refreshToken {
+			http.Error(w, "unexpected local refresh grant", http.StatusBadRequest)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `{"access_token":"floci-test-access-token","token_type":"Bearer","expires_in":3600}`)
+	}))
+	t.Cleanup(tokenServer.Close)
+	credentialJSON, err := json.Marshal(struct {
+		Type         string `json:"type"`
+		ClientID     string `json:"client_id"`
+		ClientSecret string `json:"client_secret"`
+		RefreshToken string `json:"refresh_token"`
+		TokenURI     string `json:"token_uri"`
+	}{
+		Type: "authorized_user", ClientID: clientID, ClientSecret: clientSecret,
+		RefreshToken: refreshToken, TokenURI: tokenServer.URL + "/token",
+	})
+	if err != nil {
+		t.Fatalf("marshal local Floci credentials: %v", err)
+	}
+	return string(credentialJSON)
 }
 
 func flociBucketConfig(t *testing.T, ctx context.Context, provider Provider, bucketName string) (Config, func()) {
