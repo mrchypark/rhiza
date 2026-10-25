@@ -25,6 +25,20 @@ import (
 	"github.com/thanos-io/objstore"
 )
 
+// archiveGenesisSource exposes the archive's canonical zero prefix only while
+// the Core still retains genesis. Nonzero prefixes remain sourced directly
+// from the Core, including its compaction-floor checks.
+type archiveGenesisSource struct {
+	*quepaxa.Core
+}
+
+func (s archiveGenesisSource) PrefixHash(slot quepaxa.Slot) ([32]byte, bool) {
+	if slot == 0 && s.Core.CompactionFloor() == 0 {
+		return [32]byte{}, true
+	}
+	return s.Core.PrefixHash(slot)
+}
+
 func TestRetiredPeerNestedSyncDiagnostic(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 	defer cancel()
@@ -456,7 +470,7 @@ func TestRetiredPeerArchiveRecoveryAllowsRetainedVoterCurrentSync(t *testing.T) 
 	defer publisher.Close()
 	reader := recovery.NewManager(archiveBucket, string(clusterID), recovery.ArchiveConfigID)
 	defer reader.Close()
-	if err := publisher.SyncPrefixThrough(ctx, cores["a"], terminalSlot-1); err != nil {
+	if err := publisher.SyncPrefixThrough(ctx, archiveGenesisSource{Core: cores["a"]}, terminalSlot-1); err != nil {
 		t.Fatalf("publish certified archive only through fixed terminal prefix %d: %v", terminalSlot-1, err)
 	}
 	if err := reader.LoadOnce(ctx); err != nil {
