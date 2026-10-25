@@ -431,6 +431,8 @@ func TestMutationJournalPreparationAndReceiptsBindExactProducer(t *testing.T) {
 	receipt.Outcome, receipt.PayloadDigest = MutationRejected, ""
 	rejectJournalUnchanged(t, p, func() error { return p.Resolve(1, receipt) })
 	receipt.AllCopiesTerminal = true
+	mustJournal(t, p.GrantDispatch(1, "copy-1"))
+	mustJournal(t, p.RecordDispatchTerminal(1, "copy-1", journalTestDigest))
 	mustJournal(t, p.SealDispatch(1))
 	mustJournal(t, p.Resolve(1, receipt))
 }
@@ -445,6 +447,8 @@ func TestMutationJournalLateResumableSessionCannotChangePreparation(t *testing.T
 	rejectJournalUnchanged(t, p, func() error { return p.Prepare(1, prepared) })
 	hash, err := p.PreparationHash(1)
 	mustJournal(t, err)
+	mustJournal(t, p.GrantDispatch(1, "copy-1"))
+	mustJournal(t, p.RecordDispatchTerminal(1, "copy-1", journalTestDigest))
 	mustJournal(t, p.SealDispatch(1))
 	mustJournal(t, p.Resolve(1, MutationResolution{Outcome: MutationRejected, PreparationHash: hash, ReceiptDigest: journalTestDigest, AllCopiesTerminal: true}))
 	rejectJournalUnchanged(t, p, func() error { return p.Prepare(1, prepared) })
