@@ -1085,14 +1085,98 @@ func (m *Manager) SyncPrefixThrough(ctx context.Context, core source, through qu
 	if sealed {
 		return ErrArchiveSealed
 	}
+	expectedPrefix, ok := core.PrefixHash(through)
+	if !ok {
+		return fmt.Errorf("archive source prefix %d is unavailable", through)
+	}
 	if tip >= through {
-		return nil
+		return m.requirePrefix(workCtx, through, expectedPrefix)
+	}
+	// Before extending a published archive, prove that its retained boundary
+	// is the same source history. Otherwise buildExtent could publish a new
+	// suffix that merely starts from a different prefix.
+	archivePrefix, err := m.prefixAt(workCtx, tip)
+	if err != nil {
+		return err
+	}
+	sourcePrefix, ok := core.PrefixHash(tip)
+	if !ok || sourcePrefix != archivePrefix {
+		return fmt.Errorf("archive source prefix mismatch at existing tip %d", tip)
 	}
 	progress.set("fixed-prefix-publish", "not-held")
-	if err := m.syncNow(workCtx, core, through); err != nil {
+	if err := m.syncPrefixNow(workCtx, core, through, expectedPrefix); err != nil {
 		return m.archiveSyncError(progress, through, err)
 	}
+	if err := m.Load(workCtx); err != nil {
+		return m.archiveSyncError(progress, through, err)
+	}
+	m.mu.Lock()
+	sealed = m.head.Sealed
+	m.mu.Unlock()
+	if sealed {
+		return ErrArchiveSealed
+	}
+	return m.requirePrefix(workCtx, through, expectedPrefix)
+}
+
+func (m *Manager) requirePrefix(ctx context.Context, slot quepaxa.Slot, expected [32]byte) error {
+	actual, err := m.prefixAt(ctx, slot)
+	if err != nil {
+		return err
+	}
+	if actual != expected {
+		return fmt.Errorf("archive prefix mismatch at slot %d", slot)
+	}
 	return nil
+}
+
+func (m *Manager) requireSourceBoundary(ctx context.Context, core source, tip quepaxa.Slot) error {
+	archivePrefix, err := m.prefixAt(ctx, tip)
+	if err != nil {
+		return err
+	}
+	sourcePrefix, ok := core.PrefixHash(tip)
+	if !ok || sourcePrefix != archivePrefix {
+		return fmt.Errorf("archive source prefix mismatch at existing tip %d", tip)
+	}
+	return nil
+}
+
+// prefixAt reads a prefix from the last validated archive head. A prefix
+// below Base is intentionally unavailable: it cannot be reconstructed from
+// trimmed extents, even if the source still retains it.
+func (m *Manager) prefixAt(ctx context.Context, slot quepaxa.Slot) ([32]byte, error) {
+	m.mu.Lock()
+	head, tip := m.head, m.tip
+	refs := slices.Clone(m.extents)
+	m.mu.Unlock()
+	if slot < head.Base {
+		return [32]byte{}, fmt.Errorf("%w: archive prefix %d is below checkpoint base %d", quepaxa.ErrCompacted, slot, head.Base)
+	}
+	if slot == head.Base {
+		return head.BasePrefix, nil
+	}
+	if slot > tip {
+		return [32]byte{}, fmt.Errorf("archive prefix %d is beyond loaded tip %d", slot, tip)
+	}
+	for _, ref := range refs {
+		if slot < ref.Start || slot > ref.End {
+			continue
+		}
+		extent, err := m.extentForRef(ctx, ref)
+		if err != nil {
+			return [32]byte{}, err
+		}
+		prefix := extent.StartPrefix
+		for _, decision := range extent.Decisions {
+			prefix = quepaxa.AdvancePrefixHash(prefix, decision.Slot, decision.Hash)
+			if decision.Slot == slot {
+				return prefix, nil
+			}
+		}
+		return [32]byte{}, fmt.Errorf("archive extent omitted requested prefix %d", slot)
+	}
+	return [32]byte{}, fmt.Errorf("archive has no retained prefix %d", slot)
 }
 
 func (m *Manager) flushBatch(batch *syncBatch, core source) {
@@ -1127,13 +1211,21 @@ func (m *Manager) syncNow(ctx context.Context, core source, through quepaxa.Slot
 }
 
 func (m *Manager) syncNowBatch(ctx context.Context, core source, through quepaxa.Slot, batch *syncBatch) error {
+	return m.syncNowBatchWithPrefix(ctx, core, through, batch, nil)
+}
+
+func (m *Manager) syncPrefixNow(ctx context.Context, core source, through quepaxa.Slot, expected [32]byte) error {
+	return m.syncNowBatchWithPrefix(ctx, core, through, nil, &expected)
+}
+
+func (m *Manager) syncNowBatchWithPrefix(ctx context.Context, core source, through quepaxa.Slot, batch *syncBatch, expectedPrefix *[32]byte) error {
 	var progress *archiveSyncProgress
 	if batch != nil {
 		progress = &batch.progress
 	} else {
 		progress = &archiveSyncProgress{}
 	}
-	if m.Tip() >= through {
+	if expectedPrefix == nil && m.Tip() >= through {
 		return nil
 	}
 	m.mu.Lock()
@@ -1153,6 +1245,9 @@ func (m *Manager) syncNowBatch(ctx context.Context, core source, through quepaxa
 			return ErrArchiveSealed
 		}
 		if tip >= through {
+			if expectedPrefix != nil {
+				return m.requirePrefix(ctx, through, *expectedPrefix)
+			}
 			return nil
 		}
 	} else if ctx.Err() != nil {
@@ -1172,6 +1267,14 @@ func (m *Manager) syncNowBatch(ctx context.Context, core source, through quepaxa
 		m.mu.Unlock()
 		if sealed {
 			return false, ErrArchiveSealed
+		}
+		if expectedPrefix != nil && tip < through {
+			if err := m.requireSourceBoundary(ctx, core, tip); err != nil {
+				return false, err
+			}
+		}
+		if expectedPrefix != nil && tip >= through {
+			return false, m.requirePrefix(ctx, through, *expectedPrefix)
 		}
 		return tip >= through, nil
 	}, func(ctx context.Context) error {
@@ -1193,7 +1296,7 @@ func (m *Manager) syncNowBatch(ctx context.Context, core source, through quepaxa
 				through = tip
 			}
 		}
-		return m.syncNowLockedWithProgress(ctx, core, through, progress)
+		return m.syncNowLockedWithExpectedPrefix(ctx, core, through, progress, expectedPrefix)
 	}, progress)
 	if batch == nil {
 		return err
@@ -1206,12 +1309,24 @@ func (m *Manager) syncNowLocked(ctx context.Context, core source, through quepax
 }
 
 func (m *Manager) syncNowLockedWithProgress(ctx context.Context, core source, through quepaxa.Slot, progress *archiveSyncProgress) error {
+	return m.syncNowLockedWithExpectedPrefix(ctx, core, through, progress, nil)
+}
+
+func (m *Manager) syncNowLockedWithExpectedPrefix(ctx context.Context, core source, through quepaxa.Slot, progress *archiveSyncProgress, expectedPrefix *[32]byte) error {
 	for attempt := 0; attempt < maxPublishRetries; attempt++ {
 		m.mu.Lock()
 		tip, head, refs, headCAS := m.tip, m.head, slices.Clone(m.extents), m.headCAS
 		m.mu.Unlock()
 		if head.Sealed {
 			return ErrArchiveSealed
+		}
+		if expectedPrefix != nil {
+			if tip >= through {
+				return m.requirePrefix(ctx, through, *expectedPrefix)
+			}
+			if err := m.requireSourceBoundary(ctx, core, tip); err != nil {
+				return err
+			}
 		}
 		if tip >= through {
 			return nil
