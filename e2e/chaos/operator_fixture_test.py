@@ -291,6 +291,23 @@ class BucketJobTest(unittest.TestCase):
             "node open phase consensus: nested error says open WAL: PRIVATE_CANARY"))
         self.assertEqual([], safe_startup_findings(
             "2026/10/26 12:34:56 unrelated prefix: fencing: engine repair preflight: PRIVATE_CANARY"))
+        self.assertEqual(
+            ["engine_repair_preflight", "engine_repair_state_continuity_lost"],
+            safe_startup_findings(
+                "2026/10/26 12:34:56 fencing: engine repair preflight: "
+                "voter state continuity cannot be established: PRIVATE_STATE_CANARY"))
+        self.assertEqual(
+            ["engine_repair_preflight"],
+            safe_startup_findings(
+                "2026/10/26 12:34:56 fencing: engine repair preflight: "
+                "unrecognized PRIVATE_UNKNOWN_CANARY"))
+        self.assertEqual([], safe_startup_findings(
+            "2026/10/26 12:34:56 unrelated: registered voter WAL is absent PRIVATE_UNMARKED_CANARY"))
+        self.assertEqual(
+            ["engine_repair_preflight", "engine_repair_state_continuity_lost", "engine_repair_wal_absent"],
+            safe_startup_findings(
+                "2026/10/26 12:34:56 fencing: engine repair preflight: "
+                "voter state continuity cannot be established\nregistered voter WAL is absent"))
         with tempfile.TemporaryDirectory() as directory:
             chaos = Chaos(argparse.Namespace(output=directory, cluster="fixture"))
             payload = b"\n".join((
@@ -298,6 +315,11 @@ class BucketJobTest(unittest.TestCase):
                 b"2026/10/26 12:34:56 open rhiza: node open phase identity_storage: open object store: PRIVATE_CANARY_B",
                 b"2026/10/26 12:34:56 open rhiza: node open phase wal: open WAL: PRIVATE_CANARY_C",
                 b"2026/10/26 12:34:56 fencing: engine repair preflight: PRIVATE_CANARY_D",
+                b"2026/10/26 12:34:56 fencing: engine repair preflight: voter state continuity cannot be established: PRIVATE_PREFLIGHT_STATE_CANARY",
+                b"registered voter WAL is absent",
+                b"2026/10/26 12:34:56 fencing: engine repair preflight: registered voter WAL is absent",
+                b"2026/10/26 12:34:56 fencing: engine repair preflight: unknown PRIVATE_PREFLIGHT_UNKNOWN_CANARY; voter state continuity cannot be established",
+                b"2026/10/26 12:34:56 unrelated PRIVATE_UNMARKED_CANARY: registered voter WAL is absent",
                 b"2026/10/26 12:34:56 fencing: child exited without a terminal receipt: PRIVATE_CANARY_E",
                 b"2026/10/26 12:34:56 open rhiza: node open phase unknown_phase: PRIVATE_CANARY_F",
                 b"2026/10/26 12:34:56 unrecognized private failure PRIVATE_CANARY_G",
@@ -311,12 +333,16 @@ class BucketJobTest(unittest.TestCase):
             summary = Path(directory, "startup-diagnostics-summary.json").read_text()
             capture = json.loads(summary)["captures"][0]
             self.assertEqual([
-                "consensus", "engine_repair_preflight", "identity_enrollment", "identity_storage",
-                "network", "storage_initialization", "supervisor_child_exit", "wal", "wal_open",
+                "consensus", "engine_repair_preflight", "engine_repair_state_continuity_lost",
+                "engine_repair_wal_absent", "identity_enrollment", "identity_storage", "network",
+                "storage_initialization", "supervisor_child_exit", "wal", "wal_open",
             ], capture["startupFindings"])
             for canary in ("PRIVATE_CANARY_A", "PRIVATE_CANARY_B", "PRIVATE_CANARY_C",
                            "PRIVATE_CANARY_D", "PRIVATE_CANARY_E", "PRIVATE_CANARY_F", "PRIVATE_CANARY_J",
                            "PRIVATE_CANARY_G", "PRIVATE_CANARY_H", "PRIVATE_CANARY_I"):
+                self.assertNotIn(canary, summary)
+            for canary in ("PRIVATE_PREFLIGHT_STATE_CANARY", "PRIVATE_PREFLIGHT_UNKNOWN_CANARY",
+                           "PRIVATE_UNMARKED_CANARY"):
                 self.assertNotIn(canary, summary)
 
         with tempfile.TemporaryDirectory() as directory:
