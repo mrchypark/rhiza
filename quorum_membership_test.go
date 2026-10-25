@@ -525,7 +525,11 @@ func TestQuorumMembershipQUIC(t *testing.T) {
 	peers[3].listener = nil
 	currentPeerCtx, currentPeerCancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer currentPeerCancel()
-	start(currentPeerCtx, 3, true) // Same peer ID/token, but a freshly created WAL incarnation.
+	currentPeerServeCtx, currentPeerServeCancel := context.WithCancel(context.Background())
+	t.Cleanup(currentPeerServeCancel)
+	// The five-second context bounds the later Sync attempts, not the restarted
+	// peer's serving lifetime. Keep that listener alive until test cleanup.
+	start(currentPeerServeCtx, 3, true) // Same peer ID/token, but a freshly created WAL incarnation.
 	if err := syncLearner(peers[0].core.Tip()); err != nil {
 		t.Fatal(err)
 	}
