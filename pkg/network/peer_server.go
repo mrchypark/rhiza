@@ -485,32 +485,50 @@ func (s *PeerServer) handle(ctx context.Context, certificateKey ed25519.PublicKe
 			}
 			if s.server.core.Tip() < decision.Slot-1 {
 				if s.server.transport == nil {
+					originalErr := fmt.Errorf("reconfiguration control prefix is unavailable")
 					if localtesthooks.Enabled {
-						localtesthooks.Hit(fmt.Sprintf("network:learned-control:phase=catchup-failed:node=%s:sender=%s:slot=%d:error=%q", s.server.core.NodeID(), request.SenderId, decision.Slot, "transport unavailable"))
+						localtesthooks.Hit(fmt.Sprintf("network:learned-control:phase=catchup-failed:node=%s:sender=%s:slot=%d:error=%q", s.server.core.NodeID(), request.SenderId, decision.Slot, originalErr.Error()))
 					}
+					complete := false
 					if knownGap {
-						s.server.hintArchiveCatchUp(gapKey)
+						_, complete = s.server.continueArchiveCatchUp(ctx, gapKey, decision.Slot-1)
 					}
-					return nil, fmt.Errorf("reconfiguration control prefix is unavailable")
-				}
-				if err := s.server.catchUpFrom(ctx, quepaxa.NodeID(request.SenderId), decision.Slot-1, true); err != nil {
+					if !complete {
+						if knownGap {
+							s.server.hintArchiveCatchUp(gapKey)
+						}
+						return nil, originalErr
+					}
+				} else if err := s.server.catchUpFrom(ctx, quepaxa.NodeID(request.SenderId), decision.Slot-1, true); err != nil {
 					if localtesthooks.Enabled {
 						localtesthooks.Hit(fmt.Sprintf("network:learned-control:phase=catchup-failed:node=%s:sender=%s:slot=%d:error=%q", s.server.core.NodeID(), request.SenderId, decision.Slot, err.Error()))
 					}
+					complete := false
 					if knownGap {
-						s.server.hintArchiveCatchUp(gapKey)
+						_, complete = s.server.continueArchiveCatchUp(ctx, gapKey, decision.Slot-1)
 					}
-					return nil, err
+					if !complete {
+						if knownGap {
+							s.server.hintArchiveCatchUp(gapKey)
+						}
+						return nil, err
+					}
 				}
 			}
 			if err := s.server.core.WaitTip(ctx, decision.Slot-1); err != nil {
 				if localtesthooks.Enabled {
 					localtesthooks.Hit(fmt.Sprintf("network:learned-control:phase=catchup-failed:node=%s:sender=%s:slot=%d:error=%q", s.server.core.NodeID(), request.SenderId, decision.Slot, err.Error()))
 				}
+				complete := false
 				if knownGap {
-					s.server.hintArchiveCatchUp(gapKey)
+					_, complete = s.server.continueArchiveCatchUp(ctx, gapKey, decision.Slot-1)
 				}
-				return nil, err
+				if !complete {
+					if knownGap {
+						s.server.hintArchiveCatchUp(gapKey)
+					}
+					return nil, err
+				}
 			}
 			if localtesthooks.Enabled {
 				localtesthooks.Hit(fmt.Sprintf("network:learned-control:phase=catchup-complete:node=%s:sender=%s:slot=%d", s.server.core.NodeID(), request.SenderId, decision.Slot))
