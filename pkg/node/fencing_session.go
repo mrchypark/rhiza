@@ -194,7 +194,9 @@ func (n *Node) startFenceWatcher(ctx context.Context) {
 					}
 					continue
 				}
-				n.ready.Store(true)
+				// Promotion changes the local voting boundary; require a fresh
+				// quorum round against the current membership before serving.
+				n.wakeCatchUp()
 				return
 			}
 		}()
