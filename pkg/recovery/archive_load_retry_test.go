@@ -7,7 +7,10 @@ import (
 	"io"
 	"strings"
 	"testing"
+	"time"
 
+	"github.com/mrchypark/rhiza/pkg/qlog"
+	"github.com/mrchypark/rhiza/pkg/quepaxa"
 	"github.com/thanos-io/objstore"
 )
 
@@ -89,6 +92,185 @@ func TestArchiveLoadRetriesHeadAppendWithoutRereadingExtents(t *testing.T) {
 	wantVersion, _ := writer.HeadVersion()
 	if !ok || gotVersion != wantVersion {
 		t.Fatal("reader did not install the final HEAD version")
+	}
+}
+
+func TestArchiveLoadOnceDoesNotWaitForFirstPublication(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	wal, err := qlog.Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer wal.Close()
+	core, err := quepaxa.New(quepaxa.Config{NodeID: "n1", Cluster: quepaxa.Cluster{ConfigID: 1, Members: []quepaxa.Member{{ID: "n1"}}}, WAL: wal})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := core.Propose(ctx, []byte("first publication")); err != nil {
+		t.Fatal(err)
+	}
+	base := objstore.NewInMemBucket()
+	writerBucket := &firstExtentPublicationWindowBucket{Bucket: base, started: make(chan struct{}), release: make(chan struct{})}
+	writer := NewManager(writerBucket, "cluster", 1)
+	defer writer.Close()
+	reader := NewManager(base, "cluster", 1)
+	defer reader.Close()
+	writerDone := make(chan error, 1)
+	go func() { writerDone <- writer.SyncThrough(ctx, core, core.Tip()) }()
+	select {
+	case <-writerBucket.started:
+	case err := <-writerDone:
+		t.Fatalf("writer completed before publication window: %v", err)
+	case <-ctx.Done():
+		t.Fatal("writer did not expose first-publication window")
+	}
+	if err := reader.LoadOnce(ctx); !errors.Is(err, errArchivePublicationPending) {
+		t.Fatalf("LoadOnce error=%v, want first-publication-pending", err)
+	}
+	close(writerBucket.release)
+	select {
+	case err := <-writerDone:
+		if err != nil {
+			t.Fatalf("finish writer publication: %v", err)
+		}
+	case <-ctx.Done():
+		t.Fatal("writer did not finish after release")
+	}
+	if err := reader.LoadOnce(ctx); err != nil {
+		t.Fatalf("LoadOnce after publication: %v", err)
+	}
+	if reader.Tip() != core.Tip() {
+		t.Fatalf("reader tip=%d, want %d", reader.Tip(), core.Tip())
+	}
+}
+
+func TestArchiveLoadOnceReturnsOnChangedHeadWithoutRetry(t *testing.T) {
+	ctx, bucket, core, writer := newSealableArchive(t)
+	defer writer.Close()
+	readerBucket := &archiveLoadHookBucket{Bucket: bucket, gets: map[string]int{}}
+	reader := NewManager(readerBucket, "cluster", 1)
+	defer reader.Close()
+	if err := reader.LoadOnce(ctx); err != nil {
+		t.Fatalf("initial LoadOnce: %v", err)
+	}
+	oldTip := reader.Tip()
+	if _, _, err := core.Propose(ctx, []byte("published before refresh")); err != nil {
+		t.Fatal(err)
+	}
+	if err := writer.SyncThrough(ctx, core, core.Tip()); err != nil {
+		t.Fatal(err)
+	}
+	headReads := 0
+	writerAdvanced := false
+	readerBucket.onAttributes = func(name string) error {
+		if strings.HasSuffix(name, "/archive/head.bin") {
+			headReads++
+			if headReads == 3 && !writerAdvanced {
+				writerAdvanced = true
+				if _, _, err := core.Propose(ctx, []byte("concurrent head change")); err != nil {
+					return err
+				}
+				return writer.SyncThrough(ctx, core, core.Tip())
+			}
+		}
+		return nil
+	}
+	if err := reader.LoadOnce(ctx); !errors.Is(err, errArchiveStateChanged) {
+		t.Fatalf("LoadOnce error=%v, want changed-head result", err)
+	}
+	if !writerAdvanced || reader.Tip() != oldTip {
+		t.Fatalf("writerAdvanced=%t readerTip=%d, want unchanged tip %d", writerAdvanced, reader.Tip(), oldTip)
+	}
+}
+
+func TestArchiveLoadOnceDoesNotRetryUnstableHeadRead(t *testing.T) {
+	for _, mode := range []string{"once", "load"} {
+		t.Run(mode, func(t *testing.T) {
+			ctx, bucket, core, writer := newSealableArchive(t)
+			defer writer.Close()
+			readerBucket := &archiveLoadHookBucket{Bucket: bucket, gets: map[string]int{}}
+			reader := NewManager(readerBucket, "cluster", 1)
+			defer reader.Close()
+			if err := reader.Load(ctx); err != nil {
+				t.Fatalf("initial load: %v", err)
+			}
+			oldTip := reader.Tip()
+			appendExtent := func(value string) {
+				t.Helper()
+				if _, _, err := core.Propose(ctx, []byte(value)); err != nil {
+					t.Fatal(err)
+				}
+				if err := writer.SyncThrough(ctx, core, core.Tip()); err != nil {
+					t.Fatal(err)
+				}
+			}
+			appendExtent("published before unstable read")
+
+			headGets, headAttributes := 0, 0
+			readerBucket.onGet = func(name string) error {
+				if strings.HasSuffix(name, "/archive/head.bin") {
+					headGets++
+				}
+				return nil
+			}
+			readerBucket.onAttributes = func(name string) error {
+				if strings.HasSuffix(name, "/archive/head.bin") {
+					headAttributes++
+					if headAttributes == 2 {
+						appendExtent("changed between head attributes")
+					}
+				}
+				return nil
+			}
+
+			var err error
+			if mode == "once" {
+				err = reader.LoadOnce(ctx)
+				if !errors.Is(err, errArchiveStateChanged) {
+					t.Fatalf("LoadOnce error=%v, want one-pass changed-head result", err)
+				}
+				if reader.Tip() != oldTip {
+					t.Fatalf("LoadOnce installed tip %d after unstable read, want unchanged %d", reader.Tip(), oldTip)
+				}
+				if headGets != 1 {
+					t.Fatalf("LoadOnce fetched HEAD %d times, want one", headGets)
+				}
+				return
+			}
+
+			err = reader.Load(ctx)
+			if err != nil {
+				t.Fatalf("Load across unstable head read: %v", err)
+			}
+			if reader.Tip() != core.Tip() {
+				t.Fatalf("Load tip=%d, want latest tip=%d", reader.Tip(), core.Tip())
+			}
+			if headGets < 2 {
+				t.Fatalf("Load fetched HEAD %d times, want retry after changed read", headGets)
+			}
+		})
+	}
+}
+
+func TestArchiveLoadOnceHonorsCanceledContextAndLoadsStableHead(t *testing.T) {
+	ctx, bucket, _, writer := newSealableArchive(t)
+	defer writer.Close()
+	reader := NewManager(bucket, "cluster", 1)
+	defer reader.Close()
+	canceled, cancel := context.WithCancel(ctx)
+	cancel()
+	if err := reader.LoadOnce(canceled); !errors.Is(err, context.Canceled) {
+		t.Fatalf("canceled LoadOnce error=%v, want context cancellation", err)
+	}
+	if reader.Tip() != 0 {
+		t.Fatalf("canceled LoadOnce changed tip to %d", reader.Tip())
+	}
+	if err := reader.LoadOnce(ctx); err != nil {
+		t.Fatalf("stable LoadOnce: %v", err)
+	}
+	if reader.Tip() != writer.Tip() {
+		t.Fatalf("reader tip=%d, want stable writer tip=%d", reader.Tip(), writer.Tip())
 	}
 }
 

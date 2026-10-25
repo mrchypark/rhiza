@@ -290,7 +290,7 @@ func (m *Manager) Load(ctx context.Context) error {
 		if err := ctx.Err(); err != nil {
 			return err
 		}
-		err := m.loadLocked(ctx, verified)
+		err := m.loadLocked(ctx, verified, true)
 		switch {
 		case err == nil:
 			return nil
@@ -316,6 +316,18 @@ func (m *Manager) Load(ctx context.Context) error {
 	}
 }
 
+// LoadOnce performs one archive refresh pass without waiting for a concurrent
+// first publication or retrying when the shared HEAD changes during the pass.
+// It still validates the complete HEAD and immutable extent chain before
+// installing any refreshed state. Callers that need the ordinary publication
+// wait/retry behavior should continue to use Load.
+func (m *Manager) LoadOnce(ctx context.Context) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	return m.loadLocked(ctx, make(map[extentObject]Extent), false)
+}
+
 // firstPublicationPending distinguishes a live first-HEAD publication from
 // abandoned immutable blocks. A caller already holding the observed lease
 // cannot use its own lock to disguise a failed publication as transient.
@@ -337,12 +349,16 @@ func (m *Manager) firstPublicationPending(ctx context.Context) (bool, error) {
 	return true, nil
 }
 
-func (m *Manager) loadLocked(ctx context.Context, verified map[extentObject]Extent) error {
+func (m *Manager) loadLocked(ctx context.Context, verified map[extentObject]Extent, retryUnstableHead bool) error {
 	m.mu.Lock()
 	oldExtents, oldHead, oldCAS := slices.Clone(m.extents), m.head, m.headCAS
 	m.mu.Unlock()
 	name := m.key("archive/head.bin")
-	attributes, headData, unchanged, err := m.readStableObject(ctx, name, oldCAS, oldHead.Tip == 0, maxArchiveHeadSize)
+	readHead := m.readStableObject
+	if !retryUnstableHead {
+		readHead = m.readStableObjectOnce
+	}
+	attributes, headData, unchanged, err := readHead(ctx, name, oldCAS, oldHead.Tip == 0, maxArchiveHeadSize)
 	if err != nil {
 		if !m.bucket.IsObjNotFoundErr(err) {
 			return err
@@ -369,7 +385,7 @@ func (m *Manager) loadLocked(ctx context.Context, verified map[extentObject]Exte
 			// The first HEAD read predates the block scan. A publisher may have
 			// completed HEAD and released its lease during that scan; re-read HEAD
 			// before treating the remaining blocks as abandoned.
-			_, _, _, err = m.readStableObject(ctx, name, oldCAS, true, maxArchiveHeadSize)
+			_, _, _, err = readHead(ctx, name, oldCAS, true, maxArchiveHeadSize)
 			if err == nil {
 				return errArchiveStateChanged
 			}
@@ -499,30 +515,38 @@ func (m *Manager) loadLocked(ctx context.Context, verified map[extentObject]Exte
 
 func (m *Manager) readStableObject(ctx context.Context, name string, known *objstore.ObjectVersion, allowMissing bool, limit int64) (objstore.ObjectAttributes, []byte, bool, error) {
 	for range maxPublishRetries {
-		beforeCtx := ctx
-		if allowMissing {
-			beforeCtx = objmetrics.WithExpectedNotFound(ctx)
-		}
-		before, err := m.bucket.Attributes(beforeCtx, name)
-		if err != nil {
-			return objstore.ObjectAttributes{}, nil, false, err
-		}
-		if sameObjectVersion(known, before.Version) {
-			return before, nil, true, nil
-		}
-		data, err := m.readObject(ctx, name, limit)
-		if err != nil {
-			return objstore.ObjectAttributes{}, nil, false, err
-		}
-		after, err := m.bucket.Attributes(ctx, name)
-		if err != nil {
-			return objstore.ObjectAttributes{}, nil, false, err
-		}
-		if sameObjectVersion(before.Version, after.Version) {
-			return after, data, false, nil
+		attributes, data, unchanged, err := m.readStableObjectOnce(ctx, name, known, allowMissing, limit)
+		if !errors.Is(err, errArchiveStateChanged) {
+			return attributes, data, unchanged, err
 		}
 	}
 	return objstore.ObjectAttributes{}, nil, false, fmt.Errorf("shared archive object did not stabilize")
+}
+
+func (m *Manager) readStableObjectOnce(ctx context.Context, name string, known *objstore.ObjectVersion, allowMissing bool, limit int64) (objstore.ObjectAttributes, []byte, bool, error) {
+	beforeCtx := ctx
+	if allowMissing {
+		beforeCtx = objmetrics.WithExpectedNotFound(ctx)
+	}
+	before, err := m.bucket.Attributes(beforeCtx, name)
+	if err != nil {
+		return objstore.ObjectAttributes{}, nil, false, err
+	}
+	if sameObjectVersion(known, before.Version) {
+		return before, nil, true, nil
+	}
+	data, err := m.readObject(ctx, name, limit)
+	if err != nil {
+		return objstore.ObjectAttributes{}, nil, false, err
+	}
+	after, err := m.bucket.Attributes(ctx, name)
+	if err != nil {
+		return objstore.ObjectAttributes{}, nil, false, err
+	}
+	if !sameObjectVersion(before.Version, after.Version) {
+		return objstore.ObjectAttributes{}, nil, false, errArchiveStateChanged
+	}
+	return after, data, false, nil
 }
 
 func sameObjectVersion(a, b *objstore.ObjectVersion) bool {
