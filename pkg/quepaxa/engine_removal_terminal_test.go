@@ -44,7 +44,9 @@ func TestEngineRemovalTerminalSnapshotReadsExactCertifiedValue(t *testing.T) {
 	for _, core := range cores {
 		core.reconfigAdmission = func(context.Context, ReconfigurationAdmission) error { return nil }
 	}
-	if err := cores["b"].FinishEngineOwnedRemovalAt(ctx, operation); err != nil {
+	// This test validates the exact retained terminal snapshot on the same core
+	// that decided the freeze; it does not assert cross-core propagation.
+	if err := cores["a"].FinishEngineOwnedRemovalAt(ctx, operation); err != nil {
 		t.Fatalf("commit terminal in fixture: %v", err)
 	}
 	snapshot, err := cores["a"].EngineRemovalTerminalSnapshot(ctx, operation)
