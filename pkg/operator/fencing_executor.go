@@ -671,6 +671,10 @@ func (e *FencingExecutor) handle(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var stop fencing.StopRequest
+	var registrationPredecessor *fencing.Run
+	if err == nil && message.Action == "register" && message.RegistrationWALIdentity != "" {
+		registrationPredecessor, err = e.prepareRegistrationPredecessor(r.Context(), uid, message.Identity, message.RegistrationWALIdentity)
+	}
 	var binding fencing.BindReceipt
 	var mutationLookup fencing.MutationLookupResult
 	if message.Action == "mutation-lookup" {
@@ -720,6 +724,9 @@ func (e *FencingExecutor) handle(w http.ResponseWriter, r *http.Request) {
 							return fmt.Errorf("fencing: registration continuation requires runtime enrollment")
 						}
 						if err := validateRegistrationContinuation(l, message.Identity, message.RegistrationWALIdentity, uid); err != nil {
+							return err
+						}
+						if err := validatePreparedRegistrationPredecessor(l, registrationPredecessor); err != nil {
 							return err
 						}
 					}

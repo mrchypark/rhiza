@@ -269,6 +269,87 @@ func TestRegistrationContinuationRacesDifferentPriorBind(t *testing.T) {
 	}
 }
 
+func TestRegistrationContinuationDoesNotRetargetPreparedPredecessor(t *testing.T) {
+	f := newSupervisorRegistrationFixture(t, true)
+	prepareInitialRegistrationFixture(t, &f)
+	client := fencing.AuthorityClient{URL: f.server.URL + "/v1/supervisor", TokenFile: f.token, Client: f.server.Client()}
+	if _, err := client.RegisterInitialStartup(t.Context(), f.identity); err != nil {
+		t.Fatal(err)
+	}
+	request := f.identity
+	request.RunID = "losing-successor"
+	wal := strings.Repeat("a", 64)
+	prepared, err := f.e.prepareRegistrationPredecessor(t.Context(), "sts-uid", request, wal)
+	if err != nil || prepared == nil {
+		t.Fatalf("prepare predecessor: %v", err)
+	}
+	winner := f.identity
+	winner.RunID = "winning-successor"
+	if _, err := client.RegisterStartupContinuation(t.Context(), winner, wal); err != nil {
+		t.Fatal(err)
+	}
+	_, err = f.e.change(t.Context(), "sts-uid", request.SourceClusterID, func(l *fencing.Ledger) error {
+		return validatePreparedRegistrationPredecessor(l, prepared)
+	})
+	if err == nil {
+		t.Fatal("stale preparation accepted after another successor won")
+	}
+	root, _, err := f.state.ReadRoot(t.Context(), "sts-uid", request.SourceClusterID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, exists := root.Ledger.Runs[request.RunID]; exists || root.Ledger.Runs[f.identity.RunID].RegistrationSupersededBy != winner.RunID {
+		t.Fatal("failed stale preparation altered the winning handoff")
+	}
+}
+
+func TestRegistrationContinuationPreparesInterruptedPredecessor(t *testing.T) {
+	f := newSupervisorRegistrationFixture(t, true)
+	prepareInitialRegistrationFixture(t, &f)
+	client := fencing.AuthorityClient{URL: f.server.URL + "/v1/supervisor", TokenFile: f.token, Client: f.server.Client()}
+	if _, err := client.RegisterInitialStartup(t.Context(), f.identity); err != nil {
+		t.Fatal(err)
+	}
+	root, version, err := f.state.ReadRoot(t.Context(), "sts-uid", f.identity.SourceClusterID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	middle := f.identity
+	middle.RunID = "interrupted-middle"
+	runtime := *root.Ledger.Runs[f.identity.RunID].Runtime
+	runtime.RunID, runtime.ContainerID = middle.RunID, "middle-container"
+	wal := strings.Repeat("a", 64)
+	// Persist the exact interruption window: transfer CAS succeeded, but
+	// the successor's producer has not yet been created or pinned.
+	if err := root.Ledger.ContinueUnboundRegistration(middle, runtime, wal); err != nil {
+		t.Fatal(err)
+	}
+	if err := f.state.WriteRoot(t.Context(), "sts-uid", f.identity.SourceClusterID, root, version); err != nil {
+		t.Fatal(err)
+	}
+	last := f.identity
+	last.RunID = "final-successor"
+	if _, err := client.RegisterStartupContinuation(t.Context(), last, wal); err != nil {
+		t.Fatal(err)
+	}
+	root, _, err = f.state.ReadRoot(t.Context(), "sts-uid", f.identity.SourceClusterID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	prior := root.Ledger.Runs[middle.RunID]
+	if prior.MutationProducerUID == "" || prior.RegistrationSupersededBy != last.RunID || prior.Exited || prior.Stop != nil {
+		t.Fatal("interrupted predecessor was revoked without retained producer bookkeeping")
+	}
+	producer, err := f.e.reserveMutationProducer(t.Context(), runtime)
+	if err != nil || producer.Phase != fencing.MutationReserved || producer.WALIdentity != "" || producer.LastAdmitted != 0 {
+		t.Fatalf("superseded predecessor cannot be settled: producer=%+v err=%v", producer, err)
+	}
+	middle.WALIdentity = wal
+	if _, err := client.Bind(t.Context(), middle); err == nil {
+		t.Fatal("bookkeeping preparation reopened old Bind authority")
+	}
+}
+
 func TestRegistrationContinuationTransfersUnboundReservation(t *testing.T) {
 	f := newSupervisorRegistrationFixture(t, true)
 	prepareInitialRegistrationFixture(t, &f)

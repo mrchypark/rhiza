@@ -333,6 +333,62 @@ func validateRegistrationContinuation(ledger *fencing.Ledger, identity fencing.I
 	return nil
 }
 
+// prepareRegistrationPredecessor completes reservation bookkeeping before its
+// admission is revoked. The caller must compare this exact Run inside its CAS.
+func validatePreparedRegistrationPredecessor(ledger *fencing.Ledger, prior *fencing.Run) error {
+	if prior == nil {
+		return nil
+	}
+	current, exists := ledger.Runs[prior.Identity.RunID]
+	if !exists || hashJSON(current) != hashJSON(*prior) {
+		return fmt.Errorf("fencing: registration predecessor changed during preparation")
+	}
+	return nil
+}
+
+func (e *FencingExecutor) prepareRegistrationPredecessor(ctx context.Context, uid string, id fencing.Identity, wal string) (*fencing.Run, error) {
+	root, _, err := e.AuthorityState.ReadRoot(ctx, uid, id.SourceClusterID)
+	if err != nil {
+		return nil, err
+	}
+	if err := validateRegistrationContinuation(&root.Ledger, id, wal, uid); err != nil {
+		return nil, err
+	}
+	if _, replay := root.Ledger.Runs[id.RunID]; replay {
+		return nil, nil
+	}
+	var prior *fencing.Run
+	for _, run := range root.Ledger.Runs {
+		if run.Identity.NodeID != id.NodeID {
+			continue
+		}
+		if run.Identity.WALIdentity != "" {
+			return nil, nil
+		}
+		if run.RegistrationSupersededBy == "" {
+			copy := run
+			prior = &copy
+		}
+	}
+	if prior == nil || prior.Runtime == nil {
+		return nil, fencing.ErrClosed
+	}
+	if root.Ledger.RequireMutationJournal {
+		producer, err := e.reserveMutationProducer(ctx, *prior.Runtime)
+		if err != nil {
+			return nil, err
+		}
+		if producer.Validate() != nil || producer.Phase != fencing.MutationReserved || producer.WALIdentity != "" ||
+			producer.LastAdmitted != 0 || producer.EvidenceFault != "" || producer.ArchiveHead != nil || producer.ArchiveScan != nil {
+			return nil, fmt.Errorf("fencing: registration predecessor is not a zero-work reservation")
+		}
+		// Pin only the deterministic UID we prepared; every other field must
+		// still match, including runtime, unbound WAL and revocation state.
+		prior.MutationProducerUID = stableMutationProducerUID(*prior.Runtime)
+	}
+	return prior, nil
+}
+
 var errInitialRegistrationObjectNotFound = errors.New("fencing: initial registration object not found")
 
 func readInitialRegistrationObject(ctx context.Context, bucket objstore.Bucket, key string) ([]byte, error) {

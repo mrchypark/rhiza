@@ -213,6 +213,9 @@ func (s *EngineRepairStore) AdoptPendingEngineRepair(ctx context.Context, pendin
 		if err := adoptedRecord.ValidateAgainstLedger(state.Ledger); err != nil {
 			return fencing.EngineRepairRecord{}, err
 		}
+		if err := s.verifySupersededReservations(ctx, state.Ledger, incarnations); err != nil {
+			return fencing.EngineRepairRecord{}, err
+		}
 		if err := s.persistImmutableRecord(ctx, adoptedRecord); err != nil {
 			return fencing.EngineRepairRecord{}, err
 		}
@@ -246,6 +249,33 @@ func (s *EngineRepairStore) AdoptPendingEngineRepair(ctx context.Context, pendin
 		}
 	}
 	return fencing.EngineRepairRecord{}, fencing.ErrUnavailable
+}
+
+func (s *EngineRepairStore) verifySupersededReservations(ctx context.Context, ledger fencing.Ledger, inventory []fencing.RepairIncarnation) error {
+	for _, incarnation := range inventory {
+		if !incarnation.SupersededReservation() {
+			continue
+		}
+		run := ledger.Runs[incarnation.Identity.RunID]
+		if run.Runtime == nil || run.RegistrationSupersededBy != incarnation.RegistrationSupersededBy {
+			return fmt.Errorf("fencing: superseded reservation has no exact runtime")
+		}
+		producer, uid, _, err := s.authority.ReadProducer(ctx, *run.Runtime)
+		if err != nil {
+			return fmt.Errorf("fencing: read superseded reservation producer: %w", err)
+		}
+		if uid != incarnation.ProducerUID || producer.Runtime != *run.Runtime || producer.Validate() != nil ||
+			producer.WALIdentity != "" || producer.LastAdmitted != 0 || producer.CompactedThrough != 0 ||
+			producer.RetiredStageThrough != 0 || producer.ArchiveHead != nil || producer.ArchiveScan != nil ||
+			producer.EvidenceFault != "" || len(producer.Entries) != 0 ||
+			(producer.Phase != fencing.MutationReserved && producer.Phase != fencing.MutationClosed) {
+			return fmt.Errorf("fencing: superseded reservation producer is not zero-work")
+		}
+		if producer.Phase == fencing.MutationClosed && (run.Stop == nil || producer.CloseOperationID != run.Stop.OperationID || producer.CloseRequestHash != run.Stop.RequestHash) {
+			return fmt.Errorf("fencing: superseded reservation producer closure differs from root")
+		}
+	}
+	return nil
 }
 
 func validatePendingEngineRepairRequests(ledger fencing.Ledger, uid, source string) error {
@@ -855,6 +885,9 @@ func (s *EngineRepairStore) CreateOrReadEngineRepair(ctx context.Context, record
 			}
 		}
 		if err := record.ValidateAgainstLedger(state.Ledger); err != nil {
+			return fencing.EngineRepairRecord{}, err
+		}
+		if err := s.verifySupersededReservations(ctx, state.Ledger, record.Incarnations); err != nil {
 			return fencing.EngineRepairRecord{}, err
 		}
 		if err := validateNoLiveEngineRepairForSource(state.Ledger, record.Binding.SourceClusterID, ""); err != nil {
