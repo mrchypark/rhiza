@@ -18,7 +18,7 @@ fn watch_go(path: &Path) {
 // Shown when the Go build is unavailable, so the Go-free path is discoverable
 // from the failure itself.
 const NATIVE_HINT: &str = concat!(
-    "install Go 1.27+ and a C compiler, or point RHIZA_NATIVE_LIB_DIR at a directory containing librhiza_ffi.a; ",
+    "install Go 1.27.3+ and a C compiler, or point RHIZA_NATIVE_LIB_DIR at a directory containing librhiza_ffi.a; ",
     "prebuilt archives: https://github.com/mrchypark/rhiza/releases/tag/v",
     env!("CARGO_PKG_VERSION"),
     " (sdk/rust/scripts/fetch-native.sh)",

@@ -26,7 +26,7 @@ Old materializations, checkpoints, SQL history, and graph history are rejected; 
 peers are unsupported. Follow the [logical migration procedure](docs/sql-execution-policy.md)
 and preserve the old installation before changing binaries.
 
-Rhiza requires Go 1.27 or newer. `GOTOOLCHAIN=auto` is expected. SQLite uses
+Rhiza requires Go 1.27.3 or newer. `GOTOOLCHAIN=auto` is expected. SQLite uses
 [`ncruces/go-sqlite3`](https://github.com/ncruces/go-sqlite3), and Graph uses
 [`latticedb-go`](https://github.com/mrchypark/latticedb-go), both without cgo.
 
@@ -105,7 +105,7 @@ cargo run --manifest-path sdk/rust/Cargo.toml --example embedded
 ```
 
 Use `rhizadb = "0.20.0"` in your Cargo dependencies.
-Native builds support macOS and Linux GNU and require Rust, Go 1.27+, and a C
+Native builds support macOS and Linux GNU and require Rust, Go 1.27.3+, and a C
 compiler. The Rust bridge requires cgo; Go-only applications remain cgo-free.
 Calls are synchronous. By default the embedded engine starts its private peer
 endpoint; use `Config::local()` to disable peer networking. SQL, KV, Graph, stream, and request-status access are documented in

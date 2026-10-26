@@ -44,7 +44,7 @@ its default `./rhiza-data`; the fix is in the same release.
 ## Migration from `rhizadb` 0.4
 
 Version 0.5 replaces the earlier Rust implementation with the Rhiza Go FFI
-bridge and therefore has no compatibility layer. It requires Go 1.27+ and a C
+bridge and therefore has no compatibility layer. It requires Go 1.27.3+ and a C
 toolchain at consumer build time. Update imports to `rhizadb`, create a
 `Config`, open `Db`, and use the request/response types in this crate.
 
