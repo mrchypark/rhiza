@@ -151,7 +151,7 @@ func TestFenceStageDiagnosticsDistinguishRecoveryBoundaries(t *testing.T) {
 		if !errors.Is(err, ErrFencePending) {
 			t.Fatalf("missing runtime verifier error = %v", err)
 		}
-		requireFenceStageDiagnostic(t, output, "terminal-verification")
+		requireFenceStageDiagnostic(t, output, "cohort-validation")
 	})
 
 	t.Run("proof status write", func(t *testing.T) {
@@ -173,6 +173,28 @@ func TestFenceStageDiagnosticsDistinguishRecoveryBoundaries(t *testing.T) {
 		}
 		requireFenceStageDiagnostic(t, output, "proof-status-write")
 	})
+}
+
+func TestFenceStageDiagnosticAllowsIndependentFenceBoundaries(t *testing.T) {
+	stages := []string{"cohort-validation", "cohort-revalidation", "terminal-receipt-read", "root-reread", "inventory-revalidation"}
+	output, _ := captureFenceStageDiagnostic(t, func() error {
+		for _, stage := range stages {
+			logFenceStageDiagnostic(stage, errors.New("private terminal detail"))
+		}
+		return nil
+	})
+	lines := strings.Split(strings.TrimSpace(output), "\n")
+	if len(lines) != len(stages) {
+		t.Fatalf("stage diagnostic count=%d, want %d: %q", len(lines), len(stages), output)
+	}
+	for i, stage := range stages {
+		if !strings.HasSuffix(lines[i], "fencing stage blocked: stage="+stage+" class=error") {
+			t.Errorf("stage %q mapped to unexpected diagnostic %q", stage, lines[i])
+		}
+	}
+	if strings.Contains(output, "private terminal detail") {
+		t.Fatalf("stage diagnostic leaked error text: %q", output)
+	}
 }
 
 func TestFenceStageDiagnosticUsesOnlyFixedFields(t *testing.T) {
