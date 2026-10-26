@@ -20,12 +20,14 @@ import (
 	"os"
 	"path"
 	"path/filepath"
+	"sort"
 	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
 
 	"cloud.google.com/go/storage"
+	"github.com/mrchypark/rhiza/internal/localtesthooks"
 	"github.com/mrchypark/rhiza/internal/objstore"
 	"github.com/mrchypark/rhiza/internal/types"
 	"github.com/mrchypark/rhiza/pkg/checkpoint"
@@ -44,6 +46,13 @@ func TestFlociGCSLogicalAuthorityThreeNodeBeforeAckAndSamePodRestart(t *testing.
 	requireFlociEnvironment(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 6*time.Minute)
 	defer cancel()
+	mutationTrace := localtesthooks.NewLogicalMutationExecutionTrace(256)
+	defer func() {
+		if !t.Failed() {
+			return
+		}
+		t.Logf("logical_mutation_execution_trace=%s", logicalMutationTraceJSON(mutationTrace))
+	}()
 	metadata := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodGet || r.Header.Get("Metadata-Flavor") != "Google" {
 			t.Errorf("unexpected Floci metadata request: %s %s flavor=%q", r.Method, r.URL.Path, r.Header.Get("Metadata-Flavor"))
@@ -271,6 +280,7 @@ func TestFlociGCSLogicalAuthorityThreeNodeBeforeAckAndSamePodRestart(t *testing.
 	stageID := ids[3]
 	droppedRegistrationReply := &atomic.Bool{}
 	authority := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		r = r.WithContext(mutationTrace.Context(r.Context()))
 		if r.Method == http.MethodPost && r.URL.Path == "/v1/supervisor" {
 			body, err := io.ReadAll(r.Body)
 			if err != nil {
@@ -314,6 +324,16 @@ func TestFlociGCSLogicalAuthorityThreeNodeBeforeAckAndSamePodRestart(t *testing.
 	nodes := make(map[string]*node.Node, len(ids))
 	configs := make(map[string]*types.ExecutionConfig, len(ids))
 	closed := make(map[string]bool, len(ids))
+	// Registered after the authority server's close cleanup but before node
+	// cleanup callbacks. LIFO cleanup stops nodes first, then performs one
+	// post-attempt canonical reread while the authority endpoint is still open.
+	t.Cleanup(func() {
+		if !t.Failed() {
+			return
+		}
+		t.Logf("post_cleanup_logical_mutation_snapshot=%s", collectLogicalAuthorityFailureSnapshot(nodes, state, executor, statefulSetUID, clusterID))
+		t.Logf("post_cleanup_logical_mutation_trace=%s", logicalMutationTraceJSON(mutationTrace))
+	})
 	for _, id := range ids {
 		tokenPath := filepath.Join(t.TempDir(), "pod-token")
 		if err := os.WriteFile(tokenPath, []byte(tokens[id]), 0600); err != nil {
@@ -384,6 +404,7 @@ func TestFlociGCSLogicalAuthorityThreeNodeBeforeAckAndSamePodRestart(t *testing.
 		t.Logf("logical_failure_snapshot=%s", collectLogicalAuthorityFailureSnapshot(nodes, state, executor, statefulSetUID, clusterID))
 		t.Fatalf("before-ack insert: %v", err)
 	}
+	assertLogicalMutationTraceSettled(t, mutationTrace)
 	if _, err := apiA.Execute(ctx, network.ExecuteRequest{RequestID: "floci-create-compaction-" + suffix, SQL: "CREATE TABLE mutation_history (id INTEGER PRIMARY KEY, value TEXT)"}); err != nil {
 		logReadDurabilityDiagnostic(t, "before-ack-history-create", err)
 		t.Logf("logical_failure_snapshot=%s", collectLogicalAuthorityFailureSnapshot(nodes, state, executor, statefulSetUID, clusterID))
@@ -586,6 +607,99 @@ func logReadDurabilityDiagnostic(t *testing.T, phase string, err error) {
 		required, archiveTip, stage, lockState := diagnostic.ReadDurabilityDiagnostic()
 		t.Logf("logical_durability_failure phase=%s required_slot=%d archive_tip=%d stage=%s lock_state=%s", phase, required, archiveTip, stage, lockState)
 	}
+}
+
+func assertLogicalMutationTraceSettled(t *testing.T, trace *localtesthooks.LogicalMutationExecutionTrace) {
+	t.Helper()
+	events, truncated := trace.Snapshot()
+	if truncated {
+		t.Fatal("logical mutation trace unexpectedly reached its event bound before the first write checkpoint")
+	}
+	byTuple := make(map[string]map[localtesthooks.LogicalMutationStage]localtesthooks.LogicalMutationOutcome)
+	for _, event := range events {
+		key := fmt.Sprintf("%s/%d", event.ProducerHash, event.Sequence)
+		if byTuple[key] == nil {
+			byTuple[key] = make(map[localtesthooks.LogicalMutationStage]localtesthooks.LogicalMutationOutcome)
+		}
+		byTuple[key][event.Stage] = event.Outcome
+	}
+	required := []localtesthooks.LogicalMutationStage{
+		localtesthooks.LogicalMutationAttemptStarted,
+		localtesthooks.LogicalMutationDispatchGranted,
+		localtesthooks.LogicalMutationPayloadOpened,
+		localtesthooks.LogicalMutationProviderStarted,
+		localtesthooks.LogicalMutationProviderReturned,
+		localtesthooks.LogicalMutationReceiptPersisted,
+		localtesthooks.LogicalMutationJournalResolved,
+		localtesthooks.LogicalMutationKeyReleased,
+		localtesthooks.LogicalMutationAttemptReturned,
+	}
+	for _, stages := range byTuple {
+		settled := true
+		for _, stage := range required {
+			if stages[stage] != localtesthooks.LogicalMutationSucceeded {
+				settled = false
+				break
+			}
+		}
+		if settled {
+			return
+		}
+	}
+	t.Fatalf("authority request handler did not capture a settled mutation execution; events=%+v", events)
+}
+
+func logicalMutationTraceJSON(trace *localtesthooks.LogicalMutationExecutionTrace) string {
+	events, truncated := trace.Snapshot()
+	type attemptState struct {
+		ProducerHash string `json:"producer_hash"`
+		Sequence     uint64 `json:"sequence"`
+		State        string `json:"state"`
+	}
+	type tuple struct {
+		producer string
+		sequence uint64
+	}
+	seen := make(map[tuple]bool)
+	started := make(map[tuple]bool)
+	returned := make(map[tuple]bool)
+	for _, event := range events {
+		key := tuple{producer: event.ProducerHash, sequence: event.Sequence}
+		seen[key] = true
+		if event.Stage == localtesthooks.LogicalMutationAttemptStarted {
+			started[key] = true
+		}
+		if event.Stage == localtesthooks.LogicalMutationAttemptReturned {
+			returned[key] = true
+		}
+	}
+	keys := make([]tuple, 0, len(seen))
+	for key := range seen {
+		keys = append(keys, key)
+	}
+	sort.Slice(keys, func(i, j int) bool {
+		if keys[i].producer != keys[j].producer {
+			return keys[i].producer < keys[j].producer
+		}
+		return keys[i].sequence < keys[j].sequence
+	})
+	states := make([]attemptState, 0, len(keys))
+	for _, key := range keys {
+		state := "start-not-observed"
+		if started[key] {
+			state = "started-no-return-observed"
+		}
+		if returned[key] {
+			state = "returned"
+		}
+		states = append(states, attemptState{ProducerHash: key.producer, Sequence: key.sequence, State: state})
+	}
+	data, _ := json.Marshal(struct {
+		Events    []localtesthooks.LogicalMutationExecutionEvent `json:"events"`
+		Attempts  []attemptState                                 `json:"attempts"`
+		Truncated bool                                           `json:"truncated"`
+	}{events, states, truncated})
+	return string(data)
 }
 
 func readLogicalRunID(t *testing.T, dataDir string) string {

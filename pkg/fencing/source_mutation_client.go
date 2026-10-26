@@ -196,6 +196,15 @@ func (c *sourceMutationClient) settle(ctx context.Context, step sourceRetryStep)
 	if entry.Intent != intent {
 		return fmt.Errorf("fencing: authority result changed original intent")
 	}
+	if terminalMutationKeyCleanupCandidate(entry) {
+		executor, ok := c.authority.(sourceMutationExecutor)
+		if !ok {
+			return ErrPending
+		}
+		if err := executor.Execute(ctx, sequence, intent); err != nil {
+			return err
+		}
+	}
 	if entry.Resolution == nil {
 		executor, ok := c.authority.(sourceMutationExecutor)
 		if !ok {
@@ -225,6 +234,26 @@ func (c *sourceMutationClient) settle(ctx context.Context, step sourceRetryStep)
 		}
 	}
 	return finishErr
+}
+
+// terminalMutationKeyCleanupCandidate selects only resolved, dispatched,
+// generation-bound uploads whose ordinary completion receipt closes all copies.
+// Other terminal profiles retain their own guard/finalization recovery paths.
+func terminalMutationKeyCleanupCandidate(entry MutationEntry) bool {
+	if entry.Resolution == nil || entry.Resolution.Outcome != MutationCommitted || entry.Resolution.ConditionFailed ||
+		!entry.Resolution.AllCopiesTerminal || entry.Preparation == nil || entry.Preparation.Profile != MutationExecutionProfile ||
+		entry.Preparation.Generation <= 0 || entry.Intent.Kind != "upload" || entry.Intent.Condition.Mode != MutationMatchGeneration ||
+		entry.Intent.Condition.Generation != entry.Preparation.Generation || entry.Resolution.PayloadDigest != entry.Intent.PayloadDigest ||
+		entry.CopyCompletion != nil || entry.GuardedLogicalResolution != nil || entry.GenerationZeroGuard != nil || entry.GenerationZeroRights != nil ||
+		!entry.DispatchClosed || len(entry.Dispatches) != 1 {
+		return false
+	}
+	for _, dispatch := range entry.Dispatches {
+		if dispatch.ReceiptDigest == "" || dispatch.ReceiptDigest != entry.Resolution.ReceiptDigest {
+			return false
+		}
+	}
+	return true
 }
 
 func (c *sourceMutationClient) finish(step sourceRetryStep) error {
