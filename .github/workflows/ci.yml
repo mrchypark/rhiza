@@ -331,7 +331,7 @@ jobs:
           tar -xf "$archive" -C "$RUNNER_TEMP"
           cd "$RUNNER_TEMP/coreutils-$COREUTILS_VERSION"
           ./configure --disable-nls --without-libgmp
-          make -j2 src/timeout
+          make -j2
           install -D src/timeout "$RUNNER_TEMP/gnu-timeout/bin/timeout"
           "$RUNNER_TEMP/gnu-timeout/bin/timeout" --version
           echo "$RUNNER_TEMP/gnu-timeout/bin" >> "$GITHUB_PATH"
