@@ -312,7 +312,8 @@ jobs:
           cargo test --manifest-path "sdk/rust/target/package/rhizadb-$crate_version/Cargo.toml" --locked --all-targets
 
   go:
-    runs-on: ubuntu-latest
+    # Qualification regressions require native GNU coreutils, not uutils.
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-go@v6
