@@ -220,6 +220,55 @@ func TestRegistrationContinuationNeverBootstrapsMissingAuthority(t *testing.T) {
 	}
 }
 
+func TestRegistrationContinuationRacesDifferentPriorBind(t *testing.T) {
+	f := newSupervisorRegistrationFixture(t, true)
+	prepareInitialRegistrationFixture(t, &f)
+	client := fencing.AuthorityClient{URL: f.server.URL + "/v1/supervisor", TokenFile: f.token, Client: f.server.Client()}
+	nextClient := fencing.AuthorityClient{URL: f.server.URL + "/v1/supervisor", TokenFile: f.token, Client: f.server.Client()}
+	if _, err := client.RegisterInitialStartup(t.Context(), f.identity); err != nil {
+		t.Fatal(err)
+	}
+	next := f.identity
+	next.RunID = "concurrent-continuation"
+	old := f.identity
+	old.WALIdentity = strings.Repeat("b", 64)
+	start := make(chan struct{})
+	bindResult, continuationResult := make(chan error, 1), make(chan error, 1)
+	go func() {
+		<-start
+		_, err := client.Bind(t.Context(), old)
+		bindResult <- err
+	}()
+	go func() {
+		<-start
+		_, err := nextClient.RegisterStartupContinuation(t.Context(), next, strings.Repeat("a", 64))
+		continuationResult <- err
+	}()
+	close(start)
+	bindErr, continuationErr := <-bindResult, <-continuationResult
+	if (bindErr == nil) == (continuationErr == nil) {
+		t.Fatalf("expected one winner: prior Bind=%v, continuation=%v", bindErr, continuationErr)
+	}
+	next.WALIdentity = strings.Repeat("a", 64)
+	_, nextErr := nextClient.Bind(t.Context(), next)
+	if (nextErr == nil) != (continuationErr == nil) {
+		t.Fatalf("new Bind disagrees with reservation winner: %v", nextErr)
+	}
+	root, _, err := f.state.ReadRoot(t.Context(), "sts-uid", f.identity.SourceClusterID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	boundRuns := 0
+	for _, run := range root.Ledger.Runs {
+		if run.Identity.NodeID == old.NodeID && run.Identity.WALIdentity != "" {
+			boundRuns++
+		}
+	}
+	if boundRuns != 1 {
+		t.Fatalf("bound runs=%d, want1", boundRuns)
+	}
+}
+
 func TestRegistrationContinuationTransfersUnboundReservation(t *testing.T) {
 	f := newSupervisorRegistrationFixture(t, true)
 	prepareInitialRegistrationFixture(t, &f)
