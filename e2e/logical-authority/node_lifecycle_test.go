@@ -361,18 +361,22 @@ func TestFlociGCSLogicalAuthorityThreeNodeBeforeAckAndSamePodRestart(t *testing.
 		t.Fatal(err)
 	}
 	if _, err := apiA.Execute(ctx, network.ExecuteRequest{RequestID: "floci-create-" + suffix, SQL: "CREATE TABLE lifecycle (id INTEGER PRIMARY KEY, value TEXT)"}); err != nil {
+		t.Logf("logical_failure_snapshot=%s", collectLogicalAuthorityFailureSnapshot(nodes, state, executor, rootUID, clusterID))
 		t.Fatalf("before-ack create table: %v", err)
 	}
 	if _, err := apiA.Execute(ctx, network.ExecuteRequest{RequestID: "floci-insert-" + suffix, SQL: "INSERT INTO lifecycle(value) VALUES ('durable')"}); err != nil {
+		t.Logf("logical_failure_snapshot=%s", collectLogicalAuthorityFailureSnapshot(nodes, state, executor, rootUID, clusterID))
 		t.Fatalf("before-ack insert: %v", err)
 	}
 	if _, err := apiA.Execute(ctx, network.ExecuteRequest{RequestID: "floci-create-compaction-" + suffix, SQL: "CREATE TABLE mutation_history (id INTEGER PRIMARY KEY, value TEXT)"}); err != nil {
+		t.Logf("logical_failure_snapshot=%s", collectLogicalAuthorityFailureSnapshot(nodes, state, executor, rootUID, clusterID))
 		t.Fatalf("create bounded mutation-history table: %v", err)
 	}
 	for i := range 70 {
 		requestID := fmt.Sprintf("floci-compaction-%s-%02d", suffix, i)
 		sql := fmt.Sprintf("INSERT INTO mutation_history(id, value) VALUES (%d, 'entry-%02d')", i+1, i)
 		if _, err := apiA.Execute(ctx, network.ExecuteRequest{RequestID: requestID, SQL: sql}); err != nil {
+			t.Logf("logical_failure_snapshot=%s", collectLogicalAuthorityFailureSnapshot(nodes, state, executor, rootUID, clusterID))
 			t.Fatalf("before-ack mutation %d/70: %v", i+1, err)
 		}
 	}
@@ -382,6 +386,7 @@ func TestFlociGCSLogicalAuthorityThreeNodeBeforeAckAndSamePodRestart(t *testing.
 	}
 	query, err := apiB.Query(ctx, network.QueryRequest{SQL: "SELECT value FROM lifecycle WHERE id = 1", Consistency: "linearizable"})
 	if err != nil || len(query.Rows) != 1 || len(query.Rows[0]) != 1 || query.Rows[0][0] != "durable" {
+		t.Logf("logical_failure_snapshot=%s", collectLogicalAuthorityFailureSnapshot(nodes, state, executor, rootUID, clusterID))
 		t.Fatalf("cross-node linearizable read: rows=%v err=%v", query.Rows, err)
 	}
 
@@ -422,18 +427,22 @@ func TestFlociGCSLogicalAuthorityThreeNodeBeforeAckAndSamePodRestart(t *testing.
 	}
 	afterRestart, err := restartedAPI.Query(ctx, network.QueryRequest{SQL: "SELECT value FROM lifecycle WHERE id = 1", Consistency: "linearizable"})
 	if err != nil || len(afterRestart.Rows) != 1 || len(afterRestart.Rows[0]) != 1 || afterRestart.Rows[0][0] != "durable" {
+		t.Logf("logical_failure_snapshot=%s", collectLogicalAuthorityFailureSnapshot(nodes, state, executor, rootUID, clusterID))
 		t.Fatalf("same-Pod continuation lost durable row: rows=%v err=%v", afterRestart.Rows, err)
 	}
 	history, err := restartedAPI.Query(ctx, network.QueryRequest{SQL: "SELECT COUNT(*) FROM mutation_history", Consistency: "linearizable"})
 	if err != nil || len(history.Rows) != 1 || len(history.Rows[0]) != 1 || history.Rows[0][0] != int64(70) && history.Rows[0][0] != float64(70) {
+		t.Logf("logical_failure_snapshot=%s", collectLogicalAuthorityFailureSnapshot(nodes, state, executor, rootUID, clusterID))
 		t.Fatalf("same-Pod continuation lost mutations across the compaction threshold: rows=%v err=%v", history.Rows, err)
 	}
 	if _, err := restartedAPI.Execute(ctx, network.ExecuteRequest{RequestID: "floci-restart-insert-" + suffix,
 		SQL: "INSERT INTO lifecycle(value) VALUES ('after-restart')"}); err != nil {
+		t.Logf("logical_failure_snapshot=%s", collectLogicalAuthorityFailureSnapshot(nodes, state, executor, rootUID, clusterID))
 		t.Fatalf("same-Pod continuation could not reuse the canonical source producer: %v", err)
 	}
 	continued, err := restartedAPI.Query(ctx, network.QueryRequest{SQL: "SELECT value FROM lifecycle ORDER BY id", Consistency: "linearizable"})
 	if err != nil || len(continued.Rows) != 2 || continued.Rows[1][0] != "after-restart" {
+		t.Logf("logical_failure_snapshot=%s", collectLogicalAuthorityFailureSnapshot(nodes, state, executor, rootUID, clusterID))
 		t.Fatalf("same-Pod continuation readback: rows=%v err=%v", continued.Rows, err)
 	}
 
