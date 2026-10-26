@@ -349,7 +349,14 @@ func verifyForkSnapshotConfig(ctx context.Context, snapshot *RecoverySnapshot, s
 }
 
 func verifyForkSnapshotWithMode(ctx context.Context, snapshot *RecoverySnapshot, seal quepaxa.CheckpointSeal, decision quepaxa.DecidedValue, checkpoints *checkpoint.Manager, bootstrap quepaxa.Cluster, reconfiguration bool) ([32]byte, error) {
+	return verifyForkSnapshotWithAnchor(ctx, snapshot, seal, decision, checkpoints, bootstrap, reconfiguration, nil, [32]byte{})
+}
+
+func verifyForkSnapshotWithAnchor(ctx context.Context, snapshot *RecoverySnapshot, seal quepaxa.CheckpointSeal, decision quepaxa.DecidedValue, checkpoints *checkpoint.Manager, bootstrap quepaxa.Cluster, reconfiguration bool, anchor *GenerationAnchor, anchorHash [32]byte) ([32]byte, error) {
 	var zero [32]byte
+	if snapshot == nil || len(bootstrap.Members) == 0 {
+		return zero, fmt.Errorf("fork verification requires a snapshot and bootstrap membership")
+	}
 	dir, err := os.MkdirTemp("", "rhiza-fork-verify-*")
 	if err != nil {
 		return zero, err
@@ -374,6 +381,28 @@ func verifyForkSnapshotWithMode(ctx context.Context, snapshot *RecoverySnapshot,
 		core.SetCheckpointValidator(func(ctx context.Context, candidate quepaxa.CheckpointSeal) error {
 			return checkpoints.Verify(ctx, uint64(candidate.Index), candidate.RootHash, candidate.StateHash)
 		})
+	}
+	if anchor != nil {
+		capturedAnchor, ok := snapshot.GenerationAnchor()
+		if !ok || capturedAnchor != anchorHash || anchorHash == ([32]byte{}) {
+			return zero, fmt.Errorf("fork verifier snapshot does not match generation anchor")
+		}
+		prefixHash, err := parseGenerationHash(anchor.SourcePrefixHash)
+		if err != nil {
+			return zero, err
+		}
+		rootHash, err := parseGenerationHash(anchor.Checkpoint.RootHash)
+		if err != nil {
+			return zero, err
+		}
+		if err := core.InstallFencedGenerationBase(ctx, quepaxa.FencedGenerationBase{
+			ConfigID: bootstrap.ConfigID, Index: quepaxa.Slot(anchor.SourceTip), PrefixHash: prefixHash,
+			RootHash: rootHash, AnchorHash: anchorHash,
+		}); err != nil {
+			return zero, err
+		}
+	}
+	if checkpoints != nil {
 		if err := core.RestoreCheckpointBase(ctx, seal, decision); err != nil {
 			return zero, err
 		}

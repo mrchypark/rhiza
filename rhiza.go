@@ -100,6 +100,9 @@ type Config struct {
 	ClusterID  string
 	NodeID     string
 	DataDir    string
+	// HAInitRestoreDir is an optional separate mount populated by the HA init
+	// restore process. It is never used by Local mode.
+	HAInitRestoreDir string
 	BindAddr   string
 	PeerAddr   string
 	AdminToken string
@@ -270,7 +273,7 @@ func executionConfig(config Config) (*types.ExecutionConfig, error) {
 	return &types.ExecutionConfig{
 		Local:     config.Local,
 		ClusterID: types.ClusterID(config.ClusterID), NodeID: types.NodeID(config.NodeID),
-		DataDir: config.DataDir, BindAddr: config.BindAddr, PeerAddr: config.PeerAddr,
+		DataDir: config.DataDir, HAInitRestoreDir: config.HAInitRestoreDir, BindAddr: config.BindAddr, PeerAddr: config.PeerAddr,
 		AdminToken: config.AdminToken, PeerToken: config.PeerToken, Members: config.Members, EnableReconfiguration: config.EnableReconfiguration,
 		// Reconfiguration remains available to ordinary embedded callers. The
 		// engine-owned REMOVE protocol is a separate supervised trust boundary.

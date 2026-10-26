@@ -39,6 +39,11 @@ type ExecutionConfig struct {
 	ClusterID  ClusterID `json:"cluster_id"`
 	NodeID     NodeID    `json:"node_id"`
 	DataDir    string    `json:"data_dir"`
+	// HAInitRestoreDir is an optional staging mount populated by the HA init
+	// restore process. It must be separate from DataDir; Node.Open adopts a
+	// staged checkpoint only for a clean first start after validating its
+	// archive and root evidence.
+	HAInitRestoreDir string `json:"ha_init_restore_dir,omitempty"`
 	BindAddr   string    `json:"bind_addr"`
 	PeerAddr   string    `json:"peer_addr"`
 	AdminToken string    `json:"admin_token"`
