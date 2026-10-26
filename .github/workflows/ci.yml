@@ -427,6 +427,11 @@ jobs:
           kind load docker-image rhiza-chaos:local rhiza-operator-chaos:local --name rhiza-operator-chaos
       - name: Inject faults and verify unattended Operator recovery
         run: python3 -u e2e/chaos/automatic_recovery.py --embedded-host "${{ matrix.host }}"
+      - name: Project allowlisted fence-stage diagnostics
+        if: always()
+        env:
+          FENCING_E2E_OUT: automatic-chaos-results
+        run: go run ./e2e/fencing project-fence-stage-diagnostics
       - name: Collect cluster diagnostics
         if: always()
         run: kind export logs automatic-chaos-results/kind --name rhiza-operator-chaos || true

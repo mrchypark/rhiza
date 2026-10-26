@@ -618,6 +618,234 @@ type supervisorRejectionDiagnostic struct {
 
 const maxRuntimeAgentDiagnostics = 20
 const maxSupervisorRejectionDiagnostics = 20
+const maxFenceStageDiagnostics = 32
+
+type fenceStageDiagnostic struct {
+	Stage string `json:"stage"`
+	Class string `json:"class"`
+}
+
+type fenceStageDiagnosticsView struct {
+	Version     int                    `json:"version"`
+	Status      string                 `json:"status"`
+	Diagnostics []fenceStageDiagnostic `json:"diagnostics"`
+	Truncated   bool                   `json:"truncated,omitempty"`
+}
+
+var allowedFenceDiagnosticStages = map[string]bool{
+	"root-close": true, "inventory": true, "producer-settlement": true, "runtime-collection": true,
+	"terminal-retention": true, "terminal-verification": true, "proof-validation": true,
+	"proof-status-write": true, "bootstrap-revalidation": true,
+}
+
+var allowedFenceDiagnosticClasses = map[string]bool{
+	"error": true, "pending": true, "timeout": true, "canceled": true,
+	"conflict": true, "unavailable": true, "permission": true,
+}
+
+type fenceStageLogSummary struct {
+	Captures []struct {
+		Component string `json:"component"`
+		Container string `json:"container"`
+		Logs      map[string]struct {
+			Captured bool   `json:"captured"`
+			Bytes    int64  `json:"bytes"`
+			SHA256   string `json:"sha256"`
+		} `json:"logs"`
+	} `json:"captures"`
+}
+
+type fenceStagePrivateRecord struct {
+	Captures []struct {
+		Identity struct {
+			Name string `json:"name"`
+			UID  string `json:"uid"`
+		} `json:"identity"`
+		Component string `json:"component"`
+		Container string `json:"container"`
+		Logs      map[string]struct {
+			Captured bool   `json:"captured"`
+			Bytes    int64  `json:"bytes"`
+			SHA256   string `json:"sha256"`
+		} `json:"logs"`
+	} `json:"captures"`
+}
+
+// projectFenceStageDiagnostics verifies the receipt for the private authority
+// log, then publishes only exact allowlisted stage/class pairs.
+func projectFenceStageDiagnostics(raw string) ([]byte, error) {
+	view := fenceStageDiagnosticsView{Version: 1, Status: "not_captured", Diagnostics: []fenceStageDiagnostic{}}
+	if raw == "" {
+		return nil, fmt.Errorf("fencer stage diagnostic output directory is required")
+	}
+	summaryPath := filepath.Join(raw, "startup-diagnostics-summary.json")
+	summaryInfo, err := os.Lstat(summaryPath)
+	if os.IsNotExist(err) {
+		return json.Marshal(view)
+	}
+	if err != nil || !summaryInfo.Mode().IsRegular() || summaryInfo.Mode()&os.ModeSymlink != 0 || summaryInfo.Size() > 1<<20 {
+		view.Status = "invalid_capture"
+		return json.Marshal(view)
+	}
+	summaryData, err := os.ReadFile(summaryPath)
+	if err != nil {
+		view.Status = "invalid_capture"
+		return json.Marshal(view)
+	}
+	var summary fenceStageLogSummary
+	if json.Unmarshal(summaryData, &summary) != nil {
+		view.Status = "invalid_capture"
+		return json.Marshal(view)
+	}
+	var logCaptured bool
+	var logBytes int64
+	var logSHA256 string
+	matchingCaptures := 0
+	foundLogReceipt := false
+	for i := range summary.Captures {
+		capture := &summary.Captures[i]
+		if capture.Component == "rhiza-fencer" && capture.Container == "authority" {
+			matchingCaptures++
+			if matchingCaptures > 1 {
+				view.Status = "invalid_capture"
+				return json.Marshal(view)
+			}
+			if current, ok := capture.Logs["current"]; ok {
+				logCaptured, logBytes, logSHA256 = current.Captured, current.Bytes, current.SHA256
+				foundLogReceipt = true
+			}
+		}
+	}
+	if matchingCaptures == 0 || !foundLogReceipt || !logCaptured {
+		return json.Marshal(view)
+	}
+	privateDir := filepath.Join(raw, "private-startup-diagnostics")
+	dirInfo, err := os.Lstat(privateDir)
+	if err != nil || !dirInfo.IsDir() || dirInfo.Mode()&os.ModeSymlink != 0 {
+		view.Status = "capture_mismatch"
+		return json.Marshal(view)
+	}
+	recordPath := filepath.Join(privateDir, "record.json")
+	recordInfo, err := os.Lstat(recordPath)
+	if err != nil || !recordInfo.Mode().IsRegular() || recordInfo.Mode()&os.ModeSymlink != 0 || recordInfo.Size() > 1<<20 {
+		view.Status = "capture_mismatch"
+		return json.Marshal(view)
+	}
+	recordData, err := os.ReadFile(recordPath)
+	if err != nil {
+		view.Status = "capture_mismatch"
+		return json.Marshal(view)
+	}
+	var record fenceStagePrivateRecord
+	if json.Unmarshal(recordData, &record) != nil {
+		view.Status = "capture_mismatch"
+		return json.Marshal(view)
+	}
+	var podName string
+	foundPrivateCapture := false
+	for i := range record.Captures {
+		capture := &record.Captures[i]
+		if capture.Component == "rhiza-fencer" && capture.Container == "authority" {
+			current, ok := capture.Logs["current"]
+			if !ok || foundPrivateCapture || capture.Identity.UID == "" || !validFenceStagePodName(capture.Identity.Name) || !current.Captured || current.Bytes != logBytes || current.SHA256 != logSHA256 {
+				view.Status = "invalid_capture"
+				return json.Marshal(view)
+			}
+			podName = capture.Identity.Name
+			foundPrivateCapture = true
+		}
+	}
+	if !foundPrivateCapture {
+		view.Status = "capture_mismatch"
+		return json.Marshal(view)
+	}
+	logName := podName + "-authority-current.log"
+	if filepath.Base(logName) != logName {
+		view.Status = "invalid_capture"
+		return json.Marshal(view)
+	}
+	logPath := filepath.Join(privateDir, logName)
+	logInfo, err := os.Lstat(logPath)
+	if err != nil || !logInfo.Mode().IsRegular() || logInfo.Mode()&os.ModeSymlink != 0 || logInfo.Size() > 32768 || logBytes < 0 || logInfo.Size() != logBytes {
+		view.Status = "capture_mismatch"
+		return json.Marshal(view)
+	}
+	logData, err := os.ReadFile(logPath)
+	if err != nil || len(logData) > 32768 || bytes.Count(logData, []byte("\n")) > 101 {
+		view.Status = "capture_mismatch"
+		return json.Marshal(view)
+	}
+	digest := sha256.Sum256(logData)
+	if hex.EncodeToString(digest[:]) != logSHA256 {
+		view.Status = "capture_mismatch"
+		return json.Marshal(view)
+	}
+	view.Status = "captured"
+	seen := make(map[string]bool)
+	for _, line := range strings.Split(string(logData), "\n") {
+		diagnostic, ok := parseFenceStageDiagnostic(line)
+		if !ok {
+			continue
+		}
+		key := diagnostic.Stage + "/" + diagnostic.Class
+		if seen[key] {
+			continue
+		}
+		seen[key] = true
+		if len(view.Diagnostics) == maxFenceStageDiagnostics {
+			view.Truncated = true
+			continue
+		}
+		view.Diagnostics = append(view.Diagnostics, diagnostic)
+	}
+	return json.Marshal(view)
+}
+
+func validFenceStagePodName(name string) bool {
+	if len(name) == 0 || len(name) > 253 || name[0] == '-' || name[len(name)-1] == '-' {
+		return false
+	}
+	for _, r := range name {
+		if !(r >= 'a' && r <= 'z' || r >= '0' && r <= '9' || r == '-') {
+			return false
+		}
+	}
+	return filepath.Base(name) == name
+}
+
+func parseFenceStageDiagnostic(line string) (fenceStageDiagnostic, bool) {
+	const marker = "fencing stage blocked: stage="
+	index := strings.Index(line, marker)
+	if index < 0 || !validSupervisorLogPrefix(line[:index]) {
+		return fenceStageDiagnostic{}, false
+	}
+	stage, classText, ok := strings.Cut(line[index+len(marker):], " class=")
+	if !ok {
+		return fenceStageDiagnostic{}, false
+	}
+	class := classText
+	if strings.ContainsAny(class, " \t\r") || !allowedFenceDiagnosticStages[stage] || !allowedFenceDiagnosticClasses[class] {
+		return fenceStageDiagnostic{}, false
+	}
+	return fenceStageDiagnostic{Stage: stage, Class: class}, true
+}
+
+func writeFenceStageDiagnostics(raw string) error {
+	data, err := projectFenceStageDiagnostics(raw)
+	if err != nil {
+		return err
+	}
+	if err := os.MkdirAll(raw, 0700); err != nil {
+		return err
+	}
+	path := filepath.Join(raw, "fencer-stage-diagnostics.json")
+	if info, err := os.Lstat(path); err == nil && (!info.Mode().IsRegular() || info.Mode()&os.ModeSymlink != 0) {
+		return fmt.Errorf("fencer stage diagnostic output is unsafe")
+	} else if err != nil && !os.IsNotExist(err) {
+		return fmt.Errorf("fencer stage diagnostic output is unavailable")
+	}
+	return os.WriteFile(path, data, 0600)
+}
 
 var allowedRuntimeAgentDiagnosticPairs = map[string]struct{}{
 	"authorization/token_missing":                              {},

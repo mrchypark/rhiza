@@ -1454,6 +1454,49 @@ func (e *FencingExecutor) Reconcile(ctx context.Context) error {
 	return errors.Join(failures...)
 }
 
+// logFenceStageDiagnostic emits only fixed stage and error-class values. Fence
+// errors can include object-store URLs, resource names, or provider details.
+func logFenceStageDiagnostic(stage string, err error) {
+	if err == nil {
+		return
+	}
+	switch stage {
+	case "root-close", "inventory", "producer-settlement", "runtime-collection", "terminal-retention", "terminal-verification", "proof-validation", "proof-status-write", "bootstrap-revalidation":
+	default:
+		stage = "other"
+	}
+	class := "error"
+	switch {
+	case errors.Is(err, ErrFencePending), errors.Is(err, fencing.ErrPending):
+		class = "pending"
+	case errors.Is(err, context.DeadlineExceeded):
+		class = "timeout"
+	case errors.Is(err, context.Canceled):
+		class = "canceled"
+	case errors.Is(err, errAuthorityStateConflict):
+		class = "conflict"
+	case errors.Is(err, fencing.ErrClosed):
+		class = "conflict"
+	case errors.Is(err, fencing.ErrUnavailable):
+		class = "unavailable"
+	default:
+		var statusErr interface{ HTTPStatusCode() int }
+		if errors.As(err, &statusErr) {
+			switch statusErr.HTTPStatusCode() {
+			case 401, 403:
+				class = "permission"
+			case 408, 504:
+				class = "timeout"
+			case 409, 412:
+				class = "conflict"
+			case 429, 500, 502, 503:
+				class = "unavailable"
+			}
+		}
+	}
+	log.Printf("fencing stage blocked: stage=%s class=%s", stage, class)
+}
+
 func (e *FencingExecutor) reconcileFence(ctx context.Context, endpoint string, record *fenceResource) error {
 	r := record.Spec
 	if err := validateRequest(&r); err != nil {
@@ -1502,10 +1545,12 @@ func (e *FencingExecutor) reconcileFence(ctx context.Context, endpoint string, r
 		return l.CloseNodes(r.OperationID, hash, nodes)
 	})
 	if err != nil {
+		logFenceStageDiagnostic("root-close", err)
 		return err
 	}
 	current, err := e.currentInventory(ctx, r.StatefulSetUID, nodes)
 	if err != nil {
+		logFenceStageDiagnostic("inventory", err)
 		return err
 	}
 	for _, target := range r.Targets {
@@ -1516,6 +1561,7 @@ func (e *FencingExecutor) reconcileFence(ctx context.Context, endpoint string, r
 			}
 		}
 		if !found {
+			logFenceStageDiagnostic("inventory", ErrFencePending)
 			return ErrFencePending
 		}
 	}
@@ -1525,22 +1571,28 @@ func (e *FencingExecutor) reconcileFence(ctx context.Context, endpoint string, r
 	if state.Ledger.RequireMutationJournal {
 		settled, err := e.closeMutationProducers(ctx, state, nodes)
 		if err != nil {
+			logFenceStageDiagnostic("producer-settlement", err)
 			return err
 		}
 		if !settled {
+			logFenceStageDiagnostic("producer-settlement", ErrFencePending)
 			return ErrFencePending
 		}
 		if r.BootstrapGenesis != nil {
 			closed, err := e.read(ctx, r.StatefulSetUID, r.SourceClusterID)
 			if err != nil {
+				logFenceStageDiagnostic("bootstrap-revalidation", err)
 				return err
 			}
 			if closed.Ledger.ClosedBy != r.OperationID || closed.Ledger.ClosedHash != hash {
+				logFenceStageDiagnostic("bootstrap-revalidation", fencing.ErrPending)
 				return fencing.ErrPending
 			}
 			candidate, targets, err := e.bootstrapGenesisFenceCandidate(ctx, r, closed, true)
 			if err != nil || r.BootstrapGenesis.CandidateDigest != hashJSON(candidate) || r.BootstrapGenesis.ClusterUID != candidate.ClusterUID || hashJSON(targets) != hashJSON(r.Targets) {
-				return errors.Join(err, fencing.ErrPending)
+				combined := errors.Join(err, fencing.ErrPending)
+				logFenceStageDiagnostic("bootstrap-revalidation", combined)
+				return combined
 			}
 		}
 		return e.independentFence(ctx, endpoint, record, r, sts, state, hash, nodes, current)
@@ -1550,7 +1602,11 @@ func (e *FencingExecutor) reconcileFence(ctx context.Context, endpoint string, r
 	}
 	proof := &FenceProof{OperationID: r.OperationID, SourceClusterID: r.SourceClusterID, BindingUID: r.BindingUID, RequestHash: hash, ProofID: "cooperative-" + hashJSON(state), ProcessesTerminated: true, RecreationBlocked: true, StorageQuiesced: true}
 	record.Status.Proof = proof
-	return e.Kube.Put(ctx, endpoint+"/"+url.PathEscape(str(record.Metadata["name"]))+"/status", record, nil)
+	if err := e.Kube.Put(ctx, endpoint+"/"+url.PathEscape(str(record.Metadata["name"]))+"/status", record, nil); err != nil {
+		logFenceStageDiagnostic("proof-status-write", err)
+		return err
+	}
+	return nil
 }
 
 // currentInventory lists the Pod UIDs in the fenced scope. An unsupported Pod
