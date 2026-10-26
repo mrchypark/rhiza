@@ -317,6 +317,8 @@ func TestS3MembershipReplacement(t *testing.T) {
 				case <-time.After(20 * time.Millisecond):
 				}
 			}
+			// Membership installation precedes the new configuration's readiness round.
+			membershipWaitReady(t, ctx, learner)
 			if _, err := learner.Execute(ctx, rhiza.ExecuteRequest{RequestID: "after-replacement", SQL: "INSERT INTO replacement VALUES (1)"}); err != nil {
 				t.Fatalf("new voter write: %v", err)
 			}

@@ -237,7 +237,8 @@ func (c *Core) allowsPendingReconfigurationLearnLocked(decision Decision) bool {
 		return false
 	}
 	if state.engineRemoval == nil {
-		return control.EngineRemoval == nil
+		return control.EngineRemoval == nil &&
+			(!control.Abort || reconfigurationAdds(c.clusterForSlotLocked(decision.Slot), state.target))
 	}
 	return !control.Abort && control.EngineRemoval != nil &&
 		sameEngineRemoval(*state.engineRemoval, *control.EngineRemoval, true) &&

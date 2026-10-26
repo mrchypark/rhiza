@@ -290,6 +290,18 @@ func TestNodePendingReconfigurationDoesNotRejectValidPeerLearn(t *testing.T) {
 	if err := json.Unmarshal(terminal.Value[len("QRCF\x00"):], &changedControl); err != nil {
 		t.Fatalf("decode terminal control for negative case: %v", err)
 	}
+	changedControl.Abort = true
+	abortPayload, err := json.Marshal(changedControl)
+	if err != nil {
+		t.Fatal(err)
+	}
+	abortRemoval := terminalDecision
+	abortRemoval.Proposal.Value = append([]byte("QRCF\x00"), abortPayload...)
+	abortRemoval.Proposal.Hash = quepaxa.ValueHash(sha256.Sum256(abortRemoval.Proposal.Value))
+	if node.peerLearnDecisionAllowed(abortRemoval) {
+		t.Fatal("pending-Learn exception admitted an abort of ordinary removal")
+	}
+	changedControl.Abort = false
 	changedControl.Target.ConfigID++
 	changedPayload, err := json.Marshal(changedControl)
 	if err != nil {
