@@ -328,6 +328,15 @@ jobs:
           go build -o "$RUNNER_TEMP/chaos-images/rhiza-fencer" ./cmd/rhiza-fencer
           go build -o "$RUNNER_TEMP/chaos-images/rhiza-runtime-agent" ./cmd/rhiza-runtime-agent
           docker build -f e2e/chaos/Dockerfile --build-arg BINARY=rhiza -t rhiza-chaos:local "$RUNNER_TEMP/chaos-images"
+          docker build -f Dockerfile.operator --target peer-admission-test -t rhiza-operator-peer-admission:local .
+          docker run --rm --entrypoint /bin/sh rhiza-operator-peer-admission:local -ec '
+            test -x /usr/local/bin/fencing-e2e
+            if /usr/local/bin/fencing-e2e peer-admission-probe </dev/null >/dev/null 2>&1; then
+              exit 1
+            else
+              test "$?" -eq 1
+            fi
+          '
           docker build -f e2e/chaos/Dockerfile --build-arg BINARY=operator -t rhiza-operator-chaos:local "$RUNNER_TEMP/chaos-images"
           kind create cluster --name rhiza-operator-chaos --wait 120s
           kind load docker-image rhiza-chaos:local rhiza-operator-chaos:local --name rhiza-operator-chaos

@@ -155,9 +155,9 @@ func TestEngineRepairPreflightContinuesSavedAssignmentBeforeWALCreation(t *testi
 	if err != nil || !assigned {
 		t.Fatalf("saved assignment was not accepted for fresh physical RunID: assigned=%t err=%v", assigned, err)
 	}
-	proposal, needed, err := EngineRepairPreflight(config)(ctx, physicalRestart)
-	if err != nil || needed || proposal.CandidateIdentity.NodeID != "" {
-		t.Fatalf("pre-WAL retry created a new old-voter request: needed=%t proposal=%+v err=%v", needed, proposal, err)
+	result, err := EngineRepairPreflight(config)(ctx, physicalRestart)
+	if err != nil || result.InitialRegistration || result.PendingEngineRepair != nil {
+		t.Fatalf("pre-WAL retry created a new old-voter request: result=%+v err=%v", result, err)
 	}
 }
 
@@ -209,9 +209,10 @@ func TestEngineRepairPreflightReadsWriterMembershipKeyWhenLocalNoPVCStateIsAbsen
 	lost.DataDir = t.TempDir() // NoPVC replacement: both local voter identity and WAL are absent.
 	physical := fencing.Identity{SourceClusterID: string(config.ClusterID), NodeID: string(config.NodeID),
 		PodName: "rhiza-0", PodUID: "replacement-pod-uid", RunID: "replacement-supervisor-run"}
-	proposal, needed, err := EngineRepairPreflight(&lost)(ctx, physical)
-	if err != nil || !needed {
-		t.Fatalf("NoPVC replacement did not produce a pending repair proposal: needed=%t err=%v", needed, err)
+	result, err := EngineRepairPreflight(&lost)(ctx, physical)
+	proposal := result.PendingEngineRepair
+	if err != nil || proposal == nil || result.InitialRegistration {
+		t.Fatalf("NoPVC replacement did not produce a pending repair proposal: result=%+v err=%v", result, err)
 	}
 	if proposal.OldMemberID != string(config.NodeID) || proposal.OldWALIdentity != firstIdentity.Nonce ||
 		proposal.CandidateIdentity.PodUID != physical.PodUID {
@@ -221,8 +222,8 @@ func TestEngineRepairPreflightReadsWriterMembershipKeyWhenLocalNoPVCStateIsAbsen
 	firstBoot := *config
 	firstBoot.DataDir = t.TempDir()
 	firstBoot.ObjStoreDir = filepath.Join(t.TempDir(), "empty-archive")
-	firstBootProposal, firstBootNeeded, err := EngineRepairPreflight(&firstBoot)(ctx, physical)
-	if err != nil || firstBootNeeded {
-		t.Fatalf("genuinely absent genesis was not treated as initial enrollment: needed=%t proposal=%+v err=%v", firstBootNeeded, firstBootProposal, err)
+	firstBootResult, err := EngineRepairPreflight(&firstBoot)(ctx, physical)
+	if err != nil || firstBootResult.InitialRegistration || firstBootResult.PendingEngineRepair != nil {
+		t.Fatalf("genuinely absent genesis was not treated as ordinary first startup: result=%+v err=%v", firstBootResult, err)
 	}
 }

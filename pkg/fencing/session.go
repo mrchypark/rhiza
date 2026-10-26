@@ -23,6 +23,7 @@ type Session struct {
 	mu                  sync.Mutex
 	identity            Identity
 	role                StartupRole
+	initialRegistration *InitialRegistrationProvenance
 	startupEnvironment  map[string]string
 	expectedWALIdentity string
 	replacedNodeID      string
@@ -58,6 +59,10 @@ func Connect(ctx context.Context, socketPath, ticket, sourceClusterID, nodeID st
 		return nil, fmt.Errorf("fencing: startup grant logical identity differs from child configuration")
 	}
 	s.identity, s.role = grant.Identity, grant.Role
+	if grant.InitialRegistration != nil {
+		copy := *grant.InitialRegistration
+		s.initialRegistration = &copy
+	}
 	s.startupEnvironment = make(map[string]string, len(grant.Environment))
 	for key, value := range grant.Environment {
 		s.startupEnvironment[key] = value
@@ -88,6 +93,17 @@ func (s *Session) StartupRole() StartupRole {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return s.role
+}
+
+// InitialRegistration returns the authority-issued first-use metadata for
+// this exact Run. It is absent for ordinary active voters and repair learners.
+func (s *Session) InitialRegistration() (InitialRegistrationProvenance, bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.initialRegistration == nil {
+		return InitialRegistrationProvenance{}, false
+	}
+	return *s.initialRegistration, true
 }
 
 func (s *Session) ExpectedWALIdentity() (string, string, string) {

@@ -460,9 +460,6 @@ func (s *PeerServer) handle(ctx context.Context, certificateKey ed25519.PublicKe
 		}
 		return &peerfb.ResponseT{Summary: summaryToWire(summary)}, nil
 	case peerfb.OperationLearned:
-		if !s.server.PeerLearnReady() {
-			return nil, ErrNotReady
-		}
 		decision, err := decisionFromWire(request.Decision)
 		if err != nil {
 			return nil, err
@@ -471,6 +468,14 @@ func (s *PeerServer) handle(ctx context.Context, certificateKey ed25519.PublicKe
 			if err := types.ValidateExecutionPolicy(decision.Proposal.Value); err != nil {
 				return nil, err
 			}
+		}
+		// Bind this request to the exact locally observed pending transition
+		// before any catch-up I/O. A later gate check alone could admit the same
+		// decision under a different transition that appeared while catch-up
+		// was blocked.
+		gapKey, capturedGap := s.server.core.PendingTerminalGapForLearn(decision)
+		if !s.server.PeerLearnReady() && !s.server.PeerLearnDecisionAllowed(decision) {
+			return nil, ErrNotReady
 		}
 		control, controlErr := quepaxa.DecodeReconfiguration(decision.Proposal.Value)
 		if control && localtesthooks.Enabled {
@@ -533,6 +538,16 @@ func (s *PeerServer) handle(ctx context.Context, certificateKey ed25519.PublicKe
 			if localtesthooks.Enabled {
 				localtesthooks.Hit(fmt.Sprintf("network:learned-control:phase=catchup-complete:node=%s:sender=%s:slot=%d", s.server.core.NodeID(), request.SenderId, decision.Slot))
 			}
+		}
+		// Catch-up may block while the local reconfiguration, lifecycle, or
+		// fencing state changes. Revalidate the same authenticated decision
+		// immediately before normal certificate validation and durable accept.
+		if capturedGap && !s.server.core.PendingTerminalGap(gapKey) &&
+			!s.server.core.AllowsInstalledTerminalLearn(decision) {
+			return nil, ErrNotReady
+		}
+		if !s.server.PeerLearnReady() && !s.server.PeerLearnDecisionAllowed(decision) {
+			return nil, ErrNotReady
 		}
 		if localtesthooks.Enabled {
 			localtesthooks.Hit(fmt.Sprintf("network:learned:phase=accept-start:node=%s:sender=%s:slot=%d", s.server.core.NodeID(), request.SenderId, decision.Slot))

@@ -34,67 +34,117 @@ type engineRepairCandidateDescriptor struct {
 // EngineRepairPreflight makes a repeatable, unauthorised proposal only for a
 // registered voter whose WAL manifest is genuinely absent.
 func EngineRepairPreflight(config *types.ExecutionConfig) fencing.EngineRepairPreflight {
-	return func(ctx context.Context, physical fencing.Identity) (fencing.PendingEngineRepairProposal, bool, error) {
+	return func(ctx context.Context, physical fencing.Identity) (fencing.StartupPreflightResult, error) {
 		if config == nil || !config.EnableReconfiguration || !config.EngineOwnedRemovals || len(config.Members) < 2 || physical.PodName == "" {
-			return fencing.PendingEngineRepairProposal{}, false, nil
+			return fencing.StartupPreflightResult{}, nil
 		}
 		local, err := loadVoterIdentity(config)
 		if local.identity != nil && local.identity.Node != string(config.NodeID) {
 			if err != nil {
-				return fencing.PendingEngineRepairProposal{}, false, err
+				return fencing.StartupPreflightResult{}, err
 			}
 			descriptor, ok, descriptorErr := loadEngineRepairCandidateRestart(config, physical, local)
 			if descriptorErr != nil {
-				return fencing.PendingEngineRepairProposal{}, false, descriptorErr
+				return fencing.StartupPreflightResult{}, descriptorErr
 			}
 			if !ok {
-				return fencing.PendingEngineRepairProposal{}, false, fmt.Errorf("%w: local voter identity differs from configured source member", ErrVoterStateLost)
+				return fencing.StartupPreflightResult{}, fmt.Errorf("%w: local voter identity differs from configured source member", ErrVoterStateLost)
 			}
 			remote, exists, remoteErr := readRemoteVoterIdentity(ctx, config)
 			if remoteErr != nil {
-				return fencing.PendingEngineRepairProposal{}, false, remoteErr
+				return fencing.StartupPreflightResult{}, remoteErr
 			}
 			if !exists || remote != descriptor.OldIdentity {
-				return fencing.PendingEngineRepairProposal{}, false, fmt.Errorf("%w: candidate descriptor does not match the immutable source voter registration", ErrVoterStateLost)
+				return fencing.StartupPreflightResult{}, fmt.Errorf("%w: candidate descriptor does not match the immutable source voter registration", ErrVoterStateLost)
 			}
 			// The authority resolves this authenticated physical Pod against the
 			// persisted assignment and creates a fresh RunID continuation. The
 			// original descriptor RunID is history, not a restart restriction.
-			return fencing.PendingEngineRepairProposal{}, false, nil
+			return fencing.StartupPreflightResult{}, nil
 		}
 		if errors.Is(err, ErrVoterWALLost) {
-			return buildLostWALProposal(config, physical, local)
+			proposal, needed, err := buildLostWALProposal(config, physical, local)
+			return fencing.StartupPreflightResult{PendingEngineRepair: proposalPointer(proposal, needed)}, err
 		}
 		if err != nil {
-			return fencing.PendingEngineRepairProposal{}, false, err
+			return fencing.StartupPreflightResult{}, err
 		}
 		if local.identity != nil {
 			want := *local.identity
 			want.Nonce, want.Registered = "", false
 			if local.identity.Cluster != string(config.ClusterID) || local.identity.Node != string(config.NodeID) || want != voterIdentityFor(config) {
-				return fencing.PendingEngineRepairProposal{}, false, fmt.Errorf("%w: local voter identity differs from cluster or store configuration", ErrVoterStateLost)
+				return fencing.StartupPreflightResult{}, fmt.Errorf("%w: local voter identity differs from cluster or store configuration", ErrVoterStateLost)
 			}
-			return fencing.PendingEngineRepairProposal{}, false, nil
+			return fencing.StartupPreflightResult{}, nil
 		}
-		remote, exists, err := readRemoteVoterIdentity(ctx, config)
+		state, err := readRemoteVoterState(ctx, config)
 		if err != nil {
-			return fencing.PendingEngineRepairProposal{}, false, err
+			return fencing.StartupPreflightResult{}, err
 		}
-		if exists {
+		if state.membershipPresent && state.identity == nil {
+			if local.hadWAL {
+				return fencing.StartupPreflightResult{}, fmt.Errorf("%w: local WAL exists without its immutable voter identity", ErrVoterStateLost)
+			}
+			pristine, err := initialVoterLocalStateIsPristine(config, local)
+			if err != nil {
+				return fencing.StartupPreflightResult{}, err
+			}
+			if !pristine || physical.SourceClusterID != string(config.ClusterID) || physical.NodeID != string(config.NodeID) || physical.PodName == "" || physical.PodUID == "" || physical.RunID == "" {
+				return fencing.StartupPreflightResult{}, fmt.Errorf("%w: first-registration local state is not pristine", ErrVoterStateLost)
+			}
+			return fencing.StartupPreflightResult{InitialRegistration: true}, nil
+		}
+		if state.identity != nil {
+			remote := *state.identity
 			assigned, restartErr := loadUnboundEngineRepairCandidateRestart(ctx, config, physical, local, remote)
 			if restartErr != nil {
-				return fencing.PendingEngineRepairProposal{}, false, restartErr
+				return fencing.StartupPreflightResult{}, restartErr
 			}
 			if assigned {
 				// The saved descriptor plus absent candidate identity/WAL is the
 				// pre-WAL state of an existing assignment, not a new old-voter loss.
 				// Let the authority continue that exact candidate with this RunID.
-				return fencing.PendingEngineRepairProposal{}, false, nil
+				return fencing.StartupPreflightResult{}, nil
 			}
-			return buildLostWALProposal(config, physical, localVoterState{identity: &remote, hadWAL: local.hadWAL})
+			proposal, needed, err := buildLostWALProposal(config, physical, localVoterState{identity: &remote, hadWAL: local.hadWAL})
+			return fencing.StartupPreflightResult{PendingEngineRepair: proposalPointer(proposal, needed)}, err
 		}
-		return fencing.PendingEngineRepairProposal{}, false, nil
+		return fencing.StartupPreflightResult{}, nil
 	}
+}
+
+func proposalPointer(proposal fencing.PendingEngineRepairProposal, needed bool) *fencing.PendingEngineRepairProposal {
+	if !needed {
+		return nil
+	}
+	return &proposal
+}
+
+func initialVoterLocalStateIsPristine(config *types.ExecutionConfig, local localVoterState) (bool, error) {
+	if config == nil || local.identity != nil || local.hadWAL {
+		return false, nil
+	}
+	entries, err := os.ReadDir(config.DataDir)
+	if errors.Is(err, os.ErrNotExist) {
+		return true, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	for _, entry := range entries {
+		// Only an empty, real qlog directory is harmless first-start preparation.
+		if entry.Name() != "qlog" || !entry.IsDir() {
+			return false, nil
+		}
+		children, err := os.ReadDir(filepath.Join(config.DataDir, entry.Name()))
+		if err != nil {
+			return false, err
+		}
+		if len(children) != 0 {
+			return false, nil
+		}
+	}
+	return true, nil
 }
 
 func loadUnboundEngineRepairCandidateRestart(ctx context.Context, config *types.ExecutionConfig, physical fencing.Identity, local localVoterState, source voterIdentity) (bool, error) {
@@ -318,7 +368,12 @@ func buildLostWALProposal(config *types.ExecutionConfig, physical fencing.Identi
 		CandidateIdentity: descriptor.Candidate, CandidateMember: descriptor.Member}, true, nil
 }
 
-func readRemoteVoterIdentity(ctx context.Context, config *types.ExecutionConfig) (voterIdentity, bool, error) {
+type remoteVoterState struct {
+	membershipPresent bool
+	identity          *voterIdentity
+}
+
+func readRemoteVoterState(ctx context.Context, config *types.ExecutionConfig) (remoteVoterState, error) {
 	provider := objmetrics.Provider(config.ObjStoreProvider)
 	if provider == "" {
 		provider = objmetrics.ProviderS3
@@ -334,16 +389,16 @@ func readRemoteVoterIdentity(ctx context.Context, config *types.ExecutionConfig)
 		AzureConnectionString: config.ObjStoreAzureConnectionString, AzureUserAssignedID: config.ObjStoreAzureUserAssignedID,
 	})
 	if err != nil {
-		return voterIdentity{}, false, err
+		return remoteVoterState{}, err
 	}
 	defer bucket.Close()
 	genesisKey := voterMembershipRegistrationKey(config)
 	genesis, err := readVoterRegistration(ctx, bucket, genesisKey)
 	if err != nil {
-		return voterIdentity{}, false, err
+		return remoteVoterState{}, err
 	}
 	if genesis == nil {
-		return voterIdentity{}, false, nil
+		return remoteVoterState{}, nil
 	}
 	var membership recovery.MembershipRecord
 	decoder := json.NewDecoder(bytes.NewReader(genesis))
@@ -351,36 +406,52 @@ func readRemoteVoterIdentity(ctx context.Context, config *types.ExecutionConfig)
 	wantMembership := recovery.NewMembershipRecord(string(config.ClusterID), config.Members, string(config.ObjStoreDurability))
 	if decoder.Decode(&membership) != nil || decoder.Decode(new(any)) != io.EOF || membership.Version != recovery.MembershipRecordVersion ||
 		membership.Cluster != string(config.ClusterID) || membership.Membership != wantMembership.Membership || membership.Durability != wantMembership.Durability {
-		return voterIdentity{}, false, fmt.Errorf("%w: immutable remote membership differs from configuration", ErrVoterStateLost)
+		return remoteVoterState{}, fmt.Errorf("%w: immutable remote membership differs from configuration", ErrVoterStateLost)
 	}
 	canonical, err := json.Marshal(membership)
 	if err != nil || !bytes.Equal(canonical, genesis) {
-		return voterIdentity{}, false, fmt.Errorf("%w: immutable remote membership is not canonical", ErrVoterStateLost)
+		return remoteVoterState{}, fmt.Errorf("%w: immutable remote membership is not canonical", ErrVoterStateLost)
 	}
+	state := remoteVoterState{membershipPresent: true}
 	key := voterIdentityRegistrationKey(config, string(config.NodeID))
 	data, err := readVoterRegistration(ctx, bucket, key)
 	if err != nil {
-		return voterIdentity{}, false, err
+		return remoteVoterState{}, err
 	}
 	if data == nil {
-		return voterIdentity{}, false, fmt.Errorf("%w: remote membership exists without this voter's immutable registration", ErrVoterStateLost)
+		return state, nil
 	}
 	var identity voterIdentity
 	decoder = json.NewDecoder(bytes.NewReader(data))
 	decoder.DisallowUnknownFields()
 	if decoder.Decode(&identity) != nil || decoder.Decode(new(any)) != io.EOF || identity.Version != voterIdentityVersion ||
 		identity.Cluster != string(config.ClusterID) || identity.Node != string(config.NodeID) || !identity.Registered {
-		return voterIdentity{}, false, fmt.Errorf("%w: immutable remote voter identity is invalid", ErrVoterStateLost)
+		return remoteVoterState{}, fmt.Errorf("%w: immutable remote voter identity is invalid", ErrVoterStateLost)
 	}
 	if _, err := hex.DecodeString(identity.Nonce); err != nil || len(identity.Nonce) != 64 {
-		return voterIdentity{}, false, fmt.Errorf("%w: immutable remote WAL identity is invalid", ErrVoterStateLost)
+		return remoteVoterState{}, fmt.Errorf("%w: immutable remote WAL identity is invalid", ErrVoterStateLost)
 	}
 	want := voterIdentityFor(config)
 	want.Nonce, want.Registered = identity.Nonce, true
 	if want != identity {
-		return voterIdentity{}, false, fmt.Errorf("%w: immutable remote voter identity differs from configuration", ErrVoterStateLost)
+		return remoteVoterState{}, fmt.Errorf("%w: immutable remote voter identity differs from configuration", ErrVoterStateLost)
 	}
-	return identity, true, nil
+	state.identity = &identity
+	return state, nil
+}
+
+func readRemoteVoterIdentity(ctx context.Context, config *types.ExecutionConfig) (voterIdentity, bool, error) {
+	state, err := readRemoteVoterState(ctx, config)
+	if err != nil {
+		return voterIdentity{}, false, err
+	}
+	if !state.membershipPresent {
+		return voterIdentity{}, false, nil
+	}
+	if state.identity == nil {
+		return voterIdentity{}, false, fmt.Errorf("%w: remote membership exists without this voter's immutable registration", ErrVoterStateLost)
+	}
+	return *state.identity, true, nil
 }
 
 func statefulOrdinal(podName string) (int, error) {

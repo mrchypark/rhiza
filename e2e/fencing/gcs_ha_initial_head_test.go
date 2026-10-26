@@ -1126,15 +1126,42 @@ func TestWaitForGCSInitialHeadRecoveryDoesNotAcceptPendingFence(t *testing.T) {
 		t.Fatal(err)
 	}
 	t.Setenv("PATH", tmp+string(os.PathListSeparator)+os.Getenv("PATH"))
-	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
+	// Cancel after a second inventory attempt: the first pending fence has
+	// then been processed, independent of subprocess scheduling speed.
+	observerDone := make(chan struct{})
+	go func() {
+		defer close(observerDone)
+		ticker := time.NewTicker(10 * time.Millisecond)
+		defer ticker.Stop()
+		guard := time.NewTimer(10 * time.Second)
+		defer guard.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-guard.C:
+				cancel()
+				return
+			case <-ticker.C:
+				data, _ := os.ReadFile(logPath)
+				if strings.Count(string(data), "get rhizafences") >= 2 {
+					cancel()
+					return
+				}
+			}
+		}
+	}()
 	source := gcsRecoverySource{Namespace: namespace, ClusterID: "source", StatefulSet: "rhiza", StatefulSetUID: "sts-uid", BindingUID: "binding-uid", LogicalID: "logical"}
 	gotRequest, gotProof, gotRecovery, _, err := waitForGCSInitialHeadRecovery(ctx, source, obj{"metadata": obj{"name": "cluster", "uid": "cluster-uid"}}, nil)
-	if !errors.Is(err, context.DeadlineExceeded) || gotRequest.OperationID != request.OperationID || gotProof.OperationID != "" || gotRecovery.Status.Phase != "" {
+	cancel()
+	<-observerDone
+	if !errors.Is(err, context.Canceled) || gotRequest.OperationID != request.OperationID || gotProof.OperationID != "" || gotRecovery.Status.Phase != "" {
 		t.Fatalf("pending fence was treated as completed recovery: request=%+v proof=%+v recovery=%+v err=%v", gotRequest, gotProof, gotRecovery, err)
 	}
 	logBytes, err := os.ReadFile(logPath)
-	if err != nil || !strings.Contains(string(logBytes), "get rhizafences") || strings.Contains(string(logBytes), "get rhizarecoveries") {
+	if err != nil || strings.Count(string(logBytes), "get rhizafences") < 2 || strings.Contains(string(logBytes), "get rhizarecoveries") {
 		t.Fatalf("pending fence advanced past canonical proof/status gating: log=%s err=%v", logBytes, err)
 	}
 }

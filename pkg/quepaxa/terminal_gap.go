@@ -1,6 +1,9 @@
 package quepaxa
 
-import "crypto/sha256"
+import (
+	"bytes"
+	"crypto/sha256"
+)
 
 // TerminalGapKey identifies one locally known, pending reconfiguration
 // terminal. It is an observation key, not authority to accept the terminal.
@@ -131,4 +134,130 @@ func (c *Core) PendingTerminalGap(key TerminalGapKey) bool {
 	state := c.reconfiguration
 	return state != nil && state.freeze == key.Freeze && state.terminal == key.Terminal &&
 		state.id == key.FreezeHash && c.clusterForSlotLocked(state.freeze).ConfigID == key.ConfigID
+}
+
+// AllowsPendingReconfigurationLearn admits only the locally frozen old-config
+// prefix and its exact terminal. The normal AcceptDecision path still verifies
+// the decision certificate and applies it durably.
+func (c *Core) AllowsPendingReconfigurationLearn(decision Decision) bool {
+	if c == nil {
+		return false
+	}
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.allowsPendingReconfigurationLearnLocked(decision)
+}
+
+// PendingTerminalGapForLearn atomically captures the pending transition that
+// admits decision. The returned key is an observation that must be rechecked
+// after any blocking catch-up and immediately before accepting the decision.
+func (c *Core) PendingTerminalGapForLearn(decision Decision) (TerminalGapKey, bool) {
+	if c == nil {
+		return TerminalGapKey{}, false
+	}
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	if !c.allowsPendingReconfigurationLearnLocked(decision) {
+		return TerminalGapKey{}, false
+	}
+	state := c.reconfiguration
+	return TerminalGapKey{
+		ConfigID:   c.clusterForSlotLocked(state.freeze).ConfigID,
+		Freeze:     state.freeze,
+		Terminal:   state.terminal,
+		FreezeHash: state.id,
+	}, true
+}
+
+func (c *Core) allowsPendingReconfigurationLearnLocked(decision Decision) bool {
+	if decision.Slot == 0 || len(decision.Proposal.Value) == 0 ||
+		decision.Proposal.Hash != ValueHash(sha256.Sum256(decision.Proposal.Value)) {
+		return false
+	}
+	state := c.reconfiguration
+	if state == nil || state.freeze == 0 || state.terminal <= state.freeze ||
+		decision.Slot < state.freeze || decision.Slot > state.terminal ||
+		decision.ConfigID != c.clusterForSlotLocked(state.freeze).ConfigID {
+		return false
+	}
+
+	freeze, exists := c.decided[state.freeze]
+	if !exists || !c.durable[state.freeze] || freeze.Hash != state.id ||
+		sha256.Sum256(freeze.Value) != [32]byte(state.id) {
+		return false
+	}
+	freezeControl, isControl, err := decodeReconfiguration(freeze.Value)
+	if err != nil || !isControl || freezeControl.Terminal || freezeControl.Abort ||
+		freezeControl.Freeze != state.freeze || freezeControl.TerminalSlot != state.terminal ||
+		!sameCluster(freezeControl.Target, state.target) {
+		return false
+	}
+
+	control, isControl, err := decodeReconfiguration(decision.Proposal.Value)
+	if err != nil {
+		return false
+	}
+	if decision.Slot < state.terminal {
+		if decision.Slot == state.freeze {
+			return isControl && decision.Proposal.Hash == freeze.Hash && bytes.Equal(decision.Proposal.Value, freeze.Value)
+		}
+		if isControl && (control.Terminal || control.Abort) {
+			return false
+		}
+		// The frozen old-config drain is bounded by this locally certified
+		// terminal. Permit sparse delivery inside that exact interval; the
+		// ordinary AcceptDecision path still verifies the certificate and
+		// buffers/replays decisions in slot order.
+		return decision.Slot <= state.terminal-1
+	}
+	if !isControl || !control.Terminal || control.Freeze != state.freeze ||
+		control.TerminalSlot != state.terminal ||
+		(c.tip >= state.terminal-1 && control.PrefixHash != c.prefixes[state.terminal-1]) ||
+		!sameCluster(control.Target, state.target) {
+		return false
+	}
+	if state.engineRemoval == nil {
+		return control.EngineRemoval == nil
+	}
+	return !control.Abort && control.EngineRemoval != nil &&
+		sameEngineRemoval(*state.engineRemoval, *control.EngineRemoval, true) &&
+		control.EngineRemoval.FreezeHash == state.id &&
+		control.EngineRemoval.StorageEffectsExcludedHash != (ValueHash{})
+}
+
+// AllowsInstalledTerminalLearn permits an exact retry of a terminal already
+// installed on this Core while the Node re-establishes readiness. It does not
+// authorize a different decision or any subsequent mutation.
+func (c *Core) AllowsInstalledTerminalLearn(decision Decision) bool {
+	if c == nil || decision.Slot == 0 || len(decision.Proposal.Value) == 0 ||
+		decision.Proposal.Hash != ValueHash(sha256.Sum256(decision.Proposal.Value)) {
+		return false
+	}
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	installed, exists := c.decided[decision.Slot]
+	if !exists || !c.durable[decision.Slot] || installed.Hash != decision.Proposal.Hash ||
+		!bytes.Equal(installed.Value, decision.Proposal.Value) {
+		return false
+	}
+	configID, stored, err := decodeCertificate(installed.Certificate)
+	if err != nil || configID != decision.ConfigID || stored.Slot != decision.Slot ||
+		stored.Proposal.Hash != decision.Proposal.Hash {
+		return false
+	}
+	expectedCertificate, err := encodeCertificate(configID, decision)
+	if err != nil || !bytes.Equal(installed.Certificate, expectedCertificate) {
+		return false
+	}
+	control, ok, err := decodeReconfiguration(installed.Value)
+	if err != nil || !ok || !control.Terminal || control.TerminalSlot != decision.Slot || control.Freeze == 0 ||
+		c.clusterForSlotLocked(control.TerminalSlot).ConfigID != configID {
+		return false
+	}
+	old := c.clusterForSlotLocked(control.TerminalSlot)
+	if control.Abort {
+		return control.EngineRemoval == nil && reconfigurationAdds(old, control.Target) &&
+			sameCluster(c.clusterForSlotLocked(control.TerminalSlot+1), old)
+	}
+	return sameCluster(c.clusterForSlotLocked(control.TerminalSlot+1), control.Target)
 }

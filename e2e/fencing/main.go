@@ -57,7 +57,11 @@ type obj = map[string]any
 
 func main() {
 	if len(os.Args) != 2 {
-		fatal(fmt.Errorf("usage: fencing-e2e manifests|local-cooperative-store-secret|wait-source|run|run-gcs-ha|run-gcs-ha-explicit|run-gcs-ha-ordinary-recovery|run-gcs-ha-async-empty|run-gcs-ha-async-empty-explicit|run-gcs-ha-async-nonempty|run-gcs-ha-manual-terminal|run-gcs-ha-missing-membership|run-gcs-ha-ack-loss|run-gcs-ha-dead-pod|run-gcs-ha-mixed-pending|prepare-gcs-ha-initial-head-ack-loss|cleanup-gcs-ha-initial-head-ack-loss|run-gcs-ha-initial-head-ack-loss|runtime-probe|runtime-agent-request"))
+		fatal(fmt.Errorf("usage: fencing-e2e manifests|local-cooperative-store-secret|wait-source|run|run-gcs-ha|run-gcs-ha-explicit|run-gcs-ha-ordinary-recovery|run-gcs-ha-async-empty|run-gcs-ha-async-empty-explicit|run-gcs-ha-async-nonempty|run-gcs-ha-manual-terminal|run-gcs-ha-missing-membership|run-gcs-ha-ack-loss|run-gcs-ha-dead-pod|run-gcs-ha-mixed-pending|prepare-gcs-ha-initial-head-ack-loss|cleanup-gcs-ha-initial-head-ack-loss|run-gcs-ha-initial-head-ack-loss|runtime-probe|runtime-agent-request|peer-admission-probe"))
+	}
+	if os.Args[1] == "peer-admission-probe" {
+		fatal(runPeerAdmissionProbeCommand())
+		return
 	}
 	if isGCSMixedPendingSelected(os.Args[1], strings.TrimSpace(os.Getenv(gcsHAScenarioEnv))) {
 		fatal(runGCSMixedPendingCommand(configureGCSMixedPending, qualifyGCSMixedPending))

@@ -36,9 +36,11 @@ func (supervisorRegistrationAgentAuth) Authenticate(_ context.Context, token str
 	}, nil
 }
 
-type supervisorRegistrationAgentBackend struct{}
+type supervisorRegistrationAgentBackend struct {
+	beforeReturn func(context.Context, fencing.RuntimeBinding) error
+}
 
-func (supervisorRegistrationAgentBackend) Enroll(_ context.Context, base fencing.RuntimeBinding) (fencing.RuntimeBinding, json.RawMessage, error) {
+func (b *supervisorRegistrationAgentBackend) Enroll(ctx context.Context, base fencing.RuntimeBinding) (fencing.RuntimeBinding, json.RawMessage, error) {
 	base.NodeUID = "node-uid"
 	base.MachineID = "machine-id"
 	base.BootID = "boot-id"
@@ -48,6 +50,9 @@ func (supervisorRegistrationAgentBackend) Enroll(_ context.Context, base fencing
 		Path: "kubepods.slice/rhiza", Dev: 1, Ino: 2, PID: 3, StartTime: 4,
 		RuntimeHash: fencing.RuntimeScopeBindingDigest(base), ProfileID: "test-profile",
 	})
+	if err == nil && b != nil && b.beforeReturn != nil {
+		err = b.beforeReturn(ctx, base)
+	}
 	return base, scope, err
 }
 
@@ -62,6 +67,8 @@ func (supervisorRegistrationAgentBackend) ResumeStop(context.Context, fencing.Ru
 type supervisorRegistrationFixture struct {
 	e        *FencingExecutor
 	state    *AuthorityStateStore
+	api      *mutationStoreFixture
+	backend  *supervisorRegistrationAgentBackend
 	identity fencing.Identity
 	token    string
 	server   *httptest.Server
@@ -151,6 +158,7 @@ func newSupervisorRegistrationFixture(t *testing.T, required bool) supervisorReg
 		AuthorityState: state, ArchiveBucket: stateBucket, RequireMutationJournal: required,
 		MutationProfile: fencing.MutationHeldExecutionProfile,
 	}
+	var runtimeBackend *supervisorRegistrationAgentBackend
 	if required {
 		runtimeStateDir := filepath.Join(t.TempDir(), "runtime-agent-state")
 		if err := os.Mkdir(runtimeStateDir, 0700); err != nil {
@@ -160,10 +168,11 @@ func newSupervisorRegistrationFixture(t *testing.T, required bool) supervisorReg
 		if err != nil {
 			t.Fatal(err)
 		}
+		runtimeBackend = &supervisorRegistrationAgentBackend{}
 		runtimeService, err := runtimeagent.New(runtimeagent.Config{
 			AuthorityID: "authority", AuthorityNamespace: "test", AuthorityServiceAccount: "runtime-agent",
 			AuthorityWorkloadUID: "runtime-agent-workload", Audience: "rhiza-runtime-agent", Directory: runtimeStateDir,
-			Auth: supervisorRegistrationAgentAuth{}, Backend: supervisorRegistrationAgentBackend{},
+			Auth: supervisorRegistrationAgentAuth{}, Backend: runtimeBackend,
 		})
 		if err != nil {
 			_ = listener.Close()
@@ -191,7 +200,7 @@ func newSupervisorRegistrationFixture(t *testing.T, required bool) supervisorReg
 	// discovery/authentication performed by that handler still uses apiServer.
 	authorityServer := httptest.NewTLSServer(e.Handler())
 	t.Cleanup(authorityServer.Close)
-	return supervisorRegistrationFixture{e: e, state: state, identity: identity, token: tokenFile, server: authorityServer}
+	return supervisorRegistrationFixture{e: e, state: state, api: apiState, backend: runtimeBackend, identity: identity, token: tokenFile, server: authorityServer}
 }
 
 func TestRequiredMutationProducerIsReservedByAuthenticatedRegistrationBeforeWALBind(t *testing.T) {

@@ -470,6 +470,10 @@ func (e *FencingExecutor) handle(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "unexpected engine repair preflight payload", http.StatusBadRequest)
 		return
 	}
+	if message.InitialRegistration && message.Action != "register" {
+		http.Error(w, "unexpected initial registration marker", http.StatusBadRequest)
+		return
+	}
 	if message.Action == "engine-repair-preflight" {
 		if message.PreflightProposal == nil || message.EngineRepair != nil || message.Drain != nil ||
 			message.Request != nil || message.MutationLookup != nil || message.ArchiveGenesis != nil || message.LearnerIdentity != nil {
@@ -514,40 +518,53 @@ func (e *FencingExecutor) handle(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var activeRestartGrant *fencing.StartupGrant
+	var initialRegistrationGrant *fencing.StartupGrant
+	var initialRegistrationProvenance *fencing.InitialRegistrationProvenance
 	if message.Action == "register" {
-		grant, assigned, restartErr := e.resolveEngineRepairActiveRestartRegistration(r.Context(), uid, message.Identity)
-		if restartErr != nil {
-			if errors.Is(restartErr, fencing.ErrClosed) {
-				e.emitEarlyClosedRegistrationDenial(uid, message.Identity)
+		if message.InitialRegistration {
+			grant, provenance, err := e.resolveInitialRegistrationGrant(r.Context(), uid, message.Identity)
+			if err != nil {
+				writeEngineRepairStartupError(w, err)
+				return
 			}
-			writeEngineRepairStartupError(w, restartErr)
-			return
-		}
-		if assigned {
-			activeRestartGrant = &grant
+			initialRegistrationGrant, initialRegistrationProvenance = &grant, &provenance
 		} else {
-			grant, assigned, bootstrapErr := e.resolveEngineRepairBootstrapRegistration(r.Context(), uid, message.Identity)
-			if bootstrapErr != nil {
-				if errors.Is(bootstrapErr, fencing.ErrClosed) {
+			grant, assigned, restartErr := e.resolveEngineRepairActiveRestartRegistration(r.Context(), uid, message.Identity)
+			if restartErr != nil {
+				if errors.Is(restartErr, fencing.ErrClosed) {
 					e.emitEarlyClosedRegistrationDenial(uid, message.Identity)
 				}
-				writeEngineRepairStartupError(w, bootstrapErr)
+				writeEngineRepairStartupError(w, restartErr)
 				return
 			}
 			if assigned {
-				w.Header().Set("Content-Type", "application/json")
-				_ = json.NewEncoder(w).Encode(grant)
-				return
+				activeRestartGrant = &grant
+			} else {
+				grant, assigned, bootstrapErr := e.resolveEngineRepairBootstrapRegistration(r.Context(), uid, message.Identity)
+				if bootstrapErr != nil {
+					if errors.Is(bootstrapErr, fencing.ErrClosed) {
+						e.emitEarlyClosedRegistrationDenial(uid, message.Identity)
+					}
+					writeEngineRepairStartupError(w, bootstrapErr)
+					return
+				}
+				if assigned {
+					w.Header().Set("Content-Type", "application/json")
+					_ = json.NewEncoder(w).Encode(grant)
+					return
+				}
 			}
 		}
 	}
 	registrationStage := ""
 	grantResolved := false
 	if message.Action == "register" {
-		registrationStage = startupRegistrationStageRootInit
-		// Persist the immutable profile claim before enrollment or any admission
-		// side effect. A failed enrollment leaves a required, retryable root.
-		err = registerStageError("root-init", e.initializeRoot(r.Context(), uid, message.Identity.SourceClusterID))
+		if initialRegistrationGrant == nil {
+			registrationStage = startupRegistrationStageRootInit
+			// Persist the immutable profile claim before enrollment or any admission
+			// side effect. A failed enrollment leaves a required, retryable root.
+			err = registerStageError("root-init", e.initializeRoot(r.Context(), uid, message.Identity.SourceClusterID))
+		}
 	}
 	startupGrant := fencing.StartupGrant{Identity: message.Identity, Role: fencing.StartupRoleVoterActive}
 	if startupGrant.Identity.PodName == "" {
@@ -555,12 +572,23 @@ func (e *FencingExecutor) handle(w http.ResponseWriter, r *http.Request) {
 	}
 	if err == nil && message.Action == "register" {
 		registrationStage = startupRegistrationStageGrant
-		err = registerStageError("startup-grant", e.rejectClosedCanonicalStartup(r.Context(), uid, message.Identity.SourceClusterID))
+		if initialRegistrationGrant == nil {
+			err = registerStageError("startup-grant", e.rejectClosedCanonicalStartup(r.Context(), uid, message.Identity.SourceClusterID))
+		}
 		if err == nil {
 			if activeRestartGrant != nil {
 				startupGrant = *activeRestartGrant
+			} else if initialRegistrationGrant != nil {
+				startupGrant = *initialRegistrationGrant
 			} else {
 				startupGrant, err = e.resolveStartupGrant(r.Context(), uid, message.Identity)
+				if err == nil {
+					var required bool
+					required, err = e.initialRegistrationMarkerRequired(r.Context(), uid, message.Identity)
+					if err == nil && required {
+						err = fmt.Errorf("fencing: initial registration authority evidence required")
+					}
+				}
 				err = registerStageError("startup-grant", err)
 			}
 			grantResolved = err == nil
@@ -676,7 +704,27 @@ func (e *FencingExecutor) handle(w http.ResponseWriter, r *http.Request) {
 					}
 					if enrolled != nil {
 						l.RequireRuntimeBinding = true
-						return registerStageError("ledger-register", l.RegisterEnrolledWithRole(startupGrant.Identity, *enrolled, startupGrant.Role))
+						if initialRegistrationProvenance != nil {
+							ordinal, ordinalErr := engineRepairPodOrdinal(startupGrant.Identity.PodName)
+							if ordinalErr != nil {
+								return fencing.ErrClosed
+							}
+							if err := validateInitialRegistrationLedger(l, startupGrant.Identity, *initialRegistrationProvenance, ordinal, uid); err != nil {
+								return err
+							}
+							if err := l.RegisterEnrolledWithRole(startupGrant.Identity, *enrolled, startupGrant.Role); err != nil {
+								return registerStageError("ledger-register", err)
+							}
+							run := l.Runs[startupGrant.Identity.RunID]
+							provenance := *initialRegistrationProvenance
+							run.InitialRegistration = &provenance
+							l.Runs[startupGrant.Identity.RunID] = run
+							return nil
+						}
+						if err := l.RegisterEnrolledWithRole(startupGrant.Identity, *enrolled, startupGrant.Role); err != nil {
+							return registerStageError("ledger-register", err)
+						}
+						return nil
 					}
 					if l.RequireRuntimeBinding {
 						return fmt.Errorf("fencing: runtime agent is required")

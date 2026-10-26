@@ -344,7 +344,7 @@ func activeRestartRuntimeAgentClient(t *testing.T, e *FencingExecutor) (*Runtime
 	}
 	service, err := runtimeagent.New(runtimeagent.Config{AuthorityID: "authority", AuthorityNamespace: "test", AuthorityServiceAccount: "runtime-agent",
 		AuthorityWorkloadUID: "runtime-agent-workload", Audience: "rhiza-runtime-agent", Directory: directory,
-		Auth: supervisorRegistrationAgentAuth{}, Backend: supervisorRegistrationAgentBackend{}})
+		Auth: supervisorRegistrationAgentAuth{}, Backend: &supervisorRegistrationAgentBackend{}})
 	if err != nil {
 		t.Fatal(err)
 	}

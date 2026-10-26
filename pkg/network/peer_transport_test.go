@@ -310,6 +310,10 @@ func TestSupervisedCandidateMayLearnWhilePublicAndReadIndexReadinessStayClosed(t
 	}
 	server.SetPeerLearnReady(nil)
 	request.Operation = peerfb.OperationLearned
+	// Reach admission with a decodable request; malformed frames are rejected earlier.
+	request.Decision = decisionToWire(quepaxa.Decision{
+		Slot: 1, ConfigID: core.ConfigID(), Proposal: quepaxa.Proposal{ProposerID: member.ID},
+	})
 	if _, err := peer.handle(context.Background(), certificateKey, request); !errors.Is(err, ErrNotReady) {
 		t.Fatalf("ordinary peer Learn did not retain public readiness gating: %v", err)
 	}

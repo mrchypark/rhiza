@@ -21,15 +21,16 @@ import (
 // AuthorityMessage is sent only over authenticated TLS. The server authenticates
 // the bound service account token independently of the claimed identity.
 type AuthorityMessage struct {
-	Action            string                       `json:"action"`
-	Identity          Identity                     `json:"identity"`
-	EngineRepair      *EngineRepairRequest         `json:"engineRepair,omitempty"`
-	Drain             *DrainReceipt                `json:"drain,omitempty"`
-	Request           *StopRequest                 `json:"request,omitempty"`
-	MutationLookup    *MutationLookupRequest       `json:"mutationLookup,omitempty"`
-	ArchiveGenesis    *ArchiveGenesisStatusRequest `json:"archiveGenesis,omitempty"`
-	LearnerIdentity   *LearnerIdentityRegistration `json:"learnerIdentity,omitempty"`
-	PreflightProposal *PendingEngineRepairProposal `json:"preflightProposal,omitempty"`
+	Action              string                       `json:"action"`
+	Identity            Identity                     `json:"identity"`
+	InitialRegistration bool                         `json:"initialRegistration,omitempty"`
+	EngineRepair        *EngineRepairRequest         `json:"engineRepair,omitempty"`
+	Drain               *DrainReceipt                `json:"drain,omitempty"`
+	Request             *StopRequest                 `json:"request,omitempty"`
+	MutationLookup      *MutationLookupRequest       `json:"mutationLookup,omitempty"`
+	ArchiveGenesis      *ArchiveGenesisStatusRequest `json:"archiveGenesis,omitempty"`
+	LearnerIdentity     *LearnerIdentityRegistration `json:"learnerIdentity,omitempty"`
+	PreflightProposal   *PendingEngineRepairProposal `json:"preflightProposal,omitempty"`
 }
 
 // LearnerIdentityRegistration is the one create-only voter identity object a
@@ -146,13 +147,24 @@ func (a *AuthorityClient) Register(ctx context.Context, id Identity) error {
 }
 
 func (a *AuthorityClient) RegisterStartup(ctx context.Context, id Identity) (StartupGrant, error) {
+	return a.registerStartup(ctx, id, false)
+}
+
+func (a *AuthorityClient) RegisterInitialStartup(ctx context.Context, id Identity) (StartupGrant, error) {
+	return a.registerStartup(ctx, id, true)
+}
+
+func (a *AuthorityClient) registerStartup(ctx context.Context, id Identity, initial bool) (StartupGrant, error) {
 	var grant StartupGrant
-	err := a.call(ctx, AuthorityMessage{Action: "register", Identity: id}, &grant)
+	err := a.call(ctx, AuthorityMessage{Action: "register", Identity: id, InitialRegistration: initial}, &grant)
 	if err != nil {
 		return StartupGrant{}, err
 	}
 	if err := grant.Validate(id); err != nil {
 		return StartupGrant{}, err
+	}
+	if initial && grant.InitialRegistration == nil {
+		return StartupGrant{}, fmt.Errorf("fencing: initial startup grant lacks first-registration evidence")
 	}
 	a.role = grant.Role
 	return grant, nil

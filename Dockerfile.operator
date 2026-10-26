@@ -10,7 +10,7 @@ RUN CGO_ENABLED=0 GOOS=linux go build -o rhiza-operator ./cmd/rhiza-operator
 RUN CGO_ENABLED=0 GOOS=linux go build -o rhiza-fencer ./cmd/rhiza-fencer
 RUN CGO_ENABLED=0 GOOS=linux go build -o rhiza-runtime-agent ./cmd/rhiza-runtime-agent
 
-FROM mirror.gcr.io/library/alpine:3.24.3@sha256:be2656061b536c1883c4034790e21d0a09c5aaaf51968b89368a3c0371ea2c9a
+FROM mirror.gcr.io/library/alpine:3.24.3@sha256:be2656061b536c1883c4034790e21d0a09c5aaaf51968b89368a3c0371ea2c9a AS runtime
 
 RUN apk --no-cache add ca-certificates && adduser -D -u 65532 rhiza
 
@@ -21,3 +21,14 @@ COPY --from=builder /app/rhiza-runtime-agent /usr/local/bin/rhiza-runtime-agent
 USER 65532:65532
 
 ENTRYPOINT ["rhiza-operator"]
+
+# A separate qualification image contains the probe binary used by the
+# digest-pinned GCS ordinary-recovery driver. The final default target below
+# remains the production operator image and does not include this executable.
+FROM builder AS peer-admission-builder
+RUN CGO_ENABLED=0 GOOS=linux go build -trimpath -buildvcs=false -o fencing-e2e ./e2e/fencing
+
+FROM runtime AS peer-admission-test
+COPY --from=peer-admission-builder --chmod=0755 /app/fencing-e2e /usr/local/bin/fencing-e2e
+
+FROM runtime AS final
