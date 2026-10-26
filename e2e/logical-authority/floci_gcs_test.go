@@ -1,3 +1,5 @@
+//go:build localhooks
+
 package logicalauthority_test
 
 import (

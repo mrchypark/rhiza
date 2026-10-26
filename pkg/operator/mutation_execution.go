@@ -219,44 +219,7 @@ func (r mutationGenerationZeroLineageRecord) ref() string {
 // live-entry bound. Archives are committed only for the contiguous terminal
 // prefix and commitMutationArchive verifies all prepared-entry receipts.
 func (e *FencingExecutor) compactSourceMutationJournal(ctx context.Context, runtime fencing.RuntimeBinding, nextSequence uint64) error {
-	if err := e.ReconcileArchivedStages(ctx, runtime); err != nil {
-		return err
-	}
-	producer, err := e.reserveMutationProducer(ctx, runtime)
-	if err != nil {
-		return err
-	}
-	if producer.LastAdmitted == ^uint64(0) || nextSequence != producer.LastAdmitted+1 || producer.LastAdmitted-producer.CompactedThrough < fencing.MaxMutationJournalEntries/2 {
-		return nil
-	}
-	through := producer.CompactedThrough
-	for sequence := producer.CompactedThrough; sequence < producer.LastAdmitted; {
-		sequence++
-		entry := producer.Entries[sequence]
-		if entry.Resolution == nil || (entry.Preparation != nil && entry.Preparation.Generation == 0 && !entry.Resolution.AllCopiesTerminal && entry.CopyCompletion == nil && entry.GuardedLogicalResolution == nil) {
-			break
-		}
-		through = sequence
-	}
-	if through == producer.CompactedThrough {
-		return nil
-	}
-	run, err := e.enrolledMutationRun(ctx, runtime)
-	if err != nil {
-		return err
-	}
-	plan, err := producer.PlanMutationCompaction(run.MutationProducerUID, through)
-	if err != nil {
-		return err
-	}
-	committed, err := e.commitMutationArchive(ctx, runtime, plan)
-	if err != nil {
-		return err
-	}
-	if committed.CompactedThrough != plan.Through || committed.ArchiveHead == nil {
-		return nil
-	}
-	return e.ReconcileArchivedStages(ctx, runtime)
+	return e.compactMutationJournalForAuthority(ctx, runtimeMutationAuthority(runtime), nextSequence)
 }
 
 const archivedStageRetirementBatch = 16
@@ -267,73 +230,11 @@ const archivedStageRetirementBatch = 16
 // tombstone/quota update succeeds. Work is bounded per call so admission can
 // retry maintenance without an unbounded request.
 func (e *FencingExecutor) ReconcileArchivedStages(ctx context.Context, runtime fencing.RuntimeBinding) error {
-	if ctx == nil || e == nil || e.AuthorityState == nil {
-		return fmt.Errorf("fencing: archived stage reconciliation is not configured")
-	}
-	producer, err := e.reserveMutationProducer(ctx, runtime)
-	if err != nil {
-		return err
-	}
-	run, err := e.enrolledMutationRun(ctx, runtime)
-	if err != nil {
-		return err
-	}
-	if run.MutationProducerUID == "" || run.MutationProducerUID != stableMutationProducerUID(runtime) {
-		return fmt.Errorf("fencing: archived stage reconciliation producer differs from root")
-	}
-	stop := producer.CompactedThrough
-	if remaining := stop - producer.RetiredStageThrough; remaining > archivedStageRetirementBatch {
-		stop = producer.RetiredStageThrough + archivedStageRetirementBatch
-	}
-	for retired := producer.RetiredStageThrough; retired < stop; retired++ {
-		sequence := retired + 1
-		entry, archiveRef, err := e.archivedMutationAt(ctx, runtime, run.MutationProducerUID, sequence)
-		if err != nil {
-			return err
-		}
-		if entry.Intent.Kind == "upload" && strings.HasPrefix(entry.Intent.PayloadRef, "payload-") {
-			if err := e.retireArchivedSourceStage(ctx, runtime, run.MutationProducerUID, sequence, entry.Intent, archiveRef); err != nil {
-				return err
-			}
-		}
-		if _, err := e.changeMutationProducer(ctx, runtime, func(p *fencing.MutationProducer) error {
-			return p.AdvanceArchivedStageRetirement(sequence)
-		}); err != nil {
-			return err
-		}
-	}
-	return nil
+	return e.reconcileArchivedStagesForAuthority(ctx, runtimeMutationAuthority(runtime))
 }
 
 func (e *FencingExecutor) archivedMutationAt(ctx context.Context, runtime fencing.RuntimeBinding, producerUID string, sequence uint64) (fencing.MutationEntry, fencing.MutationArchiveReference, error) {
-	verificationID := hashJSON([]any{"lookup-archived-sequence", producerUID, sequence})
-	done, found, err := e.scanMutationArchiveHistory(ctx, runtime, verificationID, 32, nil, sequence)
-	if err != nil {
-		return fencing.MutationEntry{}, fencing.MutationArchiveReference{}, err
-	}
-	if !done || !found {
-		return fencing.MutationEntry{}, fencing.MutationArchiveReference{}, ErrFencePending
-	}
-	producer, storedUID, _, err := e.AuthorityState.ReadProducer(ctx, runtime)
-	if err != nil {
-		return fencing.MutationEntry{}, fencing.MutationArchiveReference{}, err
-	}
-	if storedUID != producerUID || producer.ArchiveScan == nil || producer.ArchiveScan.VerificationID != verificationID || producer.ArchiveScan.Sequence != sequence || producer.ArchiveScan.ResultArchive == nil {
-		return fencing.MutationEntry{}, fencing.MutationArchiveReference{}, ErrFencePending
-	}
-	ref := *producer.ArchiveScan.ResultArchive
-	plan, err := e.readMutationArchive(ctx, ref, runtime, producerUID, producer.WALIdentity)
-	if err != nil {
-		return fencing.MutationEntry{}, fencing.MutationArchiveReference{}, e.mutationArchiveFailure(ctx, runtime, err)
-	}
-	entry, ok := plan.Entries[sequence]
-	if !ok {
-		return fencing.MutationEntry{}, fencing.MutationArchiveReference{}, e.mutationArchiveFailure(ctx, runtime, errMutationArchiveEvidence)
-	}
-	if err := e.verifyMutationArchiveReceipts(ctx, plan); err != nil {
-		return fencing.MutationEntry{}, fencing.MutationArchiveReference{}, e.mutationArchiveFailure(ctx, runtime, err)
-	}
-	return entry, ref, nil
+	return e.archivedMutationAtForAuthority(ctx, runtimeMutationAuthority(runtime), producerUID, sequence)
 }
 
 func (e *FencingExecutor) mutationKeyIdentity(scopeHash, key string) (string, string) {
@@ -1195,7 +1096,9 @@ func (e *FencingExecutor) releaseMutationKeyAfterVerifiedTerminal(ctx context.Co
 // one provider request under a durable cross-producer key lock. Only a fsynced
 // provider receipt followed by a committed journal CAS can return success.
 func (e *FencingExecutor) ExecuteSourceMutation(ctx context.Context, runtime fencing.RuntimeBinding, producerUID string, sequence uint64, intent fencing.MutationIntent, scope AttestationStoreScope, provider mutationExecutionProvider, receipts *MutationExecutionReceiptStore) error {
-	return e.executeSourceMutation(ctx, mutationExecutionAuthority{runtime: &runtime}, producerUID, sequence, intent, scope, provider, receipts)
+	return e.executeSourceMutation(ctx, mutationExecutionAuthority{statefulSetUID: runtime.StatefulSetUID,
+		sourceClusterID: runtime.SourceClusterID, runID: runtime.RunID, runtime: &runtime},
+		producerUID, sequence, intent, scope, provider, receipts)
 }
 
 func (e *FencingExecutor) ExecuteLogicalSourceMutation(ctx context.Context, statefulSetUID string, binding fencing.LogicalWriterBindingV1, producerUID string, sequence uint64, intent fencing.MutationIntent, scope AttestationStoreScope, provider mutationExecutionProvider, receipts *MutationExecutionReceiptStore) error {
@@ -1297,6 +1200,18 @@ func (e *FencingExecutor) executeSourceMutation(ctx context.Context, authority m
 		return fmt.Errorf("fencing: source mutation authority profile differs from the canonical Run")
 	}
 	lookup, err := e.lookupMutationForAuthority(ctx, authority, run, fencing.MutationLookupRequest{ProducerUID: producerUID, Sequence: sequence, Intent: intent})
+	if err != nil && authority.logicalBinding != nil && errors.Is(err, ErrFencePending) {
+		// The producer retains only the bounded live interval. An exact retry
+		// below its compaction watermark is resolved from the root-bound archive
+		// chain; this lookup is read-only with respect to dispatch permission.
+		archived, archiveErr := e.lookupArchivedMutationForAuthority(ctx, authority, producerUID, sequence, intent)
+		if archiveErr == nil {
+			lookup = fencing.MutationLookupResult{Found: true, Archived: true, Entry: &archived}
+			err = nil
+		} else {
+			err = archiveErr
+		}
+	}
 	if err != nil {
 		return err
 	}
@@ -1320,6 +1235,18 @@ func (e *FencingExecutor) executeSourceMutation(ctx context.Context, authority m
 		// readback. Replaying this tuple must not reacquire or release a key that
 		// may now belong to a later producer.
 		return nil
+	}
+	if entry.Resolution != nil && entry.Preparation == nil {
+		// Cancellation before preparation granted no provider permission and
+		// therefore owns no cross-producer key lock. In particular, replaying an
+		// archived no-work tuple must not manufacture a permanent key reservation.
+		if !entry.DispatchClosed || len(entry.Dispatches) != 0 || entry.Resolution.Outcome != fencing.MutationRejected {
+			return ErrFencePending
+		}
+		if entry.Resolution.ConditionFailed {
+			return fencing.ErrMutationConditionFailed
+		}
+		return fmt.Errorf("fencing: original source mutation is terminally rejected")
 	}
 	owner := authority.mutationOwner(run, producerUID, sequence, intent)
 	if err := e.acquireMutationKey(ctx, intent.StoreScopeHash, intent.Key, owner, len(lookup.Entry.Dispatches) == 0); err != nil {

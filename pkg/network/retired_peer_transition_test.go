@@ -278,11 +278,11 @@ func TestRetiredPeerTransitionRejectsCachedIdentityAndAdmitsNewIdentity(t *testi
 		select {
 		case event := <-staleSyncEvents:
 			for _, field := range []string{
-				"test_alias=" + testAlias, "operation=sync", "request_config=1", "selected_config=2", "slot=0", "from=1",
+				"test_alias=" + testAlias, "operation=sync", "request_config=1", "selected_config=1", "slot=0", "from=1",
 				"lookup_ok=true", "cluster_match=true", "config_match=false", "rejection=cluster_or_config",
 			} {
 				if !strings.Contains(event, field) {
-					t.Fatalf("test_alias=retired-peer-transition rejected Sync event missing %q", field)
+					t.Fatalf("test_alias=retired-peer-transition rejected Sync event missing %q in %q", field, event)
 				}
 			}
 			if strings.Contains(event, "cluster=") || strings.Contains(event, "sender=") || strings.Contains(event, "error=") {

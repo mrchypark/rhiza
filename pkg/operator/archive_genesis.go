@@ -23,6 +23,18 @@ type archiveGenesisCancellationProof struct {
 	WinningGenesis fencing.ArchiveGenesisRef `json:"winningGenesis"`
 }
 
+type logicalArchiveGenesisCancellationProof struct {
+	Version         int                            `json:"version"`
+	StatefulSetUID  string                         `json:"statefulSetUID"`
+	SourceClusterID string                         `json:"sourceClusterID"`
+	Binding         fencing.LogicalWriterBindingV1 `json:"binding"`
+	WALIdentity     string                         `json:"walIdentity"`
+	ProducerUID     string                         `json:"producerUID"`
+	Sequence        uint64                         `json:"sequence"`
+	Intent          fencing.MutationIntent         `json:"intent"`
+	WinningGenesis  fencing.ArchiveGenesisRef      `json:"winningGenesis"`
+}
+
 func (e *FencingExecutor) claimArchiveScopeForRegistration(ctx context.Context, uid string, id fencing.Identity, runtime fencing.RuntimeBinding) error {
 	if e == nil || e.AuthorityState == nil || !e.RequireMutationJournal || id.SourceClusterID != runtime.SourceClusterID || uid != runtime.StatefulSetUID {
 		return fmt.Errorf("fencing: archive genesis registration is not configured")
@@ -229,6 +241,89 @@ func (e *FencingExecutor) prepareLogicalArchiveGenesisMutation(ctx context.Conte
 	ref := fencing.ArchiveGenesisRef{Version: fencing.ArchiveGenesisVersion, ConfigID: recovery.ArchiveConfigID, ScopeHash: scopeHash,
 		Mutation: &fencing.ArchiveGenesisMutation{ProducerUID: producerUID, Sequence: sequence, Intent: intent}}
 	return e.commitArchiveGenesisRef(ctx, uid, id.SourceClusterID, scope, ref)
+}
+
+// cancelLogicalArchiveGenesisLoser records an immutable exact-winner proof,
+// then consumes the losing sequence with a single canonical producer CAS. It
+// only accepts the next unprepared sequence (or an exact already-terminal
+// retry); it never infers anything from Pod liveness or a storage response.
+func (e *FencingExecutor) cancelLogicalArchiveGenesisLoser(ctx context.Context, uid string, id fencing.Identity,
+	binding fencing.LogicalWriterBindingV1, producerUID string, sequence uint64, intent fencing.MutationIntent) error {
+	scope, scopeHash, err := e.logicalArchiveScope(ctx, uid, binding)
+	if err != nil {
+		return err
+	}
+	claim, _, err := e.AuthorityState.ReadArchiveScopeClaim(ctx, scope)
+	if err != nil || claim.ConfigID != recovery.ArchiveConfigID || claim.ScopeHash != scopeHash || claim.GenesisRef == nil || claim.GenesisRef.Mutation == nil {
+		return errors.Join(err, fencing.ErrPending)
+	}
+	winner := claim.GenesisRef
+	if winner.Mutation.ProducerUID == producerUID && winner.Mutation.Sequence == sequence && winner.Mutation.Intent == intent {
+		return fencing.ErrPending
+	}
+	root, err := e.read(ctx, uid, id.SourceClusterID)
+	if err != nil || !authorityMatchesLogicalRun(root, id, binding) || root.Ledger.ArchiveGenesisRef == nil || !sameArchiveGenesisRef(root.Ledger.ArchiveGenesisRef, winner) {
+		return errors.Join(err, fencing.ErrPending)
+	}
+	run := root.Ledger.Runs[id.RunID]
+	if run.MutationProducerUID != producerUID || run.MutationScopeHash != intent.StoreScopeHash || run.MutationScopeHash == "" ||
+		intent.OperationID != fencing.MutationRequestID(producerUID, sequence) {
+		return fmt.Errorf("fencing: logical genesis loser differs from its enrolled producer")
+	}
+	producer, actualUID, _, err := e.AuthorityState.ReadLogicalProducer(ctx, uid, binding)
+	if err != nil || actualUID != producerUID || producer.WALIdentity != id.WALIdentity || producer.Profile != fencing.LogicalWriterProfileV1 || producer.Validate() != nil {
+		return errors.Join(err, fmt.Errorf("fencing: logical genesis loser producer differs from canonical Run"))
+	}
+	if sequence <= producer.CompactedThrough {
+		return fencing.ErrPending
+	}
+	if sequence <= producer.LastAdmitted {
+		entry, ok := producer.Entries[sequence]
+		if !ok || entry.Intent != intent || entry.Preparation != nil || len(entry.Dispatches) != 0 {
+			return fencing.ErrPending
+		}
+		if entry.Resolution != nil && (entry.Resolution.Outcome != fencing.MutationRejected || !entry.Resolution.AllCopiesTerminal) {
+			return fencing.ErrPending
+		}
+	} else if sequence != producer.LastAdmitted+1 || producer.Phase != fencing.MutationOpen {
+		return fencing.ErrPending
+	}
+	proof := logicalArchiveGenesisCancellationProof{Version: 1, StatefulSetUID: uid, SourceClusterID: id.SourceClusterID, Binding: binding,
+		WALIdentity: id.WALIdentity, ProducerUID: producerUID, Sequence: sequence, Intent: intent, WinningGenesis: *winner}
+	body, err := json.Marshal(proof)
+	if err != nil {
+		return err
+	}
+	receiptDigest := authorityStateDigest(body)
+	evidence, err := e.authorityEvidenceForRoot(uid, id.SourceClusterID)
+	if err != nil {
+		return err
+	}
+	key := "archive-genesis-cancellations/" + receiptDigest
+	if _, err := evidence.CreateImmutable(ctx, key, body); err != nil {
+		return err
+	}
+	authority := mutationExecutionAuthority{statefulSetUID: uid, sourceClusterID: id.SourceClusterID, runID: id.RunID, logicalBinding: &binding}
+	_, err = e.changeMutationProducerForAuthority(ctx, authority, producerUID, func(current *fencing.MutationProducer) error {
+		if current.WALIdentity != id.WALIdentity || current.Profile != fencing.LogicalWriterProfileV1 {
+			return fencing.ErrPending
+		}
+		if sequence == current.LastAdmitted+1 {
+			return current.AdmitAndCancel(sequence, intent, receiptDigest)
+		}
+		entry, ok := current.Entries[sequence]
+		if !ok || entry.Intent != intent || entry.Preparation != nil || len(entry.Dispatches) != 0 {
+			return fencing.ErrPending
+		}
+		if entry.Resolution != nil {
+			if entry.Resolution.Outcome == fencing.MutationRejected && entry.Resolution.AllCopiesTerminal && entry.Resolution.ReceiptDigest == receiptDigest {
+				return nil
+			}
+			return fencing.ErrPending
+		}
+		return current.CancelUnprepared(sequence, receiptDigest)
+	})
+	return err
 }
 
 func authorityMatchesLogicalRun(root fenceLedger, id fencing.Identity, binding fencing.LogicalWriterBindingV1) bool {

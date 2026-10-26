@@ -144,10 +144,18 @@ func (n *Node) connectFenceSession(ctx context.Context) error {
 			client.CloseIdleConnections()
 			return fmt.Errorf("fencing: logical startup grant differs from the requested workload identity")
 		}
-		if continuation && ((grant.LogicalBinding.Recovery.Kind != fencing.LogicalRecoverySameWAL && grant.LogicalBinding.Recovery.Kind != fencing.LogicalRecoveryReplacement) ||
-			grant.LogicalBinding.Recovery.ExpectedWALIdentity != identity.WALIdentity || grant.ExpectedWALIdentity != identity.WALIdentity) {
-			client.CloseIdleConnections()
-			return fmt.Errorf("fencing: logical continuation grant does not preserve the exact existing WAL")
+		if continuation {
+			// The authority validates the exact persisted Run/Pod/WAL tuple from
+			// RegistrationWALIdentity, then returns that Run's canonical grant.
+			// It deliberately does not synthesize a Recovery binding: doing so
+			// would change the binding pinned to the mutation producer/journal.
+			wantIdentity := identity
+			wantIdentity.WALIdentity = ""
+			if grant.Identity != wantIdentity || grant.ExpectedWALIdentity != "" ||
+				grant.LogicalBinding.Recovery != (fencing.LogicalRecoveryBindingV1{}) {
+				client.CloseIdleConnections()
+				return fmt.Errorf("fencing: logical continuation changed the canonical Run binding")
+			}
 		}
 		runState, err = persistLogicalRunAssignment(n.config, runState, grant.Identity)
 		if err != nil {

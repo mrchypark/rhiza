@@ -86,7 +86,7 @@ WAL/identity makes the stage ineligible, preserving same-Pod continuity.
 ## Pro-reviewed no-CRI authority direction and implementation status
 
 The preserved Pro response at
-`/Users/cypark/.codex/task-state/rhiza-review-followups/pro-no-cri-authority-response-20261026.txt`
+`pro-no-cri-authority-response-20261026.txt` in the retained review evidence
 reviewed baseline `42857613dc6c6c505c692d245d203fe0b54b8e16`, not this
 worktree's implementation. Its design conclusion is to reuse the existing
 canonical authority and source-mutation journal with an explicit logical writer
@@ -190,18 +190,19 @@ ACK. Storage-write exclusion does not claim stale-read or old-service
 exclusion. Unknown provider outcomes stay pending; Pod deletion, API absence,
 timeouts, quiet buckets, a new Pod UID, or a Boolean lease do not settle them.
 
-The prototype provider is GCS-only. No logical-binding implementation or
-provider-neutral contract exists yet for S3/Azure. The design remains blocked
-for any profile whose late operations, conditionals, retries, deletions, pins,
-or GC cannot be accounted for. Read-only init remains separate: it performs
-no remote pin/claim/write; if source evidence disappears during staging, it
-fails. Normal main startup may use its existing recovery pin lifecycle.
+The implemented logical provider path is GCS-only. No logical-binding
+implementation or provider-neutral contract exists yet for S3/Azure. Any
+profile whose late operations, conditionals, retries, deletions, pins, or GC
+cannot be accounted for remains unsupported. Read-only init is separate: it
+performs no remote pin/claim/write; if source evidence disappears during
+staging, it fails. Normal main startup may use its existing recovery pin
+lifecycle.
 
 ### Compatibility and migration
 
 No automatic flag-based conversion is allowed:
 
-| Existing state | Proposed handling |
+| Existing state | Required handling |
 |---|---|
 | New root | Create with explicit logical schema/profile and required journal. |
 | Runtime-bound strict root | Preserve runtime meaning; migrate only through an explicit operation that closes old producers and verifies effects before a new logical root/profile. |
@@ -217,7 +218,9 @@ admission; it cannot resurrect a retired grant.
 
 **Pro review:** design GO for the no-CRI direction; NO-GO to treating existing
 flags as an implemented mode. The review is baseline-scoped and did not run
-tests or approve this uncommitted code.
+tests or approve this implementation. A subsequent source review of checkpoint
+`105197c` withheld code GO and identified connected lifecycle defects; its
+repairs still require exact-candidate CI and runtime qualification.
 
 **Current source status:** the explicit `logical-writer-v1` profile, direct
 authority registration/WAL binding, logical mutation journal path, and GCS

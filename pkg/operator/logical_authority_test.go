@@ -5,6 +5,7 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -105,6 +106,13 @@ func TestLogicalAuthorityRootProfileAndRegistrationMutationRevocation(t *testing
 		Condition:   fencing.MutationCondition{Mode: fencing.MutationMatchGeneration, Generation: 3},
 		OperationID: fencing.MutationRequestID(expectedProducerUID, 1), Kind: "delete", Key: "objects/a"}
 	if err := producer.Admit(1, intent); err != nil {
+		t.Fatal(err)
+	}
+	if err := producer.Prepare(1, fencing.MutationPreparation{Profile: fencing.MutationExecutionProfile,
+		StoreScopeHash: scopeHash, GenerationSet: true, Generation: 3}); err != nil {
+		t.Fatal(err)
+	}
+	if err := producer.GrantDispatch(1, "dispatch-in-flight"); err != nil {
 		t.Fatal(err)
 	}
 	if err := store.WriteLogicalProducer(ctx, uid, *run.LogicalBinding, producer, producerVersion); err != nil {
@@ -291,6 +299,196 @@ func TestLogicalUnboundNoWorkRunCanBeClosedWithoutPhysicalExit(t *testing.T) {
 	}
 }
 
+func TestLogicalStorageClosureVerifiesCompactedTerminalPrefix(t *testing.T) {
+	ctx := t.Context()
+	const uid, source, node, runID = "closure-archive-sts", "closure-archive-source", "voter", "run"
+	scope := AttestationStoreScope{Provider: "gcs", Bucket: "archive-bucket", Prefix: "archive/" + source}
+	bucket := &archiveTestBucket{Bucket: objstore.NewInMemBucket()}
+	t.Cleanup(func() { _ = bucket.Close() })
+	store, err := NewAuthorityStateStore(bucket, "logical-closure-archive")
+	if err != nil {
+		t.Fatal(err)
+	}
+	sts := object{"metadata": object{"uid": uid}, "spec": object{"template": object{"spec": object{"containers": []any{object{
+		"name": "rhiza", "env": []any{object{"name": "RHIZA_OBJSTORE_PROVIDER", "value": "gcs"},
+			object{"name": "RHIZA_OBJSTORE_BUCKET", "value": scope.Bucket},
+			object{"name": "RHIZA_OBJSTORE_PREFIX", "value": "archive"}}}}}}}}
+	kubeServer := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/apis/apps/v1/namespaces/test/statefulsets" {
+			http.NotFound(w, r)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(object{"items": []any{sts}})
+	}))
+	t.Cleanup(kubeServer.Close)
+	token := filepath.Join(t.TempDir(), "token")
+	if err := os.WriteFile(token, []byte("test"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	e := &FencingExecutor{Kube: &Kubernetes{BaseURL: kubeServer.URL, Namespace: "test", TokenFile: token, Client: kubeServer.Client()},
+		AuthorityState: store, RequireMutationJournal: true, AuthorityProfile: fencing.LogicalWriterProfileV1}
+	if err := e.initializeRoot(ctx, uid, source); err != nil {
+		t.Fatal(err)
+	}
+	id := fencing.Identity{SourceClusterID: source, NodeID: node, RunID: runID}
+	binding := fencing.LogicalWriterBindingV1{Version: fencing.LogicalWriterVersionV1, Profile: fencing.LogicalWriterProfileV1,
+		SourceClusterID: source, NodeID: node, RunID: runID, Role: fencing.StartupRoleVoterActive,
+		ProducerUID: "closure-archive-producer", StoreScopeHash: hashJSON(scope)}
+	root, version, err := store.ReadRoot(ctx, uid, source)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := root.Ledger.RegisterLogicalWithRole(id, binding); err != nil {
+		t.Fatal(err)
+	}
+	if err := root.Ledger.BindLogicalMutationProducer(id, binding.ProducerUID); err != nil {
+		t.Fatal(err)
+	}
+	if err := root.Ledger.BindLogicalMutationScope(id, binding.StoreScopeHash, fencing.MutationExecutionProfile); err != nil {
+		t.Fatal(err)
+	}
+	if err := root.Ledger.BindLogicalMutationStage(id, hashJSON([]string{"closure-stage", runID})); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.WriteRoot(ctx, uid, source, root, version); err != nil {
+		t.Fatal(err)
+	}
+	if err := e.reserveLogicalMutationProducer(ctx, uid, binding); err != nil {
+		t.Fatal(err)
+	}
+	id.WALIdentity = hashJSON([]string{"closure-wal", runID})
+	receipt, err := e.bindLogicalSupervisorWAL(ctx, uid, id)
+	if err != nil || receipt.LogicalBinding == nil {
+		t.Fatalf("bind logical WAL: receipt=%+v err=%v", receipt, err)
+	}
+	binding = *receipt.LogicalBinding
+	providerServer := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { http.NotFound(w, r) }))
+	t.Cleanup(providerServer.Close)
+	client, err := storage.NewClient(ctx, option.WithEndpoint(providerServer.URL+"/storage/v1/"), option.WithHTTPClient(providerServer.Client()), option.WithoutAuthentication())
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = client.Close() })
+	e.SourceMutationStorage = client
+	receipts, err := e.receiptsForLogicalBinding(uid, binding)
+	if err != nil {
+		t.Fatal(err)
+	}
+	authority := logicalMutationAuthority(uid, binding)
+	boundRoot, _, err := store.ReadRoot(ctx, uid, source)
+	if err != nil {
+		t.Fatal(err)
+	}
+	run := boundRoot.Ledger.Runs[runID]
+	for sequence := uint64(1); sequence <= 130; sequence++ {
+		if err := e.compactLogicalSourceMutationJournal(ctx, uid, binding, sequence); err != nil {
+			t.Fatalf("compact before admission %d: %v", sequence, err)
+		}
+		intent := fencing.MutationIntent{ContractVersion: fencing.MutationIntentVersion, StoreScopeHash: binding.StoreScopeHash,
+			OperationID: fencing.MutationRequestID(binding.ProducerUID, sequence), OwnerStep: fencing.MutationOwnerStep{Owner: "test", Workflow: "closure", Step: "delete", Attempt: sequence},
+			Condition: fencing.MutationCondition{Mode: fencing.MutationMatchGeneration, Generation: 1}, Kind: "delete", Key: fmt.Sprintf("objects/key-%03d", sequence)}
+		preparation := fencing.MutationPreparation{Profile: fencing.MutationExecutionProfile, StoreScopeHash: binding.StoreScopeHash, GenerationSet: true, Generation: 1}
+		dispatchID := fmt.Sprintf("dispatch-%03d", sequence)
+		_, err := e.changeMutationProducerForAuthority(ctx, authority, binding.ProducerUID, func(producer *fencing.MutationProducer) error {
+			if err := producer.Admit(sequence, intent); err != nil {
+				return err
+			}
+			if err := producer.Prepare(sequence, preparation); err != nil {
+				return err
+			}
+			return producer.GrantDispatch(sequence, dispatchID)
+		})
+		if err != nil {
+			t.Fatalf("admit logical mutation %d: %v", sequence, err)
+		}
+		preparationHash, err := func() (string, error) {
+			producer, _, _, readErr := e.readMutationProducerForAuthority(ctx, authority)
+			if readErr != nil {
+				return "", readErr
+			}
+			return producer.PreparationHash(sequence)
+		}()
+		if err != nil {
+			t.Fatal(err)
+		}
+		providerResult := mutationProviderResult{Outcome: fencing.MutationCommitted, Generation: 1, AllCopiesTerminal: true}
+		executionReceipt := authority.makeReceipt(run, binding.ProducerUID, sequence, intent, preparation, dispatchID, providerResult)
+		if digest, err := receipts.put(executionReceipt); err != nil || digest != executionReceipt.ReceiptDigest {
+			t.Fatalf("persist receipt %d: digest=%q err=%v", sequence, digest, err)
+		}
+		_, err = e.changeMutationProducerForAuthority(ctx, authority, binding.ProducerUID, func(producer *fencing.MutationProducer) error {
+			if err := producer.SealDispatch(sequence); err != nil {
+				return err
+			}
+			if err := producer.RecordDispatchTerminal(sequence, dispatchID, executionReceipt.ReceiptDigest); err != nil {
+				return err
+			}
+			return producer.Resolve(sequence, fencing.MutationResolution{Outcome: fencing.MutationCommitted, PreparationHash: preparationHash,
+				ReceiptDigest: executionReceipt.ReceiptDigest, AllCopiesTerminal: true})
+		})
+		if err != nil {
+			t.Fatalf("settle logical mutation %d: %v", sequence, err)
+		}
+	}
+	producer, _, _, err := e.readMutationProducerForAuthority(ctx, authority)
+	if err != nil || producer.CompactedThrough == 0 || producer.CompactedThrough >= producer.LastAdmitted {
+		t.Fatalf("expected compacted prefix and retained suffix: producer=%+v err=%v", producer, err)
+	}
+	if _, err := e.change(ctx, uid, source, func(ledger *fencing.Ledger) error {
+		return ledger.CloseNodes("remove-voter", hashJSON("close-logical-voter"), []string{node})
+	}); err != nil {
+		t.Fatal(err)
+	}
+	archiveEvidence, err := e.evidenceStoreForMutationAuthority(authority)
+	if err != nil {
+		t.Fatal(err)
+	}
+	archivePath, err := archiveEvidence.objectKey(producer.ArchiveHead.Name)
+	if err != nil {
+		t.Fatal(err)
+	}
+	bucket.failReadKey = archivePath
+	if err := e.recordLogicalRunClosure(ctx, uid, id); err == nil {
+		t.Fatal("transient archive read failure incorrectly verified logical closure")
+	}
+	stillPending, _, _, err := e.readMutationProducerForAuthority(ctx, authority)
+	if err != nil || stillPending.EvidenceFault != "" {
+		t.Fatalf("transient archive read failure latched permanent corruption: producer=%+v err=%v", stillPending, err)
+	}
+	bucket.failReadKey = ""
+	if err := e.recordLogicalRunClosure(ctx, uid, id); err != nil {
+		t.Fatalf("closure rejected verified compacted terminal prefix: %v", err)
+	}
+	closedRoot, _, err := store.ReadRoot(ctx, uid, source)
+	if err != nil {
+		t.Fatal(err)
+	}
+	closure := closedRoot.Ledger.Runs[runID].LogicalClosure
+	if closure == nil {
+		t.Fatal("compacted closure reference was not persisted")
+	}
+	evidence, err := e.authorityEvidenceForRoot(uid, source)
+	if err != nil {
+		t.Fatal(err)
+	}
+	reader, _, err := evidence.Read(ctx, closure.EvidenceName)
+	if err != nil {
+		t.Fatal(err)
+	}
+	closedProducer, _, _, err := e.readMutationProducerForAuthority(ctx, authority)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var proof logicalStorageClosureEvidence
+	decodeErr := json.NewDecoder(reader).Decode(&proof)
+	closeErr := reader.Close()
+	if err := errors.Join(decodeErr, closeErr); err != nil || proof.CompactedThrough != closedProducer.CompactedThrough || proof.ClosedThrough != 130 ||
+		proof.EntryCount != 130 || proof.ClosedPrefixDigest == "" || proof.ArchiveHead == nil || len(proof.Entries) != int(closedProducer.ClosedThrough-closedProducer.CompactedThrough) {
+		t.Fatalf("compacted closure proof did not bind compacted prefix plus live suffix: proof=%+v err=%v", proof, err)
+	}
+}
+
 func TestLogicalUnboundNoWorkClosureRejectsAdmittedOrDispatchedProducer(t *testing.T) {
 	for _, tc := range []struct {
 		name  string
@@ -395,11 +593,22 @@ func TestLogicalProfileSupervisorHandlerRegistersAndBindsWithoutRuntimeAgent(t *
 		http.NotFound(w, r)
 	}))
 	t.Cleanup(storeGCS.Close)
-	containerSpec := object{"name": "rhiza", "image": "rhiza:test", "securityContext": object{"allowPrivilegeEscalation": false},
-		"volumeMounts": []any{object{"name": "data", "mountPath": "/data"}},
-		"envFrom":      []any{object{"configMapRef": object{"name": "rhiza-config"}}, object{"secretRef": object{"name": "peer-credentials"}}}}
+	image := "ghcr.io/example/rhiza@sha256:" + strings.Repeat("a", 64)
+	containerSpec := object{"name": "rhiza", "image": image, "command": []any{"/usr/local/bin/rhiza"}, "securityContext": object{"runAsNonRoot": true, "allowPrivilegeEscalation": false, "readOnlyRootFilesystem": true, "capabilities": object{"drop": []any{"ALL"}}},
+		"volumeMounts": []any{object{"name": "temporary", "mountPath": "/tmp"}, object{"name": "data", "mountPath": "/data"},
+			object{"name": "restore-staging", "mountPath": "/ha-restore-staging", "readOnly": true},
+			object{"name": "authority-token", "mountPath": "/var/run/secrets/rhiza-authority", "readOnly": true},
+			object{"name": "authority-ca", "mountPath": "/fencer-ca", "readOnly": true}},
+		"envFrom": []any{object{"configMapRef": object{"name": "rhiza-config"}}, object{"secretRef": object{"name": "peer-credentials"}}}}
+	initSpec := object{"name": "restore-init", "image": image, "imagePullPolicy": "IfNotPresent", "command": []any{"/usr/local/bin/rhiza"}, "args": []any{"restore-init"},
+		"envFrom":         []any{object{"configMapRef": object{"name": "rhiza-config"}}, object{"configMapRef": object{"name": "rhiza-object-store"}}},
+		"env":             []any{object{"name": "RHIZA_HA_INIT_RESTORE_DIR", "value": "/ha-restore-staging/stage"}},
+		"securityContext": object{"runAsNonRoot": true, "allowPrivilegeEscalation": false, "readOnlyRootFilesystem": true, "capabilities": object{"drop": []any{"ALL"}}},
+		"volumeMounts":    []any{object{"name": "temporary", "mountPath": "/tmp"}, object{"name": "restore-staging", "mountPath": "/ha-restore-staging"}}}
 	template := object{"metadata": object{"annotations": object{fencingProtocolAnnotation: "1", fencingRootAnnotation: rootUID}},
-		"spec": object{"containers": []any{containerSpec}, "volumes": []any{object{"name": "data", "emptyDir": object{}}}}}
+		"spec": object{"serviceAccountName": "rhiza-voter-reader", "automountServiceAccountToken": false,
+			"containers": []any{containerSpec}, "initContainers": []any{initSpec},
+			"volumes": []any{object{"name": "data", "emptyDir": object{}}, object{"name": "temporary", "emptyDir": object{}}, object{"name": "restore-staging", "emptyDir": object{}}}}}
 	clone, err := json.Marshal(template["spec"])
 	if err != nil {
 		t.Fatal(err)
@@ -421,7 +630,7 @@ func TestLogicalProfileSupervisorHandlerRegistersAndBindsWithoutRuntimeAgent(t *
 		switch r.URL.Path {
 		case "/apis/authentication.k8s.io/v1/tokenreviews":
 			_ = json.NewEncoder(w).Encode(object{"status": object{"authenticated": true, "audiences": []any{"rhiza-fencer"}, "user": object{
-				"username": "system:serviceaccount:default:default", "extra": object{
+				"username": "system:serviceaccount:default:rhiza-voter-reader", "extra": object{
 					"authentication.kubernetes.io/pod-uid": []any{podUID}, "authentication.kubernetes.io/pod-name": []any{podName}}}}})
 		case "/api/v1/namespaces/default/pods/" + podName:
 			_ = json.NewEncoder(w).Encode(pod)
@@ -591,8 +800,61 @@ func TestLogicalProfileSupervisorHandlerRegistersAndBindsWithoutRuntimeAgent(t *
 	nextBinding := fencing.LogicalWriterBindingV1{Version: fencing.LogicalWriterVersionV1, Profile: fencing.LogicalWriterProfileV1,
 		SourceClusterID: source, NodeID: nextIdentity.NodeID, RunID: nextIdentity.RunID, ProducerUID: "logical-producer-b",
 		StoreScopeHash: receipt.Producer.StoreScopeHash, Role: fencing.StartupRoleVoterActive}
+	rootForLoser, rootVersion, err := store.ReadRoot(t.Context(), stsUID, source)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := rootForLoser.Ledger.RegisterLogicalWithRole(nextIdentity, nextBinding); err != nil {
+		t.Fatal(err)
+	}
+	if err := rootForLoser.Ledger.BindLogicalMutationScope(nextIdentity, nextBinding.StoreScopeHash, fencing.MutationExecutionProfile); err != nil {
+		t.Fatal(err)
+	}
+	if err := rootForLoser.Ledger.BindLogicalMutationStage(nextIdentity, hashJSON("logical-producer-b-stage")); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.WriteRoot(t.Context(), stsUID, source, rootForLoser, rootVersion); err != nil {
+		t.Fatal(err)
+	}
 	if err := e.claimLogicalArchiveScopeForRegistration(t.Context(), stsUID, nextIdentity, nextBinding); err != nil {
 		t.Fatalf("next logical voter could not reuse the committed canonical archive scope: %v", err)
+	}
+	if err := e.reserveLogicalMutationProducer(t.Context(), stsUID, nextBinding); err != nil {
+		t.Fatal(err)
+	}
+	nextIdentity.WALIdentity = hashJSON("logical-producer-b-wal")
+	if _, err := e.bindLogicalSupervisorWAL(t.Context(), stsUID, nextIdentity); err != nil {
+		t.Fatalf("next logical voter WAL bind failed: %v", err)
+	}
+	rootForLoser, _, err = store.ReadRoot(t.Context(), stsUID, source)
+	if err != nil {
+		t.Fatal(err)
+	}
+	boundLoserBinding := *rootForLoser.Ledger.Runs[nextIdentity.RunID].LogicalBinding
+	loserIntent := intent
+	loserIntent.OperationID = fencing.MutationRequestID(nextBinding.ProducerUID, 1)
+	if err := e.cancelLogicalArchiveGenesisLoser(t.Context(), stsUID, nextIdentity, boundLoserBinding, nextBinding.ProducerUID, 1, loserIntent); err != nil {
+		t.Fatalf("logical archive-genesis loser tuple was not atomically consumed: %v", err)
+	}
+	loserProducer, loserProducerUID, _, err := store.ReadLogicalProducer(t.Context(), stsUID, boundLoserBinding)
+	if err != nil || loserProducerUID != nextBinding.ProducerUID || loserProducer.LastAdmitted != 1 ||
+		loserProducer.Entries[1].Resolution == nil || loserProducer.Entries[1].Resolution.Outcome != fencing.MutationRejected || !loserProducer.Entries[1].Resolution.AllCopiesTerminal {
+		t.Fatalf("logical genesis loser is not terminally rejected: producer=%+v err=%v", loserProducer, err)
+	}
+	if err := e.cancelLogicalArchiveGenesisLoser(t.Context(), stsUID, nextIdentity, boundLoserBinding, nextBinding.ProducerUID, 1, loserIntent); err != nil {
+		t.Fatalf("exact logical genesis loser retry was not idempotent: %v", err)
+	}
+	if _, err := e.change(t.Context(), stsUID, source, func(ledger *fencing.Ledger) error {
+		return ledger.CloseNodes("remove-loser", hashJSON("remove-loser-request"), []string{nextIdentity.NodeID})
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := e.recordLogicalRunClosure(t.Context(), stsUID, nextIdentity); err != nil {
+		t.Fatalf("logical Run with an exact terminal genesis cancellation did not close: %v", err)
+	}
+	closedLoserRoot, _, err := store.ReadRoot(t.Context(), stsUID, source)
+	if err != nil || closedLoserRoot.Ledger.Runs[nextIdentity.RunID].LogicalClosure == nil {
+		t.Fatalf("logical cancellation closure was not persisted: root=%+v err=%v", closedLoserRoot.Ledger, err)
 	}
 	logicalProducer, _, _, err = store.ReadLogicalProducer(t.Context(), stsUID, *receipt.LogicalBinding)
 	if err != nil || logicalProducer.Entries[1].Resolution == nil || !logicalProducer.Entries[1].Resolution.AllCopiesTerminal || logicalProducer.Entries[1].Resolution.Outcome != fencing.MutationCommitted {

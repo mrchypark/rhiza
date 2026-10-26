@@ -8,7 +8,9 @@ import (
 	"fmt"
 	"io"
 
+	"cloud.google.com/go/storage"
 	"github.com/mrchypark/rhiza/pkg/fencing"
+	"github.com/mrchypark/rhiza/pkg/recovery"
 	"github.com/thanos-io/objstore"
 )
 
@@ -348,26 +350,171 @@ func (e *FencingExecutor) recordLogicalUnboundNoWorkClosure(ctx context.Context,
 }
 
 type logicalStorageClosureEvidence struct {
-	Version             int                            `json:"version"`
-	ClosureKind         string                         `json:"closureKind"`
-	RootIdentity        string                         `json:"rootIdentity"`
-	Identity            fencing.Identity               `json:"identity"`
-	Binding             fencing.LogicalWriterBindingV1 `json:"binding"`
-	ProducerUID         string                         `json:"producerUID"`
-	StoreScopeHash      string                         `json:"storeScopeHash"`
-	CloseOperationID    string                         `json:"closeOperationID"`
-	CloseRequestHash    string                         `json:"closeRequestHash"`
-	ClosedThrough       uint64                         `json:"closedThrough"`
-	ProducerStateDigest string                         `json:"producerStateDigest"`
-	Entries             []logicalStorageClosureEntry   `json:"entries"`
+	Version             int                               `json:"version"`
+	ClosureKind         string                            `json:"closureKind"`
+	RootIdentity        string                            `json:"rootIdentity"`
+	Identity            fencing.Identity                  `json:"identity"`
+	Binding             fencing.LogicalWriterBindingV1    `json:"binding"`
+	ProducerUID         string                            `json:"producerUID"`
+	StoreScopeHash      string                            `json:"storeScopeHash"`
+	CloseOperationID    string                            `json:"closeOperationID"`
+	CloseRequestHash    string                            `json:"closeRequestHash"`
+	ClosedThrough       uint64                            `json:"closedThrough"`
+	CompactedThrough    uint64                            `json:"compactedThrough,omitempty"`
+	ArchiveHead         *fencing.MutationArchiveReference `json:"archiveHead,omitempty"`
+	ClosedPrefixDigest  string                            `json:"closedPrefixDigest,omitempty"`
+	EntryCount          uint64                            `json:"entryCount,omitempty"`
+	ProducerStateDigest string                            `json:"producerStateDigest"`
+	Entries             []logicalStorageClosureEntry      `json:"entries"`
 }
 
 type logicalStorageClosureEntry struct {
-	Sequence        uint64 `json:"sequence"`
-	OperationID     string `json:"operationID"`
-	ReceiptDigest   string `json:"receiptDigest,omitempty"`
-	GuardDigest     string `json:"guardDigest,omitempty"`
-	EffectsExcluded bool   `json:"effectsExcluded"`
+	Sequence           uint64 `json:"sequence"`
+	OperationID        string `json:"operationID"`
+	Outcome            string `json:"outcome,omitempty"`
+	ReceiptDigest      string `json:"receiptDigest,omitempty"`
+	CancellationDigest string `json:"cancellationDigest,omitempty"`
+	GuardDigest        string `json:"guardDigest,omitempty"`
+	EffectsExcluded    bool   `json:"effectsExcluded"`
+}
+
+func (e *FencingExecutor) verifyLogicalStorageClosureEntry(ctx context.Context, uid string, id fencing.Identity,
+	binding fencing.LogicalWriterBindingV1, run fencing.Run, producerUID string, sequence uint64, entry fencing.MutationEntry,
+	provider *gcsMutationProvider) (logicalStorageClosureEntry, error) {
+	result := logicalStorageClosureEntry{Sequence: sequence, OperationID: entry.Intent.OperationID}
+	if sequence == 0 || entry.Intent.OperationID != fencing.MutationRequestID(producerUID, sequence) ||
+		entry.Intent.StoreScopeHash != run.MutationScopeHash || !entry.DispatchClosed {
+		return result, ErrFencePending
+	}
+	if entry.GuardedLogicalResolution != nil {
+		authority := logicalMutationAuthority(uid, binding)
+		if err := e.verifyGuardedLogicalResolutionForAuthority(ctx, authority, run, producerUID, sequence, entry, provider); err != nil {
+			return result, errors.Join(ErrFencePending, err)
+		}
+		result.Outcome = string(fencing.MutationCommitted)
+		result.GuardDigest = entry.GuardedLogicalResolution.GuardDigest
+		result.EffectsExcluded = true
+		return result, nil
+	}
+	if entry.Resolution == nil || entry.CopyCompletion != nil || entry.GenerationZeroGuard != nil {
+		return result, ErrFencePending
+	}
+	resolution := entry.Resolution
+	if entry.Preparation == nil {
+		if resolution.Outcome != fencing.MutationRejected || resolution.ConditionFailed || resolution.PayloadDigest != "" ||
+			!resolution.AllCopiesTerminal || len(entry.Dispatches) != 0 {
+			return result, ErrFencePending
+		}
+		if err := e.verifyLogicalArchiveGenesisCancellation(ctx, uid, id, binding, producerUID, sequence, entry.Intent, resolution.ReceiptDigest); err != nil {
+			return result, err
+		}
+		result.Outcome = string(resolution.Outcome)
+		result.CancellationDigest = resolution.ReceiptDigest
+		result.EffectsExcluded = true
+		return result, nil
+	}
+	if len(entry.Dispatches) != 1 || resolution.Outcome != fencing.MutationCommitted && resolution.Outcome != fencing.MutationExcluded && resolution.Outcome != fencing.MutationRejected {
+		return result, ErrFencePending
+	}
+	authority := logicalMutationAuthority(uid, binding)
+	owner := authority.mutationOwner(run, producerUID, sequence, entry.Intent)
+	receipts, err := e.receiptsForLogicalBinding(uid, binding)
+	if err != nil {
+		return result, err
+	}
+	receipt, err := receipts.get("receipt-" + owner)
+	if err != nil || !authority.matchesReceipt(receipt, run, producerUID, sequence, entry.Intent) || receipt.Preparation != *entry.Preparation ||
+		receipt.ReceiptDigest != receipt.digest() || receipt.ReceiptDigest != resolution.ReceiptDigest || receipt.Outcome != resolution.Outcome ||
+		receipt.ConditionFailed != resolution.ConditionFailed || receipt.PayloadDigest != resolution.PayloadDigest ||
+		receipt.AllCopiesTerminal != resolution.AllCopiesTerminal || !mutationReceiptMatchesDispatch(entry, receipt) {
+		return result, errors.Join(ErrFencePending, err, fmt.Errorf("fencing: logical mutation receipt differs from its closed journal tuple"))
+	}
+	result.Outcome = string(resolution.Outcome)
+	result.ReceiptDigest = receipt.ReceiptDigest
+	switch resolution.Outcome {
+	case fencing.MutationCommitted:
+		if !receipt.AllCopiesTerminal {
+			return result, ErrFencePending
+		}
+		if entry.Intent.Kind != "upload" && entry.Intent.Kind != "delete" {
+			return result, ErrFencePending
+		}
+	case fencing.MutationRejected:
+		if !receipt.ConditionFailed || !receipt.AllCopiesTerminal || receipt.PayloadDigest != "" || receipt.Metageneration != 0 ||
+			receipt.Generation != receipt.Preparation.Generation || entry.Intent.Condition.Mode != fencing.MutationMatchGeneration ||
+			entry.Intent.Condition.Generation != receipt.Preparation.Generation {
+			return result, ErrFencePending
+		}
+	case fencing.MutationExcluded:
+		if receipt.ConditionFailed || receipt.PayloadDigest != "" || entry.Intent.Kind != "delete" || receipt.Generation != receipt.Preparation.Generation ||
+			entry.Preparation.Generation <= 0 {
+			return result, ErrFencePending
+		}
+		if err := verifyLogicalDeletedGeneration(ctx, provider, entry.Intent.Key, receipt.Generation); err != nil {
+			return result, errors.Join(ErrFencePending, err)
+		}
+	}
+	result.EffectsExcluded = true
+	return result, nil
+}
+
+func verifyLogicalDeletedGeneration(ctx context.Context, provider *gcsMutationProvider, key string, generation int64) error {
+	if provider == nil || generation <= 0 {
+		return ErrFencePending
+	}
+	object := provider.object(key)
+	if object == nil {
+		return ErrFencePending
+	}
+	_, err := object.Generation(generation).Retryer(storage.WithPolicy(storage.RetryNever)).Attrs(ctx)
+	if errors.Is(err, storage.ErrObjectNotExist) {
+		return nil
+	}
+	return errors.Join(err, ErrFencePending)
+}
+
+func (e *FencingExecutor) verifyLogicalArchiveGenesisCancellation(ctx context.Context, uid string, id fencing.Identity,
+	binding fencing.LogicalWriterBindingV1, producerUID string, sequence uint64, intent fencing.MutationIntent, digest string) error {
+	if !validEvidenceDigest(digest) || isArchiveGenesisMutation(intent) && intent.OperationID == "" {
+		return ErrFencePending
+	}
+	evidence, err := e.authorityEvidenceForRoot(uid, id.SourceClusterID)
+	if err != nil {
+		return err
+	}
+	reader, _, err := evidence.Read(ctx, "archive-genesis-cancellations/"+digest)
+	if err != nil {
+		return errors.Join(ErrFencePending, err)
+	}
+	data, readErr := io.ReadAll(io.LimitReader(reader, (1<<20)+1))
+	closeErr := reader.Close()
+	if err := errors.Join(readErr, closeErr); err != nil || len(data) > 1<<20 || authorityStateDigest(data) != digest {
+		return errors.Join(ErrFencePending, err)
+	}
+	var proof logicalArchiveGenesisCancellationProof
+	decoder := json.NewDecoder(bytes.NewReader(data))
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(&proof); err != nil || decoder.Decode(new(any)) != io.EOF {
+		return errors.Join(ErrFencePending, err)
+	}
+	canonical, err := json.Marshal(proof)
+	if err != nil || !bytes.Equal(canonical, data) || proof.Version != 1 || proof.StatefulSetUID != uid || proof.SourceClusterID != id.SourceClusterID ||
+		proof.Binding != binding || proof.WALIdentity != id.WALIdentity || proof.ProducerUID != producerUID || proof.Sequence != sequence || proof.Intent != intent ||
+		proof.WinningGenesis.Validate() != nil || proof.WinningGenesis.Mutation == nil ||
+		(proof.WinningGenesis.Mutation.ProducerUID == producerUID && proof.WinningGenesis.Mutation.Sequence == sequence && proof.WinningGenesis.Mutation.Intent == intent) {
+		return errors.Join(ErrFencePending, err)
+	}
+	scope, scopeHash, err := e.logicalArchiveScope(ctx, uid, binding)
+	if err != nil || proof.WinningGenesis.ScopeHash != scopeHash {
+		return errors.Join(ErrFencePending, err)
+	}
+	claim, _, err := e.AuthorityState.ReadArchiveScopeClaim(ctx, scope)
+	root, rootErr := e.read(ctx, uid, id.SourceClusterID)
+	if err != nil || rootErr != nil || claim.ConfigID != recovery.ArchiveConfigID || claim.ScopeHash != scopeHash ||
+		!sameArchiveGenesisRef(claim.GenesisRef, &proof.WinningGenesis) || !sameArchiveGenesisRef(root.Ledger.ArchiveGenesisRef, &proof.WinningGenesis) {
+		return errors.Join(ErrFencePending, err, rootErr)
+	}
+	return nil
 }
 
 func (e *FencingExecutor) verifyLogicalStorageClosure(ctx context.Context, uid string, id fencing.Identity, binding fencing.LogicalWriterBindingV1,
@@ -375,7 +522,7 @@ func (e *FencingExecutor) verifyLogicalStorageClosure(ctx context.Context, uid s
 	if e == nil || e.SourceMutationStorage == nil || run.LogicalBinding == nil || *run.LogicalBinding != binding || run.Runtime != nil ||
 		producer.Profile != fencing.LogicalWriterProfileV1 || !sameLogicalProducerBinding(producer.LogicalBinding, &binding) ||
 		producer.Phase != fencing.MutationClosed || producer.Validate() != nil || producerUID != run.MutationProducerUID ||
-		producer.WALIdentity != id.WALIdentity || producer.ClosedThrough != producer.LastAdmitted || producer.CompactedThrough != 0 || producer.ArchiveHead != nil {
+		producer.WALIdentity != id.WALIdentity || producer.ClosedThrough != producer.LastAdmitted {
 		return "", "", "", ErrFencePending
 	}
 	scope, err := e.sourceMutationStorageScopeForRoot(ctx, uid, id.SourceClusterID)
@@ -392,53 +539,70 @@ func (e *FencingExecutor) verifyLogicalStorageClosure(ctx context.Context, uid s
 	}
 	proof := logicalStorageClosureEvidence{Version: 1, ClosureKind: fencing.LogicalRunClosureBoundWAL, RootIdentity: evidenceStore.Identity(), Identity: id, Binding: binding,
 		ProducerUID: producerUID, StoreScopeHash: run.MutationScopeHash, CloseOperationID: producer.CloseOperationID,
-		CloseRequestHash: producer.CloseRequestHash, ClosedThrough: producer.ClosedThrough, ProducerStateDigest: hashJSON(producer)}
-	for sequence := uint64(0); sequence < producer.ClosedThrough; {
-		sequence++
-		entry, exists := producer.Entries[sequence]
-		if !exists || entry.DispatchClosed != true {
+		CloseRequestHash: producer.CloseRequestHash, ClosedThrough: producer.ClosedThrough, CompactedThrough: producer.CompactedThrough,
+		ArchiveHead: producer.ArchiveHead, ProducerStateDigest: hashJSON(producer), EntryCount: producer.ClosedThrough}
+	authority := logicalMutationAuthority(uid, binding)
+	prefixDigest := hashJSON([]any{"logical-storage-closed-prefix-v1", uid, id.SourceClusterID, id, binding, producerUID, producer.ClosedThrough})
+	if producer.CompactedThrough > 0 {
+		if producer.ArchiveHead == nil {
 			return "", "", "", ErrFencePending
 		}
-		if entry.GuardedLogicalResolution != nil {
-			authority := mutationExecutionAuthority{statefulSetUID: uid, sourceClusterID: id.SourceClusterID, runID: id.RunID, logicalBinding: &binding}
-			if err := e.verifyGuardedLogicalResolutionForAuthority(ctx, authority, run, producerUID, sequence, entry, provider); err != nil {
-				return "", "", "", errors.Join(ErrFencePending, err)
-			}
-			proof.Entries = append(proof.Entries, logicalStorageClosureEntry{Sequence: sequence, OperationID: entry.Intent.OperationID,
-				GuardDigest: entry.GuardedLogicalResolution.GuardDigest, EffectsExcluded: true})
-			continue
-		}
-		if entry.Resolution == nil || entry.Preparation == nil || !entry.Resolution.AllCopiesTerminal || entry.Resolution.Outcome != fencing.MutationCommitted ||
-			entry.CopyCompletion != nil || len(entry.Dispatches) != 1 {
-			return "", "", "", ErrFencePending
-		}
-		authority := mutationExecutionAuthority{statefulSetUID: uid, sourceClusterID: id.SourceClusterID, runID: id.RunID, logicalBinding: &binding}
-		owner := authority.mutationOwner(run, producerUID, sequence, entry.Intent)
-		receipts, err := e.receiptsForLogicalBinding(uid, binding)
-		if err != nil {
-			return "", "", "", err
-		}
-		receipt, err := receipts.get("receipt-" + owner)
-		if err != nil || !authority.matchesReceipt(receipt, run, producerUID, sequence, entry.Intent) || receipt.Preparation != *entry.Preparation ||
-			receipt.ReceiptDigest != receipt.digest() || receipt.ReceiptDigest != entry.Resolution.ReceiptDigest || receipt.Outcome != entry.Resolution.Outcome ||
-			receipt.PayloadDigest != entry.Resolution.PayloadDigest || receipt.AllCopiesTerminal != entry.Resolution.AllCopiesTerminal || !mutationReceiptMatchesDispatch(entry, receipt) {
-			return "", "", "", errors.Join(ErrFencePending, err, fmt.Errorf("fencing: logical mutation receipt differs from the closed journal tuple"))
-		}
-		if fencing.IsHeldCreateEligible(entry.Intent, *entry.Preparation) {
-			if provider.finalizeHeldCreate(ctx, entry.Intent.Key, entry.Intent, receipt) != nil {
+		refs := make([]fencing.MutationArchiveReference, 0, 8)
+		next := *producer.ArchiveHead
+		expectedThrough := producer.CompactedThrough
+		for links := 0; ; links++ {
+			if links >= 8192 || !next.Valid() {
 				return "", "", "", ErrFencePending
 			}
-		} else {
-			committed, found, err := provider.committed(ctx, entry.Intent.Key, entry.Intent, *entry.Preparation)
-			if err != nil || !found || (entry.Intent.Kind == "upload" && (committed.Outcome != fencing.MutationCommitted || committed.Generation != receipt.Generation ||
-				committed.Metageneration != receipt.Metageneration || committed.PayloadDigest != receipt.PayloadDigest)) ||
-				(entry.Intent.Kind == "delete" && (committed.Outcome != fencing.MutationExcluded || committed.Generation != receipt.Generation)) {
-				return "", "", "", errors.Join(ErrFencePending, err, fmt.Errorf("fencing: logical mutation storage readback differs from its receipt"))
+			plan, readErr := e.readMutationArchiveForAuthority(ctx, authority, next, producerUID, producer.WALIdentity)
+			if readErr != nil {
+				return "", "", "", errors.Join(ErrFencePending, e.logicalMutationArchiveFailure(ctx, authority, readErr))
+			}
+			if plan.Through != expectedThrough || plan.PreviousThrough >= plan.Through || uint64(len(plan.Entries)) != plan.Through-plan.PreviousThrough {
+				return "", "", "", e.logicalMutationArchiveFailure(ctx, authority, errMutationArchiveEvidence)
+			}
+			refs = append(refs, next)
+			expectedThrough = plan.PreviousThrough
+			if plan.Previous == nil {
+				if expectedThrough != 0 {
+					return "", "", "", ErrFencePending
+				}
+				break
+			}
+			next = *plan.Previous
+		}
+		for i := len(refs) - 1; i >= 0; i-- {
+			plan, readErr := e.readMutationArchiveForAuthority(ctx, authority, refs[i], producerUID, producer.WALIdentity)
+			if readErr != nil {
+				return "", "", "", errors.Join(ErrFencePending, e.logicalMutationArchiveFailure(ctx, authority, readErr))
+			}
+			for sequence := plan.PreviousThrough + 1; sequence <= plan.Through; sequence++ {
+				entry, exists := plan.Entries[sequence]
+				if !exists {
+					return "", "", "", e.logicalMutationArchiveFailure(ctx, authority, errMutationArchiveEvidence)
+				}
+				closureEntry, verifyErr := e.verifyLogicalStorageClosureEntry(ctx, uid, id, binding, run, producerUID, sequence, entry, provider)
+				if verifyErr != nil {
+					return "", "", "", verifyErr
+				}
+				prefixDigest = hashJSON([]any{"logical-storage-closed-prefix-entry-v1", sequence, closureEntry, prefixDigest})
 			}
 		}
-		proof.Entries = append(proof.Entries, logicalStorageClosureEntry{Sequence: sequence, OperationID: entry.Intent.OperationID,
-			ReceiptDigest: receipt.ReceiptDigest, EffectsExcluded: true})
 	}
+	for sequence := producer.CompactedThrough; sequence < producer.ClosedThrough; {
+		sequence++
+		entry, exists := producer.Entries[sequence]
+		if !exists {
+			return "", "", "", ErrFencePending
+		}
+		closureEntry, verifyErr := e.verifyLogicalStorageClosureEntry(ctx, uid, id, binding, run, producerUID, sequence, entry, provider)
+		if verifyErr != nil {
+			return "", "", "", verifyErr
+		}
+		proof.Entries = append(proof.Entries, closureEntry)
+		prefixDigest = hashJSON([]any{"logical-storage-closed-prefix-entry-v1", sequence, closureEntry, prefixDigest})
+	}
+	proof.ClosedPrefixDigest = prefixDigest
 	body, err := json.Marshal(proof)
 	if err != nil {
 		return "", "", "", err
@@ -480,7 +644,12 @@ func (e *FencingExecutor) lookupMutationForAuthority(ctx context.Context, author
 		return fencing.MutationLookupResult{}, nil
 	}
 	if request.Sequence <= producer.CompactedThrough {
-		return fencing.MutationLookupResult{}, ErrFencePending
+		entry, err := e.lookupArchivedMutationForAuthority(ctx, authority, request.ProducerUID, request.Sequence, request.Intent)
+		if err != nil {
+			return fencing.MutationLookupResult{}, err
+		}
+		return fencing.MutationLookupResult{Found: true, Archived: true, CompactedThrough: producer.CompactedThrough,
+			ArchiveHead: producer.ArchiveHead, Entry: &entry}, nil
 	}
 	entry, ok := producer.Entries[request.Sequence]
 	if !ok || entry.Intent != request.Intent {

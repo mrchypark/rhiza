@@ -264,6 +264,12 @@ func TestLogicalAssignedLearnerBindsOnlyExpectedWALAndPromotesWithTypedEvidence(
 	if err := l.PromoteLogicalLearner(identity, badProof, active, MutationExecutionProfile, strings.Repeat("a", 64)); err == nil {
 		t.Fatal("logical learner promoted without ordered canonical REMOVE/ADD/activation evidence")
 	}
+	if err := l.PromoteLogicalLearner(identity, proof, active, MutationExecutionProfile, strings.Repeat("a", 64)); err == nil {
+		t.Fatal("logical learner promoted before the replaced writer's storage-effects closure")
+	}
+	if err := installClosedReplacedLogicalRun(&l, recovery); err != nil {
+		t.Fatal(err)
+	}
 	if err := l.PromoteLogicalLearner(identity, proof, active, MutationExecutionProfile, strings.Repeat("a", 64)); err != nil {
 		t.Fatal(err)
 	}
@@ -278,6 +284,69 @@ func TestLogicalAssignedLearnerBindsOnlyExpectedWALAndPromotesWithTypedEvidence(
 	if err := l.PromoteLogicalLearner(identity, proof, active, MutationExecutionProfile, strings.Repeat("a", 64)); err != nil {
 		t.Fatalf("exact promotion retry: %v", err)
 	}
+}
+
+func TestLogicalAssignedLearnerPinsWALAtFirstAuthenticatedBind(t *testing.T) {
+	l := logicalTestLedger()
+	identity := Identity{SourceClusterID: "source", NodeID: "new-node", PodName: "rhiza-1", PodUID: "pod-new",
+		RunID: "run-new", AssignmentID: strings.Repeat("1", 64)}
+	recovery := LogicalRecoveryBindingV1{Version: LogicalRecoveryBindingVersionV1, Kind: LogicalRecoveryReplacement,
+		OperationID: "assignment-op", AssignmentID: identity.AssignmentID, ReplacedNodeID: "old-node",
+		ReplacedWALIdentity: strings.Repeat("2", 64), RemoveOperationID: "remove-op", AddOperationID: "add-op",
+		TargetConfigID: 2, TargetMembershipHash: strings.Repeat("3", 64)}
+	binding := LogicalWriterBindingV1{Version: LogicalWriterVersionV1, Profile: LogicalWriterProfileV1,
+		SourceClusterID: identity.SourceClusterID, NodeID: identity.NodeID, RunID: identity.RunID,
+		AssignmentID: identity.AssignmentID, Role: StartupRoleLearnerPendingRemove, Recovery: recovery}
+	if err := l.RegisterLogicalWithRole(identity, binding); err != nil {
+		t.Fatalf("register assignment before a fresh local WAL exists: %v", err)
+	}
+	identity.WALIdentity = strings.Repeat("4", 64)
+	if err := l.BindLogicalWAL(identity); err != nil {
+		t.Fatalf("bind candidate's first authenticated WAL: %v", err)
+	}
+	run := l.Runs[identity.RunID]
+	if run.LogicalBinding == nil || run.LogicalBinding.WALIdentity != identity.WALIdentity ||
+		run.LogicalBinding.Recovery.ExpectedWALIdentity != identity.WALIdentity || run.MutationProducerUID != "" || run.MutationScopeHash != "" {
+		t.Fatalf("first bind did not pin WAL without granting mutation authority: %+v", run)
+	}
+	if err := l.ValidateProfile(); err != nil {
+		t.Fatalf("profile rejected the atomically pinned pending WAL: %v", err)
+	}
+	other := identity
+	other.WALIdentity = strings.Repeat("5", 64)
+	if err := l.BindLogicalWAL(other); err == nil {
+		t.Fatal("assigned learner rebound its immutable WAL")
+	}
+}
+
+func installClosedReplacedLogicalRun(l *Ledger, recovery LogicalRecoveryBindingV1) error {
+	identity := Identity{SourceClusterID: l.SourceClusterID, NodeID: recovery.ReplacedNodeID, RunID: "run-replaced"}
+	binding := LogicalWriterBindingV1{Version: LogicalWriterVersionV1, Profile: LogicalWriterProfileV1,
+		SourceClusterID: identity.SourceClusterID, NodeID: identity.NodeID, RunID: identity.RunID,
+		ProducerUID: "producer-replaced", StoreScopeHash: strings.Repeat("b", 64),
+		Role: StartupRoleVoterActive}
+	if err := l.RegisterLogicalWithRole(Identity{SourceClusterID: identity.SourceClusterID, NodeID: identity.NodeID, RunID: identity.RunID}, binding); err != nil {
+		return err
+	}
+	if err := l.BindLogicalMutationScope(Identity{SourceClusterID: identity.SourceClusterID, NodeID: identity.NodeID, RunID: identity.RunID}, binding.StoreScopeHash, MutationExecutionProfile); err != nil {
+		return err
+	}
+	if err := l.BindLogicalMutationStage(Identity{SourceClusterID: identity.SourceClusterID, NodeID: identity.NodeID, RunID: identity.RunID}, strings.Repeat("c", 64)); err != nil {
+		return err
+	}
+	identity.WALIdentity = recovery.ReplacedWALIdentity
+	if err := l.BindLogicalWAL(identity); err != nil {
+		return err
+	}
+	close := StopRequest{OperationID: "close-replaced", RequestHash: strings.Repeat("d", 64), Identity: identity}
+	run := l.Runs[identity.RunID]
+	run.Stop = &close
+	l.Runs[identity.RunID] = run
+	return l.RecordLogicalRunClosure(LogicalRunClosureReference{Version: LogicalRunClosureReferenceVersion,
+		Kind: LogicalRunClosureBoundWAL, Identity: identity, ProducerUID: binding.ProducerUID,
+		StoreScopeHash: binding.StoreScopeHash, CloseOperationID: close.OperationID, CloseRequestHash: close.RequestHash,
+		ProducerStateDigest: strings.Repeat("e", 64), EvidenceName: "closure-evidence", EvidenceUID: "evidence-uid",
+		EvidenceDigest: strings.Repeat("f", 64)})
 }
 
 func TestLogicalPromotionReceiptMustPreserveAssignedRecovery(t *testing.T) {

@@ -165,9 +165,9 @@ func TestLogicalAuthorityWorkloadSeparatesRestoreStageAndWriterCredentials(t *te
 	if !projectedAudience(volumes, "authority-token", "rhiza-fencer", "token") {
 		t.Fatal("main authority token must be projected for the rhiza-fencer audience")
 	}
-	if envValue(t, init["env"], "RHIZA_HA_INIT_RESTORE_DIR") != "/ha-restore-staging" ||
-		envValue(t, main["env"], "RHIZA_HA_INIT_RESTORE_DIR") != "/ha-restore-staging" {
-		t.Fatal("init/main stage path differs from the mounted restore staging directory")
+	if envValue(t, init["env"], "RHIZA_HA_INIT_RESTORE_DIR") != "/ha-restore-staging/stage" ||
+		envValue(t, main["env"], "RHIZA_HA_INIT_RESTORE_DIR") != "/ha-restore-staging/stage" {
+		t.Fatal("init/main must share the exact stage child on the mounted restore staging directory")
 	}
 	if envValue(t, main["env"], "RHIZA_AUTHORITY_PROFILE") != "logical-writer-v1" ||
 		envValue(t, main["env"], "RHIZA_AUTHORITY_URL") != "https://rhiza-fencer:9444/v1/supervisor" ||

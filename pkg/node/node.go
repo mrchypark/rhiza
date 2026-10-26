@@ -374,6 +374,16 @@ func (n *Node) open(ctx context.Context, enroll bool) (err error) {
 	if err != nil {
 		return fmt.Errorf("load voter identity: %w", err)
 	}
+	haStageEligible := cleanStart && localVoter.identity == nil && !localVoter.hadWAL
+	if haStageEligible && n.config.HAInitRestoreDir != "" {
+		// Check freshness before logical registration writes logical-run.json
+		// and the source retry journal into DataDir. Those exact startup-owned
+		// files do not make a pristine staged restore stale, but pre-existing
+		// non-qlog state must still fail closed.
+		if err := validateHAStageOnlyQlog(n.config.DataDir); err != nil {
+			return fmt.Errorf("HA init restore requires a fresh DataDir: %w", err)
+		}
+	}
 	if directAuthority {
 		if err := n.connectFenceSession(ctx); err != nil {
 			return err
@@ -395,7 +405,6 @@ func (n *Node) open(ctx context.Context, enroll bool) (err error) {
 	}
 	var haStageDir string
 	var haStageIndex *haRestoreStageIndex
-	haStageEligible := cleanStart && localVoter.identity == nil && !localVoter.hadWAL
 	if n.config.HAInitRestoreDir != "" {
 		haStageDir, err = resolveHAStagePath(n.config.DataDir, n.config.HAInitRestoreDir)
 		if err != nil {
@@ -633,11 +642,6 @@ func (n *Node) open(ctx context.Context, enroll bool) (err error) {
 	phase = nodeOpenPhaseMaterializer
 	var material *materializer.Materializer
 	if localRestoreAuthority == nil {
-		if haStageEligible && haStageIndex != nil {
-			if err := validateHAStageOnlyQlog(n.config.DataDir); err != nil {
-				return fmt.Errorf("HA init restore requires a fresh DataDir: %w", err)
-			}
-		}
 		material, err = materializer.Open(filepath.Join(n.config.DataDir, "sqlite.db"), 4)
 		if err != nil {
 			if errors.Is(err, sqlpolicy.ErrIncompatible) {
@@ -2437,8 +2441,7 @@ func (n *Node) apiReady() bool {
 }
 
 func (n *Node) logicalPendingLearner() bool {
-	return n != nil && ((n.authorityClient != nil && n.authorityGrant.Role == fencing.StartupRoleLearnerPendingRemove) ||
-		(n.fenceSession != nil && n.fenceSession.StartupRole() == fencing.StartupRoleLearnerPendingRemove))
+	return n != nil && n.authorityClient != nil && n.authorityGrant.Role == fencing.StartupRoleLearnerPendingRemove
 }
 
 func (n *Node) supervisedEngineRepairCandidatePending() bool {
