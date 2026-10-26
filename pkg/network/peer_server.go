@@ -475,7 +475,7 @@ func (s *PeerServer) handle(ctx context.Context, certificateKey ed25519.PublicKe
 		// was blocked.
 		gapKey, capturedGap := s.server.core.PendingTerminalGapForLearn(decision)
 		if !s.server.PeerLearnReady() && !s.server.PeerLearnDecisionAllowed(decision) {
-			return nil, ErrNotReady
+			return nil, fmt.Errorf("%w: learned admission phase=before-catchup node=%s slot=%d config=%d pending=%t", ErrNotReady, s.server.core.NodeID(), decision.Slot, decision.ConfigID, capturedGap)
 		}
 		control, controlErr := quepaxa.DecodeReconfiguration(decision.Proposal.Value)
 		if control && localtesthooks.Enabled {
@@ -544,10 +544,10 @@ func (s *PeerServer) handle(ctx context.Context, certificateKey ed25519.PublicKe
 		// immediately before normal certificate validation and durable accept.
 		if capturedGap && !s.server.core.PendingTerminalGap(gapKey) &&
 			!s.server.core.AllowsInstalledTerminalLearn(decision) {
-			return nil, ErrNotReady
+			return nil, fmt.Errorf("%w: learned admission phase=round-recheck node=%s slot=%d config=%d", ErrNotReady, s.server.core.NodeID(), decision.Slot, decision.ConfigID)
 		}
 		if !s.server.PeerLearnReady() && !s.server.PeerLearnDecisionAllowed(decision) {
-			return nil, ErrNotReady
+			return nil, fmt.Errorf("%w: learned admission phase=after-catchup node=%s slot=%d config=%d pending=%t", ErrNotReady, s.server.core.NodeID(), decision.Slot, decision.ConfigID, capturedGap)
 		}
 		if localtesthooks.Enabled {
 			localtesthooks.Hit(fmt.Sprintf("network:learned:phase=accept-start:node=%s:sender=%s:slot=%d", s.server.core.NodeID(), request.SenderId, decision.Slot))
