@@ -54,7 +54,7 @@ containers="$containers $list_id"
 docker start "$list_id" >/dev/null
 if [ "$(docker wait "$list_id")" -ne 0 ]; then echo "Could not list selected tests" >&2; exit 1; fi
 docker logs "$list_id" >"$run_dir/selected-tests.txt" 2>&1
-if ! rg '^Test[[:alnum:]_]+$' "$run_dir/selected-tests.txt" >/dev/null; then
+if ! grep -E '^Test[[:alnum:]_]+$' "$run_dir/selected-tests.txt" >/dev/null; then
  echo "Test pattern selected no tests: $pattern" >&2
  exit 1
 fi

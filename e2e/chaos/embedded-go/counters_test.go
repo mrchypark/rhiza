@@ -3329,8 +3329,12 @@ func TestQualificationGNUTimeoutIgnoresUutils(t *testing.T) {
 		t.Fatal(err)
 	}
 	t.Setenv("PATH", dir)
-	if got := qualificationGNUTimeout(t); got != filepath.Join(dir, "gtimeout") {
-		t.Fatalf("selected %s instead of validated GNU timeout", got)
+	got := qualificationGNUTimeout(t)
+	if got == filepath.Join(dir, "timeout") {
+		t.Fatalf("selected shadowing uutils timeout: %s", got)
+	}
+	if output, err := exec.Command(got, "--version").CombinedOutput(); err != nil || !bytes.Contains(output, []byte("GNU coreutils")) {
+		t.Fatalf("selected %s is not GNU timeout: %v %s", got, err, output)
 	}
 }
 
