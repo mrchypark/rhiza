@@ -946,12 +946,19 @@ func TestConcurrentProposersPreserveBothCommands(t *testing.T) {
 		err  error
 	}
 	results := make(chan result, 2)
+	start := make(chan struct{})
+	var ready sync.WaitGroup
+	ready.Add(2)
 	for id, value := range map[NodeID]string{"n2": "alpha", "n3": "beta"} {
 		go func(id NodeID, value string) {
+			ready.Done()
+			<-start
 			slot, _, err := cores[id].Propose(ctx, []byte(value))
 			results <- result{slot: slot, err: err}
 		}(id, value)
 	}
+	ready.Wait()
+	close(start)
 	seenSlots := map[Slot]bool{}
 	for range 2 {
 		result := <-results
@@ -979,6 +986,11 @@ func TestConcurrentProposersPreserveBothCommands(t *testing.T) {
 		}
 		if baseline == nil {
 			baseline = decisions
+			values := []string{string(decisions[0].Value), string(decisions[1].Value)}
+			slices.Sort(values)
+			if !slices.Equal(values, []string{"alpha", "beta"}) {
+				t.Fatalf("commands were not preserved: %q", values)
+			}
 		} else if baseline[0].Hash != decisions[0].Hash || baseline[1].Hash != decisions[1].Hash {
 			t.Fatalf("agreement failure on %s", id)
 		}

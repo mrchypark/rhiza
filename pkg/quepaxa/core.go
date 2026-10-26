@@ -531,13 +531,15 @@ func (c *Core) hydrateProposal(ctx context.Context, proposal *Proposal, sources 
 	if proposal == nil || len(proposal.Value) != 0 {
 		return nil
 	}
-	if value, ok := c.stagedValue(proposal.Hash); ok {
+	// Fetches can outlive hydration and the caller's reuse of proposal.
+	hash := proposal.Hash
+	if value, ok := c.stagedValue(hash); ok {
 		proposal.Value = value
 		return nil
 	}
 	transport := c.transport
 	if transport == nil {
-		return fmt.Errorf("value %x is unavailable", proposal.Hash[:8])
+		return fmt.Errorf("value %x is unavailable", hash[:8])
 	}
 	type result struct {
 		value []byte
@@ -557,8 +559,8 @@ func (c *Core) hydrateProposal(ctx context.Context, proposal *Proposal, sources 
 		seen[source] = struct{}{}
 		pending++
 		go func(source NodeID) {
-			value, err := transport.FetchValue(fetchCtx, source, proposal.Hash)
-			if err != nil || sha256.Sum256(value) != proposal.Hash {
+			value, err := transport.FetchValue(fetchCtx, source, hash)
+			if err != nil || sha256.Sum256(value) != hash {
 				results <- result{}
 				return
 			}
@@ -573,14 +575,14 @@ func (c *Core) hydrateProposal(ctx context.Context, proposal *Proposal, sources 
 			if len(result.value) == 0 {
 				continue
 			}
-			if err := c.storeValue(proposal.Hash, result.value); err != nil {
+			if err := c.storeValue(hash, result.value); err != nil {
 				return err
 			}
 			proposal.Value = result.value
 			return nil
 		}
 	}
-	return fmt.Errorf("value %x is unavailable", proposal.Hash[:8])
+	return fmt.Errorf("value %x is unavailable", hash[:8])
 }
 
 // ReadIndex returns a certified tip observed by a quorum. Writes are exposed
