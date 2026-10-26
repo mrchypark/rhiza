@@ -57,11 +57,21 @@ func (b EngineRemovalBinding) Validate() error {
 // It intentionally contains identity/enrollment references only; callers must
 // load and verify producer/archive state before issuing exclusion evidence.
 type RepairIncarnation struct {
-	Identity          Identity    `json:"identity"`
-	Role              StartupRole `json:"role"`
-	ProducerUID       string      `json:"producerUID,omitempty"`
-	MutationScopeHash string      `json:"mutationScopeHash,omitempty"`
-	MutationProfile   string      `json:"mutationProfile,omitempty"`
+	Identity                 Identity    `json:"identity"`
+	Role                     StartupRole `json:"role"`
+	ProducerUID              string      `json:"producerUID,omitempty"`
+	MutationScopeHash        string      `json:"mutationScopeHash,omitempty"`
+	MutationProfile          string      `json:"mutationProfile,omitempty"`
+	RegistrationSupersededBy string      `json:"registrationSupersededBy,omitempty"`
+	RegistrationRuntimeHash  string      `json:"registrationRuntimeHash,omitempty"`
+}
+
+// SupersededReservation describes revoked admission, never process termination.
+// The authority must additionally verify the retained producer has zero work.
+func (i RepairIncarnation) SupersededReservation() bool {
+	return i.RegistrationSupersededBy != "" && i.RegistrationSupersededBy != i.Identity.RunID &&
+		i.Identity.WALIdentity == "" && i.Role == StartupRoleVoterActive && i.ProducerUID != "" &&
+		i.MutationScopeHash == "" && i.MutationProfile == "" && mutationDigestValid(i.RegistrationRuntimeHash)
 }
 
 // EngineRepairCandidateContinuation records a fresh supervisor incarnation of
@@ -363,7 +373,10 @@ func (r EngineRepairRecord) validateIncarnations() error {
 			}
 			oldMemberFound = oldMemberFound || id.WALIdentity == r.Binding.OldWALIdentity
 		}
-		if incarnation.ProducerUID != "" && (!mutationDigestValid(incarnation.MutationScopeHash) || incarnation.MutationProfile == "") {
+		if (incarnation.RegistrationSupersededBy != "" || incarnation.RegistrationRuntimeHash != "") && !incarnation.SupersededReservation() {
+			return fmt.Errorf("fencing: invalid superseded registration inventory")
+		}
+		if incarnation.ProducerUID != "" && !incarnation.SupersededReservation() && (!mutationDigestValid(incarnation.MutationScopeHash) || incarnation.MutationProfile == "") {
 			return fmt.Errorf("fencing: repair producer enrollment is incomplete")
 		}
 		if incarnation.ProducerUID == "" && (incarnation.MutationScopeHash != "" || incarnation.MutationProfile != "") {
@@ -552,6 +565,14 @@ func (r EngineRepairRecord) ValidateAgainstLedger(l Ledger) error {
 		if !exists || run.Identity != incarnation.Identity || RunRole(run) != incarnation.Role || run.MutationProducerUID != incarnation.ProducerUID ||
 			run.MutationScopeHash != incarnation.MutationScopeHash || run.MutationProfile != incarnation.MutationProfile {
 			return fmt.Errorf("fencing: engine repair incarnation differs from canonical root")
+		}
+		if run.RegistrationSupersededBy != incarnation.RegistrationSupersededBy {
+			return fmt.Errorf("fencing: repair registration revocation differs from canonical root")
+		}
+		if incarnation.SupersededReservation() {
+			if run.Runtime == nil || run.Runtime.Validate(run.Identity) != nil || hashJSONValue(*run.Runtime) != incarnation.RegistrationRuntimeHash {
+				return fmt.Errorf("fencing: repair registration runtime differs from canonical root")
+			}
 		}
 		seen[incarnation.Identity.RunID] = struct{}{}
 	}
@@ -745,8 +766,13 @@ func SortedRepairIncarnations(l Ledger) ([]RepairIncarnation, error) {
 		if run.Identity.SourceClusterID != l.SourceClusterID || run.Identity.RunID == "" {
 			return nil, fmt.Errorf("fencing: canonical incarnation inventory is malformed")
 		}
-		incarnations = append(incarnations, RepairIncarnation{Identity: run.Identity, Role: RunRole(run), ProducerUID: run.MutationProducerUID,
-			MutationScopeHash: run.MutationScopeHash, MutationProfile: run.MutationProfile})
+		incarnation := RepairIncarnation{Identity: run.Identity, Role: RunRole(run), ProducerUID: run.MutationProducerUID,
+			MutationScopeHash: run.MutationScopeHash, MutationProfile: run.MutationProfile,
+			RegistrationSupersededBy: run.RegistrationSupersededBy}
+		if run.RegistrationSupersededBy != "" && run.Runtime != nil {
+			incarnation.RegistrationRuntimeHash = hashJSONValue(*run.Runtime)
+		}
+		incarnations = append(incarnations, incarnation)
 	}
 	sort.Slice(incarnations, func(i, j int) bool {
 		if incarnations[i].Identity.NodeID != incarnations[j].Identity.NodeID {
