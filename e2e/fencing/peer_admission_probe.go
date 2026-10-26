@@ -526,6 +526,8 @@ func peerAdmissionCredentialsForTargets(ctx context.Context, source gcsRecoveryS
 	return credentials, nil
 }
 
+var errPeerCredentialMissing = errors.New("credential Secret reference is missing")
+
 func podCredentialValue(ctx context.Context, pod obj, containerName, envName string) (value, secretName, secretUID string, err error) {
 	containerList, _ := nested(pod, "spec", "containers").([]any)
 	var app any
@@ -541,19 +543,32 @@ func podCredentialValue(ctx context.Context, pod obj, containerName, envName str
 		return "", "", "", fmt.Errorf("application container is missing")
 	}
 	var key string
+	found := false
 	envs, _ := nested(app, "env").([]any)
 	for _, entry := range envs {
 		if nested(entry, "name") == envName {
-			if key != "" || nested(entry, "value") != nil {
+			if found || nested(entry, "value") != nil {
 				return "", "", "", fmt.Errorf("credential is not secret-backed")
 			}
 			key = text(nested(entry, "valueFrom", "secretKeyRef", "key"))
 			secretName = text(nested(entry, "valueFrom", "secretKeyRef", "name"))
+			found = true
+			if key == "" || secretName == "" {
+				return "", "", "", fmt.Errorf("credential Secret reference is malformed")
+			}
 		}
 	}
 	if key == "" {
 		refs, _ := nested(app, "envFrom").([]any)
 		for _, ref := range refs {
+			if nested(ref, "configMapRef") != nil {
+				return "", "", "", fmt.Errorf("credential envFrom ConfigMap is unsupported")
+			}
+			prefix := text(nested(ref, "prefix"))
+			if !strings.HasPrefix(envName, prefix) {
+				continue
+			}
+			dataKey := strings.TrimPrefix(envName, prefix)
 			name := text(nested(ref, "secretRef", "name"))
 			if name == "" {
 				continue
@@ -562,16 +577,18 @@ func podCredentialValue(ctx context.Context, pod obj, containerName, envName str
 			if getErr != nil {
 				return "", "", "", getErr
 			}
-			_, ok := nested(secret, "data", envName).(string)
+			_, ok := nested(secret, "data", dataKey).(string)
 			if !ok {
 				continue
 			}
-			key, secretName = envName, name
-			break
+			if key != "" {
+				return "", "", "", fmt.Errorf("competing credential Secret sources")
+			}
+			key, secretName = dataKey, name
 		}
 	}
 	if key == "" || secretName == "" {
-		return "", "", "", fmt.Errorf("credential Secret reference is missing")
+		return "", "", "", errPeerCredentialMissing
 	}
 	secret, getErr := get(ctx, "secret", secretName)
 	if getErr != nil || secret["immutable"] != true || text(nested(secret, "metadata", "namespace")) != namespace {
@@ -587,6 +604,8 @@ func podCredentialValue(ctx context.Context, pod obj, containerName, envName str
 func podPeerToken(ctx context.Context, pod obj, containerName string, nodeID quepaxa.NodeID) (token, secretName, secretUID string, err error) {
 	if value, name, uid, readErr := podCredentialValue(ctx, pod, containerName, "RHIZA_PEER_TOKEN"); readErr == nil {
 		return value, name, uid, nil
+	} else if !errors.Is(readErr, errPeerCredentialMissing) {
+		return "", "", "", readErr
 	}
 	value, name, uid, err := podCredentialValue(ctx, pod, containerName, "RHIZA_PEER_TOKENS")
 	if err != nil {

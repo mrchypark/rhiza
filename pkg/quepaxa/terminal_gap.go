@@ -152,6 +152,7 @@ func (c *Core) AllowsNextReconfigurationFreeze(decision Decision) bool {
 	current := c.clusterForSlotLocked(c.tip + 1)
 	return c.reconfigEnabled && c.reconfiguration == nil && c.voterForClusterLocked(current) &&
 		decision.Slot == c.tip+1 && decision.ConfigID == current.ConfigID &&
+		control.PrefixHash == c.prefixes[c.tip] &&
 		c.validateReconfigurationSlotsLocked(control.Freeze, control.TerminalSlot) == nil &&
 		validateReconfigurationTarget(current, control.Target, c.retiredIDs) == nil
 }

@@ -532,7 +532,7 @@ func (e *FencingExecutor) handle(w http.ResponseWriter, r *http.Request) {
 				return
 			}
 			initialRegistrationGrant, initialRegistrationProvenance = &grant, &provenance
-		} else {
+		} else if message.RegistrationWALIdentity == "" {
 			grant, assigned, restartErr := e.resolveEngineRepairActiveRestartRegistration(r.Context(), uid, message.Identity)
 			if restartErr != nil {
 				if errors.Is(restartErr, fencing.ErrClosed) {
@@ -565,9 +565,18 @@ func (e *FencingExecutor) handle(w http.ResponseWriter, r *http.Request) {
 	if message.Action == "register" {
 		if initialRegistrationGrant == nil {
 			registrationStage = startupRegistrationStageRootInit
-			// Persist the immutable profile claim before enrollment or any admission
-			// side effect. A failed enrollment leaves a required, retryable root.
-			err = registerStageError("root-init", e.initializeRoot(r.Context(), uid, message.Identity.SourceClusterID))
+			if message.RegistrationWALIdentity != "" {
+				// Continuation consumes existing authority; it must never create genesis.
+				var root fenceLedger
+				root, _, err = e.AuthorityState.ReadRoot(r.Context(), uid, message.Identity.SourceClusterID)
+				if err == nil {
+					err = e.validateMutationJournalProfile(root)
+				}
+				err = registerStageError("root-read", err)
+			} else {
+				// Persist the immutable profile claim before enrollment or admission.
+				err = registerStageError("root-init", e.initializeRoot(r.Context(), uid, message.Identity.SourceClusterID))
+			}
 		}
 	}
 	startupGrant := fencing.StartupGrant{Identity: message.Identity, Role: fencing.StartupRoleVoterActive}
@@ -585,7 +594,15 @@ func (e *FencingExecutor) handle(w http.ResponseWriter, r *http.Request) {
 			} else if initialRegistrationGrant != nil {
 				startupGrant = *initialRegistrationGrant
 			} else {
-				startupGrant, err = e.resolveStartupGrant(r.Context(), uid, message.Identity)
+				if message.RegistrationWALIdentity != "" {
+					var static bool
+					startupGrant, static, err = e.resolveStaticVoterStartupGrant(r.Context(), uid, message.Identity)
+					if err == nil && (!static || startupGrant.Identity != message.Identity || startupGrant.Role != fencing.StartupRoleVoterActive) {
+						err = fencing.ErrClosed
+					}
+				} else {
+					startupGrant, err = e.resolveStartupGrant(r.Context(), uid, message.Identity)
+				}
 				if err == nil {
 					var required bool
 					required, err = e.initialRegistrationMarkerRequired(r.Context(), uid, message.Identity)
