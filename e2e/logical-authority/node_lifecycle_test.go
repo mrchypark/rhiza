@@ -168,6 +168,11 @@ func TestFlociGCSLogicalAuthorityThreeNodeBeforeAckAndSamePodRestart(t *testing.
 
 	api := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
+		if r.Header.Get("Authorization") != "Bearer operator-test-token" {
+			t.Errorf("fake Kubernetes API received unauthenticated request: %s %s", r.Method, r.URL.Path)
+			http.Error(w, "wrong operator token", http.StatusUnauthorized)
+			return
+		}
 		switch {
 		case r.URL.Path == "/apis/authentication.k8s.io/v1/tokenreviews":
 			var request struct {
@@ -207,6 +212,8 @@ func TestFlociGCSLogicalAuthorityThreeNodeBeforeAckAndSamePodRestart(t *testing.
 			_ = json.NewEncoder(w).Encode(secret)
 		case r.URL.Path == "/apis/apps/v1/namespaces/default/statefulsets/rhiza":
 			_ = json.NewEncoder(w).Encode(statefulSet)
+		case r.URL.Path == "/apis/apps/v1/namespaces/default/statefulsets":
+			_ = json.NewEncoder(w).Encode(map[string]any{"items": []any{statefulSet}})
 		case r.URL.Path == "/apis/rhiza.mrchypark.dev/v1alpha1/namespaces/default/rhizaclusters":
 			_ = json.NewEncoder(w).Encode(map[string]any{"items": []any{map[string]any{
 				"apiVersion": "rhiza.mrchypark.dev/v1alpha1", "kind": "RhizaCluster",
@@ -214,6 +221,7 @@ func TestFlociGCSLogicalAuthorityThreeNodeBeforeAckAndSamePodRestart(t *testing.
 				"spec":     map[string]any{"statefulSet": statefulSetName, "container": "rhiza", "adoptClusterID": clusterID, "automatic": false},
 			}}})
 		default:
+			t.Errorf("unexpected fake Kubernetes API request: %s %s", r.Method, r.URL.Path)
 			http.NotFound(w, r)
 		}
 	}))
