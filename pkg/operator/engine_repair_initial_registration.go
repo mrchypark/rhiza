@@ -55,7 +55,7 @@ func (e *FencingExecutor) resolveInitialRegistrationGrant(ctx context.Context, s
 	if err != nil {
 		// A missing root must remain distinct from this path; only ordinary
 		// first-generation initialization may create a new authority root.
-		return closed()
+		return fencing.StartupGrant{}, fencing.InitialRegistrationProvenance{}, fmt.Errorf("fencing: initial registration canonical root read: %w", err)
 	}
 	if root.StatefulSetUID != statefulSetUID || root.Ledger.SourceClusterID != request.SourceClusterID ||
 		root.Ledger.ClosedBy != "" || root.Ledger.ClosedHash != "" {
