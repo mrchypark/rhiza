@@ -2,9 +2,61 @@ package fencing
 
 import (
 	"encoding/json"
+	"fmt"
 	"strings"
 	"testing"
 )
+
+func TestUnboundRegistrationRepeatedTransferKeepsRevocations(t *testing.T) {
+	id := testIdentity()
+	id.PodName, id.WALIdentity = id.NodeID, ""
+	l := Ledger{SourceClusterID: id.SourceClusterID, RequireRuntimeBinding: true}
+	runtime := enrolledRuntime(id, "initial")
+	runtime.PodName = id.PodName
+	if err := l.RegisterEnrolled(id, runtime); err != nil {
+		t.Fatal(err)
+	}
+	wal := strings.Repeat("a", 64)
+	previous := []Identity{id}
+	for i := 1; i <= 3; i++ {
+		next := id
+		next.RunID = fmt.Sprintf("continuation-%d", i)
+		runtime := enrolledRuntime(next, next.RunID)
+		runtime.PodName = next.PodName
+		if err := l.ContinueUnboundRegistration(next, runtime, wal); err != nil {
+			t.Fatal(err)
+		}
+		for _, old := range previous {
+			old.WALIdentity = wal
+			if err := l.Bind(old); err == nil {
+				t.Fatal("old Run regained Bind after another restart")
+			}
+			old.WALIdentity = ""
+			if err := l.Register(old); err == nil {
+				t.Fatal("old Run replay reopened reservation")
+			}
+		}
+		before, _ := json.Marshal(l)
+		changedRuntime := runtime
+		changedRuntime.ContainerID += "-changed"
+		if err := l.ContinueUnboundRegistration(next, changedRuntime, wal); err == nil {
+			t.Fatal("same Run changed runtime")
+		}
+		after, _ := json.Marshal(l)
+		if string(before) != string(after) {
+			t.Fatal("rejected replay changed history")
+		}
+		previous = append(previous, next)
+	}
+	last := previous[len(previous)-1]
+	last.WALIdentity = wal
+	if err := l.Bind(last); err != nil {
+		t.Fatal(err)
+	}
+	if len(l.Runs) != len(previous) {
+		t.Fatal("transfer discarded prior authority evidence")
+	}
+}
 
 func TestUnboundRegistrationTransferPinsWALAndRevokesOnlyPriorRun(t *testing.T) {
 	id := testIdentity()
