@@ -231,6 +231,10 @@ func TestFenceStageProjectionPublishesOnlyBoundedEnumPairs(t *testing.T) {
 		"2026/10/26 02:12:07 fencing stage blocked: stage=terminal-receipt-read class=error",
 		"2026/10/26 02:12:08 fencing stage blocked: stage=root-reread class=error",
 		"2026/10/26 02:12:09 fencing stage blocked: stage=inventory-revalidation class=pending",
+		"2026/10/26 02:12:10 fencing stage blocked: stage=cohort-profile class=pending",
+		"2026/10/26 02:12:11 fencing stage blocked: stage=cohort-freeze class=pending",
+		"2026/10/26 02:12:12 fencing stage blocked: stage=cohort-runtime-binding class=pending",
+		"2026/10/26 02:12:13 fencing stage blocked: stage=cohort-stop-binding class=pending",
 	}, "\n") + "\n"
 	digest := sha256.Sum256([]byte(privateLog))
 	raw := t.TempDir()
@@ -275,6 +279,10 @@ func TestFenceStageProjectionPublishesOnlyBoundedEnumPairs(t *testing.T) {
 		{Stage: "terminal-receipt-read", Class: "error"},
 		{Stage: "root-reread", Class: "error"},
 		{Stage: "inventory-revalidation", Class: "pending"},
+		{Stage: "cohort-profile", Class: "pending"},
+		{Stage: "cohort-freeze", Class: "pending"},
+		{Stage: "cohort-runtime-binding", Class: "pending"},
+		{Stage: "cohort-stop-binding", Class: "pending"},
 	}
 	if got.Status != "captured" || got.Version != 1 || got.Truncated || len(got.Diagnostics) != len(want) {
 		t.Fatalf("stage projection = %+v", got)

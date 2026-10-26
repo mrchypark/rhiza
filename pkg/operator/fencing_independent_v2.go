@@ -90,19 +90,23 @@ func independentClosedRuns(state fenceLedger, request FenceRequest, nodes []stri
 	l := state.Ledger
 	hash, err := requestHash(&request)
 	if err != nil {
+		logFenceStageDiagnostic("cohort-request", err)
 		return nil, err
 	}
 	if !l.RequireRuntimeBinding || !l.RequireMutationJournal || state.StatefulSetUID != request.StatefulSetUID || l.SourceClusterID != request.SourceClusterID {
+		logFenceStageDiagnostic("cohort-profile", ErrFencePending)
 		return nil, fmt.Errorf("fencing: independent v2 enrollment profile is unavailable")
 	}
 	if len(nodes) == 0 {
 		if l.ClosedBy != request.OperationID || l.ClosedHash != hash {
+			logFenceStageDiagnostic("cohort-freeze", ErrFencePending)
 			return nil, fmt.Errorf("fencing: generation cohort is not frozen by this operation")
 		}
 	} else {
 		for _, node := range nodes {
 			closed, ok := l.ClosedNodes[node]
 			if !ok || closed.OperationID != request.OperationID || closed.RequestHash != hash {
+				logFenceStageDiagnostic("cohort-freeze", ErrFencePending)
 				return nil, fmt.Errorf("fencing: voter cohort is not frozen by this operation")
 			}
 		}
@@ -112,14 +116,22 @@ func independentClosedRuns(state fenceLedger, request FenceRequest, nodes []stri
 		if len(nodes) != 0 && !slices.Contains(nodes, run.Identity.NodeID) {
 			continue
 		}
-		if runID != run.Identity.RunID || run.Identity.SourceClusterID != l.SourceClusterID || run.Runtime == nil || run.Runtime.Validate(run.Identity) != nil ||
-			run.Runtime.StatefulSetUID != state.StatefulSetUID || run.Runtime.BindingUID != request.BindingUID || run.Stop == nil || run.Stop.Identity != run.Identity ||
-			run.Stop.OperationID == "" || !validEvidenceDigest(run.Stop.RequestHash) {
+		if runID != run.Identity.RunID || run.Identity.SourceClusterID != l.SourceClusterID {
+			logFenceStageDiagnostic("cohort-run-identity", ErrFencePending)
+			return nil, fmt.Errorf("fencing: closed historical run identity differs")
+		}
+		if run.Runtime == nil || run.Runtime.Validate(run.Identity) != nil || run.Runtime.StatefulSetUID != state.StatefulSetUID || run.Runtime.BindingUID != request.BindingUID {
+			logFenceStageDiagnostic("cohort-runtime-binding", ErrFencePending)
+			return nil, fmt.Errorf("fencing: closed historical run runtime binding differs")
+		}
+		if run.Stop == nil || run.Stop.Identity != run.Identity || run.Stop.OperationID == "" || !validEvidenceDigest(run.Stop.RequestHash) {
+			logFenceStageDiagnostic("cohort-stop-binding", ErrFencePending)
 			return nil, fmt.Errorf("fencing: closed historical run lacks its own enrollment or stop binding")
 		}
 		runs = append(runs, run)
 	}
 	if len(runs) == 0 || len(runs) > fenceTargetCapacity {
+		logFenceStageDiagnostic("cohort-capacity", ErrFencePending)
 		return nil, fmt.Errorf("fencing: independent v2 cohort is empty or exceeds capacity")
 	}
 	sort.Slice(runs, func(i, j int) bool { return runs[i].Identity.RunID < runs[j].Identity.RunID })
@@ -130,11 +142,11 @@ func independentClosedRuns(state fenceLedger, request FenceRequest, nodes []stri
 // frozen cohort. API absence, a DELETE response and quiet reads cannot replace it.
 func (e *FencingExecutor) independentFence(ctx context.Context, endpoint string, record *fenceResource, request FenceRequest, sts object, state fenceLedger, hash string, nodes, current []string) error {
 	runs, err := independentClosedRuns(state, request, nodes)
-	if err != nil || e.VerifyRuntimeEvidence == nil {
-		if err == nil {
-			err = ErrFencePending
-		}
-		logFenceStageDiagnostic("cohort-validation", err)
+	if err != nil {
+		return ErrFencePending
+	}
+	if e.VerifyRuntimeEvidence == nil {
+		logFenceStageDiagnostic("runtime-verifier-config", ErrFencePending)
 		return ErrFencePending
 	}
 	storage, err := e.storageScope(ctx, sts, request.SourceClusterID)

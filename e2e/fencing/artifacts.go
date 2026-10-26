@@ -637,6 +637,8 @@ var allowedFenceDiagnosticStages = map[string]bool{
 	"terminal-retention": true, "terminal-verification": true, "proof-validation": true,
 	"proof-status-write": true, "bootstrap-revalidation": true, "cohort-validation": true,
 	"cohort-revalidation": true, "terminal-receipt-read": true, "root-reread": true, "inventory-revalidation": true,
+	"cohort-request": true, "cohort-profile": true, "cohort-freeze": true, "cohort-run-identity": true,
+	"cohort-runtime-binding": true, "cohort-stop-binding": true, "cohort-capacity": true, "runtime-verifier-config": true,
 }
 
 var allowedFenceDiagnosticClasses = map[string]bool{

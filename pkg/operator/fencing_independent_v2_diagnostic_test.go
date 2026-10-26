@@ -142,7 +142,7 @@ func TestFenceStageDiagnosticsDistinguishRecoveryBoundaries(t *testing.T) {
 		}
 	})
 
-	t.Run("terminal verification", func(t *testing.T) {
+	t.Run("runtime verifier configuration", func(t *testing.T) {
 		e, _, record, _ := newIndependentV2Fixture(t)
 		e.VerifyRuntimeEvidence = nil
 		output, err := captureFenceStageDiagnostic(t, func() error {
@@ -151,7 +151,7 @@ func TestFenceStageDiagnosticsDistinguishRecoveryBoundaries(t *testing.T) {
 		if !errors.Is(err, ErrFencePending) {
 			t.Fatalf("missing runtime verifier error = %v", err)
 		}
-		requireFenceStageDiagnostic(t, output, "cohort-validation")
+		requireFenceStageDiagnostic(t, output, "runtime-verifier-config")
 	})
 
 	t.Run("proof status write", func(t *testing.T) {
@@ -176,7 +176,11 @@ func TestFenceStageDiagnosticsDistinguishRecoveryBoundaries(t *testing.T) {
 }
 
 func TestFenceStageDiagnosticAllowsIndependentFenceBoundaries(t *testing.T) {
-	stages := []string{"cohort-validation", "cohort-revalidation", "terminal-receipt-read", "root-reread", "inventory-revalidation"}
+	stages := []string{
+		"cohort-validation", "cohort-revalidation", "terminal-receipt-read", "root-reread", "inventory-revalidation",
+		"cohort-request", "cohort-profile", "cohort-freeze", "cohort-run-identity", "cohort-runtime-binding",
+		"cohort-stop-binding", "cohort-capacity", "runtime-verifier-config",
+	}
 	output, _ := captureFenceStageDiagnostic(t, func() error {
 		for _, stage := range stages {
 			logFenceStageDiagnostic(stage, errors.New("private terminal detail"))
@@ -195,6 +199,36 @@ func TestFenceStageDiagnosticAllowsIndependentFenceBoundaries(t *testing.T) {
 	if strings.Contains(output, "private terminal detail") {
 		t.Fatalf("stage diagnostic leaked error text: %q", output)
 	}
+}
+
+func TestIndependentClosedRunsReportsMissingRuntimeBindingStage(t *testing.T) {
+	e, _, record, runtime := newIndependentV2Fixture(t)
+	hash, err := requestHash(&record.Spec)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := e.change(t.Context(), runtime.StatefulSetUID, runtime.SourceClusterID, func(l *fencing.Ledger) error {
+		if err := l.CloseNodes(record.Spec.OperationID, hash, []string{runtime.NodeID}); err != nil {
+			return err
+		}
+		old := fencing.Identity{SourceClusterID: runtime.SourceClusterID, NodeID: runtime.NodeID, PodUID: "old-pod", RunID: "old-run", WALIdentity: "old-wal"}
+		l.Runs[old.RunID] = fencing.Run{Identity: old}
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	state, err := e.read(t.Context(), runtime.StatefulSetUID, runtime.SourceClusterID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	output, err := captureFenceStageDiagnostic(t, func() error {
+		_, err := independentClosedRuns(state, record.Spec, []string{runtime.NodeID})
+		return err
+	})
+	if err == nil {
+		t.Fatal("historical run without runtime binding was accepted")
+	}
+	requireFenceStageDiagnostic(t, output, "cohort-runtime-binding")
 }
 
 func TestFenceStageDiagnosticUsesOnlyFixedFields(t *testing.T) {
