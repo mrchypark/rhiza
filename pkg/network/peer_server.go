@@ -415,6 +415,7 @@ func (s *PeerServer) handle(ctx context.Context, certificateKey ed25519.PublicKe
 	voter := historicalOK && activeOK && certificateKey != nil &&
 		subtle.ConstantTimeCompare(certificateKey, historical.PublicKey[:]) == 1 &&
 		subtle.ConstantTimeCompare(certificateKey, active.PublicKey[:]) == 1
+	staleSync := request.Operation == peerfb.OperationSync && request.ConfigId != uint64(current.ConfigID)
 	// Non-voting clients may only pull already-certified decisions. They use
 	// the cluster admin token and never enter the fixed voter membership.
 	admin := s.adminToken != "" && subtle.ConstantTimeCompare([]byte(request.AdminToken), []byte(s.adminToken)) == 1
@@ -422,6 +423,11 @@ func (s *PeerServer) handle(ctx context.Context, certificateKey ed25519.PublicKe
 	// decisions, it may request the exact engine-removal freeze or committed
 	// terminal and its durable prefix. The response is independently signed by
 	// this voter and never changes local consensus state.
+	// A stale Sync is useful only to a voter still present in both configurations.
+	if staleSync && !voter {
+		observeRejectedPeerRequest(request, config, nil, clusterMatch, configMatch, "cluster_or_config")
+		return nil, fmt.Errorf("cluster identity mismatch")
+	}
 	if !voter && !(admin && (request.Operation == peerfb.OperationSync || request.Operation == peerfb.OperationEngineRemovalFreeze)) {
 		observeRejectedPeerRequest(request, config, nil, clusterMatch, configMatch, "peer_authentication")
 		return nil, fmt.Errorf("peer authentication failed")
@@ -737,6 +743,12 @@ func (s *PeerServer) configurationFor(request *peerfb.RequestT) (quepaxa.Cluster
 		current := s.server.core.CurrentCluster()
 		if request.ConfigId == uint64(current.ConfigID) {
 			return current, nil
+		}
+		if request.From != 0 {
+			historical := s.server.core.ClusterForSlot(quepaxa.Slot(request.From))
+			if request.ConfigId == uint64(historical.ConfigID) {
+				return historical, nil
+			}
 		}
 	case peerfb.OperationEngineRemovalFreeze:
 		if request.From != 0 {
