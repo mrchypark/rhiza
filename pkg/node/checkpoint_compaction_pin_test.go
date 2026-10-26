@@ -228,6 +228,16 @@ func TestPeerCheckpointWaitsForAuthenticatedPrefixBeforePublication(t *testing.T
 }
 
 func TestPeerCheckpointRejectsClaimReplacedDuringPrefixWait(t *testing.T) {
+	testPeerCheckpointClaimInterleaving(t, true, false)
+}
+
+func TestPeerCheckpointClaimAfterPrefixBecomesAvailable(t *testing.T) {
+	t.Run("live", func(t *testing.T) { testPeerCheckpointClaimInterleaving(t, false, true) })
+	t.Run("replaced", func(t *testing.T) { testPeerCheckpointClaimInterleaving(t, true, true) })
+}
+
+func testPeerCheckpointClaimInterleaving(t *testing.T, replaceClaim, prefixBeforeReadReturns bool) {
+	t.Helper()
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 	bucket := &claimReadBarrier{Bucket: objstore.NewInMemBucket(), entered: make(chan struct{}), release: make(chan struct{})}
@@ -298,25 +308,46 @@ func TestPeerCheckpointRejectsClaimReplacedDuringPrefixWait(t *testing.T) {
 	case <-ctx.Done():
 		t.Fatal(ctx.Err())
 	}
-	if err := manager.ReleasePublisherClaim(ctx, claim); err != nil {
-		t.Fatal(err)
+	if replaceClaim {
+		if err := manager.ReleasePublisherClaim(ctx, claim); err != nil {
+			t.Fatal(err)
+		}
+		replacement, err := manager.AcquirePublisherClaim(ctx, "replacement", 0, time.Minute)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer manager.ReleasePublisherClaim(context.Background(), replacement)
+	} else {
+		defer manager.ReleasePublisherClaim(context.Background(), claim)
 	}
-	replacement, err := manager.AcquirePublisherClaim(ctx, "replacement", 0, time.Minute)
-	if err != nil {
-		t.Fatal(err)
+	if prefixBeforeReadReturns {
+		// Force the no-wait path while the initial claim read still holds old attributes.
+		if err := peer.AcceptCertifiedValue(certified); err != nil {
+			t.Fatal(err)
+		}
+		close(bucket.release)
+	} else {
+		callCtx.armed.Store(true)
+		close(bucket.release)
+		select {
+		case <-callCtx.entered:
+		case err := <-result:
+			t.Fatalf("claim replacement returned before prefix wait: %v", err)
+		case <-ctx.Done():
+			t.Fatal(ctx.Err())
+		}
+		if err := peer.AcceptCertifiedValue(certified); err != nil {
+			t.Fatal(err)
+		}
 	}
-	defer manager.ReleasePublisherClaim(context.Background(), replacement)
-	callCtx.armed.Store(true)
-	close(bucket.release)
-	select {
-	case <-callCtx.entered:
-	case err := <-result:
-		t.Fatalf("claim replacement returned before prefix wait: %v", err)
-	case <-ctx.Done():
-		t.Fatal(ctx.Err())
-	}
-	if err := peer.AcceptCertifiedValue(certified); err != nil {
-		t.Fatal(err)
+	if !replaceClaim {
+		if err := <-result; err != nil {
+			t.Fatalf("live claim returned %v", err)
+		}
+		if err := peer.RequirePreparedCheckpoint(seal); err != nil {
+			t.Fatalf("live claim did not prepare checkpoint: %v", err)
+		}
+		return
 	}
 	if err := <-result; !errors.Is(err, checkpoint.ErrPublisherFenced) {
 		t.Fatalf("replaced claim returned %v, want fenced", err)

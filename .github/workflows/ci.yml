@@ -16,6 +16,31 @@ permissions:
   contents: read
 
 jobs:
+  embedded-object-storage-providers:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+          cache: true
+      - name: Qualify embedded storage against all three pinned Floci providers
+        shell: bash
+        run: |
+          unset RHIZA_EMBEDDED_TEST_PATTERN
+          sh scripts/test-embedded-object-providers.sh 2>&1 | tee "$RUNNER_TEMP/embedded-object-storage-providers.log"
+      - name: Preserve provider qualification logs and failure diagnostics
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: embedded-object-storage-providers-${{ github.run_id }}
+          path: |
+            ${{ runner.temp }}/embedded-object-storage-providers.log
+            /tmp/rhiza-embedded-providers.*/*.log
+            /tmp/rhiza-embedded-providers.*/*-image-digests.json
+            /tmp/rhiza-embedded-providers.*/selected-tests.txt
+
   cooperative-fencing:
     runs-on: ubuntu-latest
     timeout-minutes: 30
@@ -287,13 +312,29 @@ jobs:
           cargo test --manifest-path "sdk/rust/target/package/rhizadb-$crate_version/Cargo.toml" --locked --all-targets
 
   go:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-go@v6
         with:
           go-version-file: go.mod
           cache: true
+      - name: Install GNU timeout 9.12
+        env:
+          COREUTILS_VERSION: '9.12'
+          COREUTILS_SHA256: a480198559733e9b3da999e90543ac6f888a2caa544d8d664c5a1f17e528e210
+        run: |
+          archive="$RUNNER_TEMP/coreutils-$COREUTILS_VERSION.tar.xz"
+          curl --fail --location --retry 3 --max-time 120 \
+            "https://ftp.gnu.org/gnu/coreutils/coreutils-$COREUTILS_VERSION.tar.xz" -o "$archive"
+          printf '%s  %s\n' "$COREUTILS_SHA256" "$archive" | sha256sum --check
+          tar -xf "$archive" -C "$RUNNER_TEMP"
+          cd "$RUNNER_TEMP/coreutils-$COREUTILS_VERSION"
+          ./configure --disable-nls --without-libgmp
+          make -j2
+          install -D src/timeout "$RUNNER_TEMP/gnu-timeout/bin/timeout"
+          "$RUNNER_TEMP/gnu-timeout/bin/timeout" --version
+          echo "$RUNNER_TEMP/gnu-timeout/bin" >> "$GITHUB_PATH"
       - name: Test
         env:
           CGO_ENABLED: 0
@@ -404,7 +445,7 @@ jobs:
         run: |
           awk '
             { print }
-            $0 == "FROM mirror.gcr.io/library/golang:1.27-alpine@sha256:738d1cf061836894ff6bb8c33881080ac66de8cf0586615012a0c8f592649cfa AS builder" {
+            $0 == "FROM mirror.gcr.io/library/golang:1.27.3-alpine@sha256:b8c9b82affbbb82a020bbcf998dad2ba9516944ac7e883524642a481a9505e9c AS builder" {
               print "RUN apk --no-cache add jq coreutils"
               matched++
             }

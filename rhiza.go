@@ -76,7 +76,11 @@ type ObjectStoreDurability = types.ObjectStoreDurability
 
 // Config contains the durable local path, fixed membership, and peer endpoint.
 type Config struct {
-	// Local disables peer networking and requires standalone, local-disk configuration.
+	// Local disables peer networking and uses a standalone local store. When
+	// ObjStore settings are supplied, backups stream automatically and an empty
+	// DataDir restores from that archive. The deployment must ensure one writer,
+	// including during offline restore. Local backups default to BeforeAck;
+	// explicitly select Async to allow acknowledged writes ahead of the backup.
 	Local      bool
 	ClusterID  string
 	NodeID     string
@@ -116,10 +120,16 @@ type Config struct {
 	ObjStoreSyncInterval           time.Duration
 	ObjStoreBatchDelay             time.Duration
 	ObjStoreGCInterval             time.Duration
-	ObjStoreGCGracePeriod          time.Duration
-	CheckpointInterval             time.Duration
-	CheckpointTailBytes            int64
-	MaxWALBytes                    int64
+	// ObjStoreGCGracePeriod delays collection of obsolete backup objects.
+	// In Local mode, zero selects 24 hours, including an explicit zero from
+	// RHIZA_OBJSTORE_GC_GRACE_PERIOD. Use a positive duration to shorten it.
+	ObjStoreGCGracePeriod time.Duration
+	CheckpointInterval    time.Duration
+	CheckpointTailBytes   int64
+	// CheckpointRetainCount retains the latest Local backup snapshots. Zero uses
+	// three; CURRENT and active restores remain protected even beyond this count.
+	CheckpointRetainCount int
+	MaxWALBytes           int64
 	// Both zero use 64 concurrent reads / 8 long-poll reads. With an explicit
 	// total, zero MaxLongPollReads disables waiting stream reads.
 	MaxConcurrentReads int
@@ -260,7 +270,7 @@ func executionConfig(config Config) (*types.ExecutionConfig, error) {
 		ObjStoreDurability: config.ObjStoreDurability, ObjStoreSyncInterval: config.ObjStoreSyncInterval,
 		ObjStoreBatchDelay: config.ObjStoreBatchDelay,
 		ObjStoreGCInterval: config.ObjStoreGCInterval, ObjStoreGCGracePeriod: config.ObjStoreGCGracePeriod,
-		CheckpointInterval: config.CheckpointInterval, CheckpointTailBytes: config.CheckpointTailBytes, MaxWALBytes: config.MaxWALBytes,
+		CheckpointInterval: config.CheckpointInterval, CheckpointTailBytes: config.CheckpointTailBytes, CheckpointRetainCount: config.CheckpointRetainCount, MaxWALBytes: config.MaxWALBytes,
 		MaxConcurrentReads: config.MaxConcurrentReads, MaxLongPollReads: config.MaxLongPollReads,
 		LocalGraphNodePropertyIndexes: slices.Clone(config.LocalGraphNodePropertyIndexes),
 	}, nil

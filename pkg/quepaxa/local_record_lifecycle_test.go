@@ -93,6 +93,53 @@ func TestLocalRecordQuorumRunsSelfRecordBeforeReturningCancellation(t *testing.T
 	}
 }
 
+func TestLocalRecordQuorumCompletesSyncBeforeReturning(t *testing.T) {
+	for _, cancelled := range []bool{false, true} {
+		name := "live"
+		if cancelled {
+			name = "cancel-during-sync"
+		}
+		t.Run(name, func(t *testing.T) {
+			core, wal := localReserveCore(t, t.TempDir(), "local")
+			defer wal.Close()
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			synced := make(chan struct{})
+			core.commits = newGroupCommit(func() error {
+				if cancelled {
+					cancel()
+				}
+				err := wal.Sync()
+				close(synced)
+				return err
+			})
+			if err := core.acquireLocalExecution(context.Background()); err != nil {
+				t.Fatal(err)
+			}
+			defer core.releaseLocalExecution()
+			proposal := newProposal(highestPriority, "local", []byte("local sync"))
+			summaries, err := core.recordQuorum(ctx, map[NodeID]RecordRequest{
+				"local": {Slot: 1, Step: 4, Proposal: proposal},
+			})
+			select {
+			case <-synced:
+			default:
+				t.Fatal("recordQuorum returned before receipt sync completed")
+			}
+			if cancelled {
+				if !errors.Is(err, ErrQuorumUnavailable) || !errors.Is(err, context.Canceled) {
+					t.Fatalf("recordQuorum error=%v, want quorum unavailable and cancellation", err)
+				}
+			} else if err != nil || len(summaries) != 1 || summaries[0].RecorderID != "local" || summaries[0].Step != 4 || !sameProposal(summaries[0].FirstCurrent, &proposal) {
+				t.Fatalf("live recordQuorum summaries=%+v error=%v", summaries, err)
+			}
+			if got := localReserveReceiptCount(localReserveEntries(t, wal)); got != 1 {
+				t.Fatalf("persisted receipt entries=%d, want 1 before return", got)
+			}
+		})
+	}
+}
+
 func TestLocalProposeAndRecoveryCancellationPersistBeforeReturning(t *testing.T) {
 	for _, mode := range []string{"propose", "recovery"} {
 		t.Run(mode, func(t *testing.T) {

@@ -1066,13 +1066,17 @@ func immutableDigest(value string) (string, error) {
 // Kind can discard the archive's import repository name while retaining its
 // immutable content. Follow only hash-verified descriptors, never a mutable tag.
 func imageConfig(ctx context.Context, reference string) (obj, []obj, error) {
+	return resolveImageConfig(ctx, reference, command)
+}
+
+func resolveImageConfig(ctx context.Context, reference string, run func(context.Context, string, ...string) ([]byte, error)) (obj, []obj, error) {
 	d, err := immutableDigest(reference)
 	if err != nil {
 		return nil, nil, err
 	}
 	var chain []obj
 	for range 4 {
-		data, lookupErr := command(ctx, "docker", "exec", kindNode, "crictl", "inspecti", "-o", "json", d)
+		data, lookupErr := run(ctx, "docker", "exec", kindNode, "crictl", "inspecti", "-o", "json", d)
 		if lookupErr == nil {
 			var cri obj
 			if err := json.Unmarshal(data, &cri); err != nil {
@@ -1084,7 +1088,7 @@ func imageConfig(ctx context.Context, reference string) (obj, []obj, error) {
 			chain = append(chain, obj{"digest": d, "cri": publicCRIImage(cri)})
 			return cri, chain, nil
 		}
-		content, err := command(ctx, "docker", "exec", kindNode, "ctr", "-n", "k8s.io", "content", "get", d)
+		content, err := run(ctx, "docker", "exec", kindNode, "ctr", "-n", "k8s.io", "content", "get", d)
 		if err != nil {
 			return nil, chain, fmt.Errorf("resolve immutable image %s: CRI: %v; content: %w", d, lookupErr, err)
 		}
@@ -1107,10 +1111,11 @@ func imageDescriptor(d string, content []byte) (string, error) {
 			Digest string `json:"digest"`
 		} `json:"config"`
 		Manifests []struct {
-			Digest    string `json:"digest"`
-			Size      int64  `json:"size"`
-			MediaType string `json:"mediaType"`
-			Platform  obj    `json:"platform"`
+			Digest      string            `json:"digest"`
+			Size        int64             `json:"size"`
+			MediaType   string            `json:"mediaType"`
+			Platform    obj               `json:"platform"`
+			Annotations map[string]string `json:"annotations"`
 		} `json:"manifests"`
 	}
 	if err := json.Unmarshal(content, &descriptor); err != nil {
@@ -1120,10 +1125,34 @@ func imageDescriptor(d string, content []byte) (string, error) {
 		return immutableDigest(descriptor.Config.Digest)
 	}
 	if descriptor.Config.Digest == "" && len(descriptor.Manifests) > 0 {
+		var attestations []string
+		runnable := descriptor.Manifests[:0]
+		for _, manifest := range descriptor.Manifests {
+			if text(manifest.Platform["os"]) == "unknown" || text(manifest.Platform["architecture"]) == "unknown" || manifest.Annotations["vnd.docker.reference.type"] == "attestation-manifest" {
+				if len(manifest.Platform) != 2 || text(manifest.Platform["os"]) != "unknown" || text(manifest.Platform["architecture"]) != "unknown" || manifest.Size <= 0 || manifest.MediaType != "application/vnd.oci.image.manifest.v1+json" || manifest.Annotations["vnd.docker.reference.type"] != "attestation-manifest" {
+					return "", fmt.Errorf("invalid attestation in immutable image index %s", d)
+				}
+				if _, err := immutableDigest(manifest.Digest); err != nil {
+					return "", err
+				}
+				attestations = append(attestations, manifest.Annotations["vnd.docker.reference.digest"])
+				continue
+			}
+			runnable = append(runnable, manifest)
+		}
+		if len(runnable) == 0 {
+			return "", fmt.Errorf("no runnable manifest in immutable image index %s", d)
+		}
+		descriptor.Manifests = runnable
 		first := descriptor.Manifests[0]
 		resolved, err := immutableDigest(first.Digest)
 		if err != nil {
 			return "", err
+		}
+		for _, reference := range attestations {
+			if reference != resolved {
+				return "", fmt.Errorf("attestation references another immutable image in %s", d)
+			}
 		}
 		knownMediaType := first.MediaType == "application/vnd.oci.image.manifest.v1+json" || first.MediaType == "application/vnd.oci.image.index.v1+json" || first.MediaType == "application/vnd.docker.distribution.manifest.v2+json" || first.MediaType == "application/vnd.docker.distribution.manifest.list.v2+json"
 		for _, alias := range descriptor.Manifests[1:] {
@@ -1216,15 +1245,20 @@ func verifyImages(ctx context.Context, out, phase string, current ...operator.Fe
 		cri, chain, resolveErr := imageConfig(ctx, podImage)
 		configID := text(nested(cri, "status", "id"))
 		builtID := text(built[0]["Id"])
+		builtCRI, builtChain, builtErr := imageConfig(ctx, builtID)
+		builtConfigID := text(nested(builtCRI, "status", "id"))
 		repos, _ := nested(cri, "status", "repoDigests").([]any)
-		evidence = append(evidence, obj{"pod": nested(pod, "metadata", "name"), "uid": nested(pod, "metadata", "uid"), "role": role, "podImageID": podImage, "container": publicRuntime(runtime), "resolution": chain, "builtConfigID": builtID, "criConfigID": configID, "criRepoDigests": repos})
+		evidence = append(evidence, obj{"pod": nested(pod, "metadata", "name"), "uid": nested(pod, "metadata", "uid"), "role": role, "podImageID": podImage, "container": publicRuntime(runtime), "resolution": chain, "builtImageID": builtID, "builtResolution": builtChain, "builtConfigID": builtConfigID, "criConfigID": configID, "criRepoDigests": repos})
 		if err := os.WriteFile(filepath.Join(out, phase+"-image-evidence.json"), encoded(evidence), 0600); err != nil {
 			return err
 		}
 		if resolveErr != nil {
 			return resolveErr
 		}
-		if configID == "" || digest(configID) != digest(builtID) {
+		if builtErr != nil {
+			return builtErr
+		}
+		if configID == "" || digest(configID) != digest(builtConfigID) {
 			return fmt.Errorf("%s running image configuration differs from built image", role)
 		}
 		counts[role]++

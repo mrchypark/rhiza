@@ -554,7 +554,6 @@ func TestLocalModeRejectsConflictingConfiguration(t *testing.T) {
 		{BindAddr: "127.0.0.1:0"}, {PeerAddr: "127.0.0.1:0"},
 		{Members: []quepaxa.Member{{ID: "local"}}}, {Learner: &quepaxa.Member{ID: "learner"}},
 		{EnableReconfiguration: true}, {PeerToken: "secret"}, {AdminToken: "secret"},
-		{ObjStoreProvider: "filesystem"}, {ObjStoreDir: "archive"}, {ObjStoreEndpoint: "localhost"}, {ObjStoreBucket: "archive"},
 	}
 	for _, config := range cases {
 		config.Local, config.NodeID, config.DataDir = true, "local", filepath.Join(t.TempDir(), "absent")

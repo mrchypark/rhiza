@@ -77,9 +77,10 @@ type ExecutionConfig struct {
 	ObjStoreGCGracePeriod          time.Duration         `json:"objstore_gc_grace_period"`
 
 	// Timing
-	CheckpointInterval  time.Duration `json:"checkpoint_interval"`
-	CheckpointTailBytes int64         `json:"checkpoint_tail_bytes"`
-	MaxWALBytes         int64         `json:"max_wal_bytes"`
-	MaxConcurrentReads  int           `json:"max_concurrent_reads"`
-	MaxLongPollReads    int           `json:"max_long_poll_reads"`
+	CheckpointInterval    time.Duration `json:"checkpoint_interval"`
+	CheckpointTailBytes   int64         `json:"checkpoint_tail_bytes"`
+	CheckpointRetainCount int           `json:"checkpoint_retain_count"`
+	MaxWALBytes           int64         `json:"max_wal_bytes"`
+	MaxConcurrentReads    int           `json:"max_concurrent_reads"`
+	MaxLongPollReads      int           `json:"max_long_poll_reads"`
 }

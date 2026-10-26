@@ -26,7 +26,7 @@ Old materializations, checkpoints, SQL history, and graph history are rejected; 
 peers are unsupported. Follow the [logical migration procedure](docs/sql-execution-policy.md)
 and preserve the old installation before changing binaries.
 
-Rhiza requires Go 1.27 or newer. `GOTOOLCHAIN=auto` is expected. SQLite uses
+Rhiza requires Go 1.27.3 or newer. `GOTOOLCHAIN=auto` is expected. SQLite uses
 [`ncruces/go-sqlite3`](https://github.com/ncruces/go-sqlite3), and Graph uses
 [`latticedb-go`](https://github.com/mrchypark/latticedb-go), both without cgo.
 
@@ -42,8 +42,26 @@ open a public HTTP listener.
 For an embedded local-only database, set `Local: true`. Rhiza then creates no
 peer transport or network listener, and uses the same durable WAL and SQL/KV/graph
 engines. Do not set listener addresses, members, learner/reconfiguration options,
-tokens, or object-storage configuration in this mode. It provides no replication
-or remote backup; the existing local WAL size limit still applies.
+or peer tokens in this mode. Configure the existing `ObjStore*` fields for
+continuous object-storage backup and restoration of a missing `DataDir` before
+`Open` returns ready. Use `ObjectStoreDurabilityBeforeAck` when acknowledged
+writes must survive total local loss; asynchronous backup has a loss window.
+Local mode provides no peer replication. See [embedded object-storage backup](docs/embedded-object-storage.md)
+for reconciliation, failure handling, and integration verification. Automatic GC
+preserves current state, retained committed snapshots, and live restore pins
+while collecting unreachable eligible objects. The integrated provider suite
+passed on S3, GCS, and Azure Floci emulators: each had 18 passes and two expected
+skips. Emulator results do not establish production-cloud parity; the linked
+verification notes identify the skipped tests and remaining gaps.
+After final lease-margin hardening, all six GC tests and two strengthened
+restore tests passed again on each provider, without skips.
+`CheckpointInterval` defaults to 15 minutes and skips new periodic
+checkpoints when state is unchanged. `CheckpointRetainCount` is an `int`; zero
+selects 3 snapshots. `ObjStoreGCInterval` defaults to 1 hour and
+environment configuration defaults GC grace to 24 hours. Direct Go
+`ObjStoreGCGracePeriod` zero also selects 24 hours, including explicit environment
+zero; positive values are preserved. Never
+delete backup objects based only on age.
 
 ```go
 db, err := rhiza.Open(ctx, rhiza.Config{
@@ -86,8 +104,8 @@ it uses the embedded Go API without a public HTTP server. From this checkout:
 cargo run --manifest-path sdk/rust/Cargo.toml --example embedded
 ```
 
-Use `rhizadb = "0.19.5"` in your Cargo dependencies.
-Native builds support macOS and Linux GNU and require Rust, Go 1.27+, and a C
+Use `rhizadb = "0.20.0"` in your Cargo dependencies.
+Native builds support macOS and Linux GNU and require Rust, Go 1.27.3+, and a C
 compiler. The Rust bridge requires cgo; Go-only applications remain cgo-free.
 Calls are synchronous. By default the embedded engine starts its private peer
 endpoint; use `Config::local()` to disable peer networking. SQL, KV, Graph, stream, and request-status access are documented in
