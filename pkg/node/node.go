@@ -1066,17 +1066,15 @@ func (n *Node) preparePeerCheckpoint(ctx context.Context, sender quepaxa.NodeID,
 	if err := n.checkpoints.ValidatePublisherClaim(ctx, string(sender), uint64(seal.Index), seal.RootHash); err != nil {
 		return err
 	}
-	waited, err := n.core.WaitCheckpointPrefixIfLagging(ctx, seal)
-	if err != nil {
+	if _, err := n.core.WaitCheckpointPrefixIfLagging(ctx, seal); err != nil {
 		return err
 	}
-	if waited {
-		if err := ctx.Err(); err != nil {
-			return err
-		}
-		if err := n.checkpoints.ValidatePublisherClaim(ctx, string(sender), uint64(seal.Index), seal.RootHash); err != nil {
-			return err
-		}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	// The claim can change during its initial read even if the prefix is already available.
+	if err := n.checkpoints.ValidatePublisherClaim(ctx, string(sender), uint64(seal.Index), seal.RootHash); err != nil {
+		return err
 	}
 	if err := n.core.PrepareCheckpoint(ctx, seal); err != nil {
 		return err
