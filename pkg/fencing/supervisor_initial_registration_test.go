@@ -33,6 +33,48 @@ type ordinaryOnlyStartupAuthorityFixture struct {
 	calls int
 }
 
+type continuationStartupAuthorityFixture struct {
+	initialStartupAuthorityFixture
+	wal               string
+	continuationCalls int
+}
+
+func (a *continuationStartupAuthorityFixture) RegisterStartupContinuation(_ context.Context, id Identity, wal string) (StartupGrant, error) {
+	a.continuationCalls++
+	if id != a.identity || wal != a.wal {
+		return StartupGrant{}, errors.New("continuation request changed")
+	}
+	return a.grant, nil
+}
+
+func TestSupervisorRegistrationContinuationValidatesExplicitRoute(t *testing.T) {
+	for _, mode := range []string{"valid", "wrong-identity", "initial-grant", "learner-grant"} {
+		t.Run(mode, func(t *testing.T) {
+			id := testIdentity()
+			id.WALIdentity = ""
+			a := &continuationStartupAuthorityFixture{initialStartupAuthorityFixture: initialStartupAuthorityFixture{
+				identity: id, grant: StartupGrant{Identity: id, Role: StartupRoleVoterActive},
+			}, wal: strings.Repeat("a", 64)}
+			switch mode {
+			case "wrong-identity":
+				a.grant.Identity.PodUID = "other"
+			case "initial-grant":
+				a.grant.InitialRegistration = &InitialRegistrationProvenance{}
+			case "learner-grant":
+				a.grant.Role = StartupRoleLearnerPendingRemove
+			}
+			s := &Supervisor{Identity: id, Authority: a}
+			_, err := s.registerStartup(t.Context(), a, StartupPreflightResult{RegistrationWALIdentity: a.wal})
+			if (err == nil) != (mode == "valid") {
+				t.Fatalf("mode=%s err=%v", mode, err)
+			}
+			if a.continuationCalls != 1 || a.ordinaryCalls != 0 || a.initialCalls != 0 {
+				t.Fatal("wrong registration route")
+			}
+		})
+	}
+}
+
 func (a *ordinaryOnlyStartupAuthorityFixture) RegisterStartup(context.Context, Identity) (StartupGrant, error) {
 	a.calls++
 	return StartupGrant{}, nil

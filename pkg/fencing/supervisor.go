@@ -48,6 +48,10 @@ type InitialStartupGrantAuthority interface {
 	RegisterInitialStartup(context.Context, Identity) (StartupGrant, error)
 }
 
+type RegistrationContinuationAuthority interface {
+	RegisterStartupContinuation(context.Context, Identity, string) (StartupGrant, error)
+}
+
 type LearnerIdentityAuthority interface {
 	RegisterLearnerIdentity(context.Context, Identity, LearnerIdentityRegistration) error
 }
@@ -76,11 +80,12 @@ type PendingEngineRepairAuthority interface {
 }
 
 // StartupPreflightResult is a local, unauthorised classification. Exactly one
-// of InitialRegistration or PendingEngineRepair may be set. Initial
+// of InitialRegistration, RegistrationWALIdentity or PendingEngineRepair may be set. Initial
 // registration is not a repair proposal and does not mutate remote state.
 type StartupPreflightResult struct {
-	InitialRegistration bool
-	PendingEngineRepair *PendingEngineRepairProposal
+	InitialRegistration     bool
+	RegistrationWALIdentity string
+	PendingEngineRepair     *PendingEngineRepairProposal
 }
 
 // EngineRepairPreflight builds local, unauthorised startup evidence before the
@@ -130,7 +135,7 @@ func (s *Supervisor) Run(ctx context.Context) error {
 		if err != nil {
 			return fmt.Errorf("fencing: engine repair preflight: %w", err)
 		}
-		if result.InitialRegistration && result.PendingEngineRepair != nil {
+		if (result.InitialRegistration && result.PendingEngineRepair != nil) || (result.RegistrationWALIdentity != "" && (result.InitialRegistration || result.PendingEngineRepair != nil)) {
 			return fmt.Errorf("fencing: startup preflight has conflicting classifications")
 		}
 		if result.PendingEngineRepair != nil {
@@ -160,7 +165,7 @@ func (s *Supervisor) Run(ctx context.Context) error {
 		}
 		s.grant, s.bound = grant, grant.Identity
 	} else {
-		if preflight.InitialRegistration || preflight.PendingEngineRepair != nil {
+		if preflight.InitialRegistration || preflight.PendingEngineRepair != nil || preflight.RegistrationWALIdentity != "" {
 			return fmt.Errorf("fencing: startup authority cannot enforce preflight classification")
 		}
 		if err := s.Authority.Register(ctx, s.Identity); err != nil {
@@ -256,8 +261,25 @@ func (s *Supervisor) registerStartup(ctx context.Context, authority StartupGrant
 	if s == nil || ctx == nil || authority == nil {
 		return StartupGrant{}, fmt.Errorf("fencing: startup registration is incomplete")
 	}
-	if preflight.InitialRegistration && preflight.PendingEngineRepair != nil {
+	if (preflight.InitialRegistration && preflight.PendingEngineRepair != nil) || (preflight.RegistrationWALIdentity != "" && (preflight.InitialRegistration || preflight.PendingEngineRepair != nil)) {
 		return StartupGrant{}, fmt.Errorf("fencing: startup preflight has conflicting classifications")
+	}
+	if preflight.RegistrationWALIdentity != "" {
+		continuation, ok := s.Authority.(RegistrationContinuationAuthority)
+		if !ok {
+			return StartupGrant{}, fmt.Errorf("fencing: registration continuation authority is unavailable")
+		}
+		grant, err := continuation.RegisterStartupContinuation(ctx, s.Identity, preflight.RegistrationWALIdentity)
+		if err != nil {
+			return StartupGrant{}, err
+		}
+		if err := grant.Validate(s.Identity); err != nil {
+			return StartupGrant{}, err
+		}
+		if grant.Role != StartupRoleVoterActive || grant.InitialRegistration != nil {
+			return StartupGrant{}, fmt.Errorf("fencing: invalid registration continuation grant")
+		}
+		return grant, nil
 	}
 	if preflight.InitialRegistration {
 		initial, ok := s.Authority.(InitialStartupGrantAuthority)
