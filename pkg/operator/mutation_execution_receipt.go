@@ -17,20 +17,22 @@ import (
 )
 
 type mutationExecutionReceipt struct {
-	Runtime           fencing.RuntimeBinding      `json:"runtime"`
-	WALIdentity       string                      `json:"walIdentity"`
-	ProducerUID       string                      `json:"producerUID"`
-	Sequence          uint64                      `json:"sequence"`
-	Intent            fencing.MutationIntent      `json:"intent"`
-	Preparation       fencing.MutationPreparation `json:"preparation"`
-	DispatchID        string                      `json:"dispatchID"`
-	Outcome           fencing.MutationOutcome     `json:"outcome"`
-	ConditionFailed   bool                        `json:"conditionFailed,omitempty"`
-	Generation        int64                       `json:"generation"`
-	Metageneration    int64                       `json:"metageneration,omitempty"`
-	PayloadDigest     string                      `json:"payloadDigest,omitempty"`
-	AllCopiesTerminal bool                        `json:"allCopiesTerminal,omitempty"`
-	ReceiptDigest     string                      `json:"receiptDigest"`
+	Runtime           fencing.RuntimeBinding          `json:"runtime"`
+	AuthorityProfile  string                          `json:"authorityProfile,omitempty"`
+	LogicalBinding    *fencing.LogicalWriterBindingV1 `json:"logicalBinding,omitempty"`
+	WALIdentity       string                          `json:"walIdentity"`
+	ProducerUID       string                          `json:"producerUID"`
+	Sequence          uint64                          `json:"sequence"`
+	Intent            fencing.MutationIntent          `json:"intent"`
+	Preparation       fencing.MutationPreparation     `json:"preparation"`
+	DispatchID        string                          `json:"dispatchID"`
+	Outcome           fencing.MutationOutcome         `json:"outcome"`
+	ConditionFailed   bool                            `json:"conditionFailed,omitempty"`
+	Generation        int64                           `json:"generation"`
+	Metageneration    int64                           `json:"metageneration,omitempty"`
+	PayloadDigest     string                          `json:"payloadDigest,omitempty"`
+	AllCopiesTerminal bool                            `json:"allCopiesTerminal,omitempty"`
+	ReceiptDigest     string                          `json:"receiptDigest"`
 }
 
 func (r mutationExecutionReceipt) digest() string {
@@ -139,6 +141,15 @@ func (s *MutationExecutionReceiptStore) Close() error {
 }
 
 func (s *MutationExecutionReceiptStore) put(receipt mutationExecutionReceipt) (string, error) {
+	if receipt.AuthorityProfile == fencing.LogicalWriterProfileV1 {
+		if receipt.Runtime != (fencing.RuntimeBinding{}) || receipt.LogicalBinding == nil || receipt.LogicalBinding.ValidateBound() != nil ||
+			receipt.LogicalBinding.Role != fencing.StartupRoleVoterActive || receipt.WALIdentity != receipt.LogicalBinding.WALIdentity ||
+			receipt.Sequence == 0 || receipt.ProducerUID != receipt.LogicalBinding.ProducerUID {
+			return "", fmt.Errorf("fencing: incomplete logical mutation receipt identity")
+		}
+	} else if receipt.LogicalBinding != nil || receipt.AuthorityProfile != "" {
+		return "", fmt.Errorf("fencing: mutation receipt authority profile is unsupported")
+	}
 	if s != nil && s.evidence != nil {
 		if receipt.Sequence == 0 || receipt.ProducerUID == "" || receipt.WALIdentity == "" || receipt.DispatchID == "" || receipt.ReceiptDigest != receipt.digest() {
 			return "", fmt.Errorf("fencing: incomplete mutation execution receipt")
@@ -212,7 +223,21 @@ func (s *MutationExecutionReceiptStore) put(receipt mutationExecutionReceipt) (s
 }
 
 func mutationExecutionReceiptName(receipt mutationExecutionReceipt) string {
+	if receipt.AuthorityProfile == fencing.LogicalWriterProfileV1 && receipt.LogicalBinding != nil {
+		return "receipt-" + hashJSON([]any{"rhiza-logical-mutation-receipt-v1", *receipt.LogicalBinding, receipt.WALIdentity, receipt.ProducerUID, receipt.Sequence, receipt.Intent.OperationID})
+	}
 	return "receipt-" + hashJSON([]any{receipt.Runtime, receipt.WALIdentity, receipt.ProducerUID, receipt.Sequence, receipt.Intent.OperationID})
+}
+
+func (e *FencingExecutor) receiptsForLogicalBinding(statefulSetUID string, binding fencing.LogicalWriterBindingV1) (*MutationExecutionReceiptStore, error) {
+	if e == nil || e.AuthorityState == nil || statefulSetUID == "" || binding.ValidateBound() != nil || binding.Role != fencing.StartupRoleVoterActive {
+		return nil, fmt.Errorf("fencing: logical mutation receipts require an exact root-bound active binding")
+	}
+	evidence, err := e.authorityEvidenceForRoot(statefulSetUID, binding.SourceClusterID)
+	if err != nil {
+		return nil, err
+	}
+	return NewRemoteMutationExecutionReceiptStore(evidence)
 }
 
 // VerifySourceMutationEvidence checks an archived producer entry against its

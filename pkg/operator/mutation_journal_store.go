@@ -219,6 +219,9 @@ func (e *FencingExecutor) mutateProducer(ctx context.Context, runtime fencing.Ru
 // merely ConfigMaps returned by a list. Incomplete creation is still an obligation.
 // The result is a mutation barrier only, never runtime-termination evidence.
 func (e *FencingExecutor) closeMutationProducers(ctx context.Context, state fenceLedger, nodes []string) (bool, error) {
+	if state.Ledger.Profile == fencing.LogicalWriterProfileV1 {
+		return e.closeLogicalMutationProducers(ctx, state, nodes)
+	}
 	if !state.Ledger.RequireRuntimeBinding || (len(nodes) == 0 && state.Ledger.ClosedBy == "") {
 		return false, fmt.Errorf("fencing: producer cohort is not frozen")
 	}
@@ -268,6 +271,43 @@ func (e *FencingExecutor) closeMutationProducers(ctx context.Context, state fenc
 			if !verified {
 				complete = false
 			}
+		}
+	}
+	return complete, nil
+}
+
+func (e *FencingExecutor) closeLogicalMutationProducers(ctx context.Context, state fenceLedger, nodes []string) (bool, error) {
+	if e == nil || e.AuthorityState == nil || !state.Ledger.RequireMutationJournal || state.Ledger.RequireRuntimeBinding ||
+		state.Ledger.Profile != fencing.LogicalWriterProfileV1 || (len(nodes) == 0 && state.Ledger.ClosedBy == "") {
+		return false, fmt.Errorf("fencing: logical producer cohort is not frozen")
+	}
+	for _, nodeID := range nodes {
+		if _, ok := state.Ledger.ClosedNodes[nodeID]; !ok {
+			return false, fmt.Errorf("fencing: logical producer cohort is not frozen")
+		}
+	}
+	complete := true
+	for _, run := range state.Ledger.Runs {
+		if len(nodes) != 0 && !slices.Contains(nodes, run.Identity.NodeID) {
+			continue
+		}
+		if fencing.RunRole(run) != fencing.StartupRoleVoterActive || run.Runtime != nil || run.LogicalBinding == nil || run.Stop == nil {
+			return false, ErrFencePending
+		}
+		if err := e.recordLogicalRunClosure(ctx, state.StatefulSetUID, run.Identity); err != nil {
+			if errors.Is(err, fencing.ErrPending) || errors.Is(err, ErrFencePending) || errors.Is(err, errAuthorityStateConflict) {
+				complete = false
+				continue
+			}
+			return false, err
+		}
+		latest, err := e.read(ctx, state.StatefulSetUID, state.Ledger.SourceClusterID)
+		if err != nil {
+			return false, err
+		}
+		current, ok := latest.Ledger.Runs[run.Identity.RunID]
+		if !ok || current.LogicalClosure == nil || current.LogicalClosure.Identity != run.Identity {
+			complete = false
 		}
 	}
 	return complete, nil

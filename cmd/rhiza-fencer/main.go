@@ -112,6 +112,7 @@ func serve(ctx context.Context, args []string) error {
 	runtimeAgentPort := f.String("runtime-agent-port", "9445", "node runtime-agent HTTPS host port")
 	authorityStatePrefix := f.String("authority-state-prefix", os.Getenv("FENCER_AUTHORITY_STATE_PREFIX"), "canonical authority state prefix in the configured remote ObjectStorage bucket")
 	independentMutation := f.Bool("independent-mutation-profile", os.Getenv("FENCER_INDEPENDENT_MUTATION_PROFILE") == "true", "require canonical remote state and source-mutation providers for the independent NoPVC mutation profile")
+	authorityProfile := f.String("authority-profile", os.Getenv("FENCER_AUTHORITY_PROFILE"), "explicit authority profile (empty or logical-writer-v1)")
 	controllerSA := os.Getenv("FENCER_CONTROLLER_SERVICE_ACCOUNT")
 	if controllerSA == "" {
 		controllerSA = "rhiza-operator"
@@ -128,7 +129,7 @@ func serve(ctx context.Context, args []string) error {
 	}
 	stateConfig := objectstore.LoadConfig()
 	if err := validateSourceWriterConfig(sourceWriterConfig{
-		Independent: *independentMutation, HasCanonicalState: hasRemoteCanonicalState(stateConfig), SourceProvider: stateConfig.Provider,
+		Independent: *independentMutation, AuthorityProfile: *authorityProfile, HasCanonicalState: hasRemoteCanonicalState(stateConfig), SourceProvider: stateConfig.Provider,
 		RuntimeAgentCA: *runtimeAgentCA, StageDir: *stageDir, StageIncarnation: *stageIncarnation,
 		ReceiptDir: *sourceReceiptDir, CredentialsFile: *sourceWriterCredentials, UseADC: *sourceWriterUseADC,
 		AckLossConfig:       *ackLossConfigFile != "",
@@ -165,7 +166,7 @@ func serve(ctx context.Context, args []string) error {
 			return fmt.Errorf("independent mutation profile requires canonical remote authority state")
 		}
 	}
-	executor := newFencingExecutor(kube, authorityState, *independentMutation, *sourceReceiptDir, *sourceWriterCredentials, *sourceWriterUseADC)
+	executor := newFencingExecutor(kube, authorityState, *independentMutation, *authorityProfile, *sourceReceiptDir, *sourceWriterCredentials, *sourceWriterUseADC)
 	executor.ArchiveBucket = archiveBucket
 	executor.AutomaticControlPrefix = stateConfig.Prefix
 	executor.ArchiveStoreIdentity = operator.StoreIdentity(map[string]string{
@@ -286,6 +287,7 @@ func serve(ctx context.Context, args []string) error {
 
 type sourceWriterConfig struct {
 	Independent         bool
+	AuthorityProfile    string
 	HasCanonicalState   bool
 	SourceProvider      objectstore.Provider
 	RuntimeAgentCA      string
@@ -328,16 +330,17 @@ func legacyCooperativeControlState(independent bool, receiptDir, credentialsFile
 	return !independent && receiptDir == "" && credentialsFile == "" && !useADC
 }
 
-func newFencingExecutor(kube *operator.Kubernetes, authorityState *operator.AuthorityStateStore, independent bool, receiptDir, credentialsFile string, useADC bool) *operator.FencingExecutor {
+func newFencingExecutor(kube *operator.Kubernetes, authorityState *operator.AuthorityStateStore, independent bool, authorityProfile, receiptDir, credentialsFile string, useADC bool) *operator.FencingExecutor {
 	profile := fencing.MutationExecutionProfile
-	if independent {
+	if independent || authorityProfile == fencing.LogicalWriterProfileV1 {
 		profile = fencing.MutationHeldExecutionProfile
 	}
 	return &operator.FencingExecutor{
 		Kube: kube, AuthorityState: authorityState,
-		RequireMutationJournal:        independent,
+		RequireMutationJournal:        independent || authorityProfile == fencing.LogicalWriterProfileV1,
+		AuthorityProfile:              authorityProfile,
 		MutationProfile:               profile,
-		LegacyCooperativeControlState: legacyCooperativeControlState(independent, receiptDir, credentialsFile, useADC),
+		LegacyCooperativeControlState: legacyCooperativeControlState(independent || authorityProfile == fencing.LogicalWriterProfileV1, receiptDir, credentialsFile, useADC),
 	}
 }
 
@@ -347,10 +350,31 @@ func validateSourceWriterConfig(c sourceWriterConfig) error {
 	if c.CredentialsFile != "" && c.UseADC {
 		return fmt.Errorf("source writer credentials file and Application Default Credentials are mutually exclusive")
 	}
-	if c.Independent || c.ReceiptDir != "" || c.CredentialsFile != "" || c.UseADC {
+	if c.AuthorityProfile != "" && c.AuthorityProfile != fencing.LogicalWriterProfileV1 {
+		return fmt.Errorf("unsupported authority profile %q", c.AuthorityProfile)
+	}
+	if c.Independent && c.AuthorityProfile != "" {
+		return fmt.Errorf("independent mutation and logical writer authority profiles are mutually exclusive")
+	}
+	if c.Independent || c.AuthorityProfile != "" || c.ReceiptDir != "" || c.CredentialsFile != "" || c.UseADC {
 		if c.SourceProvider != objectstore.ProviderGCS {
 			return fmt.Errorf("source mutation proof profile for provider %q not implemented", c.SourceProvider)
 		}
+	}
+	if c.AuthorityProfile == fencing.LogicalWriterProfileV1 {
+		if !c.HasCanonicalState {
+			return fmt.Errorf("logical writer profile requires a configured remote canonical authority store")
+		}
+		if c.StorageEmulatorHost != "" {
+			return fmt.Errorf("logical writer profile rejects STORAGE_EMULATOR_HOST")
+		}
+		if (c.CredentialsFile == "") == !c.UseADC {
+			return fmt.Errorf("logical writer profile requires exactly one separate source writer credential mode")
+		}
+		if c.ReceiptDir != "" || c.StageDir != "" || c.StageIncarnation != "" || c.AckLossConfig {
+			return fmt.Errorf("logical writer profile requires canonical remote staging and receipts and does not enable acknowledgement-loss qualification")
+		}
+		return nil
 	}
 	if c.UseADC && !c.Independent {
 		return fmt.Errorf("source writer Application Default Credentials require the independent mutation profile")

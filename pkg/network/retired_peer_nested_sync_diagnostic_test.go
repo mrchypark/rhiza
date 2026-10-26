@@ -304,8 +304,11 @@ func TestRetiredPeerNestedSyncDiagnostic(t *testing.T) {
 		}
 	}
 	for _, field := range []string{
-		"request_config=1", "selected_config=2", "slot=0", "from=2",
-		"lookup_ok=true", "cluster_match=true", "config_match=false", "rejection=cluster_or_config",
+		// A's decision slot still belongs to the historical configuration. The
+		// request is rejected because B is no longer a voter in A's current
+		// configuration, not because this read-only Sync uses the old config.
+		"request_config=1", "selected_config=1", "slot=0", "from=2",
+		"lookup_ok=true", "cluster_match=true", "config_match=true", "rejection=cluster_or_config",
 	} {
 		if !strings.Contains(rejectedSync, field) {
 			t.Fatalf("nested Sync rejection missing %q: %s", field, rejectedSync)
@@ -412,8 +415,9 @@ func TestRetiredPeerArchiveRecoveryAllowsRetainedVoterCurrentSync(t *testing.T) 
 	}
 
 	// Recreate B from its certified prefix at the freeze. This is a stale but
-	// retained voter: its old-config Sync must fail until certified archive
-	// recovery applies the exact suffix through the fixed terminal.
+	// retained voter: it may read the historical certified suffix through its
+	// unchanged membership identity. The response does not apply decisions;
+	// archive recovery below remains responsible for durable state restoration.
 	if err := peerServers["b"].Close(); err != nil {
 		t.Fatalf("stop B before restoring its stale certified prefix: %v", err)
 	}
@@ -461,8 +465,12 @@ func TestRetiredPeerArchiveRecoveryAllowsRetainedVoterCurrentSync(t *testing.T) 
 	if staleCore.CurrentCluster().ConfigID != 1 || staleCore.Tip() != freeze {
 		t.Fatalf("stale B fixture is not exactly at the freeze: config=%d tip=%d freeze=%d", staleCore.CurrentCluster().ConfigID, staleCore.Tip(), freeze)
 	}
-	if _, err := staleTransport.FetchDecisions(ctx, "a", freeze+1, 1); err == nil || !strings.Contains(err.Error(), "cluster identity mismatch") {
-		t.Fatalf("pre-archive stale B Sync error=%v, want cluster identity mismatch", err)
+	staleResponse, err := staleTransport.FetchDecisions(ctx, "a", freeze+1, 1)
+	if err != nil || staleResponse.ConfigID != 1 || len(staleResponse.Decisions) != 1 || staleResponse.Decisions[0].Slot != freeze+1 {
+		t.Fatalf("pre-archive retained-voter historical Sync=%+v err=%v, want one certified historical decision", staleResponse, err)
+	}
+	if staleCore.CurrentCluster().ConfigID != 1 || staleCore.Tip() != freeze {
+		t.Fatalf("read-only historical Sync applied data locally: config=%d tip=%d freeze=%d", staleCore.CurrentCluster().ConfigID, staleCore.Tip(), freeze)
 	}
 
 	archiveBucket := objstore.NewInMemBucket()
@@ -543,22 +551,25 @@ func TestRetiredPeerArchiveRecoveryAllowsRetainedVoterCurrentSync(t *testing.T) 
 		t.Fatalf("stale continuation key was not rejected before callback: configured=%t complete=%t calls=%d",
 			configured, complete, continuationCalls.Load())
 	}
+	configured, complete = staleServer.continueArchiveCatchUp(ctx, gapKey, terminalSlot-1)
+	if !configured || !complete || continuationCalls.Load() != 1 {
+		t.Fatalf("exact archive prefix continuation: configured=%t complete=%t calls=%d",
+			configured, complete, continuationCalls.Load())
+	}
+	if callbackErr := <-continuationResult; callbackErr != nil {
+		t.Fatalf("archive prefix continuation failed: %v", callbackErr)
+	}
+	if staleCore.Tip() != terminalSlot-1 || staleCore.CurrentCluster().ConfigID != 1 {
+		t.Fatalf("archive prefix did not stop before the terminal: tip=%d config=%d", staleCore.Tip(), staleCore.CurrentCluster().ConfigID)
+	}
 	request := transports["a"].request(peerfb.OperationLearned)
 	request.Decision = decisionToWire(decision)
 	if _, err := transports["a"].call(ctx, "b", request); err != nil {
-		var callbackErr error
-		select {
-		case callbackErr = <-continuationResult:
-		default:
-		}
-		t.Fatalf("same admitted Learned did not resume after fixed archive prefix: err=%v continuation_calls=%d continuation_err=%v local_tip=%d pending=%t",
-			err, continuationCalls.Load(), callbackErr, staleCore.Tip(), staleCore.PendingTerminalGap(gapKey))
-	}
-	if callbackErr := <-continuationResult; callbackErr != nil {
-		t.Fatalf("archive continuation failed: %v", callbackErr)
+		t.Fatalf("same admitted Learned did not resume after fixed archive prefix: err=%v continuation_calls=%d local_tip=%d pending=%t",
+			err, continuationCalls.Load(), staleCore.Tip(), staleCore.PendingTerminalGap(gapKey))
 	}
 	if got := continuationCalls.Load(); got != 1 {
-		t.Fatalf("continuation calls=%d, want exactly once", got)
+		t.Fatalf("historical terminal Sync unexpectedly re-entered archive continuation: calls=%d", got)
 	}
 	if staleCore.Tip() != terminalSlot {
 		t.Fatalf("B durable tip=%d, want terminal accepted at %d", staleCore.Tip(), terminalSlot)

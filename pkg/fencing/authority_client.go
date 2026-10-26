@@ -23,6 +23,7 @@ import (
 // the bound service account token independently of the claimed identity.
 type AuthorityMessage struct {
 	Action                  string                       `json:"action"`
+	AuthorityProfile        string                       `json:"authorityProfile,omitempty"`
 	Identity                Identity                     `json:"identity"`
 	InitialRegistration     bool                         `json:"initialRegistration,omitempty"`
 	RegistrationWALIdentity string                       `json:"registrationWALIdentity,omitempty"`
@@ -62,14 +63,17 @@ type MutationLookupResult struct {
 }
 
 type AuthorityClient struct {
-	URL       string
-	TokenFile string
-	Client    *http.Client
+	URL              string
+	TokenFile        string
+	Client           *http.Client
+	AuthorityProfile string
 	// Bound identity and producer are populated only by a validated Bind.
 	// Source mutation endpoints are unavailable before that receipt.
-	boundIdentity Identity
-	producer      *ProducerBinding
-	role          StartupRole
+	boundIdentity  Identity
+	producer       *ProducerBinding
+	binding        *BindReceipt
+	role           StartupRole
+	logicalBinding *LogicalWriterBindingV1
 }
 
 func (a *AuthorityClient) call(ctx context.Context, message AuthorityMessage, result any) error {
@@ -160,11 +164,12 @@ func (a *AuthorityClient) RegisterInitialStartup(ctx context.Context, id Identit
 }
 
 func (a *AuthorityClient) RegisterStartupContinuation(ctx context.Context, id Identity, wal string) (StartupGrant, error) {
+	a.clearStartupState()
 	if !mutationDigestValid(wal) {
 		return StartupGrant{}, fmt.Errorf("fencing: invalid registration continuation WAL")
 	}
 	var grant StartupGrant
-	if err := a.call(ctx, AuthorityMessage{Action: "register", Identity: id, RegistrationWALIdentity: wal}, &grant); err != nil {
+	if err := a.call(ctx, AuthorityMessage{Action: "register", AuthorityProfile: a.AuthorityProfile, Identity: id, RegistrationWALIdentity: wal}, &grant); err != nil {
 		return StartupGrant{}, err
 	}
 	if err := grant.Validate(id); err != nil {
@@ -173,13 +178,17 @@ func (a *AuthorityClient) RegisterStartupContinuation(ctx context.Context, id Id
 	if grant.Role != StartupRoleVoterActive || grant.InitialRegistration != nil {
 		return StartupGrant{}, fmt.Errorf("fencing: invalid registration continuation grant")
 	}
+	if err := a.acceptStartupGrant(grant); err != nil {
+		return StartupGrant{}, err
+	}
 	a.role = grant.Role
 	return grant, nil
 }
 
 func (a *AuthorityClient) registerStartup(ctx context.Context, id Identity, initial bool) (StartupGrant, error) {
+	a.clearStartupState()
 	var grant StartupGrant
-	err := a.call(ctx, AuthorityMessage{Action: "register", Identity: id, InitialRegistration: initial}, &grant)
+	err := a.call(ctx, AuthorityMessage{Action: "register", AuthorityProfile: a.AuthorityProfile, Identity: id, InitialRegistration: initial}, &grant)
 	if err != nil {
 		return StartupGrant{}, err
 	}
@@ -189,8 +198,34 @@ func (a *AuthorityClient) registerStartup(ctx context.Context, id Identity, init
 	if initial && grant.InitialRegistration == nil {
 		return StartupGrant{}, fmt.Errorf("fencing: initial startup grant lacks first-registration evidence")
 	}
+	if err := a.acceptStartupGrant(grant); err != nil {
+		return StartupGrant{}, err
+	}
 	a.role = grant.Role
 	return grant, nil
+}
+
+func (a *AuthorityClient) clearStartupState() {
+	a.boundIdentity = Identity{}
+	a.producer = nil
+	a.binding = nil
+	a.role = ""
+	a.logicalBinding = nil
+}
+
+func (a *AuthorityClient) acceptStartupGrant(grant StartupGrant) error {
+	if a.AuthorityProfile != grant.AuthorityProfile {
+		return fmt.Errorf("fencing: startup grant profile differs from requested profile")
+	}
+	a.logicalBinding = nil
+	if grant.AuthorityProfile == LogicalWriterProfileV1 {
+		if grant.LogicalBinding == nil || grant.LogicalBinding.Validate() != nil {
+			return fmt.Errorf("fencing: logical startup grant lacks a valid binding")
+		}
+		binding := *grant.LogicalBinding
+		a.logicalBinding = &binding
+	}
+	return nil
 }
 
 func (a *AuthorityClient) CreatePendingEngineRepair(ctx context.Context, id Identity, proposal PendingEngineRepairProposal) error {
@@ -329,22 +364,66 @@ func (a *AuthorityClient) RegisterLearnerIdentity(ctx context.Context, id Identi
 // PromoteLearner asks the authority to activate this already-bound WAL only
 // after it has independently verified the committed membership journal.
 func (a *AuthorityClient) PromoteLearner(ctx context.Context, id Identity) (BindReceipt, error) {
+	if a == nil || a.role != StartupRoleLearnerPendingRemove || a.boundIdentity != id {
+		return BindReceipt{}, fmt.Errorf("fencing: learner promotion identity is not bound")
+	}
 	var receipt BindReceipt
-	err := a.call(ctx, AuthorityMessage{Action: "promote-learner", Identity: id}, &receipt)
-	return receipt, err
+	if err := a.call(ctx, AuthorityMessage{Action: "promote-learner", AuthorityProfile: a.AuthorityProfile, Identity: id}, &receipt); err != nil {
+		return BindReceipt{}, err
+	}
+	if err := receipt.Validate(id); err != nil || receipt.Role != StartupRoleVoterActive || receipt.AuthorityProfile != a.AuthorityProfile {
+		return BindReceipt{}, fmt.Errorf("fencing: invalid learner promotion receipt")
+	}
+	if a.AuthorityProfile == LogicalWriterProfileV1 {
+		if a.logicalBinding == nil || receipt.LogicalBinding == nil || !logicalPromotionBindingMatches(*a.logicalBinding, *receipt.LogicalBinding) {
+			return BindReceipt{}, fmt.Errorf("fencing: logical learner promotion binding differs")
+		}
+		binding := *receipt.LogicalBinding
+		a.logicalBinding = &binding
+	}
+	a.role = StartupRoleVoterActive
+	a.producer = nil
+	if receipt.Producer != nil {
+		producer := *receipt.Producer
+		if producer.LogicalBinding != nil {
+			binding := *producer.LogicalBinding
+			producer.LogicalBinding = &binding
+		}
+		a.producer = &producer
+	}
+	copy := receipt.clone()
+	a.binding = &copy
+	return receipt, nil
 }
 func (a *AuthorityClient) Bind(ctx context.Context, id Identity) (BindReceipt, error) {
 	a.boundIdentity = Identity{}
 	a.producer = nil
+	a.binding = nil
+	if a.AuthorityProfile == LogicalWriterProfileV1 && (a.role == "" || a.logicalBinding == nil) {
+		return BindReceipt{}, fmt.Errorf("fencing: logical bind requires an accepted startup grant")
+	}
 	if a.role == "" {
 		a.role = StartupRoleVoterActive
 	}
 	var receipt BindReceipt
-	if err := a.call(ctx, AuthorityMessage{Action: "bind", Identity: id}, &receipt); err != nil {
+	if err := a.call(ctx, AuthorityMessage{Action: "bind", AuthorityProfile: a.AuthorityProfile, Identity: id}, &receipt); err != nil {
 		return BindReceipt{}, err
 	}
 	if err := receipt.Validate(id); err != nil {
 		return BindReceipt{}, err
+	}
+	if receipt.AuthorityProfile != a.AuthorityProfile {
+		return BindReceipt{}, fmt.Errorf("fencing: bind receipt profile differs from startup profile")
+	}
+	if receipt.AuthorityProfile == LogicalWriterProfileV1 {
+		if a.logicalBinding == nil || receipt.LogicalBinding == nil {
+			return BindReceipt{}, fmt.Errorf("fencing: logical bind receipt has no startup binding")
+		}
+		want, got := *a.logicalBinding, *receipt.LogicalBinding
+		want.WALIdentity = got.WALIdentity
+		if want != got {
+			return BindReceipt{}, fmt.Errorf("fencing: logical bind receipt differs from startup grant")
+		}
 	}
 	receiptRole := receipt.Role
 	if receiptRole == "" {
@@ -357,8 +436,14 @@ func (a *AuthorityClient) Bind(ctx context.Context, id Identity) (BindReceipt, e
 	a.producer = nil
 	if receipt.Producer != nil {
 		producer := *receipt.Producer
+		if producer.LogicalBinding != nil {
+			binding := *producer.LogicalBinding
+			producer.LogicalBinding = &binding
+		}
 		a.producer = &producer
 	}
+	copy := receipt.clone()
+	a.binding = &copy
 	return receipt, nil
 }
 func (a *AuthorityClient) Stop(ctx context.Context, id Identity) (StopRequest, error) {
@@ -407,10 +492,37 @@ func (a *AuthorityClient) LookupMutation(ctx context.Context, id Identity, produ
 }
 
 func (a *AuthorityClient) sourceMutationBinding() (Identity, ProducerBinding, error) {
-	if a == nil || (a.role != "" && a.role != StartupRoleVoterActive) || a.producer == nil || a.producer.StageIncarnation == "" || a.producer.ProducerUID == "" || a.producer.Runtime.StatefulSetUID == "" || a.boundIdentity.WALIdentity == "" {
+	if a == nil || (a.role != "" && a.role != StartupRoleVoterActive) || a.binding == nil || a.binding.Identity != a.boundIdentity ||
+		a.binding.AuthorityProfile != a.AuthorityProfile ||
+		a.binding.Producer == nil || a.producer == nil || !sameProducerBinding(*a.binding.Producer, *a.producer) ||
+		a.producer.StageIncarnation == "" || a.producer.ProducerUID == "" || a.boundIdentity.WALIdentity == "" {
 		return Identity{}, ProducerBinding{}, fmt.Errorf("fencing: source mutation producer is not bound")
 	}
+	if a.AuthorityProfile == LogicalWriterProfileV1 {
+		p := a.producer
+		if p.Profile != LogicalWriterProfileV1 || p.LogicalBinding == nil || p.Runtime != (RuntimeBinding{}) ||
+			p.LogicalBinding.ValidateBound() != nil || !p.LogicalBinding.MatchesIdentity(a.boundIdentity) ||
+			p.LogicalBinding.ProducerUID != p.ProducerUID || p.LogicalBinding.StoreScopeHash != p.StoreScopeHash {
+			return Identity{}, ProducerBinding{}, fmt.Errorf("fencing: logical source mutation producer differs from bind")
+		}
+	} else if (a.AuthorityProfile != "" && a.AuthorityProfile != RuntimeWriterProfileV1) || a.producer.Runtime.StatefulSetUID == "" {
+		return Identity{}, ProducerBinding{}, fmt.Errorf("fencing: physical source mutation runtime binding is missing")
+	}
 	return a.boundIdentity, *a.producer, nil
+}
+
+func (a *AuthorityClient) validatedSourceMutationBinding(expected BindReceipt) (BindReceipt, error) {
+	if err := expected.Validate(expected.Identity); err != nil || expected.Producer == nil {
+		return BindReceipt{}, fmt.Errorf("fencing: direct source mutation opener requires a validated producer receipt")
+	}
+	identity, _, err := a.sourceMutationBinding()
+	if err != nil {
+		return BindReceipt{}, err
+	}
+	if identity != expected.Identity || a.binding == nil || !a.binding.SameBinding(expected) {
+		return BindReceipt{}, fmt.Errorf("fencing: direct source mutation receipt differs from the authenticated Bind")
+	}
+	return a.binding.clone(), nil
 }
 
 func (a *AuthorityClient) sourceEndpoint(suffix string) (string, error) {

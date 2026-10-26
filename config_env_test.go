@@ -81,6 +81,25 @@ func TestConfigFromEnvKeepsOrdinaryReconfigurationOnLegacyPath(t *testing.T) {
 	}
 }
 
+func TestConfigFromEnvReadsExplicitLogicalAuthorityProfile(t *testing.T) {
+	t.Setenv("RHIZA_FENCE_SOCKET", "")
+	t.Setenv("RHIZA_FENCE_TICKET", "")
+	t.Setenv("RHIZA_AUTHORITY_PROFILE", "logical-writer-v1")
+	t.Setenv("RHIZA_AUTHORITY_URL", "https://authority.example/v1/supervisor")
+	t.Setenv("RHIZA_AUTHORITY_CA_FILE", "/run/secrets/authority-ca.pem")
+	t.Setenv("RHIZA_AUTHORITY_TOKEN_FILE", "/run/secrets/authority-token")
+	config, err := ConfigFromEnv()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if config.AuthorityProfile != "logical-writer-v1" || config.AuthorityURL != "https://authority.example/v1/supervisor" || config.AuthorityCAFile != "/run/secrets/authority-ca.pem" || config.AuthorityTokenFile != "/run/secrets/authority-token" {
+		t.Fatalf("logical authority environment was not preserved: %+v", config)
+	}
+	if config.EngineOwnedRemovals {
+		t.Fatal("logical authority profile was silently treated as a supervisor runtime profile")
+	}
+}
+
 func TestConfigFromEnvKeepsSupervisorGrantedGenesisMemberMap(t *testing.T) {
 	const members = `[{"node_id":"survivor-a","peer_url":"quic://survivor-a:9090","public_key":"AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE="},{"node_id":"survivor-b","peer_url":"quic://survivor-b:9090","public_key":"AgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgI="}]`
 	t.Setenv("RHIZA_FENCE_SOCKET", "/run/rhiza/fence.sock")

@@ -96,16 +96,23 @@ type ObjectStoreDurability = types.ObjectStoreDurability
 // Config contains the durable local path, fixed membership, and peer endpoint.
 type Config struct {
 	// Local disables peer networking and requires standalone, local-disk configuration.
-	Local      bool
-	ClusterID  string
-	NodeID     string
-	DataDir    string
+	Local     bool
+	ClusterID string
+	NodeID    string
+	DataDir   string
 	// HAInitRestoreDir is an optional separate mount populated by the HA init
 	// restore process. It is never used by Local mode.
 	HAInitRestoreDir string
-	BindAddr   string
-	PeerAddr   string
-	AdminToken string
+	// AuthorityProfile, AuthorityURL, and AuthorityTokenFile configure an
+	// explicit authenticated source-authority profile. They are never inferred
+	// from object-store settings or a missing supervisor socket.
+	AuthorityProfile   string
+	AuthorityURL       string
+	AuthorityCAFile    string
+	AuthorityTokenFile string
+	BindAddr           string
+	PeerAddr           string
+	AdminToken         string
 	// PeerToken is this process's private peer identity secret. Members carry
 	// only public identity, so a replicated membership never holds a secret.
 	PeerToken string
@@ -273,7 +280,9 @@ func executionConfig(config Config) (*types.ExecutionConfig, error) {
 	return &types.ExecutionConfig{
 		Local:     config.Local,
 		ClusterID: types.ClusterID(config.ClusterID), NodeID: types.NodeID(config.NodeID),
-		DataDir: config.DataDir, HAInitRestoreDir: config.HAInitRestoreDir, BindAddr: config.BindAddr, PeerAddr: config.PeerAddr,
+		DataDir: config.DataDir, HAInitRestoreDir: config.HAInitRestoreDir,
+		AuthorityProfile: config.AuthorityProfile, AuthorityURL: config.AuthorityURL, AuthorityCAFile: config.AuthorityCAFile, AuthorityTokenFile: config.AuthorityTokenFile,
+		BindAddr: config.BindAddr, PeerAddr: config.PeerAddr,
 		AdminToken: config.AdminToken, PeerToken: config.PeerToken, Members: config.Members, EnableReconfiguration: config.EnableReconfiguration,
 		// Reconfiguration remains available to ordinary embedded callers. The
 		// engine-owned REMOVE protocol is a separate supervised trust boundary.

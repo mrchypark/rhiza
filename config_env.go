@@ -89,6 +89,7 @@ func ConfigFromEnv() (Config, error) {
 	return Config{
 		ClusterID: configEnvOrDefault("RHIZA_CLUSTER_ID", "cluster-a"), NodeID: nodeID,
 		DataDir: configEnvOrDefault("RHIZA_DATA_DIR", "./rhiza-data"), HAInitRestoreDir: os.Getenv("RHIZA_HA_INIT_RESTORE_DIR"),
+		AuthorityProfile: os.Getenv("RHIZA_AUTHORITY_PROFILE"), AuthorityURL: os.Getenv("RHIZA_AUTHORITY_URL"), AuthorityCAFile: os.Getenv("RHIZA_AUTHORITY_CA_FILE"), AuthorityTokenFile: os.Getenv("RHIZA_AUTHORITY_TOKEN_FILE"),
 		BindAddr: configEnvOrDefault("RHIZA_BIND_ADDR", "127.0.0.1:8080"),
 		PeerAddr: configEnvOrDefault("RHIZA_PEER_ADDR", "127.0.0.1:9090"), AdminToken: os.Getenv("RHIZA_ADMIN_TOKEN"), PeerToken: peerToken, Members: members, EnableReconfiguration: enableReconfiguration,
 		// Reconfiguration remains backward-compatible for ordinary embedded

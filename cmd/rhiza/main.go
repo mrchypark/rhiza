@@ -22,6 +22,17 @@ import (
 )
 
 func main() {
+	if len(os.Args) > 1 && os.Args[1] == "restore-init" {
+		ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+		defer cancel()
+		if len(os.Args) != 2 {
+			log.Fatal("restore-init does not accept positional arguments; configure it with RHIZA_* environment variables")
+		}
+		if err := runRestoreInitCommand(ctx); err != nil {
+			log.Fatal(err)
+		}
+		return
+	}
 	enroll := flag.Bool("enroll-existing-voter", false, "register an original pre-upgrade WAL while every voter is offline, then exit")
 	flag.Parse()
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
@@ -29,6 +40,17 @@ func main() {
 	if err := runCommand(ctx, *enroll); err != nil {
 		log.Fatal(err)
 	}
+}
+
+func runRestoreInitCommand(ctx context.Context) error {
+	config, err := rhiza.ConfigFromEnv()
+	if err != nil {
+		return err
+	}
+	if err := rhiza.PrepareHAInitRestore(ctx, config); err != nil {
+		return fmt.Errorf("prepare HA init restore: %w", err)
+	}
+	return nil
 }
 
 func run(ctx context.Context) (resultErr error) {

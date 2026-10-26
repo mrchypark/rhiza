@@ -23,6 +23,7 @@ import (
 	"time"
 
 	"github.com/mrchypark/rhiza/internal/types"
+	"github.com/mrchypark/rhiza/pkg/fencing"
 	"github.com/mrchypark/rhiza/pkg/network"
 	"github.com/mrchypark/rhiza/pkg/quepaxa"
 	"github.com/mrchypark/rhiza/pkg/recovery"
@@ -890,6 +891,14 @@ func (c *Controller) startAndObserve(ctx context.Context, r *Resource, sts objec
 			values = replaceEnv(values, "RHIZA_OBJSTORE_DURABILITY", object{"value": r.Spec.Durability})
 			ctr["env"] = values
 			applyTargetCredentials(ctr, r.Status.SecretName)
+			if env["RHIZA_AUTHORITY_PROFILE"] == fencing.LogicalWriterProfileV1 {
+				if err := c.ensurePublicMembershipProjection(ctx, r.Status.SecretName, c.operationID(r), members); err != nil {
+					return c.record(ctx, r, "Blocked", "public target membership projection is unavailable or inconsistent")
+				}
+				if !applyLogicalMembershipProjection(sts, ctr, recoveryMembershipProjectionName(r.Status.SecretName), r.Status.Target, r.Spec.Durability) {
+					return c.record(ctx, r, "Blocked", "logical target requires exactly one restore-init container for public membership")
+				}
+			}
 			asObject(sts["spec"])["replicas"] = float64(len(members))
 			if err := c.Kube.Put(ctx, c.stsPath(r.Spec.StatefulSet), sts, &sts); err != nil {
 				return err

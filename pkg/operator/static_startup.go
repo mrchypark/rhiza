@@ -40,7 +40,11 @@ func (e *FencingExecutor) resolveStaticVoterStartupGrant(ctx context.Context, st
 	if str(nested(pod, "metadata", "annotations", fencingProtocolAnnotation)) != "1" {
 		return fencing.StartupGrant{}, false, fmt.Errorf("fencing: static startup workload is not enrolled")
 	}
-	if err := validateSupervisedPod(pod); err != nil {
+	if e.AuthorityProfile == fencing.LogicalWriterProfileV1 {
+		if err := validateLogicalWriterPod(pod); err != nil {
+			return fencing.StartupGrant{}, false, err
+		}
+	} else if err := validateSupervisedPod(pod); err != nil {
 		return fencing.StartupGrant{}, false, err
 	}
 	// The registration handler has already applied initializeRoot's configured
@@ -128,6 +132,11 @@ func (e *FencingExecutor) resolveStaticVoterStartupGrant(ctx context.Context, st
 			return fencing.StartupGrant{}, false, fmt.Errorf("fencing: static startup Pod differs from current template store identity")
 		}
 	}
+	if e.AuthorityProfile == fencing.LogicalWriterProfileV1 {
+		if err := noPVC(sts, podContainer, podEnv); err != nil {
+			return fencing.StartupGrant{}, false, fmt.Errorf("fencing: logical workload violates the no-PVC data contract: %w", err)
+		}
+	}
 	for _, key := range []string{"RHIZA_CLUSTER_ID", "RHIZA_CLUSTER_MEMBERS"} {
 		if templateEnv[key] == "" || podEnv[key] != templateEnv[key] {
 			return fencing.StartupGrant{}, false, fmt.Errorf("fencing: static startup Pod differs from current template")
@@ -194,14 +203,30 @@ func (e *FencingExecutor) resolveStaticVoterStartupGrant(ctx context.Context, st
 	if err != nil {
 		return fencing.StartupGrant{}, false, err
 	}
-	return fencing.StartupGrant{
+	grant := fencing.StartupGrant{
 		Identity: request,
 		Role:     fencing.StartupRoleVoterActive,
 		Environment: map[string]string{
 			"RHIZA_CLUSTER_MEMBERS": string(canonicalMembers),
 			"RHIZA_PEER_TOKEN":      ownToken,
 		},
-	}, true, nil
+	}
+	if e.AuthorityProfile == fencing.LogicalWriterProfileV1 {
+		if e.AuthorityState == nil || !e.RequireMutationJournal {
+			return fencing.StartupGrant{}, false, fmt.Errorf("fencing: logical startup authority is not configured")
+		}
+		scope, err := e.storageScope(ctx, sts, request.SourceClusterID)
+		if err != nil {
+			return fencing.StartupGrant{}, false, err
+		}
+		binding := fencing.LogicalWriterBindingV1{Version: fencing.LogicalWriterVersionV1, Profile: fencing.LogicalWriterProfileV1,
+			SourceClusterID: request.SourceClusterID, NodeID: request.NodeID, RunID: request.RunID,
+			ProducerUID:    "logical-producer-" + hashJSON([]any{"rhiza-logical-producer-v1", statefulSetUID, request.SourceClusterID, request.NodeID, request.RunID, hashJSON(scope)})[:40],
+			StoreScopeHash: hashJSON(scope), Role: fencing.StartupRoleVoterActive}
+		grant.AuthorityProfile = fencing.LogicalWriterProfileV1
+		grant.LogicalBinding = &binding
+	}
+	return grant, true, nil
 }
 
 func namedPodContainer(pod object, name string) (object, error) {

@@ -23,6 +23,8 @@ type Session struct {
 	mu                  sync.Mutex
 	identity            Identity
 	role                StartupRole
+	authorityProfile    string
+	logicalBinding      *LogicalWriterBindingV1
 	initialRegistration *InitialRegistrationProvenance
 	startupEnvironment  map[string]string
 	expectedWALIdentity string
@@ -59,6 +61,11 @@ func Connect(ctx context.Context, socketPath, ticket, sourceClusterID, nodeID st
 		return nil, fmt.Errorf("fencing: startup grant logical identity differs from child configuration")
 	}
 	s.identity, s.role = grant.Identity, grant.Role
+	s.authorityProfile = grant.AuthorityProfile
+	if grant.LogicalBinding != nil {
+		binding := *grant.LogicalBinding
+		s.logicalBinding = &binding
+	}
 	if grant.InitialRegistration != nil {
 		copy := *grant.InitialRegistration
 		s.initialRegistration = &copy
@@ -129,6 +136,19 @@ func (s *Session) BindWAL(ctx context.Context, walIdentity string) error {
 	if err := receipt.Validate(bound); err != nil {
 		return err
 	}
+	if receipt.AuthorityProfile != s.authorityProfile {
+		return fmt.Errorf("fencing: bind receipt profile differs from startup grant")
+	}
+	if receipt.AuthorityProfile == LogicalWriterProfileV1 {
+		if s.logicalBinding == nil || receipt.LogicalBinding == nil {
+			return fmt.Errorf("fencing: logical bind receipt has no startup binding")
+		}
+		want, got := *s.logicalBinding, *receipt.LogicalBinding
+		want.WALIdentity = got.WALIdentity
+		if want != got {
+			return fmt.Errorf("fencing: logical bind receipt differs from startup grant")
+		}
+	}
 	startupRole := s.role
 	if startupRole == "" && s.identity.AssignmentID == "" {
 		// Package-local legacy sessions used by static-voter integrations may
@@ -181,10 +201,38 @@ func (s *Session) PromoteLearner(ctx context.Context) error {
 	if err := receipt.Validate(s.identity); err != nil || receipt.Role != StartupRoleVoterActive {
 		return fmt.Errorf("fencing: learner promotion receipt is invalid")
 	}
+	if receipt.AuthorityProfile != s.authorityProfile {
+		return fmt.Errorf("fencing: learner promotion profile differs from startup grant")
+	}
+	if receipt.AuthorityProfile == LogicalWriterProfileV1 {
+		if s.logicalBinding == nil || receipt.LogicalBinding == nil || !logicalPromotionBindingMatches(*s.logicalBinding, *receipt.LogicalBinding) {
+			return fmt.Errorf("fencing: logical learner promotion binding differs from startup grant")
+		}
+	}
 	s.role = StartupRoleVoterActive
 	copy := receipt.clone()
 	s.binding = &copy
+	if receipt.LogicalBinding != nil {
+		binding := *receipt.LogicalBinding
+		s.logicalBinding = &binding
+	}
 	return nil
+}
+
+func logicalPromotionBindingMatches(pending, active LogicalWriterBindingV1) bool {
+	if pending.ValidateBound() != nil || active.ValidateBound() != nil ||
+		pending.Role != StartupRoleLearnerPendingRemove || active.Role != StartupRoleVoterActive ||
+		pending.SourceClusterID != active.SourceClusterID || pending.NodeID != active.NodeID ||
+		pending.RunID != active.RunID || pending.AssignmentID != active.AssignmentID ||
+		pending.WALIdentity != active.WALIdentity || pending.ProducerUID != "" || pending.StoreScopeHash != "" ||
+		active.ProducerUID == "" || active.StoreScopeHash == "" ||
+		!mutationDigestValid(active.Recovery.PromotionEvidenceHash) {
+		return false
+	}
+	wantRecovery := pending.Recovery
+	gotRecovery := active.Recovery
+	wantRecovery.PromotionEvidenceHash = gotRecovery.PromotionEvidenceHash
+	return wantRecovery == gotRecovery
 }
 
 // MutationBinding returns an immutable copy of the validated journal binding.
@@ -195,7 +243,8 @@ func (s *Session) MutationBinding() (ProducerBinding, bool) {
 	if s.role != StartupRoleVoterActive || s.binding == nil || s.binding.Producer == nil {
 		return ProducerBinding{}, false
 	}
-	return *s.binding.Producer, true
+	copy := s.binding.clone()
+	return *copy.Producer, true
 }
 
 // CurrentEngineRepair reads the canonical repair only from an authenticated

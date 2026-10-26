@@ -1,0 +1,64 @@
+name: logical-authority-floci
+
+on:
+  pull_request:
+    paths:
+      - '.github/workflows/logical-authority-floci.yml'
+      - 'e2e/logical-authority/**'
+      - 'internal/objstore/**'
+      - 'pkg/fencing/**'
+      - 'pkg/node/**'
+      - 'pkg/operator/**'
+      - 'scripts/test-floci-logical-authority.sh'
+      - 'go.mod'
+      - 'go.sum'
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/logical-authority-floci.yml'
+      - 'e2e/logical-authority/**'
+      - 'internal/objstore/**'
+      - 'pkg/fencing/**'
+      - 'pkg/node/**'
+      - 'pkg/operator/**'
+      - 'scripts/test-floci-logical-authority.sh'
+      - 'go.mod'
+      - 'go.sum'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  logical-authority-floci-gcs:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    container:
+      image: golang:1.27.3-bookworm@sha256:972b4110ba0f47539a975c31e52c64765e1ff19f2d74469ae4a595c6676e80a5
+    services:
+      floci-gcs:
+        image: floci/floci-gcp:0.11.0@sha256:eae9683d806ceb643bcb36aee97cdb8cad13c3e2959cd053bf40e481994fde12
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+      - name: Wait for task-owned Floci-GCS service
+        run: |
+          set -eu
+          attempt=0
+          until bash -c 'exec 3<>/dev/tcp/floci-gcs/4588' 2>/dev/null; do
+            attempt=$((attempt + 1))
+            if [ "$attempt" -ge 120 ]; then
+              echo 'Floci-GCS did not open port 4588 after 60 seconds' >&2
+              exit 1
+            fi
+            sleep 0.5
+          done
+      - name: Run isolated logical-authority GCS adapter harness
+        env:
+          RHIZA_LOGICAL_AUTHORITY_FLOCI: '1'
+          RHIZA_LOCALHOOKS_ALLOW_FLOCI_GCS: '1'
+          STORAGE_EMULATOR_HOST: 'http://floci-gcs:4588'
+          GOOGLE_CLOUD_PROJECT: 'floci-local'
+          GOOGLE_APPLICATION_CREDENTIALS: ''
+        run: sh scripts/test-floci-logical-authority.sh

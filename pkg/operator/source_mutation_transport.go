@@ -23,7 +23,7 @@ func (e *FencingExecutor) handleSourceMutation(w http.ResponseWriter, r *http.Re
 		http.NotFound(w, r)
 		return
 	}
-	if e.SourceMutationStorage == nil || e.AuthorityState == nil {
+	if e.AuthorityState == nil {
 		http.Error(w, "source mutation execution is not configured", http.StatusServiceUnavailable)
 		return
 	}
@@ -43,6 +43,26 @@ func (e *FencingExecutor) handleSourceMutation(w http.ResponseWriter, r *http.Re
 	if r.URL.Path == "/v1/source-mutations/genesis-status" {
 		if request.ArchiveGenesis.ArchiveKey != "archive/head.bin" || request.ArchiveGenesis.ConfigID == 0 || request.ProducerUID != "" || request.Sequence != 0 || request.Intent != (fencing.MutationIntent{}) {
 			http.Error(w, "invalid archive genesis status request", http.StatusBadRequest)
+			return
+		}
+		uid, authErr := e.authenticate(r.Context(), r.Header.Get("Authorization"), request.Identity)
+		if authErr != nil {
+			e.writeSourceStageError(w, sourceStageAuthenticationError{err: authErr})
+			return
+		}
+		root, rootErr := e.read(r.Context(), uid, request.Identity.SourceClusterID)
+		if rootErr != nil {
+			e.writeSourceStageError(w, rootErr)
+			return
+		}
+		if root.Ledger.Profile == fencing.LogicalWriterProfileV1 {
+			status, err := e.archiveGenesisStatusLogical(r.Context(), r.Header.Get("Authorization"), request.Identity, request.ArchiveGenesis.ArchiveKey, request.ArchiveGenesis.ConfigID)
+			if err != nil {
+				e.writeSourceStageError(w, err)
+				return
+			}
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(status)
 			return
 		}
 		status, err := e.archiveGenesisStatus(r.Context(), r.Header.Get("Authorization"), request.Identity, request.ArchiveGenesis.ArchiveKey, request.ArchiveGenesis.ConfigID)
@@ -73,6 +93,22 @@ func (e *FencingExecutor) executeSourceMutationRequest(ctx context.Context, auth
 	uid, err := e.authenticate(ctx, authorization, id)
 	if err != nil {
 		return sourceStageAuthenticationError{err: err}
+	}
+	state, err := e.read(ctx, uid, id.SourceClusterID)
+	if err != nil {
+		return err
+	}
+	if state.Ledger.Profile == fencing.LogicalWriterProfileV1 {
+		if err := e.validateMutationJournalProfile(state); err != nil {
+			return err
+		}
+		if !admit {
+			return e.executeLogicalSourceMutationRequest(ctx, uid, id, request)
+		}
+		return e.admitLogicalSourceMutation(ctx, uid, id, request)
+	}
+	if e.SourceMutationStorage == nil {
+		return fmt.Errorf("fencing: source mutation execution is not configured")
 	}
 	runtime, scopeHash, err := e.sourceMutationProducer(ctx, uid, id, admit)
 	if err != nil {
@@ -149,6 +185,77 @@ func (e *FencingExecutor) executeSourceMutationRequest(ctx context.Context, auth
 	return nil
 }
 
+func (e *FencingExecutor) admitLogicalSourceMutation(ctx context.Context, uid string, id fencing.Identity, request sourceMutationRequest) error {
+	for range 8 {
+		root, err := e.read(ctx, uid, id.SourceClusterID)
+		if err != nil {
+			return err
+		}
+		if err := e.validateMutationJournalProfile(root); err != nil || root.Ledger.Profile != fencing.LogicalWriterProfileV1 {
+			return errors.Join(err, fmt.Errorf("fencing: logical mutation is outside its selected profile"))
+		}
+		run, ok := root.Ledger.Runs[id.RunID]
+		if !ok || run.Identity != id || run.Runtime != nil || run.LogicalBinding == nil || run.LogicalBinding.ValidateBound() != nil ||
+			run.LogicalBinding.Role != fencing.StartupRoleVoterActive || run.MutationProducerUID != request.ProducerUID ||
+			run.MutationScopeHash == "" || run.MutationScopeHash != request.Intent.StoreScopeHash || run.MutationProfile == "" ||
+			request.Sequence == 0 || request.Intent.OperationID != fencing.MutationRequestID(request.ProducerUID, request.Sequence) {
+			return fmt.Errorf("fencing: logical mutation is outside the exact enrolled producer scope")
+		}
+		producer, producerUID, version, err := e.AuthorityState.ReadLogicalProducer(ctx, uid, *run.LogicalBinding)
+		if err != nil {
+			return err
+		}
+		if producerUID != request.ProducerUID || producer.WALIdentity != id.WALIdentity || producer.Profile != fencing.LogicalWriterProfileV1 || producer.Validate() != nil {
+			return fmt.Errorf("fencing: logical mutation producer differs from canonical Run")
+		}
+		if request.Sequence <= producer.LastAdmitted {
+			entry, exists := producer.Entries[request.Sequence]
+			if exists && entry.Intent == request.Intent {
+				return nil
+			}
+			return fmt.Errorf("fencing: logical mutation retry differs from original tuple")
+		}
+		_, voterClosed := root.Ledger.ClosedNodes[id.NodeID]
+		if run.Stop != nil || voterClosed || root.Ledger.ClosedBy != "" || producer.Phase != fencing.MutationOpen {
+			return fencing.ErrClosed
+		}
+		if request.Intent.Kind == "upload" {
+			stages, err := e.sourceStagesForRoot(ctx, uid, id.SourceClusterID)
+			if err != nil {
+				return err
+			}
+			if run.MutationStageIncarnation == "" || run.MutationStageIncarnation != stages.incarnation {
+				return fmt.Errorf("fencing: logical source stage identity differs")
+			}
+			payload, err := stages.openMutationPayloadContext(ctx, request.ProducerUID, request.Intent)
+			if err != nil {
+				return err
+			}
+			if err := payload.Close(); err != nil {
+				return err
+			}
+		}
+		if isArchiveGenesisMutation(request.Intent) {
+			if err := e.prepareLogicalArchiveGenesisMutation(ctx, uid, id, *run.LogicalBinding, request.ProducerUID, request.Sequence, request.Intent); err != nil {
+				return err
+			}
+		} else if err := e.requireLogicalArchiveGenesisCommitted(ctx, uid, id, run, request.Intent); err != nil {
+			return err
+		}
+		if err := producer.Admit(request.Sequence, request.Intent); err != nil {
+			return err
+		}
+		if err := e.AuthorityState.WriteLogicalProducer(ctx, uid, *run.LogicalBinding, producer, version); err != nil {
+			if errors.Is(err, errAuthorityStateConflict) {
+				continue
+			}
+			return err
+		}
+		return nil
+	}
+	return fencing.ErrUnavailable
+}
+
 // sourceMutationProducer permits replay of an exact admitted tuple after root
 // closure, but new admission still requires an open producer and run.
 func (e *FencingExecutor) sourceMutationProducer(ctx context.Context, uid string, id fencing.Identity, requireOpen bool) (fencing.RuntimeBinding, string, error) {
@@ -189,6 +296,13 @@ func (e *FencingExecutor) sourceMutationProducer(ctx context.Context, uid string
 }
 
 func (e *FencingExecutor) sourceMutationStorageScope(ctx context.Context, runtime fencing.RuntimeBinding) (AttestationStoreScope, error) {
+	return e.sourceMutationStorageScopeForRoot(ctx, runtime.StatefulSetUID, runtime.SourceClusterID)
+}
+
+func (e *FencingExecutor) sourceMutationStorageScopeForRoot(ctx context.Context, statefulSetUID, sourceClusterID string) (AttestationStoreScope, error) {
+	if e == nil || e.Kube == nil || statefulSetUID == "" || sourceClusterID == "" {
+		return AttestationStoreScope{}, fmt.Errorf("fencing: source mutation storage root is incomplete")
+	}
 	var workloads struct {
 		Items []object `json:"items"`
 	}
@@ -196,8 +310,8 @@ func (e *FencingExecutor) sourceMutationStorageScope(ctx context.Context, runtim
 		return AttestationStoreScope{}, err
 	}
 	for _, workload := range workloads.Items {
-		if str(nested(workload, "metadata", "uid")) == runtime.StatefulSetUID {
-			return e.storageScope(ctx, workload, runtime.SourceClusterID)
+		if str(nested(workload, "metadata", "uid")) == statefulSetUID {
+			return e.storageScope(ctx, workload, sourceClusterID)
 		}
 	}
 	return AttestationStoreScope{}, fmt.Errorf("fencing: enrolled source StatefulSet is unavailable")

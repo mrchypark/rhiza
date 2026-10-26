@@ -1,0 +1,163 @@
+# Logical-writer-v1 authority profile replacing the prior authority profile.
+# Requires GCS workload identity bindings to a dedicated authority service
+# account with read access to canonical state/archive and write access only to
+# this cluster's source mutation scope. Never inject source writer keys into
+# voter Pods. Replace the image digest and externally provisioned TLS Secret,
+# CA ConfigMap, and rhiza-object-store coordinates before applying.
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: rhiza-fencer
+  namespace: rhiza
+  annotations:
+    iam.gke.io/gcp-service-account: REPLACE_WITH_AUTHORITY_GSA_EMAIL
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: rhiza-fencer
+  namespace: rhiza
+rules:
+  - apiGroups: [""]
+    resources: [pods]
+    verbs: [get, list]
+  - apiGroups: [""]
+    resources: [secrets]
+    verbs: [get]
+  - apiGroups: [""]
+    resources: [configmaps]
+    verbs: [get, create, update]
+  - apiGroups: [apps]
+    resources: [statefulsets]
+    verbs: [get, list]
+  - apiGroups: [rhiza.mrchypark.dev]
+    resources: [rhizaclusters]
+    verbs: [get, list]
+  - apiGroups: [rhiza.mrchypark.dev]
+    resources: [rhizarecoveries]
+    verbs: [get]
+  - apiGroups: [rhiza.mrchypark.dev]
+    resources: [rhizafences]
+    verbs: [get, list, create]
+  - apiGroups: [rhiza.mrchypark.dev]
+    resources: [rhizafences/status]
+    verbs: [get, update]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: rhiza-fencer
+  namespace: rhiza
+subjects:
+  - kind: ServiceAccount
+    name: rhiza-fencer
+    namespace: rhiza
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: rhiza-fencer
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: rhiza-fencer-tokenreview
+rules:
+  - apiGroups: [authentication.k8s.io]
+    resources: [tokenreviews]
+    verbs: [create]
+  - apiGroups: [""]
+    resources: [namespaces]
+    verbs: [get]
+    resourceNames: [rhiza]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: rhiza-fencer-tokenreview
+subjects:
+  - kind: ServiceAccount
+    name: rhiza-fencer
+    namespace: rhiza
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: rhiza-fencer-tokenreview
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: rhiza-fencer
+  namespace: rhiza
+spec:
+  selector:
+    app.kubernetes.io/name: rhiza-fencer
+  ports:
+    - name: https
+      port: 9444
+      targetPort: https
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: rhiza-fencer
+  namespace: rhiza
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: rhiza-fencer
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: rhiza-fencer
+    spec:
+      serviceAccountName: rhiza-fencer
+      securityContext:
+        runAsNonRoot: true
+        fsGroup: 65532
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: authority
+          image: ghcr.io/REPLACE_WITH_ORG/rhiza-operator@sha256:REPLACE_WITH_64_HEX_DIGEST
+          imagePullPolicy: IfNotPresent
+          command: [/usr/local/bin/rhiza-fencer]
+          args:
+            - serve
+            - --tls-cert=/tls/tls.crt
+            - --tls-key=/tls/tls.key
+            - --authority-profile=logical-writer-v1
+            - --source-writer-use-adc
+          env:
+            - name: POD_NAMESPACE
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace
+            - name: FENCER_AUTHORITY_STATE_PREFIX
+              value: rhiza-authority-state
+          envFrom:
+            - configMapRef:
+                name: rhiza-object-store
+          ports:
+            - name: https
+              containerPort: 9444
+          securityContext:
+            runAsNonRoot: true
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: [ALL]
+          volumeMounts:
+            - name: tls
+              mountPath: /tls
+              readOnly: true
+          resources:
+            requests:
+              cpu: 100m
+              memory: 128Mi
+            limits:
+              memory: 512Mi
+      volumes:
+        - name: tls
+          secret:
+            secretName: rhiza-fencer-tls

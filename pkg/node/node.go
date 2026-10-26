@@ -99,6 +99,10 @@ type Node struct {
 	terminalResult            TerminalDrainResult
 	terminalErr               error
 	fenceSession              *fencing.Session
+	authorityClient           *fencing.AuthorityClient
+	authorityGrant            fencing.StartupGrant
+	authorityIdentity         fencing.Identity
+	authorityPromotionReceipt *fencing.BindReceipt
 	recoveryWALIdentity       string
 }
 
@@ -229,7 +233,14 @@ func (n *Node) open(ctx context.Context, enroll bool) (err error) {
 		return fmt.Errorf("node is already open")
 	}
 	socket, ticket := os.Getenv("RHIZA_FENCE_SOCKET"), os.Getenv("RHIZA_FENCE_TICKET")
-	supervised := socket != "" || ticket != ""
+	supervised := socket != "" || ticket != "" || n.config.AuthorityProfile != ""
+	if err := validateAuthorityProfile(n.config, socket, ticket); err != nil {
+		return err
+	}
+	directAuthority := n.config.AuthorityProfile == fencing.LogicalWriterProfileV1
+	if directAuthority && enroll {
+		return fmt.Errorf("fencing: logical authority does not support offline voter enrollment")
+	}
 	if n.config.Local && (enroll || len(n.config.Members) != 0 || n.config.Learner != nil || n.config.EnableReconfiguration ||
 		n.config.BindAddr != "" || n.config.PeerAddr != "" || n.config.PeerToken != "" || n.config.AdminToken != "" ||
 		n.config.ObjStoreProvider != "" || n.config.ObjStoreEndpoint != "" || n.config.ObjStoreBucket != "" || n.config.ObjStoreDir != "") {
@@ -313,19 +324,21 @@ func (n *Node) open(ctx context.Context, enroll bool) (err error) {
 	// Do not durably enroll a process until all pure configuration and
 	// admission checks have passed and failure cleanup is installed.
 	phase = nodeOpenPhaseFencing
-	if err := n.connectFenceSession(ctx); err != nil {
-		return err
-	}
-	if n.fenceSession != nil {
-		if err := n.applyFenceStartupEnvironment(); err != nil {
+	if !directAuthority {
+		if err := n.connectFenceSession(ctx); err != nil {
 			return err
 		}
+		if n.fenceSession != nil {
+			if err := n.applyFenceStartupEnvironment(); err != nil {
+				return err
+			}
+		}
+		if n.fenceSession != nil && n.fenceSession.StartupRole() == fencing.StartupRoleLearnerPendingRemove &&
+			(n.config.Learner == nil || n.config.Learner.ID != n.config.NodeID || len(n.config.Members) < 2) {
+			return fmt.Errorf("fencing: pending-removal startup requires an explicit nonvoting learner configuration")
+		}
 	}
-	if n.fenceSession != nil && n.fenceSession.StartupRole() == fencing.StartupRoleLearnerPendingRemove &&
-		(n.config.Learner == nil || n.config.Learner.ID != n.config.NodeID || len(n.config.Members) < 2) {
-		return fmt.Errorf("fencing: pending-removal startup requires an explicit nonvoting learner configuration")
-	}
-	supervised = n.fenceSession != nil
+	supervised = n.hasFencingAuthority()
 	ctx, n.cancel = context.WithCancel(ctx)
 
 	// 1. Acquire lock file
@@ -342,6 +355,25 @@ func (n *Node) open(ctx context.Context, enroll bool) (err error) {
 	}
 	if err != nil {
 		return fmt.Errorf("load voter identity: %w", err)
+	}
+	if directAuthority {
+		if err := n.connectFenceSession(ctx); err != nil {
+			return err
+		}
+		if err := n.applyAuthorityStartupEnvironment(); err != nil {
+			return err
+		}
+		supervised = n.hasFencingAuthority()
+		if n.authorityGrant.Role != fencing.StartupRoleVoterActive && n.authorityGrant.Role != fencing.StartupRoleLearnerPendingRemove {
+			return fmt.Errorf("fencing: unsupported direct logical startup role %q", n.authorityGrant.Role)
+		}
+		n.recoveryWALIdentity, err = logicalAssignedWALForStartup(n.authorityGrant, localVoter)
+		if err != nil {
+			return err
+		}
+		if n.authorityGrant.Role == fencing.StartupRoleLearnerPendingRemove && (n.config.Learner == nil || n.config.Learner.ID != n.config.NodeID || len(n.config.Members) < 2) {
+			return fmt.Errorf("fencing: pending logical startup requires authority-issued nonvoting learner configuration")
+		}
 	}
 	var haStageDir string
 	var haStageIndex *haRestoreStageIndex
@@ -478,13 +510,13 @@ func (n *Node) open(ctx context.Context, enroll bool) (err error) {
 		if provider == "" {
 			provider = objectstore.ProviderS3
 		}
-		if n.fenceSession != nil && provider == objectstore.ProviderGCS {
+		if n.hasFencingAuthority() && provider == objectstore.ProviderGCS {
 			if err := rejectSupervisedWriterCredentials(n.config); err != nil {
 				return err
 			}
 		}
 		newBucket := objectstore.NewBucketWithContext
-		if n.fenceSession != nil {
+		if n.hasFencingAuthority() {
 			newBucket = objectstore.NewBucketForSupervisedStartup
 		}
 		bucket, bucketErr := newBucket(ctx, objectstore.Config{
@@ -501,7 +533,7 @@ func (n *Node) open(ctx context.Context, enroll bool) (err error) {
 			return fmt.Errorf("open object store: %w", bucketErr)
 		}
 		var runtimeBucket nodeObjectBucket = bucket
-		if n.fenceSession != nil {
+		if n.hasFencingAuthority() {
 			protected := &fencedBucket{MeteredBucket: bucket, prefix: path.Join(n.config.ObjStorePrefix, string(n.config.ClusterID))}
 			n.protectedBucket = protected
 			runtimeBucket = protected
@@ -509,18 +541,23 @@ func (n *Node) open(ctx context.Context, enroll bool) (err error) {
 		n.bucket = runtimeBucket
 		var beforeWrite []func(context.Context, string) error
 		var pendingIdentityWrite []func(context.Context, string, []byte) error
-		if n.fenceSession != nil {
+		if n.hasFencingAuthority() {
 			beforeWrite = append(beforeWrite, n.bindFenceWAL)
-			if n.fenceSession.StartupRole() == fencing.StartupRoleLearnerPendingRemove {
+			if n.fenceSession != nil && n.fenceSession.StartupRole() == fencing.StartupRoleLearnerPendingRemove ||
+				n.authorityClient != nil && n.authorityGrant.Role == fencing.StartupRoleLearnerPendingRemove {
 				pendingIdentityWrite = append(pendingIdentityWrite, n.registerLearnerIdentity)
 			}
 		}
-		assignedRestart := n.fenceSession != nil && n.fenceSession.StartupRole() == fencing.StartupRoleVoterActive && n.fenceSession.Identity().AssignmentID != ""
+		assignedRestart := n.fenceSession != nil && n.fenceSession.StartupRole() == fencing.StartupRoleVoterActive && n.fenceSession.Identity().AssignmentID != "" ||
+			n.authorityClient != nil && n.authorityGrant.Role == fencing.StartupRoleVoterActive && n.authorityIdentity.AssignmentID != ""
 		if err := ensureVoterIdentityWithHooks(ctx, n.config, runtimeBucket, n.wal, localVoter, enroll, beforeWrite, pendingIdentityWrite, assignedRestart, n.recoveryWALIdentity); err != nil {
 			return fmt.Errorf("ensure voter identity: %w", err)
 		}
 		if n.fenceSession != nil && n.fenceSession.Identity().WALIdentity == "" {
 			return fmt.Errorf("supervised fencing requires registered voter WAL identity")
+		}
+		if n.authorityClient != nil && n.authorityIdentity.WALIdentity == "" {
+			return fmt.Errorf("fencing: logical authority did not bind the voter WAL")
 		}
 		if enroll {
 			return n.Shutdown()
@@ -1159,6 +1196,12 @@ func (n *Node) maySkipCatchUp(cluster quepaxa.Cluster) bool {
 }
 
 func (n *Node) registerLearnerIdentity(ctx context.Context, key string, data []byte) error {
+	if n.authorityClient != nil && n.authorityGrant.Role == fencing.StartupRoleLearnerPendingRemove {
+		if n.authorityIdentity.WALIdentity == "" {
+			return fmt.Errorf("fencing: logical learner identity registration precedes authority WAL binding")
+		}
+		return n.authorityClient.RegisterLearnerIdentity(ctx, n.authorityIdentity, fencing.LearnerIdentityRegistration{Key: key, Data: data})
+	}
 	if n.fenceSession == nil || n.fenceSession.StartupRole() != fencing.StartupRoleLearnerPendingRemove {
 		return fmt.Errorf("fencing: learner identity registration is unavailable")
 	}
@@ -2249,8 +2292,8 @@ func (n *Node) observeCatchUpRound(err error, captured *quepaxa.Cluster) {
 		log.Printf("quorum catch-up failed: %v", err)
 		return
 	}
-	if n.fenceSession != nil && n.core != nil && n.core.IsVoter() &&
-		(n.fenceSession.StartupRole() == fencing.StartupRoleLearnerPendingRemove || !n.fenceWriterActive.Load()) {
+	if n.hasFencingAuthority() && n.core != nil && n.core.IsVoter() &&
+		((n.fenceSession != nil && n.fenceSession.StartupRole() == fencing.StartupRoleLearnerPendingRemove) || !n.fenceWriterActive.Load()) {
 		// The ADD may be locally applied before its canonical journal is durably
 		// acknowledged. Keep client writes unavailable until the authority changes
 		// the startup role and returns the active producer receipt.
@@ -2298,10 +2341,18 @@ func (n *Node) readyForCurrentCluster() bool {
 }
 
 func (n *Node) apiReady() bool {
-	if n == nil || !n.ready.Load() || !n.readyForCurrentCluster() || n.supervisedEngineRepairCandidatePending() {
+	if n == nil || !n.ready.Load() || !n.readyForCurrentCluster() || n.supervisedEngineRepairCandidatePending() || n.logicalPendingLearner() {
 		return false
 	}
+	if n.authorityClient != nil {
+		return n.authorityGrant.Role == fencing.StartupRoleVoterActive && n.fenceWriterActive.Load()
+	}
 	return n.fenceSession == nil || n.fenceSession.StartupRole() != fencing.StartupRoleVoterActive || n.fenceWriterActive.Load()
+}
+
+func (n *Node) logicalPendingLearner() bool {
+	return n != nil && ((n.authorityClient != nil && n.authorityGrant.Role == fencing.StartupRoleLearnerPendingRemove) ||
+		(n.fenceSession != nil && n.fenceSession.StartupRole() == fencing.StartupRoleLearnerPendingRemove))
 }
 
 func (n *Node) supervisedEngineRepairCandidatePending() bool {
@@ -2313,7 +2364,7 @@ func (n *Node) peerLearnReady() bool {
 	if n == nil || n.terminalRequested.Load() {
 		return false
 	}
-	if n.supervisedEngineRepairCandidatePending() {
+	if n.supervisedEngineRepairCandidatePending() || n.logicalPendingLearner() {
 		return true
 	}
 	return n.apiReady()
@@ -2323,10 +2374,11 @@ func (n *Node) peerLearnDecisionAllowed(decision quepaxa.Decision) bool {
 	if n == nil || n.config == nil || n.core == nil || n.terminalRequested.Load() {
 		return false
 	}
-	if n.supervisedEngineRepairCandidatePending() {
+	if n.supervisedEngineRepairCandidatePending() || n.logicalPendingLearner() {
 		return true
 	}
-	if n.fenceSession != nil && n.fenceSession.StartupRole() == fencing.StartupRoleVoterActive && !n.fenceWriterActive.Load() {
+	if (n.authorityClient != nil && n.authorityGrant.Role == fencing.StartupRoleVoterActive ||
+		n.fenceSession != nil && n.fenceSession.StartupRole() == fencing.StartupRoleVoterActive) && !n.fenceWriterActive.Load() {
 		return false
 	}
 	if !n.opened.Load() {
@@ -2571,6 +2623,9 @@ func (n *Node) shutdownEngine(closeBucket bool) error {
 	if n.bucket != nil && closeBucket {
 		shutdownErr = errors.Join(shutdownErr, n.bucket.Close())
 		n.bucket = nil
+	}
+	if n.authorityClient != nil && n.authorityClient.Client != nil {
+		n.authorityClient.Client.CloseIdleConnections()
 	}
 	return shutdownErr
 }
