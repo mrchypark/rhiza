@@ -573,14 +573,16 @@ func (a *LocalArchive) publishHead(ctx context.Context, head localHead) (resultE
 		}
 		return err
 	}
-	got, err := a.read(ctx, "HEAD", maxLocalHeadSize)
+	readback, cancel := checkpoint.LocalReadbackContext(ctx)
+	defer cancel()
+	got, err := a.read(readback, "HEAD", maxLocalHeadSize)
 	if err != nil {
 		return err
 	}
 	if !bytes.Equal(got, data) {
 		return fmt.Errorf("local head publication readback mismatch")
 	}
-	attrs, err := a.bucket.Attributes(ctx, a.key("HEAD"))
+	attrs, err := a.bucket.Attributes(readback, a.key("HEAD"))
 	if err != nil {
 		return err
 	}

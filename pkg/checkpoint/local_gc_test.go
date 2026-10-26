@@ -9,6 +9,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"testing/synctest"
 	"time"
 
 	"github.com/thanos-io/objstore"
@@ -344,6 +345,145 @@ func TestLocalGCRejectsNoncanonicalCandidateKeys(t *testing.T) {
 					t.Fatal("deleted before validation completed")
 				}
 			}
+		})
+	}
+}
+
+func TestLocalReadbackPreservesMutationAdmission(t *testing.T) {
+	request, stop := context.WithCancel(context.Background())
+	state := &localOperation{request: request, timeout: time.Second}
+	ctx := context.WithValue(request, localOperationKey{}, state)
+	stop()
+	completion, cancel := LocalReadbackContext(ctx)
+	defer cancel()
+	if err := localVoid(completion, false, func(context.Context) error { return nil }); err != nil {
+		t.Fatal(err)
+	}
+	for _, readCtx := range []context.Context{ctx, completion} {
+		if err := localVoid(readCtx, true, func(context.Context) error { t.Error("canceled mutation dispatched"); return nil }); !LocalBeforeDispatch(err) || !errors.Is(err, context.Canceled) {
+			t.Fatal(err)
+		}
+	}
+	if err := localVoid(ctx, false, func(context.Context) error { t.Error("ordinary canceled read dispatched"); return nil }); !errors.Is(err, context.Canceled) {
+		t.Fatal(err)
+	}
+	deadline, expire := context.WithTimeout(completion, 10*time.Millisecond)
+	defer expire()
+	started := time.Now()
+	if err := localVoid(deadline, false, func(rpc context.Context) error { <-rpc.Done(); return rpc.Err() }); !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatal(err)
+	}
+	if time.Since(started) > 500*time.Millisecond {
+		t.Fatal("RPC stripped the shared readback deadline")
+	}
+	if err := localVoid(deadline, false, func(context.Context) error { t.Error("expired completion dispatched"); return nil }); !LocalBeforeDispatch(err) {
+		t.Fatal(err)
+	}
+	state.uncertain.Store(true)
+	if err := localVoid(completion, false, func(context.Context) error { return nil }); err != nil {
+		t.Fatal(err)
+	}
+	if !state.uncertain.Load() {
+		t.Fatal("readback cleared uncertain mutation")
+	}
+}
+
+type localReadbackStreamBucket struct {
+	objstore.Bucket
+	phase   string
+	release chan struct{}
+}
+
+func (b localReadbackStreamBucket) Get(ctx context.Context, _ string) (io.ReadCloser, error) {
+	if b.phase == "get" {
+		<-ctx.Done()
+		return nil, ctx.Err()
+	}
+	time.Sleep(5 * time.Second)
+	return &localReadbackStream{ctx: ctx, bucket: b}, nil
+}
+
+func (b localReadbackStreamBucket) Attributes(ctx context.Context, _ string) (objstore.ObjectAttributes, error) {
+	if b.phase == "attributes" {
+		<-ctx.Done()
+		return objstore.ObjectAttributes{}, ctx.Err()
+	}
+	time.Sleep(5 * time.Second)
+	return objstore.ObjectAttributes{}, nil
+}
+
+type localReadbackStream struct {
+	ctx    context.Context
+	bucket localReadbackStreamBucket
+	read   bool
+}
+
+func (r *localReadbackStream) Read(p []byte) (int, error) {
+	if r.bucket.phase == "body" {
+		<-r.ctx.Done()
+		return 0, r.ctx.Err()
+	}
+	if !r.read {
+		time.Sleep(5 * time.Second)
+		r.read = true
+		return copy(p, "HEAD"), nil
+	}
+	return 0, io.EOF
+}
+func (r *localReadbackStream) Close() error {
+	if r.bucket.phase == "body" {
+		return nil
+	}
+	if r.bucket.phase == "close" {
+		// Deliberately ignore RPC cancellation; Close must still obey the total budget.
+		<-r.bucket.release
+		return nil
+	}
+	time.Sleep(5 * time.Second)
+	return nil
+}
+
+func TestLocalReadbackStreamSharesDeadline(t *testing.T) {
+	for _, phase := range []string{"healthy", "get", "body", "close", "attributes"} {
+		t.Run(phase, func(t *testing.T) {
+			synctest.Test(t, func(t *testing.T) {
+				request, stop := context.WithCancel(context.Background())
+				state := &localOperation{request: request, timeout: localRPCTimeout}
+				ctx := context.WithValue(request, localOperationKey{}, state)
+				stop()
+				started := time.Now()
+				completion, cancel := LocalReadbackContext(ctx)
+				defer cancel()
+				deadline, ok := completion.Deadline()
+				if !ok || deadline.Sub(started) != localRPCTimeout || completion.Value(localOperationKey{}) != state || state.request != request || state.timeout != localRPCTimeout {
+					t.Fatal("readback changed the caller state or RPC allowance")
+				}
+				release := make(chan struct{})
+				defer func() { close(release); synctest.Wait() }()
+				bucket := LocalBucket(localReadbackStreamBucket{Bucket: objstore.NewInMemBucket(), phase: phase, release: release})
+				reader, err := bucket.Get(completion, "HEAD")
+				if err == nil {
+					_, err = io.ReadAll(reader)
+					closeErr := reader.Close()
+					if err == nil {
+						err = closeErr
+					}
+				}
+				if err == nil {
+					_, err = bucket.Attributes(completion, "HEAD")
+				}
+				if phase == "healthy" {
+					if err != nil || time.Since(started) != 20*time.Second {
+						t.Fatalf("healthy readback: elapsed=%v err=%v", time.Since(started), err)
+					}
+				} else {
+					// Body errors may need Close too, but it cannot extend the total deadline.
+					if !errors.Is(err, context.DeadlineExceeded) || time.Since(started) != localRPCTimeout {
+						t.Fatalf("shared budget lost: elapsed=%v err=%v", time.Since(started), err)
+					}
+				}
+				synctest.Wait()
+			})
 		})
 	}
 }

@@ -14,6 +14,35 @@ import (
 const localRPCTimeout = 30 * time.Second
 
 type localOperationKey struct{}
+type localReadbackKey struct{}
+
+// LocalReadbackContext finishes acknowledged publication reads within one budget.
+// The original operation still controls mutation admission and uncertainty.
+func LocalReadbackContext(ctx context.Context) (context.Context, context.CancelFunc) {
+	if state, _ := ctx.Value(localOperationKey{}).(*localOperation); state == nil {
+		return ctx, func() {}
+	}
+	// Retain the RPC retry allowance, shared across Get, body, Close and Attributes.
+	ctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), localRPCTimeout)
+	return context.WithValue(ctx, localReadbackKey{}, true), cancel
+}
+
+func localRPCContext(ctx context.Context, state *localOperation, mutate bool) (context.Context, context.CancelFunc, error) {
+	readback, _ := ctx.Value(localReadbackKey{}).(bool)
+	if !mutate && readback {
+		if err := ctx.Err(); err != nil {
+			return nil, nil, localBeforeDispatchError{err}
+		}
+		rpc, cancel := context.WithTimeout(ctx, state.timeout)
+		return rpc, cancel, nil
+	}
+	if err := state.request.Err(); err != nil {
+		return nil, nil, localBeforeDispatchError{err}
+	}
+	rpc, cancel := context.WithTimeout(context.WithoutCancel(ctx), state.timeout)
+	return rpc, cancel, nil
+}
+
 type localOperation struct {
 	request   context.Context
 	timeout   time.Duration
@@ -42,10 +71,10 @@ func localCall[T any](ctx context.Context, mutate bool, work func(context.Contex
 		return value, err
 	}
 	var zero T
-	if err := state.request.Err(); err != nil {
-		return zero, localBeforeDispatchError{err}
+	rpcCtx, cancel, err := localRPCContext(ctx, state, mutate)
+	if err != nil {
+		return zero, err
 	}
-	rpcCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), state.timeout)
 	defer cancel()
 	type result struct {
 		value T
@@ -141,10 +170,10 @@ func (b *localBucket) Get(ctx context.Context, name string) (io.ReadCloser, erro
 		return b.Bucket.Get(ctx, name)
 	}
 	// Keep the stream's RPC context live through Close, including body reads.
-	if err := state.request.Err(); err != nil {
+	rpcCtx, cancel, err := localRPCContext(ctx, state, false)
+	if err != nil {
 		return nil, err
 	}
-	rpcCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), state.timeout)
 	type result struct {
 		reader io.ReadCloser
 		err    error
@@ -157,7 +186,7 @@ func (b *localBucket) Get(ctx context.Context, name string) (io.ReadCloser, erro
 			cancel()
 			return nil, result.err
 		}
-		return &localRPCReader{ReadCloser: result.reader, ctx: rpcCtx, cancel: cancel}, nil
+		return &localRPCReader{ReadCloser: result.reader, ctx: rpcCtx, cancel: cancel, completion: ctx}, nil
 	case <-rpcCtx.Done():
 		cancel()
 		go func() {
@@ -172,8 +201,9 @@ func (b *localBucket) Get(ctx context.Context, name string) (io.ReadCloser, erro
 
 type localRPCReader struct {
 	io.ReadCloser
-	ctx    context.Context
-	cancel context.CancelFunc
+	ctx        context.Context
+	cancel     context.CancelFunc
+	completion context.Context
 }
 
 func (r *localRPCReader) Read(p []byte) (int, error) {
@@ -198,10 +228,16 @@ func (r *localRPCReader) Close() error {
 	go func() { done <- r.ReadCloser.Close() }()
 	timer := time.NewTimer(localRPCTimeout)
 	defer timer.Stop()
+	var completionDone <-chan struct{}
+	if readback, _ := r.completion.Value(localReadbackKey{}).(bool); readback {
+		completionDone = r.completion.Done()
+	}
 	select {
 	case err := <-done:
 		return err
 	case <-timer.C:
 		return fmt.Errorf("Local stream close deadline")
+	case <-completionDone:
+		return r.completion.Err()
 	}
 }

@@ -11,6 +11,8 @@ import (
 	"strings"
 	"sync/atomic"
 	"testing"
+	"testing/synctest"
+	"time"
 
 	"github.com/mrchypark/rhiza/pkg/quepaxa"
 	"github.com/thanos-io/objstore"
@@ -353,6 +355,94 @@ func TestLocalPublicationExtentReadsScaleLinearly(t *testing.T) {
 			if _, err := OpenLocalArchive(ctx, bucket, "local"); err == nil {
 				t.Fatal("Open accepted corrupted extent")
 			}
+		})
+	}
+}
+
+// Cancel exactly after the backing store acknowledges HEAD, before Get admission.
+type localHeadACKBucket struct {
+	objstore.Bucket
+	cancel context.CancelFunc
+	fault  string
+	active bool
+}
+
+func (b *localHeadACKBucket) Upload(ctx context.Context, name string, r io.Reader, opts ...objstore.ObjectUploadOption) error {
+	err := b.Bucket.Upload(ctx, name, r, opts...)
+	if err == nil && strings.HasSuffix(name, "/HEAD") && b.cancel != nil {
+		b.cancel()
+		b.cancel = nil
+		b.active = true
+	}
+	return err
+}
+
+func (b *localHeadACKBucket) Get(ctx context.Context, name string) (io.ReadCloser, error) {
+	if strings.HasSuffix(name, "/HEAD") && b.active {
+		switch b.fault {
+		case "slow":
+			time.Sleep(3 * time.Second)
+		case "corrupt":
+			return io.NopCloser(strings.NewReader("corrupt")), nil
+		case "timeout":
+			<-ctx.Done()
+			return nil, ctx.Err()
+		}
+	}
+	return b.Bucket.Get(ctx, name)
+}
+
+func TestLocalHeadACKCancellationReadback(t *testing.T) {
+	for _, fault := range []string{"", "slow", "corrupt", "timeout"} {
+		t.Run(fault, func(t *testing.T) {
+			synctest.Test(t, func(t *testing.T) {
+				ctx := context.Background()
+				bucket := &localHeadACKBucket{Bucket: objstore.NewInMemBucket()}
+				a, err := CreateLocalArchive(ctx, bucket, "local", localTestBinding(), nil)
+				if err != nil {
+					t.Fatal(err)
+				}
+				old := a.headHash
+				head := localV2Head(a.head)
+				request, cancel := context.WithCancel(ctx)
+				defer cancel()
+				bucket.cancel, bucket.fault = cancel, fault
+				err = a.localManager().WithLocalMaintenanceContext(request, func(work context.Context) error {
+					return a.publish(work, head)
+				})
+				if fault == "" || fault == "slow" {
+					if !errors.Is(err, context.Canceled) || a.failure != nil || a.head.Version != 2 || a.headHash == old {
+						t.Fatalf("acknowledged HEAD not retained: err=%v failure=%v head=%+v", err, a.failure, a.head)
+					}
+					if pending, _, err := a.localProtocol(ctx); err != nil || !pending {
+						t.Fatalf("canceled request sealed upgrade: pending=%t err=%v", pending, err)
+					}
+					fresh, err := OpenLocalArchive(ctx, bucket, "local")
+					if err != nil || fresh.headHash != a.headHash || !sameObjectVersion(fresh.version, a.version) {
+						t.Fatalf("verified cache differs from reopened HEAD: %v", err)
+					}
+				} else {
+					if err == nil || a.failure == nil || a.headHash != old {
+						t.Fatalf("failed readback accepted: %v failure=%v", err, a.failure)
+					}
+					if fault == "timeout" && !errors.Is(err, context.DeadlineExceeded) {
+						t.Fatal(err)
+					}
+				}
+				if err := a.localManager().WithLocalMaintenanceContext(ctx, func(context.Context) error { return nil }); err != nil {
+					t.Fatal("gate not free after acknowledged mutations", err)
+				}
+				if fault == "" || fault == "slow" {
+					// Final flush on the same handle must remain usable; publish seals the intent.
+					if err := a.GarbageCollect(ctx, 1, 0); err != nil {
+						t.Fatal("final flush", err)
+					}
+					if _, err := OpenLocalArchive(ctx, bucket, "local"); err != nil {
+						t.Fatal("reopen", err)
+					}
+				}
+				synctest.Wait()
+			})
 		})
 	}
 }
