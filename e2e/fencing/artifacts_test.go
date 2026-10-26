@@ -216,6 +216,175 @@ func TestFencerRejectionProjectionUsesFixedCodesOnly(t *testing.T) {
 	}
 }
 
+func TestFenceStageProjectionPublishesOnlyBoundedEnumPairs(t *testing.T) {
+	const canary = "private-stage-detail-token-canary"
+	const podName = "rhiza-fencer-86f89cd76d-brjc4"
+	const podUID = "private-fencer-pod-uid-canary"
+	privateLog := strings.Join([]string{
+		"2026/10/26 02:12:00 fencing stage blocked: stage=root-close class=pending",
+		"2026/10/26 02:12:01 fencing stage blocked: stage=runtime-collection class=error",
+		"2026/10/26 02:12:02 fencing stage blocked: stage=runtime-collection class=error",
+		"2026/10/26 02:12:03 fencing stage blocked: stage=not-allowlisted class=error detail=" + canary,
+		"2026/10/26 02:12:04 fencing stage blocked: stage=inventory class=error detail=" + canary,
+	}, "\n") + "\n"
+	digest := sha256.Sum256([]byte(privateLog))
+	raw := t.TempDir()
+	private := filepath.Join(raw, "private-startup-diagnostics")
+	if err := os.Mkdir(private, 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(private, podName+"-authority-current.log"), []byte(privateLog), 0600); err != nil {
+		t.Fatal(err)
+	}
+	privateRecord := obj{"captures": []obj{{
+		"identity":  obj{"name": podName, "uid": podUID},
+		"component": "rhiza-fencer", "container": "authority",
+		"logs": obj{"current": obj{"captured": true, "bytes": len(privateLog), "sha256": hex.EncodeToString(digest[:])}},
+	}}}
+	if err := os.WriteFile(filepath.Join(private, "record.json"), encoded(privateRecord), 0600); err != nil {
+		t.Fatal(err)
+	}
+	summary := obj{"captures": []obj{{
+		"component": "rhiza-fencer", "container": "authority",
+		"logs": obj{"current": obj{"captured": true, "bytes": len(privateLog), "sha256": hex.EncodeToString(digest[:])}},
+	}}}
+	if err := os.WriteFile(filepath.Join(raw, "startup-diagnostics-summary.json"), encoded(summary), 0600); err != nil {
+		t.Fatal(err)
+	}
+	projected, err := projectFenceStageDiagnostics(raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if bytes.Contains(projected, []byte(canary)) || bytes.Contains(projected, []byte("runtime endpoint")) || bytes.Contains(projected, []byte(podName)) || bytes.Contains(projected, []byte(podUID)) {
+		t.Fatalf("private stage log content leaked: %s", projected)
+	}
+	var got fenceStageDiagnosticsView
+	if err := json.Unmarshal(projected, &got); err != nil {
+		t.Fatal(err)
+	}
+	want := []fenceStageDiagnostic{{Stage: "root-close", Class: "pending"}, {Stage: "runtime-collection", Class: "error"}}
+	if got.Status != "captured" || got.Version != 1 || got.Truncated || len(got.Diagnostics) != len(want) {
+		t.Fatalf("stage projection = %+v", got)
+	}
+	for i := range want {
+		if got.Diagnostics[i] != want[i] {
+			t.Fatalf("diagnostic %d = %+v, want %+v", i, got.Diagnostics[i], want[i])
+		}
+	}
+	if err := writeFenceStageDiagnostics(raw); err != nil {
+		t.Fatal(err)
+	}
+	if data, err := os.ReadFile(filepath.Join(raw, "fencer-stage-diagnostics.json")); err != nil || bytes.Contains(data, []byte(canary)) {
+		t.Fatalf("standalone public stage artifact missing or leaked: %v", err)
+	}
+
+	badSummary := obj{"captures": []obj{{
+		"component": "rhiza-fencer", "container": "authority",
+		"logs": obj{"current": obj{"captured": true, "bytes": len(privateLog), "sha256": strings.Repeat("0", 64)}},
+	}}}
+	if err := os.WriteFile(filepath.Join(raw, "startup-diagnostics-summary.json"), encoded(badSummary), 0600); err != nil {
+		t.Fatal(err)
+	}
+	projected, err = projectFenceStageDiagnostics(raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if json.Unmarshal(projected, &got) != nil || got.Status != "invalid_capture" || len(got.Diagnostics) != 0 {
+		t.Fatalf("mismatched private capture was projected: %s", projected)
+	}
+
+	// Duplicate authority captures remain invalid even when one entry omits
+	// the current receipt entirely.
+	duplicateMissingCurrent := obj{"captures": []obj{
+		{"component": "rhiza-fencer", "container": "authority", "logs": obj{}},
+		summary["captures"].([]obj)[0],
+	}}
+	if err := os.WriteFile(filepath.Join(raw, "startup-diagnostics-summary.json"), encoded(duplicateMissingCurrent), 0600); err != nil {
+		t.Fatal(err)
+	}
+	projected, err = projectFenceStageDiagnostics(raw)
+	if err != nil || json.Unmarshal(projected, &got) != nil || got.Status != "invalid_capture" || len(got.Diagnostics) != 0 {
+		t.Fatalf("duplicate capture with missing current receipt was accepted: %s (%v)", projected, err)
+	}
+
+	// A valid summary/private receipt is insufficient if its Pod-suffixed file
+	// is missing: never fall back to a fabricated or guessed filename.
+	if err := os.WriteFile(filepath.Join(raw, "startup-diagnostics-summary.json"), encoded(summary), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Remove(filepath.Join(private, podName+"-authority-current.log")); err != nil {
+		t.Fatal(err)
+	}
+	projected, err = projectFenceStageDiagnostics(raw)
+	if err != nil || json.Unmarshal(projected, &got) != nil || got.Status != "capture_mismatch" || len(got.Diagnostics) != 0 {
+		t.Fatalf("missing Pod-suffixed log was projected: %s (%v)", projected, err)
+	}
+
+	// Duplicate matching records are ambiguous even when they carry identical
+	// receipts; reject instead of selecting one identity.
+	privateRecord["captures"] = append(privateRecord["captures"].([]obj), privateRecord["captures"].([]obj)[0])
+	if err := os.WriteFile(filepath.Join(private, "record.json"), encoded(privateRecord), 0600); err != nil {
+		t.Fatal(err)
+	}
+	projected, err = projectFenceStageDiagnostics(raw)
+	if err != nil || json.Unmarshal(projected, &got) != nil || got.Status != "invalid_capture" || len(got.Diagnostics) != 0 {
+		t.Fatalf("duplicate identity records were projected: %s (%v)", projected, err)
+	}
+}
+
+func TestFenceStageProjectionRejectsSymlinkedPrivateDirectory(t *testing.T) {
+	const podName = "rhiza-fencer-86f89cd76d-brjc4"
+	privateLog := "2026/10/26 02:12:00 fencing stage blocked: stage=inventory class=error\n"
+	digest := sha256.Sum256([]byte(privateLog))
+	root := t.TempDir()
+	privateTarget := filepath.Join(root, "private-target")
+	if err := os.Mkdir(privateTarget, 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(privateTarget, podName+"-authority-current.log"), []byte(privateLog), 0600); err != nil {
+		t.Fatal(err)
+	}
+	privateRecord := obj{"captures": []obj{{
+		"identity":  obj{"name": podName, "uid": "private-uid"},
+		"component": "rhiza-fencer", "container": "authority",
+		"logs": obj{"current": obj{"captured": true, "bytes": len(privateLog), "sha256": hex.EncodeToString(digest[:])}},
+	}}}
+	if err := os.WriteFile(filepath.Join(privateTarget, "record.json"), encoded(privateRecord), 0600); err != nil {
+		t.Fatal(err)
+	}
+	raw := filepath.Join(root, "output")
+	if err := os.Mkdir(raw, 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(privateTarget, filepath.Join(raw, "private-startup-diagnostics")); err != nil {
+		t.Fatal(err)
+	}
+	summary := obj{"captures": []obj{{
+		"component": "rhiza-fencer", "container": "authority",
+		"logs": obj{"current": obj{"captured": true, "bytes": len(privateLog), "sha256": hex.EncodeToString(digest[:])}},
+	}}}
+	if err := os.WriteFile(filepath.Join(raw, "startup-diagnostics-summary.json"), encoded(summary), 0600); err != nil {
+		t.Fatal(err)
+	}
+	projected, err := projectFenceStageDiagnostics(raw)
+	var got fenceStageDiagnosticsView
+	if err != nil || json.Unmarshal(projected, &got) != nil || got.Status != "capture_mismatch" || len(got.Diagnostics) != 0 {
+		t.Fatalf("symlinked private diagnostics directory was accepted: %s (%v)", projected, err)
+	}
+}
+
+func TestFenceStageProjectionReportsWhenNoLogWasCaptured(t *testing.T) {
+	raw := t.TempDir()
+	projected, err := projectFenceStageDiagnostics(raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var got fenceStageDiagnosticsView
+	if json.Unmarshal(projected, &got) != nil || got.Status != "not_captured" || len(got.Diagnostics) != 0 {
+		t.Fatalf("missing log did not produce an empty bounded receipt: %s", projected)
+	}
+}
+
 func TestFencerStartupGrantRejectionProjectionUsesFixedCodes(t *testing.T) {
 	const canary = "private-backend-detail-canary"
 	tests := []struct {

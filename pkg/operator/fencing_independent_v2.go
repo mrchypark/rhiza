@@ -131,10 +131,15 @@ func independentClosedRuns(state fenceLedger, request FenceRequest, nodes []stri
 func (e *FencingExecutor) independentFence(ctx context.Context, endpoint string, record *fenceResource, request FenceRequest, sts object, state fenceLedger, hash string, nodes, current []string) error {
 	runs, err := independentClosedRuns(state, request, nodes)
 	if err != nil || e.VerifyRuntimeEvidence == nil {
+		if err == nil {
+			err = ErrFencePending
+		}
+		logFenceStageDiagnostic("terminal-verification", err)
 		return ErrFencePending
 	}
 	storage, err := e.storageScope(ctx, sts, request.SourceClusterID)
 	if err != nil {
+		logFenceStageDiagnostic("terminal-retention", err)
 		return err
 	}
 	// Retain each original termination first. This can span reconciles or
@@ -144,19 +149,23 @@ func (e *FencingExecutor) independentFence(ctx context.Context, endpoint string,
 			continue
 		}
 		if e.CollectRuntimeEvidence == nil {
+			logFenceStageDiagnostic("runtime-collection", ErrFencePending)
 			return ErrFencePending
 		}
 		if fencing.RunRole(run) == fencing.StartupRoleLearnerPendingRemove {
 			if err := validatePendingTerminalRun(state, run); err != nil {
+				logFenceStageDiagnostic("terminal-verification", err)
 				return err
 			}
 			if err := e.requirePendingProducerAbsent(ctx, *run.Runtime); err != nil {
+				logFenceStageDiagnostic("producer-settlement", err)
 				return err
 			}
 		} else if fencing.RunRole(run) == fencing.StartupRoleVoterActive {
 			// Producer admission must already be closed before the runtime provider
 			// acts. This also pins a missing never-bound active producer's UID.
 			if _, err := e.reserveMutationProducer(ctx, *run.Runtime); err != nil {
+				logFenceStageDiagnostic("producer-settlement", err)
 				return err
 			}
 		} else {
@@ -164,9 +173,11 @@ func (e *FencingExecutor) independentFence(ctx context.Context, endpoint string,
 		}
 		receipt, err := e.CollectRuntimeEvidence(ctx, *run.Runtime, *run.Stop)
 		if err != nil {
+			logFenceStageDiagnostic("runtime-collection", err)
 			return err
 		}
 		if _, err := e.retainIndependentTerminal(ctx, *run.Runtime, storage, receipt); err != nil {
+			logFenceStageDiagnostic("terminal-retention", err)
 			return err
 		}
 	}
@@ -176,6 +187,7 @@ func (e *FencingExecutor) independentFence(ctx context.Context, endpoint string,
 	}
 	runs, err = independentClosedRuns(state, request, nodes)
 	if err != nil {
+		logFenceStageDiagnostic("terminal-verification", err)
 		return ErrFencePending
 	}
 	evidence := &IndependentEvidenceV2{Version: 2, RequestHash: hash, LedgerHash: e.ledgerHash(state), StorageScope: storage,
@@ -185,6 +197,7 @@ func (e *FencingExecutor) independentFence(ctx context.Context, endpoint string,
 		verificationID := hashJSON([]any{"compose-independent-terminal", hash, storage, run.Identity.RunID})
 		ref, err := e.readIndependentTerminal(ctx, *run.Runtime, storage, verificationID)
 		if err != nil {
+			logFenceStageDiagnostic("terminal-verification", err)
 			return err
 		}
 		evidence.Terminals = append(evidence.Terminals, ref)
@@ -193,23 +206,35 @@ func (e *FencingExecutor) independentFence(ctx context.Context, endpoint string,
 	// inventory changes nor a different root snapshot may reuse this proof.
 	rechecked, err := e.read(ctx, state.StatefulSetUID, state.Ledger.SourceClusterID)
 	if err != nil {
+		logFenceStageDiagnostic("terminal-verification", err)
 		return err
 	}
 	again, err := e.currentInventory(ctx, request.StatefulSetUID, nodes)
 	if err != nil {
+		logFenceStageDiagnostic("inventory", err)
 		return err
 	}
-	if e.ledgerHash(rechecked) != evidence.LedgerHash || !sameStrings(again, current) {
+	if e.ledgerHash(rechecked) != evidence.LedgerHash {
+		logFenceStageDiagnostic("terminal-verification", ErrFencePending)
+		return ErrFencePending
+	}
+	if !sameStrings(again, current) {
+		logFenceStageDiagnostic("inventory", ErrFencePending)
 		return ErrFencePending
 	}
 	proof := &FenceProof{OperationID: request.OperationID, SourceClusterID: request.SourceClusterID, BindingUID: request.BindingUID,
 		RequestHash: hash, ProofID: "independent-v2-" + hashJSON(evidence), ProcessesTerminated: true, RecreationBlocked: true, StorageQuiesced: true,
 		IndependentV2: evidence}
 	if err := validateFenceProof(request, proof); err != nil {
+		logFenceStageDiagnostic("proof-validation", err)
 		return err
 	}
 	record.Status.Proof = proof
-	return e.Kube.Put(ctx, endpoint+"/"+url.PathEscape(str(record.Metadata["name"]))+"/status", record, nil)
+	if err := e.Kube.Put(ctx, endpoint+"/"+url.PathEscape(str(record.Metadata["name"]))+"/status", record, nil); err != nil {
+		logFenceStageDiagnostic("proof-status-write", err)
+		return err
+	}
+	return nil
 }
 
 // verifyIndependentVoterProofCoverage validates the complete retained history
