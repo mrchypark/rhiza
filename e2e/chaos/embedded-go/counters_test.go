@@ -3301,7 +3301,7 @@ stop_forward "$second"
 func qualificationGNUTimeout(t *testing.T) string {
 	t.Helper()
 	// Hosted runners may put uutils ahead of the system GNU coreutils.
-	for _, candidate := range []string{"timeout", "gtimeout", "/usr/bin/timeout", "/bin/timeout"} {
+	for _, candidate := range []string{"timeout", "gtimeout", "gnutimeout", "/usr/bin/timeout", "/bin/timeout"} {
 		path, err := exec.LookPath(candidate)
 		if err != nil {
 			continue
