@@ -9,8 +9,10 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net/http"
 	"path"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -26,6 +28,16 @@ type pausePendingIdentityUploadBucket struct {
 	reached chan struct{}
 	release chan struct{}
 	once    sync.Once
+}
+
+type pendingIdentityRoundTripper struct {
+	base  http.RoundTripper
+	calls atomic.Int32
+}
+
+func (r *pendingIdentityRoundTripper) RoundTrip(request *http.Request) (*http.Response, error) {
+	r.calls.Add(1)
+	return r.base.RoundTrip(request)
 }
 
 func (b *pausePendingIdentityUploadBucket) Upload(ctx context.Context, name string, reader io.Reader, options ...objstore.ObjectUploadOption) error {
@@ -160,18 +172,39 @@ func TestPendingIdentityLateUploadCannotMutateClosedAuthority(t *testing.T) {
 			t.Fatal("source archive changed before the paused identity upload resumed")
 		}
 
-		if _, err := fixture.client.RegisterStartup(ctx, fixture.physicalID); err == nil {
+		staleRegistrationClient := fixture.client
+		if _, err := staleRegistrationClient.RegisterStartup(ctx, fixture.physicalID); err == nil {
 			t.Fatal("closed pending identity was re-registered")
 		}
-		if _, err := fixture.client.Bind(ctx, id); !errors.Is(err, fencing.ErrClosed) {
+		failedRebindClient := fixture.client
+		httpClient := *fixture.client.Client
+		transport := httpClient.Transport
+		if transport == nil {
+			transport = http.DefaultTransport
+		}
+		countingTransport := &pendingIdentityRoundTripper{base: transport}
+		httpClient.Transport = countingTransport
+		failedRebindClient.Client = &httpClient
+		if _, err := failedRebindClient.Bind(ctx, id); !errors.Is(err, fencing.ErrClosed) {
 			t.Fatalf("closed pending identity WAL bind error=%v, want ErrClosed", err)
 		}
-		if _, err := fixture.client.PromoteLearner(ctx, id); !errors.Is(err, fencing.ErrClosed) {
-			t.Fatalf("closed pending identity promotion error=%v, want ErrClosed", err)
+		callsAfterClosedBind := countingTransport.calls.Load()
+		if callsAfterClosedBind == 0 {
+			t.Fatal("closed WAL bind did not reach the authority")
+		}
+		if _, err := failedRebindClient.PromoteLearner(ctx, id); err == nil {
+			t.Fatal("promotion without a locally bound learner identity succeeded")
+		}
+		if countingTransport.calls.Load() != callsAfterClosedBind {
+			t.Fatal("promotion after failed closed bind unexpectedly reached the authority")
 		}
 		stillClosedRoot, _, err := f.e.AuthorityState.ReadRoot(ctx, f.runtime.StatefulSetUID, f.runtime.SourceClusterID)
 		if err != nil || hashJSON(closedRoot) != hashJSON(stillClosedRoot) {
 			t.Fatalf("stale Register/Bind/Promote changed the closed canonical root: err=%v", err)
+		}
+		staleRetryArchive := pendingIdentityBucketSnapshot(t, ctx, f.e.ArchiveBucket)
+		if hashJSON(closedArchive) != hashJSON(staleRetryArchive) {
+			t.Fatal("stale Register/Bind/Promote dispatched a source-archive mutation")
 		}
 
 		release()
