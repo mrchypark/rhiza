@@ -49,6 +49,8 @@ type MutationExecutionReceiptStore struct {
 
 const maxMutationExecutionReceipts = 8192
 
+var errInvalidMutationExecutionReceipt = errors.New("fencing: mutation execution receipt is invalid")
+
 // openMutationExecutionReceiptStore requires a separately provisioned private
 // directory so the stage manifest's strict file inventory remains unchanged.
 func OpenMutationExecutionReceiptStore(dir string) (*MutationExecutionReceiptStore, error) {
@@ -448,12 +450,27 @@ func (e *FencingExecutor) verifyGenerationZeroOriginalDispatchReceipt(ctx contex
 }
 
 func (s *MutationExecutionReceiptStore) get(name string) (mutationExecutionReceipt, error) {
+	return s.getContext(context.Background(), name)
+}
+
+// getContext reads and validates one immutable receipt while respecting the
+// caller's cancellation/deadline for root-bound remote evidence.
+func (s *MutationExecutionReceiptStore) getContext(ctx context.Context, name string) (mutationExecutionReceipt, error) {
+	if ctx == nil {
+		return mutationExecutionReceipt{}, fmt.Errorf("fencing: mutation receipt context is required")
+	}
+	if err := ctx.Err(); err != nil {
+		return mutationExecutionReceipt{}, err
+	}
+	if s == nil {
+		return mutationExecutionReceipt{}, fmt.Errorf("fencing: mutation receipt store is not configured")
+	}
 	if s != nil && s.evidence != nil {
 		var receipt mutationExecutionReceipt
 		if !strings.HasPrefix(name, "receipt-") || strings.Contains(name, "/") || len(name) != len("receipt-")+64 {
-			return receipt, fmt.Errorf("fencing: invalid mutation receipt reference")
+			return receipt, fmt.Errorf("%w: invalid reference", errInvalidMutationExecutionReceipt)
 		}
-		r, _, err := s.evidence.Read(context.Background(), name)
+		r, _, err := s.evidence.Read(ctx, name)
 		if err != nil {
 			if errors.Is(err, os.ErrNotExist) || s.evidence.IsNotFound(err) {
 				return receipt, fmt.Errorf("%w: %v", os.ErrNotExist, err)
@@ -465,24 +482,31 @@ func (s *MutationExecutionReceiptStore) get(name string) (mutationExecutionRecei
 			return receipt, err
 		}
 		if len(data) > 1<<20 {
-			return receipt, fmt.Errorf("fencing: mutation execution receipt exceeds capacity")
+			return receipt, fmt.Errorf("%w: exceeds capacity", errInvalidMutationExecutionReceipt)
 		}
 		decoder := json.NewDecoder(bytes.NewReader(data))
 		decoder.DisallowUnknownFields()
 		if err := decoder.Decode(&receipt); err != nil {
-			return receipt, err
+			return receipt, fmt.Errorf("%w: decode failed", errInvalidMutationExecutionReceipt)
 		}
 		if err := decoder.Decode(new(any)); err != io.EOF || receipt.ReceiptDigest != receipt.digest() || mutationExecutionReceiptName(receipt) != name {
-			return receipt, fmt.Errorf("fencing: mutation execution receipt is corrupt")
+			return receipt, fmt.Errorf("%w: integrity check failed", errInvalidMutationExecutionReceipt)
 		}
 		return receipt, nil
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if s.lock == nil || !strings.HasPrefix(name, "receipt-") || strings.Contains(name, "/") {
+	if s.lock == nil || !strings.HasPrefix(name, "receipt-") || strings.Contains(name, "/") || len(name) != len("receipt-")+64 {
 		return mutationExecutionReceipt{}, fmt.Errorf("fencing: invalid mutation receipt reference")
 	}
-	return readMutationExecutionReceipt(filepath.Join(s.dir, name))
+	receipt, err := readMutationExecutionReceipt(filepath.Join(s.dir, name))
+	if err != nil {
+		return receipt, err
+	}
+	if mutationExecutionReceiptName(receipt) != name {
+		return mutationExecutionReceipt{}, fmt.Errorf("%w: filename does not match tuple", errInvalidMutationExecutionReceipt)
+	}
+	return receipt, nil
 }
 
 func readMutationExecutionReceipt(path string) (mutationExecutionReceipt, error) {

@@ -13,6 +13,7 @@ import (
 	"path"
 	"strings"
 
+	"github.com/mrchypark/rhiza/internal/localtesthooks"
 	"github.com/mrchypark/rhiza/pkg/fencing"
 	"github.com/mrchypark/rhiza/pkg/recovery"
 	"github.com/thanos-io/objstore"
@@ -1170,7 +1171,11 @@ func (a mutationExecutionAuthority) matchesReceipt(receipt mutationExecutionRece
 		receipt.LogicalBinding != nil && *receipt.LogicalBinding == *a.logicalBinding
 }
 
-func (e *FencingExecutor) executeSourceMutation(ctx context.Context, authority mutationExecutionAuthority, producerUID string, sequence uint64, intent fencing.MutationIntent, scope AttestationStoreScope, provider mutationExecutionProvider, receipts *MutationExecutionReceiptStore) error {
+func (e *FencingExecutor) executeSourceMutation(ctx context.Context, authority mutationExecutionAuthority, producerUID string, sequence uint64, intent fencing.MutationIntent, scope AttestationStoreScope, provider mutationExecutionProvider, receipts *MutationExecutionReceiptStore) (returnErr error) {
+	localtesthooks.HitLogicalMutationExecution(ctx, producerUID, sequence, localtesthooks.LogicalMutationAttemptStarted, localtesthooks.LogicalMutationStarted)
+	defer func() {
+		localtesthooks.HitLogicalMutationExecutionError(ctx, producerUID, sequence, localtesthooks.LogicalMutationAttemptReturned, returnErr)
+	}()
 	if e == nil || e.AuthorityState == nil {
 		return fmt.Errorf("fencing: canonical authority state is required for source mutation execution")
 	}
@@ -1249,8 +1254,21 @@ func (e *FencingExecutor) executeSourceMutation(ctx context.Context, authority m
 		return fmt.Errorf("fencing: original source mutation is terminally rejected")
 	}
 	owner := authority.mutationOwner(run, producerUID, sequence, intent)
-	if err := e.acquireMutationKey(ctx, intent.StoreScopeHash, intent.Key, owner, len(lookup.Entry.Dispatches) == 0); err != nil {
-		return err
+	if terminalMutationKeyCleanupCandidateForAuthority(run, entry) {
+		return e.resumeTerminalMutationKeyCleanup(ctx, authority, run, producerUID, sequence, entry, owner, receipts)
+	}
+	allowCreate := len(lookup.Entry.Dispatches) == 0
+	if err := e.acquireMutationKey(ctx, intent.StoreScopeHash, intent.Key, owner, allowCreate); err != nil {
+		if authority.logicalBinding != nil && errors.Is(err, ErrFencePending) {
+			if cleanupErr := e.resumeForeignLogicalTerminalKeyOwner(ctx, authority, intent.StoreScopeHash, intent.Key, owner); cleanupErr == nil {
+				err = e.acquireMutationKey(ctx, intent.StoreScopeHash, intent.Key, owner, allowCreate)
+			} else if !errors.Is(cleanupErr, ErrFencePending) {
+				return errors.Join(err, cleanupErr)
+			}
+		}
+		if err != nil {
+			return err
+		}
 	}
 	keyState, err := e.readMutationKeyState(ctx, intent.StoreScopeHash, intent.Key)
 	if err != nil {
@@ -1316,8 +1334,10 @@ func (e *FencingExecutor) executeSourceMutation(ctx context.Context, authority m
 		}
 		digest, err := receipts.put(receipt)
 		if err != nil {
+			localtesthooks.HitLogicalMutationExecutionError(ctx, producerUID, sequence, localtesthooks.LogicalMutationReceiptPersisted, err)
 			return err
 		}
+		localtesthooks.HitLogicalMutationExecution(ctx, producerUID, sequence, localtesthooks.LogicalMutationReceiptPersisted, localtesthooks.LogicalMutationSucceeded)
 		if _, err := e.changeMutationProducerForAuthority(ctx, authority, producerUID, func(p *fencing.MutationProducer) error {
 			if p.WALIdentity != run.Identity.WALIdentity {
 				return fmt.Errorf("fencing: mutation producer WAL differs")
@@ -1334,8 +1354,10 @@ func (e *FencingExecutor) executeSourceMutation(ctx context.Context, authority m
 			return p.Resolve(sequence, fencing.MutationResolution{Outcome: receipt.Outcome, PreparationHash: preparationHash, ReceiptDigest: digest, ConditionFailed: receipt.ConditionFailed,
 				PayloadDigest: receipt.PayloadDigest, AllCopiesTerminal: receipt.AllCopiesTerminal})
 		}); err != nil {
+			localtesthooks.HitLogicalMutationExecutionError(ctx, producerUID, sequence, localtesthooks.LogicalMutationJournalResolved, err)
 			return err
 		}
+		localtesthooks.HitLogicalMutationExecution(ctx, producerUID, sequence, localtesthooks.LogicalMutationJournalResolved, localtesthooks.LogicalMutationSucceeded)
 		if barrier != nil && receipt.Outcome == fencing.MutationCommitted && receipt.Intent.Kind == "upload" {
 			if receipt.Preparation.Generation <= 0 || receipt.Generation <= 0 || receipt.Generation == receipt.Preparation.Generation || receipt.Metageneration <= 0 {
 				return ErrFencePending
@@ -1366,8 +1388,10 @@ func (e *FencingExecutor) executeSourceMutation(ctx context.Context, authority m
 		// cross-producer key guard after its caller-visible commit.
 		if receipt.Preparation.Generation != 0 || receipt.AllCopiesTerminal {
 			if err := e.releaseMutationKeyAfterVerifiedTerminal(ctx, intent.StoreScopeHash, intent.Key, owner); err != nil {
+				localtesthooks.HitLogicalMutationExecutionError(ctx, producerUID, sequence, localtesthooks.LogicalMutationKeyReleased, err)
 				return err
 			}
+			localtesthooks.HitLogicalMutationExecution(ctx, producerUID, sequence, localtesthooks.LogicalMutationKeyReleased, localtesthooks.LogicalMutationSucceeded)
 		}
 		if receipt.Outcome != fencing.MutationCommitted {
 			if receipt.ConditionFailed {
@@ -1499,10 +1523,16 @@ func (e *FencingExecutor) executeSourceMutation(ctx context.Context, authority m
 		if fencing.IsHeldCreateEligible(intent, *entry.Preparation) {
 			return e.replayGuardedLogicalResolutionForAuthority(ctx, authority, run, producerUID, sequence, entry, stages, provider)
 		}
+		localtesthooks.HitLogicalMutationExecution(ctx, producerUID, sequence, localtesthooks.LogicalMutationProviderStarted, localtesthooks.LogicalMutationStarted)
 		result, found, err := provider.committed(ctx, intent.Key, intent, *entry.Preparation)
 		if err != nil || !found {
+			if err == nil {
+				err = errors.New("exact mutation readback not found")
+			}
+			localtesthooks.HitLogicalMutationExecutionError(ctx, producerUID, sequence, localtesthooks.LogicalMutationProviderReturned, err)
 			return ErrFencePending
 		}
+		localtesthooks.HitLogicalMutationExecution(ctx, producerUID, sequence, localtesthooks.LogicalMutationProviderReturned, localtesthooks.LogicalMutationSucceeded)
 		receipt := authority.makeReceipt(run, producerUID, sequence, intent, *entry.Preparation, dispatchID, result)
 		return finish(receipt)
 	}
@@ -1513,17 +1543,21 @@ func (e *FencingExecutor) executeSourceMutation(ctx context.Context, authority m
 	if _, err := e.changeMutationProducerForAuthority(ctx, authority, producerUID, func(p *fencing.MutationProducer) error {
 		return grantMutationDispatch(p, sequence, dispatchID)
 	}); err != nil {
+		localtesthooks.HitLogicalMutationExecutionError(ctx, producerUID, sequence, localtesthooks.LogicalMutationDispatchGranted, err)
 		return err
 	}
+	localtesthooks.HitLogicalMutationExecution(ctx, producerUID, sequence, localtesthooks.LogicalMutationDispatchGranted, localtesthooks.LogicalMutationSucceeded)
 	// Persist the permission before the one provider dispatch; any failure after
 	// this point remains an unresolved lock and is not retried by another worker.
 	var result mutationProviderResult
 	if intent.Kind == "upload" {
 		payload, err := stages.openMutationPayloadContext(ctx, producerUID, intent)
 		if err != nil {
+			localtesthooks.HitLogicalMutationExecutionError(ctx, producerUID, sequence, localtesthooks.LogicalMutationPayloadOpened, err)
 			return err
 		}
 		defer payload.Close()
+		localtesthooks.HitLogicalMutationExecution(ctx, producerUID, sequence, localtesthooks.LogicalMutationPayloadOpened, localtesthooks.LogicalMutationSucceeded)
 		dispatchContext := ctx
 		if e.GCSMutationAckLoss != nil && fencing.IsHeldCreateEligible(intent, *entry.Preparation) {
 			if authority.runtime == nil {
@@ -1547,29 +1581,151 @@ func (e *FencingExecutor) executeSourceMutation(ctx context.Context, authority m
 			}
 			barrier = &updatedBarrier
 		}
+		localtesthooks.HitLogicalMutationExecution(ctx, producerUID, sequence, localtesthooks.LogicalMutationProviderStarted, localtesthooks.LogicalMutationStarted)
 		result, err = provider.upload(dispatchContext, intent.Key, entry.Preparation.Generation, intent, payload)
 		if err != nil {
+			localtesthooks.HitLogicalMutationExecutionError(ctx, producerUID, sequence, localtesthooks.LogicalMutationProviderReturned, err)
 			return ErrFencePending
 		}
 	} else {
+		localtesthooks.HitLogicalMutationExecution(ctx, producerUID, sequence, localtesthooks.LogicalMutationProviderStarted, localtesthooks.LogicalMutationStarted)
 		result, err = provider.delete(ctx, intent.Key, entry.Preparation.Generation)
 		if err != nil {
+			localtesthooks.HitLogicalMutationExecutionError(ctx, producerUID, sequence, localtesthooks.LogicalMutationProviderReturned, err)
 			return ErrFencePending
 		}
 	}
 	conditionRejected := result.Outcome == fencing.MutationRejected && result.ConditionFailed && result.AllCopiesTerminal && result.PayloadDigest == "" && result.Generation == entry.Preparation.Generation
 	if result.ConditionFailed && !conditionRejected {
+		localtesthooks.HitLogicalMutationExecutionError(ctx, producerUID, sequence, localtesthooks.LogicalMutationProviderReturned, errors.New("provider result validation failed"))
 		return ErrFencePending
 	}
 	if (result.Outcome != fencing.MutationCommitted && result.Outcome != fencing.MutationExcluded && !conditionRejected) ||
 		(intent.Kind == "upload" && (result.Outcome != fencing.MutationCommitted || result.PayloadDigest != intent.PayloadDigest || result.Generation <= 0)) ||
 		(intent.Kind == "delete" && result.Generation != entry.Preparation.Generation) {
 		if !conditionRejected {
+			localtesthooks.HitLogicalMutationExecutionError(ctx, producerUID, sequence, localtesthooks.LogicalMutationProviderReturned, errors.New("provider result validation failed"))
 			return ErrFencePending
 		}
 	}
+	localtesthooks.HitLogicalMutationExecution(ctx, producerUID, sequence, localtesthooks.LogicalMutationProviderReturned, localtesthooks.LogicalMutationSucceeded)
 	receipt = authority.makeReceipt(run, producerUID, sequence, intent, *entry.Preparation, dispatchID, result)
 	return finish(receipt)
+}
+
+func terminalMutationKeyCleanupCandidateForAuthority(run fencing.Run, entry fencing.MutationEntry) bool {
+	if run.MutationProfile != fencing.MutationExecutionProfile || entry.Resolution == nil ||
+		entry.Resolution.Outcome != fencing.MutationCommitted || entry.Resolution.ConditionFailed || !entry.Resolution.AllCopiesTerminal ||
+		entry.Preparation == nil || entry.Preparation.Profile != fencing.MutationExecutionProfile || entry.Preparation.Generation <= 0 ||
+		entry.Intent.Kind != "upload" || entry.Intent.Condition.Mode != fencing.MutationMatchGeneration ||
+		entry.Intent.Condition.Generation != entry.Preparation.Generation || entry.Resolution.PayloadDigest != entry.Intent.PayloadDigest ||
+		entry.CopyCompletion != nil || entry.GuardedLogicalResolution != nil || entry.GenerationZeroGuard != nil || entry.GenerationZeroRights != nil ||
+		!entry.DispatchClosed || len(entry.Dispatches) != 1 {
+		return false
+	}
+	for _, dispatch := range entry.Dispatches {
+		if dispatch.ReceiptDigest == "" || dispatch.ReceiptDigest != entry.Resolution.ReceiptDigest {
+			return false
+		}
+	}
+	return true
+}
+
+func (e *FencingExecutor) resumeTerminalMutationKeyCleanup(ctx context.Context, authority mutationExecutionAuthority, run fencing.Run,
+	producerUID string, sequence uint64, entry fencing.MutationEntry, owner string, receipts *MutationExecutionReceiptStore) error {
+	resolution := entry.Resolution
+	if resolution == nil || entry.Preparation == nil || len(entry.Dispatches) != 1 || !entry.DispatchClosed ||
+		entry.Intent.Condition.Mode != fencing.MutationMatchGeneration || entry.Intent.Condition.Generation != entry.Preparation.Generation ||
+		entry.Preparation.Generation <= 0 || resolution.Outcome != fencing.MutationCommitted || !resolution.AllCopiesTerminal ||
+		resolution.ConditionFailed || resolution.PayloadDigest != entry.Intent.PayloadDigest {
+		return ErrFencePending
+	}
+	receipt, err := receipts.getContext(ctx, "receipt-"+owner)
+	if err != nil || !authority.matchesReceipt(receipt, run, producerUID, sequence, entry.Intent) || receipt.Preparation != *entry.Preparation ||
+		receipt.ReceiptDigest == "" || receipt.ReceiptDigest != receipt.digest() || receipt.ReceiptDigest != resolution.ReceiptDigest ||
+		receipt.Outcome != fencing.MutationCommitted || receipt.ConditionFailed || !receipt.AllCopiesTerminal ||
+		receipt.Generation <= receipt.Preparation.Generation || receipt.Metageneration <= 0 || receipt.PayloadDigest != entry.Intent.PayloadDigest ||
+		!mutationReceiptMatchesDispatch(entry, receipt) {
+		return errors.Join(ErrFencePending, err, fmt.Errorf("fencing: terminal mutation cleanup receipt differs from canonical journal"))
+	}
+	keyState, err := e.readMutationKeyState(ctx, entry.Intent.StoreScopeHash, entry.Intent.Key)
+	if errors.Is(err, errAuthorityStateNotFound) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	if keyState.PendingGenerationZero != nil || keyState.Barrier != nil || keyState.Retirement != nil {
+		return ErrFencePending
+	}
+	if err := e.releaseMutationKeyAfterVerifiedTerminal(ctx, entry.Intent.StoreScopeHash, entry.Intent.Key, owner); err != nil {
+		localtesthooks.HitLogicalMutationExecution(ctx, producerUID, sequence, localtesthooks.LogicalMutationKeyReleased, localtesthooks.LogicalMutationPending)
+		return err
+	}
+	localtesthooks.HitLogicalMutationExecution(ctx, producerUID, sequence, localtesthooks.LogicalMutationKeyReleased, localtesthooks.LogicalMutationSucceeded)
+	return nil
+}
+
+// resumeForeignLogicalTerminalKeyOwner releases a predecessor only after
+// locating its exact terminal tuple in the canonical root's producer journal
+// or authenticated archive and validating that tuple's immutable receipt.
+// It never reacquires, redispatches, or performs historical provider reads.
+func (e *FencingExecutor) resumeForeignLogicalTerminalKeyOwner(ctx context.Context, current mutationExecutionAuthority,
+	scopeHash, key, currentOwner string) error {
+	if ctx == nil || e == nil || e.AuthorityState == nil || current.logicalBinding == nil || scopeHash == "" || key == "" || currentOwner == "" {
+		return ErrFencePending
+	}
+	keyState, err := e.readMutationKeyState(ctx, scopeHash, key)
+	if err != nil || keyState.ScopeHash != scopeHash || keyState.Key != key || keyState.Owner == "" || keyState.Owner == currentOwner ||
+		keyState.PendingGenerationZero != nil || keyState.Barrier != nil || keyState.Retirement != nil {
+		return ErrFencePending
+	}
+	evidence, err := e.authorityEvidenceForRoot(current.statefulSetUID, current.sourceClusterID)
+	if err != nil {
+		return err
+	}
+	receipts, err := NewRemoteMutationExecutionReceiptStore(evidence)
+	if err != nil {
+		return err
+	}
+	prior, err := receipts.getContext(ctx, "receipt-"+keyState.Owner)
+	if err != nil || prior.AuthorityProfile != fencing.LogicalWriterProfileV1 || prior.LogicalBinding == nil || prior.Runtime != (fencing.RuntimeBinding{}) ||
+		prior.Sequence == 0 || prior.ProducerUID == "" || prior.Intent.StoreScopeHash != scopeHash || prior.Intent.Key != key ||
+		prior.Intent.OperationID != fencing.MutationRequestID(prior.ProducerUID, prior.Sequence) {
+		return errors.Join(ErrFencePending, err)
+	}
+	binding := *prior.LogicalBinding
+	if binding.SourceClusterID != current.sourceClusterID || binding.ProducerUID != prior.ProducerUID || binding.WALIdentity != prior.WALIdentity ||
+		binding.ValidateBound() != nil || binding.Role != fencing.StartupRoleVoterActive {
+		return ErrFencePending
+	}
+	priorAuthority := logicalMutationAuthority(current.statefulSetUID, binding)
+	owner := priorAuthority.mutationOwner(fencing.Run{Identity: fencing.Identity{SourceClusterID: priorAuthority.sourceClusterID,
+		RunID: priorAuthority.runID, WALIdentity: prior.WALIdentity}}, prior.ProducerUID, prior.Sequence, prior.Intent)
+	if owner != keyState.Owner {
+		return ErrFencePending
+	}
+	state, err := e.read(ctx, current.statefulSetUID, current.sourceClusterID)
+	if err != nil {
+		return err
+	}
+	run, exists := state.Ledger.Runs[binding.RunID]
+	if !exists || !priorAuthority.matchesRun(run) || run.LogicalBinding == nil || *run.LogicalBinding != binding ||
+		run.MutationProfile != fencing.MutationExecutionProfile || run.MutationProducerUID != prior.ProducerUID ||
+		run.MutationScopeHash != scopeHash || run.Identity.WALIdentity != prior.WALIdentity {
+		return ErrFencePending
+	}
+	lookup, err := e.lookupMutationForAuthority(ctx, priorAuthority, run, fencing.MutationLookupRequest{ProducerUID: prior.ProducerUID,
+		Sequence: prior.Sequence, Intent: prior.Intent})
+	if err != nil || !lookup.Found || lookup.Entry == nil || lookup.Entry.Intent != prior.Intent ||
+		!terminalMutationKeyCleanupCandidateForAuthority(run, *lookup.Entry) {
+		return errors.Join(ErrFencePending, err)
+	}
+	exactReceipts, err := e.receiptsForLogicalBinding(priorAuthority.statefulSetUID, binding)
+	if err != nil {
+		return err
+	}
+	return e.resumeTerminalMutationKeyCleanup(ctx, priorAuthority, run, prior.ProducerUID, prior.Sequence, *lookup.Entry, keyState.Owner, exactReceipts)
 }
 
 // resumeResolvedGenerationZeroBarrier completes the lineage CAS after a crash

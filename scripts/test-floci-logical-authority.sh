@@ -24,7 +24,7 @@ trap 'if [ "$keep_log" -eq 0 ]; then rm -f "$log_file"; fi' 0
 
 # Go returns success when -run matches no tests, so verify the exact inventory
 # before running and checking both required tests.
-if go test -tags localhooks ./e2e/logical-authority -list "$test_pattern" >"$log_file" 2>&1; then
+if go test -tags 'localhooks rhiza_local_testhooks' ./e2e/logical-authority -list "$test_pattern" >"$log_file" 2>&1; then
 	list_status=0
 else
 	list_status=$?
@@ -47,7 +47,7 @@ do
 	fi
 done
 
-if go test -tags localhooks ./e2e/logical-authority -run "$test_pattern" -count=1 -timeout=8m -v >"$log_file" 2>&1; then
+if go test -tags 'localhooks rhiza_local_testhooks' ./e2e/logical-authority -run "$test_pattern" -count=1 -timeout=8m -v >"$log_file" 2>&1; then
 	test_status=0
 else
 	test_status=$?

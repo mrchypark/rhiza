@@ -38,7 +38,10 @@ func collectLogicalAuthorityFailureSnapshot(nodes map[string]*node.Node, authori
 		IntentDigest                   string `json:"intent_digest"`
 		KeyHash                        string `json:"key_hash"`
 		KeyClass                       string `json:"key_class"`
+		ConditionMode                  string `json:"condition_mode"`
 		Prepared                       bool   `json:"prepared"`
+		PreparationProfile             string `json:"preparation_profile,omitempty"`
+		PreparationGeneration          int64  `json:"preparation_generation,omitempty"`
 		DispatchClosed                 bool   `json:"dispatch_closed"`
 		DispatchCount                  int    `json:"dispatch_count"`
 		DispatchReceiptCount           int    `json:"dispatch_receipt_count"`
@@ -50,6 +53,9 @@ func collectLogicalAuthorityFailureSnapshot(nodes map[string]*node.Node, authori
 		KeyOwnerEntryFound             bool   `json:"key_owner_entry_found"`
 		KeyOwnerEntryTerminal          bool   `json:"key_owner_entry_terminal"`
 		KeyOwnerEntryRetired           bool   `json:"key_owner_entry_retired"`
+		OwnerReceiptStatus             string `json:"owner_receipt_status,omitempty"`
+		OwnerReceiptOutcome            string `json:"owner_receipt_outcome,omitempty"`
+		OwnerReceiptDigestMatches      bool   `json:"owner_receipt_digest_matches"`
 		CurrentTupleMatchesKeyOwner    bool   `json:"current_tuple_matches_key_owner"`
 		CurrentEntryTerminal           bool   `json:"current_entry_terminal"`
 		CurrentEntryRetired            bool   `json:"current_entry_retired"`
@@ -170,12 +176,17 @@ func collectLogicalAuthorityFailureSnapshot(nodes map[string]*node.Node, authori
 					intentData, _ := json.Marshal(entry.Intent)
 					row := producerEntrySnapshot{Sequence: sequence, IntentDigest: diagnosticDigest(string(intentData)),
 						KeyHash: diagnosticDigest(entry.Intent.Key), KeyClass: safeKeyClass(entry.Intent.Key),
-						Prepared: entry.Preparation != nil, DispatchClosed: entry.DispatchClosed,
+						ConditionMode: safeMutationConditionMode(entry.Intent.Condition.Mode),
+						Prepared:      entry.Preparation != nil, DispatchClosed: entry.DispatchClosed,
 						DispatchCount: len(entry.Dispatches), GenerationZeroGuardPresent: entry.GenerationZeroGuard != nil,
 						GuardedResolutionPresent: entry.GuardedLogicalResolution != nil}
 					if entry.Resolution != nil {
 						row.Resolution = string(entry.Resolution.Outcome)
 						row.ResolutionReceiptDigestPresent = entry.Resolution.ReceiptDigest != ""
+					}
+					if entry.Preparation != nil {
+						row.PreparationProfile = safeMutationProfile(entry.Preparation.Profile)
+						row.PreparationGeneration = entry.Preparation.Generation
 					}
 					if entry.Resolution == nil || !entry.DispatchClosed {
 						if remainingKeyReads == 0 {
@@ -196,6 +207,9 @@ func collectLogicalAuthorityFailureSnapshot(nodes map[string]*node.Node, authori
 									row.KeyOwnerEntryFound = keyState.OwnerEntryFound
 									row.KeyOwnerEntryTerminal = keyState.OwnerEntryTerminal
 									row.KeyOwnerEntryRetired = keyState.OwnerEntryRetired
+									row.OwnerReceiptStatus = safeOwnerReceiptStatus(keyState.OwnerReceiptStatus)
+									row.OwnerReceiptOutcome = safeMutationOutcome(keyState.OwnerReceiptOutcome)
+									row.OwnerReceiptDigestMatches = keyState.OwnerReceiptDigestMatches
 									row.CurrentTupleMatchesKeyOwner = keyState.CurrentTupleMatch
 									row.CurrentEntryTerminal = keyState.CurrentEntryTerminal
 									row.CurrentEntryRetired = keyState.CurrentEntryRetired
@@ -287,6 +301,9 @@ func safeKeyClass(value string) string {
 	if clean == "archive/head.bin" {
 		return "archive-head"
 	}
+	if clean == "archive/PUBLISH_LOCK" {
+		return "publication-lock"
+	}
 	parts := strings.Split(clean, "/")
 	for _, part := range parts {
 		if part == "blocks" || part == "extents" {
@@ -306,12 +323,64 @@ func safeKeyClass(value string) string {
 	return "other"
 }
 
+func safeMutationConditionMode(mode fencing.MutationConditionMode) string {
+	switch mode {
+	case fencing.MutationUnconditional, fencing.MutationCreateOnly, fencing.MutationMatchGeneration:
+		return string(mode)
+	default:
+		return "unknown"
+	}
+}
+
+func safeMutationProfile(profile string) string {
+	switch profile {
+	case fencing.MutationExecutionProfile, fencing.MutationHeldExecutionProfile, "gcs-resumable-v1":
+		return profile
+	default:
+		return "unknown"
+	}
+}
+
+func safeMutationOutcome(outcome fencing.MutationOutcome) string {
+	switch outcome {
+	case fencing.MutationCommitted, fencing.MutationRejected, fencing.MutationExcluded:
+		return string(outcome)
+	default:
+		return "unknown"
+	}
+}
+
+func safeOwnerReceiptStatus(status string) string {
+	switch status {
+	case "absent", "read-error", "invalid", "valid", "incomplete":
+		return status
+	default:
+		return "unknown"
+	}
+}
+
+func TestSafeOwnerReceiptStatusPreservesIncomplete(t *testing.T) {
+	for _, test := range []struct{ input, want string }{
+		{"absent", "absent"},
+		{"read-error", "read-error"},
+		{"invalid", "invalid"},
+		{"valid", "valid"},
+		{"incomplete", "incomplete"},
+		{"unknown-sensitive-detail", "unknown"},
+	} {
+		if got := safeOwnerReceiptStatus(test.input); got != test.want {
+			t.Errorf("safeOwnerReceiptStatus(%q)=%q, want %q", test.input, got, test.want)
+		}
+	}
+}
+
 func TestSafeKeyClassDoesNotExposeObjectNames(t *testing.T) {
 	for _, test := range []struct {
 		key  string
 		want string
 	}{
 		{key: "archive/head.bin", want: "archive-head"},
+		{key: "archive/PUBLISH_LOCK", want: "publication-lock"},
 		{key: "archive/blocks/secret-object", want: "block"},
 		{key: "checkpoint/blocks/secret-object", want: "block"},
 		{key: "voters/node-secret/identity", want: "voter"},
