@@ -248,12 +248,30 @@ func (a *LocalArchive) checkLocalHead(ctx context.Context) error {
 	if a.failure != nil {
 		return a.failure
 	}
-	fresh, err := OpenLocalArchive(ctx, a.bucket, a.prefix)
+	fresh := &LocalArchive{bucket: a.bucket, prefix: a.prefix, Binding: a.Binding}
+	binding, err := a.read(ctx, "BINDING", 64<<10)
 	if err != nil {
 		return err
 	}
-	if !sameObjectVersion(a.version, fresh.version) {
+	if sha256.Sum256(binding) != a.head.BindingHash {
+		return fmt.Errorf("local archive identity mismatch")
+	}
+	if err := fresh.readLocalHead(ctx, binding); err != nil {
+		return err
+	}
+	if !sameObjectVersion(a.version, fresh.version) || a.headHash != fresh.headHash {
 		return fmt.Errorf("%w; reopen required", ErrLocalHEADAdvanced)
+	}
+	// A read-only Open may observe the protocol-only target before its fence
+	// is sealed. Complete that fence before any GC, pin, or archive mutation.
+	if a.head.Version == 2 {
+		pending, _, err := a.localProtocol(ctx)
+		if err != nil {
+			return err
+		}
+		if pending {
+			return a.publish(ctx, a.head)
+		}
 	}
 	return nil
 }

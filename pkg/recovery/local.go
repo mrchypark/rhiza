@@ -49,14 +49,15 @@ type localHead struct {
 // LocalArchive reuses the decision extent format without shared-voter leases,
 // generation recovery, or any relaxation of consensus certificate validation.
 type LocalArchive struct {
-	mu      sync.Mutex
-	bucket  objstore.Bucket
-	prefix  string
-	Binding LocalBinding
-	head    localHead
-	version *objstore.ObjectVersion
-	extents []Extent
-	failure error
+	mu       sync.Mutex
+	bucket   objstore.Bucket
+	prefix   string
+	Binding  LocalBinding
+	head     localHead
+	headHash [32]byte
+	version  *objstore.ObjectVersion
+	extents  []Extent
+	failure  error
 }
 
 func OpenLocalArchive(ctx context.Context, bucket objstore.Bucket, prefix string) (*LocalArchive, error) {
@@ -72,36 +73,9 @@ func OpenLocalArchive(ctx context.Context, bucket objstore.Bucket, prefix string
 	if err := validateLocalBinding(a.Binding); err != nil {
 		return nil, err
 	}
-	attrs, err := bucket.Attributes(ctx, a.key("HEAD"))
-	if err != nil {
-		return nil, fmt.Errorf("local archive head missing: %w", err)
-	}
-	head, err := a.read(ctx, "HEAD", maxLocalHeadSize)
-	if err != nil {
+	if err := a.readLocalHead(ctx, data); err != nil {
 		return nil, err
 	}
-	after, err := bucket.Attributes(ctx, a.key("HEAD"))
-	if err != nil || !sameObjectVersion(attrs.Version, after.Version) || attrs.Version == nil {
-		return nil, fmt.Errorf("local archive head changed during read")
-	}
-	if err := strictLocalJSON(head, &a.head); err != nil {
-		return nil, err
-	}
-	if (a.head.Version != 1 && a.head.Version != 2) || a.head.Version == 1 && len(a.head.Catalog) != 0 || a.head.BindingHash != sha256.Sum256(data) {
-		return nil, fmt.Errorf("local archive identity mismatch")
-	}
-	if a.head.Version == 1 {
-		active, err := bucket.Exists(ctx, a.key("local-gc-protocol"))
-		if err != nil {
-			return nil, err
-		}
-		if active {
-			return nil, fmt.Errorf("Local GC protocol downgrade")
-		}
-	} else if err := a.validateLocalCatalog(); err != nil {
-		return nil, err
-	}
-	a.version = attrs.Version
 	hash := a.head.Tail
 	next, prefixHash := a.head.Tip, a.head.Prefix
 	seen := make(map[[32]byte]bool)
@@ -147,6 +121,37 @@ func OpenLocalArchive(ctx context.Context, bucket objstore.Bucket, prefix string
 		}
 	}
 	return a, nil
+}
+
+// readLocalHead validates bounded metadata only. Extent reconstruction belongs to Open.
+func (a *LocalArchive) readLocalHead(ctx context.Context, data []byte) error {
+	attrs, err := a.bucket.Attributes(ctx, a.key("HEAD"))
+	if err != nil {
+		return fmt.Errorf("local archive head missing: %w", err)
+	}
+	head, err := a.read(ctx, "HEAD", maxLocalHeadSize)
+	if err != nil {
+		return err
+	}
+	after, err := a.bucket.Attributes(ctx, a.key("HEAD"))
+	if err != nil || !sameObjectVersion(attrs.Version, after.Version) || attrs.Version == nil {
+		return fmt.Errorf("local archive head changed during read")
+	}
+	if err := strictLocalJSON(head, &a.head); err != nil {
+		return err
+	}
+	if (a.head.Version != 1 && a.head.Version != 2) || a.head.Version == 1 && len(a.head.Catalog) != 0 || a.head.BindingHash != sha256.Sum256(data) {
+		return fmt.Errorf("local archive identity mismatch")
+	}
+	if a.head.Version == 2 {
+		if err := a.validateLocalCatalog(); err != nil {
+			return err
+		}
+	}
+	a.version = attrs.Version
+	a.headHash = sha256.Sum256(head)
+	_, _, err = a.localProtocol(ctx)
+	return err
 }
 
 // CreateLocalArchive uses conditional creation for both genesis objects. A
@@ -418,7 +423,130 @@ func (s localArchiveSuffix) DecisionsFromBounded(from quepaxa.Slot, limit, bytes
 	}
 	return result, s.tip, nil
 }
-func (a *LocalArchive) publish(ctx context.Context, head localHead) (resultErr error) {
+
+// The initial transition changes only the protocol, so a retry never needs to
+// reconstruct or adopt a partially published rebase.
+func localV2Head(head localHead) localHead {
+	head.Version = 2
+	if head.Snapshot != nil {
+		head.Catalog = []LocalSnapshot{*head.Snapshot}
+	}
+	return head
+}
+
+type localUpgradeIntent struct {
+	Version           uint                       `json:"version"`
+	BindingHash       [32]byte                   `json:"binding_hash"`
+	SourceHash        [32]byte                   `json:"source_hash"`
+	SourceVersion     []byte                     `json:"source_version"`
+	SourceVersionType objstore.ObjectVersionType `json:"source_version_type"`
+	TargetHash        [32]byte                   `json:"target_hash"`
+}
+
+// A literal 2 is the permanent fence (including archives written by old code).
+// Only an exact, uncompleted transition permits a v1 HEAD to reopen.
+func (a *LocalArchive) localProtocol(ctx context.Context) (bool, *objstore.ObjectVersion, error) {
+	key := a.key("local-gc-protocol")
+	before, err := a.bucket.Attributes(ctx, key)
+	if a.bucket.IsObjNotFoundErr(err) {
+		if a.head.Version == 2 {
+			return false, nil, fmt.Errorf("Local GC protocol marker missing")
+		}
+		return false, nil, nil
+	}
+	if err != nil {
+		return false, nil, err
+	}
+	data, err := a.read(ctx, "local-gc-protocol", 4096)
+	if err != nil {
+		return false, nil, err
+	}
+	after, err := a.bucket.Attributes(ctx, key)
+	if err != nil {
+		return false, nil, err
+	}
+	if !sameObjectVersion(before.Version, after.Version) {
+		return false, nil, fmt.Errorf("Local GC protocol changed during read")
+	}
+	if bytes.Equal(data, []byte("2")) {
+		if a.head.Version != 2 {
+			return false, nil, fmt.Errorf("Local GC protocol downgrade")
+		}
+		return false, after.Version, nil
+	}
+	var intent localUpgradeIntent
+	if err := strictLocalJSON(data, &intent); err != nil {
+		return false, nil, err
+	}
+	if intent.Version != 2 || intent.BindingHash != a.head.BindingHash || len(intent.SourceVersion) == 0 || (intent.SourceVersionType != objstore.Generation && intent.SourceVersionType != objstore.ETag) || intent.SourceHash == ([32]byte{}) || intent.TargetHash == ([32]byte{}) {
+		return false, nil, fmt.Errorf("invalid Local protocol transition")
+	}
+	if a.head.Version == 1 {
+		target, _ := json.Marshal(localV2Head(a.head))
+		if intent.SourceHash != a.headHash || intent.SourceVersionType != a.version.Type || !bytes.Equal(intent.SourceVersion, []byte(a.version.Value)) || intent.TargetHash != sha256.Sum256(target) {
+			return false, nil, fmt.Errorf("Local GC protocol downgrade or mismatched transition")
+		}
+	} else if intent.TargetHash != a.headHash {
+		return false, nil, fmt.Errorf("Local protocol transition target mismatch")
+	}
+	return true, after.Version, nil
+}
+
+func (a *LocalArchive) publish(ctx context.Context, head localHead) error {
+	// Preserve the no-I/O rejection for an oversized requested publication.
+	data, err := json.Marshal(head)
+	if err != nil {
+		return err
+	}
+	if len(data) > maxLocalHeadSize {
+		return fmt.Errorf("Local HEAD exceeds %d-byte limit", maxLocalHeadSize)
+	}
+	if a.version != nil {
+		pending, markerVersion, err := a.localProtocol(ctx)
+		if err != nil {
+			return err
+		}
+		if a.head.Version == 2 && head.Version != 2 {
+			return fmt.Errorf("Local GC protocol downgrade")
+		}
+		if a.head.Version == 1 && (head.Version == 2 || pending) {
+			target := localV2Head(a.head)
+			encoded, err := json.Marshal(target)
+			if err != nil {
+				return err
+			}
+			if len(encoded) > maxLocalHeadSize {
+				return fmt.Errorf("Local protocol transition exceeds %d-byte HEAD limit", maxLocalHeadSize)
+			}
+			if !pending {
+				intent, _ := json.Marshal(localUpgradeIntent{Version: 2, BindingHash: a.head.BindingHash, SourceHash: a.headHash, SourceVersion: []byte(a.version.Value), SourceVersionType: a.version.Type, TargetHash: sha256.Sum256(encoded)})
+				if err := a.bucket.Upload(ctx, a.key("local-gc-protocol"), bytes.NewReader(intent), objstore.WithIfNotExists()); err != nil {
+					return err
+				}
+				_, markerVersion, err = a.localProtocol(ctx)
+				if err != nil {
+					return err
+				}
+			}
+			if err := a.publishHead(ctx, target); err != nil {
+				return err
+			}
+			pending = true
+			if head.Version == 1 {
+				head = localV2Head(head)
+			}
+		}
+		if pending {
+			// Seal the intent before acknowledging completion or changing history.
+			if err := a.bucket.Upload(ctx, a.key("local-gc-protocol"), bytes.NewReader([]byte("2")), objstore.WithIfMatch(markerVersion)); err != nil {
+				return err
+			}
+		}
+	}
+	return a.publishHead(ctx, head)
+}
+
+func (a *LocalArchive) publishHead(ctx context.Context, head localHead) (resultErr error) {
 	attempted := false
 	defer func() {
 		if resultErr != nil && attempted {
@@ -433,11 +561,6 @@ func (a *LocalArchive) publish(ctx context.Context, head localHead) (resultErr e
 	// backlog growth before I/O rather than publishing an unreadable HEAD.
 	if len(data) > maxLocalHeadSize {
 		return fmt.Errorf("Local HEAD exceeds %d-byte limit; pending retention catalog must shrink before publication", maxLocalHeadSize)
-	}
-	if head.Version == 2 {
-		if err := a.bucket.Upload(ctx, a.key("local-gc-protocol"), bytes.NewReader([]byte("2")), objstore.WithIfNotExists()); err != nil && !a.bucket.IsConditionNotMetErr(err) {
-			return err
-		}
 	}
 	option := objstore.WithIfNotExists()
 	if a.version != nil {
@@ -465,6 +588,7 @@ func (a *LocalArchive) publish(ctx context.Context, head localHead) (resultErr e
 		return fmt.Errorf("local head version unavailable")
 	}
 	a.head, a.version = head, attrs.Version
+	a.headHash = sha256.Sum256(data)
 	return nil
 }
 

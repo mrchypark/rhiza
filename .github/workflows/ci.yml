@@ -16,6 +16,31 @@ permissions:
   contents: read
 
 jobs:
+  embedded-object-storage-providers:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+          cache: true
+      - name: Qualify embedded storage against all three pinned Floci providers
+        shell: bash
+        run: |
+          unset RHIZA_EMBEDDED_TEST_PATTERN
+          sh scripts/test-embedded-object-providers.sh 2>&1 | tee "$RUNNER_TEMP/embedded-object-storage-providers.log"
+      - name: Preserve provider qualification logs and failure diagnostics
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: embedded-object-storage-providers-${{ github.run_id }}
+          path: |
+            ${{ runner.temp }}/embedded-object-storage-providers.log
+            /tmp/rhiza-embedded-providers.*/*.log
+            /tmp/rhiza-embedded-providers.*/*-image-digests.json
+            /tmp/rhiza-embedded-providers.*/selected-tests.txt
+
   cooperative-fencing:
     runs-on: ubuntu-latest
     timeout-minutes: 30

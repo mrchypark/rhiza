@@ -3298,17 +3298,46 @@ stop_forward "$second"
 	}
 }
 
+func qualificationGNUTimeout(t *testing.T) string {
+	t.Helper()
+	// Hosted runners may put uutils ahead of the system GNU coreutils.
+	for _, candidate := range []string{"timeout", "gtimeout", "/usr/bin/timeout", "/bin/timeout"} {
+		path, err := exec.LookPath(candidate)
+		if err != nil {
+			continue
+		}
+		output, err := exec.Command(path, "--version").CombinedOutput()
+		if err == nil && bytes.Contains(output, []byte("GNU coreutils")) {
+			absolute, err := filepath.Abs(path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			return absolute
+		}
+	}
+	t.Fatal("native GNU timeout required for qualification tests")
+	return ""
+}
+
+func TestQualificationGNUTimeoutIgnoresUutils(t *testing.T) {
+	native := qualificationGNUTimeout(t)
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "timeout"), []byte("#!/bin/sh\nprintf 'timeout (uutils coreutils) 0.10.0\\n'\n"), 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(native, filepath.Join(dir, "gtimeout")); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", dir)
+	if got := qualificationGNUTimeout(t); got != filepath.Join(dir, "gtimeout") {
+		t.Fatalf("selected %s instead of validated GNU timeout", got)
+	}
+}
+
 // Exercise the actual shell entry with synthetic files and a non-networking
 // kubectl. No token is minted, no application opens, and no cloud call is made.
 func TestQualificationLocalRuntime(t *testing.T) {
-	nativeTimeout, err := exec.LookPath("timeout")
-	if err != nil {
-		t.Fatal("native GNU timeout required for the local runtime tests")
-	}
-	nativeTimeout, err = filepath.Abs(nativeTimeout)
-	if err != nil {
-		t.Fatal(err)
-	}
+	nativeTimeout := qualificationGNUTimeout(t)
 	scriptPath := os.Getenv("RHIZA_RUNTIME_TEST_SCRIPT")
 	if scriptPath == "" {
 		scriptPath = "../run-gcs-postrelease.sh"
@@ -3336,6 +3365,9 @@ func TestQualificationLocalRuntime(t *testing.T) {
 			}
 			write(filepath.Join(bin, "setsid"), "#!/bin/sh\nexec \"$@\"\n", 0700)
 			write(filepath.Join(bin, "lsof"), "#!/bin/sh\nexit 1\n", 0700)
+			if err := os.Symlink(nativeTimeout, filepath.Join(bin, "timeout")); err != nil {
+				t.Fatal(err)
+			}
 			const run = "a1b2c3d4"
 			const harness = "9b53158b38352ae78446e70a298616a31dc44a69"
 			application := syntheticFixtureRevision
@@ -3516,6 +3548,9 @@ esac
 			// Functional cases check parser arguments and auth boundaries, not
 			// process-launch performance. Timing cases keep the native timer.
 			if scenario != "parser-timeout" && scenario != "deadline" && scenario != "watchdog" {
+				if err := os.Remove(filepath.Join(bin, "timeout")); err != nil {
+					t.Fatal(err)
+				}
 				write(filepath.Join(bin, "timeout"), `#!/bin/sh
 previous=
 parser=no
@@ -5319,10 +5354,11 @@ func TestQualificationMetadataReadinessOuterWatchdog(t *testing.T) {
 	if !bytes.Contains(source[start:end], []byte("auth_expiry - 1200 - metadata_budget_now - metadata_kill_grace")) {
 		t.Fatal("watchdog does not reserve kill grace before the full auth cleanup reserve")
 	}
-	if output, err := exec.Command("timeout", "--version").CombinedOutput(); err != nil || !bytes.Contains(output, []byte("GNU coreutils")) {
-		t.Fatalf("GNU timeout required for monotonic watchdog regression: %v %s", err, output)
-	}
+	nativeTimeout := qualificationGNUTimeout(t)
 	dir := t.TempDir()
+	if err := os.Symlink(nativeTimeout, filepath.Join(dir, "timeout")); err != nil {
+		t.Fatal(err)
+	}
 	worker := filepath.Join(dir, "run-gcs-postrelease.sh")
 	if err := os.WriteFile(worker, []byte("#!/bin/sh\ntrap '' TERM\nwhile :; do sleep 1; done\n"), 0700); err != nil {
 		t.Fatal(err)
@@ -5338,7 +5374,7 @@ date() { printf '%s\n' 1000; }
 	ctx, cancel := context.WithTimeout(context.Background(), 9*time.Second)
 	defer cancel()
 	command := exec.CommandContext(ctx, "/bin/sh", "-c", fixture+string(source[start:end])+"\nmetadata_credentials_ready")
-	command.Env = append(os.Environ(), "FAKE_SCRIPT_DIR="+dir)
+	command.Env = append(os.Environ(), "FAKE_SCRIPT_DIR="+dir, "PATH="+dir+":"+os.Getenv("PATH"))
 	started := time.Now()
 	output, runErr := command.CombinedOutput()
 	elapsed := time.Since(started)

@@ -1107,10 +1107,11 @@ func imageDescriptor(d string, content []byte) (string, error) {
 			Digest string `json:"digest"`
 		} `json:"config"`
 		Manifests []struct {
-			Digest    string `json:"digest"`
-			Size      int64  `json:"size"`
-			MediaType string `json:"mediaType"`
-			Platform  obj    `json:"platform"`
+			Digest      string            `json:"digest"`
+			Size        int64             `json:"size"`
+			MediaType   string            `json:"mediaType"`
+			Platform    obj               `json:"platform"`
+			Annotations map[string]string `json:"annotations"`
 		} `json:"manifests"`
 	}
 	if err := json.Unmarshal(content, &descriptor); err != nil {
@@ -1120,10 +1121,34 @@ func imageDescriptor(d string, content []byte) (string, error) {
 		return immutableDigest(descriptor.Config.Digest)
 	}
 	if descriptor.Config.Digest == "" && len(descriptor.Manifests) > 0 {
+		var attestations []string
+		runnable := descriptor.Manifests[:0]
+		for _, manifest := range descriptor.Manifests {
+			if text(manifest.Platform["os"]) == "unknown" || text(manifest.Platform["architecture"]) == "unknown" || manifest.Annotations["vnd.docker.reference.type"] == "attestation-manifest" {
+				if len(manifest.Platform) != 2 || text(manifest.Platform["os"]) != "unknown" || text(manifest.Platform["architecture"]) != "unknown" || manifest.Size <= 0 || manifest.MediaType != "application/vnd.oci.image.manifest.v1+json" || manifest.Annotations["vnd.docker.reference.type"] != "attestation-manifest" {
+					return "", fmt.Errorf("invalid attestation in immutable image index %s", d)
+				}
+				if _, err := immutableDigest(manifest.Digest); err != nil {
+					return "", err
+				}
+				attestations = append(attestations, manifest.Annotations["vnd.docker.reference.digest"])
+				continue
+			}
+			runnable = append(runnable, manifest)
+		}
+		if len(runnable) == 0 {
+			return "", fmt.Errorf("no runnable manifest in immutable image index %s", d)
+		}
+		descriptor.Manifests = runnable
 		first := descriptor.Manifests[0]
 		resolved, err := immutableDigest(first.Digest)
 		if err != nil {
 			return "", err
+		}
+		for _, reference := range attestations {
+			if reference != resolved {
+				return "", fmt.Errorf("attestation references another immutable image in %s", d)
+			}
 		}
 		knownMediaType := first.MediaType == "application/vnd.oci.image.manifest.v1+json" || first.MediaType == "application/vnd.oci.image.index.v1+json" || first.MediaType == "application/vnd.docker.distribution.manifest.v2+json" || first.MediaType == "application/vnd.docker.distribution.manifest.list.v2+json"
 		for _, alias := range descriptor.Manifests[1:] {

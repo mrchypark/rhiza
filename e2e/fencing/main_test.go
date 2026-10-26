@@ -62,6 +62,7 @@ func TestImmutableImageResolutionDescriptors(t *testing.T) {
 	manifest := `{"digest":"` + config + `","size":708,"mediaType":"application/vnd.oci.image.manifest.v1+json","annotations":{"tag":"host"}}`
 	alias := strings.Replace(manifest, `"host"`, `"operator"`, 1)
 	index := func(second string) string { return `{"manifests":[` + manifest + `,` + second + `]}` }
+	attestation := `{"digest":"sha256:` + strings.Repeat("c", 64) + `","size":600,"mediaType":"application/vnd.oci.image.manifest.v1+json","platform":{"os":"unknown","architecture":"unknown"},"annotations":{"vnd.docker.reference.type":"attestation-manifest","vnd.docker.reference.digest":"` + config + `"}}`
 	for _, tc := range []struct {
 		body  string
 		valid bool
@@ -70,6 +71,17 @@ func TestImmutableImageResolutionDescriptors(t *testing.T) {
 		{`{"manifests":[{"digest":"` + config + `"}]}`, true},
 		{`{"manifests":[{"digest":"` + config + `"},{"digest":"` + config + `"}]}`, false},
 		{index(alias), true},
+		{index(attestation), true},
+		{`{"manifests":[` + attestation + `,` + manifest + `]}`, true},
+		{`{"manifests":[` + attestation + `]}`, false},
+		{index(strings.Replace(attestation, `"attestation-manifest"`, `"other"`, 1)), false},
+		{index(strings.Replace(attestation, `"os":"unknown"`, `"os":"linux"`, 1)), false},
+		{index(strings.Replace(attestation, "application/vnd.oci.image.manifest.v1+json", "application/vnd.oci.image.index.v1+json", 1)), false},
+		{index(strings.Replace(attestation, config, "sha256:"+strings.Repeat("b", 64), 1)), false},
+		{index(strings.Replace(attestation, `"size":600`, `"size":0`, 1)), false},
+		{index(strings.Replace(attestation, `"vnd.docker.reference.type":"attestation-manifest",`, ``, 1)), false},
+		{index(strings.Replace(attestation, "sha256:"+strings.Repeat("c", 64), "sha256:invalid", 1)), false},
+		{`{"manifests":[` + manifest + `,` + attestation + `,` + strings.Replace(alias, config, "sha256:"+strings.Repeat("b", 64), 1) + `]}`, false},
 		{index(strings.Replace(alias, config, "sha256:"+strings.Repeat("b", 64), 1)), false},
 		{index(strings.Replace(alias, `"size":708`, `"size":709`, 1)), false},
 		{index(strings.Replace(alias, "application/vnd.oci.image.manifest.v1+json", "application/vnd.docker.distribution.manifest.v2+json", 1)), false},

@@ -4,14 +4,17 @@ import (
 	"bytes"
 	"context"
 	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"log"
+	"net/url"
 	"os"
 	"path"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 
@@ -22,6 +25,7 @@ import (
 	"github.com/mrchypark/rhiza/pkg/qlog"
 	"github.com/mrchypark/rhiza/pkg/quepaxa"
 	"github.com/mrchypark/rhiza/pkg/recovery"
+	"github.com/ncruces/go-sqlite3/driver"
 )
 
 func (n *Node) localBackupPrefix() string {
@@ -180,6 +184,11 @@ func (n *Node) prepareLocalBackup(ctx context.Context) error {
 		return fmt.Errorf("Local and remote histories diverge or prefix proof is unavailable")
 	}
 	localTip := core.Tip()
+	if archive.Tip() > localTip {
+		if err := n.validateLocalBackupMaterialized(ctx, core); err != nil {
+			return errors.Join(err, wal.Close())
+		}
+	}
 	if err := wal.Close(); err != nil {
 		return err
 	}
@@ -191,6 +200,70 @@ func (n *Node) prepareLocalBackup(ctx context.Context) error {
 		return nil
 	}
 	return atomicLocalFile(n.config.DataDir, marker, bindingData)
+}
+
+// Inspect a copy, including any uncheckpointed SQLite WAL, so even SQLite's
+// read-only sidecar handling cannot change the surviving evidence.
+func (n *Node) validateLocalBackupMaterialized(ctx context.Context, core *quepaxa.Core) error {
+	source := filepath.Join(n.config.DataDir, "sqlite.db")
+	if _, err := os.Lstat(source); errors.Is(err, os.ErrNotExist) {
+		return nil
+	} else if err != nil {
+		return err
+	}
+	dir, err := os.MkdirTemp("", "rhiza-local-materialized-")
+	if err != nil {
+		return err
+	}
+	defer os.RemoveAll(dir)
+	for _, suffix := range []string{"", "-wal"} {
+		input, err := os.Open(source + suffix)
+		if suffix != "" && errors.Is(err, os.ErrNotExist) {
+			continue
+		}
+		if err != nil {
+			return err
+		}
+		output, err := os.OpenFile(filepath.Join(dir, "sqlite.db")+suffix, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0600)
+		if err != nil {
+			return errors.Join(err, input.Close())
+		}
+		_, copyErr := io.Copy(output, input)
+		if err := errors.Join(copyErr, input.Close(), output.Close()); err != nil {
+			return err
+		}
+	}
+	db, err := driver.Open((&url.URL{Scheme: "file", Path: filepath.ToSlash(filepath.Join(dir, "sqlite.db"))}).String() + "?mode=ro")
+	if err != nil {
+		return err
+	}
+	defer db.Close()
+	var slotText, hashText string
+	if err := db.QueryRowContext(ctx, `SELECT (SELECT value FROM _rhiza_meta WHERE key='applied_slot'), (SELECT value FROM _rhiza_meta WHERE key='applied_hash')`).Scan(&slotText, &hashText); err != nil {
+		return fmt.Errorf("inspect original Local materialized evidence: %w", err)
+	}
+	slot, err := strconv.ParseUint(slotText, 10, 64)
+	if err != nil {
+		return fmt.Errorf("invalid original Local materialized slot: %w", err)
+	}
+	hash, err := hex.DecodeString(hashText)
+	if err != nil || len(hash) != sha256.Size {
+		return fmt.Errorf("invalid original Local materialized hash")
+	}
+	if quepaxa.Slot(slot) > core.Tip() {
+		return fmt.Errorf("original Local materialized slot %d is ahead of certified log tip %d; preserve existing data", slot, core.Tip())
+	}
+	if slot > uint64(core.CompactionFloor()) {
+		decision, ok := core.CertifiedValue(quepaxa.Slot(slot))
+		if !ok {
+			return fmt.Errorf("original Local materialized slot %d has no certified decision", slot)
+		}
+		want := sha256.Sum256(decision.Value)
+		if !bytes.Equal(hash, want[:]) {
+			return fmt.Errorf("original Local materialized slot %d hash conflicts with certified decision", slot)
+		}
+	}
+	return nil
 }
 
 func (n *Node) initializeLocalBackup(ctx context.Context) error {

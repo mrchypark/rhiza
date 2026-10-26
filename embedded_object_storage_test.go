@@ -3,11 +3,13 @@ package rhiza_test
 import (
 	"context"
 	"os"
+	"path"
 	"reflect"
 	"testing"
 	"time"
 
 	"github.com/mrchypark/rhiza"
+	"github.com/mrchypark/rhiza/pkg/recovery"
 )
 
 // This exercises only the exported embedded API. The backup lives outside the
@@ -16,6 +18,7 @@ func TestEmbeddedObjectStorageRepeatedTotalLoss(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 	cfg := embeddedStoreConfig(t)
+	cfg.ClusterID = "embedded-repeated-total-loss"
 
 	var db *rhiza.DB
 	t.Cleanup(func() {
@@ -64,13 +67,26 @@ func TestEmbeddedObjectStorageRepeatedTotalLoss(t *testing.T) {
 			t.Fatalf("idempotent retry=%+v original=%+v err=%v", retry, original, err)
 		}
 	}
+	acknowledged := original.Slot
 	for loss := 1; loss <= 2; loss++ {
-		// Freeze the acknowledged remote image before Close can flush anything.
+		// Prove remote durability before Close can flush any missing writes.
+		readOnly := &embeddedReadOnlyBucket{Bucket: embeddedBucket(t, cfg)}
+		archive, err := recovery.OpenLocalArchive(ctx, readOnly, path.Join(cfg.ObjStorePrefix, string(cfg.ClusterID), "local/v1"))
+		if err != nil {
+			t.Fatalf("read acknowledged archive before Close: %v", err)
+		}
+		if uint64(archive.Tip()) < acknowledged {
+			t.Fatalf("remote tip=%d before Close, want acknowledged slot >=%d", archive.Tip(), acknowledged)
+		}
+		if readOnly.mutations != 0 {
+			t.Fatalf("archive validation attempted %d remote mutations", readOnly.mutations)
+		}
+		closeDB()
+		// Capture all keys only after the writer and its gate have drained.
 		published := embeddedRemoteImage(t, cfg)
 		if len(published) == 0 {
 			t.Fatal("acknowledged mutations have no remote backup")
 		}
-		closeDB()
 		embeddedReplaceRemote(t, cfg, published)
 		if err := os.RemoveAll(cfg.DataDir); err != nil {
 			t.Fatal(err)
@@ -84,9 +100,11 @@ func TestEmbeddedObjectStorageRepeatedTotalLoss(t *testing.T) {
 		if loss == 2 {
 			name = "after-second-restore"
 		}
-		if _, err := db.ExecuteReturning(ctx, rhiza.ExecuteRequest{RequestID: name, SQL: "INSERT INTO backup_items(name) VALUES (?) RETURNING id, name", Args: []any{name}}); err != nil {
+		written, err := db.ExecuteReturning(ctx, rhiza.ExecuteRequest{RequestID: name, SQL: "INSERT INTO backup_items(name) VALUES (?) RETURNING id, name", Args: []any{name}})
+		if err != nil {
 			t.Fatalf("write after loss %d: %v", loss, err)
 		}
+		acknowledged = written.Slot
 		check(loss + 1)
 		closeDB()
 		open()
