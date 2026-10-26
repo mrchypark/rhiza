@@ -193,6 +193,52 @@ func TestAuthenticatedInitialRegistrationRequiresCanonicalGenesisAndRunBoundEvid
 	}
 }
 
+func TestInitialRegistrationContinuationRequiresSamePodAndHistoricalWAL(t *testing.T) {
+	f := newSupervisorRegistrationFixture(t, true)
+	prepareInitialRegistrationFixture(t, &f)
+	client := fencing.AuthorityClient{URL: f.server.URL + "/v1/supervisor", TokenFile: f.token, Client: f.server.Client()}
+	if _, err := client.RegisterInitialStartup(t.Context(), f.identity); err != nil {
+		t.Fatal(err)
+	}
+	bound := f.identity
+	bound.WALIdentity = strings.Repeat("a", 64)
+	if _, err := client.Bind(t.Context(), bound); err != nil {
+		t.Fatal(err)
+	}
+	request := f.identity
+	request.RunID = "continued-run"
+	root, _, err := f.state.ReadRoot(t.Context(), "sts-uid", request.SourceClusterID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := validateRegistrationContinuation(&root.Ledger, request, bound.WALIdentity, "sts-uid"); err != nil {
+		t.Fatalf("intact same-Pod WAL rejected: %v", err)
+	}
+	newPod := request
+	newPod.PodUID = "replacement-pod"
+	if err := validateRegistrationContinuation(&root.Ledger, newPod, bound.WALIdentity, "sts-uid"); err == nil {
+		t.Fatal("replacement Pod reused historical WAL claim")
+	}
+	if _, err := client.RegisterStartupContinuation(t.Context(), request, strings.Repeat("b", 64)); err == nil {
+		t.Fatal("different WAL admitted as continuation")
+	}
+	grant, err := client.RegisterStartupContinuation(t.Context(), request, bound.WALIdentity)
+	if err != nil {
+		t.Fatalf("same-Pod continuation: %v", err)
+	}
+	if grant.InitialRegistration != nil || grant.Identity != request {
+		t.Fatal("continuation reissued first-use authority or changed identity")
+	}
+	retry, err := client.RegisterStartupContinuation(t.Context(), request, bound.WALIdentity)
+	if err != nil || hashJSON(retry) != hashJSON(grant) {
+		t.Fatalf("same-Run continuation retry changed grant: %v", err)
+	}
+	request.WALIdentity = bound.WALIdentity
+	if _, err := client.Bind(t.Context(), request); err != nil {
+		t.Fatalf("continuation final Bind: %v", err)
+	}
+}
+
 func TestInitialRegistrationRejectsPresentEmptyIdentityObject(t *testing.T) {
 	f := newSupervisorRegistrationFixture(t, true)
 	_ = prepareInitialRegistrationFixture(t, &f)

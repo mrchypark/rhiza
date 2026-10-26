@@ -1,6 +1,7 @@
 package node
 
 import (
+	"bytes"
 	"context"
 	"encoding/hex"
 	"encoding/json"
@@ -14,7 +15,60 @@ import (
 	"github.com/mrchypark/rhiza/pkg/fencing"
 	"github.com/mrchypark/rhiza/pkg/qlog"
 	"github.com/mrchypark/rhiza/pkg/quepaxa"
+	"github.com/mrchypark/rhiza/pkg/recovery"
 )
+
+func TestRegistrationContinuationPreflightRequiresActualBoundWAL(t *testing.T) {
+	for _, matching := range []bool{true, false} {
+		t.Run(map[bool]string{true: "intact", false: "different-wal"}[matching], func(t *testing.T) {
+			config := voterTestConfig(t)
+			config.EngineOwnedRemovals, config.EnableReconfiguration = true, true
+			config.ObjStoreProvider = string(objmetrics.ProviderFilesystem)
+			config.ObjStoreDir = filepath.Join(t.TempDir(), "archive")
+			bucket, err := objmetrics.NewBucketForSupervisedStartup(t.Context(), objmetrics.Config{Provider: objmetrics.ProviderFilesystem, FilesystemDir: config.ObjStoreDir})
+			if err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(func() { _ = bucket.Close() })
+			genesis, err := json.Marshal(recovery.NewMembershipRecord(string(config.ClusterID), config.Members, string(config.ObjStoreDurability)))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := bucket.Upload(t.Context(), voterMembershipRegistrationKey(config), bytes.NewReader(genesis)); err != nil {
+				t.Fatal(err)
+			}
+			identity := voterIdentityFor(config)
+			identity.Nonce = strings.Repeat("a", 64)
+			wal, err := qlog.Open(filepath.Join(config.DataDir, "qlog"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			value := identity.Nonce
+			if !matching {
+				value = strings.Repeat("b", 64)
+			}
+			nonce, _ := hex.DecodeString(value)
+			if err := wal.BindIdentity(nonce); err != nil {
+				t.Fatal(err)
+			}
+			if err := wal.Close(); err != nil {
+				t.Fatal(err)
+			}
+			if err := writeVoterIdentity(config.DataDir, identity); err != nil {
+				t.Fatal(err)
+			}
+			physical := fencing.Identity{SourceClusterID: string(config.ClusterID), NodeID: string(config.NodeID), PodName: "rhiza-0", PodUID: "same-pod", RunID: "new-run"}
+			result, err := EngineRepairPreflight(config)(t.Context(), physical)
+			if matching {
+				if err != nil || result.RegistrationWALIdentity != identity.Nonce || result.InitialRegistration || result.PendingEngineRepair != nil {
+					t.Fatalf("intact continuation classification: %+v %v", result, err)
+				}
+			} else if err == nil || result.RegistrationWALIdentity != "" {
+				t.Fatal("different WAL accepted from pending local marker")
+			}
+		})
+	}
+}
 
 func TestEngineRepairCandidatePreflightAcceptsFreshSupervisorRun(t *testing.T) {
 	const (

@@ -75,6 +75,26 @@ func EngineRepairPreflight(config *types.ExecutionConfig) fencing.EngineRepairPr
 			if local.identity.Cluster != string(config.ClusterID) || local.identity.Node != string(config.NodeID) || want != voterIdentityFor(config) {
 				return fencing.StartupPreflightResult{}, fmt.Errorf("%w: local voter identity differs from cluster or store configuration", ErrVoterStateLost)
 			}
+			if !local.identity.Registered {
+				wal, err := qlog.OpenReadOnly(filepath.Join(config.DataDir, "qlog"))
+				if err != nil {
+					return fencing.StartupPreflightResult{}, err
+				}
+				bound, present := wal.Identity()
+				closeErr := wal.Close()
+				if closeErr != nil || (present && hex.EncodeToString(bound) != local.identity.Nonce) {
+					return fencing.StartupPreflightResult{}, fmt.Errorf("%w: pending registration WAL binding differs", ErrVoterStateLost)
+				}
+				if present {
+					remote, err := readRemoteVoterState(ctx, config)
+					if err != nil {
+						return fencing.StartupPreflightResult{}, err
+					}
+					if remote.membershipPresent && remote.identity == nil {
+						return fencing.StartupPreflightResult{RegistrationWALIdentity: local.identity.Nonce}, nil
+					}
+				}
+			}
 			return fencing.StartupPreflightResult{}, nil
 		}
 		state, err := readRemoteVoterState(ctx, config)

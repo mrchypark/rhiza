@@ -283,6 +283,45 @@ func validateInitialRegistrationLedger(ledger *fencing.Ledger, identity fencing.
 	return nil
 }
 
+// Continuation uses the caller's intact WAL, never a nonce recovered from authority.
+// Final Bind still checks the historical WAL in its own canonical CAS.
+func validateRegistrationContinuation(ledger *fencing.Ledger, identity fencing.Identity, wal, uid string) error {
+	nonce, err := hex.DecodeString(wal)
+	if err != nil || len(nonce) != 32 || ledger == nil || identity.WALIdentity != "" || identity.AssignmentID != "" ||
+		identity.PodName != identity.NodeID || ledger.SourceClusterID != identity.SourceClusterID ||
+		ledger.ClosedBy != "" || ledger.ClosedHash != "" {
+		return fencing.ErrClosed
+	}
+	if _, closed := ledger.ClosedNodes[identity.NodeID]; closed {
+		return fencing.ErrClosed
+	}
+	for _, pending := range ledger.PendingEngineRepairs {
+		if pending.OldMemberID == identity.NodeID {
+			return fencing.ErrClosed
+		}
+	}
+	for _, ref := range ledger.EngineRepairs {
+		if ref.Binding.OldMemberID == identity.NodeID || ref.CandidateIdentity.PodName == identity.PodName {
+			return fencing.ErrClosed
+		}
+	}
+	found := false
+	for _, run := range ledger.Runs {
+		if run.Identity.NodeID != identity.NodeID || run.Identity.WALIdentity == "" {
+			continue
+		}
+		if run.Identity.WALIdentity != wal || run.Identity.PodUID != identity.PodUID || run.Identity.PodName != identity.PodName ||
+			run.Stop != nil || run.Runtime == nil || run.Runtime.StatefulSetUID != uid || run.Runtime.Validate(run.Identity) != nil {
+			return fencing.ErrClosed
+		}
+		found = true
+	}
+	if !found {
+		return fencing.ErrClosed
+	}
+	return nil
+}
+
 var errInitialRegistrationObjectNotFound = errors.New("fencing: initial registration object not found")
 
 func readInitialRegistrationObject(ctx context.Context, bucket objstore.Bucket, key string) ([]byte, error) {

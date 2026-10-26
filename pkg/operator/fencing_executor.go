@@ -474,6 +474,10 @@ func (e *FencingExecutor) handle(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "unexpected initial registration marker", http.StatusBadRequest)
 		return
 	}
+	if message.RegistrationWALIdentity != "" && (message.Action != "register" || message.InitialRegistration || e.AuthorityState == nil) {
+		http.Error(w, "unexpected registration continuation", http.StatusBadRequest)
+		return
+	}
 	if message.Action == "engine-repair-preflight" {
 		if message.PreflightProposal == nil || message.EngineRepair != nil || message.Drain != nil ||
 			message.Request != nil || message.MutationLookup != nil || message.ArchiveGenesis != nil || message.LearnerIdentity != nil {
@@ -585,7 +589,13 @@ func (e *FencingExecutor) handle(w http.ResponseWriter, r *http.Request) {
 				if err == nil {
 					var required bool
 					required, err = e.initialRegistrationMarkerRequired(r.Context(), uid, message.Identity)
-					if err == nil && required {
+					if err == nil && message.RegistrationWALIdentity != "" {
+						var root fenceLedger
+						root, _, err = e.AuthorityState.ReadRoot(r.Context(), uid, message.Identity.SourceClusterID)
+						if err == nil {
+							err = validateRegistrationContinuation(&root.Ledger, message.Identity, message.RegistrationWALIdentity, uid)
+						}
+					} else if err == nil && required {
 						err = fmt.Errorf("fencing: initial registration authority evidence required")
 					}
 				}
@@ -688,6 +698,11 @@ func (e *FencingExecutor) handle(w http.ResponseWriter, r *http.Request) {
 			changed, err = e.change(r.Context(), uid, message.Identity.SourceClusterID, func(l *fencing.Ledger) error {
 				switch message.Action {
 				case "register":
+					if message.RegistrationWALIdentity != "" {
+						if err := validateRegistrationContinuation(l, message.Identity, message.RegistrationWALIdentity, uid); err != nil {
+							return err
+						}
+					}
 					if e.RequireMutationJournal && !l.RequireMutationJournal {
 						return fmt.Errorf("fencing: authority root does not require mutation journal")
 					}
