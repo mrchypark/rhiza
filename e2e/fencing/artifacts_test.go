@@ -226,6 +226,11 @@ func TestFenceStageProjectionPublishesOnlyBoundedEnumPairs(t *testing.T) {
 		"2026/10/26 02:12:02 fencing stage blocked: stage=runtime-collection class=error",
 		"2026/10/26 02:12:03 fencing stage blocked: stage=not-allowlisted class=error detail=" + canary,
 		"2026/10/26 02:12:04 fencing stage blocked: stage=inventory class=error detail=" + canary,
+		"2026/10/26 02:12:05 fencing stage blocked: stage=cohort-validation class=error",
+		"2026/10/26 02:12:06 fencing stage blocked: stage=cohort-revalidation class=error",
+		"2026/10/26 02:12:07 fencing stage blocked: stage=terminal-receipt-read class=error",
+		"2026/10/26 02:12:08 fencing stage blocked: stage=root-reread class=error",
+		"2026/10/26 02:12:09 fencing stage blocked: stage=inventory-revalidation class=pending",
 	}, "\n") + "\n"
 	digest := sha256.Sum256([]byte(privateLog))
 	raw := t.TempDir()
@@ -262,7 +267,15 @@ func TestFenceStageProjectionPublishesOnlyBoundedEnumPairs(t *testing.T) {
 	if err := json.Unmarshal(projected, &got); err != nil {
 		t.Fatal(err)
 	}
-	want := []fenceStageDiagnostic{{Stage: "root-close", Class: "pending"}, {Stage: "runtime-collection", Class: "error"}}
+	want := []fenceStageDiagnostic{
+		{Stage: "root-close", Class: "pending"},
+		{Stage: "runtime-collection", Class: "error"},
+		{Stage: "cohort-validation", Class: "error"},
+		{Stage: "cohort-revalidation", Class: "error"},
+		{Stage: "terminal-receipt-read", Class: "error"},
+		{Stage: "root-reread", Class: "error"},
+		{Stage: "inventory-revalidation", Class: "pending"},
+	}
 	if got.Status != "captured" || got.Version != 1 || got.Truncated || len(got.Diagnostics) != len(want) {
 		t.Fatalf("stage projection = %+v", got)
 	}

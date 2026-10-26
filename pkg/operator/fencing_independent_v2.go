@@ -134,7 +134,7 @@ func (e *FencingExecutor) independentFence(ctx context.Context, endpoint string,
 		if err == nil {
 			err = ErrFencePending
 		}
-		logFenceStageDiagnostic("terminal-verification", err)
+		logFenceStageDiagnostic("cohort-validation", err)
 		return ErrFencePending
 	}
 	storage, err := e.storageScope(ctx, sts, request.SourceClusterID)
@@ -183,11 +183,12 @@ func (e *FencingExecutor) independentFence(ctx context.Context, endpoint string,
 	}
 	state, err = e.read(ctx, state.StatefulSetUID, state.Ledger.SourceClusterID)
 	if err != nil {
+		logFenceStageDiagnostic("root-reread", err)
 		return err
 	}
 	runs, err = independentClosedRuns(state, request, nodes)
 	if err != nil {
-		logFenceStageDiagnostic("terminal-verification", err)
+		logFenceStageDiagnostic("cohort-revalidation", err)
 		return ErrFencePending
 	}
 	evidence := &IndependentEvidenceV2{Version: 2, RequestHash: hash, LedgerHash: e.ledgerHash(state), StorageScope: storage,
@@ -197,7 +198,7 @@ func (e *FencingExecutor) independentFence(ctx context.Context, endpoint string,
 		verificationID := hashJSON([]any{"compose-independent-terminal", hash, storage, run.Identity.RunID})
 		ref, err := e.readIndependentTerminal(ctx, *run.Runtime, storage, verificationID)
 		if err != nil {
-			logFenceStageDiagnostic("terminal-verification", err)
+			logFenceStageDiagnostic("terminal-receipt-read", err)
 			return err
 		}
 		evidence.Terminals = append(evidence.Terminals, ref)
@@ -206,20 +207,20 @@ func (e *FencingExecutor) independentFence(ctx context.Context, endpoint string,
 	// inventory changes nor a different root snapshot may reuse this proof.
 	rechecked, err := e.read(ctx, state.StatefulSetUID, state.Ledger.SourceClusterID)
 	if err != nil {
-		logFenceStageDiagnostic("terminal-verification", err)
+		logFenceStageDiagnostic("root-reread", err)
 		return err
 	}
 	again, err := e.currentInventory(ctx, request.StatefulSetUID, nodes)
 	if err != nil {
-		logFenceStageDiagnostic("inventory", err)
+		logFenceStageDiagnostic("inventory-revalidation", err)
 		return err
 	}
 	if e.ledgerHash(rechecked) != evidence.LedgerHash {
-		logFenceStageDiagnostic("terminal-verification", ErrFencePending)
+		logFenceStageDiagnostic("cohort-revalidation", ErrFencePending)
 		return ErrFencePending
 	}
 	if !sameStrings(again, current) {
-		logFenceStageDiagnostic("inventory", ErrFencePending)
+		logFenceStageDiagnostic("inventory-revalidation", ErrFencePending)
 		return ErrFencePending
 	}
 	proof := &FenceProof{OperationID: request.OperationID, SourceClusterID: request.SourceClusterID, BindingUID: request.BindingUID,

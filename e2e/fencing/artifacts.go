@@ -635,7 +635,8 @@ type fenceStageDiagnosticsView struct {
 var allowedFenceDiagnosticStages = map[string]bool{
 	"root-close": true, "inventory": true, "producer-settlement": true, "runtime-collection": true,
 	"terminal-retention": true, "terminal-verification": true, "proof-validation": true,
-	"proof-status-write": true, "bootstrap-revalidation": true,
+	"proof-status-write": true, "bootstrap-revalidation": true, "cohort-validation": true,
+	"cohort-revalidation": true, "terminal-receipt-read": true, "root-reread": true, "inventory-revalidation": true,
 }
 
 var allowedFenceDiagnosticClasses = map[string]bool{
