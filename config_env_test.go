@@ -48,6 +48,8 @@ func TestConfigFromEnvRejectsInvalidInput(t *testing.T) {
 	for _, test := range []struct{ key, value string }{
 		{"RHIZA_CLUSTER_MEMBERS", `[{"node_id":"n1","unknown":true}]`},
 		{"RHIZA_CHECKPOINT_INTERVAL", "-1s"},
+		{"RHIZA_CHECKPOINT_RETAIN_COUNT", "-1"},
+		{"RHIZA_CHECKPOINT_RETAIN_COUNT", "invalid"},
 		{"RHIZA_MAX_LONG_POLL_READS", "1"},
 		{"RHIZA_OBJSTORE_INSECURE", "treu"},
 		{"RHIZA_OBJSTORE_BATCH_DELAY", "0s"},
@@ -59,6 +61,24 @@ func TestConfigFromEnvRejectsInvalidInput(t *testing.T) {
 			}
 			if _, err := ConfigFromEnv(); err == nil || !strings.Contains(err.Error(), test.key) {
 				t.Fatalf("error=%v", err)
+			}
+		})
+	}
+}
+
+func TestConfigFromEnvCheckpointRetainCount(t *testing.T) {
+	for _, test := range []struct {
+		value string
+		want  int
+	}{{"", 3}, {"0", 3}, {"1", 1}, {"7", 7}} {
+		t.Run("count="+test.value, func(t *testing.T) {
+			t.Setenv("RHIZA_CHECKPOINT_RETAIN_COUNT", test.value)
+			config, err := ConfigFromEnv()
+			if err != nil {
+				t.Fatal(err)
+			}
+			if config.CheckpointRetainCount != test.want {
+				t.Fatalf("retain count=%d, want %d", config.CheckpointRetainCount, test.want)
 			}
 		})
 	}

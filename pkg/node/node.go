@@ -47,6 +47,13 @@ type Node struct {
 	archive                   *recovery.Manager
 	checkpointer              *checkpoint.AutoCheckpointer
 	localStore                *localCheckpointIdentity
+	localBackup               *recovery.LocalArchive
+	localBackupReady          bool
+	localBackupNeedsSnapshot  bool
+	localGCContext            context.Context
+	localGCCancel             context.CancelFunc
+	localSnapshotMu           sync.Mutex
+	localBackupRestorePins    *localRestorePins
 	localRoot                 *localCheckpointDescriptor
 	localRestoreSuffixPending bool
 	recoveryPhases            nodeRecoveryPhases
@@ -185,13 +192,15 @@ func (n *Node) open(ctx context.Context, enroll bool) (err error) {
 	if n.opened.Load() {
 		return fmt.Errorf("node is already open")
 	}
+	if err := validateLocalGCConfig(n.config); err != nil {
+		return err
+	}
 	if err := n.connectFenceSession(ctx); err != nil {
 		return err
 	}
 	if n.config.Local && (enroll || len(n.config.Members) != 0 || n.config.Learner != nil || n.config.EnableReconfiguration ||
-		n.config.BindAddr != "" || n.config.PeerAddr != "" || n.config.PeerToken != "" || n.config.AdminToken != "" ||
-		n.config.ObjStoreProvider != "" || n.config.ObjStoreEndpoint != "" || n.config.ObjStoreBucket != "" || n.config.ObjStoreDir != "") {
-		return fmt.Errorf("local mode requires standalone local storage without listeners, membership, enrollment, or object storage")
+		n.config.BindAddr != "" || n.config.PeerAddr != "" || n.config.PeerToken != "" || n.config.AdminToken != "") {
+		return fmt.Errorf("local mode requires standalone storage without listeners, membership, or enrollment")
 	}
 	if !n.config.Local {
 		if err := sqlpolicy.CheckExisting(ctx, n.config.DataDir+"/sqlite.db"); err != nil {
@@ -216,6 +225,9 @@ func (n *Node) open(ctx context.Context, enroll bool) (err error) {
 	}
 	if n.config.ObjStoreDurability == "" {
 		n.config.ObjStoreDurability = types.ObjectStoreDurabilityAsync
+		if n.config.Local && (n.config.ObjStoreProvider != "" || n.config.ObjStoreEndpoint != "" || n.config.ObjStoreBucket != "" || n.config.ObjStoreDir != "") {
+			n.config.ObjStoreDurability = types.ObjectStoreDurabilityBeforeAck
+		}
 	}
 	if n.config.ObjStoreDurability != types.ObjectStoreDurabilityAsync && n.config.ObjStoreDurability != types.ObjectStoreDurabilityBeforeAck {
 		return fmt.Errorf("invalid object-store durability %q", n.config.ObjStoreDurability)
@@ -260,6 +272,12 @@ func (n *Node) open(ctx context.Context, enroll bool) (err error) {
 		}
 	}()
 	ctx, n.cancel = context.WithCancel(ctx)
+	defer func() {
+		if pins := n.localBackupRestorePins; pins != nil {
+			err = errors.Join(err, context.Cause(pins.ctx), pins.close())
+			n.localBackupRestorePins = nil
+		}
+	}()
 
 	// 1. Acquire lock file
 	cleanStart, lock, err := qlog.Acquire(n.config.DataDir + "/qlog")
@@ -273,6 +291,15 @@ func (n *Node) open(ctx context.Context, enroll bool) (err error) {
 	}
 	if n.config.Local && localVoter.identity != nil {
 		return fmt.Errorf("%w: registered voter cannot be reopened as standalone Local data", ErrVoterStateLost)
+	}
+	if n.config.Local && objectStoreConfigured {
+		if err := n.prepareLocalBackup(ctx); err != nil {
+			return fmt.Errorf("reconcile Local backup: %w", err)
+		}
+		if pins := n.localBackupRestorePins; pins != nil {
+			stop := context.AfterFunc(pins.ctx, n.cancel)
+			defer stop()
+		}
 	}
 	if !n.config.Local {
 		if _, err := os.Lstat(filepath.Join(n.config.DataDir, "local-store.json")); err == nil {
@@ -375,7 +402,7 @@ func (n *Node) open(ctx context.Context, enroll bool) (err error) {
 			return err
 		}
 	}
-	if objectStoreConfigured {
+	if objectStoreConfigured && !n.config.Local {
 		provider := objectstore.Provider(n.config.ObjStoreProvider)
 		if provider == "" {
 			provider = objectstore.ProviderS3
@@ -431,7 +458,7 @@ func (n *Node) open(ctx context.Context, enroll bool) (err error) {
 			return recovery.ErrArchiveSealed
 		}
 	}
-	if !objectStoreConfigured {
+	if !objectStoreConfigured && !n.config.Local {
 		if err := ensureVoterIdentity(ctx, n.config, nil, n.wal, localVoter, enroll); err != nil {
 			return err
 		}
@@ -545,6 +572,11 @@ func (n *Node) open(ctx context.Context, enroll bool) (err error) {
 	// base authorized by the read-only pass is still selected before installing
 	// the snapshot pair.
 	if localRestoreAuthority != nil {
+		if pins := n.localBackupRestorePins; pins != nil {
+			if err := pins.confirm(); err != nil {
+				return err
+			}
+		}
 		floor, root, ok := core.RecoveryRoot()
 		prefix, prefixOK := core.PrefixHash(quepaxa.Slot(localRestoreAuthority.Index))
 		if !ok || !prefixOK || uint64(floor) != localRestoreAuthority.Index || fmt.Sprintf("%x", root) != localRestoreAuthority.RootHash || fmt.Sprintf("%x", prefix) != localRestoreAuthority.PrefixHash {
@@ -693,6 +725,9 @@ func (n *Node) open(ctx context.Context, enroll bool) (err error) {
 			if err := core.EnsureDurable(slot); err != nil {
 				return err
 			}
+			if n.config.Local {
+				return n.syncLocalBackup(ctx)
+			}
 			if err := n.archive.SyncThrough(ctx, core, slot); err != nil {
 				return err
 			}
@@ -834,6 +869,11 @@ func (n *Node) open(ctx context.Context, enroll bool) (err error) {
 			log.Printf("Local WAL committed-file cleanup deferred: %v", err)
 		}
 	}
+	if n.config.Local && objectStoreConfigured {
+		if err := n.initializeLocalBackup(ctx); err != nil {
+			return fmt.Errorf("initialize Local backup: %w", err)
+		}
+	}
 	if len(cluster.Members) == 1 {
 		n.ready.Store(true)
 	} else {
@@ -842,6 +882,18 @@ func (n *Node) open(ctx context.Context, enroll bool) (err error) {
 			defer n.wg.Done()
 			n.startCatchUp(ctx, n.catchUp, cluster)
 		}()
+	}
+	if n.localBackupReady {
+		if n.localBackupNeedsSnapshot {
+			if err := n.reclaimLocalCheckpoint(ctx); err != nil {
+				return fmt.Errorf("snapshot Local extension: %w", err)
+			}
+			n.localBackupNeedsSnapshot = false
+		}
+		if err := n.completeLocalBackupImport(); err != nil {
+			return fmt.Errorf("finish Local backup import: %w", err)
+		}
+		n.startLocalBackup(ctx)
 	}
 
 	// 8. Start periodic WAL sync
@@ -1157,6 +1209,13 @@ func (n *Node) reclaimLocalCheckpoint(ctx context.Context) (resultErr error) {
 		}
 		resume()
 	}()
+	n.localSnapshotMu.Lock()
+	defer func() {
+		n.localSnapshotMu.Unlock()
+		if resultErr == nil {
+			n.collectLocalBackup(ctx)
+		}
+	}()
 	if err := n.localCheckpointSpacePreflight(); err != nil {
 		return fmt.Errorf("%w: %v", network.ErrLocalMaintenanceRefused, err)
 	}
@@ -1219,6 +1278,9 @@ func (n *Node) reclaimLocalCheckpoint(ctx context.Context) (resultErr error) {
 		if quepaxa.Slot(n.material.Tip()) < appliedThrough {
 			return fmt.Errorf("Local materializer stopped at %d before seal slot %d", n.material.Tip(), appliedThrough)
 		}
+		if err := n.publishLocalBackupCheckpoint(applyCtx, seal, appliedThrough); err != nil {
+			return err
+		}
 		return n.localCheckpointSpacePreflight()
 	})
 	if err != nil {
@@ -1242,7 +1304,7 @@ func (n *Node) reclaimLocalCheckpoint(ctx context.Context) (resultErr error) {
 	return nil
 }
 
-func (n *Node) resumePreparedLocalCheckpoint(ctx context.Context) error {
+func (n *Node) resumePreparedLocalCheckpoint(ctx context.Context) (resultErr error) {
 	index, root, prepared := n.core.LatestPreparedCheckpoint()
 	if !prepared {
 		return nil
@@ -1274,6 +1336,13 @@ func (n *Node) resumePreparedLocalCheckpoint(ctx context.Context) error {
 		return err
 	}
 	defer resume()
+	n.localSnapshotMu.Lock()
+	defer func() {
+		n.localSnapshotMu.Unlock()
+		if resultErr == nil {
+			n.collectLocalBackup(ctx)
+		}
+	}()
 	seal, err := sealFromLocalDescriptor(n.core, descriptor)
 	if err != nil {
 		return err
@@ -1287,7 +1356,7 @@ func (n *Node) resumePreparedLocalCheckpoint(ctx context.Context) error {
 		if quepaxa.Slot(n.material.Tip()) < through {
 			return fmt.Errorf("resumed Local materializer stopped at %d before seal slot %d", n.material.Tip(), through)
 		}
-		return nil
+		return n.publishLocalBackupCheckpoint(applyCtx, seal, through)
 	})
 	if err != nil {
 		return fmt.Errorf("complete prepared Local checkpoint: %w", err)
@@ -1969,6 +2038,13 @@ func (n *Node) shutdownEngine(closeBucket bool) error {
 	n.opened.Store(false)
 	n.ready.Store(false)
 	var shutdownErr error
+	if n.localGCCancel != nil {
+		n.localGCCancel()
+	}
+	// Stop Local maintenance retries before Close waits on the apply lock.
+	if n.config != nil && n.config.Local && n.cancel != nil {
+		n.cancel()
+	}
 	// End admission and join foreground work before choosing the durable tip.
 	// Keep the server reachable until the peer handlers that reference it join.
 	if n.server != nil {
@@ -1983,6 +2059,8 @@ func (n *Node) shutdownEngine(closeBucket bool) error {
 		n.cancel = nil
 	}
 	n.wg.Wait()
+	n.localGCContext = nil
+	n.localGCCancel = nil
 	if n.peer != nil {
 		shutdownErr = errors.Join(shutdownErr, n.peer.Close())
 		n.peer = nil
@@ -2000,6 +2078,13 @@ func (n *Node) shutdownEngine(closeBucket bool) error {
 	if n.core != nil {
 		n.core.StopPeriodicSync()
 	}
+	if n.localBackupReady && n.localBackup != nil && n.core != nil {
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		shutdownErr = errors.Join(shutdownErr, n.syncLocalBackup(shutdownCtx))
+		cancel()
+	}
+	n.localBackupReady = false
+	n.localBackup = nil
 	// Existing certified decisions can be archived without a live quorum.
 	// Creating a new checkpoint here would instead require new consensus and
 	// make simultaneous or last-voter shutdown depend on peers staying alive.

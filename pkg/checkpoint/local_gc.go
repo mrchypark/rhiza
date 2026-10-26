@@ -1,0 +1,247 @@
+package checkpoint
+
+import (
+	"bytes"
+	"context"
+	"crypto/rand"
+	"encoding/hex"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"path"
+	"strconv"
+	"strings"
+	"time"
+
+	"github.com/thanos-io/objstore"
+)
+
+var ErrLocalMaintenanceBusy = errors.New("Local maintenance busy; retry after holder completes")
+
+// LocalRootExists checks the canonical immutable root while the Local gate is held.
+func (m *Manager) LocalRootExists(ctx context.Context, index uint64, hash [32]byte) (bool, error) {
+	return m.bucket.Exists(ctx, m.key(rootName(index, hash)))
+}
+
+// LocalRecoveryActive is called under the Local maintenance gate. Archive GC
+// conservatively keeps every extent while a captured restore view is active.
+func (m *Manager) LocalRecoveryActive(ctx context.Context) (bool, error) {
+	roots, err := m.activeRecoveryRoots(ctx)
+	return len(roots) != 0, err
+}
+
+// WithLocalMaintenanceContext serializes Local writes, pins, and deletion.
+// Cancellation stops RPC admission at acknowledgement boundaries. Ambiguous
+// mutations keep the gate held without automatic takeover; recovery requires
+// verified writer termination and resolution of outstanding storage operations.
+func (m *Manager) WithLocalMaintenanceContext(ctx context.Context, work func(context.Context) error) error {
+	timer := time.NewTimer(5 * time.Second)
+	defer timer.Stop()
+	for {
+		err := m.withLocalMaintenanceContextOnce(ctx, work)
+		if !errors.Is(err, ErrLocalMaintenanceBusy) {
+			return err
+		}
+		retry := time.NewTimer(10 * time.Millisecond)
+		select {
+		case <-ctx.Done():
+			retry.Stop()
+			return ctx.Err()
+		case <-timer.C:
+			retry.Stop()
+			return err
+		case <-retry.C:
+		}
+	}
+}
+
+func (m *Manager) withLocalMaintenanceContextOnce(ctx context.Context, work func(context.Context) error) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	requestCtx := ctx
+	admission := &localOperation{request: context.WithoutCancel(ctx), timeout: localRPCTimeout}
+	ctx = context.WithValue(context.WithoutCancel(ctx), localOperationKey{}, admission)
+	gate := NewManager(LocalBucket(m.bucket), m.prefix, "", m.configID)
+	key := m.key("local-gc-control")
+	data, version, err := gate.readStableLeaseObject(ctx, key, 4096)
+	type control struct {
+		Version uint   `json:"version"`
+		Token   string `json:"token"`
+	}
+	var state control
+	options := []objstore.ObjectUploadOption{objstore.WithIfNotExists()}
+	if err == nil {
+		if err := decodePersistedJSON(data, &state); err != nil {
+			return err
+		}
+		if state.Version != 1 {
+			return fmt.Errorf("invalid Local maintenance control")
+		}
+		if state.Token != "" {
+			return ErrLocalMaintenanceBusy
+		}
+		options = []objstore.ObjectUploadOption{objstore.WithIfMatch(version)}
+	} else if !m.bucket.IsObjNotFoundErr(err) {
+		return err
+	}
+	var token [16]byte
+	if _, err := rand.Read(token[:]); err != nil {
+		return err
+	}
+	state = control{Version: 1, Token: hex.EncodeToString(token[:])}
+	encoded, _ := json.Marshal(state)
+	if err := gate.bucket.Upload(ctx, key, bytes.NewReader(encoded), options...); err != nil {
+		if m.bucket.IsConditionNotMetErr(err) {
+			return ErrLocalMaintenanceBusy
+		}
+		return err
+	}
+	got, heldVersion, err := gate.readStableLeaseObject(ctx, key, 4096)
+	if err != nil {
+		return err
+	}
+	if !bytes.Equal(got, encoded) {
+		return fmt.Errorf("Local maintenance readback mismatch")
+	}
+	var workErr error
+	operation := &localOperation{request: requestCtx, timeout: localRPCTimeout}
+	ctx = context.WithValue(ctx, localOperationKey{}, operation)
+	if requestCtx.Err() == nil {
+		workErr = work(ctx)
+	}
+	if operation.uncertain.Load() {
+		return fmt.Errorf("Local maintenance remains held after uncertain work; verify writer termination and outstanding operations before recovery: %w", workErr)
+	}
+	// The callback must await every storage operation before releasing the gate.
+	releaseCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	free, _ := json.Marshal(control{Version: 1})
+	releaseCtx = context.WithValue(releaseCtx, localOperationKey{}, &localOperation{request: context.Background(), timeout: 5 * time.Second})
+	if err := gate.bucket.Upload(releaseCtx, key, bytes.NewReader(free), objstore.WithIfMatch(heldVersion)); err != nil {
+		return fmt.Errorf("Local maintenance release (work: %v): %w", workErr, err)
+	}
+	if workErr != nil {
+		return workErr
+	}
+	return requestCtx.Err()
+}
+
+// GarbageCollectLocal is called inside WithLocalMaintenanceContext. Only explicitly
+// retired committed roots are deleted; prepared roots remain publication-safe.
+func (m *Manager) GarbageCollectLocal(ctx context.Context, retired, retain map[[32]byte]struct{}, grace time.Duration) error {
+	if _, wrapped := m.bucket.(*localBucket); !wrapped {
+		return NewManager(LocalBucket(m.bucket), m.prefix, m.localDir, m.configID).GarbageCollectLocal(ctx, retired, retain, grace)
+	}
+	if grace < 0 {
+		return fmt.Errorf("invalid Local GC grace")
+	}
+	if err := m.bucket.Iter(ctx, m.key("checkpoint/roots"), func(name string) error {
+		index, hash, ok := parseRootKey(name)
+		if !ok || name != m.key(rootName(index, hash)) {
+			return fmt.Errorf("unknown Local checkpoint root: %s", name)
+		}
+		return nil
+	}, objstore.WithRecursiveIter()); err != nil {
+		return err
+	}
+	pinned, err := m.activeRecoveryRoots(ctx)
+	if err != nil {
+		return err
+	}
+	if err := m.loadAll(ctx); err != nil {
+		return err
+	}
+	m.mu.Lock()
+	roots := append([]Checkpoint(nil), m.checkpoints...)
+	m.mu.Unlock()
+	live := map[string]bool{}
+	var remove []string
+	cutoff := time.Now().Add(-grace)
+	for _, root := range roots {
+		_, obsolete := retired[root.RootHash]
+		_, keep := retain[root.RootHash]
+		_, pin := pinned[root.RootHash]
+		name := m.key(rootName(root.Index, root.RootHash))
+		attrs, err := m.bucket.Attributes(ctx, name)
+		if err != nil {
+			return err
+		}
+		if obsolete && !keep && !pin && !attrs.LastModified.IsZero() && attrs.LastModified.Before(cutoff) {
+			remove = append(remove, name)
+		} else {
+			for _, file := range root.Files {
+				for _, block := range file.Blocks {
+					live[m.key(blockObjectKey(block))] = true
+				}
+			}
+		}
+	}
+	for _, root := range pinned {
+		for _, file := range root.Files {
+			for _, block := range file.Blocks {
+				live[m.key(blockObjectKey(block))] = true
+			}
+		}
+	}
+	// Validate the complete listing before the first destructive operation.
+	var blocks []string
+	if err := m.bucket.Iter(ctx, m.key("checkpoint/blocks"), func(name string) error {
+		hash, ok := parseBlockKey(name)
+		canonical := blockKey(hash)
+		_, generation, suffixed := strings.Cut(strings.TrimSuffix(path.Base(name), ".block"), "_")
+		if suffixed {
+			value, err := strconv.ParseUint(generation, 10, 64)
+			if err != nil {
+				return nil
+			}
+			canonical = blockGenerationKey(hash, value)
+		}
+		if !ok || name != m.key(canonical) || live[name] {
+			return nil
+		}
+		attrs, err := m.bucket.Attributes(ctx, name)
+		if err != nil {
+			return err
+		}
+		if !attrs.LastModified.IsZero() && attrs.LastModified.Before(cutoff) {
+			blocks = append(blocks, name)
+		}
+		return nil
+	}, objstore.WithRecursiveIter()); err != nil {
+		return err
+	}
+	for _, name := range append(remove, blocks...) {
+		if err := m.bucket.Delete(ctx, name); err != nil && !m.bucket.IsObjNotFoundErr(err) {
+			return err
+		}
+	}
+	return nil
+}
+
+// LocalRecoveryPinDeadline validates every identity without extending leases.
+// The caller must compare the returned minimum again after other admission RPCs.
+func LocalRecoveryPinDeadline(ctx context.Context, pins []*RecoveryPin) (time.Time, error) {
+	var earliest time.Time
+	for _, pin := range pins {
+		if pin == nil || pin.manager == nil {
+			return time.Time{}, ErrPublisherFenced
+		}
+		record, err := pin.manager.readRecoveryPin(ctx, pin.key)
+		if err != nil {
+			return time.Time{}, err
+		}
+		expected := pin.record
+		if record.ConfigID != expected.ConfigID || record.OwnerID != expected.OwnerID || record.Token != expected.Token || record.Index != expected.Index || record.RootHash != expected.RootHash {
+			return time.Time{}, ErrPublisherFenced
+		}
+		deadline := time.UnixMilli(record.LeaseUntilMS)
+		if earliest.IsZero() || deadline.Before(earliest) {
+			earliest = deadline
+		}
+	}
+	if !earliest.IsZero() && !earliest.After(time.Now()) {
+		return time.Time{}, ErrPublisherFenced
+	}
+	return earliest, nil
+}

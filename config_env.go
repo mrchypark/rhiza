@@ -39,6 +39,13 @@ func ConfigFromEnv() (Config, error) {
 	if err != nil {
 		return Config{}, err
 	}
+	checkpointRetainCount, err := parseConfigEnvInt("RHIZA_CHECKPOINT_RETAIN_COUNT", "3", func(v int) bool { return v >= 0 })
+	if err != nil {
+		return Config{}, err
+	}
+	if checkpointRetainCount == 0 {
+		checkpointRetainCount = 3
+	}
 	maxWALBytes, err := parseConfigEnvInt64("RHIZA_MAX_WAL_BYTES", "0", func(v int64) bool { return v >= 0 })
 	if err != nil {
 		return Config{}, err
@@ -99,7 +106,7 @@ func ConfigFromEnv() (Config, error) {
 		ObjStoreAzureConnectionString: os.Getenv("RHIZA_OBJSTORE_AZURE_CONNECTION_STRING"), ObjStoreAzureUserAssignedID: os.Getenv("RHIZA_OBJSTORE_AZURE_USER_ASSIGNED_ID"),
 		ObjStoreDurability: ObjectStoreDurability(configEnvOrDefault("RHIZA_OBJSTORE_DURABILITY", "async")), ObjStoreSyncInterval: objStoreSyncInterval,
 		ObjStoreBatchDelay: objStoreBatchDelay, ObjStoreGCInterval: objStoreGCInterval, ObjStoreGCGracePeriod: objStoreGCGracePeriod,
-		CheckpointInterval: checkpointInterval, CheckpointTailBytes: checkpointTailBytes, MaxWALBytes: maxWALBytes,
+		CheckpointInterval: checkpointInterval, CheckpointTailBytes: checkpointTailBytes, CheckpointRetainCount: checkpointRetainCount, MaxWALBytes: maxWALBytes,
 		MaxConcurrentReads: maxConcurrentReads, MaxLongPollReads: maxLongPollReads,
 	}, nil
 }
