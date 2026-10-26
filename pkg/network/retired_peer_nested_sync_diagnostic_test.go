@@ -226,7 +226,7 @@ func TestRetiredPeerNestedSyncDiagnostic(t *testing.T) {
 	// trigger archive work before the real nested-Sync failure occurs.
 	certificateKey := PeerPublicKey(clusterID, "a", tokens["a"])
 	staleServer.SetPeerLearnReady(func() bool { return false })
-	if _, err := peerServers["b"].handle(ctx, certificateKey, request); err != ErrNotReady {
+	if _, err := peerServers["b"].handle(ctx, certificateKey, request); !errors.Is(err, ErrNotReady) {
 		t.Fatalf("unready Learned error=%v, want ErrNotReady", err)
 	}
 	if _, err := peerServers["b"].handle(ctx, nil, request); err == nil || !strings.Contains(err.Error(), "peer authentication failed") {

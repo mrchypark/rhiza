@@ -7,6 +7,8 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -17,6 +19,40 @@ import (
 	"github.com/mrchypark/rhiza/pkg/quepaxa"
 	"github.com/quic-go/quic-go"
 )
+
+func TestPeerCredentialSourceRejectsAmbiguityAndInvalidFallback(t *testing.T) {
+	dir := t.TempDir()
+	script := `#!/bin/sh
+printf '%s' '{"immutable":true,"metadata":{"namespace":"` + namespace + `","uid":"uid"},"data":{"RHIZA_PEER_TOKEN":"dG9rZW4=","RHIZA_PEER_TOKENS":"eyJhIjoidG9rZW4ifQ=="}}'
+`
+	if err := os.WriteFile(filepath.Join(dir, "kubectl"), []byte(script), 0700); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", dir+string(os.PathListSeparator)+os.Getenv("PATH"))
+	secretEnv := func(name string) obj { return obj{"secretRef": obj{"name": name}} }
+	for _, tc := range []struct {
+		name   string
+		app    obj
+		wantOK bool
+	}{
+		{"single", obj{"envFrom": []any{secretEnv("one")}}, true},
+		{"map only", obj{"env": []any{obj{"name": "RHIZA_PEER_TOKENS", "valueFrom": obj{"secretKeyRef": obj{"name": "one", "key": "RHIZA_PEER_TOKENS"}}}}}, true},
+		{"competing", obj{"envFrom": []any{secretEnv("one"), secretEnv("two")}}, false},
+		{"configmap override", obj{"envFrom": []any{secretEnv("one"), obj{"configMapRef": obj{"name": "other"}}}}, false},
+		{"prefixed unrelated", obj{"envFrom": []any{obj{"prefix": "OTHER_", "secretRef": obj{"name": "one"}}}}, false},
+		{"literal must not fall back", obj{"env": []any{obj{"name": "RHIZA_PEER_TOKEN", "value": "literal"}}, "envFrom": []any{secretEnv("one")}}, false},
+		{"malformed must not fall back", obj{"env": []any{obj{"name": "RHIZA_PEER_TOKEN", "valueFrom": obj{"secretKeyRef": obj{"name": "one"}}}}, "envFrom": []any{secretEnv("one")}}, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			tc.app["name"] = "app"
+			pod := obj{"spec": obj{"containers": []any{tc.app}}}
+			_, _, _, err := podPeerToken(context.Background(), pod, "app", "a")
+			if (err == nil) != tc.wantOK {
+				t.Fatalf("accepted=%t, want=%t (error=%v)", err == nil, tc.wantOK, err)
+			}
+		})
+	}
+}
 
 type peerProbeUnavailableTransport struct{}
 

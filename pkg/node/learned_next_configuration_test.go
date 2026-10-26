@@ -2,6 +2,7 @@ package node
 
 import (
 	"context"
+	"crypto/sha256"
 	"encoding/json"
 	"testing"
 	"time"
@@ -58,9 +59,29 @@ func TestLearnNextFreezeWhilePublicReadySnapshotIsPreviousConfiguration(t *testi
 	wrongSlot.Slot++
 	wrongHash := decision
 	wrongHash.Proposal.Hash[0] ^= 1
-	for _, invalid := range []quepaxa.Decision{wrongConfig, wrongSlot, wrongHash} {
+	var control map[string]json.RawMessage
+	if err := json.Unmarshal(value.Value[len("QRCF\x00"):], &control); err != nil {
+		t.Fatal(err)
+	}
+	var prefix [32]byte
+	if err := json.Unmarshal(control["prefix_hash"], &prefix); err != nil {
+		t.Fatal(err)
+	}
+	prefix[0] ^= 1
+	control["prefix_hash"], err = json.Marshal(prefix)
+	if err != nil {
+		t.Fatal(err)
+	}
+	payload, err := json.Marshal(control)
+	if err != nil {
+		t.Fatal(err)
+	}
+	wrongPrefix := decision
+	wrongPrefix.Proposal.Value = append([]byte("QRCF\x00"), payload...)
+	wrongPrefix.Proposal.Hash = quepaxa.ValueHash(sha256.Sum256(wrongPrefix.Proposal.Value))
+	for _, invalid := range []quepaxa.Decision{wrongConfig, wrongSlot, wrongHash, wrongPrefix} {
 		if n.peerLearnDecisionAllowed(invalid) {
-			t.Fatal("next-freeze admission accepted mismatched config, slot, or hash")
+			t.Fatal("next-freeze admission accepted mismatched config, slot, value hash, or prefix")
 		}
 	}
 	n.terminalRequested.Store(true)

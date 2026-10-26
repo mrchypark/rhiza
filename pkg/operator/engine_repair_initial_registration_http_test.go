@@ -193,6 +193,33 @@ func TestAuthenticatedInitialRegistrationRequiresCanonicalGenesisAndRunBoundEvid
 	}
 }
 
+func TestRegistrationContinuationNeverBootstrapsMissingAuthority(t *testing.T) {
+	f := newSupervisorRegistrationFixture(t, true)
+	prepareInitialRegistrationFixture(t, &f)
+	key, identity, err := f.state.rootKey("sts-uid", f.identity.SourceClusterID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, target := range []string{key, f.state.genesisKey(identity)} {
+		if err := f.state.bucket.Delete(t.Context(), target); err != nil {
+			t.Fatal(err)
+		}
+	}
+	client := fencing.AuthorityClient{URL: f.server.URL + "/v1/supervisor", TokenFile: f.token, Client: f.server.Client()}
+	if _, err := client.RegisterStartupContinuation(t.Context(), f.identity, strings.Repeat("a", 64)); err == nil {
+		t.Fatal("continuation admitted without authority history")
+	}
+	for _, target := range []string{key, f.state.genesisKey(identity)} {
+		exists, err := f.state.bucket.Exists(t.Context(), target)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if exists {
+			t.Fatal("rejected continuation recreated canonical authority")
+		}
+	}
+}
+
 func TestInitialRegistrationContinuationRequiresSamePodAndHistoricalWAL(t *testing.T) {
 	f := newSupervisorRegistrationFixture(t, true)
 	prepareInitialRegistrationFixture(t, &f)
