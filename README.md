@@ -53,8 +53,8 @@ while collecting unreachable eligible objects. The integrated provider suite
 passed on S3, GCS, and Azure Floci emulators: each had 18 passes and two expected
 skips. Emulator results do not establish production-cloud parity; the linked
 verification notes identify the skipped tests and remaining gaps.
-Those provider results precede final lease-margin hardening; a final-binary
-three-provider GC rerun is still required.
+After final lease-margin hardening, all six GC tests and two strengthened
+restore tests passed again on each provider, without skips.
 `CheckpointInterval` defaults to 15 minutes and skips new periodic
 checkpoints when state is unchanged. `CheckpointRetainCount` is an `int`; zero
 selects 3 snapshots. `ObjStoreGCInterval` defaults to 1 hour and
@@ -104,7 +104,7 @@ it uses the embedded Go API without a public HTTP server. From this checkout:
 cargo run --manifest-path sdk/rust/Cargo.toml --example embedded
 ```
 
-Use `rhizadb = "0.19.5"` in your Cargo dependencies.
+Use `rhizadb = "0.20.0"` in your Cargo dependencies.
 Native builds support macOS and Linux GNU and require Rust, Go 1.27+, and a C
 compiler. The Rust bridge requires cgo; Go-only applications remain cgo-free.
 Calls are synchronous. By default the embedded engine starts its private peer
