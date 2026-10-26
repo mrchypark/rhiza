@@ -305,10 +305,10 @@ func TestRetiredPeerNestedSyncDiagnostic(t *testing.T) {
 	}
 	for _, field := range []string{
 		// A's decision slot still belongs to the historical configuration. The
-		// request is rejected because B is no longer a voter in A's current
+		// request is rejected because B has been retired from A's current
 		// configuration, not because this read-only Sync uses the old config.
 		"request_config=1", "selected_config=1", "slot=0", "from=2",
-		"lookup_ok=true", "cluster_match=true", "config_match=true", "rejection=cluster_or_config",
+		"lookup_ok=true", "cluster_match=true", "config_match=true", "rejection=retired_sender",
 	} {
 		if !strings.Contains(rejectedSync, field) {
 			t.Fatalf("nested Sync rejection missing %q: %s", field, rejectedSync)

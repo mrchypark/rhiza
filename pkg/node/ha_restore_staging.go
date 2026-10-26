@@ -429,16 +429,37 @@ func hashFromStage(value string) [32]byte {
 	return hash
 }
 
-// validateHAStageOnlyQlog is called after qlog.Acquire and before opening the
-// materializer. Identity/WAL details are checked separately; any other entry
-// means this is not a fresh DataDir that may adopt an init-stage checkpoint.
-func validateHAStageOnlyQlog(dataDir string) error {
+// validateHAStageFreshness permits only the exact pre-WAL Run identity that a
+// same Pod may have persisted before an uncertain authority registration.
+func validateHAStageFreshness(dataDir, clusterID, nodeID, podUID string, logicalAuthority bool, local localVoterState) error {
 	entries, err := os.ReadDir(dataDir)
 	if err != nil {
 		return err
 	}
-	if len(entries) != 1 || entries[0].Name() != "qlog" || !entries[0].IsDir() {
-		return fmt.Errorf("DataDir contains state beyond the fresh qlog directory")
+	if len(entries) == 1 && entries[0].Name() == "qlog" && entries[0].IsDir() {
+		return nil
+	}
+	if len(entries) != 2 || !logicalAuthority || local.identity != nil || local.hadWAL || podUID == "" {
+		return fmt.Errorf("DataDir contains state beyond a fresh qlog directory or exact same-Pod pending Run")
+	}
+	seenQlog, seenRun := false, false
+	for _, entry := range entries {
+		switch entry.Name() {
+		case "qlog":
+			seenQlog = entry.IsDir()
+		case "logical-run.json":
+			seenRun = !entry.IsDir()
+		}
+	}
+	if !seenQlog || !seenRun {
+		return fmt.Errorf("DataDir contains state beyond a fresh qlog directory or exact same-Pod pending Run")
+	}
+	run, err := readLogicalRunState(filepath.Join(dataDir, "logical-run.json"))
+	if err != nil {
+		return fmt.Errorf("validate pending logical Run: %w", err)
+	}
+	if run.ClusterID != clusterID || run.NodeID != nodeID || run.PodUID != podUID {
+		return fmt.Errorf("pending logical Run belongs to a different workload")
 	}
 	return nil
 }

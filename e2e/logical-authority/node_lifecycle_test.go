@@ -3,9 +3,12 @@
 package logicalauthority_test
 
 import (
+	"bytes"
 	"context"
 	"crypto/rand"
+	"crypto/sha256"
 	"encoding/base64"
+	"encoding/hex"
 	"encoding/json"
 	"encoding/pem"
 	"errors"
@@ -18,6 +21,7 @@ import (
 	"path"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -40,6 +44,29 @@ func TestFlociGCSLogicalAuthorityThreeNodeBeforeAckAndSamePodRestart(t *testing.
 	requireFlociEnvironment(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 6*time.Minute)
 	defer cancel()
+	metadata := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet || r.Header.Get("Metadata-Flavor") != "Google" {
+			t.Errorf("unexpected Floci metadata request: %s %s flavor=%q", r.Method, r.URL.Path, r.Header.Get("Metadata-Flavor"))
+			http.Error(w, "unexpected metadata request", http.StatusBadRequest)
+			return
+		}
+		switch r.URL.Path {
+		case "/computeMetadata/v1/project/project-id":
+			_, _ = io.WriteString(w, "floci-local")
+		case "/computeMetadata/v1/instance/service-accounts/default/token":
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = io.WriteString(w, `{"access_token":"floci-reader-token","token_type":"Bearer","expires_in":3600}`)
+		case "/computeMetadata/v1/universe/universe-domain":
+			// The pinned SDK falls back to googleapis.com when this optional
+			// metadata value is absent.
+			http.NotFound(w, r)
+		default:
+			t.Errorf("unexpected Floci metadata endpoint: %s %s", r.Method, r.URL.Path)
+			http.NotFound(w, r)
+		}
+	}))
+	t.Cleanup(metadata.Close)
+	t.Setenv("GCE_METADATA_HOST", strings.TrimPrefix(metadata.URL, "http://"))
 
 	clusterID := fmt.Sprintf("logical-%d", time.Now().UnixNano())
 	var randomSuffix [8]byte
@@ -138,6 +165,12 @@ func TestFlociGCSLogicalAuthorityThreeNodeBeforeAckAndSamePodRestart(t *testing.
 
 	const statefulSetUID, statefulSetName = "logical-authority-sts-uid", "rhiza"
 	rootUID := "logical-authority-root-" + suffix
+	ledgerKey, err := json.Marshal([]string{statefulSetUID, clusterID})
+	if err != nil {
+		t.Fatal("encode legacy-ledger lookup identity")
+	}
+	ledgerDigest := sha256.Sum256(ledgerKey)
+	legacyLedgerPath := "/api/v1/namespaces/default/configmaps/rhiza-fence-ledger-" + hex.EncodeToString(ledgerDigest[:])[:40]
 	statefulSet, template, err := loadLogicalAuthorityStatefulSet(t, rootUID)
 	if err != nil {
 		t.Fatal(err)
@@ -220,6 +253,8 @@ func TestFlociGCSLogicalAuthorityThreeNodeBeforeAckAndSamePodRestart(t *testing.
 				"metadata": map[string]any{"name": statefulSetName, "namespace": "default", "uid": rootUID},
 				"spec":     map[string]any{"statefulSet": statefulSetName, "container": "rhiza", "adoptClusterID": clusterID, "automatic": false},
 			}}})
+		case r.Method == http.MethodGet && r.URL.Path == legacyLedgerPath:
+			http.NotFound(w, r)
 		default:
 			t.Errorf("unexpected fake Kubernetes API request: %s %s", r.Method, r.URL.Path)
 			http.NotFound(w, r)
@@ -233,7 +268,43 @@ func TestFlociGCSLogicalAuthorityThreeNodeBeforeAckAndSamePodRestart(t *testing.
 	executor := &operator.FencingExecutor{Kube: &operator.Kubernetes{BaseURL: api.URL, Namespace: "default", TokenFile: kubeTokenPath, Client: api.Client()},
 		AuthorityState: state, ArchiveBucket: authorityBucket, SourceMutationStorage: sourceClient,
 		RequireMutationJournal: true, AuthorityProfile: fencing.LogicalWriterProfileV1}
-	authority := httptest.NewTLSServer(executor.Handler())
+	stageID := ids[3]
+	droppedRegistrationReply := &atomic.Bool{}
+	authority := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodPost && r.URL.Path == "/v1/supervisor" {
+			body, err := io.ReadAll(r.Body)
+			if err != nil {
+				http.Error(w, "read request", http.StatusBadRequest)
+				return
+			}
+			_ = r.Body.Close()
+			r.Body = io.NopCloser(bytes.NewReader(body))
+			var message fencing.AuthorityMessage
+			if json.Unmarshal(body, &message) == nil && message.Action == "register" && message.Identity.PodUID == podUIDs[stageID] && !droppedRegistrationReply.Load() {
+				recorded := httptest.NewRecorder()
+				executor.Handler().ServeHTTP(recorded, r)
+				var grant fencing.StartupGrant
+				committedGrant := recorded.Code == http.StatusOK && json.Unmarshal(recorded.Body.Bytes(), &grant) == nil &&
+					grant.AuthorityProfile == fencing.LogicalWriterProfileV1 && grant.Role == fencing.StartupRoleVoterActive && grant.Validate(message.Identity) == nil
+				if committedGrant && droppedRegistrationReply.CompareAndSwap(false, true) {
+					// The handler durably committed an exact active grant; deliberately
+					// lose only this successful response to exercise same-Pod retry.
+					w.Header().Set("Content-Type", "application/json")
+					w.WriteHeader(http.StatusOK)
+					return
+				}
+				for name, values := range recorded.Header() {
+					for _, value := range values {
+						w.Header().Add(name, value)
+					}
+				}
+				w.WriteHeader(recorded.Code)
+				_, _ = w.Write(recorded.Body.Bytes())
+				return
+			}
+		}
+		executor.Handler().ServeHTTP(w, r)
+	}))
 	t.Cleanup(authority.Close)
 	caPath := filepath.Join(t.TempDir(), "authority-ca.pem")
 	if err := os.WriteFile(caPath, pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: authority.Certificate().Raw}), 0600); err != nil {
@@ -366,7 +437,6 @@ func TestFlociGCSLogicalAuthorityThreeNodeBeforeAckAndSamePodRestart(t *testing.
 		t.Fatalf("same-Pod continuation readback: rows=%v err=%v", continued.Rows, err)
 	}
 
-	stageID := ids[3]
 	stageConfig := configs[stageID]
 	stageConfig.HAInitRestoreDir = filepath.Join(t.TempDir(), "ha-init-stage")
 	archiveBucket, err := objstore.NewBucket(objstore.Config{Provider: objstore.ProviderGCS, Bucket: bucketName})
@@ -401,14 +471,49 @@ func TestFlociGCSLogicalAuthorityThreeNodeBeforeAckAndSamePodRestart(t *testing.
 	}
 	t.Setenv("POD_UID", podUIDs[stageID])
 	t.Setenv("RHIZA_POD_NAME", stageID)
+	failedAttempt := node.New(stageConfig)
+	if err := failedAttempt.Open(ctx); err == nil {
+		_ = failedAttempt.Shutdown()
+		t.Fatal("first registration unexpectedly received the grant response")
+	}
+	if !droppedRegistrationReply.Load() {
+		t.Fatal("registration response-drop fault did not reach the intended staged Pod")
+	}
+	preWALRunID := readLogicalRunID(t, stageConfig.DataDir)
+	if _, err := os.Lstat(filepath.Join(stageConfig.DataDir, "qlog", "voter-identity.json")); !os.IsNotExist(err) {
+		t.Fatalf("failed pre-WAL registration unexpectedly created voter identity: %v", err)
+	}
 	stagedNode := node.New(stageConfig)
 	if err := stagedNode.Open(ctx); err != nil {
 		_ = restoreFlociCheckpointBlocks(ctx, setupClient, bucketName, blocks)
 		t.Fatalf("first-use logical Node.Open from staged checkpoint bytes: %v", err)
 	}
+	if got := readLogicalRunID(t, stageConfig.DataDir); got != preWALRunID {
+		_ = stagedNode.Shutdown()
+		t.Fatalf("same-Pod retry changed pre-WAL RunID: before=%q after=%q", preWALRunID, got)
+	}
 	if err := restoreFlociCheckpointBlocks(ctx, setupClient, bucketName, blocks); err != nil {
 		_ = stagedNode.Shutdown()
 		t.Fatalf("restore checkpoint payloads after adoption oracle: %v", err)
+	}
+	authorityRoot, _, err := state.ReadRoot(ctx, statefulSetUID, clusterID)
+	if err != nil {
+		_ = stagedNode.Shutdown()
+		t.Fatalf("read canonical logical authority root after pre-WAL retry: %v", err)
+	}
+	stageRuns := 0
+	for _, run := range authorityRoot.Ledger.Runs {
+		if run.Identity.PodUID == podUIDs[stageID] && run.Identity.NodeID == stageID && run.Identity.RunID == preWALRunID {
+			stageRuns++
+			if run.MutationProducerUID == "" {
+				_ = stagedNode.Shutdown()
+				t.Fatal("successful retry did not retain its canonical logical producer")
+			}
+		}
+	}
+	if stageRuns != 1 {
+		_ = stagedNode.Shutdown()
+		t.Fatalf("same-Pod retry registered %d matching canonical Runs, want exactly one", stageRuns)
 	}
 	for !stagedNode.Ready() {
 		select {

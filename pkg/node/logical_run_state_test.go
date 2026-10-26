@@ -26,6 +26,71 @@ func TestLogicalRunStatePersistsSamePodIdentityAndRejectsNewPodReuse(t *testing.
 	}
 }
 
+func TestHAStageFreshnessAllowsOnlyExactPreWALSamePodRun(t *testing.T) {
+	config := &types.ExecutionConfig{ClusterID: "cluster", NodeID: "node-a", DataDir: t.TempDir()}
+	if err := os.Mkdir(filepath.Join(config.DataDir, "qlog"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	run, continuation, err := loadOrCreateLogicalRunState(config, "pod-uid-a", localVoterState{})
+	if err != nil || continuation {
+		t.Fatalf("create pending Run: state=%+v continuation=%t err=%v", run, continuation, err)
+	}
+	if err := validateHAStageFreshness(config.DataDir, "cluster", "node-a", "pod-uid-a", false, localVoterState{}); err == nil {
+		t.Fatal("pending logical Run was accepted without logical-authority mode")
+	}
+	if err := validateHAStageFreshness(config.DataDir, "cluster", "node-a", "pod-uid-a", true, localVoterState{}); err != nil {
+		t.Fatalf("exact same-Pod no-WAL pending Run was rejected: %v", err)
+	}
+	got, err := readLogicalRunState(filepath.Join(config.DataDir, "logical-run.json"))
+	if err != nil || got != run {
+		t.Fatalf("freshness validation changed or lost RunID: got=%+v want=%+v err=%v", got, run, err)
+	}
+	if err := validateHAStageFreshness(config.DataDir, "cluster", "node-a", "pod-uid-b", true, localVoterState{}); err == nil {
+		t.Fatal("another PodUID inherited the pending Run")
+	}
+	if err := validateHAStageFreshness(config.DataDir, "cluster", "node-a", "pod-uid-a", true, localVoterState{hadWAL: true}); err == nil {
+		t.Fatal("pending Run was accepted despite an existing WAL")
+	}
+	if err := validateHAStageFreshness(config.DataDir, "foreign-cluster", "node-a", "pod-uid-a", true, localVoterState{}); err == nil {
+		t.Fatal("pending Run from a different source cluster was accepted")
+	}
+}
+
+func TestHAStageFreshnessRejectsMalformedOrForeignPreWALFiles(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		mutate func(*testing.T, string)
+	}{
+		{name: "malformed run", mutate: func(t *testing.T, dir string) {
+			if err := os.WriteFile(filepath.Join(dir, "logical-run.json"), []byte("{}\n"), 0o600); err != nil {
+				t.Fatal(err)
+			}
+		}},
+		{name: "foreign file", mutate: func(t *testing.T, dir string) {
+			if err := os.WriteFile(filepath.Join(dir, "foreign.json"), []byte("{}\n"), 0o600); err != nil {
+				t.Fatal(err)
+			}
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			dir := t.TempDir()
+			if err := os.Mkdir(filepath.Join(dir, "qlog"), 0o700); err != nil {
+				t.Fatal(err)
+			}
+			if tc.name == "foreign file" {
+				config := &types.ExecutionConfig{ClusterID: "cluster", NodeID: "node-a", DataDir: dir}
+				if _, _, err := loadOrCreateLogicalRunState(config, "pod-uid-a", localVoterState{}); err != nil {
+					t.Fatal(err)
+				}
+			}
+			tc.mutate(t, dir)
+			if err := validateHAStageFreshness(dir, "cluster", "node-a", "pod-uid-a", true, localVoterState{}); err == nil {
+				t.Fatal("invalid pre-WAL DataDir state was accepted")
+			}
+		})
+	}
+}
+
 func TestLogicalRunStatePersistsAuthorityAssignmentForSamePodContinuation(t *testing.T) {
 	config := &types.ExecutionConfig{ClusterID: "cluster", NodeID: "physical", DataDir: t.TempDir()}
 	state, _, err := loadOrCreateLogicalRunState(config, "pod-uid", localVoterState{})

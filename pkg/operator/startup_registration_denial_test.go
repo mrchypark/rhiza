@@ -401,11 +401,13 @@ func TestConcurrentClosedRegistrationCASRetriesEmitOneEventPerIdentity(t *testin
 		err error
 	}
 	results := make(chan result, 2)
-	client := fencing.AuthorityClient{URL: f.server.URL + "/v1/supervisor", TokenFile: f.token, Client: f.server.Client()}
 	for _, run := range []string{"run-left", "run-right"} {
 		identity := f.identity
 		identity.RunID = run
 		go func(identity fencing.Identity) {
+			// AuthorityClient carries mutable per-registration grant state; keep
+			// each concurrent request on its own client while racing server CAS.
+			client := fencing.AuthorityClient{URL: f.server.URL + "/v1/supervisor", TokenFile: f.token, Client: f.server.Client()}
 			_, err := client.RegisterStartup(ctx, identity)
 			results <- result{run: identity.RunID, err: err}
 		}(identity)

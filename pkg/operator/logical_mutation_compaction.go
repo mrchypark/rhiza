@@ -492,7 +492,7 @@ func (e *FencingExecutor) reconcileArchivedStagesForAuthority(ctx context.Contex
 			return err
 		}
 		if entry.Intent.Kind == "upload" && strings.HasPrefix(entry.Intent.PayloadRef, "payload-") {
-			if err := e.retireArchivedSourceStageForAuthority(ctx, authority, producerUID, sequence, entry.Intent, archiveRef); err != nil {
+			if err := e.retireArchivedSourceStageForAuthority(ctx, authority, producerUID, sequence, entry, archiveRef); err != nil {
 				return err
 			}
 		}
@@ -539,27 +539,23 @@ func (e *FencingExecutor) archivedMutationAtForAuthority(ctx context.Context, au
 }
 
 func (e *FencingExecutor) retireArchivedSourceStageForAuthority(ctx context.Context, authority mutationExecutionAuthority,
-	producerUID string, sequence uint64, intent fencing.MutationIntent, archiveRef fencing.MutationArchiveReference) error {
+	producerUID string, sequence uint64, entry fencing.MutationEntry, archiveRef fencing.MutationArchiveReference) error {
+	intent := entry.Intent
 	if authority.runtime != nil {
 		return e.retireArchivedSourceStage(ctx, *authority.runtime, producerUID, sequence, intent, archiveRef)
 	}
-	if authority.logicalBinding == nil || !archiveRef.Valid() || intent.Kind != "upload" || !strings.HasPrefix(intent.PayloadRef, "payload-") {
+	if authority.logicalBinding == nil || !archiveRef.Valid() || intent.OperationID != fencing.MutationRequestID(producerUID, sequence) ||
+		intent.Kind != "upload" || !strings.HasPrefix(intent.PayloadRef, "payload-") {
 		return fmt.Errorf("fencing: logical archived source-stage retirement proof is incomplete")
 	}
-	entry, err := e.lookupArchivedMutationForAuthority(ctx, authority, producerUID, sequence, intent)
-	if err != nil {
-		return err
-	}
-	if entry.Intent != intent {
-		return fmt.Errorf("fencing: logical archived source-stage intent differs")
-	}
-	verificationID := hashJSON([]any{"lookup-archived-mutation", producerUID, sequence, intent})
+	verificationID := hashJSON([]any{"lookup-archived-sequence", producerUID, sequence})
 	producer, actualUID, _, err := e.readMutationProducerForAuthority(ctx, authority)
 	if err != nil {
 		return err
 	}
 	if actualUID != producerUID || producer.ArchiveScan == nil || producer.ArchiveScan.VerificationID != verificationID ||
-		producer.ArchiveScan.Sequence != sequence || producer.ArchiveScan.ResultArchive == nil || *producer.ArchiveScan.ResultArchive != archiveRef {
+		producer.ArchiveScan.Sequence != sequence || !producer.ArchiveScan.Found || producer.ArchiveScan.ResultArchive == nil ||
+		*producer.ArchiveScan.ResultArchive != archiveRef {
 		return ErrFencePending
 	}
 	stages, err := e.sourceStagesForRoot(ctx, authority.statefulSetUID, authority.sourceClusterID)
@@ -588,14 +584,22 @@ func (e *FencingExecutor) retireArchivedSourceStageForAuthority(ctx context.Cont
 		}
 		if err == nil {
 			verified, verifyErr := verifiedStageTemp(payload, want.Digest, want.Size)
+			var verifiedTemp *removeOnClose
+			if verified != nil {
+				verifiedTemp = &removeOnClose{verified}
+				defer func() { _ = verifiedTemp.Close() }()
+			}
 			closeErr := payload.Close()
 			if verifyErr != nil || closeErr != nil || payloadVersion == nil || payloadVersion.Type != objstore.Generation {
-				if verified != nil {
-					_ = verified.Close()
-				}
 				return errors.Join(verifyErr, closeErr, fmt.Errorf("fencing: logical archived payload failed exact-version verification"))
 			}
-			_ = verified.Close()
+			if verifiedTemp != nil {
+				if err := verifiedTemp.Close(); err != nil {
+					verifiedTemp = nil
+					return err
+				}
+				verifiedTemp = nil
+			}
 			if err := stages.evidence.DeleteVersion(ctx, payloadKey, *payloadVersion); err != nil {
 				return err
 			}
