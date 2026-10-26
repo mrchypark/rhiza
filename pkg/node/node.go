@@ -2259,6 +2259,9 @@ func (n *Node) peerLearnDecisionAllowed(decision quepaxa.Decision) bool {
 	if n.core.AllowsInstalledTerminalLearn(decision) {
 		return true
 	}
+	if n.config.EnableReconfiguration && n.ready.Load() && n.core.AllowsNextReconfigurationFreeze(decision) {
+		return true
+	}
 	return n.config.EnableReconfiguration && n.core.AllowsPendingReconfigurationLearn(decision)
 }
 
