@@ -6,6 +6,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/mrchypark/rhiza/internal/localtesthooks"
 	"github.com/mrchypark/rhiza/pkg/network/peerfb"
 	"github.com/mrchypark/rhiza/pkg/qlog"
 	"github.com/mrchypark/rhiza/pkg/quepaxa"
@@ -75,12 +76,34 @@ func TestStaleConfigSyncRequiresUnchangedCurrentVoterIdentity(t *testing.T) {
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			req := request(tc.operation, tc.sender)
+			rejected := make(chan string, 1)
+			restoreHook := installRetiredPeerTestHook(func(event string) {
+				if strings.HasPrefix(event, "network:peer-request-rejected:") {
+					select {
+					case rejected <- event:
+					default:
+					}
+				}
+			})
 			response, err := peer.handle(ctx, PeerPublicKey(cluster, quepaxa.NodeID(tc.sender), tc.token), req)
+			restoreHook()
 			if tc.wantErr == "" && err != nil || tc.wantErr != "" && (err == nil || !strings.Contains(err.Error(), tc.wantErr)) {
 				t.Fatalf("error=%v, want %q", err, tc.wantErr)
 			}
 			if tc.wantErr == "" && (response == nil || response.ConfigId != req.ConfigId) {
 				t.Fatalf("response=%+v, want requested historical config %d", response, req.ConfigId)
+			}
+			if localtesthooks.Enabled && tc.name == "retired voter C cannot use admin token for stale sync" {
+				select {
+				case event := <-rejected:
+					for _, field := range []string{"request_config=1", "selected_config=1", "lookup_ok=true", "cluster_match=true", "config_match=true", "rejection=retired_sender"} {
+						if !strings.Contains(event, field) {
+							t.Fatalf("retired Sync diagnostic missing %q: %s", field, event)
+						}
+					}
+				default:
+					t.Fatal("retired Sync rejection diagnostic was not observed")
+				}
 			}
 		})
 	}

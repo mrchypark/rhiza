@@ -425,7 +425,16 @@ func (s *PeerServer) handle(ctx context.Context, certificateKey ed25519.PublicKe
 	// this voter and never changes local consensus state.
 	// A stale Sync is useful only to a voter still present in both configurations.
 	if staleSync && !voter {
-		observeRejectedPeerRequest(request, config, nil, clusterMatch, configMatch, "cluster_or_config")
+		rejection := "sender_not_member"
+		switch {
+		case historicalOK && activeOK:
+			rejection = "voter_identity_mismatch"
+		case historicalOK:
+			rejection = "retired_sender"
+		case activeOK:
+			rejection = "sender_not_historical_voter"
+		}
+		observeRejectedPeerRequest(request, config, nil, clusterMatch, configMatch, rejection)
 		return nil, fmt.Errorf("cluster identity mismatch")
 	}
 	if !voter && !(admin && (request.Operation == peerfb.OperationSync || request.Operation == peerfb.OperationEngineRemovalFreeze)) {

@@ -358,11 +358,9 @@ func (n *Node) open(ctx context.Context, enroll bool) (err error) {
 	}
 	haStageEligible := cleanStart && localVoter.identity == nil && !localVoter.hadWAL
 	if haStageEligible && n.config.HAInitRestoreDir != "" {
-		// Check freshness before logical registration writes logical-run.json
-		// and the source retry journal into DataDir. Those exact startup-owned
-		// files do not make a pristine staged restore stale, but pre-existing
-		// non-qlog state must still fail closed.
-		if err := validateHAStageOnlyQlog(n.config.DataDir); err != nil {
+		// Permit only a strictly parsed same-Pod pending Run left by an uncertain
+		// pre-WAL registration; all other pre-existing DataDir state remains stale.
+		if err := validateHAStageFreshness(n.config.DataDir, string(n.config.ClusterID), string(n.config.NodeID), os.Getenv("POD_UID"), directAuthority, localVoter); err != nil {
 			return fmt.Errorf("HA init restore requires a fresh DataDir: %w", err)
 		}
 	}
