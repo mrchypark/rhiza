@@ -1169,8 +1169,12 @@ func (c *Core) recordQuorum(ctx context.Context, requests map[NodeID]RecordReque
 		if !ok {
 			return nil, ErrQuorumUnavailable
 		}
-		summary, err := c.recordLocalOwned(ctx, request)
+		// Finish the owned receipt before observing request cancellation.
+		summary, err := c.recordLocalOwned(context.WithoutCancel(ctx), request)
 		if err != nil {
+			return nil, fmt.Errorf("%w: %w", ErrQuorumUnavailable, err)
+		}
+		if err := ctx.Err(); err != nil {
 			return nil, fmt.Errorf("%w: %w", ErrQuorumUnavailable, err)
 		}
 		return []Summary{summary}, nil
