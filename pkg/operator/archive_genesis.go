@@ -78,6 +78,203 @@ func (e *FencingExecutor) claimArchiveScopeForRegistration(ctx context.Context, 
 	return fmt.Errorf("fencing: archive genesis root claim changed too often")
 }
 
+func (e *FencingExecutor) logicalArchiveScope(ctx context.Context, uid string, binding fencing.LogicalWriterBindingV1) (fencing.ArchiveScope, string, error) {
+	storeScope, err := e.sourceMutationStorageScopeForRoot(ctx, uid, binding.SourceClusterID)
+	if err != nil {
+		return fencing.ArchiveScope{}, "", err
+	}
+	scope := fencing.ArchiveScope{Provider: storeScope.Provider, Bucket: storeScope.Bucket, Prefix: storeScope.Prefix, ClusterID: binding.SourceClusterID}
+	hash, err := scope.Hash()
+	return scope, hash, err
+}
+
+func (e *FencingExecutor) claimLogicalArchiveScopeForRegistration(ctx context.Context, uid string, id fencing.Identity, binding fencing.LogicalWriterBindingV1) error {
+	if e == nil || e.AuthorityState == nil || !e.RequireMutationJournal || e.AuthorityProfile != fencing.LogicalWriterProfileV1 ||
+		uid == "" || id.WALIdentity != "" || binding.Validate() != nil || binding.WALIdentity != "" ||
+		binding.Role != fencing.StartupRoleVoterActive || id.SourceClusterID != binding.SourceClusterID || id.NodeID != binding.NodeID || id.RunID != binding.RunID {
+		return fmt.Errorf("fencing: logical archive genesis registration is not configured")
+	}
+	scope, scopeHash, err := e.logicalArchiveScope(ctx, uid, binding)
+	if err != nil {
+		return err
+	}
+	registration := hashJSON([]any{"rhiza-logical-archive-registration-v1", uid, id, binding})
+	claim, err := e.AuthorityState.ClaimArchiveScope(ctx, scope, recovery.ArchiveConfigID, uid, id.SourceClusterID, registration)
+	if err != nil {
+		return err
+	}
+	for range 8 {
+		root, version, err := e.AuthorityState.ReadRoot(ctx, uid, id.SourceClusterID)
+		if err != nil {
+			return err
+		}
+		if root.Ledger.Profile != fencing.LogicalWriterProfileV1 || !root.Ledger.RequireMutationJournal || root.Ledger.ClosedBy != "" {
+			return fmt.Errorf("fencing: logical archive genesis root is closed or has a different profile")
+		}
+		if root.Ledger.ArchiveScopeHash == claim.ScopeHash {
+			switch root.Ledger.ArchiveGenesisState {
+			case fencing.ArchiveGenesisAwaitingRef:
+				if root.Ledger.ArchiveGenesisRef == nil && claim.GenesisRef == nil {
+					return nil
+				}
+			case fencing.ArchiveGenesisCommitted:
+				if sameArchiveGenesisRef(root.Ledger.ArchiveGenesisRef, claim.GenesisRef) && claim.GenesisRef != nil {
+					return nil
+				}
+			}
+		}
+		if root.Ledger.ArchiveGenesisState != "" || root.Ledger.ArchiveScopeHash != "" || root.Ledger.ArchiveGenesisRef != nil || claim.ScopeHash != scopeHash {
+			return fmt.Errorf("fencing: logical archive genesis scope claim differs")
+		}
+		root.Ledger.ArchiveGenesisState = fencing.ArchiveGenesisAwaitingRef
+		root.Ledger.ArchiveScopeHash = claim.ScopeHash
+		if err := e.AuthorityState.WriteRoot(ctx, uid, id.SourceClusterID, root, version); err == nil {
+			return nil
+		} else if !errors.Is(err, errAuthorityStateConflict) {
+			confirmed, _, readErr := e.AuthorityState.ReadRoot(ctx, uid, id.SourceClusterID)
+			if readErr == nil && confirmed.Ledger.ArchiveGenesisState == fencing.ArchiveGenesisAwaitingRef && confirmed.Ledger.ArchiveScopeHash == scopeHash {
+				return nil
+			}
+			return errors.Join(err, readErr)
+		}
+	}
+	return fencing.ErrUnavailable
+}
+
+func (e *FencingExecutor) validateLogicalArchiveGenesisMutation(ctx context.Context, uid string, binding fencing.LogicalWriterBindingV1,
+	producerUID string, sequence uint64, intent fencing.MutationIntent) error {
+	if !isArchiveGenesisMutation(intent) {
+		return nil
+	}
+	scope, scopeHash, err := e.logicalArchiveScope(ctx, uid, binding)
+	if err != nil || binding.StoreScopeHash != intent.StoreScopeHash || binding.StoreScopeHash == "" {
+		return errors.Join(err, fmt.Errorf("fencing: logical archive genesis mutation scope differs"))
+	}
+	claim, _, err := e.AuthorityState.ReadArchiveScopeClaim(ctx, scope)
+	if err != nil || claim.ConfigID != recovery.ArchiveConfigID || claim.ScopeHash != scopeHash || claim.OwnerStatefulSetUID != uid || claim.OwnerSourceClusterID != binding.SourceClusterID {
+		return errors.Join(err, fmt.Errorf("fencing: logical archive genesis claim differs from the authenticated root"))
+	}
+	root, err := e.read(ctx, uid, binding.SourceClusterID)
+	if err != nil || root.Ledger.Profile != fencing.LogicalWriterProfileV1 || root.Ledger.ArchiveGenesisState != fencing.ArchiveGenesisAwaitingRef || root.Ledger.ArchiveScopeHash != scopeHash {
+		return errors.Join(err, fmt.Errorf("fencing: logical archive genesis root is not awaiting its first reference"))
+	}
+	if claim.EmptyRecoveryAuthorization != nil || root.Ledger.EmptyRecoveryAuthorization != nil {
+		return fmt.Errorf("fencing: logical empty-recovery archive genesis is not configured")
+	}
+	if claim.GenesisRef != nil || root.Ledger.ArchiveGenesisRef != nil {
+		if claim.GenesisRef == nil || root.Ledger.ArchiveGenesisRef == nil || !sameArchiveGenesisRef(claim.GenesisRef, root.Ledger.ArchiveGenesisRef) ||
+			claim.GenesisRef.Mutation == nil || claim.GenesisRef.Mutation.ProducerUID != producerUID || claim.GenesisRef.Mutation.Sequence != sequence || claim.GenesisRef.Mutation.Intent != intent {
+			return errArchiveGenesisClaimed
+		}
+		return nil
+	}
+	if intent.PayloadSize <= 0 || intent.PayloadSize > 64<<10 {
+		return fmt.Errorf("fencing: logical archive genesis HEAD exceeds the bounded payload size")
+	}
+	stages, err := e.sourceStagesForRoot(ctx, uid, binding.SourceClusterID)
+	if err != nil {
+		return err
+	}
+	reader, err := stages.openMutationPayloadContext(ctx, producerUID, intent)
+	if err != nil {
+		return err
+	}
+	data, readErr := io.ReadAll(io.LimitReader(reader, (64<<10)+1))
+	closeErr := reader.Close()
+	if err := errors.Join(readErr, closeErr); err != nil {
+		return err
+	}
+	if int64(len(data)) != intent.PayloadSize || recovery.ValidateEmptyArchiveHead(data, recovery.ArchiveConfigID) != nil {
+		return fmt.Errorf("fencing: logical archive genesis payload is not the registered empty HEAD")
+	}
+	if err := e.ensureArchiveScopeHasNoGenesisEvidence(ctx, scope); err != nil {
+		return err
+	}
+	return nil
+}
+
+func (e *FencingExecutor) prepareLogicalArchiveGenesisMutation(ctx context.Context, uid string, id fencing.Identity, binding fencing.LogicalWriterBindingV1,
+	producerUID string, sequence uint64, intent fencing.MutationIntent) error {
+	if !isArchiveGenesisMutation(intent) {
+		return nil
+	}
+	scope, scopeHash, err := e.logicalArchiveScope(ctx, uid, binding)
+	if err != nil {
+		return err
+	}
+	claim, _, err := e.AuthorityState.ReadArchiveScopeClaim(ctx, scope)
+	if err != nil {
+		return err
+	}
+	if claim.GenesisRef != nil {
+		if claim.GenesisRef.Mutation == nil || claim.GenesisRef.Mutation.ProducerUID != producerUID || claim.GenesisRef.Mutation.Sequence != sequence || claim.GenesisRef.Mutation.Intent != intent {
+			return errArchiveGenesisClaimed
+		}
+		return e.setRootArchiveGenesisRef(ctx, uid, id.SourceClusterID, *claim.GenesisRef)
+	}
+	if err := e.validateLogicalArchiveGenesisMutation(ctx, uid, binding, producerUID, sequence, intent); err != nil {
+		return err
+	}
+	root, err := e.read(ctx, uid, id.SourceClusterID)
+	if err != nil {
+		return err
+	}
+	if !authorityMatchesLogicalRun(root, id, binding) {
+		return fencing.ErrClosed
+	}
+	producer, actualUID, _, err := e.AuthorityState.ReadLogicalProducer(ctx, uid, binding)
+	if err != nil || actualUID != producerUID || producer.WALIdentity != id.WALIdentity || producer.Phase != fencing.MutationOpen || sequence != producer.LastAdmitted+1 {
+		return errors.Join(err, fencing.ErrClosed)
+	}
+	ref := fencing.ArchiveGenesisRef{Version: fencing.ArchiveGenesisVersion, ConfigID: recovery.ArchiveConfigID, ScopeHash: scopeHash,
+		Mutation: &fencing.ArchiveGenesisMutation{ProducerUID: producerUID, Sequence: sequence, Intent: intent}}
+	return e.commitArchiveGenesisRef(ctx, uid, id.SourceClusterID, scope, ref)
+}
+
+func authorityMatchesLogicalRun(root fenceLedger, id fencing.Identity, binding fencing.LogicalWriterBindingV1) bool {
+	run, ok := root.Ledger.Runs[id.RunID]
+	return ok && root.Ledger.Profile == fencing.LogicalWriterProfileV1 && run.Identity == id && run.Runtime == nil && run.LogicalBinding != nil && *run.LogicalBinding == binding
+}
+
+func (e *FencingExecutor) requireLogicalArchiveGenesisCommitted(ctx context.Context, uid string, id fencing.Identity, run fencing.Run, intent fencing.MutationIntent) error {
+	if isArchiveGenesisMutation(intent) {
+		return nil
+	}
+	scope, scopeHash, err := e.logicalArchiveScope(ctx, uid, *run.LogicalBinding)
+	if err != nil {
+		return err
+	}
+	claim, _, err := e.AuthorityState.ReadArchiveScopeClaim(ctx, scope)
+	if err != nil || claim.ScopeHash != scopeHash || claim.GenesisRef == nil {
+		return errors.Join(err, fencing.ErrPending)
+	}
+	root, err := e.read(ctx, uid, id.SourceClusterID)
+	if err != nil || root.Ledger.ArchiveGenesisRef == nil || !sameArchiveGenesisRef(root.Ledger.ArchiveGenesisRef, claim.GenesisRef) {
+		return errors.Join(err, fencing.ErrPending)
+	}
+	if claim.GenesisRef.Mutation != nil {
+		mutation := claim.GenesisRef.Mutation
+		var owner fencing.Run
+		for _, candidate := range root.Ledger.Runs {
+			if candidate.MutationProducerUID == mutation.ProducerUID && candidate.LogicalBinding != nil && candidate.Runtime == nil {
+				if owner.Identity.RunID != "" {
+					return fencing.ErrPending
+				}
+				owner = candidate
+			}
+		}
+		if owner.Identity.RunID == "" || owner.MutationScopeHash != mutation.Intent.StoreScopeHash {
+			return fencing.ErrPending
+		}
+		authority := mutationExecutionAuthority{statefulSetUID: uid, sourceClusterID: id.SourceClusterID, runID: owner.Identity.RunID, logicalBinding: owner.LogicalBinding}
+		lookup, err := e.lookupMutationForAuthority(ctx, authority, owner, fencing.MutationLookupRequest{ProducerUID: mutation.ProducerUID, Sequence: mutation.Sequence, Intent: mutation.Intent})
+		if err != nil || !lookup.Found || lookup.Entry == nil || lookup.Entry.Resolution == nil || lookup.Entry.Resolution.Outcome != fencing.MutationCommitted || !lookup.Entry.Resolution.AllCopiesTerminal {
+			return errors.Join(err, fencing.ErrPending)
+		}
+	}
+	return nil
+}
+
 func sameArchiveGenesisRef(left, right *fencing.ArchiveGenesisRef) bool {
 	if left == nil || right == nil {
 		return left == nil && right == nil
@@ -568,6 +765,122 @@ func (e *FencingExecutor) archiveGenesisStatus(ctx context.Context, authorizatio
 		if claim.EmptyRecoveryAuthorization != nil && lookup.Entry.Resolution != nil && lookup.Entry.Resolution.Outcome == fencing.MutationCommitted && lookup.Entry.Resolution.AllCopiesTerminal {
 			status.EmptyRecoveryState = fencing.EmptyRecoveryCommitted
 		}
+	}
+	return status, nil
+}
+
+func (e *FencingExecutor) archiveGenesisStatusLogical(ctx context.Context, authorization string, id fencing.Identity, archiveKey string, configID uint) (fencing.ArchiveGenesisStatus, error) {
+	if archiveKey != "archive/head.bin" || configID != recovery.ArchiveConfigID {
+		return fencing.ArchiveGenesisStatus{}, fmt.Errorf("fencing: archive genesis request config or key differs")
+	}
+	uid, err := e.authenticate(ctx, authorization, id)
+	if err != nil {
+		return fencing.ArchiveGenesisStatus{}, sourceStageAuthenticationError{err: err}
+	}
+	root, err := e.read(ctx, uid, id.SourceClusterID)
+	if err != nil {
+		return fencing.ArchiveGenesisStatus{}, err
+	}
+	run, ok := root.Ledger.Runs[id.RunID]
+	if root.Ledger.Profile != fencing.LogicalWriterProfileV1 || !root.Ledger.RequireMutationJournal || !ok || run.Identity != id ||
+		run.Runtime != nil || run.LogicalBinding == nil || run.LogicalBinding.ValidateBound() != nil || run.LogicalBinding.Role != fencing.StartupRoleVoterActive ||
+		run.MutationProducerUID == "" || run.MutationScopeHash == "" || run.LogicalBinding.StoreScopeHash != run.MutationScopeHash {
+		return fencing.ArchiveGenesisStatus{}, fmt.Errorf("fencing: logical archive genesis status is outside an exact active Run")
+	}
+	binding := *run.LogicalBinding
+	scope, scopeHash, err := e.logicalArchiveScope(ctx, uid, binding)
+	if err != nil {
+		return fencing.ArchiveGenesisStatus{}, err
+	}
+	claim, _, err := e.AuthorityState.ReadArchiveScopeClaim(ctx, scope)
+	if err != nil || claim.ConfigID != configID || claim.ScopeHash != scopeHash || claim.OwnerStatefulSetUID != uid || claim.OwnerSourceClusterID != id.SourceClusterID {
+		return fencing.ArchiveGenesisStatus{}, errors.Join(err, fmt.Errorf("fencing: logical archive scope claim differs"))
+	}
+	if root.Ledger.ArchiveScopeHash != scopeHash {
+		return fencing.ArchiveGenesisStatus{}, fmt.Errorf("fencing: logical archive genesis root scope differs")
+	}
+	switch root.Ledger.ArchiveGenesisState {
+	case fencing.ArchiveGenesisAwaitingRef:
+		if root.Ledger.ArchiveGenesisRef != nil && claim.GenesisRef == nil {
+			return fencing.ArchiveGenesisStatus{}, fencing.ErrPending
+		}
+	case fencing.ArchiveGenesisCommitted:
+		if claim.GenesisRef == nil || root.Ledger.ArchiveGenesisRef == nil || !sameArchiveGenesisRef(root.Ledger.ArchiveGenesisRef, claim.GenesisRef) {
+			return fencing.ArchiveGenesisStatus{}, fmt.Errorf("fencing: committed logical archive genesis references differ")
+		}
+	default:
+		return fencing.ArchiveGenesisStatus{}, fmt.Errorf("fencing: logical archive genesis is not initialized")
+	}
+	if (claim.EmptyRecoveryAuthorization == nil) != (root.Ledger.EmptyRecoveryAuthorization == nil) ||
+		(claim.EmptyRecoveryAuthorization != nil && hashJSON(claim.EmptyRecoveryAuthorization) != hashJSON(root.Ledger.EmptyRecoveryAuthorization)) {
+		return fencing.ArchiveGenesisStatus{}, fmt.Errorf("fencing: logical empty-recovery authorization differs")
+	}
+	if claim.GenesisRef == nil {
+		if root.Ledger.ArchiveGenesisRef != nil || claim.EmptyRecoveryAuthorization != nil {
+			return fencing.ArchiveGenesisStatus{}, fencing.ErrPending
+		}
+		if err := e.ensureArchiveScopeHasNoGenesisEvidence(ctx, scope); err != nil {
+			return fencing.ArchiveGenesisStatus{}, err
+		}
+		return fencing.ArchiveGenesisStatus{ScopeHash: scopeHash, MutationScopeHash: run.MutationScopeHash, ConfigID: configID, CanInitializeEmpty: true}, nil
+	}
+	if root.Ledger.ArchiveGenesisRef == nil {
+		if err := e.setRootArchiveGenesisRef(ctx, uid, id.SourceClusterID, *claim.GenesisRef); err != nil {
+			return fencing.ArchiveGenesisStatus{}, err
+		}
+		root, err = e.read(ctx, uid, id.SourceClusterID)
+		if err != nil {
+			return fencing.ArchiveGenesisStatus{}, err
+		}
+	} else if !sameArchiveGenesisRef(root.Ledger.ArchiveGenesisRef, claim.GenesisRef) {
+		return fencing.ArchiveGenesisStatus{}, fmt.Errorf("fencing: logical root and archive scope genesis references differ")
+	}
+	status := fencing.ArchiveGenesisStatus{ScopeHash: scopeHash, MutationScopeHash: run.MutationScopeHash, ConfigID: configID, Ref: claim.GenesisRef,
+		EmptyRecoveryAuthorization: claim.EmptyRecoveryAuthorization}
+	if claim.GenesisRef.Mutation != nil {
+		mutation := claim.GenesisRef.Mutation
+		var owner fencing.Run
+		for _, candidate := range root.Ledger.Runs {
+			if candidate.MutationProducerUID == mutation.ProducerUID && candidate.LogicalBinding != nil && candidate.Runtime == nil {
+				if owner.Identity.RunID != "" {
+					return fencing.ArchiveGenesisStatus{}, fencing.ErrPending
+				}
+				owner = candidate
+			}
+		}
+		if owner.Identity.RunID == "" || owner.MutationScopeHash != mutation.Intent.StoreScopeHash || owner.LogicalBinding == nil {
+			return fencing.ArchiveGenesisStatus{}, fencing.ErrPending
+		}
+		authority := mutationExecutionAuthority{statefulSetUID: uid, sourceClusterID: id.SourceClusterID, runID: owner.Identity.RunID, logicalBinding: owner.LogicalBinding}
+		lookup, err := e.lookupMutationForAuthority(ctx, authority, owner, fencing.MutationLookupRequest{ProducerUID: mutation.ProducerUID, Sequence: mutation.Sequence, Intent: mutation.Intent})
+		if err != nil || !lookup.Found || lookup.Entry == nil || lookup.Entry.Intent != mutation.Intent {
+			return fencing.ArchiveGenesisStatus{}, errors.Join(err, fencing.ErrPending)
+		}
+		if lookup.Entry.Resolution == nil {
+			storeScope, scopeErr := e.sourceMutationStorageScopeForRoot(ctx, uid, id.SourceClusterID)
+			if scopeErr != nil || hashJSON(storeScope) != owner.MutationScopeHash {
+				return fencing.ArchiveGenesisStatus{}, errors.Join(scopeErr, fencing.ErrPending)
+			}
+			provider, providerErr := newGCSMutationProviderForProfile(e.SourceMutationStorage, storeScope, owner.MutationProfile)
+			if providerErr != nil {
+				return fencing.ArchiveGenesisStatus{}, providerErr
+			}
+			receipts, receiptErr := e.receiptsForLogicalBinding(uid, *owner.LogicalBinding)
+			if receiptErr != nil {
+				return fencing.ArchiveGenesisStatus{}, receiptErr
+			}
+			if executeErr := e.ExecuteLogicalSourceMutation(ctx, uid, *owner.LogicalBinding, mutation.ProducerUID, mutation.Sequence, mutation.Intent, storeScope, provider, receipts); executeErr != nil {
+				return fencing.ArchiveGenesisStatus{}, executeErr
+			}
+			lookup, err = e.lookupMutationForAuthority(ctx, authority, owner, fencing.MutationLookupRequest{ProducerUID: mutation.ProducerUID, Sequence: mutation.Sequence, Intent: mutation.Intent})
+			if err != nil || !lookup.Found || lookup.Entry == nil || lookup.Entry.Resolution == nil {
+				return fencing.ArchiveGenesisStatus{}, errors.Join(err, fencing.ErrPending)
+			}
+		}
+		status.Mutation = &lookup
+	}
+	if err := status.Validate(run.MutationScopeHash, configID); err != nil {
+		return fencing.ArchiveGenesisStatus{}, err
 	}
 	return status, nil
 }

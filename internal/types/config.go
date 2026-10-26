@@ -35,18 +35,25 @@ type GraphNodePropertyIndex struct {
 
 // ExecutionConfig holds runtime configuration.
 type ExecutionConfig struct {
-	Local      bool      `json:"local,omitempty"`
-	ClusterID  ClusterID `json:"cluster_id"`
-	NodeID     NodeID    `json:"node_id"`
-	DataDir    string    `json:"data_dir"`
+	Local     bool      `json:"local,omitempty"`
+	ClusterID ClusterID `json:"cluster_id"`
+	NodeID    NodeID    `json:"node_id"`
+	DataDir   string    `json:"data_dir"`
 	// HAInitRestoreDir is an optional staging mount populated by the HA init
 	// restore process. It must be separate from DataDir; Node.Open adopts a
 	// staged checkpoint only for a clean first start after validating its
 	// archive and root evidence.
 	HAInitRestoreDir string `json:"ha_init_restore_dir,omitempty"`
-	BindAddr   string    `json:"bind_addr"`
-	PeerAddr   string    `json:"peer_addr"`
-	AdminToken string    `json:"admin_token"`
+	// AuthorityProfile selects an explicit source-authority protocol. Logical
+	// writer mode uses the authenticated HTTPS authority directly and never
+	// falls back to a supervisor socket or direct object-store writes.
+	AuthorityProfile   string `json:"authority_profile,omitempty"`
+	AuthorityURL       string `json:"authority_url,omitempty"`
+	AuthorityCAFile    string `json:"authority_ca_file,omitempty"`
+	AuthorityTokenFile string `json:"authority_token_file,omitempty"`
+	BindAddr           string `json:"bind_addr"`
+	PeerAddr           string `json:"peer_addr"`
+	AdminToken         string `json:"admin_token"`
 	// PeerToken is this process's private peer identity secret. It is never
 	// replicated; Members carry only public identity.
 	PeerToken             string       `json:"peer_token"`

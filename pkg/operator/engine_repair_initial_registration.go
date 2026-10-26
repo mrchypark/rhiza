@@ -158,6 +158,12 @@ func (e *FencingExecutor) initialRegistrationMarkerRequired(ctx context.Context,
 		root.Ledger.ArchiveGenesisState == fencing.ArchiveGenesisAwaitingRef {
 		return false, nil
 	}
+	if e.AuthorityProfile == fencing.LogicalWriterProfileV1 {
+		if err := e.validateMutationJournalProfile(root); err != nil {
+			return false, err
+		}
+		return false, nil
+	}
 	grant, static, err := e.resolveStaticVoterStartupGrant(ctx, statefulSetUID, request)
 	if err != nil || !static {
 		return false, err

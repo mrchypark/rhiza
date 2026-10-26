@@ -952,7 +952,6 @@ func TestFixtureOnlyWorkflowIsExclusiveAndRunsFixedGoSelectors(t *testing.T) {
 		t.Fatal("fixture_only must be an opt-in boolean that defaults to the normal full workflow")
 	}
 	wantConditions := map[string]string{
-<<<<<<< HEAD
 		"fencing-only":                    "github.event_name == 'workflow_dispatch' && inputs.fencing_only && !inputs.fixture_only",
 		"fixture-only":                    "github.event_name == 'workflow_dispatch' && inputs.fixture_only",
 		"cooperative-fencing":             "github.event_name != 'workflow_dispatch' || !inputs.fixture_only",

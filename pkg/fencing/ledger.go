@@ -9,7 +9,10 @@ import (
 // persisted with the resourceVersion read alongside this value. Never replace a
 // ledger after a conflict or discard an older incarnation when a Pod disappears.
 type Ledger struct {
-	SourceClusterID            string                             `json:"sourceClusterID"`
+	SourceClusterID string `json:"sourceClusterID"`
+	// Profile is an explicit writer-contract discriminator. Empty remains the
+	// historical physical/legacy format and never selects logical writers.
+	Profile                    string                             `json:"profile,omitempty"`
 	ClosedBy                   string                             `json:"closedBy,omitempty"`
 	ClosedHash                 string                             `json:"closedHash,omitempty"`
 	ClosedNodes                map[string]StopRequest             `json:"closedNodes,omitempty"`
@@ -29,19 +32,22 @@ type Ledger struct {
 }
 
 type Run struct {
-	Identity                 Identity           `json:"identity"`
-	Role                     StartupRole        `json:"role,omitempty"`
-	Stop                     *StopRequest       `json:"stop,omitempty"`
-	Drain                    *DrainReceipt      `json:"drain,omitempty"`
-	Exited                   bool               `json:"exited,omitempty"`
-	NeverBoundExit           *StopRequest       `json:"neverBoundExit,omitempty"`
-	Runtime                  *RuntimeBinding    `json:"runtime,omitempty"`
-	MutationProducerUID      string             `json:"mutationProducerUID,omitempty"`
-	MutationScopeHash        string             `json:"mutationScopeHash,omitempty"`
-	MutationProfile          string             `json:"mutationProfile,omitempty"`
-	MutationStageIncarnation string             `json:"mutationStageIncarnation,omitempty"`
-	IndependentTerminal      *TerminalReference `json:"independentTerminal,omitempty"`
-	Promotion                *LearnerPromotion  `json:"promotion,omitempty"`
+	Identity                 Identity                    `json:"identity"`
+	Role                     StartupRole                 `json:"role,omitempty"`
+	Stop                     *StopRequest                `json:"stop,omitempty"`
+	Drain                    *DrainReceipt               `json:"drain,omitempty"`
+	Exited                   bool                        `json:"exited,omitempty"`
+	NeverBoundExit           *StopRequest                `json:"neverBoundExit,omitempty"`
+	Runtime                  *RuntimeBinding             `json:"runtime,omitempty"`
+	LogicalBinding           *LogicalWriterBindingV1     `json:"logicalBinding,omitempty"`
+	LogicalExpectedWAL       string                      `json:"logicalExpectedWAL,omitempty"`
+	LogicalClosure           *LogicalRunClosureReference `json:"logicalClosure,omitempty"`
+	MutationProducerUID      string                      `json:"mutationProducerUID,omitempty"`
+	MutationScopeHash        string                      `json:"mutationScopeHash,omitempty"`
+	MutationProfile          string                      `json:"mutationProfile,omitempty"`
+	MutationStageIncarnation string                      `json:"mutationStageIncarnation,omitempty"`
+	IndependentTerminal      *TerminalReference          `json:"independentTerminal,omitempty"`
+	Promotion                *LearnerPromotion           `json:"promotion,omitempty"`
 	// EngineRepairProvenance is authority-written from a canonical repair
 	// reservation. It is never accepted from a startup request or grant.
 	EngineRepairProvenance *EngineRepairRunProvenance `json:"engineRepairProvenance,omitempty"`
@@ -380,6 +386,11 @@ func (l *Ledger) Register(identity Identity) error {
 // independently resolved a role. Empty roles in historical ledger records are
 // interpreted as voter-active for wire/storage compatibility.
 func (l *Ledger) RegisterWithRole(identity Identity, role StartupRole) error {
+	if l.Profile != "" {
+		if err := l.ValidateProfile(); err != nil || l.Profile == LogicalWriterProfileV1 {
+			return fmt.Errorf("fencing: legacy registration is unavailable for selected writer profile")
+		}
+	}
 	if identity.SourceClusterID != l.SourceClusterID || identity.NodeID == "" || identity.PodUID == "" || identity.RunID == "" || identity.WALIdentity != "" {
 		return fmt.Errorf("fencing: invalid registration")
 	}
@@ -575,6 +586,14 @@ func (l *Ledger) PromoteLearner(identity Identity, operationID, evidenceHash str
 }
 
 func (l *Ledger) Bind(identity Identity) error {
+	if l.Profile == LogicalWriterProfileV1 {
+		return l.BindLogicalWAL(identity)
+	}
+	if l.Profile != "" {
+		if err := l.ValidateProfile(); err != nil {
+			return err
+		}
+	}
 	run, exists := l.Runs[identity.RunID]
 	if !exists || identity.WALIdentity == "" {
 		return fmt.Errorf("fencing: unknown WAL registration")

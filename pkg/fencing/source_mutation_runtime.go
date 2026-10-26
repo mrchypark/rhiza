@@ -39,8 +39,51 @@ func OpenSourceMutationClient(dir string, session *Session) (*SourceMutationClie
 	if err != nil {
 		return nil, err
 	}
-	return &SourceMutationClient{state: state, client: &sourceMutationClient{state: state, authority: session}}, nil
+	return newSourceMutationClient(state, session), nil
 }
+
+// CreateAuthoritySourceMutationClient creates the same run-scoped retry journal
+// used by OpenSourceMutationClient, but uses a directly configured authenticated
+// AuthorityClient instead of the local-supervisor relay. The receipt must be the
+// exact validated Bind result held by that client.
+func CreateAuthoritySourceMutationClient(dir string, authority *AuthorityClient, receipt BindReceipt) (*SourceMutationClient, error) {
+	if dir == "" {
+		return nil, fmt.Errorf("fencing: direct source mutation retry directory is required")
+	}
+	validated, err := authority.validatedSourceMutationBinding(receipt)
+	if err != nil {
+		return nil, fmt.Errorf("fencing: direct source mutation client requires a bound authority: %w", err)
+	}
+	state, err := createSourceRetryState(dir, validated)
+	if err != nil {
+		return nil, err
+	}
+	return newSourceMutationClient(state, authority), nil
+}
+
+// OpenAuthoritySourceMutationClient reopens an existing retry journal for the
+// exact Bind receipt held by the authenticated authority client. It never
+// creates, resets, or adopts a missing journal.
+func OpenAuthoritySourceMutationClient(dir string, authority *AuthorityClient, receipt BindReceipt) (*SourceMutationClient, error) {
+	if dir == "" {
+		return nil, fmt.Errorf("fencing: direct source mutation retry directory is required")
+	}
+	validated, err := authority.validatedSourceMutationBinding(receipt)
+	if err != nil {
+		return nil, fmt.Errorf("fencing: direct source mutation recovery requires a bound authority: %w", err)
+	}
+	state, err := openSourceRetryState(dir, validated)
+	if err != nil {
+		return nil, err
+	}
+	return newSourceMutationClient(state, authority), nil
+}
+
+func newSourceMutationClient(state *sourceRetryState, authority sourceMutationAuthority) *SourceMutationClient {
+	return &SourceMutationClient{state: state, client: &sourceMutationClient{state: state, authority: authority}}
+}
+
+var _ sourceMutationAuthority = (*AuthorityClient)(nil)
 
 // Upload consumes the exact caller bytes. OwnerStep is a durable per-invocation
 // counter, not a key/content deduplication key.

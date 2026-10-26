@@ -1,0 +1,80 @@
+package node
+
+import (
+	"errors"
+	"os"
+	"path/filepath"
+	"strings"
+	"testing"
+
+	"github.com/mrchypark/rhiza/internal/types"
+	"github.com/mrchypark/rhiza/pkg/fencing"
+)
+
+func TestLogicalRunStatePersistsSamePodIdentityAndRejectsNewPodReuse(t *testing.T) {
+	config := &types.ExecutionConfig{ClusterID: "cluster", NodeID: "node-a", DataDir: t.TempDir()}
+	first, continuation, err := loadOrCreateLogicalRunState(config, "pod-uid-a", localVoterState{})
+	if err != nil || continuation {
+		t.Fatalf("first run state = %+v, continuation=%t, err=%v", first, continuation, err)
+	}
+	second, continuation, err := loadOrCreateLogicalRunState(config, "pod-uid-a", localVoterState{})
+	if err != nil || continuation || second != first {
+		t.Fatalf("same-Pod run state = %+v, continuation=%t, err=%v; want exact %+v", second, continuation, err, first)
+	}
+	if _, _, err := loadOrCreateLogicalRunState(config, "pod-uid-b", localVoterState{}); err == nil {
+		t.Fatal("different PodUID reused the prior local logical RunID")
+	}
+}
+
+func TestLogicalRunStatePersistsAuthorityAssignmentForSamePodContinuation(t *testing.T) {
+	config := &types.ExecutionConfig{ClusterID: "cluster", NodeID: "physical", DataDir: t.TempDir()}
+	state, _, err := loadOrCreateLogicalRunState(config, "pod-uid", localVoterState{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	identity := fencing.Identity{SourceClusterID: "cluster", NodeID: "logical-candidate", PodUID: "pod-uid", RunID: state.RunID, AssignmentID: strings.Repeat("a", 64)}
+	updated, err := persistLogicalRunAssignment(config, state, identity)
+	if err != nil {
+		t.Fatal(err)
+	}
+	loaded, err := readLogicalRunState(filepath.Join(config.DataDir, "logical-run.json"))
+	if err != nil || loaded != updated || loaded.AssignedNodeID != identity.NodeID || loaded.AssignmentID != identity.AssignmentID {
+		t.Fatalf("persisted logical assignment=%+v err=%v; want %+v", loaded, err, updated)
+	}
+	local := localVoterState{identity: &voterIdentity{Cluster: "cluster", Node: identity.NodeID, Registered: false}, hadWAL: true}
+	resume, continuation, err := loadOrCreateLogicalRunState(config, "pod-uid", local)
+	if err != nil || !continuation || resume != loaded {
+		t.Fatalf("same-Pod assigned continuation=%+v continuation=%t err=%v; want %+v", resume, continuation, err, loaded)
+	}
+}
+
+func TestLogicalRunStateRequiresPersistedIdentityForExistingWAL(t *testing.T) {
+	config := &types.ExecutionConfig{ClusterID: "cluster", NodeID: "node-a", DataDir: t.TempDir()}
+	local := localVoterState{identity: &voterIdentity{Cluster: "cluster", Node: "node-a", Registered: true}}
+	if _, _, err := loadOrCreateLogicalRunState(config, "pod-uid", local); !errors.Is(err, ErrVoterStateLost) {
+		t.Fatalf("registered WAL without logical RunID error=%v, want ErrVoterStateLost", err)
+	}
+	if _, _, err := loadOrCreateLogicalRunState(config, "pod-uid", localVoterState{hadWAL: true}); !errors.Is(err, ErrVoterStateLost) {
+		t.Fatalf("WAL without logical RunID error=%v, want ErrVoterStateLost", err)
+	}
+}
+
+func TestReadLogicalRunStateRejectsMalformedAndNonRegularFiles(t *testing.T) {
+	dir := t.TempDir()
+	file := filepath.Join(dir, "logical-run.json")
+	if err := os.WriteFile(file, []byte(`{"version":1,"clusterID":"cluster","nodeID":"node-a","podUID":"pod","runID":"not-a-run-id"}`), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := readLogicalRunState(file); err == nil {
+		t.Fatal("malformed persisted logical RunID was accepted")
+	}
+	if err := os.Remove(file); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Mkdir(file, 0700); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := readLogicalRunState(file); err == nil {
+		t.Fatal("non-regular persisted logical Run state was accepted")
+	}
+}

@@ -21,11 +21,7 @@ func (e *FencingExecutor) sourceStagesFor(ctx context.Context, runtime fencing.R
 		return nil, fmt.Errorf("fencing: source staging requires an enrolled root identity")
 	}
 	if e != nil && e.AuthorityState != nil {
-		evidence, err := e.authorityEvidenceFor(runtime)
-		if err != nil {
-			return nil, err
-		}
-		return NewRemoteSourceStageStore(evidence)
+		return e.sourceStagesForRoot(ctx, runtime.StatefulSetUID, runtime.SourceClusterID)
 	}
 	if e != nil && e.SourceStages != nil {
 		return e.SourceStages, nil
@@ -33,11 +29,26 @@ func (e *FencingExecutor) sourceStagesFor(ctx context.Context, runtime fencing.R
 	return nil, fmt.Errorf("fencing: canonical source staging is not configured")
 }
 
+func (e *FencingExecutor) sourceStagesForRoot(ctx context.Context, statefulSetUID, sourceClusterID string) (*SourceStageStore, error) {
+	if ctx == nil || e == nil || e.AuthorityState == nil || statefulSetUID == "" || sourceClusterID == "" {
+		return nil, fmt.Errorf("fencing: source staging requires a canonical root identity")
+	}
+	evidence, err := e.authorityEvidenceForRoot(statefulSetUID, sourceClusterID)
+	if err != nil {
+		return nil, err
+	}
+	return NewRemoteSourceStageStore(evidence)
+}
+
 func (e *FencingExecutor) authorityEvidenceFor(runtime fencing.RuntimeBinding) (*AuthorityEvidenceStore, error) {
-	if e == nil || e.AuthorityState == nil || runtime.StatefulSetUID == "" || runtime.SourceClusterID == "" {
+	return e.authorityEvidenceForRoot(runtime.StatefulSetUID, runtime.SourceClusterID)
+}
+
+func (e *FencingExecutor) authorityEvidenceForRoot(statefulSetUID, sourceClusterID string) (*AuthorityEvidenceStore, error) {
+	if e == nil || e.AuthorityState == nil || statefulSetUID == "" || sourceClusterID == "" {
 		return nil, fmt.Errorf("fencing: canonical authority evidence root is not configured")
 	}
-	return NewAuthorityEvidenceStore(e.AuthorityState.bucket, e.AuthorityState.prefix, runtime.StatefulSetUID, runtime.SourceClusterID)
+	return NewAuthorityEvidenceStore(e.AuthorityState.bucket, e.AuthorityState.prefix, statefulSetUID, sourceClusterID)
 }
 
 // openMutationPayload returns only the exact sealed bytes bound by the admitted

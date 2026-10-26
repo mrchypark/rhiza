@@ -64,6 +64,10 @@ type FencingExecutor struct {
 	// source-mutation profile. The persisted root claim is immutable: this option
 	// may create a required root, but never upgrades an existing cooperative root.
 	RequireMutationJournal bool
+	// AuthorityProfile explicitly selects the writer model for new roots. Empty
+	// preserves the existing cooperative/runtime-bound selection; logical
+	// authority is never inferred from missing runtime evidence.
+	AuthorityProfile string
 	// MutationProfile selects the profile for newly enrolled source producers.
 	// Existing root-bound profiles are always preserved on rebind.
 	MutationProfile string
@@ -205,11 +209,23 @@ func (e *FencingExecutor) initializeRoot(ctx context.Context, uid, source string
 	} else if !apiNotFound(legacyErr) {
 		return errors.Join(fmt.Errorf("fencing: root-init phase=legacy_check cause=legacy_check_unavailable: cannot verify legacy cooperative ledger before canonical root bootstrap"), legacyErr)
 	}
+	profile := ""
+	if e != nil {
+		profile = e.AuthorityProfile
+	}
+	if profile != "" && profile != fencing.LogicalWriterProfileV1 && profile != fencing.RuntimeWriterProfileV1 {
+		return fmt.Errorf("fencing: configured authority profile is unsupported")
+	}
+	logical := profile == fencing.LogicalWriterProfileV1
+	if (logical || profile == fencing.RuntimeWriterProfileV1) && (e == nil || !e.RequireMutationJournal) {
+		return fmt.Errorf("fencing: selected writer profile requires the mutation journal")
+	}
 	initial := fenceLedger{StatefulSetUID: uid, Ledger: fencing.Ledger{
-		SourceClusterID: source, RequireRuntimeBinding: e != nil && e.RequireMutationJournal,
+		SourceClusterID: source, Profile: profile,
+		RequireRuntimeBinding:  e != nil && e.RequireMutationJournal && !logical,
 		RequireMutationJournal: e != nil && e.RequireMutationJournal,
 		ArchiveGenesisState: func() string {
-			if e != nil && e.RequireMutationJournal {
+			if e != nil && e.RequireMutationJournal && !logical {
 				return fencing.ArchiveGenesisRegistrationPending
 			}
 			return ""
@@ -266,6 +282,25 @@ func (e *FencingExecutor) rejectClosedCanonicalStartup(ctx context.Context, uid,
 }
 
 func (e *FencingExecutor) validateMutationJournalProfile(state fenceLedger) error {
+	wantProfile := ""
+	if e != nil {
+		wantProfile = e.AuthorityProfile
+	}
+	if wantProfile != "" && state.Ledger.Profile != wantProfile {
+		return fmt.Errorf("fencing: existing authority root writer profile differs; refusing profile conversion")
+	}
+	if state.Ledger.Profile == fencing.LogicalWriterProfileV1 {
+		if e == nil || e.AuthorityProfile != fencing.LogicalWriterProfileV1 || !e.RequireMutationJournal || !state.Ledger.RequireMutationJournal || state.Ledger.RequireRuntimeBinding {
+			return fmt.Errorf("fencing: logical authority profile requirements differ")
+		}
+		return state.Ledger.ValidateProfile()
+	}
+	if state.Ledger.Profile == fencing.RuntimeWriterProfileV1 && !state.Ledger.RequireRuntimeBinding {
+		return fmt.Errorf("fencing: runtime-bound authority profile requirements differ")
+	}
+	if wantProfile == fencing.LogicalWriterProfileV1 {
+		return fmt.Errorf("fencing: existing authority root is not logical-writer-v1; refusing profile conversion")
+	}
 	if e != nil && e.RequireMutationJournal && !fencing.MutationProfileSupported(e.sourceMutationProfile()) {
 		return fmt.Errorf("fencing: configured source mutation profile is unsupported")
 	}
@@ -524,6 +559,7 @@ func (e *FencingExecutor) handle(w http.ResponseWriter, r *http.Request) {
 	var activeRestartGrant *fencing.StartupGrant
 	var initialRegistrationGrant *fencing.StartupGrant
 	var initialRegistrationProvenance *fencing.InitialRegistrationProvenance
+	var logicalContinuationGrant *fencing.StartupGrant
 	if message.Action == "register" {
 		if message.InitialRegistration {
 			grant, provenance, err := e.resolveInitialRegistrationGrant(r.Context(), uid, message.Identity)
@@ -532,7 +568,14 @@ func (e *FencingExecutor) handle(w http.ResponseWriter, r *http.Request) {
 				return
 			}
 			initialRegistrationGrant, initialRegistrationProvenance = &grant, &provenance
-		} else if message.RegistrationWALIdentity == "" {
+		} else if message.RegistrationWALIdentity != "" && e.AuthorityProfile == fencing.LogicalWriterProfileV1 {
+			grant, continuationErr := e.resolveLogicalWALContinuationGrant(r.Context(), uid, message.Identity, message.RegistrationWALIdentity)
+			if continuationErr != nil {
+				writeEngineRepairStartupError(w, continuationErr)
+				return
+			}
+			logicalContinuationGrant = &grant
+		} else if message.RegistrationWALIdentity == "" && e.AuthorityProfile != fencing.LogicalWriterProfileV1 {
 			grant, assigned, restartErr := e.resolveEngineRepairActiveRestartRegistration(r.Context(), uid, message.Identity)
 			if restartErr != nil {
 				if errors.Is(restartErr, fencing.ErrClosed) {
@@ -589,7 +632,9 @@ func (e *FencingExecutor) handle(w http.ResponseWriter, r *http.Request) {
 			err = registerStageError("startup-grant", e.rejectClosedCanonicalStartup(r.Context(), uid, message.Identity.SourceClusterID))
 		}
 		if err == nil {
-			if activeRestartGrant != nil {
+			if logicalContinuationGrant != nil {
+				startupGrant = *logicalContinuationGrant
+			} else if activeRestartGrant != nil {
 				startupGrant = *activeRestartGrant
 			} else if initialRegistrationGrant != nil {
 				startupGrant = *initialRegistrationGrant
@@ -622,7 +667,7 @@ func (e *FencingExecutor) handle(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	var enrolled *fencing.RuntimeBinding
-	if err == nil && message.Action == "register" && e.RuntimeAgent != nil {
+	if err == nil && message.Action == "register" && e.RuntimeAgent != nil && startupGrant.AuthorityProfile != fencing.LogicalWriterProfileV1 {
 		base, enrollErr := e.RuntimeAgent.enrollmentBase(r.Context(), e.Kube.Namespace, uid, startupGrant.Identity)
 		if enrollErr == nil {
 			var binding fencing.RuntimeBinding
@@ -672,12 +717,25 @@ func (e *FencingExecutor) handle(w http.ResponseWriter, r *http.Request) {
 	}
 	var stop fencing.StopRequest
 	var registrationPredecessor *fencing.Run
-	if err == nil && message.Action == "register" && message.RegistrationWALIdentity != "" {
+	if err == nil && message.Action == "register" && message.RegistrationWALIdentity != "" && logicalContinuationGrant == nil {
 		registrationPredecessor, err = e.prepareRegistrationPredecessor(r.Context(), uid, message.Identity, message.RegistrationWALIdentity)
+	}
+	logicalStageIncarnation := ""
+	if err == nil && message.Action == "register" && logicalContinuationGrant == nil && startupGrant.AuthorityProfile == fencing.LogicalWriterProfileV1 && startupGrant.Role == fencing.StartupRoleVoterActive {
+		stages, stageErr := e.sourceStagesForRoot(r.Context(), uid, message.Identity.SourceClusterID)
+		if stageErr != nil {
+			err = registerStageError("logical-stage", stageErr)
+		} else {
+			logicalStageIncarnation = stages.incarnation
+		}
 	}
 	var binding fencing.BindReceipt
 	var mutationLookup fencing.MutationLookupResult
-	if message.Action == "mutation-lookup" {
+	if message.Action == "register" && logicalContinuationGrant != nil {
+		// The exact registered Run already owns the supplied WAL. This branch
+		// returns its original grant after a lost bind response without changing
+		// the producer or reopening a stopped incarnation.
+	} else if message.Action == "mutation-lookup" {
 		if message.MutationLookup == nil || message.Drain != nil || message.Request != nil {
 			err = fmt.Errorf("fencing: malformed mutation lookup request")
 		} else {
@@ -687,9 +745,19 @@ func (e *FencingExecutor) handle(w http.ResponseWriter, r *http.Request) {
 		err = fmt.Errorf("fencing: unexpected mutation lookup request")
 	} else if message.Action == "bind" {
 		var engineOwned bool
-		binding, engineOwned, err = e.bindEngineRepairCandidate(r.Context(), uid, message.Identity)
-		if err == nil && !engineOwned {
-			binding, err = e.bindSupervisorWAL(r.Context(), uid, message.Identity)
+		var logical bool
+		if e.AuthorityState != nil {
+			var root fenceLedger
+			root, _, err = e.AuthorityState.ReadRoot(r.Context(), uid, message.Identity.SourceClusterID)
+			logical = err == nil && root.Ledger.Profile == fencing.LogicalWriterProfileV1
+		}
+		if err == nil && logical {
+			binding, err = e.bindLogicalSupervisorWAL(r.Context(), uid, message.Identity)
+		} else if err == nil {
+			binding, engineOwned, err = e.bindEngineRepairCandidate(r.Context(), uid, message.Identity)
+			if err == nil && !engineOwned {
+				binding, err = e.bindSupervisorWAL(r.Context(), uid, message.Identity)
+			}
 		}
 	} else if message.Action == "promote-learner" {
 		if message.Drain != nil || message.Request != nil || message.MutationLookup != nil || message.ArchiveGenesis != nil || message.LearnerIdentity != nil {
@@ -719,6 +787,32 @@ func (e *FencingExecutor) handle(w http.ResponseWriter, r *http.Request) {
 			changed, err = e.change(r.Context(), uid, message.Identity.SourceClusterID, func(l *fencing.Ledger) error {
 				switch message.Action {
 				case "register":
+					if l.Profile == fencing.LogicalWriterProfileV1 {
+						if message.RegistrationWALIdentity != "" || startupGrant.AuthorityProfile != fencing.LogicalWriterProfileV1 || startupGrant.LogicalBinding == nil ||
+							startupGrant.Identity.WALIdentity != "" || startupGrant.LogicalBinding.SourceClusterID != startupGrant.Identity.SourceClusterID ||
+							startupGrant.LogicalBinding.NodeID != startupGrant.Identity.NodeID || startupGrant.LogicalBinding.RunID != startupGrant.Identity.RunID ||
+							startupGrant.LogicalBinding.Role != startupGrant.Role {
+							return fmt.Errorf("fencing: logical startup grant does not match selected authority profile")
+						}
+						if startupGrant.Role == fencing.StartupRoleVoterActive && (startupGrant.LogicalBinding.ProducerUID == "" || startupGrant.LogicalBinding.StoreScopeHash == "") {
+							return fmt.Errorf("fencing: logical active startup grant lacks producer scope")
+						}
+						if err := l.RegisterLogicalWithRole(startupGrant.Identity, *startupGrant.LogicalBinding); err != nil {
+							return registerStageError("ledger-register", err)
+						}
+						if startupGrant.Role == fencing.StartupRoleVoterActive {
+							if err := l.BindLogicalMutationScope(startupGrant.Identity, startupGrant.LogicalBinding.StoreScopeHash, e.sourceMutationProfile()); err != nil {
+								return registerStageError("logical-scope", err)
+							}
+							if err := l.BindLogicalMutationStage(startupGrant.Identity, logicalStageIncarnation); err != nil {
+								return registerStageError("logical-stage", err)
+							}
+						}
+						return nil
+					}
+					if startupGrant.AuthorityProfile == fencing.LogicalWriterProfileV1 {
+						return fmt.Errorf("fencing: logical startup grant cannot register into a non-logical root")
+					}
 					if message.RegistrationWALIdentity != "" {
 						if enrolled == nil {
 							return fmt.Errorf("fencing: registration continuation requires runtime enrollment")
@@ -802,7 +896,19 @@ func (e *FencingExecutor) handle(w http.ResponseWriter, r *http.Request) {
 					return fmt.Errorf("fencing: unknown action")
 				}
 			})
-			if err == nil && message.Action == "register" && changed.Ledger.RequireMutationJournal && startupGrant.Role == fencing.StartupRoleVoterActive {
+			if err == nil && message.Action == "register" && logicalContinuationGrant == nil && changed.Ledger.Profile == fencing.LogicalWriterProfileV1 && startupGrant.Role == fencing.StartupRoleVoterActive {
+				registrationStage = startupRegistrationStageProducerReserve
+				run, ok := changed.Ledger.Runs[startupGrant.Identity.RunID]
+				if !ok || run.LogicalBinding == nil {
+					err = fmt.Errorf("fencing: logical registration did not persist its binding")
+				} else {
+					err = registerStageError("producer-reserve", e.reserveLogicalMutationProducer(r.Context(), uid, *run.LogicalBinding))
+					if err == nil {
+						registrationStage = startupRegistrationStageArchiveScope
+						err = registerStageError("archive-scope", e.claimLogicalArchiveScopeForRegistration(r.Context(), uid, startupGrant.Identity, *run.LogicalBinding))
+					}
+				}
+			} else if err == nil && message.Action == "register" && changed.Ledger.RequireMutationJournal && startupGrant.Role == fencing.StartupRoleVoterActive {
 				if enrolled == nil {
 					err = fmt.Errorf("fencing: required archive genesis registration lacks runtime binding")
 				} else {
@@ -971,7 +1077,11 @@ func (e *FencingExecutor) authenticate(ctx context.Context, authorization string
 	if str(nested(review, "status", "user", "username")) != "system:serviceaccount:"+e.Kube.Namespace+":"+sa {
 		return "", fmt.Errorf("fencing: token namespace differs")
 	}
-	if err := validateSupervisedPod(pod); err != nil {
+	if e.AuthorityProfile == fencing.LogicalWriterProfileV1 {
+		if err := validateLogicalWriterPod(pod); err != nil {
+			return "", err
+		}
+	} else if err := validateSupervisedPod(pod); err != nil {
 		return "", err
 	}
 	var uid, ownerName string
@@ -1000,6 +1110,11 @@ func (e *FencingExecutor) authenticate(ctx context.Context, authorization string
 	env, err := e.controller().environment(ctx, ctr)
 	if err != nil || env["RHIZA_CLUSTER_ID"] != id.SourceClusterID {
 		return "", fmt.Errorf("fencing: Pod source differs")
+	}
+	if e.AuthorityProfile == fencing.LogicalWriterProfileV1 {
+		if err := noPVC(sts, ctr, env); err != nil {
+			return "", fmt.Errorf("fencing: logical workload violates the no-PVC data contract: %w", err)
+		}
 	}
 	return uid, nil
 }
@@ -1427,6 +1542,47 @@ func validateSupervisedPod(pod object) error {
 	for _, volume := range list(spec["volumes"]) {
 		if asObject(volume)["hostPath"] != nil {
 			return fmt.Errorf("fencing: host mounts unsupported")
+		}
+	}
+	return nil
+}
+
+// validateLogicalWriterPod admits the direct Rhiza main container under the
+// explicit logical authority profile. It intentionally does not relax the
+// legacy supervisor validator and currently rejects all init/sidecar paths;
+// any future init exception needs its own trusted capability profile.
+func validateLogicalWriterPod(pod object) error {
+	if str(nested(pod, "metadata", "annotations", fencingProtocolAnnotation)) != "1" {
+		return fmt.Errorf("fencing: workload is not enrolled")
+	}
+	spec := asObject(pod["spec"])
+	if spec["hostPID"] == true || spec["shareProcessNamespace"] == true || len(list(spec["containers"])) != 1 ||
+		len(list(spec["initContainers"])) != 0 || len(list(spec["ephemeralContainers"])) != 0 {
+		return fmt.Errorf("fencing: logical writer requires one private main process and no auxiliary containers")
+	}
+	for _, volume := range list(spec["volumes"]) {
+		v := asObject(volume)
+		if v["hostPath"] != nil || v["persistentVolumeClaim"] != nil {
+			return fmt.Errorf("fencing: logical writer forbids host and persistent volumes")
+		}
+	}
+	ctr := asObject(list(spec["containers"])[0])
+	if ctr["lifecycle"] != nil {
+		return fmt.Errorf("fencing: untracked lifecycle processes are unsupported")
+	}
+	for _, probe := range []string{"readinessProbe", "livenessProbe", "startupProbe"} {
+		if nested(ctr, probe, "exec") != nil {
+			return fmt.Errorf("fencing: exec probes may create untracked processes")
+		}
+	}
+	security := asObject(ctr["securityContext"])
+	if security["privileged"] == true || security["allowPrivilegeEscalation"] == true || len(list(nested(ctr, "securityContext", "capabilities", "add"))) != 0 {
+		return fmt.Errorf("fencing: logical writer requires an unprivileged main container")
+	}
+	for _, mount := range list(ctr["volumeMounts"]) {
+		p := path.Clean(str(asObject(mount)["mountPath"]))
+		if p == "/proc" || strings.HasPrefix(p, "/proc/") {
+			return fmt.Errorf("fencing: procfs must remain kernel-provided")
 		}
 	}
 	return nil

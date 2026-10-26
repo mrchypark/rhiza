@@ -44,8 +44,10 @@ func (r StartupRole) Valid() bool {
 // empty response remain static-voter compatible through the supervisor's
 // legacy registration path.
 type StartupGrant struct {
-	Identity Identity    `json:"identity"`
-	Role     StartupRole `json:"role"`
+	Identity         Identity                `json:"identity"`
+	Role             StartupRole             `json:"role"`
+	AuthorityProfile string                  `json:"authorityProfile,omitempty"`
+	LogicalBinding   *LogicalWriterBindingV1 `json:"logicalBinding,omitempty"`
 	// InitialRegistration is authority-issued, run-bound evidence that this
 	// exact static voter is entering for the first time. A voter-active role by
 	// itself never authorizes creating a missing local identity.
@@ -64,6 +66,53 @@ type StartupGrant struct {
 }
 
 func (g StartupGrant) Validate(request Identity) error {
+	if g.AuthorityProfile == LogicalWriterProfileV1 {
+		physical := request.PodName
+		if physical == "" {
+			physical = request.NodeID
+		}
+		if g.LogicalBinding == nil || g.LogicalBinding.Validate() != nil ||
+			g.LogicalBinding.SourceClusterID != g.Identity.SourceClusterID || g.LogicalBinding.NodeID != g.Identity.NodeID ||
+			g.LogicalBinding.RunID != g.Identity.RunID || g.LogicalBinding.Role != g.Role ||
+			g.LogicalBinding.AssignmentID != g.Identity.AssignmentID ||
+			(g.Role == StartupRoleVoterActive && (g.LogicalBinding.ProducerUID == "" || !mutationDigestValid(g.LogicalBinding.StoreScopeHash))) {
+			return errors.New("fencing: logical startup grant binding differs")
+		}
+		recovery := g.LogicalBinding.Recovery
+		if recovery.empty() {
+			if g.ExpectedWALIdentity != "" || g.ReplacedNodeID != "" || g.ReplacedWALIdentity != "" {
+				return errors.New("fencing: logical startup grant has unbound recovery fields")
+			}
+		} else if g.ExpectedWALIdentity != recovery.ExpectedWALIdentity {
+			return errors.New("fencing: logical startup expected WAL differs from its recovery binding")
+		} else if recovery.Kind == LogicalRecoveryReplacement {
+			if g.Role != StartupRoleLearnerPendingRemove && g.Role != StartupRoleVoterActive ||
+				g.ReplacedNodeID != recovery.ReplacedNodeID || g.ReplacedWALIdentity != recovery.ReplacedWALIdentity ||
+				(g.Role == StartupRoleLearnerPendingRemove && recovery.PromotionEvidenceHash != "") ||
+				(g.Role == StartupRoleVoterActive && !mutationDigestValid(recovery.PromotionEvidenceHash)) {
+				return errors.New("fencing: logical replacement grant differs from its recovery binding")
+			}
+		} else if recovery.Kind == LogicalRecoverySameWAL {
+			if g.Role != StartupRoleVoterActive || g.ReplacedNodeID != "" || g.ReplacedWALIdentity != "" {
+				return errors.New("fencing: logical continuation grant differs from its recovery binding")
+			}
+		}
+		if !g.Role.Valid() || g.Identity.SourceClusterID == "" || g.Identity.NodeID == "" || g.Identity.PodUID != request.PodUID ||
+			g.Identity.RunID != request.RunID || g.Identity.SourceClusterID != request.SourceClusterID || g.Identity.WALIdentity != "" ||
+			physical == "" || (g.Identity.PodName != "" && g.Identity.PodName != physical) ||
+			(g.Identity.PodName == "" && g.Identity.NodeID != physical) ||
+			(g.Identity.NodeID != physical && !mutationDigestValid(g.Identity.AssignmentID)) ||
+			(g.Identity.NodeID == physical && g.Identity.AssignmentID != "") || g.InitialRegistration != nil {
+			return errors.New("fencing: logical startup grant identity differs")
+		}
+		if err := validateLogicalStartupEnvironment(g, physical); err != nil {
+			return err
+		}
+		return nil
+	}
+	if g.AuthorityProfile != "" && g.AuthorityProfile != RuntimeWriterProfileV1 || g.LogicalBinding != nil {
+		return errors.New("fencing: unsupported startup grant profile")
+	}
 	physical := request.PodName
 	if physical == "" {
 		physical = request.NodeID
@@ -122,6 +171,43 @@ func (g StartupGrant) Validate(request Identity) error {
 		} else if g.Identity.AssignmentID == "" || g.Identity.NodeID == physical || (g.Role != StartupRoleLearnerPendingRemove && g.Role != StartupRoleVoterActive) {
 			return errors.New("fencing: startup environment is restricted to assigned identities")
 		}
+	}
+	return nil
+}
+
+func validateLogicalStartupEnvironment(g StartupGrant, physical string) error {
+	if len(g.Environment) == 0 {
+		if g.Identity.NodeID != physical {
+			return errors.New("fencing: assigned logical startup environment is missing")
+		}
+		return nil
+	}
+	total := 0
+	for key, value := range g.Environment {
+		if key != "RHIZA_NODE_ID" && key != "RHIZA_LEARNER" && key != "RHIZA_PEER_TOKEN" &&
+			key != "RHIZA_PEER_TOKENS" && key != "RHIZA_CLUSTER_MEMBERS" {
+			return errors.New("fencing: logical startup grant contains an unsupported environment override")
+		}
+		total += len(key) + len(value)
+		if len(value) > 16<<10 || total > 32<<10 {
+			return errors.New("fencing: logical startup environment exceeds capacity")
+		}
+	}
+	if g.Identity.NodeID == physical {
+		if g.Role != StartupRoleVoterActive || g.Identity.AssignmentID != "" || len(g.Environment) != 2 ||
+			g.Environment["RHIZA_CLUSTER_MEMBERS"] == "" || g.Environment["RHIZA_PEER_TOKEN"] == "" {
+			return errors.New("fencing: static logical startup environment is incomplete")
+		}
+		return nil
+	}
+	if g.Identity.AssignmentID == "" || g.Environment["RHIZA_NODE_ID"] != g.Identity.NodeID ||
+		g.Environment["RHIZA_PEER_TOKEN"] == "" || g.Environment["RHIZA_PEER_TOKENS"] != "" ||
+		g.Environment["RHIZA_CLUSTER_MEMBERS"] == "" {
+		return errors.New("fencing: assigned logical startup configuration is incomplete")
+	}
+	if g.Role == StartupRoleLearnerPendingRemove && g.Environment["RHIZA_LEARNER"] == "" ||
+		g.Role == StartupRoleVoterActive && g.Environment["RHIZA_LEARNER"] != "" {
+		return errors.New("fencing: assigned logical learner role configuration differs")
 	}
 	return nil
 }

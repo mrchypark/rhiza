@@ -58,7 +58,9 @@ func MutationRequestID(producerUID string, sequence uint64) string {
 // commits its reference; persisting this payload alone never advances coverage.
 type MutationCompactionPlan struct {
 	ProducerUID     string                    `json:"producerUID"`
-	Runtime         RuntimeBinding            `json:"runtime"`
+	Runtime         RuntimeBinding            `json:"runtime,omitzero"`
+	Profile         string                    `json:"profile,omitempty"`
+	LogicalBinding  *LogicalWriterBindingV1   `json:"logicalBinding,omitempty"`
 	WALIdentity     string                    `json:"walIdentity"`
 	PreviousThrough uint64                    `json:"previousThrough"`
 	Previous        *MutationArchiveReference `json:"previous,omitempty"`
@@ -92,11 +94,14 @@ func (plan MutationCompactionPlan) Validate() error {
 			break
 		}
 	}
-	p := MutationProducer{Runtime: plan.Runtime, WALIdentity: plan.WALIdentity, Phase: phase, ClosedThrough: closedThrough,
+	p := MutationProducer{Runtime: plan.Runtime, Profile: plan.Profile, LogicalBinding: plan.LogicalBinding, WALIdentity: plan.WALIdentity, Phase: phase, ClosedThrough: closedThrough,
 		CloseOperationID: closeOperationID, CloseRequestHash: closeRequestHash, LastAdmitted: plan.Through,
 		CompactedThrough: plan.PreviousThrough, ArchiveHead: plan.Previous, Entries: plan.Entries}
 	if err := p.Validate(); err != nil {
 		return err
+	}
+	if plan.Profile == LogicalWriterProfileV1 && (plan.LogicalBinding == nil || plan.LogicalBinding.ProducerUID != plan.ProducerUID || plan.LogicalBinding.WALIdentity != plan.WALIdentity) {
+		return fmt.Errorf("fencing: logical archive profile differs from producer binding")
 	}
 	for sequence, entry := range plan.Entries {
 		if !mutationEntryTerminal(entry) || entry.Intent.OperationID != MutationRequestID(plan.ProducerUID, sequence) {
@@ -118,7 +123,7 @@ func (p *MutationProducer) PlanMutationCompaction(producerUID string, through ui
 	if through <= p.CompactedThrough || through > p.LastAdmitted {
 		return MutationCompactionPlan{}, fmt.Errorf("fencing: archive range is outside live journal")
 	}
-	plan := MutationCompactionPlan{ProducerUID: producerUID, Runtime: p.Runtime, WALIdentity: p.WALIdentity, PreviousThrough: p.CompactedThrough, Previous: p.ArchiveHead, Through: through, Entries: make(map[uint64]MutationEntry)}
+	plan := MutationCompactionPlan{ProducerUID: producerUID, Runtime: p.Runtime, Profile: p.Profile, LogicalBinding: p.LogicalBinding, WALIdentity: p.WALIdentity, PreviousThrough: p.CompactedThrough, Previous: p.ArchiveHead, Through: through, Entries: make(map[uint64]MutationEntry)}
 	for sequence := p.CompactedThrough; sequence < through; {
 		sequence++
 		plan.Entries[sequence] = p.Entries[sequence]
@@ -149,7 +154,8 @@ func (p *MutationProducer) CommitMutationCompaction(producerUID string, plan Mut
 	if err := plan.Validate(); err != nil {
 		return err
 	}
-	if producerUID != plan.ProducerUID || p.Runtime != plan.Runtime || p.WALIdentity != plan.WALIdentity || !reference.Valid() || reference.Digest != plan.Digest() {
+	if producerUID != plan.ProducerUID || p.Runtime != plan.Runtime || p.Profile != plan.Profile || p.WALIdentity != plan.WALIdentity ||
+		!sameLogicalBinding(p.LogicalBinding, plan.LogicalBinding) || !reference.Valid() || reference.Digest != plan.Digest() {
 		return fmt.Errorf("fencing: archive identity or persisted reference differs")
 	}
 	if p.CompactedThrough == plan.Through && p.ArchiveHead != nil && *p.ArchiveHead == reference {

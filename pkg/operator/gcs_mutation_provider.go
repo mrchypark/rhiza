@@ -9,7 +9,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"os"
 	"path"
 	"strings"
 
@@ -37,7 +36,7 @@ func newGCSHeldCreateMutationProvider(client *storage.Client, scope AttestationS
 }
 
 func newGCSMutationProviderForProfile(client *storage.Client, scope AttestationStoreScope, profile string) (*gcsMutationProvider, error) {
-	if os.Getenv("STORAGE_EMULATOR_HOST") != "" {
+	if rejectGCSMutationEmulator() {
 		return nil, fmt.Errorf("fencing: independent GCS mutation profile rejects STORAGE_EMULATOR_HOST")
 	}
 	if client == nil || (profile != fencing.MutationExecutionProfile && profile != fencing.MutationHeldExecutionProfile) || scope.Provider != "gcs" || scope.Bucket == "" || scope.Prefix == "" || path.Clean(scope.Prefix) != scope.Prefix || scope.Prefix == "." || strings.HasPrefix(scope.Prefix, "/") || scope.Endpoint != "" || scope.Account != "" || scope.ConnectionStringDigest != "" {
@@ -218,6 +217,8 @@ func (p *gcsMutationProvider) settleHeldRepairCreate(ctx context.Context, key st
 // create or infer that authorization itself.
 type heldCreateAuthorization struct {
 	Runtime           fencing.RuntimeBinding
+	AuthorityProfile  string
+	LogicalBinding    *fencing.LogicalWriterBindingV1
 	WALIdentity       string
 	ProducerUID       string
 	Sequence          uint64
@@ -236,7 +237,7 @@ func (p *gcsMutationProvider) settleHeldCreate(ctx context.Context, key string, 
 	if !fencing.IsHeldCreateEligible(intent, preparation) || intent.PayloadSize < 0 || !mutationDigestValidOperator(intent.PayloadDigest) ||
 		p.profile != fencing.MutationHeldExecutionProfile || !p.matchesIntentScope(intent) ||
 		preparation.Profile != fencing.MutationHeldExecutionProfile || !preparation.GenerationSet || preparation.Generation != 0 || preparation.StoreScopeHash != intent.StoreScopeHash || payload == nil ||
-		authorization.Runtime.SourceClusterID == "" || authorization.Runtime.NodeID == "" || authorization.Runtime.PodUID == "" || authorization.Runtime.RunID == "" || authorization.Runtime.StatefulSetUID == "" ||
+		!validHeldCreateAuthority(authorization.Runtime, authorization.AuthorityProfile, authorization.LogicalBinding) ||
 		authorization.WALIdentity == "" || authorization.ProducerUID == "" || authorization.Sequence == 0 || authorization.DispatchID == "" || !mutationDigestValidOperator(authorization.PreparationHash) ||
 		authorization.GuardRootIdentity == "" || !mutationDigestValidOperator(authorization.GuardRootIdentity) || authorization.GuardRef == "" || len(authorization.GuardRef) > 512 ||
 		authorization.GuardRef == "." || strings.HasPrefix(authorization.GuardRef, "/") || path.Clean(authorization.GuardRef) != authorization.GuardRef || strings.HasPrefix(authorization.GuardRef, "../") || !mutationDigestValidOperator(authorization.GuardDigest) {
@@ -268,13 +269,20 @@ func (p *gcsMutationProvider) settleHeldCreate(ctx context.Context, key string, 
 		return fencing.MutationGuardedLogicalResolution{}, err
 	}
 	return fencing.MutationGuardedLogicalResolution{
-		Version: fencing.MutationGuardedLogicalResolutionVersion, Runtime: authorization.Runtime, WALIdentity: authorization.WALIdentity,
+		Version: fencing.MutationGuardedLogicalResolutionVersion, Runtime: authorization.Runtime, AuthorityProfile: authorization.AuthorityProfile, LogicalBinding: authorization.LogicalBinding, WALIdentity: authorization.WALIdentity,
 		ProducerUID: authorization.ProducerUID, Sequence: authorization.Sequence, Intent: intent, Preparation: preparation,
 		PreparationHash: authorization.PreparationHash, DispatchID: authorization.DispatchID, Profile: fencing.MutationHeldExecutionProfile,
 		GuardRootIdentity: authorization.GuardRootIdentity, GuardVersion: fencing.MutationGuardedLogicalResolutionVersion,
 		GuardRef: authorization.GuardRef, GuardDigest: authorization.GuardDigest,
 		ObjectGeneration: attrs.Generation, ObjectMetageneration: attrs.Metageneration, ObjectSize: attrs.Size, PayloadDigest: intent.PayloadDigest,
 	}, nil
+}
+
+func validHeldCreateAuthority(runtime fencing.RuntimeBinding, profile string, binding *fencing.LogicalWriterBindingV1) bool {
+	if profile == fencing.LogicalWriterProfileV1 {
+		return runtime == (fencing.RuntimeBinding{}) && binding != nil && binding.ValidateBound() == nil && binding.Role == fencing.StartupRoleVoterActive
+	}
+	return profile == "" && binding == nil && runtime.SourceClusterID != "" && runtime.NodeID != "" && runtime.PodUID != "" && runtime.RunID != "" && runtime.StatefulSetUID != ""
 }
 
 // finalizeHeldCreate clears a hold only for a self-consistent, terminal
@@ -479,16 +487,18 @@ func (p *gcsMutationProvider) verifyHeldCreateBytes(ctx context.Context, target 
 }
 
 type heldCreateGuardRecord struct {
-	Version         int                         `json:"version"`
-	RootIdentity    string                      `json:"rootIdentity"`
-	Runtime         fencing.RuntimeBinding      `json:"runtime"`
-	WALIdentity     string                      `json:"walIdentity"`
-	ProducerUID     string                      `json:"producerUID"`
-	Sequence        uint64                      `json:"sequence"`
-	Intent          fencing.MutationIntent      `json:"intent"`
-	Preparation     fencing.MutationPreparation `json:"preparation"`
-	PreparationHash string                      `json:"preparationHash"`
-	DispatchID      string                      `json:"dispatchID"`
+	Version          int                             `json:"version"`
+	RootIdentity     string                          `json:"rootIdentity"`
+	Runtime          fencing.RuntimeBinding          `json:"runtime"`
+	AuthorityProfile string                          `json:"authorityProfile,omitempty"`
+	LogicalBinding   *fencing.LogicalWriterBindingV1 `json:"logicalBinding,omitempty"`
+	WALIdentity      string                          `json:"walIdentity"`
+	ProducerUID      string                          `json:"producerUID"`
+	Sequence         uint64                          `json:"sequence"`
+	Intent           fencing.MutationIntent          `json:"intent"`
+	Preparation      fencing.MutationPreparation     `json:"preparation"`
+	PreparationHash  string                          `json:"preparationHash"`
+	DispatchID       string                          `json:"dispatchID"`
 }
 
 func (p *gcsMutationProvider) replayGuardedCreate(ctx context.Context, evidenceStore *AuthorityEvidenceStore, request mutationGuardedReplayRequest, payload io.Reader) (fencing.MutationGuardedLogicalResolution, error) {
@@ -505,7 +515,7 @@ func (p *gcsMutationProvider) replayGuardedCreate(ctx context.Context, evidenceS
 	if err := verifyHeldCreateGuardReadback(ctx, evidenceStore, guardRef, recordBytes); err != nil {
 		return fencing.MutationGuardedLogicalResolution{}, err
 	}
-	authorization := heldCreateAuthorization{Runtime: request.Runtime, WALIdentity: request.WALIdentity, ProducerUID: request.ProducerUID,
+	authorization := heldCreateAuthorization{Runtime: request.Runtime, AuthorityProfile: request.AuthorityProfile, LogicalBinding: request.LogicalBinding, WALIdentity: request.WALIdentity, ProducerUID: request.ProducerUID,
 		Sequence: request.Sequence, PreparationHash: request.PreparationHash, DispatchID: request.DispatchID,
 		GuardRootIdentity: request.GuardRootIdentity, GuardRef: guardRef, GuardDigest: guardDigest}
 	return p.settleHeldCreate(ctx, request.Intent.Key, request.Intent, request.Preparation, payload, authorization)
@@ -519,7 +529,7 @@ func (p *gcsMutationProvider) verifyGuardedCreate(ctx context.Context, evidenceS
 	if err != nil {
 		return err
 	}
-	if evidence.Version != fencing.MutationGuardedLogicalResolutionVersion || evidence.Runtime != request.Runtime || evidence.WALIdentity != request.WALIdentity ||
+	if evidence.Version != fencing.MutationGuardedLogicalResolutionVersion || evidence.Runtime != request.Runtime || evidence.AuthorityProfile != request.AuthorityProfile || !sameLogicalProducerBinding(evidence.LogicalBinding, request.LogicalBinding) || evidence.WALIdentity != request.WALIdentity ||
 		evidence.ProducerUID != request.ProducerUID || evidence.Sequence != request.Sequence || evidence.Intent != request.Intent || evidence.Preparation != request.Preparation ||
 		evidence.PreparationHash != request.PreparationHash || evidence.DispatchID != request.DispatchID || evidence.Profile != fencing.MutationHeldExecutionProfile ||
 		evidence.GuardRootIdentity != request.GuardRootIdentity || evidence.GuardVersion != fencing.MutationGuardedLogicalResolutionVersion ||
@@ -544,14 +554,14 @@ func (p *gcsMutationProvider) verifyGuardedCreate(ctx context.Context, evidenceS
 }
 
 func heldCreateGuard(request mutationGuardedReplayRequest) (heldCreateGuardRecord, []byte, string, string, error) {
-	if request.Runtime.SourceClusterID == "" || request.Runtime.NodeID == "" || request.Runtime.PodUID == "" || request.Runtime.RunID == "" || request.Runtime.StatefulSetUID == "" ||
+	if !validHeldCreateAuthority(request.Runtime, request.AuthorityProfile, request.LogicalBinding) ||
 		request.WALIdentity == "" || request.ProducerUID == "" || request.Sequence == 0 || request.DispatchID == "" || request.Intent.Kind != "upload" ||
 		!fencing.IsHeldCreateEligible(request.Intent, request.Preparation) || request.Intent.StoreScopeHash == "" ||
 		!mutationDigestValidOperator(request.PreparationHash) || request.GuardRootIdentity == "" || !mutationDigestValidOperator(request.GuardRootIdentity) {
 		return heldCreateGuardRecord{}, nil, "", "", fmt.Errorf("fencing: incomplete guarded held-create request")
 	}
 	record := heldCreateGuardRecord{Version: fencing.MutationGuardedLogicalResolutionVersion, RootIdentity: request.GuardRootIdentity,
-		Runtime: request.Runtime, WALIdentity: request.WALIdentity, ProducerUID: request.ProducerUID, Sequence: request.Sequence,
+		Runtime: request.Runtime, AuthorityProfile: request.AuthorityProfile, LogicalBinding: request.LogicalBinding, WALIdentity: request.WALIdentity, ProducerUID: request.ProducerUID, Sequence: request.Sequence,
 		Intent: request.Intent, Preparation: request.Preparation, PreparationHash: request.PreparationHash, DispatchID: request.DispatchID}
 	body, err := json.Marshal(record)
 	if err != nil {
@@ -559,6 +569,9 @@ func heldCreateGuard(request mutationGuardedReplayRequest) (heldCreateGuardRecor
 	}
 	guardDigest := authorityStateDigest(body)
 	keyDigest := hashJSON([]string{"rhiza-held-create-guard-v1", request.Intent.StoreScopeHash, request.Intent.Key})
+	if request.AuthorityProfile == fencing.LogicalWriterProfileV1 {
+		keyDigest = hashJSON([]any{"rhiza-logical-held-create-guard-v1", request.AuthorityProfile, request.LogicalBinding, request.Intent.StoreScopeHash, request.Intent.Key})
+	}
 	guardRef := path.Join("mutation-guards", keyDigest+".json")
 	return record, body, guardRef, guardDigest, nil
 }

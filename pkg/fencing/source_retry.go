@@ -191,7 +191,8 @@ func (d sourceRetryData) validate() error {
 			return fmt.Errorf("fencing: source retry original tuple/owner differs")
 		}
 		owners[intent.OwnerStep] = true
-		p := MutationProducer{Runtime: d.Binding.Producer.Runtime, WALIdentity: d.Binding.Identity.WALIdentity}
+		p := MutationProducer{Runtime: d.Binding.Producer.Runtime, Profile: d.Binding.Producer.Profile,
+			LogicalBinding: d.Binding.Producer.LogicalBinding, WALIdentity: d.Binding.Identity.WALIdentity}
 		if err := p.validateEntry(step.Sequence, step.Entry); err != nil {
 			return err
 		}

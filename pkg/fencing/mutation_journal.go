@@ -158,24 +158,26 @@ type MutationGenerationZeroGuard struct {
 // uncertain held generation-zero create. It deliberately does not terminalize
 // the original provider permission; the live held object fences later effects.
 type MutationGuardedLogicalResolution struct {
-	Version              int                 `json:"version"`
-	Runtime              RuntimeBinding      `json:"runtime"`
-	WALIdentity          string              `json:"walIdentity"`
-	ProducerUID          string              `json:"producerUID"`
-	Sequence             uint64              `json:"sequence"`
-	Intent               MutationIntent      `json:"intent"`
-	Preparation          MutationPreparation `json:"preparation"`
-	PreparationHash      string              `json:"preparationHash"`
-	DispatchID           string              `json:"dispatchID"`
-	Profile              string              `json:"profile"`
-	GuardRootIdentity    string              `json:"guardRootIdentity"`
-	GuardVersion         int                 `json:"guardVersion"`
-	GuardRef             string              `json:"guardRef"`
-	GuardDigest          string              `json:"guardDigest"`
-	ObjectGeneration     int64               `json:"objectGeneration"`
-	ObjectMetageneration int64               `json:"objectMetageneration"`
-	ObjectSize           int64               `json:"objectSize"`
-	PayloadDigest        string              `json:"payloadDigest"`
+	Version              int                     `json:"version"`
+	Runtime              RuntimeBinding          `json:"runtime,omitzero"`
+	AuthorityProfile     string                  `json:"authorityProfile,omitempty"`
+	LogicalBinding       *LogicalWriterBindingV1 `json:"logicalBinding,omitempty"`
+	WALIdentity          string                  `json:"walIdentity"`
+	ProducerUID          string                  `json:"producerUID"`
+	Sequence             uint64                  `json:"sequence"`
+	Intent               MutationIntent          `json:"intent"`
+	Preparation          MutationPreparation     `json:"preparation"`
+	PreparationHash      string                  `json:"preparationHash"`
+	DispatchID           string                  `json:"dispatchID"`
+	Profile              string                  `json:"profile"`
+	GuardRootIdentity    string                  `json:"guardRootIdentity"`
+	GuardVersion         int                     `json:"guardVersion"`
+	GuardRef             string                  `json:"guardRef"`
+	GuardDigest          string                  `json:"guardDigest"`
+	ObjectGeneration     int64                   `json:"objectGeneration"`
+	ObjectMetageneration int64                   `json:"objectMetageneration"`
+	ObjectSize           int64                   `json:"objectSize"`
+	PayloadDigest        string                  `json:"payloadDigest"`
 }
 
 const MutationGuardedLogicalResolutionVersion = 1
@@ -227,14 +229,16 @@ func (r MutationGenerationZeroRights) Digest() string {
 // each transition before dispatch or ACK; this type does not provide persistence.
 // Missing state is Reserved/unknown, never an implicitly open producer.
 type MutationProducer struct {
-	Runtime          RuntimeBinding `json:"runtime"`
-	WALIdentity      string         `json:"walIdentity,omitempty"`
-	Phase            MutationPhase  `json:"phase"`
-	LastAdmitted     uint64         `json:"lastAdmitted"`
-	ClosedThrough    uint64         `json:"closedThrough,omitempty"`
-	CloseOperationID string         `json:"closeOperationID,omitempty"`
-	CloseRequestHash string         `json:"closeRequestHash,omitempty"`
-	CompactedThrough uint64         `json:"compactedThrough,omitempty"`
+	Runtime          RuntimeBinding          `json:"runtime,omitzero"`
+	Profile          string                  `json:"profile,omitempty"`
+	LogicalBinding   *LogicalWriterBindingV1 `json:"logicalBinding,omitempty"`
+	WALIdentity      string                  `json:"walIdentity,omitempty"`
+	Phase            MutationPhase           `json:"phase"`
+	LastAdmitted     uint64                  `json:"lastAdmitted"`
+	ClosedThrough    uint64                  `json:"closedThrough,omitempty"`
+	CloseOperationID string                  `json:"closeOperationID,omitempty"`
+	CloseRequestHash string                  `json:"closeRequestHash,omitempty"`
+	CompactedThrough uint64                  `json:"compactedThrough,omitempty"`
 	// RetiredStageThrough is the contiguous archive prefix whose remote stage
 	// payloads have been retired (or whose entries had no staged payload).
 	// It is persisted separately from CompactedThrough so retirement can resume
@@ -254,9 +258,25 @@ func (p *MutationProducer) Validate() error {
 	if p == nil {
 		return fmt.Errorf("fencing: missing mutation producer")
 	}
-	id := Identity{SourceClusterID: p.Runtime.SourceClusterID, NodeID: p.Runtime.NodeID, PodUID: p.Runtime.PodUID, RunID: p.Runtime.RunID, AssignmentID: p.Runtime.AssignmentID}
-	if err := p.Runtime.Validate(id); err != nil {
-		return err
+	switch p.Profile {
+	case LogicalWriterProfileV1:
+		if p.Runtime != (RuntimeBinding{}) || p.LogicalBinding == nil || p.LogicalBinding.Validate() != nil ||
+			p.LogicalBinding.Role != StartupRoleVoterActive || p.LogicalBinding.WALIdentity != p.WALIdentity {
+			return fmt.Errorf("fencing: incomplete logical mutation producer binding")
+		}
+		if p.WALIdentity != "" && p.LogicalBinding.ValidateBound() != nil {
+			return fmt.Errorf("fencing: bound logical mutation producer lacks writer scope")
+		}
+	case "", RuntimeWriterProfileV1:
+		if p.LogicalBinding != nil {
+			return fmt.Errorf("fencing: physical mutation producer contains logical binding")
+		}
+		id := Identity{SourceClusterID: p.Runtime.SourceClusterID, NodeID: p.Runtime.NodeID, PodUID: p.Runtime.PodUID, RunID: p.Runtime.RunID, AssignmentID: p.Runtime.AssignmentID}
+		if err := p.Runtime.Validate(id); err != nil {
+			return err
+		}
+	default:
+		return fmt.Errorf("fencing: unknown mutation producer profile")
 	}
 	if p.CompactedThrough > p.LastAdmitted || p.RetiredStageThrough > p.CompactedThrough || p.Entries == nil || p.LastAdmitted-p.CompactedThrough > MaxMutationJournalEntries || uint64(len(p.Entries)) != p.LastAdmitted-p.CompactedThrough {
 		return fmt.Errorf("fencing: mutation journal is incomplete or exceeds capacity")
@@ -311,6 +331,33 @@ func (p *MutationProducer) Validate() error {
 		}
 	}
 	return nil
+}
+
+func (p *MutationProducer) validateIdentity(id Identity) error {
+	if p == nil {
+		return fmt.Errorf("fencing: missing mutation producer")
+	}
+	if p.Profile == LogicalWriterProfileV1 {
+		if p.LogicalBinding == nil || p.LogicalBinding.Validate() != nil || id.SourceClusterID != p.LogicalBinding.SourceClusterID ||
+			id.NodeID != p.LogicalBinding.NodeID || id.RunID != p.LogicalBinding.RunID || id.AssignmentID != p.LogicalBinding.AssignmentID ||
+			(p.LogicalBinding.WALIdentity != "" && id.WALIdentity != p.LogicalBinding.WALIdentity) {
+			return fmt.Errorf("fencing: logical mutation producer identity differs")
+		}
+		return nil
+	}
+	return p.Runtime.Validate(id)
+}
+
+func (p *MutationProducer) identity(walIdentity string) Identity {
+	if p != nil && p.Profile == LogicalWriterProfileV1 && p.LogicalBinding != nil {
+		return Identity{SourceClusterID: p.LogicalBinding.SourceClusterID, NodeID: p.LogicalBinding.NodeID,
+			RunID: p.LogicalBinding.RunID, AssignmentID: p.LogicalBinding.AssignmentID, WALIdentity: walIdentity}
+	}
+	if p == nil {
+		return Identity{}
+	}
+	return Identity{SourceClusterID: p.Runtime.SourceClusterID, NodeID: p.Runtime.NodeID, PodUID: p.Runtime.PodUID,
+		RunID: p.Runtime.RunID, AssignmentID: p.Runtime.AssignmentID, WALIdentity: walIdentity}
 }
 
 // AdvanceArchivedStageRetirement advances exactly one archived sequence after
@@ -402,6 +449,16 @@ func NewMutationProducer(id Identity, runtime RuntimeBinding) (*MutationProducer
 	return &MutationProducer{Runtime: runtime, Phase: MutationReserved, Entries: make(map[uint64]MutationEntry)}, nil
 }
 
+// NewLogicalMutationProducer constructs the existing durable journal value
+// under an explicit logical-writer profile. Pending learners are ineligible.
+func NewLogicalMutationProducer(binding LogicalWriterBindingV1) (*MutationProducer, error) {
+	if binding.Validate() != nil || binding.Role != StartupRoleVoterActive || binding.ProducerUID == "" || !mutationDigestValid(binding.StoreScopeHash) {
+		return nil, fmt.Errorf("fencing: invalid logical mutation producer binding")
+	}
+	return &MutationProducer{Profile: LogicalWriterProfileV1, LogicalBinding: &binding, WALIdentity: binding.WALIdentity,
+		Phase: MutationReserved, Entries: make(map[uint64]MutationEntry)}, nil
+}
+
 // Activate is authorized only after the matching durable WAL bind. A closer
 // can close a Reserved producer before it ever admits a physical mutation.
 func (p *MutationProducer) Activate(id Identity) error {
@@ -414,14 +471,22 @@ func (p *MutationProducer) Activate(id Identity) error {
 	if p.Phase != MutationReserved && p.Phase != MutationOpen {
 		return ErrClosed
 	}
-	if err := p.Runtime.Validate(id); err != nil {
+	if err := p.validateIdentity(id); err != nil {
 		return err
+	}
+	if p.Profile == LogicalWriterProfileV1 && (p.LogicalBinding.ProducerUID == "" || !mutationDigestValid(p.LogicalBinding.StoreScopeHash)) {
+		return fmt.Errorf("fencing: logical mutation producer lacks producer scope")
 	}
 	if id.WALIdentity == "" || (p.WALIdentity != "" && p.WALIdentity != id.WALIdentity) {
 		return fmt.Errorf("fencing: mutation producer WAL differs")
 	}
 	p.WALIdentity, p.Phase = id.WALIdentity, MutationOpen
-	return nil
+	if p.Profile == LogicalWriterProfileV1 {
+		binding := *p.LogicalBinding
+		binding.WALIdentity = id.WALIdentity
+		p.LogicalBinding = &binding
+	}
+	return p.Validate()
 }
 
 // BindWAL pins the already-authorized WAL on a Reserved producer without
@@ -438,14 +503,22 @@ func (p *MutationProducer) BindWAL(id Identity) error {
 	if p.Phase != MutationReserved || p.LastAdmitted != 0 {
 		return ErrClosed
 	}
-	if err := p.Runtime.Validate(id); err != nil {
+	if err := p.validateIdentity(id); err != nil {
 		return err
+	}
+	if p.Profile == LogicalWriterProfileV1 && (p.LogicalBinding.ProducerUID == "" || !mutationDigestValid(p.LogicalBinding.StoreScopeHash)) {
+		return fmt.Errorf("fencing: logical mutation producer lacks producer scope")
 	}
 	if id.WALIdentity == "" || (p.WALIdentity != "" && p.WALIdentity != id.WALIdentity) {
 		return fmt.Errorf("fencing: mutation producer WAL differs")
 	}
 	p.WALIdentity = id.WALIdentity
-	return nil
+	if p.Profile == LogicalWriterProfileV1 {
+		binding := *p.LogicalBinding
+		binding.WALIdentity = id.WALIdentity
+		p.LogicalBinding = &binding
+	}
+	return p.Validate()
 }
 
 func (p *MutationProducer) Admit(sequence uint64, intent MutationIntent) error {
@@ -776,7 +849,7 @@ func (p *MutationProducer) RecordGenerationZeroGuard(producerUID string, sequenc
 // producer entry. The caller must independently load GuardRef, verify its UID
 // and digest, and read back the held object's exact positive generation.
 func (p *MutationProducer) ValidateGenerationZeroGuard(producerUID string, sequence uint64, repair EngineRepairRecord, entry MutationEntry) error {
-	if p == nil || p.Phase != MutationClosed || p.WALIdentity == "" || producerUID == "" || entry.GenerationZeroGuard == nil || entry.GenerationZeroGuard.ProducerUID != producerUID ||
+	if p == nil || p.Profile == LogicalWriterProfileV1 || p.Phase != MutationClosed || p.WALIdentity == "" || producerUID == "" || entry.GenerationZeroGuard == nil || entry.GenerationZeroGuard.ProducerUID != producerUID ||
 		repair.Validate() != nil || repair.IdentityDigest() != entry.GenerationZeroGuard.RepairRecordHash || repair.Binding != entry.GenerationZeroGuard.RepairBinding || !repair.evidencePhase().atLeast(RepairStorageClosing) {
 		return fmt.Errorf("fencing: generation-zero guard producer identity differs")
 	}
@@ -788,7 +861,7 @@ func (p *MutationProducer) ValidateGenerationZeroGuard(producerUID string, seque
 }
 
 func (p *MutationProducer) validateGenerationZeroGuard(sequence uint64, entry MutationEntry, guard MutationGenerationZeroGuard) error {
-	if p == nil || p.Phase != MutationClosed || sequence == 0 || sequence > p.ClosedThrough || entry.Preparation == nil ||
+	if p == nil || p.Profile == LogicalWriterProfileV1 || p.Phase != MutationClosed || sequence == 0 || sequence > p.ClosedThrough || entry.Preparation == nil ||
 		guard.Version != MutationGenerationZeroGuardVersion || guard.RepairBinding.Validate() != nil || guard.RepairBinding.FreezeSlot == 0 ||
 		guard.RepairBinding.SourceClusterID != p.Runtime.SourceClusterID || guard.RepairBinding.OldMemberID != p.Runtime.NodeID ||
 		guard.RepairBinding.OldWALIdentity != p.WALIdentity || guard.RepairBinding.StatefulSetUID != p.Runtime.StatefulSetUID ||
@@ -821,7 +894,7 @@ func (p *MutationProducer) validateGenerationZeroGuard(sequence uint64, entry Mu
 }
 
 func (p *MutationProducer) validateGenerationZeroRights(sequence uint64, entry MutationEntry, rights MutationGenerationZeroRights) error {
-	if p == nil || p.Phase != MutationClosed || sequence == 0 || sequence > p.ClosedThrough || entry.Preparation == nil ||
+	if p == nil || p.Profile == LogicalWriterProfileV1 || p.Phase != MutationClosed || sequence == 0 || sequence > p.ClosedThrough || entry.Preparation == nil ||
 		!IsHeldCreateEligible(entry.Intent, *entry.Preparation) || !entry.DispatchClosed || len(entry.Dispatches) != 1 ||
 		rights.RepairBinding.Validate() != nil || rights.RepairBinding.SourceClusterID != p.Runtime.SourceClusterID ||
 		rights.RepairBinding.OldMemberID != p.Runtime.NodeID || rights.RepairBinding.OldWALIdentity != p.WALIdentity ||
@@ -870,16 +943,23 @@ func (p *MutationProducer) ValidateGuardedLogicalResolution(producerUID string, 
 	if p == nil || p.Phase != MutationClosed || p.WALIdentity == "" || producerUID == "" || entry.GuardedLogicalResolution == nil || entry.GuardedLogicalResolution.ProducerUID != producerUID {
 		return fmt.Errorf("fencing: guarded logical resolution producer identity differs")
 	}
-	id := Identity{SourceClusterID: p.Runtime.SourceClusterID, NodeID: p.Runtime.NodeID, PodUID: p.Runtime.PodUID, RunID: p.Runtime.RunID, AssignmentID: p.Runtime.AssignmentID, WALIdentity: p.WALIdentity}
-	if err := p.Runtime.Validate(id); err != nil {
+	id := p.identity(p.WALIdentity)
+	if err := p.validateIdentity(id); err != nil {
 		return err
 	}
 	return p.validateGuardedLogicalResolution(sequence, entry, *entry.GuardedLogicalResolution)
 }
 
 func (p *MutationProducer) validateGuardedLogicalResolution(sequence uint64, entry MutationEntry, evidence MutationGuardedLogicalResolution) error {
+	if p == nil {
+		return fmt.Errorf("fencing: missing mutation producer")
+	}
+	identityBindingMatches := evidence.AuthorityProfile == p.Profile && evidence.LogicalBinding == nil && evidence.Runtime == p.Runtime
+	if p.Profile == LogicalWriterProfileV1 {
+		identityBindingMatches = evidence.AuthorityProfile == LogicalWriterProfileV1 && evidence.Runtime == (RuntimeBinding{}) && sameLogicalBinding(evidence.LogicalBinding, p.LogicalBinding)
+	}
 	if p == nil || p.Phase != MutationClosed || sequence > p.ClosedThrough || entry.Preparation == nil || evidence.Version != MutationGuardedLogicalResolutionVersion ||
-		evidence.Runtime != p.Runtime || evidence.WALIdentity != p.WALIdentity || evidence.ProducerUID == "" || evidence.Sequence != sequence ||
+		!identityBindingMatches || evidence.WALIdentity != p.WALIdentity || evidence.ProducerUID == "" || evidence.Sequence != sequence ||
 		evidence.Intent != entry.Intent || evidence.Preparation != *entry.Preparation || evidence.Profile != MutationHeldExecutionProfile ||
 		evidence.Preparation.Profile != MutationHeldExecutionProfile || evidence.PreparationHash != p.preparationHash(sequence, entry) ||
 		evidence.GuardRootIdentity == "" || !mutationDigestValid(evidence.GuardRootIdentity) || evidence.GuardVersion != MutationGuardedLogicalResolutionVersion || evidence.GuardRef == "" || len(evidence.GuardRef) > 512 ||
@@ -905,6 +985,19 @@ func (p *MutationProducer) validateGuardedLogicalResolution(sequence uint64, ent
 }
 
 func (p *MutationProducer) preparationHash(sequence uint64, entry MutationEntry) string {
+	if p.Profile == LogicalWriterProfileV1 {
+		encoded, _ := json.Marshal(struct {
+			Domain         string
+			Profile        string
+			LogicalBinding LogicalWriterBindingV1
+			WALIdentity    string
+			Sequence       uint64
+			Intent         MutationIntent
+			Prepared       MutationPreparation
+		}{"rhiza-logical-writer-mutation-preparation-v1", p.Profile, *p.LogicalBinding, p.WALIdentity, sequence, entry.Intent, *entry.Preparation})
+		digest := sha256.Sum256(encoded)
+		return hex.EncodeToString(digest[:])
+	}
 	encoded, _ := json.Marshal(struct {
 		Runtime     RuntimeBinding
 		WALIdentity string

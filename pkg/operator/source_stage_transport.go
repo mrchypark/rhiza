@@ -76,12 +76,16 @@ func (e *FencingExecutor) handleSourceStageReserve(w http.ResponseWriter, r *htt
 		http.Error(w, "invalid source stage reservation", http.StatusBadRequest)
 		return
 	}
-	producerUID, scope, stages, runtime, err := e.sourceStageProducer(r, request.Identity)
+	producerUID, scope, stages, runtime, logical, err := e.sourceStageProducer(r, request.Identity)
 	if err == nil && request.Draft.StoreScopeHash != scope {
 		err = fmt.Errorf("fencing: source stage scope differs from enrolled workload")
 	}
 	if err == nil {
-		err = e.reserveSourceStage(r.Context(), runtime, stages, producerUID, request.Ticket, request.Draft)
+		if logical {
+			err = stages.ReserveContext(r.Context(), producerUID, request.Ticket, request.Draft)
+		} else {
+			err = e.reserveSourceStage(r.Context(), runtime, stages, producerUID, request.Ticket, request.Draft)
+		}
 	}
 	if err != nil {
 		e.writeSourceStageError(w, err)
@@ -101,7 +105,7 @@ func (e *FencingExecutor) handleSourceStageSeal(w http.ResponseWriter, r *http.R
 		http.Error(w, "invalid source stage identity", http.StatusBadRequest)
 		return
 	}
-	producerUID, _, stages, _, err := e.sourceStageProducer(r, id)
+	producerUID, _, stages, _, _, err := e.sourceStageProducer(r, id)
 	if err != nil {
 		e.writeSourceStageError(w, err)
 		return
@@ -134,7 +138,7 @@ func (e *FencingExecutor) handleSourceStageCancel(w http.ResponseWriter, r *http
 		http.Error(w, "invalid source stage identity", http.StatusBadRequest)
 		return
 	}
-	producerUID, _, stages, _, err := e.sourceStageProducer(r, id)
+	producerUID, _, stages, _, _, err := e.sourceStageProducer(r, id)
 	if err == nil {
 		err = stages.CancelContext(r.Context(), producerUID, ticket)
 	}
@@ -160,53 +164,75 @@ func sourceStageIdentity(r *http.Request) (fencing.Identity, error) {
 	return id, nil
 }
 
-func (e *FencingExecutor) sourceStageProducer(r *http.Request, id fencing.Identity) (string, string, *SourceStageStore, fencing.RuntimeBinding, error) {
+func (e *FencingExecutor) sourceStageProducer(r *http.Request, id fencing.Identity) (string, string, *SourceStageStore, fencing.RuntimeBinding, bool, error) {
 	uid, err := e.authenticate(r.Context(), r.Header.Get("Authorization"), id)
 	if err != nil {
-		return "", "", nil, fencing.RuntimeBinding{}, sourceStageAuthenticationError{err: err}
+		return "", "", nil, fencing.RuntimeBinding{}, false, sourceStageAuthenticationError{err: err}
 	}
 	state, err := e.read(r.Context(), uid, id.SourceClusterID)
 	if err != nil {
-		return "", "", nil, fencing.RuntimeBinding{}, err
+		return "", "", nil, fencing.RuntimeBinding{}, false, err
 	}
 	run, ok := state.Ledger.Runs[id.RunID]
 	_, closed := state.Ledger.ClosedNodes[id.NodeID]
+	if state.Ledger.Profile == fencing.LogicalWriterProfileV1 {
+		if err := e.validateMutationJournalProfile(state); err != nil {
+			return "", "", nil, fencing.RuntimeBinding{}, true, err
+		}
+		if !ok || fencing.RunRole(run) != fencing.StartupRoleVoterActive || run.Identity != id || run.Stop != nil || closed || state.Ledger.ClosedBy != "" ||
+			run.Runtime != nil || run.LogicalBinding == nil || run.LogicalBinding.ValidateBound() != nil || !run.LogicalBinding.MatchesIdentity(id) ||
+			run.MutationProducerUID == "" || run.MutationScopeHash == "" || !fencing.MutationProfileSupported(run.MutationProfile) {
+			return "", "", nil, fencing.RuntimeBinding{}, true, fmt.Errorf("fencing: source stage is outside the active logical producer")
+		}
+		stages, err := e.sourceStagesForRoot(r.Context(), uid, id.SourceClusterID)
+		if err != nil || (run.MutationStageIncarnation != "" && run.MutationStageIncarnation != stages.incarnation) {
+			return "", "", nil, fencing.RuntimeBinding{}, true, errors.Join(err, fmt.Errorf("fencing: bound logical source stage store is unavailable or differs"))
+		}
+		producer, producerUID, _, err := e.AuthorityState.ReadLogicalProducer(r.Context(), uid, *run.LogicalBinding)
+		if err != nil {
+			return "", "", nil, fencing.RuntimeBinding{}, true, err
+		}
+		if producerUID != run.MutationProducerUID || producer.Profile != fencing.LogicalWriterProfileV1 || producer.WALIdentity != id.WALIdentity || producer.Phase != fencing.MutationOpen || producer.Validate() != nil {
+			return "", "", nil, fencing.RuntimeBinding{}, true, fmt.Errorf("fencing: logical source stage producer is not open and bound")
+		}
+		return producerUID, run.MutationScopeHash, stages, fencing.RuntimeBinding{}, true, nil
+	}
 	if !ok || fencing.RunRole(run) != fencing.StartupRoleVoterActive || run.Identity != id || run.Stop != nil || closed || state.Ledger.ClosedBy != "" || !state.Ledger.RequireMutationJournal || run.Runtime == nil || run.Runtime.StatefulSetUID != uid || run.MutationProducerUID == "" || run.MutationScopeHash == "" || !fencing.MutationProfileSupported(run.MutationProfile) {
-		return "", "", nil, fencing.RuntimeBinding{}, fmt.Errorf("fencing: source stage is outside the active enrolled producer")
+		return "", "", nil, fencing.RuntimeBinding{}, false, fmt.Errorf("fencing: source stage is outside the active enrolled producer")
 	}
 	if err := run.Runtime.Validate(id); err != nil {
-		return "", "", nil, fencing.RuntimeBinding{}, err
+		return "", "", nil, fencing.RuntimeBinding{}, false, err
 	}
 	stages, err := e.sourceStagesFor(r.Context(), *run.Runtime)
 	if err != nil || run.MutationStageIncarnation == "" || run.MutationStageIncarnation != stages.incarnation {
-		return "", "", nil, fencing.RuntimeBinding{}, errors.Join(err, fmt.Errorf("fencing: bound source stage store is unavailable or differs"))
+		return "", "", nil, fencing.RuntimeBinding{}, false, errors.Join(err, fmt.Errorf("fencing: bound source stage store is unavailable or differs"))
 	}
 	var producer fencing.MutationProducer
 	var producerUID string
 	if e.AuthorityState != nil {
 		producer, producerUID, _, err = e.AuthorityState.ReadProducer(r.Context(), *run.Runtime)
 		if err != nil {
-			return "", "", nil, fencing.RuntimeBinding{}, err
+			return "", "", nil, fencing.RuntimeBinding{}, false, err
 		}
 	} else {
 		var resource object
 		if err := e.Kube.Get(r.Context(), e.mutationProducerPath(*run.Runtime), &resource); err != nil {
-			return "", "", nil, fencing.RuntimeBinding{}, err
+			return "", "", nil, fencing.RuntimeBinding{}, false, err
 		}
 		if nested(resource, "metadata", "deletionTimestamp") != nil || str(nested(resource, "metadata", "resourceVersion")) == "" {
-			return "", "", nil, fencing.RuntimeBinding{}, fmt.Errorf("fencing: source stage producer storage identity differs")
+			return "", "", nil, fencing.RuntimeBinding{}, false, fmt.Errorf("fencing: source stage producer storage identity differs")
 		}
 		producerUID = str(nested(resource, "metadata", "uid"))
 		d := json.NewDecoder(strings.NewReader(str(nested(resource, "data", "producer.json"))))
 		d.DisallowUnknownFields()
 		if err := d.Decode(&producer); err != nil || d.Decode(new(any)) != io.EOF {
-			return "", "", nil, fencing.RuntimeBinding{}, fmt.Errorf("fencing: source stage producer record is invalid")
+			return "", "", nil, fencing.RuntimeBinding{}, false, fmt.Errorf("fencing: source stage producer record is invalid")
 		}
 	}
 	if producerUID != run.MutationProducerUID || producer.Runtime != *run.Runtime || producer.WALIdentity != id.WALIdentity || producer.Phase != fencing.MutationOpen || producer.Validate() != nil {
-		return "", "", nil, fencing.RuntimeBinding{}, fmt.Errorf("fencing: source stage producer is not open and bound")
+		return "", "", nil, fencing.RuntimeBinding{}, false, fmt.Errorf("fencing: source stage producer is not open and bound")
 	}
-	return run.MutationProducerUID, run.MutationScopeHash, stages, *run.Runtime, nil
+	return run.MutationProducerUID, run.MutationScopeHash, stages, *run.Runtime, false, nil
 }
 
 func (e *FencingExecutor) reserveSourceStage(ctx context.Context, runtime fencing.RuntimeBinding, stages *SourceStageStore, producerUID, ticket string, draft fencing.MutationIntent) error {
@@ -232,6 +258,10 @@ func (e *FencingExecutor) writeSourceStageError(w http.ResponseWriter, err error
 	}
 	if errors.Is(err, fencing.ErrMutationConditionFailed) {
 		w.WriteHeader(http.StatusPreconditionFailed)
+		return
+	}
+	if errors.Is(err, errLogicalMutationExecutionUnavailable) {
+		http.Error(w, "logical source mutation execution is not configured", http.StatusServiceUnavailable)
 		return
 	}
 	if transientFenceAuthority(err) {

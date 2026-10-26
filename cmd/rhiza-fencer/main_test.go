@@ -6,6 +6,7 @@ import (
 	"testing"
 
 	objectstore "github.com/mrchypark/rhiza/internal/objstore"
+	"github.com/mrchypark/rhiza/pkg/fencing"
 )
 
 func TestServeRejectsLegacyAttestorBeforeOpeningCredentialsOrListener(t *testing.T) {
@@ -37,6 +38,38 @@ func TestSourceWriterConfigValidationIsPureAndFailClosed(t *testing.T) {
 			name: "independent profile preserves credential file mode",
 			config: sourceWriterConfig{Independent: true, HasCanonicalState: true, SourceProvider: objectstore.ProviderGCS,
 				RuntimeAgentCA: "/runtime-agent-ca", CredentialsFile: "/writer/credentials.json"},
+		},
+		{
+			name: "logical writer accepts ADC with canonical GCS state",
+			config: sourceWriterConfig{AuthorityProfile: "logical-writer-v1", HasCanonicalState: true,
+				SourceProvider: objectstore.ProviderGCS, UseADC: true},
+		},
+		{
+			name: "logical writer accepts credentials without local receipts",
+			config: sourceWriterConfig{AuthorityProfile: "logical-writer-v1", HasCanonicalState: true,
+				SourceProvider: objectstore.ProviderGCS, CredentialsFile: "/writer/credentials.json"},
+		},
+		{
+			name:    "logical writer requires canonical remote state",
+			config:  sourceWriterConfig{AuthorityProfile: "logical-writer-v1", SourceProvider: objectstore.ProviderGCS, UseADC: true},
+			wantErr: "requires a configured remote canonical authority store",
+		},
+		{
+			name: "logical writer rejects physical independent profile selection",
+			config: sourceWriterConfig{Independent: true, AuthorityProfile: "logical-writer-v1", HasCanonicalState: true,
+				SourceProvider: objectstore.ProviderGCS, RuntimeAgentCA: "/runtime-agent-ca", UseADC: true},
+			wantErr: "mutually exclusive",
+		},
+		{
+			name:    "logical writer rejects missing GCS writer credentials",
+			config:  sourceWriterConfig{AuthorityProfile: "logical-writer-v1", HasCanonicalState: true, SourceProvider: objectstore.ProviderGCS},
+			wantErr: "exactly one separate source writer credential mode",
+		},
+		{
+			name: "logical writer rejects emulator",
+			config: sourceWriterConfig{AuthorityProfile: "logical-writer-v1", HasCanonicalState: true,
+				SourceProvider: objectstore.ProviderGCS, UseADC: true, StorageEmulatorHost: "http://127.0.0.1:9999"},
+			wantErr: "rejects STORAGE_EMULATOR_HOST",
 		},
 		{
 			name: "independent profile rejects storage emulator",
@@ -191,12 +224,20 @@ func TestLegacyCooperativeControlStateIsExplicitlyLimitedToCooperativeOnly(t *te
 }
 
 func TestExecutorMutationJournalRequirementFollowsExistingIndependentFlag(t *testing.T) {
-	independent := newFencingExecutor(nil, nil, true, "", "", false)
+	independent := newFencingExecutor(nil, nil, true, "", "", "", false)
 	if !independent.RequireMutationJournal || independent.LegacyCooperativeControlState {
 		t.Fatalf("independent CLI profile not pinned into executor: %+v", independent)
 	}
-	cooperative := newFencingExecutor(nil, nil, false, "", "", false)
+	cooperative := newFencingExecutor(nil, nil, false, "", "", "", false)
 	if cooperative.RequireMutationJournal || !cooperative.LegacyCooperativeControlState {
 		t.Fatalf("cooperative CLI profile unexpectedly requires mutation journal: %+v", cooperative)
+	}
+}
+
+func TestLogicalAuthorityProfilePinsExecutorWithoutRuntimeAgent(t *testing.T) {
+	executor := newFencingExecutor(nil, nil, false, fencing.LogicalWriterProfileV1, "", "", true)
+	if !executor.RequireMutationJournal || executor.AuthorityProfile != fencing.LogicalWriterProfileV1 ||
+		executor.MutationProfile != fencing.MutationHeldExecutionProfile || executor.LegacyCooperativeControlState {
+		t.Fatalf("logical authority profile was not pinned into executor: %+v", executor)
 	}
 }
