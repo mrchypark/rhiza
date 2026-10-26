@@ -1,11 +1,8 @@
 name: Application image
 
-# Publishes a digest-pinned release application image from the repository
-# Dockerfile, which installs /usr/local/bin/rhiza and /usr/local/bin/rhiza-fencer.
-# This is the supervised workload for the voterCount GCS/Chaos harness; it is not
-# the e2e/chaos qualification host, which serves the older rhiza-entrypoint flow.
-# Only the immutable tag sha-<commit> is pushed, and an existing tag is never
-# retargeted. Dispatch this workflow against the exact release commit.
+# Publishes one immutable image per dispatch. The application image remains
+# the default; the test-only probe image is independently selectable so a
+# partial publication cannot strand the other immutable tag.
 on:
   workflow_dispatch:
     inputs:
@@ -13,13 +10,21 @@ on:
         description: Commit SHA to build (defaults to the dispatched ref)
         required: false
         type: string
+      image_target:
+        description: Image to publish (application preserves the existing default)
+        required: true
+        type: choice
+        default: application
+        options:
+          - application
+          - peer-admission
 
 permissions:
   contents: read
 
 jobs:
-  publish:
-    if: github.repository == 'mrchypark/rhiza'
+  publish-application:
+    if: github.repository == 'mrchypark/rhiza' && inputs.image_target == 'application'
     runs-on: ubuntu-latest
     timeout-minutes: 60
     permissions:
@@ -30,14 +35,15 @@ jobs:
         with:
           ref: ${{ inputs.source_sha || github.sha }}
           fetch-depth: 0
-      - name: Resolve the immutable commit and tag
+      - name: Resolve the immutable application commit and tag
         id: source
         run: |
+          owner=$(printf '%s' "$GITHUB_REPOSITORY_OWNER" | tr '[:upper:]' '[:lower:]')
           {
             sha=$(git rev-parse HEAD)
             echo "sha=$sha"
             echo "tag=sha-$sha"
-            echo "image=ghcr.io/$GITHUB_REPOSITORY_OWNER/rhiza-application:sha-$sha"
+            echo "image=ghcr.io/$owner/rhiza-application:sha-$sha"
           } >> "$GITHUB_OUTPUT"
       - uses: docker/setup-buildx-action@v3
         with:
@@ -49,15 +55,14 @@ jobs:
           password: ${{ secrets.GITHUB_TOKEN }}
       - name: Refuse to retarget an existing immutable tag
         run: |
-          if docker manifest inspect "${{ steps.source.outputs.image }}" >/dev/null 2>&1; then
+          if docker manifest inspect '${{ steps.source.outputs.image }}' >/dev/null 2>&1; then
             echo "::error::${{ steps.source.outputs.image }} already exists; immutable tags are never retargeted" >&2
             exit 1
           fi
       - name: Prepare container build tools
         run: |
           # The Dockerfile runs the qualification tests, which need jq and
-          # coreutils; the minimal golang:alpine builder lacks them. Mirror the
-          # ci.yml containers job so this build matches CI.
+          # coreutils; the minimal golang:alpine builder lacks them. Mirror CI.
           awk '
             { print }
             $0 == "FROM mirror.gcr.io/library/golang:1.27.3-alpine@sha256:f2c872bcee949b7be9c490efd02b48a8a2fbf947cdf533f1c58525ec9d8170fd AS builder" {
@@ -77,26 +82,114 @@ jobs:
           provenance: true
           sbom: true
       - name: Verify anonymous pull access for the harness cluster
+        env:
+          IMAGE_TAG: ${{ steps.source.outputs.tag }}
         run: |
-          # The GCS/Chaos harness sets no imagePullSecrets, so the package must be
-          # publicly pullable. GHCR may create a fresh package private, and the
-          # immutable tag guard blocks a rerun, so record the real state instead
-          # of failing: the digest is still published either way.
-          owner="${{ github.repository_owner }}"
+          # The GCS/Chaos harness sets no imagePullSecrets. Record actual package
+          # visibility; do not fail after publishing an immutable tag.
+          owner=$(printf '%s' "$GITHUB_REPOSITORY_OWNER" | tr '[:upper:]' '[:lower:]')
           token=$(curl -fsS "https://ghcr.io/token?service=ghcr.io&scope=repository:$owner/rhiza-application:pull" | jq -r .token)
-          # Without an Accept header GHCR answers 404 even for public images.
-          code=$(curl -sS -o /dev/null -w '%{http_code}' -H "Authorization: Bearer $token" -H "Accept: application/vnd.oci.image.index.v1+json,application/vnd.oci.image.manifest.v1+json,application/vnd.docker.distribution.manifest.list.v2+json,application/vnd.docker.distribution.manifest.v2+json" "https://ghcr.io/v2/$owner/rhiza-application/manifests/${{ steps.source.outputs.tag }}")
+          code=$(curl -sS -o /dev/null -w '%{http_code}' -H "Authorization: Bearer $token" -H "Accept: application/vnd.oci.image.index.v1+json,application/vnd.oci.image.manifest.v1+json,application/vnd.docker.distribution.manifest.list.v2+json,application/vnd.docker.distribution.manifest.v2+json" "https://ghcr.io/v2/$owner/rhiza-application/manifests/$IMAGE_TAG")
           if [ "$code" = "200" ]; then
             echo 'anonymous_pull=public' >> "$GITHUB_STEP_SUMMARY"
           else
-            echo "::warning::ghcr.io/$owner/rhiza-application is not anonymously pullable (HTTP $code); set the package visibility to public before the harness pulls it" >&2
+            echo "::warning::ghcr.io/$owner/rhiza-application is not anonymously pullable (HTTP $code); set package visibility before the harness pulls it" >&2
             echo "anonymous_pull=private (HTTP $code)" >> "$GITHUB_STEP_SUMMARY"
           fi
-      - name: Record the immutable digest
+      - name: Record the immutable application digest
         run: |
           {
             # shellcheck disable=SC2016 # Markdown backticks are literal output.
-            printf 'Application image: `%s`\n\n' "${{ steps.source.outputs.image }}"
+            printf 'Source SHA: `%s`\n\n' "${{ steps.source.outputs.sha }}"
             # shellcheck disable=SC2016 # Markdown backticks are literal output.
-            printf 'Digest: `%s`\n' "${{ steps.build.outputs.digest }}"
+            printf 'Application image: `%s@%s`\n' "${{ steps.source.outputs.image }}" "${{ steps.build.outputs.digest }}"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  publish-peer-admission:
+    if: github.repository == 'mrchypark/rhiza' && inputs.image_target == 'peer-admission'
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.source_sha || github.sha }}
+          fetch-depth: 0
+      - name: Resolve the immutable peer-admission commit and tag
+        id: source
+        run: |
+          owner=$(printf '%s' "$GITHUB_REPOSITORY_OWNER" | tr '[:upper:]' '[:lower:]')
+          sha=$(git rev-parse HEAD)
+          {
+            echo "sha=$sha"
+            echo "tag=sha-$sha"
+            echo "image=ghcr.io/$owner/rhiza-operator-peer-admission:sha-$sha"
+          } >> "$GITHUB_OUTPUT"
+      - uses: docker/setup-buildx-action@v3
+        with:
+          driver-opts: image=mirror.gcr.io/moby/buildkit:buildx-stable-1@sha256:cec9f139f45e93c5c69c60f8b07cfad9f43f4ef6b6a6cd917527fea5ff2e3dea
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Refuse to retarget an existing immutable tag
+        run: |
+          if docker manifest inspect '${{ steps.source.outputs.image }}' >/dev/null 2>&1; then
+            echo "::error::${{ steps.source.outputs.image }} already exists; immutable tags are never retargeted" >&2
+            exit 1
+          fi
+      - uses: docker/build-push-action@v6
+        id: peer_probe
+        with:
+          context: .
+          file: Dockerfile.operator
+          target: peer-admission-test
+          platforms: linux/amd64
+          push: true
+          tags: ${{ steps.source.outputs.image }}
+          labels: |
+            org.opencontainers.image.source=https://github.com/${{ github.repository }}
+            org.opencontainers.image.revision=${{ steps.source.outputs.sha }}
+            io.rhiza.qualification.probe=peer-admission
+          provenance: true
+          sbom: true
+      - name: Verify peer-admission image contents
+        env:
+          PEER_IMAGE: ${{ steps.source.outputs.image }}
+        run: |
+          docker pull "$PEER_IMAGE"
+          # shellcheck disable=SC2016 # The container command intentionally runs in a single-quoted shell script.
+          docker run --rm --entrypoint /bin/sh "$PEER_IMAGE" -ec '
+            test -x /usr/local/bin/fencing-e2e
+            if /usr/local/bin/fencing-e2e peer-admission-probe </dev/null >/dev/null 2>&1; then
+              exit 1
+            else
+              test "$?" -eq 1
+            fi
+          '
+      - name: Verify anonymous peer-admission image pull for the harness
+        env:
+          IMAGE_TAG: ${{ steps.source.outputs.tag }}
+        run: |
+          owner=$(printf '%s' "$GITHUB_REPOSITORY_OWNER" | tr '[:upper:]' '[:lower:]')
+          token=$(curl -fsS "https://ghcr.io/token?service=ghcr.io&scope=repository:$owner/rhiza-operator-peer-admission:pull" | jq -r .token)
+          code=$(curl -sS -o /dev/null -w '%{http_code}' -H "Authorization: Bearer $token" -H "Accept: application/vnd.oci.image.index.v1+json,application/vnd.oci.image.manifest.v1+json,application/vnd.docker.distribution.manifest.v2+json" "https://ghcr.io/v2/$owner/rhiza-operator-peer-admission/manifests/$IMAGE_TAG")
+          if [ "$code" = "200" ]; then
+            echo 'peer_admission_anonymous_pull=public' >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "::warning::ghcr.io/$owner/rhiza-operator-peer-admission is not anonymously pullable (HTTP $code); set package visibility before the harness pulls it" >&2
+            echo "peer_admission_anonymous_pull=private (HTTP $code)" >> "$GITHUB_STEP_SUMMARY"
+          fi
+      - name: Record the immutable peer-admission digest
+        run: |
+          {
+            # shellcheck disable=SC2016 # Markdown backticks are literal output.
+            printf 'Source SHA: `%s`\n\n' "${{ steps.source.outputs.sha }}"
+            # shellcheck disable=SC2016 # Markdown backticks are literal output.
+            printf 'Peer-admission test-only operator image: `%s@%s`\n' "${{ steps.source.outputs.image }}" "${{ steps.peer_probe.outputs.digest }}"
+            # shellcheck disable=SC2016 # Markdown backticks are literal output.
+            printf 'Set `RHIZA_OPERATOR_IMAGE` to that digest only for a driver build containing `peer-admission-probe`. The application and operator release images are unchanged.\n'
           } >> "$GITHUB_STEP_SUMMARY"

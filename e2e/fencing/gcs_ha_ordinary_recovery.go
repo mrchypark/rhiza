@@ -220,6 +220,11 @@ func qualifyGCSOrdinaryRecovery(ctx context.Context) (resultErr error) {
 	currentTarget := target
 	currentCredentialUID := oldCredentialUID
 	priorIncarnations := []operator.FenceTarget{target}
+	currentPeerCredentials, err := peerAdmissionCredentialsForTargets(ctx, currentSource, currentSource.Targets)
+	if err != nil {
+		return fmt.Errorf("ordinary-recovery initial peer credential bindings: %w", err)
+	}
+	var priorPeerCredentials []peerAdmissionCredential
 	var checkpointBeforeSecondRecovery gcsOrdinaryCheckpointEvidence
 	for incident := 1; incident <= 2; incident++ {
 		if err := waitRunOwnedOperatorAbsent(ctx, operatorOwned, fencerOwned); err != nil {
@@ -270,6 +275,30 @@ func qualifyGCSOrdinaryRecovery(ctx context.Context) (resultErr error) {
 		replacement := capturedTarget(operator.FenceTarget{NodeID: string(newStatus.NodeID), Pod: currentTarget.Pod,
 			PodUID: text(nested(newPod, "metadata", "uid")), WALIdentity: newStatus.WALIdentity}, newPod)
 		currentSource.Targets[0] = replacement
+		var removedCredential *peerAdmissionCredential
+		for i := range currentPeerCredentials {
+			if currentPeerCredentials[i].Member.ID == quepaxa.NodeID(currentTarget.NodeID) {
+				copy := currentPeerCredentials[i]
+				removedCredential = &copy
+				break
+			}
+		}
+		if removedCredential == nil {
+			return fmt.Errorf("ordinary-recovery incident %d lacks the exact prior peer credential for the removed voter", incident)
+		}
+		priorPeerCredentials = append(priorPeerCredentials, *removedCredential)
+		currentPeerCredentials, err = peerAdmissionCredentialsForTargets(ctx, currentSource, currentSource.Targets)
+		if err != nil {
+			return fmt.Errorf("ordinary-recovery incident %d current peer credentials: %w", incident, err)
+		}
+		probeResult, err := executePeerAdmissionProbe(ctx, fencerOwned, peerAdmissionProbeRequest{
+			ClusterID: source.ClusterID, ConfigID: newStatus.ConfigID, Current: currentPeerCredentials, Previous: priorPeerCredentials,
+		})
+		if err != nil {
+			return fmt.Errorf("ordinary-recovery incident %d stale peer admission probe: %w", incident, err)
+		}
+		appendEvent("stale_peer_admission_verified", obj{"incident": incident, "configID": probeResult.ConfigID,
+			"currentReadTipSuccesses": probeResult.CurrentSuccesses, "previousPeerAuthDenials": probeResult.PreviousRejections})
 		for _, voter := range []struct {
 			forward *forward
 			target  operator.FenceTarget

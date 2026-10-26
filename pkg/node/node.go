@@ -587,9 +587,9 @@ func (n *Node) open(ctx context.Context, enroll bool) (err error) {
 	}
 	core, err := makeCore(quepaxa.Config{
 		NodeID: n.config.NodeID, Cluster: *cluster, WAL: wal, Transport: coreTransport, LocalMode: n.config.Local,
-		EnableReconfiguration:    n.config.EnableReconfiguration,
-		EngineOwnedRemovals:      n.config.EngineOwnedRemovals,
-		ReconfigurationAdmission: n.verifyMembershipAdmission,
+		EnableReconfiguration:            n.config.EnableReconfiguration,
+		EngineOwnedRemovals:              n.config.EngineOwnedRemovals,
+		ReconfigurationAdmission:         n.verifyMembershipAdmission,
 		ReconfigurationPrefixPublication: n.publishReconfigurationPrefix,
 	})
 	if err != nil {
@@ -697,8 +697,9 @@ func (n *Node) open(ctx context.Context, enroll bool) (err error) {
 	// proposals and learned decisions remain gated by ready=false.
 	server := network.NewServer(core, material, n.config.ClusterID, true, transport, n.apiReady)
 	n.installArchiveCatchUpHint(server, core)
-	if n.config.EngineOwnedRemovals && n.config.Learner != nil && n.fenceSession != nil {
+	if n.config.EnableReconfiguration || (n.config.EngineOwnedRemovals && n.config.Learner != nil && n.fenceSession != nil) {
 		server.SetPeerLearnReady(n.peerLearnReady)
+		server.SetPeerLearnDecisionAllowed(n.peerLearnDecisionAllowed)
 	}
 	server.SetTerminalDrain(func(ctx context.Context, expected network.TerminalDrainRequest) (any, error) {
 		return n.TerminalDrain(ctx, expected)
@@ -2240,6 +2241,25 @@ func (n *Node) peerLearnReady() bool {
 		return true
 	}
 	return n.apiReady()
+}
+
+func (n *Node) peerLearnDecisionAllowed(decision quepaxa.Decision) bool {
+	if n == nil || n.config == nil || n.core == nil || n.terminalRequested.Load() {
+		return false
+	}
+	if n.supervisedEngineRepairCandidatePending() {
+		return true
+	}
+	if n.fenceSession != nil && n.fenceSession.StartupRole() == fencing.StartupRoleVoterActive && !n.fenceWriterActive.Load() {
+		return false
+	}
+	if !n.opened.Load() {
+		return false
+	}
+	if n.core.AllowsInstalledTerminalLearn(decision) {
+		return true
+	}
+	return n.config.EnableReconfiguration && n.core.AllowsPendingReconfigurationLearn(decision)
 }
 
 func hasUsablePeerSuffix(applied quepaxa.Slot, successes, quorum int, best *network.DecisionsResponse) bool {

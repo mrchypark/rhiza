@@ -45,6 +45,49 @@ type Run struct {
 	// EngineRepairProvenance is authority-written from a canonical repair
 	// reservation. It is never accepted from a startup request or grant.
 	EngineRepairProvenance *EngineRepairRunProvenance `json:"engineRepairProvenance,omitempty"`
+	// InitialRegistration is authority-written only for the one Run admitted
+	// from a pristine local voter state. It survives Bind so an active role
+	// alone can never be mistaken for first-use authority.
+	InitialRegistration *InitialRegistrationProvenance `json:"initialRegistration,omitempty"`
+}
+
+const InitialRegistrationProvenanceVersion = 1
+
+// InitialRegistrationProvenance records the authority-verified static
+// genesis and store scope for one physical first-registration Run.
+type InitialRegistrationProvenance struct {
+	Version        int      `json:"version"`
+	IdentityDigest string   `json:"identityDigest"`
+	MembershipHash string   `json:"membershipHash"`
+	StoreScopeHash string   `json:"storeScopeHash"`
+	RunIdentity    Identity `json:"runIdentity"`
+}
+
+func InitialRegistrationIdentityDigest(identity Identity) string {
+	identity.WALIdentity = ""
+	return hashJSONValue([]any{"rhiza-initial-voter-registration-v1", identity})
+}
+
+func (p InitialRegistrationProvenance) ValidateForIdentity(identity Identity) error {
+	want, got := identity, p.RunIdentity
+	want.WALIdentity, got.WALIdentity = "", ""
+	if p.Version != InitialRegistrationProvenanceVersion || p.IdentityDigest != InitialRegistrationIdentityDigest(identity) ||
+		!mutationDigestValid(p.MembershipHash) || !mutationDigestValid(p.StoreScopeHash) || got != want ||
+		identity.SourceClusterID == "" || identity.NodeID == "" || identity.PodName != identity.NodeID ||
+		identity.PodUID == "" || identity.RunID == "" || identity.AssignmentID != "" {
+		return fmt.Errorf("fencing: initial-registration provenance differs from its Run")
+	}
+	return nil
+}
+
+func (p InitialRegistrationProvenance) ValidateForRun(run Run) error {
+	if err := p.ValidateForIdentity(run.Identity); err != nil {
+		return err
+	}
+	if runRole(run) != StartupRoleVoterActive || run.Runtime == nil || run.Runtime.Validate(run.Identity) != nil {
+		return fmt.Errorf("fencing: initial-registration Run lacks its active runtime enrollment")
+	}
+	return nil
 }
 
 const EngineRepairRunProvenanceVersion = 1
@@ -407,6 +450,9 @@ func (l Ledger) EngineRepairCapacityUse() (int, error) {
 		if run.EngineRepairProvenance != nil && run.EngineRepairProvenance.ValidateForRun(run) != nil {
 			return 0, fmt.Errorf("fencing: malformed engine-repair Run provenance")
 		}
+		if run.InitialRegistration != nil && run.InitialRegistration.ValidateForRun(run) != nil {
+			return 0, fmt.Errorf("fencing: malformed initial-registration Run provenance")
+		}
 	}
 	// Root references preserve the immutable evidence chain even after a
 	// generation is closed. Bound that history separately from live run slots:
@@ -528,6 +574,20 @@ func (l *Ledger) Bind(identity Identity) error {
 	if provenance := run.EngineRepairProvenance; provenance != nil &&
 		(provenance.ValidateForRun(run) != nil || identity.WALIdentity != provenance.CandidateIdentity.WALIdentity) {
 		return fmt.Errorf("fencing: engine-repair WAL bind differs from the authority-pinned candidate")
+	}
+	if provenance := run.InitialRegistration; provenance != nil {
+		// A bind response can be lost after the CAS commits. Accept only an
+		// exact retry of that same binding; the equality check below still
+		// rejects any different nonce or identity.
+		if provenance.ValidateForRun(run) != nil || run.Stop != nil ||
+			runRole(run) != StartupRoleVoterActive {
+			return fmt.Errorf("fencing: initial voter WAL bind lacks its authority-issued Run evidence")
+		}
+		for runID, old := range l.Runs {
+			if runID != identity.RunID && old.Identity.NodeID == identity.NodeID && old.Identity.WALIdentity != "" {
+				return fmt.Errorf("fencing: initial voter has historical WAL binding")
+			}
+		}
 	}
 	old := identity
 	old.WALIdentity = run.Identity.WALIdentity

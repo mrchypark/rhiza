@@ -40,6 +40,14 @@ type StartupGrantAuthority interface {
 	RegisterStartup(context.Context, Identity) (StartupGrant, error)
 }
 
+// InitialStartupGrantAuthority is used only when the local, read-only
+// preflight classified this Run as a pristine first registration. The
+// authority must independently prove that classification against its
+// authenticated workload and canonical root before creating the Run.
+type InitialStartupGrantAuthority interface {
+	RegisterInitialStartup(context.Context, Identity) (StartupGrant, error)
+}
+
 type LearnerIdentityAuthority interface {
 	RegisterLearnerIdentity(context.Context, Identity, LearnerIdentityRegistration) error
 }
@@ -67,10 +75,18 @@ type PendingEngineRepairAuthority interface {
 	CreatePendingEngineRepair(context.Context, Identity, PendingEngineRepairProposal) error
 }
 
-// EngineRepairPreflight builds the local, unauthorised proposal before the
+// StartupPreflightResult is a local, unauthorised classification. Exactly one
+// of InitialRegistration or PendingEngineRepair may be set. Initial
+// registration is not a repair proposal and does not mutate remote state.
+type StartupPreflightResult struct {
+	InitialRegistration bool
+	PendingEngineRepair *PendingEngineRepairProposal
+}
+
+// EngineRepairPreflight builds local, unauthorised startup evidence before the
 // application child starts. Implementations may inspect local WAL identity,
 // but must not acquire authority or mutate remote state.
-type EngineRepairPreflight func(context.Context, Identity) (PendingEngineRepairProposal, bool, error)
+type EngineRepairPreflight func(context.Context, Identity) (StartupPreflightResult, error)
 
 // Supervisor supports only a dedicated, private Linux process namespace in
 // which it is PID 1. A crash never produces a receipt; restart must reserve a
@@ -108,32 +124,34 @@ func (s *Supervisor) Run(ctx context.Context) error {
 	s.grant = StartupGrant{Identity: s.Identity, Role: StartupRoleVoterActive}
 	s.binding = nil
 	s.ticket = hex.EncodeToString(nonce[16:])
-	pendingPreflight := false
-	var pendingProposal *PendingEngineRepairProposal
+	preflight := StartupPreflightResult{}
 	if s.Preflight != nil {
-		proposal, needed, err := s.Preflight(ctx, s.Identity)
+		result, err := s.Preflight(ctx, s.Identity)
 		if err != nil {
 			return fmt.Errorf("fencing: engine repair preflight: %w", err)
 		}
-		if needed {
-			pendingPreflight = true
+		if result.InitialRegistration && result.PendingEngineRepair != nil {
+			return fmt.Errorf("fencing: startup preflight has conflicting classifications")
+		}
+		if result.PendingEngineRepair != nil {
 			_, ok := s.Authority.(PendingEngineRepairAuthority)
 			if !ok {
 				return fmt.Errorf("fencing: pending engine repair authority is unavailable")
 			}
+			proposal := result.PendingEngineRepair
 			if proposal.BootstrapIdentity != s.Identity || proposal.SourceClusterID != s.Identity.SourceClusterID {
 				return fmt.Errorf("fencing: preflight proposal differs from supervisor identity")
 			}
 			if err := proposal.ValidatePreflight(); err != nil {
 				return err
 			}
-			pendingProposal = &proposal
 		}
+		preflight = result
 	}
 	// Must precede listener readiness and exec. The authority can close this
 	// reservation concurrently; the child must also pass Connect and BindWAL.
 	if authority, ok := s.Authority.(StartupGrantAuthority); ok {
-		grant, err := s.registerStartup(ctx, authority, pendingProposal, pendingPreflight)
+		grant, err := s.registerStartup(ctx, authority, preflight)
 		if err != nil {
 			return err
 		}
@@ -141,8 +159,13 @@ func (s *Supervisor) Run(ctx context.Context) error {
 			return err
 		}
 		s.grant, s.bound = grant, grant.Identity
-	} else if err := s.Authority.Register(ctx, s.Identity); err != nil {
-		return err
+	} else {
+		if preflight.InitialRegistration || preflight.PendingEngineRepair != nil {
+			return fmt.Errorf("fencing: startup authority cannot enforce preflight classification")
+		}
+		if err := s.Authority.Register(ctx, s.Identity); err != nil {
+			return err
+		}
 	}
 	listener, err := listenSupervisor(s.SocketPath)
 	if err != nil {
@@ -229,10 +252,31 @@ func supervisorChildEnvironment(parent []string, grant StartupGrant, socketPath,
 // registerStartup retries only idempotent operations with the exact same
 // physical run and proposal. In particular, no child exists while either the
 // pending request or its survivor adoption is unresolved.
-func (s *Supervisor) registerStartup(ctx context.Context, authority StartupGrantAuthority, proposal *PendingEngineRepairProposal, pending bool) (StartupGrant, error) {
+func (s *Supervisor) registerStartup(ctx context.Context, authority StartupGrantAuthority, preflight StartupPreflightResult) (StartupGrant, error) {
 	if s == nil || ctx == nil || authority == nil {
 		return StartupGrant{}, fmt.Errorf("fencing: startup registration is incomplete")
 	}
+	if preflight.InitialRegistration && preflight.PendingEngineRepair != nil {
+		return StartupGrant{}, fmt.Errorf("fencing: startup preflight has conflicting classifications")
+	}
+	if preflight.InitialRegistration {
+		initial, ok := s.Authority.(InitialStartupGrantAuthority)
+		if !ok {
+			return StartupGrant{}, fmt.Errorf("fencing: initial startup authority is unavailable")
+		}
+		grant, err := initial.RegisterInitialStartup(ctx, s.Identity)
+		if err != nil {
+			return StartupGrant{}, err
+		}
+		if err := grant.Validate(s.Identity); err != nil {
+			return StartupGrant{}, err
+		}
+		if grant.InitialRegistration == nil {
+			return StartupGrant{}, fmt.Errorf("fencing: initial startup grant lacks first-registration evidence")
+		}
+		return grant, nil
+	}
+	proposal := preflight.PendingEngineRepair
 	if proposal != nil {
 		pendingAuthority, ok := s.Authority.(PendingEngineRepairAuthority)
 		if !ok {
@@ -253,7 +297,7 @@ func (s *Supervisor) registerStartup(ctx context.Context, authority StartupGrant
 	}
 	for {
 		grant, err := authority.RegisterStartup(ctx, s.Identity)
-		if err == nil || !pending || (!errors.Is(err, ErrPending) && !errors.Is(err, ErrUnavailable)) {
+		if err == nil || proposal == nil || (!errors.Is(err, ErrPending) && !errors.Is(err, ErrUnavailable)) {
 			return grant, err
 		}
 		if err := waitStartupRegistration(ctx); err != nil {

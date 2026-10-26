@@ -71,7 +71,7 @@ func pendingStartupFixture() (*Supervisor, *pendingStartupAuthority, PendingEngi
 func TestSupervisorPendingStartupKeepsRunAndWaitsForRuntimeEnrollment(t *testing.T) {
 	s, authority, proposal := pendingStartupFixture()
 	authority.uncertainCreate = true
-	grant, err := s.registerStartup(t.Context(), authority, &proposal, true)
+	grant, err := s.registerStartup(t.Context(), authority, StartupPreflightResult{PendingEngineRepair: &proposal})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -97,7 +97,7 @@ func TestSupervisorPendingStartupStopsOnClosedOrCancelledAuthority(t *testing.T)
 	t.Run("closed", func(t *testing.T) {
 		s, authority, proposal := pendingStartupFixture()
 		authority.closed = true
-		if _, err := s.registerStartup(t.Context(), authority, &proposal, true); !errors.Is(err, ErrClosed) {
+		if _, err := s.registerStartup(t.Context(), authority, StartupPreflightResult{PendingEngineRepair: &proposal}); !errors.Is(err, ErrClosed) {
 			t.Fatalf("closed pending startup error=%v", err)
 		}
 		if authority.registerCalls != 1 || len(authority.events) != 1 || authority.events[0] != "pending" {
@@ -110,7 +110,10 @@ func TestSupervisorPendingStartupStopsOnClosedOrCancelledAuthority(t *testing.T)
 		// Always remain pending; the cancellation must interrupt the bounded poll.
 		mock := &alwaysPendingStartupAuthority{pendingStartupAuthority: authority}
 		done := make(chan error, 1)
-		go func() { _, err := s.registerStartup(ctx, mock, &proposal, true); done <- err }()
+		go func() {
+			_, err := s.registerStartup(ctx, mock, StartupPreflightResult{PendingEngineRepair: &proposal})
+			done <- err
+		}()
 		cancel()
 		if err := <-done; !errors.Is(err, context.Canceled) {
 			t.Fatalf("cancelled pending startup error=%v", err)

@@ -332,7 +332,7 @@ func runAuthenticatedLearnerPromotionRetriesExactCanonicalCompletion(t *testing.
 	}
 	runtimeService, err := runtimeagent.New(runtimeagent.Config{AuthorityID: "authority", AuthorityNamespace: "test", AuthorityServiceAccount: "runtime-agent",
 		AuthorityWorkloadUID: "runtime-agent-workload", Audience: "rhiza-runtime-agent", Directory: runtimeDir,
-		Auth: supervisorRegistrationAgentAuth{}, Backend: supervisorRegistrationAgentBackend{}})
+		Auth: supervisorRegistrationAgentAuth{}, Backend: &supervisorRegistrationAgentBackend{}})
 	if err != nil {
 		_ = listener.Close()
 		t.Fatal(err)

@@ -78,6 +78,7 @@ type Server struct {
 	mux                        *http.ServeMux
 	ready                      func() bool
 	peerLearnReady             func() bool
+	peerLearnDecisionAllowed   func(quepaxa.Decision) bool
 	writable                   bool
 	sqlBatcher                 *mutationBatcher[types.SQLCommand]
 	graphBatcher               *mutationBatcher[types.GraphCommand]
@@ -233,7 +234,10 @@ func (s *Server) continueArchiveCatchUp(ctx context.Context, key quepaxa.Termina
 	if handler(ctx, key) != nil {
 		return true, false
 	}
-	return true, s.core.PendingTerminalGap(key) && s.core.Tip() >= through
+	// The callback may install the exact terminal while it fills the prefix.
+	// The caller revalidates the captured key or exact installed terminal before
+	// accepting the request, so completion here only reports prefix availability.
+	return true, s.core.Tip() >= through
 }
 
 func (s *Server) handleCompacted() {
@@ -430,6 +434,9 @@ func (s *Server) Ready() bool {
 // of HTTP serving readiness for supervised engine-repair candidates that must
 // learn their ADD before receiving producer-backed serving authority.
 func (s *Server) PeerLearnReady() bool {
+	if s.localFailure() != nil {
+		return false
+	}
 	if s.peerLearnReady != nil {
 		return s.peerLearnReady()
 	}
@@ -440,6 +447,27 @@ func (s *Server) PeerLearnReady() bool {
 // before the server is exposed. Public API and ReadIndex still use Ready.
 func (s *Server) SetPeerLearnReady(ready func() bool) {
 	s.peerLearnReady = ready
+}
+
+// SetPeerLearnDecisionAllowed installs the narrow authenticated Learn
+// exception used for a locally certified pending reconfiguration. The
+// decision still passes the ordinary certificate and durability checks.
+func (s *Server) SetPeerLearnDecisionAllowed(allowed func(quepaxa.Decision) bool) {
+	s.proposeMu.Lock()
+	s.peerLearnDecisionAllowed = allowed
+	s.proposeMu.Unlock()
+}
+
+func (s *Server) PeerLearnDecisionAllowed(decision quepaxa.Decision) bool {
+	s.proposeMu.Lock()
+	allowed, failure := s.peerLearnDecisionAllowed, s.lifecycleFailure
+	s.proposeMu.Unlock()
+	if failure != nil || allowed == nil || !allowed(decision) {
+		return false
+	}
+	// The predicate may overlap a lifecycle transition. Do not authorize a
+	// decision if the local server became terminal while the predicate ran.
+	return s.localFailure() == nil
 }
 
 func (s *Server) localFailure() error {

@@ -102,15 +102,24 @@ them, `source-sha.txt`, and `SHA256SUMS` as
 tests and disposable-Kubernetes qualification pass. Building this artifact is
 not a GCS or Chaos run.
 
-Use the driver artifact and immutable application/operator image digests from
-the same successful workflow run. The image digests are in that run's
+Use the driver artifact and immutable application image digest from the same
+successful workflow run. The application digest is in that run's
 `qualification-publication-<sha>-<run>-<attempt>` artifact when the existing
-`workflow_dispatch` input `publish_chaos_image` is enabled. Read the
-`RepoDigests` in its published-image records; do not use local tags or images
-from another source SHA. The qualification host image is not needed: this
-native command runs on a host with the approved `kubectl` context and `kubectl`
-installed. The driver is not added to the app or operator
-image.
+`workflow_dispatch` input `publish_chaos_image` is enabled. The ordinary-recovery
+peer-admission check also needs a test-only operator image: dispatch
+`.github/workflows/application-image.yml` with `image_target: peer-admission`
+and that exact `source_sha`, then use
+the `Peer-admission test-only operator image` digest from its workflow summary
+as `RHIZA_OPERATOR_IMAGE`. Its immutable image reference has the form
+`ghcr.io/mrchypark/rhiza-operator-peer-admission@sha256:<digest>`; the workflow
+checks that the image contains and can execute `fencing-e2e`. This separate
+image retains the normal operator, fencer, and runtime-agent binaries but adds
+only the bounded probe executable. It does not alter the `rhiza-operator`
+release image or `latest` tag. Ensure the test package is anonymously pullable
+before using it in the GCS cluster, which has no image pull secret. Do not use
+local tags or images from another source SHA. The qualification host image is
+not needed: this native command runs on a host with the approved `kubectl`
+context and `kubectl` installed.
 
 After extracting the artifact, verify its checksums and compare its source SHA
 with the commit SHA of that exact Actions run. On Linux:

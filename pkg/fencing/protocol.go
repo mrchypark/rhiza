@@ -46,6 +46,10 @@ func (r StartupRole) Valid() bool {
 type StartupGrant struct {
 	Identity Identity    `json:"identity"`
 	Role     StartupRole `json:"role"`
+	// InitialRegistration is authority-issued, run-bound evidence that this
+	// exact static voter is entering for the first time. A voter-active role by
+	// itself never authorizes creating a missing local identity.
+	InitialRegistration *InitialRegistrationProvenance `json:"initialRegistration,omitempty"`
 	// ExpectedWALIdentity and the replaced voter tuple are set only for an
 	// authority-enrolled engine-repair learner. The WAL identity remains empty
 	// in Identity until the candidate binds its newly opened WAL.
@@ -66,6 +70,13 @@ func (g StartupGrant) Validate(request Identity) error {
 	}
 	if !g.Role.Valid() || g.Identity.SourceClusterID == "" || g.Identity.NodeID == "" || g.Identity.PodUID == "" || g.Identity.RunID == "" || g.Identity.SourceClusterID != request.SourceClusterID || g.Identity.PodUID != request.PodUID || g.Identity.RunID != request.RunID || g.Identity.WALIdentity != "" || physical == "" {
 		return errors.New("fencing: startup grant identity differs")
+	}
+	if g.InitialRegistration != nil {
+		if g.Role != StartupRoleVoterActive || g.Identity.NodeID != physical || g.Identity.AssignmentID != "" ||
+			g.ExpectedWALIdentity != "" || g.ReplacedNodeID != "" || g.ReplacedWALIdentity != "" ||
+			g.InitialRegistration.ValidateForIdentity(g.Identity) != nil {
+			return errors.New("fencing: invalid initial-registration authority evidence")
+		}
 	}
 	assignedPhysical := g.Identity.PodName
 	if assignedPhysical == "" {
