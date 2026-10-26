@@ -306,17 +306,28 @@ func validateRegistrationContinuation(ledger *fencing.Ledger, identity fencing.I
 		}
 	}
 	found := false
+	unbound := 0
 	for _, run := range ledger.Runs {
-		if run.Identity.NodeID != identity.NodeID || run.Identity.WALIdentity == "" {
+		if run.Identity.NodeID != identity.NodeID {
 			continue
 		}
-		if run.Identity.WALIdentity != wal || run.Identity.PodUID != identity.PodUID || run.Identity.PodName != identity.PodName ||
+		if (run.Identity.WALIdentity != "" && run.Identity.WALIdentity != wal) || run.Identity.PodUID != identity.PodUID || run.Identity.PodName != identity.PodName ||
 			run.Stop != nil || run.Runtime == nil || run.Runtime.StatefulSetUID != uid || run.Runtime.Validate(run.Identity) != nil {
 			return fencing.ErrClosed
 		}
-		found = true
+		if run.RegistrationExpectedWAL != "" && run.RegistrationExpectedWAL != wal {
+			return fencing.ErrClosed
+		}
+		if run.Identity.RunID == identity.RunID && run.RegistrationSupersededBy != "" {
+			return fencing.ErrClosed
+		}
+		if run.Identity.WALIdentity != "" {
+			found = true
+		} else if run.RegistrationSupersededBy == "" {
+			unbound++
+		}
 	}
-	if !found {
+	if !found && unbound != 1 {
 		return fencing.ErrClosed
 	}
 	return nil

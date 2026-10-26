@@ -220,6 +220,51 @@ func TestRegistrationContinuationNeverBootstrapsMissingAuthority(t *testing.T) {
 	}
 }
 
+func TestRegistrationContinuationTransfersUnboundReservation(t *testing.T) {
+	f := newSupervisorRegistrationFixture(t, true)
+	prepareInitialRegistrationFixture(t, &f)
+	client := fencing.AuthorityClient{URL: f.server.URL + "/v1/supervisor", TokenFile: f.token, Client: f.server.Client()}
+	if _, err := client.RegisterInitialStartup(t.Context(), f.identity); err != nil {
+		t.Fatal(err)
+	}
+	request := f.identity
+	request.RunID = "continued-before-authority-bind"
+	wal := strings.Repeat("a", 64)
+	if _, err := client.RegisterStartupContinuation(t.Context(), request, wal); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := client.RegisterStartupContinuation(t.Context(), request, wal); err != nil {
+		t.Fatalf("same claim replay: %v", err)
+	}
+	if _, err := client.RegisterStartupContinuation(t.Context(), request, strings.Repeat("b", 64)); err == nil {
+		t.Fatal("changed WAL replay accepted")
+	}
+	old := f.identity
+	old.WALIdentity = wal
+	if _, err := client.Bind(t.Context(), old); err == nil {
+		t.Fatal("superseded Run acquired Bind")
+	}
+	if _, err := client.RegisterInitialStartup(t.Context(), f.identity); err == nil {
+		t.Fatal("superseded Run registered again")
+	}
+	request.WALIdentity = strings.Repeat("b", 64)
+	if _, err := client.Bind(t.Context(), request); err == nil {
+		t.Fatal("continuation changed expected WAL")
+	}
+	request.WALIdentity = wal
+	if _, err := client.Bind(t.Context(), request); err != nil {
+		t.Fatal(err)
+	}
+	root, _, err := f.state.ReadRoot(t.Context(), "sts-uid", request.SourceClusterID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	prior := root.Ledger.Runs[f.identity.RunID]
+	if prior.RegistrationSupersededBy != request.RunID || prior.Exited || prior.Stop != nil || prior.Identity.WALIdentity != "" {
+		t.Fatal("reservation transfer fabricated termination or binding")
+	}
+}
+
 func TestInitialRegistrationContinuationRequiresSamePodAndHistoricalWAL(t *testing.T) {
 	f := newSupervisorRegistrationFixture(t, true)
 	prepareInitialRegistrationFixture(t, &f)
