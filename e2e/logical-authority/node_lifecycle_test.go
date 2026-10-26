@@ -33,6 +33,7 @@ import (
 	"github.com/mrchypark/rhiza/pkg/recovery"
 	"google.golang.org/api/iterator"
 	"google.golang.org/api/option"
+	"gopkg.in/yaml.v3"
 )
 
 func TestFlociGCSLogicalAuthorityThreeNodeBeforeAckAndSamePodRestart(t *testing.T) {
@@ -96,9 +97,9 @@ func TestFlociGCSLogicalAuthorityThreeNodeBeforeAckAndSamePodRestart(t *testing.
 	}
 	t.Cleanup(func() { _ = sourceClient.Close() })
 
-	// Three live voters form quorum in this five-member bootstrap. voter-d is
+	// Three live voters form quorum in this five-member bootstrap. rhiza-3 is
 	// intentionally left pristine until it adopts the verified init stage.
-	ids := []string{"voter-a", "voter-b", "voter-c", "voter-d", "voter-e"}
+	ids := []string{"rhiza-0", "rhiza-1", "rhiza-2", "rhiza-3", "rhiza-4"}
 	peerTokens := map[string]string{}
 	members := make([]quepaxa.Member, 0, len(ids))
 	peerAddrs := make(map[string]string, len(ids))
@@ -125,30 +126,45 @@ func TestFlociGCSLogicalAuthorityThreeNodeBeforeAckAndSamePodRestart(t *testing.
 	if err != nil {
 		t.Fatal("encode initial voter tokens")
 	}
-	configMap := map[string]any{"data": map[string]string{
-		"RHIZA_CLUSTER_ID": clusterID, "RHIZA_CLUSTER_MEMBERS": string(membersJSON),
+	configMap := map[string]any{"apiVersion": "v1", "kind": "ConfigMap", "metadata": map[string]any{"name": "rhiza-config", "namespace": "default"}, "data": map[string]string{
+		"RHIZA_CLUSTER_ID": clusterID,
+	}}
+	objectStoreConfigMap := map[string]any{"apiVersion": "v1", "kind": "ConfigMap", "metadata": map[string]any{"name": "rhiza-object-store", "namespace": "default"}, "data": map[string]string{
 		"RHIZA_OBJSTORE_PROVIDER": "gcs", "RHIZA_OBJSTORE_BUCKET": bucketName, "RHIZA_OBJSTORE_PREFIX": "archive/" + clusterID,
 	}}
-	secret := map[string]any{"data": map[string]string{"RHIZA_PEER_TOKENS": base64.StdEncoding.EncodeToString(peerTokensJSON)}}
+	secret := map[string]any{"apiVersion": "v1", "kind": "Secret", "metadata": map[string]any{"name": "rhiza-peer-credentials", "namespace": "default"}, "data": map[string]string{
+		"members": base64.StdEncoding.EncodeToString(membersJSON), "RHIZA_PEER_TOKENS": base64.StdEncoding.EncodeToString(peerTokensJSON),
+	}}
 
 	const statefulSetUID, statefulSetName = "logical-authority-sts-uid", "rhiza"
+	rootUID := "logical-authority-root-" + suffix
+	statefulSet, template, err := loadLogicalAuthorityStatefulSet(t, rootUID)
+	if err != nil {
+		t.Fatal(err)
+	}
 	podUIDs := map[string]string{}
 	tokens := map[string]string{}
 	pods := map[string]map[string]any{}
 	for _, id := range ids {
 		podUIDs[id] = "uid-" + id + "-" + suffix
 		tokens[id] = "pod-token-" + id + "-" + suffix
-		container := map[string]any{"name": "rhiza", "image": "test", "securityContext": map[string]any{"allowPrivilegeEscalation": false},
-			"envFrom": []any{map[string]any{"configMapRef": map[string]any{"name": "rhiza-config"}}, map[string]any{"secretRef": map[string]any{"name": "rhiza-peer-tokens"}}}}
-		podSpec := map[string]any{"serviceAccountName": "default", "containers": []any{container}}
+		podSpec, err := cloneJSONMap(template["spec"])
+		if err != nil {
+			t.Fatalf("clone rendered logical-authority Pod spec: %v", err)
+		}
 		pods[id] = map[string]any{"metadata": map[string]any{"name": id, "uid": podUIDs[id],
-			"annotations":     map[string]string{"rhiza.mrchypark.dev/fencing-protocol": "1"},
-			"ownerReferences": []any{map[string]any{"apiVersion": "apps/v1", "kind": "StatefulSet", "name": statefulSetName, "uid": statefulSetUID, "controller": true}}}, "spec": podSpec}
+			"namespace": "default", "annotations": map[string]string{
+				"rhiza.mrchypark.dev/cooperative-fencing": "1", "rhiza.mrchypark.dev/fencing-root-uid": rootUID,
+			}, "ownerReferences": []any{map[string]any{"apiVersion": "apps/v1", "kind": "StatefulSet", "name": statefulSetName, "uid": statefulSetUID, "controller": true}}}, "spec": podSpec}
 	}
-	template := map[string]any{"metadata": map[string]any{"annotations": map[string]string{"rhiza.mrchypark.dev/fencing-protocol": "1"}},
-		"spec": map[string]any{"containers": []any{map[string]any{"name": "rhiza", "image": "test", "securityContext": map[string]any{"allowPrivilegeEscalation": false},
-			"envFrom": []any{map[string]any{"configMapRef": map[string]any{"name": "rhiza-config"}}, map[string]any{"secretRef": map[string]any{"name": "rhiza-peer-tokens"}}}}}}}
-	statefulSet := map[string]any{"metadata": map[string]string{"name": statefulSetName, "uid": statefulSetUID}, "spec": map[string]any{"template": template}}
+	statefulSet["metadata"].(map[string]any)["name"] = statefulSetName
+	statefulSet["metadata"].(map[string]any)["namespace"] = "default"
+	statefulSet["metadata"].(map[string]any)["uid"] = statefulSetUID
+	statefulSet["spec"].(map[string]any)["replicas"] = len(ids)
+	templateMetadata := template["metadata"].(map[string]any)
+	templateMetadata["annotations"] = map[string]string{
+		"rhiza.mrchypark.dev/cooperative-fencing": "1", "rhiza.mrchypark.dev/fencing-root-uid": rootUID,
+	}
 
 	api := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
@@ -175,7 +191,7 @@ func TestFlociGCSLogicalAuthorityThreeNodeBeforeAckAndSamePodRestart(t *testing.
 				return
 			}
 			_ = json.NewEncoder(w).Encode(map[string]any{"status": map[string]any{"authenticated": true, "audiences": []string{"rhiza-fencer"}, "user": map[string]any{
-				"username": "system:serviceaccount:default:default", "extra": map[string]any{"authentication.kubernetes.io/pod-uid": []string{podUIDs[podName]}, "authentication.kubernetes.io/pod-name": []string{podName}}}}})
+				"username": "system:serviceaccount:default:rhiza-voter-reader", "extra": map[string]any{"authentication.kubernetes.io/pod-uid": []string{podUIDs[podName]}, "authentication.kubernetes.io/pod-name": []string{podName}}}}})
 		case strings.HasPrefix(r.URL.Path, "/api/v1/namespaces/default/pods/"):
 			name := strings.TrimPrefix(r.URL.Path, "/api/v1/namespaces/default/pods/")
 			if pod, ok := pods[name]; ok {
@@ -185,10 +201,18 @@ func TestFlociGCSLogicalAuthorityThreeNodeBeforeAckAndSamePodRestart(t *testing.
 			http.NotFound(w, r)
 		case r.URL.Path == "/api/v1/namespaces/default/configmaps/rhiza-config":
 			_ = json.NewEncoder(w).Encode(configMap)
-		case r.URL.Path == "/api/v1/namespaces/default/secrets/rhiza-peer-tokens":
+		case r.URL.Path == "/api/v1/namespaces/default/configmaps/rhiza-object-store":
+			_ = json.NewEncoder(w).Encode(objectStoreConfigMap)
+		case r.URL.Path == "/api/v1/namespaces/default/secrets/rhiza-peer-credentials":
 			_ = json.NewEncoder(w).Encode(secret)
 		case r.URL.Path == "/apis/apps/v1/namespaces/default/statefulsets/rhiza":
 			_ = json.NewEncoder(w).Encode(statefulSet)
+		case r.URL.Path == "/apis/rhiza.mrchypark.dev/v1alpha1/namespaces/default/rhizaclusters":
+			_ = json.NewEncoder(w).Encode(map[string]any{"items": []any{map[string]any{
+				"apiVersion": "rhiza.mrchypark.dev/v1alpha1", "kind": "RhizaCluster",
+				"metadata": map[string]any{"name": statefulSetName, "namespace": "default", "uid": rootUID},
+				"spec":     map[string]any{"statefulSet": statefulSetName, "container": "rhiza", "adoptClusterID": clusterID, "automatic": false},
+			}}})
 		default:
 			http.NotFound(w, r)
 		}
@@ -421,6 +445,73 @@ func readLogicalRunID(t *testing.T, dataDir string) string {
 		t.Fatalf("decode persisted logical Run state: runID=%q err=%v", state.RunID, err)
 	}
 	return state.RunID
+}
+
+func loadLogicalAuthorityStatefulSet(t *testing.T, rootUID string) (map[string]any, map[string]any, error) {
+	t.Helper()
+	data, err := os.ReadFile(filepath.Join("..", "..", "deploy", "operator", "logical-authority", "statefulset.yaml"))
+	if err != nil {
+		return nil, nil, fmt.Errorf("read logical-authority StatefulSet manifest: %w", err)
+	}
+	decoder := yaml.NewDecoder(strings.NewReader(string(data)))
+	var statefulSet map[string]any
+	for {
+		var document any
+		if err := decoder.Decode(&document); err != nil {
+			if errors.Is(err, io.EOF) {
+				break
+			}
+			return nil, nil, fmt.Errorf("decode logical-authority manifest: %w", err)
+		}
+		resource, ok := document.(map[string]any)
+		if !ok || resource["kind"] != "StatefulSet" {
+			continue
+		}
+		statefulSet = resource
+	}
+	if statefulSet == nil {
+		return nil, nil, fmt.Errorf("logical-authority manifest has no StatefulSet")
+	}
+	template, ok := statefulSet["spec"].(map[string]any)["template"].(map[string]any)
+	if !ok {
+		return nil, nil, fmt.Errorf("logical-authority StatefulSet has no Pod template")
+	}
+	spec, ok := template["spec"].(map[string]any)
+	if !ok {
+		return nil, nil, fmt.Errorf("logical-authority StatefulSet has no Pod spec")
+	}
+	for _, group := range []string{"containers", "initContainers"} {
+		entries, ok := spec[group].([]any)
+		if !ok || len(entries) != 1 {
+			return nil, nil, fmt.Errorf("logical-authority manifest %s inventory is not the expected single-container profile", group)
+		}
+		container, ok := entries[0].(map[string]any)
+		if !ok {
+			return nil, nil, fmt.Errorf("logical-authority manifest %s entry is malformed", group)
+		}
+		container["image"] = "ghcr.io/example/rhiza@sha256:" + strings.Repeat("a", 64)
+	}
+	templateMetadata, ok := template["metadata"].(map[string]any)
+	if !ok {
+		return nil, nil, fmt.Errorf("logical-authority manifest template metadata is malformed")
+	}
+	templateMetadata["annotations"] = map[string]any{
+		"rhiza.mrchypark.dev/cooperative-fencing": "1",
+		"rhiza.mrchypark.dev/fencing-root-uid":    rootUID,
+	}
+	return statefulSet, template, nil
+}
+
+func cloneJSONMap(value any) (map[string]any, error) {
+	data, err := json.Marshal(value)
+	if err != nil {
+		return nil, err
+	}
+	var cloned map[string]any
+	if err := json.Unmarshal(data, &cloned); err != nil {
+		return nil, err
+	}
+	return cloned, nil
 }
 
 type flociCheckpointBlock struct {
