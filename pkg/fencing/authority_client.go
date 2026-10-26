@@ -7,6 +7,7 @@ import (
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -135,6 +136,9 @@ func (a *AuthorityClient) call(ctx context.Context, message AuthorityMessage, re
 	decoder := json.NewDecoder(bytes.NewReader(data))
 	decoder.DisallowUnknownFields()
 	if err := decoder.Decode(result); err != nil {
+		if errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) {
+			return fmt.Errorf("%w: %w", ErrUnavailable, err)
+		}
 		return err
 	}
 	if err := decoder.Decode(new(any)); err != io.EOF {
