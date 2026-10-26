@@ -113,6 +113,7 @@ type Node struct {
 // It is written synchronously during open and observed after Open returns.
 type nodeRecoveryPhases struct {
 	selectedCheckpoint               bool
+	haStageAdopted                   bool
 	checkpointIndex                  uint64
 	checkpointRootHash               [32]byte
 	checkpointDownloadVerify         time.Duration
@@ -243,6 +244,9 @@ func (n *Node) open(ctx context.Context, enroll bool) (err error) {
 		n.config.BindAddr != "" || n.config.PeerAddr != "" || n.config.PeerToken != "" || n.config.AdminToken != "") {
 		return fmt.Errorf("local mode requires standalone storage without listeners, membership, or enrollment")
 	}
+	if n.config.HAInitRestoreDir != "" && n.config.Local {
+		return fmt.Errorf("HA init restore staging is unavailable in Local mode")
+	}
 	if !n.config.Local {
 		if err := sqlpolicy.CheckExisting(ctx, n.config.DataDir+"/sqlite.db"); err != nil {
 			return err
@@ -294,6 +298,9 @@ func (n *Node) open(ctx context.Context, enroll bool) (err error) {
 	}
 	if len(n.config.Members) > 1 && !objectStoreConfigured {
 		return fmt.Errorf("multi-node clusters require shared object storage")
+	}
+	if n.config.HAInitRestoreDir != "" && !objectStoreConfigured {
+		return fmt.Errorf("HA init restore staging requires shared object storage")
 	}
 	if n.config.MaxWALBytes < 0 {
 		return fmt.Errorf("max WAL bytes must not be negative")
@@ -353,6 +360,30 @@ func (n *Node) open(ctx context.Context, enroll bool) (err error) {
 	}
 	if err != nil {
 		return fmt.Errorf("load voter identity: %w", err)
+	}
+	var haStageDir string
+	var haStageIndex *haRestoreStageIndex
+	haStageEligible := cleanStart && localVoter.identity == nil && !localVoter.hadWAL
+	if n.config.HAInitRestoreDir != "" {
+		haStageDir, err = resolveHAStagePath(n.config.DataDir, n.config.HAInitRestoreDir)
+		if err != nil {
+			return fmt.Errorf("resolve HA init restore stage: %w", err)
+		}
+		if haStageEligible {
+			var present bool
+			haStageIndex, present, err = readHAStageIndex(haStageDir)
+			if err != nil {
+				return fmt.Errorf("read HA init restore stage: %w", err)
+			}
+			if !present {
+				return fmt.Errorf("HA init restore stage is missing")
+			}
+			bootstrap := n.loadClusterConfig()
+			wantMembership := recovery.NewMembershipRecord(string(n.config.ClusterID), bootstrap.Members, string(n.config.ObjStoreDurability))
+			if haStageIndex.BootstrapMembership != wantMembership || haStageIndex.BootstrapConfigID != bootstrap.ConfigID {
+				return fmt.Errorf("HA init restore bootstrap membership differs from current configuration")
+			}
+		}
 	}
 	if n.config.Local && localVoter.identity != nil {
 		return fmt.Errorf("%w: registered voter cannot be reopened as standalone Local data", ErrVoterStateLost)
@@ -565,6 +596,11 @@ func (n *Node) open(ctx context.Context, enroll bool) (err error) {
 	phase = nodeOpenPhaseMaterializer
 	var material *materializer.Materializer
 	if localRestoreAuthority == nil {
+		if haStageEligible && haStageIndex != nil {
+			if err := validateHAStageOnlyQlog(n.config.DataDir); err != nil {
+				return fmt.Errorf("HA init restore requires a fresh DataDir: %w", err)
+			}
+		}
 		material, err = materializer.Open(filepath.Join(n.config.DataDir, "sqlite.db"), 4)
 		if err != nil {
 			if errors.Is(err, sqlpolicy.ErrIncompatible) {
@@ -686,6 +722,18 @@ func (n *Node) open(ctx context.Context, enroll bool) (err error) {
 	}
 	if n.checkpoints != nil {
 		core.SetCheckpointValidator(func(ctx context.Context, seal quepaxa.CheckpointSeal) error {
+			if haStageIndex != nil && haStageIndex.HasCheckpoint && uint64(seal.Index) == haStageIndex.Index &&
+				seal.RootHash == hashFromStage(haStageIndex.RootHash) {
+				root, err := n.checkpoints.OpenRoot(ctx, uint64(seal.Index), seal.RootHash)
+				if err != nil {
+					return err
+				}
+				if root.Hash != seal.StateHash || haStageIndex.StateHash != fmt.Sprintf("%x", seal.StateHash) {
+					return fmt.Errorf("HA init restore checkpoint state differs from certified seal")
+				}
+				_, err = verifyHAStagedFilesAgainstRoot(haStageDir, *haStageIndex, root)
+				return err
+			}
 			return n.checkpoints.Verify(ctx, uint64(seal.Index), seal.RootHash, seal.StateHash)
 		})
 	}
@@ -889,22 +937,40 @@ func (n *Node) open(ctx context.Context, enroll bool) (err error) {
 			n.recoveryPhases.selectedCheckpoint = true
 			n.recoveryPhases.checkpointIndex = certifiedCheckpoint.Index
 			n.recoveryPhases.checkpointRootHash = certifiedCheckpoint.RootHash
-			dir, fileErr := os.MkdirTemp(n.config.DataDir, ".rhiza-checkpoint-restore-*")
-			if fileErr != nil {
-				return fileErr
-			}
-			defer os.RemoveAll(dir)
-			n.recoveryPhases.checkpointDownloadVerifyStarted = true
-			downloadStarted := time.Now()
-			files, readErr := n.checkpoints.DownloadRootFiles(startupRecovery.Context(), certifiedCheckpoint.Index, certifiedCheckpoint.RootHash, dir)
-			n.recoveryPhases.checkpointDownloadVerify = time.Since(downloadStarted)
-			n.recoveryPhases.checkpointDownloadVerifyComplete = readErr == nil
-			if readErr != nil {
-				return readErr
-			}
-			materialFiles := make([]materializer.CheckpointFile, 0, len(files))
-			for _, file := range files {
-				materialFiles = append(materialFiles, materializer.CheckpointFile{Role: materializer.CheckpointRole(file.Role), Path: file.Path})
+			var materialFiles []materializer.CheckpointFile
+			if haStageIndex != nil && haStageIndex.HasCheckpoint && haStageIndex.Index == certifiedCheckpoint.Index &&
+				haStageIndex.RootHash == fmt.Sprintf("%x", certifiedCheckpoint.RootHash) &&
+				haStageEligible && haStageDir != "" {
+				prefix := path.Join(n.config.ObjStorePrefix, string(n.config.ClusterID))
+				archiveTip := n.archive.Tip()
+				if snapshot := startupRecovery.Snapshot(); snapshot != nil {
+					archiveTip = snapshot.Tip()
+				}
+				anchorHash := core.GenerationAnchorHash()
+				materialFiles, err = verifyHAStagedCheckpointFiles(haStageDir, *haStageIndex, prefix, recovery.ArchiveConfigID, 1,
+					certifiedCheckpoint, core, archiveTip, anchorHash)
+				if err != nil {
+					return fmt.Errorf("verify HA init restore stage against current history: %w", err)
+				}
+				n.recoveryPhases.haStageAdopted = true
+			} else {
+				dir, fileErr := os.MkdirTemp(n.config.DataDir, ".rhiza-checkpoint-restore-*")
+				if fileErr != nil {
+					return fileErr
+				}
+				defer os.RemoveAll(dir)
+				n.recoveryPhases.checkpointDownloadVerifyStarted = true
+				downloadStarted := time.Now()
+				files, readErr := n.checkpoints.DownloadRootFiles(startupRecovery.Context(), certifiedCheckpoint.Index, certifiedCheckpoint.RootHash, dir)
+				n.recoveryPhases.checkpointDownloadVerify = time.Since(downloadStarted)
+				n.recoveryPhases.checkpointDownloadVerifyComplete = readErr == nil
+				if readErr != nil {
+					return readErr
+				}
+				materialFiles = make([]materializer.CheckpointFile, 0, len(files))
+				for _, file := range files {
+					materialFiles = append(materialFiles, materializer.CheckpointFile{Role: materializer.CheckpointRole(file.Role), Path: file.Path})
+				}
 			}
 			n.recoveryPhases.materializerRestoreStarted = true
 			restoreStarted := time.Now()
@@ -914,6 +980,16 @@ func (n *Node) open(ctx context.Context, enroll bool) (err error) {
 			}
 			n.recoveryPhases.materializerRestore = time.Since(restoreStarted)
 			n.recoveryPhases.materializerRestoreComplete = true
+		}
+	}
+	if haStageIndex != nil && !haStageIndex.HasCheckpoint && haStageEligible {
+		prefix := path.Join(n.config.ObjStorePrefix, string(n.config.ClusterID))
+		archiveTip := n.archive.Tip()
+		if snapshot := startupRecovery.Snapshot(); snapshot != nil {
+			archiveTip = snapshot.Tip()
+		}
+		if err := verifyHAStagedHistoryOnly(*haStageIndex, prefix, recovery.ArchiveConfigID, 1, core, archiveTip, core.GenerationAnchorHash()); err != nil {
+			return fmt.Errorf("verify checkpointless HA init history against current archive: %w", err)
 		}
 	}
 
