@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"net"
 	"os"
 	"strings"
 	"testing"
@@ -246,6 +247,23 @@ func membershipWaitReady(t *testing.T, ctx context.Context, db *rhiza.DB) {
 	}
 }
 
+func membershipRestartUDPAddr(t *testing.T) string {
+	t.Helper()
+	// The supported Linux CI runner uses 32768+ for ephemeral ports, so keep this
+	// listener below that range. This is a CI fixture assumption, not portable
+	// across every OS or host configuration.
+	port := 20000 + os.Getpid()%10000
+	addr := fmt.Sprintf("127.0.0.1:%d", port)
+	conn, err := net.ListenPacket("udp", addr)
+	if err != nil {
+		t.Fatalf("reserve stable membership peer address %s: %v", addr, err)
+	}
+	if err := conn.Close(); err != nil {
+		t.Fatalf("release stable membership peer address %s: %v", addr, err)
+	}
+	return addr
+}
+
 func TestS3MembershipReplacement(t *testing.T) {
 	_, _ = requireS3E2E(t)
 	for _, durability := range []rhiza.ObjectStoreDurability{rhiza.ObjectStoreDurabilityAsync, rhiza.ObjectStoreDurabilityBeforeAck} {
@@ -271,7 +289,7 @@ func TestS3MembershipReplacement(t *testing.T) {
 			if err := voters[0].ChangeMembership(ctx, remove); err != nil {
 				t.Fatalf("retry removal: %v", err)
 			}
-			config := learnerS3Config(t, clusterID, freeUDPAddr(t), members, "replacement-token")
+			config := learnerS3Config(t, clusterID, membershipRestartUDPAddr(t), members, "replacement-token")
 			config.ObjStoreDurability = durability
 			learner, err := rhiza.Open(ctx, config)
 			if err != nil {
@@ -299,11 +317,20 @@ func TestS3MembershipReplacement(t *testing.T) {
 				case <-time.After(20 * time.Millisecond):
 				}
 			}
+			// Membership installation precedes the new configuration's readiness round.
+			membershipWaitReady(t, ctx, learner)
 			if _, err := learner.Execute(ctx, rhiza.ExecuteRequest{RequestID: "after-replacement", SQL: "INSERT INTO replacement VALUES (1)"}); err != nil {
 				t.Fatalf("new voter write: %v", err)
 			}
 			if err := learner.Close(); err != nil {
 				t.Fatal(err)
+			}
+			probe, err := net.ListenPacket("udp", config.PeerAddr)
+			if err != nil {
+				t.Fatalf("learner close retained peer UDP address %s: %v", config.PeerAddr, err)
+			}
+			if err := probe.Close(); err != nil {
+				t.Fatalf("release learner peer UDP address %s after close check: %v", config.PeerAddr, err)
 			}
 			restarted, err := rhiza.Open(ctx, config)
 			if err != nil {

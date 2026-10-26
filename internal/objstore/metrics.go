@@ -12,6 +12,7 @@ import (
 	"sync"
 	"sync/atomic"
 
+	"cloud.google.com/go/storage"
 	minio "github.com/minio/minio-go/v7"
 	thanosobjstore "github.com/thanos-io/objstore"
 )
@@ -303,6 +304,19 @@ func (b *MeteredBucket) Stats() Stats {
 	}
 }
 
+// BucketAttrs forwards the optional provider metadata capability. Providers
+// without bucket-level metadata fail closed rather than fabricating attributes.
+func (b *MeteredBucket) BucketAttrs(ctx context.Context) (*storage.BucketAttrs, error) {
+	if b == nil || b.Bucket == nil {
+		return nil, ErrBucketAttrsUnsupported
+	}
+	reader, ok := b.Bucket.(BucketAttrsReader)
+	if !ok {
+		return nil, ErrBucketAttrsUnsupported
+	}
+	return reader.BucketAttrs(ctx)
+}
+
 func (b *MeteredBucket) Upload(ctx context.Context, name string, reader io.Reader, opts ...thanosobjstore.ObjectUploadOption) error {
 	if err := b.metrics.mutations.begin(); err != nil {
 		return err
@@ -436,6 +450,36 @@ func (b *MeteredBucket) Delete(ctx context.Context, name string) error {
 	ctx, operation := b.metrics.beginReplayOperation(ctx)
 	defer finishReplayOperation(operation)
 	err := b.Bucket.Delete(ctx, name)
+	known = err == nil || b.Bucket.IsObjNotFoundErr(err) || b.Bucket.IsConditionNotMetErr(err)
+	b.record(err)
+	return err
+}
+
+// SupportsVersionedDelete reports whether the underlying provider can delete
+// an exact object version. The MeteredBucket method keeps the optional
+// capability visible through this wrapper without claiming support otherwise.
+func (b *MeteredBucket) SupportsVersionedDelete() bool {
+	return SupportsVersionedDelete(b.Bucket)
+}
+
+// DeleteVersion deletes only the selected object version. It deliberately
+// returns an unsupported-capability error instead of falling back to Delete.
+func (b *MeteredBucket) DeleteVersion(ctx context.Context, name string, version thanosobjstore.ObjectVersion) error {
+	if err := b.metrics.mutations.begin(); err != nil {
+		return err
+	}
+	known := false
+	defer func() { b.metrics.mutations.end(known) }()
+	b.metrics.deletes.Add(1)
+	ctx, operation := b.metrics.beginReplayOperation(ctx)
+	defer finishReplayOperation(operation)
+	deleter, ok := b.Bucket.(VersionedDeleteBucket)
+	if !ok || !SupportsVersionedDelete(b.Bucket) {
+		err := ErrVersionedDeleteUnsupported
+		b.record(err)
+		return err
+	}
+	err := deleter.DeleteVersion(ctx, name, version)
 	known = err == nil || b.Bucket.IsObjNotFoundErr(err) || b.Bucket.IsConditionNotMetErr(err)
 	b.record(err)
 	return err

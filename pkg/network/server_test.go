@@ -20,6 +20,8 @@ import (
 	"github.com/mrchypark/rhiza/pkg/materializer"
 	"github.com/mrchypark/rhiza/pkg/qlog"
 	"github.com/mrchypark/rhiza/pkg/quepaxa"
+	"github.com/mrchypark/rhiza/pkg/recovery"
+	"github.com/thanos-io/objstore"
 )
 
 type unavailableTransport struct{}
@@ -195,22 +197,28 @@ func TestDurabilityFailureIsRetryableWithSameRequestID(t *testing.T) {
 		return errors.New("bucket unavailable")
 	})
 	req := ExecuteRequest{RequestID: "schema", SQL: "CREATE TABLE durable (id INTEGER)"}
-	if _, err := server.Execute(context.Background(), req); !errors.Is(err, ErrCommitUnknown) {
-		t.Fatalf("error=%v, want ErrCommitUnknown", err)
+	if response, err := server.Execute(context.Background(), req); !errors.Is(err, ErrCommitUnknown) || !errors.Is(err, ErrDurabilityUnavailable) {
+		t.Fatalf("response=%+v error=%v, want commit-unknown durability failure", response, err)
 	} else {
+		if response.Slot != 0 || response.Status != "" {
+			t.Fatalf("failed write returned a success receipt: %+v", response.MutationReceipt)
+		}
 		var unknown *CommitUnknownError
 		if !errors.As(err, &unknown) || unknown.Slot == 0 || unknown.RequestID != req.RequestID {
 			t.Fatalf("commit unknown detail=%#v", unknown)
 		}
-		status, statusErr := server.RequestStatus(context.Background(), RequestStatusRequest{Kind: "sql", RequestID: req.RequestID})
-		if statusErr != nil || status.State != "committed" {
-			t.Fatalf("status=%+v err=%v", status, statusErr)
-		}
 	}
 
-	// A committed request status does not prove object-store durability.
+	status, statusErr := server.RequestStatus(context.Background(), RequestStatusRequest{Kind: "sql", RequestID: req.RequestID})
+	if !errors.Is(statusErr, ErrCommitUnknown) || !errors.Is(statusErr, ErrDurabilityUnavailable) || status.Receipt != nil || status.State != "" {
+		t.Fatalf("status=%+v err=%v; want unavailable durability with no receipt", status, statusErr)
+	}
+
+	// The same request remains unknown until its original slot is durable.
 	if response, err := server.Execute(context.Background(), req); !errors.Is(err, ErrDurabilityUnavailable) || !errors.Is(err, ErrCommitUnknown) {
-		t.Fatalf("retry after committed status: response=%+v err=%v, want durability unavailable and commit unknown", response, err)
+		t.Fatalf("retry while unavailable: response=%+v err=%v, want durability unavailable and commit unknown", response, err)
+	} else if response.Slot != 0 || response.Status != "" {
+		t.Fatalf("unavailable retry returned a success receipt: %+v", response.MutationReceipt)
 	}
 	server.SetDurabilityBarrier(nil)
 	response, err := server.Execute(context.Background(), req)
@@ -219,6 +227,13 @@ func TestDurabilityFailureIsRetryableWithSameRequestID(t *testing.T) {
 	}
 	if response.Slot == 0 {
 		t.Fatal("retry returned no slot")
+	}
+	if response.Slot != uint64(material.Tip()) || material.Tip() != 1 {
+		t.Fatalf("retry slot=%d material tip=%d; want original slot 1", response.Slot, material.Tip())
+	}
+	query, err := server.Query(context.Background(), QueryRequest{SQL: "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='durable'"})
+	if err != nil || len(query.Rows) != 1 || len(query.Rows[0]) != 1 || query.Rows[0][0] != int64(1) {
+		t.Fatalf("durable table query=%+v err=%v; want one applied table", query, err)
 	}
 }
 
@@ -317,6 +332,41 @@ func TestCachedReceiptsWaitForDurabilityBeforeAcknowledging(t *testing.T) {
 				t.Fatalf("recovered retry advanced consensus tip to %d", tip)
 			}
 		})
+	}
+}
+
+func TestCachedWriteReceiptCannotBeAcknowledgedAfterArchiveSeal(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	core := mustCore(t, "n1", []quepaxa.Member{{ID: "n1"}}, nil, nil)
+	material, err := materializer.Open(t.TempDir()+"/db.sqlite", 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer material.Close()
+	bucket := objstore.NewInMemBucket()
+	defer bucket.Close()
+	archive := recovery.NewManager(bucket, "cluster", 1)
+	defer archive.Close()
+	server := NewServer(core, material, "cluster", true, nil)
+	defer server.Close()
+	server.SetDurabilityBarrier(func(barrierCtx context.Context, slot quepaxa.Slot) error {
+		if err := core.EnsureDurable(slot); err != nil {
+			return err
+		}
+		return archive.SyncThrough(barrierCtx, core, slot)
+	})
+
+	req := KVMutationRequest{RequestID: "receipt-before-seal", Key: "key", Value: []byte("value")}
+	first, err := server.KVPut(ctx, req)
+	if err != nil || !first.Applied || archive.Tip() < quepaxa.Slot(first.Slot) {
+		t.Fatalf("initial write receipt=%+v archive_tip=%d err=%v", first, archive.Tip(), err)
+	}
+	if err := recovery.Seal(ctx, bucket, "cluster", "recovery-after-ack"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := server.KVPut(ctx, req); !errors.Is(err, ErrCommitUnknown) || !errors.Is(err, recovery.ErrArchiveSealed) {
+		t.Fatalf("cached write receipt after seal error=%v, want commit-unknown with archive-sealed cause", err)
 	}
 }
 

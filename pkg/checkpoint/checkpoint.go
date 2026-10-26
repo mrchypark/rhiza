@@ -1447,7 +1447,7 @@ func (m *Manager) garbageCollect(ctx context.Context, claim *PublisherClaim, ret
 		if err := m.validateMaintenanceClaim(ctx, claim); err != nil {
 			return err
 		}
-		if err := m.bucket.Delete(ctx, name); err != nil && !m.bucket.IsObjNotFoundErr(err) {
+		if err := objmetrics.DeleteSelectedVersion(ctx, m.bucket, name, attributes.Version); err != nil && !m.bucket.IsObjNotFoundErr(err) {
 			return err
 		}
 		removed = append(removed, root)
@@ -1508,12 +1508,16 @@ func (m *Manager) garbageCollect(ctx context.Context, claim *PublisherClaim, ret
 			return nil
 		}
 		modified, ok := attributes.LastModified()
-		if !ok {
+		var version *objstore.ObjectVersion
+		if !ok || objmetrics.SupportsVersionedDelete(m.bucket) {
 			objectAttributes, err := m.bucket.Attributes(ctx, attributes.Name)
 			if err != nil {
 				return err
 			}
-			modified = objectAttributes.LastModified
+			if !ok {
+				modified = objectAttributes.LastModified
+			}
+			version = objectAttributes.Version
 		}
 		if modified.After(cutoff) {
 			return nil
@@ -1521,7 +1525,7 @@ func (m *Manager) garbageCollect(ctx context.Context, claim *PublisherClaim, ret
 		if err := m.validateMaintenanceClaim(ctx, claim); err != nil {
 			return err
 		}
-		if err := m.bucket.Delete(ctx, attributes.Name); err != nil && !m.bucket.IsObjNotFoundErr(err) {
+		if err := objmetrics.DeleteSelectedVersion(ctx, m.bucket, attributes.Name, version); err != nil && !m.bucket.IsObjNotFoundErr(err) {
 			return err
 		}
 		return nil

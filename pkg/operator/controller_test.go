@@ -3,10 +3,14 @@ package operator
 import (
 	"bytes"
 	"context"
+	"crypto/hmac"
+	"crypto/sha256"
 	"encoding/base64"
+	"encoding/binary"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"hash/crc32"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -18,12 +22,15 @@ import (
 	"testing"
 
 	"github.com/mrchypark/rhiza/internal/types"
+	"github.com/mrchypark/rhiza/pkg/fencing"
 	"github.com/mrchypark/rhiza/pkg/network"
 	"github.com/mrchypark/rhiza/pkg/qlog"
 	"github.com/mrchypark/rhiza/pkg/quepaxa"
 	"github.com/mrchypark/rhiza/pkg/recovery"
 	"github.com/thanos-io/objstore"
 )
+
+const controllerFixtureAdminToken = "controller-fixture-admin"
 
 func TestControllerObservationAndFenceDoNotMutateStatefulSet(t *testing.T) {
 	ctx, bucket, r, api, c := controllerFixture(t, "before-ack", "before-ack")
@@ -57,6 +64,178 @@ func TestControllerAsyncSourceRequiresLossPolicyForBeforeAckTarget(t *testing.T)
 	}
 }
 
+func TestControllerEmptySourceRequiresCanonicalCommitAndTargetReadBarrier(t *testing.T) {
+	ctx, bucket, r, api, c := controllerEmptyFixture(t, "before-ack", "before-ack")
+	r.Spec.RecoveryID = "empty-recovery-1"
+	r.Spec.Fence = fence(r)
+	registrar := &archiveForkRegistrarFixture{emptyState: "authorized"}
+	c.Fencer = registrar
+
+	for _, stage := range []string{"Reserved", "Sealed", "Stopping", "Stopping", "Starting", "Restarted", "Restarted"} {
+		if err := c.reconcileAll(ctx); err != nil {
+			t.Fatal(err)
+		}
+		if r.Status.Stage != stage {
+			t.Fatalf("stage=%q want=%q status=%+v", r.Status.Stage, stage, r.Status)
+		}
+	}
+	if r.Status.TargetBaseKind != "empty" || r.Status.RecoveredTip != 0 || r.Status.ManifestHash != "" {
+		t.Fatalf("empty source was represented as a fork: %+v", r.Status)
+	}
+	if r.Status.Phase != "WaitingReady" {
+		t.Fatalf("target did not wait for runtime quorum after activation: %+v", r.Status)
+	}
+	// Model a target process publishing its first archive HEAD. Subsequent
+	// reconciliation must consult the canonical receipt, not rerun the
+	// pre-activation pristine-scope check against a live archive.
+	if err := bucket.Upload(ctx, "root/"+r.Status.Target+"/archive/head.bin", bytes.NewReader(emptyArchiveHeadFixture())); err != nil {
+		t.Fatal(err)
+	}
+	if registrar.emptyCalls < 2 || registrar.emptyRequest.RecoveryName != resourceName(r) ||
+		registrar.emptyRequest.PolicyDigest != hashJSON(r.Spec) || registrar.emptyRequest.SourceFenceOperationID != r.Spec.RecoveryID {
+		t.Fatalf("empty recovery was not bound to its persisted request: calls=%d request=%+v", registrar.emptyCalls, registrar.emptyRequest)
+	}
+	if _, err := bucket.Get(ctx, "root/"+r.Status.Target+"/recovery/generation.json"); !bucket.IsObjNotFoundErr(err) {
+		t.Fatalf("empty recovery fabricated fork lineage: %v", err)
+	}
+
+	api.noQuorum = true
+	if err := c.reconcileAll(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if r.Status.Stage == "Complete" {
+		t.Fatal("empty recovery completed without a target service ReadIndex barrier")
+	}
+	api.noQuorum = false
+	if err := c.reconcileAll(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if r.Status.Stage == "Complete" {
+		t.Fatal("authorized empty recovery completed before canonical genesis commit")
+	}
+	registrar.emptyState = "committed"
+	api.readBarrierUnavailable = true
+	if err := c.reconcileAll(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if r.Status.Stage == "Complete" || api.readBarrierCalls == 0 {
+		t.Fatalf("empty recovery completed without the target application read-durability barrier: status=%+v calls=%d", r.Status, api.readBarrierCalls)
+	}
+	api.readBarrierUnavailable = false
+	if err := c.reconcileAll(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if r.Status.Stage != "Complete" || r.Status.RecoveredTip != 0 {
+		t.Fatalf("committed empty recovery did not complete after the real target read-durability barrier: %+v", r.Status)
+	}
+}
+
+func TestTargetReadBarrierRejectsReplacementAfterFinalProbe(t *testing.T) {
+	ctx, _, r, api, c := controllerEmptyFixture(t, "before-ack", "before-ack")
+	r.Spec.RecoveryID = "read-barrier-replacement"
+	r.Status.Target = "rhiza-r-" + shortID(c.operationID(r))
+	r.Status.StatefulSetUID = "sts-uid"
+	api.replacePodAfterProbe = true
+	ready := map[string]bool{}
+	for _, member := range api.voters {
+		ready[string(member.ID)] = true
+	}
+	err := c.targetApplicationReadBarrier(ctx, r, api.sts, ready, controllerFixtureAdminToken)
+	if err == nil {
+		t.Fatal("read barrier accepted a Pod replacement after its final authenticated probe")
+	}
+	if api.finalProbeCalls == 0 || api.podUIDOverride == "" {
+		t.Fatalf("fixture did not replace the probed Pod incarnation: probes=%d override=%q", api.finalProbeCalls, api.podUIDOverride)
+	}
+}
+
+func TestControllerEmptyAsyncSourceRequiresExplicitLossPolicy(t *testing.T) {
+	ctx, bucket, r, api, c := controllerEmptyFixture(t, "async", "before-ack")
+	r.Spec.RecoveryID = "empty-async-recovery"
+	r.Spec.Fence = fence(r)
+	if err := c.reconcileAll(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if r.Status.Phase != "Blocked" || r.Status.Stage != "" || api.zeroPuts != 0 {
+		t.Fatalf("async empty source without loss policy advanced: status=%+v zeroPuts=%d", r.Status, api.zeroPuts)
+	}
+	if _, err := bucket.Get(ctx, "root/source/recovery/successor.json"); !bucket.IsObjNotFoundErr(err) {
+		t.Fatalf("async no-policy request reserved source: %v", err)
+	}
+}
+
+func TestControllerEmptyRecoveryFailsClosedWithoutInitializedHeadOrRegistrar(t *testing.T) {
+	t.Run("missing source HEAD is not fresh empty", func(t *testing.T) {
+		ctx, bucket, r, api, c := controllerEmptyFixture(t, "before-ack", "before-ack")
+		if err := bucket.Delete(ctx, "root/source/archive/head.bin"); err != nil {
+			t.Fatal(err)
+		}
+		r.Spec.RecoveryID = "missing-empty-head"
+		r.Spec.Fence = fence(r)
+		if err := c.reconcileAll(ctx); err != nil {
+			t.Fatal(err)
+		}
+		if r.Status.Phase != "Blocked" || r.Status.Stage != "" || api.zeroPuts != 0 {
+			t.Fatalf("missing source HEAD advanced recovery: status=%+v zeroPuts=%d", r.Status, api.zeroPuts)
+		}
+		if _, err := bucket.Get(ctx, "root/source/recovery/successor.json"); !bucket.IsObjNotFoundErr(err) {
+			t.Fatalf("missing source HEAD reserved a successor: %v", err)
+		}
+	})
+
+	t.Run("independent backend without empty registrar blocks before shutdown", func(t *testing.T) {
+		ctx, _, r, api, c := controllerEmptyFixture(t, "before-ack", "before-ack")
+		r.Spec.RecoveryID = "empty-without-registrar"
+		r.Spec.Fence = fence(r)
+		c.Fencer = archiveForkRegistrarHidingFencer{&FencingClient{}}
+		for range 3 {
+			if err := c.reconcileAll(ctx); err != nil {
+				t.Fatal(err)
+			}
+		}
+		if r.Status.Phase != "Blocked" || r.Status.Stage != "Sealed" || api.zeroPuts != 0 {
+			t.Fatalf("missing empty registrar advanced recovery: status=%+v zeroPuts=%d", r.Status, api.zeroPuts)
+		}
+	})
+}
+
+func controllerEmptyFixture(t *testing.T, sourceMode, targetMode string) (context.Context, objstore.Bucket, *Resource, *operatorAPI, *Controller) {
+	t.Helper()
+	ctx := context.Background()
+	bucket := objstore.NewInMemBucket()
+	voters := members()
+	if err := bucket.Upload(ctx, "root/source/archive/head.bin", bytes.NewReader(emptyArchiveHeadFixture())); err != nil {
+		t.Fatal(err)
+	}
+	if err := bucket.Upload(ctx, "root/source/voters/membership.json", bytes.NewReader(jsonBytes(recovery.NewMembershipRecord("source", voters, sourceMode)))); err != nil {
+		t.Fatal(err)
+	}
+	r := &Resource{Metadata: map[string]any{"name": "recover", "uid": "resource-uid", "generation": float64(1), "resourceVersion": "1"}, Spec: Spec{StatefulSet: "rhiza", SourceClusterID: "source", Durability: targetMode}}
+	api := newOperatorAPIVoters(t, r, sourceMode, voters)
+	ctr, err := container(api.sts, "rhiza")
+	if err != nil {
+		t.Fatal(err)
+	}
+	env := list(ctr["env"])
+	env = replaceEnv(env, "RHIZA_ENABLE_RECONFIGURATION", object{"value": "true"})
+	env = replaceEnv(env, "RHIZA_ADMIN_TOKEN", object{"value": controllerFixtureAdminToken})
+	ctr["env"] = env
+	t.Cleanup(api.Close)
+	return ctx, bucket, r, api, &Controller{Kube: api.kube(t), Bucket: bucket, Prefix: "root", StoreIdentity: storeIdentity(), Fencer: &archiveForkRegistrarFixture{emptyState: "authorized"}}
+}
+
+func emptyArchiveHeadFixture() []byte {
+	// Minimal valid config-1 generation-1 HEAD with an empty decision history.
+	data := make([]byte, 132)
+	copy(data[:8], []byte{'R', 'H', 'Z', 'A', 'H', 'D', '2', '!'})
+	binary.BigEndian.PutUint32(data[8:12], uint32(len(data)))
+	binary.BigEndian.PutUint64(data[16:24], uint64(recovery.ArchiveConfigID))
+	binary.BigEndian.PutUint64(data[24:32], 1)
+	binary.BigEndian.PutUint32(data[124:128], 0)
+	binary.BigEndian.PutUint32(data[128:132], crc32.Checksum(data[:128], crc32.MakeTable(crc32.Castagnoli)))
+	return data
+}
+
 func TestControllerReconfigurationForkPersistsAnchoredGenerationAcrossRestarts(t *testing.T) {
 	ctx, bucket, r, api, c := controllerFixture(t, "before-ack", "before-ack")
 	r.Spec.RecoveryID = "recovery-1"
@@ -65,10 +244,10 @@ func TestControllerReconfigurationForkPersistsAnchoredGenerationAcrossRestarts(t
 	if err != nil {
 		t.Fatal(err)
 	}
-	ctr["env"] = append(list(ctr["env"]), object{"name": "RHIZA_ENABLE_RECONFIGURATION", "value": "true"})
+	ctr["env"] = replaceEnv(list(ctr["env"]), "RHIZA_ENABLE_RECONFIGURATION", object{"value": "true"})
 
 	restart := func() {
-		c = &Controller{Kube: c.Kube, Bucket: bucket, Prefix: c.Prefix, StoreIdentity: c.StoreIdentity}
+		c = &Controller{Kube: c.Kube, Bucket: bucket, Prefix: c.Prefix, StoreIdentity: c.StoreIdentity, Fencer: c.Fencer}
 	}
 	advance := func(stage string) {
 		t.Helper()
@@ -114,6 +293,148 @@ func TestControllerReconfigurationForkPersistsAnchoredGenerationAcrossRestarts(t
 	if r.Status.Phase != "Complete" {
 		t.Fatalf("completion=%+v", r.Status)
 	}
+	registrar := c.Fencer.(*archiveForkRegistrarFixture)
+	wantRegistration := ArchiveForkGenesisRequest{
+		StatefulSetUID: "sts-uid", TargetClusterID: r.Status.Target,
+		OperationID: c.operationID(r), SourceFenceOperationID: r.Spec.RecoveryID,
+	}
+	if registrar.calls != 1 || registrar.request != wantRegistration {
+		t.Fatalf("canonical fork registration calls=%d request=%+v want=%+v", registrar.calls, registrar.request, wantRegistration)
+	}
+}
+
+type archiveForkRegistrarFixture struct {
+	request      ArchiveForkGenesisRequest
+	calls        int
+	err          error
+	emptyRequest ArchiveEmptyRecoveryRequest
+	emptyCalls   int
+	emptyState   string
+	emptyErr     error
+}
+
+type archiveForkRegistrarHidingFencer struct{ Fencer }
+
+func (*archiveForkRegistrarFixture) Fence(context.Context, FenceRequest) (*FenceProof, error) {
+	return nil, fmt.Errorf("unexpected fencing request")
+}
+
+func (f *archiveForkRegistrarFixture) RegisterArchiveForkGenesis(_ context.Context, request ArchiveForkGenesisRequest) error {
+	f.calls++
+	f.request = request
+	if request.StatefulSetUID == "" || request.TargetClusterID == "" || request.OperationID == "" || request.SourceFenceOperationID == "" {
+		return fmt.Errorf("incomplete archive fork registration request: %+v", request)
+	}
+	return f.err
+}
+
+func (f *archiveForkRegistrarFixture) RegisterArchiveEmptyRecovery(_ context.Context, request ArchiveEmptyRecoveryRequest) (ArchiveEmptyRecoveryResponse, error) {
+	f.emptyCalls++
+	f.emptyRequest = request
+	if f.emptyErr != nil {
+		return ArchiveEmptyRecoveryResponse{}, f.emptyErr
+	}
+	digest := hashJSON("empty-recovery-fixture")
+	return ArchiveEmptyRecoveryResponse{State: f.emptyState, Authorization: fencing.ArchiveEmptyRecoveryAuthorization{
+		Version: fencing.ArchiveGenesisVersion, StatefulSetUID: request.StatefulSetUID,
+		TargetClusterID: request.TargetClusterID, OperationID: request.OperationID,
+		SourceFenceOperationID: request.SourceFenceOperationID, ConfigID: recovery.ArchiveConfigID,
+		SourceScopeHash: digest, TargetScopeHash: hashJSON("target-scope"),
+		SourceGenesisRefDigest: digest, SourceHeadDigest: digest,
+		SourceHeadVersion:     objstore.ObjectVersion{Type: objstore.ETag, Value: "source-head"},
+		TargetEmptyHeadDigest: authorityStateDigest(emptyArchiveHeadFixture()),
+		SourceRootDigest:      digest, SourceFenceDigest: digest, SourceMembershipHash: digest,
+		SourceDurability: "before-ack", TargetMembershipHash: request.TargetMembershipHash,
+		TargetDurability: request.TargetDurability, AllowDataLoss: request.AllowDataLoss,
+		PolicyDigest: emptyRecoveryPolicyDigest(request.PolicyDigest, "before-ack", request.TargetDurability, request.AllowDataLoss),
+	}}, nil
+}
+
+func TestControllerRegistersCanonicalForkBeforeAdvancing(t *testing.T) {
+	for _, failRegistration := range []bool{false, true} {
+		name := "success"
+		if failRegistration {
+			name = "registration error"
+		}
+		t.Run(name, func(t *testing.T) {
+			ctx, _, r, api, c := controllerFixture(t, "before-ack", "before-ack")
+			r.Spec.RecoveryID = "source-fence-op"
+			r.Spec.Fence = fence(r)
+			ctr, err := container(api.sts, "rhiza")
+			if err != nil {
+				t.Fatal(err)
+			}
+			ctr["env"] = replaceEnv(list(ctr["env"]), "RHIZA_ENABLE_RECONFIGURATION", object{"value": "true"})
+			registrar := &archiveForkRegistrarFixture{}
+			if failRegistration {
+				registrar.err = fmt.Errorf("canonical registration unavailable")
+			}
+			c.Fencer = registrar
+			for range 3 {
+				if err := c.reconcileAll(ctx); err != nil {
+					t.Fatal(err)
+				}
+				if r.Status.Stage == "Stopping" || r.Status.Phase == "Blocked" {
+					break
+				}
+			}
+			if registrar.calls != 1 {
+				t.Fatalf("registration calls=%d, want 1", registrar.calls)
+			}
+			want := ArchiveForkGenesisRequest{
+				StatefulSetUID: "sts-uid", TargetClusterID: r.Status.Target,
+				OperationID: c.operationID(r), SourceFenceOperationID: r.Spec.RecoveryID,
+			}
+			if registrar.request != want {
+				t.Fatalf("registered request=%+v want=%+v", registrar.request, want)
+			}
+			if failRegistration {
+				if r.Status.Phase != "Blocked" || r.Status.Stage != "Sealed" || api.zeroPuts != 0 {
+					t.Fatalf("failed registration advanced recovery: status=%+v zeroPuts=%d", r.Status, api.zeroPuts)
+				}
+			} else if r.Status.Stage != "Stopping" {
+				t.Fatalf("successful registration did not advance verified fork: %+v", r.Status)
+			}
+		})
+	}
+}
+
+func TestControllerDoesNotTreatMissingRegistrarAsCooperativeProfile(t *testing.T) {
+	for _, tc := range []struct {
+		name      string
+		fencer    Fencer
+		wantStage string
+		wantPhase string
+	}{
+		{name: "wrapped independent backend without registrar", fencer: archiveForkRegistrarHidingFencer{&FencingClient{}}, wantStage: "Sealed", wantPhase: "Blocked"},
+		{name: "explicit Kubernetes cooperative backend", fencer: &KubernetesFencer{}, wantStage: "Stopping", wantPhase: "Recovering"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx, _, r, api, c := controllerFixture(t, "before-ack", "before-ack")
+			r.Spec.RecoveryID = "source-fence-op"
+			r.Spec.Fence = fence(r)
+			ctr, err := container(api.sts, "rhiza")
+			if err != nil {
+				t.Fatal(err)
+			}
+			ctr["env"] = replaceEnv(list(ctr["env"]), "RHIZA_ENABLE_RECONFIGURATION", object{"value": "true"})
+			c.Fencer = tc.fencer
+			for range 3 {
+				if err := c.reconcileAll(ctx); err != nil {
+					t.Fatal(err)
+				}
+				if r.Status.Stage == "Stopping" || r.Status.Phase == "Blocked" {
+					break
+				}
+			}
+			if r.Status.Stage != tc.wantStage || r.Status.Phase != tc.wantPhase {
+				t.Fatalf("unexpected recovery progress: got stage=%q phase=%q, want stage=%q phase=%q", r.Status.Stage, r.Status.Phase, tc.wantStage, tc.wantPhase)
+			}
+			if tc.wantPhase == "Blocked" && api.zeroPuts != 0 {
+				t.Fatalf("missing canonical registrar advanced activation: zero replica writes=%d", api.zeroPuts)
+			}
+		})
+	}
 }
 
 func TestControllerRejectsInvalidReconfigurationFlag(t *testing.T) {
@@ -122,7 +443,7 @@ func TestControllerRejectsInvalidReconfigurationFlag(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	ctr["env"] = append(list(ctr["env"]), object{"name": "RHIZA_ENABLE_RECONFIGURATION", "value": "sometimes"})
+	ctr["env"] = replaceEnv(list(ctr["env"]), "RHIZA_ENABLE_RECONFIGURATION", object{"value": "sometimes"})
 	if err := c.reconcileAll(ctx); err != nil {
 		t.Fatal(err)
 	}
@@ -198,10 +519,16 @@ func TestControllerMembershipRetryUsesExactJournaledPayloads(t *testing.T) {
 	ctx, r, api, c := membershipFixture(t)
 	api.membership["n1"] = network.MembershipStatus{NodeID: "n1", ClusterID: "source", ConfigID: 1, Voters: []quepaxa.NodeID{"n1", "n2", "n3"}, Voting: true, AbortSlot: 7}
 	api.membership["n2"] = network.MembershipStatus{NodeID: "n2", ClusterID: "source", ConfigID: 1, Voters: []quepaxa.NodeID{"n1", "n2", "n3"}, Voting: true, AbortSlot: 7}
+	seedLegacyRemoveMembershipJournal(r)
+	r.Status.Membership.RemoveRequest.ExpectedAbortSlot = 7
+	var seededRemove network.MembershipChange
+	if err := json.Unmarshal(jsonBytes(r.Status.Membership.RemoveRequest), &seededRemove); err != nil {
+		t.Fatal(err)
+	}
 	if err := c.reconcileAll(ctx); err != nil {
 		t.Fatal(err)
 	}
-	if r.Status.Membership == nil || r.Status.Membership.RemoveRequest == nil || r.Status.Membership.RemoveRequest.ExpectedAbortSlot != 7 || len(api.changes) != 0 {
+	if r.Status.Membership == nil || r.Status.Membership.RemoveRequest == nil || r.Status.Membership.RemoveRequest.ExpectedAbortSlot != 7 || len(api.changes) != 1 || !sameJSON(api.changes[0], seededRemove) {
 		t.Fatalf("remove journal=%+v changes=%d", r.Status.Membership, len(api.changes))
 	}
 	api.changeStatus = http.StatusServiceUnavailable
@@ -211,7 +538,7 @@ func TestControllerMembershipRetryUsesExactJournaledPayloads(t *testing.T) {
 	if err := c.reconcileAll(ctx); err != nil {
 		t.Fatal(err)
 	}
-	if len(api.changes) != 2 || !bytes.Equal(jsonBytes(api.changes[0]), jsonBytes(api.changes[1])) {
+	if len(api.changes) != 3 || !sameJSON(api.changes[0], seededRemove) || !sameJSON(api.changes[1], seededRemove) || !sameJSON(api.changes[2], seededRemove) {
 		t.Fatalf("remove retries differ: %+v", api.changes)
 	}
 	api.changeStatus = 0
@@ -228,7 +555,7 @@ func TestControllerMembershipRetryUsesExactJournaledPayloads(t *testing.T) {
 	if err := c.reconcileAll(ctx); err != nil {
 		t.Fatal(err)
 	}
-	if r.Status.Phase != "Blocked" || len(api.changes) != 2 {
+	if r.Status.Phase != "Blocked" || len(api.changes) != 4 {
 		t.Fatalf("credential drift=%+v changes=%d", r.Status, len(api.changes))
 	}
 	api.membershipSecret["metadata"].(object)["resourceVersion"] = "1"
@@ -239,7 +566,7 @@ func TestControllerMembershipRetryUsesExactJournaledPayloads(t *testing.T) {
 	if err := c.reconcileAll(ctx); err != nil {
 		t.Fatal(err)
 	}
-	if len(api.changes) != 4 || !bytes.Equal(jsonBytes(api.changes[2]), jsonBytes(api.changes[3])) {
+	if len(api.changes) != 6 || !bytes.Equal(jsonBytes(api.changes[4]), jsonBytes(api.changes[5])) {
 		t.Fatalf("add retries differ: %+v", api.changes)
 	}
 	api.membership["n1"] = network.MembershipStatus{NodeID: "n1", ClusterID: "source", ConfigID: 3, Voters: []quepaxa.NodeID{"n1", "n2", "n4"}, Voting: true}
@@ -262,6 +589,7 @@ func TestControllerMembershipRetryUsesExactJournaledPayloads(t *testing.T) {
 		t.Fatal("credential drift bypassed completion validation")
 	}
 	api.membershipSecret["metadata"].(object)["resourceVersion"] = "1"
+	api.changeStatus = 0
 	if err := c.reconcileAll(ctx); err != nil {
 		t.Fatal(err)
 	}
@@ -277,6 +605,7 @@ func TestControllerMembershipRejectsBadFenceAndWorkload(t *testing.T) {
 	} {
 		t.Run(name, func(t *testing.T) {
 			ctx, r, api, c := membershipFixture(t)
+			seedLegacyRemoveMembershipJournal(r)
 			change(&r.Spec.Membership.Fence)
 			if err := c.reconcileAll(ctx); err != nil {
 				t.Fatal(err)
@@ -290,6 +619,7 @@ func TestControllerMembershipRejectsBadFenceAndWorkload(t *testing.T) {
 
 func TestControllerMembershipFailsClosedWithoutQuorum(t *testing.T) {
 	ctx, r, api, c := membershipFixture(t)
+	seedLegacyRemoveMembershipJournal(r)
 	delete(api.membership, "n2")
 	if err := c.reconcileAll(ctx); err != nil {
 		t.Fatal(err)
@@ -301,6 +631,7 @@ func TestControllerMembershipFailsClosedWithoutQuorum(t *testing.T) {
 
 func TestControllerMembershipAbortThenResumeWithNewLearner(t *testing.T) {
 	ctx, r, api, c := membershipFixture(t)
+	seedLegacyRemoveMembershipJournal(r)
 	if err := c.reconcileAll(ctx); err != nil {
 		t.Fatal(err)
 	} // journal remove
@@ -363,6 +694,49 @@ func TestControllerMembershipAbortThenResumeWithNewLearner(t *testing.T) {
 func TestControllerMembershipSecondReplacementUsesStandaloneVoter(t *testing.T) {
 	ctx, r, api, c := membershipFixture(t)
 	r.Spec.Membership = &MembershipSpec{OperationID: "replace-n1", Remove: "n1", Fence: MembershipFence{NodeID: "n1", WALIdentity: strings.Repeat("c", 64), WorkloadUID: "pod-n1", Confirmed: true, Evidence: "external-fencer: incident-43"}, VoterPods: []VoterPod{{NodeID: "n2", Pod: "n2"}, {NodeID: "n4", Pod: "learner"}}, ReplacementPod: "learner2", ReplacementSecret: "learner-credentials"}
+	standalone := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, q *http.Request) {
+		api.mu.Lock()
+		defer api.mu.Unlock()
+		switch q.URL.Path {
+		case "/membership/status":
+			status, ok := api.membership["n4"]
+			if !ok {
+				http.NotFound(w, q)
+				return
+			}
+			_ = json.NewEncoder(w).Encode(status)
+		case "/membership/change":
+			var change network.MembershipChange
+			if json.NewDecoder(q.Body).Decode(&change) != nil {
+				http.Error(w, "bad request", http.StatusBadRequest)
+				return
+			}
+			api.changes = append(api.changes, change)
+			if api.changeStatus != 0 {
+				w.WriteHeader(api.changeStatus)
+				return
+			}
+			_ = json.NewEncoder(w).Encode(map[string]string{"status": "completed"})
+		default:
+			http.NotFound(w, q)
+		}
+	}))
+	t.Cleanup(standalone.Close)
+	_, standalonePort, err := net.SplitHostPort(standalone.Listener.Addr().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	port, err := strconv.Atoi(standalonePort)
+	if err != nil {
+		t.Fatal(err)
+	}
+	api.replacement = object{"metadata": object{"name": "learner", "uid": "learner-uid"}, "status": object{"podIP": "127.0.0.1"}, "spec": object{"containers": []any{object{"name": "rhiza", "ports": []any{object{"name": "http", "containerPort": float64(port)}}}}}}
+	seedLegacyRemoveMembershipJournal(r)
+	r.Status.Membership.RemoveRequest.ExpectedConfigID = 3
+	var seededRemove network.MembershipChange
+	if err := json.Unmarshal(jsonBytes(r.Status.Membership.RemoveRequest), &seededRemove); err != nil {
+		t.Fatal(err)
+	}
 	api.replacement2 = object{"metadata": object{"name": "learner2", "uid": "learner2-uid"}, "status": object{"podIP": "127.0.0.1"}, "spec": object{"containers": []any{object{"name": "rhiza", "ports": []any{object{"name": "http", "containerPort": float64(8080)}}}}}}
 	api.membership["n1"] = membershipStatus("n1", 3, "n1", "n2", "n4")
 	api.membership["n2"] = membershipStatus("n2", 3, "n1", "n2", "n4")
@@ -371,14 +745,14 @@ func TestControllerMembershipSecondReplacementUsesStandaloneVoter(t *testing.T) 
 	if err := c.reconcileAll(ctx); err != nil {
 		t.Fatal(err)
 	}
-	if r.Status.Phase != "Blocked" || r.Status.Membership != nil {
+	if r.Status.Phase != "Blocked" || r.Status.Membership == nil || !sameJSON(r.Status.Membership.RemoveRequest, seededRemove) || len(api.changes) != 0 {
 		t.Fatalf("standalone voter was not required: %+v", r.Status)
 	}
 	api.membership["n4"] = network.MembershipStatus{NodeID: "n4", ClusterID: "source", ConfigID: 3, Voters: []quepaxa.NodeID{"n1", "n2", "n4"}, WALIdentity: strings.Repeat("a", 64), Voting: true}
 	if err := c.reconcileAll(ctx); err != nil {
 		t.Fatal(err)
 	}
-	if r.Status.Membership == nil || r.Status.Membership.RemoveRequest == nil || r.Status.Membership.RemoveRequest.ExpectedConfigID != 3 {
+	if r.Status.Membership == nil || r.Status.Membership.RemoveRequest == nil || r.Status.Membership.RemoveRequest.ExpectedConfigID != 3 || !sameJSON(r.Status.Membership.RemoveRequest, seededRemove) || len(api.changes) != 1 {
 		t.Fatalf("second replacement was not journaled from standalone-voter quorum: %+v", r.Status)
 	}
 }
@@ -391,7 +765,7 @@ func membershipFixture(t *testing.T) (context.Context, *Resource, *operatorAPI, 
 	if err != nil {
 		t.Fatal(err)
 	}
-	ctr["env"] = append(list(ctr["env"]), object{"name": "RHIZA_ADMIN_TOKEN", "value": "admin"})
+	ctr["env"] = replaceEnv(list(ctr["env"]), "RHIZA_ADMIN_TOKEN", object{"value": controllerFixtureAdminToken})
 	_, port, err := net.SplitHostPort(api.learner.Listener.Addr().String())
 	if err != nil {
 		t.Fatal(err)
@@ -536,7 +910,7 @@ func TestControllerVoterCountContract(t *testing.T) {
 				api.unready[string(voters[i].ID)] = true
 			}
 			for range 8 {
-				c = &Controller{Kube: c.Kube, Bucket: bucket, Prefix: c.Prefix, StoreIdentity: c.StoreIdentity}
+				c = &Controller{Kube: c.Kube, Bucket: bucket, Prefix: c.Prefix, StoreIdentity: c.StoreIdentity, Fencer: c.Fencer}
 				if err := c.reconcileAll(ctx); err != nil {
 					t.Fatal(err)
 				}
@@ -667,7 +1041,7 @@ func TestControllerRejectsSubsetTargetCredentials(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	ctr["env"] = append(list(ctr["env"]), object{"name": "RHIZA_ENABLE_RECONFIGURATION", "value": "true"})
+	ctr["env"] = replaceEnv(list(ctr["env"]), "RHIZA_ENABLE_RECONFIGURATION", object{"value": "true"})
 	subset := []quepaxa.Member{voterMember("source", "n1", "new1"), voterMember("source", "n2", "new2"), voterMember("source", "n3", "new3")}
 	tokens := map[string]string{}
 	for _, member := range subset {
@@ -715,6 +1089,14 @@ func controllerFixture(t *testing.T, sourceMode, targetMode string) (context.Con
 	return controllerFixtureVoters(t, sourceMode, targetMode, members())
 }
 
+func controllerFixtureRecoveryProbeMAC(probe network.RecoveryProbe, token string) string {
+	probe.MAC = ""
+	payload, _ := json.Marshal(probe)
+	mac := hmac.New(sha256.New, []byte(token))
+	_, _ = mac.Write(payload)
+	return hex.EncodeToString(mac.Sum(nil))
+}
+
 // controllerFixtureVoters builds the same recovery fixture for any supported
 // voter count.
 func controllerFixtureVoters(t *testing.T, sourceMode, targetMode string, voters []quepaxa.Member) (context.Context, objstore.Bucket, *Resource, *operatorAPI, *Controller) {
@@ -724,8 +1106,16 @@ func controllerFixtureVoters(t *testing.T, sourceMode, targetMode string, voters
 	seedArchive(t, ctx, bucket, "root/source", voters, sourceMode)
 	r := &Resource{Metadata: map[string]any{"name": "recover", "uid": "resource-uid", "generation": float64(1), "resourceVersion": "1"}, Spec: Spec{StatefulSet: "rhiza", SourceClusterID: "source", Durability: targetMode}}
 	api := newOperatorAPIVoters(t, r, sourceMode, voters)
+	ctr, err := container(api.sts, "rhiza")
+	if err != nil {
+		t.Fatal(err)
+	}
+	env := list(ctr["env"])
+	env = replaceEnv(env, "RHIZA_ENABLE_RECONFIGURATION", object{"value": "true"})
+	env = replaceEnv(env, "RHIZA_ADMIN_TOKEN", object{"value": controllerFixtureAdminToken})
+	ctr["env"] = env
 	t.Cleanup(api.Close)
-	return ctx, bucket, r, api, &Controller{Kube: api.kube(t), Bucket: bucket, Prefix: "root", StoreIdentity: storeIdentity()}
+	return ctx, bucket, r, api, &Controller{Kube: api.kube(t), Bucket: bucket, Prefix: "root", StoreIdentity: storeIdentity(), Fencer: &archiveForkRegistrarFixture{}}
 }
 
 type operatorAPI struct {
@@ -742,9 +1132,16 @@ type operatorAPI struct {
 	peers                         []*httptest.Server
 	learner                       *httptest.Server
 	membership                    map[string]network.MembershipStatus
+	recoveryStatusClusterID       string
 	changes                       []network.MembershipChange
 	aborts                        []network.MembershipChange
 	changeStatus                  int
+	noQuorum                      bool
+	readBarrierUnavailable        bool
+	readBarrierCalls              int
+	finalProbeCalls               int
+	replacePodAfterProbe          bool
+	podUIDOverride                string
 	learnerID                     string
 	voters                        []quepaxa.Member
 	unready                       map[string]bool
@@ -757,6 +1154,60 @@ func newOperatorAPIVoters(t *testing.T, r *Resource, mode string, voters []quepa
 		a.peers = append(a.peers, httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, q *http.Request) {
 			a.mu.Lock()
 			defer a.mu.Unlock()
+			if q.URL.Path == "/recovery/archive" && q.Method == http.MethodPost {
+				if q.Header.Get("Authorization") != "Bearer "+controllerFixtureAdminToken {
+					w.WriteHeader(http.StatusUnauthorized)
+					return
+				}
+				// seedArchive already materializes the current-policy certified
+				// source history; this endpoint models its authenticated capture ack.
+				w.WriteHeader(http.StatusOK)
+				return
+			}
+			if q.URL.Path == "/recovery/probe" && q.Method == http.MethodGet {
+				// Activation replaces the source admin token with the freshly
+				// generated target credential. Validate the installed target
+				// token so the fixture reaches the SQL read-barrier path.
+				token := controllerFixtureAdminToken
+				if a.secret != nil {
+					if decoded, err := base64.StdEncoding.DecodeString(str(nested(a.secret, "data", "admin"))); err == nil {
+						token = string(decoded)
+					}
+				}
+				if q.Header.Get("Authorization") != "Bearer "+token {
+					w.WriteHeader(http.StatusUnauthorized)
+					return
+				}
+				a.finalProbeCalls++
+				tip := uint64(1)
+				if a.r.Status.TargetBaseKind == "empty" {
+					tip = 0
+				}
+				probe := network.RecoveryProbe{Nonce: q.URL.Query().Get("nonce"), Status: network.VoterRecoveryStatus{
+					NodeID: string(member.ID), ClusterID: "rhiza-r-" + shortID(str(a.r.Metadata["uid"])+":"+a.r.Spec.RecoveryID), Durability: a.r.Spec.Durability,
+					Ready: !a.unready[string(member.ID)], Quorum: !a.noQuorum, CertifiedTip: tip, AppliedTip: tip,
+				}}
+				probe.MAC = controllerFixtureRecoveryProbeMAC(probe, token)
+				_ = json.NewEncoder(w).Encode(probe)
+				if a.replacePodAfterProbe && a.finalProbeCalls >= 2 {
+					a.podUIDOverride = "replacement-after-probe"
+				}
+				return
+			}
+			if q.URL.Path == "/sql/query" && q.Method == http.MethodPost {
+				a.readBarrierCalls++
+				var request network.QueryRequest
+				if json.NewDecoder(q.Body).Decode(&request) != nil || request.SQL != "SELECT 1" || request.Consistency != "linearizable" {
+					http.Error(w, "invalid application read barrier", http.StatusBadRequest)
+					return
+				}
+				if a.readBarrierUnavailable {
+					w.WriteHeader(http.StatusServiceUnavailable)
+					return
+				}
+				_ = json.NewEncoder(w).Encode(network.QueryResponse{Columns: []string{"1"}, Rows: [][]interface{}{{float64(1)}}, AppliedSlot: 0, ConsensusTip: 0})
+				return
+			}
 			if q.URL.Path == "/membership/status" {
 				status, ok := a.membership[string(member.ID)]
 				if !ok {
@@ -794,7 +1245,17 @@ func newOperatorAPIVoters(t *testing.T, r *Resource, mode string, voters []quepa
 				http.NotFound(w, q)
 				return
 			}
-			_ = json.NewEncoder(w).Encode(network.VoterRecoveryStatus{NodeID: string(member.ID), ClusterID: "rhiza-r-" + shortID("resource-uid:recovery-1"), Durability: "before-ack", Ready: !a.unready[string(member.ID)], Quorum: true, CertifiedTip: 1, AppliedTip: 1})
+			tip, durability := uint64(1), "before-ack"
+			clusterID := "rhiza-r-" + shortID("resource-uid:recovery-1")
+			if a.r.Status.TargetBaseKind == "empty" {
+				tip = 0
+				durability = a.r.Spec.Durability
+				clusterID = "rhiza-r-" + shortID(str(a.r.Metadata["uid"])+":"+a.r.Spec.RecoveryID)
+			}
+			if a.recoveryStatusClusterID != "" {
+				clusterID = a.recoveryStatusClusterID
+			}
+			_ = json.NewEncoder(w).Encode(network.VoterRecoveryStatus{NodeID: string(member.ID), ClusterID: clusterID, Durability: durability, Ready: !a.unready[string(member.ID)], Quorum: !a.noQuorum, CertifiedTip: tip, AppliedTip: tip})
 		})))
 	}
 	a.learner = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, q *http.Request) {
@@ -832,6 +1293,11 @@ func (a *operatorAPI) serve(w http.ResponseWriter, q *http.Request) {
 	case "/apis/rhiza.mrchypark.dev/v1alpha1/namespaces/default/rhizarecoveries":
 		if q.Method == "GET" {
 			json.NewEncoder(w).Encode(recoveryList{Items: []Resource{*a.r}})
+			return
+		}
+	case "/apis/rhiza.mrchypark.dev/v1alpha1/namespaces/default/rhizarecoveries/recover":
+		if q.Method == "GET" {
+			json.NewEncoder(w).Encode(a.r)
 			return
 		}
 	case "/apis/rhiza.mrchypark.dev/v1alpha1/namespaces/default/rhizarecoveries/recover/status":
@@ -942,8 +1408,12 @@ func (a *operatorAPI) pods() []object {
 		if err != nil {
 			continue
 		}
+		podUID := "pod-" + string(a.voters[i].ID)
+		if a.podUIDOverride != "" {
+			podUID = a.podUIDOverride
+		}
 		result = append(result, object{
-			"metadata": object{"name": string(a.voters[i].ID), "uid": "pod-" + string(a.voters[i].ID), "ownerReferences": []any{object{"uid": "sts-uid", "kind": "StatefulSet"}}},
+			"metadata": object{"name": string(a.voters[i].ID), "uid": podUID, "ownerReferences": []any{object{"uid": "sts-uid", "kind": "StatefulSet"}}},
 			"status":   object{"podIP": "127.0.0.1"},
 			"spec":     object{"containers": []any{object{"name": "rhiza", "ports": []any{object{"name": "http", "containerPort": float64(p)}}}}},
 		})
@@ -1006,7 +1476,7 @@ func seedArchive(t *testing.T, ctx context.Context, bucket objstore.Bucket, pref
 		t.Fatal(err)
 	}
 	defer wal.Close()
-	core, err := quepaxa.New(quepaxa.Config{NodeID: ms[0].ID, Cluster: quepaxa.Cluster{ConfigID: 1, Members: ms}, WAL: wal, Transport: testTransport{}})
+	core, err := quepaxa.New(quepaxa.Config{NodeID: ms[0].ID, Cluster: quepaxa.Cluster{ConfigID: recovery.ArchiveConfigID, Members: ms}, WAL: wal, Transport: testTransport{}})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1014,10 +1484,13 @@ func seedArchive(t *testing.T, ctx context.Context, bucket objstore.Bucket, pref
 	if err != nil {
 		t.Fatal(err)
 	}
+	if err := types.ValidateExecutionPolicy(value); err != nil {
+		t.Fatalf("seed archive must use the current SQL execution policy: %v", err)
+	}
 	if _, _, err = core.Propose(ctx, value); err != nil {
 		t.Fatal(err)
 	}
-	archive := recovery.NewManager(bucket, prefix, 1)
+	archive := recovery.NewManager(bucket, prefix, recovery.ArchiveConfigID)
 	defer archive.Close()
 	if err = archive.SyncThrough(ctx, core, core.Tip()); err != nil {
 		t.Fatal(err)
@@ -1029,6 +1502,34 @@ func seedArchive(t *testing.T, ctx context.Context, bucket objstore.Bucket, pref
 }
 
 type testTransport struct{}
+
+func TestManualMissingSourceMembershipOptInIsManualOnly(t *testing.T) {
+	base := Resource{Metadata: object{"uid": "recovery-uid"}, Spec: Spec{RecoveryID: "recovery-id"}}
+	if manualMissingSourceMembershipAllowed(&base) {
+		t.Fatal("missing-membership recovery was enabled by default")
+	}
+	base.Spec.AllowMissingSourceMembership = true
+	if !manualMissingSourceMembershipAllowed(&base) {
+		t.Fatal("explicit manual recovery opt-in was rejected")
+	}
+	for name, mutate := range map[string]func(*Resource){
+		"missing recovery uid": func(r *Resource) { r.Metadata["uid"] = "" },
+		"missing operation":    func(r *Resource) { r.Spec.RecoveryID = "" },
+		"membership operation": func(r *Resource) { r.Spec.Membership = &MembershipSpec{} },
+		"automatic owner":      func(r *Resource) { r.Metadata["annotations"] = object{automaticOwner: "cluster-uid"} },
+		"automatic logical":    func(r *Resource) { r.Metadata["annotations"] = object{automaticLogical: "logical"} },
+	} {
+		t.Run(name, func(t *testing.T) {
+			candidate := base
+			candidate.Metadata = object{"uid": "recovery-uid"}
+			candidate.Spec.Membership = nil
+			mutate(&candidate)
+			if manualMissingSourceMembershipAllowed(&candidate) {
+				t.Fatal("invalid or automatic recovery satisfied the manual opt-in gate")
+			}
+		})
+	}
+}
 
 func (testTransport) SendRecord(_ context.Context, to quepaxa.NodeID, r quepaxa.RecordRequest) (quepaxa.Summary, error) {
 	p := r.Proposal

@@ -75,6 +75,7 @@ func TestAdvanceAutomaticPropagatesAnchorID(t *testing.T) {
 	c.Kube = kube
 	r := autoClusterResource("cluster-1", "uid-1", "logical-1")
 	r.Spec.AnchorID = "auto-anchor"
+	r.Spec.Policy = &goodPolicy
 
 	state := validAutoControl()
 	request := FenceRequest{
@@ -91,7 +92,7 @@ func TestAdvanceAutomaticPropagatesAnchorID(t *testing.T) {
 	hash, _ := requestHash(&request)
 	state.Intent = &autoIntent{
 		Request:      request,
-		Policy:       r.Spec.Policy,
+		Policy:       *r.Spec.Policy,
 		Durability:   "async",
 		Voters:       append([]VoterPod(nil), state.Voters...),
 		RecoveryName: "auto-1",

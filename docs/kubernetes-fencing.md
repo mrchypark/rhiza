@@ -74,9 +74,49 @@ while admission is open, but must bind its exact historical WAL before writers
 start. A different Pod UID cannot bypass an unresolved prior voter. Restarting
 does not prove an old run safe: every old record remains, and a later fence stays
 pending without its evidence. Such fencing incidents need independent stronger
-evidence from the optional external attestor described below or a carefully
+evidence from enrolled runtime/mutation providers described below or a carefully
 verified manual recovery; never delete the ledger or restart the object store to
 manufacture a pass.
+
+The fencer's cooperative-only default may use the explicitly selected legacy
+Kubernetes control ledger when canonical GCS authority state is not configured.
+That mode is for cooperative fencing only and is **not NoPVC-qualified**. The
+independent mutation profile requires remote canonical authority state and its
+separate runtime, staging, receipt, and source-writer providers. If a remote
+authority store is configured but unavailable, the fencer fails closed; it does
+not fall back to the Kubernetes ledger. Source-mutation endpoints always require
+canonical remote authority state, even when the cooperative-only option is set.
+
+The base `deploy/operator/fencing/authority.yaml` intentionally remains
+provider-neutral and does not inject `rhiza-config` or `rhiza-object-store` into
+the fencer. For automatic learner startup and canonical recovery, configure the
+fencer explicitly with the same canonical ObjectStorage provider, bucket, and
+data prefix as the operator, and with credentials accepted by that store. Use
+the deployment's existing overlay/configuration convention; do not infer that
+the operator's `RHIZA_OBJSTORE_*` configuration is inherited by the fencer.
+Where the selected profile uses a separate canonical authority/control prefix,
+configure and verify that prefix separately from the archive data prefix.
+Cooperative use of the legacy Kubernetes control ledger does not qualify or
+enable automatic learners or canonical recovery.
+
+The GCS HA launcher is a separate deployment path: its dedicated rendered
+manifest imports `rhiza-config` into its fencer and sets the authority-state
+prefix explicitly; its GCS credentials use the launcher's configured ADC / Workload
+Identity path. It does not inherit configuration from the base authority
+manifest. For either path, verify the fencer's effective provider, bucket, data
+prefix, and control prefix by checking only those named non-secret settings.
+Do not print the full container environment or Secret contents. Then exercise
+the existing automatic startup-grant/recovery path to verify that the fencer
+can use the configured authority. These checks establish wiring and path
+behavior only; they do not qualify GCS fencing or recovery.
+
+Anchored recovery additionally requires a configured fencer that implements
+canonical archive-fork registration. The cooperative `KubernetesFencer` does not
+provide this registrar, so the operator rejects an anchored recovery before it
+reserves a successor or mutates source/target archive state. Unanchored
+cooperative recovery retains its legacy immutable DATA reservation; it is not a
+canonical CONTROL successor claim and does not qualify the workload for
+independent NoPVC recovery.
 
 Voter fencing permanently closes that stable slot in the source generation but
 does not stop surviving voters. A later generation fence preserves immutable
@@ -92,58 +132,48 @@ disappear before the new generation can start.
 
 ### Independent evidence for an unreachable incarnation
 
-A hard-killed or deleted voter leaves no exit receipt, so the cooperative ledger
-can never complete on its own. `rhiza-fencer serve` accepts one **optional**
-external attestation service for exactly that case. Without it, the fence stays
-pending exactly as before.
+A hard-killed or deleted voter leaves no cooperative exit receipt. Independent
+completion now uses **evidence v2**, not the legacy v1 quiet-window attestor.
+Unchanged object observations cannot exclude an arbitrarily delayed accepted
+mutation. Both the authority and recovery controller reject v1 authorization.
+Any legacy `RHIZA_FENCE_ATTESTOR_*` setting makes `rhiza-fencer serve` fail startup
+with an explicit unsupported-profile error rather than silently ignore it.
 
-The trust boundary is explicit. The operator keeps only its namespaced
-Kubernetes credentials and asks a separately operated service, over HTTPS with a
-pinned CA and an audience-bound projected token, to prove that the exact dead
-incarnation is terminally gone. No node, CRI, or cloud credential is added to
-the operator, and the service must not hold write access to `RhizaFence`
-status. Configure it with `RHIZA_FENCE_ATTESTOR_URL`,
-`RHIZA_FENCE_ATTESTOR_TOKEN_FILE`, and `RHIZA_FENCE_ATTESTOR_CA_FILE`. All
-three values are required together, the CA bundle replaces the system root pool
-rather than adding to it, and a partial configuration fails startup instead of
-silently disabling independent evidence or leaving the attestor unpinned.
+The v2 authority closes the exact enrolled runtime/producer cohort first, then
+collects trusted runtime receipts for each run that lacks retained terminal
+evidence. Runtime collection cannot substitute the latest container for an
+older attempt sharing its Pod UID. Missing enrollment, an unavailable provider,
+or unresolved admitted mutations prevents completion. Every prepared mutation
+needs provider receipt verification and exact store-scope binding; archive
+verification resumes across reconciles and authority restarts.
 
-The authority keeps closing the durable ledger first and keeps writing the status
-itself. It consults the attestor only after that closure is persisted and only
-while the cooperative proof is still incomplete. Before it issues a proof, the
-returned evidence must bind all of:
+Actual evidence is persisted immutably before its reference is pinned in the
+root ledger. Historical references preserve the original voter stop request and
+can compose into a later generation proof even when that voter no longer
+appears among current targets. Every historical run is included; none is erased
+or relabelled a clean cooperative drain. A voter fence does not close survivor
+producers or require generation-wide storage silence.
 
-- the exact request hash and the canonical hash of the closed ledger;
-- the closing operation ID and that same request hash in the barrier evidence;
-- the exact current supervised Pod UID inventory, which is re-read after the
-  attestation and must be unchanged;
-- one terminal runtime per fenced Pod incarnation, restating the Pod UID, node
-  name, node UID, compute instance, container ID, image ID, run IDs, and WAL
-  identities the operator captured before the fault;
-- the exact object-store location of the workload, including the endpoint and
-  account identity that make a provider, bucket, and prefix unambiguous;
-- two observations of `archive/head.bin` and `checkpoint/CURRENT` whose
-  generation, metageneration, and inventory digest are identical, taken at the
-  start and end of a quiet window of at least 30 seconds, whose later
-  observation is no more than two minutes ahead of the authority's own clock.
+Before writing `RhizaFence.status.proof.independentV2`, the authority verifies
+all retained evidence, re-reads the root and supervised Pod inventory, and
+requires both to match. The proof carries exact request/root hashes, store
+scope, current Pod UIDs and one immutable terminal reference per closed run.
+The CRD bounds the reference array at 64. The recovery controller validates
+the v2 format and rejects v1 records even if their boolean assertions are true.
 
-An incarnation stays pending when its immutable identity was never captured. The
-authority never resolves a dead request by Pod name, never re-derives identity
-after the fault, and never accepts a weaker signal: Pod absence from the
-Kubernetes API, a successful DELETE, an unreachable runtime, an unfinished quiet
-window, and a Pod inventory that changed during attestation all leave the fence
-pending. The storage observation is explicitly labelled independent evidence of
-writer absence and object stability. It is not a clean engine drain, and it never
-authorizes cooperative cleanup that requires one.
+**Deployment status:** the v2 reconcile/store path is implemented and tested
+with a fake Kubernetes API and injected test providers. The shipped command and
+Deployment do not yet configure a real Linux/CRI provider, authenticated source
+mutation routing or provider settlement verification. They must not be claimed
+as production independent healing. The generic Kubernetes profile is intended
+to use a dedicated trusted CRI node agent; optional infrastructure power fencing
+is needed for unreachable nodes, not required for every ordinary Kubernetes
+failure. No node/CRI/cloud privilege is granted by these changes. Real provider
+wiring and positive Kubernetes/GCS/Chaos qualification remain required work.
 
-The evidence is additive. It is recorded on the existing `RhizaFence` status
-beside the unchanged cooperative proof fields, and the operator still validates
-the persisted proof before it dispatches any recovery. The recommended provider
-behind the service is a GCP VM/power provider for a dedicated
-one-voter-per-node pool that stops the exact instance and detaches its disks.
-That provider, its least-privilege credentials, its deployment, and its
-disposable-cluster qualification are a separate deliverable; nothing in this
-repository contacts a cloud API.
+See [terminal evidence retention](terminal-evidence-retention.md) and
+[the implementation plan](independent-fencing-v2-plan.md) for retained data,
+verification boundaries, and the remaining qualification contract.
 
 ### Pod deletion scope
 
@@ -188,7 +218,17 @@ integration; unwrapped or unsupported hosts cannot produce this proof.
    strategic-merge patch and a separate application ServiceAccount document;
    split these documents in your manifest renderer. The application account has
    no Kubernetes RoleBinding. The token is audience-bound and rotates every ten
-   minutes; the client rereads the token file for each request.
+   minutes; the client rereads the token file for each request. For a fresh
+   supervised generation, keep the StatefulSet at `replicas: 0` while installing
+   the operator and applying the matching `RhizaCluster`; set the StatefulSet
+   Pod-template annotation `rhiza.mrchypark.dev/cooperative-fencing: "1"`.
+   The operator pins the empty StatefulSet template to that exact RhizaCluster
+   UID before any voter Pod can start. With `spec.bootstrap: true`, reconciliation
+   then installs immutable membership
+   credentials and performs the initial scale; do not manually scale or wait
+   for voter readiness before applying the RhizaCluster. Without bootstrap
+   opt-in, the operator leaves the workload deferred after pinning, and an
+   initial scale remains a separate explicit operator action.
 5. Set `RHIZA_AUTOMATIC_RECOVERY=true` on the operator. Leave
    `RHIZA_FENCER_BACKEND` empty (default) or use `kubernetes`. For compatibility,
    an empty backend with existing HTTP URL/token/CA configuration still selects
@@ -219,6 +259,14 @@ if a newer run exits cleanly. Cloud adapters are optional stronger alternatives,
 not evidence silently supplied by this cooperative default.
 
 ## Verification scope
+
+For quorum-preserving ordinary voter replacement, the engine-owned membership
+path is responsible for removing and activating the voter; the recovery
+controller is reserved for quorum-loss generation recovery. This division does
+not change the fencer's restricted authority. The current positive ordinary
+replacement scope is the three-voter GCS before-ACK profile only, and Kubernetes
+runtime qualification is pending. No-PVC operation and storage-effect exclusion
+for an old identity do not prove physical process death.
 
 ### Learner cleanup evidence
 
@@ -256,6 +304,6 @@ exceeding the control-record read limit.
 Package tests cover identity, receipt ordering, CAS races, immutable evidence,
 restart uncertainty, and voter-to-generation escalation. Linux Kubernetes
 qualification must exercise the real supervisor/authority and physical storage
-drain without the test-only MinIO-restart fencer. Legacy Kind-fencer test success
+drain without the test-only S3 gateway-restart fencer. Legacy Kind-fencer test success
 is not evidence for this backend. No GCS, Chaos Mesh, cloud cost, release, or
 unreachable-node power-fencing qualification is implied by package tests.

@@ -1,0 +1,45 @@
+apiVersion: v1
+kind: Pod
+metadata:
+  name: __PROBE_POD__
+  namespace: __NAMESPACE__
+  labels: {chaos.rhiza.io/run: '__RUN_ID__', app: rhiza-gcs-iam-preflight}
+  annotations: {chaos.rhiza.io/owner: gcs-iam-preflight}
+spec:
+  serviceAccountName: __PROBE_KSA__
+  automountServiceAccountToken: false
+  restartPolicy: Never
+  affinity:
+    nodeAffinity:
+      requiredDuringSchedulingIgnoredDuringExecution:
+        nodeSelectorTerms:
+          - matchFields:
+              - key: metadata.name
+                operator: In
+                values: [__NODE_A__]
+          - matchFields:
+              - key: metadata.name
+                operator: In
+                values: [__NODE_B__]
+          - matchFields:
+              - key: metadata.name
+                operator: In
+                values: [__NODE_C__]
+  securityContext: {runAsNonRoot: true, runAsUser: 65532, runAsGroup: 65532, seccompProfile: {type: RuntimeDefault}}
+  containers:
+    - name: probe
+      image: __APP_IMAGE__
+      command: [/usr/local/bin/rhiza-entrypoint, qualification-gcs-iam-probe, __PROBE_MODE__]
+      env:
+        - {name: RHIZA_GCS_BUCKET, value: '__GCS_BUCKET__'}
+        - {name: RHIZA_GCS_PREFIX, value: '__GCS_PREFIX__'}
+        - {name: RHIZA_RUN_ID, value: '__RUN_ID__'}
+        - {name: RHIZA_GCS_IAM_PROBE_NONCE, value: '__PROBE_NONCE__'}
+        - {name: RHIZA_GCS_IAM_PROBE_MANIFEST_GENERATION, value: '__MANIFEST_GENERATION__'}
+        - {name: RHIZA_GCS_IAM_PROBE_CREATE_GENERATION, value: '__CREATE_GENERATION__'}
+        - {name: RHIZA_GCS_IAM_PROBE_UPDATE_GENERATION, value: '__UPDATE_GENERATION__'}
+        - {name: RHIZA_GCS_IAM_PROBE_EXPECTED_GSA, value: '__EXPECTED_GSA__'}
+      securityContext: {allowPrivilegeEscalation: false, readOnlyRootFilesystem: true, runAsNonRoot: true, capabilities: {drop: [ALL]}}
+      resources:
+        requests: {cpu: 50m, memory: 96Mi, ephemeral-storage: 32Mi}
+        limits: {cpu: 250m, memory: 192Mi, ephemeral-storage: 128Mi}

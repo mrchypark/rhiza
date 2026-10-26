@@ -3,6 +3,8 @@ package recovery
 import (
 	"context"
 	"encoding/hex"
+	"errors"
+	"io"
 	"path/filepath"
 	"testing"
 	"time"
@@ -14,6 +16,30 @@ import (
 	"github.com/mrchypark/rhiza/pkg/quepaxa"
 	"github.com/thanos-io/objstore"
 )
+
+var errAnchoredHeadResponseLost = errors.New("anchored archive head response lost")
+
+type failAfterAnchoredHeadBucket struct {
+	objstore.Bucket
+	key        string
+	fail       bool
+	headWrites int
+}
+
+func (b *failAfterAnchoredHeadBucket) Upload(ctx context.Context, name string, reader io.Reader, options ...objstore.ObjectUploadOption) error {
+	if name != b.key {
+		return b.Bucket.Upload(ctx, name, reader, options...)
+	}
+	b.headWrites++
+	if err := b.Bucket.Upload(ctx, name, reader, options...); err != nil {
+		return err
+	}
+	if b.fail {
+		b.fail = false
+		return errAnchoredHeadResponseLost
+	}
+	return nil
+}
 
 func TestForkMaterializesAnchoredTargetWithoutSourceExtents(t *testing.T) {
 	ctx := context.Background()
@@ -104,12 +130,34 @@ func TestForkMaterializesAnchoredTargetWithoutSourceExtents(t *testing.T) {
 	}
 	targetMembers := []quepaxa.Member{{ID: "new", PublicKey: testPublicKey("new")}}
 	targetMembership := NewMembershipRecord("anchor-source", targetMembers, "async")
-	result, err := Fork(ctx, bucket, ForkOptions{SourcePrefix: "source", TargetPrefix: "anchor-source", SourceBootstrap: quepaxa.Cluster{ConfigID: 1, Members: sourceMembers}, TargetMembers: targetMembers, TargetMembership: targetMembership, OperationID: "op"})
+	options := ForkOptions{SourcePrefix: "source", TargetPrefix: "anchor-source", SourceBootstrap: quepaxa.Cluster{ConfigID: 1, Members: sourceMembers}, TargetMembers: targetMembers, TargetMembership: targetMembership, OperationID: "op"}
+	faultBucket := &failAfterAnchoredHeadBucket{Bucket: bucket, key: forkKey("anchor-source", "archive/head.bin"), fail: true}
+	if _, err := Fork(ctx, faultBucket, options); !errors.Is(err, errAnchoredHeadResponseLost) {
+		t.Fatalf("fork did not stop at the committed-head response-loss boundary: %v", err)
+	}
+	if _, ok, err := readForkResult(ctx, bucket, "anchor-source"); err != nil || ok {
+		t.Fatalf("fork result unexpectedly committed before retry: present=%v err=%v", ok, err)
+	}
+	partialTarget := NewManager(bucket, "anchor-source", 1)
+	if err := partialTarget.Load(ctx); err != nil {
+		t.Fatalf("load committed target head after lost response: %v", err)
+	}
+	partialHash, present := partialTarget.GenerationAnchor()
+	partialTip := partialTarget.Tip()
+	partialTarget.Close()
+	if !present || partialHash == ([32]byte{}) || partialTip == 0 {
+		t.Fatal("target head did not retain the committed generation anchor")
+	}
+	result, err := Fork(ctx, faultBucket, options)
 	if err != nil {
-		t.Fatal(err)
+		t.Fatalf("resume committed materialization: %v", err)
+	}
+	if faultBucket.headWrites != 1 {
+		t.Fatalf("retry reinitialized target archive head: writes=%d", faultBucket.headWrites)
 	}
 	anchor, hash, err := ReadGenerationAnchor(ctx, bucket, "anchor-source")
-	if err != nil || anchor.SourceTip != result.Tip {
+	storedResult, resultPresent, resultErr := readForkResult(ctx, bucket, "anchor-source")
+	if err != nil || resultErr != nil || !resultPresent || !sameForkResult(storedResult, result) || anchor.SourceTip != result.Tip || anchor.SourcePrefixHash != result.PrefixHash || partialTip != quepaxa.Slot(result.Tip) {
 		t.Fatalf("anchor=%+v err=%v", anchor, err)
 	}
 	target := NewManager(bucket, "anchor-source", 1)
@@ -259,13 +307,33 @@ func TestForkMaterializesAnchoredTargetWithoutSourceExtents(t *testing.T) {
 	if resumed, err := Fork(ctx, bucket, cOptions); err != nil || resumed != cResult {
 		t.Fatalf("resume incomplete B to C result: %+v %v", resumed, err)
 	}
+	// A missing HEAD with an anchor but no result is ambiguous (it may have
+	// been deleted after publication), so do not repair it from source replay.
+	if err := bucket.Delete(ctx, forkResultKey("third-generation")); err != nil {
+		t.Fatal(err)
+	}
+	if err := bucket.Delete(ctx, forkKey("third-generation", "archive/head.bin")); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Fork(ctx, bucket, cOptions); err == nil {
+		t.Fatal("fork recreated a missing target head after anchor publication")
+	}
+	if _, ok, err := readForkResult(ctx, bucket, "third-generation"); err != nil || ok {
+		t.Fatalf("fork committed a result despite missing target head: present=%v err=%v", ok, err)
+	}
+	missingHead := NewManager(bucket, "third-generation", 1)
+	if err := missingHead.Load(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := missingHead.HeadVersion(); ok {
+		t.Fatal("fork recreated the missing target archive head")
+	}
+	missingHead.Close()
 	// Model interruption after CURRENT publication but before anchor/head/result.
 	// The retry must compare the rebuilt checkpoint bytes to CURRENT rather than
 	// acquiring a normal publisher slot above C's fixed generation tip.
-	for _, key := range []string{forkResultKey("third-generation"), GenerationAnchorKey("third-generation"), forkKey("third-generation", "archive/head.bin")} {
-		if err := bucket.Delete(ctx, key); err != nil {
-			t.Fatal(err)
-		}
+	if err := bucket.Delete(ctx, GenerationAnchorKey("third-generation")); err != nil {
+		t.Fatal(err)
 	}
 	if resumed, err := Fork(ctx, bucket, cOptions); err != nil || resumed != cResult {
 		t.Fatalf("resume pre-anchor B to C result: %+v %v", resumed, err)

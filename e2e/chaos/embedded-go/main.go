@@ -30,11 +30,18 @@ import (
 
 	"github.com/mrchypark/rhiza"
 	"github.com/mrchypark/rhiza/internal/sqlpolicy"
+	"github.com/mrchypark/rhiza/pkg/fencing"
 	"github.com/mrchypark/rhiza/pkg/operator"
 	"github.com/mrchypark/rhiza/pkg/quepaxa"
 	"github.com/mrchypark/rhiza/pkg/recoveryanchor"
 	"github.com/quic-go/quic-go"
 )
+
+const recoveryAddr = "0.0.0.0:9091"
+
+func fixtureSupervisorStartupRole() fencing.StartupRole {
+	return fencing.StartupRole(os.Getenv("RHIZA_STARTUP_ROLE"))
+}
 
 var errAnchorBlocked = errors.New("anchor binding not verified")
 
@@ -56,6 +63,15 @@ func main() {
 		}
 		if err := json.NewEncoder(os.Stdout).Encode(head); err != nil {
 			log.Fatalf("archive head output failed: %v", err)
+		}
+		return
+	}
+	if len(os.Args) > 1 && os.Args[1] == "qualification-gcs-iam-probe" {
+		if len(os.Args) != 3 {
+			log.Fatal("invalid GCS IAM probe arguments")
+		}
+		if err := runGCSIAMProbeCommand(os.Args[2]); err != nil {
+			log.Fatal(err)
 		}
 		return
 	}
@@ -98,10 +114,10 @@ func main() {
 		log.Fatal("QUIC probe expectation failed")
 	}
 	if len(os.Args) > 1 && os.Args[1] == "qualification-fixture" {
-		if len(os.Args) != 5 {
+		if len(os.Args) != 6 {
 			log.Fatal("invalid qualification fixture arguments")
 		}
-		fixture, err := qualificationFixture(os.Args[2], os.Args[3], os.Args[4], rand.Reader)
+		fixture, err := qualificationFixture(os.Args[2], os.Args[3], os.Args[4], os.Args[5], rand.Reader)
 		if err != nil {
 			log.Fatal("qualification fixture generation failed")
 		}
@@ -239,11 +255,39 @@ func runApplication(ctx context.Context, config rhiza.Config) (result error) {
 		log.Printf("anchor guard active: id=%s cluster=%s", anchorID, config.ClusterID)
 	}
 
-	management := &http.Server{Addr: config.BindAddr, Handler: db.OperatorHandler(), ReadHeaderTimeout: 5 * time.Second}
+	operatorHandler := db.OperatorHandler()
+	var removeGate *fixtureRemoveGate
+	if source := os.Getenv(fixtureRemoveGateSourceEnv); source != "" {
+		startupRole := fixtureSupervisorStartupRole()
+		if source == config.ClusterID && !config.EnableReconfiguration {
+			return errors.New("fixture REMOVE gate requires reconfiguration-enabled source voters")
+		}
+		pendingLearnerID := ""
+		if config.Learner != nil {
+			pendingLearnerID = string(config.Learner.ID)
+		}
+		voterIDs := make([]string, len(config.Members))
+		for i, member := range config.Members {
+			voterIDs[i] = string(member.ID)
+		}
+		removeGate, err = newFixtureRemoveGate(source, config.ClusterID, config.NodeID, voterIDs, startupRole, pendingLearnerID, operatorHandler)
+		if err != nil {
+			return err
+		}
+		operatorHandler = removeGate
+	}
+	management := &http.Server{Addr: recoveryAddr, Handler: operatorHandler, ReadHeaderTimeout: 5 * time.Second}
 
 	app := http.NewServeMux()
 	// Test-harness telemetry only; never expose Config or credentials.
 	app.Handle("GET /qualification/object-store", objectStoreCounters(db.ObjectStoreStats))
+	app.HandleFunc("GET /qualification/remove-gate", func(w http.ResponseWriter, _ *http.Request) {
+		if removeGate == nil {
+			respond(w, fixtureRemoveGateSnapshot{}, nil)
+			return
+		}
+		respond(w, removeGate.snapshot(), nil)
+	})
 	app.HandleFunc("GET /host", func(w http.ResponseWriter, r *http.Request) {
 		respond(w, map[string]string{"host": "go-embedded"}, nil)
 	})
@@ -258,7 +302,32 @@ func runApplication(ctx context.Context, config rhiza.Config) (result error) {
 		}
 		respond(w, map[string]bool{"ready": true}, nil)
 	})
-	app.HandleFunc("POST /sql/execute", func(w http.ResponseWriter, r *http.Request) {
+	app.HandleFunc("POST /sql/execute", sqlExecuteHandler(db, guard))
+	app.HandleFunc("POST /sql/query", func(w http.ResponseWriter, r *http.Request) {
+		var req rhiza.QueryRequest
+		if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 65536)).Decode(&req); err != nil {
+			http.Error(w, "invalid request", 400)
+			return
+		}
+		result, err := db.Query(r.Context(), req)
+		respond(w, result, err)
+	})
+	app.HandleFunc("POST /qualification/request-status", func(w http.ResponseWriter, r *http.Request) {
+		var req rhiza.RequestStatusRequest
+		if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 65536)).Decode(&req); err != nil {
+			http.Error(w, "invalid request", http.StatusBadRequest)
+			return
+		}
+		result, err := db.RequestStatus(r.Context(), req)
+		respond(w, result, err)
+	})
+	server := &http.Server{Addr: ":8080", Handler: app, ReadHeaderTimeout: 5 * time.Second}
+	servers = []*http.Server{server, management}
+	return serveHost(ctx, servers, identity, os.Stdout)
+}
+
+func sqlExecuteHandler(db *rhiza.DB, guard *anchorGuard) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
 		var req rhiza.ExecuteRequest
 		if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 65536)).Decode(&req); err != nil {
 			http.Error(w, "invalid request", 400)
@@ -285,28 +354,7 @@ func runApplication(ctx context.Context, config rhiza.Config) (result error) {
 		}
 		result, err := db.Execute(r.Context(), req)
 		respond(w, result, err)
-	})
-	app.HandleFunc("POST /sql/query", func(w http.ResponseWriter, r *http.Request) {
-		var req rhiza.QueryRequest
-		if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 65536)).Decode(&req); err != nil {
-			http.Error(w, "invalid request", 400)
-			return
-		}
-		result, err := db.Query(r.Context(), req)
-		respond(w, result, err)
-	})
-	app.HandleFunc("POST /qualification/request-status", func(w http.ResponseWriter, r *http.Request) {
-		var req rhiza.RequestStatusRequest
-		if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 65536)).Decode(&req); err != nil {
-			http.Error(w, "invalid request", http.StatusBadRequest)
-			return
-		}
-		result, err := db.RequestStatus(r.Context(), req)
-		respond(w, result, err)
-	})
-	server := &http.Server{Addr: ":8080", Handler: app, ReadHeaderTimeout: 5 * time.Second}
-	servers = []*http.Server{server, management}
-	return serveHost(ctx, servers, identity, os.Stdout)
+	}
 }
 
 func qualificationRole(role string) (string, error) {
@@ -521,8 +569,9 @@ func probeQUICHandshake(ctx context.Context, address, nodeID string, expected rh
 }
 
 // qualificationFixture is test-host-only: no node opens and no remote calls.
-func qualificationFixture(namespace, run, owner string, entropy io.Reader) (map[string]any, error) {
-	if !regexp.MustCompile(`^[a-f0-9]{8}$`).MatchString(run) || namespace != "rhiza-v0191-"+run ||
+func qualificationFixture(namespace, run, versionPrefix, owner string, entropy io.Reader) (map[string]any, error) {
+	if !regexp.MustCompile(`^[a-f0-9]{8}$`).MatchString(run) ||
+		!regexp.MustCompile(`^v[0-9]+$`).MatchString(versionPrefix) || namespace != "rhiza-"+versionPrefix+"-"+run ||
 		!regexp.MustCompile(`^rhiza-postrelease-`+run+`-[a-f0-9]{40}$`).MatchString(owner) {
 		return nil, errors.New("invalid fixture identity")
 	}
@@ -626,7 +675,7 @@ func newAnchorGuard(b recoveryanchor.Backend, anchorID, clusterID string) *ancho
 		anchorID:          anchorID,
 		clusterID:         clusterID,
 		format:            "sql-epoch-token/v1",
-		expectedStorageID: storageID("s3", "rhiza-minio:9000", "rhiza", "rhiza", clusterID),
+		expectedStorageID: storageID("s3", "rhiza-versitygw:9000", "rhiza", "rhiza", clusterID),
 	}
 }
 

@@ -166,6 +166,7 @@ const (
 type ReadReplica struct {
 	mode                    ReplicaMode
 	config                  ReplicaConfig
+	historyAware            bool
 	core                    *quepaxa.Core
 	material                *materializer.Materializer
 	api                     *network.Server
@@ -311,7 +312,7 @@ func openReplica(ctx context.Context, config ReplicaConfig, mode ReplicaMode, ve
 		return nil, err
 	}
 	childCtx, cancel := context.WithCancel(ctx)
-	r := &ReadReplica{mode: mode, config: config, status: ReplicaStatus{Mode: mode}, ctx: childCtx, cancel: cancel}
+	r := &ReadReplica{mode: mode, config: config, historyAware: verification.enabled, status: ReplicaStatus{Mode: mode}, ctx: childCtx, cancel: cancel}
 	defer func() {
 		if resultErr != nil {
 			_ = r.Close()
@@ -342,7 +343,7 @@ func openReplica(ctx context.Context, config ReplicaConfig, mode ReplicaMode, ve
 	if err := r.checkpoints.Load(childCtx); err != nil {
 		return nil, fmt.Errorf("load replica checkpoints: %w", err)
 	}
-	r.archive = recovery.NewManager(r.bucket, prefix, 1)
+	r.archive = recovery.NewManager(r.bucket, prefix, recovery.ArchiveConfigID)
 	if err := r.archive.Load(childCtx); err != nil {
 		return nil, fmt.Errorf("load replica archive: %w", err)
 	}
@@ -355,7 +356,7 @@ func openReplica(ctx context.Context, config ReplicaConfig, mode ReplicaMode, ve
 		}
 	}
 	cluster := quepaxa.Cluster{ConfigID: 1, Members: voters}
-	r.core, err = quepaxa.NewObserver(quepaxa.Config{NodeID: quepaxa.NodeID(config.ReplicaID), Cluster: cluster, WAL: r.wal, EnableReconfiguration: verification.enabled})
+	r.core, err = quepaxa.NewObserver(quepaxa.Config{NodeID: quepaxa.NodeID(config.ReplicaID), Cluster: cluster, WAL: r.wal, EnableReconfiguration: verification.enabled, EngineOwnedRemovals: verification.enabled})
 	if err != nil {
 		return nil, fmt.Errorf("open replica verifier: %w", err)
 	}
@@ -364,6 +365,13 @@ func openReplica(ctx context.Context, config ReplicaConfig, mode ReplicaMode, ve
 	})
 	if mode == ReplicaModeLearner {
 		r.transport = network.NewLearnerTransport(types.ClusterID(config.ClusterID), quepaxa.NodeID(config.ReplicaID), cluster.ConfigID, config.Members, config.AdminToken)
+		if verification.enabled {
+			// The history-aware verifier starts from the public bootstrap
+			// configuration, then advances only as it accepts certified history.
+			// Bind only this path: fixed-membership learners keep their separately
+			// pinned bootstrap peer identities in the transport.
+			r.transport.BindCore(r.core)
+		}
 		r.fetch = r.transport.FetchDecisions
 	}
 	if quepaxa.Slot(r.material.Tip()) > r.core.Tip() {
@@ -580,17 +588,50 @@ func (r *ReadReplica) syncPeer(ctx context.Context) error {
 	if r.fetch == nil {
 		return fmt.Errorf("learner peer transport is unavailable")
 	}
+	peers := r.config.Members
+	if r.historyAware {
+		members := r.core.CurrentCluster().Members
+		if len(members) == 0 {
+			return fmt.Errorf("verified learner membership is empty")
+		}
+		peers = make([]network.PeerIdentity, 0, len(members))
+		for _, member := range members {
+			identity, err := network.NewPeerIdentity(types.ClusterID(r.config.ClusterID), member)
+			if err != nil {
+				return fmt.Errorf("verified learner member %s has no usable peer identity: %w", member.ID, err)
+			}
+			peers = append(peers, identity)
+		}
+	}
 	var firstErr error
-	for offset := range len(r.config.Members) {
-		index := (r.peerCursor + offset) % len(r.config.Members)
-		member := r.config.Members[index]
+	if len(peers) == 0 {
+		return fmt.Errorf("learner peer membership is empty")
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	startCursor := r.peerCursor % len(peers)
+	if startCursor < 0 {
+		startCursor += len(peers)
+	}
+	r.peerCursor = startCursor
+	for offset := range len(peers) {
+		index := (startCursor + offset) % len(peers)
+		member := peers[index]
 		var target quepaxa.Slot
 		targetSet := false
 		for {
+			if err := ctx.Err(); err != nil {
+				return errors.Join(firstErr, err)
+			}
 			response, err := r.fetch(ctx, member.ID, r.core.Tip()+1, 128)
 			if err != nil {
 				if firstErr == nil {
 					firstErr = err
+				}
+				r.peerCursor = (index + 1) % len(peers)
+				if callerErr := ctx.Err(); callerErr != nil {
+					return errors.Join(firstErr, callerErr)
 				}
 				break
 			}
@@ -598,13 +639,17 @@ func (r *ReadReplica) syncPeer(ctx context.Context) error {
 				target, targetSet = response.Tip, true
 			}
 			if r.core.Tip() >= target {
-				r.peerCursor = (index + 1) % len(r.config.Members)
+				r.peerCursor = (index + 1) % len(peers)
 				r.setSource("peer:"+string(member.ID), uint64(target))
 				return r.applyCertified(ctx)
 			}
 			if len(response.Decisions) == 0 {
 				if firstErr == nil {
 					firstErr = fmt.Errorf("peer %s omitted slot %d", member.ID, r.core.Tip()+1)
+				}
+				r.peerCursor = (index + 1) % len(peers)
+				if callerErr := ctx.Err(); callerErr != nil {
+					return errors.Join(firstErr, callerErr)
 				}
 				break
 			}
@@ -631,7 +676,7 @@ func (r *ReadReplica) syncPeer(ctx context.Context) error {
 				return err
 			}
 			if r.core.Tip() >= target {
-				r.peerCursor = (index + 1) % len(r.config.Members)
+				r.peerCursor = (index + 1) % len(peers)
 				r.setSource("peer:"+string(member.ID), uint64(target))
 				return nil
 			}
@@ -718,14 +763,14 @@ func (r *ReadReplica) verifyLearnerCheckpoint(ctx context.Context, job *learnerC
 	}
 	seal = cloneReplicaSeal(seal)
 	decision = cloneReplicaDecision(decision)
-	manager := checkpoint.NewManager(r.bucket, path.Join(r.config.ObjStorePrefix, r.config.ClusterID), "", seal.ConfigID)
+	manager := checkpoint.NewManager(r.bucket, path.Join(r.config.ObjStorePrefix, r.config.ClusterID), "", 1)
 	root, err := manager.OpenRoot(ctx, uint64(seal.Index), seal.RootHash)
 	if err != nil {
 		job.result <- learnerCheckpointResult{err: err}
 		_ = closeRecoverySnapshot(snapshot)
 		return
 	}
-	if root.Index != uint64(seal.Index) || root.ConfigID != seal.ConfigID || root.Hash != seal.StateHash {
+	if root.Index != uint64(seal.Index) || root.Hash != seal.StateHash {
 		job.result <- learnerCheckpointResult{err: fmt.Errorf("published recovery root does not match its certified seal")}
 		_ = closeRecoverySnapshot(snapshot)
 		return

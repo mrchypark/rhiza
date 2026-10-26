@@ -25,6 +25,8 @@ spec:
               x-kubernetes-validations:
                 - rule: self == oldSelf
                   message: fencing requests are immutable
+                - rule: '!has(self.bootstrapGenesis) || (self.scope == "Generation" && size(self.targets) > 0)'
+                  message: bootstrap genesis fencing requires a captured generation cohort
               required: [logicalID, bindingUID, namespace, statefulSet, statefulSetUID, sourceClusterID, operationID, scope, targets]
               properties:
                 logicalID: {type: string, maxLength: 256, minLength: 1}
@@ -35,6 +37,14 @@ spec:
                 sourceClusterID: {type: string, maxLength: 256, minLength: 1}
                 operationID: {type: string, maxLength: 256, minLength: 1}
                 scope: {type: string, enum: [Voter, Generation]}
+                bootstrapGenesis:
+                  type: object
+                  required: [version, candidateDigest, clusterName, clusterUID]
+                  properties:
+                    version: {type: integer, enum: [1]}
+                    candidateDigest: {type: string, pattern: '^[a-f0-9]{64}$'}
+                    clusterName: {type: string, maxLength: 253, minLength: 1}
+                    clusterUID: {type: string, maxLength: 256, minLength: 1}
                 targets:
                   description: >-
                     Every voter of the fenced generation plus retained learner
@@ -68,11 +78,76 @@ spec:
                     processesTerminated: {type: boolean}
                     recreationBlocked: {type: boolean}
                     storageQuiesced: {type: boolean}
+                    independentV2:
+                      description: >-
+                        Authority-verified per-run runtime termination. V2 active
+                        references include settled producer mutation evidence; V3
+                        is reserved for closed pending learners with no producer
+                        mutation evidence. Every historical run in the closed
+                        cohort is retained; quiet storage observations alone
+                        cannot authorize recovery.
+                      type: object
+                      required: [version, requestHash, ledgerHash, storageScope, currentPodUIDs, terminals]
+                      properties:
+                        version: {type: integer, enum: [2]}
+                        requestHash: {type: string, pattern: '^[a-f0-9]{64}$'}
+                        ledgerHash: {type: string, pattern: '^[a-f0-9]{64}$'}
+                        storageScope:
+                          type: object
+                          required: [provider, bucket, prefix]
+                          properties:
+                            provider: {type: string, maxLength: 256, minLength: 1}
+                            endpoint: {type: string, maxLength: 512}
+                            bucket: {type: string, maxLength: 256, minLength: 1}
+                            prefix: {type: string, maxLength: 1024, minLength: 1}
+                            account: {type: string, maxLength: 256}
+                            connectionStringDigest: {type: string, maxLength: 64}
+                        currentPodUIDs:
+                          type: array
+                          maxItems: 64
+                          items: {type: string, maxLength: 256, minLength: 1}
+                        terminals:
+                          type: array
+                          minItems: 1
+                          maxItems: 64
+                          items:
+                            type: object
+                            required: [evidenceVersion, request, runtimeHash, producerUID, proofName, proofUID, proofDigest, runtimeReceiptDigest, mutationReceiptDigest, storageScopeDigest]
+                            x-kubernetes-validations:
+                              - rule: "(self.evidenceVersion == 2 && size(self.producerUID) > 0 && self.mutationReceiptDigest.matches('^[a-f0-9]{64}$')) || (self.evidenceVersion == 3 && self.producerUID == '' && self.mutationReceiptDigest == '')"
+                                message: evidenceVersion 2 requires producer mutation evidence; version 3 is reserved for closed pending learners without a producer
+                            properties:
+                              evidenceVersion: {type: integer, enum: [2, 3]}
+                              request:
+                                type: object
+                                required: [operationID, requestHash, identity]
+                                properties:
+                                  operationID: {type: string, maxLength: 256, minLength: 1}
+                                  requestHash: {type: string, pattern: '^[a-f0-9]{64}$'}
+                                  identity:
+                                    type: object
+                                    required: [sourceClusterID, nodeID, podUID, runID, walIdentity]
+                                    properties:
+                                      sourceClusterID: {type: string, maxLength: 256, minLength: 1}
+                                      nodeID: {type: string, maxLength: 256, minLength: 1}
+                                      podName: {type: string, maxLength: 256}
+                                      podUID: {type: string, maxLength: 256, minLength: 1}
+                                      runID: {type: string, maxLength: 128, minLength: 1}
+                                      walIdentity: {type: string, maxLength: 128}
+                                      assignmentID: {type: string, pattern: '^[a-f0-9]{64}$'}
+                              runtimeHash: {type: string, pattern: '^[a-f0-9]{64}$'}
+                              producerUID: {type: string, maxLength: 128}
+                              proofName: {type: string, maxLength: 63, minLength: 1}
+                              proofUID: {type: string, maxLength: 128, minLength: 1}
+                              proofDigest: {type: string, pattern: '^[a-f0-9]{64}$'}
+                              runtimeReceiptDigest: {type: string, pattern: '^[a-f0-9]{64}$'}
+                              mutationReceiptDigest: {type: string, maxLength: 64, pattern: '^([a-f0-9]{64})?$'}
+                              storageScopeDigest: {type: string, pattern: '^[a-f0-9]{64}$'}
                     independent:
                       description: >-
-                        Structured external evidence for this closed operation. It
-                        is additive to the durable cooperative ledger, never a
-                        replacement for it, and never a Pod-deletion claim.
+                        Legacy v1 diagnostic record retained for readability.
+                        The authority and recovery controller reject this field
+                        as a recovery authorization; new proofs use independentV2.
                       type: object
                       required: [version, provider, mode, observedAt, requestHash, ledgerHash, barrierID, barrier, runtimes, storage]
                       properties:

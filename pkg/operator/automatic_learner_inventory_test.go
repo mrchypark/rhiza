@@ -1,6 +1,7 @@
 package operator
 
 import (
+	"context"
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
@@ -36,6 +37,29 @@ func TestLearnerFenceTargetCarriesTheJournaledIdentity(t *testing.T) {
 	request.Targets[len(request.Targets)-1] = FenceTarget{NodeID: "learner", Pod: "learner", PodUID: "learner-uid", WALIdentity: "learner-wal"}
 	if err := includeLearnerHistory(state, &request); err == nil {
 		t.Fatal("accepted a rebuilt learner incarnation")
+	}
+}
+
+func TestLearnerHistoryAllowsFreshLogicalIncarnationAtSamePhysicalOrdinal(t *testing.T) {
+	state := validAutoControl()
+	state.Learners = []learnerIncarnation{
+		{SourceClusterID: state.ActiveClusterID, OperationID: "op-old", CredentialName: "old-credentials", CredentialUID: "secret-old", Target: FenceTarget{NodeID: "rhiza-0", Pod: "rhiza-0", PodUID: "pod-old", WALIdentity: "wal-old"}},
+		{SourceClusterID: state.ActiveClusterID, OperationID: "op-new", CredentialName: "inc-credentials", CredentialUID: "secret-new", Target: FenceTarget{NodeID: "inc-abc123", Pod: "rhiza-0", PodUID: "pod-new", WALIdentity: "wal-new"}},
+	}
+	if err := validateLearnerHistory(state.Learners); err != nil {
+		t.Fatalf("fresh logical identity on a new Pod UID at the same ordinal was rejected: %v", err)
+	}
+	got := learnerFenceTarget(state, "inc-abc123", "pod-new", "wal-new")
+	want := FenceTarget{NodeID: "inc-abc123", Pod: "rhiza-0", PodUID: "pod-new", WALIdentity: "wal-new"}
+	if got != want {
+		t.Fatalf("journaled physical/logical mapping=%+v, want %+v", got, want)
+	}
+	request := FenceRequest{SourceClusterID: state.ActiveClusterID, Scope: ScopeGeneration, Targets: []FenceTarget{{NodeID: "inc-abc123", Pod: "rhiza-0", PodUID: "pod-new", WALIdentity: "wal-new"}}}
+	if err := includeLearnerHistory(state, &request); err != nil {
+		t.Fatalf("generation history did not add the old incarnation at the same physical ordinal: %v", err)
+	}
+	if len(request.Targets) != 2 || request.Targets[1] != state.Learners[0].Target {
+		t.Fatalf("generation scope omitted captured old incarnation: %+v", request.Targets)
 	}
 }
 
@@ -127,7 +151,14 @@ func TestRetiredLearnerSurvivesRotationAndGenerationRequest(t *testing.T) {
 			state.Intent.Aborting = true
 			f.child.Spec.Membership.AbortAddition = true
 			f.child.Spec.Membership.ReplacementPod = "learner"
-			f.child.Status.Membership.Phase = "Aborted"
+			if f.child.Status.Membership == nil || f.child.Status.Membership.Add == nil || f.child.Status.Membership.RemoveRequest == nil {
+				t.Fatalf("fixture must retain both completed membership journals before abort acknowledgment: %+v", f.child.Status.Membership)
+			}
+			addBefore, removeBefore := hashJSON(f.child.Status.Membership.Add), hashJSON(f.child.Status.Membership.RemoveRequest)
+			acknowledgeCanonicalLearnerAbort(f.child)
+			if hashJSON(f.child.Status.Membership.Add) != addBefore || hashJSON(f.child.Status.Membership.RemoveRequest) != removeBefore {
+				t.Fatalf("abort acknowledgment changed membership journals: before add=%s remove=%s after=%+v", addBefore, removeBefore, f.child.Status.Membership)
+			}
 			state.Intent.SpecHash = hashJSON(f.child.Spec)
 			f.fencePending = false
 			if err := f.c.saveAuto(t.Context(), f.r, state, version); err != nil {
@@ -238,6 +269,25 @@ func TestRetiredLearnerSurvivesRotationAndGenerationRequest(t *testing.T) {
 			state.Intent.RecoveryName, state.Intent.RecoveryUID = request.OperationID, str(recovery.Metadata["uid"])
 			state.Intent.SpecHash = hashJSON(recovery.Spec)
 			state.Intent.Proof = &FenceProof{OperationID: request.OperationID, SourceClusterID: "source", BindingUID: state.BindingUID, RequestHash: hash, ProofID: recovery.Spec.Fence.Evidence, ProcessesTerminated: true, RecreationBlocked: true, StorageQuiesced: true}
+			if neverBound {
+				// Never-bound cleanup re-reads the canonical fence status; keep the
+				// fixture bound to the exact generation request and its persisted proof.
+				retiredRequest := request
+				retiredProof := *state.Intent.Proof
+				retiredHash, err := requestHash(&retiredRequest)
+				if err != nil {
+					t.Fatal(err)
+				}
+				c.Fencer = retirementFencer(func(_ context.Context, got FenceRequest) (*FenceProof, error) {
+					if hashJSON(got) != hashJSON(retiredRequest) {
+						return nil, ErrFencePending
+					}
+					if retiredProof.RequestHash != retiredHash {
+						return nil, fmt.Errorf("persisted generation proof does not match its immutable request")
+					}
+					return &retiredProof, nil
+				})
+			}
 			_, version = f.load(t)
 			var pods []object
 			secrets := map[string]object{}
@@ -378,6 +428,7 @@ func TestCompactionRequiresLedgerProof(t *testing.T) {
 			}
 			if tc.ledgerOK {
 				f.ledger = terminatedLedger(t, []learnerIncarnation{entry})
+				f.fenceReady = true
 			}
 			state := validAutoControl()
 			state.StatefulSetUID, state.ActiveClusterID = "sts-uid", "source"
@@ -394,7 +445,7 @@ func TestCompactionRequiresLedgerProof(t *testing.T) {
 					state.Intent.Request.Targets = []FenceTarget{entry.Target}
 				}
 			}
-			changed, err := f.c.compactLearnerHistory(t.Context(), state)
+			changed, err := f.c.compactLearnerHistory(t.Context(), f.resource, state)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -428,12 +479,13 @@ func TestCompactionRetriesUntilProofIsAvailable(t *testing.T) {
 	f := newCompactionFixture(t)
 	state := validAutoControl()
 	state.StatefulSetUID, state.ActiveClusterID, state.Learners = "sts-uid", "source", []learnerIncarnation{entry}
-	changed, err := f.c.compactLearnerHistory(ctx, state)
+	changed, err := f.c.compactLearnerHistory(ctx, f.resource, state)
 	if err != nil || changed || len(state.Learners) != 1 {
 		t.Fatalf("missing proof compacted history: changed=%t err=%v state=%+v", changed, err, state)
 	}
 	f.ledger = terminatedLedger(t, []learnerIncarnation{entry})
-	changed, err = f.c.compactLearnerHistory(ctx, state)
+	f.fenceReady = true
+	changed, err = f.c.compactLearnerHistory(ctx, f.resource, state)
 	if err != nil || !changed || len(state.Learners) != 0 {
 		t.Fatalf("late proof did not compact history: changed=%t err=%v state=%+v", changed, err, state)
 	}
@@ -444,6 +496,7 @@ func TestCompactionIsIdempotentAndCASOrdered(t *testing.T) {
 	entry := learnerIncarnation{SourceClusterID: "source", OperationID: "op", CredentialUID: "credential-uid", Target: FenceTarget{NodeID: "learner", Pod: "learner", PodUID: "learner-uid", WALIdentity: strings.Repeat("a", 64)}}
 	f := newCompactionFixture(t)
 	f.ledger = terminatedLedger(t, []learnerIncarnation{entry})
+	f.fenceReady = true
 	root := autoClusterResource("root", "binding", "logical")
 	state := validAutoControl()
 	state.StatefulSetUID, state.Learners = "sts-uid", []learnerIncarnation{entry}
@@ -454,10 +507,10 @@ func TestCompactionIsIdempotentAndCASOrdered(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if changed, err := f.c.compactLearnerHistory(ctx, loaded); err != nil || !changed {
+	if changed, err := f.c.compactLearnerHistory(ctx, f.resource, loaded); err != nil || !changed {
 		t.Fatalf("first compaction: changed=%t err=%v", changed, err)
 	}
-	if changed, err := f.c.compactLearnerHistory(ctx, loaded); err != nil || changed {
+	if changed, err := f.c.compactLearnerHistory(ctx, f.resource, loaded); err != nil || changed {
 		t.Fatalf("second compaction was not idempotent: changed=%t err=%v", changed, err)
 	}
 	if err := f.c.saveAuto(ctx, root, loaded, version); err != nil {
@@ -493,7 +546,8 @@ func TestLearnerHistoryStaysBoundedAcrossManyReplacements(t *testing.T) {
 			t.Fatal(err)
 		}
 		f.ledger = terminatedLedger(t, []learnerIncarnation{entry})
-		changed, err := f.c.compactLearnerHistory(ctx, loaded)
+		f.fenceReady = true
+		changed, err := f.c.compactLearnerHistory(ctx, f.resource, loaded)
 		if err != nil || !changed || len(loaded.Learners) != 0 {
 			t.Fatalf("cycle %d did not compact: changed=%t err=%v learners=%d", i, changed, err, len(loaded.Learners))
 		}
@@ -514,66 +568,37 @@ func TestCompactionBlocksOversizedUnreducibleHistory(t *testing.T) {
 	for i := range maxLearnerHistory + 1 {
 		state.Learners = append(state.Learners, learnerIncarnation{SourceClusterID: "source", OperationID: fmt.Sprintf("op-%d", i), CredentialUID: fmt.Sprintf("credential-%d", i), Target: FenceTarget{NodeID: fmt.Sprintf("learner-%d", i), Pod: fmt.Sprintf("learner-%d", i), PodUID: fmt.Sprintf("learner-uid-%d", i), WALIdentity: strings.Repeat("a", 64)}})
 	}
-	if _, err := f.c.compactLearnerHistory(t.Context(), state); err == nil || !strings.Contains(err.Error(), "cannot be compacted") {
+	if _, err := f.c.compactLearnerHistory(t.Context(), f.resource, state); err == nil || !strings.Contains(err.Error(), "cannot be compacted") {
 		t.Fatalf("unreducible history error=%v", err)
 	}
 }
 
-func TestCompactionRequiresEveryRunForPodUID(t *testing.T) {
-	ctx := t.Context()
-	entry := learnerIncarnation{SourceClusterID: "source", OperationID: "op", CredentialUID: "cred", Target: FenceTarget{NodeID: "learner", Pod: "learner", PodUID: "pod-uid", WALIdentity: strings.Repeat("a", 64)}}
-	ledger := &fenceLedger{StatefulSetUID: "sts-uid", Ledger: fencing.Ledger{SourceClusterID: "source"}}
-	clean := fencing.Identity{SourceClusterID: "source", NodeID: "learner", PodUID: "pod-uid", RunID: "clean"}
-	unknown := fencing.Identity{SourceClusterID: "source", NodeID: "learner", PodUID: "pod-uid", RunID: "unknown"}
-	if err := ledger.Ledger.Register(clean); err != nil {
-		t.Fatal(err)
-	}
-	if err := ledger.Ledger.Register(unknown); err != nil {
-		t.Fatal(err)
-	}
-	clean.WALIdentity = entry.Target.WALIdentity
-	if err := ledger.Ledger.Bind(clean); err != nil {
-		t.Fatal(err)
-	}
-	if err := ledger.Ledger.CloseNodes("op", "hash", nil); err != nil {
-		t.Fatal(err)
-	}
-	cleanRun := ledger.Ledger.Runs["clean"]
-	if err := ledger.Ledger.RecordDrain(fencing.DrainReceipt{Request: *cleanRun.Stop, WritersJoined: true}); err != nil {
-		t.Fatal(err)
-	}
-	if err := ledger.Ledger.RecordExit(*cleanRun.Stop); err != nil {
-		t.Fatal(err)
-	}
+func TestLearnerCompactionUsesCanonicalRunCohort(t *testing.T) {
+	entry := learnerIncarnation{SourceClusterID: "source", OperationID: "original-op", CredentialUID: "cred", Target: FenceTarget{NodeID: "learner", Pod: "learner", PodUID: "pod-uid", WALIdentity: strings.Repeat("a", 64)}}
 	f := newCompactionFixture(t)
-	f.ledger = ledger
-	if err := f.c.verifyTerminatedCleanup(ctx, "sts-uid", entry); err == nil {
-		t.Fatal("clean run hid an unresolved run for the same Pod UID")
-	}
-	cleanLedger := &fenceLedger{StatefulSetUID: "sts-uid", Ledger: fencing.Ledger{SourceClusterID: "source"}}
-	for _, runID := range []string{"first", "second"} {
-		id := fencing.Identity{SourceClusterID: "source", NodeID: "learner", PodUID: "pod-uid", RunID: runID, WALIdentity: entry.Target.WALIdentity}
-		if err := cleanLedger.Ledger.Register(fencing.Identity{SourceClusterID: id.SourceClusterID, NodeID: id.NodeID, PodUID: id.PodUID, RunID: id.RunID}); err != nil {
-			t.Fatal(err)
+	// This stale local snapshot contains only an old clean run. Canonical status
+	// is still pending because a later exact-incarnation run has not terminated.
+	f.ledger = terminatedLedger(t, []learnerIncarnation{entry})
+	state := validAutoControl()
+	state.Learners = []learnerIncarnation{entry}
+	var calls []FenceRequest
+	f.c.Fencer = learnerCompactionFencer(func(_ context.Context, request FenceRequest) (*FenceProof, error) {
+		calls = append(calls, request)
+		if len(calls) == 1 {
+			return nil, ErrFencePending
 		}
-		if err := cleanLedger.Ledger.Bind(id); err != nil {
-			t.Fatal(err)
-		}
+		return completeLearnerCohortProof(t, request, entry.Target, "old-run", "later-run"), nil
+	})
+	changed, err := f.c.compactLearnerHistory(t.Context(), f.resource, state)
+	if err != nil || changed || len(state.Learners) != 1 {
+		t.Fatalf("stale local ledger pruned pending canonical history: changed=%t err=%v learners=%d", changed, err, len(state.Learners))
 	}
-	if err := cleanLedger.Ledger.CloseNodes("op", "hash", nil); err != nil {
-		t.Fatal(err)
+	changed, err = f.c.compactLearnerHistory(t.Context(), f.resource, state)
+	if err != nil || !changed || len(state.Learners) != 0 {
+		t.Fatalf("complete canonical cohort did not compact: changed=%t err=%v learners=%d", changed, err, len(state.Learners))
 	}
-	for _, run := range cleanLedger.Ledger.Runs {
-		if err := cleanLedger.Ledger.RecordDrain(fencing.DrainReceipt{Request: *run.Stop, WritersJoined: true}); err != nil {
-			t.Fatal(err)
-		}
-		if err := cleanLedger.Ledger.RecordExit(*run.Stop); err != nil {
-			t.Fatal(err)
-		}
-	}
-	f.ledger = cleanLedger
-	if err := f.c.verifyTerminatedCleanup(ctx, "sts-uid", entry); err != nil {
-		t.Fatalf("all proven runs rejected: %v", err)
+	if len(calls) != 2 || hashJSON(calls[0]) != hashJSON(calls[1]) {
+		t.Fatalf("canonical status was not queried with the same immutable request: %+v", calls)
 	}
 }
 
@@ -600,13 +625,78 @@ func TestLearnerProvisioningChecksJournalCapacityBeforeMutation(t *testing.T) {
 	if r.Status.Phase != "Blocked" || !strings.Contains(r.Status.Message, "cannot reserve its fallback generation fence") || f.mutations != 0 || len(loaded.Learners) != maxLearnerHistory {
 		t.Fatalf("full journal mutated Kubernetes: status=%+v mutations=%d learners=%d", r.Status, f.mutations, len(loaded.Learners))
 	}
+	originalLearners := append([]learnerIncarnation(nil), loaded.Learners...)
+
+	// Reuse the real learner provisioning API fixture for the next reconcile;
+	// only the CR status endpoint is added so we can observe actual Pod creation.
+	api := &learnerAPI{}
+	api.server = httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, q *http.Request) {
+		if q.Method == http.MethodPut && q.URL.Path == "/apis/rhiza.mrchypark.dev/v1alpha1/namespaces/default/rhizaclusters/root/status" {
+			var status ClusterResource
+			if err := json.NewDecoder(q.Body).Decode(&status); err != nil {
+				http.Error(w, "invalid status", http.StatusBadRequest)
+				return
+			}
+			_ = json.NewEncoder(w).Encode(status)
+			return
+		}
+		api.serve(w, q)
+	}))
+	t.Cleanup(api.Close)
+	f.c.Kube = api.kube(t)
 
 	f.ledger = terminatedLedger(t, append([]learnerIncarnation(nil), loaded.Learners[:4]...))
-	if handled, err := f.c.handleAutomaticLearner(ctx, r, loaded, version, object{}, &Resource{}); err != nil || !handled {
+	f.fenceReady = true
+	f.c.Fencer = learnerCompactionFencer(func(_ context.Context, request FenceRequest) (*FenceProof, error) {
+		if !f.fenceReady || f.ledger == nil {
+			return nil, ErrFencePending
+		}
+		for _, target := range request.Targets {
+			covered := false
+			for _, run := range f.ledger.Ledger.Runs {
+				if run.Identity.NodeID != target.NodeID || run.Identity.PodUID != target.PodUID || run.Identity.WALIdentity != target.WALIdentity || run.Stop == nil || !run.Exited {
+					continue
+				}
+				if run.Identity.WALIdentity == "" {
+					covered = run.NeverBoundExit != nil && *run.NeverBoundExit == *run.Stop
+				} else {
+					covered = run.Drain != nil && run.Drain.Request == *run.Stop && run.Drain.Clean()
+				}
+				if covered {
+					break
+				}
+			}
+			if !covered {
+				return nil, ErrFencePending
+			}
+		}
+		hash, err := requestHash(&request)
+		if err != nil {
+			return nil, err
+		}
+		return &FenceProof{OperationID: request.OperationID, SourceClusterID: request.SourceClusterID, BindingUID: request.BindingUID, RequestHash: hash, ProofID: "test-canonical-status-" + hash, ProcessesTerminated: true, RecreationBlocked: true, StorageQuiesced: true}, nil
+	})
+	sts := learnerSTS(t)
+	if handled, err := f.c.handleAutomaticLearner(ctx, r, loaded, version, sts, &Resource{}); err != nil || !handled {
 		t.Fatalf("compaction recovery handled=%t err=%v", handled, err)
 	}
-	if r.Status.Phase != "Recovering" || !strings.Contains(r.Status.Message, "compacted before replacement provisioning") || f.mutations != 0 || len(loaded.Learners) != maxLearnerHistory-4 {
-		t.Fatalf("compaction did not free capacity before mutation: status=%+v mutations=%d learners=%d", r.Status, f.mutations, len(loaded.Learners))
+	if r.Status.Phase != "Recovering" || !strings.Contains(r.Status.Message, "compacted before replacement provisioning") || api.createCount != 0 || len(loaded.Learners) != maxLearnerHistory-4 {
+		t.Fatalf("compaction did not free capacity before mutation: status=%+v creates=%d learners=%d", r.Status, api.createCount, len(loaded.Learners))
+	}
+	loaded, version, err = f.c.loadAuto(ctx, f.c.autoKey(r))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if handled, err := f.c.handleAutomaticLearner(ctx, r, loaded, version, sts, &Resource{}); err != nil || !handled {
+		t.Fatalf("next reconcile did not provision after compaction: handled=%t err=%v status=%+v", handled, err, r.Status)
+	}
+	if api.createCount != 3 || !api.podExists || len(loaded.Learners) != maxLearnerHistory-4+1 || len(loaded.Learners) > maxLearnerHistory {
+		t.Fatalf("freed capacity did not permit replacement provisioning: creates=%d pod=%t learners=%d", api.createCount, api.podExists, len(loaded.Learners))
+	}
+	for i, old := range originalLearners[4:] {
+		if loaded.Learners[i] != old {
+			t.Fatalf("unproven learner history at index %d was not retained: got=%+v want=%+v", i, loaded.Learners[i], old)
+		}
 	}
 }
 
@@ -639,9 +729,108 @@ func TestLearnerProvisioningReservesWorstCaseGenerationScope(t *testing.T) {
 	}
 }
 
+func TestAbortedLearnerRetirementPreservesCredentialIdentity(t *testing.T) {
+	f := newRetirementEscalationFixture(t)
+	state, version := f.load(t)
+	created, err := f.c.learnerInventoryEntry(t.Context(), state, f.api.sts, f.learnerPod)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if created.CredentialName == "" || created.CredentialUID == "" {
+		t.Fatalf("learner creation history omitted credential identity: %+v", created)
+	}
+	if err := rememberLearner(state, created); err != nil {
+		t.Fatalf("refresh fixture learner creation history: %v", err)
+	}
+	state.Intent.Aborting = true
+	f.child.Spec.Membership.AbortAddition = true
+	f.child.Spec.Membership.ReplacementPod = learnerPhysicalPod(state.Intent)
+	if f.child.Status.Membership == nil || f.child.Status.Membership.Add == nil || f.child.Status.Membership.RemoveRequest == nil {
+		t.Fatalf("fixture must retain both completed membership journals before abort acknowledgment: %+v", f.child.Status.Membership)
+	}
+	addBefore, removeBefore := hashJSON(f.child.Status.Membership.Add), hashJSON(f.child.Status.Membership.RemoveRequest)
+	acknowledgeCanonicalLearnerAbort(f.child)
+	if hashJSON(f.child.Status.Membership.Add) != addBefore || hashJSON(f.child.Status.Membership.RemoveRequest) != removeBefore {
+		t.Fatalf("abort acknowledgment changed membership journals: before add=%s remove=%s after=%+v", addBefore, removeBefore, f.child.Status.Membership)
+	}
+	state.Intent.SpecHash = hashJSON(f.child.Spec)
+	f.fencePending = false
+	if err := f.c.saveAuto(t.Context(), f.r, state, version); err != nil {
+		t.Fatal(err)
+	}
+	state, version = f.load(t)
+
+	handled, err := f.c.handleAutomaticLearner(t.Context(), f.r, state, version, f.api.sts, f.child)
+	if err != nil || !handled {
+		t.Fatalf("verified abort was not handled: handled=%t err=%v", handled, err)
+	}
+	retired, _ := f.load(t)
+	if retired.Intent.Aborting || retired.Intent.LearnerAttempt != 1 || retired.Intent.LearnerUID != "" {
+		t.Fatalf("verified abort did not advance to a fresh learner: intent=%+v status=%+v", retired.Intent, f.r.Status)
+	}
+	if len(retired.Learners) != 1 {
+		t.Fatalf("retirement changed learner history cardinality: %+v", retired.Learners)
+	}
+	got := retired.Learners[0]
+	if got.CredentialName != created.CredentialName || got.CredentialUID != created.CredentialUID || got.Target != created.Target || got.Retirement == nil {
+		t.Fatalf("retirement did not preserve exact credential and workload identity: got=%+v want=%+v", got, created)
+	}
+}
+
+func acknowledgeCanonicalLearnerAbort(child *Resource) {
+	child.Status.Phase = "Aborted"
+	child.Status.ObservedGeneration = number(child.Metadata["generation"])
+	if child.Status.Membership == nil {
+		child.Status.Membership = &MembershipStatus{}
+	}
+	child.Status.Membership.Phase = "Aborted"
+}
+
+func TestAbortedLearnerRetirementRejectsMutatedADDJournal(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		mutate func(*MembershipAddJournal)
+	}{
+		{name: "request hash", mutate: func(add *MembershipAddJournal) { add.RequestHash = strings.Repeat("f", 64) }},
+		{name: "secret UID", mutate: func(add *MembershipAddJournal) { add.SecretUID = "different-secret-uid" }},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			f := newRetirementEscalationFixture(t)
+			state, version := f.load(t)
+			if f.child.Status.Membership == nil || f.child.Status.Membership.Add == nil {
+				t.Fatal("fixture is missing the ADD journal under test")
+			}
+			state.Intent.Aborting = true
+			f.child.Spec.Membership.AbortAddition = true
+			f.child.Spec.Membership.ReplacementPod = learnerPhysicalPod(state.Intent)
+			tc.mutate(f.child.Status.Membership.Add)
+			acknowledgeCanonicalLearnerAbort(f.child)
+			state.Intent.SpecHash = hashJSON(f.child.Spec)
+			if err := f.c.saveAuto(t.Context(), f.r, state, version); err != nil {
+				t.Fatal(err)
+			}
+			state, version = f.load(t)
+			before := *state.Intent
+			fenceCount := len(f.fences)
+			handled, err := f.c.handleAutomaticLearner(t.Context(), f.r, state, version, f.api.sts, f.child)
+			if err != nil || !handled || f.r.Status.Phase != "Blocked" {
+				t.Fatalf("mutated ADD journal was not fail-closed: handled=%t err=%v status=%+v", handled, err, f.r.Status)
+			}
+			if len(f.fences) != fenceCount {
+				t.Fatalf("mutated ADD journal reached the learner fencer: before=%d after=%d", fenceCount, len(f.fences))
+			}
+			if state.Intent.LearnerAttempt != before.LearnerAttempt || state.Intent.LearnerName != before.LearnerName ||
+				state.Intent.LearnerUID != before.LearnerUID || !state.Intent.Aborting {
+				t.Fatalf("mutated ADD journal rotated the learner candidate: before=%+v after=%+v", before, state.Intent)
+			}
+		})
+	}
+}
+
 func TestLearnerRetirementReceiptCompactsWithoutCooperativeLedger(t *testing.T) {
 	ctx := t.Context()
 	f := newCompactionFixture(t)
+	f.fenceReady = true
 	root := autoClusterResource("root", "binding", "logical")
 	state := validAutoControl()
 	state.StatefulSetUID = "sts-uid"
@@ -661,7 +850,7 @@ func TestLearnerRetirementReceiptCompactsWithoutCooperativeLedger(t *testing.T) 
 		}
 		entry := learnerIncarnation{SourceClusterID: "source", OperationID: request.OperationID, CredentialUID: fmt.Sprintf("cred-%d", i), Target: target, Retirement: &learnerRetirement{Request: request, Proof: FenceProof{OperationID: request.OperationID, SourceClusterID: "source", BindingUID: "binding", RequestHash: hash, ProofID: "external-proof", ProcessesTerminated: true, RecreationBlocked: true, StorageQuiesced: true}}}
 		loaded.Learners = append(loaded.Learners, entry)
-		changed, err := f.c.compactLearnerHistory(ctx, loaded)
+		changed, err := f.c.compactLearnerHistory(ctx, f.resource, loaded)
 		if err != nil || !changed || len(loaded.Learners) != 0 {
 			t.Fatalf("cycle %d did not compact with external proof: changed=%t err=%v learners=%d", i, changed, err, len(loaded.Learners))
 		}
@@ -675,7 +864,8 @@ func TestLearnerRetirementReceiptCompactsWithoutCooperativeLedger(t *testing.T) 
 		t.Fatal(err)
 	}
 	loaded.Learners = append(loaded.Learners, unresolved)
-	changed, err := f.c.compactLearnerHistory(ctx, loaded)
+	f.fenceReady = false
+	changed, err := f.c.compactLearnerHistory(ctx, f.resource, loaded)
 	if err != nil || changed || len(loaded.Learners) != 1 {
 		t.Fatalf("unresolved learner was removed: changed=%t err=%v learners=%d", changed, err, len(loaded.Learners))
 	}
@@ -698,6 +888,7 @@ func TestNonSupervisedLearnerInventoryCapturesCredentialUID(t *testing.T) {
 
 func TestCompactionRetiresLearnerCredential(t *testing.T) {
 	f := newCompactionFixture(t)
+	f.fenceReady = true
 	target := FenceTarget{NodeID: "learner", Pod: "learner", PodUID: "pod-uid", WALIdentity: strings.Repeat("a", 64)}
 	request := FenceRequest{LogicalID: "logical", BindingUID: "binding", Namespace: "default", StatefulSet: "rhiza", StatefulSetUID: "sts-uid", SourceClusterID: "source", OperationID: "retire", Scope: ScopeVoter, Targets: []FenceTarget{target}}
 	hash, err := requestHash(&request)
@@ -708,7 +899,7 @@ func TestCompactionRetiresLearnerCredential(t *testing.T) {
 	f.secretUIDs[target.Pod] = entry.CredentialUID
 	state := validAutoControl()
 	state.StatefulSetUID, state.Learners = "sts-uid", []learnerIncarnation{entry}
-	changed, err := f.c.compactLearnerHistory(t.Context(), state)
+	changed, err := f.c.compactLearnerHistory(t.Context(), f.resource, state)
 	if err != nil || !changed || len(state.Learners) != 0 || f.secretUIDs[target.Pod] != "" {
 		t.Fatalf("credential retirement failed: changed=%t err=%v learners=%+v secretUID=%q", changed, err, state.Learners, f.secretUIDs[target.Pod])
 	}
@@ -716,6 +907,7 @@ func TestCompactionRetiresLearnerCredential(t *testing.T) {
 
 func TestCompactionKeepsReplacementCredentialWithDifferentUID(t *testing.T) {
 	f := newCompactionFixture(t)
+	f.fenceReady = true
 	target := FenceTarget{NodeID: "learner", Pod: "learner", PodUID: "pod-uid", WALIdentity: strings.Repeat("a", 64)}
 	request := FenceRequest{LogicalID: "logical", BindingUID: "binding", Namespace: "default", StatefulSet: "rhiza", StatefulSetUID: "sts-uid", SourceClusterID: "source", OperationID: "retire", Scope: ScopeVoter, Targets: []FenceTarget{target}}
 	hash, err := requestHash(&request)
@@ -726,7 +918,7 @@ func TestCompactionKeepsReplacementCredentialWithDifferentUID(t *testing.T) {
 	f.secretUIDs[target.Pod] = "replacement-credential"
 	state := validAutoControl()
 	state.StatefulSetUID, state.Learners = "sts-uid", []learnerIncarnation{entry}
-	changed, err := f.c.compactLearnerHistory(t.Context(), state)
+	changed, err := f.c.compactLearnerHistory(t.Context(), f.resource, state)
 	if err != nil || !changed || len(state.Learners) != 0 || f.secretUIDs[target.Pod] != "replacement-credential" {
 		t.Fatalf("replacement credential was removed: changed=%t err=%v learners=%+v secretUID=%q", changed, err, state.Learners, f.secretUIDs[target.Pod])
 	}
@@ -734,15 +926,53 @@ func TestCompactionKeepsReplacementCredentialWithDifferentUID(t *testing.T) {
 
 type compactionFixture struct {
 	c          *Controller
+	resource   *ClusterResource
 	ledger     *fenceLedger
 	podUIDs    map[string]string
 	secretUIDs map[string]string
 	mutations  int
+	fenceReady bool
+}
+
+type learnerCompactionFencer func(context.Context, FenceRequest) (*FenceProof, error)
+
+func (f learnerCompactionFencer) Fence(ctx context.Context, request FenceRequest) (*FenceProof, error) {
+	return f(ctx, request)
+}
+
+func completeLearnerCohortProof(t *testing.T, request FenceRequest, target FenceTarget, runIDs ...string) *FenceProof {
+	t.Helper()
+	hash, err := requestHash(&request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	scope := AttestationStoreScope{Provider: "s3", Bucket: "bucket", Prefix: "source"}
+	evidence := &IndependentEvidenceV2{Version: 2, RequestHash: hash, LedgerHash: strings.Repeat("b", 64), StorageScope: scope}
+	for _, runID := range runIDs {
+		id := fencing.Identity{SourceClusterID: request.SourceClusterID, NodeID: target.NodeID, PodUID: target.PodUID, RunID: runID, WALIdentity: target.WALIdentity}
+		stop := fencing.StopRequest{OperationID: "stop-" + runID, RequestHash: strings.Repeat("c", 64), Identity: id}
+		evidence.Terminals = append(evidence.Terminals, fencing.TerminalReference{
+			EvidenceVersion: 2, Request: stop, RuntimeHash: strings.Repeat("d", 64), ProducerUID: "producer-" + runID,
+			ProofName: "proof-" + runID, ProofUID: "proof-uid-" + runID, ProofDigest: strings.Repeat("e", 64),
+			RuntimeReceiptDigest: strings.Repeat("f", 64), MutationReceiptDigest: strings.Repeat("1", 64), StorageScopeDigest: hashJSON(scope),
+		})
+	}
+	return &FenceProof{OperationID: request.OperationID, SourceClusterID: request.SourceClusterID, BindingUID: request.BindingUID, RequestHash: hash, ProofID: "independent-v2-" + hashJSON(evidence), ProcessesTerminated: true, RecreationBlocked: true, StorageQuiesced: true, IndependentV2: evidence}
 }
 
 func newCompactionFixture(t *testing.T) *compactionFixture {
 	t.Helper()
-	f := &compactionFixture{c: autoController(autoBucket(t)), podUIDs: map[string]string{}, secretUIDs: map[string]string{}}
+	f := &compactionFixture{c: autoController(autoBucket(t)), resource: autoClusterResource("root", "binding-uid-1", "logical"), podUIDs: map[string]string{}, secretUIDs: map[string]string{}}
+	f.c.Fencer = learnerCompactionFencer(func(_ context.Context, request FenceRequest) (*FenceProof, error) {
+		if !f.fenceReady {
+			return nil, ErrFencePending
+		}
+		hash, err := requestHash(&request)
+		if err != nil {
+			return nil, err
+		}
+		return &FenceProof{OperationID: request.OperationID, SourceClusterID: request.SourceClusterID, BindingUID: request.BindingUID, RequestHash: hash, ProofID: "test-canonical-status", ProcessesTerminated: true, RecreationBlocked: true, StorageQuiesced: true}, nil
+	})
 	token := filepath.Join(t.TempDir(), "token")
 	if err := os.WriteFile(token, []byte("token"), 0o600); err != nil {
 		t.Fatal(err)

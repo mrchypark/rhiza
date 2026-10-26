@@ -36,7 +36,7 @@ func (n *Node) changeMembership(ctx context.Context, request network.MembershipC
 	if err != nil {
 		return err
 	}
-	operation := membershipOperation{Request: request}
+	var operation membershipOperation
 	current := n.core.CurrentCluster()
 	if stored != nil {
 		if err := json.Unmarshal(stored, &operation); err != nil {
@@ -52,6 +52,7 @@ func (n *Node) changeMembership(ctx context.Context, request network.MembershipC
 		if revision, _, _ := n.core.LastReconfigurationAbort(); revision != request.ExpectedAbortSlot {
 			return network.ErrRequestConflict
 		}
+		operation.Request = request
 		operation.Target = quepaxa.Cluster{ConfigID: current.ConfigID + 1}
 		found := false
 		for _, member := range current.Members {
@@ -212,14 +213,32 @@ func (n *Node) validateMembershipFence(ctx context.Context, request network.Memb
 
 // Admission must use the configuration that owns the drain, even if another
 // goroutine has already learned its terminal while this recorder was verifying.
-func (n *Node) verifyMembershipAdmission(ctx context.Context, target quepaxa.Cluster, through quepaxa.Slot, prefix [32]byte) error {
-	previous := n.core.ClusterForSlot(through)
-	for _, candidate := range target.Members {
-		if !slices.ContainsFunc(previous.Members, func(member quepaxa.Member) bool { return member.ID == candidate.ID }) {
-			if err := n.transport.VerifyLearner(ctx, candidate, through, prefix); err != nil {
-				return err
+func (n *Node) verifyMembershipAdmission(ctx context.Context, admission quepaxa.ReconfigurationAdmission) error {
+	switch admission.Kind {
+	case quepaxa.ReconfigurationAdmissionLearner:
+		previous := n.core.ClusterForSlot(admission.Through)
+		for _, candidate := range admission.Target.Members {
+			if !slices.ContainsFunc(previous.Members, func(member quepaxa.Member) bool { return member.ID == candidate.ID }) {
+				if err := n.transport.VerifyLearner(ctx, candidate, admission.Through, admission.PrefixHash); err != nil {
+					return err
+				}
 			}
 		}
+		return nil
+	case quepaxa.ReconfigurationAdmissionEngineRemoval:
+		if admission.EngineRemoval == nil || n.fenceSession == nil {
+			return network.ErrNotReady
+		}
+		verifier, ok := any(n.fenceSession).(interface {
+			// The repair verifier resolves the candidate identity from its
+			// canonical repair record; EngineRemoval.Target is the survivor set.
+			VerifyEngineRemovalStorageEffects(context.Context, quepaxa.EngineRemoval) error
+		})
+		if !ok {
+			return network.ErrNotReady
+		}
+		return verifier.VerifyEngineRemovalStorageEffects(ctx, *admission.EngineRemoval)
+	default:
+		return network.ErrInvalidRequest
 	}
-	return nil
 }

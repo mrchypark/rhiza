@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
-"""Anchor recovery: external CAS anchor gates generation transition.
+"""Verify the unsupported S3/Kubernetes anchored-recovery profile blocks safely.
 
-Fixtures: namespace+RBAC+anchor CM BEFORE self.setup(). Seed trust_state
-AFTER stop writer. Evidence correct from initial seed (no later preseed).
-Three negative gates, then resume and verify.
+The Kind fixture supplies a valid external anchor, but its S3 archive and
+Kubernetes cooperative fencer cannot perform canonical archive-fork
+registration. This is negative contract evidence, not recovery qualification.
 """
 import argparse
 import base64
@@ -13,14 +13,13 @@ import subprocess
 import time
 
 from automatic_recovery import AutomaticChaos
-from kind_fencer import KindFencer
 from operator_fixture import AWS_CLI_IMAGE
 
 ANCHOR_ID = "chaos-anchor"
 ANCHOR_CM = "rhiza-anchor-chaos-anchor"
 SOURCE_CLUSTER = "chaos-source"
 ANCHOR_SA = "anchor-service"
-STORE_CFG = ["s3", "rhiza-minio:9000", "rhiza", "rhiza", SOURCE_CLUSTER]
+STORE_CFG = ["s3", "rhiza-versitygw:9000", "rhiza", "rhiza", SOURCE_CLUSTER]
 ANCHOR_ENV = [
     {"name": "RHIZA_RECOVERY_ANCHOR_ID", "value": ANCHOR_ID},
     {"name": "RHIZA_NAMESPACE", "value": "__NS__"},
@@ -52,10 +51,19 @@ def make_anchor_record(src_cluster):
         "binding": {"cluster_id": src_cluster,
                     "storage_id": storage_id(src_cluster)},
         "evidence": canonical_evidence(),
-        "pending_write": False, "generation": 0}
+        "pending_write": False, "generation": 0,
+        "transition": None, "last_transition": None}
 
 
 class AnchorChaos(AutomaticChaos):
+
+    def before_supervised_root(self):
+        self.wait("anchor pod running", self._anchor_running, 120)
+
+    def supervised_root_resource(self):
+        resource = super().supervised_root_resource()
+        resource["spec"]["anchorID"] = ANCHOR_ID
+        return resource
 
     def apply(self, objs):
         ns = self.ns
@@ -69,12 +77,35 @@ class AnchorChaos(AutomaticChaos):
                 obj["data"]["RHIZA_RECOVERY_ANCHOR_TOKEN_FILE"] = "/anchor/token"
                 obj["data"]["RHIZA_RECOVERY_ANCHOR_CA_FILE"] = "/anchor/ca.crt"
             if kind == "StatefulSet" and name == "rhiza":
+                podspec = obj["spec"]["template"]["spec"]
                 ctr = obj["spec"]["template"]["spec"]["containers"][0]
                 env = ctr.get("env", [])
                 for e in ANCHOR_ENV:
                     env.append({"name": e["name"],
                                 "value": e["value"].replace("__NS__", ns)})
                 ctr["env"] = env
+                podspec["serviceAccountName"] = "rhiza-supervised"
+                podspec["automountServiceAccountToken"] = False
+                podspec.setdefault("securityContext", {})["fsGroup"] = 65532
+                podspec.setdefault("volumes", []).append({
+                    "name": "anchor-api",
+                    "projected": {
+                        "defaultMode": 0o440,
+                        "sources": [
+                            {"serviceAccountToken": {"path": "token"}},
+                            {"configMap": {
+                                "name": "kube-root-ca.crt",
+                                "optional": False,
+                                "items": [{"key": "ca.crt", "path": "ca.crt"}],
+                            }},
+                        ],
+                    },
+                })
+                ctr.setdefault("volumeMounts", []).append({
+                    "name": "anchor-api",
+                    "mountPath": "/var/run/secrets/kubernetes.io/serviceaccount",
+                    "readOnly": True,
+                })
             if kind == "Deployment" and name == "rhiza-operator":
                 ctr = obj["spec"]["template"]["spec"]["containers"][0]
                 env = ctr.get("env", [])
@@ -137,7 +168,7 @@ class AnchorChaos(AutomaticChaos):
                         "verbs": ["get", "update"]}]},
             {"apiVersion": "rbac.authorization.k8s.io/v1", "kind": "RoleBinding",
              "metadata": {"name": "anchor-app-guard", "namespace": ns},
-             "subjects": [{"kind": "ServiceAccount", "name": "default",
+             "subjects": [{"kind": "ServiceAccount", "name": "rhiza-supervised",
                            "namespace": ns}],
              "roleRef": {"apiGroup": "rbac.authorization.k8s.io",
                          "kind": "Role", "name": "anchor-app-guard"}},
@@ -170,44 +201,19 @@ class AnchorChaos(AutomaticChaos):
                 key = fk.read()
         return cert, key
 
-    def seed_trust_state(self, pod):
-        self.execute(pod, "seed-schema",
-            "CREATE TABLE IF NOT EXISTS trust_state "
-            "(id INTEGER PRIMARY KEY, epoch INTEGER NOT NULL, "
-            "token TEXT NOT NULL)")
-        self.execute(pod, "seed-evidence",
-            "INSERT OR REPLACE INTO trust_state (id, epoch, token) "
-            "VALUES (1, 1, 'initial')")
-        rows = self.http(pod, "/sql/query",
-            {"sql": "SELECT epoch, token FROM trust_state WHERE id=1"})
-        assert rows['rows'] == [[1, 'initial']], rows
-        self.event("trust_state_seeded")
-
-    def verify_trust_state(self, pod, epoch, token):
-        rows = self.http(pod, "/sql/query",
-            {"sql": "SELECT epoch, token FROM trust_state WHERE id=1"})
-        assert rows['rows'] == [[epoch, token]], rows
-
     def _read_anchor(self):
         cm = self.get("configmap", ANCHOR_CM)
         return json.loads(cm["data"]["anchor.json"])
 
-    def _write_anchor(self, record):
-        self.k("patch", "configmap", ANCHOR_CM, "--type=merge",
-               "-p", json.dumps({"data": {
-                   "anchor.json": json.dumps(record)}}))
-
-    def _set_pending(self, pending):
-        rec = self._read_anchor()
-        rec["pending_write"] = pending
-        self._write_anchor(rec)
-
-    def _mc_run(self, mc_args, expect_phase="Succeeded"):
+    def _mc_run(self, mc_args, expect_phase="Succeeded", *, service="s3",
+                log_tail=50):
         ns = self.ns
-        full = ("aws --endpoint-url http://rhiza-minio:9000 s3 "
-                + mc_args[0] + " " + " ".join(
-                    "s3://" + arg.removeprefix("local/") for arg in mc_args[1:]))
-        pod = f"mc-{int(time.time())}"
+        args = mc_args[1:]
+        if service == "s3":
+            args = ["s3://" + arg.removeprefix("local/") for arg in args]
+        full = ("aws --endpoint-url http://rhiza-versitygw:9000 " + service + " "
+                + mc_args[0] + " " + " ".join(args))
+        pod = f"mc-{time.time_ns()}"
         self.apply({
             "apiVersion": "v1", "kind": "Pod",
             "metadata": {"name": pod, "namespace": ns},
@@ -216,18 +222,42 @@ class AnchorChaos(AutomaticChaos):
                          "command": ["/bin/sh", "-c"],
                          "args": [full],
                          "env": [
-                             {"name": "AWS_ACCESS_KEY_ID", "value": "chaos-minio"},
-                             {"name": "AWS_SECRET_ACCESS_KEY", "value": "chaos-minio-secret"},
+                             {"name": "AWS_ACCESS_KEY_ID", "value": "chaos-versity"},
+                             {"name": "AWS_SECRET_ACCESS_KEY", "value": "chaos-versity-secret"},
                              {"name": "AWS_DEFAULT_REGION", "value": "us-east-1"},
                          ]}]}})
         self.wait(f"mc {mc_args[0]}", lambda: self._mc_done(pod), 120)
         p = self.get("pod", pod)
         phase = p["status"].get("phase", "")
-        out = self.k("logs", pod, "--tail=50")
+        out = self.k("logs", pod, f"--tail={log_tail}")
         self.k("delete", "pod", pod, "--ignore-not-found", "--wait=false")
         if phase != expect_phase:
             raise RuntimeError(f"mc {mc_args[0]} phase={phase}: {out[:200]}")
         return out
+
+    def _source_archive_snapshot(self):
+        raw = self._mc_run(
+            ["list-objects-v2", "--bucket", "rhiza",
+             "--prefix", f"rhiza/{SOURCE_CLUSTER}/"],
+            service="s3api", log_tail=10000)
+        response = json.loads(raw)
+        if response.get("IsTruncated"):
+            raise RuntimeError("source archive listing was truncated")
+        return sorted((item["Key"], item["ETag"], item["Size"])
+                      for item in response.get("Contents", []))
+
+    def _stable_source_archive_snapshot(self):
+        previous = self._source_archive_snapshot()
+
+        def stable():
+            nonlocal previous
+            current = self._source_archive_snapshot()
+            if current == previous:
+                return current
+            previous = current
+            return None
+
+        return self.wait("source archive quiescence", stable, 30)
 
     def _mc_done(self, name):
         try:
@@ -235,41 +265,6 @@ class AnchorChaos(AutomaticChaos):
             return p["status"].get("phase", "") in ("Succeeded", "Failed")
         except Exception:
             return False
-
-    def mc_backup_anchor(self, tp):
-        self._mc_run(["cp",
-            f"local/rhiza/rhiza/{tp}/recovery/anchor.json",
-            f"local/rhiza/rhiza/{tp}/recovery/anchor.json.bak"])
-
-    def mc_restore_anchor(self, tp):
-        self._mc_run(["cp",
-            f"local/rhiza/rhiza/{tp}/recovery/anchor.json.bak",
-            f"local/rhiza/rhiza/{tp}/recovery/anchor.json"])
-
-    def mc_corrupt_anchor(self, tp):
-        ns = self.ns
-        dst = f"s3://rhiza/rhiza/{tp}/recovery/anchor.json"
-        full = f'printf CORRUPTED | aws --endpoint-url http://rhiza-minio:9000 s3 cp - {dst}'
-        pod = f"mc-corrupt-{int(time.time())}"
-        self.apply({
-            "apiVersion": "v1", "kind": "Pod",
-            "metadata": {"name": pod, "namespace": ns},
-            "spec": {"restartPolicy": "Never",
-                     "containers": [{"name": "aws-cli", "image": AWS_CLI_IMAGE,
-                         "command": ["/bin/sh", "-c"],
-                         "args": [full],
-                         "env": [
-                             {"name": "AWS_ACCESS_KEY_ID", "value": "chaos-minio"},
-                             {"name": "AWS_SECRET_ACCESS_KEY", "value": "chaos-minio-secret"},
-                             {"name": "AWS_DEFAULT_REGION", "value": "us-east-1"},
-                         ]}]}})
-        self.wait(f"mc corrupt {pod}",
-            lambda: self._mc_done(pod), 60)
-        p = self.get("pod", pod)
-        self.k("delete", "pod", pod, "--ignore-not-found", "--wait=false")
-        if p["status"].get("phase") != "Succeeded":
-            raise RuntimeError("mc corrupt failed")
-        self.event("anchor_json_corrupted", target=tp)
 
     def _child_for_op(self, op):
         items = json.loads(
@@ -279,27 +274,6 @@ class AnchorChaos(AutomaticChaos):
             if s.get("recoveryID") == op or item["metadata"]["name"] == op:
                 return item
         return None
-
-    def _child_sealed_blocked(self, op):
-        item = self._child_for_op(op)
-        if item is None:
-            return False
-        s = item.get("status", {})
-        return (s.get("stage") == "Sealed" and
-                s.get("phase") == "Blocked")
-
-    def _child_target(self, op):
-        item = self._child_for_op(op)
-        return item.get("status", {}).get("target") if item else None
-
-    def _child_message(self, op):
-        item = self._child_for_op(op)
-        return item.get("status", {}).get("message", "") if item else ""
-
-    def _source_cluster_id(self):
-        """Resolve source cluster ID from rhiza-config envFrom."""
-        cfg = self.get("configmap", "rhiza-config")
-        return cfg["data"].get("RHIZA_CLUSTER_ID", SOURCE_CLUSTER)
 
     def run(self):
         root = self.repo_root()
@@ -320,143 +294,101 @@ class AnchorChaos(AutomaticChaos):
         # Now setup (reapplies namespace idempotently, creates fixture).
         self.setup()
 
-        # Enable automatic recovery.
-        self.k("set", "env", "deployment/rhiza-operator",
-                "RHIZA_AUTOMATIC_RECOVERY=true",
-                "RHIZA_FENCER_BACKEND=kubernetes")
-        self.k("rollout", "status", "deployment/rhiza-operator",
-                "--timeout=120s")
-
-        self.wait("anchor pod running", self._anchor_running, 120)
-
-        # Create RhizaCluster WITH anchorID.
-        self.apply({"apiVersion": "rhiza.mrchypark.dev/v1alpha1",
-                    "kind": "RhizaCluster",
-                    "metadata": {"name": "rhiza", "namespace": self.ns},
-                    "spec": {"anchorID": ANCHOR_ID,
-                             "logicalID": "chaos",
-                             "statefulSet": "rhiza", "container": "rhiza",
-                             "adoptClusterID": SOURCE_CLUSTER,
-                             "automatic": True,
-                             "voterCount": 3,
-                             "policy": {"failureGraceSeconds": 15,
-                                        "cooldownSeconds": 3,
-                                        "maxRecoveriesPerDay": 10,
-                                        "allowDataLoss": False}}})
         self.wait("automatic cluster healthy", self.healthy, 180)
 
-        # Stop writer BEFORE seed — no pending races.
+        # Stop writer before snapshotting the source archive.
         self.stop.set()
         self.writer.join(timeout=15)
         assert not self.writer.is_alive()
 
-        self.seed_trust_state("rhiza-0")
+        self.verify_idempotent_write(
+            "rhiza-0", "anchor-baseline-write",
+            "INSERT INTO chaos_items VALUES (10003, 'anchor-baseline')",
+            (10003, "anchor-baseline"))
 
-        self.executor = KindFencer(self)
-        self.executor.start()
-
-        # Resolve source cluster ID from ConfigMap (envFrom, not inline env).
+        anchor_before = self.get("configmap", ANCHOR_CM)
+        assert json.loads(anchor_before["data"]["anchor.json"]) == \
+            make_anchor_record(SOURCE_CLUSTER), "fixture anchor is not valid"
+        source_cluster_before = self.cluster()["status"].get("activeClusterID")
+        assert source_cluster_before == SOURCE_CLUSTER, \
+            f"unexpected active source before fenced recovery: {source_cluster_before!r}"
+        sts_before = self.get("statefulset", "rhiza")
+        workload_env = {entry["name"]: entry.get("value", "")
+                        for entry in sts_before["spec"]["template"]["spec"]["containers"][0].get("env", [])}
+        assert workload_env.get("RHIZA_RECOVERY_ANCHOR_ID") == ANCHOR_ID, \
+            "source workload is not configured for the valid anchor"
+        operator = self.get("deployment", "rhiza-operator")
+        operator_env = {entry["name"]: entry.get("value", "")
+                        for entry in operator["spec"]["template"]["spec"]["containers"][0].get("env", [])}
+        assert operator_env.get("RHIZA_RECOVERY_ANCHOR_URL") == \
+            f"https://anchor-service.{self.ns}.svc:9191", \
+            "Operator is not configured for the valid anchor service"
+        assert operator_env.get("RHIZA_RECOVERY_ANCHOR_TOKEN_FILE") == "/anchor/token"
+        assert operator_env.get("RHIZA_RECOVERY_ANCHOR_CA_FILE") == "/anchor/ca.crt"
+        archive_before = self._stable_source_archive_snapshot()
 
         current = ["rhiza-0", "rhiza-1", "rhiza-2"]
-        old_uids = [self.runtime(p)[0] for p in current]
-
-        # ── Gate 1: Missing anchor ConfigMap ──
-        saved_cm = self.k("get", "configmap", ANCHOR_CM, "-o", "json")
-        self.k("delete", "configmap", ANCHOR_CM)
         for pod in current:
             self.udp(pod, True)
-        self.executor.enabled = True
-        dr = self.wait("generation fence",
+        dr = self.wait("confirmed generation fence",
             lambda: next((f for f in self.fences()
-                if f["spec"]["scope"] == "Generation"), None), 180)
+                if f["spec"]["scope"] == "Generation" and
+                f.get("status", {}).get("proof", {}).get("processesTerminated") and
+                f.get("status", {}).get("proof", {}).get("recreationBlocked") and
+                f.get("status", {}).get("proof", {}).get("storageQuiesced")), None), 180)
         operation = dr["spec"]["operationID"]
         self.wait("recovery child",
             lambda: self._child_for_op(operation) is not None, 120)
-        self.wait("blocked without anchor",
-            lambda: self._child_sealed_blocked(operation), 60)
+        def unsupported_profile_blocked():
+            child = self._child_for_op(operation)
+            if child is None:
+                return None
+            status = child.get("status", {})
+            if (status.get("phase") == "Blocked" and
+                    "canonical archive fork registration" in
+                    status.get("message", "")):
+                return child
+            return None
+
+        child = self.wait("unsupported S3/Kubernetes anchor profile blocked",
+                          unsupported_profile_blocked, 60)
+        child_status = child.get("status", {})
+        assert not child_status.get("target"), \
+            f"unsupported profile reserved a recovery target: {child_status}"
+        assert not child_status.get("stage"), \
+            f"unsupported profile advanced recovery stages: {child_status}"
+
+        anchor_after = self.get("configmap", ANCHOR_CM)
+        assert anchor_after["metadata"].get("uid") == anchor_before["metadata"].get("uid")
+        assert anchor_after["metadata"].get("resourceVersion") == \
+            anchor_before["metadata"].get("resourceVersion")
+        assert anchor_after["data"] == anchor_before["data"], \
+            "blocked unsupported profile changed the valid anchor"
         sts = self.get("statefulset", "rhiza")
-        env = {e["name"]: e.get("value", "")
-               for e in sts["spec"]["template"]["spec"]["containers"][0].get("env", [])}
-        assert env.get("RHIZA_CLUSTER_ID", self._source_cluster_id()) == SOURCE_CLUSTER, \
-            "target generation started while anchor blocked"
-        assert sts["spec"]["replicas"] == 3, "STS replicas changed"
-        msg1 = self._child_message(operation)
-        assert "anchor activation" in msg1.lower(), \
-            f"gate1 message missing anchor activation: {msg1}"
-        self.event("missing_anchor_gate", op=operation, msg=msg1)
-
-        # Restore CM ATOMICALLY with Pending=true.
-        saved = json.loads(saved_cm)
-        del saved.get("metadata", {})["resourceVersion"]
-        saved["metadata"].pop("uid", None)
-        anchor_data = json.loads(saved["data"]["anchor.json"])
-        anchor_data["pending_write"] = True
-        saved["data"]["anchor.json"] = json.dumps(anchor_data)
-        self.apply(saved)
-        self.event("anchor_cm_restored_pending", op=operation)
-
-        # ── Gate 2: PendingWrite flag ──
-        # Kubernetes status PUT is no-op when nothing changed; RV won't advance.
-        # Restart operator + force re-reconciliation via observedGeneration=0.
-        self.operator_restart()
-        self.k("patch", "rhizarecovery", operation, "--subresource=status",
-               "--type=merge", "-p",
-               json.dumps({"status": {"observedGeneration": 0}}))
-        prev_rv_gate2 = self._child_for_op(operation)["metadata"]["resourceVersion"]
-        self.wait("pending flag blocked", lambda: (
-            self._child_sealed_blocked(operation)
-            and self._child_for_op(operation)["status"].get("observedGeneration", 0)
-                >= self._child_for_op(operation)["metadata"].get("generation", 0)
-            and "anchor activation" in self._child_message(operation).lower()
-        ), 60)
-        msg2 = self._child_message(operation)
-        self.event("pending_flag_gate", op=operation, msg=msg2,
-                   prev_rv=prev_rv_gate2,
-                   new_rv=self._child_for_op(operation)["metadata"]["resourceVersion"])
-
-        # ── Gate 3: Target checkpoint corruption ──
-        target = self._child_target(operation)
-        assert target, "target must be allocated"
-        self.mc_backup_anchor(target)
-        prev_child_rv = self._child_for_op(operation)["metadata"]["resourceVersion"]
-        prev_msg3 = self._child_message(operation)
-        self.mc_corrupt_anchor(target)
-        self._set_pending(False)
-        self.wait("blocked after corruption", lambda: (
-            self._child_sealed_blocked(operation)
-            and self._child_for_op(operation)["metadata"]["resourceVersion"] != prev_child_rv
-            and self._child_message(operation) != prev_msg3
-        ), 60)
-        new_child_rv = self._child_for_op(operation)["metadata"]["resourceVersion"]
-        msg3 = self._child_message(operation)
-        self.event("corrupt_anchor_gate", op=operation, msg=msg3,
-                   prev_rv=prev_child_rv, new_rv=new_child_rv)
-
-        self.mc_restore_anchor(target)
-        self.event("anchor_json_restored", target=target)
-
-        # ── Recovery resumes (evidence correct from initial seed) ──
-        self.wait("generation recovery complete",
-            lambda: self.healthy() and
-                self.cluster()["status"].get("activeClusterID") != self._source_cluster_id(),
-            480)
-        target = self._child_target(operation)
-        assert target and target != self._source_cluster_id()
-        self.event("recovery_pass", op=operation, target=target)
-
-        count = self.verify_data("rhiza-0")
-        self.verify_trust_state("rhiza-0", 1, "initial")
-        self.execute("rhiza-0", "target-write",
-            "INSERT INTO chaos_items VALUES (10002, 'anchor-recovered')")
-        self.event("data_pass", rows=count)
-
-        assert all(self.runtime_gone(uid) for uid in old_uids)
-        record = self._read_anchor()
-        assert record["binding"]["cluster_id"] == target
-        assert record["binding"]["cluster_id"] != self._source_cluster_id()
-        self.event("oldgen_pass", old_uids=old_uids)
-
-        self.event("PASS", scenarios=1, anchor=True, negative_gates=3)
+        assert sts["metadata"].get("uid") == sts_before["metadata"].get("uid")
+        assert sts["metadata"].get("generation") == sts_before["metadata"].get("generation")
+        assert sts["spec"] == sts_before["spec"], \
+            "blocked unsupported profile mutated the source StatefulSet"
+        source_cluster_after = self.cluster()["status"].get("activeClusterID")
+        assert source_cluster_after == SOURCE_CLUSTER, \
+            f"unsupported profile promoted a target: {source_cluster_after!r}"
+        archive_after = self._source_archive_snapshot()
+        assert archive_after == archive_before, \
+            "blocked unsupported profile changed source archive objects"
+        fence_after = next((f for f in self.fences()
+                            if f.get("spec", {}).get("operationID") == operation), None)
+        assert fence_after is not None and \
+            fence_after.get("metadata", {}).get("uid") == dr["metadata"]["uid"] and \
+            fence_after.get("spec") == dr.get("spec") and \
+            fence_after.get("status") == dr.get("status"), \
+            "blocked unsupported profile changed the confirmed source fence"
+        self.event("SUPPORTED-NEGATIVE", op=operation,
+                   profile="S3/KubernetesFencer",
+                   message=child_status.get("message", ""),
+                   source_archive_objects=len(archive_after),
+                   target_reserved=False, anchor_unchanged=True,
+                   source_statefulset_unchanged=True,
+                   source_fence_unchanged=True)
 
     def _anchor_cm_only(self):
         ns = self.ns
@@ -505,7 +437,7 @@ class AnchorChaos(AutomaticChaos):
                                  {"name": "RHIZA_OBJSTORE_PROVIDER",
                                   "value": "s3"},
                                  {"name": "RHIZA_OBJSTORE_ENDPOINT",
-                                  "value": "rhiza-minio:9000"},
+                                  "value": "rhiza-versitygw:9000"},
                                  {"name": "RHIZA_OBJSTORE_BUCKET",
                                   "value": "rhiza"},
                                  {"name": "RHIZA_OBJSTORE_PREFIX",
@@ -513,9 +445,9 @@ class AnchorChaos(AutomaticChaos):
                                  {"name": "RHIZA_OBJSTORE_INSECURE",
                                   "value": "true"},
                                  {"name": "AWS_ACCESS_KEY_ID",
-                                  "value": "chaos-minio"},
+                                  "value": "chaos-versity"},
                                  {"name": "AWS_SECRET_ACCESS_KEY",
-                                  "value": "chaos-minio-secret"},
+                                  "value": "chaos-versity-secret"},
                                  {"name": "AWS_REGION",
                                   "value": "us-east-1"},
                              ],
@@ -569,8 +501,6 @@ class AnchorChaos(AutomaticChaos):
         except RuntimeError:
             pass
         super().cleanup()
-        if hasattr(self, "executor"):
-            self.executor.close()
 
 
 def main():
@@ -587,6 +517,14 @@ def main():
     chaos = AnchorChaos(parser.parse_args())
     try:
         chaos.run()
+    except Exception as original:
+        try:
+            errors = chaos.capture_failure_diagnostics()
+        except Exception:
+            errors = ["diagnostic_capture_failed"]
+        if errors:
+            raise RuntimeError(f"{original}; bounded diagnostic capture errors: {errors}") from original
+        raise
     finally:
         chaos.cleanup()
 

@@ -1,18 +1,101 @@
 package operator
 
 import (
+	"bytes"
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
+	"log"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
 
 	"github.com/mrchypark/rhiza/pkg/fencing"
+	"github.com/thanos-io/objstore"
 )
+
+type rootInitStatusError struct {
+	status int
+	cause  error
+}
+
+func (e rootInitStatusError) Error() string       { return "private endpoint and credential detail" }
+func (e rootInitStatusError) Unwrap() error       { return e.cause }
+func (e rootInitStatusError) HTTPStatusCode() int { return e.status }
+
+type rootInitFailingBucket struct {
+	objstore.Bucket
+	err error
+}
+
+func (b rootInitFailingBucket) Attributes(context.Context, string) (objstore.ObjectAttributes, error) {
+	return objstore.ObjectAttributes{}, b.err
+}
+
+type rootInitCreateFailingBucket struct {
+	objstore.Bucket
+	err error
+}
+
+func (b rootInitCreateFailingBucket) Upload(context.Context, string, io.Reader, ...objstore.ObjectUploadOption) error {
+	return b.err
+}
+
+func TestAuthorityRootInitDiagnosticPreservesCauseAndSafeStatus(t *testing.T) {
+	rootCause := errors.New("underlying provider sentinel")
+	base := objstore.NewInMemBucket()
+	t.Cleanup(func() { _ = base.Close() })
+	bucket := rootInitFailingBucket{Bucket: base, err: rootInitStatusError{status: 403, cause: rootCause}}
+	store, err := NewAuthorityStateStore(bucket, "diagnostic-test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, _, err = store.ReadRoot(t.Context(), "sts", "source")
+	if err == nil || !errors.Is(err, rootCause) {
+		t.Fatalf("root wrapper lost the provider cause: %v", err)
+	}
+	if !strings.Contains(err.Error(), "fencing: root-init phase=load cause=permission:") {
+		t.Fatalf("root wrapper omitted fixed phase/cause: %v", err)
+	}
+	if got := store.rootCause(errors.New("private unknown backend code")); got != "unknown" {
+		t.Fatalf("unknown backend cause = %q", got)
+	}
+}
+
+func TestAuthorityRootGenesisCreateCauseSurvivesMissingReadback(t *testing.T) {
+	for _, tc := range []struct {
+		name, causeCode string
+		status          int
+	}{
+		{name: "permission", causeCode: "permission", status: 403},
+		{name: "timeout", causeCode: "timeout", status: 504},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			providerCause := errors.New("private provider sentinel")
+			base := objstore.NewInMemBucket()
+			t.Cleanup(func() { _ = base.Close() })
+			bucket := rootInitCreateFailingBucket{Bucket: base, err: rootInitStatusError{status: tc.status, cause: providerCause}}
+			store, err := NewAuthorityStateStore(bucket, "genesis-diagnostic-test")
+			if err != nil {
+				t.Fatal(err)
+			}
+			err = store.ensureRootGenesis(t.Context(), "root-identity")
+			if err == nil || !errors.Is(err, providerCause) || !errors.Is(err, errAuthorityStateNotFound) {
+				t.Fatalf("genesis error lost provider/readback chain: %v", err)
+			}
+			wantPrefix := "fencing: root-init phase=genesis cause=" + tc.causeCode + ":"
+			if !strings.HasPrefix(err.Error(), wantPrefix) {
+				t.Fatalf("genesis create cause was replaced by readback error: got %q, want prefix %q", err, wantPrefix)
+			}
+		})
+	}
+}
 
 func TestCooperativeLedgerCASRegistrationRacesClosure(t *testing.T) {
 	var mu sync.Mutex
@@ -52,7 +135,7 @@ func TestCooperativeLedgerCASRegistrationRacesClosure(t *testing.T) {
 	if err := os.WriteFile(token, []byte("test"), 0600); err != nil {
 		t.Fatal(err)
 	}
-	e := &FencingExecutor{Kube: &Kubernetes{BaseURL: api.URL, Namespace: "test", TokenFile: token, Client: api.Client()}}
+	e := &FencingExecutor{Kube: &Kubernetes{BaseURL: api.URL, Namespace: "test", TokenFile: token, Client: api.Client()}, LegacyCooperativeControlState: true}
 	id := fencing.Identity{SourceClusterID: "source", NodeID: "n1", PodUID: "pod", RunID: "run"}
 	start := make(chan struct{})
 	results := make(chan error, 2)
@@ -84,6 +167,45 @@ func TestCooperativeLedgerCASRegistrationRacesClosure(t *testing.T) {
 	}
 	if err := state.Ledger.Register(fencing.Identity{SourceClusterID: "source", NodeID: "n2", PodUID: "p2", RunID: "r2"}); err != fencing.ErrClosed {
 		t.Fatalf("restart gate reopened: %v", err)
+	}
+}
+
+func TestRegisterStageErrorPreservesCause(t *testing.T) {
+	cause := fmt.Errorf("private backend failure: %w", fencing.ErrPending)
+	for _, stage := range []string{"root-init", "startup-grant", "ledger-register", "producer-reserve", "archive-scope"} {
+		t.Run(stage, func(t *testing.T) {
+			err := registerStageError(stage, cause)
+			if !errors.Is(err, cause) {
+				t.Fatalf("stage wrapper lost cause: %v", err)
+			}
+			if !errors.Is(err, fencing.ErrPending) {
+				t.Fatalf("stage wrapper lost sentinel semantics: %v", err)
+			}
+			if !strings.HasPrefix(err.Error(), "fencing: register "+stage+" rejected:") {
+				t.Fatalf("stage wrapper has no fixed diagnostic prefix: %v", err)
+			}
+		})
+	}
+}
+
+func TestRegisterRootInitRejectionEmitsStageDiagnostic(t *testing.T) {
+	f := newSupervisorRegistrationFixture(t, false)
+	ctx := t.Context()
+	if err := f.e.initializeRoot(ctx, "sts-uid", f.identity.SourceClusterID); err != nil {
+		t.Fatal(err)
+	}
+	f.e.RequireMutationJournal = true
+	client := fencing.AuthorityClient{URL: f.server.URL + "/v1/supervisor", TokenFile: f.token, Client: f.server.Client()}
+
+	var captured bytes.Buffer
+	previous := log.Writer()
+	log.SetOutput(&captured)
+	t.Cleanup(func() { log.SetOutput(previous) })
+	if err := client.Register(ctx, f.identity); err == nil {
+		t.Fatal("required executor accepted an existing cooperative root")
+	}
+	if !strings.Contains(captured.String(), `fencing supervisor transition rejected: action="register" podUID="pod-0" error="fencing: register root-init rejected:`) {
+		t.Fatalf("actual handler rejection omitted the fixed register diagnostic: %s", captured.String())
 	}
 }
 

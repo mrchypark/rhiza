@@ -12,6 +12,8 @@ spec:
         rhiza.mrchypark.dev/cooperative-fencing: "1"
     spec:
       serviceAccountName: rhiza-supervised
+      # Bind this workload identity to read/list-only object-store permissions.
+      # Source object writes/deletes use the separate rhiza-fencer identity.
       automountServiceAccountToken: false
       hostPID: false
       shareProcessNamespace: false
@@ -19,11 +21,22 @@ spec:
         - name: rhiza
           command: [/usr/local/bin/rhiza-fencer]
           args: [supervise, --, /usr/local/bin/rhiza]
+          # Keep only public store coordinates and peer identity; never inject
+          # the object-store writer Secret into the voter.
+          envFrom:
+            - configMapRef:
+                name: rhiza-config
+            - secretRef:
+                name: rhiza-peer-credentials
           env:
             - name: POD_UID
               valueFrom:
                 fieldRef:
                   fieldPath: metadata.uid
+            - name: RHIZA_POD_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
             - name: FENCER_AUTHORITY_URL
               value: https://rhiza-fencer:9444/v1/supervisor
             - name: FENCER_CA_FILE

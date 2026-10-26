@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"path"
 	"path/filepath"
 	"slices"
@@ -106,6 +107,27 @@ func TestMembershipOperationJournalAndFence(t *testing.T) {
 	assertNoMembershipOperation(t, ctx, n, bucket, 2)
 }
 
+type failFirstArchiveHeadUploadBucket struct {
+	thanosobjstore.Bucket
+	failed atomic.Bool
+}
+
+func (b *failFirstArchiveHeadUploadBucket) Upload(ctx context.Context, name string, reader io.Reader, options ...thanosobjstore.ObjectUploadOption) error {
+	if strings.HasSuffix(name, "/archive/head.bin") && b.failed.CompareAndSwap(false, true) {
+		return errors.New("injected archive head persistence failure")
+	}
+	return b.Bucket.Upload(ctx, name, reader, options...)
+}
+
+func containsMember(members []quepaxa.Member, id quepaxa.NodeID) bool {
+	for _, member := range members {
+		if member.ID == id {
+			return true
+		}
+	}
+	return false
+}
+
 func TestMembershipOperationRejectsDifferentPendingTargetBeforeJournal(t *testing.T) {
 	ctx := context.Background()
 	n, identities, bucket, transport := newMembershipOperationNode(t)
@@ -148,6 +170,16 @@ func TestMembershipAdditionAbortAllowsNextRevision(t *testing.T) {
 	if err := n.abortMembership(ctx, addition); err != nil {
 		t.Fatalf("abort retry: %v", err)
 	}
+	changedAddition := addition
+	changedMember := *addition.Add
+	changedMember.PeerURL = "https://different-candidate"
+	changedAddition.Add = &changedMember
+	if err := n.changeMembership(ctx, changedAddition); !errors.Is(err, network.ErrRequestConflict) {
+		t.Fatalf("changed learner payload replay error=%v, want request conflict", err)
+	}
+	if changedAddition.Add.PeerURL != "https://different-candidate" || addition.Add.PeerURL != learner.PeerURL {
+		t.Fatalf("changed learner payload replay mutated caller request: changed=%q original=%q", changedAddition.Add.PeerURL, addition.Add.PeerURL)
+	}
 	if err := n.changeMembership(ctx, addition); !errors.Is(err, network.ErrRequestConflict) {
 		t.Fatalf("stale addition error=%v, want request conflict", err)
 	}
@@ -181,7 +213,7 @@ func TestMembershipAdmissionUsesDrainConfigurationAfterTerminal(t *testing.T) {
 		t.Cleanup(func() { _ = wal.Close() })
 		core, err := quepaxa.New(quepaxa.Config{
 			NodeID: member.ID, Cluster: quepaxa.Cluster{ConfigID: 1, Members: initial}, WAL: wal, Transport: transport, EnableReconfiguration: true,
-			ReconfigurationAdmission: func(context.Context, quepaxa.Cluster, quepaxa.Slot, [32]byte) error { admitted.Store(true); return nil },
+			ReconfigurationAdmission: func(context.Context, quepaxa.ReconfigurationAdmission) error { admitted.Store(true); return nil },
 		})
 		if err != nil {
 			t.Fatal(err)
@@ -206,8 +238,19 @@ func TestMembershipAdmissionUsesDrainConfigurationAfterTerminal(t *testing.T) {
 	canceled, cancel := context.WithCancel(ctx)
 	cancel()
 	through := core.Tip() - 1
-	if err := n.verifyMembershipAdmission(canceled, target, through, quepaxa.ValueHash{}); !errors.Is(err, context.Canceled) {
+	if err := n.verifyMembershipAdmission(canceled, quepaxa.ReconfigurationAdmission{Kind: quepaxa.ReconfigurationAdmissionLearner, Target: target, Through: through}); !errors.Is(err, context.Canceled) {
 		t.Fatalf("admission after terminal error=%v, want canceled learner verification", err)
+	}
+}
+
+func TestEngineRemovalAdmissionFailsClosedWithoutStorageVerifier(t *testing.T) {
+	n := &Node{}
+	operation := quepaxa.EngineRemoval{OperationID: "remove-c"}
+	err := n.verifyMembershipAdmission(context.Background(), quepaxa.ReconfigurationAdmission{
+		Kind: quepaxa.ReconfigurationAdmissionEngineRemoval, EngineRemoval: &operation,
+	})
+	if !errors.Is(err, network.ErrNotReady) {
+		t.Fatalf("engine removal admission without verifier=%v, want not ready", err)
 	}
 }
 

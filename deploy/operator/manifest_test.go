@@ -21,6 +21,119 @@ func TestNoPVCBootstrapRetainsPeerCredentials(t *testing.T) {
 	}
 }
 
+func TestSupervisedSourcePodReplacesObjectStoreSecretInjection(t *testing.T) {
+	data, err := os.ReadFile("fencing/supervised-statefulset.patch.yaml")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var patch map[string]any
+	if err := yaml.Unmarshal(data, &patch); err != nil {
+		t.Fatal(err)
+	}
+	spec, _ := patch["spec"].(map[string]any)
+	template, _ := spec["template"].(map[string]any)
+	podSpec, _ := nestedManifestMap(template, "spec")
+	containers, _ := podSpec["containers"].([]any)
+	if len(containers) != 1 {
+		t.Fatalf("supervised StatefulSet has %d containers, want exactly one", len(containers))
+	}
+	container, _ := containers[0].(map[string]any)
+	envFrom, _ := container["envFrom"].([]any)
+	if len(envFrom) != 2 {
+		t.Fatalf("supervised envFrom has %d entries, want only ConfigMap and peer Secret", len(envFrom))
+	}
+	if !isEnvFromRef(envFrom[0], "configMapRef", "rhiza-config") || !isEnvFromRef(envFrom[1], "secretRef", "rhiza-peer-credentials") {
+		t.Fatalf("supervised envFrom is not the exact public-config plus peer-credentials allowlist: %#v", envFrom)
+	}
+}
+
+func nestedManifestMap(value map[string]any, key string) (map[string]any, bool) {
+	nested, ok := value[key].(map[string]any)
+	return nested, ok
+}
+
+func isEnvFromRef(value any, kind, name string) bool {
+	ref, ok := value.(map[string]any)
+	if !ok || len(ref) != 1 {
+		return false
+	}
+	entry, ok := ref[kind].(map[string]any)
+	return ok && len(entry) == 1 && entry["name"] == name
+}
+
+func TestOperatorDeploymentProjectsFencerAudienceTokenReadOnly(t *testing.T) {
+	data, err := os.ReadFile("deployment.yaml")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var deployment map[string]any
+	if err := yaml.Unmarshal(data, &deployment); err != nil {
+		t.Fatal(err)
+	}
+	spec, _ := deployment["spec"].(map[string]any)
+	template, _ := spec["template"].(map[string]any)
+	podSpec, _ := template["spec"].(map[string]any)
+	if podSpec["serviceAccountName"] != "rhiza-operator" {
+		t.Fatalf("operator service account=%v, want rhiza-operator", podSpec["serviceAccountName"])
+	}
+	containers, _ := podSpec["containers"].([]any)
+	if len(containers) != 1 {
+		t.Fatalf("operator deployment containers=%d, want 1", len(containers))
+	}
+	container, _ := containers[0].(map[string]any)
+	env, _ := container["env"].([]any)
+	if !containsManifestNameValue(env, "RHIZA_FENCER_TOKEN_FILE", "/var/run/secrets/rhiza-fencer/token") {
+		t.Fatal("operator must read the projected rhiza-fencer audience token from its configured path")
+	}
+	mounts, _ := container["volumeMounts"].([]any)
+	if !containsReadonlyManifestMount(mounts, "fencer-token", "/var/run/secrets/rhiza-fencer") {
+		t.Fatal("operator fencer token mount must be read-only at /var/run/secrets/rhiza-fencer")
+	}
+	volumes, _ := podSpec["volumes"].([]any)
+	if !containsProjectedServiceAccountToken(volumes, "fencer-token", "rhiza-fencer", "token") {
+		t.Fatal("operator must project a service-account token with audience rhiza-fencer and path token")
+	}
+}
+
+func containsManifestNameValue(items []any, name, value string) bool {
+	for _, item := range items {
+		entry, _ := item.(map[string]any)
+		if entry["name"] == name && entry["value"] == value {
+			return true
+		}
+	}
+	return false
+}
+
+func containsReadonlyManifestMount(items []any, name, mountPath string) bool {
+	for _, item := range items {
+		entry, _ := item.(map[string]any)
+		if entry["name"] == name && entry["mountPath"] == mountPath && entry["readOnly"] == true {
+			return true
+		}
+	}
+	return false
+}
+
+func containsProjectedServiceAccountToken(items []any, name, audience, tokenPath string) bool {
+	for _, item := range items {
+		volume, _ := item.(map[string]any)
+		if volume["name"] != name {
+			continue
+		}
+		projected, _ := volume["projected"].(map[string]any)
+		sources, _ := projected["sources"].([]any)
+		for _, source := range sources {
+			tokenSource, _ := source.(map[string]any)
+			token, _ := tokenSource["serviceAccountToken"].(map[string]any)
+			if token["audience"] == audience && token["path"] == tokenPath {
+				return true
+			}
+		}
+	}
+	return false
+}
+
 // The CRD schema accepts the supported voterCount range and no longer exposes
 // the removed authoritative voter list.
 func TestClusterCRDAcceptsVoterCountRange(t *testing.T) {
@@ -55,6 +168,45 @@ func TestClusterCRDAcceptsVoterCountRange(t *testing.T) {
 	}
 	if domain, _ := spec["clusterDomain"].(map[string]any); domain["default"] != "cluster.local" {
 		t.Fatalf("clusterDomain default=%v, want cluster.local", domain["default"])
+	}
+}
+
+func TestClusterCRDAutomaticRecoveryRequiresExplicitPolicy(t *testing.T) {
+	data, err := os.ReadFile("cluster-crd.yaml")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var crd map[string]any
+	if err := yaml.Unmarshal(data, &crd); err != nil {
+		t.Fatal(err)
+	}
+	versions, _ := crd["spec"].(map[string]any)["versions"].([]any)
+	spec, _ := versions[0].(map[string]any)["schema"].(map[string]any)["openAPIV3Schema"].(map[string]any)["properties"].(map[string]any)["spec"].(map[string]any)
+	properties, _ := spec["properties"].(map[string]any)
+	requiredSpec, _ := spec["required"].([]any)
+	for _, field := range requiredSpec {
+		if field == "automatic" || field == "policy" {
+			t.Fatalf("spec.%s must be optional for manual recovery", field)
+		}
+	}
+	if automatic, _ := properties["automatic"].(map[string]any); automatic["default"] != false {
+		t.Fatalf("automatic default=%v, want false", automatic["default"])
+	}
+	policy, ok := properties["policy"].(map[string]any)
+	if !ok {
+		t.Fatal("optional policy schema is missing")
+	}
+	wantRequired := map[string]bool{"failureGraceSeconds": true, "cooldownSeconds": true, "maxRecoveriesPerDay": true, "allowDataLoss": true}
+	required, _ := policy["required"].([]any)
+	for _, field := range required {
+		delete(wantRequired, field.(string))
+	}
+	if len(wantRequired) != 0 {
+		t.Fatalf("policy omits required explicit fields: %v", wantRequired)
+	}
+	validations, _ := spec["x-kubernetes-validations"].([]any)
+	if len(validations) != 1 || !strings.Contains(validations[0].(map[string]any)["rule"].(string), "has(self.policy)") {
+		t.Fatalf("automatic policy opt-in validation missing: %v", validations)
 	}
 }
 
@@ -101,6 +253,64 @@ func TestFenceCRDKeepsGenerationTargetBound(t *testing.T) {
 	targets, _ := spec["targets"].(map[string]any)
 	if targets["maxItems"] != 64 {
 		t.Fatalf("fence targets maxItems=%v, want 64", targets["maxItems"])
+	}
+}
+
+func TestFenceCRDMixesStrictV2AndClosedPendingV3WithoutPruningIdentity(t *testing.T) {
+	data, err := os.ReadFile("fence-crd.yaml")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var crd map[string]any
+	if err := yaml.Unmarshal(data, &crd); err != nil {
+		t.Fatal(err)
+	}
+	versions, _ := nestedManifestMap(crd, "spec")
+	versionList, _ := versions["versions"].([]any)
+	if len(versionList) != 1 {
+		t.Fatalf("served CRD versions=%d, want one stable outer version", len(versionList))
+	}
+	version, _ := versionList[0].(map[string]any)
+	schema, _ := nestedManifestMap(version, "schema")
+	openAPI, _ := nestedManifestMap(schema, "openAPIV3Schema")
+	properties, _ := nestedManifestMap(openAPI, "properties")
+	status, _ := nestedManifestMap(properties, "status")
+	statusProperties, _ := nestedManifestMap(status, "properties")
+	proofProperties, _ := nestedManifestMap(statusProperties, "proof")
+	proofFields, _ := nestedManifestMap(proofProperties, "properties")
+	independent, _ := nestedManifestMap(proofFields, "independentV2")
+	independentFields, _ := nestedManifestMap(independent, "properties")
+	if independentFields["version"].(map[string]any)["enum"].([]any)[0] != 2 {
+		t.Fatal("outer independent evidence version changed from V2")
+	}
+	terminals, _ := nestedManifestMap(independentFields, "terminals")
+	terminalItems, _ := nestedManifestMap(terminals, "items")
+	terminalFields, _ := nestedManifestMap(terminalItems, "properties")
+	if got := terminalFields["evidenceVersion"].(map[string]any)["enum"].([]any); len(got) != 2 || got[0] != 2 || got[1] != 3 {
+		t.Fatalf("terminal evidence versions=%v, want [2, 3]", got)
+	}
+	validations, _ := terminalItems["x-kubernetes-validations"].([]any)
+	if len(validations) != 1 {
+		t.Fatalf("terminal conditional validations=%d, want exact V2/V3 producer relationship", len(validations))
+	}
+	rule, _ := validations[0].(map[string]any)["rule"].(string)
+	for _, fragment := range []string{"self.evidenceVersion == 2", "size(self.producerUID) > 0", "self.evidenceVersion == 3", "self.producerUID == ''", "self.mutationReceiptDigest == ''"} {
+		if !strings.Contains(rule, fragment) {
+			t.Fatalf("terminal conditional validation omits %q: %s", fragment, rule)
+		}
+	}
+	identity, _ := nestedManifestMap(terminalFields, "request")
+	requestFields, _ := nestedManifestMap(identity, "properties")
+	requestIdentity, _ := nestedManifestMap(requestFields, "identity")
+	identityFields, _ := nestedManifestMap(requestIdentity, "properties")
+	if podName, ok := identityFields["podName"].(map[string]any); !ok || podName["maxLength"] != 256 {
+		t.Fatalf("optional bounded podName identity field missing: %v", identityFields["podName"])
+	}
+	if assignment, ok := identityFields["assignmentID"].(map[string]any); !ok || assignment["pattern"] != "^[a-f0-9]{64}$" {
+		t.Fatalf("optional digest-form assignmentID identity field missing: %v", identityFields["assignmentID"])
+	}
+	if terminalFields["producerUID"].(map[string]any)["maxLength"] != 128 || terminalFields["mutationReceiptDigest"].(map[string]any)["maxLength"] != 64 || terminals["maxItems"] != 64 {
+		t.Fatal("mixed references lost existing proof or cohort bounds")
 	}
 }
 
@@ -158,5 +368,170 @@ func TestOperatorRoleCoversControllerWrites(t *testing.T) {
 				t.Errorf("operator Role must grant %q on %q", verb, resource)
 			}
 		}
+	}
+}
+
+func TestFencerRoleCreatesFenceRequestsWithoutClusterWrites(t *testing.T) {
+	data, err := os.ReadFile("fencing/authority.yaml")
+	if err != nil {
+		t.Fatal(err)
+	}
+	grants := map[string]map[string]bool{}
+	decoder := yaml.NewDecoder(bytes.NewReader(data))
+	for {
+		var doc map[string]any
+		if err := decoder.Decode(&doc); err != nil {
+			break
+		}
+		if doc["kind"] != "Role" {
+			continue
+		}
+		meta, _ := doc["metadata"].(map[string]any)
+		if meta["name"] != "rhiza-fencer" {
+			continue
+		}
+		for _, raw := range doc["rules"].([]any) {
+			rule, _ := raw.(map[string]any)
+			for _, resource := range rule["resources"].([]any) {
+				name, _ := resource.(string)
+				if grants[name] == nil {
+					grants[name] = map[string]bool{}
+				}
+				for _, verb := range rule["verbs"].([]any) {
+					grants[name][verb.(string)] = true
+				}
+			}
+		}
+	}
+	for _, verb := range []string{"get", "list", "create"} {
+		if !grants["rhizafences"][verb] {
+			t.Errorf("fencer Role must grant %q on rhizafences", verb)
+		}
+	}
+	for _, verb := range []string{"get", "list"} {
+		if !grants["rhizaclusters"][verb] {
+			t.Errorf("fencer Role must grant %q on rhizaclusters", verb)
+		}
+	}
+	for _, verb := range []string{"create", "update", "patch", "delete", "deletecollection"} {
+		if grants["rhizaclusters"][verb] {
+			t.Errorf("fencer Role must not grant %q on rhizaclusters", verb)
+		}
+	}
+	if !grants["rhizarecoveries"]["get"] {
+		t.Error("fencer Role must grant get on rhizarecoveries for canonical recovery registration")
+	}
+	for _, verb := range []string{"list", "create", "update", "patch", "delete", "deletecollection"} {
+		if grants["rhizarecoveries"][verb] {
+			t.Errorf("fencer Role must not grant %q on rhizarecoveries", verb)
+		}
+	}
+}
+
+func TestRuntimeAgentSharesHostPIDNamespaceWithoutCapabilities(t *testing.T) {
+	data, err := os.ReadFile("fencing/authority.yaml")
+	if err != nil {
+		t.Fatal(err)
+	}
+	decoder := yaml.NewDecoder(bytes.NewReader(data))
+	for {
+		var doc map[string]any
+		if err := decoder.Decode(&doc); err != nil {
+			break
+		}
+		if doc["kind"] != "DaemonSet" {
+			continue
+		}
+		metadata, _ := doc["metadata"].(map[string]any)
+		if metadata["name"] != "rhiza-runtime-agent" {
+			continue
+		}
+		spec, ok := nestedManifestMap(doc, "spec")
+		if !ok {
+			t.Fatal("runtime-agent DaemonSet spec is missing")
+		}
+		template, ok := nestedManifestMap(spec, "template")
+		if !ok {
+			t.Fatal("runtime-agent DaemonSet template is missing")
+		}
+		podSpec, ok := nestedManifestMap(template, "spec")
+		if !ok || podSpec["hostPID"] != true {
+			t.Fatalf("runtime-agent must share the host PID namespace, got %#v", podSpec["hostPID"])
+		}
+		for _, field := range []string{"hostNetwork", "hostIPC"} {
+			if podSpec[field] == true {
+				t.Errorf("runtime-agent must not share host %s", field)
+			}
+		}
+		containers, _ := podSpec["containers"].([]any)
+		if len(containers) != 1 {
+			t.Fatalf("runtime-agent containers=%d, want exactly one", len(containers))
+		}
+		container, _ := containers[0].(map[string]any)
+		security, _ := container["securityContext"].(map[string]any)
+		if security["allowPrivilegeEscalation"] != false || security["privileged"] == true {
+			t.Fatal("runtime-agent must not allow privilege escalation or privileged mode")
+		}
+		capabilities, _ := security["capabilities"].(map[string]any)
+		if capabilities["add"] != nil {
+			t.Fatalf("runtime-agent must not add Linux capabilities: %#v", capabilities["add"])
+		}
+		dropped, _ := capabilities["drop"].([]any)
+		if len(dropped) != 1 || dropped[0] != "ALL" {
+			t.Fatalf("runtime-agent must drop all Linux capabilities, got %#v", dropped)
+		}
+		return
+	}
+	t.Fatal("runtime-agent DaemonSet not found")
+}
+
+func TestFencerNamespaceLookupIsPinnedToOnlyTheRhizaNamespace(t *testing.T) {
+	data, err := os.ReadFile("fencing/authority.yaml")
+	if err != nil {
+		t.Fatal(err)
+	}
+	decoder := yaml.NewDecoder(bytes.NewReader(data))
+	found := false
+	for {
+		var doc map[string]any
+		if err := decoder.Decode(&doc); err != nil {
+			break
+		}
+		if doc["kind"] != "ClusterRole" {
+			continue
+		}
+		meta, _ := doc["metadata"].(map[string]any)
+		if meta["name"] != "rhiza-fencer-tokenreview" {
+			continue
+		}
+		for _, raw := range doc["rules"].([]any) {
+			rule, _ := raw.(map[string]any)
+			groups, _ := rule["apiGroups"].([]any)
+			resources, _ := rule["resources"].([]any)
+			coversNamespace := false
+			for _, resource := range resources {
+				if resource == "namespaces" || resource == "*" {
+					coversNamespace = true
+				}
+			}
+			if !coversNamespace {
+				continue
+			}
+			found = true
+			if len(groups) != 1 || groups[0] != "" || len(resources) != 1 || resources[0] != "namespaces" {
+				t.Errorf("namespace lookup rule has broad apiGroups/resources: apiGroups=%v resources=%v", groups, resources)
+			}
+			verbs, _ := rule["verbs"].([]any)
+			if len(verbs) != 1 || verbs[0] != "get" {
+				t.Errorf("namespace lookup verbs=%v, want only get", verbs)
+			}
+			names, _ := rule["resourceNames"].([]any)
+			if len(names) != 1 || names[0] != "rhiza" {
+				t.Errorf("namespace lookup resourceNames=%v, want only rhiza", names)
+			}
+		}
+	}
+	if !found {
+		t.Fatal("fencer ClusterRole must contain a namespace get rule scoped to rhiza")
 	}
 }

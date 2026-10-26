@@ -1,0 +1,34 @@
+# The installer must bind rhiza-manual-recovery-approver to its separately
+# authenticated incident-admin group. Deliberately no human subject is guessed.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: rhiza-manual-recovery-approver
+rules:
+  - apiGroups: [rhiza.mrchypark.dev]
+    resources: [rhizamanualrecoveryattestations]
+    verbs: [create]
+---
+# The fencer Role grants namespace-scoped get only. The fencer implementation
+# must fetch the deterministic name selected by its validated Recovery UID;
+# it cannot create, mutate, delete, or list approvals.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: rhiza-fencer-manual-attestation-reader
+rules:
+  - apiGroups: [rhiza.mrchypark.dev]
+    resources: [rhizamanualrecoveryattestations]
+    verbs: [get]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: rhiza-fencer-manual-attestation-reader
+subjects:
+  - kind: ServiceAccount
+    name: rhiza-fencer
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: rhiza-fencer-manual-attestation-reader

@@ -23,6 +23,7 @@ import (
 	"time"
 
 	"github.com/mrchypark/rhiza/internal/types"
+	"github.com/mrchypark/rhiza/pkg/fencing"
 	"github.com/mrchypark/rhiza/pkg/network"
 	"github.com/mrchypark/rhiza/pkg/quepaxa"
 	"github.com/mrchypark/rhiza/pkg/recovery"
@@ -99,6 +100,10 @@ func (c *Controller) reconcileAll(ctx context.Context) error {
 		if err := c.reconcileClusters(ctx); err != nil {
 			failures = append(failures, err)
 		}
+	} else {
+		if err := c.reconcileInitialSupervisedRoots(ctx); err != nil {
+			failures = append(failures, err)
+		}
 	}
 	return errors.Join(failures...)
 }
@@ -109,6 +114,10 @@ func (c *Controller) operationID(r *Resource) string {
 func (c *Controller) reconcile(ctx context.Context, r *Resource) error {
 	authorized, err := c.authorizeAutomaticChild(ctx, r)
 	if err != nil || !authorized {
+		return err
+	}
+	bootstrapConfirmation, err := c.confirmedBootstrapFenceForChild(ctx, r)
+	if err != nil {
 		return err
 	}
 	if r.Spec.Membership != nil {
@@ -187,21 +196,41 @@ func (c *Controller) reconcile(ctx context.Context, r *Resource) error {
 	if err := anchorEnvGate(r.Spec.AnchorID, env, reconfiguration, c.Anchor); err != nil {
 		return reject(err.Error())
 	}
-	prefix := path.Join(c.Prefix, r.Spec.SourceClusterID)
-	registered, err := c.sourceMembership(ctx, prefix)
+	source := sourceState{prefix: path.Join(c.Prefix, r.Spec.SourceClusterID), members: members, durability: mode, reconfiguration: reconfiguration, env: env, stateful: sts}
+	prefix := source.prefix
+	registered, membershipMissing, err := c.sourceMembershipOrMissing(ctx, prefix)
 	if err != nil {
 		return reject(err.Error())
 	}
-	if registered != recovery.NewMembershipRecord(r.Spec.SourceClusterID, members, mode) {
+	manualMissingMembership := membershipMissing && bootstrapConfirmation == nil &&
+		manualMissingSourceMembershipAllowed(r) && c.useFrozenSourceFork(source) && mode == "async" && r.Spec.AllowDataLoss
+	if membershipMissing {
+		if manualMissingMembership {
+			// This is only a provisional target input. The canonical fencer must
+			// independently bind the complete declared cohort to the closed root
+			// before any source-stop or target authorization side effect.
+			registered = recovery.NewMembershipRecord(r.Spec.SourceClusterID, members, mode)
+		} else if bootstrapConfirmation == nil || !c.useFrozenSourceFork(source) || mode != "async" || !r.Spec.AllowDataLoss {
+			return reject("immutable source membership is missing outside the confirmed frozen bootstrap-genesis path")
+		} else {
+			members, err = c.confirmedBootstrapSourceMembers(ctx, r, sts, ctr, env, members, *bootstrapConfirmation)
+			if err != nil {
+				return reject("confirmed bootstrap source cohort differs from canonical fence evidence: " + err.Error())
+			}
+			// This value is a derived input for the target only. It is never written
+			// back to the source archive or treated as an existing source receipt.
+			registered = recovery.NewMembershipRecord(r.Spec.SourceClusterID, members, mode)
+		}
+	} else if registered != recovery.NewMembershipRecord(r.Spec.SourceClusterID, members, mode) {
 		return reject("immutable source membership or durability differs from StatefulSet")
 	}
+	source.members = members
 	fingerprint := sourceFingerprint(r.Spec.SourceClusterID, mode, members, prefix)
 	if r.Status.RecoveryID != "" && fingerprint != r.Status.SourceMembership {
 		return reject("source configuration changed during recovery")
 	}
 	r.Status.Source, r.Status.SourceDurability, r.Status.SourceMembership = r.Spec.SourceClusterID, registered.Durability, fingerprint
 	r.Status.StatefulSetUID = uid
-	source := sourceState{prefix, members, mode, reconfiguration, env, sts}
 	if r.Spec.RecoveryID == "" {
 		peers, err := c.probe(ctx, r, sts)
 		if err != nil {
@@ -210,20 +239,57 @@ func (c *Controller) reconcile(ctx context.Context, r *Resource) error {
 		r.Status.Peers = peers
 		return c.record(ctx, r, "Observed", "observation only; missing peers never authorize recovery")
 	}
+	if r.Spec.AnchorID != "" {
+		if _, ok := c.Fencer.(ArchiveForkGenesisRegistrar); !ok {
+			return reject("anchored recovery requires a configured fencer with canonical archive fork registration")
+		}
+	}
 	if mode == "async" && !r.Spec.AllowDataLoss {
 		return reject("async source requires explicit allowDataLoss, regardless of target mode")
 	}
-	if r.Status.Stage == "" {
-		r.Status.ArchiveCapture = c.captureArchive(ctx, r, sts, env["RHIZA_ADMIN_TOKEN"])
+	if r.Status.RecoveryMode != "" && r.Status.RecoveryMode != RecoveryModeFrozenSource {
+		return reject("recovery journal contains an unsupported immutable mode")
 	}
+	if r.Status.RecoveryMode == "" && r.Status.Stage == "" && r.Status.RecoveryID == "" && r.Status.Target == "" && c.useFrozenSourceFork(source) {
+		r.Status.RecoveryMode = RecoveryModeFrozenSource
+		r.Status.RecoveryID, r.Status.SpecHash = r.Spec.RecoveryID, immutableSpecHash(r.Spec)
+		r.Status.StatefulSetUID, r.Status.Source = uid, r.Spec.SourceClusterID
+		return c.record(ctx, r, "Recovering", "frozen-source mode selected before authenticated fencer preflight")
+	}
+	frozen := r.Status.RecoveryMode == RecoveryModeFrozenSource
 	if err := validateFence(r.Spec.Fence, r.Spec.RecoveryID, r.Spec.SourceClusterID, uid); err != nil {
 		return c.record(ctx, r, "AwaitingFence", err.Error())
 	}
 	if r.Status.Stage == "" {
-		archive := recovery.NewManager(c.Bucket, prefix, 1)
+		persistedTargetBaseKind := r.Status.TargetBaseKind
+		persistedHeadlessGenesis := r.Status.FrozenEmptyGenesisPending
+		archive := recovery.NewManager(c.Bucket, prefix, recovery.ArchiveConfigID)
 		defer archive.Close()
-		if err := archive.Load(ctx); err != nil || archive.Tip() == 0 {
-			return reject("source archive has no available certified history")
+		headlessGenesisCandidate := false
+		if err := archive.Load(ctx); err != nil {
+			if !frozen || mode != "async" || !r.Spec.AllowDataLoss || r.Spec.MaxArchiveAgeSeconds != 0 {
+				return reject("source archive is unavailable")
+			}
+			headKey := path.Join(prefix, "archive/head.bin")
+			if exists, existsErr := c.Bucket.Exists(ctx, headKey); existsErr != nil || exists {
+				return reject("source archive HEAD is present or its absence cannot be verified")
+			}
+			if _, ok := c.Fencer.(ArchiveEmptyRecoveryRegistrar); !ok {
+				return reject("frozen empty recovery registrar is unavailable")
+			}
+			if err := verifyFrozenEmptyArchiveNamespace(ctx, c.Bucket, prefix); err != nil {
+				return reject("headless source contains archive history or cannot be enumerated")
+			}
+			r.Status.FrozenEmptyGenesisPending = true
+			headlessGenesisCandidate = true
+			r.Status.TargetBaseKind = "empty"
+		} else if archive.Tip() == 0 {
+			if _, exists := archive.HeadVersion(); !exists {
+				return reject("source archive has no initialized empty HEAD")
+			}
+			r.Status.TargetBaseKind = "empty"
+		} else {
+			r.Status.TargetBaseKind = "fork"
 		}
 		if r.Spec.MaxArchiveAgeSeconds > 0 {
 			attrs, err := c.Bucket.Attributes(ctx, path.Join(prefix, "archive/head.bin"))
@@ -234,19 +300,189 @@ func (c *Controller) reconcile(ctx context.Context, r *Resource) error {
 				return reject("archive evidence exceeds maxArchiveAgeSeconds; this is not a loss-window bound")
 			}
 		}
+		if frozen {
+			if persistedTargetBaseKind != "" && persistedTargetBaseKind != r.Status.TargetBaseKind {
+				return reject("frozen-source target base changed during recovery")
+			}
+			if persistedTargetBaseKind != "" && persistedHeadlessGenesis != headlessGenesisCandidate {
+				return reject("frozen-source empty-genesis mode changed during recovery")
+			}
+			if persistedTargetBaseKind == "" {
+				r.Status.FrozenEmptyGenesisPending = headlessGenesisCandidate
+				r.Status.RecoveryID, r.Status.SpecHash = r.Spec.RecoveryID, immutableSpecHash(r.Spec)
+				r.Status.StatefulSetUID, r.Status.Source = uid, r.Spec.SourceClusterID
+				return c.record(ctx, r, "Recovering", "frozen-source target base persisted before authenticated preflight")
+			}
+			if r.Status.FrozenBucketEnvironment == nil {
+				bucketName := StoreIdentity(source.env)["RHIZA_OBJSTORE_BUCKET"]
+				bucketEnvironment, err := c.captureFrozenBucketEnvironment(ctx, bucketName, prefix)
+				if err != nil {
+					return reject("source bucket lifecycle is not safely observable: " + err.Error())
+				}
+				r.Status.FrozenBucketEnvironment = &bucketEnvironment
+				return c.record(ctx, r, "Recovering", "frozen-source bucket lifecycle snapshot persisted before authenticated preflight")
+			}
+			preflight, err := c.frozenSourcePreflight(ctx, r)
+			if err != nil {
+				if errors.Is(err, ErrFencePending) {
+					return c.record(ctx, r, "Recovering", "frozen-source closure is pending")
+				}
+				return reject("frozen-source canonical preflight failed: " + err.Error())
+			}
+			if headlessGenesisCandidate && !preflight.EmptyGenesisEligible {
+				return reject("canonical source root has no exact eligible empty genesis")
+			}
+			proposedTarget, targetErr := recovery.FrozenTargetID(preflight.Identity)
+			if targetErr != nil || (r.Status.Target != "" && r.Status.Target != proposedTarget) {
+				return reject("frozen-source proposed target differs from the canonical source identity")
+			}
+			if !preflight.ClosureReady {
+				if preflight.ManualRecoveryChallenge != nil {
+					if preflight.ManualRecoveryChallenge.TargetClusterID != proposedTarget || preflight.ManualRecoveryChallenge.TargetBaseKind != r.Status.TargetBaseKind {
+						return reject("manual terminal recovery challenge target differs from the canonical proposal")
+					}
+					challengeDigest, digestErr := ManualRecoveryChallengeDigest(*preflight.ManualRecoveryChallenge)
+					if digestErr != nil || challengeDigest != preflight.ManualRecoveryChallengeDigest {
+						return reject("manual terminal recovery challenge is inconsistent")
+					}
+					if r.Status.ManualRecoveryChallengeDigest != "" && r.Status.ManualRecoveryChallengeDigest != challengeDigest {
+						return reject("manual terminal recovery challenge changed during recovery")
+					}
+					if r.Status.ManualRecoveryChallenge != nil && hashJSON(r.Status.ManualRecoveryChallenge) != hashJSON(preflight.ManualRecoveryChallenge) {
+						return reject("manual terminal recovery challenge object changed during recovery")
+					}
+					if r.Status.ManualRecoveryChallengeDigest == "" || r.Status.ManualRecoveryChallenge == nil {
+						r.Status.ManualRecoveryChallenge = preflight.ManualRecoveryChallenge
+						r.Status.ManualRecoveryChallengeDigest = challengeDigest
+						return c.record(ctx, r, "Recovering", "manual terminal recovery challenge persisted; administrator attestation is required")
+					}
+				}
+				return c.record(ctx, r, "Recovering", "frozen-source closure proof is pending")
+			}
+			if preflight.EvidenceKind == ManualTerminalEvidenceKind {
+				if !validEvidenceDigest(preflight.ManualRecoveryChallengeDigest) || !validEvidenceDigest(preflight.ManualTerminalAttestationDigest) || preflight.ProofDigest != "" {
+					return reject("manual terminal recovery evidence is incomplete or mixed with independent proof")
+				}
+				changed := false
+				if r.Status.ManualRecoveryChallengeDigest == "" {
+					r.Status.ManualRecoveryChallengeDigest = preflight.ManualRecoveryChallengeDigest
+					changed = true
+				} else if r.Status.ManualRecoveryChallengeDigest != preflight.ManualRecoveryChallengeDigest {
+					return reject("manual terminal recovery challenge changed during recovery")
+				}
+				if r.Status.ManualAttestationDigest == "" {
+					r.Status.ManualAttestationDigest = preflight.ManualTerminalAttestationDigest
+					changed = true
+				} else if r.Status.ManualAttestationDigest != preflight.ManualTerminalAttestationDigest {
+					return reject("manual terminal recovery attestation changed during recovery")
+				}
+				if changed {
+					return c.record(ctx, r, "Recovering", "manual terminal attestation persisted before target authorization")
+				}
+			} else if r.Status.ManualRecoveryChallengeDigest != "" || r.Status.ManualAttestationDigest != "" {
+				return reject("manual terminal evidence disappeared or changed kind during recovery")
+			}
+			if membershipMissing {
+				if bootstrapConfirmation != nil {
+					// Existing automatic bootstrap recovery is authorized by its
+					// independently re-derived canonical CONTROL confirmation, not
+					// by the separate manual missing-membership opt-in.
+					if r.Status.ManualMembershipBindingDigest != "" || preflight.ManualMembershipBindingDigest != "" {
+						return reject("automatic bootstrap recovery carries a manual membership binding")
+					}
+				} else {
+					if !manualMissingSourceMembershipAllowed(r) || mode != "async" || !r.Spec.AllowDataLoss || preflight.ManualMembershipBindingDigest == "" {
+						return reject("manual missing-membership authorization is not bound to a closed canonical source cohort")
+					}
+					if r.Status.ManualMembershipBindingDigest == "" {
+						r.Status.ManualMembershipBindingDigest = preflight.ManualMembershipBindingDigest
+						return c.record(ctx, r, "Recovering", "manual source-cohort binding persisted before target authorization")
+					}
+					if r.Status.ManualMembershipBindingDigest != preflight.ManualMembershipBindingDigest {
+						return reject("manual source-cohort binding changed during recovery")
+					}
+				}
+			} else if r.Status.ManualMembershipBindingDigest != "" {
+				return reject("manual source-cohort binding exists without a missing source membership")
+			}
+			configuredIdentity, err := c.frozenSourceIdentity(r, source)
+			if err != nil || configuredIdentity != preflight.Identity {
+				return reject("configured archive scope differs from canonical frozen-source identity")
+			}
+			target, err := recovery.FrozenTargetID(preflight.Identity)
+			if err != nil || target != proposedTarget {
+				return reject("frozen source identity is invalid or its proposed target changed")
+			}
+			if preflight.EvidenceKind == ManualTerminalEvidenceKind && r.Status.ManualRecoveryChallenge != nil &&
+				r.Status.ManualRecoveryChallenge.TargetClusterID != target {
+				return reject("approved manual recovery target differs from its immutable challenge")
+			}
+			bucketName := StoreIdentity(source.env)["RHIZA_OBJSTORE_BUCKET"]
+			bucketEnvironment := *r.Status.FrozenBucketEnvironment
+			if err := c.frozenBucketEnvironmentVerifier(bucketName, prefix)(ctx, bucketEnvironment); err != nil {
+				return reject("source bucket lifecycle changed or is unavailable: " + err.Error())
+			}
+			r.Status.Target = target
+			r.Status.RecoveryMode = RecoveryModeFrozenSource
+			r.Status.RecoveryID, r.Status.SpecHash = r.Spec.RecoveryID, immutableSpecHash(r.Spec)
+			if r.Status.TargetBaseKind == "empty" {
+				r.Status.Stage = "FrozenEmpty"
+			} else {
+				r.Status.Stage = "FrozenForked"
+			}
+			return c.record(ctx, r, "Recovering", "stable source-derived target claimed before recovery side effects")
+		}
 		r.Status.Target = "rhiza-r-" + shortID(c.operationID(r))
 		r.Status.RecoveryID, r.Status.SpecHash = r.Spec.RecoveryID, immutableSpecHash(r.Spec)
 		reservation := c.reservation(r)
-		if err := c.immutable(ctx, path.Join(prefix, "recovery/successor.json"), jsonBytes(reservation)); err != nil {
-			return reject("source generation already reserved or reservation unavailable")
+		reserved, _, err := c.verifyOrFindSuccessorReservation(ctx, prefix, reservation)
+		if err != nil {
+			return reject("legacy successor reservation is inconsistent or unavailable: " + err.Error())
+		}
+		// DATA keeps the legacy retry reservation; the trusted archive registrar
+		// arbitrates canonical successors in CONTROL.
+		if !reserved {
+			if err := c.immutable(ctx, path.Join(prefix, "recovery/successor.json"), jsonBytes(reservation)); err != nil {
+				return reject("source generation already reserved or reservation unavailable")
+			}
 		}
 		r.Status.Stage = "Reserved"
 		return c.record(ctx, r, "Recovering", "unique successor reserved; original generation must remain fenced")
 	}
-	if err := c.verifyReservation(ctx, r); err != nil {
-		return reject("reserved source successor changed or disappeared")
+	if r.Status.RecoveryMode == RecoveryModeFrozenSource {
+		if (r.Status.TargetBaseKind != "fork" || r.Status.Stage != "FrozenForked") && (r.Status.TargetBaseKind != "empty" || r.Status.Stage != "FrozenEmpty") {
+			return reject("frozen-source recovery mode is inconsistent with its immutable stage")
+		}
+		if r.Status.FrozenBucketEnvironment == nil {
+			return reject("frozen-source recovery has no persisted bucket lifecycle snapshot")
+		}
+		if err := c.frozenBucketEnvironmentVerifier(StoreIdentity(source.env)["RHIZA_OBJSTORE_BUCKET"], source.prefix)(ctx, *r.Status.FrozenBucketEnvironment); err != nil {
+			return reject("source bucket lifecycle changed or is unavailable: " + err.Error())
+		}
+		target, err := c.frozenTargetFor(r, source)
+		if err != nil || target != r.Status.Target {
+			return reject("frozen-source target differs from the stable source identity")
+		}
+	} else {
+		if r.Status.Stage == "FrozenForked" || r.Status.Stage == "FrozenEmpty" {
+			return reject("frozen-source stage has no immutable recovery mode")
+		}
+		if err := c.verifyReservation(ctx, r); err != nil {
+			return reject("reserved source successor changed or disappeared")
+		}
 	}
 	return c.advance(ctx, r, source)
+}
+
+func (c *Controller) useFrozenSourceFork(source sourceState) bool {
+	return source.reconfiguration && StoreIdentity(source.env)["RHIZA_OBJSTORE_PROVIDER"] == "gcs" &&
+		c.Fencer != nil && func() bool {
+		if _, ok := c.Fencer.(ArchiveForkGenesisRegistrar); !ok {
+			return false
+		}
+		_, cooperative := c.Fencer.(*KubernetesFencer)
+		return !cooperative
+	}()
 }
 
 func (c *Controller) advance(ctx context.Context, r *Resource, s sourceState) error {
@@ -282,8 +518,8 @@ func (c *Controller) advance(ctx context.Context, r *Resource, s sourceState) er
 		}
 		r.Status.Stage = "Starting"
 		return c.record(ctx, r, "Recovering", "source StatefulSet Pods terminated; externally fenced target may start")
-	case "Sealed":
-		secret := "rhiza-recovery-" + shortID(c.operationID(r))
+	case "FrozenForked", "FrozenEmpty", "Sealed":
+		secret := c.recoverySecretName(r)
 		var targetMembers []quepaxa.Member
 		if s.reconfiguration {
 			var err error
@@ -292,9 +528,43 @@ func (c *Controller) advance(ctx context.Context, r *Resource, s sourceState) er
 				return c.record(ctx, r, "Blocked", err.Error())
 			}
 		}
-		result, err := recovery.Fork(ctx, c.Bucket, c.forkOptions(r, s.prefix, s.members, s.reconfiguration, targetMembers))
-		if err != nil {
-			return c.record(ctx, r, "Blocked", "certified archive fork failed: "+err.Error())
+		targetBaseKind := r.Status.TargetBaseKind
+		if targetBaseKind == "" {
+			// Pre-field reservations were only created for nonzero forks.
+			targetBaseKind = "fork"
+		}
+		if targetBaseKind == "empty" {
+			return c.prepareEmptyRecovery(ctx, r, s, secret, targetMembers)
+		}
+		if targetBaseKind != "fork" {
+			return c.record(ctx, r, "Blocked", "recovery target base kind is missing or invalid")
+		}
+		var result recovery.ForkResult
+		var err error
+		if r.Status.RecoveryMode == RecoveryModeFrozenSource {
+			if r.Status.FrozenBucketEnvironment == nil {
+				return c.record(ctx, r, "Blocked", "frozen-source bucket lifecycle snapshot is missing")
+			}
+			identity, evidenceKind, proofDigest, manualAttestationDigest, rootDigest, err := c.frozenSourceClosure(ctx, r, s)
+			if err != nil {
+				return c.record(ctx, r, "Blocked", "frozen source closure changed or is unavailable: "+err.Error())
+			}
+			options := c.forkOptions(r, s.prefix, s.members, true, targetMembers)
+			frozen, err := recovery.ForkFrozenSource(ctx, c.Bucket, recovery.FrozenForkOptions{
+				ForkOptions: options, SourceIdentity: identity, EvidenceKind: evidenceKind, FenceProofDigest: proofDigest,
+				ManualAttestationDigest: manualAttestationDigest, ClosedRootDigest: rootDigest,
+				BucketEnvironment: *r.Status.FrozenBucketEnvironment,
+				VerifyEnvironment: c.frozenBucketEnvironmentVerifier(StoreIdentity(s.env)["RHIZA_OBJSTORE_BUCKET"], s.prefix),
+			})
+			if err != nil {
+				return c.record(ctx, r, "Blocked", "verified frozen-source fork failed: "+err.Error())
+			}
+			result = frozen.ForkResult
+		} else {
+			result, err = recovery.Fork(ctx, c.Bucket, c.forkOptions(r, s.prefix, s.members, s.reconfiguration, targetMembers))
+			if err != nil {
+				return c.record(ctx, r, "Blocked", "certified archive fork failed: "+err.Error())
+			}
 		}
 		if !s.reconfiguration {
 			targetMembers, err = c.targetCredentials(ctx, r, secret, s.members)
@@ -312,11 +582,22 @@ func (c *Controller) advance(ctx context.Context, r *Resource, s sourceState) er
 			return c.record(ctx, r, "Blocked", "target lineage is unavailable or inconsistent")
 		}
 
-		// External anchor activation: delegate to trusted Coordinator/Client.
-		if r.Spec.AnchorID != "" {
-			if c.Anchor == nil {
-				return c.record(ctx, r, "Blocked", "anchor backend is not configured for anchorID "+r.Spec.AnchorID)
-			}
+		// Only the explicitly configured Kubernetes fencer is the legacy
+		// cooperative backend. Unknown or wrapped backends must prove the
+		// canonical genesis capability; absence of that capability is not
+		// evidence that the source uses cooperative storage.
+		requiresArchiveGenesis := true
+		if _, cooperative := c.Fencer.(*KubernetesFencer); cooperative {
+			requiresArchiveGenesis = false
+		}
+		registrar, canRegisterArchiveGenesis := c.Fencer.(ArchiveForkGenesisRegistrar)
+		if requiresArchiveGenesis && !canRegisterArchiveGenesis {
+			return c.record(ctx, r, "Blocked", "configured fencing backend cannot register canonical archive fork genesis")
+		}
+		if requiresArchiveGenesis && !s.reconfiguration {
+			return c.record(ctx, r, "Blocked", "canonical archive fork genesis requires verified reconfiguration lineage")
+		}
+		if requiresArchiveGenesis || r.Spec.AnchorID != "" {
 			targetPrefix := path.Join(c.Prefix, r.Status.Target)
 			anchor, anchorH, anchorErr := recovery.ReadGenerationAnchor(ctx, c.Bucket, targetPrefix)
 			if anchorErr != nil {
@@ -332,13 +613,36 @@ func (c *Controller) advance(ctx context.Context, r *Resource, s sourceState) er
 			if anchor.OperationID != c.operationID(r) || anchor.SourcePrefix != s.prefix || anchor.SourcePrefixHash != result.PrefixHash || anchor.SourceTip != result.Tip || anchor.SourceManifest != result.ManifestHash {
 				return c.record(ctx, r, "Blocked", "target generation anchor does not match fork result")
 			}
-			req := c.buildAnchorRequest(r, s, record, result, hex.EncodeToString(anchorH[:]))
-			receipt, actErr := c.Anchor.Activate(ctx, req)
-			if actErr != nil {
-				return c.record(ctx, r, "Blocked", "anchor activation failed: "+actErr.Error())
+			if requiresArchiveGenesis {
+				request := ArchiveForkGenesisRequest{
+					StatefulSetUID: r.Status.StatefulSetUID, TargetClusterID: r.Status.Target,
+					OperationID: c.operationID(r), SourceFenceOperationID: r.Spec.RecoveryID, RecoveryMode: r.Status.RecoveryMode,
+					BucketEnvironment: r.Status.FrozenBucketEnvironment, ManualMembershipBindingDigest: r.Status.ManualMembershipBindingDigest,
+					ManualRecoveryChallengeDigest:   r.Status.ManualRecoveryChallengeDigest,
+					ManualTerminalAttestationDigest: r.Status.ManualAttestationDigest,
+				}
+				if r.Status.ManualAttestationDigest != "" {
+					request.EvidenceKind = ManualTerminalEvidenceKind
+				}
+				if r.Status.RecoveryMode == RecoveryModeFrozenSource {
+					request.RecoveryName = resourceName(r)
+				}
+				if err := registrar.RegisterArchiveForkGenesis(ctx, request); err != nil {
+					return c.record(ctx, r, "Blocked", "canonical archive fork genesis registration failed: "+err.Error())
+				}
 			}
-			r.Status.AnchorRequest = &req
-			r.Status.AnchorReceipt = &receipt
+			if r.Spec.AnchorID != "" {
+				if c.Anchor == nil {
+					return c.record(ctx, r, "Blocked", "anchor backend is not configured for anchorID "+r.Spec.AnchorID)
+				}
+				req := c.buildAnchorRequest(r, s, record, result, hex.EncodeToString(anchorH[:]))
+				receipt, actErr := c.Anchor.Activate(ctx, req)
+				if actErr != nil {
+					return c.record(ctx, r, "Blocked", "anchor activation failed: "+actErr.Error())
+				}
+				r.Status.AnchorRequest = &req
+				r.Status.AnchorReceipt = &receipt
+			}
 		}
 		r.Status.SecretName, r.Status.ManifestHash, r.Status.RecoveredTip = secret, result.ManifestHash, result.Tip
 		r.Status.Stage = "Stopping"
@@ -348,9 +652,88 @@ func (c *Controller) advance(ctx context.Context, r *Resource, s sourceState) er
 	}
 }
 
+func (c *Controller) prepareEmptyRecovery(ctx context.Context, r *Resource, s sourceState, secret string, targetMembers []quepaxa.Member) error {
+	if r.Spec.AnchorID != "" {
+		return c.record(ctx, r, "Blocked", "empty archive recovery cannot claim fork-anchor evidence")
+	}
+	if targetMembers == nil {
+		var err error
+		targetMembers, err = c.targetCredentials(ctx, r, secret, s.members)
+		if err != nil {
+			return c.record(ctx, r, "Blocked", err.Error())
+		}
+	}
+	record := recovery.NewMembershipRecord(r.Status.Target, targetMembers, r.Spec.Durability)
+	if err := c.immutable(ctx, path.Join(c.Prefix, r.Status.Target, "voters/membership.json"), jsonBytes(record)); err != nil {
+		return c.record(ctx, r, "Blocked", "target membership is unavailable or inconsistent")
+	}
+	if err := recovery.RequireEmptyArchiveScope(ctx, c.Bucket, path.Join(c.Prefix, r.Status.Target)); err != nil {
+		return c.record(ctx, r, "Blocked", "target archive is not a pristine empty scope")
+	}
+	response, err := c.registerEmptyRecovery(ctx, r, record)
+	if err != nil {
+		if errors.Is(err, ErrFencePending) {
+			return c.record(ctx, r, "Recovering", "canonical empty recovery authorization is pending")
+		}
+		return c.record(ctx, r, "Blocked", "canonical empty recovery authorization failed")
+	}
+	if response.State != "authorized" && response.State != "committed" {
+		return c.record(ctx, r, "Blocked", "canonical empty recovery returned an invalid state")
+	}
+	r.Status.SecretName = secret
+	r.Status.ManifestHash = ""
+	r.Status.RecoveredTip = 0
+	r.Status.Stage = "Stopping"
+	return c.record(ctx, r, "Recovering", "authorized empty target and credentials preserved before source shutdown")
+}
+
+func (c *Controller) registerEmptyRecovery(ctx context.Context, r *Resource, membership recovery.MembershipRecord) (ArchiveEmptyRecoveryResponse, error) {
+	registrar, ok := c.Fencer.(ArchiveEmptyRecoveryRegistrar)
+	if !ok || registrar == nil {
+		return ArchiveEmptyRecoveryResponse{}, fmt.Errorf("canonical empty recovery registrar is required")
+	}
+	request := ArchiveEmptyRecoveryRequest{
+		RecoveryName: resourceName(r), StatefulSetUID: r.Status.StatefulSetUID,
+		TargetClusterID: r.Status.Target, OperationID: c.operationID(r),
+		SourceFenceOperationID: r.Spec.RecoveryID,
+		TargetMembershipHash:   authorityStateDigest(jsonBytes(membership)),
+		TargetDurability:       r.Spec.Durability, AllowDataLoss: r.Spec.AllowDataLoss,
+		PolicyDigest: hashJSON(r.Spec), RecoveryMode: r.Status.RecoveryMode, BucketEnvironment: r.Status.FrozenBucketEnvironment,
+		ManualMembershipBindingDigest: r.Status.ManualMembershipBindingDigest,
+	}
+	if request.RecoveryName == "" || request.StatefulSetUID == "" || request.TargetClusterID == "" || request.OperationID == "" ||
+		request.SourceFenceOperationID == "" || request.TargetMembershipHash == "" || request.PolicyDigest == "" {
+		return ArchiveEmptyRecoveryResponse{}, fmt.Errorf("incomplete canonical empty recovery request")
+	}
+	response, err := registrar.RegisterArchiveEmptyRecovery(ctx, request)
+	if err != nil {
+		return ArchiveEmptyRecoveryResponse{}, err
+	}
+	if response.State != "authorized" && response.State != "committed" {
+		return ArchiveEmptyRecoveryResponse{}, fmt.Errorf("invalid canonical empty recovery state")
+	}
+	authorization := response.Authorization
+	expectedSourcePrefix := ""
+	if request.RecoveryMode == RecoveryModeFrozenSource {
+		expectedSourcePrefix = path.Join(strings.Trim(c.Prefix, "/"), r.Status.Source)
+	}
+	if err := authorization.Validate(); err != nil || authorization.StatefulSetUID != request.StatefulSetUID ||
+		authorization.TargetClusterID != request.TargetClusterID || authorization.OperationID != request.OperationID ||
+		authorization.SourceFenceOperationID != request.SourceFenceOperationID || authorization.SourceTip != 0 ||
+		authorization.TargetMembershipHash != request.TargetMembershipHash || authorization.TargetDurability != request.TargetDurability ||
+		authorization.AllowDataLoss != request.AllowDataLoss || authorization.PolicyDigest != emptyRecoveryPolicyDigest(request.PolicyDigest, authorization.SourceDurability, request.TargetDurability, request.AllowDataLoss) ||
+		authorization.RecoveryMode != request.RecoveryMode || authorization.SourcePrefix != expectedSourcePrefix ||
+		authorization.BucketMetageneration != frozenBucketMetageneration(request.BucketEnvironment) || authorization.LifecyclePolicyDigest != frozenBucketLifecycleDigest(request.BucketEnvironment) {
+		return ArchiveEmptyRecoveryResponse{}, fmt.Errorf("canonical empty recovery authorization differs from the requested operation")
+	}
+	return response, nil
+}
+
 func (c *Controller) startAndObserve(ctx context.Context, r *Resource, sts object) error {
-	if err := c.verifyReservation(ctx, r); err != nil {
-		return c.record(ctx, r, "Blocked", "reserved source successor changed or disappeared")
+	if r.Status.RecoveryMode != RecoveryModeFrozenSource {
+		if err := c.verifyReservation(ctx, r); err != nil {
+			return c.record(ctx, r, "Blocked", "reserved source successor changed or disappeared")
+		}
 	}
 	if err := validateFence(r.Spec.Fence, r.Spec.RecoveryID, r.Spec.SourceClusterID, r.Status.StatefulSetUID); err != nil {
 		return c.record(ctx, r, "AwaitingFence", err.Error())
@@ -358,7 +741,15 @@ func (c *Controller) startAndObserve(ctx context.Context, r *Resource, sts objec
 	if r.Status.SourceDurability == "async" && !r.Spec.AllowDataLoss {
 		return c.record(ctx, r, "Blocked", "async recovery still requires allowDataLoss")
 	}
-	if r.Status.Target != "rhiza-r-"+shortID(c.operationID(r)) || r.Status.SecretName != "rhiza-recovery-"+shortID(c.operationID(r)) || r.Status.RecoveredTip == 0 {
+	targetBaseKind := r.Status.TargetBaseKind
+	if targetBaseKind == "" && r.Status.Stage != "" {
+		// Prior journal entries were only created for nonzero certified forks.
+		targetBaseKind = "fork"
+	}
+	if r.Status.Target != c.recoveryTargetID(r) || r.Status.SecretName != c.recoverySecretName(r) ||
+		(targetBaseKind == "fork" && r.Status.RecoveredTip == 0) ||
+		(targetBaseKind == "empty" && (r.Status.RecoveredTip != 0 || r.Status.ManifestHash != "")) ||
+		(targetBaseKind != "fork" && targetBaseKind != "empty") {
 		return c.record(ctx, r, "Blocked", "invalid target recovery journal")
 	}
 	if str(nested(sts, "metadata", "annotations", ownerAnnotation)) != c.operationID(r) {
@@ -371,6 +762,13 @@ func (c *Controller) startAndObserve(ctx context.Context, r *Resource, sts objec
 	env, err := c.environment(ctx, ctr)
 	if err != nil {
 		return err
+	}
+	if r.Status.RecoveryMode == RecoveryModeFrozenSource {
+		prefix := path.Join(strings.Trim(StoreIdentity(env)["RHIZA_OBJSTORE_PREFIX"], "/"), r.Spec.SourceClusterID)
+		target, err := c.frozenTargetFor(r, sourceState{prefix: prefix, env: env})
+		if err != nil || target != r.Status.Target {
+			return c.record(ctx, r, "Blocked", "stable frozen-source target identity changed")
+		}
 	}
 	if err := c.storeConfigMatches(env); err != nil {
 		return c.record(ctx, r, "Blocked", err.Error())
@@ -393,6 +791,14 @@ func (c *Controller) startAndObserve(ctx context.Context, r *Resource, sts objec
 	record, err := c.sourceMembership(ctx, path.Join(c.Prefix, r.Status.Target))
 	if err != nil || record != recovery.NewMembershipRecord(r.Status.Target, members, r.Spec.Durability) {
 		return c.record(ctx, r, "Blocked", "target membership changed")
+	}
+	if targetBaseKind == "empty" {
+		if _, err := c.registerEmptyRecovery(ctx, r, record); err != nil {
+			if errors.Is(err, ErrFencePending) {
+				return c.record(ctx, r, "Recovering", "canonical empty recovery authorization is pending")
+			}
+			return c.record(ctx, r, "Blocked", "canonical empty recovery authorization is unavailable")
+		}
 	}
 	// Common anchor verification: covers Starting (both branches) and Restarted.
 	sourcePrefix := path.Join(c.Prefix, r.Spec.SourceClusterID)
@@ -438,9 +844,18 @@ func (c *Controller) startAndObserve(ctx context.Context, r *Resource, sts objec
 			if err != nil {
 				return c.record(ctx, r, "Blocked", err.Error())
 			}
-			result, err := recovery.Fork(ctx, c.Bucket, c.forkOptions(r, sourcePrefix, sourceMembers, reconfiguration, members))
-			if err != nil || result.Tip != r.Status.RecoveredTip || result.ManifestHash != r.Status.ManifestHash {
-				return c.record(ctx, r, "Blocked", "prepared target evidence changed before activation")
+			var result recovery.ForkResult
+			if targetBaseKind == "fork" {
+				result, err = recovery.Fork(ctx, c.Bucket, c.forkOptions(r, sourcePrefix, sourceMembers, reconfiguration, members))
+				if err != nil || result.Tip != r.Status.RecoveredTip || result.ManifestHash != r.Status.ManifestHash {
+					return c.record(ctx, r, "Blocked", "prepared target evidence changed before activation")
+				}
+			} else if targetBaseKind == "empty" {
+				if err := recovery.RequireEmptyArchiveScope(ctx, c.Bucket, path.Join(c.Prefix, r.Status.Target)); err != nil {
+					return c.record(ctx, r, "Blocked", "empty target archive is not pristine before activation")
+				}
+			} else {
+				return c.record(ctx, r, "Blocked", "invalid target recovery base kind")
 			}
 			if number(nested(sts, "spec", "replicas")) != 0 {
 				return c.record(ctx, r, "Blocked", "source replicas reappeared before activation")
@@ -453,7 +868,7 @@ func (c *Controller) startAndObserve(ctx context.Context, r *Resource, sts objec
 				return c.record(ctx, r, "Blocked", "source pods reappeared before activation")
 			}
 			// Live re-verify anchor receipt just before StatefulSet PUT.
-			if r.Spec.AnchorID != "" {
+			if r.Spec.AnchorID != "" && targetBaseKind == "fork" {
 				targetPrefix := path.Join(c.Prefix, r.Status.Target)
 				gaRecord, gaRecErr := c.sourceMembership(ctx, targetPrefix)
 				if gaRecErr != nil {
@@ -476,6 +891,14 @@ func (c *Controller) startAndObserve(ctx context.Context, r *Resource, sts objec
 			values = replaceEnv(values, "RHIZA_OBJSTORE_DURABILITY", object{"value": r.Spec.Durability})
 			ctr["env"] = values
 			applyTargetCredentials(ctr, r.Status.SecretName)
+			if env["RHIZA_AUTHORITY_PROFILE"] == fencing.LogicalWriterProfileV1 {
+				if err := c.ensurePublicMembershipProjection(ctx, r.Status.SecretName, c.operationID(r), members); err != nil {
+					return c.record(ctx, r, "Blocked", "public target membership projection is unavailable or inconsistent")
+				}
+				if !applyLogicalMembershipProjection(sts, ctr, recoveryMembershipProjectionName(r.Status.SecretName), r.Status.Target, r.Spec.Durability) {
+					return c.record(ctx, r, "Blocked", "logical target requires exactly one restore-init container for public membership")
+				}
+			}
 			asObject(sts["spec"])["replicas"] = float64(len(members))
 			if err := c.Kube.Put(ctx, c.stsPath(r.Spec.StatefulSet), sts, &sts); err != nil {
 				return err
@@ -513,6 +936,31 @@ func (c *Controller) startAndObserve(ctx context.Context, r *Resource, sts objec
 	if len(ready) < len(members)/2+1 {
 		return c.record(ctx, r, "WaitingReady", "waiting for a matching recovered quorum")
 	}
+	if targetBaseKind == "empty" {
+		response, err := c.registerEmptyRecovery(ctx, r, record)
+		if err != nil {
+			if errors.Is(err, ErrFencePending) {
+				return c.record(ctx, r, "WaitingReady", "canonical empty archive genesis commit is pending")
+			}
+			return c.record(ctx, r, "Blocked", "canonical empty archive genesis commit is unavailable")
+		}
+		if response.State != "committed" {
+			return c.record(ctx, r, "WaitingReady", "target quorum is ready; canonical empty archive genesis is not committed")
+		}
+		if err := c.targetApplicationReadBarrier(ctx, r, sts, ready, env["RHIZA_ADMIN_TOKEN"]); err != nil {
+			return c.record(ctx, r, "WaitingReady", "target application read-durability barrier is unavailable")
+		}
+		response, err = c.registerEmptyRecovery(ctx, r, record)
+		if err != nil {
+			if errors.Is(err, ErrFencePending) {
+				return c.record(ctx, r, "WaitingReady", "canonical empty archive genesis commit is pending")
+			}
+			return c.record(ctx, r, "Blocked", "canonical empty archive genesis commit is unavailable")
+		}
+		if response.State != "committed" {
+			return c.record(ctx, r, "WaitingReady", "target application barrier passed; canonical empty archive genesis is not committed")
+		}
+	}
 	if str(nested(r.Metadata, "annotations", automaticOwner)) != "" {
 		identities, err := c.captureAutomaticTargetIdentities(ctx, r, sts, members, env["RHIZA_ADMIN_TOKEN"])
 		if err != nil {
@@ -526,8 +974,110 @@ func (c *Controller) startAndObserve(ctx context.Context, r *Resource, sts objec
 	return c.record(ctx, r, "Complete", "new generation has a verified recovered quorum")
 }
 
+// targetApplicationReadBarrier requires a live target voter to pass the
+// authenticated ReadIndex probe and the application route's linearizable,
+// read-durable query before an empty recovery can complete.
+func (c *Controller) targetApplicationReadBarrier(ctx context.Context, r *Resource, sts object, ready map[string]bool, token string) error {
+	if token == "" {
+		return fmt.Errorf("target admin token is unavailable")
+	}
+	pods, err := c.ownedPods(ctx, str(nested(sts, "metadata", "uid")))
+	if err != nil {
+		return err
+	}
+	for _, pod := range pods {
+		name, uid := str(nested(pod, "metadata", "name")), str(nested(pod, "metadata", "uid"))
+		if !ready[name] || uid == "" || nested(pod, "metadata", "deletionTimestamp") != nil || !ownedBy(pod, r.Status.StatefulSetUID) {
+			continue
+		}
+		probeEndpoint, err := podEndpoint(pod, r.Spec.Container, "/recovery/probe")
+		if err != nil || !c.automaticQuorumProbe(ctx, probeEndpoint, token, r.Status.Target, name) {
+			continue
+		}
+		queryEndpoint, err := podEndpoint(pod, r.Spec.Container, "/sql/query")
+		if err != nil {
+			continue
+		}
+		body, err := json.Marshal(network.QueryRequest{SQL: "SELECT 1", Consistency: "linearizable"})
+		if err != nil {
+			return err
+		}
+		call, cancel := context.WithTimeout(ctx, 5*time.Second)
+		request, err := http.NewRequestWithContext(call, http.MethodPost, queryEndpoint, bytes.NewReader(body))
+		if err != nil {
+			cancel()
+			return err
+		}
+		request.Header.Set("Content-Type", "application/json")
+		response, err := c.client().Do(request)
+		if err != nil {
+			cancel()
+			continue
+		}
+		var result network.QueryResponse
+		decodeErr := error(nil)
+		if response.StatusCode != http.StatusOK {
+			decodeErr = fmt.Errorf("linearizable application query returned HTTP %d", response.StatusCode)
+		} else {
+			decodeErr = json.NewDecoder(io.LimitReader(response.Body, 16<<10)).Decode(&result)
+		}
+		response.Body.Close()
+		cancel()
+		var value float64
+		valueOK := false
+		if len(result.Rows) == 1 && len(result.Rows[0]) == 1 {
+			value, valueOK = result.Rows[0][0].(float64)
+		}
+		if decodeErr != nil || len(result.Columns) != 1 || result.Columns[0] != "1" || !valueOK || value != 1 || result.ConsensusTip < result.AppliedSlot {
+			continue
+		}
+		// Bind both service calls to the same still-owned Pod incarnation.
+		var current object
+		if err := c.Kube.Get(ctx, c.corePath("pods", name), &current); err != nil ||
+			str(nested(current, "metadata", "uid")) != uid ||
+			nested(current, "status", "podIP") != nested(pod, "status", "podIP") ||
+			nested(current, "metadata", "deletionTimestamp") != nil || !ownedBy(current, r.Status.StatefulSetUID) {
+			continue
+		}
+		if !c.automaticQuorumProbe(ctx, probeEndpoint, token, r.Status.Target, name) {
+			continue
+		}
+		// The final authenticated probe is the last service interaction. Re-read
+		// the Pod afterward so a same-name replacement between the earlier
+		// identity check and this probe cannot satisfy the barrier as the old
+		// incarnation.
+		var final object
+		if err := c.Kube.Get(ctx, c.corePath("pods", name), &final); err != nil ||
+			str(nested(final, "metadata", "uid")) != uid ||
+			nested(final, "status", "podIP") != nested(pod, "status", "podIP") ||
+			nested(final, "metadata", "deletionTimestamp") != nil || !ownedBy(final, r.Status.StatefulSetUID) {
+			continue
+		}
+		return nil
+	}
+	return fmt.Errorf("no ready target voter completed an authenticated ReadIndex and linearizable application read-durability barrier")
+}
+
 func (c *Controller) reservation(r *Resource) object {
-	return object{"version": 1, "operation_id": c.operationID(r), "target": r.Status.Target, "source": r.Spec.SourceClusterID, "source_membership": r.Status.SourceMembership, "statefulset_uid": r.Status.StatefulSetUID, "spec_hash": r.Status.SpecHash}
+	reservation := object{"version": 1, "operation_id": c.operationID(r), "target": r.Status.Target, "source": r.Spec.SourceClusterID, "source_membership": r.Status.SourceMembership, "statefulset_uid": r.Status.StatefulSetUID, "spec_hash": r.Status.SpecHash}
+	if r.Status.TargetBaseKind != "" {
+		reservation["target_base_kind"] = r.Status.TargetBaseKind
+	}
+	return reservation
+}
+
+func (c *Controller) recoveryTargetID(r *Resource) string {
+	if r.Status.RecoveryMode == RecoveryModeFrozenSource {
+		return r.Status.Target
+	}
+	return "rhiza-r-" + shortID(c.operationID(r))
+}
+
+func (c *Controller) recoverySecretName(r *Resource) string {
+	if r.Status.RecoveryMode == RecoveryModeFrozenSource {
+		return "rhiza-recovery-" + shortID(r.Status.Target)
+	}
+	return "rhiza-recovery-" + shortID(c.operationID(r))
 }
 func reconfigurationEnabled(env map[string]string) (bool, error) {
 	raw := env["RHIZA_ENABLE_RECONFIGURATION"]
@@ -892,17 +1442,143 @@ func (c *Controller) immutable(ctx context.Context, key string, data []byte) err
 	return nil
 }
 func (c *Controller) sourceMembership(ctx context.Context, prefix string) (recovery.MembershipRecord, error) {
+	record, missing, err := c.sourceMembershipOrMissing(ctx, prefix)
+	if err != nil {
+		return recovery.MembershipRecord{}, err
+	}
+	if missing {
+		return recovery.MembershipRecord{}, fmt.Errorf("source membership history unavailable")
+	}
+	return record, nil
+}
+
+// sourceMembershipOrMissing preserves the distinction between definitive
+// absence and an unreadable or malformed source object. Only the former may be
+// considered by the authenticated bootstrap-genesis exception.
+func (c *Controller) sourceMembershipOrMissing(ctx context.Context, prefix string) (recovery.MembershipRecord, bool, error) {
 	var record recovery.MembershipRecord
 	reader, err := c.Bucket.Get(ctx, path.Join(prefix, "voters/membership.json"))
+	if c.Bucket.IsObjNotFoundErr(err) {
+		return record, true, nil
+	}
 	if err != nil {
-		return record, fmt.Errorf("source membership history unavailable")
+		return record, false, fmt.Errorf("source membership history unavailable")
 	}
 	data, err := io.ReadAll(io.LimitReader(reader, 64<<10))
 	closeErr := reader.Close()
 	if err != nil || closeErr != nil || len(data) == 64<<10 || json.Unmarshal(data, &record) != nil || record.Version != 2 || (record.Durability != "async" && record.Durability != "before-ack") || !bytes.Equal(data, jsonBytes(record)) {
-		return record, fmt.Errorf("source membership or durability history is invalid")
+		return record, false, fmt.Errorf("source membership or durability history is invalid")
 	}
-	return record, nil
+	return record, false, nil
+}
+
+func manualMissingSourceMembershipAllowed(r *Resource) bool {
+	if r == nil || !r.Spec.AllowMissingSourceMembership || r.Spec.RecoveryID == "" ||
+		str(r.Metadata["uid"]) == "" || r.Spec.Membership != nil {
+		return false
+	}
+	// Automatic recovery owns a different policy and binding. This opt-in is
+	// deliberately unavailable to annotated automatic children.
+	return str(nested(r.Metadata, "annotations", automaticOwner)) == "" &&
+		str(nested(r.Metadata, "annotations", automaticLogical)) == ""
+}
+
+func (c *Controller) confirmedBootstrapSourceMembers(ctx context.Context, r *Resource, sts, ctr object, env map[string]string, members []quepaxa.Member, confirmation BootstrapGenesisFenceConfirmation) ([]quepaxa.Member, error) {
+	request := confirmation.Request
+	binding := request.BootstrapGenesis
+	if binding == nil || request.Scope != ScopeGeneration || request.OperationID != r.Spec.RecoveryID || request.SourceClusterID != r.Spec.SourceClusterID ||
+		request.StatefulSet != r.Spec.StatefulSet || request.StatefulSetUID != str(nested(sts, "metadata", "uid")) ||
+		request.LogicalID == "" || request.LogicalID != str(nested(r.Metadata, "annotations", automaticLogical)) ||
+		request.BindingUID != str(nested(r.Metadata, "annotations", automaticOwner)) || request.Namespace != c.Kube.Namespace || binding.ClusterName == "" || binding.ClusterUID == "" {
+		return nil, fmt.Errorf("confirmed fence request does not identify this source generation")
+	}
+	var cluster ClusterResource
+	if err := c.Kube.Get(ctx, c.clusterPath(binding.ClusterName), &cluster); err != nil {
+		return nil, fmt.Errorf("bootstrap cluster configuration is unavailable")
+	}
+	normalizeClusterSpec(&cluster)
+	logical := str(nested(r.Metadata, "annotations", automaticLogical))
+	auto, _, err := c.loadAuto(ctx, path.Join(c.Prefix, "automatic", c.Kube.Namespace, logical, "control.json"))
+	if err != nil {
+		return nil, fmt.Errorf("protected automatic bootstrap intent is unavailable")
+	}
+	if str(cluster.Metadata["name"]) != binding.ClusterName || str(cluster.Metadata["namespace"]) != c.Kube.Namespace ||
+		str(cluster.Metadata["uid"]) != binding.ClusterUID || cluster.Spec.StatefulSet != r.Spec.StatefulSet ||
+		cluster.Spec.AdoptClusterID != r.Spec.SourceClusterID || cluster.Spec.LogicalID != request.LogicalID || !cluster.Spec.Automatic || !cluster.Spec.Bootstrap ||
+		cluster.Spec.Policy == nil || !cluster.Spec.Policy.AllowDataLoss || cluster.Spec.VoterCount != len(members) ||
+		logical != request.LogicalID || auto.BindingUID != str(cluster.Metadata["uid"]) || auto.BindingVersion != autoBindingVersion ||
+		auto.BindingHash != autoBinding(&cluster) || auto.StatefulSetUID != request.StatefulSetUID || auto.ActiveClusterID != request.SourceClusterID ||
+		auto.BootstrapGenesis == nil || *auto.BootstrapGenesis != *binding || auto.Intent == nil || auto.Intent.Proof == nil ||
+		hashJSON(auto.Intent.Request) != hashJSON(request) || hashJSON(*auto.Intent.Proof) != hashJSON(confirmation.Proof) ||
+		env["RHIZA_CLUSTER_ID"] != r.Spec.SourceClusterID || env["RHIZA_OBJSTORE_DURABILITY"] != "async" || env["RHIZA_ENABLE_RECONFIGURATION"] != "true" {
+		return nil, fmt.Errorf("bootstrap source configuration no longer matches the confirmed policy")
+	}
+	if err := validateClusterRuntime(&cluster, ctr, env); err != nil {
+		return nil, err
+	}
+	if err := noPVC(sts, ctr, env); err != nil {
+		return nil, err
+	}
+	if err := c.storeConfigMatches(env); err != nil {
+		return nil, err
+	}
+	if !bootstrapTemplateInstalled(ctr, &cluster) {
+		return nil, fmt.Errorf("source membership is not from the immutable bootstrap configuration")
+	}
+	allowed, err := allowedGenerationVoterIDs(&cluster, sts, nil)
+	if err != nil {
+		return nil, err
+	}
+	if err := voterCountContract(&cluster, sts, members, true, true, allowed); err != nil {
+		return nil, err
+	}
+	if err := c.validateBootstrappedMembers(ctx, &cluster, sts, true, members, allowed); err != nil {
+		return nil, err
+	}
+	if len(request.Targets) != len(members) {
+		return nil, fmt.Errorf("confirmed fence target count differs from bootstrap membership")
+	}
+	targets := make(map[string]FenceTarget, len(request.Targets))
+	for _, target := range request.Targets {
+		if target.NodeID == "" || target.Pod == "" || target.NodeID != target.Pod || targets[target.NodeID].NodeID != "" {
+			return nil, fmt.Errorf("confirmed fence target inventory is incomplete or ambiguous")
+		}
+		targets[target.NodeID] = target
+	}
+	for _, member := range members {
+		if _, ok := targets[string(member.ID)]; !ok {
+			return nil, fmt.Errorf("bootstrap membership differs from the confirmed fence cohort")
+		}
+	}
+	// Cross-check the bootstrap Secret-backed source endpoints against the
+	// configured endpoints and CONTROL-confirmed voter IDs before using them for
+	// the target-only source fingerprint.
+	derived, err := clusterMemberSources(&cluster, sts, c.Kube.Namespace)
+	if err != nil || len(derived) != len(request.Targets) {
+		return nil, errors.Join(err, fmt.Errorf("bootstrap source cohort could not be derived"))
+	}
+	for _, member := range derived {
+		if _, ok := targets[string(member.ID)]; !ok {
+			return nil, fmt.Errorf("derived bootstrap membership differs from the confirmed fence cohort")
+		}
+	}
+	if len(members) != len(derived) {
+		return nil, fmt.Errorf("bootstrap membership differs from the configured source cohort")
+	}
+	configured := make(map[quepaxa.NodeID]quepaxa.Member, len(members))
+	for _, member := range members {
+		configured[member.ID] = member
+	}
+	for _, member := range derived {
+		observed, ok := configured[member.ID]
+		if !ok || observed.URL != member.URL || observed.PeerURL != member.PeerURL {
+			return nil, fmt.Errorf("bootstrap source endpoints differ from the configured cohort")
+		}
+	}
+	// Preserve the source public keys so the target-only fingerprint matches the
+	// fencer's independently checked cohort; targetCredentials replaces them
+	// with fresh target keys before any target membership is written.
+	return members, nil
 }
 func (c *Controller) record(ctx context.Context, r *Resource, phase, message string) error {
 	r.Status.Phase, r.Status.Message = phase, message

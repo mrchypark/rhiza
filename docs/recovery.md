@@ -64,8 +64,26 @@ The guard does not establish exclusive execution for cloned complete disks or
 detect an intentional rollback of both disk and shared storage. Original-disk
 exclusivity, prevention of old-instance reconnection (fencing), and durable,
 non-rollback storage remain deployment requirements. Single-voter archive
-restoration retains its existing behavior and requires the old instance to be
-stopped permanently; it is not a multi-voter replacement protocol.
+restoration retains its existing behavior only for a namespace with no prior
+voter records and requires the old instance to be stopped permanently; it is
+not a multi-voter replacement protocol. If canonical membership is absent while
+voter records remain, normal startup, single-voter recovery, and offline
+enrollment must not create a replacement membership. Offline enrollment remains
+the one-time upgrade path for intact original WALs; it cannot repair missing
+canonical membership around existing voter records.
+
+Manual frozen-source recovery may set
+`RhizaRecovery.spec.allowMissingSourceMembership: true` only when the source
+membership object is definitively absent. This is default-off and is not an
+automatic-recovery policy. The source must be asynchronous and the recovery
+must explicitly set `allowDataLoss: true`; the canonical fencer independently
+binds the full persisted Recovery spec, Recovery UID, StatefulSet UID, declared
+voter cohort, and closed CONTROL fence before authorizing either a fork or an
+empty target. A malformed membership object, an unreadable object, an incomplete
+cohort, or any missing canonical fence evidence remains fail-closed. The
+derived membership is target input only: Rhiza never writes a synthetic
+membership record into the source archive, and this opt-in does not make absent
+source history equivalent to an observed source receipt.
 
 ## Checkpoints and remote durability
 

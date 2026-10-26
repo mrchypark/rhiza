@@ -3,8 +3,11 @@ package operator
 import (
 	"github.com/mrchypark/rhiza/pkg/network"
 	"github.com/mrchypark/rhiza/pkg/quepaxa"
+	"github.com/mrchypark/rhiza/pkg/recovery"
 	"github.com/mrchypark/rhiza/pkg/recoveryanchor"
 )
+
+const RecoveryModeFrozenSource = "frozen-source-v1"
 
 type Resource struct {
 	APIVersion string         `json:"apiVersion"`
@@ -20,11 +23,15 @@ type Spec struct {
 	SourceClusterID string `json:"sourceClusterID"`
 	// Durability is the NEW generation's mode. The immutable source record,
 	// not this desired setting, determines whether recovery can lose ACKs.
-	Durability           string `json:"durability"`
-	RecoveryID           string `json:"recoveryID,omitempty"`
-	AllowDataLoss        bool   `json:"allowDataLoss,omitempty"`
-	MaxArchiveAgeSeconds int64  `json:"maxArchiveAgeSeconds,omitempty"`
-	Fence                Fence  `json:"fence,omitempty"`
+	Durability    string `json:"durability"`
+	RecoveryID    string `json:"recoveryID,omitempty"`
+	AllowDataLoss bool   `json:"allowDataLoss,omitempty"`
+	// AllowMissingSourceMembership is a default-off manual recovery opt-in. It
+	// is accepted only when the canonical frozen-source fencer independently
+	// binds the complete live cohort to a closed CONTROL fence.
+	AllowMissingSourceMembership bool  `json:"allowMissingSourceMembership,omitempty"`
+	MaxArchiveAgeSeconds         int64 `json:"maxArchiveAgeSeconds,omitempty"`
+	Fence                        Fence `json:"fence,omitempty"`
 	// AnchorID opts this recovery into external anchor verification. When set,
 	// the workload must export RHIZA_RECOVERY_ANCHOR_ID matching this value.
 	AnchorID   string          `json:"anchorID,omitempty"`
@@ -69,22 +76,36 @@ type Fence struct {
 }
 
 type Status struct {
-	Phase              string                        `json:"phase"`
-	Message            string                        `json:"message"`
-	ObservedGeneration int64                         `json:"observedGeneration"`
-	Source             string                        `json:"source"`
-	Target             string                        `json:"target,omitempty"`
-	RecoveryID         string                        `json:"recoveryID,omitempty"`
-	SpecHash           string                        `json:"specHash,omitempty"`
-	StatefulSetUID     string                        `json:"statefulSetUID,omitempty"`
-	SourceDurability   string                        `json:"sourceDurability,omitempty"`
-	SourceMembership   string                        `json:"sourceMembership,omitempty"`
-	ManifestHash       string                        `json:"manifestHash,omitempty"`
-	RecoveredTip       uint64                        `json:"recoveredTip,omitempty"`
-	SecretName         string                        `json:"secretName,omitempty"`
-	Stage              string                        `json:"stage,omitempty"`
-	ArchiveCapture     string                        `json:"archiveCapture,omitempty"`
-	Peers              []network.VoterRecoveryStatus `json:"peers,omitempty"`
+	Phase              string `json:"phase"`
+	Message            string `json:"message"`
+	ObservedGeneration int64  `json:"observedGeneration"`
+	Source             string `json:"source"`
+	Target             string `json:"target,omitempty"`
+	// TargetBaseKind distinguishes an authorized empty recovery from a fork.
+	// Empty means tip zero was explicitly observed and authorized, not absent.
+	TargetBaseKind string `json:"targetBaseKind,omitempty"`
+	// FrozenEmptyGenesisPending selects the narrow headless-bootstrap check for
+	// a frozen recovery; it is persisted before the fencer preflight RPC.
+	FrozenEmptyGenesisPending bool `json:"frozenEmptyGenesisPending,omitempty"`
+	// RecoveryMode is selected before recovery side effects and is immutable for
+	// the operation. Empty preserves the legacy path for already-running entries.
+	RecoveryMode                  string                            `json:"recoveryMode,omitempty"`
+	FrozenBucketEnvironment       *recovery.FrozenBucketEnvironment `json:"frozenBucketEnvironment,omitempty"`
+	RecoveryID                    string                            `json:"recoveryID,omitempty"`
+	SpecHash                      string                            `json:"specHash,omitempty"`
+	ManualMembershipBindingDigest string                            `json:"manualMembershipBindingDigest,omitempty"`
+	ManualRecoveryChallenge       *ManualRecoveryChallenge          `json:"manualRecoveryChallenge,omitempty"`
+	ManualRecoveryChallengeDigest string                            `json:"manualRecoveryChallengeDigest,omitempty"`
+	ManualAttestationDigest       string                            `json:"manualAttestationDigest,omitempty"`
+	StatefulSetUID                string                            `json:"statefulSetUID,omitempty"`
+	SourceDurability              string                            `json:"sourceDurability,omitempty"`
+	SourceMembership              string                            `json:"sourceMembership,omitempty"`
+	ManifestHash                  string                            `json:"manifestHash,omitempty"`
+	RecoveredTip                  uint64                            `json:"recoveredTip,omitempty"`
+	SecretName                    string                            `json:"secretName,omitempty"`
+	Stage                         string                            `json:"stage,omitempty"`
+	ArchiveCapture                string                            `json:"archiveCapture,omitempty"`
+	Peers                         []network.VoterRecoveryStatus     `json:"peers,omitempty"`
 	// Automatic installation retains authenticated identities for a new incident
 	// even when a target voter fails before the parent adopts this generation.
 	// Missing observations never authorize single-voter fencing or invented WALs.

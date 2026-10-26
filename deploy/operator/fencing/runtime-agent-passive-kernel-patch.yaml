@@ -1,0 +1,21 @@
+# Explicit, test-namespace-only opt-in for passive kernel terminal proof.
+# Keep the base DaemonSet capability-free; this grants only SYS_PTRACE.
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: rhiza-runtime-agent
+  namespace: rhiza
+spec:
+  template:
+    metadata:
+      annotations:
+        rhiza.mrchypark.dev/runtime-proof-profile: passive-kernel-v1
+    spec:
+      containers:
+        - name: runtime-agent
+          securityContext:
+            privileged: false
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: [ALL]
+              add: [SYS_PTRACE]

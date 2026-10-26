@@ -13,6 +13,8 @@ import (
 	"os"
 	"strings"
 	"time"
+
+	"github.com/mrchypark/rhiza/pkg/fencing"
 )
 
 // ErrFencePending is returned when the fencing service accepts
@@ -64,15 +66,25 @@ const (
 const fenceTargetCapacity = 64
 
 type FenceRequest struct {
-	LogicalID       string        `json:"logicalID"`
-	BindingUID      string        `json:"bindingUID"`
-	Namespace       string        `json:"namespace"`
-	StatefulSet     string        `json:"statefulSet"`
-	StatefulSetUID  string        `json:"statefulSetUID"`
-	SourceClusterID string        `json:"sourceClusterID"`
-	OperationID     string        `json:"operationID"`
-	Scope           Scope         `json:"scope"`
-	Targets         []FenceTarget `json:"targets"`
+	LogicalID        string                   `json:"logicalID"`
+	BindingUID       string                   `json:"bindingUID"`
+	Namespace        string                   `json:"namespace"`
+	StatefulSet      string                   `json:"statefulSet"`
+	StatefulSetUID   string                   `json:"statefulSetUID"`
+	SourceClusterID  string                   `json:"sourceClusterID"`
+	OperationID      string                   `json:"operationID"`
+	Scope            Scope                    `json:"scope"`
+	Targets          []FenceTarget            `json:"targets"`
+	BootstrapGenesis *BootstrapGenesisBinding `json:"bootstrapGenesis,omitempty"`
+}
+
+// BootstrapGenesisBinding is present only for a fencer-authorized recovery of
+// an automatic bootstrap blocked on its first canonical HEAD mutation.
+type BootstrapGenesisBinding struct {
+	Version         int    `json:"version"`
+	CandidateDigest string `json:"candidateDigest"`
+	ClusterName     string `json:"clusterName"`
+	ClusterUID      string `json:"clusterUID"`
 }
 
 type FenceProof struct {
@@ -88,7 +100,19 @@ type FenceProof struct {
 	// this exact closed operation. It is additive: it never replaces the
 	// cooperative ledger, and the authority attaches it only after validating
 	// every binding against that ledger.
-	Independent *IndependentEvidence `json:"independent,omitempty"`
+	Independent   *IndependentEvidence   `json:"independent,omitempty"`
+	IndependentV2 *IndependentEvidenceV2 `json:"independentV2,omitempty"`
+}
+
+// IndependentEvidenceV2 refers to evidence verified and retained by the authority,
+// not stability observations supplied by a workload or external HTTP response.
+type IndependentEvidenceV2 struct {
+	Version        int                         `json:"version"`
+	RequestHash    string                      `json:"requestHash"`
+	LedgerHash     string                      `json:"ledgerHash"`
+	StorageScope   AttestationStoreScope       `json:"storageScope"`
+	CurrentPodUIDs []string                    `json:"currentPodUIDs"`
+	Terminals      []fencing.TerminalReference `json:"terminals"`
 }
 
 // independentEvidenceVersion is the only supported evidence schema.
@@ -236,6 +260,20 @@ type Fencer interface {
 	Fence(context.Context, FenceRequest) (*FenceProof, error)
 }
 
+// ArchiveForkGenesisRegistrar binds a verified successor fork to the
+// canonical archive authority. Cooperative backends may omit this capability;
+// configured HTTPS authorities implement it and fail closed if unsupported.
+type ArchiveForkGenesisRegistrar interface {
+	RegisterArchiveForkGenesis(context.Context, ArchiveForkGenesisRequest) error
+}
+
+// ArchiveEmptyRecoveryRegistrar authorizes or confirms a fresh empty target.
+// It reports committed only after the target's real archive genesis receipt is
+// canonical; authorized alone permits activation but never completion.
+type ArchiveEmptyRecoveryRegistrar interface {
+	RegisterArchiveEmptyRecovery(context.Context, ArchiveEmptyRecoveryRequest) (ArchiveEmptyRecoveryResponse, error)
+}
+
 // FencingClient is the HTTPS backend; it does not own recovery decisions.
 type FencingClient struct {
 	URL       string
@@ -243,7 +281,9 @@ type FencingClient struct {
 	Client    *http.Client
 }
 
-const maxResponseBytes = 64 * 1024
+// A 64-run v2 proof carries immutable references, not just three booleans.
+// Keep the bound finite while accommodating the complete supported cohort.
+const maxResponseBytes = 512 * 1024
 
 const maxFenceTimeout = 10 * time.Second
 
@@ -307,6 +347,15 @@ func validateRequest(req *FenceRequest) error {
 	}
 	if req.Scope != ScopeGeneration && req.Scope != ScopeVoter {
 		return fmt.Errorf("fencing: invalid scope %q", req.Scope)
+	}
+	if req.BootstrapGenesis != nil {
+		binding := req.BootstrapGenesis
+		if binding.Version != 1 || !validEvidenceDigest(binding.CandidateDigest) || binding.ClusterName == "" || len(binding.ClusterName) > 253 || binding.ClusterUID == "" || len(binding.ClusterUID) > 256 {
+			return fmt.Errorf("fencing: bootstrap genesis binding is invalid")
+		}
+		if req.Scope != ScopeGeneration || len(req.Targets) == 0 {
+			return fmt.Errorf("fencing: bootstrap genesis requires a generation-wide captured cohort")
+		}
 	}
 	return fenceCapacityError(len(req.Targets))
 }
@@ -388,6 +437,157 @@ func (fc *FencingClient) Fence(ctx context.Context, req FenceRequest) (*FencePro
 	return &proof, nil
 }
 
+// RegisterArchiveForkGenesis submits only the canonical identifiers. The
+// authority independently reads and verifies the fork evidence before binding
+// it; the controller never supplies a caller-asserted proof.
+func (fc *FencingClient) RegisterArchiveForkGenesis(ctx context.Context, request ArchiveForkGenesisRequest) error {
+	if err := validateURL(fc.URL); err != nil {
+		return err
+	}
+	if request.StatefulSetUID == "" || request.TargetClusterID == "" || request.OperationID == "" || request.SourceFenceOperationID == "" {
+		return fmt.Errorf("fencing: archive fork genesis identifiers are required")
+	}
+	if request.EvidenceKind == ManualTerminalEvidenceKind {
+		if request.RecoveryMode != RecoveryModeFrozenSource || request.ManualMembershipBindingDigest != "" ||
+			!validEvidenceDigest(request.ManualRecoveryChallengeDigest) || !validEvidenceDigest(request.ManualTerminalAttestationDigest) {
+			return fmt.Errorf("fencing: manual terminal archive fork bindings are incomplete")
+		}
+	} else if request.EvidenceKind != "" || request.ManualRecoveryChallengeDigest != "" || request.ManualTerminalAttestationDigest != "" {
+		return fmt.Errorf("fencing: archive fork carries an unsupported terminal evidence binding")
+	}
+	body, err := json.Marshal(request)
+	if err != nil {
+		return fmt.Errorf("fencing: marshal archive fork genesis request: %w", err)
+	}
+	endpoint, err := url.Parse(fc.URL)
+	if err != nil {
+		return fmt.Errorf("fencing: invalid endpoint")
+	}
+	endpoint.Path = "/v1/archive-genesis/fork/register"
+	endpoint.RawPath = ""
+	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint.String(), bytes.NewReader(body))
+	if err != nil {
+		return fmt.Errorf("fencing: build archive fork genesis request: %w", err)
+	}
+	httpReq.Header.Set("Content-Type", "application/json")
+	httpReq.Header.Set("Idempotency-Key", request.OperationID)
+	token, err := readToken(fc.TokenFile)
+	if err != nil {
+		return err
+	}
+	httpReq.Header.Set("Authorization", "Bearer "+token)
+	resp, err := cloneClient(fc.Client).Do(httpReq)
+	if err != nil {
+		return fmt.Errorf("fencing: archive fork genesis request failed")
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode == http.StatusAccepted {
+		return ErrFencePending
+	}
+	if resp.StatusCode != http.StatusOK {
+		return fmt.Errorf("fencing: archive fork genesis HTTP %d", resp.StatusCode)
+	}
+	responseBody, err := io.ReadAll(io.LimitReader(resp.Body, maxResponseBytes+1))
+	if err != nil {
+		return fmt.Errorf("fencing: read archive fork genesis response: %w", err)
+	}
+	if int64(len(responseBody)) > maxResponseBytes {
+		return fmt.Errorf("fencing: archive fork genesis response exceeds %d bytes", maxResponseBytes)
+	}
+	var result struct {
+		Profile           string `json:"profile"`
+		GenesisRegistered bool   `json:"genesisRegistered"`
+	}
+	decoder := json.NewDecoder(bytes.NewReader(responseBody))
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(&result); err != nil || decoder.Decode(new(any)) != io.EOF {
+		return fmt.Errorf("fencing: invalid archive fork genesis profile response")
+	}
+	switch {
+	case result.Profile == "independent" && result.GenesisRegistered:
+		return nil
+	case result.Profile == "cooperative" && !result.GenesisRegistered:
+		return nil
+	default:
+		return fmt.Errorf("fencing: archive fork genesis profile response is inconsistent")
+	}
+}
+
+// RegisterArchiveEmptyRecovery submits identifiers and the exact policy
+// snapshot. The authority reads the stored fence, source archive, and target
+// membership itself; the controller does not provide a caller-asserted proof.
+func (fc *FencingClient) RegisterArchiveEmptyRecovery(ctx context.Context, request ArchiveEmptyRecoveryRequest) (ArchiveEmptyRecoveryResponse, error) {
+	if err := validateURL(fc.URL); err != nil {
+		return ArchiveEmptyRecoveryResponse{}, err
+	}
+	if request.RecoveryName == "" || request.StatefulSetUID == "" || request.TargetClusterID == "" || request.OperationID == "" ||
+		request.SourceFenceOperationID == "" || !validEvidenceDigest(request.TargetMembershipHash) ||
+		(request.TargetDurability != "async" && request.TargetDurability != "before-ack") ||
+		!validEvidenceDigest(request.PolicyDigest) || request.SourceFenceOperationID == request.OperationID {
+		return ArchiveEmptyRecoveryResponse{}, fmt.Errorf("fencing: empty recovery request identity or policy is invalid")
+	}
+	body, err := json.Marshal(request)
+	if err != nil {
+		return ArchiveEmptyRecoveryResponse{}, fmt.Errorf("fencing: marshal empty recovery request: %w", err)
+	}
+	endpoint, err := url.Parse(fc.URL)
+	if err != nil {
+		return ArchiveEmptyRecoveryResponse{}, fmt.Errorf("fencing: invalid endpoint")
+	}
+	endpoint.Path = "/v1/archive-genesis/empty-recovery/register"
+	endpoint.RawPath = ""
+	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint.String(), bytes.NewReader(body))
+	if err != nil {
+		return ArchiveEmptyRecoveryResponse{}, fmt.Errorf("fencing: build empty recovery request: %w", err)
+	}
+	httpReq.Header.Set("Content-Type", "application/json")
+	httpReq.Header.Set("Idempotency-Key", request.OperationID)
+	token, err := readToken(fc.TokenFile)
+	if err != nil {
+		return ArchiveEmptyRecoveryResponse{}, err
+	}
+	httpReq.Header.Set("Authorization", "Bearer "+token)
+	resp, err := cloneClient(fc.Client).Do(httpReq)
+	if err != nil {
+		return ArchiveEmptyRecoveryResponse{}, fmt.Errorf("fencing: empty recovery request failed")
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode == http.StatusAccepted {
+		return ArchiveEmptyRecoveryResponse{}, ErrFencePending
+	}
+	if resp.StatusCode != http.StatusOK {
+		return ArchiveEmptyRecoveryResponse{}, fmt.Errorf("fencing: empty recovery HTTP %d", resp.StatusCode)
+	}
+	responseBody, err := io.ReadAll(io.LimitReader(resp.Body, maxResponseBytes+1))
+	if err != nil {
+		return ArchiveEmptyRecoveryResponse{}, fmt.Errorf("fencing: read empty recovery response: %w", err)
+	}
+	if int64(len(responseBody)) > maxResponseBytes {
+		return ArchiveEmptyRecoveryResponse{}, fmt.Errorf("fencing: empty recovery response exceeds %d bytes", maxResponseBytes)
+	}
+	var result ArchiveEmptyRecoveryResponse
+	decoder := json.NewDecoder(bytes.NewReader(responseBody))
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(&result); err != nil || decoder.Decode(new(any)) != io.EOF {
+		return ArchiveEmptyRecoveryResponse{}, fmt.Errorf("fencing: invalid empty recovery response")
+	}
+	if (result.State != fencing.EmptyRecoveryAuthorized && result.State != fencing.EmptyRecoveryCommitted) || result.Authorization.Validate() != nil {
+		return ArchiveEmptyRecoveryResponse{}, fmt.Errorf("fencing: empty recovery response is not a valid authorization")
+	}
+	authorization := result.Authorization
+	if authorization.StatefulSetUID != request.StatefulSetUID || authorization.TargetClusterID != request.TargetClusterID ||
+		authorization.OperationID != request.OperationID || authorization.SourceFenceOperationID != request.SourceFenceOperationID ||
+		authorization.TargetMembershipHash != request.TargetMembershipHash || authorization.TargetDurability != request.TargetDurability ||
+		authorization.AllowDataLoss != request.AllowDataLoss || authorization.PolicyDigest != emptyRecoveryPolicyDigest(request.PolicyDigest, authorization.SourceDurability, request.TargetDurability, request.AllowDataLoss) {
+		return ArchiveEmptyRecoveryResponse{}, fmt.Errorf("fencing: empty recovery authorization differs from request")
+	}
+	return result, nil
+}
+
+func emptyRecoveryPolicyDigest(specDigest, sourceDurability, targetDurability string, allowDataLoss bool) string {
+	return hashJSON([]any{"rhiza-empty-recovery-policy-v1", specDigest, sourceDurability, targetDurability, allowDataLoss})
+}
+
 // Validate independently of the backend before authorizing recovery effects.
 func validateFenceProof(req FenceRequest, proof *FenceProof) error {
 	if proof == nil {
@@ -414,6 +614,20 @@ func validateFenceProof(req FenceRequest, proof *FenceProof) error {
 	}
 	if !proof.ProcessesTerminated || !proof.RecreationBlocked || !proof.StorageQuiesced {
 		return fmt.Errorf("fencing: proof booleans incomplete")
+	}
+	if proof.Independent != nil {
+		return fmt.Errorf("fencing: quiet-window independent evidence v1 cannot authorize recovery")
+	}
+	if strings.HasPrefix(proof.ProofID, "independent-v2-") && proof.IndependentV2 == nil {
+		return fmt.Errorf("fencing: independent v2 evidence was omitted or pruned")
+	}
+	if proof.IndependentV2 != nil {
+		if proof.ProofID != "independent-v2-"+hashJSON(proof.IndependentV2) {
+			return fmt.Errorf("fencing: independent v2 proof identity differs from its evidence")
+		}
+		if err := validateIndependentV2(req, proof.IndependentV2); err != nil {
+			return err
+		}
 	}
 	return nil
 }

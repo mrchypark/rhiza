@@ -29,6 +29,28 @@ import (
 	"github.com/mrchypark/rhiza/pkg/qlog"
 	"github.com/mrchypark/rhiza/pkg/quepaxa"
 	"github.com/mrchypark/rhiza/pkg/recovery"
+	thanosobjstore "github.com/thanos-io/objstore"
+)
+
+type nodeObjectBucket interface {
+	thanosobjstore.Bucket
+	Stats() objectstore.Stats
+	DrainMutations(context.Context) error
+	Close() error
+}
+
+const (
+	nodeOpenPhaseConfiguration = "configuration"
+	nodeOpenPhaseFencing       = "fencing"
+	nodeOpenPhaseLocalState    = "local_state"
+	nodeOpenPhaseWAL           = "wal"
+	nodeOpenPhaseIdentityStore = "identity_storage"
+	nodeOpenPhaseArchive       = "archive"
+	nodeOpenPhaseMaterializer  = "materializer"
+	nodeOpenPhaseConsensus     = "consensus"
+	nodeOpenPhaseRecovery      = "recovery"
+	nodeOpenPhaseNetwork       = "network"
+	nodeOpenPhaseServices      = "services"
 )
 
 // Node is the main runtime container.
@@ -42,7 +64,8 @@ type Node struct {
 	catchUp                   *network.Transport
 	wal                       *qlog.WAL
 	lock                      *qlog.LockFile
-	bucket                    *objectstore.MeteredBucket
+	bucket                    nodeObjectBucket
+	protectedBucket           *fencedBucket
 	checkpoints               *checkpoint.Manager
 	archive                   *recovery.Manager
 	checkpointer              *checkpoint.AutoCheckpointer
@@ -51,6 +74,9 @@ type Node struct {
 	localRestoreSuffixPending bool
 	recoveryPhases            nodeRecoveryPhases
 	ready                     atomic.Bool
+	readyClusterMu            sync.RWMutex
+	readyCluster              *quepaxa.Cluster
+	fenceWriterActive         atomic.Bool
 	membershipMu              sync.Mutex
 	opened                    atomic.Bool
 	cancel                    context.CancelFunc
@@ -59,6 +85,12 @@ type Node struct {
 	replayMu                  sync.Mutex
 	compactionMu              sync.Mutex
 	catchUpWake               chan struct{}
+	archiveHintMu             sync.Mutex
+	archiveHintWake           chan struct{}
+	archiveHintLatest         quepaxa.TerminalGapKey
+	archiveHintPending        quepaxa.TerminalGapKey
+	archiveHintLastAttempted  quepaxa.TerminalGapKey
+	archiveStartupCheck       archiveStartupCheck
 	shutdownMu                sync.Mutex
 	terminalMu                sync.Mutex
 	terminalIdentity          network.TerminalDrainRequest
@@ -67,12 +99,18 @@ type Node struct {
 	terminalResult            TerminalDrainResult
 	terminalErr               error
 	fenceSession              *fencing.Session
+	authorityClient           *fencing.AuthorityClient
+	authorityGrant            fencing.StartupGrant
+	authorityIdentity         fencing.Identity
+	authorityPromotionReceipt *fencing.BindReceipt
+	recoveryWALIdentity       string
 }
 
 // nodeRecoveryPhases records the selected certified checkpoint restore path.
 // It is written synchronously during open and observed after Open returns.
 type nodeRecoveryPhases struct {
 	selectedCheckpoint               bool
+	haStageAdopted                   bool
 	checkpointIndex                  uint64
 	checkpointRootHash               [32]byte
 	checkpointDownloadVerify         time.Duration
@@ -131,6 +169,9 @@ func validateReadAdmissionConfig(config *types.ExecutionConfig) error {
 // validateVoterMembership mirrors Core's fixed-membership checks before
 // offline enrollment can write a remote registration.
 func validateVoterMembership(config *types.ExecutionConfig) error {
+	if config.EngineOwnedRemovals && (!config.EnableReconfiguration || config.Local || len(config.Members) < 2) {
+		return fmt.Errorf("engine-owned removals require multi-voter non-Local reconfiguration")
+	}
 	if config.EnableReconfiguration && (len(config.Members) < 2 || config.AdminToken == "") {
 		return fmt.Errorf("managed membership requires bootstrap voters and an admin token")
 	}
@@ -174,6 +215,12 @@ func (n *Node) EnrollExistingVoter(ctx context.Context) error {
 }
 
 func (n *Node) open(ctx context.Context, enroll bool) (err error) {
+	phase := nodeOpenPhaseConfiguration
+	defer func() {
+		if err != nil {
+			err = fmt.Errorf("node open phase %s: %w", phase, err)
+		}
+	}()
 	if n.terminalRequested.Load() {
 		return fmt.Errorf("terminally drained node cannot reopen")
 	}
@@ -185,13 +232,22 @@ func (n *Node) open(ctx context.Context, enroll bool) (err error) {
 	if n.opened.Load() {
 		return fmt.Errorf("node is already open")
 	}
-	if err := n.connectFenceSession(ctx); err != nil {
+	socket, ticket := os.Getenv("RHIZA_FENCE_SOCKET"), os.Getenv("RHIZA_FENCE_TICKET")
+	supervised := socket != "" || ticket != "" || n.config.AuthorityProfile != ""
+	if err := validateAuthorityProfile(n.config, socket, ticket); err != nil {
 		return err
+	}
+	directAuthority := n.config.AuthorityProfile == fencing.LogicalWriterProfileV1
+	if directAuthority && enroll {
+		return fmt.Errorf("fencing: logical authority does not support offline voter enrollment")
 	}
 	if n.config.Local && (enroll || len(n.config.Members) != 0 || n.config.Learner != nil || n.config.EnableReconfiguration ||
 		n.config.BindAddr != "" || n.config.PeerAddr != "" || n.config.PeerToken != "" || n.config.AdminToken != "" ||
 		n.config.ObjStoreProvider != "" || n.config.ObjStoreEndpoint != "" || n.config.ObjStoreBucket != "" || n.config.ObjStoreDir != "") {
 		return fmt.Errorf("local mode requires standalone local storage without listeners, membership, enrollment, or object storage")
+	}
+	if n.config.HAInitRestoreDir != "" && n.config.Local {
+		return fmt.Errorf("HA init restore staging is unavailable in Local mode")
 	}
 	if !n.config.Local {
 		if err := sqlpolicy.CheckExisting(ctx, n.config.DataDir+"/sqlite.db"); err != nil {
@@ -233,11 +289,17 @@ func (n *Node) open(ctx context.Context, enroll bool) (err error) {
 	if configErr != nil {
 		return configErr
 	}
+	if supervised && !objectStoreConfigured {
+		return fmt.Errorf("supervised fencing requires a shared decision archive")
+	}
 	if n.config.ObjStoreDurability == types.ObjectStoreDurabilityBeforeAck && !objectStoreConfigured {
 		return fmt.Errorf("before-ack durability requires object storage")
 	}
 	if len(n.config.Members) > 1 && !objectStoreConfigured {
 		return fmt.Errorf("multi-node clusters require shared object storage")
+	}
+	if n.config.HAInitRestoreDir != "" && !objectStoreConfigured {
+		return fmt.Errorf("HA init restore staging requires shared object storage")
 	}
 	if n.config.MaxWALBytes < 0 {
 		return fmt.Errorf("max WAL bytes must not be negative")
@@ -259,17 +321,92 @@ func (n *Node) open(ctx context.Context, enroll bool) (err error) {
 			_ = n.Shutdown()
 		}
 	}()
+	// Do not durably enroll a process until all pure configuration and
+	// admission checks have passed and failure cleanup is installed.
+	phase = nodeOpenPhaseFencing
+	if !directAuthority {
+		if err := n.connectFenceSession(ctx); err != nil {
+			return err
+		}
+		if n.fenceSession != nil {
+			if err := n.applyFenceStartupEnvironment(); err != nil {
+				return err
+			}
+		}
+		if n.fenceSession != nil && n.fenceSession.StartupRole() == fencing.StartupRoleLearnerPendingRemove &&
+			(n.config.Learner == nil || n.config.Learner.ID != n.config.NodeID || len(n.config.Members) < 2) {
+			return fmt.Errorf("fencing: pending-removal startup requires an explicit nonvoting learner configuration")
+		}
+	}
+	supervised = n.hasFencingAuthority()
 	ctx, n.cancel = context.WithCancel(ctx)
 
 	// 1. Acquire lock file
+	phase = nodeOpenPhaseLocalState
 	cleanStart, lock, err := qlog.Acquire(n.config.DataDir + "/qlog")
 	if err != nil {
 		return fmt.Errorf("acquire lock: %w", err)
 	}
 	n.lock = lock
 	localVoter, err := loadVoterIdentity(n.config)
+	localVoter, err = n.prepareEngineRepairLearnerBootstrap(localVoter, err)
+	if err == nil && localVoter.identity == nil && n.recoveryWALIdentity != "" {
+		err = validateVoterMembership(n.config)
+	}
 	if err != nil {
-		return err
+		return fmt.Errorf("load voter identity: %w", err)
+	}
+	haStageEligible := cleanStart && localVoter.identity == nil && !localVoter.hadWAL
+	if haStageEligible && n.config.HAInitRestoreDir != "" {
+		// Check freshness before logical registration writes logical-run.json
+		// and the source retry journal into DataDir. Those exact startup-owned
+		// files do not make a pristine staged restore stale, but pre-existing
+		// non-qlog state must still fail closed.
+		if err := validateHAStageOnlyQlog(n.config.DataDir); err != nil {
+			return fmt.Errorf("HA init restore requires a fresh DataDir: %w", err)
+		}
+	}
+	if directAuthority {
+		if err := n.connectFenceSession(ctx); err != nil {
+			return err
+		}
+		if err := n.applyAuthorityStartupEnvironment(); err != nil {
+			return err
+		}
+		supervised = n.hasFencingAuthority()
+		if n.authorityGrant.Role != fencing.StartupRoleVoterActive && n.authorityGrant.Role != fencing.StartupRoleLearnerPendingRemove {
+			return fmt.Errorf("fencing: unsupported direct logical startup role %q", n.authorityGrant.Role)
+		}
+		n.recoveryWALIdentity, err = logicalAssignedWALForStartup(n.authorityGrant, localVoter)
+		if err != nil {
+			return err
+		}
+		if n.authorityGrant.Role == fencing.StartupRoleLearnerPendingRemove && (n.config.Learner == nil || n.config.Learner.ID != n.config.NodeID || len(n.config.Members) < 2) {
+			return fmt.Errorf("fencing: pending logical startup requires authority-issued nonvoting learner configuration")
+		}
+	}
+	var haStageDir string
+	var haStageIndex *haRestoreStageIndex
+	if n.config.HAInitRestoreDir != "" {
+		haStageDir, err = resolveHAStagePath(n.config.DataDir, n.config.HAInitRestoreDir)
+		if err != nil {
+			return fmt.Errorf("resolve HA init restore stage: %w", err)
+		}
+		if haStageEligible {
+			var present bool
+			haStageIndex, present, err = readHAStageIndex(haStageDir)
+			if err != nil {
+				return fmt.Errorf("read HA init restore stage: %w", err)
+			}
+			if !present {
+				return fmt.Errorf("HA init restore stage is missing")
+			}
+			bootstrap := n.loadClusterConfig()
+			wantMembership := recovery.NewMembershipRecord(string(n.config.ClusterID), bootstrap.Members, string(n.config.ObjStoreDurability))
+			if haStageIndex.BootstrapMembership != wantMembership || haStageIndex.BootstrapConfigID != bootstrap.ConfigID {
+				return fmt.Errorf("HA init restore bootstrap membership differs from current configuration")
+			}
+		}
 	}
 	if n.config.Local && localVoter.identity != nil {
 		return fmt.Errorf("%w: registered voter cannot be reopened as standalone Local data", ErrVoterStateLost)
@@ -356,6 +493,7 @@ func (n *Node) open(ctx context.Context, enroll bool) (err error) {
 	}
 
 	// 2. Open WAL
+	phase = nodeOpenPhaseWAL
 	var wal *qlog.WAL
 	if n.config.Local {
 		wal, err = qlog.OpenLocalDeferredCleanup(n.config.DataDir + "/qlog")
@@ -376,12 +514,18 @@ func (n *Node) open(ctx context.Context, enroll bool) (err error) {
 		}
 	}
 	if objectStoreConfigured {
+		phase = nodeOpenPhaseIdentityStore
 		provider := objectstore.Provider(n.config.ObjStoreProvider)
 		if provider == "" {
 			provider = objectstore.ProviderS3
 		}
+		if n.hasFencingAuthority() && provider == objectstore.ProviderGCS {
+			if err := rejectSupervisedWriterCredentials(n.config); err != nil {
+				return err
+			}
+		}
 		newBucket := objectstore.NewBucketWithContext
-		if n.fenceSession != nil {
+		if n.hasFencingAuthority() {
 			newBucket = objectstore.NewBucketForSupervisedStartup
 		}
 		bucket, bucketErr := newBucket(ctx, objectstore.Config{
@@ -397,45 +541,58 @@ func (n *Node) open(ctx context.Context, enroll bool) (err error) {
 		if bucketErr != nil {
 			return fmt.Errorf("open object store: %w", bucketErr)
 		}
-		n.bucket = bucket
-		var beforeWrite []func(context.Context, string) error
-		if n.fenceSession != nil {
-			beforeWrite = append(beforeWrite, n.fenceSession.BindWAL)
+		var runtimeBucket nodeObjectBucket = bucket
+		if n.hasFencingAuthority() {
+			protected := &fencedBucket{MeteredBucket: bucket, prefix: path.Join(n.config.ObjStorePrefix, string(n.config.ClusterID))}
+			n.protectedBucket = protected
+			runtimeBucket = protected
 		}
-		if err := ensureVoterIdentity(ctx, n.config, bucket, n.wal, localVoter, enroll, beforeWrite...); err != nil {
-			return err
+		n.bucket = runtimeBucket
+		var beforeWrite []func(context.Context, string) error
+		var pendingIdentityWrite []func(context.Context, string, []byte) error
+		if n.hasFencingAuthority() {
+			beforeWrite = append(beforeWrite, n.bindFenceWAL)
+			if n.fenceSession != nil && n.fenceSession.StartupRole() == fencing.StartupRoleLearnerPendingRemove ||
+				n.authorityClient != nil && n.authorityGrant.Role == fencing.StartupRoleLearnerPendingRemove {
+				pendingIdentityWrite = append(pendingIdentityWrite, n.registerLearnerIdentity)
+			}
+		}
+		assignedRestart := n.fenceSession != nil && n.fenceSession.StartupRole() == fencing.StartupRoleVoterActive && n.fenceSession.Identity().AssignmentID != "" ||
+			n.authorityClient != nil && n.authorityGrant.Role == fencing.StartupRoleVoterActive && n.authorityIdentity.AssignmentID != ""
+		if err := ensureVoterIdentityWithHooks(ctx, n.config, runtimeBucket, n.wal, localVoter, enroll, beforeWrite, pendingIdentityWrite, assignedRestart, n.recoveryWALIdentity); err != nil {
+			return fmt.Errorf("ensure voter identity: %w", err)
 		}
 		if n.fenceSession != nil && n.fenceSession.Identity().WALIdentity == "" {
 			return fmt.Errorf("supervised fencing requires registered voter WAL identity")
 		}
+		if n.authorityClient != nil && n.authorityIdentity.WALIdentity == "" {
+			return fmt.Errorf("fencing: logical authority did not bind the voter WAL")
+		}
 		if enroll {
 			return n.Shutdown()
 		}
+		phase = nodeOpenPhaseArchive
 		clusterPrefix := path.Join(n.config.ObjStorePrefix, string(n.config.ClusterID))
-		n.checkpoints = checkpoint.NewManager(bucket, clusterPrefix, n.config.DataDir, 1)
+		n.checkpoints = checkpoint.NewManager(runtimeBucket, clusterPrefix, n.config.DataDir, 1)
 		if loadErr := n.checkpoints.Load(ctx); loadErr != nil {
 			return fmt.Errorf("load checkpoint manifest: %w", loadErr)
 		}
-		n.archive = recovery.NewManager(bucket, clusterPrefix, 1)
+		n.archive = recovery.NewManager(runtimeBucket, clusterPrefix, recovery.ArchiveConfigID)
 		n.archive.SetGroupDelay(n.config.ObjStoreBatchDelay)
 		if len(n.config.Members) > 1 && !n.archive.CASSupported() {
 			return fmt.Errorf("multi-node shared archive requires conditional object writes")
 		}
-		if loadErr := n.archive.Load(ctx); loadErr != nil {
-			if n.config.ObjStoreDurability == types.ObjectStoreDurabilityBeforeAck {
-				return fmt.Errorf("load shared decision archive: %w", loadErr)
-			}
-			log.Printf("shared archive unavailable during async startup: %v", loadErr)
-		}
-		if n.archive.Sealed() {
-			return recovery.ErrArchiveSealed
+		if err := loadNodeArchive(ctx, n.archive, n.config.ObjStoreDurability, supervised); err != nil {
+			return fmt.Errorf("load shared decision archive: %w", err)
 		}
 	}
+	phase = nodeOpenPhaseIdentityStore
 	if !objectStoreConfigured {
 		if err := ensureVoterIdentity(ctx, n.config, nil, n.wal, localVoter, enroll); err != nil {
 			return err
 		}
 	}
+	phase = nodeOpenPhaseRecovery
 	startupRecovery := &startupRecoveryGuard{ctx: ctx}
 	if n.checkpoints != nil {
 		owner, ownerErr := startupRecoveryOwner(string(n.config.NodeID))
@@ -454,6 +611,7 @@ func (n *Node) open(ctx context.Context, enroll bool) (err error) {
 		log.Println("non-clean start detected, recovering from WAL...")
 	}
 
+	phase = nodeOpenPhaseMaterializer
 	var material *materializer.Materializer
 	if localRestoreAuthority == nil {
 		material, err = materializer.Open(filepath.Join(n.config.DataDir, "sqlite.db"), 4)
@@ -479,6 +637,7 @@ func (n *Node) open(ctx context.Context, enroll bool) (err error) {
 	}
 
 	// 5. Create consensus core through the same public API available to external users.
+	phase = nodeOpenPhaseConsensus
 	cluster := n.loadClusterConfig()
 	var transport *network.Transport
 	var coreTransport quepaxa.Transport
@@ -505,13 +664,16 @@ func (n *Node) open(ctx context.Context, enroll bool) (err error) {
 	}
 	core, err := makeCore(quepaxa.Config{
 		NodeID: n.config.NodeID, Cluster: *cluster, WAL: wal, Transport: coreTransport, LocalMode: n.config.Local,
-		EnableReconfiguration:    n.config.EnableReconfiguration,
-		ReconfigurationAdmission: n.verifyMembershipAdmission,
+		EnableReconfiguration:            n.config.EnableReconfiguration,
+		EngineOwnedRemovals:              n.config.EngineOwnedRemovals,
+		ReconfigurationAdmission:         n.verifyMembershipAdmission,
+		ReconfigurationPrefixPublication: n.publishReconfigurationPrefix,
 	})
 	if err != nil {
 		return fmt.Errorf("create QuePaxa core: %w", err)
 	}
 	n.core = core
+	n.initArchiveCatchUpHints()
 	if n.config.Local {
 		recovered := core.CurrentCluster()
 		if len(recovered.Members) != 1 || recovered.Members[0].ID != n.config.NodeID {
@@ -568,9 +730,22 @@ func (n *Node) open(ctx context.Context, enroll bool) (err error) {
 	}
 	if n.checkpoints != nil {
 		core.SetCheckpointValidator(func(ctx context.Context, seal quepaxa.CheckpointSeal) error {
+			if haStageIndex != nil && haStageIndex.HasCheckpoint && uint64(seal.Index) == haStageIndex.Index &&
+				seal.RootHash == hashFromStage(haStageIndex.RootHash) {
+				root, err := n.checkpoints.OpenRoot(ctx, uint64(seal.Index), seal.RootHash)
+				if err != nil {
+					return err
+				}
+				if root.Hash != seal.StateHash || haStageIndex.StateHash != fmt.Sprintf("%x", seal.StateHash) {
+					return fmt.Errorf("HA init restore checkpoint state differs from certified seal")
+				}
+				_, err = verifyHAStagedFilesAgainstRoot(haStageDir, *haStageIndex, root)
+				return err
+			}
 			return n.checkpoints.Verify(ctx, uint64(seal.Index), seal.RootHash, seal.StateHash)
 		})
 	}
+	phase = nodeOpenPhaseRecovery
 	generationCheckpoint, err := n.installGenerationAnchor(startupRecovery)
 	if err != nil {
 		return fmt.Errorf("restore generation anchor: %w", startupRecovery.Check(err))
@@ -609,7 +784,12 @@ func (n *Node) open(ctx context.Context, enroll bool) (err error) {
 	}
 	// Record RPCs must be available while every replica is recovering. Public
 	// proposals and learned decisions remain gated by ready=false.
-	server := network.NewServer(core, material, n.config.ClusterID, true, transport, n.ready.Load)
+	server := network.NewServer(core, material, n.config.ClusterID, true, transport, n.apiReady)
+	n.installArchiveCatchUpHint(server, core)
+	if n.config.EnableReconfiguration || (n.config.EngineOwnedRemovals && n.config.Learner != nil && n.fenceSession != nil) {
+		server.SetPeerLearnReady(n.peerLearnReady)
+		server.SetPeerLearnDecisionAllowed(n.peerLearnDecisionAllowed)
+	}
 	server.SetTerminalDrain(func(ctx context.Context, expected network.TerminalDrainRequest) (any, error) {
 		return n.TerminalDrain(ctx, expected)
 	})
@@ -673,7 +853,7 @@ func (n *Node) open(ctx context.Context, enroll bool) (err error) {
 			NodeID:       string(n.config.NodeID),
 			ClusterID:    string(n.config.ClusterID),
 			Durability:   string(n.config.ObjStoreDurability),
-			Ready:        n.ready.Load(),
+			Ready:        n.apiReady(),
 			Quorum:       quorumErr == nil,
 			CertifiedTip: uint64(core.Tip()),
 			AppliedTip:   material.Tip(),
@@ -688,16 +868,9 @@ func (n *Node) open(ctx context.Context, enroll bool) (err error) {
 			return archive.SyncThrough(ctx, core, core.Tip())
 		})
 	}
-	if n.config.ObjStoreDurability == types.ObjectStoreDurabilityBeforeAck {
-		server.SetDurabilityBarrier(func(ctx context.Context, slot quepaxa.Slot) error {
-			if err := core.EnsureDurable(slot); err != nil {
-				return err
-			}
-			if err := n.archive.SyncThrough(ctx, core, slot); err != nil {
-				return err
-			}
-			return nil
-		})
+	phase = nodeOpenPhaseNetwork
+	if err := installArchiveDurabilityBarriers(server, core, n.archive, n.config.ObjStoreDurability, n.config.EnableReconfiguration, supervised); err != nil {
+		return err
 	}
 	n.server = server
 	server.SetCompactedHandler(n.wakeCatchUp)
@@ -712,6 +885,7 @@ func (n *Node) open(ctx context.Context, enroll bool) (err error) {
 	}
 	n.peer = peer
 
+	phase = nodeOpenPhaseRecovery
 	certifiedCheckpoint := generationCheckpoint
 	if n.checkpoints != nil {
 		seal, sealed, sealErr := core.LatestCheckpointSeal()
@@ -771,22 +945,40 @@ func (n *Node) open(ctx context.Context, enroll bool) (err error) {
 			n.recoveryPhases.selectedCheckpoint = true
 			n.recoveryPhases.checkpointIndex = certifiedCheckpoint.Index
 			n.recoveryPhases.checkpointRootHash = certifiedCheckpoint.RootHash
-			dir, fileErr := os.MkdirTemp(n.config.DataDir, ".rhiza-checkpoint-restore-*")
-			if fileErr != nil {
-				return fileErr
-			}
-			defer os.RemoveAll(dir)
-			n.recoveryPhases.checkpointDownloadVerifyStarted = true
-			downloadStarted := time.Now()
-			files, readErr := n.checkpoints.DownloadRootFiles(startupRecovery.Context(), certifiedCheckpoint.Index, certifiedCheckpoint.RootHash, dir)
-			n.recoveryPhases.checkpointDownloadVerify = time.Since(downloadStarted)
-			n.recoveryPhases.checkpointDownloadVerifyComplete = readErr == nil
-			if readErr != nil {
-				return readErr
-			}
-			materialFiles := make([]materializer.CheckpointFile, 0, len(files))
-			for _, file := range files {
-				materialFiles = append(materialFiles, materializer.CheckpointFile{Role: materializer.CheckpointRole(file.Role), Path: file.Path})
+			var materialFiles []materializer.CheckpointFile
+			if haStageIndex != nil && haStageIndex.HasCheckpoint && haStageIndex.Index == certifiedCheckpoint.Index &&
+				haStageIndex.RootHash == fmt.Sprintf("%x", certifiedCheckpoint.RootHash) &&
+				haStageEligible && haStageDir != "" {
+				prefix := path.Join(n.config.ObjStorePrefix, string(n.config.ClusterID))
+				archiveTip := n.archive.Tip()
+				if snapshot := startupRecovery.Snapshot(); snapshot != nil {
+					archiveTip = snapshot.Tip()
+				}
+				anchorHash := core.GenerationAnchorHash()
+				materialFiles, err = verifyHAStagedCheckpointFiles(haStageDir, *haStageIndex, prefix, recovery.ArchiveConfigID, 1,
+					certifiedCheckpoint, core, archiveTip, anchorHash)
+				if err != nil {
+					return fmt.Errorf("verify HA init restore stage against current history: %w", err)
+				}
+				n.recoveryPhases.haStageAdopted = true
+			} else {
+				dir, fileErr := os.MkdirTemp(n.config.DataDir, ".rhiza-checkpoint-restore-*")
+				if fileErr != nil {
+					return fileErr
+				}
+				defer os.RemoveAll(dir)
+				n.recoveryPhases.checkpointDownloadVerifyStarted = true
+				downloadStarted := time.Now()
+				files, readErr := n.checkpoints.DownloadRootFiles(startupRecovery.Context(), certifiedCheckpoint.Index, certifiedCheckpoint.RootHash, dir)
+				n.recoveryPhases.checkpointDownloadVerify = time.Since(downloadStarted)
+				n.recoveryPhases.checkpointDownloadVerifyComplete = readErr == nil
+				if readErr != nil {
+					return readErr
+				}
+				materialFiles = make([]materializer.CheckpointFile, 0, len(files))
+				for _, file := range files {
+					materialFiles = append(materialFiles, materializer.CheckpointFile{Role: materializer.CheckpointRole(file.Role), Path: file.Path})
+				}
 			}
 			n.recoveryPhases.materializerRestoreStarted = true
 			restoreStarted := time.Now()
@@ -796,6 +988,16 @@ func (n *Node) open(ctx context.Context, enroll bool) (err error) {
 			}
 			n.recoveryPhases.materializerRestore = time.Since(restoreStarted)
 			n.recoveryPhases.materializerRestoreComplete = true
+		}
+	}
+	if haStageIndex != nil && !haStageIndex.HasCheckpoint && haStageEligible {
+		prefix := path.Join(n.config.ObjStorePrefix, string(n.config.ClusterID))
+		archiveTip := n.archive.Tip()
+		if snapshot := startupRecovery.Snapshot(); snapshot != nil {
+			archiveTip = snapshot.Tip()
+		}
+		if err := verifyHAStagedHistoryOnly(*haStageIndex, prefix, recovery.ArchiveConfigID, 1, core, archiveTip, core.GenerationAnchorHash()); err != nil {
+			return fmt.Errorf("verify checkpointless HA init history against current archive: %w", err)
 		}
 	}
 
@@ -829,12 +1031,17 @@ func (n *Node) open(ctx context.Context, enroll bool) (err error) {
 			return fmt.Errorf("publish certified checkpoint: %w", err)
 		}
 	}
+	phase = nodeOpenPhaseServices
 	if n.config.Local {
 		if err := wal.FinalizeDeferredCleanup(); err != nil {
 			log.Printf("Local WAL committed-file cleanup deferred: %v", err)
 		}
 	}
-	if len(cluster.Members) == 1 {
+	currentCluster := core.CurrentCluster()
+	if n.maySkipCatchUp(currentCluster) {
+		if n.config.EnableReconfiguration {
+			n.rememberReadyCluster(&currentCluster)
+		}
 		n.ready.Store(true)
 	} else {
 		n.wg.Add(1)
@@ -847,33 +1054,7 @@ func (n *Node) open(ctx context.Context, enroll bool) (err error) {
 	// 8. Start periodic WAL sync
 	core.StartPeriodicSync(ctx, 1*time.Second)
 	if n.archive != nil {
-		interval := n.config.ObjStoreSyncInterval
-		if interval == 0 {
-			interval = time.Minute
-		}
-		n.wg.Add(1)
-		go func() {
-			defer n.wg.Done()
-			ticker := time.NewTicker(interval)
-			defer ticker.Stop()
-			for {
-				select {
-				case <-ctx.Done():
-					return
-				case <-ticker.C:
-					if n.config.EnableReconfiguration && !core.IsVoter() {
-						continue
-					}
-					if err := n.catchUpArchive(ctx); err != nil {
-						log.Printf("shared archive catch-up error: %v", err)
-					} else if err := n.archive.SyncThrough(ctx, core, core.Tip()); err != nil {
-						log.Printf("shared archive sync error: %v", err)
-					} else if err := n.compactCertifiedCheckpoint(ctx); err != nil {
-						log.Printf("certified checkpoint compaction skipped: %v", err)
-					}
-				}
-			}
-		}()
+		n.startArchiveWorker(ctx, core)
 	}
 	if n.checkpoints != nil {
 		interval := n.config.CheckpointInterval
@@ -1007,6 +1188,105 @@ func (n *Node) open(ctx context.Context, enroll bool) (err error) {
 		}()
 	}
 	n.startFenceWatcher(ctx)
+	n.startEngineRepairRunner(ctx)
+	return nil
+}
+
+func (n *Node) maySkipCatchUp(cluster quepaxa.Cluster) bool {
+	if len(cluster.Members) != 1 || (n.config.EngineOwnedRemovals && n.config.Learner != nil) {
+		return false
+	}
+	return !n.config.EnableReconfiguration || (n.core != nil && n.core.StartupCatchUpRoundEligible(cluster))
+}
+
+func (n *Node) registerLearnerIdentity(ctx context.Context, key string, data []byte) error {
+	if n.authorityClient != nil && n.authorityGrant.Role == fencing.StartupRoleLearnerPendingRemove {
+		if n.authorityIdentity.WALIdentity == "" {
+			return fmt.Errorf("fencing: logical learner identity registration precedes authority WAL binding")
+		}
+		return n.authorityClient.RegisterLearnerIdentity(ctx, n.authorityIdentity, fencing.LearnerIdentityRegistration{Key: key, Data: data})
+	}
+	if n.fenceSession == nil || n.fenceSession.StartupRole() != fencing.StartupRoleLearnerPendingRemove {
+		return fmt.Errorf("fencing: learner identity registration is unavailable")
+	}
+	return n.fenceSession.RegisterLearnerIdentity(ctx, key, data)
+}
+
+func voterReadDurabilityBarrier(isVoter func() bool, barrier func(context.Context, quepaxa.Slot) error) func(context.Context, quepaxa.Slot) error {
+	return func(ctx context.Context, slot quepaxa.Slot) error {
+		if !isVoter() {
+			return nil
+		}
+		return barrier(ctx, slot)
+	}
+}
+
+func loadNodeArchive(ctx context.Context, archive *recovery.Manager, durability types.ObjectStoreDurability, supervised bool) error {
+	if archive == nil {
+		if supervised || durability == types.ObjectStoreDurabilityBeforeAck {
+			return fmt.Errorf("shared decision archive is required")
+		}
+		return nil
+	}
+	if err := archive.Load(ctx); err != nil {
+		if supervised || durability == types.ObjectStoreDurabilityBeforeAck {
+			return fmt.Errorf("load shared decision archive: %w", err)
+		}
+		log.Printf("shared archive unavailable during async startup: %v", err)
+	}
+	if archive.Sealed() {
+		return recovery.ErrArchiveSealed
+	}
+	return nil
+}
+
+func installArchiveDurabilityBarriers(server *network.Server, core *quepaxa.Core, archive *recovery.Manager, durability types.ObjectStoreDurability, reconfiguration, supervised bool) error {
+	if archive == nil {
+		if supervised || durability == types.ObjectStoreDurabilityBeforeAck {
+			return fmt.Errorf("shared decision archive is required")
+		}
+		return nil
+	}
+	if !supervised && durability != types.ObjectStoreDurabilityBeforeAck {
+		return nil
+	}
+	barrier := func(ctx context.Context, slot quepaxa.Slot) error {
+		if supervised && durability == types.ObjectStoreDurabilityAsync {
+			if err := archive.Load(ctx); err != nil {
+				return err
+			}
+			if archive.Sealed() {
+				return recovery.ErrArchiveSealed
+			}
+			return nil
+		}
+		if slot == 0 {
+			if err := archive.Load(ctx); err != nil {
+				return err
+			}
+			if archive.Sealed() {
+				return recovery.ErrArchiveSealed
+			}
+			return nil
+		}
+		if err := core.EnsureDurable(slot); err != nil {
+			return err
+		}
+		return archive.SyncThrough(ctx, core, slot)
+	}
+	server.SetDurabilityBarrier(barrier)
+	if supervised {
+		server.SetReadDurabilityBarrier(barrier)
+	} else if durability == types.ObjectStoreDurabilityBeforeAck && reconfiguration {
+		server.SetReadDurabilityBarrier(voterReadDurabilityBarrier(core.IsVoter, barrier))
+	}
+	return nil
+}
+
+func rejectSupervisedWriterCredentials(config *types.ExecutionConfig) error {
+	if config.ObjStoreServiceAccount != "" || os.Getenv("GOOGLE_APPLICATION_CREDENTIALS") != "" {
+		return fmt.Errorf("supervised node must use its read-only workload identity; key-file credentials belong only to the fencer")
+	}
 	return nil
 }
 
@@ -1401,6 +1681,161 @@ func (n *Node) catchUpArchive(ctx context.Context) error {
 	return n.replayLocalDecisions(ctx)
 }
 
+func (n *Node) queueArchiveCatchUpHint(key quepaxa.TerminalGapKey) {
+	if key.ConfigID == 0 || key.Freeze == 0 || key.Terminal <= key.Freeze || key.FreezeHash == (quepaxa.ValueHash{}) {
+		return
+	}
+	n.archiveHintMu.Lock()
+	wake := n.archiveHintWake
+	if wake == nil || key == n.archiveHintLastAttempted || key == n.archiveHintPending {
+		n.archiveHintMu.Unlock()
+		return
+	}
+	if latest := n.archiveHintLatest; latest.Terminal != 0 && !newerArchiveCatchUpHint(key, latest) {
+		n.archiveHintMu.Unlock()
+		return
+	}
+	n.archiveHintLatest = key
+	n.archiveHintPending = key
+	n.archiveHintMu.Unlock()
+	select {
+	case wake <- struct{}{}:
+	default:
+	}
+}
+
+func (n *Node) initArchiveCatchUpHints() {
+	if n.archive == nil {
+		return
+	}
+	// Install the signal state before the peer listener can expose Learned.
+	// The one-slot channel coalesces concurrent hints without a retry queue.
+	n.archiveHintMu.Lock()
+	n.archiveHintWake = make(chan struct{}, 1)
+	n.archiveHintLatest = quepaxa.TerminalGapKey{}
+	n.archiveHintPending = quepaxa.TerminalGapKey{}
+	n.archiveHintLastAttempted = quepaxa.TerminalGapKey{}
+	n.archiveStartupCheck = archiveStartupCheck{}
+	n.archiveHintMu.Unlock()
+}
+
+func (n *Node) installArchiveCatchUpHint(server *network.Server, core *quepaxa.Core) {
+	if n.archive == nil || server == nil || core == nil {
+		return
+	}
+	server.SetArchiveCatchUpHint(func(key quepaxa.TerminalGapKey) {
+		if core.IsVoter() {
+			n.queueArchiveCatchUpHint(key)
+		}
+	})
+	server.SetArchiveCatchUpContinuation(func(ctx context.Context, key quepaxa.TerminalGapKey) error {
+		return n.catchUpArchivePrefix(ctx, core, key)
+	})
+}
+
+func newerArchiveCatchUpHint(candidate, current quepaxa.TerminalGapKey) bool {
+	if candidate.ConfigID < current.ConfigID || candidate.Terminal < current.Terminal {
+		return false
+	}
+	return candidate.ConfigID > current.ConfigID || candidate.Freeze > current.Freeze || candidate.Terminal > current.Terminal
+}
+
+func (n *Node) takeArchiveCatchUpHint() (quepaxa.TerminalGapKey, bool) {
+	n.archiveHintMu.Lock()
+	defer n.archiveHintMu.Unlock()
+	key := n.archiveHintPending
+	if key.Terminal == 0 {
+		return quepaxa.TerminalGapKey{}, false
+	}
+	n.archiveHintPending = quepaxa.TerminalGapKey{}
+	n.archiveHintLastAttempted = key
+	return key, true
+}
+
+func (n *Node) catchUpArchiveHint(ctx context.Context, key quepaxa.TerminalGapKey) error {
+	if n.archive == nil || n.core == nil || !n.core.IsVoter() || !n.core.PendingTerminalGap(key) {
+		return nil
+	}
+	if err := n.archive.LoadOnce(ctx); err != nil {
+		return err
+	}
+	if !n.core.PendingTerminalGap(key) {
+		return nil
+	}
+	archiveTip := n.archive.Tip()
+	if archiveTip < key.Terminal {
+		return nil
+	}
+	localTip := n.core.Tip()
+	if localTip >= key.Terminal {
+		return nil
+	}
+	if localTip < key.Freeze || key.Terminal-localTip > 16 {
+		return fmt.Errorf("pending archive terminal range is invalid")
+	}
+	values, readTip, err := n.archive.DecisionsFrom(ctx, localTip+1, int(key.Terminal-localTip))
+	if err != nil {
+		return err
+	}
+	count := int(key.Terminal - localTip)
+	if readTip < key.Terminal || len(values) != count {
+		return fmt.Errorf("shared archive omitted pending terminal range")
+	}
+	for i, value := range values {
+		if value.Slot != localTip+1+quepaxa.Slot(i) {
+			return fmt.Errorf("shared archive returned a non-contiguous pending terminal range")
+		}
+		if err := types.ValidateExecutionPolicy(value.Value); err != nil {
+			return err
+		}
+	}
+	if !n.core.PendingTerminalGap(key) {
+		return nil
+	}
+	return n.core.AcceptCertifiedValues(values)
+}
+
+func (n *Node) startArchiveWorker(ctx context.Context, core *quepaxa.Core) {
+	interval := n.config.ObjStoreSyncInterval
+	if interval == 0 {
+		interval = time.Minute
+	}
+	n.wg.Add(1)
+	go func() {
+		defer n.wg.Done()
+		ticker := time.NewTicker(interval)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-n.archiveHintWake:
+				if key, ok := n.takeArchiveCatchUpHint(); ok {
+					if err := n.catchUpArchiveHint(ctx, key); err != nil {
+						log.Printf("shared archive terminal catch-up deferred: %v", err)
+					}
+				}
+				if captured, ok := n.takeStartupArchiveCheck(); ok {
+					if err := n.catchUpStartupArchive(ctx, captured); err != nil {
+						log.Printf("shared archive startup catch-up deferred: %v", err)
+					}
+				}
+			case <-ticker.C:
+				if n.config.EnableReconfiguration && !core.IsVoter() {
+					continue
+				}
+				if err := n.catchUpArchive(ctx); err != nil {
+					log.Printf("shared archive catch-up error: %v", err)
+				} else if err := n.archive.SyncThrough(ctx, core, core.Tip()); err != nil {
+					log.Printf("shared archive sync error: %v", err)
+				} else if err := n.compactCertifiedCheckpoint(ctx); err != nil {
+					log.Printf("certified checkpoint compaction skipped: %v", err)
+				}
+			}
+		}
+	}()
+}
+
 func archiveRecoveryRequired(localTip, archiveBase quepaxa.Slot) bool {
 	return archiveBase != 0 && localTip < archiveBase
 }
@@ -1638,9 +2073,9 @@ func (n *Node) API() (*network.Server, error) {
 	return n.server, nil
 }
 
-// Ready reports whether local startup recovery and catch-up have completed.
-// It does not prove current quorum availability.
-func (n *Node) Ready() bool { return n.ready.Load() }
+// Ready reports public serving readiness, including supervised candidate
+// activation. It does not prove current quorum availability.
+func (n *Node) Ready() bool { return n.apiReady() }
 
 func quarantineSQLite(path string) error {
 	if _, err := os.Stat(path); os.IsNotExist(err) {
@@ -1698,8 +2133,33 @@ func (n *Node) catchUpMembership(ctx context.Context, transport *network.Transpo
 		cluster = &current
 	}
 	if n.config.Learner == nil || n.core.IsVoter() {
+		if n.config.EnableReconfiguration {
+			return n.catchUpStartupVoterQuorum(ctx, transport)
+		}
 		return n.catchUpQuorum(ctx, transport, cluster)
 	}
+	peerErr := n.catchUpLearnerPeers(ctx, transport, cluster)
+	if peerErr == nil || !n.config.EnableReconfiguration || n.archive == nil {
+		return peerErr
+	}
+	// A stale learner configuration can be rejected before the peer returns
+	// any decisions, so peer catch-up alone cannot reveal the transition. Read
+	// the existing certified archive once per worker pass, then retry against
+	// the configuration it authenticated and applied.
+	if err := n.catchUpArchive(ctx); err != nil {
+		return fmt.Errorf("refresh learner membership from shared archive: %w", err)
+	}
+	current := n.core.CurrentCluster()
+	if current.ConfigID == cluster.ConfigID {
+		return peerErr
+	}
+	if n.core.IsVoter() {
+		return n.catchUpQuorum(ctx, transport, &current)
+	}
+	return n.catchUpLearnerPeers(ctx, transport, &current)
+}
+
+func (n *Node) catchUpLearnerPeers(ctx context.Context, transport *network.Transport, cluster *quepaxa.Cluster) error {
 	var last error = quepaxa.ErrQuorumUnavailable
 	for _, member := range cluster.Members {
 		if member.ID == n.core.NodeID() {
@@ -1716,7 +2176,16 @@ func (n *Node) catchUpMembership(ctx context.Context, transport *network.Transpo
 }
 
 func (n *Node) startCatchUp(ctx context.Context, transport *network.Transport, cluster *quepaxa.Cluster) {
-	n.observeCatchUp(n.catchUpMembership(ctx, transport, cluster))
+	var initialCluster *quepaxa.Cluster
+	if n.config.EnableReconfiguration {
+		current := n.core.CurrentCluster()
+		cluster = &current
+		captured := cloneStartupCluster(current)
+		initialCluster = &captured
+	}
+	initialErr := n.catchUpMembership(ctx, transport, cluster)
+	n.observeCatchUpRound(initialErr, initialCluster)
+	n.queueInitialStartupArchiveCheck(initialErr)
 	var round uint64
 	for {
 		delay := syncInterval(n.config.NodeID, round)
@@ -1743,8 +2212,16 @@ func (n *Node) startCatchUp(ctx context.Context, transport *network.Transport, c
 			current := n.core.CurrentCluster()
 			cluster = &current
 		}
-		if !n.ready.Load() {
-			n.observeCatchUp(n.catchUpMembership(ctx, transport, cluster))
+		if n.ready.Load() && !n.readyForCurrentCluster() {
+			n.ready.Store(false)
+		}
+		if !n.apiReady() {
+			var captured *quepaxa.Cluster
+			if n.config.EnableReconfiguration {
+				current := cloneStartupCluster(*cluster)
+				captured = &current
+			}
+			n.observeCatchUpRound(n.catchUpMembership(ctx, transport, cluster), captured)
 		} else if sources := syncSources(n.config.NodeID, cluster.Members, round); len(sources) > 0 {
 			var syncErr error
 			for _, source := range sources {
@@ -1758,7 +2235,12 @@ func (n *Node) startCatchUp(ctx context.Context, transport *network.Transport, c
 			// A compacted peer can force checkpoint recovery from catchUpPeer.
 			// Only a fresh quorum round may make that node ready again.
 			if !n.ready.Load() {
-				n.observeCatchUp(n.catchUpMembership(ctx, transport, cluster))
+				var captured *quepaxa.Cluster
+				if n.config.EnableReconfiguration {
+					current := cloneStartupCluster(*cluster)
+					captured = &current
+				}
+				n.observeCatchUpRound(n.catchUpMembership(ctx, transport, cluster), captured)
 			}
 		}
 		round++
@@ -1804,13 +2286,114 @@ func syncSources(nodeID quepaxa.NodeID, members []quepaxa.Member, round uint64) 
 }
 
 func (n *Node) observeCatchUp(err error) {
+	n.observeCatchUpRound(err, nil)
+}
+
+func (n *Node) observeCatchUpRound(err error, captured *quepaxa.Cluster) {
 	if err != nil {
 		// A transient peer timeout must not make an already caught-up node
 		// reject traffic; quorum operations enforce their own availability.
 		log.Printf("quorum catch-up failed: %v", err)
 		return
 	}
+	if n.hasFencingAuthority() && n.core != nil && n.core.IsVoter() &&
+		((n.fenceSession != nil && n.fenceSession.StartupRole() == fencing.StartupRoleLearnerPendingRemove) || !n.fenceWriterActive.Load()) {
+		// The ADD may be locally applied before its canonical journal is durably
+		// acknowledged. Keep client writes unavailable until the authority changes
+		// the startup role and returns the active producer receipt.
+		n.ready.Store(false)
+		return
+	}
+	if n.config != nil && n.config.EnableReconfiguration && n.core != nil &&
+		(n.config.Learner == nil || n.core.IsVoter()) {
+		if captured == nil || !n.core.StartupCatchUpRoundEligible(*captured) {
+			n.ready.Store(false)
+			n.rememberReadyCluster(nil)
+			return
+		}
+		n.rememberReadyCluster(captured)
+	} else {
+		n.rememberReadyCluster(nil)
+	}
 	n.ready.Store(true)
+}
+
+func (n *Node) rememberReadyCluster(cluster *quepaxa.Cluster) {
+	n.readyClusterMu.Lock()
+	defer n.readyClusterMu.Unlock()
+	if cluster == nil || cluster.ConfigID == 0 {
+		n.readyCluster = nil
+		return
+	}
+	captured := cloneStartupCluster(*cluster)
+	n.readyCluster = &captured
+}
+
+func (n *Node) readyForCurrentCluster() bool {
+	if n == nil || n.config == nil || !n.config.EnableReconfiguration || n.core == nil ||
+		(n.config.Learner != nil && !n.core.IsVoter()) {
+		return true
+	}
+	n.readyClusterMu.RLock()
+	if n.readyCluster == nil {
+		n.readyClusterMu.RUnlock()
+		return false
+	}
+	captured := cloneStartupCluster(*n.readyCluster)
+	n.readyClusterMu.RUnlock()
+	return n.core.StartupCatchUpRoundEligible(captured)
+}
+
+func (n *Node) apiReady() bool {
+	if n == nil || !n.ready.Load() || !n.readyForCurrentCluster() || n.supervisedEngineRepairCandidatePending() || n.logicalPendingLearner() {
+		return false
+	}
+	if n.authorityClient != nil {
+		return n.authorityGrant.Role == fencing.StartupRoleVoterActive && n.fenceWriterActive.Load()
+	}
+	return n.fenceSession == nil || n.fenceSession.StartupRole() != fencing.StartupRoleVoterActive || n.fenceWriterActive.Load()
+}
+
+func (n *Node) logicalPendingLearner() bool {
+	return n != nil && n.authorityClient != nil && n.authorityGrant.Role == fencing.StartupRoleLearnerPendingRemove
+}
+
+func (n *Node) supervisedEngineRepairCandidatePending() bool {
+	return n != nil && n.config != nil && n.config.EngineOwnedRemovals && n.config.Learner != nil && n.fenceSession != nil &&
+		n.fenceSession.StartupRole() == fencing.StartupRoleLearnerPendingRemove
+}
+
+func (n *Node) peerLearnReady() bool {
+	if n == nil || n.terminalRequested.Load() {
+		return false
+	}
+	if n.supervisedEngineRepairCandidatePending() || n.logicalPendingLearner() {
+		return true
+	}
+	return n.apiReady()
+}
+
+func (n *Node) peerLearnDecisionAllowed(decision quepaxa.Decision) bool {
+	if n == nil || n.config == nil || n.core == nil || n.terminalRequested.Load() {
+		return false
+	}
+	if n.supervisedEngineRepairCandidatePending() || n.logicalPendingLearner() {
+		return true
+	}
+	if (n.authorityClient != nil && n.authorityGrant.Role == fencing.StartupRoleVoterActive ||
+		n.fenceSession != nil && n.fenceSession.StartupRole() == fencing.StartupRoleVoterActive) && !n.fenceWriterActive.Load() {
+		return false
+	}
+	if !n.opened.Load() {
+		return false
+	}
+	if n.core.AllowsInstalledTerminalLearn(decision) {
+		return true
+	}
+	if n.config.EnableReconfiguration && n.ready.Load() && n.core.AllowsNextReconfigurationFreeze(decision) {
+		return true
+	}
+	return n.config.EnableReconfiguration && n.core.AllowsPendingReconfigurationLearn(decision)
 }
 
 func hasUsablePeerSuffix(applied quepaxa.Slot, successes, quorum int, best *network.DecisionsResponse) bool {
@@ -1818,7 +2401,13 @@ func hasUsablePeerSuffix(applied quepaxa.Slot, successes, quorum int, best *netw
 }
 
 func (n *Node) catchUpQuorum(ctx context.Context, transport *network.Transport, cluster *quepaxa.Cluster) error {
+	startupRound := false
 	for {
+		if n.config.EnableReconfiguration && startupRound && !n.core.StartupCatchUpRoundEligible(*cluster) {
+			n.queueStartupTerminalGap()
+			return quepaxa.ErrQuorumUnavailable
+		}
+		startupRound = true
 		if err := n.replayLocalDecisions(ctx); err != nil {
 			return err
 		}
@@ -1906,6 +2495,10 @@ func (n *Node) catchUpQuorum(ctx context.Context, transport *network.Transport, 
 		}
 		if err := n.material.ApplyBatch(ctx, best.Decisions); err != nil {
 			return err
+		}
+		if n.config.EnableReconfiguration && !n.core.StartupCatchUpRoundEligible(*cluster) {
+			n.queueStartupTerminalGap()
+			return quepaxa.ErrQuorumUnavailable
 		}
 		if len(best.Decisions) == 0 {
 			return fmt.Errorf("catch-up source reported tip %d without slot %d", best.Tip, expected)
@@ -2033,6 +2626,9 @@ func (n *Node) shutdownEngine(closeBucket bool) error {
 	if n.bucket != nil && closeBucket {
 		shutdownErr = errors.Join(shutdownErr, n.bucket.Close())
 		n.bucket = nil
+	}
+	if n.authorityClient != nil && n.authorityClient.Client != nil {
+		n.authorityClient.Client.CloseIdleConnections()
 	}
 	return shutdownErr
 }

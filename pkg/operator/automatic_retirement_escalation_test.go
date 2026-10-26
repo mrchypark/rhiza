@@ -30,9 +30,11 @@ func newRetirementEscalationFixture(t *testing.T) *retirementEscalationFixture {
 	child.Spec.Container = "rhiza"
 	child.Spec.Membership.OperationID = "recover"
 	child.Spec.Membership.RemovedPod = "n3"
+	seedLegacyRemoveMembershipJournal(child)
 	api.learnerID = "learner"
 	api.membership["learner"] = network.MembershipStatus{NodeID: "learner", ClusterID: "source", WALIdentity: strings.Repeat("a", 64)}
 	api.membershipSecret["data"].(object)["member"] = base64.StdEncoding.EncodeToString(jsonBytes(voterMember("source", "learner", "new-token")))
+	asObject(api.membershipSecret["metadata"])["annotations"] = object{ownerAnnotation: "recover"}
 	if err := c.reconcileAll(ctx); err != nil {
 		t.Fatal(err)
 	}
@@ -63,6 +65,18 @@ func newRetirementEscalationFixture(t *testing.T) *retirementEscalationFixture {
 	}
 	proof.ProofID = child.Spec.Membership.Fence.Evidence
 	state.Intent = &autoIntent{Request: request, Proof: proof, Failed: "n3", Voters: append([]VoterPod(nil), state.Voters...), Durability: "before-ack", RecoveryName: "recover", RecoveryUID: "resource-uid", LearnerName: "learner", LearnerUID: "learner-uid", LearnerWAL: strings.Repeat("a", 64), LearnerMissingSince: time.Now().Add(-time.Minute), NoQuorumSince: time.Now().Add(-2 * time.Second), Policy: AutoPolicy{FailureGraceSeconds: 15}}
+	if err := rememberLearner(state, learnerIncarnation{
+		SourceClusterID: state.ActiveClusterID,
+		OperationID:     state.Intent.Request.OperationID,
+		CredentialName:  learnerCredentialName(state.Intent),
+		CredentialUID:   str(nested(api.membershipSecret, "metadata", "uid")),
+		Target: FenceTarget{
+			NodeID: state.Intent.LearnerName, Pod: learnerPhysicalPod(state.Intent),
+			PodUID: state.Intent.LearnerUID, WALIdentity: state.Intent.LearnerWAL,
+		},
+	}); err != nil {
+		t.Fatalf("persist production-equivalent standalone learner history: %v", err)
+	}
 	child.Metadata["annotations"] = object{automaticOwner: state.BindingUID, automaticLogical: r.Spec.LogicalID}
 	state.Intent.SpecHash = hashJSON(child.Spec)
 	for _, ref := range state.Voters {
@@ -186,6 +200,26 @@ func TestAutomaticRetirementEscalationPendingAddReachesAbortBeforeFence(t *testi
 	state = f.advance(t)
 	if state.Intent.LearnerAttempt != 1 || state.Intent.LearnerUID != "" || state.Intent.LearnerName == "learner" || !state.Intent.RetirementSince.Equal(retirementSince) {
 		t.Fatalf("verified proof did not rotate once or reset the incident budget: %+v", state.Intent)
+	}
+}
+
+func TestAutomaticRetirementEscalationDoesNotStopOnNextSameOrdinalUID(t *testing.T) {
+	f := newRetirementEscalationFixture(t)
+	state, version := f.load(t)
+	state.Intent.Aborting = true
+	state.Intent.RetirementSince = time.Now()
+	f.api.replacement = f.learnerPod
+	asObject(f.api.replacement["metadata"])["uid"] = "learner-u2-uid"
+	if err := f.c.saveAuto(t.Context(), f.r, state, version); err != nil {
+		t.Fatal(err)
+	}
+	state, version = f.load(t)
+	disposition, err := f.c.assessAutomaticEscalation(t.Context(), f.r, state, version, f.api.sts)
+	if err != nil {
+		t.Fatalf("assess exact learner retirement after next ordinal UID: %v", err)
+	}
+	if disposition == automaticEscalationStop || state.Intent.Request.Scope != ScopeVoter || state.Intent.LearnerUID != "learner-uid" {
+		t.Fatalf("next ordinal UID prevented propagation of the exact learner abort: disposition=%v intent=%+v", disposition, state.Intent)
 	}
 }
 

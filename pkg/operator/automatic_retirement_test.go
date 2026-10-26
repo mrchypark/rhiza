@@ -3,6 +3,7 @@ package operator
 import (
 	"bytes"
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -21,6 +22,19 @@ import (
 	"github.com/mrchypark/rhiza/pkg/quepaxa"
 )
 
+// seedLegacyRemoveMembershipJournal models status persisted by an older
+// operator before engine-owned ordinary replacement became the policy. The
+// current controller may drain this exact request, but must not invent it.
+func seedLegacyRemoveMembershipJournal(r *Resource) {
+	m := r.Spec.Membership
+	r.Status.Membership = &MembershipStatus{Phase: "Removing", RemoveRequest: &network.MembershipChange{
+		OperationID: membershipOperationID(r, "remove"), ClusterID: r.Spec.SourceClusterID,
+		ExpectedConfigID: 1, Remove: m.Remove,
+		Fence: &network.MembershipFence{NodeID: m.Fence.NodeID, WALIdentity: m.Fence.WALIdentity,
+			WorkloadUID: m.Fence.WorkloadUID, Confirmed: m.Fence.Confirmed, Evidence: m.Fence.Evidence},
+	}}
+}
+
 type retirementTransport func(*http.Request) (*http.Response, error)
 
 func (f retirementTransport) RoundTrip(r *http.Request) (*http.Response, error) { return f(r) }
@@ -34,28 +48,97 @@ func (f retirementFencer) Fence(ctx context.Context, r FenceRequest) (*FenceProo
 func TestLearnerRetirementReservesHandshakeWithoutSnapshotJournal(t *testing.T) {
 	r := autoClusterResource("cluster", "uid", "logical")
 	state := validAutoControl()
-	state.Intent = &autoIntent{RecoveryName: "replace", LearnerName: "replace-learner-0", LearnerUID: "learner-uid", LearnerWAL: strings.Repeat("a", 64), LearnerMissingSince: time.Now().Add(-time.Hour), Request: FenceRequest{LogicalID: "logical", BindingUID: "binding", Namespace: "default", StatefulSet: "rhiza", StatefulSetUID: "sts", SourceClusterID: "source", OperationID: "replace", Scope: ScopeVoter}}
+	request := FenceRequest{LogicalID: "logical", BindingUID: state.BindingUID, Namespace: "default", StatefulSet: "rhiza", StatefulSetUID: state.StatefulSetUID, SourceClusterID: "source", OperationID: "replace", Scope: ScopeVoter,
+		Targets: []FenceTarget{{NodeID: "n3", Pod: "rhiza-2", PodUID: "failed-uid", WALIdentity: "failed-wal"}}}
+	state.Intent = &autoIntent{RecoveryName: "replace", RecoveryUID: "recovery-uid", Failed: "n3", Voters: append([]VoterPod(nil), state.Voters...),
+		Durability: "before-ack", Proof: &FenceProof{ProofID: "fence-proof"}, LearnerName: "replace-learner-0", LearnerUID: "learner-uid",
+		LearnerPodName: "rhiza-2", LearnerSecretName: sameOrdinalSecretName(state.BindingUID, "learner-uid"), LearnerSecretUID: "learner-secret-uid",
+		LearnerSecretRV: "17", LearnerWAL: strings.Repeat("a", 64), LearnerMissingSince: time.Now().Add(-time.Hour), Request: request}
+	proofCalls := 0
+	proof, err := (&countingFencer{count: &proofCalls}).Fence(context.Background(), request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	proof.ProofID = "fence-proof"
+	state.Intent.Proof = proof
+	peerToken := "learner-peer-token"
+	member := voterMember("source", state.Intent.LearnerName, peerToken)
+	member.WALIdentity = state.Intent.LearnerWAL
+	secretData := object{
+		"member":           base64.StdEncoding.EncodeToString(jsonBytes(member)),
+		"RHIZA_PEER_TOKEN": base64.StdEncoding.EncodeToString([]byte(peerToken)),
+	}
+	state.Intent.LearnerSecretHash = hashJSON(secretData)
+	secret := object{
+		"immutable": true,
+		"metadata": object{
+			"name": state.Intent.LearnerSecretName, "uid": state.Intent.LearnerSecretUID, "resourceVersion": state.Intent.LearnerSecretRV,
+			"annotations": object{ownerAnnotation: state.Intent.Request.OperationID},
+		},
+		"data": secretData,
+	}
+	if err := rememberLearner(state, learnerIncarnation{
+		SourceClusterID: state.ActiveClusterID, OperationID: state.Intent.Request.OperationID,
+		CredentialName: state.Intent.LearnerSecretName, CredentialUID: state.Intent.LearnerSecretUID,
+		Target: FenceTarget{NodeID: state.Intent.LearnerName, Pod: learnerPhysicalPod(state.Intent), PodUID: state.Intent.LearnerUID, WALIdentity: state.Intent.LearnerWAL},
+	}); err != nil {
+		t.Fatalf("seed canonical learner credential history: %v", err)
+	}
+	c := autoController(autoBucket(t))
 	api := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		if req.Method == http.MethodGet && req.URL.Path == c.corePath("secrets", state.Intent.LearnerSecretName) {
+			_ = json.NewEncoder(w).Encode(secret)
+			return
+		}
 		if req.Method == http.MethodPut {
 			_ = json.NewEncoder(w).Encode(r)
 			return
 		}
 		http.NotFound(w, req)
 	}))
-	defer api.Close()
+	var closeAPIOne sync.Once
+	closeAPI := func() { closeAPIOne.Do(func() { api.Close() }) }
+	defer closeAPI()
 	count := 0
-	c := autoController(autoBucket(t))
 	c.Kube.BaseURL, c.Kube.Client = api.URL, api.Client()
 	c.Kube.TokenFile = filepath.Join(t.TempDir(), "token")
 	if err := os.WriteFile(c.Kube.TokenFile, []byte("token"), 0600); err != nil {
 		t.Fatal(err)
 	}
 	child := &Resource{} // Snapshot read before a delayed executor journals its add.
-	liveChild := &Resource{}
+	liveChild := &Resource{Metadata: object{"name": state.Intent.RecoveryName, "uid": state.Intent.RecoveryUID, "generation": float64(1),
+		"annotations": object{automaticOwner: state.BindingUID, automaticLogical: r.Spec.LogicalID}}}
+	liveChild.Spec = automaticRecoveryChildSpec(r, state, state.Intent)
+	state.Intent.SpecHash = hashJSON(liveChild.Spec)
+	assignment, err := sameOrdinalAssignmentDigest(state, state.Intent)
+	if err != nil {
+		t.Fatalf("build canonical learner assignment: %v", err)
+	}
+	state.Intent.LearnerAssignmentID = assignment
+	addRequest := network.MembershipChange{
+		OperationID: membershipOperationID(liveChild, "add"), ClusterID: state.ActiveClusterID,
+		ExpectedConfigID: 2, ExpectedAbortSlot: 0, Add: &member,
+	}
+	add := &MembershipAddJournal{
+		OperationID: addRequest.OperationID, ExpectedConfigID: addRequest.ExpectedConfigID, ExpectedAbortSlot: addRequest.ExpectedAbortSlot,
+		MemberID: member.ID, WALIdentity: member.WALIdentity, RequestHash: hashJSON(addRequest),
+		SecretUID: state.Intent.LearnerSecretUID, SecretResourceVer: state.Intent.LearnerSecretRV,
+	}
+	removeRequest := &network.MembershipChange{
+		OperationID: membershipOperationID(liveChild, "remove"), ClusterID: state.ActiveClusterID, ExpectedConfigID: 1,
+		Remove: liveChild.Spec.Membership.Remove,
+		Fence: &network.MembershipFence{
+			NodeID: liveChild.Spec.Membership.Fence.NodeID, WALIdentity: liveChild.Spec.Membership.Fence.WALIdentity,
+			WorkloadUID: liveChild.Spec.Membership.Fence.WorkloadUID, Confirmed: true, Evidence: liveChild.Spec.Membership.Fence.Evidence,
+		},
+	}
+	liveChild.Status.Membership = &MembershipStatus{Phase: "Adding", Add: add, RemoveRequest: removeRequest}
+	if matches, err := c.membershipAddMatchesIntent(context.Background(), liveChild, state, add, state.Intent); err != nil || !matches {
+		t.Fatalf("delayed ADD fixture is not bound to the current immutable credential and request: matches=%t err=%v", matches, err)
+	}
 	if _, err := c.handleAutomaticLearner(context.Background(), r, state, nil, nil, child); err != nil {
 		t.Fatal(err)
 	}
-	liveChild.Status.Membership = &MembershipStatus{Phase: "Adding", Add: &MembershipAddJournal{MemberID: "replace-learner-0"}}
 	if !state.Intent.Aborting || state.Intent.LearnerAttempt != 0 || state.Intent.LearnerName != "replace-learner-0" {
 		t.Fatalf("candidate changed before executor retirement acknowledgment: %+v", state.Intent)
 	}
@@ -65,24 +148,82 @@ func TestLearnerRetirementReservesHandshakeWithoutSnapshotJournal(t *testing.T) 
 	if count != 0 {
 		t.Fatal("physical fencing started before retirement was acknowledged")
 	}
-	liveChild.Status.Membership.Phase = "Aborted"
-	if handled, err := c.handleAutomaticLearner(context.Background(), r, state, nil, nil, liveChild); handled || err != nil || state.Intent.LearnerAttempt != 0 {
-		t.Fatalf("stale acknowledgment advanced the candidate: handled=%t err=%v", handled, err)
-	}
-	liveChild.Spec.Membership = &MembershipSpec{AbortAddition: true, ReplacementPod: state.Intent.LearnerName}
 	state, version, err := c.loadAuto(context.Background(), c.autoKey(r))
 	if err != nil {
 		t.Fatal(err)
 	}
+	state.Intent.PreviousSpecHash = state.Intent.SpecHash
+	liveChild.Spec = automaticRecoveryChildSpec(r, state, state.Intent)
 	state.Intent.SpecHash = hashJSON(liveChild.Spec)
+	assignment, err = sameOrdinalAssignmentDigest(state, state.Intent)
+	if err != nil {
+		t.Fatalf("update canonical learner assignment for abort revision: %v", err)
+	}
+	state.Intent.LearnerAssignmentID = assignment
+	liveChild.Metadata["generation"] = float64(2)
+	addBefore, removeBefore := hashJSON(liveChild.Status.Membership.Add), hashJSON(liveChild.Status.Membership.RemoveRequest)
+	acknowledgeCanonicalLearnerAbort(liveChild)
+	liveChild.Status.ObservedGeneration = 1
+	if hashJSON(liveChild.Status.Membership.Add) != addBefore || hashJSON(liveChild.Status.Membership.RemoveRequest) != removeBefore {
+		t.Fatal("abort acknowledgment helper changed the delayed ADD or REMOVE journal")
+	}
 	if err := c.saveAuto(context.Background(), r, state, version); err != nil {
 		t.Fatal(err)
+	}
+	if handled, err := c.handleAutomaticLearner(context.Background(), r, state, nil, nil, liveChild); handled || err != nil || state.Intent.LearnerAttempt != 0 || count != 0 {
+		t.Fatalf("stale acknowledgment advanced the candidate: handled=%t err=%v intent=%+v", handled, err, state.Intent)
+	}
+	if hashJSON(liveChild.Status.Membership.Add) != addBefore || hashJSON(liveChild.Status.Membership.RemoveRequest) != removeBefore {
+		t.Fatal("stale acknowledgment changed the delayed ADD or REMOVE journal")
+	}
+	acknowledgeCanonicalLearnerAbort(liveChild)
+	if hashJSON(liveChild.Status.Membership.Add) != addBefore || hashJSON(liveChild.Status.Membership.RemoveRequest) != removeBefore {
+		t.Fatal("current-generation acknowledgment changed the delayed ADD or REMOVE journal")
+	}
+	c.Fencer = &countingFencer{count: &count}
+	for _, tc := range []struct {
+		name   string
+		mutate func(*MembershipAddJournal)
+	}{
+		{name: "request hash", mutate: func(add *MembershipAddJournal) { add.RequestHash = strings.Repeat("f", 64) }},
+		{name: "secret UID", mutate: func(add *MembershipAddJournal) { add.SecretUID = "replacement-secret-uid" }},
+	} {
+		t.Run("reject changed "+tc.name, func(t *testing.T) {
+			candidate := *liveChild
+			membership := *liveChild.Status.Membership
+			add := *membership.Add
+			membership.Add = &add
+			candidate.Status = liveChild.Status
+			candidate.Status.Membership = &membership
+			tc.mutate(candidate.Status.Membership.Add)
+			stored, _, err := c.loadAuto(context.Background(), c.autoKey(r))
+			if err != nil {
+				t.Fatal(err)
+			}
+			handled, err := c.handleAutomaticLearner(context.Background(), r, stored, nil, nil, &candidate)
+			if !handled || err != nil || count != 0 {
+				t.Fatalf("changed delayed ADD was fenced: handled=%t fences=%d err=%v", handled, count, err)
+			}
+			unchanged, _, err := c.loadAuto(context.Background(), c.autoKey(r))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if unchanged.Intent.LearnerAttempt != 0 || unchanged.Intent.LearnerName != "replace-learner-0" || unchanged.Intent.LearnerUID != "learner-uid" {
+				t.Fatalf("invalid delayed ADD rotated the learner candidate: %+v", unchanged.Intent)
+			}
+		})
 	}
 	state, version, err = c.loadAuto(context.Background(), c.autoKey(r))
 	if err != nil {
 		t.Fatal(err)
 	}
+	retirementSinceBeforeRace := state.Intent.RetirementSince
+	if retirementSinceBeforeRace.IsZero() {
+		t.Fatal("incident retirement budget was not persisted before the race")
+	}
 	entered, release := make(chan struct{}), make(chan struct{})
+	var releaseOnce sync.Once
+	releaseFence := func() { releaseOnce.Do(func() { close(release) }) }
 	var fencedRequest FenceRequest
 	c.Fencer = retirementFencer(func(ctx context.Context, request FenceRequest) (*FenceProof, error) {
 		fencedRequest = request
@@ -90,18 +231,62 @@ func TestLearnerRetirementReservesHandshakeWithoutSnapshotJournal(t *testing.T) 
 		<-release
 		return (&countingFencer{count: &count}).Fence(ctx, request)
 	})
-	done := make(chan error, 1)
-	go func() {
-		_, err := c.handleAutomaticLearner(context.Background(), r, state, version, nil, liveChild)
-		done <- err
+	type handlerOutcome struct {
+		handled bool
+		err     error
+	}
+	done := make(chan handlerOutcome, 1)
+	handlerCtx, cancelHandler := context.WithCancel(context.Background())
+	handlerFinished := false
+	defer func() {
+		cancelHandler()
+		releaseFence()
+		if !handlerFinished {
+			select {
+			case <-done:
+			case <-time.After(2 * time.Second):
+				t.Errorf("retirement handler did not exit after test cleanup released the fencer")
+			}
+		}
 	}()
-	<-entered
+	go func() {
+		handled, err := c.handleAutomaticLearner(handlerCtx, r, state, version, nil, liveChild)
+		done <- handlerOutcome{handled: handled, err: err}
+	}()
+	select {
+	case <-entered:
+	case outcome := <-done:
+		handlerFinished = true
+		t.Fatalf("retirement handler returned before starting the fencer: handled=%t err=%v intent=%+v", outcome.handled, outcome.err, state.Intent)
+	case <-time.After(5 * time.Second):
+		cancelHandler()
+		releaseFence()
+		closeAPI()
+		select {
+		case outcome := <-done:
+			handlerFinished = true
+			t.Fatalf("timed out waiting for retirement fencer; handler returned after cancellation: handled=%t err=%v intent=%+v", outcome.handled, outcome.err, state.Intent)
+		case <-time.After(2 * time.Second):
+			t.Fatal("timed out waiting for retirement fencer; handler did not exit after cancellation and fencer release")
+		}
+	}
+	waitHandler := func() (handlerOutcome, bool) {
+		select {
+		case outcome := <-done:
+			handlerFinished = true
+			return outcome, true
+		case <-time.After(5 * time.Second):
+			return handlerOutcome{}, false
+		}
+	}
 	// Another reconciler can finish this exact retirement while the old call is
 	// paused. Its CAS must prevent the delayed proof from rotating a second time.
 	current, currentVersion, err := c.loadAuto(context.Background(), c.autoKey(r))
 	if err != nil {
-		close(release)
-		<-done
+		releaseFence()
+		if _, ok := waitHandler(); !ok {
+			t.Errorf("retirement handler did not finish after releasing its fencer")
+		}
 		t.Fatal(err)
 	}
 	current.Intent.Aborting = false
@@ -109,16 +294,23 @@ func TestLearnerRetirementReservesHandshakeWithoutSnapshotJournal(t *testing.T) 
 	current.Intent.LearnerName = "replace-learner-1"
 	current.Intent.LearnerUID, current.Intent.LearnerWAL = "", ""
 	if err := c.saveAuto(context.Background(), r, current, currentVersion); err != nil {
-		close(release)
-		<-done
+		releaseFence()
+		if _, ok := waitHandler(); !ok {
+			t.Errorf("retirement handler did not finish after releasing its fencer")
+		}
 		t.Fatal(err)
 	}
-	close(release)
-	if err := <-done; !c.Bucket.IsConditionNotMetErr(err) {
-		t.Fatalf("stale post-fence CAS was accepted: %v", err)
+	releaseFence()
+	outcome, ok := waitHandler()
+	if !ok {
+		t.Fatal("retirement handler did not finish after releasing its fencer")
 	}
-	if count != 1 || len(fencedRequest.Targets) != 1 || fencedRequest.Targets[0].PodUID != "learner-uid" || fencedRequest.Targets[0].NodeID != "replace-learner-0" {
-		t.Fatalf("delayed fence escaped its retired incarnation: %+v", fencedRequest)
+	if !c.Bucket.IsConditionNotMetErr(outcome.err) {
+		t.Fatalf("stale post-fence CAS was accepted: %v", outcome.err)
+	}
+	wantFenceTarget := FenceTarget{NodeID: "replace-learner-0", Pod: "rhiza-2", PodUID: "learner-uid", WALIdentity: strings.Repeat("a", 64)}
+	if count != 1 || len(fencedRequest.Targets) != 1 || fencedRequest.Targets[0] != wantFenceTarget {
+		t.Fatalf("delayed fence escaped its retired incarnation: count=%d target=%+v want=%+v", count, fencedRequest.Targets, wantFenceTarget)
 	}
 	current, _, err = c.loadAuto(context.Background(), c.autoKey(r))
 	if err != nil {
@@ -127,24 +319,31 @@ func TestLearnerRetirementReservesHandshakeWithoutSnapshotJournal(t *testing.T) 
 	if current.Intent.LearnerAttempt != 1 || current.Intent.LearnerName != "replace-learner-1" {
 		t.Fatalf("stale fence changed the next candidate: %+v", current.Intent)
 	}
-	if current.Intent.RetirementSince.IsZero() {
-		t.Fatal("incident retirement budget was lost")
+	if !current.Intent.RetirementSince.Equal(retirementSinceBeforeRace) {
+		t.Fatalf("incident retirement budget changed across the race: before=%s after=%s", retirementSinceBeforeRace, current.Intent.RetirementSince)
 	}
 }
 
-func TestMembershipRetirementAcknowledgesNeverJournaledAddition(t *testing.T) {
+func TestMembershipRetirementBlocksNeverJournaledAddition(t *testing.T) {
 	ctx, r, api, c := membershipFixture(t)
 	r.Spec.Membership.AbortAddition = true
 	if err := c.reconcileAll(ctx); err != nil {
 		t.Fatal(err)
 	}
-	if r.Status.Membership == nil || r.Status.Membership.Phase != "Aborted" || len(api.changes) != 0 || len(api.aborts) != 0 {
-		t.Fatalf("never dispatched candidate did not retire: %+v", r.Status)
+	if r.Status.Phase != "Blocked" || !strings.Contains(r.Status.Message, "new operator-managed membership changes are disabled") {
+		t.Fatalf("never-journaled request was not rejected by the engine-owned policy: phase=%q message=%q", r.Status.Phase, r.Status.Message)
+	}
+	if r.Status.Membership != nil || len(api.changes) != 0 || len(api.aborts) != 0 || api.stsPuts != 0 {
+		t.Fatalf("never-journaled request created or mutated a membership operation: status=%+v changes=%d aborts=%d StatefulSetPuts=%d", r.Status.Membership, len(api.changes), len(api.aborts), api.stsPuts)
 	}
 }
 
 func TestMembershipRetirementRecognizesCommittedAdditionAfterLearnerLoss(t *testing.T) {
 	ctx, r, api, c := membershipFixture(t)
+	// This test covers a removal request journaled by the previous operator
+	// policy and then resumed by the current controller. New requests without
+	// persisted status are separately required to block above.
+	seedLegacyRemoveMembershipJournal(r)
 	if err := c.reconcileAll(ctx); err != nil {
 		t.Fatal(err)
 	}
@@ -175,8 +374,12 @@ func TestMembershipRetirementRecognizesCommittedAdditionAfterLearnerLoss(t *test
 
 func TestMembershipRetirementRejectsDelayedJournalAfterAcknowledgment(t *testing.T) {
 	ctx, r, api, c := membershipFixture(t)
+	seedLegacyRemoveMembershipJournal(r)
 	if err := c.reconcileAll(ctx); err != nil {
 		t.Fatal(err)
+	}
+	if len(api.changes) != 1 || api.changes[0].Remove != "n3" || api.changes[0].Add != nil {
+		t.Fatalf("legacy setup did not dispatch only the journaled REMOVE: %+v", api.changes)
 	}
 	api.membership["n1"] = membershipStatus("n1", 2, "n1", "n2")
 	api.membership["n2"] = membershipStatus("n2", 2, "n1", "n2")
@@ -200,6 +403,12 @@ func TestMembershipRetirementRejectsDelayedJournalAfterAcknowledgment(t *testing
 	var mu sync.Mutex
 	current := "2" // The automatic parent has submitted its retirement revision.
 	casAPI := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		if req.URL.Path == c.resourcePath(resourceName(r)) && req.Method == http.MethodGet {
+			mu.Lock()
+			defer mu.Unlock()
+			_ = json.NewEncoder(w).Encode(r)
+			return
+		}
 		if strings.HasSuffix(req.URL.Path, "/recover/status") && req.Method == http.MethodPut {
 			mu.Lock()
 			defer mu.Unlock()
@@ -238,13 +447,18 @@ func TestMembershipRetirementRejectsDelayedJournalAfterAcknowledgment(t *testing
 	if !errors.As(err, &conflict) || conflict.StatusCode != http.StatusConflict {
 		t.Fatalf("stale journal write error=%v", err)
 	}
-	if r.Status.Membership.Phase != "Aborted" || r.Status.Membership.Add != nil || len(api.changes) != 0 {
+	if r.Status.Membership.Phase != "Aborted" || r.Status.Membership.Add != nil || len(api.changes) != 1 {
 		t.Fatalf("delayed executor reopened retired candidate: %+v changes=%d", r.Status, len(api.changes))
 	}
 }
 
 func TestMembershipRetirementReplaysJournalBeforeFirstDispatch(t *testing.T) {
 	ctx, r, api, c := membershipFixture(t)
+	seedLegacyRemoveMembershipJournal(r)
+	var seededRemove network.MembershipChange
+	if err := json.Unmarshal(jsonBytes(r.Status.Membership.RemoveRequest), &seededRemove); err != nil {
+		t.Fatal(err)
+	}
 	if err := c.reconcileAll(ctx); err != nil {
 		t.Fatal(err)
 	}
@@ -264,7 +478,8 @@ func TestMembershipRetirementReplaysJournalBeforeFirstDispatch(t *testing.T) {
 	if err := c.reconcileAll(ctx); err != nil {
 		t.Fatal(err)
 	}
-	if r.Status.Phase != "Aborting" || len(api.changes) != 1 || hashJSON(api.changes[0]) != requestHash {
+	if r.Status.Phase != "Aborting" || len(api.changes) != 3 || api.changes[0].Remove != "n3" || api.changes[0].Add != nil || api.changes[0].ExpectedConfigID != 1 ||
+		!sameJSON(api.changes[0], seededRemove) || !sameJSON(api.changes[1], seededRemove) || api.changes[2].ExpectedConfigID != 2 || hashJSON(api.changes[2]) != requestHash {
 		t.Fatalf("journaled request was not replayed verbatim: %+v changes=%+v", r.Status, api.changes)
 	}
 	c.HTTP = nil
@@ -278,6 +493,7 @@ func TestMembershipRetirementReplaysJournalBeforeFirstDispatch(t *testing.T) {
 
 func TestMembershipRetirementDelayedDispatchCannotEscapeAbortedRound(t *testing.T) {
 	ctx, r, api, c := membershipFixture(t)
+	seedLegacyRemoveMembershipJournal(r)
 	if err := c.reconcileAll(ctx); err != nil {
 		t.Fatal(err)
 	}
@@ -369,6 +585,11 @@ func TestMembershipRetirementCommittedEvidenceFailsClosed(t *testing.T) {
 	for _, scenario := range []string{"missing-operation", "changed-operation-target", "changed-request", "changed-secret", "wrong-wal", "pending-survivor", "abort-revision", "unexpected-voter"} {
 		t.Run(scenario, func(t *testing.T) {
 			ctx, r, api, c := membershipFixture(t)
+			seedLegacyRemoveMembershipJournal(r)
+			var seededRemove network.MembershipChange
+			if err := json.Unmarshal(jsonBytes(r.Status.Membership.RemoveRequest), &seededRemove); err != nil {
+				t.Fatal(err)
+			}
 			if err := c.reconcileAll(ctx); err != nil {
 				t.Fatal(err)
 			}
@@ -377,6 +598,11 @@ func TestMembershipRetirementCommittedEvidenceFailsClosed(t *testing.T) {
 			if err := c.reconcileAll(ctx); err != nil {
 				t.Fatal(err)
 			}
+			if len(api.changes) != 2 || api.changes[0].Remove != "n3" || api.changes[0].Add != nil ||
+				!sameJSON(api.changes[0], seededRemove) || !sameJSON(api.changes[1], seededRemove) {
+				t.Fatalf("valid replacement setup did not acknowledge only the removal: %+v", api.changes)
+			}
+			acknowledgedChanges := len(api.changes)
 			if scenario != "missing-operation" {
 				if err := writeRetirementOperation(ctx, c, r); err != nil {
 					t.Fatal(err)
@@ -432,7 +658,7 @@ func TestMembershipRetirementCommittedEvidenceFailsClosed(t *testing.T) {
 			if err := c.reconcileAll(ctx); err != nil {
 				t.Fatal(err)
 			}
-			if r.Status.Phase != "Blocked" || r.Status.Membership.Add == nil || len(api.changes) != 0 || len(api.aborts) != 0 {
+			if r.Status.Phase != "Blocked" || r.Status.Membership.Add == nil || len(api.changes) != acknowledgedChanges || len(api.aborts) != 0 {
 				t.Fatalf("unproven commit accepted: %+v", r.Status)
 			}
 		})
@@ -441,6 +667,7 @@ func TestMembershipRetirementCommittedEvidenceFailsClosed(t *testing.T) {
 
 func TestMembershipRetirementRestartKeepsRoundUntilAbortRevisionObserved(t *testing.T) {
 	ctx, r, api, c := membershipFixture(t)
+	seedLegacyRemoveMembershipJournal(r)
 	if err := c.reconcileAll(ctx); err != nil {
 		t.Fatal(err)
 	}

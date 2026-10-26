@@ -1,9 +1,186 @@
 package fencing
 
-import "testing"
+import (
+	"strings"
+	"testing"
+)
 
 func testIdentity() Identity {
 	return Identity{SourceClusterID: "source", NodeID: "n1", PodUID: "pod-uid", RunID: "run-1"}
+}
+
+func TestStartupGrantRoleIsAuthorityOwnedAndPhysicalPodBound(t *testing.T) {
+	request := testIdentity()
+	request.NodeID = "physical-ordinal-0"
+	request.PodName = request.NodeID
+	grant := StartupGrant{Identity: request, Role: StartupRoleLearnerPendingRemove}
+	if err := grant.Validate(request); err != nil {
+		t.Fatal(err)
+	}
+	grant.Role = StartupRole("voter-active")
+	grant.Identity.NodeID = "replacement-logical-id"
+	if err := grant.Validate(request); err == nil {
+		t.Fatal("active voter grant changed logical identity away from physical Pod")
+	}
+	grant.Role = StartupRoleLearnerPendingRemove
+	grant.Identity.PodName = "another-pod"
+	if err := grant.Validate(request); err == nil {
+		t.Fatal("learner grant escaped authenticated physical Pod binding")
+	}
+}
+
+func TestStartupGrantAllowsOnlyBoundPendingLogicalAssignment(t *testing.T) {
+	request := testIdentity()
+	request.PodName = "rhiza-2"
+	grant := StartupGrant{Identity: request, Role: StartupRoleLearnerPendingRemove}
+	grant.Identity.NodeID = "logical-incarnation-7f3a"
+	grant.Identity.AssignmentID = strings.Repeat("a", 64)
+	grant.Environment = map[string]string{"RHIZA_NODE_ID": grant.Identity.NodeID, "RHIZA_LEARNER": `{"id":"logical-incarnation-7f3a"}`, "RHIZA_PEER_TOKEN": "private-token", "RHIZA_PEER_TOKENS": ""}
+	if err := grant.Validate(request); err != nil {
+		t.Fatal(err)
+	}
+	for name, mutate := range map[string]func(*StartupGrant){
+		"changed physical Pod":    func(g *StartupGrant) { g.Identity.PodName = "rhiza-3" },
+		"missing assignment":      func(g *StartupGrant) { g.Identity.AssignmentID = "" },
+		"unsupported environment": func(g *StartupGrant) { g.Environment["RHIZA_ADMIN_TOKEN"] = "secret" },
+		"learner role omitted":    func(g *StartupGrant) { delete(g.Environment, "RHIZA_LEARNER") },
+	} {
+		t.Run(name, func(t *testing.T) {
+			candidate := grant
+			candidate.Environment = make(map[string]string, len(grant.Environment))
+			for key, value := range grant.Environment {
+				candidate.Environment[key] = value
+			}
+			mutate(&candidate)
+			if err := candidate.Validate(request); err == nil {
+				t.Fatal("invalid logical assignment accepted")
+			}
+		})
+	}
+	active := grant
+	active.Role = StartupRoleVoterActive
+	active.Environment = map[string]string{
+		"RHIZA_NODE_ID":         active.Identity.NodeID,
+		"RHIZA_LEARNER":         "",
+		"RHIZA_PEER_TOKEN":      "private-token",
+		"RHIZA_PEER_TOKENS":     "",
+		"RHIZA_CLUSTER_MEMBERS": "[{\"id\":\"existing-voter\"},{\"id\":\"logical-incarnation-7f3a\"}]",
+	}
+	if err := active.Validate(request); err != nil {
+		t.Fatalf("authority-issued assigned identity could not restart as active after canonical completion: %v", err)
+	}
+	active.Environment["RHIZA_LEARNER"] = "{\"id\":\"logical-incarnation-7f3a\"}"
+	if err := active.Validate(request); err == nil {
+		t.Fatal("active assigned restart retained learner mode")
+	}
+}
+
+func TestStartupGrantAllowsOnlyStaticActiveMembershipEnvironment(t *testing.T) {
+	request := testIdentity()
+	request.NodeID = "rhiza-0"
+	request.PodName = request.NodeID
+	grant := StartupGrant{
+		Identity: request,
+		Role:     StartupRoleVoterActive,
+		Environment: map[string]string{
+			"RHIZA_CLUSTER_MEMBERS": `[{"id":"rhiza-0"},{"id":"rhiza-1"}]`,
+			"RHIZA_PEER_TOKEN":      "private-peer-token",
+		},
+	}
+	if err := grant.Validate(request); err != nil {
+		t.Fatalf("valid authority-issued static active grant rejected: %v", err)
+	}
+
+	for name, mutate := range map[string]func(*StartupGrant){
+		"admin token":        func(g *StartupGrant) { g.Environment["RHIZA_ADMIN_TOKEN"] = "private-admin-token" },
+		"per-node token map": func(g *StartupGrant) { g.Environment["RHIZA_PEER_TOKENS"] = `{"rhiza-0":"token"}` },
+		"node id override":   func(g *StartupGrant) { g.Environment["RHIZA_NODE_ID"] = "rhiza-0" },
+		"arbitrary override": func(g *StartupGrant) { g.Environment["RHIZA_EXTRA"] = "value" },
+		"missing members":    func(g *StartupGrant) { delete(g.Environment, "RHIZA_CLUSTER_MEMBERS") },
+		"empty members":      func(g *StartupGrant) { g.Environment["RHIZA_CLUSTER_MEMBERS"] = "" },
+		"missing own token":  func(g *StartupGrant) { delete(g.Environment, "RHIZA_PEER_TOKEN") },
+		"empty own token":    func(g *StartupGrant) { g.Environment["RHIZA_PEER_TOKEN"] = "" },
+		"wrong role":         func(g *StartupGrant) { g.Role = StartupRoleLearnerPendingRemove },
+		"logical identity": func(g *StartupGrant) {
+			g.Identity.NodeID = "logical-incarnation"
+		},
+		"assigned active without assignment environment": func(g *StartupGrant) {
+			g.Identity.NodeID = "logical-incarnation"
+			g.Identity.AssignmentID = strings.Repeat("b", 64)
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			candidate := grant
+			candidate.Environment = make(map[string]string, len(grant.Environment)+1)
+			for key, value := range grant.Environment {
+				candidate.Environment[key] = value
+			}
+			mutate(&candidate)
+			if err := candidate.Validate(request); err == nil {
+				t.Fatal("invalid static startup grant environment accepted")
+			}
+		})
+	}
+}
+
+func TestInitialRegistrationGrantAndRunEvidenceAreExactAndBindRetryIsIdempotent(t *testing.T) {
+	identity := testIdentity()
+	identity.NodeID, identity.PodName = "rhiza-0", "rhiza-0"
+	identity.WALIdentity = ""
+	grant := StartupGrant{
+		Identity: identity,
+		Role:     StartupRoleVoterActive,
+		InitialRegistration: &InitialRegistrationProvenance{
+			Version: InitialRegistrationProvenanceVersion, IdentityDigest: InitialRegistrationIdentityDigest(identity),
+			MembershipHash: strings.Repeat("a", 64), StoreScopeHash: strings.Repeat("b", 64), RunIdentity: identity,
+		},
+	}
+	if err := grant.Validate(identity); err != nil {
+		t.Fatalf("authority-issued first-registration grant rejected: %v", err)
+	}
+	wrongPhysical := grant
+	wrongPhysical.Identity.PodName = "rhiza-1"
+	if err := wrongPhysical.Validate(identity); err == nil {
+		t.Fatal("first-registration evidence was accepted for another physical Pod")
+	}
+	wrongRole := grant
+	wrongRole.Role = StartupRoleLearnerPendingRemove
+	if err := wrongRole.Validate(identity); err == nil {
+		t.Fatal("first-registration evidence was accepted with learner role")
+	}
+
+	ledger := Ledger{SourceClusterID: identity.SourceClusterID, RequireRuntimeBinding: true, RequireMutationJournal: true}
+	runtime := enrolledRuntime(identity, "container-first")
+	runtime.PodName = identity.PodName
+	if err := ledger.RegisterEnrolledWithRole(identity, runtime, StartupRoleVoterActive); err != nil {
+		t.Fatal(err)
+	}
+	run := ledger.Runs[identity.RunID]
+	provenance := *grant.InitialRegistration
+	run.InitialRegistration = &provenance
+	run.MutationProducerUID = strings.Repeat("c", 64)
+	run.MutationScopeHash = strings.Repeat("d", 64)
+	run.MutationProfile = MutationHeldExecutionProfile
+	run.MutationStageIncarnation = "stage-0"
+	ledger.Runs[identity.RunID] = run
+
+	bound := identity
+	bound.WALIdentity = strings.Repeat("e", 64)
+	if err := ledger.Bind(bound); err != nil {
+		t.Fatalf("first WAL bind rejected: %v", err)
+	}
+	if err := ledger.Bind(bound); err != nil {
+		t.Fatalf("exact retry after a lost bind response was rejected: %v", err)
+	}
+	before := ledger.Runs[identity.RunID]
+	otherWAL := bound
+	otherWAL.WALIdentity = strings.Repeat("f", 64)
+	if err := ledger.Bind(otherWAL); err == nil {
+		t.Fatal("competing WAL nonce was accepted")
+	}
+	if after := ledger.Runs[identity.RunID]; after.Identity != before.Identity || after.InitialRegistration == nil || *after.InitialRegistration != provenance {
+		t.Fatalf("rejected competing bind mutated the initial Run: before=%+v after=%+v", before, after)
+	}
 }
 
 func TestLedgerRequiresSeparateDrainAndExit(t *testing.T) {

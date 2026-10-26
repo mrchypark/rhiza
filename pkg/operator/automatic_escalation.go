@@ -9,7 +9,6 @@ import (
 
 	"github.com/mrchypark/rhiza/pkg/network"
 	"github.com/mrchypark/rhiza/pkg/quepaxa"
-	"github.com/mrchypark/rhiza/pkg/recovery"
 	"github.com/thanos-io/objstore"
 )
 
@@ -52,9 +51,9 @@ func (c *Controller) assessAutomaticEscalation(ctx context.Context, r *ClusterRe
 		}
 	}
 	if intent.LearnerName != "" {
-		voters = append(voters, VoterPod{NodeID: quepaxa.NodeID(intent.LearnerName), Pod: intent.LearnerName})
+		voters = append(voters, VoterPod{NodeID: quepaxa.NodeID(intent.LearnerName), Pod: learnerPhysicalPod(intent)})
 		if intent.LearnerUID != "" && intent.LearnerWAL != "" {
-			fencePods[quepaxa.NodeID(intent.LearnerName)] = intent.LearnerName
+			fencePods[quepaxa.NodeID(intent.LearnerName)] = learnerPhysicalPod(intent)
 		}
 	}
 	for _, ref := range voters {
@@ -70,7 +69,16 @@ func (c *Controller) assessAutomaticEscalation(ctx context.Context, r *ClusterRe
 			return automaticEscalationStop, err
 		}
 		if string(ref.NodeID) == intent.LearnerName && intent.LearnerUID != "" && str(nested(pod, "metadata", "uid")) != intent.LearnerUID {
-			return automaticEscalationStop, c.autoStatus(ctx, r, state, "Blocked", "learner Pod differs from the generation fencing scope")
+			if !intent.Aborting {
+				return automaticEscalationStop, c.autoStatus(ctx, r, state, "Blocked", "learner Pod differs from the generation fencing scope")
+			}
+			// The exact prior ADD still needs its abort revision propagated. A new
+			// Pod at the same ordinal is not that learner and cannot contribute a
+			// status or generation-fence target to this retirement round.
+			continue
+		}
+		if string(ref.NodeID) == intent.LearnerName && intent.Aborting && nested(pod, "metadata", "deletionTimestamp") != nil {
+			continue
 		}
 		endpoint, err := podEndpoint(pod, r.Spec.Container, "/membership/status")
 		if err != nil {
@@ -133,11 +141,7 @@ func (c *Controller) assessAutomaticEscalation(ctx context.Context, r *ClusterRe
 	if intent.Durability == "async" && !intent.Policy.AllowDataLoss {
 		return automaticEscalationStop, c.autoStatus(ctx, r, state, "Blocked", "async generation escalation requires allowDataLoss")
 	}
-	archive := recovery.NewManager(c.Bucket, path.Join(c.Prefix, state.ActiveClusterID), 1)
-	err = archive.Load(ctx)
-	tip := archive.Tip()
-	archive.Close()
-	if err != nil || tip == 0 {
+	if !automaticArchiveAllowsGenerationRecovery(ctx, c.Bucket, path.Join(c.Prefix, state.ActiveClusterID), intent.Durability, intent.Policy.AllowDataLoss) {
 		return automaticEscalationStop, c.autoStatus(ctx, r, state, "Blocked", "certified archive unavailable for escalation")
 	}
 	state.Sequence++

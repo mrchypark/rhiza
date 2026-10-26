@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"math"
 	"net/http"
 	"strings"
@@ -71,60 +72,66 @@ func commitUnknown(slot quepaxa.Slot, requestID string, err error) error {
 
 // Server is the HTTP server for client API.
 type Server struct {
-	core                 *quepaxa.Core
-	material             *materializer.Materializer
-	cluster              types.ClusterID
-	mux                  *http.ServeMux
-	ready                func() bool
-	writable             bool
-	sqlBatcher           *mutationBatcher[types.SQLCommand]
-	graphBatcher         *mutationBatcher[types.GraphCommand]
-	kvBatcher            *mutationBatcher[types.KVCommand]
-	transport            *Transport
-	applyMu              sync.Mutex
-	requestLocks         [4096]chan struct{}
-	mutationMu           sync.Mutex
-	mutationAdmission    mutationAdmission
-	durability           func(context.Context, quepaxa.Slot) error
-	proposeMu            sync.Mutex
-	admissionChanged     chan struct{}
-	admissionEpoch       uint64
-	admissionWaiters     int
-	inflight             map[[32]byte]*proposalCall
-	proposalCtx          context.Context
-	proposalStop         context.CancelFunc
-	proposalWG           sync.WaitGroup
-	logicalWG            sync.WaitGroup
-	closeOnce            sync.Once
-	closing              bool
-	quiescing            bool
-	localMode            bool
-	lifecycleFailure     error
-	localFailureHandler  func(error)
-	localReclaimHandler  func(context.Context) error
-	operationCap         chan struct{}
-	localCap             chan struct{}
-	operationB           int
-	localB               int
-	objectStats          func() (map[string]uint64, bool)
-	replicaStatus        func() ReplicaStatus
-	voterRecoveryStatus  func(context.Context) VoterRecoveryStatus
-	recoveryArchiveToken string
-	membershipToken      string
-	membershipChange     func(context.Context, MembershipChange) error
-	membershipAbort      func(context.Context, MembershipChange) error
-	recoveryArchive      func(context.Context) error
-	terminalDrain        func(context.Context, TerminalDrainRequest) (any, error)
-	handlerMu            sync.Mutex
-	handlerWG            sync.WaitGroup
-	handlerClosing       bool
-	syncLimit            chan struct{}
-	syncMu               sync.Mutex
-	syncSources          map[quepaxa.NodeID]chan struct{}
-	checkpointPrepare    func(context.Context, quepaxa.NodeID, quepaxa.CheckpointSeal) error
-	compactedHandler     func()
-	readAdmissionMu      sync.RWMutex
-	readAdmission        *readAdmission
+	core                       *quepaxa.Core
+	material                   *materializer.Materializer
+	cluster                    types.ClusterID
+	mux                        *http.ServeMux
+	ready                      func() bool
+	peerLearnReady             func() bool
+	peerLearnDecisionAllowed   func(quepaxa.Decision) bool
+	writable                   bool
+	sqlBatcher                 *mutationBatcher[types.SQLCommand]
+	graphBatcher               *mutationBatcher[types.GraphCommand]
+	kvBatcher                  *mutationBatcher[types.KVCommand]
+	transport                  *Transport
+	applyMu                    sync.Mutex
+	requestLocks               [4096]chan struct{}
+	mutationMu                 sync.Mutex
+	mutationAdmission          mutationAdmission
+	durability                 func(context.Context, quepaxa.Slot) error
+	readDurability             func(context.Context, quepaxa.Slot) error
+	proposeMu                  sync.Mutex
+	admissionChanged           chan struct{}
+	admissionEpoch             uint64
+	admissionWaiters           int
+	inflight                   map[[32]byte]*proposalCall
+	proposalCtx                context.Context
+	proposalStop               context.CancelFunc
+	proposalWG                 sync.WaitGroup
+	logicalWG                  sync.WaitGroup
+	closeOnce                  sync.Once
+	closing                    bool
+	quiescing                  bool
+	localMode                  bool
+	lifecycleFailure           error
+	localFailureHandler        func(error)
+	localReclaimHandler        func(context.Context) error
+	operationCap               chan struct{}
+	localCap                   chan struct{}
+	operationB                 int
+	localB                     int
+	objectStats                func() (map[string]uint64, bool)
+	replicaStatus              func() ReplicaStatus
+	voterRecoveryStatus        func(context.Context) VoterRecoveryStatus
+	recoveryArchiveToken       string
+	membershipToken            string
+	membershipChange           func(context.Context, MembershipChange) error
+	membershipAbort            func(context.Context, MembershipChange) error
+	recoveryArchive            func(context.Context) error
+	terminalDrain              func(context.Context, TerminalDrainRequest) (any, error)
+	handlerMu                  sync.Mutex
+	handlerWG                  sync.WaitGroup
+	handlerClosing             bool
+	syncLimit                  chan struct{}
+	syncMu                     sync.Mutex
+	syncSources                map[quepaxa.NodeID]chan struct{}
+	checkpointPrepare          func(context.Context, quepaxa.NodeID, quepaxa.CheckpointSeal) error
+	compactedHandler           func()
+	archiveCatchUpHint         func(quepaxa.TerminalGapKey)
+	archiveCatchUpContinuation func(context.Context, quepaxa.TerminalGapKey) error
+	readAdmissionMu            sync.RWMutex
+	readAdmission              *readAdmission
+	statusLookupHook           func()
 }
 
 // ReadAdmissionLimits bounds concurrent read work in one Server. Long-poll
@@ -183,6 +190,54 @@ func (s *Server) SetCompactedHandler(handler func()) {
 	s.proposeMu.Lock()
 	s.compactedHandler = handler
 	s.proposeMu.Unlock()
+}
+
+// SetArchiveCatchUpHint installs an optional non-blocking signal for a
+// certified terminal whose exact local prefix catch-up failed. The callback
+// should only enqueue the key; it must not perform archive I/O in the peer
+// request path.
+func (s *Server) SetArchiveCatchUpHint(handler func(quepaxa.TerminalGapKey)) {
+	s.proposeMu.Lock()
+	s.archiveCatchUpHint = handler
+	s.proposeMu.Unlock()
+}
+
+func (s *Server) hintArchiveCatchUp(key quepaxa.TerminalGapKey) {
+	s.proposeMu.Lock()
+	handler := s.archiveCatchUpHint
+	s.proposeMu.Unlock()
+	if handler != nil {
+		handler(key)
+	}
+}
+
+// SetArchiveCatchUpContinuation installs a synchronous, request-scoped path
+// for an admitted terminal Learned whose exact prefix is unavailable from its
+// sender. The callback may apply only the already-published prefix through
+// T-1; this handler still performs AcceptDecision(T), durability, and ACK.
+func (s *Server) SetArchiveCatchUpContinuation(handler func(context.Context, quepaxa.TerminalGapKey) error) {
+	s.proposeMu.Lock()
+	s.archiveCatchUpContinuation = handler
+	s.proposeMu.Unlock()
+}
+
+func (s *Server) continueArchiveCatchUp(ctx context.Context, key quepaxa.TerminalGapKey, through quepaxa.Slot) (configured, complete bool) {
+	s.proposeMu.Lock()
+	handler := s.archiveCatchUpContinuation
+	s.proposeMu.Unlock()
+	if handler == nil {
+		return false, false
+	}
+	if s.core == nil || !s.core.PendingTerminalGap(key) {
+		return true, false
+	}
+	if handler(ctx, key) != nil {
+		return true, false
+	}
+	// The callback may install the exact terminal while it fills the prefix.
+	// The caller revalidates the captured key or exact installed terminal before
+	// accepting the request, so completion here only reports prefix availability.
+	return true, s.core.Tip() >= through
 }
 
 func (s *Server) handleCompacted() {
@@ -375,6 +430,46 @@ func (s *Server) Ready() bool {
 	return s.lifecycleFailure == nil
 }
 
+// PeerLearnReady gates authenticated peer decisions only. It is independent
+// of HTTP serving readiness for supervised engine-repair candidates that must
+// learn their ADD before receiving producer-backed serving authority.
+func (s *Server) PeerLearnReady() bool {
+	if s.localFailure() != nil {
+		return false
+	}
+	if s.peerLearnReady != nil {
+		return s.peerLearnReady()
+	}
+	return s.Ready()
+}
+
+// SetPeerLearnReady installs the private peer-decision admission predicate
+// before the server is exposed. Public API and ReadIndex still use Ready.
+func (s *Server) SetPeerLearnReady(ready func() bool) {
+	s.peerLearnReady = ready
+}
+
+// SetPeerLearnDecisionAllowed installs the narrow authenticated Learn
+// exception used for a locally certified pending reconfiguration. The
+// decision still passes the ordinary certificate and durability checks.
+func (s *Server) SetPeerLearnDecisionAllowed(allowed func(quepaxa.Decision) bool) {
+	s.proposeMu.Lock()
+	s.peerLearnDecisionAllowed = allowed
+	s.proposeMu.Unlock()
+}
+
+func (s *Server) PeerLearnDecisionAllowed(decision quepaxa.Decision) bool {
+	s.proposeMu.Lock()
+	allowed, failure := s.peerLearnDecisionAllowed, s.lifecycleFailure
+	s.proposeMu.Unlock()
+	if failure != nil || allowed == nil || !allowed(decision) {
+		return false
+	}
+	// The predicate may overlap a lifecycle transition. Do not authorize a
+	// decision if the local server became terminal while the predicate ran.
+	return s.localFailure() == nil
+}
+
 func (s *Server) localFailure() error {
 	s.proposeMu.Lock()
 	defer s.proposeMu.Unlock()
@@ -454,6 +549,23 @@ func (s *Server) SetDurabilityBarrier(barrier func(context.Context, quepaxa.Slot
 	s.durability = barrier
 }
 
+// SetReadDurabilityBarrier installs a post-read barrier. A successful read is
+// not returned until the exact materializer snapshot it observed is durable.
+// Standalone callers leave this unset.
+func (s *Server) SetReadDurabilityBarrier(barrier func(context.Context, quepaxa.Slot) error) {
+	s.readDurability = barrier
+}
+
+func (s *Server) waitReadDurable(ctx context.Context, slot uint64) error {
+	if s.readDurability == nil {
+		return nil
+	}
+	if err := s.readDurability(ctx, quepaxa.Slot(slot)); err != nil {
+		return fmt.Errorf("%w: %w", ErrDurabilityUnavailable, err)
+	}
+	return nil
+}
+
 func (s *Server) waitDurable(ctx context.Context, slot quepaxa.Slot) error {
 	if s.durability == nil {
 		return nil
@@ -462,7 +574,7 @@ func (s *Server) waitDurable(ctx context.Context, slot quepaxa.Slot) error {
 		if s.localMode {
 			return fmt.Errorf("local durability wait: %w", err)
 		}
-		return fmt.Errorf("%w: %v", ErrDurabilityUnavailable, err)
+		return fmt.Errorf("%w: %w", ErrDurabilityUnavailable, err)
 	}
 	return nil
 }
@@ -1580,6 +1692,11 @@ func (s *Server) query(ctx context.Context, req QueryRequest) (QueryResponse, er
 	if err != nil {
 		return QueryResponse{}, fmt.Errorf("%w: %v", ErrInvalidRequest, err)
 	}
+	durabilityStarted := time.Now()
+	if err := s.waitReadDurable(ctx, appliedSlot); err != nil {
+		s.logReadFailure("read-durability", durabilityStarted, quepaxa.Slot(appliedSlot), "", err)
+		return QueryResponse{}, err
+	}
 	return QueryResponse{Columns: result.Columns, Rows: result.Rows, AppliedSlot: appliedSlot, ConsensusTip: uint64(s.core.Tip())}, nil
 }
 
@@ -1680,7 +1797,6 @@ func (s *Server) RequestStatus(ctx context.Context, req RequestStatusRequest) (R
 	if !ok {
 		return RequestStatusResponse{}, ErrInvalidRequest
 	}
-	tip := s.material.Tip()
 	var receipt types.MutationReceipt
 	var found bool
 	var err error
@@ -1692,8 +1808,28 @@ func (s *Server) RequestStatus(ctx context.Context, req RequestStatusRequest) (R
 	if err != nil {
 		return RequestStatusResponse{}, err
 	}
+	if s.statusLookupHook != nil {
+		s.statusLookupHook()
+	}
+	tip := s.material.Tip()
 	if !found {
+		if s.readDurability != nil {
+			err = s.waitReadDurable(ctx, tip)
+		} else {
+			err = s.waitDurable(ctx, quepaxa.Slot(tip))
+		}
+		if err != nil {
+			return RequestStatusResponse{}, err
+		}
 		return RequestStatusResponse{State: "unknown_or_expired", Tip: tip}, nil
+	}
+	if err := s.waitReceiptDurable(ctx, receipt, req.RequestID); err != nil {
+		return RequestStatusResponse{}, err
+	}
+	if s.readDurability != nil {
+		if err := s.waitReadDurable(ctx, receipt.Slot); err != nil {
+			return RequestStatusResponse{}, err
+		}
 	}
 	return RequestStatusResponse{State: string(receipt.Status), Tip: tip, Receipt: &receipt}, nil
 }
@@ -1795,6 +1931,9 @@ func (s *Server) kvGet(ctx context.Context, req KVGetRequest) (KVGetResponse, er
 		return KVGetResponse{}, err
 	}
 	value, found, appliedSlot, err := s.material.KVGetAt(ctx, req.Key, time.Now())
+	if err == nil {
+		err = s.waitReadDurable(ctx, appliedSlot)
+	}
 	return KVGetResponse{Found: found, Value: value, AppliedSlot: appliedSlot, ConsensusTip: uint64(s.core.Tip())}, err
 }
 
@@ -1912,15 +2051,21 @@ func (s *Server) readBarrier(ctx context.Context, consistency string) error {
 	case "", "local":
 		return nil
 	case "linearizable":
+		started := time.Now()
 		index, source, err := s.core.ReadIndex(ctx)
 		if err != nil {
+			s.logReadFailure("read-index", started, 0, "", err)
 			return err
 		}
 		if index > s.core.Tip() {
 			if s.transport == nil || source == s.core.NodeID() {
-				return fmt.Errorf("read-index source cannot supply slot %d", index)
+				err := fmt.Errorf("read-index source cannot supply slot %d", index)
+				s.logReadFailure("read-index-catch-up", time.Now(), index, source, err)
+				return err
 			}
+			started = time.Now()
 			if err := s.catchUpFrom(ctx, source, index, true); err != nil {
+				s.logReadFailure("read-index-catch-up", started, index, source, err)
 				return err
 			}
 		}
@@ -1929,9 +2074,11 @@ func (s *Server) readBarrier(ctx context.Context, consistency string) error {
 				return nil
 			}
 			if err := s.beginLocalLifecycle(); err != nil {
+				s.logReadFailure("read-index-apply", time.Now(), index, source, err)
 				return err
 			}
 			done := make(chan error, 1)
+			started = time.Now()
 			go func() {
 				applyCtx, cancel := context.WithTimeout(s.proposalCtx, 30*time.Second)
 				err := s.applyDecisions(applyCtx, index)
@@ -1941,14 +2088,81 @@ func (s *Server) readBarrier(ctx context.Context, consistency string) error {
 			}()
 			select {
 			case <-ctx.Done():
-				return ctx.Err()
+				err := ctx.Err()
+				s.logReadFailure("read-index-apply", started, index, source, err)
+				return err
 			case err := <-done:
+				if err != nil {
+					s.logReadFailure("read-index-apply", started, index, source, err)
+				}
 				return err
 			}
 		}
-		return s.applyDecisions(ctx, index)
+		started = time.Now()
+		err = s.applyDecisions(ctx, index)
+		if err != nil {
+			s.logReadFailure("read-index-apply", started, index, source, err)
+		}
+		return err
 	default:
 		return errConsistency
+	}
+}
+
+func (s *Server) logReadFailure(phase string, started time.Time, index quepaxa.Slot, source quepaxa.NodeID, err error) {
+	errorClass := "backend"
+	switch {
+	case errors.Is(err, context.Canceled):
+		errorClass = "canceled"
+	case errors.Is(err, context.DeadlineExceeded):
+		errorClass = "deadline"
+	case errors.Is(err, quepaxa.ErrQuorumUnavailable):
+		errorClass = "quorum-unavailable"
+	case errors.Is(err, ErrNotReady):
+		errorClass = "not-ready"
+	case errors.Is(err, ErrDurabilityUnavailable):
+		errorClass = "durability-unavailable"
+	}
+	indexLabel := "read_index"
+	if phase == "read-durability" {
+		// This phase receives the materializer slot, not the earlier consensus
+		// ReadIndex value. Do not report it under a misleading field name.
+		indexLabel = "applied_slot"
+	}
+	var archiveDiagnostic interface {
+		ReadDurabilityDiagnostic() (required, archiveTip uint64, stage, lockState string)
+	}
+	if phase == "read-durability" && errors.As(err, &archiveDiagnostic) {
+		required, archiveTip, stage, lockState := archiveDiagnostic.ReadDurabilityDiagnostic()
+		stage = boundedArchiveWaitStage(stage)
+		lockState = boundedArchiveLockState(lockState)
+		log.Printf("read failed: phase=%s node=%s %s=%d source=%s core_tip=%d applied_tip=%d elapsed=%s error_class=%s archive_required_slot=%d archive_tip=%d archive_wait_stage=%s archive_lock_state=%s",
+			phase, s.core.NodeID(), indexLabel, index, source, s.core.Tip(), s.material.Tip(), time.Since(started), errorClass,
+			required, archiveTip, stage, lockState)
+		return
+	}
+	log.Printf("read failed: phase=%s node=%s %s=%d source=%s core_tip=%d applied_tip=%d elapsed=%s error_class=%s",
+		phase, s.core.NodeID(), indexLabel, index, source, s.core.Tip(), s.material.Tip(), time.Since(started), errorClass)
+}
+
+func boundedArchiveWaitStage(stage string) string {
+	switch stage {
+	case "entry-head-refresh", "batch-coalesce", "archive-sync", "archive-head-refresh",
+		"publication-lock", "lock-recheck-head-refresh", "head-refresh-under-lock",
+		"extent-build-upload", "head-publish", "head-readback", "publish-conflict-refresh",
+		"publication-lock-release":
+		return stage
+	default:
+		return "unknown"
+	}
+}
+
+func boundedArchiveLockState(state string) string {
+	switch state {
+	case "not-observed", "not-held", "busy", "held", "released", "unknown":
+		return state
+	default:
+		return "unknown"
 	}
 }
 
@@ -2039,13 +2253,63 @@ func (s *Server) NotifyPublish(ctx context.Context, req types.NotifyCommand) (ty
 }
 
 func (s *Server) NotifySubscribe(topic string) (<-chan []byte, func(), error) {
+	events, cancelEvents, err := s.notifySubscribeEvents(topic)
+	if err != nil {
+		return nil, nil, err
+	}
+	s.handlerMu.Lock()
+	if s.handlerClosing {
+		s.handlerMu.Unlock()
+		cancelEvents()
+		return nil, nil, ErrNotReady
+	}
+	s.handlerWG.Add(1)
+	s.handlerMu.Unlock()
+	parent := s.proposalCtx
+	if parent == nil {
+		parent = context.Background()
+	}
+	ctx, cancelContext := context.WithCancel(parent)
+	out := make(chan []byte)
+	go func() {
+		defer s.handlerWG.Done()
+		defer cancelContext()
+		defer cancelEvents()
+		defer close(out)
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case event, ok := <-events:
+				if !ok || ctx.Err() != nil || s.waitReadDurable(ctx, event.AppliedSlot) != nil {
+					return
+				}
+				payload := append([]byte(nil), event.Payload...)
+				select {
+				case out <- payload:
+				case <-ctx.Done():
+					return
+				}
+			}
+		}
+	}()
+	var cancelOnce sync.Once
+	return out, func() {
+		cancelOnce.Do(func() {
+			cancelContext()
+			cancelEvents()
+		})
+	}, nil
+}
+
+func (s *Server) notifySubscribeEvents(topic string) (<-chan materializer.NotificationEvent, func(), error) {
 	if s.localFailure() != nil {
 		return nil, nil, ErrNotReady
 	}
 	if topic == "" || len(topic) > 256 {
 		return nil, nil, ErrInvalidRequest
 	}
-	ch, cancel, err := s.material.Subscribe(topic)
+	ch, cancel, err := s.material.SubscribeEvents(topic)
 	if err != nil {
 		return nil, nil, fmt.Errorf("%w: %v", ErrOverloaded, err)
 	}
@@ -2075,7 +2339,7 @@ func (s *Server) handleNotifySubscribe(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "text/event-stream")
 	w.Header().Set("Cache-Control", "no-cache")
 	w.Header().Set("X-Accel-Buffering", "no")
-	ch, cancel, err := s.NotifySubscribe(topic)
+	ch, cancel, err := s.notifySubscribeEvents(topic)
 	if err != nil {
 		writeAPIError(w, err)
 		return
@@ -2089,11 +2353,14 @@ func (s *Server) handleNotifySubscribe(w http.ResponseWriter, r *http.Request) {
 		select {
 		case <-r.Context().Done():
 			return
-		case payload, ok := <-ch:
+		case event, ok := <-ch:
 			if !ok {
 				return
 			}
-			data, _ := json.Marshal(payload)
+			if err := s.waitReadDurable(r.Context(), event.AppliedSlot); err != nil {
+				return
+			}
+			data, _ := json.Marshal(event.Payload)
 			fmt.Fprintf(w, "data: %s\n\n", data)
 			flusher.Flush()
 		case <-keepalive.C:

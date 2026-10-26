@@ -5,7 +5,9 @@ import (
 	"fmt"
 	"net/http"
 	"os"
+	"strconv"
 
+	"cloud.google.com/go/storage"
 	kitlog "github.com/go-kit/log"
 	"github.com/thanos-io/objstore"
 	"github.com/thanos-io/objstore/providers/azure"
@@ -108,8 +110,12 @@ func newBucket(cfg Config, observeReplay, supervised bool) (*MeteredBucket, erro
 	case ProviderGCS:
 		providerConfig := gcs.DefaultConfig
 		providerConfig.Bucket, providerConfig.ServiceAccount, providerConfig.MaxRetries = cfg.Bucket, cfg.ServiceAccount, cfg.MaxRetries
-		bucket, err = gcs.NewBucketWithConfig(context.Background(), kitlog.NewNopLogger(), providerConfig,
+		var gcsBucket *gcs.Bucket
+		gcsBucket, err = gcs.NewBucketWithConfig(context.Background(), kitlog.NewNopLogger(), providerConfig,
 			"rhiza", func(next http.RoundTripper) http.RoundTripper { return metrics.transport(next) })
+		if err == nil {
+			bucket = &gcsVersionedDeleteBucket{Bucket: gcsBucket, handle: gcsBucket.Handle()}
+		}
 	case ProviderAzure:
 		providerConfig := azure.DefaultConfig
 		if supervised {
@@ -131,6 +137,24 @@ func newBucket(cfg Config, observeReplay, supervised bool) (*MeteredBucket, erro
 		return nil, err
 	}
 	return newMeteredBucket(bucket, metrics), nil
+}
+
+type gcsVersionedDeleteBucket struct {
+	objstore.Bucket
+	handle *storage.BucketHandle
+}
+
+func (b *gcsVersionedDeleteBucket) SupportsVersionedDelete() bool { return b.handle != nil }
+
+func (b *gcsVersionedDeleteBucket) DeleteVersion(ctx context.Context, name string, version objstore.ObjectVersion) error {
+	if b.handle == nil || version.Type != objstore.Generation {
+		return fmt.Errorf("object version must be a GCS generation")
+	}
+	generation, err := strconv.ParseInt(version.Value, 10, 64)
+	if err != nil || generation <= 0 || strconv.FormatInt(generation, 10) != version.Value {
+		return fmt.Errorf("object version must be a positive GCS generation")
+	}
+	return b.handle.Object(name).Generation(generation).If(storage.Conditions{GenerationMatch: generation}).Delete(ctx)
 }
 
 // ValidateConfig rejects invalid or silently ignored provider options before
@@ -184,6 +208,9 @@ func LoadConfig() Config {
 		Endpoint:       os.Getenv("RHIZA_OBJSTORE_ENDPOINT"),
 		Bucket:         os.Getenv("RHIZA_OBJSTORE_BUCKET"),
 		Region:         os.Getenv("AWS_REGION"),
+		AccessKey:      os.Getenv("RHIZA_OBJSTORE_ACCESS_KEY"),
+		SecretKey:      os.Getenv("RHIZA_OBJSTORE_SECRET_KEY"),
+		SessionToken:   os.Getenv("RHIZA_OBJSTORE_SESSION_TOKEN"),
 		ServiceAccount: os.Getenv("RHIZA_OBJSTORE_SERVICE_ACCOUNT"),
 		AzureTenantID:  os.Getenv("RHIZA_OBJSTORE_AZURE_TENANT_ID"), AzureClientID: os.Getenv("RHIZA_OBJSTORE_AZURE_CLIENT_ID"),
 		AzureClientSecret: os.Getenv("RHIZA_OBJSTORE_AZURE_CLIENT_SECRET"), AzureStorageAccount: os.Getenv("RHIZA_OBJSTORE_AZURE_STORAGE_ACCOUNT"),

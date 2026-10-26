@@ -16,17 +16,23 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 
 	"github.com/mrchypark/rhiza/internal/localtesthooks"
 	objmetrics "github.com/mrchypark/rhiza/internal/objstore"
+	"github.com/mrchypark/rhiza/pkg/fencing"
 	"github.com/mrchypark/rhiza/pkg/quepaxa"
 	"github.com/thanos-io/objstore"
 	"golang.org/x/sync/errgroup"
 )
 
 const (
+	// ArchiveConfigID is the immutable shared-archive lineage identity. It is
+	// distinct from QuePaxa's ConfigID, which changes with membership.
+	ArchiveConfigID uint = 1
+
 	maxExtentSize      = 8 << 20
 	maxExtentItems     = 1024
 	maxExtentPayload   = maxExtentSize - extentHeaderSize - archiveCRCSize - 8
@@ -42,14 +48,19 @@ const (
 var (
 	ErrArchiveClosed = errors.New("archive manager is closed")
 	ErrArchiveBusy   = errors.New("archive maintenance is active")
+	// ErrArchiveDeferredDeletion reports a cleanup pass that completed other
+	// eligible work but retained one or more markers for authority-deferred
+	// deletions. It is not a successful-GC result.
+	ErrArchiveDeferredDeletion = errors.New("archive cleanup deferred protected deletions")
 	// ErrActiveGCLock is only a pre-entry refusal by a live GC lease.
 	// Direct callers still observe ErrArchiveBusy through errors.Is.
 	ErrActiveGCLock error = activeGCLockError{}
 	// ErrActiveRecoveryPin identifies only the trim guard's live-pin refusal.
 	// It retains ErrArchiveBusy compatibility without conflating lock failures.
-	ErrActiveRecoveryPin   error = activeRecoveryPinError{}
-	ErrArchiveSealed             = errors.New("archive is sealed for recovery")
-	errArchiveStateChanged       = errors.New("archive state changed during I/O")
+	ErrActiveRecoveryPin         error = activeRecoveryPinError{}
+	ErrArchiveSealed                   = errors.New("archive is sealed for recovery")
+	errArchiveStateChanged             = errors.New("archive state changed during I/O")
+	errArchivePublicationPending       = errors.New("archive first publication is still in progress")
 )
 
 type activeRecoveryPinError struct{}
@@ -130,9 +141,84 @@ type source interface {
 }
 
 type syncBatch struct {
-	target quepaxa.Slot
-	done   chan struct{}
-	err    error
+	target   quepaxa.Slot
+	done     chan struct{}
+	err      error
+	progress archiveSyncProgress
+}
+
+// archiveSyncDiagnostic contains only fixed categories and numeric slots.
+type archiveSyncDiagnostic struct {
+	requiredSlot quepaxa.Slot
+	// archiveTip is the last locally validated remote HEAD tip observed by this
+	// manager; it is not a claim that the remote HEAD cannot have since changed.
+	archiveTip quepaxa.Slot
+	stage      string
+	lockState  string
+}
+
+type archiveSyncProgress struct {
+	mu        sync.Mutex
+	stage     string
+	lockState string
+}
+
+func (p *archiveSyncProgress) set(stage, lockState string) {
+	if p == nil {
+		return
+	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.stage = stage
+	if lockState != "" {
+		p.lockState = lockState
+	}
+}
+
+func (p *archiveSyncProgress) setLockState(lockState string) {
+	if p == nil {
+		return
+	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.lockState = lockState
+}
+
+func (p *archiveSyncProgress) snapshot(required, tip quepaxa.Slot) archiveSyncDiagnostic {
+	diagnostic := archiveSyncDiagnostic{requiredSlot: required, archiveTip: tip, stage: "unknown", lockState: "not-observed"}
+	if p == nil {
+		return diagnostic
+	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.stage != "" {
+		diagnostic.stage = p.stage
+	}
+	if p.lockState != "" {
+		diagnostic.lockState = p.lockState
+	}
+	return diagnostic
+}
+
+type archiveSyncError struct {
+	diagnostic archiveSyncDiagnostic
+	cause      error
+}
+
+func (e archiveSyncError) Error() string { return e.cause.Error() }
+func (e archiveSyncError) Unwrap() error { return e.cause }
+
+// ReadDurabilityDiagnostic exposes only bounded fields for callers that log
+// failed read barriers. It deliberately excludes the underlying error text.
+func (e archiveSyncError) ReadDurabilityDiagnostic() (required, archiveTip uint64, stage, lockState string) {
+	return uint64(e.diagnostic.requiredSlot), uint64(e.diagnostic.archiveTip), e.diagnostic.stage, e.diagnostic.lockState
+}
+
+func (m *Manager) archiveSyncError(progress *archiveSyncProgress, required quepaxa.Slot, err error) error {
+	if err == nil {
+		return nil
+	}
+	return archiveSyncError{diagnostic: progress.snapshot(required, m.Tip()), cause: err}
 }
 
 type extentObject struct {
@@ -199,33 +285,114 @@ func (m *Manager) Load(ctx context.Context) error {
 	// Keep validated immutable references across HEAD retries. A live writer
 	// must not force each retry to download the entire historical chain again.
 	verified := make(map[extentObject]Extent)
-	for range maxPublishRetries {
+	stateRetries := 0
+	for {
 		if err := ctx.Err(); err != nil {
 			return err
 		}
-		if err := m.loadLocked(ctx, verified); !errors.Is(err, errArchiveStateChanged) {
+		err := m.loadLocked(ctx, verified, true)
+		switch {
+		case err == nil:
+			return nil
+		case errors.Is(err, errArchiveStateChanged):
+			stateRetries++
+			if stateRetries >= maxPublishRetries {
+				return fmt.Errorf("shared archive state changed too often")
+			}
+		case errors.Is(err, errArchivePublicationPending):
+			// The current HEAD read may have preceded a valid concurrent first
+			// publication's block upload. Re-enter Load after a short bounded poll;
+			// the caller context, not an arbitrary internal deadline, bounds waits.
+			timer := time.NewTimer(50 * time.Millisecond)
+			select {
+			case <-ctx.Done():
+				timer.Stop()
+				return ctx.Err()
+			case <-timer.C:
+			}
+		default:
 			return err
 		}
 	}
-	return fmt.Errorf("shared archive state changed too often")
 }
 
-func (m *Manager) loadLocked(ctx context.Context, verified map[extentObject]Extent) error {
+// LoadOnce performs one archive refresh pass without waiting for a concurrent
+// first publication or retrying when the shared HEAD changes during the pass.
+// It still validates the complete HEAD and immutable extent chain before
+// installing any refreshed state. Callers that need the ordinary publication
+// wait/retry behavior should continue to use Load.
+func (m *Manager) LoadOnce(ctx context.Context) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	return m.loadLocked(ctx, make(map[extentObject]Extent), false)
+}
+
+// firstPublicationPending distinguishes a live first-HEAD publication from
+// abandoned immutable blocks. A caller already holding the observed lease
+// cannot use its own lock to disguise a failed publication as transient.
+func (m *Manager) firstPublicationPending(ctx context.Context) (bool, error) {
+	lock, err := m.readArchiveLock(ctx, m.publicationLockKey())
+	if err != nil {
+		if m.bucket.IsObjNotFoundErr(err) {
+			return false, nil
+		}
+		return false, err
+	}
+	if lock.LeaseUntilMS <= time.Now().UnixMilli() {
+		return false, nil
+	}
+	if held, ok := ctx.Value(publicationLeaseContextKey{}).(archiveGCLock); ok &&
+		held.OwnerID == lock.OwnerID && held.Generation == lock.Generation {
+		return false, nil
+	}
+	return true, nil
+}
+
+func (m *Manager) loadLocked(ctx context.Context, verified map[extentObject]Extent, retryUnstableHead bool) error {
 	m.mu.Lock()
 	oldExtents, oldHead, oldCAS := slices.Clone(m.extents), m.head, m.headCAS
 	m.mu.Unlock()
 	name := m.key("archive/head.bin")
-	attributes, headData, unchanged, err := m.readStableObject(ctx, name, oldCAS, oldHead.Tip == 0, maxArchiveHeadSize)
+	readHead := m.readStableObject
+	if !retryUnstableHead {
+		readHead = m.readStableObjectOnce
+	}
+	attributes, headData, unchanged, err := readHead(ctx, name, oldCAS, oldHead.Tip == 0, maxArchiveHeadSize)
 	if err != nil {
 		if !m.bucket.IsObjNotFoundErr(err) {
 			return err
 		}
-		unsupported := false
-		if err := m.bucket.Iter(ctx, m.key("archive/extents"), func(string) error { unsupported = true; return nil }); err != nil {
+		legacyExtents := false
+		if err := m.bucket.Iter(ctx, m.key("archive/extents"), func(string) error { legacyExtents = true; return nil }); err != nil {
 			return err
 		}
-		if unsupported {
+		if legacyExtents {
 			return fmt.Errorf("unsupported shared archive layout")
+		}
+		orphanedBlocks := false
+		if err := m.bucket.Iter(ctx, m.key("archive/blocks"), func(string) error { orphanedBlocks = true; return nil }); err != nil {
+			return err
+		}
+		if orphanedBlocks {
+			pending, err := m.firstPublicationPending(ctx)
+			if err != nil {
+				return err
+			}
+			if pending {
+				return errArchivePublicationPending
+			}
+			// The first HEAD read predates the block scan. A publisher may have
+			// completed HEAD and released its lease during that scan; re-read HEAD
+			// before treating the remaining blocks as abandoned.
+			_, _, _, err = readHead(ctx, name, oldCAS, true, maxArchiveHeadSize)
+			if err == nil {
+				return errArchiveStateChanged
+			}
+			if !m.bucket.IsObjNotFoundErr(err) {
+				return err
+			}
+			return fmt.Errorf("shared archive head is missing but immutable blocks remain")
 		}
 		if oldHead.Tip != 0 {
 			return fmt.Errorf("shared archive head disappeared")
@@ -348,30 +515,38 @@ func (m *Manager) loadLocked(ctx context.Context, verified map[extentObject]Exte
 
 func (m *Manager) readStableObject(ctx context.Context, name string, known *objstore.ObjectVersion, allowMissing bool, limit int64) (objstore.ObjectAttributes, []byte, bool, error) {
 	for range maxPublishRetries {
-		beforeCtx := ctx
-		if allowMissing {
-			beforeCtx = objmetrics.WithExpectedNotFound(ctx)
-		}
-		before, err := m.bucket.Attributes(beforeCtx, name)
-		if err != nil {
-			return objstore.ObjectAttributes{}, nil, false, err
-		}
-		if sameObjectVersion(known, before.Version) {
-			return before, nil, true, nil
-		}
-		data, err := m.readObject(ctx, name, limit)
-		if err != nil {
-			return objstore.ObjectAttributes{}, nil, false, err
-		}
-		after, err := m.bucket.Attributes(ctx, name)
-		if err != nil {
-			return objstore.ObjectAttributes{}, nil, false, err
-		}
-		if sameObjectVersion(before.Version, after.Version) {
-			return after, data, false, nil
+		attributes, data, unchanged, err := m.readStableObjectOnce(ctx, name, known, allowMissing, limit)
+		if !errors.Is(err, errArchiveStateChanged) {
+			return attributes, data, unchanged, err
 		}
 	}
 	return objstore.ObjectAttributes{}, nil, false, fmt.Errorf("shared archive object did not stabilize")
+}
+
+func (m *Manager) readStableObjectOnce(ctx context.Context, name string, known *objstore.ObjectVersion, allowMissing bool, limit int64) (objstore.ObjectAttributes, []byte, bool, error) {
+	beforeCtx := ctx
+	if allowMissing {
+		beforeCtx = objmetrics.WithExpectedNotFound(ctx)
+	}
+	before, err := m.bucket.Attributes(beforeCtx, name)
+	if err != nil {
+		return objstore.ObjectAttributes{}, nil, false, err
+	}
+	if sameObjectVersion(known, before.Version) {
+		return before, nil, true, nil
+	}
+	data, err := m.readObject(ctx, name, limit)
+	if err != nil {
+		return objstore.ObjectAttributes{}, nil, false, err
+	}
+	after, err := m.bucket.Attributes(ctx, name)
+	if err != nil {
+		return objstore.ObjectAttributes{}, nil, false, err
+	}
+	if !sameObjectVersion(before.Version, after.Version) {
+		return objstore.ObjectAttributes{}, nil, false, errArchiveStateChanged
+	}
+	return after, data, false, nil
 }
 
 func sameObjectVersion(a, b *objstore.ObjectVersion) bool {
@@ -810,40 +985,198 @@ func (s *RecoverySnapshot) Close(ctx context.Context) error {
 // SyncThrough publishes all decisions through the requested slot. Concurrent
 // callers share a bounded delay and one immutable block/head publication.
 func (m *Manager) SyncThrough(ctx context.Context, core source, through quepaxa.Slot) error {
-	if through == 0 || m.Tip() >= through {
+	if through == 0 {
+		return nil
+	}
+	progress := &archiveSyncProgress{}
+	// Refresh even when the local tip already covers the slot: a different
+	// recovery manager may have permanently sealed the source archive since
+	// this manager last loaded HEAD. A cached tip cannot authorize an ACK after
+	// that revocation.
+	progress.set("entry-head-refresh", "not-observed")
+	if err := m.Load(ctx); err != nil {
+		return m.archiveSyncError(progress, through, err)
+	}
+	m.mu.Lock()
+	tip, sealed := m.tip, m.head.Sealed
+	m.mu.Unlock()
+	if sealed {
+		return ErrArchiveSealed
+	}
+	if tip >= through {
 		return nil
 	}
 	m.batchMu.Lock()
 	if m.closed {
 		m.batchMu.Unlock()
-		return ErrArchiveClosed
+		return m.archiveSyncError(progress, through, ErrArchiveClosed)
 	}
 	if batch := m.batch; batch != nil {
 		if through > batch.target {
 			batch.target = through
 		}
+		progress = &batch.progress
 		m.batchMu.Unlock()
 		select {
 		case <-ctx.Done():
-			return ctx.Err()
+			return m.archiveSyncError(progress, through, ctx.Err())
 		case <-batch.done:
 			if batch.err != nil {
-				return batch.err
+				return m.archiveSyncError(progress, through, batch.err)
 			}
 			return m.SyncThrough(ctx, core, through)
 		}
 	}
-	batch := &syncBatch{target: through, done: make(chan struct{})}
+	batch := &syncBatch{target: through, done: make(chan struct{}), progress: archiveSyncProgress{stage: "batch-coalesce", lockState: "not-held"}}
+	progress = &batch.progress
 	m.batch = batch
 	m.batchWG.Add(1)
 	m.batchMu.Unlock()
 	go m.flushBatch(batch, core)
 	select {
 	case <-ctx.Done():
-		return ctx.Err()
+		return m.archiveSyncError(progress, through, ctx.Err())
 	case <-batch.done:
-		return batch.err
+		return m.archiveSyncError(progress, through, batch.err)
 	}
+}
+
+// SyncPrefixThrough publishes only through the caller's fixed slot without
+// joining the ordinary coalescing batch. It retains the fresh HEAD/sealed
+// check from SyncThrough and the existing publication lease/CAS path. A
+// concurrent writer may publish a later HEAD independently; this call never
+// widens its own target to the live source tip.
+func (m *Manager) SyncPrefixThrough(ctx context.Context, core source, through quepaxa.Slot) error {
+	if through == 0 {
+		return nil
+	}
+	progress := &archiveSyncProgress{}
+	progress.set("fixed-prefix-head-refresh", "not-observed")
+
+	// Register this direct publication under the same close barrier used by
+	// batched work so Close cannot return while it is still publishing.
+	m.batchMu.Lock()
+	if m.closed {
+		m.batchMu.Unlock()
+		return m.archiveSyncError(progress, through, ErrArchiveClosed)
+	}
+	m.batchWG.Add(1)
+	m.batchMu.Unlock()
+	defer m.batchWG.Done()
+
+	workCtx, cancel := context.WithCancel(ctx)
+	stopClose := context.AfterFunc(m.ctx, cancel)
+	defer func() {
+		stopClose()
+		cancel()
+	}()
+	if err := m.ctx.Err(); err != nil {
+		return m.archiveSyncError(progress, through, ErrArchiveClosed)
+	}
+	if err := m.Load(workCtx); err != nil {
+		return m.archiveSyncError(progress, through, err)
+	}
+	if err := workCtx.Err(); err != nil {
+		return m.archiveSyncError(progress, through, err)
+	}
+	m.mu.Lock()
+	tip, sealed := m.tip, m.head.Sealed
+	m.mu.Unlock()
+	if sealed {
+		return ErrArchiveSealed
+	}
+	expectedPrefix, ok := core.PrefixHash(through)
+	if !ok {
+		return fmt.Errorf("archive source prefix %d is unavailable", through)
+	}
+	if tip >= through {
+		return m.requirePrefix(workCtx, through, expectedPrefix)
+	}
+	// Before extending a published archive, prove that its retained boundary
+	// is the same source history. Otherwise buildExtent could publish a new
+	// suffix that merely starts from a different prefix.
+	archivePrefix, err := m.prefixAt(workCtx, tip)
+	if err != nil {
+		return err
+	}
+	sourcePrefix, ok := core.PrefixHash(tip)
+	if !ok || sourcePrefix != archivePrefix {
+		return fmt.Errorf("archive source prefix mismatch at existing tip %d", tip)
+	}
+	progress.set("fixed-prefix-publish", "not-held")
+	if err := m.syncPrefixNow(workCtx, core, through, expectedPrefix); err != nil {
+		return m.archiveSyncError(progress, through, err)
+	}
+	if err := m.Load(workCtx); err != nil {
+		return m.archiveSyncError(progress, through, err)
+	}
+	m.mu.Lock()
+	sealed = m.head.Sealed
+	m.mu.Unlock()
+	if sealed {
+		return ErrArchiveSealed
+	}
+	return m.requirePrefix(workCtx, through, expectedPrefix)
+}
+
+func (m *Manager) requirePrefix(ctx context.Context, slot quepaxa.Slot, expected [32]byte) error {
+	actual, err := m.prefixAt(ctx, slot)
+	if err != nil {
+		return err
+	}
+	if actual != expected {
+		return fmt.Errorf("archive prefix mismatch at slot %d", slot)
+	}
+	return nil
+}
+
+func (m *Manager) requireSourceBoundary(ctx context.Context, core source, tip quepaxa.Slot) error {
+	archivePrefix, err := m.prefixAt(ctx, tip)
+	if err != nil {
+		return err
+	}
+	sourcePrefix, ok := core.PrefixHash(tip)
+	if !ok || sourcePrefix != archivePrefix {
+		return fmt.Errorf("archive source prefix mismatch at existing tip %d", tip)
+	}
+	return nil
+}
+
+// prefixAt reads a prefix from the last validated archive head. A prefix
+// below Base is intentionally unavailable: it cannot be reconstructed from
+// trimmed extents, even if the source still retains it.
+func (m *Manager) prefixAt(ctx context.Context, slot quepaxa.Slot) ([32]byte, error) {
+	m.mu.Lock()
+	head, tip := m.head, m.tip
+	refs := slices.Clone(m.extents)
+	m.mu.Unlock()
+	if slot < head.Base {
+		return [32]byte{}, fmt.Errorf("%w: archive prefix %d is below checkpoint base %d", quepaxa.ErrCompacted, slot, head.Base)
+	}
+	if slot == head.Base {
+		return head.BasePrefix, nil
+	}
+	if slot > tip {
+		return [32]byte{}, fmt.Errorf("archive prefix %d is beyond loaded tip %d", slot, tip)
+	}
+	for _, ref := range refs {
+		if slot < ref.Start || slot > ref.End {
+			continue
+		}
+		extent, err := m.extentForRef(ctx, ref)
+		if err != nil {
+			return [32]byte{}, err
+		}
+		prefix := extent.StartPrefix
+		for _, decision := range extent.Decisions {
+			prefix = quepaxa.AdvancePrefixHash(prefix, decision.Slot, decision.Hash)
+			if decision.Slot == slot {
+				return prefix, nil
+			}
+		}
+		return [32]byte{}, fmt.Errorf("archive extent omitted requested prefix %d", slot)
+	}
+	return [32]byte{}, fmt.Errorf("archive has no retained prefix %d", slot)
 }
 
 func (m *Manager) flushBatch(batch *syncBatch, core source) {
@@ -860,6 +1193,7 @@ func (m *Manager) flushBatch(batch *syncBatch, core source) {
 		if tip := core.Tip(); tip > target {
 			target = tip
 		}
+		batch.progress.set("archive-sync", "not-held")
 		ctx, cancel := context.WithTimeout(m.ctx, archiveSyncTimeout)
 		batch.err = m.syncNowBatch(ctx, core, target, batch)
 		cancel()
@@ -877,7 +1211,21 @@ func (m *Manager) syncNow(ctx context.Context, core source, through quepaxa.Slot
 }
 
 func (m *Manager) syncNowBatch(ctx context.Context, core source, through quepaxa.Slot, batch *syncBatch) error {
-	if m.Tip() >= through {
+	return m.syncNowBatchWithPrefix(ctx, core, through, batch, nil)
+}
+
+func (m *Manager) syncPrefixNow(ctx context.Context, core source, through quepaxa.Slot, expected [32]byte) error {
+	return m.syncNowBatchWithPrefix(ctx, core, through, nil, &expected)
+}
+
+func (m *Manager) syncNowBatchWithPrefix(ctx context.Context, core source, through quepaxa.Slot, batch *syncBatch, expectedPrefix *[32]byte) error {
+	var progress *archiveSyncProgress
+	if batch != nil {
+		progress = &batch.progress
+	} else {
+		progress = &archiveSyncProgress{}
+	}
+	if expectedPrefix == nil && m.Tip() >= through {
 		return nil
 	}
 	m.mu.Lock()
@@ -888,6 +1236,7 @@ func (m *Manager) syncNowBatch(ctx context.Context, core source, through quepaxa
 	}
 	// Another manager may already have durably published this batch's effective
 	// target. Only a validated, non-sealed remote HEAD can skip admission.
+	progress.set("archive-head-refresh", "not-held")
 	if err := m.Load(ctx); err == nil {
 		m.mu.Lock()
 		tip, sealed := m.tip, m.head.Sealed
@@ -896,10 +1245,17 @@ func (m *Manager) syncNowBatch(ctx context.Context, core source, through quepaxa
 			return ErrArchiveSealed
 		}
 		if tip >= through {
+			if expectedPrefix != nil {
+				return m.requirePrefix(ctx, through, *expectedPrefix)
+			}
 			return nil
 		}
+	} else if ctx.Err() != nil {
+		return ctx.Err()
 	}
-	return m.withPublicationLockRecheck(ctx, "archive-sync", func(ctx context.Context) (bool, error) {
+	progress.set("publication-lock", "not-held")
+	err := m.withPublicationLockRecheckProgress(ctx, "archive-sync", func(ctx context.Context) (bool, error) {
+		progress.set("lock-recheck-head-refresh", "busy")
 		if err := m.Load(ctx); err != nil {
 			if ctxErr := ctx.Err(); ctxErr != nil {
 				return false, ctxErr
@@ -912,8 +1268,17 @@ func (m *Manager) syncNowBatch(ctx context.Context, core source, through quepaxa
 		if sealed {
 			return false, ErrArchiveSealed
 		}
+		if expectedPrefix != nil && tip < through {
+			if err := m.requireSourceBoundary(ctx, core, tip); err != nil {
+				return false, err
+			}
+		}
+		if expectedPrefix != nil && tip >= through {
+			return false, m.requirePrefix(ctx, through, *expectedPrefix)
+		}
 		return tip >= through, nil
 	}, func(ctx context.Context) error {
+		progress.set("head-refresh-under-lock", "held")
 		m.transitionMu.Lock()
 		defer m.transitionMu.Unlock()
 		if err := m.Load(ctx); err != nil {
@@ -931,17 +1296,37 @@ func (m *Manager) syncNowBatch(ctx context.Context, core source, through quepaxa
 				through = tip
 			}
 		}
-		return m.syncNowLocked(ctx, core, through)
-	})
+		return m.syncNowLockedWithExpectedPrefix(ctx, core, through, progress, expectedPrefix)
+	}, progress)
+	if batch == nil {
+		return err
+	}
+	return m.archiveSyncError(progress, through, err)
 }
 
 func (m *Manager) syncNowLocked(ctx context.Context, core source, through quepaxa.Slot) error {
+	return m.syncNowLockedWithProgress(ctx, core, through, nil)
+}
+
+func (m *Manager) syncNowLockedWithProgress(ctx context.Context, core source, through quepaxa.Slot, progress *archiveSyncProgress) error {
+	return m.syncNowLockedWithExpectedPrefix(ctx, core, through, progress, nil)
+}
+
+func (m *Manager) syncNowLockedWithExpectedPrefix(ctx context.Context, core source, through quepaxa.Slot, progress *archiveSyncProgress, expectedPrefix *[32]byte) error {
 	for attempt := 0; attempt < maxPublishRetries; attempt++ {
 		m.mu.Lock()
 		tip, head, refs, headCAS := m.tip, m.head, slices.Clone(m.extents), m.headCAS
 		m.mu.Unlock()
 		if head.Sealed {
 			return ErrArchiveSealed
+		}
+		if expectedPrefix != nil {
+			if tip >= through {
+				return m.requirePrefix(ctx, through, *expectedPrefix)
+			}
+			if err := m.requireSourceBoundary(ctx, core, tip); err != nil {
+				return err
+			}
 		}
 		if tip >= through {
 			return nil
@@ -956,6 +1341,7 @@ func (m *Manager) syncNowLocked(ctx context.Context, core source, through quepax
 		nextGeneration := head.Generation + 1
 		previous, previousObject := head.TailHash, head.TailObject
 		from := tip + 1
+		progress.set("extent-build-upload", "held")
 		for from <= through {
 			extent, data, sourceTip, err := m.buildExtent(core, from, through, previous, previousObject)
 			if err != nil {
@@ -986,11 +1372,14 @@ func (m *Manager) syncNowLocked(ctx context.Context, core source, through quepax
 			from = extent.End + 1
 		}
 		head.Generation = nextGeneration
+		progress.set("head-publish", "held")
 		if err := m.publishHead(ctx, head, headCAS); err == nil {
+			progress.set("head-readback", "held")
 			return m.refreshPublishedHead(ctx, head, headCAS, append(refs, added...), cacheTail[:cacheTailCount]...)
 		} else if !m.cas {
 			return err
 		}
+		progress.set("publish-conflict-refresh", "held")
 		if err := m.Load(ctx); err != nil {
 			return err
 		}
@@ -1430,18 +1819,49 @@ func (m *Manager) cleanupDeletes(ctx context.Context, grace time.Duration, keep 
 		return err
 	}
 	_ = archiveGCTrace(ctx, "readers", func() error { m.waitReaders(); return nil })
-	markers := make(map[string]time.Time)
+	type gcMarker struct {
+		modified time.Time
+		version  *objstore.ObjectVersion
+	}
+	versionedDelete := objmetrics.SupportsVersionedDelete(m.bucket)
+	var deferredDeletes atomic.Uint64
+	var deferredMarkerMu sync.Mutex
+	deferredMarkers := make(map[string]struct{})
+	markDeferredMarker := func(marker string) {
+		deferredMarkerMu.Lock()
+		deferredMarkers[marker] = struct{}{}
+		deferredMarkerMu.Unlock()
+	}
+	deleteSelected := func(deleteCtx context.Context, name string, version *objstore.ObjectVersion) (bool, error) {
+		err := objmetrics.DeleteSelectedVersion(deleteCtx, m.bucket, name, version)
+		if errors.Is(err, fencing.ErrMutationDeferred) {
+			deferredDeletes.Add(1)
+			deferredMarkerMu.Lock()
+			deferredMarkers[name] = struct{}{}
+			deferredMarkerMu.Unlock()
+			return true, nil
+		}
+		if err != nil && !m.bucket.IsObjNotFoundErr(err) {
+			return false, err
+		}
+		return false, nil
+	}
+	markers := make(map[string]gcMarker)
 	localtesthooks.HitArchiveGCPhase(ctx, "archive-gc:candidate-scan:begin")
 	err = m.bucket.IterWithAttributes(ctx, m.key("archive/gc-candidates"), func(attributes objstore.IterObjectAttributes) error {
 		modified, ok := attributes.LastModified()
-		if !ok {
+		var version *objstore.ObjectVersion
+		if !ok || versionedDelete {
 			objectAttributes, err := m.bucket.Attributes(ctx, attributes.Name)
 			if err != nil {
 				return err
 			}
-			modified = objectAttributes.LastModified
+			if !ok {
+				modified = objectAttributes.LastModified
+			}
+			version = objectAttributes.Version
 		}
-		markers[attributes.Name] = modified
+		markers[attributes.Name] = gcMarker{modified: modified, version: version}
 		return nil
 	}, objstore.WithUpdatedAt(), objstore.WithRecursiveIter())
 	if err != nil {
@@ -1451,7 +1871,7 @@ func (m *Manager) cleanupDeletes(ctx context.Context, grace time.Duration, keep 
 	localtesthooks.HitArchiveGCPhase(ctx, "archive-gc:candidate-scan:success")
 	deleteCtx, cancelDeletes := context.WithCancel(ctx)
 	defer cancelDeletes()
-	deletes, deleteCtx := errgroup.WithContext(deleteCtx)
+	var deletes errgroup.Group
 	deletes.SetLimit(4)
 	for _, dir := range []string{"archive/manifests", "archive/blocks"} {
 		localtesthooks.HitArchiveGCPhase(deleteCtx, "archive-gc:object-scan:begin")
@@ -1460,7 +1880,7 @@ func (m *Manager) cleanupDeletes(ctx context.Context, grace time.Duration, keep 
 				return err
 			}
 			marker := m.gcMarkerKey(name)
-			markedAt, marked := markers[marker]
+			markerState, marked := markers[marker]
 			delete(markers, marker)
 			if dir == "archive/blocks" {
 				generation, ok := extentObjectGeneration(name)
@@ -1469,20 +1889,22 @@ func (m *Manager) cleanupDeletes(ctx context.Context, grace time.Duration, keep 
 				}
 				if generation > gcGeneration {
 					if marked {
-						return m.bucket.Delete(ctx, marker)
+						_, err := deleteSelected(ctx, marker, markerState.version)
+						return err
 					}
 					return nil
 				}
 				if pinnedGeneration != 0 && generation <= pinnedGeneration {
 					if marked {
-						return m.bucket.Delete(ctx, marker)
+						_, err := deleteSelected(ctx, marker, markerState.version)
+						return err
 					}
 					return nil
 				}
 			}
 			if _, ok := keep[name]; ok {
 				if marked {
-					if err := m.bucket.Delete(ctx, marker); err != nil && !m.bucket.IsObjNotFoundErr(err) {
+					if _, err := deleteSelected(ctx, marker, markerState.version); err != nil {
 						return err
 					}
 				}
@@ -1495,17 +1917,34 @@ func (m *Manager) cleanupDeletes(ctx context.Context, grace time.Duration, keep 
 				}
 				return nil
 			}
-			if markedAt.After(cutoff) {
+			if markerState.modified.After(cutoff) {
 				return nil
+			}
+			var objectVersion *objstore.ObjectVersion
+			if versionedDelete {
+				objectAttributes, err := m.bucket.Attributes(deleteCtx, name)
+				if err != nil {
+					if m.bucket.IsObjNotFoundErr(err) {
+						_, deleteErr := deleteSelected(deleteCtx, marker, markerState.version)
+						return deleteErr
+					}
+					return err
+				}
+				objectVersion = objectAttributes.Version
 			}
 			deletes.Go(func() error {
 				if err := deleteCtx.Err(); err != nil {
 					return err
 				}
-				if err := m.bucket.Delete(deleteCtx, name); err != nil && !m.bucket.IsObjNotFoundErr(err) {
+				deferred, err := deleteSelected(deleteCtx, name, objectVersion)
+				if deferred {
+					markDeferredMarker(marker)
+					return nil
+				}
+				if err != nil {
 					return err
 				}
-				if err := m.bucket.Delete(deleteCtx, marker); err != nil && !m.bucket.IsObjNotFoundErr(err) {
+				if _, err := deleteSelected(deleteCtx, marker, markerState.version); err != nil {
 					return err
 				}
 				return nil
@@ -1523,13 +1962,22 @@ func (m *Manager) cleanupDeletes(ctx context.Context, grace time.Duration, keep 
 		return err
 	}
 	localtesthooks.HitArchiveGCPhase(ctx, "archive-gc:marker-cleanup:begin")
-	for marker := range markers {
-		if err := m.bucket.Delete(ctx, marker); err != nil && !m.bucket.IsObjNotFoundErr(err) {
+	for marker, state := range markers {
+		deferredMarkerMu.Lock()
+		_, deferred := deferredMarkers[marker]
+		deferredMarkerMu.Unlock()
+		if deferred {
+			continue
+		}
+		if _, err := deleteSelected(ctx, marker, state.version); err != nil {
 			localtesthooks.HitArchiveGCPhase(ctx, "archive-gc:marker-cleanup:error")
 			return err
 		}
 	}
 	localtesthooks.HitArchiveGCPhase(ctx, "archive-gc:marker-cleanup:success")
+	if count := deferredDeletes.Load(); count != 0 {
+		return fmt.Errorf("%w: %d exact deletion(s) remain marked for a later cleanup", ErrArchiveDeferredDeletion, count)
+	}
 	return nil
 }
 
@@ -1757,6 +2205,10 @@ func (m *Manager) withPublicationLock(ctx context.Context, owner string, work fu
 // withPublicationLockRecheck may acknowledge completed work only after a busy,
 // unentered admission attempt. Other publication paths keep their old behavior.
 func (m *Manager) withPublicationLockRecheck(ctx context.Context, owner string, recheck func(context.Context) (bool, error), work func(context.Context) error) error {
+	return m.withPublicationLockRecheckProgress(ctx, owner, recheck, work, nil)
+}
+
+func (m *Manager) withPublicationLockRecheckProgress(ctx context.Context, owner string, recheck func(context.Context) (bool, error), work func(context.Context) error, progress *archiveSyncProgress) error {
 	if err := ctx.Err(); err != nil {
 		return err
 	}
@@ -1764,9 +2216,17 @@ func (m *Manager) withPublicationLockRecheck(ctx context.Context, owner string, 
 		entered := false
 		err := m.withArchiveLock(ctx, m.publicationLockKey(), owner, false, func(workCtx context.Context) error {
 			entered = true
+			progress.set("publication-lock", "held")
 			return work(workCtx)
 		})
 		if entered || !errors.Is(err, ErrArchiveBusy) {
+			if entered {
+				if err == nil {
+					progress.set("publication-lock-release", "released")
+				} else {
+					progress.setLockState("unknown")
+				}
+			}
 			if errors.Is(err, ErrArchiveBusy) {
 				m.traceArchiveBusy(ctx, owner, m.publicationLockKey(), "returned", "terminal", entered)
 			}
@@ -1776,6 +2236,7 @@ func (m *Manager) withPublicationLockRecheck(ctx context.Context, owner string, 
 			m.traceArchiveBusy(ctx, owner, m.publicationLockKey(), "returned", "terminal", false)
 			return err
 		}
+		progress.set("publication-lock", "busy")
 		timer := time.NewTimer(50 * time.Millisecond)
 		select {
 		case <-ctx.Done():

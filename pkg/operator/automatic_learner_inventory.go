@@ -2,6 +2,7 @@ package operator
 
 import (
 	"context"
+	"errors"
 	"fmt"
 
 	"github.com/thanos-io/objstore"
@@ -16,7 +17,8 @@ const maxLearnerHistory = 64
 func learnerFenceTarget(state *autoControl, name, uid, wal string) FenceTarget {
 	target := FenceTarget{NodeID: name, Pod: name, PodUID: uid, WALIdentity: wal}
 	for _, entry := range state.Learners {
-		if entry.SourceClusterID == state.ActiveClusterID && entry.Target.Pod == name && entry.Target.PodUID == uid {
+		if entry.SourceClusterID == state.ActiveClusterID && entry.Target.NodeID == name && entry.Target.PodUID == uid {
+			target.Pod = entry.Target.Pod
 			target.NodeName, target.NodeUID, target.ContainerID, target.ImageID = entry.Target.NodeName, entry.Target.NodeUID, entry.Target.ContainerID, entry.Target.ImageID
 		}
 	}
@@ -28,10 +30,14 @@ func rememberLearner(state *autoControl, entry learnerIncarnation) error {
 		return err
 	}
 	for i, old := range state.Learners {
-		if old.SourceClusterID != entry.SourceClusterID || old.Target.Pod != entry.Target.Pod {
+		if old.SourceClusterID != entry.SourceClusterID || old.Target.NodeID != entry.Target.NodeID || old.Target.PodUID != entry.Target.PodUID {
 			continue
 		}
-		if old.Target.PodUID != entry.Target.PodUID || old.OperationID != entry.OperationID || old.CredentialUID != entry.CredentialUID || old.Target.NodeID != entry.Target.NodeID || (old.Target.WALIdentity != "" && old.Target.WALIdentity != entry.Target.WALIdentity) {
+		oldCredentialName := old.CredentialName
+		if oldCredentialName == "" {
+			oldCredentialName = old.Target.Pod + "-credentials"
+		}
+		if old.Target.Pod != entry.Target.Pod || old.OperationID != entry.OperationID || oldCredentialName != entry.CredentialName || old.CredentialUID != entry.CredentialUID || (old.Target.WALIdentity != "" && old.Target.WALIdentity != entry.Target.WALIdentity) {
 			return fmt.Errorf("learner incarnation history conflicts")
 		}
 		state.Learners[i] = entry
@@ -46,11 +52,11 @@ func rememberLearner(state *autoControl, entry learnerIncarnation) error {
 
 func validateLearnerHistory(entries []learnerIncarnation) error {
 	for i, entry := range entries {
-		if entry.SourceClusterID == "" || entry.OperationID == "" || entry.Target.PodUID == "" || entry.Target.NodeID != entry.Target.Pod || !identifier.MatchString(entry.Target.Pod) {
+		if entry.SourceClusterID == "" || entry.OperationID == "" || entry.Target.PodUID == "" || !identifier.MatchString(entry.Target.NodeID) || !identifier.MatchString(entry.Target.Pod) {
 			return fmt.Errorf("invalid learner history")
 		}
 		for _, old := range entries[:i] {
-			if old.SourceClusterID == entry.SourceClusterID && (old.Target.Pod == entry.Target.Pod || old.Target.PodUID == entry.Target.PodUID) {
+			if old.SourceClusterID == entry.SourceClusterID && (old.Target.NodeID == entry.Target.NodeID || old.Target.PodUID == entry.Target.PodUID) {
 				return fmt.Errorf("duplicate learner history")
 			}
 		}
@@ -68,7 +74,7 @@ func includeLearnerHistory(state *autoControl, request *FenceRequest) error {
 		}
 		found := false
 		for _, target := range request.Targets {
-			if target.Pod == entry.Target.Pod {
+			if target.NodeID == entry.Target.NodeID || target.PodUID == entry.Target.PodUID {
 				if target != entry.Target {
 					return fmt.Errorf("learner generation inventory conflicts")
 				}
@@ -91,11 +97,15 @@ func learnerTargetCovered(target FenceTarget, targets []FenceTarget) bool {
 	return false
 }
 
-// compactLearnerHistory retries every retained incarnation on each reconcile.
+// compactLearnerHistory re-queries trusted fencing status for every eligible incarnation.
 // An in-flight intent only protects its own targets, active voters, and current
 // learner; unrelated entries remain eligible for ledger-backed compaction.
-func (c *Controller) compactLearnerHistory(ctx context.Context, state *autoControl) (bool, error) {
+func (c *Controller) compactLearnerHistory(ctx context.Context, r *ClusterResource, state *autoControl) (bool, error) {
 	if err := validateLearnerHistory(state.Learners); err != nil {
+		return false, err
+	}
+	journalRefs, err := c.journalReferencedLearners(ctx, r, state)
+	if err != nil {
 		return false, err
 	}
 	protected := make(map[string]bool)
@@ -113,10 +123,11 @@ func (c *Controller) compactLearnerHistory(ctx context.Context, state *autoContr
 			protected[target.Pod] = true
 		}
 		protected[intent.LearnerName] = true
+		protected[learnerPhysicalPod(intent)] = true
 	}
 	retained := make([]learnerIncarnation, 0, len(state.Learners))
 	for _, entry := range state.Learners {
-		if protected[string(entry.Target.NodeID)] || protected[entry.Target.Pod] {
+		if protected[string(entry.Target.NodeID)] || protected[entry.Target.Pod] || journalRefs[learnerHistoryKey(entry)] {
 			retained = append(retained, entry)
 			continue
 		}
@@ -124,13 +135,17 @@ func (c *Controller) compactLearnerHistory(ctx context.Context, state *autoContr
 			retained = append(retained, entry)
 			continue
 		}
-		proven := false
-		if entry.Retirement != nil && learnerTargetCovered(entry.Target, entry.Retirement.Request.Targets) && validateFenceProof(entry.Retirement.Request, &entry.Retirement.Proof) == nil {
-			proven = true
-		}
-		if !proven && c.verifyTerminatedCleanup(ctx, state.StatefulSetUID, entry) != nil {
+		request := learnerRetirementRequest(c, r, state, entry)
+		proof, err := c.fence(ctx, request)
+		if errors.Is(err, ErrFencePending) {
 			retained = append(retained, entry)
 			continue
+		}
+		if err != nil {
+			return false, fmt.Errorf("query canonical learner retirement for %q: %w", entry.Target.PodUID, err)
+		}
+		if err := proofCoversLearner(request, proof, entry.Target); err != nil {
+			return false, err
 		}
 		if !c.retireLearnerCredential(ctx, entry) {
 			retained = append(retained, entry)
@@ -140,9 +155,61 @@ func (c *Controller) compactLearnerHistory(ctx context.Context, state *autoContr
 	changed := len(retained) != len(state.Learners)
 	state.Learners = retained
 	if len(state.Learners) > maxLearnerHistory {
-		return changed, fmt.Errorf("learner history has %d entries and cannot be compacted; restore the fencing ledger for the affected generations or remove verified completed generation learners", len(state.Learners))
+		return changed, fmt.Errorf("learner history has %d entries and cannot be compacted; restore canonical fencing evidence for the affected generations or remove verified completed generation learners", len(state.Learners))
 	}
 	return changed, nil
+}
+
+func learnerHistoryKey(entry learnerIncarnation) string {
+	return hashJSON([]string{entry.SourceClusterID, entry.Target.PodUID})
+}
+
+// journalReferencedLearners retains the exact history entry needed to validate
+// a still-journaled ADD. An unresolved canonical child blocks compaction rather
+// than guessing which old credential the journal references.
+func (c *Controller) journalReferencedLearners(ctx context.Context, r *ClusterResource, state *autoControl) (map[string]bool, error) {
+	intent := state.Intent
+	if intent == nil || intent.RecoveryName == "" {
+		return nil, nil
+	}
+	var child Resource
+	err := c.Kube.Get(ctx, c.resourcePath(intent.RecoveryName), &child)
+	if intent.RecoveryUID == "" || intent.SpecHash == "" {
+		if apiNotFound(err) {
+			return nil, nil
+		}
+		return nil, fmt.Errorf("canonical recovery child checkpoint is incomplete; refusing learner-history compaction")
+	}
+	if err != nil {
+		return nil, fmt.Errorf("resolve canonical recovery child before learner-history compaction: %w", err)
+	}
+	if resourceName(&child) != intent.RecoveryName || str(child.Metadata["uid"]) != intent.RecoveryUID ||
+		hashJSON(child.Spec) != intent.SpecHash ||
+		str(nested(child.Metadata, "annotations", automaticOwner)) != state.BindingUID ||
+		str(nested(child.Metadata, "annotations", automaticLogical)) != r.Spec.LogicalID {
+		return nil, fmt.Errorf("canonical recovery child differs from intent; refusing learner-history compaction")
+	}
+	if child.Status.Membership == nil || child.Status.Membership.Add == nil {
+		return nil, nil
+	}
+	if child.Spec.Membership == nil {
+		return nil, fmt.Errorf("canonical recovery ADD has no membership specification; refusing learner-history compaction")
+	}
+	add := child.Status.Membership.Add
+	var match *learnerIncarnation
+	for i := range state.Learners {
+		entry := &state.Learners[i]
+		if entry.SourceClusterID == child.Spec.SourceClusterID && string(entry.Target.NodeID) == string(add.MemberID) && entry.CredentialUID == add.SecretUID {
+			if match != nil {
+				return nil, fmt.Errorf("canonical recovery ADD matches multiple learner histories; refusing compaction")
+			}
+			match = entry
+		}
+	}
+	if match == nil || add.OperationID != membershipOperationID(&child, "add") || add.RequestHash == "" || add.SecretResourceVer == "" {
+		return nil, fmt.Errorf("canonical recovery ADD does not resolve to one exact learner history; refusing compaction")
+	}
+	return map[string]bool{learnerHistoryKey(*match): true}, nil
 }
 
 func (c *Controller) learnerPodUIDGone(ctx context.Context, name, uid string) bool {
@@ -161,8 +228,12 @@ func (c *Controller) retireLearnerCredential(ctx context.Context, entry learnerI
 	if entry.CredentialUID == "" {
 		return false
 	}
+	name := entry.CredentialName
+	if name == "" {
+		name = entry.Target.Pod + "-credentials"
+	}
 	var secret object
-	err := c.Kube.Get(ctx, c.corePath("secrets", entry.Target.Pod+"-credentials"), &secret)
+	err := c.Kube.Get(ctx, c.corePath("secrets", name), &secret)
 	if apiNotFound(err) {
 		return true
 	}
@@ -172,42 +243,50 @@ func (c *Controller) retireLearnerCredential(ctx context.Context, entry learnerI
 	if str(nested(secret, "metadata", "uid")) != entry.CredentialUID {
 		return true
 	}
-	if err := c.Kube.DeleteSecret(ctx, c.Kube.Namespace, entry.Target.Pod+"-credentials", entry.CredentialUID); err != nil {
+	if err := c.Kube.DeleteSecret(ctx, c.Kube.Namespace, name, entry.CredentialUID); err != nil {
 		return apiNotFound(err)
 	}
 	return true
 }
 
-func (c *Controller) verifyTerminatedCleanup(ctx context.Context, stsUID string, entry learnerIncarnation) error {
-	ledger, err := (&FencingExecutor{Kube: c.Kube}).read(ctx, stsUID, entry.SourceClusterID)
-	if err != nil {
-		return err
+func learnerRetirementRequest(c *Controller, r *ClusterResource, state *autoControl, entry learnerIncarnation) FenceRequest {
+	if entry.Retirement != nil {
+		return entry.Retirement.Request
 	}
-	found := false
-	for _, run := range ledger.Ledger.Runs {
-		if run.Identity.PodUID != entry.Target.PodUID {
-			continue
-		}
-		found = true
-		if run.Identity.NodeID != entry.Target.NodeID || run.Identity.SourceClusterID != entry.SourceClusterID || run.Stop == nil {
-			return fmt.Errorf("learner run identity differs")
-		}
-		if entry.Target.WALIdentity == "" {
-			if run.Identity.WALIdentity != "" || run.NeverBoundExit == nil || *run.NeverBoundExit != *run.Stop {
-				return fmt.Errorf("learner never-bound exit is not proven")
-			}
-		} else if run.Identity.WALIdentity != entry.Target.WALIdentity || !run.Exited || run.Drain == nil || run.Drain.Request != *run.Stop || !run.Drain.Clean() {
-			return fmt.Errorf("learner termination proof is incomplete")
+	request := FenceRequest{
+		LogicalID:       str(r.Spec.LogicalID),
+		BindingUID:      state.BindingUID,
+		Namespace:       c.Kube.Namespace,
+		StatefulSet:     r.Spec.StatefulSet,
+		StatefulSetUID:  state.StatefulSetUID,
+		SourceClusterID: entry.SourceClusterID,
+		Scope:           ScopeVoter,
+		Targets:         []FenceTarget{entry.Target},
+	}
+	request.OperationID = "learner-retire-" + hashJSON([]any{state.BindingUID, state.StatefulSetUID, entry.SourceClusterID, entry.OperationID, entry.Target})[:32]
+	return request
+}
+
+func proofCoversLearner(request FenceRequest, proof *FenceProof, target FenceTarget) error {
+	if proof == nil || !learnerTargetCovered(target, request.Targets) {
+		return fmt.Errorf("learner retirement proof omits the captured target")
+	}
+	if proof.IndependentV2 == nil {
+		// The configured Fencer is the trusted status API for the cooperative
+		// backend; its validated proof represents its complete ledger check.
+		return nil
+	}
+	for _, ref := range proof.IndependentV2.Terminals {
+		id := ref.Request.Identity
+		if id.SourceClusterID == request.SourceClusterID && id.NodeID == target.NodeID && id.PodUID == target.PodUID && id.WALIdentity == target.WALIdentity {
+			return nil
 		}
 	}
-	if !found {
-		return fmt.Errorf("learner run is absent from the fencing ledger")
-	}
-	return nil
+	return fmt.Errorf("canonical learner retirement proof omits the exact captured run")
 }
 
 func (c *Controller) prepareLearnerProvisioning(ctx context.Context, r *ClusterResource, state *autoControl, version *objstore.ObjectVersion) (bool, error) {
-	changed, err := c.compactLearnerHistory(ctx, state)
+	changed, err := c.compactLearnerHistory(ctx, r, state)
 	if err != nil {
 		return true, c.autoStatus(ctx, r, state, "Blocked", err.Error())
 	}
@@ -227,7 +306,7 @@ func (c *Controller) prepareLearnerProvisioning(ctx context.Context, r *ClusterR
 		return true, c.autoStatus(ctx, r, state, "Blocked", "online learner replacement cannot reserve its fallback generation fence: "+err.Error()+"; use whole-generation recovery instead")
 	}
 	if len(state.Learners) >= maxLearnerHistory {
-		return true, c.autoStatus(ctx, r, state, "Blocked", fmt.Sprintf("learner history is full (%d) and no ledger proof can compact it; restore the fencing ledger or remove verified completed-generation learners", maxLearnerHistory))
+		return true, c.autoStatus(ctx, r, state, "Blocked", fmt.Sprintf("learner history is full (%d) and canonical fencing status cannot compact it; restore canonical fencing evidence or remove verified completed-generation learners", maxLearnerHistory))
 	}
 	return false, nil
 }
@@ -251,12 +330,14 @@ func worstCaseGenerationTargets(state *autoControl) int {
 func (c *Controller) learnerInventoryEntry(ctx context.Context, state *autoControl, sts object, pod object) (learnerIncarnation, error) {
 	i := state.Intent
 	name, uid := str(nested(pod, "metadata", "name")), str(nested(pod, "metadata", "uid"))
-	entry := learnerIncarnation{SourceClusterID: state.ActiveClusterID, OperationID: i.Request.OperationID, Target: capturedFenceIdentity(FenceTarget{NodeID: name, Pod: name, PodUID: uid, WALIdentity: i.LearnerWAL}, pod)}
-	if uid == "" || name != i.LearnerName || (i.LearnerUID != "" && uid != i.LearnerUID) {
+	physical := learnerPhysicalPod(i)
+	entry := learnerIncarnation{SourceClusterID: state.ActiveClusterID, OperationID: i.Request.OperationID, CredentialName: learnerCredentialName(i), CredentialUID: i.LearnerSecretUID,
+		Target: capturedFenceIdentity(FenceTarget{NodeID: i.LearnerName, Pod: physical, PodUID: uid, WALIdentity: i.LearnerWAL}, pod)}
+	if uid == "" || name != physical || i.LearnerName == "" || (i.LearnerUID != "" && uid != i.LearnerUID) {
 		return entry, fmt.Errorf("learner Pod identity differs")
 	}
 	supervised := str(nested(sts, "spec", "template", "metadata", "annotations", fencingProtocolAnnotation)) == "1"
-	if supervised {
+	if supervised && i.LearnerPodName == "" {
 		refs := list(nested(pod, "metadata", "ownerReferences"))
 		if len(refs) != 1 {
 			return entry, fmt.Errorf("learner owner differs")
@@ -268,16 +349,21 @@ func (c *Controller) learnerInventoryEntry(ctx context.Context, state *autoContr
 		if err := validateSupervisedPod(pod); err != nil {
 			return entry, err
 		}
-		if err := (&FencingExecutor{Kube: c.Kube}).validateLearnerBinding(ctx, pod, str(nested(sts, "metadata", "name"))); err != nil {
+		if err := (&FencingExecutor{Kube: c.Kube, LegacyCooperativeControlState: true}).validateLearnerBinding(ctx, pod, str(nested(sts, "metadata", "name"))); err != nil {
 			return entry, err
 		}
 	}
 	var credential object
-	if err := c.Kube.Get(ctx, c.corePath("secrets", name+"-credentials"), &credential); err != nil {
+	secretName := learnerCredentialName(i)
+	if err := c.Kube.Get(ctx, c.corePath("secrets", secretName), &credential); err != nil {
 		return entry, err
 	}
-	entry.CredentialUID = str(nested(credential, "metadata", "uid"))
-	if supervised && entry.CredentialUID != str(nested(pod, "metadata", "annotations", fencingCredentialAnnotation)) {
+	credentialUID := str(nested(credential, "metadata", "uid"))
+	if entry.CredentialUID != "" && credentialUID != entry.CredentialUID {
+		return entry, fmt.Errorf("learner credential UID differs from its canonical assignment")
+	}
+	entry.CredentialUID = credentialUID
+	if supervised && i.LearnerPodName == "" && entry.CredentialUID != str(nested(pod, "metadata", "annotations", fencingCredentialAnnotation)) {
 		return entry, fmt.Errorf("learner credential UID differs")
 	}
 	if entry.CredentialUID == "" {
@@ -295,7 +381,7 @@ func (c *Controller) recoverLearnerInventory(ctx context.Context, r *ClusterReso
 	}
 	seen := false
 	for _, old := range state.Learners {
-		if old.SourceClusterID != state.ActiveClusterID || old.Target.Pod != i.LearnerName {
+		if old.SourceClusterID != state.ActiveClusterID || old.Target.NodeID != i.LearnerName || old.Target.Pod != learnerPhysicalPod(i) {
 			continue
 		}
 		if seen || old.Target.PodUID != i.LearnerUID || old.Target.WALIdentity != i.LearnerWAL || old.OperationID != i.Request.OperationID {
@@ -307,7 +393,7 @@ func (c *Controller) recoverLearnerInventory(ctx context.Context, r *ClusterReso
 		return false, nil
 	}
 	var pod object
-	if err := c.Kube.Get(ctx, c.corePath("pods", i.LearnerName), &pod); err != nil {
+	if err := c.Kube.Get(ctx, c.corePath("pods", learnerPhysicalPod(i)), &pod); err != nil {
 		if apiNotFound(err) {
 			return false, nil
 		}
@@ -325,29 +411,24 @@ func (c *Controller) recoverLearnerInventory(ctx context.Context, r *ClusterReso
 }
 
 func (c *Controller) verifyNeverBoundCleanup(ctx context.Context, request FenceRequest, proof *FenceProof, target FenceTarget) error {
-	state, err := (&FencingExecutor{Kube: c.Kube}).read(ctx, request.StatefulSetUID, request.SourceClusterID)
+	verified, err := c.fence(ctx, request)
 	if err != nil {
 		return err
 	}
-	hash, err := requestHash(&request)
-	if err != nil {
-		return err
+	if proof == nil || verified.ProofID != proof.ProofID {
+		return fmt.Errorf("never-bound cleanup proof differs from canonical fencing status")
 	}
-	if proof.ProofID != "cooperative-"+hashJSON(state) || !state.Ledger.CompleteNodes(request.OperationID, hash, nil, []string{target.PodUID}) {
-		return fmt.Errorf("never-bound cleanup lacks exact complete ledger proof")
-	}
-	found := false
-	for _, run := range state.Ledger.Runs {
-		if run.Identity.PodUID != target.PodUID {
-			continue
+	if verified.IndependentV2 != nil {
+		for _, ref := range verified.IndependentV2.Terminals {
+			id := ref.Request.Identity
+			if id.SourceClusterID == request.SourceClusterID && id.NodeID == target.NodeID && id.PodUID == target.PodUID && id.WALIdentity == "" {
+				return nil
+			}
 		}
-		if run.Identity.NodeID != target.NodeID || run.Identity.SourceClusterID != request.SourceClusterID || run.Identity.WALIdentity != "" || run.NeverBoundExit == nil {
-			return fmt.Errorf("learner was bound or has unknown startup history")
-		}
-		found = true
+		return fmt.Errorf("never-bound cleanup lacks an exact canonical never-bound terminal")
 	}
-	if !found {
-		return fmt.Errorf("never-bound learner is absent from ledger")
+	if !learnerTargetCovered(target, request.Targets) {
+		return fmt.Errorf("never-bound cleanup target is outside the canonical request")
 	}
 	return nil
 }

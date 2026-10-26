@@ -36,9 +36,27 @@ func (c *Controller) verifyAutomaticCompletion(ctx context.Context, r *ClusterRe
 		if remove.OperationID != membershipOperationID(child, "remove") || remove.ClusterID != state.ActiveClusterID || remove.Remove != i.Failed || !sameFence(remove.Fence, m.Fence) {
 			return fmt.Errorf("committed removal differs from fenced intent")
 		}
+		if m.ReplacementPod != learnerPhysicalPod(i) || m.ReplacementSecret != learnerCredentialName(i) {
+			return fmt.Errorf("replacement physical Pod or credential name differs from the frozen assignment")
+		}
+		if i.LearnerPodName != "" {
+			assignment, err := sameOrdinalAssignmentDigest(state, i)
+			if err != nil || assignment != i.LearnerAssignmentID || i.LearnerAssignmentID == "" {
+				return fmt.Errorf("same-ordinal learner assignment digest differs from the completed child")
+			}
+		}
 		member, uid, rv, err := c.replacementMember(ctx, m.ReplacementSecret)
 		if err != nil {
 			return err
+		}
+		if i.LearnerSecretName != "" {
+			var secret object
+			if err := c.Kube.Get(ctx, c.corePath("secrets", i.LearnerSecretName), &secret); err != nil {
+				return err
+			}
+			if secret["immutable"] != true || uid != i.LearnerSecretUID || rv != i.LearnerSecretRV || hashJSON(secret["data"]) != i.LearnerSecretHash {
+				return fmt.Errorf("committed learner credential differs from the frozen Pod assignment")
+			}
 		}
 		member.WALIdentity = i.LearnerWAL
 		add := journal.Add
@@ -48,7 +66,16 @@ func (c *Controller) verifyAutomaticCompletion(ctx context.Context, r *ClusterRe
 		}
 		return nil
 	}
-	if child.Status.Stage != "Complete" || child.Status.Source != state.ActiveClusterID || child.Status.StatefulSetUID != state.StatefulSetUID || child.Status.RecoveryID != child.Spec.RecoveryID || child.Status.SpecHash != immutableSpecHash(child.Spec) || child.Status.Target != "rhiza-r-"+shortID(c.operationID(child)) || child.Status.SecretName != "rhiza-recovery-"+shortID(c.operationID(child)) || child.Status.RecoveredTip == 0 || child.Status.ManifestHash == "" {
+	targetBaseKind := child.Status.TargetBaseKind
+	if targetBaseKind == "" && child.Status.Stage == "Complete" {
+		// Completed legacy entries predate explicit base-kind tracking and
+		// required a nonzero fork tip. Keep the old immutable reservation bytes.
+		targetBaseKind = "fork"
+	}
+	if child.Status.Stage != "Complete" || child.Status.Source != state.ActiveClusterID || child.Status.StatefulSetUID != state.StatefulSetUID || child.Status.RecoveryID != child.Spec.RecoveryID || child.Status.SpecHash != immutableSpecHash(child.Spec) || child.Status.Target != "rhiza-r-"+shortID(c.operationID(child)) || child.Status.SecretName != "rhiza-recovery-"+shortID(c.operationID(child)) ||
+		(targetBaseKind == "fork" && (child.Status.RecoveredTip == 0 || child.Status.ManifestHash == "")) ||
+		(targetBaseKind == "empty" && (child.Status.RecoveredTip != 0 || child.Status.ManifestHash != "")) ||
+		(targetBaseKind != "fork" && targetBaseKind != "empty") {
 		return fmt.Errorf("generation completion journal differs from reserved operation")
 	}
 	if err := c.verifyReservation(ctx, child); err != nil {
@@ -62,47 +89,54 @@ func (c *Controller) verifyAutomaticCompletion(ctx context.Context, r *ClusterRe
 	if err != nil || registered != recovery.NewMembershipRecord(child.Status.Target, members, child.Spec.Durability) {
 		return fmt.Errorf("installed target membership differs from reserved credentials")
 	}
-	var lineage struct {
-		Version          int                       `json:"version"`
-		OperationID      string                    `json:"operation_id"`
-		Source           string                    `json:"source"`
-		SourceDurability string                    `json:"source_durability"`
-		SourceMembership string                    `json:"source_membership"`
-		TargetMembership recovery.MembershipRecord `json:"target_membership"`
-		Fork             recovery.ForkResult       `json:"fork"`
-	}
-	reader, err := c.Bucket.Get(ctx, path.Join(c.Prefix, child.Status.Target, "recovery/generation.json"))
-	if err != nil {
-		return err
-	}
-	decoder := json.NewDecoder(io.LimitReader(reader, 1<<20))
-	decoder.DisallowUnknownFields()
-	decodeErr := decoder.Decode(&lineage)
-	trailingErr := decoder.Decode(new(any))
-	closeErr := reader.Close()
-	if decodeErr != nil || trailingErr != io.EOF || closeErr != nil || lineage.Version != 1 || lineage.OperationID != c.operationID(child) || lineage.Source != child.Spec.SourceClusterID || lineage.SourceDurability != child.Status.SourceDurability || lineage.SourceMembership != child.Status.SourceMembership || lineage.TargetMembership != registered || lineage.Fork.Tip != child.Status.RecoveredTip || lineage.Fork.ManifestHash != child.Status.ManifestHash || lineage.Fork.PrefixHash == "" {
-		return fmt.Errorf("immutable generation lineage differs from completed fork")
-	}
-	source := recovery.NewManager(c.Bucket, path.Join(c.Prefix, child.Spec.SourceClusterID), 1)
-	defer source.Close()
-	if err := source.Load(ctx); err != nil || !source.Sealed() || uint64(source.Tip()) != child.Status.RecoveredTip {
-		return fmt.Errorf("source is not sealed at the completed fork tip")
-	}
-	if child.Spec.AnchorID != "" {
-		targetPrefix := path.Join(c.Prefix, child.Status.Target)
-		anchor, anchorHash, err := recovery.ReadGenerationAnchor(ctx, c.Bucket, targetPrefix)
+	if targetBaseKind == "empty" {
+		response, err := c.registerEmptyRecovery(ctx, child, registered)
+		if err != nil || response.State != "committed" {
+			return fmt.Errorf("empty archive genesis is not canonically committed")
+		}
+	} else {
+		var lineage struct {
+			Version          int                       `json:"version"`
+			OperationID      string                    `json:"operation_id"`
+			Source           string                    `json:"source"`
+			SourceDurability string                    `json:"source_durability"`
+			SourceMembership string                    `json:"source_membership"`
+			TargetMembership recovery.MembershipRecord `json:"target_membership"`
+			Fork             recovery.ForkResult       `json:"fork"`
+		}
+		reader, err := c.Bucket.Get(ctx, path.Join(c.Prefix, child.Status.Target, "recovery/generation.json"))
 		if err != nil {
 			return err
 		}
-		if _, err := recovery.VerifyGenerationAnchor(ctx, c.Bucket, targetPrefix, registered, anchorHash); err != nil {
-			return err
+		decoder := json.NewDecoder(io.LimitReader(reader, 1<<20))
+		decoder.DisallowUnknownFields()
+		decodeErr := decoder.Decode(&lineage)
+		trailingErr := decoder.Decode(new(any))
+		closeErr := reader.Close()
+		if decodeErr != nil || trailingErr != io.EOF || closeErr != nil || lineage.Version != 1 || lineage.OperationID != c.operationID(child) || lineage.Source != child.Spec.SourceClusterID || lineage.SourceDurability != child.Status.SourceDurability || lineage.SourceMembership != child.Status.SourceMembership || lineage.TargetMembership != registered || lineage.Fork.Tip != child.Status.RecoveredTip || lineage.Fork.ManifestHash != child.Status.ManifestHash || lineage.Fork.PrefixHash == "" {
+			return fmt.Errorf("immutable generation lineage differs from completed fork")
 		}
-		if anchor.SourcePrefix != path.Join(c.Prefix, child.Spec.SourceClusterID) || anchor.OperationID != c.operationID(child) || anchor.SourceTip != child.Status.RecoveredTip || anchor.SourceManifest != child.Status.ManifestHash {
-			return fmt.Errorf("completed generation anchor differs from reserved operation")
+		source := recovery.NewManager(c.Bucket, path.Join(c.Prefix, child.Spec.SourceClusterID), recovery.ArchiveConfigID)
+		defer source.Close()
+		if err := source.Load(ctx); err != nil || !source.Sealed() || uint64(source.Tip()) != child.Status.RecoveredTip {
+			return fmt.Errorf("source is not sealed at the completed fork tip")
 		}
-		result := recovery.ForkResult{Tip: anchor.SourceTip, ManifestHash: anchor.SourceManifest, PrefixHash: anchor.SourcePrefixHash}
-		if err := c.verifyAnchorRequest(ctx, child, sourceState{prefix: anchor.SourcePrefix}, registered, result, hex.EncodeToString(anchorHash[:])); err != nil {
-			return err
+		if child.Spec.AnchorID != "" {
+			targetPrefix := path.Join(c.Prefix, child.Status.Target)
+			anchor, anchorHash, err := recovery.ReadGenerationAnchor(ctx, c.Bucket, targetPrefix)
+			if err != nil {
+				return err
+			}
+			if _, err := recovery.VerifyGenerationAnchor(ctx, c.Bucket, targetPrefix, registered, anchorHash); err != nil {
+				return err
+			}
+			if anchor.SourcePrefix != path.Join(c.Prefix, child.Spec.SourceClusterID) || anchor.OperationID != c.operationID(child) || anchor.SourceTip != child.Status.RecoveredTip || anchor.SourceManifest != child.Status.ManifestHash {
+				return fmt.Errorf("completed generation anchor differs from reserved operation")
+			}
+			result := recovery.ForkResult{Tip: anchor.SourceTip, ManifestHash: anchor.SourceManifest, PrefixHash: anchor.SourcePrefixHash}
+			if err := c.verifyAnchorRequest(ctx, child, sourceState{prefix: anchor.SourcePrefix}, registered, result, hex.EncodeToString(anchorHash[:])); err != nil {
+				return err
+			}
 		}
 	}
 	ctr, err := container(sts, r.Spec.Container)

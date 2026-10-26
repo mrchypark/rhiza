@@ -15,8 +15,8 @@ AWS_CLI_IMAGE = (
     "amazon/aws-cli@sha256:83f8ffe939569070c5b66d22231862ab78718766d9d8e4c44ca84dd0be5569a5"
 )
 
-_MINIO_ACCESS = "chaos-minio"
-_MINIO_SECRET = "chaos-minio-secret"
+_VERSITY_ACCESS = "chaos-versity"
+_VERSITY_SECRET = "chaos-versity-secret"
 
 # Peer identity tokens stay in the Secret; the replicated membership publishes
 # only the public key each token derives for cluster "chaos-source". The values
@@ -43,7 +43,8 @@ _MEMBERS = [
 ]
 
 
-def resources(namespace: str, db_image: str, operator_image: str) -> list[dict]:
+def resources(namespace: str, db_image: str, operator_image: str, *,
+              supervised: bool = False) -> list[dict]:
     """Return Kubernetes manifest dicts for the chaos operator fixture.
 
     Excludes CRD, RBAC, and Namespace resources -- the parent applies those
@@ -98,10 +99,10 @@ def resources(namespace: str, db_image: str, operator_image: str) -> list[dict]:
         },
         "type": "Opaque",
         "stringData": {
-            "RHIZA_OBJSTORE_ENDPOINT": "rhiza-minio:9000",
+            "RHIZA_OBJSTORE_ENDPOINT": "rhiza-versitygw:9000",
             "RHIZA_OBJSTORE_BUCKET": "rhiza",
-            "RHIZA_OBJSTORE_ACCESS_KEY": _MINIO_ACCESS,
-            "RHIZA_OBJSTORE_SECRET_KEY": _MINIO_SECRET,
+            "RHIZA_OBJSTORE_ACCESS_KEY": _VERSITY_ACCESS,
+            "RHIZA_OBJSTORE_SECRET_KEY": _VERSITY_SECRET,
             "RHIZA_OBJSTORE_INSECURE": "true",
         },
     }
@@ -148,13 +149,16 @@ def resources(namespace: str, db_image: str, operator_image: str) -> list[dict]:
             "serviceName": "rhiza-headless",
             "podManagementPolicy": "Parallel",
             "updateStrategy": {"type": "OnDelete", "rollingUpdate": None},
-            "replicas": 3,
+            "replicas": 0 if supervised else 3,
             "selector": {
                 "matchLabels": {"app.kubernetes.io/name": "rhiza"}
             },
             "template": {
                 "metadata": {
-                    "labels": {"app.kubernetes.io/name": "rhiza"}
+                    "labels": {"app.kubernetes.io/name": "rhiza"},
+                    "annotations": {
+                        "rhiza.mrchypark.dev/cooperative-fencing": "1"
+                    },
                 },
                 "spec": {
                     "securityContext": {
@@ -243,53 +247,53 @@ def resources(namespace: str, db_image: str, operator_image: str) -> list[dict]:
         },
     }
 
-    minio_secret = {
+    versity_secret = {
         "apiVersion": "v1",
         "kind": "Secret",
         "metadata": {
-            "name": "rhiza-minio",
+            "name": "rhiza-versitygw",
             "namespace": namespace,
         },
         "type": "Opaque",
         "stringData": {
-            "access-key": _MINIO_ACCESS,
-            "secret-key": _MINIO_SECRET,
+            "access-key": _VERSITY_ACCESS,
+            "secret-key": _VERSITY_SECRET,
         },
     }
 
-    minio_service = {
+    versity_service = {
         "apiVersion": "v1",
         "kind": "Service",
         "metadata": {
-            "name": "rhiza-minio",
+            "name": "rhiza-versitygw",
             "namespace": namespace,
         },
         "spec": {
-            "selector": {"app": "rhiza-minio"},
+            "selector": {"app": "rhiza-versitygw"},
             "ports": [{"name": "s3", "port": 9000}],
         },
     }
 
-    minio_deployment = {
+    versity_deployment = {
         "apiVersion": "apps/v1",
         "kind": "Deployment",
         "metadata": {
-            "name": "rhiza-minio",
+            "name": "rhiza-versitygw",
             "namespace": namespace,
         },
         "spec": {
             "replicas": 1,
             "selector": {
-                "matchLabels": {"app": "rhiza-minio"}
+                "matchLabels": {"app": "rhiza-versitygw"}
             },
             "template": {
                 "metadata": {
-                    "labels": {"app": "rhiza-minio"}
+                    "labels": {"app": "rhiza-versitygw"}
                 },
                 "spec": {
                     "containers": [
                         {
-                            "name": "minio",
+                            "name": "versitygw",
                             "image": S3_IMAGE,
                             "args": ["--port", ":9000", "--health", "/_/health", "posix", "/data"],
                             "env": [
@@ -297,7 +301,7 @@ def resources(namespace: str, db_image: str, operator_image: str) -> list[dict]:
                                     "name": "ROOT_ACCESS_KEY",
                                     "valueFrom": {
                                         "secretKeyRef": {
-                                            "name": "rhiza-minio",
+                                            "name": "rhiza-versitygw",
                                             "key": "access-key",
                                         }
                                     },
@@ -306,7 +310,7 @@ def resources(namespace: str, db_image: str, operator_image: str) -> list[dict]:
                                     "name": "ROOT_SECRET_KEY",
                                     "valueFrom": {
                                         "secretKeyRef": {
-                                            "name": "rhiza-minio",
+                                            "name": "rhiza-versitygw",
                                             "key": "secret-key",
                                         }
                                     },
@@ -352,8 +356,8 @@ def resources(namespace: str, db_image: str, operator_image: str) -> list[dict]:
                             "command": ["/bin/sh", "-c"],
                             "args": [
                                 "i=0; while [ \"$i\" -lt 120 ]; do "
-                                "aws --endpoint-url http://rhiza-minio:9000 s3api head-bucket --bucket rhiza && exit 0; "
-                                "aws --endpoint-url http://rhiza-minio:9000 s3 mb s3://rhiza && exit 0; "
+                                "aws --endpoint-url http://rhiza-versitygw:9000 s3api head-bucket --bucket rhiza && exit 0; "
+                                "aws --endpoint-url http://rhiza-versitygw:9000 s3 mb s3://rhiza && exit 0; "
                                 "i=$((i+1)); sleep 1; done; exit 1"
                             ],
                             "env": [
@@ -361,7 +365,7 @@ def resources(namespace: str, db_image: str, operator_image: str) -> list[dict]:
                                     "name": "AWS_ACCESS_KEY_ID",
                                     "valueFrom": {
                                         "secretKeyRef": {
-                                            "name": "rhiza-minio",
+                                            "name": "rhiza-versitygw",
                                             "key": "access-key",
                                         }
                                     },
@@ -370,7 +374,7 @@ def resources(namespace: str, db_image: str, operator_image: str) -> list[dict]:
                                     "name": "AWS_SECRET_ACCESS_KEY",
                                     "valueFrom": {
                                         "secretKeyRef": {
-                                            "name": "rhiza-minio",
+                                            "name": "rhiza-versitygw",
                                             "key": "secret-key",
                                         }
                                     },
@@ -393,7 +397,7 @@ def resources(namespace: str, db_image: str, operator_image: str) -> list[dict]:
             "labels": {"app.kubernetes.io/name": "rhiza-operator"},
         },
         "spec": {
-            "replicas": 1,
+            "replicas": 0 if supervised else 1,
             "selector": {
                 "matchLabels": {
                     "app.kubernetes.io/name": "rhiza-operator"
@@ -430,6 +434,11 @@ def resources(namespace: str, db_image: str, operator_image: str) -> list[dict]:
                                         }
                                     },
                                 },
+                                # This Versity Gateway/S3 Kind fixture intentionally
+                                # exercises the cooperative Kubernetes fencer;
+                                # it is not the independent NoPVC profile.
+                                {"name": "RHIZA_AUTOMATIC_RECOVERY", "value": "true"},
+                                {"name": "RHIZA_FENCER_BACKEND", "value": "kubernetes"},
                             ],
                             "envFrom": [
                                 {"configMapRef": {"name": "rhiza-config"}},
@@ -470,9 +479,9 @@ def resources(namespace: str, db_image: str, operator_image: str) -> list[dict]:
         object_store,
         headless_service,
         stateful_set,
-        minio_secret,
-        minio_service,
-        minio_deployment,
+        versity_secret,
+        versity_service,
+        versity_deployment,
         create_bucket_job,
         operator_deployment,
     ]

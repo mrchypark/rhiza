@@ -34,6 +34,15 @@ func TestAutomaticMembershipCompletionInstallsFailedLearner(t *testing.T) {
 	child.Spec.Container = "rhiza"
 	child.Spec.Membership.OperationID = "recover"
 	child.Spec.Membership.RemovedPod = "n3"
+	// This represents an operation already journaled by an older controller;
+	// new membership requests are no longer started by the operator.
+	child.Status.Membership = &MembershipStatus{Phase: "Removing", RemoveRequest: &network.MembershipChange{
+		OperationID: membershipOperationID(child, "remove"), ClusterID: child.Spec.SourceClusterID,
+		ExpectedConfigID: 1, Remove: child.Spec.Membership.Remove,
+		Fence: &network.MembershipFence{NodeID: child.Spec.Membership.Fence.NodeID, WALIdentity: child.Spec.Membership.Fence.WALIdentity,
+			WorkloadUID: child.Spec.Membership.Fence.WorkloadUID, Confirmed: child.Spec.Membership.Fence.Confirmed,
+			Evidence: child.Spec.Membership.Fence.Evidence},
+	}}
 	api.learnerID = "learner"
 	api.membership["learner"] = network.MembershipStatus{NodeID: "learner", ClusterID: "source", ConfigID: 1, Voters: []quepaxa.NodeID{"n1", "n2", "n3"}, WALIdentity: strings.Repeat("a", 64)}
 	api.membershipSecret["data"].(object)["member"] = base64.StdEncoding.EncodeToString(jsonBytes(voterMember("source", "learner", "new-token")))
@@ -85,7 +94,7 @@ func TestAutomaticMembershipCompletionInstallsFailedLearner(t *testing.T) {
 	t.Cleanup(server.Close)
 	c.Kube.BaseURL, c.Kube.Client = server.URL, server.Client()
 	fenced := 0
-	c.Fencer = &countingFencer{count: &fenced}
+	c.Fencer = &completionOutcomeFencer{countingFencer: &countingFencer{count: &fenced}, archiveForkRegistrarFixture: &archiveForkRegistrarFixture{}}
 	if err := c.saveAuto(ctx, r, state, nil); err != nil {
 		t.Fatal(err)
 	}
@@ -320,7 +329,7 @@ func completedAutomaticTarget(t *testing.T, voters []quepaxa.Member) *automaticC
 	if err := bucket.Upload(ctx, "root/source/recovery/successor.json", bytes.NewReader(jsonBytes(c.reservation(child)))); err != nil {
 		t.Fatal(err)
 	}
-	c.Fencer = &countingFencer{count: new(int)}
+	c.Fencer = &completionOutcomeFencer{countingFencer: &countingFencer{count: new(int)}, archiveForkRegistrarFixture: &archiveForkRegistrarFixture{}}
 	server := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, q *http.Request) {
 		if q.Method == http.MethodGet && q.URL.Path == c.resourcePath("recovery-1") {
 			json.NewEncoder(w).Encode(child)
@@ -498,7 +507,7 @@ func testAutomaticCompletionOutcome(t *testing.T, mode string) {
 	t.Cleanup(server.Close)
 	c.Kube.BaseURL, c.Kube.Client = server.URL, server.Client()
 	fenced := 0
-	c.Fencer = &countingFencer{count: &fenced}
+	c.Fencer = &completionOutcomeFencer{countingFencer: &countingFencer{count: &fenced}, archiveForkRegistrarFixture: &archiveForkRegistrarFixture{}}
 	if err := c.saveAuto(ctx, r, state, nil); err != nil {
 		t.Fatal(err)
 	}
@@ -578,7 +587,7 @@ func testAutomaticCompletionOutcome(t *testing.T, mode string) {
 	}
 	if mode == "single target failure" || twoFailures || partialInventory {
 		r.Spec.Automatic = true
-		r.Spec.Policy = AutoPolicy{FailureGraceSeconds: 1, CooldownSeconds: 1, MaxRecoveriesPerDay: 10}
+		r.Spec.Policy = &AutoPolicy{FailureGraceSeconds: 1, CooldownSeconds: 1, MaxRecoveriesPerDay: 10}
 		loaded.BindingHash = autoBinding(r)
 		loaded.SuspectedSince = time.Now().Add(-3 * time.Second)
 		loaded.Completions = []time.Time{loaded.SuspectedSince}
@@ -627,20 +636,16 @@ func testAutomaticCompletionOutcome(t *testing.T, mode string) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if partialInventory && targetMode == "async" {
-			if next.Intent != nil || next.ActiveClusterID != child.Status.Target || r.Status.Phase != "Blocked" || !strings.Contains(r.Status.Message, "async source requires allowDataLoss") || fenced != 0 {
-				t.Fatalf("unknown incarnation bypassed async generation loss approval: %+v status=%+v", next, r.Status)
+		if !twoFailures {
+			if next.Intent != nil || next.ActiveClusterID != child.Status.Target || len(next.Completions) != 1 || r.Status.Phase != string(AutoDegraded) || fenced != 0 {
+				t.Fatalf("operator started recovery while the engine could repair one failed Pod under quorum: %+v status=%+v", next, r.Status)
 			}
 			return
 		}
-		if partialInventory || twoFailures {
-			wantIdentities := 3
-			if partialInventory {
-				wantIdentities = 2
-			}
-			if next.Intent == nil || next.Intent.Failed != "" || next.Intent.Request.Scope != ScopeGeneration || next.Intent.Request.SourceClusterID != child.Status.Target || next.Intent.RecoveryName == "recovery-1" || len(next.Intent.Request.Targets) != 3 || next.Intent.Proof != nil || fenced != 0 || len(next.Identities) != wantIdentities {
-				t.Fatalf("unknown incarnation did not reserve fresh full-generation fencing: %+v status=%+v", next, r.Status)
-			}
+		if next.Intent == nil || next.Intent.Failed != "" || next.Intent.Request.Scope != ScopeGeneration || next.Intent.Request.SourceClusterID != child.Status.Target || next.Intent.RecoveryName == "recovery-1" || len(next.Intent.Request.Targets) != 3 || next.Intent.Proof != nil || fenced != 0 {
+			t.Fatalf("quorum loss did not reserve fresh full-generation fencing: %+v status=%+v", next, r.Status)
+		}
+		if twoFailures {
 			reader, err := bucket.Get(ctx, "root/source/recovery/successor.json")
 			if err != nil {
 				t.Fatal(err)
@@ -652,10 +657,6 @@ func testAutomaticCompletionOutcome(t *testing.T, mode string) {
 			}
 			return
 		}
-		if next.Intent == nil || next.Intent.Failed != "n3" || next.Intent.Request.SourceClusterID != child.Status.Target || next.Intent.RecoveryName == "recovery-1" || len(next.Intent.Request.Targets) != 1 || next.Intent.Request.Targets[0].WALIdentity != "target-wal-n3" || next.Intent.Request.Targets[0].PodUID != "pod-n3" {
-			t.Fatalf("new incident cannot fence installed failed voter: %+v status=%+v", next, r.Status)
-		}
-		return
 	}
 	obs, _, err := c.observeAutomatic(ctx, r, loaded, api.sts)
 	if err != nil || !obs.Known || obs.QuorumVerified || obs.Reachable != 0 {
@@ -667,5 +668,14 @@ func testAutomaticCompletionOutcome(t *testing.T, mode string) {
 }
 
 type completionOutcomeTransport func(*http.Request) (*http.Response, error)
+
+type completionOutcomeFencer struct {
+	*countingFencer
+	*archiveForkRegistrarFixture
+}
+
+func (f *completionOutcomeFencer) Fence(ctx context.Context, request FenceRequest) (*FenceProof, error) {
+	return f.countingFencer.Fence(ctx, request)
+}
 
 func (f completionOutcomeTransport) RoundTrip(r *http.Request) (*http.Response, error) { return f(r) }

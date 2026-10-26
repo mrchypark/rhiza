@@ -17,7 +17,9 @@ type completionAuthority struct {
 }
 
 func (a *completionAuthority) Register(context.Context, Identity) error { return nil }
-func (a *completionAuthority) Bind(context.Context, Identity) error     { return nil }
+func (a *completionAuthority) Bind(_ context.Context, id Identity) (BindReceipt, error) {
+	return BindReceipt{Identity: id}, nil
+}
 func (a *completionAuthority) Stop(context.Context, Identity) (StopRequest, error) {
 	a.events = append(a.events, "stop")
 	return a.request, nil

@@ -17,6 +17,7 @@ const (
 	OperationFetchValue        Operation = 7
 	OperationPrepareCheckpoint Operation = 8
 	OperationVerifyPrefix      Operation = 9
+	OperationEngineRemovalFreeze Operation = 10
 )
 
 var EnumNamesOperation = map[Operation]string{
@@ -30,6 +31,7 @@ var EnumNamesOperation = map[Operation]string{
 	OperationFetchValue:        "FetchValue",
 	OperationPrepareCheckpoint: "PrepareCheckpoint",
 	OperationVerifyPrefix:      "VerifyPrefix",
+	OperationEngineRemovalFreeze: "EngineRemovalFreeze",
 }
 
 var EnumValuesOperation = map[string]Operation{
@@ -43,6 +45,7 @@ var EnumValuesOperation = map[string]Operation{
 	"FetchValue":        OperationFetchValue,
 	"PrepareCheckpoint": OperationPrepareCheckpoint,
 	"VerifyPrefix":      OperationVerifyPrefix,
+	"EngineRemovalFreeze": OperationEngineRemovalFreeze,
 }
 
 func (v Operation) String() string {

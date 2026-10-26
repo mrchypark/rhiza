@@ -6,6 +6,16 @@ on:
   pull_request:
   workflow_dispatch:
     inputs:
+      fencing_only:
+        description: Run only the fencing harness and checkpoint/archive regression tests
+        type: boolean
+        required: false
+        default: false
+      fixture_only:
+        description: Run only focused durability, rollback, IAM, manifest, operator, and fencing Go regressions
+        type: boolean
+        required: false
+        default: false
       publish_chaos_image:
         description: Publish the tested qualification host image for a local run
         type: boolean
@@ -16,7 +26,8 @@ permissions:
   contents: read
 
 jobs:
-  cooperative-fencing:
+  fencing-only:
+    if: github.event_name == 'workflow_dispatch' && inputs.fencing_only && !inputs.fixture_only
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
@@ -25,10 +36,188 @@ jobs:
         with:
           go-version-file: go.mod
           cache: true
-      - name: Check cooperative protocol and engine regression tests
+      - name: Check fencing harness fixtures
+        run: FENCING_PROFILE_SELFTEST=1 sh e2e/fencing/run.sh
+      - name: Check public fencing artifact fixtures
+        env:
+          CGO_ENABLED: 1
+        run: go test -race ./e2e/fencing -count=1 -timeout=5m
+      - name: Check checkpoint adoption and archive regressions
+        env:
+          CGO_ENABLED: 1
         run: |
-          go test -race ./pkg/fencing ./pkg/operator ./pkg/node ./pkg/network ./internal/objstore ./e2e/fencing -count=1 -timeout=5m
-      - name: Qualify actual cooperative executor in disposable Kubernetes
+          tests='^(TestLearnerHardKillAtAdoptionWALBoundaries|TestLearnerExpiredPinDuringBuildAllowsSuccessorGCAndRestart|TestLearnerExpiredPinAtManifestAllowsSuccessorGCAndRestart|TestCertifiedCheckpointDefersOnlyLivePinCompaction|TestCertifiedCheckpointDefersOnlyHeldGCLockCompaction|TestCheckpointClaimLifecycle.*|TestNodeForegroundCheckpointClaimRetry.*|TestNodeForegroundArchiveBusy.*|TestNodeArchiveGCPhaseTraceFiniteTerminals|TestNodeArchiveExtentAttributionRowGate)$'
+          go test -tags rhiza_local_testhooks . ./pkg/node ./pkg/checkpoint -run "$tests" -count=1 -timeout=8m
+          go test -race -tags rhiza_local_testhooks . ./pkg/node ./pkg/checkpoint -run "$tests" -count=1 -timeout=8m
+      - name: Check archive version-GC races
+        env:
+          CGO_ENABLED: 1
+        run: |
+          tests='^(TestArchiveGCVersionDeleteCannotRemoveReplacement|TestRecoveryPinGCDoesNotDeleteConcurrentRenewal|TestRecoveryPinGCKeepsGenerationWithoutReadingExtentChain)$'
+          go test -tags rhiza_local_testhooks ./pkg/recovery -run "$tests" -count=1 -timeout=2m
+          go test -race -tags rhiza_local_testhooks ./pkg/recovery -run "$tests" -count=1 -timeout=2m
+
+  fixture-only:
+    if: github.event_name == 'workflow_dispatch' && inputs.fixture_only
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+          cache: true
+      - name: Select GNU coreutils timeout for bounded shell tests
+        run: |
+          set -eu
+          package_dir="$RUNNER_TEMP/gnu-coreutils-package"
+          install_dir="$RUNNER_TEMP/gnu-coreutils"
+          mkdir -p "$package_dir" "$install_dir"
+          (
+            cd "$package_dir"
+            apt-get download gnu-coreutils coreutils-from-gnu
+            implementation=$(find . -maxdepth 1 -type f -name 'gnu-coreutils_*.deb' -print -quit)
+            aliases=$(find . -maxdepth 1 -type f -name 'coreutils-from-gnu_*.deb' -print -quit)
+            test -n "$implementation"
+            test -n "$aliases"
+            dpkg-deb -x "$implementation" "$install_dir"
+            dpkg-deb -x "$aliases" "$install_dir"
+          )
+          timeout_bin="$install_dir/usr/bin/timeout"
+          test -x "$timeout_bin"
+          "$timeout_bin" --version | grep -Fq 'GNU coreutils'
+          printf '%s\n' "$install_dir/usr/bin" >>"$GITHUB_PATH"
+      - name: Check focused durability, rollback, IAM, manifest, and recovery fixtures
+        run: |
+          go test ./pkg/operator -run '^(TestManualTerminalFrozenForkRegistersWithoutIndependentV2|TestAuthenticatedLearnerPromotionRetriesExactCanonicalCompletion)$' -count=1 -timeout=5m
+          go test ./pkg/node -run '^(TestMembershipRetryDurablyPublishesCommittedConfiguration|TestMembershipAdditionAbortAllowsNextRevision)$' -count=1 -timeout=5m
+          embedded_tests='^(TestIndependentRollbackReconcilesInterruptedCreateMarkers|TestRollbackMarkerGateCoversEveryIndependentAndCIWrite|TestIndependentGCSChaosManifestContract|TestNamespaceExpiryRendersUIDResourceVersionDelete|TestQualificationHostContainsPinnedKubectlTools|TestRuntimeAgentRenderPinsNodesAndNamespaceOwnerReferences|TestVoterCountLauncherRunRequiresPrivilegedInstallCredential|TestGCSIAM.*)$'
+          go test ./e2e/chaos/embedded-go -run "$embedded_tests" -count=1 -timeout=5m
+          go test ./pkg/fencing ./pkg/fencing/cri ./pkg/fencing/runtimeagent ./pkg/operator ./pkg/recovery ./internal/objstore ./e2e/fencing -count=1 -timeout=5m
+          go test -race ./pkg/node -run '^(TestMembershipRetryDurablyPublishesCommittedConfiguration|TestMembershipAdditionAbortAllowsNextRevision)$' -count=1 -timeout=5m
+          go test -race ./e2e/chaos/embedded-go -run "$embedded_tests" -count=1 -timeout=5m
+          go test -race ./pkg/fencing ./pkg/fencing/cri ./pkg/fencing/runtimeagent ./pkg/operator ./pkg/recovery ./internal/objstore ./e2e/fencing -count=1 -timeout=5m
+
+  object-store-provider-contracts:
+    if: github.event_name != 'workflow_dispatch' || (!inputs.fencing_only && !inputs.fixture_only)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    # The contract launcher uses fixed service DNS aliases, so run the test
+    # inside a job container on the same Actions network as its services.
+    container:
+      image: golang:1.27.3-bookworm@sha256:972b4110ba0f47539a975c31e52c64765e1ff19f2d74469ae4a595c6676e80a5
+    services:
+      floci-s3:
+        image: floci/floci:2.3.0@sha256:e0b292df4dc9559b7b1bf4f51bdda4bb8e269276236438cd03cae661260ea8a9
+      floci-gcs:
+        image: floci/floci-gcp:0.11.0@sha256:eae9683d806ceb643bcb36aee97cdb8cad13c3e2959cd053bf40e481994fde12
+      floci-az:
+        image: floci/floci-az:0.15.0@sha256:530635d603223e120adbf9221a97560cffc6991d65fa0c72d0f79d1097974c89
+    steps:
+      - uses: actions/checkout@v4
+      - name: Wait for Floci service ports
+        run: |
+          set -eu
+          for endpoint in floci-s3:4566 floci-gcs:4588 floci-az:4577; do
+            host=${endpoint%:*}
+            port=${endpoint##*:}
+            attempt=0
+            until bash -c "exec 3<>/dev/tcp/$host/$port" 2>/dev/null; do
+              attempt=$((attempt + 1))
+              if [ "$attempt" -ge 120 ]; then
+                printf 'Floci service did not open %s after 60 seconds\n' "$endpoint" >&2
+                exit 1
+              fi
+              sleep 0.5
+            done
+          done
+      - name: Run pinned Floci provider SDK contracts
+        env:
+          RHIZA_FLOCI_INTEGRATION: "1"
+        run: sh scripts/test-floci-objstore.sh
+
+  cooperative-fencing:
+    if: github.event_name != 'workflow_dispatch' || !inputs.fixture_only
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+          cache: true
+      - name: Select GNU coreutils timeout for bounded shell tests
+        run: |
+          set -eu
+          package_dir="$RUNNER_TEMP/gnu-coreutils-package"
+          install_dir="$RUNNER_TEMP/gnu-coreutils"
+          mkdir -p "$package_dir" "$install_dir"
+          (
+            cd "$package_dir"
+            apt-get download gnu-coreutils coreutils-from-gnu
+            implementation=$(find . -maxdepth 1 -type f -name 'gnu-coreutils_*.deb' -print -quit)
+            aliases=$(find . -maxdepth 1 -type f -name 'coreutils-from-gnu_*.deb' -print -quit)
+            test -n "$implementation"
+            test -n "$aliases"
+            dpkg-deb -x "$implementation" "$install_dir"
+            dpkg-deb -x "$aliases" "$install_dir"
+          )
+          timeout_bin="$install_dir/usr/bin/timeout"
+          test -x "$timeout_bin"
+          "$timeout_bin" --version | grep -Fq 'GNU coreutils'
+          printf '%s\n' "$install_dir/usr/bin" >>"$GITHUB_PATH"
+      - name: Compile all Go tests with local hooks (do not execute)
+        id: compile_go_tests
+        run: |
+          set -eu
+          output_dir="$RUNNER_TEMP/rhiza-compiled-tests"
+          package_list="$RUNNER_TEMP/rhiza-test-packages.txt"
+          mkdir -p "$output_dir"
+          go list -tags rhiza_local_testhooks ./... > "$package_list"
+          test -s "$package_list"
+          index=0
+          compile_failed=0
+          while IFS= read -r package; do
+            index=$((index + 1))
+            binary_name=$(printf '%04d.test' "$index")
+            printf 'Compiling test package %s\n' "$package"
+            if ! go test -c -tags rhiza_local_testhooks -o "$output_dir/$binary_name" "$package"; then
+              compile_failed=1
+            fi
+          done < "$package_list"
+          if [ "$compile_failed" -ne 0 ]; then
+            exit 1
+          fi
+      - name: Run bounded quorum membership cancellation diagnostics
+        timeout-minutes: 3
+        run: >-
+          go test -tags rhiza_local_testhooks .
+          -run '^(TestQuorumMembershipQUICDiagnosticNoHold|TestQuorumMembershipQUICDiagnostic)$'
+          -count=1 -timeout=90s
+      - name: Check fencing runtime profile validator
+        id: profile_selftest
+        run: FENCING_PROFILE_SELFTEST=1 sh e2e/fencing/run.sh
+      - name: Check cooperative protocol and engine regression tests
+        id: cooperative_tests
+        run: |
+          go test -race ./cmd/rhiza-fencer ./cmd/rhiza-runtime-agent ./pkg/fencing ./pkg/fencing/cri ./pkg/fencing/runtimeagent ./pkg/operator ./pkg/node ./pkg/network ./pkg/recovery ./pkg/materializer ./internal/objstore ./e2e/fencing ./deploy/operator ./e2e/chaos/embedded-go -count=1 -timeout=5m
+      - name: Build native GCS HA qualification drivers
+        id: gcs_qualification_driver
+        env:
+          CGO_ENABLED: 0
+        run: |
+          set -eu
+          artifact_dir="$RUNNER_TEMP/gcs-ha-qualification-driver"
+          mkdir -p "$artifact_dir"
+          printf '%s\n' "$GITHUB_SHA" >"$artifact_dir/source-sha.txt"
+          GOOS=linux GOARCH=amd64 CGO_ENABLED=0 go build -trimpath -buildvcs=false -o "$artifact_dir/fencing-e2e-linux-amd64" ./e2e/fencing
+          GOOS=darwin GOARCH=arm64 CGO_ENABLED=0 go build -trimpath -buildvcs=false -o "$artifact_dir/fencing-e2e-darwin-arm64" ./e2e/fencing
+          (
+            cd "$artifact_dir"
+            sha256sum fencing-e2e-linux-amd64 fencing-e2e-darwin-arm64 source-sha.txt >SHA256SUMS
+          )
+      - name: Qualify shipped runtime agent and cooperative executor in disposable Kubernetes
+        id: qualify
         env:
           CGO_ENABLED: 0
           FENCING_E2E_OUT: cooperative-fencing-results
@@ -38,24 +227,52 @@ jobs:
           go build -o "$RUNNER_TEMP/fencing-images/rhiza" ./cmd/rhiza
           go build -o "$RUNNER_TEMP/fencing-images/rhiza-operator" ./cmd/rhiza-operator
           go build -o "$RUNNER_TEMP/fencing-images/rhiza-fencer" ./cmd/rhiza-fencer
+          go build -o "$RUNNER_TEMP/fencing-images/rhiza-runtime-agent" ./cmd/rhiza-runtime-agent
           go build -o "$RUNNER_TEMP/fencing-e2e" ./e2e/fencing
+          cp "$RUNNER_TEMP/fencing-e2e" "$RUNNER_TEMP/fencing-images/fencing-e2e"
           docker build -f Dockerfile.fencing-test -t rhiza-fencing-host:local -t rhiza-fencing-operator:local "$RUNNER_TEMP/fencing-images"
           if kind get clusters | grep -Fx rhiza-generic-fencing; then exit 1; fi
-          printf '%s\n' rhiza-generic-fencing > cooperative-fencing-results/owned-cluster.txt
           FENCING_E2E_BIN="$RUNNER_TEMP/fencing-e2e" sh e2e/fencing/run.sh
-      - name: Collect owned runtime diagnostics
+      - uses: actions/upload-artifact@v4
+        if: always() && steps.gcs_qualification_driver.outcome == 'success' && steps.cooperative_tests.outcome == 'success' && steps.qualify.outcome == 'success'
+        with:
+          name: gcs-ha-qualification-driver-${{ github.sha }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/gcs-ha-qualification-driver
+          if-no-files-found: error
+          retention-days: 7
+      - name: Verify pre-cleanup runtime diagnostics on failure
         if: always()
         run: |
-          mkdir -p cooperative-fencing-results
-          kubectl --context kind-rhiza-generic-fencing -n rhiza-fencing-e2e get pods,events,configmaps,rhizafences -o yaml > cooperative-fencing-results/resources.yaml 2>&1 || true
-          kubectl --context kind-rhiza-generic-fencing -n rhiza-fencing-e2e logs -l app.kubernetes.io/name=rhiza-fencer --all-containers --prefix > cooperative-fencing-results/post-cleanup-authority.log 2>&1 || true
-          kind export logs cooperative-fencing-results/post-step-kind --name rhiza-generic-fencing || true
+          if test -f cooperative-fencing-results/actual-exit.txt && test "$(cat cooperative-fencing-results/actual-exit.txt)" != 0; then
+            test -s cooperative-fencing-results/fencer-diagnostics.json
+            test -s cooperative-fencing-results/fencer-pods.json
+            test -s cooperative-fencing-results/fencer-events.json
+            test -s cooperative-fencing-results/fencer-deployment.json
+            test -f cooperative-fencing-results/private-fencer-diagnostics/authority-current.log
+          fi
       - name: Prepare allowlisted public fencing evidence
         id: fencing_public
         if: always()
         run: |
-          test -x "$RUNNER_TEMP/fencing-e2e"
-          FENCING_E2E_OUT=cooperative-fencing-results "$RUNNER_TEMP/fencing-e2e" safe-artifacts
+          if [ '${{ steps.qualify.outcome }}' = 'skipped' ]; then
+            mkdir -p cooperative-fencing-results/public
+            prior_step=unknown
+            prior_outcome=cancelled
+            if [ '${{ steps.compile_go_tests.outcome }}' = 'failure' ]; then
+              prior_step=compile-go-tests
+              prior_outcome=failure
+            elif [ '${{ steps.profile_selftest.outcome }}' = 'failure' ]; then
+              prior_step=profile-selftest
+              prior_outcome=failure
+            elif [ '${{ steps.cooperative_tests.outcome }}' = 'failure' ]; then
+              prior_step=cooperative-tests
+              prior_outcome=failure
+            fi
+            printf '{"kind":"qualification-not-started","stage":"pre-kind","priorStep":"%s","priorStepOutcome":"%s"}\n' "$prior_step" "$prior_outcome" > cooperative-fencing-results/public/qualification-not-started.json
+          else
+            test -x "$RUNNER_TEMP/fencing-e2e"
+            FENCING_E2E_OUT=cooperative-fencing-results "$RUNNER_TEMP/fencing-e2e" safe-artifacts
+          fi
           find cooperative-fencing-results/public -type f ! -name SHA256SUMS -exec sha256sum {} + > cooperative-fencing-results/public/SHA256SUMS
       - uses: actions/upload-artifact@v4
         if: always() && steps.fencing_public.outcome == 'success'
@@ -66,11 +283,14 @@ jobs:
         if: always()
         run: |
           if test -f cooperative-fencing-results/owned-cluster.txt && command -v kind >/dev/null 2>&1; then
-            kind delete cluster --name rhiza-generic-fencing
+            if kind get clusters | grep -Fx rhiza-generic-fencing; then
+              kind delete cluster --name rhiza-generic-fencing
+            fi
             if kind get clusters | grep -Fx rhiza-generic-fencing; then exit 1; fi
           fi
 
   operator-chaos:
+    if: github.event_name != 'workflow_dispatch' || (!inputs.fencing_only && !inputs.fixture_only)
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
@@ -87,7 +307,18 @@ jobs:
           mkdir -p "$RUNNER_TEMP/chaos-images"
           go build -o "$RUNNER_TEMP/chaos-images/rhiza" ./cmd/rhiza
           go build -o "$RUNNER_TEMP/chaos-images/operator" ./cmd/rhiza-operator
+          go build -o "$RUNNER_TEMP/chaos-images/rhiza-fencer" ./cmd/rhiza-fencer
+          go build -o "$RUNNER_TEMP/chaos-images/rhiza-runtime-agent" ./cmd/rhiza-runtime-agent
           docker build -f e2e/chaos/Dockerfile --build-arg BINARY=rhiza -t rhiza-chaos:local "$RUNNER_TEMP/chaos-images"
+          docker build -f Dockerfile.operator --target peer-admission-test -t rhiza-operator-peer-admission:local .
+          docker run --rm --entrypoint /bin/sh rhiza-operator-peer-admission:local -ec '
+            test -x /usr/local/bin/fencing-e2e
+            if /usr/local/bin/fencing-e2e peer-admission-probe </dev/null >/dev/null 2>&1; then
+              exit 1
+            else
+              test "$?" -eq 1
+            fi
+          '
           docker build -f e2e/chaos/Dockerfile --build-arg BINARY=operator -t rhiza-operator-chaos:local "$RUNNER_TEMP/chaos-images"
           kind create cluster --name rhiza-operator-chaos --wait 120s
           kind load docker-image rhiza-chaos:local rhiza-operator-chaos:local --name rhiza-operator-chaos
@@ -103,11 +334,14 @@ jobs:
           path: |
             operator-chaos-results
             !operator-chaos-results/kind/**
+            !operator-chaos-results/private-startup-diagnostics/**
       - name: Remove test cluster
         if: always()
         run: kind delete cluster --name rhiza-operator-chaos
 
   automatic-operator-chaos:
+    if: github.event_name != 'workflow_dispatch' || (!inputs.fencing_only && !inputs.fixture_only)
+    needs: [containers]
     runs-on: ubuntu-latest
     timeout-minutes: 30
     strategy:
@@ -124,6 +358,28 @@ jobs:
         if: matrix.host == 'rust'
       - name: Fencing executor regression checks
         run: python3 e2e/chaos/kind_fencer_test.py
+      - uses: actions/download-artifact@v4
+        if: matrix.host == 'go'
+        with:
+          name: runtime-candidate-${{ github.sha }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: runtime-candidate
+      - name: Load exact Go runtime candidate images
+        if: matrix.host == 'go'
+        working-directory: runtime-candidate
+        run: |
+          set -eu
+          sha256sum -c SHA256SUMS
+          docker load -i runtime-images.tar
+          test "$(docker image inspect rhiza:ci --format '{{.Id}}')" = "$(jq -r '.[0].Id' application-image.json)"
+          test "$(docker image inspect rhiza-operator:ci --format '{{.Id}}')" = "$(jq -r '.[0].Id' operator-image.json)"
+          docker tag rhiza:ci rhiza-chaos:local
+          docker tag rhiza-operator:ci rhiza-operator-chaos:local
+          app_container=$(docker create rhiza-chaos:local)
+          trap 'docker rm "$app_container" >/dev/null' EXIT
+          docker cp "$app_container:/usr/local/bin/rhiza" rhiza
+          docker cp "$app_container:/usr/local/bin/rhiza-entrypoint" rhiza-entrypoint
+          cmp rhiza rhiza-entrypoint
+          cmp bin/rhiza rhiza
       - name: Build test images and Kubernetes cluster
         env:
           CGO_ENABLED: 0
@@ -132,23 +388,32 @@ jobs:
           mkdir -p "$RUNNER_TEMP/chaos-images"
           case "${{ matrix.host }}" in
             server) go build -o "$RUNNER_TEMP/chaos-images/rhiza" ./cmd/rhiza ;;
-            go) go build -o "$RUNNER_TEMP/chaos-images/rhiza" ./e2e/chaos/embedded-go ;;
+            go) : ;; # The exact embedded Go candidate image was loaded above.
             rust)
               cargo build --manifest-path sdk/rust/Cargo.toml --locked --example operator_chaos
               cp sdk/rust/target/debug/examples/operator_chaos "$RUNNER_TEMP/chaos-images/rhiza"
               ;;
           esac
-          go build -o "$RUNNER_TEMP/chaos-images/operator" ./cmd/rhiza-operator
-          if [[ "${{ matrix.host }}" == rust ]]; then
-            docker build -f e2e/chaos/Dockerfile.rust -t rhiza-chaos:local "$RUNNER_TEMP/chaos-images"
-          else
-            docker build -f e2e/chaos/Dockerfile --build-arg BINARY=rhiza -t rhiza-chaos:local "$RUNNER_TEMP/chaos-images"
+          if [[ "${{ matrix.host }}" != go ]]; then
+            go build -o "$RUNNER_TEMP/chaos-images/operator" ./cmd/rhiza-operator
+            go build -o "$RUNNER_TEMP/chaos-images/rhiza-fencer" ./cmd/rhiza-fencer
+            go build -o "$RUNNER_TEMP/chaos-images/rhiza-runtime-agent" ./cmd/rhiza-runtime-agent
+            if [[ "${{ matrix.host }}" == rust ]]; then
+              docker build -f e2e/chaos/Dockerfile.rust -t rhiza-chaos:local "$RUNNER_TEMP/chaos-images"
+            else
+              docker build -f e2e/chaos/Dockerfile --build-arg BINARY=rhiza -t rhiza-chaos:local "$RUNNER_TEMP/chaos-images"
+            fi
+            docker build -f e2e/chaos/Dockerfile --build-arg BINARY=operator -t rhiza-operator-chaos:local "$RUNNER_TEMP/chaos-images"
           fi
-          docker build -f e2e/chaos/Dockerfile --build-arg BINARY=operator -t rhiza-operator-chaos:local "$RUNNER_TEMP/chaos-images"
           kind create cluster --name rhiza-operator-chaos --wait 120s
           kind load docker-image rhiza-chaos:local rhiza-operator-chaos:local --name rhiza-operator-chaos
       - name: Inject faults and verify unattended Operator recovery
         run: python3 -u e2e/chaos/automatic_recovery.py --embedded-host "${{ matrix.host }}"
+      - name: Project allowlisted fence-stage diagnostics
+        if: always()
+        env:
+          FENCING_E2E_OUT: automatic-chaos-results
+        run: go run ./e2e/fencing project-fence-stage-diagnostics
       - name: Collect cluster diagnostics
         if: always()
         run: kind export logs automatic-chaos-results/kind --name rhiza-operator-chaos || true
@@ -159,10 +424,12 @@ jobs:
           path: |
             automatic-chaos-results
             !automatic-chaos-results/kind/**
+            !automatic-chaos-results/private-startup-diagnostics/**
       - name: Remove test cluster
         if: always()
         run: kind delete cluster --name rhiza-operator-chaos
   membership-e2e:
+    if: github.event_name != 'workflow_dispatch' || (!inputs.fencing_only && !inputs.fixture_only)
     runs-on: ubuntu-24.04
     timeout-minutes: 15
     steps:
@@ -171,7 +438,7 @@ jobs:
         with:
           go-version-file: go.mod
           cache: true
-      - name: Membership lifecycle with real QUIC and object storage
+      - name: S3 voter membership, recovery, and read-replica lifecycle with Versity
         env:
           CGO_ENABLED: 1
           RHIZA_E2E_S3_ENDPOINT: 127.0.0.1:19000
@@ -249,9 +516,10 @@ jobs:
 
             aws --endpoint-url http://127.0.0.1:19000 s3 mb s3://rhiza
           )
-          go test -race . -run '^TestS3(Membership|VoterIdentity)' -count=1 -timeout=8m
+          go test -race . -run '^TestS3(Membership|VoterIdentity|ReadReplica)' -count=1 -timeout=8m
 
   rust-sdk:
+    if: github.event_name != 'workflow_dispatch' || (!inputs.fencing_only && !inputs.fixture_only)
     strategy:
       matrix:
         os: [ubuntu-latest, macos-latest]
@@ -287,6 +555,7 @@ jobs:
           cargo test --manifest-path "sdk/rust/target/package/rhizadb-$crate_version/Cargo.toml" --locked --all-targets
 
   go:
+    if: github.event_name != 'workflow_dispatch' || (!inputs.fencing_only && !inputs.fixture_only)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -294,10 +563,65 @@ jobs:
         with:
           go-version-file: go.mod
           cache: true
+      - name: Select GNU coreutils timeout for bounded shell tests
+        run: |
+          set -eu
+          package_dir="$RUNNER_TEMP/gnu-coreutils-package"
+          install_dir="$RUNNER_TEMP/gnu-coreutils"
+          mkdir -p "$package_dir" "$install_dir"
+          (
+            cd "$package_dir"
+            apt-get download gnu-coreutils coreutils-from-gnu
+            implementation=$(find . -maxdepth 1 -type f -name 'gnu-coreutils_*.deb' -print -quit)
+            aliases=$(find . -maxdepth 1 -type f -name 'coreutils-from-gnu_*.deb' -print -quit)
+            test -n "$implementation"
+            test -n "$aliases"
+            dpkg-deb -x "$implementation" "$install_dir"
+            dpkg-deb -x "$aliases" "$install_dir"
+          )
+          timeout_bin="$install_dir/usr/bin/timeout"
+          test -x "$timeout_bin"
+          "$timeout_bin" --version | grep -Fq 'GNU coreutils'
+          printf '%s\n' "$install_dir/usr/bin" >>"$GITHUB_PATH"
+      - name: Diagnose pipeline leader-schedule regression
+        timeout-minutes: 3
+        env:
+          CGO_ENABLED: "0"
+        run: go test -v ./pkg/quepaxa -run '^TestPipelineCrossesLeaderScheduleWithPreferredReplicaDown$' -count=20 -failfast -timeout=90s
       - name: Test
         env:
           CGO_ENABLED: 0
         run: go test ./...
+      - name: Capture retired-peer REMOVE rejection diagnostics
+        if: always()
+        env:
+          CGO_ENABLED: 1
+          DIAGNOSTIC_LOG: ${{ runner.temp }}/retired-peer-remove-diagnostic.log
+        run: |
+          set +e
+          go test -tags rhiza_local_testhooks ./pkg/network -run '^TestRetiredPeerTransitionRejectsCachedIdentityAndAdmitsNewIdentity$' -count=1 -timeout=30s >"$DIAGNOSTIC_LOG" 2>&1
+          test_status=$?
+          set -e
+          cat "$DIAGNOSTIC_LOG"
+          printf '\ngo_test_exit=%s\n' "$test_status" >>"$DIAGNOSTIC_LOG"
+          exit "$test_status"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: retired-peer-remove-diagnostic-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/retired-peer-remove-diagnostic.log
+          if-no-files-found: warn
+      - name: Install pinned kubectl for client-side fixture tests
+        run: |
+          image=registry.k8s.io/kubectl@sha256:9cd9070def4060229de73314aef753caff194eebe2ca1f04d21f22320932c0c0
+          container=$(docker create "$image")
+          trap 'docker rm -f "$container" >/dev/null 2>&1 || true' EXIT
+          mkdir -p "$RUNNER_TEMP/fixture-kubectl"
+          docker cp "$container:/bin/kubectl" "$RUNNER_TEMP/fixture-kubectl/kubectl"
+          docker rm "$container"
+          trap - EXIT
+          chmod 0755 "$RUNNER_TEMP/fixture-kubectl/kubectl"
+          echo "$RUNNER_TEMP/fixture-kubectl" >> "$GITHUB_PATH"
       - name: Bucket fixture retry regression
         run: |
           python3 e2e/chaos/operator_fixture_test.py
@@ -350,6 +674,24 @@ jobs:
           go test -race -tags rhiza_local_testhooks ./pkg/network -run '^TestOverload(MutationAdmissionEmitsFixedSite|QueueReservationEmitsFixedSite|InputChannelFullEmitsFixedSite|WorkerInflightBytesEmitsFixedSite|ProposalAdmissionSubtypeEmitsFixedSite)$' -count=1 -timeout=30s
           go test -race -tags rhiza_local_testhooks ./pkg/node -run '^TestAdvanceCheckpointReadBarriersRetriesRealPreAdmissionRefusal$' -count=1 -timeout=30s
           go test -race -tags rhiza_local_testhooks ./pkg/recovery -run '^(TestArchiveCleanupReusesUnchangedPrefixAfterRealHeadConflict|TestArchiveCleanupReuseRequiresExactBaseAndRefPrefix|TestArchiveCleanupIncrementalPackingMatchesFullAtBoundaries|TestArchiveCleanupAmbiguousPublicationReloadsCommittedHead|TestArchiveCleanupCanceledAfterHeadConflictDoesNotRepublish)$' -count=1 -timeout=2m
+      - name: Cached QUIC restart and cancellation regressions
+        if: ${{ always() && !cancelled() }}
+        timeout-minutes: 4
+        env:
+          CGO_ENABLED: 1
+        run: >-
+          go test -tags rhiza_local_testhooks ./pkg/network
+          -run '^(TestWarmCachedQUICReadIndexAfterPeerHardRestart|TestGenericMutationCallDoesNotRetryAfterStatelessReset|TestReadTipResetRetryDoesNotDialAfterTransportClose|TestReadTipResetRetryRequiresCachedTypedResetAndLiveContext|TestReadTipResetRetryStopsAfterSecondPeerFailure|TestColdTransportReadIndexAfterPeerRestartControl|TestPeerStatelessResetKeyIsStableAndScoped|TestQUICCancellationReleasesStreamAndPreservesConnection|TestLearnedMutationAppliedOnceWhenResponseIsLost|TestRetiredPeerNestedSyncDiagnostic|TestRetiredPeerArchiveRecoveryAllowsRetainedVoterCurrentSync)$'
+          -count=1 -timeout=2m
+      - name: Cached QUIC restart and cancellation regressions (race)
+        if: ${{ always() && !cancelled() }}
+        timeout-minutes: 5
+        env:
+          CGO_ENABLED: 1
+        run: >-
+          go test -race -tags rhiza_local_testhooks ./pkg/network
+          -run '^(TestWarmCachedQUICReadIndexAfterPeerHardRestart|TestGenericMutationCallDoesNotRetryAfterStatelessReset|TestReadTipResetRetryDoesNotDialAfterTransportClose|TestReadTipResetRetryRequiresCachedTypedResetAndLiveContext|TestReadTipResetRetryStopsAfterSecondPeerFailure|TestColdTransportReadIndexAfterPeerRestartControl|TestPeerStatelessResetKeyIsStableAndScoped|TestQUICCancellationReleasesStreamAndPreservesConnection|TestLearnedMutationAppliedOnceWhenResponseIsLost|TestRetiredPeerNestedSyncDiagnostic|TestRetiredPeerArchiveRecoveryAllowsRetainedVoterCurrentSync)$'
+          -count=1 -timeout=2m
       - name: Vet
         env:
           CGO_ENABLED: 0
@@ -393,38 +735,120 @@ jobs:
       - name: Vulnerability scan
         run: go run golang.org/x/vuln/cmd/govulncheck@v1.7.0 ./...
 
+  node-startup-versity:
+    if: github.event_name != 'workflow_dispatch' || (!inputs.fencing_only && !inputs.fixture_only)
+    runs-on: macos-15
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+          cache: true
+      - name: Download and verify pinned local Versity Gateway
+        env:
+          VERSITY_ARCHIVE_SHA256: 4953096f65a9c0d62ab184fb6b2ba7c2435229205cf00a56cb62cd4bf6b216ca
+        run: |
+          set -eu
+          archive="$RUNNER_TEMP/versitygw_v1.8.0_Darwin_arm64.tar.gz"
+          install_dir="$RUNNER_TEMP/rhiza-versitygw"
+          curl --fail --location --silent --show-error \
+            https://github.com/versity/versitygw/releases/download/v1.8.0/versitygw_v1.8.0_Darwin_arm64.tar.gz \
+            --output "$archive"
+          printf '%s  %s\n' "$VERSITY_ARCHIVE_SHA256" "$archive" | shasum -a 256 --check
+          test "$(uname -m)" = arm64
+          mkdir -p "$install_dir"
+          tar -xzf "$archive" -C "$install_dir"
+          binary="$install_dir/versitygw_v1.8.0_Darwin_arm64/versitygw"
+          test -x "$binary"
+          "$binary" --version | grep -F 'Version  : 1.8.0'
+          printf 'RHIZA_VERSITYGW_BIN=%s\n' "$binary" >>"$GITHUB_ENV"
+          evidence_dir="$RUNNER_TEMP/rhiza-node-startup-versity-evidence"
+          mkdir -p "$evidence_dir"
+          printf 'RHIZA_VERSITY_EVIDENCE_DIR=%s\n' "$evidence_dir" >>"$GITHUB_ENV"
+      - name: Verify Node startup archive recovery with live quorum
+        env:
+          CGO_ENABLED: "1"
+        run: >-
+          go test -count=1 -v -timeout=10m ./pkg/node
+          -run '^(TestNodeOpenRefreshesFixedArchiveAfterInitialQuorumFailure|TestNodeOpenConsumesPendingTerminalArchiveGap|TestNodeOpenRemovedSingletonNeverBecomesReady|TestNodeOpenLiveQuorumServesUserWrites|TestNodeOpenRecoversClusteredDurableRecorderWithLiveQuorum)$'
+      - name: Preserve Node startup Versity evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: node-startup-versity-${{ github.run_id }}
+          path: ${{ runner.temp }}/rhiza-node-startup-versity-evidence
+          if-no-files-found: error
+          retention-days: 7
+
   containers:
+    if: github.event_name != 'workflow_dispatch' || (!inputs.fencing_only && !inputs.fixture_only)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: docker/setup-buildx-action@v3
-        with:
-          driver-opts: image=mirror.gcr.io/moby/buildkit:buildx-stable-1@sha256:cec9f139f45e93c5c69c60f8b07cfad9f43f4ef6b6a6cd917527fea5ff2e3dea
-      - name: Prepare container test tools
-        run: |
-          awk '
-            { print }
-            $0 == "FROM mirror.gcr.io/library/golang:1.27-alpine@sha256:738d1cf061836894ff6bb8c33881080ac66de8cf0586615012a0c8f592649cfa AS builder" {
-              print "RUN apk --no-cache add jq coreutils"
-              matched++
-            }
-            END { if (matched != 1) exit 1 }
-          ' Dockerfile > "$RUNNER_TEMP/Dockerfile.ci"
       - uses: docker/build-push-action@v6
         with:
           context: .
-          file: ${{ runner.temp }}/Dockerfile.ci
+          file: Dockerfile
+          build-args: |
+            RHIZA_APPLICATION_PACKAGE=./e2e/chaos/embedded-go
           push: false
+          load: true
           tags: rhiza:ci
+          labels: |
+            org.opencontainers.image.source=https://github.com/${{ github.repository }}
+            org.opencontainers.image.revision=${{ github.sha }}
+            io.rhiza.candidate.source-sha=${{ github.sha }}
+            io.rhiza.candidate.application-package=./e2e/chaos/embedded-go
 
       - uses: docker/build-push-action@v6
         with:
           context: .
           file: Dockerfile.operator
           push: false
+          load: true
           tags: rhiza-operator:ci
+          labels: |
+            org.opencontainers.image.source=https://github.com/${{ github.repository }}
+            org.opencontainers.image.revision=${{ github.sha }}
+            io.rhiza.candidate.source-sha=${{ github.sha }}
+
+      - name: Export voter and operator images for exact recovery testing
+        run: |
+          set -eu
+          export_dir="$RUNNER_TEMP/runtime-candidate"
+          mkdir -p "$export_dir/bin"
+          docker image inspect rhiza:ci > "$export_dir/application-image.json"
+          docker image inspect rhiza-operator:ci > "$export_dir/operator-image.json"
+          for image_file in "$export_dir/application-image.json" "$export_dir/operator-image.json"; do
+            jq -e --arg revision "$GITHUB_SHA" --arg source "https://github.com/$GITHUB_REPOSITORY" '
+              .[0] | .Os == "linux" and .Architecture == "amd64" and
+              .Config.Labels["org.opencontainers.image.source"] == $source and
+              .Config.Labels["org.opencontainers.image.revision"] == $revision and
+              .Config.Labels["io.rhiza.candidate.source-sha"] == $revision
+            ' "$image_file" >/dev/null
+          done
+          app_container=$(docker create rhiza:ci)
+          operator_container=$(docker create rhiza-operator:ci)
+          trap 'docker rm "$app_container" "$operator_container" >/dev/null' EXIT
+          docker cp "$app_container:/usr/local/bin/rhiza" "$export_dir/bin/rhiza"
+          docker cp "$app_container:/usr/local/bin/rhiza-entrypoint" "$export_dir/bin/rhiza-entrypoint"
+          docker cp "$app_container:/usr/local/bin/rhiza-fencer" "$export_dir/bin/application-rhiza-fencer"
+          docker cp "$operator_container:/usr/local/bin/rhiza-operator" "$export_dir/bin/rhiza-operator"
+          docker cp "$operator_container:/usr/local/bin/rhiza-fencer" "$export_dir/bin/operator-rhiza-fencer"
+          docker cp "$operator_container:/usr/local/bin/rhiza-runtime-agent" "$export_dir/bin/rhiza-runtime-agent"
+          (cd "$export_dir" && sha256sum bin/* > binaries.sha256)
+          docker save rhiza:ci rhiza-operator:ci -o "$export_dir/runtime-images.tar"
+          (cd "$export_dir" && sha256sum application-image.json operator-image.json binaries.sha256 runtime-images.tar > SHA256SUMS)
+      - uses: actions/upload-artifact@v4
+        with:
+          name: runtime-candidate-${{ github.sha }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/runtime-candidate
+          if-no-files-found: error
+          retention-days: 7
 
   anchor-operator-chaos:
+    if: github.event_name != 'workflow_dispatch' || (!inputs.fencing_only && !inputs.fixture_only)
     runs-on: ubuntu-latest
     timeout-minutes: 30
     env:
@@ -450,6 +874,8 @@ jobs:
           mkdir -p "$RUNNER_TEMP/chaos-images"
           go build -o "$RUNNER_TEMP/chaos-images/rhiza" ./e2e/chaos/embedded-go
           go build -o "$RUNNER_TEMP/chaos-images/operator" ./cmd/rhiza-operator
+          go build -o "$RUNNER_TEMP/chaos-images/rhiza-fencer" ./cmd/rhiza-fencer
+          go build -o "$RUNNER_TEMP/chaos-images/rhiza-runtime-agent" ./cmd/rhiza-runtime-agent
           go build -o "$RUNNER_TEMP/chaos-images/anchor-service" ./examples/recovery-anchor
           labels=()
           if [ "$PUBLISH_CHAOS_IMAGE" = true ]; then
@@ -461,11 +887,20 @@ jobs:
           docker build -f e2e/chaos/Dockerfile --build-arg BINARY=rhiza "${labels[@]}" -t rhiza-chaos:local "$RUNNER_TEMP/chaos-images"
           docker build -f e2e/chaos/Dockerfile --build-arg BINARY=operator -t rhiza-operator-chaos:local "$RUNNER_TEMP/chaos-images"
           docker build -f e2e/chaos/Dockerfile --build-arg BINARY=anchor-service -t rhiza-anchor-service:local "$RUNNER_TEMP/chaos-images"
+          docker run --rm --entrypoint /bin/sh rhiza-chaos:local -ec 'command -v kubectl >/dev/null && command -v date >/dev/null && command -v sleep >/dev/null && kubectl version --client --output=yaml'
           kind create cluster --name rhiza-anchor-chaos --wait 120s
           kind load docker-image rhiza-chaos:local rhiza-operator-chaos:local rhiza-anchor-service:local --name rhiza-anchor-chaos
+      - name: Exercise namespace expiry and owned RBAC garbage collection
+        env:
+          RHIZA_NAMESPACE_EXPIRY_KIND_TEST: "1"
+          RHIZA_NAMESPACE_EXPIRY_KIND_CONTEXT: kind-rhiza-anchor-chaos
+          RHIZA_NAMESPACE_EXPIRY_KIND_IMAGE: rhiza-chaos:local
+        run: go test ./e2e/chaos/embedded-go -run '^TestNamespaceExpiryDeletesOwnedNamespaceInKind$' -count=1 -timeout=4m
       - name: Fencing executor regression checks
         run: python3 e2e/chaos/kind_fencer_test.py
-      - name: Inject faults and verify anchor-gated recovery
+      - name: Check anchored cooperative profile contract
+        run: go test ./pkg/operator -run '^TestAnchoredCooperativeRecoveryBlocksBeforeArchiveOrAnchorEffects$' -count=1 -timeout=5m
+      - name: Verify supported-negative S3/Kubernetes anchor behavior
         run: python3 -u e2e/chaos/anchor_recovery.py --embedded-host go
       - name: Collect cluster diagnostics
         if: always()
@@ -477,6 +912,7 @@ jobs:
           path: |
             anchor-chaos-results
             !anchor-chaos-results/kind/**
+            !anchor-chaos-results/private-startup-diagnostics/**
       - name: Remove test cluster
         if: always()
         run: kind delete cluster --name rhiza-anchor-chaos
@@ -511,8 +947,8 @@ jobs:
           retention-days: 7
 
   publish-chaos-image:
-    if: github.repository == 'mrchypark/rhiza' && github.event_name == 'workflow_dispatch' && inputs.publish_chaos_image
-    needs: [anchor-operator-chaos, go, containers]
+    if: github.repository == 'mrchypark/rhiza' && github.event_name == 'workflow_dispatch' && inputs.publish_chaos_image && !inputs.fencing_only && !inputs.fixture_only
+    needs: [anchor-operator-chaos, go, containers, automatic-operator-chaos, cooperative-fencing]
     runs-on: ubuntu-latest
     timeout-minutes: 10
     permissions:
@@ -523,6 +959,38 @@ jobs:
         with:
           name: qualification-host-${{ github.sha }}-${{ github.run_id }}-${{ github.run_attempt }}
           path: qualification-host
+      - uses: actions/download-artifact@v4
+        with:
+          name: runtime-candidate-${{ github.sha }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: runtime-candidate
+      - name: Verify and load tested voter and operator images
+        working-directory: runtime-candidate
+        run: |
+          set -eu
+          sha256sum -c SHA256SUMS
+          for image_file in application-image.json operator-image.json; do
+            jq -e --arg revision "$GITHUB_SHA" '
+              .[0].Config.Labels["io.rhiza.candidate.source-sha"] == $revision and
+              .[0].Config.Labels["org.opencontainers.image.revision"] == $revision
+            ' "$image_file" >/dev/null
+          done
+          jq -e '.[0].Config.Labels["io.rhiza.candidate.application-package"] == "./e2e/chaos/embedded-go"' application-image.json >/dev/null
+          docker load -i runtime-images.tar
+          test "$(docker image inspect rhiza:ci --format '{{.Id}}')" = "$(jq -r '.[0].Id' application-image.json)"
+          test "$(docker image inspect rhiza-operator:ci --format '{{.Id}}')" = "$(jq -r '.[0].Id' operator-image.json)"
+          app_container=$(docker create rhiza:ci)
+          operator_container=$(docker create rhiza-operator:ci)
+          trap 'docker rm "$app_container" "$operator_container" >/dev/null' EXIT
+          mkdir -p verify-bin
+          docker cp "$app_container:/usr/local/bin/rhiza" verify-bin/rhiza
+          docker cp "$app_container:/usr/local/bin/rhiza-entrypoint" verify-bin/rhiza-entrypoint
+          docker cp "$app_container:/usr/local/bin/rhiza-fencer" verify-bin/application-rhiza-fencer
+          docker cp "$operator_container:/usr/local/bin/rhiza-operator" verify-bin/rhiza-operator
+          docker cp "$operator_container:/usr/local/bin/rhiza-fencer" verify-bin/operator-rhiza-fencer
+          docker cp "$operator_container:/usr/local/bin/rhiza-runtime-agent" verify-bin/rhiza-runtime-agent
+          for binary in rhiza rhiza-entrypoint application-rhiza-fencer rhiza-operator operator-rhiza-fencer rhiza-runtime-agent; do
+            cmp "bin/$binary" "verify-bin/$binary"
+          done
       - name: Verify and load the tested host image
         working-directory: qualification-host
         run: |
@@ -541,13 +1009,43 @@ jobs:
       - name: Publish only the immutable run tag
         shell: bash
         run: |
+          set -euo pipefail
           target="ghcr.io/mrchypark/rhiza-sql:ci-$GITHUB_SHA-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
+          app_target="ghcr.io/mrchypark/rhiza-application:ci-$GITHUB_SHA-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
+          operator_target="ghcr.io/mrchypark/rhiza-operator:ci-$GITHUB_SHA-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
+          for candidate in "$target" "$app_target" "$operator_target"; do
+            if docker manifest inspect "$candidate" >/dev/null 2>&1; then
+              echo "::error::refusing to retarget immutable image $candidate" >&2
+              exit 1
+            fi
+          done
           docker tag rhiza-chaos:local "$target"
+          docker tag rhiza:ci "$app_target"
+          docker tag rhiza-operator:ci "$operator_target"
           docker push "$target" | tee qualification-host/push.log
           docker image inspect "$target" > qualification-host/published-image.json
-          # shellcheck disable=SC2016 # Markdown backticks are literal output.
-          printf 'Qualification host: `%s`\n\n' "$target" >> "$GITHUB_STEP_SUMMARY"
-          jq -r '.[0].RepoDigests[]' qualification-host/published-image.json >> "$GITHUB_STEP_SUMMARY"
+          docker push "$app_target" | tee runtime-candidate/application-push.log
+          docker image inspect "$app_target" > runtime-candidate/application-published-image.json
+          docker push "$operator_target" | tee runtime-candidate/operator-push.log
+          docker image inspect "$operator_target" > runtime-candidate/operator-published-image.json
+          for published in runtime-candidate/application-published-image.json runtime-candidate/operator-published-image.json; do
+            jq -e --arg revision "$GITHUB_SHA" '
+              .[0].Config.Labels["io.rhiza.candidate.source-sha"] == $revision and
+              .[0].Config.Labels["org.opencontainers.image.revision"] == $revision and
+              ([.[0].RepoDigests[]? | select(test("@sha256:[a-f0-9]{64}$"))] | length) > 0
+            ' "$published" >/dev/null
+          done
+          {
+            # shellcheck disable=SC2016 # Markdown backticks are literal output.
+            printf 'Qualification host: `%s`\n\n' "$target"
+            jq -r '.[0].RepoDigests[]' qualification-host/published-image.json
+            # shellcheck disable=SC2016 # Markdown backticks are literal output.
+            printf '\nVoter application image: `%s`\n\n' "$app_target"
+            jq -r '.[0].RepoDigests[]' runtime-candidate/application-published-image.json
+            # shellcheck disable=SC2016 # Markdown backticks are literal output.
+            printf '\nOperator/fencer/runtime-agent image: `%s`\n\n' "$operator_target"
+            jq -r '.[0].RepoDigests[]' runtime-candidate/operator-published-image.json
+          } >> "$GITHUB_STEP_SUMMARY"
       - uses: actions/upload-artifact@v4
         if: always()
         with:
@@ -558,5 +1056,13 @@ jobs:
             qualification-host/SHA256SUMS
             qualification-host/push.log
             qualification-host/published-image.json
+            runtime-candidate/application-image.json
+            runtime-candidate/operator-image.json
+            runtime-candidate/binaries.sha256
+            runtime-candidate/SHA256SUMS
+            runtime-candidate/application-push.log
+            runtime-candidate/operator-push.log
+            runtime-candidate/application-published-image.json
+            runtime-candidate/operator-published-image.json
           if-no-files-found: error
           retention-days: 7

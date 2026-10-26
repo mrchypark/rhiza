@@ -1,0 +1,1773 @@
+package operator
+
+import (
+	"bytes"
+	"context"
+	"encoding/base64"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
+	"net/http"
+	"net/http/httptest"
+	"path"
+	"strings"
+	"sync"
+	"testing"
+	"time"
+
+	"github.com/mrchypark/rhiza/pkg/fencing"
+	"github.com/mrchypark/rhiza/pkg/quepaxa"
+	"github.com/mrchypark/rhiza/pkg/recovery"
+	"github.com/thanos-io/objstore"
+)
+
+// automaticBootstrapGenesisFixture starts from the same CONTROL-backed,
+// enrolled held-profile fixture used by the frozen-source recovery tests. It
+// leaves a real admitted and dispatched empty-HEAD create unresolved, with no
+// provider object, so bootstrap tests cannot mistake an absent HEAD for proof
+// that no write was attempted.
+type automaticBootstrapGenesisFixture struct {
+	heldProfileFixture
+	archive            *objstore.InMemBucket
+	provider           *heldGCSServer
+	intent             fencing.MutationIntent
+	cohort             []fencing.RuntimeBinding
+	emptyRecoveryError *emptyRecoveryErrorCapture
+}
+
+type emptyRecoveryErrorCapture struct {
+	mu  sync.Mutex
+	err string
+}
+
+func (c *emptyRecoveryErrorCapture) record(err error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.err = err.Error()
+}
+
+func (c *emptyRecoveryErrorCapture) value() string {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.err
+}
+
+const (
+	automaticBootstrapClusterName  = "bootstrap-cluster"
+	automaticBootstrapClusterUID   = "bootstrap-cluster-uid"
+	automaticBootstrapNamespaceUID = "bootstrap-namespace-uid"
+)
+
+func newAutomaticBootstrapGenesisFixture(t *testing.T) automaticBootstrapGenesisFixture {
+	t.Helper()
+	e, api, _, baseRuntime := newMutationStoreFixture(t)
+	// newMutationStoreFixture initializes a cooperative-only root. The
+	// bootstrap fixture must instead start with an independently configured
+	// CONTROL store, because production deliberately refuses to upgrade an
+	// existing cooperative root in place.
+	controlBucket := objstore.NewInMemBucket()
+	t.Cleanup(func() { _ = controlBucket.Close() })
+	controlState, err := NewAuthorityStateStore(controlBucket, "test-authority")
+	if err != nil {
+		t.Fatal(err)
+	}
+	e.AuthorityState = controlState
+	api.authorityBucket = controlBucket
+	e.MutationProfile = fencing.MutationHeldExecutionProfile
+	e.RequireMutationJournal = true
+	e.ArchiveStoreIdentity = StoreIdentity(map[string]string{
+		"RHIZA_OBJSTORE_PROVIDER": "gcs", "RHIZA_OBJSTORE_BUCKET": "archive", "RHIZA_OBJSTORE_PREFIX": "root",
+	})
+	scope := AttestationStoreScope{Provider: "gcs", Bucket: "archive", Prefix: "root/source"}
+	f := heldProfileFixture{e: e, api: api, scope: scope}
+	if err := e.initializeRoot(t.Context(), baseRuntime.StatefulSetUID, baseRuntime.SourceClusterID); err != nil {
+		t.Fatalf("initialize required canonical bootstrap CONTROL root: %v", err)
+	}
+	cohort := configureAutomaticBootstrapCohort(t, &f, baseRuntime, 3)
+	e.RuntimeAgent = &RuntimeAgentClient{AuthorityID: cohort[0].AuthorityID}
+	f.id, f.runtime = fencing.Identity{SourceClusterID: "source", NodeID: "rhiza-0", PodUID: "bootstrap-pod-0", RunID: "bootstrap-run-0"}, cohort[0]
+	if _, err := e.change(t.Context(), f.runtime.StatefulSetUID, f.runtime.SourceClusterID, func(ledger *fencing.Ledger) error {
+		ledger.RequireRuntimeBinding = true
+		ledger.RequireMutationJournal = true
+		return ledger.RegisterEnrolled(f.id, f.runtime)
+	}); err != nil {
+		t.Fatalf("enroll bootstrap runtime before WAL binding: %v", err)
+	}
+	if _, err := e.reserveMutationProducer(t.Context(), f.runtime); err != nil {
+		t.Fatalf("reserve bootstrap producer after enrollment: %v", err)
+	}
+	f.id.WALIdentity = "bootstrap-wal-0"
+	f.stages, err = e.sourceStagesFor(t.Context(), f.runtime)
+	if err != nil || f.stages == nil {
+		t.Fatalf("configure root-bound bootstrap source stage store: %v", err)
+	}
+	if _, err := e.change(t.Context(), f.runtime.StatefulSetUID, f.runtime.SourceClusterID, func(ledger *fencing.Ledger) error {
+		if err := ledger.BindMutationScope(f.id, hashJSON(scope), fencing.MutationHeldExecutionProfile); err != nil {
+			return err
+		}
+		if err := ledger.BindMutationStage(f.id, f.stages.incarnation); err != nil {
+			return err
+		}
+		return ledger.Bind(f.id)
+	}); err != nil {
+		t.Fatalf("bind bootstrap runtime WAL and held mutation scope: %v", err)
+	}
+	producer, err := e.enrolledMutationRun(t.Context(), f.runtime)
+	if err != nil {
+		t.Fatalf("read enrolled bootstrap mutation producer: %v", err)
+	}
+	f.producer = producer.MutationProducerUID
+	if _, err := e.changeMutationProducer(t.Context(), f.runtime, func(p *fencing.MutationProducer) error { return p.Activate(f.id) }); err != nil {
+		t.Fatalf("activate bootstrap mutation producer: %v", err)
+	}
+	f.receipts, err = e.receiptsForRuntime(f.runtime)
+	if err != nil {
+		t.Fatalf("configure bootstrap mutation receipts: %v", err)
+	}
+	configureAutomaticBootstrapKubernetes(t, &f, cohort)
+	archive := objstore.NewInMemBucket()
+	t.Cleanup(func() { _ = archive.Close() })
+	e.ArchiveBucket = frozenSourceEmptyTestBucket{Bucket: archive}
+	if err := f.e.claimArchiveScopeForRegistration(t.Context(), f.runtime.StatefulSetUID, f.id, f.runtime); err != nil {
+		t.Fatalf("claim canonical bootstrap archive scope after enrollment: %v", err)
+	}
+	provider := newFrozenEmptyNoEffectServer(t, f)
+	payload, err := recovery.EmptyArchiveHeadBytes()
+	if err != nil {
+		t.Fatalf("encode canonical empty bootstrap HEAD: %v", err)
+	}
+	intent := f.admitUpload(t, 1, "archive/head.bin", fencing.MutationCondition{Mode: fencing.MutationCreateOnly}, payload)
+	if err := f.e.executeSourceMutationRequest(t.Context(), "Bearer test", f.id, sourceMutationRequest{
+		ProducerUID: f.producer, Sequence: 1, Intent: intent,
+	}, true); !errors.Is(err, ErrFencePending) {
+		t.Fatalf("dispatch canonical held bootstrap HEAD and preserve provider no-effect as pending: %v", err)
+	}
+	root, err := f.e.read(t.Context(), f.runtime.StatefulSetUID, f.runtime.SourceClusterID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	mutationProducer, _, _, err := f.e.AuthorityState.ReadProducer(t.Context(), f.runtime)
+	if err != nil {
+		t.Fatal(err)
+	}
+	entry := mutationProducer.Entries[1]
+	if root.Ledger.ArchiveGenesisRef == nil || root.Ledger.ArchiveGenesisRef.Mutation == nil ||
+		root.Ledger.ArchiveGenesisRef.Mutation.Intent != intent || entry.Intent != intent ||
+		entry.Preparation == nil || entry.Preparation.Profile != fencing.MutationHeldExecutionProfile ||
+		entry.Resolution != nil || entry.GuardedLogicalResolution != nil || len(entry.Dispatches) != 1 {
+		t.Fatalf("fixture lacks exact CONTROL-backed unresolved genesis admission: root=%+v entry=%+v", root.Ledger, entry)
+	}
+	if exists, err := archive.Exists(t.Context(), "root/source/archive/head.bin"); err != nil || exists {
+		t.Fatalf("fixture unexpectedly has an archive HEAD: exists=%t err=%v", exists, err)
+	}
+	return automaticBootstrapGenesisFixture{heldProfileFixture: f, archive: archive, provider: provider, intent: intent, cohort: cohort}
+}
+
+// configureAutomaticBootstrapCohort mirrors the exact enrolled runtime cohort
+// into both canonical CONTROL and the live StatefulSet-owned Pod inventory.
+// Recovery tests must not rely on missing Pods or membership as a shortcut for
+// the bootstrap candidate.
+func configureAutomaticBootstrapCohort(t *testing.T, f *heldProfileFixture, base fencing.RuntimeBinding, count int) []fencing.RuntimeBinding {
+	t.Helper()
+	if count < 1 {
+		t.Fatal("bootstrap cohort must contain at least one enrolled runtime")
+	}
+	cohort := make([]fencing.RuntimeBinding, 0, count)
+	for i := range count {
+		runtime := base
+		runtime.NodeID = fmt.Sprintf("rhiza-%d", i)
+		runtime.PodUID = fmt.Sprintf("bootstrap-pod-%d", i)
+		runtime.RunID = fmt.Sprintf("bootstrap-run-%d", i)
+		runtime.NodeName = fmt.Sprintf("node-%d", i)
+		runtime.NodeUID = fmt.Sprintf("node-uid-%d", i)
+		runtime.MachineID = fmt.Sprintf("machine-%d", i)
+		runtime.BootID = fmt.Sprintf("boot-%d", i)
+		runtime.RuntimeID = fmt.Sprintf("runtime-%d", i)
+		runtime.SandboxID = fmt.Sprintf("sandbox-%d", i)
+		runtime.ContainerID = fmt.Sprintf("containerd://%032x", i+1)
+		runtime.ImageID = fmt.Sprintf("registry.example/rhiza@sha256:%064x", i+1)
+		runtime.BindingUID = automaticBootstrapClusterUID
+		runtime.NamespaceUID = automaticBootstrapNamespaceUID
+		cohort = append(cohort, runtime)
+	}
+	return cohort
+}
+
+func configureAutomaticBootstrapKubernetes(t *testing.T, f *heldProfileFixture, cohort []fencing.RuntimeBinding) {
+	t.Helper()
+	sts := object{
+		"metadata": object{"name": "rhiza", "namespace": "test", "uid": f.runtime.StatefulSetUID},
+		"spec": object{
+			"replicas": float64(len(cohort)), "ordinals": object{"start": float64(0)}, "volumeClaimTemplates": []any{}, "serviceName": "rhiza-headless",
+			"template": object{"spec": object{
+				"containers": []any{object{"name": "rhiza", "env": []any{
+					object{"name": "RHIZA_CLUSTER_ID", "value": f.runtime.SourceClusterID},
+					object{"name": "RHIZA_OBJSTORE_PROVIDER", "value": "gcs"},
+					object{"name": "RHIZA_OBJSTORE_BUCKET", "value": f.scope.Bucket},
+					object{"name": "RHIZA_OBJSTORE_PREFIX", "value": "root"},
+					object{"name": "RHIZA_OBJSTORE_DURABILITY", "value": "async"},
+					object{"name": "RHIZA_ENABLE_RECONFIGURATION", "value": "true"},
+					object{"name": "RHIZA_BIND_ADDR", "value": "0.0.0.0:8080"},
+					object{"name": "RHIZA_PEER_ADDR", "value": "0.0.0.0:9090"},
+					object{"name": "RHIZA_NODE_ID", "valueFrom": object{"fieldRef": object{"fieldPath": "metadata.name"}}},
+				}, "volumeMounts": []any{object{"name": "data", "mountPath": "/data"}},
+					"command": []any{"/usr/local/bin/rhiza-fencer"}, "args": []any{"supervise", "--", "/usr/local/bin/rhiza"}}},
+				"volumes": []any{object{"name": "data", "emptyDir": object{}}},
+			}},
+		},
+	}
+	cluster := ClusterResource{APIVersion: "rhiza.mrchypark.dev/v1alpha1", Kind: "RhizaCluster",
+		Metadata: object{"name": automaticBootstrapClusterName, "namespace": "test", "uid": automaticBootstrapClusterUID},
+		Spec: ClusterSpec{LogicalID: "bootstrap-logical", StatefulSet: "rhiza", Container: "rhiza", ClusterDomain: "cluster.local", AdoptClusterID: f.runtime.SourceClusterID,
+			VoterCount: len(cohort), HTTPPort: 8080, PeerPort: 9090, Bootstrap: true, Automatic: true,
+			Policy: func() *AutoPolicy { p := goodPolicy; p.AllowDataLoss = true; return &p }()},
+	}
+	members, err := clusterMemberSources(&cluster, sts, "test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	// This fixture models an adopted source whose immutable membership was
+	// already published, not a fresh bootstrap with keyless member sources.
+	// Give each declared voter its existing deterministic public identity.
+	for i := range members {
+		members[i] = voterMember(f.runtime.SourceClusterID, string(members[i].ID), "bootstrap-token-"+string(members[i].ID))
+		members[i].URL = fmt.Sprintf("http://%s.rhiza-headless.test.svc.cluster.local:8080", members[i].ID)
+		members[i].PeerURL = fmt.Sprintf("quic://%s.rhiza-headless.test.svc.cluster.local:9090", members[i].ID)
+	}
+	container := asObject(list(nested(sts, "spec", "template", "spec", "containers"))[0])
+	peerTokens := make(map[string]string, len(members))
+	for _, member := range members {
+		peerTokens[string(member.ID)] = "bootstrap-token-" + string(member.ID)
+	}
+	secretName := bootstrapSecretName(&cluster)
+	f.api.objects["/api/v1/namespaces/test/secrets/"+secretName] = object{
+		"apiVersion": "v1", "kind": "Secret", "type": "Opaque", "immutable": true,
+		"metadata": object{"name": secretName, "namespace": "test", "annotations": object{ownerAnnotation: automaticBootstrapClusterUID + ":bootstrap-logical"}},
+		"data": object{
+			"members":     base64.StdEncoding.EncodeToString(jsonBytes(members)),
+			"admin":       base64.StdEncoding.EncodeToString([]byte(strings.Repeat("a", 32))),
+			"peer_tokens": base64.StdEncoding.EncodeToString(jsonBytes(peerTokens)),
+		},
+	}
+	applyTargetCredentials(container, secretName)
+	clusterPath := f.e.controller().clusterPath(automaticBootstrapClusterName)
+	podList := make([]any, 0, len(cohort))
+	for i, runtime := range cohort {
+		identity := fencing.Identity{SourceClusterID: runtime.SourceClusterID, NodeID: runtime.NodeID, PodUID: runtime.PodUID,
+			RunID: runtime.RunID}
+		if i > 0 {
+			if _, err := f.e.change(t.Context(), runtime.StatefulSetUID, runtime.SourceClusterID, func(ledger *fencing.Ledger) error {
+				return ledger.RegisterEnrolled(identity, runtime)
+			}); err != nil {
+				t.Fatalf("register bootstrap runtime %d: %v", i, err)
+			}
+			if _, err := f.e.reserveMutationProducer(t.Context(), runtime); err != nil {
+				t.Fatalf("reserve bootstrap mutation producer %d: %v", i, err)
+			}
+			identity.WALIdentity = fmt.Sprintf("bootstrap-wal-%d", i)
+			stages, err := f.e.sourceStagesFor(t.Context(), runtime)
+			if err != nil {
+				t.Fatalf("create bootstrap stage store %d: %v", i, err)
+			}
+			if _, err := f.e.change(t.Context(), runtime.StatefulSetUID, runtime.SourceClusterID, func(ledger *fencing.Ledger) error {
+				if err := ledger.BindMutationScope(identity, hashJSON(f.scope), fencing.MutationHeldExecutionProfile); err != nil {
+					return err
+				}
+				if err := ledger.BindMutationStage(identity, stages.incarnation); err != nil {
+					return err
+				}
+				return ledger.Bind(identity)
+			}); err != nil {
+				t.Fatalf("bind bootstrap runtime %d: %v", i, err)
+			}
+			if _, err := f.e.changeMutationProducer(t.Context(), runtime, func(producer *fencing.MutationProducer) error {
+				return producer.Activate(identity)
+			}); err != nil {
+				t.Fatalf("activate bootstrap producer %d: %v", i, err)
+			}
+		} else {
+			identity = f.id
+		}
+		pod := independentPod(runtime.NodeID, runtime.PodUID)
+		metadata := asObject(pod["metadata"])
+		metadata["namespace"] = "test"
+		metadata["ownerReferences"] = []any{object{"apiVersion": "apps/v1", "kind": "StatefulSet", "name": "rhiza", "uid": runtime.StatefulSetUID, "controller": true}}
+		podSpec := asObject(pod["spec"])
+		podSpec["nodeName"] = runtime.NodeName
+		podEnv := make([]any, 0, len(list(container["env"])))
+		for _, env := range list(container["env"]) {
+			podEnv = append(podEnv, jsonObjectForPreflight(t, env))
+		}
+		asObject(list(podSpec["containers"])[0])["env"] = podEnv
+		status := asObject(list(nested(pod, "status", "containerStatuses"))[0])
+		status["containerID"], status["imageID"] = runtime.ContainerID, runtime.ImageID
+		podList = append(podList, pod)
+	}
+	f.api.mu.Lock()
+	sts["spec"].(object)["template"].(object)["metadata"] = object{"labels": object{"app": "rhiza"}}
+	f.api.authStatefulSet = sts
+	f.api.objects["/apis/apps/v1/namespaces/test/statefulsets/rhiza"] = sts
+	// Registration derives the archive scope from the live StatefulSet
+	// collection, not only from the named object used by pod authentication.
+	f.api.objects["/apis/apps/v1/namespaces/test/statefulsets"] = object{"items": []any{sts}}
+	f.api.objects[clusterPath] = jsonObjectForPreflight(t, cluster)
+	f.api.objects["/apis/rhiza.mrchypark.dev/v1alpha1/namespaces/test/rhizaclusters"] = object{"items": []any{jsonObjectForPreflight(t, cluster)}}
+	f.api.objects["/api/v1/namespaces/test"] = object{"metadata": object{"name": "test", "uid": automaticBootstrapNamespaceUID}}
+	for _, runtime := range cohort {
+		f.api.objects["/api/v1/nodes/"+runtime.NodeName] = object{"metadata": object{"name": runtime.NodeName, "uid": runtime.NodeUID}}
+	}
+	f.api.objects[f.e.controller().corePath("services", "rhiza-headless")] = object{"metadata": object{"name": "rhiza-headless", "namespace": "test"}, "spec": object{
+		"clusterIP": "None", "publishNotReadyAddresses": true, "selector": object{"app": "rhiza"},
+	}}
+	f.api.objects[f.e.controller().corePath("pods", "")] = object{"items": podList}
+	f.api.authPod = asObject(podList[0])
+	f.api.authPodName, f.api.authPodUID = cohort[0].NodeID, cohort[0].PodUID
+	f.api.mu.Unlock()
+	if len(cohort) > 0 && cohort[0].StatefulSetUID != f.runtime.StatefulSetUID {
+		t.Fatal("bootstrap cohort StatefulSet UID differs from canonical runtime")
+	}
+}
+
+func TestBootstrapGenesisPreflightUsesCanonicalControlAndCompleteLiveCohort(t *testing.T) {
+	f := newAutomaticBootstrapGenesisFixture(t)
+	f.e.ControllerServiceAccount = "default"
+	server := httptest.NewTLSServer(f.e.Handler())
+	t.Cleanup(server.Close)
+	client := &FencingClient{URL: server.URL, TokenFile: f.e.Kube.TokenFile, Client: server.Client()}
+	request := BootstrapGenesisPreflightRequest{ClusterName: automaticBootstrapClusterName, ClusterUID: automaticBootstrapClusterUID, StatefulSetUID: f.runtime.StatefulSetUID}
+
+	rootBefore, rootVersion, err := f.e.AuthorityState.ReadRoot(t.Context(), f.runtime.StatefulSetUID, f.runtime.SourceClusterID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	producerBefore := make(map[string]fencing.MutationProducer, len(f.cohort))
+	for _, runtime := range f.cohort {
+		producer, _, _, err := f.e.AuthorityState.ReadProducer(t.Context(), runtime)
+		if err != nil {
+			t.Fatal(err)
+		}
+		producerBefore[runtime.RunID] = producer
+	}
+	response, err := client.BootstrapGenesisPreflight(t.Context(), request)
+	if err != nil {
+		t.Fatalf("valid held unknown genesis and complete unready cohort were rejected: %v", err)
+	}
+	if response.Binding.Version != 1 || response.Binding.ClusterName != automaticBootstrapClusterName ||
+		response.Binding.ClusterUID != automaticBootstrapClusterUID || !validEvidenceDigest(response.Binding.CandidateDigest) {
+		t.Fatalf("preflight returned an incomplete candidate binding: %+v", response.Binding)
+	}
+	if len(response.Targets) != len(f.cohort) {
+		t.Fatalf("preflight captured %d targets, want the full %d-Pod cohort: %+v", len(response.Targets), len(f.cohort), response.Targets)
+	}
+	for i, target := range response.Targets {
+		runtime := f.cohort[i]
+		if target.NodeID != runtime.NodeID || target.Pod != runtime.NodeID || target.PodUID != runtime.PodUID ||
+			target.WALIdentity != fmt.Sprintf("bootstrap-wal-%d", i) || target.NodeName != runtime.NodeName ||
+			target.NodeUID != runtime.NodeUID || target.ContainerID != runtime.ContainerID || target.ImageID != runtime.ImageID {
+			t.Fatalf("target %d is not bound to the enrolled CONTROL runtime: target=%+v runtime=%+v", i, target, runtime)
+		}
+	}
+	rootAfter, rootVersionAfter, err := f.e.AuthorityState.ReadRoot(t.Context(), f.runtime.StatefulSetUID, f.runtime.SourceClusterID)
+	if err != nil || hashJSON(rootBefore) != hashJSON(rootAfter) || rootVersion.Value != rootVersionAfter.Value {
+		t.Fatalf("read-only candidate preflight changed canonical CONTROL root: err=%v", err)
+	}
+	for _, runtime := range f.cohort {
+		producer, _, _, err := f.e.AuthorityState.ReadProducer(t.Context(), runtime)
+		if err != nil || hashJSON(producerBefore[runtime.RunID]) != hashJSON(producer) {
+			t.Fatalf("read-only candidate preflight changed CONTROL producer %q: err=%v", runtime.RunID, err)
+		}
+	}
+}
+
+func TestBootstrapGenesisPreflightRequiresExplicitEligiblePolicyAndExactInventory(t *testing.T) {
+	for _, name := range []string{"automatic-off", "bootstrap-off", "policy-absent", "loss-not-allowed", "PVC", "missing-members-reference", "changed-members-reference", "wrong-members-key", "peer-token-not-cleared", "mutable-secret", "wrong-secret-owner", "missing-pod", "ready-pod", "malformed-owner-reference", "malformed-condition", "malformed-container-status"} {
+		t.Run(name, func(t *testing.T) {
+			f := newAutomaticBootstrapGenesisFixture(t)
+			f.e.ControllerServiceAccount = "default"
+			cluster := automaticBootstrapCluster(t, f)
+			secretName := bootstrapSecretName(&cluster)
+			switch name {
+			case "automatic-off", "bootstrap-off", "policy-absent", "loss-not-allowed":
+				switch name {
+				case "automatic-off":
+					cluster.Spec.Automatic = false
+				case "bootstrap-off":
+					cluster.Spec.Bootstrap = false
+				case "policy-absent":
+					cluster.Spec.Policy = nil
+				case "loss-not-allowed":
+					cluster.Spec.Policy.AllowDataLoss = false
+				}
+				storeAutomaticBootstrapCluster(t, f, cluster)
+			case "PVC":
+				f.api.mu.Lock()
+				asObject(f.api.authStatefulSet["spec"])["volumeClaimTemplates"] = []any{object{"metadata": object{"name": "data"}}}
+				f.api.mu.Unlock()
+			case "missing-members-reference", "changed-members-reference", "wrong-members-key", "peer-token-not-cleared":
+				f.api.mu.Lock()
+				ctr := asObject(list(nested(f.api.authStatefulSet, "spec", "template", "spec", "containers"))[0])
+				switch name {
+				case "missing-members-reference":
+					ctr["env"] = removeEnv(list(ctr["env"]), "RHIZA_CLUSTER_MEMBERS")
+				case "changed-members-reference":
+					ctr["env"] = replaceEnv(list(ctr["env"]), "RHIZA_CLUSTER_MEMBERS", object{"valueFrom": object{"secretKeyRef": object{"name": "unexpected-bootstrap-secret", "key": "members"}}})
+				case "wrong-members-key":
+					ctr["env"] = replaceEnv(list(ctr["env"]), "RHIZA_CLUSTER_MEMBERS", object{"valueFrom": object{"secretKeyRef": object{"name": secretName, "key": "peer_tokens"}}})
+				case "peer-token-not-cleared":
+					ctr["env"] = replaceEnv(list(ctr["env"]), "RHIZA_PEER_TOKEN", object{"value": "not-cleared"})
+				}
+				f.api.mu.Unlock()
+			case "mutable-secret", "wrong-secret-owner":
+				f.api.mu.Lock()
+				secret := asObject(f.api.objects[f.e.controller().corePath("secrets", secretName)])
+				if name == "mutable-secret" {
+					secret["immutable"] = false
+				} else {
+					asObject(nested(secret, "metadata", "annotations"))[ownerAnnotation] = "other-cluster:other-logical"
+				}
+				f.api.mu.Unlock()
+			case "missing-pod", "ready-pod", "malformed-owner-reference", "malformed-condition", "malformed-container-status":
+				f.api.mu.Lock()
+				pods := list(asObject(f.api.objects[f.e.controller().corePath("pods", "")])["items"])
+				if name == "missing-pod" {
+					asObject(f.api.objects[f.e.controller().corePath("pods", "")])["items"] = pods[:len(pods)-1]
+				} else if name == "ready-pod" {
+					conditions := []any{object{"type": "Ready", "status": "True"}}
+					asObject(pods[0])["status"] = object{"containerStatuses": []any{object{"containerID": f.cohort[0].ContainerID, "imageID": f.cohort[0].ImageID}}, "conditions": conditions}
+				} else {
+					pod := asObject(pods[0])
+					switch name {
+					case "malformed-owner-reference":
+						asObject(pod["metadata"])["ownerReferences"] = []any{"not-an-owner-reference"}
+					case "malformed-condition":
+						asObject(pod["status"])["conditions"] = []any{"not-a-condition"}
+					case "malformed-container-status":
+						asObject(pod["status"])["containerStatuses"] = []any{"not-a-container-status"}
+					}
+				}
+				f.api.mu.Unlock()
+			}
+			if _, err := f.e.bootstrapGenesisPreflight(t.Context(), BootstrapGenesisPreflightRequest{
+				ClusterName: automaticBootstrapClusterName, ClusterUID: automaticBootstrapClusterUID, StatefulSetUID: f.runtime.StatefulSetUID,
+			}); err == nil {
+				t.Fatal("bootstrap preflight accepted an ineligible policy, unsupported credential template, or incomplete live inventory")
+			}
+		})
+	}
+}
+
+func TestBootstrapGenesisPreflightRequiresTheCanonicalControlRoot(t *testing.T) {
+	f := newAutomaticBootstrapGenesisFixture(t)
+	request := BootstrapGenesisPreflightRequest{ClusterName: automaticBootstrapClusterName, ClusterUID: automaticBootstrapClusterUID, StatefulSetUID: f.runtime.StatefulSetUID}
+	// The valid fixture has neither a provider HEAD nor membership. It remains
+	// eligible only because CONTROL binds the exact held genesis tuple.
+	if _, err := f.e.bootstrapGenesisPreflight(t.Context(), request); err != nil {
+		t.Fatalf("complete CONTROL-bound held genesis was rejected: %v", err)
+	}
+	rootKey, _, err := f.e.AuthorityState.rootKey(f.runtime.StatefulSetUID, f.runtime.SourceClusterID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := f.e.AuthorityState.bucket.Delete(t.Context(), rootKey); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.e.bootstrapGenesisPreflight(t.Context(), request); err == nil {
+		t.Fatal("missing CONTROL root was treated as bootstrap evidence because the archive HEAD and membership were absent")
+	}
+}
+
+func TestBootstrapGenesisFenceRejectsCandidateChangesBeforeClosingRoot(t *testing.T) {
+	for _, name := range []string{"policy", "inventory", "root", "template", "wrong-members-key", "mutable-secret", "wrong-secret-owner"} {
+		t.Run(name, func(t *testing.T) {
+			f := newAutomaticBootstrapGenesisFixture(t)
+			response, err := f.e.bootstrapGenesisPreflight(t.Context(), BootstrapGenesisPreflightRequest{
+				ClusterName: automaticBootstrapClusterName, ClusterUID: automaticBootstrapClusterUID, StatefulSetUID: f.runtime.StatefulSetUID,
+			})
+			if err != nil {
+				t.Fatalf("bootstrap candidate preflight failed: %v", err)
+			}
+			cluster := automaticBootstrapCluster(t, f)
+			secretName := bootstrapSecretName(&cluster)
+			switch name {
+			case "policy":
+				cluster.Spec.Policy.CooldownSeconds++
+				storeAutomaticBootstrapCluster(t, f, cluster)
+			case "inventory":
+				f.api.mu.Lock()
+				pods := list(asObject(f.api.objects[f.e.controller().corePath("pods", "")])["items"])
+				asObject(pods[0])["metadata"].(object)["uid"] = "replacement-pod-uid"
+				f.api.mu.Unlock()
+			case "root":
+				if _, err := f.e.change(t.Context(), f.runtime.StatefulSetUID, f.runtime.SourceClusterID, func(ledger *fencing.Ledger) error {
+					ledger.RequireMutationJournal = false
+					return nil
+				}); err != nil {
+					t.Fatal(err)
+				}
+			case "template":
+				f.api.mu.Lock()
+				ctr := asObject(list(nested(f.api.authStatefulSet, "spec", "template", "spec", "containers"))[0])
+				ctr["env"] = replaceEnv(list(ctr["env"]), "RHIZA_PEER_TOKEN", object{"value": "not-cleared"})
+				f.api.mu.Unlock()
+			case "wrong-members-key":
+				f.api.mu.Lock()
+				ctr := asObject(list(nested(f.api.authStatefulSet, "spec", "template", "spec", "containers"))[0])
+				ctr["env"] = replaceEnv(list(ctr["env"]), "RHIZA_CLUSTER_MEMBERS", object{"valueFrom": object{"secretKeyRef": object{"name": secretName, "key": "peer_tokens"}}})
+				f.api.mu.Unlock()
+			case "mutable-secret", "wrong-secret-owner":
+				f.api.mu.Lock()
+				secret := asObject(f.api.objects[f.e.controller().corePath("secrets", secretName)])
+				if name == "mutable-secret" {
+					secret["immutable"] = false
+				} else {
+					asObject(nested(secret, "metadata", "annotations"))[ownerAnnotation] = "other-cluster:other-logical"
+				}
+				f.api.mu.Unlock()
+			}
+			request := FenceRequest{LogicalID: cluster.Spec.LogicalID, BindingUID: automaticBootstrapClusterUID, Namespace: "test",
+				StatefulSet: cluster.Spec.StatefulSet, StatefulSetUID: f.runtime.StatefulSetUID, SourceClusterID: f.runtime.SourceClusterID,
+				OperationID: "bootstrap-genesis-close", Scope: ScopeGeneration, Targets: response.Targets, BootstrapGenesis: &response.Binding}
+			record := &fenceResource{Metadata: object{"name": "bootstrap-fence", "namespace": "test"}, Spec: request}
+			if err := f.e.reconcileFence(t.Context(), v2FenceEndpoint(), record); err == nil {
+				t.Fatalf("fence closed a changed automatic bootstrap %s candidate", name)
+			}
+			root, err := f.e.read(t.Context(), f.runtime.StatefulSetUID, f.runtime.SourceClusterID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			producer, _, _, err := f.e.AuthorityState.ReadProducer(t.Context(), f.runtime)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if root.Ledger.ClosedBy != "" || producer.Phase != fencing.MutationOpen || record.Status.Proof != nil {
+				t.Fatalf("changed candidate produced a closed root or proof: root=%+v producer=%+v proof=%+v", root.Ledger, producer, record.Status.Proof)
+			}
+			f.api.mu.Lock()
+			defer f.api.mu.Unlock()
+			if f.api.statusWrites != 0 {
+				t.Fatalf("changed candidate caused %d fence status writes", f.api.statusWrites)
+			}
+		})
+	}
+}
+
+func automaticBootstrapCluster(t *testing.T, f automaticBootstrapGenesisFixture) ClusterResource {
+	t.Helper()
+	var cluster ClusterResource
+	if err := json.Unmarshal(jsonBytes(f.api.objects[f.e.controller().clusterPath(automaticBootstrapClusterName)]), &cluster); err != nil {
+		t.Fatal(err)
+	}
+	return cluster
+}
+
+func storeAutomaticBootstrapCluster(t *testing.T, f automaticBootstrapGenesisFixture, cluster ClusterResource) {
+	t.Helper()
+	encoded := jsonObjectForPreflight(t, cluster)
+	f.api.mu.Lock()
+	defer f.api.mu.Unlock()
+	f.api.objects[f.e.controller().clusterPath(automaticBootstrapClusterName)] = encoded
+	f.api.objects["/apis/rhiza.mrchypark.dev/v1alpha1/namespaces/test/rhizaclusters"] = object{"items": []any{encoded}}
+}
+
+func automaticBootstrapController(t *testing.T, f automaticBootstrapGenesisFixture) (*Controller, *httptest.Server, ClusterResource) {
+	t.Helper()
+	f.e.ControllerServiceAccount = "default"
+	if f.emptyRecoveryError != nil {
+		f.e.observeEmptyRecoveryError = f.emptyRecoveryError.record
+	}
+	f.e.ArchiveStoreIdentity = StoreIdentity(map[string]string{
+		"RHIZA_OBJSTORE_PROVIDER": "gcs", "RHIZA_OBJSTORE_BUCKET": f.scope.Bucket, "RHIZA_OBJSTORE_PREFIX": "root",
+	})
+	handler := f.e.Handler()
+	server := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/v1/archive-genesis/empty-recovery/register" {
+			handler.ServeHTTP(w, r)
+			return
+		}
+		recorded := httptest.NewRecorder()
+		handler.ServeHTTP(recorded, r)
+		f.api.mu.Lock()
+		f.api.lastEmptyRecoveryHTTP = fmt.Sprintf("POST %s -> %d %q", r.URL.Path, recorded.Code, strings.TrimSpace(recorded.Body.String()))
+		f.api.mu.Unlock()
+		for key, values := range recorded.Header() {
+			for _, value := range values {
+				w.Header().Add(key, value)
+			}
+		}
+		w.WriteHeader(recorded.Code)
+		_, _ = w.Write(recorded.Body.Bytes())
+	}))
+	t.Cleanup(server.Close)
+	client := &FencingClient{URL: server.URL, TokenFile: f.e.Kube.TokenFile, Client: server.Client()}
+	cluster := automaticBootstrapCluster(t, f)
+	normalizeClusterSpec(&cluster)
+	storeAutomaticBootstrapCluster(t, f, cluster)
+	var sts object
+	if err := f.e.Kube.Get(t.Context(), f.e.controller().stsPath("rhiza"), &sts); err != nil {
+		t.Fatal(err)
+	}
+	candidate := expectedBootstrapCandidate(&cluster, sts)
+	if err := f.archive.Upload(t.Context(), path.Join("root", "automatic-bootstrap", "test", "rhiza.json"), bytes.NewReader(jsonBytes(candidate)), objstore.WithIfNotExists()); err != nil {
+		t.Fatal(err)
+	}
+	container := asObject(list(nested(sts, "spec", "template", "spec", "containers"))[0])
+	env, err := (&Controller{Kube: f.e.Kube}).environment(t.Context(), container)
+	if err != nil {
+		t.Fatal(err)
+	}
+	controller := &Controller{Fencer: client, Automatic: true, Kube: f.e.Kube, Bucket: frozenSourceEmptyTestBucket{Bucket: f.archive}, Prefix: "root", StoreIdentity: StoreIdentity(env)}
+	return controller, server, cluster
+}
+
+func prepareAutomaticInitialRootPin(t *testing.T, f *automaticBootstrapGenesisFixture) (*Controller, ClusterResource, []any) {
+	t.Helper()
+	stsPath := f.e.controller().stsPath("rhiza")
+	podsPath := f.e.controller().corePath("pods", "")
+	f.api.mu.Lock()
+	sts := f.api.objects[stsPath]
+	if sts == nil {
+		sts = f.api.authStatefulSet
+	}
+	spec := asObject(sts["spec"])
+	spec["replicas"] = float64(0)
+	spec["selector"] = object{"matchLabels": object{"app": "rhiza"}}
+	metadata := asObject(sts["metadata"])
+	metadata["resourceVersion"] = "1"
+	template := asObject(spec["template"])
+	templateMetadata := asObject(template["metadata"])
+	if templateMetadata == nil {
+		templateMetadata = object{"labels": object{"app": "rhiza"}}
+		template["metadata"] = templateMetadata
+	}
+	templateMetadata["labels"] = object{"app": "rhiza"}
+	templateMetadata["annotations"] = object{fencingProtocolAnnotation: "1"}
+	containers := list(nested(sts, "spec", "template", "spec", "containers"))
+	if len(containers) != 1 || asObject(containers[0]) == nil {
+		f.api.mu.Unlock()
+		t.Fatal("supervised initial-root fixture container is missing or ambiguous")
+	}
+	asObject(containers[0])["securityContext"] = object{"allowPrivilegeEscalation": false, "readOnlyRootFilesystem": true, "capabilities": object{"drop": []any{"ALL"}}}
+	originalPods := list(asObject(f.api.objects[podsPath])["items"])
+	for _, raw := range originalPods {
+		asObject(asObject(raw)["metadata"])["labels"] = object{"app": "rhiza"}
+	}
+	f.api.objects[stsPath] = sts
+	f.api.authStatefulSet = sts
+	f.api.objects[podsPath] = object{"items": []any{}}
+	f.api.mu.Unlock()
+	controller, _, cluster := automaticBootstrapController(t, *f)
+	return controller, cluster, originalPods
+}
+
+type initialRootPinRaceTransport struct {
+	api   *mutationStoreFixture
+	next  http.RoundTripper
+	path  string
+	fired bool
+}
+
+func (t *initialRootPinRaceTransport) RoundTrip(request *http.Request) (*http.Response, error) {
+	if request.Method == http.MethodPut && request.URL.Path == t.path && !t.fired {
+		t.api.mu.Lock()
+		current := t.api.objects[t.path]
+		if current != nil {
+			asObject(current["metadata"])["resourceVersion"] = "2"
+			t.fired = true
+		}
+		t.api.mu.Unlock()
+	}
+	return t.next.RoundTrip(request)
+}
+
+func TestAutomaticSupervisedSourcePinsRootBeforeInitialScale(t *testing.T) {
+	for _, name := range []string{"valid", "manual-supervised", "conflicting-root", "scaled", "matching-pod", "matching-unowned-pod", "terminating-pod", "stale-cluster-uid", "existing-binding", "empty-selector", "wrong-source", "resource-version-race", "not-supervised"} {
+		t.Run(name, func(t *testing.T) {
+			f := newAutomaticBootstrapGenesisFixture(t)
+			controller, cluster, originalPods := prepareAutomaticInitialRootPin(t, &f)
+			stsPath := f.e.controller().stsPath("rhiza")
+			podsPath := f.e.controller().corePath("pods", "")
+			switch name {
+			case "conflicting-root":
+				f.api.mu.Lock()
+				asObject(nested(f.api.objects[stsPath], "spec", "template", "metadata"))["annotations"] = object{fencingProtocolAnnotation: "1", fencingRootAnnotation: "another-root"}
+				f.api.mu.Unlock()
+			case "scaled":
+				f.api.mu.Lock()
+				asObject(f.api.objects[stsPath]["spec"])["replicas"] = float64(3)
+				f.api.mu.Unlock()
+			case "matching-pod":
+				f.api.mu.Lock()
+				f.api.objects[podsPath] = object{"items": originalPods}
+				f.api.mu.Unlock()
+			case "matching-unowned-pod":
+				f.api.mu.Lock()
+				pod := asObject(originalPods[0])
+				asObject(pod["metadata"])["ownerReferences"] = []any{object{"apiVersion": "apps/v1", "kind": "StatefulSet", "name": "rhiza", "uid": "other-sts-uid", "controller": true}}
+				f.api.objects[podsPath] = object{"items": originalPods[:1]}
+				f.api.mu.Unlock()
+			case "terminating-pod":
+				f.api.mu.Lock()
+				pod := asObject(originalPods[0])
+				asObject(pod["metadata"])["deletionTimestamp"] = "2026-10-24T00:00:00Z"
+				f.api.objects[podsPath] = object{"items": originalPods[:1]}
+				f.api.mu.Unlock()
+			case "stale-cluster-uid":
+				f.api.mu.Lock()
+				clusterObject := asObject(f.api.objects[controller.clusterPath(automaticBootstrapClusterName)])
+				asObject(clusterObject["metadata"])["uid"] = "recreated-cluster-uid"
+				f.api.mu.Unlock()
+			case "existing-binding":
+				key := path.Join(controller.Prefix, "automatic-workloads", controller.Kube.Namespace, f.runtime.StatefulSetUID, "binding.json")
+				if err := controller.immutable(t.Context(), key, jsonBytes(object{"bindingUID": automaticBootstrapClusterUID})); err != nil {
+					t.Fatal(err)
+				}
+			case "empty-selector":
+				f.api.mu.Lock()
+				asObject(f.api.objects[stsPath]["spec"])["selector"] = object{"matchLabels": object{}}
+				f.api.mu.Unlock()
+			case "wrong-source":
+				f.api.mu.Lock()
+				ctr := asObject(list(nested(f.api.objects[stsPath], "spec", "template", "spec", "containers"))[0])
+				ctr["env"] = replaceEnv(list(ctr["env"]), "RHIZA_CLUSTER_ID", object{"value": "wrong-source"})
+				f.api.mu.Unlock()
+			case "manual-supervised":
+				cluster.Spec.Automatic = false
+				cluster.Spec.Policy = nil
+				storeAutomaticBootstrapCluster(t, f, cluster)
+			case "resource-version-race":
+				tracer := &initialRootPinRaceTransport{api: f.api, next: controller.Kube.Client.Transport, path: stsPath}
+				controller.Kube.Client.Transport = tracer
+				t.Cleanup(func() { controller.Kube.Client.Transport = tracer.next })
+			case "not-supervised":
+				f.api.mu.Lock()
+				asObject(nested(f.api.objects[stsPath], "spec", "template", "metadata"))["annotations"] = object{}
+				f.api.mu.Unlock()
+			}
+
+			err := controller.reconcileCluster(t.Context(), &cluster)
+			if err != nil {
+				t.Fatalf("controller reconcile returned an unexpected transport error: %v", err)
+			}
+			gotRoot := str(nested(f.api.objects[stsPath], "spec", "template", "metadata", "annotations", fencingRootAnnotation))
+			if name == "valid" || name == "manual-supervised" {
+				if gotRoot != automaticBootstrapClusterUID || int(number(nested(f.api.objects[stsPath], "spec", "replicas"))) != 0 {
+					f.api.mu.Lock()
+					clusterObject := asObject(f.api.objects[controller.clusterPath(automaticBootstrapClusterName)])
+					phase := str(nested(clusterObject, "status", "phase"))
+					message := str(nested(clusterObject, "status", "message"))
+					f.api.mu.Unlock()
+					t.Fatalf("supervised source was not pinned while still empty: root=%q phase=%q status=%q", gotRoot, phase, message)
+				}
+				f.api.mu.Lock()
+				clusterObject := asObject(f.api.objects[controller.clusterPath(automaticBootstrapClusterName)])
+				phase := str(nested(clusterObject, "status", "phase"))
+				message := str(nested(clusterObject, "status", "message"))
+				f.api.mu.Unlock()
+				if phase != "Observing" || message != "supervised source root is pinned; waiting for the authorized initial bootstrap or scale" {
+					t.Fatalf("successful root pin did not report the expected observing status: phase=%q status=%q", phase, message)
+				}
+				if state, _, err := controller.loadAuto(t.Context(), controller.autoKey(&cluster)); err == nil || state != nil {
+					t.Fatalf("controller advanced durable recovery state before initial scale: state=%+v err=%v", state, err)
+				}
+				if len(list(asObject(f.api.objects[podsPath])["items"])) != 0 {
+					t.Fatal("root pin created or retained a source Pod")
+				}
+				return
+			}
+			if name == "resource-version-race" {
+				transport := controller.Kube.Client.Transport.(*initialRootPinRaceTransport)
+				if !transport.fired {
+					t.Fatal("resourceVersion race was not injected before the root-pin PUT")
+				}
+				if str(nested(f.api.objects[stsPath], "metadata", "resourceVersion")) != "2" {
+					t.Fatalf("concurrent StatefulSet update was not retained: %v", f.api.objects[stsPath])
+				}
+			}
+			if gotRoot == automaticBootstrapClusterUID {
+				t.Fatalf("%s precondition failure was accepted and the root pin was written", name)
+			}
+			expectedBlock := map[string]string{
+				"conflicting-root":      "template is bound to another root UID",
+				"scaled":                "only be pinned before the StatefulSet is scaled",
+				"matching-pod":          "requires no matching or StatefulSet-owned Pods",
+				"matching-unowned-pod":  "requires no matching or StatefulSet-owned Pods",
+				"terminating-pod":       "has a terminating matching or StatefulSet-owned Pod",
+				"stale-cluster-uid":     "root identity or contract changed",
+				"existing-binding":      "binding exists without its control record",
+				"empty-selector":        "requires a nonempty, explicit matchLabels selector",
+				"wrong-source":          "supervised source contract differs from RhizaCluster",
+				"resource-version-race": "root pin conflicted; retry after revalidation",
+			}
+			if fragment, ok := expectedBlock[name]; ok {
+				f.api.mu.Lock()
+				clusterObject := asObject(f.api.objects[controller.clusterPath(automaticBootstrapClusterName)])
+				phase := str(nested(clusterObject, "status", "phase"))
+				message := str(nested(clusterObject, "status", "message"))
+				f.api.mu.Unlock()
+				if phase != "Blocked" || !strings.Contains(message, fragment) {
+					t.Fatalf("%s did not reach its intended fail-closed guard: phase=%q status=%q; want %q", name, phase, message, fragment)
+				}
+			}
+		})
+	}
+}
+
+func TestSupervisedBootstrapContinuesOnlyAfterVerifiedRootPin(t *testing.T) {
+	prepareCredentialInstalled := func(t *testing.T) (automaticBootstrapGenesisFixture, *Controller, ClusterResource, string, string) {
+		t.Helper()
+		f := newAutomaticBootstrapGenesisFixture(t)
+		controller, cluster, _ := prepareAutomaticInitialRootPin(t, &f)
+		stsPath := controller.stsPath(cluster.Spec.StatefulSet)
+		secretPath := controller.corePath("secrets", bootstrapSecretName(&cluster))
+		f.api.mu.Lock()
+		ctr := asObject(list(nested(f.api.objects[stsPath], "spec", "template", "spec", "containers"))[0])
+		for _, name := range []string{"RHIZA_CLUSTER_MEMBERS", "RHIZA_ADMIN_TOKEN", "RHIZA_PEER_TOKENS", "RHIZA_PEER_TOKEN"} {
+			ctr["env"] = removeEnv(list(ctr["env"]), name)
+		}
+		delete(f.api.objects, secretPath)
+		f.api.mu.Unlock()
+		if err := controller.reconcileCluster(t.Context(), &cluster); err != nil {
+			t.Fatalf("root-pin reconcile: %v", err)
+		}
+		if err := controller.reconcileCluster(t.Context(), &cluster); err != nil {
+			t.Fatalf("credential-install reconcile: %v", err)
+		}
+		if str(nested(f.api.objects[stsPath], "spec", "template", "metadata", "annotations", fencingRootAnnotation)) != automaticBootstrapClusterUID || f.api.objects[secretPath] == nil || int(number(nested(f.api.objects[stsPath], "spec", "replicas"))) != 0 {
+			t.Fatalf("fixture did not reach pinned, credential-installed, zero-replica state: root=%q secret=%t replicas=%d", nested(f.api.objects[stsPath], "spec", "template", "metadata", "annotations", fencingRootAnnotation), f.api.objects[secretPath] != nil, int(number(nested(f.api.objects[stsPath], "spec", "replicas"))))
+		}
+		return f, controller, cluster, stsPath, controller.corePath("pods", "")
+	}
+
+	t.Run("bootstrap installs credentials then scales on later adopted reconcile", func(t *testing.T) {
+		f := newAutomaticBootstrapGenesisFixture(t)
+		controller, cluster, _ := prepareAutomaticInitialRootPin(t, &f)
+		stsPath := controller.stsPath(cluster.Spec.StatefulSet)
+		secretPath := controller.corePath("secrets", bootstrapSecretName(&cluster))
+		bootstrapDiagnostics := func(stage string) string {
+			f.api.mu.Lock()
+			clusterObject := asObject(f.api.objects[controller.clusterPath(automaticBootstrapClusterName)])
+			sts := f.api.objects[stsPath]
+			phase := str(nested(clusterObject, "status", "phase"))
+			message := str(nested(clusterObject, "status", "message"))
+			rootPinned := str(nested(sts, "spec", "template", "metadata", "annotations", fencingRootAnnotation)) == automaticBootstrapClusterUID
+			replicas := int(number(nested(sts, "spec", "replicas")))
+			secretInstalled := f.api.objects[secretPath] != nil
+			f.api.mu.Unlock()
+			state, _, stateErr := controller.loadAuto(t.Context(), controller.autoKey(&cluster))
+			candidateExists, candidateErr := controller.Bucket.Exists(t.Context(), controller.bootstrapCandidateKey(&cluster))
+			membershipMissing, membershipErr := controller.archiveMembershipMissing(t.Context(), cluster.Spec.AdoptClusterID)
+			return fmt.Sprintf("stage=%s phase=%q message=%q rootPinned=%t replicas=%d secretInstalled=%t candidateExists=%t candidateCheckFailed=%t controlStatePresent=%t controlStateLoadFailed=%t bootstrapGenesisPresent=%t intentPresent=%t voterCount=%d membershipMissing=%t membershipCheckFailed=%t",
+				stage, phase, message, rootPinned, replicas, secretInstalled, candidateExists, candidateErr != nil,
+				state != nil, stateErr != nil, state != nil && state.BootstrapGenesis != nil, state != nil && state.Intent != nil,
+				func() int {
+					if state == nil {
+						return 0
+					}
+					return len(state.Voters)
+				}(), membershipMissing, membershipErr != nil)
+		}
+		f.api.mu.Lock()
+		ctr := asObject(list(nested(f.api.objects[stsPath], "spec", "template", "spec", "containers"))[0])
+		for _, name := range []string{"RHIZA_CLUSTER_MEMBERS", "RHIZA_ADMIN_TOKEN", "RHIZA_PEER_TOKENS", "RHIZA_PEER_TOKEN"} {
+			ctr["env"] = removeEnv(list(ctr["env"]), name)
+		}
+		delete(f.api.objects, secretPath)
+		f.api.mu.Unlock()
+
+		if err := controller.reconcileCluster(t.Context(), &cluster); err != nil {
+			t.Fatalf("first root-pin reconcile: %v; %s", err, bootstrapDiagnostics("first-reconcile"))
+		}
+		if got := str(nested(f.api.objects[stsPath], "spec", "template", "metadata", "annotations", fencingRootAnnotation)); got != automaticBootstrapClusterUID {
+			t.Fatalf("first reconcile did not pin the exact root before bootstrap: %q; %s", got, bootstrapDiagnostics("first-reconcile"))
+		}
+		if int(number(nested(f.api.objects[stsPath], "spec", "replicas"))) != 0 || f.api.objects[secretPath] != nil {
+			t.Fatalf("first root-pin reconcile installed credentials or scaled the workload; %s", bootstrapDiagnostics("first-reconcile"))
+		}
+
+		if err := controller.reconcileCluster(t.Context(), &cluster); err != nil {
+			t.Fatalf("credential-install reconcile: %v; %s", err, bootstrapDiagnostics("credential-install-reconcile"))
+		}
+		if f.api.objects[secretPath] == nil || int(number(nested(f.api.objects[stsPath], "spec", "replicas"))) != 0 {
+			t.Fatalf("verified-root bootstrap did not install credentials while remaining writer-free; %s", bootstrapDiagnostics("credential-install-reconcile"))
+		}
+		ctr = asObject(list(nested(f.api.objects[stsPath], "spec", "template", "spec", "containers"))[0])
+		if str(nested(envEntry(ctr, "RHIZA_CLUSTER_MEMBERS"), "valueFrom", "secretKeyRef", "name")) != bootstrapSecretName(&cluster) {
+			t.Fatal("bootstrap did not install the expected immutable membership Secret reference")
+		}
+
+		if err := controller.reconcileCluster(t.Context(), &cluster); err != nil {
+			t.Fatalf("scale reconcile: %v; %s", err, bootstrapDiagnostics("scale-reconcile"))
+		}
+		if int(number(nested(f.api.objects[stsPath], "spec", "replicas"))) != cluster.Spec.VoterCount {
+			t.Fatalf("adopted bootstrap did not scale after credentials were installed: replicas=%v; %s", nested(f.api.objects[stsPath], "spec", "replicas"), bootstrapDiagnostics("scale-reconcile"))
+		}
+		if got := str(nested(f.api.objects[stsPath], "spec", "template", "metadata", "annotations", fencingRootAnnotation)); got != automaticBootstrapClusterUID {
+			t.Fatalf("bootstrap scale changed the verified root binding: %q", got)
+		}
+	})
+
+	t.Run("intermediate replica count remains rejected", func(t *testing.T) {
+		f, controller, cluster, stsPath, _ := prepareCredentialInstalled(t)
+		f.api.mu.Lock()
+		asObject(f.api.objects[stsPath]["spec"])["replicas"] = float64(1)
+		f.api.mu.Unlock()
+
+		if err := controller.reconcileCluster(t.Context(), &cluster); err != nil {
+			t.Fatalf("intermediate replica reconcile returned transport error: %v", err)
+		}
+		f.api.mu.Lock()
+		phase := str(nested(f.api.objects[controller.clusterPath(automaticBootstrapClusterName)], "status", "phase"))
+		message := str(nested(f.api.objects[controller.clusterPath(automaticBootstrapClusterName)], "status", "message"))
+		replicas := int(number(nested(f.api.objects[stsPath], "spec", "replicas")))
+		f.api.mu.Unlock()
+		if phase != "Blocked" || !strings.Contains(message, "StatefulSet has 1 desired replicas but voterCount is 3") || replicas != 1 {
+			t.Fatalf("intermediate replica count was not rejected by the ordinary voter-count contract: phase=%q status=%q replicas=%d", phase, message, replicas)
+		}
+		if state, _, err := controller.loadAuto(t.Context(), controller.autoKey(&cluster)); err == nil && state != nil && state.Intent != nil {
+			t.Fatalf("intermediate replica count created a fence intent: %+v", state.Intent)
+		}
+	})
+
+	for _, podCase := range []struct {
+		name           string
+		labels         object
+		owner          bool
+		rootAnnotation bool
+		wantMessage    string
+	}{
+		{name: "matching unowned Pod", labels: object{"app": "rhiza"}, wantMessage: "automatic source Pod ownership or root binding differs"},
+		{name: "owned nonmatching Pod", labels: object{"app": "other"}, owner: true, wantMessage: "automatic source Pod ownership or root binding differs"},
+		{name: "matching owned Pod", labels: object{"app": "rhiza"}, owner: true, rootAnnotation: true, wantMessage: "automatic source root pin requires no matching or StatefulSet-owned Pods"},
+	} {
+		t.Run("zero replicas reject "+podCase.name, func(t *testing.T) {
+			f, controller, cluster, stsPath, podsPath := prepareCredentialInstalled(t)
+			podMetadata := object{"name": "rhiza-0", "uid": "bootstrap-pod-0", "labels": podCase.labels}
+			if podCase.owner {
+				podMetadata["ownerReferences"] = []any{object{"apiVersion": "apps/v1", "kind": "StatefulSet", "name": "rhiza", "uid": str(nested(f.api.objects[stsPath], "metadata", "uid")), "controller": true}}
+			}
+			if podCase.rootAnnotation {
+				podMetadata["annotations"] = object{fencingRootAnnotation: automaticBootstrapClusterUID}
+			}
+			f.api.mu.Lock()
+			f.api.objects[podsPath] = object{"items": []any{object{"metadata": podMetadata}}}
+			f.api.mu.Unlock()
+
+			if err := controller.reconcileCluster(t.Context(), &cluster); err != nil {
+				t.Fatalf("Pod-inventory reconcile returned transport error: %v", err)
+			}
+			f.api.mu.Lock()
+			phase := str(nested(f.api.objects[controller.clusterPath(automaticBootstrapClusterName)], "status", "phase"))
+			message := str(nested(f.api.objects[controller.clusterPath(automaticBootstrapClusterName)], "status", "message"))
+			replicas := int(number(nested(f.api.objects[stsPath], "spec", "replicas")))
+			f.api.mu.Unlock()
+			if phase != "Blocked" || !strings.Contains(message, podCase.wantMessage) || replicas != 0 {
+				t.Fatalf("zero-replica bootstrap did not reject %s: phase=%q status=%q replicas=%d", podCase.name, phase, message, replicas)
+			}
+			if state, _, err := controller.loadAuto(t.Context(), controller.autoKey(&cluster)); err == nil && state != nil && state.Intent != nil {
+				t.Fatalf("zero-replica bootstrap with %s created a fence intent: %+v", podCase.name, state.Intent)
+			}
+		})
+	}
+
+	t.Run("nonbootstrap supervised source remains deferred", func(t *testing.T) {
+		f := newAutomaticBootstrapGenesisFixture(t)
+		controller, cluster, _ := prepareAutomaticInitialRootPin(t, &f)
+		cluster.Spec.Bootstrap = false
+		storeAutomaticBootstrapCluster(t, f, cluster)
+		stsPath := controller.stsPath(cluster.Spec.StatefulSet)
+		secretPath := controller.corePath("secrets", bootstrapSecretName(&cluster))
+		candidateKey := controller.bootstrapCandidateKey(&cluster)
+		if err := controller.Bucket.Delete(t.Context(), candidateKey); err != nil {
+			t.Fatal(err)
+		}
+		f.api.mu.Lock()
+		ctr := asObject(list(nested(f.api.objects[stsPath], "spec", "template", "spec", "containers"))[0])
+		for _, name := range []string{"RHIZA_CLUSTER_MEMBERS", "RHIZA_ADMIN_TOKEN", "RHIZA_PEER_TOKENS", "RHIZA_PEER_TOKEN"} {
+			ctr["env"] = removeEnv(list(ctr["env"]), name)
+		}
+		delete(f.api.objects, secretPath)
+		f.api.mu.Unlock()
+
+		for i := 0; i < 2; i++ {
+			if err := controller.reconcileCluster(t.Context(), &cluster); err != nil {
+				t.Fatal(err)
+			}
+		}
+		if got := str(nested(f.api.objects[stsPath], "spec", "template", "metadata", "annotations", fencingRootAnnotation)); got != automaticBootstrapClusterUID {
+			t.Fatalf("nonbootstrap source lost its initial root pin: %q", got)
+		}
+		if int(number(nested(f.api.objects[stsPath], "spec", "replicas"))) != 0 || f.api.objects[secretPath] != nil {
+			t.Fatal("nonbootstrap supervised source was bootstrapped or scaled without opt-in")
+		}
+	})
+}
+
+func TestReconcileAllPinsSupervisedRootWithAutomaticRecoveryDisabled(t *testing.T) {
+	for _, mode := range []string{"manual-cluster", "global-recovery-disabled"} {
+		t.Run(mode, func(t *testing.T) {
+			f := newAutomaticBootstrapGenesisFixture(t)
+			controller, cluster, _ := prepareAutomaticInitialRootPin(t, &f)
+			controller.Automatic = false
+			if mode == "manual-cluster" {
+				cluster.Spec.Automatic = false
+				cluster.Spec.Policy = nil
+			}
+			storeAutomaticBootstrapCluster(t, f, cluster)
+			f.api.mu.Lock()
+			f.api.objects[controller.resourcePath("")] = object{"items": []any{}}
+			f.api.mu.Unlock()
+
+			if err := controller.reconcileAll(t.Context()); err != nil {
+				t.Fatalf("global-off reconcile failed to perform supervised root initialization: %v", err)
+			}
+			stsPath := controller.stsPath("rhiza")
+			if got := str(nested(f.api.objects[stsPath], "spec", "template", "metadata", "annotations", fencingRootAnnotation)); got != automaticBootstrapClusterUID {
+				t.Fatalf("global-off reconcile did not pin the supervised root: got %q", got)
+			}
+			f.api.mu.Lock()
+			phase := str(nested(f.api.objects[controller.clusterPath(automaticBootstrapClusterName)], "status", "phase"))
+			f.api.mu.Unlock()
+			if phase == "Blocked" {
+				t.Fatal("global-off initialization persisted a Blocked status after pinning the supervised root")
+			}
+			if state, _, err := controller.loadAuto(t.Context(), controller.autoKey(&cluster)); err == nil || state != nil {
+				t.Fatalf("global-off initialization advanced automatic recovery: state=%+v err=%v", state, err)
+			}
+			if len(list(asObject(f.api.objects[controller.resourcePath("")])["items"])) != 0 {
+				t.Fatal("global-off initialization created a recovery child")
+			}
+		})
+	}
+}
+
+func TestAutomaticControllerRecognizesMissingMembershipOnlyWithCanonicalBootstrapEvidence(t *testing.T) {
+	t.Run("valid control preflight creates protected fence intent", func(t *testing.T) {
+		f := newAutomaticBootstrapGenesisFixture(t)
+		controller, _, cluster := automaticBootstrapController(t, f)
+		if exists, err := f.archive.Exists(t.Context(), "root/source/voters/membership.json"); err != nil || exists {
+			t.Fatalf("fixture must start without source membership: exists=%t err=%v", exists, err)
+		}
+		if err := controller.reconcileCluster(t.Context(), &cluster); err != nil {
+			t.Fatal(err)
+		}
+		state, _, err := controller.loadAuto(t.Context(), controller.autoKey(&cluster))
+		if err != nil || state == nil || state.BootstrapGenesis == nil || state.Intent != nil {
+			t.Fatalf("authenticated missing-membership bootstrap did not persist its protected pre-fence state: state=%+v err=%v", state, err)
+		}
+		state.SuspectedSince = time.Now().Add(-24 * time.Hour)
+		_, version, err := controller.loadAuto(t.Context(), controller.autoKey(&cluster))
+		if err != nil || version == nil {
+			t.Fatalf("reload protected bootstrap state before CAS update: version=%v err=%v", version, err)
+		}
+		if err := controller.saveAuto(t.Context(), &cluster, state, version); err != nil {
+			t.Fatalf("persist elapsed bootstrap failure grace: %v", err)
+		}
+		if err := controller.reconcileCluster(t.Context(), &cluster); err != nil {
+			t.Fatal(err)
+		}
+		state, _, err = controller.loadAuto(t.Context(), controller.autoKey(&cluster))
+		if err != nil || state == nil || state.Intent == nil || state.Intent.Request.BootstrapGenesis == nil ||
+			*state.Intent.Request.BootstrapGenesis != *state.BootstrapGenesis || state.Intent.Request.Scope != ScopeGeneration {
+			t.Fatalf("controller did not durably reserve the exact canonical bootstrap generation fence: state=%+v err=%v", state, err)
+		}
+		f.api.mu.Lock()
+		child := f.api.objects[controller.resourcePath(state.Intent.RecoveryName)]
+		f.api.mu.Unlock()
+		if child != nil {
+			t.Fatal("controller created a recovery child before persisting a canonical CONTROL fence proof")
+		}
+	})
+
+	for _, name := range []string{"missing-control-root", "malformed-membership", "membership-read-error"} {
+		t.Run(name, func(t *testing.T) {
+			f := newAutomaticBootstrapGenesisFixture(t)
+			controller, _, cluster := automaticBootstrapController(t, f)
+			switch name {
+			case "missing-control-root":
+				key, _, err := f.e.AuthorityState.rootKey(f.runtime.StatefulSetUID, f.runtime.SourceClusterID)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if err := f.e.AuthorityState.bucket.Delete(t.Context(), key); err != nil {
+					t.Fatal(err)
+				}
+			case "malformed-membership":
+				if err := f.archive.Upload(t.Context(), "root/source/voters/membership.json", strings.NewReader("{"), objstore.WithIfNotExists()); err != nil {
+					t.Fatal(err)
+				}
+			case "membership-read-error":
+				controller.Bucket = membershipReadErrorBucket{Bucket: f.archive, key: "root/source/voters/membership.json"}
+			}
+			if err := controller.reconcileCluster(t.Context(), &cluster); err != nil {
+				t.Fatal(err)
+			}
+			state, _, err := controller.loadAuto(t.Context(), controller.autoKey(&cluster))
+			if state != nil {
+				t.Fatalf("%s was treated as missing-membership proof or created protected bootstrap state: state=%+v err=%v", name, state, err)
+			}
+		})
+	}
+}
+
+// TestAutomaticRecoveryChildReconcilesMissingMembershipFromCanonicalBootstrap
+// exercises the actual child reconciler (not only its preflight helpers). The
+// source has no membership object; the only permitted cohort comes from the
+// exact, authenticated CONTROL fence proof and the bootstrap cluster's
+// Secret-backed declared members.
+func TestAutomaticRecoveryChildReconcilesMissingMembershipFromCanonicalBootstrap(t *testing.T) {
+	f := newAutomaticBootstrapGenesisFixture(t)
+	controller, client, child, request, proof := closeAutomaticBootstrapForChild(t, f)
+	ctx := t.Context()
+
+	if exists, err := f.archive.Exists(ctx, "root/source/voters/membership.json"); err != nil || exists {
+		t.Fatalf("test setup unexpectedly created source membership: exists=%t err=%v", exists, err)
+	}
+	rootBefore, rootVersion, err := f.e.AuthorityState.ReadRoot(ctx, f.runtime.StatefulSetUID, f.runtime.SourceClusterID)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Reconcile persists the missing-membership exception and then crosses the
+	// old membership gate only after checking both the durable child binding and
+	// the authenticated historical CONTROL proof.
+	for step := 0; step < 4; step++ {
+		if err := controller.reconcile(ctx, &child); err != nil {
+			t.Fatalf("controller reconcile step %d rejected the canonical bootstrap child: %v", step, err)
+		}
+		persistTestRecovery(t, f, child)
+		if child.Status.Stage == "Stopping" {
+			break
+		}
+	}
+	if child.Status.RecoveryMode != RecoveryModeFrozenSource || child.Status.Source != request.SourceClusterID ||
+		child.Status.SourceDurability != "async" || child.Status.TargetBaseKind != "empty" ||
+		child.Status.FrozenEmptyGenesisPending || child.Status.Stage != "Stopping" || child.Status.Target == "" ||
+		child.Status.SecretName == "" || child.Status.RecoveredTip != 0 {
+		t.Fatalf("controller did not progress the confirmed missing-membership recovery through canonical empty-target authorization: status=%+v diagnostics={%s}", child.Status, automaticBootstrapEmptyRecoveryDiagnostic(t, f, request, child.Status.Target))
+	}
+	if child.Status.SourceMembership != sourceFingerprint(request.SourceClusterID, "async", bootstrapMembersFromCluster(t, f), "root/source") {
+		t.Fatal("controller did not derive the target membership fingerprint from the declared bootstrap cohort")
+	}
+	if child.Status.ManualMembershipBindingDigest != "" {
+		t.Fatal("automatic bootstrap recovery was incorrectly converted to the separate manual membership authorization")
+	}
+	if exists, err := f.archive.Exists(ctx, "root/source/voters/membership.json"); err != nil || exists {
+		t.Fatalf("controller wrote or exposed synthetic source membership: exists=%t err=%v", exists, err)
+	}
+	if exists, err := f.archive.Exists(ctx, path.Join("root", child.Status.Target, "voters/membership.json")); err != nil || !exists {
+		t.Fatalf("Secret-backed target membership was not created: exists=%t err=%v", exists, err)
+	}
+	var targetRoot fenceLedger
+	if targetRoot, err = f.e.read(ctx, f.runtime.StatefulSetUID, child.Status.Target); err != nil ||
+		targetRoot.Ledger.EmptyRecoveryAuthorization == nil || targetRoot.Ledger.ArchiveGenesisRef != nil {
+		t.Fatalf("controller crossed the membership gate without persisting only an authorized, uncommitted empty target: root=%+v err=%v", targetRoot.Ledger, err)
+	}
+	rootAfter, rootVersionAfter, err := f.e.AuthorityState.ReadRoot(ctx, f.runtime.StatefulSetUID, f.runtime.SourceClusterID)
+	if err != nil || hashJSON(rootBefore) != hashJSON(rootAfter) || rootVersion == nil || rootVersionAfter == nil || *rootVersion != *rootVersionAfter {
+		t.Fatalf("controller reconciliation changed canonical source CONTROL state: err=%v", err)
+	}
+
+	// The same historical CONTROL proof must remain confirmable after the live
+	// StatefulSet and same-named Pods belong to the successor. This endpoint is
+	// a read-only proof lookup, not a fresh source-cohort preflight.
+	activateBootstrapTargetFixture(t, f, child.Status.Target)
+	confirmation, err := client.ConfirmBootstrapGenesisFence(ctx, request)
+	if err != nil || hashJSON(confirmation.Request) != hashJSON(request) || hashJSON(confirmation.Proof) != hashJSON(*proof) {
+		t.Fatalf("persisted CONTROL proof became unavailable after target activation/source Pod replacement: confirmation=%+v err=%v", confirmation, err)
+	}
+	rootAfterConfirm, rootVersionAfterConfirm, err := f.e.AuthorityState.ReadRoot(ctx, f.runtime.StatefulSetUID, f.runtime.SourceClusterID)
+	if err != nil || hashJSON(rootBefore) != hashJSON(rootAfterConfirm) || rootVersionAfterConfirm == nil || *rootVersion != *rootVersionAfterConfirm {
+		t.Fatalf("historical proof confirmation mutated source CONTROL state: err=%v", err)
+	}
+}
+
+func TestManualMissingSourceMembershipReconcilesCanonicalEmptyRecovery(t *testing.T) {
+	f := newAutomaticBootstrapGenesisFixture(t)
+	registrarError := &emptyRecoveryErrorCapture{}
+	f.emptyRecoveryError = registrarError
+	controller, _, child, request, _ := closeAutomaticBootstrapForChild(t, f)
+	ctx := t.Context()
+	if exists, err := f.archive.Exists(ctx, "root/source/voters/membership.json"); err != nil || exists {
+		t.Fatalf("manual source must start without a membership record: exists=%t err=%v", exists, err)
+	}
+	child.Metadata["annotations"] = object{}
+	child.Spec.AllowMissingSourceMembership = true
+	child.Status.SpecHash = immutableSpecHash(child.Spec)
+	child.Status.ManualMembershipBindingDigest = ""
+	if !manualMissingSourceMembershipAllowed(&child) || child.Spec.Membership != nil {
+		t.Fatal("empty authorization fixture is not a default-off manual-only recovery child")
+	}
+	persistTestRecovery(t, f, child)
+	manualPreflight, err := f.e.frozenSourcePreflight(ctx, FrozenSourcePreflightRequest{
+		RecoveryName: resourceName(&child), RecoveryUID: str(child.Metadata["uid"]),
+	})
+	if err != nil || manualPreflight.ManualMembershipBindingDigest == "" {
+		t.Fatalf("direct manual canonical preflight rejected the controlled fixture: response=%+v err=%v", manualPreflight, err)
+	}
+	configuredArchiveIdentity := f.e.ArchiveStoreIdentity
+	mismatchedArchiveIdentity := make(map[string]string, len(configuredArchiveIdentity))
+	for key, value := range configuredArchiveIdentity {
+		mismatchedArchiveIdentity[key] = value
+	}
+	mismatchedArchiveIdentity["RHIZA_OBJSTORE_PREFIX"] = "different-root"
+	f.e.ArchiveStoreIdentity = mismatchedArchiveIdentity
+	_, mismatchErr := f.e.frozenSourcePreflight(ctx, FrozenSourcePreflightRequest{
+		RecoveryName: resourceName(&child), RecoveryUID: str(child.Metadata["uid"]),
+	})
+	f.e.ArchiveStoreIdentity = configuredArchiveIdentity
+	if mismatchErr == nil {
+		t.Fatal("manual preflight accepted a source workload outside the configured archive identity")
+	}
+	manualController := *controller
+	manualController.Automatic = false
+	for step := 0; step < 5; step++ {
+		if err := manualController.reconcile(ctx, &child); err != nil {
+			direct, directErr := f.e.frozenSourcePreflight(ctx, FrozenSourcePreflightRequest{
+				RecoveryName: resourceName(&child), RecoveryUID: str(child.Metadata["uid"]),
+			})
+			t.Fatalf("manual recovery reconcile step %d: %v; direct canonical preflight response=%+v err=%v", step, err, direct, directErr)
+		}
+		persistTestRecovery(t, f, child)
+		if child.Status.Stage == "Stopping" {
+			break
+		}
+	}
+	if child.Status.Stage != "Stopping" || child.Status.RecoveryMode != RecoveryModeFrozenSource ||
+		child.Status.ManualMembershipBindingDigest == "" || child.Status.TargetBaseKind != "empty" || child.Status.Target == "" {
+		t.Fatalf("manual path did not persist its canonical binding and reach empty-target authorization: status=%+v registrarError=%q diagnostics={%s}",
+			child.Status, registrarError.value(), automaticBootstrapEmptyRecoveryDiagnostic(t, f, request, child.Status.Target))
+	}
+	if exists, err := f.archive.Exists(ctx, "root/source/voters/membership.json"); err != nil || exists {
+		t.Fatalf("manual recovery fabricated source membership: exists=%t err=%v", exists, err)
+	}
+	targetMembershipKey := path.Join("root", child.Status.Target, "voters/membership.json")
+	if exists, err := f.archive.Exists(ctx, targetMembershipKey); err != nil || !exists {
+		t.Fatalf("manual recovery did not create the independently provisioned target membership: exists=%t err=%v", exists, err)
+	}
+	targetRoot, _, err := f.e.AuthorityState.ReadRoot(ctx, child.Status.StatefulSetUID, child.Status.Target)
+	if err != nil || targetRoot.Ledger.EmptyRecoveryAuthorization == nil || targetRoot.Ledger.ArchiveGenesisRef != nil {
+		t.Fatalf("manual source binding did not authorize only the canonical empty target: root=%+v err=%v", targetRoot.Ledger, err)
+	}
+	sourceRoot, _, err := f.e.AuthorityState.ReadRoot(ctx, child.Status.StatefulSetUID, request.SourceClusterID)
+	if err != nil || sourceRoot.Ledger.ClosedBy != request.OperationID {
+		t.Fatalf("manual empty authorization lost its exact closed source CONTROL root: root=%+v err=%v", sourceRoot.Ledger, err)
+	}
+}
+
+func TestManualMissingSourceMembershipRejectsMalformedOrUnavailableRecord(t *testing.T) {
+	for _, name := range []string{"malformed-record", "membership-read-error"} {
+		t.Run(name, func(t *testing.T) {
+			f := newAutomaticBootstrapGenesisFixture(t)
+			controller, _, child, _, _ := closeAutomaticBootstrapForChild(t, f)
+			child.Metadata["annotations"] = object{}
+			child.Spec.AllowMissingSourceMembership = true
+			child.Status.SpecHash = immutableSpecHash(child.Spec)
+			persistTestRecovery(t, f, child)
+			readErrorHits := 0
+			if name == "malformed-record" {
+				if err := f.archive.Upload(t.Context(), "root/source/voters/membership.json", strings.NewReader("{")); err != nil {
+					t.Fatal(err)
+				}
+			} else {
+				controller.Bucket = membershipReadErrorBucket{Bucket: f.archive, key: "root/source/voters/membership.json", readErrorHits: &readErrorHits}
+			}
+			manualController := *controller
+			manualController.Automatic = false
+			for step := 0; step < 6 && child.Status.Phase != "Blocked"; step++ {
+				if err := manualController.reconcile(t.Context(), &child); err != nil {
+					t.Fatalf("manual recovery step %d for %s: %v", step+1, name, err)
+				}
+				if child.Status.Phase != "Blocked" && child.Status.Phase != "Recovering" {
+					t.Fatalf("manual recovery left the expected preflight lifecycle while checking %s: status=%+v", name, child.Status)
+				}
+			}
+			if child.Status.Phase != "Blocked" {
+				t.Fatalf("manual recovery did not reach the membership preflight rejection for %s: status=%+v", name, child.Status)
+			}
+			wantMessage := "source membership history unavailable"
+			if name == "malformed-record" {
+				wantMessage = "source membership or durability history is invalid"
+			} else if readErrorHits == 0 {
+				t.Fatalf("membership read-error fixture never intercepted the controller's source-membership read: status=%+v", child.Status)
+			}
+			if !strings.Contains(child.Status.Message, wantMessage) {
+				t.Fatalf("manual recovery blocked before the expected %s membership guard: message=%q status=%+v", name, child.Status.Message, child.Status)
+			}
+			if child.Status.ManualMembershipBindingDigest != "" || child.Status.Target != "" || child.Status.Stage != "" {
+				t.Fatalf("invalid membership evidence advanced or bound manual recovery: %+v", child.Status)
+			}
+			if child.Status.Target != "" {
+				if exists, err := f.archive.Exists(t.Context(), path.Join("root", child.Status.Target, "voters/membership.json")); err != nil {
+					t.Fatal(err)
+				} else if exists {
+					t.Fatal("invalid membership evidence created a target membership")
+				}
+			}
+		})
+	}
+}
+
+func automaticBootstrapEmptyRecoveryDiagnostic(t *testing.T, f automaticBootstrapGenesisFixture, request FenceRequest, targetID string) string {
+	t.Helper()
+	f.api.mu.Lock()
+	httpResponse := f.api.lastEmptyRecoveryHTTP
+	f.api.mu.Unlock()
+	rootSummary := func(uid, clusterID string) string {
+		root, _, err := f.e.AuthorityState.ReadRoot(t.Context(), uid, clusterID)
+		if err != nil {
+			return fmt.Sprintf("unavailable(%v)", err)
+		}
+		return fmt.Sprintf("closedBy=%q genesisState=%q genesisRef=%t emptyAuthorization=%t", root.Ledger.ClosedBy,
+			root.Ledger.ArchiveGenesisState, root.Ledger.ArchiveGenesisRef != nil, root.Ledger.EmptyRecoveryAuthorization != nil)
+	}
+	targetScope := fencing.ArchiveScope{Provider: "gcs", Bucket: f.scope.Bucket, Prefix: path.Join("root", targetID), ClusterID: targetID}
+	claim, _, claimErr := f.e.AuthorityState.ReadArchiveScopeClaim(t.Context(), targetScope)
+	claimSummary := fmt.Sprintf("unavailable(%v)", claimErr)
+	if claimErr == nil {
+		claimSummary = fmt.Sprintf("genesisRef=%t emptyAuthorization=%t", claim.GenesisRef != nil, claim.EmptyRecoveryAuthorization != nil)
+	}
+	return fmt.Sprintf("emptyRecoveryHTTP=%q sourceRoot={%s} targetRoot={%s} targetClaim={%s}", httpResponse,
+		rootSummary(request.StatefulSetUID, request.SourceClusterID), rootSummary(request.StatefulSetUID, targetID), claimSummary)
+}
+
+func TestAutomaticRecoveryChildRejectsMissingControlCohortChangesAndMalformedMembership(t *testing.T) {
+	for _, name := range []string{"missing-control-root", "mismatched-live-cohort", "malformed-membership"} {
+		t.Run(name, func(t *testing.T) {
+			f := newAutomaticBootstrapGenesisFixture(t)
+			controller, _, child, request, _ := closeAutomaticBootstrapForChild(t, f)
+			switch name {
+			case "missing-control-root":
+				key, _, err := f.e.AuthorityState.rootKey(request.StatefulSetUID, request.SourceClusterID)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if err := f.e.AuthorityState.bucket.Delete(t.Context(), key); err != nil {
+					t.Fatal(err)
+				}
+			case "mismatched-live-cohort":
+				members := bootstrapMembersFromCluster(t, f)
+				container := asObject(list(nested(f.api.authStatefulSet, "spec", "template", "spec", "containers"))[0])
+				container["env"] = replaceEnv(list(container["env"]), "RHIZA_CLUSTER_MEMBERS", object{"value": string(jsonBytes(members[:len(members)-1]))})
+			case "malformed-membership":
+				if err := f.archive.Upload(t.Context(), "root/source/voters/membership.json", strings.NewReader("{"), objstore.WithIfNotExists()); err != nil {
+					t.Fatal(err)
+				}
+			}
+			err := controller.reconcile(t.Context(), &child)
+			if name == "missing-control-root" {
+				if err == nil {
+					t.Fatal("controller accepted a DATA-side proof after the canonical CONTROL root disappeared")
+				}
+			} else if err != nil || child.Status.Phase != "Blocked" {
+				t.Fatalf("controller did not fail closed for %s: phase=%q message=%q err=%v", name, child.Status.Phase, child.Status.Message, err)
+			}
+			if exists, err := f.archive.Exists(t.Context(), "root/source/voters/membership.json"); err != nil {
+				t.Fatal(err)
+			} else if name != "malformed-membership" && exists {
+				t.Fatal("controller created source membership while rejecting bootstrap evidence")
+			}
+			if child.Status.Stage != "" || child.Status.Target != "" {
+				t.Fatalf("rejected source evidence advanced target recovery: %+v", child.Status)
+			}
+			scope := fencing.ArchiveScope{Provider: "gcs", Bucket: f.scope.Bucket, Prefix: "root/source", ClusterID: request.SourceClusterID}
+			scopeHash, err := scope.Hash()
+			if err != nil {
+				t.Fatal(err)
+			}
+			targetID, err := recovery.FrozenTargetID(recovery.FrozenSourceIdentity{ScopeHash: scopeHash, ClusterID: request.SourceClusterID, StatefulSetUID: request.StatefulSetUID})
+			if err != nil {
+				t.Fatal(err)
+			}
+			targetScope := fencing.ArchiveScope{Provider: "gcs", Bucket: f.scope.Bucket, Prefix: path.Join("root", targetID), ClusterID: targetID}
+			if _, _, err := f.e.AuthorityState.ReadArchiveScopeClaim(t.Context(), targetScope); err == nil {
+				t.Fatal("rejected source evidence created canonical target claim")
+			}
+			rootKey, _, err := f.e.AuthorityState.rootKey(request.StatefulSetUID, targetID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if exists, err := f.e.AuthorityState.bucket.Exists(t.Context(), rootKey); err != nil || exists {
+				t.Fatalf("rejected source evidence created target root: exists=%t err=%v", exists, err)
+			}
+		})
+	}
+}
+
+func closeAutomaticBootstrapForChild(t *testing.T, f automaticBootstrapGenesisFixture) (*Controller, *FencingClient, Resource, FenceRequest, *FenceProof) {
+	t.Helper()
+	ctx := t.Context()
+	controller, _, cluster := automaticBootstrapController(t, f)
+	client := controller.Fencer.(*FencingClient)
+	preflight, err := client.BootstrapGenesisPreflight(ctx, BootstrapGenesisPreflightRequest{
+		ClusterName: automaticBootstrapClusterName, ClusterUID: automaticBootstrapClusterUID, StatefulSetUID: f.runtime.StatefulSetUID,
+	})
+	if err != nil {
+		t.Fatalf("canonical bootstrap preflight: %v", err)
+	}
+	request := FenceRequest{LogicalID: cluster.Spec.LogicalID, BindingUID: automaticBootstrapClusterUID, Namespace: "test",
+		StatefulSet: cluster.Spec.StatefulSet, StatefulSetUID: f.runtime.StatefulSetUID, SourceClusterID: f.runtime.SourceClusterID,
+		OperationID: "bootstrap-recovery-child", Scope: ScopeGeneration, Targets: append([]FenceTarget(nil), preflight.Targets...), BootstrapGenesis: &preflight.Binding}
+	f.e.CollectRuntimeEvidence = func(_ context.Context, runtime fencing.RuntimeBinding, stop fencing.StopRequest) ([]byte, error) {
+		for i, expected := range f.cohort {
+			if runtime == expected && stop.Identity.RunID == expected.RunID {
+				return []byte("bootstrap-terminal:" + fmt.Sprint(i)), nil
+			}
+		}
+		return nil, fmt.Errorf("unexpected bootstrap terminal collection target")
+	}
+	f.e.VerifyRuntimeEvidence = func(_ context.Context, runtime fencing.RuntimeBinding, stop fencing.StopRequest, receipt []byte) error {
+		for i, expected := range f.cohort {
+			if runtime == expected && stop.Identity.RunID == expected.RunID && string(receipt) == "bootstrap-terminal:"+fmt.Sprint(i) {
+				return nil
+			}
+		}
+		return fmt.Errorf("bootstrap terminal receipt differs from the enrolled runtime")
+	}
+	fenceName := "fence-" + hashJSON([]string{request.BindingUID, request.OperationID})[:40]
+	fence := &fenceResource{APIVersion: "rhiza.mrchypark.dev/v1alpha1", Kind: "RhizaFence",
+		Metadata: object{"name": fenceName, "namespace": "test", "uid": "bootstrap-fence-uid", "resourceVersion": "1"}, Spec: request}
+	if err := f.e.reconcileFence(ctx, v2FenceEndpoint(), fence); err != nil {
+		t.Fatalf("reconcile real CONTROL generation fence: %v", err)
+	}
+	if fence.Status.Proof == nil || fence.Status.Proof.IndependentV2 == nil {
+		t.Fatal("fencer did not persist an IndependentV2 proof")
+	}
+	fenceData, err := json.Marshal(fence)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var fenceObject object
+	if err := json.Unmarshal(fenceData, &fenceObject); err != nil {
+		t.Fatal(err)
+	}
+	f.api.mu.Lock()
+	f.api.objects[v2FenceEndpoint()+"/"+fenceName] = fenceObject
+	f.api.objects[v2FenceEndpoint()] = object{"items": []any{fenceObject}}
+	f.api.mu.Unlock()
+
+	// The two fixture clients represent the same test bucket: expose the exact
+	// provider-created bytes to the archive reader without inventing a separate
+	// HEAD or membership object.
+	f.provider.mu.Lock()
+	providerHead, exists := f.provider.objects[path.Join(f.scope.Prefix, "archive/head.bin")]
+	f.provider.mu.Unlock()
+	if !exists {
+		t.Fatal("closure did not settle the exact held source HEAD in the provider fixture")
+	}
+	if err := f.archive.Upload(ctx, path.Join(f.scope.Prefix, "archive/head.bin"), bytes.NewReader(providerHead.payload), objstore.WithIfNotExists()); err != nil {
+		t.Fatalf("make exact provider HEAD visible to the archive reader: %v", err)
+	}
+
+	rootAfterFence, _, err := f.e.AuthorityState.ReadRoot(ctx, request.StatefulSetUID, request.SourceClusterID)
+	if err != nil || rootAfterFence.Ledger.ClosedBy != request.OperationID || rootAfterFence.Ledger.ClosedHash != fence.Status.Proof.RequestHash {
+		t.Fatalf("source root is not closed by the exact canonical request: root=%+v err=%v", rootAfterFence.Ledger, err)
+	}
+
+	clusterPath := controller.clusterPath(automaticBootstrapClusterName)
+	var storedCluster ClusterResource
+	if err := json.Unmarshal(jsonBytes(f.api.objects[clusterPath]), &storedCluster); err != nil {
+		t.Fatal(err)
+	}
+	sts := f.api.authStatefulSet
+	container := asObject(list(nested(sts, "spec", "template", "spec", "containers"))[0])
+	env, err := controller.environment(ctx, container)
+	if err != nil {
+		t.Fatal(err)
+	}
+	members, err := recoveryMembers(env["RHIZA_CLUSTER_MEMBERS"])
+	if err != nil {
+		t.Fatal(err)
+	}
+	voters, err := derivedVoters(&storedCluster, sts)
+	if err != nil {
+		t.Fatal(err)
+	}
+	identities := make(map[quepaxa.NodeID]FenceTarget, len(preflight.Targets))
+	for _, target := range preflight.Targets {
+		identities[quepaxa.NodeID(target.NodeID)] = target
+	}
+	spec := Spec{StatefulSet: "rhiza", Container: "rhiza", SourceClusterID: f.runtime.SourceClusterID, Durability: "async",
+		RecoveryID: request.OperationID, AllowDataLoss: true, Fence: Fence{RecoveryID: request.OperationID, ClusterID: f.runtime.SourceClusterID,
+			StatefulSetUID: f.runtime.StatefulSetUID, Confirmed: true, Evidence: fence.Status.Proof.ProofID}}
+	child := Resource{APIVersion: "rhiza.mrchypark.dev/v1alpha1", Kind: "RhizaRecovery",
+		Metadata: object{"name": request.OperationID, "namespace": "test", "uid": "bootstrap-child-uid", "generation": float64(1),
+			"annotations": object{automaticOwner: automaticBootstrapClusterUID, automaticLogical: storedCluster.Spec.LogicalID}}, Spec: spec,
+		Status: Status{RecoveryMode: RecoveryModeFrozenSource, RecoveryID: request.OperationID, SpecHash: immutableSpecHash(spec),
+			StatefulSetUID: f.runtime.StatefulSetUID, Source: f.runtime.SourceClusterID, SourceDurability: "async",
+			SourceMembership: sourceFingerprint(f.runtime.SourceClusterID, "async", members, "root/source"),
+			TargetBaseKind:   "empty", FrozenEmptyGenesisPending: false}}
+	autoState := &autoControl{Version: 1, BindingUID: automaticBootstrapClusterUID, BindingHash: autoBinding(&storedCluster),
+		BindingVersion: autoBindingVersion, StatefulSetUID: f.runtime.StatefulSetUID, ActiveClusterID: f.runtime.SourceClusterID,
+		Voters: voters, Identities: identities, BootstrapGenesis: &preflight.Binding,
+		Intent: &autoIntent{Request: request, Policy: *storedCluster.Spec.Policy, Durability: "async", Voters: voters,
+			Proof: fence.Status.Proof, RecoveryName: request.OperationID, RecoveryUID: str(child.Metadata["uid"]), SpecHash: hashJSON(child.Spec)}}
+	if err := controller.saveAuto(ctx, &storedCluster, autoState, nil); err != nil {
+		t.Fatalf("persist matching automatic bootstrap intent: %v", err)
+	}
+	persistTestRecovery(t, f, child)
+	return controller, client, child, request, fence.Status.Proof
+}
+
+func persistTestRecovery(t *testing.T, f automaticBootstrapGenesisFixture, resource Resource) {
+	t.Helper()
+	data, err := json.Marshal(resource)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var value object
+	if err := json.Unmarshal(data, &value); err != nil {
+		t.Fatal(err)
+	}
+	f.api.mu.Lock()
+	f.api.objects[f.e.controller().resourcePath(resourceName(&resource))] = value
+	f.api.mu.Unlock()
+}
+
+func bootstrapMembersFromCluster(t *testing.T, f automaticBootstrapGenesisFixture) []quepaxa.Member {
+	t.Helper()
+	container := list(nested(f.api.authStatefulSet, "spec", "template", "spec", "containers"))[0]
+	env, err := (&Controller{Kube: f.e.Kube}).environment(t.Context(), asObject(container))
+	if err != nil {
+		t.Fatal(err)
+	}
+	members, err := recoveryMembers(env["RHIZA_CLUSTER_MEMBERS"])
+	if err != nil {
+		t.Fatal(err)
+	}
+	return members
+}
+
+func activateBootstrapTargetFixture(t *testing.T, f automaticBootstrapGenesisFixture, target string) {
+	t.Helper()
+	f.api.mu.Lock()
+	defer f.api.mu.Unlock()
+	sts := f.api.authStatefulSet
+	container := asObject(list(nested(sts, "spec", "template", "spec", "containers"))[0])
+	container["env"] = replaceEnv(list(container["env"]), "RHIZA_CLUSTER_ID", object{"value": target})
+	f.api.objects[f.e.controller().stsPath("rhiza")] = sts
+	pods := list(asObject(f.api.objects[f.e.controller().corePath("pods", "")])["items"])
+	for i, pod := range pods {
+		metadata := asObject(asObject(pod)["metadata"])
+		metadata["uid"] = fmt.Sprintf("successor-pod-%d", i)
+	}
+}
+
+type membershipReadErrorBucket struct {
+	objstore.Bucket
+	key           string
+	readErrorHits *int
+}
+
+func (b membershipReadErrorBucket) Get(ctx context.Context, name string) (io.ReadCloser, error) {
+	if name == b.key {
+		if b.readErrorHits != nil {
+			*b.readErrorHits++
+		}
+		return nil, errors.New("injected membership read failure")
+	}
+	return b.Bucket.Get(ctx, name)
+}
+
+type bootstrapControlFenceConfirmer struct {
+	// records models the independently persisted CONTROL fence records. It is
+	// intentionally not backed by the controller's automatic DATA bucket.
+	records map[string]BootstrapGenesisFenceConfirmation
+	calls   int
+}
+
+func (f *bootstrapControlFenceConfirmer) Fence(context.Context, FenceRequest) (*FenceProof, error) {
+	return nil, errors.New("unexpected fence dispatch from child authorization")
+}
+
+func (f *bootstrapControlFenceConfirmer) ConfirmBootstrapGenesisFence(_ context.Context, request FenceRequest) (BootstrapGenesisFenceConfirmation, error) {
+	f.calls++
+	record, ok := f.records[hashJSON(request)]
+	if !ok || hashJSON(record.Request) != hashJSON(request) {
+		return BootstrapGenesisFenceConfirmation{}, errors.New("canonical CONTROL fence record is missing or differs")
+	}
+	return record, nil
+}
+
+func TestBootstrapChildRequiresExactCanonicalControlProof(t *testing.T) {
+	for _, tc := range []struct {
+		name                string
+		controlPresent      bool
+		alterControlProof   bool
+		alterControlBinding bool
+		wantAuthorized      bool
+	}{
+		{name: "missing canonical proof"},
+		{name: "different valid proof", controlPresent: true, alterControlProof: true},
+		{name: "different candidate binding", controlPresent: true, alterControlBinding: true},
+		{name: "exact canonical proof", controlPresent: true, wantAuthorized: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			bucket := autoBucket(t)
+			t.Cleanup(func() { _ = bucket.Close() })
+			c := autoController(bucket)
+			cluster := autoClusterResource("bootstrap-cluster", "bootstrap-cluster-uid", "bootstrap-logical")
+			binding := BootstrapGenesisBinding{Version: 1, CandidateDigest: strings.Repeat("a", 64), ClusterName: "bootstrap-cluster", ClusterUID: "bootstrap-cluster-uid"}
+			request := FenceRequest{LogicalID: cluster.Spec.LogicalID, BindingUID: "automatic-binding", Namespace: "default",
+				StatefulSet: "rhiza", StatefulSetUID: "bootstrap-sts-uid", SourceClusterID: "source", OperationID: "bootstrap-recovery-1",
+				Scope: ScopeGeneration, BootstrapGenesis: &binding, Targets: []FenceTarget{
+					{NodeID: "rhiza-0", Pod: "rhiza-0", PodUID: "pod-0", WALIdentity: "wal-0"},
+					{NodeID: "rhiza-1", Pod: "rhiza-1", PodUID: "pod-1", WALIdentity: "wal-1"},
+					{NodeID: "rhiza-2", Pod: "rhiza-2", PodUID: "pod-2", WALIdentity: "wal-2"},
+				}}
+			dataProof := bootstrapIndependentProof(t, request)
+			controlRequest := request
+			controlProof := *dataProof
+			controlEvidence := *dataProof.IndependentV2
+			controlEvidence.Terminals = append([]fencing.TerminalReference(nil), dataProof.IndependentV2.Terminals...)
+			controlProof.IndependentV2 = &controlEvidence
+			if tc.alterControlProof {
+				controlProof.IndependentV2.Terminals[0].RuntimeHash = strings.Repeat("9", 64)
+				controlProof.ProofID = "independent-v2-" + hashJSON(controlProof.IndependentV2)
+			}
+			if tc.alterControlBinding {
+				changed := *controlRequest.BootstrapGenesis
+				changed.CandidateDigest = strings.Repeat("b", 64)
+				controlRequest.BootstrapGenesis = &changed
+				controlProof = *bootstrapIndependentProof(t, controlRequest)
+			}
+			confirmer := &bootstrapControlFenceConfirmer{records: make(map[string]BootstrapGenesisFenceConfirmation)}
+			if tc.controlPresent {
+				confirmer.records[hashJSON(controlRequest)] = BootstrapGenesisFenceConfirmation{Request: controlRequest, Proof: controlProof}
+			}
+			c.Fencer = confirmer
+
+			desired := Spec{StatefulSet: request.StatefulSet, Container: "rhiza", SourceClusterID: request.SourceClusterID,
+				Durability: "async", RecoveryID: request.OperationID, AllowDataLoss: true}
+			state := validAutoControl()
+			state.BindingUID = request.BindingUID
+			state.StatefulSetUID = request.StatefulSetUID
+			state.ActiveClusterID = request.SourceClusterID
+			state.BootstrapGenesis = &binding
+			state.Intent = &autoIntent{RecoveryName: request.OperationID, RecoveryUID: "recovery-resource-uid", SpecHash: hashJSON(desired),
+				Request: request, Proof: dataProof}
+			if err := c.saveAuto(t.Context(), cluster, state, nil); err != nil {
+				t.Fatal(err)
+			}
+			child := &Resource{Metadata: map[string]any{"name": request.OperationID, "namespace": "default", "uid": "recovery-resource-uid",
+				"annotations": map[string]any{automaticOwner: state.BindingUID, automaticLogical: cluster.Spec.LogicalID}}, Spec: desired}
+			authorized, err := c.authorizeAutomaticChild(t.Context(), child)
+			if tc.wantAuthorized {
+				if err != nil || !authorized {
+					t.Fatalf("exact canonical CONTROL proof did not authorize child: authorized=%t err=%v", authorized, err)
+				}
+				if confirmer.calls != 1 {
+					t.Fatalf("canonical CONTROL was checked %d times, want once", confirmer.calls)
+				}
+				return
+			}
+			if err == nil || authorized {
+				t.Fatalf("proof-shaped DATA record authorized child without exact CONTROL confirmation: authorized=%t err=%v", authorized, err)
+			}
+			if confirmer.calls != 1 {
+				t.Fatalf("canonical CONTROL was checked %d times, want one fail-closed check", confirmer.calls)
+			}
+		})
+	}
+}
+
+func TestBootstrapChildConfirmerReadsCanonicalControlOverAuthenticatedHTTP(t *testing.T) {
+	for _, name := range []string{"missing-control-fence", "different-control-proof"} {
+		t.Run(name, func(t *testing.T) {
+			f := newAutomaticBootstrapGenesisFixture(t)
+			f.e.ControllerServiceAccount = "default"
+			f.e.ArchiveStoreIdentity = StoreIdentity(map[string]string{
+				"RHIZA_OBJSTORE_PROVIDER": "gcs", "RHIZA_OBJSTORE_BUCKET": f.scope.Bucket, "RHIZA_OBJSTORE_PREFIX": "root",
+			})
+			server := httptest.NewTLSServer(f.e.Handler())
+			t.Cleanup(server.Close)
+			client := &FencingClient{URL: server.URL, TokenFile: f.e.Kube.TokenFile, Client: server.Client()}
+			preflight, err := client.BootstrapGenesisPreflight(t.Context(), BootstrapGenesisPreflightRequest{
+				ClusterName: automaticBootstrapClusterName, ClusterUID: automaticBootstrapClusterUID, StatefulSetUID: f.runtime.StatefulSetUID,
+			})
+			if err != nil {
+				t.Fatalf("prepare canonical request binding: %v", err)
+			}
+			request := FenceRequest{LogicalID: "bootstrap-logical", BindingUID: automaticBootstrapClusterUID, Namespace: "test",
+				StatefulSet: "rhiza", StatefulSetUID: f.runtime.StatefulSetUID, SourceClusterID: f.runtime.SourceClusterID,
+				OperationID: "bootstrap-rpc-operation", Scope: ScopeGeneration, Targets: preflight.Targets, BootstrapGenesis: &preflight.Binding}
+			requestHash, err := requestHash(&request)
+			if err != nil {
+				t.Fatal(err)
+			}
+			nodes := make([]string, 0, len(request.Targets))
+			for _, target := range request.Targets {
+				nodes = append(nodes, target.NodeID)
+			}
+			if _, err := f.e.change(t.Context(), request.StatefulSetUID, request.SourceClusterID, func(ledger *fencing.Ledger) error {
+				return ledger.CloseNodes(request.OperationID, requestHash, nodes)
+			}); err != nil {
+				t.Fatalf("persist exact CONTROL closure for RPC fixture: %v", err)
+			}
+			if name == "different-control-proof" {
+				wrong := bootstrapIndependentProof(t, request)
+				wrong.IndependentV2.LedgerHash = strings.Repeat("f", 64)
+				wrong.ProofID = "independent-v2-" + hashJSON(wrong.IndependentV2)
+				fenceName := "fence-" + hashJSON([]string{request.BindingUID, request.OperationID})[:40]
+				fence := &fenceResource{Metadata: object{"name": fenceName, "namespace": "test"}, Spec: request}
+				fence.Status.Proof = wrong
+				f.api.mu.Lock()
+				f.api.objects[v2FenceEndpoint()+"/"+fenceName] = jsonObjectForPreflight(t, fence)
+				f.api.mu.Unlock()
+			}
+
+			controller := &Controller{Fencer: client, Kube: f.e.Kube, Bucket: f.archive, Prefix: "root"}
+			dataProof := bootstrapIndependentProof(t, request)
+			state := validAutoControl()
+			state.BindingUID, state.StatefulSetUID, state.ActiveClusterID = request.BindingUID, request.StatefulSetUID, request.SourceClusterID
+			state.BootstrapGenesis = request.BootstrapGenesis
+			desired := Spec{StatefulSet: request.StatefulSet, Container: "rhiza", SourceClusterID: request.SourceClusterID,
+				Durability: "async", RecoveryID: request.OperationID, AllowDataLoss: true}
+			state.Intent = &autoIntent{RecoveryName: request.OperationID, RecoveryUID: "bootstrap-child-uid", SpecHash: hashJSON(desired), Request: request, Proof: dataProof}
+			cluster := autoClusterResource(automaticBootstrapClusterName, automaticBootstrapClusterUID, request.LogicalID)
+			if err := controller.saveAuto(t.Context(), cluster, state, nil); err != nil {
+				t.Fatal(err)
+			}
+			child := &Resource{Metadata: map[string]any{"name": request.OperationID, "namespace": "default", "uid": "bootstrap-child-uid",
+				"annotations": map[string]any{automaticOwner: state.BindingUID, automaticLogical: request.LogicalID}}, Spec: desired}
+
+			before, beforeVersion, err := f.e.AuthorityState.ReadRoot(t.Context(), request.StatefulSetUID, request.SourceClusterID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			authorized, authErr := controller.authorizeAutomaticChild(t.Context(), child)
+			if authErr == nil && authorized {
+				t.Fatal("DATA-resident shaped proof authorized a child without the exact canonical CONTROL fence proof")
+			}
+			after, afterVersion, err := f.e.AuthorityState.ReadRoot(t.Context(), request.StatefulSetUID, request.SourceClusterID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if hashJSON(before) != hashJSON(after) || beforeVersion == nil || afterVersion == nil || *beforeVersion != *afterVersion {
+				t.Fatalf("authenticated read-only confirmer changed CONTROL source root: before=%+v after=%+v", beforeVersion, afterVersion)
+			}
+		})
+	}
+}
+
+func bootstrapIndependentProof(t *testing.T, request FenceRequest) *FenceProof {
+	t.Helper()
+	hash, err := requestHash(&request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	scope := AttestationStoreScope{Provider: "gcs", Bucket: "archive", Prefix: "root/source"}
+	evidence := &IndependentEvidenceV2{Version: 2, RequestHash: hash, LedgerHash: strings.Repeat("1", 64), StorageScope: scope}
+	for i, target := range request.Targets {
+		identity := fencing.Identity{SourceClusterID: request.SourceClusterID, NodeID: target.NodeID, PodUID: target.PodUID,
+			RunID: fmt.Sprintf("bootstrap-run-%d", i), WALIdentity: target.WALIdentity}
+		stop := fencing.StopRequest{OperationID: "stop-" + identity.RunID, RequestHash: strings.Repeat("2", 64), Identity: identity}
+		evidence.Terminals = append(evidence.Terminals, fencing.TerminalReference{EvidenceVersion: 2, Request: stop,
+			RuntimeHash: strings.Repeat("3", 64), ProducerUID: "producer-" + identity.RunID, ProofName: "proof-" + identity.RunID,
+			ProofUID: "proof-uid-" + identity.RunID, ProofDigest: strings.Repeat("4", 64), RuntimeReceiptDigest: strings.Repeat("5", 64),
+			MutationReceiptDigest: strings.Repeat("6", 64), StorageScopeDigest: hashJSON(scope)})
+	}
+	return &FenceProof{OperationID: request.OperationID, SourceClusterID: request.SourceClusterID, BindingUID: request.BindingUID,
+		RequestHash: hash, ProofID: "independent-v2-" + hashJSON(evidence), ProcessesTerminated: true, RecreationBlocked: true,
+		StorageQuiesced: true, IndependentV2: evidence}
+}

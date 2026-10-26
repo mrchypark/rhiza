@@ -5,6 +5,13 @@ set -eu
 set +x
 umask 077
 die() { printf '%s\n' "$*" >&2; exit 1; }
+script_dir=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)
+repo_root=$(CDPATH='' cd -- "$script_dir/../.." && pwd)
+manifest_version=$(sed -n 's/^version = "\(.*\)"/\1/p' "$repo_root/sdk/rust/Cargo.toml" | head -n 1)
+[ -n "$manifest_version" ] || die 'Cannot read the SDK version from sdk/rust/Cargo.toml'
+version_prefix=v$(printf '%s' "$manifest_version" | tr -d '.')
+printf '%s\n' "$version_prefix" | LC_ALL=C grep -Eq '^v[0-9]+$' || die 'Malformed SDK version prefix'
+printf '%s\n' "$manifest_version" | LC_ALL=C grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+$' || die 'Malformed SDK version'
 sha256_file() {
     if command -v sha256sum >/dev/null 2>&1; then
         sha256_output=$(sha256sum "$1") || return
@@ -20,7 +27,7 @@ sha256_file() {
 }
 gsa_delete_wait_worker() {
     deleted_tag=$1
-    case "$deleted_tag" in ci) deleted_account=$ci ;; data) deleted_account=$data ;; *) die 'GSA delete tag rejected' ;; esac
+    case "$deleted_tag" in ci) deleted_account=$ci ;; data) deleted_account=$data ;; readonly) deleted_account=$readonly_email ;; *) die 'GSA delete tag rejected' ;; esac
     deleted_create="$RHIZA_AUTH_STATE/$deleted_tag-create.json"
     deleted_marker="$RHIZA_AUTH_STATE/$deleted_tag.created"
     [ -f "$deleted_create" ] && [ ! -L "$deleted_create" ] &&
@@ -79,17 +86,17 @@ gsa_delete_wait_worker() {
 mode=${1:-render}
 auth_mode=ci
 case "$mode" in
-    render-local|apply-local|mint-local|rollback-local|check-local-auth|gsa-delete-wait-worker-local)
+    render-local|apply-local|preflight-local|mint-local|rollback-local|check-local-auth|gsa-delete-wait-worker-local)
         auth_mode=local
-        case "$mode" in render-local) mode=render ;; apply-local) mode=apply ;; rollback-local) mode=rollback ;; gsa-delete-wait-worker-local) mode=gsa-delete-wait-worker ;; esac
+        case "$mode" in render-local) mode=render ;; apply-local) mode=apply ;; preflight-local) mode=preflight ;; rollback-local) mode=rollback ;; gsa-delete-wait-worker-local) mode=gsa-delete-wait-worker ;; esac
         : "${RHIZA_HARNESS_SHA:?reviewed local harness SHA required}"
         RHIZA_WORKFLOW_SHA=$RHIZA_HARNESS_SHA ;;
-    render|check-fixture|check-folder-iam|check-cleanup-uris|negative-node-fixture|apply|rollback|gsa-delete-wait-worker) ;;
-    *) die 'Usage: bootstrap-gcs-postrelease.sh render[-local]|apply[-local]|mint-local|rollback[-local]|check-local-auth|check-fixture|check-folder-iam|check-cleanup-uris|negative-node-fixture' ;;
+    render|preflight|check-fixture|check-folder-iam|check-cleanup-uris|negative-node-fixture|apply|rollback|gsa-delete-wait-worker) ;;
+    *) die 'Usage: bootstrap-gcs-postrelease.sh render[-local]|preflight[-local]|apply[-local]|mint-local|rollback[-local]|check-local-auth|check-fixture|check-folder-iam|check-cleanup-uris|negative-node-fixture' ;;
 esac
 if [ "$mode" = gsa-delete-wait-worker ]; then
     [ "$#" = 2 ] || die 'GSA delete worker arguments rejected'
-    case "$2" in ci|data) worker_tag=$2 ;; *) die 'GSA delete tag rejected' ;; esac
+    case "$2" in ci|data|readonly) worker_tag=$2 ;; *) die 'GSA delete tag rejected' ;; esac
 fi
 : "${RHIZA_RUN_ID:?8 lowercase hexadecimal characters required}"
 : "${RHIZA_WORKFLOW_SHA:?protected-merge workflow SHA required}"
@@ -105,6 +112,20 @@ fi
 : "${RHIZA_GCS_PREFIX:?fresh run-specific GCS prefix required}"
 : "${RHIZA_NAMESPACE:?fresh Kubernetes namespace required}"
 : "${RHIZA_DATA_GSA_ID:?fresh data GSA account ID required}"
+: "${RHIZA_GCS_INDEPENDENT_LAYOUT:=no}"
+case "$RHIZA_GCS_INDEPENDENT_LAYOUT" in
+    yes|no) ;;
+    *) die 'RHIZA_GCS_INDEPENDENT_LAYOUT must be yes or no' ;;
+esac
+if [ "$RHIZA_GCS_INDEPENDENT_LAYOUT" = yes ]; then
+    : "${RHIZA_READONLY_WORKLOAD_GSA_ID:?fresh read-only workload GSA account ID required}"
+    case "$mode" in
+        apply|rollback)
+            [ "${RHIZA_GCS_INDEPENDENT_CONSUMER:-}" = run-votercount-gcs-chaos/v2 ] ||
+              die 'Independent identity receipts require the v2 workload launcher/rollback consumer'
+            ;;
+    esac
+fi
 : "${RHIZA_NODE_A:?first existing node required}"
 : "${RHIZA_NODE_B:?second existing node required}"
 : "${RHIZA_NODE_C:?third existing node required}"
@@ -125,6 +146,11 @@ printf '%s\n' "$RHIZA_NAMESPACE" | LC_ALL=C grep -Eq '^[a-z0-9]([-a-z0-9]*[a-z0-
 printf '%s\n' "$RHIZA_DATA_GSA_ID" | LC_ALL=C grep -Eq '^[a-z][a-z0-9-]{4,28}[a-z0-9]$' || die 'Invalid data GSA account ID'
 case "$RHIZA_NAMESPACE" in *"$RHIZA_RUN_ID"*) ;; *) die 'Namespace must contain the fresh run ID' ;; esac
 case "$RHIZA_DATA_GSA_ID" in *"$RHIZA_RUN_ID"*) ;; *) die 'Data GSA account ID must contain the fresh run ID' ;; esac
+if [ "$RHIZA_GCS_INDEPENDENT_LAYOUT" = yes ]; then
+    printf '%s\n' "$RHIZA_READONLY_WORKLOAD_GSA_ID" | LC_ALL=C grep -Eq '^[a-z][a-z0-9-]{4,28}[a-z0-9]$' || die 'Invalid read-only workload GSA account ID'
+    case "$RHIZA_READONLY_WORKLOAD_GSA_ID" in *"$RHIZA_RUN_ID"*) ;; *) die 'Read-only workload GSA account ID must contain the fresh run ID' ;; esac
+    [ "$RHIZA_READONLY_WORKLOAD_GSA_ID" != "$RHIZA_DATA_GSA_ID" ] || die 'Writer and read-only workload GSAs must be distinct'
+fi
 for node in "$RHIZA_NODE_A" "$RHIZA_NODE_B" "$RHIZA_NODE_C"; do
     printf '%s\n' "$node" | LC_ALL=C grep -Eq '^[a-z0-9]([-a-z0-9.]*[a-z0-9])?$' || die 'Invalid existing node name'
 done
@@ -148,6 +174,22 @@ if [ "$auth_mode" = ci ]; then
     printf '%s\n' "$RHIZA_GITHUB_ENVIRONMENT" | LC_ALL=C grep -Eq '^[A-Za-z0-9_.-]+$' || die 'Invalid GitHub environment'
     printf '%s\n' "$RHIZA_CI_GSA_ID" | LC_ALL=C grep -Eq '^[a-z][a-z0-9-]{4,28}[a-z0-9]$' || die 'Invalid CI GSA account ID'
 fi
+validate_identity_family() {
+    expected_prefix="postrelease/v$manifest_version/$RHIZA_RUN_ID/"
+    expected_namespace="rhiza-$version_prefix-$RHIZA_RUN_ID"
+    expected_data_gsa="rhiza-$version_prefix-gcs-$RHIZA_RUN_ID"
+    [ "$RHIZA_GCS_PREFIX" = "$expected_prefix" ] || die "GCS prefix identity mismatch: expected $expected_prefix, got $RHIZA_GCS_PREFIX"
+    [ "$RHIZA_NAMESPACE" = "$expected_namespace" ] || die "Namespace identity mismatch: expected $expected_namespace, got $RHIZA_NAMESPACE"
+    [ "$RHIZA_DATA_GSA_ID" = "$expected_data_gsa" ] || die "Data GSA identity mismatch: expected $expected_data_gsa, got $RHIZA_DATA_GSA_ID"
+    if [ "$auth_mode" = ci ]; then
+        expected_ci_gsa="rhiza-$version_prefix-ci-$RHIZA_RUN_ID"
+        [ "$RHIZA_CI_GSA_ID" = "$expected_ci_gsa" ] || die "CI GSA identity mismatch: expected $expected_ci_gsa, got $RHIZA_CI_GSA_ID"
+    fi
+}
+if [ "$mode" = preflight ] || [ "$mode" = mint-local ]; then
+    validate_identity_family
+    [ "$mode" != preflight ] || exit 0
+fi
 project=$RHIZA_GCP_PROJECT_ID
 number=$RHIZA_GCP_PROJECT_NUMBER
 context=$RHIZA_KUBE_CONTEXT
@@ -155,11 +197,18 @@ bucket=$RHIZA_GCS_BUCKET
 ns=$RHIZA_NAMESPACE
 prefix=$RHIZA_GCS_PREFIX
 folder=gs://$bucket/$prefix
-pool=rhiza-v0191-gcs-$RHIZA_RUN_ID
+data_prefix=${prefix}data/
+control_prefix=${prefix}control/
+data_folder=gs://$bucket/$data_prefix
+control_folder=gs://$bucket/$control_prefix
+pool=rhiza-$version_prefix-gcs-$RHIZA_RUN_ID
+provider=github
 ci_id=${RHIZA_CI_GSA_ID:-unused-local-ci-account}
 data_id=$RHIZA_DATA_GSA_ID
+readonly_id=${RHIZA_READONLY_WORKLOAD_GSA_ID:-unused-local-readonly-account}
 ci=$ci_id@$project.iam.gserviceaccount.com
 data=$data_id@$project.iam.gserviceaccount.com
+readonly_email=$readonly_id@$project.iam.gserviceaccount.com
 cluster_role=rhiza19_${RHIZA_RUN_ID}_cluster
 folder_role=rhiza19_${RHIZA_RUN_ID}_objects
 owner=rhiza-postrelease-$RHIZA_RUN_ID-$RHIZA_WORKFLOW_SHA
@@ -167,26 +216,61 @@ expiry="title=rhiza-$RHIZA_RUN_ID-expiry,expression=request.time < timestamp('$R
 cluster_condition="title=rhiza-$RHIZA_RUN_ID-cluster,expression=resource.type == 'container.googleapis.com/Cluster' && resource.name == 'projects/$project/locations/$RHIZA_GKE_LOCATION/clusters/$RHIZA_GKE_CLUSTER' && request.time < timestamp('$RHIZA_AUTH_EXPIRES')"
 ci_member=principalSet://iam.googleapis.com/projects/$number/locations/global/workloadIdentityPools/$pool/attribute.repository_id/${RHIZA_GITHUB_REPOSITORY_ID:-0}
 data_member=serviceAccount:$project.svc.id.goog[$ns/rhiza-gcs]
+workload_member=serviceAccount:$project.svc.id.goog[$ns/rhiza-workload]
 operator_member=serviceAccount:$project.svc.id.goog[$ns/rhiza-operator]
+fencer_member=serviceAccount:$project.svc.id.goog[$ns/rhiza-fencer]
 oidc="assertion.repository_id == '${RHIZA_GITHUB_REPOSITORY_ID:-0}' && assertion.repository_owner_id == '${RHIZA_GITHUB_OWNER_ID:-0}' && assertion.ref == 'refs/heads/main' && assertion.event_name == 'workflow_dispatch' && assertion.workflow_ref == '${RHIZA_GITHUB_WORKFLOW_REF:-unused}' && assertion.workflow_sha == '$RHIZA_WORKFLOW_SHA' && assertion.environment == '${RHIZA_GITHUB_ENVIRONMENT:-unused}'"
 mapping='google.subject=assertion.sub,attribute.repository_id=assertion.repository_id,attribute.repository_owner_id=assertion.repository_owner_id,attribute.ref=assertion.ref,attribute.event_name=assertion.event_name,attribute.workflow_ref=assertion.workflow_ref,attribute.workflow_sha=assertion.workflow_sha,attribute.environment=assertion.environment'
-script_dir=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)
 . "$script_dir/cluster-metadata-projection.sh"
 describe_cluster_metadata() { exec gcloud --project="$project" --quiet "$@"; }
 render() {
     runtime_kind=User; runtime_name=$ci
     runtime_api_group='    apiGroup: rbac.authorization.k8s.io'; runtime_namespace=
+    pod_gsa=$data
+    if [ "$RHIZA_GCS_INDEPENDENT_LAYOUT" = yes ]; then pod_gsa=$readonly_email; fi
     if [ "$auth_mode" = local ]; then
         runtime_kind=ServiceAccount; runtime_name=rhiza-runtime
         runtime_api_group=; runtime_namespace="    namespace: $ns"
     fi
-    sed -e "s/@NAMESPACE@/$ns/g" -e "s/@RUN_ID@/$RHIZA_RUN_ID/g" -e "s/@POD_GSA@/$data/g" -e "s/@OWNER@/$owner/g" \
+    sed -e "s/@NAMESPACE@/$ns/g" -e "s/@RUN_ID@/$RHIZA_RUN_ID/g" -e "s/@POD_GSA@/$pod_gsa/g" -e "s/@OWNER@/$owner/g" \
       -e "s/@RUNTIME_KIND@/$runtime_kind/g" -e "s/@RUNTIME_NAME@/$runtime_name/g" \
       -e "s/@RUNTIME_API_GROUP@/$runtime_api_group/g" -e "s/@RUNTIME_NAMESPACE@/$runtime_namespace/g" \
       "$script_dir/gcs-postrelease-auth.yaml.in" | awk -v mode="$auth_mode" '
         /^# BEGIN LOCAL RUNTIME ACCOUNT/ {skip=(mode!="local"); next}
         /^# END LOCAL RUNTIME ACCOUNT/ {skip=0; next}
         !skip {print}'
+    if [ "$RHIZA_GCS_INDEPENDENT_LAYOUT" = yes ]; then
+        cat <<EOF
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: rhiza-workload
+  namespace: $ns
+  annotations:
+    iam.gke.io/gcp-service-account: $readonly_email
+    iam.gke.io/return-principal-id-as-email: "true"
+automountServiceAccountToken: false
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: rhiza-operator
+  namespace: $ns
+  annotations:
+    iam.gke.io/gcp-service-account: $data
+    iam.gke.io/return-principal-id-as-email: "true"
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: rhiza-fencer
+  namespace: $ns
+  annotations:
+    iam.gke.io/gcp-service-account: $data
+    iam.gke.io/return-principal-id-as-email: "true"
+EOF
+    fi
 }
 validate_project_identity() {
     jq -e --arg project "$RHIZA_GCP_PROJECT_ID" --arg number "$RHIZA_GCP_PROJECT_NUMBER" '
@@ -424,6 +508,104 @@ seal_workload_identity() {
     sha256_file "$wi_receipt" > "$wi_checksum"
     chmod 600 "$wi_checksum"
 }
+seal_independent_workload_identity() {
+    for live_receipt in \
+      "$RHIZA_AUTH_STATE/data-create.json" "$RHIZA_AUTH_STATE/readonly-create.json" \
+      "$RHIZA_AUTH_STATE/data-wi-before.json" "$RHIZA_AUTH_STATE/readonly-wi-before.json" \
+      "$RHIZA_AUTH_STATE/data-wi-after.json" "$RHIZA_AUTH_STATE/readonly-wi-after.json" \
+      "$RHIZA_AUTH_STATE/data-post-grant-identity.json" "$RHIZA_AUTH_STATE/readonly-post-grant-identity.json" \
+      "$RHIZA_AUTH_STATE/workload-ksa-identity.json" "$RHIZA_AUTH_STATE/operator-ksa-identity.json" \
+      "$RHIZA_AUTH_STATE/fencer-ksa-identity.json" "$RHIZA_AUTH_STATE/data-folder-before.json" \
+      "$RHIZA_AUTH_STATE/data-folder-after.json" "$RHIZA_AUTH_STATE/control-folder-before.json" \
+      "$RHIZA_AUTH_STATE/control-folder-after.json" "$RHIZA_AUTH_STATE/folder-before.json" \
+      "$RHIZA_AUTH_STATE/folder-after.json"; do
+        [ -f "$live_receipt" ] && [ ! -L "$live_receipt" ] || die 'Independent workload identity receipts missing'
+    done
+    [ ! -e "$RHIZA_AUTH_STATE/workload-identity.json" ] && [ ! -e "$RHIZA_AUTH_STATE/workload-identity.sha256" ] || die 'Workload identity receipt collision'
+    for pair in "data:$data" "readonly:$readonly_email"; do
+        identity_tag=${pair%%:*}; identity_email=${pair#*:}
+        jq -e --arg email "$identity_email" --arg owner "$owner" --arg name "projects/$project/serviceAccounts/$identity_email" '
+          .email==$email and .name==$name and .description==$owner and (.uniqueId|type)=="string" and (.uniqueId|length)>0
+        ' "$RHIZA_AUTH_STATE/$identity_tag-create.json" >/dev/null || die 'Fresh independent GSA identity/owner rejected'
+        jq -e '((has("bindings")|not) or .bindings==[])' "$RHIZA_AUTH_STATE/$identity_tag-wi-before.json" >/dev/null || die 'Fresh independent GSA had preexisting IAM bindings'
+        jq -e --arg email "$identity_email" --arg owner "$owner" --slurpfile created "$RHIZA_AUTH_STATE/$identity_tag-create.json" '
+          .email==$email and .description==$owner and .uniqueId==$created[0].uniqueId
+        ' "$RHIZA_AUTH_STATE/$identity_tag-post-grant-identity.json" >/dev/null || die 'Independent GSA changed before identity seal'
+    done
+    jq -e --arg ns "$ns" --arg email "$readonly_email" '
+      .kind=="ServiceAccount" and .metadata.name=="rhiza-workload" and .metadata.namespace==$ns and
+      (.metadata.uid|type)=="string" and (.metadata.uid|length)>0 and
+      .metadata.annotations["iam.gke.io/gcp-service-account"]==$email and
+      .metadata.annotations["iam.gke.io/return-principal-id-as-email"]=="true" and .automountServiceAccountToken==false
+    ' "$RHIZA_AUTH_STATE/workload-ksa-identity.json" >/dev/null || die 'Read-only workload KSA identity rejected'
+    for ksa in operator fencer; do
+        jq -e --arg ns "$ns" --arg email "$data" --arg name "rhiza-$ksa" '
+          .kind=="ServiceAccount" and .metadata.name==$name and .metadata.namespace==$ns and
+          (.metadata.uid|type)=="string" and (.metadata.uid|length)>0 and
+          .metadata.annotations["iam.gke.io/gcp-service-account"]==$email and
+          .metadata.annotations["iam.gke.io/return-principal-id-as-email"]=="true"
+        ' "$RHIZA_AUTH_STATE/$ksa-ksa-identity.json" >/dev/null || die 'Trusted writer KSA identity rejected'
+    done
+    jq -e --arg member "$workload_member" --arg title "rhiza-$RHIZA_RUN_ID-expiry" \
+      --arg expression "request.time < timestamp('$RHIZA_AUTH_EXPIRES')" '
+      (.bindings|type)=="array" and (.bindings|length)==1 and
+      .bindings[0].role=="roles/iam.workloadIdentityUser" and
+      (.bindings[0].members|sort)==([$member]|sort) and
+      .bindings[0].condition=={title:$title,expression:$expression}
+    ' "$RHIZA_AUTH_STATE/readonly-wi-after.json" >/dev/null || die 'Read-only GSA is not restricted to the workload KSA'
+    jq -e --arg operator "$operator_member" --arg fencer "$fencer_member" --arg title "rhiza-$RHIZA_RUN_ID-expiry" \
+      --arg expression "request.time < timestamp('$RHIZA_AUTH_EXPIRES')" '
+      (.bindings|type)=="array" and (.bindings|length)==1 and
+      .bindings[0].role=="roles/iam.workloadIdentityUser" and
+      (.bindings[0].members|sort)==([$operator,$fencer]|sort) and
+      .bindings[0].condition=={title:$title,expression:$expression}
+    ' "$RHIZA_AUTH_STATE/data-wi-after.json" >/dev/null || die 'Writer GSA binding does not exactly match operator and fencer KSAs'
+    jq -e --arg readonly "$readonly_email" --arg writer "$data" \
+      --arg role "projects/$project/roles/$folder_role" --arg prefix "$data_prefix" \
+      --arg title "rhiza-$RHIZA_RUN_ID-expiry" \
+      --arg expression "request.time < timestamp('$RHIZA_AUTH_EXPIRES')" '
+      (.bindings|type)=="array" and (.bindings|length)==2 and
+      (.resourceId|endswith("/managedFolders/"+$prefix)) and
+      any(.bindings[]; .role=="roles/storage.objectViewer" and .members==[$readonly] and .condition==null) and
+      any(.bindings[]; .role==$role and .members==[$writer] and
+        .condition=={title:$title,expression:$expression})
+    ' "$RHIZA_AUTH_STATE/data-folder-after.json" >/dev/null || die 'Writer/reader IAM grants are not exact on the data child folder'
+    jq -e --arg writer "$data" --arg role "projects/$project/roles/$folder_role" \
+      --arg prefix "$control_prefix" --arg title "rhiza-$RHIZA_RUN_ID-expiry" \
+      --arg expression "request.time < timestamp('$RHIZA_AUTH_EXPIRES')" '
+      (.bindings|type)=="array" and (.bindings|length)==1 and
+      (.resourceId|endswith("/managedFolders/"+$prefix)) and
+      .bindings[0].role==$role and .bindings[0].members==[$writer] and
+      .bindings[0].condition=={title:$title,expression:$expression}
+    ' "$RHIZA_AUTH_STATE/control-folder-after.json" >/dev/null || die 'Writer IAM grant is not exact on the control child folder'
+    jq -e --slurpfile before "$RHIZA_AUTH_STATE/folder-before.json" \
+      '.bindings==$before[0].bindings' "$RHIZA_AUTH_STATE/folder-after.json" >/dev/null ||
+      die 'Writer IAM grant escaped the DATA/CONTROL child folders'
+    workload_uid=$(jq -r '.metadata.uid' "$RHIZA_AUTH_STATE/workload-ksa-identity.json")
+    operator_uid=$(jq -r '.metadata.uid' "$RHIZA_AUTH_STATE/operator-ksa-identity.json")
+    fencer_uid=$(jq -r '.metadata.uid' "$RHIZA_AUTH_STATE/fencer-ksa-identity.json")
+    readonly_uid=$(jq -r '.uniqueId' "$RHIZA_AUTH_STATE/readonly-create.json")
+    data_uid=$(jq -r '.uniqueId' "$RHIZA_AUTH_STATE/data-create.json")
+    jq -n --arg run "$RHIZA_RUN_ID" --arg ns "$ns" --arg prefix "$prefix" \
+      --arg data_prefix "$data_prefix" --arg control_prefix "$control_prefix" \
+      --arg workload_uid "$workload_uid" --arg operator_uid "$operator_uid" --arg fencer_uid "$fencer_uid" \
+      --arg readonly "$readonly_email" --arg writer "$data" --arg readonly_uid "$readonly_uid" --arg writer_uid "$data_uid" \
+      --arg writer_role "projects/$project/roles/$folder_role" \
+      --arg workload_member "$workload_member" --arg operator_member "$operator_member" --arg fencer_member "$fencer_member" \
+      --arg title "rhiza-$RHIZA_RUN_ID-expiry" --arg expression "request.time < timestamp('$RHIZA_AUTH_EXPIRES')" '{
+        run:$run,namespace:$ns,parentPrefix:$prefix,
+        workload:{ksa:{name:"rhiza-workload",uid:$workload_uid,gcp_service_account:$readonly,member:$workload_member},
+          gsa:{email:$readonly,unique_id:$readonly_uid,role:"roles/storage.objectViewer",managedFolder:$data_prefix},
+          workloadIdentityBinding:{role:"roles/iam.workloadIdentityUser",members:[$workload_member],condition:{title:$title,expression:$expression}}},
+        writer:{ksas:[{name:"rhiza-operator",uid:$operator_uid,member:$operator_member},{name:"rhiza-fencer",uid:$fencer_uid,member:$fencer_member}],
+          gsa:{email:$writer,unique_id:$writer_uid,managedFolders:[$data_prefix,$control_prefix],role:$writer_role},
+          workloadIdentityBinding:{role:"roles/iam.workloadIdentityUser",members:[$operator_member,$fencer_member],condition:{title:$title,expression:$expression}}},
+        controlPrefix:$control_prefix
+      }' > "$RHIZA_AUTH_STATE/workload-identity.json"
+    chmod 600 "$RHIZA_AUTH_STATE/workload-identity.json"
+    sha256_file "$RHIZA_AUTH_STATE/workload-identity.json" > "$RHIZA_AUTH_STATE/workload-identity.sha256"
+    chmod 600 "$RHIZA_AUTH_STATE/workload-identity.sha256"
+}
 mint_local() (
     : "${RHIZA_NODE_A:?}" "${RHIZA_NODE_B:?}" "${RHIZA_NODE_C:?}"
     [ ! -e "$RHIZA_AUTH_STATE/runtime-token-request.attempted" ] || die 'TokenRequest already attempted; no renewal/retry'
@@ -474,13 +656,15 @@ admission_uri() {
     printf '/apis/admissionregistration.k8s.io/v1/%s/%s\n' "$collection" "$2"
 }
 create_account() {
-    case "$1" in "$ci_id"|"$data_id") ;; *) die 'Account ID does not match fresh run' ;; esac
+    case "$1" in "$ci_id"|"$data_id"|"$readonly_id") ;; *) die 'Account ID does not match fresh run' ;; esac
     gcloud --project="$project" --quiet iam service-accounts create "$1" --description="$owner" --format=json
 }
 check_folder_identity() {
     # Path/id alone cannot distinguish a replacement folder. IAM may legitimately
     # change metageneration, so preserve createTime and validate current metadata.
-    jq -e --arg bucket "$bucket" --arg prefix "$prefix" --slurpfile original "$RHIZA_AUTH_STATE/folder-identity.json" '
+    expected_prefix=${2:-$prefix}
+    original_identity=${3:-$RHIZA_AUTH_STATE/folder-identity.json}
+    jq -e --arg bucket "$bucket" --arg prefix "$expected_prefix" --slurpfile original "$original_identity" '
       ($original[0]) as $o |
       $o.bucket==$bucket and $o.name==$prefix and $o.id==($bucket+"/"+$prefix) and
       ($o.createTime|type)=="string" and ($o.createTime|length)>0 and
@@ -491,12 +675,63 @@ check_folder_identity() {
       (.updateTime|type)=="string" and (.updateTime|length)>0
     ' "$1" >/dev/null || die 'Managed folder incarnation/metadata changed or missing'
 }
+check_folder_create_readback() {
+    create_receipt=$1
+    current_receipt=$2
+    expected_prefix=$3
+    jq -e --arg bucket "$bucket" --arg prefix "$expected_prefix" --slurpfile created "$create_receipt" '
+      ($created|length)==1 and
+      $created[0].name==("projects/_/buckets/"+$bucket+"/managedFolders/"+$prefix) and
+      ($created[0].createTime|type)=="string" and ($created[0].createTime|length)>0 and
+      .bucket==$bucket and .name==$prefix and .id==($bucket+"/"+$prefix) and
+      .createTime==$created[0].createTime and
+      (.metageneration|type)=="string" and (.metageneration|test("^[1-9][0-9]*$")) and
+      (.updateTime|type)=="string" and (.updateTime|length)>0
+    ' "$current_receipt" >/dev/null || die 'Managed-folder create receipt does not match the live incarnation'
+}
+folder_iam_data() (
+    action=$1
+    folder=$data_folder
+    prefix=$data_prefix
+    folder_role=roles/storage.objectViewer
+    folder_role_resource=roles/storage.objectViewer
+    data=$readonly_email
+    folder_identity_receipt=$RHIZA_AUTH_STATE/data-folder-identity.json
+    folder_iam "$action"
+)
+folder_iam_writer_data() (
+    action=$1
+    folder=$data_folder
+    prefix=$data_prefix
+    folder_role_resource=projects/$project/roles/$folder_role
+    folder_identity_receipt=$RHIZA_AUTH_STATE/data-folder-identity.json
+    folder_iam "$action"
+)
+folder_iam_writer_control() (
+    action=$1
+    folder=$control_folder
+    prefix=$control_prefix
+    folder_role_resource=projects/$project/roles/$folder_role
+    folder_identity_receipt=$RHIZA_AUTH_STATE/control-folder-identity.json
+    folder_iam "$action"
+)
+folder_iam_control() (
+    action=$1
+    folder=$control_folder
+    prefix=$control_prefix
+    folder_role=roles/storage.objectViewer
+    folder_role_resource=roles/storage.objectViewer
+    data=$readonly_email
+    folder_identity_receipt=$RHIZA_AUTH_STATE/control-folder-identity.json
+    folder_iam "$action"
+)
 folder_iam() (
     # Subshell keeps private credential traps separate from fixture-secret traps.
     # No SDK policy projection, automatic folder creation or old-policy restore.
     # Only the exact fresh-role propagation error gets a bounded retry below.
     action=$1
     case "$action" in get|add|remove) ;; *) die 'Unknown folder IAM action' ;; esac
+    scope_role=${folder_role_resource:-projects/$project/roles/$folder_role}
     iam_dir=$(mktemp -d "$RHIZA_AUTH_STATE/.folder-iam.XXXXXXXX") || exit 1
     chmod 700 "$iam_dir" || exit 1
     # Invoked by the EXIT/signal trap, not as an ordinary shell call.
@@ -536,7 +771,7 @@ folder_iam() (
         fi
         printf '%s\n' "$metadata_exit" > "$iam_dir/$metadata_phase.exit"
         if [ "$metadata_exit" != 0 ]; then cat "$iam_dir/$metadata_phase.stderr" >&2; return "$metadata_exit"; fi
-        check_folder_identity "$iam_dir/$metadata_phase.json"
+        check_folder_identity "$iam_dir/$metadata_phase.json" "$prefix" "${folder_identity_receipt:-$RHIZA_AUTH_STATE/folder-identity.json}"
     }
     folder_metadata metadata-before-get || exit $?
     auth_exit=0
@@ -593,7 +828,7 @@ folder_iam() (
     if [ "$action" = get ]; then cat "$iam_dir/current.json"; exit 0; fi
     build_desired() {
       desired_input=$1; desired_output=$2; desired_error=$3
-      jq --arg action "$action" --arg role "projects/$project/roles/$folder_role" --arg member "serviceAccount:$data" \
+      jq --arg action "$action" --arg role "$scope_role" --arg member "serviceAccount:$data" \
       --arg title "rhiza-$RHIZA_RUN_ID-expiry" --arg expression "request.time < timestamp('$RHIZA_AUTH_EXPIRES')" '
       {title:$title,expression:$expression} as $condition |
       (.bindings//[]) as $bindings |
@@ -623,7 +858,7 @@ folder_iam() (
         if [ "$put_attempt" -gt 1 ]; then folder_metadata "metadata-before-put-$put_attempt" || return $?; fi
         if folder_request PUT "$put_phase" "$put_body"; then break; else put_exit=$?; fi
         [ "$action" = add ] && [ "$(cat "$iam_dir/$put_phase.http-status")" = 400 ] &&
-          jq -e --arg role "projects/$project/roles/$folder_role" '
+          jq -e --arg role "$scope_role" '
             .error.code==400 and (.error.errors|type)=="array" and (.error.errors|length)==1 and
             .error.errors[0].reason=="invalid" and
             (.error.message|type)=="string" and (.error.message|contains($role)) and
@@ -678,6 +913,7 @@ validate_fixture() {
     ' >/dev/null 2>/dev/null
 }
 if [ "$mode" = render ]; then
+    validate_identity_family
     render
     exit 0
 fi
@@ -842,6 +1078,7 @@ if [ "$mode" = check-cleanup-uris ]; then
     exit 0
 fi
 if [ "$mode" = check-folder-iam ]; then
+    validate_identity_family
     # Native command doubles exercise folder_iam itself, never external commands.
     fixture_dir=$(mktemp -d "${TMPDIR:-/tmp}/rhiza-folder-iam.XXXXXXXX")
     RHIZA_AUTH_STATE=$fixture_dir
@@ -889,13 +1126,21 @@ if [ "$mode" = check-folder-iam ]; then
             *) die 'Unexpected synthetic gcloud command' ;;
         esac
     }
-    [ "$pool" = "rhiza-v0191-gcs-$RHIZA_RUN_ID" ] && [ "$ci" = "rhiza-v0191-ci-$RHIZA_RUN_ID@$project.iam.gserviceaccount.com" ] && [ "$data" = "rhiza-v0191-gcs-$RHIZA_RUN_ID@$project.iam.gserviceaccount.com" ] || die 'Fresh identity derivation regression'
+    [ "$pool" = "rhiza-$version_prefix-gcs-$RHIZA_RUN_ID" ] && [ "$ci" = "rhiza-$version_prefix-ci-$RHIZA_RUN_ID@$project.iam.gserviceaccount.com" ] && [ "$data" = "rhiza-$version_prefix-gcs-$RHIZA_RUN_ID@$project.iam.gserviceaccount.com" ] || die 'Fresh identity derivation regression'
+    stale_prefix=v0000
+    [ "$stale_prefix" != "$version_prefix" ] || stale_prefix=v9999
+    stale_version=0.0.0
+    [ "$stale_version" != "$manifest_version" ] || stale_version=999.999.999
+    if (RHIZA_NAMESPACE="rhiza-$stale_prefix-$RHIZA_RUN_ID" validate_identity_family) >/dev/null 2>&1; then die 'Stale namespace family accepted'; fi
+    if (RHIZA_DATA_GSA_ID="rhiza-$stale_prefix-gcs-$RHIZA_RUN_ID" validate_identity_family) >/dev/null 2>&1; then die 'Stale data GSA family accepted'; fi
+    if (RHIZA_CI_GSA_ID="rhiza-$stale_prefix-ci-$RHIZA_RUN_ID" validate_identity_family) >/dev/null 2>&1; then die 'Stale CI GSA family accepted'; fi
+    if (RHIZA_GCS_PREFIX="postrelease/v$stale_version/$RHIZA_RUN_ID/" validate_identity_family) >/dev/null 2>&1; then die 'Stale GCS prefix family accepted'; fi
     create_account "$ci_id" | jq -e --arg id "$ci_id" '.fixture_created==$id' >/dev/null
     create_account "$data_id" | jq -e --arg id "$data_id" '.fixture_created==$id' >/dev/null
     if (create_account rhiza-v0190-ci-1008) >/dev/null 2>&1; then die 'Old account accepted'; fi
     other_run=ffffffff
     [ "$RHIZA_RUN_ID" != "$other_run" ] || other_run=00000000
-    if (create_account "rhiza-v0191-gcs-$other_run") >/dev/null 2>&1; then die 'Cross-run account accepted'; fi
+    if (create_account "rhiza-$version_prefix-gcs-$other_run") >/dev/null 2>&1; then die 'Cross-run account accepted'; fi
     printf 'Fresh run %s: exact pool, two GSA create arguments, old/cross-run refusal verified.\n' "$RHIZA_RUN_ID"
     curl() {
         fixture_method=GET; fixture_output=; fixture_body=; fixture_header=; fixture_url=
@@ -1093,6 +1338,11 @@ command -v sha256sum >/dev/null 2>&1 || command -v shasum >/dev/null 2>&1 || die
 k() { kubectl --context="$context" "$@"; }
 g() { gcloud --project="$project" --quiet "$@"; }
 identity=$(jq -nc --arg run "$RHIZA_RUN_ID" --arg sha "$RHIZA_WORKFLOW_SHA" --arg expiry "$RHIZA_AUTH_EXPIRES" --arg cap "$RHIZA_COST_CAP_KRW" --arg owner "$owner" --arg host_image "$RHIZA_HOST_IMAGE" '{run:$run,workflow_sha:$sha,expiry:$expiry,cost_cap_krw:$cap,owner:$owner,host_image:$host_image}')
+identity=$(printf '%s\n' "$identity" | jq -c --arg namespace "$ns" --arg data_gsa_id "$data_id" --arg ci_gsa_id "$ci_id" --arg gcs_prefix "$prefix" --arg pool "$pool" --arg provider "$provider" '. + {namespace:$namespace,data_gsa_id:$data_gsa_id,ci_gsa_id:$ci_gsa_id,gcs_prefix:$gcs_prefix,pool:$pool,provider:$provider}')
+if [ "$RHIZA_GCS_INDEPENDENT_LAYOUT" = yes ]; then
+    identity=$(printf '%s\n' "$identity" | jq -c --arg reader "$readonly_id" --arg data "$data_prefix" --arg control "$control_prefix" \
+      '. + {gcs_layout:"independent",readonly_workload_gsa_id:$reader,data_prefix:$data,control_prefix:$control}')
+fi
 if [ "$auth_mode" = local ]; then identity=$(printf '%s\n' "$identity" | jq -c '.auth_mode="local"'); fi
 # Receipts are local and private, not public artifacts. No shell tracing/tokens.
 record() {
@@ -1106,6 +1356,7 @@ record() {
     fi
 }
 if [ "$mode" = apply ]; then
+    validate_identity_family
     # Refuse stale/long-lived grants before the first remote call.
     expires=$(utc_epoch "$RHIZA_AUTH_EXPIRES")
     now=$(date -u '+%s')
@@ -1133,6 +1384,28 @@ else
     [ -f "$RHIZA_AUTH_STATE/identity.json" ] && [ ! -L "$RHIZA_AUTH_STATE/identity.json" ] &&
       [ -n "$(find "$RHIZA_AUTH_STATE/identity.json" -type f -user "$(id -u)" -perm 0600 -print)" ] || die 'Private ownership identity receipt required'
     [ "$(jq -cS . "$RHIZA_AUTH_STATE/identity.json")" = "$(printf '%s\n' "$identity" | jq -cS .)" ] || die 'Receipt identity mismatch'
+    ns=$(jq -r .namespace "$RHIZA_AUTH_STATE/identity.json")
+    data_id=$(jq -r .data_gsa_id "$RHIZA_AUTH_STATE/identity.json")
+    ci_id=$(jq -r .ci_gsa_id "$RHIZA_AUTH_STATE/identity.json")
+    prefix=$(jq -r .gcs_prefix "$RHIZA_AUTH_STATE/identity.json")
+    pool=$(jq -r .pool "$RHIZA_AUTH_STATE/identity.json")
+    provider=$(jq -r .provider "$RHIZA_AUTH_STATE/identity.json")
+    folder=gs://$bucket/$prefix
+    ci=$ci_id@$project.iam.gserviceaccount.com
+    data=$data_id@$project.iam.gserviceaccount.com
+    ci_member=principalSet://iam.googleapis.com/projects/$number/locations/global/workloadIdentityPools/$pool/attribute.repository_id/${RHIZA_GITHUB_REPOSITORY_ID:-0}
+    data_member=serviceAccount:$project.svc.id.goog[$ns/rhiza-gcs]
+    operator_member=serviceAccount:$project.svc.id.goog[$ns/rhiza-operator]
+    if [ -f "$RHIZA_AUTH_STATE/pool.created" ] && [ "$(cat "$RHIZA_AUTH_STATE/pool.created")" = "$owner" ]; then
+        jq -e --arg name "projects/$number/locations/global/workloadIdentityPools/$pool" 'type=="object" and .name==$name' "$RHIZA_AUTH_STATE/pool-create.json" >/dev/null || die 'Pool create receipt identity rejected'
+        pool=$(jq -r .name "$RHIZA_AUTH_STATE/pool-create.json")
+        pool=${pool##*/}
+    fi
+    if [ -f "$RHIZA_AUTH_STATE/provider.created" ] && [ "$(cat "$RHIZA_AUTH_STATE/provider.created")" = "$owner" ]; then
+        jq -e --arg name "projects/$number/locations/global/workloadIdentityPools/$pool/providers/$provider" 'type=="object" and .name==$name' "$RHIZA_AUTH_STATE/provider-create.json" >/dev/null || die 'Provider create receipt identity rejected'
+        provider=$(jq -r .name "$RHIZA_AUTH_STATE/provider-create.json")
+        provider=${provider##*/}
+    fi
 fi
 [ ! -L "$RHIZA_AUTH_STATE" ] && [ "$(CDPATH='' cd -- "$RHIZA_AUTH_STATE" && pwd -P)" = "$RHIZA_AUTH_STATE" ] || die 'State path must be a private physical directory'
 [ -n "$(find "$RHIZA_AUTH_STATE" -prune -type d -user "$(id -u)" -perm 0700 -print)" ] || die 'State directory owner/mode rejected'
@@ -1282,11 +1555,32 @@ check_folder_role() {
       .includedPermissions==$original[0].includedPermissions and .stage==$original[0].stage
     ' "$RHIZA_AUTH_STATE/folder-role-current.json" >/dev/null || die 'Folder role ownership/metadata changed'
 }
+check_readonly_inherited_access() {
+    [ "$RHIZA_GCS_INDEPENDENT_LAYOUT" = yes ] || return 0
+    for policy_receipt in "$RHIZA_AUTH_STATE/project-before.json" "$RHIZA_AUTH_STATE/bucket-before.json" \
+      "$RHIZA_AUTH_STATE/project-after.json" "$RHIZA_AUTH_STATE/bucket-after.json" \
+      "$RHIZA_AUTH_STATE/folder-before.json" "$RHIZA_AUTH_STATE/folder-after.json"; do
+        [ -f "$policy_receipt" ] || continue
+        jq -e --arg email "$readonly_email" '
+          type=="object" and ((.bindings // [])|type)=="array" and
+          all((.bindings // [])[];
+            ((.members // [])|index($email))==null and
+            all((.members // [])[]; .!="allUsers" and .!="allAuthenticatedUsers"))
+        ' "$policy_receipt" >/dev/null || die 'Read-only identity would inherit project/bucket access; isolate the qualification account'
+    done
+}
 if [ "$mode" = mint-local ]; then
     [ "$auth_mode" = local ] || die 'Local mode required'
-    for required in local-prepared kubernetes data-wi-grant operator-wi-grant folder-grant fixture-secret; do
+    for required in local-prepared kubernetes data-wi-grant operator-wi-grant fixture-secret; do
         owned "$required" || die 'Local bootstrap did not complete; no mint from partial/failed apply'
     done
+    if [ "$RHIZA_GCS_INDEPENDENT_LAYOUT" = yes ]; then
+        for required in data-writer-folder-grant control-writer-folder-grant data-folder-grant; do
+            owned "$required" || die 'Local bootstrap lacks exact DATA/CONTROL writer grants; no token mint'
+        done
+    else
+        owned folder-grant || die 'Local bootstrap lacks its run-prefix writer grant; no token mint'
+    fi
     if [ -f "$RHIZA_AUTH_STATE/inflight" ]; then
         last=$(cat "$RHIZA_AUTH_STATE/inflight")
         [ -f "$RHIZA_AUTH_STATE/$last.exit" ] && [ "$(cat "$RHIZA_AUTH_STATE/$last.exit")" = 0 ] || die 'Unresolved operation outcome; no token mint'
@@ -1326,6 +1620,7 @@ if [ "$mode" = apply ]; then
     fi
     record project-before g projects get-iam-policy "$project" --format=json
     record bucket-before g storage buckets get-iam-policy "gs://$bucket" --format=json
+    check_readonly_inherited_access
     absent namespace k get namespace "$ns" -o json
     for suffix in faults network-faults; do
         absent "$suffix-policy" k get validatingadmissionpolicy "$ns-$suffix" -o json
@@ -1334,6 +1629,11 @@ if [ "$mode" = apply ]; then
     absent ns-reader k get clusterrole "$ns-reader" -o json
     absent ns-reader-binding k get clusterrolebinding "$ns-reader" -o json
     absent data g iam service-accounts describe "$data" --format=json
+    if [ "$RHIZA_GCS_INDEPENDENT_LAYOUT" = yes ]; then
+        absent readonly g iam service-accounts describe "$readonly_email" --format=json
+        absent data-folder g storage managed-folders describe "$data_folder" --raw --format=json
+        absent control-folder g storage managed-folders describe "$control_folder" --raw --format=json
+    fi
     if [ "$auth_mode" = ci ]; then
         absent pool g iam workload-identity-pools describe "$pool" --location=global --format=json
         absent ci g iam service-accounts describe "$ci" --format=json
@@ -1347,6 +1647,10 @@ if [ "$mode" = apply ]; then
     if [ "$auth_mode" = ci ]; then record ci-create create_account "$ci_id"; mark ci; fi
     record data-create create_account "$data_id"
     mark data
+    if [ "$RHIZA_GCS_INDEPENDENT_LAYOUT" = yes ]; then
+        record readonly-create create_account "$readonly_id"
+        mark readonly
+    fi
     if [ "$auth_mode" = ci ]; then
         record cluster-role-create g iam roles create "$cluster_role" --title='Rhiza temporary cluster metadata' --description="$owner" --permissions=container.clusters.get --stage=GA --format=json
         mark cluster-role
@@ -1356,7 +1660,7 @@ if [ "$mode" = apply ]; then
     if [ "$auth_mode" = ci ]; then
     record pool-create g iam workload-identity-pools create "$pool" --location=global --description="$owner" --format=json
     mark pool
-    record provider-create g iam workload-identity-pools providers create-oidc github --location=global --workload-identity-pool="$pool" --issuer-uri=https://token.actions.githubusercontent.com --attribute-mapping="$mapping" --attribute-condition="$oidc" --description="$owner" --format=json
+    record provider-create g iam workload-identity-pools providers create-oidc "$provider" --location=global --workload-identity-pool="$pool" --issuer-uri=https://token.actions.githubusercontent.com --attribute-mapping="$mapping" --attribute-condition="$oidc" --description="$owner" --format=json
     mark provider
     fi
     record folder-create g storage managed-folders create "$folder" --format=json
@@ -1364,8 +1668,26 @@ if [ "$mode" = apply ]; then
     record folder-identity g storage managed-folders describe "$folder" --raw --format=json
     check_folder_identity "$RHIZA_AUTH_STATE/folder-identity.json"
     record folder-before folder_iam get
+    check_readonly_inherited_access
+    if [ "$RHIZA_GCS_INDEPENDENT_LAYOUT" = yes ]; then
+        record data-folder-create g storage managed-folders create "$data_folder" --format=json
+        mark data-folder
+        record control-folder-create g storage managed-folders create "$control_folder" --format=json
+        mark control-folder
+        record data-folder-identity g storage managed-folders describe "$data_folder" --raw --format=json
+        check_folder_identity "$RHIZA_AUTH_STATE/data-folder-identity.json" "$data_prefix" "$RHIZA_AUTH_STATE/data-folder-identity.json"
+        record control-folder-identity g storage managed-folders describe "$control_folder" --raw --format=json
+        check_folder_identity "$RHIZA_AUTH_STATE/control-folder-identity.json" "$control_prefix" "$RHIZA_AUTH_STATE/control-folder-identity.json"
+        record data-folder-before folder_iam_data get
+        record control-folder-before folder_iam_control get
+        jq -e '((.bindings // [])|length)==0' "$RHIZA_AUTH_STATE/data-folder-before.json" >/dev/null || die 'New data folder has preexisting IAM bindings'
+        jq -e '((.bindings // [])|length)==0' "$RHIZA_AUTH_STATE/control-folder-before.json" >/dev/null || die 'New control folder has preexisting IAM bindings'
+    fi
     if [ "$auth_mode" = ci ]; then record ci-wi-before g iam service-accounts get-iam-policy "$ci" --format=json; fi
     record data-wi-before g iam service-accounts get-iam-policy "$data" --format=json
+    if [ "$RHIZA_GCS_INDEPENDENT_LAYOUT" = yes ]; then
+        record readonly-wi-before g iam service-accounts get-iam-policy "$readonly_email" --format=json
+    fi
     # Bootstrap namespace and admission BEFORE any CI runtime access.
     # No apply/adoption: a collision fails. Partial kubectl creation needs audit.
     record kubernetes-create k create -f "$RHIZA_AUTH_STATE/auth.yaml" -o json
@@ -1381,6 +1703,11 @@ if [ "$mode" = apply ]; then
     extract_created_identity clusterrolebinding "$ns-reader" "$RHIZA_AUTH_STATE/clusterrolebinding-reader-identity.json" "$owner"
     record namespace-identity k get namespace "$ns" -o json
     record data-ksa-identity k get serviceaccount rhiza-gcs --namespace="$ns" -o json
+    if [ "$RHIZA_GCS_INDEPENDENT_LAYOUT" = yes ]; then
+        record workload-ksa-identity k get serviceaccount rhiza-workload --namespace="$ns" -o json
+        record operator-ksa-identity k get serviceaccount rhiza-operator --namespace="$ns" -o json
+        record fencer-ksa-identity k get serviceaccount rhiza-fencer --namespace="$ns" -o json
+    fi
     record inspector-ksa-identity k get serviceaccount rhiza-inspector --namespace="$ns" -o json
     jq -e --arg ns "$ns" '
       .metadata.name=="rhiza-inspector" and .metadata.namespace==$ns and
@@ -1424,7 +1751,7 @@ if [ "$mode" = apply ]; then
     }
     trap clear_fixture 0
     trap 'exit 130' HUP INT TERM
-    if ! "$RHIZA_FIXTURE_GENERATOR" qualification-fixture "$ns" "$RHIZA_RUN_ID" "$owner" > "$fixture_dir/secret.json" 2>/dev/null; then
+    if ! "$RHIZA_FIXTURE_GENERATOR" qualification-fixture "$ns" "$RHIZA_RUN_ID" "$version_prefix" "$owner" > "$fixture_dir/secret.json" 2>/dev/null; then
         die 'Trusted fixture generator failed (payload/diagnostics omitted)'
     fi
     chmod 600 "$fixture_dir/secret.json"
@@ -1449,17 +1776,42 @@ if [ "$mode" = apply ]; then
     record ci-wi-grant g iam service-accounts add-iam-policy-binding "$ci" --member="$ci_member" --role=roles/iam.workloadIdentityUser --condition="$expiry" --format=json
     mark ci-wi-grant
     fi
-    record data-wi-grant g iam service-accounts add-iam-policy-binding "$data" --member="$data_member" --role=roles/iam.workloadIdentityUser --condition="$expiry" --format=json
-    mark data-wi-grant
-    record operator-wi-grant g iam service-accounts add-iam-policy-binding "$data" --member="$operator_member" --role=roles/iam.workloadIdentityUser --condition="$expiry" --format=json
-    mark operator-wi-grant
-    record data-post-grant-identity g iam service-accounts describe "$data" --format=json
-    seal_workload_identity
-    record folder-grant folder_iam add
-    mark folder-grant
+    if [ "$RHIZA_GCS_INDEPENDENT_LAYOUT" = yes ]; then
+        record data-wi-grant g iam service-accounts add-iam-policy-binding "$readonly_email" --member="$workload_member" --role=roles/iam.workloadIdentityUser --condition="$expiry" --format=json
+        mark data-wi-grant
+        record operator-wi-grant g iam service-accounts add-iam-policy-binding "$data" --member="$operator_member" --role=roles/iam.workloadIdentityUser --condition="$expiry" --format=json
+        mark operator-wi-grant
+        record fencer-wi-grant g iam service-accounts add-iam-policy-binding "$data" --member="$fencer_member" --role=roles/iam.workloadIdentityUser --condition="$expiry" --format=json
+        mark fencer-wi-grant
+        record data-post-grant-identity g iam service-accounts describe "$data" --format=json
+        record readonly-post-grant-identity g iam service-accounts describe "$readonly_email" --format=json
+        record data-writer-folder-grant folder_iam_writer_data add
+        mark data-writer-folder-grant
+        record control-writer-folder-grant folder_iam_writer_control add
+        mark control-writer-folder-grant
+        record data-folder-grant folder_iam_data add
+        mark data-folder-grant
+        record data-wi-after g iam service-accounts get-iam-policy "$data" --format=json
+        record readonly-wi-after g iam service-accounts get-iam-policy "$readonly_email" --format=json
+        record data-folder-after folder_iam_data get
+        record control-folder-after folder_iam_control get
+        record folder-after folder_iam get
+        seal_independent_workload_identity
+    else
+        record data-wi-grant g iam service-accounts add-iam-policy-binding "$data" --member="$data_member" --role=roles/iam.workloadIdentityUser --condition="$expiry" --format=json
+        mark data-wi-grant
+        record operator-wi-grant g iam service-accounts add-iam-policy-binding "$data" --member="$operator_member" --role=roles/iam.workloadIdentityUser --condition="$expiry" --format=json
+        mark operator-wi-grant
+        record data-post-grant-identity g iam service-accounts describe "$data" --format=json
+        seal_workload_identity
+        record folder-grant folder_iam add
+        mark folder-grant
+        record folder-after folder_iam get
+    fi
     record project-after g projects get-iam-policy "$project" --format=json
     record bucket-after g storage buckets get-iam-policy "gs://$bucket" --format=json
-    record folder-after folder_iam get
+    check_readonly_inherited_access
+    check_readonly_inherited_access
     if [ "$auth_mode" = local ]; then mark local-prepared; fi
     printf '%s\n' "Prepared $ns ($auth_mode); scoped actor/GCS/admission checks still required before faults."
     exit 0
@@ -1479,9 +1831,101 @@ if [ "$auth_mode" = local ]; then
 fi
 check_sa() {
     which=$1; account=$2
+    jq -e --arg email "$account" --arg owner "$owner" '
+      type=="object" and .email==$email and (.uniqueId|type)=="string" and (.uniqueId|length)>0 and .description==$owner
+    ' "$RHIZA_AUTH_STATE/$which-create.json" >/dev/null || die 'GSA create receipt identity rejected'
     record "$which-current" g iam service-accounts describe "$account" --format=json
-    [ "$(jq -r .uniqueId "$RHIZA_AUTH_STATE/$which-current.json")" = "$(jq -r .uniqueId "$RHIZA_AUTH_STATE/$which-create.json")" ] || die 'GSA identity changed'
-    [ "$(jq -r .description "$RHIZA_AUTH_STATE/$which-current.json")" = "$owner" ] || die 'GSA ownership changed'
+    jq -e --arg email "$account" --arg owner "$owner" --slurpfile original "$RHIZA_AUTH_STATE/$which-create.json" '
+      type=="object" and .email==$email and .uniqueId==$original[0].uniqueId and .description==$owner
+    ' "$RHIZA_AUTH_STATE/$which-current.json" >/dev/null || die 'GSA identity/ownership changed'
+}
+receipt_succeeded() {
+    receipt_path=$1
+    [ -f "$receipt_path" ] && [ ! -L "$receipt_path" ] &&
+      [ -n "$(find "$receipt_path" -type f -user "$(id -u)" -perm 0600 -print)" ] || die 'Private successful create receipt required for ownership recovery'
+    [ -f "${receipt_path%.json}.exit" ] && [ ! -L "${receipt_path%.json}.exit" ] &&
+      [ -n "$(find "${receipt_path%.json}.exit" -type f -user "$(id -u)" -perm 0600 -print)" ] &&
+      [ "$(cat "${receipt_path%.json}.exit")" = 0 ] || die 'Create outcome is not a proven success; preserve resources for manual review'
+}
+marker_writable() {
+    marker_path=$RHIZA_AUTH_STATE/$1.created
+    if [ -e "$marker_path" ] || [ -L "$marker_path" ]; then
+        [ -f "$marker_path" ] && [ ! -L "$marker_path" ] &&
+          [ -n "$(find "$marker_path" -type f -user "$(id -u)" -perm 0600 -print)" ] || die 'Ownership marker is not a private regular file'
+    fi
+}
+recover_created_gsa_marker() {
+    gsa_tag=$1
+    gsa_account=$2
+    owned "$gsa_tag" && return 0
+    marker_writable "$gsa_tag"
+    gsa_receipt=$RHIZA_AUTH_STATE/$gsa_tag-create.json
+    if [ ! -e "$gsa_receipt" ] && [ ! -L "$gsa_receipt" ]; then
+        [ ! -e "$RHIZA_AUTH_STATE/$gsa_tag-create.exit" ] && [ ! -L "$RHIZA_AUTH_STATE/$gsa_tag-create.exit" ] || die 'GSA create outcome exists without exact identity receipt; preserve resource for manual review'
+        [ ! -e "$RHIZA_AUTH_STATE/$gsa_tag.created" ] && [ ! -L "$RHIZA_AUTH_STATE/$gsa_tag.created" ] || die 'GSA ownership marker has no create receipt'
+        return 0
+    fi
+    receipt_succeeded "$gsa_receipt"
+    # The create response's exact uniqueId and run-owned description must
+    # still identify the live account before a missing marker is reconstructed.
+    check_sa "$gsa_tag" "$gsa_account"
+    mark "$gsa_tag"
+}
+recover_created_folder_marker() {
+    folder_tag=$1
+    folder_resource=$2
+    folder_path=$3
+    owned "$folder_tag" && return 0
+    marker_writable "$folder_tag"
+    folder_receipt=$RHIZA_AUTH_STATE/$folder_tag-create.json
+    if [ ! -e "$folder_receipt" ] && [ ! -L "$folder_receipt" ]; then
+        [ ! -e "$RHIZA_AUTH_STATE/$folder_tag-create.exit" ] && [ ! -L "$RHIZA_AUTH_STATE/$folder_tag-create.exit" ] || die 'Folder create outcome exists without exact identity receipt; preserve resource for manual review'
+        [ ! -e "$RHIZA_AUTH_STATE/$folder_tag.created" ] && [ ! -L "$RHIZA_AUTH_STATE/$folder_tag.created" ] || die 'Folder ownership marker has no create receipt'
+        return 0
+    fi
+    receipt_succeeded "$folder_receipt"
+    # A successful create receipt binds the exact folder incarnation. Only
+    # matching live metadata may restore the local cleanup marker.
+    record "$folder_tag-reconcile-current" g storage managed-folders describe "$folder_resource" --raw --format=json
+    check_folder_create_readback "$folder_receipt" "$RHIZA_AUTH_STATE/$folder_tag-reconcile-current.json" "$folder_path"
+    mark "$folder_tag"
+}
+verify_rollback_side_effect_markers() {
+    # A successful remote mutation without its following local marker is an
+    # interrupted rollback prerequisite, not evidence that the resource was
+    # never created. Reconstruct only the narrowly verified GSA/folder cases
+    # above; every other category must stop short of a false terminal receipt.
+    side_effects='data-create:data folder-role-create:folder-role folder-create:folder kubernetes-create:kubernetes fixture-secret-create:fixture-secret data-wi-grant:data-wi-grant operator-wi-grant:operator-wi-grant'
+    if [ "$auth_mode" = ci ]; then
+        side_effects="$side_effects ci-create:ci cluster-role-create:cluster-role pool-create:pool provider-create:provider ci-project-grant:ci-project-grant ci-wi-grant:ci-wi-grant"
+    fi
+    if [ "$RHIZA_GCS_INDEPENDENT_LAYOUT" = yes ]; then
+        side_effects="$side_effects readonly-create:readonly data-folder-create:data-folder control-folder-create:control-folder fencer-wi-grant:fencer-wi-grant data-folder-grant:data-folder-grant data-writer-folder-grant:data-writer-folder-grant control-writer-folder-grant:control-writer-folder-grant"
+    else
+        side_effects="$side_effects folder-grant:folder-grant"
+    fi
+    for pair in $side_effects; do
+        effect=${pair%%:*}
+        marker_tag=${pair#*:}
+        receipt_path=$RHIZA_AUTH_STATE/$effect.json
+        exit_path=$RHIZA_AUTH_STATE/$effect.exit
+        marker_path=$RHIZA_AUTH_STATE/$marker_tag.created
+        if [ ! -e "$receipt_path" ] && [ ! -L "$receipt_path" ] &&
+           [ ! -e "$exit_path" ] && [ ! -L "$exit_path" ] &&
+           [ ! -e "$marker_path" ] && [ ! -L "$marker_path" ]; then
+            continue
+        fi
+        [ -f "$receipt_path" ] && [ ! -L "$receipt_path" ] &&
+          [ -n "$(find "$receipt_path" -type f -user "$(id -u)" -perm 0600 -print)" ] ||
+          die "Side-effect receipt missing or unsafe: $effect"
+        [ -f "$exit_path" ] && [ ! -L "$exit_path" ] &&
+          [ -n "$(find "$exit_path" -type f -user "$(id -u)" -perm 0600 -print)" ] &&
+          [ "$(cat "$exit_path")" = 0 ] || die "Side-effect outcome is not proven successful: $effect"
+        [ -f "$marker_path" ] && [ ! -L "$marker_path" ] &&
+          [ -n "$(find "$marker_path" -type f -user "$(id -u)" -perm 0600 -print)" ] &&
+          [ "$(cat "$marker_path")" = "$owner" ] ||
+          die "Successful side effect lacks an exact ownership marker: $effect"
+    done
 }
 wait_deleted_sa() {
     deleted_tag=$1
@@ -1490,16 +1934,25 @@ wait_deleted_sa() {
     timeout --kill-after=5s 415s /bin/sh "$script_dir/bootstrap-gcs-postrelease.sh" "$deleted_worker" "$deleted_tag" || deleted_exit=$?
     case "$deleted_exit" in 0) return 0 ;; 124|137) die "GSA deletion deadline exhausted: $deleted_tag" ;; *) die "GSA deletion wait failed: $deleted_tag" ;; esac
 }
+if [ "$RHIZA_GCS_INDEPENDENT_LAYOUT" = yes ]; then
+    recover_created_gsa_marker data "$data"
+    recover_created_gsa_marker readonly "$readonly_email"
+    recover_created_folder_marker folder "$folder" "$prefix"
+    recover_created_folder_marker data-folder "$data_folder" "$data_prefix"
+    recover_created_folder_marker control-folder "$control_folder" "$control_prefix"
+fi
+verify_rollback_side_effect_markers
 owned ci && check_sa ci "$ci"
 owned data && check_sa data "$data"
+owned readonly && check_sa readonly "$readonly_email"
 if owned pool; then
     record pool-current g iam workload-identity-pools describe "$pool" --location=global --format=json
-    [ "$(jq -r .description "$RHIZA_AUTH_STATE/pool-current.json")" = "$owner" ] || die 'Pool ownership changed'
+    jq -e --slurpfile created "$RHIZA_AUTH_STATE/pool-create.json" 'type=="object" and ($created|length)==1 and .name==$created[0].name' "$RHIZA_AUTH_STATE/pool-current.json" >/dev/null || die 'Pool identity changed'
 fi
 if owned provider; then
-    record provider-current g iam workload-identity-pools providers describe github --location=global --workload-identity-pool="$pool" --format=json
-    [ "$(jq -r .description "$RHIZA_AUTH_STATE/provider-current.json")" = "$owner" ] || die 'Provider ownership changed'
-    record provider-disable g iam workload-identity-pools providers update-oidc github --location=global --workload-identity-pool="$pool" --disabled --format=json
+    record provider-current g iam workload-identity-pools providers describe "$provider" --location=global --workload-identity-pool="$pool" --format=json
+    jq -e --slurpfile created "$RHIZA_AUTH_STATE/provider-create.json" 'type=="object" and ($created|length)==1 and .name==$created[0].name' "$RHIZA_AUTH_STATE/provider-current.json" >/dev/null || die 'Provider identity changed'
+    record provider-disable g iam workload-identity-pools providers update-oidc "$provider" --location=global --workload-identity-pool="$pool" --disabled --format=json
 fi
 if owned folder; then
     record folder-current g storage managed-folders describe "$folder" --raw --format=json
@@ -1510,11 +1963,40 @@ if owned folder; then
     if owned folder-grant; then expected_folder_policy=$RHIZA_AUTH_STATE/folder-after.json; fi
     jq -e --slurpfile expected "$expected_folder_policy" '(.bindings // [] | sort_by(.role,.condition.title)) == ($expected[0].bindings // [] | sort_by(.role,.condition.title))' "$RHIZA_AUTH_STATE/folder-policy-current.json" >/dev/null || die 'Folder policy changed; preserve concurrent bindings for review'
 fi
+if [ "$RHIZA_GCS_INDEPENDENT_LAYOUT" = yes ] && owned data-folder; then
+    record data-folder-current g storage managed-folders describe "$data_folder" --raw --format=json
+    check_folder_identity "$RHIZA_AUTH_STATE/data-folder-current.json" "$data_prefix" "$RHIZA_AUTH_STATE/data-folder-identity.json"
+    record data-folder-policy-current folder_iam_data get
+    expected_data_folder_policy=$RHIZA_AUTH_STATE/data-folder-before.json
+    if owned data-writer-folder-grant; then expected_data_folder_policy=$RHIZA_AUTH_STATE/data-writer-folder-grant.json; fi
+    if owned data-folder-grant; then expected_data_folder_policy=$RHIZA_AUTH_STATE/data-folder-grant.json; fi
+    jq -e --slurpfile expected "$expected_data_folder_policy" '(.bindings // [] | sort_by(.role,.condition.title)) == ($expected[0].bindings // [] | sort_by(.role,.condition.title))' \
+      "$RHIZA_AUTH_STATE/data-folder-policy-current.json" >/dev/null || die 'Data-folder policy changed; preserve concurrent bindings for review'
+fi
+if [ "$RHIZA_GCS_INDEPENDENT_LAYOUT" = yes ] && owned control-folder; then
+    record control-folder-current g storage managed-folders describe "$control_folder" --raw --format=json
+    check_folder_identity "$RHIZA_AUTH_STATE/control-folder-current.json" "$control_prefix" "$RHIZA_AUTH_STATE/control-folder-identity.json"
+    record control-folder-policy-current folder_iam_control get
+    expected_control_folder_policy=$RHIZA_AUTH_STATE/control-folder-before.json
+    if owned control-writer-folder-grant; then expected_control_folder_policy=$RHIZA_AUTH_STATE/control-writer-folder-grant.json; fi
+    jq -e --slurpfile expected "$expected_control_folder_policy" '(.bindings // [] | sort_by(.role,.condition.title)) == ($expected[0].bindings // [] | sort_by(.role,.condition.title))' \
+      "$RHIZA_AUTH_STATE/control-folder-policy-current.json" >/dev/null || die 'Control-folder policy changed; preserve concurrent bindings for review'
+fi
 # Only the exact live folder binding is changed with its current etag. No retries.
 if owned folder-grant; then record revoke-folder folder_iam remove; fi
+if owned data-writer-folder-grant; then record revoke-data-writer-folder folder_iam_writer_data remove; fi
+if owned control-writer-folder-grant; then record revoke-control-writer-folder folder_iam_writer_control remove; fi
+if owned data-folder-grant; then record revoke-data-folder folder_iam_data remove; fi
 if owned ci-wi-grant; then record revoke-ci-wi g iam service-accounts remove-iam-policy-binding "$ci" --member="$ci_member" --role=roles/iam.workloadIdentityUser --condition="$expiry" --format=json; fi
-if owned data-wi-grant; then record revoke-data-wi g iam service-accounts remove-iam-policy-binding "$data" --member="$data_member" --role=roles/iam.workloadIdentityUser --condition="$expiry" --format=json; fi
+if owned data-wi-grant; then
+    if [ "$RHIZA_GCS_INDEPENDENT_LAYOUT" = yes ]; then
+        record revoke-data-wi g iam service-accounts remove-iam-policy-binding "$readonly_email" --member="$workload_member" --role=roles/iam.workloadIdentityUser --condition="$expiry" --format=json
+    else
+        record revoke-data-wi g iam service-accounts remove-iam-policy-binding "$data" --member="$data_member" --role=roles/iam.workloadIdentityUser --condition="$expiry" --format=json
+    fi
+fi
 if owned operator-wi-grant; then record revoke-operator-wi g iam service-accounts remove-iam-policy-binding "$data" --member="$operator_member" --role=roles/iam.workloadIdentityUser --condition="$expiry" --format=json; fi
+if owned fencer-wi-grant; then record revoke-fencer-wi g iam service-accounts remove-iam-policy-binding "$data" --member="$fencer_member" --role=roles/iam.workloadIdentityUser --condition="$expiry" --format=json; fi
 if owned kubernetes; then
     # The preserved original bootstrap matched both fault kinds in -faults.
     # A reviewed transition records the added pair in a separate working
@@ -1570,6 +2052,26 @@ if owned kubernetes; then
     done
 fi
 # No bucket/object recursive deletion or --all IAM removal is permitted here.
+if [ "$RHIZA_GCS_INDEPENDENT_LAYOUT" = yes ] && owned data-folder; then
+    absent data-folder-objects g storage ls "$data_folder**"
+    record data-folder-predelete g storage managed-folders describe "$data_folder" --raw --format=json
+    check_folder_identity "$RHIZA_AUTH_STATE/data-folder-predelete.json" "$data_prefix" "$RHIZA_AUTH_STATE/data-folder-identity.json"
+    record data-folder-predelete-iam folder_iam_data get
+    jq -e --slurpfile expected "$RHIZA_AUTH_STATE/data-folder-before.json" '(.bindings // [] | sort_by(.role,.condition.title)) == ($expected[0].bindings // [] | sort_by(.role,.condition.title))' \
+      "$RHIZA_AUTH_STATE/data-folder-predelete-iam.json" >/dev/null || die 'Data-folder policy has unrelated changes; do not delete'
+    record data-folder-delete g storage managed-folders delete "$data_folder"
+    verify_absent data-folder g storage managed-folders describe "$data_folder" --raw --format=json
+fi
+if [ "$RHIZA_GCS_INDEPENDENT_LAYOUT" = yes ] && owned control-folder; then
+    absent control-folder-objects g storage ls "$control_folder**"
+    record control-folder-predelete g storage managed-folders describe "$control_folder" --raw --format=json
+    check_folder_identity "$RHIZA_AUTH_STATE/control-folder-predelete.json" "$control_prefix" "$RHIZA_AUTH_STATE/control-folder-identity.json"
+    record control-folder-predelete-iam folder_iam_control get
+    jq -e --slurpfile expected "$RHIZA_AUTH_STATE/control-folder-before.json" '(.bindings // [] | sort_by(.role,.condition.title)) == ($expected[0].bindings // [] | sort_by(.role,.condition.title))' \
+      "$RHIZA_AUTH_STATE/control-folder-predelete-iam.json" >/dev/null || die 'Control-folder policy has unrelated changes; do not delete'
+    record control-folder-delete g storage managed-folders delete "$control_folder"
+    verify_absent control-folder g storage managed-folders describe "$control_folder" --raw --format=json
+fi
 if owned folder; then
     record folder-predelete g storage managed-folders describe "$folder" --raw --format=json
     check_folder_identity "$RHIZA_AUTH_STATE/folder-predelete.json"
@@ -1582,8 +2084,8 @@ if owned folder; then
     verify_absent folder g storage managed-folders describe "$folder" --raw --format=json
 fi
 if owned provider; then
-    record provider-delete g iam workload-identity-pools providers delete github --location=global --workload-identity-pool="$pool"
-    verify_absent provider g iam workload-identity-pools providers describe github --location=global --workload-identity-pool="$pool" --format=json
+    record provider-delete g iam workload-identity-pools providers delete "$provider" --location=global --workload-identity-pool="$pool"
+    verify_absent provider g iam workload-identity-pools providers describe "$provider" --location=global --workload-identity-pool="$pool" --format=json
 fi
 if owned pool; then
     record pool-delete g iam workload-identity-pools delete "$pool" --location=global
@@ -1599,6 +2101,11 @@ if owned data; then
     data_uid=$(jq -r .uniqueId "$RHIZA_AUTH_STATE/data-create.json")
     record data-delete g iam service-accounts delete "$data_uid"
     wait_deleted_sa data
+fi
+if owned readonly; then
+    readonly_uid=$(jq -r .uniqueId "$RHIZA_AUTH_STATE/readonly-create.json")
+    record readonly-delete g iam service-accounts delete "$readonly_uid"
+    wait_deleted_sa readonly
 fi
 tag='folder-role'; role=$folder_role
 if owned "$tag"; then
@@ -1633,6 +2140,7 @@ if owned cluster-role; then
     ' "$RHIZA_AUTH_STATE/$tag-delete.json" >/dev/null || die 'Custom role delete receipt rejected'
     verify_deleted_role "$tag" "$role"
 fi
+verify_rollback_side_effect_markers
 jq -n --arg run "$RHIZA_RUN_ID" --arg owner "$owner" '{status:"complete",run:$run,owner:$owner}' > "$RHIZA_AUTH_STATE/rollback-terminal.json"
 chmod 600 "$RHIZA_AUTH_STATE/rollback-terminal.json"
 printf '%s\n' 'Rollback completed; soft-deleted storage remains billable for retention period.'

@@ -80,6 +80,14 @@ func TestRestoreArchiveCatchUpMarksNodeNotReadyBeforeValidation(t *testing.T) {
 	}
 }
 
+func TestNodeOpenPhaseWrapsPreflightError(t *testing.T) {
+	n := New(nil)
+	err := n.Open(context.Background())
+	if err == nil || !strings.Contains(err.Error(), "node open phase configuration:") || !strings.Contains(err.Error(), "node ID is required") {
+		t.Fatalf("preflight error lacks its fixed phase or cause: %v", err)
+	}
+}
+
 func TestCompactedWakeMarksNodeNotReadyAndCoalesces(t *testing.T) {
 	n := &Node{catchUpWake: make(chan struct{}, 1)}
 	n.ready.Store(true)

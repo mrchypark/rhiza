@@ -27,11 +27,34 @@ not include operator RBAC/Deployment or a Namespace, so rendering it cannot
 silently widen permissions or select a different namespace. The Kustomize
 input preserves `OnDelete`, parallel bootstrap, and the PDB.
 
-Apply the namespace, CRD, RBAC, and Deployment in that order. The controller
+Apply the namespace, CRDs, RBAC, and Deployment in that order. The controller
 uses its service account and the Kubernetes JSON API; it polls the namespace
 selected by `--namespace`. The Deployment supplies that flag from
 `POD_NAMESPACE`; if it is omitted, the command reads the mounted service
 account namespace. `--poll-interval` defaults to `10s` and must be positive.
+
+The manual terminal-attestation schema is installed separately. Set the
+installation namespace and the exact incident-admin group supplied by your
+cluster's authentication provider, then apply the schema and namespaced roles:
+
+```sh
+: "${RHIZA_OPERATOR_NAMESPACE:?set the operator/fencer namespace}"
+: "${RHIZA_INCIDENT_ADMIN_GROUP:?set the authenticated incident-admin group}"
+kubectl apply -f deploy/operator/manual-recovery-attestation-crd.yaml
+kubectl -n "$RHIZA_OPERATOR_NAMESPACE" apply -f deploy/operator/fencing/manual-attestation-rbac.yaml
+kubectl -n "$RHIZA_OPERATOR_NAMESPACE" create rolebinding rhiza-manual-recovery-approver \
+  --role=rhiza-manual-recovery-approver \
+  --group="$RHIZA_INCIDENT_ADMIN_GROUP"
+```
+
+The RoleBinding command intentionally takes an authentication-provider group
+instead of guessing a person or group name. Bind the approver Role only to the
+independently authenticated incident-admin group for this installation. Do not
+bind it to the operator, fencer, application, or workload service accounts.
+The reader RoleBinding grants the fencer `get` only. Installing these manifests
+alone does not enable manual recovery: use this path only with a fencer release
+that issues and validates the typed, expiring canonical challenge described
+below.
 
 Post-fence standalone learner cleanup uses `--delete-namespaces`, defaulted from
 `RHIZA_OPERATOR_DELETE_NAMESPACES`. Empty means the actual operator Pod namespace
@@ -45,6 +68,55 @@ The operator reads the same `RHIZA_OBJSTORE_*` settings as Rhiza itself from
 the bucket endpoint and credentials appropriate for the selected provider.
 Generation-specific peer credentials are distinct secrets created by the
 controller; they must not reuse the source voters' credentials.
+
+The base fencing authority manifest is provider-neutral and does not reference
+these objects. If automatic learner startup or canonical recovery is required,
+configure the fencer explicitly with the same canonical ObjectStorage provider,
+bucket, and data prefix used by the operator, plus credentials valid for that
+store. Reuse the installation's existing overlay or deployment configuration
+to wire the `RHIZA_OBJSTORE_*` values into the fencer; do not assume that
+configuring the operator also configures the fencer. Keep the canonical
+authority/control prefix explicitly configured and separate from the archive
+data prefix where the selected profile requires it. A cooperative legacy
+Kubernetes control ledger can support cooperative fencing without remote
+canonical state, but it does not enable automatic learner startup or canonical
+recovery. Before relying on these paths, verify the effective provider,
+bucket, data prefix, and control prefix by inspecting only those named
+non-secret settings (never dump the complete environment or Secret), then use
+the existing automatic-startup-grant/recovery harness to verify the real
+fencer path. This wiring check is not evidence of GCS or recovery qualification.
+
+The independent NoPVC mutation profile requires a configured remote canonical
+authority store whose constructor accepts the selected ObjectStorage
+provider's conditional create and compare-and-swap capabilities; operations
+that retire exact objects also require that provider's versioned-delete
+semantics. It also requires the runtime-agent CA and exactly one source-writer
+credential mode: the existing
+`--source-writer-credentials-file` (or
+`FENCER_SOURCE_WRITER_CREDENTIALS_FILE`), or explicit
+`--source-writer-use-adc` (or `FENCER_SOURCE_WRITER_USE_ADC=true`). These
+options are mutually exclusive; ADC mode is accepted only with the independent
+profile and has no fallback to the credential file. The current source-mutation
+proof adapter is GCS-specific; selecting another provider for source mutations
+fails startup with an explicit unsupported-profile error before Google client
+setup. This does not make GCS a requirement of the general ObjectStorage
+architecture or establish support for another mutation provider. ADC mode uses
+the fencing authority Pod's Application Default Credentials for the GCS source
+writer (on GKE, configure that Pod's Workload Identity principal deliberately).
+When the authority-state provider is GCS and also uses default credentials, it
+uses that principal too; explicit `RHIZA_OBJSTORE_SERVICE_ACCOUNT` credentials
+can select a different GCS state principal. ADC mode does not itself prove
+separation between authority-state and source-object permissions. Keep the source
+application's KSA distinct and read/list-only, do not mount or inject writer
+credentials into the application Pod, and verify IAM bindings and denied
+operations with the qualification harness before making an isolation claim.
+Source staging and execution receipts then use root-bound remote ObjectStorage;
+local stage and receipt directories are rejected rather than used as
+fallbacks. The remote stage quota is 64 tickets and 4 GiB per producer.
+Cancellation before a ticket enters receiving may durably retire it and release
+quota. Once receiving/admission has begun, tickets remain reserved until their
+exact mutation is found in verified compacted archive history; age alone never
+frees capacity.
 
 ## Operator image
 
@@ -89,25 +161,53 @@ available, immutable to late writers, and protected from rollback for the
 entire recovery. A bucket copy or an apparently quiet pod is not proof that
 the source is safe.
 
-## Fence requirement
+## Fence requirement and manual terminal evidence
 
-Only a trusted fencing authority may create or update recovery resource specs.
-Grant that permission separately to your incident administrator or fencing
-automation; do not grant it to ordinary application service accounts. The CR
-attestation is an authorization boundary, not an independently verified power
-or network fence.
+Normal recovery requires the canonical fencer proof and all existing source,
+storage, quorum, and read-barrier checks. Kubernetes Pod absence, failed probes,
+StatefulSet scale-down, and a `spec.fence.confirmed` boolean are not terminal
+proof.
 
-For manual requests, `spec.fence` is a trusted out-of-band administrator attestation. It must bind
-the same `recoveryID`, `sourceClusterID`, and live StatefulSet UID, set
-`confirmed: true`, and contain concrete evidence. The operator never infers a
-fence from missing pods, failed probes, or Kubernetes deletion state.
+For the explicitly selected human-recovery exception, the approval is a
+separate immutable `RhizaManualRecoveryAttestation`, not a field in
+`RhizaRecovery.spec`, status, or an operator request. Its authorization comes
+from Kubernetes RBAC and API audit: the installation binds
+`rhiza-manual-recovery-approver` only to its incident-admin identity; the
+operator has no approval write access; the fencer has namespace-scoped `get`
+only (no list or write verbs), and its implementation must fetch the exact
+deterministic object name and verify its UID and spec. The `attester` text field
+is descriptive and is not proof of identity.
 
-Before confirming it, fence **all** old voters, every client that can write,
-and read replicas or learners that can reconnect with credentials. Prevent
-late object-store writes from the old generation as well. This normally means
-revoking old peer and client credentials, stopping external supervisors, and
-blocking old workload identity or bucket access. Do not rely on scale-down
-alone: a partitioned old voter can still retain voting authority.
+The fencer must first establish canonical CONTROL closure, the complete
+historical cohort, exact archive/provider scope, target binding, and current
+Pod UID inventory. Only then may it return a typed, expiring challenge bound to
+the Recovery name and UID, operation, full policy (including
+`allowDataLoss`), closed root/ledger/cohort, storage scope, archive, target,
+and current Pod inventory. The administrator must independently verify every
+old run is terminated, recreation is blocked, old peer/client write access is
+blocked, old archive-writer access is revoked, and storage is quiescent. The
+fencer rechecks those bindings and challenge expiry both when accepting the
+immutable approval and when consuming its proof. Any drift, expired challenge,
+or changed approval object fails closed. Before a canonical source-successor
+claim exists, an expired challenge requires a new Recovery operation. After
+that exact claim has consumed the accepted immutable approval, the same
+Recovery may resume after expiry only while its current source, root, workload,
+inventory, challenge, approval UID/spec, and claim still match exactly.
+
+This exception is an explicit external-administrator trust decision, not
+IndependentV2 runtime evidence and not a guarantee from Kubernetes object
+absence. It cannot synthesize a missing ACK or archive HEAD; an async source
+still requires the existing `allowDataLoss: true` gate and recovers only the
+canonical sealed tip. For a `before-ack` source, the same canonical archive-tip
+and closure checks apply, but manual recovery does not assert data loss and does
+not require `allowDataLoss`. A surviving source quorum should use normal membership
+recovery unless an authorized operator deliberately chooses full-generation
+recovery.
+
+The schema and RBAC manifests do not enable the route by themselves: deploy a
+matching controller and fencer that implement the typed challenge and canonical
+attestation-consumption protocol. Do not create an attestation or treat existing
+`spec.fence` fields as equivalent.
 
 ## Deployment contract
 
@@ -120,6 +220,9 @@ membership and do not reuse old PVCs.
 
 The operator container has a read-only root filesystem and mounts an
 `emptyDir` at `/tmp` for the recovery worker's temporary WAL files.
+
+The supervised StatefulSet patch deliberately omits the `rhiza-object-store`
+Secret from the source Pod. Put only non-secret GCS coordinates (`RHIZA_OBJSTORE_PROVIDER=gcs`, bucket, and prefix) in `rhiza-config`; bind the `rhiza-supervised` workload identity to read/list-only access. The mutation writer credential file belongs only to the fencing authority deployment. Do not mount or inject that credential into the source Pod.
 
 ## Voter count
 
@@ -196,6 +299,21 @@ prevent recreation and quiesce storage before updating the fence status. The
 Operator service account cannot write that status. Missing executor or incomplete
 proof leaves recovery pending; a Pod DELETE response is insufficient.
 
+When the Operator uses the HTTPS fencer client, it posts the immutable request
+to `/v1/fences` on `rhiza-fencer`. The adapter authenticates the configured
+controller service account and creates or joins the same `RhizaFence` CRD record;
+HTTP 202 means the executor has not yet stored a validated proof. The CRD remains
+the only request journal.
+
+For a certified zero-tip source, recovery uses the same explicit `RhizaRecovery`
+operation and additionally requires the fencer to register a canonical empty
+target authorization. This path is distinct from a fork: it records tip zero
+and an immutable empty-HEAD receipt, then waits for a target quorum plus an
+authenticated ReadIndex and linearizable application read before completion.
+An async source requires `allowDataLoss: true`; without it, the operation stays
+blocked. The fencer Role needs only `get` on `rhizarecoveries` to verify the
+persisted operation and policy; it does not gain recovery-resource write access.
+
 After proof, the Operator provisions and promotes a learner, fences and aborts a
 lost learner before retrying a fresh identity, or restores a new generation when
 quorum is lost. The StatefulSet remains the deployment basis. The kind executor
@@ -203,11 +321,12 @@ in `e2e/chaos/` is CI-only; production runtime/storage isolation still requires 
 environment-specific executor. See the
 [execution contract and CI evidence](../../docs/automatic-recovery-design.md#kubernetes-backend-실행-계약).
 
-Dead-Pod incidents, where no supervisor can ever report an exit, can use the
-optional external attestor of `rhiza-fencer` instead. It is off unless every one
-of `RHIZA_FENCE_ATTESTOR_URL`, `RHIZA_FENCE_ATTESTOR_TOKEN_FILE` and
-`RHIZA_FENCE_ATTESTOR_CA_FILE` is set on the authority Deployment, and it grants
-the operator no node, CRI, or cloud credential. `deploy/operator/fencing/authority.yaml`
-ships the commented wiring. Without it this backend behaves exactly as before: an
-incarnation without a cooperative exit receipt stays pending. See
+Dead-Pod completion requires enrolled runtime and mutation evidence v2. Legacy
+quiet-window-only attestations are rejected by both authority and recovery
+controller; setting any `RHIZA_FENCE_ATTESTOR_*` value now fails command startup
+instead of advertising unsupported healing. The v2 reconciliation and retained
+history path has deterministic fake-provider coverage, but `rhiza-fencer serve`
+does not yet configure real runtime/mutation providers. It must not be advertised
+as production dead-Pod healing. No node, CRI or cloud credential is added to the
+operator by this change. See
 [Independent evidence](../../docs/kubernetes-fencing.md#independent-evidence-for-an-unreachable-incarnation).

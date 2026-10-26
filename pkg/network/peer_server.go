@@ -37,6 +37,7 @@ const (
 type PeerServer struct {
 	listener       *quic.EarlyListener
 	server         *Server
+	peerSigningKey ed25519.PrivateKey
 	members        map[quepaxa.NodeID]quepaxa.Member
 	adminToken     string
 	connections    chan struct{}
@@ -59,7 +60,10 @@ func StartPeerServer(ctx context.Context, addr string, server *Server, members [
 		if err != nil {
 			return nil, err
 		}
-		transport = &quic.Transport{Conn: conn}
+		transport = &quic.Transport{
+			Conn:              conn,
+			StatelessResetKey: peerStatelessResetKey(server.cluster, server.core.NodeID(), peerToken),
+		}
 		return transport.ListenEarly(tlsConfig, config)
 	})
 	if err != nil {
@@ -136,6 +140,13 @@ func startPeerServer(ctx context.Context, server *Server, members []quepaxa.Memb
 	peer := &PeerServer{
 		listener: listener, server: server, members: make(map[quepaxa.NodeID]quepaxa.Member, len(members)), adminToken: adminToken,
 		connections: make(chan struct{}, maxPeerConnections), streams: make(chan struct{}, maxPeerStreams), cancel: cancel,
+	}
+	if key, ok := certificate.PrivateKey.(ed25519.PrivateKey); ok {
+		peer.peerSigningKey = append(ed25519.PrivateKey(nil), key...)
+	} else {
+		_ = listener.Close()
+		cancel()
+		return nil, fmt.Errorf("peer identity signing key is unavailable")
 	}
 	for _, member := range members {
 		peer.members[member.ID] = member
@@ -309,6 +320,62 @@ func peerMember(config quepaxa.Cluster, id quepaxa.NodeID) (quepaxa.Member, bool
 	return quepaxa.Member{}, false
 }
 
+func peerOperationName(operation peerfb.Operation) string {
+	switch operation {
+	case peerfb.OperationRecord:
+		return "record"
+	case peerfb.OperationReservedPropose:
+		return "reserved_propose"
+	case peerfb.OperationLearned:
+		return "learned"
+	case peerfb.OperationSync:
+		return "sync"
+	case peerfb.OperationReadIndex:
+		return "read_index"
+	case peerfb.OperationStageValue:
+		return "stage_value"
+	case peerfb.OperationFetchValue:
+		return "fetch_value"
+	case peerfb.OperationEngineRemovalFreeze:
+		return "engine_removal_freeze"
+	case peerfb.OperationPrepareCheckpoint:
+		return "prepare_checkpoint"
+	case peerfb.OperationVerifyPrefix:
+		return "verify_prefix"
+	default:
+		return "other"
+	}
+}
+
+// observeRejectedPeerRequest exposes only bounded request-selection metadata
+// to tagged local tests. It never records peer, cluster, endpoint, token, or
+// error contents.
+func observeRejectedPeerRequest(request *peerfb.RequestT, selected quepaxa.Cluster, lookupErr error,
+	clusterMatch, configMatch bool, rejection string) {
+	if !localtesthooks.Enabled || request == nil {
+		return
+	}
+	slot, from := uint64(0), request.From
+	switch request.Operation {
+	case peerfb.OperationRecord:
+		if request.Record != nil {
+			slot = request.Record.Slot
+		}
+	case peerfb.OperationLearned:
+		if request.Decision != nil {
+			slot = request.Decision.Slot
+		}
+	case peerfb.OperationPrepareCheckpoint:
+		if seal, checkpoint, err := quepaxa.DecodeCheckpointSeal(request.Value); err == nil && checkpoint {
+			slot = uint64(seal.Index)
+		}
+	}
+	localtesthooks.Hit(fmt.Sprintf(
+		"network:peer-request-rejected:operation=%s:request_config=%d:selected_config=%d:slot=%d:from=%d:lookup_ok=%t:cluster_match=%t:config_match=%t:rejection=%s",
+		peerOperationName(request.Operation), request.ConfigId, selected.ConfigID, slot, from,
+		lookupErr == nil, clusterMatch, configMatch, rejection))
+}
+
 // peerCertificateKey returns the Ed25519 public key of the certificate the
 // client presented during the TLS handshake. A client without a client
 // certificate yields nil and can only authenticate as a non-voter.
@@ -333,7 +400,10 @@ func peerCertificateKey(conn *quic.Conn) ed25519.PublicKey {
 // the cluster admin token for the read-only sync path.
 func (s *PeerServer) handle(ctx context.Context, certificateKey ed25519.PublicKey, request *peerfb.RequestT) (*peerfb.ResponseT, error) {
 	config, err := s.configurationFor(request)
-	if err != nil || request.ClusterId != string(s.server.cluster) || request.ConfigId != uint64(config.ConfigID) {
+	clusterMatch := request.ClusterId == string(s.server.cluster)
+	configMatch := request.ConfigId == uint64(config.ConfigID)
+	if err != nil || !clusterMatch || !configMatch {
+		observeRejectedPeerRequest(request, config, err, clusterMatch, configMatch, "cluster_or_config")
 		return nil, fmt.Errorf("cluster identity mismatch")
 	}
 	historical, historicalOK := peerMember(config, quepaxa.NodeID(request.SenderId))
@@ -345,10 +415,21 @@ func (s *PeerServer) handle(ctx context.Context, certificateKey ed25519.PublicKe
 	voter := historicalOK && activeOK && certificateKey != nil &&
 		subtle.ConstantTimeCompare(certificateKey, historical.PublicKey[:]) == 1 &&
 		subtle.ConstantTimeCompare(certificateKey, active.PublicKey[:]) == 1
+	staleSync := request.Operation == peerfb.OperationSync && request.ConfigId != uint64(current.ConfigID)
 	// Non-voting clients may only pull already-certified decisions. They use
 	// the cluster admin token and never enter the fixed voter membership.
 	admin := s.adminToken != "" && subtle.ConstantTimeCompare([]byte(request.AdminToken), []byte(s.adminToken)) == 1
-	if !voter && !(admin && request.Operation == peerfb.OperationSync) {
+	// The admin token remains read-only: in addition to pulling certified
+	// decisions, it may request the exact engine-removal freeze or committed
+	// terminal and its durable prefix. The response is independently signed by
+	// this voter and never changes local consensus state.
+	// A stale Sync is useful only to a voter still present in both configurations.
+	if staleSync && !voter {
+		observeRejectedPeerRequest(request, config, nil, clusterMatch, configMatch, "cluster_or_config")
+		return nil, fmt.Errorf("cluster identity mismatch")
+	}
+	if !voter && !(admin && (request.Operation == peerfb.OperationSync || request.Operation == peerfb.OperationEngineRemovalFreeze)) {
+		observeRejectedPeerRequest(request, config, nil, clusterMatch, configMatch, "peer_authentication")
 		return nil, fmt.Errorf("peer authentication failed")
 	}
 	switch request.Operation {
@@ -385,9 +466,6 @@ func (s *PeerServer) handle(ctx context.Context, certificateKey ed25519.PublicKe
 		}
 		return &peerfb.ResponseT{Summary: summaryToWire(summary)}, nil
 	case peerfb.OperationLearned:
-		if !s.server.Ready() {
-			return nil, ErrNotReady
-		}
 		decision, err := decisionFromWire(request.Decision)
 		if err != nil {
 			return nil, err
@@ -397,6 +475,14 @@ func (s *PeerServer) handle(ctx context.Context, certificateKey ed25519.PublicKe
 				return nil, err
 			}
 		}
+		// Bind this request to the exact locally observed pending transition
+		// before any catch-up I/O. A later gate check alone could admit the same
+		// decision under a different transition that appeared while catch-up
+		// was blocked.
+		gapKey, capturedGap := s.server.core.PendingTerminalGapForLearn(decision)
+		if !s.server.PeerLearnReady() && !s.server.PeerLearnDecisionAllowed(decision) {
+			return nil, fmt.Errorf("%w: learned admission phase=before-catchup node=%s slot=%d config=%d pending=%t", ErrNotReady, s.server.core.NodeID(), decision.Slot, decision.ConfigID, capturedGap)
+		}
 		control, controlErr := quepaxa.DecodeReconfiguration(decision.Proposal.Value)
 		if control && localtesthooks.Enabled {
 			localtesthooks.Hit(fmt.Sprintf("network:learned-control:phase=received:node=%s:sender=%s:slot=%d", s.server.core.NodeID(), request.SenderId, decision.Slot))
@@ -404,32 +490,70 @@ func (s *PeerServer) handle(ctx context.Context, certificateKey ed25519.PublicKe
 		if controlErr != nil {
 			return nil, controlErr
 		} else if control && decision.Slot > 1 {
+			gapKey, knownGap := s.server.core.KnownTerminalGap(decision)
 			if localtesthooks.Enabled {
 				localtesthooks.Hit(fmt.Sprintf("network:learned-control:phase=catchup-start:node=%s:sender=%s:slot=%d", s.server.core.NodeID(), request.SenderId, decision.Slot))
 			}
 			if s.server.core.Tip() < decision.Slot-1 {
 				if s.server.transport == nil {
+					originalErr := fmt.Errorf("reconfiguration control prefix is unavailable")
 					if localtesthooks.Enabled {
-						localtesthooks.Hit(fmt.Sprintf("network:learned-control:phase=catchup-failed:node=%s:sender=%s:slot=%d:error=%q", s.server.core.NodeID(), request.SenderId, decision.Slot, "transport unavailable"))
+						localtesthooks.Hit(fmt.Sprintf("network:learned-control:phase=catchup-failed:node=%s:sender=%s:slot=%d:error=%q", s.server.core.NodeID(), request.SenderId, decision.Slot, originalErr.Error()))
 					}
-					return nil, fmt.Errorf("reconfiguration control prefix is unavailable")
-				}
-				if err := s.server.catchUpFrom(ctx, quepaxa.NodeID(request.SenderId), decision.Slot-1, true); err != nil {
+					complete := false
+					if knownGap {
+						_, complete = s.server.continueArchiveCatchUp(ctx, gapKey, decision.Slot-1)
+					}
+					if !complete {
+						if knownGap {
+							s.server.hintArchiveCatchUp(gapKey)
+						}
+						return nil, originalErr
+					}
+				} else if err := s.server.catchUpFrom(ctx, quepaxa.NodeID(request.SenderId), decision.Slot-1, true); err != nil {
 					if localtesthooks.Enabled {
 						localtesthooks.Hit(fmt.Sprintf("network:learned-control:phase=catchup-failed:node=%s:sender=%s:slot=%d:error=%q", s.server.core.NodeID(), request.SenderId, decision.Slot, err.Error()))
 					}
-					return nil, err
+					complete := false
+					if knownGap {
+						_, complete = s.server.continueArchiveCatchUp(ctx, gapKey, decision.Slot-1)
+					}
+					if !complete {
+						if knownGap {
+							s.server.hintArchiveCatchUp(gapKey)
+						}
+						return nil, err
+					}
 				}
 			}
 			if err := s.server.core.WaitTip(ctx, decision.Slot-1); err != nil {
 				if localtesthooks.Enabled {
 					localtesthooks.Hit(fmt.Sprintf("network:learned-control:phase=catchup-failed:node=%s:sender=%s:slot=%d:error=%q", s.server.core.NodeID(), request.SenderId, decision.Slot, err.Error()))
 				}
-				return nil, err
+				complete := false
+				if knownGap {
+					_, complete = s.server.continueArchiveCatchUp(ctx, gapKey, decision.Slot-1)
+				}
+				if !complete {
+					if knownGap {
+						s.server.hintArchiveCatchUp(gapKey)
+					}
+					return nil, err
+				}
 			}
 			if localtesthooks.Enabled {
 				localtesthooks.Hit(fmt.Sprintf("network:learned-control:phase=catchup-complete:node=%s:sender=%s:slot=%d", s.server.core.NodeID(), request.SenderId, decision.Slot))
 			}
+		}
+		// Catch-up may block while the local reconfiguration, lifecycle, or
+		// fencing state changes. Revalidate the same authenticated decision
+		// immediately before normal certificate validation and durable accept.
+		if capturedGap && !s.server.core.PendingTerminalGap(gapKey) &&
+			!s.server.core.AllowsInstalledTerminalLearn(decision) {
+			return nil, fmt.Errorf("%w: learned admission phase=round-recheck node=%s slot=%d config=%d", ErrNotReady, s.server.core.NodeID(), decision.Slot, decision.ConfigID)
+		}
+		if !s.server.PeerLearnReady() && !s.server.PeerLearnDecisionAllowed(decision) {
+			return nil, fmt.Errorf("%w: learned admission phase=after-catchup node=%s slot=%d config=%d pending=%t", ErrNotReady, s.server.core.NodeID(), decision.Slot, decision.ConfigID, capturedGap)
 		}
 		if localtesthooks.Enabled {
 			localtesthooks.Hit(fmt.Sprintf("network:learned:phase=accept-start:node=%s:sender=%s:slot=%d", s.server.core.NodeID(), request.SenderId, decision.Slot))
@@ -548,6 +672,46 @@ func (s *PeerServer) handle(ctx context.Context, certificateKey ed25519.PublicKe
 			return nil, fmt.Errorf("durable prefix mismatch")
 		}
 		return &peerfb.ResponseT{ClusterId: string(s.server.cluster), ProposerId: string(s.server.core.NodeID()), ConfigId: request.ConfigId, Tip: request.From}, nil
+	case peerfb.OperationEngineRemovalFreeze:
+		if request.From == 0 || len(request.Value) == 0 || len(request.Value) > 128<<10 || len(s.peerSigningKey) != ed25519.PrivateKeySize {
+			return nil, fmt.Errorf("invalid engine removal freeze request")
+		}
+		var proofRequest engineRemovalProofRequest
+		if err := decodeStrictPeerJSON(request.Value, &proofRequest); err != nil || proofRequest.Version != engineRemovalProofRequestVersion ||
+			proofRequest.Operation.ExpectedConfigID != uint(request.ConfigId) {
+			return nil, fmt.Errorf("engine removal freeze request binding is invalid")
+		}
+		operation := proofRequest.Operation
+		if proofRequest.Kind == engineRemovalProofFreeze {
+			if operation.Freeze != quepaxa.Slot(request.From) {
+				return nil, fmt.Errorf("engine removal freeze slot differs from request")
+			}
+			snapshot, err := s.server.core.EngineRemovalFreezeSnapshot(ctx, operation)
+			if err != nil {
+				return nil, err
+			}
+			attestation := EngineRemovalFreezeAttestationMessage(string(s.server.cluster), s.server.core.NodeID(), snapshot.ConfigID, operation, snapshot.Decision.Hash, snapshot.PrefixHash)
+			payload := make([]byte, 32+ed25519.SignatureSize)
+			copy(payload[:32], snapshot.PrefixHash[:])
+			copy(payload[32:], ed25519.Sign(s.peerSigningKey, attestation))
+			return &peerfb.ResponseT{ClusterId: string(s.server.cluster), ProposerId: string(s.server.core.NodeID()), ConfigId: uint64(snapshot.ConfigID), Tip: uint64(operation.Freeze), Decided: decidedToWire(snapshot.Decision), Value: payload}, nil
+		}
+		if proofRequest.Kind == engineRemovalProofTerminal {
+			terminalSlot := operation.Freeze + 16
+			if terminalSlot < operation.Freeze || terminalSlot != quepaxa.Slot(request.From) {
+				return nil, fmt.Errorf("engine removal terminal slot differs from request")
+			}
+			snapshot, err := s.server.core.EngineRemovalTerminalSnapshot(ctx, operation)
+			if err != nil {
+				return nil, err
+			}
+			attestation := EngineRemovalTerminalAttestationMessage(string(s.server.cluster), s.server.core.NodeID(), snapshot.ConfigID, operation, terminalSlot, snapshot.Decision.Hash, snapshot.PrefixHash)
+			payload := make([]byte, 32+ed25519.SignatureSize)
+			copy(payload[:32], snapshot.PrefixHash[:])
+			copy(payload[32:], ed25519.Sign(s.peerSigningKey, attestation))
+			return &peerfb.ResponseT{ClusterId: string(s.server.cluster), ProposerId: string(s.server.core.NodeID()), ConfigId: uint64(snapshot.ConfigID), Tip: uint64(terminalSlot), Decided: decidedToWire(snapshot.Decision), Value: payload}, nil
+		}
+		return nil, fmt.Errorf("unknown engine removal proof kind")
 	case peerfb.OperationPrepareCheckpoint:
 		seal, checkpoint, err := quepaxa.DecodeCheckpointSeal(request.Value)
 		if err != nil || !checkpoint {
@@ -581,6 +745,13 @@ func (s *PeerServer) configurationFor(request *peerfb.RequestT) (quepaxa.Cluster
 			return current, nil
 		}
 		if request.From != 0 {
+			historical := s.server.core.ClusterForSlot(quepaxa.Slot(request.From))
+			if request.ConfigId == uint64(historical.ConfigID) {
+				return historical, nil
+			}
+		}
+	case peerfb.OperationEngineRemovalFreeze:
+		if request.From != 0 {
 			return s.server.core.ClusterForSlot(quepaxa.Slot(request.From)), nil
 		}
 	case peerfb.OperationPrepareCheckpoint:
@@ -609,6 +780,20 @@ func peerPrivateKey(clusterID types.ClusterID, nodeID quepaxa.NodeID, token stri
 	mac.Write([]byte{0})
 	mac.Write([]byte(nodeID))
 	return ed25519.NewKeyFromSeed(mac.Sum(nil))
+}
+
+func peerStatelessResetKey(clusterID types.ClusterID, nodeID quepaxa.NodeID, token string) *quic.StatelessResetKey {
+	if token == "" {
+		return nil
+	}
+	mac := hmac.New(sha256.New, []byte(token))
+	mac.Write([]byte("rhiza-peer-stateless-reset\x00"))
+	mac.Write([]byte(clusterID))
+	mac.Write([]byte{0})
+	mac.Write([]byte(nodeID))
+	var key quic.StatelessResetKey
+	copy(key[:], mac.Sum(nil))
+	return &key
 }
 
 func peerCertificate(clusterID types.ClusterID, nodeID quepaxa.NodeID, token string) (tls.Certificate, error) {

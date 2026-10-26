@@ -1,0 +1,500 @@
+//go:build localhooks
+
+package logicalauthority_test
+
+import (
+	"context"
+	"crypto/rand"
+	"encoding/base64"
+	"encoding/json"
+	"encoding/pem"
+	"errors"
+	"fmt"
+	"io"
+	"net"
+	"net/http"
+	"net/http/httptest"
+	"os"
+	"path"
+	"path/filepath"
+	"strings"
+	"testing"
+	"time"
+
+	"cloud.google.com/go/storage"
+	"github.com/mrchypark/rhiza/internal/objstore"
+	"github.com/mrchypark/rhiza/internal/types"
+	"github.com/mrchypark/rhiza/pkg/checkpoint"
+	"github.com/mrchypark/rhiza/pkg/fencing"
+	"github.com/mrchypark/rhiza/pkg/network"
+	"github.com/mrchypark/rhiza/pkg/node"
+	"github.com/mrchypark/rhiza/pkg/operator"
+	"github.com/mrchypark/rhiza/pkg/quepaxa"
+	"github.com/mrchypark/rhiza/pkg/recovery"
+	"google.golang.org/api/iterator"
+	"google.golang.org/api/option"
+)
+
+func TestFlociGCSLogicalAuthorityThreeNodeBeforeAckAndSamePodRestart(t *testing.T) {
+	requireFlociEnvironment(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 6*time.Minute)
+	defer cancel()
+
+	clusterID := fmt.Sprintf("logical-%d", time.Now().UnixNano())
+	var randomSuffix [8]byte
+	if _, err := rand.Read(randomSuffix[:]); err != nil {
+		t.Fatal("generate task-owned resource suffix")
+	}
+	suffix := fmt.Sprintf("%x", randomSuffix[:])
+	bucketName := "rhiza-la-" + suffix
+	credentials := localFlociCredentials(t)
+	setupClient, err := storage.NewClient(ctx, option.WithoutAuthentication())
+	if err != nil {
+		t.Fatalf("create Floci GCS setup client: %v", err)
+	}
+	if err := setupClient.Bucket(bucketName).Create(ctx, "floci-local", nil); err != nil {
+		_ = setupClient.Close()
+		t.Fatalf("create task-owned bucket: %v", err)
+	}
+	t.Cleanup(func() {
+		cleanupCtx, cleanupCancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cleanupCancel()
+		objects := setupClient.Bucket(bucketName).Objects(cleanupCtx, nil)
+		for {
+			attrs, err := objects.Next()
+			if err == iterator.Done {
+				break
+			}
+			if err != nil {
+				t.Errorf("list task-owned bucket objects during cleanup: %v", err)
+				break
+			}
+			if err := setupClient.Bucket(bucketName).Object(attrs.Name).Generation(attrs.Generation).Delete(cleanupCtx); err != nil {
+				t.Errorf("delete task-owned object %q: %v", attrs.Name, err)
+			}
+		}
+		if err := setupClient.Bucket(bucketName).Delete(cleanupCtx); err != nil {
+			t.Errorf("delete task-owned bucket: %v", err)
+		}
+		if err := setupClient.Close(); err != nil {
+			t.Errorf("close Floci setup client: %v", err)
+		}
+	})
+
+	authorityBucket, err := objstore.NewBucket(objstore.Config{Provider: objstore.ProviderGCS, Bucket: bucketName, Prefix: "authority", ServiceAccount: credentials})
+	if err != nil {
+		t.Fatalf("create canonical GCS authority bucket: %v", err)
+	}
+	t.Cleanup(func() { _ = authorityBucket.Close() })
+	state, err := operator.NewAuthorityStateStore(authorityBucket, "rhiza-logical-authority")
+	if err != nil {
+		t.Fatalf("create GCS-backed authority state: %v", err)
+	}
+	sourceClient, err := storage.NewClient(ctx, option.WithoutAuthentication())
+	if err != nil {
+		t.Fatalf("create source mutation GCS client: %v", err)
+	}
+	t.Cleanup(func() { _ = sourceClient.Close() })
+
+	// Three live voters form quorum in this five-member bootstrap. voter-d is
+	// intentionally left pristine until it adopts the verified init stage.
+	ids := []string{"voter-a", "voter-b", "voter-c", "voter-d", "voter-e"}
+	peerTokens := map[string]string{}
+	members := make([]quepaxa.Member, 0, len(ids))
+	peerAddrs := make(map[string]string, len(ids))
+	for _, id := range ids {
+		peerToken := "peer-" + id + "-" + suffix
+		peerTokens[id] = peerToken
+		packet, err := net.ListenPacket("udp", "127.0.0.1:0")
+		if err != nil {
+			t.Fatalf("reserve peer address for %s: %v", id, err)
+		}
+		peerAddrs[id] = packet.LocalAddr().String()
+		if err := packet.Close(); err != nil {
+			t.Fatalf("release reserved peer address for %s: %v", id, err)
+		}
+		var publicKey quepaxa.PublicKey
+		copy(publicKey[:], network.PeerPublicKey(types.ClusterID(clusterID), quepaxa.NodeID(id), peerToken))
+		members = append(members, quepaxa.Member{ID: quepaxa.NodeID(id), URL: "http://127.0.0.1:1", PeerURL: "quic://" + peerAddrs[id], PublicKey: publicKey})
+	}
+	membersJSON, err := json.Marshal(members)
+	if err != nil {
+		t.Fatal("encode initial voter membership")
+	}
+	peerTokensJSON, err := json.Marshal(peerTokens)
+	if err != nil {
+		t.Fatal("encode initial voter tokens")
+	}
+	configMap := map[string]any{"data": map[string]string{
+		"RHIZA_CLUSTER_ID": clusterID, "RHIZA_CLUSTER_MEMBERS": string(membersJSON),
+		"RHIZA_OBJSTORE_PROVIDER": "gcs", "RHIZA_OBJSTORE_BUCKET": bucketName, "RHIZA_OBJSTORE_PREFIX": "archive/" + clusterID,
+	}}
+	secret := map[string]any{"data": map[string]string{"RHIZA_PEER_TOKENS": base64.StdEncoding.EncodeToString(peerTokensJSON)}}
+
+	const statefulSetUID, statefulSetName = "logical-authority-sts-uid", "rhiza"
+	podUIDs := map[string]string{}
+	tokens := map[string]string{}
+	pods := map[string]map[string]any{}
+	for _, id := range ids {
+		podUIDs[id] = "uid-" + id + "-" + suffix
+		tokens[id] = "pod-token-" + id + "-" + suffix
+		container := map[string]any{"name": "rhiza", "image": "test", "securityContext": map[string]any{"allowPrivilegeEscalation": false},
+			"envFrom": []any{map[string]any{"configMapRef": map[string]any{"name": "rhiza-config"}}, map[string]any{"secretRef": map[string]any{"name": "rhiza-peer-tokens"}}}}
+		podSpec := map[string]any{"serviceAccountName": "default", "containers": []any{container}}
+		pods[id] = map[string]any{"metadata": map[string]any{"name": id, "uid": podUIDs[id],
+			"annotations":     map[string]string{"rhiza.mrchypark.dev/fencing-protocol": "1"},
+			"ownerReferences": []any{map[string]any{"apiVersion": "apps/v1", "kind": "StatefulSet", "name": statefulSetName, "uid": statefulSetUID, "controller": true}}}, "spec": podSpec}
+	}
+	template := map[string]any{"metadata": map[string]any{"annotations": map[string]string{"rhiza.mrchypark.dev/fencing-protocol": "1"}},
+		"spec": map[string]any{"containers": []any{map[string]any{"name": "rhiza", "image": "test", "securityContext": map[string]any{"allowPrivilegeEscalation": false},
+			"envFrom": []any{map[string]any{"configMapRef": map[string]any{"name": "rhiza-config"}}, map[string]any{"secretRef": map[string]any{"name": "rhiza-peer-tokens"}}}}}}}
+	statefulSet := map[string]any{"metadata": map[string]string{"name": statefulSetName, "uid": statefulSetUID}, "spec": map[string]any{"template": template}}
+
+	api := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch {
+		case r.URL.Path == "/apis/authentication.k8s.io/v1/tokenreviews":
+			var request struct {
+				Spec struct {
+					Token string `json:"token"`
+				} `json:"spec"`
+			}
+			if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
+				http.Error(w, "invalid token review", http.StatusBadRequest)
+				return
+			}
+			podName := ""
+			for id, token := range tokens {
+				if token == request.Spec.Token {
+					podName = id
+					break
+				}
+			}
+			if podName == "" {
+				_ = json.NewEncoder(w).Encode(map[string]any{"status": map[string]any{"authenticated": false}})
+				return
+			}
+			_ = json.NewEncoder(w).Encode(map[string]any{"status": map[string]any{"authenticated": true, "audiences": []string{"rhiza-fencer"}, "user": map[string]any{
+				"username": "system:serviceaccount:default:default", "extra": map[string]any{"authentication.kubernetes.io/pod-uid": []string{podUIDs[podName]}, "authentication.kubernetes.io/pod-name": []string{podName}}}}})
+		case strings.HasPrefix(r.URL.Path, "/api/v1/namespaces/default/pods/"):
+			name := strings.TrimPrefix(r.URL.Path, "/api/v1/namespaces/default/pods/")
+			if pod, ok := pods[name]; ok {
+				_ = json.NewEncoder(w).Encode(pod)
+				return
+			}
+			http.NotFound(w, r)
+		case r.URL.Path == "/api/v1/namespaces/default/configmaps/rhiza-config":
+			_ = json.NewEncoder(w).Encode(configMap)
+		case r.URL.Path == "/api/v1/namespaces/default/secrets/rhiza-peer-tokens":
+			_ = json.NewEncoder(w).Encode(secret)
+		case r.URL.Path == "/apis/apps/v1/namespaces/default/statefulsets/rhiza":
+			_ = json.NewEncoder(w).Encode(statefulSet)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	t.Cleanup(api.Close)
+	kubeTokenPath := filepath.Join(t.TempDir(), "operator-token")
+	if err := os.WriteFile(kubeTokenPath, []byte("operator-test-token"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	executor := &operator.FencingExecutor{Kube: &operator.Kubernetes{BaseURL: api.URL, Namespace: "default", TokenFile: kubeTokenPath, Client: api.Client()},
+		AuthorityState: state, ArchiveBucket: authorityBucket, SourceMutationStorage: sourceClient,
+		RequireMutationJournal: true, AuthorityProfile: fencing.LogicalWriterProfileV1}
+	authority := httptest.NewTLSServer(executor.Handler())
+	t.Cleanup(authority.Close)
+	caPath := filepath.Join(t.TempDir(), "authority-ca.pem")
+	if err := os.WriteFile(caPath, pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: authority.Certificate().Raw}), 0600); err != nil {
+		t.Fatal(err)
+	}
+
+	nodes := make(map[string]*node.Node, len(ids))
+	configs := make(map[string]*types.ExecutionConfig, len(ids))
+	closed := make(map[string]bool, len(ids))
+	for _, id := range ids {
+		tokenPath := filepath.Join(t.TempDir(), "pod-token")
+		if err := os.WriteFile(tokenPath, []byte(tokens[id]), 0600); err != nil {
+			t.Fatal(err)
+		}
+		dataDir := filepath.Join(t.TempDir(), "data")
+		cfg := &types.ExecutionConfig{DataDir: dataDir, ClusterID: types.ClusterID(clusterID), NodeID: types.NodeID(id),
+			BindAddr: "127.0.0.1:0", PeerAddr: peerAddrs[id], PeerToken: peerTokens[id], AdminToken: "admin-" + suffix,
+			Members: members, EnableReconfiguration: true, AuthorityProfile: fencing.LogicalWriterProfileV1,
+			AuthorityURL: authority.URL + "/v1/supervisor", AuthorityCAFile: caPath, AuthorityTokenFile: tokenPath,
+			ObjStoreProvider: "gcs", ObjStoreBucket: bucketName, ObjStorePrefix: "archive/" + clusterID,
+			ObjStoreDurability:   types.ObjectStoreDurabilityBeforeAck,
+			ObjStoreSyncInterval: time.Hour, CheckpointInterval: time.Second}
+		configs[id] = cfg
+		if id == ids[3] || id == ids[4] {
+			continue
+		}
+		t.Setenv("POD_UID", podUIDs[id])
+		t.Setenv("RHIZA_POD_NAME", id)
+		instance := node.New(cfg)
+		if err := instance.Open(ctx); err != nil {
+			t.Fatalf("Node.Open(%s): %v", id, err)
+		}
+		nodes[id] = instance
+		t.Cleanup(func() {
+			if !closed[id] {
+				if err := instance.Shutdown(); err != nil {
+					t.Errorf("shutdown %s: %v", id, err)
+				}
+				closed[id] = true
+			}
+		})
+	}
+	for _, id := range ids[:3] {
+		for !nodes[id].Ready() {
+			select {
+			case <-ctx.Done():
+				t.Fatalf("node %s did not become ready: %v", id, ctx.Err())
+			case <-time.After(25 * time.Millisecond):
+			}
+		}
+	}
+	apiA, err := nodes[ids[0]].API()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := apiA.Execute(ctx, network.ExecuteRequest{RequestID: "floci-create-" + suffix, SQL: "CREATE TABLE lifecycle (id INTEGER PRIMARY KEY, value TEXT)"}); err != nil {
+		t.Fatalf("before-ack create table: %v", err)
+	}
+	if _, err := apiA.Execute(ctx, network.ExecuteRequest{RequestID: "floci-insert-" + suffix, SQL: "INSERT INTO lifecycle(value) VALUES ('durable')"}); err != nil {
+		t.Fatalf("before-ack insert: %v", err)
+	}
+	if _, err := apiA.Execute(ctx, network.ExecuteRequest{RequestID: "floci-create-compaction-" + suffix, SQL: "CREATE TABLE mutation_history (id INTEGER PRIMARY KEY, value TEXT)"}); err != nil {
+		t.Fatalf("create bounded mutation-history table: %v", err)
+	}
+	for i := range 70 {
+		requestID := fmt.Sprintf("floci-compaction-%s-%02d", suffix, i)
+		sql := fmt.Sprintf("INSERT INTO mutation_history(id, value) VALUES (%d, 'entry-%02d')", i+1, i)
+		if _, err := apiA.Execute(ctx, network.ExecuteRequest{RequestID: requestID, SQL: sql}); err != nil {
+			t.Fatalf("before-ack mutation %d/70: %v", i+1, err)
+		}
+	}
+	apiB, err := nodes[ids[1]].API()
+	if err != nil {
+		t.Fatal(err)
+	}
+	query, err := apiB.Query(ctx, network.QueryRequest{SQL: "SELECT value FROM lifecycle WHERE id = 1", Consistency: "linearizable"})
+	if err != nil || len(query.Rows) != 1 || len(query.Rows[0]) != 1 || query.Rows[0][0] != "durable" {
+		t.Fatalf("cross-node linearizable read: rows=%v err=%v", query.Rows, err)
+	}
+
+	beforeRestartRunID := readLogicalRunID(t, configs[ids[1]].DataDir)
+	if err := nodes[ids[1]].Shutdown(); err != nil {
+		t.Fatalf("stop same-Pod node: %v", err)
+	}
+	closed[ids[1]] = true
+	t.Setenv("POD_UID", podUIDs[ids[1]])
+	t.Setenv("RHIZA_POD_NAME", ids[1])
+	restarted := node.New(configs[ids[1]])
+	if err := restarted.Open(ctx); err != nil {
+		t.Fatalf("same-Pod exact-WAL Node.Open: %v", err)
+	}
+	if got := readLogicalRunID(t, configs[ids[1]].DataDir); got != beforeRestartRunID {
+		t.Fatalf("same-Pod continuation changed canonical RunID: before=%q after=%q", beforeRestartRunID, got)
+	}
+	nodes[ids[1]] = restarted
+	closed[ids[1]] = false
+	t.Cleanup(func() {
+		if !closed[ids[1]] {
+			if err := restarted.Shutdown(); err != nil {
+				t.Errorf("shutdown restarted %s: %v", ids[1], err)
+			}
+			closed[ids[1]] = true
+		}
+	})
+	for !restarted.Ready() {
+		select {
+		case <-ctx.Done():
+			t.Fatalf("same-Pod reopened node did not become ready: %v", ctx.Err())
+		case <-time.After(25 * time.Millisecond):
+		}
+	}
+	restartedAPI, err := restarted.API()
+	if err != nil {
+		t.Fatal(err)
+	}
+	afterRestart, err := restartedAPI.Query(ctx, network.QueryRequest{SQL: "SELECT value FROM lifecycle WHERE id = 1", Consistency: "linearizable"})
+	if err != nil || len(afterRestart.Rows) != 1 || len(afterRestart.Rows[0]) != 1 || afterRestart.Rows[0][0] != "durable" {
+		t.Fatalf("same-Pod continuation lost durable row: rows=%v err=%v", afterRestart.Rows, err)
+	}
+	history, err := restartedAPI.Query(ctx, network.QueryRequest{SQL: "SELECT COUNT(*) FROM mutation_history", Consistency: "linearizable"})
+	if err != nil || len(history.Rows) != 1 || len(history.Rows[0]) != 1 || history.Rows[0][0] != int64(70) && history.Rows[0][0] != float64(70) {
+		t.Fatalf("same-Pod continuation lost mutations across the compaction threshold: rows=%v err=%v", history.Rows, err)
+	}
+	if _, err := restartedAPI.Execute(ctx, network.ExecuteRequest{RequestID: "floci-restart-insert-" + suffix,
+		SQL: "INSERT INTO lifecycle(value) VALUES ('after-restart')"}); err != nil {
+		t.Fatalf("same-Pod continuation could not reuse the canonical source producer: %v", err)
+	}
+	continued, err := restartedAPI.Query(ctx, network.QueryRequest{SQL: "SELECT value FROM lifecycle ORDER BY id", Consistency: "linearizable"})
+	if err != nil || len(continued.Rows) != 2 || continued.Rows[1][0] != "after-restart" {
+		t.Fatalf("same-Pod continuation readback: rows=%v err=%v", continued.Rows, err)
+	}
+
+	stageID := ids[3]
+	stageConfig := configs[stageID]
+	stageConfig.HAInitRestoreDir = filepath.Join(t.TempDir(), "ha-init-stage")
+	archiveBucket, err := objstore.NewBucket(objstore.Config{Provider: objstore.ProviderGCS, Bucket: bucketName})
+	if err != nil {
+		t.Fatalf("open isolated Floci bucket for init staging: %v", err)
+	}
+	t.Cleanup(func() { _ = archiveBucket.Close() })
+	var stageErr error
+	for {
+		stageErr = node.PrepareHAInitRestore(ctx, stageConfig, archiveBucket)
+		if stageErr == nil {
+			break
+		}
+		select {
+		case <-ctx.Done():
+			t.Fatalf("prepare stage from the certified Floci checkpoint: last error: %v; context: %v", stageErr, ctx.Err())
+		case <-time.After(time.Second):
+		}
+	}
+	manager := checkpoint.NewManager(archiveBucket, path.Join(stageConfig.ObjStorePrefix, string(stageConfig.ClusterID)), "", recovery.ArchiveConfigID)
+	if err := manager.Load(ctx); err != nil {
+		t.Fatalf("load Floci checkpoint root after staging: %v", err)
+	}
+	root := manager.Latest()
+	if root == nil {
+		t.Fatal("stage preparation succeeded without a certified checkpoint root")
+	}
+	blocks := captureFlociCheckpointBlocks(t, ctx, setupClient, bucketName,
+		path.Join(stageConfig.ObjStorePrefix, string(stageConfig.ClusterID)), root)
+	if err := removeFlociCheckpointBlocks(ctx, setupClient, bucketName, blocks); err != nil {
+		t.Fatalf("remove remote checkpoint payloads to force staged-file adoption: %v", err)
+	}
+	t.Setenv("POD_UID", podUIDs[stageID])
+	t.Setenv("RHIZA_POD_NAME", stageID)
+	stagedNode := node.New(stageConfig)
+	if err := stagedNode.Open(ctx); err != nil {
+		_ = restoreFlociCheckpointBlocks(ctx, setupClient, bucketName, blocks)
+		t.Fatalf("first-use logical Node.Open from staged checkpoint bytes: %v", err)
+	}
+	if err := restoreFlociCheckpointBlocks(ctx, setupClient, bucketName, blocks); err != nil {
+		_ = stagedNode.Shutdown()
+		t.Fatalf("restore checkpoint payloads after adoption oracle: %v", err)
+	}
+	for !stagedNode.Ready() {
+		select {
+		case <-ctx.Done():
+			_ = stagedNode.Shutdown()
+			t.Fatalf("fresh logical startup did not become Ready from staged files: %v", ctx.Err())
+		case <-time.After(25 * time.Millisecond):
+		}
+	}
+	stagedAPI, err := stagedNode.API()
+	if err != nil {
+		_ = stagedNode.Shutdown()
+		t.Fatal(err)
+	}
+	stagedRead, err := stagedAPI.Query(ctx, network.QueryRequest{SQL: "SELECT value FROM lifecycle WHERE id = 1", Consistency: "linearizable"})
+	if err != nil || len(stagedRead.Rows) != 1 || stagedRead.Rows[0][0] != "durable" {
+		_ = stagedNode.Shutdown()
+		t.Fatalf("staged logical startup lost checkpointed data: rows=%v err=%v", stagedRead.Rows, err)
+	}
+	closed[stageID] = false
+	nodes[stageID] = stagedNode
+	t.Cleanup(func() {
+		if !closed[stageID] {
+			if err := stagedNode.Shutdown(); err != nil {
+				t.Errorf("shutdown staged startup %s: %v", stageID, err)
+			}
+			closed[stageID] = true
+		}
+	})
+}
+
+func readLogicalRunID(t *testing.T, dataDir string) string {
+	t.Helper()
+	data, err := os.ReadFile(filepath.Join(dataDir, "logical-run.json"))
+	if err != nil {
+		t.Fatalf("read persisted logical Run state: %v", err)
+	}
+	var state struct {
+		RunID string `json:"runID"`
+	}
+	if err := json.Unmarshal(data, &state); err != nil || state.RunID == "" {
+		t.Fatalf("decode persisted logical Run state: runID=%q err=%v", state.RunID, err)
+	}
+	return state.RunID
+}
+
+type flociCheckpointBlock struct {
+	key        string
+	generation int64
+	data       []byte
+}
+
+func captureFlociCheckpointBlocks(t *testing.T, ctx context.Context, client *storage.Client, bucketName, prefix string, root *checkpoint.Checkpoint) []flociCheckpointBlock {
+	t.Helper()
+	seen := make(map[string]bool)
+	var blocks []flociCheckpointBlock
+	for _, file := range root.Files {
+		for _, block := range file.Blocks {
+			name := block.Hash + ".block"
+			if block.Generation != 0 {
+				name = fmt.Sprintf("%s_%020d.block", block.Hash, block.Generation)
+			}
+			key := path.Join(prefix, "checkpoint", "blocks", name)
+			if seen[key] {
+				continue
+			}
+			seen[key] = true
+			object := client.Bucket(bucketName).Object(key)
+			attrs, err := object.Attrs(ctx)
+			if err != nil {
+				t.Fatalf("read checkpoint block attributes %q: %v", key, err)
+			}
+			reader, err := object.Generation(attrs.Generation).NewReader(ctx)
+			if err != nil {
+				t.Fatalf("read checkpoint block %q: %v", key, err)
+			}
+			data, readErr := io.ReadAll(reader)
+			closeErr := reader.Close()
+			if readErr != nil || closeErr != nil {
+				t.Fatalf("read checkpoint block %q: %v", key, errors.Join(readErr, closeErr))
+			}
+			blocks = append(blocks, flociCheckpointBlock{key: key, generation: attrs.Generation, data: data})
+		}
+	}
+	if len(blocks) == 0 {
+		t.Fatal("certified staged checkpoint has no payload blocks")
+	}
+	return blocks
+}
+
+func removeFlociCheckpointBlocks(ctx context.Context, client *storage.Client, bucketName string, blocks []flociCheckpointBlock) error {
+	for _, block := range blocks {
+		if err := client.Bucket(bucketName).Object(block.key).Generation(block.generation).Delete(ctx); err != nil {
+			return fmt.Errorf("delete checkpoint block %q: %w", block.key, err)
+		}
+	}
+	return nil
+}
+
+func restoreFlociCheckpointBlocks(ctx context.Context, client *storage.Client, bucketName string, blocks []flociCheckpointBlock) error {
+	for _, block := range blocks {
+		writer := client.Bucket(bucketName).Object(block.key).NewWriter(ctx)
+		if _, err := writer.Write(block.data); err != nil {
+			_ = writer.Close()
+			return fmt.Errorf("restore checkpoint block %q: %w", block.key, err)
+		}
+		if err := writer.Close(); err != nil {
+			return fmt.Errorf("restore checkpoint block %q: %w", block.key, err)
+		}
+	}
+	return nil
+}
+
+func requireFlociEnvironment(t *testing.T) {
+	t.Helper()
+	if os.Getenv("CI") != "true" || os.Getenv("RHIZA_LOGICAL_AUTHORITY_FLOCI") != "1" ||
+		os.Getenv("STORAGE_EMULATOR_HOST") != flociGCSEndpoint || os.Getenv("GOOGLE_CLOUD_PROJECT") != "floci-local" ||
+		os.Getenv("GOOGLE_APPLICATION_CREDENTIALS") != "" || os.Getenv("RHIZA_LOCALHOOKS_ALLOW_FLOCI_GCS") != "1" {
+		t.Fatal("requires explicit pinned Floci-GCS localhooks CI environment; refusing SDK construction")
+	}
+}

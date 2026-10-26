@@ -1,0 +1,202 @@
+# Replacement NoPVC workload for logical-writer-v1. This consumes the existing
+# verified HA restore-init flow; it does not provide first-genesis authority.
+# Replace the image digest and provision rhiza-config (no credentials),
+# rhiza-object-store, rhiza-peer-credentials, and rhiza-fencer-ca for the target
+# namespace. The recovery controller creates the per-recovery public membership
+# ConfigMap and injects it into both main and restore-init.
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: rhiza-voter-reader
+  namespace: rhiza
+  annotations:
+    iam.gke.io/gcp-service-account: REPLACE_WITH_READ_ONLY_GSA_EMAIL
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: rhiza-headless
+  namespace: rhiza
+spec:
+  clusterIP: None
+  publishNotReadyAddresses: true
+  selector:
+    app.kubernetes.io/name: rhiza
+  ports:
+    - name: peer-quic
+      port: 9090
+      targetPort: peer-quic
+      protocol: UDP
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: rhiza
+  namespace: rhiza
+  labels:
+    app.kubernetes.io/name: rhiza
+spec:
+  serviceName: rhiza-headless
+  replicas: 3
+  podManagementPolicy: Parallel
+  updateStrategy:
+    type: OnDelete
+    rollingUpdate: null
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: rhiza
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: rhiza
+    spec:
+      serviceAccountName: rhiza-voter-reader
+      automountServiceAccountToken: false
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+        runAsGroup: 65532
+        fsGroup: 65532
+        seccompProfile:
+          type: RuntimeDefault
+      initContainers:
+        - name: restore-init
+          image: ghcr.io/REPLACE_WITH_ORG/rhiza@sha256:REPLACE_WITH_64_HEX_DIGEST
+          imagePullPolicy: IfNotPresent
+          command: [/usr/local/bin/rhiza]
+          args: [restore-init]
+          envFrom:
+            - configMapRef:
+                name: rhiza-config
+            - configMapRef:
+                name: rhiza-object-store
+          env:
+            - name: RHIZA_HA_INIT_RESTORE_DIR
+              value: /ha-restore-staging/stage
+          securityContext:
+            runAsNonRoot: true
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: [ALL]
+          volumeMounts:
+            - name: temporary
+              mountPath: /tmp
+            - name: restore-staging
+              mountPath: /ha-restore-staging
+          resources:
+            requests:
+              cpu: 100m
+              memory: 128Mi
+            limits:
+              memory: 1Gi
+      containers:
+        - name: rhiza
+          image: ghcr.io/REPLACE_WITH_ORG/rhiza@sha256:REPLACE_WITH_64_HEX_DIGEST
+          imagePullPolicy: IfNotPresent
+          command: [/usr/local/bin/rhiza]
+          ports:
+            - name: http
+              containerPort: 8080
+            - name: peer-quic
+              containerPort: 9090
+              protocol: UDP
+          envFrom:
+            - configMapRef:
+                name: rhiza-config
+            - configMapRef:
+                name: rhiza-object-store
+            - secretRef:
+                name: rhiza-peer-credentials
+          env:
+            - name: RHIZA_CLUSTER_MEMBERS
+              valueFrom:
+                secretKeyRef:
+                  name: rhiza-peer-credentials
+                  key: members
+            - name: RHIZA_NODE_ID
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            - name: RHIZA_POD_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            - name: POD_UID
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.uid
+            - name: RHIZA_DATA_DIR
+              value: /data
+            - name: RHIZA_HA_INIT_RESTORE_DIR
+              value: /ha-restore-staging/stage
+            - name: RHIZA_AUTHORITY_PROFILE
+              value: logical-writer-v1
+            - name: RHIZA_AUTHORITY_URL
+              value: https://rhiza-fencer:9444/v1/supervisor
+            - name: RHIZA_AUTHORITY_CA_FILE
+              value: /fencer-ca/ca.crt
+            - name: RHIZA_AUTHORITY_TOKEN_FILE
+              value: /var/run/secrets/rhiza-authority/token
+          securityContext:
+            runAsNonRoot: true
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: [ALL]
+          volumeMounts:
+            - name: temporary
+              mountPath: /tmp
+            - name: data
+              mountPath: /data
+            - name: restore-staging
+              mountPath: /ha-restore-staging
+              readOnly: true
+            - name: authority-token
+              mountPath: /var/run/secrets/rhiza-authority
+              readOnly: true
+            - name: authority-ca
+              mountPath: /fencer-ca
+              readOnly: true
+          startupProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            periodSeconds: 5
+            failureThreshold: 60
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            periodSeconds: 10
+          readinessProbe:
+            httpGet:
+              path: /ready
+              port: http
+            periodSeconds: 5
+          resources:
+            requests:
+              cpu: 500m
+              memory: 512Mi
+            limits:
+              memory: 2Gi
+      volumes:
+        - name: temporary
+          emptyDir: {}
+        - name: data
+          emptyDir: {}
+        - name: restore-staging
+          emptyDir: {}
+        - name: authority-token
+          projected:
+            sources:
+              - serviceAccountToken:
+                  path: token
+                  audience: rhiza-fencer
+                  expirationSeconds: 3600
+        - name: authority-ca
+          configMap:
+            name: rhiza-fencer-ca
+            items:
+              - key: ca.crt
+                path: ca.crt

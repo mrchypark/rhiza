@@ -82,3 +82,66 @@ func (c *Controller) retiringMembershipRequest(ctx context.Context, r *Resource)
 	}
 	return request, nil
 }
+
+// historicalRetiringMembershipRequest validates an ADD journal against the
+// immutable credential and retained retirement evidence of an older learner.
+// It never dispatches the ADD; callers may only use the returned request for
+// an idempotent /membership/abort confirmation.
+func (c *Controller) historicalRetiringMembershipRequest(ctx context.Context, r *Resource, state *autoControl) (network.MembershipChange, error) {
+	if state == nil || state.Intent == nil || r.Status.Membership == nil || r.Status.Membership.Add == nil {
+		return network.MembershipChange{}, fmt.Errorf("historical addition context is unavailable")
+	}
+	add := r.Status.Membership.Add
+	if add.OperationID != membershipOperationID(r, "add") || add.MemberID == "" || add.WALIdentity == "" || add.RequestHash == "" || add.SecretUID == "" || add.SecretResourceVer == "" {
+		return network.MembershipChange{}, fmt.Errorf("historical addition journal is incomplete")
+	}
+	if err := validateLearnerHistory(state.Learners); err != nil {
+		return network.MembershipChange{}, fmt.Errorf("historical learner inventory is invalid")
+	}
+	var entry *learnerIncarnation
+	for i := range state.Learners {
+		candidate := &state.Learners[i]
+		if candidate.SourceClusterID != state.ActiveClusterID || candidate.Target.NodeID != string(add.MemberID) {
+			continue
+		}
+		if entry != nil {
+			return network.MembershipChange{}, fmt.Errorf("historical addition has ambiguous learner history")
+		}
+		entry = candidate
+	}
+	if entry == nil || entry.OperationID != state.Intent.Request.OperationID || entry.CredentialName == "" || entry.CredentialUID != add.SecretUID || entry.Target.WALIdentity != add.WALIdentity || entry.Retirement == nil {
+		return network.MembershipChange{}, fmt.Errorf("historical addition does not match retained learner history")
+	}
+	retirement := entry.Retirement
+	req, proof := retirement.Request, &retirement.Proof
+	retirementOperationMatches := false
+	for priorAttempt := 0; priorAttempt < state.Intent.LearnerAttempt && priorAttempt < 3; priorAttempt++ {
+		if req.OperationID == fmt.Sprintf("%s-learner-fence-%d", state.Intent.RecoveryName, priorAttempt) {
+			retirementOperationMatches = true
+			break
+		}
+	}
+	if req.LogicalID != state.Intent.Request.LogicalID || req.BindingUID != state.BindingUID || req.Namespace != c.Kube.Namespace ||
+		req.StatefulSet != state.Intent.Request.StatefulSet || req.StatefulSetUID != state.StatefulSetUID ||
+		req.SourceClusterID != entry.SourceClusterID || !retirementOperationMatches || req.Scope != ScopeVoter || len(req.Targets) != 1 || req.Targets[0] != entry.Target ||
+		validateFenceProof(req, proof) != nil || proofCoversLearner(req, proof, entry.Target) != nil {
+		return network.MembershipChange{}, fmt.Errorf("historical learner retirement proof does not bind the journaled addition")
+	}
+	var secret object
+	if err := c.Kube.Get(ctx, c.corePath("secrets", entry.CredentialName), &secret); err != nil {
+		return network.MembershipChange{}, fmt.Errorf("historical learner credentials are unavailable")
+	}
+	member, uid, version, err := replacementMemberFromSecret(secret)
+	if err != nil || uid != add.SecretUID || version != add.SecretResourceVer ||
+		str(nested(secret, "metadata", "name")) != entry.CredentialName ||
+		str(nested(secret, "metadata", "annotations", ownerAnnotation)) != entry.OperationID ||
+		string(member.ID) != string(add.MemberID) || member.PublicKey == (quepaxa.PublicKey{}) {
+		return network.MembershipChange{}, fmt.Errorf("historical learner credentials differ from the journal")
+	}
+	member.WALIdentity = add.WALIdentity
+	request := network.MembershipChange{OperationID: add.OperationID, ClusterID: r.Spec.SourceClusterID, ExpectedConfigID: add.ExpectedConfigID, ExpectedAbortSlot: add.ExpectedAbortSlot, Add: &member}
+	if request.ClusterID != entry.SourceClusterID || add.RequestHash != hashJSON(request) {
+		return network.MembershipChange{}, fmt.Errorf("historical addition request hash differs from immutable credentials")
+	}
+	return request, nil
+}

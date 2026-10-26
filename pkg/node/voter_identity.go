@@ -25,7 +25,9 @@ import (
 
 var (
 	ErrVoterStateLost          = errors.New("voter state continuity cannot be established")
+	ErrVoterWALLost            = errors.New("registered voter WAL is absent")
 	ErrVoterEnrollmentRequired = errors.New("existing voter requires offline enrollment")
+	errStopVoterPrefixScan     = errors.New("stop voter prefix scan after legacy object")
 )
 
 // voterIdentityVersion 2 records the learner's public key instead of a hash of
@@ -70,10 +72,24 @@ func loadVoterIdentity(config *types.ExecutionConfig) (localVoterState, error) {
 		return state, fmt.Errorf("%w: invalid local identity", ErrVoterStateLost)
 	}
 	nonce, err := hex.DecodeString(identity.Nonce)
-	if err != nil || len(nonce) != 32 || identity.Version != voterIdentityVersion || !state.hadWAL {
+	if err != nil || len(nonce) != 32 || identity.Version != voterIdentityVersion {
 		return state, fmt.Errorf("%w: local identity or WAL manifest is missing/invalid; preserve the original disk", ErrVoterStateLost)
 	}
 	state.identity = &identity
+	if !state.hadWAL {
+		if !identity.Registered {
+			return state, fmt.Errorf("%w: unregistered identity has no WAL manifest", ErrVoterStateLost)
+		}
+		inspection, inspectErr := qlog.OpenReadOnly(dir)
+		if inspectErr != nil {
+			return state, fmt.Errorf("%w: missing WAL manifest has other local data: %v", ErrVoterStateLost, inspectErr)
+		}
+		closeErr := inspection.Close()
+		if closeErr != nil {
+			return state, errors.Join(ErrVoterStateLost, closeErr)
+		}
+		return state, errors.Join(ErrVoterStateLost, ErrVoterWALLost)
+	}
 	return state, nil
 }
 
@@ -87,10 +103,46 @@ func voterIdentityFor(config *types.ExecutionConfig) voterIdentity {
 	return identity
 }
 
+func voterRegistrationPrefix(config *types.ExecutionConfig) string {
+	return path.Join(config.ObjStorePrefix, string(config.ClusterID), "voters")
+}
+
+func voterMembershipRegistrationKey(config *types.ExecutionConfig) string {
+	return path.Join(voterRegistrationPrefix(config), "membership.json")
+}
+
+func voterIdentityRegistrationKey(config *types.ExecutionConfig, nodeID string) string {
+	return path.Join(voterRegistrationPrefix(config), fmt.Sprintf("%x.json", sha256.Sum256([]byte(nodeID))))
+}
+
 // ensureVoterIdentity runs before any archive replay or peer listener. An
 // archive contains decided values, not the lost voter's outstanding promises.
 func ensureVoterIdentity(ctx context.Context, config *types.ExecutionConfig, bucket objstore.Bucket, wal *qlog.WAL, local localVoterState, enroll bool, beforeWrite ...func(context.Context, string) error) error {
+	return ensureVoterIdentityWithHooks(ctx, config, bucket, wal, local, enroll, beforeWrite, nil, false, "")
+}
+
+func ensureVoterIdentityWithHooks(ctx context.Context, config *types.ExecutionConfig, bucket objstore.Bucket, wal *qlog.WAL, local localVoterState, enroll bool, beforeWrite []func(context.Context, string) error, pendingIdentityWrite []func(context.Context, string, []byte) error, assignedRestart bool, assignedWALIdentity string) error {
 	want := voterIdentityFor(config)
+	if assignedRestart {
+		if local.identity == nil || !local.identity.Registered || config.Learner != nil || local.identity.Node != string(config.NodeID) || local.identity.Cluster != string(config.ClusterID) {
+			return fmt.Errorf("%w: authority-assigned restart lacks its registered logical identity", ErrVoterStateLost)
+		}
+		// Only the fencer can set this branch after verifying the completed
+		// same-ordinal assignment. The immutable voter record intentionally
+		// retains the cohort under which its learner identity was first bound.
+		want.Membership = local.identity.Membership
+		want.LearnerPublicKey = local.identity.LearnerPublicKey
+	}
+	if assignedWALIdentity != "" {
+		if local.identity != nil || local.hadWAL || !assignedRestart && config.Learner == nil {
+			return fmt.Errorf("%w: fresh WAL assignment is restricted to an authority-assigned learner", ErrVoterStateLost)
+		}
+		nonce, err := hex.DecodeString(assignedWALIdentity)
+		if err != nil || len(nonce) != 32 {
+			return fmt.Errorf("%w: authority-assigned WAL identity is invalid", ErrVoterStateLost)
+		}
+		want.Nonce = assignedWALIdentity
+	}
 	bound, hasBinding := wal.Identity()
 	if local.identity != nil {
 		nonce, _ := hex.DecodeString(local.identity.Nonce)
@@ -113,16 +165,64 @@ func ensureVoterIdentity(ctx context.Context, config *types.ExecutionConfig, buc
 		}
 		return nil
 	}
-	prefix := path.Join(config.ObjStorePrefix, string(config.ClusterID), "voters")
-	clusterKey := path.Join(prefix, "membership.json")
+	prefix := voterRegistrationPrefix(config)
+	clusterKey := voterMembershipRegistrationKey(config)
 	clusterData, err := readVoterRegistration(ctx, bucket, clusterKey)
 	if err != nil {
 		return err
 	}
-	// Single-voter archive recovery remains supported, but must never bypass
-	// a namespace that was registered for a multi-voter cluster.
+	clusterWant, _ := json.Marshal(recovery.NewMembershipRecord(want.Cluster, config.Members, string(config.ObjStoreDurability)))
+	if clusterData == nil {
+		// A voter namespace with identity records but no canonical membership is
+		// ambiguous, including during offline enrollment. For the legacy
+		// multi-voter non-enrollment path, also preserve the older-database guard.
+		scanRoot := prefix + "/"
+		if len(config.Members) > 1 && !enroll {
+			scanRoot = path.Join(config.ObjStorePrefix, string(config.ClusterID)) + "/"
+		}
+		priorVoterRecord := false
+		legacyObjectFound := false
+		if err := bucket.Iter(ctx, scanRoot, func(key string) error {
+			if !strings.HasPrefix(key, prefix+"/") {
+				if len(config.Members) > 1 && !enroll {
+					legacyObjectFound = true
+					return errStopVoterPrefixScan
+				}
+				return nil
+			}
+			if key != clusterKey {
+				priorVoterRecord = true
+			}
+			return nil
+		}); err != nil && !errors.Is(err, errStopVoterPrefixScan) {
+			return err
+		}
+		// Always reread after the scan: a concurrent first registrant may have
+		// published membership without its identity yet, or just after Iter saw
+		// an empty prefix. Single-voter recovery must not bypass that publication.
+		clusterData, err = readVoterRegistration(ctx, bucket, clusterKey)
+		if err != nil {
+			return err
+		}
+		if clusterData == nil && priorVoterRecord {
+			return fmt.Errorf("%w: voter records exist without canonical membership", ErrVoterStateLost)
+		}
+		if clusterData == nil && legacyObjectFound {
+			return ErrVoterEnrollmentRequired
+		}
+		if clusterData != nil && !assignedRestart {
+			if err := matchVoterRegistration(ctx, bucket, clusterKey, clusterWant, clusterData); err != nil {
+				return err
+			}
+		}
+	}
+	// Single-voter archive recovery remains supported only when the scan and
+	// reread establish that this is still an unregistered namespace.
 	if len(config.Members) <= 1 && clusterData == nil && local.identity == nil && !enroll {
 		return nil
+	}
+	if assignedRestart && clusterData == nil {
+		return fmt.Errorf("%w: assigned restart lacks its immutable voter genesis", ErrVoterStateLost)
 	}
 	if len(config.Members) <= 1 {
 		return fmt.Errorf("%w: membership cannot be changed during startup", ErrVoterStateLost)
@@ -130,7 +230,7 @@ func ensureVoterIdentity(ctx context.Context, config *types.ExecutionConfig, buc
 	if !slices.Contains(bucket.SupportedObjectUploadOptions(), objstore.IfNotExists) {
 		return fmt.Errorf("voter registration requires conditional object writes")
 	}
-	identityKey := path.Join(prefix, fmt.Sprintf("%x.json", sha256.Sum256([]byte(config.NodeID))))
+	identityKey := voterIdentityRegistrationKey(config, string(config.NodeID))
 	registered, err := readVoterRegistration(ctx, bucket, identityKey)
 	if err != nil {
 		return err
@@ -150,24 +250,28 @@ func ensureVoterIdentity(ctx context.Context, config *types.ExecutionConfig, buc
 	if enroll && !local.hadWAL {
 		return fmt.Errorf("%w: enrollment requires the original WAL", ErrVoterStateLost)
 	}
-	if clusterData == nil && !enroll {
-		// A namespace containing older database state cannot be auto-adopted.
-		if err := bucket.Iter(ctx, path.Join(config.ObjStorePrefix, string(config.ClusterID))+"/", func(key string) error {
-			if !strings.HasPrefix(key, prefix+"/") {
-				return ErrVoterEnrollmentRequired
-			}
-			return nil
-		}); err != nil {
-			return err
+	if assignedRestart && clusterData != nil {
+		var genesis recovery.MembershipRecord
+		decoder := json.NewDecoder(bytes.NewReader(clusterData))
+		decoder.DisallowUnknownFields()
+		if decoder.Decode(&genesis) != nil || decoder.Decode(new(any)) != io.EOF || genesis.Version != recovery.MembershipRecordVersion ||
+			genesis.Cluster != want.Cluster || genesis.Membership != want.Membership || genesis.Durability != string(config.ObjStoreDurability) {
+			return fmt.Errorf("%w: assigned restart does not match the immutable voter genesis", ErrVoterStateLost)
 		}
+		canonical, _ := json.Marshal(genesis)
+		if !bytes.Equal(canonical, clusterData) {
+			return fmt.Errorf("%w: assigned restart voter genesis is not canonical", ErrVoterStateLost)
+		}
+		clusterWant = append([]byte(nil), clusterData...)
 	}
-	clusterWant, _ := json.Marshal(recovery.NewMembershipRecord(want.Cluster, config.Members, string(config.ObjStoreDurability)))
 	if local.identity == nil {
-		var nonce [32]byte
-		if _, err := rand.Read(nonce[:]); err != nil {
-			return err
+		if want.Nonce == "" {
+			var nonce [32]byte
+			if _, err := rand.Read(nonce[:]); err != nil {
+				return err
+			}
+			want.Nonce = hex.EncodeToString(nonce[:])
 		}
-		want.Nonce = hex.EncodeToString(nonce[:])
 		local.identity = &want
 		if err := writeVoterIdentity(config.DataDir, want); err != nil {
 			return err
@@ -196,7 +300,18 @@ func ensureVoterIdentity(ctx context.Context, config *types.ExecutionConfig, buc
 	remote := *local.identity
 	remote.Registered = true
 	data, _ := json.Marshal(remote)
-	if err := matchVoterRegistration(ctx, bucket, identityKey, data, registered); err != nil {
+	if registered == nil && len(pendingIdentityWrite) != 0 {
+		if err := pendingIdentityWrite[0](ctx, identityKey, data); err != nil {
+			return err
+		}
+		registered, err = readVoterRegistration(ctx, bucket, identityKey)
+		if err != nil {
+			return err
+		}
+		if registered == nil || !bytes.Equal(data, registered) {
+			return fmt.Errorf("%w: authority learner identity readback differs", ErrVoterStateLost)
+		}
+	} else if err := matchVoterRegistration(ctx, bucket, identityKey, data, registered); err != nil {
 		return err
 	}
 	if !local.identity.Registered {

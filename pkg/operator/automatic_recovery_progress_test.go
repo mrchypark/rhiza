@@ -8,7 +8,6 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"io"
-	"net"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -166,11 +165,17 @@ func TestAutomaticRecoveryProgressEscalatesWithFullFencingInventory(t *testing.T
 	}
 }
 
-func TestAutomaticRecoveryProgressReplacesCommittedFailedLearner(t *testing.T) {
+func TestAutomaticRecoveryProgressFencesInstalledGenerationAfterQuorumLoss(t *testing.T) {
 	ctx, child, api, c := membershipFixture(t)
 	child.Spec.Container = "rhiza"
+	ctr, err := container(api.sts, "rhiza")
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctr["env"] = replaceEnv(list(ctr["env"]), "RHIZA_ADMIN_TOKEN", object{"value": "admin"})
 	child.Spec.Membership.OperationID = "recover"
 	child.Spec.Membership.RemovedPod = "n3"
+	seedLegacyRemoveMembershipJournal(child)
 	api.learnerID = "learner"
 	wal := strings.Repeat("a", 64)
 	api.membership["learner"] = network.MembershipStatus{NodeID: "learner", ClusterID: "source", ConfigID: 1, Voters: []quepaxa.NodeID{"n1", "n2", "n3"}, WALIdentity: wal}
@@ -182,6 +187,12 @@ func TestAutomaticRecoveryProgressReplacesCommittedFailedLearner(t *testing.T) {
 	api.membership["n2"] = membershipStatus("n2", 2, "n1", "n2")
 	if err := c.reconcileAll(ctx); err != nil {
 		t.Fatal(err)
+	}
+	if child.Status.Membership == nil || child.Status.Membership.Add == nil {
+		n1, n2, learner := api.membership["n1"], api.membership["n2"], api.membership["learner"]
+		t.Fatalf("committed learner fixture reached retirement without ADD journal: phase=%q message=%q membership=%+v config_n1=%d voters_n1=%v config_n2=%d voters_n2=%v learner={node:%s cluster:%s config:%d voting:%t pending:%t} changes=%d",
+			child.Status.Phase, child.Status.Message, child.Status.Membership, n1.ConfigID, n1.Voters, n2.ConfigID, n2.Voters,
+			learner.NodeID, learner.ClusterID, learner.ConfigID, learner.Voting, learner.Pending, len(api.changes))
 	}
 	if err := writeRetirementOperation(ctx, c, child); err != nil {
 		t.Fatal(err)
@@ -204,7 +215,7 @@ func TestAutomaticRecoveryProgressReplacesCommittedFailedLearner(t *testing.T) {
 	}
 	r := autoClusterResource("cluster-1", "binding-uid-1", "logical-1")
 	r.Spec.Automatic = true
-	r.Spec.Policy = AutoPolicy{FailureGraceSeconds: 1, CooldownSeconds: 1, MaxRecoveriesPerDay: 10}
+	r.Spec.Policy = &AutoPolicy{FailureGraceSeconds: 1, CooldownSeconds: 1, MaxRecoveriesPerDay: 10}
 	state := validAutoControl()
 	state.StatefulSetUID = "sts-uid"
 	state.Voters = []VoterPod{{NodeID: "n1", Pod: "n1"}, {NodeID: "n2", Pod: "n2"}, {NodeID: "n3", Pod: "n3"}}
@@ -218,35 +229,26 @@ func TestAutomaticRecoveryProgressReplacesCommittedFailedLearner(t *testing.T) {
 	state.Intent = &autoIntent{Request: request, RecoveryName: "recover", RecoveryUID: "resource-uid", Durability: "before-ack", Failed: "n3", Voters: append([]VoterPod(nil), state.Voters...), LearnerName: "learner", LearnerUID: "learner-uid", LearnerWAL: wal, Aborting: true, Proof: &FenceProof{OperationID: request.OperationID, SourceClusterID: "source", BindingUID: state.BindingUID, RequestHash: hash, ProofID: child.Spec.Membership.Fence.Evidence, ProcessesTerminated: true, RecreationBlocked: true, StorageQuiesced: true}}
 	child.Metadata["annotations"] = object{automaticOwner: state.BindingUID, automaticLogical: r.Spec.LogicalID}
 	state.Intent.SpecHash = hashJSON(child.Spec)
-	var nextChild *Resource
-	var nextLearner string
 	server := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, q *http.Request) {
+		if q.Method == http.MethodGet && q.URL.Path == "/apis/rhiza.mrchypark.dev/v1alpha1/namespaces/default/rhizaclusters" {
+			_ = json.NewEncoder(w).Encode(struct {
+				Items []ClusterResource `json:"items"`
+			}{Items: []ClusterResource{*r}})
+			return
+		}
 		if q.Method == http.MethodGet && q.URL.Path == c.resourcePath("recover") {
 			_ = json.NewEncoder(w).Encode(child)
-			return
-		}
-		if nextChild != nil && q.Method == http.MethodGet && q.URL.Path == c.resourcePath(resourceName(nextChild)) {
-			_ = json.NewEncoder(w).Encode(nextChild)
-			return
-		}
-		if nextChild != nil && q.Method == http.MethodPut && q.URL.Path == c.resourcePath(resourceName(nextChild))+"/status" {
-			if err := json.NewDecoder(q.Body).Decode(nextChild); err != nil {
-				t.Error(err)
-			}
-			_ = json.NewEncoder(w).Encode(nextChild)
 			return
 		}
 		if q.Method == http.MethodPut && q.URL.Path == c.clusterPath("cluster-1")+"/status" {
 			_ = json.NewEncoder(w).Encode(r)
 			return
 		}
-		if nextLearner != "" && q.Method == http.MethodGet && q.URL.Path == c.corePath("pods", nextLearner) {
-			q.URL.Path = c.corePath("pods", "learner2")
-		}
 		api.serve(w, q)
 	}))
 	t.Cleanup(server.Close)
 	c.Kube.BaseURL, c.Kube.Client = server.URL, server.Client()
+	probeQuorum := true
 	c.HTTP = &http.Client{Transport: escalationProbeTransport(func(req *http.Request) (*http.Response, error) {
 		if req.URL.Path != "/recovery/probe" {
 			return http.DefaultTransport.RoundTrip(req)
@@ -258,7 +260,7 @@ func TestAutomaticRecoveryProgressReplacesCommittedFailedLearner(t *testing.T) {
 		if req.Header.Get("Authorization") != "Bearer admin" {
 			t.Error("missing probe authentication")
 		}
-		return progressProbeResponse(req, id, true), nil
+		return progressProbeResponse(req, id, probeQuorum), nil
 	})}
 	fenced := 0
 	var lastFence FenceRequest
@@ -289,6 +291,9 @@ func TestAutomaticRecoveryProgressReplacesCommittedFailedLearner(t *testing.T) {
 	if err := c.saveAuto(ctx, r, state, version); err != nil {
 		t.Fatal(err)
 	}
+	// A verified quorum keeps the controller in Degraded; model the subsequent
+	// voter failure that is supposed to trigger the next recovery operation.
+	probeQuorum = false
 	if err := c.reconcileCluster(ctx, r); err != nil {
 		t.Fatal(err)
 	}
@@ -296,8 +301,30 @@ func TestAutomaticRecoveryProgressReplacesCommittedFailedLearner(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if state.Intent == nil || state.Intent.Failed != "learner" || state.Intent.Request.Scope != ScopeVoter || state.Intent.Request.OperationID == "recover" || len(state.Intent.Request.Targets) != 1 || state.Intent.Request.Targets[0] != (FenceTarget{NodeID: "learner", Pod: "learner", PodUID: "learner-uid", WALIdentity: wal}) {
-		t.Fatalf("next failure did not use installed voter authority: %+v status=%+v", state.Intent, r.Status)
+	if state.Intent == nil || state.Intent.Request.Scope != ScopeGeneration || state.Intent.Request.OperationID == "recover" {
+		t.Fatalf("quorum loss did not reserve a fresh generation recovery: %+v status=%+v", state.Intent, r.Status)
+	}
+	wantTargets := map[string]FenceTarget{}
+	for _, voter := range state.Voters {
+		target, ok := state.Identities[voter.NodeID]
+		if !ok {
+			t.Fatalf("installed voter %q has no captured identity: %+v", voter.NodeID, state.Identities)
+		}
+		target.NodeID = string(voter.NodeID)
+		wantTargets[string(voter.NodeID)] = target
+	}
+	if len(wantTargets) != 3 || wantTargets["n1"].NodeID != "n1" || wantTargets["n2"].NodeID != "n2" ||
+		wantTargets["learner"].NodeID != "learner" || wantTargets["n3"].NodeID != "" || len(state.Intent.Request.Targets) != len(wantTargets) {
+		t.Fatalf("generation recovery did not use the installed voter set without retired n3: voters=%v identities=%+v targets=%+v", state.Voters, state.Identities, state.Intent.Request.Targets)
+	}
+	for _, target := range state.Intent.Request.Targets {
+		if expected, ok := wantTargets[target.NodeID]; !ok || expected != target {
+			t.Fatalf("generation recovery target is not the captured installed identity: got=%+v want=%+v", target, expected)
+		}
+		delete(wantTargets, target.NodeID)
+	}
+	if len(wantTargets) != 0 {
+		t.Fatalf("generation recovery omitted installed voter identities: %+v", wantTargets)
 	}
 	if err := c.reconcileCluster(ctx, r); err != nil {
 		t.Fatal(err)
@@ -306,71 +333,15 @@ func TestAutomaticRecoveryProgressReplacesCommittedFailedLearner(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if fenced != 1 || state.Intent.Proof == nil || lastFence.Targets[0].NodeID != "learner" {
+	if fenced != 1 || state.Intent.Proof == nil || len(lastFence.Targets) != 3 {
 		t.Fatalf("next replacement was not fenced: count=%d intent=%+v", fenced, state.Intent)
 	}
-	// Workload-provisioning tests cover Kubernetes creation. Resume here with the
-	// resulting frozen child/learner identities and exercise the real executor.
-	nextLearner = state.Intent.LearnerName
-	newWal := strings.Repeat("d", 64)
-	api.replacement2 = object{}
-	api.replacement2["metadata"] = object{"name": nextLearner, "uid": "new-learner-uid"}
-	api.replacement2["status"] = object{"podIP": "127.0.0.1"}
-	// Reuse the live learner test endpoint, not a StatefulSet peer endpoint.
-	_, port, err := net.SplitHostPort(api.learner.Listener.Addr().String())
-	if err != nil {
-		t.Fatal(err)
+	fencedTargets := make(map[string]bool, len(lastFence.Targets))
+	for _, target := range lastFence.Targets {
+		fencedTargets[target.NodeID] = true
 	}
-	n, err := strconv.Atoi(port)
-	if err != nil {
-		t.Fatal(err)
-	}
-	api.replacement2["spec"] = object{"containers": []any{object{"name": "rhiza", "ports": []any{object{"name": "http", "containerPort": float64(n)}}}}}
-	member := voterMember("source", nextLearner, "next-token")
-	api.membershipSecrets[nextLearner+"-credentials"] = object{"immutable": true, "metadata": object{"uid": "new-secret-uid", "resourceVersion": "1"}, "data": object{"member": base64.StdEncoding.EncodeToString(jsonBytes(member))}}
-	api.learnerID = nextLearner
-	api.membership[nextLearner] = network.MembershipStatus{NodeID: quepaxa.NodeID(nextLearner), ClusterID: "source", ConfigID: 3, Voters: []quepaxa.NodeID{"n1", "n2", "learner"}, WALIdentity: newWal}
-	i := state.Intent
-	nextChild = &Resource{Metadata: object{"name": i.RecoveryName, "uid": "next-child-uid", "resourceVersion": "1", "annotations": object{automaticOwner: state.BindingUID, automaticLogical: r.Spec.LogicalID}}, Spec: Spec{StatefulSet: "rhiza", Container: "rhiza", SourceClusterID: "source", Durability: i.Durability, Membership: &MembershipSpec{OperationID: i.RecoveryName, Remove: "learner", RemovedPod: "learner", VoterPods: []VoterPod{{NodeID: "n1", Pod: "n1"}, {NodeID: "n2", Pod: "n2"}}, ReplacementPod: nextLearner, ReplacementSecret: nextLearner + "-credentials", Fence: MembershipFence{NodeID: "learner", WALIdentity: wal, WorkloadUID: "learner-uid", Confirmed: true, Evidence: i.Proof.ProofID}}}}
-	i.LearnerUID, i.LearnerWAL, i.RecoveryUID, i.SpecHash = "new-learner-uid", newWal, "next-child-uid", hashJSON(nextChild.Spec)
-	if err := c.saveAuto(ctx, r, state, version); err != nil {
-		t.Fatal(err)
-	}
-	if err := c.reconcile(ctx, nextChild); err != nil {
-		t.Fatal(err)
-	}
-	if nextChild.Status.Membership == nil || nextChild.Status.Membership.RemoveRequest == nil || nextChild.Status.Membership.RemoveRequest.Remove != "learner" {
-		t.Fatalf("fresh removal not journaled: %+v", nextChild.Status)
-	}
-	api.membership["n1"] = membershipStatus("n1", 4, "n1", "n2")
-	api.membership["n2"] = membershipStatus("n2", 4, "n1", "n2")
-	if err := c.reconcile(ctx, nextChild); err != nil {
-		t.Fatal(err)
-	}
-	for _, id := range []string{"n1", "n2", nextLearner} {
-		status := membershipStatus(id, 5, "n1", "n2", nextLearner)
-		status.WALIdentity = newWal
-		api.membership[id] = status
-	}
-	if err := c.reconcile(ctx, nextChild); err != nil {
-		t.Fatal(err)
-	}
-	if nextChild.Status.Phase != "Complete" {
-		t.Fatalf("fresh replacement did not complete: %+v", nextChild.Status)
-	}
-	state, version, err = c.loadAuto(ctx, c.autoKey(r))
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := c.advanceAutomatic(ctx, r, state, version, api.sts); err != nil {
-		t.Fatal(err)
-	}
-	state, _, err = c.loadAuto(ctx, c.autoKey(r))
-	if err != nil {
-		t.Fatal(err)
-	}
-	if state.Intent != nil || state.Completed == nil || state.Voters[2].NodeID != quepaxa.NodeID(nextLearner) || state.Identities[quepaxa.NodeID(nextLearner)].PodUID != "new-learner-uid" || state.Identities["learner"].NodeID != "" {
-		t.Fatalf("next committed inventory retained failed identity: %+v", state)
+	if !fencedTargets["n1"] || !fencedTargets["n2"] || !fencedTargets["learner"] || fencedTargets["n3"] {
+		t.Fatalf("generation fence did not preserve exact installed voter scope: %+v", lastFence.Targets)
 	}
 }
 
@@ -400,7 +371,7 @@ func TestAutomaticReservationRejectsUnfenceableScope(t *testing.T) {
 			ctr["env"] = append(list(ctr["env"]), object{"name": "RHIZA_ADMIN_TOKEN", "value": "admin"})
 			r := autoClusterResource("cluster-1", "binding-uid-1", "logical-1")
 			r.Spec.Container, r.Spec.Automatic = "rhiza", true
-			r.Spec.Policy = AutoPolicy{FailureGraceSeconds: 1, CooldownSeconds: 1, MaxRecoveriesPerDay: 10}
+			r.Spec.Policy = &AutoPolicy{FailureGraceSeconds: 1, CooldownSeconds: 1, MaxRecoveriesPerDay: 10}
 			voterPods := make([]VoterPod, 0, tc.voters)
 			for _, member := range voters {
 				voterPods = append(voterPods, VoterPod{NodeID: member.ID, Pod: string(member.ID)})
@@ -417,7 +388,12 @@ func TestAutomaticReservationRejectsUnfenceableScope(t *testing.T) {
 				pod := "learner-" + strconv.Itoa(i)
 				state.Learners = append(state.Learners, learnerIncarnation{SourceClusterID: "source", OperationID: "retire-1", CredentialUID: "cred-1", Target: FenceTarget{NodeID: pod, Pod: pod, PodUID: "pod-" + pod, WALIdentity: "wal-" + pod}})
 			}
-			c.Fencer = &countingFencer{count: new(int)}
+			// These target identities are intentionally absent from the fake API;
+			// keep their cleanup unresolved so this test measures reserved scope
+			// capacity rather than accidentally compacting it first.
+			c.Fencer = retirementFencer(func(context.Context, FenceRequest) (*FenceProof, error) {
+				return nil, ErrFencePending
+			})
 			api.membership = nil
 			server := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, q *http.Request) {
 				if q.Method == http.MethodPut && q.URL.Path == c.clusterPath("cluster-1")+"/status" {

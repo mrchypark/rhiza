@@ -1853,50 +1853,73 @@ func TestGraphCheckpointProgressesDuringWrites(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer m.Close()
-	ctx := context.Background()
-	stopWrites := make(chan struct{})
-	started := make(chan struct{})
-	done := make(chan error, 1)
-	go func() {
-		for slot := uint64(1); ; slot++ {
-			select {
-			case <-stopWrites:
-				done <- nil
-				return
-			default:
-			}
-			value, encodeErr := types.EncodeKVCommand(types.KVCommand{RequestID: fmt.Sprintf("write-%d", slot), Operation: "put", Key: "active", Value: []byte("1")})
-			if encodeErr != nil {
-				done <- encodeErr
-				return
-			}
-			if applyErr := m.Apply(ctx, slot, value); applyErr != nil {
-				done <- applyErr
-				return
-			}
-			if slot == 1 {
-				close(started)
-			}
-		}
-	}()
-	<-started
 	deadline, stop := context.WithTimeout(context.Background(), 5*time.Second)
 	defer stop()
-	files, index, cleanup, err := m.CheckpointFilesAt(deadline)
-	close(stopWrites)
-	writeErr := <-done
+	first, err := types.EncodeKVCommand(types.KVCommand{RequestID: "write-1", Operation: "put", Key: "active", Value: []byte("1")})
 	if err != nil {
 		t.Fatal(err)
 	}
-	cleanup()
-	if index == 0 || len(files) != 2 {
-		t.Fatalf("checkpoint index=%d files=%d", index, len(files))
+	if err := m.Apply(deadline, 1, first); err != nil {
+		t.Fatal(err)
+	}
+
+	snapshotReady := make(chan struct{})
+	continueBackup := make(chan struct{})
+	m.checkpointAfterSnapshot = func() {
+		close(snapshotReady)
+		select {
+		case <-continueBackup:
+		case <-deadline.Done():
+		}
+	}
+	type checkpointResult struct {
+		files   []CheckpointFile
+		index   uint64
+		cleanup func()
+		err     error
+	}
+	checkpointDone := make(chan checkpointResult, 1)
+	go func() {
+		files, index, cleanup, err := m.CheckpointFilesAt(deadline)
+		checkpointDone <- checkpointResult{files: files, index: index, cleanup: cleanup, err: err}
+	}()
+	var continueOnce sync.Once
+	continueCheckpoint := func() { continueOnce.Do(func() { close(continueBackup) }) }
+	checkpointReceived := false
+	defer func() {
+		continueCheckpoint()
+		if !checkpointReceived {
+			<-checkpointDone
+		}
+	}()
+	select {
+	case <-snapshotReady:
+	case <-deadline.Done():
+		t.Fatalf("checkpoint snapshots were not acquired: %v", deadline.Err())
+	}
+
+	second, err := types.EncodeKVCommand(types.KVCommand{RequestID: "write-2", Operation: "put", Key: "active", Value: []byte("2")})
+	if err != nil {
+		t.Fatal(err)
+	}
+	writeErr := m.Apply(deadline, 2, second)
+	continueCheckpoint()
+	checkpoint := <-checkpointDone
+	checkpointReceived = true
+	if checkpoint.cleanup != nil {
+		defer checkpoint.cleanup()
 	}
 	if writeErr != nil {
-		t.Fatal(writeErr)
+		t.Fatalf("write during held checkpoint snapshots: %v", writeErr)
 	}
-	if final := m.Tip(); final <= index {
-		t.Fatalf("writes did not progress during checkpoint: snapshot=%d final=%d", index, final)
+	if err := checkpoint.err; err != nil {
+		t.Fatalf("checkpoint after concurrent write: %v", err)
+	}
+	if checkpoint.index != 1 || len(checkpoint.files) != 2 {
+		t.Fatalf("checkpoint index=%d files=%d", checkpoint.index, len(checkpoint.files))
+	}
+	if final := m.Tip(); final != 2 || final <= checkpoint.index {
+		t.Fatalf("writes did not progress during checkpoint: snapshot=%d final=%d", checkpoint.index, final)
 	}
 }
 

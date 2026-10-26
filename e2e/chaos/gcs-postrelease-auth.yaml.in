@@ -52,10 +52,12 @@ spec:
     limits.memory: 8Gi
     requests.ephemeral-storage: 8Gi
     limits.ephemeral-storage: 8Gi
-    # Three voters, operator and authority are resident, plus the two transient
-    # isolation probe Pods: the positive run needs 7, leaving one Pod of headroom.
-    pods: '8'
-    services: '2'
+    # Three runtime agents, operator, authority, three voters, expiry Job Pod,
+    # one concurrent IAM probe, paired inspectors, and one temporary learner.
+    pods: '12'
+    # Two static Services plus up to three learner incarnations. The operator
+    # does not clean up Services, so retries retain each incarnation Service.
+    services: '5'
     services.loadbalancers: '0'
     services.nodeports: '0'
     persistentvolumeclaims: '0'
@@ -143,9 +145,8 @@ spec:
   variables:
     - name: selector
       expression: object.spec.selector
-    # Exactly one of the two correlated sources: the isolated voter or the
-    # run's operator Pod. Never a Pod-name selector on the source, never a node
-    # or cluster external target.
+    # Source selectors are restricted to the legacy isolated voter, the run's
+    # operator, runtime-agent Pods, or an explicit bounded voter cohort.
     - name: selectorIsolatedVoter
       expression: >-
         has(variables.selector.labelSelectors) && size(variables.selector.labelSelectors) == 3 &&
@@ -157,22 +158,48 @@ spec:
         has(variables.selector.labelSelectors) && size(variables.selector.labelSelectors) == 2 &&
         'chaos.rhiza.io/run' in variables.selector.labelSelectors && variables.selector.labelSelectors['chaos.rhiza.io/run'] == '@RUN_ID@' &&
         'app' in variables.selector.labelSelectors && variables.selector.labelSelectors['app'] == 'rhiza-operator'
+    - name: selectorRuntimeAgent
+      expression: >-
+        has(variables.selector.labelSelectors) && size(variables.selector.labelSelectors) == 2 &&
+        'app.kubernetes.io/name' in variables.selector.labelSelectors && variables.selector.labelSelectors['app.kubernetes.io/name'] == 'rhiza-runtime-agent' &&
+        'rhiza.dev/gcs-capture' in variables.selector.labelSelectors && variables.selector.labelSelectors['rhiza.dev/gcs-capture'].matches('^[a-f0-9]{32}$') &&
+        has(variables.selector.pods) && size(variables.selector.pods) == 1 && '@NAMESPACE@' in variables.selector.pods &&
+        size(variables.selector.pods['@NAMESPACE@']) > 0 && size(variables.selector.pods['@NAMESPACE@']) <= 64 &&
+        variables.selector.pods['@NAMESPACE@'].all(p, p.startsWith('rhiza-runtime-agent-'))
+    - name: selectorOperatorPod
+      expression: >-
+        has(variables.selector.labelSelectors) && size(variables.selector.labelSelectors) == 3 &&
+        'chaos.rhiza.io/run' in variables.selector.labelSelectors && variables.selector.labelSelectors['chaos.rhiza.io/run'] == '@RUN_ID@' &&
+        'app' in variables.selector.labelSelectors && variables.selector.labelSelectors['app'] == 'rhiza-operator' &&
+        'rhiza.dev/gcs-capture' in variables.selector.labelSelectors && variables.selector.labelSelectors['rhiza.dev/gcs-capture'].matches('^[a-f0-9]{32}$') &&
+        has(variables.selector.pods) && size(variables.selector.pods) == 1 && '@NAMESPACE@' in variables.selector.pods &&
+        size(variables.selector.pods['@NAMESPACE@']) == 1 && variables.selector.pods['@NAMESPACE@'][0].startsWith('rhiza-operator-')
+    - name: selectorVoterCohort
+      expression: >-
+        has(variables.selector.labelSelectors) && size(variables.selector.labelSelectors) == 4 &&
+        'chaos.rhiza.io/run' in variables.selector.labelSelectors && variables.selector.labelSelectors['chaos.rhiza.io/run'] == '@RUN_ID@' &&
+        'app' in variables.selector.labelSelectors && variables.selector.labelSelectors['app'] == 'rhiza-voter' &&
+        'app.kubernetes.io/part-of' in variables.selector.labelSelectors && variables.selector.labelSelectors['app.kubernetes.io/part-of'] == 'rhiza-chaos' &&
+        'rhiza.dev/gcs-capture' in variables.selector.labelSelectors && variables.selector.labelSelectors['rhiza.dev/gcs-capture'].matches('^[a-f0-9]{32}$') &&
+        has(variables.selector.pods) && size(variables.selector.pods) == 1 && '@NAMESPACE@' in variables.selector.pods &&
+        size(variables.selector.pods['@NAMESPACE@']) >= 2 && size(variables.selector.pods['@NAMESPACE@']) <= 64 &&
+        variables.selector.pods['@NAMESPACE@'].all(p, p.matches('^rhiza-voter-[0-9]+$'))
     - name: sourceSafe
       expression: >-
         has(variables.selector.namespaces) && variables.selector.namespaces == ['@NAMESPACE@'] &&
-        !has(variables.selector.pods) && !has(variables.selector.nodes) && !has(variables.selector.nodeSelectors) &&
+        !has(variables.selector.nodes) && !has(variables.selector.nodeSelectors) &&
         !has(variables.selector.annotationSelectors) && !has(variables.selector.expressionSelectors) &&
         !has(variables.selector.fieldSelectors) && !has(variables.selector.podPhaseSelectors) &&
-        (variables.selectorIsolatedVoter || variables.selectorOperator)
+        (variables.selectorIsolatedVoter || variables.selectorOperator || variables.selectorRuntimeAgent || variables.selectorOperatorPod || variables.selectorVoterCohort)
   validations:
     - expression: >-
         object.metadata.namespace == '@NAMESPACE@' && has(object.metadata.labels) &&
         'chaos.rhiza.io/run' in object.metadata.labels && object.metadata.labels['chaos.rhiza.io/run'] == '@RUN_ID@' &&
         variables.sourceSafe
       message: Fault metadata and source selector must select only this run's peer Pods.
-    # Two correlated full shapes, never a cross-product of source, window and
-    # target. Shape A isolates voter-0 for 45s against voters 1 and 2 only.
-    # Shape B partitions the operator from every voter for 60s.
+    # Correlated full shapes, never an unbounded selector cross-product:
+    # legacy voter/operator tests, exact runtime-agent/operator-to-fencer links,
+    # and a bounded full voter cohort whose source and target sets are equal.
     - expression: >-
         object.spec.action == 'partition' && has(object.spec.direction) && object.spec.direction == 'both' &&
         !has(object.spec.externalTargets) && !has(object.spec.device) && !has(object.spec.delay) &&
@@ -182,16 +209,18 @@ spec:
         has(object.spec.target) && has(object.spec.target.mode) && object.spec.target.mode == 'all' &&
         !has(object.spec.target.value) && has(object.spec.target.selector) &&
         has(object.spec.target.selector.namespaces) && object.spec.target.selector.namespaces == ['@NAMESPACE@'] &&
-        has(object.spec.target.selector.labelSelectors) && size(object.spec.target.selector.labelSelectors) == 2 &&
+        has(object.spec.target.selector.labelSelectors) && (size(object.spec.target.selector.labelSelectors) == 2 || size(object.spec.target.selector.labelSelectors) == 3) &&
         'chaos.rhiza.io/run' in object.spec.target.selector.labelSelectors && object.spec.target.selector.labelSelectors['chaos.rhiza.io/run'] == '@RUN_ID@' &&
-        'app' in object.spec.target.selector.labelSelectors && object.spec.target.selector.labelSelectors['app'] == 'rhiza-voter' &&
-        !has(object.spec.target.selector.pods) &&
+        'app' in object.spec.target.selector.labelSelectors && object.spec.target.selector.labelSelectors['app'] in ['rhiza-voter', 'rhiza-fencer'] &&
         !has(object.spec.target.selector.nodes) && !has(object.spec.target.selector.nodeSelectors) &&
         !has(object.spec.target.selector.annotationSelectors) &&
         !has(object.spec.target.selector.fieldSelectors) && !has(object.spec.target.selector.podPhaseSelectors) &&
         has(object.spec.duration) && !has(object.spec.value) && (
           (object.spec.duration == '45s' && object.spec.mode == 'one' &&
            variables.selectorIsolatedVoter &&
+           !has(variables.selector.pods) &&
+           object.spec.target.selector.labelSelectors['app'] == 'rhiza-voter' &&
+           !has(object.spec.target.selector.pods) &&
            has(object.spec.target.selector.expressionSelectors) &&
            size(object.spec.target.selector.expressionSelectors) == 1 &&
            object.spec.target.selector.expressionSelectors[0].key == 'statefulset.kubernetes.io/pod-name' &&
@@ -201,8 +230,31 @@ spec:
            'rhiza-voter-2' in object.spec.target.selector.expressionSelectors[0].values) ||
           (object.spec.duration == '60s' && object.spec.mode == 'all' &&
            variables.selectorOperator &&
-           !has(object.spec.target.selector.expressionSelectors)))
-      message: NetworkChaos admits only voter-0 isolation or the operator whole-generation partition.
+           !has(variables.selector.pods) &&
+           object.spec.target.selector.labelSelectors['app'] == 'rhiza-voter' &&
+           !has(object.spec.target.selector.pods) && !has(object.spec.target.selector.expressionSelectors)) ||
+          ((object.spec.duration == '180s' && object.spec.mode == 'all' && variables.selectorRuntimeAgent &&
+            has(object.spec.target.selector.pods) && size(object.spec.target.selector.pods) == 1 &&
+            '@NAMESPACE@' in object.spec.target.selector.pods && size(object.spec.target.selector.pods['@NAMESPACE@']) == 1 &&
+            object.spec.target.selector.pods['@NAMESPACE@'][0].startsWith('rhiza-fencer-') &&
+            size(object.spec.target.selector.labelSelectors) == 3 &&
+            object.spec.target.selector.labelSelectors['app'] == 'rhiza-fencer' &&
+            object.spec.target.selector.labelSelectors['rhiza.dev/gcs-capture'] == variables.selector.labelSelectors['rhiza.dev/gcs-capture'] &&
+            !has(object.spec.target.selector.expressionSelectors)) ||
+           (object.spec.duration == '180s' && object.spec.mode == 'one' && variables.selectorOperatorPod &&
+            has(object.spec.target.selector.pods) && size(object.spec.target.selector.pods) == 1 &&
+            '@NAMESPACE@' in object.spec.target.selector.pods && size(object.spec.target.selector.pods['@NAMESPACE@']) == 1 &&
+            object.spec.target.selector.pods['@NAMESPACE@'][0].startsWith('rhiza-fencer-') &&
+            size(object.spec.target.selector.labelSelectors) == 3 &&
+            object.spec.target.selector.labelSelectors['app'] == 'rhiza-fencer' &&
+            object.spec.target.selector.labelSelectors['rhiza.dev/gcs-capture'] == variables.selector.labelSelectors['rhiza.dev/gcs-capture'] &&
+            !has(object.spec.target.selector.expressionSelectors)) ||
+           (object.spec.duration == '180s' && object.spec.mode == 'all' &&
+            variables.selectorVoterCohort && has(object.spec.target.selector.pods) &&
+            object.spec.target.selector.pods == variables.selector.pods &&
+            object.spec.target.selector.labelSelectors == variables.selector.labelSelectors &&
+            !has(object.spec.target.selector.expressionSelectors))))
+      message: NetworkChaos admits only the legacy voter/operator shapes, exact control-loss links, or a bounded full voter-cohort partition.
 ---
 apiVersion: admissionregistration.k8s.io/v1
 kind: ValidatingAdmissionPolicyBinding
@@ -243,7 +295,10 @@ metadata:
   namespace: @NAMESPACE@
 rules:
   - apiGroups: ['']
-    resources: [pods, configmaps, services]
+    resources: [pods]
+    verbs: [create, get, list, watch, delete, patch]
+  - apiGroups: ['']
+    resources: [configmaps, services]
     verbs: [create, get, list, watch, delete]
   - apiGroups: ['']
     resources: [serviceaccounts]

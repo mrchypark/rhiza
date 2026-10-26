@@ -41,6 +41,14 @@ spec:
                   type: string
                 allowDataLoss:
                   type: boolean
+                allowMissingSourceMembership:
+                  type: boolean
+                  description: >-
+                    Default-off manual recovery opt-in for a definitively absent
+                    source membership object. Requires async durability,
+                    allowDataLoss, a closed canonical CONTROL cohort, and the
+                    frozen-source GCS recovery path. Malformed or unreadable
+                    membership is never treated as missing.
                 maxArchiveAgeSeconds:
                   type: integer
                   format: int64

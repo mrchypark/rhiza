@@ -36,20 +36,22 @@ type ForkOptions struct {
 }
 
 type ForkResult struct {
-	Tip          uint64 `json:"tip"`
-	PrefixHash   string `json:"prefix_hash"`
-	ManifestHash string `json:"manifest_hash"`
+	Tip          uint64               `json:"tip"`
+	PrefixHash   string               `json:"prefix_hash"`
+	ManifestHash string               `json:"manifest_hash"`
+	FrozenSource *FrozenSourceBinding `json:"frozen_source,omitempty"`
 }
 
 type forkIntent struct {
-	Version              int      `json:"version"`
-	OperationID          string   `json:"operation_id"`
-	SourcePrefix         string   `json:"source_prefix"`
-	TargetPrefix         string   `json:"target_prefix"`
-	MemberIDs            []string `json:"member_ids"`
-	ManifestHash         string   `json:"manifest_hash"`
-	SourceBootstrapHash  string   `json:"source_bootstrap_hash,omitempty"`
-	TargetMembershipHash string   `json:"target_membership_hash,omitempty"`
+	Version              int                  `json:"version"`
+	OperationID          string               `json:"operation_id"`
+	SourcePrefix         string               `json:"source_prefix"`
+	TargetPrefix         string               `json:"target_prefix"`
+	MemberIDs            []string             `json:"member_ids"`
+	ManifestHash         string               `json:"manifest_hash"`
+	SourceBootstrapHash  string               `json:"source_bootstrap_hash,omitempty"`
+	TargetMembershipHash string               `json:"target_membership_hash,omitempty"`
+	FrozenSource         *FrozenSourceBinding `json:"frozen_source,omitempty"`
 }
 
 const forkLease = 10 * time.Minute
@@ -83,7 +85,7 @@ func Fork(ctx context.Context, bucket objstore.Bucket, options ForkOptions) (For
 			if err != nil {
 				return ForkResult{}, err
 			}
-			if result.ManifestHash != existing.ManifestHash {
+			if result.FrozenSource != nil || result.ManifestHash != existing.ManifestHash {
 				return ForkResult{}, fmt.Errorf("fork result does not match intent")
 			}
 			if err := verifyCachedForkResult(ctx, bucket, targetPrefix, options.OperationID, options.Members, result); err != nil {
@@ -95,7 +97,7 @@ func Fork(ctx context.Context, bucket objstore.Bucket, options ForkOptions) (For
 		return ForkResult{}, err
 	}
 
-	source := NewManager(bucket, sourcePrefix, 1)
+	source := NewManager(bucket, sourcePrefix, ArchiveConfigID)
 	defer source.Close()
 	if err := source.Load(ctx); err != nil {
 		return ForkResult{}, fmt.Errorf("load source archive: %w", err)
@@ -226,7 +228,10 @@ func forkAnchoredGeneration(ctx context.Context, bucket objstore.Bucket, options
 			if err != nil {
 				return ForkResult{}, err
 			}
-			target := NewManager(bucket, targetPrefix, 1)
+			if result.FrozenSource != nil {
+				return ForkResult{}, fmt.Errorf("anchored fork result has unexpected frozen source binding")
+			}
+			target := NewManager(bucket, targetPrefix, ArchiveConfigID)
 			if err := target.Load(ctx); err != nil {
 				target.Close()
 				return ForkResult{}, err
@@ -245,7 +250,7 @@ func forkAnchoredGeneration(ctx context.Context, bucket objstore.Bucket, options
 	} else if err := ensureForkTargetEmpty(ctx, bucket, targetPrefix); err != nil {
 		return ForkResult{}, err
 	}
-	source := NewManager(bucket, sourcePrefix, 1)
+	source := NewManager(bucket, sourcePrefix, ArchiveConfigID)
 	defer source.Close()
 	if err := source.Load(ctx); err != nil {
 		return ForkResult{}, fmt.Errorf("load source archive: %w", err)
@@ -344,7 +349,14 @@ func verifyForkSnapshotConfig(ctx context.Context, snapshot *RecoverySnapshot, s
 }
 
 func verifyForkSnapshotWithMode(ctx context.Context, snapshot *RecoverySnapshot, seal quepaxa.CheckpointSeal, decision quepaxa.DecidedValue, checkpoints *checkpoint.Manager, bootstrap quepaxa.Cluster, reconfiguration bool) ([32]byte, error) {
+	return verifyForkSnapshotWithAnchor(ctx, snapshot, seal, decision, checkpoints, bootstrap, reconfiguration, nil, [32]byte{})
+}
+
+func verifyForkSnapshotWithAnchor(ctx context.Context, snapshot *RecoverySnapshot, seal quepaxa.CheckpointSeal, decision quepaxa.DecidedValue, checkpoints *checkpoint.Manager, bootstrap quepaxa.Cluster, reconfiguration bool, anchor *GenerationAnchor, anchorHash [32]byte) ([32]byte, error) {
 	var zero [32]byte
+	if snapshot == nil || len(bootstrap.Members) == 0 {
+		return zero, fmt.Errorf("fork verification requires a snapshot and bootstrap membership")
+	}
 	dir, err := os.MkdirTemp("", "rhiza-fork-verify-*")
 	if err != nil {
 		return zero, err
@@ -361,7 +373,7 @@ func verifyForkSnapshotWithMode(ctx context.Context, snapshot *RecoverySnapshot,
 			return zero, fmt.Errorf("fork observer ID collides with member")
 		}
 	}
-	core, err := quepaxa.NewObserver(quepaxa.Config{NodeID: observerID, Cluster: bootstrap, WAL: wal, EnableReconfiguration: reconfiguration})
+	core, err := quepaxa.NewObserver(quepaxa.Config{NodeID: observerID, Cluster: bootstrap, WAL: wal, EnableReconfiguration: reconfiguration, EngineOwnedRemovals: reconfiguration})
 	if err != nil {
 		return zero, err
 	}
@@ -369,6 +381,28 @@ func verifyForkSnapshotWithMode(ctx context.Context, snapshot *RecoverySnapshot,
 		core.SetCheckpointValidator(func(ctx context.Context, candidate quepaxa.CheckpointSeal) error {
 			return checkpoints.Verify(ctx, uint64(candidate.Index), candidate.RootHash, candidate.StateHash)
 		})
+	}
+	if anchor != nil {
+		capturedAnchor, ok := snapshot.GenerationAnchor()
+		if !ok || capturedAnchor != anchorHash || anchorHash == ([32]byte{}) {
+			return zero, fmt.Errorf("fork verifier snapshot does not match generation anchor")
+		}
+		prefixHash, err := parseGenerationHash(anchor.SourcePrefixHash)
+		if err != nil {
+			return zero, err
+		}
+		rootHash, err := parseGenerationHash(anchor.Checkpoint.RootHash)
+		if err != nil {
+			return zero, err
+		}
+		if err := core.InstallFencedGenerationBase(ctx, quepaxa.FencedGenerationBase{
+			ConfigID: bootstrap.ConfigID, Index: quepaxa.Slot(anchor.SourceTip), PrefixHash: prefixHash,
+			RootHash: rootHash, AnchorHash: anchorHash,
+		}); err != nil {
+			return zero, err
+		}
+	}
+	if checkpoints != nil {
 		if err := core.RestoreCheckpointBase(ctx, seal, decision); err != nil {
 			return zero, err
 		}
@@ -393,7 +427,7 @@ func verifyForkSnapshotWithMode(ctx context.Context, snapshot *RecoverySnapshot,
 }
 
 func verifyCachedForkResult(ctx context.Context, bucket objstore.Bucket, targetPrefix, operationID string, members []quepaxa.Member, result ForkResult) error {
-	target := NewManager(bucket, targetPrefix, 1)
+	target := NewManager(bucket, targetPrefix, ArchiveConfigID)
 	defer target.Close()
 	if err := target.Load(ctx); err != nil {
 		return err
@@ -579,7 +613,7 @@ func readForkIntent(ctx context.Context, bucket objstore.Bucket, prefix string) 
 		return forkIntent{}, false, fmt.Errorf("read fork intent")
 	}
 	var intent forkIntent
-	if err := json.Unmarshal(data, &intent); err != nil || (intent.Version != 1 && intent.Version != 2) || intent.OperationID == "" || !validForkHash(intent.ManifestHash) {
+	if err := json.Unmarshal(data, &intent); err != nil || (intent.Version != 1 && intent.Version != 2 && intent.Version != 3) || intent.OperationID == "" || !validForkHash(intent.ManifestHash) {
 		return forkIntent{}, false, fmt.Errorf("invalid fork intent")
 	}
 	canonical, _ := json.Marshal(intent)
@@ -590,10 +624,13 @@ func readForkIntent(ctx context.Context, bucket objstore.Bucket, prefix string) 
 	if err != nil || source != intent.SourcePrefix || target != intent.TargetPrefix || !validForkMemberIDs(intent.MemberIDs) {
 		return forkIntent{}, false, fmt.Errorf("invalid fork intent")
 	}
-	if intent.Version == 1 && (intent.SourceBootstrapHash != "" || intent.TargetMembershipHash != "") {
+	if intent.Version == 1 && (intent.SourceBootstrapHash != "" || intent.TargetMembershipHash != "" || intent.FrozenSource != nil) {
 		return forkIntent{}, false, fmt.Errorf("invalid fork intent")
 	}
-	if intent.Version == 2 && (!validForkHash(intent.SourceBootstrapHash) || !validForkHash(intent.TargetMembershipHash)) {
+	if (intent.Version == 2 || intent.Version == 3) && (!validForkHash(intent.SourceBootstrapHash) || !validForkHash(intent.TargetMembershipHash)) {
+		return forkIntent{}, false, fmt.Errorf("invalid fork intent")
+	}
+	if intent.Version == 2 && intent.FrozenSource != nil || intent.Version == 3 && (intent.FrozenSource == nil || validateFrozenBinding(*intent.FrozenSource) != nil || !frozenTargetPrefixMatches(intent.SourcePrefix, intent.TargetPrefix, intent.FrozenSource.Identity)) {
 		return forkIntent{}, false, fmt.Errorf("invalid fork intent")
 	}
 	return intent, true, nil
@@ -658,6 +695,9 @@ func readForkResult(ctx context.Context, bucket objstore.Bucket, prefix string) 
 	if err := json.Unmarshal(data, &result); err != nil || result.Tip == 0 || !validForkHash(result.PrefixHash) || !validForkHash(result.ManifestHash) {
 		return ForkResult{}, false, fmt.Errorf("invalid fork result")
 	}
+	if result.FrozenSource != nil && validateFrozenForkResult(result) != nil {
+		return ForkResult{}, false, fmt.Errorf("invalid fork result")
+	}
 	canonical, _ := json.Marshal(result)
 	if !bytes.Equal(canonical, data) {
 		return ForkResult{}, false, fmt.Errorf("invalid fork result")
@@ -682,14 +722,20 @@ func closeRootPin(pin *checkpoint.RecoveryPin) {
 }
 
 func writeForkResult(ctx context.Context, bucket objstore.Bucket, prefix string, result ForkResult) error {
-	data, _ := json.Marshal(result)
+	if result.FrozenSource != nil && validateFrozenForkResult(result) != nil {
+		return fmt.Errorf("invalid frozen fork result")
+	}
+	data, err := json.Marshal(result)
+	if err != nil || len(data) > maxHeadSize {
+		return fmt.Errorf("fork result exceeds the bounded record size")
+	}
 	if err := bucket.Upload(ctx, forkResultKey(prefix), bytes.NewReader(data), objstore.WithIfNotExists()); err == nil {
 		return nil
 	} else if !bucket.IsConditionNotMetErr(err) {
 		return err
 	}
 	got, ok, err := readForkResult(ctx, bucket, prefix)
-	if err != nil || !ok || got != result {
+	if err != nil || !ok || !sameForkResult(got, result) {
 		return fmt.Errorf("fork result conflict")
 	}
 	return nil

@@ -25,7 +25,7 @@ func Seal(ctx context.Context, bucket objstore.Bucket, prefix, operationID strin
 	if operationID == "" {
 		return fmt.Errorf("archive seal requires an operation ID")
 	}
-	m := NewManager(bucket, prefix, 1)
+	m := NewManager(bucket, prefix, ArchiveConfigID)
 	defer m.Close()
 	if err := m.Load(ctx); err != nil {
 		return fmt.Errorf("load archive for seal: %w", err)

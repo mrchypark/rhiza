@@ -795,6 +795,7 @@ func TestReconcileClusterRequiresMatchingVoterCount(t *testing.T) {
 	sts := fakeSTS("before-ack", voterMembers(3))
 	r := autoClusterResource("cluster-1", "uid-1", "logical-1")
 	r.Spec.Container, r.Spec.Automatic = "rhiza", true
+	r.Spec.Policy = &goodPolicy
 	normalizeClusterSpec(r)
 	adopted := adoptedClusterMembers(t, r, sts)
 	ctr, err := container(sts, "rhiza")
@@ -921,6 +922,7 @@ func boundClusterFixture(t *testing.T, voters []quepaxa.Member) (*Controller, *C
 	sts := fakeSTS("before-ack", voters)
 	r := autoClusterResource("cluster-1", "uid-1", "logical-1")
 	r.Spec.Container, r.Spec.Automatic = "rhiza", true
+	r.Spec.Policy = &goodPolicy
 	r.Spec.VoterCount = len(voters)
 	normalizeClusterSpec(r)
 	ctr, err := container(sts, "rhiza")
@@ -1631,6 +1633,7 @@ func TestClusterVoterCountAdoptsDerivedInventory(t *testing.T) {
 			c := clusterController(t, api)
 			r := autoClusterResource("cluster-1", "uid-1", "logical-1")
 			r.Spec.VoterCount, r.Spec.Automatic = count, true
+			r.Spec.Policy = &goodPolicy
 			normalizeClusterSpec(r)
 			members := adoptedClusterMembers(t, r, api.sts)
 			ctr, _ := container(api.sts, "rhiza")
@@ -1662,6 +1665,7 @@ func TestClusterFreshBootstrapGeneratesImmutableIdentitiesOnce(t *testing.T) {
 	c := clusterController(t, api)
 	r := autoClusterResource("cluster-1", "uid-1", "logical-1")
 	r.Spec.VoterCount, r.Spec.Automatic, r.Spec.Bootstrap = count, true, true
+	r.Spec.Policy = &goodPolicy
 	normalizeClusterSpec(r)
 
 	if err := c.reconcileCluster(ctx, r); err != nil {

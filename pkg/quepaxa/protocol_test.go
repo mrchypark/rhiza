@@ -316,11 +316,14 @@ func TestFastPathUsesEpochLeader(t *testing.T) {
 }
 
 type clusterTransport struct {
-	mu           sync.RWMutex
-	catchup      sync.Map
-	cores        map[NodeID]*Core
-	down         map[NodeID]bool
-	dropDecision map[NodeID]bool
+	mu                   sync.RWMutex
+	errorMu              sync.Mutex
+	catchup              sync.Map
+	cores                map[NodeID]*Core
+	down                 map[NodeID]bool
+	dropDecision         map[NodeID]bool
+	beforeAcceptDecision func(context.Context, NodeID, Decision) error
+	decisionErrors       map[Slot]map[NodeID]string
 }
 
 func (transport *clusterTransport) SendRecord(ctx context.Context, to NodeID, request RecordRequest) (Summary, error) {
@@ -362,6 +365,7 @@ func (transport *clusterTransport) SendRecord(ctx context.Context, to NodeID, re
 func (transport *clusterTransport) SendDecision(ctx context.Context, decision Decision) error {
 	transport.mu.RLock()
 	coreCount := len(transport.cores)
+	beforeAcceptDecision := transport.beforeAcceptDecision
 	targets := make([]*Core, 0, len(transport.cores))
 	var nextMembers, added map[NodeID]Member
 	for id, core := range transport.cores {
@@ -384,32 +388,88 @@ func (transport *clusterTransport) SendDecision(ctx context.Context, decision De
 		err error
 	}
 	results := make(chan result, len(targets))
+	recordError := func(slot Slot, id NodeID, err error) {
+		if err == nil {
+			return
+		}
+		transport.errorMu.Lock()
+		defer transport.errorMu.Unlock()
+		if transport.decisionErrors == nil {
+			transport.decisionErrors = make(map[Slot]map[NodeID]string)
+		}
+		if transport.decisionErrors[slot] == nil {
+			transport.decisionErrors[slot] = make(map[NodeID]string)
+		}
+		transport.decisionErrors[slot][id] = err.Error()
+	}
 	for _, core := range targets {
 		go func() {
-			if nextMembers != nil {
-				if err := core.WaitTip(ctx, decision.Slot-1); err != nil {
+			if beforeAcceptDecision != nil {
+				if err := beforeAcceptDecision(ctx, core.nodeID, decision); err != nil {
+					recordError(decision.Slot, core.nodeID, err)
 					results <- result{core.nodeID, err}
 					return
 				}
 			}
-			results <- result{core.nodeID, core.AcceptDecision(decision)}
+			if nextMembers != nil {
+				if err := core.WaitTip(ctx, decision.Slot-1); err != nil {
+					recordError(decision.Slot, core.nodeID, err)
+					results <- result{core.nodeID, err}
+					return
+				}
+			}
+			err := core.AcceptDecision(decision)
+			recordError(decision.Slot, core.nodeID, err)
+			results <- result{core.nodeID, err}
 		}()
 	}
 	successes := 0
 	nextSuccesses := 0
 	for range targets {
-		if result := <-results; result.err == nil {
-			successes++
-			if _, ok := nextMembers[result.id]; ok {
-				nextSuccesses++
-			}
-			delete(added, result.id)
-			if successes >= coreCount/2+1 && (nextMembers == nil || nextSuccesses >= len(nextMembers)/2+1 && len(added) == 0) {
-				return nil
-			}
+		result := <-results
+		if result.err != nil {
+			continue
+		}
+		successes++
+		if _, ok := nextMembers[result.id]; ok {
+			nextSuccesses++
+		}
+		delete(added, result.id)
+		if successes >= coreCount/2+1 && (nextMembers == nil || nextSuccesses >= len(nextMembers)/2+1 && len(added) == 0) {
+			return nil
 		}
 	}
 	return ErrQuorumUnavailable
+}
+
+func (transport *clusterTransport) decisionErrorsFor(slot Slot) map[NodeID]string {
+	transport.errorMu.Lock()
+	defer transport.errorMu.Unlock()
+	errors := make(map[NodeID]string, len(transport.decisionErrors[slot]))
+	for id, err := range transport.decisionErrors[slot] {
+		errors[id] = err
+	}
+	return errors
+}
+
+func (transport *clusterTransport) decisionErrorsSnapshot() map[Slot]map[NodeID]string {
+	transport.errorMu.Lock()
+	defer transport.errorMu.Unlock()
+	bySlot := make(map[Slot]map[NodeID]string, len(transport.decisionErrors))
+	for slot, recipientErrors := range transport.decisionErrors {
+		byRecipient := make(map[NodeID]string, len(recipientErrors))
+		for id, err := range recipientErrors {
+			byRecipient[id] = err
+		}
+		bySlot[slot] = byRecipient
+	}
+	return bySlot
+}
+
+func (transport *clusterTransport) setBeforeAcceptDecision(hook func(context.Context, NodeID, Decision) error) {
+	transport.mu.Lock()
+	defer transport.mu.Unlock()
+	transport.beforeAcceptDecision = hook
 }
 
 func (transport *clusterTransport) ReadTip(_ context.Context, to NodeID) (Slot, error) {
@@ -774,6 +834,112 @@ func TestProposalRecoversEarlierSlotWithoutFailureTimeout(t *testing.T) {
 	}
 }
 
+func TestDelayedScheduleDecisionReplicaCatchesUpContiguously(t *testing.T) {
+	cores, transport := newTestCluster(t)
+	transport.fail("n1")
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	leader := cores["n2"]
+	delayedSlot := leaderEpochFirst(uint64(256 / leaderEpochSize))
+	for request := uint64(1); leader.Tip() < delayedSlot-1; request++ {
+		tipBefore := leader.Tip()
+		value := make([]byte, 8)
+		binary.LittleEndian.PutUint64(value, request)
+		if _, _, err := leader.Propose(ctx, value); err != nil {
+			t.Fatalf("setup proposal request=%d tip-before=%d err=%v", request, tipBefore, err)
+		}
+		if got := leader.Tip(); got <= tipBefore || got > delayedSlot-1 {
+			t.Fatalf("setup proposal request=%d advanced tip from %d to %d, want progress through %d only", request, tipBefore, got, delayedSlot-1)
+		}
+	}
+	if leader.Tip() != delayedSlot-1 || cores["n3"].Tip() != delayedSlot-1 {
+		t.Fatalf("setup tips n2=%d n3=%d, want 256", leader.Tip(), cores["n3"].Tip())
+	}
+
+	entered := make(chan struct{}, 1)
+	release := make(chan struct{})
+	var releaseOnce sync.Once
+	defer releaseOnce.Do(func() { close(release) })
+	var gated atomic.Bool
+	transport.setBeforeAcceptDecision(func(ctx context.Context, id NodeID, decision Decision) error {
+		if id != "n3" || decision.Slot != delayedSlot || !gated.CompareAndSwap(false, true) {
+			return nil
+		}
+		entered <- struct{}{}
+		select {
+		case <-release:
+			return nil
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	})
+
+	type proposalResult struct {
+		slot Slot
+		err  error
+	}
+	results := make(chan proposalResult, 8)
+	for i := range 8 {
+		go func(i int) {
+			value := make([]byte, 8)
+			binary.LittleEndian.PutUint64(value, uint64(10_000+i))
+			slot, _, err := leader.Propose(ctx, value)
+			results <- proposalResult{slot: slot, err: err}
+		}(i)
+	}
+
+	select {
+	case <-entered:
+	case <-ctx.Done():
+		releaseOnce.Do(func() { close(release) })
+		t.Fatalf("slot %d did not reach delayed n3 delivery: %v", delayedSlot, ctx.Err())
+	}
+
+	var completed []proposalResult
+	var laterSuccesses int
+	for laterSuccesses < 4 && len(completed) < 8 {
+		select {
+		case result := <-results:
+			completed = append(completed, result)
+			if result.err == nil && result.slot > delayedSlot {
+				laterSuccesses++
+			}
+		case <-ctx.Done():
+			releaseOnce.Do(func() { close(release) })
+			t.Fatalf("later proposals did not pass delayed slot: completed=%+v n2=%d n3=%d delayed-slot-errors=%v err=%v",
+				completed, leader.Tip(), cores["n3"].Tip(), transport.decisionErrorsFor(delayedSlot), ctx.Err())
+		}
+	}
+	if laterSuccesses < 4 {
+		releaseOnce.Do(func() { close(release) })
+		t.Fatalf("only %d later proposals completed before release: %+v", laterSuccesses, completed)
+	}
+	if got := cores["n3"].Tip(); got != delayedSlot-1 {
+		releaseOnce.Do(func() { close(release) })
+		t.Fatalf("n3 contiguous tip advanced while slot %d was withheld: got=%d want=%d", delayedSlot, got, delayedSlot-1)
+	}
+	releaseOnce.Do(func() { close(release) })
+
+	for len(completed) < 8 {
+		select {
+		case result := <-results:
+			completed = append(completed, result)
+		case <-ctx.Done():
+			t.Fatalf("proposal workers did not finish after release: completed=%+v n2=%d n3=%d delayed-slot-errors=%v err=%v",
+				completed, leader.Tip(), cores["n3"].Tip(), transport.decisionErrorsFor(delayedSlot), ctx.Err())
+		}
+	}
+	for _, result := range completed {
+		if result.err != nil {
+			t.Fatalf("proposal slot=%d err=%v recipient-errors=%v", result.slot, result.err, transport.decisionErrorsFor(result.slot))
+		}
+	}
+	if got := cores["n3"].Tip(); got != leader.Tip() || got < delayedSlot+4 {
+		t.Fatalf("n3 did not catch up contiguously: n2=%d n3=%d", leader.Tip(), got)
+	}
+}
+
 func TestPipelineCrossesLeaderScheduleWithPreferredReplicaDown(t *testing.T) {
 	cores, transport := newTestCluster(t)
 	transport.fail("n1")
@@ -789,15 +955,16 @@ func TestPipelineCrossesLeaderScheduleWithPreferredReplicaDown(t *testing.T) {
 		slot    Slot
 	}
 	type workerResult struct {
-		worker      int
-		request     int
-		phase       string
-		slot        Slot
-		tipBefore   Slot
-		orderBefore []NodeID
-		elapsed     time.Duration
-		err         error
-		completed   []completedProposal
+		worker            int
+		request           int
+		phase             string
+		slot              Slot
+		tipBefore         Slot
+		orderBefore       []NodeID
+		elapsed           time.Duration
+		err               string
+		quorumUnavailable bool
+		completed         []completedProposal
 	}
 	jobs := make(chan int, 400)
 	results := make(chan workerResult, 8)
@@ -817,10 +984,13 @@ func TestPipelineCrossesLeaderScheduleWithPreferredReplicaDown(t *testing.T) {
 				}
 				started := time.Now()
 				proposalCtx, stop := context.WithTimeout(ctx, 30*time.Second)
-				last.slot, _, last.err = cores["n2"].Propose(proposalCtx, value)
+				slot, _, err := cores["n2"].Propose(proposalCtx, value)
+				last.slot = slot
 				stop()
 				last.elapsed = time.Since(started)
-				if last.err != nil {
+				if err != nil {
+					last.err = err.Error()
+					last.quorumUnavailable = errors.Is(err, ErrQuorumUnavailable)
 					results <- last
 					return
 				}
@@ -840,7 +1010,7 @@ func TestPipelineCrossesLeaderScheduleWithPreferredReplicaDown(t *testing.T) {
 	for range 8 {
 		result := <-results
 		completed = append(completed, result.completed...)
-		if result.err != nil {
+		if result.err != "" {
 			failures = append(failures, result)
 		}
 	}
@@ -907,8 +1077,8 @@ func TestPipelineCrossesLeaderScheduleWithPreferredReplicaDown(t *testing.T) {
 		}
 		tail = append(tail, fmt.Sprintf("%d:value-bytes=%d", decision.Slot, len(decision.Value)))
 	}
-	t.Fatalf("Propose workers failed: failures=%+v replica-tips={n1:%d n2:%d n3:%d} n2-next-decided=%t n2-next-proposers=%v n2-tail=[%s] through=%d tail-err=%v",
-		failures,
+	t.Fatalf("Propose workers failed: failures=%+v recipient-errors=%+v replica-tips={n1:%d n2:%d n3:%d} n2-next-decided=%t n2-next-proposers=%v n2-tail=[%s] through=%d tail-err=%v",
+		failures, transport.decisionErrorsSnapshot(),
 		cores["n1"].Tip(), core.Tip(), cores["n3"].Tip(), core.IsDecided(core.Tip()+1), core.ProposerOrder(), strings.Join(tail, ","), through, tailErr)
 }
 
