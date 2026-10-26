@@ -108,6 +108,11 @@ func (e *FencingExecutor) resolveStaticVoterStartupGrant(ctx context.Context, st
 	if str(nested(sts, "spec", "template", "metadata", "annotations", fencingProtocolAnnotation)) != "1" || str(nested(sts, "spec", "template", "metadata", "annotations", fencingRootAnnotation)) != rootUID {
 		return fencing.StartupGrant{}, false, fmt.Errorf("fencing: static startup template binding differs")
 	}
+	if e.AuthorityProfile == fencing.LogicalWriterProfileV1 {
+		if err := validateLogicalWriterTemplate(pod, sts); err != nil {
+			return fencing.StartupGrant{}, false, err
+		}
+	}
 	templateContainer, err := container(sts, containerName)
 	if err != nil {
 		return fencing.StartupGrant{}, false, err

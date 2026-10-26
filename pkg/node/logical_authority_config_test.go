@@ -204,8 +204,8 @@ func TestLogicalAuthoritySamePodRestartRequestsExactWALContinuationOverTLS(t *te
 		t.Fatalf("same-Pod logical WAL continuation: %v", err)
 	}
 	if node.authorityIdentity.RunID != runState.RunID || node.authorityIdentity.PodUID != podUID || node.authorityIdentity.WALIdentity != "" ||
-		node.authorityGrant.LogicalBinding.Recovery.ExpectedWALIdentity != walID {
-		t.Fatalf("continuation identity=%+v binding=%+v; want same RunID/PodUID and an authority-pinned exact local WAL", node.authorityIdentity, node.authorityGrant.LogicalBinding)
+		node.authorityGrant.ExpectedWALIdentity != "" || node.authorityGrant.LogicalBinding.Recovery != (fencing.LogicalRecoveryBindingV1{}) {
+		t.Fatalf("continuation identity=%+v grant=%+v; want same RunID/PodUID and the canonical existing binding without synthetic recovery fields", node.authorityIdentity, node.authorityGrant)
 	}
 }
 
@@ -391,9 +391,6 @@ func logicalAuthorityTestServer(t *testing.T, mode string) (*httptest.Server, st
 			}
 			if mode == "continuation" {
 				grant.Identity.WALIdentity = ""
-				grant.LogicalBinding.Recovery = fencing.LogicalRecoveryBindingV1{Version: fencing.LogicalRecoveryBindingVersionV1,
-					Kind: fencing.LogicalRecoverySameWAL, ExpectedWALIdentity: message.RegistrationWALIdentity}
-				grant.ExpectedWALIdentity = message.RegistrationWALIdentity
 			}
 			_ = json.NewEncoder(w).Encode(grant)
 		case "bind":

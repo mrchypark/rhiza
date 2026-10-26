@@ -1,3 +1,5 @@
+//go:build localhooks
+
 package logicalauthority_test
 
 import (
@@ -6,11 +8,14 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"encoding/pem"
+	"errors"
 	"fmt"
+	"io"
 	"net"
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"path"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -19,11 +24,13 @@ import (
 	"cloud.google.com/go/storage"
 	"github.com/mrchypark/rhiza/internal/objstore"
 	"github.com/mrchypark/rhiza/internal/types"
+	"github.com/mrchypark/rhiza/pkg/checkpoint"
 	"github.com/mrchypark/rhiza/pkg/fencing"
 	"github.com/mrchypark/rhiza/pkg/network"
 	"github.com/mrchypark/rhiza/pkg/node"
 	"github.com/mrchypark/rhiza/pkg/operator"
 	"github.com/mrchypark/rhiza/pkg/quepaxa"
+	"github.com/mrchypark/rhiza/pkg/recovery"
 	"google.golang.org/api/iterator"
 	"google.golang.org/api/option"
 )
@@ -89,7 +96,9 @@ func TestFlociGCSLogicalAuthorityThreeNodeBeforeAckAndSamePodRestart(t *testing.
 	}
 	t.Cleanup(func() { _ = sourceClient.Close() })
 
-	ids := []string{"voter-a", "voter-b", "voter-c"}
+	// Three live voters form quorum in this five-member bootstrap. voter-d is
+	// intentionally left pristine until it adopts the verified init stage.
+	ids := []string{"voter-a", "voter-b", "voter-c", "voter-d", "voter-e"}
 	peerTokens := map[string]string{}
 	members := make([]quepaxa.Member, 0, len(ids))
 	peerAddrs := make(map[string]string, len(ids))
@@ -141,7 +150,7 @@ func TestFlociGCSLogicalAuthorityThreeNodeBeforeAckAndSamePodRestart(t *testing.
 			"envFrom": []any{map[string]any{"configMapRef": map[string]any{"name": "rhiza-config"}}, map[string]any{"secretRef": map[string]any{"name": "rhiza-peer-tokens"}}}}}}}
 	statefulSet := map[string]any{"metadata": map[string]string{"name": statefulSetName, "uid": statefulSetUID}, "spec": map[string]any{"template": template}}
 
-	api := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	api := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		switch {
 		case r.URL.Path == "/apis/authentication.k8s.io/v1/tokenreviews":
@@ -213,9 +222,12 @@ func TestFlociGCSLogicalAuthorityThreeNodeBeforeAckAndSamePodRestart(t *testing.
 			Members: members, EnableReconfiguration: true, AuthorityProfile: fencing.LogicalWriterProfileV1,
 			AuthorityURL: authority.URL + "/v1/supervisor", AuthorityCAFile: caPath, AuthorityTokenFile: tokenPath,
 			ObjStoreProvider: "gcs", ObjStoreBucket: bucketName, ObjStorePrefix: "archive/" + clusterID,
-			ObjStoreDurability: types.ObjectStoreDurabilityBeforeAck, ObjStoreServiceAccount: credentials,
-			ObjStoreSyncInterval: time.Hour, CheckpointInterval: time.Hour}
+			ObjStoreDurability:   types.ObjectStoreDurabilityBeforeAck,
+			ObjStoreSyncInterval: time.Hour, CheckpointInterval: time.Second}
 		configs[id] = cfg
+		if id == ids[3] || id == ids[4] {
+			continue
+		}
 		t.Setenv("POD_UID", podUIDs[id])
 		t.Setenv("RHIZA_POD_NAME", id)
 		instance := node.New(cfg)
@@ -232,7 +244,7 @@ func TestFlociGCSLogicalAuthorityThreeNodeBeforeAckAndSamePodRestart(t *testing.
 			}
 		})
 	}
-	for _, id := range ids {
+	for _, id := range ids[:3] {
 		for !nodes[id].Ready() {
 			select {
 			case <-ctx.Done():
@@ -251,6 +263,16 @@ func TestFlociGCSLogicalAuthorityThreeNodeBeforeAckAndSamePodRestart(t *testing.
 	if _, err := apiA.Execute(ctx, network.ExecuteRequest{RequestID: "floci-insert-" + suffix, SQL: "INSERT INTO lifecycle(value) VALUES ('durable')"}); err != nil {
 		t.Fatalf("before-ack insert: %v", err)
 	}
+	if _, err := apiA.Execute(ctx, network.ExecuteRequest{RequestID: "floci-create-compaction-" + suffix, SQL: "CREATE TABLE mutation_history (id INTEGER PRIMARY KEY, value TEXT)"}); err != nil {
+		t.Fatalf("create bounded mutation-history table: %v", err)
+	}
+	for i := range 70 {
+		requestID := fmt.Sprintf("floci-compaction-%s-%02d", suffix, i)
+		sql := fmt.Sprintf("INSERT INTO mutation_history(id, value) VALUES (%d, 'entry-%02d')", i+1, i)
+		if _, err := apiA.Execute(ctx, network.ExecuteRequest{RequestID: requestID, SQL: sql}); err != nil {
+			t.Fatalf("before-ack mutation %d/70: %v", i+1, err)
+		}
+	}
 	apiB, err := nodes[ids[1]].API()
 	if err != nil {
 		t.Fatal(err)
@@ -260,6 +282,7 @@ func TestFlociGCSLogicalAuthorityThreeNodeBeforeAckAndSamePodRestart(t *testing.
 		t.Fatalf("cross-node linearizable read: rows=%v err=%v", query.Rows, err)
 	}
 
+	beforeRestartRunID := readLogicalRunID(t, configs[ids[1]].DataDir)
 	if err := nodes[ids[1]].Shutdown(); err != nil {
 		t.Fatalf("stop same-Pod node: %v", err)
 	}
@@ -269,6 +292,9 @@ func TestFlociGCSLogicalAuthorityThreeNodeBeforeAckAndSamePodRestart(t *testing.
 	restarted := node.New(configs[ids[1]])
 	if err := restarted.Open(ctx); err != nil {
 		t.Fatalf("same-Pod exact-WAL Node.Open: %v", err)
+	}
+	if got := readLogicalRunID(t, configs[ids[1]].DataDir); got != beforeRestartRunID {
+		t.Fatalf("same-Pod continuation changed canonical RunID: before=%q after=%q", beforeRestartRunID, got)
 	}
 	nodes[ids[1]] = restarted
 	closed[ids[1]] = false
@@ -295,6 +321,173 @@ func TestFlociGCSLogicalAuthorityThreeNodeBeforeAckAndSamePodRestart(t *testing.
 	if err != nil || len(afterRestart.Rows) != 1 || len(afterRestart.Rows[0]) != 1 || afterRestart.Rows[0][0] != "durable" {
 		t.Fatalf("same-Pod continuation lost durable row: rows=%v err=%v", afterRestart.Rows, err)
 	}
+	history, err := restartedAPI.Query(ctx, network.QueryRequest{SQL: "SELECT COUNT(*) FROM mutation_history", Consistency: "linearizable"})
+	if err != nil || len(history.Rows) != 1 || len(history.Rows[0]) != 1 || history.Rows[0][0] != int64(70) && history.Rows[0][0] != float64(70) {
+		t.Fatalf("same-Pod continuation lost mutations across the compaction threshold: rows=%v err=%v", history.Rows, err)
+	}
+	if _, err := restartedAPI.Execute(ctx, network.ExecuteRequest{RequestID: "floci-restart-insert-" + suffix,
+		SQL: "INSERT INTO lifecycle(value) VALUES ('after-restart')"}); err != nil {
+		t.Fatalf("same-Pod continuation could not reuse the canonical source producer: %v", err)
+	}
+	continued, err := restartedAPI.Query(ctx, network.QueryRequest{SQL: "SELECT value FROM lifecycle ORDER BY id", Consistency: "linearizable"})
+	if err != nil || len(continued.Rows) != 2 || continued.Rows[1][0] != "after-restart" {
+		t.Fatalf("same-Pod continuation readback: rows=%v err=%v", continued.Rows, err)
+	}
+
+	stageID := ids[3]
+	stageConfig := configs[stageID]
+	stageConfig.HAInitRestoreDir = filepath.Join(t.TempDir(), "ha-init-stage")
+	archiveBucket, err := objstore.NewBucket(objstore.Config{Provider: objstore.ProviderGCS, Bucket: bucketName})
+	if err != nil {
+		t.Fatalf("open isolated Floci bucket for init staging: %v", err)
+	}
+	t.Cleanup(func() { _ = archiveBucket.Close() })
+	var stageErr error
+	for {
+		stageErr = node.PrepareHAInitRestore(ctx, stageConfig, archiveBucket)
+		if stageErr == nil {
+			break
+		}
+		select {
+		case <-ctx.Done():
+			t.Fatalf("prepare stage from the certified Floci checkpoint: last error: %v; context: %v", stageErr, ctx.Err())
+		case <-time.After(time.Second):
+		}
+	}
+	manager := checkpoint.NewManager(archiveBucket, path.Join(stageConfig.ObjStorePrefix, string(stageConfig.ClusterID)), "", recovery.ArchiveConfigID)
+	if err := manager.Load(ctx); err != nil {
+		t.Fatalf("load Floci checkpoint root after staging: %v", err)
+	}
+	root := manager.Latest()
+	if root == nil {
+		t.Fatal("stage preparation succeeded without a certified checkpoint root")
+	}
+	blocks := captureFlociCheckpointBlocks(t, ctx, setupClient, bucketName,
+		path.Join(stageConfig.ObjStorePrefix, string(stageConfig.ClusterID)), root)
+	if err := removeFlociCheckpointBlocks(ctx, setupClient, bucketName, blocks); err != nil {
+		t.Fatalf("remove remote checkpoint payloads to force staged-file adoption: %v", err)
+	}
+	t.Setenv("POD_UID", podUIDs[stageID])
+	t.Setenv("RHIZA_POD_NAME", stageID)
+	stagedNode := node.New(stageConfig)
+	if err := stagedNode.Open(ctx); err != nil {
+		_ = restoreFlociCheckpointBlocks(ctx, setupClient, bucketName, blocks)
+		t.Fatalf("first-use logical Node.Open from staged checkpoint bytes: %v", err)
+	}
+	if err := restoreFlociCheckpointBlocks(ctx, setupClient, bucketName, blocks); err != nil {
+		_ = stagedNode.Shutdown()
+		t.Fatalf("restore checkpoint payloads after adoption oracle: %v", err)
+	}
+	for !stagedNode.Ready() {
+		select {
+		case <-ctx.Done():
+			_ = stagedNode.Shutdown()
+			t.Fatalf("fresh logical startup did not become Ready from staged files: %v", ctx.Err())
+		case <-time.After(25 * time.Millisecond):
+		}
+	}
+	stagedAPI, err := stagedNode.API()
+	if err != nil {
+		_ = stagedNode.Shutdown()
+		t.Fatal(err)
+	}
+	stagedRead, err := stagedAPI.Query(ctx, network.QueryRequest{SQL: "SELECT value FROM lifecycle WHERE id = 1", Consistency: "linearizable"})
+	if err != nil || len(stagedRead.Rows) != 1 || stagedRead.Rows[0][0] != "durable" {
+		_ = stagedNode.Shutdown()
+		t.Fatalf("staged logical startup lost checkpointed data: rows=%v err=%v", stagedRead.Rows, err)
+	}
+	closed[stageID] = false
+	nodes[stageID] = stagedNode
+	t.Cleanup(func() {
+		if !closed[stageID] {
+			if err := stagedNode.Shutdown(); err != nil {
+				t.Errorf("shutdown staged startup %s: %v", stageID, err)
+			}
+			closed[stageID] = true
+		}
+	})
+}
+
+func readLogicalRunID(t *testing.T, dataDir string) string {
+	t.Helper()
+	data, err := os.ReadFile(filepath.Join(dataDir, "logical-run.json"))
+	if err != nil {
+		t.Fatalf("read persisted logical Run state: %v", err)
+	}
+	var state struct {
+		RunID string `json:"runID"`
+	}
+	if err := json.Unmarshal(data, &state); err != nil || state.RunID == "" {
+		t.Fatalf("decode persisted logical Run state: runID=%q err=%v", state.RunID, err)
+	}
+	return state.RunID
+}
+
+type flociCheckpointBlock struct {
+	key        string
+	generation int64
+	data       []byte
+}
+
+func captureFlociCheckpointBlocks(t *testing.T, ctx context.Context, client *storage.Client, bucketName, prefix string, root *checkpoint.Checkpoint) []flociCheckpointBlock {
+	t.Helper()
+	seen := make(map[string]bool)
+	var blocks []flociCheckpointBlock
+	for _, file := range root.Files {
+		for _, block := range file.Blocks {
+			name := block.Hash + ".block"
+			if block.Generation != 0 {
+				name = fmt.Sprintf("%s_%020d.block", block.Hash, block.Generation)
+			}
+			key := path.Join(prefix, "checkpoint", "blocks", name)
+			if seen[key] {
+				continue
+			}
+			seen[key] = true
+			object := client.Bucket(bucketName).Object(key)
+			attrs, err := object.Attrs(ctx)
+			if err != nil {
+				t.Fatalf("read checkpoint block attributes %q: %v", key, err)
+			}
+			reader, err := object.Generation(attrs.Generation).NewReader(ctx)
+			if err != nil {
+				t.Fatalf("read checkpoint block %q: %v", key, err)
+			}
+			data, readErr := io.ReadAll(reader)
+			closeErr := reader.Close()
+			if readErr != nil || closeErr != nil {
+				t.Fatalf("read checkpoint block %q: %v", key, errors.Join(readErr, closeErr))
+			}
+			blocks = append(blocks, flociCheckpointBlock{key: key, generation: attrs.Generation, data: data})
+		}
+	}
+	if len(blocks) == 0 {
+		t.Fatal("certified staged checkpoint has no payload blocks")
+	}
+	return blocks
+}
+
+func removeFlociCheckpointBlocks(ctx context.Context, client *storage.Client, bucketName string, blocks []flociCheckpointBlock) error {
+	for _, block := range blocks {
+		if err := client.Bucket(bucketName).Object(block.key).Generation(block.generation).Delete(ctx); err != nil {
+			return fmt.Errorf("delete checkpoint block %q: %w", block.key, err)
+		}
+	}
+	return nil
+}
+
+func restoreFlociCheckpointBlocks(ctx context.Context, client *storage.Client, bucketName string, blocks []flociCheckpointBlock) error {
+	for _, block := range blocks {
+		writer := client.Bucket(bucketName).Object(block.key).NewWriter(ctx)
+		if _, err := writer.Write(block.data); err != nil {
+			_ = writer.Close()
+			return fmt.Errorf("restore checkpoint block %q: %w", block.key, err)
+		}
+		if err := writer.Close(); err != nil {
+			return fmt.Errorf("restore checkpoint block %q: %w", block.key, err)
+		}
+	}
+	return nil
 }
 
 func requireFlociEnvironment(t *testing.T) {

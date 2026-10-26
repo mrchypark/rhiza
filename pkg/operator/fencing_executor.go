@@ -16,6 +16,7 @@ import (
 	"net/url"
 	"path"
 	"path/filepath"
+	"reflect"
 	"slices"
 	"strings"
 	"time"
@@ -739,7 +740,23 @@ func (e *FencingExecutor) handle(w http.ResponseWriter, r *http.Request) {
 		if message.MutationLookup == nil || message.Drain != nil || message.Request != nil {
 			err = fmt.Errorf("fencing: malformed mutation lookup request")
 		} else {
-			mutationLookup, err = e.lookupMutation(r.Context(), uid, message.Identity, *message.MutationLookup)
+			root, readErr := e.read(r.Context(), uid, message.Identity.SourceClusterID)
+			if readErr != nil {
+				err = readErr
+			} else if root.Ledger.Profile != fencing.LogicalWriterProfileV1 {
+				// Preserve the physical RuntimeBinding lookup for legacy roots.
+				mutationLookup, err = e.lookupMutation(r.Context(), uid, message.Identity, *message.MutationLookup)
+			} else {
+				run, ok := root.Ledger.Runs[message.Identity.RunID]
+				if !ok || run.Identity != message.Identity || run.Runtime != nil || run.LogicalBinding == nil ||
+					fencing.RunRole(run) != fencing.StartupRoleVoterActive || run.LogicalBinding.ValidateBound() != nil ||
+					run.LogicalBinding.Role != fencing.StartupRoleVoterActive {
+					err = fmt.Errorf("fencing: logical mutation lookup is outside the exact enrolled Run")
+				} else {
+					authority := logicalMutationAuthority(uid, *run.LogicalBinding)
+					mutationLookup, err = e.lookupMutationForAuthority(r.Context(), authority, run, *message.MutationLookup)
+				}
+			}
 		}
 	} else if message.MutationLookup != nil {
 		err = fmt.Errorf("fencing: unexpected mutation lookup request")
@@ -1100,6 +1117,11 @@ func (e *FencingExecutor) authenticate(ctx context.Context, authorization string
 	}
 	if str(nested(sts, "metadata", "uid")) != uid {
 		return "", fmt.Errorf("fencing: workload UID differs")
+	}
+	if e.AuthorityProfile == fencing.LogicalWriterProfileV1 {
+		if err := validateLogicalWriterTemplate(pod, sts); err != nil {
+			return "", err
+		}
 	}
 	if str(nested(pod, "metadata", "labels", "rhiza.mrchypark.dev/automatic-learner")) != "" {
 		if err := e.validateLearnerBinding(ctx, pod, ownerName); err != nil {
@@ -1547,18 +1569,18 @@ func validateSupervisedPod(pod object) error {
 	return nil
 }
 
-// validateLogicalWriterPod admits the direct Rhiza main container under the
-// explicit logical authority profile. It intentionally does not relax the
-// legacy supervisor validator and currently rejects all init/sidecar paths;
-// any future init exception needs its own trusted capability profile.
+// validateLogicalWriterPod admits the direct Rhiza main container and the
+// exact read-only restore-init profile under logical-writer-v1. It does not
+// relax the legacy supervisor validator or admit arbitrary init containers.
 func validateLogicalWriterPod(pod object) error {
 	if str(nested(pod, "metadata", "annotations", fencingProtocolAnnotation)) != "1" {
 		return fmt.Errorf("fencing: workload is not enrolled")
 	}
 	spec := asObject(pod["spec"])
-	if spec["hostPID"] == true || spec["shareProcessNamespace"] == true || len(list(spec["containers"])) != 1 ||
-		len(list(spec["initContainers"])) != 0 || len(list(spec["ephemeralContainers"])) != 0 {
-		return fmt.Errorf("fencing: logical writer requires one private main process and no auxiliary containers")
+	if spec["hostPID"] == true || spec["shareProcessNamespace"] == true || spec["serviceAccountName"] != "rhiza-voter-reader" ||
+		spec["automountServiceAccountToken"] != false || len(list(spec["containers"])) != 1 ||
+		len(list(spec["initContainers"])) != 1 || len(list(spec["ephemeralContainers"])) != 0 {
+		return fmt.Errorf("fencing: logical writer requires one private main process and one approved restore init")
 	}
 	for _, volume := range list(spec["volumes"]) {
 		v := asObject(volume)
@@ -1567,8 +1589,14 @@ func validateLogicalWriterPod(pod object) error {
 		}
 	}
 	ctr := asObject(list(spec["containers"])[0])
+	if str(ctr["name"]) != "rhiza" || !reflect.DeepEqual(ctr["command"], []any{"/usr/local/bin/rhiza"}) {
+		return fmt.Errorf("fencing: logical writer main container identity differs")
+	}
 	if ctr["lifecycle"] != nil {
 		return fmt.Errorf("fencing: untracked lifecycle processes are unsupported")
+	}
+	if !logicalMainMounts(ctr["volumeMounts"]) {
+		return fmt.Errorf("fencing: logical writer main mounts differ from the read-only restore-stage profile")
 	}
 	for _, probe := range []string{"readinessProbe", "livenessProbe", "startupProbe"} {
 		if nested(ctr, probe, "exec") != nil {
@@ -1585,7 +1613,158 @@ func validateLogicalWriterPod(pod object) error {
 			return fmt.Errorf("fencing: procfs must remain kernel-provided")
 		}
 	}
+	return validateLogicalRestoreInit(spec, ctr)
+}
+
+func validateLogicalWriterTemplate(pod, sts object) error {
+	if err := validateLogicalWriterPod(pod); err != nil {
+		return fmt.Errorf("fencing: logical Pod is not trusted: %w", err)
+	}
+	template := asObject(nested(sts, "spec", "template"))
+	if template == nil || str(nested(template, "metadata", "annotations", fencingProtocolAnnotation)) != "1" ||
+		str(nested(template, "metadata", "annotations", fencingRootAnnotation)) != str(nested(pod, "metadata", "annotations", fencingRootAnnotation)) {
+		return fmt.Errorf("fencing: logical StatefulSet template binding differs")
+	}
+	templatePod := object{"metadata": template["metadata"], "spec": template["spec"]}
+	if err := validateLogicalWriterPod(templatePod); err != nil {
+		return fmt.Errorf("fencing: logical StatefulSet template is not trusted: %w", err)
+	}
+	for _, group := range []string{"containers", "initContainers"} {
+		live, expected := list(nested(pod, "spec", group)), list(nested(templatePod, "spec", group))
+		if len(live) != 1 || len(expected) != 1 {
+			return fmt.Errorf("fencing: logical Pod/template %s inventory differs", group)
+		}
+		liveContainer, templateContainer := asObject(live[0]), asObject(expected[0])
+		for _, field := range []string{"name", "image", "command", "args"} {
+			if !reflect.DeepEqual(liveContainer[field], templateContainer[field]) {
+				return fmt.Errorf("fencing: logical Pod %s differs from current StatefulSet template", field)
+			}
+		}
+	}
 	return nil
+}
+
+func validateLogicalRestoreInit(podSpec, main object) error {
+	init := asObject(list(podSpec["initContainers"])[0])
+	if str(init["name"]) != "restore-init" || !digestPinnedImage(str(main["image"])) || init["image"] != str(main["image"]) ||
+		init["imagePullPolicy"] != "IfNotPresent" || !reflect.DeepEqual(init["command"], main["command"]) ||
+		!reflect.DeepEqual(init["args"], []any{"restore-init"}) || init["lifecycle"] != nil || init["ports"] != nil ||
+		init["livenessProbe"] != nil || init["readinessProbe"] != nil || init["startupProbe"] != nil {
+		return fmt.Errorf("fencing: restore init does not match the trusted image and command profile")
+	}
+	if !logicalRestoreInitEnvFrom(init["envFrom"]) || !logicalRestoreInitEnv(init["env"]) || !logicalRestoreInitSecurity(asObject(init["securityContext"])) ||
+		!logicalRestoreInitMounts(init["volumeMounts"]) || !logicalRestoreInitVolumes(podSpec["volumes"]) {
+		return fmt.Errorf("fencing: restore init credentials, staging storage, or security profile differs")
+	}
+	return nil
+}
+
+func digestPinnedImage(image string) bool {
+	marker := strings.LastIndex(image, "@sha256:")
+	if marker <= 0 || len(image)-marker != len("@sha256:")+64 {
+		return false
+	}
+	_, err := hex.DecodeString(image[marker+len("@sha256:"):])
+	return err == nil
+}
+
+func logicalRestoreInitEnvFrom(value any) bool {
+	entries := list(value)
+	if len(entries) != 2 {
+		return false
+	}
+	want := []string{"rhiza-config", "rhiza-object-store"}
+	for i, entry := range entries {
+		entryObject := asObject(entry)
+		ref := asObject(nested(entryObject, "configMapRef"))
+		if len(entryObject) != 1 || ref == nil || len(ref) != 1 || str(ref["name"]) != want[i] {
+			return false
+		}
+	}
+	return true
+}
+
+func logicalRestoreInitEnv(value any) bool {
+	entries := list(value)
+	if len(entries) != 1 {
+		return false
+	}
+	env := asObject(entries[0])
+	return len(env) == 2 && str(env["name"]) == "RHIZA_HA_INIT_RESTORE_DIR" && str(env["value"]) == "/ha-restore-staging/stage"
+}
+
+func logicalRestoreInitSecurity(security object) bool {
+	if len(security) != 4 || security["runAsNonRoot"] != true || security["allowPrivilegeEscalation"] != false ||
+		security["readOnlyRootFilesystem"] != true {
+		return false
+	}
+	caps := asObject(security["capabilities"])
+	if caps == nil || len(list(caps["drop"])) != 1 || str(list(caps["drop"])[0]) != "ALL" || len(list(caps["add"])) != 0 {
+		return false
+	}
+	return true
+}
+
+func logicalRestoreInitMounts(value any) bool {
+	mounts := list(value)
+	if len(mounts) != 2 {
+		return false
+	}
+	got := map[string]object{}
+	for _, value := range mounts {
+		mount := asObject(value)
+		name := str(mount["name"])
+		if name == "" || got[name] != nil || len(mount) != 2 {
+			return false
+		}
+		got[name] = mount
+	}
+	return str(got["temporary"]["mountPath"]) == "/tmp" && got["temporary"]["readOnly"] != true &&
+		str(got["restore-staging"]["mountPath"]) == "/ha-restore-staging" && got["restore-staging"]["readOnly"] != true
+}
+
+func logicalRestoreInitVolumes(value any) bool {
+	wanted := map[string]bool{"temporary": false, "restore-staging": false}
+	for _, raw := range list(value) {
+		volume := asObject(raw)
+		name := str(volume["name"])
+		if _, ok := wanted[name]; !ok {
+			continue
+		}
+		if wanted[name] || asObject(volume["emptyDir"]) == nil || volume["hostPath"] != nil || volume["persistentVolumeClaim"] != nil {
+			return false
+		}
+		wanted[name] = true
+	}
+	return wanted["temporary"] && wanted["restore-staging"]
+}
+
+func logicalMainMounts(value any) bool {
+	want := map[string]struct {
+		path     string
+		readOnly bool
+	}{
+		"temporary":       {path: "/tmp"},
+		"data":            {path: "/data"},
+		"restore-staging": {path: "/ha-restore-staging", readOnly: true},
+		"authority-token": {path: "/var/run/secrets/rhiza-authority", readOnly: true},
+		"authority-ca":    {path: "/fencer-ca", readOnly: true},
+	}
+	mounts := list(value)
+	if len(mounts) != len(want) {
+		return false
+	}
+	seen := make(map[string]bool, len(mounts))
+	for _, raw := range mounts {
+		mount := asObject(raw)
+		name := str(mount["name"])
+		expected, ok := want[name]
+		if !ok || seen[name] || str(mount["mountPath"]) != expected.path || (mount["readOnly"] == true) != expected.readOnly {
+			return false
+		}
+		seen[name] = true
+	}
+	return len(seen) == len(want)
 }
 
 // Reconcile evaluates durable proof, never status-only assertions. The current

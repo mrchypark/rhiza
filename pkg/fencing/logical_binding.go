@@ -46,12 +46,12 @@ func (r LogicalRecoveryBindingV1) Validate(candidateNodeID, assignmentID string)
 	if r.empty() {
 		return nil
 	}
-	if r.Version != LogicalRecoveryBindingVersionV1 || !mutationDigestValid(r.ExpectedWALIdentity) {
+	if r.Version != LogicalRecoveryBindingVersionV1 || (r.ExpectedWALIdentity != "" && !mutationDigestValid(r.ExpectedWALIdentity)) {
 		return fmt.Errorf("fencing: logical recovery binding is incomplete or unsupported")
 	}
 	switch r.Kind {
 	case LogicalRecoverySameWAL:
-		if assignmentID != "" || r.AssignmentID != "" || r.OperationID != "" || r.ReplacedNodeID != "" ||
+		if !mutationDigestValid(r.ExpectedWALIdentity) || assignmentID != "" || r.AssignmentID != "" || r.OperationID != "" || r.ReplacedNodeID != "" ||
 			r.ReplacedWALIdentity != "" || r.RemoveOperationID != "" || r.AddOperationID != "" ||
 			r.TargetConfigID != 0 || r.TargetMembershipHash != "" || r.PromotionEvidenceHash != "" {
 			return fmt.Errorf("fencing: same-WAL recovery carries replacement authority")
@@ -59,7 +59,7 @@ func (r LogicalRecoveryBindingV1) Validate(candidateNodeID, assignmentID string)
 	case LogicalRecoveryReplacement:
 		if !mutationDigestValid(assignmentID) || r.AssignmentID != assignmentID || r.OperationID == "" || len(r.OperationID) > 256 ||
 			r.ReplacedNodeID == "" || r.ReplacedNodeID == candidateNodeID || !mutationDigestValid(r.ReplacedWALIdentity) ||
-			r.ReplacedWALIdentity == r.ExpectedWALIdentity || r.RemoveOperationID == "" || len(r.RemoveOperationID) > 256 ||
+			(r.ExpectedWALIdentity != "" && r.ReplacedWALIdentity == r.ExpectedWALIdentity) || r.RemoveOperationID == "" || len(r.RemoveOperationID) > 256 ||
 			r.AddOperationID == "" || len(r.AddOperationID) > 256 || r.TargetConfigID == 0 || !mutationDigestValid(r.TargetMembershipHash) {
 			return fmt.Errorf("fencing: assigned replacement recovery binding is incomplete")
 		}
@@ -232,6 +232,13 @@ func (b LogicalWriterBindingV1) Validate() error {
 	}
 	if b.Role == StartupRoleLearnerPendingRemove && (b.AssignmentID == "" || b.Recovery.Kind != LogicalRecoveryReplacement) {
 		return fmt.Errorf("fencing: pending logical learner requires an authority-assigned replacement binding")
+	}
+	if b.Role == StartupRoleLearnerPendingRemove && b.Recovery.Kind == LogicalRecoveryReplacement &&
+		b.WALIdentity != "" && b.Recovery.ExpectedWALIdentity == "" {
+		return fmt.Errorf("fencing: bound pending learner lacks its pinned replacement WAL")
+	}
+	if b.Role == StartupRoleVoterActive && b.Recovery.Kind == LogicalRecoveryReplacement && b.Recovery.ExpectedWALIdentity == "" {
+		return fmt.Errorf("fencing: active replacement lacks its pinned learner WAL")
 	}
 	if b.Recovery.Kind != "" && b.WALIdentity != "" && b.WALIdentity != b.Recovery.ExpectedWALIdentity {
 		return fmt.Errorf("fencing: logical recovery WAL differs from its expected identity")
@@ -451,6 +458,9 @@ func (l *Ledger) BindLogicalWAL(identity Identity) error {
 	run.Identity = identity
 	binding := *run.LogicalBinding
 	binding.WALIdentity = identity.WALIdentity
+	if runRole(run) == StartupRoleLearnerPendingRemove && binding.Recovery.Kind == LogicalRecoveryReplacement && binding.Recovery.ExpectedWALIdentity == "" {
+		binding.Recovery.ExpectedWALIdentity = identity.WALIdentity
+	}
 	run.LogicalBinding = &binding
 	l.Runs[identity.RunID] = run
 	return nil
@@ -554,6 +564,9 @@ func (l *Ledger) PromoteLogicalLearner(identity Identity, proof LogicalPromotion
 	if err := proof.ValidateAgainst(identity, run.LogicalBinding.Recovery); err != nil {
 		return err
 	}
+	if err := l.validateReplacedLogicalWriterClosed(run.LogicalBinding.Recovery); err != nil {
+		return err
+	}
 	evidenceDigest := proof.Digest()
 	wantActiveBinding := activeBinding
 	wantActiveBinding.Recovery.PromotionEvidenceHash = evidenceDigest
@@ -592,6 +605,36 @@ func (l *Ledger) PromoteLogicalLearner(identity Identity, proof LogicalPromotion
 	run.MutationProfile = executionProfile
 	run.MutationStageIncarnation = stageIncarnation
 	l.Runs[identity.RunID] = run
+	return nil
+}
+
+// validateReplacedLogicalWriterClosed requires storage-effect closure for the
+// exact old logical WAL before an assigned replacement can become active. The
+// closure references are recorded only after the trusted storage verifier has
+// checked the canonical producer and its effects; Pod absence or REMOVE
+// membership evidence alone is not a substitute.
+func (l *Ledger) validateReplacedLogicalWriterClosed(recovery LogicalRecoveryBindingV1) error {
+	if l == nil || recovery.Kind != LogicalRecoveryReplacement || recovery.ReplacedNodeID == "" || recovery.ReplacedWALIdentity == "" {
+		return fmt.Errorf("fencing: logical replacement closure binding is incomplete")
+	}
+	foundWAL := false
+	for _, old := range l.Runs {
+		if old.Identity.NodeID != recovery.ReplacedNodeID {
+			continue
+		}
+		if old.LogicalClosure == nil || validateLogicalRunClosure(old, *old.LogicalClosure) != nil {
+			return fmt.Errorf("fencing: replaced logical voter has an unclosed Run")
+		}
+		if old.Identity.WALIdentity == recovery.ReplacedWALIdentity {
+			if old.LogicalClosure.Kind != LogicalRunClosureBoundWAL || old.LogicalClosure.Identity.WALIdentity != recovery.ReplacedWALIdentity {
+				return fmt.Errorf("fencing: replaced logical WAL lacks bound storage closure")
+			}
+			foundWAL = true
+		}
+	}
+	if !foundWAL {
+		return fmt.Errorf("fencing: replaced logical WAL has no canonical closed Run")
+	}
 	return nil
 }
 

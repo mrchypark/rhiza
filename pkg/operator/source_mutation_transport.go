@@ -213,6 +213,11 @@ func (e *FencingExecutor) admitLogicalSourceMutation(ctx context.Context, uid st
 			if exists && entry.Intent == request.Intent {
 				return nil
 			}
+			if request.Sequence <= producer.CompactedThrough {
+				_, archivedErr := e.lookupArchivedMutationForAuthority(ctx, logicalMutationAuthority(uid, *run.LogicalBinding),
+					request.ProducerUID, request.Sequence, request.Intent)
+				return archivedErr
+			}
 			return fmt.Errorf("fencing: logical mutation retry differs from original tuple")
 		}
 		_, voterClosed := root.Ledger.ClosedNodes[id.NodeID]
@@ -237,10 +242,30 @@ func (e *FencingExecutor) admitLogicalSourceMutation(ctx context.Context, uid st
 		}
 		if isArchiveGenesisMutation(request.Intent) {
 			if err := e.prepareLogicalArchiveGenesisMutation(ctx, uid, id, *run.LogicalBinding, request.ProducerUID, request.Sequence, request.Intent); err != nil {
+				if errors.Is(err, errArchiveGenesisClaimed) {
+					cancelErr := e.cancelLogicalArchiveGenesisLoser(ctx, uid, id, *run.LogicalBinding, request.ProducerUID, request.Sequence, request.Intent)
+					if cancelErr == nil {
+						return nil
+					}
+					return errors.Join(err, cancelErr)
+				}
 				return err
 			}
 		} else if err := e.requireLogicalArchiveGenesisCommitted(ctx, uid, id, run, request.Intent); err != nil {
 			return err
+		}
+		if err := e.compactLogicalSourceMutationJournal(ctx, uid, *run.LogicalBinding, request.Sequence); err != nil {
+			return err
+		}
+		producer, producerUID, version, err = e.AuthorityState.ReadLogicalProducer(ctx, uid, *run.LogicalBinding)
+		if err != nil {
+			return err
+		}
+		if producerUID != request.ProducerUID || producer.WALIdentity != id.WALIdentity || producer.Profile != fencing.LogicalWriterProfileV1 || producer.Validate() != nil {
+			return fmt.Errorf("fencing: logical mutation producer changed during compaction")
+		}
+		if request.Sequence <= producer.LastAdmitted {
+			continue
 		}
 		if err := producer.Admit(request.Sequence, request.Intent); err != nil {
 			return err

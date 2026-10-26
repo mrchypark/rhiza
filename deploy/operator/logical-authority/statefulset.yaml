@@ -72,7 +72,7 @@ spec:
                 name: rhiza-object-store
           env:
             - name: RHIZA_HA_INIT_RESTORE_DIR
-              value: /ha-restore-staging
+              value: /ha-restore-staging/stage
           securityContext:
             runAsNonRoot: true
             allowPrivilegeEscalation: false
@@ -129,7 +129,7 @@ spec:
             - name: RHIZA_DATA_DIR
               value: /data
             - name: RHIZA_HA_INIT_RESTORE_DIR
-              value: /ha-restore-staging
+              value: /ha-restore-staging/stage
             - name: RHIZA_AUTHORITY_PROFILE
               value: logical-writer-v1
             - name: RHIZA_AUTHORITY_URL
