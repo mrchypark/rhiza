@@ -82,6 +82,9 @@ func (l *Ledger) RegisterEnrolledWithRole(id Identity, runtime RuntimeBinding, r
 // is allowed for an unbound run: it cannot reopen WAL or mutation admission.
 func (l *Ledger) BindMutationProducer(id Identity, runtime RuntimeBinding, producerUID string) error {
 	run, exists := l.Runs[id.RunID]
+	if run.RegistrationSupersededBy != "" {
+		return ErrClosed
+	}
 	if !exists || runRole(run) != StartupRoleVoterActive || producerUID == "" || run.Runtime == nil || *run.Runtime != runtime {
 		return fmt.Errorf("fencing: mutation producer has no matching runtime enrollment")
 	}

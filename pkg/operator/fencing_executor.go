@@ -716,6 +716,9 @@ func (e *FencingExecutor) handle(w http.ResponseWriter, r *http.Request) {
 				switch message.Action {
 				case "register":
 					if message.RegistrationWALIdentity != "" {
+						if enrolled == nil {
+							return fmt.Errorf("fencing: registration continuation requires runtime enrollment")
+						}
 						if err := validateRegistrationContinuation(l, message.Identity, message.RegistrationWALIdentity, uid); err != nil {
 							return err
 						}
@@ -736,6 +739,17 @@ func (e *FencingExecutor) handle(w http.ResponseWriter, r *http.Request) {
 					}
 					if enrolled != nil {
 						l.RequireRuntimeBinding = true
+						if message.RegistrationWALIdentity != "" {
+							boundHistory := false
+							for _, prior := range l.Runs {
+								if prior.Identity.NodeID == message.Identity.NodeID && prior.Identity.WALIdentity != "" {
+									boundHistory = true
+								}
+							}
+							if !boundHistory {
+								return l.ContinueUnboundRegistration(startupGrant.Identity, *enrolled, message.RegistrationWALIdentity)
+							}
+						}
 						if initialRegistrationProvenance != nil {
 							ordinal, ordinalErr := engineRepairPodOrdinal(startupGrant.Identity.PodName)
 							if ordinalErr != nil {

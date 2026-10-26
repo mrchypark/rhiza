@@ -48,7 +48,9 @@ type Run struct {
 	// InitialRegistration is authority-written only for the one Run admitted
 	// from a pristine local voter state. It survives Bind so an active role
 	// alone can never be mistaken for first-use authority.
-	InitialRegistration *InitialRegistrationProvenance `json:"initialRegistration,omitempty"`
+	InitialRegistration      *InitialRegistrationProvenance `json:"initialRegistration,omitempty"`
+	RegistrationExpectedWAL  string                         `json:"registrationExpectedWAL,omitempty"`
+	RegistrationSupersededBy string                         `json:"registrationSupersededBy,omitempty"`
 }
 
 const InitialRegistrationProvenanceVersion = 1
@@ -152,6 +154,9 @@ func (l *Ledger) RegisterEngineRepairCandidate(identity Identity, runtime Runtim
 		return fmt.Errorf("fencing: engine-repair candidate enrollment is not the exact authority-pinned incarnation")
 	}
 	if old, exists := l.Runs[identity.RunID]; exists {
+		if old.RegistrationSupersededBy != "" {
+			return ErrClosed
+		}
 		if old.EngineRepairProvenance == nil || *old.EngineRepairProvenance != provenance {
 			return fmt.Errorf("fencing: engine-repair Run provenance is immutable")
 		}
@@ -394,6 +399,9 @@ func (l *Ledger) RegisterWithRole(identity Identity, role StartupRole) error {
 	if old, exists := l.Runs[identity.RunID]; exists {
 		// A caller may resolve an uncertain registration response, but cannot
 		// reuse a bound run as authorization for another child spawn.
+		if old.RegistrationSupersededBy != "" {
+			return ErrClosed
+		}
 		if old.Identity == identity && runRole(old) == role && old.Stop == nil {
 			return nil
 		}
@@ -571,6 +579,12 @@ func (l *Ledger) Bind(identity Identity) error {
 	if !exists || identity.WALIdentity == "" {
 		return fmt.Errorf("fencing: unknown WAL registration")
 	}
+	if run.RegistrationSupersededBy != "" {
+		return ErrClosed
+	}
+	if run.RegistrationExpectedWAL != "" && identity.WALIdentity != run.RegistrationExpectedWAL {
+		return fmt.Errorf("fencing: registration continuation WAL differs")
+	}
 	if provenance := run.EngineRepairProvenance; provenance != nil &&
 		(provenance.ValidateForRun(run) != nil || identity.WALIdentity != provenance.CandidateIdentity.WALIdentity) {
 		return fmt.Errorf("fencing: engine-repair WAL bind differs from the authority-pinned candidate")
@@ -612,6 +626,9 @@ func (l *Ledger) Bind(identity Identity) error {
 		return fmt.Errorf("fencing: pending learner cannot bind a mutation producer")
 	}
 	for _, old := range l.Runs {
+		if old.Identity.NodeID == identity.NodeID && old.RegistrationExpectedWAL != "" && old.RegistrationExpectedWAL != identity.WALIdentity {
+			return fmt.Errorf("fencing: restarted voter must retain its reserved WAL")
+		}
 		if old.Identity.RunID != identity.RunID && old.Identity.NodeID == identity.NodeID && old.Identity.WALIdentity != "" && old.Identity.WALIdentity != identity.WALIdentity {
 			return fmt.Errorf("fencing: restarted voter must retain its historical WAL")
 		}
