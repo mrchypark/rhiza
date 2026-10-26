@@ -328,6 +328,9 @@ func TestInitialRegistrationRejectsMissingRootMismatchedGenesisAndExistingRegist
 				t.Fatal("invalid or previously used initial-registration state was admitted")
 			}
 			if tt.name == "lost canonical root" {
+				if _, _, err := f.e.resolveInitialRegistrationGrant(t.Context(), "sts-uid", f.identity); !errors.Is(err, errAuthorityRootLost) {
+					t.Fatalf("initial admission erased canonical root-loss cause: %v", err)
+				}
 				if _, _, err := f.state.ReadRoot(t.Context(), "sts-uid", f.identity.SourceClusterID); !errors.Is(err, errAuthorityRootLost) {
 					t.Fatalf("fixture did not preserve root-loss evidence: %v", err)
 				}
