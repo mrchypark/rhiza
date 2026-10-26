@@ -1066,13 +1066,17 @@ func immutableDigest(value string) (string, error) {
 // Kind can discard the archive's import repository name while retaining its
 // immutable content. Follow only hash-verified descriptors, never a mutable tag.
 func imageConfig(ctx context.Context, reference string) (obj, []obj, error) {
+	return resolveImageConfig(ctx, reference, command)
+}
+
+func resolveImageConfig(ctx context.Context, reference string, run func(context.Context, string, ...string) ([]byte, error)) (obj, []obj, error) {
 	d, err := immutableDigest(reference)
 	if err != nil {
 		return nil, nil, err
 	}
 	var chain []obj
 	for range 4 {
-		data, lookupErr := command(ctx, "docker", "exec", kindNode, "crictl", "inspecti", "-o", "json", d)
+		data, lookupErr := run(ctx, "docker", "exec", kindNode, "crictl", "inspecti", "-o", "json", d)
 		if lookupErr == nil {
 			var cri obj
 			if err := json.Unmarshal(data, &cri); err != nil {
@@ -1084,7 +1088,7 @@ func imageConfig(ctx context.Context, reference string) (obj, []obj, error) {
 			chain = append(chain, obj{"digest": d, "cri": publicCRIImage(cri)})
 			return cri, chain, nil
 		}
-		content, err := command(ctx, "docker", "exec", kindNode, "ctr", "-n", "k8s.io", "content", "get", d)
+		content, err := run(ctx, "docker", "exec", kindNode, "ctr", "-n", "k8s.io", "content", "get", d)
 		if err != nil {
 			return nil, chain, fmt.Errorf("resolve immutable image %s: CRI: %v; content: %w", d, lookupErr, err)
 		}
@@ -1241,15 +1245,20 @@ func verifyImages(ctx context.Context, out, phase string, current ...operator.Fe
 		cri, chain, resolveErr := imageConfig(ctx, podImage)
 		configID := text(nested(cri, "status", "id"))
 		builtID := text(built[0]["Id"])
+		builtCRI, builtChain, builtErr := imageConfig(ctx, builtID)
+		builtConfigID := text(nested(builtCRI, "status", "id"))
 		repos, _ := nested(cri, "status", "repoDigests").([]any)
-		evidence = append(evidence, obj{"pod": nested(pod, "metadata", "name"), "uid": nested(pod, "metadata", "uid"), "role": role, "podImageID": podImage, "container": publicRuntime(runtime), "resolution": chain, "builtConfigID": builtID, "criConfigID": configID, "criRepoDigests": repos})
+		evidence = append(evidence, obj{"pod": nested(pod, "metadata", "name"), "uid": nested(pod, "metadata", "uid"), "role": role, "podImageID": podImage, "container": publicRuntime(runtime), "resolution": chain, "builtImageID": builtID, "builtResolution": builtChain, "builtConfigID": builtConfigID, "criConfigID": configID, "criRepoDigests": repos})
 		if err := os.WriteFile(filepath.Join(out, phase+"-image-evidence.json"), encoded(evidence), 0600); err != nil {
 			return err
 		}
 		if resolveErr != nil {
 			return resolveErr
 		}
-		if configID == "" || digest(configID) != digest(builtID) {
+		if builtErr != nil {
+			return builtErr
+		}
+		if configID == "" || digest(configID) != digest(builtConfigID) {
 			return fmt.Errorf("%s running image configuration differs from built image", role)
 		}
 		counts[role]++

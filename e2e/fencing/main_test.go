@@ -342,3 +342,82 @@ func TestHistoricalVoterProofAllowsLaterLearnerButRejectsTargetTampering(t *test
 		}
 	}
 }
+
+// The captured CI summaries omit raw bytes and attestation annotations. Rebuild
+// the same graph shape so every traversed descriptor still needs its real hash.
+func TestDocker29ImageConfigGraph(t *testing.T) {
+	config := "sha256:78ec9d4f75a30d82997fb638f276b6b1b8ee311b05fd637784ea94f4788000a5"
+	foreign := "sha256:" + strings.Repeat("b", 64)
+	for _, tc := range []struct {
+		name                                 string
+		foreign, ambiguous, corrupt, missing bool
+	}{
+		{name: "index ID and running import resolve to config"},
+		{name: "foreign config", foreign: true},
+		{name: "ambiguous platform", ambiguous: true},
+		{name: "digest mismatch", corrupt: true},
+		{name: "missing immutable content", missing: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			content := map[string][]byte{}
+			store := func(body string) string {
+				d := fmt.Sprintf("sha256:%x", sha256.Sum256([]byte(body)))
+				content[d] = []byte(body)
+				return d
+			}
+			manifest := store(`{"config":{"digest":"` + config + `"}}`)
+			runnable := `{"digest":"` + manifest + `","size":866,"mediaType":"application/vnd.oci.image.manifest.v1+json","platform":{"os":"linux","architecture":"amd64"}}`
+			attestation := `{"digest":"sha256:531ca7d0ffd5ffce13835fcef138be1e7794b9a9931aef3bb234336a56dad845","size":564,"mediaType":"application/vnd.oci.image.manifest.v1+json","platform":{"os":"unknown","architecture":"unknown"},"annotations":{"vnd.docker.reference.type":"attestation-manifest","vnd.docker.reference.digest":"` + manifest + `"}}`
+			if tc.ambiguous {
+				attestation = strings.Replace(runnable, "amd64", "arm64", 1)
+			}
+			builtID := store(`{"manifests":[` + runnable + `,` + attestation + `]}`)
+			alias := `{"digest":"` + builtID + `","size":855,"mediaType":"application/vnd.oci.image.index.v1+json"}`
+			importID := store(`{"manifests":[` + alias + `,` + alias + `]}`)
+			if tc.corrupt {
+				content[builtID] = []byte(`{}`)
+			}
+			if tc.missing {
+				delete(content, builtID)
+			}
+			run := func(_ context.Context, name string, args ...string) ([]byte, error) {
+				d := args[len(args)-1]
+				if name != "docker" {
+					t.Fatalf("unexpected command %s", name)
+				}
+				if args[2] == "crictl" {
+					if d == config || d == foreign {
+						return encoded(obj{"status": obj{"id": d}}), nil
+					}
+					return nil, fmt.Errorf("captured CRI lookup failed")
+				}
+				if data, ok := content[d]; ok {
+					return data, nil
+				}
+				return nil, fmt.Errorf("content unavailable")
+			}
+			running, _, runningErr := resolveImageConfig(context.Background(), "docker.io/library/import-2026-10-26@"+importID, run)
+			if tc.foreign {
+				builtID = store(`{"config":{"digest":"` + foreign + `"}}`)
+			}
+			built, _, builtErr := resolveImageConfig(context.Background(), builtID, run)
+			matches := runningErr == nil && builtErr == nil && nested(running, "status", "id") == nested(built, "status", "id")
+			if matches != (!tc.foreign && !tc.ambiguous && !tc.corrupt && !tc.missing) {
+				t.Fatalf("matches=%v; running=%v (%v), built=%v (%v)", matches, running, runningErr, built, builtErr)
+			}
+			if matches {
+				for _, reference := range []string{manifest, config} {
+					cri, _, err := resolveImageConfig(context.Background(), reference, run)
+					if err != nil || nested(cri, "status", "id") != config {
+						t.Fatalf("manifest/config ID %s: %v, %v", reference, cri, err)
+					}
+				}
+				for _, reference := range []string{"rhiza-fencing-host:local", "sha256:" + strings.Repeat("d", 64)} {
+					if _, _, err := resolveImageConfig(context.Background(), reference, run); err == nil {
+						t.Fatalf("accepted reference without authoritative immutable content: %s", reference)
+					}
+				}
+			}
+		})
+	}
+}
