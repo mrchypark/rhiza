@@ -1461,7 +1461,7 @@ func logFenceStageDiagnostic(stage string, err error) {
 		return
 	}
 	switch stage {
-	case "root-close", "inventory", "inventory-revalidation", "producer-settlement", "runtime-collection", "terminal-retention", "terminal-verification", "cohort-validation", "cohort-revalidation", "terminal-receipt-read", "root-reread", "proof-validation", "proof-status-write", "bootstrap-revalidation":
+	case "root-close", "inventory", "inventory-revalidation", "producer-settlement", "runtime-collection", "terminal-retention", "terminal-verification", "cohort-validation", "cohort-revalidation", "terminal-receipt-read", "root-reread", "proof-validation", "proof-status-write", "bootstrap-revalidation", "cohort-request", "cohort-profile", "cohort-freeze", "cohort-run-identity", "cohort-runtime-binding", "cohort-stop-binding", "cohort-capacity", "runtime-verifier-config":
 	default:
 		stage = "other"
 	}
