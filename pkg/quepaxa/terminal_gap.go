@@ -136,6 +136,26 @@ func (c *Core) PendingTerminalGap(key TerminalGapKey) bool {
 		state.id == key.FreezeHash && c.clusterForSlotLocked(state.freeze).ConfigID == key.ConfigID
 }
 
+// AllowsNextReconfigurationFreeze permits an immediately contiguous freeze
+// after a committed configuration change, before public readiness catches up.
+// AcceptDecision still verifies the quorum certificate and durable transition.
+func (c *Core) AllowsNextReconfigurationFreeze(decision Decision) bool {
+	if c == nil || decision.Proposal.Hash != ValueHash(sha256.Sum256(decision.Proposal.Value)) {
+		return false
+	}
+	control, ok, err := decodeReconfiguration(decision.Proposal.Value)
+	if err != nil || !ok || control.Terminal || control.Abort || control.Freeze != decision.Slot {
+		return false
+	}
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	current := c.clusterForSlotLocked(c.tip + 1)
+	return c.reconfigEnabled && c.reconfiguration == nil && c.voterForClusterLocked(current) &&
+		decision.Slot == c.tip+1 && decision.ConfigID == current.ConfigID &&
+		c.validateReconfigurationSlotsLocked(control.Freeze, control.TerminalSlot) == nil &&
+		validateReconfigurationTarget(current, control.Target, c.retiredIDs) == nil
+}
+
 // AllowsPendingReconfigurationLearn admits only the locally frozen old-config
 // prefix and its exact terminal. The normal AcceptDecision path still verifies
 // the decision certificate and applies it durably.
