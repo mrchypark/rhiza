@@ -40,7 +40,7 @@ k get nodes >"$run_dir/nodes.txt"
 case "$(docker exec dory-k8s uname -m)" in aarch64|arm64) arch=arm64 ;; x86_64) arch=amd64 ;; *) echo "Unsupported local node architecture" >&2; exit 1 ;; esac
 CGO_ENABLED=0 GOOS=linux GOARCH="$arch" TMPDIR=/tmp go test -c -o "$run_dir/embedded.test" .
 cat >"$run_dir/Dockerfile" <<'DOCKERFILE'
-FROM mirror.gcr.io/library/alpine:3.19@sha256:6baf43584bcb78f2e5847d1de515f23499913ac9f12bdf834811a3145eb11ca1
+FROM mirror.gcr.io/library/alpine:3.24.3@sha256:be2656061b536c1883c4034790e21d0a09c5aaaf51968b89368a3c0371ea2c9a
 COPY embedded.test /embedded.test
 ENTRYPOINT ["/embedded.test"]
 DOCKERFILE
