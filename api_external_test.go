@@ -1,12 +1,27 @@
 package rhiza_test
 
 import (
+	"context"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"strings"
 	"testing"
+
+	"github.com/mrchypark/rhiza"
 )
+
+func TestPublicPrepareRestoreRequiresExplicitClusterID(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "must-not-be-created")
+	err := rhiza.PrepareRestore(context.Background(), rhiza.Config{DataDir: dir, NodeID: "fresh", PreparedPodUID: "pod"})
+	if err == nil || !strings.Contains(err.Error(), "cluster ID") {
+		t.Fatalf("PrepareRestore error=%v, want explicit cluster-ID refusal", err)
+	}
+	if _, statErr := os.Lstat(dir); !os.IsNotExist(statErr) {
+		t.Fatalf("empty ClusterID created DataDir: %v", statErr)
+	}
+}
 
 func TestExternalModuleCanUseEmbeddedAPI(t *testing.T) {
 	_, file, _, _ := runtime.Caller(0)

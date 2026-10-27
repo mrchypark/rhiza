@@ -473,6 +473,7 @@ func isLowerHexString(value string) bool {
 }
 
 func prepareRestoreWithoutRuntimeCredentials(ctx context.Context, config rhiza.Config) error {
+	config.Learner = nil
 	config.AdminToken = ""
 	config.PeerToken = ""
 	return rhiza.PrepareRestore(ctx, config)

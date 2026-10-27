@@ -4,18 +4,23 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
 
+	objectstore "github.com/mrchypark/rhiza/internal/objstore"
 	"github.com/mrchypark/rhiza/internal/types"
 	"github.com/mrchypark/rhiza/pkg/checkpoint"
 	"github.com/mrchypark/rhiza/pkg/materializer"
 	"github.com/mrchypark/rhiza/pkg/qlog"
 	"github.com/mrchypark/rhiza/pkg/quepaxa"
+	"github.com/mrchypark/rhiza/pkg/recovery"
 )
 
 func TestPrepareRestoreMaterializesCertifiedCheckpointAndSuffix(t *testing.T) {
@@ -23,6 +28,25 @@ func TestPrepareRestoreMaterializesCertifiedCheckpointAndSuffix(t *testing.T) {
 	defer cancel()
 
 	source, _, bucket, transport := newMembershipOperationNode(t)
+	// The shared fixture pre-registers a,b and then constructs a three-voter
+	// core for membership-operation tests. Recreate the still-empty source cores
+	// with the registered two-voter bootstrap so the archive and immutable
+	// membership record describe the same real source generation.
+	bootstrap := append([]quepaxa.Member(nil), source.config.Members[:2]...)
+	source.config.Members = bootstrap
+	transport.ids = []quepaxa.NodeID{bootstrap[0].ID, bootstrap[1].ID}
+	transport.cores = make(map[quepaxa.NodeID]*quepaxa.Core, len(bootstrap))
+	for _, member := range bootstrap {
+		core, err := quepaxa.New(quepaxa.Config{
+			NodeID: member.ID, Cluster: quepaxa.Cluster{ConfigID: 1, Members: bootstrap},
+			WAL: transport.wals[member.ID], Transport: transport, EnableReconfiguration: true,
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		transport.cores[member.ID] = core
+	}
+	source.core = transport.cores[bootstrap[0].ID]
 	sourceState, err := materializer.Open(filepath.Join(t.TempDir(), "source.sqlite"), 1)
 	if err != nil {
 		t.Fatal(err)
@@ -128,18 +152,98 @@ func TestPrepareRestoreMaterializesCertifiedCheckpointAndSuffix(t *testing.T) {
 		t.Fatal(err)
 	}
 	archiveTip := source.archive.Tip()
+	registrationKey := filepath.ToSlash(filepath.Join(source.config.ObjStorePrefix, string(source.config.ClusterID), "voters", "membership.json"))
+	registration, err := readVoterRegistration(ctx, bucket, registrationKey)
+	if err != nil || registration == nil {
+		t.Fatalf("read product bootstrap membership registration: %v", err)
+	}
 
 	config := *source.config
 	config.DataDir = t.TempDir()
 	config.NodeID = "fresh-learner"
 	config.PreparedPodUID = "pod-uid-new"
+	config.Members = append([]quepaxa.Member(nil), source.config.Members[:2]...)
 	config.ObjStoreProvider = "s3"
 	config.ObjStoreBucket = "test-bucket"
 	config.ObjStoreDir = ""
-	config.Learner = &quepaxa.Member{ID: config.NodeID, PublicKey: peerMember(string(config.ClusterID), quepaxa.NodeID(config.NodeID), "fresh-token").PublicKey}
+	config.Learner = nil
 	config.AdminToken = ""
 	config.PeerToken = ""
 	config.EnableReconfiguration = true
+	var registered recovery.MembershipRecord
+	if err := json.Unmarshal(registration, &registered); err != nil {
+		t.Fatal(err)
+	}
+	formattedRecord := []byte(fmt.Sprintf("{\n  \"durability\": %q,\n  \"membership\": %q,\n  \"cluster\": %q,\n  \"version\": %d\n}", registered.Durability, registered.Membership, registered.Cluster, registered.Version))
+	if err := bucket.Upload(ctx, registrationKey, bytes.NewReader(formattedRecord)); err != nil {
+		t.Fatal(err)
+	}
+	if err := validatePreparedRestoreMembership(ctx, &config, bucket); err != nil {
+		t.Fatalf("semantically equal reordered membership record rejected: %v", err)
+	}
+	if err := bucket.Upload(ctx, registrationKey, bytes.NewReader(registration)); err != nil {
+		t.Fatal(err)
+	}
+	legacy, err := json.Marshal(recovery.MembershipRecord{Version: 1, Cluster: registered.Cluster, Membership: registered.Membership, Durability: registered.Durability})
+	if err != nil {
+		t.Fatal(err)
+	}
+	duplicate := append(bytes.Clone(bytes.TrimSuffix(registration, []byte("}"))), []byte(`,"version":2}`)...)
+	trailing := append(bytes.Clone(registration), []byte(" trailing")...)
+	for _, tc := range []struct {
+		name   string
+		remove bool
+		data   []byte
+	}{
+		{name: "missing", remove: true},
+		{name: "mismatch", data: []byte(`{"version":2,"cluster":"cluster","membership":"wrong","durability":"async"}`)},
+		{name: "legacy", data: legacy},
+		{name: "malformed", data: []byte(`{"version":`)},
+		{name: "trailing", data: trailing},
+		{name: "duplicate-field", data: duplicate},
+		{name: "missing-required-field", data: []byte(`{"version":2,"cluster":"cluster","durability":"async"}`)},
+	} {
+		t.Run("bootstrap-registration-"+tc.name, func(t *testing.T) {
+			if tc.remove {
+				if err := bucket.Delete(ctx, registrationKey); err != nil {
+					t.Fatal(err)
+				}
+			} else if err := bucket.Upload(ctx, registrationKey, bytes.NewReader(tc.data)); err != nil {
+				t.Fatal(err)
+			}
+			beforeRegistration, err := readVoterRegistration(ctx, bucket, registrationKey)
+			if err != nil {
+				t.Fatal(err)
+			}
+			failed := config
+			failed.DataDir = filepath.Join(t.TempDir(), "fresh")
+			err = prepareRestore(ctx, &failed, bucket)
+			if err == nil || !errors.Is(err, ErrVoterStateLost) {
+				t.Fatalf("prepare error=%v, want immutable-membership refusal", err)
+			}
+			freshSnapshot := snapshotPreparedRestoreDataDir(t, failed.DataDir)
+			if len(freshSnapshot) != 2 || freshSnapshot["qlog"] != "<dir>" || freshSnapshot[filepath.Join("qlog", "lock.qlog")] != "" {
+				t.Fatalf("source refusal wrote beyond the temporary ownership lock: %#v", freshSnapshot)
+			}
+
+			failed.DataDir = filepath.Join(t.TempDir(), "interrupted")
+			writeInterruptedPreparedRestoreFixture(t, &failed)
+			beforeDataDir := snapshotPreparedRestoreDataDir(t, failed.DataDir)
+			if err := prepareRestore(ctx, &failed, bucket); err == nil || !errors.Is(err, ErrVoterStateLost) {
+				t.Fatalf("interrupted restore error=%v, want immutable-membership refusal", err)
+			}
+			if after := snapshotPreparedRestoreDataDir(t, failed.DataDir); !reflect.DeepEqual(beforeDataDir, after) {
+				t.Fatalf("source refusal changed populated interrupted DataDir: before=%#v after=%#v", beforeDataDir, after)
+			}
+			afterRegistration, err := readVoterRegistration(ctx, bucket, registrationKey)
+			if err != nil || !bytes.Equal(beforeRegistration, afterRegistration) {
+				t.Fatalf("source refusal changed immutable registration: before=%q after=%q err=%v", beforeRegistration, afterRegistration, err)
+			}
+			if err := bucket.Upload(ctx, registrationKey, bytes.NewReader(registration)); err != nil {
+				t.Fatalf("restore product registration: %v", err)
+			}
+		})
+	}
 	if err := prepareRestore(ctx, &config, bucket); err != nil {
 		t.Fatalf("prepare restore without runtime credentials: %v", err)
 	}
@@ -148,8 +252,23 @@ func TestPrepareRestoreMaterializesCertifiedCheckpointAndSuffix(t *testing.T) {
 	if err != nil || !exists || marker.Phase != "complete" || marker.BaseIndex != index || marker.CertifiedTip != uint64(source.core.Tip()) {
 		t.Fatalf("prepared marker=%+v exists=%v err=%v", marker, exists, err)
 	}
+	completeBefore := snapshotPreparedRestoreDataDir(t, config.DataDir)
+	// The configured S3 endpoint is intentionally absent. A matching complete
+	// marker must be a local no-op and must not open the unavailable remote.
+	if err := prepareRestore(ctx, &config, nil); err != nil {
+		t.Fatalf("matching complete marker required remote access: %v", err)
+	}
+	if completeAfter := snapshotPreparedRestoreDataDir(t, config.DataDir); !reflect.DeepEqual(completeBefore, completeAfter) {
+		t.Fatalf("complete-marker retry changed DataDir: before=%#v after=%#v", completeBefore, completeAfter)
+	}
 	if source.archive.Tip() != archiveTip {
 		t.Fatalf("preparation changed source archive tip from %d to %d", archiveTip, source.archive.Tip())
+	}
+	runtimeWithoutLearner := config
+	runtimeWithoutLearner.AdminToken = "runtime-admin-token"
+	runtimeWithoutLearner.PeerToken = "runtime-peer-token"
+	if err := New(&runtimeWithoutLearner).Open(ctx); err == nil {
+		t.Fatal("runtime open accepted a restore-only config without Learner")
 	}
 	databaseBeforeOpen, err := os.ReadFile(filepath.Join(config.DataDir, "sqlite.db"))
 	if err != nil {
@@ -159,12 +278,16 @@ func TestPrepareRestoreMaterializesCertifiedCheckpointAndSuffix(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := New(&config).Open(ctx); err == nil || !strings.Contains(err.Error(), "admin token") {
+	withLearner := config
+	withLearner.Learner = &quepaxa.Member{ID: config.NodeID, PublicKey: peerMember(string(config.ClusterID), quepaxa.NodeID(config.NodeID), "fresh-token").PublicKey}
+	withLearner.PeerToken = "runtime-peer-token"
+	if err := New(&withLearner).Open(ctx); err == nil || !strings.Contains(err.Error(), "admin token") {
 		t.Fatalf("runtime open without admin/peer credentials error=%v, want admin-token refusal", err)
 	}
 	assertPreparedRuntimeOpenPreservedFiles(t, config.DataDir, databaseBeforeOpen, markerBeforeOpen)
-	withAdmin := config
+	withAdmin := withLearner
 	withAdmin.AdminToken = "runtime-admin-token"
+	withAdmin.PeerToken = ""
 	if err := New(&withAdmin).Open(ctx); err == nil || !strings.Contains(err.Error(), "peer token") {
 		t.Fatalf("runtime open without peer credential error=%v, want peer-token refusal", err)
 	}
@@ -226,7 +349,19 @@ func TestPrepareRestoreMaterializesCertifiedCheckpointAndSuffix(t *testing.T) {
 				t.Fatal(err)
 			}
 			ready := filepath.Join(t.TempDir(), "ready")
-			request, err := json.Marshal(preparedRestoreCrashRequest{Config: crashConfig, Stage: stage, ReadyFile: ready, Operation: "prepare"})
+			crashBucketDir := filepath.Join(t.TempDir(), "archive")
+			crashBucket, err := objectstore.NewBucket(objectstore.Config{Provider: objectstore.ProviderFilesystem, FilesystemDir: crashBucketDir})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := crashBucket.Upload(ctx, registrationKey, bytes.NewReader(registration)); err != nil {
+				_ = crashBucket.Close()
+				t.Fatalf("copy product registration into child archive: %v", err)
+			}
+			if err := crashBucket.Close(); err != nil {
+				t.Fatal(err)
+			}
+			request, err := json.Marshal(preparedRestoreCrashRequest{Config: crashConfig, Stage: stage, ReadyFile: ready, Operation: "prepare", BucketDir: crashBucketDir})
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -300,6 +435,132 @@ func TestPrepareRestoreMaterializesCertifiedCheckpointAndSuffix(t *testing.T) {
 	}
 }
 
+func TestValidatePreparedRestoreConfigAllowsNoLearnerButRejectsBootstrapCollisions(t *testing.T) {
+	valid := &types.ExecutionConfig{
+		NodeID: "fresh", ClusterID: "cluster", DataDir: filepath.Join(t.TempDir(), "data"), PreparedPodUID: "pod",
+		ObjStoreProvider: "s3", ObjStoreBucket: "archive", EnableReconfiguration: true,
+		Members: []quepaxa.Member{peerMember("cluster", "a", "a-token"), peerMember("cluster", "b", "b-token")},
+	}
+	if err := validatePreparedRestoreConfig(valid); err != nil {
+		t.Fatalf("restore-only config without learner identity rejected: %v", err)
+	}
+	validLearner := *valid
+	validLearner.Learner = &quepaxa.Member{ID: valid.NodeID, PublicKey: peerMember("cluster", "fresh", "fresh-token").PublicKey}
+	if err := validatePreparedRestoreConfig(&validLearner); err != nil {
+		t.Fatalf("optional matching learner identity rejected: %v", err)
+	}
+	for _, tc := range []struct {
+		name   string
+		mutate func(*types.ExecutionConfig)
+	}{
+		{name: "empty-bootstrap-id", mutate: func(c *types.ExecutionConfig) { c.Members[0].ID = "" }},
+		{name: "target-is-bootstrap-voter", mutate: func(c *types.ExecutionConfig) { c.NodeID = c.Members[0].ID; c.Learner = nil }},
+		{name: "verifier-is-bootstrap-voter", mutate: func(c *types.ExecutionConfig) { c.Members[0].ID = "prepare-fresh" }},
+		{name: "duplicate-bootstrap-id", mutate: func(c *types.ExecutionConfig) { c.Members[1].ID = c.Members[0].ID }},
+		{name: "missing-bootstrap-key", mutate: func(c *types.ExecutionConfig) { c.Members[0].PublicKey = quepaxa.PublicKey{} }},
+		{name: "learner-id-mismatch", mutate: func(c *types.ExecutionConfig) {
+			c.Learner = &quepaxa.Member{ID: "other", PublicKey: peerMember("cluster", "other", "other-token").PublicKey}
+		}},
+		{name: "learner-key-missing", mutate: func(c *types.ExecutionConfig) { c.Learner = &quepaxa.Member{ID: c.NodeID} }},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			candidate := *valid
+			candidate.Members = append([]quepaxa.Member(nil), valid.Members...)
+			candidate.Learner = validLearner.Learner
+			tc.mutate(&candidate)
+			if err := validatePreparedRestoreConfig(&candidate); err == nil {
+				t.Fatal("accepted invalid prepared restore membership input")
+			}
+		})
+	}
+}
+
+func TestPrepareRestoreCompleteMarkerWithoutExistingLockPreservesDataDir(t *testing.T) {
+	config := &types.ExecutionConfig{
+		NodeID: "fresh", ClusterID: "cluster", DataDir: filepath.Join(t.TempDir(), "data"), PreparedPodUID: "pod",
+		ObjStoreProvider: "s3", ObjStoreBucket: "unavailable", EnableReconfiguration: true,
+		Members: []quepaxa.Member{peerMember("cluster", "a", "a-token"), peerMember("cluster", "b", "b-token")},
+	}
+	if err := os.MkdirAll(config.DataDir, 0700); err != nil {
+		t.Fatal(err)
+	}
+	marker, err := preparedMarkerForConfig(config)
+	if err != nil {
+		t.Fatal(err)
+	}
+	intent := marker
+	intent.Phase = "preparing"
+	if err := writePreparedRestoreIntent(config.DataDir, intent); err != nil {
+		t.Fatal(err)
+	}
+	marker.Phase = "complete"
+	if err := writePreparedRestoreMarker(config.DataDir, marker); err != nil {
+		t.Fatal(err)
+	}
+	before := snapshotPreparedRestoreDataDir(t, config.DataDir)
+	if err := prepareRestore(context.Background(), config, nil); err == nil {
+		t.Fatal("complete marker without its existing qlog lock was accepted")
+	}
+	if after := snapshotPreparedRestoreDataDir(t, config.DataDir); !reflect.DeepEqual(before, after) {
+		t.Fatalf("refusal created or changed DataDir entries: before=%#v after=%#v", before, after)
+	}
+}
+
+func writeInterruptedPreparedRestoreFixture(t *testing.T, config *types.ExecutionConfig) {
+	t.Helper()
+	if err := os.MkdirAll(config.DataDir, 0700); err != nil {
+		t.Fatal(err)
+	}
+	marker, err := preparedMarkerForConfig(config)
+	if err != nil {
+		t.Fatal(err)
+	}
+	marker.Phase = "preparing"
+	if err := writePreparedRestoreIntent(config.DataDir, marker); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Join(config.DataDir, "qlog"), 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(config.DataDir, "qlog", "lock.qlog"), nil, 0644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(config.DataDir, "sqlite.db"), []byte("preserve-existing-materialized-state"), 0600); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func snapshotPreparedRestoreDataDir(t *testing.T, dataDir string) map[string]string {
+	t.Helper()
+	snapshot := make(map[string]string)
+	err := filepath.WalkDir(dataDir, func(name string, entry os.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		if name == dataDir {
+			return nil
+		}
+		rel, err := filepath.Rel(dataDir, name)
+		if err != nil {
+			return err
+		}
+		if entry.IsDir() {
+			snapshot[rel] = "<dir>"
+			return nil
+		}
+		data, err := os.ReadFile(name)
+		if err != nil {
+			return err
+		}
+		snapshot[rel] = string(data)
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("snapshot prepared DataDir: %v", err)
+	}
+	return snapshot
+}
+
 func assertPreparedRuntimeOpenPreservedFiles(t *testing.T, dataDir string, databaseBefore, markerBefore []byte) {
 	t.Helper()
 	databaseAfter, err := os.ReadFile(filepath.Join(dataDir, "sqlite.db"))
@@ -321,6 +582,7 @@ type preparedRestoreCrashRequest struct {
 	Stage     string
 	ReadyFile string
 	Operation string
+	BucketDir string
 }
 
 func TestPrepareRestoreCrashHelper(t *testing.T) {
@@ -367,7 +629,16 @@ func TestPrepareRestoreCrashHelper(t *testing.T) {
 		}
 		t.Fatal("requested pending marker boundary was not reached")
 	}
-	if err := prepareRestore(context.Background(), &request.Config, nil); err != nil {
+	var bucket *objectstore.MeteredBucket
+	if request.BucketDir != "" {
+		var err error
+		bucket, err = objectstore.NewBucket(objectstore.Config{Provider: objectstore.ProviderFilesystem, FilesystemDir: request.BucketDir})
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer bucket.Close()
+	}
+	if err := prepareRestore(context.Background(), &request.Config, bucket); err != nil {
 		t.Fatalf("prepare restore before requested crash boundary: %v", err)
 	}
 	t.Fatal("requested prepare restore boundary was not reached")

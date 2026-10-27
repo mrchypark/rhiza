@@ -97,9 +97,17 @@ func prepareRestore(ctx context.Context, config *types.ExecutionConfig, injected
 	if _, err := os.Stat(config.DataDir); err != nil {
 		return err
 	}
-	_, markerExistsBeforeLock, err := readPreparedRestoreMarkerForConfig(config.DataDir, intentMarker)
+	markerBeforeLock, markerExistsBeforeLock, err := readPreparedRestoreMarkerForConfig(config.DataDir, intentMarker)
 	if err != nil {
 		return err
+	}
+	if markerExistsBeforeLock && markerBeforeLock.Phase == "complete" {
+		if !preparedMarkerMatchesConfig(markerBeforeLock, baseMarker) {
+			return fmt.Errorf("prepared restore marker does not match this Pod, node, source, or store; preserve DataDir")
+		}
+		if err := requireExistingPreparedRestoreLock(config.DataDir); err != nil {
+			return err
+		}
 	}
 	if !markerExistsBeforeLock {
 		if err := validatePreparedRestoreInventory(config.DataDir, "fresh-preflight"); err != nil {
@@ -133,6 +141,32 @@ func prepareRestore(ctx context.Context, config *types.ExecutionConfig, injected
 		if err := validatePreparedRestoreInventory(config.DataDir, "fresh"); err != nil {
 			return err
 		}
+	}
+	provider := objectstore.Provider(config.ObjStoreProvider)
+	if provider == "" {
+		provider = objectstore.ProviderS3
+	}
+	bucket := injected
+	if bucket == nil {
+		bucket, err = objectstore.NewBucketWithContext(ctx, objectstore.Config{
+			Provider: provider, FilesystemDir: config.ObjStoreDir, Prefix: config.ObjStorePrefix,
+			Endpoint: config.ObjStoreEndpoint, Bucket: config.ObjStoreBucket, Region: config.ObjStoreRegion,
+			Insecure: config.ObjStoreInsecure, MaxRetries: config.ObjStoreRetries,
+			AccessKey: config.ObjStoreAccessKey, SecretKey: config.ObjStoreSecretKey, SessionToken: config.ObjStoreSessionToken,
+			ServiceAccount: config.ObjStoreServiceAccount, AzureTenantID: config.ObjStoreAzureTenantID,
+			AzureClientID: config.ObjStoreAzureClientID, AzureClientSecret: config.ObjStoreAzureClientSecret,
+			AzureStorageAccount: config.ObjStoreAzureStorageAccount, AzureStorageAccountKey: config.ObjStoreAzureStorageAccountKey,
+			AzureConnectionString: config.ObjStoreAzureConnectionString, AzureUserAssignedID: config.ObjStoreAzureUserAssignedID,
+		})
+		if err != nil {
+			return fmt.Errorf("open restore source: %w", err)
+		}
+		defer func() { resultErr = errors.Join(resultErr, bucket.Close()) }()
+	}
+	if err := validatePreparedRestoreMembership(ctx, config, bucket); err != nil {
+		return err
+	}
+	if !markerExists {
 		if preparedRestoreCrashBoundary != nil {
 			preparedRestoreCrashBoundary("intent-before-write")
 		}
@@ -163,28 +197,6 @@ func prepareRestore(ctx context.Context, config *types.ExecutionConfig, injected
 	defer func() { resultErr = errors.Join(resultErr, observerWAL.Close()) }()
 	if preparedRestoreCrashBoundary != nil {
 		preparedRestoreCrashBoundary("observer-open")
-	}
-
-	provider := objectstore.Provider(config.ObjStoreProvider)
-	if provider == "" {
-		provider = objectstore.ProviderS3
-	}
-	bucket := injected
-	if bucket == nil {
-		bucket, err = objectstore.NewBucketWithContext(ctx, objectstore.Config{
-			Provider: provider, FilesystemDir: config.ObjStoreDir, Prefix: config.ObjStorePrefix,
-			Endpoint: config.ObjStoreEndpoint, Bucket: config.ObjStoreBucket, Region: config.ObjStoreRegion,
-			Insecure: config.ObjStoreInsecure, MaxRetries: config.ObjStoreRetries,
-			AccessKey: config.ObjStoreAccessKey, SecretKey: config.ObjStoreSecretKey, SessionToken: config.ObjStoreSessionToken,
-			ServiceAccount: config.ObjStoreServiceAccount, AzureTenantID: config.ObjStoreAzureTenantID,
-			AzureClientID: config.ObjStoreAzureClientID, AzureClientSecret: config.ObjStoreAzureClientSecret,
-			AzureStorageAccount: config.ObjStoreAzureStorageAccount, AzureStorageAccountKey: config.ObjStoreAzureStorageAccountKey,
-			AzureConnectionString: config.ObjStoreAzureConnectionString, AzureUserAssignedID: config.ObjStoreAzureUserAssignedID,
-		})
-		if err != nil {
-			return fmt.Errorf("open restore source: %w", err)
-		}
-		defer func() { resultErr = errors.Join(resultErr, bucket.Close()) }()
 	}
 
 	prefix := path.Join(config.ObjStorePrefix, string(config.ClusterID))
@@ -361,6 +373,25 @@ func prepareRestore(ctx context.Context, config *types.ExecutionConfig, injected
 	return nil
 }
 
+func requireExistingPreparedRestoreLock(dataDir string) error {
+	qlogDir := filepath.Join(dataDir, "qlog")
+	dirInfo, err := os.Lstat(qlogDir)
+	if err != nil {
+		return fmt.Errorf("completed prepared restore is missing its existing qlog lock directory; preserve DataDir: %w", err)
+	}
+	if !dirInfo.IsDir() || dirInfo.Mode()&os.ModeSymlink != 0 {
+		return fmt.Errorf("completed prepared restore has an invalid qlog lock directory; preserve DataDir")
+	}
+	lockInfo, err := os.Lstat(filepath.Join(qlogDir, "lock.qlog"))
+	if err != nil {
+		return fmt.Errorf("completed prepared restore is missing its existing qlog lock file; preserve DataDir: %w", err)
+	}
+	if !lockInfo.Mode().IsRegular() || lockInfo.Mode()&os.ModeSymlink != 0 {
+		return fmt.Errorf("completed prepared restore has an invalid qlog lock file; preserve DataDir")
+	}
+	return nil
+}
+
 func validatePreparedRestoreInventory(dataDir, phase string) error {
 	entries, err := os.ReadDir(dataDir)
 	if err != nil {
@@ -429,11 +460,25 @@ func validatePreparedRestoreConfig(config *types.ExecutionConfig) error {
 	if config.PreparedPodUID != strings.TrimSpace(config.PreparedPodUID) {
 		return fmt.Errorf("prepared Pod UID is not canonical")
 	}
-	if config.Local || !config.EnableReconfiguration || config.Learner == nil || config.Learner.ID != config.NodeID || len(config.Members) < 2 {
+	if config.Local || !config.EnableReconfiguration || len(config.Members) < 2 {
 		return fmt.Errorf("prepared restore requires a reconfigurable fresh learner with bootstrap voters")
 	}
-	if err := validateVoterMembershipStructure(config); err != nil {
-		return err
+	seen := make(map[quepaxa.NodeID]struct{}, len(config.Members))
+	observerID := quepaxa.NodeID("prepare-" + string(config.NodeID))
+	for _, member := range config.Members {
+		if member.ID == "" || member.PublicKey == (quepaxa.PublicKey{}) {
+			return fmt.Errorf("prepared restore bootstrap voters require IDs and public keys")
+		}
+		if _, duplicate := seen[member.ID]; duplicate {
+			return fmt.Errorf("prepared restore bootstrap contains duplicate voter %q", member.ID)
+		}
+		seen[member.ID] = struct{}{}
+		if member.ID == config.NodeID || member.ID == observerID {
+			return fmt.Errorf("prepared restore target and verifier IDs must be absent from bootstrap voters")
+		}
+	}
+	if config.Learner != nil && (config.Learner.ID != config.NodeID || config.Learner.PublicKey == (quepaxa.PublicKey{})) {
+		return fmt.Errorf("prepared restore learner identity must match the target node and include its public key")
 	}
 	configured, err := validateObjectStoreConfig(config)
 	if err != nil {
@@ -441,6 +486,76 @@ func validatePreparedRestoreConfig(config *types.ExecutionConfig) error {
 	}
 	if !configured {
 		return fmt.Errorf("prepared restore requires shared object storage")
+	}
+	return nil
+}
+
+func validatePreparedRestoreMembership(ctx context.Context, config *types.ExecutionConfig, bucket *objectstore.MeteredBucket) error {
+	key := path.Join(config.ObjStorePrefix, string(config.ClusterID), "voters", "membership.json")
+	got, err := readVoterRegistration(ctx, bucket, key)
+	if err != nil {
+		return fmt.Errorf("validate prepared restore bootstrap membership: %w", err)
+	}
+	if got == nil {
+		return fmt.Errorf("%w: prepared restore bootstrap membership is missing", ErrVoterStateLost)
+	}
+	var record recovery.MembershipRecord
+	if err := decodePreparedRestoreMembershipRecord(got, &record); err != nil {
+		return fmt.Errorf("%w: malformed prepared restore bootstrap membership: %v", ErrVoterStateLost, err)
+	}
+	want := recovery.NewMembershipRecord(string(config.ClusterID), config.Members, string(config.ObjStoreDurability))
+	if record.Version != want.Version || record.Cluster != want.Cluster || record.Membership != want.Membership || record.Durability != want.Durability {
+		return fmt.Errorf("%w: prepared restore bootstrap membership differs from immutable registration", ErrVoterStateLost)
+	}
+	return nil
+}
+
+func decodePreparedRestoreMembershipRecord(data []byte, record *recovery.MembershipRecord) error {
+	decoder := json.NewDecoder(bytes.NewReader(data))
+	seen := make(map[string]bool, 4)
+	token, err := decoder.Token()
+	if err != nil || token != json.Delim('{') {
+		return fmt.Errorf("membership record must be a JSON object")
+	}
+	for decoder.More() {
+		token, err := decoder.Token()
+		if err != nil {
+			return err
+		}
+		key, ok := token.(string)
+		if !ok || seen[key] {
+			return fmt.Errorf("membership record has an invalid or duplicate field")
+		}
+		seen[key] = true
+		switch key {
+		case "version":
+			err = decoder.Decode(&record.Version)
+		case "cluster":
+			err = decoder.Decode(&record.Cluster)
+		case "membership":
+			err = decoder.Decode(&record.Membership)
+		case "durability":
+			err = decoder.Decode(&record.Durability)
+		default:
+			return fmt.Errorf("membership record has unknown field %q", key)
+		}
+		if err != nil {
+			return err
+		}
+	}
+	if token, err = decoder.Token(); err != nil || token != json.Delim('}') {
+		return fmt.Errorf("membership record is not a complete JSON object")
+	}
+	if err := decoder.Decode(new(any)); !errors.Is(err, io.EOF) {
+		return fmt.Errorf("membership record has trailing data")
+	}
+	if record.Version == 0 || record.Cluster == "" || record.Membership == "" || record.Durability == "" {
+		return fmt.Errorf("membership record omits a required field")
+	}
+	for _, key := range []string{"version", "cluster", "membership", "durability"} {
+		if !seen[key] {
+			return fmt.Errorf("membership record omits required field %q", key)
+		}
 	}
 	return nil
 }

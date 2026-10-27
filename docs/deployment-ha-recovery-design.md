@@ -112,8 +112,15 @@ OS 파일 잠금만으로 분산 HA의 이전 writer 차단이 해결되는 것�
 HA 전용 Go API `PrepareRestore(ctx, Config)`와 실행 파일의 `--prepare-restore`
 early-exit 경로가 unreleased feature candidate에 구현되어 있다. 이 경로는
 `Local` 모드를 거부하며, shared object store, bootstrap voters, 재구성 설정과 새
-`Config.Learner` identity를 요구한다. 기존 certified archive/checkpoint 및 materializer
-복구 helper를 재사용한다. 단독 노드용 공통 Local 복구 API로 해석해서는 안 된다.
+명시적 `ClusterID`, `NodeID`, `PreparedPodUID`를 요구한다. 복구 대상의 공개 learner
+identity는 선택 사항이며, 제공되면 `NodeID`와 일치하고 유효한 공개 키를 포함해야 한다.
+새 복원과 중단된 복원 재개는 bootstrap voter ID/키를 불변 `voters/membership.json`
+등록과 대조한다. 누락·구버전·불일치 시 복원 데이터를 쓰거나 등록을 고치지 않고 거부하며,
+새 DataDir에는 소유권 잠금 항목만 남을 수 있다. 완료 marker가 일치하는 재호출은
+원격 저장소에 접근하지 않으며 최신 runtime WAL을 되감지 않는다. 준비는 runtime
+learner 권한을 부여하지 않는다. 실제 Node 시작은 별도로 `Config.Learner`, admin token 및
+peer token을 요구한다. 기존 certified archive/checkpoint 및 materializer 복구 helper를
+재사용한다. 단독 노드용 공통 Local 복구 API로 해석해서는 안 된다.
 
 실제 initContainer에서 API를 호출하고 DataDir 및 복구 설정을 앱 컨테이너와 동일하게
 공유하는 manifest wiring은 아직 미구현이다. initContainer는 `RHIZA_PREPARED_POD_UID`에
