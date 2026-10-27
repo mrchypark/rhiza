@@ -23,6 +23,8 @@ import (
 	"github.com/mrchypark/rhiza/pkg/recovery"
 )
 
+const preparedRestoreBaseValueBytes = 64 << 10
+
 // TestEmbeddedObjectStoragePrepareRestore uses a real multi-voter archive so the public
 // API is exercised against its actual object-store and consensus boundaries.
 // The archive fixtures are isolated local emulators selected by the existing
@@ -60,17 +62,19 @@ func TestEmbeddedObjectStoragePrepareRestore(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("create source SQL schema: %v", err)
 	}
-	if err := executeGraphRecoveryTest(ctx, source, rhiza.GraphCommand{RequestID: "prepare-restore-graph-schema", Cypher: "CREATE NODE TABLE PreparedRestore(id INTEGER, value STRING, PRIMARY KEY(id))"}); err != nil {
+	if _, err := executeGraphRecoveryTest(ctx, source, rhiza.GraphCommand{RequestID: "prepare-restore-graph-schema", Cypher: "CREATE NODE TABLE PreparedRestore(id INTEGER, value STRING, PRIMARY KEY(id))"}); err != nil {
 		t.Fatalf("create source Graph schema: %v", err)
 	}
-	largeValue := strings.Repeat("base-", (256<<10)/5)
-	if _, _, err := executeRecoveryTest(ctx, source, rhiza.ExecuteRequest{
+	largeValue := strings.Repeat("base-", preparedRestoreBaseValueBytes/len("base-"))
+	_, baseSQL, err := executeRecoveryTest(ctx, source, rhiza.ExecuteRequest{
 		RequestID: "prepare-restore-base-sql",
 		SQL:       "INSERT INTO prepared_restore_rows VALUES (1, '" + largeValue + "')",
-	}); err != nil {
+	})
+	if err != nil {
 		t.Fatalf("write checkpoint SQL base: %v", err)
 	}
-	if err := executeGraphRecoveryTest(ctx, source, rhiza.GraphCommand{RequestID: "prepare-restore-base-graph", Cypher: "CREATE (:PreparedRestore {id: 1, value: 'graph-base'})"}); err != nil {
+	baseGraphSlot, err := executeGraphRecoveryTest(ctx, source, rhiza.GraphCommand{RequestID: "prepare-restore-base-graph", Cypher: "CREATE (:PreparedRestore {id: 1, value: 'graph-base'})"})
+	if err != nil {
 		t.Fatalf("write checkpoint Graph base: %v", err)
 	}
 
@@ -80,7 +84,7 @@ func TestEmbeddedObjectStoragePrepareRestore(t *testing.T) {
 	var baseIndex uint64
 	for {
 		if err := archive.Load(ctx); err == nil {
-			if seal, _, ok := archive.RecoveryBase(); ok {
+			if seal, _, ok := archive.RecoveryBase(); ok && uint64(seal.Index) >= maxSlot(baseSQL.Slot, baseGraphSlot) {
 				baseIndex = uint64(seal.Index)
 				break
 			}
@@ -95,18 +99,29 @@ func TestEmbeddedObjectStoragePrepareRestore(t *testing.T) {
 		t.Fatal("source archive published an empty recovery base")
 	}
 
-	if _, _, err := executeRecoveryTest(ctx, source, rhiza.ExecuteRequest{
+	_, suffixSQL, err := executeRecoveryTest(ctx, source, rhiza.ExecuteRequest{
 		RequestID: "prepare-restore-suffix-sql",
 		SQL:       "INSERT INTO prepared_restore_rows VALUES (2, 'sql-suffix')",
-	}); err != nil {
+	})
+	if err != nil {
 		t.Fatalf("write certified SQL suffix: %v", err)
 	}
-	if err := executeGraphRecoveryTest(ctx, source, rhiza.GraphCommand{RequestID: "prepare-restore-suffix-graph", Cypher: "CREATE (:PreparedRestore {id: 2, value: 'graph-suffix'})"}); err != nil {
+	suffixGraphSlot, err := executeGraphRecoveryTest(ctx, source, rhiza.GraphCommand{RequestID: "prepare-restore-suffix-graph", Cypher: "CREATE (:PreparedRestore {id: 2, value: 'graph-suffix'})"})
+	if err != nil {
 		t.Fatalf("write certified Graph suffix: %v", err)
 	}
 	for {
-		if err := archive.Load(ctx); err == nil && uint64(archive.Tip()) > baseIndex {
-			break
+		if err := archive.Load(ctx); err == nil {
+			if seal, _, ok := archive.RecoveryBase(); ok {
+				selectedBase := uint64(seal.Index)
+				certifiedTip := uint64(archive.Tip())
+				if selectedBase >= minSlot(suffixSQL.Slot, suffixGraphSlot) {
+					t.Fatalf("selected checkpoint %d already includes a certified suffix write (SQL=%d Graph=%d); cannot prove suffix replay", selectedBase, suffixSQL.Slot, suffixGraphSlot)
+				}
+				if maxSlot(baseSQL.Slot, baseGraphSlot) <= selectedBase && selectedBase < minSlot(suffixSQL.Slot, suffixGraphSlot) && certifiedTip >= maxSlot(suffixSQL.Slot, suffixGraphSlot) {
+					break
+				}
+			}
 		}
 		select {
 		case <-ctx.Done():
@@ -134,10 +149,13 @@ func TestEmbeddedObjectStoragePrepareRestore(t *testing.T) {
 	prepared.Learner = &learner
 	prepared.Members = members
 
-	if err := rhiza.PrepareRestore(ctx, prepared); err != nil {
+	if err := prepareRestoreWithoutRuntimeCredentials(ctx, prepared); err != nil {
 		t.Fatalf("prepare learner materialization: %v", err)
 	}
-	assertPreparedRestoreFiles(t, ctx, prepared.DataDir)
+	markerBase, markerTip := assertPreparedRestoreFiles(t, ctx, prepared.DataDir)
+	if maxSlot(baseSQL.Slot, baseGraphSlot) > markerBase || markerBase >= minSlot(suffixSQL.Slot, suffixGraphSlot) || markerTip < maxSlot(suffixSQL.Slot, suffixGraphSlot) {
+		t.Fatalf("prepared marker does not prove checkpoint-base plus certified SQL/Graph suffix replay: base_index=%d certified_tip=%d SQLbase=%d Graphbase=%d SQLsuffix=%d Graphsuffix=%d", markerBase, markerTip, baseSQL.Slot, baseGraphSlot, suffixSQL.Slot, suffixGraphSlot)
+	}
 	assertNoPreparedRuntimeAuthority(t, prepared)
 	listener, err := net.ListenPacket("udp", prepared.PeerAddr)
 	if err != nil {
@@ -160,12 +178,12 @@ func TestEmbeddedObjectStoragePrepareRestore(t *testing.T) {
 	beforeMismatch := readPreparedDataDir(t, prepared.DataDir)
 	wrongPod := prepared
 	wrongPod.PreparedPodUID = "pod-incarnation-2"
-	if err := rhiza.PrepareRestore(ctx, wrongPod); err == nil {
+	if err := prepareRestoreWithoutRuntimeCredentials(ctx, wrongPod); err == nil {
 		t.Fatal("PrepareRestore accepted a completed DataDir for another Pod UID")
 	}
 	wrongSource := prepared
 	wrongSource.ObjStorePrefix += "/different-source"
-	if err := rhiza.PrepareRestore(ctx, wrongSource); err == nil {
+	if err := prepareRestoreWithoutRuntimeCredentials(ctx, wrongSource); err == nil {
 		t.Fatal("PrepareRestore accepted a completed DataDir for a different archive source")
 	}
 	if after := readPreparedDataDir(t, prepared.DataDir); !reflect.DeepEqual(beforeMismatch, after) {
@@ -181,7 +199,7 @@ func TestEmbeddedObjectStoragePrepareRestore(t *testing.T) {
 	if err != nil {
 		t.Fatalf("open prepared learner for same-Pod WAL check: %v", err)
 	}
-	if err := rhiza.PrepareRestore(runtimeCtx, prepared); err == nil {
+	if err := prepareRestoreWithoutRuntimeCredentials(runtimeCtx, prepared); err == nil {
 		_ = db.Close()
 		t.Fatal("PrepareRestore accepted concurrent use of the same DataDir")
 	}
@@ -196,7 +214,7 @@ func TestEmbeddedObjectStoragePrepareRestore(t *testing.T) {
 	if !hasPreparedRuntimeWAL(validWAL) {
 		t.Fatal("opening the learner did not produce a runtime WAL for the no-rewind check")
 	}
-	if err := rhiza.PrepareRestore(runtimeCtx, prepared); err != nil {
+	if err := prepareRestoreWithoutRuntimeCredentials(runtimeCtx, prepared); err != nil {
 		t.Fatalf("same-Pod retry with valid runtime WAL: %v", err)
 	}
 	if after := readPreparedDataDir(t, prepared.DataDir); !reflect.DeepEqual(validWAL, after) {
@@ -444,22 +462,42 @@ func isLowerHexString(value string) bool {
 	return true
 }
 
-func executeGraphRecoveryTest(ctx context.Context, voters []*rhiza.DB, command rhiza.GraphCommand) error {
+func prepareRestoreWithoutRuntimeCredentials(ctx context.Context, config rhiza.Config) error {
+	config.AdminToken = ""
+	config.PeerToken = ""
+	return rhiza.PrepareRestore(ctx, config)
+}
+
+func executeGraphRecoveryTest(ctx context.Context, voters []*rhiza.DB, command rhiza.GraphCommand) (uint64, error) {
 	var last error
 	for {
 		for _, voter := range voters {
-			if _, err := voter.GraphExecute(ctx, command); err == nil {
-				return nil
+			if response, err := voter.GraphExecute(ctx, command); err == nil {
+				return response.Slot, nil
 			} else {
 				last = err
 			}
 		}
 		select {
 		case <-ctx.Done():
-			return fmt.Errorf("execute Graph request %q: %w (last error: %v)", command.RequestID, ctx.Err(), last)
+			return 0, fmt.Errorf("execute Graph request %q: %w (last error: %v)", command.RequestID, ctx.Err(), last)
 		case <-time.After(25 * time.Millisecond):
 		}
 	}
+}
+
+func maxSlot(a, b uint64) uint64 {
+	if a > b {
+		return a
+	}
+	return b
+}
+
+func minSlot(a, b uint64) uint64 {
+	if a < b {
+		return a
+	}
+	return b
 }
 
 func closePreparedArchiveSource(voters []*rhiza.DB) error {
@@ -486,8 +524,20 @@ func reopenPreparedArchiveSource(t testing.TB, ctx context.Context, configs []rh
 	return voters
 }
 
-func assertPreparedRestoreFiles(t *testing.T, ctx context.Context, dataDir string) {
+func assertPreparedRestoreFiles(t *testing.T, ctx context.Context, dataDir string) (uint64, uint64) {
 	t.Helper()
+	markerBytes, err := os.ReadFile(filepath.Join(dataDir, "prepared-restore.json"))
+	if err != nil {
+		t.Fatalf("read prepared completion marker: %v", err)
+	}
+	var marker struct {
+		Phase        string `json:"phase"`
+		BaseIndex    uint64 `json:"base_index"`
+		CertifiedTip uint64 `json:"certified_tip"`
+	}
+	if err := json.Unmarshal(markerBytes, &marker); err != nil || marker.Phase != "complete" {
+		t.Fatalf("invalid prepared completion marker %s: %v", markerBytes, err)
+	}
 	material, err := materializer.Open(filepath.Join(dataDir, "sqlite.db"), 1)
 	if err != nil {
 		t.Fatalf("open prepared materialized SQL/Graph state before application Open: %v", err)
@@ -512,7 +562,8 @@ func assertPreparedRestoreFiles(t *testing.T, ctx context.Context, dataDir strin
 		_ = material.Close()
 		t.Fatalf("read prepared SQL rows: %v", err)
 	}
-	if len(sqlRows) != 2 || sqlRows[0] != "1:"+strings.Repeat("base-", (256<<10)/5) || sqlRows[1] != "2:sql-suffix" {
+	wantBaseValue := strings.Repeat("base-", preparedRestoreBaseValueBytes/len("base-"))
+	if len(sqlRows) != 2 || sqlRows[0] != "1:"+wantBaseValue || sqlRows[1] != "2:sql-suffix" {
 		_ = material.Close()
 		t.Fatalf("prepared SQL rows=%v; want checkpoint base and certified suffix", sqlRows)
 	}
@@ -533,6 +584,7 @@ func assertPreparedRestoreFiles(t *testing.T, ctx context.Context, dataDir strin
 	if tip == 0 {
 		t.Fatal("prepared materializer has no applied certified tip")
 	}
+	return marker.BaseIndex, marker.CertifiedTip
 }
 
 func assertNoPreparedRuntimeAuthority(t *testing.T, config rhiza.Config) {

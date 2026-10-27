@@ -119,6 +119,25 @@ func TestOperatorRecoveryForkE2E(t *testing.T) {
 	}
 }
 
+func TestExecuteRecoveryTestReturnsPermanentInvalidRequest(t *testing.T) {
+	db, err := rhiza.Open(context.Background(), rhiza.Config{NodeID: "invalid-request", DataDir: t.TempDir()})
+	if err != nil {
+		t.Fatalf("open local database: %v", err)
+	}
+	t.Cleanup(func() {
+		if err := db.Close(); err != nil {
+			t.Errorf("close local database: %v", err)
+		}
+	})
+
+	ctx, cancel := context.WithTimeout(context.Background(), 250*time.Millisecond)
+	defer cancel()
+	_, _, err = executeRecoveryTest(ctx, []*rhiza.DB{db}, rhiza.ExecuteRequest{RequestID: "permanent-invalid-sql"})
+	if !errors.Is(err, rhiza.ErrInvalidRequest) {
+		t.Fatalf("executeRecoveryTest error=%v, want immediate permanent invalid-request error", err)
+	}
+}
+
 // recoveryTestMembers publishes only public identity; the private tokens stay
 // with the test's per-node process configuration.
 func recoveryTestMembers(t testing.TB, cluster, tokenPrefix string) ([]rhiza.Member, map[string]string) {
@@ -209,6 +228,9 @@ func executeRecoveryTest(ctx context.Context, voters []*rhiza.DB, request rhiza.
 			response, err := voter.Execute(ctx, request)
 			if err == nil {
 				return voter, response, nil
+			}
+			if errors.Is(err, rhiza.ErrInvalidRequest) {
+				return nil, rhiza.ExecuteResponse{}, err
 			}
 			last = err
 		}
