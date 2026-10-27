@@ -22,7 +22,11 @@ import (
 var ErrLocalHEADAdvanced = errors.New("Local HEAD advanced")
 
 func (a *LocalArchive) localManager() *checkpoint.Manager {
-	return checkpoint.NewManager(a.bucket, a.prefix, "", a.Binding.Bootstrap.ConfigID)
+	manager := checkpoint.NewManager(a.bucket, a.prefix, "", a.Binding.Bootstrap.ConfigID)
+	if a.Binding.Version == 2 {
+		manager.SetLocalControlProfile(2, a.Binding.ArchiveLocationHash, hex.EncodeToString(a.head.BindingHash[:]))
+	}
+	return manager
 }
 
 // GarbageCollect retains the current snapshot, latest keep committed snapshots,
@@ -293,7 +297,7 @@ func (a *LocalArchive) pinLocalView(ctx context.Context, selected *LocalSnapshot
 	}
 	a.mu.Lock()
 	defer a.mu.Unlock()
-	pin := &LocalRestorePin{}
+	pin := &LocalRestorePin{archive: a}
 	err := a.localManager().WithLocalMaintenanceContext(ctx, func(ctx context.Context) error {
 		if err := a.checkLocalHead(ctx); err != nil {
 			return err
@@ -460,18 +464,24 @@ func (p *LocalRestorePin) Close(ctx context.Context) error {
 	if p.closed {
 		return nil
 	}
-	for _, part := range p.parts {
-		if err := part.Close(ctx); err != nil {
-			return err
-		}
+	if p.archive == nil {
+		p.closed = true
+		return nil
 	}
-	if p.key != "" {
-		if err := p.updateView(ctx, 0, true); err != nil {
-			return err
+	return p.archive.localManager().WithLocalMaintenanceContext(ctx, func(ctx context.Context) error {
+		for _, part := range p.parts {
+			if err := part.Close(ctx); err != nil {
+				return err
+			}
 		}
-	}
-	p.closed = true
-	return nil
+		if p.key != "" {
+			if err := p.updateView(ctx, 0, true); err != nil {
+				return err
+			}
+		}
+		p.closed = true
+		return nil
+	})
 }
 
 type localViewRecord struct {

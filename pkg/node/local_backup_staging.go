@@ -73,7 +73,13 @@ func (n *Node) verifyLocalBackupStageOwner(owner *localBackupStageOwner) error {
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
-	archive, err := recovery.OpenLocalArchive(ctx, n.bucket, n.localBackupPrefix())
+	var archive *recovery.LocalArchive
+	var err error
+	if n.localOwner != nil {
+		archive, err = recovery.OpenLocalArchiveOwned(ctx, n.bucket, n.localBackupPrefix(), n.localOwner)
+	} else {
+		archive, err = recovery.OpenLocalArchive(ctx, n.bucket, n.localBackupPrefix())
+	}
 	if err != nil {
 		return err
 	}

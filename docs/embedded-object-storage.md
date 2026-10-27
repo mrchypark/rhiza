@@ -30,6 +30,47 @@ window. An empty policy defaults to before-ack for Local plus object storage.
 The same bounded storage-outage test exercises both the explicit policy and
 the empty default. Nonlocal policy defaults are outside this test contract.
 
+## Filesystem-backed Local recovery (opt-in)
+
+Filesystem-backed Local recovery requires the explicit `filesystem-v2` archive
+profile, a dedicated filesystem root outside `DataDir`, and before-ack
+durability:
+
+```go
+cfg := rhiza.Config{
+    Local:               true,
+    NodeID:              "application",
+    DataDir:             "./application-data",
+    ObjStoreProvider:    rhiza.ObjectStoreProviderFilesystem,
+    ObjStoreDir:         "./application-archive",
+    ObjStoreDurability:  rhiza.ObjectStoreDurabilityBeforeAck,
+    LocalArchiveProfile: rhiza.LocalArchiveProfileFilesystem,
+}
+```
+
+This profile is limited to supported local filesystems on Linux and macOS. Its
+exclusive owner lock covers the entire archive root on the same host, including
+all prefixes beneath it. The root and its parent must be trusted, stable, and
+disjoint from `DataDir`. Neither may be renamed, replaced, remounted, or
+externally removed while Rhiza is using the root. The advisory lock only
+coordinates cooperating processes; pathname changes and external filesystem
+mutation are not detected or fenced. Existing symlinks anywhere below the v2
+archive namespace are rejected at startup.
+Filesystem-v2 does not adopt or migrate an existing v1 archive; keep the
+default legacy profile for v1 archives, or use a new empty archive root for
+v2. Do not run a v1 and v2 binary concurrently against the same empty root and
+prefix. A racing legacy genesis may leave a partial namespace; startup rejects
+that state and does not repair it automatically. This profile does not promise
+availability or fencing against concurrent legacy clients.
+
+The owner lock is a process-lifetime kernel lock: process termination releases
+it so the next process can validate and recover an acknowledged archive without
+an administrator clearing a token. This is a process-crash guarantee, not a
+power-loss or filesystem-hardware durability qualification. If a live process
+cannot prove that filesystem work drained, it deliberately retains ownership;
+restart that process to release the kernel lock. Do not remove the lock anchor
+while any process could still be using the root.
+
 ## Reconciliation contract
 
 An unbound local database may adopt an empty remote store. Matching histories

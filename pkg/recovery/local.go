@@ -7,6 +7,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	internalobjstore "github.com/mrchypark/rhiza/internal/objstore"
 	"github.com/mrchypark/rhiza/pkg/checkpoint"
 	"io"
 	"path"
@@ -19,11 +20,12 @@ import (
 // LocalBinding is immutable identity, not a distributed ownership claim.
 // Its namespace must have exactly one externally exclusive writer.
 type LocalBinding struct {
-	Version       uint            `json:"version"`
-	StoreUUID     string          `json:"store_uuid"`
-	ConfigDigest  string          `json:"config_digest"`
-	PolicyVersion uint            `json:"policy_version"`
-	Bootstrap     quepaxa.Cluster `json:"bootstrap"`
+	Version             uint            `json:"version"`
+	ArchiveLocationHash string          `json:"archive_location_hash,omitempty"`
+	StoreUUID           string          `json:"store_uuid"`
+	ConfigDigest        string          `json:"config_digest"`
+	PolicyVersion       uint            `json:"policy_version"`
+	Bootstrap           quepaxa.Cluster `json:"bootstrap"`
 }
 
 type LocalSnapshot struct {
@@ -61,6 +63,25 @@ type LocalArchive struct {
 }
 
 func OpenLocalArchive(ctx context.Context, bucket objstore.Bucket, prefix string) (*LocalArchive, error) {
+	return openLocalArchive(ctx, bucket, prefix, nil)
+}
+
+// OpenLocalArchiveOwned is restricted to Node's internal filesystem-v2 path.
+func OpenLocalArchiveOwned(ctx context.Context, bucket objstore.Bucket, prefix string, owner *internalobjstore.LocalFilesystemOwner) (*LocalArchive, error) {
+	if owner == nil || !owner.Held() {
+		return nil, fmt.Errorf("filesystem-v2 archive open requires its owner")
+	}
+	a, err := openLocalArchive(ctx, bucket, prefix, owner)
+	if err != nil {
+		return nil, err
+	}
+	if a.Binding.Version != 2 || a.Binding.ArchiveLocationHash != owner.LocationHash(prefix) {
+		return nil, fmt.Errorf("filesystem-v2 archive location differs from its owner")
+	}
+	return a, nil
+}
+
+func openLocalArchive(ctx context.Context, bucket objstore.Bucket, prefix string, owner *internalobjstore.LocalFilesystemOwner) (*LocalArchive, error) {
 	bucket = checkpoint.LocalBucket(bucket)
 	a := &LocalArchive{bucket: bucket, prefix: prefix}
 	data, err := a.read(ctx, "BINDING", 64<<10)
@@ -72,6 +93,14 @@ func OpenLocalArchive(ctx context.Context, bucket objstore.Bucket, prefix string
 	}
 	if err := validateLocalBinding(a.Binding); err != nil {
 		return nil, err
+	}
+	if a.Binding.Version == 2 && (owner == nil || !owner.Held()) {
+		return nil, fmt.Errorf("filesystem-v2 archive requires its owner")
+	}
+	if a.Binding.Version == 2 {
+		if err := a.validateLocalControl(ctx, data); err != nil {
+			return nil, err
+		}
 	}
 	if err := a.readLocalHead(ctx, data); err != nil {
 		return nil, err
@@ -157,6 +186,98 @@ func (a *LocalArchive) readLocalHead(ctx context.Context, data []byte) error {
 // CreateLocalArchive uses conditional creation for both genesis objects. A
 // partially published genesis is an error on later opens, never empty bootstrap.
 func CreateLocalArchive(ctx context.Context, bucket objstore.Bucket, prefix string, binding LocalBinding, base *LocalSnapshot) (*LocalArchive, error) {
+	return createLocalArchive(ctx, bucket, prefix, binding, base, nil)
+}
+
+// CreateLocalArchiveOwned is restricted to Node's internal filesystem-v2 path.
+func CreateLocalArchiveOwned(ctx context.Context, bucket objstore.Bucket, prefix string, binding LocalBinding, base *LocalSnapshot, owner *internalobjstore.LocalFilesystemOwner) (*LocalArchive, error) {
+	if owner == nil || !owner.Held() || binding.ArchiveLocationHash != owner.LocationHash(prefix) {
+		return nil, fmt.Errorf("filesystem-v2 archive creation requires its owner")
+	}
+	genesis, err := PrepareLocalArchiveOwned(ctx, bucket, prefix, binding, owner)
+	if err != nil {
+		return nil, err
+	}
+	return CreateLocalArchiveFromPreparedOwned(ctx, genesis, base, owner)
+}
+
+// LocalArchiveGenesis is a process-local capability for completing the exact
+// BINDING+control pair created by PrepareLocalArchiveOwned.
+type LocalArchiveGenesis struct {
+	owner       *internalobjstore.LocalFilesystemOwner
+	bucket      objstore.Bucket
+	prefix      string
+	binding     LocalBinding
+	bindingData []byte
+}
+
+// PrepareLocalArchiveOwned creates BINDING and then the v2 control before any
+// checkpoint roots, snapshots, extents, or HEAD are written.
+func PrepareLocalArchiveOwned(ctx context.Context, bucket objstore.Bucket, prefix string, binding LocalBinding, owner *internalobjstore.LocalFilesystemOwner) (*LocalArchiveGenesis, error) {
+	if owner == nil || !owner.Held() || binding.Version != 2 || binding.ArchiveLocationHash != owner.LocationHash(prefix) {
+		return nil, fmt.Errorf("filesystem-v2 archive preparation requires its owner")
+	}
+	bucket = checkpoint.LocalBucket(bucket)
+	conditional, match := false, false
+	for _, option := range bucket.SupportedObjectUploadOptions() {
+		conditional = conditional || option == objstore.IfNotExists
+		match = match || option == objstore.IfMatch
+	}
+	if !conditional || !match {
+		return nil, fmt.Errorf("local backup requires conditional object writes")
+	}
+	if err := validateLocalBinding(binding); err != nil {
+		return nil, err
+	}
+	data, err := json.Marshal(binding)
+	if err != nil {
+		return nil, err
+	}
+	a := &LocalArchive{bucket: bucket, prefix: prefix}
+	if err := bucket.Upload(ctx, a.key("BINDING"), bytes.NewReader(data), objstore.WithIfNotExists()); err != nil {
+		return nil, err
+	}
+	bindingHash := sha256.Sum256(data)
+	control, err := json.Marshal(localMaintenanceControlV2{Version: 2, LocationHash: binding.ArchiveLocationHash, BindingHash: hex.EncodeToString(bindingHash[:])})
+	if err != nil {
+		return nil, err
+	}
+	if err := bucket.Upload(ctx, a.key("local-gc-control"), bytes.NewReader(control), objstore.WithIfNotExists()); err != nil {
+		return nil, err
+	}
+	return &LocalArchiveGenesis{owner: owner, bucket: bucket, prefix: prefix, binding: binding, bindingData: data}, nil
+}
+
+// CreateLocalArchiveFromPreparedOwned publishes HEAD only after the caller has
+// uploaded and verified any base checkpoint beneath the already-created v2 control.
+func CreateLocalArchiveFromPreparedOwned(ctx context.Context, genesis *LocalArchiveGenesis, base *LocalSnapshot, owner *internalobjstore.LocalFilesystemOwner) (*LocalArchive, error) {
+	if genesis == nil || owner == nil || genesis.owner != owner || !owner.Held() || genesis.binding.Version != 2 || genesis.binding.ArchiveLocationHash != owner.LocationHash(genesis.prefix) {
+		return nil, fmt.Errorf("filesystem-v2 archive genesis is invalid")
+	}
+	a := &LocalArchive{bucket: genesis.bucket, prefix: genesis.prefix, Binding: genesis.binding}
+	if base != nil {
+		if err := a.validateSnapshot(*base, true); err != nil {
+			return nil, err
+		}
+	}
+	binding, err := a.read(ctx, "BINDING", 64<<10)
+	if err != nil || !bytes.Equal(binding, genesis.bindingData) {
+		return nil, fmt.Errorf("filesystem-v2 binding changed during genesis")
+	}
+	if err := a.validateLocalControl(ctx, binding); err != nil {
+		return nil, err
+	}
+	a.head = localHead{Version: 1, BindingHash: sha256.Sum256(binding), Origin: base, Snapshot: base}
+	if base != nil {
+		a.head.Tip, a.head.Prefix = base.Seal.Index, base.Seal.PrefixHash
+	}
+	if err := a.publish(ctx, a.head); err != nil {
+		return nil, err
+	}
+	return OpenLocalArchiveOwned(ctx, a.bucket, a.prefix, owner)
+}
+
+func createLocalArchive(ctx context.Context, bucket objstore.Bucket, prefix string, binding LocalBinding, base *LocalSnapshot, owner *internalobjstore.LocalFilesystemOwner) (*LocalArchive, error) {
 	bucket = checkpoint.LocalBucket(bucket)
 	a := &LocalArchive{bucket: bucket, prefix: prefix, Binding: binding}
 	conditional, match := false, false
@@ -169,6 +290,9 @@ func CreateLocalArchive(ctx context.Context, bucket objstore.Bucket, prefix stri
 	}
 	if err := validateLocalBinding(binding); err != nil {
 		return nil, err
+	}
+	if binding.Version != 1 || owner != nil {
+		return nil, fmt.Errorf("Local archive profile and owner do not match")
 	}
 	if base != nil {
 		if err := a.validateSnapshot(*base, true); err != nil {
@@ -190,6 +314,69 @@ func CreateLocalArchive(ctx context.Context, bucket objstore.Bucket, prefix stri
 		return nil, err
 	}
 	return OpenLocalArchive(ctx, bucket, prefix)
+}
+
+// ReadOnly is for startup restore validation while a LocalFilesystemOwner is
+// held. It preserves the captured view and rejects every archive mutation.
+func (a *LocalArchive) ReadOnly() *LocalArchive {
+	return &LocalArchive{
+		bucket: &readOnlyLocalArchiveBucket{Bucket: a.bucket}, prefix: a.prefix,
+		Binding: a.Binding, head: a.head, headHash: a.headHash, version: a.version,
+		extents: append([]Extent(nil), a.extents...), failure: a.failure,
+	}
+}
+
+type readOnlyLocalArchiveBucket struct{ objstore.Bucket }
+
+func (b *readOnlyLocalArchiveBucket) Upload(context.Context, string, io.Reader, ...objstore.ObjectUploadOption) error {
+	return fmt.Errorf("Local startup archive validation is read-only")
+}
+func (b *readOnlyLocalArchiveBucket) Delete(context.Context, string) error {
+	return fmt.Errorf("Local startup archive validation is read-only")
+}
+
+// RecoverMaintenanceControl clears only a v2 held token after the caller has
+// completed owner-authorized staged validation and the exclusive owner remains held.
+func (a *LocalArchive) RecoverMaintenanceControl(ctx context.Context, owner *internalobjstore.LocalFilesystemOwner) error {
+	if a.Binding.Version != 2 || owner == nil || !owner.Held() {
+		return fmt.Errorf("v2 Local recovery requires the filesystem owner")
+	}
+	return a.localManager().RecoverLocalMaintenanceControl(ctx, owner)
+}
+
+func (a *LocalArchive) MaintenanceResolved(ctx context.Context) (bool, error) {
+	if a.Binding.Version != 2 {
+		return true, nil
+	}
+	return a.localManager().LocalMaintenanceResolved(ctx)
+}
+
+type localMaintenanceControlV2 struct {
+	Version      uint   `json:"version"`
+	Token        string `json:"token"`
+	LocationHash string `json:"location_hash"`
+	BindingHash  string `json:"binding_hash"`
+}
+
+func (a *LocalArchive) validateLocalControl(ctx context.Context, binding []byte) error {
+	key := a.key("local-gc-control")
+	before, err := a.bucket.Attributes(ctx, key)
+	if err != nil {
+		return fmt.Errorf("v2 Local maintenance control missing: %w", err)
+	}
+	data, err := a.read(ctx, "local-gc-control", 4096)
+	if err != nil {
+		return err
+	}
+	after, err := a.bucket.Attributes(ctx, key)
+	if err != nil || before.Version == nil || !sameObjectVersion(before.Version, after.Version) {
+		return fmt.Errorf("v2 Local maintenance control changed during read")
+	}
+	var control localMaintenanceControlV2
+	if err := strictLocalJSON(data, &control); err != nil || control.Version != 2 || control.LocationHash != a.Binding.ArchiveLocationHash || control.BindingHash != fmt.Sprintf("%x", sha256.Sum256(binding)) {
+		return fmt.Errorf("invalid v2 Local maintenance control")
+	}
+	return nil
 }
 
 func (a *LocalArchive) Tip() quepaxa.Slot { a.mu.Lock(); defer a.mu.Unlock(); return a.head.Tip }
@@ -597,7 +784,8 @@ func (a *LocalArchive) publishHead(ctx context.Context, head localHead) (resultE
 func validateLocalBinding(binding LocalBinding) error {
 	_, uuidErr := hex.DecodeString(binding.StoreUUID)
 	_, digestErr := hex.DecodeString(binding.ConfigDigest)
-	if binding.Version != 1 || binding.PolicyVersion != 1 || uuidErr != nil || digestErr != nil || len(binding.StoreUUID) != 32 || len(binding.ConfigDigest) != 64 || binding.Bootstrap.ConfigID == 0 || len(binding.Bootstrap.Members) != 1 || binding.Bootstrap.Members[0].ID == "" {
+	location, locationErr := hex.DecodeString(binding.ArchiveLocationHash)
+	if (binding.Version != 1 && binding.Version != 2) || binding.Version == 1 && binding.ArchiveLocationHash != "" || binding.Version == 2 && (locationErr != nil || len(location) != 32 || hex.EncodeToString(location) != binding.ArchiveLocationHash) || binding.PolicyVersion != 1 || uuidErr != nil || digestErr != nil || len(binding.StoreUUID) != 32 || len(binding.ConfigDigest) != 64 || binding.Bootstrap.ConfigID == 0 || len(binding.Bootstrap.Members) != 1 || binding.Bootstrap.Members[0].ID == "" {
 		return fmt.Errorf("invalid Local archive binding")
 	}
 	return nil

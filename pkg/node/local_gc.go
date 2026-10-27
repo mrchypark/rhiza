@@ -9,6 +9,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/mrchypark/rhiza/internal/objstore"
 	"github.com/mrchypark/rhiza/internal/types"
 	"github.com/mrchypark/rhiza/pkg/checkpoint"
 	"github.com/mrchypark/rhiza/pkg/recovery"
@@ -115,6 +116,7 @@ type localRestorePins struct {
 	cancel context.CancelCauseFunc
 	wg     sync.WaitGroup
 	pin    *localRestorePin
+	owner  *objstore.LocalFilesystemOwner
 }
 
 func newLocalRestorePins(ctx context.Context) *localRestorePins {
@@ -122,9 +124,21 @@ func newLocalRestorePins(ctx context.Context) *localRestorePins {
 	return &localRestorePins{ctx: workCtx, cancel: cancel}
 }
 
+func newOwnerLocalRestorePins(ctx context.Context, owner *objstore.LocalFilesystemOwner) *localRestorePins {
+	pins := newLocalRestorePins(ctx)
+	pins.owner = owner
+	return pins
+}
+
 func (p *localRestorePins) acquire(archive *recovery.LocalArchive) error {
 	if err := context.Cause(p.ctx); err != nil {
 		return err
+	}
+	if p.owner != nil {
+		if !p.owner.Held() {
+			return fmt.Errorf("Local startup recovery lost filesystem ownership")
+		}
+		return nil
 	}
 	if p.pin != nil {
 		return nil
@@ -169,6 +183,9 @@ func (p *localRestorePins) watch(guard *localRestorePin) {
 }
 
 func (p *localRestorePins) confirm() error {
+	if p.owner != nil && !p.owner.Held() {
+		return fmt.Errorf("Local startup recovery lost filesystem ownership")
+	}
 	if p.pin != nil {
 		renewCtx, cancel := context.WithTimeout(p.ctx, localRestorePinRenewBudget)
 		defer cancel()

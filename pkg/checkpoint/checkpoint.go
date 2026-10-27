@@ -117,16 +117,19 @@ type RecoveryPin struct {
 }
 
 type Manager struct {
-	bucket        objstore.Bucket
-	prefix        string
-	localDir      string
-	configID      uint
-	checkpoints   []Checkpoint
-	certified     *Checkpoint
-	mu            sync.Mutex
-	verifiedMu    sync.Mutex
-	verified      map[string]int64
-	verifiedRoots map[[32]byte]verifiedRoot
+	bucket                   objstore.Bucket
+	prefix                   string
+	localDir                 string
+	configID                 uint
+	localControlVersion      uint
+	localControlLocationHash string
+	localControlBindingHash  string
+	checkpoints              []Checkpoint
+	certified                *Checkpoint
+	mu                       sync.Mutex
+	verifiedMu               sync.Mutex
+	verified                 map[string]int64
+	verifiedRoots            map[[32]byte]verifiedRoot
 }
 
 func NewManager(bucket objstore.Bucket, prefix, localDir string, configID ...uint) *Manager {
