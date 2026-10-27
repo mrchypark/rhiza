@@ -19,8 +19,12 @@ import (
 	"time"
 
 	"github.com/mrchypark/rhiza"
+	"github.com/mrchypark/rhiza/pkg/checkpoint"
 	"github.com/mrchypark/rhiza/pkg/materializer"
+	"github.com/mrchypark/rhiza/pkg/qlog"
+	"github.com/mrchypark/rhiza/pkg/quepaxa"
 	"github.com/mrchypark/rhiza/pkg/recovery"
+	"github.com/thanos-io/objstore"
 )
 
 const preparedRestoreBaseValueBytes = 64 << 10
@@ -130,14 +134,40 @@ func TestEmbeddedObjectStoragePrepareRestore(t *testing.T) {
 		}
 	}
 	// Shutdown joins each checkpointer and archive writer. Capture only after
-	// every source is closed so the full-image comparison cannot race a valid
-	// background checkpoint publication.
+	// every source is closed so the image and API-decoded anchors are stable.
 	if err := closePreparedArchiveSource(source); err != nil {
 		t.Fatalf("quiesce source archive writers: %v", err)
 	}
+	if err := archive.Load(ctx); err != nil {
+		t.Fatalf("reload quiesced source archive: %v", err)
+	}
+	seal, _, hasBase := archive.RecoveryBase()
+	if !hasBase {
+		t.Fatal("quiesced source archive lost its certified checkpoint base")
+	}
+	checkpointManager := checkpoint.NewManager(embeddedBucket(t, base), path.Join(base.ObjStorePrefix, cluster), "", 1)
+	if err := checkpointManager.Load(ctx); err != nil {
+		t.Fatalf("load source checkpoint through checkpoint manager: %v", err)
+	}
+	currentCheckpoint := checkpointManager.Latest()
+	if currentCheckpoint == nil {
+		t.Fatal("quiesced source archive has no current checkpoint")
+	}
 
-	archiveBefore := embeddedRemoteImage(t, base)
 	learnerID, learnerToken := "fresh-learner", generation+"-learner-token"
+	baselineOwner := "prepare-observation-" + generation
+	baselineSnapshot, err := archive.BeginRecoverySnapshot(ctx, baselineOwner, time.Minute)
+	if err != nil {
+		t.Fatalf("capture baseline archive head through recovery API: %v", err)
+	}
+	if err := baselineSnapshot.Close(ctx); err != nil {
+		t.Fatalf("release baseline archive snapshot: %v", err)
+	}
+	archiveBefore := embeddedRemoteImage(t, base)
+	expectedArchivePin := requirePreparedArchivePin(t, archiveBefore, base.ObjStorePrefix, cluster, baselineOwner)
+	if expectedArchivePin.Base != uint64(seal.Index) || expectedArchivePin.Tip != uint64(archive.Tip()) {
+		t.Fatalf("baseline recovery API snapshot differs from loaded source anchors: pin=%+v base=%d tip=%d", expectedArchivePin, seal.Index, archive.Tip())
+	}
 	learner := rhiza.Member{ID: rhiza.NodeID(learnerID), PeerURL: "quic://" + freeUDPAddr(t), PublicKey: rhiza.PeerPublicKey(cluster, learnerID, learnerToken)}
 	prepared := base
 	prepared.ClusterID = cluster
@@ -165,7 +195,7 @@ func TestEmbeddedObjectStoragePrepareRestore(t *testing.T) {
 		t.Fatal(err)
 	}
 	archiveAfter := embeddedRemoteImage(t, base)
-	if err := comparePreparedRestoreArchiveImages(archiveBefore, archiveAfter, prepared.ObjStorePrefix, string(prepared.ClusterID), string(prepared.NodeID), time.Now()); err != nil {
+	if err := comparePreparedRestoreArchiveImages(archiveBefore, archiveAfter, prepared.ObjStorePrefix, string(prepared.ClusterID), string(prepared.NodeID), uint64(archive.Tip()), uint64(seal.Index), expectedArchivePin, currentCheckpoint, time.Now()); err != nil {
 		t.Fatalf("PrepareRestore changed canonical archive state or left invalid recovery-pin state: %v", err)
 	}
 
@@ -222,20 +252,6 @@ func TestEmbeddedObjectStoragePrepareRestore(t *testing.T) {
 	}
 }
 
-type preparedArchiveHead struct {
-	ConfigID      uint            `json:"config_id"`
-	Generation    uint64          `json:"Generation"`
-	Base          uint64          `json:"base"`
-	BasePrefix    [32]byte        `json:"base_prefix"`
-	BaseSeal      json.RawMessage `json:"base_seal,omitempty"`
-	BaseDecision  json.RawMessage `json:"base_decision,omitempty"`
-	BaseAnchor    json.RawMessage `json:"base_anchor,omitempty"`
-	LineageAnchor json.RawMessage `json:"lineage_anchor,omitempty"`
-	Tip           uint64          `json:"tip"`
-	TailHash      [32]byte        `json:"tail_hash"`
-	TailObject    uint64          `json:"tail_object"`
-}
-
 type preparedArchivePin struct {
 	OwnerID      string   `json:"owner_id"`
 	Token        string   `json:"token"`
@@ -250,11 +266,6 @@ type preparedArchiveGCLock struct {
 	OwnerID      string `json:"owner_id"`
 	Generation   uint64 `json:"generation"`
 	LeaseUntilMS int64  `json:"lease_until_unix_ms"`
-}
-
-type preparedCheckpointPointer struct {
-	Index    uint64 `json:"index"`
-	RootHash string `json:"root_hash"`
 }
 
 type preparedCheckpointPublisher struct {
@@ -281,7 +292,7 @@ type preparedCheckpointPin struct {
 // comparePreparedRestoreArchiveImages permits only new, correctly scoped,
 // expired recovery pins. Every canonical object and every pre-existing pin
 // remains byte-for-byte identical.
-func comparePreparedRestoreArchiveImages(before, after map[string][]byte, prefix, clusterID, nodeID string, now time.Time) error {
+func comparePreparedRestoreArchiveImages(before, after map[string][]byte, prefix, clusterID, nodeID string, archiveTip, archiveBase uint64, expectedArchivePin preparedArchivePin, currentCheckpoint *checkpoint.Checkpoint, now time.Time) error {
 	root := path.Join(prefix, clusterID)
 	archivePins := path.Join(root, "archive/recovery-pins") + "/"
 	checkpointPins := path.Join(root, "checkpoint/recovery-pins") + "/"
@@ -289,16 +300,15 @@ func comparePreparedRestoreArchiveImages(before, after map[string][]byte, prefix
 	currentKey := path.Join(root, "checkpoint/CURRENT")
 	gcLockKey := path.Join(root, "archive/GC_LOCK")
 	checkpointPublisherKey := path.Join(root, "checkpoint/PUBLISHER")
-	var head preparedArchiveHead
-	if err := decodePreparedJSON(before[headKey], &head); err != nil {
-		return fmt.Errorf("decode original archive head: %w", err)
-	}
-	var pointer preparedCheckpointPointer
-	if err := decodePreparedJSON(before[currentKey], &pointer); err != nil {
-		return fmt.Errorf("decode original checkpoint pointer: %w", err)
-	}
-	if head.Tip == 0 || head.TailObject == 0 || pointer.Index == 0 || len(pointer.RootHash) != 64 || !isLowerHexString(pointer.RootHash) {
+	if len(before[headKey]) == 0 || len(before[currentKey]) == 0 || archiveTip == 0 || currentCheckpoint == nil || currentCheckpoint.Index == 0 {
 		return fmt.Errorf("original archive/checkpoint anchors are incomplete")
+	}
+	if expectedArchivePin.Tip != archiveTip || expectedArchivePin.Base != archiveBase || expectedArchivePin.Tip < expectedArchivePin.Base || (expectedArchivePin.Tip > expectedArchivePin.Base) != (expectedArchivePin.TailHash != ([32]byte{})) || (expectedArchivePin.TailHash == ([32]byte{})) != (expectedArchivePin.TailObject == 0) {
+		return fmt.Errorf("baseline recovery snapshot does not identify the loaded archive head")
+	}
+	checkpointRootHash := hex.EncodeToString(currentCheckpoint.RootHash[:])
+	if len(checkpointRootHash) != 64 || !isLowerHexString(checkpointRootHash) {
+		return fmt.Errorf("loaded checkpoint manager returned an invalid root hash")
 	}
 	ownerPrefix := "startup-prepare-" + nodeID + "-"
 	newArchivePins, newCheckpointPins := 0, 0
@@ -332,7 +342,7 @@ func comparePreparedRestoreArchiveImages(before, after map[string][]byte, prefix
 			if err := validatePreparedPinIdentity(name, archivePins, pin.OwnerID, pin.Token, pin.LeaseUntilMS, ownerPrefix, now); err != nil {
 				return err
 			}
-			if pin.Base != head.Base || pin.Tip != head.Tip || pin.TailHash != head.TailHash || pin.TailObject != head.TailObject {
+			if pin.Base != expectedArchivePin.Base || pin.Tip != expectedArchivePin.Tip || pin.TailHash != expectedArchivePin.TailHash || pin.TailObject != expectedArchivePin.TailObject {
 				return fmt.Errorf("new archive recovery pin %q is not bound to the original head", name)
 			}
 			if newOwner != "" && newOwner != pin.OwnerID {
@@ -351,7 +361,7 @@ func comparePreparedRestoreArchiveImages(before, after map[string][]byte, prefix
 			rootName := path.Join(root, "checkpoint/roots", fmt.Sprintf("%020d_%s.json", pin.Index, pin.RootHash))
 			canonicalRoot, ok := before[rootName]
 			rootHash := sha256.Sum256(canonicalRoot)
-			if pin.ConfigID != 1 || pin.Index != pointer.Index || pin.RootHash != pointer.RootHash || !ok || !bytes.Equal(pin.Root, canonicalRoot) || hex.EncodeToString(rootHash[:]) != pin.RootHash {
+			if pin.ConfigID != 1 || pin.Index != currentCheckpoint.Index || pin.RootHash != checkpointRootHash || !ok || !bytes.Equal(pin.Root, canonicalRoot) || hex.EncodeToString(rootHash[:]) != pin.RootHash {
 				return fmt.Errorf("new checkpoint recovery pin %q is not bound to the original checkpoint", name)
 			}
 			if newOwner != "" && newOwner != pin.OwnerID {
@@ -662,114 +672,273 @@ func hasPreparedRuntimeWAL(image map[string][]byte) bool {
 }
 
 func TestComparePreparedRestoreArchiveImages(t *testing.T) {
-	now := time.Now()
 	t.Run("only validated expired pins may be added", func(t *testing.T) {
-		before, after, prefix, cluster, node := preparedRestoreImagePair(t, now)
-		if err := comparePreparedRestoreArchiveImages(before, after, prefix, cluster, node, now); err != nil {
+		fixture := preparedRestoreImagePair(t)
+		if err := comparePreparedRestoreArchiveImages(fixture.before, fixture.after, fixture.prefix, fixture.cluster, fixture.node, fixture.archiveTip, fixture.archiveBase, fixture.expectedArchivePin, fixture.currentCheckpoint, fixture.now); err != nil {
 			t.Fatalf("valid pin lifecycle refused: %v", err)
 		}
 	})
 	t.Run("canonical mutation refused", func(t *testing.T) {
-		before, after, prefix, cluster, node := preparedRestoreImagePair(t, now)
-		after[path.Join(prefix, cluster, "archive/head.bin")] = []byte(`{}`)
-		if err := comparePreparedRestoreArchiveImages(before, after, prefix, cluster, node, now); err == nil {
+		fixture := preparedRestoreImagePair(t)
+		fixture.after[path.Join(fixture.prefix, fixture.cluster, "archive/head.bin")] = []byte("mutated raw head")
+		if err := comparePreparedRestoreArchiveImages(fixture.before, fixture.after, fixture.prefix, fixture.cluster, fixture.node, fixture.archiveTip, fixture.archiveBase, fixture.expectedArchivePin, fixture.currentCheckpoint, fixture.now); err == nil {
 			t.Fatal("canonical archive mutation accepted")
 		}
 	})
 	t.Run("active archive pin refused", func(t *testing.T) {
-		before, after, prefix, cluster, node := preparedRestoreImagePair(t, now)
-		key := path.Join(prefix, cluster, "archive/recovery-pins") + "/"
-		for name, data := range after {
-			if strings.HasPrefix(name, key) && before[name] == nil {
-				var pin preparedArchivePin
-				if err := json.Unmarshal(data, &pin); err != nil {
-					t.Fatal(err)
-				}
-				pin.LeaseUntilMS = now.Add(time.Minute).UnixMilli()
-				after[name], _ = json.Marshal(pin)
-			}
-		}
-		if err := comparePreparedRestoreArchiveImages(before, after, prefix, cluster, node, now); err == nil {
+		fixture := preparedRestoreImagePair(t)
+		setPreparedPinLease(t, fixture, path.Join(fixture.prefix, fixture.cluster, "archive/recovery-pins")+"/", fixture.now.Add(time.Minute).UnixMilli())
+		if err := comparePreparedRestoreArchiveImages(fixture.before, fixture.after, fixture.prefix, fixture.cluster, fixture.node, fixture.archiveTip, fixture.archiveBase, fixture.expectedArchivePin, fixture.currentCheckpoint, fixture.now); err == nil {
 			t.Fatal("active archive pin accepted")
 		}
 	})
 	t.Run("active checkpoint pin refused", func(t *testing.T) {
-		before, after, prefix, cluster, node := preparedRestoreImagePair(t, now)
-		key := path.Join(prefix, cluster, "checkpoint/recovery-pins") + "/"
-		for name, data := range after {
-			if strings.HasPrefix(name, key) && before[name] == nil {
-				var pin preparedCheckpointPin
-				if err := json.Unmarshal(data, &pin); err != nil {
-					t.Fatal(err)
-				}
-				pin.LeaseUntilMS = now.Add(time.Minute).UnixMilli()
-				after[name], _ = json.Marshal(pin)
-			}
-		}
-		if err := comparePreparedRestoreArchiveImages(before, after, prefix, cluster, node, now); err == nil {
+		fixture := preparedRestoreImagePair(t)
+		setPreparedPinLease(t, fixture, path.Join(fixture.prefix, fixture.cluster, "checkpoint/recovery-pins")+"/", fixture.now.Add(time.Minute).UnixMilli())
+		if err := comparePreparedRestoreArchiveImages(fixture.before, fixture.after, fixture.prefix, fixture.cluster, fixture.node, fixture.archiveTip, fixture.archiveBase, fixture.expectedArchivePin, fixture.currentCheckpoint, fixture.now); err == nil {
 			t.Fatal("active checkpoint pin accepted")
 		}
 	})
 	t.Run("changed pre-existing pin refused", func(t *testing.T) {
-		before, after, prefix, cluster, node := preparedRestoreImagePair(t, now)
-		key := path.Join(prefix, cluster, "archive/recovery-pins") + "/old"
-		before[key], after[key] = []byte("old-pin"), []byte("changed-pin")
-		if err := comparePreparedRestoreArchiveImages(before, after, prefix, cluster, node, now); err == nil {
+		fixture := preparedRestoreImagePair(t)
+		key := firstMapKeyWithPrefix(fixture.before, path.Join(fixture.prefix, fixture.cluster, "archive/recovery-pins")+"/")
+		fixture.after[key] = append(fixture.after[key], 'x')
+		if err := comparePreparedRestoreArchiveImages(fixture.before, fixture.after, fixture.prefix, fixture.cluster, fixture.node, fixture.archiveTip, fixture.archiveBase, fixture.expectedArchivePin, fixture.currentCheckpoint, fixture.now); err == nil {
 			t.Fatal("changed pre-existing pin accepted")
 		}
 	})
 	t.Run("unexpected object refused", func(t *testing.T) {
-		before, after, prefix, cluster, node := preparedRestoreImagePair(t, now)
-		after[path.Join(prefix, cluster, "archive/unexpected-object")] = []byte("mutation")
-		if err := comparePreparedRestoreArchiveImages(before, after, prefix, cluster, node, now); err == nil {
+		fixture := preparedRestoreImagePair(t)
+		fixture.after[path.Join(fixture.prefix, fixture.cluster, "archive/unexpected-object")] = []byte("mutation")
+		if err := comparePreparedRestoreArchiveImages(fixture.before, fixture.after, fixture.prefix, fixture.cluster, fixture.node, fixture.archiveTip, fixture.archiveBase, fixture.expectedArchivePin, fixture.currentCheckpoint, fixture.now); err == nil {
 			t.Fatal("unexpected archive object accepted")
+		}
+	})
+	t.Run("same tip with wrong nonzero tail hash refused", func(t *testing.T) {
+		fixture := preparedRestoreImagePair(t)
+		mutateNewArchivePin(t, fixture, func(pin *preparedArchivePin) { pin.TailHash[0] ^= 0xff })
+		if err := comparePreparedRestoreArchiveImages(fixture.before, fixture.after, fixture.prefix, fixture.cluster, fixture.node, fixture.archiveTip, fixture.archiveBase, fixture.expectedArchivePin, fixture.currentCheckpoint, fixture.now); err == nil {
+			t.Fatal("same-tip recovery pin with another nonzero tail hash accepted")
+		}
+	})
+	t.Run("same tip with wrong nonzero tail object refused", func(t *testing.T) {
+		fixture := preparedRestoreImagePair(t)
+		mutateNewArchivePin(t, fixture, func(pin *preparedArchivePin) { pin.TailObject++ })
+		if err := comparePreparedRestoreArchiveImages(fixture.before, fixture.after, fixture.prefix, fixture.cluster, fixture.node, fixture.archiveTip, fixture.archiveBase, fixture.expectedArchivePin, fixture.currentCheckpoint, fixture.now); err == nil {
+			t.Fatal("same-tip recovery pin with another nonzero tail object accepted")
 		}
 	})
 }
 
-func preparedRestoreImagePair(t *testing.T, now time.Time) (map[string][]byte, map[string][]byte, string, string, string) {
+type preparedRestoreImageFixture struct {
+	before, after      map[string][]byte
+	prefix, cluster    string
+	node               string
+	archiveTip         uint64
+	archiveBase        uint64
+	expectedArchivePin preparedArchivePin
+	currentCheckpoint  *checkpoint.Checkpoint
+	now                time.Time
+}
+
+func preparedRestoreImagePair(t *testing.T) preparedRestoreImageFixture {
 	t.Helper()
+	ctx := context.Background()
 	prefix, cluster, node := "test-prefix", "test-cluster", "fresh-learner"
-	root := path.Join(prefix, cluster)
+	rootPrefix := path.Join(prefix, cluster)
+	bucket := objstore.NewInMemBucket()
+	archive := recovery.NewManager(bucket, rootPrefix, 1)
+	t.Cleanup(archive.Close)
+	wal, err := qlog.Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = wal.Close() })
+	core, err := quepaxa.New(quepaxa.Config{NodeID: "fixture-voter", Cluster: quepaxa.Cluster{ConfigID: 1, Members: []quepaxa.Member{{ID: "fixture-voter"}}}, WAL: wal})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < 2; i++ {
+		if _, _, err := core.Propose(ctx, []byte(fmt.Sprintf("archive-tail-%d", i))); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := archive.SyncThrough(ctx, core, core.Tip()); err != nil {
+		t.Fatal(err)
+	}
+	if err := archive.Load(ctx); err != nil {
+		t.Fatal(err)
+	}
+	checkpoints := checkpoint.NewManager(bucket, rootPrefix, t.TempDir(), 1)
+	material, err := materializer.Open(filepath.Join(t.TempDir(), "sqlite.db"), 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = material.Close() })
+	files, _, closeFiles, err := material.CheckpointFilesAt(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(closeFiles)
+	sources := make([]checkpoint.Source, 0, len(files))
+	for _, file := range files {
+		sources = append(sources, checkpoint.Source{Role: string(file.Role), Path: file.Path})
+	}
+	claim, err := checkpoints.AcquirePublisherClaim(ctx, "fixture-publisher", 0, time.Minute)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rootCheckpoint, err := checkpoints.CreateFiles(ctx, claim, sources, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := checkpoints.PromoteCertifiedCurrent(ctx, rootCheckpoint); err != nil {
+		t.Fatal(err)
+	}
+	if err := checkpoints.ReleasePublisherClaim(ctx, claim); err != nil {
+		t.Fatal(err)
+	}
+	if err := checkpoints.Load(ctx); err != nil {
+		t.Fatal(err)
+	}
+	current := checkpoints.Latest()
+	if current == nil {
+		t.Fatal("checkpoint manager did not load the product-published CURRENT")
+	}
+	priorArchivePin, err := archive.BeginRecoverySnapshot(ctx, "prior-owner", time.Minute)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := priorArchivePin.Close(ctx); err != nil {
+		t.Fatal(err)
+	}
+	priorCheckpointPin, err := checkpoints.PinRecoveryRoot(ctx, current, "prior-owner", time.Minute)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := priorCheckpointPin.Close(ctx); err != nil {
+		t.Fatal(err)
+	}
+	before := capturePreparedObjectImage(t, ctx, bucket)
+	expectedArchivePin := requirePreparedArchivePin(t, before, prefix, cluster, "prior-owner")
+	if expectedArchivePin.Tip <= expectedArchivePin.Base || expectedArchivePin.TailHash == ([32]byte{}) || expectedArchivePin.TailObject == 0 {
+		t.Fatalf("fixture must contain a real nonempty archive tail: %+v", expectedArchivePin)
+	}
 	owner := "startup-prepare-" + node + "-0123456789abcdef"
+	archivePin, err := archive.BeginRecoverySnapshot(ctx, owner, time.Minute)
+	if err != nil {
+		t.Fatal(err)
+	}
+	checkpointPin, err := checkpoints.PinRecoveryRoot(ctx, current, owner, time.Minute)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := archivePin.Close(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if err := checkpointPin.Close(ctx); err != nil {
+		t.Fatal(err)
+	}
+	after := capturePreparedObjectImage(t, ctx, bucket)
+	now := time.Now()
+	if err := archive.Load(ctx); err != nil {
+		t.Fatal(err)
+	}
+	return preparedRestoreImageFixture{
+		before: before, after: after, prefix: prefix, cluster: cluster, node: node,
+		archiveTip: uint64(archive.Tip()), archiveBase: uint64(expectedArchivePin.Base), expectedArchivePin: expectedArchivePin,
+		currentCheckpoint: current, now: now,
+	}
+}
+
+func capturePreparedObjectImage(t *testing.T, ctx context.Context, bucket objstore.Bucket) map[string][]byte {
+	t.Helper()
+	image := make(map[string][]byte)
+	err := bucket.Iter(ctx, "", func(name string) error {
+		reader, err := bucket.Get(ctx, name)
+		if err != nil {
+			return err
+		}
+		data, readErr := io.ReadAll(reader)
+		closeErr := reader.Close()
+		if readErr != nil {
+			return readErr
+		}
+		if closeErr != nil {
+			return closeErr
+		}
+		image[name] = data
+		return nil
+	}, objstore.WithRecursiveIter())
+	if err != nil {
+		t.Fatalf("capture product-published object image: %v", err)
+	}
+	return image
+}
+
+func requirePreparedArchivePin(t *testing.T, image map[string][]byte, prefix, cluster, owner string) preparedArchivePin {
+	t.Helper()
 	ownerHash := sha256.Sum256([]byte(owner))
-	var tailHash [32]byte
-	tailHash[0] = 9
-	head, err := json.Marshal(preparedArchiveHead{ConfigID: 1, Generation: 1, Base: 1, Tip: 2, TailHash: tailHash, TailObject: 2})
-	if err != nil {
-		t.Fatal(err)
+	name := path.Join(prefix, cluster, "archive/recovery-pins", hex.EncodeToString(ownerHash[:]))
+	var pin preparedArchivePin
+	if err := decodePreparedJSON(image[name], &pin); err != nil {
+		t.Fatalf("decode baseline recovery snapshot pin %q: %v", name, err)
 	}
-	rootJSON := []byte(`{"config_id":1,"index":1}`)
-	rootHash := sha256.Sum256(rootJSON)
-	rootHashText := hex.EncodeToString(rootHash[:])
-	checkpointPointer, err := json.Marshal(preparedCheckpointPointer{Index: 1, RootHash: rootHashText})
-	if err != nil {
-		t.Fatal(err)
+	if pin.OwnerID != owner {
+		t.Fatalf("baseline recovery pin owner=%q want=%q", pin.OwnerID, owner)
 	}
-	before := map[string][]byte{
-		path.Join(root, "archive/head.bin"):                                            head,
-		path.Join(root, "checkpoint/CURRENT"):                                          checkpointPointer,
-		path.Join(root, "checkpoint/roots/00000000000000000001_"+rootHashText+".json"): rootJSON,
-		path.Join(root, "archive/canonical-object"):                                    []byte("unchanged"),
-		path.Join(root, "archive/recovery-pins") + "/previous-owner":                   []byte("old-pin"),
+	return pin
+}
+
+func setPreparedPinLease(t *testing.T, fixture preparedRestoreImageFixture, prefix string, lease int64) {
+	t.Helper()
+	for name, data := range fixture.after {
+		if !strings.HasPrefix(name, prefix) || fixture.before[name] != nil {
+			continue
+		}
+		if strings.Contains(prefix, "/archive/recovery-pins/") {
+			var pin preparedArchivePin
+			if err := decodePreparedJSON(data, &pin); err != nil {
+				t.Fatal(err)
+			}
+			pin.LeaseUntilMS = lease
+			fixture.after[name], _ = json.Marshal(pin)
+			return
+		}
+		var pin preparedCheckpointPin
+		if err := decodePreparedJSON(data, &pin); err != nil {
+			t.Fatal(err)
+		}
+		pin.LeaseUntilMS = lease
+		fixture.after[name], _ = json.Marshal(pin)
+		return
 	}
-	before[path.Join(root, "archive/GC_LOCK")], _ = json.Marshal(preparedArchiveGCLock{OwnerID: "previous-snapshot", Generation: 3, LeaseUntilMS: now.Add(-time.Second).UnixMilli()})
-	before[path.Join(root, "checkpoint/PUBLISHER")], _ = json.Marshal(preparedCheckpointPublisher{ConfigID: 1, Generation: 4, OwnerID: "previous-writer", Purpose: "publisher", LeaseUntilMS: now.Add(-time.Second).UnixMilli(), ReservedIndex: 1})
-	after := make(map[string][]byte, len(before)+2)
-	for name, data := range before {
-		after[name] = append([]byte(nil), data...)
+	t.Fatalf("no newly generated pin under %q", prefix)
+}
+
+func mutateNewArchivePin(t *testing.T, fixture preparedRestoreImageFixture, mutate func(*preparedArchivePin)) {
+	t.Helper()
+	prefix := path.Join(fixture.prefix, fixture.cluster, "archive/recovery-pins") + "/"
+	for name, data := range fixture.after {
+		if !strings.HasPrefix(name, prefix) || fixture.before[name] != nil {
+			continue
+		}
+		var pin preparedArchivePin
+		if err := decodePreparedJSON(data, &pin); err != nil {
+			t.Fatal(err)
+		}
+		mutate(&pin)
+		fixture.after[name], _ = json.Marshal(pin)
+		return
 	}
-	archivePin, err := json.Marshal(preparedArchivePin{OwnerID: owner, Token: "0123456789abcdef0123456789abcdef", Base: 1, Tip: 2, TailHash: tailHash, TailObject: 2, LeaseUntilMS: now.Add(-time.Second).UnixMilli()})
-	if err != nil {
-		t.Fatal(err)
+	t.Fatal("no newly generated archive pin to mutate")
+}
+
+func firstMapKeyWithPrefix(image map[string][]byte, prefix string) string {
+	for name := range image {
+		if strings.HasPrefix(name, prefix) {
+			return name
+		}
 	}
-	checkpointPin, err := json.Marshal(preparedCheckpointPin{ConfigID: 1, OwnerID: owner, Token: "fedcba9876543210fedcba9876543210", Index: 1, RootHash: rootHashText, Root: rootJSON, LeaseUntilMS: now.Add(-time.Second).UnixMilli()})
-	if err != nil {
-		t.Fatal(err)
-	}
-	after[path.Join(root, "archive/recovery-pins", hex.EncodeToString(ownerHash[:]))] = archivePin
-	after[path.Join(root, "checkpoint/recovery-pins", hex.EncodeToString(ownerHash[:]))] = checkpointPin
-	after[path.Join(root, "archive/GC_LOCK")], _ = json.Marshal(preparedArchiveGCLock{OwnerID: "snapshot:" + owner, Generation: 4, LeaseUntilMS: now.Add(-time.Second).UnixMilli()})
-	after[path.Join(root, "checkpoint/PUBLISHER")], _ = json.Marshal(preparedCheckpointPublisher{ConfigID: 1, Generation: 5, OwnerID: "checkpoint-gc", Purpose: "maintenance", LeaseUntilMS: now.Add(-time.Second).UnixMilli()})
-	return before, after, prefix, cluster, node
+	return ""
 }
