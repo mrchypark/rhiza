@@ -94,7 +94,8 @@ func ConfigFromEnv() (Config, error) {
 
 	return Config{
 		ClusterID: configEnvOrDefault("RHIZA_CLUSTER_ID", "cluster-a"), NodeID: nodeID,
-		DataDir: configEnvOrDefault("RHIZA_DATA_DIR", "./rhiza-data"), BindAddr: configEnvOrDefault("RHIZA_BIND_ADDR", "127.0.0.1:8080"),
+		PreparedPodUID: os.Getenv("RHIZA_PREPARED_POD_UID"),
+		DataDir:        configEnvOrDefault("RHIZA_DATA_DIR", "./rhiza-data"), BindAddr: configEnvOrDefault("RHIZA_BIND_ADDR", "127.0.0.1:8080"),
 		PeerAddr: configEnvOrDefault("RHIZA_PEER_ADDR", "127.0.0.1:9090"), AdminToken: os.Getenv("RHIZA_ADMIN_TOKEN"), PeerToken: peerToken, Members: members, EnableReconfiguration: enableReconfiguration, Learner: learner,
 		ObjStoreProvider: os.Getenv("RHIZA_OBJSTORE_PROVIDER"), ObjStoreDir: objStoreDir, ObjStorePrefix: os.Getenv("RHIZA_OBJSTORE_PREFIX"),
 		ObjStoreEndpoint: os.Getenv("RHIZA_OBJSTORE_ENDPOINT"), ObjStoreBucket: os.Getenv("RHIZA_OBJSTORE_BUCKET"), ObjStoreRegion: os.Getenv("RHIZA_OBJSTORE_REGION"),

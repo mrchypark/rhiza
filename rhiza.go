@@ -95,6 +95,9 @@ type Config struct {
 	// EnableReconfiguration enables externally fenced voter replacement.
 	// All voters must opt in; workload fencing and learner provisioning are external.
 	EnableReconfiguration bool
+	// PreparedPodUID requires an offline restore marker for this Pod incarnation.
+	// It is provenance only and does not grant voter or fencing authority.
+	PreparedPodUID string
 	// Learner supplies a new identity absent from the immutable bootstrap members.
 	Learner                        *Member
 	ObjStoreEndpoint               string
@@ -258,7 +261,7 @@ func executionConfig(config Config) (*types.ExecutionConfig, error) {
 		Local:     config.Local,
 		ClusterID: types.ClusterID(config.ClusterID), NodeID: types.NodeID(config.NodeID),
 		DataDir: config.DataDir, BindAddr: config.BindAddr, PeerAddr: config.PeerAddr,
-		AdminToken: config.AdminToken, PeerToken: config.PeerToken, Members: config.Members, EnableReconfiguration: config.EnableReconfiguration, Learner: config.Learner,
+		AdminToken: config.AdminToken, PeerToken: config.PeerToken, Members: config.Members, EnableReconfiguration: config.EnableReconfiguration, PreparedPodUID: config.PreparedPodUID, Learner: config.Learner,
 		ObjStoreEndpoint: config.ObjStoreEndpoint, ObjStoreBucket: config.ObjStoreBucket,
 		ObjStoreProvider: config.ObjStoreProvider, ObjStoreDir: config.ObjStoreDir, ObjStorePrefix: config.ObjStorePrefix,
 		ObjStoreRegion: config.ObjStoreRegion, ObjStoreInsecure: config.ObjStoreInsecure, ObjStoreRetries: config.ObjStoreRetries,

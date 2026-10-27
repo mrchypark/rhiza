@@ -2,9 +2,22 @@
 
 - 작성일: 2026-10-27 (Asia/Seoul)
 - 출처: 사용자와의 사이드 대화에서 논의한 요구와 설계
-- 상태: 설계 초안. 구현 완료·안전성 검증·Pro 승인 기록이 아니다.
-- 코드 확인 기준: 현재 체크아웃의 HEAD `a078cca81bd8c5a68d139eb2c12e04794cb44893`와 관찰 당시 작업 파일
+- 상태: 설계 초안. 아래 구현 상태 갱신은 부분적인 준비 API/CLI만 기록하며, 전체 HA 복구 완료·안전성 검증·Pro 승인 기록이 아니다.
+- 설계 기준선: `a078cca81bd8c5a68d139eb2c12e04794cb44893`. 구현 상태 갱신: 2026-10-28 unreleased feature candidate.
 - 경계: 이 문서 작성 외에 코드, 실행 중인 작업, 다른 브랜치와 워커는 변경하지 않았다.
+
+## 구현 상태 갱신 — 2026-10-28
+
+이 갱신은 승인된 오프라인 준비 경로의 범위만 반영한다. 설계 목표·NoPVC 전제·기존 writer 차단 요구는 바꾸지 않는다.
+
+- Go API는 `PrepareRestore(ctx, Config)`이며, 실행 파일은 `rhiza --prepare-restore`로 이를 호출하고 일반 서버 시작 전에 종료한다.
+- `Config.PreparedPodUID`는 `RHIZA_PREPARED_POD_UID`에서 읽는다. 이는 initContainer가 Downward API의 현재 Pod UID로 설정해야 하는 incarnation binding이다.
+- HA membership learner의 새 멤버 정보는 `RHIZA_LEARNER` JSON에서 `Config.Learner`로 파싱한다. 이는 앱 역할을 고르는 `RHIZA_ROLE`과 다른 설정이다. `RHIZA_ROLE=learner`는 read-replica 실행 경로이며 consensus membership learner나 voter 교체 역할이 아니다.
+- 준비 단계는 shared object store의 인증된 checkpoint와 연속 suffix를 DataDir에 오프라인 materialize하고, source/Pod-bound marker를 쓴다. 이는 재구성 가능한 HA learner 전용 경로이며 `Local` 모드나 단독 로컬 복구를 지원하는 공통 API가 아니다. 이후 정상 Node open은 설정된 Pod UID와 일치하는 marker를 요구한다. 준비 API 자체는 Node를 열거나 listener를 띄우거나 투표권·멤버십을 부여하지 않는다.
+- marker intent, observer 생성, pending marker 기록 단계의 다섯 SIGKILL 경계에서 프로세스 재시작 테스트가 추가되었다. 종료된 자식 프로세스를 회수한 뒤 동일 Pod 준비 재개와 다른 Pod UID 거부를 검사한다. 실제 rename 이후의 별도 crash point나 전원 손실, Kubernetes initContainer, Chaos Mesh 검증을 뜻하지 않는다.
+- NoPVC Deployment/StatefulSet manifest에 initContainer와 공유 DataDir/Pod UID를 연결하는 작업, 정상 quorum의 learner catch-up 및 실제 coordinator에 의한 voter 교체·승격, 분산 HA의 old-writer 게시/GC 차단 구현은 아직 완료되지 않았다. 아래 설계의 authority 경계를 유지하며 이를 모의 coordinator로 대체하지 않는다.
+- 실제 CI Kind + Chaos Mesh 흐름과 ACK readback end-to-end 결과는 아직 없다. `operator-chaos` 또는 직접 Pod 삭제 테스트를 해당 증거로 간주하지 않는다.
+- 조건부 설계 검토 기록과 기존 안전 조건은 이 문서의 원문대로 유지한다. 전체 HA 구현·운영 자격에 대한 최종 Pro 승인은 아직 없다. 이 변경은 미출시 feature branch 작업이며 Rhiza 0.21 release에 포함되지 않았다.
 
 ## 1. 목표와 합의한 방향
 
@@ -96,12 +109,23 @@ OS 파일 잠금만으로 분산 HA의 이전 writer 차단이 해결되는 것�
 
 ## 5. initContainer 계약
 
-단독 노드용 공통 Go 복구 API를 재사용하고 HA 전용 복원 엔진을 중복 구현하지 않는다.
-재사용 API의 정확한 버전·입출력은 해당 구현과 대조하여 확정해야 한다.
+HA 전용 Go API `PrepareRestore(ctx, Config)`와 실행 파일의 `--prepare-restore`
+early-exit 경로가 unreleased feature candidate에 구현되어 있다. 이 경로는
+`Local` 모드를 거부하며, shared object store, bootstrap voters, 재구성 설정과 새
+`Config.Learner` identity를 요구한다. 기존 certified archive/checkpoint 및 materializer
+복구 helper를 재사용한다. 단독 노드용 공통 Local 복구 API로 해석해서는 안 된다.
 
-initContainer는 현재 세대와 복구 지시를 확인하고, 복원 데이터와 검증 결과를
-애플리케이션에 전달한다. 전체 quorum이 뜨기를 기다리지는 않는다. 모든 Pod의
-앱 시작이 quorum 대기에 막히는 순환 대기를 피해야 한다.
+실제 initContainer에서 API를 호출하고 DataDir 및 복구 설정을 앱 컨테이너와 동일하게
+공유하는 manifest wiring은 아직 미구현이다. initContainer는 `RHIZA_PREPARED_POD_UID`에
+Downward API의 현재 `metadata.uid`를 전달해야 한다. HA 런타임의 consensus learner identity는
+`RHIZA_LEARNER` JSON으로 설정되는 `Config.Learner`이며, `RHIZA_ROLE=learner`는 read-replica
+분기다. 이를 멤버십 learner 실행 설정으로 사용하면 안 된다.
+
+준비 단계는 현재 세대의 인증된 복구 지점만 materialize하며 quorum 구성·투표권 부여·멤버십
+변경을 하지 않는다. 설정된 `PreparedPodUID`에 대한 marker 검증은 정상 Node open에
+연결되어 있지만, 이 연결만으로 learner catch-up, authority 확인 또는 voter 승격이 완료되는
+것은 아니다. 전체 quorum을 기다리지 않아 앱 시작과 순환 대기를 만들지 않는 계약은 그대로
+유지한다.
 
 데이터가 없거나 복구 근거가 누락된 경우 이를 신규 bootstrap 신호로 해석하지 않는다.
 클러스터 최초 생성은 별도의 명시적 절차로 남긴다.
@@ -231,7 +255,10 @@ Deployment는 새 Pod가 Ready가 되어야 기존 Pod를 제거하는 교착도
 - NodeID·주소 검색의 분리 및 현재 불변 Member와의 접점
 - 롤링 업데이트 중 추가·제거 순서와 readiness 교착 방지
 - 전체 복구의 확정 지점 선정과 데이터 손실 정책
-- 공통 Go 복구 API의 정확한 호출 계약
+- initContainer manifest wiring, 동일 DataDir/config 전달, Pod UID Downward API binding
 
-이 문서 작성 과정에서는 코드 변경, 테스트·CI·실제 클러스터 실행을 수행하지 않았다.
-기존 코드의 안전장치를 제거하거나, 이 초안을 구현 완료 근거로 사용해서는 안 된다.
+초안의 최초 작성은 코드 변경이나 클러스터 실행을 포함하지 않았다. 위에 적은 오프라인
+준비 API/CLI와 crash-boundary 단위 테스트는 별도의 unreleased candidate 변경이다.
+이 문서 갱신은 source·CI·클러스터를 변경하지 않았다. 실제 initContainer, Chaos Mesh,
+Deployment, GCS 또는 release qualification은 아직 검증되지 않았다. 이 초안을 전체 HA
+복구 구현 완료 근거로 사용해서는 안 된다.

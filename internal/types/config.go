@@ -48,6 +48,7 @@ type ExecutionConfig struct {
 	PeerToken                     string                   `json:"peer_token"`
 	Members                       []NodeConfig             `json:"members"`
 	EnableReconfiguration         bool                     `json:"enable_reconfiguration,omitempty"`
+	PreparedPodUID                string                   `json:"prepared_pod_uid,omitempty"`
 	Learner                       *NodeConfig              `json:"learner,omitempty"`
 	LocalGraphNodePropertyIndexes []GraphNodePropertyIndex `json:"local_graph_node_property_indexes,omitempty"`
 

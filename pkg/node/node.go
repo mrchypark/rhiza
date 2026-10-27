@@ -185,6 +185,11 @@ func (n *Node) open(ctx context.Context, enroll bool) (err error) {
 	if n.terminalRequested.Load() {
 		return fmt.Errorf("terminally drained node cannot reopen")
 	}
+	if n.config != nil && n.config.PreparedPodUID != "" {
+		if err := validatePreparedRestoreConfig(n.config); err != nil {
+			return err
+		}
+	}
 	var localRestoreAuthority *materializer.LocalRestoreAuthority
 	var localRestoreFiles []materializer.CheckpointFile
 	if n.config == nil || n.config.NodeID == "" {
@@ -286,6 +291,9 @@ func (n *Node) open(ctx context.Context, enroll bool) (err error) {
 		return fmt.Errorf("acquire lock: %w", err)
 	}
 	n.lock = lock
+	if err := validatePreparedRestoreMarker(n.config); err != nil {
+		return err
+	}
 	localVoter, err := loadVoterIdentity(n.config)
 	if err != nil {
 		return err

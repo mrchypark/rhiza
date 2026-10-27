@@ -22,20 +22,41 @@ import (
 )
 
 func main() {
-	enroll := flag.Bool("enroll-existing-voter", false, "register an original pre-upgrade WAL while every voter is offline, then exit")
-	flag.Parse()
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer cancel()
-	if err := runCommand(ctx, *enroll); err != nil {
+	if err := runArgs(ctx, os.Args[1:]); err != nil {
 		log.Fatal(err)
 	}
 }
 
 func run(ctx context.Context) (resultErr error) {
-	return runCommand(ctx, false)
+	return runCommand(ctx, false, false)
 }
 
-func runCommand(ctx context.Context, enroll bool) (resultErr error) {
+func runArgs(ctx context.Context, args []string) error {
+	return runArgsWithOutput(ctx, args, os.Stderr)
+}
+
+func runArgsWithOutput(ctx context.Context, args []string, helpOutput io.Writer) error {
+	flags := flag.NewFlagSet("rhiza", flag.ContinueOnError)
+	flags.SetOutput(io.Discard)
+	enroll := flags.Bool("enroll-existing-voter", false, "register an original pre-upgrade WAL while every voter is offline, then exit")
+	prepareRestore := flags.Bool("prepare-restore", false, "materialize certified state for a fresh Pod, then exit without opening the server")
+	if err := flags.Parse(args); err != nil {
+		if errors.Is(err, flag.ErrHelp) {
+			flags.SetOutput(helpOutput)
+			flags.Usage()
+			return nil
+		}
+		return err
+	}
+	if *enroll && *prepareRestore {
+		return errors.New("--enroll-existing-voter and --prepare-restore are mutually exclusive")
+	}
+	return runCommand(ctx, *enroll, *prepareRestore)
+}
+
+func runCommand(ctx context.Context, enroll, prepareRestore bool) (resultErr error) {
 	config, err := rhiza.ConfigFromEnv()
 	if err != nil {
 		return err
@@ -48,6 +69,9 @@ func runCommand(ctx context.Context, enroll bool) (resultErr error) {
 			return fmt.Errorf("offline enrollment requires RHIZA_ROLE=voter")
 		}
 		return rhiza.EnrollExistingVoter(ctx, config)
+	}
+	if prepareRestore {
+		return rhiza.PrepareRestore(ctx, config)
 	}
 	var handler http.Handler
 	var closeService func() error
