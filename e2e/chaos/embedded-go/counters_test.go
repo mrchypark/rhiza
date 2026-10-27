@@ -3342,6 +3342,91 @@ func TestQualificationGNUTimeoutIgnoresUutils(t *testing.T) {
 // kubectl. No token is minted, no application opens, and no cloud call is made.
 func TestQualificationLocalRuntime(t *testing.T) {
 	nativeTimeout := qualificationGNUTimeout(t)
+	processState := func(pid int) (string, error) {
+		output, err := exec.Command("ps", "-o", "stat=", "-p", strconv.Itoa(pid)).Output()
+		if err != nil {
+			if exitErr, ok := err.(*exec.ExitError); ok && exitErr.ExitCode() == 1 {
+				return "", nil
+			}
+			return "", err
+		}
+		return strings.TrimSpace(string(output)), nil
+	}
+	stopWatchdogControl := func(out string) {
+		t.Helper()
+		controlPath := filepath.Join(out, "watchdog.control")
+		if _, err := os.Stat(controlPath); errors.Is(err, os.ErrNotExist) {
+			return
+		}
+		deadline := time.Now().Add(2 * time.Second)
+		for {
+			if _, err := os.Stat(filepath.Join(out, "watchdog-ready")); err == nil {
+				break
+			}
+			if time.Now().After(deadline) {
+				t.Errorf("watchdog control reader never became ready")
+				return
+			}
+			time.Sleep(10 * time.Millisecond)
+		}
+		control, err := os.OpenFile(controlPath, os.O_RDWR|syscall.O_NONBLOCK, 0)
+		if err != nil {
+			t.Errorf("open owned watchdog control pipe: %v", err)
+			return
+		}
+		if _, err := control.Write([]byte("stop\n")); err != nil {
+			t.Errorf("request owned watchdog stop: %v", err)
+		}
+		if err := control.Close(); err != nil {
+			t.Errorf("close owned watchdog control pipe: %v", err)
+		}
+	}
+	assertWatchdogCleanup := func(out string, expired bool, expectedWaitCode string) {
+		t.Helper()
+		watchdogPIDData, err := os.ReadFile(filepath.Join(out, "watchdog.pid"))
+		if err != nil {
+			t.Fatalf("watchdog PID evidence absent: %v", err)
+		}
+		watchdogPID, err := strconv.Atoi(strings.TrimSpace(string(watchdogPIDData)))
+		if err != nil {
+			t.Fatalf("invalid watchdog PID evidence: %v", err)
+		}
+		state, err := processState(watchdogPID)
+		if err != nil || state != "" {
+			t.Fatalf("watchdog PID still exists after owner wait (including zombies): state=%q err=%v", state, err)
+		}
+		watchdogWait, err := os.ReadFile(filepath.Join(out, "watchdog-wait.exit"))
+		waitCode := strings.TrimSpace(string(watchdogWait))
+		if err != nil || waitCode != expectedWaitCode {
+			t.Fatalf("watchdog owner wait returned %q, want %q: %v", watchdogWait, expectedWaitCode, err)
+		}
+		watchdogCommand, err := os.ReadFile(filepath.Join(out, "watchdog-command.pid"))
+		if err != nil {
+			t.Fatalf("watchdog command ownership evidence absent: %v", err)
+		}
+		pid, err := strconv.Atoi(strings.TrimSpace(string(watchdogCommand)))
+		if err != nil {
+			t.Fatalf("invalid watchdog command PID evidence: %v", err)
+		}
+		state, err = processState(pid)
+		if err != nil || state != "" {
+			t.Fatalf("watchdog command PID still exists after owner wait (including zombies): state=%q err=%v", state, err)
+		}
+		if _, err := os.Stat(filepath.Join(out, "watchdog-ready")); err != nil {
+			t.Fatalf("watchdog readiness evidence absent: %v", err)
+		}
+		if _, err := os.Stat(filepath.Join(out, "watchdog.control")); !errors.Is(err, os.ErrNotExist) {
+			t.Fatalf("watchdog control pipe was not removed: %v", err)
+		}
+		expiry, err := os.ReadFile(filepath.Join(out, "watchdog-expired"))
+		if expired {
+			if err != nil || strings.TrimSpace(string(expiry)) != "expired" {
+				t.Fatalf("watchdog timeout signal was not recorded: %q err=%v", expiry, err)
+			}
+		} else if !errors.Is(err, os.ErrNotExist) {
+			t.Fatalf("unexpected watchdog timeout event in early-stop scenario: %v", err)
+		}
+	}
 	scriptPath := os.Getenv("RHIZA_RUNTIME_TEST_SCRIPT")
 	if scriptPath == "" {
 		scriptPath = "../run-gcs-postrelease.sh"
@@ -3350,8 +3435,47 @@ func TestQualificationLocalRuntime(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	launchWindowFixture := func() string {
+		t.Helper()
+		contents, err := os.ReadFile(script)
+		if err != nil {
+			t.Fatal(err)
+		}
+		const launch = `  ' sh "$runtime_pid" "$out" "$watchdog_control" 3>&- & watchdog=$!
+  printf '%s\n' "$watchdog" > "$out/watchdog.pid"`
+		const instrumented = `  ' sh "$runtime_pid" "$out" "$watchdog_control" 3>&- &
+  [ -z "$watchdog" ] || { printf '%s\n' 'watchdog assigned before launch-window signal' >&2; exit 98; }
+  printf '%s\n' 'pid-unassigned' > "$out/watchdog-launch-window.txt"
+  kill -TERM "$runtime_pid"
+  watchdog=$!
+  printf '%s\n' "$watchdog" > "$out/watchdog.pid"`
+		if strings.Count(string(contents), launch) != 1 {
+			t.Fatal("could not uniquely locate the watchdog launch for the deterministic fixture")
+		}
+		contents = []byte(strings.Replace(string(contents), launch, instrumented, 1))
+		fixture, err := os.CreateTemp(filepath.Dir(script), ".run-gcs-postrelease-watchdog-*.sh")
+		if err != nil {
+			t.Fatal(err)
+		}
+		fixturePath := fixture.Name()
+		if _, err := fixture.Write(contents); err != nil {
+			_ = fixture.Close()
+			_ = os.Remove(fixturePath)
+			t.Fatal(err)
+		}
+		if err := fixture.Close(); err != nil {
+			_ = os.Remove(fixturePath)
+			t.Fatal(err)
+		}
+		if err := os.Chmod(fixturePath, 0700); err != nil {
+			_ = os.Remove(fixturePath)
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { _ = os.Remove(fixturePath) })
+		return fixturePath
+	}
 	const syntheticFixtureRevision = "1111111111111111111111111111111111111111"
-	for _, scenario := range []string{"embedded-token", "exec", "alternate-context", "token-permissions", "wrong-identity", "fake-ci", "head-mismatch", "application-mismatch", "expiry", "command-failure", "deadline", "watchdog", "parser-timeout", "parser-argument-error", "runtime-kubeconfig-path", "cluster-receipt-changed", "workload-identity-receipt-changed", "workload-identity-wrong-binding", "workload-identity-extra-member", "workload-identity-extra-binding", "workload-identity-preexisting-binding", "workload-identity-recreated-gsa", "workload-identity-mode-false", "workload-identity-mode-absent", "workload-identity-mode-other", "metadata-worker-entrypoint", "metadata-credential-failure", "metadata-wrong-service-account", "metadata-gce-mode", "outside-prefix-auth-failure", "outside-prefix-accessible", "inside-prefix-auth-failure", "voter-create-failure", "voter-create-unknown"} {
+	for _, scenario := range []string{"embedded-token", "exec", "alternate-context", "token-permissions", "wrong-identity", "fake-ci", "head-mismatch", "application-mismatch", "expiry", "command-failure", "deadline", "watchdog", "watchdog-expiry", "watchdog-launch-signal", "watchdog-owner-failure", "parser-timeout", "parser-argument-error", "runtime-kubeconfig-path", "cluster-receipt-changed", "workload-identity-receipt-changed", "workload-identity-wrong-binding", "workload-identity-extra-member", "workload-identity-extra-binding", "workload-identity-preexisting-binding", "workload-identity-recreated-gsa", "workload-identity-mode-false", "workload-identity-mode-absent", "workload-identity-mode-other", "metadata-worker-entrypoint", "metadata-credential-failure", "metadata-wrong-service-account", "metadata-gce-mode", "outside-prefix-auth-failure", "outside-prefix-accessible", "inside-prefix-auth-failure", "voter-create-failure", "voter-create-unknown"} {
 		t.Run(scenario, func(t *testing.T) {
 			dir := t.TempDir()
 			if err := os.Chmod(dir, 0700); err != nil {
@@ -3441,7 +3565,7 @@ func TestQualificationLocalRuntime(t *testing.T) {
 				}
 			}
 			now := time.Now().Unix()
-			write(filepath.Join(bin, "date"), "#!/bin/sh\nif [ \"$*\" = '+%s' ]; then\n if [ -f \"$FAKE_CLOCK\" ]; then cat \"$FAKE_CLOCK\"; else printf '%s\\n' \"$FAKE_NOW\"; fi\nelse exec /bin/date \"$@\"; fi\n", 0700)
+			write(filepath.Join(bin, "date"), "#!/bin/sh\nif [ \"$*\" = '+%s' ]; then\n if [ \"$FAKE_SCENARIO\" = watchdog-expiry ] && [ ! -f \"$FAKE_CLOCK\" ]; then printf '%s\\n' \"$((FAKE_NOW + 1199))\" > \"$FAKE_CLOCK\"; printf '%s\\n' \"$FAKE_NOW\"; elif [ -f \"$FAKE_CLOCK\" ]; then cat \"$FAKE_CLOCK\"; else printf '%s\\n' \"$FAKE_NOW\"; fi\nelse exec /bin/date \"$@\"; fi\n", 0700)
 			write(filepath.Join(bin, "git"), `#!/bin/sh
 [ "$#" = 4 ] && [ "$1" = -C ] && [ "$2" = "$FAKE_GIT_ROOT" ] &&
  [ "$3" = rev-parse ] && [ "$4" = HEAD ] || exit 91
@@ -3473,7 +3597,7 @@ case "$1 $2" in
   exit "$code" ;;
  "auth whoami")
   if [ "$FAKE_SCENARIO" = watchdog ]; then touch "$FAKE_SIGNAL_READY"; /bin/sleep 1; fi
-  if [ "$FAKE_SCENARIO" = wrong-identity ]; then printf '%s\n' '{"status":{"userInfo":{"username":"admin","groups":[]}}}'
+  if [ "$FAKE_SCENARIO" = wrong-identity ] || [ "$FAKE_SCENARIO" = watchdog-owner-failure ]; then printf '%s\n' '{"status":{"userInfo":{"username":"admin","groups":[]}}}'
   else printf '%s\n' '{"status":{"userInfo":{"username":"system:serviceaccount:rhiza-v0191-20261008-a1b2c3d4:rhiza-runtime","groups":["system:authenticated","system:serviceaccounts","system:serviceaccounts:rhiza-v0191-20261008-a1b2c3d4"]}}}'; fi ;;
  "auth can-i")
   case "$*" in
@@ -3495,6 +3619,7 @@ case "$1 $2" in
   [ "$3" = -f ] && [ "$5 $6" = '-o json' ] || exit 97
   case "$4" in */initial.yaml|*/learner.yaml|*/inspector-pod.yaml|*/inspector-control-pod.yaml) printf '%s\n' '{"kind":"List","items":[]}' ;; */inspector-networkpolicy-additive.json) printf '%s\n' 'Error from server (Forbidden): networkpolicies is forbidden' >&2; exit 1 ;; *) exit 97 ;; esac ;;
  "create -f")
+  if [ "$FAKE_SCENARIO" = watchdog-launch-signal ]; then exit 53; fi
   case "$FAKE_SCENARIO" in
    metadata-credential-failure|metadata-wrong-service-account|metadata-gce-mode|outside-prefix-auth-failure|outside-prefix-accessible|inside-prefix-auth-failure|voter-create-failure|voter-create-unknown)
     case "$3" in
@@ -3551,7 +3676,7 @@ esac
 `, 0700)
 			// Functional cases check parser arguments and auth boundaries, not
 			// process-launch performance. Timing cases keep the native timer.
-			if scenario != "parser-timeout" && scenario != "deadline" && scenario != "watchdog" {
+			if scenario != "parser-timeout" && scenario != "deadline" && scenario != "watchdog" && scenario != "watchdog-expiry" {
 				if err := os.Remove(filepath.Join(bin, "timeout")); err != nil {
 					t.Fatal(err)
 				}
@@ -3571,6 +3696,10 @@ if [ "$parser" = yes ]; then
   [ "${10}" = -o ] && [ "${11}" = json ] || exit 98
  shift 3
  exec "$FAKE_KUBECTL" "$@"
+fi
+if [ "$FAKE_SCENARIO" = watchdog-owner-failure ] && [ "$1" = --signal=USR1 ]; then
+ "$FAKE_NATIVE_TIMEOUT" "$@"
+ exit 77
 fi
 exec "$FAKE_NATIVE_TIMEOUT" "$@"
 `, 0700)
@@ -3656,6 +3785,9 @@ exec "$FAKE_NATIVE_TIMEOUT" "$@"
 				entrypoint = "metadata-readiness-worker"
 			}
 			cmd := exec.CommandContext(ctx, "/bin/sh", script, entrypoint)
+			if scenario == "watchdog-launch-signal" {
+				cmd = exec.CommandContext(ctx, "/bin/sh", launchWindowFixture(), entrypoint)
+			}
 			// Do not inherit any live credential/CI/approval variables.
 			cmd.Env = []string{"PATH=" + bin + ":" + os.Getenv("PATH"), "RHIZA_RUN_ID=" + run, "RHIZA_NAMESPACE=" + namespace,
 				"RHIZA_AUTH_CREATION_SHA=" + harness, "RHIZA_HARNESS_SHA=" + syntheticFixtureRevision, "RHIZA_APPLICATION_SHA=" + application,
@@ -3693,31 +3825,85 @@ exec "$FAKE_NATIVE_TIMEOUT" "$@"
 					t.Fatal("malformed parser tuple reached kubectl")
 				}
 			}
-			var captured bytes.Buffer
-			cmd.Stdout, cmd.Stderr = &captured, &captured
-			if err := cmd.Start(); err != nil {
+			outputPath := filepath.Join(dir, "runtime-output.log")
+			outputFile, err := os.Create(outputPath)
+			if err != nil {
 				t.Fatal(err)
 			}
+			cmd.Stdout, cmd.Stderr = outputFile, outputFile
+			if err := cmd.Start(); err != nil {
+				_ = outputFile.Close()
+				t.Fatal(err)
+			}
+			waited := false
+			t.Cleanup(func() {
+				stopWatchdogControl(out)
+				if !waited {
+					_ = cmd.Process.Signal(syscall.SIGTERM)
+					_ = cmd.Wait()
+				}
+				for _, name := range []string{"watchdog.pid", "watchdog-command.pid"} {
+					data, err := os.ReadFile(filepath.Join(out, name))
+					if err != nil {
+						continue
+					}
+					pid, err := strconv.Atoi(strings.TrimSpace(string(data)))
+					if err != nil {
+						t.Errorf("invalid %s cleanup evidence: %v", name, err)
+						continue
+					}
+					deadline := time.Now().Add(2 * time.Second)
+					for time.Now().Before(deadline) {
+						state, err := processState(pid)
+						if err == nil && state == "" {
+							break
+						}
+						time.Sleep(10 * time.Millisecond)
+					}
+					state, err := processState(pid)
+					if err != nil || state != "" {
+						t.Errorf("owned watchdog process %d remains after cleanup: state=%q err=%v", pid, state, err)
+					}
+				}
+				_ = outputFile.Close()
+			})
 			write(filepath.Join(dir, "parent"), strconv.Itoa(cmd.Process.Pid), 0600)
 			if scenario == "watchdog" {
 				deadline := time.Now().Add(5 * time.Second)
 				for {
-					if _, err := os.Stat(filepath.Join(dir, "signal-ready")); err == nil {
-						if err := syscall.Kill(cmd.Process.Pid, syscall.SIGUSR1); err != nil {
-							t.Fatal("owned runtime signal failed")
+					_, readyErr := os.Stat(filepath.Join(dir, "signal-ready"))
+					watchdogData, watchdogErr := os.ReadFile(filepath.Join(out, "watchdog.pid"))
+					commandData, commandErr := os.ReadFile(filepath.Join(out, "watchdog-command.pid"))
+					watchdogPID, watchdogParseErr := strconv.Atoi(strings.TrimSpace(string(watchdogData)))
+					commandPID, commandParseErr := strconv.Atoi(strings.TrimSpace(string(commandData)))
+					commandState, stateErr := processState(commandPID)
+					if readyErr == nil && watchdogErr == nil && commandErr == nil && watchdogParseErr == nil && commandParseErr == nil && stateErr == nil && commandState != "" && !strings.HasPrefix(commandState, "Z") {
+						parent, parentErr := exec.Command("ps", "-o", "ppid=", "-p", strconv.Itoa(commandPID)).Output()
+						if parentErr == nil && strings.TrimSpace(string(parent)) == strconv.Itoa(watchdogPID) {
+							if err := syscall.Kill(cmd.Process.Pid, syscall.SIGUSR1); err != nil {
+								t.Fatal("owned runtime signal failed")
+							}
+							break
 						}
-						break
 					}
 					if time.Now().After(deadline) {
-						_ = cmd.Process.Kill()
+						_ = cmd.Process.Signal(syscall.SIGTERM)
 						_ = cmd.Wait()
-						t.Fatal("runtime did not arm its owned watchdog")
+						waited = true
+						_ = outputFile.Sync()
+						diagnostic, _ := os.ReadFile(outputPath)
+						t.Fatalf("runtime watchdog command was not live under its timeout owner: %s", diagnostic)
 					}
 					time.Sleep(10 * time.Millisecond)
 				}
 			}
 			err = cmd.Wait()
-			output := captured.Bytes()
+			waited = true
+			_ = outputFile.Close()
+			output, outputErr := os.ReadFile(outputPath)
+			if outputErr != nil {
+				t.Fatal(outputErr)
+			}
 			events, eventErr := os.ReadFile(filepath.Join(dir, "config-events"))
 			calls, callsErr := os.ReadFile(filepath.Join(dir, "calls"))
 			t.Logf("mock events: %q readError=%v; calls: %q readError=%v", events, eventErr, calls, callsErr)
@@ -3749,11 +3935,24 @@ exec "$FAKE_NATIVE_TIMEOUT" "$@"
 			if scenario == "voter-create-unknown" {
 				want = 55
 			}
-			if scenario == "deadline" || scenario == "watchdog" {
+			if scenario == "deadline" || scenario == "watchdog" || scenario == "watchdog-expiry" || scenario == "watchdog-launch-signal" {
 				want = 124
+			}
+			if scenario == "watchdog-launch-signal" {
+				want = 130
 			}
 			if exited.ExitCode() != want {
 				t.Fatalf("runtime exit=%d want=%d diagnostic=%s", exited.ExitCode(), want, output)
+			}
+			if scenario == "watchdog-launch-signal" {
+				assertWatchdogCleanup(out, false, "0")
+				if marker, err := os.ReadFile(filepath.Join(out, "watchdog-launch-window.txt")); err != nil || strings.TrimSpace(string(marker)) != "pid-unassigned" {
+					t.Fatalf("launch-window hook did not prove watchdog was unassigned before TERM: marker=%q err=%v", marker, err)
+				}
+				if bytes.Contains(calls, []byte("auth whoami")) {
+					t.Fatalf("deferred launch-window signal did not stop before runtime work: %s", calls)
+				}
+				return
 			}
 			if scenario == "application-mismatch" && !bytes.Contains(output, []byte("candidate application mismatch")) {
 				t.Fatalf("runtime accepted mismatched application provenance: %s", output)
@@ -3839,7 +4038,7 @@ exec "$FAKE_NATIVE_TIMEOUT" "$@"
 					t.Fatal(err)
 				}
 			}
-			if scenario != "deadline" && scenario != "command-failure" && scenario != "watchdog" && scenario != "metadata-credential-failure" && scenario != "metadata-wrong-service-account" && scenario != "outside-prefix-auth-failure" && scenario != "outside-prefix-accessible" && scenario != "inside-prefix-auth-failure" && scenario != "voter-create-failure" && scenario != "voter-create-unknown" {
+			if scenario != "deadline" && scenario != "command-failure" && scenario != "watchdog" && scenario != "watchdog-expiry" && scenario != "watchdog-launch-signal" && scenario != "metadata-credential-failure" && scenario != "metadata-wrong-service-account" && scenario != "outside-prefix-auth-failure" && scenario != "outside-prefix-accessible" && scenario != "inside-prefix-auth-failure" && scenario != "voter-create-failure" && scenario != "voter-create-unknown" {
 				reason := "local kubeconfig must be one pinned tokenFile-only identity"
 				switch scenario {
 				case "head-mismatch":
@@ -3852,7 +4051,7 @@ exec "$FAKE_NATIVE_TIMEOUT" "$@"
 					reason = "local kubeconfig parsing failed (exit 124)"
 				case "token-permissions":
 					reason = "private credential ownership/permissions required"
-				case "wrong-identity":
+				case "wrong-identity", "watchdog-owner-failure":
 					reason = "local runtime server identity mismatch"
 				case "fake-ci":
 					reason = "local entry must not impersonate CI"
@@ -3898,6 +4097,14 @@ exec "$FAKE_NATIVE_TIMEOUT" "$@"
 					}
 					t.Log("native parser exit124 preserved; owned child reaped")
 				}
+				if scenario == "wrong-identity" {
+					assertWatchdogCleanup(out, false, "0")
+				} else if scenario == "watchdog-owner-failure" {
+					if !bytes.Contains(output, []byte("watchdog owner exited unexpectedly: 77")) {
+						t.Fatalf("watchdog owner failure was not reported with the original failure: %s", output)
+					}
+					assertWatchdogCleanup(out, false, "77")
+				}
 				return
 			}
 			for _, name := range []string{"workload.exit", "root.exit"} {
@@ -3906,14 +4113,11 @@ exec "$FAKE_NATIVE_TIMEOUT" "$@"
 					t.Fatalf("original exit not preserved in %s", name)
 				}
 			}
-			watchdog, err := os.ReadFile(filepath.Join(out, "watchdog.pid"))
-			if err != nil {
-				t.Fatal("watchdog ownership evidence absent")
+			waitCode := "0"
+			if scenario == "watchdog-expiry" {
+				waitCode = "124"
 			}
-			pid, err := strconv.Atoi(strings.TrimSpace(string(watchdog)))
-			if err != nil || syscall.Kill(pid, 0) == nil {
-				t.Fatal("owned watchdog not reaped before sealing")
-			}
+			assertWatchdogCleanup(out, scenario == "watchdog-expiry", waitCode)
 			verify := exec.Command("sha256sum", "-c", "SHA256SUMS")
 			verify.Dir = out
 			if verifyOutput, err := verify.CombinedOutput(); err != nil {
@@ -3942,6 +4146,48 @@ func TestObjectStoreCountersUnavailable(t *testing.T) {
 		httptest.NewRequest(http.MethodGet, "/qualification/object-store", nil))
 	if response.Code != http.StatusServiceUnavailable || response.Body.String() != "object store unavailable\n" {
 		t.Fatalf("unexpected unavailable response: %d %q", response.Code, response.Body.String())
+	}
+}
+
+func TestQualificationWatchdogUnexpectedOwnerExitFailsClosed(t *testing.T) {
+	scriptPath := os.Getenv("RHIZA_RUNTIME_TEST_SCRIPT")
+	if scriptPath == "" {
+		scriptPath = "../run-gcs-postrelease.sh"
+	}
+	script, err := filepath.Abs(scriptPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	source, err := os.ReadFile(script)
+	if err != nil {
+		t.Fatal(err)
+	}
+	start := strings.Index(string(source), "stop_watchdog() {")
+	if start < 0 {
+		t.Fatal("actual watchdog stop function missing")
+	}
+	endOffset := strings.Index(string(source[start:]), "\nstop_forward() {")
+	if endOffset < 0 {
+		t.Fatal("actual watchdog stop function end missing")
+	}
+	end := start + endOffset
+	harness := string(source[start:end]) + `
+out=$1
+mkfifo "$out/watchdog.control"
+exec 3<> "$out/watchdog.control"
+(IFS= read -r request < "$out/watchdog.control"; exit 77) 3>&- & watchdog=$!
+code=0
+stop_watchdog
+printf 'FINAL_CODE=%s\n' "$code"
+`
+	cmd := exec.Command("/bin/sh", "-c", harness, "watchdog-owner-failure", t.TempDir())
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("actual stop function failed: %v; output=%s", err, output)
+	}
+	if !bytes.Contains(output, []byte("watchdog owner exited unexpectedly: 77 (original exit 0)")) ||
+		!bytes.Contains(output, []byte("FINAL_CODE=1")) {
+		t.Fatalf("unexpected owner exit did not convert success into failure: %s", output)
 	}
 }
 

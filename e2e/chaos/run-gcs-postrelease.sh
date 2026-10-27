@@ -109,7 +109,7 @@ k() {
     if [ -n "${metadata_wait_deadline:-}" ] && [ "$seconds" -gt "$metadata_seconds" ]; then seconds=$metadata_seconds; fi
     if [ -n "${voter_wait_deadline:-}" ] && [ "$seconds" -gt "$k_deadline_seconds" ]; then seconds=$k_deadline_seconds; fi
     timeout --kill-after=5s "${seconds}s" kubectl --kubeconfig="$RHIZA_LOCAL_RUNTIME_KUBECONFIG" \
-      --context="$context" --namespace="$ns" --request-timeout=30s "$@"
+      --context="$context" --namespace="$ns" --request-timeout=30s "$@" 3>&-
   else
     if [ -n "${metadata_wait_deadline:-}" ]; then
       timeout --kill-after=5s "${metadata_seconds}s" kubectl --context="$context" --namespace="$ns" "$@"
@@ -251,7 +251,7 @@ metadata_credentials_ready() {
   RHIZA_METADATA_PARENT_MODE=$mode \
     RHIZA_CLUSTER_METADATA=$RHIZA_CLUSTER_METADATA \
     RHIZA_LOCAL_RUNTIME_KUBECONFIG=${RHIZA_LOCAL_RUNTIME_KUBECONFIG:-} \
-    timeout --kill-after="${metadata_kill_grace}s" "${metadata_budget}s" /bin/sh "$script_dir/run-gcs-postrelease.sh" metadata-readiness-worker
+    timeout --kill-after="${metadata_kill_grace}s" "${metadata_budget}s" /bin/sh "$script_dir/run-gcs-postrelease.sh" metadata-readiness-worker 3>&-
 }
 validate_cluster_metadata() {
   jq -e --arg cluster "$RHIZA_GKE_CLUSTER" --arg location "$RHIZA_GKE_LOCATION" '
@@ -923,7 +923,14 @@ run() {
   if [ "$mode" = run-local ] && [ "$1" = curl ]; then
     seconds=$(remaining)
     code=$?
-    if [ "$code" = 0 ]; then timeout --kill-after=5s "${seconds}s" "$@" > "$out/$seq-$label.stdout" 2> "$out/$seq-$label.stderr"; code=$?; fi
+    if [ "$code" = 0 ]; then timeout --kill-after=5s "${seconds}s" "$@" 3>&- > "$out/$seq-$label.stdout" 2> "$out/$seq-$label.stderr"; code=$?; fi
+  elif [ "$mode" = run-local ]; then
+    case "$1" in
+      k|metadata_credentials_ready|wait_voters|pod_snapshot|decode_archive_head|redacted_storage_json)
+        "$@" > "$out/$seq-$label.stdout" 2> "$out/$seq-$label.stderr" ;;
+      *) "$@" 3>&- > "$out/$seq-$label.stdout" 2> "$out/$seq-$label.stderr" ;;
+    esac
+    code=$?
   else
     "$@" > "$out/$seq-$label.stdout" 2> "$out/$seq-$label.stderr"
     code=$?
@@ -1012,7 +1019,19 @@ started=${RHIZA_JOB_STARTED:-$(date +%s)}
 [ "$mode" != run-local ] || started=$now
 watchdog=''
 stop_watchdog() {
-  if [ -n "$watchdog" ]; then kill "$watchdog" 2>/dev/null || true; wait "$watchdog" 2>/dev/null || true; watchdog=''; fi
+  if [ -n "$watchdog" ]; then
+    printf '%s\n' stop >&3 || true
+    watchdog_wait_code=0
+    wait "$watchdog" 2>/dev/null || watchdog_wait_code=$?
+    printf '%s\n' "$watchdog_wait_code" > "$out/watchdog-wait.exit"
+    watchdog=''
+    exec 3>&-
+    rm -f "$out/watchdog.control"
+    if [ "$watchdog_wait_code" != 0 ] && { [ "$watchdog_wait_code" != 124 ] || [ "$code" != 124 ] || [ ! -f "$out/watchdog-expired" ]; }; then
+      printf 'watchdog owner exited unexpectedly: %s (original exit %s)\n' "$watchdog_wait_code" "$code" >&2
+      [ "$code" != 0 ] || code=1
+    fi
+  fi
 }
 stop_forward() {
   forward_stop_pid=$1
@@ -1072,7 +1091,7 @@ shutdown_stream() {
     stream_limit=$(remaining) || return 124
     [ "$stream_limit" -le 240 ] || stream_limit=240
     exec timeout --kill-after=5s "${stream_limit}s" kubectl --kubeconfig="$RHIZA_LOCAL_RUNTIME_KUBECONFIG" \
-      --context="$context" --namespace="$ns" --request-timeout=0 "$@"
+      --context="$context" --namespace="$ns" --request-timeout=0 "$@" 3>&-
   fi
   exec timeout --kill-after=5s 240s kubectl --context="$context" --namespace="$ns" --request-timeout=0 "$@"
 }
@@ -1132,9 +1151,9 @@ capture_shutdown() {
   shutdown_watch_pid=''
   shutdown_log_pids=''
   shutdown_capture_state=active
-  shutdown_watch "$resource_version" "$shutdown_watch_deadline" > "$out/shutdown-watch.json" 2> "$out/shutdown-watch.stderr" & shutdown_watch_pid=$!
+  shutdown_watch "$resource_version" "$shutdown_watch_deadline" 3>&- > "$out/shutdown-watch.json" 2> "$out/shutdown-watch.stderr" & shutdown_watch_pid=$!
   for shutdown_pod in $(jq -r '.[].name' "$out/shutdown-before.json"); do
-    shutdown_stream logs "$shutdown_pod" --container=rhiza --follow > "$out/$shutdown_pod-shutdown.log" 2> "$out/$shutdown_pod-shutdown.stderr" &
+    shutdown_stream logs "$shutdown_pod" --container=rhiza --follow 3>&- > "$out/$shutdown_pod-shutdown.log" 2> "$out/$shutdown_pod-shutdown.stderr" &
     shutdown_log_pids="$shutdown_log_pids $shutdown_pod:$!"
   done
 }
@@ -1476,14 +1495,44 @@ if [ "$mode" = run-local ]; then
   trap 'exit 124' USR1
   runtime_pid=$$
   watchdog_seconds=$(remaining) || exit 124
-  (
-    sleep_pid=''
-    trap 'if [ -n "$sleep_pid" ]; then kill "$sleep_pid" 2>/dev/null || true; wait "$sleep_pid" 2>/dev/null || true; fi; exit 0' HUP INT TERM
-    sleep "$watchdog_seconds" & sleep_pid=$!
-    wait "$sleep_pid"
-    kill -USR1 "$runtime_pid"
-  ) & watchdog=$!
+  watchdog_control="$out/watchdog.control"
+  mkfifo "$watchdog_control" || die 'cannot create local watchdog control pipe'
+  exec 3<> "$watchdog_control"
+  watchdog_launching=true
+  watchdog_pending_signal=''
+  trap 'if [ "$watchdog_launching" = true ]; then watchdog_pending_signal=HUP; else exit 130; fi' HUP
+  trap 'if [ "$watchdog_launching" = true ]; then watchdog_pending_signal=INT; else exit 130; fi' INT
+  trap 'if [ "$watchdog_launching" = true ]; then watchdog_pending_signal=TERM; else exit 130; fi' TERM
+  trap 'if [ "$watchdog_launching" = true ]; then watchdog_pending_signal=USR1; else exit 124; fi' USR1
+  timeout --signal=USR1 --kill-after=5s "${watchdog_seconds}s" sh -c '
+    runtime_pid=$1
+    out=$2
+    control=$3
+    watchdog_expired() {
+      printf "%s\n" expired > "$out/watchdog-expired"
+      kill -USR1 "$runtime_pid"
+      exit 0
+    }
+    trap "watchdog_expired" USR1
+    printf "%s\n" "$$" > "$out/watchdog-command.pid"
+    printf "ready\n" > "$out/watchdog-ready"
+    IFS= read -r request < "$control" || exit 1
+    [ "$request" = stop ] || exit 1
+  ' sh "$runtime_pid" "$out" "$watchdog_control" 3>&- & watchdog=$!
   printf '%s\n' "$watchdog" > "$out/watchdog.pid"
+  watchdog_launching=false
+  trap 'exit 130' HUP INT TERM
+  trap 'exit 124' USR1
+  case "$watchdog_pending_signal" in
+    HUP|INT|TERM) exit 130 ;;
+    USR1) exit 124 ;;
+  esac
+  watchdog_start_attempts=0
+  while [ ! -f "$out/watchdog-ready" ]; do
+    watchdog_start_attempts=$((watchdog_start_attempts + 1))
+    [ "$watchdog_start_attempts" -lt 500 ] || die 'local watchdog readiness timed out'
+    sleep 0.01
+  done
   run local-identity k auth whoami -o json
   jq -e --arg user "system:serviceaccount:$ns:rhiza-runtime" --arg group "system:serviceaccounts:$ns" \
     '.status.userInfo.username==$user and (.status.userInfo.groups|sort)==(["system:authenticated","system:serviceaccounts",$group]|sort)' \
@@ -1601,7 +1650,7 @@ forward() {
   assert_port_free "$port" "$raft_port"
   if [ "$mode" = run-local ]; then
     setsid timeout --kill-after=5s "${forward_seconds}s" kubectl --kubeconfig="$RHIZA_LOCAL_RUNTIME_KUBECONFIG" \
-      --context="$context" --namespace="$ns" --request-timeout=30s port-forward --address=127.0.0.1 "pod/$pod" "$port:8080" "$raft_port:8081" > "$out/$pod-portforward.log" 2>&1 &
+      --context="$context" --namespace="$ns" --request-timeout=30s port-forward --address=127.0.0.1 "pod/$pod" "$port:8080" "$raft_port:8081" 3>&- > "$out/$pod-portforward.log" 2>&1 &
   else
     setsid timeout --kill-after=5s "${forward_seconds}s" kubectl --context="$context" --namespace="$ns" \
       port-forward --address=127.0.0.1 "pod/$pod" "$port:8080" "$raft_port:8081" > "$out/$pod-portforward.log" 2>&1 &
@@ -1737,7 +1786,7 @@ execute() {
 diagnostic_k() {
   if [ "$mode" = run-local ]; then
     timeout --kill-after=1s 3s kubectl --kubeconfig="$RHIZA_LOCAL_RUNTIME_KUBECONFIG" \
-      --context="$context" --namespace="$ns" --request-timeout=2s "$@"
+      --context="$context" --namespace="$ns" --request-timeout=2s "$@" 3>&-
   else
     timeout --kill-after=1s 3s kubectl --context="$context" --namespace="$ns" --request-timeout=2s "$@"
   fi
@@ -1767,7 +1816,7 @@ capture_network_failure() {
             > "$out/$diagnostic_label.http-timing" 2> "$out/$diagnostic_label.stderr"
         fi
         printf '%s\n' "$?" > "$out/$diagnostic_label.exit"
-      ) & diagnostic_pids="$diagnostic_pids $!"
+      ) 3>&- & diagnostic_pids="$diagnostic_pids $!"
     done
     diagnostic_label="network-failure-$diagnostic_port-linearizable-read"
     (
@@ -1776,7 +1825,7 @@ capture_network_failure() {
         --write-out '%{http_code}\n%{time_total}\n' -H 'Content-Type: application/json' -d "$query_payload" \
         "http://127.0.0.1:$diagnostic_port/sql/query" > "$out/$diagnostic_label.http-timing" 2> "$out/$diagnostic_label.stderr"
       printf '%s\n' "$?" > "$out/$diagnostic_label.exit"
-    ) & diagnostic_pids="$diagnostic_pids $!"
+    ) 3>&- & diagnostic_pids="$diagnostic_pids $!"
   done
   for diagnostic_resource in fault pods endpoints endpointslices.discovery.k8s.io; do
     diagnostic_label="network-failure-${diagnostic_resource%%.*}"
@@ -1789,7 +1838,7 @@ capture_network_failure() {
         endpointslices.discovery.k8s.io) diagnostic_k get endpointslices.discovery.k8s.io -l kubernetes.io/service-name=rhiza-peers -o json > "$out/$diagnostic_label.stdout" 2> "$out/$diagnostic_label.stderr" ;;
       esac
       printf '%s\n' "$?" > "$out/$diagnostic_label.exit"
-    ) & diagnostic_pids="$diagnostic_pids $!"
+    ) 3>&- & diagnostic_pids="$diagnostic_pids $!"
   done
   set +e
   for diagnostic_pid in $diagnostic_pids; do wait "$diagnostic_pid"; done

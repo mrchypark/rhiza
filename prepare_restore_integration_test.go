@@ -711,17 +711,94 @@ type prepareRestoreMutation struct {
 	Denied bool
 }
 
+type prepareRestoreConnContextKey struct{}
+
+type prepareRestoreConnInfo struct {
+	id           uint64
+	accepted     time.Time
+	state        http.ConnState
+	activeAtStop bool
+}
+
+type prepareRestoreConnEvent struct {
+	id    uint64
+	state http.ConnState
+}
+
 type prepareRestoreMutationObserver struct {
-	t        *testing.T
-	provider string
-	upstream *url.URL
-	server   *http.Server
-	listener net.Listener
-	mu       sync.Mutex
-	active   bool
-	root     string
-	records  []prepareRestoreMutation
-	sessions map[string]string
+	t               *testing.T
+	provider        string
+	upstream        *url.URL
+	server          *http.Server
+	listener        net.Listener
+	transport       *http.Transport
+	serveDone       chan error
+	connections     map[net.Conn]*prepareRestoreConnInfo
+	connEvents      chan prepareRestoreConnEvent
+	nextConnID      uint64
+	stopping        bool
+	stopOnce        sync.Once
+	stopErr         error
+	closeErr        error
+	serveErr        error
+	expectedStopErr bool
+	handlers        int
+	proxyCalls      int
+	roundTrips      int
+	bodyEOF         int
+	bodyClosed      int
+	cleanupStep     string
+	mu              sync.Mutex
+	active          bool
+	root            string
+	records         []prepareRestoreMutation
+	sessions        map[string]string
+}
+
+type prepareRestoreObservedBody struct {
+	io.ReadCloser
+	observer  *prepareRestoreMutationObserver
+	eofOnce   sync.Once
+	closeOnce sync.Once
+}
+
+func (b *prepareRestoreObservedBody) Read(p []byte) (int, error) {
+	n, err := b.ReadCloser.Read(p)
+	if errors.Is(err, io.EOF) {
+		b.eofOnce.Do(func() {
+			b.observer.mu.Lock()
+			b.observer.bodyEOF++
+			b.observer.mu.Unlock()
+		})
+	}
+	return n, err
+}
+
+func (b *prepareRestoreObservedBody) Close() error {
+	err := b.ReadCloser.Close()
+	b.closeOnce.Do(func() {
+		b.observer.mu.Lock()
+		b.observer.bodyClosed++
+		b.observer.mu.Unlock()
+	})
+	return err
+}
+
+type prepareRestoreObservedRoundTripper struct {
+	next http.RoundTripper
+	o    *prepareRestoreMutationObserver
+}
+
+func (rt prepareRestoreObservedRoundTripper) RoundTrip(r *http.Request) (*http.Response, error) {
+	rt.o.mu.Lock()
+	rt.o.roundTrips++
+	rt.o.mu.Unlock()
+	defer func() {
+		rt.o.mu.Lock()
+		rt.o.roundTrips--
+		rt.o.mu.Unlock()
+	}()
+	return rt.next.RoundTrip(r)
 }
 
 func newPrepareRestoreMutationObserver(t *testing.T, upstream string) *prepareRestoreMutationObserver {
@@ -736,9 +813,14 @@ func newPrepareRestoreMutationObserver(t *testing.T, upstream string) *prepareRe
 	}
 	o := &prepareRestoreMutationObserver{
 		t: t, provider: os.Getenv("RHIZA_EMBEDDED_PROVIDER"), upstream: target,
-		listener: listener, sessions: make(map[string]string),
+		listener: listener, sessions: make(map[string]string), serveDone: make(chan error, 1),
+		connections: make(map[net.Conn]*prepareRestoreConnInfo), connEvents: make(chan prepareRestoreConnEvent, 64),
 	}
 	proxy := httputil.NewSingleHostReverseProxy(target)
+	// Own the proxy transport so its keep-alive pool can be closed with this
+	// observer instead of leaving test-owned upstream connections behind.
+	o.transport = http.DefaultTransport.(*http.Transport).Clone()
+	proxy.Transport = prepareRestoreObservedRoundTripper{next: o.transport, o: o}
 	proxy.ModifyResponse = func(response *http.Response) error {
 		if response.Request == nil {
 			return nil
@@ -771,44 +853,185 @@ func newPrepareRestoreMutationObserver(t *testing.T, upstream string) *prepareRe
 		}
 		return nil
 	}
-	o.server = &http.Server{Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	serveProxy := func(w http.ResponseWriter, r *http.Request) {
 		o.mu.Lock()
-		active, root := o.active, o.root
-		if !active || !isPrepareRestoreMutation(r.Method) || (r.Method == http.MethodPost && r.URL.Path == "/token") {
-			o.mu.Unlock()
-			proxy.ServeHTTP(w, r)
-			return
-		}
-		body, err := readPrepareRestoreBody(r)
-		if err != nil {
-			o.records = append(o.records, prepareRestoreMutation{Method: r.Method, Denied: true})
-			o.mu.Unlock()
-			http.Error(w, "provider mutation body exceeds observer bound", http.StatusRequestEntityTooLarge)
-			return
-		}
-		key, parseErr := prepareRestoreMutationKey(r, body, o.provider, o.sessions)
-		allowed := parseErr == nil && isAllowedPrepareRestoreMutationKey(key, root)
-		record := prepareRestoreMutation{Method: r.Method, Key: key, Denied: !allowed}
-		o.records = append(o.records, record)
-		if allowed && r.Method == http.MethodPost && strings.HasPrefix(r.URL.Path, "/upload/") {
-			o.sessions[prepareRestoreRequestFingerprint(r.URL)] = key
-		}
+		o.proxyCalls++
 		o.mu.Unlock()
-		if !allowed {
-			http.Error(w, "provider mutation is outside PrepareRestore allowlist", http.StatusForbidden)
-			return
-		}
+		defer func() {
+			o.mu.Lock()
+			o.proxyCalls--
+			o.mu.Unlock()
+		}()
 		proxy.ServeHTTP(w, r)
-	})}
-	go func() { _ = o.server.Serve(listener) }()
+	}
+	o.server = &http.Server{
+		ConnContext: func(ctx context.Context, conn net.Conn) context.Context {
+			return context.WithValue(ctx, prepareRestoreConnContextKey{}, conn)
+		},
+		ConnState: o.trackConnState,
+		Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			conn, _ := r.Context().Value(prepareRestoreConnContextKey{}).(net.Conn)
+			o.mu.Lock()
+			o.handlers++
+			info := o.connections[conn]
+			reject := o.stopping && (info == nil || !info.activeAtStop)
+			o.mu.Unlock()
+			defer func() {
+				o.mu.Lock()
+				o.handlers--
+				o.mu.Unlock()
+			}()
+			if reject {
+				http.Error(w, "provider observer is stopping", http.StatusServiceUnavailable)
+				return
+			}
+			if r.Body != nil {
+				body := &prepareRestoreObservedBody{ReadCloser: r.Body, observer: o}
+				r.Body = body
+				defer func() { _ = body.Close() }()
+			}
+			o.mu.Lock()
+			active, root := o.active, o.root
+			o.mu.Unlock()
+			if !active || !isPrepareRestoreMutation(r.Method) || (r.Method == http.MethodPost && r.URL.Path == "/token") {
+				serveProxy(w, r)
+				return
+			}
+			body, err := readPrepareRestoreBody(r)
+			if err != nil {
+				o.mu.Lock()
+				o.records = append(o.records, prepareRestoreMutation{Method: r.Method, Denied: true})
+				o.mu.Unlock()
+				http.Error(w, "provider mutation body exceeds observer bound", http.StatusRequestEntityTooLarge)
+				return
+			}
+			o.mu.Lock()
+			key, parseErr := prepareRestoreMutationKey(r, body, o.provider, o.sessions)
+			allowed := parseErr == nil && isAllowedPrepareRestoreMutationKey(key, root)
+			record := prepareRestoreMutation{Method: r.Method, Key: key, Denied: !allowed}
+			o.records = append(o.records, record)
+			if allowed && r.Method == http.MethodPost && strings.HasPrefix(r.URL.Path, "/upload/") {
+				o.sessions[prepareRestoreRequestFingerprint(r.URL)] = key
+			}
+			o.mu.Unlock()
+			if !allowed {
+				http.Error(w, "provider mutation is outside PrepareRestore allowlist", http.StatusForbidden)
+				return
+			}
+			serveProxy(w, r)
+		}),
+	}
+	go func() { o.serveDone <- o.server.Serve(listener) }()
 	t.Cleanup(func() {
-		ctx, cancel := context.WithTimeout(context.Background(), time.Second)
-		defer cancel()
-		if err := o.server.Shutdown(ctx); err != nil {
-			t.Errorf("stop provider observer: %v", err)
+		if err := o.stop(); err != nil {
+			o.mu.Lock()
+			expected := o.expectedStopErr
+			o.mu.Unlock()
+			if !expected {
+				t.Errorf("stop provider observer: %v", err)
+			}
 		}
 	})
 	return o
+}
+
+func (o *prepareRestoreMutationObserver) trackConnState(conn net.Conn, state http.ConnState) {
+	o.mu.Lock()
+	info := o.connections[conn]
+	if state == http.StateClosed || state == http.StateHijacked {
+		if info != nil {
+			select {
+			case o.connEvents <- prepareRestoreConnEvent{id: info.id, state: state}:
+			default:
+			}
+		}
+		delete(o.connections, conn)
+		o.mu.Unlock()
+		return
+	}
+	if info == nil {
+		o.nextConnID++
+		info = &prepareRestoreConnInfo{id: o.nextConnID, accepted: time.Now()}
+		o.connections[conn] = info
+	}
+	info.state = state
+	closeConn := false
+	if o.stopping {
+		switch state {
+		case http.StateNew, http.StateIdle:
+			info.activeAtStop = false
+			closeConn = true
+		case http.StateActive:
+			closeConn = !info.activeAtStop
+		}
+	}
+	select {
+	case o.connEvents <- prepareRestoreConnEvent{id: info.id, state: state}:
+	default:
+	}
+	o.mu.Unlock()
+	if closeConn {
+		_ = conn.Close()
+	}
+}
+
+func (o *prepareRestoreMutationObserver) stop() error {
+	o.stopOnce.Do(func() {
+		o.mu.Lock()
+		o.stopping = true
+		o.cleanupStep = "producer and fixture cleanup complete; close unused connections"
+		var closeConns []net.Conn
+		for conn, info := range o.connections {
+			switch info.state {
+			case http.StateNew, http.StateIdle:
+				info.activeAtStop = false
+				closeConns = append(closeConns, conn)
+			case http.StateActive:
+				info.activeAtStop = true
+			}
+		}
+		o.mu.Unlock()
+		for _, conn := range closeConns {
+			_ = conn.Close()
+		}
+
+		o.server.SetKeepAlivesEnabled(false)
+		o.transport.CloseIdleConnections()
+		o.mu.Lock()
+		o.cleanupStep = "graceful server shutdown"
+		o.mu.Unlock()
+		ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+		shutdownErr := o.server.Shutdown(ctx)
+		cancel()
+		if shutdownErr != nil {
+			diagnostic := o.shutdownDiagnostic()
+			o.mu.Lock()
+			o.cleanupStep = "forced server close after shutdown failure"
+			o.mu.Unlock()
+			o.closeErr = o.server.Close()
+			o.stopErr = errors.Join(fmt.Errorf("shutdown: %w; %s", shutdownErr, diagnostic), o.closeErr)
+		}
+		o.transport.CloseIdleConnections()
+		o.mu.Lock()
+		o.cleanupStep = "join Serve"
+		o.mu.Unlock()
+		serveErr := <-o.serveDone
+		if serveErr != nil && !errors.Is(serveErr, http.ErrServerClosed) {
+			o.serveErr = serveErr
+			o.stopErr = errors.Join(o.stopErr, fmt.Errorf("Serve: %w", serveErr))
+		}
+	})
+	return o.stopErr
+}
+
+func (o *prepareRestoreMutationObserver) shutdownDiagnostic() string {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	connections := make([]string, 0, len(o.connections))
+	for _, info := range o.connections {
+		connections = append(connections, fmt.Sprintf("conn=%d age=%s state=%s", info.id, time.Since(info.accepted).Round(time.Millisecond), info.state))
+	}
+	return fmt.Sprintf("step=%q conns=%v handlers=%d proxy_calls=%d upstream_round_trips=%d body_eof=%d body_closed=%d", o.cleanupStep, connections, o.handlers, o.proxyCalls, o.roundTrips, o.bodyEOF, o.bodyClosed)
 }
 
 func (o *prepareRestoreMutationObserver) endpoint() string {
@@ -1238,6 +1461,9 @@ func TestPrepareRestoreProviderObserverForwardsBodyAndTracksResumableUpload(t *t
 	observer := newPrepareRestoreMutationObserver(t, upstream.URL)
 	observer.setRoot("prefix/cluster")
 	observer.begin()
+	clientTransport := &http.Transport{}
+	client := &http.Client{Transport: clientTransport}
+	defer clientTransport.CloseIdleConnections()
 	body := []byte(`{"name":"prefix/cluster/archive/recovery-pins/pin-a"}`)
 	request, err := http.NewRequest(http.MethodPost, observer.endpoint()+"/upload/storage/v1/b/bucket/o?uploadType=resumable", bytes.NewReader(body))
 	if err != nil {
@@ -1245,7 +1471,7 @@ func TestPrepareRestoreProviderObserverForwardsBodyAndTracksResumableUpload(t *t
 	}
 	request.Header.Set("Content-Type", "application/json")
 	request.Header.Set("Authorization", "Bearer signature-preservation-test")
-	response, err := http.DefaultClient.Do(request)
+	response, err := client.Do(request)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1268,7 +1494,7 @@ func TestPrepareRestoreProviderObserverForwardsBodyAndTracksResumableUpload(t *t
 	if err != nil {
 		t.Fatal(err)
 	}
-	putResponse, err := http.DefaultClient.Do(put)
+	putResponse, err := client.Do(put)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1276,6 +1502,134 @@ func TestPrepareRestoreProviderObserverForwardsBodyAndTracksResumableUpload(t *t
 	records := observer.end()
 	if len(records) != 2 || records[0].Key != "prefix/cluster/archive/recovery-pins/pin-a" || records[1].Key != records[0].Key {
 		t.Fatalf("resumable upload mutations not both observed against exact object: %+v", records)
+	}
+	if err := observer.stop(); err != nil {
+		t.Fatalf("stop after completed proxy requests: %v", err)
+	}
+	observer.mu.Lock()
+	handlers, proxyCalls, roundTrips := observer.handlers, observer.proxyCalls, observer.roundTrips
+	bodyEOF, bodyClosed := observer.bodyEOF, observer.bodyClosed
+	observer.mu.Unlock()
+	if handlers != 0 || proxyCalls != 0 || roundTrips != 0 || bodyEOF != 2 || bodyClosed != 2 {
+		t.Fatalf("observer resources not drained: handlers=%d proxy_calls=%d round_trips=%d body_eof=%d body_closed=%d", handlers, proxyCalls, roundTrips, bodyEOF, bodyClosed)
+	}
+}
+
+func TestPrepareRestoreObserverOwnsUnusedConnectionsButRejectsActiveShutdown(t *testing.T) {
+	t.Run("unused StateNew is closed before graceful shutdown", func(t *testing.T) {
+		upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) { _, _ = io.WriteString(w, "ok") }))
+		t.Cleanup(upstream.Close)
+		observer := newPrepareRestoreMutationObserver(t, upstream.URL)
+		clientTransport := &http.Transport{}
+		client := &http.Client{Transport: clientTransport}
+		defer clientTransport.CloseIdleConnections()
+		response, err := client.Get(observer.endpoint() + "/idle")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := io.Copy(io.Discard, response.Body); err != nil {
+			_ = response.Body.Close()
+			t.Fatal(err)
+		}
+		if err := response.Body.Close(); err != nil {
+			t.Fatal(err)
+		}
+		idleEvent := awaitPrepareRestoreObserverState(t, observer, http.StateIdle)
+		conn, err := net.Dial("tcp", observer.listener.Addr().String())
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer conn.Close()
+		event := awaitPrepareRestoreObserverState(t, observer, http.StateNew)
+		if err := observer.stop(); err != nil {
+			t.Fatalf("stop with unused StateNew conn %d: %v", event.id, err)
+		}
+		if err := conn.SetReadDeadline(time.Now().Add(time.Second)); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := conn.Read(make([]byte, 1)); err == nil {
+			t.Fatal("observer left unused StateNew TCP connection open")
+		}
+		t.Logf("conn=%d state=new age<5s and conn=%d state=idle explicitly closed; Shutdown succeeded and Serve joined", event.id, idleEvent.id)
+	})
+
+	t.Run("active proxy request still fails shutdown then is canceled", func(t *testing.T) {
+		upstreamStarted := make(chan struct{})
+		upstreamDone := make(chan struct{})
+		upstream := httptest.NewServer(http.HandlerFunc(func(_ http.ResponseWriter, r *http.Request) {
+			close(upstreamStarted)
+			<-r.Context().Done()
+			close(upstreamDone)
+		}))
+		t.Cleanup(upstream.Close)
+		observer := newPrepareRestoreMutationObserver(t, upstream.URL)
+		transport := &http.Transport{}
+		client := &http.Client{Transport: transport}
+		requestDone := make(chan error, 1)
+		go func() {
+			response, err := client.Get(observer.endpoint() + "/active")
+			if response != nil {
+				_ = response.Body.Close()
+			}
+			requestDone <- err
+		}()
+		select {
+		case <-upstreamStarted:
+		case <-time.After(2 * time.Second):
+			t.Fatal("observer did not start upstream request")
+		}
+		event := awaitPrepareRestoreObserverState(t, observer, http.StateActive)
+		stopErr := observer.stop()
+		if !errors.Is(stopErr, context.DeadlineExceeded) {
+			t.Fatalf("stop with active conn %d returned %v, want preserved shutdown deadline", event.id, stopErr)
+		}
+		if !strings.Contains(stopErr.Error(), "state=active") || !strings.Contains(stopErr.Error(), "handlers=1") {
+			t.Fatalf("active shutdown diagnostic omitted connection/handler state: %v", stopErr)
+		}
+		observer.mu.Lock()
+		closeErr, serveErr := observer.closeErr, observer.serveErr
+		observer.mu.Unlock()
+		if closeErr != nil {
+			t.Fatalf("forced Close after expected shutdown timeout failed: %v", closeErr)
+		}
+		if serveErr != nil {
+			t.Fatalf("Serve after expected shutdown timeout failed: %v", serveErr)
+		}
+		t.Logf("active shutdown diagnostic: %v", stopErr)
+		observer.mu.Lock()
+		observer.expectedStopErr = true
+		observer.mu.Unlock()
+		select {
+		case <-upstreamDone:
+		case <-time.After(time.Second):
+			t.Fatal("fallback close did not cancel the upstream handler")
+		}
+		select {
+		case err := <-requestDone:
+			if err == nil {
+				t.Fatal("active request unexpectedly succeeded after observer close")
+			}
+		case <-time.After(time.Second):
+			t.Fatal("active request goroutine did not finish after observer close")
+		}
+		transport.CloseIdleConnections()
+		t.Logf("conn=%d state=active; shutdown deadline retained; fallback close canceled upstream and Serve joined", event.id)
+	})
+}
+
+func awaitPrepareRestoreObserverState(t *testing.T, observer *prepareRestoreMutationObserver, want http.ConnState) prepareRestoreConnEvent {
+	t.Helper()
+	deadline := time.NewTimer(2 * time.Second)
+	defer deadline.Stop()
+	for {
+		select {
+		case event := <-observer.connEvents:
+			if event.state == want {
+				return event
+			}
+		case <-deadline.C:
+			t.Fatalf("did not observe observer ConnState %s", want)
+		}
 	}
 }
 
