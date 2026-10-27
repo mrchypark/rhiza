@@ -163,6 +163,8 @@ func TestAutomaticEscalationRequiresLiveQuorum(t *testing.T) {
 		mixed, unknown, unbound bool
 		mixedMembership         bool
 		unapprovedMembership    bool
+		prospectiveLearner      bool
+		uidWithoutWAL           bool
 		recreated               bool
 		sourceWALMismatch       bool
 		sourcePodReplaced       bool
@@ -181,6 +183,8 @@ func TestAutomaticEscalationRequiresLiveQuorum(t *testing.T) {
 		{name: "mixed known configurations without live quorum", mixed: true},
 		{name: "approved pre-add and post-add snapshots advance no-quorum fence intent", mixedMembership: true, expired: true, reserve: true},
 		{name: "known but unapproved membership blocks timer and reservation", unapprovedMembership: true, expired: true},
+		{name: "prospective learner without captured identity does not block quorum progress", prospectiveLearner: true, live: true, noTimer: true},
+		{name: "UID-known learner without WAL is not treated as probe identity", uidWithoutWAL: true, live: true},
 		{name: "unknown membership must block live proof", mixed: true, unknown: true, live: true},
 		{name: "matching unknown membership must block live proof", unknown: true, live: true},
 		{name: "versioned unknown is absence of fresh positive", corrupt: "unknown", noTimer: true},
@@ -218,14 +222,31 @@ func TestAutomaticEscalationRequiresLiveQuorum(t *testing.T) {
 			if tc.noTimer {
 				noQuorumSince = time.Time{}
 			}
-			includeLearner := tc.learnerOnly || tc.unbound || tc.recreated || tc.mixedMembership || tc.unapprovedMembership
+			includeLearner := tc.learnerOnly || tc.unbound || tc.recreated || tc.mixedMembership || tc.unapprovedMembership || tc.prospectiveLearner || tc.uidWithoutWAL
 			learnerName := ""
 			if includeLearner {
 				learnerName = "learner"
 			}
 			state.Intent = &autoIntent{Failed: "n1", Voters: state.Voters, LearnerName: learnerName, Policy: AutoPolicy{FailureGraceSeconds: 600}, NoQuorumSince: noQuorumSince}
-			if includeLearner && !tc.unbound {
+			if includeLearner && !tc.unbound && !tc.prospectiveLearner && !tc.uidWithoutWAL {
 				state.Intent.LearnerUID, state.Intent.LearnerWAL = "learner-uid", "learner-wal"
+			} else if tc.uidWithoutWAL {
+				state.Intent.LearnerUID = "learner-uid"
+			}
+			if tc.prospectiveLearner {
+				request := FenceRequest{
+					LogicalID: "logical", BindingUID: state.BindingUID, Namespace: "default",
+					StatefulSet: "rhiza", StatefulSetUID: state.StatefulSetUID,
+					SourceClusterID: state.ActiveClusterID, OperationID: "auto-prospective-learner",
+					Scope: ScopeVoter, Targets: []FenceTarget{state.Identities["n1"]},
+				}
+				hash, err := requestHash(&request)
+				if err != nil {
+					t.Fatal(err)
+				}
+				state.Intent.RecoveryName = request.OperationID
+				state.Intent.Request = request
+				state.Intent.Proof = &FenceProof{OperationID: request.OperationID, SourceClusterID: state.ActiveClusterID, BindingUID: state.BindingUID, RequestHash: hash, ProofID: "verified-voter-proof", ProcessesTerminated: true, RecreationBlocked: true, StorageQuiesced: true}
 			}
 			r := autoClusterResource("cluster", "uid", "logical")
 			c := autoController(autoBucket(t))
@@ -321,6 +342,10 @@ func TestAutomaticEscalationRequiresLiveQuorum(t *testing.T) {
 						}
 						if tc.unapprovedMembership && id != "n2" {
 							voters = []quepaxa.NodeID{"n1", "n3", "learner"}
+							config = 3
+						}
+						if tc.unbound && id == "n3" {
+							voters = []quepaxa.NodeID{"n2", "n3", "learner"}
 							config = 3
 						}
 						if tc.unknown {
@@ -421,7 +446,10 @@ func TestAutomaticEscalationRequiresLiveQuorum(t *testing.T) {
 				cancel()
 				probeCtx = canceledCtx
 			}
-			_, err = c.maybeEscalateAutomatic(probeCtx, r, state, version, sts)
+			handled, err := c.maybeEscalateAutomatic(probeCtx, r, state, version, sts)
+			if tc.prospectiveLearner && (handled || err != nil || probes != 2 || podGets["learner"] != 0) {
+				t.Fatalf("unprovisioned learner blocked the ordinary voter-fenced progression: handled=%v err=%v probes=%d podGets=%v status=%+v", handled, err, probes, podGets, r.Status)
+			}
 			if tc.outerCanceled {
 				if err == nil || probes != 0 || !state.Intent.NoQuorumSince.Equal(since) {
 					t.Fatalf("outer-canceled reconcile advanced timer: err=%v probes=%d since=%v", err, probes, state.Intent.NoQuorumSince)
@@ -472,6 +500,14 @@ func TestAutomaticEscalationRequiresLiveQuorum(t *testing.T) {
 				}
 				return
 			}
+			if tc.prospectiveLearner || tc.uidWithoutWAL {
+				if r.Status.Phase == "Blocked" || podGets["learner"] != 0 {
+					t.Fatalf("uncaptured learner blocked or entered voter probing: status=%+v podGets=%v", r.Status, podGets)
+				}
+				if tc.uidWithoutWAL && (state.Intent.LearnerUID != "learner-uid" || state.Intent.LearnerWAL != "") {
+					t.Fatalf("probe eligibility discarded the captured learner UID: %+v", state.Intent)
+				}
+			}
 			if got, want := state.Intent.NoQuorumSince.IsZero(), wantLive; got != want {
 				t.Fatalf("NoQuorumSince cleared=%v, want %v", got, want)
 			}
@@ -491,7 +527,11 @@ func TestAutomaticEscalationRequiresLiveQuorum(t *testing.T) {
 					t.Fatalf("archive guard bypassed: %+v", r.Status)
 				}
 			} else if tc.noTimer {
-				if state.Intent.NoQuorumSince.IsZero() {
+				if tc.live {
+					if !state.Intent.NoQuorumSince.IsZero() {
+						t.Fatal("fresh positive round retained no-quorum policy timer")
+					}
+				} else if state.Intent.NoQuorumSince.IsZero() {
 					t.Fatal("completed no-positive probe round did not start policy timer")
 				}
 			} else if !wantLive && r.Status.Phase != "Recovering" {

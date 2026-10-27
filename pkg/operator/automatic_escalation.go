@@ -47,11 +47,12 @@ func (c *Controller) assessAutomaticEscalation(ctx context.Context, r *ClusterRe
 			return automaticEscalationStop, c.autoStatus(ctx, r, state, "Blocked", "intent voter is outside the generation fencing scope")
 		}
 	}
-	if intent.LearnerName != "" {
+	// A prospective learner is not a voter probe target until both its exact
+	// Pod UID and WAL identity have been captured. Its history still remains in
+	// the later generation-fence inventory through includeLearnerHistory.
+	if intent.LearnerName != "" && intent.LearnerUID != "" && intent.LearnerWAL != "" {
 		voters = append(voters, VoterPod{NodeID: quepaxa.NodeID(intent.LearnerName), Pod: intent.LearnerName})
-		if intent.LearnerUID != "" && intent.LearnerWAL != "" {
-			fencePods[quepaxa.NodeID(intent.LearnerName)] = intent.LearnerName
-		}
+		fencePods[quepaxa.NodeID(intent.LearnerName)] = intent.LearnerName
 	}
 	allowedMemberships := automaticIntentMemberships(intent)
 	var quorum bool
