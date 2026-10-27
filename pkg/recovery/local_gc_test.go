@@ -23,31 +23,43 @@ import (
 	"github.com/thanos-io/objstore"
 )
 
-func TestLocalGCProtocolDowngradeAndReadOnlyOpen(t *testing.T) {
+func TestLocalArchiveUsesOneFixedSchemaAndReadOnlyOpen(t *testing.T) {
 	ctx := context.Background()
 	bucket := objstore.NewInMemBucket()
 	archive, err := CreateLocalArchive(ctx, bucket, "local", localTestBinding(), nil)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if exists, _ := bucket.Exists(ctx, "local/local-gc-control"); exists {
-		t.Fatal("read-only open created control")
+	if exists, _ := bucket.Exists(ctx, "local/local-gc-control"); !exists {
+		t.Fatal("genesis omitted maintenance control")
 	}
-	old, _ := json.Marshal(archive.head)
+	if archive.head.Version != localArchiveFormatVersion || archive.Binding.Version != localArchiveFormatVersion {
+		t.Fatal("genesis used unexpected format marker")
+	}
+	encodedControl, err := archive.read(ctx, "local-gc-control", 4096)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var control localArchiveMaintenanceControl
+	if err := json.Unmarshal(encodedControl, &control); err != nil || control.Version != localArchiveFormatVersion || control.LocationHash != "" || control.BindingHash == "" {
+		t.Fatalf("remote control shape=%+v err=%v", control, err)
+	}
 	if err := archive.GarbageCollect(ctx, 0, 0); err != nil {
 		t.Fatal(err)
 	}
-	if archive.head.Version != 2 {
-		t.Fatal("protocol not activated")
+	if archive.head.Version != localArchiveFormatVersion {
+		t.Fatal("GC changed the fixed schema marker")
 	}
 	if _, err := OpenLocalArchive(ctx, bucket, "local"); err != nil {
 		t.Fatal(err)
 	}
+	archive.head.Version = 1
+	old, _ := json.Marshal(archive.head)
 	if err := bucket.Upload(ctx, "local/HEAD", bytes.NewReader(old)); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := OpenLocalArchive(ctx, bucket, "local"); err == nil {
-		t.Fatal("downgrade accepted")
+		t.Fatal("unsupported archive format was accepted")
 	}
 }
 
@@ -63,6 +75,9 @@ func TestLocalGCRejectsStateAdvance(t *testing.T) {
 		t.Fatal(err)
 	}
 	if err := first.GarbageCollect(ctx, 1, 0); err != nil {
+		t.Fatal(err)
+	}
+	if err := first.publish(ctx, first.head); err != nil {
 		t.Fatal(err)
 	}
 	if err := stale.GarbageCollect(ctx, 1, 0); err == nil {
@@ -84,7 +99,16 @@ func TestLocalGCCatalogRetentionAndRestorePin(t *testing.T) {
 	ctx := context.Background()
 	bucket := &localViewAdmissionDelayBucket{Bucket: objstore.NewInMemBucket()}
 	binding := localTestBinding()
+	genesis, err := PrepareLocalArchive(ctx, bucket, "local", binding)
+	if err != nil {
+		t.Fatal(err)
+	}
+	bindingData, err := json.Marshal(binding)
+	if err != nil {
+		t.Fatal(err)
+	}
 	manager := checkpoint.NewManager(bucket, "local", "", 1)
+	manager.SetLocalControlBinding("", fmt.Sprintf("%x", sha256.Sum256(bindingData)))
 	var snapshots []LocalSnapshot
 	for i := uint64(1); i <= 4; i++ {
 		filename := filepath.Join(t.TempDir(), "snapshot.db")
@@ -124,7 +148,7 @@ func TestLocalGCCatalogRetentionAndRestorePin(t *testing.T) {
 		snapshots = append(snapshots, snapshot)
 	}
 	current := snapshots[3]
-	archive, err := CreateLocalArchive(ctx, bucket, "local", binding, &snapshots[0])
+	archive, err := CreateLocalArchiveFromPrepared(ctx, genesis, &snapshots[0])
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -668,6 +692,7 @@ func TestLocalGCCatalogBoundedAcrossCompletedRetirements(t *testing.T) {
 		t.Fatal(closeErr)
 	}
 	manager := checkpoint.NewManager(bucket, "local", "", 1)
+	manager.SetLocalControlBinding(archive.Binding.ArchiveLocationHash, fmt.Sprintf("%x", archive.head.BindingHash))
 	unknownMetadata := fmt.Sprintf("local/snapshots/%x.json", sha256.Sum256([]byte("prepared-or-legacy")))
 	if err := bucket.Upload(ctx, unknownMetadata, strings.NewReader(`{}`)); err != nil {
 		t.Fatal(err)

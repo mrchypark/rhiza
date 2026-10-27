@@ -64,7 +64,7 @@ func TestFenceWatcherKeepsEngineAliveAcrossActualSessionOutage(t *testing.T) {
 		t.Run(fault, func(t *testing.T) {
 			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 			defer cancel()
-			socket := filepath.Join(t.TempDir(), "session.sock")
+			socket := shortTestUnixSocketPath(t, "session.sock")
 			identity := fencing.Identity{SourceClusterID: "cluster", NodeID: "node", PodUID: "pod", RunID: "run"}
 			var stopCalls atomic.Int32
 			var unavailable atomic.Bool

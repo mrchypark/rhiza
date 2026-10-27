@@ -48,6 +48,7 @@ type Node struct {
 	checkpointer              *checkpoint.AutoCheckpointer
 	localStore                *localCheckpointIdentity
 	localBackup               *recovery.LocalArchive
+	localOwner                *objectstore.LocalFilesystemOwner
 	localBackupReady          bool
 	localBackupNeedsSnapshot  bool
 	localGCContext            context.Context
@@ -2082,7 +2083,6 @@ func (n *Node) shutdownEngine(closeBucket bool) error {
 		cancel()
 	}
 	n.localBackupReady = false
-	n.localBackup = nil
 	// Existing certified decisions can be archived without a live quorum.
 	// Creating a new checkpoint here would instead require new consensus and
 	// make simultaneous or last-voter shutdown depend on peers staying alive.
@@ -2107,15 +2107,46 @@ func (n *Node) shutdownEngine(closeBucket bool) error {
 		n.material = nil
 	}
 
-	// Release lock
+	if n.localOwner != nil {
+		drainCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		if n.bucket != nil {
+			if err := n.bucket.DrainMutations(drainCtx); err != nil {
+				n.localOwner.Poison()
+				shutdownErr = errors.Join(shutdownErr, err)
+			}
+		}
+		cancel()
+		if n.localBackup != nil {
+			checkCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			resolved, err := n.localBackup.MaintenanceResolved(checkCtx)
+			cancel()
+			if err != nil || !resolved {
+				n.localOwner.Poison()
+				shutdownErr = errors.Join(shutdownErr, err, fmt.Errorf("v2 Local maintenance is unresolved"))
+			}
+		}
+	}
+	if n.bucket != nil && closeBucket {
+		if err := n.bucket.Close(); err != nil {
+			if n.localOwner != nil {
+				n.localOwner.Poison()
+			}
+			shutdownErr = errors.Join(shutdownErr, err)
+		}
+		n.bucket = nil
+	}
+	if n.localOwner != nil {
+		if err := n.localOwner.Close(30 * time.Second); err != nil {
+			shutdownErr = errors.Join(shutdownErr, err)
+		} else {
+			n.localOwner = nil
+		}
+	}
+	n.localBackup = nil
+	// Release the DataDir lock only after filesystem archive ownership drains.
 	if n.lock != nil {
 		shutdownErr = errors.Join(shutdownErr, n.lock.Release())
 		n.lock = nil
-	}
-
-	if n.bucket != nil && closeBucket {
-		shutdownErr = errors.Join(shutdownErr, n.bucket.Close())
-		n.bucket = nil
 	}
 	return shutdownErr
 }

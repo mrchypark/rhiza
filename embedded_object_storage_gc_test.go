@@ -17,6 +17,7 @@ import (
 	"time"
 
 	"github.com/mrchypark/rhiza"
+	localobj "github.com/mrchypark/rhiza/internal/objstore"
 	"github.com/mrchypark/rhiza/pkg/checkpoint"
 	"github.com/mrchypark/rhiza/pkg/recovery"
 	"github.com/thanos-io/objstore"
@@ -187,9 +188,16 @@ func TestEmbeddedObjectStorageGCUnknownHEADNonmutating(t *testing.T) {
 	}
 }
 
-func embeddedGCArchive(t *testing.T, ctx context.Context, b objstore.Bucket, cfg rhiza.Config) *recovery.LocalArchive {
+func embeddedGCArchive(t *testing.T, ctx context.Context, b objstore.Bucket, cfg rhiza.Config, owner *localobj.LocalFilesystemOwner) *recovery.LocalArchive {
 	t.Helper()
-	a, err := recovery.OpenLocalArchive(ctx, b, path.Join(cfg.ObjStorePrefix, string(cfg.ClusterID), "local/v1"))
+	prefix := path.Join(cfg.ObjStorePrefix, string(cfg.ClusterID), "local/v1")
+	var a *recovery.LocalArchive
+	var err error
+	if owner != nil {
+		a, err = recovery.OpenLocalArchiveOwned(ctx, b, prefix, owner)
+	} else {
+		a, err = recovery.OpenLocalArchive(ctx, b, prefix)
+	}
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -223,8 +231,9 @@ func TestEmbeddedObjectStorageGCPinRelease(t *testing.T) {
 	slot := embeddedAdvanceCheckpoint(h, h.original.Slot, "gc-pinned-old", &names)
 	slot = embeddedAdvanceCheckpoint(h, slot, "gc-shared-warm", &names)
 	h.close()
-	b := embeddedBucket(t, cfg)
-	a := embeddedGCArchive(t, h.ctx, b, cfg)
+	b, owner, releaseBucket := embeddedOwnedBucket(t, cfg)
+	a := embeddedGCArchive(t, h.ctx, b, cfg, owner)
+	localFilesystem := owner != nil
 	old := a.Snapshot()
 	if old == nil {
 		t.Fatal("committed snapshot missing")
@@ -234,6 +243,9 @@ func TestEmbeddedObjectStorageGCPinRelease(t *testing.T) {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() {
+		if localFilesystem {
+			return
+		}
 		if pin != nil {
 			cleanupCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 			defer cancel()
@@ -242,15 +254,24 @@ func TestEmbeddedObjectStorageGCPinRelease(t *testing.T) {
 			}
 		}
 	})
+	if localFilesystem {
+		// The pin is persisted under owner 1, then owner 1 is released before
+		// node 2 opens. This exercises a durable active lease across the owner
+		// transition without attempting an unsupported concurrent owner.
+		releaseBucket()
+	}
 	h.open(cfg)
 	for i := 0; i < cfg.CheckpointRetainCount+1; i++ {
 		slot = embeddedAdvanceCheckpoint(h, slot, fmt.Sprintf("gc-after-pin-%d", i), &names)
 	}
 	h.close()
-	if err := pin.Renew(h.ctx, 5*time.Minute); err != nil {
-		t.Fatal(err)
+	if !localFilesystem {
+		if err := pin.Renew(h.ctx, 5*time.Minute); err != nil {
+			t.Fatal(err)
+		}
 	}
-	a = embeddedGCArchive(t, h.ctx, b, cfg)
+	b, owner, releaseBucket = embeddedOwnedBucket(t, cfg)
+	a = embeddedGCArchive(t, h.ctx, b, cfg, owner)
 	// Repeated passes exercise positive 1ns grace without waiting through the
 	// production grace period.
 	for i := 0; i < 3; i++ {
@@ -342,31 +363,41 @@ func TestEmbeddedObjectStorageGCPinRelease(t *testing.T) {
 	if err != nil || len(files) != 2 {
 		t.Fatalf("pinned old root download files=%d err=%v", len(files), err)
 	}
-	if err := pin.Close(h.ctx); err != nil {
-		t.Fatal(err)
-	}
-	pin = nil
-	for i := 0; i < 3; i++ {
-		if err := a.GarbageCollect(h.ctx, cfg.CheckpointRetainCount, time.Nanosecond); err != nil {
+	if localFilesystem {
+		// The old pin's bucket was closed when owner 1 was released. Its durable
+		// lease is intentionally left to expire; Node-internal tests exercise
+		// explicit filesystem pin release while holding the managed owner.
+		pin = nil
+		releaseBucket()
+	} else {
+		if err := pin.Close(h.ctx); err != nil {
 			t.Fatal(err)
 		}
+		pin = nil
 	}
-	released := embeddedGCNames(t, cfg)
-	for _, key := range uniqueOld {
-		if released[key] {
-			t.Fatalf("uniquely old block survived pin release and GC: %s", key)
+	if !localFilesystem {
+		for i := 0; i < 3; i++ {
+			if err := a.GarbageCollect(h.ctx, cfg.CheckpointRetainCount, time.Nanosecond); err != nil {
+				t.Fatal(err)
+			}
 		}
-	}
-	for key := range oldBlocks {
-		if otherBlocks[key] && !released[key] {
-			t.Fatalf("shared native block deleted: %s", key)
+		released := embeddedGCNames(t, cfg)
+		for _, key := range uniqueOld {
+			if released[key] {
+				t.Fatalf("uniquely old block survived pin release and GC: %s", key)
+			}
 		}
-	}
-	if released[oldKey] {
-		t.Fatal("released root outside retention was not collected")
-	}
-	if len(released) >= len(protected) {
-		t.Fatalf("pin release did not reclaim objects: %d -> %d", len(protected), len(released))
+		for key := range oldBlocks {
+			if otherBlocks[key] && !released[key] {
+				t.Fatalf("shared native block deleted: %s", key)
+			}
+		}
+		if released[oldKey] {
+			t.Fatal("released root outside retention was not collected")
+		}
+		if len(released) >= len(protected) {
+			t.Fatalf("pin release did not reclaim objects: %d -> %d", len(protected), len(released))
+		}
 	}
 	if err := os.RemoveAll(cfg.DataDir); err != nil {
 		t.Fatal(err)
@@ -412,16 +443,20 @@ func TestEmbeddedObjectStorageGCUncertainDeleteGateHeld(t *testing.T) {
 	h := newEmbeddedHistoryConfig(t, false, cfg)
 	names := []string{"original"}
 	slot := embeddedAdvanceCheckpoint(h, h.original.Slot, "gc-uncertain-old", &names)
-	b := embeddedBucket(t, cfg)
 	embeddedAdvanceCheckpoint(h, slot, "gc-uncertain-new", &names)
 	h.close()
 	abandoned := []byte("owned abandoned extent, never referenced by HEAD")
 	target := path.Join(cfg.ObjStorePrefix, string(cfg.ClusterID), "local/v1/extents", fmt.Sprintf("%x", sha256.Sum256(abandoned)))
+	var fault *embeddedGCUncertainDelete
+	b, owner, releaseBucket := embeddedOwnedBucket(t, cfg, func(bucket objstore.Bucket) objstore.Bucket {
+		fault = &embeddedGCUncertainDelete{Bucket: bucket, target: target}
+		return fault
+	})
+	defer releaseBucket()
 	if err := b.Upload(h.ctx, target, bytes.NewReader(abandoned), objstore.WithIfNotExists()); err != nil {
 		t.Fatal(err)
 	}
-	fault := &embeddedGCUncertainDelete{Bucket: b, target: target}
-	a := embeddedGCArchive(t, h.ctx, fault, cfg)
+	a := embeddedGCArchive(t, h.ctx, b, cfg, owner)
 	for i := 0; i < 4 && !fault.uncertain; i++ {
 		err := a.GarbageCollect(h.ctx, 1, time.Nanosecond)
 		if err != nil && !fault.uncertain {
@@ -434,9 +469,14 @@ func TestEmbeddedObjectStorageGCUncertainDeleteGateHeld(t *testing.T) {
 	if !fault.uncertain {
 		t.Fatal("collector never attempted the abandoned extent deletion")
 	}
-	// Reopening read-only does not resolve the old owner's outstanding deletion.
-	// Test a new handle with a healthy provider, not merely the poisoned handle.
-	a = embeddedGCArchive(t, h.ctx, b, cfg)
+	// A poisoned filesystem owner cannot be replaced inside this process. Keep
+	// using the already-open archive only for refusal checks; the raw inventory
+	// below is observational and never grants recovery authority.
+	if owner == nil {
+		a = embeddedGCArchive(t, h.ctx, b, cfg, nil)
+	} else if owner.Held() {
+		t.Fatal("uncertain filesystem deletion did not poison and retain its owner")
+	}
 	current := a.Snapshot()
 	if current == nil {
 		t.Fatal("current snapshot missing")
@@ -447,7 +487,7 @@ func TestEmbeddedObjectStorageGCUncertainDeleteGateHeld(t *testing.T) {
 		Token   string `json:"token"`
 	}
 	gateKey := path.Join(cfg.ObjStorePrefix, string(cfg.ClusterID), "local/v1/local-gc-control")
-	if err := json.Unmarshal(before[gateKey], &gate); err != nil || gate.Version != 1 || gate.Token == "" {
+	if err := json.Unmarshal(before[gateKey], &gate); err != nil || gate.Version != 2 || gate.Token == "" {
 		t.Fatalf("uncertain deleter did not leave a held gate: %q err=%v", before[gateKey], err)
 	}
 	for i := 0; i < 2; i++ {
@@ -487,13 +527,19 @@ func TestEmbeddedObjectStorageGCPreparedRootPreserved(t *testing.T) {
 	names := []string{"original"}
 	embeddedAdvanceCheckpoint(h, h.original.Slot, "gc-before-prepared", &names)
 	h.close()
-	b := embeddedBucket(t, cfg)
-	a := embeddedGCArchive(t, h.ctx, b, cfg)
+	b, owner, releaseBucket := embeddedOwnedBucket(t, cfg)
+	a := embeddedGCArchive(t, h.ctx, b, cfg, owner)
 	current := a.Snapshot()
 	if current == nil {
 		t.Fatal("current snapshot missing")
 	}
 	manager := checkpoint.NewManager(b, path.Join(cfg.ObjStorePrefix, string(cfg.ClusterID), "local/v1"), "", current.Seal.ConfigID)
+	bindingData, err := json.Marshal(a.Binding)
+	if err != nil {
+		t.Fatal(err)
+	}
+	bindingHash := sha256.Sum256(bindingData)
+	manager.SetLocalControlBinding(a.Binding.ArchiveLocationHash, fmt.Sprintf("%x", bindingHash[:]))
 	files, err := manager.DownloadRootFiles(h.ctx, uint64(current.Seal.Index), current.PortableRoot, t.TempDir())
 	if err != nil {
 		t.Fatal(err)
@@ -524,6 +570,7 @@ func TestEmbeddedObjectStorageGCPreparedRootPreserved(t *testing.T) {
 			t.Fatalf("committed/prepared root %d lost: files=%d err=%v", root.index, len(files), err)
 		}
 	}
+	releaseBucket()
 	h.open(cfg)
 	h.check(names...)
 	h.close()
@@ -547,8 +594,8 @@ func TestEmbeddedObjectStorageGCDeletionScope(t *testing.T) {
 	names := []string{"original"}
 	embeddedAdvanceCheckpoint(h, h.original.Slot, "gc-scope", &names)
 	h.close()
-	b := embeddedBucket(t, cfg)
-	a := embeddedGCArchive(t, h.ctx, b, cfg)
+	b, owner, releaseBucket := embeddedOwnedBucket(t, cfg)
+	a := embeddedGCArchive(t, h.ctx, b, cfg, owner)
 	prefix := path.Join(cfg.ObjStorePrefix, string(cfg.ClusterID), "local/v1")
 	payload := []byte("owned namespace sentinel")
 	hash := fmt.Sprintf("%x", sha256.Sum256(payload))
@@ -576,7 +623,7 @@ func TestEmbeddedObjectStorageGCDeletionScope(t *testing.T) {
 	if err := a.GarbageCollect(h.ctx, 1, time.Nanosecond); err == nil || !strings.Contains(err.Error(), "unknown Local extent metadata") {
 		t.Fatalf("nested extent path must fail closed: %v", err)
 	}
-	refused := embeddedRemoteImage(t, cfg)
+	refused := embeddedReadRemoteImage(t, cfg, b, owner, false)
 	for _, key := range append(append([]string(nil), foreign...), candidate) {
 		if !bytes.Equal(refused[key], payload) {
 			t.Fatalf("refused GC changed object: %s", key)
@@ -593,7 +640,7 @@ func TestEmbeddedObjectStorageGCDeletionScope(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	image := embeddedRemoteImage(t, cfg)
+	image := embeddedReadRemoteImage(t, cfg, b, owner, false)
 	if _, remains := image[candidate]; remains {
 		t.Fatal("owned unreferenced extent was not deleted")
 	}
@@ -605,6 +652,7 @@ func TestEmbeddedObjectStorageGCDeletionScope(t *testing.T) {
 			t.Fatalf("GC changed foreign object: %s", key)
 		}
 	}
+	releaseBucket()
 	if err := os.RemoveAll(cfg.DataDir); err != nil {
 		t.Fatal(err)
 	}

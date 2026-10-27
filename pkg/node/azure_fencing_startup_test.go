@@ -7,6 +7,7 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"path/filepath"
 	"strings"
 	"sync/atomic"
@@ -46,7 +47,7 @@ func TestOpenSupervisedAzureDoesNotCreateContainerBeforeRejectedBind(t *testing.
 	previous := azure.DefaultConfig
 	azure.DefaultConfig.HTTPConfig.Transport = store.Client().Transport
 	t.Cleanup(func() { azure.DefaultConfig = previous })
-	socket := filepath.Join(t.TempDir(), "startup.sock")
+	socket := shortTestUnixSocketPath(t, "startup.sock")
 	listener, err := net.Listen("unix", socket)
 	if err != nil {
 		t.Fatal(err)
@@ -82,4 +83,22 @@ func TestOpenSupervisedAzureDoesNotCreateContainerBeforeRejectedBind(t *testing.
 	if reads.Load() == 0 || creates.Load() != 0 {
 		t.Fatalf("actual supervised Node.Open pre-bind requests: reads=%d mutations=%d", reads.Load(), creates.Load())
 	}
+}
+
+func shortTestUnixSocketPath(t *testing.T, name string) string {
+	t.Helper()
+	dir, err := os.MkdirTemp("/tmp", "rhiza-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		if err := os.RemoveAll(dir); err != nil {
+			t.Errorf("remove Unix socket directory: %v", err)
+		}
+	})
+	socket := filepath.Join(dir, name)
+	if len(socket) >= 104 {
+		t.Fatalf("Unix socket path is too long for Darwin: %d bytes", len(socket))
+	}
+	return socket
 }

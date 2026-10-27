@@ -5,18 +5,23 @@ import (
 	"context"
 	"crypto/rand"
 	"crypto/rsa"
+	"crypto/sha256"
 	"crypto/x509"
 	"encoding/base64"
+	"encoding/hex"
 	"encoding/json"
 	"encoding/pem"
+	"errors"
 	"fmt"
 	"io"
 	"io/fs"
 	"net"
 	"net/url"
 	"os"
+	"path"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -26,6 +31,7 @@ import (
 	"github.com/minio/minio-go/v7/pkg/credentials"
 	"github.com/mrchypark/rhiza"
 	localobj "github.com/mrchypark/rhiza/internal/objstore"
+	"github.com/mrchypark/rhiza/pkg/recovery"
 	thanosobj "github.com/thanos-io/objstore"
 	"google.golang.org/api/option"
 )
@@ -161,7 +167,7 @@ func embeddedStoreConfig(t *testing.T) rhiza.Config {
 
 func embeddedBucket(t *testing.T, cfg rhiza.Config) *localobj.MeteredBucket {
 	t.Helper()
-	b, err := localobj.NewBucket(localobj.Config{Provider: localobj.Provider(cfg.ObjStoreProvider), FilesystemDir: cfg.ObjStoreDir, Endpoint: cfg.ObjStoreEndpoint, Bucket: cfg.ObjStoreBucket, Region: cfg.ObjStoreRegion, Insecure: cfg.ObjStoreInsecure, AccessKey: cfg.ObjStoreAccessKey, SecretKey: cfg.ObjStoreSecretKey, AzureStorageAccount: cfg.ObjStoreAzureStorageAccount, AzureConnectionString: cfg.ObjStoreAzureConnectionString})
+	b, err := localobj.NewBucket(embeddedBucketConfig(cfg))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -173,6 +179,60 @@ func embeddedBucket(t *testing.T, cfg rhiza.Config) *localobj.MeteredBucket {
 	return b
 }
 
+func embeddedBucketConfig(cfg rhiza.Config) localobj.Config {
+	return localobj.Config{Provider: localobj.Provider(cfg.ObjStoreProvider), FilesystemDir: cfg.ObjStoreDir, Endpoint: cfg.ObjStoreEndpoint, Bucket: cfg.ObjStoreBucket, Region: cfg.ObjStoreRegion, Insecure: cfg.ObjStoreInsecure, AccessKey: cfg.ObjStoreAccessKey, SecretKey: cfg.ObjStoreSecretKey, AzureStorageAccount: cfg.ObjStoreAzureStorageAccount, AzureConnectionString: cfg.ObjStoreAzureConnectionString}
+}
+
+// embeddedOwnedBucket gives direct Local archive test access the same lifetime
+// owner used by rhiza.Open. The owner is released only after the bucket closes.
+func embeddedOwnedBucket(t *testing.T, cfg rhiza.Config, decorate ...func(thanosobj.Bucket) thanosobj.Bucket) (*localobj.MeteredBucket, *localobj.LocalFilesystemOwner, func()) {
+	t.Helper()
+	if len(decorate) > 1 {
+		t.Fatal("embeddedOwnedBucket accepts at most one bucket decorator")
+	}
+	b, err := localobj.NewBucket(embeddedBucketConfig(cfg))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var owner *localobj.LocalFilesystemOwner
+	var bucket thanosobj.Bucket = b.Bucket
+	if len(decorate) == 1 {
+		bucket = decorate[0](bucket)
+	}
+	if cfg.Local && localobj.Provider(cfg.ObjStoreProvider) == localobj.ProviderFilesystem {
+		if err := os.MkdirAll(cfg.DataDir, 0700); err != nil {
+			_ = b.Close()
+			t.Fatal(err)
+		}
+		root := cfg.ObjStoreDir
+		if root == "" {
+			root = "./objstore"
+		}
+		owner, err = localobj.AcquireLocalFilesystemOwner(root, cfg.DataDir)
+		if err != nil {
+			_ = b.Close()
+			t.Fatal(err)
+		}
+		bucket = owner.Wrap(bucket)
+	}
+	b.Bucket = bucket
+	var once sync.Once
+	var closeErr error
+	close := func() {
+		once.Do(func() {
+			closeErr = b.Close()
+			if owner != nil && owner.Held() {
+				closeErr = errors.Join(closeErr, owner.Close(5*time.Second))
+			}
+		})
+		if closeErr != nil {
+			t.Errorf("close owned fixture bucket: %v", closeErr)
+		}
+	}
+	t.Cleanup(close)
+	return b, owner, close
+}
+
 func embeddedRemoteImage(t *testing.T, cfg rhiza.Config) map[string][]byte {
 	t.Helper()
 	return embeddedRemoteImageState(t, cfg, false)
@@ -180,7 +240,17 @@ func embeddedRemoteImage(t *testing.T, cfg rhiza.Config) map[string][]byte {
 
 func embeddedRemoteImageState(t *testing.T, cfg rhiza.Config, allowHeld bool) map[string][]byte {
 	t.Helper()
+	if cfg.Local && localobj.Provider(cfg.ObjStoreProvider) == localobj.ProviderFilesystem && !allowHeld {
+		b, owner, release := embeddedOwnedBucket(t, cfg)
+		defer release()
+		return embeddedReadRemoteImage(t, cfg, b, owner, false)
+	}
 	b := embeddedBucket(t, cfg)
+	return embeddedReadRemoteImage(t, cfg, b, nil, allowHeld)
+}
+
+func embeddedReadRemoteImage(t *testing.T, cfg rhiza.Config, b thanosobj.Bucket, owner *localobj.LocalFilesystemOwner, allowHeld bool) map[string][]byte {
+	t.Helper()
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 	defer cancel()
 	for {
@@ -200,18 +270,23 @@ func embeddedRemoteImageState(t *testing.T, cfg rhiza.Config, allowHeld bool) ma
 				return closeErr
 			}
 			image[name] = data
-			if !allowHeld && strings.HasSuffix("/"+name, "/local/v1/local-gc-control") {
-				var gate struct {
-					Version uint   `json:"version"`
-					Token   string `json:"token"`
-				}
-				if err := json.Unmarshal(data, &gate); err != nil || gate.Version != 1 {
-					return fmt.Errorf("invalid maintenance authority at %s: %v", name, err)
-				}
-				busy = busy || gate.Token != ""
-			}
 			return nil
 		}, thanosobj.WithRecursiveIter())
+		if err == nil && cfg.Local {
+			controlName := path.Join(cfg.ObjStorePrefix, string(cfg.ClusterID), "local/v1/local-gc-control")
+			if embeddedHasLocalNamespace(cfg, image) {
+				if cfg.ObjStoreProvider == rhiza.ObjectStoreProviderFilesystem && !allowHeld && owner == nil {
+					err = fmt.Errorf("Local filesystem inventory requires its owner")
+				} else {
+					token, controlErr := embeddedValidateLocalControl(cfg, image, controlName, owner)
+					if controlErr != nil {
+						err = controlErr
+					} else {
+						busy = !allowHeld && token != ""
+					}
+				}
+			}
+		}
 		if busy {
 			t.Fatal("full namespace capture requires a stopped/drained owner and free gate; refusing to copy held authority")
 		}
@@ -233,20 +308,16 @@ func embeddedRemoteImageState(t *testing.T, cfg rhiza.Config, allowHeld bool) ma
 
 func embeddedReplaceRemote(t *testing.T, cfg rhiza.Config, image map[string][]byte) {
 	t.Helper()
-	for name, data := range image {
-		if !strings.HasSuffix("/"+name, "/local/v1/local-gc-control") {
-			continue
-		}
-		var gate struct {
-			Version uint   `json:"version"`
-			Token   string `json:"token"`
-		}
-		if err := json.Unmarshal(data, &gate); err != nil || gate.Version != 1 || gate.Token != "" {
-			t.Fatalf("refusing historical copy with invalid/held maintenance authority: %s", name)
+	b, owner, close := embeddedOwnedBucket(t, cfg)
+	defer close()
+	current := embeddedReadRemoteImage(t, cfg, b, owner, false)
+	controlName := path.Join(cfg.ObjStorePrefix, string(cfg.ClusterID), "local/v1/local-gc-control")
+	if embeddedHasLocalNamespace(cfg, image) {
+		token, err := embeddedValidateLocalControl(cfg, image, controlName, owner)
+		if err != nil || token != "" {
+			t.Fatalf("refusing historical copy with invalid maintenance authority: %s: %v", controlName, err)
 		}
 	}
-	current := embeddedRemoteImage(t, cfg)
-	b := embeddedBucket(t, cfg)
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 	defer cancel()
 	for name := range current {
@@ -259,6 +330,60 @@ func embeddedReplaceRemote(t *testing.T, cfg rhiza.Config, image map[string][]by
 			t.Fatal(err)
 		}
 	}
+}
+
+func embeddedHasLocalNamespace(cfg rhiza.Config, image map[string][]byte) bool {
+	prefix := path.Join(cfg.ObjStorePrefix, string(cfg.ClusterID), "local/v1") + "/"
+	for name := range image {
+		if strings.HasPrefix(name, prefix) {
+			return true
+		}
+	}
+	return false
+}
+
+func embeddedValidateLocalControl(cfg rhiza.Config, image map[string][]byte, controlName string, owner *localobj.LocalFilesystemOwner) (string, error) {
+	bindingName := path.Join(path.Dir(controlName), "BINDING")
+	bindingData, ok := image[bindingName]
+	if !ok {
+		return "", fmt.Errorf("Local maintenance binding missing at %s", bindingName)
+	}
+	var binding recovery.LocalBinding
+	bindingDecoder := json.NewDecoder(bytes.NewReader(bindingData))
+	bindingDecoder.DisallowUnknownFields()
+	if err := bindingDecoder.Decode(&binding); err != nil {
+		return "", fmt.Errorf("decode Local archive binding at %s: %w", bindingName, err)
+	}
+	if err := bindingDecoder.Decode(new(any)); err != io.EOF {
+		return "", fmt.Errorf("trailing Local archive binding data at %s", bindingName)
+	}
+	var control struct {
+		Version      uint   `json:"version"`
+		Token        string `json:"token"`
+		LocationHash string `json:"location_hash"`
+		BindingHash  string `json:"binding_hash"`
+	}
+	data := image[controlName]
+	decoder := json.NewDecoder(bytes.NewReader(data))
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(&control); err != nil {
+		return "", fmt.Errorf("decode Local maintenance control at %s: %w", controlName, err)
+	}
+	if err := decoder.Decode(new(any)); err != io.EOF {
+		return "", fmt.Errorf("trailing Local maintenance control data at %s", controlName)
+	}
+	wantBindingHash := sha256.Sum256(bindingData)
+	if binding.Version != 2 || control.Version != 2 || control.LocationHash != binding.ArchiveLocationHash || control.BindingHash != hex.EncodeToString(wantBindingHash[:]) {
+		return "", fmt.Errorf("control does not match the current archive binding at %s", controlName)
+	}
+	if cfg.Local && localobj.Provider(cfg.ObjStoreProvider) == localobj.ProviderFilesystem {
+		if owner != nil && control.LocationHash != owner.LocationHash(path.Join(cfg.ObjStorePrefix, string(cfg.ClusterID), "local/v1")) {
+			return "", fmt.Errorf("control location does not match the managed filesystem root at %s", controlName)
+		}
+	} else if control.LocationHash != "" {
+		return "", fmt.Errorf("remote Local archive has a filesystem location binding at %s", controlName)
+	}
+	return control.Token, nil
 }
 
 func embeddedDeleteBucketObjects(t *testing.T, cfg rhiza.Config) {

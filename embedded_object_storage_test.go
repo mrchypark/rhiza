@@ -19,6 +19,11 @@ func TestEmbeddedObjectStorageRepeatedTotalLoss(t *testing.T) {
 	defer cancel()
 	cfg := embeddedStoreConfig(t)
 	cfg.ClusterID = "embedded-repeated-total-loss"
+	// Each BeforeAck mutation synchronizes before its response. Keep periodic
+	// writer/GC workers idle so the read-only pre-Close snapshot below observes
+	// a stable control object without masking the acknowledged-tip assertion.
+	cfg.ObjStoreSyncInterval = time.Hour
+	cfg.ObjStoreGCInterval = 24 * time.Hour
 
 	var db *rhiza.DB
 	t.Cleanup(func() {

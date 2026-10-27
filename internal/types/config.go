@@ -25,6 +25,7 @@ type ObjectStoreDurability string
 const (
 	ObjectStoreDurabilityAsync     ObjectStoreDurability = "async"
 	ObjectStoreDurabilityBeforeAck ObjectStoreDurability = "before-ack"
+	LocalArchiveFormatVersion      uint                  = 2
 )
 
 // GraphNodePropertyIndex is node-local derived state rebuilt when a materializer is replaced.

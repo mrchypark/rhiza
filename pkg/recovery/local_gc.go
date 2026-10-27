@@ -22,13 +22,18 @@ import (
 var ErrLocalHEADAdvanced = errors.New("Local HEAD advanced")
 
 func (a *LocalArchive) localManager() *checkpoint.Manager {
-	return checkpoint.NewManager(a.bucket, a.prefix, "", a.Binding.Bootstrap.ConfigID)
+	manager := checkpoint.NewManager(a.bucket, a.prefix, "", a.Binding.Bootstrap.ConfigID)
+	manager.SetLocalControlBinding(a.Binding.ArchiveLocationHash, hex.EncodeToString(a.head.BindingHash[:]))
+	return manager
 }
 
 // GarbageCollect retains the current snapshot, latest keep committed snapshots,
 // and all active restore pins. Zero selects the default of three snapshots.
 // It never runs implicitly during read-only archive opening.
 func (a *LocalArchive) GarbageCollect(ctx context.Context, keep int, grace time.Duration) error {
+	if err := a.requireWritable(); err != nil {
+		return err
+	}
 	if keep == 0 {
 		keep = 3
 	}
@@ -40,16 +45,6 @@ func (a *LocalArchive) GarbageCollect(ctx context.Context, keep int, grace time.
 	return a.localManager().WithLocalMaintenanceContext(ctx, func(ctx context.Context) error {
 		if err := a.checkLocalHead(ctx); err != nil {
 			return err
-		}
-		head := a.head
-		if head.Version == 1 {
-			head.Version = 2
-			if head.Snapshot != nil {
-				head.Catalog = []LocalSnapshot{*head.Snapshot}
-			}
-			if err := a.publish(ctx, head); err != nil {
-				return err
-			}
 		}
 		catalog := append([]LocalSnapshot(nil), a.head.Catalog...)
 		sort.Slice(catalog, func(i, j int) bool { return catalog[i].Seal.Index > catalog[j].Seal.Index })
@@ -256,22 +251,14 @@ func (a *LocalArchive) checkLocalHead(ctx context.Context) error {
 	if sha256.Sum256(binding) != a.head.BindingHash {
 		return fmt.Errorf("local archive identity mismatch")
 	}
+	if err := a.validateLocalControl(ctx, binding); err != nil {
+		return err
+	}
 	if err := fresh.readLocalHead(ctx, binding); err != nil {
 		return err
 	}
 	if !sameObjectVersion(a.version, fresh.version) || a.headHash != fresh.headHash {
 		return fmt.Errorf("%w; reopen required", ErrLocalHEADAdvanced)
-	}
-	// A read-only Open may observe the protocol-only target before its fence
-	// is sealed. Complete that fence before any GC, pin, or archive mutation.
-	if a.head.Version == 2 {
-		pending, _, err := a.localProtocol(ctx)
-		if err != nil {
-			return err
-		}
-		if pending {
-			return a.publish(ctx, a.head)
-		}
 	}
 	return nil
 }
@@ -288,12 +275,15 @@ func (a *LocalArchive) PinView(ctx context.Context, owner string, lease time.Dur
 }
 
 func (a *LocalArchive) pinLocalView(ctx context.Context, selected *LocalSnapshot, owner string, lease time.Duration) (*LocalRestorePin, error) {
+	if err := a.requireWritable(); err != nil {
+		return nil, err
+	}
 	if owner == "" || lease <= 0 {
 		return nil, fmt.Errorf("Local restore pin requires owner and positive lease")
 	}
 	a.mu.Lock()
 	defer a.mu.Unlock()
-	pin := &LocalRestorePin{}
+	pin := &LocalRestorePin{archive: a}
 	err := a.localManager().WithLocalMaintenanceContext(ctx, func(ctx context.Context) error {
 		if err := a.checkLocalHead(ctx); err != nil {
 			return err
@@ -460,18 +450,24 @@ func (p *LocalRestorePin) Close(ctx context.Context) error {
 	if p.closed {
 		return nil
 	}
-	for _, part := range p.parts {
-		if err := part.Close(ctx); err != nil {
-			return err
-		}
+	if p.archive == nil {
+		p.closed = true
+		return nil
 	}
-	if p.key != "" {
-		if err := p.updateView(ctx, 0, true); err != nil {
-			return err
+	return p.archive.localManager().WithLocalMaintenanceContext(ctx, func(ctx context.Context) error {
+		for _, part := range p.parts {
+			if err := part.Close(ctx); err != nil {
+				return err
+			}
 		}
-	}
-	p.closed = true
-	return nil
+		if p.key != "" {
+			if err := p.updateView(ctx, 0, true); err != nil {
+				return err
+			}
+		}
+		p.closed = true
+		return nil
+	})
 }
 
 type localViewRecord struct {
