@@ -2,11 +2,9 @@ package operator
 
 import (
 	"context"
-	"crypto/hmac"
-	"crypto/sha256"
 	"encoding/base64"
-	"encoding/hex"
 	"encoding/json"
+	"fmt"
 	"io"
 	"net"
 	"net/http"
@@ -24,11 +22,31 @@ import (
 )
 
 func progressProbeResponse(req *http.Request, node string, live bool) *http.Response {
-	p := network.RecoveryProbe{Nonce: req.URL.Query().Get("nonce"), Excluded: req.URL.Query().Get("exclude"), Status: network.VoterRecoveryStatus{NodeID: node, ClusterID: "source", Quorum: live}}
-	data, _ := json.Marshal(p)
-	mac := hmac.New(sha256.New, []byte("admin"))
-	_, _ = mac.Write(data)
-	p.MAC = hex.EncodeToString(mac.Sum(nil))
+	voters := []string{"n1", "n2", "n3"}
+	configID := uint(2)
+	if node == "learner" {
+		voters = []string{"n2", "n3", "learner"}
+		configID = 3
+	}
+	wal := "wal-" + node
+	if node == "learner" {
+		wal = "learner-wal"
+	}
+	return progressProbeResponseForMembership(req, node, live, configID, voters, wal)
+}
+
+func progressProbeResponseForMembership(req *http.Request, node string, live bool, configID uint, voters []string, wal string) *http.Response {
+	status := network.VoterRecoveryStatus{
+		NodeID: node, ClusterID: "source", ConfigID: configID, Voters: append([]string(nil), voters...),
+		WALIdentity: wal, Voting: true, Quorum: live,
+		QuorumKnown: live, QuorumUnavailable: !live,
+	}
+	if live {
+		status.QuorumConfigID = configID
+		status.ReadIndexSlot = 1
+	}
+	p := network.RecoveryProbe{Nonce: req.URL.Query().Get("nonce"), Excluded: req.URL.Query().Get("exclude"), Status: status}
+	signVersionedRecoveryProbe(&p, "admin")
 	return &http.Response{StatusCode: http.StatusOK, Body: io.NopCloser(strings.NewReader(string(jsonBytes(p)))), Header: make(http.Header)}
 }
 
@@ -258,7 +276,7 @@ func TestAutomaticRecoveryProgressReplacesCommittedFailedLearner(t *testing.T) {
 		if req.Header.Get("Authorization") != "Bearer admin" {
 			t.Error("missing probe authentication")
 		}
-		return progressProbeResponse(req, id, true), nil
+		return progressProbeResponseForMembership(req, id, true, 3, []string{"n1", "n2", "learner"}, map[string]string{"n1": "wal-n1", "n2": "wal-n2"}[id]), nil
 	})}
 	fenced := 0
 	var lastFence FenceRequest
@@ -413,6 +431,10 @@ func TestAutomaticReservationRejectsUnfenceableScope(t *testing.T) {
 			for _, member := range voters {
 				state.Identities[member.ID] = FenceTarget{NodeID: string(member.ID), Pod: string(member.ID), PodUID: "pod-" + string(member.ID), WALIdentity: "wal-" + string(member.ID)}
 			}
+			voterIDs := make([]string, len(voters))
+			for i, member := range voters {
+				voterIDs[i] = string(member.ID)
+			}
 			for i := range tc.learners {
 				pod := "learner-" + strconv.Itoa(i)
 				state.Learners = append(state.Learners, learnerIncarnation{SourceClusterID: "source", OperationID: "retire-1", CredentialUID: "cred-1", Target: FenceTarget{NodeID: pod, Pod: pod, PodUID: "pod-" + pod, WALIdentity: "wal-" + pod}})
@@ -428,6 +450,30 @@ func TestAutomaticReservationRejectsUnfenceableScope(t *testing.T) {
 			}))
 			t.Cleanup(server.Close)
 			c.Kube.BaseURL, c.Kube.Client = server.URL, server.Client()
+			c.HTTP = &http.Client{Transport: escalationProbeTransport(func(req *http.Request) (*http.Response, error) {
+				if req.URL.Path != "/recovery/probe" {
+					return http.DefaultTransport.RoundTrip(req)
+				}
+				var nodeID string
+				for i, peer := range api.peers {
+					if req.URL.Host == strings.TrimPrefix(peer.URL, "http://") {
+						nodeID = voterIDs[i]
+						break
+					}
+				}
+				if nodeID == "" {
+					return nil, fmt.Errorf("unexpected recovery-probe peer %q", req.URL.Host)
+				}
+				probe := network.RecoveryProbe{
+					Nonce: req.URL.Query().Get("nonce"), Excluded: req.URL.Query().Get("exclude"),
+					Status: network.VoterRecoveryStatus{
+						NodeID: nodeID, ClusterID: "source", ConfigID: 1, Voters: append([]string(nil), voterIDs...),
+						WALIdentity: "wal-" + nodeID, Voting: true, QuorumUnavailable: true,
+					},
+				}
+				signVersionedRecoveryProbe(&probe, "admin")
+				return &http.Response{StatusCode: http.StatusOK, Body: io.NopCloser(strings.NewReader(string(jsonBytes(probe)))), Header: make(http.Header)}, nil
+			})}
 			if err := c.saveAuto(ctx, r, state, nil); err != nil {
 				t.Fatal(err)
 			}

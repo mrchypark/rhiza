@@ -2,12 +2,10 @@ package operator
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"path"
 	"time"
 
-	"github.com/mrchypark/rhiza/pkg/network"
 	"github.com/mrchypark/rhiza/pkg/quepaxa"
 	"github.com/mrchypark/rhiza/pkg/recovery"
 	"github.com/thanos-io/objstore"
@@ -39,8 +37,6 @@ func (c *Controller) assessAutomaticEscalation(ctx context.Context, r *ClusterRe
 	if err != nil {
 		return automaticEscalationStop, err
 	}
-	statuses := map[quepaxa.NodeID]network.MembershipStatus{}
-	pods := map[quepaxa.NodeID]object{}
 	fencePods := map[quepaxa.NodeID]string{}
 	for _, ref := range state.Voters {
 		fencePods[ref.NodeID] = ref.Pod
@@ -57,58 +53,89 @@ func (c *Controller) assessAutomaticEscalation(ctx context.Context, r *ClusterRe
 			fencePods[quepaxa.NodeID(intent.LearnerName)] = intent.LearnerName
 		}
 	}
+	allowedMemberships := automaticIntentMemberships(intent)
+	var quorum bool
+	probes := 0
 	for _, ref := range voters {
 		if ref.NodeID == intent.Failed {
 			continue
 		}
+		if err := ctx.Err(); err != nil {
+			return automaticEscalationWait, err
+		}
+		expected, expectedOK := state.Identities[ref.NodeID]
+		if ref.NodeID == quepaxa.NodeID(intent.LearnerName) {
+			expected = FenceTarget{NodeID: string(ref.NodeID), Pod: ref.Pod, PodUID: intent.LearnerUID, WALIdentity: intent.LearnerWAL}
+			expectedOK = intent.LearnerUID != "" && intent.LearnerWAL != ""
+		}
+		if !expectedOK || expected.NodeID != string(ref.NodeID) || expected.Pod != ref.Pod || expected.PodUID == "" || expected.WALIdentity == "" {
+			return automaticEscalationStop, c.autoStatus(ctx, r, state, "Blocked", "voter identity is missing from the generation fencing scope")
+		}
+		probes++
 		var pod object
 		err := c.Kube.Get(ctx, c.corePath("pods", ref.Pod), &pod)
 		if err != nil {
 			if apiNotFound(err) {
-				continue
+				return automaticEscalationStop, c.autoStatus(ctx, r, state, "Blocked", "voter Pod is missing from the generation fencing scope")
 			}
 			return automaticEscalationStop, err
 		}
-		if string(ref.NodeID) == intent.LearnerName && intent.LearnerUID != "" && str(nested(pod, "metadata", "uid")) != intent.LearnerUID {
-			return automaticEscalationStop, c.autoStatus(ctx, r, state, "Blocked", "learner Pod differs from the generation fencing scope")
+		if str(nested(pod, "metadata", "uid")) != expected.PodUID || str(nested(pod, "status", "podIP")) == "" {
+			return automaticEscalationStop, c.autoStatus(ctx, r, state, "Blocked", "voter Pod differs from the generation fencing scope")
 		}
-		endpoint, err := podEndpoint(pod, r.Spec.Container, "/membership/status")
+		endpoint, err := podEndpoint(pod, r.Spec.Container, "/recovery/probe")
 		if err != nil {
-			continue
+			return automaticEscalationStop, c.autoStatus(ctx, r, state, "Blocked", "voter probe endpoint is invalid")
 		}
-		status, err := c.membershipStatus(ctx, endpoint, env["RHIZA_ADMIN_TOKEN"])
-		if errors.Is(err, ErrMembershipUnauthorized) {
-			return automaticEscalationStop, err
-		}
-		if err == nil {
-			if string(ref.NodeID) == intent.LearnerName && status.NodeID == ref.NodeID && status.ClusterID == state.ActiveClusterID && intent.LearnerWAL != "" && status.WALIdentity != "" && status.WALIdentity != intent.LearnerWAL {
-				return automaticEscalationStop, c.autoStatus(ctx, r, state, "Blocked", "learner WAL differs from the generation fencing scope")
+		status, result, err := c.automaticQuorumProbe(ctx, endpoint, env["RHIZA_ADMIN_TOKEN"], state.ActiveClusterID, string(ref.NodeID), string(intent.Failed))
+		if err != nil {
+			if ctx.Err() != nil {
+				return automaticEscalationWait, ctx.Err()
 			}
-			statuses[ref.NodeID] = status
-			pods[ref.NodeID] = pod
+			return automaticEscalationStop, c.autoStatus(ctx, r, state, "Blocked", "voter recovery probe proof is invalid")
 		}
-	}
-	for id, status := range statuses {
-		if status.NodeID != id || status.ClusterID != state.ActiveClusterID {
+		var current object
+		if err := c.Kube.Get(ctx, c.corePath("pods", ref.Pod), &current); err != nil {
+			return automaticEscalationStop, c.autoStatus(ctx, r, state, "Blocked", "voter Pod disappeared during recovery probe")
+		}
+		if err := validateProbePodIncarnation(pod, current, expected); err != nil {
+			return automaticEscalationStop, c.autoStatus(ctx, r, state, "Blocked", "voter Pod changed during recovery probe")
+		}
+		if result == quorumProbeNoResponse {
 			continue
+		}
+		if status.NodeID != string(ref.NodeID) || status.ClusterID != state.ActiveClusterID || status.ConfigID == 0 || status.WALIdentity == "" {
+			return automaticEscalationStop, c.autoStatus(ctx, r, state, "Blocked", "voter recovery probe identity differs from the generation fencing scope")
+		}
+		if status.WALIdentity != expected.WALIdentity {
+			return automaticEscalationStop, c.autoStatus(ctx, r, state, "Blocked", "voter WAL identity differs from the generation fencing scope")
+		}
+		if ref.NodeID != quepaxa.NodeID(intent.LearnerName) && !status.Voting {
+			return automaticEscalationStop, c.autoStatus(ctx, r, state, "Blocked", "voter recovery probe is outside the generation fencing scope")
+		}
+		if string(ref.NodeID) == intent.LearnerName && status.WALIdentity != intent.LearnerWAL && intent.LearnerWAL != "" {
+			return automaticEscalationStop, c.autoStatus(ctx, r, state, "Blocked", "learner WAL differs from the generation fencing scope")
+		}
+		if !uniqueIDs(nodeIDs(status.Voters)) {
+			return automaticEscalationStop, c.autoStatus(ctx, r, state, "Blocked", "observed membership is invalid")
 		}
 		for _, voter := range status.Voters {
-			if _, known := fencePods[voter]; !known {
+			if _, known := fencePods[quepaxa.NodeID(voter)]; !known {
 				return automaticEscalationStop, c.autoStatus(ctx, r, state, "Blocked", "observed membership is outside the generation fencing scope")
 			}
 		}
-	}
-	quorum := false
-	// Local configurations may differ while promotion propagates. A fresh
-	// ReadIndex proves source-cluster liveness, not the earlier snapshot's config.
-	for id, status := range statuses {
-		if status.NodeID != id || status.ClusterID != state.ActiveClusterID || !status.Voting || status.ConfigID == 0 || !containsID(status.Voters, id) || !uniqueIDs(status.Voters) {
-			continue
+		statusVoters := nodeIDs(status.Voters)
+		if !automaticMembershipAllowed(statusVoters, allowedMemberships) {
+			return automaticEscalationStop, c.autoStatus(ctx, r, state, "Blocked", "observed membership differs from the active intent")
 		}
-		endpoint, err := podEndpoint(pods[id], r.Spec.Container, "/recovery/probe")
-		if err == nil && c.automaticQuorumProbe(ctx, endpoint, env["RHIZA_ADMIN_TOKEN"], state.ActiveClusterID, string(id), string(intent.Failed)) {
+		switch result {
+		case quorumProbeAvailable:
 			quorum = true
-			break
+		case quorumProbeUnavailable, quorumProbeUnknown:
+			// A completed versioned observation without a fresh positive is
+			// policy input only; it never supplies death or fencing proof.
+		default:
+			return automaticEscalationStop, c.autoStatus(ctx, r, state, "Blocked", "voter recovery probe state is invalid")
 		}
 	}
 	if quorum {
@@ -117,6 +144,12 @@ func (c *Controller) assessAutomaticEscalation(ctx context.Context, r *ClusterRe
 		}
 		intent.NoQuorumSince = time.Time{}
 		return automaticEscalationStop, c.saveAuto(ctx, r, state, version)
+	}
+	if err := ctx.Err(); err != nil {
+		return automaticEscalationWait, err
+	}
+	if probes == 0 {
+		return automaticEscalationWait, c.autoStatus(ctx, r, state, "Blocked", "no surviving voter probe was attempted")
 	}
 	// A frozen Add can itself disable ReadIndex. Give its exact retirement round
 	// one finite incident-wide window, without treating snapshots as live quorum.
@@ -174,4 +207,37 @@ func (c *Controller) assessAutomaticEscalation(ctx context.Context, r *ClusterRe
 		return automaticEscalationStop, err
 	}
 	return automaticEscalationStop, c.autoStatus(ctx, r, state, "Fencing", "online quorum lost; generation-wide fencing reserved")
+}
+
+func automaticIntentMemberships(intent *autoIntent) [][]quepaxa.NodeID {
+	base := voterPodIDs(intent.Voters)
+	allowed := [][]quepaxa.NodeID{base}
+	if intent.Failed != "" {
+		withoutFailed := make([]quepaxa.NodeID, 0, len(base))
+		for _, id := range base {
+			if id != intent.Failed {
+				withoutFailed = append(withoutFailed, id)
+			}
+		}
+		allowed = append(allowed, withoutFailed)
+		if intent.LearnerName != "" && intent.LearnerUID != "" && intent.LearnerWAL != "" {
+			learner := quepaxa.NodeID(intent.LearnerName)
+			withLearner := append(append([]quepaxa.NodeID(nil), base...), learner)
+			allowed = append(allowed, withLearner)
+			withoutFailed = append(withoutFailed, learner)
+			allowed = append(allowed, withoutFailed)
+		}
+	} else if intent.LearnerName != "" && intent.LearnerUID != "" && intent.LearnerWAL != "" {
+		allowed = append(allowed, append(append([]quepaxa.NodeID(nil), base...), quepaxa.NodeID(intent.LearnerName)))
+	}
+	return allowed
+}
+
+func automaticMembershipAllowed(observed []quepaxa.NodeID, allowed [][]quepaxa.NodeID) bool {
+	for _, candidate := range allowed {
+		if sameIDs(observed, candidate) {
+			return true
+		}
+	}
+	return false
 }

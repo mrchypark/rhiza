@@ -696,23 +696,7 @@ func (n *Node) open(ctx context.Context, enroll bool) (err error) {
 		server.SetMembershipChange(n.changeMembership)
 		server.SetMembershipAbort(n.abortMembership)
 	}
-	server.SetVoterRecoveryStatus(func(ctx context.Context) network.VoterRecoveryStatus {
-		_, _, quorumErr := core.ReadIndex(ctx)
-		archiveTip := uint64(0)
-		if archive != nil {
-			archiveTip = uint64(archive.Tip())
-		}
-		return network.VoterRecoveryStatus{
-			NodeID:       string(n.config.NodeID),
-			ClusterID:    string(n.config.ClusterID),
-			Durability:   string(n.config.ObjStoreDurability),
-			Ready:        n.ready.Load(),
-			Quorum:       quorumErr == nil,
-			CertifiedTip: uint64(core.Tip()),
-			AppliedTip:   material.Tip(),
-			ArchiveTip:   archiveTip,
-		}
-	})
+	server.SetVoterRecoveryObservation(n.voterRecoveryStatus)
 	if archive != nil {
 		server.SetRecoveryArchive(n.config.AdminToken, func(ctx context.Context) error {
 			if n.config.EnableReconfiguration && !core.IsVoter() {
@@ -1709,6 +1693,162 @@ func (n *Node) API() (*network.Server, error) {
 // Ready reports whether local startup recovery and catch-up have completed.
 // It does not prove current quorum availability.
 func (n *Node) Ready() bool { return n.ready.Load() }
+
+type recoveryMembershipSnapshot struct {
+	configID    uint
+	voters      []string
+	walIdentity string
+	voting      bool
+	pending     bool
+	abortSlot   uint64
+}
+
+type recoveryMembershipRevision struct {
+	configID  uint
+	abortSlot uint64
+}
+
+func recoveryAbortSlot(core *quepaxa.Core) uint64 {
+	if slot, _, ok := core.LastReconfigurationAbort(); ok {
+		return uint64(slot)
+	}
+	return 0
+}
+
+func (n *Node) recoveryMembershipRevisionBefore() recoveryMembershipRevision {
+	return recoveryMembershipRevision{
+		configID:  n.core.CurrentCluster().ConfigID,
+		abortSlot: recoveryAbortSlot(n.core),
+	}
+}
+
+func (n *Node) recoveryMembershipRevisionAfter() recoveryMembershipRevision {
+	abortSlot := recoveryAbortSlot(n.core)
+	return recoveryMembershipRevision{configID: n.core.CurrentCluster().ConfigID, abortSlot: abortSlot}
+}
+
+func (n *Node) recoveryMembershipSnapshot() recoveryMembershipSnapshot {
+	cluster := n.core.CurrentCluster()
+	snapshot := recoveryMembershipSnapshot{
+		configID:    cluster.ConfigID,
+		walIdentity: n.core.WALIdentity(),
+		voting:      n.core.IsVoter(),
+	}
+	for _, member := range cluster.Members {
+		snapshot.voters = append(snapshot.voters, string(member.ID))
+	}
+	_, snapshot.pending = n.core.PendingReconfiguration()
+	snapshot.abortSlot = recoveryAbortSlot(n.core)
+	return snapshot
+}
+
+func (s recoveryMembershipSnapshot) equal(other recoveryMembershipSnapshot) bool {
+	if s.configID != other.configID || s.walIdentity != other.walIdentity || s.voting != other.voting || s.pending != other.pending || s.abortSlot != other.abortSlot || len(s.voters) != len(other.voters) {
+		return false
+	}
+	for i := range s.voters {
+		if s.voters[i] != other.voters[i] {
+			return false
+		}
+	}
+	return true
+}
+
+func (s recoveryMembershipSnapshot) validFor(revision recoveryMembershipRevision, nodeID string) bool {
+	if s.configID != revision.configID || s.abortSlot != revision.abortSlot || s.configID == 0 || !s.voting || s.pending {
+		return false
+	}
+	count := 0
+	for _, voter := range s.voters {
+		if voter == nodeID {
+			count++
+		}
+	}
+	return count == 1
+}
+
+func confirmedRecoveryReadIndex(
+	ctx context.Context,
+	before recoveryMembershipSnapshot,
+	beforeRevision recoveryMembershipRevision,
+	nodeID string,
+	afterSnapshot func() recoveryMembershipSnapshot,
+	afterRevision func() recoveryMembershipRevision,
+	readIndex func(context.Context) (quepaxa.Slot, error),
+) (slot quepaxa.Slot, known, unavailable bool) {
+	if !before.validFor(beforeRevision, nodeID) {
+		return 0, false, false
+	}
+	slot, err := readIndex(ctx)
+	after := afterSnapshot()
+	afterRev := afterRevision()
+	if !after.validFor(afterRev, nodeID) || !before.equal(after) || beforeRevision != afterRev {
+		return 0, false, false
+	}
+	if ctx.Err() != nil || errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+		return 0, false, false
+	}
+	if err == nil {
+		return slot, true, false
+	}
+	if errors.Is(err, quepaxa.ErrQuorumUnavailable) {
+		return 0, false, true
+	}
+	return 0, false, false
+}
+
+// voterRecoveryStatus keeps local readiness, membership identity, and fresh
+// quorum evidence separate. A quorum result is known only if the membership
+// snapshot is stable around the read-index operation.
+func (n *Node) voterRecoveryStatus(ctx context.Context, excluded string) network.VoterRecoveryStatus {
+	archiveTip := uint64(0)
+	if n.archive != nil {
+		archiveTip = uint64(n.archive.Tip())
+	}
+	status := network.VoterRecoveryStatus{
+		NodeID:       string(n.config.NodeID),
+		ClusterID:    string(n.config.ClusterID),
+		Durability:   string(n.config.ObjStoreDurability),
+		Ready:        n.ready.Load(),
+		CertifiedTip: uint64(n.core.Tip()),
+		ArchiveTip:   archiveTip,
+	}
+	if n.material != nil {
+		status.AppliedTip = n.material.Tip()
+	}
+	beforeRevision := n.recoveryMembershipRevisionBefore()
+	before := n.recoveryMembershipSnapshot()
+	status.ConfigID = before.configID
+	status.Voters = append([]string(nil), before.voters...)
+	status.WALIdentity = before.walIdentity
+	status.Voting = before.voting
+	status.Pending = before.pending
+	status.AbortSlot = before.abortSlot
+	if excluded == status.NodeID || !before.validFor(beforeRevision, status.NodeID) {
+		return status
+	}
+
+	readIndex := func(ctx context.Context) (quepaxa.Slot, error) {
+		var slot quepaxa.Slot
+		var err error
+		if excluded == "" {
+			slot, _, err = n.core.ReadIndex(ctx)
+		} else {
+			slot, _, err = n.core.ReadIndexExcluding(ctx, quepaxa.NodeID(excluded))
+		}
+		return slot, err
+	}
+	slot, known, unavailable := confirmedRecoveryReadIndex(ctx, before, beforeRevision, status.NodeID,
+		n.recoveryMembershipSnapshot, n.recoveryMembershipRevisionAfter, readIndex)
+	status.QuorumKnown = known
+	status.QuorumUnavailable = unavailable
+	status.Quorum = known
+	if known {
+		status.QuorumConfigID = before.configID
+		status.ReadIndexSlot = uint64(slot)
+	}
+	return status
+}
 
 func quarantineSQLite(path string) error {
 	if _, err := os.Stat(path); os.IsNotExist(err) {

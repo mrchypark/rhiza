@@ -923,6 +923,11 @@ func (c *Controller) reconcileCluster(ctx context.Context, r *ClusterResource) e
 		return block(state, err.Error())
 	}
 	now := time.Now().UTC()
+	if !obs.Known {
+		// Unknown observations do not accumulate toward death or recovery. Start
+		// a fresh grace interval only after a later stable no-quorum observation.
+		state.SuspectedSince = time.Time{}
+	}
 	decision, message := DecideAutoRecovery(r.Spec.Policy, obs, now, state.SuspectedSince, state.Completions)
 	if decision == AutoHealthy {
 		state.SuspectedSince = time.Time{}
@@ -967,8 +972,21 @@ func (c *Controller) reconcileCluster(ctx context.Context, r *ClusterResource) e
 				return block(state, "certified archive is unavailable; no destructive recovery will start")
 			}
 		}
-		if failed != "" && !c.automaticSurvivingQuorum(ctx, r, state, sts, failed) {
-			return block(state, "quorum excluding the failed voter is not verified; refusing online fencing")
+		if failed != "" {
+			result, err := c.automaticSurvivingQuorum(ctx, r, state, sts, failed)
+			if err != nil {
+				return block(state, "surviving quorum proof is invalid")
+			}
+			switch result {
+			case quorumProbeAvailable:
+				// Continue only with an authenticated fresh read-index against the
+				// same membership snapshot. Existing independent fencing remains
+				// mandatory before retiring the failed identity.
+			case quorumProbeUnavailable:
+				return block(state, "quorum excluding the failed voter is unavailable; refusing online fencing")
+			default:
+				return block(state, "surviving quorum observation is unknown; refusing online fencing")
+			}
 		}
 		state.Sequence++
 		name := "auto-" + shortID(state.BindingUID+":"+fmt.Sprint(state.Sequence))
@@ -998,7 +1016,7 @@ func (c *Controller) reconcileCluster(ctx context.Context, r *ClusterResource) e
 	return c.autoStatus(ctx, r, state, string(decision), message)
 }
 
-func (c *Controller) observeAutomatic(ctx context.Context, r *ClusterResource, state *autoControl, sts object) (AutoObservation, map[quepaxa.NodeID]network.MembershipStatus, error) {
+func (c *Controller) observeAutomatic(ctx context.Context, r *ClusterResource, state *autoControl, sts object) (AutoObservation, map[quepaxa.NodeID]network.VoterRecoveryStatus, error) {
 	obs := AutoObservation{Voters: len(state.Voters)}
 	ctr, err := container(sts, r.Spec.Container)
 	if err != nil {
@@ -1025,10 +1043,11 @@ func (c *Controller) observeAutomatic(ctx context.Context, r *ClusterResource, s
 	if registered != recovery.NewMembershipRecord(state.ActiveClusterID, members, env["RHIZA_OBJSTORE_DURABILITY"]) {
 		return obs, nil, fmt.Errorf("immutable source membership differs from workload")
 	}
-	obs.Known = true
 	obs.StoreAvailable = true
 	obs.Durability = registered.Durability
-	statuses := map[quepaxa.NodeID]network.MembershipStatus{}
+	// Known describes trusted source metadata, not fresh quorum evidence.
+	obs.Known = true
+	statuses := map[quepaxa.NodeID]network.VoterRecoveryStatus{}
 	for _, ref := range state.Voters {
 		var pod object
 		err := c.Kube.Get(ctx, c.corePath("pods", ref.Pod), &pod)
@@ -1039,28 +1058,25 @@ func (c *Controller) observeAutomatic(ctx context.Context, r *ClusterResource, s
 			}
 			return obs, nil, err
 		}
-		endpoint, err := podEndpoint(pod, r.Spec.Container, "/membership/status")
+		endpoint, err := podEndpoint(pod, r.Spec.Container, "/recovery/probe")
 		if err != nil {
+			return obs, nil, err
+		}
+		status, probeState, err := c.automaticQuorumProbe(ctx, endpoint, env["RHIZA_ADMIN_TOKEN"], state.ActiveClusterID, string(ref.NodeID))
+		if err != nil {
+			return obs, nil, err
+		}
+		if probeState == quorumProbeNoResponse {
 			continue
 		}
-		status, err := c.membershipStatus(ctx, endpoint, env["RHIZA_ADMIN_TOKEN"])
-		if err != nil {
-			if errors.Is(err, ErrMembershipUnauthorized) {
-				return obs, nil, err
-			}
-			continue
-		}
-		if status.ClusterID != state.ActiveClusterID || status.NodeID != ref.NodeID || !status.Voting || status.WALIdentity == "" {
+		if status.NodeID == "" || status.ClusterID != state.ActiveClusterID || status.NodeID != string(ref.NodeID) || !status.Voting || status.WALIdentity == "" {
 			return obs, nil, fmt.Errorf("voter identity differs from active inventory")
-		}
-		if status.Pending {
-			return obs, nil, fmt.Errorf("unmanaged membership transition is pending")
 		}
 		if len(status.Voters) != len(state.Voters) {
 			return obs, nil, fmt.Errorf("membership differs from active inventory")
 		}
 		for _, voter := range state.Voters {
-			if !containsID(status.Voters, voter.NodeID) {
+			if !containsID(nodeIDs(status.Voters), voter.NodeID) {
 				return obs, nil, fmt.Errorf("membership differs from active inventory")
 			}
 		}
@@ -1074,14 +1090,18 @@ func (c *Controller) observeAutomatic(ctx context.Context, r *ClusterResource, s
 		}
 		state.Identities[ref.NodeID] = capturedFenceIdentity(FenceTarget{NodeID: string(ref.NodeID), Pod: ref.Pod, PodUID: uid, WALIdentity: status.WALIdentity}, current)
 		statuses[ref.NodeID] = status
-		endpoint, err = podEndpoint(pod, r.Spec.Container, "/recovery/probe")
-		if err != nil {
-			continue
-		}
-		if c.automaticQuorumProbe(ctx, endpoint, env["RHIZA_ADMIN_TOKEN"], state.ActiveClusterID, string(ref.NodeID)) {
+		if probeState == quorumProbeAvailable {
 			obs.QuorumVerified = true
 		}
 	}
 	obs.Reachable = len(statuses)
 	return obs, statuses, nil
+}
+
+func nodeIDs(voters []string) []quepaxa.NodeID {
+	ids := make([]quepaxa.NodeID, len(voters))
+	for i, voter := range voters {
+		ids[i] = quepaxa.NodeID(voter)
+	}
+	return ids
 }

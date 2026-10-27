@@ -109,6 +109,7 @@ type Server struct {
 	objectStats          func() (map[string]uint64, bool)
 	replicaStatus        func() ReplicaStatus
 	voterRecoveryStatus  func(context.Context) VoterRecoveryStatus
+	probeStatus          VoterRecoveryStatusFunc
 	recoveryArchiveToken string
 	membershipToken      string
 	membershipChange     func(context.Context, MembershipChange) error

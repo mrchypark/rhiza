@@ -112,24 +112,33 @@ func TestAutomaticMembershipCompletionInstallsFailedLearner(t *testing.T) {
 func automaticTargetFixture(t *testing.T, targetMode string, voters []quepaxa.Member) (context.Context, objstore.Bucket, *Resource, *operatorAPI, *Controller) {
 	t.Helper()
 	ctx, bucket, child, api, c := controllerFixtureVoters(t, "before-ack", targetMode, voters)
-	if targetMode == "async" {
-		// The shared fixture's recovery HTTP responder is fixed to before-ack;
-		// serve this candidate's actual configured target mode instead.
-		c.HTTP = &http.Client{Transport: completionOutcomeTransport(func(q *http.Request) (*http.Response, error) {
-			response, err := http.DefaultTransport.RoundTrip(q)
-			if err != nil || q.URL.Path != "/recovery/status" {
-				return response, err
-			}
-			defer response.Body.Close()
-			var peer network.VoterRecoveryStatus
-			if err := json.NewDecoder(response.Body).Decode(&peer); err != nil {
+	// Use the current signed probe contract for observation while letting the
+	// fixture's peer servers continue to handle the legacy startup status route.
+	c.HTTP = &http.Client{Transport: completionOutcomeTransport(func(q *http.Request) (*http.Response, error) {
+		if q.URL.Path == "/recovery/probe" {
+			ctr, err := container(api.sts, "rhiza")
+			if err != nil {
 				return nil, err
 			}
-			peer.Durability = targetMode
-			response.Body = io.NopCloser(bytes.NewReader(jsonBytes(peer)))
-			return response, nil
-		})}
-	}
+			env, err := c.environment(q.Context(), ctr)
+			if err != nil {
+				return nil, err
+			}
+			return completionRecoveryProbeResponse(q, api, child.Status.Target, targetMode, true, env["RHIZA_ADMIN_TOKEN"])
+		}
+		response, err := http.DefaultTransport.RoundTrip(q)
+		if err != nil || q.URL.Path != "/recovery/status" || targetMode != "async" {
+			return response, err
+		}
+		defer response.Body.Close()
+		var peer network.VoterRecoveryStatus
+		if err := json.NewDecoder(response.Body).Decode(&peer); err != nil {
+			return nil, err
+		}
+		peer.Durability = targetMode
+		response.Body = io.NopCloser(bytes.NewReader(jsonBytes(peer)))
+		return response, nil
+	})}
 	child.Spec.RecoveryID = "recovery-1"
 	child.Spec.Fence = fence(child)
 	for range 12 {
@@ -610,15 +619,7 @@ func testAutomaticCompletionOutcome(t *testing.T, mode string) {
 			if q.URL.Path != "/recovery/probe" {
 				return http.DefaultTransport.RoundTrip(q)
 			}
-			id := "n1"
-			if q.URL.Host == strings.TrimPrefix(api.peers[1].URL, "http://") {
-				id = "n2"
-			}
-			probe := network.RecoveryProbe{Excluded: q.URL.Query().Get("exclude"), Nonce: q.URL.Query().Get("nonce"), Status: network.VoterRecoveryStatus{NodeID: id, ClusterID: child.Status.Target, Quorum: !twoFailures}}
-			mac := hmac.New(sha256.New, []byte(env["RHIZA_ADMIN_TOKEN"]))
-			mac.Write(jsonBytes(probe))
-			probe.MAC = hex.EncodeToString(mac.Sum(nil))
-			return &http.Response{StatusCode: http.StatusOK, Body: io.NopCloser(bytes.NewReader(jsonBytes(probe))), Header: make(http.Header)}, nil
+			return completionRecoveryProbeResponse(q, api, child.Status.Target, targetMode, !twoFailures, env["RHIZA_ADMIN_TOKEN"])
 		})}
 		if err := c.reconcileCluster(ctx, r); err != nil {
 			t.Fatal(err)
@@ -669,3 +670,41 @@ func testAutomaticCompletionOutcome(t *testing.T, mode string) {
 type completionOutcomeTransport func(*http.Request) (*http.Response, error)
 
 func (f completionOutcomeTransport) RoundTrip(r *http.Request) (*http.Response, error) { return f(r) }
+
+func completionRecoveryProbeResponse(q *http.Request, api *operatorAPI, cluster, durability string, quorum bool, token string) (*http.Response, error) {
+	var nodeID string
+	for i, peer := range api.peers {
+		if q.URL.Host == strings.TrimPrefix(peer.URL, "http://") && i < len(api.voters) {
+			nodeID = string(api.voters[i].ID)
+			break
+		}
+	}
+	if nodeID == "" {
+		return nil, context.DeadlineExceeded
+	}
+	member, ok := api.membership[nodeID]
+	if !ok || member.ClusterID != cluster || member.WALIdentity == "" {
+		return nil, context.DeadlineExceeded
+	}
+	status := network.VoterRecoveryStatus{
+		NodeID: nodeID, ClusterID: cluster, Durability: durability, Ready: true,
+		ConfigID: member.ConfigID, WALIdentity: member.WALIdentity, Voting: member.Voting,
+		Pending: member.Pending, AbortSlot: uint64(member.AbortSlot), Quorum: quorum,
+		QuorumKnown: quorum, QuorumUnavailable: !quorum,
+	}
+	for _, voter := range member.Voters {
+		status.Voters = append(status.Voters, string(voter))
+	}
+	if quorum {
+		status.QuorumConfigID = member.ConfigID
+		status.ReadIndexSlot = 1
+	}
+	probe := network.RecoveryProbe{
+		Version: network.RecoveryProbeProtocolVersion, Excluded: q.URL.Query().Get("exclude"),
+		Nonce: q.URL.Query().Get("nonce"), Status: status,
+	}
+	mac := hmac.New(sha256.New, []byte(token))
+	mac.Write(jsonBytes(probe))
+	probe.MAC = hex.EncodeToString(mac.Sum(nil))
+	return &http.Response{StatusCode: http.StatusOK, Body: io.NopCloser(bytes.NewReader(jsonBytes(probe))), Header: make(http.Header)}, nil
+}

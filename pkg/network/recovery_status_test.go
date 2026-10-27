@@ -21,12 +21,16 @@ func TestVoterRecoveryStatusEndpoint(t *testing.T) {
 	t.Cleanup(func() { _ = material.Close() })
 	server := NewServer(core, material, "cluster-a", true, nil)
 	t.Cleanup(server.Close)
-	server.SetVoterRecoveryStatus(func(ctx context.Context) VoterRecoveryStatus {
+	server.SetVoterRecoveryObservation(func(ctx context.Context, excluded string) VoterRecoveryStatus {
+		if excluded != "" {
+			t.Fatalf("unexpected excluded voter %q", excluded)
+		}
 		_, _, err := core.ReadIndex(ctx)
 		return VoterRecoveryStatus{
 			NodeID: "n1", ClusterID: "cluster-a", Durability: "before-ack",
-			Ready: true, Quorum: err == nil, CertifiedTip: uint64(core.Tip()),
-			AppliedTip: material.Tip(), ArchiveTip: 0,
+			Ready: true, ConfigID: 1, Voters: []string{"n1"}, WALIdentity: core.WALIdentity(), Voting: true,
+			Quorum: err == nil, QuorumKnown: err == nil, QuorumConfigID: 1,
+			CertifiedTip: uint64(core.Tip()), AppliedTip: material.Tip(), ArchiveTip: 0,
 		}
 	})
 
@@ -36,11 +40,21 @@ func TestVoterRecoveryStatusEndpoint(t *testing.T) {
 		t.Fatalf("status=%d body=%s", response.Code, response.Body.String())
 	}
 	var status VoterRecoveryStatus
-	if err := json.NewDecoder(response.Body).Decode(&status); err != nil {
+	body := response.Body.Bytes()
+	if err := json.Unmarshal(body, &status); err != nil {
 		t.Fatal(err)
 	}
 	if status.NodeID != "n1" || status.ClusterID != "cluster-a" || status.Durability != "before-ack" || !status.Ready || !status.Quorum || status.ArchiveTip != 0 {
 		t.Fatalf("status=%+v", status)
+	}
+	var public map[string]json.RawMessage
+	if err := json.Unmarshal(body, &public); err != nil {
+		t.Fatal(err)
+	}
+	for _, key := range []string{"wal_identity", "voters", "config_id", "quorum_known"} {
+		if _, ok := public[key]; ok {
+			t.Fatalf("unauthenticated status leaked %q: %s", key, response.Body.String())
+		}
 	}
 }
 

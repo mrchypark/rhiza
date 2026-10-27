@@ -17,19 +17,42 @@ const (
 // VoterRecoveryStatus reports the read-only facts an operator needs to assess
 // voter recovery. It does not grant recovery or fencing authority.
 type VoterRecoveryStatus struct {
-	NodeID       string `json:"node_id"`
-	ClusterID    string `json:"cluster_id"`
-	Durability   string `json:"durability"`
-	Ready        bool   `json:"ready"`
-	Quorum       bool   `json:"quorum"`
-	CertifiedTip uint64 `json:"certified_tip"`
-	AppliedTip   uint64 `json:"applied_tip"`
-	ArchiveTip   uint64 `json:"archive_tip"`
+	NodeID            string   `json:"node_id"`
+	ClusterID         string   `json:"cluster_id"`
+	Durability        string   `json:"durability"`
+	Ready             bool     `json:"ready"`
+	ConfigID          uint     `json:"config_id"`
+	Voters            []string `json:"voters"`
+	WALIdentity       string   `json:"wal_identity"`
+	Voting            bool     `json:"voting"`
+	Pending           bool     `json:"pending"`
+	AbortSlot         uint64   `json:"abort_slot"`
+	Quorum            bool     `json:"quorum"`
+	QuorumKnown       bool     `json:"quorum_known"`
+	QuorumUnavailable bool     `json:"quorum_unavailable"`
+	QuorumConfigID    uint     `json:"quorum_config_id"`
+	ReadIndexSlot     uint64   `json:"read_index_slot"`
+	CertifiedTip      uint64   `json:"certified_tip"`
+	AppliedTip        uint64   `json:"applied_tip"`
+	ArchiveTip        uint64   `json:"archive_tip"`
 }
 
-// SetVoterRecoveryStatus installs the voter-only recovery status source.
+// VoterRecoveryStatusFunc reports one membership snapshot and a fresh
+// read-index result against that snapshot. Excluded is empty for the normal
+// quorum or names the voter to exclude for a recovery-survivor probe.
+type VoterRecoveryStatusFunc func(context.Context, string) VoterRecoveryStatus
+
+// SetVoterRecoveryStatus installs the legacy voter status source.
 func (s *Server) SetVoterRecoveryStatus(status func(context.Context) VoterRecoveryStatus) {
 	s.voterRecoveryStatus = status
+	s.probeStatus = nil
+}
+
+// SetVoterRecoveryObservation installs a coherent membership/quorum source for
+// authenticated recovery probes.
+func (s *Server) SetVoterRecoveryObservation(status VoterRecoveryStatusFunc) {
+	s.probeStatus = status
+	s.voterRecoveryStatus = nil
 }
 
 // SetRecoveryArchive installs the authenticated operation that publishes the
@@ -44,7 +67,7 @@ func (s *Server) handleVoterRecoveryStatus(w http.ResponseWriter, r *http.Reques
 		writeMethodNotAllowed(w, http.MethodGet)
 		return
 	}
-	if s.voterRecoveryStatus == nil {
+	if s.voterRecoveryStatus == nil && s.probeStatus == nil {
 		writeHTTPError(w, http.StatusNotFound, "not_a_voter", "not a voter")
 		return
 	}
@@ -57,7 +80,25 @@ func (s *Server) handleVoterRecoveryStatus(w http.ResponseWriter, r *http.Reques
 	}
 	defer release()
 	w.Header().Set("Content-Type", "application/json")
-	_ = json.NewEncoder(w).Encode(s.voterRecoveryStatus(ctx))
+	var status VoterRecoveryStatus
+	if s.probeStatus != nil {
+		status = s.probeStatus(ctx, "")
+	} else {
+		status = s.voterRecoveryStatus(ctx)
+	}
+	// Preserve the legacy unauthenticated endpoint's limited response. The new
+	// membership and WAL identity fields are available only through the
+	// authenticated, challenge-bound recovery probe.
+	_ = json.NewEncoder(w).Encode(struct {
+		NodeID       string `json:"node_id"`
+		ClusterID    string `json:"cluster_id"`
+		Durability   string `json:"durability"`
+		Ready        bool   `json:"ready"`
+		Quorum       bool   `json:"quorum"`
+		CertifiedTip uint64 `json:"certified_tip"`
+		AppliedTip   uint64 `json:"applied_tip"`
+		ArchiveTip   uint64 `json:"archive_tip"`
+	}{status.NodeID, status.ClusterID, status.Durability, status.Ready, status.Quorum, status.CertifiedTip, status.AppliedTip, status.ArchiveTip})
 }
 
 func (s *Server) handleRecoveryArchive(w http.ResponseWriter, r *http.Request) {

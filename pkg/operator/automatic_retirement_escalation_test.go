@@ -90,12 +90,26 @@ func newRetirementEscalationFixture(t *testing.T) *retirementEscalationFixture {
 	c.HTTP = &http.Client{Transport: escalationProbeTransport(func(q *http.Request) (*http.Response, error) {
 		if q.URL.Path == "/recovery/probe" {
 			id := "n1"
-			if q.URL.Host == strings.TrimPrefix(api.peers[1].URL, "http://") {
-				id = "n2"
+			if api.learner != nil && q.URL.Host == strings.TrimPrefix(api.learner.URL, "http://") {
+				id = "learner"
+			} else {
+				for i, peer := range api.peers {
+					if q.URL.Host == strings.TrimPrefix(peer.URL, "http://") {
+						id = []string{"n1", "n2", "n3"}[i]
+						break
+					}
+				}
 			}
 			api.mu.Lock()
 			pending := api.membership[id].Pending
+			walIdentity := api.membership[id].WALIdentity
 			api.mu.Unlock()
+			if id == "learner" {
+				if walIdentity == "" {
+					walIdentity = strings.Repeat("a", 64)
+				}
+				return progressProbeResponseForMembership(q, id, f.live && !pending, 3, []string{"n1", "n2", "learner"}, walIdentity), nil
+			}
 			return progressProbeResponse(q, id, f.live && !pending), nil
 		}
 		if !f.live && (q.URL.Path == "/membership/abort" || q.URL.Path == "/membership/change") {
@@ -137,6 +151,9 @@ func (f *retirementEscalationFixture) advance(t *testing.T) *autoControl {
 
 func TestAutomaticRetirementEscalationPendingAddReachesAbortBeforeFence(t *testing.T) {
 	f := newRetirementEscalationFixture(t)
+	// The candidate is unreachable to the probe but its frozen Pod UID/IP must
+	// remain observable while the test exercises retirement policy.
+	f.api.replacement = f.learnerPod
 	state := f.advance(t)
 	if !state.Intent.Aborting || state.Intent.RetirementSince.IsZero() || len(f.fences) != 0 {
 		t.Fatalf("pending Add probe failure starved retirement reservation: %+v fences=%d", state.Intent, len(f.fences))
@@ -149,7 +166,7 @@ func TestAutomaticRetirementEscalationPendingAddReachesAbortBeforeFence(t *testi
 		}
 	}
 	if !f.child.Spec.Membership.AbortAddition || !state.Intent.Aborting {
-		t.Fatalf("abort revision was starved by unavailable ReadIndex: %+v child=%+v", state.Intent, f.child.Spec.Membership)
+		t.Fatalf("abort revision was starved by unavailable ReadIndex: %+v child=%+v clusterStatus=%+v", state.Intent, f.child.Spec.Membership, f.r.Status)
 	}
 	if err := f.c.reconcile(t.Context(), f.child); err != nil {
 		t.Fatal(err)
@@ -191,6 +208,9 @@ func TestAutomaticRetirementEscalationPendingAddReachesAbortBeforeFence(t *testi
 
 func TestAutomaticRetirementEscalationRealQuorumLossRemainsBounded(t *testing.T) {
 	f := newRetirementEscalationFixture(t)
+	// Keep the bound candidate Pod observable; this case tests quorum loss, not
+	// disappearance or recreation of the candidate incarnation.
+	f.api.replacement = f.learnerPod
 	f.live = false
 	state := f.advance(t)
 	if !state.Intent.Aborting {
@@ -203,7 +223,7 @@ func TestAutomaticRetirementEscalationRealQuorumLossRemainsBounded(t *testing.T)
 		}
 	}
 	if !f.child.Spec.Membership.AbortAddition {
-		t.Fatal("finite retirement window did not submit abort")
+		t.Fatalf("finite retirement window did not submit abort: clusterStatus=%+v", f.r.Status)
 	}
 	if err := f.c.reconcile(t.Context(), f.child); err != nil {
 		t.Fatal(err)
