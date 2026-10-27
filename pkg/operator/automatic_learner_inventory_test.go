@@ -4,6 +4,7 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -123,7 +124,22 @@ func TestRetiredLearnerSurvivesRotationAndGenerationRequest(t *testing.T) {
 	for _, neverBound := range []bool{false, true} {
 		t.Run(map[bool]string{false: "bound", true: "never-bound"}[neverBound], func(t *testing.T) {
 			f := newRetirementEscalationFixture(t)
+			// The replacement learner has a new Pod name after rotation. Serve
+			// that exact incarnation from this fixture instead of accidentally
+			// returning 404 for the controller's Pod identity check.
+			baseTransport := f.api.server.Client().Transport
+			f.c.Kube.Client = &http.Client{Transport: learnerPodLookupTransport{
+				base: baseTransport,
+				name: "recover-learner-1",
+				uid:  "next-uid",
+				pod:  f.learnerPod,
+			}}
 			state, version := f.load(t)
+			if neverBound {
+				// This scenario models a retired learner that never acquired a
+				// WAL identity. The newly rotated learner below is still bound.
+				state.Intent.LearnerWAL = ""
+			}
 			state.Intent.Aborting = true
 			f.child.Spec.Membership.AbortAddition = true
 			f.child.Spec.Membership.ReplacementPod = "learner"
@@ -140,9 +156,6 @@ func TestRetiredLearnerSurvivesRotationAndGenerationRequest(t *testing.T) {
 			state, version = f.load(t)
 			state.Intent.LearnerUID = "next-uid"
 			state.Intent.LearnerWAL = strings.Repeat("c", 64)
-			if neverBound {
-				state.Intent.LearnerWAL = ""
-			}
 			state.Intent.LearnerMissingSince = time.Now()
 			state.Intent.NoQuorumSince = time.Now().Add(-time.Hour)
 			next := learnerIncarnation{SourceClusterID: "source", OperationID: "recover", Target: FenceTarget{NodeID: state.Intent.LearnerName, Pod: state.Intent.LearnerName, PodUID: "next-uid", WALIdentity: state.Intent.LearnerWAL}}
@@ -152,20 +165,57 @@ func TestRetiredLearnerSurvivesRotationAndGenerationRequest(t *testing.T) {
 			if err := f.c.saveAuto(t.Context(), f.r, state, version); err != nil {
 				t.Fatal(err)
 			}
+			f.c.HTTP = &http.Client{Transport: escalationProbeTransport(func(q *http.Request) (*http.Response, error) {
+				if q.URL.Path == "/recovery/probe" {
+					node := "n1"
+					wal := "wal-n1"
+					configID := uint(2)
+					voters := []string{"n1", "n2", "n3"}
+					if f.api.learner != nil && q.URL.Host == strings.TrimPrefix(f.api.learner.URL, "http://") {
+						node, wal = state.Intent.LearnerName, state.Intent.LearnerWAL
+						configID = 3
+						voters = append(voters, node)
+					} else {
+						for i, peer := range f.api.peers {
+							if q.URL.Host == strings.TrimPrefix(peer.URL, "http://") {
+								node = []string{"n1", "n2", "n3"}[i]
+								wal = "wal-" + node
+								break
+							}
+						}
+					}
+					return progressProbeResponseForMembership(q, node, false, configID, voters, wal), nil
+				}
+				if q.URL.Path == "/membership/abort" || q.URL.Path == "/membership/change" {
+					return &http.Response{StatusCode: http.StatusServiceUnavailable, Body: http.NoBody, Header: make(http.Header)}, nil
+				}
+				return http.DefaultTransport.RoundTrip(q)
+			})}
 			f.live = false
 			state = f.advance(t)
 			if state.Intent.Request.Scope != ScopeGeneration {
-				t.Fatalf("no escalation: %+v", state.Intent)
+				t.Fatalf("no escalation: %+v status=%+v", state.Intent, f.r.Status)
 			}
 			found := map[string]bool{}
+			currentWAL := ""
 			for _, target := range state.Intent.Request.Targets {
 				found[target.PodUID] = true
+				if target.PodUID == "next-uid" {
+					currentWAL = target.WALIdentity
+				}
 			}
 			if !found["learner-uid"] || !found["next-uid"] {
 				t.Fatalf("generation lost retired/current learner: %+v", state.Intent.Request)
 			}
 			if len(state.Learners) != 2 || state.Learners[0].OperationID != "recover" {
 				t.Fatal("new generation rewrote creation authority")
+			}
+			wantRetiredWAL := strings.Repeat("a", 64)
+			if neverBound {
+				wantRetiredWAL = ""
+			}
+			if state.Learners[0].Target.WALIdentity != wantRetiredWAL || currentWAL != strings.Repeat("c", 64) {
+				t.Fatalf("rotation changed learner WAL history: retired=%q current=%q", state.Learners[0].Target.WALIdentity, currentWAL)
 			}
 			// Continue the actual newly reserved request through full proof and Stopping.
 			ctx, _, recovery, api, c := controllerFixture(t, "before-ack", "before-ack")
@@ -197,11 +247,17 @@ func TestRetiredLearnerSurvivesRotationAndGenerationRequest(t *testing.T) {
 				t.Fatal(err)
 			}
 			retiredStop := *ledger.Ledger.Runs["run-learner"].Stop
-			if err := ledger.Ledger.RecordDrain(fencing.DrainReceipt{Request: retiredStop, WritersJoined: true}); err != nil {
-				t.Fatal(err)
-			}
-			if err := ledger.Ledger.RecordExit(retiredStop); err != nil {
-				t.Fatal(err)
+			if ledger.Ledger.Runs["run-learner"].Identity.WALIdentity == "" {
+				if err := ledger.Ledger.RecordNeverBoundExit(retiredStop); err != nil {
+					t.Fatal(err)
+				}
+			} else {
+				if err := ledger.Ledger.RecordDrain(fencing.DrainReceipt{Request: retiredStop, WritersJoined: true}); err != nil {
+					t.Fatal(err)
+				}
+				if err := ledger.Ledger.RecordExit(retiredStop); err != nil {
+					t.Fatal(err)
+				}
 			}
 			if err := ledger.Ledger.CloseNodes(request.OperationID, hash, nil); err != nil {
 				t.Fatal(err)
@@ -329,6 +385,39 @@ func TestRetiredLearnerSurvivesRotationAndGenerationRequest(t *testing.T) {
 			}
 		})
 	}
+}
+
+type learnerPodLookupTransport struct {
+	base http.RoundTripper
+	name string
+	uid  string
+	pod  object
+}
+
+func (t learnerPodLookupTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	if req.Method == http.MethodGet && strings.HasSuffix(req.URL.Path, "/pods/"+t.name) {
+		pod := object{}
+		for key, value := range t.pod {
+			pod[key] = value
+		}
+		metadata := object{}
+		for key, value := range asObject(t.pod["metadata"]) {
+			metadata[key] = value
+		}
+		metadata["name"], metadata["uid"] = t.name, t.uid
+		pod["metadata"] = metadata
+		body, err := json.Marshal(pod)
+		if err != nil {
+			return nil, err
+		}
+		return &http.Response{
+			StatusCode: http.StatusOK,
+			Header:     http.Header{"Content-Type": []string{"application/json"}},
+			Body:       io.NopCloser(strings.NewReader(string(body))),
+			Request:    req,
+		}, nil
+	}
+	return t.base.RoundTrip(req)
 }
 
 func TestLearnerCleanupLedgerReadIsInOperatorRBAC(t *testing.T) {
