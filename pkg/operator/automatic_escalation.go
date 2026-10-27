@@ -77,7 +77,10 @@ func (c *Controller) assessAutomaticEscalation(ctx context.Context, r *ClusterRe
 		err := c.Kube.Get(ctx, c.corePath("pods", ref.Pod), &pod)
 		if err != nil {
 			if apiNotFound(err) {
-				return automaticEscalationStop, c.autoStatus(ctx, r, state, "Blocked", "voter Pod is missing from the generation fencing scope")
+				// A captured but currently absent Pod cannot provide a quorum
+				// observation. Keep its durable target in the eventual closure
+				// inventory; absence is no response, never termination proof.
+				continue
 			}
 			return automaticEscalationStop, err
 		}
@@ -97,6 +100,12 @@ func (c *Controller) assessAutomaticEscalation(ctx context.Context, r *ClusterRe
 		}
 		var current object
 		if err := c.Kube.Get(ctx, c.corePath("pods", ref.Pod), &current); err != nil {
+			if apiNotFound(err) {
+				// The signed response cannot be tied to a Pod still present at
+				// verification time, so discard it as no response. Identity
+				// changes for a present Pod remain a hard block below.
+				continue
+			}
 			return automaticEscalationStop, c.autoStatus(ctx, r, state, "Blocked", "voter Pod disappeared during recovery probe")
 		}
 		if err := validateProbePodIncarnation(pod, current, expected); err != nil {

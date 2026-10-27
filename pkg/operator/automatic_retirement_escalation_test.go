@@ -206,6 +206,199 @@ func TestAutomaticRetirementEscalationPendingAddReachesAbortBeforeFence(t *testi
 	}
 }
 
+func TestAutomaticRetirementMissingPendingAddAbortsThenRetries(t *testing.T) {
+	f := newRetirementEscalationFixture(t)
+	f.live = false
+	f.api.replacement = nil // The captured learner UID/WAL remains; its Pod is gone.
+	for _, id := range []string{"n1", "n2"} {
+		status := f.api.membership[id]
+		status.Pending = true
+		f.api.membership[id] = status
+	}
+	containerSpec, err := container(f.api.sts, "rhiza")
+	if err != nil {
+		t.Fatal(err)
+	}
+	containerSpec["ports"] = []any{
+		object{"name": "http", "containerPort": float64(8080)},
+		object{"name": "peer-quic", "containerPort": float64(9090), "protocol": "UDP"},
+	}
+	state, version := f.load(t)
+	if state.Intent.Aborting || state.Intent.LearnerUID != "learner-uid" || state.Intent.LearnerWAL != strings.Repeat("a", 64) || state.Intent.LearnerName != "learner" {
+		t.Fatalf("fixture must start with a bound learner and no pre-injected abort: %+v", state.Intent)
+	}
+	if f.child.Spec.Membership.AbortAddition || f.child.Status.Membership == nil || f.child.Status.Membership.Add == nil {
+		t.Fatalf("fixture must start with an outstanding Add request: spec=%+v status=%+v", f.child.Spec.Membership, f.child.Status.Membership)
+	}
+	add := f.child.Status.Membership.Add
+	if add.ExpectedConfigID != 2 || add.ExpectedAbortSlot != 0 || add.OperationID == "" {
+		t.Fatalf("fixture must retain the exact pending Add identity: %+v", add)
+	}
+	state.Intent.LearnerMissingSince = time.Time{}
+	state.Intent.RetirementSince = time.Time{}
+	state.Intent.NoQuorumSince = time.Time{}
+	state.Intent.Policy.FailureGraceSeconds = 1
+	if err := f.c.saveAuto(t.Context(), f.r, state, version); err != nil {
+		t.Fatal(err)
+	}
+	f.fencePending = true
+
+	var candidate = "learner"
+	var candidatePod, candidateSecret, candidateService object
+	podCreates := 0
+	server := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, q *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch {
+		case q.URL.Path == f.c.resourcePath("recover") && q.Method == http.MethodGet:
+			_ = json.NewEncoder(w).Encode(f.child)
+			return
+		case q.URL.Path == f.c.resourcePath("recover") && q.Method == http.MethodPut:
+			if err := json.NewDecoder(q.Body).Decode(f.child); err != nil {
+				t.Errorf("decode recovery update: %v", err)
+				w.WriteHeader(http.StatusBadRequest)
+				return
+			}
+			_ = json.NewEncoder(w).Encode(f.child)
+			return
+		case q.URL.Path == f.c.resourcePath("recover")+"/status" && q.Method == http.MethodPut:
+			if err := json.NewDecoder(q.Body).Decode(f.child); err != nil {
+				t.Errorf("decode recovery status: %v", err)
+				w.WriteHeader(http.StatusBadRequest)
+				return
+			}
+			_ = json.NewEncoder(w).Encode(f.child)
+			return
+		case q.URL.Path == f.c.clusterPath("cluster")+"/status" && q.Method == http.MethodPut:
+			_ = json.NewEncoder(w).Encode(f.r)
+			return
+		case q.URL.Path == f.c.corePath("pods", candidate) && q.Method == http.MethodGet:
+			if candidatePod == nil {
+				w.WriteHeader(http.StatusNotFound)
+				return
+			}
+			_ = json.NewEncoder(w).Encode(candidatePod)
+			return
+		case q.URL.Path == f.c.corePath("pods", "") && q.Method == http.MethodPost:
+			if err := json.NewDecoder(q.Body).Decode(&candidatePod); err != nil {
+				t.Errorf("decode learner Pod: %v", err)
+				w.WriteHeader(http.StatusBadRequest)
+				return
+			}
+			asObject(candidatePod["metadata"])["uid"] = "retry-learner-uid"
+			candidatePod["status"] = object{"podIP": "127.0.0.8"}
+			podCreates++
+			_ = json.NewEncoder(w).Encode(candidatePod)
+			return
+		case q.URL.Path == f.c.corePath("secrets", candidate+"-credentials") && q.Method == http.MethodGet:
+			if candidateSecret == nil {
+				w.WriteHeader(http.StatusNotFound)
+				return
+			}
+			_ = json.NewEncoder(w).Encode(candidateSecret)
+			return
+		case q.URL.Path == f.c.corePath("secrets", "") && q.Method == http.MethodPost:
+			if err := json.NewDecoder(q.Body).Decode(&candidateSecret); err != nil {
+				t.Errorf("decode learner Secret: %v", err)
+				w.WriteHeader(http.StatusBadRequest)
+				return
+			}
+			asObject(candidateSecret["metadata"])["uid"] = "retry-learner-secret-uid"
+			_ = json.NewEncoder(w).Encode(candidateSecret)
+			return
+		case q.URL.Path == f.c.corePath("services", candidate) && q.Method == http.MethodGet:
+			if candidateService == nil {
+				w.WriteHeader(http.StatusNotFound)
+				return
+			}
+			_ = json.NewEncoder(w).Encode(candidateService)
+			return
+		case q.URL.Path == f.c.corePath("services", "") && q.Method == http.MethodPost:
+			if err := json.NewDecoder(q.Body).Decode(&candidateService); err != nil {
+				t.Errorf("decode learner Service: %v", err)
+				w.WriteHeader(http.StatusBadRequest)
+				return
+			}
+			_ = json.NewEncoder(w).Encode(candidateService)
+			return
+		default:
+			f.api.serve(w, q)
+		}
+	}))
+	t.Cleanup(server.Close)
+	f.c.Kube.BaseURL, f.c.Kube.Client = server.URL, server.Client()
+
+	deadline := time.Now().Add(5 * time.Second)
+	for !f.child.Spec.Membership.AbortAddition {
+		state = f.advance(t)
+		if f.child.Spec.Membership.AbortAddition {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("actual advanceAutomatic never submitted the abort revision: intent=%+v child=%+v cluster=%+v", state.Intent, f.child.Spec.Membership, f.r.Status)
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	if !state.Intent.Aborting || len(f.fences) != 0 || podCreates != 0 || state.Intent.LearnerUID != "learner-uid" || state.Intent.LearnerWAL != strings.Repeat("a", 64) {
+		t.Fatalf("abort revision escaped before preserving the captured learner or before its fence: intent=%+v fences=%+v podCreates=%d", state.Intent, f.fences, podCreates)
+	}
+	childUID := str(f.child.Metadata["uid"])
+
+	// The pending Add cannot be acknowledged while both survivors still report
+	// Pending. Once the test authority accepts the same abort, the child records
+	// the terminal abort without requiring the deleted candidate Pod.
+	if err := f.c.reconcile(t.Context(), f.child); err != nil {
+		t.Fatal(err)
+	}
+	if f.child.Status.Membership.Phase != "Aborting" || len(f.api.aborts) != 0 {
+		t.Fatalf("pending Add was treated as aborted without survivor acknowledgement: %+v aborts=%d", f.child.Status.Membership, len(f.api.aborts))
+	}
+	f.live = true
+	// Keep the live survivor quorum's Pending bit set until its authority has
+	// accepted the exact abort request. Pending is not evidence that the add
+	// was already aborted.
+	if err := f.c.reconcile(t.Context(), f.child); err != nil {
+		t.Fatal(err)
+	}
+	if f.child.Status.Membership.Phase != "Aborted" || len(f.api.aborts) != 1 {
+		t.Fatalf("survivor authority did not acknowledge the abort: %+v aborts=%d", f.child.Status.Membership, len(f.api.aborts))
+	}
+	abort := f.api.aborts[0]
+	if abort.OperationID != add.OperationID || abort.ClusterID != f.child.Spec.SourceClusterID || abort.ExpectedConfigID != 2 || abort.ExpectedConfigID != add.ExpectedConfigID || abort.ExpectedAbortSlot != 0 || abort.ExpectedAbortSlot != add.ExpectedAbortSlot {
+		t.Fatalf("abort did not target the exact pending Add operation: abort=%+v add=%+v", abort, add)
+	}
+	for _, id := range []string{"n1", "n2"} {
+		status := f.api.membership[id]
+		if !status.Pending {
+			t.Fatalf("fixture lost Pending before accepted abort response for %s: %+v", id, status)
+		}
+		status.Pending = false
+		status.AbortSlot = 1
+		f.api.membership[id] = status
+	}
+
+	// A missing independent learner fence proof must retain the exact target and
+	// must not create a replacement under a new identity.
+	state = f.advance(t)
+	if !state.Intent.Aborting || state.Intent.LearnerName != "learner" || state.Intent.LearnerUID != "learner-uid" || state.Intent.LearnerWAL != strings.Repeat("a", 64) || len(f.fences) != 1 || podCreates != 0 || str(f.child.Metadata["uid"]) != childUID {
+		t.Fatalf("fence-pending state rotated/created a learner or lost its exact target: intent=%+v fences=%+v podCreates=%d childUID=%q", state.Intent, f.fences, podCreates, str(f.child.Metadata["uid"]))
+	}
+	request := f.fences[0]
+	if request.Scope != ScopeVoter || len(request.Targets) != 1 || request.Targets[0] != (FenceTarget{NodeID: "learner", Pod: "learner", PodUID: "learner-uid", WALIdentity: strings.Repeat("a", 64)}) {
+		t.Fatalf("retirement fence did not retain the captured UID/WAL: %+v", request)
+	}
+
+	f.fencePending = false
+	state = f.advance(t)
+	if state.Intent.Aborting || state.Intent.LearnerAttempt != 1 || state.Intent.LearnerName == "learner" || state.Intent.LearnerUID != "" || len(state.Learners) != 1 || state.Learners[0].Target.PodUID != "learner-uid" || state.Learners[0].Target.WALIdentity != strings.Repeat("a", 64) {
+		t.Fatalf("verified retirement proof did not preserve old history and reserve a fresh learner: intent=%+v learners=%+v", state.Intent, state.Learners)
+	}
+	candidate = state.Intent.LearnerName
+	state = f.advance(t)
+	if podCreates != 1 || candidatePod == nil || str(nested(candidatePod, "metadata", "name")) != candidate || state.Intent.LearnerUID != "retry-learner-uid" || state.Intent.LearnerWAL != "" || len(state.Learners) != 2 || state.Learners[0].Target.PodUID != "learner-uid" || state.Learners[1].Target.PodUID != "retry-learner-uid" {
+		t.Fatalf("fresh automatic retry did not create/journal a new UID while retaining the retired target: candidate=%q pod=%+v intent=%+v learners=%+v creates=%d", candidate, candidatePod, state.Intent, state.Learners, podCreates)
+	}
+}
+
 func TestAutomaticRetirementEscalationRealQuorumLossRemainsBounded(t *testing.T) {
 	f := newRetirementEscalationFixture(t)
 	// Keep the bound candidate Pod observable; this case tests quorum loss, not

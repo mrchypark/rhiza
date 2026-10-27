@@ -151,24 +151,27 @@ func TestAutomaticSurvivingQuorumBindsCapturedIncarnation(t *testing.T) {
 
 func TestAutomaticEscalationRequiresLiveQuorum(t *testing.T) {
 	for _, tc := range []struct {
-		name                    string
-		live, learnerOnly       bool
-		corrupt                 string
-		zeroSlot                bool
-		unknownRead             bool
-		noTimer                 bool
-		expired                 bool
-		reserve                 bool
-		outerCanceled           bool
-		mixed, unknown, unbound bool
-		mixedMembership         bool
-		unapprovedMembership    bool
-		prospectiveLearner      bool
-		uidWithoutWAL           bool
-		recreated               bool
-		sourceWALMismatch       bool
-		sourcePodReplaced       bool
-		sourceIPChanged         bool
+		name                        string
+		live, learnerOnly           bool
+		corrupt                     string
+		zeroSlot                    bool
+		unknownRead                 bool
+		noTimer                     bool
+		expired                     bool
+		reserve                     bool
+		outerCanceled               bool
+		mixed, unknown, unbound     bool
+		mixedMembership             bool
+		unapprovedMembership        bool
+		prospectiveLearner          bool
+		uidWithoutWAL               bool
+		learnerPodMissing           bool
+		learnerPodMissingAfterProbe bool
+		voterPodMissing             bool
+		recreated                   bool
+		sourceWALMismatch           bool
+		sourcePodReplaced           bool
+		sourceIPChanged             bool
 	}{
 		{name: "matching isolated snapshots"},
 		{name: "active surviving quorum", live: true},
@@ -185,6 +188,10 @@ func TestAutomaticEscalationRequiresLiveQuorum(t *testing.T) {
 		{name: "known but unapproved membership blocks timer and reservation", unapprovedMembership: true, expired: true},
 		{name: "prospective learner without captured identity does not block quorum progress", prospectiveLearner: true, live: true, noTimer: true},
 		{name: "UID-known learner without WAL is not treated as probe identity", uidWithoutWAL: true, live: true},
+		{name: "captured current learner Pod 404 is policy no-response and remains fenced", learnerPodMissing: true, expired: true, reserve: true},
+		{name: "learner disappears after signed probe is policy no-response", learnerPodMissingAfterProbe: true, expired: true, reserve: true},
+		{name: "captured source voter Pod 404 is policy no-response and remains fenced", voterPodMissing: true, expired: true, reserve: true},
+		{name: "UID-known WAL-empty learner remains in generation closure inventory", uidWithoutWAL: true, expired: true, reserve: true},
 		{name: "unknown membership must block live proof", mixed: true, unknown: true, live: true},
 		{name: "matching unknown membership must block live proof", unknown: true, live: true},
 		{name: "versioned unknown is absence of fresh positive", corrupt: "unknown", noTimer: true},
@@ -222,7 +229,7 @@ func TestAutomaticEscalationRequiresLiveQuorum(t *testing.T) {
 			if tc.noTimer {
 				noQuorumSince = time.Time{}
 			}
-			includeLearner := tc.learnerOnly || tc.unbound || tc.recreated || tc.mixedMembership || tc.unapprovedMembership || tc.prospectiveLearner || tc.uidWithoutWAL
+			includeLearner := tc.learnerOnly || tc.unbound || tc.recreated || tc.mixedMembership || tc.unapprovedMembership || tc.prospectiveLearner || tc.uidWithoutWAL || tc.learnerPodMissing || tc.learnerPodMissingAfterProbe
 			learnerName := ""
 			if includeLearner {
 				learnerName = "learner"
@@ -288,6 +295,15 @@ func TestAutomaticEscalationRequiresLiveQuorum(t *testing.T) {
 					ip := map[string]string{"rhiza-1": "127.0.0.2", "rhiza-2": "127.0.0.3", "learner": "127.0.0.4"}[pod]
 					if ip == "" {
 						code = 404
+					}
+					if tc.learnerPodMissing && pod == "learner" {
+						code = http.StatusNotFound
+					}
+					if tc.learnerPodMissingAfterProbe && pod == "learner" && podGets[pod] > 1 {
+						code = http.StatusNotFound
+					}
+					if tc.voterPodMissing && pod == "rhiza-1" {
+						code = http.StatusNotFound
 					}
 					uid := "uid-" + id
 					if id == "learner" {
@@ -465,11 +481,40 @@ func TestAutomaticEscalationRequiresLiveQuorum(t *testing.T) {
 					t.Fatal(err)
 				}
 				wantTargets := len(state.Voters)
-				if tc.mixedMembership {
+				if tc.mixedMembership || tc.uidWithoutWAL || tc.learnerPodMissing || tc.learnerPodMissingAfterProbe {
 					wantTargets++
 				}
 				if loaded.Intent == nil || loaded.Intent.Proof != nil || loaded.Intent.Request.Scope != ScopeGeneration || len(loaded.Intent.Request.Targets) != wantTargets {
 					t.Fatalf("all-timeout round did not durably reserve generation fencing: %+v", loaded.Intent)
+				}
+				if tc.uidWithoutWAL || tc.learnerPodMissing || tc.learnerPodMissingAfterProbe {
+					found := false
+					for _, target := range loaded.Intent.Request.Targets {
+						if target.PodUID != "learner-uid" {
+							continue
+						}
+						found = true
+						if tc.uidWithoutWAL && target.WALIdentity != "" {
+							t.Fatalf("UID-known/WAL-empty learner identity changed in closure inventory: %+v", target)
+						}
+						if tc.learnerPodMissing && target.WALIdentity != "learner-wal" {
+							t.Fatalf("captured learner WAL lost from closure inventory: %+v", target)
+						}
+					}
+					if !found {
+						t.Fatal("current learner identity was omitted from generation fence inventory")
+					}
+				}
+				if tc.voterPodMissing {
+					found := false
+					for _, target := range loaded.Intent.Request.Targets {
+						if target.PodUID == state.Identities["n2"].PodUID && target.WALIdentity == state.Identities["n2"].WALIdentity {
+							found = true
+						}
+					}
+					if !found {
+						t.Fatal("captured absent source voter was omitted from generation fence inventory")
+					}
 				}
 				fenceCalls := 0
 				c.Fencer = retirementFencer(func(_ context.Context, request FenceRequest) (*FenceProof, error) {
