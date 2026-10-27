@@ -121,7 +121,7 @@ func (e *FencingExecutor) read(ctx context.Context, uid, source string) (fenceLe
 func (e *FencingExecutor) Handler() http.Handler { return http.HandlerFunc(e.handle) }
 
 func (e *FencingExecutor) handle(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodPost || r.URL.Path != "/v1/supervisor" {
+	if r.Method != http.MethodPost || (r.URL.Path != "/v1/supervisor" && r.URL.Path != "/v1/peer-closure/request" && r.URL.Path != "/v1/peer-closure/status") {
 		http.NotFound(w, r)
 		return
 	}
@@ -147,7 +147,20 @@ func (e *FencingExecutor) handle(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var stop fencing.StopRequest
-	if message.Action == "stop" {
+	var peerReceipt fencing.PeerClosureReceipt
+	if r.URL.Path == "/v1/peer-closure/request" || r.URL.Path == "/v1/peer-closure/status" {
+		if message.Identity.NodeID == "" || message.PeerClosure == nil || message.Drain != nil || message.Request != nil {
+			err = fmt.Errorf("fencing: peer-closure request shape differs")
+		} else if r.URL.Path == "/v1/peer-closure/request" && message.Action == "peer-closure-request" {
+			peerReceipt, err = e.requestPeerClosure(r.Context(), message.Identity, *message.PeerClosure, uid)
+		} else if r.URL.Path == "/v1/peer-closure/status" && message.Action == "peer-closure-status" {
+			peerReceipt, err = e.readPeerClosure(r.Context(), message.Identity, *message.PeerClosure, uid)
+		} else {
+			err = fmt.Errorf("fencing: peer-closure action differs")
+		}
+	} else if message.PeerClosure != nil {
+		err = fmt.Errorf("fencing: unexpected peer-closure request")
+	} else if message.Action == "stop" {
 		var state fenceLedger
 		state, err = e.read(r.Context(), uid, message.Identity.SourceClusterID)
 		if err == nil {
@@ -195,6 +208,10 @@ func (e *FencingExecutor) handle(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusGone)
 		return
 	}
+	if errors.Is(err, fencing.ErrNotFound) {
+		http.Error(w, "peer-closure request not found", http.StatusNotFound)
+		return
+	}
 	if err != nil {
 		if transientFenceAuthority(err) {
 			http.Error(w, "authority unavailable", http.StatusServiceUnavailable)
@@ -205,7 +222,9 @@ func (e *FencingExecutor) handle(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	w.Header().Set("Content-Type", "application/json")
-	if message.Action == "stop" {
+	if r.URL.Path == "/v1/peer-closure/request" || r.URL.Path == "/v1/peer-closure/status" {
+		_ = json.NewEncoder(w).Encode(peerReceipt)
+	} else if message.Action == "stop" {
 		_ = json.NewEncoder(w).Encode(stop)
 	} else {
 		_, _ = w.Write([]byte("{}\n"))

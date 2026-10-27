@@ -16,10 +16,11 @@ import (
 // AuthorityMessage is sent only over authenticated TLS. The server authenticates
 // the bound service account token independently of the claimed identity.
 type AuthorityMessage struct {
-	Action   string        `json:"action"`
-	Identity Identity      `json:"identity"`
-	Drain    *DrainReceipt `json:"drain,omitempty"`
-	Request  *StopRequest  `json:"request,omitempty"`
+	Action      string              `json:"action"`
+	Identity    Identity            `json:"identity"`
+	Drain       *DrainReceipt       `json:"drain,omitempty"`
+	Request     *StopRequest        `json:"request,omitempty"`
+	PeerClosure *PeerClosureRequest `json:"peerClosure,omitempty"`
 }
 
 type AuthorityClient struct {
@@ -28,8 +29,27 @@ type AuthorityClient struct {
 	Client    *http.Client
 }
 
+var _ PeerClosureAuthority = (*AuthorityClient)(nil)
+
 func (a *AuthorityClient) call(ctx context.Context, message AuthorityMessage, result any) error {
+	return a.callURL(ctx, a.URL, message, result)
+}
+
+func (a *AuthorityClient) callPeerClosure(ctx context.Context, endpointPath string, message AuthorityMessage, result any) error {
 	u, err := url.Parse(a.URL)
+	if err != nil || u.Scheme != "https" || u.Host == "" || u.User != nil || u.RawQuery != "" || u.Fragment != "" {
+		return fmt.Errorf("fencing: HTTPS authority required")
+	}
+	if !strings.HasSuffix(u.Path, "/v1/supervisor") {
+		return fmt.Errorf("fencing: configured authority URL must end in /v1/supervisor")
+	}
+	u.Path = strings.TrimSuffix(u.Path, "/v1/supervisor") + endpointPath
+	u.RawPath = ""
+	return a.callURL(ctx, u.String(), message, result)
+}
+
+func (a *AuthorityClient) callURL(ctx context.Context, endpoint string, message AuthorityMessage, result any) error {
+	u, err := url.Parse(endpoint)
 	if err != nil || u.Scheme != "https" || u.Host == "" || u.User != nil || u.RawQuery != "" || u.Fragment != "" {
 		return fmt.Errorf("fencing: HTTPS authority required")
 	}
@@ -44,7 +64,7 @@ func (a *AuthorityClient) call(ctx context.Context, message AuthorityMessage, re
 	if err != nil {
 		return err
 	}
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, a.URL, bytes.NewReader(body))
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, bytes.NewReader(body))
 	if err != nil {
 		return err
 	}
@@ -69,6 +89,9 @@ func (a *AuthorityClient) call(ctx context.Context, message AuthorityMessage, re
 	}
 	if resp.StatusCode == http.StatusGone {
 		return ErrClosed
+	}
+	if resp.StatusCode == http.StatusNotFound && message.Action == "peer-closure-status" {
+		return ErrNotFound
 	}
 	if resp.StatusCode != http.StatusOK {
 		if resp.StatusCode >= 500 || resp.StatusCode == http.StatusTooManyRequests {
@@ -117,4 +140,56 @@ func (a *AuthorityClient) Exit(ctx context.Context, r StopRequest) error {
 
 func (a *AuthorityClient) NeverBoundExit(ctx context.Context, r StopRequest) error {
 	return a.call(ctx, AuthorityMessage{Action: "never-bound-exit", Identity: r.Identity, Request: &r}, nil)
+}
+
+func (a *AuthorityClient) RequestPeerClosure(ctx context.Context, caller Identity, closure PeerClosureRequest) (PeerClosureReceipt, error) {
+	if err := closure.Validate(caller); err != nil {
+		return PeerClosureReceipt{}, err
+	}
+	var receipt PeerClosureReceipt
+	err := a.callPeerClosure(ctx, "/v1/peer-closure/request", AuthorityMessage{Action: "peer-closure-request", Identity: caller, PeerClosure: &closure}, &receipt)
+	if err != nil {
+		return PeerClosureReceipt{}, err
+	}
+	if err := validatePeerClosureReceipt(caller, closure, receipt); err != nil {
+		return PeerClosureReceipt{}, err
+	}
+	return receipt, nil
+}
+
+func (a *AuthorityClient) ReadPeerClosure(ctx context.Context, caller Identity, closure PeerClosureRequest) (PeerClosureReceipt, error) {
+	if err := closure.Validate(caller); err != nil {
+		return PeerClosureReceipt{}, err
+	}
+	var receipt PeerClosureReceipt
+	err := a.callPeerClosure(ctx, "/v1/peer-closure/status", AuthorityMessage{Action: "peer-closure-status", Identity: caller, PeerClosure: &closure}, &receipt)
+	if err != nil {
+		return PeerClosureReceipt{}, err
+	}
+	if err := validatePeerClosureReceipt(caller, closure, receipt); err != nil {
+		return PeerClosureReceipt{}, err
+	}
+	return receipt, nil
+}
+
+func validatePeerClosureReceipt(caller Identity, request PeerClosureRequest, receipt PeerClosureReceipt) error {
+	if err := request.Validate(caller); err != nil {
+		return err
+	}
+	if receipt.ExpectedAbortSlot == nil || receipt.OperationID == "" || receipt.SourceClusterID != caller.SourceClusterID || receipt.BindingUID == "" || receipt.StatefulSetUID == "" || receipt.RequestHash == "" || receipt.ProofID == "" ||
+		receipt.ExpectedConfigID != request.ExpectedConfigID || *receipt.ExpectedAbortSlot != *request.ExpectedAbortSlot || receipt.TargetNodeID != request.TargetNodeID || receipt.TargetWALIdentity != request.TargetWALIdentity ||
+		!receipt.ProcessesTerminated || !receipt.RecreationBlocked || !receipt.StorageQuiesced || len(receipt.Targets) == 0 {
+		return fmt.Errorf("fencing: peer-closure receipt does not match request")
+	}
+	covered := false
+	for _, target := range receipt.Targets {
+		if target.NodeID != request.TargetNodeID || target.WALIdentity != request.TargetWALIdentity || target.Pod != request.TargetNodeID || target.PodUID == "" {
+			return fmt.Errorf("fencing: peer-closure receipt target differs")
+		}
+		covered = true
+	}
+	if !covered {
+		return fmt.Errorf("fencing: peer-closure receipt omitted target")
+	}
+	return nil
 }

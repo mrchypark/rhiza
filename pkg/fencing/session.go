@@ -87,6 +87,35 @@ func (s *Session) AcknowledgeDrain(ctx context.Context, receipt DrainReceipt) er
 	return s.call(ctx, "/v1/drained", receipt, nil)
 }
 
+// RequestPeerClosure asks the bound supervisor to submit one exact voter-slot
+// closure. The local session identity remains the caller; target identity is a
+// separate field and cannot be substituted for the caller.
+func (s *Session) RequestPeerClosure(ctx context.Context, closure PeerClosureRequest) (PeerClosureReceipt, error) {
+	return s.peerClosureCall(ctx, "/v1/peer-closure/request", "peer-closure-request", closure)
+}
+
+// ReadPeerClosure reads only an already persisted exact operation. A missing
+// record is reported as ErrNotFound and must never trigger request creation.
+func (s *Session) ReadPeerClosure(ctx context.Context, closure PeerClosureRequest) (PeerClosureReceipt, error) {
+	return s.peerClosureCall(ctx, "/v1/peer-closure/status", "peer-closure-status", closure)
+}
+
+func (s *Session) peerClosureCall(ctx context.Context, path, action string, closure PeerClosureRequest) (PeerClosureReceipt, error) {
+	caller := s.Identity()
+	if err := closure.Validate(caller); err != nil {
+		return PeerClosureReceipt{}, err
+	}
+	message := AuthorityMessage{Action: action, Identity: caller, PeerClosure: &closure}
+	var receipt PeerClosureReceipt
+	if err := s.call(ctx, path, message, &receipt); err != nil {
+		return PeerClosureReceipt{}, err
+	}
+	if err := validatePeerClosureReceipt(caller, closure, receipt); err != nil {
+		return PeerClosureReceipt{}, err
+	}
+	return receipt, nil
+}
+
 func (s *Session) call(ctx context.Context, path string, value, out any) error {
 	body, err := json.Marshal(value)
 	if err != nil {
@@ -108,6 +137,10 @@ func (s *Session) call(ctx context.Context, path string, value, out any) error {
 		return ErrPending
 	case http.StatusGone:
 		return ErrClosed
+	case http.StatusNotFound:
+		if path == "/v1/peer-closure/status" {
+			return ErrNotFound
+		}
 	}
 	if resp.StatusCode != http.StatusOK {
 		if resp.StatusCode >= 500 || resp.StatusCode == http.StatusTooManyRequests {

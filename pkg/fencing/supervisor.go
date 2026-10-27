@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net"
 	"net/http"
 	"os"
@@ -286,6 +287,30 @@ func (s *Supervisor) handler() http.Handler {
 					s.mu.Unlock()
 				}
 			}
+		} else if r.URL.Path == "/v1/peer-closure/request" || r.URL.Path == "/v1/peer-closure/status" {
+			var message AuthorityMessage
+			err = decoder.Decode(&message)
+			if err == nil && decoder.Decode(new(any)) != io.EOF {
+				err = fmt.Errorf("fencing: trailing peer-closure request")
+			}
+			if err == nil {
+				s.mu.Lock()
+				bound := s.bound
+				s.mu.Unlock()
+				if message.Identity != bound || message.PeerClosure == nil || message.Drain != nil || message.Request != nil {
+					err = fmt.Errorf("fencing: peer-closure caller differs from bound incarnation")
+				} else if validateErr := message.PeerClosure.Validate(bound); validateErr != nil {
+					err = validateErr
+				} else if authority, ok := s.Authority.(PeerClosureAuthority); !ok {
+					err = fmt.Errorf("fencing: peer-closure authority unavailable")
+				} else if r.URL.Path == "/v1/peer-closure/request" && message.Action == "peer-closure-request" {
+					result, err = authority.RequestPeerClosure(r.Context(), bound, *message.PeerClosure)
+				} else if r.URL.Path == "/v1/peer-closure/status" && message.Action == "peer-closure-status" {
+					result, err = authority.ReadPeerClosure(r.Context(), bound, *message.PeerClosure)
+				} else {
+					err = fmt.Errorf("fencing: peer-closure action differs")
+				}
+			}
 		} else {
 			var identity Identity
 			err = decoder.Decode(&identity)
@@ -299,6 +324,10 @@ func (s *Supervisor) handler() http.Handler {
 		}
 		if err == ErrClosed {
 			w.WriteHeader(http.StatusGone)
+			return
+		}
+		if err == ErrNotFound {
+			http.Error(w, "peer-closure request not found", http.StatusNotFound)
 			return
 		}
 		if errors.Is(err, ErrUnavailable) {
