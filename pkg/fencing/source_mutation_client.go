@@ -6,6 +6,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"time"
 )
 
 var (
@@ -154,6 +155,37 @@ func sameSourcePayload(intent MutationIntent, payload []byte) bool {
 }
 
 func (c *sourceMutationClient) settle(ctx context.Context, step sourceRetryStep) error {
+	for {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		err := c.settleOnce(ctx, step)
+		if !IsMutationPreDispatchContention(err) {
+			return err
+		}
+		if err := c.state.admitted(step.Sequence, step.Entry.Intent); err != nil {
+			return err
+		}
+		step.Admitted = true
+		if _, bounded := ctx.Deadline(); !bounded {
+			return ErrMutationPreDispatchContention
+		}
+		timer := time.NewTimer(50 * time.Millisecond)
+		select {
+		case <-ctx.Done():
+			if !timer.Stop() {
+				select {
+				case <-timer.C:
+				default:
+				}
+			}
+			return ctx.Err()
+		case <-timer.C:
+		}
+	}
+}
+
+func (c *sourceMutationClient) settleOnce(ctx context.Context, step sourceRetryStep) error {
 	intent, sequence := step.Entry.Intent, step.Sequence
 	result, err := c.authority.Lookup(ctx, sequence, intent)
 	if err != nil {

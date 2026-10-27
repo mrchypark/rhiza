@@ -248,6 +248,11 @@ func (e *FencingExecutor) writeSourceStageError(w http.ResponseWriter, err error
 	if err == nil {
 		return
 	}
+	if fencing.IsMutationPreDispatchContention(err) {
+		w.Header().Set(fencing.MutationPendingReasonHeader, fencing.MutationPreDispatchContentionReason)
+		w.WriteHeader(http.StatusAccepted)
+		return
+	}
 	if errors.Is(err, fencing.ErrPending) || errors.Is(err, ErrFencePending) {
 		w.WriteHeader(http.StatusAccepted)
 		return

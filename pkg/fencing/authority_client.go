@@ -567,7 +567,7 @@ func (a *AuthorityClient) sourcePost(ctx context.Context, endpoint string, body 
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode == http.StatusAccepted {
-		return ErrPending
+		return sourceMutationPendingResponse(resp, sourceMutationEndpointPath(endpoint))
 	}
 	if resp.StatusCode == http.StatusGone {
 		return ErrClosed

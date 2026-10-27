@@ -95,6 +95,23 @@ type mutationKeyState struct {
 	Retirement            *mutationGenerationZeroRetirementReference `json:"generationZeroRetirement,omitempty"`
 }
 
+// errForeignMutationKeyOwner is narrower than ErrFencePending: it is returned
+// only after decoding an exact key record whose nonempty owner is different
+// from the caller and which carries no generation-zero or retirement state.
+// It is private so only the logical execution boundary can decide whether a
+// pristine waiter is eligible for the public pre-dispatch retry signal.
+var errForeignMutationKeyOwner = errors.New("fencing: exact mutation key has a foreign owner")
+
+func mutationKeyHasExactForeignOwner(state mutationKeyState, scopeHash, key, owner string) bool {
+	return scopeHash != "" && key != "" && owner != "" && state.ScopeHash == scopeHash && state.Key == key &&
+		state.Owner != "" && state.Owner != owner && state.PendingGenerationZero == nil && state.Barrier == nil && state.Retirement == nil
+}
+
+func pristineLogicalMutationWaiter(entry fencing.MutationEntry) bool {
+	return entry.Preparation == nil && entry.Resolution == nil && !entry.DispatchClosed && len(entry.Dispatches) == 0 &&
+		entry.CopyCompletion == nil && entry.GuardedLogicalResolution == nil && entry.GenerationZeroGuard == nil && entry.GenerationZeroRights == nil
+}
+
 // mutationGenerationZeroRight records the exact already-sealed journal
 // dispatch before repair settlement may send its create-only replay. It is a
 // reference to the original permission, not a second permission or a terminal
@@ -365,6 +382,11 @@ func (e *FencingExecutor) readMutationKeyState(ctx context.Context, scopeHash, k
 		return mutationKeyState{}, fmt.Errorf("fencing: mutation key lock identity differs")
 	}
 	return state, nil
+}
+
+func (e *FencingExecutor) confirmExactForeignMutationKeyOwner(ctx context.Context, scopeHash, key, owner string) bool {
+	state, err := e.readMutationKeyState(ctx, scopeHash, key)
+	return err == nil && mutationKeyHasExactForeignOwner(state, scopeHash, key, owner)
 }
 
 func generationZeroRetirementProofFor(runtime fencing.RuntimeBinding, walIdentity, producerUID string, sequence uint64, entry fencing.MutationEntry) (mutationGenerationZeroRetirementProof, error) {
@@ -993,6 +1015,9 @@ func (e *FencingExecutor) acquireMutationKey(ctx context.Context, scopeHash, key
 				return nil
 			}
 			if state.Owner != "" {
+				if mutationKeyHasExactForeignOwner(state, scopeHash, key, owner) {
+					return errors.Join(ErrFencePending, errForeignMutationKeyOwner)
+				}
 				return ErrFencePending
 			}
 		}
@@ -1014,8 +1039,14 @@ func (e *FencingExecutor) acquireMutationKey(ctx context.Context, scopeHash, key
 		if readErr != nil {
 			return errors.Join(err, readErr)
 		}
-		if !creating && actual.ScopeHash == scopeHash && actual.Key == key && actual.Owner != "" && actual.Owner != owner {
-			return ErrFencePending
+		if !creating {
+			decodeErr := decodeAuthorityValue(stored, &actual)
+			if decodeErr == nil && mutationKeyHasExactForeignOwner(actual, scopeHash, key, owner) {
+				return errors.Join(ErrFencePending, errForeignMutationKeyOwner)
+			}
+			if decodeErr != nil {
+				return errors.Join(err, decodeErr)
+			}
 		}
 		if !creating && actual.ScopeHash == scopeHash && actual.Key == key && actual.Owner == "" {
 			continue
@@ -1258,17 +1289,34 @@ func (e *FencingExecutor) executeSourceMutation(ctx context.Context, authority m
 		return e.resumeTerminalMutationKeyCleanup(ctx, authority, run, producerUID, sequence, entry, owner, receipts)
 	}
 	allowCreate := len(lookup.Entry.Dispatches) == 0
-	if err := e.acquireMutationKey(ctx, intent.StoreScopeHash, intent.Key, owner, allowCreate); err != nil {
-		if authority.logicalBinding != nil && errors.Is(err, ErrFencePending) {
-			if cleanupErr := e.resumeForeignLogicalTerminalKeyOwner(ctx, authority, intent.StoreScopeHash, intent.Key, owner); cleanupErr == nil {
-				err = e.acquireMutationKey(ctx, intent.StoreScopeHash, intent.Key, owner, allowCreate)
-			} else if !errors.Is(cleanupErr, ErrFencePending) {
-				return errors.Join(err, cleanupErr)
+	keyErr := e.acquireMutationKey(ctx, intent.StoreScopeHash, intent.Key, owner, allowCreate)
+	if errors.Is(keyErr, errForeignMutationKeyOwner) {
+		if authority.logicalBinding == nil {
+			return ErrFencePending
+		}
+		cleanupErr := e.resumeForeignLogicalTerminalKeyOwner(ctx, authority, intent.StoreScopeHash, intent.Key, owner)
+		switch {
+		case cleanupErr == nil:
+			keyErr = e.acquireMutationKey(ctx, intent.StoreScopeHash, intent.Key, owner, allowCreate)
+		case cleanupErr == ErrFencePending:
+			if run.MutationProfile == fencing.MutationExecutionProfile && pristineLogicalMutationWaiter(entry) &&
+				e.confirmExactForeignMutationKeyOwner(ctx, intent.StoreScopeHash, intent.Key, owner) {
+				return fencing.ErrMutationPreDispatchContention
 			}
+			return ErrFencePending
+		default:
+			return errors.Join(ErrFencePending, cleanupErr)
 		}
-		if err != nil {
-			return err
+	}
+	if errors.Is(keyErr, errForeignMutationKeyOwner) {
+		if authority.logicalBinding != nil && run.MutationProfile == fencing.MutationExecutionProfile && pristineLogicalMutationWaiter(entry) &&
+			e.confirmExactForeignMutationKeyOwner(ctx, intent.StoreScopeHash, intent.Key, owner) {
+			return fencing.ErrMutationPreDispatchContention
 		}
+		return ErrFencePending
+	}
+	if keyErr != nil {
+		return keyErr
 	}
 	keyState, err := e.readMutationKeyState(ctx, intent.StoreScopeHash, intent.Key)
 	if err != nil {
@@ -1689,6 +1737,12 @@ func (e *FencingExecutor) resumeForeignLogicalTerminalKeyOwner(ctx context.Conte
 		return err
 	}
 	prior, err := receipts.getContext(ctx, "receipt-"+keyState.Owner)
+	if errors.Is(err, os.ErrNotExist) {
+		// A foreign owner without a durable receipt is still in progress (or
+		// unresolved). It is safe to tell a pristine waiter to retry its own
+		// tuple, but never to clear or otherwise reinterpret the foreign owner.
+		return ErrFencePending
+	}
 	if err != nil || prior.AuthorityProfile != fencing.LogicalWriterProfileV1 || prior.LogicalBinding == nil || prior.Runtime != (fencing.RuntimeBinding{}) ||
 		prior.Sequence == 0 || prior.ProducerUID == "" || prior.Intent.StoreScopeHash != scopeHash || prior.Intent.Key != key ||
 		prior.Intent.OperationID != fencing.MutationRequestID(prior.ProducerUID, prior.Sequence) {

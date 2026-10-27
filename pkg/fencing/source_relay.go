@@ -158,7 +158,10 @@ func decodeSourceRelayJSON(w http.ResponseWriter, r *http.Request, out any, limi
 
 func writeSourceRelayError(w http.ResponseWriter, err error) {
 	switch {
-	case err == ErrPending:
+	case IsMutationPreDispatchContention(err):
+		w.Header().Set(MutationPendingReasonHeader, MutationPreDispatchContentionReason)
+		w.WriteHeader(http.StatusAccepted)
+	case errors.Is(err, ErrPending):
 		w.WriteHeader(http.StatusAccepted)
 	case err == ErrClosed:
 		w.WriteHeader(http.StatusGone)
@@ -294,7 +297,7 @@ func (s *Session) sourceRequest(ctx context.Context, path, contentType string, b
 	defer response.Body.Close()
 	switch response.StatusCode {
 	case http.StatusAccepted:
-		return ErrPending
+		return sourceMutationPendingResponse(response, path)
 	case http.StatusGone:
 		return ErrClosed
 	case http.StatusPreconditionFailed:
