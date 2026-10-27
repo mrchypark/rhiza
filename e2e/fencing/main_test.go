@@ -1250,7 +1250,7 @@ func TestImmutableImageResolutionDescriptors(t *testing.T) {
 	leaf := fmt.Sprintf(`{"config":{"digest":%q}}`, configID)
 	leafID := hashContent(leaf)
 	attestationID := "sha256:" + strings.Repeat("f", 64)
-	builtPlatformIndex := fmt.Sprintf(`{"manifests":[{"digest":%q,"size":%d,"mediaType":"application/vnd.oci.image.manifest.v1+json","platform":{"os":"linux","architecture":"amd64"}},{"digest":%q,"size":564,"mediaType":"application/vnd.oci.image.manifest.v1+json","platform":{"os":"unknown","architecture":"unknown"}}]}`, leafID, len(leaf), attestationID)
+	builtPlatformIndex := fmt.Sprintf(`{"manifests":[{"digest":%q,"size":%d,"mediaType":"application/vnd.oci.image.manifest.v1+json","platform":{"os":"linux","architecture":"amd64"}},{"digest":%q,"size":564,"mediaType":"application/vnd.oci.image.manifest.v1+json","platform":{"os":"unknown","architecture":"unknown"},"annotations":{"vnd.docker.reference.type":"attestation-manifest","vnd.docker.reference.digest":%q}}]}`, leafID, len(leaf), attestationID, leafID)
 	platformIndexID := hashContent(builtPlatformIndex)
 	builtIndexID := platformIndexID
 	contents := map[string][]byte{platformIndexID: []byte(builtPlatformIndex), leafID: []byte(leaf)}
