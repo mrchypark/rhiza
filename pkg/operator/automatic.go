@@ -243,7 +243,7 @@ func legacyVoterIdentityDrift(voters []VoterPod, members []quepaxa.Member) error
 
 func (c *Controller) claimAutoBinding(ctx context.Context, r *ClusterResource, state *autoControl, uid string) error {
 	key := path.Join(c.Prefix, "automatic-workloads", c.Kube.Namespace, uid, "binding.json")
-	reader, err := c.Bucket.Get(ctx, key)
+	_, err := c.readAutoBinding(ctx, r, state, uid)
 	if c.Bucket.IsObjNotFoundErr(err) {
 		binding := object{"logicalID": r.Spec.LogicalID, "bindingUID": state.BindingUID, "bindingHash": state.BindingHash}
 		if err := c.immutable(ctx, key, jsonBytes(binding)); err != nil {
@@ -254,20 +254,52 @@ func (c *Controller) claimAutoBinding(ctx context.Context, r *ClusterResource, s
 	if err != nil {
 		return err
 	}
+	return nil
+}
+
+// readAutoBinding never creates or claims the workload record. Peer-closure
+// authorization must prove the binding that already exists.
+func (c *Controller) readAutoBinding(ctx context.Context, r *ClusterResource, state *autoControl, uid string) (string, error) {
+	key := path.Join(c.Prefix, "automatic-workloads", c.Kube.Namespace, uid, "binding.json")
+	reader, err := c.Bucket.Get(ctx, key)
+	if err != nil {
+		return "", err
+	}
 	data, readErr := io.ReadAll(io.LimitReader(reader, 1<<20))
 	closeErr := reader.Close()
 	var binding object
 	if readErr != nil || closeErr != nil || len(data) >= 1<<20 || json.Unmarshal(data, &binding) != nil {
-		return fmt.Errorf("workload binding record is unreadable")
+		return "", fmt.Errorf("workload binding record is unreadable")
 	}
 	if str(binding["logicalID"]) != r.Spec.LogicalID || str(binding["bindingUID"]) != state.BindingUID {
-		return fmt.Errorf("workload is owned by another automatic binding")
+		return "", fmt.Errorf("workload is owned by another automatic binding")
 	}
 	hash := str(binding["bindingHash"])
 	if hash != state.BindingHash && (state.LegacyBindingHash == "" || hash != state.LegacyBindingHash) {
-		return fmt.Errorf("workload binding hash changed")
+		return "", fmt.Errorf("workload binding hash changed")
 	}
-	return nil
+	return hashJSON(string(data)), nil
+}
+
+func (c *Controller) peerClosureAutoBinding(ctx context.Context, r *ClusterResource, workloadUID, source string) (string, string, error) {
+	if c.Bucket == nil {
+		return "", "", fmt.Errorf("fencing: durable automatic binding store unavailable")
+	}
+	state, _, err := c.loadAuto(ctx, c.autoKey(r))
+	if err != nil {
+		return "", "", fmt.Errorf("fencing: durable automatic control unavailable: %w", err)
+	}
+	rootUID := str(r.Metadata["uid"])
+	if state.BindingUID != rootUID || state.StatefulSetUID != workloadUID || state.ActiveClusterID != source ||
+		state.BindingVersion != autoBindingVersion || state.LegacyBindingHash != "" || state.BindingHash != autoBinding(r) {
+		return "", "", fmt.Errorf("fencing: durable automatic binding differs")
+	}
+	recordHash, err := c.readAutoBinding(ctx, r, state, workloadUID)
+	if err != nil {
+		return "", "", fmt.Errorf("fencing: durable workload binding unavailable: %w", err)
+	}
+	controlHash := hashJSON([]any{state.Version, state.BindingUID, state.BindingHash, state.BindingVersion, state.StatefulSetUID, state.ActiveClusterID})
+	return controlHash, recordHash, nil
 }
 func (c *Controller) autoStatus(ctx context.Context, r *ClusterResource, state *autoControl, phase, message string) error {
 	r.Status = ClusterStatus{Phase: phase, Message: message, ObservedGeneration: number(r.Metadata["generation"])}

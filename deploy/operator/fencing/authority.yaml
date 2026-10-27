@@ -109,6 +109,14 @@ spec:
           image: rhiza-operator:latest
           command: [/usr/local/bin/rhiza-fencer]
           args: [serve, --tls-cert=/tls/tls.crt, --tls-key=/tls/tls.key]
+          # Optional peer-closure approval requires the same RHIZA_OBJSTORE_*
+          # location and provider authentication used by the automatic-recovery
+          # controller. Do not configure filesystem storage. Without a usable
+          # shared store, new peer-closure requests fail closed; supervisor
+          # registration, drain, and existing fence reconciliation still run.
+          # Supply existing environment sources here; this manifest creates no
+          # object-store Secret or credential grant. The peer-closure path only
+          # reads automatic control and immutable workload-binding records.
           env:
             - name: POD_NAMESPACE
               valueFrom:

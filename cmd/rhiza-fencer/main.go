@@ -16,8 +16,10 @@ import (
 	"syscall"
 	"time"
 
+	objectstore "github.com/mrchypark/rhiza/internal/objstore"
 	"github.com/mrchypark/rhiza/pkg/fencing"
 	"github.com/mrchypark/rhiza/pkg/operator"
+	thanosobjstore "github.com/thanos-io/objstore"
 )
 
 func main() {
@@ -94,7 +96,23 @@ func serve(ctx context.Context, args []string) error {
 	if err != nil {
 		return err
 	}
-	executor := &operator.FencingExecutor{Kube: kube}
+	var bucket thanosobjstore.Bucket
+	var bucketConfig objectstore.Config
+	if config, configErr := objectstore.LoadOperatorConfig(); configErr != nil {
+		log.Printf("peer-closure durable binding reads disabled: invalid object-store config: %v", configErr)
+	} else {
+		bucketConfig = config
+		opened, openErr := openPeerClosureBucket(ctx, config)
+		if openErr != nil {
+			log.Printf("peer-closure durable binding reads disabled: object-store unavailable: %v", openErr)
+		} else {
+			bucket = opened
+		}
+	}
+	if closer, ok := bucket.(interface{ Close() error }); ok {
+		defer func() { _ = closer.Close() }()
+	}
+	executor := &operator.FencingExecutor{Kube: kube, Bucket: bucket, Prefix: bucketConfig.Prefix}
 	// Independent evidence is optional and off unless the administrator configures
 	// the whole trust relationship. A partial configuration fails startup.
 	if *attestorURL != "" || *attestorToken != "" || *attestorCA != "" {
@@ -122,4 +140,15 @@ func serve(ctx context.Context, args []string) error {
 			}
 		}
 	}
+}
+
+func openPeerClosureBucket(ctx context.Context, config objectstore.Config) (thanosobjstore.Bucket, error) {
+	if config.Provider == objectstore.ProviderFilesystem {
+		return nil, nil
+	}
+	bucket, err := objectstore.NewBucketForSupervisedStartup(ctx, config)
+	if err != nil {
+		return nil, err
+	}
+	return bucket, nil
 }

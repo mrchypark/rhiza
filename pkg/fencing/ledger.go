@@ -6,11 +6,25 @@ import "fmt"
 // persisted with the resourceVersion read alongside this value. Never replace a
 // ledger after a conflict or discard an older incarnation when a Pod disappears.
 type Ledger struct {
-	SourceClusterID string                 `json:"sourceClusterID"`
-	ClosedBy        string                 `json:"closedBy,omitempty"`
-	ClosedHash      string                 `json:"closedHash,omitempty"`
-	ClosedNodes     map[string]StopRequest `json:"closedNodes,omitempty"`
-	Runs            map[string]Run         `json:"runs"`
+	SourceClusterID string                  `json:"sourceClusterID"`
+	ClosedBy        string                  `json:"closedBy,omitempty"`
+	ClosedHash      string                  `json:"closedHash,omitempty"`
+	ClosedNodes     map[string]StopRequest  `json:"closedNodes,omitempty"`
+	Runs            map[string]Run          `json:"runs"`
+	PeerClosure     *PeerClosureReservation `json:"peerClosure,omitempty"`
+}
+
+// PeerClosureReservation is one CAS-serialized target closure in a source
+// membership round. It is durable before an executable RhizaFence is created.
+type PeerClosureReservation struct {
+	OperationID  string              `json:"operationID"`
+	RequestHash  string              `json:"requestHash"`
+	ConfigID     uint64              `json:"configID"`
+	AbortSlot    uint64              `json:"abortSlot"`
+	TargetNodeID string              `json:"targetNodeID"`
+	TargetWAL    string              `json:"targetWAL"`
+	Voters       []string            `json:"voters"`
+	Targets      []PeerClosureTarget `json:"targets"`
 }
 
 type Run struct {
@@ -84,6 +98,16 @@ func (l *Ledger) CloseNodes(operationID, requestHash string, nodeIDs []string) e
 	if operationID == "" || requestHash == "" {
 		return ErrClosed
 	}
+	if reservation := l.PeerClosure; reservation != nil {
+		if reservation.OperationID != operationID || reservation.RequestHash != requestHash || len(nodeIDs) == 0 {
+			return ErrPending
+		}
+		for _, nodeID := range nodeIDs {
+			if nodeID != reservation.TargetNodeID {
+				return ErrPending
+			}
+		}
+	}
 	if l.ClosedBy != "" {
 		// An earlier pending voter operation may finish after escalation has
 		// closed the generation. It cannot reopen or alter its original scope.
@@ -121,6 +145,171 @@ func (l *Ledger) CloseNodes(operationID, requestHash string, nodeIDs []string) e
 		}
 	}
 	return nil
+}
+
+// ReservePeerClosure atomically closes admission for the exact target and
+// serializes it against another voter closure in the same source ledger.
+func (l *Ledger) ReservePeerClosure(request PeerClosureReservation) error {
+	if request.OperationID == "" || request.RequestHash == "" || request.ConfigID == 0 || request.TargetNodeID == "" || request.TargetWAL == "" || len(request.Voters) == 0 || len(request.Targets) == 0 {
+		return fmt.Errorf("fencing: incomplete peer-closure reservation")
+	}
+	voters := make(map[string]bool, len(request.Voters))
+	for _, nodeID := range request.Voters {
+		if nodeID == "" || voters[nodeID] {
+			return fmt.Errorf("fencing: invalid peer-closure voter inventory")
+		}
+		voters[nodeID] = true
+	}
+	if !voters[request.TargetNodeID] {
+		return fmt.Errorf("fencing: peer-closure target is not a current voter")
+	}
+	targets := make(map[peerClosureTargetKey]PeerClosureTarget, len(request.Targets))
+	requestedWAL := false
+	for _, target := range request.Targets {
+		key := peerClosureTargetIdentity(target)
+		if target.NodeID != request.TargetNodeID || target.Pod == "" || target.PodUID == "" || (target.WALIdentity != "" && target.WALIdentity != request.TargetWAL) {
+			return fmt.Errorf("fencing: invalid peer-closure target inventory")
+		}
+		if old, exists := targets[key]; exists {
+			if old != target {
+				return fmt.Errorf("fencing: conflicting peer-closure runtime inventory")
+			}
+			return fmt.Errorf("fencing: duplicate peer-closure target inventory")
+		}
+		if target.WALIdentity == request.TargetWAL {
+			requestedWAL = true
+		}
+		targets[key] = target
+	}
+	if !requestedWAL {
+		return fmt.Errorf("fencing: requested target WAL is absent from retained history")
+	}
+	// CloseNodes and Register share this CAS. The inventory must cover every run
+	// now, so a concurrent registration cannot escape the eventual fence.
+	ledgerTargets := make(map[peerClosureTargetKey]bool)
+	for _, run := range l.Runs {
+		if run.Identity.NodeID != request.TargetNodeID {
+			continue
+		}
+		key := peerClosureTargetIdentity(PeerClosureTarget{NodeID: run.Identity.NodeID, Pod: run.Identity.NodeID, PodUID: run.Identity.PodUID, WALIdentity: run.Identity.WALIdentity})
+		if _, ok := targets[key]; !ok {
+			return fmt.Errorf("fencing: peer-closure target inventory changed")
+		}
+		ledgerTargets[key] = true
+	}
+	if len(ledgerTargets) != len(targets) {
+		return fmt.Errorf("fencing: peer-closure target inventory has unregistered incarnations")
+	}
+
+	if old := l.PeerClosure; old != nil {
+		if samePeerClosureReservation(*old, request) {
+			return l.CloseNodes(request.OperationID, request.RequestHash, []string{request.TargetNodeID})
+		}
+		if request.ConfigID <= old.ConfigID || voters[old.TargetNodeID] || !l.peerClosureTargetComplete(*old) {
+			return ErrPending
+		}
+	}
+	for nodeID, old := range l.ClosedNodes {
+		if nodeID == request.TargetNodeID {
+			if old.OperationID != request.OperationID || old.RequestHash != request.RequestHash {
+				return ErrPending
+			}
+			continue
+		}
+		if voters[nodeID] || !l.closedNodeComplete(nodeID) {
+			return ErrPending
+		}
+	}
+	if requestTarget, exists := l.ClosedNodes[request.TargetNodeID]; exists && (requestTarget.OperationID != request.OperationID || requestTarget.RequestHash != request.RequestHash) {
+		return ErrPending
+	}
+	// A successful source-generation close permanently supersedes peer closures.
+	if l.ClosedBy != "" {
+		return ErrClosed
+	}
+	previous := l.PeerClosure
+	l.PeerClosure = nil
+	if err := l.CloseNodes(request.OperationID, request.RequestHash, []string{request.TargetNodeID}); err != nil {
+		l.PeerClosure = previous
+		return err
+	}
+	copy := request
+	copy.Voters = append([]string(nil), request.Voters...)
+	copy.Targets = append([]PeerClosureTarget(nil), request.Targets...)
+	l.PeerClosure = &copy
+	return nil
+}
+
+func samePeerClosureReservation(a, b PeerClosureReservation) bool {
+	if a.OperationID != b.OperationID || a.RequestHash != b.RequestHash || a.ConfigID != b.ConfigID || a.AbortSlot != b.AbortSlot || a.TargetNodeID != b.TargetNodeID || a.TargetWAL != b.TargetWAL || len(a.Voters) != len(b.Voters) || len(a.Targets) != len(b.Targets) {
+		return false
+	}
+	for i := range a.Voters {
+		if a.Voters[i] != b.Voters[i] {
+			return false
+		}
+	}
+	for i := range a.Targets {
+		if a.Targets[i] != b.Targets[i] {
+			return false
+		}
+	}
+	return true
+}
+
+type peerClosureTargetKey struct {
+	NodeID, Pod, PodUID, WALIdentity string
+}
+
+func peerClosureTargetIdentity(target PeerClosureTarget) peerClosureTargetKey {
+	return peerClosureTargetKey{NodeID: target.NodeID, Pod: target.Pod, PodUID: target.PodUID, WALIdentity: target.WALIdentity}
+}
+
+func (l *Ledger) peerClosureTargetComplete(reservation PeerClosureReservation) bool {
+	seen := make(map[peerClosureTargetKey]bool, len(reservation.Targets))
+	for _, target := range reservation.Targets {
+		seen[peerClosureTargetIdentity(target)] = false
+	}
+	for _, run := range l.Runs {
+		if run.Identity.NodeID != reservation.TargetNodeID {
+			continue
+		}
+		target := PeerClosureTarget{NodeID: run.Identity.NodeID, Pod: run.Identity.NodeID, PodUID: run.Identity.PodUID, WALIdentity: run.Identity.WALIdentity}
+		key := peerClosureTargetIdentity(target)
+		if _, ok := seen[key]; !ok || !runTerminated(run) {
+			return false
+		}
+		seen[key] = true
+	}
+	for _, covered := range seen {
+		if !covered {
+			return false
+		}
+	}
+	return true
+}
+
+func (l *Ledger) closedNodeComplete(nodeID string) bool {
+	seen := false
+	for _, run := range l.Runs {
+		if run.Identity.NodeID == nodeID {
+			seen = true
+			if !runTerminated(run) {
+				return false
+			}
+		}
+	}
+	return seen
+}
+
+func runTerminated(run Run) bool {
+	if !run.Exited || run.Stop == nil {
+		return false
+	}
+	if run.Identity.WALIdentity == "" {
+		return run.NeverBoundExit != nil && *run.NeverBoundExit == *run.Stop && run.Drain == nil
+	}
+	return run.Drain != nil && run.Drain.Request == *run.Stop && run.Drain.Clean()
 }
 
 // Close permanently closes generation-wide startup admission before stop

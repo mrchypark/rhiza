@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"net/http"
 	"os"
+	"strconv"
 
 	kitlog "github.com/go-kit/log"
 	"github.com/thanos-io/objstore"
@@ -202,4 +203,37 @@ func LoadConfig() Config {
 	}
 
 	return cfg
+}
+
+// LoadOperatorConfig preserves the operator's object-store environment aliases
+// for components that need to address the same archive namespace.
+func LoadOperatorConfig() (Config, error) {
+	config := LoadConfig()
+	if directory := os.Getenv("RHIZA_OBJSTORE_DIR"); directory != "" {
+		if legacy := os.Getenv("RHIZA_FILESYSTEM_DIR"); legacy != "" && legacy != directory {
+			return Config{}, fmt.Errorf("RHIZA_OBJSTORE_DIR conflicts with RHIZA_FILESYSTEM_DIR")
+		}
+		config.FilesystemDir = directory
+	}
+	if region := os.Getenv("RHIZA_OBJSTORE_REGION"); region != "" {
+		config.Region = region
+	}
+	if raw := os.Getenv("RHIZA_OBJSTORE_INSECURE"); raw != "" {
+		insecure, err := strconv.ParseBool(raw)
+		if err != nil {
+			return Config{}, fmt.Errorf("invalid RHIZA_OBJSTORE_INSECURE")
+		}
+		config.Insecure = insecure
+	}
+	config.AccessKey = os.Getenv("RHIZA_OBJSTORE_ACCESS_KEY")
+	config.SecretKey = os.Getenv("RHIZA_OBJSTORE_SECRET_KEY")
+	config.SessionToken = os.Getenv("RHIZA_OBJSTORE_SESSION_TOKEN")
+	if raw := os.Getenv("RHIZA_OBJSTORE_MAX_RETRIES"); raw != "" {
+		retries, err := strconv.Atoi(raw)
+		if err != nil || retries < 0 {
+			return Config{}, fmt.Errorf("invalid RHIZA_OBJSTORE_MAX_RETRIES")
+		}
+		config.MaxRetries = retries
+	}
+	return config, nil
 }

@@ -182,13 +182,17 @@ func validatePeerClosureReceipt(caller Identity, request PeerClosureRequest, rec
 		return fmt.Errorf("fencing: peer-closure receipt does not match request")
 	}
 	covered := false
+	requestedWAL := false
 	for _, target := range receipt.Targets {
-		if target.NodeID != request.TargetNodeID || target.WALIdentity != request.TargetWALIdentity || target.Pod != request.TargetNodeID || target.PodUID == "" {
+		if target.NodeID != request.TargetNodeID || target.Pod != request.TargetNodeID || target.PodUID == "" || (target.WALIdentity != "" && target.WALIdentity != request.TargetWALIdentity) {
 			return fmt.Errorf("fencing: peer-closure receipt target differs")
+		}
+		if target.WALIdentity == request.TargetWALIdentity {
+			requestedWAL = true
 		}
 		covered = true
 	}
-	if !covered {
+	if !covered || !requestedWAL {
 		return fmt.Errorf("fencing: peer-closure receipt omitted target")
 	}
 	return nil

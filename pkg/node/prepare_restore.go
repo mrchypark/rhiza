@@ -77,7 +77,7 @@ func PrepareRestore(ctx context.Context, config *types.ExecutionConfig) (resultE
 }
 
 // prepareRestore accepts an injected bucket only for package tests; production
-// always resolves the configured provider through NewBucketWithContext.
+// always resolves the configured provider through the supervised constructor.
 func prepareRestore(ctx context.Context, config *types.ExecutionConfig, injected *objectstore.MeteredBucket) (resultErr error) {
 	if err := validatePreparedRestoreConfig(config); err != nil {
 		return err
@@ -119,6 +119,53 @@ func prepareRestore(ctx context.Context, config *types.ExecutionConfig, injected
 		return err
 	}
 	defer func() { resultErr = errors.Join(resultErr, lock.Release()) }()
+	var bucket *objectstore.MeteredBucket
+	var archive *recovery.Manager
+	var guard *startupRecoveryGuard
+	var observerWAL *qlog.WAL
+	var observerDir string
+	var n *Node
+	var completeMarker *preparedRestoreMarker
+	defer func() {
+		var cleanupErr error
+		if n != nil && n.material != nil {
+			cleanupErr = errors.Join(cleanupErr, n.material.Close())
+			n.material = nil
+		}
+		if guard != nil {
+			cleanupErr = errors.Join(cleanupErr, closePreparedRecovery(guard))
+			guard = nil
+		}
+		if archive != nil {
+			archive.Close()
+			archive = nil
+		}
+		if bucket != nil {
+			closeCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			cleanupErr = errors.Join(cleanupErr, bucket.DrainMutations(closeCtx))
+			cancel()
+			cleanupErr = errors.Join(cleanupErr, bucket.Close())
+			bucket = nil
+		}
+		if observerWAL != nil {
+			cleanupErr = errors.Join(cleanupErr, observerWAL.Close())
+			observerWAL = nil
+		}
+		if observerDir != "" {
+			cleanupErr = errors.Join(cleanupErr, os.RemoveAll(observerDir))
+			observerDir = ""
+		}
+		resultErr = errors.Join(resultErr, cleanupErr)
+		if resultErr == nil && completeMarker != nil {
+			if preparedRestoreCrashBoundary != nil {
+				preparedRestoreCrashBoundary("complete-marker-commit")
+			}
+			resultErr = writePreparedRestoreMarker(config.DataDir, *completeMarker)
+			if resultErr != nil {
+				resultErr = fmt.Errorf("commit prepared restore marker: %w", resultErr)
+			}
+		}
+	}()
 
 	marker, markerExists, err := readPreparedRestoreMarkerForConfig(config.DataDir, intentMarker)
 	if err != nil {
@@ -146,9 +193,9 @@ func prepareRestore(ctx context.Context, config *types.ExecutionConfig, injected
 	if provider == "" {
 		provider = objectstore.ProviderS3
 	}
-	bucket := injected
+	bucket = injected
 	if bucket == nil {
-		bucket, err = objectstore.NewBucketWithContext(ctx, objectstore.Config{
+		bucket, err = objectstore.NewBucketForSupervisedStartup(ctx, objectstore.Config{
 			Provider: provider, FilesystemDir: config.ObjStoreDir, Prefix: config.ObjStorePrefix,
 			Endpoint: config.ObjStoreEndpoint, Bucket: config.ObjStoreBucket, Region: config.ObjStoreRegion,
 			Insecure: config.ObjStoreInsecure, MaxRetries: config.ObjStoreRetries,
@@ -161,7 +208,6 @@ func prepareRestore(ctx context.Context, config *types.ExecutionConfig, injected
 		if err != nil {
 			return fmt.Errorf("open restore source: %w", err)
 		}
-		defer func() { resultErr = errors.Join(resultErr, bucket.Close()) }()
 	}
 	if err := validatePreparedRestoreMembership(ctx, config, bucket); err != nil {
 		return err
@@ -185,23 +231,24 @@ func prepareRestore(ctx context.Context, config *types.ExecutionConfig, injected
 	if err := ctx.Err(); err != nil {
 		return err
 	}
-	observerDir, err := os.MkdirTemp("", ".rhiza-prepare-observer-")
+	observerDir, err = os.MkdirTemp("", ".rhiza-prepare-observer-")
 	if err != nil {
 		return err
 	}
-	defer func() { resultErr = errors.Join(resultErr, os.RemoveAll(observerDir)) }()
-	observerWAL, err := qlog.Open(observerDir)
+	observerWAL, err = qlog.Open(observerDir)
 	if err != nil {
 		return fmt.Errorf("open temporary history verifier: %w", err)
 	}
-	defer func() { resultErr = errors.Join(resultErr, observerWAL.Close()) }()
+	checkpointCacheDir := filepath.Join(observerDir, "checkpoint-cache")
+	if err := os.Mkdir(checkpointCacheDir, 0o700); err != nil {
+		return fmt.Errorf("create temporary checkpoint verification cache: %w", err)
+	}
 	if preparedRestoreCrashBoundary != nil {
 		preparedRestoreCrashBoundary("observer-open")
 	}
 
 	prefix := path.Join(config.ObjStorePrefix, string(config.ClusterID))
-	archive := recovery.NewManager(bucket, prefix, 1)
-	defer archive.Close()
+	archive = recovery.NewManager(bucket, prefix, 1)
 	if err := archive.Load(ctx); err != nil {
 		return fmt.Errorf("load certified source archive: %w", err)
 	}
@@ -214,7 +261,7 @@ func prepareRestore(ctx context.Context, config *types.ExecutionConfig, injected
 	if len(config.Members) > 1 && !archive.CASSupported() {
 		return fmt.Errorf("prepared learner restore requires conditional shared archive writes")
 	}
-	checkpoints := checkpoint.NewManager(bucket, prefix, config.DataDir, 1)
+	checkpoints := checkpoint.NewManager(bucket, prefix, checkpointCacheDir, 1)
 	if err := checkpoints.Load(ctx); err != nil {
 		return fmt.Errorf("load certified checkpoint manifest: %w", err)
 	}
@@ -222,11 +269,10 @@ func prepareRestore(ctx context.Context, config *types.ExecutionConfig, injected
 	if err != nil {
 		return err
 	}
-	guard, err := newStartupRecoveryGuard(ctx, archive, owner)
+	guard, err = newStartupRecoveryGuard(ctx, archive, owner)
 	if err != nil {
 		return fmt.Errorf("pin prepared restore source: %w", err)
 	}
-	defer func() { resultErr = errors.Join(resultErr, closePreparedRecovery(guard)) }()
 	snapshot := guard.Snapshot()
 	if snapshot == nil {
 		return fmt.Errorf("prepared learner restore requires a pinned archive snapshot")
@@ -235,7 +281,7 @@ func prepareRestore(ctx context.Context, config *types.ExecutionConfig, injected
 		return recovery.ErrArchiveSealed
 	}
 
-	n := &Node{config: config, bucket: bucket, archive: archive, checkpoints: checkpoints}
+	n = &Node{config: config, bucket: bucket, archive: archive, checkpoints: checkpoints}
 	cluster := n.loadClusterConfig()
 	core, err := quepaxa.NewObserver(quepaxa.Config{NodeID: quepaxa.NodeID("prepare-" + string(config.NodeID)), Cluster: *cluster, WAL: observerWAL, EnableReconfiguration: config.EnableReconfiguration})
 	if err != nil {
@@ -309,12 +355,6 @@ func prepareRestore(ctx context.Context, config *types.ExecutionConfig, injected
 		return fmt.Errorf("open prepared materializer: %w", err)
 	}
 	n.material = material
-	defer func() {
-		if n.material != nil {
-			resultErr = errors.Join(resultErr, n.material.Close())
-			n.material = nil
-		}
-	}()
 	if err := material.ConfigureLocalGraphNodePropertyIndexes(config.LocalGraphNodePropertyIndexes); err != nil {
 		return err
 	}
@@ -362,14 +402,8 @@ func prepareRestore(ctx context.Context, config *types.ExecutionConfig, injected
 	if err := guard.Check(ctx.Err()); err != nil {
 		return err
 	}
-	if err := material.Close(); err != nil {
-		return fmt.Errorf("sync prepared materializer: %w", err)
-	}
-	n.material = nil
 	baseMarker.Phase = "complete"
-	if err := writePreparedRestoreMarker(config.DataDir, baseMarker); err != nil {
-		return fmt.Errorf("commit prepared restore marker: %w", err)
-	}
+	completeMarker = &baseMarker
 	return nil
 }
 

@@ -122,6 +122,14 @@ learner 권한을 부여하지 않는다. 실제 Node 시작은 별도로 `Confi
 peer token을 요구한다. 기존 certified archive/checkpoint 및 materializer 복구 helper를
 재사용한다. 단독 노드용 공통 Local 복구 API로 해석해서는 안 된다.
 
+완료 marker는 materializer 동기화, recovery-pin 취소 및 종료, archive 종료, bucket mutation
+drain과 종료, 임시 observer WAL 정리가 모두 성공한 뒤 DataDir qlog 잠금을 보유한 상태에서만
+기록한다. 이 정리 단계에서 오류나 미확정 mutation이 있으면 완료 marker 기록을 시작하지 않고
+`preparing` 상태를 유지하며, 그 상태를 완료로 간주하거나 원격 상태를 강제로 정리하지 않는다.
+완료 marker의 rename/fsync 또는 qlog 잠금 해제에서 오류나 결과 미확정이 발생한 경우에는
+marker가 존재하더라도 settlement 증거로 단독 간주하지 않는다. 재시도는 기존 marker와 원격
+source를 다시 검증해야 하며, 원격 상태를 강제로 정리하지 않는다.
+
 실제 initContainer에서 API를 호출하고 DataDir 및 복구 설정을 앱 컨테이너와 동일하게
 공유하는 manifest wiring은 아직 미구현이다. initContainer는 `RHIZA_PREPARED_POD_UID`에
 Downward API의 현재 `metadata.uid`를 전달해야 한다. HA 런타임의 consensus learner identity는

@@ -137,15 +137,19 @@ func openGraph(path string, sqliteTip, idempotencyWindow uint64) (*graphState, e
 		return nil, err
 	}
 	g := &graphState{db: db, idempotencyWindow: idempotencyWindow, streamWake: make(chan struct{})}
+	closeOnError := func(cause error) (*graphState, error) {
+		if closeErr := g.close(); closeErr != nil {
+			cause = errors.Join(cause, fmt.Errorf("close graph database after open failure: %w", closeErr))
+		}
+		return nil, cause
+	}
 	encodedFormat, err := g.getMetadata(graphFormatKey)
 	if err != nil {
-		g.close()
-		return nil, err
+		return closeOnError(err)
 	}
 	if encodedFormat == nil {
 		if existing || sqliteTip != 0 {
-			g.close()
-			return nil, fmt.Errorf("existing graph state has no storage policy; rebuild from the decision log")
+			return closeOnError(fmt.Errorf("existing graph state has no storage policy; rebuild from the decision log"))
 		}
 		if err := db.Update(func(tx *latticedb.Tx) error {
 			if err := tx.PutAppMetadata(graphFormatKey, graphStoragePolicy); err != nil {
@@ -159,74 +163,60 @@ func openGraph(path string, sqliteTip, idempotencyWindow uint64) (*graphState, e
 			}
 			return tx.DeleteAppMetadata(graphPendingKey)
 		}); err != nil {
-			g.close()
-			return nil, err
+			return closeOnError(err)
 		}
 	} else if !bytes.Equal(encodedFormat, graphStoragePolicy) {
-		g.close()
-		return nil, fmt.Errorf("unsupported graph storage policy %q", encodedFormat)
+		return closeOnError(fmt.Errorf("unsupported graph storage policy %q", encodedFormat))
 	}
 	encodedTip, err := g.getMetadata(graphTipKey)
 	if err != nil {
-		g.close()
-		return nil, err
+		return closeOnError(err)
 	}
 	if encodedTip == nil {
-		g.close()
-		return nil, fmt.Errorf("graph storage policy has no applied slot; rebuild from the decision log")
+		return closeOnError(fmt.Errorf("graph storage policy has no applied slot; rebuild from the decision log"))
 	} else {
 		g.durableTip, err = decodeGraphTip(encodedTip)
 		if err != nil {
-			g.close()
-			return nil, err
+			return closeOnError(err)
 		}
 	}
 	encodedJournal, err := g.getMetadata(graphJournalKey)
 	if err != nil {
-		g.close()
-		return nil, err
+		return closeOnError(err)
 	}
 	journal, err := decodeGraphJournal(encodedJournal)
 	if err != nil {
-		g.close()
-		return nil, err
+		return closeOnError(err)
 	}
 	encodedPending, hasPending, err := g.getMetadataValue(graphPendingKey)
 	if err != nil {
-		g.close()
-		return nil, err
+		return closeOnError(err)
 	}
 	if hasPending && len(encodedPending) == 0 {
-		g.close()
-		return nil, fmt.Errorf("invalid pending graph apply marker")
+		return closeOnError(fmt.Errorf("invalid pending graph apply marker"))
 	}
 	pending, err := decodeGraphPending(encodedPending)
 	if err != nil {
-		g.close()
-		return nil, err
+		return closeOnError(err)
 	}
 	for _, entry := range journal {
 		if entry.Slot > g.durableTip {
-			g.close()
-			return nil, fmt.Errorf("graph recovery journal exceeds durable graph slot %d", g.durableTip)
+			return closeOnError(fmt.Errorf("graph recovery journal exceeds durable graph slot %d", g.durableTip))
 		}
 	}
 	if pending != nil && (pending.Slot <= sqliteTip || pending.Slot <= g.durableTip) {
-		g.close()
-		return nil, fmt.Errorf("pending graph slot %d is not ahead of SQLite and completed graph tips", pending.Slot)
+		return closeOnError(fmt.Errorf("pending graph slot %d is not ahead of SQLite and completed graph tips", pending.Slot))
 	}
 	journal = pendingGraphJournal(journal, sqliteTip)
 	if g.durableTip > sqliteTip && (len(journal) == 0 || journal[len(journal)-1].Slot != g.durableTip) {
-		g.close()
-		return nil, fmt.Errorf("graph recovery journal does not cover durable graph slot %d", g.durableTip)
+		return closeOnError(fmt.Errorf("graph recovery journal does not cover durable graph slot %d", g.durableTip))
 	}
 	g.pending = pending
 	g.tip = max(g.durableTip, sqliteTip)
 	if err := db.Update(func(tx *latticedb.Tx) error {
 		return tx.PutAppMetadata(graphJournalKey, encodeGraphJournal(journal))
 	}); err != nil {
-		g.close()
-		return nil, err
+		return closeOnError(err)
 	}
 	return g, nil
 }
@@ -386,18 +376,26 @@ func graphSlotKey(slot uint64) []byte {
 	return key
 }
 
-func (g *graphState) close() {
+func (g *graphState) close() error {
 	if g == nil {
-		return
+		return nil
 	}
 	g.mu.Lock()
 	defer g.mu.Unlock()
 	g.queryWG.Wait()
 	if g.db != nil {
-		close(g.streamWake)
-		_ = g.db.Close()
+		if err := g.db.Close(); err != nil {
+			if g.db.IsOpen() {
+				return err
+			}
+			g.db = nil
+			close(g.streamWake)
+			return err
+		}
 		g.db = nil
+		close(g.streamWake)
 	}
+	return nil
 }
 
 // update is the graph transaction boundary. afterCommitError is an unexported

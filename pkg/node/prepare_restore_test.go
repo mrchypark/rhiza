@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -21,6 +22,7 @@ import (
 	"github.com/mrchypark/rhiza/pkg/qlog"
 	"github.com/mrchypark/rhiza/pkg/quepaxa"
 	"github.com/mrchypark/rhiza/pkg/recovery"
+	thanosobjstore "github.com/thanos-io/objstore"
 )
 
 func TestPrepareRestoreMaterializesCertifiedCheckpointAndSuffix(t *testing.T) {
@@ -184,6 +186,10 @@ func TestPrepareRestoreMaterializesCertifiedCheckpointAndSuffix(t *testing.T) {
 	if err := bucket.Upload(ctx, registrationKey, bytes.NewReader(registration)); err != nil {
 		t.Fatal(err)
 	}
+	archiveDir := clonePreparedRestoreArchive(t, ctx, bucket)
+	openArchive := func() *objectstore.MeteredBucket {
+		return openPreparedRestoreTestBucket(t, archiveDir)
+	}
 	legacy, err := json.Marshal(recovery.MembershipRecord{Version: 1, Cluster: registered.Cluster, Membership: registered.Membership, Durability: registered.Durability})
 	if err != nil {
 		t.Fatal(err)
@@ -204,20 +210,24 @@ func TestPrepareRestoreMaterializesCertifiedCheckpointAndSuffix(t *testing.T) {
 		{name: "missing-required-field", data: []byte(`{"version":2,"cluster":"cluster","durability":"async"}`)},
 	} {
 		t.Run("bootstrap-registration-"+tc.name, func(t *testing.T) {
+			caseBucket := openPreparedRestoreTestBucket(t, archiveDir)
 			if tc.remove {
-				if err := bucket.Delete(ctx, registrationKey); err != nil {
+				if err := caseBucket.Delete(ctx, registrationKey); err != nil {
 					t.Fatal(err)
 				}
-			} else if err := bucket.Upload(ctx, registrationKey, bytes.NewReader(tc.data)); err != nil {
+			} else if err := caseBucket.Upload(ctx, registrationKey, bytes.NewReader(tc.data)); err != nil {
 				t.Fatal(err)
 			}
-			beforeRegistration, err := readVoterRegistration(ctx, bucket, registrationKey)
+			beforeRegistration, err := readVoterRegistration(ctx, caseBucket, registrationKey)
 			if err != nil {
+				t.Fatal(err)
+			}
+			if err := caseBucket.Close(); err != nil {
 				t.Fatal(err)
 			}
 			failed := config
 			failed.DataDir = filepath.Join(t.TempDir(), "fresh")
-			err = prepareRestore(ctx, &failed, bucket)
+			err = prepareRestore(ctx, &failed, openPreparedRestoreTestBucket(t, archiveDir))
 			if err == nil || !errors.Is(err, ErrVoterStateLost) {
 				t.Fatalf("prepare error=%v, want immutable-membership refusal", err)
 			}
@@ -229,23 +239,51 @@ func TestPrepareRestoreMaterializesCertifiedCheckpointAndSuffix(t *testing.T) {
 			failed.DataDir = filepath.Join(t.TempDir(), "interrupted")
 			writeInterruptedPreparedRestoreFixture(t, &failed)
 			beforeDataDir := snapshotPreparedRestoreDataDir(t, failed.DataDir)
-			if err := prepareRestore(ctx, &failed, bucket); err == nil || !errors.Is(err, ErrVoterStateLost) {
+			if err := prepareRestore(ctx, &failed, openPreparedRestoreTestBucket(t, archiveDir)); err == nil || !errors.Is(err, ErrVoterStateLost) {
 				t.Fatalf("interrupted restore error=%v, want immutable-membership refusal", err)
 			}
 			if after := snapshotPreparedRestoreDataDir(t, failed.DataDir); !reflect.DeepEqual(beforeDataDir, after) {
 				t.Fatalf("source refusal changed populated interrupted DataDir: before=%#v after=%#v", beforeDataDir, after)
 			}
-			afterRegistration, err := readVoterRegistration(ctx, bucket, registrationKey)
+			afterBucket := openPreparedRestoreTestBucket(t, archiveDir)
+			afterRegistration, err := readVoterRegistration(ctx, afterBucket, registrationKey)
 			if err != nil || !bytes.Equal(beforeRegistration, afterRegistration) {
 				t.Fatalf("source refusal changed immutable registration: before=%q after=%q err=%v", beforeRegistration, afterRegistration, err)
 			}
-			if err := bucket.Upload(ctx, registrationKey, bytes.NewReader(registration)); err != nil {
+			if err := afterBucket.Close(); err != nil {
+				t.Fatal(err)
+			}
+			repairBucket := openPreparedRestoreTestBucket(t, archiveDir)
+			if err := repairBucket.Upload(ctx, registrationKey, bytes.NewReader(registration)); err != nil {
 				t.Fatalf("restore product registration: %v", err)
+			}
+			if err := repairBucket.Close(); err != nil {
+				t.Fatal(err)
 			}
 		})
 	}
-	if err := prepareRestore(ctx, &config, bucket); err != nil {
-		t.Fatalf("prepare restore without runtime credentials: %v", err)
+	lockHeldAtCommit := false
+	previousBoundary := preparedRestoreCrashBoundary
+	preparedRestoreCrashBoundary = func(stage string) {
+		if previousBoundary != nil {
+			previousBoundary(stage)
+		}
+		if stage == "complete-marker-commit" {
+			_, lock, err := qlog.Acquire(filepath.Join(config.DataDir, "qlog"))
+			if err != nil {
+				lockHeldAtCommit = true
+				return
+			}
+			_ = lock.Release()
+		}
+	}
+	prepareErr := prepareRestore(ctx, &config, openArchive())
+	preparedRestoreCrashBoundary = previousBoundary
+	if prepareErr != nil {
+		t.Fatalf("prepare restore without runtime credentials: %v", prepareErr)
+	}
+	if !lockHeldAtCommit {
+		t.Fatal("qlog lock was not held at complete-marker commit")
 	}
 
 	marker, exists, err := readPreparedRestoreMarker(config.DataDir)
@@ -324,9 +362,11 @@ func TestPrepareRestoreMaterializesCertifiedCheckpointAndSuffix(t *testing.T) {
 	if err := state.Close(); err != nil {
 		t.Fatal(err)
 	}
+	runPreparedRestoreCloseFailureRegression(t, ctx, config, archiveDir)
+	runPreparedRestoreCleanupJoinRegression(t, ctx, config, archiveDir)
 
 	markerBytes := markerBeforeOpen
-	if err := prepareRestore(ctx, &config, bucket); err != nil {
+	if err := prepareRestore(ctx, &config, openArchive()); err != nil {
 		t.Fatalf("same-Pod prepare retry: %v", err)
 	}
 	markerRetry, err := os.ReadFile(filepath.Join(config.DataDir, preparedRestoreMarkerName))
@@ -349,18 +389,7 @@ func TestPrepareRestoreMaterializesCertifiedCheckpointAndSuffix(t *testing.T) {
 				t.Fatal(err)
 			}
 			ready := filepath.Join(t.TempDir(), "ready")
-			crashBucketDir := filepath.Join(t.TempDir(), "archive")
-			crashBucket, err := objectstore.NewBucket(objectstore.Config{Provider: objectstore.ProviderFilesystem, FilesystemDir: crashBucketDir})
-			if err != nil {
-				t.Fatal(err)
-			}
-			if err := crashBucket.Upload(ctx, registrationKey, bytes.NewReader(registration)); err != nil {
-				_ = crashBucket.Close()
-				t.Fatalf("copy product registration into child archive: %v", err)
-			}
-			if err := crashBucket.Close(); err != nil {
-				t.Fatal(err)
-			}
+			crashBucketDir := archiveDir
 			request, err := json.Marshal(preparedRestoreCrashRequest{Config: crashConfig, Stage: stage, ReadyFile: ready, Operation: "prepare", BucketDir: crashBucketDir})
 			if err != nil {
 				t.Fatal(err)
@@ -421,7 +450,7 @@ func TestPrepareRestoreMaterializesCertifiedCheckpointAndSuffix(t *testing.T) {
 				t.Fatal(err)
 			}
 			t.Setenv("TMPDIR", tmpDir)
-			if err := prepareRestore(ctx, &crashConfig, bucket); err != nil {
+			if err := prepareRestore(ctx, &crashConfig, openArchive()); err != nil {
 				t.Fatalf("same-Pod retry after %s hard kill: %v", stage, err)
 			}
 			completed, exists, err := readPreparedRestoreMarker(crashConfig.DataDir)
@@ -636,12 +665,48 @@ func TestPrepareRestoreCrashHelper(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		defer bucket.Close()
 	}
 	if err := prepareRestore(context.Background(), &request.Config, bucket); err != nil {
 		t.Fatalf("prepare restore before requested crash boundary: %v", err)
 	}
 	t.Fatal("requested prepare restore boundary was not reached")
+}
+
+func clonePreparedRestoreArchive(t *testing.T, ctx context.Context, source *objectstore.MeteredBucket) string {
+	t.Helper()
+	dir := filepath.Join(t.TempDir(), "prepared-restore-archive")
+	target, err := objectstore.NewBucket(objectstore.Config{Provider: objectstore.ProviderFilesystem, FilesystemDir: dir})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := source.Iter(ctx, "", func(name string) error {
+		reader, err := source.Get(ctx, name)
+		if err != nil {
+			return err
+		}
+		data, readErr := io.ReadAll(reader)
+		closeErr := reader.Close()
+		if readErr != nil || closeErr != nil {
+			return errors.Join(readErr, closeErr)
+		}
+		return target.Upload(ctx, name, bytes.NewReader(data))
+	}, thanosobjstore.WithRecursiveIter()); err != nil {
+		_ = target.Close()
+		t.Fatalf("copy certified restore archive: %v", err)
+	}
+	if err := target.Close(); err != nil {
+		t.Fatal(err)
+	}
+	return dir
+}
+
+func openPreparedRestoreTestBucket(t *testing.T, archiveDir string) *objectstore.MeteredBucket {
+	t.Helper()
+	bucket, err := objectstore.NewBucket(objectstore.Config{Provider: objectstore.ProviderFilesystem, FilesystemDir: archiveDir})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return bucket
 }
 
 func TestPrepareRestoreFailsClosedForUnknownOrPartialData(t *testing.T) {

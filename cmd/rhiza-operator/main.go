@@ -12,7 +12,6 @@ import (
 	"net/url"
 	"os"
 	"os/signal"
-	"strconv"
 	"strings"
 	"syscall"
 	"time"
@@ -194,32 +193,5 @@ func validateAnchorEndpoint(raw string) error {
 }
 
 func operatorBucketConfig() (objectstore.Config, error) {
-	config := objectstore.LoadConfig()
-	if directory := os.Getenv("RHIZA_OBJSTORE_DIR"); directory != "" {
-		if legacy := os.Getenv("RHIZA_FILESYSTEM_DIR"); legacy != "" && legacy != directory {
-			return objectstore.Config{}, fmt.Errorf("RHIZA_OBJSTORE_DIR conflicts with RHIZA_FILESYSTEM_DIR")
-		}
-		config.FilesystemDir = directory
-	}
-	if region := os.Getenv("RHIZA_OBJSTORE_REGION"); region != "" {
-		config.Region = region
-	}
-	if raw := os.Getenv("RHIZA_OBJSTORE_INSECURE"); raw != "" {
-		insecure, err := strconv.ParseBool(raw)
-		if err != nil {
-			return objectstore.Config{}, fmt.Errorf("invalid RHIZA_OBJSTORE_INSECURE")
-		}
-		config.Insecure = insecure
-	}
-	config.AccessKey = os.Getenv("RHIZA_OBJSTORE_ACCESS_KEY")
-	config.SecretKey = os.Getenv("RHIZA_OBJSTORE_SECRET_KEY")
-	config.SessionToken = os.Getenv("RHIZA_OBJSTORE_SESSION_TOKEN")
-	if raw := os.Getenv("RHIZA_OBJSTORE_MAX_RETRIES"); raw != "" {
-		retries, err := strconv.Atoi(raw)
-		if err != nil || retries < 0 {
-			return objectstore.Config{}, fmt.Errorf("invalid RHIZA_OBJSTORE_MAX_RETRIES")
-		}
-		config.MaxRetries = retries
-	}
-	return config, nil
+	return objectstore.LoadOperatorConfig()
 }

@@ -3,6 +3,7 @@ package sqlpolicy
 
 import (
 	"context"
+	"database/sql"
 	"errors"
 	"fmt"
 	"net/url"
@@ -40,7 +41,7 @@ func CheckSnapshotFile(ctx context.Context, path string) error {
 	return checkFile(ctx, path, true)
 }
 
-func checkFile(ctx context.Context, path string, immutable bool) error {
+func checkFile(ctx context.Context, path string, immutable bool) (resultErr error) {
 	path, err := filepath.Abs(path)
 	if err != nil {
 		return err
@@ -53,31 +54,43 @@ func checkFile(ctx context.Context, path string, immutable bool) error {
 	if err != nil {
 		return fmt.Errorf("%w: %v", ErrIncompatible, err)
 	}
-	defer db.Close()
+	return checkDatabase(ctx, db)
+}
+
+func checkDatabase(ctx context.Context, db *sql.DB) (resultErr error) {
+	defer func() {
+		if err := db.Close(); err != nil {
+			resultErr = errors.Join(resultErr, fmt.Errorf("%w: close policy database: %w", ErrIncompatible, err))
+		}
+	}()
 	var policy string
 	if err := db.QueryRowContext(ctx, `SELECT value FROM _rhiza_meta WHERE key='sql_execution_policy'`).Scan(&policy); err != nil {
-		return fmt.Errorf("%w: missing materialization marker: %v", ErrIncompatible, err)
+		return fmt.Errorf("%w: missing materialization marker: %w", ErrIncompatible, err)
 	}
 	if policy != Marker() {
 		return fmt.Errorf("%w: marker %q", ErrIncompatible, policy)
 	}
 	rows, err := db.QueryContext(ctx, `PRAGMA main.table_list`)
 	if err != nil {
-		return fmt.Errorf("%w: inspect table kinds: %v", ErrIncompatible, err)
+		return fmt.Errorf("%w: inspect table kinds: %w", ErrIncompatible, err)
 	}
-	defer rows.Close()
+	defer func() {
+		if err := rows.Close(); err != nil {
+			resultErr = errors.Join(resultErr, fmt.Errorf("%w: close policy table rows: %w", ErrIncompatible, err))
+		}
+	}()
 	for rows.Next() {
 		var schema, name, kind string
 		var columns, withoutRowID, strict int
 		if err := rows.Scan(&schema, &name, &kind, &columns, &withoutRowID, &strict); err != nil {
-			return fmt.Errorf("%w: inspect table kinds: %v", ErrIncompatible, err)
+			return fmt.Errorf("%w: inspect table kinds: %w", ErrIncompatible, err)
 		}
 		if kind == "virtual" || kind == "shadow" {
 			return fmt.Errorf("%w: persistent virtual tables are unsupported", ErrIncompatible)
 		}
 	}
 	if err := rows.Err(); err != nil {
-		return fmt.Errorf("%w: inspect table kinds: %v", ErrIncompatible, err)
+		return fmt.Errorf("%w: inspect table kinds: %w", ErrIncompatible, err)
 	}
 	return nil
 }

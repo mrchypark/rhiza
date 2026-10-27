@@ -71,35 +71,39 @@ var errSQLPreconditionFailed = errors.New("SQL precondition failed")
 // Materializer applies decided values to SQLite.
 // Uses single writer, multiple readers pattern like Hiqlite.
 type Materializer struct {
-	db                       *sql.DB
-	writer                   *sql.DB
-	readers                  []*sql.DB
-	mu                       sync.RWMutex
-	tip                      uint64
-	stateTip                 uint64
-	tipHash                  [32]byte
-	dbPath                   string
-	readersN                 int
-	idempotencyWindow        uint64
-	sqlReceiptRetention      sqlReceiptRetentionUsage
-	afterApplyCommitError    func() error
-	recentSQLReceipts        map[string]storedReceipt
-	pendingSQLReceipts       []pendingSQLReceipt
-	pendingSQLResultBytes    int
-	sqlReceipts              sqlReceiptBloom
-	graph                    *graphState
-	graphNodePropertyIndexes []types.GraphNodePropertyIndex
-	notifyMu                 sync.Mutex
-	nextSub                  uint64
-	subs                     map[uint64]notificationSubscription
-	notifyQueue              chan pendingNotification
-	notifyStop               chan struct{}
-	notifyStopOnce           sync.Once
-	notifyWG                 sync.WaitGroup
-	notifyDrops              atomic.Uint64
-	walCheckpointStop        chan struct{}
-	walCheckpointOnce        sync.Once
-	walCheckpointWG          sync.WaitGroup
+	db                          *sql.DB
+	writer                      *sql.DB
+	readers                     []*sql.DB
+	mu                          sync.RWMutex
+	closeErr                    error
+	restoreStateWriteHook       func(string, restoreState) error
+	restoreOpenedHook           func(*Materializer)
+	checkpointSnapshotCloseHook func(string)
+	tip                         uint64
+	stateTip                    uint64
+	tipHash                     [32]byte
+	dbPath                      string
+	readersN                    int
+	idempotencyWindow           uint64
+	sqlReceiptRetention         sqlReceiptRetentionUsage
+	afterApplyCommitError       func() error
+	recentSQLReceipts           map[string]storedReceipt
+	pendingSQLReceipts          []pendingSQLReceipt
+	pendingSQLResultBytes       int
+	sqlReceipts                 sqlReceiptBloom
+	graph                       *graphState
+	graphNodePropertyIndexes    []types.GraphNodePropertyIndex
+	notifyMu                    sync.Mutex
+	nextSub                     uint64
+	subs                        map[uint64]notificationSubscription
+	notifyQueue                 chan pendingNotification
+	notifyStop                  chan struct{}
+	notifyStopOnce              sync.Once
+	notifyWG                    sync.WaitGroup
+	notifyDrops                 atomic.Uint64
+	walCheckpointStop           chan struct{}
+	walCheckpointOnce           sync.Once
+	walCheckpointWG             sync.WaitGroup
 }
 
 type notificationSubscription struct {
@@ -2451,20 +2455,17 @@ func beginSQLiteSnapshot(ctx context.Context, db *sql.DB) (*sqliteSnapshot, erro
 		return nil, err
 	}
 	if _, err := conn.ExecContext(ctx, "BEGIN"); err != nil {
-		_ = conn.Close()
-		return nil, err
+		return nil, errors.Join(err, conn.Close())
 	}
 	var value string
 	if err := conn.QueryRowContext(ctx, `SELECT value FROM _rhiza_meta WHERE key = 'applied_slot'`).Scan(&value); err != nil {
-		_, _ = conn.ExecContext(context.Background(), "ROLLBACK")
-		_ = conn.Close()
-		return nil, err
+		_, rollbackErr := conn.ExecContext(context.Background(), "ROLLBACK")
+		return nil, errors.Join(err, rollbackErr, conn.Close())
 	}
 	index, err := strconv.ParseUint(value, 10, 64)
 	if err != nil {
-		_, _ = conn.ExecContext(context.Background(), "ROLLBACK")
-		_ = conn.Close()
-		return nil, err
+		_, rollbackErr := conn.ExecContext(context.Background(), "ROLLBACK")
+		return nil, errors.Join(err, rollbackErr, conn.Close())
 	}
 	return &sqliteSnapshot{conn: conn, index: index}, nil
 }
@@ -2487,10 +2488,7 @@ func (snapshot *sqliteSnapshot) Close() error {
 	_, rollbackErr := snapshot.conn.ExecContext(context.Background(), "ROLLBACK")
 	closeErr := snapshot.conn.Close()
 	snapshot.conn = nil
-	if rollbackErr != nil {
-		return rollbackErr
-	}
-	return closeErr
+	return errors.Join(rollbackErr, closeErr)
 }
 
 // CheckpointFilesAt captures fixed-role database files without packaging them.
@@ -2532,29 +2530,40 @@ func (m *Materializer) CheckpointFilesAt(ctx context.Context) ([]CheckpointFile,
 		err = fmt.Errorf("checkpoint stores disagree at slot %d", index)
 	}
 	var graphSnap *graphSnapshot
+	if err == nil && m.checkpointSnapshotCloseHook != nil {
+		m.checkpointSnapshotCloseHook("sqlite-snapshot-acquired-before-graph")
+	}
 	if err == nil {
 		graphSnap, err = m.beginGraphSnapshot(ctx)
 	}
-	m.mu.Unlock()
 	if err != nil {
+		var closeErr error
 		if sqliteSnapshot != nil {
-			_ = sqliteSnapshot.Close()
+			closeErr = errors.Join(closeErr, sqliteSnapshot.Close())
+			if m.checkpointSnapshotCloseHook != nil {
+				m.checkpointSnapshotCloseHook("snapshot-acquire-error-sqlite-closed")
+			}
 		}
+		if graphSnap != nil {
+			closeErr = errors.Join(closeErr, graphSnap.Close())
+		}
+		m.mu.Unlock()
 		cleanup()
-		return nil, 0, nil, err
+		return nil, 0, nil, errors.Join(err, closeErr)
 	}
+	m.mu.Unlock()
 	if err = sqliteSnapshot.Backup(sqlitePath); err == nil {
 		err = ctx.Err()
 	}
 	if err == nil {
 		err = graphSnap.Backup(graphPath)
 	}
-	if closeErr := graphSnap.Close(); err == nil {
-		err = closeErr
+	sqliteCloseErr := sqliteSnapshot.Close()
+	if m.checkpointSnapshotCloseHook != nil {
+		m.checkpointSnapshotCloseHook("sqlite-closed-before-graph")
 	}
-	if closeErr := sqliteSnapshot.Close(); err == nil {
-		err = closeErr
-	}
+	graphCloseErr := graphSnap.Close()
+	err = errors.Join(err, sqliteCloseErr, graphCloseErr)
 	if err != nil {
 		cleanup()
 		return nil, 0, nil, err
@@ -2655,6 +2664,10 @@ func syncDirectory(dir string) error {
 }
 
 func writeRestoreState(dbPath string, state restoreState) error {
+	return writeRestoreStateUsing(dbPath, state, syncDirectory)
+}
+
+func writeRestoreStateUsing(dbPath string, state restoreState, syncDir func(string) error) error {
 	dir := filepath.Dir(dbPath)
 	file, err := os.CreateTemp(dir, ".rhiza-restore-state-*")
 	if err != nil {
@@ -2677,7 +2690,14 @@ func writeRestoreState(dbPath string, state restoreState) error {
 	if err := os.Rename(name, restoreStatePath(dbPath)); err != nil {
 		return err
 	}
-	return syncDirectory(dir)
+	return syncDir(dir)
+}
+
+func (m *Materializer) writeRestoreState(state restoreState) error {
+	if m.restoreStateWriteHook != nil {
+		return m.restoreStateWriteHook(m.dbPath, state)
+	}
+	return writeRestoreState(m.dbPath, state)
 }
 
 func recoverRestore(dbPath string) error {
@@ -2742,8 +2762,15 @@ func recoverRestore(dbPath string) error {
 }
 
 func (m *Materializer) restoreParts(ctx context.Context, parts snapshotParts) error {
+	return m.restorePartsUsing(ctx, parts, os.Remove)
+}
+
+func (m *Materializer) restorePartsUsing(ctx context.Context, parts snapshotParts, removeFile func(string) error) (resultErr error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	if m.closeErr != nil {
+		return fmt.Errorf("materializer cannot restore after connection close failure: %w", m.closeErr)
+	}
 	dir := filepath.Dir(m.dbPath)
 	if parts.cleanup != nil {
 		defer parts.cleanup()
@@ -2753,41 +2780,63 @@ func (m *Materializer) restoreParts(ctx context.Context, parts snapshotParts) er
 		return err
 	}
 	tempPath := file.Name()
-	defer os.Remove(tempPath)
+	sidecarsOwned := false
+	defer func() {
+		var cleanupErr error
+		for _, path := range []string{tempPath, tempPath + "-wal", tempPath + "-shm"} {
+			if path != tempPath && !sidecarsOwned {
+				continue
+			}
+			if err := removeFile(path); err != nil && !os.IsNotExist(err) {
+				cleanupErr = errors.Join(cleanupErr, fmt.Errorf("remove owned restore temporary %q: %w", path, err))
+			}
+		}
+		resultErr = errors.Join(resultErr, cleanupErr)
+	}()
 	if err = file.Chmod(0o600); err == nil {
 		var source *os.File
 		source, err = os.Open(parts.sqlitePath)
 		if err == nil {
 			_, err = io.Copy(file, source)
-			if closeErr := source.Close(); err == nil {
-				err = closeErr
-			}
+			err = errors.Join(err, source.Close())
 		}
 	}
 	if err == nil {
 		err = file.Sync()
 	}
-	closeErr := file.Close()
-	if err != nil {
-		return fmt.Errorf("write snapshot: %w", err)
+	fileCloseErr := file.Close()
+	if err = errors.Join(err, fileCloseErr); err != nil {
+		return fmt.Errorf("write and close snapshot copy: %w", err)
 	}
-	if closeErr != nil {
-		return fmt.Errorf("close snapshot: %w", closeErr)
+	tempWALPath, tempSHMPath := tempPath+"-wal", tempPath+"-shm"
+	for _, sidecar := range []string{tempWALPath, tempSHMPath} {
+		if _, err := os.Lstat(sidecar); err == nil {
+			return fmt.Errorf("restore temporary sidecar %q already exists; preserve it", sidecar)
+		} else if !os.IsNotExist(err) {
+			return fmt.Errorf("inspect restore temporary sidecar %q: %w", sidecar, err)
+		}
 	}
+	sidecarsOwned = true
 	check, err := openSQLite((&url.URL{Scheme: "file", Path: filepath.ToSlash(tempPath)}).String()+"?mode=ro", false)
 	if err != nil {
 		return fmt.Errorf("open snapshot: %w", err)
 	}
 	var status string
 	err = check.QueryRowContext(ctx, `PRAGMA quick_check`).Scan(&status)
-	check.Close()
-	if err != nil || status != "ok" {
-		return fmt.Errorf("invalid snapshot: quick_check=%q err=%v", status, err)
+	checkCloseErr := check.Close()
+	if err = errors.Join(err, checkCloseErr); err != nil {
+		return fmt.Errorf("quick-check prepared SQLite snapshot: %w", err)
 	}
-	backupPath := m.dbPath + ".restore-backup"
+	if status != "ok" {
+		return fmt.Errorf("invalid snapshot: quick_check=%q", status)
+	}
 	if err := sqlpolicy.CheckFile(ctx, tempPath); err != nil {
 		return err
 	}
+	if err := removeRestoreTempSidecars(removeFile, tempWALPath, tempSHMPath); err != nil {
+		return err
+	}
+	backupPath := m.dbPath + ".restore-backup"
 	graphPath := filepath.Join(dir, "latticedb")
 	graphBackupPath := graphPath + ".restore-backup"
 	if _, err := os.Stat(backupPath); !os.IsNotExist(err) {
@@ -2801,9 +2850,6 @@ func (m *Materializer) restoreParts(ctx context.Context, parts snapshotParts) er
 	if graphStatErr != nil && !os.IsNotExist(graphStatErr) {
 		return graphStatErr
 	}
-	if err := writeRestoreState(m.dbPath, state); err != nil {
-		return fmt.Errorf("prepare restore journal: %w", err)
-	}
 	rollback := func(cause error) error {
 		var recoveryErr, reopenErr error
 		if err := recoverRestore(m.dbPath); err != nil {
@@ -2815,7 +2861,10 @@ func (m *Materializer) restoreParts(ctx context.Context, parts snapshotParts) er
 		return errors.Join(cause, recoveryErr, reopenErr)
 	}
 	if err := m.closeConnections(); err != nil {
-		return rollback(err)
+		return fmt.Errorf("close original materializer before restore: %w", err)
+	}
+	if err := m.writeRestoreState(state); err != nil {
+		return rollback(fmt.Errorf("prepare restore journal: %w", err))
 	}
 	for _, suffix := range []string{"-wal", "-shm"} {
 		if err := os.Remove(m.dbPath + suffix); err != nil && !os.IsNotExist(err) {
@@ -2829,7 +2878,7 @@ func (m *Materializer) restoreParts(ctx context.Context, parts snapshotParts) er
 		return rollback(err)
 	}
 	state.Phase = "sqlite-backed-up"
-	if err := writeRestoreState(m.dbPath, state); err != nil {
+	if err := m.writeRestoreState(state); err != nil {
 		return rollback(err)
 	}
 	graphBackedUp := false
@@ -2853,7 +2902,7 @@ func (m *Materializer) restoreParts(ctx context.Context, parts snapshotParts) er
 			return rollback(err)
 		}
 		state.Phase = "graph-installed"
-		if err := writeRestoreState(m.dbPath, state); err != nil {
+		if err := m.writeRestoreState(state); err != nil {
 			return rollback(err)
 		}
 	}
@@ -2871,10 +2920,13 @@ func (m *Materializer) restoreParts(ctx context.Context, parts snapshotParts) er
 		return rollback(err)
 	}
 	state.Phase = "sqlite-installed"
-	if err := writeRestoreState(m.dbPath, state); err != nil {
+	if err := m.writeRestoreState(state); err != nil {
 		return rollback(err)
 	}
 	restored, err := openMaterializer(m.dbPath, m.readersN, m.idempotencyWindow)
+	if err == nil && m.restoreOpenedHook != nil {
+		m.restoreOpenedHook(restored)
+	}
 	if err == nil {
 		err = restored.validateRestoredSnapshot()
 	}
@@ -2883,8 +2935,11 @@ func (m *Materializer) restoreParts(ctx context.Context, parts snapshotParts) er
 		restored.graphNodePropertyIndexes = slices.Clone(m.graphNodePropertyIndexes)
 	}
 	if err != nil {
+		cause := fmt.Errorf("open restored snapshot: %w", err)
 		if restored != nil {
-			_ = restored.Close()
+			if closeErr := restored.Close(); closeErr != nil {
+				return errors.Join(cause, fmt.Errorf("close restored materializer before rollback: %w", closeErr))
+			}
 		}
 		os.Remove(m.dbPath)
 		if graphInstalled {
@@ -2894,16 +2949,22 @@ func (m *Materializer) restoreParts(ctx context.Context, parts snapshotParts) er
 			_ = os.Rename(graphBackupPath, graphPath)
 		}
 		_ = os.Rename(backupPath, m.dbPath)
-		return rollback(fmt.Errorf("open restored snapshot: %w", err))
+		return rollback(cause)
 	}
 	state.Phase = "committed"
-	if err := writeRestoreState(m.dbPath, state); err != nil {
-		_ = restored.Close()
-		return rollback(fmt.Errorf("commit restore journal: %w", err))
+	if err := m.writeRestoreState(state); err != nil {
+		cause := fmt.Errorf("commit restore journal: %w", err)
+		if closeErr := restored.Close(); closeErr != nil {
+			return errors.Join(cause, fmt.Errorf("close restored materializer before rollback: %w", closeErr))
+		}
+		return rollback(cause)
 	}
 	if err := recoverRestore(m.dbPath); err != nil {
-		_ = restored.Close()
-		return rollback(fmt.Errorf("finalize restore: %w", err))
+		cause := fmt.Errorf("finalize restore: %w", err)
+		if closeErr := restored.Close(); closeErr != nil {
+			return errors.Join(cause, fmt.Errorf("close restored materializer before rollback: %w", closeErr))
+		}
+		return rollback(cause)
 	}
 	m.adopt(restored)
 	return nil
@@ -2966,25 +3027,56 @@ func (m *Materializer) Close() error {
 }
 
 func (m *Materializer) closeConnections() error {
+	if m.closeErr != nil && m.graph == nil {
+		return m.closeErr
+	}
+	priorErr := m.closeErr
+	var closeErr error
 	if m.graph != nil {
-		m.graph.close()
-		m.graph = nil
+		if err := m.graph.close(); err != nil {
+			closeErr = fmt.Errorf("close materializer graph database: %w", err)
+			if m.graph.db != nil && m.graph.db.IsOpen() {
+				return errors.Join(priorErr, closeErr)
+			}
+			m.graph = nil
+		} else {
+			m.graph = nil
+		}
 	}
 	if m.db != nil {
-		m.db.Close()
+		if err := m.db.Close(); err != nil {
+			closeErr = errors.Join(closeErr, fmt.Errorf("close materializer database: %w", err))
+		}
 		m.db = nil
 	}
 	if m.writer != nil {
-		m.writer.Close()
+		if err := m.writer.Close(); err != nil {
+			closeErr = errors.Join(closeErr, fmt.Errorf("close materializer writer: %w", err))
+		}
 		m.writer = nil
 	}
-	for _, r := range m.readers {
+	for i, r := range m.readers {
 		if r != nil {
-			r.Close()
+			if err := r.Close(); err != nil {
+				closeErr = errors.Join(closeErr, fmt.Errorf("close materializer reader %d: %w", i, err))
+			}
 		}
 	}
 	m.readers = nil
-	return nil
+	if closeErr != nil {
+		m.closeErr = errors.Join(m.closeErr, closeErr)
+	}
+	return errors.Join(priorErr, closeErr)
+}
+
+func removeRestoreTempSidecars(removeFile func(string) error, paths ...string) error {
+	var resultErr error
+	for _, path := range paths {
+		if err := removeFile(path); err != nil && !os.IsNotExist(err) {
+			resultErr = errors.Join(resultErr, fmt.Errorf("remove owned restore sidecar %q: %w", path, err))
+		}
+	}
+	return resultErr
 }
 
 // Health check

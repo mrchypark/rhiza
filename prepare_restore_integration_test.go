@@ -9,12 +9,20 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"mime"
+	"mime/multipart"
 	"net"
+	"net/http"
+	"net/http/httptest"
+	"net/http/httputil"
+	"net/textproto"
+	"net/url"
 	"os"
 	"path"
 	"path/filepath"
 	"reflect"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -42,6 +50,9 @@ func TestEmbeddedObjectStoragePrepareRestore(t *testing.T) {
 	if provider != "s3" && provider != "gcs" && provider != "azure" {
 		t.Fatalf("unsupported explicit emulator provider %q", provider)
 	}
+	upstream := embeddedEndpoint(t)
+	observer := newPrepareRestoreMutationObserver(t, upstream)
+	t.Setenv("RHIZA_EMBEDDED_ENDPOINT", observer.endpoint())
 
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Minute)
 	defer cancel()
@@ -56,6 +67,7 @@ func TestEmbeddedObjectStoragePrepareRestore(t *testing.T) {
 	base.CheckpointTailBytes = 1
 	base.EnableReconfiguration = true
 	base.AdminToken = generation + "-admin"
+	observer.setRoot(path.Join(base.ObjStorePrefix, cluster))
 
 	members, tokens := recoveryTestMembers(t, cluster, generation+"-source-token")
 	source, sourceConfigs := openRecoveryTestVoters(t, ctx, base, cluster, members, tokens)
@@ -179,8 +191,14 @@ func TestEmbeddedObjectStoragePrepareRestore(t *testing.T) {
 	prepared.Learner = &learner
 	prepared.Members = members
 
-	if err := prepareRestoreWithoutRuntimeCredentials(ctx, prepared); err != nil {
-		t.Fatalf("prepare learner materialization: %v", err)
+	observer.begin()
+	prepareErr := prepareRestoreWithoutRuntimeCredentials(ctx, prepared)
+	prepareMutations := observer.end()
+	if prepareErr != nil {
+		t.Fatalf("prepare learner materialization: %v; observed provider mutations: %+v", prepareErr, prepareMutations)
+	}
+	if err := assertPreparedRestoreMutationAllowlist(prepareMutations, path.Join(base.ObjStorePrefix, cluster)); err != nil {
+		t.Fatalf("PrepareRestore provider mutation scope: %v", err)
 	}
 	markerBase, markerTip := assertPreparedRestoreFiles(t, ctx, prepared.DataDir)
 	if maxSlot(baseSQL.Slot, baseGraphSlot) > markerBase || markerBase >= minSlot(suffixSQL.Slot, suffixGraphSlot) || markerTip < maxSlot(suffixSQL.Slot, suffixGraphSlot) {
@@ -249,6 +267,20 @@ func TestEmbeddedObjectStoragePrepareRestore(t *testing.T) {
 	}
 	if after := readPreparedDataDir(t, prepared.DataDir); !reflect.DeepEqual(validWAL, after) {
 		t.Fatal("same-Pod preparation rewrote or removed valid runtime WAL/materialized state")
+	}
+	if provider == "azure" {
+		missing := prepared
+		missing.ObjStoreBucket = "rhiza-never-create-" + generation
+		missing.DataDir = filepath.Join(t.TempDir(), "missing-container")
+		observer.begin()
+		missingErr := prepareRestoreWithoutRuntimeCredentials(ctx, missing)
+		missingMutations := observer.end()
+		if missingErr == nil {
+			t.Fatal("PrepareRestore unexpectedly succeeded with an absent Azure container")
+		}
+		if len(missingMutations) != 0 {
+			t.Fatalf("absent Azure container caused provider mutations: %+v", missingMutations)
+		}
 	}
 }
 
@@ -670,6 +702,581 @@ func hasPreparedRuntimeWAL(image map[string][]byte) bool {
 		}
 	}
 	return false
+}
+
+type prepareRestoreMutation struct {
+	Method string
+	Key    string
+	Status int
+	Denied bool
+}
+
+type prepareRestoreMutationObserver struct {
+	t        *testing.T
+	provider string
+	upstream *url.URL
+	server   *http.Server
+	listener net.Listener
+	mu       sync.Mutex
+	active   bool
+	root     string
+	records  []prepareRestoreMutation
+	sessions map[string]string
+}
+
+func newPrepareRestoreMutationObserver(t *testing.T, upstream string) *prepareRestoreMutationObserver {
+	t.Helper()
+	target, err := url.Parse(upstream)
+	if err != nil || target.Scheme != "http" || target.Host == "" {
+		t.Fatalf("invalid local provider upstream %q", upstream)
+	}
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen for provider observer: %v", err)
+	}
+	o := &prepareRestoreMutationObserver{
+		t: t, provider: os.Getenv("RHIZA_EMBEDDED_PROVIDER"), upstream: target,
+		listener: listener, sessions: make(map[string]string),
+	}
+	proxy := httputil.NewSingleHostReverseProxy(target)
+	proxy.ModifyResponse = func(response *http.Response) error {
+		if response.Request == nil {
+			return nil
+		}
+		o.mu.Lock()
+		defer o.mu.Unlock()
+		if len(o.records) > 0 {
+			for i := len(o.records) - 1; i >= 0; i-- {
+				if o.records[i].Status == 0 && o.records[i].Method == response.Request.Method {
+					o.records[i].Status = response.StatusCode
+					break
+				}
+			}
+		}
+		if response.Request.Method == http.MethodPost && strings.HasPrefix(response.Request.URL.Path, "/upload/") {
+			if location := response.Header.Get("Location"); location != "" {
+				u, err := url.Parse(location)
+				if err != nil || (u.IsAbs() && !strings.EqualFold(u.Host, o.upstream.Host) && !strings.EqualFold(u.Host, o.listener.Addr().String())) {
+					return fmt.Errorf("unrecognized provider resumable upload location")
+				}
+				if u.IsAbs() {
+					u.Scheme = "http"
+					u.Host = o.listener.Addr().String()
+					response.Header.Set("Location", u.String())
+				}
+				if key := o.sessions[prepareRestoreRequestFingerprint(response.Request.URL)]; key != "" {
+					o.sessions[prepareRestoreURLFingerprint(u)] = key
+				}
+			}
+		}
+		return nil
+	}
+	o.server = &http.Server{Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		o.mu.Lock()
+		active, root := o.active, o.root
+		if !active || !isPrepareRestoreMutation(r.Method) || (r.Method == http.MethodPost && r.URL.Path == "/token") {
+			o.mu.Unlock()
+			proxy.ServeHTTP(w, r)
+			return
+		}
+		body, err := readPrepareRestoreBody(r)
+		if err != nil {
+			o.records = append(o.records, prepareRestoreMutation{Method: r.Method, Denied: true})
+			o.mu.Unlock()
+			http.Error(w, "provider mutation body exceeds observer bound", http.StatusRequestEntityTooLarge)
+			return
+		}
+		key, parseErr := prepareRestoreMutationKey(r, body, o.provider, o.sessions)
+		allowed := parseErr == nil && isAllowedPrepareRestoreMutationKey(key, root)
+		record := prepareRestoreMutation{Method: r.Method, Key: key, Denied: !allowed}
+		o.records = append(o.records, record)
+		if allowed && r.Method == http.MethodPost && strings.HasPrefix(r.URL.Path, "/upload/") {
+			o.sessions[prepareRestoreRequestFingerprint(r.URL)] = key
+		}
+		o.mu.Unlock()
+		if !allowed {
+			http.Error(w, "provider mutation is outside PrepareRestore allowlist", http.StatusForbidden)
+			return
+		}
+		proxy.ServeHTTP(w, r)
+	})}
+	go func() { _ = o.server.Serve(listener) }()
+	t.Cleanup(func() {
+		ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+		defer cancel()
+		if err := o.server.Shutdown(ctx); err != nil {
+			t.Errorf("stop provider observer: %v", err)
+		}
+	})
+	return o
+}
+
+func (o *prepareRestoreMutationObserver) endpoint() string {
+	return "http://" + o.listener.Addr().String()
+}
+
+func (o *prepareRestoreMutationObserver) setRoot(root string) {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	o.root = strings.Trim(root, "/")
+}
+
+func (o *prepareRestoreMutationObserver) begin() {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	if o.active {
+		o.t.Fatal("provider mutation observer capture already active")
+	}
+	o.records = nil
+	o.sessions = make(map[string]string)
+	o.active = true
+}
+
+func (o *prepareRestoreMutationObserver) end() []prepareRestoreMutation {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	o.active = false
+	return append([]prepareRestoreMutation(nil), o.records...)
+}
+
+func readPrepareRestoreBody(r *http.Request) ([]byte, error) {
+	const maxObservedBody = 1 << 20
+	if r.Body == nil {
+		return nil, nil
+	}
+	body, err := io.ReadAll(io.LimitReader(r.Body, maxObservedBody+1))
+	if err != nil {
+		return nil, err
+	}
+	if len(body) > maxObservedBody {
+		return nil, fmt.Errorf("request body exceeds observation limit")
+	}
+	r.Body = io.NopCloser(bytes.NewReader(body))
+	r.ContentLength = int64(len(body))
+	return body, nil
+}
+
+func isPrepareRestoreMutation(method string) bool {
+	switch method {
+	case http.MethodPut, http.MethodPost, http.MethodPatch, http.MethodDelete:
+		return true
+	default:
+		return false
+	}
+}
+
+func prepareRestoreMutationKey(r *http.Request, body []byte, provider string, sessions map[string]string) (string, error) {
+	if key := sessions[prepareRestoreRequestFingerprint(r.URL)]; key != "" {
+		return key, nil
+	}
+	decodedPath, err := url.PathUnescape(r.URL.EscapedPath())
+	if err != nil || strings.Contains(decodedPath, "%") || path.Clean(decodedPath) != decodedPath {
+		return "", fmt.Errorf("noncanonical or multiply escaped mutation path")
+	}
+	if provider == "gcs" {
+		query, err := url.ParseQuery(r.URL.RawQuery)
+		if err != nil {
+			return "", fmt.Errorf("parse GCS mutation query: %w", err)
+		}
+		queryNames := query["name"]
+		if len(queryNames) > 1 {
+			return "", fmt.Errorf("GCS mutation has duplicate query object names")
+		}
+		if len(queryNames) == 1 && queryNames[0] == "" {
+			return "", fmt.Errorf("GCS mutation has an empty query object name")
+		}
+		bodyName := ""
+		mediaType, _, mediaTypeErr := mime.ParseMediaType(r.Header.Get("Content-Type"))
+		if mediaTypeErr == nil && (strings.HasPrefix(mediaType, "multipart/") || strings.Contains(mediaType, "json")) {
+			bodyName, err = gcsObjectNameFromBody(r.Header.Get("Content-Type"), body)
+			if err != nil {
+				return "", err
+			}
+		}
+		key := ""
+		for _, candidate := range []string{firstGCSObjectName(queryNames), bodyName, gcsObjectNameFromPath(decodedPath)} {
+			if candidate == "" {
+				continue
+			}
+			if key != "" && key != candidate {
+				return "", fmt.Errorf("GCS mutation object names conflict")
+			}
+			key = candidate
+		}
+		if key == "" {
+			return "", fmt.Errorf("GCS mutation has no exact object name")
+		}
+		return key, nil
+	}
+	parts := strings.Split(strings.Trim(decodedPath, "/"), "/")
+	strip := 1
+	if provider == "azure" {
+		strip = 2 // account and container; container creation has no blob key.
+	}
+	if len(parts) <= strip {
+		return "", fmt.Errorf("provider mutation path has no object key")
+	}
+	key := strings.Join(parts[strip:], "/")
+	if key == "" || strings.HasPrefix(key, "/") {
+		return "", fmt.Errorf("provider mutation has an empty object key")
+	}
+	return key, nil
+}
+
+func firstGCSObjectName(names []string) string {
+	if len(names) == 0 {
+		return ""
+	}
+	return names[0]
+}
+
+func gcsObjectNameFromPath(p string) string {
+	const marker = "/o/"
+	index := strings.Index(p, marker)
+	if index < 0 || !strings.HasPrefix(p, "/storage/v1/b/") {
+		return ""
+	}
+	return strings.TrimPrefix(p[index+len(marker):], "/")
+}
+
+func gcsObjectNameFromBody(contentType string, body []byte) (string, error) {
+	mediaType, params, err := mime.ParseMediaType(contentType)
+	if err != nil {
+		return "", err
+	}
+	if strings.HasPrefix(mediaType, "multipart/") {
+		reader := multipart.NewReader(bytes.NewReader(body), params["boundary"])
+		metadataParts := 0
+		multipleMetadata := false
+		partIndex := 0
+		var objectName string
+		for {
+			part, nextErr := reader.NextPart()
+			if errors.Is(nextErr, io.EOF) {
+				break
+			}
+			if nextErr != nil {
+				return "", nextErr
+			}
+			partMediaType, _, partMediaTypeErr := mime.ParseMediaType(part.Header.Get("Content-Type"))
+			isFormMetadata := part.FormName() == "metadata"
+			isRelatedMetadata := mediaType == "multipart/related" && partIndex == 0 && partMediaTypeErr == nil && strings.Contains(partMediaType, "json")
+			if isFormMetadata || isRelatedMetadata {
+				metadataParts++
+				if metadataParts > 1 {
+					multipleMetadata = true
+					_ = part.Close()
+					partIndex++
+					continue
+				}
+				objectName, err = readPrepareRestoreMultipartMetadata(part)
+				_ = part.Close()
+				if err != nil {
+					return "", err
+				}
+			} else if mediaType == "multipart/related" && partIndex > 0 && partMediaTypeErr == nil && strings.Contains(partMediaType, "json") {
+				metadata, parseErr := readPrepareRestoreMultipartMetadata(part)
+				_ = part.Close()
+				if parseErr != nil {
+					return "", parseErr
+				}
+				if metadata != "" {
+					multipleMetadata = true
+				}
+			} else {
+				_ = part.Close()
+			}
+			partIndex++
+		}
+		if multipleMetadata || metadataParts > 1 {
+			return "", fmt.Errorf("multipart request has multiple metadata parts")
+		}
+		if metadataParts != 1 {
+			return "", fmt.Errorf("multipart metadata part missing")
+		}
+		return objectName, nil
+	}
+	if strings.Contains(mediaType, "json") {
+		return decodeGCSMetadataName(body)
+	}
+	return "", fmt.Errorf("unrecognized GCS mutation content type")
+}
+
+func readPrepareRestoreMultipartMetadata(part *multipart.Part) (string, error) {
+	const maxMetadataBytes = 64 << 10
+	data, err := io.ReadAll(io.LimitReader(part, maxMetadataBytes+1))
+	if err != nil {
+		return "", err
+	}
+	if len(data) > maxMetadataBytes {
+		return "", fmt.Errorf("multipart metadata exceeds observer bound")
+	}
+	return decodeGCSMetadataName(data)
+}
+
+func decodeGCSMetadataName(data []byte) (string, error) {
+	decoder := json.NewDecoder(bytes.NewReader(data))
+	opening, err := decoder.Token()
+	if err != nil {
+		return "", err
+	}
+	if opening != json.Delim('{') {
+		return "", fmt.Errorf("GCS metadata must be a JSON object")
+	}
+	var name string
+	nameSeen := false
+	for decoder.More() {
+		fieldToken, err := decoder.Token()
+		if err != nil {
+			return "", err
+		}
+		field, ok := fieldToken.(string)
+		if !ok {
+			return "", fmt.Errorf("GCS metadata field name is not a string")
+		}
+		if field == "name" {
+			if nameSeen {
+				return "", fmt.Errorf("GCS metadata has duplicate name fields")
+			}
+			nameSeen = true
+			if err := decoder.Decode(&name); err != nil {
+				return "", fmt.Errorf("decode GCS metadata name: %w", err)
+			}
+			continue
+		}
+		var ignored json.RawMessage
+		if err := decoder.Decode(&ignored); err != nil {
+			return "", err
+		}
+	}
+	closing, err := decoder.Token()
+	if err != nil || closing != json.Delim('}') {
+		return "", fmt.Errorf("GCS metadata object is incomplete")
+	}
+	if _, err := decoder.Token(); !errors.Is(err, io.EOF) {
+		if err == nil {
+			return "", fmt.Errorf("GCS metadata has trailing JSON")
+		}
+		return "", fmt.Errorf("GCS metadata trailing data: %w", err)
+	}
+	if nameSeen && name == "" {
+		return "", fmt.Errorf("GCS metadata has an empty name")
+	}
+	return name, nil
+}
+
+func prepareRestoreRequestFingerprint(u *url.URL) string {
+	return prepareRestoreURLFingerprint(u)
+}
+
+func prepareRestoreURLFingerprint(u *url.URL) string {
+	if u == nil {
+		return ""
+	}
+	sum := sha256.Sum256([]byte(u.EscapedPath() + "?" + u.RawQuery))
+	return hex.EncodeToString(sum[:])
+}
+
+func isAllowedPrepareRestoreMutationKey(key, root string) bool {
+	if key == "" || strings.Contains(key, "\\") || strings.Contains(key, "%") || path.Clean(key) != key || strings.HasPrefix(key, "../") {
+		return false
+	}
+	if key == path.Join(root, "archive/GC_LOCK") || key == path.Join(root, "checkpoint/PUBLISHER") {
+		return true
+	}
+	for _, prefix := range []string{path.Join(root, "archive/recovery-pins") + "/", path.Join(root, "checkpoint/recovery-pins") + "/"} {
+		if strings.HasPrefix(key, prefix) {
+			leaf := strings.TrimPrefix(key, prefix)
+			return leaf != "" && !strings.Contains(leaf, "/") && leaf != "." && leaf != ".."
+		}
+	}
+	return false
+}
+
+func assertPreparedRestoreMutationAllowlist(records []prepareRestoreMutation, root string) error {
+	if len(records) == 0 {
+		return fmt.Errorf("no provider mutations were observed during PrepareRestore")
+	}
+	for _, record := range records {
+		if record.Denied || record.Status == 0 || !isAllowedPrepareRestoreMutationKey(record.Key, root) {
+			return fmt.Errorf("unexpected provider mutation method=%s key=%q status=%d", record.Method, record.Key, record.Status)
+		}
+	}
+	return nil
+}
+
+func TestPrepareRestoreProviderMutationParsing(t *testing.T) {
+	root := "prefix/cluster"
+	allowed := root + "/archive/recovery-pins/pin-1"
+	newRequest := func(method, target, contentType string, body []byte) *http.Request {
+		r := httptest.NewRequest(method, target, bytes.NewReader(body))
+		r.Header.Set("Content-Type", contentType)
+		return r
+	}
+	makeRelated := func(t *testing.T, metadata ...string) (string, []byte) {
+		t.Helper()
+		var body bytes.Buffer
+		writer := multipart.NewWriter(&body)
+		for _, document := range metadata {
+			header := make(textproto.MIMEHeader)
+			header.Set("Content-Type", "application/json; charset=UTF-8")
+			part, err := writer.CreatePart(header)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err := io.WriteString(part, document); err != nil {
+				t.Fatal(err)
+			}
+		}
+		header := make(textproto.MIMEHeader)
+		header.Set("Content-Type", "application/octet-stream")
+		media, err := writer.CreatePart(header)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := io.WriteString(media, "payload"); err != nil {
+			t.Fatal(err)
+		}
+		if err := writer.Close(); err != nil {
+			t.Fatal(err)
+		}
+		return "multipart/related; boundary=" + writer.Boundary(), body.Bytes()
+	}
+	t.Run("GCS SDK multipart/related metadata header", func(t *testing.T) {
+		contentType, body := makeRelated(t, `{"name":"`+allowed+`"}`)
+		r := newRequest(http.MethodPost, "http://emulator/upload/storage/v1/b/bucket/o?uploadType=multipart&name="+url.QueryEscape(allowed), contentType, body)
+		key, err := prepareRestoreMutationKey(r, body, "gcs", nil)
+		if err != nil || key != allowed {
+			t.Fatalf("SDK multipart/related name=%q err=%v", key, err)
+		}
+	})
+	t.Run("GCS resumable query exact name", func(t *testing.T) {
+		r := newRequest(http.MethodPost, "http://emulator/upload/storage/v1/b/bucket/o?uploadType=resumable&name="+url.QueryEscape(allowed), "application/json", []byte(`{}`))
+		key, err := prepareRestoreMutationKey(r, []byte(`{}`), "gcs", nil)
+		if err != nil || key != allowed {
+			t.Fatalf("query name=%q err=%v", key, err)
+		}
+	})
+	t.Run("unknown GCS name rejected", func(t *testing.T) {
+		r := newRequest(http.MethodPost, "http://emulator/upload/storage/v1/b/bucket/o?uploadType=resumable", "application/json", []byte(`{"name":"other/object"}`))
+		key, err := prepareRestoreMutationKey(r, []byte(`{"name":"other/object"}`), "gcs", nil)
+		if err != nil || isAllowedPrepareRestoreMutationKey(key, root) {
+			t.Fatalf("unknown name accepted: key=%q err=%v", key, err)
+		}
+	})
+	t.Run("missing GCS name rejected", func(t *testing.T) {
+		r := newRequest(http.MethodPost, "http://emulator/upload/storage/v1/b/bucket/o?uploadType=resumable", "application/json", []byte(`{}`))
+		if _, err := prepareRestoreMutationKey(r, []byte(`{}`), "gcs", nil); err == nil {
+			t.Fatal("missing object name accepted")
+		}
+	})
+	t.Run("duplicate JSON name rejected", func(t *testing.T) {
+		if _, err := decodeGCSMetadataName([]byte(`{"name":"` + allowed + `","name":"` + allowed + `"}`)); err == nil {
+			t.Fatal("duplicate JSON name accepted")
+		}
+	})
+	t.Run("trailing JSON object rejected", func(t *testing.T) {
+		if _, err := decodeGCSMetadataName([]byte(`{"name":"` + allowed + `"}{"name":"other/object"}`)); err == nil {
+			t.Fatal("trailing JSON object accepted")
+		}
+	})
+	t.Run("multiple SDK metadata parts rejected", func(t *testing.T) {
+		contentType, body := makeRelated(t, `{"name":"`+allowed+`"}`, `{"name":"`+allowed+`"}`)
+		if _, err := gcsObjectNameFromBody(contentType, body); err == nil {
+			t.Fatal("multiple metadata parts accepted")
+		}
+	})
+	t.Run("query and body name conflict rejected", func(t *testing.T) {
+		body := []byte(`{"name":"other/object"}`)
+		target := "http://emulator/upload/storage/v1/b/bucket/o?uploadType=resumable&name=" + url.QueryEscape(allowed)
+		r := newRequest(http.MethodPost, target, "application/json", body)
+		if _, err := prepareRestoreMutationKey(r, body, "gcs", nil); err == nil {
+			t.Fatal("conflicting query and body object names accepted")
+		}
+	})
+	t.Run("HEAD is not mutation", func(t *testing.T) {
+		if isPrepareRestoreMutation(http.MethodHead) {
+			t.Fatal("HEAD treated as mutation")
+		}
+	})
+	t.Run("DELETE canonical control allowed", func(t *testing.T) {
+		if !isPrepareRestoreMutation(http.MethodDelete) || !isAllowedPrepareRestoreMutationKey(root+"/archive/GC_LOCK", root) {
+			t.Fatal("canonical control DELETE was not recognized")
+		}
+	})
+	t.Run("escaped traversal rejected", func(t *testing.T) {
+		r := newRequest(http.MethodPut, "http://emulator/bucket/prefix%2f..%2fcluster%2farchive%2fGC_LOCK", "application/octet-stream", nil)
+		if _, err := prepareRestoreMutationKey(r, nil, "s3", nil); err == nil {
+			t.Fatal("escaped traversal accepted")
+		}
+	})
+	t.Run("double escaped path rejected", func(t *testing.T) {
+		r := newRequest(http.MethodPut, "http://emulator/bucket/prefix/%252e%252e/cluster/archive/GC_LOCK", "application/octet-stream", nil)
+		if _, err := prepareRestoreMutationKey(r, nil, "s3", nil); err == nil {
+			t.Fatal("double escaped path accepted")
+		}
+	})
+}
+
+func TestPrepareRestoreProviderObserverForwardsBodyAndTracksResumableUpload(t *testing.T) {
+	var gotBody []byte
+	var gotHost string
+	var gotAuthorization string
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotHost = r.Host
+		gotAuthorization = r.Header.Get("Authorization")
+		gotBody, _ = io.ReadAll(r.Body)
+		if r.Method == http.MethodPost {
+			w.Header().Set("Location", "http://"+r.Host+"/upload/session?token=opaque")
+			w.WriteHeader(http.StatusCreated)
+			return
+		}
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer upstream.Close()
+	t.Setenv("RHIZA_EMBEDDED_PROVIDER", "gcs")
+	observer := newPrepareRestoreMutationObserver(t, upstream.URL)
+	observer.setRoot("prefix/cluster")
+	observer.begin()
+	body := []byte(`{"name":"prefix/cluster/archive/recovery-pins/pin-a"}`)
+	request, err := http.NewRequest(http.MethodPost, observer.endpoint()+"/upload/storage/v1/b/bucket/o?uploadType=resumable", bytes.NewReader(body))
+	if err != nil {
+		t.Fatal(err)
+	}
+	request.Header.Set("Content-Type", "application/json")
+	request.Header.Set("Authorization", "Bearer signature-preservation-test")
+	response, err := http.DefaultClient.Do(request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	location := response.Header.Get("Location")
+	_ = response.Body.Close()
+	parsedLocation, err := url.Parse(location)
+	if err != nil || parsedLocation.Host != observer.listener.Addr().String() {
+		t.Fatalf("resumable location not kept on observer: %q err=%v", location, err)
+	}
+	if !bytes.Equal(gotBody, body) {
+		t.Fatalf("forwarded body changed: got=%q want=%q", gotBody, body)
+	}
+	if gotHost != observer.listener.Addr().String() {
+		t.Fatalf("request Host changed: got=%q want=%q", gotHost, observer.listener.Addr().String())
+	}
+	if gotAuthorization != "Bearer signature-preservation-test" {
+		t.Fatalf("authorization/signature header changed: got=%q", gotAuthorization)
+	}
+	put, err := http.NewRequest(http.MethodPut, location, bytes.NewReader([]byte("chunk")))
+	if err != nil {
+		t.Fatal(err)
+	}
+	putResponse, err := http.DefaultClient.Do(put)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = putResponse.Body.Close()
+	records := observer.end()
+	if len(records) != 2 || records[0].Key != "prefix/cluster/archive/recovery-pins/pin-a" || records[1].Key != records[0].Key {
+		t.Fatalf("resumable upload mutations not both observed against exact object: %+v", records)
+	}
 }
 
 func TestComparePreparedRestoreArchiveImages(t *testing.T) {

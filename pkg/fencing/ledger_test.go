@@ -1,6 +1,15 @@
 package fencing
 
-import "testing"
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"net/http"
+	"net/http/httptest"
+	"os"
+	"path/filepath"
+	"testing"
+)
 
 func testIdentity() Identity {
 	return Identity{SourceClusterID: "source", NodeID: "n1", PodUID: "pod-uid", RunID: "run-1"}
@@ -123,6 +132,163 @@ func TestLedgerVoterFenceThenGenerationPreservesReceipts(t *testing.T) {
 				t.Fatal("prior clean stop not reused")
 			}
 		})
+	}
+}
+
+func TestPeerClosureReservationRejectsAbortRoundTargetSwitch(t *testing.T) {
+	l := peerClosureLedger(t)
+	first := peerClosureReservation("op-b", "hash-b", 3, 7, "B", "wal-B", []string{"A", "B", "C"}, "pod-B")
+	if err := l.ReservePeerClosure(first); err != nil {
+		t.Fatal(err)
+	}
+	if err := l.ReservePeerClosure(first); err != nil {
+		t.Fatalf("exact reservation retry failed: %v", err)
+	}
+	second := peerClosureReservation("op-c", "hash-c", 3, 8, "C", "wal-C", []string{"A", "B", "C"}, "pod-C")
+	if err := l.ReservePeerClosure(second); !errors.Is(err, ErrPending) {
+		t.Fatalf("different target in the same membership generation = %v, want pending", err)
+	}
+	if l.PeerClosure == nil || l.PeerClosure.TargetNodeID != "B" {
+		t.Fatalf("rejected request replaced the durable reservation: %+v", l.PeerClosure)
+	}
+}
+
+func TestPeerClosureReservationAllowsNextTargetOnlyAfterRemovalAndTerminalProof(t *testing.T) {
+	l := peerClosureLedger(t)
+	first := peerClosureReservation("op-b", "hash-b", 3, 7, "B", "wal-B", []string{"A", "B", "C"}, "pod-B")
+	if err := l.ReservePeerClosure(first); err != nil {
+		t.Fatal(err)
+	}
+	if err := l.ReservePeerClosure(peerClosureReservation("op-c", "hash-c", 4, 8, "C", "wal-C", []string{"A", "C"}, "pod-C")); !errors.Is(err, ErrPending) {
+		t.Fatalf("target switch before termination proof = %v, want pending", err)
+	}
+	request := *l.Runs["run-B"].Stop
+	if err := l.RecordDrain(DrainReceipt{Request: request, WritersJoined: true}); err != nil {
+		t.Fatal(err)
+	}
+	if err := l.RecordExit(request); err != nil {
+		t.Fatal(err)
+	}
+	second := peerClosureReservation("op-c", "hash-c", 4, 8, "C", "wal-C", []string{"A", "C"}, "pod-C")
+	if err := l.ReservePeerClosure(second); err != nil {
+		t.Fatalf("target switch after prior target left membership and exited = %v", err)
+	}
+	if l.ClosedNodes["B"].OperationID != first.OperationID || l.PeerClosure.TargetNodeID != "C" {
+		t.Fatalf("reservation replacement discarded prior closure: peer=%+v closed=%+v", l.PeerClosure, l.ClosedNodes)
+	}
+}
+
+func TestPeerClosureReservationConflictsWithOtherVoterFence(t *testing.T) {
+	l := peerClosureLedger(t)
+	if err := l.CloseNodes("operator-op", "operator-hash", []string{"B"}); err != nil {
+		t.Fatal(err)
+	}
+	request := peerClosureReservation("peer-op", "peer-hash", 3, 7, "C", "wal-C", []string{"A", "B", "C"}, "pod-C")
+	if err := l.ReservePeerClosure(request); !errors.Is(err, ErrPending) {
+		t.Fatalf("peer closure ignored an existing in-membership operator fence = %v, want pending", err)
+	}
+
+	// The reverse race is equally serialized: an operator CR may exist before
+	// its reconciler reaches the ledger CAS, but it cannot execute after this
+	// reservation wins.
+	reverse := peerClosureLedger(t)
+	request = peerClosureReservation("peer-op", "peer-hash", 3, 7, "B", "wal-B", []string{"A", "B", "C"}, "pod-B")
+	if err := reverse.ReservePeerClosure(request); err != nil {
+		t.Fatal(err)
+	}
+	if err := reverse.CloseNodes("operator-op", "operator-hash", []string{"B"}); !errors.Is(err, ErrPending) {
+		t.Fatalf("delayed operator voter fence passed a peer reservation = %v, want pending", err)
+	}
+	if err := reverse.Close("generation-op", "generation-hash"); err != nil {
+		t.Fatalf("generation-wide emergency close blocked by voter reservation: %v", err)
+	}
+}
+
+func TestPeerClosureReservationRetainsUnboundHistoryAlongsideRequestedWAL(t *testing.T) {
+	l := Ledger{SourceClusterID: "source", Runs: map[string]Run{
+		"run-caller": {Identity: Identity{SourceClusterID: "source", NodeID: "A", PodUID: "pod-A", RunID: "run-caller", WALIdentity: "wal-A"}},
+		"run-empty":  {Identity: Identity{SourceClusterID: "source", NodeID: "B", PodUID: "pod-B", RunID: "run-empty"}},
+		"run-bound":  {Identity: Identity{SourceClusterID: "source", NodeID: "B", PodUID: "pod-B", RunID: "run-bound", WALIdentity: "wal-B"}},
+	}}
+	request := PeerClosureReservation{
+		OperationID: "op-b", RequestHash: "hash-b", ConfigID: 3, AbortSlot: 7,
+		TargetNodeID: "B", TargetWAL: "wal-B", Voters: []string{"A", "B", "C"},
+		Targets: []PeerClosureTarget{
+			{NodeID: "B", Pod: "B", PodUID: "pod-B"},
+			{NodeID: "B", Pod: "B", PodUID: "pod-B", WALIdentity: "wal-B"},
+		},
+	}
+	if err := l.ReservePeerClosure(request); err != nil {
+		t.Fatalf("exact requested WAL with retained unbound history rejected: %v", err)
+	}
+	if l.PeerClosure.Targets[0].WALIdentity != "" && l.PeerClosure.Targets[1].WALIdentity != "" {
+		t.Fatal("unbound history was rewritten to a bound WAL")
+	}
+}
+
+func TestAuthorityClientAcceptsRetainedUnboundPeerTarget(t *testing.T) {
+	caller := Identity{SourceClusterID: "source", NodeID: "rhiza-0", PodUID: "caller-uid", RunID: "caller-run", WALIdentity: "wal-caller"}
+	closure := PeerClosureRequest{ExpectedConfigID: 3, ExpectedAbortSlot: uint64Pointer(7), TargetNodeID: "rhiza-1", TargetWALIdentity: "wal-target"}
+	token := filepath.Join(t.TempDir(), "token")
+	if err := os.WriteFile(token, []byte("test-token"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	for _, test := range []struct {
+		name      string
+		targets   []PeerClosureTarget
+		wantError bool
+	}{
+		{name: "retained unbound run plus requested WAL", targets: []PeerClosureTarget{{NodeID: "rhiza-1", Pod: "rhiza-1", PodUID: "target-uid"}, {NodeID: "rhiza-1", Pod: "rhiza-1", PodUID: "target-uid", WALIdentity: "wal-target"}}},
+		{name: "missing requested WAL", targets: []PeerClosureTarget{{NodeID: "rhiza-1", Pod: "rhiza-1", PodUID: "target-uid"}}, wantError: true},
+		{name: "conflicting nonempty WAL", targets: []PeerClosureTarget{{NodeID: "rhiza-1", Pod: "rhiza-1", PodUID: "target-uid", WALIdentity: "other-wal"}, {NodeID: "rhiza-1", Pod: "rhiza-1", PodUID: "target-uid", WALIdentity: "wal-target"}}, wantError: true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			receipt := PeerClosureReceipt{
+				OperationID: "peer-operation", SourceClusterID: caller.SourceClusterID, BindingUID: "root-uid", StatefulSetUID: "workload-uid",
+				RequestHash: "request-hash", ExpectedConfigID: closure.ExpectedConfigID, ExpectedAbortSlot: uint64Pointer(*closure.ExpectedAbortSlot),
+				TargetNodeID: closure.TargetNodeID, TargetWALIdentity: closure.TargetWALIdentity, Targets: test.targets,
+				ProofID: "proof-id", ProcessesTerminated: true, RecreationBlocked: true, StorageQuiesced: true,
+			}
+			server := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if r.URL.Path != "/v1/peer-closure/request" {
+					http.NotFound(w, r)
+					return
+				}
+				w.Header().Set("Content-Type", "application/json")
+				_ = json.NewEncoder(w).Encode(receipt)
+			}))
+			defer server.Close()
+			client := &AuthorityClient{URL: server.URL + "/v1/supervisor", TokenFile: token, Client: server.Client()}
+			_, err := client.RequestPeerClosure(context.Background(), caller, closure)
+			if (err != nil) != test.wantError {
+				t.Fatalf("RequestPeerClosure err=%v, wantError=%t", err, test.wantError)
+			}
+		})
+	}
+}
+
+func peerClosureLedger(t *testing.T) Ledger {
+	t.Helper()
+	l := Ledger{SourceClusterID: "source", Runs: map[string]Run{}}
+	for _, node := range []string{"A", "B", "C"} {
+		id := Identity{SourceClusterID: "source", NodeID: node, PodUID: "pod-" + node, RunID: "run-" + node}
+		if err := l.Register(id); err != nil {
+			t.Fatal(err)
+		}
+		id.WALIdentity = "wal-" + node
+		if err := l.Bind(id); err != nil {
+			t.Fatal(err)
+		}
+	}
+	return l
+}
+
+func peerClosureReservation(operationID, requestHash string, configID, abortSlot uint64, targetNode, targetWAL string, voters []string, podUID string) PeerClosureReservation {
+	return PeerClosureReservation{
+		OperationID: operationID, RequestHash: requestHash, ConfigID: configID, AbortSlot: abortSlot,
+		TargetNodeID: targetNode, TargetWAL: targetWAL, Voters: voters,
+		Targets: []PeerClosureTarget{{NodeID: targetNode, Pod: targetNode, PodUID: podUID, WALIdentity: targetWAL,
+			NodeName: "worker-" + targetNode, NodeUID: "node-uid-" + targetNode, ContainerID: "containerd://" + podUID, ImageID: "sha256:" + podUID}},
 	}
 }
 

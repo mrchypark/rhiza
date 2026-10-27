@@ -17,6 +17,7 @@ import (
 
 	"github.com/mrchypark/rhiza/pkg/fencing"
 	"github.com/mrchypark/rhiza/pkg/quepaxa"
+	"github.com/thanos-io/objstore"
 )
 
 const fencingProtocolAnnotation = "rhiza.mrchypark.dev/cooperative-fencing"
@@ -33,6 +34,8 @@ const fencingCredentialAnnotation = "rhiza.mrchypark.dev/fencing-credential-uid"
 type FencingExecutor struct {
 	Kube     *Kubernetes
 	Attestor FenceAttestor
+	Bucket   objstore.Bucket
+	Prefix   string
 }
 
 type fenceLedger struct {
@@ -40,7 +43,9 @@ type fenceLedger struct {
 	Ledger         fencing.Ledger `json:"ledger"`
 }
 
-func (e *FencingExecutor) controller() *Controller { return &Controller{Kube: e.Kube} }
+func (e *FencingExecutor) controller() *Controller {
+	return &Controller{Kube: e.Kube, Bucket: e.Bucket, Prefix: e.Prefix}
+}
 
 func (e *FencingExecutor) ledgerPath(uid, source string) string {
 	return e.controller().corePath("configmaps", "rhiza-fence-ledger-"+hashJSON([]string{uid, source})[:40])
