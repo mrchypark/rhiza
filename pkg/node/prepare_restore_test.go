@@ -277,10 +277,13 @@ func TestPrepareRestoreMaterializesCertifiedCheckpointAndSuffix(t *testing.T) {
 			_ = lock.Release()
 		}
 	}
-	prepareErr := prepareRestore(ctx, &config, openArchive())
+	execution, prepareErr := prepareRestoreWithExecution(ctx, &config, openArchive())
 	preparedRestoreCrashBoundary = previousBoundary
 	if prepareErr != nil {
 		t.Fatalf("prepare restore without runtime credentials: %v", prepareErr)
+	}
+	if execution.MarkerNoop || !execution.BucketDrainSucceeded || execution.CleanupErr != nil {
+		t.Fatalf("completed restore execution report=%+v, want actual clean bucket drain", execution)
 	}
 	if !lockHeldAtCommit {
 		t.Fatal("qlog lock was not held at complete-marker commit")
@@ -293,8 +296,22 @@ func TestPrepareRestoreMaterializesCertifiedCheckpointAndSuffix(t *testing.T) {
 	completeBefore := snapshotPreparedRestoreDataDir(t, config.DataDir)
 	// The configured S3 endpoint is intentionally absent. A matching complete
 	// marker must be a local no-op and must not open the unavailable remote.
-	if err := prepareRestore(ctx, &config, nil); err != nil {
+	noopExecution, err := prepareRestoreWithExecution(ctx, &config, nil)
+	if err != nil {
 		t.Fatalf("matching complete marker required remote access: %v", err)
+	}
+	if !noopExecution.MarkerNoop || noopExecution.BucketDrainSucceeded || noopExecution.CleanupErr != nil {
+		t.Fatalf("complete-marker no-op report=%+v, want no drain claim", noopExecution)
+	}
+	unlockErr := errors.New("injected prepared restore qlog unlock failure")
+	previousRelease := preparedRestoreReleaseLock
+	preparedRestoreReleaseLock = func(lock *qlog.LockFile) error {
+		return errors.Join(previousRelease(lock), unlockErr)
+	}
+	unlockExecution, unlockResultErr := prepareRestoreWithExecution(ctx, &config, nil)
+	preparedRestoreReleaseLock = previousRelease
+	if !errors.Is(unlockResultErr, unlockErr) || !errors.Is(unlockExecution.CleanupErr, unlockErr) || !unlockExecution.MarkerNoop || unlockExecution.BucketDrainSucceeded {
+		t.Fatalf("qlog unlock failure report=%+v err=%v", unlockExecution, unlockResultErr)
 	}
 	if completeAfter := snapshotPreparedRestoreDataDir(t, config.DataDir); !reflect.DeepEqual(completeBefore, completeAfter) {
 		t.Fatalf("complete-marker retry changed DataDir: before=%#v after=%#v", completeBefore, completeAfter)

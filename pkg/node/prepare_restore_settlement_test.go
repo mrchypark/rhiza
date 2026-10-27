@@ -89,7 +89,7 @@ func runPreparedRestoreCloseFailureRegression(t *testing.T, ctx context.Context,
 			original := bucket.Bucket
 			fault := &preparedPinCloseFaultBucket{Bucket: original, mode: mode}
 			bucket.Bucket = fault
-			firstErr := prepareRestore(ctx, &failed, bucket)
+			firstExecution, firstErr := prepareRestoreWithExecution(ctx, &failed, bucket)
 
 			marker, markerExists, markerErr := readPreparedRestoreMarker(failed.DataDir)
 			leaseUntil := int64(0)
@@ -131,6 +131,15 @@ func runPreparedRestoreCloseFailureRegression(t *testing.T, ctx context.Context,
 			}
 			if !errors.Is(firstErr, wantErr) {
 				t.Errorf("PrepareRestore error=%v, want injected cleanup error %v", firstErr, wantErr)
+			}
+			if firstExecution.MarkerNoop {
+				t.Errorf("failed restore was incorrectly reported as a marker no-op: %+v", firstExecution)
+			}
+			if mode == "bucket-close-error" && !errors.Is(firstExecution.CleanupErr, errInjectedPreparedBucketClose) {
+				t.Errorf("bucket close error was not retained in execution report: %+v", firstExecution)
+			}
+			if mode == "unknown-after-write" && (firstExecution.BucketDrainSucceeded || !errors.Is(firstExecution.CleanupErr, objectstore.ErrMutationOutcomeUnknown)) {
+				t.Errorf("unknown drain was not retained in execution report: %+v", firstExecution)
 			}
 			if mode != "bucket-close-error" && fault.failingKey == "" {
 				t.Errorf("did not intercept the archive recovery pin close upload")

@@ -32,6 +32,17 @@ const (
 )
 
 var preparedRestoreCrashBoundary func(string)
+var preparedRestoreReleaseLock = func(lock *qlog.LockFile) error { return lock.Release() }
+
+type preparedRestoreExecution struct {
+	// MarkerNoop means a matching complete marker short-circuited all archive I/O.
+	MarkerNoop bool
+	// BucketDrainSucceeded records a successful DrainMutations call in this
+	// invocation only; it is cleanup information, not init-terminal or fencing proof.
+	BucketDrainSucceeded bool
+	// CleanupErr contains finalizer, temporary-path removal, and qlog-release errors.
+	CleanupErr error
+}
 
 type preparedRestoreMarker struct {
 	Version        uint   `json:"version"`
@@ -70,55 +81,61 @@ type preparedSourceIdentity struct {
 // without opening its runtime WAL, registering its voter identity, or starting
 // any listener or background publisher.
 func PrepareRestore(ctx context.Context, config *types.ExecutionConfig) (resultErr error) {
-	if err := validatePreparedRestoreConfig(config); err != nil {
-		return err
-	}
 	return prepareRestore(ctx, config, nil)
 }
 
 // prepareRestore accepts an injected bucket only for package tests; production
 // always resolves the configured provider through the supervised constructor.
 func prepareRestore(ctx context.Context, config *types.ExecutionConfig, injected *objectstore.MeteredBucket) (resultErr error) {
+	_, resultErr = prepareRestoreWithExecution(ctx, config, injected)
+	return resultErr
+}
+
+func prepareRestoreWithExecution(ctx context.Context, config *types.ExecutionConfig, injected *objectstore.MeteredBucket) (execution preparedRestoreExecution, resultErr error) {
 	if err := validatePreparedRestoreConfig(config); err != nil {
-		return err
+		return execution, err
 	}
 	if config.ObjStoreDurability == "" {
 		config.ObjStoreDurability = types.ObjectStoreDurabilityAsync
 	}
 	baseMarker, err := preparedMarkerForConfig(config)
 	if err != nil {
-		return err
+		return execution, err
 	}
 	intentMarker := baseMarker
 	intentMarker.Phase = "preparing"
 	if err := os.MkdirAll(config.DataDir, 0700); err != nil {
-		return err
+		return execution, err
 	}
 	if _, err := os.Stat(config.DataDir); err != nil {
-		return err
+		return execution, err
 	}
 	markerBeforeLock, markerExistsBeforeLock, err := readPreparedRestoreMarkerForConfig(config.DataDir, intentMarker)
 	if err != nil {
-		return err
+		return execution, err
 	}
 	if markerExistsBeforeLock && markerBeforeLock.Phase == "complete" {
 		if !preparedMarkerMatchesConfig(markerBeforeLock, baseMarker) {
-			return fmt.Errorf("prepared restore marker does not match this Pod, node, source, or store; preserve DataDir")
+			return execution, fmt.Errorf("prepared restore marker does not match this Pod, node, source, or store; preserve DataDir")
 		}
 		if err := requireExistingPreparedRestoreLock(config.DataDir); err != nil {
-			return err
+			return execution, err
 		}
 	}
 	if !markerExistsBeforeLock {
 		if err := validatePreparedRestoreInventory(config.DataDir, "fresh-preflight"); err != nil {
-			return err
+			return execution, err
 		}
 	}
 	_, lock, err := qlog.Acquire(filepath.Join(config.DataDir, "qlog"))
 	if err != nil {
-		return err
+		return execution, err
 	}
-	defer func() { resultErr = errors.Join(resultErr, lock.Release()) }()
+	defer func() {
+		releaseErr := preparedRestoreReleaseLock(lock)
+		execution.CleanupErr = errors.Join(execution.CleanupErr, releaseErr)
+		resultErr = errors.Join(resultErr, releaseErr)
+	}()
 	var bucket *objectstore.MeteredBucket
 	var archive *recovery.Manager
 	var guard *startupRecoveryGuard
@@ -142,7 +159,11 @@ func prepareRestore(ctx context.Context, config *types.ExecutionConfig, injected
 		}
 		if bucket != nil {
 			closeCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-			cleanupErr = errors.Join(cleanupErr, bucket.DrainMutations(closeCtx))
+			drainErr := bucket.DrainMutations(closeCtx)
+			if drainErr == nil {
+				execution.BucketDrainSucceeded = true
+			}
+			cleanupErr = errors.Join(cleanupErr, drainErr)
 			cancel()
 			cleanupErr = errors.Join(cleanupErr, bucket.Close())
 			bucket = nil
@@ -155,6 +176,7 @@ func prepareRestore(ctx context.Context, config *types.ExecutionConfig, injected
 			cleanupErr = errors.Join(cleanupErr, os.RemoveAll(observerDir))
 			observerDir = ""
 		}
+		execution.CleanupErr = errors.Join(execution.CleanupErr, cleanupErr)
 		resultErr = errors.Join(resultErr, cleanupErr)
 		if resultErr == nil && completeMarker != nil {
 			if preparedRestoreCrashBoundary != nil {
@@ -169,24 +191,25 @@ func prepareRestore(ctx context.Context, config *types.ExecutionConfig, injected
 
 	marker, markerExists, err := readPreparedRestoreMarkerForConfig(config.DataDir, intentMarker)
 	if err != nil {
-		return err
+		return execution, err
 	}
 	if markerExists {
 		if !preparedMarkerMatchesConfig(marker, baseMarker) {
-			return fmt.Errorf("prepared restore marker does not match this Pod, node, source, or store; preserve DataDir")
+			return execution, fmt.Errorf("prepared restore marker does not match this Pod, node, source, or store; preserve DataDir")
 		}
 		if marker.Phase == "complete" {
-			return nil
+			execution.MarkerNoop = true
+			return execution, nil
 		}
 		if marker.Phase != "preparing" {
-			return fmt.Errorf("prepared restore marker has unknown phase %q; preserve DataDir", marker.Phase)
+			return execution, fmt.Errorf("prepared restore marker has unknown phase %q; preserve DataDir", marker.Phase)
 		}
 		if err := validatePreparedRestoreInventory(config.DataDir, marker.Phase); err != nil {
-			return err
+			return execution, err
 		}
 	} else {
 		if err := validatePreparedRestoreInventory(config.DataDir, "fresh"); err != nil {
-			return err
+			return execution, err
 		}
 	}
 	provider := objectstore.Provider(config.ObjStoreProvider)
@@ -206,18 +229,18 @@ func prepareRestore(ctx context.Context, config *types.ExecutionConfig, injected
 			AzureConnectionString: config.ObjStoreAzureConnectionString, AzureUserAssignedID: config.ObjStoreAzureUserAssignedID,
 		})
 		if err != nil {
-			return fmt.Errorf("open restore source: %w", err)
+			return execution, fmt.Errorf("open restore source: %w", err)
 		}
 	}
 	if err := validatePreparedRestoreMembership(ctx, config, bucket); err != nil {
-		return err
+		return execution, err
 	}
 	if !markerExists {
 		if preparedRestoreCrashBoundary != nil {
 			preparedRestoreCrashBoundary("intent-before-write")
 		}
 		if err := writePreparedRestoreIntent(config.DataDir, intentMarker); err != nil {
-			return fmt.Errorf("record prepared restore intent: %w", err)
+			return execution, fmt.Errorf("record prepared restore intent: %w", err)
 		}
 		if preparedRestoreCrashBoundary != nil {
 			preparedRestoreCrashBoundary("intent-durable")
@@ -225,23 +248,23 @@ func prepareRestore(ctx context.Context, config *types.ExecutionConfig, injected
 	}
 	if markerExists && marker.Phase == "preparing" && marker.CertifiedTip == 0 {
 		if err := writePreparedRestoreIntent(config.DataDir, intentMarker); err != nil {
-			return fmt.Errorf("resume prepared restore intent: %w", err)
+			return execution, fmt.Errorf("resume prepared restore intent: %w", err)
 		}
 	}
 	if err := ctx.Err(); err != nil {
-		return err
+		return execution, err
 	}
 	observerDir, err = os.MkdirTemp("", ".rhiza-prepare-observer-")
 	if err != nil {
-		return err
+		return execution, err
 	}
 	observerWAL, err = qlog.Open(observerDir)
 	if err != nil {
-		return fmt.Errorf("open temporary history verifier: %w", err)
+		return execution, fmt.Errorf("open temporary history verifier: %w", err)
 	}
 	checkpointCacheDir := filepath.Join(observerDir, "checkpoint-cache")
 	if err := os.Mkdir(checkpointCacheDir, 0o700); err != nil {
-		return fmt.Errorf("create temporary checkpoint verification cache: %w", err)
+		return execution, fmt.Errorf("create temporary checkpoint verification cache: %w", err)
 	}
 	if preparedRestoreCrashBoundary != nil {
 		preparedRestoreCrashBoundary("observer-open")
@@ -250,42 +273,42 @@ func prepareRestore(ctx context.Context, config *types.ExecutionConfig, injected
 	prefix := path.Join(config.ObjStorePrefix, string(config.ClusterID))
 	archive = recovery.NewManager(bucket, prefix, 1)
 	if err := archive.Load(ctx); err != nil {
-		return fmt.Errorf("load certified source archive: %w", err)
+		return execution, fmt.Errorf("load certified source archive: %w", err)
 	}
 	if archive.Sealed() {
-		return recovery.ErrArchiveSealed
+		return execution, recovery.ErrArchiveSealed
 	}
 	if archive.Tip() == 0 {
-		return fmt.Errorf("certified source has no materialized history")
+		return execution, fmt.Errorf("certified source has no materialized history")
 	}
 	if len(config.Members) > 1 && !archive.CASSupported() {
-		return fmt.Errorf("prepared learner restore requires conditional shared archive writes")
+		return execution, fmt.Errorf("prepared learner restore requires conditional shared archive writes")
 	}
 	checkpoints := checkpoint.NewManager(bucket, prefix, checkpointCacheDir, 1)
 	if err := checkpoints.Load(ctx); err != nil {
-		return fmt.Errorf("load certified checkpoint manifest: %w", err)
+		return execution, fmt.Errorf("load certified checkpoint manifest: %w", err)
 	}
 	owner, err := startupRecoveryOwner("prepare-" + string(config.NodeID))
 	if err != nil {
-		return err
+		return execution, err
 	}
 	guard, err = newStartupRecoveryGuard(ctx, archive, owner)
 	if err != nil {
-		return fmt.Errorf("pin prepared restore source: %w", err)
+		return execution, fmt.Errorf("pin prepared restore source: %w", err)
 	}
 	snapshot := guard.Snapshot()
 	if snapshot == nil {
-		return fmt.Errorf("prepared learner restore requires a pinned archive snapshot")
+		return execution, fmt.Errorf("prepared learner restore requires a pinned archive snapshot")
 	}
 	if archive.Sealed() {
-		return recovery.ErrArchiveSealed
+		return execution, recovery.ErrArchiveSealed
 	}
 
 	n = &Node{config: config, bucket: bucket, archive: archive, checkpoints: checkpoints}
 	cluster := n.loadClusterConfig()
 	core, err := quepaxa.NewObserver(quepaxa.Config{NodeID: quepaxa.NodeID("prepare-" + string(config.NodeID)), Cluster: *cluster, WAL: observerWAL, EnableReconfiguration: config.EnableReconfiguration})
 	if err != nil {
-		return fmt.Errorf("create passive history verifier: %w", err)
+		return execution, fmt.Errorf("create passive history verifier: %w", err)
 	}
 	n.core = core
 	core.SetCheckpointValidator(func(ctx context.Context, seal quepaxa.CheckpointSeal) error {
@@ -293,40 +316,23 @@ func prepareRestore(ctx context.Context, config *types.ExecutionConfig, injected
 	})
 	generationCheckpoint, err := n.installGenerationAnchor(guard)
 	if err != nil {
-		return fmt.Errorf("verify source generation anchor: %w", err)
+		return execution, fmt.Errorf("verify source generation anchor: %w", err)
 	}
 	if seal, decision, ok := snapshot.RecoveryBase(); ok && core.Tip() < seal.Index {
 		if err := core.RestoreCheckpointBase(guard.Context(), seal, decision); err != nil {
-			return fmt.Errorf("verify certified source checkpoint base: %w", err)
+			return execution, fmt.Errorf("verify certified source checkpoint base: %w", err)
 		}
 	}
-	for core.Tip() < snapshot.Tip() {
-		values, _, err := snapshot.DecisionsFrom(guard.Context(), core.Tip()+1, 256)
-		if err != nil {
-			return fmt.Errorf("read certified source suffix: %w", err)
-		}
-		if len(values) == 0 {
-			return fmt.Errorf("certified source omitted slot %d", core.Tip()+1)
-		}
-		for _, decision := range values {
-			if err := types.ValidateExecutionPolicy(decision.Value); err != nil {
-				return err
-			}
-		}
-		if err := core.AcceptCertifiedValues(values); err != nil {
-			return fmt.Errorf("verify certified source decisions: %w", err)
-		}
-	}
-	if core.Tip() != snapshot.Tip() {
-		return fmt.Errorf("verified source tip %d differs from pinned tip %d", core.Tip(), snapshot.Tip())
+	if err := recovery.ReplayCertifiedThrough(guard.Context(), core, snapshot.Tip(), snapshot.DecisionsFrom); err != nil {
+		return execution, fmt.Errorf("verify certified source suffix: %w", err)
 	}
 
 	root, err := n.preparedCheckpoint(guard, generationCheckpoint)
 	if err != nil {
-		return err
+		return execution, err
 	}
 	if root == nil && core.CompactionFloor() > 0 {
-		return fmt.Errorf("certified history was compacted without an available checkpoint")
+		return execution, fmt.Errorf("certified history was compacted without an available checkpoint")
 	}
 	baseMarker.BaseIndex = 0
 	if root != nil {
@@ -336,75 +342,79 @@ func prepareRestore(ctx context.Context, config *types.ExecutionConfig, injected
 		if prefixHash, ok := core.PrefixHash(quepaxa.Slot(root.Index)); ok {
 			baseMarker.BasePrefixHash = hex.EncodeToString(prefixHash[:])
 		} else {
-			return fmt.Errorf("selected checkpoint prefix is not in certified history")
+			return execution, fmt.Errorf("selected checkpoint prefix is not in certified history")
 		}
 	}
 	tipPrefix, ok := core.PrefixHash(core.Tip())
 	if !ok {
-		return fmt.Errorf("certified source tip has no prefix hash")
+		return execution, fmt.Errorf("certified source tip has no prefix hash")
 	}
 	baseMarker.CertifiedTip = uint64(core.Tip())
 	baseMarker.TipPrefixHash = hex.EncodeToString(tipPrefix[:])
 	baseMarker.Phase = "preparing"
 	if err := writePreparedRestoreMarker(config.DataDir, baseMarker); err != nil {
-		return fmt.Errorf("record prepared restore intent: %w", err)
+		return execution, fmt.Errorf("record prepared restore intent: %w", err)
 	}
 
 	material, err := materializer.Open(filepath.Join(config.DataDir, "sqlite.db"), 4)
 	if err != nil {
-		return fmt.Errorf("open prepared materializer: %w", err)
+		return execution, fmt.Errorf("open prepared materializer: %w", err)
 	}
 	n.material = material
 	if err := material.ConfigureLocalGraphNodePropertyIndexes(config.LocalGraphNodePropertyIndexes); err != nil {
-		return err
+		return execution, err
 	}
 	if material.Tip() > uint64(core.Tip()) {
-		return fmt.Errorf("existing materialized tip %d is ahead of certified source %d", material.Tip(), core.Tip())
+		return execution, fmt.Errorf("existing materialized tip %d is ahead of certified source %d", material.Tip(), core.Tip())
 	}
 	if material.Tip() > 0 {
 		decision, ok := core.CertifiedValue(quepaxa.Slot(material.Tip()))
 		if !ok {
-			return fmt.Errorf("existing materialized tip %d has no certified decision", material.Tip())
+			return execution, fmt.Errorf("existing materialized tip %d has no certified decision", material.Tip())
 		}
 		if err := material.ValidateTip(material.Tip(), decision.Value); err != nil {
-			return fmt.Errorf("validate existing materialized state: %w", err)
+			return execution, fmt.Errorf("validate existing materialized state: %w", err)
 		}
 	}
 	if root != nil && root.Index > material.Tip() {
 		tempDir, err := os.MkdirTemp("", ".rhiza-prepare-checkpoint-")
 		if err != nil {
-			return err
+			return execution, err
 		}
-		defer func() { resultErr = errors.Join(resultErr, os.RemoveAll(tempDir)) }()
+		defer func() {
+			removeErr := os.RemoveAll(tempDir)
+			execution.CleanupErr = errors.Join(execution.CleanupErr, removeErr)
+			resultErr = errors.Join(resultErr, removeErr)
+		}()
 		files, err := checkpoints.DownloadRootFiles(guard.Context(), root.Index, root.RootHash, tempDir)
 		if err != nil {
-			return fmt.Errorf("download selected certified checkpoint: %w", err)
+			return execution, fmt.Errorf("download selected certified checkpoint: %w", err)
 		}
 		materialFiles := make([]materializer.CheckpointFile, 0, len(files))
 		for _, file := range files {
 			materialFiles = append(materialFiles, materializer.CheckpointFile{Role: materializer.CheckpointRole(file.Role), Path: file.Path})
 		}
 		if err := material.RestoreCheckpoint(guard.Context(), materialFiles); err != nil {
-			return fmt.Errorf("install SQL and Graph checkpoint: %w", err)
+			return execution, fmt.Errorf("install SQL and Graph checkpoint: %w", err)
 		}
 	}
 	if err := n.replayLocalDecisions(guard.Context()); err != nil {
-		return fmt.Errorf("replay certified SQL and Graph suffix: %w", err)
+		return execution, fmt.Errorf("replay certified SQL and Graph suffix: %w", err)
 	}
 	if material.Tip() != uint64(core.Tip()) {
-		return fmt.Errorf("prepared materializer tip %d differs from certified source tip %d", material.Tip(), core.Tip())
+		return execution, fmt.Errorf("prepared materializer tip %d differs from certified source tip %d", material.Tip(), core.Tip())
 	}
 	if decision, ok := core.CertifiedValue(core.Tip()); ok {
 		if err := material.ValidateTip(uint64(core.Tip()), decision.Value); err != nil {
-			return fmt.Errorf("verify prepared SQL and Graph tip: %w", err)
+			return execution, fmt.Errorf("verify prepared SQL and Graph tip: %w", err)
 		}
 	}
 	if err := guard.Check(ctx.Err()); err != nil {
-		return err
+		return execution, err
 	}
 	baseMarker.Phase = "complete"
 	completeMarker = &baseMarker
-	return nil
+	return execution, nil
 }
 
 func requireExistingPreparedRestoreLock(dataDir string) error {
