@@ -22,13 +22,10 @@ const (
 
 type ObjectStoreDurability string
 
-type LocalArchiveProfile string
-
 const (
 	ObjectStoreDurabilityAsync     ObjectStoreDurability = "async"
 	ObjectStoreDurabilityBeforeAck ObjectStoreDurability = "before-ack"
-	LocalArchiveProfileLegacy      LocalArchiveProfile   = "legacy-v1"
-	LocalArchiveProfileFilesystem  LocalArchiveProfile   = "filesystem-v2"
+	LocalArchiveFormatVersion      uint                  = 2
 )
 
 // GraphNodePropertyIndex is node-local derived state rebuilt when a materializer is replaced.
@@ -39,14 +36,13 @@ type GraphNodePropertyIndex struct {
 
 // ExecutionConfig holds runtime configuration.
 type ExecutionConfig struct {
-	Local               bool                `json:"local,omitempty"`
-	LocalArchiveProfile LocalArchiveProfile `json:"local_archive_profile,omitempty"`
-	ClusterID           ClusterID           `json:"cluster_id"`
-	NodeID              NodeID              `json:"node_id"`
-	DataDir             string              `json:"data_dir"`
-	BindAddr            string              `json:"bind_addr"`
-	PeerAddr            string              `json:"peer_addr"`
-	AdminToken          string              `json:"admin_token"`
+	Local      bool      `json:"local,omitempty"`
+	ClusterID  ClusterID `json:"cluster_id"`
+	NodeID     NodeID    `json:"node_id"`
+	DataDir    string    `json:"data_dir"`
+	BindAddr   string    `json:"bind_addr"`
+	PeerAddr   string    `json:"peer_addr"`
+	AdminToken string    `json:"admin_token"`
 	// PeerToken is this process's private peer identity secret. It is never
 	// replicated; Members carry only public identity.
 	PeerToken                     string                   `json:"peer_token"`

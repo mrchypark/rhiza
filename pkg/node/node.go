@@ -190,12 +190,6 @@ func (n *Node) open(ctx context.Context, enroll bool) (err error) {
 	if n.config == nil || n.config.NodeID == "" {
 		return fmt.Errorf("node ID is required")
 	}
-	if n.config.LocalArchiveProfile == "" {
-		n.config.LocalArchiveProfile = types.LocalArchiveProfileLegacy
-	}
-	if n.config.LocalArchiveProfile != types.LocalArchiveProfileLegacy && n.config.LocalArchiveProfile != types.LocalArchiveProfileFilesystem {
-		return fmt.Errorf("invalid Local archive profile %q", n.config.LocalArchiveProfile)
-	}
 	if n.opened.Load() {
 		return fmt.Errorf("node is already open")
 	}
@@ -238,9 +232,6 @@ func (n *Node) open(ctx context.Context, enroll bool) (err error) {
 	}
 	if n.config.ObjStoreDurability != types.ObjectStoreDurabilityAsync && n.config.ObjStoreDurability != types.ObjectStoreDurabilityBeforeAck {
 		return fmt.Errorf("invalid object-store durability %q", n.config.ObjStoreDurability)
-	}
-	if n.config.LocalArchiveProfile == types.LocalArchiveProfileFilesystem && (!n.config.Local || n.config.ObjStoreProvider != string(objectstore.ProviderFilesystem) || n.config.ObjStoreDir == "" || n.config.ObjStoreDurability != types.ObjectStoreDurabilityBeforeAck) {
-		return fmt.Errorf("filesystem-v2 Local archive profile requires Local mode, explicit filesystem storage, and before-ack durability")
 	}
 	if n.config.ObjStoreSyncInterval < 0 {
 		return fmt.Errorf("object-store sync interval must not be negative")

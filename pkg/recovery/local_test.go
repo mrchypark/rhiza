@@ -8,11 +8,16 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 
+	"github.com/mrchypark/rhiza/internal/sqlpolicy"
+	"github.com/mrchypark/rhiza/pkg/checkpoint"
 	"github.com/mrchypark/rhiza/pkg/qlog"
 	"github.com/mrchypark/rhiza/pkg/quepaxa"
+	"github.com/ncruces/go-sqlite3/driver"
 	"github.com/thanos-io/objstore"
 	"github.com/thanos-io/objstore/providers/filesystem"
 )
@@ -40,7 +45,7 @@ func (b *localUncertainBucket) Upload(ctx context.Context, name string, r io.Rea
 	return err
 }
 func localTestBinding() LocalBinding {
-	return LocalBinding{Version: 1, StoreUUID: strings.Repeat("a", 32), ConfigDigest: strings.Repeat("b", 64), PolicyVersion: 1, Bootstrap: quepaxa.Cluster{ConfigID: 1, Members: []quepaxa.Member{{ID: "local"}}}}
+	return LocalBinding{Version: localArchiveFormatVersion, StoreUUID: strings.Repeat("a", 32), ConfigDigest: strings.Repeat("b", 64), PolicyVersion: 1, Bootstrap: quepaxa.Cluster{ConfigID: 1, Members: []quepaxa.Member{{ID: "local"}}}}
 }
 func TestLocalArchiveRequiresBothConditionalCapabilities(t *testing.T) {
 	bucket, err := filesystem.NewBucket(t.TempDir())
@@ -172,13 +177,37 @@ func TestLocalArchiveRebaseDropsHistoryAndPreservesPagedSuffix(t *testing.T) {
 	}
 	seal := quepaxa.CheckpointSeal{ConfigID: 1, Index: index, RootHash: sha256.Sum256([]byte("local-root")), StateHash: sha256.Sum256([]byte("local-state")), PrefixHash: prefix, NextLeaderOrder: next, FollowingLeaderOrder: following}
 	core.SetCheckpointValidator(func(context.Context, quepaxa.CheckpointSeal) error { return nil })
+	portableDir := t.TempDir()
+	portableDBPath := filepath.Join(portableDir, "sqlite.db")
+	portableDB, err := driver.Open(portableDBPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = portableDB.Exec(`CREATE TABLE _rhiza_meta(key TEXT PRIMARY KEY, value TEXT); INSERT INTO _rhiza_meta VALUES ('sql_execution_policy','` + sqlpolicy.Marker() + `'); CREATE TABLE payload(value INTEGER)`)
+	closeErr := portableDB.Close()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if closeErr != nil {
+		t.Fatal(closeErr)
+	}
+	portablePath := filepath.Join(portableDir, "graph.snapshot")
+	if err := os.WriteFile(portablePath, []byte("portable checkpoint"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	portableManager := checkpoint.NewManager(bucket, "local/v1", "", seal.ConfigID)
+	portableManager.SetLocalControlBinding(archive.Binding.ArchiveLocationHash, fmt.Sprintf("%x", archive.head.BindingHash))
+	portable, err := portableManager.CreateLocalFiles(ctx, []checkpoint.Source{{Role: checkpoint.RoleSQLite, Path: portableDBPath}, {Role: checkpoint.RoleGraphData, Path: portablePath}}, uint64(seal.Index))
+	if err != nil {
+		t.Fatal(err)
+	}
 	var snapshot LocalSnapshot
 	_, err = core.ReclaimLocalCheckpoint(ctx, seal, func(ctx context.Context, slot quepaxa.Slot) error {
 		decision, ok := core.CertifiedValue(slot)
 		if !ok {
 			return fmt.Errorf("seal not certified")
 		}
-		snapshot = LocalSnapshot{Seal: seal, Decision: decision, PortableRoot: sha256.Sum256([]byte("portable")), Descriptor: json.RawMessage(`{}`)}
+		snapshot = LocalSnapshot{Seal: seal, Decision: decision, PortableRoot: portable.RootHash, Descriptor: json.RawMessage(`{}`)}
 		return StoreLocalSnapshot(ctx, bucket, "local/v1", snapshot)
 	})
 	if err != nil {
@@ -189,6 +218,9 @@ func TestLocalArchiveRebaseDropsHistoryAndPreservesPagedSuffix(t *testing.T) {
 		t.Fatal(err)
 	}
 	if err := bucket.Delete(ctx, "local/v1/BINDING"); err != nil {
+		t.Fatal(err)
+	}
+	if err := bucket.Delete(ctx, "local/v1/local-gc-control"); err != nil {
 		t.Fatal(err)
 	}
 	archive, err = CreateLocalArchive(ctx, bucket, "local/v1", localTestBinding(), &snapshot)

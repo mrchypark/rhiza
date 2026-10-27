@@ -14,7 +14,7 @@ import (
 	"github.com/mrchypark/rhiza/pkg/recovery"
 )
 
-func localBackupStagingFixture(t *testing.T) (types.ExecutionConfig, *recovery.LocalArchive) {
+func localBackupStagingFixture(t *testing.T) (types.ExecutionConfig, recovery.LocalBinding) {
 	t.Helper()
 	config := types.ExecutionConfig{Local: true, NodeID: "local", ClusterID: "staging", DataDir: t.TempDir(), ObjStoreProvider: "filesystem", ObjStoreDir: t.TempDir(), ObjStoreSyncInterval: time.Hour, CheckpointInterval: time.Hour}
 	seed := New(&config)
@@ -41,12 +41,28 @@ func localBackupStagingFixture(t *testing.T) (types.ExecutionConfig, *recovery.L
 	if err := reader.openLocalBackupBucket(context.Background()); err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() { _ = reader.bucket.Close() })
-	archive, err := recovery.OpenLocalArchive(context.Background(), reader.bucket, reader.localBackupPrefix())
+	t.Cleanup(func() {
+		if reader.bucket != nil {
+			_ = reader.bucket.Close()
+		}
+		if reader.localOwner != nil {
+			_ = reader.localOwner.Close(time.Second)
+		}
+	})
+	archive, err := recovery.OpenLocalArchiveOwned(context.Background(), reader.bucket, reader.localBackupPrefix(), reader.localOwner)
 	if err != nil {
 		t.Fatal(err)
 	}
-	return config, archive
+	binding := archive.Binding
+	if err := reader.bucket.Close(); err != nil {
+		t.Fatal(err)
+	}
+	reader.bucket = nil
+	if err := reader.localOwner.Close(time.Second); err != nil {
+		t.Fatal(err)
+	}
+	reader.localOwner = nil
+	return config, binding
 }
 
 func stagingImage(t *testing.T, root string) map[string]string {
@@ -104,7 +120,7 @@ func materializeStageOwner(t *testing.T, n *Node, binding recovery.LocalBinding)
 }
 
 func TestLocalBackupStagingPreinstallCrashPhases(t *testing.T) {
-	base, archive := localBackupStagingFixture(t)
+	base, binding := localBackupStagingFixture(t)
 	for _, phase := range []string{"intent", "journal", "next", "policy", "wal", "checkpoint", "install_temp"} {
 		t.Run(phase, func(t *testing.T) {
 			config := base
@@ -113,11 +129,15 @@ func TestLocalBackupStagingPreinstallCrashPhases(t *testing.T) {
 			if err := n.openLocalBackupBucket(context.Background()); err != nil {
 				t.Fatal(err)
 			}
-			defer n.bucket.Close()
+			defer func() {
+				if err := n.Shutdown(); err != nil {
+					t.Errorf("release fixture Local owner: %v", err)
+				}
+			}()
 			original := filepath.Join(config.DataDir, "sqlite.db")
 			writeStageFile(t, original, "original authority")
 			for retry := 0; retry < 2; retry++ {
-				materializeStageOwner(t, n, archive.Binding)
+				materializeStageOwner(t, n, binding)
 				journal := filepath.Join(config.DataDir, ".local-backup-import")
 				if phase != "intent" {
 					if err := os.Mkdir(journal, 0700); err != nil {
@@ -160,7 +180,7 @@ func TestLocalBackupStagingPreinstallCrashPhases(t *testing.T) {
 }
 
 func TestLocalBackupStagingForeignEvidenceUnchanged(t *testing.T) {
-	base, archive := localBackupStagingFixture(t)
+	base, binding := localBackupStagingFixture(t)
 	for _, mode := range []string{"unknown", "foreign_node", "foreign_path", "foreign_binding", "malformed", "previous", "unexpected", "symlink", "malformed_install"} {
 		t.Run(mode, func(t *testing.T) {
 			config := base
@@ -169,7 +189,11 @@ func TestLocalBackupStagingForeignEvidenceUnchanged(t *testing.T) {
 			if err := n.openLocalBackupBucket(context.Background()); err != nil {
 				t.Fatal(err)
 			}
-			defer n.bucket.Close()
+			defer func() {
+				if err := n.Shutdown(); err != nil {
+					t.Errorf("release fixture Local owner: %v", err)
+				}
+			}()
 			journal := filepath.Join(config.DataDir, ".local-backup-import")
 			writeStageFile(t, filepath.Join(config.DataDir, "sqlite.db"), "original authority")
 			if mode == "symlink" {
@@ -182,7 +206,7 @@ func TestLocalBackupStagingForeignEvidenceUnchanged(t *testing.T) {
 				writeStageFile(t, filepath.Join(journal, "next/payload"), "unfinished")
 			}
 			if mode != "unknown" && mode != "malformed_install" {
-				materializeStageOwner(t, n, archive.Binding)
+				materializeStageOwner(t, n, binding)
 				var owner localBackupStageOwner
 				data, err := os.ReadFile(n.localBackupStageOwnerPath())
 				if err != nil {
@@ -229,15 +253,19 @@ func TestLocalBackupStagingForeignEvidenceUnchanged(t *testing.T) {
 }
 
 func TestLocalBackupStagingCommittedRetryAndOpen(t *testing.T) {
-	config, archive := localBackupStagingFixture(t)
+	config, binding := localBackupStagingFixture(t)
 	n := New(&config)
 	if err := n.openLocalBackupBucket(context.Background()); err != nil {
 		t.Fatal(err)
 	}
-	defer n.bucket.Close()
+	defer func() {
+		if err := n.Shutdown(); err != nil {
+			t.Errorf("release fixture Local owner: %v", err)
+		}
+	}()
 	// The crash happened after a complete install.json publication and after the
 	// original file move, but before installing its staged replacement.
-	if err := n.beginLocalBackupStage(archive.Binding); err != nil {
+	if err := n.beginLocalBackupStage(binding); err != nil {
 		t.Fatal(err)
 	}
 	journal := filepath.Join(config.DataDir, ".local-backup-import")
@@ -272,17 +300,27 @@ func TestLocalBackupStagingCommittedRetryAndOpen(t *testing.T) {
 	if err := n.finishLocalBackupImport(); err != nil {
 		t.Fatalf("legacy committed retry: %v", err)
 	}
+	if err := n.Shutdown(); err != nil {
+		t.Fatal(err)
+	}
 	// Independent real import exercises pre-install retry followed by normal Open.
 	config.DataDir = t.TempDir()
 	n2 := New(&config)
 	if err := n2.openLocalBackupBucket(context.Background()); err != nil {
 		t.Fatal(err)
 	}
-	defer n2.bucket.Close()
-	if err := n2.beginLocalBackupStage(archive.Binding); err != nil {
+	defer func() {
+		if err := n2.Shutdown(); err != nil {
+			t.Errorf("release interrupted-import Local owner: %v", err)
+		}
+	}()
+	if err := n2.beginLocalBackupStage(binding); err != nil {
 		t.Fatal(err)
 	}
 	writeStageFile(t, filepath.Join(config.DataDir, ".local-backup-import/next/qlog/partial"), "interrupted download")
+	if err := n2.Shutdown(); err != nil {
+		t.Fatal(err)
+	}
 	reopened := New(&config)
 	if err := reopened.Open(context.Background()); err != nil {
 		t.Fatal(err)

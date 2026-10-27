@@ -73,7 +73,6 @@ type RequestStatusRequest = network.RequestStatusRequest
 type RequestStatusResponse = network.RequestStatusResponse
 type ObjectStoreStats = objstore.Stats
 type ObjectStoreDurability = types.ObjectStoreDurability
-type LocalArchiveProfile = types.LocalArchiveProfile
 
 // Config contains the durable local path, fixed membership, and peer endpoint.
 type Config struct {
@@ -82,16 +81,13 @@ type Config struct {
 	// DataDir restores from that archive. The deployment must ensure one writer,
 	// including during offline restore. Local backups default to BeforeAck;
 	// explicitly select Async to allow acknowledged writes ahead of the backup.
-	Local bool
-	// LocalArchiveProfile opts a filesystem-backed Local archive into the
-	// crash-recoverable v2 ownership protocol. The zero value remains legacy.
-	LocalArchiveProfile LocalArchiveProfile
-	ClusterID           string
-	NodeID              string
-	DataDir             string
-	BindAddr            string
-	PeerAddr            string
-	AdminToken          string
+	Local      bool
+	ClusterID  string
+	NodeID     string
+	DataDir    string
+	BindAddr   string
+	PeerAddr   string
+	AdminToken string
 	// PeerToken is this process's private peer identity secret. Members carry
 	// only public identity, so a replicated membership never holds a secret.
 	PeerToken string
@@ -148,8 +144,6 @@ const (
 	ConsistencyLinearizable             = "linearizable"
 	ObjectStoreDurabilityAsync          = types.ObjectStoreDurabilityAsync
 	ObjectStoreDurabilityBeforeAck      = types.ObjectStoreDurabilityBeforeAck
-	LocalArchiveProfileLegacy           = types.LocalArchiveProfileLegacy
-	LocalArchiveProfileFilesystem       = types.LocalArchiveProfileFilesystem
 	MutationCommitted                   = types.MutationCommitted
 	MutationRejected                    = types.MutationRejected
 	MutationErrorCodeExecutionFailed    = types.MutationErrorCodeExecutionFailed
@@ -261,9 +255,8 @@ func executionConfig(config Config) (*types.ExecutionConfig, error) {
 		config.ClusterID = "cluster-a"
 	}
 	return &types.ExecutionConfig{
-		Local:               config.Local,
-		LocalArchiveProfile: config.LocalArchiveProfile,
-		ClusterID:           types.ClusterID(config.ClusterID), NodeID: types.NodeID(config.NodeID),
+		Local:     config.Local,
+		ClusterID: types.ClusterID(config.ClusterID), NodeID: types.NodeID(config.NodeID),
 		DataDir: config.DataDir, BindAddr: config.BindAddr, PeerAddr: config.PeerAddr,
 		AdminToken: config.AdminToken, PeerToken: config.PeerToken, Members: config.Members, EnableReconfiguration: config.EnableReconfiguration, Learner: config.Learner,
 		ObjStoreEndpoint: config.ObjStoreEndpoint, ObjStoreBucket: config.ObjStoreBucket,

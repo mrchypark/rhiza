@@ -33,9 +33,32 @@ func (n *Node) localBackupPrefix() string {
 	return path.Join(n.config.ObjStorePrefix, string(n.config.ClusterID), "local/v1")
 }
 
+func (n *Node) localArchiveBinding() recovery.LocalBinding {
+	if n.localBackup != nil {
+		return n.localBackup.Binding
+	}
+	binding := recovery.LocalBinding{Version: types.LocalArchiveFormatVersion, StoreUUID: n.localStore.policy.StoreUUID, ConfigDigest: n.localStore.configDigest, PolicyVersion: localCheckpointVersion, Bootstrap: *n.loadClusterConfig()}
+	if n.localOwner != nil {
+		binding.ArchiveLocationHash = n.localOwner.LocationHash(n.localBackupPrefix())
+	}
+	return binding
+}
+
+func (n *Node) localCheckpointManager(configID uint) (*checkpoint.Manager, error) {
+	binding := n.localArchiveBinding()
+	data, err := json.Marshal(binding)
+	if err != nil {
+		return nil, err
+	}
+	hash := sha256.Sum256(data)
+	manager := checkpoint.NewManager(n.bucket, n.localBackupPrefix(), "", configID)
+	manager.SetLocalControlBinding(binding.ArchiveLocationHash, hex.EncodeToString(hash[:]))
+	return manager, nil
+}
+
 func validateLocalFilesystemArchiveNamespace(root, prefix, clusterID string) error {
 	if path.IsAbs(prefix) || filepath.IsAbs(prefix) || path.IsAbs(clusterID) || filepath.IsAbs(clusterID) {
-		return fmt.Errorf("filesystem-v2 Local archive prefix and cluster ID must be relative")
+		return fmt.Errorf("Local filesystem archive prefix and cluster ID must be relative")
 	}
 	rootAbs, err := filepath.Abs(root)
 	if err != nil {
@@ -48,15 +71,15 @@ func validateLocalFilesystemArchiveNamespace(root, prefix, clusterID string) err
 			return err
 		}
 		if !info.IsDir() {
-			return fmt.Errorf("filesystem-v2 Local archive root is not a directory")
+			return fmt.Errorf("Local filesystem archive root is not a directory")
 		}
 	} else if !errors.Is(rootErr, os.ErrNotExist) {
-		return fmt.Errorf("resolve filesystem-v2 Local archive root: %w", rootErr)
+		return fmt.Errorf("resolve Local filesystem archive root: %w", rootErr)
 	}
 	namespace := path.Join(prefix, clusterID, "local/v1")
 	clean := path.Clean(namespace)
 	if path.IsAbs(clean) || clean == ".." || strings.HasPrefix(clean, "../") {
-		return fmt.Errorf("filesystem-v2 Local archive namespace escapes its root")
+		return fmt.Errorf("Local filesystem archive namespace escapes its root")
 	}
 	archivePath := filepath.Join(rootAbs, filepath.FromSlash(clean))
 	rel, err := filepath.Rel(rootAbs, archivePath)
@@ -64,7 +87,7 @@ func validateLocalFilesystemArchiveNamespace(root, prefix, clusterID string) err
 		return err
 	}
 	if rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) || filepath.IsAbs(rel) {
-		return fmt.Errorf("filesystem-v2 Local archive namespace escapes its root")
+		return fmt.Errorf("Local filesystem archive namespace escapes its root")
 	}
 	if rootErr == nil {
 		if err := rejectLocalArchiveSymlinks(rootReal, clean); err != nil {
@@ -87,21 +110,21 @@ func rejectLocalArchiveSymlinks(root, namespace string) error {
 			return err
 		}
 		if info.Mode()&os.ModeSymlink != 0 {
-			return fmt.Errorf("filesystem-v2 Local archive namespace contains a symlink")
+			return fmt.Errorf("Local filesystem archive namespace contains a symlink")
 		}
 		if i < len(parts)-1 && !info.IsDir() {
-			return fmt.Errorf("filesystem-v2 Local archive namespace contains a non-directory path component")
+			return fmt.Errorf("Local filesystem archive namespace contains a non-directory path component")
 		}
 		if i == len(parts)-1 {
 			if !info.IsDir() {
-				return fmt.Errorf("filesystem-v2 Local archive namespace is not a directory")
+				return fmt.Errorf("Local filesystem archive namespace is not a directory")
 			}
 			return filepath.WalkDir(current, func(name string, entry os.DirEntry, err error) error {
 				if err != nil {
 					return err
 				}
 				if entry.Type()&os.ModeSymlink != 0 {
-					return fmt.Errorf("filesystem-v2 Local archive namespace contains a symlink")
+					return fmt.Errorf("Local filesystem archive namespace contains a symlink")
 				}
 				return nil
 			})
@@ -128,8 +151,11 @@ func (n *Node) openLocalBackupBucket(ctx context.Context) error {
 		}
 	}
 	filesystemDir := c.ObjStoreDir
+	if provider == objectstore.ProviderFilesystem && filesystemDir == "" {
+		filesystemDir = "./objstore"
+	}
 	var owner *objectstore.LocalFilesystemOwner
-	if c.LocalArchiveProfile == types.LocalArchiveProfileFilesystem {
+	if c.Local && provider == objectstore.ProviderFilesystem {
 		if err := validateLocalFilesystemArchiveNamespace(filesystemDir, c.ObjStorePrefix, string(c.ClusterID)); err != nil {
 			return err
 		}
@@ -210,19 +236,15 @@ func (n *Node) prepareLocalBackup(ctx context.Context) (resultErr error) {
 	if err != nil {
 		return err
 	}
-	if n.config.LocalArchiveProfile == types.LocalArchiveProfileFilesystem {
-		if archive.Binding.Version != 2 || archive.Binding.ArchiveLocationHash != n.localOwner.LocationHash(n.localBackupPrefix()) {
-			return fmt.Errorf("Local archive profile or filesystem location differs; automatic migration is unsupported")
-		}
-	} else if archive.Binding.Version != 1 {
-		return fmt.Errorf("Local archive requires its explicit filesystem-v2 profile")
+	if n.localOwner != nil && archive.Binding.ArchiveLocationHash != n.localOwner.LocationHash(n.localBackupPrefix()) {
+		return fmt.Errorf("Local archive filesystem location differs")
 	}
-	maintenanceResolved := true
-	if n.localOwner != nil {
-		maintenanceResolved, err = archive.MaintenanceResolved(ctx)
-		if err != nil {
-			return err
-		}
+	maintenanceResolved, err := archive.MaintenanceResolved(ctx)
+	if err != nil {
+		return err
+	}
+	if !maintenanceResolved && n.localOwner == nil {
+		return fmt.Errorf("Local archive maintenance state is unresolved; remote ownership cannot be recovered automatically")
 	}
 	bindingData, err := json.Marshal(archive.Binding)
 	if err != nil {
@@ -326,7 +348,7 @@ func (n *Node) prepareLocalBackup(ctx context.Context) (resultErr error) {
 		return n.recoverStagedLocalMaintenance(ctx, archive, maintenanceResolved)
 	}
 	if !maintenanceResolved {
-		return fmt.Errorf("v2 Local maintenance is held; startup cannot clear it without staged archive replay")
+		return fmt.Errorf("Local maintenance is held; startup cannot clear it without staged archive replay")
 	}
 	n.localBackupNeedsSnapshot = localTip > archive.Tip()
 	if markerErr == nil {
@@ -335,11 +357,14 @@ func (n *Node) prepareLocalBackup(ctx context.Context) (resultErr error) {
 	return atomicLocalFile(n.config.DataDir, marker, bindingData)
 }
 
-// A held v2 token is cleared only after the archive has passed the same full
+// A held token is cleared only after the archive has passed the same full
 // staged replay and install path used for restoring a lost or behind DataDir.
 func (n *Node) recoverStagedLocalMaintenance(ctx context.Context, archive *recovery.LocalArchive, alreadyResolved bool) error {
-	if n.localOwner == nil || alreadyResolved {
+	if alreadyResolved {
 		return nil
+	}
+	if n.localOwner == nil {
+		return fmt.Errorf("Local archive maintenance recovery requires filesystem ownership")
 	}
 	return archive.RecoverMaintenanceControl(ctx, n.localOwner)
 }
@@ -415,12 +440,22 @@ func (n *Node) initializeLocalBackup(ctx context.Context) error {
 }
 
 func (n *Node) initializeLocalBackupLocked(ctx context.Context) error {
+	if err := n.ensureLocalBackupArchiveLocked(ctx); err != nil {
+		return err
+	}
+	if err := n.syncLocalBackupLocked(ctx); err != nil {
+		return err
+	}
+	n.localBackupReady = true
+	return nil
+}
+
+// ensureLocalBackupArchiveLocked creates only the bound archive genesis. A
+// checkpoint artifact must be published before SyncThrough can archive its
+// seal decision, so callers publishing a checkpoint must not sync here.
+func (n *Node) ensureLocalBackupArchiveLocked(ctx context.Context) error {
 	if n.localBackup == nil {
-		binding := recovery.LocalBinding{Version: 1, StoreUUID: n.localStore.policy.StoreUUID, ConfigDigest: n.localStore.configDigest, PolicyVersion: localCheckpointVersion, Bootstrap: *n.loadClusterConfig()}
-		if n.config.LocalArchiveProfile == types.LocalArchiveProfileFilesystem {
-			binding.Version = 2
-			binding.ArchiveLocationHash = n.localOwner.LocationHash(n.localBackupPrefix())
-		}
+		binding := n.localArchiveBinding()
 		// Persist intent first. After any uncertain genesis, absence is an error,
 		// rather than authorization to silently initialize another archive.
 		data, err := json.Marshal(binding)
@@ -433,9 +468,11 @@ func (n *Node) initializeLocalBackupLocked(ctx context.Context) error {
 		var genesis *recovery.LocalArchiveGenesis
 		if n.localOwner != nil {
 			genesis, err = recovery.PrepareLocalArchiveOwned(ctx, n.bucket, n.localBackupPrefix(), binding, n.localOwner)
-			if err != nil {
-				return err
-			}
+		} else {
+			genesis, err = recovery.PrepareLocalArchive(ctx, n.bucket, n.localBackupPrefix(), binding)
+		}
+		if err != nil {
+			return err
 		}
 		var base *recovery.LocalSnapshot
 		if n.core.CompactionFloor() > 0 {
@@ -456,7 +493,7 @@ func (n *Node) initializeLocalBackupLocked(ctx context.Context) error {
 		if n.localOwner != nil {
 			archive, err = recovery.CreateLocalArchiveFromPreparedOwned(ctx, genesis, base, n.localOwner)
 		} else {
-			archive, err = recovery.CreateLocalArchive(ctx, n.bucket, n.localBackupPrefix(), binding, base)
+			archive, err = recovery.CreateLocalArchiveFromPrepared(ctx, genesis, base)
 		}
 		if err != nil {
 			return err
@@ -464,10 +501,6 @@ func (n *Node) initializeLocalBackupLocked(ctx context.Context) error {
 		n.localBackup = archive
 		n.localBackupNeedsSnapshot = n.core.Tip() > 0 && base == nil
 	}
-	if err := n.syncLocalBackupLocked(ctx); err != nil {
-		return err
-	}
-	n.localBackupReady = true
 	return nil
 }
 
@@ -475,6 +508,9 @@ func (n *Node) initializeLocalBackupLocked(ctx context.Context) error {
 func (n *Node) publishLocalBackupCheckpoint(ctx context.Context, seal quepaxa.CheckpointSeal, slot quepaxa.Slot) error {
 	if n.bucket == nil || !n.config.Local {
 		return nil
+	}
+	if err := n.ensureLocalBackupArchiveLocked(ctx); err != nil {
+		return err
 	}
 	snapshot, err := n.uploadLocalBackupSnapshot(ctx, seal, slot)
 	if err != nil {
@@ -507,7 +543,10 @@ func (n *Node) uploadLocalBackupSnapshot(ctx context.Context, seal quepaxa.Check
 	for _, file := range files {
 		sources = append(sources, checkpoint.Source{Role: string(file.Role), Path: file.Path})
 	}
-	manager := checkpoint.NewManager(n.bucket, n.localBackupPrefix(), "", seal.ConfigID)
+	manager, err := n.localCheckpointManager(seal.ConfigID)
+	if err != nil {
+		return recovery.LocalSnapshot{}, err
+	}
 	var portable *checkpoint.Checkpoint
 	err = retryLocalMaintenance(ctx, func() error {
 		var err error
@@ -578,7 +617,10 @@ func (n *Node) downloadLocalBackupRoot(ctx context.Context, identity localCheckp
 	if err := decodeLocalJSON(snapshot.Descriptor, &descriptor); err != nil {
 		return err
 	}
-	manager := checkpoint.NewManager(n.bucket, n.localBackupPrefix(), "", snapshot.Seal.ConfigID)
+	manager, err := n.localCheckpointManager(snapshot.Seal.ConfigID)
+	if err != nil {
+		return err
+	}
 	download, err := os.MkdirTemp(stage, ".download-")
 	if err != nil {
 		return err

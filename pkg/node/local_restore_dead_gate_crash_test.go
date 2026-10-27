@@ -25,15 +25,15 @@ type localDeadGateCrashRequest struct {
 	Ready    string
 }
 
-func TestLocalFilesystemV2RestoreAfterDeadMaintenanceHolder(t *testing.T) {
-	testLocalFilesystemV2RestoreAfterDeadMaintenanceHolder(t, false)
+func TestLocalFilesystemRestoreAfterDeadMaintenanceHolder(t *testing.T) {
+	testLocalFilesystemRestoreAfterDeadMaintenanceHolder(t, false)
 }
 
-func TestLocalFilesystemV2HeldGateWithMatchingDataDir(t *testing.T) {
-	testLocalFilesystemV2RestoreAfterDeadMaintenanceHolder(t, true)
+func TestLocalFilesystemHeldGateWithMatchingDataDir(t *testing.T) {
+	testLocalFilesystemRestoreAfterDeadMaintenanceHolder(t, true)
 }
 
-func testLocalFilesystemV2RestoreAfterDeadMaintenanceHolder(t *testing.T, keepDataDir bool) {
+func testLocalFilesystemRestoreAfterDeadMaintenanceHolder(t *testing.T, keepDataDir bool) {
 	t.Helper()
 	root := t.TempDir()
 	dataDir, archiveDir, ready := filepath.Join(root, "data"), filepath.Join(root, "archive"), filepath.Join(root, "gate-held")
@@ -44,8 +44,8 @@ func testLocalFilesystemV2RestoreAfterDeadMaintenanceHolder(t *testing.T, keepDa
 	if err != nil {
 		t.Fatal(err)
 	}
-	cmd := exec.Command(os.Args[0], "-test.run=^TestLocalFilesystemV2MaintenanceHolderHelper$")
-	cmd.Env = append(os.Environ(), "RHIZA_LOCAL_V2_DEAD_GATE_CRASH="+string(request))
+	cmd := exec.Command(os.Args[0], "-test.run=^TestLocalFilesystemMaintenanceHolderHelper$")
+	cmd.Env = append(os.Environ(), "RHIZA_LOCAL_DEAD_GATE_CRASH="+string(request))
 	startLocalNodeCrashChild(t, cmd, ready)
 	defer func() {
 		if cmd.ProcessState == nil {
@@ -55,7 +55,7 @@ func testLocalFilesystemV2RestoreAfterDeadMaintenanceHolder(t *testing.T, keepDa
 	}()
 	waitForLocalDeadGateReady(t, cmd, ready)
 
-	config := localFilesystemV2CrashConfig(filepath.Join(root, "live-data"), archiveDir)
+	config := localFilesystemCrashConfig(filepath.Join(root, "live-data"), archiveDir)
 	if err := os.Mkdir(config.DataDir, 0700); err != nil {
 		t.Fatal(err)
 	}
@@ -68,7 +68,7 @@ func testLocalFilesystemV2RestoreAfterDeadMaintenanceHolder(t *testing.T, keepDa
 		BindingHash  string `json:"binding_hash"`
 	}
 	if err := json.Unmarshal(controlBefore, &control); err != nil || control.Version != 2 || control.Token == "" || control.LocationHash == "" || control.BindingHash == "" {
-		t.Fatalf("held v2 maintenance control=%s err=%v", controlBefore, err)
+		t.Fatalf("held Local maintenance control=%s err=%v", controlBefore, err)
 	}
 	locationHash, bindingHash := control.LocationHash, control.BindingHash
 	var binding struct {
@@ -76,7 +76,7 @@ func testLocalFilesystemV2RestoreAfterDeadMaintenanceHolder(t *testing.T, keepDa
 		ArchiveLocationHash string `json:"archive_location_hash"`
 	}
 	if err := json.Unmarshal(localDeadGateFilesystemObject(t, archiveDir, path.Join("dead-gate", "local/v1/BINDING")), &binding); err != nil || binding.Version != 2 || binding.ArchiveLocationHash != locationHash {
-		t.Fatalf("filesystem-v2 archive binding=%+v err=%v", binding, err)
+		t.Fatalf("Local archive binding=%+v err=%v", binding, err)
 	}
 	live := New(&config)
 	liveCtx, cancelLive := context.WithTimeout(context.Background(), time.Second)
@@ -104,7 +104,7 @@ func testLocalFilesystemV2RestoreAfterDeadMaintenanceHolder(t *testing.T, keepDa
 		}
 	}
 
-	restoreConfig := localFilesystemV2CrashConfig(dataDir, archiveDir)
+	restoreConfig := localFilesystemCrashConfig(dataDir, archiveDir)
 	restored := New(&restoreConfig)
 	restoreCtx, cancelRestore := context.WithTimeout(context.Background(), 15*time.Second)
 	err = restored.Open(restoreCtx)
@@ -120,14 +120,14 @@ func testLocalFilesystemV2RestoreAfterDeadMaintenanceHolder(t *testing.T, keepDa
 	controlAfter := localDeadGateFilesystemObject(t, archiveDir, controlKey)
 	if err := json.Unmarshal(controlAfter, &control); err != nil || control.Version != 2 || control.Token != "" || control.LocationHash != locationHash || control.BindingHash != bindingHash {
 		_ = restored.Shutdown()
-		t.Fatalf("recovered v2 maintenance control=%s err=%v, want only its token cleared", controlAfter, err)
+		t.Fatalf("recovered Local maintenance control=%s err=%v, want only its token cleared", controlAfter, err)
 	}
 	secondDir := filepath.Join(root, "concurrent-data")
 	if err := os.Mkdir(secondDir, 0700); err != nil {
 		_ = restored.Shutdown()
 		t.Fatal(err)
 	}
-	concurrentConfig := localFilesystemV2CrashConfig(secondDir, archiveDir)
+	concurrentConfig := localFilesystemCrashConfig(secondDir, archiveDir)
 	concurrent := New(&concurrentConfig)
 	concurrentCtx, cancelConcurrent := context.WithTimeout(context.Background(), time.Second)
 	err = concurrent.Open(concurrentCtx)
@@ -142,8 +142,8 @@ func testLocalFilesystemV2RestoreAfterDeadMaintenanceHolder(t *testing.T, keepDa
 	}
 }
 
-func TestLocalFilesystemV2MaintenanceHolderHelper(t *testing.T) {
-	raw := os.Getenv("RHIZA_LOCAL_V2_DEAD_GATE_CRASH")
+func TestLocalFilesystemMaintenanceHolderHelper(t *testing.T) {
+	raw := os.Getenv("RHIZA_LOCAL_DEAD_GATE_CRASH")
 	if raw == "" {
 		return
 	}
@@ -151,7 +151,7 @@ func TestLocalFilesystemV2MaintenanceHolderHelper(t *testing.T) {
 	if err := json.Unmarshal([]byte(raw), &request); err != nil {
 		t.Fatal(err)
 	}
-	config := localFilesystemV2CrashConfig(request.DataDir, request.ObjStore)
+	config := localFilesystemCrashConfig(request.DataDir, request.ObjStore)
 	n := New(&config)
 	if err := n.Open(context.Background()); err != nil {
 		t.Fatal(err)
@@ -173,65 +173,135 @@ func TestLocalFilesystemV2MaintenanceHolderHelper(t *testing.T) {
 	}
 }
 
-func localFilesystemV2CrashConfig(dataDir, archiveDir string) types.ExecutionConfig {
-	return types.ExecutionConfig{Local: true, LocalArchiveProfile: types.LocalArchiveProfileFilesystem, NodeID: "local", ClusterID: "dead-gate", DataDir: dataDir, ObjStoreProvider: "filesystem", ObjStoreDir: archiveDir, ObjStoreDurability: types.ObjectStoreDurabilityBeforeAck, ObjStoreSyncInterval: time.Hour, CheckpointInterval: time.Hour}
+func localFilesystemCrashConfig(dataDir, archiveDir string) types.ExecutionConfig {
+	return types.ExecutionConfig{Local: true, NodeID: "local", ClusterID: "dead-gate", DataDir: dataDir, ObjStoreProvider: "filesystem", ObjStoreDir: archiveDir, ObjStoreSyncInterval: time.Hour, CheckpointInterval: time.Hour}
 }
 
-func TestLocalFilesystemV2ProfileRejectsUnsupportedModes(t *testing.T) {
-	for name, configure := range map[string]func(*types.ExecutionConfig){
-		"non-local":      func(c *types.ExecutionConfig) { c.Local = false },
-		"non-filesystem": func(c *types.ExecutionConfig) { c.ObjStoreProvider = "s3" },
-		"async":          func(c *types.ExecutionConfig) { c.ObjStoreDurability = types.ObjectStoreDurabilityAsync },
-	} {
-		t.Run(name, func(t *testing.T) {
-			config := localFilesystemV2CrashConfig(filepath.Join(t.TempDir(), "data"), filepath.Join(t.TempDir(), "archive"))
-			configure(&config)
-			n := New(&config)
-			ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
-			defer cancel()
-			if err := n.Open(ctx); err == nil {
-				_ = n.Shutdown()
-				t.Fatal("unsupported filesystem-v2 profile configuration was accepted")
-			}
-		})
-	}
-}
-
-func TestLocalFilesystemV2RefusesLegacyArchiveUnchanged(t *testing.T) {
+func TestLocalFilesystemConfigInfersFilesystemProviderAndOwner(t *testing.T) {
 	root := t.TempDir()
 	dataDir, archiveDir := filepath.Join(root, "data"), filepath.Join(root, "archive")
 	if err := os.Mkdir(dataDir, 0700); err != nil {
 		t.Fatal(err)
 	}
-	legacy := localFilesystemV2CrashConfig(dataDir, archiveDir)
-	legacy.LocalArchiveProfile = types.LocalArchiveProfileLegacy
-	n := New(&legacy)
+	config := localFilesystemCrashConfig(dataDir, archiveDir)
+	config.ObjStoreProvider = ""
+	n := New(&config)
 	if err := n.Open(context.Background()); err != nil {
 		t.Fatal(err)
+	}
+	if n.localOwner == nil || !n.localOwner.Held() {
+		_ = n.Shutdown()
+		t.Fatal("Local filesystem configuration with only ObjStoreDir did not acquire its lifetime owner")
 	}
 	if err := n.Shutdown(); err != nil {
 		t.Fatal(err)
 	}
-	keys := []string{
-		path.Join("dead-gate", "local/v1/BINDING"),
-		path.Join("dead-gate", "local/v1/HEAD"),
-		path.Join("dead-gate", "local/v1/local-gc-control"),
+}
+
+func TestLocalFilesystemAsyncConfigOpensAndReleasesOwner(t *testing.T) {
+	root := t.TempDir()
+	dataDir, archiveDir := filepath.Join(root, "data"), filepath.Join(root, "archive")
+	if err := os.Mkdir(dataDir, 0700); err != nil {
+		t.Fatal(err)
 	}
-	before := localDeadGateFilesystemSnapshot(t, archiveDir, keys)
-	v2 := localFilesystemV2CrashConfig(dataDir, archiveDir)
-	rejected := New(&v2)
-	if err := rejected.Open(context.Background()); err == nil {
-		_ = rejected.Shutdown()
-		t.Fatal("filesystem-v2 silently adopted a legacy-v1 archive")
+	config := localFilesystemCrashConfig(dataDir, archiveDir)
+	config.ObjStoreDurability = types.ObjectStoreDurabilityAsync
+	n := New(&config)
+	if err := n.Open(context.Background()); err != nil {
+		t.Fatalf("explicit async Local filesystem configuration: %v", err)
 	}
-	after := localDeadGateFilesystemSnapshot(t, archiveDir, keys)
-	if len(before) != len(after) {
-		t.Fatalf("legacy archive object set changed during v2 refusal: before=%v after=%v", before, after)
+	if n.localOwner == nil || !n.localOwner.Held() {
+		_ = n.Shutdown()
+		t.Fatal("async Local filesystem configuration did not acquire its lifetime owner")
 	}
-	for key, data := range before {
-		if !bytes.Equal(data, after[key]) {
-			t.Fatalf("legacy object %s changed during v2 refusal: before=%s after=%s", key, data, after[key])
-		}
+	if _, err := n.server.Execute(context.Background(), network.ExecuteRequest{RequestID: "async-schema", SQL: "CREATE TABLE async_rows (id INTEGER PRIMARY KEY)"}); err != nil {
+		_ = n.Shutdown()
+		t.Fatalf("async Local filesystem write: %v", err)
+	}
+	if err := n.Shutdown(); err != nil {
+		t.Fatalf("async Local filesystem shutdown: %v", err)
+	}
+
+	owner, err := rhizaobjstore.AcquireLocalFilesystemOwner(archiveDir, dataDir)
+	if err != nil {
+		t.Fatalf("owner was not released after clean async shutdown: %v", err)
+	}
+	if err := owner.Close(time.Second); err != nil {
+		t.Fatalf("release owner acquired by shutdown assertion: %v", err)
+	}
+}
+
+func TestLocalFilesystemRefusesMissingOrMalformedOwnershipControlUnchanged(t *testing.T) {
+	for _, tc := range []struct {
+		name      string
+		malformed []byte
+	}{
+		{name: "missing"},
+		{name: "malformed", malformed: []byte("{not-json")},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			root := t.TempDir()
+			dataDir, archiveDir := filepath.Join(root, "data"), filepath.Join(root, "archive")
+			config := localFilesystemCrashConfig(dataDir, archiveDir)
+			n := New(&config)
+			if err := n.Open(context.Background()); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := n.server.Execute(context.Background(), network.ExecuteRequest{RequestID: "ownership-schema", SQL: "CREATE TABLE ownership_rows (id INTEGER PRIMARY KEY)"}); err != nil {
+				_ = n.Shutdown()
+				t.Fatal(err)
+			}
+			ack, err := n.server.Execute(context.Background(), network.ExecuteRequest{RequestID: "ownership-ack", SQL: "INSERT INTO ownership_rows VALUES (11)"})
+			if err != nil || ack.Status != types.MutationCommitted || ack.Slot == 0 {
+				_ = n.Shutdown()
+				t.Fatalf("ownership fixture acknowledgement=%+v err=%v", ack.MutationReceipt, err)
+			}
+			if uint64(n.localBackup.Tip()) < ack.Slot || n.localBackup.Tip() != n.core.Tip() {
+				_ = n.Shutdown()
+				t.Fatalf("ownership fixture archive tip=%d core tip=%d row ACK slot=%d", n.localBackup.Tip(), n.core.Tip(), ack.Slot)
+			}
+			if err := n.Shutdown(); err != nil {
+				t.Fatal(err)
+			}
+
+			keys := []string{
+				path.Join("dead-gate", "local/v1/BINDING"),
+				path.Join("dead-gate", "local/v1/HEAD"),
+				path.Join("dead-gate", "local/v1/local-gc-control"),
+			}
+			bucket, err := rhizaobjstore.NewBucket(rhizaobjstore.Config{Provider: rhizaobjstore.ProviderFilesystem, FilesystemDir: archiveDir})
+			if err != nil {
+				t.Fatal(err)
+			}
+			controlKey := keys[2]
+			if tc.name == "missing" {
+				err = bucket.Delete(context.Background(), controlKey)
+			} else {
+				err = bucket.Upload(context.Background(), controlKey, bytes.NewReader(tc.malformed))
+			}
+			if err := errors.Join(err, bucket.Close()); err != nil {
+				t.Fatal(err)
+			}
+			before := localDeadGateFilesystemSnapshot(t, archiveDir, keys)
+
+			rejected := New(&config)
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			err = rejected.Open(ctx)
+			cancel()
+			if err == nil {
+				_ = rejected.Shutdown()
+				t.Fatal("startup accepted missing or malformed Local ownership control")
+			}
+			after := localDeadGateFilesystemSnapshot(t, archiveDir, keys)
+			if len(before) != len(after) {
+				t.Fatalf("archive object set changed during ownership-control refusal: before=%v after=%v", before, after)
+			}
+			for key, data := range before {
+				if !bytes.Equal(data, after[key]) {
+					t.Fatalf("archive object %s changed during ownership-control refusal: before=%s after=%s", key, data, after[key])
+				}
+			}
+		})
 	}
 }
 
@@ -268,7 +338,7 @@ func waitForLocalDeadGateReady(t *testing.T, cmd *exec.Cmd, ready string) {
 			_ = cmd.Process.Kill()
 			waitErr := cmd.Wait()
 			output, _ := os.ReadFile(ready + ".child.log")
-			t.Fatalf("child did not hold v2 archive gate: wait=%v output=%s", waitErr, output)
+			t.Fatalf("child did not hold Local archive maintenance: wait=%v output=%s", waitErr, output)
 		}
 		time.Sleep(10 * time.Millisecond)
 	}
@@ -284,7 +354,7 @@ func localDeadGateFilesystemObject(t *testing.T, root, name string) []byte {
 	return localDeadGateObject(t, bucket, name)
 }
 
-func TestLocalFilesystemV2UnknownUploadEffectKeepsOwner(t *testing.T) {
+func TestLocalFilesystemUnknownUploadEffectKeepsOwner(t *testing.T) {
 	root := t.TempDir()
 	archiveDir, dataDir := filepath.Join(root, "archive"), filepath.Join(root, "data")
 	if err := os.Mkdir(dataDir, 0700); err != nil {
@@ -328,97 +398,6 @@ func (b *localDeadGateUnknownEffectBucket) Upload(ctx context.Context, name stri
 		return errors.New("injected unknown result after filesystem adapter write")
 	}
 	return nil
-}
-
-// This compatibility case deliberately preserves a v1 held token after its
-// holder is killed because that protocol cannot prove process fencing.
-func TestLocalLegacyGateRemainsHeldAfterWriterDeath(t *testing.T) {
-	if raw := os.Getenv("RHIZA_LOCAL_LEGACY_GATE_CRASH"); raw != "" {
-		var request localDeadGateCrashRequest
-		if err := json.Unmarshal([]byte(raw), &request); err != nil {
-			t.Fatal(err)
-		}
-		config := types.ExecutionConfig{Local: true, NodeID: "local", ClusterID: "legacy-gate", DataDir: request.DataDir, ObjStoreProvider: "filesystem", ObjStoreDir: request.ObjStore, ObjStoreDurability: types.ObjectStoreDurabilityBeforeAck, ObjStoreSyncInterval: time.Hour, CheckpointInterval: time.Hour}
-		n := New(&config)
-		if err := n.Open(context.Background()); err != nil {
-			t.Fatal(err)
-		}
-		for _, write := range []network.ExecuteRequest{
-			{RequestID: "legacy-schema", SQL: "CREATE TABLE legacy_gate_rows (id INTEGER PRIMARY KEY)"},
-			{RequestID: "legacy-row", SQL: "INSERT INTO legacy_gate_rows VALUES (9)"},
-		} {
-			if _, err := n.server.Execute(context.Background(), write); err != nil {
-				t.Fatal(err)
-			}
-		}
-		if n.localBackup.Tip() != n.core.Tip() {
-			t.Fatal("before-ack writes were not confirmed in the archive")
-		}
-		var head struct {
-			Version uint `json:"version"`
-		}
-		data := localDeadGateObject(t, n.bucket, path.Join(n.localBackupPrefix(), "HEAD"))
-		if err := json.Unmarshal(data, &head); err != nil || head.Version != 1 {
-			t.Fatalf("legacy archive HEAD version=%d err=%v, want v1", head.Version, err)
-		}
-		gateKey := path.Join(n.localBackupPrefix(), "local-gc-control")
-		n.bucket.Bucket = &localDeadGateUploadBucket{Bucket: n.bucket.Bucket, key: gateKey, ready: request.Ready}
-		if err := n.localBackup.GarbageCollect(context.Background(), config.CheckpointRetainCount, config.ObjStoreGCGracePeriod); err == nil {
-			t.Fatal("held legacy gate fixture unexpectedly returned")
-		}
-		return
-	}
-
-	root := t.TempDir()
-	dataDir, remote := filepath.Join(root, "data"), filepath.Join(root, "archive")
-	ready := filepath.Join(root, "legacy-gate-held")
-	request, err := json.Marshal(localDeadGateCrashRequest{DataDir: dataDir, ObjStore: remote, Ready: ready})
-	if err != nil {
-		t.Fatal(err)
-	}
-	cmd := exec.Command(os.Args[0], "-test.run=^TestLocalLegacyGateRemainsHeldAfterWriterDeath$")
-	cmd.Env = append(os.Environ(), "RHIZA_LOCAL_LEGACY_GATE_CRASH="+string(request))
-	startLocalNodeCrashChild(t, cmd, ready)
-	waitForLocalNodeCrashBoundary(t, cmd, ready)
-
-	config := types.ExecutionConfig{Local: true, NodeID: "local", ClusterID: "legacy-gate", DataDir: filepath.Join(root, "restored"), ObjStoreProvider: "filesystem", ObjStoreDir: remote, ObjStoreDurability: types.ObjectStoreDurabilityBeforeAck, ObjStoreSyncInterval: time.Hour, CheckpointInterval: time.Hour}
-	reader := New(&config)
-	if err := reader.openLocalBackupBucket(context.Background()); err != nil {
-		t.Fatal(err)
-	}
-	defer reader.bucket.Close()
-	gateKey := path.Join(reader.localBackupPrefix(), "local-gc-control")
-	controlBefore := localDeadGateObject(t, reader.bucket, gateKey)
-	var control struct {
-		Version uint   `json:"version"`
-		Token   string `json:"token"`
-	}
-	if err := json.Unmarshal(controlBefore, &control); err != nil || control.Version != 1 || control.Token == "" {
-		t.Fatalf("held legacy maintenance control=%s err=%v", controlBefore, err)
-	}
-	headKey := path.Join(reader.localBackupPrefix(), "HEAD")
-	var head struct {
-		Version uint `json:"version"`
-	}
-	if err := json.Unmarshal(localDeadGateObject(t, reader.bucket, headKey), &head); err != nil || head.Version != 1 {
-		t.Fatalf("archive HEAD version=%d err=%v, want legacy v1", head.Version, err)
-	}
-
-	openCtx, cancel := context.WithTimeout(context.Background(), 6*time.Second)
-	defer cancel()
-	restorer := New(&config)
-	openErr := restorer.Open(openCtx)
-	if openErr == nil {
-		_ = restorer.Shutdown()
-		t.Fatal("restore auto-released an unowned legacy gate; legacy writers cannot prove process fencing")
-	}
-	controlAfter := localDeadGateObject(t, reader.bucket, gateKey)
-	if !bytes.Equal(controlBefore, controlAfter) {
-		t.Fatalf("legacy control changed after dead-writer restore attempt: before=%s after=%s", controlBefore, controlAfter)
-	}
-	if err := json.Unmarshal(localDeadGateObject(t, reader.bucket, headKey), &head); err != nil || head.Version != 1 {
-		t.Fatalf("archive HEAD changed to version=%d err=%v, want legacy v1", head.Version, err)
-	}
 }
 
 func localDeadGateObject(t *testing.T, bucket interface {

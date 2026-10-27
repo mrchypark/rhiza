@@ -121,7 +121,6 @@ type Manager struct {
 	prefix                   string
 	localDir                 string
 	configID                 uint
-	localControlVersion      uint
 	localControlLocationHash string
 	localControlBindingHash  string
 	checkpoints              []Checkpoint

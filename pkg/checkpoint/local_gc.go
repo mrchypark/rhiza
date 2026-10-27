@@ -14,6 +14,7 @@ import (
 	"time"
 
 	internalobjstore "github.com/mrchypark/rhiza/internal/objstore"
+	"github.com/mrchypark/rhiza/internal/types"
 	"github.com/thanos-io/objstore"
 )
 
@@ -22,12 +23,11 @@ var ErrLocalMaintenanceBusy = errors.New("Local maintenance busy; retry after ho
 type localMaintenanceControl struct {
 	Version      uint   `json:"version"`
 	Token        string `json:"token"`
-	LocationHash string `json:"location_hash,omitempty"`
-	BindingHash  string `json:"binding_hash,omitempty"`
+	LocationHash string `json:"location_hash"`
+	BindingHash  string `json:"binding_hash"`
 }
 
-func (m *Manager) SetLocalControlProfile(version uint, locationHash, bindingHash string) {
-	m.localControlVersion = version
+func (m *Manager) SetLocalControlBinding(locationHash, bindingHash string) {
 	m.localControlLocationHash = locationHash
 	m.localControlBindingHash = bindingHash
 }
@@ -76,12 +76,10 @@ func (m *Manager) withLocalMaintenanceContextOnce(ctx context.Context, work func
 	requestCtx := ctx
 	admission := &localOperation{request: context.WithoutCancel(ctx), timeout: localRPCTimeout}
 	ctx = context.WithValue(context.WithoutCancel(ctx), localOperationKey{}, admission)
-	controlVersion := m.localControlVersion
-	if controlVersion == 0 {
-		controlVersion = 1
-	}
+	controlVersion := types.LocalArchiveFormatVersion
 	gate := NewManager(LocalBucket(m.bucket), m.prefix, "", m.configID)
-	gate.SetLocalControlProfile(controlVersion, m.localControlLocationHash, m.localControlBindingHash)
+	gate.localControlLocationHash = m.localControlLocationHash
+	gate.localControlBindingHash = m.localControlBindingHash
 	key := m.key("local-gc-control")
 	data, version, err := gate.readStableLeaseObject(ctx, key, 4096)
 	var state localMaintenanceControl
@@ -90,7 +88,7 @@ func (m *Manager) withLocalMaintenanceContextOnce(ctx context.Context, work func
 		if err := decodePersistedJSON(data, &state); err != nil {
 			return err
 		}
-		if state.Version != controlVersion || controlVersion == 2 && (state.LocationHash != m.localControlLocationHash || state.BindingHash != m.localControlBindingHash) {
+		if state.Version != controlVersion || state.LocationHash != m.localControlLocationHash || state.BindingHash != m.localControlBindingHash {
 			return fmt.Errorf("invalid Local maintenance control")
 		}
 		if state.Token != "" {
@@ -99,8 +97,8 @@ func (m *Manager) withLocalMaintenanceContextOnce(ctx context.Context, work func
 		options = []objstore.ObjectUploadOption{objstore.WithIfMatch(version)}
 	} else if !m.bucket.IsObjNotFoundErr(err) {
 		return err
-	} else if controlVersion == 2 {
-		return fmt.Errorf("v2 Local maintenance control missing")
+	} else if m.localControlBindingHash != "" {
+		return fmt.Errorf("Local maintenance control missing")
 	}
 	var token [16]byte
 	if _, err := rand.Read(token[:]); err != nil {
@@ -144,45 +142,45 @@ func (m *Manager) withLocalMaintenanceContextOnce(ctx context.Context, work func
 	return requestCtx.Err()
 }
 
-// RecoverLocalMaintenanceControl is the sole v2 held-token recovery operation.
+// RecoverLocalMaintenanceControl is the sole bound held-token recovery operation.
 // Callers must finish owner-authorized read-only validation before invoking it.
 func (m *Manager) RecoverLocalMaintenanceControl(ctx context.Context, owner *internalobjstore.LocalFilesystemOwner) error {
-	if m.localControlVersion != 2 || owner == nil || !owner.Held() || owner.LocationHash(m.prefix) != m.localControlLocationHash {
-		return fmt.Errorf("v2 Local control recovery requires the filesystem owner")
+	if m.localControlBindingHash == "" || owner == nil || !owner.Held() || owner.LocationHash(m.prefix) != m.localControlLocationHash {
+		return fmt.Errorf("Local control recovery requires the filesystem owner")
 	}
 	gate := NewManager(LocalBucket(m.bucket), m.prefix, "", m.configID)
-	gate.SetLocalControlProfile(2, m.localControlLocationHash, m.localControlBindingHash)
+	gate.SetLocalControlBinding(m.localControlLocationHash, m.localControlBindingHash)
 	key := m.key("local-gc-control")
 	data, version, err := gate.readStableLeaseObject(ctx, key, 4096)
 	if err != nil {
-		return fmt.Errorf("read v2 Local maintenance control: %w", err)
+		return fmt.Errorf("read Local maintenance control: %w", err)
 	}
 	var state localMaintenanceControl
-	if err := decodePersistedJSON(data, &state); err != nil || state.Version != 2 || state.LocationHash != m.localControlLocationHash || state.BindingHash != m.localControlBindingHash {
-		return fmt.Errorf("invalid v2 Local maintenance control")
+	if err := decodePersistedJSON(data, &state); err != nil || state.Version != types.LocalArchiveFormatVersion || state.LocationHash != m.localControlLocationHash || state.BindingHash != m.localControlBindingHash {
+		return fmt.Errorf("invalid Local maintenance control")
 	}
 	if state.Token == "" {
 		return nil
 	}
-	free, err := json.Marshal(localMaintenanceControl{Version: 2, LocationHash: m.localControlLocationHash, BindingHash: m.localControlBindingHash})
+	free, err := json.Marshal(localMaintenanceControl{Version: types.LocalArchiveFormatVersion, LocationHash: m.localControlLocationHash, BindingHash: m.localControlBindingHash})
 	if err != nil {
 		return err
 	}
 	if err := gate.bucket.Upload(ctx, key, bytes.NewReader(free), objstore.WithIfMatch(version)); err != nil {
-		return fmt.Errorf("release recovered v2 Local maintenance control: %w", err)
+		return fmt.Errorf("release recovered Local maintenance control: %w", err)
 	}
 	got, _, err := gate.readStableLeaseObject(ctx, key, 4096)
 	if err != nil {
-		return fmt.Errorf("v2 Local maintenance recovery readback: %w", err)
+		return fmt.Errorf("Local maintenance recovery readback: %w", err)
 	}
 	if !bytes.Equal(got, free) {
-		return fmt.Errorf("v2 Local maintenance recovery readback mismatch")
+		return fmt.Errorf("Local maintenance recovery readback mismatch")
 	}
 	return nil
 }
 
 func (m *Manager) LocalMaintenanceResolved(ctx context.Context) (bool, error) {
-	if m.localControlVersion != 2 {
+	if m.localControlBindingHash == "" {
 		return true, nil
 	}
 	data, _, err := m.readStableLeaseObject(ctx, m.key("local-gc-control"), 4096)
@@ -190,8 +188,8 @@ func (m *Manager) LocalMaintenanceResolved(ctx context.Context) (bool, error) {
 		return false, err
 	}
 	var state localMaintenanceControl
-	if err := decodePersistedJSON(data, &state); err != nil || state.Version != 2 || state.LocationHash != m.localControlLocationHash || state.BindingHash != m.localControlBindingHash {
-		return false, fmt.Errorf("invalid v2 Local maintenance control")
+	if err := decodePersistedJSON(data, &state); err != nil || state.Version != types.LocalArchiveFormatVersion || state.LocationHash != m.localControlLocationHash || state.BindingHash != m.localControlBindingHash {
+		return false, fmt.Errorf("invalid Local maintenance control")
 	}
 	return state.Token == "", nil
 }

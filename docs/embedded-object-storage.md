@@ -30,11 +30,10 @@ window. An empty policy defaults to before-ack for Local plus object storage.
 The same bounded storage-outage test exercises both the explicit policy and
 the empty default. Nonlocal policy defaults are outside this test contract.
 
-## Filesystem-backed Local recovery (opt-in)
+## Filesystem-backed Local recovery
 
-Filesystem-backed Local recovery requires the explicit `filesystem-v2` archive
-profile, a dedicated filesystem root outside `DataDir`, and before-ack
-durability:
+Filesystem-backed Local archives automatically acquire a same-host process-lifetime
+owner. Configure a dedicated filesystem root outside `DataDir`:
 
 ```go
 cfg := rhiza.Config{
@@ -43,33 +42,46 @@ cfg := rhiza.Config{
     DataDir:             "./application-data",
     ObjStoreProvider:    rhiza.ObjectStoreProviderFilesystem,
     ObjStoreDir:         "./application-archive",
-    ObjStoreDurability:  rhiza.ObjectStoreDurabilityBeforeAck,
-    LocalArchiveProfile: rhiza.LocalArchiveProfileFilesystem,
+    ObjStoreDurability: rhiza.ObjectStoreDurabilityBeforeAck,
 }
 ```
 
-This profile is limited to supported local filesystems on Linux and macOS. Its
-exclusive owner lock covers the entire archive root on the same host, including
-all prefixes beneath it. The root and its parent must be trusted, stable, and
-disjoint from `DataDir`. Neither may be renamed, replaced, remounted, or
-externally removed while Rhiza is using the root. The advisory lock only
-coordinates cooperating processes; pathname changes and external filesystem
-mutation are not detected or fenced. Existing symlinks anywhere below the v2
+The owner lock covers the whole archive root on one host, so every prefix under
+that root is serialized. Supported local filesystems are limited to Linux and
+macOS; other platforms fail closed. The root and its parent must be trusted,
+stable, and disjoint from `DataDir`. Neither may be renamed, replaced,
+remounted, or externally removed while Rhiza is using the root. The advisory
+lock coordinates cooperating processes; pathname changes and external
+filesystem mutation are not detected or fenced. Existing symlinks below the
 archive namespace are rejected at startup.
-Filesystem-v2 does not adopt or migrate an existing v1 archive; keep the
-default legacy profile for v1 archives, or use a new empty archive root for
-v2. Do not run a v1 and v2 binary concurrently against the same empty root and
-prefix. A racing legacy genesis may leave a partial namespace; startup rejects
-that state and does not repair it automatically. This profile does not promise
-availability or fencing against concurrent legacy clients.
+
+There is one fixed archive format. Older or partial archives are rejected and
+left unchanged; Rhiza does not migrate, adopt, or delete their data. Keep the
+existing `local/v1` namespace unchanged when reusing a location; a rejected
+archive is not permission to bootstrap a sibling namespace. Do not run older
+unfenced clients concurrently against a Local filesystem archive.
 
 The owner lock is a process-lifetime kernel lock: process termination releases
 it so the next process can validate and recover an acknowledged archive without
-an administrator clearing a token. This is a process-crash guarantee, not a
-power-loss or filesystem-hardware durability qualification. If a live process
-cannot prove that filesystem work drained, it deliberately retains ownership;
-restart that process to release the kernel lock. Do not remove the lock anchor
-while any process could still be using the root.
+an administrator clearing a token. This covers process crashes, not power loss
+or filesystem-hardware durability. Explicit `Async` durability retains its
+original loss window; use `BeforeAck` when successful mutation responses must
+be acknowledged by the archive. If a live process cannot prove filesystem work
+drained, it deliberately retains ownership until process exit. Do not remove
+the lock anchor while any process could still be using the root.
+
+S3, GCS, and Azure Local archives continue to use object-store conditional
+writes. The filesystem owner does not fence those providers. A held or
+uncertain remote maintenance token remains unresolved and blocks recovery; it
+is never cleared based on age or process state.
+
+The automatic ownership guarantee applies to Local filesystem archives opened
+through `rhiza.Open`. Lower-level `pkg/recovery` APIs that accept a generic
+object-store bucket remain caller-fenced; they cannot infer or acquire a
+filesystem-root owner from an arbitrary bucket value. The generic opener may
+inspect filesystem-bound metadata without that owner, but returns a strictly
+read-only archive; all archive mutation and restore-pin operations require the
+managed owner. Remote archives retain conditional-write behavior.
 
 ## Reconciliation contract
 
@@ -155,8 +167,8 @@ The Node renews every 20 seconds with a 20-second budget, including waiting for
 the renewal lock; failure cancels restore before pins are released. The remaining
 margin allows a 30-second in-flight RPC batch drain and 20 seconds of scheduling
 slack. A merely unexpired but nearly exhausted lease is refused.
-HEAD v2's catalog records committed retention roots; its protocol marker must
-prevent a downgrade to a writer or collector that ignores that protocol.
+The fixed archive HEAD catalog records committed retention roots. Readers
+reject unsupported formats rather than upgrading or adopting them.
 
 Offline read-only init performs no remote writes and cannot acquire a remote
 write-based pin. Its safety requires externally established single-writer

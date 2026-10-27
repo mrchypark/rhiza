@@ -6,16 +6,15 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"io"
 	"os"
+	"os/exec"
 	"path"
 	"path/filepath"
 	"reflect"
 	"sort"
 	"strings"
-	"syscall"
 	"testing"
 	"time"
 
@@ -260,7 +259,9 @@ func TestEmbeddedObjectStorageRemoteAheadRestoresProvenExtension(t *testing.T) {
 	h.close()
 	embeddedReplaceLocal(t, h.cfg.DataDir, staleLocal)
 	remote := embeddedRemoteImage(t, h.cfg)
-	archive := embeddedGCArchive(t, h.ctx, embeddedBucket(t, h.cfg), h.cfg)
+	archiveBucket, owner, releaseArchiveBucket := embeddedOwnedBucket(t, h.cfg)
+	archive := embeddedGCArchive(t, h.ctx, archiveBucket, h.cfg, owner)
+	releaseArchiveBucket()
 	h.open(h.cfg)
 	h.check("original", "remote-ahead")
 	h.close()
@@ -451,6 +452,11 @@ func TestEmbeddedObjectStorageMissingBoundRemoteFailureRetry(t *testing.T) {
 }
 
 func TestEmbeddedObjectStorageBeforeAckUnavailablePreservesRetry(t *testing.T) {
+	const childKey = "RHIZA_EMBEDDED_BEFORE_ACK_OUTAGE_CHILD"
+	if os.Getenv(childKey) == "1" {
+		runEmbeddedBeforeAckOutageChild(t)
+		return
+	}
 	if provider := os.Getenv("RHIZA_EMBEDDED_PROVIDER"); provider != "" && provider != "filesystem" {
 		t.Skip("filesystem path failure fixture; remote providers use emulator contract checks")
 	}
@@ -468,82 +474,67 @@ func TestEmbeddedObjectStorageBeforeAckUnavailablePreservesRetry(t *testing.T) {
 			h := newEmbeddedHistoryConfig(t, false, cfg)
 			h.close()
 			beforeFailureRemote := embeddedRemoteImage(t, h.cfg)
-			h.open(h.cfg)
-			remote := h.cfg.ObjStoreDir
+			request := rhiza.ExecuteRequest{RequestID: "outage", SQL: "INSERT INTO backup_items(name) VALUES (?) RETURNING id, name", Args: []any{"outage"}}
+			remote := cfg.ObjStoreDir
 			saved := remote + "-outage"
-			if err := os.Rename(remote, saved); err != nil {
+			config, err := json.Marshal(embeddedBeforeAckOutageConfig{
+				DataDir: cfg.DataDir, ArchiveRoot: cfg.ObjStoreDir, ClusterID: cfg.ClusterID,
+				Prefix: cfg.ObjStorePrefix, Durability: cfg.ObjStoreDurability,
+			})
+			if err != nil {
 				t.Fatal(err)
 			}
-			restored := false
-			stopped := false
-			var closeDone chan error
-			stopDB := func() bool {
-				t.Helper()
-				if stopped {
-					return true
-				}
-				if closeDone == nil {
-					db := h.db
-					h.db = nil
-					closeDone = make(chan error, 1)
-					go func() { closeDone <- db.Close() }()
-				}
-				select {
-				case err := <-closeDone:
-					stopped = true
-					if err != nil && !errors.Is(err, syscall.ENOTDIR) {
-						t.Errorf("unexpected close error during archive outage: %v", err)
-					} else if err != nil {
-						t.Logf("expected archive outage close error: %v", err)
-					}
-					return true
-				case <-time.After(20 * time.Second):
-					t.Error("DB close did not complete within 20s; leaving the archive blocked rather than repairing under active workers")
-					return false
-				}
+			if _, err := os.Lstat(saved); !os.IsNotExist(err) {
+				t.Fatalf("saved archive path already exists: %s: %v", saved, err)
 			}
-			repair := func() {
-				t.Helper()
-				if restored {
-					return
+			var cmd *exec.Cmd
+			repairArchive := func() error {
+				if cmd != nil && cmd.Process != nil && cmd.ProcessState == nil {
+					_ = cmd.Process.Kill()
+					_ = cmd.Wait()
 				}
-				if !stopped {
-					t.Fatal("archive repair requires confirmed DB shutdown")
+				if cmd != nil && cmd.Process != nil && cmd.ProcessState == nil {
+					return fmt.Errorf("outage child was not reaped before archive repair")
 				}
-				// The original archive is saved separately. Anything at this owned
-				// path is the injected blocker or a test-created replacement directory.
+				if _, err := os.Lstat(saved); os.IsNotExist(err) {
+					return nil
+				} else if err != nil {
+					return fmt.Errorf("inspect saved archive: %w", err)
+				}
 				if err := os.RemoveAll(remote); err != nil {
-					t.Fatal(err)
+					return fmt.Errorf("remove outage blocker: %w", err)
 				}
 				if err := os.Rename(saved, remote); err != nil {
-					t.Fatal(err)
+					return fmt.Errorf("restore saved archive: %w", err)
 				}
-				restored = true
+				return nil
 			}
-			// LIFO cleanup stops owned workers before repairing the archive and
-			// before the history fixture's ordinary close cleanup can run.
+			// This cleanup kills and reaps any child before restoring the archive.
 			t.Cleanup(func() {
-				if stopDB() {
-					repair()
+				if err := repairArchive(); err != nil {
+					t.Errorf("restore archive after outage child: %v", err)
 				}
 			})
-			if err := os.WriteFile(remote, []byte("not a directory"), 0600); err != nil {
+			watchdog, cancel := context.WithTimeout(context.Background(), 45*time.Second)
+			defer cancel()
+			cmd = exec.CommandContext(watchdog, os.Args[0], "-test.run=^TestEmbeddedObjectStorageBeforeAckUnavailablePreservesRetry$", "-test.v")
+			cmd.WaitDelay = 5 * time.Second
+			cmd.Env = append(os.Environ(), childKey+"=1", "RHIZA_EMBEDDED_BEFORE_ACK_OUTAGE_CONFIG="+string(config))
+			output, childErr := cmd.CombinedOutput() // Run waits for and reaps the child, including on watchdog expiry.
+			if childErr != nil {
+				t.Fatalf("outage child failed (reaped=%v): %v\n%s", cmd.ProcessState != nil, childErr, output)
+			}
+			if !strings.Contains(string(output), "BEFORE_ACK_OUTAGE_REJECTED") || !strings.Contains(string(output), "BEFORE_ACK_OUTAGE_CLOSED") {
+				t.Fatalf("outage child did not report both rejection and close: %s", output)
+			}
+			// The child has exited and been reaped, so its poisoned owner is gone.
+			// Only now restore the archive path; never rewrite or clear its control.
+			if err := repairArchive(); err != nil {
 				t.Fatal(err)
 			}
-			request := rhiza.ExecuteRequest{RequestID: "outage", SQL: "INSERT INTO backup_items(name) VALUES (?) RETURNING id, name", Args: []any{"outage"}}
-			ctx, cancel := context.WithTimeout(h.ctx, time.Second)
-			_, err := h.db.ExecuteReturning(ctx, request)
-			cancel()
-			if err == nil {
-				t.Fatal("BeforeAck reported success while remote writes were impossible")
+			if got := embeddedRemoteImage(t, h.cfg); !reflect.DeepEqual(got, beforeFailureRemote) {
+				t.Fatal("failed BeforeAck attempt changed the saved archive")
 			}
-			if !stopDB() {
-				t.FailNow()
-			}
-			repair()
-			// Discard any shutdown-time remote flush so restart must reconcile the
-			// locally preserved operation against the last known published prefix.
-			embeddedReplaceRemote(t, h.cfg, beforeFailureRemote)
 			if got := embeddedLocalImage(t, h.cfg.DataDir); len(got) == 0 {
 				t.Fatal("failed publication discarded local state")
 			}
@@ -561,4 +552,52 @@ func TestEmbeddedObjectStorageBeforeAckUnavailablePreservesRetry(t *testing.T) {
 			h.close()
 		})
 	}
+}
+
+type embeddedBeforeAckOutageConfig struct {
+	DataDir     string                      `json:"data_dir"`
+	ArchiveRoot string                      `json:"archive_root"`
+	ClusterID   string                      `json:"cluster_id"`
+	Prefix      string                      `json:"prefix"`
+	Durability  rhiza.ObjectStoreDurability `json:"durability"`
+}
+
+func runEmbeddedBeforeAckOutageChild(t *testing.T) {
+	t.Helper()
+	var input embeddedBeforeAckOutageConfig
+	if err := json.Unmarshal([]byte(os.Getenv("RHIZA_EMBEDDED_BEFORE_ACK_OUTAGE_CONFIG")), &input); err != nil {
+		t.Fatalf("decode child config: %v", err)
+	}
+	cfg := rhiza.Config{
+		Local: true, NodeID: "embedded-backup", ClusterID: input.ClusterID, DataDir: input.DataDir,
+		ObjStoreProvider: rhiza.ObjectStoreProviderFilesystem, ObjStoreDir: input.ArchiveRoot,
+		ObjStorePrefix: input.Prefix, ObjStoreDurability: input.Durability,
+		ObjStoreSyncInterval: time.Hour, ObjStoreGCInterval: 24 * time.Hour,
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	db, err := rhiza.Open(ctx, cfg)
+	if err != nil {
+		t.Fatalf("child open: %v", err)
+	}
+	remote, saved := cfg.ObjStoreDir, cfg.ObjStoreDir+"-outage"
+	if err := os.Rename(remote, saved); err != nil {
+		_ = db.Close()
+		t.Fatalf("child rename archive root: %v", err)
+	}
+	if err := os.WriteFile(remote, []byte("not a directory"), 0600); err != nil {
+		_ = db.Close()
+		t.Fatalf("child install outage blocker: %v", err)
+	}
+	request := rhiza.ExecuteRequest{RequestID: "outage", SQL: "INSERT INTO backup_items(name) VALUES (?) RETURNING id, name", Args: []any{"outage"}}
+	requestCtx, requestCancel := context.WithTimeout(ctx, time.Second)
+	_, requestErr := db.ExecuteReturning(requestCtx, request)
+	requestCancel()
+	if requestErr == nil {
+		_ = db.Close()
+		t.Fatal("BeforeAck reported success while remote writes were impossible")
+	}
+	fmt.Printf("BEFORE_ACK_OUTAGE_REJECTED: %v\n", requestErr)
+	closeErr := db.Close()
+	fmt.Printf("BEFORE_ACK_OUTAGE_CLOSED: %v\n", closeErr)
 }

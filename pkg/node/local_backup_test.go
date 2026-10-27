@@ -110,10 +110,36 @@ func TestLocalBackupWholeLossCheckpointTailAndRestart(t *testing.T) {
 	}
 }
 
+func TestLocalFilesystemEmptyDirUsesProviderDefaultRoot(t *testing.T) {
+	cwd := t.TempDir()
+	t.Chdir(cwd)
+	dataDir := filepath.Join(t.TempDir(), "data")
+	if err := os.MkdirAll(dataDir, 0700); err != nil {
+		t.Fatal(err)
+	}
+	config := types.ExecutionConfig{Local: true, NodeID: "local", ClusterID: "default-root", DataDir: dataDir, ObjStoreProvider: "filesystem"}
+	n := New(&config)
+	if err := n.openLocalBackupBucket(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	defer n.bucket.Close()
+	defer n.localOwner.Close(time.Second)
+	want, err := filepath.EvalSymlinks(filepath.Join(cwd, "objstore"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n.localOwner.RootDir() != want {
+		t.Fatalf("owned root=%q want provider default %q", n.localOwner.RootDir(), want)
+	}
+	if _, err := os.Stat(filepath.Join(cwd, "BINDING")); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("provider fallback wrote an object at cwd: %v", err)
+	}
+}
+
 func TestLocalBackupHeldMaintenanceEqualTipReplaysBeforeRelease(t *testing.T) {
 	ctx := context.Background()
 	config := types.ExecutionConfig{
-		Local: true, LocalArchiveProfile: types.LocalArchiveProfileFilesystem,
+		Local:  true,
 		NodeID: "local", ClusterID: "held-equal-tip", DataDir: t.TempDir(),
 		ObjStoreProvider: "filesystem", ObjStoreDir: t.TempDir(),
 		ObjStoreDurability:   types.ObjectStoreDurabilityBeforeAck,
@@ -178,7 +204,7 @@ func TestLocalBackupHeldMaintenanceEqualTipReplaysBeforeRelease(t *testing.T) {
 	}
 }
 
-func TestFilesystemV2ArchiveNamespaceContainment(t *testing.T) {
+func TestLocalFilesystemArchiveNamespaceContainment(t *testing.T) {
 	invalid := []struct {
 		name    string
 		prefix  func(string) string
@@ -223,7 +249,7 @@ func TestFilesystemV2ArchiveNamespaceContainment(t *testing.T) {
 				t.Fatal(err)
 			}
 			config := types.ExecutionConfig{
-				Local: true, LocalArchiveProfile: types.LocalArchiveProfileFilesystem,
+				Local:  true,
 				NodeID: "local", ClusterID: types.ClusterID(test.cluster(base)), DataDir: dataDir,
 				ObjStoreProvider: "filesystem", ObjStoreDir: root,
 				ObjStorePrefix: test.prefix(base), ObjStoreDurability: types.ObjectStoreDurabilityBeforeAck,
@@ -274,7 +300,7 @@ func TestFilesystemV2ArchiveNamespaceContainment(t *testing.T) {
 			t.Fatal(err)
 		}
 		config := types.ExecutionConfig{
-			Local: true, LocalArchiveProfile: types.LocalArchiveProfileFilesystem,
+			Local:  true,
 			NodeID: "local", ClusterID: "cluster", DataDir: dataDir,
 			ObjStoreProvider: "filesystem", ObjStoreDir: root,
 			ObjStorePrefix: "organization/team", ObjStoreDurability: types.ObjectStoreDurabilityBeforeAck,
@@ -308,7 +334,7 @@ func TestFilesystemV2ArchiveNamespaceContainment(t *testing.T) {
 			t.Fatal(err)
 		}
 		config := types.ExecutionConfig{
-			Local: true, LocalArchiveProfile: types.LocalArchiveProfileFilesystem,
+			Local:  true,
 			NodeID: "local", ClusterID: "cluster", DataDir: dataDir,
 			ObjStoreProvider: "filesystem", ObjStoreDir: root,
 			ObjStorePrefix: "organization/team", ObjStoreDurability: types.ObjectStoreDurabilityBeforeAck,
@@ -539,6 +565,12 @@ func TestLocalBackupFirstAttachCompactedStoreAndRestore(t *testing.T) {
 	if err := n.Open(ctx); err != nil {
 		t.Fatalf("first attach: %v", err)
 	}
+	if _, err := n.server.Execute(ctx, network.ExecuteRequest{RequestID: "first-attach-row", SQL: "INSERT INTO attach VALUES (1)"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := n.reclaimLocalCheckpoint(ctx); err != nil {
+		t.Fatalf("checkpoint after first attach: %v", err)
+	}
 	if err := n.Shutdown(); err != nil {
 		t.Fatal(err)
 	}
@@ -550,7 +582,11 @@ func TestLocalBackupFirstAttachCompactedStoreAndRestore(t *testing.T) {
 	if err := n.Open(ctx); err != nil {
 		t.Fatalf("compacted archive restore: %v", err)
 	}
-	if _, err := n.server.Execute(ctx, network.ExecuteRequest{RequestID: "after", SQL: "INSERT INTO attach VALUES (1)"}); err != nil {
+	rows, err := n.server.Query(ctx, network.QueryRequest{SQL: "SELECT id FROM attach ORDER BY id"})
+	if err != nil || len(rows.Rows) != 1 || rows.Rows[0][0] != int64(1) {
+		t.Fatalf("restored rows=%v err=%v", rows.Rows, err)
+	}
+	if _, err := n.server.Execute(ctx, network.ExecuteRequest{RequestID: "after", SQL: "INSERT INTO attach VALUES (2)"}); err != nil {
 		t.Fatal(err)
 	}
 }
