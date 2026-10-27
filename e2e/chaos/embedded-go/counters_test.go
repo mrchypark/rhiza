@@ -24,6 +24,7 @@ import (
 	"os/exec"
 	"os/signal"
 	"path/filepath"
+	"runtime"
 	"strconv"
 	"strings"
 	"syscall"
@@ -3338,19 +3339,173 @@ func TestQualificationGNUTimeoutIgnoresUutils(t *testing.T) {
 	}
 }
 
+func parseLinuxProcStat(expectedPID int, stat string) (int, string, int, error) {
+	// comm is parenthesized but may contain spaces, newlines, and ')'. Its last
+	// ')' closes the comm field; field 3 (state) and field 4 (PPID) follow.
+	separatorOpen := strings.Index(stat, " (")
+	separator := strings.LastIndexByte(stat, ')')
+	if separatorOpen <= 0 || separator <= separatorOpen+2 || separator+1 >= len(stat) || stat[separator+1] != ' ' {
+		return 0, "", 0, fmt.Errorf("malformed proc stat: missing PID or comm terminator")
+	}
+	pidText := stat[:separatorOpen]
+	pid, err := strconv.Atoi(pidText)
+	if err != nil || pid <= 0 || strconv.Itoa(pid) != pidText {
+		return 0, "", 0, fmt.Errorf("malformed proc stat PID %q", stat[:separatorOpen])
+	}
+	if expectedPID <= 0 || pid != expectedPID {
+		return 0, "", 0, fmt.Errorf("proc stat PID %d differs from requested PID %d", pid, expectedPID)
+	}
+	fields := strings.Fields(stat[separator+2:])
+	if len(fields) < 2 || len(fields[0]) != 1 || !strings.Contains("RSDZTtXxKWPI", fields[0]) {
+		return 0, "", 0, fmt.Errorf("malformed proc stat state or missing fields: %q", stat[separator+2:])
+	}
+	parentPID, err := strconv.Atoi(fields[1])
+	if err != nil || parentPID < 0 || strconv.Itoa(parentPID) != fields[1] {
+		return 0, "", 0, fmt.Errorf("malformed proc stat parent PID %q", fields[1])
+	}
+	return pid, fields[0], parentPID, nil
+}
+
+func readLinuxProcessInfo(pid int) (int, string, int, error) {
+	if pid <= 0 {
+		return 0, "", 0, fmt.Errorf("invalid process ID %d", pid)
+	}
+	contents, err := os.ReadFile(filepath.Join("/proc", strconv.Itoa(pid), "stat"))
+	if errors.Is(err, os.ErrNotExist) {
+		return 0, "", 0, nil
+	}
+	if err != nil {
+		return 0, "", 0, fmt.Errorf("read /proc/%d/stat: %w", pid, err)
+	}
+	actualPID, state, parentPID, err := parseLinuxProcStat(pid, string(contents))
+	if err != nil {
+		return 0, "", 0, err
+	}
+	return actualPID, state, parentPID, nil
+}
+
+func processInfoFromPS(pid int, output []byte, queryErr, existenceErr error) (string, int, error) {
+	if pid <= 0 {
+		return "", 0, fmt.Errorf("invalid process ID %d", pid)
+	}
+	fields := strings.Fields(string(output))
+	if queryErr != nil || len(fields) == 0 {
+		if errors.Is(existenceErr, syscall.ESRCH) {
+			return "", 0, nil
+		}
+		return "", 0, fmt.Errorf("ps process query for %d failed (query=%v, kill(pid, 0)=%v, output=%q)", pid, queryErr, existenceErr, output)
+	}
+	if queryErr != nil || len(fields) != 2 || fields[0] == "" {
+		return "", 0, fmt.Errorf("unexpected ps process query for %d (query=%v, output=%q)", pid, queryErr, output)
+	}
+	parentPID, err := strconv.Atoi(fields[1])
+	if err != nil || parentPID < 0 || strconv.Itoa(parentPID) != fields[1] {
+		return "", 0, fmt.Errorf("invalid ps parent PID for %d: %q", pid, output)
+	}
+	return fields[0], parentPID, nil
+}
+
+func readProcessInfo(pid int) (string, int, error) {
+	if pid <= 0 {
+		return "", 0, fmt.Errorf("invalid process ID %d", pid)
+	}
+	if runtime.GOOS == "linux" {
+		_, state, parentPID, err := readLinuxProcessInfo(pid)
+		return state, parentPID, err
+	}
+	output, queryErr := exec.Command("ps", "-o", "stat=,ppid=", "-p", strconv.Itoa(pid)).CombinedOutput()
+	if queryErr == nil && len(strings.Fields(string(output))) != 0 {
+		return processInfoFromPS(pid, output, nil, nil)
+	}
+	existenceErr := syscall.Kill(pid, 0)
+	return processInfoFromPS(pid, output, queryErr, existenceErr)
+}
+
+func processStateIsLive(state string) bool {
+	if state == "" {
+		return false
+	}
+	switch state[0] {
+	case 'R', 'S', 'D', 'T', 't', 'W', 'I', 'K', 'P', 'U':
+		return true
+	default:
+		return false
+	}
+}
+
+func TestQualificationLinuxProcStat(t *testing.T) {
+	pid, state, parentPID, err := parseLinuxProcStat(123, "123 (worker ) with\nspaces (child)) S 42 1 1 0 0")
+	if err != nil || pid != 123 || state != "S" || parentPID != 42 {
+		t.Fatalf("parse proc stat with ')' in comm: pid=%d state=%q ppid=%d err=%v", pid, state, parentPID, err)
+	}
+	if _, state, parentPID, err := parseLinuxProcStat(123, "123 (worker) S 0 1 1"); err != nil || state != "S" || parentPID != 0 {
+		t.Fatalf("PPID 0 should remain a valid present-process result: state=%q ppid=%d err=%v", state, parentPID, err)
+	}
+	for _, malformed := range []struct {
+		expected int
+		stat     string
+	}{
+		{expected: 123, stat: "not-a-proc-stat"},
+		{expected: 123, stat: "124 (worker) S 42 1 1"},
+		{expected: 123, stat: "123 () S 42 1 1"},
+		{expected: 123, stat: "123 (worker S 42 1 1"},
+		{expected: 123, stat: "123 (worker) ? 42 1 1"},
+		{expected: 123, stat: "123 (worker) S"},
+		{expected: 123, stat: "123 (worker) S bad 1 1"},
+		{expected: 123, stat: "123 (worker) S 999999999999999999999999 1 1"},
+		{expected: 123, stat: "999999999999999999999999 (worker) S 42 1 1"},
+	} {
+		if _, _, _, err := parseLinuxProcStat(malformed.expected, malformed.stat); err == nil {
+			t.Fatalf("malformed proc stat was accepted: %q", malformed.stat)
+		}
+	}
+	for _, state := range []string{"", "Z", "X", "x", "Z+", "X+", "x+", "?"} {
+		if processStateIsLive(state) {
+			t.Fatalf("non-live process state %q passed the live check", state)
+		}
+	}
+	for _, state := range []string{"R", "S", "I", "U", "D", "Ss", "R+"} {
+		if !processStateIsLive(state) {
+			t.Fatalf("live process state %q failed the live check", state)
+		}
+	}
+	if state, ppid, err := processInfoFromPS(44, nil, nil, nil); err == nil || state != "" || ppid != 0 {
+		t.Fatalf("empty successful ps row was treated as absent without ESRCH: state=%q ppid=%d err=%v", state, ppid, err)
+	}
+	if state, ppid, err := processInfoFromPS(44, nil, errors.New("unsupported ps option"), syscall.EPERM); err == nil || state != "" || ppid != 0 {
+		t.Fatalf("unsupported ps query with a live/unknown PID was treated as absent: state=%q ppid=%d err=%v", state, ppid, err)
+	}
+	if state, ppid, err := processInfoFromPS(44, nil, errors.New("ps query failed"), syscall.ESRCH); err != nil || state != "" || ppid != 0 {
+		t.Fatalf("ESRCH did not classify a missing PID: state=%q ppid=%d err=%v", state, ppid, err)
+	}
+	if runtime.GOOS != "linux" {
+		t.Skip("Linux /proc process inspection")
+	}
+	pid, state, parentPID, err = readLinuxProcessInfo(os.Getpid())
+	if err != nil || pid != os.Getpid() || state == "" || parentPID != os.Getppid() {
+		t.Fatalf("current process lookup failed: state=%q ppid=%d err=%v", state, parentPID, err)
+	}
+	legacyPS := exec.Command("ps", "-o", "stat=", "-p", strconv.Itoa(os.Getpid()))
+	legacyOutput, legacyErr := legacyPS.CombinedOutput()
+	t.Logf("legacy ps own-PID diagnostic: err=%v output=%q", legacyErr, legacyOutput)
+	pid, state, parentPID, err = readLinuxProcessInfo(2147483647)
+	if err != nil || pid != 0 || state != "" || parentPID != 0 {
+		t.Fatalf("missing process was not distinguished from query failure: state=%q ppid=%d err=%v", state, parentPID, err)
+	}
+}
+
 // Exercise the actual shell entry with synthetic files and a non-networking
 // kubectl. No token is minted, no application opens, and no cloud call is made.
 func TestQualificationLocalRuntime(t *testing.T) {
 	nativeTimeout := qualificationGNUTimeout(t)
-	processState := func(pid int) (string, error) {
-		output, err := exec.Command("ps", "-o", "stat=", "-p", strconv.Itoa(pid)).Output()
-		if err != nil {
-			if exitErr, ok := err.(*exec.ExitError); ok && exitErr.ExitCode() == 1 {
-				return "", nil
-			}
-			return "", err
-		}
-		return strings.TrimSpace(string(output)), nil
+	ownState, ownParentPID, ownErr := readProcessInfo(os.Getpid())
+	if ownErr != nil || !processStateIsLive(ownState) || ownParentPID != os.Getppid() {
+		t.Fatalf("own-PID process query failed at runtime test entry: state=%q ppid=%d err=%v", ownState, ownParentPID, ownErr)
+	}
+	if runtime.GOOS == "linux" {
+		legacyPS := exec.Command("ps", "-o", "stat=", "-p", strconv.Itoa(os.Getpid()))
+		legacyOutput, legacyErr := legacyPS.CombinedOutput()
+		t.Logf("legacy ps own-PID diagnostic: err=%v output=%q", legacyErr, legacyOutput)
 	}
 	stopWatchdogControl := func(out string) {
 		t.Helper()
@@ -3391,7 +3546,7 @@ func TestQualificationLocalRuntime(t *testing.T) {
 		if err != nil {
 			t.Fatalf("invalid watchdog PID evidence: %v", err)
 		}
-		state, err := processState(watchdogPID)
+		state, _, err := readProcessInfo(watchdogPID)
 		if err != nil || state != "" {
 			t.Fatalf("watchdog PID still exists after owner wait (including zombies): state=%q err=%v", state, err)
 		}
@@ -3408,7 +3563,7 @@ func TestQualificationLocalRuntime(t *testing.T) {
 		if err != nil {
 			t.Fatalf("invalid watchdog command PID evidence: %v", err)
 		}
-		state, err = processState(pid)
+		state, _, err = readProcessInfo(pid)
 		if err != nil || state != "" {
 			t.Fatalf("watchdog command PID still exists after owner wait (including zombies): state=%q err=%v", state, err)
 		}
@@ -3854,13 +4009,13 @@ exec "$FAKE_NATIVE_TIMEOUT" "$@"
 					}
 					deadline := time.Now().Add(2 * time.Second)
 					for time.Now().Before(deadline) {
-						state, err := processState(pid)
+						state, _, err := readProcessInfo(pid)
 						if err == nil && state == "" {
 							break
 						}
 						time.Sleep(10 * time.Millisecond)
 					}
-					state, err := processState(pid)
+					state, _, err := readProcessInfo(pid)
 					if err != nil || state != "" {
 						t.Errorf("owned watchdog process %d remains after cleanup: state=%q err=%v", pid, state, err)
 					}
@@ -3876,10 +4031,10 @@ exec "$FAKE_NATIVE_TIMEOUT" "$@"
 					commandData, commandErr := os.ReadFile(filepath.Join(out, "watchdog-command.pid"))
 					watchdogPID, watchdogParseErr := strconv.Atoi(strings.TrimSpace(string(watchdogData)))
 					commandPID, commandParseErr := strconv.Atoi(strings.TrimSpace(string(commandData)))
-					commandState, stateErr := processState(commandPID)
-					if readyErr == nil && watchdogErr == nil && commandErr == nil && watchdogParseErr == nil && commandParseErr == nil && stateErr == nil && commandState != "" && !strings.HasPrefix(commandState, "Z") {
-						parent, parentErr := exec.Command("ps", "-o", "ppid=", "-p", strconv.Itoa(commandPID)).Output()
-						if parentErr == nil && strings.TrimSpace(string(parent)) == strconv.Itoa(watchdogPID) {
+					commandState, commandParentPID, stateErr := readProcessInfo(commandPID)
+					lastProcessQuery := fmt.Sprintf("pid=%d state=%q ppid=%d err=%v", commandPID, commandState, commandParentPID, stateErr)
+					if readyErr == nil && watchdogErr == nil && commandErr == nil && watchdogParseErr == nil && commandParseErr == nil && stateErr == nil && processStateIsLive(commandState) {
+						if commandParentPID == watchdogPID {
 							if err := syscall.Kill(cmd.Process.Pid, syscall.SIGUSR1); err != nil {
 								t.Fatal("owned runtime signal failed")
 							}
@@ -3892,7 +4047,7 @@ exec "$FAKE_NATIVE_TIMEOUT" "$@"
 						waited = true
 						_ = outputFile.Sync()
 						diagnostic, _ := os.ReadFile(outputPath)
-						t.Fatalf("runtime watchdog command was not live under its timeout owner: %s", diagnostic)
+						t.Fatalf("runtime watchdog command was not live under its timeout owner (last process query: %s): %s", lastProcessQuery, diagnostic)
 					}
 					time.Sleep(10 * time.Millisecond)
 				}
