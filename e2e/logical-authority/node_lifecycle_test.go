@@ -615,38 +615,51 @@ func assertLogicalMutationTraceSettled(t *testing.T, trace *localtesthooks.Logic
 	if truncated {
 		t.Fatal("logical mutation trace unexpectedly reached its event bound before the first write checkpoint")
 	}
-	byTuple := make(map[string]map[localtesthooks.LogicalMutationStage]localtesthooks.LogicalMutationOutcome)
+	if !logicalMutationTraceHasSettledAttempt(events) {
+		t.Fatalf("authority request handler did not capture a settled mutation execution; events=%+v", events)
+	}
+}
+
+func logicalMutationTraceHasSettledAttempt(events []localtesthooks.LogicalMutationExecutionEvent) bool {
+	type tuple struct {
+		producer string
+		sequence uint64
+	}
+	byTuple := make(map[tuple][]localtesthooks.LogicalMutationExecutionEvent)
 	for _, event := range events {
-		key := fmt.Sprintf("%s/%d", event.ProducerHash, event.Sequence)
-		if byTuple[key] == nil {
-			byTuple[key] = make(map[localtesthooks.LogicalMutationStage]localtesthooks.LogicalMutationOutcome)
-		}
-		byTuple[key][event.Stage] = event.Outcome
+		key := tuple{producer: event.ProducerHash, sequence: event.Sequence}
+		byTuple[key] = append(byTuple[key], event)
 	}
-	required := []localtesthooks.LogicalMutationStage{
-		localtesthooks.LogicalMutationAttemptStarted,
-		localtesthooks.LogicalMutationDispatchGranted,
-		localtesthooks.LogicalMutationPayloadOpened,
-		localtesthooks.LogicalMutationProviderStarted,
-		localtesthooks.LogicalMutationProviderReturned,
-		localtesthooks.LogicalMutationReceiptPersisted,
-		localtesthooks.LogicalMutationJournalResolved,
-		localtesthooks.LogicalMutationKeyReleased,
-		localtesthooks.LogicalMutationAttemptReturned,
+	want := [...]struct {
+		stage   localtesthooks.LogicalMutationStage
+		outcome localtesthooks.LogicalMutationOutcome
+	}{
+		{localtesthooks.LogicalMutationAttemptStarted, localtesthooks.LogicalMutationStarted},
+		{localtesthooks.LogicalMutationDispatchGranted, localtesthooks.LogicalMutationSucceeded},
+		{localtesthooks.LogicalMutationPayloadOpened, localtesthooks.LogicalMutationSucceeded},
+		{localtesthooks.LogicalMutationProviderStarted, localtesthooks.LogicalMutationStarted},
+		{localtesthooks.LogicalMutationProviderReturned, localtesthooks.LogicalMutationSucceeded},
+		{localtesthooks.LogicalMutationReceiptPersisted, localtesthooks.LogicalMutationSucceeded},
+		{localtesthooks.LogicalMutationJournalResolved, localtesthooks.LogicalMutationSucceeded},
+		{localtesthooks.LogicalMutationKeyReleased, localtesthooks.LogicalMutationSucceeded},
+		{localtesthooks.LogicalMutationAttemptReturned, localtesthooks.LogicalMutationSucceeded},
 	}
-	for _, stages := range byTuple {
-		settled := true
-		for _, stage := range required {
-			if stages[stage] != localtesthooks.LogicalMutationSucceeded {
-				settled = false
-				break
+	for _, attempt := range byTuple {
+		for start := 0; start+len(want) <= len(attempt); start++ {
+			matched := true
+			for offset, expected := range want {
+				event := attempt[start+offset]
+				if event.Stage != expected.stage || event.Outcome != expected.outcome {
+					matched = false
+					break
+				}
+			}
+			if matched {
+				return true
 			}
 		}
-		if settled {
-			return
-		}
 	}
-	t.Fatalf("authority request handler did not capture a settled mutation execution; events=%+v", events)
+	return false
 }
 
 func logicalMutationTraceJSON(trace *localtesthooks.LogicalMutationExecutionTrace) string {

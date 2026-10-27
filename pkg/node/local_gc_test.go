@@ -19,6 +19,7 @@ import (
 	"testing/synctest"
 	"time"
 
+	rhizaobjstore "github.com/mrchypark/rhiza/internal/objstore"
 	"github.com/mrchypark/rhiza/internal/types"
 	"github.com/mrchypark/rhiza/pkg/checkpoint"
 	"github.com/mrchypark/rhiza/pkg/network"
@@ -288,6 +289,15 @@ type localGCCancelledDeleteBucket struct {
 	cancel context.CancelFunc
 }
 
+func localGCMeteredBucket(t *testing.T, n *Node) *rhizaobjstore.MeteredBucket {
+	t.Helper()
+	bucket, ok := n.bucket.(*rhizaobjstore.MeteredBucket)
+	if !ok {
+		t.Fatalf("Local bucket type is %T, want metered wrapper", n.bucket)
+	}
+	return bucket
+}
+
 func (b *localGCCancelledDeleteBucket) Delete(ctx context.Context, name string) error {
 	if name == b.target {
 		b.cancel()
@@ -321,8 +331,9 @@ func TestLocalGCLogsUncertainDeleteDespiteCancellation(t *testing.T) {
 	}
 	gcCtx, stopGC := context.WithCancel(ctx)
 	defer stopGC()
-	raw := n.bucket.Bucket
-	n.bucket.Bucket = &localGCCancelledDeleteBucket{Bucket: raw, target: target, cancel: stopGC}
+	metered := localGCMeteredBucket(t, n)
+	raw := metered.Bucket
+	metered.Bucket = &localGCCancelledDeleteBucket{Bucket: raw, target: target, cancel: stopGC}
 	var output bytes.Buffer
 	oldOutput := log.Writer()
 	log.SetOutput(&output)
@@ -453,9 +464,10 @@ func TestLocalGCInterruptionDrainsBeforeGateReleaseAndClose(t *testing.T) {
 			if err := n.bucket.Upload(ctx, target, bytes.NewReader([]byte("orphan extent"))); err != nil {
 				t.Fatal(err)
 			}
-			raw := n.bucket.Bucket
+			metered := localGCMeteredBucket(t, n)
+			raw := metered.Bucket
 			boundary := &localGCDrainBucket{Bucket: raw, target: target, entered: make(chan struct{}), release: make(chan struct{}), drained: make(chan struct{})}
-			n.bucket.Bucket = boundary
+			metered.Bucket = boundary
 			var release sync.Once
 			defer release.Do(func() { close(boundary.release) })
 			gcCtx, stopGC := context.WithCancel(ctx)

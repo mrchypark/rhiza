@@ -611,7 +611,6 @@ func (n *Node) open(ctx context.Context, enroll bool) (err error) {
 			return fmt.Errorf("load shared decision archive: %w", err)
 		}
 	}
-	if !objectStoreConfigured && !n.config.Local {
 	phase = nodeOpenPhaseIdentityStore
 	if !objectStoreConfigured && !n.config.Local {
 		if err := ensureVoterIdentity(ctx, n.config, nil, n.wal, localVoter, enroll); err != nil {

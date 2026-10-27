@@ -65,6 +65,76 @@ func TestWorkflowExcludesRawKindArtifacts(t *testing.T) {
 	}
 }
 
+func validateWorkflowStepCommands(data []byte) error {
+	var workflow struct {
+		Jobs map[string]struct {
+			Steps []struct {
+				Run  string `yaml:"run"`
+				Uses string `yaml:"uses"`
+			} `yaml:"steps"`
+		} `yaml:"jobs"`
+	}
+	if err := yaml.Unmarshal(data, &workflow); err != nil {
+		return err
+	}
+	if len(workflow.Jobs) == 0 {
+		return fmt.Errorf("workflow has no jobs")
+	}
+	for jobName, job := range workflow.Jobs {
+		for index, step := range job.Steps {
+			hasRun, hasUses := strings.TrimSpace(step.Run) != "", strings.TrimSpace(step.Uses) != ""
+			if hasRun == hasUses {
+				return fmt.Errorf("job %s step %d must declare exactly one step-level run or uses", jobName, index)
+			}
+		}
+	}
+	return nil
+}
+
+func TestWorkflowStepCommandContractFixtures(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		workflow string
+		wantErr  bool
+	}{
+		{
+			name:     "env run is not a step command",
+			workflow: "jobs:\n  broken:\n    steps:\n      - name: misplaced command\n        env:\n          run: echo misplaced\n",
+			wantErr:  true,
+		},
+		{
+			name:     "step-level run is valid",
+			workflow: "jobs:\n  valid-run:\n    steps:\n      - run: echo valid\n",
+		},
+		{
+			name:     "step-level uses is valid",
+			workflow: "jobs:\n  valid-uses:\n    steps:\n      - uses: actions/checkout@v4\n",
+		},
+		{
+			name:     "run and uses together are invalid",
+			workflow: "jobs:\n  both:\n    steps:\n      - run: echo invalid\n        uses: actions/checkout@v4\n",
+			wantErr:  true,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			err := validateWorkflowStepCommands([]byte(tc.workflow))
+			if (err != nil) != tc.wantErr {
+				t.Fatalf("validateWorkflowStepCommands() error=%v, wantErr=%t", err, tc.wantErr)
+			}
+		})
+	}
+}
+
+func TestCIWorkflowStepsHaveExactlyOneCommand(t *testing.T) {
+	data, err := os.ReadFile("../../.github/workflows/ci.yml")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := validateWorkflowStepCommands(data); err != nil {
+		t.Fatalf("CI workflow step command contract: %v", err)
+	}
+}
+
 func TestRunOwnedDeploymentScaleUsesUIDAndResourceVersionPreconditions(t *testing.T) {
 	dir := t.TempDir()
 	argsPath := filepath.Join(dir, "kubectl-args")
