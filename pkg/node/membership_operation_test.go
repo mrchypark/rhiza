@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"path"
 	"path/filepath"
+	"reflect"
 	"slices"
 	"strings"
 	"sync"
@@ -124,6 +125,110 @@ func TestMembershipOperationRejectsDifferentPendingTargetBeforeJournal(t *testin
 	assertNoMembershipOperation(t, ctx, n, bucket, 1)
 }
 
+func TestMembershipAdditionRetryRecompletesTerminalAfterRestart(t *testing.T) {
+	ctx := context.Background()
+	n, _, bucket, transport := newMembershipOperationNodeWithAdmission(t)
+	learner, learnerWAL := registerMembershipLearnerWithWAL(t, bucket, "fresh")
+	request := network.MembershipChange{
+		OperationID: "add-fresh", ClusterID: "cluster", ExpectedConfigID: 1, Add: &learner,
+	}
+	expectedTarget := quepaxa.Cluster{ConfigID: 2, Members: append(append([]quepaxa.Member(nil), n.config.Members...), learner)}
+	terminalSlot := n.core.Tip() + 17 // freeze plus the fixed 16-slot drain.
+	learnerCore, err := quepaxa.NewLearner(quepaxa.Config{
+		NodeID: learner.ID, Cluster: quepaxa.Cluster{ConfigID: 1, Members: append([]quepaxa.Member(nil), n.config.Members...)},
+		WAL: learnerWAL, Transport: transport, EnableReconfiguration: true,
+	})
+	if err != nil {
+		t.Fatalf("create actual learner core: %v", err)
+	}
+	if learnerCore.WALIdentity() != learner.WALIdentity {
+		t.Fatalf("learner WAL identity=%q, want registered identity %q", learnerCore.WALIdentity(), learner.WALIdentity)
+	}
+	transport.mu.Lock()
+	transport.learners[learner.ID] = learnerCore
+	transport.blockLearnerTerminalSlot = terminalSlot
+	transport.learnerTerminalSlot = terminalSlot
+	transport.mu.Unlock()
+	if err := n.changeMembership(ctx, request); !errors.Is(err, quepaxa.ErrQuorumUnavailable) {
+		t.Fatal("addition succeeded despite terminal delivery failure")
+	}
+	if got := n.core.CurrentCluster(); !reflect.DeepEqual(got, expectedTarget) {
+		t.Fatalf("failed call did not locally accept target before delivery error: %+v", got)
+	}
+	localTerminal, ok := n.core.CertifiedValue(terminalSlot)
+	if !ok {
+		t.Fatalf("locally accepted terminal slot %d is unavailable", terminalSlot)
+	}
+	if got := learnerCore.CurrentCluster(); got.ConfigID != 1 {
+		t.Fatalf("new voter learned terminal despite injected delivery failure: %+v", got)
+	}
+	for _, id := range transport.ids {
+		if got := transport.cores[id].CurrentCluster(); !reflect.DeepEqual(got, expectedTarget) {
+			t.Fatalf("old voter %s did not accept terminal before learner failure: %+v", id, got)
+		}
+	}
+	if _, ok := learnerCore.CertifiedValue(terminalSlot); ok {
+		t.Fatal("new voter unexpectedly has the terminal decision after failed delivery")
+	}
+
+	// Reopen the node's actual qlog so the retry proves the terminal survived
+	// process restart, rather than relying on transient Core state.
+	walPath := filepath.Join(n.config.DataDir, "qlog")
+	if err := transport.wals["a"].Close(); err != nil {
+		t.Fatalf("close node WAL: %v", err)
+	}
+	reopenedWAL, err := qlog.Open(walPath)
+	if err != nil {
+		t.Fatalf("reopen node WAL: %v", err)
+	}
+	t.Cleanup(func() { _ = reopenedWAL.Close() })
+	restarted, err := quepaxa.New(quepaxa.Config{
+		NodeID: "a", Cluster: quepaxa.Cluster{ConfigID: 1, Members: append([]quepaxa.Member(nil), n.config.Members...)},
+		WAL: reopenedWAL, Transport: transport, EnableReconfiguration: true,
+	})
+	if err != nil {
+		t.Fatalf("restart node core: %v", err)
+	}
+	transport.mu.Lock()
+	transport.cores["a"] = restarted
+	transport.mu.Unlock()
+	n.core = restarted
+	if !reflect.DeepEqual(restarted.CurrentCluster(), expectedTarget) {
+		t.Fatal("restarted core lost the accepted target")
+	}
+	if err := n.changeMembership(ctx, request); !errors.Is(err, quepaxa.ErrQuorumUnavailable) {
+		t.Fatalf("retry without learner terminal ACK error=%v, want quorum unavailable", err)
+	}
+	if got := learnerCore.CurrentCluster(); got.ConfigID != 1 {
+		t.Fatalf("blocked retry changed learner configuration: %+v", got)
+	}
+	if got := transport.learnerTerminalAcks[learner.ID]; got != 0 {
+		t.Fatalf("learner terminal ACK count while blocked=%d, want 0", got)
+	}
+	transport.mu.Lock()
+	transport.blockLearnerTerminalSlot = 0
+	transport.mu.Unlock()
+	if err := n.changeMembership(ctx, request); err != nil {
+		t.Fatalf("retry after learner becomes reachable: %v", err)
+	}
+	if got := transport.learnerTerminalAcks[learner.ID]; got != 1 {
+		t.Fatalf("learner terminal ACK count after delivery=%d, want 1", got)
+	}
+	if got := restarted.CurrentCluster(); !reflect.DeepEqual(got, expectedTarget) {
+		t.Fatalf("restarted target after retry: %+v", got)
+	}
+	if got := learnerCore.CurrentCluster(); !reflect.DeepEqual(got, expectedTarget) {
+		t.Fatalf("learner target after durable terminal ACK: %+v", got)
+	}
+	if _, err := learnerCore.DurablePrefix(terminalSlot); err != nil {
+		t.Fatalf("learner terminal ACK was not durable: %v", err)
+	}
+	learnerTerminal, ok := learnerCore.CertifiedValue(terminalSlot)
+	if !ok || learnerTerminal.Hash != localTerminal.Hash {
+		t.Fatalf("learner terminal=%+v available=%t, want exact terminal hash %x", learnerTerminal, ok, localTerminal.Hash)
+	}
+}
+
 func TestMembershipAdditionAbortAllowsNextRevision(t *testing.T) {
 	ctx := context.Background()
 	n, identities, bucket, _ := newMembershipOperationNode(t)
@@ -212,6 +317,14 @@ func TestMembershipAdmissionUsesDrainConfigurationAfterTerminal(t *testing.T) {
 }
 
 func newMembershipOperationNode(t *testing.T) (*Node, map[quepaxa.NodeID]string, *objectstore.MeteredBucket, *membershipOperationTransport) {
+	return newMembershipOperationNodeWithAdmissionOption(t, false)
+}
+
+func newMembershipOperationNodeWithAdmission(t *testing.T) (*Node, map[quepaxa.NodeID]string, *objectstore.MeteredBucket, *membershipOperationTransport) {
+	return newMembershipOperationNodeWithAdmissionOption(t, true)
+}
+
+func newMembershipOperationNodeWithAdmissionOption(t *testing.T, admit bool) (*Node, map[quepaxa.NodeID]string, *objectstore.MeteredBucket, *membershipOperationTransport) {
 	t.Helper()
 	bucket, err := objectstore.NewBucket(objectstore.Config{Provider: objectstore.ProviderFilesystem, FilesystemDir: t.TempDir()})
 	if err != nil {
@@ -253,9 +366,13 @@ func newMembershipOperationNode(t *testing.T) (*Node, map[quepaxa.NodeID]string,
 	for i := range members {
 		members[i].WALIdentity = identities[members[i].ID]
 	}
-	transport := &membershipOperationTransport{cores: make(map[quepaxa.NodeID]*quepaxa.Core), disabled: make(map[quepaxa.NodeID]bool)}
+	transport := &membershipOperationTransport{cores: make(map[quepaxa.NodeID]*quepaxa.Core), disabled: make(map[quepaxa.NodeID]bool), wals: wals, learners: make(map[quepaxa.NodeID]*quepaxa.Core), learnerTerminalAcks: make(map[quepaxa.NodeID]int)}
 	for _, member := range members {
-		core, err := quepaxa.New(quepaxa.Config{NodeID: member.ID, Cluster: quepaxa.Cluster{ConfigID: 1, Members: members}, WAL: wals[member.ID], Transport: transport, EnableReconfiguration: true})
+		coreConfig := quepaxa.Config{NodeID: member.ID, Cluster: quepaxa.Cluster{ConfigID: 1, Members: members}, WAL: wals[member.ID], Transport: transport, EnableReconfiguration: true}
+		if admit {
+			coreConfig.ReconfigurationAdmission = func(context.Context, quepaxa.Cluster, quepaxa.Slot, [32]byte) error { return nil }
+		}
+		core, err := quepaxa.New(coreConfig)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -274,6 +391,11 @@ func newMembershipOperationNode(t *testing.T) (*Node, map[quepaxa.NodeID]string,
 }
 
 func registerMembershipLearner(t *testing.T, bucket *objectstore.MeteredBucket, id quepaxa.NodeID) quepaxa.Member {
+	member, _ := registerMembershipLearnerWithWAL(t, bucket, id)
+	return member
+}
+
+func registerMembershipLearnerWithWAL(t *testing.T, bucket *objectstore.MeteredBucket, id quepaxa.NodeID) (quepaxa.Member, *qlog.WAL) {
 	t.Helper()
 	config := &types.ExecutionConfig{
 		DataDir: t.TempDir(), ClusterID: "cluster", NodeID: types.NodeID(id), ObjStoreProvider: "filesystem", ObjStoreDir: "unused",
@@ -295,7 +417,7 @@ func registerMembershipLearner(t *testing.T, bucket *objectstore.MeteredBucket, 
 	if err != nil || state.identity == nil {
 		t.Fatalf("load learner registration: %v", err)
 	}
-	return quepaxa.Member{ID: id, PublicKey: peerMember("cluster", id, "fresh-token").PublicKey, PeerURL: "https://fresh", WALIdentity: state.identity.Nonce}
+	return quepaxa.Member{ID: id, PublicKey: peerMember("cluster", id, "fresh-token").PublicKey, PeerURL: "https://fresh", WALIdentity: state.identity.Nonce}, wal
 }
 
 func assertDurableArchivedMembership(t *testing.T, ctx context.Context, n *Node, bucket *objectstore.MeteredBucket, through quepaxa.Slot) {
@@ -359,10 +481,15 @@ func legacyRegistration(t *testing.T, ctx context.Context, n *Node, bucket *obje
 }
 
 type membershipOperationTransport struct {
-	mu       sync.RWMutex
-	cores    map[quepaxa.NodeID]*quepaxa.Core
-	ids      []quepaxa.NodeID
-	disabled map[quepaxa.NodeID]bool
+	mu                       sync.RWMutex
+	cores                    map[quepaxa.NodeID]*quepaxa.Core
+	ids                      []quepaxa.NodeID
+	disabled                 map[quepaxa.NodeID]bool
+	wals                     map[quepaxa.NodeID]*qlog.WAL
+	learners                 map[quepaxa.NodeID]*quepaxa.Core
+	blockLearnerTerminalSlot quepaxa.Slot
+	learnerTerminalSlot      quepaxa.Slot
+	learnerTerminalAcks      map[quepaxa.NodeID]int
 }
 
 func (t *membershipOperationTransport) SendRecord(ctx context.Context, to quepaxa.NodeID, request quepaxa.RecordRequest) (quepaxa.Summary, error) {
@@ -374,17 +501,45 @@ func (t *membershipOperationTransport) SendRecord(ctx context.Context, to quepax
 }
 
 func (t *membershipOperationTransport) SendDecision(ctx context.Context, decision quepaxa.Decision) error {
-	t.mu.RLock()
+	t.mu.Lock()
 	cores := make([]*quepaxa.Core, 0, len(t.ids))
 	for _, id := range t.ids {
 		if !t.disabled[id] {
 			cores = append(cores, t.cores[id])
 		}
 	}
-	t.mu.RUnlock()
+	learners := make([]struct {
+		id   quepaxa.NodeID
+		core *quepaxa.Core
+	}, 0, len(t.learners))
+	for id, core := range t.learners {
+		learners = append(learners, struct {
+			id   quepaxa.NodeID
+			core *quepaxa.Core
+		}{id: id, core: core})
+	}
+	terminalSlot := t.learnerTerminalSlot
+	blockedLearnerTerminal := t.blockLearnerTerminalSlot == decision.Slot && decision.Slot != 0
+	t.mu.Unlock()
 	for _, core := range cores {
 		if err := core.AcceptDecision(decision); err != nil {
 			return err
+		}
+	}
+	if blockedLearnerTerminal {
+		return errors.New("injected new-voter terminal delivery failure")
+	}
+	for _, learner := range learners {
+		if err := learner.core.AcceptDecision(decision); err != nil {
+			return err
+		}
+		if decision.Slot == terminalSlot && terminalSlot != 0 {
+			if _, err := learner.core.DurablePrefix(decision.Slot); err != nil {
+				return fmt.Errorf("learner %s terminal was not durable: %w", learner.id, err)
+			}
+			t.mu.Lock()
+			t.learnerTerminalAcks[learner.id]++
+			t.mu.Unlock()
 		}
 	}
 	return nil

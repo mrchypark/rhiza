@@ -126,6 +126,19 @@ func (n *Node) changeMembership(ctx context.Context, request network.MembershipC
 		if !reflect.DeepEqual(n.core.CurrentCluster(), operation.Target) {
 			return network.ErrRequestConflict
 		}
+	} else {
+		// Local acceptance may precede the added learner's durable terminal ACK.
+		history, err := n.core.MembershipHistory()
+		if err != nil {
+			return err
+		}
+		if len(history.Transitions) == 0 {
+			return network.ErrRequestConflict
+		}
+		terminal := history.Transitions[len(history.Transitions)-1].Terminal
+		if _, err := n.core.CompleteDecision(ctx, terminal.Slot); err != nil {
+			return err
+		}
 	}
 	return n.persistMembership(ctx)
 }
