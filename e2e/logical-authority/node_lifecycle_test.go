@@ -612,11 +612,11 @@ func logReadDurabilityDiagnostic(t *testing.T, phase string, err error) {
 func assertLogicalMutationTraceSettled(t *testing.T, trace *localtesthooks.LogicalMutationExecutionTrace) {
 	t.Helper()
 	events, truncated := trace.Snapshot()
-	if truncated {
-		t.Fatal("logical mutation trace unexpectedly reached its event bound before the first write checkpoint")
-	}
 	if !logicalMutationTraceHasSettledAttempt(events) {
-		t.Fatalf("authority request handler did not capture a settled mutation execution; events=%+v", events)
+		t.Fatalf("authority request handler did not capture a settled mutation execution in the retained window (truncated=%t); events=%+v", truncated, events)
+	}
+	if truncated {
+		t.Logf("logical mutation trace retained a settled execution, but earlier history was truncated; retained_events=%d", len(events))
 	}
 }
 

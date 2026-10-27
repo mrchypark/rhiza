@@ -19,6 +19,21 @@ func TestAssertLogicalMutationTraceSettledAcceptsStartedBoundaries(t *testing.T)
 	assertLogicalMutationTraceSettled(t, trace)
 }
 
+func TestAssertLogicalMutationTraceSettledAcceptsTruncatedCompleteWindow(t *testing.T) {
+	trace := localtesthooks.NewLogicalMutationExecutionTrace(9)
+	ctx := trace.Context(context.Background())
+	localtesthooks.HitLogicalMutationExecution(ctx, "old-prefix-producer", 1,
+		localtesthooks.LogicalMutationAttemptStarted, localtesthooks.LogicalMutationStarted)
+	for _, event := range settledLogicalMutationEvents("settled-test-producer", 17) {
+		localtesthooks.HitLogicalMutationExecution(ctx, "settled-test-producer", 17, event.stage, event.outcome)
+	}
+	if events, truncated := trace.Snapshot(); !truncated || !logicalMutationTraceHasSettledAttempt(events) {
+		t.Fatalf("fixture events=%+v truncated=%t, want a complete retained settlement and truncation", events, truncated)
+	}
+
+	assertLogicalMutationTraceSettled(t, trace)
+}
+
 func TestLogicalMutationSettlementRejectsInvalidTraceVariants(t *testing.T) {
 	valid := settledLogicalMutationEvents("producer", 17)
 	tests := []struct {
@@ -54,6 +69,25 @@ func TestLogicalMutationSettlementRejectsInvalidTraceVariants(t *testing.T) {
 				t.Fatalf("settled=%t, want %t; events=%+v", got, test.want, test.events)
 			}
 		})
+	}
+}
+
+func TestLogicalMutationSettlementRejectsTruncatedPartialWindow(t *testing.T) {
+	trace := localtesthooks.NewLogicalMutationExecutionTrace(9)
+	ctx := trace.Context(context.Background())
+	for sequence := uint64(1); sequence <= 2; sequence++ {
+		localtesthooks.HitLogicalMutationExecution(ctx, "old-prefix-producer", sequence,
+			localtesthooks.LogicalMutationAttemptStarted, localtesthooks.LogicalMutationStarted)
+	}
+	for _, event := range settledLogicalMutationEvents("partial-test-producer", 17)[:8] {
+		localtesthooks.HitLogicalMutationExecution(ctx, "partial-test-producer", 17, event.stage, event.outcome)
+	}
+	events, truncated := trace.Snapshot()
+	if !truncated {
+		t.Fatal("fixture did not reach its trace bound")
+	}
+	if logicalMutationTraceHasSettledAttempt(events) {
+		t.Fatalf("truncated partial trace was accepted as settled: %+v", events)
 	}
 }
 
