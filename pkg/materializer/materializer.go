@@ -2552,6 +2552,9 @@ func (m *Materializer) CheckpointFilesAt(ctx context.Context) ([]CheckpointFile,
 		return nil, 0, nil, errors.Join(err, closeErr)
 	}
 	m.mu.Unlock()
+	if m.checkpointSnapshotCloseHook != nil {
+		m.checkpointSnapshotCloseHook("snapshots-acquired-before-backup")
+	}
 	if err = sqliteSnapshot.Backup(sqlitePath); err == nil {
 		err = ctx.Err()
 	}

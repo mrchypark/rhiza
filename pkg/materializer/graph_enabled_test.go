@@ -1853,50 +1853,150 @@ func TestGraphCheckpointProgressesDuringWrites(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer m.Close()
-	ctx := context.Background()
-	stopWrites := make(chan struct{})
-	started := make(chan struct{})
-	done := make(chan error, 1)
-	go func() {
-		for slot := uint64(1); ; slot++ {
-			select {
-			case <-stopWrites:
-				done <- nil
-				return
-			default:
-			}
-			value, encodeErr := types.EncodeKVCommand(types.KVCommand{RequestID: fmt.Sprintf("write-%d", slot), Operation: "put", Key: "active", Value: []byte("1")})
-			if encodeErr != nil {
-				done <- encodeErr
-				return
-			}
-			if applyErr := m.Apply(ctx, slot, value); applyErr != nil {
-				done <- applyErr
-				return
-			}
-			if slot == 1 {
-				close(started)
-			}
-		}
-	}()
-	<-started
-	deadline, stop := context.WithTimeout(context.Background(), 5*time.Second)
-	defer stop()
-	files, index, cleanup, err := m.CheckpointFilesAt(deadline)
-	close(stopWrites)
-	writeErr := <-done
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	seedKV, err := types.EncodeKVCommand(types.KVCommand{RequestID: "checkpoint-before", Operation: "put", Key: "checkpoint-value", Value: []byte("before")})
 	if err != nil {
 		t.Fatal(err)
 	}
-	cleanup()
-	if index == 0 || len(files) != 2 {
-		t.Fatalf("checkpoint index=%d files=%d", index, len(files))
+	seedGraph, err := types.EncodeGraphCommand(types.GraphCommand{RequestID: "checkpoint-node-before", Cypher: `CREATE (:CheckpointProgress {id: 'before'})`})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := m.Apply(ctx, 1, seedKV); err != nil {
+		t.Fatal(err)
+	}
+	if err := m.Apply(ctx, 2, seedGraph); err != nil {
+		t.Fatal(err)
+	}
+	snapshotTip := m.Tip()
+	if snapshotTip != 2 {
+		t.Fatalf("seed tip=%d, want 2", snapshotTip)
+	}
+
+	checkpointEntered := make(chan struct{})
+	releaseSnapshots := make(chan struct{})
+	var releaseOnce sync.Once
+	release := func() { releaseOnce.Do(func() { close(releaseSnapshots) }) }
+	m.checkpointSnapshotCloseHook = func(stage string) {
+		if stage == "snapshots-acquired-before-backup" {
+			close(checkpointEntered)
+			<-releaseSnapshots
+		}
+	}
+	type checkpointResult struct {
+		files   []CheckpointFile
+		index   uint64
+		cleanup func()
+		err     error
+	}
+	checkpointDone := make(chan checkpointResult, 1)
+	go func() {
+		files, index, cleanup, checkpointErr := m.CheckpointFilesAt(ctx)
+		checkpointDone <- checkpointResult{files: files, index: index, cleanup: cleanup, err: checkpointErr}
+	}()
+
+	var checkpoint checkpointResult
+	select {
+	case <-checkpointEntered:
+	case <-ctx.Done():
+		release()
+		checkpoint = <-checkpointDone
+		m.checkpointSnapshotCloseHook = nil
+		if checkpoint.cleanup != nil {
+			checkpoint.cleanup()
+		}
+		t.Fatalf("checkpoint did not acquire both snapshots: %v", ctx.Err())
+	}
+
+	writeKV, err := types.EncodeKVCommand(types.KVCommand{RequestID: "checkpoint-after", Operation: "put", Key: "checkpoint-value", Value: []byte("after")})
+	if err != nil {
+		release()
+		checkpoint = <-checkpointDone
+		m.checkpointSnapshotCloseHook = nil
+		if checkpoint.cleanup != nil {
+			checkpoint.cleanup()
+		}
+		t.Fatal(err)
+	}
+	writeGraph, err := types.EncodeGraphCommand(types.GraphCommand{RequestID: "checkpoint-node-after", Cypher: `CREATE (:CheckpointProgress {id: 'after'})`})
+	if err != nil {
+		release()
+		checkpoint = <-checkpointDone
+		m.checkpointSnapshotCloseHook = nil
+		if checkpoint.cleanup != nil {
+			checkpoint.cleanup()
+		}
+		t.Fatal(err)
+	}
+	writeDone := make(chan error, 1)
+	go func() {
+		if err := m.Apply(ctx, 3, writeKV); err != nil {
+			writeDone <- err
+			return
+		}
+		writeDone <- m.Apply(ctx, 4, writeGraph)
+	}()
+	var writeErr error
+	writeCompleted := false
+	select {
+	case writeErr = <-writeDone:
+		writeCompleted = true
+	case <-ctx.Done():
+		writeErr = ctx.Err()
+	}
+	// Record the progress result before releasing the snapshots, so a write
+	// that only proceeds after checkpoint completion cannot satisfy the test.
+	release()
+	checkpoint = <-checkpointDone
+	if !writeCompleted {
+		writeErr = <-writeDone
+	}
+	m.checkpointSnapshotCloseHook = nil
+	if checkpoint.cleanup != nil {
+		defer checkpoint.cleanup()
+	}
+	if !writeCompleted {
+		t.Fatalf("write did not complete while both checkpoint snapshots were held: %v", writeErr)
 	}
 	if writeErr != nil {
-		t.Fatal(writeErr)
+		t.Fatalf("write while checkpoint snapshots were held: %v", writeErr)
 	}
-	if final := m.Tip(); final <= index {
-		t.Fatalf("writes did not progress during checkpoint: snapshot=%d final=%d", index, final)
+	if checkpoint.err != nil {
+		t.Fatalf("CheckpointFilesAt: %v", checkpoint.err)
+	}
+	if checkpoint.index != snapshotTip || len(checkpoint.files) != 2 {
+		t.Fatalf("checkpoint index=%d files=%d, want index=%d and two roles", checkpoint.index, len(checkpoint.files), snapshotTip)
+	}
+	if final := m.Tip(); final != 4 {
+		t.Fatalf("live tip=%d, want 4 after concurrent writes", final)
+	}
+	if value, found, err := m.KVGet(ctx, "checkpoint-value", time.Now()); err != nil || !found || string(value) != "after" {
+		t.Fatalf("live KV value=%q found=%v err=%v, want after", value, found, err)
+	}
+	liveGraph, err := m.GraphQuery(ctx, `MATCH (n:CheckpointProgress) RETURN count(n)`, nil)
+	if err != nil || len(liveGraph.Rows) != 1 || liveGraph.Rows[0][0] != int64(2) {
+		t.Fatalf("live graph count result=%+v err=%v, want 2", liveGraph, err)
+	}
+
+	restored, err := Open(filepath.Join(t.TempDir(), "checkpoint.db"), 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer restored.Close()
+	if err := restored.RestoreCheckpoint(ctx, checkpoint.files); err != nil {
+		t.Fatalf("restore checkpoint: %v", err)
+	}
+	if tip := restored.Tip(); tip != snapshotTip {
+		t.Fatalf("restored tip=%d, want snapshot tip %d", tip, snapshotTip)
+	}
+	if value, found, err := restored.KVGet(ctx, "checkpoint-value", time.Now()); err != nil || !found || string(value) != "before" {
+		t.Fatalf("restored KV value=%q found=%v err=%v, want before", value, found, err)
+	}
+	checkpointGraph, err := restored.GraphQuery(ctx, `MATCH (n:CheckpointProgress) RETURN count(n)`, nil)
+	if err != nil || len(checkpointGraph.Rows) != 1 || checkpointGraph.Rows[0][0] != int64(1) {
+		t.Fatalf("restored graph count result=%+v err=%v, want 1", checkpointGraph, err)
 	}
 }
 
