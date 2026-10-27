@@ -140,6 +140,9 @@ func (p *gcsMutationProvider) uploadHeldCreate(ctx context.Context, key string, 
 	writer.Metadata = map[string]string{"rhiza-operation-id": intent.OperationID, "rhiza-payload-sha256": intent.PayloadDigest}
 	if _, err := io.Copy(writer, payload); err != nil {
 		_ = writer.CloseWithError(err)
+		if gcsConditionFailed(err) {
+			return mutationProviderResult{Outcome: fencing.MutationRejected, ConditionFailed: true, Generation: 0, AllCopiesTerminal: true}, nil
+		}
 		return mutationProviderResult{}, err
 	}
 	if err := writer.Close(); err != nil {

@@ -4,18 +4,24 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"io"
 	"net/http"
 	"net/http/httptest"
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 
 	"cloud.google.com/go/storage"
 	"github.com/mrchypark/rhiza/pkg/fencing"
 	"google.golang.org/api/option"
 )
+
+type heldCreateErrorReader struct{ err error }
+
+func (r heldCreateErrorReader) Read([]byte) (int, error) { return 0, r.err }
 
 func TestGCSHeldCreateWritesHoldAndFinalizesOnlyExactReceipt(t *testing.T) {
 	payload := []byte(`{"sealed":"payload"}`)
@@ -116,6 +122,96 @@ func TestGCSHeldCreateWritesHoldAndFinalizesOnlyExactReceipt(t *testing.T) {
 	defer mu.Unlock()
 	if uploadCount != 1 || updateCount != 1 || attrs["temporaryHold"] != false {
 		t.Fatalf("unexpected held-create lifecycle: uploads=%d updates=%d attrs=%v", uploadCount, updateCount, attrs)
+	}
+}
+
+func TestGCSHeldCreateClassifiesCopy412ButNotUnknownCopyError(t *testing.T) {
+	scope := AttestationStoreScope{Provider: "gcs", Bucket: "archive", Prefix: "root/source"}
+	for _, tc := range []struct {
+		name       string
+		copyError  error
+		respond412 bool
+		copy412    bool
+		wantReject bool
+	}{
+		{name: "provider 412 during copy", respond412: true, copy412: true, wantReject: true},
+		{name: "provider 412 during close", respond412: true, wantReject: true},
+		{name: "unrecognized payload error during copy", copyError: errors.New("payload read failed")},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			payload := bytes.Repeat([]byte("held-copy"), 1<<17)
+			if tc.respond412 && !tc.copy412 {
+				payload = nil
+			}
+			intent := fencing.MutationIntent{ContractVersion: fencing.MutationIntentVersion, StoreScopeHash: hashJSON(scope),
+				OwnerStep: fencing.MutationOwnerStep{Owner: "source", Workflow: "archive", Step: "copy-classification", Attempt: 1},
+				Condition: fencing.MutationCondition{Mode: fencing.MutationCreateOnly}, OperationID: "producer-sequence", Kind: "upload",
+				Key: "archive/head.bin", PayloadRef: "staging/payload", PayloadDigest: hashBytes(payload), PayloadSize: int64(len(payload))}
+			attrs := map[string]any{"kind": "storage#object", "bucket": "archive", "name": "root/source/archive/head.bin",
+				"generation": "61", "metageneration": "1", "size": strconv.Itoa(len(payload)),
+				"temporaryHold": true, "metadata": map[string]string{"rhiza-operation-id": intent.OperationID, "rhiza-payload-sha256": intent.PayloadDigest}}
+			var requests atomic.Int32
+			server := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if r.Method != http.MethodPost || !strings.HasSuffix(r.URL.Path, "/b/archive/o") {
+					t.Errorf("unexpected GCS request %s %s", r.Method, r.URL.String())
+					http.Error(w, "unexpected request", http.StatusMethodNotAllowed)
+					return
+				}
+				requests.Add(1)
+				if tc.respond412 {
+					if tc.copy412 {
+						// Reject while the SDK writer is still consuming the request pipe,
+						// so the 412 is observed by io.Copy rather than Writer.Close.
+						buf := make([]byte, 128)
+						if n, err := r.Body.Read(buf); n == 0 || err != nil {
+							t.Errorf("read initial upload bytes: n=%d err=%v", n, err)
+						}
+					} else if _, err := io.Copy(io.Discard, r.Body); err != nil {
+						t.Errorf("drain close-stage request: %v", err)
+					}
+					w.Header().Set("Content-Type", "application/json")
+					w.WriteHeader(http.StatusPreconditionFailed)
+					_, _ = io.WriteString(w, `{"error":{"code":412,"message":"conditionNotMet","errors":[{"domain":"global","reason":"conditionNotMet","message":"generation precondition failed"}]}}`)
+					return
+				}
+				if _, err := io.Copy(io.Discard, r.Body); err != nil {
+					t.Errorf("drain uploaded bytes: %v", err)
+				}
+				w.Header().Set("Content-Type", "application/json")
+				_ = json.NewEncoder(w).Encode(attrs)
+			}))
+			defer server.Close()
+			client, err := storage.NewClient(t.Context(), option.WithEndpoint(server.URL+"/storage/v1/"), option.WithHTTPClient(server.Client()), option.WithoutAuthentication())
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer client.Close()
+			provider, err := newGCSHeldCreateMutationProvider(client, scope)
+			if err != nil {
+				t.Fatal(err)
+			}
+			var source io.Reader = bytes.NewReader(payload)
+			if tc.copyError != nil {
+				source = io.MultiReader(bytes.NewReader(payload[:128]), heldCreateErrorReader{err: tc.copyError})
+			}
+			result, uploadErr := provider.upload(t.Context(), intent.Key, 0, intent, source)
+			wantRequests := int32(1)
+			if tc.copyError != nil {
+				wantRequests = 0 // A source read error must not dispatch an incomplete body.
+			}
+			if requests.Load() != wantRequests {
+				t.Fatalf("SDK upload requests=%d, want %d", requests.Load(), wantRequests)
+			}
+			if tc.wantReject {
+				if uploadErr != nil || result.Outcome != fencing.MutationRejected || !result.ConditionFailed || !result.AllCopiesTerminal {
+					t.Fatalf("recognized copy 412 was not a terminal rejection: result=%+v err=%T %v", result, uploadErr, uploadErr)
+				}
+				return
+			}
+			if uploadErr == nil || result.AllCopiesTerminal || result.Outcome != "" {
+				t.Fatalf("unknown copy error became a terminal provider result: result=%+v err=%T %v", result, uploadErr, uploadErr)
+			}
+		})
 	}
 }
 
