@@ -1,12 +1,14 @@
 package recovery
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
+	"reflect"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -19,10 +21,11 @@ import (
 
 type localPublicationBucket struct {
 	objstore.Bucket
-	changeHeadDuringRead atomic.Bool
-	writes               atomic.Int64
-	heads                atomic.Int64
-	extents              atomic.Int64
+	changeHeadDuringRead         atomic.Bool
+	changeLocalControlDuringRead atomic.Bool
+	writes                       atomic.Int64
+	heads                        atomic.Int64
+	extents                      atomic.Int64
 }
 
 func (b *localPublicationBucket) Upload(ctx context.Context, name string, r io.Reader, opts ...objstore.ObjectUploadOption) error {
@@ -45,6 +48,26 @@ func (b *localPublicationBucket) Get(ctx context.Context, name string) (io.ReadC
 		b.extents.Add(1)
 	}
 	r, err := b.Bucket.Get(ctx, name)
+	if err == nil && strings.HasSuffix(name, "/local-gc-control") && b.changeLocalControlDuringRead.Swap(false) {
+		data, readErr := io.ReadAll(r)
+		closeErr := r.Close()
+		if err := errors.Join(readErr, closeErr); err != nil {
+			return nil, err
+		}
+		var control localArchiveMaintenanceControl
+		if err := json.Unmarshal(data, &control); err != nil {
+			return nil, err
+		}
+		control.Token = strings.Repeat("f", 32)
+		changed, err := json.Marshal(control)
+		if err != nil {
+			return nil, err
+		}
+		if err := b.Bucket.Upload(ctx, name, bytes.NewReader(changed)); err != nil {
+			return nil, err
+		}
+		return io.NopCloser(bytes.NewReader(data)), nil
+	}
 	if err == nil && strings.HasSuffix(name, "/HEAD") && b.changeHeadDuringRead.Swap(false) {
 		if err := b.Bucket.Upload(ctx, name, strings.NewReader("changed during read")); err != nil {
 			_ = r.Close()
@@ -65,6 +88,50 @@ func TestLocalFreshnessRequiresStableHeadVersion(t *testing.T) {
 	if err := a.checkLocalHead(ctx); err == nil || !strings.Contains(err.Error(), "head changed during read") {
 		t.Fatalf("unstable HEAD not rejected: %v", err)
 	}
+}
+
+func TestOpenLocalArchiveRejectsMaintenanceControlVersionChangeDuringRead(t *testing.T) {
+	ctx := context.Background()
+	bucket := &localPublicationBucket{Bucket: objstore.NewInMemBucket()}
+	if _, err := CreateLocalArchive(ctx, bucket, "local", localTestBinding(), nil); err != nil {
+		t.Fatal(err)
+	}
+	before := localPublicationCanonicalImage(t, ctx, bucket)
+	bucket.changeLocalControlDuringRead.Store(true)
+	if _, err := OpenLocalArchive(ctx, bucket, "local"); err == nil || !strings.Contains(err.Error(), "Local maintenance control changed during read") {
+		t.Fatalf("Open accepted a maintenance-control version change: %v", err)
+	}
+	if bucket.changeLocalControlDuringRead.Load() {
+		t.Fatal("test did not change the maintenance-control version during Open")
+	}
+	if after := localPublicationCanonicalImage(t, ctx, bucket); !reflect.DeepEqual(before, after) {
+		t.Fatal("failed Open changed canonical archive objects")
+	}
+}
+
+func localPublicationCanonicalImage(t *testing.T, ctx context.Context, bucket objstore.Bucket) map[string][]byte {
+	t.Helper()
+	image := make(map[string][]byte)
+	err := bucket.Iter(ctx, "local/", func(name string) error {
+		if name != "local/BINDING" && name != "local/HEAD" && !strings.HasPrefix(name, "local/extents/") {
+			return nil
+		}
+		reader, err := bucket.Get(ctx, name)
+		if err != nil {
+			return err
+		}
+		data, readErr := io.ReadAll(reader)
+		closeErr := reader.Close()
+		if err := errors.Join(readErr, closeErr); err != nil {
+			return err
+		}
+		image[name] = data
+		return nil
+	}, objstore.WithRecursiveIter())
+	if err != nil {
+		t.Fatalf("capture canonical Local archive image: %v", err)
+	}
+	return image
 }
 
 func TestLocalFreshnessRejectsMetadataCorruption(t *testing.T) {
