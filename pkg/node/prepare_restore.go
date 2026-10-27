@@ -432,7 +432,7 @@ func validatePreparedRestoreConfig(config *types.ExecutionConfig) error {
 	if config.Local || !config.EnableReconfiguration || config.Learner == nil || config.Learner.ID != config.NodeID || len(config.Members) < 2 {
 		return fmt.Errorf("prepared restore requires a reconfigurable fresh learner with bootstrap voters")
 	}
-	if err := validateVoterMembership(config); err != nil {
+	if err := validateVoterMembershipStructure(config); err != nil {
 		return err
 	}
 	configured, err := validateObjectStoreConfig(config)

@@ -137,10 +137,11 @@ func TestPrepareRestoreMaterializesCertifiedCheckpointAndSuffix(t *testing.T) {
 	config.ObjStoreBucket = "test-bucket"
 	config.ObjStoreDir = ""
 	config.Learner = &quepaxa.Member{ID: config.NodeID, PublicKey: peerMember(string(config.ClusterID), quepaxa.NodeID(config.NodeID), "fresh-token").PublicKey}
-	config.AdminToken = "admin-token"
+	config.AdminToken = ""
+	config.PeerToken = ""
 	config.EnableReconfiguration = true
 	if err := prepareRestore(ctx, &config, bucket); err != nil {
-		t.Fatalf("prepare restore: %v", err)
+		t.Fatalf("prepare restore without runtime credentials: %v", err)
 	}
 
 	marker, exists, err := readPreparedRestoreMarker(config.DataDir)
@@ -150,6 +151,24 @@ func TestPrepareRestoreMaterializesCertifiedCheckpointAndSuffix(t *testing.T) {
 	if source.archive.Tip() != archiveTip {
 		t.Fatalf("preparation changed source archive tip from %d to %d", archiveTip, source.archive.Tip())
 	}
+	databaseBeforeOpen, err := os.ReadFile(filepath.Join(config.DataDir, "sqlite.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	markerBeforeOpen, err := os.ReadFile(filepath.Join(config.DataDir, preparedRestoreMarkerName))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := New(&config).Open(ctx); err == nil || !strings.Contains(err.Error(), "admin token") {
+		t.Fatalf("runtime open without admin/peer credentials error=%v, want admin-token refusal", err)
+	}
+	assertPreparedRuntimeOpenPreservedFiles(t, config.DataDir, databaseBeforeOpen, markerBeforeOpen)
+	withAdmin := config
+	withAdmin.AdminToken = "runtime-admin-token"
+	if err := New(&withAdmin).Open(ctx); err == nil || !strings.Contains(err.Error(), "peer token") {
+		t.Fatalf("runtime open without peer credential error=%v, want peer-token refusal", err)
+	}
+	assertPreparedRuntimeOpenPreservedFiles(t, config.DataDir, databaseBeforeOpen, markerBeforeOpen)
 	if manifests, err := filepath.Glob(filepath.Join(config.DataDir, "qlog", "manifest_*.bin")); err != nil || len(manifests) != 0 {
 		t.Fatalf("prepare created runtime WAL manifests %v, err=%v", manifests, err)
 	}
@@ -183,10 +202,7 @@ func TestPrepareRestoreMaterializesCertifiedCheckpointAndSuffix(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	markerBytes, err := os.ReadFile(filepath.Join(config.DataDir, preparedRestoreMarkerName))
-	if err != nil {
-		t.Fatal(err)
-	}
+	markerBytes := markerBeforeOpen
 	if err := prepareRestore(ctx, &config, bucket); err != nil {
 		t.Fatalf("same-Pod prepare retry: %v", err)
 	}
@@ -281,6 +297,22 @@ func TestPrepareRestoreMaterializesCertifiedCheckpointAndSuffix(t *testing.T) {
 				t.Fatalf("pending marker remained after completion: %v", err)
 			}
 		})
+	}
+}
+
+func assertPreparedRuntimeOpenPreservedFiles(t *testing.T, dataDir string, databaseBefore, markerBefore []byte) {
+	t.Helper()
+	databaseAfter, err := os.ReadFile(filepath.Join(dataDir, "sqlite.db"))
+	if err != nil || !bytes.Equal(databaseAfter, databaseBefore) {
+		t.Fatalf("runtime-open refusal changed prepared database: err=%v", err)
+	}
+	markerAfter, err := os.ReadFile(filepath.Join(dataDir, preparedRestoreMarkerName))
+	if err != nil || !bytes.Equal(markerAfter, markerBefore) {
+		t.Fatalf("runtime-open refusal changed prepared marker: err=%v", err)
+	}
+	manifests, err := filepath.Glob(filepath.Join(dataDir, "qlog", "manifest_*.bin"))
+	if err != nil || len(manifests) != 0 {
+		t.Fatalf("runtime-open refusal created WAL manifests %v, err=%v", manifests, err)
 	}
 }
 

@@ -136,10 +136,19 @@ func validateReadAdmissionConfig(config *types.ExecutionConfig) error {
 	return nil
 }
 
-// validateVoterMembership mirrors Core's fixed-membership checks before
-// offline enrollment can write a remote registration.
+// validateVoterMembership requires the runtime membership credential and then
+// validates the public membership shape.
 func validateVoterMembership(config *types.ExecutionConfig) error {
-	if config.EnableReconfiguration && (len(config.Members) < 2 || config.AdminToken == "") {
+	if config.EnableReconfiguration && config.AdminToken == "" {
+		return fmt.Errorf("managed membership requires bootstrap voters and an admin token")
+	}
+	return validateVoterMembershipStructure(config)
+}
+
+// validateVoterMembershipStructure checks only public membership configuration.
+// Offline restore uses it without receiving runtime membership credentials.
+func validateVoterMembershipStructure(config *types.ExecutionConfig) error {
+	if config.EnableReconfiguration && len(config.Members) < 2 {
 		return fmt.Errorf("managed membership requires bootstrap voters and an admin token")
 	}
 	if config.Learner != nil && len(config.Members) == 0 {
