@@ -1850,6 +1850,8 @@ func TestQualificationRuntimeEndpointRBAC(t *testing.T) {
 		"  - apiGroups: ['']\n    resources: [endpoints]\n    verbs: [get, list, watch]\n",
 		"  - apiGroups: [discovery.k8s.io]\n    resources: [endpointslices]\n    verbs: [get, list, watch]\n",
 	}
+	readerNamespace := qualificationNamespace("a1b2c3d4")
+	readerRoleName := readerNamespace + "-reader"
 	var runtimeRole, readerRole string
 	for _, document := range strings.Split(string(rendered), "\n---\n") {
 		if strings.Contains(document, "\nkind: Role\n") && strings.Contains(document, "  name: rhiza-ci-runtime\n") {
@@ -1858,7 +1860,7 @@ func TestQualificationRuntimeEndpointRBAC(t *testing.T) {
 		if strings.Contains(document, "\nkind: ClusterRole\n") && (strings.Contains(document, "resources: [endpoints]") || strings.Contains(document, "discovery.k8s.io")) {
 			t.Fatal("endpoint access escaped the namespaced runtime role")
 		}
-		if strings.Contains(document, "\nkind: ClusterRole\n") && strings.Contains(document, "  name: rhiza-v0195-a1b2c3d4-reader\n") {
+		if strings.Contains(document, "\nkind: ClusterRole\n") && strings.Contains(document, "  name: "+readerRoleName+"\n") {
 			if readerRole != "" {
 				t.Fatal("duplicate runtime reader ClusterRole")
 			}
@@ -1876,7 +1878,7 @@ func TestQualificationRuntimeEndpointRBAC(t *testing.T) {
 	}
 	defaultRoles := []string{"system:basic-user", "system:discovery", "system:public-info-viewer", "system:service-account-issuer-discovery"}
 	expectedReaderRules := []map[string]any{
-		{"apiGroups": []string{""}, "resources": []string{"namespaces"}, "resourceNames": []string{"rhiza-v0195-a1b2c3d4"}, "verbs": []string{"get"}},
+		{"apiGroups": []string{""}, "resources": []string{"namespaces"}, "resourceNames": []string{readerNamespace}, "verbs": []string{"get"}},
 		{"apiGroups": []string{"rbac.authorization.k8s.io"}, "resources": []string{"clusterrolebindings"}, "verbs": []string{"list"}},
 		{"apiGroups": []string{"rbac.authorization.k8s.io"}, "resources": []string{"clusterroles"}, "resourceNames": defaultRoles, "verbs": []string{"get"}},
 	}
@@ -1903,7 +1905,7 @@ func TestQualificationRuntimeEndpointRBAC(t *testing.T) {
 			t.Fatalf("rendered runtime endpoint role is not exact:\n%s", runtimeRole)
 		}
 	}
-	if strings.Count(runtimeRole, "resources: [endpoints]") != 1 || strings.Count(runtimeRole, "discovery.k8s.io") != 1 || !strings.Contains(runtimeRole, "  namespace: rhiza-v0195-a1b2c3d4\n") {
+	if strings.Count(runtimeRole, "resources: [endpoints]") != 1 || strings.Count(runtimeRole, "discovery.k8s.io") != 1 || !strings.Contains(runtimeRole, "  namespace: "+readerNamespace+"\n") {
 		t.Fatalf("rendered runtime endpoint role is not exact:\n%s", runtimeRole)
 	}
 	networkRule := strings.Index(runtimeRole, "resources: [networkpolicies]")
@@ -2283,7 +2285,7 @@ esac
  printf '%s\n' "$*" >> "$FAKE_DIR/calls"
  case "$FAKE_SCENARIO" in
   eventual-not-found)
-	   if [ "$attempt" = 1 ]; then printf '%s\n' '{"email":"rhiza-v0195-gcs-a1b2c3d4@example-project.iam.gserviceaccount.com","uniqueId":"fixture-uid","description":"rhiza-postrelease-a1b2c3d4-0123456789abcdef0123456789abcdef01234567"}'; exit 0; fi
+	   if [ "$attempt" = 1 ]; then printf '%s\n' '{"email":"__DATA_GSA_EMAIL__","uniqueId":"fixture-uid","description":"rhiza-postrelease-a1b2c3d4-0123456789abcdef0123456789abcdef01234567"}'; exit 0; fi
    printf '%s\n' 'ERROR: (gcloud.iam.service-accounts.describe) NOT_FOUND: Unknown service account. This command is authenticated as [fixture@example.invalid] which is the active account specified by the [core/account] property' >&2; exit 1 ;;
   identity-drift) printf '%s\n' '{"email":"other@example.invalid","uniqueId":"fixture-uid","description":"rhiza-postrelease-a1b2c3d4-0123456789abcdef0123456789abcdef01234567"}'; exit 0 ;;
   permission-denied) printf '%s\n' 'ERROR: PERMISSION_DENIED' >&2; exit 1 ;;
@@ -2291,7 +2293,7 @@ esac
   server-error) printf '%s\n' 'ERROR: HTTPError 503' >&2; exit 1 ;;
  esac
 `
-			gcloud = strings.ReplaceAll(gcloud, "rhiza-v0195-gcs-a1b2c3d4@example-project.iam.gserviceaccount.com", dataGSA+"@example-project.iam.gserviceaccount.com")
+			gcloud = strings.ReplaceAll(gcloud, "__DATA_GSA_EMAIL__", dataGSA+"@example-project.iam.gserviceaccount.com")
 			listFallback := "\n case \"$*\" in\n  *'iam service-accounts list'*)\n   case \"$FAKE_SCENARIO\" in\n    permission-denied-or-missing) printf '[]\\n'; exit 0 ;;\n    list-present) printf '[{\"email\":\"" + dataGSA + "@example-project.iam.gserviceaccount.com\",\"uniqueId\":\"fixture-uid\"}]\\n'; exit 0 ;;\n    list-failure) printf 'ERROR: PERMISSION_DENIED\\n' >&2; exit 1 ;;\n   esac\n  ;;\n esac\n"
 			gcloud = strings.Replace(gcloud, "\n case \"$FAKE_SCENARIO\" in", listFallback+"\n case \"$FAKE_SCENARIO\" in", 1)
 			gcloud = strings.Replace(gcloud, "  permission-denied) printf '%s\\n' 'ERROR: PERMISSION_DENIED' >&2; exit 1 ;;", "  permission-denied) printf '%s\\n' 'ERROR: PERMISSION_DENIED' >&2; exit 1 ;;\n  permission-denied-or-missing|list-present|list-failure) printf '%s\\n' 'ERROR: (gcloud.iam.service-accounts.describe) PERMISSION_DENIED: Permission denied on resource (or it may not exist).' >&2; exit 1 ;;", 1)
@@ -2318,7 +2320,7 @@ esac
 				t.Fatalf("exit=%d want=%d attempts=%s want=%d output=%s error=%v", code, scenario.want, attempts, scenario.attempts, output, err)
 			}
 			calls, err := os.ReadFile(filepath.Join(dir, "calls"))
-			if err != nil || bytes.Contains(calls, []byte(" delete ")) || !bytes.Contains(calls, []byte("iam service-accounts describe rhiza-v0195-gcs-a1b2c3d4@example-project.iam.gserviceaccount.com --format=json")) {
+			if err != nil || bytes.Contains(calls, []byte(" delete ")) || !bytes.Contains(calls, []byte("iam service-accounts describe "+dataGSA+"@example-project.iam.gserviceaccount.com --format=json")) {
 				t.Fatalf("worker issued a non-describe operation: %q error=%v", calls, err)
 			}
 		})
@@ -3416,6 +3418,7 @@ func TestQualificationLocalRuntime(t *testing.T) {
 			}
 			const contextName = "gke_example-project_test-region1_test-cluster"
 			namespace := qualificationNamespace(run)
+			dataEmail := qualificationDataGSA(run) + "@example-project.iam.gserviceaccount.com"
 			metadata, err := json.Marshal(map[string]any{"kind": "Pod", "metadata": map[string]any{"name": "rhiza-metadata", "namespace": namespace,
 				"uid": "metadata-uid", "resourceVersion": "7", "labels": map[string]string{"chaos.rhiza.io/run": run}},
 				"spec": map[string]any{"serviceAccountName": "rhiza-gcs", "nodeName": "gke-test-cluster-fixture-a",
@@ -3479,13 +3482,13 @@ func TestQualificationLocalRuntime(t *testing.T) {
  [ "$3" = rev-parse ] && [ "$4" = HEAD ] || exit 91
 printf '%s\n' "$FAKE_GIT_REVISION"
 `, 0700)
-			write(filepath.Join(bin, "kubectl"), `#!/bin/sh
+			kubectlFixture := `#!/bin/sh
 printf 'mock-entry\n' >> "$FAKE_CONFIG_EVENTS"
 if [ "$FAKE_SCENARIO" = parser-argument-error ]; then set -- --unexpected "$@"; fi
 case "$1" in --kubeconfig=*) config=${1#*=}; shift ;; *) exit 92 ;; esac
 [ "$1" = "--context=gke_example-project_test-region1_test-cluster" ] || exit 93
 shift
-[ "$1" = "--namespace=rhiza-v0195-a1b2c3d4" ] || exit 94
+[ "$1" = "--namespace=__NAMESPACE__" ] || exit 94
 shift
 case "$1" in --request-timeout=*) shift ;; esac
 printf 'args-ok\n' >> "$FAKE_CONFIG_EVENTS"
@@ -3506,7 +3509,7 @@ case "$1 $2" in
  "auth whoami")
   if [ "$FAKE_SCENARIO" = watchdog ]; then touch "$FAKE_SIGNAL_READY"; /bin/sleep 1; fi
   if [ "$FAKE_SCENARIO" = wrong-identity ]; then printf '%s\n' '{"status":{"userInfo":{"username":"admin","groups":[]}}}'
-  else printf '%s\n' '{"status":{"userInfo":{"username":"system:serviceaccount:rhiza-v0195-a1b2c3d4:rhiza-runtime","groups":["system:authenticated","system:serviceaccounts","system:serviceaccounts:rhiza-v0195-a1b2c3d4"]}}}'; fi ;;
+  else printf '%s\n' '{"status":{"userInfo":{"username":"system:serviceaccount:__NAMESPACE__:rhiza-runtime","groups":["system:authenticated","system:serviceaccounts","system:serviceaccounts:__NAMESPACE__"]}}}'; fi ;;
  "auth can-i")
   case "$*" in
    "auth can-i get secrets"|"auth can-i create serviceaccounts --subresource=token"|"auth can-i create roles"|"auth can-i create validatingadmissionpolicies.admissionregistration.k8s.io --all-namespaces") printf 'no\n'; exit 1 ;;
@@ -3520,7 +3523,7 @@ case "$1 $2" in
   if [ "$FAKE_SCENARIO" = deadline ]; then printf '%s\n' "$((FAKE_NOW + 1199))" > "$FAKE_CLOCK"; fi
   printf '%s\n' '{"items":[]}' ;;
  "get networkpolicy.networking.k8s.io")
-  printf '%s\n' '{"apiVersion":"networking.k8s.io/v1","kind":"NetworkPolicy","metadata":{"name":"rhiza-inspector-deny-all","namespace":"rhiza-v0195-a1b2c3d4","uid":"policy-uid","resourceVersion":"12","labels":{"app":"rhiza-inspector","chaos.rhiza.io/run":"a1b2c3d4"},"annotations":{"rhiza.dev/auth-owner":"rhiza-postrelease-a1b2c3d4-9b53158b38352ae78446e70a298616a31dc44a69"}},"spec":{"podSelector":{"matchLabels":{"app":"rhiza-inspector","chaos.rhiza.io/run":"a1b2c3d4"}},"policyTypes":["Ingress","Egress"],"ingress":[],"egress":[]}}' ;;
+  printf '%s\n' '{"apiVersion":"networking.k8s.io/v1","kind":"NetworkPolicy","metadata":{"name":"rhiza-inspector-deny-all","namespace":"__NAMESPACE__","uid":"policy-uid","resourceVersion":"12","labels":{"app":"rhiza-inspector","chaos.rhiza.io/run":"a1b2c3d4"},"annotations":{"rhiza.dev/auth-owner":"rhiza-postrelease-a1b2c3d4-9b53158b38352ae78446e70a298616a31dc44a69"}},"spec":{"podSelector":{"matchLabels":{"app":"rhiza-inspector","chaos.rhiza.io/run":"a1b2c3d4"}},"policyTypes":["Ingress","Egress"],"ingress":[],"egress":[]}}' ;;
  "get networkpolicies.networking.k8s.io") printf '%s\n' '{"items":[{"metadata":{"uid":"policy-uid"}}]}' ;;
  "delete --dry-run=server"|"replace --dry-run=server") printf '%s\n' 'Error from server (Forbidden): networkpolicies is forbidden' >&2; exit 1 ;;
  "create --dry-run=server")
@@ -3547,7 +3550,7 @@ case "$1 $2" in
     case "$*" in
      *'/instance/service-accounts/default/email')
       if [ "$FAKE_SCENARIO" = metadata-wrong-service-account ]; then printf 'node@project.iam.gserviceaccount.com\n200'
-      else printf 'rhiza-v0195-gcs-a1b2c3d4@example-project.iam.gserviceaccount.com\n200'; fi ;;
+      else printf '__DATA_GSA_EMAIL__\n200'; fi ;;
      *'/instance/service-accounts/default/token')
       if [ "$FAKE_SCENARIO" = metadata-credential-failure ]; then printf 'synthetic-metadata-token\n401'
       else printf '{"access_token":"synthetic-metadata-token","token_type":"Bearer","expires_in":100}\n200'; fi ;;
@@ -3573,21 +3576,24 @@ case "$1 $2" in
   else jq '{items:[.]}' "$FAKE_METADATA"; fi ;;
  "get pods") printf '%s\n' '{"items":[]}' ;;
  "delete --raw")
-  [ "$3" = /api/v1/namespaces/rhiza-v0195-a1b2c3d4/pods/rhiza-metadata ] && [ "$4" = -f ] || exit 99
+  [ "$3" = /api/v1/namespaces/__NAMESPACE__/pods/rhiza-metadata ] && [ "$4" = -f ] || exit 99
   jq -e '.preconditions=={uid:"metadata-uid",resourceVersion:"7"}' "$5" >/dev/null || exit 99
   touch "$FAKE_METADATA_DELETED" ;;
  "logs "*) kill -USR1 "$(cat "$FAKE_PARENT")"; exit 0 ;;
  "scale "*|"wait "*|"delete "*) exit 0 ;;
  *) exit 95 ;;
 esac
-`, 0700)
+`
+			kubectlFixture = strings.ReplaceAll(kubectlFixture, "__NAMESPACE__", namespace)
+			kubectlFixture = strings.ReplaceAll(kubectlFixture, "__DATA_GSA_EMAIL__", dataEmail)
+			write(filepath.Join(bin, "kubectl"), kubectlFixture, 0700)
 			// Functional cases check parser arguments and auth boundaries, not
 			// process-launch performance. Timing cases keep the native timer.
 			if scenario != "parser-timeout" && scenario != "deadline" && scenario != "watchdog" {
 				if err := os.Remove(filepath.Join(bin, "timeout")); err != nil {
 					t.Fatal(err)
 				}
-				write(filepath.Join(bin, "timeout"), `#!/bin/sh
+				timeoutFixture := `#!/bin/sh
 previous=
 parser=no
 for argument do
@@ -3598,20 +3604,21 @@ if [ "$parser" = yes ]; then
  [ "$#" = 11 ] && [ "$1" = --kill-after=5s ] && [ "$2" = 5s ] &&
   [ "$3" = kubectl ] && [ "$4" = "--kubeconfig=$FAKE_KUBECONFIG" ] &&
   [ "$5" = --context=gke_example-project_test-region1_test-cluster ] &&
-  [ "$6" = --namespace=rhiza-v0195-a1b2c3d4 ] &&
+				  [ "$6" = --namespace=__NAMESPACE__ ] &&
   [ "$7" = config ] && [ "$8" = view ] && [ "$9" = --raw ] &&
   [ "${10}" = -o ] && [ "${11}" = json ] || exit 98
  shift 3
  exec "$FAKE_KUBECTL" "$@"
 fi
 exec "$FAKE_NATIVE_TIMEOUT" "$@"
-`, 0700)
+`
+				timeoutFixture = strings.ReplaceAll(timeoutFixture, "__NAMESPACE__", namespace)
+				write(filepath.Join(bin, "timeout"), timeoutFixture, 0700)
 			}
 			expiry := time.Unix(now+3300, 0).UTC().Format(time.RFC3339)
 			if scenario == "expiry" {
 				expiry = time.Unix(now+14400, 0).UTC().Format(time.RFC3339)
 			}
-			dataEmail := qualificationDataGSA(run) + "@example-project.iam.gserviceaccount.com"
 			owner := "rhiza-postrelease-" + run + "-" + harness
 			member := "serviceAccount:example-project.svc.id.goog[" + namespace + "/rhiza-gcs]"
 			operatorMember := "serviceAccount:example-project.svc.id.goog[" + namespace + "/rhiza-operator]"
