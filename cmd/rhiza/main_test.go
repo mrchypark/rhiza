@@ -17,6 +17,8 @@ import (
 
 	"github.com/mrchypark/rhiza"
 	"github.com/mrchypark/rhiza/pkg/fencing"
+	"github.com/mrchypark/rhiza/pkg/recovery"
+	"github.com/mrchypark/rhiza/pkg/recoveryanchor"
 )
 
 type managedAssignmentReaderFixture struct {
@@ -194,6 +196,49 @@ func TestManagedAssignmentDiscoveryKeepsInitialLookupExactAndReadErrorsFailClose
 	}
 }
 
+func TestManagedAssignmentDiscoveryUsesExplicitDRPurposeBeforeLearnerDiscovery(t *testing.T) {
+	candidate := fencing.Identity{SourceClusterID: "target", NodeID: "n1", PodName: "rhiza-0", PodUID: "uid-1"}
+	operationID := "dr-successor-0123456789abcdef01234567"
+	members := []rhiza.Member{{ID: "n1", PublicKey: rhiza.PublicKey{1}}, {ID: "n2", PublicKey: rhiza.PublicKey{2}}}
+	targetMembership := recovery.NewMembershipRecord("target", members, "async")
+	request := recoveryanchor.Request{
+		AnchorID: "anchor", OperationID: "recovery-op", StatefulSetUID: "sts", SourceClusterID: "source",
+		TargetClusterID: "target", SourcePrefix: "source-prefix", TargetPrefix: "target-prefix",
+		TargetAnchorHash: strings.Repeat("a", 64), FenceHash: strings.Repeat("b", 64),
+		Fork:             recovery.ForkResult{Tip: 1, PrefixHash: strings.Repeat("c", 64), ManifestHash: strings.Repeat("d", 64)},
+		TargetMembership: targetMembership,
+	}
+	requestHash, err := recoveryanchor.RequestHash(request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	assignment := fencing.BootstrapAssignment{
+		OperationID: operationID, RequestHash: strings.Repeat("e", 64), Purpose: fencing.BootstrapDRSuccessor,
+		RootUID: "root", StatefulSetUID: "sts", SourceClusterID: "target", PodName: candidate.PodName,
+		PodUID: candidate.PodUID, NodeID: candidate.NodeID, CredentialName: "secret", CredentialUID: "secret-uid",
+		MembershipHash: fencing.BootstrapMembersHash(members), ProfileHash: strings.Repeat("f", 64), LedgerUID: "ledger",
+		DRApproval: fencing.BootstrapDRApproval{Request: request, Receipt: recoveryanchor.Receipt{
+			AnchorID: request.AnchorID, OperationID: request.OperationID, RequestHash: requestHash,
+			Target: recoveryanchor.Binding{ClusterID: "target", StorageID: "storage"}, Generation: 1,
+		}},
+	}
+	assignment.AuthorizationHash = fencing.BootstrapDRAuthorizationHash(assignment)
+	if err := assignment.Validate(); err != nil {
+		t.Fatalf("test assignment invalid: %v", err)
+	}
+	reader := &managedAssignmentReaderFixture{responses: map[string]fencing.BootstrapStatusResult{
+		operationID: {Assignment: &assignment},
+	}}
+	got, err := resolveManagedAssignment(context.Background(), reader, operationID, candidate)
+	if err != nil || got != assignment || !reflect.DeepEqual(reader.calls, []string{operationID}) {
+		t.Fatalf("assignment=%+v calls=%q err=%v", got, reader.calls, err)
+	}
+	reader = &managedAssignmentReaderFixture{errors: map[string]error{operationID: errors.New("authority unavailable")}}
+	if _, err := resolveManagedAssignment(context.Background(), reader, operationID, candidate); err == nil || !reflect.DeepEqual(reader.calls, []string{operationID}) {
+		t.Fatalf("authority failure fell through to learner discovery: err=%v calls=%q", err, reader.calls)
+	}
+}
+
 func testManagedLearnerAssignment(candidate fencing.Identity, operationID string) fencing.BootstrapAssignment {
 	nodeID, _ := fencing.ReplacementNodeID(candidate.PodUID)
 	return fencing.BootstrapAssignment{
@@ -209,7 +254,7 @@ func testManagedLearnerAssignment(candidate fencing.Identity, operationID string
 func TestBindManagedLearnerAssignmentPinsStaticMembershipAndStore(t *testing.T) {
 	member := rhiza.Member{ID: "n1", PublicKey: rhiza.PublicKey{1}}
 	config := rhiza.Config{
-		ClusterID: "cluster", Members: []rhiza.Member{member},
+		ClusterID: "cluster", PreparedPodUID: "uid-1", Members: []rhiza.Member{member},
 		ObjStoreProvider: "s3", ObjStoreEndpoint: "https://s3.example", ObjStoreBucket: "archive", ObjStorePrefix: "rhiza",
 		ObjStoreDurability: rhiza.ObjectStoreDurabilityBeforeAck,
 	}
@@ -218,8 +263,8 @@ func TestBindManagedLearnerAssignmentPinsStaticMembershipAndStore(t *testing.T) 
 		Purpose: fencing.BootstrapLearner, RootUID: "root", StatefulSetUID: "sts", LedgerUID: "ledger",
 		SourceClusterID: "cluster", PodName: "rhiza-0", PodUID: "uid-1", NodeID: "pod-uid-1",
 		CredentialName: "rhiza-0-credentials", CredentialUID: "secret-uid", ProfileHash: strings.Repeat("c", 64),
-		MembershipHash: bootstrapMembershipHash(config.Members),
-		PublicMember:   fencing.BootstrapPublicMember{ID: "pod-uid-1", URL: "http://rhiza-0", PeerURL: "quic://rhiza-0", LogURL: "http://rhiza-0/log", PublicKey: strings.Repeat("0", 62) + "01"},
+		MembershipHash: fencing.BootstrapMembersHash(config.Members),
+		PublicMember:   fencing.BootstrapPublicMember{ID: "pod-uid-1", URL: "http://rhiza-0", PeerURL: "quic://rhiza-0", PublicKey: strings.Repeat("0", 62) + "01"},
 		Durability:     string(config.ObjStoreDurability), StoreIdentityHash: bootstrapStoreIdentityHash(config),
 	}
 	if err := bindManagedLearnerAssignment(&config, assignment); err != nil {
@@ -228,16 +273,23 @@ func TestBindManagedLearnerAssignmentPinsStaticMembershipAndStore(t *testing.T) 
 	if config.NodeID != assignment.NodeID || config.Learner == nil || string(config.Learner.ID) != assignment.NodeID || config.Members[0] != member {
 		t.Fatalf("config=%+v; assignment did not bind without changing source membership", config)
 	}
-	for name, mutate := range map[string]func(*rhiza.Config){
-		"membership": func(c *rhiza.Config) { c.Members[0].PublicKey[0]++ },
-		"store":      func(c *rhiza.Config) { c.ObjStorePrefix += "/other" },
-		"durability": func(c *rhiza.Config) { c.ObjStoreDurability = rhiza.ObjectStoreDurabilityAsync },
+	for name, mutate := range map[string]func(*rhiza.Config, *fencing.BootstrapAssignment){
+		"membership": func(c *rhiza.Config, _ *fencing.BootstrapAssignment) { c.Members[0].PublicKey[0]++ },
+		"store":      func(c *rhiza.Config, _ *fencing.BootstrapAssignment) { c.ObjStorePrefix += "/other" },
+		"durability": func(c *rhiza.Config, _ *fencing.BootstrapAssignment) {
+			c.ObjStoreDurability = rhiza.ObjectStoreDurabilityAsync
+		},
+		"peer URL":   func(_ *rhiza.Config, a *fencing.BootstrapAssignment) { a.PublicMember.PeerURL = "quic://other" },
+		"public key": func(_ *rhiza.Config, a *fencing.BootstrapAssignment) { a.PublicMember.PublicKey = "not-a-key" },
+		"Pod UID":    func(c *rhiza.Config, _ *fencing.BootstrapAssignment) { c.PreparedPodUID = "other-pod" },
+		"WAL":        func(_ *rhiza.Config, a *fencing.BootstrapAssignment) { a.PublicMember.WALIdentity = "unexpected" },
 	} {
 		t.Run(name, func(t *testing.T) {
 			wrong := config
 			wrong.Members = append([]rhiza.Member(nil), config.Members...)
-			mutate(&wrong)
-			if err := bindManagedLearnerAssignment(&wrong, assignment); err == nil {
+			changedAssignment := assignment
+			mutate(&wrong, &changedAssignment)
+			if err := bindManagedLearnerAssignment(&wrong, changedAssignment); err == nil {
 				t.Fatal("assignment accepted a mismatched source profile")
 			}
 		})

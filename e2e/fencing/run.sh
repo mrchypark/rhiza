@@ -94,15 +94,16 @@ k create configmap rhiza-fencer-ca --from-file="ca.crt=$fencing_tmp/tls.crt"
 printf '%s\n' '[req]' 'distinguished_name=dn' 'req_extensions=ext' 'prompt=no' '[dn]' 'CN=anchor-service' '[ext]' 'basicConstraints=critical,CA:FALSE' 'keyUsage=critical,digitalSignature,keyEncipherment' 'extendedKeyUsage=serverAuth' "subjectAltName=DNS:anchor-service.$fencing_namespace.svc" >"$fencing_tmp/anchor-openssl.cnf"
 openssl req -x509 -newkey rsa:2048 -nodes -days 1 -config "$fencing_tmp/anchor-openssl.cnf" -extensions ext -keyout "$fencing_tmp/anchor-tls.key" -out "$fencing_tmp/anchor-tls.crt" 2>"$FENCING_E2E_OUT/anchor-tls-generation.log"
 k create secret tls anchor-tls --cert="$fencing_tmp/anchor-tls.crt" --key="$fencing_tmp/anchor-tls.key"
-k create secret generic anchor-token --from-literal=token=anchor-test-token --from-file="ca.crt=$fencing_tmp/anchor-tls.crt"
+k create secret generic rhiza-recovery-anchor-token --from-literal=token=anchor-test-token
+k create configmap rhiza-recovery-anchor-ca --from-file="ca.crt=$fencing_tmp/anchor-tls.crt"
+"$FENCING_E2E_BIN" manifests >"$fencing_tmp/manifests.json"
+k apply -f "$fencing_tmp/manifests.json"
 sed -e "s/namespace: rhiza$/namespace: $fencing_namespace/" -e 's/image: rhiza-operator:latest$/image: rhiza-fencing-operator:local/' deploy/operator/fencing/authority.yaml >"$fencing_tmp/authority.yaml"
 k apply -f "$fencing_tmp/authority.yaml"
 # The second YAML document is the application's unprivileged ServiceAccount.
 sed -n '/^---$/,$p' deploy/operator/fencing/supervised-statefulset.patch.yaml | sed "s/namespace: rhiza$/namespace: $fencing_namespace/" >"$fencing_tmp/sa.yaml"
 k apply -f "$fencing_tmp/sa.yaml"
 sed '/^---$/,$d' deploy/operator/fencing/supervised-statefulset.patch.yaml | sed "s/namespace: rhiza$/namespace: $fencing_namespace/" >"$fencing_tmp/supervised.patch.yaml"
-"$FENCING_E2E_BIN" manifests >"$fencing_tmp/manifests.json"
-k apply -f "$fencing_tmp/manifests.json"
 k patch statefulset rhiza --type=strategic --patch-file "$fencing_tmp/supervised.patch.yaml"
 k rollout status deployment/anchor-service --timeout=180s
 k rollout status deployment/rhiza-minio --timeout=180s

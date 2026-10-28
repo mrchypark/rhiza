@@ -185,6 +185,15 @@ type proofView struct {
 type eventView struct {
 	Event                          string                 `json:"event"`
 	Time                           string                 `json:"time"`
+	FenceOperationID               string                 `json:"fenceOperationID,omitempty"`
+	AnchorOperationID              string                 `json:"anchorOperationID,omitempty"`
+	TargetClusterID                string                 `json:"targetClusterID,omitempty"`
+	AnchorStage                    string                 `json:"stage,omitempty"`
+	AnchorPhase                    string                 `json:"phase,omitempty"`
+	AnchorRecordState              string                 `json:"anchorRecordState,omitempty"`
+	CorruptBytesSHA256             string                 `json:"corruptBytesSHA256,omitempty"`
+	AnchorArtifactSHA256           string                 `json:"anchorArtifactSHA256,omitempty"`
+	PreRuntimeAssignmentObserved   bool                   `json:"preRuntimeAssignmentObserved,omitempty"`
 	Rows                           json.RawMessage        `json:"rows,omitempty"`
 	Voters                         int                    `json:"voters,omitempty"`
 	ConfigID                       uint                   `json:"configID,omitempty"`
@@ -223,6 +232,157 @@ type eventView struct {
 		Target      operator.FenceTarget `json:"target"`
 		Removed     bool                 `json:"removed"`
 	} `json:"fault,omitempty"`
+}
+
+// verifyAnchorGateEvidence validates the bounded event packet emitted by the
+// cooperative runtime. It does not infer success from a PASS record alone:
+// each missing/pending/corrupt gate must precede exact restoration and the
+// same retained operation must later receive its runtime ACK.
+func verifyAnchorGateEvidence(eventsPath, qualificationPath, sourceHeadPath, expectedSourceHead string) (obj, error) {
+	file, err := os.Open(eventsPath)
+	if err != nil {
+		return nil, err
+	}
+	defer file.Close()
+	scan := bufio.NewScanner(file)
+	scan.Buffer(make([]byte, 4096), 1<<20)
+	var gates []eventView
+	var gateEventIndexes []int
+	var ack, pass *eventView
+	var ackIndex, passIndex int
+	var ackCount, passCount int
+	eventIndex := 0
+	for scan.Scan() {
+		var event eventView
+		decoder := json.NewDecoder(bytes.NewReader(scan.Bytes()))
+		decoder.DisallowUnknownFields()
+		if err := decoder.Decode(&event); err != nil {
+			return nil, fmt.Errorf("decode bounded event: %w", err)
+		}
+		if err := decoder.Decode(new(any)); err != io.EOF {
+			return nil, fmt.Errorf("trailing event data")
+		}
+		switch event.Event {
+		case "anchor_gate_missing_record", "anchor_gate_pending_write", "anchor_gate_corrupt_target", "anchor_gate_restored_exact_target":
+			gates = append(gates, event)
+			gateEventIndexes = append(gateEventIndexes, eventIndex)
+		case "anchor_gates_restored":
+			gates = append(gates, event)
+			gateEventIndexes = append(gateEventIndexes, eventIndex)
+		case "dr_successor_runtime_ack":
+			copy := event
+			ack = &copy
+			ackIndex = eventIndex
+			ackCount++
+		case "PASS":
+			copy := event
+			pass = &copy
+			passIndex = eventIndex
+			passCount++
+		}
+		eventIndex++
+	}
+	if err := scan.Err(); err != nil {
+		return nil, err
+	}
+	if len(gates) != 5 || ack == nil || pass == nil || ackCount != 1 || passCount != 1 {
+		return nil, fmt.Errorf("anchor gate sequence or final runtime evidence is incomplete")
+	}
+	if ackIndex <= gateEventIndexes[4] || passIndex <= ackIndex {
+		return nil, fmt.Errorf("final runtime ACK and PASS must follow all anchor gates in order")
+	}
+	first := gates[0]
+	if first.Event != "anchor_gate_missing_record" || first.AnchorRecordState != "missing" ||
+		gates[1].Event != "anchor_gate_pending_write" || gates[1].AnchorRecordState != "pending_write" ||
+		gates[2].Event != "anchor_gate_corrupt_target" || gates[2].AnchorRecordState != "corrupt" ||
+		gates[3].Event != "anchor_gate_restored_exact_target" || gates[3].AnchorRecordState != "restored_exact" ||
+		gates[4].Event != "anchor_gates_restored" || !gates[4].PreRuntimeAssignmentObserved {
+		return nil, fmt.Errorf("anchor gates are missing or out of order")
+	}
+	if first.FenceOperationID == "" || first.AnchorOperationID == "" || first.TargetClusterID == "" {
+		return nil, fmt.Errorf("anchor gate identity is incomplete")
+	}
+	for i, gate := range gates {
+		if gate.FenceOperationID != first.FenceOperationID || gate.AnchorOperationID != first.AnchorOperationID || gate.TargetClusterID != first.TargetClusterID {
+			return nil, fmt.Errorf("anchor gate identity changed at step %d", i)
+		}
+		if i < 3 && (gate.AnchorStage != "Sealed" || gate.AnchorPhase != "Blocked") {
+			return nil, fmt.Errorf("anchor gate %d was not observed sealed and blocked", i)
+		}
+	}
+	if len(gates[2].CorruptBytesSHA256) != 64 || len(gates[3].AnchorArtifactSHA256) != 64 {
+		return nil, fmt.Errorf("anchor corruption/restoration digest is absent")
+	}
+	if _, err := hex.DecodeString(gates[2].CorruptBytesSHA256); err != nil {
+		return nil, fmt.Errorf("invalid corrupted-anchor digest")
+	}
+	if _, err := hex.DecodeString(gates[3].AnchorArtifactSHA256); err != nil {
+		return nil, fmt.Errorf("invalid restored-anchor digest")
+	}
+	if ack.DRTargetClusterID != first.TargetClusterID || ack.DRWriteEpoch != 2 || !ack.DRAssignmentsObserved || len(ack.DRReadbackSHA256) != 64 {
+		return nil, fmt.Errorf("final runtime ACK is not bound to the recovered target")
+	}
+	if _, err := hex.DecodeString(ack.DRReadbackSHA256); err != nil {
+		return nil, fmt.Errorf("invalid final runtime readback digest")
+	}
+	qualificationBytes, err := os.ReadFile(qualificationPath)
+	if err != nil {
+		return nil, err
+	}
+	if _, err := safeJSON("dr-qualification.json", qualificationBytes); err != nil {
+		return nil, fmt.Errorf("qualification artifact is not safe or valid: %w", err)
+	}
+	var qualification struct {
+		Version                      int                    `json:"version"`
+		TargetClusterID              string                 `json:"targetClusterID"`
+		AnchorID                     string                 `json:"anchorID"`
+		RecoveryName                 string                 `json:"recoveryName"`
+		RecoveryUID                  string                 `json:"recoveryUID"`
+		OperationID                  string                 `json:"operationID"`
+		RequestHash                  string                 `json:"requestHash"`
+		Receipt                      recoveryanchor.Receipt `json:"receipt"`
+		Assignments                  []drAssignmentView     `json:"assignments"`
+		TargetVoters                 int                    `json:"targetVoters"`
+		InitSucceeded                bool                   `json:"initSucceeded"`
+		PreRuntimeAssignmentObserved bool                   `json:"preRuntimeAssignmentObserved"`
+		RuntimeWALBound              bool                   `json:"runtimeWALBound"`
+	}
+	qualificationDecoder := json.NewDecoder(bytes.NewReader(qualificationBytes))
+	qualificationDecoder.DisallowUnknownFields()
+	if err := qualificationDecoder.Decode(&qualification); err != nil {
+		return nil, fmt.Errorf("decode bounded DR qualification: %w", err)
+	}
+	if err := qualificationDecoder.Decode(new(any)); err != io.EOF {
+		return nil, fmt.Errorf("trailing DR qualification data")
+	}
+	if qualification.Version != 1 || qualification.AnchorID != recoveryAnchorID || qualification.RecoveryName == "" ||
+		!validPodUID(qualification.RecoveryUID) || qualification.OperationID != qualification.RecoveryUID+":"+qualification.RecoveryName ||
+		qualification.OperationID != first.AnchorOperationID || qualification.TargetClusterID != first.TargetClusterID ||
+		qualification.OperationID != qualification.Receipt.OperationID || qualification.RequestHash == "" ||
+		qualification.RequestHash != qualification.Receipt.RequestHash || qualification.Receipt.AnchorID != recoveryAnchorID ||
+		qualification.Receipt.Target.ClusterID != first.TargetClusterID || qualification.Receipt.Generation == 0 ||
+		qualification.TargetVoters != 3 || !qualification.InitSucceeded || !qualification.PreRuntimeAssignmentObserved ||
+		!qualification.RuntimeWALBound || len(qualification.Assignments) != 3 {
+		return nil, fmt.Errorf("DR qualification does not prove the exact anchor operation and target")
+	}
+	if _, err := hex.DecodeString(qualification.RequestHash); err != nil {
+		return nil, fmt.Errorf("invalid DR qualification request digest")
+	}
+	if !pass.OldRuntimesGone || !pass.NewGenerationWrite || !pass.OnlineVoterReplacement {
+		return nil, fmt.Errorf("final PASS record lacks replacement, termination, or write evidence")
+	}
+	sourceHeadBytes, err := os.ReadFile(sourceHeadPath)
+	if err != nil {
+		return nil, err
+	}
+	sourceHead := strings.TrimSpace(string(sourceHeadBytes))
+	if len(expectedSourceHead) != 40 || sourceHead != expectedSourceHead {
+		return nil, fmt.Errorf("cooperative runtime evidence source revision does not match this workflow revision")
+	}
+	if _, err := hex.DecodeString(sourceHead); err != nil {
+		return nil, fmt.Errorf("invalid cooperative runtime source revision")
+	}
+	return obj{"fenceOperationID": first.FenceOperationID, "anchorOperationID": first.AnchorOperationID, "targetClusterID": first.TargetClusterID, "sourceHead": sourceHead, "gateCount": len(gates), "qualificationBound": true, "runtimeAck": true, "oldRuntimesGone": pass.OldRuntimesGone, "newGenerationWrite": pass.NewGenerationWrite}, nil
 }
 
 type runtimeDiagnosticsView struct {

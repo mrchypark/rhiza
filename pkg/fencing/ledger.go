@@ -170,6 +170,16 @@ func (l *Ledger) BeginMembershipRepairInit(assignment BootstrapAssignment, attem
 	if candidate == nil || candidate.Assignment != assignment {
 		return InitAttempt{}, ErrPending
 	}
+	// This check belongs in the ledger transition, not just in the authority's
+	// preliminary reads. changeExisting may retry this transition against a
+	// newer CAS snapshot after closure wins the race. Even a duplicate Begin is
+	// admission to start/use init work and must not cross that closed boundary.
+	if l.ClosedBy != "" {
+		return InitAttempt{}, ErrClosed
+	}
+	if _, closed := l.ClosedNodes[assignment.NodeID]; closed {
+		return InitAttempt{}, ErrClosed
+	}
 	if old, ok := candidate.Attempts[attemptID]; ok {
 		if old.Assignment == assignment && old.Scope == scope {
 			return cloneInitAttempt(old), nil
@@ -904,12 +914,21 @@ func (l *Ledger) Register(identity Identity) error {
 	// A Pod UID is one immutable mapping to a consensus identity and Secret.
 	// A new UID at the same ordinal is a new identity, but cannot register until
 	// every prior incarnation of that ordinal has terminal evidence.
+	var retainedWAL string
 	for _, old := range l.Runs {
-		if old.Identity.PodUID == identity.PodUID && old.Identity.RunID != identity.RunID && !runTerminated(old) {
-			return fmt.Errorf("fencing: previous run for this Pod UID has no terminal receipt")
-		}
-		if old.Identity.PodUID == identity.PodUID && (old.Identity.NodeID != identity.NodeID || PodNameForIdentity(old.Identity) != PodNameForIdentity(identity) || old.Identity.CredentialUID != identity.CredentialUID || old.Identity.CredentialName != identity.CredentialName) {
-			return fmt.Errorf("fencing: Pod UID is already bound to another identity or credential")
+		if old.Identity.PodUID == identity.PodUID {
+			if old.Identity.NodeID != identity.NodeID || PodNameForIdentity(old.Identity) != PodNameForIdentity(identity) || old.Identity.CredentialUID != identity.CredentialUID || old.Identity.CredentialName != identity.CredentialName {
+				return fmt.Errorf("fencing: Pod UID is already bound to another identity or credential")
+			}
+			if old.Identity.WALIdentity != "" {
+				if retainedWAL != "" && retainedWAL != old.Identity.WALIdentity {
+					return fmt.Errorf("fencing: Pod UID has conflicting historical WAL identities")
+				}
+				retainedWAL = old.Identity.WALIdentity
+			}
+			if old.Identity.RunID != identity.RunID && !runTerminated(old) && old.Identity.WALIdentity == "" {
+				return fmt.Errorf("fencing: previous unbound run for this Pod UID has no terminal receipt")
+			}
 		}
 		if PodNameForIdentity(old.Identity) == PodNameForIdentity(identity) && old.Identity.PodUID != identity.PodUID && !runTerminated(old) && !l.authorizesRepairLearner(identity, old.Identity) {
 			return fmt.Errorf("fencing: earlier incarnation has no clean termination proof")
@@ -1328,35 +1347,56 @@ func (l *Ledger) CompleteNodes(operationID, requestHash string, nodeIDs, current
 // completion boundary as runtime Runs. A successful outcome is live Node
 // evidence only; it must also have exact authority-observed terminal evidence.
 func (l *Ledger) bootstrapInitComplete(wanted map[string]bool) bool {
-	if l.Bootstrap == nil {
-		return true
+	if l == nil {
+		return false
 	}
-	for _, operation := range l.Bootstrap.Operations {
-		for _, assignment := range operation.Assignments {
-			if len(wanted) != 0 && !wanted[assignment.NodeID] {
+	check := func(assignment BootstrapAssignment, attempts map[string]InitAttempt) bool {
+		if len(wanted) != 0 && !wanted[assignment.NodeID] {
+			return true
+		}
+		resolved := false
+		materialized := false
+		for _, attempt := range attempts {
+			if attempt.Assignment.PodUID != assignment.PodUID {
 				continue
 			}
-			resolved := false
-			materialized := false
-			for _, attempt := range operation.Attempts {
-				if attempt.Assignment.PodUID != assignment.PodUID {
-					continue
-				}
-				if attempt.Assignment != assignment || len(attempt.Outcomes) != 1 || attempt.Terminal == nil ||
-					attempt.Terminal.ContainerID != attempt.Scope.ContainerID || attempt.Terminal.ImageID != attempt.Scope.ImageID || attempt.Terminal.Reason == "" {
-					return false
-				}
-				if attempt.Outcomes[0].ValidateForAssignment(assignment) != nil {
-					return false
-				}
-				resolved = true
-				if attempt.Outcomes[0].State == InitAttemptMaterialized && attempt.Terminal.ExitCode == 0 && attempt.Terminal.Reason == "Completed" {
-					materialized = true
-				}
-			}
-			if !resolved || !materialized {
+			if attempt.Assignment != assignment || len(attempt.Outcomes) != 1 || attempt.Terminal == nil ||
+				attempt.Terminal.ContainerID != attempt.Scope.ContainerID || attempt.Terminal.ImageID != attempt.Scope.ImageID || attempt.Terminal.Reason == "" {
 				return false
 			}
+			if attempt.Outcomes[0].ValidateForAssignment(assignment) != nil {
+				return false
+			}
+			resolved = true
+			if attempt.Outcomes[0].State == InitAttemptMaterialized && attempt.Terminal.ExitCode == 0 && attempt.Terminal.Reason == "Completed" {
+				materialized = true
+			}
+		}
+		return resolved && materialized
+	}
+	if l.Bootstrap != nil {
+		for _, operation := range l.Bootstrap.Operations {
+			for _, assignment := range operation.Assignments {
+				if !check(assignment, operation.Attempts) {
+					return false
+				}
+			}
+		}
+	}
+	checkRepair := func(record MembershipRepairRecord) bool {
+		for _, candidate := range record.Progress.Candidates {
+			if !check(candidate.Assignment, candidate.Attempts) {
+				return false
+			}
+		}
+		return true
+	}
+	if l.MembershipRepair != nil && !checkRepair(*l.MembershipRepair) {
+		return false
+	}
+	for _, record := range l.MembershipRepairHistory {
+		if !checkRepair(record) {
+			return false
 		}
 	}
 	return true

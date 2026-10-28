@@ -288,11 +288,22 @@ func (a *sessionAuthority) AuthorizeMembershipPhase(_ context.Context, identity 
 }
 
 func TestSessionRelaysBootstrapStatusAndCompletionOnlyAfterWALBind(t *testing.T) {
-	id := testIdentity()
-	id.WALIdentity = "wal-1"
+	podUID := "pod-uid"
+	nodeID, err := ReplacementNodeID(podUID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	id := Identity{SourceClusterID: "source", NodeID: nodeID, PodName: "rhiza-0", PodUID: podUID, CredentialName: "candidate-secret", CredentialUID: "candidate-secret-uid", RunID: "run-1", WALIdentity: "wal-1"}
+	assignment := BootstrapAssignment{
+		OperationID: "operation-1", RequestHash: strings.Repeat("a", 64), AuthorizationHash: strings.Repeat("b", 64), Purpose: BootstrapLearner,
+		RootUID: "root-uid", StatefulSetUID: "sts-uid", SourceClusterID: id.SourceClusterID, PodName: id.PodName, PodUID: id.PodUID, NodeID: id.NodeID,
+		CredentialName: id.CredentialName, CredentialUID: id.CredentialUID, MembershipHash: strings.Repeat("c", 64), ProfileHash: strings.Repeat("d", 64), LedgerUID: "ledger-uid",
+		PublicMember: BootstrapPublicMember{ID: id.NodeID, URL: "http://rhiza-0", PeerURL: "quic://rhiza-0", PublicKey: strings.Repeat("e", 64)}, Durability: "async", StoreIdentityHash: strings.Repeat("f", 64),
+	}
+	assignmentSetHash := BootstrapAssignmentSetHash([]BootstrapAssignment{assignment})
 	authority := &sessionAuthority{
 		id:              id,
-		bootstrapStatus: BootstrapStatusResult{AssignmentSetHash: BootstrapAssignmentSetHash(nil)},
+		bootstrapStatus: BootstrapStatusResult{Assignment: &assignment, AssignmentSetHash: assignmentSetHash},
 	}
 	supervisor := &Supervisor{Authority: authority, bound: id, ticket: "private-ticket"}
 	server := httptest.NewServer(supervisor.handler())
@@ -311,11 +322,11 @@ func TestSessionRelaysBootstrapStatusAndCompletionOnlyAfterWALBind(t *testing.T)
 		t.Fatal("unbound bootstrap status was accepted")
 	}
 	status, err := session.BootstrapStatus(t.Context(), "operation-1")
-	if err != nil || status.AssignmentSetHash != BootstrapAssignmentSetHash(nil) {
+	if err != nil || status.Assignment == nil || *status.Assignment != assignment || status.AssignmentSetHash != assignmentSetHash {
 		t.Fatalf("bootstrap status=%+v err=%v", status, err)
 	}
 	completion := BootstrapCompletion{
-		OperationID: "operation-1", AuthorizationHash: "authorization",
+		OperationID: "operation-1", AuthorizationHash: assignment.AuthorizationHash,
 		AssignmentSetHash: status.AssignmentSetHash, CertifiedBarrierRef: "9",
 	}
 	if err := session.CompleteBootstrap(t.Context(), completion); err != nil {

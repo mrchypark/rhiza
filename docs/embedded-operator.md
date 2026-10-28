@@ -291,6 +291,18 @@ Operator Deployment에 다음 환경 변수를 추가한다:
 | `RHIZA_RECOVERY_ANCHOR_URL` | recovery-anchor 서비스 URL. 예: `https://anchor.svc:9191` |
 | `RHIZA_RECOVERY_ANCHOR_TOKEN_FILE` | Bearer token 파일 경로 |
 | `RHIZA_RECOVERY_ANCHOR_CA_FILE` | TLS CA 인증서 파일 경로 |
+| `RHIZA_RECOVERY_ANCHOR_BINDING_POLICY` | 필수 정책. `derived` 또는 `opaque`를 명시합니다. |
+| `RHIZA_RECOVERY_ANCHOR_STORAGE_ID` | `opaque` 정책을 선택할 때만 필요한 외부 관리 스토리지 식별자입니다. |
+
+`derived` 정책은 애플리케이션과 동일한 `RHIZA_OBJSTORE_*` 설정에서 provider,
+endpoint, bucket, base prefix를 읽어 기대 binding을 계산합니다. 인증 정보는
+binding에 포함하지 않습니다. Azure처럼 파생 규칙이 전체 스토리지 식별자를
+포함하지 못하는 provider는 `opaque`를 선택하고, 독립적으로 검증한 storage ID를
+설정해야 합니다. receipt의 값을 기대 binding으로 재사용하지 않습니다.
+
+Operator와 `rhiza-fencer`는 같은 `rhiza-recovery-anchor` ConfigMap, 읽기 전용
+token Secret, 선택적 CA ConfigMap을 사용합니다. 설정은 두 Pod에 동일하게
+주입해야 합니다.
 
 ### Workload 환경 변수
 

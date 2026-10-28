@@ -1,11 +1,13 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -14,15 +16,58 @@ import (
 	"testing"
 	"time"
 
+	objmetrics "github.com/mrchypark/rhiza/internal/objstore"
 	"github.com/mrchypark/rhiza/internal/types"
 	"github.com/mrchypark/rhiza/pkg/fencing"
 	"github.com/mrchypark/rhiza/pkg/network"
 	"github.com/mrchypark/rhiza/pkg/operator"
 	"github.com/mrchypark/rhiza/pkg/qlog"
 	"github.com/mrchypark/rhiza/pkg/quepaxa"
+	"github.com/mrchypark/rhiza/pkg/recovery"
 	"github.com/mrchypark/rhiza/pkg/recoveryanchor"
+	"github.com/thanos-io/objstore"
 	"gopkg.in/yaml.v3"
 )
+
+type anchorRestoreFaultBucket struct {
+	objstore.Bucket
+	uploadErr   error
+	getErrAt    int
+	getErr      error
+	closeErrAt  int
+	closeErr    error
+	uploadCalls int
+	getCalls    int
+}
+
+type anchorRestoreCloseErrorReader struct {
+	io.ReadCloser
+	err error
+}
+
+func (r anchorRestoreCloseErrorReader) Close() error {
+	return errors.Join(r.ReadCloser.Close(), r.err)
+}
+
+func (b *anchorRestoreFaultBucket) Upload(ctx context.Context, key string, reader io.Reader, options ...objstore.ObjectUploadOption) error {
+	b.uploadCalls++
+	if b.uploadErr != nil {
+		return b.uploadErr
+	}
+	return b.Bucket.Upload(ctx, key, reader, options...)
+}
+
+func (b *anchorRestoreFaultBucket) Get(ctx context.Context, key string) (io.ReadCloser, error) {
+	b.getCalls++
+	if b.getErr != nil && b.getCalls == b.getErrAt {
+		return nil, b.getErr
+	}
+	reader, err := b.Bucket.Get(ctx, key)
+	if err == nil && b.closeErr != nil && b.getCalls == b.closeErrAt {
+		reader = anchorRestoreCloseErrorReader{ReadCloser: reader, err: b.closeErr}
+	}
+	return reader, err
+}
 
 func TestRunCapturesDiagnosticsBeforeDeleteAndPreservesPrimaryFailure(t *testing.T) {
 	result := runDiagnosticTrapFixture(t, 1, true, false, false)
@@ -106,7 +151,9 @@ func runDiagnosticTrapFixture(t *testing.T, createExit int, diagnosticsFail, blo
 		}
 		return path
 	}
-	writeExecutable("docker", "printf '%s\\n' sha256:"+strings.Repeat("a", 64)+" sha256:"+strings.Repeat("b", 64))
+	writeExecutable("git", `test "$*" = 'rev-parse HEAD' || exit 2
+printf '%s\\n' `+strings.Repeat("a", 40))
+	writeExecutable("docker", "printf '%s\\n' sha256:"+strings.Repeat("a", 64)+" sha256:"+strings.Repeat("b", 64)+" sha256:"+strings.Repeat("c", 64))
 	diagnosticsExit := "0"
 	if diagnosticsFail {
 		diagnosticsExit = "23"
@@ -207,7 +254,7 @@ func TestWorkflowExcludesRawKindArtifacts(t *testing.T) {
 	if err := yaml.Unmarshal(data, &workflow); err != nil {
 		t.Fatal(err)
 	}
-	for job, root := range map[string]string{"operator-chaos": "operator-chaos-results", "automatic-operator-chaos": "automatic-chaos-results", "anchor-operator-chaos": "anchor-chaos-results"} {
+	for job, root := range map[string]string{"operator-chaos": "operator-chaos-results", "automatic-operator-chaos": "automatic-chaos-results"} {
 		found := false
 		for _, step := range workflow.Jobs[job].Steps {
 			if strings.HasPrefix(step.Uses, "actions/upload-artifact@") && strings.TrimSpace(step.With.Path) == root+"\n!"+root+"/kind/**" {
@@ -217,6 +264,15 @@ func TestWorkflowExcludesRawKindArtifacts(t *testing.T) {
 		if !found {
 			t.Fatalf("%s upload must exclude the entire raw Kind subtree", job)
 		}
+	}
+	anchorFound := false
+	for _, step := range workflow.Jobs["anchor-operator-chaos"].Steps {
+		if strings.HasPrefix(step.Uses, "actions/upload-artifact@") && strings.TrimSpace(step.With.Path) == "anchor-chaos-results" {
+			anchorFound = true
+		}
+	}
+	if !anchorFound {
+		t.Fatal("anchor job must upload only its bounded evidence summary")
 	}
 }
 
@@ -274,6 +330,172 @@ func TestImmutableImageResolutionDescriptors(t *testing.T) {
 	}
 }
 
+func TestPreRuntimeApplicationStatusesAcceptOnlyPodInitializing(t *testing.T) {
+	valid := obj{"name": "rhiza", "ready": false, "restartCount": float64(0), "state": obj{"waiting": obj{"reason": "PodInitializing"}}}
+	if !preRuntimeApplicationStatusesSafe([]any{valid}) {
+		t.Fatal("normal kubelet PodInitializing application status was rejected while init runs")
+	}
+	if !preRuntimeApplicationStatusesSafe(nil) {
+		t.Fatal("absent application status should remain admissible before kubelet publishes it")
+	}
+	for name, status := range map[string]obj{
+		"running":              {"name": "rhiza", "ready": false, "restartCount": float64(0), "state": obj{"running": obj{}}},
+		"terminated":           {"name": "rhiza", "ready": false, "restartCount": float64(0), "state": obj{"terminated": obj{}}},
+		"restarted":            {"name": "rhiza", "ready": false, "restartCount": float64(1), "state": obj{"waiting": obj{"reason": "PodInitializing"}}},
+		"unexpected-container": {"name": "unexpected", "ready": false, "restartCount": float64(0), "state": obj{"waiting": obj{"reason": "PodInitializing"}}},
+		"other-wait":           {"name": "rhiza", "ready": false, "restartCount": float64(0), "state": obj{"waiting": obj{"reason": "ImagePullBackOff"}}},
+		"prior-state":          {"name": "rhiza", "ready": false, "restartCount": float64(0), "lastState": obj{"terminated": obj{}}, "state": obj{"waiting": obj{"reason": "PodInitializing"}}},
+	} {
+		t.Run(name, func(t *testing.T) {
+			if preRuntimeApplicationStatusesSafe([]any{status}) {
+				t.Fatal("unsafe application status accepted")
+			}
+		})
+	}
+	if preRuntimeApplicationStatusesSafe([]any{valid, valid}) {
+		t.Fatal("unexpected additional application container accepted")
+	}
+}
+
+func TestOnlineFenceSelectionIgnoresUnrelatedHistory(t *testing.T) {
+	target := operator.FenceTarget{NodeID: "rhiza-2", Pod: "rhiza-2", PodUID: "pod-old", WALIdentity: "wal-old"}
+	makeFence := func(operation string, targets []operator.FenceTarget) obj {
+		request := operator.FenceRequest{LogicalID: "fencing-e2e", BindingUID: "root-uid", Namespace: namespace, StatefulSet: "rhiza", StatefulSetUID: "sts-uid", SourceClusterID: "chaos-source", OperationID: operation, Scope: operator.ScopeVoter, Targets: targets}
+		return obj{"spec": request, "status": obj{"proof": obj{}}}
+	}
+	unrelated := makeFence("earlier", []operator.FenceTarget{{NodeID: "rhiza-2", Pod: "rhiza-2", PodUID: "older-uid", WALIdentity: "older-wal"}})
+	intended := makeFence("current", []operator.FenceTarget{target})
+	for _, items := range [][]obj{{unrelated, intended}, {intended, unrelated}} {
+		selected := 0
+		for _, item := range items {
+			if isIntendedOnlineVoterFence(item, "sts-uid", "root-uid", target) {
+				selected++
+			}
+		}
+		if selected != 1 {
+			t.Fatalf("selected %d exact target proofs from mixed history, want 1", selected)
+		}
+	}
+	if isIntendedOnlineVoterFence(unrelated, "sts-uid", "root-uid", target) {
+		t.Fatal("unrelated historical exact-scope proof selected for current target")
+	}
+}
+
+func TestOnlineRepairRequiresRetainedAcceptedCompletion(t *testing.T) {
+	record, old := completedOnlineRepairFixture(t)
+	if !membershipRepairCompletionAccepted(record, "online-op", "sts-uid", "root-uid", old) {
+		t.Fatal("exact retained ADD completion was rejected")
+	}
+	mutations := map[string]func(*fencing.MembershipRepairRecord){
+		"not complete":              func(r *fencing.MembershipRepairRecord) { r.Progress.Stage = fencing.MembershipRepairAdded },
+		"missing accepted response": func(r *fencing.MembershipRepairRecord) { r.Progress.Completion.Accepted = nil },
+		"wrong accepted request digest": func(r *fencing.MembershipRepairRecord) {
+			r.Progress.Completion.Accepted.RequestDigest = strings.Repeat("0", 64)
+		},
+		"wrong completion phase": func(r *fencing.MembershipRepairRecord) {
+			r.Progress.Completion.Request.PhaseHash = strings.Repeat("0", 64)
+		},
+		"wrong ADD result": func(r *fencing.MembershipRepairRecord) { r.Progress.Results[0].Outcome = "pending" },
+	}
+	for name, mutate := range mutations {
+		t.Run(name, func(t *testing.T) {
+			bad := record
+			bad.Progress = record.Progress
+			bad.Progress.Phases = append([]fencing.MembershipRepairPhase(nil), record.Progress.Phases...)
+			bad.Progress.Candidates = append([]fencing.MembershipRepairCandidate(nil), record.Progress.Candidates...)
+			bad.Progress.Results = append([]fencing.MembershipRepairPhaseResult(nil), record.Progress.Results...)
+			completion := *record.Progress.Completion
+			request := completion.Request
+			response := *completion.Accepted
+			completion.Request, completion.Accepted = request, &response
+			bad.Progress.Completion = &completion
+			mutate(&bad)
+			if membershipRepairCompletionAccepted(bad, "online-op", "sts-uid", "root-uid", old) {
+				t.Fatal("incomplete or mismatched authority completion accepted")
+			}
+		})
+	}
+}
+
+func TestRetainedOnlineRepairCompletionRequiresPinnedLedgerUID(t *testing.T) {
+	record, old := completedOnlineRepairFixture(t)
+	encodeLedger := func(t *testing.T, record fencing.MembershipRepairRecord) string {
+		t.Helper()
+		ledger := fencing.Ledger{SourceClusterID: oldSourceClusterID, MembershipRepairHistory: map[string]fencing.MembershipRepairRecord{record.Authorization.OperationID: record}}
+		data, err := json.Marshal(fenceLedgerState{StatefulSetUID: "sts-uid", Ledger: ledger})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return string(data)
+	}
+	item := func(uid string, record fencing.MembershipRepairRecord) any {
+		return obj{"metadata": obj{"uid": uid}, "data": obj{"ledger.json": encodeLedger(t, record)}}
+	}
+
+	staleCopy := item("replacement-ledger-uid", record)
+	pending := record
+	pending.Progress.Stage = fencing.MembershipRepairAdded
+	realPending := item(record.Authorization.LedgerUID, pending)
+	if retainedOnlineRepairCompletionFromMaps(obj{"items": []any{staleCopy, realPending}}, "online-op", "sts-uid", "root-uid", old) {
+		t.Fatal("stale copied completion or correct-UID pending record authorized completion")
+	}
+	if !retainedOnlineRepairCompletionFromMaps(obj{"items": []any{staleCopy, item(record.Authorization.LedgerUID, record)}}, "online-op", "sts-uid", "root-uid", old) {
+		t.Fatal("correctly UID-bound retained completion was rejected beside a stale copy")
+	}
+}
+
+func TestOnlineRepairQualificationWaitsForAuthorityCompletion(t *testing.T) {
+	child := operator.Resource{Status: operator.Status{Phase: "Complete", Membership: &operator.MembershipStatus{Phase: "Complete"}}}
+	if onlineRepairQualificationReady(child, false) {
+		t.Fatal("matching voter/child completion authorized qualification without retained authority acceptance")
+	}
+	if !onlineRepairQualificationReady(child, true) {
+		t.Fatal("qualification did not proceed after exact retained authority completion")
+	}
+	child.Status.Membership.Phase = "Added"
+	if onlineRepairQualificationReady(child, true) {
+		t.Fatal("authority acceptance bypassed an incomplete operator membership status")
+	}
+}
+
+func completedOnlineRepairFixture(t *testing.T) (fencing.MembershipRepairRecord, operator.FenceTarget) {
+	t.Helper()
+	old := operator.FenceTarget{NodeID: "rhiza-2", Pod: "rhiza-2", PodUID: "old-pod", WALIdentity: "old-wal"}
+	oldIdentity := fencing.Identity{SourceClusterID: "chaos-source", NodeID: old.NodeID, PodUID: old.PodUID, RunID: "old-run", WALIdentity: old.WALIdentity}
+	oldMember := quepaxa.Member{ID: quepaxa.NodeID(old.NodeID), URL: "http://rhiza-2", PeerURL: "http://rhiza-2:9090", LogURL: "http://rhiza-2/log", PublicKey: quepaxa.PublicKey(sha256.Sum256([]byte("old-key"))), WALIdentity: old.WALIdentity}
+	otherMember := quepaxa.Member{ID: "rhiza-0", URL: "http://rhiza-0", PeerURL: "http://rhiza-0:9090", LogURL: "http://rhiza-0/log", PublicKey: quepaxa.PublicKey(sha256.Sum256([]byte("other-key"))), WALIdentity: "other-wal"}
+	baseMembers := []quepaxa.Member{oldMember, otherMember}
+	baseHash := fmt.Sprintf("%x", sha256.Sum256(encoded(baseMembers)))
+	abort := quepaxa.Slot(8)
+	auth := fencing.MembershipRepairAuthorization{OperationID: "online-op", RequestHash: strings.Repeat("a", 64), AuthorizationHash: strings.Repeat("b", 64), RootUID: "root-uid", StatefulSetUID: "sts-uid", LedgerUID: "ledger-uid", SourceClusterID: "chaos-source", MembershipHash: baseHash, ExpectedAbortSlot: &abort, OldIdentity: oldIdentity, Membership: quepaxa.Cluster{ConfigID: 1, Members: baseMembers}}
+	if err := auth.Validate(); err != nil {
+		t.Fatalf("test authorization invalid: %v", err)
+	}
+	newID, err := fencing.ReplacementNodeID("new-pod")
+	if err != nil {
+		t.Fatal(err)
+	}
+	newMember := quepaxa.Member{ID: quepaxa.NodeID(newID), URL: "http://rhiza-2", PeerURL: "http://rhiza-2:9090", LogURL: "http://rhiza-2/log", PublicKey: quepaxa.PublicKey(sha256.Sum256([]byte("new-key"))), WALIdentity: strings.Repeat("4", 64)}
+	assignment := fencing.BootstrapAssignment{OperationID: "init-op", RequestHash: strings.Repeat("c", 64), AuthorizationHash: strings.Repeat("d", 64), Purpose: fencing.BootstrapLearner, RootUID: "root-uid", StatefulSetUID: "sts-uid", SourceClusterID: "chaos-source", PodName: old.Pod, PodUID: "new-pod", NodeID: newID, CredentialName: "candidate-credentials", CredentialUID: "candidate-secret-uid", MembershipHash: strings.Repeat("e", 64), ProfileHash: strings.Repeat("f", 64), LedgerUID: "ledger-uid"}
+	phaseChange := network.MembershipChange{OperationID: "online-op:add", ClusterID: "chaos-source", ExpectedConfigID: 2, ExpectedAbortSlot: abort, Add: &newMember}
+	changeHash := fmt.Sprintf("%x", sha256.Sum256(encoded(phaseChange)))
+	phase := fencing.MembershipRepairPhase{Kind: fencing.MembershipRepairAdd, CandidatePodUID: assignment.PodUID, Change: phaseChange, AbortSlot: &abort}
+	phase.Hash, err = fencing.MembershipRepairPhaseHash(phase)
+	if err != nil {
+		t.Fatal(err)
+	}
+	target := quepaxa.Cluster{ConfigID: 3, Members: []quepaxa.Member{otherMember, newMember}}
+	result := fencing.MembershipRepairPhaseResult{PhaseHash: phase.Hash, JournalOperationID: phaseChange.OperationID, JournalRequestHash: changeHash, Target: target, FreezeSlot: 10, FreezeHash: strings.Repeat("1", 64), TerminalSlot: 12, TerminalHash: strings.Repeat("2", 64), Outcome: "completed"}
+	request := network.MembershipRepairCompletionRequest{Version: 1, Action: network.MembershipRepairCompletionAction, Challenge: strings.Repeat("3", 64), AttemptRevision: 9, RepairOperationID: auth.OperationID, RepairBindingDigest: fencing.MembershipRepairAuthorizationHash(auth), PhaseHash: phase.Hash, JournalOperationID: phaseChange.OperationID, JournalRequestHash: changeHash, SourceClusterID: "chaos-source", SourceConfigID: 2, AbortSlot: &abort, FreezeSlot: result.FreezeSlot, FreezeHash: result.FreezeHash, TerminalSlot: result.TerminalSlot, TerminalHash: result.TerminalHash, Target: target, CandidatePodUID: assignment.PodUID, CandidateMember: newMember, CandidateBindRef: fencing.BootstrapAssignmentDigest(assignment), ExecutorNodeID: "rhiza-0", ExecutorPodUID: "other-pod", ExecutorRunID: "executor-run", ExecutorWALIdentity: strings.Repeat("5", 64)}
+	request.ScopeDigest = fencing.MembershipRepairCompletionScopeDigest(request)
+	digest, err := network.MembershipRepairCompletionRequestDigest(request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	accepted := &network.MembershipRepairCompletionResponse{Version: request.Version, Action: request.Action, Challenge: request.Challenge, AttemptRevision: request.AttemptRevision, ScopeDigest: request.ScopeDigest, RequestDigest: digest, ExecutorNodeID: request.ExecutorNodeID, ExecutorPodUID: request.ExecutorPodUID, ExecutorRunID: request.ExecutorRunID, ExecutorWALIdentity: request.ExecutorWALIdentity, TerminalSlot: request.TerminalSlot, TerminalHash: request.TerminalHash, Outcome: "completed", MAC: "authority-signed"}
+	return fencing.MembershipRepairRecord{Authorization: auth, Progress: fencing.MembershipRepairProgress{Stage: fencing.MembershipRepairComplete, Phases: []fencing.MembershipRepairPhase{phase}, Candidates: []fencing.MembershipRepairCandidate{{Assignment: assignment, Member: &newMember}}, Results: []fencing.MembershipRepairPhaseResult{result}, Completion: &fencing.MembershipRepairCompletion{Request: request, Accepted: accepted}}}, old
+}
+
 func TestFixtureHoldsWritersUntilSupervisorAndStoreReady(t *testing.T) {
 	items := manifests()["items"].([]obj)
 	var sts, job, operator bool
@@ -311,12 +533,15 @@ func TestFixtureHoldsWritersUntilSupervisorAndStoreReady(t *testing.T) {
 
 func TestFixtureUsesRealRecoveryAnchorServiceAndApprovedDRGate(t *testing.T) {
 	items := manifests()["items"].([]obj)
-	var anchorConfig, anchorDeployment, anchorService, operator, binding obj
+	var anchorConfig, anchorClientConfig, anchorDeployment, anchorService, operator, binding obj
 	for _, item := range items {
 		switch nested(item, "kind") {
 		case "ConfigMap":
-			if nested(item, "metadata", "name") == recoveryAnchorConfigMap {
+			switch nested(item, "metadata", "name") {
+			case recoveryAnchorConfigMap:
 				anchorConfig = item
+			case "rhiza-recovery-anchor":
+				anchorClientConfig = item
 			}
 		case "Deployment":
 			switch nested(item, "metadata", "name") {
@@ -333,7 +558,7 @@ func TestFixtureUsesRealRecoveryAnchorServiceAndApprovedDRGate(t *testing.T) {
 			binding = item
 		}
 	}
-	if anchorConfig == nil || anchorDeployment == nil || anchorService == nil || operator == nil || binding == nil {
+	if anchorConfig == nil || anchorClientConfig == nil || anchorDeployment == nil || anchorService == nil || operator == nil || binding == nil {
 		t.Fatal("fixture omitted a real anchor resource or the anchored workload binding")
 	}
 	var initial recoveryanchor.Record
@@ -345,20 +570,339 @@ func TestFixtureUsesRealRecoveryAnchorServiceAndApprovedDRGate(t *testing.T) {
 	if nested(container, "image") != "rhiza-anchor-service:local" || nested(container, "command") == nil || len(ports) != 1 || fmt.Sprint(nested(ports[0], "port")) != "9191" {
 		t.Fatal("fixture does not run the actual anchor-service image behind the TLS service")
 	}
-	var anchorURL, tokenPath, caPath string
-	for _, env := range nested(operator, "spec", "template", "spec", "containers").([]obj)[0]["env"].([]obj) {
-		switch nested(env, "name") {
-		case "RHIZA_RECOVERY_ANCHOR_URL":
-			anchorURL = text(nested(env, "value"))
-		case "RHIZA_RECOVERY_ANCHOR_TOKEN_FILE":
-			tokenPath = text(nested(env, "value"))
-		case "RHIZA_RECOVERY_ANCHOR_CA_FILE":
-			caPath = text(nested(env, "value"))
+	clientData := nested(anchorClientConfig, "data")
+	if nested(clientData, "RHIZA_RECOVERY_ANCHOR_URL") != "https://anchor-service."+namespace+".svc:9191" ||
+		nested(clientData, "RHIZA_RECOVERY_ANCHOR_TOKEN_FILE") != "/var/run/secrets/rhiza-recovery-anchor-token/token" ||
+		nested(clientData, "RHIZA_RECOVERY_ANCHOR_CA_FILE") != "/var/run/secrets/rhiza-recovery-anchor-ca/ca.crt" ||
+		nested(clientData, "RHIZA_RECOVERY_ANCHOR_BINDING_POLICY") != "derived" ||
+		nested(clientData, "RHIZA_RECOVERY_ANCHOR_STORAGE_ID") != nil || nested(binding, "spec", "anchorID") != recoveryAnchorID {
+		t.Fatal("shared client config does not select derived binding with trusted URL and read-only credential paths")
+	}
+	for _, workload := range []struct {
+		name       string
+		deployment obj
+	}{{name: "operator", deployment: operator}, {name: "anchor service", deployment: anchorDeployment}} {
+		container := nested(workload.deployment, "spec", "template", "spec", "containers").([]obj)[0]
+		sources := map[string]bool{}
+		for _, source := range nested(container, "envFrom").([]obj) {
+			for _, ref := range []string{"configMapRef", "secretRef"} {
+				if name := text(nested(source, ref, "name")); name != "" {
+					sources[name] = true
+				}
+			}
+		}
+		for _, name := range []string{"rhiza-config", "rhiza-object-store", "rhiza-recovery-anchor"} {
+			if !sources[name] {
+				t.Fatalf("%s does not consume effective store and shared anchor config %s", workload.name, name)
+			}
 		}
 	}
-	if anchorURL != "https://anchor-service."+namespace+".svc:9191" || tokenPath == "" || caPath == "" || nested(binding, "spec", "anchorID") != recoveryAnchorID {
-		t.Fatal("operator/workload are not configured to use the real anchor authority")
+}
+
+func TestFixtureAnchorBindingMatchesEffectiveStoreAndRejectsReceiptGuess(t *testing.T) {
+	items := manifests()["items"].([]obj)
+	resources := map[string]obj{}
+	for _, item := range items {
+		resources[text(nested(item, "metadata", "name"))] = item
 	}
+	bindingConfig := e2eRecoveryAnchorStorageBindingConfig()
+	rootStoreConfig := nested(resources["rhiza-config"], "data")
+	storeCredentials := nested(resources["rhiza-object-store"], "stringData")
+	for key, want := range map[string]string{
+		"RHIZA_OBJSTORE_PROVIDER": bindingConfig.Provider,
+		"RHIZA_OBJSTORE_PREFIX":   bindingConfig.Prefix,
+		"RHIZA_OBJSTORE_ENDPOINT": bindingConfig.Endpoint,
+		"RHIZA_OBJSTORE_BUCKET":   bindingConfig.Bucket,
+	} {
+		actual := nested(rootStoreConfig, key)
+		if key == "RHIZA_OBJSTORE_ENDPOINT" || key == "RHIZA_OBJSTORE_BUCKET" {
+			actual = nested(storeCredentials, key)
+		}
+		if actual != want {
+			t.Fatalf("effective store setting %s=%v, want binding input %q", key, actual, want)
+		}
+	}
+	if nested(rootStoreConfig, "RHIZA_RECOVERY_ANCHOR_BINDING_POLICY") != nil {
+		t.Fatal("anchor-only policy leaked into the application-wide object-store ConfigMap")
+	}
+	var anchorClientConfig obj
+	for _, item := range items {
+		if nested(item, "kind") == "ConfigMap" && nested(item, "metadata", "name") == "rhiza-recovery-anchor" {
+			anchorClientConfig = item
+		}
+	}
+	if anchorClientConfig == nil || nested(anchorClientConfig, "data", "RHIZA_RECOVERY_ANCHOR_BINDING_POLICY") != string(bindingConfig.Policy) {
+		t.Fatal("shared anchor ConfigMap lacks the explicit derived policy")
+	}
+	source, err := expectedRecoveryAnchorBinding("chaos-source")
+	if err != nil || initialRecoveryAnchorRecord().Binding != source {
+		t.Fatalf("initial source record was not derived from effective store config: got=%+v want=%+v err=%v", initialRecoveryAnchorRecord().Binding, source, err)
+	}
+	target, err := expectedRecoveryAnchorBinding("target-cluster")
+	if err != nil {
+		t.Fatal(err)
+	}
+	request := recoveryanchor.Request{TargetClusterID: "target-cluster"}
+	receipt := recoveryanchor.Receipt{Target: target}
+	if err := validateRecoveryAnchorTargetBinding(request, receipt); err != nil {
+		t.Fatalf("independently computed exact target binding rejected: %v", err)
+	}
+	receipt.Target.StorageID = strings.Repeat("0", 64)
+	if err := validateRecoveryAnchorTargetBinding(request, receipt); err == nil {
+		t.Fatal("receipt-provided storage binding was accepted instead of independently computed expectation")
+	}
+}
+
+func TestFencingRunnerPreparesSharedAnchorInputsBeforeFencer(t *testing.T) {
+	script, err := os.ReadFile("run.sh")
+	if err != nil {
+		t.Fatal(err)
+	}
+	source := string(script)
+	manifests := strings.Index(source, `"$FENCING_E2E_BIN" manifests >"$fencing_tmp/manifests.json"`)
+	fencer := strings.Index(source, `k apply -f "$fencing_tmp/authority.yaml"`)
+	if manifests < 0 || fencer < 0 || manifests >= fencer {
+		t.Fatal("shared anchor and effective-store ConfigMaps must be created before the fencer Deployment")
+	}
+	for _, required := range []string{
+		`k create secret generic rhiza-recovery-anchor-token --from-literal=token=anchor-test-token`,
+		`k create configmap rhiza-recovery-anchor-ca --from-file="ca.crt=$fencing_tmp/anchor-tls.crt"`,
+	} {
+		index := strings.Index(source, required)
+		if index < 0 || index >= manifests {
+			t.Fatalf("runner does not provision shared anchor input before applying manifests: %s", required)
+		}
+	}
+}
+
+func TestStorageBindingConfigRequiresExplicitDerivedOrOpaquePolicy(t *testing.T) {
+	tests := []struct {
+		name    string
+		config  recoveryanchor.StorageBindingConfig
+		cluster string
+		wantID  string
+		wantErr bool
+	}{
+		{name: "derived from effective location", config: e2eRecoveryAnchorStorageBindingConfig(), cluster: "target-a"},
+		{name: "explicit opaque mapping", config: recoveryanchor.StorageBindingConfig{Policy: recoveryanchor.StorageBindingOpaque, OpaqueStorageID: "independent-target-store"}, cluster: "target-a", wantID: "independent-target-store"},
+		{name: "missing policy", config: recoveryanchor.StorageBindingConfig{Provider: "s3", Endpoint: "rhiza-minio:9000", Bucket: "rhiza", Prefix: "rhiza"}, cluster: "target-a", wantErr: true},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			binding, err := test.config.ExpectedBinding(test.cluster)
+			if test.wantErr {
+				if err == nil {
+					t.Fatal("binding config without an explicit supported policy was accepted")
+				}
+				return
+			}
+			if err != nil || binding.ClusterID != test.cluster || test.wantID != "" && binding.StorageID != test.wantID || binding.StorageID == "" {
+				t.Fatalf("expected binding=%+v err=%v", binding, err)
+			}
+		})
+	}
+}
+
+func TestAnchorRecoveryGateBindsExactRetainedIdentity(t *testing.T) {
+	child := obj{
+		"metadata": obj{"name": "recovery-name", "uid": "recovery-uid"},
+		"spec":     obj{"recoveryID": "recovery-name", "sourceClusterID": "chaos-source", "anchorID": recoveryAnchorID},
+		"status":   obj{"recoveryID": "recovery-name", "target": "target-cluster"},
+	}
+	operationID, target, err := exactAnchorRecoveryIdentity(child)
+	if err != nil || operationID != "recovery-uid:recovery-name" || target != "target-cluster" {
+		t.Fatalf("exact retained recovery identity=%q/%q err=%v", operationID, target, err)
+	}
+	for name, mutate := range map[string]func(obj){
+		"wrong target path":          func(v obj) { v["status"].(obj)["target"] = "../other" },
+		"wrong source":               func(v obj) { v["spec"].(obj)["sourceClusterID"] = "other" },
+		"wrong anchor":               func(v obj) { v["spec"].(obj)["anchorID"] = "other" },
+		"wrong retained recovery ID": func(v obj) { v["status"].(obj)["recoveryID"] = "other" },
+	} {
+		t.Run(name, func(t *testing.T) {
+			bad := jsonCloneObject(t, child)
+			mutate(bad)
+			if _, _, err := exactAnchorRecoveryIdentity(bad); err == nil {
+				t.Fatal("mismatched recovery identity accepted")
+			}
+		})
+	}
+	otherUID := jsonCloneObject(t, child)
+	otherUID["metadata"].(obj)["uid"] = "other-uid"
+	otherOperation, otherTarget, err := exactAnchorRecoveryIdentity(otherUID)
+	if err != nil || otherOperation == operationID || otherTarget != target {
+		t.Fatalf("new child incarnation was not distinguished in retained identity: %q/%q err=%v", otherOperation, otherTarget, err)
+	}
+}
+
+func TestRestoreCorruptedAnchorPreservesCleanupErrorsAndDoesNotOverwriteNewState(t *testing.T) {
+	const key = "rhiza/target/generation-anchor"
+	ctx := context.Background()
+	saved := []byte("exact saved generation anchor")
+	corrupt := []byte("CORRUPTED")
+	newer := []byte("a newer generation's artifact")
+	newBucket := func() *objmetrics.MeteredBucket {
+		t.Helper()
+		bucket, err := objmetrics.NewBucket(objmetrics.Config{Provider: objmetrics.ProviderFilesystem, FilesystemDir: t.TempDir()})
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { _ = bucket.Close() })
+		return bucket
+	}
+	seed := func(t *testing.T, bucket *objmetrics.MeteredBucket, value []byte) {
+		t.Helper()
+		if err := bucket.Upload(ctx, key, bytes.NewReader(value)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	read := func(t *testing.T, bucket *objmetrics.MeteredBucket) []byte {
+		t.Helper()
+		data, err := readAnchorObject(ctx, bucket, key, 1<<20)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return data
+	}
+
+	t.Run("successful conditional restore verifies exact bytes", func(t *testing.T) {
+		bucket := newBucket()
+		seed(t, bucket, corrupt)
+		if err := restoreExactCorruptedAnchor(ctx, bucket, key, corrupt, saved); err != nil {
+			t.Fatal(err)
+		}
+		if got := read(t, bucket); !bytes.Equal(got, saved) {
+			t.Fatalf("restored bytes=%q, want exact saved bytes %q", got, saved)
+		}
+	})
+
+	t.Run("upload failure is joined with primary failure and restoration was attempted", func(t *testing.T) {
+		bucket := newBucket()
+		seed(t, bucket, corrupt)
+		uploadErr := errors.New("injected conditional restore upload failure")
+		faulty := &anchorRestoreFaultBucket{Bucket: bucket, uploadErr: uploadErr}
+		primaryErr := errors.New("injected primary gate failure")
+		restoreErr := restoreExactCorruptedAnchor(ctx, faulty, key, corrupt, saved)
+		joined := joinAnchorRestoreError(primaryErr, restoreErr)
+		if !errors.Is(joined, primaryErr) || !errors.Is(joined, uploadErr) || faulty.uploadCalls != 1 {
+			t.Fatalf("primary/restore errors or attempt lost: joined=%v uploadCalls=%d", joined, faulty.uploadCalls)
+		}
+		if got := read(t, bucket); !bytes.Equal(got, corrupt) {
+			t.Fatalf("failed restore changed target unexpectedly: %q", got)
+		}
+	})
+
+	t.Run("readback close failure is joined while restore remains verified by bytes", func(t *testing.T) {
+		bucket := newBucket()
+		seed(t, bucket, corrupt)
+		closeErr := errors.New("injected restored-anchor reader close failure")
+		faulty := &anchorRestoreFaultBucket{Bucket: bucket, closeErrAt: 2, closeErr: closeErr}
+		primaryErr := errors.New("injected primary gate failure")
+		restoreErr := restoreExactCorruptedAnchor(ctx, faulty, key, corrupt, saved)
+		joined := joinAnchorRestoreError(primaryErr, restoreErr)
+		if !errors.Is(joined, primaryErr) || !errors.Is(joined, closeErr) || faulty.uploadCalls != 1 {
+			t.Fatalf("primary/close errors or restoration attempt lost: joined=%v uploadCalls=%d", joined, faulty.uploadCalls)
+		}
+		if got := read(t, bucket); !bytes.Equal(got, saved) {
+			t.Fatalf("restore bytes changed despite close reporting: %q", got)
+		}
+	})
+
+	t.Run("newer artifact is never overwritten", func(t *testing.T) {
+		bucket := newBucket()
+		seed(t, bucket, newer)
+		faulty := &anchorRestoreFaultBucket{Bucket: bucket}
+		if err := restoreExactCorruptedAnchor(ctx, faulty, key, corrupt, saved); err == nil {
+			t.Fatal("restore accepted an artifact that no longer matches the injected corruption")
+		}
+		if faulty.uploadCalls != 0 {
+			t.Fatalf("restore wrote over newer target state: uploads=%d", faulty.uploadCalls)
+		}
+		if got := read(t, bucket); !bytes.Equal(got, newer) {
+			t.Fatalf("newer target artifact changed: %q", got)
+		}
+	})
+}
+
+func TestAnchorChaosJobConsumesCooperativeRuntimeEvidence(t *testing.T) {
+	workflow, err := os.ReadFile(filepath.Join("..", "..", ".github", "workflows", "ci.yml"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	text := string(workflow)
+	start := strings.Index(text, "  anchor-operator-chaos:")
+	if start < 0 {
+		t.Fatal("anchor job block not found")
+	}
+	end := strings.Index(text[start+1:], "\n  publish-chaos-image:")
+	if end < 0 {
+		t.Fatal("anchor job block terminator not found")
+	}
+	job := text[start : start+1+end]
+	for _, required := range []string{
+		"needs: cooperative-fencing",
+		"actions/download-artifact@v4",
+		"cooperative-fencing-${{ github.run_id }}",
+		"sha256sum --check cooperative-fencing-results/public/SHA256SUMS",
+		"test \"$(cat cooperative-fencing-results/public/source-head.txt)\" = \"$GITHUB_SHA\"",
+		"verify-anchor-gate-evidence cooperative-fencing-results/public/events.jsonl cooperative-fencing-results/public/dr-qualification.json cooperative-fencing-results/public/source-head.txt \"$GITHUB_SHA\"",
+		"Reject optional publication until the published host has exact-runtime qualification",
+		"name: Build the qualification host for the optional publication flow\n        if: env.PUBLISH_CHAOS_IMAGE == 'true'",
+		"exit 1",
+	} {
+		if !strings.Contains(job, required) {
+			t.Fatalf("anchor job does not consume cooperative runtime evidence: missing %q", required)
+		}
+	}
+	if strings.Contains(job, "anchor_recovery.py") || strings.Contains(job, "kind create cluster") {
+		t.Fatal("anchor job still duplicates the runtime scenario or uses the parked Python gate")
+	}
+}
+
+func TestReadQualifiedGenerationAnchorRequiresExactTargetAndOperation(t *testing.T) {
+	bucket, err := objmetrics.NewBucket(objmetrics.Config{Provider: objmetrics.ProviderFilesystem, FilesystemDir: t.TempDir()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer bucket.Close()
+	anchor := recovery.GenerationAnchor{
+		Version: 1, OperationID: "recovery-uid:recovery-name", SourcePrefix: "rhiza/chaos-source",
+		TargetPrefix: "rhiza/target-cluster", SourceTip: 1,
+		SourceManifest: strings.Repeat("a", 64), SourcePrefixHash: strings.Repeat("b", 64), SourceBootstrap: strings.Repeat("c", 64),
+		TargetMembership: recovery.NewMembershipRecord("target-cluster", []quepaxa.Member{{ID: "n1", PublicKey: quepaxa.PublicKey{1}}}, "before-ack"),
+		Checkpoint:       recovery.GenerationCheckpoint{Index: 1, RootHash: strings.Repeat("d", 64), StateHash: strings.Repeat("e", 64)},
+	}
+	data, err := json.Marshal(anchor)
+	if err != nil {
+		t.Fatal(err)
+	}
+	key := recovery.GenerationAnchorKey("rhiza/target-cluster")
+	if err := bucket.Upload(context.Background(), key, strings.NewReader(string(data))); err != nil {
+		t.Fatal(err)
+	}
+	got, err := readQualifiedGenerationAnchor(context.Background(), bucket, "target-cluster", anchor.OperationID)
+	if err != nil || !reflect.DeepEqual(got, data) {
+		t.Fatalf("exact target anchor bytes differ: %v", err)
+	}
+	if _, err := readQualifiedGenerationAnchor(context.Background(), bucket, "other-target", anchor.OperationID); err == nil {
+		t.Fatal("anchor at another target path accepted")
+	}
+	if _, err := readQualifiedGenerationAnchor(context.Background(), bucket, "target-cluster", "other-operation"); err == nil {
+		t.Fatal("anchor for another operation accepted")
+	}
+}
+
+func jsonCloneObject(t *testing.T, value obj) obj {
+	t.Helper()
+	data, err := json.Marshal(value)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var clone obj
+	if err := json.Unmarshal(data, &clone); err != nil {
+		t.Fatal(err)
+	}
+	return clone
 }
 
 func TestDRPodControllerBindingRequiresExactStatefulSetUID(t *testing.T) {

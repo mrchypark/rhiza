@@ -121,8 +121,15 @@ func TestDRSuccessorAssignmentUsesFreshTLSAnchorAdmissionAndConfiguredStorage(t 
 	ctx := context.Background()
 	ms := members()
 	targetMembership := recovery.NewMembershipRecord("target", ms, "before-ack")
-	sourceBinding := recoveryanchor.Binding{ClusterID: "source", StorageID: "source-store"}
-	targetBinding := recoveryanchor.Binding{ClusterID: "target", StorageID: "configured-target-store"}
+	bindingConfig := recoveryanchor.StorageBindingConfig{Policy: recoveryanchor.StorageBindingDerived, Provider: "s3", Endpoint: "https://objects.example", Bucket: "archive", Prefix: "root"}
+	sourceBinding, err := bindingConfig.ExpectedBinding("source")
+	if err != nil {
+		t.Fatal(err)
+	}
+	targetBinding, err := bindingConfig.ExpectedBinding("target")
+	if err != nil {
+		t.Fatal(err)
+	}
 	backend := &drAdmissionTestBackend{record: recoveryanchor.Record{Version: recoveryanchor.Version1, EvidenceFormat: "test/v1", Binding: sourceBinding, Evidence: []byte("source-evidence"), Generation: 4}, version: "1"}
 	coordinator := &recoveryanchor.Coordinator{Backend: backend, EvidenceFormat: "test/v1", Verifier: func(_ context.Context, _ recoveryanchor.Request, record recoveryanchor.Record) (recoveryanchor.Binding, []byte, error) {
 		return targetBinding, append([]byte(nil), record.Evidence...), nil
@@ -215,7 +222,7 @@ func TestDRSuccessorAssignmentUsesFreshTLSAnchorAdmissionAndConfiguredStorage(t 
 	if err := os.WriteFile(kubeToken, []byte("kube-token"), 0600); err != nil {
 		t.Fatal(err)
 	}
-	e := &FencingExecutor{Kube: &Kubernetes{BaseURL: kubeAPI.URL, Namespace: "default", TokenFile: kubeToken, Client: kubeAPI.Client()}, Anchor: anchorClient, AnchorStorageID: targetBinding.StorageID}
+	e := &FencingExecutor{Kube: &Kubernetes{BaseURL: kubeAPI.URL, Namespace: "default", TokenFile: kubeToken, Client: kubeAPI.Client()}, Anchor: anchorClient, AnchorBindingConfig: &bindingConfig}
 	authority := httptest.NewTLSServer(e.Handler())
 	defer authority.Close()
 	client := &fencing.AuthorityClient{URL: authority.URL + "/v1/supervisor", TokenFile: kubeToken, Client: authority.Client()}
@@ -308,11 +315,13 @@ func TestDRSuccessorAssignmentUsesFreshTLSAnchorAdmissionAndConfiguredStorage(t 
 	if err := e.bindRuntime(ctx, stsUID, runtime); err != nil {
 		t.Fatalf("DR runtime bind failed after fresh admission recheck: %v", err)
 	}
-	e.AnchorStorageID = "wrong-storage"
+	wrongBindingConfig := bindingConfig
+	wrongBindingConfig.Bucket = "other-archive"
+	e.AnchorBindingConfig = &wrongBindingConfig
 	if _, _, _, err := e.drSuccessorAssignment(ctx, stsUID, rootUID, id, operationID); err == nil {
-		t.Fatal("wrong configured target storage binding was accepted")
+		t.Fatal("receipt binding inconsistent with independently derived target storage was accepted")
 	}
-	e.AnchorStorageID = targetBinding.StorageID
+	e.AnchorBindingConfig = &bindingConfig
 	wrongUID := id
 	wrongUID.PodUID = "different-pod-uid"
 	if _, _, _, err := e.drSuccessorAssignment(ctx, stsUID, rootUID, wrongUID, operationID); err == nil {

@@ -262,8 +262,7 @@ func validateInitialGenesisConfig(config *types.ExecutionConfig, assignment fenc
 	if !config.EnableReconfiguration || len(config.Members) < 2 || config.Learner != nil {
 		return fmt.Errorf("initial genesis requires the authorized initial voter membership")
 	}
-	want := recovery.NewMembershipRecord(string(config.ClusterID), config.Members, string(config.ObjStoreDurability))
-	if assignment.MembershipHash != want.Membership {
+	if assignment.MembershipHash != fencing.BootstrapMembersHash(config.Members) {
 		return fmt.Errorf("initial genesis membership differs from its authority assignment")
 	}
 	configured, err := validateObjectStoreConfig(config)

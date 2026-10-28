@@ -21,6 +21,7 @@ import (
 	"github.com/mrchypark/rhiza/pkg/network"
 	"github.com/mrchypark/rhiza/pkg/quepaxa"
 	"github.com/mrchypark/rhiza/pkg/recovery"
+	"github.com/mrchypark/rhiza/pkg/recoveryanchor"
 	"github.com/thanos-io/objstore"
 )
 
@@ -47,8 +48,9 @@ type FencingExecutor struct {
 	// prefix and StoreIdentity digest. DR admission fails closed when either is
 	// absent; the target cluster component is checked against the authenticated
 	// Pod's source cluster and the retained assignment.
-	Anchor          AnchorClient
-	AnchorStorageID string
+	Anchor              AnchorClient
+	AnchorStorageID     string
+	AnchorBindingConfig *recoveryanchor.StorageBindingConfig
 }
 
 type fenceLedger struct {
@@ -57,7 +59,7 @@ type fenceLedger struct {
 }
 
 func (e *FencingExecutor) controller() *Controller {
-	return &Controller{Kube: e.Kube, Bucket: e.Bucket, Prefix: e.Prefix, StoreIdentity: e.StoreIdentity, Anchor: e.Anchor}
+	return &Controller{Kube: e.Kube, Bucket: e.Bucket, Prefix: e.Prefix, StoreIdentity: e.StoreIdentity, Anchor: e.Anchor, AnchorBindingConfig: e.AnchorBindingConfig}
 }
 
 func (e *FencingExecutor) ledgerPath(uid, source string) string {

@@ -109,20 +109,29 @@ func TestFencerBackendPreservesLegacyHTTPAndDefaultsToKubernetes(t *testing.T) {
 
 func TestRecoveryAnchorConfigurationIsAllOrNothing(t *testing.T) {
 	for _, test := range []struct {
-		name, endpoint, tokenFile, caFile, storageID string
-		configured, wantErr                          bool
+		name, endpoint, tokenFile, caFile, policy, storageID, provider, bucket string
+		configured, wantErr                                                    bool
 	}{
 		{name: "unconfigured remains legacy", configured: false},
-		{name: "complete without custom CA", endpoint: "https://anchor", tokenFile: "/token", storageID: "store", configured: true},
-		{name: "complete with custom CA", endpoint: "https://anchor", tokenFile: "/token", caFile: "/ca.pem", storageID: "store", configured: true},
+		{name: "complete opaque without custom CA", endpoint: "https://anchor", tokenFile: "/token", policy: "opaque", storageID: "store", configured: true},
+		{name: "complete opaque with custom CA", endpoint: "https://anchor", tokenFile: "/token", caFile: "/ca.pem", policy: "opaque", storageID: "store", configured: true},
+		{name: "derived from configured shared store", endpoint: "https://anchor", tokenFile: "/token", policy: "derived", provider: "s3", bucket: "archive", configured: true},
 		{name: "endpoint only", endpoint: "https://anchor", wantErr: true},
 		{name: "token only", tokenFile: "/token", wantErr: true},
 		{name: "CA only", caFile: "/ca.pem", wantErr: true},
-		{name: "storage ID only", storageID: "store", wantErr: true},
-		{name: "CA with incomplete mandatory fields", endpoint: "https://anchor", caFile: "/ca.pem", storageID: "store", wantErr: true},
+		{name: "policy only", policy: "derived", wantErr: true},
+		{name: "missing policy", endpoint: "https://anchor", tokenFile: "/token", storageID: "store", wantErr: true},
+		{name: "missing opaque ID", endpoint: "https://anchor", tokenFile: "/token", policy: "opaque", wantErr: true},
+		{name: "ambiguous derived and opaque", endpoint: "https://anchor", tokenFile: "/token", policy: "derived", storageID: "store", provider: "s3", bucket: "archive", wantErr: true},
+		{name: "derived missing shared bucket", endpoint: "https://anchor", tokenFile: "/token", policy: "derived", provider: "s3", wantErr: true},
+		{name: "CA with incomplete mandatory fields", endpoint: "https://anchor", caFile: "/ca.pem", policy: "opaque", storageID: "store", wantErr: true},
 	} {
 		t.Run(test.name, func(t *testing.T) {
-			configured, err := recoveryAnchorConfigured(test.endpoint, test.tokenFile, test.caFile, test.storageID)
+			provider := objectstore.Provider(test.provider)
+			if provider == "" {
+				provider = objectstore.ProviderFilesystem
+			}
+			configured, _, err := recoveryAnchorConfigured(test.endpoint, test.tokenFile, test.caFile, test.policy, test.storageID, objectstore.Config{Provider: provider, Bucket: test.bucket})
 			if (err != nil) != test.wantErr {
 				t.Fatalf("recoveryAnchorConfigured() error = %v, wantErr %t", err, test.wantErr)
 			}

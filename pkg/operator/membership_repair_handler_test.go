@@ -23,8 +23,10 @@ import (
 	"sync/atomic"
 	"testing"
 
+	"github.com/mrchypark/rhiza/internal/types"
 	"github.com/mrchypark/rhiza/pkg/fencing"
 	"github.com/mrchypark/rhiza/pkg/network"
+	"github.com/mrchypark/rhiza/pkg/node"
 	"github.com/mrchypark/rhiza/pkg/qlog"
 	"github.com/mrchypark/rhiza/pkg/quepaxa"
 	"github.com/mrchypark/rhiza/pkg/recovery"
@@ -512,6 +514,7 @@ func TestMembershipRepairSourceObservationIsBoundToRetainedSlotAndLivePodUID(t *
 	main["env"] = []any{
 		object{"name": "RHIZA_CLUSTER_ID", "value": "source"}, object{"name": "RHIZA_ADMIN_TOKEN", "value": adminToken},
 		object{"name": "RHIZA_CLUSTER_MEMBERS", "value": string(jsonBytes(members))}, object{"name": "RHIZA_OBJSTORE_PROVIDER", "value": "s3"},
+		object{"name": "RHIZA_OBJSTORE_ENDPOINT", "value": "http://127.0.0.1:1"},
 		object{"name": "RHIZA_OBJSTORE_BUCKET", "value": "test-bucket"}, object{"name": "RHIZA_OBJSTORE_PREFIX", "value": "root"},
 		object{"name": "RHIZA_BIND_ADDR", "value": "0.0.0.0:8080"}, object{"name": "RHIZA_PEER_ADDR", "value": "0.0.0.0:9090"},
 	}
@@ -521,6 +524,7 @@ func TestMembershipRepairSourceObservationIsBoundToRetainedSlotAndLivePodUID(t *
 	newInit := asObject(list(nested(newPod, "spec", "initContainers"))[0])
 	for _, container := range []object{newMain, newInit} {
 		setBootstrapEnv(container, "RHIZA_CLUSTER_ID", "source")
+		setBootstrapEnv(container, "RHIZA_OBJSTORE_ENDPOINT", "http://127.0.0.1:1")
 		setBootstrapEnv(container, "RHIZA_OBJSTORE_BUCKET", "test-bucket")
 		setBootstrapEnv(container, "RHIZA_OBJSTORE_PREFIX", "root")
 	}
@@ -543,6 +547,8 @@ func TestMembershipRepairSourceObservationIsBoundToRetainedSlotAndLivePodUID(t *
 	}}}
 	ledgerMu := sync.Mutex{}
 	ledgerRV := 1
+	closeOnNextLedgerConflict := false
+	closeRaceNode := ""
 	secretMu := sync.Mutex{}
 	authMu := sync.Mutex{}
 	authPodUID, authPodName := "caller-pod-uid", "rhiza-0"
@@ -559,6 +565,17 @@ func TestMembershipRepairSourceObservationIsBoundToRetainedSlotAndLivePodUID(t *
 			var updated object
 			if err := json.NewDecoder(r.Body).Decode(&updated); err != nil {
 				http.Error(w, "invalid ConfigMap", http.StatusBadRequest)
+				return
+			}
+			if closeOnNextLedgerConflict {
+				closeOnNextLedgerConflict = false
+				if err := ledger.Ledger.CloseNodes("race-close", "race-close-hash", []string{closeRaceNode}); err != nil {
+					t.Errorf("test could not commit closure between CAS attempts: %v", err)
+					http.Error(w, "could not close init admission", http.StatusInternalServerError)
+					return
+				}
+				ledgerRV++
+				http.Error(w, "simulated resourceVersion conflict after closure committed", http.StatusConflict)
 				return
 			}
 			if err := json.Unmarshal([]byte(str(nested(updated, "data", "ledger.json"))), &ledger); err != nil {
@@ -641,7 +658,7 @@ func TestMembershipRepairSourceObservationIsBoundToRetainedSlotAndLivePodUID(t *
 		t.Fatal(err)
 	}
 	kube := &Kubernetes{BaseURL: api.URL, Namespace: "test", TokenFile: tokenPath, Client: api.Client()}
-	executor := &FencingExecutor{Kube: kube, Bucket: bucket, Prefix: "root", StoreIdentity: StoreIdentity(map[string]string{"RHIZA_OBJSTORE_PROVIDER": "s3", "RHIZA_OBJSTORE_BUCKET": "test-bucket", "RHIZA_OBJSTORE_PREFIX": "root"})}
+	executor := &FencingExecutor{Kube: kube, Bucket: bucket, Prefix: "root", StoreIdentity: StoreIdentity(map[string]string{"RHIZA_OBJSTORE_PROVIDER": "s3", "RHIZA_OBJSTORE_ENDPOINT": "http://127.0.0.1:1", "RHIZA_OBJSTORE_BUCKET": "test-bucket", "RHIZA_OBJSTORE_PREFIX": "root"})}
 	authority := httptest.NewTLSServer(executor.Handler())
 	defer authority.Close()
 	client := &fencing.AuthorityClient{URL: authority.URL + "/v1/supervisor", TokenFile: tokenPath, Client: authority.Client()}
@@ -672,6 +689,27 @@ func TestMembershipRepairSourceObservationIsBoundToRetainedSlotAndLivePodUID(t *
 	if assignment.PodUID != newUID || assignment.NodeID != "pod-"+newUID || assignment.Purpose != fencing.BootstrapLearner {
 		t.Fatalf("reserved assignment is not bound to live replacement UID: %+v", assignment)
 	}
+	if assignment.PublicMember.LogURL != "" {
+		t.Fatalf("actual immutable learner credential unexpectedly has LogURL %q", assignment.PublicMember.LogURL)
+	}
+	learnerKey, err := hex.DecodeString(assignment.PublicMember.PublicKey)
+	if err != nil || len(learnerKey) != len(quepaxa.PublicKey{}) {
+		t.Fatalf("actual learner assignment public key is invalid: %q", assignment.PublicMember.PublicKey)
+	}
+	var learnerPublicKey quepaxa.PublicKey
+	copy(learnerPublicKey[:], learnerKey)
+	learnerConfig := &types.ExecutionConfig{
+		ClusterID: "source", NodeID: types.NodeID(assignment.NodeID), PreparedPodUID: assignment.PodUID,
+		DataDir: t.TempDir(), EnableReconfiguration: true, Members: append([]quepaxa.Member(nil), members...),
+		Learner: &quepaxa.Member{ID: quepaxa.NodeID(assignment.PublicMember.ID), URL: assignment.PublicMember.URL,
+			PeerURL: assignment.PublicMember.PeerURL, LogURL: assignment.PublicMember.LogURL, PublicKey: learnerPublicKey},
+		ObjStoreProvider: "s3", ObjStoreEndpoint: "http://127.0.0.1:1", ObjStoreBucket: "test-bucket",
+		ObjStorePrefix: "root", ObjStoreDurability: types.ObjectStoreDurabilityAsync,
+	}
+	_, _, prepareErr := node.PrepareManagedInit(ctx, learnerConfig, assignment)
+	if prepareErr == nil || strings.Contains(prepareErr.Error(), "managed learner assignment differs") || strings.Contains(prepareErr.Error(), "requires its exact assigned public identity") {
+		t.Fatalf("actual retained learner assignment did not pass Node binding validation before its unavailable disposable archive: %v", prepareErr)
+	}
 	secretMu.Lock()
 	_, immutableCredentialReadBack := secretObjects[path.Join("/api/v1/namespaces/test/secrets", assignment.CredentialName)]
 	secretMu.Unlock()
@@ -694,6 +732,36 @@ func TestMembershipRepairSourceObservationIsBoundToRetainedSlotAndLivePodUID(t *
 	if err != nil || status.Assignment == nil || *status.Assignment != assignment {
 		t.Fatalf("readonly own-init discovery status=%+v err=%v", status, err)
 	}
+	ledgerMu.Lock()
+	openLedgerSnapshot, err := json.Marshal(ledger)
+	if err != nil {
+		ledgerMu.Unlock()
+		t.Fatal(err)
+	}
+	openLedgerRV := ledgerRV
+	closeOnNextLedgerConflict, closeRaceNode = true, assignment.NodeID
+	ledgerMu.Unlock()
+	if _, err := client.BeginInit(ctx, assignment, "learner-attempt-closure-race"); err == nil {
+		t.Fatal("real init authority path admitted work after closure won its CAS conflict")
+	}
+	ledgerMu.Lock()
+	if _, closed := ledger.Ledger.ClosedNodes[assignment.NodeID]; !closed {
+		ledgerMu.Unlock()
+		t.Fatal("CAS conflict fixture did not commit node closure before retry")
+	}
+	if len(ledger.Ledger.MembershipRepair.Progress.Candidates[0].Attempts) != 0 {
+		ledgerMu.Unlock()
+		t.Fatal("failed CAS retry retained a new learner init attempt")
+	}
+	var restoredLedger fenceLedger
+	if err := json.Unmarshal(openLedgerSnapshot, &restoredLedger); err != nil {
+		ledgerMu.Unlock()
+		t.Fatal(err)
+	}
+	ledger = restoredLedger
+	ledgerRV = openLedgerRV
+	closeOnNextLedgerConflict, closeRaceNode = false, ""
+	ledgerMu.Unlock()
 	attempt, err := client.BeginInit(ctx, assignment, "learner-attempt-1")
 	if err != nil || attempt.Assignment != assignment || attempt.Scope.ContainerID != "containerd://learner-init" {
 		t.Fatalf("learner init begin did not retain live execution scope: attempt=%+v err=%v", attempt, err)
@@ -873,6 +941,32 @@ func TestMembershipRepairSourceObservationIsBoundToRetainedSlotAndLivePodUID(t *
 		t.Fatalf("runtime retries did not converge on the retained challenge: %+v", completionRequests)
 	}
 	completionRequestsMu.Unlock()
+
+	// The next replacement of the same ordinal must use the just-completed
+	// candidate as its old identity, even though the original autoControl was
+	// not advanced by an operator process during the repair.
+	const secondReplacementUID = "replacement-pod-uid-2"
+	targetUIDMu.Lock()
+	targetUID = secondReplacementUID
+	newMetadata["uid"] = secondReplacementUID
+	targetUIDMu.Unlock()
+	if _, err := client.ReadMembershipRepairForTarget(ctx, caller, "rhiza-1"); !errors.Is(err, fencing.ErrPending) {
+		t.Fatalf("completed repair projection refresh should persist before admission retry: %v", err)
+	}
+	controller := &Controller{Kube: kube, Bucket: bucket, Prefix: "root"}
+	projected, _, err := controller.loadAuto(ctx, controller.autoKey(&root))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(projected.Voters) != 3 || projected.Voters[1] != (VoterPod{NodeID: quepaxa.NodeID(assignment.NodeID), Pod: "rhiza-1"}) ||
+		projected.Identities[quepaxa.NodeID(assignment.NodeID)] != (FenceTarget{NodeID: assignment.NodeID, Pod: "rhiza-1", PodUID: newUID, WALIdentity: runtime.WALIdentity}) {
+		t.Fatalf("completed candidate was not installed into the existing autoControl projection: voters=%+v identity=%+v", projected.Voters, projected.Identities[quepaxa.NodeID(assignment.NodeID)])
+	}
+	next, err := client.ReadMembershipRepairForTarget(ctx, caller, "rhiza-1")
+	if err != nil || next.Observation == nil || next.Observation.TargetNodeID != assignment.NodeID || next.Observation.TargetPodUID != newUID ||
+		next.Observation.TargetWALIdentity != runtime.WALIdentity || next.Observation.ReplacementPodUID != secondReplacementUID {
+		t.Fatalf("second same-ordinal replacement did not use the first accepted successor: observation=%+v err=%v", next.Observation, err)
+	}
 }
 
 func objectFromCluster(value ClusterResource) object {

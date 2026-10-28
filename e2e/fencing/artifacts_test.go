@@ -173,3 +173,100 @@ func TestDRQualificationAndACKArtifactsPublishThroughFullSafePath(t *testing.T) 
 		t.Fatalf("public DR qualification artifact missing: %v", err)
 	}
 }
+
+func TestVerifyAnchorGateEvidenceRequiresOrderedExactRuntimeRecovery(t *testing.T) {
+	writeEvents := func(t *testing.T, events []obj) string {
+		t.Helper()
+		path := filepath.Join(t.TempDir(), "events.jsonl")
+		var data []byte
+		for _, event := range events {
+			data = append(data, encoded(event)...)
+			data = append(data, '\n')
+		}
+		if err := os.WriteFile(path, data, 0600); err != nil {
+			t.Fatal(err)
+		}
+		return path
+	}
+	writeQualification := func(t *testing.T, eventsPath, operationID, target string) string {
+		t.Helper()
+		path := filepath.Join(filepath.Dir(eventsPath), "dr-qualification.json")
+		uid := "123e4567-e89b-12d3-a456-426614174000"
+		name := "recovery-1"
+		requestHash := strings.Repeat("d", 64)
+		qualification := obj{
+			"version": 1, "targetClusterID": target, "anchorID": recoveryAnchorID,
+			"recoveryName": name, "recoveryUID": uid, "operationID": operationID,
+			"requestHash":  requestHash,
+			"receipt":      recoveryanchor.Receipt{AnchorID: recoveryAnchorID, OperationID: operationID, RequestHash: requestHash, Target: recoveryanchor.Binding{ClusterID: target, StorageID: "storage"}, Generation: 2},
+			"assignments":  []obj{{"pod": "rhiza-0", "podUID": "123e4567-e89b-12d3-a456-426614174001", "nodeID": "rhiza-0", "credentialUID": "credential", "initExitCode": 0}, {"pod": "rhiza-1", "podUID": "123e4567-e89b-12d3-a456-426614174002", "nodeID": "rhiza-1", "credentialUID": "credential", "initExitCode": 0}, {"pod": "rhiza-2", "podUID": "123e4567-e89b-12d3-a456-426614174003", "nodeID": "rhiza-2", "credentialUID": "credential", "initExitCode": 0}},
+			"targetVoters": 3, "initSucceeded": true, "preRuntimeAssignmentObserved": true, "runtimeWALBound": true,
+		}
+		if err := os.WriteFile(path, encoded(qualification), 0600); err != nil {
+			t.Fatal(err)
+		}
+		for name, value := range map[string]string{
+			"actual-exit.txt": "0\n", "source-head.txt": strings.Repeat("a", 40) + "\n",
+			"image-ids.txt": "sha256:" + strings.Repeat("b", 64) + "\n",
+		} {
+			if err := os.WriteFile(filepath.Join(filepath.Dir(eventsPath), name), []byte(value), 0600); err != nil {
+				t.Fatal(err)
+			}
+		}
+		return path
+	}
+	base := []obj{
+		{"event": "anchor_gate_missing_record", "fenceOperationID": "fence-1", "anchorOperationID": "123e4567-e89b-12d3-a456-426614174000:recovery-1", "targetClusterID": "target-1", "stage": "Sealed", "phase": "Blocked", "anchorRecordState": "missing"},
+		{"event": "anchor_gate_pending_write", "fenceOperationID": "fence-1", "anchorOperationID": "123e4567-e89b-12d3-a456-426614174000:recovery-1", "targetClusterID": "target-1", "stage": "Sealed", "phase": "Blocked", "anchorRecordState": "pending_write"},
+		{"event": "anchor_gate_corrupt_target", "fenceOperationID": "fence-1", "anchorOperationID": "123e4567-e89b-12d3-a456-426614174000:recovery-1", "targetClusterID": "target-1", "stage": "Sealed", "phase": "Blocked", "anchorRecordState": "corrupt", "corruptBytesSHA256": strings.Repeat("a", 64)},
+		{"event": "anchor_gate_restored_exact_target", "fenceOperationID": "fence-1", "anchorOperationID": "123e4567-e89b-12d3-a456-426614174000:recovery-1", "targetClusterID": "target-1", "anchorRecordState": "restored_exact", "anchorArtifactSHA256": strings.Repeat("b", 64)},
+		{"event": "anchor_gates_restored", "fenceOperationID": "fence-1", "anchorOperationID": "123e4567-e89b-12d3-a456-426614174000:recovery-1", "targetClusterID": "target-1", "preRuntimeAssignmentObserved": true},
+		{"event": "dr_successor_runtime_ack", "drTargetClusterID": "target-1", "drWriteEpoch": 2, "drAssignmentsObserved": true, "drReadbackSHA256": strings.Repeat("c", 64)},
+		{"event": "PASS", "onlineVoterReplacement": true, "newGenerationWrite": true, "oldRuntimesGone": true},
+	}
+
+	path := writeEvents(t, base)
+	writeQualification(t, path, "123e4567-e89b-12d3-a456-426614174000:recovery-1", "target-1")
+	raw := filepath.Dir(path)
+	if err := safeArtifacts(raw); err != nil {
+		t.Fatalf("project runtime evidence through allowlist: %v", err)
+	}
+	public := filepath.Join(raw, "public")
+	result, err := verifyAnchorGateEvidence(filepath.Join(public, "events.jsonl"), filepath.Join(public, "dr-qualification.json"), filepath.Join(public, "source-head.txt"), strings.Repeat("a", 40))
+	if err != nil || result["targetClusterID"] != "target-1" || result["gateCount"] != 5 {
+		t.Fatalf("valid ordered anchor recovery evidence rejected: result=%v err=%v", result, err)
+	}
+
+	for name, mutate := range map[string]func([]obj){
+		"missing gate":                  func(events []obj) { events[4]["event"] = "unrecognized_event" },
+		"different target ACK":          func(events []obj) { events[5]["drTargetClusterID"] = "other" },
+		"different qualified operation": func(events []obj) { events[0]["anchorOperationID"] = "other" },
+		"not blocked":                   func(events []obj) { events[1]["phase"] = "Ready" },
+		"unobserved assignment":         func(events []obj) { events[4]["preRuntimeAssignmentObserved"] = false },
+		"ACK before PASS":               func(events []obj) { events[5], events[6] = events[6], events[5] },
+	} {
+		t.Run(name, func(t *testing.T) {
+			events := make([]obj, len(base))
+			for i, event := range base {
+				copy := obj{}
+				for key, value := range event {
+					copy[key] = value
+				}
+				events[i] = copy
+			}
+			mutate(events)
+			eventsPath := writeEvents(t, events)
+			qualificationPath := writeQualification(t, eventsPath, "123e4567-e89b-12d3-a456-426614174000:recovery-1", "target-1")
+			if _, err := verifyAnchorGateEvidence(eventsPath, qualificationPath, filepath.Join(filepath.Dir(eventsPath), "source-head.txt"), strings.Repeat("a", 40)); err == nil {
+				t.Fatal("invalid gate evidence accepted")
+			}
+		})
+	}
+	badQualification := writeQualification(t, path, "different-operation", "target-1")
+	if _, err := verifyAnchorGateEvidence(path, badQualification, filepath.Join(filepath.Dir(path), "source-head.txt"), strings.Repeat("a", 40)); err == nil {
+		t.Fatal("qualification for another operation was accepted")
+	}
+	if _, err := verifyAnchorGateEvidence(filepath.Join(public, "events.jsonl"), filepath.Join(public, "dr-qualification.json"), filepath.Join(public, "source-head.txt"), strings.Repeat("c", 40)); err == nil {
+		t.Fatal("runtime evidence from another source revision was accepted")
+	}
+}

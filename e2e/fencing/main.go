@@ -32,6 +32,7 @@ import (
 	"github.com/mrchypark/rhiza/pkg/quepaxa"
 	"github.com/mrchypark/rhiza/pkg/recovery"
 	"github.com/mrchypark/rhiza/pkg/recoveryanchor"
+	"github.com/thanos-io/objstore"
 )
 
 const namespace = "rhiza-fencing-e2e"
@@ -52,12 +53,20 @@ func main() {
 		fatal(captureRuntimeDiagnostics(ctx, os.Getenv("FENCING_E2E_OUT")))
 		return
 	}
+	if len(os.Args) == 6 && os.Args[1] == "verify-anchor-gate-evidence" {
+		result, err := verifyAnchorGateEvidence(os.Args[2], os.Args[3], os.Args[4], os.Args[5])
+		if err == nil {
+			err = json.NewEncoder(os.Stdout).Encode(result)
+		}
+		fatal(err)
+		return
+	}
 	if len(os.Args) == 3 && os.Args[1] == "peer-probe" {
 		fatal(runPeerProbe(os.Args[2]))
 		return
 	}
 	if len(os.Args) != 2 {
-		fatal(fmt.Errorf("usage: fencing-e2e manifests|wait-source|run|capture-runtime-diagnostics|peer-probe <control|stale>"))
+		fatal(fmt.Errorf("usage: fencing-e2e manifests|wait-source|run|safe-artifacts|capture-runtime-diagnostics|verify-anchor-gate-evidence <events.jsonl> <dr-qualification.json> <source-head.txt> <expected-git-sha>|peer-probe <control|stale>"))
 	}
 	if os.Args[1] == "manifests" {
 		fatal(json.NewEncoder(os.Stdout).Encode(manifests()))
@@ -464,24 +473,45 @@ func field(name, path string) obj {
 func value(name, val string) obj { return obj{"name": name, "value": val} }
 func selector(name string) obj   { return obj{"app.kubernetes.io/name": name} }
 
-func recoveryAnchorStorageID(cluster string) string {
-	identity := [5]string{"s3", "rhiza-minio:9000", "rhiza", "rhiza", cluster}
-	sum := sha256.Sum256(encoded(identity))
-	return fmt.Sprintf("%x", sum[:])
+func e2eRecoveryAnchorStorageBindingConfig() recoveryanchor.StorageBindingConfig {
+	return recoveryanchor.StorageBindingConfig{
+		Policy:   recoveryanchor.StorageBindingDerived,
+		Provider: "s3", Endpoint: "rhiza-minio:9000", Bucket: "rhiza", Prefix: "rhiza",
+	}
+}
+
+func expectedRecoveryAnchorBinding(clusterID string) (recoveryanchor.Binding, error) {
+	return e2eRecoveryAnchorStorageBindingConfig().ExpectedBinding(clusterID)
+}
+
+func validateRecoveryAnchorTargetBinding(request recoveryanchor.Request, receipt recoveryanchor.Receipt) error {
+	expected, err := expectedRecoveryAnchorBinding(request.TargetClusterID)
+	if err != nil {
+		return fmt.Errorf("compute independent target anchor binding: %w", err)
+	}
+	if receipt.Target != expected {
+		return fmt.Errorf("anchor receipt target binding differs from effective object-store configuration")
+	}
+	return nil
 }
 
 func initialRecoveryAnchorRecord() recoveryanchor.Record {
+	binding, err := expectedRecoveryAnchorBinding("chaos-source")
+	if err != nil {
+		panic(err)
+	}
 	return recoveryanchor.Record{
 		Version: 1, EvidenceFormat: "sql-epoch-token/v1",
-		Binding:  recoveryanchor.Binding{ClusterID: "chaos-source", StorageID: recoveryAnchorStorageID("chaos-source")},
+		Binding:  binding,
 		Evidence: encoded(obj{"epoch": 1, "token": "initial"}),
 	}
 }
 
 func manifests() obj {
-	config := obj{"RHIZA_CLUSTER_ID": "chaos-source", "RHIZA_BIND_ADDR": "0.0.0.0:8080", "RHIZA_PEER_ADDR": "0.0.0.0:9090", "RHIZA_DATA_DIR": "/data", "RHIZA_ENABLE_RECONFIGURATION": "true", "RHIZA_CHECKPOINT_INTERVAL": "0", "RHIZA_OBJSTORE_SYNC_INTERVAL": "1s", "RHIZA_OBJSTORE_GC_INTERVAL": "0", "RHIZA_OBJSTORE_PROVIDER": "s3", "RHIZA_OBJSTORE_PREFIX": "rhiza", "RHIZA_OBJSTORE_DURABILITY": "before-ack", "RHIZA_CLUSTER_MEMBERS": ""}
+	storageBinding := e2eRecoveryAnchorStorageBindingConfig()
+	config := obj{"RHIZA_CLUSTER_ID": "chaos-source", "RHIZA_BIND_ADDR": "0.0.0.0:8080", "RHIZA_PEER_ADDR": "0.0.0.0:9090", "RHIZA_DATA_DIR": "/data", "RHIZA_ENABLE_RECONFIGURATION": "true", "RHIZA_CHECKPOINT_INTERVAL": "0", "RHIZA_OBJSTORE_SYNC_INTERVAL": "1s", "RHIZA_OBJSTORE_GC_INTERVAL": "0", "RHIZA_OBJSTORE_PROVIDER": storageBinding.Provider, "RHIZA_OBJSTORE_PREFIX": storageBinding.Prefix, "RHIZA_OBJSTORE_DURABILITY": "before-ack", "RHIZA_CLUSTER_MEMBERS": ""}
 	configMap := obj{"apiVersion": "v1", "kind": "ConfigMap", "metadata": metadata("rhiza-config"), "data": config}
-	storeCredentials := obj{"apiVersion": "v1", "kind": "Secret", "metadata": metadata("rhiza-object-store"), "stringData": obj{"RHIZA_OBJSTORE_ENDPOINT": "rhiza-minio:9000", "RHIZA_OBJSTORE_BUCKET": "rhiza", "RHIZA_OBJSTORE_INSECURE": "true", "RHIZA_OBJSTORE_ACCESS_KEY": "fencing-local", "RHIZA_OBJSTORE_SECRET_KEY": "fencing-local-secret", "RHIZA_OBJSTORE_REGION": "us-east-1"}}
+	storeCredentials := obj{"apiVersion": "v1", "kind": "Secret", "metadata": metadata("rhiza-object-store"), "stringData": obj{"RHIZA_OBJSTORE_ENDPOINT": storageBinding.Endpoint, "RHIZA_OBJSTORE_BUCKET": storageBinding.Bucket, "RHIZA_OBJSTORE_INSECURE": "true", "RHIZA_OBJSTORE_ACCESS_KEY": "fencing-local", "RHIZA_OBJSTORE_SECRET_KEY": "fencing-local-secret", "RHIZA_OBJSTORE_REGION": "us-east-1"}}
 	store := resource("apps/v1", "Deployment", "rhiza-minio", obj{"replicas": 1, "selector": obj{"matchLabels": selector("rhiza-minio")}, "template": obj{"metadata": obj{"labels": selector("rhiza-minio")}, "spec": obj{"containers": []obj{{"name": "minio", "image": "ghcr.io/versity/versitygw@sha256:30292fc2eeacc67a36993b01f7a7a5e3361a19cced0e80c1d71cfa2a4b0a2499", "args": []string{"--port", ":9000", "--health", "/_/health", "posix", "/data"}, "env": []obj{value("ROOT_ACCESS_KEY", "fencing-local"), value("ROOT_SECRET_KEY", "fencing-local-secret")}, "ports": []obj{{"name": "s3", "containerPort": 9000}}, "readinessProbe": obj{"httpGet": obj{"path": "/_/health", "port": "s3"}}, "volumeMounts": []obj{{"name": "data", "mountPath": "/data"}}}}, "volumes": []obj{{"name": "data", "emptyDir": obj{}}}}}})
 	storeService := resource("v1", "Service", "rhiza-minio", obj{"selector": selector("rhiza-minio"), "ports": []obj{{"port": 9000, "targetPort": "s3"}}})
 	bucketJob := resource("batch/v1", "Job", "rhiza-create-bucket", obj{"backoffLimit": 0, "activeDeadlineSeconds": 120, "template": obj{"spec": obj{"restartPolicy": "Never", "containers": []obj{{"name": "create", "image": "amazon/aws-cli@sha256:83f8ffe939569070c5b66d22231862ab78718766d9d8e4c44ca84dd0be5569a5", "args": []string{"--endpoint-url=http://rhiza-minio:9000", "s3api", "create-bucket", "--bucket", "rhiza"}, "env": []obj{value("AWS_ACCESS_KEY_ID", "fencing-local"), value("AWS_SECRET_ACCESS_KEY", "fencing-local-secret"), value("AWS_DEFAULT_REGION", "us-east-1"), value("AWS_EC2_METADATA_DISABLED", "true")}}}}}})
@@ -519,21 +549,25 @@ func manifests() obj {
 	workload["hostPID"], workload["shareProcessNamespace"] = false, false
 	application := workload["containers"].([]obj)[0]
 	application["securityContext"] = obj{"allowPrivilegeEscalation": false, "readOnlyRootFilesystem": true, "capabilities": obj{"drop": []string{"ALL"}}}
-	opEnv := []obj{field("POD_NAMESPACE", "metadata.namespace"), value("RHIZA_AUTOMATIC_RECOVERY", "true"), value("RHIZA_FENCER_BACKEND", "kubernetes"),
-		value("RHIZA_RECOVERY_ANCHOR_URL", "https://anchor-service."+namespace+".svc:9191"),
-		value("RHIZA_RECOVERY_ANCHOR_TOKEN_FILE", "/anchor/token"), value("RHIZA_RECOVERY_ANCHOR_CA_FILE", "/anchor/ca.crt")}
-	op := resource("apps/v1", "Deployment", "rhiza-operator", obj{"replicas": 0, "selector": obj{"matchLabels": selector("rhiza-operator")}, "template": obj{"metadata": obj{"labels": selector("rhiza-operator")}, "spec": obj{"serviceAccountName": "rhiza-operator", "securityContext": obj{"runAsNonRoot": true, "fsGroup": 65532}, "containers": []obj{{"name": "operator", "image": "rhiza-fencing-operator:local", "args": []string{"--namespace=$(POD_NAMESPACE)", "--poll-interval=1s"}, "env": opEnv, "envFrom": []obj{envFrom[0], envFrom[1]}, "volumeMounts": []obj{{"name": "tmp", "mountPath": "/tmp"}, {"name": "anchor", "mountPath": "/anchor", "readOnly": true}}}}, "volumes": []obj{{"name": "tmp", "emptyDir": obj{}}, {"name": "anchor", "secret": obj{"secretName": "anchor-token"}}}}}})
-	anchorConfig := obj{"apiVersion": "v1", "kind": "ConfigMap", "metadata": metadata(recoveryAnchorConfigMap), "data": obj{"anchor.json": string(encoded(initialRecoveryAnchorRecord()))}}
+	anchorClientConfig := obj{"apiVersion": "v1", "kind": "ConfigMap", "metadata": metadata("rhiza-recovery-anchor"), "data": obj{
+		"RHIZA_RECOVERY_ANCHOR_URL":            "https://anchor-service." + namespace + ".svc:9191",
+		"RHIZA_RECOVERY_ANCHOR_TOKEN_FILE":     "/var/run/secrets/rhiza-recovery-anchor-token/token",
+		"RHIZA_RECOVERY_ANCHOR_CA_FILE":        "/var/run/secrets/rhiza-recovery-anchor-ca/ca.crt",
+		"RHIZA_RECOVERY_ANCHOR_BINDING_POLICY": string(storageBinding.Policy),
+	}}
+	opEnv := []obj{field("POD_NAMESPACE", "metadata.namespace"), value("RHIZA_AUTOMATIC_RECOVERY", "true"), value("RHIZA_FENCER_BACKEND", "kubernetes")}
+	op := resource("apps/v1", "Deployment", "rhiza-operator", obj{"replicas": 0, "selector": obj{"matchLabels": selector("rhiza-operator")}, "template": obj{"metadata": obj{"labels": selector("rhiza-operator")}, "spec": obj{"serviceAccountName": "rhiza-operator", "securityContext": obj{"runAsNonRoot": true, "fsGroup": 65532}, "containers": []obj{{"name": "operator", "image": "rhiza-fencing-operator:local", "args": []string{"--namespace=$(POD_NAMESPACE)", "--poll-interval=1s"}, "env": opEnv, "envFrom": []obj{envFrom[0], envFrom[1], obj{"configMapRef": obj{"name": "rhiza-recovery-anchor"}}}, "volumeMounts": []obj{{"name": "tmp", "mountPath": "/tmp"}, {"name": "recovery-anchor-token", "mountPath": "/var/run/secrets/rhiza-recovery-anchor-token", "readOnly": true}, {"name": "recovery-anchor-ca", "mountPath": "/var/run/secrets/rhiza-recovery-anchor-ca", "readOnly": true}}}}, "volumes": []obj{{"name": "tmp", "emptyDir": obj{}}, {"name": "recovery-anchor-token", "secret": obj{"secretName": "rhiza-recovery-anchor-token"}}, {"name": "recovery-anchor-ca", "configMap": obj{"name": "rhiza-recovery-anchor-ca"}}}}}})
+	anchorRecordConfig := obj{"apiVersion": "v1", "kind": "ConfigMap", "metadata": metadata(recoveryAnchorConfigMap), "data": obj{"anchor.json": string(encoded(initialRecoveryAnchorRecord()))}}
 	anchorAccount := obj{"apiVersion": "v1", "kind": "ServiceAccount", "metadata": metadata("anchor-service")}
 	anchorRole := obj{"apiVersion": "rbac.authorization.k8s.io/v1", "kind": "Role", "metadata": metadata("anchor-service"), "rules": []obj{{"apiGroups": []string{""}, "resources": []string{"configmaps"}, "resourceNames": []string{recoveryAnchorConfigMap}, "verbs": []string{"get", "update"}}}}
 	anchorRoleBinding := obj{"apiVersion": "rbac.authorization.k8s.io/v1", "kind": "RoleBinding", "metadata": metadata("anchor-service"), "subjects": []obj{{"kind": "ServiceAccount", "name": "anchor-service", "namespace": namespace}}, "roleRef": obj{"apiGroup": "rbac.authorization.k8s.io", "kind": "Role", "name": "anchor-service"}}
 	appAnchorRole := obj{"apiVersion": "rbac.authorization.k8s.io/v1", "kind": "Role", "metadata": metadata("anchor-app-guard"), "rules": []obj{{"apiGroups": []string{""}, "resources": []string{"configmaps"}, "resourceNames": []string{recoveryAnchorConfigMap}, "verbs": []string{"get", "update"}}}}
 	appAnchorRoleBinding := obj{"apiVersion": "rbac.authorization.k8s.io/v1", "kind": "RoleBinding", "metadata": metadata("anchor-app-guard"), "subjects": []obj{{"kind": "ServiceAccount", "name": "rhiza-supervised", "namespace": namespace}}, "roleRef": obj{"apiGroup": "rbac.authorization.k8s.io", "kind": "Role", "name": "anchor-app-guard"}}
-	anchorDeployment := resource("apps/v1", "Deployment", "anchor-service", obj{"replicas": 1, "selector": obj{"matchLabels": obj{"app": "anchor-service"}}, "template": obj{"metadata": obj{"labels": obj{"app": "anchor-service"}}, "spec": obj{"serviceAccountName": "anchor-service", "securityContext": obj{"runAsNonRoot": true, "fsGroup": 65532}, "containers": []obj{{"name": "anchor", "image": "rhiza-anchor-service:local", "command": []string{"/usr/local/bin/rhiza-entrypoint"}, "ports": []obj{{"name": "https", "containerPort": 9191}}, "env": []obj{value("RHIZA_NAMESPACE", namespace), value("ANCHOR_TOKEN_FILE", "/token/token"), value("ANCHOR_TLS_CERT", "/certs/tls.crt"), value("ANCHOR_TLS_KEY", "/certs/tls.key")}, "envFrom": envFrom, "volumeMounts": []obj{{"name": "certs", "mountPath": "/certs", "readOnly": true}, {"name": "token", "mountPath": "/token", "readOnly": true}}}}, "volumes": []obj{{"name": "certs", "secret": obj{"secretName": "anchor-tls"}}, {"name": "token", "secret": obj{"secretName": "anchor-token"}}}}}})
+	anchorDeployment := resource("apps/v1", "Deployment", "anchor-service", obj{"replicas": 1, "selector": obj{"matchLabels": obj{"app": "anchor-service"}}, "template": obj{"metadata": obj{"labels": obj{"app": "anchor-service"}}, "spec": obj{"serviceAccountName": "anchor-service", "securityContext": obj{"runAsNonRoot": true, "fsGroup": 65532}, "containers": []obj{{"name": "anchor", "image": "rhiza-anchor-service:local", "command": []string{"/usr/local/bin/rhiza-entrypoint"}, "ports": []obj{{"name": "https", "containerPort": 9191}}, "env": []obj{value("RHIZA_NAMESPACE", namespace), value("ANCHOR_TOKEN_FILE", "/var/run/secrets/rhiza-recovery-anchor-token/token"), value("ANCHOR_TLS_CERT", "/certs/tls.crt"), value("ANCHOR_TLS_KEY", "/certs/tls.key")}, "envFrom": []obj{envFrom[0], envFrom[1], obj{"configMapRef": obj{"name": "rhiza-recovery-anchor"}}}, "volumeMounts": []obj{{"name": "certs", "mountPath": "/certs", "readOnly": true}, {"name": "token", "mountPath": "/var/run/secrets/rhiza-recovery-anchor-token", "readOnly": true}}}}, "volumes": []obj{{"name": "certs", "secret": obj{"secretName": "anchor-tls"}}, {"name": "token", "secret": obj{"secretName": "rhiza-recovery-anchor-token"}}}}}})
 	anchorService := resource("v1", "Service", "anchor-service", obj{"selector": obj{"app": "anchor-service"}, "ports": []obj{{"name": "https", "port": 9191, "targetPort": 9191}}})
 	binding := resource("rhiza.mrchypark.dev/v1alpha1", "RhizaCluster", "rhiza", obj{"logicalID": "fencing-e2e", "statefulSet": "rhiza", "container": "rhiza", "adoptClusterID": "chaos-source", "automatic": true, "bootstrap": true, "anchorID": recoveryAnchorID, "voterCount": 3, "policy": obj{"failureGraceSeconds": 15, "cooldownSeconds": 3, "maxRecoveriesPerDay": 3, "allowDataLoss": false}})
 	bucketJob["spec"].(obj)["suspend"] = true
-	return obj{"apiVersion": "v1", "kind": "List", "items": []obj{configMap, storeCredentials, store, storeService, bucketJob, headless, sts, op, binding, anchorConfig, anchorAccount, anchorRole, anchorRoleBinding, appAnchorRole, appAnchorRoleBinding, anchorDeployment, anchorService}}
+	return obj{"apiVersion": "v1", "kind": "List", "items": []obj{configMap, storeCredentials, store, storeService, bucketJob, headless, sts, op, binding, anchorClientConfig, anchorRecordConfig, anchorAccount, anchorRole, anchorRoleBinding, appAnchorRole, appAnchorRoleBinding, anchorDeployment, anchorService}}
 }
 
 // generatedAdminToken follows the same Secret reference written by the real
@@ -1375,8 +1409,20 @@ func command(ctx context.Context, name string, args ...string) ([]byte, error) {
 	}
 	return data, nil
 }
+func commandInput(ctx context.Context, input []byte, name string, args ...string) ([]byte, error) {
+	cmd := exec.CommandContext(ctx, name, args...)
+	cmd.Stdin = bytes.NewReader(input)
+	data, err := cmd.CombinedOutput()
+	if err != nil {
+		return nil, fmt.Errorf("%s command failed: %w: %s", name, err, data)
+	}
+	return data, nil
+}
 func kubectl(ctx context.Context, args ...string) ([]byte, error) {
 	return command(ctx, "kubectl", append([]string{"--context", kubeContext, "-n", namespace}, args...)...)
+}
+func kubectlInput(ctx context.Context, input []byte, args ...string) ([]byte, error) {
+	return commandInput(ctx, input, "kubectl", append([]string{"--context", kubeContext, "-n", namespace}, args...)...)
 }
 func get(ctx context.Context, kind, name string) (obj, error) {
 	args := []string{"get", kind}
@@ -1697,6 +1743,44 @@ func qualify(ctx context.Context) (resultErr error) {
 	}
 	event("source_acknowledged", obj{"rows": 1, "operatorReplicas": 0, "independentArchiveTip": archive.Tip, "independentArchiveStart": archive.Start, "independentArchiveThrough": archive.Through, "independentArchivePrefixSHA256": archive.PrefixSHA256, "archivedRequestIDs": []string{"fencing-ack", "fencing-graph-ack"}, "absentPeerProbeRequestIDs": probeRequestIDs, "absentPeerProbeMarkers": []string{fmt.Sprintf("%x", sha256.Sum256([]byte(controlMarker))), fmt.Sprintf("%x", sha256.Sum256([]byte(staleMarker)))}})
 	event("source_graph_acknowledged", obj{"rows": 1, "operatorReplicas": 0})
+	anchorSourceSTS, err := get(ctx, "statefulset", "rhiza")
+	anchorReplicas, replicasOK := nested(anchorSourceSTS, "spec", "replicas").(float64)
+	if err != nil || !replicasOK || anchorReplicas != 3 {
+		return fmt.Errorf("source StatefulSet is not intact before anchor fault gates: %v", err)
+	}
+	anchorConfig, err := get(ctx, "configmap", recoveryAnchorConfigMap)
+	if err != nil {
+		return fmt.Errorf("capture exact external anchor before generation recovery: %w", err)
+	}
+	savedAnchorRecord := text(nested(anchorConfig, "data", "anchor.json"))
+	if savedAnchorRecord == "" {
+		return fmt.Errorf("external anchor ConfigMap has no exact saved record")
+	}
+	var savedAnchor recoveryanchor.Record
+	if err := json.Unmarshal([]byte(savedAnchorRecord), &savedAnchor); err != nil || savedAnchor.PendingWrite {
+		return fmt.Errorf("source anchor is not a valid acknowledged record before recovery: %v", err)
+	}
+	if _, err := kubectl(ctx, "delete", "configmap", recoveryAnchorConfigMap); err != nil {
+		return fmt.Errorf("remove external anchor record for recovery gate: %w", err)
+	}
+	anchorRecordRemoved := true
+	defer func() {
+		if resultErr == nil || !anchorRecordRemoved {
+			return
+		}
+		cleanupCtx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+		defer cancel()
+		live, liveErr := get(cleanupCtx, "configmap", recoveryAnchorConfigMap)
+		if liveErr == nil {
+			var record recoveryanchor.Record
+			if json.Unmarshal([]byte(text(nested(live, "data", "anchor.json"))), &record) == nil && (record.Binding != savedAnchor.Binding || record.Generation > savedAnchor.Generation) {
+				return
+			}
+		}
+		if restoreErr := applyAnchorRecord(cleanupCtx, savedAnchorRecord); restoreErr != nil {
+			resultErr = errors.Join(resultErr, fmt.Errorf("restore pre-test external anchor after failed gate: %w", restoreErr))
+		}
+	}()
 	if err := scaleOperator(ctx, 1); err != nil {
 		return fmt.Errorf("restore operator after Node-driven replacement/readback: %w", err)
 	}
@@ -1766,6 +1850,7 @@ func qualify(ctx context.Context) (resultErr error) {
 		}
 		event("generation_operator_observation_fault", obj{"fault": fault})
 	}
+	var generationOperationID string
 	if err := wait(ctx, "generic generation fence proof", func() (bool, error) {
 		list, err := get(ctx, "rhizafences", "")
 		if err != nil {
@@ -1776,17 +1861,29 @@ func qualify(ctx context.Context) (resultErr error) {
 			if nested(item, "spec", "scope") != "Generation" || nested(item, "status", "proof") == nil {
 				continue
 			}
-			return true, verifyGenerationProof(ctx, item, stsUID, bindingUID, oldUIDs, out, current...)
+			if err := verifyGenerationProof(ctx, item, stsUID, bindingUID, oldUIDs, out, current...); err != nil {
+				return true, err
+			}
+			var request operator.FenceRequest
+			if err := json.Unmarshal(encoded(nested(item, "spec")), &request); err != nil {
+				return true, fmt.Errorf("verified generation fence has no exact operation identity: %w", err)
+			}
+			if request.OperationID == "" {
+				return true, fmt.Errorf("verified generation fence has no operation ID")
+			}
+			generationOperationID = request.OperationID
+			return true, nil
 		}
 		return false, nil
 	}); err != nil {
 		return err
 	}
 	event("generic_generation_proof", obj{"oldUIDs": oldUIDs})
-	preRuntime, err := observeDRAssignmentsBeforeRuntime(ctx, stsUID, out)
+	preRuntime, err := runAnchorRecoveryFaultGates(ctx, generationOperationID, stsUID, anchorSourceSTS, savedAnchorRecord, out, event)
 	if err != nil {
-		return fmt.Errorf("observe DR assignments before runtime binding: %w", err)
+		return fmt.Errorf("anchor-gated DR qualification before runtime binding: %w", err)
 	}
+	anchorRecordRemoved = false
 	if err := os.WriteFile(filepath.Join(out, "dr-pre-runtime-assignment.json"), encoded(preRuntime), 0600); err != nil {
 		return err
 	}
@@ -1912,6 +2009,340 @@ type drPreRuntimeAssignment struct {
 	CredentialUID  string `json:"credentialUID"`
 	LedgerUID      string `json:"ledgerUID"`
 	MembershipHash string `json:"membershipHash"`
+}
+
+func joinAnchorRestoreError(primary, restoreErr error) error {
+	if restoreErr == nil {
+		return primary
+	}
+	return errors.Join(primary, fmt.Errorf("restore exact saved target generation anchor after gate failure: %w", restoreErr))
+}
+
+func restoreExactCorruptedAnchor(ctx context.Context, bucket objstore.Bucket, key string, expectedCorrupt, saved []byte) error {
+	if !containsUploadOption(bucket.SupportedObjectUploadOptions(), objstore.IfMatch) {
+		return fmt.Errorf("anchor store does not support conditional restore")
+	}
+	attributes, err := bucket.Attributes(ctx, key)
+	if err != nil {
+		return fmt.Errorf("read corrupted target anchor version: %w", err)
+	}
+	if attributes.Version == nil {
+		return fmt.Errorf("corrupted target anchor has no conditional version")
+	}
+	current, err := readAnchorObject(ctx, bucket, key, 32)
+	if err != nil {
+		return fmt.Errorf("read corrupted target anchor before restore: %w", err)
+	}
+	if !bytes.Equal(current, expectedCorrupt) {
+		return fmt.Errorf("target generation anchor changed after corruption; refusing to overwrite newer state")
+	}
+	if err := bucket.Upload(ctx, key, bytes.NewReader(saved), objstore.WithIfMatch(attributes.Version)); err != nil {
+		return fmt.Errorf("conditionally restore saved target anchor: %w", err)
+	}
+	restored, err := readAnchorObject(ctx, bucket, key, 1<<20+1)
+	if err != nil {
+		return fmt.Errorf("read restored target anchor: %w", err)
+	}
+	if len(restored) > 1<<20 || !bytes.Equal(restored, saved) {
+		return fmt.Errorf("restored target generation anchor does not match the exact saved bytes")
+	}
+	return nil
+}
+
+func containsUploadOption(options []objstore.ObjectUploadOptionType, wanted objstore.ObjectUploadOptionType) bool {
+	for _, option := range options {
+		if option == wanted {
+			return true
+		}
+	}
+	return false
+}
+
+func readAnchorObject(ctx context.Context, bucket objstore.Bucket, key string, limit int64) ([]byte, error) {
+	reader, err := bucket.Get(ctx, key)
+	if err != nil {
+		return nil, err
+	}
+	data, readErr := io.ReadAll(io.LimitReader(reader, limit))
+	closeErr := reader.Close()
+	return data, errors.Join(readErr, closeErr)
+}
+
+func runAnchorRecoveryFaultGates(ctx context.Context, fenceOperationID, sourceStatefulSetUID string, sourceSTS obj, savedRecordJSON, out string, event func(string, obj)) (observation drPreRuntimeObservation, resultErr error) {
+	if fenceOperationID == "" || sourceStatefulSetUID == "" || savedRecordJSON == "" {
+		return drPreRuntimeObservation{}, fmt.Errorf("anchor fault gates lack the exact generation fence or saved source record")
+	}
+	child, err := waitForAnchorBlocked(ctx, fenceOperationID, "anchor activation", false)
+	if err != nil {
+		return drPreRuntimeObservation{}, fmt.Errorf("missing external anchor did not block the exact recovery: %w", err)
+	}
+	operationID, target, err := exactAnchorRecoveryIdentity(child)
+	if err != nil {
+		return drPreRuntimeObservation{}, err
+	}
+	if err := assertAnchorRecoverySourceUnchanged(ctx, sourceSTS); err != nil {
+		return drPreRuntimeObservation{}, fmt.Errorf("missing-anchor gate changed the source workload: %w", err)
+	}
+	event("anchor_gate_missing_record", obj{"fenceOperationID": fenceOperationID, "anchorOperationID": operationID, "targetClusterID": target, "stage": nested(child, "status", "stage"), "phase": nested(child, "status", "phase"), "anchorRecordState": "missing"})
+
+	var originalRecord recoveryanchor.Record
+	if err := json.Unmarshal([]byte(savedRecordJSON), &originalRecord); err != nil || originalRecord.PendingWrite {
+		return drPreRuntimeObservation{}, fmt.Errorf("saved source anchor is invalid or already pending: %v", err)
+	}
+	pendingRecord := originalRecord
+	pendingRecord.PendingWrite = true
+	pendingBytes, err := json.Marshal(pendingRecord)
+	if err != nil {
+		return drPreRuntimeObservation{}, err
+	}
+	if err := applyAnchorRecord(ctx, string(pendingBytes)); err != nil {
+		return drPreRuntimeObservation{}, fmt.Errorf("restore saved source anchor with PendingWrite: %w", err)
+	}
+	if err := assertExternalAnchorRecord(ctx, pendingRecord); err != nil {
+		return drPreRuntimeObservation{}, err
+	}
+	if err := restartOperatorForAnchorRetry(ctx, child); err != nil {
+		return drPreRuntimeObservation{}, err
+	}
+	child, err = waitForAnchorBlocked(ctx, fenceOperationID, "pending", true)
+	if err != nil {
+		return drPreRuntimeObservation{}, fmt.Errorf("fresh PendingWrite reconciliation did not block the same recovery: %w", err)
+	}
+	if gotOperation, gotTarget, identityErr := exactAnchorRecoveryIdentity(child); identityErr != nil || gotOperation != operationID || gotTarget != target {
+		return drPreRuntimeObservation{}, fmt.Errorf("PendingWrite retry changed its retained operation or target: %v", identityErr)
+	}
+	if err := assertAnchorRecoverySourceUnchanged(ctx, sourceSTS); err != nil {
+		return drPreRuntimeObservation{}, fmt.Errorf("PendingWrite gate changed the source workload: %w", err)
+	}
+	event("anchor_gate_pending_write", obj{"fenceOperationID": fenceOperationID, "anchorOperationID": operationID, "targetClusterID": target, "stage": nested(child, "status", "stage"), "phase": nested(child, "status", "phase"), "anchorRecordState": "pending_write"})
+
+	forward, err := startServiceForward(ctx, "rhiza-minio", 9000, out)
+	if err != nil {
+		return drPreRuntimeObservation{}, err
+	}
+	defer forward.close()
+	bucket, err := objmetrics.NewBucket(objmetrics.Config{
+		Provider: objmetrics.ProviderS3, Endpoint: fmt.Sprintf("http://127.0.0.1:%d", forward.port),
+		Bucket: "rhiza", Region: "us-east-1", Insecure: true,
+		AccessKey: "fencing-local", SecretKey: "fencing-local-secret",
+	})
+	if err != nil {
+		return drPreRuntimeObservation{}, fmt.Errorf("open isolated target-anchor object-store client: %w", err)
+	}
+	defer bucket.Close()
+	anchorBytes, err := readQualifiedGenerationAnchor(ctx, bucket, target, operationID)
+	if err != nil {
+		return drPreRuntimeObservation{}, fmt.Errorf("read exact reserved target generation anchor: %w", err)
+	}
+	anchorKey := recovery.GenerationAnchorKey("rhiza/" + target)
+	corrupted := false
+	defer func() {
+		if !corrupted {
+			return
+		}
+		cleanupCtx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+		defer cancel()
+		resultErr = joinAnchorRestoreError(resultErr, restoreExactCorruptedAnchor(cleanupCtx, bucket, anchorKey, []byte("CORRUPTED"), anchorBytes))
+	}()
+	if err := bucket.Upload(ctx, anchorKey, strings.NewReader("CORRUPTED")); err != nil {
+		return drPreRuntimeObservation{}, fmt.Errorf("corrupt exact reserved target generation anchor: %w", err)
+	}
+	corrupted = true
+	corruptReadback, err := bucket.Get(ctx, anchorKey)
+	if err != nil {
+		return drPreRuntimeObservation{}, err
+	}
+	corruptBytes, readErr := io.ReadAll(io.LimitReader(corruptReadback, 32))
+	closeErr := corruptReadback.Close()
+	if readErr != nil || closeErr != nil || string(corruptBytes) != "CORRUPTED" {
+		return drPreRuntimeObservation{}, fmt.Errorf("corrupted target anchor readback differs: read=%v close=%v", readErr, closeErr)
+	}
+	if err := applyAnchorRecord(ctx, savedRecordJSON); err != nil {
+		return drPreRuntimeObservation{}, fmt.Errorf("restore exact saved source record before corrupt-target retry: %w", err)
+	}
+	if err := assertExternalAnchorRecord(ctx, originalRecord); err != nil {
+		return drPreRuntimeObservation{}, err
+	}
+	if err := restartOperatorForAnchorRetry(ctx, child); err != nil {
+		return drPreRuntimeObservation{}, err
+	}
+	child, err = waitForAnchorBlocked(ctx, fenceOperationID, "target generation anchor unavailable", true)
+	if err != nil {
+		return drPreRuntimeObservation{}, fmt.Errorf("corrupt target generation anchor did not block the same recovery: %w", err)
+	}
+	if gotOperation, gotTarget, identityErr := exactAnchorRecoveryIdentity(child); identityErr != nil || gotOperation != operationID || gotTarget != target {
+		return drPreRuntimeObservation{}, fmt.Errorf("corrupt-anchor retry changed its retained operation or target: %v", identityErr)
+	}
+	if err := assertAnchorRecoverySourceUnchanged(ctx, sourceSTS); err != nil {
+		return drPreRuntimeObservation{}, fmt.Errorf("corrupt-anchor gate changed the source workload: %w", err)
+	}
+	event("anchor_gate_corrupt_target", obj{"fenceOperationID": fenceOperationID, "anchorOperationID": operationID, "targetClusterID": target, "stage": nested(child, "status", "stage"), "phase": nested(child, "status", "phase"), "anchorRecordState": "corrupt", "corruptBytesSHA256": fmt.Sprintf("%x", sha256.Sum256(corruptBytes))})
+	if err := restoreExactCorruptedAnchor(ctx, bucket, anchorKey, []byte("CORRUPTED"), anchorBytes); err != nil {
+		return drPreRuntimeObservation{}, fmt.Errorf("restore exact saved target generation anchor: %w", err)
+	}
+	corrupted = false
+	if _, err := readQualifiedGenerationAnchor(ctx, bucket, target, operationID); err != nil {
+		return drPreRuntimeObservation{}, fmt.Errorf("restored target generation anchor is not valid: %w", err)
+	}
+	event("anchor_gate_restored_exact_target", obj{"fenceOperationID": fenceOperationID, "anchorOperationID": operationID, "targetClusterID": target, "anchorRecordState": "restored_exact", "anchorArtifactSHA256": fmt.Sprintf("%x", sha256.Sum256(anchorBytes))})
+	if err := restartOperatorForAnchorRetry(ctx, child); err != nil {
+		return drPreRuntimeObservation{}, err
+	}
+	observation, err = observeDRAssignmentsBeforeRuntime(ctx, sourceStatefulSetUID, out)
+	if err != nil {
+		return drPreRuntimeObservation{}, err
+	}
+	if observation.OperationID != operationID || observation.TargetClusterID != target {
+		return drPreRuntimeObservation{}, fmt.Errorf("restored generation did not resume the same retained operation and target")
+	}
+	event("anchor_gates_restored", obj{"fenceOperationID": fenceOperationID, "anchorOperationID": operationID, "targetClusterID": target, "preRuntimeAssignmentObserved": true})
+	return observation, nil
+}
+
+func waitForAnchorBlocked(ctx context.Context, fenceOperationID, message string, requireFresh bool) (obj, error) {
+	var selected obj
+	err := wait(ctx, "exact anchor recovery remains sealed and blocked", func() (bool, error) {
+		child, ok, err := recoveryForFenceOperation(ctx, fenceOperationID)
+		if err != nil || !ok {
+			return false, err
+		}
+		statusMessage := strings.ToLower(text(nested(child, "status", "message")))
+		if nested(child, "status", "stage") != "Sealed" || nested(child, "status", "phase") != "Blocked" || !strings.Contains(statusMessage, strings.ToLower(message)) {
+			return false, nil
+		}
+		if requireFresh {
+			generation, _ := nested(child, "metadata", "generation").(float64)
+			observed, _ := nested(child, "status", "observedGeneration").(float64)
+			if generation == 0 || observed < generation {
+				return false, nil
+			}
+		}
+		selected = child
+		return true, nil
+	})
+	return selected, err
+}
+
+func recoveryForFenceOperation(ctx context.Context, operationID string) (obj, bool, error) {
+	list, err := get(ctx, "rhizarecoveries", "")
+	if err != nil {
+		return nil, false, err
+	}
+	items, _ := list["items"].([]any)
+	var selected obj
+	for _, item := range items {
+		if text(nested(item, "metadata", "name")) == operationID || text(nested(item, "spec", "recoveryID")) == operationID ||
+			text(nested(item, "spec", "fence", "recoveryID")) == operationID || text(nested(item, "status", "recoveryID")) == operationID {
+			if selected != nil {
+				return nil, false, fmt.Errorf("multiple recovery resources match the exact generation-fence operation")
+			}
+			selected, _ = item.(map[string]any)
+		}
+	}
+	return selected, selected != nil, nil
+}
+
+func exactAnchorRecoveryIdentity(child obj) (string, string, error) {
+	target := text(nested(child, "status", "target"))
+	name := text(nested(child, "spec", "recoveryID"))
+	uid := text(nested(child, "metadata", "uid"))
+	if target == "" || strings.ContainsAny(target, "/\\") || name == "" || uid == "" ||
+		text(nested(child, "status", "recoveryID")) != name || nested(child, "spec", "anchorID") != recoveryAnchorID || nested(child, "spec", "sourceClusterID") != "chaos-source" {
+		return "", "", fmt.Errorf("sealed recovery lacks an exact retained UID/name/target")
+	}
+	return uid + ":" + name, target, nil
+}
+
+func assertAnchorRecoverySourceUnchanged(ctx context.Context, originalSTS obj) error {
+	liveSTS, err := get(ctx, "statefulset", "rhiza")
+	if err != nil {
+		return err
+	}
+	replicas, replicasOK := nested(liveSTS, "spec", "replicas").(float64)
+	if text(nested(liveSTS, "metadata", "uid")) != text(nested(originalSTS, "metadata", "uid")) ||
+		!bytes.Equal(encoded(nested(liveSTS, "spec")), encoded(nested(originalSTS, "spec"))) || !replicasOK || replicas != 3 {
+		return fmt.Errorf("source StatefulSet identity, spec, or replicas changed")
+	}
+	root, err := get(ctx, "rhizacluster", "rhiza")
+	if err != nil {
+		return err
+	}
+	if text(nested(root, "status", "activeClusterID")) != "chaos-source" {
+		return fmt.Errorf("root active cluster changed before external anchor approval")
+	}
+	return nil
+}
+
+func restartOperatorForAnchorRetry(ctx context.Context, child obj) error {
+	name := text(nested(child, "metadata", "name"))
+	if name == "" {
+		return fmt.Errorf("anchor retry child has no exact resource name")
+	}
+	if err := scaleOperator(ctx, 0); err != nil {
+		return err
+	}
+	if err := scaleOperator(ctx, 1); err != nil {
+		return err
+	}
+	patch := encoded(obj{"status": obj{"observedGeneration": float64(0)}})
+	if _, err := kubectl(ctx, "patch", "rhizarecovery", name, "--subresource=status", "--type=merge", "-p", string(patch)); err != nil {
+		return fmt.Errorf("request fresh anchor reconciliation for exact recovery %s: %w", name, err)
+	}
+	return nil
+}
+
+func applyAnchorRecord(ctx context.Context, raw string) error {
+	var record recoveryanchor.Record
+	if err := json.Unmarshal([]byte(raw), &record); err != nil {
+		return fmt.Errorf("decode saved external anchor record: %w", err)
+	}
+	manifest := encoded(obj{"apiVersion": "v1", "kind": "ConfigMap", "metadata": obj{"name": recoveryAnchorConfigMap, "namespace": namespace}, "data": obj{"anchor.json": raw}})
+	if _, err := kubectlInput(ctx, manifest, "apply", "-f", "-"); err != nil {
+		return fmt.Errorf("apply source anchor ConfigMap: %w", err)
+	}
+	return nil
+}
+
+func assertExternalAnchorRecord(ctx context.Context, expected recoveryanchor.Record) error {
+	config, err := get(ctx, "configmap", recoveryAnchorConfigMap)
+	if err != nil {
+		return err
+	}
+	var record recoveryanchor.Record
+	if err := json.Unmarshal([]byte(text(nested(config, "data", "anchor.json"))), &record); err != nil {
+		return fmt.Errorf("decode external anchor readback: %w", err)
+	}
+	gotJSON, gotErr := json.Marshal(record)
+	wantJSON, wantErr := json.Marshal(expected)
+	if gotErr != nil || wantErr != nil || !bytes.Equal(gotJSON, wantJSON) {
+		return fmt.Errorf("external anchor record readback differs from the exact saved source record (PendingWrite=%t)", expected.PendingWrite)
+	}
+	return nil
+}
+
+func readQualifiedGenerationAnchor(ctx context.Context, bucket *objmetrics.MeteredBucket, target, operationID string) ([]byte, error) {
+	if target == "" || strings.ContainsAny(target, "/\\") {
+		return nil, fmt.Errorf("unsafe retained target identifier")
+	}
+	key := recovery.GenerationAnchorKey("rhiza/" + target)
+	reader, err := bucket.Get(ctx, key)
+	if err != nil {
+		return nil, err
+	}
+	data, readErr := io.ReadAll(io.LimitReader(reader, 1<<20+1))
+	closeErr := reader.Close()
+	if readErr != nil || closeErr != nil || len(data) > 1<<20 {
+		return nil, fmt.Errorf("read bounded target generation anchor: %v", errors.Join(readErr, closeErr))
+	}
+	var anchor recovery.GenerationAnchor
+	if err := json.Unmarshal(data, &anchor); err != nil || recovery.ValidateGenerationAnchor(anchor) != nil || anchor.OperationID != operationID || anchor.TargetPrefix != "rhiza/"+target {
+		return nil, fmt.Errorf("target generation anchor does not bind the exact reserved recovery")
+	}
+	canonical, err := json.Marshal(anchor)
+	if err != nil || !bytes.Equal(data, canonical) {
+		return nil, fmt.Errorf("target generation anchor is not canonical")
+	}
+	return data, nil
 }
 
 type drPreRuntimeObservation struct {
@@ -2058,6 +2489,9 @@ func readDRPreRuntimeObservation(ctx context.Context, sourceStatefulSetUID, out 
 	if err != nil || requestHash != receipt.RequestHash || request.TargetClusterID != target || request.StatefulSetUID != sourceStatefulSetUID || request.AnchorID != recoveryAnchorID || receipt.Target.ClusterID != target || receipt.Generation == 0 {
 		return drPreRuntimeObservation{}, false, fmt.Errorf("pre-runtime anchor approval pair differs from its recovery target")
 	}
+	if err := validateRecoveryAnchorTargetBinding(request, receipt); err != nil {
+		return drPreRuntimeObservation{}, false, err
+	}
 	secretName := text(nested(child, "status", "secretName"))
 	if secretName == "" {
 		return drPreRuntimeObservation{}, false, nil
@@ -2146,7 +2580,7 @@ func readDRPreRuntimeObservation(ctx context.Context, sourceStatefulSetUID, out 
 		if len(initStatuses) != 1 || nested(initStatuses[0], "name") != "rhiza-prepare" || nested(initStatuses[0], "state", "terminated") != nil || nested(initStatuses[0], "state", "waiting") == nil && nested(initStatuses[0], "state", "running") == nil {
 			continue
 		}
-		if len(listAny(nested(pod, "status", "containerStatuses"))) != 0 {
+		if !preRuntimeApplicationStatusesSafe(listAny(nested(pod, "status", "containerStatuses"))) {
 			continue
 		}
 		runtimeBound := false
@@ -2246,6 +2680,9 @@ func verifyDRSuccessor(ctx context.Context, sourceStatefulSetUID, targetClusterI
 	requestHash, err := recoveryanchor.RequestHash(request)
 	if err != nil || requestHash != receipt.RequestHash || request.AnchorID != recoveryAnchorID || request.TargetClusterID != targetClusterID || request.StatefulSetUID != sourceStatefulSetUID || receipt.AnchorID != recoveryAnchorID || receipt.OperationID != request.OperationID || receipt.Generation == 0 || receipt.Target.ClusterID != targetClusterID {
 		return nil, fmt.Errorf("retained approval pair is incomplete or does not match the completed target")
+	}
+	if err := validateRecoveryAnchorTargetBinding(request, receipt); err != nil {
+		return nil, err
 	}
 	if request.Fork.Tip == 0 || request.Fork.ManifestHash == "" || request.Fork.PrefixHash == "" || request.TargetMembership.Cluster != targetClusterID {
 		return nil, fmt.Errorf("approved recovery fork or membership is incomplete")
@@ -2639,7 +3076,7 @@ func qualifyOnline(ctx context.Context, survivor *forward, adminToken, stsUID, b
 		}
 		items, _ := list["items"].([]any)
 		for _, item := range items {
-			if nested(item, "spec", "scope") != "Voter" || nested(item, "status", "proof") == nil {
+			if nested(item, "status", "proof") == nil || !isIntendedOnlineVoterFence(item, stsUID, bindingUID, failed) {
 				continue
 			}
 			if err := verifyScopedProof(ctx, item, stsUID, bindingUID, []string{failed.PodUID}, operator.ScopeVoter, []operator.FenceTarget{failed}, out); err != nil {
@@ -2675,6 +3112,9 @@ func qualifyOnline(ctx context.Context, survivor *forward, adminToken, stsUID, b
 			return false, err
 		}
 		if child.Status.Phase != "Complete" || child.Status.Membership == nil || child.Status.Membership.Phase != "Complete" {
+			return false, nil
+		}
+		if !onlineRepairQualificationReady(child, retainedOnlineRepairCompletion(ctx, voterRequest.OperationID, stsUID, bindingUID, failed)) {
 			return false, nil
 		}
 		root, err := get(ctx, "rhizacluster", "rhiza")
@@ -2756,6 +3196,122 @@ func qualifyOnline(ctx context.Context, survivor *forward, adminToken, stsUID, b
 	}
 	event("online_operator_observation_fault_removed", obj{"fault": fault})
 	return targets, os.WriteFile(filepath.Join(out, "online-completed-membership.json"), encoded(obj{"recovery": child, "targets": targets, "observations": observations}), 0600)
+}
+
+func preRuntimeApplicationStatusesSafe(statuses []any) bool {
+	if len(statuses) == 0 {
+		return true
+	}
+	if len(statuses) != 1 {
+		return false
+	}
+	status := statuses[0]
+	if nested(status, "name") != "rhiza" || nested(status, "ready") == true || nested(status, "restartCount") != float64(0) ||
+		nested(status, "containerID") != nil && nested(status, "containerID") != "" || nested(status, "imageID") != nil && nested(status, "imageID") != "" ||
+		nested(status, "lastState") != nil || nested(status, "state", "running") != nil || nested(status, "state", "terminated") != nil {
+		return false
+	}
+	return nested(status, "state", "waiting", "reason") == "PodInitializing"
+}
+
+func isIntendedOnlineVoterFence(item any, stsUID, bindingUID string, target operator.FenceTarget) bool {
+	var request operator.FenceRequest
+	if json.Unmarshal(encoded(nested(item, "spec")), &request) != nil {
+		return false
+	}
+	return request.OperationID != "" && request.Scope == operator.ScopeVoter && request.LogicalID == "fencing-e2e" &&
+		request.Namespace == namespace && request.StatefulSet == "rhiza" && request.StatefulSetUID == stsUID &&
+		request.BindingUID == bindingUID && request.SourceClusterID == "chaos-source" && len(request.Targets) == 1 && request.Targets[0] == target
+}
+
+func retainedOnlineRepairCompletion(ctx context.Context, operationID, stsUID, bindingUID string, old operator.FenceTarget) bool {
+	maps, err := get(ctx, "configmaps", "")
+	if err != nil {
+		return false
+	}
+	return retainedOnlineRepairCompletionFromMaps(maps, operationID, stsUID, bindingUID, old)
+}
+
+func retainedOnlineRepairCompletionFromMaps(maps obj, operationID, stsUID, bindingUID string, old operator.FenceTarget) bool {
+	items, _ := maps["items"].([]any)
+	for _, item := range items {
+		data := text(nested(item, "data", "ledger.json"))
+		if data == "" {
+			continue
+		}
+		var state fenceLedgerState
+		if json.Unmarshal([]byte(data), &state) != nil || state.StatefulSetUID != stsUID || state.Ledger.SourceClusterID != oldSourceClusterID {
+			continue
+		}
+		record, ok := retainedRepairRecord(state.Ledger, operationID)
+		if !ok || text(nested(item, "metadata", "uid")) == "" || record.Authorization.LedgerUID != text(nested(item, "metadata", "uid")) ||
+			!membershipRepairCompletionAccepted(record, operationID, stsUID, bindingUID, old) {
+			continue
+		}
+		return true
+	}
+	return false
+}
+
+func onlineRepairQualificationReady(child operator.Resource, authorityAccepted bool) bool {
+	return child.Status.Phase == "Complete" && child.Status.Membership != nil && child.Status.Membership.Phase == "Complete" && authorityAccepted
+}
+
+const oldSourceClusterID = "chaos-source"
+
+func retainedRepairRecord(ledger fencing.Ledger, operationID string) (fencing.MembershipRepairRecord, bool) {
+	if ledger.MembershipRepair != nil && ledger.MembershipRepair.Authorization.OperationID == operationID {
+		return *ledger.MembershipRepair, true
+	}
+	record, ok := ledger.MembershipRepairHistory[operationID]
+	return record, ok
+}
+
+func membershipRepairCompletionAccepted(record fencing.MembershipRepairRecord, operationID, stsUID, bindingUID string, old operator.FenceTarget) bool {
+	auth := record.Authorization
+	completion := record.Progress.Completion
+	if auth.Validate() != nil || auth.OperationID != operationID || auth.RootUID != bindingUID || auth.StatefulSetUID != stsUID || auth.SourceClusterID != oldSourceClusterID ||
+		auth.OldIdentity.NodeID != old.NodeID || fencing.PodNameForIdentity(auth.OldIdentity) != old.Pod || auth.OldIdentity.PodUID != old.PodUID || auth.OldIdentity.WALIdentity != old.WALIdentity ||
+		record.Progress.Stage != fencing.MembershipRepairComplete || completion == nil || completion.Accepted == nil {
+		return false
+	}
+	request, response := completion.Request, *completion.Accepted
+	if network.ValidateMembershipRepairCompletionRequest(request) != nil || request.RepairOperationID != operationID || request.RepairBindingDigest != fencing.MembershipRepairAuthorizationHash(auth) ||
+		request.SourceClusterID != oldSourceClusterID || request.CandidatePodUID == "" || request.CandidateMember.WALIdentity == "" || request.CandidateMember.PublicKey == (quepaxa.PublicKey{}) ||
+		request.CandidateMember.ID == "" || response.MAC == "" || response.Outcome != "completed" {
+		return false
+	}
+	digest, err := network.MembershipRepairCompletionRequestDigest(request)
+	if err != nil || request.ScopeDigest != fencing.MembershipRepairCompletionScopeDigest(request) || response.Version != request.Version || response.Action != request.Action ||
+		response.Challenge != request.Challenge || response.AttemptRevision != request.AttemptRevision || response.ScopeDigest != request.ScopeDigest || response.RequestDigest != digest ||
+		response.ExecutorNodeID != request.ExecutorNodeID || response.ExecutorPodUID != request.ExecutorPodUID || response.ExecutorRunID != request.ExecutorRunID ||
+		response.ExecutorWALIdentity != request.ExecutorWALIdentity || response.TerminalSlot != request.TerminalSlot || response.TerminalHash != request.TerminalHash {
+		return false
+	}
+	var phase *fencing.MembershipRepairPhase
+	var candidate *fencing.MembershipRepairCandidate
+	var result *fencing.MembershipRepairPhaseResult
+	for i := range record.Progress.Phases {
+		if record.Progress.Phases[i].Hash == request.PhaseHash {
+			phase = &record.Progress.Phases[i]
+		}
+	}
+	for i := range record.Progress.Candidates {
+		if record.Progress.Candidates[i].Assignment.PodUID == request.CandidatePodUID {
+			candidate = &record.Progress.Candidates[i]
+		}
+	}
+	for i := range record.Progress.Results {
+		if record.Progress.Results[i].PhaseHash == request.PhaseHash {
+			result = &record.Progress.Results[i]
+		}
+	}
+	return phase != nil && phase.Kind == fencing.MembershipRepairAdd && candidate != nil && candidate.Member != nil && *candidate.Member == request.CandidateMember &&
+		candidate.Assignment.PodName == old.Pod && candidate.Assignment.PodUID == request.CandidatePodUID && candidate.Assignment.NodeID == string(request.CandidateMember.ID) &&
+		phase.Change.Add != nil && *phase.Change.Add == request.CandidateMember && phase.Change.OperationID == request.JournalOperationID &&
+		phase.CandidatePodUID == request.CandidatePodUID && fencing.BootstrapAssignmentDigest(candidate.Assignment) == request.CandidateBindRef && result != nil && result.Outcome == "completed" &&
+		result.JournalOperationID == request.JournalOperationID && result.JournalRequestHash == request.JournalRequestHash && bytes.Equal(encoded(result.Target), encoded(request.Target)) &&
+		result.FreezeSlot == request.FreezeSlot && result.FreezeHash == request.FreezeHash && result.TerminalSlot == request.TerminalSlot && result.TerminalHash == request.TerminalHash
 }
 
 func checkRows(ctx context.Context, f *forward, token, expected string) error {

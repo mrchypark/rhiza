@@ -273,7 +273,7 @@ func managedDRRuntimeAdmissionFixture(t *testing.T, azureEndpoint string) (types
 	request := assignment.DRApproval.Request
 	request.TargetMembership = recovery.NewMembershipRecord(string(config.ClusterID), config.Members, string(config.ObjStoreDurability))
 	assignment.NodeID = string(config.NodeID)
-	assignment.MembershipHash = request.TargetMembership.Membership
+	assignment.MembershipHash = fencing.BootstrapMembersHash(config.Members)
 	assignment.StoreIdentityHash = managedStoreIdentityHash(&config)
 	requestHash, err := recoveryanchor.RequestHash(request)
 	if err != nil {

@@ -135,9 +135,14 @@ func serve(ctx context.Context, args []string) error {
 	}
 	anchorURL, anchorTokenFile := os.Getenv("RHIZA_RECOVERY_ANCHOR_URL"), os.Getenv("RHIZA_RECOVERY_ANCHOR_TOKEN_FILE")
 	anchorCAFile, anchorStorageID := os.Getenv("RHIZA_RECOVERY_ANCHOR_CA_FILE"), os.Getenv("RHIZA_RECOVERY_ANCHOR_STORAGE_ID")
-	if anchorURL != "" || anchorTokenFile != "" || anchorCAFile != "" || anchorStorageID != "" {
-		if anchorURL == "" || anchorTokenFile == "" || anchorStorageID == "" {
-			return fmt.Errorf("DR admission requires RHIZA_RECOVERY_ANCHOR_URL, RHIZA_RECOVERY_ANCHOR_TOKEN_FILE, and explicit RHIZA_RECOVERY_ANCHOR_STORAGE_ID")
+	anchorPolicy := os.Getenv("RHIZA_RECOVERY_ANCHOR_BINDING_POLICY")
+	if anchorURL != "" || anchorTokenFile != "" || anchorCAFile != "" || anchorStorageID != "" || anchorPolicy != "" {
+		if anchorURL == "" || anchorTokenFile == "" {
+			return fmt.Errorf("DR admission requires RHIZA_RECOVERY_ANCHOR_URL and RHIZA_RECOVERY_ANCHOR_TOKEN_FILE")
+		}
+		bindingConfig, err := recoveryAnchorBindingConfig(anchorPolicy, anchorStorageID, bucketConfig)
+		if err != nil {
+			return err
 		}
 		if err := validateAnchorEndpoint(anchorURL); err != nil {
 			return err
@@ -156,7 +161,7 @@ func serve(ctx context.Context, args []string) error {
 			}
 		}
 		executor.Anchor = &recoveryanchor.Client{URL: anchorURL, TokenFile: anchorTokenFile, Client: &http.Client{Timeout: 10 * time.Second, Transport: &http.Transport{TLSClientConfig: &tls.Config{MinVersion: tls.VersionTLS12, RootCAs: roots}}}}
-		executor.AnchorStorageID = anchorStorageID
+		executor.AnchorBindingConfig = bindingConfig
 	}
 	// Independent evidence is optional and off unless the administrator configures
 	// the whole trust relationship. A partial configuration fails startup.
@@ -185,6 +190,20 @@ func serve(ctx context.Context, args []string) error {
 			}
 		}
 	}
+}
+
+func recoveryAnchorBindingConfig(policy, storageID string, store objectstore.Config) (*recoveryanchor.StorageBindingConfig, error) {
+	if err := objectstore.ValidateConfig(store); err != nil {
+		return nil, fmt.Errorf("recovery anchor object-store configuration: %w", err)
+	}
+	binding := &recoveryanchor.StorageBindingConfig{Policy: recoveryanchor.StorageBindingPolicy(policy), OpaqueStorageID: storageID}
+	if store.Provider != objectstore.ProviderFilesystem {
+		binding.Provider, binding.Endpoint, binding.Bucket, binding.Prefix = string(store.Provider), store.Endpoint, store.Bucket, store.Prefix
+	}
+	if err := binding.Validate(); err != nil {
+		return nil, fmt.Errorf("recovery anchor storage binding: %w", err)
+	}
+	return binding, nil
 }
 
 func openPeerClosureBucket(ctx context.Context, config objectstore.Config) (thanosobjstore.Bucket, error) {

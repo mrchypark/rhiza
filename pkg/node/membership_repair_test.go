@@ -32,6 +32,7 @@ type membershipRepairSessionFixture struct {
 	qualificationCode atomic.Int32
 	authorized        []fencing.MembershipRepairPhase
 	preparedPhase     *fencing.MembershipRepairPhase
+	prepared          []fencing.MembershipRepairPhasePrepareRequest
 	observed          []fencing.MembershipRepairPhaseObserveRequest
 	completed         []fencing.MembershipRepairPhaseObserveRequest
 	closureReq        fencing.PeerClosureRequest
@@ -129,6 +130,7 @@ func (f *membershipRepairSessionFixture) serve(w http.ResponseWriter, r *http.Re
 			return
 		}
 		f.mu.Lock()
+		f.prepared = append(f.prepared, *message.RepairPhasePrepare)
 		var phase *fencing.MembershipRepairPhase
 		if f.view != nil {
 			if len(f.view.Progress.Candidates) > 0 {
@@ -429,6 +431,9 @@ func TestMembershipRepairWorkerRequestsClosureForBoundCandidate(t *testing.T) {
 	}
 	if authority.closureRead.Load() != 1 || authority.closureCall.Load() != 1 || authority.closureReq.TargetNodeID != "c" || authority.closureReq.TargetWALIdentity != identities["c"] || authority.closureReq.ExpectedConfigID != 1 || authority.closureReq.ExpectedAbortSlot == nil || *authority.closureReq.ExpectedAbortSlot != 0 {
 		t.Fatalf("closure request did not preserve exact old target and round: %+v", authority.closureReq)
+	}
+	if len(authority.prepared) != 1 || authority.prepared[0].OperationID != view.Authorization.OperationID || authority.prepared[0].Kind != fencing.MembershipRepairRemove {
+		t.Fatalf("CandidateBound closure did not prepare its retained REMOVE phase: %+v", authority.prepared)
 	}
 }
 

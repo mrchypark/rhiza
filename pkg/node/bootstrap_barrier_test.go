@@ -2,7 +2,9 @@ package node
 
 import (
 	"context"
+	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -125,5 +127,32 @@ func TestInitialBootstrapBarrierNonceBindsOperation(t *testing.T) {
 	otherOperation := fencing.BootstrapBarrierNonce("operation-b")
 	if first == otherOperation {
 		t.Fatalf("operation change did not change nonce: %x %x", first, otherOperation)
+	}
+}
+
+func TestPreparedDRVoterDoesNotEnterInitialGenesisReadinessGate(t *testing.T) {
+	config, assignment := managedDRRuntimeAdmissionFixture(t, "http://127.0.0.1:1")
+	if err := os.MkdirAll(config.DataDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	marker, err := preparedMarkerForConfig(&config)
+	if err != nil {
+		t.Fatal(err)
+	}
+	marker.Phase = "preparing"
+	marker.DRAssignment = &assignment
+	if err := writePreparedRestoreIntent(config.DataDir, marker); err != nil {
+		t.Fatal(err)
+	}
+	marker.Phase = "complete"
+	marker.CertifiedTip = 1
+	marker.TipPrefixHash = strings.Repeat("a", 64)
+	if err := writePreparedRestoreMarker(config.DataDir, marker); err != nil {
+		t.Fatal(err)
+	}
+	n := &Node{config: &config}
+	n.observeCatchUp(context.Background(), nil)
+	if !n.ready.Load() {
+		t.Fatal("validated DR voter remained gated on an initial-genesis marker")
 	}
 }

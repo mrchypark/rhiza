@@ -344,18 +344,36 @@ func TestLedgerCanonicalSameUIDRunRequiresTerminalAndPreservesSettledNeighbor(t 
 	if err := l.Register(first); err != nil {
 		t.Fatal(err)
 	}
+	second := first
+	second.RunID = "run-2"
+	if err := l.Register(second); err == nil {
+		t.Fatal("same Pod UID started a second run while prior run had no known WAL")
+	}
+	if len(l.Runs) != 1 || l.Runs[first.RunID].Identity != first {
+		t.Fatal("rejected same-UID run changed retained history")
+	}
 	first.WALIdentity = "wal-0"
 	if err := l.Bind(first); err != nil {
 		t.Fatal(err)
 	}
-	second := first
-	second.RunID = "run-2"
-	second.WALIdentity = ""
-	if err := l.Register(second); err == nil {
-		t.Fatal("same Pod UID started a second run without terminal evidence")
+	if err := l.Register(second); err != nil {
+		t.Fatalf("same-Pod intact-WAL restart registration: %v", err)
 	}
-	if len(l.Runs) != 1 || l.Runs[first.RunID].Identity != first {
-		t.Fatal("rejected same-UID run changed retained history")
+	wrongWAL := second
+	wrongWAL.WALIdentity = "wal-recreated"
+	if err := l.Bind(wrongWAL); err == nil {
+		t.Fatal("same-Pod restart changed the historical WAL")
+	}
+	second.WALIdentity = "wal-0"
+	if err := l.Bind(second); err != nil {
+		t.Fatalf("same-Pod intact-WAL restart bind: %v", err)
+	}
+	wrongCredential := second
+	wrongCredential.RunID = "run-credential-change"
+	wrongCredential.WALIdentity = ""
+	wrongCredential.CredentialUID = "recreated-secret-uid"
+	if err := l.Register(wrongCredential); err == nil {
+		t.Fatal("same Pod UID accepted a recreated immutable credential")
 	}
 	next := second
 	next.RunID = "run-new-uid"
@@ -370,17 +388,19 @@ func TestLedgerCanonicalSameUIDRunRequiresTerminalAndPreservesSettledNeighbor(t 
 	if err := l.CloseNodes("close", "hash", []string{first.NodeID}); err != nil {
 		t.Fatal(err)
 	}
-	request := *l.Runs[first.RunID].Stop
-	if err := l.RecordDrain(DrainReceipt{Request: request, WritersJoined: true}); err != nil {
-		t.Fatal(err)
-	}
-	if err := l.RecordExit(request); err != nil {
-		t.Fatal(err)
+	for _, runID := range []string{first.RunID, second.RunID} {
+		request := *l.Runs[runID].Stop
+		if err := l.RecordDrain(DrainReceipt{Request: request, WritersJoined: true}); err != nil {
+			t.Fatal(err)
+		}
+		if err := l.RecordExit(request); err != nil {
+			t.Fatal(err)
+		}
 	}
 	if err := l.Register(next); err != nil {
 		t.Fatalf("terminal-settled old UID did not permit its new-UID neighbor: %v", err)
 	}
-	if len(l.Runs) != 2 || !runTerminated(l.Runs[first.RunID]) || l.Runs[next.RunID].Identity != next {
+	if len(l.Runs) != 3 || !runTerminated(l.Runs[first.RunID]) || !runTerminated(l.Runs[second.RunID]) || l.Runs[next.RunID].Identity != next {
 		t.Fatal("settled neighbor changed or erased the old incarnation history")
 	}
 }

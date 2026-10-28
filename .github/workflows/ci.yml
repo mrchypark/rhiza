@@ -477,6 +477,7 @@ jobs:
           tags: rhiza-operator:ci
 
   anchor-operator-chaos:
+    needs: cooperative-fencing
     runs-on: ubuntu-latest
     timeout-minutes: 30
     env:
@@ -494,11 +495,31 @@ jobs:
         with:
           go-version-file: go.mod
           cache: true
-      - name: Build test images and Kubernetes cluster
+      - name: Reject optional publication until the published host has exact-runtime qualification
+        if: env.PUBLISH_CHAOS_IMAGE == 'true'
+        run: |
+          echo '::error::Optional publication is disabled until the exact embedded-go host binary runs the anchor-gated runtime scenario.'
+          exit 1
+      - name: Download cooperative runtime's allowlisted qualification evidence
+        uses: actions/download-artifact@v4
+        with:
+          name: cooperative-fencing-${{ github.run_id }}
+          path: cooperative-fencing-results/public
+      - name: Verify the three anchor gates and final same-target recovery
         env:
           CGO_ENABLED: 0
         run: |
-          go install sigs.k8s.io/kind@v0.32.0
+          mkdir -p anchor-chaos-results
+          sha256sum --check cooperative-fencing-results/public/SHA256SUMS
+          test "$(cat cooperative-fencing-results/public/source-head.txt)" = "$GITHUB_SHA"
+          go build -o "$RUNNER_TEMP/fencing-e2e-verifier" ./e2e/fencing
+          "$RUNNER_TEMP/fencing-e2e-verifier" verify-anchor-gate-evidence cooperative-fencing-results/public/events.jsonl cooperative-fencing-results/public/dr-qualification.json cooperative-fencing-results/public/source-head.txt "$GITHUB_SHA" > anchor-chaos-results/anchor-gates.json
+          sha256sum cooperative-fencing-results/public/events.jsonl > anchor-chaos-results/source-evidence.sha256
+      - name: Build the qualification host for the optional publication flow
+        if: env.PUBLISH_CHAOS_IMAGE == 'true'
+        env:
+          CGO_ENABLED: 0
+        run: |
           mkdir -p "$RUNNER_TEMP/chaos-images"
           go build -o "$RUNNER_TEMP/chaos-images/rhiza" ./e2e/chaos/embedded-go
           go build -o "$RUNNER_TEMP/chaos-images/operator" ./cmd/rhiza-operator
@@ -513,25 +534,14 @@ jobs:
           docker build -f e2e/chaos/Dockerfile --build-arg BINARY=rhiza "${labels[@]}" -t rhiza-chaos:local "$RUNNER_TEMP/chaos-images"
           docker build -f e2e/chaos/Dockerfile --build-arg BINARY=operator -t rhiza-operator-chaos:local "$RUNNER_TEMP/chaos-images"
           docker build -f e2e/chaos/Dockerfile --build-arg BINARY=anchor-service -t rhiza-anchor-service:local "$RUNNER_TEMP/chaos-images"
-          kind create cluster --name rhiza-anchor-chaos --wait 120s
-          kind load docker-image rhiza-chaos:local rhiza-operator-chaos:local rhiza-anchor-service:local --name rhiza-anchor-chaos
       - name: Fencing executor regression checks
         run: python3 e2e/chaos/kind_fencer_test.py
-      - name: Inject faults and verify anchor-gated recovery
-        run: python3 -u e2e/chaos/anchor_recovery.py --embedded-host go
-      - name: Collect cluster diagnostics
-        if: always()
-        run: kind export logs anchor-chaos-results/kind --name rhiza-anchor-chaos || true
       - uses: actions/upload-artifact@v4
         if: always()
         with:
           name: anchor-operator-chaos-${{ github.run_id }}
-          path: |
-            anchor-chaos-results
-            !anchor-chaos-results/kind/**
-      - name: Remove test cluster
-        if: always()
-        run: kind delete cluster --name rhiza-anchor-chaos
+          path: anchor-chaos-results
+          if-no-files-found: error
       - name: Export the tested qualification host
         if: env.PUBLISH_CHAOS_IMAGE == 'true'
         run: |

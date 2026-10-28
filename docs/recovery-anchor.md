@@ -116,6 +116,21 @@ to connect to the recovery-anchor service. See [embedded-operator.md](embedded-o
 | `RHIZA_RECOVERY_ANCHOR_URL` | HTTPS URL of the recovery-anchor service (e.g. `https://anchor.svc:9191`) |
 | `RHIZA_RECOVERY_ANCHOR_TOKEN_FILE` | Path to the bearer token file for the anchor service |
 | `RHIZA_RECOVERY_ANCHOR_CA_FILE` | Path to the TLS CA certificate file for the anchor service |
+| `RHIZA_RECOVERY_ANCHOR_BINDING_POLICY` | Required storage-binding policy: `derived` or `opaque` |
+| `RHIZA_RECOVERY_ANCHOR_STORAGE_ID` | Required only for `opaque`; independently managed storage identity |
+
+With `derived`, the operator and fencing authority compute the expected
+binding from the effective `RHIZA_OBJSTORE_PROVIDER`, endpoint, bucket, and
+base prefix shared with the application and anchor service. Credentials are
+not part of that identity. The bundled S3 and GCS recipes are supported; GCS
+does not accept an endpoint override. Azure requires `opaque` because the
+five-field recipe does not cover its full storage identity. `opaque` must be
+selected explicitly and must use an independently verified storage ID; the
+receipt itself is never used to establish the expected binding.
+
+Both client deployments consume the same optional `rhiza-recovery-anchor`
+ConfigMap and mount the same token Secret and optional CA ConfigMap read-only.
+Do not configure the storage policy or binding ID from an untrusted request.
 
 Workload Pods must also set:
 

@@ -13,7 +13,6 @@ import (
 	"github.com/mrchypark/rhiza/pkg/fencing"
 	"github.com/mrchypark/rhiza/pkg/quepaxa"
 	"github.com/mrchypark/rhiza/pkg/recovery"
-	"github.com/mrchypark/rhiza/pkg/recoveryanchor"
 )
 
 const prepareInitContainerName = "rhiza-prepare"
@@ -130,7 +129,8 @@ func validateBootstrapLedgerOperation(ledger fencing.Ledger, pin bootstrapLedger
 // ID is separately configured; it is never derived from the archive prefix or
 // the opaque StoreIdentity digest.
 func (e *FencingExecutor) drSuccessorAssignment(ctx context.Context, stsUID, rootUID string, id fencing.Identity, operationID string) (fencing.BootstrapAssignment, fenceLedger, string, error) {
-	if e.Anchor == nil || e.AnchorStorageID == "" || id.SourceClusterID == "" {
+	wantBinding, bindingErr := expectedAnchorBinding(e.AnchorBindingConfig, e.AnchorStorageID, id.SourceClusterID)
+	if e.Anchor == nil || bindingErr != nil {
 		return fencing.BootstrapAssignment{}, fenceLedger{}, "", fencing.ErrPending
 	}
 	state, ledgerUID, _, err := e.readWithUID(ctx, stsUID, id.SourceClusterID)
@@ -149,8 +149,10 @@ func (e *FencingExecutor) drSuccessorAssignment(ctx context.Context, stsUID, roo
 	if request.TargetClusterID != id.SourceClusterID || receipt.Target.ClusterID != id.SourceClusterID {
 		return fencing.BootstrapAssignment{}, state, ledgerUID, fencing.ErrPending
 	}
-	want := recoveryanchor.Binding{ClusterID: id.SourceClusterID, StorageID: e.AnchorStorageID}
-	if err := e.Anchor.VerifyAdmission(ctx, request, receipt, want, receipt.Generation); err != nil {
+	if receipt.Target != wantBinding {
+		return fencing.BootstrapAssignment{}, state, ledgerUID, fencing.ErrPending
+	}
+	if err := e.Anchor.VerifyAdmission(ctx, request, receipt, wantBinding, receipt.Generation); err != nil {
 		return fencing.BootstrapAssignment{}, state, ledgerUID, fmt.Errorf("fencing: DR successor anchor admission is not current: %w", err)
 	}
 	var secret object
@@ -162,7 +164,7 @@ func (e *FencingExecutor) drSuccessorAssignment(ctx context.Context, stsUID, roo
 		return fencing.BootstrapAssignment{}, state, ledgerUID, fencing.ErrPending
 	}
 	members, err := recoveryMembers(string(membersData))
-	if err != nil || hashJSON(members) != assignment.MembershipHash {
+	if err != nil || fencing.BootstrapMembersHash(members) != assignment.MembershipHash {
 		return fencing.BootstrapAssignment{}, state, ledgerUID, fencing.ErrPending
 	}
 	return assignment, state, ledgerUID, nil
@@ -236,7 +238,7 @@ func (e *FencingExecutor) bootstrapTrust(ctx context.Context, stsUID, rootUID, s
 		return bootstrapLedgerPin{}, fencing.ErrPending
 	}
 	members, err := recoveryMembers(string(membersData))
-	if err != nil || hashJSON(members) != pin.MembershipHash {
+	if err != nil || fencing.BootstrapMembersHash(members) != pin.MembershipHash {
 		return bootstrapLedgerPin{}, fencing.ErrPending
 	}
 	return pin, nil
@@ -1481,7 +1483,7 @@ func (c *Controller) assignBootstrapPods(ctx context.Context, r *ClusterResource
 		return fmt.Errorf("pinned bootstrap membership is invalid")
 	}
 	members, err := recoveryMembers(string(encoded))
-	if err != nil || len(members) != r.Spec.VoterCount || hashJSON(members) != pin.MembershipHash {
+	if err != nil || len(members) != r.Spec.VoterCount || fencing.BootstrapMembersHash(members) != pin.MembershipHash {
 		return fmt.Errorf("pinned bootstrap membership changed")
 	}
 	voters, err := derivedVoters(r, sts)

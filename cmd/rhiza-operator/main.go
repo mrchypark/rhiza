@@ -108,7 +108,8 @@ func run(ctx context.Context, namespace string, poll time.Duration, deleteNamesp
 	anchorTokenFile := os.Getenv("RHIZA_RECOVERY_ANCHOR_TOKEN_FILE")
 	anchorCAFile := os.Getenv("RHIZA_RECOVERY_ANCHOR_CA_FILE")
 	anchorStorageID := os.Getenv("RHIZA_RECOVERY_ANCHOR_STORAGE_ID")
-	anchorConfigured, err := recoveryAnchorConfigured(anchorURL, anchorTokenFile, anchorCAFile, anchorStorageID)
+	anchorPolicy := os.Getenv("RHIZA_RECOVERY_ANCHOR_BINDING_POLICY")
+	anchorConfigured, anchorBinding, err := recoveryAnchorConfigured(anchorURL, anchorTokenFile, anchorCAFile, anchorPolicy, anchorStorageID, bucketConfig)
 	if err != nil {
 		return err
 	}
@@ -134,20 +135,30 @@ func run(ctx context.Context, namespace string, poll time.Duration, deleteNamesp
 			TokenFile: anchorTokenFile,
 			Client:    &http.Client{Timeout: 10 * time.Second, Transport: &http.Transport{TLSClientConfig: &tls.Config{MinVersion: tls.VersionTLS12, RootCAs: anchorRoots}}},
 		}
-		controller.AnchorBinding.StorageID = anchorStorageID
+		controller.AnchorBindingConfig = anchorBinding
 	}
 	return controller.Run(ctx, poll)
 }
 
-func recoveryAnchorConfigured(endpoint, tokenFile, caFile, storageID string) (bool, error) {
-	configured := endpoint != "" || tokenFile != "" || caFile != "" || storageID != ""
+func recoveryAnchorConfigured(endpoint, tokenFile, caFile, policy, storageID string, store objectstore.Config) (bool, *recoveryanchor.StorageBindingConfig, error) {
+	configured := endpoint != "" || tokenFile != "" || caFile != "" || policy != "" || storageID != ""
 	if !configured {
-		return false, nil
+		return false, nil, nil
 	}
-	if endpoint == "" || tokenFile == "" || storageID == "" {
-		return false, fmt.Errorf("RHIZA_RECOVERY_ANCHOR_URL, RHIZA_RECOVERY_ANCHOR_TOKEN_FILE, and RHIZA_RECOVERY_ANCHOR_STORAGE_ID must all be set when any recovery anchor setting is configured")
+	if endpoint == "" || tokenFile == "" {
+		return false, nil, fmt.Errorf("RHIZA_RECOVERY_ANCHOR_URL and RHIZA_RECOVERY_ANCHOR_TOKEN_FILE must be set when any recovery anchor setting is configured")
 	}
-	return true, nil
+	if err := objectstore.ValidateConfig(store); err != nil {
+		return false, nil, fmt.Errorf("recovery anchor object-store configuration: %w", err)
+	}
+	binding := &recoveryanchor.StorageBindingConfig{Policy: recoveryanchor.StorageBindingPolicy(policy), OpaqueStorageID: storageID}
+	if store.Provider != objectstore.ProviderFilesystem {
+		binding.Provider, binding.Endpoint, binding.Bucket, binding.Prefix = string(store.Provider), store.Endpoint, store.Bucket, store.Prefix
+	}
+	if err := binding.Validate(); err != nil {
+		return false, nil, fmt.Errorf("recovery anchor storage binding: %w", err)
+	}
+	return true, binding, nil
 }
 
 func configureDeletion(kube *operator.Kubernetes, raw, namespaceFile string) error {

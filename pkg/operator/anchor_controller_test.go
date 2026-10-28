@@ -10,6 +10,7 @@ import (
 	"testing"
 
 	"github.com/mrchypark/rhiza/pkg/recoveryanchor"
+	"github.com/thanos-io/objstore"
 )
 
 // fakeAnchorClient implements AnchorClient for controller tests.
@@ -216,6 +217,89 @@ func TestAnchorSuccessFullFlow(t *testing.T) {
 	if r.Status.AnchorRequest == nil || r.Status.AnchorReceipt == nil {
 		t.Fatal("anchor request/receipt not persisted")
 	}
+}
+
+func TestAnchorDerivedBindingAcceptanceAndWrongTargetNegative(t *testing.T) {
+	newDerivedConfig := func(c *Controller) *recoveryanchor.StorageBindingConfig {
+		return &recoveryanchor.StorageBindingConfig{
+			Policy:   recoveryanchor.StorageBindingDerived,
+			Provider: c.StoreIdentity["RHIZA_OBJSTORE_PROVIDER"], Endpoint: c.StoreIdentity["RHIZA_OBJSTORE_ENDPOINT"],
+			Bucket: c.StoreIdentity["RHIZA_OBJSTORE_BUCKET"], Prefix: c.StoreIdentity["RHIZA_OBJSTORE_PREFIX"],
+		}
+	}
+	makeAnchor := func(cfg *recoveryanchor.StorageBindingConfig, wrong bool) *fakeAnchorClient {
+		return &fakeAnchorClient{activate: func(_ context.Context, req recoveryanchor.Request) (recoveryanchor.Receipt, error) {
+			requestHash, err := recoveryanchor.RequestHash(req)
+			if err != nil {
+				return recoveryanchor.Receipt{}, err
+			}
+			binding, err := cfg.ExpectedBinding(req.TargetClusterID)
+			if err != nil {
+				return recoveryanchor.Receipt{}, err
+			}
+			if wrong {
+				binding.StorageID = "receipt-only-untrusted-store"
+			}
+			return recoveryanchor.Receipt{AnchorID: req.AnchorID, OperationID: req.OperationID, RequestHash: requestHash, Target: binding, Generation: 1}, nil
+		}}
+	}
+	setup := func(t *testing.T) (context.Context, objstore.Bucket, *Resource, *operatorAPI, *Controller) {
+		t.Helper()
+		ctx, bucket, r, api, c := controllerFixture(t, "before-ack", "before-ack")
+		r.Spec.RecoveryID = "recovery-derived"
+		r.Spec.Fence = fence(r)
+		r.Spec.AnchorID = "derived-anchor"
+		setAnchorEnv(r, api)
+		return ctx, bucket, r, api, c
+	}
+
+	t.Run("accepted exact derived target", func(t *testing.T) {
+		ctx, bucket, r, _, c := setup(t)
+		cfg := newDerivedConfig(c)
+		anchor := makeAnchor(cfg, false)
+		advance := func(want string) {
+			t.Helper()
+			c = &Controller{Kube: c.Kube, Bucket: bucket, Prefix: c.Prefix, StoreIdentity: c.StoreIdentity, Anchor: anchor, AnchorBindingConfig: cfg}
+			if err := c.reconcileAll(ctx); err != nil {
+				t.Fatal(err)
+			}
+			if r.Status.Stage != want {
+				t.Fatalf("stage=%q want=%q phase=%q message=%q", r.Status.Stage, want, r.Status.Phase, r.Status.Message)
+			}
+		}
+		advance("Reserved")
+		advance("Sealed")
+		advance("Stopping")
+		if r.Status.AnchorReceipt == nil {
+			t.Fatal("controller did not retain the independently derived receipt")
+		}
+		want, err := cfg.ExpectedBinding(r.Status.Target)
+		if err != nil || r.Status.AnchorReceipt.Target != want {
+			t.Fatalf("retained target=%+v want=%+v err=%v", r.Status.AnchorReceipt.Target, want, err)
+		}
+	})
+
+	t.Run("receipt target inconsistent with trusted store", func(t *testing.T) {
+		ctx, bucket, r, _, c := setup(t)
+		cfg := newDerivedConfig(c)
+		anchor := makeAnchor(cfg, true)
+		for _, want := range []string{"Reserved", "Sealed"} {
+			c = &Controller{Kube: c.Kube, Bucket: bucket, Prefix: c.Prefix, StoreIdentity: c.StoreIdentity, Anchor: anchor, AnchorBindingConfig: cfg}
+			if err := c.reconcileAll(ctx); err != nil {
+				t.Fatal(err)
+			}
+			if r.Status.Stage != want {
+				t.Fatalf("stage=%q want=%q", r.Status.Stage, want)
+			}
+		}
+		c = &Controller{Kube: c.Kube, Bucket: bucket, Prefix: c.Prefix, StoreIdentity: c.StoreIdentity, Anchor: anchor, AnchorBindingConfig: cfg}
+		if err := c.reconcileAll(ctx); err != nil {
+			t.Fatal(err)
+		}
+		if r.Status.Phase != "Blocked" || r.Status.AnchorReceipt != nil || !strings.Contains(r.Status.Message, "trusted storage configuration") {
+			t.Fatalf("untrusted target receipt was not rejected: status=%+v", r.Status)
+		}
+	})
 }
 
 func TestAnchorMissingReceiptBlocks(t *testing.T) {

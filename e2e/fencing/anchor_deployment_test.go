@@ -60,6 +60,24 @@ func TestRecoveryAnchorDeploymentIsSharedAndOptIn(t *testing.T) {
 			}
 			assertOptionalAnchorConfig(t, container)
 			assertAnchorMount(t, podSpec, container)
+			if deployment.name == "fencer" {
+				sources := map[string]bool{}
+				for _, raw := range container["envFrom"].([]any) {
+					from := yamlMap(t, raw)
+					for _, refName := range []string{"configMapRef", "secretRef"} {
+						if ref, ok := from[refName]; ok {
+							refConfig := yamlMap(t, ref)
+							name := refConfig["name"].(string)
+							sources[name] = refConfig["optional"] == true
+						}
+					}
+				}
+				for _, name := range []string{"rhiza-config", "rhiza-object-store", anchorDeploymentConfigMap} {
+					if !sources[name] {
+						t.Fatalf("fencer lacks optional effective store/anchor env source %q", name)
+					}
+				}
+			}
 		})
 	}
 
@@ -73,17 +91,32 @@ func TestRecoveryAnchorDeploymentIsSharedAndOptIn(t *testing.T) {
 	}
 	values := yamlMap(t, data[0]["data"])
 	for key, want := range map[string]string{
-		"RHIZA_RECOVERY_ANCHOR_URL":        "https://replace-with-trusted-anchor.example/v1",
-		"RHIZA_RECOVERY_ANCHOR_TOKEN_FILE": "/var/run/secrets/rhiza-recovery-anchor-token/token",
-		"RHIZA_RECOVERY_ANCHOR_STORAGE_ID": "replace-with-exact-trusted-target-storage-id",
+		"RHIZA_RECOVERY_ANCHOR_URL":            "https://replace-with-trusted-anchor.example/v1",
+		"RHIZA_RECOVERY_ANCHOR_TOKEN_FILE":     "/var/run/secrets/rhiza-recovery-anchor-token/token",
+		"RHIZA_RECOVERY_ANCHOR_BINDING_POLICY": "derived",
 	} {
 		if values[key] != want {
 			t.Errorf("example %s=%v, want %q", key, values[key], want)
 		}
 	}
+	if _, exists := values["RHIZA_RECOVERY_ANCHOR_STORAGE_ID"]; exists {
+		t.Fatal("derived example must not require or pin a static storage ID")
+	}
+	if !strings.Contains(string(mustReadFile(t, "../../deploy/operator/fencing/recovery-anchor-config.example.yaml")), "RHIZA_RECOVERY_ANCHOR_BINDING_POLICY: opaque") {
+		t.Fatal("example must document the explicit opaque alternative")
+	}
 	if _, exists := values["RHIZA_RECOVERY_ANCHOR_CA_FILE"]; exists {
 		t.Fatal("example must leave the private-CA path unset unless the CA is supplied")
 	}
+}
+
+func mustReadFile(t *testing.T, path string) []byte {
+	t.Helper()
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return data
 }
 
 func TestRecoveryAnchorHandlerUsesSharedStaticBearer(t *testing.T) {

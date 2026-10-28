@@ -95,7 +95,19 @@ func (n *Node) resumeMembershipRepairView(ctx context.Context, view fencing.Memb
 		if qualification.Preclosure == nil || qualification.Preclosure.CandidateMember != *candidate.Member || qualification.Preclosure.CandidateBindRef != fencing.BootstrapAssignmentDigest(candidate.Assignment) {
 			return fmt.Errorf("candidate preclosure proof differs from retained binding")
 		}
-		return n.requestMembershipRepairClosure(ctx, view)
+		if err := n.requestMembershipRepairClosure(ctx, view); err != nil {
+			return err
+		}
+		prepared, err := n.fenceSession.PrepareMembershipRepairPhase(ctx, fencing.MembershipRepairPhasePrepareRequest{
+			OperationID: view.Authorization.OperationID, Kind: fencing.MembershipRepairRemove,
+		})
+		if err != nil {
+			return fmt.Errorf("prepare retained REMOVE phase after closure: %w", err)
+		}
+		if prepared.Phase.CandidatePodUID != candidate.Assignment.PodUID || prepared.Phase.Validate(view.Authorization, *candidate) != nil {
+			return fmt.Errorf("prepared REMOVE phase differs from retained candidate")
+		}
+		return nil
 	case fencing.MembershipRepairOldClosed:
 		phase, ok := retainedRepairPhase(view, candidate.Assignment.PodUID, fencing.MembershipRepairRemove)
 		if !ok {

@@ -74,7 +74,14 @@ func run() error {
 		return fmt.Errorf("kubernetes client: %w", err)
 	}
 
-	storeCfg := objstorecfg.LoadConfig()
+	storeCfg, err := objstorecfg.LoadOperatorConfig()
+	if err != nil {
+		return fmt.Errorf("load object store configuration: %w", err)
+	}
+	bindingConfig, err := anchorStorageBindingConfig(storeCfg, os.Getenv("RHIZA_RECOVERY_ANCHOR_BINDING_POLICY"), os.Getenv("RHIZA_RECOVERY_ANCHOR_STORAGE_ID"))
+	if err != nil {
+		return fmt.Errorf("anchor storage binding configuration: %w", err)
+	}
 	bucket, err := objstorecfg.NewBucket(storeCfg)
 	if err != nil {
 		return fmt.Errorf("object store bucket: %w", err)
@@ -103,13 +110,16 @@ func run() error {
 			copy(targetAnchorHash[:], decoded)
 		}
 
-		sourceStorageID := hashStoreIdentity(storeCfg, req.SourceClusterID)
+		sourceBinding, err := bindingConfig.ExpectedBinding(req.SourceClusterID)
+		if err != nil {
+			return recoveryanchor.Binding{}, nil, err
+		}
 
 		if rec.Binding.ClusterID != req.SourceClusterID {
 			return recoveryanchor.Binding{}, nil, fmt.Errorf("binding cluster mismatch: record %q, request %q", rec.Binding.ClusterID, req.SourceClusterID)
 		}
-		if rec.Binding.StorageID != sourceStorageID {
-			return recoveryanchor.Binding{}, nil, fmt.Errorf("binding storage mismatch: record %q, computed %q", rec.Binding.StorageID, sourceStorageID)
+		if rec.Binding != sourceBinding {
+			return recoveryanchor.Binding{}, nil, fmt.Errorf("binding mismatch: record %+v, computed %+v", rec.Binding, sourceBinding)
 		}
 
 		if req.SourcePrefix != storagePrefix(storeCfg, req.SourceClusterID) {
@@ -120,14 +130,14 @@ func run() error {
 		}
 
 		var appEvidence []byte
-		_, err := recovery.RecoverApplicationEvidence(
+		_, err = recovery.RecoverApplicationEvidence(
 			ctx, bucket, req.TargetPrefix,
 			recovery.EvidenceOptions{
-				ExpectedAnchorHash:    targetAnchorHash,
-				ExpectedMembership:    req.TargetMembership,
-				ExpectedForkResult:    req.Fork,
-				ExpectedSourcePrefix:  req.SourcePrefix,
-				ExpectedOperationID:   req.OperationID,
+				ExpectedAnchorHash:   targetAnchorHash,
+				ExpectedMembership:   req.TargetMembership,
+				ExpectedForkResult:   req.Fork,
+				ExpectedSourcePrefix: req.SourcePrefix,
+				ExpectedOperationID:  req.OperationID,
 			},
 			func(ctx context.Context, mat *recovery.RecoveredMaterializer) error {
 				rows, err := mat.Query(ctx, "SELECT epoch, token FROM trust_state WHERE id = 1")
@@ -149,9 +159,9 @@ func run() error {
 			return recoveryanchor.Binding{}, nil, fmt.Errorf("no evidence produced")
 		}
 
-		targetBinding := recoveryanchor.Binding{
-			ClusterID: req.TargetClusterID,
-			StorageID: hashStoreIdentity(storeCfg, req.TargetClusterID),
+		targetBinding, err := bindingConfig.ExpectedBinding(req.TargetClusterID)
+		if err != nil {
+			return recoveryanchor.Binding{}, nil, err
 		}
 		return targetBinding, appEvidence, nil
 	}

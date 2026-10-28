@@ -87,7 +87,17 @@ func (n *Node) persistBootstrapBarrier(ctx context.Context, nonce [types.ReadBar
 }
 
 func (n *Node) completeInitialBootstrap(ctx context.Context) error {
-	if n.config == nil || n.config.PreparedPodUID == "" || !preparedGenesisNodeCandidate(n.config) {
+	if n.config == nil || n.config.PreparedPodUID == "" {
+		return nil
+	}
+	if _, isDR, err := preparedDRAssignmentForRuntime(n.config); err != nil {
+		return err
+	} else if isDR {
+		// DR activation is admitted against the live anchor before WAL binding;
+		// it does not own the initial-genesis completion marker.
+		return nil
+	}
+	if !preparedGenesisNodeCandidate(n.config) {
 		return nil
 	}
 	if n.fenceSession == nil {

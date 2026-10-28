@@ -2,6 +2,8 @@ package fencing
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"net/http"
@@ -11,7 +13,21 @@ import (
 	"reflect"
 	"strings"
 	"testing"
+
+	"github.com/mrchypark/rhiza/pkg/quepaxa"
 )
+
+func TestBootstrapMembersHashMatchesFullSerializedProducerDigest(t *testing.T) {
+	members := []quepaxa.Member{{ID: "n1", URL: "https://n1", PublicKey: quepaxa.PublicKey{1}}, {ID: "n2", PeerURL: "quic://n2", PublicKey: quepaxa.PublicKey{2}}}
+	encoded, err := json.Marshal(members)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := sha256.Sum256(encoded)
+	if got := BootstrapMembersHash(members); got != hex.EncodeToString(want[:]) {
+		t.Fatalf("bootstrap assignment digest=%s, want full-member JSON digest %x", got, want)
+	}
+}
 
 func TestBootstrapLedgerRetainsPerProcessInitEvidence(t *testing.T) {
 	ledger := &Ledger{SourceClusterID: "source"}

@@ -71,7 +71,7 @@ func TestFenceWatcherKeepsEngineAliveAcrossActualSessionOutage(t *testing.T) {
 			handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 				switch r.URL.Path {
 				case "/v1/startup":
-					_ = json.NewEncoder(w).Encode(identity)
+					_ = json.NewEncoder(w).Encode(fencing.Registration{Identity: identity})
 				case "/v1/bind":
 					w.WriteHeader(http.StatusOK)
 				case "/v1/stop":

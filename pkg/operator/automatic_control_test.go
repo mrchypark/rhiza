@@ -17,7 +17,9 @@ import (
 	"time"
 
 	"github.com/mrchypark/rhiza/internal/types"
+	"github.com/mrchypark/rhiza/pkg/fencing"
 	"github.com/mrchypark/rhiza/pkg/network"
+	"github.com/mrchypark/rhiza/pkg/node"
 	"github.com/mrchypark/rhiza/pkg/quepaxa"
 	"github.com/mrchypark/rhiza/pkg/recovery"
 	"github.com/thanos-io/objstore"
@@ -1082,11 +1084,9 @@ func prepareBootstrapFixture(sts object) {
 	ctr["securityContext"] = object{"allowPrivilegeEscalation": false, "capabilities": object{"drop": []any{"ALL"}}}
 	ctr["env"] = replaceEnv(list(ctr["env"]), "RHIZA_NODE_ID", object{"name": "RHIZA_NODE_ID", "valueFrom": object{"fieldRef": object{"fieldPath": "metadata.name"}}})
 	ctr["env"] = replaceEnv(list(ctr["env"]), "RHIZA_ENABLE_RECONFIGURATION", object{"name": "RHIZA_ENABLE_RECONFIGURATION", "value": "true"})
-	ctr["env"] = append(list(ctr["env"]),
-		object{"name": "RHIZA_DATA_DIR", "value": "/data"},
-		object{"name": "FENCER_AUTHORITY_URL", "value": "https://rhiza-fencer:9444/v1/supervisor"},
-		object{"name": "FENCER_CA_FILE", "value": "/fencer-ca/ca.crt"},
-	)
+	ctr["env"] = replaceEnv(list(ctr["env"]), "RHIZA_DATA_DIR", object{"name": "RHIZA_DATA_DIR", "value": "/data"})
+	ctr["env"] = replaceEnv(list(ctr["env"]), "FENCER_AUTHORITY_URL", object{"name": "FENCER_AUTHORITY_URL", "value": "https://rhiza-fencer:9444/v1/supervisor"})
+	ctr["env"] = replaceEnv(list(ctr["env"]), "FENCER_CA_FILE", object{"name": "FENCER_CA_FILE", "value": "/fencer-ca/ca.crt"})
 	ctr["volumeMounts"] = append(list(ctr["volumeMounts"]),
 		object{"name": "fence-token", "mountPath": "/var/run/secrets/rhiza-fencer", "readOnly": true},
 		object{"name": "fence-ca", "mountPath": "/fencer-ca", "readOnly": true},
@@ -1095,6 +1095,95 @@ func prepareBootstrapFixture(sts object) {
 		object{"name": "fence-token", "projected": object{"sources": []any{object{"serviceAccountToken": object{"path": "token", "audience": "rhiza-fencer", "expirationSeconds": float64(600)}}}}},
 		object{"name": "fence-ca", "configMap": object{"name": "rhiza-fencer-ca"}},
 	)
+}
+
+func TestDRSuccessorPrepareProfileAllowsOnlyPinnedInitialOperationTransition(t *testing.T) {
+	newStatefulSet := func(previousOperation, rootUID string) (object, object) {
+		sts := freshBootstrapSTS(3)
+		prepareBootstrapFixture(sts)
+		annotations := asObject(nested(sts, "spec", "template", "metadata", "annotations"))
+		annotations[fencingPrepareOperationAnnotation] = previousOperation
+		annotations[fencingRootAnnotation] = rootUID
+		ctr, _ := container(sts, "rhiza")
+		return sts, ctr
+	}
+	const rootUID, previous = "root-uid", "pinned-initial-operation"
+	recovery := &Resource{Metadata: object{"uid": "recovery-uid"}, Spec: Spec{RecoveryID: "recover", AnchorID: "anchor"}, Status: Status{Stage: "Starting", RecoveryID: "recover", Target: "rhiza-r-" + shortID("recovery-uid:recover"), StatefulSetUID: "sts-uid"}}
+	sts, ctr := newStatefulSet(previous, rootUID)
+	if err := installDRSuccessorPrepareInitProfile(sts, ctr, rootUID, previous, recovery); err != nil {
+		t.Fatalf("exact initial-to-DR transition rejected: %v", err)
+	}
+	if got, want := str(nested(sts, "spec", "template", "metadata", "annotations", fencingPrepareOperationAnnotation)), drSuccessorOperationID("recovery-uid:recover", "sts-uid", recovery.Status.Target); got != want {
+		t.Fatalf("successor operation=%q want %q", got, want)
+	}
+	for name, tc := range map[string]struct {
+		previous, root string
+		mutate         func(*Resource)
+	}{
+		"wrong previous operation":  {previous: "other-initial", root: rootUID},
+		"wrong root":                {previous: previous, root: "other-root"},
+		"wrong successor workload":  {previous: previous, root: rootUID, mutate: func(r *Resource) { r.Status.StatefulSetUID = "other-sts" }},
+		"wrong successor target":    {previous: previous, root: rootUID, mutate: func(r *Resource) { r.Status.Target = "other-target" }},
+		"wrong successor operation": {previous: previous, root: rootUID, mutate: func(r *Resource) { r.Spec.RecoveryID = "other-operation" }},
+	} {
+		t.Run(name, func(t *testing.T) {
+			badSTS, badCtr := newStatefulSet(tc.previous, tc.root)
+			badRecovery := *recovery
+			badRecovery.Metadata = map[string]any{"uid": "recovery-uid"}
+			badRecovery.Status = recovery.Status
+			badRecovery.Spec = recovery.Spec
+			if tc.mutate != nil {
+				tc.mutate(&badRecovery)
+			}
+			if err := installDRSuccessorPrepareInitProfile(badSTS, badCtr, rootUID, previous, &badRecovery); err == nil {
+				t.Fatal("unapproved prepare profile transition accepted")
+			}
+		})
+	}
+}
+
+func TestAuthorizedInitialPrepareOperationResolvesExactLiveRootAndPin(t *testing.T) {
+	root := ClusterResource{Metadata: object{"uid": "root-uid", "name": "root", "namespace": "test"}, Spec: ClusterSpec{Automatic: true, StatefulSet: "rhiza", AdoptClusterID: "source"}}
+	sts := object{"metadata": object{"uid": "sts-uid", "name": "rhiza"}}
+	api := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch r.URL.Path {
+		case "/apis/rhiza.mrchypark.dev/v1alpha1/namespaces/test/rhizaclusters":
+			_ = json.NewEncoder(w).Encode(object{"items": []any{root}})
+		case "/apis/apps/v1/namespaces/test/statefulsets/rhiza":
+			_ = json.NewEncoder(w).Encode(sts)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer api.Close()
+	bucket := autoBucket(t)
+	tokenPath := filepath.Join(t.TempDir(), "token")
+	if err := os.WriteFile(tokenPath, []byte("test-token"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	controller := &Controller{Kube: &Kubernetes{BaseURL: api.URL, Namespace: "test", TokenFile: tokenPath, Client: api.Client()}, Bucket: bucket, Prefix: "root"}
+	pin := bootstrapLedgerPin{Version: 1, OperationID: "pinned-initial-operation", RequestHash: strings.Repeat("a", 64), AuthorizationHash: strings.Repeat("b", 64),
+		RootUID: "root-uid", StatefulSetUID: "sts-uid", SourceClusterID: "source", CredentialName: "credentials", CredentialUID: "credential-uid",
+		MembershipHash: strings.Repeat("c", 64), ProfileHash: strings.Repeat("d", 64), LedgerUID: "ledger-uid"}
+	if err := uploadBootstrapTestObject(context.Background(), bucket, controller.bootstrapLedgerPinKey(&root), pin); err != nil {
+		t.Fatal(err)
+	}
+	got, err := controller.authorizedInitialPrepareOperation(context.Background(), "root-uid", "sts-uid", "source")
+	if err != nil || got != pin.OperationID {
+		t.Fatalf("resolved initial prepare pin=%q err=%v", got, err)
+	}
+	for name, tc := range map[string]struct{ rootUID, stsUID, source string }{
+		"different root":        {rootUID: "replacement-root", stsUID: "sts-uid", source: "source"},
+		"different StatefulSet": {rootUID: "root-uid", stsUID: "replacement-sts", source: "source"},
+		"different source":      {rootUID: "root-uid", stsUID: "sts-uid", source: "other-source"},
+	} {
+		t.Run(name, func(t *testing.T) {
+			if operation, err := controller.authorizedInitialPrepareOperation(context.Background(), tc.rootUID, tc.stsUID, tc.source); err == nil {
+				t.Fatalf("unauthorized live binding resolved operation %q", operation)
+			}
+		})
+	}
 }
 
 func TestClusterFreshBootstrapValidatesRuntimeIdentity(t *testing.T) {
@@ -1860,8 +1949,48 @@ func TestClusterFreshBootstrapGeneratesImmutableIdentitiesOnce(t *testing.T) {
 	if r.Status.Message != "bootstrap membership installed; starting voters" || int(number(nested(api.sts, "spec", "replicas"))) != count {
 		t.Fatalf("bootstrap scale-up status=%+v replicas=%v", r.Status, nested(api.sts, "spec", "replicas"))
 	}
+	api.pods = make([]object, 0, count)
+	for i := 0; i < count; i++ {
+		data, err := json.Marshal(nested(api.sts, "spec", "template"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		var pod object
+		if err := json.Unmarshal(data, &pod); err != nil {
+			t.Fatal(err)
+		}
+		name := fmt.Sprintf("rhiza-%d", i)
+		meta := asObject(pod["metadata"])
+		meta["name"], meta["uid"] = name, fmt.Sprintf("pod-uid-%d", i)
+		meta["ownerReferences"] = []any{object{"apiVersion": "apps/v1", "kind": "StatefulSet", "name": "rhiza", "uid": "sts-uid", "controller": true}}
+		asObject(pod["spec"])["nodeName"] = "worker-1"
+		api.pods = append(api.pods, pod)
+	}
 	if err := c.reconcileCluster(ctx, r); err != nil {
 		t.Fatal(err)
+	}
+	pin, err := c.readBootstrapLedgerPin(ctx, r)
+	if err != nil || pin.MembershipHash != fencing.BootstrapMembersHash(members) {
+		t.Fatalf("actual bootstrap producer pin hash=%q err=%v, want full-member digest %q", pin.MembershipHash, err, fencing.BootstrapMembersHash(members))
+	}
+	ledger, ledgerUID, _, err := (&FencingExecutor{Kube: c.Kube}).readWithUID(ctx, pin.StatefulSetUID, pin.SourceClusterID)
+	if err != nil || ledgerUID != pin.LedgerUID || ledger.Ledger.Bootstrap == nil {
+		t.Fatalf("actual bootstrap producer ledger uid=%q err=%v", ledgerUID, err)
+	}
+	operation := ledger.Ledger.Bootstrap.Operations[pin.OperationID]
+	assignment, ok := operation.Assignments["pod-uid-0"]
+	if !ok || assignment.MembershipHash != pin.MembershipHash || assignment.NodeID != "rhiza-0" {
+		t.Fatalf("actual assigned bootstrap operation=%+v", operation)
+	}
+	consumerConfig := &types.ExecutionConfig{
+		ClusterID: types.ClusterID(assignment.SourceClusterID), NodeID: types.NodeID(assignment.NodeID),
+		PreparedPodUID: assignment.PodUID, DataDir: filepath.Join(t.TempDir(), "initial-node"),
+		EnableReconfiguration: true, Members: members, ObjStoreProvider: "s3", ObjStoreEndpoint: "https://s3.example",
+		ObjStoreBucket: "archive", ObjStorePrefix: "root", ObjStoreDurability: types.ObjectStoreDurabilityAsync,
+	}
+	cleanup, genesisDigest, err := node.PrepareManagedInit(ctx, consumerConfig, assignment)
+	if err != nil || !cleanup.CleanupSucceeded || genesisDigest == "" {
+		t.Fatalf("actual producer assignment did not pass initial managed consumer: cleanup=%+v digest=%q err=%v", cleanup, genesisDigest, err)
 	}
 	state, _, err := c.loadAuto(ctx, c.autoKey(r))
 	if err != nil || len(state.Voters) != count || api.secretCreates != 1 {

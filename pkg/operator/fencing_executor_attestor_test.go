@@ -180,6 +180,32 @@ func TestAttestedFenceNeverReplacesTheCooperativeLedger(t *testing.T) {
 	}
 }
 
+func TestUnresolvedRepairInitHistoryBlocksCooperativeAndIndependentFenceCompletion(t *testing.T) {
+	attestor := &stubAttestor{fn: func(req AttestationRequest) (*AttestationResponse, error) { return independentEvidenceFor(req), nil }}
+	executor, api, record := newAttestedExecutor(t, attestor)
+	hash, err := requestHash(&record.Spec)
+	if err != nil {
+		t.Fatal(err)
+	}
+	closed := closedLedger(record.Spec, hash)
+	var state fenceLedger
+	if err := json.Unmarshal([]byte(str(nested(closed, "data", "ledger.json"))), &state); err != nil {
+		t.Fatal(err)
+	}
+	state.Ledger.MembershipRepairHistory = map[string]fencing.MembershipRepairRecord{
+		"old-repair": {Progress: fencing.MembershipRepairProgress{Candidates: []fencing.MembershipRepairCandidate{{
+			Assignment: fencing.BootstrapAssignment{PodUID: "candidate-pod", NodeID: "rhiza-0"},
+		}}}},
+	}
+	api.ledger = object{"apiVersion": "v1", "kind": "ConfigMap", "metadata": object{"name": "ledger", "namespace": "default", "resourceVersion": "1"}, "data": object{"ledger.json": string(jsonBytes(state))}}
+	if err := executor.reconcileFence(t.Context(), fenceEndpoint, record); !errors.Is(err, ErrFencePending) {
+		t.Fatalf("unresolved historical repair init did not keep fence pending: %v", err)
+	}
+	if attestor.count() != 0 || api.statusPuts != 0 {
+		t.Fatalf("unresolved init history permitted independent/cooperative completion: attestations=%d statusWrites=%d", attestor.count(), api.statusPuts)
+	}
+}
+
 func TestAttestedFenceWritesBoundIndependentProof(t *testing.T) {
 	attestor := &stubAttestor{fn: func(req AttestationRequest) (*AttestationResponse, error) { return independentEvidenceFor(req), nil }}
 	executor, api, record := newAttestedExecutor(t, attestor)

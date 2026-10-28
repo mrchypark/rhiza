@@ -20,6 +20,32 @@ func TestPeerClosureStoreDoesNotOpenFilesystemDefault(t *testing.T) {
 	}
 }
 
+func TestRecoveryAnchorBindingConfigRequiresExplicitPolicy(t *testing.T) {
+	for _, test := range []struct {
+		name, policy, storageID string
+		store                   objectstore.Config
+		wantErr                 bool
+	}{
+		{name: "derived", policy: "derived", store: objectstore.Config{Provider: objectstore.ProviderS3, Endpoint: "https://s3.example", Bucket: "archive", Prefix: "root"}},
+		{name: "opaque", policy: "opaque", storageID: "external-store", store: objectstore.Config{Provider: objectstore.ProviderFilesystem}},
+		{name: "missing policy", storageID: "external-store", wantErr: true},
+		{name: "missing opaque ID", policy: "opaque", wantErr: true},
+		{name: "derived and opaque ambiguous", policy: "derived", storageID: "external-store", store: objectstore.Config{Provider: objectstore.ProviderS3, Bucket: "archive"}, wantErr: true},
+		{name: "derived incomplete store", policy: "derived", store: objectstore.Config{Provider: objectstore.ProviderS3}, wantErr: true},
+		{name: "unknown policy", policy: "guess", wantErr: true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			cfg, err := recoveryAnchorBindingConfig(test.policy, test.storageID, test.store)
+			if (err != nil) != test.wantErr {
+				t.Fatalf("config=%+v err=%v wantErr=%t", cfg, err, test.wantErr)
+			}
+			if err == nil && cfg == nil {
+				t.Fatal("valid explicit binding returned nil config")
+			}
+		})
+	}
+}
+
 func TestPeerClosureStoreRequiresUsableRemoteConfiguration(t *testing.T) {
 	bucket, err := openPeerClosureBucket(context.Background(), objectstore.Config{Provider: objectstore.ProviderS3})
 	if err == nil || bucket != nil {

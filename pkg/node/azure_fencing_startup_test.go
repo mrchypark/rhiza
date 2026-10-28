@@ -55,7 +55,7 @@ func TestOpenSupervisedAzureDoesNotCreateContainerBeforeRejectedBind(t *testing.
 	supervisor := &http.Server{Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
 		case "/v1/startup":
-			_ = json.NewEncoder(w).Encode(fencing.Identity{SourceClusterID: "cluster", NodeID: "a", PodUID: "pod", RunID: "run"})
+			_ = json.NewEncoder(w).Encode(fencing.Registration{Identity: fencing.Identity{SourceClusterID: "cluster", NodeID: "a", PodUID: "pod", RunID: "run"}})
 		case "/v1/bind":
 			binds.Add(1)
 			w.WriteHeader(http.StatusForbidden)

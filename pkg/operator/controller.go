@@ -55,7 +55,10 @@ type Controller struct {
 	// AnchorBinding is resolved from trusted configured storage identity; it is
 	// deliberately distinct from the archive prefix and StoreIdentity hash.
 	AnchorBinding recoveryanchor.Binding
-	Anchor        AnchorClient
+	// AnchorBindingConfig is the explicit trusted derived/opaque policy used by
+	// production commands. AnchorBinding remains as an opaque compatibility API.
+	AnchorBindingConfig *recoveryanchor.StorageBindingConfig
+	Anchor              AnchorClient
 }
 type recoveryList struct {
 	Items []Resource `json:"items"`
@@ -342,6 +345,13 @@ func (c *Controller) advance(ctx context.Context, r *Resource, s sourceState) er
 			if actErr != nil {
 				return c.record(ctx, r, "Blocked", "anchor activation failed: "+actErr.Error())
 			}
+			wantBinding, bindingErr := expectedAnchorBinding(c.AnchorBindingConfig, c.AnchorBinding.StorageID, r.Status.Target)
+			if bindingErr != nil || receipt.Target != wantBinding {
+				return c.record(ctx, r, "Blocked", "anchor activation returned a target binding inconsistent with trusted storage configuration")
+			}
+			if verifyErr := c.Anchor.VerifyAdmission(ctx, req, receipt, wantBinding, receipt.Generation); verifyErr != nil {
+				return c.record(ctx, r, "Blocked", "anchor activation receipt is not current: "+verifyErr.Error())
+			}
 			r.Status.AnchorRequest = &req
 			r.Status.AnchorReceipt = &receipt
 		}
@@ -483,8 +493,11 @@ func (c *Controller) startAndObserve(ctx context.Context, r *Resource, sts objec
 			applyTargetCredentials(ctr, r.Status.SecretName)
 			if r.Spec.AnchorID != "" {
 				rootUID := str(nested(sts, "spec", "template", "metadata", "annotations", fencingRootAnnotation))
-				operationID := drSuccessorOperationID(c.operationID(r), r.Status.StatefulSetUID, r.Status.Target)
-				if err := installPrepareInitProfile(sts, ctr, operationID, rootUID); err != nil {
+				previousOperationID, err := c.authorizedInitialPrepareOperation(ctx, rootUID, r.Status.StatefulSetUID, r.Spec.SourceClusterID)
+				if err != nil {
+					return c.record(ctx, r, "Blocked", "initial prepare profile authorization is unavailable: "+err.Error())
+				}
+				if err := installDRSuccessorPrepareInitProfile(sts, ctr, rootUID, previousOperationID, r); err != nil {
 					return c.record(ctx, r, "Blocked", "DR successor prepare-init profile is unavailable: "+err.Error())
 				}
 				// ProfileHash covers the init template, so the operation must be
@@ -1056,5 +1069,9 @@ func (c *Controller) verifyAnchorRequest(ctx context.Context, r *Resource, s sou
 	if wantReq != *r.Status.AnchorRequest {
 		return fmt.Errorf("anchor request does not match current operation state")
 	}
-	return c.Anchor.Verify(ctx, *r.Status.AnchorRequest, *r.Status.AnchorReceipt)
+	wantBinding, err := expectedAnchorBinding(c.AnchorBindingConfig, c.AnchorBinding.StorageID, r.Status.Target)
+	if err != nil || r.Status.AnchorReceipt.Target != wantBinding {
+		return fmt.Errorf("anchor receipt target differs from trusted storage configuration")
+	}
+	return c.Anchor.VerifyAdmission(ctx, *r.Status.AnchorRequest, *r.Status.AnchorReceipt, wantBinding, r.Status.AnchorReceipt.Generation)
 }

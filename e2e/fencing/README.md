@@ -72,3 +72,13 @@ injection of an ambiguous storage mutation. Unknown mutation,
 stale receipt and crash history rejection are covered by focused Go regressions.
 The added online stage is not qualified until this exact candidate passes runtime
 CI; an earlier generation-only success does not qualify the extended scenario.
+
+The same cooperative runtime run also exercises three anchor gates: removing
+the external record, restoring it with `PendingWrite`, and corrupting then
+restoring the exact reserved target generation-anchor bytes. Each failure must
+leave the source workload and retained operation unchanged; only after the
+exact target bytes are restored may that operation resume. The
+`anchor-operator-chaos` CI job validates these ordered events against the final
+same-target runtime ACK and readback instead of starting a second cluster or
+rerunning the runtime scenario. Its public artifact contains only the
+allowlisted event projection and a bounded verification summary.

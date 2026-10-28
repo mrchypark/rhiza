@@ -97,7 +97,7 @@ func validateManagedDRSuccessorAssignment(config *types.ExecutionConfig, assignm
 	wantMembership := recovery.NewMembershipRecord(string(config.ClusterID), config.Members, durability)
 	if request.TargetClusterID != string(config.ClusterID) || request.StatefulSetUID != assignment.StatefulSetUID ||
 		request.TargetPrefix != path.Join(config.ObjStorePrefix, string(config.ClusterID)) || request.TargetMembership != wantMembership ||
-		assignment.MembershipHash != wantMembership.Membership || assignment.Durability != durability ||
+		assignment.MembershipHash != fencing.BootstrapMembersHash(config.Members) || assignment.Durability != durability ||
 		assignment.StoreIdentityHash != managedStoreIdentityHash(config) {
 		return fail()
 	}
@@ -139,9 +139,10 @@ func validateManagedDRSuccessorAssignment(config *types.ExecutionConfig, assignm
 }
 
 func validateManagedLearnerAssignment(config *types.ExecutionConfig, assignment fencing.BootstrapAssignment) error {
-	if config == nil || config.Learner == nil || config.Learner.ID != config.NodeID ||
+	if config == nil || config.PreparedPodUID != assignment.PodUID || string(config.ClusterID) != assignment.SourceClusterID || string(config.NodeID) != assignment.NodeID ||
+		config.Learner == nil || config.Learner.ID != config.NodeID ||
 		config.Learner.PublicKey == (quepaxa.PublicKey{}) || assignment.PublicMember.ID != assignment.NodeID ||
-		assignment.PublicMember.URL == "" || assignment.PublicMember.PeerURL == "" || assignment.PublicMember.LogURL == "" || assignment.PublicMember.WALIdentity != "" {
+		assignment.PublicMember.URL == "" || assignment.PublicMember.PeerURL == "" || assignment.PublicMember.WALIdentity != "" {
 		return fmt.Errorf("managed learner preparation requires its exact assigned public identity")
 	}
 	key, err := hex.DecodeString(assignment.PublicMember.PublicKey)
@@ -154,7 +155,7 @@ func validateManagedLearnerAssignment(config *types.ExecutionConfig, assignment 
 		ID: quepaxa.NodeID(assignment.PublicMember.ID), URL: assignment.PublicMember.URL,
 		PeerURL: assignment.PublicMember.PeerURL, LogURL: assignment.PublicMember.LogURL, PublicKey: publicKey,
 	}
-	if *config.Learner != wantMember || assignment.MembershipHash != recovery.NewMembershipRecord(string(config.ClusterID), config.Members, string(config.ObjStoreDurability)).Membership {
+	if *config.Learner != wantMember || assignment.MembershipHash != fencing.BootstrapMembersHash(config.Members) {
 		return fmt.Errorf("managed learner assignment differs from its immutable source profile")
 	}
 	durability := string(config.ObjStoreDurability)

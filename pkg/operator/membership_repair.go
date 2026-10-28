@@ -21,6 +21,7 @@ import (
 	"github.com/mrchypark/rhiza/pkg/quepaxa"
 	"github.com/mrchypark/rhiza/pkg/recovery"
 	"github.com/mrchypark/rhiza/pkg/recoveryanchor"
+	"github.com/thanos-io/objstore"
 )
 
 func membershipRepairOperationID(requestHash string) string {
@@ -262,10 +263,11 @@ func (e *FencingExecutor) membershipRepairEvidenceOptions(ctx context.Context, b
 	if approved == nil {
 		return options, false, nil
 	}
-	if e.Anchor == nil || e.AnchorStorageID == "" || approvedReceipt.Target != (recoveryanchor.Binding{ClusterID: source, StorageID: e.AnchorStorageID}) {
+	wantBinding, bindingErr := expectedAnchorBinding(e.AnchorBindingConfig, e.AnchorStorageID, source)
+	if e.Anchor == nil || bindingErr != nil || approvedReceipt.Target != wantBinding {
 		return options, false, fmt.Errorf("membership-repair source DR storage binding is unavailable")
 	}
-	if err := e.Anchor.VerifyAdmission(ctx, *approved, *approvedReceipt, approvedReceipt.Target, approvedReceipt.Generation); err != nil {
+	if err := e.Anchor.VerifyAdmission(ctx, *approved, *approvedReceipt, wantBinding, approvedReceipt.Generation); err != nil {
 		return options, false, fmt.Errorf("membership-repair source DR admission is no longer current: %w", err)
 	}
 	anchorHash, err := hex.DecodeString(approved.TargetAnchorHash)
@@ -598,13 +600,22 @@ func (e *FencingExecutor) membershipRepairSourceObservation(ctx context.Context,
 	if !identifier.MatchString(targetPodName) || targetPodName == caller.PodName {
 		return nil, fencing.ErrPending
 	}
-	control, _, err := e.controller().loadAuto(ctx, e.controller().autoKey(&binding.root))
+	control, controlVersion, err := e.controller().loadAuto(ctx, e.controller().autoKey(&binding.root))
 	if err != nil || control.BindingUID != binding.rootUID || control.BindingHash != autoBinding(&binding.root) || control.BindingVersion != autoBindingVersion || control.LegacyBindingHash != "" || control.StatefulSetUID != binding.workloadUID || control.ActiveClusterID != caller.SourceClusterID {
 		return nil, fencing.ErrPending
 	}
 	controlHash := hashJSON([]any{control.Version, control.BindingUID, control.BindingHash, control.BindingVersion, control.StatefulSetUID, control.ActiveClusterID})
 	recordHash, err := e.controller().readAutoBinding(ctx, &binding.root, control, binding.workloadUID)
 	if err != nil || controlHash != binding.autoControl || recordHash != binding.autoBinding {
+		return nil, fencing.ErrPending
+	}
+	current, pending, abortSlot, err := e.membershipRepairArchiveState(ctx, binding, fencing.MembershipRepairAuthorization{SourceClusterID: caller.SourceClusterID})
+	if err != nil || pending.ConfigID != 0 || current.ConfigID == 0 {
+		return nil, fencing.ErrPending
+	}
+	if changed, projectionErr := e.refreshCompletedRepairProjection(ctx, binding, control, controlVersion, caller.SourceClusterID, &current, targetPodName); projectionErr != nil {
+		return nil, projectionErr
+	} else if changed {
 		return nil, fencing.ErrPending
 	}
 	var targetNode string
@@ -618,11 +629,7 @@ func (e *FencingExecutor) membershipRepairSourceObservation(ctx context.Context,
 		targetNode = string(voter.NodeID)
 	}
 	old, ok := control.Identities[quepaxa.NodeID(targetNode)]
-	if targetNode == "" || !ok || old.NodeID != targetNode || old.Pod != targetPodName || old.PodUID == "" || old.WALIdentity == "" {
-		return nil, fencing.ErrPending
-	}
-	current, pending, abortSlot, err := e.membershipRepairArchiveState(ctx, binding, fencing.MembershipRepairAuthorization{SourceClusterID: caller.SourceClusterID})
-	if err != nil || pending.ConfigID != 0 || current.ConfigID == 0 || !repairMembershipContains(current, targetNode, old.WALIdentity) {
+	if targetNode == "" || !ok || old.NodeID != targetNode || old.Pod != targetPodName || old.PodUID == "" || old.WALIdentity == "" || !repairMembershipContains(current, targetNode, old.WALIdentity) {
 		return nil, fencing.ErrPending
 	}
 	var pod object
@@ -649,6 +656,145 @@ func (e *FencingExecutor) membershipRepairSourceObservation(ctx context.Context,
 		TargetNodeID: targetNode, TargetPodUID: old.PodUID, TargetWALIdentity: old.WALIdentity,
 		ReplacementPodUID: replacementUID, MembershipHash: hashJSON(current.Members),
 	}, nil
+}
+
+// refreshCompletedRepairProjection reconciles the existing automatic-control
+// voter/identity projection from accepted, retained repair completion records.
+// It never creates a repair record or infers completion from Pod/status data.
+func (e *FencingExecutor) refreshCompletedRepairProjection(ctx context.Context, binding peerClosureBinding, control *autoControl, version *objstore.ObjectVersion, source string, current *quepaxa.Cluster, podName string) (bool, error) {
+	ledgerState, ledgerUID, _, err := e.readWithUID(ctx, binding.workloadUID, source)
+	if err != nil {
+		return false, err
+	}
+	pin, err := e.controller().readBootstrapLedgerPin(ctx, &binding.root)
+	if err != nil || pin.StatefulSetUID != binding.workloadUID || pin.SourceClusterID != source || pin.LedgerUID != ledgerUID {
+		return false, fencing.ErrPending
+	}
+	records := make([]fencing.MembershipRepairRecord, 0, 1+len(ledgerState.Ledger.MembershipRepairHistory))
+	if ledgerState.Ledger.MembershipRepair != nil {
+		records = append(records, *ledgerState.Ledger.MembershipRepair)
+	}
+	for _, record := range ledgerState.Ledger.MembershipRepairHistory {
+		records = append(records, record)
+	}
+	var selected *fencing.MembershipRepairCandidate
+	var selectedMember quepaxa.Member
+	var selectedConfig uint
+	for i := range records {
+		record := records[i]
+		candidate, member, configID, ok := completedRepairProjection(record, binding.rootUID, binding.workloadUID, ledgerUID, source, podName)
+		if !ok || configID > uint(current.ConfigID) || !membershipHasExactMember(*current, member) {
+			continue
+		}
+		if selected == nil || configID > selectedConfig {
+			copy := candidate
+			selected, selectedMember, selectedConfig = &copy, member, configID
+		}
+	}
+	if selected == nil {
+		return false, nil
+	}
+	if len(current.Members) != len(control.Voters) {
+		return false, fencing.ErrPending
+	}
+	for _, voter := range control.Voters {
+		if voter.Pod == podName {
+			continue
+		}
+		if !repairMembershipContains(*current, string(voter.NodeID), control.Identities[voter.NodeID].WALIdentity) {
+			return false, fencing.ErrPending
+		}
+	}
+	if selected.Assignment.PodUID == "" || selected.Assignment.PodName != podName || selectedMember.ID == "" {
+		return false, fencing.ErrPending
+	}
+	newID := quepaxa.NodeID(selectedMember.ID)
+	for _, voter := range control.Voters {
+		if voter.Pod != podName && voter.NodeID == newID {
+			return false, fencing.ErrPending
+		}
+	}
+	idx := -1
+	for i, voter := range control.Voters {
+		if voter.Pod == podName {
+			if idx != -1 {
+				return false, fencing.ErrPending
+			}
+			idx = i
+		}
+	}
+	if idx == -1 {
+		return false, fencing.ErrPending
+	}
+	oldID := control.Voters[idx].NodeID
+	target := FenceTarget{NodeID: string(newID), Pod: podName, PodUID: selected.Assignment.PodUID, WALIdentity: selectedMember.WALIdentity}
+	if oldID == newID && control.Identities[newID] == target {
+		return false, nil
+	}
+	delete(control.Identities, oldID)
+	control.Voters[idx] = VoterPod{NodeID: newID, Pod: podName}
+	control.Identities[newID] = target
+	controller := e.controller()
+	if err := controller.saveAuto(ctx, &binding.root, control, version); err != nil {
+		return false, err
+	}
+	return true, nil
+}
+
+func completedRepairProjection(record fencing.MembershipRepairRecord, rootUID, statefulSetUID, ledgerUID, source, podName string) (fencing.MembershipRepairCandidate, quepaxa.Member, uint, bool) {
+	auth := record.Authorization
+	if auth.Validate() != nil || auth.RootUID != rootUID || auth.StatefulSetUID != statefulSetUID || auth.LedgerUID != ledgerUID || auth.SourceClusterID != source || record.Progress.Stage != fencing.MembershipRepairComplete {
+		return fencing.MembershipRepairCandidate{}, quepaxa.Member{}, 0, false
+	}
+	copyLedger := fencing.Ledger{SourceClusterID: source, MembershipRepair: &record}
+	copyLedger.MembershipRepair.Progress.Stage = fencing.MembershipRepairAdded
+	if err := copyLedger.AdvanceMembershipRepair(auth.OperationID, record.Progress.Revision, fencing.MembershipRepairComplete); err != nil {
+		return fencing.MembershipRepairCandidate{}, quepaxa.Member{}, 0, false
+	}
+	completion := record.Progress.Completion
+	if completion == nil || completion.Accepted == nil {
+		return fencing.MembershipRepairCandidate{}, quepaxa.Member{}, 0, false
+	}
+	request, response := completion.Request, *completion.Accepted
+	digest, err := network.MembershipRepairCompletionRequestDigest(request)
+	if err != nil || network.ValidateMembershipRepairCompletionRequest(request) != nil || request.RepairOperationID != auth.OperationID || request.RepairBindingDigest != fencing.MembershipRepairAuthorizationHash(auth) ||
+		response.Outcome != "completed" || response.MAC == "" || response.RequestDigest != digest || response.ScopeDigest != request.ScopeDigest || response.TerminalHash != request.TerminalHash || response.TerminalSlot != request.TerminalSlot {
+		return fencing.MembershipRepairCandidate{}, quepaxa.Member{}, 0, false
+	}
+	var candidate *fencing.MembershipRepairCandidate
+	var phase *fencing.MembershipRepairPhase
+	var result *fencing.MembershipRepairPhaseResult
+	for i := range record.Progress.Candidates {
+		if record.Progress.Candidates[i].Assignment.PodUID == request.CandidatePodUID {
+			candidate = &record.Progress.Candidates[i]
+		}
+	}
+	for i := range record.Progress.Phases {
+		if record.Progress.Phases[i].Hash == request.PhaseHash {
+			phase = &record.Progress.Phases[i]
+		}
+	}
+	for i := range record.Progress.Results {
+		if record.Progress.Results[i].PhaseHash == request.PhaseHash {
+			result = &record.Progress.Results[i]
+		}
+	}
+	view := fencing.MembershipRepairView{Authorization: auth, Progress: record.Progress, Preclosure: record.Preclosure}
+	if candidate == nil || candidate.Member == nil || phase == nil || result == nil || phase.Kind != fencing.MembershipRepairAdd || !completionMatchesPhase(request, view, *phase, *result) ||
+		candidate.Assignment.PodName != podName || candidate.Assignment.PodUID == auth.OldIdentity.PodUID || result.Outcome != "completed" || result.Target.ConfigID != auth.Membership.ConfigID+2 ||
+		phase.Change.Add == nil || *phase.Change.Add != *candidate.Member {
+		return fencing.MembershipRepairCandidate{}, quepaxa.Member{}, 0, false
+	}
+	return *candidate, *candidate.Member, result.Target.ConfigID, true
+}
+
+func membershipHasExactMember(cluster quepaxa.Cluster, member quepaxa.Member) bool {
+	for _, current := range cluster.Members {
+		if current.ID == member.ID {
+			return current == member
+		}
+	}
+	return false
 }
 
 func (e *FencingExecutor) authorizeMembershipRepairPhase(ctx context.Context, caller fencing.Identity, phase fencing.MembershipRepairPhase, workloadUID string) error {

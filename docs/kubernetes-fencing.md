@@ -187,8 +187,11 @@ integration; unwrapped or unsupported hosts cannot produce this proof.
    ConfigMap. Leave it absent for installations that do not configure external
    anchor admission. To enable it, edit and apply
    `deploy/operator/fencing/recovery-anchor-config.example.yaml` with the same
-   trusted HTTPS anchor URL and explicit target `RHIZA_RECOVERY_ANCHOR_STORAGE_ID`
-   used by the operator. The token-file path must be
+   trusted HTTPS anchor URL and an explicit `RHIZA_RECOVERY_ANCHOR_BINDING_POLICY`.
+   Use `derived` to calculate the target binding from the shared effective
+   object-store provider, endpoint, bucket, and base prefix. Use `opaque` only
+   when the derived provider recipe is insufficient, and provide an independently
+   verified `RHIZA_RECOVERY_ANCHOR_STORAGE_ID` in that mode. The token-file path must be
    `/var/run/secrets/rhiza-recovery-anchor-token/token`. Create the optional
    `rhiza-recovery-anchor-token` Secret with a `token` key, and provision the
    same externally managed static bearer value to the anchor service's
@@ -201,10 +204,10 @@ integration; unwrapped or unsupported hosts cannot produce this proof.
    `RHIZA_RECOVERY_ANCHOR_CA_FILE` to
    `/var/run/secrets/rhiza-recovery-anchor-ca/ca.crt` and create the separate,
    optional `rhiza-recovery-anchor-ca` ConfigMap with the issuing certificate
-   as its only `ca.crt` key. URL, token-file path, and
-   storage ID are required together; partial DR configuration fails closed.
-   The storage ID is the exact trusted anchor target binding, not a bucket or
-   prefix inferred by either deployment. The sample is not applied automatically
+   as its only `ca.crt` key. URL, token-file path, and binding policy are
+   required together; partial DR configuration fails closed. In `opaque` mode,
+   the storage ID is independently configured for the exact trusted target.
+   The sample is not applied automatically
    and contains no live credential.
 4. Apply the supervised StatefulSet patch to a **fresh** no-PVC generation. The
    file `deploy/operator/fencing/supervised-statefulset.patch.yaml` contains a

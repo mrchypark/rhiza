@@ -14,7 +14,6 @@ import (
 	"github.com/mrchypark/rhiza/pkg/fencing"
 	"github.com/mrchypark/rhiza/pkg/materializer"
 	"github.com/mrchypark/rhiza/pkg/quepaxa"
-	"github.com/mrchypark/rhiza/pkg/recovery"
 	sqlite "github.com/ncruces/go-sqlite3/driver"
 )
 
@@ -288,13 +287,12 @@ func initialGenesisTestConfig(t *testing.T) (types.ExecutionConfig, fencing.Boot
 		ObjStoreProvider: "s3", ObjStoreBucket: "rhiza", ObjStorePrefix: "root",
 	}
 	config.ObjStoreDurability = types.ObjectStoreDurabilityAsync
-	membership := recovery.NewMembershipRecord(string(config.ClusterID), config.Members, string(config.ObjStoreDurability))
 	assignment := fencing.BootstrapAssignment{
 		OperationID: "op-initial", RequestHash: "request-hash", AuthorizationHash: "auth-hash",
 		Purpose: fencing.BootstrapInitial, RootUID: "root-uid", StatefulSetUID: "sts-uid",
 		SourceClusterID: string(config.ClusterID), PodName: "rhiza-0", PodUID: config.PreparedPodUID,
 		NodeID: string(config.NodeID), CredentialName: "bootstrap-peer", CredentialUID: "credential-uid",
-		MembershipHash: membership.Membership, ProfileHash: "profile-hash", LedgerUID: "ledger-uid",
+		MembershipHash: fencing.BootstrapMembersHash(config.Members), ProfileHash: "profile-hash", LedgerUID: "ledger-uid",
 	}
 	return config, assignment
 }

@@ -8,7 +8,6 @@ import (
 
 	"github.com/mrchypark/rhiza/pkg/fencing"
 	"github.com/mrchypark/rhiza/pkg/quepaxa"
-	"github.com/mrchypark/rhiza/pkg/recoveryanchor"
 )
 
 func drSuccessorOperationID(recoveryOperationID, statefulSetUID, target string) string {
@@ -21,7 +20,8 @@ func drSuccessorOperationID(recoveryOperationID, statefulSetUID, target string) 
 // A later reconciliation calls it with pods present to bind their actual UIDs.
 // It never assigns from status/read paths and never invents run or WAL identity.
 func (c *Controller) prepareDRSuccessor(ctx context.Context, r *Resource, sts object, members []quepaxa.Member, assignPods bool) (string, error) {
-	if r.Spec.AnchorID == "" || r.Status.AnchorRequest == nil || r.Status.AnchorReceipt == nil || c.Anchor == nil || c.AnchorBinding.StorageID == "" {
+	wantBinding, bindingErr := expectedAnchorBinding(c.AnchorBindingConfig, c.AnchorBinding.StorageID, r.Status.Target)
+	if r.Spec.AnchorID == "" || r.Status.AnchorRequest == nil || r.Status.AnchorReceipt == nil || c.Anchor == nil || bindingErr != nil {
 		return "", fmt.Errorf("DR successor requires an exact anchor approval and configured target storage binding")
 	}
 	rootUID := str(nested(sts, "spec", "template", "metadata", "annotations", fencingRootAnnotation))
@@ -29,7 +29,6 @@ func (c *Controller) prepareDRSuccessor(ctx context.Context, r *Resource, sts ob
 		return "", fmt.Errorf("DR successor requires the retained root UID and StatefulSet UID")
 	}
 	request, receipt := *r.Status.AnchorRequest, *r.Status.AnchorReceipt
-	wantBinding := recoveryanchor.Binding{ClusterID: r.Status.Target, StorageID: c.AnchorBinding.StorageID}
 	if request.OperationID != c.operationID(r) || request.StatefulSetUID != r.Status.StatefulSetUID || request.TargetClusterID != r.Status.Target || receipt.Target != wantBinding {
 		return "", fmt.Errorf("DR successor anchor approval differs from the reserved target")
 	}
@@ -41,7 +40,7 @@ func (c *Controller) prepareDRSuccessor(ctx context.Context, r *Resource, sts ob
 		return "", fmt.Errorf("DR successor credentials are unavailable")
 	}
 	credentialName, credentialUID := r.Status.SecretName, str(nested(secret, "metadata", "uid"))
-	membershipHash := hashJSON(members)
+	membershipHash := fencing.BootstrapMembersHash(members)
 	profileHash := prepareProfileHash(sts)
 	storeHash := fencing.BootstrapStoreIdentityHash(c.StoreIdentity)
 	durability := r.Spec.Durability

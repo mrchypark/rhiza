@@ -3,6 +3,7 @@ package fencing
 import (
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"reflect"
 	"strings"
@@ -79,6 +80,9 @@ func TestLedgerMembershipRepairRetainsExactRoundsAndBoundSurvivorView(t *testing
 	}
 	if err := ledger.AppendMembershipRepairCandidate(MembershipRepairCandidate{Assignment: assignment}); err != nil {
 		t.Fatal(err)
+	}
+	if ledger.BootstrapInitComplete([]string{assignment.NodeID}) {
+		t.Fatal("candidate without retained init evidence passed closure completion")
 	}
 	if err := ledger.CancelMembershipRepair(authorization.OperationID, ledger.MembershipRepair.Progress.Revision); err == nil {
 		t.Fatal("repair with an assigned but unbound candidate was cancelled")
@@ -324,6 +328,32 @@ func TestMembershipRepairOwnInitStatusBeginAndOutcomeRetainExactCandidate(t *tes
 		t.Fatalf("own status=%+v err=%v", status, err)
 	}
 	scope := InitExecutionScope{PodName: assignment.PodName, PodUID: assignment.PodUID, ContainerName: "rhiza-prepare", ContainerID: "containerd://init", ImageID: "sha256:image", NodeName: "worker", NodeUID: "worker-uid"}
+	// Exercise the transition against the fresh ledger snapshot that a CAS
+	// retry would supply after closure wins the first write race.
+	for _, closeScope := range []string{"generation", "node"} {
+		t.Run("closed-"+closeScope+"-retry-snapshot", func(t *testing.T) {
+			encoded, err := json.Marshal(ledger)
+			if err != nil {
+				t.Fatal(err)
+			}
+			var retry Ledger
+			if err := json.Unmarshal(encoded, &retry); err != nil {
+				t.Fatal(err)
+			}
+			if closeScope == "generation" {
+				if err := retry.Close("generation-close", "generation-hash"); err != nil {
+					t.Fatal(err)
+				}
+			} else if err := retry.CloseNodes("node-close", "node-hash", []string{assignment.NodeID}); err != nil {
+				t.Fatal(err)
+			}
+			freshScope := scope
+			freshScope.ContainerID = "containerd://retry-" + closeScope
+			if _, err := retry.BeginMembershipRepairInit(assignment, "retry-"+closeScope, freshScope); !errors.Is(err, ErrClosed) {
+				t.Fatalf("fresh CAS retry snapshot admitted init after closure: %v", err)
+			}
+		})
+	}
 	attempt, err := ledger.BeginMembershipRepairInit(assignment, "init-nonce", scope)
 	if err != nil || attempt.Assignment != assignment || attempt.Scope != scope {
 		t.Fatalf("begin=%+v err=%v", attempt, err)
@@ -332,8 +362,54 @@ func TestMembershipRepairOwnInitStatusBeginAndOutcomeRetainExactCandidate(t *tes
 		t.Fatalf("new nonce reused the same init container: %v", err)
 	}
 	outcome := InitAttemptOutcome{State: InitAttemptMaterialized, LiveCleanup: InitLiveCleanup{Mode: InitModeRestore, BucketDrainSucceeded: true, CleanupSucceeded: true, NamespaceQuiescent: true}}
-	if err := ledger.RecordMembershipRepairInitOutcome(assignment, attempt.AttemptID, outcome); err != nil {
+	if ledger.BootstrapInitComplete([]string{assignment.NodeID}) {
+		t.Fatal("unresolved repair init passed closure completion")
+	}
+	retainedHistory := *ledger.MembershipRepair
+	historicalLedger := &Ledger{MembershipRepairHistory: map[string]MembershipRepairRecord{"repair": retainedHistory}}
+	if historicalLedger.BootstrapInitComplete([]string{assignment.NodeID}) {
+		t.Fatal("unresolved historical repair init was omitted from closure completion")
+	}
+	if err := ledger.CloseNodes("node-close", "node-hash", []string{assignment.NodeID}); err != nil {
 		t.Fatal(err)
+	}
+	if _, err := ledger.BeginMembershipRepairInit(assignment, "late-new-init", InitExecutionScope{PodName: assignment.PodName, PodUID: assignment.PodUID, ContainerName: "rhiza-prepare", ContainerID: "containerd://late", ImageID: "sha256:image", NodeName: "worker", NodeUID: "worker-uid"}); !errors.Is(err, ErrClosed) {
+		t.Fatalf("node-closed repair admitted a new init: %v", err)
+	}
+	for _, closeScope := range []string{"generation", "node"} {
+		t.Run("closed-"+closeScope+"-existing-attempt-retry", func(t *testing.T) {
+			encoded, err := json.Marshal(ledger)
+			if err != nil {
+				t.Fatal(err)
+			}
+			var retry Ledger
+			if err := json.Unmarshal(encoded, &retry); err != nil {
+				t.Fatal(err)
+			}
+			if closeScope == "generation" {
+				if err := retry.Close("generation-close", "generation-hash"); err != nil {
+					t.Fatal(err)
+				}
+			} else if err := retry.CloseNodes("node-close", "node-hash", []string{assignment.NodeID}); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := retry.BeginMembershipRepairInit(assignment, attempt.AttemptID, scope); !errors.Is(err, ErrClosed) {
+				t.Fatalf("existing attempt retry was admitted after %s closure: %v", closeScope, err)
+			}
+		})
+	}
+	if err := ledger.RecordMembershipRepairInitOutcome(assignment, attempt.AttemptID, outcome); err != nil {
+		t.Fatalf("exact late outcome was not accepted after closure: %v", err)
+	}
+	if ledger.BootstrapInitComplete([]string{assignment.NodeID}) {
+		t.Fatal("repair init outcome without terminal evidence passed closure completion")
+	}
+	terminal := InitTerminalEvidence{ContainerID: scope.ContainerID, ImageID: scope.ImageID, ExitCode: 0, Reason: "Completed"}
+	if err := ledger.RecordMembershipRepairInitTerminal(assignment, attempt.AttemptID, terminal); err != nil {
+		t.Fatalf("exact late terminal evidence was not accepted after closure: %v", err)
+	}
+	if !ledger.BootstrapInitComplete([]string{assignment.NodeID}) {
+		t.Fatal("exact outcome and terminal evidence did not settle closed repair init")
 	}
 	status, err = ledger.BootstrapLearnerStatus("new-pod")
 	if err != nil || len(status.Attempts) != 1 || len(status.Attempts[0].Outcomes) != 1 || status.Attempts[0].Outcomes[0] != outcome {

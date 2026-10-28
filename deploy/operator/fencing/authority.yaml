@@ -127,6 +127,16 @@ spec:
                   fieldPath: metadata.namespace
           envFrom:
             - configMapRef:
+                # The independently configured store location must match the
+                # recovery application and anchor service.
+                name: rhiza-config
+                optional: true
+            - secretRef:
+                # Existing object-store credentials; this manifest creates no
+                # Secret and grants no additional Kubernetes API access.
+                name: rhiza-object-store
+                optional: true
+            - configMapRef:
                 # The same optional trust configuration is consumed by the
                 # operator. An absent ConfigMap leaves DR admission disabled.
                 name: rhiza-recovery-anchor

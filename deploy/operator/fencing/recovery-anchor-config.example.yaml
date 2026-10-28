@@ -8,7 +8,11 @@ metadata:
 data:
   RHIZA_RECOVERY_ANCHOR_URL: https://replace-with-trusted-anchor.example/v1
   RHIZA_RECOVERY_ANCHOR_TOKEN_FILE: /var/run/secrets/rhiza-recovery-anchor-token/token
-  RHIZA_RECOVERY_ANCHOR_STORAGE_ID: replace-with-exact-trusted-target-storage-id
+  RHIZA_RECOVERY_ANCHOR_BINDING_POLICY: derived
+  # For a storage system not covered by the derived provider recipe, instead
+  # set the policy to opaque and provide an independently managed storage ID:
+  # RHIZA_RECOVERY_ANCHOR_BINDING_POLICY: opaque
+  # RHIZA_RECOVERY_ANCHOR_STORAGE_ID: replace-with-independently-verified-storage-id
   # For a private anchor CA, set RHIZA_RECOVERY_ANCHOR_CA_FILE to
   # /var/run/secrets/rhiza-recovery-anchor-ca/ca.crt and create the separate
   # optional rhiza-recovery-anchor-ca ConfigMap containing only the ca.crt key.

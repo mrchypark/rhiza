@@ -19,7 +19,6 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
-	"sort"
 	"strings"
 	"syscall"
 	"time"
@@ -300,6 +299,21 @@ func runManagedPrepare(ctx context.Context, config rhiza.Config, settings manage
 }
 
 func resolveManagedAssignment(ctx context.Context, authority managedAssignmentReader, initialOperationID string, candidate fencing.Identity) (fencing.BootstrapAssignment, error) {
+	if strings.HasPrefix(initialOperationID, "dr-successor-") {
+		status, err := authority.BootstrapStatus(ctx, initialOperationID, candidate)
+		if err != nil {
+			return fencing.BootstrapAssignment{}, fmt.Errorf("read exact DR successor assignment: %w", err)
+		}
+		if status.Assignment == nil || status.Complete || status.AdmissionClosed {
+			return fencing.BootstrapAssignment{}, fmt.Errorf("%w: exact DR successor assignment is unavailable or closed", fencing.ErrPending)
+		}
+		assignment := *status.Assignment
+		if assignment.Validate() != nil || assignment.Purpose != fencing.BootstrapDRSuccessor || assignment.OperationID != initialOperationID ||
+			assignment.SourceClusterID != candidate.SourceClusterID || assignment.PodName != candidate.PodName || assignment.PodUID != candidate.PodUID || assignment.NodeID != candidate.NodeID {
+			return fencing.BootstrapAssignment{}, fmt.Errorf("DR successor assignment differs from exact Pod binding")
+		}
+		return assignment, nil
+	}
 	own, err := authority.BootstrapStatus(ctx, "", candidate)
 	if err != nil {
 		return fencing.BootstrapAssignment{}, fmt.Errorf("read own init assignment: %w", err)
@@ -332,10 +346,11 @@ func resolveManagedAssignment(ctx context.Context, authority managedAssignmentRe
 
 func bindManagedLearnerAssignment(config *rhiza.Config, assignment fencing.BootstrapAssignment) error {
 	if config == nil || assignment.Validate() != nil || assignment.Purpose != fencing.BootstrapLearner ||
-		assignment.PublicMember.ID != assignment.NodeID || assignment.PublicMember.URL == "" || assignment.PublicMember.PeerURL == "" || assignment.PublicMember.LogURL == "" || assignment.PublicMember.WALIdentity != "" {
+		assignment.PodUID != config.PreparedPodUID || assignment.SourceClusterID != string(config.ClusterID) ||
+		assignment.PublicMember.ID != assignment.NodeID || assignment.PublicMember.URL == "" || assignment.PublicMember.PeerURL == "" || assignment.PublicMember.WALIdentity != "" {
 		return fmt.Errorf("own-init learner assignment lacks its exact public binding")
 	}
-	if assignment.MembershipHash != bootstrapMembershipHash(config.Members) {
+	if assignment.MembershipHash != fencing.BootstrapMembersHash(config.Members) {
 		return fmt.Errorf("learner assignment differs from immutable bootstrap membership")
 	}
 	if assignment.Durability != string(config.ObjStoreDurability) || assignment.StoreIdentityHash != bootstrapStoreIdentityHash(*config) {
@@ -360,18 +375,6 @@ func bindManagedLearnerAssignment(config *rhiza.Config, assignment fencing.Boots
 	config.Learner = &member
 	config.ObjStoreDurability = rhiza.ObjectStoreDurability(assignment.Durability)
 	return nil
-}
-
-func bootstrapMembershipHash(members []rhiza.Member) string {
-	encodedMembers := make([]string, 0, len(members))
-	for _, member := range members {
-		encoded, _ := json.Marshal([]string{string(member.ID), hex.EncodeToString(member.PublicKey[:])})
-		encodedMembers = append(encodedMembers, string(encoded))
-	}
-	sort.Strings(encodedMembers)
-	encoded, _ := json.Marshal(encodedMembers)
-	digest := sha256.Sum256(append([]byte("rhiza-membership-v2\x00"), encoded...))
-	return hex.EncodeToString(digest[:])
 }
 
 func bootstrapStoreIdentityHash(config rhiza.Config) string {

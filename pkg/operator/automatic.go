@@ -680,7 +680,7 @@ func (c *Controller) ensureBootstrapLedger(ctx context.Context, r *ClusterResour
 	}
 	candidate := expectedBootstrapCandidate(r, sts)
 	requestHash := hashJSON(candidate)
-	membershipHash := hashJSON(members)
+	membershipHash := fencing.BootstrapMembersHash(members)
 	authorizationHash := hashJSON(struct {
 		RootUID, StatefulSetUID, SourceClusterID, CredentialName, CredentialUID, MembershipHash, ProfileHash string
 	}{rootUID, stsUID, r.Spec.AdoptClusterID, secretName, secretUID, membershipHash, profileHash})
@@ -712,6 +712,10 @@ func (c *Controller) ensureBootstrapLedger(ctx context.Context, r *ClusterResour
 }
 
 func installPrepareInitProfile(sts object, ctr object, operationID, rootUID string) error {
+	return installPrepareInitProfileWithPrevious(sts, ctr, operationID, rootUID, "")
+}
+
+func installPrepareInitProfileWithPrevious(sts object, ctr object, operationID, rootUID, authorizedPreviousOperationID string) error {
 	if operationID == "" || rootUID == "" || str(nested(sts, "metadata", "uid")) == "" {
 		return fmt.Errorf("prepare init operation binding is incomplete")
 	}
@@ -775,7 +779,7 @@ func installPrepareInitProfile(sts object, ctr object, operationID, rootUID stri
 		annotations = object{}
 		templateMeta["annotations"] = annotations
 	}
-	if old := str(annotations[fencingPrepareOperationAnnotation]); old != "" && old != operationID {
+	if old := str(annotations[fencingPrepareOperationAnnotation]); old != "" && old != operationID && (authorizedPreviousOperationID == "" || old != authorizedPreviousOperationID) {
 		return fmt.Errorf("prepare init operation annotation changed")
 	}
 	if old := str(annotations[fencingRootAnnotation]); old != "" && old != rootUID {
@@ -785,6 +789,51 @@ func installPrepareInitProfile(sts object, ctr object, operationID, rootUID stri
 	annotations[fencingPrepareOperationAnnotation] = operationID
 	annotations[fencingRootAnnotation] = rootUID
 	return nil
+}
+
+func installDRSuccessorPrepareInitProfile(sts object, ctr object, rootUID, authorizedPreviousOperationID string, recovery *Resource) error {
+	if recovery == nil || str(recovery.Metadata["uid"]) == "" || recovery.Spec.RecoveryID == "" || recovery.Spec.AnchorID == "" ||
+		recovery.Status.Stage != "Starting" || recovery.Status.RecoveryID != recovery.Spec.RecoveryID || recovery.Status.Target != "rhiza-r-"+shortID(str(recovery.Metadata["uid"])+":"+recovery.Spec.RecoveryID) ||
+		recovery.Status.StatefulSetUID == "" || str(nested(sts, "metadata", "uid")) != recovery.Status.StatefulSetUID || authorizedPreviousOperationID == "" {
+		return fmt.Errorf("DR successor prepare-init transition is not bound")
+	}
+	operationID := drSuccessorOperationID(str(recovery.Metadata["uid"])+":"+recovery.Spec.RecoveryID, recovery.Status.StatefulSetUID, recovery.Status.Target)
+	return installPrepareInitProfileWithPrevious(sts, ctr, operationID, rootUID, authorizedPreviousOperationID)
+}
+
+func (c *Controller) authorizedInitialPrepareOperation(ctx context.Context, rootUID, statefulSetUID, sourceClusterID string) (string, error) {
+	var roots struct {
+		Items []ClusterResource `json:"items"`
+	}
+	if err := c.Kube.Get(ctx, c.clusterPath(""), &roots); err != nil {
+		return "", err
+	}
+	var root *ClusterResource
+	for i := range roots.Items {
+		candidate := &roots.Items[i]
+		if str(candidate.Metadata["uid"]) != rootUID {
+			continue
+		}
+		if root != nil {
+			return "", fmt.Errorf("initial prepare root is ambiguous")
+		}
+		root = candidate
+	}
+	if root == nil || root.Metadata["deletionTimestamp"] != nil || !root.Spec.Automatic || root.Spec.StatefulSet == "" || root.Spec.AdoptClusterID != sourceClusterID {
+		return "", fmt.Errorf("initial prepare root binding is unavailable")
+	}
+	var sts object
+	if err := c.Kube.Get(ctx, c.stsPath(root.Spec.StatefulSet), &sts); err != nil {
+		return "", err
+	}
+	if str(nested(sts, "metadata", "uid")) != statefulSetUID {
+		return "", fmt.Errorf("initial prepare StatefulSet identity changed")
+	}
+	pin, err := c.readBootstrapLedgerPin(ctx, root)
+	if err != nil || pin.StatefulSetUID != statefulSetUID || pin.SourceClusterID != sourceClusterID {
+		return "", fmt.Errorf("initial prepare ledger pin is unavailable")
+	}
+	return pin.OperationID, nil
 }
 
 func prepareInitEnvironmentName(name string) bool {

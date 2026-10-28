@@ -945,7 +945,7 @@ func TestLearnerProvisioningChecksJournalCapacityBeforeMutation(t *testing.T) {
 	state.Intent = &autoIntent{LearnerName: "replacement", Request: FenceRequest{OperationID: "op"}, Policy: AutoPolicy{FailureGraceSeconds: 1}}
 	for i := range maxLearnerHistory {
 		pod := fmt.Sprintf("learner-%d", i)
-		state.Learners = append(state.Learners, learnerIncarnation{SourceClusterID: "source", OperationID: fmt.Sprintf("op-%d", i), CredentialUID: fmt.Sprintf("credential-%d", i), CredentialName: pod + "-credentials", Target: FenceTarget{NodeID: pod, Pod: pod, PodUID: fmt.Sprintf("learner-uid-%d", i), WALIdentity: strings.Repeat("a", 64)}})
+		state.Learners = append(state.Learners, learnerIncarnation{SourceClusterID: "source", OperationID: fmt.Sprintf("op-%d", i), LedgerUID: f.ledgerUID, CredentialUID: fmt.Sprintf("credential-%d", i), CredentialName: pod + "-credentials", Target: compactionTarget(pod, fmt.Sprintf("learner-uid-%d", i), strings.Repeat("a", 64))})
 	}
 	if err := f.c.saveAuto(ctx, r, state, nil); err != nil {
 		t.Fatal(err)

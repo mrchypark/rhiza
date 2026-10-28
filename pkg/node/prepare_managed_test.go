@@ -25,7 +25,14 @@ func TestValidateManagedLearnerAssignmentPinsReturnedIdentityAndSource(t *testin
 	}
 	for name, mutate := range map[string]func(*types.ExecutionConfig, *fencing.BootstrapAssignment){
 		"member URL": func(c *types.ExecutionConfig, _ *fencing.BootstrapAssignment) { c.Learner.URL = "http://other" },
-		"public key": func(c *types.ExecutionConfig, _ *fencing.BootstrapAssignment) { c.Members[0].PublicKey[0]++ },
+		"peer URL": func(c *types.ExecutionConfig, a *fencing.BootstrapAssignment) {
+			a.PublicMember.PeerURL = "quic://other"
+		},
+		"public key": func(_ *types.ExecutionConfig, a *fencing.BootstrapAssignment) {
+			a.PublicMember.PublicKey = strings.Repeat("0", 64)
+		},
+		"pod UID":               func(_ *types.ExecutionConfig, a *fencing.BootstrapAssignment) { a.PodUID = "other-pod" },
+		"source membership key": func(c *types.ExecutionConfig, _ *fencing.BootstrapAssignment) { c.Members[0].PublicKey[0]++ },
 		"durability": func(c *types.ExecutionConfig, _ *fencing.BootstrapAssignment) {
 			c.ObjStoreDurability = types.ObjectStoreDurabilityAsync
 		},
@@ -55,14 +62,14 @@ func managedLearnerProfileFixture() (types.ExecutionConfig, fencing.BootstrapAss
 		ObjStoreProvider: "s3", ObjStoreEndpoint: "https://s3.example", ObjStoreBucket: "archive", ObjStorePrefix: "rhiza",
 		ObjStoreDurability: types.ObjectStoreDurabilityBeforeAck,
 	}
-	config.Learner = &quepaxa.Member{ID: quepaxa.NodeID(config.NodeID), URL: "http://rhiza-0", PeerURL: "quic://rhiza-0", LogURL: "http://rhiza-0/log", PublicKey: key}
+	config.Learner = &quepaxa.Member{ID: quepaxa.NodeID(config.NodeID), URL: "http://rhiza-0", PeerURL: "quic://rhiza-0", PublicKey: key}
 	publicKey := hex.EncodeToString(key[:])
 	assignment := fencing.BootstrapAssignment{
 		OperationID: "repair-op", RequestHash: strings.Repeat("a", 64), AuthorizationHash: strings.Repeat("b", 64),
 		Purpose: fencing.BootstrapLearner, RootUID: "root", StatefulSetUID: "sts", LedgerUID: "ledger",
 		SourceClusterID: string(config.ClusterID), PodName: "rhiza-0", PodUID: config.PreparedPodUID, NodeID: string(config.NodeID),
 		CredentialName: "rhiza-0-credentials", CredentialUID: "secret-uid", ProfileHash: strings.Repeat("c", 64),
-		MembershipHash: recovery.NewMembershipRecord(string(config.ClusterID), config.Members, string(config.ObjStoreDurability)).Membership,
+		MembershipHash: fencing.BootstrapMembersHash(config.Members),
 		PublicMember:   fencing.BootstrapPublicMember{ID: string(config.NodeID), URL: config.Learner.URL, PeerURL: config.Learner.PeerURL, LogURL: config.Learner.LogURL, PublicKey: publicKey},
 		Durability:     string(config.ObjStoreDurability), StoreIdentityHash: managedStoreIdentityHash(&config),
 	}
@@ -153,7 +160,7 @@ func managedDRProfileFixture() (types.ExecutionConfig, fencing.BootstrapAssignme
 		OperationID: "bootstrap-op", RequestHash: strings.Repeat("1", 64), Purpose: fencing.BootstrapDRSuccessor,
 		RootUID: "root-uid", StatefulSetUID: "sts-uid", SourceClusterID: string(config.ClusterID),
 		PodName: "rhiza-0", PodUID: config.PreparedPodUID, NodeID: string(config.NodeID),
-		CredentialName: "rhiza-0-credentials", CredentialUID: "secret-uid", MembershipHash: membership.Membership,
+		CredentialName: "rhiza-0-credentials", CredentialUID: "secret-uid", MembershipHash: fencing.BootstrapMembersHash(config.Members),
 		ProfileHash: strings.Repeat("2", 64), LedgerUID: "ledger-uid", Durability: string(config.ObjStoreDurability),
 		StoreIdentityHash: managedStoreIdentityHash(&config),
 		DRApproval: fencing.BootstrapDRApproval{
