@@ -79,5 +79,26 @@ func (b *immutableInstrumentedBucket) WithExpectedErrs(expected thanosobjstore.I
 }
 
 func (b *immutableInstrumentedBucket) ReaderWithExpectedErrs(expected thanosobjstore.IsOpFailureExpectedFunc) thanosobjstore.BucketReader {
-	return b.instrumented.ReaderWithExpectedErrs(expected)
+	return newImmutableBucketReader(b.instrumented.ReaderWithExpectedErrs(expected))
+}
+
+// immutableBucketReader deliberately exposes only BucketReader. In particular,
+// it must not embed or return the provider's dynamic Bucket value: callers can
+// otherwise type-assert the reader back to Upload or Delete and bypass the
+// immutable mutation boundary.
+type immutableBucketReader struct {
+	thanosobjstore.BucketReader
+}
+
+func newImmutableBucketReader(reader thanosobjstore.BucketReader) thanosobjstore.BucketReader {
+	return &immutableBucketReader{BucketReader: reader}
+}
+
+// ReaderWithExpectedErrs preserves recursive reader filtering while keeping
+// each filtered result opaque to Bucket and mutation-capability assertions.
+func (b *immutableBucketReader) ReaderWithExpectedErrs(expected thanosobjstore.IsOpFailureExpectedFunc) thanosobjstore.BucketReader {
+	if instrumented, ok := b.BucketReader.(thanosobjstore.InstrumentedBucketReader); ok {
+		return newImmutableBucketReader(instrumented.ReaderWithExpectedErrs(expected))
+	}
+	return newImmutableBucketReader(b.BucketReader)
 }

@@ -50,6 +50,9 @@ type ExecutionConfig struct {
 	EnableReconfiguration         bool                     `json:"enable_reconfiguration,omitempty"`
 	PreparedPodUID                string                   `json:"prepared_pod_uid,omitempty"`
 	Learner                       *NodeConfig              `json:"learner,omitempty"`
+	ExpectedInstalledPolicyHash   [32]byte                 `json:"expected_installed_policy_hash,omitempty"`
+	JoinCapability                []byte                   `json:"-"`
+	JoinSeeds                     []string                 `json:"join_seeds,omitempty"`
 	LocalGraphNodePropertyIndexes []GraphNodePropertyIndex `json:"local_graph_node_property_indexes,omitempty"`
 
 	// Object store configuration

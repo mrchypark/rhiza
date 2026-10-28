@@ -1,10 +1,12 @@
 package rhiza
 
 import (
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
+	"net/url"
 	"os"
 	"strconv"
 	"strings"
@@ -15,6 +17,44 @@ import (
 // rhiza server binary. It is suitable for embedded hosts managed by the
 // recovery operator, which updates those variables between generations.
 func ConfigFromEnv() (Config, error) {
+	expectedInstalledPolicyHash, err := parseInstalledPolicyHash(os.Getenv("RHIZA_EXPECTED_INSTALLED_POLICY_HASH"))
+	if err != nil {
+		return Config{}, err
+	}
+	policyPinned := expectedInstalledPolicyHash != ([32]byte{})
+	clusterID := os.Getenv("RHIZA_CLUSTER_ID")
+	if policyPinned && clusterID == "" {
+		return Config{}, fmt.Errorf("RHIZA_CLUSTER_ID is required with RHIZA_EXPECTED_INSTALLED_POLICY_HASH")
+	}
+	if os.Getenv("RHIZA_JOIN_CAPABILITY") != "" {
+		return Config{}, fmt.Errorf("RHIZA_JOIN_CAPABILITY is not accepted; configure RHIZA_JOIN_CAPABILITY_FILE")
+	}
+	joinCapabilityFile := os.Getenv("RHIZA_JOIN_CAPABILITY_FILE")
+	if !policyPinned && joinCapabilityFile != "" {
+		return Config{}, fmt.Errorf("RHIZA_JOIN_CAPABILITY_FILE requires RHIZA_EXPECTED_INSTALLED_POLICY_HASH")
+	}
+	var joinCapability []byte
+	if joinCapabilityFile != "" {
+		joinCapability, err = readJoinCapabilityFile(joinCapabilityFile)
+		if err != nil {
+			return Config{}, fmt.Errorf("read RHIZA_JOIN_CAPABILITY_FILE: %w", err)
+		}
+		if len(joinCapability) < 32 {
+			return Config{}, fmt.Errorf("RHIZA_JOIN_CAPABILITY_FILE must contain at least 32 secret bytes")
+		}
+	}
+	var joinSeeds []string
+	if raw := os.Getenv("RHIZA_JOIN_SEEDS"); raw != "" {
+		if !policyPinned {
+			return Config{}, fmt.Errorf("RHIZA_JOIN_SEEDS requires RHIZA_EXPECTED_INSTALLED_POLICY_HASH")
+		}
+		if err := decodeConfigEnvJSON(raw, &joinSeeds); err != nil {
+			return Config{}, fmt.Errorf("invalid RHIZA_JOIN_SEEDS: %w", err)
+		}
+		if err := validateJoinSeeds(joinSeeds); err != nil {
+			return Config{}, fmt.Errorf("invalid RHIZA_JOIN_SEEDS: %w", err)
+		}
+	}
 	var members []Member
 	if raw := os.Getenv("RHIZA_CLUSTER_MEMBERS"); raw != "" {
 		if err := decodeConfigEnvJSON(raw, &members); err != nil {
@@ -94,6 +134,7 @@ func ConfigFromEnv() (Config, error) {
 
 	return Config{
 		ClusterID: configEnvOrDefault("RHIZA_CLUSTER_ID", "cluster-a"), NodeID: nodeID,
+		ExpectedInstalledPolicyHash: expectedInstalledPolicyHash, JoinCapability: joinCapability, JoinSeeds: joinSeeds,
 		PreparedPodUID: os.Getenv("RHIZA_PREPARED_POD_UID"),
 		DataDir:        configEnvOrDefault("RHIZA_DATA_DIR", "./rhiza-data"), BindAddr: configEnvOrDefault("RHIZA_BIND_ADDR", "127.0.0.1:8080"),
 		PeerAddr: configEnvOrDefault("RHIZA_PEER_ADDR", "127.0.0.1:9090"), AdminToken: os.Getenv("RHIZA_ADMIN_TOKEN"), PeerToken: peerToken, Members: members, EnableReconfiguration: enableReconfiguration, Learner: learner,
@@ -110,6 +151,62 @@ func ConfigFromEnv() (Config, error) {
 		CheckpointInterval: checkpointInterval, CheckpointTailBytes: checkpointTailBytes, CheckpointRetainCount: checkpointRetainCount, MaxWALBytes: maxWALBytes,
 		MaxConcurrentReads: maxConcurrentReads, MaxLongPollReads: maxLongPollReads,
 	}, nil
+}
+
+const maxJoinCapabilityFileBytes = 4 << 10
+
+func readJoinCapabilityFile(path string) ([]byte, error) {
+	file, err := os.Open(path)
+	if err != nil {
+		return nil, errors.New("could not open capability file")
+	}
+	data, readErr := io.ReadAll(io.LimitReader(file, maxJoinCapabilityFileBytes+1))
+	closeErr := file.Close()
+	if readErr != nil {
+		return nil, errors.New("could not read capability file")
+	}
+	if closeErr != nil {
+		return nil, errors.New("could not close capability file")
+	}
+	if len(data) > maxJoinCapabilityFileBytes {
+		return nil, errors.New("capability file exceeds size limit")
+	}
+	return data, nil
+}
+
+func parseInstalledPolicyHash(raw string) ([32]byte, error) {
+	if raw == "" {
+		return [32]byte{}, nil
+	}
+	decoded, err := hex.DecodeString(raw)
+	if err != nil || len(decoded) != 32 {
+		return [32]byte{}, fmt.Errorf("invalid RHIZA_EXPECTED_INSTALLED_POLICY_HASH: want 64 hexadecimal characters")
+	}
+	var digest [32]byte
+	copy(digest[:], decoded)
+	if digest == ([32]byte{}) {
+		return [32]byte{}, fmt.Errorf("invalid RHIZA_EXPECTED_INSTALLED_POLICY_HASH: zero digest")
+	}
+	return digest, nil
+}
+
+func validateJoinSeeds(seeds []string) error {
+	seen := make(map[string]struct{}, len(seeds))
+	for _, seed := range seeds {
+		endpoint, err := url.Parse(seed)
+		if err != nil || endpoint.Scheme != "quic" || endpoint.User != nil || endpoint.Hostname() == "" || endpoint.RawQuery != "" || endpoint.Fragment != "" || endpoint.Path != "" {
+			return fmt.Errorf("join seed must be a QUIC host:port endpoint")
+		}
+		port, err := strconv.Atoi(endpoint.Port())
+		if err != nil || port < 1 || port > 65535 {
+			return fmt.Errorf("join seed must include a valid QUIC port")
+		}
+		if _, ok := seen[seed]; ok {
+			return fmt.Errorf("join seeds must be unique")
+		}
+		seen[seed] = struct{}{}
+	}
+	return nil
 }
 
 func configEnvOrDefault(key, defaultValue string) string {

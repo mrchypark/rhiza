@@ -5,6 +5,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"fmt"
+	"sort"
 )
 
 // BeginReconfiguration commits a freeze under the current voter quorum. The
@@ -313,55 +314,140 @@ func (c *Core) finishReconfiguration(ctx context.Context, abort bool, expectedTa
 // without the freeze and preceding abort revision, a retry cannot be
 // distinguished from a later or unrelated transition.
 func (c *Core) boundHistoricalTerminalLocked(target Cluster, expectedAbortSlot Slot, operationDigest [32]byte, abort bool) (Slot, bool, error) {
-	if c.floor != 0 {
-		return 0, false, fmt.Errorf("bound reconfiguration retry history is compacted")
+	if c.floor > 0 && c.baseMembership == nil && !c.authenticatedAnchorOnlyBaseLocked() {
+		return 0, false, fmt.Errorf("bound reconfiguration retry lacks an authenticated recovery base")
 	}
-	history, err := c.membershipHistoryLocked(0)
-	if err != nil {
-		return 0, false, fmt.Errorf("bound reconfiguration retry history: %w", err)
-	}
-	var matches []ConfigTransition
-	matches = append(matches, history.Transitions...)
-	if history.Abort != nil {
-		matches = append(matches, *history.Abort)
-	}
-	var found *ConfigTransition
-	for i := range matches {
-		transition := &matches[i]
-		freeze, freezeOK, freezeErr := decodeReconfiguration(transition.Freeze.Value)
-		terminal, terminalOK, terminalErr := decodeReconfiguration(transition.Terminal.Value)
-		if freezeErr != nil || terminalErr != nil || !freezeOK || !terminalOK || freeze.Terminal || !terminal.Terminal {
+	var foundFreeze, foundTerminal Slot
+	for terminalSlot, terminalValue := range c.decided {
+		if terminalSlot <= c.floor || terminalValue.Slot != terminalSlot {
 			continue
 		}
-		if freeze.OperationDigest != operationDigest || terminal.OperationDigest != operationDigest || !sameCluster(freeze.Target, target) || !sameCluster(terminal.Target, target) || terminal.Abort != abort {
+		terminal, terminalOK, terminalErr := decodeReconfiguration(terminalValue.Value)
+		if terminalErr != nil || !terminalOK || !terminal.Terminal || terminal.TerminalSlot != terminalSlot {
 			continue
 		}
-		if found != nil {
+		if err := c.validateRetainedBoundDecisionLocked(terminalValue); err != nil {
+			return 0, false, err
+		}
+		freezeSlot := terminal.Freeze
+		if freezeSlot <= c.floor || freezeSlot >= terminalSlot {
+			continue
+		}
+		freezeValue, exists := c.decided[freezeSlot]
+		if !exists || freezeValue.Slot != freezeSlot {
+			continue
+		}
+		freeze, freezeOK, freezeErr := decodeReconfiguration(freezeValue.Value)
+		if freezeErr != nil || !freezeOK || freeze.Terminal || freeze.TerminalSlot != terminalSlot {
+			continue
+		}
+		if err := c.validateRetainedBoundDecisionLocked(freezeValue); err != nil {
+			return 0, false, err
+		}
+		if freeze.OperationDigest != operationDigest || terminal.OperationDigest != operationDigest ||
+			!sameCluster(freeze.Target, target) || !sameCluster(terminal.Target, target) || terminal.Abort != abort {
+			continue
+		}
+		if foundTerminal != 0 {
 			return 0, false, fmt.Errorf("bound reconfiguration retry is ambiguous")
 		}
-		found = transition
+		foundFreeze, foundTerminal = freezeSlot, terminalSlot
 	}
-	if found == nil {
+	if foundTerminal == 0 {
 		return 0, false, nil
 	}
-	freezeSlot := found.Freeze.Slot
-	if found.Freeze.Slot == 0 || found.Terminal.Slot <= freezeSlot || !c.durable[freezeSlot] || !c.durable[found.Terminal.Slot] {
-		return 0, false, fmt.Errorf("bound reconfiguration terminal is not durably retained")
-	}
+	// Recover the abort revision in force at this exact freeze. The checkpoint
+	// base supplies the revision at the floor; every later successful terminal
+	// resets it, and every later abort terminal advances it.
 	var priorAbort Slot
-	for slot, value := range c.decided {
-		if slot >= freezeSlot {
+	if c.baseMembership != nil && c.baseMembership.Abort != nil {
+		baseAbort := c.baseMembership.Abort.Terminal.Slot
+		if baseAbort <= c.floor {
+			priorAbort = baseAbort
+		}
+	}
+	var controls []Slot
+	for slot := range c.decided {
+		if slot > c.floor && slot < foundFreeze {
+			controls = append(controls, slot)
+		}
+	}
+	sort.Slice(controls, func(i, j int) bool { return controls[i] < controls[j] })
+	for _, slot := range controls {
+		value := c.decided[slot]
+		control, ok, decodeErr := decodeReconfiguration(value.Value)
+		if decodeErr != nil || !ok || !control.Terminal || control.TerminalSlot != slot {
 			continue
 		}
-		control, ok, decodeErr := decodeReconfiguration(value.Value)
-		if decodeErr == nil && ok && control.Terminal && control.Abort && slot > priorAbort {
+		if err := c.validateRetainedBoundDecisionLocked(value); err != nil {
+			return 0, false, err
+		}
+		freezeValue, exists := c.decided[control.Freeze]
+		if !exists {
+			return 0, false, fmt.Errorf("bound reconfiguration abort revision lacks its retained freeze")
+		}
+		freeze, freezeOK, freezeErr := decodeReconfiguration(freezeValue.Value)
+		if freezeErr != nil || !freezeOK || freeze.Terminal || freeze.TerminalSlot != slot ||
+			freeze.OperationDigest != control.OperationDigest || !sameCluster(freeze.Target, control.Target) {
+			return 0, false, fmt.Errorf("bound reconfiguration abort revision has a mismatched freeze")
+		}
+		if err := c.validateRetainedBoundDecisionLocked(freezeValue); err != nil {
+			return 0, false, err
+		}
+		if control.Abort {
 			priorAbort = slot
+		} else {
+			priorAbort = 0
 		}
 	}
 	if priorAbort != expectedAbortSlot {
 		return 0, false, fmt.Errorf("bound reconfiguration retry abort revision %d does not match expected %d", priorAbort, expectedAbortSlot)
 	}
-	return found.Terminal.Slot, true, nil
+	return foundTerminal, true, nil
+}
+
+// authenticatedAnchorOnlyBaseLocked recognizes only the membership-less base
+// form explicitly installed by the fenced-generation path. That path binds
+// its ConfigID to the configured bootstrap cluster and retains the nonzero
+// generation anchor, recovery root, and prefix. Any later membership epochs
+// must start strictly after that base; no abort revision is inferred from an
+// unanchored or mismatched base.
+func (c *Core) authenticatedAnchorOnlyBaseLocked() bool {
+	if c.floor == 0 || c.floor > ^Slot(0)-18 || c.baseMembership != nil ||
+		c.generationAnchorHash == ([32]byte{}) || c.floorRoot == ([32]byte{}) || c.config == nil || len(c.configHistory) == 0 {
+		return false
+	}
+	if c.configHistory[0].start != 1 || !sameCluster(c.configHistory[0].cluster, *c.config) {
+		return false
+	}
+	prefix, ok := c.prefixes[c.floor]
+	if !ok || prefix == ([32]byte{}) {
+		return false
+	}
+	firstSuffixFreeze := c.floor + 1
+	for _, epoch := range c.configHistory[1:] {
+		if epoch.start < firstSuffixFreeze+17 {
+			return false
+		}
+	}
+	return true
+}
+
+func (c *Core) validateRetainedBoundDecisionLocked(value DecidedValue) error {
+	if !c.durable[value.Slot] {
+		return fmt.Errorf("bound reconfiguration retry decision at slot %d is not durable", value.Slot)
+	}
+	if sha256.Sum256(value.Value) != value.Hash {
+		return fmt.Errorf("bound reconfiguration retry decision at slot %d has a mismatched value hash", value.Slot)
+	}
+	configID, decision, err := decodeCertificate(value.Certificate)
+	if err != nil {
+		return fmt.Errorf("bound reconfiguration retry certificate at slot %d: %w", value.Slot, err)
+	}
+	if configID != c.clusterForSlotLocked(value.Slot).ConfigID || decision.Slot != value.Slot || decision.Proposal.Hash != value.Hash {
+		return fmt.Errorf("bound reconfiguration retry certificate at slot %d does not match retained membership", value.Slot)
+	}
+	return nil
 }
 
 func (c *Core) takePipeline(ctx context.Context) error {

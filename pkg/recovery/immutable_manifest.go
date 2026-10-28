@@ -56,12 +56,12 @@ type ImmutableExtentRef struct {
 // validates its base and replays certificates into an observer, every field is
 // untrusted data. This API does not authorize Node activation.
 type ImmutableArchiveManifest struct {
-	ConfigID    uint     `json:"config_id"`
-	Generation  uint64   `json:"generation"`
-	ProfileHash [32]byte `json:"profile_hash"`
-	// WriterIdentityHash is SHA-256 of canonical JSON for a fencing.Identity
-	// already validated with Identity.Validate. Recovery cannot import fencing
-	// without creating an import cycle through its certificate path.
+	ConfigID            uint     `json:"config_id"`
+	InstalledPolicyHash [32]byte `json:"installed_policy_hash"`
+	ProfileHash         [32]byte `json:"profile_hash"`
+	// WriterIdentityHash is derived from finalized public node, key, and WAL
+	// registration bound to InstalledPolicyHash. Recovery does not construct or
+	// validate that registration; its producer supplies the finalized digest.
 	WriterIdentityHash [32]byte             `json:"writer_identity_hash"`
 	Base               ImmutableArchiveBase `json:"base"`
 	Tip                quepaxa.Slot         `json:"tip"`
@@ -70,13 +70,13 @@ type ImmutableArchiveManifest struct {
 }
 
 // ImmutableArchiveSelection is trusted caller context used only for lookup
-// binding. Its namespace, generation, profile and validated writer identity
-// hash must come from independently authorized configuration, not a manifest
-// or receipt.
+// binding. Its namespace, installed policy, profile, and finalized writer
+// registration hashes must come from independently authorized configuration,
+// not a manifest or receipt.
 type ImmutableArchiveSelection struct {
-	Generation         uint64
-	ProfileHash        [32]byte
-	WriterIdentityHash [32]byte
+	InstalledPolicyHash [32]byte
+	ProfileHash         [32]byte
+	WriterIdentityHash  [32]byte
 }
 
 // ImmutableArchive is a structurally verified but uncertified immutable
@@ -102,7 +102,7 @@ func WriteImmutableArchiveManifest(ctx context.Context, bucket objstore.Bucket, 
 	if bucket == nil {
 		return [32]byte{}, fmt.Errorf("immutable archive bucket is required")
 	}
-	selection := ImmutableArchiveSelection{Generation: manifest.Generation, ProfileHash: manifest.ProfileHash, WriterIdentityHash: manifest.WriterIdentityHash}
+	selection := ImmutableArchiveSelection{InstalledPolicyHash: manifest.InstalledPolicyHash, ProfileHash: manifest.ProfileHash, WriterIdentityHash: manifest.WriterIdentityHash}
 	if err := validateImmutableSelection(selection); err != nil {
 		return [32]byte{}, err
 	}
@@ -171,7 +171,7 @@ func ReadImmutableArchiveManifest(ctx context.Context, bucket objstore.Bucket, n
 	if err := decodeCanonicalImmutableJSON(data, &manifest); err != nil {
 		return nil, fmt.Errorf("decode immutable archive manifest: %w", err)
 	}
-	if manifest.Generation != selection.Generation || manifest.ProfileHash != selection.ProfileHash || manifest.WriterIdentityHash != selection.WriterIdentityHash {
+	if manifest.InstalledPolicyHash != selection.InstalledPolicyHash || manifest.ProfileHash != selection.ProfileHash || manifest.WriterIdentityHash != selection.WriterIdentityHash {
 		return nil, fmt.Errorf("immutable archive manifest selection mismatch")
 	}
 	if err := validateImmutableManifest(manifest); err != nil {
@@ -217,8 +217,12 @@ func (a *ImmutableArchive) ReadExtent(ctx context.Context, index int) (Extent, e
 	if !immutableRefMatchesExtent(ref, extent) {
 		return Extent{}, fmt.Errorf("immutable archive extent reference mismatch")
 	}
+	prefixes := extentPrefixes(extent)
+	if prefixes[len(prefixes)-1] != extent.EndPrefix {
+		return Extent{}, fmt.Errorf("immutable archive extent prefix mismatch")
+	}
 	extent.hash, extent.object = ref.Hash, ref.Object
-	extent.prefixes = extentPrefixes(extent)
+	extent.prefixes = prefixes
 	return extent, nil
 }
 
@@ -290,7 +294,7 @@ func validateImmutableManifest(m ImmutableArchiveManifest) error {
 }
 
 func validateImmutableManifestIdentity(m ImmutableArchiveManifest) error {
-	if m.ConfigID == 0 || m.Generation == 0 || m.ProfileHash == ([32]byte{}) || m.WriterIdentityHash == ([32]byte{}) || len(m.Extents) > maxExtentItems || len(m.Extents) != 0 && m.Tip == 0 {
+	if m.ConfigID == 0 || m.InstalledPolicyHash == ([32]byte{}) || m.ProfileHash == ([32]byte{}) || m.WriterIdentityHash == ([32]byte{}) || len(m.Extents) > maxExtentItems || len(m.Extents) != 0 && m.Tip == 0 {
 		return fmt.Errorf("invalid immutable archive manifest identity")
 	}
 	return nil
@@ -322,7 +326,7 @@ func immutableRefMatchesExtent(ref ImmutableExtentRef, extent Extent) bool {
 }
 
 func validateImmutableSelection(s ImmutableArchiveSelection) error {
-	if s.Generation == 0 || s.ProfileHash == ([32]byte{}) || s.WriterIdentityHash == ([32]byte{}) {
+	if s.InstalledPolicyHash == ([32]byte{}) || s.ProfileHash == ([32]byte{}) || s.WriterIdentityHash == ([32]byte{}) {
 		return fmt.Errorf("invalid immutable archive selection")
 	}
 	return nil
@@ -336,7 +340,7 @@ func validateImmutableNamespace(namespace string) error {
 }
 
 func immutableScopePath(selection ImmutableArchiveSelection) (string, error) {
-	return fmt.Sprintf("generation-%020d/profile-%x/writer-%x", selection.Generation, selection.ProfileHash, selection.WriterIdentityHash), nil
+	return fmt.Sprintf("profile-%x/writer-%x", selection.ProfileHash, selection.WriterIdentityHash), nil
 }
 
 func immutableManifestKey(namespace string, selection ImmutableArchiveSelection, hash [32]byte) string {
@@ -418,6 +422,10 @@ func cloneImmutableManifest(m ImmutableArchiveManifest) ImmutableArchiveManifest
 		seal := *m.Base.Seal
 		seal.NextLeaderOrder = append([]quepaxa.NodeID(nil), seal.NextLeaderOrder...)
 		seal.FollowingLeaderOrder = append([]quepaxa.NodeID(nil), seal.FollowingLeaderOrder...)
+		if seal.Membership != nil {
+			membership := cloneImmutableMembership(*seal.Membership)
+			seal.Membership = &membership
+		}
 		m.Base.Seal = &seal
 	}
 	if m.Base.Decision != nil {
@@ -431,4 +439,32 @@ func cloneImmutableManifest(m ImmutableArchiveManifest) ImmutableArchiveManifest
 		m.Base.Checkpoint = &root
 	}
 	return m
+}
+
+func cloneImmutableMembership(record quepaxa.MembershipRecord) quepaxa.MembershipRecord {
+	copy := quepaxa.MembershipRecord{
+		Genesis:     record.Genesis,
+		Transitions: make([]quepaxa.ConfigTransition, len(record.Transitions)),
+	}
+	copy.Genesis.Members = append([]quepaxa.Member(nil), record.Genesis.Members...)
+	for i, transition := range record.Transitions {
+		copy.Transitions[i] = quepaxa.ConfigTransition{
+			Freeze:   cloneImmutableDecision(transition.Freeze),
+			Terminal: cloneImmutableDecision(transition.Terminal),
+		}
+	}
+	if record.Abort != nil {
+		abort := quepaxa.ConfigTransition{
+			Freeze:   cloneImmutableDecision(record.Abort.Freeze),
+			Terminal: cloneImmutableDecision(record.Abort.Terminal),
+		}
+		copy.Abort = &abort
+	}
+	return copy
+}
+
+func cloneImmutableDecision(decision quepaxa.DecidedValue) quepaxa.DecidedValue {
+	decision.Value = append([]byte(nil), decision.Value...)
+	decision.Certificate = append([]byte(nil), decision.Certificate...)
+	return decision
 }

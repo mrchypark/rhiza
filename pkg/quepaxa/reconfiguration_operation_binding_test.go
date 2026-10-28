@@ -4,9 +4,13 @@ import (
 	"bytes"
 	"context"
 	"crypto/sha256"
+	"errors"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/mrchypark/rhiza/pkg/qlog"
 )
 
 func TestReconfigurationControlRetainsOperationDigest(t *testing.T) {
@@ -139,6 +143,414 @@ func TestBoundReconfigurationRequiresExactOperationDigest(t *testing.T) {
 	}
 	if _, err := core.checkpointMembershipForSeal(decodedSeal); err != nil {
 		t.Fatalf("checkpoint round-trip lost operation binding: %v", err)
+	}
+}
+
+func TestBoundSingletonADDRequiresCandidateTerminalACK(t *testing.T) {
+	wal, err := qlog.Open(filepath.Join(t.TempDir(), "singleton-add"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = wal.Close() })
+
+	candidateAckAvailable := false
+	var terminalSends int
+	transport := &mockTransport{}
+	transport.sendDecision = func(_ context.Context, decision Decision) error {
+		control, ok, decodeErr := decodeReconfiguration(decision.Proposal.Value)
+		if decodeErr != nil || !ok || !control.Terminal || control.Abort {
+			return nil
+		}
+		terminalSends++
+		if !candidateAckAvailable {
+			return errors.New("candidate terminal ACK unavailable")
+		}
+		return nil
+	}
+	core, err := New(Config{
+		NodeID: "a", Cluster: Cluster{ConfigID: 1, Members: []Member{{ID: "a"}}}, WAL: wal,
+		Transport: transport, EnableReconfiguration: true,
+		ReconfigurationAdmission: func(context.Context, Cluster, Slot, [32]byte) error { return nil },
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	target := Cluster{ConfigID: 2, Members: []Member{{ID: "a"}, {ID: "candidate", WALIdentity: strings.Repeat("c", 64)}}}
+	var digest [32]byte
+	digest[0] = 0xa1
+	if _, err := core.BeginReconfigurationBoundAt(context.Background(), target, 0, digest); err != nil {
+		t.Fatalf("begin bound singleton ADD: %v", err)
+	}
+	if err := core.FinishReconfigurationBoundAt(context.Background(), target, 0, digest); err == nil {
+		t.Fatal("bound singleton ADD reported completion without the candidate terminal ACK")
+	}
+	if terminalSends == 0 {
+		t.Fatal("singleton ADD bypassed terminal transport instead of observing missing candidate ACK")
+	}
+	if err := core.FinishReconfigurationBoundAt(context.Background(), target, 0, digest); err == nil {
+		t.Fatal("exact retry reported completion while candidate ACK remained unavailable")
+	}
+	candidateAckAvailable = true
+	if err := core.FinishReconfigurationBoundAt(context.Background(), target, 0, digest); err != nil {
+		t.Fatalf("exact retry after candidate terminal ACK became available: %v", err)
+	}
+}
+
+func TestBoundSingletonADDWithoutTransportFailsClosed(t *testing.T) {
+	wal, err := qlog.Open(filepath.Join(t.TempDir(), "singleton-add-no-transport"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = wal.Close() })
+	core, err := New(Config{
+		NodeID: "a", Cluster: Cluster{ConfigID: 1, Members: []Member{{ID: "a"}}}, WAL: wal,
+		EnableReconfiguration:    true,
+		ReconfigurationAdmission: func(context.Context, Cluster, Slot, [32]byte) error { return nil },
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	target := Cluster{ConfigID: 2, Members: []Member{{ID: "a"}, {ID: "candidate", WALIdentity: strings.Repeat("f", 64)}}}
+	var digest [32]byte
+	digest[0] = 0xa2
+	if _, err := core.BeginReconfigurationBoundAt(context.Background(), target, 0, digest); err != nil {
+		t.Fatal(err)
+	}
+	if err := core.FinishReconfigurationBoundAt(context.Background(), target, 0, digest); !errors.Is(err, ErrQuorumUnavailable) {
+		t.Fatalf("singleton ADD without candidate-delivery transport returned %v", err)
+	}
+}
+
+func compactReconfigurationCheckpoint(t *testing.T, cores map[NodeID]*Core) CheckpointSeal {
+	t.Helper()
+	core := cores["a"]
+	ctx := context.Background()
+	if _, _, err := core.Propose(ctx, []byte("checkpoint-prefix")); err != nil {
+		t.Fatal(err)
+	}
+	index := core.Tip()
+	membership, err := core.CheckpointMembership(index)
+	if err != nil {
+		t.Fatal(err)
+	}
+	prefix, ok := core.PrefixHash(index)
+	if !ok {
+		t.Fatal("checkpoint prefix unavailable")
+	}
+	next, following, err := core.CheckpointLeaderOrders(index)
+	if err != nil {
+		t.Fatal(err)
+	}
+	seal := CheckpointSeal{
+		ConfigID: core.ConfigID(), Index: index, RootHash: sha256.Sum256([]byte("bound-history-checkpoint-root")),
+		StateHash: sha256.Sum256([]byte("bound-history-checkpoint-state")), PrefixHash: prefix,
+		NextLeaderOrder: next, FollowingLeaderOrder: following, Membership: &membership,
+	}
+	for _, voter := range cores {
+		if !voter.IsVoter() {
+			continue
+		}
+		voter.SetCheckpointValidator(func(context.Context, CheckpointSeal) error { return nil })
+		if err := voter.PrepareCheckpoint(ctx, seal); err != nil {
+			t.Fatalf("prepare checkpoint on %s: %v", voter.nodeID, err)
+		}
+	}
+	encoded, err := EncodeCheckpointSeal(seal)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := core.Propose(ctx, encoded); err != nil {
+		t.Fatal(err)
+	}
+	if err := core.CompactThrough(seal.Index, seal.RootHash); err != nil {
+		t.Fatal(err)
+	}
+	return seal
+}
+
+func reconfigClusterWithWALPaths(t *testing.T) (map[NodeID]*Core, *clusterTransport, map[NodeID]*qlog.WAL, map[NodeID]string, Cluster) {
+	t.Helper()
+	initial := Cluster{ConfigID: 1, Members: []Member{{ID: "a"}, {ID: "b"}, {ID: "c"}}}
+	transport := &clusterTransport{cores: map[NodeID]*Core{}, down: map[NodeID]bool{}, dropDecision: map[NodeID]bool{}}
+	cores := make(map[NodeID]*Core, len(initial.Members))
+	wals := make(map[NodeID]*qlog.WAL, len(initial.Members))
+	paths := make(map[NodeID]string, len(initial.Members))
+	root := t.TempDir()
+	t.Cleanup(func() {
+		for _, wal := range wals {
+			if wal != nil {
+				_ = wal.Close()
+			}
+		}
+	})
+	for _, member := range initial.Members {
+		paths[member.ID] = filepath.Join(root, string(member.ID))
+		wal, err := qlog.Open(paths[member.ID])
+		if err != nil {
+			t.Fatal(err)
+		}
+		core := newCore(member.ID, &initial, wal, transport)
+		core.reconfigEnabled = true
+		cores[member.ID], wals[member.ID] = core, wal
+		transport.cores[member.ID] = core
+	}
+	return cores, transport, wals, paths, initial
+}
+
+func restartRetryCore(t *testing.T, id NodeID, initial Cluster, transport *clusterTransport, wals map[NodeID]*qlog.WAL, paths map[NodeID]string) *Core {
+	t.Helper()
+	if err := wals[id].Close(); err != nil {
+		t.Fatal(err)
+	}
+	reopened, err := qlog.Open(paths[id])
+	if err != nil {
+		t.Fatal(err)
+	}
+	restarted, err := New(Config{NodeID: id, Cluster: initial, WAL: reopened, Transport: transport, EnableReconfiguration: true})
+	if err != nil {
+		_ = reopened.Close()
+		t.Fatalf("restart core %s: %v", id, err)
+	}
+	wals[id] = reopened
+	transport.setCore(id, restarted)
+	return restarted
+}
+
+func TestBoundRetryAboveRetainedCheckpointFloor(t *testing.T) {
+	cores, transport, wals, paths, initial := reconfigClusterWithWALPaths(t)
+	core := cores["a"]
+	seal := compactReconfigurationCheckpoint(t, cores)
+	if core.CompactionFloor() != seal.Index {
+		t.Fatalf("floor=%d want checkpoint index %d", core.CompactionFloor(), seal.Index)
+	}
+	target := Cluster{ConfigID: 2, Members: []Member{{ID: "a"}, {ID: "b"}}}
+	var digest [32]byte
+	digest[0] = 0xb1
+	if _, err := core.BeginReconfigurationBoundAt(context.Background(), target, 0, digest); err != nil {
+		t.Fatalf("begin post-checkpoint operation: %v", err)
+	}
+	if err := core.FinishReconfigurationBoundAt(context.Background(), target, 0, digest); err != nil {
+		t.Fatalf("finish post-checkpoint operation: %v", err)
+	}
+	core.mu.RLock()
+	terminal := core.configHistory[len(core.configHistory)-1].start - 1
+	floor := core.floor
+	core.mu.RUnlock()
+	if terminal <= floor {
+		t.Fatalf("test terminal %d is not above retained floor %d", terminal, floor)
+	}
+	core = restartRetryCore(t, "a", initial, transport, wals, paths)
+	if err := core.FinishReconfigurationBoundAt(context.Background(), target, 0, digest); err != nil {
+		t.Fatalf("exact retry with retained post-floor freeze/terminal failed: %v", err)
+	}
+	cores["a"] = core
+	compactingSeal := compactReconfigurationCheckpoint(t, cores)
+	if compactingSeal.Index <= terminal {
+		t.Fatalf("follow-up checkpoint index %d did not compact terminal %d", compactingSeal.Index, terminal)
+	}
+	if err := core.FinishReconfigurationBoundAt(context.Background(), target, 0, digest); err == nil {
+		t.Fatal("exact retry succeeded after required freeze/terminal evidence was compacted")
+	}
+}
+
+func TestBoundRetryUsesAbortRevisionAtExactFreeze(t *testing.T) {
+	cores, transport, wals, paths, initial := reconfigClusterWithWALPaths(t)
+	core := cores["a"]
+	ctx := context.Background()
+	abortedAdd := Cluster{ConfigID: 2, Members: []Member{{ID: "a"}, {ID: "b"}, {ID: "c"}, {ID: "d", WALIdentity: strings.Repeat("d", 64)}}}
+	var abortDigest, removeDigest, finalDigest [32]byte
+	abortDigest[0], removeDigest[0], finalDigest[0] = 0xb2, 0xb3, 0xb4
+	if _, err := core.BeginReconfigurationBoundAt(ctx, abortedAdd, 0, abortDigest); err != nil {
+		t.Fatal(err)
+	}
+	if err := core.AbortReconfigurationBoundAt(ctx, abortedAdd, 0, abortDigest); err != nil {
+		t.Fatal(err)
+	}
+	abortRevision := core.lastAbort.Terminal.Slot
+	removeC := Cluster{ConfigID: 2, Members: []Member{{ID: "a"}, {ID: "b"}}}
+	if _, err := core.BeginReconfigurationBoundAt(ctx, removeC, abortRevision, removeDigest); err != nil {
+		t.Fatal(err)
+	}
+	if err := core.FinishReconfigurationBoundAt(ctx, removeC, abortRevision, removeDigest); err != nil {
+		t.Fatalf("successful transition after abort: %v", err)
+	}
+	core = restartRetryCore(t, "a", initial, transport, wals, paths)
+	if err := core.AbortReconfigurationBoundAt(ctx, abortedAdd, 0, abortDigest); err != nil {
+		t.Fatalf("retained exact abort retry after later success: %v", err)
+	}
+	removeB := Cluster{ConfigID: 3, Members: []Member{{ID: "a"}}}
+	if _, err := core.BeginReconfigurationBoundAt(ctx, removeB, 0, finalDigest); err != nil {
+		t.Fatalf("begin after successful transition reset abort revision: %v", err)
+	}
+	if err := core.FinishReconfigurationBoundAt(ctx, removeB, 0, finalDigest); err != nil {
+		t.Fatal(err)
+	}
+	if err := core.FinishReconfigurationBoundAt(ctx, removeB, 0, finalDigest); err != nil {
+		t.Fatalf("exact retry incorrectly resurrected pre-success abort revision: %v", err)
+	}
+}
+
+func TestBoundRetryUsesAuthenticatedCheckpointAbortBase(t *testing.T) {
+	cores, transport, wals, paths, initial := reconfigClusterWithWALPaths(t)
+	core := cores["a"]
+	ctx := context.Background()
+	abortedAdd := Cluster{ConfigID: 2, Members: []Member{{ID: "a"}, {ID: "b"}, {ID: "c"}, {ID: "d", WALIdentity: strings.Repeat("d", 64)}}}
+	var abortDigest, afterAbortDigest, afterSuccessDigest [32]byte
+	abortDigest[0], afterAbortDigest[0], afterSuccessDigest[0] = 0xb7, 0xb8, 0xb9
+	if _, err := core.BeginReconfigurationBoundAt(ctx, abortedAdd, 0, abortDigest); err != nil {
+		t.Fatal(err)
+	}
+	if err := core.AbortReconfigurationBoundAt(ctx, abortedAdd, 0, abortDigest); err != nil {
+		t.Fatal(err)
+	}
+	abortRevision := core.lastAbort.Terminal.Slot
+	seal := compactReconfigurationCheckpoint(t, cores)
+	if core.CompactionFloor() != seal.Index {
+		t.Fatalf("floor=%d want=%d", core.CompactionFloor(), seal.Index)
+	}
+	removeC := Cluster{ConfigID: 2, Members: []Member{{ID: "a"}, {ID: "b"}}}
+	if _, err := core.BeginReconfigurationBoundAt(ctx, removeC, abortRevision, afterAbortDigest); err != nil {
+		t.Fatalf("begin using checkpoint-authenticated abort revision: %v", err)
+	}
+	if err := core.FinishReconfigurationBoundAt(ctx, removeC, abortRevision, afterAbortDigest); err != nil {
+		t.Fatalf("finish using checkpoint-authenticated abort revision: %v", err)
+	}
+	if err := core.FinishReconfigurationBoundAt(ctx, removeC, abortRevision, afterAbortDigest); err != nil {
+		t.Fatalf("exact retry lost checkpoint-authenticated abort revision: %v", err)
+	}
+	removeB := Cluster{ConfigID: 3, Members: []Member{{ID: "a"}}}
+	if _, err := core.BeginReconfigurationBoundAt(ctx, removeB, 0, afterSuccessDigest); err != nil {
+		t.Fatalf("successful terminal did not reset checkpoint abort revision: %v", err)
+	}
+	if err := core.FinishReconfigurationBoundAt(ctx, removeB, 0, afterSuccessDigest); err != nil {
+		t.Fatal(err)
+	}
+	core = restartRetryCore(t, "a", initial, transport, wals, paths)
+	if err := core.FinishReconfigurationBoundAt(ctx, removeB, 0, afterSuccessDigest); err != nil {
+		t.Fatalf("post-restart exact retry resurrected checkpoint abort revision: %v", err)
+	}
+}
+
+func TestBoundRetryWithAuthenticatedAnchorOnlyBaseAfterRestart(t *testing.T) {
+	walDir := t.TempDir()
+	wal, err := qlog.Open(walDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	wals := []*qlog.WAL{wal}
+	t.Cleanup(func() {
+		for _, opened := range wals {
+			_ = opened.Close()
+		}
+	})
+	terminalDeliveryAvailable := false
+	var terminalSends int
+	transport := &mockTransport{}
+	transport.sendDecision = func(_ context.Context, decision Decision) error {
+		control, configured, decodeErr := decodeReconfiguration(decision.Proposal.Value)
+		if decodeErr != nil || !configured || !control.Terminal || control.Abort {
+			return nil
+		}
+		terminalSends++
+		if !terminalDeliveryAvailable {
+			return errors.New("terminal response lost")
+		}
+		return nil
+	}
+	initial := Cluster{ConfigID: 1, Members: []Member{{ID: "a"}}}
+	config := Config{
+		NodeID: "a", Cluster: initial, WAL: wal, Transport: transport, EnableReconfiguration: true,
+		ReconfigurationAdmission: func(context.Context, Cluster, Slot, [32]byte) error { return nil },
+	}
+	core, err := New(config)
+	if err != nil {
+		t.Fatal(err)
+	}
+	fenced := FencedGenerationBase{
+		ConfigID: 1, Index: 137,
+		PrefixHash: sha256.Sum256([]byte("anchor-only-prefix")),
+		RootHash:   sha256.Sum256([]byte("anchor-only-root")),
+		AnchorHash: sha256.Sum256([]byte("anchor-only-generation")),
+	}
+	untrusted := fenced
+	untrusted.AnchorHash = [32]byte{}
+	if err := core.InstallFencedGenerationBase(context.Background(), untrusted); err == nil {
+		t.Fatal("accepted an unanchored membership-less base")
+	}
+	mismatched := fenced
+	mismatched.ConfigID++
+	if err := core.InstallFencedGenerationBase(context.Background(), mismatched); err == nil {
+		t.Fatal("accepted a membership-less base for a different configured cluster")
+	}
+	if err := core.InstallFencedGenerationBase(context.Background(), fenced); err != nil {
+		t.Fatalf("install approved anchor-only base: %v", err)
+	}
+	conflicting := fenced
+	conflicting.RootHash = sha256.Sum256([]byte("conflicting-anchor-only-root"))
+	if err := core.InstallFencedGenerationBase(context.Background(), conflicting); err == nil {
+		t.Fatal("accepted an ambiguous anchored base with conflicting recovery evidence")
+	}
+	target := Cluster{ConfigID: 2, Members: []Member{{ID: "a"}, {ID: "candidate", WALIdentity: strings.Repeat("a", 64)}}}
+	var digest [32]byte
+	digest[0] = 0xc1
+	if _, err := core.BeginReconfigurationBoundAt(context.Background(), target, 0, digest); err != nil {
+		t.Fatalf("begin after anchor-only base: %v", err)
+	}
+	if err := core.FinishReconfigurationBoundAt(context.Background(), target, 0, digest); !errors.Is(err, ErrQuorumUnavailable) {
+		t.Fatalf("finish after anchor-only base = %v, want lost terminal response", err)
+	}
+	if terminalSends == 0 {
+		t.Fatal("lost terminal response did not reach membership delivery")
+	}
+	if core.baseMembership != nil || core.generationAnchorHash != fenced.AnchorHash || core.floor != fenced.Index || core.config.ConfigID != fenced.ConfigID {
+		t.Fatal("test did not retain the intended anchor-only base and configured cluster")
+	}
+	if err := wal.Close(); err != nil {
+		t.Fatal(err)
+	}
+	reopened, err := qlog.Open(walDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	terminalDeliveryAvailable = true
+	wals = append(wals, reopened)
+	config.WAL = reopened
+	restarted, err := New(config)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := restarted.FinishReconfigurationBoundAt(context.Background(), target, 0, digest); err != nil {
+		t.Fatalf("post-restart exact retry after lost response from anchor-only base: %v", err)
+	}
+	if terminalSends < 2 {
+		t.Fatalf("terminal deliveries=%d, want lost response plus exact retry", terminalSends)
+	}
+}
+
+func TestBoundRetryFindsEarlierAbortAfterLaterAbort(t *testing.T) {
+	cores, transport, wals, paths, initial := reconfigClusterWithWALPaths(t)
+	core := cores["a"]
+	ctx := context.Background()
+	first := Cluster{ConfigID: 2, Members: []Member{{ID: "a"}, {ID: "b"}, {ID: "c"}, {ID: "d", WALIdentity: strings.Repeat("d", 64)}}}
+	second := Cluster{ConfigID: 2, Members: []Member{{ID: "a"}, {ID: "b"}, {ID: "c"}, {ID: "e", WALIdentity: strings.Repeat("e", 64)}}}
+	var firstDigest, secondDigest [32]byte
+	firstDigest[0], secondDigest[0] = 0xb5, 0xb6
+	if _, err := core.BeginReconfigurationBoundAt(ctx, first, 0, firstDigest); err != nil {
+		t.Fatal(err)
+	}
+	if err := core.AbortReconfigurationBoundAt(ctx, first, 0, firstDigest); err != nil {
+		t.Fatal(err)
+	}
+	firstAbort := core.lastAbort.Terminal.Slot
+	if _, err := core.BeginReconfigurationBoundAt(ctx, second, firstAbort, secondDigest); err != nil {
+		t.Fatal(err)
+	}
+	if err := core.AbortReconfigurationBoundAt(ctx, second, firstAbort, secondDigest); err != nil {
+		t.Fatal(err)
+	}
+	core = restartRetryCore(t, "a", initial, transport, wals, paths)
+	if err := core.AbortReconfigurationBoundAt(ctx, first, 0, firstDigest); err != nil {
+		t.Fatalf("earlier retained abort was hidden by later abort: %v", err)
 	}
 }
 

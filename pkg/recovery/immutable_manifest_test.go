@@ -4,12 +4,18 @@ import (
 	"bytes"
 	"context"
 	"crypto/sha256"
+	"encoding/binary"
+	"encoding/json"
 	"errors"
+	"fmt"
+	"hash/crc32"
 	"io"
 	"path/filepath"
 	"testing"
+	"time"
 
 	"github.com/mrchypark/rhiza/internal/types"
+	"github.com/mrchypark/rhiza/pkg/checkpoint"
 	"github.com/mrchypark/rhiza/pkg/qlog"
 	"github.com/mrchypark/rhiza/pkg/quepaxa"
 	"github.com/thanos-io/objstore"
@@ -77,7 +83,7 @@ func immutableManifestFixture(t *testing.T) (context.Context, *objstore.InMemBuc
 		t.Fatal("source tip has no prefix")
 	}
 	manifest := ImmutableArchiveManifest{
-		ConfigID: 1, Generation: 7, ProfileHash: sha256.Sum256([]byte("approved-profile")),
+		ConfigID: 1, InstalledPolicyHash: sha256.Sum256([]byte("approved-installed-policy")), ProfileHash: sha256.Sum256([]byte("approved-profile")),
 		WriterIdentityHash: sha256.Sum256([]byte("canonical hash of validated writer identity")),
 		Tip:                core.Tip(), TipPrefix: prefix,
 	}
@@ -95,7 +101,7 @@ func TestImmutableArchiveManifestCreateOnlyReadAndCertifiedReplay(t *testing.T) 
 	if second, err := WriteImmutableArchiveManifest(ctx, bucket, "approved/namespace", manifest, extents); err != nil || second != hash {
 		t.Fatalf("idempotent immutable publish hash=%x err=%v", second, err)
 	}
-	selection := ImmutableArchiveSelection{Generation: manifest.Generation, ProfileHash: manifest.ProfileHash, WriterIdentityHash: manifest.WriterIdentityHash}
+	selection := ImmutableArchiveSelection{InstalledPolicyHash: manifest.InstalledPolicyHash, ProfileHash: manifest.ProfileHash, WriterIdentityHash: manifest.WriterIdentityHash}
 	view, err := ReadImmutableArchiveManifest(ctx, bucket, "approved/namespace", selection, hash)
 	if err != nil {
 		t.Fatal(err)
@@ -144,6 +150,14 @@ func TestImmutableArchiveManifestRejectsOversizedExtentListBeforeUpload(t *testi
 		t.Fatal("fixture must contain at least one extent")
 	}
 	bucket := &immutableCountingBucket{Bucket: baseBucket}
+	zeroPolicy := manifest
+	zeroPolicy.InstalledPolicyHash = [32]byte{}
+	if _, err := WriteImmutableArchiveManifest(ctx, bucket, "zero-policy", zeroPolicy, extents); err == nil {
+		t.Fatal("zero installed-policy hash was accepted for publication")
+	}
+	if bucket.uploads != 0 {
+		t.Fatalf("zero installed-policy hash caused %d provider uploads, want zero", bucket.uploads)
+	}
 	oversized := make([]Extent, maxExtentItems+1)
 	for i := range oversized {
 		oversized[i] = extents[0]
@@ -190,14 +204,24 @@ func TestImmutableArchiveManifestRejectsWrongSelectionAndCorruptExtent(t *testin
 	if err != nil {
 		t.Fatal(err)
 	}
-	selection := ImmutableArchiveSelection{Generation: manifest.Generation, ProfileHash: manifest.ProfileHash, WriterIdentityHash: manifest.WriterIdentityHash}
+	selection := ImmutableArchiveSelection{InstalledPolicyHash: manifest.InstalledPolicyHash, ProfileHash: manifest.ProfileHash, WriterIdentityHash: manifest.WriterIdentityHash}
 	if _, err := ReadImmutableArchiveManifest(ctx, bucket, "approved/namespace", selection, sha256.Sum256([]byte("wrong hash"))); err == nil {
 		t.Fatal("wrong expected hash unexpectedly selected a manifest")
 	}
 	wrongSelection := selection
-	wrongSelection.Generation++
+	wrongSelection.InstalledPolicyHash[0] ^= 1
 	if _, err := ReadImmutableArchiveManifest(ctx, bucket, "approved/namespace", wrongSelection, hash); err == nil {
-		t.Fatal("manifest was selected under a different generation scope")
+		t.Fatal("manifest was selected under a different installed-policy scope")
+	}
+	wrongSelection = selection
+	wrongSelection.ProfileHash[0] ^= 1
+	if _, err := ReadImmutableArchiveManifest(ctx, bucket, "approved/namespace", wrongSelection, hash); err == nil {
+		t.Fatal("manifest was selected under a different profile scope")
+	}
+	zeroPolicy := selection
+	zeroPolicy.InstalledPolicyHash = [32]byte{}
+	if _, err := ReadImmutableArchiveManifest(ctx, bucket, "approved/namespace", zeroPolicy, hash); err == nil {
+		t.Fatal("zero installed-policy hash was accepted for selection")
 	}
 	view, err := ReadImmutableArchiveManifest(ctx, bucket, "approved/namespace", selection, hash)
 	if err != nil {
@@ -226,13 +250,35 @@ func TestImmutableArchiveManifestRejectsWrongSelectionAndCorruptExtent(t *testin
 	}
 }
 
+func TestImmutableArchiveScopeUsesPolicyBoundProfileAndWriterPaths(t *testing.T) {
+	_, _, manifest, _, _ := immutableManifestFixture(t)
+	selection := ImmutableArchiveSelection{InstalledPolicyHash: manifest.InstalledPolicyHash, ProfileHash: manifest.ProfileHash, WriterIdentityHash: manifest.WriterIdentityHash}
+	scope, err := immutableScopePath(selection)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := "profile-" + fmt.Sprintf("%x", manifest.ProfileHash) + "/writer-" + fmt.Sprintf("%x", manifest.WriterIdentityHash)
+	if scope != want {
+		t.Fatalf("scope=%q, want %q", scope, want)
+	}
+	changedPolicy := selection
+	changedPolicy.InstalledPolicyHash[0] ^= 1
+	changedScope, err := immutableScopePath(changedPolicy)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if changedScope != scope {
+		t.Fatalf("installed-policy binding unexpectedly changed derived path: got %q want %q", changedScope, scope)
+	}
+}
+
 func TestImmutableArchiveManifestRejectsDifferentBytesAtCreateOnlyKey(t *testing.T) {
 	ctx, bucket, manifest, extents, _ := immutableManifestFixture(t)
 	data, err := encodeExtent(extents[0])
 	if err != nil {
 		t.Fatal(err)
 	}
-	selection := ImmutableArchiveSelection{Generation: manifest.Generation, ProfileHash: manifest.ProfileHash, WriterIdentityHash: manifest.WriterIdentityHash}
+	selection := ImmutableArchiveSelection{InstalledPolicyHash: manifest.InstalledPolicyHash, ProfileHash: manifest.ProfileHash, WriterIdentityHash: manifest.WriterIdentityHash}
 	key := immutableExtentKey("conflict", selection, 1, sha256.Sum256(data))
 	if err := bucket.Upload(ctx, key, bytes.NewReader([]byte("different bytes"))); err != nil {
 		t.Fatal(err)
@@ -249,7 +295,7 @@ func TestImmutableArchiveManifestCheckpointReferenceUsesActualCheckpointVerifier
 	rootHash := mustGenerationHash(anchor.Checkpoint.RootHash)
 	stateHash := mustGenerationHash(anchor.Checkpoint.StateHash)
 	manifest := ImmutableArchiveManifest{
-		ConfigID: 1, Generation: 9, ProfileHash: sha256.Sum256([]byte("target-generation-profile")),
+		ConfigID: 1, InstalledPolicyHash: sha256.Sum256([]byte("target-installed-policy")), ProfileHash: sha256.Sum256([]byte("target-generation-profile")),
 		WriterIdentityHash: sha256.Sum256([]byte("canonical hash of validated target writer identity")),
 		Base: ImmutableArchiveBase{
 			Index: quepaxa.Slot(anchor.SourceTip), PrefixHash: mustGenerationHash(anchor.SourcePrefixHash),
@@ -262,7 +308,7 @@ func TestImmutableArchiveManifestCheckpointReferenceUsesActualCheckpointVerifier
 	if err != nil {
 		t.Fatal(err)
 	}
-	selection := ImmutableArchiveSelection{Generation: manifest.Generation, ProfileHash: manifest.ProfileHash, WriterIdentityHash: manifest.WriterIdentityHash}
+	selection := ImmutableArchiveSelection{InstalledPolicyHash: manifest.InstalledPolicyHash, ProfileHash: manifest.ProfileHash, WriterIdentityHash: manifest.WriterIdentityHash}
 	view, err := ReadImmutableArchiveManifest(ctx, fixture.bucket, "target-generation", selection, hash)
 	if err != nil {
 		t.Fatal(err)
@@ -305,6 +351,186 @@ func TestImmutableArchiveManifestRejectsGapPrefixAndUnsupportedBase(t *testing.T
 	}
 }
 
+func TestImmutableArchiveReaderRejectsHashValidExtentPrefixMismatch(t *testing.T) {
+	ctx, bucket, manifest, extents, _ := immutableManifestFixture(t)
+	if len(extents) != 1 {
+		t.Fatalf("fixture extents=%d, want one", len(extents))
+	}
+	forged := extents[0]
+	forged.EndPrefix[0] ^= 0xff
+	data, err := encodeExtent(extents[0])
+	if err != nil {
+		t.Fatal(err)
+	}
+	copy(data[72:104], forged.EndPrefix[:])
+	binary.BigEndian.PutUint32(data[len(data)-archiveCRCSize:], crc32.Checksum(data[:len(data)-archiveCRCSize], archiveCRCTable))
+
+	selection := ImmutableArchiveSelection{InstalledPolicyHash: manifest.InstalledPolicyHash, ProfileHash: manifest.ProfileHash, WriterIdentityHash: manifest.WriterIdentityHash}
+	hash := sha256.Sum256(data)
+	ref := ImmutableExtentRef{
+		Object: 1, Hash: hash, ConfigID: forged.ConfigID, Start: forged.Start, End: forged.End,
+		StartPrefix: forged.StartPrefix, EndPrefix: forged.EndPrefix,
+		PreviousHash: forged.PreviousHash, PreviousObject: forged.PreviousObject,
+	}
+	manifest.Tip = forged.End
+	manifest.TipPrefix = forged.EndPrefix
+	manifest.Extents = []ImmutableExtentRef{ref}
+	manifestData, err := json.Marshal(manifest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	manifestHash := sha256.Sum256(manifestData)
+	if err := bucket.Upload(ctx, immutableExtentKey("forged-prefix", selection, ref.Object, ref.Hash), bytes.NewReader(data)); err != nil {
+		t.Fatal(err)
+	}
+	if err := bucket.Upload(ctx, immutableManifestKey("forged-prefix", selection, manifestHash), bytes.NewReader(manifestData)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := ReadImmutableArchiveManifest(ctx, bucket, "forged-prefix", selection, manifestHash); err == nil {
+		t.Fatal("reader accepted a hash-valid extent whose decisions compute a different declared end prefix")
+	}
+}
+
+func TestImmutableManifestCopyDeepClonesCheckpointMembership(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	initial := []quepaxa.Member{{ID: "a"}, {ID: "b"}, {ID: "c"}}
+	transport := newArchiveTestCluster(t, initial)
+	core := transport.cores["a"]
+	if _, err := core.BeginReconfiguration(ctx, quepaxa.Cluster{ConfigID: 2, Members: initial[:2]}); err != nil {
+		t.Fatalf("finishable membership transition begin: %v", err)
+	}
+	if err := core.FinishReconfiguration(ctx); err != nil {
+		t.Fatalf("membership transition finish: %v", err)
+	}
+	current := core.CurrentCluster()
+	abortedTarget := quepaxa.Cluster{ConfigID: current.ConfigID + 1, Members: append(append([]quepaxa.Member(nil), current.Members...), quepaxa.Member{ID: "lost", WALIdentity: "0000000000000000000000000000000000000000000000000000000000000000"})}
+	freeze, err := core.BeginReconfiguration(ctx, abortedTarget)
+	if err != nil {
+		t.Fatalf("abortable membership transition begin: %v", err)
+	}
+	if err := core.AbortReconfiguration(ctx); err != nil {
+		t.Fatalf("membership transition abort: %v", err)
+	}
+	for core.Tip() < 82 {
+		if _, _, err := core.Propose(ctx, []byte("after abort")); err != nil {
+			t.Fatalf("post-abort decision: %v", err)
+		}
+	}
+	index := core.Tip()
+	membership, err := core.CheckpointMembership(index)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(membership.Transitions) != 1 || membership.Abort == nil || membership.Abort.Freeze.Slot != freeze {
+		t.Fatalf("checkpoint membership did not retain both transition and abort: transitions=%d abort=%+v", len(membership.Transitions), membership.Abort)
+	}
+
+	bucket := objstore.NewInMemBucket()
+	checkpointManager := checkpoint.NewManager(bucket, "checkpoint", t.TempDir(), 1)
+	checkpointFile := filepath.Join(t.TempDir(), "state")
+	policySnapshot(t, checkpointFile)
+	claim, err := checkpointManager.AcquirePublisherClaim(ctx, "clone-test", 0, time.Minute)
+	if err != nil {
+		t.Fatal(err)
+	}
+	root, err := checkpointManager.CreateFiles(ctx, claim, []checkpoint.Source{{Role: checkpoint.RoleSQLite, Path: checkpointFile}}, uint64(index))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := checkpointManager.ReleasePublisherClaim(ctx, claim); err != nil {
+		t.Fatal(err)
+	}
+	prefix, ok := core.PrefixHash(index)
+	if !ok {
+		t.Fatal("checkpoint prefix unavailable")
+	}
+	nextOrder, followingOrder, err := core.CheckpointLeaderOrders(index)
+	if err != nil {
+		t.Fatal(err)
+	}
+	seal := quepaxa.CheckpointSeal{
+		ConfigID: core.ConfigID(), Index: index, RootHash: root.RootHash, StateHash: root.Hash,
+		PrefixHash: prefix, NextLeaderOrder: nextOrder, FollowingLeaderOrder: followingOrder, Membership: &membership,
+	}
+	checkpointManagerVerify := func(_ context.Context, candidate quepaxa.CheckpointSeal) error {
+		return checkpointManager.Verify(ctx, uint64(candidate.Index), candidate.RootHash, candidate.StateHash)
+	}
+	for _, id := range current.Members {
+		member := transport.cores[id.ID]
+		member.SetCheckpointValidator(checkpointManagerVerify)
+		if err := member.PrepareCheckpoint(ctx, seal); err != nil {
+			t.Fatalf("prepare actual membership checkpoint on %s: %v", id.ID, err)
+		}
+	}
+	encoded, err := quepaxa.EncodeCheckpointSeal(seal)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := core.Propose(ctx, encoded); err != nil {
+		t.Fatalf("certify actual membership checkpoint: %v", err)
+	}
+	sealed, exists, err := core.LatestCheckpointSeal()
+	if err != nil || !exists || sealed.Membership == nil {
+		t.Fatalf("checkpoint seal=%v membership=%v err=%v", exists, sealed.Membership != nil, err)
+	}
+	decision, ok := core.CertifiedValue(sealed.DecisionSlot)
+	if !ok {
+		t.Fatal("checkpoint seal certificate unavailable")
+	}
+
+	manifest := ImmutableArchiveManifest{
+		ConfigID: core.ConfigID(), InstalledPolicyHash: sha256.Sum256([]byte("clone-installed-policy")), ProfileHash: sha256.Sum256([]byte("clone-profile")),
+		WriterIdentityHash: sha256.Sum256([]byte("validated writer identity")),
+		Base: ImmutableArchiveBase{
+			Index: index, PrefixHash: prefix, Seal: &sealed.CheckpointSeal, Decision: &decision,
+			Checkpoint: &ImmutableCheckpointRef{Index: uint64(index), RootHash: root.RootHash, StateHash: root.Hash},
+		},
+		Tip: index, TipPrefix: prefix,
+	}
+	hash, err := WriteImmutableArchiveManifest(ctx, bucket, "clone/namespace", manifest, nil)
+	if err != nil {
+		t.Fatalf("write immutable manifest with certified history base: %v", err)
+	}
+	selection := ImmutableArchiveSelection{InstalledPolicyHash: manifest.InstalledPolicyHash, ProfileHash: manifest.ProfileHash, WriterIdentityHash: manifest.WriterIdentityHash}
+	view, err := ReadImmutableArchiveManifest(ctx, bucket, "clone/namespace", selection, hash)
+	if err != nil {
+		t.Fatalf("read immutable manifest with certified history base: %v", err)
+	}
+	original, err := json.Marshal(view.Manifest())
+	if err != nil {
+		t.Fatal(err)
+	}
+	untouchedCopy := view.Manifest()
+	canonicalBytes, err := readImmutableObject(ctx, bucket, immutableManifestKey("clone/namespace", selection, hash), maxImmutableManifestSize)
+	if err != nil {
+		t.Fatal(err)
+	}
+	mutated := view.Manifest()
+	mutated.Base.Seal.Membership.Genesis.Members[0].ID = "changed-genesis"
+	mutated.Base.Seal.Membership.Transitions[0].Freeze.Value[0] ^= 0xff
+	mutated.Base.Seal.Membership.Transitions[0].Freeze.Certificate[0] ^= 0xff
+	mutated.Base.Seal.Membership.Transitions[0].Terminal.Value[0] ^= 0xff
+	mutated.Base.Seal.Membership.Transitions[0].Terminal.Certificate[0] ^= 0xff
+	mutated.Base.Seal.Membership.Abort.Freeze.Value[0] ^= 0xff
+	mutated.Base.Seal.Membership.Abort.Freeze.Certificate[0] ^= 0xff
+	mutated.Base.Seal.Membership.Abort.Terminal.Value[0] ^= 0xff
+	mutated.Base.Seal.Membership.Abort.Terminal.Certificate[0] ^= 0xff
+	mutated.Base.Seal.NextLeaderOrder[0] = "changed-leader"
+	mutated.Base.Seal.FollowingLeaderOrder[0] = "changed-next-leader"
+	got, err := json.Marshal(view.Manifest())
+	if err != nil || !bytes.Equal(got, original) {
+		t.Fatal("mutating one returned manifest copy changed a later copy")
+	}
+	otherCopy, err := json.Marshal(untouchedCopy)
+	if err != nil || !bytes.Equal(otherCopy, original) {
+		t.Fatal("mutating one returned manifest copy changed another outstanding copy")
+	}
+	if stored, err := readImmutableObject(ctx, bucket, immutableManifestKey("clone/namespace", selection, hash), maxImmutableManifestSize); err != nil || !bytes.Equal(stored, canonicalBytes) {
+		t.Fatalf("stored canonical manifest changed after copy mutation: err=%v", err)
+	}
+}
+
 func TestImmutableArchiveReplayRejectsFabricatedCertificate(t *testing.T) {
 	ctx, bucket, manifest, extents, _ := immutableManifestFixture(t)
 	extents[0].Decisions[0].Certificate = []byte(`{"not":"a certificate"}`)
@@ -312,7 +538,7 @@ func TestImmutableArchiveReplayRejectsFabricatedCertificate(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	selection := ImmutableArchiveSelection{Generation: manifest.Generation, ProfileHash: manifest.ProfileHash, WriterIdentityHash: manifest.WriterIdentityHash}
+	selection := ImmutableArchiveSelection{InstalledPolicyHash: manifest.InstalledPolicyHash, ProfileHash: manifest.ProfileHash, WriterIdentityHash: manifest.WriterIdentityHash}
 	view, err := ReadImmutableArchiveManifest(ctx, bucket, "fabricated", selection, hash)
 	if err != nil {
 		t.Fatal(err)

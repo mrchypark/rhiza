@@ -194,6 +194,11 @@ func (n *Node) open(ctx context.Context, enroll bool) (err error) {
 	if n.terminalRequested.Load() {
 		return fmt.Errorf("terminally drained node cannot reopen")
 	}
+	if n.config != nil && n.config.ExpectedInstalledPolicyHash != ([32]byte{}) {
+		// This pin is not active until immutable verification, initialization,
+		// and the corresponding runtime path are wired end to end.
+		return fmt.Errorf("installed-policy runtime is not wired; refusing legacy Node.Open")
+	}
 	var preparedDRAssignment *fencing.BootstrapAssignment
 	if n.config != nil && n.config.PreparedPodUID != "" {
 		assignment, isDR, markerErr := preparedDRAssignmentForRuntime(n.config)

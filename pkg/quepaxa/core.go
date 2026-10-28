@@ -2180,7 +2180,16 @@ func (c *Core) completeDecision(ctx context.Context, slot Slot, syncLocal bool) 
 	if c.reconfigEnabled {
 		cluster = c.clusterForSlot(slot)
 	}
-	if len(cluster.Members) <= 1 {
+	requiresMembershipTerminalDelivery := false
+	if c.reconfigEnabled {
+		if control, configured, decodeErr := decodeReconfiguration(value.Value); decodeErr != nil {
+			return DecidedValue{}, decodeErr
+		} else if configured && control.Terminal && !control.Abort {
+			next := c.clusterForSlot(slot + 1)
+			requiresMembershipTerminalDelivery = cluster.ConfigID != next.ConfigID
+		}
+	}
+	if len(cluster.Members) <= 1 && !requiresMembershipTerminalDelivery {
 		return value, nil
 	}
 	if c.transport == nil {

@@ -1,6 +1,9 @@
 package rhiza
 
 import (
+	"encoding/json"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -47,6 +50,143 @@ func TestConfigFromEnvParsesOperatorEnvironment(t *testing.T) {
 	}
 	if config.ObjStoreSyncInterval != 2*time.Minute || config.ObjStoreBatchDelay != 3*time.Millisecond || config.ObjStoreGCInterval != 3*time.Hour || config.ObjStoreGCGracePeriod != 48*time.Hour || config.CheckpointInterval != 20*time.Minute || config.CheckpointTailBytes != 1024 || config.MaxWALBytes != 2048 || config.MaxConcurrentReads != 8 || config.MaxLongPollReads != 2 {
 		t.Fatalf("timing config=%+v", config)
+	}
+}
+
+func TestInstalledPolicyConfigFromEnvLoadsTrustedPinAndFileSecret(t *testing.T) {
+	clearInstalledPolicyEnv(t)
+	secret := strings.Repeat("s", 32)
+	secretFile := filepath.Join(t.TempDir(), "join-capability")
+	if err := os.WriteFile(secretFile, []byte(secret), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("RHIZA_CLUSTER_ID", "generation-7")
+	t.Setenv("RHIZA_EXPECTED_INSTALLED_POLICY_HASH", strings.Repeat("ab", 32))
+	t.Setenv("RHIZA_JOIN_CAPABILITY_FILE", secretFile)
+	t.Setenv("RHIZA_JOIN_SEEDS", `["quic://peer-a.example:9090","quic://peer-b.example:9090"]`)
+
+	config, err := ConfigFromEnv()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if config.ClusterID != "generation-7" || config.ExpectedInstalledPolicyHash == ([32]byte{}) || string(config.JoinCapability) != secret || len(config.JoinSeeds) != 2 {
+		t.Fatalf("installed-policy config was not loaded: cluster=%q hash=%x secret-len=%d seeds=%v", config.ClusterID, config.ExpectedInstalledPolicyHash, len(config.JoinCapability), config.JoinSeeds)
+	}
+	runtimeConfig, err := executionConfig(config)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if runtimeConfig.ExpectedInstalledPolicyHash != config.ExpectedInstalledPolicyHash || string(runtimeConfig.JoinCapability) != secret || len(runtimeConfig.JoinSeeds) != 2 {
+		t.Fatal("installed-policy inputs were not propagated to runtime config")
+	}
+	for name, value := range map[string]any{"public config": config, "runtime config": runtimeConfig} {
+		encoded, err := json.Marshal(value)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if strings.Contains(string(encoded), secret) {
+			t.Fatalf("%s serialization exposed the join capability", name)
+		}
+	}
+}
+
+func TestInstalledPolicyConfigFromEnvRejectsOversizedCapabilityFile(t *testing.T) {
+	clearInstalledPolicyEnv(t)
+	secret := strings.Repeat("s", maxJoinCapabilityFileBytes+1)
+	secretFile := filepath.Join(t.TempDir(), "join-capability")
+	if err := os.WriteFile(secretFile, []byte(secret), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("RHIZA_CLUSTER_ID", "generation-7")
+	t.Setenv("RHIZA_EXPECTED_INSTALLED_POLICY_HASH", strings.Repeat("ab", 32))
+	t.Setenv("RHIZA_JOIN_CAPABILITY_FILE", secretFile)
+	if _, err := ConfigFromEnv(); err == nil || !strings.Contains(err.Error(), "size limit") {
+		t.Fatalf("oversized capability file error=%v", err)
+	} else if strings.Contains(err.Error(), secret) {
+		t.Fatal("oversized capability file error exposed secret contents")
+	}
+}
+
+func TestInstalledPolicyConfigFromEnvDoesNotExposeCapabilityFileErrors(t *testing.T) {
+	clearInstalledPolicyEnv(t)
+	t.Setenv("RHIZA_CLUSTER_ID", "generation-7")
+	t.Setenv("RHIZA_EXPECTED_INSTALLED_POLICY_HASH", strings.Repeat("ab", 32))
+	t.Setenv("RHIZA_JOIN_CAPABILITY_FILE", t.TempDir())
+	if _, err := ConfigFromEnv(); err == nil || strings.Contains(err.Error(), "secret") {
+		t.Fatalf("directory capability file error=%v", err)
+	}
+}
+
+func TestInstalledPolicyConfigFromEnvFailsClosed(t *testing.T) {
+	for _, test := range []struct {
+		name  string
+		setup func(*testing.T)
+	}{
+		{name: "malformed pin", setup: func(t *testing.T) { t.Setenv("RHIZA_EXPECTED_INSTALLED_POLICY_HASH", "not-a-hash") }},
+		{name: "implicit cluster ID", setup: func(t *testing.T) {
+			t.Setenv("RHIZA_EXPECTED_INSTALLED_POLICY_HASH", strings.Repeat("ab", 32))
+			t.Setenv("RHIZA_CLUSTER_ID", "")
+		}},
+		{name: "inline secret forbidden", setup: func(t *testing.T) { t.Setenv("RHIZA_JOIN_CAPABILITY", strings.Repeat("s", 32)) }},
+		{name: "seeds without policy pin", setup: func(t *testing.T) { t.Setenv("RHIZA_JOIN_SEEDS", `["quic://peer.example:9090"]`) }},
+		{name: "secret file without policy pin", setup: func(t *testing.T) { t.Setenv("RHIZA_JOIN_CAPABILITY_FILE", "/must-not-be-read") }},
+		{name: "malformed seed", setup: func(t *testing.T) {
+			t.Setenv("RHIZA_EXPECTED_INSTALLED_POLICY_HASH", strings.Repeat("ab", 32))
+			t.Setenv("RHIZA_CLUSTER_ID", "generation-7")
+			t.Setenv("RHIZA_JOIN_SEEDS", `["https://peer.example:9090"]`)
+		}},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			clearInstalledPolicyEnv(t)
+			t.Setenv("RHIZA_CLUSTER_ID", "legacy-cluster")
+			t.Setenv("RHIZA_DATA_DIR", t.TempDir())
+			test.setup(t)
+			if _, err := ConfigFromEnv(); err == nil {
+				t.Fatal("invalid installed-policy environment was accepted")
+			}
+		})
+	}
+}
+
+func TestExecutionConfigKeepsInstalledPolicyScopedAndPreservesLocalGC(t *testing.T) {
+	pinned := Config{ClusterID: "generation-7", DataDir: t.TempDir(), ExpectedInstalledPolicyHash: [32]byte{1}}
+	if _, err := executionConfig(pinned); err != nil {
+		t.Fatalf("explicit policy cluster rejected: %v", err)
+	}
+	if _, err := executionConfig(Config{DataDir: t.TempDir(), ExpectedInstalledPolicyHash: [32]byte{1}}); err == nil || !strings.Contains(err.Error(), "explicit cluster ID") {
+		t.Fatalf("policy pin without explicit cluster error=%v", err)
+	}
+	if _, err := executionConfig(Config{ClusterID: "generation-7", DataDir: t.TempDir(), Local: true, ExpectedInstalledPolicyHash: [32]byte{1}}); err == nil || !strings.Contains(err.Error(), "Local mode") {
+		t.Fatalf("Local policy profile error=%v", err)
+	}
+	if _, err := executionConfig(Config{ClusterID: "generation-7", DataDir: t.TempDir(), JoinSeeds: []string{"quic://peer.example:9090"}}); err == nil {
+		t.Fatal("join seeds without an installed-policy pin were accepted")
+	}
+	if _, err := executionConfig(Config{ClusterID: "generation-7", DataDir: t.TempDir(), JoinCapability: []byte(strings.Repeat("s", 32))}); err == nil {
+		t.Fatal("join capability without an installed-policy pin was accepted")
+	}
+	if _, err := executionConfig(Config{ClusterID: "generation-7", DataDir: t.TempDir(), ExpectedInstalledPolicyHash: [32]byte{1}, JoinCapability: []byte("short")}); err == nil {
+		t.Fatal("short join capability was accepted")
+	}
+	if _, err := executionConfig(Config{ClusterID: "generation-7", DataDir: t.TempDir(), ExpectedInstalledPolicyHash: [32]byte{1}, JoinSeeds: []string{"https://peer.example:9090"}}); err == nil {
+		t.Fatal("non-QUIC join seed was accepted")
+	}
+	legacy, err := executionConfig(Config{Local: true, DataDir: t.TempDir(), ObjStoreGCInterval: time.Hour, ObjStoreGCGracePeriod: 2 * time.Hour})
+	if err != nil {
+		t.Fatalf("legacy Local config rejected: %v", err)
+	}
+	if legacy.ClusterID != "cluster-a" || legacy.ObjStoreGCInterval != time.Hour || legacy.ObjStoreGCGracePeriod != 2*time.Hour {
+		t.Fatalf("legacy Local defaults or GC settings changed: %+v", legacy)
+	}
+}
+
+func clearInstalledPolicyEnv(t *testing.T) {
+	t.Helper()
+	for _, key := range []string{
+		"RHIZA_CLUSTER_ID", "RHIZA_EXPECTED_INSTALLED_POLICY_HASH", "RHIZA_JOIN_CAPABILITY",
+		"RHIZA_JOIN_CAPABILITY_FILE", "RHIZA_JOIN_SEEDS",
+	} {
+		t.Setenv(key, "")
 	}
 }
 

@@ -99,7 +99,13 @@ type Config struct {
 	// It is provenance only and does not grant voter or fencing authority.
 	PreparedPodUID string
 	// Learner supplies a new identity absent from the immutable bootstrap members.
-	Learner                        *Member
+	Learner *Member
+	// ExpectedInstalledPolicyHash independently pins the immutable installation policy.
+	ExpectedInstalledPolicyHash [32]byte
+	// JoinCapability is an application-only enrollment secret and is never serialized.
+	JoinCapability []byte `json:"-"`
+	// JoinSeeds are routing hints only; policy verification establishes trust.
+	JoinSeeds                      []string
 	ObjStoreEndpoint               string
 	ObjStoreBucket                 string
 	ObjStoreProvider               string
@@ -248,6 +254,22 @@ func executionConfig(config Config) (*types.ExecutionConfig, error) {
 	if config.DataDir == "" {
 		return nil, fmt.Errorf("data directory is required")
 	}
+	policyPinned := config.ExpectedInstalledPolicyHash != ([32]byte{})
+	if policyPinned && config.ClusterID == "" {
+		return nil, fmt.Errorf("installed-policy configuration requires an explicit cluster ID")
+	}
+	if !policyPinned && (len(config.JoinCapability) != 0 || len(config.JoinSeeds) != 0) {
+		return nil, fmt.Errorf("join capability and seeds require an installed-policy pin")
+	}
+	if len(config.JoinCapability) != 0 && len(config.JoinCapability) < 32 {
+		return nil, fmt.Errorf("join capability must contain at least 32 secret bytes")
+	}
+	if policyPinned && config.Local {
+		return nil, fmt.Errorf("installed-policy profile is not supported in Local mode")
+	}
+	if err := validateJoinSeeds(config.JoinSeeds); err != nil {
+		return nil, err
+	}
 	if !config.Local && config.BindAddr == "" {
 		config.BindAddr = "127.0.0.1:0"
 	}
@@ -262,6 +284,7 @@ func executionConfig(config Config) (*types.ExecutionConfig, error) {
 		ClusterID: types.ClusterID(config.ClusterID), NodeID: types.NodeID(config.NodeID),
 		DataDir: config.DataDir, BindAddr: config.BindAddr, PeerAddr: config.PeerAddr,
 		AdminToken: config.AdminToken, PeerToken: config.PeerToken, Members: config.Members, EnableReconfiguration: config.EnableReconfiguration, PreparedPodUID: config.PreparedPodUID, Learner: config.Learner,
+		ExpectedInstalledPolicyHash: config.ExpectedInstalledPolicyHash, JoinCapability: slices.Clone(config.JoinCapability), JoinSeeds: slices.Clone(config.JoinSeeds),
 		ObjStoreEndpoint: config.ObjStoreEndpoint, ObjStoreBucket: config.ObjStoreBucket,
 		ObjStoreProvider: config.ObjStoreProvider, ObjStoreDir: config.ObjStoreDir, ObjStorePrefix: config.ObjStorePrefix,
 		ObjStoreRegion: config.ObjStoreRegion, ObjStoreInsecure: config.ObjStoreInsecure, ObjStoreRetries: config.ObjStoreRetries,

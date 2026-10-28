@@ -8,6 +8,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/prometheus/client_golang/prometheus"
 	thanosobjstore "github.com/thanos-io/objstore"
 )
 
@@ -223,6 +224,9 @@ func TestImmutableBucketDelegatesReadOperations(t *testing.T) {
 
 func TestImmutableInstrumentedBucketPreservesGuardWhenFiltering(t *testing.T) {
 	backend := &immutableInstrumentedTestBucket{immutableTestBucket: &immutableTestBucket{Bucket: thanosobjstore.NewInMemBucket()}}
+	if err := backend.Bucket.Upload(context.Background(), "object", strings.NewReader("original"), thanosobjstore.WithIfNotExists()); err != nil {
+		t.Fatal(err)
+	}
 	guard, err := NewImmutableBucket(backend)
 	if err != nil {
 		t.Fatal(err)
@@ -242,11 +246,75 @@ func TestImmutableInstrumentedBucketPreservesGuardWhenFiltering(t *testing.T) {
 	if backend.uploads != 0 || backend.withExpectedErrs != 1 {
 		t.Fatalf("filtered bucket calls: uploads=%d WithExpectedErrs=%d", backend.uploads, backend.withExpectedErrs)
 	}
-	if _, ok := instrumented.ReaderWithExpectedErrs(nil).(thanosobjstore.BucketReader); !ok {
-		t.Fatal("reader instrumentation returned a non-reader")
+	reader := instrumented.ReaderWithExpectedErrs(nil)
+	assertImmutableFilteredReader(t, reader, backend.immutableTestBucket, "fake direct reader filter")
+	recursive, ok := reader.(thanosobjstore.InstrumentedBucketReader)
+	if !ok {
+		t.Fatal("opaque reader did not preserve recursive filtering")
 	}
+	assertImmutableFilteredReader(t, recursive.ReaderWithExpectedErrs(nil), backend.immutableTestBucket, "fake repeated reader filter")
 	if backend.readerWithErrors != 1 {
 		t.Fatalf("ReaderWithExpectedErrs calls = %d, want 1", backend.readerWithErrors)
+	}
+}
+
+func TestImmutableInstrumentedBucketReaderFiltersAreOpaqueWithPinnedMetrics(t *testing.T) {
+	backend := &immutableTestBucket{Bucket: thanosobjstore.NewInMemBucket()}
+	if err := backend.Bucket.Upload(context.Background(), "object", strings.NewReader("original"), thanosobjstore.WithIfNotExists()); err != nil {
+		t.Fatal(err)
+	}
+	metrics := thanosobjstore.WrapWithMetrics(backend, prometheus.NewRegistry(), "immutable-reader")
+	guard, err := NewImmutableBucket(metrics)
+	if err != nil {
+		t.Fatal(err)
+	}
+	instrumented, ok := guard.(thanosobjstore.InstrumentedBucket)
+	if !ok {
+		t.Fatal("pinned metrics bucket lost instrumentation")
+	}
+	filteredBucket := instrumented.WithExpectedErrs(nil)
+	filteredInstrumented, ok := filteredBucket.(thanosobjstore.InstrumentedBucket)
+	if !ok {
+		t.Fatal("filtered bucket lost instrumentation")
+	}
+	assertImmutableFilteredReader(t, filteredInstrumented.ReaderWithExpectedErrs(nil), backend, "metrics filtered bucket reader")
+	reader := instrumented.ReaderWithExpectedErrs(nil)
+	assertImmutableFilteredReader(t, reader, backend, "metrics direct reader")
+	recursive, ok := reader.(thanosobjstore.InstrumentedBucketReader)
+	if !ok {
+		t.Fatal("metrics opaque reader did not preserve recursive filtering")
+	}
+	assertImmutableFilteredReader(t, recursive.ReaderWithExpectedErrs(nil), backend, "metrics repeated reader")
+}
+
+func assertImmutableFilteredReader(t *testing.T, reader thanosobjstore.BucketReader, backend *immutableTestBucket, scope string) {
+	t.Helper()
+	if _, ok := reader.(thanosobjstore.Bucket); ok {
+		t.Fatalf("%s exposed a writable Bucket", scope)
+	}
+	type uploader interface {
+		Upload(context.Context, string, io.Reader, ...thanosobjstore.ObjectUploadOption) error
+	}
+	type deleter interface {
+		Delete(context.Context, string) error
+	}
+	if _, ok := reader.(uploader); ok {
+		t.Fatalf("%s exposed Upload", scope)
+	}
+	if _, ok := reader.(deleter); ok {
+		t.Fatalf("%s exposed Delete", scope)
+	}
+	got, err := reader.Get(context.Background(), "object")
+	if err != nil {
+		t.Fatalf("%s Get: %v", scope, err)
+	}
+	data, readErr := io.ReadAll(got)
+	closeImmutableReader(t, got)
+	if readErr != nil || string(data) != "original" {
+		t.Fatalf("%s changed or could not read original bytes: %q, %v", scope, data, readErr)
+	}
+	if backend.uploads != 0 || backend.deletes != 0 {
+		t.Fatalf("%s dispatched destructive operations: uploads=%d deletes=%d", scope, backend.uploads, backend.deletes)
 	}
 }
 
