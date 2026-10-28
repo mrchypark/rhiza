@@ -2194,6 +2194,7 @@ func (n *Node) shutdownEngine(closeBucket bool) error {
 	n.opened.Store(false)
 	n.ready.Store(false)
 	var shutdownErr error
+	var archiveSyncedThrough quepaxa.Slot
 	if n.localGCCancel != nil {
 		n.localGCCancel()
 	}
@@ -2245,7 +2246,12 @@ func (n *Node) shutdownEngine(closeBucket bool) error {
 	if n.archive != nil {
 		if n.core != nil && (!n.config.EnableReconfiguration || n.core.IsVoter()) {
 			shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-			shutdownErr = errors.Join(shutdownErr, n.archive.SyncThrough(shutdownCtx, n.core, n.core.Tip()))
+			through := n.core.Tip()
+			if err := n.archive.SyncThrough(shutdownCtx, n.core, through); err != nil {
+				shutdownErr = errors.Join(shutdownErr, err)
+			} else {
+				archiveSyncedThrough = through
+			}
 			cancel()
 		}
 		n.archive.Close()
@@ -2264,7 +2270,7 @@ func (n *Node) shutdownEngine(closeBucket bool) error {
 	}
 	if n.checkpointer != nil {
 		finalizeCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-		shutdownErr = errors.Join(shutdownErr, n.checkpointer.FinalizeTerminal(finalizeCtx, func(ctx context.Context, candidate *checkpoint.Checkpoint) error {
+		shutdownErr = errors.Join(shutdownErr, n.checkpointer.FinalizeTerminal(finalizeCtx, func(_ context.Context, candidate *checkpoint.Checkpoint) error {
 			if n.core == nil {
 				return fmt.Errorf("checkpoint certification state is unavailable")
 			}
@@ -2275,7 +2281,10 @@ func (n *Node) shutdownEngine(closeBucket bool) error {
 			if !ok || uint64(seal.Index) != candidate.Index || seal.ConfigID != candidate.ConfigID || seal.RootHash != candidate.RootHash || seal.StateHash != candidate.Hash {
 				return fmt.Errorf("checkpoint candidate does not match the durable certified seal")
 			}
-			return n.core.VerifyCheckpoint(ctx, seal.CheckpointSeal)
+			if archiveSyncedThrough < seal.DecisionSlot {
+				return fmt.Errorf("checkpoint seal decision was not durably synchronized to the archive before shutdown")
+			}
+			return nil
 		}))
 		cancel()
 		n.checkpointer = nil

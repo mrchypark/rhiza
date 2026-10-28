@@ -3,8 +3,11 @@ package checkpoint
 import (
 	"context"
 	"errors"
+	"io"
 	"path/filepath"
+	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -12,6 +15,30 @@ import (
 	"github.com/mrchypark/rhiza/pkg/materializer"
 	"github.com/thanos-io/objstore"
 )
+
+type terminalReleaseTestBucket struct {
+	objstore.Bucket
+	armed         bool
+	releaseErr    error
+	afterRelease  func()
+	publisherPuts atomic.Int64
+}
+
+func (b *terminalReleaseTestBucket) Upload(ctx context.Context, name string, value io.Reader, options ...objstore.ObjectUploadOption) error {
+	if strings.HasSuffix(name, "/checkpoint/PUBLISHER") {
+		b.publisherPuts.Add(1)
+	}
+	if b.armed && strings.HasSuffix(name, "/checkpoint/PUBLISHER") {
+		if err := b.Bucket.Upload(ctx, name, value, options...); err != nil {
+			return err
+		}
+		if b.afterRelease != nil {
+			b.afterRelease()
+		}
+		return b.releaseErr
+	}
+	return b.Bucket.Upload(ctx, name, value, options...)
+}
 
 func TestAutoCheckpointerStopCancelsAndJoinsBefore(t *testing.T) {
 	parent, cancel := context.WithCancel(context.Background())
@@ -188,6 +215,142 @@ func TestFinalizeTerminalRequiresCertificationBeyondCurrent(t *testing.T) {
 	}
 	if _, err := manager.AcquirePublisherClaim(ctx, "other", 0, publisherLease); !errors.Is(err, ErrPublisherBusy) {
 		t.Fatalf("claim after unproven terminal finalization=%v, want busy", err)
+	}
+}
+
+func makeTerminalCandidate(t *testing.T, manager *Manager, owner string) (*Checkpoint, *PublisherClaim) {
+	t.Helper()
+	ctx := context.Background()
+	claim, err := manager.AcquirePublisherClaim(ctx, owner, 0, publisherLease)
+	if err != nil {
+		t.Fatal(err)
+	}
+	root, err := manager.CreateFiles(ctx, claim, []Source{source(t, RoleSQLite, "terminal-candidate")}, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	claim, err = manager.BindPublisherClaim(ctx, claim, root.Index, root.RootHash, publisherLease)
+	if err != nil {
+		t.Fatal(err)
+	}
+	root.claim = claim
+	if err := manager.PromoteCertifiedCurrent(ctx, root); err != nil {
+		t.Fatal(err)
+	}
+	return root, claim
+}
+
+func TestFinalizeTerminalPreservesUnknownReleaseOutcomeAfterExpiredReadback(t *testing.T) {
+	ctx := context.Background()
+	unknown := errors.New("publisher release outcome unknown")
+	bucket := &terminalReleaseTestBucket{Bucket: objstore.NewInMemBucket(), releaseErr: unknown}
+	manager := NewManager(bucket, "terminal-unknown-expired", t.TempDir(), 1)
+	root, claim := makeTerminalCandidate(t, manager, "publisher")
+	auto := NewAutoCheckpointer(manager, nil, 1, 0)
+	auto.candidate = root
+	bucket.armed = true
+	err := auto.FinalizeTerminal(ctx, func(context.Context, *Checkpoint) error { return nil })
+	if !errors.Is(err, unknown) {
+		t.Fatalf("terminal finalization error=%v, want preserved unknown release result", err)
+	}
+	if auto.candidate == nil || auto.candidate.claim != claim {
+		t.Fatal("unknown terminal release outcome discarded the candidate")
+	}
+}
+
+func TestFinalizeTerminalPreservesUnknownReleaseOutcomeAfterSuccessorReadback(t *testing.T) {
+	ctx := context.Background()
+	unknown := errors.New("publisher release outcome unknown")
+	bucket := &terminalReleaseTestBucket{Bucket: objstore.NewInMemBucket(), releaseErr: unknown}
+	manager := NewManager(bucket, "terminal-unknown-successor", t.TempDir(), 1)
+	root, claim := makeTerminalCandidate(t, manager, "publisher")
+	successorManager := NewManager(bucket.Bucket, "terminal-unknown-successor", t.TempDir(), 1)
+	var successor *PublisherClaim
+	bucket.afterRelease = func() {
+		var err error
+		successor, err = successorManager.AcquirePublisherClaim(ctx, "successor", claim.ReservedIndex, publisherLease)
+		if err != nil {
+			t.Errorf("acquire successor after committed release: %v", err)
+		}
+	}
+	auto := NewAutoCheckpointer(manager, nil, 1, 0)
+	auto.candidate = root
+	bucket.armed = true
+	err := auto.FinalizeTerminal(ctx, func(context.Context, *Checkpoint) error { return nil })
+	if !errors.Is(err, unknown) {
+		t.Fatalf("terminal finalization error=%v, want preserved unknown release result", err)
+	}
+	if successor == nil {
+		t.Fatal("release callback did not establish successor")
+	}
+	current, err := successorManager.readPublisherClaim(ctx)
+	if err != nil || current.Generation != successor.Generation || current.OwnerID != successor.OwnerID {
+		t.Fatalf("successor after unknown release: current=%+v err=%v", current, err)
+	}
+	if err := successorManager.ReleasePublisherClaim(ctx, successor); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestFinalizeTerminalAcceptsSuccessorBeforeCurrentAndSealProof(t *testing.T) {
+	for _, advanceCurrent := range []bool{false, true} {
+		name := "unchanged-current"
+		if advanceCurrent {
+			name = "advanced-current"
+		}
+		t.Run(name, func(t *testing.T) {
+			ctx := context.Background()
+			bucket := &terminalReleaseTestBucket{Bucket: objstore.NewInMemBucket()}
+			manager := NewManager(bucket, "terminal-successor-first", t.TempDir(), 1)
+			oldRoot, oldClaim := makeTerminalCandidate(t, manager, "old-publisher")
+			if err := manager.ReleasePublisherClaim(ctx, oldClaim); err != nil {
+				t.Fatal(err)
+			}
+			successorManager := NewManager(bucket.Bucket, "terminal-successor-first", t.TempDir(), 1)
+			successor, err := successorManager.AcquirePublisherClaim(ctx, "successor", oldClaim.ReservedIndex, publisherLease)
+			if err != nil {
+				t.Fatal(err)
+			}
+			wantCurrent := oldRoot
+			if advanceCurrent {
+				nextRoot, err := successorManager.CreateFiles(ctx, successor, []Source{source(t, RoleSQLite, "successor-candidate")}, successor.ReservedIndex)
+				if err != nil {
+					t.Fatal(err)
+				}
+				successor, err = successorManager.BindPublisherClaim(ctx, successor, nextRoot.Index, nextRoot.RootHash, publisherLease)
+				if err != nil {
+					t.Fatal(err)
+				}
+				nextRoot.claim = successor
+				if err := successorManager.PromoteCertifiedCurrent(ctx, nextRoot); err != nil {
+					t.Fatal(err)
+				}
+				wantCurrent = nextRoot
+			}
+			auto := NewAutoCheckpointer(manager, nil, 1, 0)
+			auto.candidate = oldRoot
+			putsBefore := bucket.publisherPuts.Load()
+			if err := auto.FinalizeTerminal(ctx, nil); err != nil {
+				t.Fatalf("finalize fenced predecessor: %v", err)
+			}
+			if got := bucket.publisherPuts.Load(); got != putsBefore {
+				t.Fatalf("terminal finalization wrote PUBLISHER for successor: before=%d after=%d", putsBefore, got)
+			}
+			if err := manager.Load(ctx); err != nil {
+				t.Fatal(err)
+			}
+			currentRoot := manager.Latest()
+			if currentRoot == nil || currentRoot.Index != wantCurrent.Index || currentRoot.RootHash != wantCurrent.RootHash {
+				t.Fatalf("terminal finalization changed CURRENT: got=%+v want=%+v", currentRoot, wantCurrent)
+			}
+			current, err := successorManager.readPublisherClaim(ctx)
+			if err != nil || current.Generation != successor.Generation || current.OwnerID != successor.OwnerID {
+				t.Fatalf("successor claim changed: current=%+v err=%v", current, err)
+			}
+			if err := successorManager.ReleasePublisherClaim(ctx, successor); err != nil {
+				t.Fatal(err)
+			}
+		})
 	}
 }
 

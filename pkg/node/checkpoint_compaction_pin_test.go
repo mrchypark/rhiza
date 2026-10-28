@@ -23,7 +23,11 @@ import (
 
 type currentUploadCounter struct {
 	objstore.Bucket
-	currentUploads atomic.Int64
+	currentUploads      atomic.Int64
+	publisherPuts       atomic.Int64
+	failArchiveHead     atomic.Bool
+	failArchiveHeadRead atomic.Bool
+	archiveHeadErr      error
 }
 
 // claimReadBarrier returns the already-read second version of a stable lease
@@ -86,6 +90,13 @@ func (b *holdGCCandidateScan) IterWithAttributes(ctx context.Context, dir string
 }
 
 func (b *currentUploadCounter) Upload(ctx context.Context, name string, value io.Reader, options ...objstore.ObjectUploadOption) error {
+	if strings.HasSuffix(name, "/checkpoint/PUBLISHER") {
+		b.publisherPuts.Add(1)
+	}
+	if strings.HasSuffix(name, "/archive/head.bin") && b.failArchiveHead.Load() {
+		b.failArchiveHeadRead.Store(true)
+		return b.archiveHeadErr
+	}
 	if err := b.Bucket.Upload(ctx, name, value, options...); err != nil {
 		return err
 	}
@@ -93,6 +104,13 @@ func (b *currentUploadCounter) Upload(ctx context.Context, name string, value io
 		b.currentUploads.Add(1)
 	}
 	return nil
+}
+
+func (b *currentUploadCounter) Attributes(ctx context.Context, name string) (objstore.ObjectAttributes, error) {
+	if strings.HasSuffix(name, "/archive/head.bin") && b.failArchiveHeadRead.Load() {
+		return objstore.ObjectAttributes{}, b.archiveHeadErr
+	}
+	return b.Bucket.Attributes(ctx, name)
 }
 
 func TestPeerCheckpointWaitsForAuthenticatedPrefixBeforePublication(t *testing.T) {
@@ -627,6 +645,120 @@ func TestNodeCloseAfterPublishedCompactionCancellationReleasesPublishedClaim(t *
 	decisions, _, err := pin.DecisionsFrom(ctx, 1, 1)
 	if err != nil || len(decisions) != 1 || !bytes.Equal(decisions[0].Value, command) {
 		t.Fatalf("active snapshot decision after terminal shutdown: count=%d error=%v", len(decisions), err)
+	}
+}
+
+func TestNodeCloseKeepsPublisherClaimWhenFinalArchiveSyncFails(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	archiveFailure := errors.New("injected final archive head publication failure")
+	bucket := &currentUploadCounter{Bucket: objstore.NewInMemBucket(), archiveHeadErr: archiveFailure}
+	archive := recovery.NewManager(bucket, "terminal-archive-proof", 1)
+	checkpoints := checkpoint.NewManager(bucket, "terminal-archive-proof", t.TempDir(), 1)
+	wal, err := qlog.Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	core, err := quepaxa.New(quepaxa.Config{
+		NodeID: "n1", Cluster: quepaxa.Cluster{ConfigID: 1, Members: []quepaxa.Member{{ID: "n1"}}}, WAL: wal,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	material, err := materializer.Open(filepath.Join(t.TempDir(), "material.db"), 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	command, err := types.EncodeKVCommand(types.KVCommand{RequestID: "terminal-archive-proof", Operation: "put", Key: "key", Value: []byte("value")})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := core.Propose(ctx, command); err != nil {
+		t.Fatal(err)
+	}
+	if err := material.Apply(ctx, 1, command); err != nil {
+		t.Fatal(err)
+	}
+	if err := archive.SyncThrough(ctx, core, core.Tip()); err != nil {
+		t.Fatal(err)
+	}
+	n := &Node{config: &types.ExecutionConfig{}, archive: archive, checkpoints: checkpoints, core: core, material: material, wal: wal}
+	core.SetCheckpointValidator(func(ctx context.Context, seal quepaxa.CheckpointSeal) error {
+		return checkpoints.Verify(ctx, uint64(seal.Index), seal.RootHash, seal.StateHash)
+	})
+	auto := checkpoint.NewAutoCheckpointer(checkpoints, material, 1, time.Millisecond)
+	auto.ConfigurePublisher("n1", func() uint64 { return 0 }, nil)
+	published := make(chan struct{})
+	compactionCanceled := make(chan struct{})
+	auto.ConfigurePublication(nil, func(ctx context.Context, root *checkpoint.Checkpoint) error {
+		prefix, ok := core.PrefixHash(1)
+		if !ok {
+			return errors.New("missing checkpoint prefix")
+		}
+		next, following, err := core.CheckpointLeaderOrders(1)
+		if err != nil {
+			return err
+		}
+		seal := quepaxa.CheckpointSeal{
+			ConfigID: 1, Index: 1, RootHash: root.RootHash, StateHash: root.Hash, PrefixHash: prefix,
+			NextLeaderOrder: next, FollowingLeaderOrder: following,
+		}
+		if err := core.PrepareCheckpoint(ctx, seal); err != nil {
+			return err
+		}
+		encoded, err := quepaxa.EncodeCheckpointSeal(seal)
+		if err != nil {
+			return err
+		}
+		if _, _, err := core.Propose(ctx, encoded); err != nil {
+			return err
+		}
+		if err := checkpoints.PromoteCertifiedCurrent(ctx, root); err != nil {
+			return err
+		}
+		bucket.failArchiveHead.Store(true)
+		close(published)
+		<-ctx.Done()
+		close(compactionCanceled)
+		return n.compactCertifiedCheckpoint(ctx)
+	})
+	n.checkpointer = auto
+	auto.Start(ctx, material.Tip, nil)
+	select {
+	case <-published:
+	case <-ctx.Done():
+		t.Fatalf("checkpoint candidate did not become locally certified and CURRENT-published: %v", ctx.Err())
+	}
+	publisherPutsBefore := bucket.publisherPuts.Load()
+	shutdown := make(chan error, 1)
+	go func() { shutdown <- n.shutdown() }()
+	select {
+	case <-compactionCanceled:
+	case <-ctx.Done():
+		t.Fatalf("compaction callback did not observe terminal cancellation: %v", ctx.Err())
+	}
+	select {
+	case err := <-shutdown:
+		if !errors.Is(err, archiveFailure) {
+			t.Fatalf("terminal Node shutdown error=%v, want final archive sync failure", err)
+		}
+	case <-ctx.Done():
+		t.Fatalf("terminal Node shutdown did not complete: %v", ctx.Err())
+	}
+	seal, ok, err := core.LatestCheckpointSeal()
+	if err != nil || !ok || archive.Tip() >= seal.DecisionSlot {
+		t.Fatalf("archive unexpectedly reached certified seal: tip=%d seal=%+v ok=%v err=%v", archive.Tip(), seal, ok, err)
+	}
+	fresh := checkpoint.NewManager(bucket, "terminal-archive-proof", t.TempDir(), 1)
+	if err := fresh.Load(ctx); err != nil {
+		t.Fatalf("load exact CURRENT after archive sync failure: %v", err)
+	}
+	root := fresh.Latest()
+	if root == nil || root.Index != uint64(seal.Index) || root.RootHash != seal.RootHash || root.Hash != seal.StateHash {
+		t.Fatalf("CURRENT does not match local certified seal after archive sync failure: root=%+v seal=%+v", root, seal)
+	}
+	if got := bucket.publisherPuts.Load(); got != publisherPutsBefore {
+		t.Fatalf("terminal shutdown retired a claim without archive proof: PUBLISHER uploads before=%d after=%d", publisherPutsBefore, got)
 	}
 }
 

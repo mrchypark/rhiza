@@ -62,6 +62,18 @@ type activeGCLockError struct{}
 func (activeGCLockError) Error() string { return ErrArchiveBusy.Error() }
 func (activeGCLockError) Unwrap() error { return ErrArchiveBusy }
 
+type archiveLockAdmissionError struct {
+	phase     string
+	retryable bool
+	err       error
+}
+
+func (e *archiveLockAdmissionError) Error() string {
+	return fmt.Sprintf("archive GC-lock %s: %v", e.phase, e.err)
+}
+
+func (e *archiveLockAdmissionError) Unwrap() error { return e.err }
+
 type Extent struct {
 	ConfigID       uint                   `json:"config_id"`
 	Start          quepaxa.Slot           `json:"start"`
@@ -695,12 +707,23 @@ func (m *Manager) BeginRecoverySnapshot(ctx context.Context, owner string, lease
 	waitCtx, cancel := context.WithTimeout(ctx, lease)
 	defer cancel()
 	var err error
+	var lastAdmissionErr error
+	refusals := 0
 	for {
+		if waitErr := waitCtx.Err(); waitErr != nil {
+			if lastAdmissionErr == nil {
+				return nil, fmt.Errorf("archive snapshot GC-lock admission: %w", waitErr)
+			}
+			return nil, errors.Join(
+				fmt.Errorf("archive snapshot GC-lock admission after %d refusals: %w", refusals, lastAdmissionErr),
+				waitErr,
+			)
+		}
 		entered := false
 		err = m.withGCLock(waitCtx, "snapshot:"+owner, func(ctx context.Context) error {
 			entered = true
 			if err := m.Load(ctx); err != nil {
-				return err
+				return fmt.Errorf("load archive under GC-lock: %w", err)
 			}
 			m.mu.Lock()
 			head, refs := m.head, slices.Clone(m.extents)
@@ -738,14 +761,22 @@ func (m *Manager) BeginRecoverySnapshot(ctx context.Context, owner string, lease
 			}
 			return ErrArchiveBusy
 		})
-		if entered || !errors.Is(err, ErrArchiveBusy) {
+		if entered || !retryableArchiveLockAdmission(err) {
+			if !entered && err != nil && !errors.Is(err, ErrArchiveBusy) {
+				err = fmt.Errorf("archive snapshot GC-lock acquisition: %w", err)
+			}
 			break
 		}
+		lastAdmissionErr = err
+		refusals++
 		timer := time.NewTimer(50 * time.Millisecond)
 		select {
 		case <-waitCtx.Done():
 			timer.Stop()
-			return nil, waitCtx.Err()
+			return nil, errors.Join(
+				fmt.Errorf("archive snapshot GC-lock admission after %d refusals: %w", refusals, lastAdmissionErr),
+				waitCtx.Err(),
+			)
 		case <-timer.C:
 		}
 	}
@@ -1641,6 +1672,14 @@ func (m *Manager) withGCLock(ctx context.Context, owner string, work func(contex
 	return err
 }
 
+func retryableArchiveLockAdmission(err error) bool {
+	if err == ErrActiveGCLock {
+		return true
+	}
+	var admissionErr *archiveLockAdmissionError
+	return errors.As(err, &admissionErr) && admissionErr.retryable
+}
+
 // traceArchiveBusy emits only allowlisted diagnostic categories. The disabled
 // hook returns before constructing a key or retaining a lock identity.
 func (m *Manager) traceArchiveBusy(ctx context.Context, owner, key, branch, stage string, entered bool) {
@@ -1953,10 +1992,8 @@ func (m *Manager) withArchiveLock(ctx context.Context, key, owner string, gcTrac
 		releaseErr = release()
 	}
 	releaseCancel()
-	if err == nil && releaseErr != nil && (!gcTrace || !errors.Is(releaseErr, ErrArchiveBusy)) {
-		err = releaseErr
-	} else if gcTrace && errors.Is(releaseErr, ErrArchiveBusy) {
-		m.traceArchiveBusy(ctx, owner, key, "release_mismatch_or_conflict", "suppressed", true)
+	if gcTrace && errors.Is(releaseErr, ErrArchiveBusy) {
+		m.traceArchiveBusy(ctx, owner, key, "release_mismatch_or_conflict", "terminal", true)
 	}
 	if errors.Is(releaseErr, ErrArchiveBusy) && !gcTrace {
 		m.traceArchiveBusy(releaseCtx, owner, key, "release_mismatch_or_conflict", "terminal", true)
@@ -1964,27 +2001,28 @@ func (m *Manager) withArchiveLock(ctx context.Context, key, owner string, gcTrac
 	// Only a cleanly released, live-pin refusal can be deferred by the
 	// certified-checkpoint caller. Preserve any concurrent lease or context
 	// failure as a distinct, terminal outcome.
-	if err == ErrActiveRecoveryPin {
-		if releaseErr != nil {
-			err = errors.Join(err, releaseErr)
-		}
-		select {
-		case renewFailure := <-renewErr:
-			err = errors.Join(err, renewFailure)
-		default:
-		}
-		if ctx.Err() != nil {
-			err = errors.Join(err, ctx.Err())
-		}
+	var renewalFailure error
+	select {
+	case renewalFailure = <-renewErr:
+	default:
 	}
-	if err == nil {
-		select {
-		case err := <-renewErr:
-			return err
-		default:
-		}
+	if err == ErrActiveRecoveryPin && releaseErr == nil && renewalFailure == nil && ctx.Err() == nil {
+		return ErrActiveRecoveryPin
 	}
-	return err
+	var failures []error
+	if err != nil {
+		failures = append(failures, fmt.Errorf("archive lock work: %w", err))
+	}
+	if releaseErr != nil {
+		failures = append(failures, fmt.Errorf("archive lock release: %w", releaseErr))
+	}
+	if renewalFailure != nil {
+		failures = append(failures, fmt.Errorf("archive lock renewal: %w", renewalFailure))
+	}
+	if err == ErrActiveRecoveryPin && ctx.Err() != nil {
+		failures = append(failures, fmt.Errorf("archive lock context: %w", ctx.Err()))
+	}
+	return errors.Join(failures...)
 }
 
 func (m *Manager) acquireGCLock(ctx context.Context, owner string, lease time.Duration) (*archiveGCLock, error) {
@@ -2021,10 +2059,14 @@ func (m *Manager) acquireArchiveLock(ctx context.Context, key, owner string, lea
 			}
 			return nil, err
 		}
-		return m.confirmArchiveLock(ctx, key, lock, false)
+		confirmed, err := m.confirmArchiveLock(ctx, key, lock, false)
+		if err != nil {
+			return nil, &archiveLockAdmissionError{phase: "acquisition confirmation outcome unknown", err: err}
+		}
+		return confirmed, nil
 	}
 	m.traceArchiveBusy(ctx, owner, key, "conditional_exhausted", "site", false)
-	return nil, ErrArchiveBusy
+	return nil, &archiveLockAdmissionError{phase: "conditional contention exhausted", retryable: true, err: ErrArchiveBusy}
 }
 
 func (m *Manager) releaseGCLock(ctx context.Context, lock *archiveGCLock) error {
