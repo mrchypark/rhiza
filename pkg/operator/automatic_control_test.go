@@ -284,6 +284,32 @@ func TestLoadAutoRejectsNilIdentities(t *testing.T) {
 	}
 }
 
+func TestStableVoterIdentityRejectsUnprovenIncarnationChange(t *testing.T) {
+	current := FenceTarget{NodeID: "rhiza-0", Pod: "rhiza-0", PodUID: "uid-1", WALIdentity: "wal-1"}
+	tests := []struct {
+		name     string
+		observed FenceTarget
+		wantErr  bool
+	}{
+		{name: "same exact incarnation", observed: current},
+		{name: "new Pod UID", observed: FenceTarget{NodeID: "rhiza-0", Pod: "rhiza-0", PodUID: "uid-2", WALIdentity: "wal-1"}, wantErr: true},
+		{name: "new WAL identity", observed: FenceTarget{NodeID: "rhiza-0", Pod: "rhiza-0", PodUID: "uid-1", WALIdentity: "wal-2"}, wantErr: true},
+		{name: "incomplete prior identity", observed: current, wantErr: true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			previous := current
+			if tt.name == "incomplete prior identity" {
+				previous.WALIdentity = ""
+			}
+			err := validateStableVoterIdentity(previous, tt.observed)
+			if (err != nil) != tt.wantErr {
+				t.Fatalf("validateStableVoterIdentity() error = %v, wantErr %v", err, tt.wantErr)
+			}
+		})
+	}
+}
+
 func TestAuthorizeAutomaticChildRejectsWrongChildUID(t *testing.T) {
 	bucket := autoBucket(t)
 	c := autoController(bucket)
@@ -1007,6 +1033,9 @@ func TestClusterBootstrapRequiresOptInAndUnregisteredStore(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			ctx := t.Context()
 			api := &clusterAPI{sts: freshBootstrapSTS(3)}
+			if tc.bootstrap && tc.want == "" {
+				prepareBootstrapFixture(api.sts)
+			}
 			c := clusterController(t, api)
 			r := autoClusterResource("cluster-1", "uid-1", "logical-1")
 			r.Spec.VoterCount, r.Spec.Bootstrap = 3, tc.bootstrap
@@ -1041,6 +1070,31 @@ func TestClusterBootstrapRequiresOptInAndUnregisteredStore(t *testing.T) {
 			}
 		})
 	}
+}
+
+func prepareBootstrapFixture(sts object) {
+	template := asObject(nested(sts, "spec", "template"))
+	asObject(template["metadata"])["annotations"] = object{fencingProtocolAnnotation: "1"}
+	spec := asObject(template["spec"])
+	ctr := asObject(list(spec["containers"])[0])
+	ctr["command"] = []any{"/usr/local/bin/rhiza-fencer"}
+	ctr["args"] = []any{"supervise", "--", "/usr/local/bin/rhiza"}
+	ctr["securityContext"] = object{"allowPrivilegeEscalation": false, "capabilities": object{"drop": []any{"ALL"}}}
+	ctr["env"] = replaceEnv(list(ctr["env"]), "RHIZA_NODE_ID", object{"name": "RHIZA_NODE_ID", "valueFrom": object{"fieldRef": object{"fieldPath": "metadata.name"}}})
+	ctr["env"] = replaceEnv(list(ctr["env"]), "RHIZA_ENABLE_RECONFIGURATION", object{"name": "RHIZA_ENABLE_RECONFIGURATION", "value": "true"})
+	ctr["env"] = append(list(ctr["env"]),
+		object{"name": "RHIZA_DATA_DIR", "value": "/data"},
+		object{"name": "FENCER_AUTHORITY_URL", "value": "https://rhiza-fencer:9444/v1/supervisor"},
+		object{"name": "FENCER_CA_FILE", "value": "/fencer-ca/ca.crt"},
+	)
+	ctr["volumeMounts"] = append(list(ctr["volumeMounts"]),
+		object{"name": "fence-token", "mountPath": "/var/run/secrets/rhiza-fencer", "readOnly": true},
+		object{"name": "fence-ca", "mountPath": "/fencer-ca", "readOnly": true},
+	)
+	spec["volumes"] = append(list(spec["volumes"]),
+		object{"name": "fence-token", "projected": object{"sources": []any{object{"serviceAccountToken": object{"path": "token", "audience": "rhiza-fencer", "expirationSeconds": float64(600)}}}}},
+		object{"name": "fence-ca", "configMap": object{"name": "rhiza-fencer-ca"}},
+	)
 }
 
 func TestClusterFreshBootstrapValidatesRuntimeIdentity(t *testing.T) {
@@ -1382,7 +1436,7 @@ func TestBootstrapRequiresWriterFreeZeroStageAndServiceContract(t *testing.T) {
 		count   int
 		want    string
 	}{
-		{name: "existing writers", sts: freshBootstrapSTS(3), count: 3, pods: []object{{"metadata": object{"uid": "old-pod", "ownerReferences": []any{object{"apiVersion": "apps/v1", "kind": "StatefulSet", "uid": "sts-uid"}}}}}, want: "writer Pods already exist"},
+		{name: "existing writers", sts: freshBootstrapSTS(3), count: 3, pods: []object{{"metadata": object{"uid": "old-pod", "ownerReferences": []any{object{"apiVersion": "apps/v1", "kind": "StatefulSet", "uid": "sts-uid"}}}}}, want: "refuses Pods before its fixed init profile"},
 		{name: "already scaled without reservation", sts: freshClusterSTS(3), count: 3, want: "requires replicas=0"},
 		{name: "nonzero ordinals", sts: func() object {
 			s := freshBootstrapSTS(3)
@@ -1527,6 +1581,7 @@ func TestVoterIdentityContractAcceptsJournaledLearner(t *testing.T) {
 
 type clusterAPI struct {
 	sts             object
+	beforeScaleUp   func()
 	service         object
 	omitService     bool
 	pods            []object
@@ -1534,6 +1589,7 @@ type clusterAPI struct {
 	podAppearOnList int
 	secrets         map[string]object
 	secretCreates   int
+	configMaps      map[string]object
 }
 
 func (a *clusterAPI) serve(w http.ResponseWriter, q *http.Request) {
@@ -1544,6 +1600,9 @@ func (a *clusterAPI) serve(w http.ResponseWriter, q *http.Request) {
 	case q.URL.Path == "/apis/apps/v1/namespaces/default/statefulsets/rhiza" && q.Method == http.MethodPut:
 		var next object
 		if json.NewDecoder(q.Body).Decode(&next) == nil {
+			if int(number(nested(next, "spec", "replicas"))) > int(number(nested(a.sts, "spec", "replicas"))) && a.beforeScaleUp != nil {
+				a.beforeScaleUp()
+			}
 			a.sts = next
 			apiserverNormalize(a.sts)
 			_ = json.NewEncoder(w).Encode(a.sts)
@@ -1574,6 +1633,9 @@ func (a *clusterAPI) serve(w http.ResponseWriter, q *http.Request) {
 			}
 			name := str(nested(next, "metadata", "name"))
 			if a.secrets[name] == nil {
+				if str(nested(next, "metadata", "uid")) == "" {
+					asObject(next["metadata"])["uid"] = "secret-uid-" + name
+				}
 				a.secrets[name] = next
 				a.secretCreates++
 			}
@@ -1586,6 +1648,47 @@ func (a *clusterAPI) serve(w http.ResponseWriter, q *http.Request) {
 			return
 		}
 		http.NotFound(w, q)
+	case q.URL.Path == "/api/v1/namespaces/default/configmaps" && q.Method == http.MethodPost:
+		var next object
+		if json.NewDecoder(q.Body).Decode(&next) != nil {
+			http.Error(w, "invalid ConfigMap", http.StatusBadRequest)
+			return
+		}
+		if a.configMaps == nil {
+			a.configMaps = map[string]object{}
+		}
+		meta := asObject(next["metadata"])
+		name := str(meta["name"])
+		if name == "" {
+			http.Error(w, "missing ConfigMap name", http.StatusBadRequest)
+			return
+		}
+		if a.configMaps[name] == nil {
+			meta["namespace"], meta["uid"], meta["resourceVersion"] = "default", "configmap-uid-"+name, "1"
+			a.configMaps[name] = next
+		}
+		_ = json.NewEncoder(w).Encode(a.configMaps[name])
+	case strings.HasPrefix(q.URL.Path, "/api/v1/namespaces/default/configmaps/") && (q.Method == http.MethodGet || q.Method == http.MethodPut):
+		name := strings.TrimPrefix(q.URL.Path, "/api/v1/namespaces/default/configmaps/")
+		if q.Method == http.MethodGet {
+			if configMap := a.configMaps[name]; configMap != nil {
+				_ = json.NewEncoder(w).Encode(configMap)
+				return
+			}
+			http.NotFound(w, q)
+			return
+		}
+		var next object
+		if json.NewDecoder(q.Body).Decode(&next) != nil || a.configMaps[name] == nil {
+			http.NotFound(w, q)
+			return
+		}
+		meta := asObject(next["metadata"])
+		meta["uid"] = str(nested(a.configMaps[name], "metadata", "uid"))
+		meta["namespace"] = "default"
+		meta["resourceVersion"] = "2"
+		a.configMaps[name] = next
+		_ = json.NewEncoder(w).Encode(next)
 	default:
 		http.NotFound(w, q)
 	}
@@ -1619,7 +1722,37 @@ func freshClusterSTS(count int) object {
 
 func freshBootstrapSTS(count int) object {
 	sts := freshClusterSTS(count)
-	asObject(sts["spec"])["replicas"] = float64(0)
+	spec := asObject(sts["spec"])
+	spec["replicas"] = float64(0)
+	template := asObject(nested(sts, "spec", "template"))
+	asObject(template["metadata"])["annotations"] = object{fencingProtocolAnnotation: "1"}
+	main := asObject(list(nested(sts, "spec", "template", "spec", "containers"))[0])
+	main["command"] = []any{"/usr/local/bin/rhiza-fencer"}
+	main["args"] = []any{"supervise", "--", "/usr/local/bin/rhiza"}
+	main["securityContext"] = object{"allowPrivilegeEscalation": false, "capabilities": object{"drop": []any{"ALL"}}}
+	main["volumeMounts"] = []any{
+		object{"name": "data", "mountPath": "/var/lib/rhiza"},
+		object{"name": "fence-token", "mountPath": "/var/run/secrets/rhiza-fencer", "readOnly": true},
+		object{"name": "fence-ca", "mountPath": "/fencer-ca", "readOnly": true},
+	}
+	env := list(main["env"])
+	for name, entry := range map[string]object{
+		"RHIZA_NODE_ID":                {"name": "RHIZA_NODE_ID", "valueFrom": object{"fieldRef": object{"fieldPath": "metadata.name"}}},
+		"RHIZA_DATA_DIR":               {"name": "RHIZA_DATA_DIR", "value": "/var/lib/rhiza"},
+		"RHIZA_ENABLE_RECONFIGURATION": {"name": "RHIZA_ENABLE_RECONFIGURATION", "value": "true"},
+		"RHIZA_BIND_ADDR":              {"name": "RHIZA_BIND_ADDR", "value": "0.0.0.0:8080"},
+		"RHIZA_PEER_ADDR":              {"name": "RHIZA_PEER_ADDR", "value": "0.0.0.0:9090"},
+		"FENCER_AUTHORITY_URL":         {"name": "FENCER_AUTHORITY_URL", "value": "https://rhiza-fencer:9444/v1/supervisor"},
+		"FENCER_CA_FILE":               {"name": "FENCER_CA_FILE", "value": "/fencer-ca/ca.crt"},
+	} {
+		env = replaceEnv(env, name, entry)
+	}
+	main["env"] = env
+	asObject(nested(sts, "spec", "template", "spec"))["volumes"] = []any{
+		object{"name": "data", "emptyDir": object{}},
+		object{"name": "fence-token", "projected": object{"sources": []any{object{"serviceAccountToken": object{"path": "token", "audience": "rhiza-fencer", "expirationSeconds": float64(600)}}}}},
+		object{"name": "fence-ca", "configMap": object{"name": "rhiza-fencer-ca"}},
+	}
 	return sts
 }
 
@@ -1709,8 +1842,20 @@ func TestClusterFreshBootstrapGeneratesImmutableIdentitiesOnce(t *testing.T) {
 		t.Fatalf("inherited scalar token was not cleared: %+v", token)
 	}
 
+	var bindingObservedBeforeScale bool
+	api.beforeScaleUp = func() {
+		state, _, stateErr := c.loadAuto(ctx, c.autoKey(r))
+		if stateErr != nil {
+			return
+		}
+		_, bindingErr := c.readAutoBinding(ctx, r, state, "sts-uid")
+		bindingObservedBeforeScale = bindingErr == nil && len(state.Voters) == count
+	}
 	if err := c.reconcileCluster(ctx, r); err != nil {
 		t.Fatal(err)
+	}
+	if !bindingObservedBeforeScale {
+		t.Fatal("workload binding and automatic control were not durable before bootstrap scale-up")
 	}
 	if r.Status.Message != "bootstrap membership installed; starting voters" || int(number(nested(api.sts, "spec", "replicas"))) != count {
 		t.Fatalf("bootstrap scale-up status=%+v replicas=%v", r.Status, nested(api.sts, "spec", "replicas"))
@@ -1735,8 +1880,8 @@ func TestClusterFreshBootstrapGeneratesImmutableIdentitiesOnce(t *testing.T) {
 	if err := c.reconcileCluster(ctx, r); err != nil {
 		t.Fatal(err)
 	}
-	if want := "RHIZA_CLUSTER_MEMBERS node ID \"wrong-0\" is neither a derived voter nor a journaled learner"; r.Status.Message != want {
-		t.Fatalf("bound workload accepted changed node IDs: %+v want=%q", r.Status, want)
+	if !strings.Contains(r.Status.Message, "fresh bootstrap requires replicas=0") || int(number(nested(api.sts, "spec", "replicas"))) != count {
+		t.Fatalf("incomplete bootstrap accepted changed membership or rewrote the workload: status=%+v replicas=%v", r.Status, nested(api.sts, "spec", "replicas"))
 	}
 }
 

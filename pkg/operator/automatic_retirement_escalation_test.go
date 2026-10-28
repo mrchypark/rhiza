@@ -15,7 +15,9 @@ import (
 	"testing"
 	"time"
 
+	"github.com/mrchypark/rhiza/pkg/fencing"
 	"github.com/mrchypark/rhiza/pkg/network"
+	"github.com/mrchypark/rhiza/pkg/quepaxa"
 	"github.com/thanos-io/objstore"
 )
 
@@ -143,6 +145,74 @@ func newRetirementEscalationFixture(t *testing.T) *retirementEscalationFixture {
 		t.Fatal(err)
 	}
 	return f
+}
+
+func TestCompletedSupervisedLearnerPromotionPreservesCapturedFenceTarget(t *testing.T) {
+	const podName, podUID, operationID = "rhiza-0", "pod-uid-new", "learner-operation"
+	const walIdentity = "wal-identity-captured"
+	canonicalID, err := fencing.ReplacementNodeID(podUID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	pod := object{
+		"spec":   object{"nodeName": "worker-a"},
+		"status": object{"containerStatuses": []any{object{"containerID": "containerd://runtime-captured", "imageID": "sha256:captured-image"}}},
+	}
+	captured := capturedFenceIdentity(FenceTarget{NodeID: canonicalID, Pod: podName, PodUID: podUID, WALIdentity: walIdentity, NodeUID: "node-uid-captured"}, pod)
+	state := &autoControl{
+		ActiveClusterID: "source",
+		Voters:          []VoterPod{{NodeID: "old-voter", Pod: "rhiza-2"}, {NodeID: "survivor", Pod: "rhiza-1"}},
+		Identities: map[quepaxa.NodeID]FenceTarget{
+			"old-voter": {NodeID: "old-voter", Pod: "rhiza-2", PodUID: "old-uid", WALIdentity: "old-wal"},
+			"survivor":  {NodeID: "survivor", Pod: "rhiza-1", PodUID: "survivor-uid", WALIdentity: "survivor-wal"},
+		},
+		Learners: []learnerIncarnation{{
+			SourceClusterID: "source", OperationID: operationID, CredentialName: "learner-secret", CredentialUID: "secret-uid", Target: captured,
+		}},
+	}
+	intent := &autoIntent{
+		Request:     FenceRequest{OperationID: operationID},
+		Failed:      "old-voter",
+		LearnerName: podName,
+		LearnerUID:  podUID,
+		LearnerWAL:  walIdentity,
+		Voters:      []VoterPod{{NodeID: "old-voter", Pod: "rhiza-2"}, {NodeID: "survivor", Pod: "rhiza-1"}},
+	}
+	// This is the prior completion bug: an identity reconstructed only from
+	// Pod/UID/WAL conflicts with the full supervised inventory captured at
+	// learner admission.
+	partial := FenceTarget{NodeID: canonicalID, Pod: podName, PodUID: podUID, WALIdentity: walIdentity}
+	state.Identities[quepaxa.NodeID(canonicalID)] = partial
+	legacyRequest := FenceRequest{SourceClusterID: "source", Targets: []FenceTarget{partial}}
+	if err := includeLearnerHistory(state, &legacyRequest); err == nil {
+		t.Fatal("legacy reconstructed target unexpectedly matched full captured inventory")
+	}
+
+	if err := promoteCompletedMembershipLearner(state, intent, true); err != nil {
+		t.Fatalf("promote captured supervised learner: %v", err)
+	}
+	if got := state.Identities[quepaxa.NodeID(canonicalID)]; got != captured {
+		t.Fatalf("promoted target=%+v, want full captured target %+v", got, captured)
+	}
+	request := FenceRequest{SourceClusterID: "source"}
+	for _, voter := range state.Voters {
+		request.Targets = append(request.Targets, state.Identities[voter.NodeID])
+	}
+	if err := includeLearnerHistory(state, &request); err != nil {
+		t.Fatalf("generation inventory rejected promoted captured learner: %v", err)
+	}
+	count := 0
+	for _, target := range request.Targets {
+		if target.NodeID == canonicalID && target.PodUID == podUID {
+			if target != captured {
+				t.Fatalf("generation target=%+v, want captured target %+v", target, captured)
+			}
+			count++
+		}
+	}
+	if count != 1 {
+		t.Fatalf("captured learner should appear once in the promoted voter inventory, got %d targets", count)
+	}
 }
 
 func TestAutomaticRetirementEligibilityRecheckedAfterProbeCrossesGrace(t *testing.T) {

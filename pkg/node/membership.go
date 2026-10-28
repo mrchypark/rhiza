@@ -31,6 +31,9 @@ func (n *Node) changeMembership(ctx context.Context, request network.MembershipC
 	if request.OperationID == "" || len(request.OperationID) > 256 || request.ClusterID != string(n.config.ClusterID) || request.ExpectedConfigID == 0 || request.ExpectedConfigID == ^uint(0) || (request.Remove == "") == (request.Add == nil) {
 		return network.ErrInvalidRequest
 	}
+	if err := n.authorizeMembershipRepairMutation(ctx, request); err != nil {
+		return err
+	}
 	key := n.membershipOperationKey(request)
 	stored, err := readVoterRegistration(ctx, n.bucket, key)
 	if err != nil {
@@ -106,7 +109,21 @@ func (n *Node) changeMembership(ctx context.Context, request network.MembershipC
 			return err
 		}
 	}
-	if !reflect.DeepEqual(current, operation.Target) {
+	currentMatches := reflect.DeepEqual(current, operation.Target)
+	if currentMatches || current.ConfigID > operation.Target.ConfigID {
+		terminal, ok, err := membershipTargetTerminal(n.core, operation.Target)
+		if err != nil {
+			return err
+		}
+		if !ok {
+			return network.ErrRequestConflict
+		}
+		// A retained journal may finish after later configurations; only its exact
+		// durable target transition can authorize this retry's terminal ACK.
+		if _, err := n.core.CompleteDecision(ctx, terminal); err != nil {
+			return err
+		}
+	} else {
 		if current.ConfigID != request.ExpectedConfigID {
 			return network.ErrRequestConflict
 		}
@@ -126,21 +143,28 @@ func (n *Node) changeMembership(ctx context.Context, request network.MembershipC
 		if !reflect.DeepEqual(n.core.CurrentCluster(), operation.Target) {
 			return network.ErrRequestConflict
 		}
-	} else {
-		// Local acceptance may precede the added learner's durable terminal ACK.
-		history, err := n.core.MembershipHistory()
-		if err != nil {
-			return err
-		}
-		if len(history.Transitions) == 0 {
-			return network.ErrRequestConflict
-		}
-		terminal := history.Transitions[len(history.Transitions)-1].Terminal
-		if _, err := n.core.CompleteDecision(ctx, terminal.Slot); err != nil {
-			return err
-		}
 	}
 	return n.persistMembership(ctx)
+}
+
+func membershipTargetTerminal(core *quepaxa.Core, target quepaxa.Cluster) (quepaxa.Slot, bool, error) {
+	history, err := core.MembershipHistory()
+	if err != nil {
+		return 0, false, err
+	}
+	var terminal quepaxa.Slot
+	for _, transition := range history.Transitions {
+		if transition.Terminal.Slot <= transition.Freeze.Slot || transition.Terminal.Slot == 0 {
+			continue
+		}
+		if reflect.DeepEqual(core.ClusterForSlot(transition.Terminal.Slot+1), target) {
+			if terminal != 0 {
+				return 0, false, network.ErrRequestConflict
+			}
+			terminal = transition.Terminal.Slot
+		}
+	}
+	return terminal, terminal != 0, nil
 }
 
 func (n *Node) membershipOperationKey(request network.MembershipChange) string {
@@ -162,6 +186,9 @@ func (n *Node) abortMembership(ctx context.Context, request network.MembershipCh
 	}
 	if request.OperationID == "" || request.Remove != "" || request.ClusterID != string(n.config.ClusterID) || request.ExpectedConfigID != n.core.ConfigID() {
 		return network.ErrInvalidRequest
+	}
+	if err := n.authorizeMembershipRepairMutation(ctx, request); err != nil {
+		return err
 	}
 	data, err := readVoterRegistration(ctx, n.bucket, n.membershipOperationKey(request))
 	if err != nil {

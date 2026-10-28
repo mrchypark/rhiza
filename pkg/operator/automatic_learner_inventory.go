@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 
+	"github.com/mrchypark/rhiza/pkg/fencing"
 	"github.com/thanos-io/objstore"
 )
 
@@ -13,14 +14,60 @@ const maxLearnerHistory = 64
 // was captured when the learner was provisioned is never re-derived from its Pod
 // name, and a caller that rebuilt the target without it would make an unequal
 // FenceTarget that blocks generation-wide fencing during an outage.
-func learnerFenceTarget(state *autoControl, name, uid, wal string) FenceTarget {
-	target := FenceTarget{NodeID: name, Pod: name, PodUID: uid, WALIdentity: wal}
+func learnerFenceTarget(state *autoControl, name, uid, wal string) (FenceTarget, error) {
 	for _, entry := range state.Learners {
 		if entry.SourceClusterID == state.ActiveClusterID && entry.Target.Pod == name && entry.Target.PodUID == uid {
-			target.NodeName, target.NodeUID, target.ContainerID, target.ImageID = entry.Target.NodeName, entry.Target.NodeUID, entry.Target.ContainerID, entry.Target.ImageID
+			target := entry.Target
+			target.WALIdentity = wal
+			return target, nil
 		}
 	}
-	return target
+	for _, target := range state.Identities {
+		if target.Pod == name && target.PodUID == uid {
+			target.WALIdentity = wal
+			return target, nil
+		}
+	}
+	for _, entry := range state.Learners {
+		if entry.SourceClusterID == state.ActiveClusterID && entry.Target.Pod == name {
+			nodeID, err := fencing.ReplacementNodeID(uid)
+			if err != nil {
+				return FenceTarget{}, err
+			}
+			return FenceTarget{NodeID: nodeID, Pod: name, PodUID: uid, WALIdentity: wal}, nil
+		}
+	}
+	return FenceTarget{NodeID: name, Pod: name, PodUID: uid, WALIdentity: wal}, nil
+}
+
+// learnerNodeID returns the consensus identity captured for this exact learner
+// incarnation. The Pod name remains the Kubernetes address; it is not a
+// substitute for a UID-derived supervised NodeID.
+func learnerNodeID(state *autoControl, name, uid string) (string, error) {
+	target, err := learnerFenceTarget(state, name, uid, "")
+	if err != nil {
+		return "", err
+	}
+	if target.NodeID == "" || target.Pod != name || target.PodUID != uid {
+		return "", fmt.Errorf("learner consensus identity is incomplete")
+	}
+	return target.NodeID, nil
+}
+
+func capturedLearnerNodeID(state *autoControl, name, uid string) (string, error) {
+	var found string
+	for _, entry := range state.Learners {
+		if entry.SourceClusterID == state.ActiveClusterID && entry.Target.Pod == name && entry.Target.PodUID == uid {
+			if found != "" && found != entry.Target.NodeID {
+				return "", fmt.Errorf("learner incarnation has conflicting consensus identities")
+			}
+			found = entry.Target.NodeID
+		}
+	}
+	if found == "" {
+		return "", fmt.Errorf("learner incarnation consensus identity was not persisted")
+	}
+	return found, nil
 }
 
 func rememberLearner(state *autoControl, entry learnerIncarnation) error {
@@ -28,10 +75,10 @@ func rememberLearner(state *autoControl, entry learnerIncarnation) error {
 		return err
 	}
 	for i, old := range state.Learners {
-		if old.SourceClusterID != entry.SourceClusterID || old.Target.Pod != entry.Target.Pod {
+		if old.SourceClusterID != entry.SourceClusterID || old.Target.NodeID != entry.Target.NodeID || old.Target.PodUID != entry.Target.PodUID {
 			continue
 		}
-		if old.Target.PodUID != entry.Target.PodUID || old.OperationID != entry.OperationID || old.CredentialUID != entry.CredentialUID || old.Target.NodeID != entry.Target.NodeID || (old.Target.WALIdentity != "" && old.Target.WALIdentity != entry.Target.WALIdentity) {
+		if old.Target.Pod != entry.Target.Pod || old.OperationID != entry.OperationID || old.CredentialUID != entry.CredentialUID || old.CredentialName != entry.CredentialName || (old.Target.WALIdentity != "" && old.Target.WALIdentity != entry.Target.WALIdentity) || old.LedgerUID != entry.LedgerUID {
 			return fmt.Errorf("learner incarnation history conflicts")
 		}
 		state.Learners[i] = entry
@@ -46,16 +93,34 @@ func rememberLearner(state *autoControl, entry learnerIncarnation) error {
 
 func validateLearnerHistory(entries []learnerIncarnation) error {
 	for i, entry := range entries {
-		if entry.SourceClusterID == "" || entry.OperationID == "" || entry.Target.PodUID == "" || entry.Target.NodeID != entry.Target.Pod || !identifier.MatchString(entry.Target.Pod) {
+		if entry.SourceClusterID == "" || entry.OperationID == "" || !identifier.MatchString(entry.Target.Pod) || fencing.ValidatePodBinding(entry.Target.NodeID, entry.Target.Pod, entry.Target.PodUID) != nil {
 			return fmt.Errorf("invalid learner history")
 		}
 		for _, old := range entries[:i] {
-			if old.SourceClusterID == entry.SourceClusterID && (old.Target.Pod == entry.Target.Pod || old.Target.PodUID == entry.Target.PodUID) {
+			if old.SourceClusterID == entry.SourceClusterID && (old.Target.NodeID == entry.Target.NodeID || old.Target.PodUID == entry.Target.PodUID) {
 				return fmt.Errorf("duplicate learner history")
 			}
 		}
 	}
 	return nil
+}
+
+func retainedLearnerCredential(state *autoControl, source, operation, pod, podUID string) (learnerIncarnation, error) {
+	var found *learnerIncarnation
+	for _, entry := range state.Learners {
+		if entry.SourceClusterID != source || entry.OperationID != operation || entry.Target.Pod != pod || entry.Target.PodUID != podUID {
+			continue
+		}
+		if found != nil || entry.CredentialName == "" || entry.CredentialUID == "" || entry.Target.NodeID == "" {
+			return learnerIncarnation{}, fmt.Errorf("learner credential history is missing or ambiguous")
+		}
+		copy := entry
+		found = &copy
+	}
+	if found == nil {
+		return learnerIncarnation{}, fmt.Errorf("learner credential is not in retained incarnation history")
+	}
+	return *found, nil
 }
 
 func includeLearnerHistory(state *autoControl, request *FenceRequest) error {
@@ -68,7 +133,7 @@ func includeLearnerHistory(state *autoControl, request *FenceRequest) error {
 		}
 		found := false
 		for _, target := range request.Targets {
-			if target.Pod == entry.Target.Pod {
+			if target.NodeID == entry.Target.NodeID && target.PodUID == entry.Target.PodUID {
 				if target != entry.Target {
 					return fmt.Errorf("learner generation inventory conflicts")
 				}
@@ -120,15 +185,18 @@ func (c *Controller) compactLearnerHistory(ctx context.Context, state *autoContr
 			retained = append(retained, entry)
 			continue
 		}
+		// A ledger UID is captured at the authoritative live binding. Never
+		// adopt the current object UID while deciding whether old history can be
+		// removed: that would bless a recreated ledger with copied contents.
+		if entry.LedgerUID == "" {
+			retained = append(retained, entry)
+			continue
+		}
 		if !c.learnerPodUIDGone(ctx, entry.Target.Pod, entry.Target.PodUID) {
 			retained = append(retained, entry)
 			continue
 		}
-		proven := false
-		if entry.Retirement != nil && learnerTargetCovered(entry.Target, entry.Retirement.Request.Targets) && validateFenceProof(entry.Retirement.Request, &entry.Retirement.Proof) == nil {
-			proven = true
-		}
-		if !proven && c.verifyTerminatedCleanup(ctx, state.StatefulSetUID, entry) != nil {
+		if c.verifyTerminatedCleanup(ctx, state.StatefulSetUID, entry) != nil {
 			retained = append(retained, entry)
 			continue
 		}
@@ -158,11 +226,11 @@ func (c *Controller) learnerPodUIDGone(ctx context.Context, name, uid string) bo
 }
 
 func (c *Controller) retireLearnerCredential(ctx context.Context, entry learnerIncarnation) bool {
-	if entry.CredentialUID == "" {
+	if entry.CredentialUID == "" || entry.CredentialName == "" {
 		return false
 	}
 	var secret object
-	err := c.Kube.Get(ctx, c.corePath("secrets", entry.Target.Pod+"-credentials"), &secret)
+	err := c.Kube.Get(ctx, c.corePath("secrets", entry.CredentialName), &secret)
 	if apiNotFound(err) {
 		return true
 	}
@@ -172,38 +240,26 @@ func (c *Controller) retireLearnerCredential(ctx context.Context, entry learnerI
 	if str(nested(secret, "metadata", "uid")) != entry.CredentialUID {
 		return true
 	}
-	if err := c.Kube.DeleteSecret(ctx, c.Kube.Namespace, entry.Target.Pod+"-credentials", entry.CredentialUID); err != nil {
+	if err := c.Kube.DeleteSecret(ctx, c.Kube.Namespace, entry.CredentialName, entry.CredentialUID); err != nil {
 		return apiNotFound(err)
 	}
 	return true
 }
 
 func (c *Controller) verifyTerminatedCleanup(ctx context.Context, stsUID string, entry learnerIncarnation) error {
-	ledger, err := (&FencingExecutor{Kube: c.Kube}).read(ctx, stsUID, entry.SourceClusterID)
+	if entry.LedgerUID == "" {
+		return fmt.Errorf("learner cleanup has no retained ledger UID")
+	}
+	executor := &FencingExecutor{Kube: c.Kube}
+	ledger, ledgerUID, ledgerObject, err := executor.readWithUID(ctx, stsUID, entry.SourceClusterID)
 	if err != nil {
 		return err
 	}
-	found := false
-	for _, run := range ledger.Ledger.Runs {
-		if run.Identity.PodUID != entry.Target.PodUID {
-			continue
-		}
-		found = true
-		if run.Identity.NodeID != entry.Target.NodeID || run.Identity.SourceClusterID != entry.SourceClusterID || run.Stop == nil {
-			return fmt.Errorf("learner run identity differs")
-		}
-		if entry.Target.WALIdentity == "" {
-			if run.Identity.WALIdentity != "" || run.NeverBoundExit == nil || *run.NeverBoundExit != *run.Stop {
-				return fmt.Errorf("learner never-bound exit is not proven")
-			}
-		} else if run.Identity.WALIdentity != entry.Target.WALIdentity || !run.Exited || run.Drain == nil || run.Drain.Request != *run.Stop || !run.Drain.Clean() {
-			return fmt.Errorf("learner termination proof is incomplete")
-		}
+	verifiedUID, err := executor.registrationLedgerObjectUID(ledgerObject, stsUID, entry.SourceClusterID)
+	if err != nil || verifiedUID != ledgerUID || ledgerUID != entry.LedgerUID {
+		return fmt.Errorf("fencing: learner cleanup ledger identity changed")
 	}
-	if !found {
-		return fmt.Errorf("learner run is absent from the fencing ledger")
-	}
-	return nil
+	return verifyLearnerTerminalRuns(ledger.Ledger, entry, nil, nil)
 }
 
 func (c *Controller) prepareLearnerProvisioning(ctx context.Context, r *ClusterResource, state *autoControl, version *objstore.ObjectVersion) (bool, error) {
@@ -243,7 +299,13 @@ func worstCaseGenerationTargets(state *autoControl) int {
 		}
 	}
 	if state.Intent != nil && state.Intent.LearnerName != "" {
-		ids[state.Intent.LearnerName] = true
+		id := state.Intent.LearnerName
+		if state.Intent.LearnerUID != "" {
+			if captured, err := learnerNodeID(state, state.Intent.LearnerName, state.Intent.LearnerUID); err == nil {
+				id = captured
+			}
+		}
+		ids[id] = true
 	}
 	return len(ids)
 }
@@ -256,7 +318,13 @@ func (c *Controller) learnerInventoryEntry(ctx context.Context, state *autoContr
 		return entry, fmt.Errorf("learner Pod identity differs")
 	}
 	supervised := str(nested(sts, "spec", "template", "metadata", "annotations", fencingProtocolAnnotation)) == "1"
+	var registeredCredentialName, registeredCredentialUID, registeredLedgerUID string
 	if supervised {
+		nodeID, err := fencing.ReplacementNodeID(uid)
+		if err != nil {
+			return entry, err
+		}
+		entry.Target.NodeID = nodeID
 		refs := list(nested(pod, "metadata", "ownerReferences"))
 		if len(refs) != 1 {
 			return entry, fmt.Errorf("learner owner differs")
@@ -268,17 +336,20 @@ func (c *Controller) learnerInventoryEntry(ctx context.Context, state *autoContr
 		if err := validateSupervisedPod(pod); err != nil {
 			return entry, err
 		}
-		if err := (&FencingExecutor{Kube: c.Kube}).validateLearnerBinding(ctx, pod, str(nested(sts, "metadata", "name"))); err != nil {
+		registeredCredentialName, registeredCredentialUID, registeredLedgerUID, err = (&FencingExecutor{Kube: c.Kube}).learnerCredentialBindingWithLedgerUID(ctx, pod, str(nested(sts, "metadata", "name")))
+		if err != nil {
 			return entry, err
 		}
 	}
-	var credential object
-	if err := c.Kube.Get(ctx, c.corePath("secrets", name+"-credentials"), &credential); err != nil {
-		return entry, err
-	}
-	entry.CredentialUID = str(nested(credential, "metadata", "uid"))
-	if supervised && entry.CredentialUID != str(nested(pod, "metadata", "annotations", fencingCredentialAnnotation)) {
-		return entry, fmt.Errorf("learner credential UID differs")
+	if supervised {
+		entry.CredentialName, entry.CredentialUID, entry.LedgerUID = registeredCredentialName, registeredCredentialUID, registeredLedgerUID
+	} else {
+		var credential object
+		if err := c.Kube.Get(ctx, c.corePath("secrets", name+"-credentials"), &credential); err != nil {
+			return entry, err
+		}
+		entry.CredentialUID = str(nested(credential, "metadata", "uid"))
+		entry.CredentialName = name + "-credentials"
 	}
 	if entry.CredentialUID == "" {
 		return entry, fmt.Errorf("learner credential UID unavailable")
@@ -324,10 +395,18 @@ func (c *Controller) recoverLearnerInventory(ctx context.Context, r *ClusterReso
 	return true, c.saveAuto(ctx, r, state, version)
 }
 
-func (c *Controller) verifyNeverBoundCleanup(ctx context.Context, request FenceRequest, proof *FenceProof, target FenceTarget) error {
-	state, err := (&FencingExecutor{Kube: c.Kube}).read(ctx, request.StatefulSetUID, request.SourceClusterID)
+func (c *Controller) verifyNeverBoundCleanup(ctx context.Context, request FenceRequest, proof *FenceProof, target FenceTarget, expectedLedgerUID string) error {
+	if expectedLedgerUID == "" {
+		return fmt.Errorf("never-bound cleanup has no retained ledger UID")
+	}
+	executor := &FencingExecutor{Kube: c.Kube}
+	state, ledgerUID, ledgerObject, err := executor.readWithUID(ctx, request.StatefulSetUID, request.SourceClusterID)
 	if err != nil {
 		return err
+	}
+	verifiedUID, err := executor.registrationLedgerObjectUID(ledgerObject, request.StatefulSetUID, request.SourceClusterID)
+	if err != nil || verifiedUID != ledgerUID || ledgerUID != expectedLedgerUID {
+		return fmt.Errorf("never-bound cleanup ledger identity changed")
 	}
 	hash, err := requestHash(&request)
 	if err != nil {

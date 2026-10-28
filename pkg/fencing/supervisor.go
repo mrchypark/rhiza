@@ -23,7 +23,7 @@ import (
 // Register and Close use the same CAS record. None of these methods may derive
 // termination or storage proof from Pod status or API absence.
 type Authority interface {
-	Register(context.Context, Identity) error
+	Register(context.Context, Identity) (Registration, error)
 	Bind(context.Context, Identity) error
 	Stop(context.Context, Identity) (StopRequest, error)
 	Drain(context.Context, DrainReceipt) error
@@ -46,8 +46,8 @@ type Supervisor struct {
 }
 
 func (s *Supervisor) Run(ctx context.Context) error {
-	if os.Getpid() != 1 {
-		return fmt.Errorf("fencing: supervisor must be PID 1 in a private process namespace")
+	if err := VerifyPrivatePIDNamespace(); err != nil {
+		return fmt.Errorf("fencing: supervisor must be PID 1 in a private process namespace: %w", err)
 	}
 	if s.Authority == nil || len(s.Command) == 0 || s.SocketPath == "" {
 		return fmt.Errorf("fencing: incomplete supervisor configuration")
@@ -58,13 +58,19 @@ func (s *Supervisor) Run(ctx context.Context) error {
 	}
 	s.Identity.RunID = hex.EncodeToString(nonce[:16])
 	s.Identity.WALIdentity = ""
-	s.bound = s.Identity
 	s.ticket = hex.EncodeToString(nonce[16:])
 	// Must precede listener readiness and exec. The authority can close this
 	// reservation concurrently; the child must also pass Connect and BindWAL.
-	if err := s.Authority.Register(ctx, s.Identity); err != nil {
+	candidate := s.Identity
+	registration, err := s.Authority.Register(ctx, candidate)
+	if err != nil {
 		return err
 	}
+	if err := registration.ValidateFor(candidate); err != nil {
+		return err
+	}
+	s.Identity = registration.Identity
+	s.bound = registration.Identity
 	listener, err := listenSupervisor(s.SocketPath)
 	if err != nil {
 		return err
@@ -78,12 +84,7 @@ func (s *Supervisor) Run(ctx context.Context) error {
 	defer server.Close()
 	go func() { _ = server.Serve(listener) }()
 	child := exec.Command(s.Command[0], s.Command[1:]...)
-	for _, entry := range os.Environ() {
-		if !strings.HasPrefix(entry, "RHIZA_FENCE_SOCKET=") && !strings.HasPrefix(entry, "RHIZA_FENCE_TICKET=") {
-			child.Env = append(child.Env, entry)
-		}
-	}
-	child.Env = append(child.Env, "RHIZA_FENCE_SOCKET="+s.SocketPath, "RHIZA_FENCE_TICKET="+s.ticket)
+	child.Env = supervisorChildEnvironment(os.Environ(), s.SocketPath, s.ticket, registration)
 	child.Stdout, child.Stderr, child.Stdin = os.Stdout, os.Stderr, os.Stdin
 	if err := child.Start(); err != nil {
 		return err
@@ -130,6 +131,30 @@ func (s *Supervisor) Run(ctx context.Context) error {
 			}, terminatePrivateNamespace)
 		}
 	}
+}
+
+func supervisorChildEnvironment(parent []string, socketPath, ticket string, registration Registration) []string {
+	env := make([]string, 0, len(parent)+6)
+	for _, entry := range parent {
+		key, _, _ := strings.Cut(entry, "=")
+		if key == "RHIZA_FENCE_SOCKET" || key == "RHIZA_FENCE_TICKET" {
+			continue
+		}
+		if registration.PeerToken != "" && (key == "RHIZA_NODE_ID" || key == "RHIZA_PEER_TOKEN" || key == "RHIZA_PEER_TOKENS" || key == "RHIZA_LEARNER") {
+			continue
+		}
+		env = append(env, entry)
+	}
+	env = append(env, "RHIZA_FENCE_SOCKET="+socketPath, "RHIZA_FENCE_TICKET="+ticket)
+	if registration.PeerToken != "" {
+		env = append(env,
+			"RHIZA_NODE_ID="+registration.Identity.NodeID,
+			"RHIZA_PEER_TOKEN="+registration.PeerToken,
+			"RHIZA_PEER_TOKENS=",
+			"RHIZA_LEARNER="+string(registration.Learner),
+		)
+	}
+	return env
 }
 
 // finishExitedChild is called only after the direct child's Wait completed.
@@ -287,11 +312,30 @@ func (s *Supervisor) handler() http.Handler {
 					s.mu.Unlock()
 				}
 			}
+		} else if r.URL.Path == "/v1/bootstrap-status" || r.URL.Path == "/v1/bootstrap-complete" || r.URL.Path == "/v1/bootstrap-runtime-admission" || r.URL.Path == "/v1/membership-repair/status" || r.URL.Path == "/v1/membership-repair/authorize" || r.URL.Path == "/v1/membership-repair/reserve" || r.URL.Path == "/v1/membership-repair/qualify" || r.URL.Path == "/v1/membership-repair/phase/prepare" || r.URL.Path == "/v1/membership-repair/phase/observe" || r.URL.Path == "/v1/membership-repair/phase/complete" {
+			var message AuthorityMessage
+			err = decoder.Decode(&message)
+			if err == nil && decoder.Decode(new(any)) != io.EOF {
+				err = fmt.Errorf("fencing: trailing supervisor request")
+			}
+			if err == nil {
+				err = ValidateAuthorityMessageShape(message)
+			}
+			if err == nil {
+				if strings.HasPrefix(r.URL.Path, "/v1/membership-repair/") {
+					result, err = s.membershipRepairRequest(r.Context(), r.URL.Path, message)
+				} else {
+					result, err = s.bootstrapRequest(r.Context(), r.URL.Path, message)
+				}
+			}
 		} else if r.URL.Path == "/v1/peer-closure/request" || r.URL.Path == "/v1/peer-closure/status" {
 			var message AuthorityMessage
 			err = decoder.Decode(&message)
 			if err == nil && decoder.Decode(new(any)) != io.EOF {
 				err = fmt.Errorf("fencing: trailing peer-closure request")
+			}
+			if err == nil {
+				err = ValidateAuthorityMessageShape(message)
 			}
 			if err == nil {
 				s.mu.Lock()
@@ -346,12 +390,165 @@ func (s *Supervisor) handler() http.Handler {
 	})
 }
 
+type membershipRepairAuthority interface {
+	ReadMembershipRepair(context.Context, Identity) (MembershipRepairStatusResult, error)
+	AuthorizeMembershipPhase(context.Context, Identity, MembershipRepairPhase) error
+}
+
+type membershipRepairTargetAuthority interface {
+	ReadMembershipRepairForTarget(context.Context, Identity, string) (MembershipRepairStatusResult, error)
+}
+
+type membershipRepairReservationAuthority interface {
+	ReserveMembershipRepair(context.Context, Identity, MembershipRepairReserveRequest) (MembershipRepairReserveResult, error)
+}
+
+type membershipRepairQualificationAuthority interface {
+	QualifyMembershipRepair(context.Context, Identity, MembershipRepairQualificationRequest) (MembershipRepairQualificationResult, error)
+}
+
+type membershipRepairPhasePrepareAuthority interface {
+	PrepareMembershipRepairPhase(context.Context, Identity, MembershipRepairPhasePrepareRequest) (MembershipRepairPhasePrepareResult, error)
+}
+
+type membershipRepairPhaseObserveAuthority interface {
+	ObserveMembershipRepairPhase(context.Context, Identity, MembershipRepairPhaseObserveRequest) (MembershipRepairPhaseObserveResult, error)
+}
+
+type membershipRepairPhaseCompleteAuthority interface {
+	CompleteMembershipRepairPhase(context.Context, Identity, MembershipRepairPhaseObserveRequest) (MembershipRepairPhaseObserveResult, error)
+}
+
+func (s *Supervisor) membershipRepairRequest(ctx context.Context, path string, message AuthorityMessage) (any, error) {
+	s.mu.Lock()
+	bound := s.bound
+	s.mu.Unlock()
+	if bound.Validate() != nil || bound.WALIdentity == "" || message.Identity != bound {
+		return nil, fmt.Errorf("fencing: membership-repair caller differs from bound WAL")
+	}
+	authority, ok := s.Authority.(membershipRepairAuthority)
+	switch path {
+	case "/v1/membership-repair/reserve":
+		if message.Action != "membership-repair-reserve" || message.RepairReserve == nil || message.RepairStatus != nil || message.RepairPhase != nil || message.BootstrapStatus != nil || message.BeginInit != nil || message.InitOutcome != nil || message.Completion != nil || message.Drain != nil || message.Request != nil || message.PeerClosure != nil {
+			return nil, fmt.Errorf("fencing: membership-repair reservation shape differs")
+		}
+		reservationAuthority, ok := s.Authority.(membershipRepairReservationAuthority)
+		if !ok {
+			return nil, ErrPending
+		}
+		return reservationAuthority.ReserveMembershipRepair(ctx, bound, *message.RepairReserve)
+	case "/v1/membership-repair/status":
+		if message.Action != "membership-repair-status" || message.RepairStatus == nil || message.RepairReserve != nil || message.RepairPhase != nil || message.BootstrapStatus != nil || message.BeginInit != nil || message.InitOutcome != nil || message.Completion != nil || message.Drain != nil || message.Request != nil || message.PeerClosure != nil {
+			return nil, fmt.Errorf("fencing: membership-repair status shape differs")
+		}
+		if !ok {
+			return nil, ErrPending
+		}
+		if message.RepairStatus.TargetPodName != "" {
+			targetAuthority, ok := s.Authority.(membershipRepairTargetAuthority)
+			if !ok {
+				return nil, ErrPending
+			}
+			return targetAuthority.ReadMembershipRepairForTarget(ctx, bound, message.RepairStatus.TargetPodName)
+		}
+		return authority.ReadMembershipRepair(ctx, bound)
+	case "/v1/membership-repair/authorize":
+		if message.Action != "membership-repair-authorize" || message.RepairPhase == nil || message.RepairStatus != nil || message.RepairReserve != nil || message.BootstrapStatus != nil || message.BeginInit != nil || message.InitOutcome != nil || message.Completion != nil || message.Drain != nil || message.Request != nil || message.PeerClosure != nil {
+			return nil, fmt.Errorf("fencing: membership-repair authorization shape differs")
+		}
+		if !ok {
+			return nil, ErrPending
+		}
+		return nil, authority.AuthorizeMembershipPhase(ctx, bound, message.RepairPhase.Phase)
+	case "/v1/membership-repair/qualify":
+		if message.Action != "membership-repair-qualify" || message.RepairQualification == nil || message.RepairPhase != nil || message.RepairStatus != nil || message.RepairReserve != nil || message.RepairPhasePrepare != nil || message.RepairPhaseObserve != nil || message.RepairPhaseComplete != nil || message.BootstrapStatus != nil || message.RuntimeAdmission != nil || message.BeginInit != nil || message.InitOutcome != nil || message.Completion != nil || message.Drain != nil || message.Request != nil || message.PeerClosure != nil {
+			return nil, fmt.Errorf("fencing: membership-repair qualification shape differs")
+		}
+		qualificationAuthority, ok := s.Authority.(membershipRepairQualificationAuthority)
+		if !ok {
+			return nil, ErrPending
+		}
+		return qualificationAuthority.QualifyMembershipRepair(ctx, bound, *message.RepairQualification)
+	case "/v1/membership-repair/phase/prepare":
+		if message.Action != "membership-repair-phase-prepare" || message.RepairPhasePrepare == nil || message.RepairPhase != nil || message.RepairStatus != nil || message.RepairReserve != nil || message.RepairQualification != nil || message.RepairPhaseObserve != nil || message.RepairPhaseComplete != nil || message.BootstrapStatus != nil || message.RuntimeAdmission != nil || message.BeginInit != nil || message.InitOutcome != nil || message.Completion != nil || message.Drain != nil || message.Request != nil || message.PeerClosure != nil {
+			return nil, fmt.Errorf("fencing: membership-repair phase-preparation shape differs")
+		}
+		phaseAuthority, ok := s.Authority.(membershipRepairPhasePrepareAuthority)
+		if !ok {
+			return nil, ErrPending
+		}
+		return phaseAuthority.PrepareMembershipRepairPhase(ctx, bound, *message.RepairPhasePrepare)
+	case "/v1/membership-repair/phase/observe":
+		if message.Action != "membership-repair-phase-observe" || message.RepairPhaseObserve == nil || message.RepairPhase != nil || message.RepairStatus != nil || message.RepairReserve != nil || message.RepairQualification != nil || message.RepairPhasePrepare != nil || message.RepairPhaseComplete != nil || message.BootstrapStatus != nil || message.RuntimeAdmission != nil || message.BeginInit != nil || message.InitOutcome != nil || message.Completion != nil || message.Drain != nil || message.Request != nil || message.PeerClosure != nil {
+			return nil, fmt.Errorf("fencing: membership-repair phase-observation shape differs")
+		}
+		phaseAuthority, ok := s.Authority.(membershipRepairPhaseObserveAuthority)
+		if !ok {
+			return nil, ErrPending
+		}
+		return phaseAuthority.ObserveMembershipRepairPhase(ctx, bound, *message.RepairPhaseObserve)
+	case "/v1/membership-repair/phase/complete":
+		if message.Action != "membership-repair-phase-complete" || message.RepairPhaseComplete == nil || message.RepairPhase != nil || message.RepairStatus != nil || message.RepairReserve != nil || message.RepairQualification != nil || message.RepairPhasePrepare != nil || message.RepairPhaseObserve != nil || message.BootstrapStatus != nil || message.RuntimeAdmission != nil || message.BeginInit != nil || message.InitOutcome != nil || message.Completion != nil || message.Drain != nil || message.Request != nil || message.PeerClosure != nil {
+			return nil, fmt.Errorf("fencing: membership-repair phase-completion shape differs")
+		}
+		phaseAuthority, ok := s.Authority.(membershipRepairPhaseCompleteAuthority)
+		if !ok {
+			return nil, ErrPending
+		}
+		return phaseAuthority.CompleteMembershipRepairPhase(ctx, bound, *message.RepairPhaseComplete)
+	default:
+		return nil, fmt.Errorf("fencing: unknown membership-repair path")
+	}
+}
+
+func (s *Supervisor) bootstrapRequest(ctx context.Context, path string, message AuthorityMessage) (any, error) {
+	s.mu.Lock()
+	bound := s.bound
+	s.mu.Unlock()
+	if path == "/v1/bootstrap-runtime-admission" {
+		if bound.Validate() != nil || bound.WALIdentity != "" || message.Identity != bound || message.Action != "bootstrap-runtime-admission" || message.RuntimeAdmission == nil || message.BootstrapStatus != nil || message.Completion != nil || message.BeginInit != nil || message.InitOutcome != nil || message.Drain != nil || message.Request != nil || message.PeerClosure != nil || message.RuntimeAdmission.OperationID == "" {
+			return nil, fmt.Errorf("fencing: runtime admission requires the exact unbound supervisor identity")
+		}
+		authority, ok := s.Authority.(interface {
+			BootstrapRuntimeAdmission(context.Context, string, Identity) (BootstrapRuntimeAdmissionResult, error)
+		})
+		if !ok {
+			return nil, ErrPending
+		}
+		return authority.BootstrapRuntimeAdmission(ctx, message.RuntimeAdmission.OperationID, bound)
+	}
+	if bound.Validate() != nil || bound.WALIdentity == "" || message.Identity != bound {
+		return nil, fmt.Errorf("fencing: bootstrap runtime identity differs from bound WAL")
+	}
+	authority, ok := s.Authority.(interface {
+		BootstrapStatus(context.Context, string, Identity) (BootstrapStatusResult, error)
+		CompleteBootstrap(context.Context, Identity, BootstrapCompletion) error
+	})
+	if !ok {
+		return nil, ErrPending
+	}
+	switch path {
+	case "/v1/bootstrap-status":
+		if message.Action != "bootstrap-status" || message.BootstrapStatus == nil || message.Completion != nil || message.BeginInit != nil || message.InitOutcome != nil || message.Drain != nil || message.Request != nil || message.PeerClosure != nil {
+			return nil, fmt.Errorf("fencing: bootstrap status request shape differs")
+		}
+		return authority.BootstrapStatus(ctx, message.BootstrapStatus.OperationID, bound)
+	case "/v1/bootstrap-complete":
+		if message.Action != "bootstrap-complete" || message.Completion == nil || message.BootstrapStatus != nil || message.BeginInit != nil || message.InitOutcome != nil || message.Drain != nil || message.Request != nil || message.PeerClosure != nil {
+			return nil, fmt.Errorf("fencing: bootstrap completion request shape differs")
+		}
+		return nil, authority.CompleteBootstrap(ctx, bound, *message.Completion)
+	default:
+		return nil, fmt.Errorf("fencing: unknown bootstrap endpoint")
+	}
+}
+
 func (s *Supervisor) identityRequest(ctx context.Context, path string, identity Identity) (any, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	switch path {
 	case "/v1/startup":
-		if identity.SourceClusterID != s.bound.SourceClusterID || identity.NodeID != s.bound.NodeID {
+		if identity.SourceClusterID != s.bound.SourceClusterID || (identity.NodeID != s.bound.NodeID && !(s.bound.PodName != "" && identity.NodeID == s.bound.PodName)) {
 			return nil, fmt.Errorf("fencing: startup identity mismatch")
 		}
 		if _, err := s.Authority.Stop(ctx, s.bound); err != ErrPending {
@@ -360,7 +557,7 @@ func (s *Supervisor) identityRequest(ctx context.Context, path string, identity 
 			}
 			return nil, err
 		}
-		return s.bound, nil
+		return Registration{Identity: s.bound}, nil
 	case "/v1/bind":
 		if identity.WALIdentity == "" {
 			return nil, fmt.Errorf("fencing: empty WAL")

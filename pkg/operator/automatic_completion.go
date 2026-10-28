@@ -40,10 +40,14 @@ func (c *Controller) verifyAutomaticCompletion(ctx context.Context, r *ClusterRe
 		if err != nil {
 			return err
 		}
+		entry, err := retainedLearnerCredential(state, state.ActiveClusterID, i.Request.OperationID, i.LearnerName, i.LearnerUID)
+		if err != nil || entry.CredentialName != m.ReplacementSecret || entry.CredentialUID != uid || entry.Target.NodeID != string(member.ID) {
+			return fmt.Errorf("committed addition credential differs from retained learner enrollment")
+		}
 		member.WALIdentity = i.LearnerWAL
 		add := journal.Add
 		request := network.MembershipChange{OperationID: membershipOperationID(child, "add"), ClusterID: state.ActiveClusterID, ExpectedConfigID: add.ExpectedConfigID, ExpectedAbortSlot: add.ExpectedAbortSlot, Add: &member}
-		if string(member.ID) != i.LearnerName || add.MemberID != member.ID || add.WALIdentity != i.LearnerWAL || add.OperationID != request.OperationID || add.RequestHash != hashJSON(request) || add.SecretUID != uid || add.SecretResourceVer != rv {
+		if add.MemberID != member.ID || add.WALIdentity != i.LearnerWAL || add.OperationID != request.OperationID || add.RequestHash != hashJSON(request) || add.SecretUID != uid || add.SecretResourceVer != rv {
 			return fmt.Errorf("committed addition differs from authenticated learner")
 		}
 		return nil

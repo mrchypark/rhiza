@@ -112,16 +112,25 @@ spec:
           # Optional peer-closure approval requires the same RHIZA_OBJSTORE_*
           # location and provider authentication used by the automatic-recovery
           # controller. Do not configure filesystem storage. Without a usable
-          # shared store, new peer-closure requests fail closed; supervisor
-          # registration, drain, and existing fence reconciliation still run.
+          # shared store, new peer-closure requests and supervisor registrations
+          # that need fresh admission fail closed. Existing exact-run stop,
+          # drain/exit receipts, and fence reconciliation still run.
           # Supply existing environment sources here; this manifest creates no
           # object-store Secret or credential grant. The peer-closure path only
           # reads automatic control and immutable workload-binding records.
+          # Cold first registration without retained exact enrollment is not
+          # supported; an empty ConfigMap is not an enrollment/bootstrap grant.
           env:
             - name: POD_NAMESPACE
               valueFrom:
                 fieldRef:
                   fieldPath: metadata.namespace
+          envFrom:
+            - configMapRef:
+                # The same optional trust configuration is consumed by the
+                # operator. An absent ConfigMap leaves DR admission disabled.
+                name: rhiza-recovery-anchor
+                optional: true
             # Independent evidence for a dead incarnation is opt-in. Uncomment all
             # three values, the matching projected token and CA volumes below, and
             # point the URL at the attestor service. All three values are required
@@ -144,6 +153,12 @@ spec:
             - name: tls
               mountPath: /tls
               readOnly: true
+            - name: recovery-anchor-token
+              mountPath: /var/run/secrets/rhiza-recovery-anchor-token
+              readOnly: true
+            - name: recovery-anchor-ca
+              mountPath: /var/run/secrets/rhiza-recovery-anchor-ca
+              readOnly: true
             # - name: attestor-token
             #   mountPath: /var/run/secrets/rhiza-fence-attestor
             #   readOnly: true
@@ -160,6 +175,14 @@ spec:
         - name: tls
           secret:
             secretName: rhiza-fencer-tls
+        - name: recovery-anchor-token
+          secret:
+            secretName: rhiza-recovery-anchor-token
+            optional: true
+        - name: recovery-anchor-ca
+          configMap:
+            name: rhiza-recovery-anchor-ca
+            optional: true
         # The attestor token must be audience-bound and short-lived, like the
         # supervisor token; the CA bundle pins the attestor identity.
         # - name: attestor-token

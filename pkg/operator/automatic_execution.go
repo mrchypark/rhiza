@@ -58,8 +58,6 @@ func (c *Controller) advanceAutomatic(ctx context.Context, r *ClusterResource, s
 		if handled, err := c.recoverLearnerInventory(ctx, r, state, version, sts); handled || err != nil {
 			return err
 		}
-		abortRevisionAttempted := false
-		var abortRevisionErr error
 		handled := false
 		if intent.LearnerUID != "" {
 			before := hashJSON(state)
@@ -69,8 +67,10 @@ func (c *Controller) advanceAutomatic(ctx context.Context, r *ClusterResource, s
 				return err
 			}
 		}
+		abortRevisionAttempted := false
+		var abortRevisionErr error
 		if intent.Aborting {
-			revisionHandled, attempted, err := c.advancePendingAbortRevision(ctx, r, state, version, &existing)
+			revisionHandled, attempted, err := c.advancePendingAbortRevision(ctx, r, state, version, sts, &existing)
 			if revisionHandled && !attempted {
 				return err
 			}
@@ -98,9 +98,12 @@ func (c *Controller) advanceAutomatic(ctx context.Context, r *ClusterResource, s
 			}
 		}
 	}
-	desired := automaticRecoveryDesired(r, state, intent)
+	desired, err := automaticRecoveryDesired(r, state, intent, sts)
+	if err != nil {
+		return block(err.Error())
+	}
 	var child Resource
-	err := c.Kube.Get(ctx, c.resourcePath(intent.RecoveryName), &child)
+	err = c.Kube.Get(ctx, c.resourcePath(intent.RecoveryName), &child)
 	if err != nil {
 		var apiErr *APIError
 		if !errors.As(err, &apiErr) || apiErr.StatusCode != http.StatusNotFound {
@@ -162,15 +165,10 @@ func (c *Controller) advanceAutomatic(ctx context.Context, r *ClusterResource, s
 		return block("completed recovery outcome is invalid: " + err.Error())
 	}
 	if intent.Failed != "" {
-		state.Voters = nil
-		for _, ref := range intent.Voters {
-			if ref.NodeID != intent.Failed {
-				state.Voters = append(state.Voters, ref)
-			}
+		supervised := str(nested(sts, "spec", "template", "metadata", "annotations", fencingProtocolAnnotation)) == "1"
+		if err := promoteCompletedMembershipLearner(state, intent, supervised); err != nil {
+			return block("completed learner identity is unavailable: " + err.Error())
 		}
-		state.Voters = append(state.Voters, VoterPod{NodeID: quepaxa.NodeID(intent.LearnerName), Pod: intent.LearnerName})
-		delete(state.Identities, intent.Failed)
-		state.Identities[quepaxa.NodeID(intent.LearnerName)] = FenceTarget{NodeID: intent.LearnerName, Pod: intent.LearnerName, PodUID: intent.LearnerUID, WALIdentity: intent.LearnerWAL}
 	} else {
 		if child.Status.Target == "" || child.Status.Stage != "Complete" {
 			return block("target generation is not confirmed complete")
@@ -207,10 +205,38 @@ func (c *Controller) advanceAutomatic(ctx context.Context, r *ClusterResource, s
 	return c.autoStatus(ctx, r, state, "Stabilizing", "recovery completed; verifying the active quorum")
 }
 
-func automaticRecoveryDesired(r *ClusterResource, state *autoControl, intent *autoIntent) Spec {
+func promoteCompletedMembershipLearner(state *autoControl, intent *autoIntent, supervised bool) error {
+	entry, err := retainedLearnerCredential(state, state.ActiveClusterID, intent.Request.OperationID, intent.LearnerName, intent.LearnerUID)
+	if err != nil {
+		return err
+	}
+	learnerID, err := learnerNodeID(state, intent.LearnerName, intent.LearnerUID)
+	if supervised {
+		learnerID, err = capturedLearnerNodeID(state, intent.LearnerName, intent.LearnerUID)
+	}
+	if err != nil {
+		return err
+	}
+	target := entry.Target
+	if target.NodeID != learnerID || target.Pod != intent.LearnerName || target.PodUID != intent.LearnerUID || target.WALIdentity != intent.LearnerWAL {
+		return fmt.Errorf("retained learner target differs from completed incarnation")
+	}
+	state.Voters = nil
+	for _, ref := range intent.Voters {
+		if ref.NodeID != intent.Failed {
+			state.Voters = append(state.Voters, ref)
+		}
+	}
+	state.Voters = append(state.Voters, VoterPod{NodeID: quepaxa.NodeID(learnerID), Pod: intent.LearnerName})
+	delete(state.Identities, intent.Failed)
+	state.Identities[quepaxa.NodeID(learnerID)] = target
+	return nil
+}
+
+func automaticRecoveryDesired(r *ClusterResource, state *autoControl, intent *autoIntent, sts object) (Spec, error) {
 	desired := Spec{StatefulSet: r.Spec.StatefulSet, Container: r.Spec.Container, SourceClusterID: state.ActiveClusterID, Durability: intent.Durability, RecoveryID: intent.RecoveryName, AllowDataLoss: intent.Policy.AllowDataLoss, AnchorID: r.Spec.AnchorID, Fence: Fence{RecoveryID: intent.RecoveryName, ClusterID: state.ActiveClusterID, StatefulSetUID: state.StatefulSetUID, Confirmed: true, Evidence: intent.Proof.ProofID}}
 	if intent.Failed == "" {
-		return desired
+		return desired, nil
 	}
 	var voters []VoterPod
 	for _, ref := range intent.Voters {
@@ -221,15 +247,22 @@ func automaticRecoveryDesired(r *ClusterResource, state *autoControl, intent *au
 	target := intent.Request.Targets[0]
 	desired.RecoveryID = ""
 	desired.Fence = Fence{}
-	desired.Membership = &MembershipSpec{AbortAddition: intent.Aborting, OperationID: intent.RecoveryName, Remove: intent.Failed, RemovedPod: target.Pod, VoterPods: voters, ReplacementPod: intent.LearnerName, ReplacementSecret: intent.LearnerName + "-credentials", Fence: MembershipFence{NodeID: intent.Failed, WALIdentity: target.WALIdentity, WorkloadUID: target.PodUID, Confirmed: true, Evidence: intent.Proof.ProofID}}
-	return desired
+	replacementSecret := intent.LearnerName + "-credentials"
+	if str(nested(sts, "spec", "template", "metadata", "annotations", fencingProtocolAnnotation)) == "1" {
+		entry, err := retainedLearnerCredential(state, state.ActiveClusterID, intent.Request.OperationID, intent.LearnerName, intent.LearnerUID)
+		if err != nil {
+			return Spec{}, fmt.Errorf("replacement learner credential is not durably enrolled: %w", err)
+		}
+		replacementSecret = entry.CredentialName
+	}
+	desired.Membership = &MembershipSpec{AbortAddition: intent.Aborting, OperationID: intent.RecoveryName, Remove: intent.Failed, RemovedPod: target.Pod, VoterPods: voters, ReplacementPod: intent.LearnerName, ReplacementSecret: replacementSecret, Fence: MembershipFence{NodeID: intent.Failed, WALIdentity: target.WALIdentity, WorkloadUID: target.PodUID, Confirmed: true, Evidence: intent.Proof.ProofID}}
+	return desired, nil
 }
 
 // advancePendingAbortRevision prioritizes the already-proven voter's exact
-// metadata-CAS and child PUT before generation escalation. A
-// failed PUT is observed by resource UID/spec readback, then returns control to
-// the existing bounded escalation assessment rather than extending a grace.
-func (c *Controller) advancePendingAbortRevision(ctx context.Context, r *ClusterResource, state *autoControl, version *objstore.ObjectVersion, child *Resource) (handled, attempted bool, resultErr error) {
+// metadata-CAS and child PUT before generation escalation. A failed PUT is
+// observed by resource UID/spec readback, then returns to bounded escalation.
+func (c *Controller) advancePendingAbortRevision(ctx context.Context, r *ClusterResource, state *autoControl, version *objstore.ObjectVersion, sts object, child *Resource) (handled, attempted bool, resultErr error) {
 	intent := state.Intent
 	if intent == nil || !intent.Aborting || intent.Failed == "" || child == nil {
 		return false, false, nil
@@ -243,7 +276,10 @@ func (c *Controller) advancePendingAbortRevision(ctx context.Context, r *Cluster
 	if str(nested(child.Metadata, "annotations", automaticOwner)) != state.BindingUID || str(nested(child.Metadata, "annotations", automaticLogical)) != r.Spec.LogicalID {
 		return block("recovery resource differs from frozen automatic intent")
 	}
-	desired := automaticRecoveryDesired(r, state, intent)
+	desired, err := automaticRecoveryDesired(r, state, intent, sts)
+	if err != nil {
+		return block(err.Error())
+	}
 	if desired.Membership == nil || desired.Membership.OperationID != intent.RecoveryName || desired.Membership.Remove != intent.Failed || desired.Membership.ReplacementPod != intent.LearnerName || desired.Membership.Fence.Evidence != intent.Proof.ProofID {
 		return block("abort revision differs from the proven voter intent")
 	}
@@ -322,4 +358,32 @@ func (c *Controller) authorizeAutomaticChild(ctx context.Context, r *Resource) (
 		return false, err
 	}
 	return true, nil
+}
+
+// retainedMembershipLearner returns the exact credential captured for an
+// automatically authorized learner. The child spec carries the Secret name;
+// this retained control record supplies the immutable Secret UID and canonical
+// consensus identity that the membership executor must match.
+func (c *Controller) retainedMembershipLearner(ctx context.Context, r *Resource) (learnerIncarnation, bool, error) {
+	owner := str(nested(r.Metadata, "annotations", automaticOwner))
+	logical := str(nested(r.Metadata, "annotations", automaticLogical))
+	if owner == "" && logical == "" {
+		return learnerIncarnation{}, false, nil
+	}
+	if owner == "" || !identifier.MatchString(logical) || r.Spec.Membership == nil {
+		return learnerIncarnation{}, true, fmt.Errorf("automatic learner authority binding is incomplete")
+	}
+	state, _, err := c.loadAuto(ctx, path.Join(c.Prefix, "automatic", c.Kube.Namespace, logical, "control.json"))
+	if err != nil {
+		return learnerIncarnation{}, true, fmt.Errorf("automatic learner authority is unavailable: %w", err)
+	}
+	intent, membership := state.Intent, r.Spec.Membership
+	if state.BindingUID != owner || state.StatefulSetUID == "" || state.ActiveClusterID != r.Spec.SourceClusterID || intent == nil || intent.Proof == nil || intent.RecoveryName != resourceName(r) || intent.RecoveryUID != str(r.Metadata["uid"]) || intent.SpecHash != hashJSON(r.Spec) || intent.Request.OperationID == "" || intent.Failed != membership.Remove || intent.LearnerName != membership.ReplacementPod || intent.LearnerUID == "" {
+		return learnerIncarnation{}, true, fmt.Errorf("automatic learner authority differs from the immutable child")
+	}
+	entry, err := retainedLearnerCredential(state, state.ActiveClusterID, intent.Request.OperationID, intent.LearnerName, intent.LearnerUID)
+	if err != nil || entry.Target.NodeID == "" || entry.Target.WALIdentity != intent.LearnerWAL || entry.CredentialName != membership.ReplacementSecret {
+		return learnerIncarnation{}, true, fmt.Errorf("automatic learner credential differs from retained enrollment")
+	}
+	return entry, true, nil
 }

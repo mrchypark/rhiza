@@ -40,7 +40,11 @@ func (c *Controller) handleAutomaticLearner(ctx context.Context, r *ClusterResou
 		request := intent.Request
 		request.Scope = ScopeVoter
 		request.OperationID = fmt.Sprintf("%s-learner-fence-%d", intent.RecoveryName, intent.LearnerAttempt)
-		request.Targets = []FenceTarget{learnerFenceTarget(state, intent.LearnerName, intent.LearnerUID, intent.LearnerWAL)}
+		target, err := learnerFenceTarget(state, intent.LearnerName, intent.LearnerUID, intent.LearnerWAL)
+		if err != nil {
+			return block("failed learner identity is unavailable")
+		}
+		request.Targets = []FenceTarget{target}
 		proof, err := c.fence(ctx, request)
 		if err != nil {
 			return block("waiting for failed learner fencing proof")
@@ -48,11 +52,13 @@ func (c *Controller) handleAutomaticLearner(ctx context.Context, r *ClusterResou
 		entry := learnerIncarnation{SourceClusterID: state.ActiveClusterID, OperationID: intent.Request.OperationID, Target: request.Targets[0]}
 		entry.Retirement = &learnerRetirement{Request: request, Proof: *proof}
 		for _, old := range state.Learners {
-			if old.SourceClusterID == entry.SourceClusterID && old.Target.Pod == entry.Target.Pod {
+			if old.SourceClusterID == entry.SourceClusterID && old.Target.NodeID == entry.Target.NodeID && old.Target.PodUID == entry.Target.PodUID {
+				entry.LedgerUID = old.LedgerUID
 				entry.CredentialUID = old.CredentialUID
+				entry.CredentialName = old.CredentialName
 			}
 		}
-		if str(nested(sts, "spec", "template", "metadata", "annotations", fencingProtocolAnnotation)) == "1" && entry.CredentialUID == "" {
+		if str(nested(sts, "spec", "template", "metadata", "annotations", fencingProtocolAnnotation)) == "1" && (entry.CredentialUID == "" || entry.LedgerUID == "") {
 			return block("supervised learner retirement lacks durable creation history")
 		}
 		if handled, err := remember(entry); handled || err != nil {
@@ -114,7 +120,11 @@ func (c *Controller) handleAutomaticLearner(ctx context.Context, r *ClusterResou
 			if errors.Is(e, ErrMembershipUnauthorized) {
 				return block("replacement authentication failed")
 			}
-			if e == nil && string(status.NodeID) == intent.LearnerName && status.ClusterID == state.ActiveClusterID && status.WALIdentity != "" {
+			nodeID, identityErr := learnerNodeID(state, intent.LearnerName, intent.LearnerUID)
+			if str(nested(sts, "spec", "template", "metadata", "annotations", fencingProtocolAnnotation)) == "1" {
+				nodeID, identityErr = capturedLearnerNodeID(state, intent.LearnerName, intent.LearnerUID)
+			}
+			if e == nil && identityErr == nil && string(status.NodeID) == nodeID && status.ClusterID == state.ActiveClusterID && status.WALIdentity != "" {
 				if intent.LearnerWAL != "" && intent.LearnerWAL != status.WALIdentity {
 					return block("replacement WAL identity changed")
 				}

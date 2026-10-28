@@ -18,9 +18,11 @@ const maxBody = 64 << 10
 
 // actionRequest is the JSON envelope for handler requests.
 type actionRequest struct {
-	Action  string   `json:"action"`
-	Request Request  `json:"request"`
-	Receipt *Receipt `json:"receipt,omitempty"`
+	Action             string   `json:"action"`
+	Request            Request  `json:"request"`
+	Receipt            *Receipt `json:"receipt,omitempty"`
+	ExpectedBinding    *Binding `json:"expected_binding,omitempty"`
+	ExpectedGeneration uint64   `json:"expected_generation,omitempty"`
 }
 
 // NewHandler returns an HTTP handler exposing anchor activation and
@@ -85,6 +87,18 @@ func NewHandler(coord *Coordinator, token string) http.Handler {
 			w.Header().Set("Content-Type", "application/json")
 			json.NewEncoder(w).Encode(*ar.Receipt)
 
+		case "verify-admission":
+			if ar.Receipt == nil || ar.ExpectedBinding == nil || ar.ExpectedGeneration == 0 {
+				http.Error(w, "bad request", http.StatusBadRequest)
+				return
+			}
+			if err := coord.VerifyAdmission(r.Context(), ar.Request, *ar.Receipt, *ar.ExpectedBinding, ar.ExpectedGeneration); err != nil {
+				http.Error(w, "bad request", http.StatusBadRequest)
+				return
+			}
+			w.Header().Set("Content-Type", "application/json")
+			json.NewEncoder(w).Encode(*ar.Receipt)
+
 		default:
 			http.Error(w, "bad request", http.StatusBadRequest)
 		}
@@ -121,7 +135,25 @@ func (cl *Client) Verify(ctx context.Context, req Request, receipt Receipt) erro
 	return err
 }
 
+// VerifyAdmission asks the authority to recheck one committed approval and
+// its expected live binding/generation for a new recovery admission.
+func (cl *Client) VerifyAdmission(ctx context.Context, req Request, receipt Receipt, expected Binding, generation uint64) error {
+	if expected.ClusterID == "" || expected.StorageID == "" || generation == 0 || receipt.Target != expected || receipt.Generation != generation {
+		return fmt.Errorf("expected binding and generation differ from receipt")
+	}
+	_, err := cl.callAdmission(ctx, req, receipt, expected, generation)
+	return err
+}
+
+func (cl *Client) callAdmission(ctx context.Context, req Request, receipt Receipt, expected Binding, generation uint64) (Receipt, error) {
+	return cl.callWithAdmission(ctx, "verify-admission", req, receipt, &expected, generation)
+}
+
 func (cl *Client) call(ctx context.Context, action string, req Request, receipt Receipt) (Receipt, error) {
+	return cl.callWithAdmission(ctx, action, req, receipt, nil, 0)
+}
+
+func (cl *Client) callWithAdmission(ctx context.Context, action string, req Request, receipt Receipt, expected *Binding, generation uint64) (Receipt, error) {
 	u, err := url.Parse(cl.URL)
 	if err != nil || u.Scheme != "https" || u.Host == "" || u.User != nil || u.RawQuery != "" || u.ForceQuery || u.Fragment != "" {
 		return Receipt{}, fmt.Errorf("invalid or non-HTTPS URL")
@@ -136,7 +168,7 @@ func (cl *Client) call(ctx context.Context, action string, req Request, receipt 
 		return Receipt{}, fmt.Errorf("empty token")
 	}
 
-	ar := actionRequest{Action: action, Request: req, Receipt: &receipt}
+	ar := actionRequest{Action: action, Request: req, Receipt: &receipt, ExpectedBinding: expected, ExpectedGeneration: generation}
 	payload, err := json.Marshal(ar)
 	if err != nil {
 		return Receipt{}, err

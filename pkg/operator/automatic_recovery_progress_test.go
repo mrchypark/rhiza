@@ -17,6 +17,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/mrchypark/rhiza/pkg/fencing"
 	"github.com/mrchypark/rhiza/pkg/network"
 	"github.com/mrchypark/rhiza/pkg/quepaxa"
 )
@@ -24,12 +25,12 @@ import (
 func progressProbeResponse(req *http.Request, node string, live bool) *http.Response {
 	voters := []string{"n1", "n2", "n3"}
 	configID := uint(2)
-	if node == "learner" {
-		voters = []string{"n2", "n3", "learner"}
+	if node == "learner" || node == "pod-learner-uid" {
+		voters = []string{"n2", "n3", node}
 		configID = 3
 	}
 	wal := "wal-" + node
-	if node == "learner" {
+	if node == "learner" || node == "pod-learner-uid" {
 		wal = "learner-wal"
 	}
 	return progressProbeResponseForMembership(req, node, live, configID, voters, wal)
@@ -73,6 +74,7 @@ func TestAutomaticRecoveryProgressEscalatesWithFullFencingInventory(t *testing.T
 			}
 			child := Resource{Metadata: object{"name": "online-recovery", "uid": "old-child", "annotations": object{automaticOwner: state.BindingUID, automaticLogical: r.Spec.LogicalID}}, Spec: Spec{StatefulSet: "rhiza", Container: "rhiza", SourceClusterID: "source", Membership: &MembershipSpec{OperationID: "online-recovery", Remove: "n1", ReplacementPod: "learner"}}}
 			state.Intent = &autoIntent{Request: request, Proof: proof, Failed: "n1", Voters: append([]VoterPod(nil), state.Voters...), LearnerName: "learner", LearnerUID: "learner-uid", LearnerWAL: "learner-wal", RecoveryName: "online-recovery", RecoveryUID: "old-child", SpecHash: hashJSON(child.Spec), Durability: "before-ack", Policy: AutoPolicy{FailureGraceSeconds: 1}, NoQuorumSince: time.Now().Add(-time.Hour)}
+			state.Learners = []learnerIncarnation{{SourceClusterID: "source", OperationID: request.OperationID, CredentialUID: "learner-credential", CredentialName: "learner-credentials", Target: FenceTarget{NodeID: "pod-learner-uid", Pod: "learner", PodUID: "learner-uid", WALIdentity: "learner-wal"}}}
 			old := jsonBytes(state.Intent)
 			token := filepath.Join(t.TempDir(), "token")
 			if err := os.WriteFile(token, []byte("kube"), 0600); err != nil {
@@ -87,25 +89,25 @@ func TestAutomaticRecoveryProgressEscalatesWithFullFencingInventory(t *testing.T
 				var body any
 				if strings.Contains(req.URL.Path, "/pods/") {
 					pod := path.Base(req.URL.Path)
-					id := map[string]string{"rhiza-1": "n2", "rhiza-2": "n3", "learner": "learner"}[pod]
+					id := map[string]string{"rhiza-1": "n2", "rhiza-2": "n3", "learner": "pod-learner-uid"}[pod]
 					if id == "" {
 						return &http.Response{StatusCode: 404, Body: io.NopCloser(strings.NewReader("")), Header: make(http.Header)}, nil
 					}
 					uid := "uid-" + id
-					if id == "learner" {
+					if pod == "learner" {
 						uid = "learner-uid"
 					}
-					ip := map[string]string{"n2": "127.0.0.2", "n3": "127.0.0.3", "learner": "127.0.0.4"}[id]
+					ip := map[string]string{"n2": "127.0.0.2", "n3": "127.0.0.3", "pod-learner-uid": "127.0.0.4"}[id]
 					body = object{"metadata": object{"uid": uid}, "status": object{"podIP": ip}, "spec": object{"containers": []any{object{"name": "rhiza"}}}}
 				} else if req.URL.Path == "/recovery/probe" {
 					probes++
 					if req.URL.Query().Get("exclude") != "n1" || req.Header.Get("Authorization") != "Bearer admin" {
 						t.Error("active probe lost failed-voter exclusion or authentication")
 					}
-					id := map[string]string{"127.0.0.2": "n2", "127.0.0.3": "n3", "127.0.0.4": "learner"}[req.URL.Hostname()]
+					id := map[string]string{"127.0.0.2": "n2", "127.0.0.3": "n3", "127.0.0.4": "pod-learner-uid"}[req.URL.Hostname()]
 					return progressProbeResponse(req, id, false), nil
 				} else {
-					id := map[string]string{"127.0.0.2": "n2", "127.0.0.3": "n3", "127.0.0.4": "learner"}[req.URL.Hostname()]
+					id := map[string]string{"127.0.0.2": "n2", "127.0.0.3": "n3", "127.0.0.4": "pod-learner-uid"}[req.URL.Hostname()]
 					body = membershipStatus(id, 2, "n1", "n2", "n3")
 				}
 				return &http.Response{StatusCode: 200, Body: io.NopCloser(strings.NewReader(string(jsonBytes(body)))), Header: make(http.Header)}, nil
@@ -150,7 +152,7 @@ func TestAutomaticRecoveryProgressEscalatesWithFullFencingInventory(t *testing.T
 			if loaded.Intent.Request.Scope != ScopeGeneration || loaded.Intent.Request.SourceClusterID != "source" || loaded.Intent.Request.OperationID == request.OperationID || len(loaded.Intent.Request.Targets) != 4 || loaded.Intent.Proof != nil {
 				t.Fatalf("generation-wide fence was not freshly reserved: %+v", loaded.Intent)
 			}
-			want := map[string]FenceTarget{"learner": {NodeID: "learner", Pod: "learner", PodUID: "learner-uid", WALIdentity: "learner-wal"}}
+			want := map[string]FenceTarget{"pod-learner-uid": {NodeID: "pod-learner-uid", Pod: "learner", PodUID: "learner-uid", WALIdentity: "learner-wal"}}
 			for id, target := range state.Identities {
 				want[string(id)] = target
 			}
@@ -189,10 +191,14 @@ func TestAutomaticRecoveryProgressReplacesCommittedFailedLearner(t *testing.T) {
 	child.Spec.Container = "rhiza"
 	child.Spec.Membership.OperationID = "recover"
 	child.Spec.Membership.RemovedPod = "n3"
-	api.learnerID = "learner"
+	learnerID, err := fencing.ReplacementNodeID("learner-uid")
+	if err != nil {
+		t.Fatal(err)
+	}
+	api.learnerID = learnerID
 	wal := strings.Repeat("a", 64)
-	api.membership["learner"] = network.MembershipStatus{NodeID: "learner", ClusterID: "source", ConfigID: 1, Voters: []quepaxa.NodeID{"n1", "n2", "n3"}, WALIdentity: wal}
-	api.membershipSecret["data"].(object)["member"] = base64.StdEncoding.EncodeToString(jsonBytes(voterMember("source", "learner", "new-token")))
+	api.membership[learnerID] = network.MembershipStatus{NodeID: quepaxa.NodeID(learnerID), ClusterID: "source", ConfigID: 1, Voters: []quepaxa.NodeID{"n1", "n2", "n3"}, WALIdentity: wal}
+	api.membershipSecret["data"].(object)["member"] = base64.StdEncoding.EncodeToString(jsonBytes(voterMember("source", learnerID, "new-token")))
 	if err := c.reconcileAll(ctx); err != nil {
 		t.Fatal(err)
 	}
@@ -204,15 +210,17 @@ func TestAutomaticRecoveryProgressReplacesCommittedFailedLearner(t *testing.T) {
 	if err := writeRetirementOperation(ctx, c, child); err != nil {
 		t.Fatal(err)
 	}
-	api.membership["n1"] = membershipStatus("n1", 3, "n1", "n2", "learner")
-	api.membership["n2"] = membershipStatus("n2", 3, "n1", "n2", "learner")
+	api.membership["n1"] = membershipStatus("n1", 3, "n1", "n2", learnerID)
+	api.membership["n2"] = membershipStatus("n2", 3, "n1", "n2", learnerID)
+	api.membership[learnerID] = membershipStatus(learnerID, 3, "n1", "n2", learnerID)
+	api.membership[learnerID] = func() network.MembershipStatus { s := api.membership[learnerID]; s.WALIdentity = wal; return s }()
 	for _, id := range []string{"n1", "n2"} {
 		status := api.membership[id]
 		status.WALIdentity = "wal-" + id
 		api.membership[id] = status
 	}
 	api.replacement = nil
-	delete(api.membership, "learner")
+	delete(api.membership, learnerID)
 	child.Spec.Membership.AbortAddition = true
 	if err := c.reconcileAll(ctx); err != nil {
 		t.Fatal(err)
@@ -234,16 +242,31 @@ func TestAutomaticRecoveryProgressReplacesCommittedFailedLearner(t *testing.T) {
 		t.Fatal(err)
 	}
 	state.Intent = &autoIntent{Request: request, RecoveryName: "recover", RecoveryUID: "resource-uid", Durability: "before-ack", Failed: "n3", Voters: append([]VoterPod(nil), state.Voters...), LearnerName: "learner", LearnerUID: "learner-uid", LearnerWAL: wal, Aborting: true, Proof: &FenceProof{OperationID: request.OperationID, SourceClusterID: "source", BindingUID: state.BindingUID, RequestHash: hash, ProofID: child.Spec.Membership.Fence.Evidence, ProcessesTerminated: true, RecreationBlocked: true, StorageQuiesced: true}}
+	state.Learners = []learnerIncarnation{{SourceClusterID: "source", OperationID: request.OperationID, CredentialUID: "secret-uid", CredentialName: "learner-credentials", Target: FenceTarget{NodeID: learnerID, Pod: "learner", PodUID: "learner-uid", WALIdentity: wal}}}
+	api.membership[learnerID] = membershipStatus(learnerID, 3, "n1", "n2", learnerID)
+	status := api.membership[learnerID]
+	status.WALIdentity = wal
+	api.membership[learnerID] = status
 	child.Metadata["annotations"] = object{automaticOwner: state.BindingUID, automaticLogical: r.Spec.LogicalID}
 	state.Intent.SpecHash = hashJSON(child.Spec)
 	var nextChild *Resource
 	var nextLearner string
+	var newSecretName string
 	server := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, q *http.Request) {
 		if q.Method == http.MethodGet && q.URL.Path == c.resourcePath("recover") {
 			_ = json.NewEncoder(w).Encode(child)
 			return
 		}
 		if nextChild != nil && q.Method == http.MethodGet && q.URL.Path == c.resourcePath(resourceName(nextChild)) {
+			_ = json.NewEncoder(w).Encode(nextChild)
+			return
+		}
+		if nextChild != nil && q.Method == http.MethodPut && q.URL.Path == c.resourcePath(resourceName(nextChild)) {
+			if err := json.NewDecoder(q.Body).Decode(nextChild); err != nil {
+				t.Error(err)
+				w.WriteHeader(http.StatusBadRequest)
+				return
+			}
 			_ = json.NewEncoder(w).Encode(nextChild)
 			return
 		}
@@ -258,10 +281,31 @@ func TestAutomaticRecoveryProgressReplacesCommittedFailedLearner(t *testing.T) {
 			_ = json.NewEncoder(w).Encode(r)
 			return
 		}
+		if q.Method == http.MethodGet && q.URL.Path == c.corePath("secrets", newSecretName) {
+			secret := api.membershipSecrets[newSecretName]
+			if secret == nil {
+				t.Errorf("replacement credential fixture missing exact secret %q", newSecretName)
+				http.NotFound(w, q)
+				return
+			}
+			_ = json.NewEncoder(w).Encode(secret)
+			return
+		}
 		if nextLearner != "" && q.Method == http.MethodGet && q.URL.Path == c.corePath("pods", nextLearner) {
 			q.URL.Path = c.corePath("pods", "learner2")
 		}
-		api.serve(w, q)
+		response := httptest.NewRecorder()
+		api.serve(response, q)
+		if response.Code == http.StatusNotFound && q.Method == http.MethodPut && strings.HasPrefix(q.URL.Path, c.resourcePath("")) {
+			t.Errorf("unhandled Kubernetes request during automatic recovery fixture: %s %s", q.Method, q.URL.Path)
+		}
+		for key, values := range response.Header() {
+			for _, value := range values {
+				w.Header().Add(key, value)
+			}
+		}
+		w.WriteHeader(response.Code)
+		_, _ = io.Copy(w, response.Body)
 	}))
 	t.Cleanup(server.Close)
 	c.Kube.BaseURL, c.Kube.Client = server.URL, server.Client()
@@ -276,7 +320,7 @@ func TestAutomaticRecoveryProgressReplacesCommittedFailedLearner(t *testing.T) {
 		if req.Header.Get("Authorization") != "Bearer admin" {
 			t.Error("missing probe authentication")
 		}
-		return progressProbeResponseForMembership(req, id, true, 3, []string{"n1", "n2", "learner"}, map[string]string{"n1": "wal-n1", "n2": "wal-n2"}[id]), nil
+		return progressProbeResponseForMembership(req, id, true, 3, []string{"n1", "n2", learnerID}, map[string]string{"n1": "wal-n1", "n2": "wal-n2"}[id]), nil
 	})}
 	fenced := 0
 	var lastFence FenceRequest
@@ -298,8 +342,8 @@ func TestAutomaticRecoveryProgressReplacesCommittedFailedLearner(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if state.Intent != nil || state.Completed == nil || state.Identities["learner"].PodUID != "learner-uid" {
-		t.Fatalf("failed committed voter was not installed: %+v", state)
+	if state.Intent != nil || state.Completed == nil || state.Identities["pod-learner-uid"].PodUID != "learner-uid" {
+		t.Fatalf("failed committed voter was not installed: %+v status=%+v", state, r.Status)
 	}
 	// Advance the persisted grace/cooldown clocks without timing-dependent sleeps.
 	state.SuspectedSince = time.Now().Add(-time.Hour)
@@ -314,7 +358,7 @@ func TestAutomaticRecoveryProgressReplacesCommittedFailedLearner(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if state.Intent == nil || state.Intent.Failed != "learner" || state.Intent.Request.Scope != ScopeVoter || state.Intent.Request.OperationID == "recover" || len(state.Intent.Request.Targets) != 1 || state.Intent.Request.Targets[0] != (FenceTarget{NodeID: "learner", Pod: "learner", PodUID: "learner-uid", WALIdentity: wal}) {
+	if state.Intent == nil || state.Intent.Failed != "pod-learner-uid" || state.Intent.Request.Scope != ScopeVoter || state.Intent.Request.OperationID == "recover" || len(state.Intent.Request.Targets) != 1 || state.Intent.Request.Targets[0] != (FenceTarget{NodeID: "pod-learner-uid", Pod: "learner", PodUID: "learner-uid", WALIdentity: wal}) {
 		t.Fatalf("next failure did not use installed voter authority: %+v status=%+v", state.Intent, r.Status)
 	}
 	if err := c.reconcileCluster(ctx, r); err != nil {
@@ -324,7 +368,7 @@ func TestAutomaticRecoveryProgressReplacesCommittedFailedLearner(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if fenced != 1 || state.Intent.Proof == nil || lastFence.Targets[0].NodeID != "learner" {
+	if fenced != 1 || state.Intent.Proof == nil || lastFence.Targets[0].NodeID != "pod-learner-uid" {
 		t.Fatalf("next replacement was not fenced: count=%d intent=%+v", fenced, state.Intent)
 	}
 	// Workload-provisioning tests cover Kubernetes creation. Resume here with the
@@ -344,20 +388,36 @@ func TestAutomaticRecoveryProgressReplacesCommittedFailedLearner(t *testing.T) {
 		t.Fatal(err)
 	}
 	api.replacement2["spec"] = object{"containers": []any{object{"name": "rhiza", "ports": []any{object{"name": "http", "containerPort": float64(n)}}}}}
-	member := voterMember("source", nextLearner, "next-token")
-	api.membershipSecrets[nextLearner+"-credentials"] = object{"immutable": true, "metadata": object{"uid": "new-secret-uid", "resourceVersion": "1"}, "data": object{"member": base64.StdEncoding.EncodeToString(jsonBytes(member))}}
-	api.learnerID = nextLearner
-	api.membership[nextLearner] = network.MembershipStatus{NodeID: quepaxa.NodeID(nextLearner), ClusterID: "source", ConfigID: 3, Voters: []quepaxa.NodeID{"n1", "n2", "learner"}, WALIdentity: newWal}
+	templateMetadata := asObject(nested(api.sts, "spec", "template", "metadata"))
+	if templateMetadata == nil {
+		templateMetadata = object{}
+		asObject(nested(api.sts, "spec", "template"))["metadata"] = templateMetadata
+	}
+	templateMetadata["annotations"] = object{fencingProtocolAnnotation: "1"}
+	newNodeID, err := fencing.ReplacementNodeID("new-learner-uid")
+	if err != nil {
+		t.Fatal(err)
+	}
+	newIdentity := fencing.Identity{SourceClusterID: "source", NodeID: newNodeID, PodName: nextLearner, PodUID: "new-learner-uid"}
+	newSecretName = (&FencingExecutor{Kube: c.Kube}).incarnationSecretName(state.BindingUID, "sts-uid", newIdentity)
+	member := voterMember("source", newNodeID, "next-token")
+	binding := hashJSON([]string{state.BindingUID, "sts-uid", "source", nextLearner, "new-learner-uid", newNodeID})
+	api.membershipSecrets[newSecretName] = object{"type": "Opaque", "immutable": true, "metadata": object{"name": newSecretName, "namespace": c.Kube.Namespace, "uid": "new-secret-uid", "resourceVersion": "1", "annotations": object{fencingRootAnnotation: state.BindingUID, fencingBindingAnnotation: binding}}, "data": object{"member": base64.StdEncoding.EncodeToString(jsonBytes(member)), "RHIZA_PEER_TOKEN": base64.StdEncoding.EncodeToString([]byte("next-token"))}}
+	api.learnerID = newNodeID
+	api.membership[newNodeID] = network.MembershipStatus{NodeID: quepaxa.NodeID(newNodeID), ClusterID: "source", ConfigID: 3, Voters: []quepaxa.NodeID{"n1", "n2", quepaxa.NodeID(learnerID)}, WALIdentity: newWal}
 	i := state.Intent
-	nextChild = &Resource{Metadata: object{"name": i.RecoveryName, "uid": "next-child-uid", "resourceVersion": "1", "annotations": object{automaticOwner: state.BindingUID, automaticLogical: r.Spec.LogicalID}}, Spec: Spec{StatefulSet: "rhiza", Container: "rhiza", SourceClusterID: "source", Durability: i.Durability, Membership: &MembershipSpec{OperationID: i.RecoveryName, Remove: "learner", RemovedPod: "learner", VoterPods: []VoterPod{{NodeID: "n1", Pod: "n1"}, {NodeID: "n2", Pod: "n2"}}, ReplacementPod: nextLearner, ReplacementSecret: nextLearner + "-credentials", Fence: MembershipFence{NodeID: "learner", WALIdentity: wal, WorkloadUID: "learner-uid", Confirmed: true, Evidence: i.Proof.ProofID}}}}
+	nextChild = &Resource{Metadata: object{"name": i.RecoveryName, "uid": "next-child-uid", "resourceVersion": "1", "annotations": object{automaticOwner: state.BindingUID, automaticLogical: r.Spec.LogicalID}}, Spec: Spec{StatefulSet: "rhiza", Container: "rhiza", SourceClusterID: "source", Durability: i.Durability, Membership: &MembershipSpec{OperationID: i.RecoveryName, Remove: quepaxa.NodeID(learnerID), RemovedPod: "learner", VoterPods: []VoterPod{{NodeID: "n1", Pod: "n1"}, {NodeID: "n2", Pod: "n2"}}, ReplacementPod: nextLearner, ReplacementSecret: newSecretName, Fence: MembershipFence{NodeID: quepaxa.NodeID(learnerID), WALIdentity: wal, WorkloadUID: "learner-uid", Confirmed: true, Evidence: i.Proof.ProofID}}}}
 	i.LearnerUID, i.LearnerWAL, i.RecoveryUID, i.SpecHash = "new-learner-uid", newWal, "next-child-uid", hashJSON(nextChild.Spec)
+	if err := rememberLearner(state, learnerIncarnation{SourceClusterID: "source", OperationID: i.Request.OperationID, CredentialUID: "new-secret-uid", CredentialName: newSecretName, Target: FenceTarget{NodeID: newNodeID, Pod: nextLearner, PodUID: "new-learner-uid", WALIdentity: newWal}}); err != nil {
+		t.Fatal(err)
+	}
 	if err := c.saveAuto(ctx, r, state, version); err != nil {
 		t.Fatal(err)
 	}
 	if err := c.reconcile(ctx, nextChild); err != nil {
 		t.Fatal(err)
 	}
-	if nextChild.Status.Membership == nil || nextChild.Status.Membership.RemoveRequest == nil || nextChild.Status.Membership.RemoveRequest.Remove != "learner" {
+	if nextChild.Status.Membership == nil || nextChild.Status.Membership.RemoveRequest == nil || nextChild.Status.Membership.RemoveRequest.Remove != quepaxa.NodeID(learnerID) {
 		t.Fatalf("fresh removal not journaled: %+v", nextChild.Status)
 	}
 	api.membership["n1"] = membershipStatus("n1", 4, "n1", "n2")
@@ -365,8 +425,8 @@ func TestAutomaticRecoveryProgressReplacesCommittedFailedLearner(t *testing.T) {
 	if err := c.reconcile(ctx, nextChild); err != nil {
 		t.Fatal(err)
 	}
-	for _, id := range []string{"n1", "n2", nextLearner} {
-		status := membershipStatus(id, 5, "n1", "n2", nextLearner)
+	for _, id := range []string{"n1", "n2", newNodeID} {
+		status := membershipStatus(id, 5, "n1", "n2", newNodeID)
 		status.WALIdentity = newWal
 		api.membership[id] = status
 	}
@@ -376,19 +436,24 @@ func TestAutomaticRecoveryProgressReplacesCommittedFailedLearner(t *testing.T) {
 	if nextChild.Status.Phase != "Complete" {
 		t.Fatalf("fresh replacement did not complete: %+v", nextChild.Status)
 	}
-	state, version, err = c.loadAuto(ctx, c.autoKey(r))
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := c.advanceAutomatic(ctx, r, state, version, api.sts); err != nil {
-		t.Fatal(err)
+	for attempt := 0; attempt < 3; attempt++ {
+		state, version, err = c.loadAuto(ctx, c.autoKey(r))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if state.Intent == nil {
+			break
+		}
+		if err := c.advanceAutomatic(ctx, r, state, version, api.sts); err != nil {
+			t.Fatal(err)
+		}
 	}
 	state, _, err = c.loadAuto(ctx, c.autoKey(r))
 	if err != nil {
 		t.Fatal(err)
 	}
-	if state.Intent != nil || state.Completed == nil || state.Voters[2].NodeID != quepaxa.NodeID(nextLearner) || state.Identities[quepaxa.NodeID(nextLearner)].PodUID != "new-learner-uid" || state.Identities["learner"].NodeID != "" {
-		t.Fatalf("next committed inventory retained failed identity: %+v", state)
+	if state.Intent != nil || state.Completed == nil || state.Voters[2].NodeID != quepaxa.NodeID(newNodeID) || state.Identities[quepaxa.NodeID(newNodeID)].PodUID != "new-learner-uid" || state.Identities["learner"].NodeID != "" {
+		t.Fatalf("next committed inventory retained failed identity: %+v status=%+v", state, r.Status)
 	}
 }
 

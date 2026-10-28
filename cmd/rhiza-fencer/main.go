@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"log"
 	"net/http"
+	"net/url"
 	"os"
 	"os/signal"
 	"path/filepath"
@@ -19,6 +20,7 @@ import (
 	objectstore "github.com/mrchypark/rhiza/internal/objstore"
 	"github.com/mrchypark/rhiza/pkg/fencing"
 	"github.com/mrchypark/rhiza/pkg/operator"
+	"github.com/mrchypark/rhiza/pkg/recoveryanchor"
 	thanosobjstore "github.com/thanos-io/objstore"
 )
 
@@ -73,8 +75,16 @@ func supervise(ctx context.Context, args []string) error {
 	if err := os.MkdirAll(filepath.Dir(*socket), 0700); err != nil {
 		return err
 	}
-	s := &fencing.Supervisor{Authority: &fencing.AuthorityClient{URL: *endpoint, TokenFile: *token, Client: client}, SocketPath: *socket, Command: f.Args(), Identity: fencing.Identity{SourceClusterID: os.Getenv("RHIZA_CLUSTER_ID"), NodeID: os.Getenv("RHIZA_NODE_ID"), PodUID: os.Getenv("POD_UID")}}
+	s := &fencing.Supervisor{Authority: &fencing.AuthorityClient{URL: *endpoint, TokenFile: *token, Client: client}, SocketPath: *socket, Command: f.Args(), Identity: fencing.Identity{SourceClusterID: os.Getenv("RHIZA_CLUSTER_ID"), NodeID: os.Getenv("RHIZA_NODE_ID"), PodName: os.Getenv("POD_NAME"), PodUID: os.Getenv("POD_UID")}}
 	return s.Run(ctx)
+}
+
+func validateAnchorEndpoint(raw string) error {
+	u, err := url.Parse(raw)
+	if err != nil || raw == "" || u.Scheme != "https" || u.Host == "" || u.User != nil || u.RawQuery != "" || u.ForceQuery || u.Fragment != "" {
+		return fmt.Errorf("anchor: endpoint must be an HTTPS URL without credentials, query, or fragment")
+	}
+	return nil
 }
 
 func serve(ctx context.Context, args []string) error {
@@ -112,7 +122,42 @@ func serve(ctx context.Context, args []string) error {
 	if closer, ok := bucket.(interface{ Close() error }); ok {
 		defer func() { _ = closer.Close() }()
 	}
-	executor := &operator.FencingExecutor{Kube: kube, Bucket: bucket, Prefix: bucketConfig.Prefix}
+	executor := &operator.FencingExecutor{
+		Kube: kube, Bucket: bucket, Prefix: bucketConfig.Prefix,
+		StoreIdentity: operator.StoreIdentity(map[string]string{
+			"RHIZA_OBJSTORE_PROVIDER":                string(bucketConfig.Provider),
+			"RHIZA_OBJSTORE_ENDPOINT":                bucketConfig.Endpoint,
+			"RHIZA_OBJSTORE_BUCKET":                  bucketConfig.Bucket,
+			"RHIZA_OBJSTORE_PREFIX":                  bucketConfig.Prefix,
+			"RHIZA_OBJSTORE_AZURE_STORAGE_ACCOUNT":   bucketConfig.AzureStorageAccount,
+			"RHIZA_OBJSTORE_AZURE_CONNECTION_STRING": bucketConfig.AzureConnectionString,
+		}),
+	}
+	anchorURL, anchorTokenFile := os.Getenv("RHIZA_RECOVERY_ANCHOR_URL"), os.Getenv("RHIZA_RECOVERY_ANCHOR_TOKEN_FILE")
+	anchorCAFile, anchorStorageID := os.Getenv("RHIZA_RECOVERY_ANCHOR_CA_FILE"), os.Getenv("RHIZA_RECOVERY_ANCHOR_STORAGE_ID")
+	if anchorURL != "" || anchorTokenFile != "" || anchorCAFile != "" || anchorStorageID != "" {
+		if anchorURL == "" || anchorTokenFile == "" || anchorStorageID == "" {
+			return fmt.Errorf("DR admission requires RHIZA_RECOVERY_ANCHOR_URL, RHIZA_RECOVERY_ANCHOR_TOKEN_FILE, and explicit RHIZA_RECOVERY_ANCHOR_STORAGE_ID")
+		}
+		if err := validateAnchorEndpoint(anchorURL); err != nil {
+			return err
+		}
+		roots, err := x509.SystemCertPool()
+		if err != nil {
+			return err
+		}
+		if anchorCAFile != "" {
+			data, err := os.ReadFile(anchorCAFile)
+			if err != nil {
+				return fmt.Errorf("read recovery anchor CA: %w", err)
+			}
+			if !roots.AppendCertsFromPEM(data) {
+				return fmt.Errorf("recovery anchor CA contains no certificate")
+			}
+		}
+		executor.Anchor = &recoveryanchor.Client{URL: anchorURL, TokenFile: anchorTokenFile, Client: &http.Client{Timeout: 10 * time.Second, Transport: &http.Transport{TLSClientConfig: &tls.Config{MinVersion: tls.VersionTLS12, RootCAs: roots}}}}
+		executor.AnchorStorageID = anchorStorageID
+	}
 	// Independent evidence is optional and off unless the administrator configures
 	// the whole trust relationship. A partial configuration fails startup.
 	if *attestorURL != "" || *attestorToken != "" || *attestorCA != "" {

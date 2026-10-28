@@ -281,6 +281,42 @@ func (c *Coordinator) Verify(ctx context.Context, req Request, receipt Receipt) 
 	return nil
 }
 
+// VerifyAdmission verifies a committed approval and its live target binding
+// from one fresh record read. Unlike Verify, this boundary is specifically
+// for admitting new recovery work and therefore also rejects PendingWrite.
+func (c *Coordinator) VerifyAdmission(ctx context.Context, req Request, receipt Receipt, expectedBinding Binding, expectedGeneration uint64) error {
+	if c.Backend == nil {
+		return fmt.Errorf("backend is required")
+	}
+	if expectedBinding.ClusterID == "" || expectedBinding.StorageID == "" || expectedGeneration == 0 {
+		return fmt.Errorf("expected binding and generation are required")
+	}
+	rhash, err := RequestHash(req)
+	if err != nil {
+		return err
+	}
+	record, _, err := c.Backend.Read(ctx, req.AnchorID)
+	if err != nil {
+		return fmt.Errorf("read anchor for admission: %w", err)
+	}
+	if record.Version != Version1 || record.EvidenceFormat != c.EvidenceFormat {
+		return fmt.Errorf("record schema mismatch")
+	}
+	if !committed(record, req, rhash) {
+		return fmt.Errorf("record is not committed for this request")
+	}
+	if record.LastTransition == nil || receipt != *record.LastTransition {
+		return fmt.Errorf("receipt does not match stored state")
+	}
+	if receipt.Target != expectedBinding || receipt.Generation != expectedGeneration {
+		return fmt.Errorf("receipt target binding or generation differs from trusted expectation")
+	}
+	if err := CheckBinding(record, expectedBinding, expectedGeneration); err != nil {
+		return fmt.Errorf("live anchor admission binding: %w", err)
+	}
+	return nil
+}
+
 func CheckBinding(record Record, expected Binding, expectedGeneration uint64) error {
 	if record.Version != Version1 {
 		return fmt.Errorf("record version mismatch")

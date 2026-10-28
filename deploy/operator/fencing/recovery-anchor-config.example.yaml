@@ -1,0 +1,14 @@
+# Copy and edit this example only when configuring an external recovery anchor.
+# The deployments do not install or apply this ConfigMap automatically.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: rhiza-recovery-anchor
+  namespace: rhiza
+data:
+  RHIZA_RECOVERY_ANCHOR_URL: https://replace-with-trusted-anchor.example/v1
+  RHIZA_RECOVERY_ANCHOR_TOKEN_FILE: /var/run/secrets/rhiza-recovery-anchor-token/token
+  RHIZA_RECOVERY_ANCHOR_STORAGE_ID: replace-with-exact-trusted-target-storage-id
+  # For a private anchor CA, set RHIZA_RECOVERY_ANCHOR_CA_FILE to
+  # /var/run/secrets/rhiza-recovery-anchor-ca/ca.crt and create the separate
+  # optional rhiza-recovery-anchor-ca ConfigMap containing only the ca.crt key.

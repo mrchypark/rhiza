@@ -130,12 +130,19 @@ func (c *Controller) reconcileMembership(ctx context.Context, r *Resource) error
 
 func (c *Controller) reconcileMembershipAdd(ctx context.Context, r *Resource, sts object, pods map[quepaxa.NodeID]object, statuses map[quepaxa.NodeID]network.MembershipStatus, admin string, current network.MembershipStatus) error {
 	m, journal := r.Spec.Membership, r.Status.Membership
+	retained, managed, err := c.retainedMembershipLearner(ctx, r)
+	if err != nil {
+		return c.recordMembership(ctx, r, "Blocked", err.Error())
+	}
 	var replacement object
 	if err := c.Kube.Get(ctx, c.corePath("pods", m.ReplacementPod), &replacement); err != nil {
 		return c.recordMembership(ctx, r, "Blocked", "replacement learner workload is unavailable")
 	}
 	if err := c.validateMembershipReplacement(ctx, r, sts, replacement); err != nil {
 		return c.recordMembership(ctx, r, "Blocked", err.Error())
+	}
+	if managed && (str(nested(replacement, "metadata", "uid")) != retained.Target.PodUID || retained.Target.Pod != m.ReplacementPod) {
+		return c.recordMembership(ctx, r, "Blocked", "replacement learner differs from retained incarnation history")
 	}
 	endpoint, err := podEndpoint(replacement, r.Spec.Container, "/membership/status")
 	if err != nil {
@@ -144,6 +151,9 @@ func (c *Controller) reconcileMembershipAdd(ctx context.Context, r *Resource, st
 	member, secretUID, secretResourceVer, err := c.replacementMember(ctx, m.ReplacementSecret)
 	if err != nil || member.ID == "" || member.ID == m.Remove {
 		return c.recordMembership(ctx, r, "Blocked", "replacement credentials do not identify a fresh learner")
+	}
+	if managed && (m.ReplacementSecret != retained.CredentialName || secretUID != retained.CredentialUID || string(member.ID) != retained.Target.NodeID) {
+		return c.recordMembership(ctx, r, "Blocked", "replacement credentials differ from the authority-approved learner enrollment")
 	}
 	learner, err := c.membershipStatus(ctx, endpoint, admin)
 	if err != nil || learner.NodeID != member.ID || learner.ClusterID != r.Spec.SourceClusterID || learner.WALIdentity == "" {
@@ -248,13 +258,20 @@ func (c *Controller) validateMembershipReplacement(ctx context.Context, r *Resou
 	}
 	owner := asObject(refs[0])
 	root := str(nested(r.Metadata, "annotations", automaticOwner))
-	if uid == "" || owner["apiVersion"] != "apps/v1" || owner["kind"] != "StatefulSet" || owner["name"] != r.Spec.StatefulSet || owner["uid"] != uid || owner["controller"] != false || str(nested(sts, "spec", "template", "metadata", "annotations", fencingProtocolAnnotation)) != "1" || root == "" || nested(pod, "metadata", "annotations", fencingRootAnnotation) != root || nested(pod, "metadata", "annotations", ownerAnnotation) != r.Spec.Membership.OperationID || r.Spec.Membership.ReplacementSecret != r.Spec.Membership.ReplacementPod+"-credentials" {
+	if uid == "" || owner["apiVersion"] != "apps/v1" || owner["kind"] != "StatefulSet" || owner["name"] != r.Spec.StatefulSet || owner["uid"] != uid || owner["controller"] != false || str(nested(sts, "spec", "template", "metadata", "annotations", fencingProtocolAnnotation)) != "1" || root == "" || nested(pod, "metadata", "annotations", fencingRootAnnotation) != root || nested(pod, "metadata", "annotations", ownerAnnotation) != r.Spec.Membership.OperationID {
 		return fmt.Errorf("replacement learner inventory binding differs")
 	}
 	if err := validateSupervisedPod(pod); err != nil {
 		return err
 	}
-	return (&FencingExecutor{Kube: c.Kube}).validateLearnerBinding(ctx, pod, r.Spec.StatefulSet)
+	credentialName, _, err := (&FencingExecutor{Kube: c.Kube}).learnerCredentialBinding(ctx, pod, r.Spec.StatefulSet)
+	if err != nil {
+		return err
+	}
+	if r.Spec.Membership.ReplacementSecret != credentialName {
+		return fmt.Errorf("replacement learner credential name differs from its registered incarnation")
+	}
+	return nil
 }
 
 func ownedBy(pod object, uid string) bool {

@@ -16,6 +16,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/mrchypark/rhiza/pkg/fencing"
 	"github.com/mrchypark/rhiza/pkg/network"
 	"github.com/mrchypark/rhiza/pkg/quepaxa"
 	"github.com/mrchypark/rhiza/pkg/recovery"
@@ -81,7 +82,9 @@ var clusterDomainRE = regexp.MustCompile(`^[a-z0-9]([-a-z0-9]*[a-z0-9])?(\.[a-z0
 type learnerIncarnation struct {
 	SourceClusterID string             `json:"sourceClusterID"`
 	OperationID     string             `json:"operationID"`
+	LedgerUID       string             `json:"ledgerUID,omitempty"`
 	CredentialUID   string             `json:"credentialUID"`
+	CredentialName  string             `json:"credentialName,omitempty"`
 	Target          FenceTarget        `json:"target"`
 	Retirement      *learnerRetirement `json:"retirement,omitempty"`
 }
@@ -96,6 +99,21 @@ type bootstrapCandidate struct {
 	LogicalID, StatefulSet, StatefulSetUID   string
 	AdoptClusterID, Container, ClusterDomain string
 	ServiceName                              string
+}
+
+type bootstrapLedgerPin struct {
+	Version           int    `json:"version"`
+	OperationID       string `json:"operationID"`
+	RequestHash       string `json:"requestHash"`
+	AuthorizationHash string `json:"authorizationHash"`
+	RootUID           string `json:"rootUID"`
+	StatefulSetUID    string `json:"statefulSetUID"`
+	SourceClusterID   string `json:"sourceClusterID"`
+	CredentialName    string `json:"credentialName"`
+	CredentialUID     string `json:"credentialUID"`
+	MembershipHash    string `json:"membershipHash"`
+	ProfileHash       string `json:"profileHash"`
+	LedgerUID         string `json:"ledgerUID"`
 }
 
 // autoCompletion records an installed outcome, independently of later health.
@@ -623,11 +641,19 @@ func (c *Controller) bootstrapCandidateKey(r *ClusterResource) string {
 	return path.Join(c.Prefix, "automatic-bootstrap", c.Kube.Namespace, r.Spec.StatefulSet+".json")
 }
 
+func (c *Controller) bootstrapLedgerPinKey(r *ClusterResource) string {
+	return path.Join(c.Prefix, "automatic-bootstrap", c.Kube.Namespace, r.Spec.StatefulSet+"-ledger.json")
+}
+
+func bootstrapOperationID(rootUID, stsUID string, candidate bootstrapCandidate) string {
+	return "bootstrap-" + shortID(rootUID+":"+stsUID+":"+hashJSON(candidate))
+}
+
 func expectedBootstrapCandidate(r *ClusterResource, sts object) bootstrapCandidate {
 	return bootstrapCandidate{Version: 1, VoterCount: r.Spec.VoterCount, HTTPPort: r.Spec.HTTPPort, PeerPort: r.Spec.PeerPort, LogicalID: r.Spec.LogicalID, StatefulSet: r.Spec.StatefulSet, StatefulSetUID: str(nested(sts, "metadata", "uid")), AdoptClusterID: r.Spec.AdoptClusterID, Container: r.Spec.Container, ClusterDomain: r.Spec.ClusterDomain, ServiceName: str(nested(sts, "spec", "serviceName"))}
 }
 
-func bootstrapTemplateInstalled(ctr object, r *ClusterResource) bool {
+func bootstrapTemplateInstalled(sts object, ctr object, r *ClusterResource) bool {
 	secretName := bootstrapSecretName(r)
 	found := false
 	peersCleared := false
@@ -640,7 +666,142 @@ func bootstrapTemplateInstalled(ctr object, r *ClusterResource) bool {
 			peersCleared = str(entry["value"]) == ""
 		}
 	}
-	return found && peersCleared
+	operationID := bootstrapOperationID(str(r.Metadata["uid"]), str(nested(sts, "metadata", "uid")), expectedBootstrapCandidate(r, sts))
+	templateAnnotations := nested(sts, "spec", "template", "metadata", "annotations")
+	init := list(nested(sts, "spec", "template", "spec", "initContainers"))
+	return found && peersCleared && str(asObject(templateAnnotations)[fencingPrepareOperationAnnotation]) == operationID && len(init) == 1 && str(asObject(init[0])["name"]) == prepareInitContainerName && str(nested(sts, "spec", "podManagementPolicy")) == "Parallel"
+}
+
+func (c *Controller) ensureBootstrapLedger(ctx context.Context, r *ClusterResource, sts object, secretName, secretUID, profileHash string, members []quepaxa.Member) (bootstrapLedgerPin, error) {
+	rootUID := str(r.Metadata["uid"])
+	stsUID := str(nested(sts, "metadata", "uid"))
+	if rootUID == "" || stsUID == "" || secretName == "" || secretUID == "" || profileHash == "" || len(members) != r.Spec.VoterCount {
+		return bootstrapLedgerPin{}, fmt.Errorf("bootstrap authority binding is incomplete")
+	}
+	candidate := expectedBootstrapCandidate(r, sts)
+	requestHash := hashJSON(candidate)
+	membershipHash := hashJSON(members)
+	authorizationHash := hashJSON(struct {
+		RootUID, StatefulSetUID, SourceClusterID, CredentialName, CredentialUID, MembershipHash, ProfileHash string
+	}{rootUID, stsUID, r.Spec.AdoptClusterID, secretName, secretUID, membershipHash, profileHash})
+	operationID := bootstrapOperationID(rootUID, stsUID, candidate)
+	operation := fencing.BootstrapOperation{OperationID: operationID, RequestHash: requestHash, AuthorizationHash: authorizationHash, Purpose: fencing.BootstrapInitial, RootUID: rootUID, StatefulSetUID: stsUID, SourceClusterID: r.Spec.AdoptClusterID}
+	executor := &FencingExecutor{Kube: c.Kube}
+	_, err := executor.change(ctx, stsUID, r.Spec.AdoptClusterID, func(ledger *fencing.Ledger) error {
+		if len(ledger.Runs) != 0 || ledger.ClosedBy != "" || ledger.PeerClosure != nil {
+			return fmt.Errorf("bootstrap refuses a nonempty fencing ledger")
+		}
+		return ledger.InstallBootstrapOperation(operation)
+	})
+	if err != nil {
+		return bootstrapLedgerPin{}, err
+	}
+	state, ledgerUID, resource, err := executor.readWithUID(ctx, stsUID, r.Spec.AdoptClusterID)
+	if err != nil {
+		return bootstrapLedgerPin{}, err
+	}
+	verifiedUID, err := executor.registrationLedgerObjectUID(resource, stsUID, r.Spec.AdoptClusterID)
+	if err != nil || verifiedUID != ledgerUID || state.Ledger.Bootstrap == nil {
+		return bootstrapLedgerPin{}, fmt.Errorf("bootstrap fencing ledger identity is unavailable")
+	}
+	pin := bootstrapLedgerPin{Version: 1, OperationID: operationID, RequestHash: requestHash, AuthorizationHash: authorizationHash, RootUID: rootUID, StatefulSetUID: stsUID, SourceClusterID: r.Spec.AdoptClusterID, CredentialName: secretName, CredentialUID: secretUID, MembershipHash: membershipHash, ProfileHash: profileHash, LedgerUID: ledgerUID}
+	if err := c.immutable(ctx, c.bootstrapLedgerPinKey(r), jsonBytes(pin)); err != nil {
+		return bootstrapLedgerPin{}, fmt.Errorf("bootstrap ledger identity pin is unavailable or differs")
+	}
+	return pin, nil
+}
+
+func installPrepareInitProfile(sts object, ctr object, operationID, rootUID string) error {
+	if operationID == "" || rootUID == "" || str(nested(sts, "metadata", "uid")) == "" {
+		return fmt.Errorf("prepare init operation binding is incomplete")
+	}
+	if err := validateSupervisedPod(object{"metadata": object{"annotations": object{fencingProtocolAnnotation: "1"}}, "spec": object{"containers": []any{ctr}, "volumes": list(nested(sts, "spec", "template", "spec", "volumes"))}}); err != nil {
+		return fmt.Errorf("prepare init requires a supervised workload template: %w", err)
+	}
+	spec := asObject(nested(sts, "spec", "template", "spec"))
+	main := asObject(list(spec["containers"])[0])
+	envs := make(map[string]object)
+	for _, raw := range list(main["env"]) {
+		entry := asObject(raw)
+		envs[str(entry["name"])] = entry
+	}
+	prepareEnv := make([]any, 0, len(envs)+4)
+	copiedEnv := make(map[string]bool, len(envs))
+	for _, name := range []string{"RHIZA_CLUSTER_ID", "RHIZA_NODE_ID", "RHIZA_CLUSTER_MEMBERS", "RHIZA_DATA_DIR", "FENCER_AUTHORITY_URL", "FENCER_CA_FILE"} {
+		if envs[name] == nil {
+			return fmt.Errorf("prepare init requires main environment %s", name)
+		}
+	}
+	for _, raw := range list(main["env"]) {
+		entry := asObject(raw)
+		name := str(entry["name"])
+		if !prepareInitEnvironmentName(name) {
+			continue
+		}
+		if copiedEnv[name] {
+			return fmt.Errorf("prepare init cannot safely copy duplicate environment %s", name)
+		}
+		copiedEnv[name] = true
+		copy := object{}
+		for key, value := range entry {
+			copy[key] = value
+		}
+		prepareEnv = append(prepareEnv, copy)
+	}
+	prepareEnv = append(prepareEnv,
+		object{"name": "POD_UID", "valueFrom": object{"fieldRef": object{"fieldPath": "metadata.uid"}}},
+		object{"name": "POD_NAME", "valueFrom": object{"fieldRef": object{"fieldPath": "metadata.name"}}},
+		object{"name": "RHIZA_PREPARED_POD_UID", "valueFrom": object{"fieldRef": object{"fieldPath": "metadata.uid"}}},
+		object{"name": "RHIZA_PREPARE_OPERATION_ID", "valueFrom": object{"fieldRef": object{"fieldPath": "metadata.annotations['" + fencingPrepareOperationAnnotation + "']"}}},
+	)
+	mounts := make([]any, 0, len(list(main["volumeMounts"])))
+	for _, raw := range list(main["volumeMounts"]) {
+		mount := object{}
+		for key, value := range asObject(raw) {
+			mount[key] = value
+		}
+		mounts = append(mounts, mount)
+	}
+	init := object{"name": prepareInitContainerName, "image": main["image"], "command": []any{"/usr/local/bin/rhiza"}, "args": []any{"--prepare-restore"}, "env": prepareEnv, "volumeMounts": mounts, "securityContext": main["securityContext"]}
+	spec["initContainers"] = []any{init}
+	asObject(sts["spec"])["podManagementPolicy"] = "Parallel"
+	templateMeta := asObject(nested(sts, "spec", "template", "metadata"))
+	if templateMeta == nil {
+		templateMeta = object{}
+		asObject(nested(sts, "spec", "template"))["metadata"] = templateMeta
+	}
+	annotations := asObject(templateMeta["annotations"])
+	if annotations == nil {
+		annotations = object{}
+		templateMeta["annotations"] = annotations
+	}
+	if old := str(annotations[fencingPrepareOperationAnnotation]); old != "" && old != operationID {
+		return fmt.Errorf("prepare init operation annotation changed")
+	}
+	if old := str(annotations[fencingRootAnnotation]); old != "" && old != rootUID {
+		return fmt.Errorf("prepare init root annotation changed")
+	}
+	annotations[fencingProtocolAnnotation] = "1"
+	annotations[fencingPrepareOperationAnnotation] = operationID
+	annotations[fencingRootAnnotation] = rootUID
+	return nil
+}
+
+func prepareInitEnvironmentName(name string) bool {
+	return name == "RHIZA_CLUSTER_ID" || name == "RHIZA_NODE_ID" || name == "RHIZA_CLUSTER_MEMBERS" ||
+		name == "RHIZA_DATA_DIR" || name == "RHIZA_ENABLE_RECONFIGURATION" || name == "RHIZA_FILESYSTEM_DIR" ||
+		name == "AWS_REGION" || name == "FENCER_AUTHORITY_URL" || name == "FENCER_CA_FILE" || strings.HasPrefix(name, "RHIZA_OBJSTORE_")
+}
+
+func prepareProfileHash(sts object) string {
+	template := asObject(nested(sts, "spec", "template"))
+	spec := asObject(template["spec"])
+	containers := list(spec["containers"])
+	init := list(spec["initContainers"])
+	if len(containers) != 1 || len(init) != 1 {
+		return ""
+	}
+	return hashJSON(object{"image": asObject(containers[0])["image"], "init": init[0], "volumes": spec["volumes"]})
 }
 
 func (c *Controller) installBootstrapCredentials(ctx context.Context, r *ClusterResource, sts, ctr object) error {
@@ -656,7 +817,23 @@ func (c *Controller) installBootstrapCredentials(ctx context.Context, r *Cluster
 	if len(members) != r.Spec.VoterCount {
 		return fmt.Errorf("bootstrap generated %d voters but voterCount is %d", len(members), r.Spec.VoterCount)
 	}
+	var secret object
+	if err := c.Kube.Get(ctx, c.corePath("secrets", secretName), &secret); err != nil {
+		return fmt.Errorf("bootstrap credential object cannot be read back")
+	}
+	secretUID := str(nested(secret, "metadata", "uid"))
+	if secretUID == "" || secret["immutable"] != true || str(nested(secret, "metadata", "annotations", ownerAnnotation)) != c.operationID(&Resource{Metadata: object{"uid": str(r.Metadata["uid"])}, Spec: Spec{RecoveryID: r.Spec.LogicalID}, Status: Status{Target: r.Spec.AdoptClusterID}}) {
+		return fmt.Errorf("bootstrap credential object is not immutable and workload-bound")
+	}
 	applyTargetCredentials(ctr, secretName)
+	operationID := bootstrapOperationID(str(r.Metadata["uid"]), str(nested(sts, "metadata", "uid")), expectedBootstrapCandidate(r, sts))
+	if err := installPrepareInitProfile(sts, ctr, operationID, str(r.Metadata["uid"])); err != nil {
+		return err
+	}
+	profileHash := prepareProfileHash(sts)
+	if _, err := c.ensureBootstrapLedger(ctx, r, sts, secretName, secretUID, profileHash, members); err != nil {
+		return fmt.Errorf("bootstrap fencing intent could not be retained: %w", err)
+	}
 	asObject(sts["spec"])["replicas"] = float64(0)
 	return c.Kube.Put(ctx, c.stsPath(r.Spec.StatefulSet), sts, &sts)
 }
@@ -676,10 +853,7 @@ func (c *Controller) reconcileBootstrap(ctx context.Context, r *ClusterResource,
 	if err != nil {
 		return false, "", err
 	}
-	if len(pods) != 0 {
-		return false, "", fmt.Errorf("fresh bootstrap refuses to start while writer Pods already exist")
-	}
-	templateInstalled := bootstrapTemplateInstalled(ctr, r)
+	templateInstalled := bootstrapTemplateInstalled(sts, ctr, r)
 	if !templateInstalled && int(number(nested(sts, "spec", "replicas"))) != 0 {
 		return false, "", fmt.Errorf("fresh bootstrap requires replicas=0 until credentials and template are installed; observed %d", number(nested(sts, "spec", "replicas")))
 	}
@@ -711,6 +885,30 @@ func (c *Controller) reconcileBootstrap(ctx context.Context, r *ClusterResource,
 			return false, "", fmt.Errorf("fresh bootstrap reservation differs from the current workload contract")
 		}
 	}
+	if templateInstalled {
+		canCreateBinding := len(pods) == 0 && int(number(nested(sts, "spec", "replicas"))) == 0
+		if err := c.ensureBootstrapAutoBinding(ctx, r, sts, canCreateBinding); err != nil {
+			return false, "", err
+		}
+		complete, err := c.bootstrapOperationComplete(ctx, r)
+		if err != nil {
+			return false, "", err
+		}
+		if complete {
+			return false, "", nil
+		}
+	} else if len(pods) != 0 {
+		return false, "", fmt.Errorf("fresh bootstrap refuses Pods before its fixed init profile is installed")
+	}
+	if len(pods) != 0 {
+		if !templateInstalled || int(number(nested(sts, "spec", "replicas"))) != r.Spec.VoterCount {
+			return false, "", fmt.Errorf("fresh bootstrap refuses Pods before its fixed init profile and replica contract are installed")
+		}
+		if err := c.assignBootstrapPods(ctx, r, sts, pods); err != nil {
+			return false, "", err
+		}
+		return true, "bootstrap init assignments retained; awaiting safe initialization", nil
+	}
 	if !templateInstalled {
 		current, currentCtr, err := c.writerFreeBootstrapTarget(ctx, r, sts)
 		if err != nil {
@@ -738,9 +936,103 @@ func (c *Controller) reconcileBootstrap(ctx context.Context, r *ClusterResource,
 		return true, "bootstrap membership installed; starting voters", nil
 	}
 	if adopted {
-		return false, "", nil
+		return true, "bootstrap is installed; waiting for assigned Pods", nil
 	}
 	return true, "bootstrap installed credentials but the workload is not exporting its bootstrap membership", nil
+}
+
+// ensureBootstrapAutoBinding commits the normal durable workload binding while
+// the StatefulSet is still writer-free. A later reconcile never repairs a
+// missing control record after Pods have been allowed to start.
+func (c *Controller) ensureBootstrapAutoBinding(ctx context.Context, r *ClusterResource, sts object, allowCreate bool) error {
+	uid := str(nested(sts, "metadata", "uid"))
+	voters, err := derivedVoters(r, sts)
+	if err != nil {
+		return err
+	}
+	key := c.autoKey(r)
+	state, _, err := c.loadAuto(ctx, key)
+	if err != nil {
+		if !c.Bucket.IsObjNotFoundErr(err) || !allowCreate {
+			return fmt.Errorf("bootstrap automatic control is unavailable before writer admission: %w", err)
+		}
+		if err := c.requireUnstartedBootstrap(ctx, r); err != nil {
+			return err
+		}
+		bindingKey := path.Join(c.Prefix, "automatic-workloads", c.Kube.Namespace, uid, "binding.json")
+		if exists, checkErr := c.Bucket.Exists(ctx, bindingKey); checkErr != nil || exists {
+			if checkErr != nil {
+				return fmt.Errorf("bootstrap workload binding is unavailable: %w", checkErr)
+			}
+			return fmt.Errorf("bootstrap workload has a binding without its control record")
+		}
+		state = &autoControl{
+			Version: 1, BindingUID: str(r.Metadata["uid"]), BindingHash: autoBinding(r),
+			BindingVersion: autoBindingVersion, StatefulSetUID: uid,
+			ActiveClusterID: r.Spec.AdoptClusterID, Voters: voters,
+			Identities: map[quepaxa.NodeID]FenceTarget{},
+		}
+		if err := c.saveAuto(ctx, r, state, nil); err != nil {
+			// Resolve an uncertain create only by reading the immutable expected
+			// value back; never overwrite another controller's control record.
+			state, _, err = c.loadAuto(ctx, key)
+			if err != nil {
+				return fmt.Errorf("bootstrap automatic control create is uncertain: %w", err)
+			}
+		}
+	}
+	if state.BindingUID != str(r.Metadata["uid"]) || state.BindingHash != autoBinding(r) ||
+		state.BindingVersion != autoBindingVersion || state.StatefulSetUID != uid ||
+		state.ActiveClusterID != r.Spec.AdoptClusterID || !bytes.Equal(jsonBytes(state.Voters), jsonBytes(voters)) {
+		return fmt.Errorf("bootstrap automatic control differs from the writer-free workload")
+	}
+	if err := c.claimAutoBinding(ctx, r, state, uid); err != nil {
+		// A concurrent identical claim is safe only when the exact binding can
+		// be read back; a conflicting or unreadable record remains a refusal.
+		if _, readErr := c.readAutoBinding(ctx, r, state, uid); readErr != nil {
+			return fmt.Errorf("bootstrap workload binding claim is uncertain: %w", readErr)
+		}
+	}
+	if _, err := c.readAutoBinding(ctx, r, state, uid); err != nil {
+		return fmt.Errorf("bootstrap workload binding readback failed: %w", err)
+	}
+	return nil
+}
+
+func (c *Controller) requireUnstartedBootstrap(ctx context.Context, r *ClusterResource) error {
+	pin, err := c.readBootstrapLedgerPin(ctx, r)
+	if err != nil {
+		return err
+	}
+	state, ledgerUID, _, err := (&FencingExecutor{Kube: c.Kube}).readWithUID(ctx, pin.StatefulSetUID, pin.SourceClusterID)
+	if err != nil {
+		return err
+	}
+	if ledgerUID != pin.LedgerUID || validateBootstrapLedgerOperation(state.Ledger, pin) != nil ||
+		len(state.Ledger.Runs) != 0 || state.Ledger.ClosedBy != "" || len(state.Ledger.ClosedNodes) != 0 || state.Ledger.PeerClosure != nil {
+		return fmt.Errorf("bootstrap control cannot be recreated after runtime or closure state exists")
+	}
+	operation := state.Ledger.Bootstrap.Operations[pin.OperationID]
+	if operation.Complete || operation.AdmissionClosed || len(operation.Assignments) != 0 || len(operation.Attempts) != 0 {
+		return fmt.Errorf("bootstrap control cannot be recreated after Pod assignment")
+	}
+	return nil
+}
+
+func (c *Controller) bootstrapOperationComplete(ctx context.Context, r *ClusterResource) (bool, error) {
+	pin, err := c.readBootstrapLedgerPin(ctx, r)
+	if err != nil {
+		return false, err
+	}
+	state, ledgerUID, _, err := (&FencingExecutor{Kube: c.Kube}).readWithUID(ctx, pin.StatefulSetUID, pin.SourceClusterID)
+	if err != nil {
+		return false, err
+	}
+	if ledgerUID != pin.LedgerUID || validateBootstrapLedgerOperation(state.Ledger, pin) != nil {
+		return false, fencing.ErrPending
+	}
+	operation, ok := state.Ledger.Bootstrap.Operations[pin.OperationID]
+	return ok && operation.Complete, nil
 }
 
 func (c *Controller) writerFreeBootstrapTarget(ctx context.Context, r *ClusterResource, sts object) (object, object, error) {
@@ -829,23 +1121,29 @@ func (c *Controller) reconcileCluster(ctx context.Context, r *ClusterResource) e
 	if err != nil {
 		return block(nil, err.Error())
 	}
-	if state == nil {
+	// A durable automatic intent always retains priority, including its exact
+	// captured fence target and finite abort progression. Bootstrap is only an
+	// initialization/resume path when no automatic recovery is active.
+	if state == nil || state.Intent == nil {
 		candidateExists, err := c.Bucket.Exists(ctx, c.bootstrapCandidateKey(r))
 		if err != nil {
-			return block(nil, "object store unavailable while checking bootstrap reservation: "+err.Error())
+			return block(state, "object store unavailable while checking bootstrap reservation: "+err.Error())
 		}
-		if candidateExists || (!adopted && r.Spec.Bootstrap) {
+		if candidateExists || (state == nil && !adopted && r.Spec.Bootstrap) {
 			if err := validateClusterRuntime(r, ctr, env); err != nil {
-				return block(nil, err.Error())
+				return block(state, err.Error())
 			}
 			handled, message, err := c.reconcileBootstrap(ctx, r, sts, ctr, adopted)
 			if err != nil {
-				return block(nil, err.Error())
+				return block(state, err.Error())
+			}
+			if message == "" {
+				message = "bootstrap operation is complete; resuming normal observation"
 			}
 			if handled {
-				return c.autoStatus(ctx, r, nil, "Observing", message)
+				return c.autoStatus(ctx, r, state, "Observing", message)
 			}
-		} else if !adopted {
+		} else if state == nil && !adopted {
 			return block(nil, "RHIZA_CLUSTER_MEMBERS is empty; set spec.bootstrap: true for a fresh workload or export RHIZA_CLUSTER_MEMBERS")
 		}
 	}
@@ -1120,7 +1418,13 @@ func (c *Controller) observeAutomatic(ctx context.Context, r *ClusterResource, s
 		if uid == "" || uid != str(nested(current, "metadata", "uid")) || nested(pod, "status", "podIP") != nested(current, "status", "podIP") {
 			return obs, nil, fmt.Errorf("voter Pod changed during authentication")
 		}
-		state.Identities[ref.NodeID] = capturedFenceIdentity(FenceTarget{NodeID: string(ref.NodeID), Pod: ref.Pod, PodUID: uid, WALIdentity: status.WALIdentity}, current)
+		observedIdentity := capturedFenceIdentity(FenceTarget{NodeID: string(ref.NodeID), Pod: ref.Pod, PodUID: uid, WALIdentity: status.WALIdentity}, current)
+		if previous, exists := state.Identities[ref.NodeID]; exists {
+			if err := validateStableVoterIdentity(previous, observedIdentity); err != nil {
+				return obs, nil, err
+			}
+		}
+		state.Identities[ref.NodeID] = observedIdentity
 		statuses[ref.NodeID] = status
 		if probeState == quorumProbeAvailable {
 			obs.QuorumVerified = true
@@ -1128,6 +1432,19 @@ func (c *Controller) observeAutomatic(ctx context.Context, r *ClusterResource, s
 	}
 	obs.Reachable = len(statuses)
 	return obs, statuses, nil
+}
+
+// validateStableVoterIdentity prevents a fresh Pod incarnation from silently
+// replacing the last durable voter identity under the same consensus NodeID.
+// Replacement requires the explicit retirement/reconfiguration path.
+func validateStableVoterIdentity(previous, observed FenceTarget) error {
+	if previous.NodeID == "" || previous.Pod == "" || previous.PodUID == "" || previous.WALIdentity == "" {
+		return fmt.Errorf("voter identity history is incomplete")
+	}
+	if previous.NodeID != observed.NodeID || previous.Pod != observed.Pod || previous.PodUID != observed.PodUID || previous.WALIdentity != observed.WALIdentity {
+		return fmt.Errorf("voter incarnation changed without terminal replacement proof")
+	}
+	return nil
 }
 
 func nodeIDs(voters []string) []quepaxa.NodeID {

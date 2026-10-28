@@ -21,6 +21,45 @@ type EvidenceOptions struct {
 	ExpectedOperationID  string
 }
 
+// VerifyExpectedAnchorForView checks the selected archive view against the
+// complete trusted recovery contract. The expectations must come from an
+// authorization or immutable registration, never from the selected view.
+func VerifyExpectedAnchorForView(ctx context.Context, view CertifiedArchiveView, opts EvidenceOptions) (GenerationAnchor, error) {
+	if err := validateEvidenceOptions(opts); err != nil {
+		return GenerationAnchor{}, err
+	}
+	anchor, err := VerifyGenerationAnchorForView(ctx, view, opts.ExpectedMembership, opts.ExpectedAnchorHash)
+	if err != nil {
+		return GenerationAnchor{}, err
+	}
+	if anchor.SourceTip != opts.ExpectedForkResult.Tip || anchor.SourceManifest != opts.ExpectedForkResult.ManifestHash || anchor.SourcePrefixHash != opts.ExpectedForkResult.PrefixHash {
+		return GenerationAnchor{}, fmt.Errorf("generation anchor does not match expected fork result")
+	}
+	if anchor.SourcePrefix != opts.ExpectedSourcePrefix {
+		return GenerationAnchor{}, fmt.Errorf("generation anchor source prefix does not match")
+	}
+	if anchor.OperationID != opts.ExpectedOperationID {
+		return GenerationAnchor{}, fmt.Errorf("generation anchor operation ID does not match")
+	}
+	return anchor, nil
+}
+
+func validateEvidenceOptions(opts EvidenceOptions) error {
+	if opts.ExpectedAnchorHash == ([32]byte{}) || opts.ExpectedMembership.Version != MembershipRecordVersion {
+		return fmt.Errorf("expected generation anchor and immutable membership are required")
+	}
+	if opts.ExpectedForkResult.Tip == 0 || !validForkHash(opts.ExpectedForkResult.ManifestHash) || !validForkHash(opts.ExpectedForkResult.PrefixHash) {
+		return fmt.Errorf("expected fork result is required")
+	}
+	if opts.ExpectedSourcePrefix == "" {
+		return fmt.Errorf("expected source prefix is required")
+	}
+	if opts.ExpectedOperationID == "" {
+		return fmt.Errorf("expected operation ID is required")
+	}
+	return nil
+}
+
 // ApplicationEvidence is the verified anchor and restored tip returned by
 // RecoverApplicationEvidence after the callback succeeds.
 type ApplicationEvidence struct {
@@ -56,17 +95,8 @@ func RecoverApplicationEvidence(ctx context.Context, bucket objstore.Bucket, tar
 	if fn == nil {
 		return ApplicationEvidence{}, fmt.Errorf("recovery callback is required")
 	}
-	if opts.ExpectedAnchorHash == ([32]byte{}) || opts.ExpectedMembership.Version != MembershipRecordVersion {
-		return ApplicationEvidence{}, fmt.Errorf("expected generation anchor and immutable membership are required")
-	}
-	if opts.ExpectedForkResult.Tip == 0 {
-		return ApplicationEvidence{}, fmt.Errorf("expected fork result is required")
-	}
-	if opts.ExpectedSourcePrefix == "" {
-		return ApplicationEvidence{}, fmt.Errorf("expected source prefix is required")
-	}
-	if opts.ExpectedOperationID == "" {
-		return ApplicationEvidence{}, fmt.Errorf("expected operation ID is required")
+	if err := validateEvidenceOptions(opts); err != nil {
+		return ApplicationEvidence{}, err
 	}
 
 	// Verify the anchor against caller-trusted values and bucket state.
@@ -76,14 +106,8 @@ func RecoverApplicationEvidence(ctx context.Context, bucket objstore.Bucket, tar
 	}
 
 	// Bind the anchor against the caller-provided fork result and contract.
-	if anchor.SourceTip != opts.ExpectedForkResult.Tip || anchor.SourceManifest != opts.ExpectedForkResult.ManifestHash || anchor.SourcePrefixHash != opts.ExpectedForkResult.PrefixHash {
-		return ApplicationEvidence{}, fmt.Errorf("generation anchor does not match expected fork result")
-	}
-	if anchor.SourcePrefix != opts.ExpectedSourcePrefix {
-		return ApplicationEvidence{}, fmt.Errorf("generation anchor source prefix does not match")
-	}
-	if anchor.OperationID != opts.ExpectedOperationID {
-		return ApplicationEvidence{}, fmt.Errorf("generation anchor operation ID does not match")
+	if anchor.SourceTip != opts.ExpectedForkResult.Tip || anchor.SourceManifest != opts.ExpectedForkResult.ManifestHash || anchor.SourcePrefixHash != opts.ExpectedForkResult.PrefixHash || anchor.SourcePrefix != opts.ExpectedSourcePrefix || anchor.OperationID != opts.ExpectedOperationID {
+		return ApplicationEvidence{}, fmt.Errorf("generation anchor does not match expected recovery contract")
 	}
 
 	// Pin the immutable checkpoint root.

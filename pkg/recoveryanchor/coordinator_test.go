@@ -182,6 +182,38 @@ func TestActivateSuccess(t *testing.T) {
 	}
 }
 
+func TestVerifyAdmissionRequiresFreshExactCommittedBinding(t *testing.T) {
+	be := newInMemoryBackend()
+	seedRecord(be, "a1", seededRecord(Binding{ClusterID: "src", StorageID: "src/pfx"}, 0, []byte("base-ev")))
+	co := &Coordinator{Backend: be, EvidenceFormat: "test/v1", Verifier: goodVerifier}
+	ctx := context.Background()
+	req := makeRequest("a1", "admission")
+	receipt, err := co.Activate(ctx, req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := co.VerifyAdmission(ctx, req, receipt, receipt.Target, receipt.Generation); err != nil {
+		t.Fatalf("valid committed approval rejected: %v", err)
+	}
+	if err := co.VerifyAdmission(ctx, req, receipt, Binding{ClusterID: "tgt", StorageID: "guessed-prefix"}, receipt.Generation); err == nil {
+		t.Fatal("untrusted storage binding accepted")
+	}
+	if err := co.VerifyAdmission(ctx, req, receipt, receipt.Target, receipt.Generation+1); err == nil {
+		t.Fatal("wrong live generation accepted")
+	}
+	record, version, err := be.Read(ctx, "a1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	record.PendingWrite = true
+	if err := be.CAS(ctx, "a1", version, record); err != nil {
+		t.Fatal(err)
+	}
+	if err := co.VerifyAdmission(ctx, req, receipt, receipt.Target, receipt.Generation); err == nil {
+		t.Fatal("committed receipt bypassed a live PendingWrite")
+	}
+}
+
 func TestActivateIdempotent(t *testing.T) {
 	be := newInMemoryBackend()
 	seedRecord(be, "a1", seededRecord(Binding{ClusterID: "src", StorageID: "src/pfx"}, 0, []byte("ev")))

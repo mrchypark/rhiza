@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"path"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -13,7 +14,7 @@ import (
 )
 
 func TestStoppingDeletesOnlyFencedStandaloneLearner(t *testing.T) {
-	for _, scenario := range []string{"bound", "never-bound", "unknown-run", "bind-response-lost", "tampered-ledger", "history-operation", "history-credential", "duplicate-history", "scope-denied", "manual", "scale-first", "no-proof", "incomplete-proof", "voter-proof", "reused-uid", "delete-conflict", "controller", "unrelated", "wrong-owner", "wrong-operation", "wrong-credential", "changed-intent"} {
+	for _, scenario := range []string{"bound", "never-bound", "unknown-run", "bind-response-lost", "tampered-ledger", "history-operation", "history-credential", "history-ledger-uid-missing", "recreated-ledger", "recreated-credential", "duplicate-history", "scope-denied", "manual", "scale-first", "no-proof", "incomplete-proof", "voter-proof", "reused-uid", "delete-conflict", "controller", "unrelated", "wrong-owner", "wrong-operation", "wrong-credential", "changed-intent", "no-admission-closure"} {
 		t.Run(scenario, func(t *testing.T) {
 			ctx, _, r, api, c := controllerFixture(t, "before-ack", "before-ack")
 			r.Metadata["annotations"] = object{automaticOwner: "root-uid", automaticLogical: "logical"}
@@ -23,10 +24,17 @@ func TestStoppingDeletesOnlyFencedStandaloneLearner(t *testing.T) {
 			asObject(api.sts["metadata"])["annotations"] = object{ownerAnnotation: c.operationID(r)}
 			asObject(api.sts["spec"])["replicas"] = float64(0)
 			pod := supervisedTestPod()
+			container := asObject(list(nested(pod, "spec", "containers"))[0])
+			container["name"] = "rhiza"
+			container["env"] = []any{object{"name": "RHIZA_CLUSTER_ID", "value": "source"}}
 			owner := object{"apiVersion": "apps/v1", "kind": "StatefulSet", "name": "rhiza", "uid": "sts-uid", "controller": false}
 			annotations := object{fencingProtocolAnnotation: "1", fencingRootAnnotation: "root-uid", fencingCredentialAnnotation: "credential-uid", ownerAnnotation: "original-online-op"}
 			pod["metadata"] = object{"name": "learner", "uid": "learner-uid", "ownerReferences": []any{owner}, "annotations": annotations, "labels": object{"rhiza.mrchypark.dev/automatic-learner": "learner"}}
-			request := FenceRequest{LogicalID: "logical", BindingUID: "root-uid", Namespace: "default", StatefulSet: "rhiza", StatefulSetUID: "sts-uid", SourceClusterID: "source", OperationID: "recover", Scope: ScopeGeneration, Targets: []FenceTarget{{NodeID: "learner", Pod: "learner", PodUID: "learner-uid", WALIdentity: strings.Repeat("a", 64)}}}
+			nodeID, err := fencing.ReplacementNodeID("learner-uid")
+			if err != nil {
+				t.Fatal(err)
+			}
+			request := FenceRequest{LogicalID: "logical", BindingUID: "root-uid", Namespace: "default", StatefulSet: "rhiza", StatefulSetUID: "sts-uid", SourceClusterID: "source", OperationID: "recover", Scope: ScopeGeneration, Targets: []FenceTarget{{NodeID: nodeID, Pod: "learner", PodUID: "learner-uid", WALIdentity: strings.Repeat("a", 64)}}}
 			if scenario == "voter-proof" {
 				request.Scope = ScopeVoter
 			}
@@ -41,28 +49,47 @@ func TestStoppingDeletesOnlyFencedStandaloneLearner(t *testing.T) {
 			state := validAutoControl()
 			state.BindingUID, state.StatefulSetUID = "root-uid", "sts-uid"
 			state.Intent = &autoIntent{Request: request, RecoveryName: resourceName(r), RecoveryUID: str(r.Metadata["uid"]), SpecHash: hashJSON(r.Spec), Proof: &FenceProof{OperationID: request.OperationID, BindingUID: request.BindingUID, SourceClusterID: request.SourceClusterID, RequestHash: hash, ProofID: r.Spec.Fence.Evidence, ProcessesTerminated: true, RecreationBlocked: true, StorageQuiesced: true}}
-			state.Learners = []learnerIncarnation{{SourceClusterID: "source", OperationID: "original-online-op", CredentialUID: "credential-uid", Target: request.Targets[0]}}
+			credentialName := (&FencingExecutor{Kube: c.Kube}).incarnationSecretName("root-uid", "sts-uid", fencing.Identity{SourceClusterID: "source", NodeID: nodeID, PodName: "learner", PodUID: "learner-uid"})
+			ledgerUID := "ledger-uid"
+			if scenario == "history-ledger-uid-missing" {
+				ledgerUID = ""
+			}
+			state.Learners = []learnerIncarnation{{SourceClusterID: "source", OperationID: "original-online-op", LedgerUID: ledgerUID, CredentialUID: "credential-uid", CredentialName: credentialName, Target: request.Targets[0]}}
 			ledger := fenceLedger{StatefulSetUID: "sts-uid", Ledger: fencing.Ledger{SourceClusterID: "source"}}
+			id := fencing.Identity{SourceClusterID: "source", NodeID: nodeID, PodName: "learner", PodUID: "learner-uid", CredentialName: credentialName, CredentialUID: "credential-uid", RunID: "run"}
+			if err := ledger.Ledger.Register(id); err != nil {
+				t.Fatal(err)
+			}
+			if !neverBound && scenario != "bind-response-lost" {
+				id.WALIdentity = request.Targets[0].WALIdentity
+				if err := ledger.Ledger.Bind(id); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if err := ledger.Ledger.CloseNodes(request.OperationID, hash, nil); err != nil {
+				t.Fatal(err)
+			}
+			stop := *ledger.Ledger.Runs["run"].Stop
+			if neverBound && scenario != "unknown-run" && scenario != "bind-response-lost" {
+				if err := ledger.Ledger.RecordNeverBoundExit(stop); err != nil {
+					t.Fatal(err)
+				}
+			} else if !neverBound {
+				if err := ledger.Ledger.RecordDrain(fencing.DrainReceipt{Request: stop, WritersJoined: true}); err != nil {
+					t.Fatal(err)
+				}
+				if err := ledger.Ledger.RecordExit(stop); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if scenario == "unknown-run" {
+				unknown := fencing.Identity{SourceClusterID: "source", NodeID: nodeID, PodName: "learner", PodUID: "learner-uid", CredentialName: credentialName, CredentialUID: "credential-uid", RunID: "unknown"}
+				ledger.Ledger.Runs[unknown.RunID] = fencing.Run{Identity: unknown}
+			}
+			if scenario == "no-admission-closure" {
+				ledger.Ledger.ClosedBy, ledger.Ledger.ClosedHash = "", ""
+			}
 			if neverBound {
-				id := fencing.Identity{SourceClusterID: "source", NodeID: "learner", PodUID: "learner-uid", RunID: "run"}
-				if err := ledger.Ledger.Register(id); err != nil {
-					t.Fatal(err)
-				}
-				if scenario == "bind-response-lost" {
-					id.WALIdentity = strings.Repeat("a", 64)
-					if err := ledger.Ledger.Bind(id); err != nil {
-						t.Fatal(err)
-					}
-				}
-				if err := ledger.Ledger.CloseNodes(request.OperationID, hash, nil); err != nil {
-					t.Fatal(err)
-				}
-				stop := *ledger.Ledger.Runs["run"].Stop
-				if scenario != "unknown-run" && scenario != "bind-response-lost" {
-					if err := ledger.Ledger.RecordNeverBoundExit(stop); err != nil {
-						t.Fatal(err)
-					}
-				}
 				state.Intent.Proof.ProofID = "cooperative-" + hashJSON(ledger)
 				if scenario == "tampered-ledger" {
 					state.Intent.Proof.ProofID = "cooperative-tampered"
@@ -97,6 +124,8 @@ func TestStoppingDeletesOnlyFencedStandaloneLearner(t *testing.T) {
 				state.Learners[0].OperationID = "other-op"
 			case "history-credential":
 				state.Learners[0].CredentialUID = "other-credential"
+			case "recreated-ledger":
+				ledgerUID = "new-ledger-uid"
 			case "duplicate-history":
 				state.Learners = append(state.Learners, state.Learners[0])
 			}
@@ -104,12 +133,26 @@ func TestStoppingDeletesOnlyFencedStandaloneLearner(t *testing.T) {
 			if err := c.saveAuto(ctx, root, state, nil); err != nil {
 				t.Fatal(err)
 			}
-			secret := object{"immutable": true, "metadata": object{"uid": "credential-uid", "annotations": object{ownerAnnotation: "original-online-op"}}, "data": object{"member": base64.StdEncoding.EncodeToString(jsonBytes(voterMember("source", "learner", "token")))}}
+			secretToken := "token"
+			if scenario == "recreated-credential" {
+				secretToken = "replacement-token"
+			}
+			member := voterMember("source", nodeID, secretToken)
+			binding := hashJSON([]string{"root-uid", "sts-uid", "source", "learner", "learner-uid", nodeID})
+			secretUID := "credential-uid"
+			if scenario == "recreated-credential" {
+				secretUID = "new-credential-uid"
+			}
+			secret := object{"type": "Opaque", "immutable": true, "metadata": object{"name": credentialName, "namespace": "default", "uid": secretUID, "annotations": object{fencingRootAnnotation: "root-uid", fencingBindingAnnotation: binding}}, "data": object{"member": base64.StdEncoding.EncodeToString(jsonBytes(member)), "RHIZA_PEER_TOKEN": base64.StdEncoding.EncodeToString([]byte(secretToken))}}
+			originalMemberData := str(nested(secret, "data", "member"))
+			originalPeerToken := str(nested(secret, "data", "RHIZA_PEER_TOKEN"))
 			var deletes atomic.Int32
+			var secretDeletes atomic.Int32
 			var absent atomic.Bool
 			server := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
 				if req.URL.Path == (&FencingExecutor{Kube: c.Kube}).ledgerPath("sts-uid", "source") {
-					_ = json.NewEncoder(w).Encode(object{"data": object{"ledger.json": string(jsonBytes(ledger))}})
+					name := path.Base((&FencingExecutor{Kube: c.Kube}).ledgerPath("sts-uid", "source"))
+					_ = json.NewEncoder(w).Encode(object{"metadata": object{"name": name, "namespace": "default", "uid": ledgerUID}, "data": object{"ledger.json": string(jsonBytes(ledger))}})
 					return
 				}
 				switch req.URL.Path {
@@ -144,7 +187,17 @@ func TestStoppingDeletesOnlyFencedStandaloneLearner(t *testing.T) {
 						Items []ClusterResource `json:"items"`
 					}{[]ClusterResource{*root}})
 					return
-				case "/api/v1/namespaces/default/secrets/learner-credentials":
+				case c.corePath("secrets", credentialName):
+					if req.Method == http.MethodDelete {
+						secretDeletes.Add(1)
+						w.WriteHeader(http.StatusOK)
+						return
+					}
+					if req.Method != http.MethodGet {
+						t.Errorf("unexpected Secret mutation %s", req.Method)
+						w.WriteHeader(http.StatusMethodNotAllowed)
+						return
+					}
 					_ = json.NewEncoder(w).Encode(secret)
 					return
 				}
@@ -164,7 +217,7 @@ func TestStoppingDeletesOnlyFencedStandaloneLearner(t *testing.T) {
 				t.Fatal(err)
 			}
 			wantDeletes := int32(0)
-			if scenario == "bound" || scenario == "never-bound" || scenario == "delete-conflict" {
+			if scenario == "bound" || scenario == "never-bound" || scenario == "recreated-credential" || scenario == "delete-conflict" {
 				wantDeletes = 1
 			}
 			wantStage := "Stopping"
@@ -174,10 +227,15 @@ func TestStoppingDeletesOnlyFencedStandaloneLearner(t *testing.T) {
 			if deletes.Load() != wantDeletes || r.Status.Stage != wantStage {
 				t.Fatalf("deletes=%d want=%d status=%+v", deletes.Load(), wantDeletes, r.Status)
 			}
+			if scenario == "recreated-credential" {
+				if deletes.Load() != 1 || secretDeletes.Load() != 0 || str(nested(secret, "metadata", "uid")) != "new-credential-uid" || str(nested(secret, "data", "member")) != originalMemberData || str(nested(secret, "data", "RHIZA_PEER_TOKEN")) != originalPeerToken || state.Learners[0].CredentialUID != "credential-uid" || nested(pod, "metadata", "annotations", fencingCredentialAnnotation) != "credential-uid" {
+					t.Fatalf("recreated credential or old Pod was mutated: podDeletes=%d secretDeletes=%d secret=%+v", deletes.Load(), secretDeletes.Load(), secret)
+				}
+			}
 			if scenario == "delete-conflict" && r.Status.Phase != "Blocked" {
 				t.Fatalf("conflict advanced: %+v", r.Status)
 			}
-			if scenario == "bound" || scenario == "never-bound" {
+			if scenario == "bound" || scenario == "never-bound" || scenario == "recreated-credential" {
 				// A successful DELETE response alone cannot advance; the next inventory read must be empty.
 				absent.Store(true)
 				if err := c.advance(ctx, r, sourceState{stateful: api.sts}); err != nil {

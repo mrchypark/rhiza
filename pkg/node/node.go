@@ -194,8 +194,20 @@ func (n *Node) open(ctx context.Context, enroll bool) (err error) {
 	if n.terminalRequested.Load() {
 		return fmt.Errorf("terminally drained node cannot reopen")
 	}
+	var preparedDRAssignment *fencing.BootstrapAssignment
 	if n.config != nil && n.config.PreparedPodUID != "" {
-		if err := validatePreparedRestoreConfig(n.config); err != nil {
+		assignment, isDR, markerErr := preparedDRAssignmentForRuntime(n.config)
+		if markerErr != nil {
+			return markerErr
+		}
+		if isDR {
+			preparedDRAssignment = assignment
+		} else if preparedGenesisNodeCandidate(n.config) {
+			err = validatePreparedGenesisRuntimeConfig(n.config)
+		} else {
+			err = validatePreparedRestoreConfig(n.config)
+		}
+		if err != nil {
 			return err
 		}
 	}
@@ -212,6 +224,9 @@ func (n *Node) open(ctx context.Context, enroll bool) (err error) {
 	}
 	if err := n.connectFenceSession(ctx); err != nil {
 		return err
+	}
+	if n.config.PreparedPodUID != "" && (preparedGenesisNodeCandidate(n.config) || preparedDRAssignment != nil) && n.fenceSession == nil {
+		return fmt.Errorf("prepared voter requires a supervised runtime session")
 	}
 	if n.config.Local && (enroll || len(n.config.Members) != 0 || n.config.Learner != nil || n.config.EnableReconfiguration ||
 		n.config.BindAddr != "" || n.config.PeerAddr != "" || n.config.PeerToken != "" || n.config.AdminToken != "") {
@@ -275,6 +290,15 @@ func (n *Node) open(ctx context.Context, enroll bool) (err error) {
 	if n.config.Local {
 		if _, err := materializer.ValidateLocalGraphNodePropertyIndexes(n.config.LocalGraphNodePropertyIndexes); err != nil {
 			return err
+		}
+	}
+	if preparedDRAssignment != nil {
+		admission, admissionErr := n.fenceSession.BootstrapRuntimeAdmission(ctx, preparedDRAssignment.OperationID)
+		if admissionErr != nil {
+			return fmt.Errorf("revalidate prepared DR admission before runtime storage mutation: %w", admissionErr)
+		}
+		if admission.Assignment != *preparedDRAssignment {
+			return fmt.Errorf("prepared DR assignment is absent or changed at runtime handoff")
 		}
 	}
 	if !n.opened.CompareAndSwap(false, true) {
@@ -445,7 +469,21 @@ func (n *Node) open(ctx context.Context, enroll bool) (err error) {
 		n.bucket = bucket
 		var beforeWrite []func(context.Context, string) error
 		if n.fenceSession != nil {
-			beforeWrite = append(beforeWrite, n.fenceSession.BindWAL)
+			beforeWrite = append(beforeWrite, func(bindCtx context.Context, walIdentity string) error {
+				if err := n.fenceSession.BindWAL(bindCtx, walIdentity); err != nil {
+					return err
+				}
+				if preparedDRAssignment == nil {
+					return nil
+				}
+				identity := n.fenceSession.Identity()
+				if identity.SourceClusterID != preparedDRAssignment.SourceClusterID || identity.NodeID != preparedDRAssignment.NodeID ||
+					identity.PodName != preparedDRAssignment.PodName || identity.PodUID != preparedDRAssignment.PodUID ||
+					identity.CredentialName != preparedDRAssignment.CredentialName || identity.CredentialUID != preparedDRAssignment.CredentialUID || identity.WALIdentity != walIdentity {
+					return fmt.Errorf("runtime WAL identity differs from prepared DR assignment")
+				}
+				return nil
+			})
 		}
 		if err := ensureVoterIdentity(ctx, n.config, bucket, n.wal, localVoter, enroll, beforeWrite...); err != nil {
 			return err
@@ -663,6 +701,8 @@ func (n *Node) open(ctx context.Context, enroll bool) (err error) {
 	server.SetTerminalDrain(func(ctx context.Context, expected network.TerminalDrainRequest) (any, error) {
 		return n.TerminalDrain(ctx, expected)
 	})
+	server.SetMembershipRepairProbe(n.verifyMembershipRepairProbe)
+	server.SetMembershipRepairCompletion(n.completeMembershipRepairTerminal)
 	if n.config.Local {
 		server.SetLocalFailureHandler(func(error) { n.ready.Store(false) })
 		server.SetLocalReclaimHandler(n.reclaimLocalCheckpoint)
@@ -1061,6 +1101,7 @@ func (n *Node) open(ctx context.Context, enroll bool) (err error) {
 		}()
 	}
 	n.startFenceWatcher(ctx)
+	n.startMembershipRepairWorker(ctx)
 	return nil
 }
 
@@ -1941,7 +1982,7 @@ func (n *Node) catchUpMembership(ctx context.Context, transport *network.Transpo
 }
 
 func (n *Node) startCatchUp(ctx context.Context, transport *network.Transport, cluster *quepaxa.Cluster) {
-	n.observeCatchUp(n.catchUpMembership(ctx, transport, cluster))
+	n.observeCatchUp(ctx, n.catchUpMembership(ctx, transport, cluster))
 	var round uint64
 	for {
 		delay := syncInterval(n.config.NodeID, round)
@@ -1969,7 +2010,7 @@ func (n *Node) startCatchUp(ctx context.Context, transport *network.Transport, c
 			cluster = &current
 		}
 		if !n.ready.Load() {
-			n.observeCatchUp(n.catchUpMembership(ctx, transport, cluster))
+			n.observeCatchUp(ctx, n.catchUpMembership(ctx, transport, cluster))
 		} else if sources := syncSources(n.config.NodeID, cluster.Members, round); len(sources) > 0 {
 			var syncErr error
 			for _, source := range sources {
@@ -1983,7 +2024,7 @@ func (n *Node) startCatchUp(ctx context.Context, transport *network.Transport, c
 			// A compacted peer can force checkpoint recovery from catchUpPeer.
 			// Only a fresh quorum round may make that node ready again.
 			if !n.ready.Load() {
-				n.observeCatchUp(n.catchUpMembership(ctx, transport, cluster))
+				n.observeCatchUp(ctx, n.catchUpMembership(ctx, transport, cluster))
 			}
 		}
 		round++
@@ -2028,11 +2069,15 @@ func syncSources(nodeID quepaxa.NodeID, members []quepaxa.Member, round uint64) 
 	return append(peers[first:], peers[:first]...)
 }
 
-func (n *Node) observeCatchUp(err error) {
+func (n *Node) observeCatchUp(ctx context.Context, err error) {
 	if err != nil {
 		// A transient peer timeout must not make an already caught-up node
 		// reject traffic; quorum operations enforce their own availability.
 		log.Printf("quorum catch-up failed: %v", err)
+		return
+	}
+	if err := n.completeInitialBootstrap(ctx); err != nil {
+		log.Printf("initial bootstrap completion remains pending: %v", err)
 		return
 	}
 	n.ready.Store(true)

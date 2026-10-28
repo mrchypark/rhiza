@@ -16,6 +16,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/mrchypark/rhiza/pkg/fencing"
 	"github.com/mrchypark/rhiza/pkg/network"
 	"github.com/mrchypark/rhiza/pkg/quepaxa"
 	"github.com/thanos-io/objstore"
@@ -34,9 +35,13 @@ func TestAutomaticMembershipCompletionInstallsFailedLearner(t *testing.T) {
 	child.Spec.Container = "rhiza"
 	child.Spec.Membership.OperationID = "recover"
 	child.Spec.Membership.RemovedPod = "n3"
-	api.learnerID = "learner"
-	api.membership["learner"] = network.MembershipStatus{NodeID: "learner", ClusterID: "source", ConfigID: 1, Voters: []quepaxa.NodeID{"n1", "n2", "n3"}, WALIdentity: strings.Repeat("a", 64)}
-	api.membershipSecret["data"].(object)["member"] = base64.StdEncoding.EncodeToString(jsonBytes(voterMember("source", "learner", "new-token")))
+	learnerID, err := fencing.ReplacementNodeID("learner-uid")
+	if err != nil {
+		t.Fatal(err)
+	}
+	api.learnerID = learnerID
+	api.membership[learnerID] = network.MembershipStatus{NodeID: quepaxa.NodeID(learnerID), ClusterID: "source", ConfigID: 1, Voters: []quepaxa.NodeID{"n1", "n2", "n3"}, WALIdentity: strings.Repeat("a", 64)}
+	api.membershipSecret["data"].(object)["member"] = base64.StdEncoding.EncodeToString(jsonBytes(voterMember("source", learnerID, "new-token")))
 	advance := func() {
 		t.Helper()
 		if err := c.reconcileAll(ctx); err != nil {
@@ -47,20 +52,21 @@ func TestAutomaticMembershipCompletionInstallsFailedLearner(t *testing.T) {
 	api.membership["n1"] = membershipStatus("n1", 2, "n1", "n2")
 	api.membership["n2"] = membershipStatus("n2", 2, "n1", "n2")
 	advance() // addition journal
-	api.membership["n1"] = membershipStatus("n1", 3, "n1", "n2", "learner")
-	api.membership["n2"] = membershipStatus("n2", 3, "n1", "n2", "learner")
-	api.membership["learner"] = membershipStatus("learner", 3, "n1", "n2", "learner")
-	status := api.membership["learner"]
+	api.membership["n1"] = membershipStatus("n1", 3, "n1", "n2", learnerID)
+	api.membership["n2"] = membershipStatus("n2", 3, "n1", "n2", learnerID)
+	api.membership[learnerID] = membershipStatus(learnerID, 3, "n1", "n2", learnerID)
+	status := api.membership[learnerID]
 	status.WALIdentity = strings.Repeat("a", 64)
-	api.membership["learner"] = status
+	api.membership[learnerID] = status
 	advance()
 	if child.Status.Phase != "Complete" {
-		t.Fatalf("membership did not commit: %+v", child.Status)
+		t.Fatalf("membership did not commit: %+v add=%+v changes=%+v status=%+v", child.Status, child.Status.Membership.Add, api.changes, api.membership)
 	}
 	r := autoClusterResource("cluster-1", "binding-uid-1", "logical-1")
 	state := validAutoControl()
 	state.StatefulSetUID = "sts-uid"
 	state.Voters = []VoterPod{{NodeID: "n1", Pod: "n1"}, {NodeID: "n2", Pod: "n2"}, {NodeID: "n3", Pod: "n3"}}
+	state.Learners = []learnerIncarnation{{SourceClusterID: "source", OperationID: "recover", CredentialUID: "secret-uid", CredentialName: "learner-credentials", Target: FenceTarget{NodeID: learnerID, Pod: "learner", PodUID: "learner-uid", WALIdentity: strings.Repeat("a", 64)}}}
 	r.Spec.VoterCount = len(state.Voters)
 	request := FenceRequest{LogicalID: r.Spec.LogicalID, BindingUID: state.BindingUID, Namespace: "default", StatefulSet: "rhiza", StatefulSetUID: state.StatefulSetUID, SourceClusterID: "source", OperationID: "recover", Scope: ScopeVoter, Targets: []FenceTarget{{NodeID: "n3", Pod: "n3", PodUID: "pod-n3", WALIdentity: strings.Repeat("b", 64)}}}
 	hash, err := requestHash(&request)
@@ -102,7 +108,7 @@ func TestAutomaticMembershipCompletionInstallsFailedLearner(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if loaded.Intent != nil || loaded.Completed == nil || len(loaded.Voters) != 3 || loaded.Voters[2].NodeID != "learner" || loaded.Identities["learner"].WALIdentity != strings.Repeat("a", 64) || loaded.Identities["learner"].PodUID != "learner-uid" {
+	if loaded.Intent != nil || loaded.Completed == nil || len(loaded.Voters) != 3 || loaded.Voters[2].NodeID != "pod-learner-uid" || loaded.Voters[2].Pod != "learner" || loaded.Identities["pod-learner-uid"].WALIdentity != strings.Repeat("a", 64) || loaded.Identities["pod-learner-uid"].PodUID != "learner-uid" {
 		t.Fatalf("committed failed learner lost: %+v status=%+v", loaded, r.Status)
 	}
 }

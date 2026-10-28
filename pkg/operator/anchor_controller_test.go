@@ -25,11 +25,16 @@ func (f *fakeAnchorClient) Activate(ctx context.Context, req recoveryanchor.Requ
 	if f.activate != nil {
 		return f.activate(ctx, req)
 	}
+	requestHash, err := recoveryanchor.RequestHash(req)
+	if err != nil {
+		return recoveryanchor.Receipt{}, err
+	}
 	return recoveryanchor.Receipt{
 		AnchorID:    req.AnchorID,
 		OperationID: req.OperationID,
-		RequestHash: "hash",
-		Target:      recoveryanchor.Binding{ClusterID: req.TargetClusterID},
+		RequestHash: requestHash,
+		Target:      recoveryanchor.Binding{ClusterID: req.TargetClusterID, StorageID: "test-anchor-store"},
+		Generation:  1,
 	}, nil
 }
 
@@ -41,10 +46,35 @@ func (f *fakeAnchorClient) Verify(ctx context.Context, req recoveryanchor.Reques
 	return nil
 }
 
+func (f *fakeAnchorClient) VerifyAdmission(ctx context.Context, req recoveryanchor.Request, receipt recoveryanchor.Receipt, binding recoveryanchor.Binding, generation uint64) error {
+	if receipt.Target != binding || receipt.Generation != generation {
+		return fmt.Errorf("admission target differs")
+	}
+	return f.Verify(ctx, req, receipt)
+}
+
 func setAnchorEnv(r *Resource, api *operatorAPI) {
 	ctr, _ := container(api.sts, "rhiza")
 	ctr["env"] = append(list(ctr["env"]), object{"name": "RHIZA_RECOVERY_ANCHOR_ID", "value": r.Spec.AnchorID})
 	ctr["env"] = append(list(ctr["env"]), object{"name": "RHIZA_ENABLE_RECONFIGURATION", "value": "true"})
+	ctr["env"] = append(list(ctr["env"]), object{"name": "RHIZA_NODE_ID", "valueFrom": object{"fieldRef": object{"fieldPath": "metadata.name"}}})
+	ctr["env"] = append(list(ctr["env"]), object{"name": "RHIZA_DATA_DIR", "value": "/data"})
+	ctr["env"] = append(list(ctr["env"]), object{"name": "FENCER_AUTHORITY_URL", "value": "https://rhiza-fencer.default.svc:9444/v1/supervisor"})
+	ctr["env"] = append(list(ctr["env"]), object{"name": "FENCER_CA_FILE", "value": "/fencer-ca/ca.crt"})
+	ctr["command"] = []any{"/usr/local/bin/rhiza-fencer"}
+	ctr["args"] = []any{"supervise", "--", "/usr/local/bin/rhiza"}
+	ctr["securityContext"] = object{"allowPrivilegeEscalation": false, "capabilities": object{"drop": []any{"ALL"}}}
+	ctr["volumeMounts"] = append(list(ctr["volumeMounts"]), object{"name": "fence-token", "mountPath": "/var/run/secrets/rhiza-fencer", "readOnly": true}, object{"name": "fence-ca", "mountPath": "/fencer-ca", "readOnly": true})
+	spec := asObject(nested(api.sts, "spec", "template", "spec"))
+	spec["volumes"] = append(list(spec["volumes"]), object{"name": "fence-token", "projected": object{"sources": []any{object{"serviceAccountToken": object{"path": "token", "audience": "rhiza-fencer", "expirationSeconds": float64(600)}}}}}, object{"name": "fence-ca", "configMap": object{"name": "rhiza-fencer-ca"}})
+	templateMeta := asObject(nested(api.sts, "spec", "template", "metadata"))
+	annotations := asObject(templateMeta["annotations"])
+	if annotations == nil {
+		annotations = object{}
+		templateMeta["annotations"] = annotations
+	}
+	annotations[fencingProtocolAnnotation] = "1"
+	annotations[fencingRootAnnotation] = "root-uid"
 }
 
 func TestAnchorBlockedWhenBackendNil(t *testing.T) {
@@ -115,7 +145,7 @@ func TestAnchorActivateFailsClosed(t *testing.T) {
 	}
 
 	// Reserved → Sealed
-	c = &Controller{Kube: c.Kube, Bucket: bucket, Prefix: c.Prefix, StoreIdentity: c.StoreIdentity, Anchor: anchor}
+	c = &Controller{Kube: c.Kube, Bucket: bucket, Prefix: c.Prefix, StoreIdentity: c.StoreIdentity, Anchor: anchor, AnchorBinding: recoveryanchor.Binding{StorageID: "test-anchor-store"}}
 	if err := c.reconcileAll(ctx); err != nil {
 		t.Fatal(err)
 	}
@@ -127,7 +157,7 @@ func TestAnchorActivateFailsClosed(t *testing.T) {
 	failAnchor := &fakeAnchorClient{activate: func(_ context.Context, _ recoveryanchor.Request) (recoveryanchor.Receipt, error) {
 		return recoveryanchor.Receipt{}, fmt.Errorf("anchor service unavailable")
 	}}
-	c = &Controller{Kube: c.Kube, Bucket: bucket, Prefix: c.Prefix, StoreIdentity: c.StoreIdentity, Anchor: failAnchor}
+	c = &Controller{Kube: c.Kube, Bucket: bucket, Prefix: c.Prefix, StoreIdentity: c.StoreIdentity, Anchor: failAnchor, AnchorBinding: recoveryanchor.Binding{StorageID: "test-anchor-store"}}
 	if err := c.reconcileAll(ctx); err != nil {
 		t.Fatal(err)
 	}
@@ -157,7 +187,7 @@ func TestAnchorSuccessFullFlow(t *testing.T) {
 
 	advance := func(stage string) {
 		t.Helper()
-		c = &Controller{Kube: c.Kube, Bucket: bucket, Prefix: c.Prefix, StoreIdentity: c.StoreIdentity, Anchor: anchor}
+		c = &Controller{Kube: c.Kube, Bucket: bucket, Prefix: c.Prefix, StoreIdentity: c.StoreIdentity, Anchor: anchor, AnchorBinding: recoveryanchor.Binding{StorageID: "test-anchor-store"}}
 		if err := c.reconcileAll(ctx); err != nil {
 			t.Fatal(err)
 		}
@@ -228,7 +258,7 @@ func TestAnchorTamperedRequestBlocks(t *testing.T) {
 
 	advance := func(stage string) {
 		t.Helper()
-		c = &Controller{Kube: c.Kube, Bucket: bucket, Prefix: c.Prefix, StoreIdentity: c.StoreIdentity, Anchor: anchor}
+		c = &Controller{Kube: c.Kube, Bucket: bucket, Prefix: c.Prefix, StoreIdentity: c.StoreIdentity, Anchor: anchor, AnchorBinding: recoveryanchor.Binding{StorageID: "test-anchor-store"}}
 		if err := c.reconcileAll(ctx); err != nil {
 			t.Fatal(err)
 		}
@@ -246,7 +276,7 @@ func TestAnchorTamperedRequestBlocks(t *testing.T) {
 	// Tamper with the persisted anchor request.
 	r.Status.AnchorRequest.Fork.Tip = 999
 
-	c = &Controller{Kube: c.Kube, Bucket: bucket, Prefix: c.Prefix, StoreIdentity: c.StoreIdentity, Anchor: anchor}
+	c = &Controller{Kube: c.Kube, Bucket: bucket, Prefix: c.Prefix, StoreIdentity: c.StoreIdentity, Anchor: anchor, AnchorBinding: recoveryanchor.Binding{StorageID: "test-anchor-store"}}
 	if err := c.reconcileAll(ctx); err != nil {
 		t.Fatal(err)
 	}
@@ -274,7 +304,7 @@ func TestAnchorLostStatusWriteRetryIdempotent(t *testing.T) {
 	}
 
 	// Reserved → Sealed
-	c = &Controller{Kube: c.Kube, Bucket: bucket, Prefix: c.Prefix, StoreIdentity: c.StoreIdentity, Anchor: anchor}
+	c = &Controller{Kube: c.Kube, Bucket: bucket, Prefix: c.Prefix, StoreIdentity: c.StoreIdentity, Anchor: anchor, AnchorBinding: recoveryanchor.Binding{StorageID: "test-anchor-store"}}
 	if err := c.reconcileAll(ctx); err != nil {
 		t.Fatal(err)
 	}
@@ -284,7 +314,7 @@ func TestAnchorLostStatusWriteRetryIdempotent(t *testing.T) {
 
 	// Simulate lost status write.
 	api.failStatus = 1
-	c = &Controller{Kube: c.Kube, Bucket: bucket, Prefix: c.Prefix, StoreIdentity: c.StoreIdentity, Anchor: anchor}
+	c = &Controller{Kube: c.Kube, Bucket: bucket, Prefix: c.Prefix, StoreIdentity: c.StoreIdentity, Anchor: anchor, AnchorBinding: recoveryanchor.Binding{StorageID: "test-anchor-store"}}
 	err := c.reconcileAll(ctx)
 	if err == nil {
 		t.Fatal("expected status write failure")
@@ -294,7 +324,7 @@ func TestAnchorLostStatusWriteRetryIdempotent(t *testing.T) {
 	}
 
 	// Retry: idempotent.
-	c = &Controller{Kube: c.Kube, Bucket: bucket, Prefix: c.Prefix, StoreIdentity: c.StoreIdentity, Anchor: anchor}
+	c = &Controller{Kube: c.Kube, Bucket: bucket, Prefix: c.Prefix, StoreIdentity: c.StoreIdentity, Anchor: anchor, AnchorBinding: recoveryanchor.Binding{StorageID: "test-anchor-store"}}
 	if err := c.reconcileAll(ctx); err != nil {
 		t.Fatal(err)
 	}
@@ -316,7 +346,7 @@ func TestAnchorStartingAlreadyTargetStaleVerify(t *testing.T) {
 	c.Anchor = anchor
 	advance := func(stage string) {
 		t.Helper()
-		c = &Controller{Kube: c.Kube, Bucket: bucket, Prefix: c.Prefix, StoreIdentity: c.StoreIdentity, Anchor: anchor}
+		c = &Controller{Kube: c.Kube, Bucket: bucket, Prefix: c.Prefix, StoreIdentity: c.StoreIdentity, Anchor: anchor, AnchorBinding: recoveryanchor.Binding{StorageID: "test-anchor-store"}}
 		if err := c.reconcileAll(ctx); err != nil {
 			t.Fatal(err)
 		}
@@ -338,7 +368,7 @@ func TestAnchorStartingAlreadyTargetStaleVerify(t *testing.T) {
 	// Simulate lost status: sts already has target env, reset only Stage.
 	r.Status.Stage = "Starting"
 	nBefore := atomic.LoadInt32(&anchor.verifyN)
-	c = &Controller{Kube: c.Kube, Bucket: bucket, Prefix: c.Prefix, StoreIdentity: c.StoreIdentity, Anchor: failAnchor}
+	c = &Controller{Kube: c.Kube, Bucket: bucket, Prefix: c.Prefix, StoreIdentity: c.StoreIdentity, Anchor: failAnchor, AnchorBinding: recoveryanchor.Binding{StorageID: "test-anchor-store"}}
 	if err := c.reconcileAll(ctx); err != nil {
 		t.Fatal(err)
 	}
@@ -377,7 +407,7 @@ func TestAnchorStartingVerifyFailsWhenBackendUnavailable(t *testing.T) {
 	c.Anchor = anchor
 	advance := func(stage string) {
 		t.Helper()
-		c = &Controller{Kube: c.Kube, Bucket: bucket, Prefix: c.Prefix, StoreIdentity: c.StoreIdentity, Anchor: anchor}
+		c = &Controller{Kube: c.Kube, Bucket: bucket, Prefix: c.Prefix, StoreIdentity: c.StoreIdentity, Anchor: anchor, AnchorBinding: recoveryanchor.Binding{StorageID: "test-anchor-store"}}
 		if err := c.reconcileAll(ctx); err != nil {
 			t.Fatal(err)
 		}

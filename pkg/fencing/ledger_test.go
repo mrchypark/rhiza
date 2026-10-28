@@ -338,6 +338,53 @@ func TestLedgerIntactWALRestartDoesNotEraseOldUncertainty(t *testing.T) {
 	}
 }
 
+func TestLedgerCanonicalSameUIDRunRequiresTerminalAndPreservesSettledNeighbor(t *testing.T) {
+	l := Ledger{SourceClusterID: "source"}
+	first := Identity{SourceClusterID: "source", NodeID: "pod-pod-uid", PodName: "rhiza-0", PodUID: "pod-uid", CredentialName: "secret-rhiza-0", CredentialUID: "secret-uid", RunID: "run-1"}
+	if err := l.Register(first); err != nil {
+		t.Fatal(err)
+	}
+	first.WALIdentity = "wal-0"
+	if err := l.Bind(first); err != nil {
+		t.Fatal(err)
+	}
+	second := first
+	second.RunID = "run-2"
+	second.WALIdentity = ""
+	if err := l.Register(second); err == nil {
+		t.Fatal("same Pod UID started a second run without terminal evidence")
+	}
+	if len(l.Runs) != 1 || l.Runs[first.RunID].Identity != first {
+		t.Fatal("rejected same-UID run changed retained history")
+	}
+	next := second
+	next.RunID = "run-new-uid"
+	next.PodUID = "next-pod-uid"
+	next.NodeID = "pod-next-pod-uid"
+	next.CredentialName = "secret-next"
+	next.CredentialUID = "secret-next-uid"
+	next.WALIdentity = ""
+	if err := l.Register(next); err == nil {
+		t.Fatal("new Pod UID reused the slot while old run remained unresolved")
+	}
+	if err := l.CloseNodes("close", "hash", []string{first.NodeID}); err != nil {
+		t.Fatal(err)
+	}
+	request := *l.Runs[first.RunID].Stop
+	if err := l.RecordDrain(DrainReceipt{Request: request, WritersJoined: true}); err != nil {
+		t.Fatal(err)
+	}
+	if err := l.RecordExit(request); err != nil {
+		t.Fatal(err)
+	}
+	if err := l.Register(next); err != nil {
+		t.Fatalf("terminal-settled old UID did not permit its new-UID neighbor: %v", err)
+	}
+	if len(l.Runs) != 2 || !runTerminated(l.Runs[first.RunID]) || l.Runs[next.RunID].Identity != next {
+		t.Fatal("settled neighbor changed or erased the old incarnation history")
+	}
+}
+
 func TestLedgerClosureBeforeWALBindNeedsSeparateNeverBoundExit(t *testing.T) {
 	l := Ledger{SourceClusterID: "source"}
 	id := testIdentity()
@@ -436,5 +483,97 @@ func TestLedgerBindingAndOperationImmutable(t *testing.T) {
 	wrong.PodUID = "replacement"
 	if err := l.RecordDrain(DrainReceipt{Request: StopRequest{OperationID: "op", RequestHash: "hash", Identity: wrong}, WritersJoined: true}); err == nil {
 		t.Fatal("replacement drain accepted")
+	}
+}
+
+func TestReplacementIdentityKeepsOrdinalHistoryWithoutReusingIdentity(t *testing.T) {
+	ledger := Ledger{SourceClusterID: "source"}
+	firstID, err := ReplacementNodeID("uid-first")
+	if err != nil {
+		t.Fatal(err)
+	}
+	first := Identity{SourceClusterID: "source", NodeID: firstID, PodName: "rhiza-2", PodUID: "uid-first", CredentialUID: "secret-first", CredentialName: "cred-first", RunID: "run-first"}
+	if err := ledger.Register(first); err != nil {
+		t.Fatal(err)
+	}
+	if err := ledger.Bind(Identity{SourceClusterID: first.SourceClusterID, NodeID: first.NodeID, PodName: first.PodName, PodUID: first.PodUID, CredentialUID: first.CredentialUID, CredentialName: first.CredentialName, RunID: first.RunID, WALIdentity: "wal-first"}); err != nil {
+		t.Fatal(err)
+	}
+	secondID, err := ReplacementNodeID("uid-second")
+	if err != nil {
+		t.Fatal(err)
+	}
+	second := Identity{SourceClusterID: "source", NodeID: secondID, PodName: "rhiza-2", PodUID: "uid-second", CredentialUID: "secret-second", CredentialName: "cred-second", RunID: "run-second"}
+	if err := ledger.Register(second); err == nil {
+		t.Fatal("new UID at a retained ordinal registered before prior termination")
+	}
+	request := StopRequest{OperationID: "stop-first", RequestHash: "hash-first", Identity: ledger.Runs[first.RunID].Identity}
+	if err := ledger.CloseNodes(request.OperationID, request.RequestHash, []string{first.NodeID}); err != nil {
+		t.Fatal(err)
+	}
+	request = *ledger.Runs[first.RunID].Stop
+	if err := ledger.RecordDrain(DrainReceipt{Request: request, WritersJoined: true}); err != nil {
+		t.Fatal(err)
+	}
+	if err := ledger.RecordExit(request); err != nil {
+		t.Fatal(err)
+	}
+	if err := ledger.Register(second); err != nil {
+		t.Fatalf("replacement UID did not register after exact termination: %v", err)
+	}
+	if got := len(ledger.Runs); got != 2 {
+		t.Fatalf("replacement erased historical runs: got %d, want 2", got)
+	}
+	if ledger.Runs[first.RunID].Identity.NodeID == ledger.Runs[second.RunID].Identity.NodeID {
+		t.Fatal("replacement reused the prior consensus identity")
+	}
+}
+
+func TestReplacementIdentityRejectsChangedCredentialAndUIDCollision(t *testing.T) {
+	ledger := Ledger{SourceClusterID: "source"}
+	nodeID, err := ReplacementNodeID("uid-one")
+	if err != nil {
+		t.Fatal(err)
+	}
+	id := Identity{SourceClusterID: "source", NodeID: nodeID, PodName: "rhiza-0", PodUID: "uid-one", CredentialUID: "secret-one", CredentialName: "cred-one", RunID: "run-one"}
+	if err := ledger.Register(id); err != nil {
+		t.Fatal(err)
+	}
+	changed := id
+	changed.RunID = "run-two"
+	changed.CredentialUID = "secret-recreated"
+	changed.CredentialName = "cred-recreated"
+	if err := ledger.Register(changed); err == nil {
+		t.Fatal("same Pod UID accepted a recreated credential")
+	}
+	otherID, err := ReplacementNodeID("uid-two")
+	if err != nil {
+		t.Fatal(err)
+	}
+	changed = id
+	changed.RunID = "run-three"
+	changed.PodUID = "uid-two"
+	changed.NodeID = otherID
+	if err := ledger.Register(changed); err == nil {
+		t.Fatal("same Pod name accepted a different UID before termination")
+	}
+}
+
+func TestSamePodUIDCannotStartAnotherRunWithoutTerminalReceipt(t *testing.T) {
+	identity := Identity{
+		SourceClusterID: "source", NodeID: "pod-uid-1", PodName: "rhiza-0", PodUID: "uid-1",
+		CredentialUID: "credential-1", CredentialName: "rhiza-inc-1", RunID: "run-1",
+	}
+	ledger := Ledger{SourceClusterID: "source"}
+	if err := ledger.Register(identity); err != nil {
+		t.Fatal(err)
+	}
+	retry := identity
+	retry.RunID = "run-2"
+	if err := ledger.Register(retry); err == nil {
+		t.Fatal("accepted another run for the same live Pod UID")
+	}
+	if err := ledger.Register(identity); err != nil {
+		t.Fatalf("same-run registration retry should be idempotent: %v", err)
 	}
 }

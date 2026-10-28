@@ -20,6 +20,7 @@ import (
 	objectstore "github.com/mrchypark/rhiza/internal/objstore"
 	"github.com/mrchypark/rhiza/internal/types"
 	"github.com/mrchypark/rhiza/pkg/checkpoint"
+	"github.com/mrchypark/rhiza/pkg/fencing"
 	"github.com/mrchypark/rhiza/pkg/materializer"
 	"github.com/mrchypark/rhiza/pkg/qlog"
 	"github.com/mrchypark/rhiza/pkg/quepaxa"
@@ -45,20 +46,21 @@ type preparedRestoreExecution struct {
 }
 
 type preparedRestoreMarker struct {
-	Version        uint   `json:"version"`
-	Phase          string `json:"phase"`
-	PodUID         string `json:"pod_uid"`
-	NodeID         string `json:"node_id"`
-	ClusterID      string `json:"cluster_id"`
-	SourceHash     string `json:"source_hash"`
-	StoreHash      string `json:"store_hash"`
-	BootstrapHash  string `json:"bootstrap_hash"`
-	BaseIndex      uint64 `json:"base_index"`
-	BaseRootHash   string `json:"base_root_hash"`
-	BaseStateHash  string `json:"base_state_hash"`
-	BasePrefixHash string `json:"base_prefix_hash"`
-	CertifiedTip   uint64 `json:"certified_tip"`
-	TipPrefixHash  string `json:"tip_prefix_hash"`
+	Version        uint                         `json:"version"`
+	Phase          string                       `json:"phase"`
+	PodUID         string                       `json:"pod_uid"`
+	NodeID         string                       `json:"node_id"`
+	ClusterID      string                       `json:"cluster_id"`
+	SourceHash     string                       `json:"source_hash"`
+	StoreHash      string                       `json:"store_hash"`
+	BootstrapHash  string                       `json:"bootstrap_hash"`
+	BaseIndex      uint64                       `json:"base_index"`
+	BaseRootHash   string                       `json:"base_root_hash"`
+	BaseStateHash  string                       `json:"base_state_hash"`
+	BasePrefixHash string                       `json:"base_prefix_hash"`
+	CertifiedTip   uint64                       `json:"certified_tip"`
+	TipPrefixHash  string                       `json:"tip_prefix_hash"`
+	DRAssignment   *fencing.BootstrapAssignment `json:"dr_assignment,omitempty"`
 }
 
 type preparedStoreIdentity struct {
@@ -92,7 +94,22 @@ func prepareRestore(ctx context.Context, config *types.ExecutionConfig, injected
 }
 
 func prepareRestoreWithExecution(ctx context.Context, config *types.ExecutionConfig, injected *objectstore.MeteredBucket) (execution preparedRestoreExecution, resultErr error) {
-	if err := validatePreparedRestoreConfig(config); err != nil {
+	return prepareRestoreWithOptions(ctx, config, injected, nil)
+}
+
+func prepareRestoreWithDRAssignment(ctx context.Context, config *types.ExecutionConfig, injected *objectstore.MeteredBucket, assignment fencing.BootstrapAssignment) (preparedRestoreExecution, error) {
+	return prepareRestoreWithOptions(ctx, config, injected, &assignment)
+}
+
+func prepareRestoreWithOptions(ctx context.Context, config *types.ExecutionConfig, injected *objectstore.MeteredBucket, drAssignment *fencing.BootstrapAssignment) (execution preparedRestoreExecution, resultErr error) {
+	var evidence recovery.EvidenceOptions
+	var err error
+	if drAssignment == nil {
+		err = validatePreparedRestoreConfig(config)
+	} else {
+		evidence, err = validateManagedDRSuccessorAssignment(config, *drAssignment)
+	}
+	if err != nil {
 		return execution, err
 	}
 	if config.ObjStoreDurability == "" {
@@ -101,6 +118,10 @@ func prepareRestoreWithExecution(ctx context.Context, config *types.ExecutionCon
 	baseMarker, err := preparedMarkerForConfig(config)
 	if err != nil {
 		return execution, err
+	}
+	if drAssignment != nil {
+		assignment := *drAssignment
+		baseMarker.DRAssignment = &assignment
 	}
 	intentMarker := baseMarker
 	intentMarker.Phase = "preparing"
@@ -232,8 +253,10 @@ func prepareRestoreWithExecution(ctx context.Context, config *types.ExecutionCon
 			return execution, fmt.Errorf("open restore source: %w", err)
 		}
 	}
-	if err := validatePreparedRestoreMembership(ctx, config, bucket); err != nil {
-		return execution, err
+	if drAssignment == nil {
+		if err := validatePreparedRestoreMembership(ctx, config, bucket); err != nil {
+			return execution, err
+		}
 	}
 	if !markerExists {
 		if preparedRestoreCrashBoundary != nil {
@@ -314,9 +337,24 @@ func prepareRestoreWithExecution(ctx context.Context, config *types.ExecutionCon
 	core.SetCheckpointValidator(func(ctx context.Context, seal quepaxa.CheckpointSeal) error {
 		return checkpoints.Verify(ctx, uint64(seal.Index), seal.RootHash, seal.StateHash)
 	})
-	generationCheckpoint, err := n.installGenerationAnchor(guard)
-	if err != nil {
-		return execution, fmt.Errorf("verify source generation anchor: %w", err)
+	var generationCheckpoint *checkpoint.Checkpoint
+	if drAssignment == nil {
+		generationCheckpoint, err = n.installGenerationAnchor(guard)
+		if err != nil {
+			return execution, fmt.Errorf("verify source generation anchor: %w", err)
+		}
+	} else {
+		view, err := snapshot.CaptureCertifiedView()
+		if err != nil {
+			return execution, fmt.Errorf("capture selected DR archive view: %w", err)
+		}
+		if _, err := recovery.VerifyExpectedAnchorForView(guard.Context(), view, evidence); err != nil {
+			return execution, fmt.Errorf("verify approved DR anchor against selected archive: %w", err)
+		}
+		generationCheckpoint, err = recovery.InitializeCertifiedRecoveryBase(guard.Context(), core, view, evidence.ExpectedMembership, evidence.ExpectedAnchorHash, checkpoints)
+		if err != nil {
+			return execution, fmt.Errorf("initialize approved DR recovery base: %w", err)
+		}
 	}
 	if err := recovery.ReplayCertifiedThrough(guard.Context(), core, snapshot.Tip(), snapshot.DecisionsFrom); err != nil {
 		return execution, fmt.Errorf("verify certified source suffix: %w", err)
@@ -362,7 +400,7 @@ func prepareRestoreWithExecution(ctx context.Context, config *types.ExecutionCon
 	if material.Tip() > uint64(core.Tip()) {
 		return execution, fmt.Errorf("existing materialized tip %d is ahead of certified source %d", material.Tip(), core.Tip())
 	}
-	if material.Tip() > 0 {
+	if material.Tip() > 0 && (drAssignment == nil || root == nil || uint64(material.Tip()) > root.Index) {
 		decision, ok := core.CertifiedValue(quepaxa.Slot(material.Tip()))
 		if !ok {
 			return execution, fmt.Errorf("existing materialized tip %d has no certified decision", material.Tip())
@@ -371,7 +409,7 @@ func prepareRestoreWithExecution(ctx context.Context, config *types.ExecutionCon
 			return execution, fmt.Errorf("validate existing materialized state: %w", err)
 		}
 	}
-	if root != nil && root.Index > material.Tip() {
+	if root != nil && (root.Index > material.Tip() || drAssignment != nil && root.Index == material.Tip()) {
 		tempDir, err := os.MkdirTemp("", ".rhiza-prepare-checkpoint-")
 		if err != nil {
 			return execution, err
@@ -716,7 +754,9 @@ func preparedEndpointIdentity(value string) (string, error) {
 }
 
 func preparedMarkerMatchesConfig(marker, expected preparedRestoreMarker) bool {
-	return marker.Version == 1 && marker.PodUID == expected.PodUID && marker.NodeID == expected.NodeID &&
+	assignmentsMatch := marker.DRAssignment == nil && expected.DRAssignment == nil ||
+		marker.DRAssignment != nil && expected.DRAssignment != nil && *marker.DRAssignment == *expected.DRAssignment
+	return assignmentsMatch && marker.Version == 1 && marker.PodUID == expected.PodUID && marker.NodeID == expected.NodeID &&
 		marker.ClusterID == expected.ClusterID && marker.SourceHash == expected.SourceHash &&
 		marker.StoreHash == expected.StoreHash && marker.BootstrapHash == expected.BootstrapHash
 }
@@ -878,6 +918,14 @@ func validatePreparedRestoreMarker(config *types.ExecutionConfig) error {
 	if config.PreparedPodUID == "" {
 		return nil
 	}
+	if assignment, ok, err := preparedDRAssignmentForRuntime(config); err != nil {
+		return err
+	} else if ok && assignment != nil {
+		return nil
+	}
+	if preparedGenesisNodeCandidate(config) {
+		return validatePreparedGenesisRuntimeConfig(config)
+	}
 	expected, err := preparedMarkerForConfig(config)
 	if err != nil {
 		return err
@@ -898,6 +946,9 @@ func validatePreparedRestoreMarker(config *types.ExecutionConfig) error {
 func validatePreparedMarkerContents(marker preparedRestoreMarker) error {
 	if marker.Version != 1 || marker.Phase != "preparing" && marker.Phase != "complete" {
 		return fmt.Errorf("prepared restore marker has unsupported version or phase")
+	}
+	if marker.DRAssignment != nil && (marker.DRAssignment.Validate() != nil || marker.DRAssignment.Purpose != fencing.BootstrapDRSuccessor) {
+		return fmt.Errorf("prepared restore marker has an invalid DR assignment")
 	}
 	if marker.Phase == "preparing" && marker.CertifiedTip == 0 {
 		if marker.BaseIndex != 0 || marker.BaseRootHash != "" || marker.BaseStateHash != "" || marker.BasePrefixHash != "" || marker.TipPrefixHash != "" {
@@ -932,4 +983,27 @@ func validatePreparedMarkerContents(marker preparedRestoreMarker) error {
 		}
 	}
 	return nil
+}
+
+func preparedDRAssignmentForRuntime(config *types.ExecutionConfig) (*fencing.BootstrapAssignment, bool, error) {
+	marker, exists, err := readPreparedRestoreMarker(config.DataDir)
+	if err != nil || !exists || marker.DRAssignment == nil {
+		return nil, false, err
+	}
+	if marker.Phase != "complete" {
+		return nil, true, fmt.Errorf("prepared DR restore marker is not complete; preserve DataDir")
+	}
+	if _, err := validateManagedDRSuccessorAssignment(config, *marker.DRAssignment); err != nil {
+		return nil, true, err
+	}
+	expected, err := preparedMarkerForConfig(config)
+	if err != nil {
+		return nil, true, err
+	}
+	expected.DRAssignment = marker.DRAssignment
+	if !preparedMarkerMatchesConfig(marker, expected) {
+		return nil, true, fmt.Errorf("prepared DR marker differs from current target profile; preserve DataDir")
+	}
+	assignment := *marker.DRAssignment
+	return &assignment, true, nil
 }

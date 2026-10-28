@@ -5,7 +5,11 @@ import (
 	"errors"
 	"path/filepath"
 	"testing"
+	"time"
 
+	"github.com/mrchypark/rhiza/internal/types"
+	"github.com/mrchypark/rhiza/pkg/checkpoint"
+	"github.com/mrchypark/rhiza/pkg/materializer"
 	"github.com/mrchypark/rhiza/pkg/qlog"
 	"github.com/mrchypark/rhiza/pkg/quepaxa"
 	"github.com/thanos-io/objstore"
@@ -85,6 +89,227 @@ func TestVerifyCertifiedBarrier(t *testing.T) {
 	}
 	if _, _, err := verifier.VerifyCertifiedBarrier(ctx, initial, true, barrierSlot, nonce); err == nil {
 		t.Fatal("verification trusted cached extent after its backing object disappeared")
+	}
+}
+
+func TestVerifyCertifiedBarrierWithEvidenceUsesAnchorFloorAndRejectsBadExpectation(t *testing.T) {
+	ctx := context.Background()
+	fixture := newCertifiedBaseFixture(t)
+	initial, slot, nonce := publishAnchoredBarrier(t, fixture)
+	verifier := NewManager(fixture.bucket, fixture.prefix, 1)
+	defer verifier.Close()
+	opts := evidenceOptionsForAnchorFixture(fixture)
+	state, err := verifier.VerifyCertifiedBarrierWithEvidenceState(ctx, initial, true, slot, nonce, opts)
+	if err != nil {
+		t.Fatalf("verify anchored barrier after administrative floor: %v", err)
+	}
+	if state.Decision.Slot != slot || state.Membership.ConfigID != 1 || len(state.Membership.Members) != len(initial.Members) ||
+		state.PrefixHash == ([32]byte{}) || state.Pending || state.HasAbort {
+		t.Fatalf("wrong anchored barrier state: %+v", state)
+	}
+
+	wrongNonce := nonce
+	wrongNonce[0] ^= 0x80
+	if _, _, err := verifier.VerifyCertifiedBarrierWithEvidence(ctx, initial, true, slot, wrongNonce, opts); err == nil {
+		t.Fatal("accepted a barrier with the wrong nonce")
+	}
+	missing := opts
+	missing.ExpectedAnchorHash[0] ^= 1
+	if _, _, err := verifier.VerifyCertifiedBarrierWithEvidence(ctx, initial, true, slot, nonce, missing); err == nil {
+		t.Fatal("accepted a missing or mismatched expected anchor")
+	}
+}
+
+func TestVerifyCertifiedBarrierWithEvidenceRejectsCompactedBarrier(t *testing.T) {
+	ctx := context.Background()
+	fixture := newCertifiedBaseFixture(t)
+	initial, slot, _ := publishAnchoredBarrier(t, fixture)
+	publishAnchoredBarrierCheckpoint(t, fixture, initial)
+	verifier := NewManager(fixture.bucket, fixture.prefix, 1)
+	defer verifier.Close()
+	if _, _, err := verifier.VerifyCertifiedBarrierWithEvidence(ctx, initial, true, slot, [quepaxa.ReadBarrierNonceSize]byte{0x5a}, evidenceOptionsForAnchorFixture(fixture)); err == nil {
+		t.Fatal("accepted a barrier decision compacted behind the selected checkpoint base")
+	}
+}
+
+func evidenceOptionsForAnchorFixture(fixture certifiedBaseFixture) EvidenceOptions {
+	return EvidenceOptions{
+		ExpectedAnchorHash: fixture.anchorHash, ExpectedMembership: fixture.membership,
+		ExpectedForkResult:   ForkResult{Tip: fixture.anchor.SourceTip, ManifestHash: fixture.anchor.SourceManifest, PrefixHash: fixture.anchor.SourcePrefixHash},
+		ExpectedSourcePrefix: fixture.anchor.SourcePrefix, ExpectedOperationID: fixture.anchor.OperationID,
+	}
+}
+
+func publishAnchoredBarrier(t *testing.T, fixture certifiedBaseFixture) (quepaxa.Cluster, quepaxa.Slot, [quepaxa.ReadBarrierNonceSize]byte) {
+	t.Helper()
+	ctx := context.Background()
+	initial := quepaxa.Cluster{ConfigID: 1, Members: fixture.members}
+	wal, err := qlog.Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = wal.Close() })
+	core, err := quepaxa.New(quepaxa.Config{NodeID: fixture.members[0].ID, Cluster: initial, WAL: wal, EnableReconfiguration: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	core.SetCheckpointValidator(func(ctx context.Context, seal quepaxa.CheckpointSeal) error {
+		return fixture.checkpoints.Verify(ctx, uint64(seal.Index), seal.RootHash, seal.StateHash)
+	})
+	prefixHash := mustGenerationHash(fixture.anchor.SourcePrefixHash)
+	rootHash := mustGenerationHash(fixture.anchor.Checkpoint.RootHash)
+	if err := core.InstallFencedGenerationBase(ctx, quepaxa.FencedGenerationBase{
+		ConfigID: 1, Index: quepaxa.Slot(fixture.anchor.SourceTip), PrefixHash: prefixHash,
+		RootHash: rootHash, AnchorHash: fixture.anchorHash,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	var nonce [quepaxa.ReadBarrierNonceSize]byte
+	nonce[0] = 0x5a
+	slot, _, err := core.Propose(ctx, quepaxa.EncodeReadBarrier(nonce))
+	if err != nil {
+		t.Fatal(err)
+	}
+	value, err := types.EncodeGraphCommand(types.GraphCommand{RequestID: "post-barrier-write", Events: []types.GraphStreamEvent{{Stream: "barrier", Kind: "created", Payload: "certified"}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := core.Propose(ctx, value); err != nil {
+		t.Fatal(err)
+	}
+	if err := fixture.archive.SyncThrough(ctx, core, core.Tip()); err != nil {
+		t.Fatal(err)
+	}
+	return initial, slot, nonce
+}
+
+func publishAnchoredBarrierCheckpoint(t *testing.T, fixture certifiedBaseFixture, initial quepaxa.Cluster) {
+	t.Helper()
+	ctx := context.Background()
+	wal, err := qlog.Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = wal.Close() })
+	core, err := quepaxa.New(quepaxa.Config{NodeID: initial.Members[0].ID, Cluster: initial, WAL: wal, EnableReconfiguration: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	core.SetCheckpointValidator(func(ctx context.Context, seal quepaxa.CheckpointSeal) error {
+		return fixture.checkpoints.Verify(ctx, uint64(seal.Index), seal.RootHash, seal.StateHash)
+	})
+	if err := core.InstallFencedGenerationBase(ctx, quepaxa.FencedGenerationBase{
+		ConfigID: 1, Index: quepaxa.Slot(fixture.anchor.SourceTip), PrefixHash: mustGenerationHash(fixture.anchor.SourcePrefixHash),
+		RootHash: mustGenerationHash(fixture.anchor.Checkpoint.RootHash), AnchorHash: fixture.anchorHash,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	var nonce [quepaxa.ReadBarrierNonceSize]byte
+	nonce[0] = 0x5a
+	if _, _, err := core.Propose(ctx, quepaxa.EncodeReadBarrier(nonce)); err != nil {
+		t.Fatal(err)
+	}
+	value, err := types.EncodeGraphCommand(types.GraphCommand{RequestID: "post-barrier-write", Events: []types.GraphStreamEvent{{Stream: "barrier", Kind: "created", Payload: "certified"}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := core.Propose(ctx, value); err != nil {
+		t.Fatal(err)
+	}
+	anchorRoot, err := fixture.checkpoints.OpenRoot(ctx, fixture.anchor.Checkpoint.Index, mustGenerationHash(fixture.anchor.Checkpoint.RootHash))
+	if err != nil {
+		t.Fatal(err)
+	}
+	files, err := fixture.checkpoints.DownloadAndVerifyRootFiles(ctx, anchorRoot, t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	state, err := materializer.Open(filepath.Join(t.TempDir(), "restored.db"), 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = state.Close() })
+	restoreFiles := make([]materializer.CheckpointFile, 0, len(files))
+	for _, file := range files {
+		restoreFiles = append(restoreFiles, materializer.CheckpointFile{Role: materializer.CheckpointRole(file.Role), Path: file.Path})
+	}
+	if err := state.RestoreCheckpoint(ctx, restoreFiles); err != nil {
+		t.Fatal(err)
+	}
+	decisions := make([]quepaxa.DecidedValue, 0, int(core.Tip())-int(fixture.anchor.SourceTip))
+	for index := quepaxa.Slot(fixture.anchor.SourceTip + 1); index <= core.Tip(); index++ {
+		decision, ok := core.CertifiedValue(index)
+		if !ok {
+			t.Fatalf("missing certified target decision at %d", index)
+		}
+		decisions = append(decisions, decision)
+	}
+	if err := state.ApplyBatch(ctx, decisions); err != nil {
+		t.Fatal(err)
+	}
+	checkpointFiles, index, cleanup, err := state.CheckpointFilesAt(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(cleanup)
+	sources := make([]checkpoint.Source, 0, len(checkpointFiles))
+	for _, file := range checkpointFiles {
+		sources = append(sources, checkpoint.Source{Role: string(file.Role), Path: file.Path})
+	}
+	claim, err := fixture.checkpoints.AcquirePublisherClaim(ctx, "barrier-compaction", 0, time.Minute)
+	if err != nil {
+		t.Fatal(err)
+	}
+	root, err := fixture.checkpoints.CreateFiles(ctx, claim, sources, index)
+	if err != nil {
+		t.Fatal(err)
+	}
+	claim, err = fixture.checkpoints.BindPublisherClaim(ctx, claim, index, root.RootHash, time.Minute)
+	if err != nil {
+		t.Fatal(err)
+	}
+	prefix, ok := core.PrefixHash(core.Tip())
+	if !ok {
+		t.Fatal("target checkpoint prefix unavailable")
+	}
+	next, following, err := core.CheckpointLeaderOrders(core.Tip())
+	if err != nil {
+		t.Fatal(err)
+	}
+	membership, err := core.CheckpointMembership(core.Tip())
+	if err != nil {
+		t.Fatal(err)
+	}
+	seal := quepaxa.CheckpointSeal{ConfigID: 1, Index: core.Tip(), RootHash: root.RootHash, StateHash: root.Hash, PrefixHash: prefix, NextLeaderOrder: next, FollowingLeaderOrder: following, Membership: &membership, GenerationAnchorHash: fixture.anchorHash}
+	if err := core.PrepareCheckpoint(ctx, seal); err != nil {
+		t.Fatal(err)
+	}
+	encoded, err := quepaxa.EncodeCheckpointSeal(seal)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := core.Propose(ctx, encoded); err != nil {
+		t.Fatal(err)
+	}
+	if err := fixture.archive.SyncThrough(ctx, core, core.Tip()); err != nil {
+		t.Fatal(err)
+	}
+	sealed, ok, err := core.LatestCheckpointSeal()
+	if err != nil || !ok {
+		t.Fatalf("target checkpoint seal unavailable: %v", err)
+	}
+	decision, ok := core.CertifiedValue(sealed.DecisionSlot)
+	if !ok {
+		t.Fatal("target checkpoint decision unavailable")
+	}
+	if err := fixture.checkpoints.PromoteCertifiedCurrent(ctx, root); err != nil {
+		t.Fatal(err)
+	}
+	if err := fixture.archive.TrimThrough(ctx, sealed, decision); err != nil {
+		t.Fatal(err)
+	}
+	if err := fixture.checkpoints.ReleasePublisherClaim(ctx, claim); err != nil {
+		t.Fatal(err)
 	}
 }
 

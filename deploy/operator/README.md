@@ -46,6 +46,29 @@ the bucket endpoint and credentials appropriate for the selected provider.
 Generation-specific peer credentials are distinct secrets created by the
 controller; they must not reuse the source voters' credentials.
 
+The operator and `rhiza-fencer` authority can also use the same optional
+external recovery-anchor configuration. Only create the `rhiza-recovery-anchor`
+ConfigMap from
+[`fencing/recovery-anchor-config.example.yaml`](fencing/recovery-anchor-config.example.yaml)
+after replacing its URL and storage ID with the values trusted for this
+installation. Both deployments consume it with `optional: true`; when absent,
+the anchor client remains disabled. When present, the URL, token-file path, and
+explicit `RHIZA_RECOVERY_ANCHOR_STORAGE_ID` are required together. The storage
+ID must be the authority's exact target binding, not a guessed bucket or
+prefix. For a private CA, set `RHIZA_RECOVERY_ANCHOR_CA_FILE` to
+`/var/run/secrets/rhiza-recovery-anchor-ca/ca.crt` and create the separate,
+optional `rhiza-recovery-anchor-ca` ConfigMap with only its `ca.crt` key. Both
+Deployments mount the optional `rhiza-recovery-anchor-token` Secret read-only
+at `/var/run/secrets/rhiza-recovery-anchor-token`; its `token` key must contain
+the same externally provisioned static bearer value that the anchor service
+reads through `ANCHOR_TOKEN_FILE`. Provision that value outside Git in the
+anchor and client namespaces. Incomplete configured anchor environment values
+are rejected at startup. The token and optional CA files are read when anchor
+admission is requested; if either configured file is missing or unreadable,
+that request fails and DR admission cannot proceed. A missing file does not
+prevent startup when no anchor admission is attempted. The sample contains no
+bearer token or private key.
+
 ## Operator image
 
 Published GitHub releases build and push `ghcr.io/mrchypark/rhiza-operator`

@@ -8,9 +8,24 @@ import (
 	"os"
 
 	"github.com/mrchypark/rhiza/internal/types"
+	"github.com/mrchypark/rhiza/pkg/checkpoint"
 	"github.com/mrchypark/rhiza/pkg/qlog"
 	"github.com/mrchypark/rhiza/pkg/quepaxa"
 )
+
+// CertifiedBarrierState is the replayed source state at one exact certified
+// read-barrier decision. It is safe to consume only with the caller's trusted
+// membership/anchor expectations and a successful archive-stability check.
+type CertifiedBarrierState struct {
+	Decision      quepaxa.DecidedValue
+	Membership    quepaxa.Cluster
+	PrefixHash    [32]byte
+	AbortSlot     quepaxa.Slot
+	AbortTarget   quepaxa.Cluster
+	HasAbort      bool
+	Pending       bool
+	PendingTarget quepaxa.Cluster
+}
 
 // ReplayCertifiedThrough replays contiguous certified archive pages into a
 // passive observer. The callback must return the same captured archive tip for
@@ -76,6 +91,63 @@ func (m *Manager) VerifyCertifiedBarrier(
 	slot quepaxa.Slot,
 	expectedNonce [quepaxa.ReadBarrierNonceSize]byte,
 ) (decision quepaxa.DecidedValue, membership quepaxa.Cluster, resultErr error) {
+	return m.verifyCertifiedBarrier(ctx, trustedInitial, enableReconfiguration, slot, expectedNonce, nil, nil)
+}
+
+// VerifyCertifiedBarrierState returns the exact reconstructed chain and
+// membership-transition state at the certified barrier after validating the
+// archive snapshot remains unchanged.
+func (m *Manager) VerifyCertifiedBarrierState(
+	ctx context.Context,
+	trustedInitial quepaxa.Cluster,
+	enableReconfiguration bool,
+	slot quepaxa.Slot,
+	expectedNonce [quepaxa.ReadBarrierNonceSize]byte,
+) (CertifiedBarrierState, error) {
+	var state CertifiedBarrierState
+	_, _, err := m.verifyCertifiedBarrier(ctx, trustedInitial, enableReconfiguration, slot, expectedNonce, nil, &state)
+	return state, err
+}
+
+// VerifyCertifiedBarrierWithEvidence verifies a read barrier after installing
+// the generation anchor and certified checkpoint base selected by a fresh
+// archive view. expected must come from the approved recovery contract.
+func (m *Manager) VerifyCertifiedBarrierWithEvidence(
+	ctx context.Context,
+	trustedInitial quepaxa.Cluster,
+	enableReconfiguration bool,
+	slot quepaxa.Slot,
+	expectedNonce [quepaxa.ReadBarrierNonceSize]byte,
+	expected EvidenceOptions,
+) (decision quepaxa.DecidedValue, membership quepaxa.Cluster, resultErr error) {
+	return m.verifyCertifiedBarrier(ctx, trustedInitial, enableReconfiguration, slot, expectedNonce, &expected, nil)
+}
+
+// VerifyCertifiedBarrierWithEvidenceState is the anchored/checkpoint-aware
+// form of VerifyCertifiedBarrierState. Trusted expectations come from the
+// retained repair authorization, not the selected archive view.
+func (m *Manager) VerifyCertifiedBarrierWithEvidenceState(
+	ctx context.Context,
+	trustedInitial quepaxa.Cluster,
+	enableReconfiguration bool,
+	slot quepaxa.Slot,
+	expectedNonce [quepaxa.ReadBarrierNonceSize]byte,
+	expected EvidenceOptions,
+) (CertifiedBarrierState, error) {
+	var state CertifiedBarrierState
+	_, _, err := m.verifyCertifiedBarrier(ctx, trustedInitial, enableReconfiguration, slot, expectedNonce, &expected, &state)
+	return state, err
+}
+
+func (m *Manager) verifyCertifiedBarrier(
+	ctx context.Context,
+	trustedInitial quepaxa.Cluster,
+	enableReconfiguration bool,
+	slot quepaxa.Slot,
+	expectedNonce [quepaxa.ReadBarrierNonceSize]byte,
+	expected *EvidenceOptions,
+	verified *CertifiedBarrierState,
+) (decision quepaxa.DecidedValue, membership quepaxa.Cluster, resultErr error) {
 	var zero quepaxa.DecidedValue
 	if m == nil || m.bucket == nil || m.configID != 1 || slot == 0 {
 		return zero, quepaxa.Cluster{}, fmt.Errorf("certified barrier slot must be positive")
@@ -94,8 +166,29 @@ func (m *Manager) VerifyCertifiedBarrier(
 	refs := append([]Extent(nil), reader.extents...)
 	tip := reader.tip
 	reader.mu.Unlock()
-	if head.Sealed || head.Base != 0 || head.BasePrefix != ([32]byte{}) || head.BaseSeal != nil || head.BaseDecision != nil || head.BaseAnchor != nil || head.LineageAnchor != nil || slot > tip {
-		return zero, quepaxa.Cluster{}, fmt.Errorf("certified barrier source is sealed, compacted, anchored, or behind the requested slot")
+	var view CertifiedArchiveView
+	if expected == nil {
+		if head.Sealed || head.Base != 0 || head.BasePrefix != ([32]byte{}) || head.BaseSeal != nil || head.BaseDecision != nil || head.BaseAnchor != nil || head.LineageAnchor != nil || slot > tip {
+			return zero, quepaxa.Cluster{}, fmt.Errorf("certified barrier source is sealed, compacted, anchored, or behind the requested slot")
+		}
+	} else {
+		var err error
+		view, err = reader.CaptureCertifiedView()
+		if err != nil {
+			return zero, quepaxa.Cluster{}, err
+		}
+		if err := validateEvidenceOptions(*expected); err != nil {
+			return zero, quepaxa.Cluster{}, err
+		}
+		if trustedInitial.ConfigID != 1 || NewMembershipRecord(expected.ExpectedMembership.Cluster, trustedInitial.Members, expected.ExpectedMembership.Durability) != expected.ExpectedMembership {
+			return zero, quepaxa.Cluster{}, fmt.Errorf("trusted initial membership differs from expected target membership")
+		}
+		if _, err := VerifyExpectedAnchorForView(ctx, view, *expected); err != nil {
+			return zero, quepaxa.Cluster{}, fmt.Errorf("verify expected generation anchor: %w", err)
+		}
+		if head.Sealed || slot > tip {
+			return zero, quepaxa.Cluster{}, fmt.Errorf("certified barrier source is sealed or behind the requested slot")
+		}
 	}
 	if trustedInitial.ConfigID == 0 || len(trustedInitial.Members) == 0 {
 		return zero, quepaxa.Cluster{}, fmt.Errorf("trusted initial membership is unavailable")
@@ -121,6 +214,15 @@ func (m *Manager) VerifyCertifiedBarrier(
 	})
 	if err != nil {
 		return zero, quepaxa.Cluster{}, err
+	}
+	if expected != nil {
+		checkpoints := checkpoint.NewManager(reader.bucket, reader.prefix, "", 1)
+		core.SetCheckpointValidator(func(checkpointCtx context.Context, seal quepaxa.CheckpointSeal) error {
+			return checkpoints.Verify(checkpointCtx, uint64(seal.Index), seal.RootHash, seal.StateHash)
+		})
+		if _, err := InitializeCertifiedRecoveryBase(ctx, core, view, expected.ExpectedMembership, expected.ExpectedAnchorHash, checkpoints); err != nil {
+			return zero, quepaxa.Cluster{}, fmt.Errorf("initialize certified recovery base: %w", err)
+		}
 	}
 	readPage := func(pageCtx context.Context, from quepaxa.Slot, limit int) ([]quepaxa.DecidedValue, quepaxa.Slot, error) {
 		values, observedTip, err := reader.DecisionsFrom(pageCtx, from, limit)
@@ -160,6 +262,19 @@ func (m *Manager) VerifyCertifiedBarrier(
 	}
 	if err := ctx.Err(); err != nil {
 		return zero, quepaxa.Cluster{}, err
+	}
+	if verified != nil {
+		prefixHash, ok := core.PrefixHash(slot)
+		if !ok {
+			return zero, quepaxa.Cluster{}, fmt.Errorf("certified barrier prefix is unavailable")
+		}
+		pendingTarget, pending := core.PendingReconfiguration()
+		abortSlot, abortTarget, hasAbort := core.LastReconfigurationAbort()
+		*verified = CertifiedBarrierState{
+			Decision: decision, Membership: cluster, PrefixHash: prefixHash,
+			AbortSlot: abortSlot, AbortTarget: abortTarget, HasAbort: hasAbort,
+			Pending: pending, PendingTarget: pendingTarget,
+		}
 	}
 	return decision, cluster, nil
 }

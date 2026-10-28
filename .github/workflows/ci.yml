@@ -67,9 +67,11 @@ jobs:
           go build -o "$RUNNER_TEMP/fencing-images/rhiza" ./cmd/rhiza
           go build -o "$RUNNER_TEMP/fencing-images/rhiza-operator" ./cmd/rhiza-operator
           go build -o "$RUNNER_TEMP/fencing-images/rhiza-fencer" ./cmd/rhiza-fencer
+          go build -o "$RUNNER_TEMP/fencing-images/anchor-service" ./examples/recovery-anchor
           go build -o "$RUNNER_TEMP/fencing-e2e" ./e2e/fencing
           cp "$RUNNER_TEMP/fencing-e2e" "$RUNNER_TEMP/fencing-images/fencing-e2e"
           docker build -f Dockerfile.fencing-test -t rhiza-fencing-host:local -t rhiza-fencing-operator:local "$RUNNER_TEMP/fencing-images"
+          docker build -f e2e/chaos/Dockerfile --build-arg BINARY=anchor-service -t rhiza-anchor-service:local "$RUNNER_TEMP/fencing-images"
           if kind get clusters | grep -Fx rhiza-generic-fencing; then exit 1; fi
           printf '%s\n' rhiza-generic-fencing > cooperative-fencing-results/owned-cluster.txt
           FENCING_E2E_BIN="$RUNNER_TEMP/fencing-e2e" sh e2e/fencing/run.sh

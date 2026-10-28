@@ -22,6 +22,7 @@ import (
 	"github.com/mrchypark/rhiza/pkg/qlog"
 	"github.com/mrchypark/rhiza/pkg/quepaxa"
 	"github.com/mrchypark/rhiza/pkg/recovery"
+	"github.com/mrchypark/rhiza/pkg/recoveryanchor"
 	"github.com/thanos-io/objstore"
 )
 
@@ -725,7 +726,7 @@ func controllerFixtureVoters(t *testing.T, sourceMode, targetMode string, voters
 	r := &Resource{Metadata: map[string]any{"name": "recover", "uid": "resource-uid", "generation": float64(1), "resourceVersion": "1"}, Spec: Spec{StatefulSet: "rhiza", SourceClusterID: "source", Durability: targetMode}}
 	api := newOperatorAPIVoters(t, r, sourceMode, voters)
 	t.Cleanup(api.Close)
-	return ctx, bucket, r, api, &Controller{Kube: api.kube(t), Bucket: bucket, Prefix: "root", StoreIdentity: storeIdentity()}
+	return ctx, bucket, r, api, &Controller{Kube: api.kube(t), Bucket: bucket, Prefix: "root", StoreIdentity: storeIdentity(), AnchorBinding: recoveryanchor.Binding{StorageID: "test-anchor-store"}}
 }
 
 type operatorAPI struct {
@@ -733,6 +734,7 @@ type operatorAPI struct {
 	r                             *Resource
 	sts                           object
 	secret                        object
+	configmaps                    map[string]object
 	membershipSecret              object
 	membershipSecrets             map[string]object
 	replacement                   object
@@ -871,9 +873,30 @@ func (a *operatorAPI) serve(w http.ResponseWriter, q *http.Request) {
 			var next object
 			if json.NewDecoder(q.Body).Decode(&next) == nil {
 				if a.secret == nil {
+					meta := asObject(next["metadata"])
+					if str(meta["uid"]) == "" {
+						meta["uid"] = "secret-" + str(meta["name"])
+					}
 					a.secret = next
 				}
 				json.NewEncoder(w).Encode(a.secret)
+				return
+			}
+		}
+	case "/api/v1/namespaces/default/configmaps":
+		if q.Method == "POST" {
+			var next object
+			if json.NewDecoder(q.Body).Decode(&next) == nil {
+				meta := asObject(next["metadata"])
+				if meta["uid"] == nil {
+					meta["uid"] = "configmap-" + str(meta["name"])
+				}
+				meta["resourceVersion"] = "1"
+				if a.configmaps == nil {
+					a.configmaps = map[string]object{}
+				}
+				a.configmaps[str(meta["name"])] = next
+				_ = json.NewEncoder(w).Encode(next)
 				return
 			}
 		}
@@ -916,6 +939,28 @@ func (a *operatorAPI) serve(w http.ResponseWriter, q *http.Request) {
 			return
 		}
 	}
+	if strings.HasPrefix(q.URL.Path, "/api/v1/namespaces/default/configmaps/") {
+		name := strings.TrimPrefix(q.URL.Path, "/api/v1/namespaces/default/configmaps/")
+		switch q.Method {
+		case "GET":
+			if cm := a.configmaps[name]; cm != nil {
+				_ = json.NewEncoder(w).Encode(cm)
+				return
+			}
+		case "PUT":
+			var next object
+			if json.NewDecoder(q.Body).Decode(&next) == nil {
+				if a.configmaps[name] == nil {
+					http.NotFound(w, q)
+					return
+				}
+				asObject(next["metadata"])["resourceVersion"] = "2"
+				a.configmaps[name] = next
+				_ = json.NewEncoder(w).Encode(next)
+				return
+			}
+		}
+	}
 	if q.Method == "GET" && a.secret != nil && strings.HasPrefix(q.URL.Path, "/api/v1/namespaces/default/secrets/rhiza-recovery-") {
 		json.NewEncoder(w).Encode(a.secret)
 		return
@@ -942,10 +987,24 @@ func (a *operatorAPI) pods() []object {
 		if err != nil {
 			continue
 		}
+		specBytes, _ := json.Marshal(nested(a.sts, "spec", "template", "spec"))
+		var podSpec object
+		_ = json.Unmarshal(specBytes, &podSpec)
+		if containers := list(podSpec["containers"]); len(containers) == 1 {
+			asObject(containers[0])["ports"] = []any{object{"name": "http", "containerPort": float64(p)}}
+		}
+		podMetaBytes, _ := json.Marshal(nested(a.sts, "spec", "template", "metadata"))
+		var podMeta object
+		_ = json.Unmarshal(podMetaBytes, &podMeta)
+		if podMeta == nil {
+			podMeta = object{}
+		}
+		podMeta["name"], podMeta["uid"] = string(a.voters[i].ID), "pod-"+string(a.voters[i].ID)
+		podMeta["ownerReferences"] = []any{object{"apiVersion": "apps/v1", "kind": "StatefulSet", "name": "rhiza", "uid": "sts-uid", "controller": true}}
 		result = append(result, object{
-			"metadata": object{"name": string(a.voters[i].ID), "uid": "pod-" + string(a.voters[i].ID), "ownerReferences": []any{object{"uid": "sts-uid", "kind": "StatefulSet"}}},
+			"metadata": podMeta,
 			"status":   object{"podIP": "127.0.0.1"},
-			"spec":     object{"containers": []any{object{"name": "rhiza", "ports": []any{object{"name": "http", "containerPort": float64(p)}}}}},
+			"spec":     podSpec,
 		})
 	}
 	return result

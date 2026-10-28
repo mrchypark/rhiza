@@ -42,6 +42,16 @@ func (c *Controller) assessAutomaticEscalation(ctx context.Context, r *ClusterRe
 		fencePods[ref.NodeID] = ref.Pod
 	}
 	voters := append([]VoterPod(nil), intent.Voters...)
+	learnerID := intent.LearnerName
+	if intent.LearnerUID != "" {
+		learnerID, err = learnerNodeID(state, intent.LearnerName, intent.LearnerUID)
+		if str(nested(sts, "spec", "template", "metadata", "annotations", fencingProtocolAnnotation)) == "1" {
+			learnerID, err = capturedLearnerNodeID(state, intent.LearnerName, intent.LearnerUID)
+		}
+		if err != nil {
+			return automaticEscalationStop, c.autoStatus(ctx, r, state, "Blocked", "learner incarnation identity is unavailable")
+		}
+	}
 	for _, ref := range voters {
 		if fencePods[ref.NodeID] != ref.Pod {
 			return automaticEscalationStop, c.autoStatus(ctx, r, state, "Blocked", "intent voter is outside the generation fencing scope")
@@ -51,10 +61,10 @@ func (c *Controller) assessAutomaticEscalation(ctx context.Context, r *ClusterRe
 	// Pod UID and WAL identity have been captured. Its history still remains in
 	// the later generation-fence inventory through includeLearnerHistory.
 	if intent.LearnerName != "" && intent.LearnerUID != "" && intent.LearnerWAL != "" {
-		voters = append(voters, VoterPod{NodeID: quepaxa.NodeID(intent.LearnerName), Pod: intent.LearnerName})
-		fencePods[quepaxa.NodeID(intent.LearnerName)] = intent.LearnerName
+		voters = append(voters, VoterPod{NodeID: quepaxa.NodeID(learnerID), Pod: intent.LearnerName})
+		fencePods[quepaxa.NodeID(learnerID)] = intent.LearnerName
 	}
-	allowedMemberships := automaticIntentMemberships(intent)
+	allowedMemberships := automaticIntentMemberships(intent, learnerID)
 	var quorum bool
 	probes := 0
 	for _, ref := range voters {
@@ -65,8 +75,8 @@ func (c *Controller) assessAutomaticEscalation(ctx context.Context, r *ClusterRe
 			return automaticEscalationWait, err
 		}
 		expected, expectedOK := state.Identities[ref.NodeID]
-		if ref.NodeID == quepaxa.NodeID(intent.LearnerName) {
-			expected = FenceTarget{NodeID: string(ref.NodeID), Pod: ref.Pod, PodUID: intent.LearnerUID, WALIdentity: intent.LearnerWAL}
+		if ref.NodeID == quepaxa.NodeID(learnerID) {
+			expected = FenceTarget{NodeID: learnerID, Pod: ref.Pod, PodUID: intent.LearnerUID, WALIdentity: intent.LearnerWAL}
 			expectedOK = intent.LearnerUID != "" && intent.LearnerWAL != ""
 		}
 		if !expectedOK || expected.NodeID != string(ref.NodeID) || expected.Pod != ref.Pod || expected.PodUID == "" || expected.WALIdentity == "" {
@@ -120,10 +130,10 @@ func (c *Controller) assessAutomaticEscalation(ctx context.Context, r *ClusterRe
 		if status.WALIdentity != expected.WALIdentity {
 			return automaticEscalationStop, c.autoStatus(ctx, r, state, "Blocked", "voter WAL identity differs from the generation fencing scope")
 		}
-		if ref.NodeID != quepaxa.NodeID(intent.LearnerName) && !status.Voting {
+		if ref.NodeID != quepaxa.NodeID(learnerID) && !status.Voting {
 			return automaticEscalationStop, c.autoStatus(ctx, r, state, "Blocked", "voter recovery probe is outside the generation fencing scope")
 		}
-		if string(ref.NodeID) == intent.LearnerName && status.WALIdentity != intent.LearnerWAL && intent.LearnerWAL != "" {
+		if string(ref.NodeID) == learnerID && status.WALIdentity != intent.LearnerWAL && intent.LearnerWAL != "" {
 			return automaticEscalationStop, c.autoStatus(ctx, r, state, "Blocked", "learner WAL differs from the generation fencing scope")
 		}
 		if !uniqueIDs(nodeIDs(status.Voters)) {
@@ -213,7 +223,11 @@ func (c *Controller) assessAutomaticEscalation(ctx context.Context, r *ClusterRe
 		request.Targets = append(request.Targets, target)
 	}
 	if intent.LearnerUID != "" {
-		request.Targets = append(request.Targets, learnerFenceTarget(state, intent.LearnerName, intent.LearnerUID, intent.LearnerWAL))
+		target, err := learnerFenceTarget(state, intent.LearnerName, intent.LearnerUID, intent.LearnerWAL)
+		if err != nil {
+			return automaticEscalationStop, c.autoStatus(ctx, r, state, "Blocked", "learner incarnation identity is unavailable")
+		}
+		request.Targets = append(request.Targets, target)
 	}
 	if err := includeLearnerHistory(state, &request); err != nil {
 		return automaticEscalationStop, err
@@ -233,7 +247,7 @@ func (c *Controller) assessAutomaticEscalation(ctx context.Context, r *ClusterRe
 	return automaticEscalationStop, c.autoStatus(ctx, r, state, "Fencing", "online quorum lost; generation-wide fencing reserved")
 }
 
-func automaticIntentMemberships(intent *autoIntent) [][]quepaxa.NodeID {
+func automaticIntentMemberships(intent *autoIntent, learnerID string) [][]quepaxa.NodeID {
 	base := voterPodIDs(intent.Voters)
 	allowed := [][]quepaxa.NodeID{base}
 	if intent.Failed != "" {
@@ -245,14 +259,14 @@ func automaticIntentMemberships(intent *autoIntent) [][]quepaxa.NodeID {
 		}
 		allowed = append(allowed, withoutFailed)
 		if intent.LearnerName != "" && intent.LearnerUID != "" && intent.LearnerWAL != "" {
-			learner := quepaxa.NodeID(intent.LearnerName)
+			learner := quepaxa.NodeID(learnerID)
 			withLearner := append(append([]quepaxa.NodeID(nil), base...), learner)
 			allowed = append(allowed, withLearner)
 			withoutFailed = append(withoutFailed, learner)
 			allowed = append(allowed, withoutFailed)
 		}
 	} else if intent.LearnerName != "" && intent.LearnerUID != "" && intent.LearnerWAL != "" {
-		allowed = append(allowed, append(append([]quepaxa.NodeID(nil), base...), quepaxa.NodeID(intent.LearnerName)))
+		allowed = append(allowed, append(append([]quepaxa.NodeID(nil), base...), quepaxa.NodeID(learnerID)))
 	}
 	return allowed
 }

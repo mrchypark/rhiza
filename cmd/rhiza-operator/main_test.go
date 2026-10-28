@@ -106,3 +106,29 @@ func TestFencerBackendPreservesLegacyHTTPAndDefaultsToKubernetes(t *testing.T) {
 		})
 	}
 }
+
+func TestRecoveryAnchorConfigurationIsAllOrNothing(t *testing.T) {
+	for _, test := range []struct {
+		name, endpoint, tokenFile, caFile, storageID string
+		configured, wantErr                          bool
+	}{
+		{name: "unconfigured remains legacy", configured: false},
+		{name: "complete without custom CA", endpoint: "https://anchor", tokenFile: "/token", storageID: "store", configured: true},
+		{name: "complete with custom CA", endpoint: "https://anchor", tokenFile: "/token", caFile: "/ca.pem", storageID: "store", configured: true},
+		{name: "endpoint only", endpoint: "https://anchor", wantErr: true},
+		{name: "token only", tokenFile: "/token", wantErr: true},
+		{name: "CA only", caFile: "/ca.pem", wantErr: true},
+		{name: "storage ID only", storageID: "store", wantErr: true},
+		{name: "CA with incomplete mandatory fields", endpoint: "https://anchor", caFile: "/ca.pem", storageID: "store", wantErr: true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			configured, err := recoveryAnchorConfigured(test.endpoint, test.tokenFile, test.caFile, test.storageID)
+			if (err != nil) != test.wantErr {
+				t.Fatalf("recoveryAnchorConfigured() error = %v, wantErr %t", err, test.wantErr)
+			}
+			if err == nil && configured != test.configured {
+				t.Fatalf("recoveryAnchorConfigured() = %t, want %t", configured, test.configured)
+			}
+		})
+	}
+}

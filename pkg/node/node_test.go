@@ -63,9 +63,19 @@ func TestOperationSyncPeerPermutationIsDeterministicAndBalanced(t *testing.T) {
 func TestTransientCatchUpFailureKeepsReadyNodeServing(t *testing.T) {
 	n := &Node{}
 	n.ready.Store(true)
-	n.observeCatchUp(errors.New("temporary peer timeout"))
+	n.observeCatchUp(context.Background(), errors.New("temporary peer timeout"))
 	if !n.ready.Load() {
 		t.Fatal("transient catch-up failure cleared readiness")
+	}
+}
+
+func TestPreparedInitialNodeDoesNotBecomeReadyWithoutRuntimeSession(t *testing.T) {
+	n := &Node{config: &types.ExecutionConfig{
+		PreparedPodUID: "pod-uid", NodeID: "n1", Members: []quepaxa.Member{{ID: "n1"}},
+	}}
+	n.observeCatchUp(context.Background(), nil)
+	if n.ready.Load() {
+		t.Fatal("prepared initial voter became ready without its bound fencing session")
 	}
 }
 

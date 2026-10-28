@@ -183,6 +183,29 @@ integration; unwrapped or unsupported hosts cannot produce this proof.
    can update fencing ledgers/status and read workload configuration. The
    additional ClusterRole can create TokenReviews only; it cannot modify nodes
    or Pods. Use namespace-specific ClusterRoleBinding names for multiple installs.
+   The authority and operator both consume an optional `rhiza-recovery-anchor`
+   ConfigMap. Leave it absent for installations that do not configure external
+   anchor admission. To enable it, edit and apply
+   `deploy/operator/fencing/recovery-anchor-config.example.yaml` with the same
+   trusted HTTPS anchor URL and explicit target `RHIZA_RECOVERY_ANCHOR_STORAGE_ID`
+   used by the operator. The token-file path must be
+   `/var/run/secrets/rhiza-recovery-anchor-token/token`. Create the optional
+   `rhiza-recovery-anchor-token` Secret with a `token` key, and provision the
+   same externally managed static bearer value to the anchor service's
+   `ANCHOR_TOKEN_FILE` and this Secret. Do not store the value in the example or
+   source control. Incomplete configured anchor environment values are rejected
+   at startup. The token and optional CA files are read when anchor admission
+   is requested; a missing or unreadable configured file makes that request
+   fail, so DR admission cannot proceed. A missing file does not prevent startup
+   when anchor admission is not attempted. For a private CA, set
+   `RHIZA_RECOVERY_ANCHOR_CA_FILE` to
+   `/var/run/secrets/rhiza-recovery-anchor-ca/ca.crt` and create the separate,
+   optional `rhiza-recovery-anchor-ca` ConfigMap with the issuing certificate
+   as its only `ca.crt` key. URL, token-file path, and
+   storage ID are required together; partial DR configuration fails closed.
+   The storage ID is the exact trusted anchor target binding, not a bucket or
+   prefix inferred by either deployment. The sample is not applied automatically
+   and contains no live credential.
 4. Apply the supervised StatefulSet patch to a **fresh** no-PVC generation. The
    file `deploy/operator/fencing/supervised-statefulset.patch.yaml` contains a
    strategic-merge patch and a separate application ServiceAccount document;

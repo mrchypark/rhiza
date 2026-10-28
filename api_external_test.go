@@ -10,6 +10,7 @@ import (
 	"testing"
 
 	"github.com/mrchypark/rhiza"
+	"github.com/mrchypark/rhiza/pkg/fencing"
 )
 
 func TestPublicPrepareRestoreRequiresExplicitClusterID(t *testing.T) {
@@ -20,6 +21,27 @@ func TestPublicPrepareRestoreRequiresExplicitClusterID(t *testing.T) {
 	}
 	if _, statErr := os.Lstat(dir); !os.IsNotExist(statErr) {
 		t.Fatalf("empty ClusterID created DataDir: %v", statErr)
+	}
+}
+
+func TestPublicPrepareManagedRestoreRejectsCredentialsAndForwardsAssignment(t *testing.T) {
+	for _, config := range []rhiza.Config{{AdminToken: "admin"}, {PeerToken: "peer"}} {
+		_, _, err := rhiza.PrepareManagedRestore(context.Background(), config, fencing.BootstrapAssignment{})
+		if err == nil || !strings.Contains(err.Error(), "must not receive runtime credentials") {
+			t.Fatalf("credential-bearing managed init error=%v", err)
+		}
+	}
+
+	dataDir := t.TempDir()
+	_, _, err := rhiza.PrepareManagedRestore(context.Background(), rhiza.Config{
+		ClusterID: "cluster", NodeID: "node", DataDir: dataDir, PreparedPodUID: "pod",
+	}, fencing.BootstrapAssignment{})
+	if err == nil || !strings.Contains(err.Error(), "incomplete bootstrap assignment") {
+		t.Fatalf("invalid assignment error=%v, want Node API validation", err)
+	}
+	entries, readErr := os.ReadDir(dataDir)
+	if readErr != nil || len(entries) != 0 {
+		t.Fatalf("invalid assignment changed DataDir: entries=%v err=%v", entries, readErr)
 	}
 }
 

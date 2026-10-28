@@ -10,6 +10,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"mime"
 	"net/http"
 
 	"github.com/mrchypark/rhiza/pkg/quepaxa"
@@ -32,6 +33,65 @@ type RecoveryProbe struct {
 	Nonce    string              `json:"nonce"`
 	Status   VoterRecoveryStatus `json:"status"`
 	MAC      string              `json:"mac"`
+}
+
+// MembershipRepairProbeRequest is a fresh authority-scoped request for one
+// current voter to verify an exact candidate prefix before old-member
+// closure. AbortSlot is a pointer so an explicit zero is distinct from absent.
+type MembershipRepairProbeRequest struct {
+	Version             uint           `json:"version"`
+	Challenge           string         `json:"challenge"`
+	ScopeDigest         string         `json:"scope_digest"`
+	SourceConfigID      uint           `json:"source_config_id"`
+	AbortSlot           *quepaxa.Slot  `json:"abort_slot"`
+	ExcludedOldMemberID string         `json:"excluded_old_member_id"`
+	CandidateMember     quepaxa.Member `json:"candidate_member"`
+	CandidateBindRef    string         `json:"candidate_bind_ref"`
+}
+
+// MembershipRepairProbeResponse reports the exact observations made by one
+// authenticated current voter. CandidatePrefix is populated only after the
+// runtime's real VerifyLearner call accepts the exact member/WAL/bind ref.
+// It is not a caller-supplied Verified flag.
+type MembershipRepairProbeResponse struct {
+	Version                uint             `json:"version"`
+	Challenge              string           `json:"challenge"`
+	ScopeDigest            string           `json:"scope_digest"`
+	VerifierNodeID         string           `json:"verifier_node_id"`
+	VerifierWALIdentity    string           `json:"verifier_wal_identity"`
+	Ready                  bool             `json:"ready"`
+	Voting                 bool             `json:"voting"`
+	Pending                bool             `json:"pending"`
+	SourceConfigID         uint             `json:"source_config_id"`
+	SourceMembers          []quepaxa.Member `json:"source_members"`
+	AbortSlot              *quepaxa.Slot    `json:"abort_slot"`
+	ExcludedOldMemberID    string           `json:"excluded_old_member_id"`
+	ReadIndexSlot          uint64           `json:"read_index_slot"`
+	BarrierSlot            uint64           `json:"barrier_slot"`
+	BarrierNonce           string           `json:"barrier_nonce"`
+	PrefixHash             string           `json:"prefix_hash"`
+	CandidateMember        quepaxa.Member   `json:"candidate_member"`
+	CandidateBindRef       string           `json:"candidate_bind_ref"`
+	CandidatePrefixThrough uint64           `json:"candidate_prefix_through"`
+	CandidatePrefixHash    string           `json:"candidate_prefix_hash"`
+	MAC                    string           `json:"mac"`
+}
+
+type MembershipRepairProbeFunc func(context.Context, MembershipRepairProbeRequest) (MembershipRepairProbeResponse, error)
+
+// SetMembershipRepairProbe installs the authenticated preclosure verifier
+// before the HTTP server is exposed.
+func (s *Server) SetMembershipRepairProbe(probe MembershipRepairProbeFunc) {
+	s.membershipRepairProbe = probe
+}
+
+// MembershipRepairBarrierNonce deterministically binds the barrier value to
+// the authority-issued challenge.
+func MembershipRepairBarrierNonce(challenge string) [quepaxa.ReadBarrierNonceSize]byte {
+	hash := sha256.Sum256([]byte("rhiza-membership-repair-barrier-v1\x00" + challenge))
+	var nonce [quepaxa.ReadBarrierNonceSize]byte
+	copy(nonce[:], hash[:len(nonce)])
+	return nonce
 }
 
 type legacyRecoveryStatus struct {
@@ -273,8 +333,41 @@ func StrictDecodeRecoveryProbe(data []byte, nonce, excluded, token string) (Reco
 }
 
 func (s *Server) handleRecoveryProbe(w http.ResponseWriter, r *http.Request) {
+	if r.Method == http.MethodPost {
+		token := s.recoveryArchiveToken
+		if token == "" || !matchesRecoveryBearer(r.Header.Get("Authorization"), token) {
+			writeHTTPError(w, http.StatusForbidden, "forbidden", "recovery probe is not authorized")
+			return
+		}
+		body, err := io.ReadAll(io.LimitReader(r.Body, 1<<20+1))
+		if err != nil || len(body) > 1<<20 {
+			writeHTTPError(w, http.StatusBadRequest, "invalid_request", "membership repair action body is invalid or too large")
+			return
+		}
+		if err := rejectDuplicateJSONKeys(body); err != nil {
+			writeHTTPError(w, http.StatusBadRequest, "invalid_request", "membership repair action contains duplicate fields")
+			return
+		}
+		var envelope map[string]json.RawMessage
+		if err := json.Unmarshal(body, &envelope); err != nil {
+			writeHTTPError(w, http.StatusBadRequest, "invalid_request", "membership repair action must be a JSON object")
+			return
+		}
+		if rawAction, present := envelope["action"]; present {
+			var action string
+			if err := json.Unmarshal(rawAction, &action); err != nil || action != MembershipRepairCompletionAction {
+				writeHTTPError(w, http.StatusBadRequest, "invalid_request", "unsupported membership repair action")
+				return
+			}
+			s.handleMembershipRepairCompletion(w, r, body)
+			return
+		}
+		r.Body = io.NopCloser(bytes.NewReader(body))
+		s.handleMembershipRepairProbe(w, r)
+		return
+	}
 	if r.Method != http.MethodGet {
-		writeMethodNotAllowed(w, http.MethodGet)
+		writeMethodNotAllowed(w, http.MethodGet, http.MethodPost)
 		return
 	}
 	token := s.recoveryArchiveToken
@@ -319,6 +412,237 @@ func (s *Server) handleRecoveryProbe(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 	w.Header().Set("Cache-Control", "no-store")
 	_ = json.NewEncoder(w).Encode(probe)
+}
+
+func (s *Server) handleMembershipRepairCompletion(w http.ResponseWriter, r *http.Request, body []byte) {
+	token := s.recoveryArchiveToken
+	if token == "" || !matchesRecoveryBearer(r.Header.Get("Authorization"), token) {
+		writeHTTPError(w, http.StatusForbidden, "forbidden", "membership repair completion is not authorized")
+		return
+	}
+	if s.membershipRepairCompletion == nil {
+		writeHTTPError(w, http.StatusServiceUnavailable, "recovery_observation_unavailable", "membership repair completion is unavailable")
+		return
+	}
+	mediaType, _, mediaErr := mime.ParseMediaType(r.Header.Get("Content-Type"))
+	if mediaErr != nil || mediaType != "application/json" {
+		writeHTTPError(w, http.StatusUnsupportedMediaType, "unsupported_media_type", "application/json is required")
+		return
+	}
+	request, err := StrictDecodeMembershipRepairCompletionRequest(body)
+	if err != nil {
+		writeHTTPError(w, http.StatusBadRequest, "invalid_request", err.Error())
+		return
+	}
+	ctx, cancel := context.WithTimeout(r.Context(), recoveryArchiveTimeout)
+	defer cancel()
+	release, err := s.acquireRead(ctx, true)
+	if err != nil {
+		writeAPIError(w, err)
+		return
+	}
+	defer release()
+	response, err := s.membershipRepairCompletion(ctx, request)
+	if err != nil {
+		writeAPIError(w, err)
+		return
+	}
+	if err := validateMembershipRepairCompletionResponse(request, response); err != nil {
+		writeHTTPError(w, http.StatusServiceUnavailable, "invalid_recovery_observation", err.Error())
+		return
+	}
+	response.MAC = membershipRepairCompletionMAC(response, token)
+	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("Cache-Control", "no-store")
+	_ = json.NewEncoder(w).Encode(response)
+}
+
+func (s *Server) handleMembershipRepairProbe(w http.ResponseWriter, r *http.Request) {
+	token := s.recoveryArchiveToken
+	if token == "" || !matchesRecoveryBearer(r.Header.Get("Authorization"), token) {
+		writeHTTPError(w, http.StatusForbidden, "forbidden", "membership repair probe is not authorized")
+		return
+	}
+	if s.membershipRepairProbe == nil {
+		writeHTTPError(w, http.StatusServiceUnavailable, "recovery_observation_unavailable", "membership repair verification is unavailable")
+		return
+	}
+	mediaType, _, mediaErr := mime.ParseMediaType(r.Header.Get("Content-Type"))
+	if mediaErr != nil || mediaType != "application/json" {
+		writeHTTPError(w, http.StatusUnsupportedMediaType, "unsupported_media_type", "application/json is required")
+		return
+	}
+	body, err := io.ReadAll(io.LimitReader(r.Body, 1<<20+1))
+	if err != nil || len(body) > 1<<20 {
+		writeHTTPError(w, http.StatusBadRequest, "invalid_request", "membership repair probe body is invalid or too large")
+		return
+	}
+	request, err := StrictDecodeMembershipRepairProbeRequest(body)
+	if err != nil {
+		writeHTTPError(w, http.StatusBadRequest, "invalid_request", err.Error())
+		return
+	}
+	ctx, cancel := context.WithTimeout(r.Context(), recoveryArchiveTimeout)
+	defer cancel()
+	release, err := s.acquireRead(ctx, true)
+	if err != nil {
+		writeAPIError(w, err)
+		return
+	}
+	defer release()
+	response, err := s.membershipRepairProbe(ctx, request)
+	if err != nil {
+		writeAPIError(w, err)
+		return
+	}
+	if err := validateMembershipRepairProbeResponse(request, response); err != nil {
+		writeHTTPError(w, http.StatusServiceUnavailable, "invalid_recovery_observation", err.Error())
+		return
+	}
+	response.MAC = membershipRepairProbeMAC(response, token)
+	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("Cache-Control", "no-store")
+	_ = json.NewEncoder(w).Encode(response)
+}
+
+func StrictDecodeMembershipRepairProbeRequest(data []byte) (MembershipRepairProbeRequest, error) {
+	var request MembershipRepairProbeRequest
+	if err := rejectDuplicateJSONKeys(data); err != nil {
+		return request, fmt.Errorf("invalid membership repair probe: %w", err)
+	}
+	var fields map[string]json.RawMessage
+	if err := json.Unmarshal(data, &fields); err != nil {
+		return request, fmt.Errorf("invalid membership repair probe: %w", err)
+	}
+	if err := requireExactJSONFields(fields, []string{"version", "challenge", "scope_digest", "source_config_id", "abort_slot", "excluded_old_member_id", "candidate_member", "candidate_bind_ref"}); err != nil {
+		return request, err
+	}
+	decoder := json.NewDecoder(bytes.NewReader(data))
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(&request); err != nil {
+		return request, fmt.Errorf("invalid membership repair probe: %w", err)
+	}
+	if err := decoder.Decode(new(any)); !errors.Is(err, io.EOF) {
+		return request, fmt.Errorf("invalid membership repair probe: trailing JSON data")
+	}
+	if err := validateMembershipRepairProbeRequest(request); err != nil {
+		return request, err
+	}
+	return request, nil
+}
+
+func StrictDecodeMembershipRepairProbeResponse(data []byte, request MembershipRepairProbeRequest, token string) (MembershipRepairProbeResponse, error) {
+	var response MembershipRepairProbeResponse
+	if err := rejectDuplicateJSONKeys(data); err != nil {
+		return response, fmt.Errorf("invalid membership repair probe response: %w", err)
+	}
+	var fields map[string]json.RawMessage
+	if err := json.Unmarshal(data, &fields); err != nil {
+		return response, fmt.Errorf("invalid membership repair probe response: %w", err)
+	}
+	if err := requireExactJSONFields(fields, []string{"version", "challenge", "scope_digest", "verifier_node_id", "verifier_wal_identity", "ready", "voting", "pending", "source_config_id", "source_members", "abort_slot", "excluded_old_member_id", "read_index_slot", "barrier_slot", "barrier_nonce", "prefix_hash", "candidate_member", "candidate_bind_ref", "candidate_prefix_through", "candidate_prefix_hash", "mac"}); err != nil {
+		return response, err
+	}
+	decoder := json.NewDecoder(bytes.NewReader(data))
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(&response); err != nil {
+		return response, fmt.Errorf("invalid membership repair probe response: %w", err)
+	}
+	if err := decoder.Decode(new(any)); !errors.Is(err, io.EOF) {
+		return response, fmt.Errorf("invalid membership repair probe response: trailing JSON data")
+	}
+	if err := validateMembershipRepairProbeResponse(request, response); err != nil {
+		return response, err
+	}
+	got, err := hex.DecodeString(response.MAC)
+	if err != nil {
+		return response, ErrRecoveryProbeMAC
+	}
+	want, _ := hex.DecodeString(membershipRepairProbeMAC(response, token))
+	if token == "" || !hmac.Equal(got, want) {
+		return response, ErrRecoveryProbeMAC
+	}
+	return response, nil
+}
+
+func validateMembershipRepairProbeRequest(request MembershipRepairProbeRequest) error {
+	challenge, challengeErr := hex.DecodeString(request.Challenge)
+	candidate := request.CandidateMember
+	if request.Version != 1 || challengeErr != nil || len(challenge) != 32 || hex.EncodeToString(challenge) != request.Challenge ||
+		!validProbeDigest(request.ScopeDigest) || request.SourceConfigID == 0 || request.AbortSlot == nil ||
+		request.ExcludedOldMemberID == "" || candidate.ID == "" || candidate.ID == quepaxa.NodeID(request.ExcludedOldMemberID) ||
+		candidate.URL == "" || candidate.PeerURL == "" || candidate.PublicKey == (quepaxa.PublicKey{}) ||
+		!validProbeDigest(candidate.WALIdentity) || request.CandidateBindRef == "" {
+		return fmt.Errorf("invalid membership repair probe scope")
+	}
+	return nil
+}
+
+func ValidateMembershipRepairProbeRequest(request MembershipRepairProbeRequest) error {
+	return validateMembershipRepairProbeRequest(request)
+}
+
+func validateMembershipRepairProbeResponse(request MembershipRepairProbeRequest, response MembershipRepairProbeResponse) error {
+	if err := validateMembershipRepairProbeRequest(request); err != nil {
+		return err
+	}
+	if response.Version != request.Version || response.Challenge != request.Challenge || response.ScopeDigest != request.ScopeDigest ||
+		response.SourceConfigID != request.SourceConfigID || response.AbortSlot == nil || *response.AbortSlot != *request.AbortSlot ||
+		response.ExcludedOldMemberID != request.ExcludedOldMemberID || response.VerifierNodeID == "" ||
+		response.VerifierNodeID == request.ExcludedOldMemberID || !validProbeDigest(response.VerifierWALIdentity) || !response.Ready || !response.Voting || response.Pending ||
+		response.ReadIndexSlot == 0 || response.BarrierSlot < response.ReadIndexSlot || response.CandidatePrefixThrough != response.BarrierSlot ||
+		response.BarrierNonce != membershipRepairBarrierNonceHex(request.Challenge) ||
+		response.CandidateMember != request.CandidateMember || response.CandidateBindRef != request.CandidateBindRef ||
+		response.CandidatePrefixHash != response.PrefixHash || !validProbeDigest(response.PrefixHash) ||
+		!validProbeDigest(response.CandidatePrefixHash) || len(response.SourceMembers) == 0 {
+		return fmt.Errorf("membership repair probe response differs from requested scope or lacks required observations")
+	}
+	verifierCount, oldCount, candidateCount := 0, 0, 0
+	seen := make(map[quepaxa.NodeID]struct{}, len(response.SourceMembers))
+	for _, member := range response.SourceMembers {
+		if member.ID == "" {
+			return fmt.Errorf("membership repair probe response has an incomplete source member")
+		}
+		if _, duplicate := seen[member.ID]; duplicate {
+			return fmt.Errorf("membership repair probe response has duplicate source members")
+		}
+		seen[member.ID] = struct{}{}
+		if string(member.ID) == response.VerifierNodeID {
+			verifierCount++
+			if member.WALIdentity != response.VerifierWALIdentity {
+				return fmt.Errorf("membership repair probe verifier WAL differs from source membership")
+			}
+		}
+		if string(member.ID) == response.ExcludedOldMemberID {
+			oldCount++
+		}
+		if member.ID == response.CandidateMember.ID {
+			candidateCount++
+			if member != response.CandidateMember {
+				return fmt.Errorf("membership repair probe candidate ID is present with a different binding")
+			}
+		}
+	}
+	if verifierCount != 1 || oldCount != 1 || candidateCount != 0 {
+		return fmt.Errorf("membership repair probe source membership does not bind verifier, excluded voter, and candidate")
+	}
+	return nil
+}
+
+func membershipRepairBarrierNonceHex(challenge string) string {
+	nonce := MembershipRepairBarrierNonce(challenge)
+	return hex.EncodeToString(nonce[:])
+}
+
+func validProbeDigest(value string) bool {
+	decoded, err := hex.DecodeString(value)
+	return err == nil && len(decoded) == 32 && hex.EncodeToString(decoded) == value
+}
+
+func membershipRepairProbeMAC(response MembershipRepairProbeResponse, token string) string {
+	response.MAC = ""
+	data, _ := json.Marshal(response)
+	return recoveryProbeMACBytes(data, token)
 }
 
 func (s *Server) handleLegacyRecoveryProbe(w http.ResponseWriter, r *http.Request, token, nonce string) {

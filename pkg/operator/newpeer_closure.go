@@ -28,8 +28,16 @@ func peerClosureOperationID(rootUID, workloadUID, source string, configID uint64
 }
 
 func (e *FencingExecutor) peerClosureBinding(ctx context.Context, caller fencing.Identity, workloadUID string) (peerClosureBinding, error) {
+	return e.peerClosureBindingWithPrepareInit(ctx, caller, workloadUID, false)
+}
+
+// peerClosureBindingWithPrepareInit keeps the ordinary voter binding strict
+// while allowing the exact fixed init profile after its caller has already
+// been validated as a StatefulSet-owned mandatory-init learner.
+func (e *FencingExecutor) peerClosureBindingWithPrepareInit(ctx context.Context, caller fencing.Identity, workloadUID string, prepareInit bool) (peerClosureBinding, error) {
 	var callerPod object
-	if err := e.Kube.Get(ctx, e.controller().corePath("pods", caller.NodeID), &callerPod); err != nil {
+	callerName := fencing.PodNameForIdentity(caller)
+	if err := e.Kube.Get(ctx, e.controller().corePath("pods", callerName), &callerPod); err != nil {
 		return peerClosureBinding{}, err
 	}
 	if str(nested(callerPod, "metadata", "uid")) != caller.PodUID || nested(callerPod, "metadata", "deletionTimestamp") != nil {
@@ -87,7 +95,11 @@ func (e *FencingExecutor) peerClosureBinding(ctx context.Context, caller fencing
 	if err != nil {
 		return peerClosureBinding{}, err
 	}
-	if err := validateSupervisedPod(callerPod); err != nil {
+	if prepareInit {
+		if err := validatePreparePod(callerPod, caller.PodUID); err != nil {
+			return peerClosureBinding{}, err
+		}
+	} else if err := validateSupervisedPod(callerPod); err != nil {
 		return peerClosureBinding{}, err
 	}
 	containers := list(nested(sts, "spec", "template", "spec", "containers"))
@@ -186,10 +198,11 @@ func (e *FencingExecutor) requestPeerClosure(ctx context.Context, caller fencing
 		return fencing.PeerClosureReceipt{}, fmt.Errorf("fencing: survivor observation does not authorize peer closure")
 	}
 	var currentCaller object
-	if err := e.Kube.Get(ctx, e.controller().corePath("pods", caller.NodeID), &currentCaller); err != nil {
+	if err := e.Kube.Get(ctx, e.controller().corePath("pods", fencing.PodNameForIdentity(caller)), &currentCaller); err != nil {
 		return fencing.PeerClosureReceipt{}, err
 	}
-	if err := validateProbePodIncarnation(binding.callerPod, currentCaller, FenceTarget{NodeID: caller.NodeID, Pod: caller.NodeID, PodUID: caller.PodUID, WALIdentity: caller.WALIdentity}); err != nil {
+	callerTarget := FenceTarget{NodeID: caller.NodeID, Pod: fencing.PodNameForIdentity(caller), PodUID: caller.PodUID, WALIdentity: caller.WALIdentity}
+	if err := validateProbePodIncarnation(binding.callerPod, currentCaller, callerTarget); err != nil {
 		return fencing.PeerClosureReceipt{}, err
 	}
 	currentBinding, err := e.peerClosureBinding(ctx, caller, workloadUID)
@@ -199,7 +212,7 @@ func (e *FencingExecutor) requestPeerClosure(ctx context.Context, caller fencing
 	if currentBinding.rootUID != binding.rootUID || currentBinding.workloadUID != binding.workloadUID || currentBinding.rootHash != binding.rootHash || currentBinding.workloadHash != binding.workloadHash || currentBinding.autoControl != binding.autoControl || currentBinding.autoBinding != binding.autoBinding {
 		return fencing.PeerClosureReceipt{}, fmt.Errorf("fencing: trusted workload binding changed during probe")
 	}
-	if err := validateProbePodIncarnation(binding.callerPod, currentBinding.callerPod, FenceTarget{NodeID: caller.NodeID, Pod: caller.NodeID, PodUID: caller.PodUID, WALIdentity: caller.WALIdentity}); err != nil {
+	if err := validateProbePodIncarnation(binding.callerPod, currentBinding.callerPod, callerTarget); err != nil {
 		return fencing.PeerClosureReceipt{}, err
 	}
 	latest, err := e.read(ctx, binding.workloadUID, caller.SourceClusterID)
@@ -288,14 +301,15 @@ func (e *FencingExecutor) peerClosureTargets(ctx context.Context, runs []fencing
 		if id.WALIdentity != "" && id.WALIdentity != closure.TargetWALIdentity {
 			return nil, fmt.Errorf("fencing: target WAL differs from retained ledger")
 		}
-		target := fencing.PeerClosureTarget{NodeID: id.NodeID, Pod: id.NodeID, PodUID: id.PodUID, WALIdentity: id.WALIdentity}
+		podName := fencing.PodNameForIdentity(id)
+		target := fencing.PeerClosureTarget{NodeID: id.NodeID, Pod: podName, PodUID: id.PodUID, WALIdentity: id.WALIdentity}
 		var pod object
-		err := e.Kube.Get(ctx, e.controller().corePath("pods", id.NodeID), &pod)
+		err := e.Kube.Get(ctx, e.controller().corePath("pods", podName), &pod)
 		if err != nil && !apiNotFound(err) {
 			return nil, err
 		}
 		if err == nil && str(nested(pod, "metadata", "uid")) == id.PodUID && nested(pod, "metadata", "deletionTimestamp") == nil {
-			captured := capturedFenceIdentity(FenceTarget{NodeID: id.NodeID, Pod: id.NodeID, PodUID: id.PodUID, WALIdentity: id.WALIdentity}, pod)
+			captured := capturedFenceIdentity(FenceTarget{NodeID: id.NodeID, Pod: podName, PodUID: id.PodUID, WALIdentity: id.WALIdentity}, pod)
 			target.NodeName, target.NodeUID, target.ContainerID, target.ImageID = captured.NodeName, captured.NodeUID, captured.ContainerID, captured.ImageID
 		}
 		byIdentity[target] = true
@@ -362,7 +376,7 @@ func peerClosureReceiptFromRecord(caller fencing.Identity, closure fencing.PeerC
 	found := false
 	requestedWAL := false
 	for _, target := range record.Spec.Targets {
-		if target.NodeID != closure.TargetNodeID || target.Pod != closure.TargetNodeID || target.PodUID == "" || (target.WALIdentity != "" && target.WALIdentity != closure.TargetWALIdentity) {
+		if target.NodeID != closure.TargetNodeID || fencing.ValidatePodBinding(target.NodeID, target.Pod, target.PodUID) != nil || (target.WALIdentity != "" && target.WALIdentity != closure.TargetWALIdentity) {
 			return fencing.PeerClosureReceipt{}, fmt.Errorf("fencing: immutable peer-closure target differs")
 		}
 		if target.WALIdentity == closure.TargetWALIdentity {

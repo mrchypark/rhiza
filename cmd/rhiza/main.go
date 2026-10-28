@@ -3,7 +3,12 @@ package main
 import (
 	"context"
 	"crypto/ed25519"
+	"crypto/rand"
+	"crypto/sha256"
+	"crypto/tls"
+	"crypto/x509"
 	"encoding/base64"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"flag"
@@ -14,11 +19,18 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"sort"
 	"strings"
 	"syscall"
 	"time"
 
 	"github.com/mrchypark/rhiza"
+	"github.com/mrchypark/rhiza/pkg/fencing"
+)
+
+const (
+	prepareContainerName = "rhiza-prepare"
+	prepareTokenFile     = "/var/run/secrets/rhiza-fencer/token"
 )
 
 func main() {
@@ -57,6 +69,15 @@ func runArgsWithOutput(ctx context.Context, args []string, helpOutput io.Writer)
 }
 
 func runCommand(ctx context.Context, enroll, prepareRestore bool) (resultErr error) {
+	var managed managedPrepareEnvironment
+	managedEnabled := false
+	if prepareRestore {
+		var err error
+		managed, managedEnabled, err = readManagedPrepareEnvironment()
+		if err != nil {
+			return err
+		}
+	}
 	config, err := rhiza.ConfigFromEnv()
 	if err != nil {
 		return err
@@ -71,6 +92,9 @@ func runCommand(ctx context.Context, enroll, prepareRestore bool) (resultErr err
 		return rhiza.EnrollExistingVoter(ctx, config)
 	}
 	if prepareRestore {
+		if managedEnabled {
+			return runManagedPrepare(ctx, config, managed)
+		}
 		return rhiza.PrepareRestore(ctx, config)
 	}
 	var handler http.Handler
@@ -163,6 +187,232 @@ func runCommand(ctx context.Context, enroll, prepareRestore bool) (resultErr err
 		}
 	}
 	return nil
+}
+
+type managedPrepareEnvironment struct {
+	operationID string
+	podName     string
+	podUID      string
+	authority   string
+	caFile      string
+}
+
+type managedAssignmentReader interface {
+	BootstrapStatus(context.Context, string, fencing.Identity) (fencing.BootstrapStatusResult, error)
+}
+
+func readManagedPrepareEnvironment() (managedPrepareEnvironment, bool, error) {
+	settings := managedPrepareEnvironment{
+		operationID: os.Getenv("RHIZA_PREPARE_OPERATION_ID"),
+		podName:     os.Getenv("POD_NAME"),
+		podUID:      os.Getenv("POD_UID"),
+		authority:   os.Getenv("FENCER_AUTHORITY_URL"),
+		caFile:      os.Getenv("FENCER_CA_FILE"),
+	}
+	preparedUID := os.Getenv("RHIZA_PREPARED_POD_UID")
+	any := settings.operationID != "" || settings.podName != "" || settings.podUID != "" || settings.authority != "" || settings.caFile != "" || preparedUID != ""
+	if !any {
+		return managedPrepareEnvironment{}, false, nil
+	}
+	if settings.podName == "" || settings.podUID == "" || settings.authority == "" || settings.caFile == "" || preparedUID == "" {
+		return managedPrepareEnvironment{}, true, fmt.Errorf("managed prepare requires POD_NAME, POD_UID, RHIZA_PREPARED_POD_UID, FENCER_AUTHORITY_URL, and FENCER_CA_FILE")
+	}
+	if settings.podUID != preparedUID || strings.TrimSpace(settings.podUID) != settings.podUID {
+		return managedPrepareEnvironment{}, true, fmt.Errorf("POD_UID differs from RHIZA_PREPARED_POD_UID")
+	}
+	for _, key := range []string{"RHIZA_ADMIN_TOKEN", "RHIZA_PEER_TOKEN", "RHIZA_PEER_TOKENS"} {
+		if os.Getenv(key) != "" {
+			return managedPrepareEnvironment{}, true, fmt.Errorf("managed prepare must not receive %s", key)
+		}
+	}
+	for _, key := range []string{"RHIZA_CLUSTER_ID", "RHIZA_NODE_ID", "RHIZA_DATA_DIR", "RHIZA_CLUSTER_MEMBERS"} {
+		if os.Getenv(key) == "" {
+			return managedPrepareEnvironment{}, true, fmt.Errorf("managed prepare requires %s", key)
+		}
+	}
+	return settings, true, nil
+}
+
+func runManagedPrepare(ctx context.Context, config rhiza.Config, settings managedPrepareEnvironment) error {
+	if config.Local || !config.EnableReconfiguration || config.PreparedPodUID != settings.podUID || config.NodeID == "" || config.ClusterID == "" {
+		return fmt.Errorf("managed prepare requires the assigned reconfigurable cluster identity")
+	}
+	if config.AdminToken != "" || config.PeerToken != "" || os.Getenv("RHIZA_PEER_TOKENS") != "" {
+		return fmt.Errorf("managed prepare must not receive runtime credentials")
+	}
+	if err := fencing.CheckInitNamespaceQuiescence(ctx); err != nil {
+		return fmt.Errorf("verify init process namespace before preparation: %w", err)
+	}
+	caPEM, err := os.ReadFile(settings.caFile)
+	if err != nil {
+		return fmt.Errorf("read fencing CA: %w", err)
+	}
+	roots := x509.NewCertPool()
+	if !roots.AppendCertsFromPEM(caPEM) {
+		return fmt.Errorf("fencing CA file contains no certificates")
+	}
+	client := &http.Client{Timeout: 30 * time.Second, Transport: &http.Transport{TLSClientConfig: &tls.Config{MinVersion: tls.VersionTLS12, RootCAs: roots}}}
+	authority := &fencing.AuthorityClient{URL: settings.authority, TokenFile: prepareTokenFile, Client: client}
+	candidate := fencing.Identity{SourceClusterID: config.ClusterID, NodeID: config.NodeID, PodName: settings.podName, PodUID: settings.podUID}
+	assignment, err := resolveManagedAssignment(ctx, authority, settings.operationID, candidate)
+	if err != nil {
+		return err
+	}
+	if assignment.OperationID == "" || assignment.PodName != settings.podName || assignment.PodUID != settings.podUID || assignment.SourceClusterID != config.ClusterID {
+		return fmt.Errorf("init assignment differs from this Pod configuration")
+	}
+	if assignment.Purpose == fencing.BootstrapLearner {
+		if err := bindManagedLearnerAssignment(&config, assignment); err != nil {
+			return err
+		}
+	} else if settings.operationID != "" && (assignment.OperationID != settings.operationID || assignment.NodeID != config.NodeID) {
+		return fmt.Errorf("bootstrap assignment differs from this Pod configuration")
+	}
+	if assignment.Purpose != fencing.BootstrapInitial && assignment.Purpose != fencing.BootstrapLearner && assignment.Purpose != fencing.BootstrapDRSuccessor {
+		return fmt.Errorf("managed preparation purpose is unsupported")
+	}
+	var attemptBytes [16]byte
+	if _, err := rand.Read(attemptBytes[:]); err != nil {
+		return fmt.Errorf("create init process nonce: %w", err)
+	}
+	attemptID := hex.EncodeToString(attemptBytes[:])
+	admission, err := authority.BeginInitAdmission(ctx, assignment, attemptID)
+	if err != nil {
+		return fmt.Errorf("reserve init process: %w", err)
+	}
+	attempt := admission.Attempt()
+	if attempt.Scope.ContainerName != prepareContainerName {
+		return fmt.Errorf("authority observed init container %q, want %q", attempt.Scope.ContainerName, prepareContainerName)
+	}
+	cleanup, genesisDigest, prepareErr := rhiza.PrepareManagedRestoreWithAdmission(ctx, config, admission)
+	quiescenceErr := fencing.CheckInitNamespaceQuiescence(ctx)
+	outcome := managedInitOutcome(assignment.Purpose, cleanup, genesisDigest, prepareErr, quiescenceErr)
+	if err := outcome.Validate(); err != nil {
+		return errors.Join(prepareErr, quiescenceErr, fmt.Errorf("validate live init outcome: %w", err))
+	}
+	if err := authority.RecordInitOutcome(ctx, assignment, attemptID, outcome); err != nil {
+		return errors.Join(prepareErr, quiescenceErr, fmt.Errorf("record live init outcome: %w", err))
+	}
+	if outcome.State != fencing.InitAttemptMaterialized {
+		return errors.Join(prepareErr, quiescenceErr, fmt.Errorf("managed preparation did not establish its required cleanup proof"))
+	}
+	return nil
+}
+
+func resolveManagedAssignment(ctx context.Context, authority managedAssignmentReader, initialOperationID string, candidate fencing.Identity) (fencing.BootstrapAssignment, error) {
+	own, err := authority.BootstrapStatus(ctx, "", candidate)
+	if err != nil {
+		return fencing.BootstrapAssignment{}, fmt.Errorf("read own init assignment: %w", err)
+	}
+	if own.Assignment != nil {
+		assignment := *own.Assignment
+		if own.Complete || own.AdmissionClosed || assignment.Purpose != fencing.BootstrapLearner || assignment.Validate() != nil ||
+			assignment.SourceClusterID != candidate.SourceClusterID || assignment.PodName != candidate.PodName || assignment.PodUID != candidate.PodUID {
+			return fencing.BootstrapAssignment{}, fmt.Errorf("own-init status is not an exact active learner assignment")
+		}
+		return assignment, nil
+	}
+	if initialOperationID == "" {
+		return fencing.BootstrapAssignment{}, fmt.Errorf("%w: no own learner assignment is available", fencing.ErrPending)
+	}
+	initial, err := authority.BootstrapStatus(ctx, initialOperationID, candidate)
+	if err != nil {
+		return fencing.BootstrapAssignment{}, fmt.Errorf("read exact initial init assignment: %w", err)
+	}
+	if initial.Assignment == nil || initial.Complete || initial.AdmissionClosed {
+		return fencing.BootstrapAssignment{}, fmt.Errorf("%w: exact initial init assignment is unavailable or closed", fencing.ErrPending)
+	}
+	assignment := *initial.Assignment
+	if assignment.Validate() != nil || assignment.OperationID != initialOperationID || assignment.SourceClusterID != candidate.SourceClusterID ||
+		assignment.PodName != candidate.PodName || assignment.PodUID != candidate.PodUID {
+		return fencing.BootstrapAssignment{}, fmt.Errorf("initial assignment differs from exact Pod binding")
+	}
+	return assignment, nil
+}
+
+func bindManagedLearnerAssignment(config *rhiza.Config, assignment fencing.BootstrapAssignment) error {
+	if config == nil || assignment.Validate() != nil || assignment.Purpose != fencing.BootstrapLearner ||
+		assignment.PublicMember.ID != assignment.NodeID || assignment.PublicMember.URL == "" || assignment.PublicMember.PeerURL == "" || assignment.PublicMember.LogURL == "" || assignment.PublicMember.WALIdentity != "" {
+		return fmt.Errorf("own-init learner assignment lacks its exact public binding")
+	}
+	if assignment.MembershipHash != bootstrapMembershipHash(config.Members) {
+		return fmt.Errorf("learner assignment differs from immutable bootstrap membership")
+	}
+	if assignment.Durability != string(config.ObjStoreDurability) || assignment.StoreIdentityHash != bootstrapStoreIdentityHash(*config) {
+		return fmt.Errorf("learner assignment differs from object-store profile")
+	}
+	key, err := hex.DecodeString(assignment.PublicMember.PublicKey)
+	if err != nil || len(key) != ed25519.PublicKeySize {
+		return fmt.Errorf("learner assignment public key is invalid")
+	}
+	member := rhiza.Member{
+		ID: rhiza.NodeID(assignment.PublicMember.ID), URL: assignment.PublicMember.URL,
+		PeerURL: assignment.PublicMember.PeerURL, LogURL: assignment.PublicMember.LogURL,
+	}
+	copy(member.PublicKey[:], key)
+	if member.ID == "" || member.PublicKey == (rhiza.PublicKey{}) {
+		return fmt.Errorf("learner assignment public identity is empty")
+	}
+	if config.Learner != nil && *config.Learner != member {
+		return fmt.Errorf("configured learner identity differs from authority assignment")
+	}
+	config.NodeID = assignment.NodeID
+	config.Learner = &member
+	config.ObjStoreDurability = rhiza.ObjectStoreDurability(assignment.Durability)
+	return nil
+}
+
+func bootstrapMembershipHash(members []rhiza.Member) string {
+	encodedMembers := make([]string, 0, len(members))
+	for _, member := range members {
+		encoded, _ := json.Marshal([]string{string(member.ID), hex.EncodeToString(member.PublicKey[:])})
+		encodedMembers = append(encodedMembers, string(encoded))
+	}
+	sort.Strings(encodedMembers)
+	encoded, _ := json.Marshal(encodedMembers)
+	digest := sha256.Sum256(append([]byte("rhiza-membership-v2\x00"), encoded...))
+	return hex.EncodeToString(digest[:])
+}
+
+func bootstrapStoreIdentityHash(config rhiza.Config) string {
+	provider := config.ObjStoreProvider
+	if provider == "" {
+		provider = "filesystem"
+	}
+	connectionDigest := ""
+	if raw := config.ObjStoreAzureConnectionString; raw != "" {
+		encoded, _ := json.Marshal(raw)
+		digest := sha256.Sum256(encoded)
+		connectionDigest = hex.EncodeToString(digest[:])
+	}
+	return fencing.BootstrapStoreIdentityHash(map[string]string{
+		"RHIZA_OBJSTORE_PROVIDER":              provider,
+		"RHIZA_OBJSTORE_ENDPOINT":              config.ObjStoreEndpoint,
+		"RHIZA_OBJSTORE_BUCKET":                config.ObjStoreBucket,
+		"RHIZA_OBJSTORE_PREFIX":                config.ObjStorePrefix,
+		"RHIZA_OBJSTORE_AZURE_STORAGE_ACCOUNT": config.ObjStoreAzureStorageAccount,
+		"azure_connection_string_digest":       connectionDigest,
+	})
+}
+
+func managedInitOutcome(purpose fencing.BootstrapPurpose, cleanup fencing.InitLiveCleanup, genesisDigest string, prepareErr, quiescenceErr error) fencing.InitAttemptOutcome {
+	cleanup.NamespaceQuiescent = quiescenceErr == nil
+	outcome := fencing.InitAttemptOutcome{State: fencing.InitAttemptFailed, FailureClass: fencing.InitFailureOther, LiveCleanup: cleanup}
+	if purpose == fencing.BootstrapInitial {
+		outcome.FailureClass = fencing.InitFailureGenesis
+	} else {
+		outcome.FailureClass = fencing.InitFailureRestore
+	}
+	if !cleanup.CleanupSucceeded || quiescenceErr != nil {
+		outcome.FailureClass = fencing.InitFailureCleanup
+	} else if prepareErr == nil {
+		outcome.State = fencing.InitAttemptMaterialized
+		outcome.FailureClass = ""
+		if purpose == fencing.BootstrapInitial {
+			outcome.GenesisDigest = genesisDigest
+		}
+	}
+	return outcome
 }
 
 func objectReplicaMembers(clusterID string, members []rhiza.Member, preservePublicIdentity bool) ([]rhiza.ReplicaMember, error) {

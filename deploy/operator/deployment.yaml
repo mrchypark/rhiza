@@ -38,6 +38,11 @@ spec:
                 # Existing bucket endpoint and credentials. The controller also
                 # creates separate, generation-scoped peer credential secrets.
                 name: rhiza-object-store
+            - configMapRef:
+                # Optional. Supplying this enables the recovery-anchor client;
+                # without it the operator keeps its existing non-anchor path.
+                name: rhiza-recovery-anchor
+                optional: true
           securityContext:
             allowPrivilegeEscalation: false
             capabilities:
@@ -46,6 +51,12 @@ spec:
           volumeMounts:
             - name: tmp
               mountPath: /tmp
+            - name: recovery-anchor-token
+              mountPath: /var/run/secrets/rhiza-recovery-anchor-token
+              readOnly: true
+            - name: recovery-anchor-ca
+              mountPath: /var/run/secrets/rhiza-recovery-anchor-ca
+              readOnly: true
           resources:
             requests:
               cpu: 100m
@@ -55,3 +66,11 @@ spec:
       volumes:
         - name: tmp
           emptyDir: {}
+        - name: recovery-anchor-token
+          secret:
+            secretName: rhiza-recovery-anchor-token
+            optional: true
+        - name: recovery-anchor-ca
+          configMap:
+            name: rhiza-recovery-anchor-ca
+            optional: true

@@ -337,6 +337,13 @@ func TestInitializeCertifiedRecoveryBaseUsesNewerCheckpointAfterAnchorRootGC(t *
 	if err != nil {
 		t.Fatal(err)
 	}
+	if _, err := VerifyExpectedAnchorForView(ctx, view, EvidenceOptions{
+		ExpectedAnchorHash: fixture.anchorHash, ExpectedMembership: fixture.membership,
+		ExpectedForkResult:   ForkResult{Tip: fixture.anchor.SourceTip, ManifestHash: fixture.anchor.SourceManifest, PrefixHash: fixture.anchor.SourcePrefixHash},
+		ExpectedSourcePrefix: fixture.anchor.SourcePrefix, ExpectedOperationID: fixture.anchor.OperationID,
+	}); err != nil {
+		t.Fatalf("selected-view anchor verification depended on collected original root: %v", err)
+	}
 	verifier := fixture.newObserver(t, "newer-checkpoint")
 	verifier.core.SetCheckpointValidator(func(ctx context.Context, seal quepaxa.CheckpointSeal) error {
 		return fixture.checkpoints.Verify(ctx, uint64(seal.Index), seal.RootHash, seal.StateHash)

@@ -106,10 +106,13 @@ func run(ctx context.Context, namespace string, poll time.Duration, deleteNamesp
 	// Configure recovery anchor client from environment.
 	anchorURL := os.Getenv("RHIZA_RECOVERY_ANCHOR_URL")
 	anchorTokenFile := os.Getenv("RHIZA_RECOVERY_ANCHOR_TOKEN_FILE")
-	if anchorURL != "" || anchorTokenFile != "" {
-		if anchorURL == "" || anchorTokenFile == "" {
-			return fmt.Errorf("RHIZA_RECOVERY_ANCHOR_URL and RHIZA_RECOVERY_ANCHOR_TOKEN_FILE must both be set")
-		}
+	anchorCAFile := os.Getenv("RHIZA_RECOVERY_ANCHOR_CA_FILE")
+	anchorStorageID := os.Getenv("RHIZA_RECOVERY_ANCHOR_STORAGE_ID")
+	anchorConfigured, err := recoveryAnchorConfigured(anchorURL, anchorTokenFile, anchorCAFile, anchorStorageID)
+	if err != nil {
+		return err
+	}
+	if anchorConfigured {
 		if err := validateAnchorEndpoint(anchorURL); err != nil {
 			return err
 		}
@@ -117,8 +120,8 @@ func run(ctx context.Context, namespace string, poll time.Duration, deleteNamesp
 		if anchorErr != nil {
 			return anchorErr
 		}
-		if caFile := os.Getenv("RHIZA_RECOVERY_ANCHOR_CA_FILE"); caFile != "" {
-			data, caErr := os.ReadFile(caFile)
+		if anchorCAFile != "" {
+			data, caErr := os.ReadFile(anchorCAFile)
 			if caErr != nil {
 				return fmt.Errorf("read anchor CA: %w", caErr)
 			}
@@ -131,8 +134,20 @@ func run(ctx context.Context, namespace string, poll time.Duration, deleteNamesp
 			TokenFile: anchorTokenFile,
 			Client:    &http.Client{Timeout: 10 * time.Second, Transport: &http.Transport{TLSClientConfig: &tls.Config{MinVersion: tls.VersionTLS12, RootCAs: anchorRoots}}},
 		}
+		controller.AnchorBinding.StorageID = anchorStorageID
 	}
 	return controller.Run(ctx, poll)
+}
+
+func recoveryAnchorConfigured(endpoint, tokenFile, caFile, storageID string) (bool, error) {
+	configured := endpoint != "" || tokenFile != "" || caFile != "" || storageID != ""
+	if !configured {
+		return false, nil
+	}
+	if endpoint == "" || tokenFile == "" || storageID == "" {
+		return false, fmt.Errorf("RHIZA_RECOVERY_ANCHOR_URL, RHIZA_RECOVERY_ANCHOR_TOKEN_FILE, and RHIZA_RECOVERY_ANCHOR_STORAGE_ID must all be set when any recovery anchor setting is configured")
+	}
+	return true, nil
 }
 
 func configureDeletion(kube *operator.Kubernetes, raw, namespaceFile string) error {

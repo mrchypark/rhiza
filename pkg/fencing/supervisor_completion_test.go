@@ -16,8 +16,10 @@ type completionAuthority struct {
 	transientExits  int
 }
 
-func (a *completionAuthority) Register(context.Context, Identity) error { return nil }
-func (a *completionAuthority) Bind(context.Context, Identity) error     { return nil }
+func (a *completionAuthority) Register(_ context.Context, id Identity) (Registration, error) {
+	return Registration{Identity: id}, nil
+}
+func (a *completionAuthority) Bind(context.Context, Identity) error { return nil }
 func (a *completionAuthority) Stop(context.Context, Identity) (StopRequest, error) {
 	a.events = append(a.events, "stop")
 	return a.request, nil

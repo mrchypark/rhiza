@@ -71,9 +71,16 @@ func (c *Controller) confirmRetiredMembershipCommit(ctx context.Context, r *Reso
 
 func (c *Controller) retiringMembershipRequest(ctx context.Context, r *Resource) (network.MembershipChange, error) {
 	add := r.Status.Membership.Add
+	retained, managed, err := c.retainedMembershipLearner(ctx, r)
+	if err != nil {
+		return network.MembershipChange{}, err
+	}
 	member, uid, version, err := c.replacementMember(ctx, r.Spec.Membership.ReplacementSecret)
 	if err != nil || member.ID != add.MemberID || uid != add.SecretUID || version != add.SecretResourceVer {
 		return network.MembershipChange{}, fmt.Errorf("retiring addition credentials differ from the journal")
+	}
+	if managed && (r.Spec.Membership.ReplacementSecret != retained.CredentialName || uid != retained.CredentialUID || string(member.ID) != retained.Target.NodeID) {
+		return network.MembershipChange{}, fmt.Errorf("retiring addition credential differs from retained learner enrollment")
 	}
 	member.WALIdentity = add.WALIdentity
 	request := network.MembershipChange{OperationID: membershipOperationID(r, "add"), ClusterID: r.Spec.SourceClusterID, ExpectedConfigID: add.ExpectedConfigID, ExpectedAbortSlot: add.ExpectedAbortSlot, Add: &member}

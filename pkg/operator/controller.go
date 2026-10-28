@@ -23,6 +23,7 @@ import (
 	"time"
 
 	"github.com/mrchypark/rhiza/internal/types"
+	"github.com/mrchypark/rhiza/pkg/fencing"
 	"github.com/mrchypark/rhiza/pkg/network"
 	"github.com/mrchypark/rhiza/pkg/quepaxa"
 	"github.com/mrchypark/rhiza/pkg/recovery"
@@ -40,6 +41,7 @@ var identifier = regexp.MustCompile(`^[a-zA-Z0-9][a-zA-Z0-9_.-]{0,127}$`)
 type AnchorClient interface {
 	Activate(context.Context, recoveryanchor.Request) (recoveryanchor.Receipt, error)
 	Verify(context.Context, recoveryanchor.Request, recoveryanchor.Receipt) error
+	VerifyAdmission(context.Context, recoveryanchor.Request, recoveryanchor.Receipt, recoveryanchor.Binding, uint64) error
 }
 
 type Controller struct {
@@ -50,6 +52,9 @@ type Controller struct {
 	Prefix        string
 	HTTP          *http.Client
 	StoreIdentity map[string]string
+	// AnchorBinding is resolved from trusted configured storage identity; it is
+	// deliberately distinct from the archive prefix and StoreIdentity hash.
+	AnchorBinding recoveryanchor.Binding
 	Anchor        AnchorClient
 }
 type recoveryList struct {
@@ -476,6 +481,18 @@ func (c *Controller) startAndObserve(ctx context.Context, r *Resource, sts objec
 			values = replaceEnv(values, "RHIZA_OBJSTORE_DURABILITY", object{"value": r.Spec.Durability})
 			ctr["env"] = values
 			applyTargetCredentials(ctr, r.Status.SecretName)
+			if r.Spec.AnchorID != "" {
+				rootUID := str(nested(sts, "spec", "template", "metadata", "annotations", fencingRootAnnotation))
+				operationID := drSuccessorOperationID(c.operationID(r), r.Status.StatefulSetUID, r.Status.Target)
+				if err := installPrepareInitProfile(sts, ctr, operationID, rootUID); err != nil {
+					return c.record(ctx, r, "Blocked", "DR successor prepare-init profile is unavailable: "+err.Error())
+				}
+				// ProfileHash covers the init template, so the operation must be
+				// installed after the profile has been added to the StatefulSet.
+				if _, err := c.prepareDRSuccessor(ctx, r, sts, members, false); err != nil {
+					return c.record(ctx, r, "Blocked", err.Error())
+				}
+			}
 			asObject(sts["spec"])["replicas"] = float64(len(members))
 			if err := c.Kube.Put(ctx, c.stsPath(r.Spec.StatefulSet), sts, &sts); err != nil {
 				return err
@@ -483,8 +500,18 @@ func (c *Controller) startAndObserve(ctx context.Context, r *Resource, sts objec
 		} else if env["RHIZA_CLUSTER_ID"] != r.Status.Target {
 			return c.record(ctx, r, "Blocked", "unexpected StatefulSet generation during activation")
 		}
+		if r.Spec.AnchorID != "" {
+			if _, err := c.prepareDRSuccessor(ctx, r, sts, members, true); err != nil {
+				return c.record(ctx, r, "Blocked", err.Error())
+			}
+		}
 		r.Status.Stage = "Restarted"
 		return c.record(ctx, r, "WaitingReady", "target started; waiting for a matching recovered quorum")
+	}
+	if r.Spec.AnchorID != "" {
+		if _, err := c.prepareDRSuccessor(ctx, r, sts, members, true); err != nil {
+			return c.record(ctx, r, "Blocked", err.Error())
+		}
 	}
 	actual, err := recoveryMembers(env["RHIZA_CLUSTER_MEMBERS"])
 	if err != nil || env["RHIZA_CLUSTER_ID"] != r.Status.Target || env["RHIZA_OBJSTORE_DURABILITY"] != r.Spec.Durability || sourceFingerprint(r.Status.Target, r.Spec.Durability, actual, c.Prefix) != sourceFingerprint(r.Status.Target, r.Spec.Durability, members, c.Prefix) {
@@ -637,24 +664,19 @@ func (c *Controller) deleteFencedLearners(ctx context.Context, r *Resource, sts 
 		bound := false
 		var fencedTarget FenceTarget
 		for _, target := range intent.Request.Targets {
-			if target.Pod == name && target.NodeID == name && target.PodUID == uid && uid != "" {
+			if managedLearnerFenceTargetMatches(target, name, uid) {
 				if fencedTarget.Pod != "" {
 					return fmt.Errorf("duplicate learner fence target")
 				}
 				fencedTarget = target
-				bound = target.WALIdentity != ""
-				if !bound {
-					if err := c.verifyNeverBoundCleanup(ctx, intent.Request, intent.Proof, target); err != nil {
-						return err
-					}
-					bound = true
-				}
+				bound = true
 			}
 		}
 		if !bound {
 			return fmt.Errorf("standalone learner is outside the fenced incarnation inventory")
 		}
 		seen := false
+		var creation learnerIncarnation
 		for _, entry := range state.Learners {
 			if entry.SourceClusterID != r.Spec.SourceClusterID || entry.Target.Pod != name {
 				continue
@@ -662,15 +684,13 @@ func (c *Controller) deleteFencedLearners(ctx context.Context, r *Resource, sts 
 			if seen || entry.Target != fencedTarget || entry.OperationID != nested(pod, "metadata", "annotations", ownerAnnotation) || entry.CredentialUID != nested(pod, "metadata", "annotations", fencingCredentialAnnotation) {
 				return fmt.Errorf("learner cleanup creation history differs")
 			}
+			creation = entry
 			seen = true
 		}
-		if fencedTarget.WALIdentity == "" && !seen {
-			return fmt.Errorf("never-bound learner lacks durable creation history")
+		if !seen {
+			return fmt.Errorf("learner lacks durable creation history")
 		}
-		if err := validateSupervisedPod(pod); err != nil {
-			return err
-		}
-		if err := (&FencingExecutor{Kube: c.Kube}).validateLearnerBinding(ctx, pod, r.Spec.StatefulSet); err != nil {
+		if err := c.validateLearnerTerminalBinding(ctx, pod, r.Spec.StatefulSet, state, creation, fencedTarget, intent.Request, intent.Proof); err != nil {
 			return err
 		}
 		// Deletion is cleanup after fencing, never evidence of termination.
@@ -679,6 +699,14 @@ func (c *Controller) deleteFencedLearners(ctx context.Context, r *Resource, sts 
 		}
 	}
 	return nil
+}
+
+func managedLearnerFenceTargetMatches(target FenceTarget, podName, podUID string) bool {
+	if podName == "" || podUID == "" || target.Pod != podName || target.PodUID != podUID {
+		return false
+	}
+	canonicalNodeID, err := fencing.ReplacementNodeID(podUID)
+	return err == nil && target.NodeID == canonicalNodeID
 }
 
 func podEndpoint(pod object, containerName, endpoint string) (string, error) {

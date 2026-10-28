@@ -6,13 +6,16 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
+	"time"
 
 	"github.com/mrchypark/rhiza/pkg/network"
 	"github.com/mrchypark/rhiza/pkg/operator"
 	"github.com/mrchypark/rhiza/pkg/quepaxa"
+	"github.com/mrchypark/rhiza/pkg/recoveryanchor"
 )
 
 func publicRuntime(runtime obj) obj {
@@ -42,6 +45,102 @@ func publicDescriptor(data []byte) descriptorView {
 	var view descriptorView
 	_ = json.Unmarshal(data, &view)
 	return view
+}
+
+func sanitizeRuntimeDiagnostics(data []byte) ([]byte, error) {
+	var view runtimeDiagnosticsView
+	decoder := json.NewDecoder(bytes.NewReader(data))
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(&view); err != nil {
+		return nil, err
+	}
+	if err := decoder.Decode(&struct{}{}); err != io.EOF {
+		return nil, fmt.Errorf("trailing runtime diagnostics")
+	}
+	if _, err := time.Parse(time.RFC3339Nano, view.CapturedAt); err != nil || view.PodCount != len(view.Pods) || view.PodCount > 16 {
+		return nil, fmt.Errorf("invalid runtime diagnostics summary")
+	}
+	allowedSignals := map[string]bool{"error": true, "failed": true, "refused": true, "ready": true, "listening": true, "bootstrap": true, "membership": true, "restore": true}
+	allowedConditions := map[string]bool{"Ready": true, "Initialized": true, "PodScheduled": true, "ContainersReady": true, "PodReadyToStartContainers": true}
+	allowedReasons := map[string]bool{"CrashLoopBackOff": true, "ContainerCreating": true, "CreateContainerConfigError": true, "CreateContainerError": true, "ContainerCannotRun": true, "RunContainerError": true, "ErrImagePull": true, "ImagePullBackOff": true, "InvalidImageName": true, "OOMKilled": true, "Completed": true, "Error": true, "PodCompleted": true, "PodInitializing": true, "NodeLost": true, "Evicted": true, "DeadlineExceeded": true, "Shutdown": true, "StartError": true, "Preempting": true, "Unschedulable": true, "ContainersNotReady": true, "PodReadyToStartContainers": true}
+	for i := range view.Pods {
+		pod := &view.Pods[i]
+		if pod.Name != "rhiza-0" && pod.Name != "rhiza-1" && pod.Name != "rhiza-2" || !validPodUID(pod.UID) || len(pod.Containers) > 16 || len(pod.Conditions) > 32 || len(pod.Logs) > 32 {
+			return nil, fmt.Errorf("invalid runtime Pod identity or bounds")
+		}
+		if pod.NodeName != kindNode {
+			pod.NodeName = ""
+		}
+		if pod.Phase != "Pending" && pod.Phase != "Running" && pod.Phase != "Succeeded" && pod.Phase != "Failed" && pod.Phase != "Unknown" {
+			pod.Phase = ""
+		}
+		if pod.CreatedAt != "" {
+			if _, err := time.Parse(time.RFC3339Nano, pod.CreatedAt); err != nil {
+				pod.CreatedAt = ""
+			}
+		}
+		filteredConditions := pod.Conditions[:0]
+		for _, condition := range pod.Conditions {
+			if !allowedConditions[condition.Type] || condition.Status != "True" && condition.Status != "False" && condition.Status != "Unknown" {
+				continue
+			}
+			if !allowedReasons[condition.Reason] {
+				condition.Reason = ""
+			}
+			filteredConditions = append(filteredConditions, condition)
+		}
+		pod.Conditions = filteredConditions
+		for j := range pod.Containers {
+			container := &pod.Containers[j]
+			if container.Name != "rhiza" && container.Name != "rhiza-prepare" || container.State != "" && container.State != "waiting" && container.State != "running" && container.State != "terminated" {
+				return nil, fmt.Errorf("invalid runtime container status")
+			}
+			if !allowedReasons[container.Reason] {
+				container.Reason = ""
+			}
+		}
+		for j := range pod.Logs {
+			log := &pod.Logs[j]
+			if log.Container != "rhiza" && log.Container != "rhiza-prepare" || log.LineCount < 0 || log.LineCount > 200 {
+				return nil, fmt.Errorf("invalid runtime log summary")
+			}
+			if log.Available {
+				if len(log.SHA256) != 64 {
+					return nil, fmt.Errorf("invalid runtime log digest")
+				}
+				if _, err := hex.DecodeString(log.SHA256); err != nil {
+					return nil, err
+				}
+			} else if log.SHA256 != "" || log.LineCount != 0 || len(log.Signals) != 0 {
+				return nil, fmt.Errorf("unavailable runtime log has content")
+			}
+			for _, signal := range log.Signals {
+				if !allowedSignals[signal] {
+					return nil, fmt.Errorf("invalid runtime log signal")
+				}
+			}
+		}
+	}
+	return json.Marshal(view)
+}
+
+func validPodUID(value string) bool {
+	if len(value) != 36 {
+		return false
+	}
+	for i, char := range value {
+		if i == 8 || i == 13 || i == 18 || i == 23 {
+			if char != '-' {
+				return false
+			}
+			continue
+		}
+		if char >= 'a' && char <= 'f' || char >= '0' && char <= '9' {
+			continue
+		}
+		return false
+	}
+	return true
 }
 
 type imageView struct {
@@ -84,33 +183,98 @@ type proofView struct {
 }
 
 type eventView struct {
-	Event                  string                 `json:"event"`
-	Time                   string                 `json:"time"`
-	Rows                   json.RawMessage        `json:"rows,omitempty"`
-	Voters                 int                    `json:"voters,omitempty"`
-	ConfigID               uint                   `json:"configID,omitempty"`
-	Targets                []operator.FenceTarget `json:"targets,omitempty"`
-	OldUIDs                []string               `json:"oldUIDs,omitempty"`
-	Target                 *operator.FenceTarget  `json:"target,omitempty"`
-	Request                *operator.FenceRequest `json:"request,omitempty"`
-	Proof                  *operator.FenceProof   `json:"proof,omitempty"`
-	AppliedSlot            uint64                 `json:"appliedSlot,omitempty"`
-	ConsensusTip           uint64                 `json:"consensusTip,omitempty"`
-	SourceACKRows          int                    `json:"sourceACKRows,omitempty"`
-	OnlineVoterReplacement bool                   `json:"onlineVoterReplacement,omitempty"`
-	NewGenerationWrite     bool                   `json:"newGenerationWrite,omitempty"`
-	OldRuntimesGone        bool                   `json:"oldRuntimesGone,omitempty"`
-	Executor               string                 `json:"executor,omitempty"`
-	ContainerID            string                 `json:"containerID,omitempty"`
-	ImageID                string                 `json:"imageID,omitempty"`
-	PID                    string                 `json:"pid,omitempty"`
-	Fault                  *struct {
+	Event                          string                 `json:"event"`
+	Time                           string                 `json:"time"`
+	Rows                           json.RawMessage        `json:"rows,omitempty"`
+	Voters                         int                    `json:"voters,omitempty"`
+	ConfigID                       uint                   `json:"configID,omitempty"`
+	Targets                        []operator.FenceTarget `json:"targets,omitempty"`
+	OldUIDs                        []string               `json:"oldUIDs,omitempty"`
+	Target                         *operator.FenceTarget  `json:"target,omitempty"`
+	Request                        *operator.FenceRequest `json:"request,omitempty"`
+	Proof                          *operator.FenceProof   `json:"proof,omitempty"`
+	AppliedSlot                    uint64                 `json:"appliedSlot,omitempty"`
+	ConsensusTip                   uint64                 `json:"consensusTip,omitempty"`
+	SourceACKRows                  int                    `json:"sourceACKRows,omitempty"`
+	OnlineVoterReplacement         bool                   `json:"onlineVoterReplacement,omitempty"`
+	NewGenerationWrite             bool                   `json:"newGenerationWrite,omitempty"`
+	OldRuntimesGone                bool                   `json:"oldRuntimesGone,omitempty"`
+	IndependentArchiveTip          uint64                 `json:"independentArchiveTip,omitempty"`
+	IndependentArchiveStart        uint64                 `json:"independentArchiveStart,omitempty"`
+	IndependentArchiveThrough      uint64                 `json:"independentArchiveThrough,omitempty"`
+	IndependentArchivePrefixSHA256 string                 `json:"independentArchivePrefixSHA256,omitempty"`
+	ArchivedRequestIDs             []string               `json:"archivedRequestIDs,omitempty"`
+	AbsentPeerProbeRequestIDs      []string               `json:"absentPeerProbeRequestIDs,omitempty"`
+	AbsentPeerProbeMarkers         []string               `json:"absentPeerProbeMarkers,omitempty"`
+	Executor                       string                 `json:"executor,omitempty"`
+	DRTargetClusterID              string                 `json:"drTargetClusterID,omitempty"`
+	DRWriteEpoch                   int                    `json:"drWriteEpoch,omitempty"`
+	DRReadbackSHA256               string                 `json:"drReadbackSHA256,omitempty"`
+	DRAssignmentsObserved          bool                   `json:"drAssignmentsObserved,omitempty"`
+	ContainerID                    string                 `json:"containerID,omitempty"`
+	ImageID                        string                 `json:"imageID,omitempty"`
+	PID                            string                 `json:"pid,omitempty"`
+	OldIdentity                    *oldPeerIdentity       `json:"oldIdentity,omitempty"`
+	PeerProbe                      *peerProbeResult       `json:"peerProbe,omitempty"`
+	Fault                          *struct {
 		OperatorPod string               `json:"operatorPod"`
 		OperatorUID string               `json:"operatorUID"`
 		ContainerID string               `json:"containerID"`
 		Target      operator.FenceTarget `json:"target"`
 		Removed     bool                 `json:"removed"`
 	} `json:"fault,omitempty"`
+}
+
+type runtimeDiagnosticsView struct {
+	CapturedAt string           `json:"capturedAt"`
+	PodCount   int              `json:"podCount"`
+	Pods       []runtimePodView `json:"pods"`
+}
+
+type runtimePodView struct {
+	Name       string                  `json:"name"`
+	UID        string                  `json:"uid"`
+	NodeName   string                  `json:"nodeName,omitempty"`
+	CreatedAt  string                  `json:"createdAt,omitempty"`
+	Phase      string                  `json:"phase,omitempty"`
+	Conditions []runtimeConditionView  `json:"conditions,omitempty"`
+	Containers []runtimeContainerView  `json:"containers,omitempty"`
+	Logs       []runtimeLogSummaryView `json:"logs,omitempty"`
+}
+
+type runtimeConditionView struct {
+	Type   string `json:"type"`
+	Status string `json:"status"`
+	Reason string `json:"reason,omitempty"`
+}
+
+type runtimeContainerView struct {
+	Name         string `json:"name"`
+	Ready        bool   `json:"ready"`
+	RestartCount int64  `json:"restartCount"`
+	State        string `json:"state,omitempty"`
+	Reason       string `json:"reason,omitempty"`
+	ExitCode     *int64 `json:"exitCode,omitempty"`
+}
+
+// Log text is deliberately not published: even application errors can contain
+// credentials or object-store URLs. These bounded summaries establish which
+// logs were available and their broad startup/failure signals without exposing
+// their contents.
+type runtimeLogSummaryView struct {
+	Container string   `json:"container"`
+	Available bool     `json:"available"`
+	LineCount int      `json:"lineCount"`
+	SHA256    string   `json:"sha256"`
+	Signals   []string `json:"signals,omitempty"`
+}
+
+type drAssignmentView struct {
+	Pod           string `json:"pod"`
+	PodUID        string `json:"podUID"`
+	NodeID        string `json:"nodeID"`
+	CredentialUID string `json:"credentialUID"`
+	InitExitCode  int    `json:"initExitCode"`
 }
 
 func safeJSON(name string, data []byte) ([]byte, error) {
@@ -134,6 +298,8 @@ func safeJSON(name string, data []byte) ([]byte, error) {
 			summary = append(summary, obj{"kind": item["kind"], "name": nested(item, "metadata", "name"), "uid": nested(item, "metadata", "uid"), "namespace": nested(item, "metadata", "namespace"), "deletionTimestamp": nested(item, "metadata", "deletionTimestamp"), "phase": nested(item, "status", "phase"), "stage": nested(item, "status", "stage"), "activeClusterID": nested(item, "status", "activeClusterID")})
 		}
 		return encoded(summary), nil
+	case name == "runtime-diagnostics.json":
+		return sanitizeRuntimeDiagnostics(data)
 	case name == "learner-authenticated-binding.json":
 		value = &struct {
 			PodUID         string                        `json:"podUID"`
@@ -159,6 +325,41 @@ func safeJSON(name string, data []byte) ([]byte, error) {
 			return nil, err
 		}
 		source.Recovery.Metadata = obj{"name": source.Recovery.Metadata["name"], "uid": source.Recovery.Metadata["uid"], "namespace": source.Recovery.Metadata["namespace"]}
+		return encoded(source), nil
+	case name == "dr-qualification.json":
+		var source struct {
+			Version                      int                    `json:"version"`
+			TargetClusterID              string                 `json:"targetClusterID"`
+			AnchorID                     string                 `json:"anchorID"`
+			RecoveryName                 string                 `json:"recoveryName"`
+			RecoveryUID                  string                 `json:"recoveryUID"`
+			OperationID                  string                 `json:"operationID"`
+			RequestHash                  string                 `json:"requestHash"`
+			Receipt                      recoveryanchor.Receipt `json:"receipt"`
+			Assignments                  []drAssignmentView     `json:"assignments"`
+			TargetVoters                 int                    `json:"targetVoters"`
+			InitSucceeded                bool                   `json:"initSucceeded"`
+			PreRuntimeAssignmentObserved bool                   `json:"preRuntimeAssignmentObserved"`
+			RuntimeWALBound              bool                   `json:"runtimeWALBound"`
+		}
+		decoder := json.NewDecoder(bytes.NewReader(data))
+		decoder.DisallowUnknownFields()
+		if err := decoder.Decode(&source); err != nil {
+			return nil, err
+		}
+		if err := decoder.Decode(new(any)); err != io.EOF {
+			return nil, fmt.Errorf("trailing DR qualification data")
+		}
+		if source.Version != 1 || source.TargetClusterID == "" || source.AnchorID != recoveryAnchorID || source.RecoveryName == "" || !validPodUID(source.RecoveryUID) || source.OperationID == "" || len(source.RequestHash) != 64 || source.Receipt.AnchorID != source.AnchorID || source.Receipt.OperationID != source.OperationID || source.Receipt.RequestHash != source.RequestHash || source.Receipt.Target.ClusterID != source.TargetClusterID || source.Receipt.Generation == 0 || source.TargetVoters != 3 || !source.InitSucceeded || !source.PreRuntimeAssignmentObserved || !source.RuntimeWALBound || len(source.Assignments) != 3 {
+			return nil, fmt.Errorf("invalid DR qualification summary")
+		}
+		seen := map[string]bool{}
+		for _, assignment := range source.Assignments {
+			if assignment.Pod != "rhiza-0" && assignment.Pod != "rhiza-1" && assignment.Pod != "rhiza-2" || !validPodUID(assignment.PodUID) || assignment.NodeID == "" || seen[assignment.PodUID] || assignment.CredentialUID == "" || assignment.InitExitCode != 0 {
+				return nil, fmt.Errorf("invalid DR assignment summary")
+			}
+			seen[assignment.PodUID] = true
+		}
 		return encoded(source), nil
 	default:
 		return nil, fmt.Errorf("artifact type is not approved")
@@ -190,8 +391,8 @@ func safeArtifacts(raw string) error {
 		if entry.Type()&os.ModeSymlink != 0 {
 			return fmt.Errorf("artifact symlinks are unsupported")
 		}
-		approved := strings.HasSuffix(name, "-image-evidence.json") || name == "validated-voter-proof.json" || name == "validated-generation-proof.json" || name == "online-active-ledger.json" || name == "learner-authenticated-binding.json" || name == "online-completed-membership.json" || name == "terminal.json"
-		textFile := name == "source-head.txt" || name == "image-ids.txt" || name == "actual-exit.txt"
+		approved := strings.HasSuffix(name, "-image-evidence.json") || name == "validated-voter-proof.json" || name == "validated-generation-proof.json" || name == "online-active-ledger.json" || name == "learner-authenticated-binding.json" || name == "online-completed-membership.json" || name == "dr-qualification.json" || name == "terminal.json" || name == "runtime-diagnostics.json"
+		textFile := name == "source-head.txt" || name == "image-ids.txt" || name == "actual-exit.txt" || name == "pre-cleanup-exit.txt"
 		if !approved && !textFile && name != "events.jsonl" && name != "cleanup.log" {
 			continue
 		}
@@ -221,6 +422,14 @@ func safeArtifacts(raw string) error {
 				if len(event.Rows) > 0 && string(event.Rows) != "1" && string(event.Rows) != "2" && string(event.Rows) != "3" && string(event.Rows) != `[[1,"acknowledged"],[2,"quorum-survived"],[3,"learner-promoted"],[4,"recovered"]]` {
 					return fmt.Errorf("unexpected public readback values")
 				}
+				if event.Event == "dr_successor_runtime_ack" {
+					if len(event.Rows) != 0 || event.DRTargetClusterID == "" || event.DRWriteEpoch != 2 || !event.DRAssignmentsObserved || len(event.DRReadbackSHA256) != 64 {
+						return fmt.Errorf("invalid bounded DR runtime ACK summary")
+					}
+					if _, err := hex.DecodeString(event.DRReadbackSHA256); err != nil {
+						return fmt.Errorf("invalid DR readback digest")
+					}
+				}
 				if err = json.NewEncoder(&result).Encode(event); err != nil {
 					return err
 				}
@@ -237,7 +446,7 @@ func safeArtifacts(raw string) error {
 				return fmt.Errorf("missing or ambiguous public identity receipt")
 			}
 			for i, line := range lines {
-				if name == "actual-exit.txt" {
+				if name == "actual-exit.txt" || name == "pre-cleanup-exit.txt" {
 					if line != "0" && line != "1" && line != "130" && line != "143" {
 						return fmt.Errorf("invalid public exit receipt")
 					}

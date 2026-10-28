@@ -22,7 +22,9 @@ type peerClosureAuthorityTest struct {
 	action    string
 }
 
-func (a *peerClosureAuthorityTest) Register(context.Context, Identity) error { return nil }
+func (a *peerClosureAuthorityTest) Register(_ context.Context, id Identity) (Registration, error) {
+	return Registration{Identity: id}, nil
+}
 func (a *peerClosureAuthorityTest) Bind(_ context.Context, id Identity) error {
 	a.caller = id
 	return nil
@@ -178,6 +180,29 @@ func TestSupervisorRejectsNullAbortSlotBeforeAuthorityDispatch(t *testing.T) {
 	supervisor.handler().ServeHTTP(recorder, req)
 	if recorder.Code != http.StatusConflict || authority.action != "" {
 		t.Fatalf("null abort slot status=%d authority action=%q", recorder.Code, authority.action)
+	}
+}
+
+func TestSupervisorRejectsUnrelatedPayloadBeforePeerClosureDispatch(t *testing.T) {
+	caller := testIdentity()
+	caller.WALIdentity = "wal-caller"
+	authority := &peerClosureAuthorityTest{}
+	supervisor := &Supervisor{Authority: authority, bound: caller, ticket: "ticket"}
+	message := AuthorityMessage{
+		Action: "peer-closure-status", Identity: caller,
+		PeerClosure:         &PeerClosureRequest{ExpectedConfigID: 1, ExpectedAbortSlot: uint64Pointer(0), TargetNodeID: "rhiza-1", TargetWALIdentity: "wal-1"},
+		RepairPhaseComplete: &MembershipRepairPhaseObserveRequest{OperationID: "repair"},
+	}
+	data, err := json.Marshal(message)
+	if err != nil {
+		t.Fatal(err)
+	}
+	req := httptest.NewRequest(http.MethodPost, "/v1/peer-closure/status", bytes.NewReader(data))
+	req.Header.Set("Authorization", "Bearer ticket")
+	recorder := httptest.NewRecorder()
+	supervisor.handler().ServeHTTP(recorder, req)
+	if recorder.Code != http.StatusConflict || authority.action != "" {
+		t.Fatalf("mixed payload status=%d authority action=%q", recorder.Code, authority.action)
 	}
 }
 

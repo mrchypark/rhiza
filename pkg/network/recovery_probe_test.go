@@ -8,7 +8,107 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+
+	"github.com/mrchypark/rhiza/pkg/quepaxa"
 )
+
+func TestMembershipRepairProbeAuthenticatesExactCandidateObservation(t *testing.T) {
+	s := NewServer(nil, nil, "cluster", false, nil)
+	t.Cleanup(s.Close)
+	s.SetRecoveryArchive("secret", func(context.Context) error { return nil })
+	request := validMembershipRepairProbeRequest()
+	want := validMembershipRepairProbeResponse(request)
+	s.SetMembershipRepairProbe(func(_ context.Context, got MembershipRepairProbeRequest) (MembershipRepairProbeResponse, error) {
+		if got.Version != request.Version || got.Challenge != request.Challenge || got.ScopeDigest != request.ScopeDigest ||
+			got.SourceConfigID != request.SourceConfigID || got.AbortSlot == nil || *got.AbortSlot != *request.AbortSlot ||
+			got.ExcludedOldMemberID != request.ExcludedOldMemberID || got.CandidateMember != request.CandidateMember || got.CandidateBindRef != request.CandidateBindRef {
+			t.Fatalf("callback request=%+v", got)
+		}
+		return want, nil
+	})
+	body, err := json.Marshal(request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	req := httptest.NewRequest(http.MethodPost, "/recovery/probe", strings.NewReader(string(body)))
+	req.Header.Set("Authorization", "Bearer secret")
+	req.Header.Set("Content-Type", "application/json")
+	response := httptest.NewRecorder()
+	s.ServeHTTP(response, req)
+	if response.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s", response.Code, response.Body.String())
+	}
+	got, err := StrictDecodeMembershipRepairProbeResponse(response.Body.Bytes(), request, "secret")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.BarrierNonce != membershipRepairBarrierNonceHex(request.Challenge) || got.CandidatePrefixHash != got.PrefixHash {
+		t.Fatalf("observation=%+v", got)
+	}
+
+	if _, err := StrictDecodeMembershipRepairProbeResponse(response.Body.Bytes(), request, "wrong-secret"); !errors.Is(err, ErrRecoveryProbeMAC) {
+		t.Fatalf("wrong key accepted: %v", err)
+	}
+	request.CandidateBindRef = "different-bind"
+	if _, err := StrictDecodeMembershipRepairProbeResponse(response.Body.Bytes(), request, "secret"); err == nil {
+		t.Fatal("response for another candidate bind was accepted")
+	}
+}
+
+func TestMembershipRepairProbeRejectsUnauthenticatedAndUnboundRuntimeResult(t *testing.T) {
+	s := NewServer(nil, nil, "cluster", false, nil)
+	t.Cleanup(s.Close)
+	s.SetRecoveryArchive("secret", func(context.Context) error { return nil })
+	called := false
+	s.SetMembershipRepairProbe(func(_ context.Context, request MembershipRepairProbeRequest) (MembershipRepairProbeResponse, error) {
+		called = true
+		response := validMembershipRepairProbeResponse(request)
+		response.CandidateMember.WALIdentity = strings.Repeat("ee", 32)
+		return response, nil
+	})
+	body, err := json.Marshal(validMembershipRepairProbeRequest())
+	if err != nil {
+		t.Fatal(err)
+	}
+	call := func(token string) *httptest.ResponseRecorder {
+		req := httptest.NewRequest(http.MethodPost, "/recovery/probe", strings.NewReader(string(body)))
+		req.Header.Set("Authorization", "Bearer "+token)
+		req.Header.Set("Content-Type", "application/json")
+		response := httptest.NewRecorder()
+		s.ServeHTTP(response, req)
+		return response
+	}
+	if got := call("wrong"); got.Code != http.StatusForbidden || called {
+		t.Fatalf("unauthorized probe status=%d called=%v", got.Code, called)
+	}
+	if got := call("secret"); got.Code != http.StatusServiceUnavailable || !called {
+		t.Fatalf("unbound result status=%d called=%v body=%s", got.Code, called, got.Body.String())
+	}
+}
+
+func validMembershipRepairProbeRequest() MembershipRepairProbeRequest {
+	abort := quepaxa.Slot(0)
+	return MembershipRepairProbeRequest{
+		Version: 1, Challenge: strings.Repeat("ab", 32), ScopeDigest: strings.Repeat("cd", 32),
+		SourceConfigID: 3, AbortSlot: &abort, ExcludedOldMemberID: "old",
+		CandidateMember:  quepaxa.Member{ID: "candidate", URL: "https://candidate", PeerURL: "quic://candidate", LogURL: "https://candidate/log", PublicKey: quepaxa.PublicKey{1}, WALIdentity: strings.Repeat("ef", 32)},
+		CandidateBindRef: "bind-ref",
+	}
+}
+
+func validMembershipRepairProbeResponse(request MembershipRepairProbeRequest) MembershipRepairProbeResponse {
+	return MembershipRepairProbeResponse{
+		Version: 1, Challenge: request.Challenge, ScopeDigest: request.ScopeDigest,
+		VerifierNodeID: "voter", VerifierWALIdentity: strings.Repeat("12", 32), Ready: true, Voting: true,
+		SourceConfigID: request.SourceConfigID, SourceMembers: []quepaxa.Member{
+			{ID: "voter", URL: "https://voter", PeerURL: "quic://voter", LogURL: "https://voter/log", PublicKey: quepaxa.PublicKey{2}, WALIdentity: strings.Repeat("12", 32)},
+			{ID: "old", URL: "https://old", PeerURL: "quic://old", LogURL: "https://old/log", PublicKey: quepaxa.PublicKey{3}, WALIdentity: strings.Repeat("34", 32)},
+		}, AbortSlot: request.AbortSlot, ExcludedOldMemberID: request.ExcludedOldMemberID,
+		ReadIndexSlot: 10, BarrierSlot: 11, BarrierNonce: membershipRepairBarrierNonceHex(request.Challenge),
+		PrefixHash: strings.Repeat("56", 32), CandidateMember: request.CandidateMember,
+		CandidateBindRef: request.CandidateBindRef, CandidatePrefixThrough: 11, CandidatePrefixHash: strings.Repeat("56", 32),
+	}
+}
 
 func TestRecoveryProbeAuthenticatesFreshStatus(t *testing.T) {
 	s := NewServer(nil, nil, "cluster", false, nil)
