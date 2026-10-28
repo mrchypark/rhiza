@@ -48,7 +48,8 @@ pub struct Config {
     fields: Map<String, Value>,
 }
 impl Config {
-    /// Run on local disk without peer or operator listeners or object storage.
+    /// Run without peer replication or peer/operator listeners. Object storage
+    /// is optional and can be configured with Go fields via `set_option`.
     pub fn local(mut self) -> Self {
         self.fields.insert("Local".into(), Value::Bool(true));
         self

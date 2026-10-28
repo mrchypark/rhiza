@@ -15,7 +15,7 @@ toolchains above.
 
 ```toml
 [dependencies]
-rhizadb = "0.21.0"
+rhizadb = "0.21.1"
 serde_json = "1"
 ```
 
@@ -67,8 +67,15 @@ Since 0.17.0, use
 database. It opens no peer
 transport or listener; `start_operator` is rejected. SQL, KV, graph, receipts,
 and WAL recovery use the existing engine. Listener addresses, members, tokens,
-learner/reconfiguration and object-storage settings must be omitted. There is no
-replication or remote backup; the existing local WAL size limit still applies.
+and learner/reconfiguration settings must be omitted. There is no replication.
+Without object storage, the existing local WAL size limit still applies.
+
+For Local object-storage backup, the Rust facade passes documented Go config
+fields through `set_option`; it does not provide typed object-store builders.
+The engine streams backup history and can restore an empty `DataDir` during
+open. Use the same storage identity and ensure only one process owns the archive
+at a time. See the [Local backup and recovery contract](https://github.com/mrchypark/rhiza/blob/v0.21.1/docs/embedded-object-storage.md),
+including durability, archive compatibility, and filesystem ownership limits.
 
 `execute` and other mutations return `MutationReceipt`; always call
 `require_committed()` because an execution-level rejection is a valid API
@@ -140,15 +147,15 @@ target, verifies it against the published checksum, and writes it as
 `$RHIZA_NATIVE_LIB_DIR` or `./.rhiza-native`:
 
 ```sh
-curl -fsSLO https://raw.githubusercontent.com/mrchypark/rhiza/v0.21.0/sdk/rust/scripts/fetch-native.sh
-sh fetch-native.sh 0.21.0
+curl -fsSLO https://raw.githubusercontent.com/mrchypark/rhiza/v0.21.1/sdk/rust/scripts/fetch-native.sh
+sh fetch-native.sh 0.21.1
 export RHIZA_NATIVE_LIB_DIR="$(pwd)/.rhiza-native"
 ```
 
 For containers, pass the host target and destination explicitly:
 
 ```sh
-sh fetch-native.sh 0.21.0 x86_64-unknown-linux-gnu /opt/rhiza-native
+sh fetch-native.sh 0.21.1 x86_64-unknown-linux-gnu /opt/rhiza-native
 ```
 
 The same files can be fetched by hand: download

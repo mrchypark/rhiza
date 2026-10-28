@@ -47,8 +47,9 @@ continuous object-storage backup and restoration of a missing `DataDir` before
 `Open` returns ready. Use `ObjectStoreDurabilityBeforeAck` when acknowledged
 writes must survive total local loss; asynchronous backup has a loss window.
 Local mode provides no peer replication. See [embedded object-storage backup](docs/embedded-object-storage.md)
-for reconciliation, failure handling, and integration verification. Automatic GC
-preserves current state, retained committed snapshots, and live restore pins
+for reconciliation, failure handling, and integration verification. For a
+Kubernetes init-container handoff, see [Local init-container recovery](docs/local-init-container-recovery.md).
+Automatic GC preserves current state, retained committed snapshots, and live restore pins
 while collecting unreachable eligible objects. The integrated provider suite
 passed on S3, GCS, and Azure Floci emulators: each had 18 passes and two expected
 skips. Emulator results do not establish production-cloud parity; the linked
@@ -104,7 +105,7 @@ it uses the embedded Go API without a public HTTP server. From this checkout:
 cargo run --manifest-path sdk/rust/Cargo.toml --example embedded
 ```
 
-Use `rhizadb = "0.21.0"` in your Cargo dependencies.
+Use `rhizadb = "0.21.1"` in your Cargo dependencies.
 Native builds support macOS and Linux GNU and require Rust, Go 1.27.3+, and a C
 compiler. The Rust bridge requires cgo; Go-only applications remain cgo-free.
 Calls are synchronous. By default the embedded engine starts its private peer
