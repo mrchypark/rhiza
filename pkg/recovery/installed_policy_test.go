@@ -46,6 +46,43 @@ func validInstalledPolicy(t *testing.T) (InstalledPolicyRecord, []byte) {
 	}, secret
 }
 
+func TestInstalledPolicyProfileHashIsInstallationIndependent(t *testing.T) {
+	a, _ := validInstalledPolicy(t)
+	b := cloneInstalledPolicy(a)
+	b.ClusterID, b.StorageBindingID = "another-cluster", "another-store"
+	b.InitialCluster.Members[0].ID = "another-node"
+	b.JoinCapabilityVerifierHex = strings.Repeat("a", 64)
+	verify := func(record InstalledPolicyRecord) *VerifiedInstalledPolicy {
+		genesis, err := InstalledGenesisDigest(record.InitialCluster, record.Profile, record.Durability)
+		if err != nil {
+			t.Fatal(err)
+		}
+		record.Base.GenesisDigest = fmtHex(genesis)
+		bucket := objstore.NewInMemBucket()
+		digest, err := InstallInstalledPolicy(context.Background(), bucket, "", record)
+		if err != nil {
+			t.Fatal(err)
+		}
+		policy, err := VerifyInstalledPolicy(context.Background(), bucket, "", InstalledPolicyExpectation{ExpectedDigest: digest, ClusterID: record.ClusterID, StorageBindingID: record.StorageBindingID, InitialCluster: record.InitialCluster, Durability: record.Durability})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return policy
+	}
+	first := verify(a).ProfileHash()
+	if first == ([32]byte{}) || first != verify(b).ProfileHash() {
+		t.Fatal("installation changed profile hash")
+	}
+	b.Durability = "async"
+	if first == verify(b).ProfileHash() {
+		t.Fatal("durability did not change profile hash")
+	}
+	var nilPolicy *VerifiedInstalledPolicy
+	if nilPolicy.ProfileHash() != ([32]byte{}) {
+		t.Fatal("nil policy has profile hash")
+	}
+}
+
 func TestInstalledPolicyInstallerAndReadonlyVerifier(t *testing.T) {
 	ctx := context.Background()
 	bucket := objstore.NewInMemBucket()
@@ -260,6 +297,66 @@ func TestInstalledPolicyRejectsUnsupportedProfileAndConfusedBase(t *testing.T) {
 			}
 		})
 	}
+}
+
+type zeroAnchorCountingBucket struct {
+	objstore.Bucket
+	reads, uploads int
+}
+
+func (b *zeroAnchorCountingBucket) Get(ctx context.Context, key string) (io.ReadCloser, error) {
+	b.reads++
+	return b.Bucket.Get(ctx, key)
+}
+
+func (b *zeroAnchorCountingBucket) Upload(ctx context.Context, key string, data io.Reader, options ...objstore.ObjectUploadOption) error {
+	b.uploads++
+	return b.Bucket.Upload(ctx, key, data, options...)
+}
+
+func TestInstalledPolicyRejectsZeroDRAnchor(t *testing.T) {
+	ctx := context.Background()
+	record, _ := validInstalledPolicy(t)
+	record.Base = InstalledPolicyBase{Kind: InstalledPolicyBaseDR, GenerationAnchorHash: strings.Repeat("0", 64)}
+	t.Run("digest", func(t *testing.T) {
+		if _, err := InstalledPolicyDigest(record); err == nil {
+			t.Error("digest accepted zero DR anchor")
+		}
+	})
+	t.Run("installer", func(t *testing.T) {
+		bucket := &zeroAnchorCountingBucket{Bucket: objstore.NewInMemBucket()}
+		if _, err := InstallInstalledPolicy(ctx, bucket, "", record); err == nil {
+			t.Error("installer accepted zero DR anchor")
+		}
+		if bucket.reads != 0 || bucket.uploads != 0 {
+			t.Errorf("installer touched storage: reads=%d uploads=%d", bucket.reads, bucket.uploads)
+		}
+		exists, err := bucket.Bucket.Exists(ctx, mustInstalledPolicyKey(t, "", record.ClusterID))
+		if err != nil || exists {
+			t.Errorf("fixed key exists=%t err=%v", exists, err)
+		}
+	})
+	t.Run("verifier", func(t *testing.T) {
+		bucket := objstore.NewInMemBucket()
+		data, err := json.Marshal(record)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := bucket.Upload(ctx, mustInstalledPolicyKey(t, "", record.ClusterID), bytes.NewReader(data)); err != nil {
+			t.Fatal(err)
+		}
+		expected := InstalledPolicyExpectation{ExpectedDigest: sha256.Sum256(data), ClusterID: record.ClusterID, StorageBindingID: record.StorageBindingID, InitialCluster: record.InitialCluster, Durability: record.Durability}
+		if _, err := VerifyInstalledPolicy(ctx, bucket, "", expected); err == nil {
+			t.Error("verifier accepted pinned zero DR anchor")
+		}
+	})
+	t.Run("nonzero", func(t *testing.T) {
+		valid := record
+		valid.Base.GenerationAnchorHash = strings.Repeat("a", 64)
+		if _, err := InstalledPolicyDigest(valid); err != nil {
+			t.Fatalf("nonzero DR anchor rejected: %v", err)
+		}
+	})
 }
 
 func TestInstalledPolicyRejectsDuplicatePublicKeyEvenWhenHashPinned(t *testing.T) {

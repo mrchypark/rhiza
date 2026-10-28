@@ -3,7 +3,6 @@ package network
 import (
 	"context"
 	"errors"
-	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -17,6 +16,25 @@ type catchUpWaitingContext struct {
 	context.Context
 	seen chan struct{}
 	once sync.Once
+}
+
+type catchUpLearnerTransport struct {
+	unavailableTransport
+	source  *quepaxa.Core
+	learner *quepaxa.Core
+}
+
+func (t *catchUpLearnerTransport) SendDecision(_ context.Context, decision quepaxa.Decision) error {
+	if decision.Slot > 1 {
+		values, _, err := t.source.DecisionsFrom(1, int(decision.Slot-1))
+		if err != nil {
+			return err
+		}
+		if err := t.learner.AcceptCertifiedValues(values); err != nil {
+			return err
+		}
+	}
+	return t.learner.AcceptDecision(decision)
 }
 
 func (c *catchUpWaitingContext) Done() <-chan struct{} {
@@ -218,30 +236,73 @@ func TestCatchUpDifferentSourceProgresses(t *testing.T) {
 
 func TestCatchUpControlPageIsDurableEvenAsHint(t *testing.T) {
 	config := quepaxa.Cluster{ConfigID: 1, Members: []quepaxa.Member{testMember("cluster", "a", "a-token")}}
+	learnerDir := t.TempDir()
+	learnerWAL, err := qlog.Open(learnerDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer learnerWAL.Close()
+	learner, err := quepaxa.NewLearner(quepaxa.Config{NodeID: "b", Cluster: config, WAL: learnerWAL, EnableReconfiguration: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ackTransport := &catchUpLearnerTransport{learner: learner}
 	sourceWAL, err := qlog.Open(t.TempDir())
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer sourceWAL.Close()
-	source, err := quepaxa.New(quepaxa.Config{NodeID: "a", Cluster: config, WAL: sourceWAL, EnableReconfiguration: true,
+	source, err := quepaxa.New(quepaxa.Config{NodeID: "a", Cluster: config, WAL: sourceWAL, Transport: ackTransport, EnableReconfiguration: true,
 		ReconfigurationAdmission: func(context.Context, quepaxa.Cluster, quepaxa.Slot, [32]byte) error { return nil },
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
+	ackTransport.source = source
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	if _, _, err := source.Propose(ctx, policySQL(t, "SELECT 1")); err != nil {
 		t.Fatal(err)
 	}
 	joiner := testMember("cluster", "b", "b-token")
-	joiner.WALIdentity = strings.Repeat("b", 64)
+	joiner.WALIdentity = learner.WALIdentity()
 	target := quepaxa.Cluster{ConfigID: 2, Members: append(append([]quepaxa.Member(nil), config.Members...), joiner)}
 	if _, err := source.BeginReconfiguration(ctx, target); err != nil {
 		t.Fatal(err)
 	}
 	if err := source.FinishReconfiguration(ctx); err != nil {
 		t.Fatal(err)
+	}
+	if learner.Tip() != source.Tip() || learner.ConfigID() != 2 {
+		t.Fatal("learner did not acknowledge the terminal decision")
+	}
+	entries, err := learnerWAL.Read()
+	if err != nil {
+		t.Fatal(err)
+	}
+	terminalFound := false
+	for _, entry := range entries {
+		if entry.Type == qlog.EntryDecide && entry.Slot == uint64(source.Tip()) {
+			terminalFound = true
+		}
+	}
+	if !terminalFound {
+		t.Fatal("learner acknowledged without a terminal WAL record")
+	}
+	if err := learnerWAL.Close(); err != nil {
+		t.Fatal(err)
+	}
+	reopenedLearnerWAL, err := qlog.Open(learnerDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer reopenedLearnerWAL.Close()
+	restartedLearner, err := quepaxa.NewLearner(quepaxa.Config{NodeID: "b", Cluster: config, WAL: reopenedLearnerWAL, EnableReconfiguration: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if restartedLearner.Tip() != source.Tip() || restartedLearner.ConfigID() != 2 {
+		t.Fatal("learner terminal prefix or configuration did not survive restart")
 	}
 	values, _, err := source.DecisionsFrom(1, 128)
 	if err != nil {

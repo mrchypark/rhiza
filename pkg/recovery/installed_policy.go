@@ -110,6 +110,15 @@ func (p *VerifiedInstalledPolicy) Profile() string {
 	return p.record.Profile
 }
 
+// ProfileHash identifies the concrete append-only format and durability, not
+// any installation-specific identity or membership.
+func (p *VerifiedInstalledPolicy) ProfileHash() [32]byte {
+	if p == nil {
+		return [32]byte{}
+	}
+	return sha256.Sum256([]byte("rhiza-append-only-immutable-manifest-extent-profile\x00" + string(p.record.Durability)))
+}
+
 func (p *VerifiedInstalledPolicy) Durability() types.ObjectStoreDurability {
 	if p == nil {
 		return ""
@@ -391,7 +400,7 @@ func validateInstalledPolicyRecord(record InstalledPolicyRecord) error {
 		if record.Base.GenesisDigest != "" {
 			return fmt.Errorf("DR installed policy cannot contain a genesis digest")
 		}
-		if _, err := decodeInstalledPolicyHash(record.Base.GenerationAnchorHash); err != nil {
+		if anchor, err := decodeInstalledPolicyHash(record.Base.GenerationAnchorHash); err != nil || anchor == ([32]byte{}) {
 			return fmt.Errorf("installed policy DR anchor hash is invalid")
 		}
 	default:

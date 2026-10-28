@@ -1,6 +1,7 @@
 package rhiza
 
 import (
+	"encoding/base64"
 	"encoding/json"
 	"os"
 	"path/filepath"
@@ -86,6 +87,18 @@ func TestInstalledPolicyConfigFromEnvLoadsTrustedPinAndFileSecret(t *testing.T) 
 		}
 		if strings.Contains(string(encoded), secret) {
 			t.Fatalf("%s serialization exposed the join capability", name)
+		}
+		if strings.Contains(string(encoded), base64.StdEncoding.EncodeToString([]byte(secret))) {
+			t.Errorf("%s serialization exposed the base64-encoded join capability", name)
+		}
+		var fields map[string]json.RawMessage
+		if err := json.Unmarshal(encoded, &fields); err != nil {
+			t.Fatal(err)
+		}
+		for field := range fields {
+			if strings.EqualFold(field, "JoinCapability") || strings.EqualFold(field, "join_capability") {
+				t.Errorf("%s serialization included the join capability field", name)
+			}
 		}
 	}
 }
