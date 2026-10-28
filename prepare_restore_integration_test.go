@@ -191,11 +191,14 @@ func TestEmbeddedObjectStoragePrepareRestore(t *testing.T) {
 	prepared.Learner = &learner
 	prepared.Members = members
 
+	var claimDiagnostics prepareRestoreClaimDiagnostics
 	observer.begin()
-	prepareErr := prepareRestoreWithoutRuntimeCredentials(ctx, prepared)
+	prepareCtx := checkpoint.WithPublisherBusyObserver(ctx, claimDiagnostics.observe)
+	prepareErr := prepareRestoreWithoutRuntimeCredentials(prepareCtx, prepared)
 	prepareMutations := observer.end()
 	if prepareErr != nil {
-		t.Fatalf("prepare learner materialization: %v; observed provider mutations: %+v", prepareErr, prepareMutations)
+		first, latest, count := claimDiagnostics.snapshot()
+		t.Fatalf("prepare learner materialization: %v; observed provider mutations: %+v; checkpoint publisher observations: count=%d first=%+v latest=%+v", prepareErr, prepareMutations, count, first, latest)
 	}
 	if err := assertPreparedRestoreMutationAllowlist(prepareMutations, path.Join(base.ObjStorePrefix, cluster)); err != nil {
 		t.Fatalf("PrepareRestore provider mutation scope: %v", err)
@@ -282,6 +285,76 @@ func TestEmbeddedObjectStoragePrepareRestore(t *testing.T) {
 			t.Fatalf("absent Azure container caused provider mutations: %+v", missingMutations)
 		}
 	}
+}
+
+type prepareRestoreClaimDiagnostic struct {
+	Source               string
+	Purpose              string
+	OwnerID              string
+	Generation           uint64
+	ReservedIndex        uint64
+	BoundIndex           uint64
+	LeaseRemainingMillis int64
+	ObservedAtMillis     int64
+}
+
+func TestPrepareRestoreClaimDiagnosticsKeepsFirstAndLatestConcurrently(t *testing.T) {
+	var diagnostics prepareRestoreClaimDiagnostics
+	diagnostics.observe(checkpoint.PublisherBusyObservation{Source: "seed", OwnerID: "first"})
+
+	const calls = 32
+	var callers sync.WaitGroup
+	callers.Add(calls)
+	for i := 0; i < calls; i++ {
+		go func(i int) {
+			defer callers.Done()
+			diagnostics.observe(checkpoint.PublisherBusyObservation{
+				Source: "concurrent", OwnerID: fmt.Sprintf("owner-%d", i), Generation: uint64(i + 1),
+			})
+		}(i)
+	}
+	callers.Wait()
+
+	first, latest, count := diagnostics.snapshot()
+	if first.Source != "seed" || first.OwnerID != "first" {
+		t.Fatalf("first observation=%+v, want seed event", first)
+	}
+	if latest.Source != "concurrent" || !strings.HasPrefix(latest.OwnerID, "owner-") {
+		t.Fatalf("latest observation=%+v, want one concurrent event", latest)
+	}
+	if count != calls+1 {
+		t.Fatalf("observation count=%d, want %d", count, calls+1)
+	}
+}
+
+// Keep only the first and most recent bounded claim observations for failure
+// diagnostics; the observer can run from the renewal goroutine.
+type prepareRestoreClaimDiagnostics struct {
+	mu     sync.Mutex
+	first  prepareRestoreClaimDiagnostic
+	latest prepareRestoreClaimDiagnostic
+	count  uint64
+}
+
+func (d *prepareRestoreClaimDiagnostics) observe(event checkpoint.PublisherBusyObservation) {
+	diagnostic := prepareRestoreClaimDiagnostic{
+		Source: event.Source, Purpose: event.Purpose, OwnerID: event.OwnerID,
+		Generation: event.Generation, ReservedIndex: event.ReservedIndex, BoundIndex: event.BoundIndex,
+		LeaseRemainingMillis: event.LeaseRemainingMillis, ObservedAtMillis: event.ObservedAtMillis,
+	}
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	if d.count == 0 {
+		d.first = diagnostic
+	}
+	d.latest = diagnostic
+	d.count++
+}
+
+func (d *prepareRestoreClaimDiagnostics) snapshot() (prepareRestoreClaimDiagnostic, prepareRestoreClaimDiagnostic, uint64) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	return d.first, d.latest, d.count
 }
 
 type preparedArchivePin struct {
