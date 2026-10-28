@@ -494,27 +494,32 @@ jobs:
           } >>"$evidence_dir/environment.txt"
           printf 'RHIZA_VERSITYGW_BIN=%s\n' "$binary" >>"$GITHUB_ENV"
       - name: Run learner foundation normal and race tests
-        shell: bash
+        shell: sh
         env:
           CGO_ENABLED: "1"
           RHIZA_VERSITY_EVIDENCE_DIR: ${{ runner.temp }}/learner-foundation-versity/versity-raw
         run: |
-          set -euo pipefail
+          set -eu
           evidence_dir="$RUNNER_TEMP/learner-foundation-versity"
           gateway_run_dirs() {
             base=$RHIZA_VERSITY_EVIDENCE_DIR
-            [ -d "$base" ] || return 0
+            if [ ! -d "$base" ]; then
+              return 0
+            fi
             for run_dir in "$base"/versity-*; do
-              [ -d "$run_dir" ] && printf '%s\n' "$run_dir"
+              if [ -d "$run_dir" ]; then
+                printf '%s\n' "$run_dir"
+              fi
             done
-            return 0
           }
           wait_for_gateway_completion() {
-            previous_runs=$1
+            previous_file=$1
+            current_file=$2
+            gateway_run_dirs >"$current_file"
             found=0
             while IFS= read -r run_dir; do
               [ -d "$run_dir" ] || continue
-              if printf '%s\n' "$previous_runs" | grep -Fqx "$run_dir"; then
+              if grep -Fqx "$run_dir" "$previous_file"; then
                 continue
               fi
               found=$((found + 1))
@@ -525,21 +530,22 @@ jobs:
                 attempt=$((attempt + 1))
               done
               if [ ! -f "$marker" ]; then
-                printf '%s\tmissing-after-10s\n' "$run_dir" | tee -a "$evidence_dir/cleanup.tsv"
+                printf '%s\tmissing-after-10s\n' "$run_dir" >>"$evidence_dir/cleanup.tsv"
                 return 1
               fi
               if ! grep -Fqx 'gateway_reaped=true' "$marker"; then
-                printf '%s\tinvalid-completion-marker\n' "$run_dir" | tee -a "$evidence_dir/cleanup.tsv"
+                printf '%s\tinvalid-completion-marker\n' "$run_dir" >>"$evidence_dir/cleanup.tsv"
                 return 1
               fi
-              printf '%s\tcomplete\t' "$run_dir" | tee -a "$evidence_dir/cleanup.tsv"
-              tr '\n' ' ' <"$marker" | tee -a "$evidence_dir/cleanup.tsv"
-              printf '\n' | tee -a "$evidence_dir/cleanup.tsv"
-            done < <(gateway_run_dirs)
+              printf '%s\tcomplete\t' "$run_dir" >>"$evidence_dir/cleanup.tsv"
+              tr '\n' ' ' <"$marker" >>"$evidence_dir/cleanup.tsv"
+              printf '\n' >>"$evidence_dir/cleanup.tsv"
+            done <"$current_file"
             if [ "$found" -eq 0 ]; then
-              printf 'no-new-gateway-directory\n' | tee -a "$evidence_dir/cleanup.tsv"
+              printf 'no-new-gateway-directory\n' >>"$evidence_dir/cleanup.tsv"
               return 1
             fi
+            return 0
           }
           run_test() {
             label=$1
@@ -547,22 +553,26 @@ jobs:
             shift 2
             {
               printf '%s\t' "$label"
-              printf '%q ' "$@"
+              for argument in "$@"; do
+                printf '%s ' "$argument"
+              done
               printf '\n'
-            } | tee -a "$evidence_dir/commands.txt"
-            previous_runs=$(gateway_run_dirs)
+            } >>"$evidence_dir/commands.txt"
+            previous_file="$evidence_dir/logs/$label.gateway-before"
+            current_file="$evidence_dir/logs/$label.gateway-after"
+            gateway_run_dirs >"$previous_file"
             if "$@" >"$evidence_dir/logs/$label.log" 2>&1; then
               status=0
             else
               status=$?
             fi
-            if wait_for_gateway_completion "$previous_runs"; then
+            if wait_for_gateway_completion "$previous_file" "$current_file"; then
               cleanup_status=0
             else
               cleanup_status=$?
             fi
-            printf '%s\t%s\n' "$label" "$status" | tee -a "$evidence_dir/exits.tsv"
-            printf '%s\t%s\n' "$label" "$cleanup_status" | tee -a "$evidence_dir/cleanup-status.tsv"
+            printf '%s\t%s\n' "$label" "$status" >>"$evidence_dir/exits.tsv"
+            printf '%s\t%s\n' "$label" "$cleanup_status" >>"$evidence_dir/cleanup-status.tsv"
             cat "$evidence_dir/logs/$label.log"
             if [ "$status" -ne 0 ]; then
               return "$status"
@@ -571,10 +581,10 @@ jobs:
             pass_count=$(grep -Ec "^--- PASS: ${expected_test}([[:space:]]|$)" "$evidence_dir/logs/$label.log" || true)
             skip_count=$(grep -Ec "^--- SKIP: ${expected_test}([[:space:]]|$)" "$evidence_dir/logs/$label.log" || true)
             if [ "$pass_count" -lt 1 ] || [ "$skip_count" -ne 0 ]; then
-              printf '%s\tfailed\tpass=%s\tskip=%s\n' "$label" "$pass_count" "$skip_count" | tee -a "$evidence_dir/selection.tsv"
+              printf '%s\tfailed\tpass=%s\tskip=%s\n' "$label" "$pass_count" "$skip_count" >>"$evidence_dir/selection.tsv"
               return 1
             fi
-            printf '%s\tpass\tpass=%s\tskip=%s\n' "$label" "$pass_count" "$skip_count" | tee -a "$evidence_dir/selection.tsv"
+            printf '%s\tpass\tpass=%s\tskip=%s\n' "$label" "$pass_count" "$skip_count" >>"$evidence_dir/selection.tsv"
             return "$cleanup_status"
           }
           if run_test learner-foundation-normal TestNodeOpenStartsFreshLearnerWithoutFencingAuthority env \

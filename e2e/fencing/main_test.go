@@ -200,6 +200,15 @@ func runDiagnosticTrapFixture(t *testing.T, createExit int, diagnosticsFail, blo
 	writeExecutable("git", `test "$*" = 'rev-parse HEAD' || exit 2
 printf '%s\\n' `+strings.Repeat("a", 40))
 	writeExecutable("docker", "printf '%s\\n' sha256:"+strings.Repeat("a", 64)+" sha256:"+strings.Repeat("b", 64)+" sha256:"+strings.Repeat("c", 64))
+	// The production script uses openssl to create throwaway TLS key/cert
+	// files. The fixture only needs those paths to exist for fake kubectl;
+	// don't depend on openssl being installed in the minimal Alpine test image.
+	writeExecutable("openssl", `while [ "$#" -gt 0 ]; do
+  case "$1" in
+    -keyout|-out) shift; : >"$1" ;;
+  esac
+  shift
+done`)
 	diagnosticsExit := "0"
 	if diagnosticsFail {
 		diagnosticsExit = "23"

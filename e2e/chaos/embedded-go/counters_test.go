@@ -316,8 +316,9 @@ func TestLearnerFoundationWorkflowSelectorAndGatewayEvidence(t *testing.T) {
 	var workflow struct {
 		Jobs map[string]struct {
 			Steps []struct {
-				Name string `yaml:"name"`
-				Run  string `yaml:"run"`
+				Name  string `yaml:"name"`
+				Shell string `yaml:"shell"`
+				Run   string `yaml:"run"`
 			} `yaml:"steps"`
 		} `yaml:"jobs"`
 	}
@@ -325,14 +326,16 @@ func TestLearnerFoundationWorkflowSelectorAndGatewayEvidence(t *testing.T) {
 		t.Fatal(err)
 	}
 	var run string
+	var shell string
 	for _, step := range workflow.Jobs["learner-foundation-versity"].Steps {
 		if step.Name == "Run learner foundation normal and race tests" {
 			run = step.Run
+			shell = step.Shell
 			break
 		}
 	}
-	if run == "" {
-		t.Fatal("learner foundation test step is missing")
+	if run == "" || shell != "sh" {
+		t.Fatalf("learner foundation test step missing or not POSIX sh: shell=%q", shell)
 	}
 
 	tests := []struct {
@@ -388,7 +391,7 @@ esac
 			if err := os.WriteFile(filepath.Join(bin, "sleep"), []byte("#!/bin/sh\nexit 0\n"), 0o755); err != nil {
 				t.Fatal(err)
 			}
-			cmd := exec.Command("/bin/bash", "-c", run)
+			cmd := exec.Command("/bin/sh", "-c", run)
 			cmd.Env = append(os.Environ(),
 				"PATH="+bin+":"+os.Getenv("PATH"),
 				"RUNNER_TEMP="+temp,

@@ -2,8 +2,10 @@ package operator
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
+	"net/http"
 	"path"
 	"strings"
 	"sync/atomic"
@@ -76,6 +78,55 @@ func setAnchorEnv(r *Resource, api *operatorAPI) {
 	}
 	annotations[fencingProtocolAnnotation] = "1"
 	annotations[fencingRootAnnotation] = "root-uid"
+}
+
+func installInitialPrepareAuthorizationFixture(t *testing.T, ctx context.Context, bucket objstore.Bucket, api *operatorAPI, c *Controller) {
+	t.Helper()
+	root := ClusterResource{
+		APIVersion: "rhiza.mrchypark.dev/v1alpha1",
+		Kind:       "RhizaCluster",
+		Metadata:   object{"name": "rhiza", "uid": "root-uid", "generation": float64(1)},
+		Spec: ClusterSpec{
+			LogicalID: "initial", StatefulSet: "rhiza", Container: "rhiza", AdoptClusterID: "source",
+			VoterCount: 3, Automatic: true,
+		},
+	}
+
+	// Serve the actual owning root through the same list endpoint used by the
+	// controller. The shared operatorAPI intentionally defaults unknown routes
+	// to 404, so keep this addition local to anchor tests.
+	previousHandler := api.server.Config.Handler
+	rootPath := c.clusterPath("")
+	rootList, err := json.Marshal(struct {
+		Items []ClusterResource `json:"items"`
+	}{Items: []ClusterResource{root}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	api.server.Config.Handler = http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
+		if request.Method == http.MethodGet && request.URL.Path == rootPath {
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write(rootList)
+			return
+		}
+		previousHandler.ServeHTTP(w, request)
+	})
+
+	ctr, err := container(api.sts, "rhiza")
+	if err != nil {
+		t.Fatal(err)
+	}
+	candidate := expectedBootstrapCandidate(&root, api.sts)
+	operationID := bootstrapOperationID(str(root.Metadata["uid"]), str(nested(api.sts, "metadata", "uid")), candidate)
+	if err := installPrepareInitProfile(api.sts, ctr, operationID, str(root.Metadata["uid"])); err != nil {
+		t.Fatalf("install initial prepare-init profile: %v", err)
+	}
+	if err := c.immutable(ctx, c.bootstrapCandidateKey(&root), jsonBytes(candidate)); err != nil {
+		t.Fatalf("retain actual initial bootstrap candidate: %v", err)
+	}
+	if _, err := c.ensureBootstrapLedger(ctx, &root, api.sts, "initial-credentials", "initial-credential-uid", prepareProfileHash(api.sts), members()); err != nil {
+		t.Fatalf("retain actual initial bootstrap ledger operation and pin: %v", err)
+	}
 }
 
 func TestAnchorBlockedWhenBackendNil(t *testing.T) {
@@ -182,6 +233,7 @@ func TestAnchorSuccessFullFlow(t *testing.T) {
 	r.Spec.Fence = fence(r)
 	r.Spec.AnchorID = "my-anchor"
 	setAnchorEnv(r, api)
+	installInitialPrepareAuthorizationFixture(t, ctx, bucket, api, c)
 
 	anchor := &fakeAnchorClient{}
 	c.Anchor = anchor
@@ -426,6 +478,7 @@ func TestAnchorStartingAlreadyTargetStaleVerify(t *testing.T) {
 	r.Spec.Fence = fence(r)
 	r.Spec.AnchorID = "my-anchor"
 	setAnchorEnv(r, api)
+	installInitialPrepareAuthorizationFixture(t, ctx, bucket, api, c)
 	anchor := &fakeAnchorClient{}
 	c.Anchor = anchor
 	advance := func(stage string) {
