@@ -1353,11 +1353,15 @@ func TestStaleArchiveCleanupCannotDeleteRepublishedExtent(t *testing.T) {
 	if publisher.head.TailObject == 0 {
 		t.Fatal("publisher reused a stale GC candidate physical extent")
 	}
-	if err := publisher.releaseGCLock(ctx, successor); err != nil {
-		t.Fatal(err)
-	}
 	close(bucket.release)
 	if err := <-gcDone; err != nil {
+		t.Fatal(err)
+	}
+	current, err := publisher.readGCLock(ctx)
+	if err != nil || current.OwnerID != successor.OwnerID || current.Generation != successor.Generation || current.LeaseUntilMS != successor.LeaseUntilMS {
+		t.Fatalf("successor GC lock=%+v err=%v, want untouched successor %+v", current, err, successor)
+	}
+	if err := publisher.releaseGCLock(ctx, successor); err != nil {
 		t.Fatal(err)
 	}
 	reader := NewManager(bucket, "cluster", 1)

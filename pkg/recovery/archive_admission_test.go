@@ -6,6 +6,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"strings"
 	"sync/atomic"
@@ -28,6 +29,78 @@ type archiveAdmissionBucket struct {
 	confirmBusy   bool
 	releaseErr    error
 	commitRelease bool
+}
+
+type publicationConfirmationMismatchBucket struct {
+	objstore.Bucket
+	key      string
+	uploads  atomic.Int32
+	workRuns atomic.Int32
+}
+
+type releaseReadBusyBucket struct {
+	objstore.Bucket
+	key          string
+	armed        atomic.Bool
+	lockWrites   atomic.Int32
+	readAttempts atomic.Int32
+}
+
+func (b *releaseReadBusyBucket) Attributes(ctx context.Context, name string) (objstore.ObjectAttributes, error) {
+	if name == b.key && b.armed.Load() && b.readAttempts.Add(1) == 1 {
+		return objstore.ObjectAttributes{}, ErrArchiveBusy
+	}
+	return b.Bucket.Attributes(ctx, name)
+}
+
+func (b *releaseReadBusyBucket) Upload(ctx context.Context, name string, r io.Reader, options ...objstore.ObjectUploadOption) error {
+	err := b.Bucket.Upload(ctx, name, r, options...)
+	if name == b.key && err == nil {
+		b.lockWrites.Add(1)
+	}
+	return err
+}
+
+type recoveryPinUploadGateBucket struct {
+	objstore.Bucket
+	pinKey   string
+	uploaded chan struct{}
+	release  <-chan struct{}
+}
+
+func (b *recoveryPinUploadGateBucket) Upload(ctx context.Context, name string, r io.Reader, options ...objstore.ObjectUploadOption) error {
+	if err := b.Bucket.Upload(ctx, name, r, options...); err != nil {
+		return err
+	} else if name == b.pinKey {
+		close(b.uploaded)
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-b.release:
+		}
+	}
+	return nil
+}
+
+func (b *publicationConfirmationMismatchBucket) Get(ctx context.Context, name string) (io.ReadCloser, error) {
+	if name == b.key && b.uploads.Load() > 0 {
+		mismatch, err := json.Marshal(archiveGCLock{
+			OwnerID: "different-owner", Generation: 1,
+			LeaseUntilMS: time.Now().Add(archivePinLease).UnixMilli(),
+		})
+		if err != nil {
+			return nil, err
+		}
+		return io.NopCloser(strings.NewReader(string(mismatch))), nil
+	}
+	return b.Bucket.Get(ctx, name)
+}
+
+func (b *publicationConfirmationMismatchBucket) Upload(ctx context.Context, name string, r io.Reader, options ...objstore.ObjectUploadOption) error {
+	if name == b.key {
+		b.uploads.Add(1)
+	}
+	return b.Bucket.Upload(ctx, name, r, options...)
 }
 
 func (b *archiveAdmissionBucket) Get(ctx context.Context, name string) (io.ReadCloser, error) {
@@ -207,6 +280,44 @@ func TestBeginRecoverySnapshotConfirmationMismatchIsNotRetried(t *testing.T) {
 	}
 }
 
+func TestPublicationAdmissionConfirmationMismatchIsNotRechecked(t *testing.T) {
+	ctx, base, _, seed := newSealableArchive(t)
+	defer seed.Close()
+	manager := NewManager(base, "cluster", 1)
+	defer manager.Close()
+	bucket := &publicationConfirmationMismatchBucket{Bucket: base, key: manager.publicationLockKey()}
+	manager.bucket = bucket
+	operationCtx, cancel := context.WithTimeout(ctx, time.Second)
+	defer cancel()
+	traced := localtesthooks.WithArchiveBusyTrace(operationCtx, func(event localtesthooks.ArchiveBusyEvent) {
+		if event.Resource == "publication_lock" && event.Branch == "confirm_mismatch_or_expired" {
+			cancel()
+		}
+	})
+	var rechecks atomic.Int32
+	err := manager.withPublicationLockRecheck(traced, "mismatch-waiter", func(context.Context) (bool, error) {
+		rechecks.Add(1)
+		return true, nil
+	}, func(context.Context) error {
+		bucket.workRuns.Add(1)
+		return nil
+	})
+	var admissionErr *archiveLockAdmissionError
+	if !errors.Is(err, ErrArchiveBusy) || !errors.As(err, &admissionErr) ||
+		admissionErr.phase != "acquisition confirmation outcome unknown" || admissionErr.retryable || errors.Is(err, context.Canceled) {
+		t.Fatalf("publication error=%v admission=%+v, want preserved non-retryable confirmation mismatch", err, admissionErr)
+	}
+	if got := bucket.uploads.Load(); got != 1 {
+		t.Fatalf("PUBLISH_LOCK PUTs=%d, want exactly one committed PUT", got)
+	}
+	if got := bucket.workRuns.Load(); got != 0 {
+		t.Fatalf("publication work runs=%d, want zero", got)
+	}
+	if got := rechecks.Load(); got != 0 {
+		t.Fatalf("publication rechecks=%d, want zero", got)
+	}
+}
+
 func TestBeginRecoverySnapshotCallbackLoadCancellationIsTerminalAndReleases(t *testing.T) {
 	ctx, base, _, seed := newSealableArchive(t)
 	defer seed.Close()
@@ -297,5 +408,182 @@ func TestArchiveActiveRecoveryPinCleanReleaseRemainsExactSentinel(t *testing.T) 
 	defer manager.Close()
 	if err := manager.TrimThrough(ctx, sealed, decision); err != ErrActiveRecoveryPin {
 		t.Fatalf("clean active-pin refusal=%v, want exact ErrActiveRecoveryPin", err)
+	}
+}
+
+func TestArchiveGCCleanupReleaseBusyExceptionRequiresCleanCleanupOutcome(t *testing.T) {
+	key, gcKey := "cluster/archive/GC_LOCK", "cluster/archive/GC_LOCK"
+	tests := []struct {
+		name       string
+		gcTrace    bool
+		key        string
+		owner      string
+		workErr    error
+		renewalErr error
+		releaseErr error
+		contextErr error
+		want       bool
+	}{
+		{name: "actual cleanup release mismatch", gcTrace: true, key: key, owner: "archive-gc", releaseErr: ErrArchiveBusy, want: true},
+		{name: "snapshot owner", gcTrace: true, key: key, owner: "snapshot:restore", releaseErr: ErrArchiveBusy},
+		{name: "trim owner", gcTrace: true, key: key, owner: "archive-trim", releaseErr: ErrArchiveBusy},
+		{name: "publication lock", gcTrace: true, key: "cluster/archive/PUBLISH_LOCK", owner: "archive-gc", releaseErr: ErrArchiveBusy},
+		{name: "wrapped backend busy", gcTrace: true, key: key, owner: "archive-gc", releaseErr: fmt.Errorf("release read: %w", ErrArchiveBusy)},
+		{name: "joined release failure", gcTrace: true, key: key, owner: "archive-gc", releaseErr: errors.Join(ErrArchiveBusy, errors.New("other failure"))},
+		{name: "work failure", gcTrace: true, key: key, owner: "archive-gc", workErr: errors.New("work failed"), releaseErr: ErrArchiveBusy},
+		{name: "renewal failure", gcTrace: true, key: key, owner: "archive-gc", renewalErr: errors.New("renewal failed"), releaseErr: ErrArchiveBusy},
+		{name: "context canceled", gcTrace: true, key: key, owner: "archive-gc", releaseErr: ErrArchiveBusy, contextErr: context.Canceled},
+		{name: "ordinary gc lock user", gcTrace: false, key: key, owner: "archive-gc", releaseErr: ErrArchiveBusy},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			got := cleanStaleArchiveCleanupReleaseRefusal(test.gcTrace, test.key, gcKey, test.owner, test.workErr, test.renewalErr, test.releaseErr, test.contextErr)
+			if got != test.want {
+				t.Fatalf("clean stale cleanup refusal=%t, want %t", got, test.want)
+			}
+		})
+	}
+}
+
+func TestArchiveGCCleanupBackendBusyReleaseReadIsTerminal(t *testing.T) {
+	ctx, base, _, seed := newSealableArchive(t)
+	defer seed.Close()
+	key := "cluster/archive/GC_LOCK"
+	bucket := &releaseReadBusyBucket{Bucket: base, key: key}
+	manager := NewManager(bucket, "cluster", 1)
+	defer manager.Close()
+	ctx = localtesthooks.WithArchiveGCPhaseTrace(ctx, func(phase string) {
+		if phase == "archive-gc:lock-release:begin" {
+			bucket.armed.Store(true)
+		}
+	})
+	err := manager.Cleanup(ctx, time.Hour)
+	if err == nil || !errors.Is(err, ErrArchiveBusy) || err == ErrArchiveBusy || !strings.Contains(err.Error(), "archive lock release read") {
+		t.Fatalf("Cleanup error=%v, want wrapped release-read Busy", err)
+	}
+	if got := bucket.lockWrites.Load(); got != 1 {
+		t.Fatalf("GC_LOCK PUTs=%d, want acquisition only and no release PUT", got)
+	}
+}
+
+func TestArchiveGCCleanupCommittedBusyReleaseIsTerminal(t *testing.T) {
+	ctx, base, _, seed := newSealableArchive(t)
+	defer seed.Close()
+	bucket := &archiveAdmissionBucket{Bucket: base, gcKey: "cluster/archive/GC_LOCK", releaseErr: ErrArchiveBusy, commitRelease: true}
+	manager := NewManager(bucket, "cluster", 1)
+	defer manager.Close()
+	err := manager.Cleanup(ctx, time.Hour)
+	if err == nil || !errors.Is(err, ErrArchiveBusy) || err == ErrArchiveBusy || !strings.Contains(err.Error(), "archive lock release write") {
+		t.Fatalf("Cleanup error=%v, want retained committed-but-unknown release Busy", err)
+	}
+	lock, readErr := manager.readGCLock(ctx)
+	if readErr != nil || lock.LeaseUntilMS > time.Now().UnixMilli() {
+		t.Fatalf("GC_LOCK=%+v readErr=%v, want committed expired release despite unknown acknowledgment", lock, readErr)
+	}
+}
+
+func TestArchiveGCCleanupReleaseBusyDoesNotHideWorkFailure(t *testing.T) {
+	ctx, base, _, seed := newSealableArchive(t)
+	defer seed.Close()
+	owner := NewManager(base, "cluster", 1)
+	defer owner.Close()
+	successorManager := NewManager(base, "cluster", 1)
+	defer successorManager.Close()
+	workErr := errors.New("cleanup work failed")
+	var successor *archiveGCLock
+	err := owner.withGCLock(ctx, "archive-gc", func(context.Context) error {
+		current, err := owner.readGCLock(ctx)
+		if err != nil {
+			return err
+		}
+		current.LeaseUntilMS = time.Now().Add(-time.Second).UnixMilli()
+		if err := owner.writeGCLock(ctx, *current, objstore.WithIfMatch(current.version)); err != nil {
+			return err
+		}
+		successor, err = successorManager.acquireGCLock(ctx, "gc-successor", archivePinLease)
+		if err != nil {
+			return err
+		}
+		return workErr
+	})
+	if successor == nil || !errors.Is(err, workErr) || !errors.Is(err, ErrArchiveBusy) {
+		t.Fatalf("successor=%+v error=%v, want both cleanup work and stale release causes", successor, err)
+	}
+	if err := successorManager.releaseGCLock(ctx, successor); err != nil {
+		t.Fatalf("release test successor: %v", err)
+	}
+}
+
+func TestRecoverySnapshotSupersededGCReleaseRemainsFailure(t *testing.T) {
+	ctx, base, _, seed := newSealableArchive(t)
+	defer seed.Close()
+	owner := "superseded-snapshot"
+	releasePin := make(chan struct{})
+	manager := NewManager(base, "cluster", 1)
+	defer manager.Close()
+	bucket := &recoveryPinUploadGateBucket{Bucket: base, pinKey: manager.recoveryPinKey(owner), uploaded: make(chan struct{}), release: releasePin}
+	manager.bucket = bucket
+	successorManager := NewManager(base, "cluster", 1)
+	defer successorManager.Close()
+	type result struct {
+		snapshot *RecoverySnapshot
+		err      error
+	}
+	done := make(chan result, 1)
+	go func() {
+		snapshot, err := manager.BeginRecoverySnapshot(ctx, owner, time.Minute)
+		done <- result{snapshot: snapshot, err: err}
+	}()
+	select {
+	case <-bucket.uploaded:
+	case <-time.After(5 * time.Second):
+		t.Fatal("recovery pin PUT did not reach confirmation gate")
+	}
+	current, err := successorManager.readGCLock(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	current.LeaseUntilMS = time.Now().Add(-time.Second).UnixMilli()
+	if err := successorManager.writeGCLock(ctx, *current, objstore.WithIfMatch(current.version)); err != nil {
+		t.Fatal(err)
+	}
+	successor, err := successorManager.acquireGCLock(ctx, "snapshot-successor", archivePinLease)
+	if err != nil {
+		t.Fatal(err)
+	}
+	close(releasePin)
+	got := <-done
+	if got.snapshot != nil || !errors.Is(got.err, ErrArchiveBusy) || !strings.Contains(got.err.Error(), "archive lock release") {
+		t.Fatalf("snapshot=%v error=%v, want no snapshot and stale GC release failure", got.snapshot, got.err)
+	}
+	current, err = successorManager.readGCLock(ctx)
+	if err != nil || current.OwnerID != successor.OwnerID || current.Generation != successor.Generation || current.LeaseUntilMS != successor.LeaseUntilMS {
+		t.Fatalf("successor lock after snapshot=%+v err=%v, want untouched successor %+v", current, err, successor)
+	}
+	if err := successorManager.releaseGCLock(ctx, successor); err != nil {
+		t.Fatalf("release test successor: %v", err)
+	}
+}
+
+func TestPublicationReleaseBusyRemainsTerminal(t *testing.T) {
+	ctx, base, _, seed := newSealableArchive(t)
+	defer seed.Close()
+	manager := NewManager(base, "cluster", 1)
+	defer manager.Close()
+	thief := NewManager(base, "cluster", 1)
+	defer thief.Close()
+	workCalls := 0
+	err := manager.withArchiveLock(ctx, manager.publicationLockKey(), "test-publisher", false, func(context.Context) error {
+		workCalls++
+		current, err := thief.readArchiveLock(ctx, manager.publicationLockKey())
+		if err != nil {
+			return err
+		}
+		current.OwnerID = "successor"
+		current.Generation++
+		return thief.writeArchiveLock(ctx, manager.publicationLockKey(), *current, objstore.WithIfMatch(current.version))
+	})
+	if err == nil || !errors.Is(err, ErrArchiveBusy) || workCalls != 1 {
+		t.Fatalf("publication error=%v work calls=%d, want terminal Busy with one invocation", err, workCalls)
 	}
 }

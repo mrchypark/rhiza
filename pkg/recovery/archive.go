@@ -1891,6 +1891,10 @@ func (m *Manager) withPublicationLockRecheck(ctx context.Context, owner string, 
 			}
 			return err
 		}
+		var admissionErr *archiveLockAdmissionError
+		if errors.As(err, &admissionErr) && !admissionErr.retryable {
+			return err
+		}
 		if _, bounded := ctx.Deadline(); !bounded {
 			m.traceArchiveBusy(ctx, owner, m.publicationLockKey(), "returned", "terminal", false)
 			return err
@@ -2009,6 +2013,9 @@ func (m *Manager) withArchiveLock(ctx context.Context, key, owner string, gcTrac
 	if err == ErrActiveRecoveryPin && releaseErr == nil && renewalFailure == nil && ctx.Err() == nil {
 		return ErrActiveRecoveryPin
 	}
+	if cleanStaleArchiveCleanupReleaseRefusal(gcTrace, key, m.gcLockKey(), owner, err, renewalFailure, releaseErr, ctx.Err()) {
+		return nil
+	}
 	var failures []error
 	if err != nil {
 		failures = append(failures, fmt.Errorf("archive lock work: %w", err))
@@ -2023,6 +2030,11 @@ func (m *Manager) withArchiveLock(ctx context.Context, key, owner string, gcTrac
 		failures = append(failures, fmt.Errorf("archive lock context: %w", ctx.Err()))
 	}
 	return errors.Join(failures...)
+}
+
+func cleanStaleArchiveCleanupReleaseRefusal(gcTrace bool, key, gcKey, owner string, workErr, renewalErr, releaseErr, contextErr error) bool {
+	return gcTrace && key == gcKey && owner == "archive-gc" && workErr == nil && renewalErr == nil &&
+		releaseErr == ErrArchiveBusy && contextErr == nil
 }
 
 func (m *Manager) acquireGCLock(ctx context.Context, owner string, lease time.Duration) (*archiveGCLock, error) {
@@ -2076,7 +2088,7 @@ func (m *Manager) releaseGCLock(ctx context.Context, lock *archiveGCLock) error 
 func (m *Manager) releaseArchiveLock(ctx context.Context, key string, lock *archiveGCLock) error {
 	current, err := m.readArchiveLock(ctx, key)
 	if err != nil {
-		return err
+		return fmt.Errorf("archive lock release read: %w", err)
 	}
 	if lock == nil || current.OwnerID != lock.OwnerID || current.Generation != lock.Generation {
 		m.traceArchiveBusy(ctx, "unknown", key, "release_mismatch_or_conflict", "site", true)
@@ -2084,11 +2096,11 @@ func (m *Manager) releaseArchiveLock(ctx context.Context, key string, lock *arch
 	}
 	current.LeaseUntilMS = time.Now().UnixMilli()
 	if err := m.writeArchiveLock(ctx, key, *current, objstore.WithIfMatch(current.version)); err != nil {
-		if m.bucket.IsConditionNotMetErr(err) {
+		if m.bucket.IsConditionNotMetErr(err) && !errors.Is(err, ErrArchiveBusy) {
 			m.traceArchiveBusy(ctx, "unknown", key, "release_mismatch_or_conflict", "site", true)
 			return ErrArchiveBusy
 		}
-		return err
+		return fmt.Errorf("archive lock release write: %w", err)
 	}
 	return nil
 }

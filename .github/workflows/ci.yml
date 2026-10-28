@@ -53,6 +53,10 @@ jobs:
       - name: Check cooperative protocol and engine regression tests
         run: |
           go test -race ./pkg/fencing ./pkg/operator ./pkg/node ./pkg/network ./internal/objstore ./e2e/fencing -count=1 -timeout=5m
+      - name: Install pinned Helm client for Chaos Mesh qualification
+        uses: azure/setup-helm@v4
+        with:
+          version: v3.17.3
       - name: Qualify actual cooperative executor in disposable Kubernetes
         env:
           CGO_ENABLED: 0
@@ -64,6 +68,7 @@ jobs:
           go build -o "$RUNNER_TEMP/fencing-images/rhiza-operator" ./cmd/rhiza-operator
           go build -o "$RUNNER_TEMP/fencing-images/rhiza-fencer" ./cmd/rhiza-fencer
           go build -o "$RUNNER_TEMP/fencing-e2e" ./e2e/fencing
+          cp "$RUNNER_TEMP/fencing-e2e" "$RUNNER_TEMP/fencing-images/fencing-e2e"
           docker build -f Dockerfile.fencing-test -t rhiza-fencing-host:local -t rhiza-fencing-operator:local "$RUNNER_TEMP/fencing-images"
           if kind get clusters | grep -Fx rhiza-generic-fencing; then exit 1; fi
           printf '%s\n' rhiza-generic-fencing > cooperative-fencing-results/owned-cluster.txt
@@ -382,7 +387,7 @@ jobs:
           go test -tags rhiza_local_testhooks ./pkg/network -run '^TestTerminalDecisionCancelsUnneededPeerHandshake$' -count=1 -timeout=30s
           go test -tags rhiza_local_testhooks ./pkg/network -run '^TestOverload(MutationAdmissionEmitsFixedSite|QueueReservationEmitsFixedSite|InputChannelFullEmitsFixedSite|WorkerInflightBytesEmitsFixedSite|ProposalAdmissionSubtypeEmitsFixedSite)$' -count=1 -timeout=30s
           go test -tags rhiza_local_testhooks ./pkg/node -run '^TestAdvanceCheckpointReadBarriersRetriesRealPreAdmissionRefusal$' -count=1 -timeout=30s
-          go test -tags rhiza_local_testhooks ./pkg/recovery -run '^(TestArchiveCleanupReusesUnchangedPrefixAfterRealHeadConflict|TestArchiveCleanupReuseRequiresExactBaseAndRefPrefix|TestArchiveCleanupIncrementalPackingMatchesFullAtBoundaries|TestArchiveCleanupAmbiguousPublicationReloadsCommittedHead|TestArchiveCleanupCanceledAfterHeadConflictDoesNotRepublish)$' -count=1 -timeout=2m
+          go test -tags rhiza_local_testhooks ./pkg/recovery -run '^(TestArchiveCleanupReusesUnchangedPrefixAfterRealHeadConflict|TestArchiveCleanupReuseRequiresExactBaseAndRefPrefix|TestArchiveCleanupIncrementalPackingMatchesFullAtBoundaries|TestArchiveCleanupAmbiguousPublicationReloadsCommittedHead|TestArchiveCleanupCanceledAfterHeadConflictDoesNotRepublish|TestStaleArchiveCleanupCannotDeleteRepublishedExtent|TestBeginRecoverySnapshotActiveGCLockCancellationPreservesBothCauses|TestBeginRecoverySnapshotConditionalContentionIsNotActiveLease|TestBeginRecoverySnapshotConfirmationUnknownIsNotRetried|TestBeginRecoverySnapshotConfirmationMismatchIsNotRetried|TestPublicationAdmissionConfirmationMismatchIsNotRechecked|TestBeginRecoverySnapshotCallbackLoadCancellationIsTerminalAndReleases|TestArchiveLockPreservesWorkAndReleaseErrors|TestArchiveLockPreservesUnknownCommittedRelease|TestArchiveActiveRecoveryPinCleanReleaseRemainsExactSentinel|TestArchiveGCCleanupReleaseBusyExceptionRequiresCleanCleanupOutcome|TestArchiveGCCleanupBackendBusyReleaseReadIsTerminal|TestArchiveGCCleanupCommittedBusyReleaseIsTerminal|TestArchiveGCCleanupReleaseBusyDoesNotHideWorkFailure|TestRecoverySnapshotSupersededGCReleaseRemainsFailure|TestPublicationReleaseBusyRemainsTerminal)$' -count=1 -timeout=2m
       - name: Terminal decision handshake cancellation (race)
         env:
           CGO_ENABLED: 1
@@ -390,7 +395,7 @@ jobs:
           go test -race -tags rhiza_local_testhooks ./pkg/network -run '^TestTerminalDecisionCancelsUnneededPeerHandshake$' -count=1 -timeout=30s
           go test -race -tags rhiza_local_testhooks ./pkg/network -run '^TestOverload(MutationAdmissionEmitsFixedSite|QueueReservationEmitsFixedSite|InputChannelFullEmitsFixedSite|WorkerInflightBytesEmitsFixedSite|ProposalAdmissionSubtypeEmitsFixedSite)$' -count=1 -timeout=30s
           go test -race -tags rhiza_local_testhooks ./pkg/node -run '^TestAdvanceCheckpointReadBarriersRetriesRealPreAdmissionRefusal$' -count=1 -timeout=30s
-          go test -race -tags rhiza_local_testhooks ./pkg/recovery -run '^(TestArchiveCleanupReusesUnchangedPrefixAfterRealHeadConflict|TestArchiveCleanupReuseRequiresExactBaseAndRefPrefix|TestArchiveCleanupIncrementalPackingMatchesFullAtBoundaries|TestArchiveCleanupAmbiguousPublicationReloadsCommittedHead|TestArchiveCleanupCanceledAfterHeadConflictDoesNotRepublish)$' -count=1 -timeout=2m
+          go test -race -tags rhiza_local_testhooks ./pkg/recovery -run '^(TestArchiveCleanupReusesUnchangedPrefixAfterRealHeadConflict|TestArchiveCleanupReuseRequiresExactBaseAndRefPrefix|TestArchiveCleanupIncrementalPackingMatchesFullAtBoundaries|TestArchiveCleanupAmbiguousPublicationReloadsCommittedHead|TestArchiveCleanupCanceledAfterHeadConflictDoesNotRepublish|TestStaleArchiveCleanupCannotDeleteRepublishedExtent|TestBeginRecoverySnapshotActiveGCLockCancellationPreservesBothCauses|TestBeginRecoverySnapshotConditionalContentionIsNotActiveLease|TestBeginRecoverySnapshotConfirmationUnknownIsNotRetried|TestBeginRecoverySnapshotConfirmationMismatchIsNotRetried|TestPublicationAdmissionConfirmationMismatchIsNotRechecked|TestBeginRecoverySnapshotCallbackLoadCancellationIsTerminalAndReleases|TestArchiveLockPreservesWorkAndReleaseErrors|TestArchiveLockPreservesUnknownCommittedRelease|TestArchiveActiveRecoveryPinCleanReleaseRemainsExactSentinel|TestArchiveGCCleanupReleaseBusyExceptionRequiresCleanCleanupOutcome|TestArchiveGCCleanupBackendBusyReleaseReadIsTerminal|TestArchiveGCCleanupCommittedBusyReleaseIsTerminal|TestArchiveGCCleanupReleaseBusyDoesNotHideWorkFailure|TestRecoverySnapshotSupersededGCReleaseRemainsFailure|TestPublicationReleaseBusyRemainsTerminal)$' -count=1 -timeout=2m
       - name: Vet
         env:
           CGO_ENABLED: 0
