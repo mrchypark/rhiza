@@ -7,6 +7,9 @@ restores before `Open` returns ready. The implementation is in the Go engine;
 the Rust FFI SDK is unchanged. This example assumes a local VersityGW listener
 configured on port 7070.
 
+For an init container that opens and closes the same data volume before the
+application reopens it, see [Local init-container recovery](local-init-container-recovery.md).
+
 ```go
 cfg := rhiza.Config{
     Local:              true,
