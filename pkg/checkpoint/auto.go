@@ -2,6 +2,7 @@ package checkpoint
 
 import (
 	"context"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"log"
@@ -152,6 +153,61 @@ func (a *AutoCheckpointer) Stop() {
 		}
 	})
 	a.wg.Wait()
+}
+
+// FinalizeTerminal retires only a candidate whose exact root is durably
+// published. Unresolved candidates retain their publisher claim.
+func (a *AutoCheckpointer) FinalizeTerminal(ctx context.Context, verifyPublished func(context.Context, *Checkpoint) error) error {
+	a.Stop()
+	candidate := a.candidate
+	if candidate == nil || candidate.claim == nil {
+		return nil
+	}
+	claim := candidate.claim
+	if claim.Purpose != "publisher" || claim.ConfigID != a.manager.configID || claim.BoundIndex != candidate.Index || claim.RootHash != hex.EncodeToString(candidate.RootHash[:]) {
+		return fmt.Errorf("cannot retire unresolved checkpoint publisher claim")
+	}
+	if err := a.manager.Load(ctx); err != nil {
+		return fmt.Errorf("verify published checkpoint before terminal claim retirement: %w", err)
+	}
+	published := a.manager.Latest()
+	if published == nil || published.ConfigID != candidate.ConfigID || published.Index != candidate.Index || published.RootHash != candidate.RootHash || published.Hash != candidate.Hash {
+		return fmt.Errorf("cannot retire checkpoint claim without its exact published root")
+	}
+	if verifyPublished == nil {
+		return fmt.Errorf("cannot retire checkpoint claim without durable certification proof")
+	}
+	if err := verifyPublished(ctx, candidate); err != nil {
+		return fmt.Errorf("verify checkpoint certification before terminal claim retirement: %w", err)
+	}
+	current, err := a.manager.readPublisherClaim(ctx)
+	if err != nil {
+		return fmt.Errorf("read terminal checkpoint publisher claim: %w", err)
+	}
+	if current.Generation > claim.Generation {
+		a.candidate = nil
+		return nil
+	}
+	if current.ConfigID != claim.ConfigID || current.Generation != claim.Generation || current.OwnerID != claim.OwnerID || current.Purpose != claim.Purpose || current.ReservedIndex != claim.ReservedIndex || current.BoundIndex != claim.BoundIndex || current.RootHash != claim.RootHash {
+		return fmt.Errorf("checkpoint publisher claim changed before terminal retirement")
+	}
+	releaseErr := a.manager.ReleasePublisherClaim(ctx, claim)
+	current, err = a.manager.readPublisherClaim(ctx)
+	if err != nil {
+		return errors.Join(releaseErr, fmt.Errorf("verify terminal checkpoint publisher retirement: %w", err))
+	}
+	if current.Generation > claim.Generation {
+		a.candidate = nil
+		return nil
+	}
+	if current.ConfigID != claim.ConfigID || current.Generation != claim.Generation || current.OwnerID != claim.OwnerID || current.Purpose != claim.Purpose || current.ReservedIndex != claim.ReservedIndex || current.BoundIndex != claim.BoundIndex || current.RootHash != claim.RootHash {
+		return errors.Join(releaseErr, fmt.Errorf("checkpoint publisher claim changed during terminal retirement"))
+	}
+	if current.LeaseUntilMS > time.Now().UnixMilli() {
+		return errors.Join(releaseErr, fmt.Errorf("checkpoint publisher claim remains active after terminal retirement"))
+	}
+	a.candidate = nil
+	return nil
 }
 
 // CheckpointOnShutdown creates a checkpoint during shutdown.

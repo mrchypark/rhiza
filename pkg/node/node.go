@@ -2209,7 +2209,6 @@ func (n *Node) shutdownEngine(closeBucket bool) error {
 	if n.checkpointer != nil {
 		n.checkpointer.Stop()
 	}
-	n.checkpointer = nil
 	if n.cancel != nil {
 		n.cancel()
 		n.cancel = nil
@@ -2262,6 +2261,24 @@ func (n *Node) shutdownEngine(closeBucket bool) error {
 	if n.material != nil {
 		shutdownErr = errors.Join(shutdownErr, n.material.Close())
 		n.material = nil
+	}
+	if n.checkpointer != nil {
+		finalizeCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		shutdownErr = errors.Join(shutdownErr, n.checkpointer.FinalizeTerminal(finalizeCtx, func(ctx context.Context, candidate *checkpoint.Checkpoint) error {
+			if n.core == nil {
+				return fmt.Errorf("checkpoint certification state is unavailable")
+			}
+			seal, ok, err := n.core.LatestCheckpointSeal()
+			if err != nil {
+				return err
+			}
+			if !ok || uint64(seal.Index) != candidate.Index || seal.ConfigID != candidate.ConfigID || seal.RootHash != candidate.RootHash || seal.StateHash != candidate.Hash {
+				return fmt.Errorf("checkpoint candidate does not match the durable certified seal")
+			}
+			return n.core.VerifyCheckpoint(ctx, seal.CheckpointSeal)
+		}))
+		cancel()
+		n.checkpointer = nil
 	}
 
 	if n.localOwner != nil {

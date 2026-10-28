@@ -150,8 +150,44 @@ func TestAutoCheckpointerStopCancelsAndJoinsClaimWork(t *testing.T) {
 				}
 			} else if auto.candidate == nil || auto.candidate.claim == nil {
 				t.Fatal("canceled certification lost its pending candidate claim")
+			} else {
+				if err := auto.FinalizeTerminal(parent, nil); err == nil {
+					t.Fatal("terminal finalization retired an unpublished candidate")
+				}
+				if _, err := manager.AcquirePublisherClaim(parent, "unrelated", 0, publisherLease); !errors.Is(err, ErrPublisherBusy) {
+					t.Fatalf("unpublished candidate claim after terminal finalization=%v, want busy", err)
+				}
 			}
 		})
+	}
+}
+
+func TestFinalizeTerminalRequiresCertificationBeyondCurrent(t *testing.T) {
+	ctx := context.Background()
+	manager := NewManager(objstore.NewInMemBucket(), "terminal-unproven", t.TempDir(), 1)
+	claim, err := manager.AcquirePublisherClaim(ctx, "publisher", 0, publisherLease)
+	if err != nil {
+		t.Fatal(err)
+	}
+	root, err := manager.CreateFiles(ctx, claim, []Source{source(t, RoleSQLite, "candidate")}, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	claim, err = manager.BindPublisherClaim(ctx, claim, root.Index, root.RootHash, publisherLease)
+	if err != nil {
+		t.Fatal(err)
+	}
+	root.claim = claim
+	if err := manager.PromoteCertifiedCurrent(ctx, root); err != nil {
+		t.Fatal(err)
+	}
+	auto := NewAutoCheckpointer(manager, nil, 1, 0)
+	auto.candidate = root
+	if err := auto.FinalizeTerminal(ctx, nil); err == nil {
+		t.Fatal("CURRENT without durable certification proof retired the publisher claim")
+	}
+	if _, err := manager.AcquirePublisherClaim(ctx, "other", 0, publisherLease); !errors.Is(err, ErrPublisherBusy) {
+		t.Fatalf("claim after unproven terminal finalization=%v, want busy", err)
 	}
 }
 

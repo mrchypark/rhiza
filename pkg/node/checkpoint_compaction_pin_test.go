@@ -500,6 +500,136 @@ func TestCertifiedCheckpointDefersOnlyLivePinCompaction(t *testing.T) {
 	}
 }
 
+func TestNodeCloseAfterPublishedCompactionCancellationReleasesPublishedClaim(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	bucket := &currentUploadCounter{Bucket: objstore.NewInMemBucket()}
+	archive := recovery.NewManager(bucket, "terminal-publisher", 1)
+	checkpoints := checkpoint.NewManager(bucket, "terminal-publisher", t.TempDir(), 1)
+	wal, err := qlog.Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	core, err := quepaxa.New(quepaxa.Config{
+		NodeID: "n1", Cluster: quepaxa.Cluster{ConfigID: 1, Members: []quepaxa.Member{{ID: "n1"}}}, WAL: wal,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	material, err := materializer.Open(filepath.Join(t.TempDir(), "material.db"), 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	command, err := types.EncodeKVCommand(types.KVCommand{RequestID: "terminal-publisher", Operation: "put", Key: "key", Value: []byte("value")})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := core.Propose(ctx, command); err != nil {
+		t.Fatal(err)
+	}
+	if err := material.Apply(ctx, 1, command); err != nil {
+		t.Fatal(err)
+	}
+	if err := archive.SyncThrough(ctx, core, core.Tip()); err != nil {
+		t.Fatal(err)
+	}
+	reader := recovery.NewManager(bucket, "terminal-publisher", 1)
+	pin, err := reader.BeginRecoverySnapshot(ctx, "recovering-reader", time.Minute)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() {
+		closeCtx, closeCancel := context.WithTimeout(context.Background(), time.Second)
+		defer closeCancel()
+		if err := pin.Close(closeCtx); err != nil {
+			t.Errorf("close recovery snapshot: %v", err)
+		}
+		reader.Close()
+	}()
+
+	n := &Node{config: &types.ExecutionConfig{}, archive: archive, checkpoints: checkpoints, core: core, material: material, wal: wal}
+	core.SetCheckpointValidator(func(ctx context.Context, seal quepaxa.CheckpointSeal) error {
+		return checkpoints.Verify(ctx, uint64(seal.Index), seal.RootHash, seal.StateHash)
+	})
+	auto := checkpoint.NewAutoCheckpointer(checkpoints, material, 1, time.Millisecond)
+	auto.ConfigurePublisher("n1", func() uint64 { return 0 }, nil)
+	published := make(chan *checkpoint.Checkpoint, 1)
+	compactionCanceled := make(chan struct{})
+	auto.ConfigurePublication(nil, func(ctx context.Context, root *checkpoint.Checkpoint) error {
+		prefix, ok := core.PrefixHash(1)
+		if !ok {
+			return errors.New("missing checkpoint prefix")
+		}
+		next, following, err := core.CheckpointLeaderOrders(1)
+		if err != nil {
+			return err
+		}
+		seal := quepaxa.CheckpointSeal{
+			ConfigID: 1, Index: 1, RootHash: root.RootHash, StateHash: root.Hash, PrefixHash: prefix,
+			NextLeaderOrder: next, FollowingLeaderOrder: following,
+		}
+		if err := core.PrepareCheckpoint(ctx, seal); err != nil {
+			return err
+		}
+		encoded, err := quepaxa.EncodeCheckpointSeal(seal)
+		if err != nil {
+			return err
+		}
+		if _, _, err := core.Propose(ctx, encoded); err != nil {
+			return err
+		}
+		if err := n.publishCertifiedCheckpoint(ctx, root); err != nil {
+			return err
+		}
+		published <- root
+		<-ctx.Done()
+		close(compactionCanceled)
+		return n.compactCertifiedCheckpoint(ctx)
+	})
+	n.checkpointer = auto
+	auto.Start(ctx, material.Tip, nil)
+	select {
+	case <-published:
+	case <-ctx.Done():
+		t.Fatalf("certified checkpoint publication did not complete: %v", ctx.Err())
+	}
+	shutdown := make(chan error, 1)
+	go func() { shutdown <- n.shutdown() }()
+	select {
+	case <-compactionCanceled:
+	case <-ctx.Done():
+		t.Fatalf("compaction callback did not observe terminal cancellation: %v", ctx.Err())
+	}
+	select {
+	case err := <-shutdown:
+		if err != nil {
+			t.Fatalf("terminal Node shutdown: %v", err)
+		}
+	case <-ctx.Done():
+		t.Fatalf("terminal Node shutdown did not join canceled publication: %v", ctx.Err())
+	}
+
+	fresh := checkpoint.NewManager(bucket, "terminal-publisher", t.TempDir(), 1)
+	if err := fresh.Load(ctx); err != nil {
+		t.Fatalf("load durable checkpoint after shutdown: %v", err)
+	}
+	root := fresh.Latest()
+	if root == nil || root.Index != 1 {
+		t.Fatalf("published checkpoint after shutdown: %+v", root)
+	}
+	recoveryPin, admissionErr := fresh.PinRecoveryRoot(ctx, root, "next-reader", time.Minute)
+	if admissionErr != nil {
+		t.Fatalf("recovery admission after terminal Node shutdown: %v", admissionErr)
+	}
+	if err := recoveryPin.Close(ctx); err != nil {
+		t.Fatalf("close next recovery pin: %v", err)
+	}
+	decisions, _, err := pin.DecisionsFrom(ctx, 1, 1)
+	if err != nil || len(decisions) != 1 || !bytes.Equal(decisions[0].Value, command) {
+		t.Fatalf("active snapshot decision after terminal shutdown: count=%d error=%v", len(decisions), err)
+	}
+}
+
 func TestCertifiedCheckpointDefersOnlyHeldGCLockCompaction(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
