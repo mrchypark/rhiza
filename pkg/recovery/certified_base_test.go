@@ -3,6 +3,7 @@ package recovery
 import (
 	"context"
 	"encoding/hex"
+	"encoding/json"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -48,28 +49,131 @@ func TestInitializeCertifiedRecoveryBaseAnchorOnlyAndTrustedLineage(t *testing.T
 
 func TestInitializeCertifiedRecoveryBaseValidatesEqualIndexCheckpointCertificate(t *testing.T) {
 	ctx := context.Background()
-	fixture := newCertifiedBaseFixture(t)
-	view, err := fixture.archive.CaptureCertifiedView()
+	bucket := objstore.NewInMemBucket()
+	archive := NewManager(bucket, "equal-index", 1)
+	defer archive.Close()
+	writerWAL, err := qlog.Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer writerWAL.Close()
+	members := []quepaxa.Member{{ID: "target"}}
+	writer, err := quepaxa.New(quepaxa.Config{
+		NodeID: "target", Cluster: quepaxa.Cluster{ConfigID: 1, Members: members},
+		WAL: writerWAL, EnableReconfiguration: true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	writer.SetCheckpointValidator(func(context.Context, quepaxa.CheckpointSeal) error { return nil })
+	if _, _, err := writer.Propose(ctx, []byte("state before equal-index checkpoint")); err != nil {
+		t.Fatal(err)
+	}
+	sealIndex := writer.Tip()
+	prefix, ok := writer.PrefixHash(sealIndex)
+	if !ok {
+		t.Fatal("writer checkpoint prefix is unavailable")
+	}
+	next, following, err := writer.CheckpointLeaderOrders(sealIndex)
+	if err != nil {
+		t.Fatal(err)
+	}
+	membership, err := writer.CheckpointMembership(sealIndex)
 	if err != nil {
 		t.Fatal(err)
 	}
 	seal := quepaxa.CheckpointSeal{
-		ConfigID: 1, Index: quepaxa.Slot(fixture.anchor.SourceTip), RootHash: testHash(1),
-		StateHash: testHash(2), PrefixHash: mustGenerationHash(fixture.anchor.SourcePrefixHash),
-		NextLeaderOrder: []quepaxa.NodeID{"target"}, GenerationAnchorHash: fixture.anchorHash,
+		ConfigID: 1, Index: sealIndex, RootHash: testHash(5), StateHash: testHash(6),
+		PrefixHash: prefix, NextLeaderOrder: next, FollowingLeaderOrder: following,
+		Membership: &membership,
+	}
+	if err := writer.PrepareCheckpoint(ctx, seal); err != nil {
+		t.Fatal(err)
 	}
 	sealValue, err := quepaxa.EncodeCheckpointSeal(seal)
 	if err != nil {
 		t.Fatal(err)
 	}
-	view.head.Base = seal.Index
-	view.head.BasePrefix = seal.PrefixHash
-	view.head.BaseAnchor = nil
-	view.head.BaseSeal = &seal
-	view.head.BaseDecision = &quepaxa.DecidedValue{Slot: seal.Index, Value: sealValue}
-	verifier := fixture.newObserver(t, "equal-index-invalid-certificate")
-	if _, err := InitializeCertifiedRecoveryBase(ctx, verifier.core, view, fixture.membership, fixture.anchorHash, fixture.checkpoints); err == nil {
-		t.Fatal("equal-index checkpoint base without a valid certificate was accepted")
+	if _, _, err := writer.Propose(ctx, sealValue); err != nil {
+		t.Fatal(err)
+	}
+	sealed, ok, err := writer.LatestCheckpointSeal()
+	if err != nil || !ok || sealed.Index != sealIndex {
+		t.Fatalf("writer checkpoint seal=%+v ok=%v err=%v", sealed, ok, err)
+	}
+	baseDecision, ok := writer.CertifiedValue(sealed.DecisionSlot)
+	if !ok {
+		t.Fatal("writer checkpoint decision is unavailable")
+	}
+	if err := archive.SyncThrough(ctx, writer, writer.Tip()); err != nil {
+		t.Fatal(err)
+	}
+	if err := archive.TrimThrough(ctx, sealed, baseDecision); err != nil {
+		t.Fatal(err)
+	}
+	view, err := archive.CaptureCertifiedView()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, anchored := view.GenerationAnchor(); anchored {
+		t.Fatal("regular checkpoint fixture unexpectedly has generation lineage")
+	}
+	if base, _, ok := view.RecoveryBase(); !ok || base.Index != seal.Index {
+		t.Fatalf("archive recovery base=%+v ok=%v, want index %d", base, ok, seal.Index)
+	}
+
+	observerWAL, err := qlog.Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer observerWAL.Close()
+	observer, err := quepaxa.NewObserver(quepaxa.Config{
+		NodeID: "verify-equal-index", Cluster: quepaxa.Cluster{ConfigID: 1, Members: members},
+		WAL: observerWAL, EnableReconfiguration: true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	observer.SetCheckpointValidator(func(context.Context, quepaxa.CheckpointSeal) error { return nil })
+	if err := observer.RestoreCheckpointBase(ctx, seal, baseDecision); err != nil {
+		t.Fatal(err)
+	}
+	if observer.Tip() != seal.Index {
+		t.Fatalf("observer tip=%d, want same index as base %d", observer.Tip(), seal.Index)
+	}
+	if _, err := InitializeCertifiedRecoveryBase(ctx, observer, view, MembershipRecord{}, [32]byte{}, nil); err != nil {
+		t.Fatalf("valid same-index checkpoint certificate was rejected: %v", err)
+	}
+	if observer.Tip() != seal.Index || observer.GenerationAnchorHash() != ([32]byte{}) {
+		t.Fatal("valid same-index verification unexpectedly changed observer state")
+	}
+
+	invalidView := view
+	invalidView.head = cloneArchiveHead(view.head)
+	invalidDecision := *invalidView.head.BaseDecision
+	var certificate map[string]any
+	if err := json.Unmarshal(invalidDecision.Certificate, &certificate); err != nil {
+		t.Fatal(err)
+	}
+	summaries, ok := certificate["summaries"].([]any)
+	if !ok || len(summaries) == 0 {
+		t.Fatalf("checkpoint certificate summaries=%v", certificate["summaries"])
+	}
+	first, ok := summaries[0].(map[string]any)
+	if !ok {
+		t.Fatalf("checkpoint certificate summary=%T", summaries[0])
+	}
+	first["recorder_id"] = "not-a-member"
+	invalidDecision.Certificate, err = json.Marshal(certificate)
+	if err != nil {
+		t.Fatal(err)
+	}
+	invalidView.head.BaseDecision = &invalidDecision
+	if _, err := InitializeCertifiedRecoveryBase(ctx, observer, invalidView, MembershipRecord{}, [32]byte{}, nil); err == nil || !strings.Contains(err.Error(), "validate checkpoint recovery decision") {
+		t.Fatalf("invalid same-index certificate error=%v, want certificate validation failure", err)
+	}
+	if observer.Tip() != seal.Index || observer.GenerationAnchorHash() != ([32]byte{}) {
+		t.Fatal("invalid same-index certificate changed observer state")
 	}
 }
 

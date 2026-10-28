@@ -18,6 +18,11 @@ func (n *Node) installGenerationAnchor(guard *startupRecoveryGuard) (*checkpoint
 		}
 		return nil, nil
 	}
+	_, anchored := snapshot.GenerationAnchor()
+	_, _, hasBase := snapshot.RecoveryBase()
+	if snapshot.Tip() == 0 && local == ([32]byte{}) && !anchored && !hasBase {
+		return nil, nil
+	}
 	view, err := snapshot.CaptureCertifiedView()
 	if err != nil {
 		return nil, err
