@@ -4,9 +4,14 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
+	"path"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -22,6 +27,13 @@ type retirementEscalationFixture struct {
 	learnerPod         object
 	live, fencePending bool
 	fences             []FenceRequest
+	probeHook          func()
+}
+
+type retirementRoundTripper func(*http.Request) (*http.Response, error)
+
+func (roundTrip retirementRoundTripper) RoundTrip(request *http.Request) (*http.Response, error) {
+	return roundTrip(request)
 }
 
 func newRetirementEscalationFixture(t *testing.T) *retirementEscalationFixture {
@@ -89,6 +101,9 @@ func newRetirementEscalationFixture(t *testing.T) *retirementEscalationFixture {
 	c.Kube.BaseURL, c.Kube.Client = server.URL, server.Client()
 	c.HTTP = &http.Client{Transport: escalationProbeTransport(func(q *http.Request) (*http.Response, error) {
 		if q.URL.Path == "/recovery/probe" {
+			if f.probeHook != nil {
+				f.probeHook()
+			}
 			id := "n1"
 			if api.learner != nil && q.URL.Host == strings.TrimPrefix(api.learner.URL, "http://") {
 				id = "learner"
@@ -128,6 +143,137 @@ func newRetirementEscalationFixture(t *testing.T) *retirementEscalationFixture {
 		t.Fatal(err)
 	}
 	return f
+}
+
+func TestAutomaticRetirementEligibilityRecheckedAfterProbeCrossesGrace(t *testing.T) {
+	f := newRetirementEscalationFixture(t)
+	f.live = false
+	fenceGrace := time.Second
+	state, version := f.load(t)
+	state.Intent.Aborting = false
+	state.Intent.RetirementSince = time.Time{}
+	state.Intent.LearnerMissingSince = time.Now().Add(-900 * time.Millisecond)
+	state.Intent.NoQuorumSince = time.Now().Add(-time.Minute)
+	state.Intent.Policy.FailureGraceSeconds = 1
+	if err := f.c.saveAuto(t.Context(), f.r, state, version); err != nil {
+		t.Fatal(err)
+	}
+	entered, release := make(chan struct{}), make(chan struct{})
+	var once sync.Once
+	f.probeHook = func() { once.Do(func() { close(entered); <-release }) }
+	state, version = f.load(t)
+	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+	defer cancel()
+	done := make(chan error, 1)
+	go func() { done <- f.c.advanceAutomatic(ctx, f.r, state, version, f.api.sts) }()
+	select {
+	case <-entered:
+	case <-ctx.Done():
+		t.Fatalf("assessment probe did not reach deterministic barrier: %v", ctx.Err())
+	}
+	// The handler already observed the learner within its missing grace window.
+	// Hold the later no-quorum probes until that same captured window expires.
+	timer := time.NewTimer(fenceGrace + 100*time.Millisecond)
+	select {
+	case <-timer.C:
+	case <-ctx.Done():
+		t.Fatalf("probe barrier exceeded bounded timeout: %v", ctx.Err())
+	}
+	close(release)
+	if err := <-done; err != nil {
+		t.Fatal(err)
+	}
+	state, _ = f.load(t)
+	if state.Intent.Request.Scope != ScopeVoter || !state.Intent.Aborting || state.Intent.RetirementSince.IsZero() || state.Intent.LearnerUID != "learner-uid" || state.Intent.LearnerWAL != strings.Repeat("a", 64) || len(f.fences) != 0 {
+		t.Fatalf("probe crossed learner retirement eligibility without reserving exact abort: %s", retirementStateDiagnostic(t, f, state))
+	}
+}
+
+func TestExpiredAbortRevisionGetsExactChildCASAndPutBeforeEscalation(t *testing.T) {
+	f := newRetirementEscalationFixture(t)
+	f.live = false
+	state, version := f.load(t)
+	add := f.child.Status.Membership.Add
+	if add == nil || add.OperationID == "" || add.ExpectedConfigID == 0 || add.ExpectedAbortSlot != 0 {
+		t.Fatalf("fixture lacks exact pending ADD identity: %+v", add)
+	}
+	state.Intent.Aborting = true
+	state.Intent.RetirementSince = time.Now().Add(-time.Minute)
+	state.Intent.NoQuorumSince = time.Now().Add(-time.Minute)
+	state.Intent.Policy.FailureGraceSeconds = 1
+	if err := f.c.saveAuto(t.Context(), f.r, state, version); err != nil {
+		t.Fatal(err)
+	}
+	state = f.advance(t)
+	if state.Intent.Request.Scope != ScopeVoter || !state.Intent.Aborting || f.child.Spec.Membership.AbortAddition || state.Intent.PreviousSpecHash == "" || state.Intent.SpecHash == hashJSON(f.child.Spec) {
+		t.Fatalf("expired abort did not reserve its exact child revision first: %s", retirementStateDiagnostic(t, f, state))
+	}
+	state = f.advance(t)
+	if state.Intent.Request.Scope != ScopeVoter || !state.Intent.Aborting || !f.child.Spec.Membership.AbortAddition || hashJSON(f.child.Spec) != state.Intent.SpecHash || len(f.fences) != 0 {
+		t.Fatalf("expired abort did not submit the reserved exact child revision before generation escalation: %s", retirementStateDiagnostic(t, f, state))
+	}
+	got := f.child.Status.Membership.Add
+	if got == nil || got.OperationID != add.OperationID || got.ExpectedConfigID != add.ExpectedConfigID || got.ExpectedAbortSlot != add.ExpectedAbortSlot {
+		t.Fatalf("abort revision changed the pending ADD identity: before=%+v after=%+v", add, got)
+	}
+}
+
+func TestFailedAbortPUTDoesNotExtendGenerationEscalationForever(t *testing.T) {
+	f := newRetirementEscalationFixture(t)
+	f.live = false
+	state, version := f.load(t)
+	state.Intent.Aborting = true
+	state.Intent.RetirementSince = time.Now().Add(-time.Minute)
+	state.Intent.NoQuorumSince = time.Now().Add(-time.Minute)
+	state.Intent.Policy.FailureGraceSeconds = 1
+	if err := f.c.saveAuto(t.Context(), f.r, state, version); err != nil {
+		t.Fatal(err)
+	}
+	state = f.advance(t) // Persist the exact SpecHash revision before attempting the child PUT.
+	reservedHash := state.Intent.SpecHash
+	originalClient := f.c.Kube.Client
+	putAttempts := 0
+	f.c.Kube.Client = &http.Client{Transport: retirementRoundTripper(func(request *http.Request) (*http.Response, error) {
+		if request.Method == http.MethodPut && request.URL.Path == f.c.resourcePath("recover") {
+			putAttempts++
+			return &http.Response{StatusCode: http.StatusServiceUnavailable, Body: io.NopCloser(strings.NewReader("")), Header: make(http.Header), Request: request}, nil
+		}
+		return originalClient.Transport.RoundTrip(request)
+	})}
+	state, version = f.load(t)
+	err := f.c.advanceAutomatic(t.Context(), f.r, state, version, f.api.sts)
+	var apiErr *APIError
+	if !errors.As(err, &apiErr) || apiErr.StatusCode != http.StatusServiceUnavailable {
+		t.Fatalf("failed child PUT error=%v, want observable HTTP 503", err)
+	}
+	state, _ = f.load(t)
+	if putAttempts != 1 || state.Intent.Request.Scope != ScopeGeneration || state.Intent.Proof != nil || state.Intent.Supersedes == "" || f.child.Spec.Membership.AbortAddition || reservedHash == "" {
+		t.Fatalf("failed exact abort PUT shielded bounded escalation or changed child: attempts=%d reservedHash=%s diagnostic=%s", putAttempts, reservedHash, retirementStateDiagnostic(t, f, state))
+	}
+}
+
+func retirementStateDiagnostic(t *testing.T, f *retirementEscalationFixture, state *autoControl) string {
+	t.Helper()
+	current := func(intent *autoIntent) string {
+		if intent == nil {
+			return "<nil>"
+		}
+		return fmt.Sprintf("scope=%s op=%s failed=%s aborting=%t proof=%t missing=%s noQuorum=%s retirement=%s supersedes=%s spec=%s previous=%s", intent.Request.Scope, intent.RecoveryName, intent.Failed, intent.Aborting, intent.Proof != nil, intent.LearnerMissingSince.UTC().Format(time.RFC3339Nano), intent.NoQuorumSince.UTC().Format(time.RFC3339Nano), intent.RetirementSince.UTC().Format(time.RFC3339Nano), intent.Supersedes, intent.SpecHash, intent.PreviousSpecHash)
+	}
+	snapshot := "<none>"
+	if state.Intent != nil && state.Intent.Supersedes != "" {
+		key := path.Join(f.c.Prefix, "automatic", f.c.Kube.Namespace, f.r.Spec.LogicalID, "superseded", state.Intent.Supersedes+".json")
+		reader, err := f.c.Bucket.Get(t.Context(), key)
+		if err == nil {
+			data, readErr := io.ReadAll(io.LimitReader(reader, 1<<20))
+			closeErr := reader.Close()
+			var original autoIntent
+			if readErr == nil && closeErr == nil && json.Unmarshal(data, &original) == nil {
+				snapshot = current(&original)
+			}
+		}
+	}
+	return fmt.Sprintf("current={%s} superseded={%s} childUID=%s childAbort=%t", current(state.Intent), snapshot, str(f.child.Metadata["uid"]), f.child.Spec.Membership != nil && f.child.Spec.Membership.AbortAddition)
 }
 
 func (f *retirementEscalationFixture) load(t *testing.T) (*autoControl, *objstore.ObjectVersion) {

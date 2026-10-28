@@ -58,6 +58,8 @@ func (c *Controller) advanceAutomatic(ctx context.Context, r *ClusterResource, s
 		if handled, err := c.recoverLearnerInventory(ctx, r, state, version, sts); handled || err != nil {
 			return err
 		}
+		abortRevisionAttempted := false
+		var abortRevisionErr error
 		handled := false
 		if intent.LearnerUID != "" {
 			before := hashJSON(state)
@@ -67,9 +69,24 @@ func (c *Controller) advanceAutomatic(ctx context.Context, r *ClusterResource, s
 				return err
 			}
 		}
-		disposition, err := c.assessAutomaticEscalation(ctx, r, state, version, sts)
+		if intent.Aborting {
+			revisionHandled, attempted, err := c.advancePendingAbortRevision(ctx, r, state, version, &existing)
+			if revisionHandled && !attempted {
+				return err
+			}
+			if err != nil && !attempted {
+				return err
+			}
+			handled = handled || revisionHandled
+			abortRevisionErr = err
+			abortRevisionAttempted = attempted
+		}
+		disposition, err := c.assessAutomaticEscalation(ctx, r, state, version, sts, &existing)
 		if err != nil || disposition == automaticEscalationStop || handled {
-			return err
+			return errors.Join(abortRevisionErr, err)
+		}
+		if abortRevisionAttempted {
+			return errors.Join(abortRevisionErr, c.autoStatus(ctx, r, state, "Recovering", "exact abort submission failed; bounded escalation remains active"))
 		}
 		if disposition == automaticEscalationWait && !intent.Aborting {
 			return nil
@@ -81,19 +98,7 @@ func (c *Controller) advanceAutomatic(ctx context.Context, r *ClusterResource, s
 			}
 		}
 	}
-	desired := Spec{StatefulSet: r.Spec.StatefulSet, Container: r.Spec.Container, SourceClusterID: state.ActiveClusterID, Durability: intent.Durability, RecoveryID: intent.RecoveryName, AllowDataLoss: intent.Policy.AllowDataLoss, AnchorID: r.Spec.AnchorID, Fence: Fence{RecoveryID: intent.RecoveryName, ClusterID: state.ActiveClusterID, StatefulSetUID: state.StatefulSetUID, Confirmed: true, Evidence: intent.Proof.ProofID}}
-	if intent.Failed != "" {
-		var voters []VoterPod
-		for _, ref := range intent.Voters {
-			if ref.NodeID != intent.Failed {
-				voters = append(voters, ref)
-			}
-		}
-		target := intent.Request.Targets[0]
-		desired.RecoveryID = ""
-		desired.Fence = Fence{}
-		desired.Membership = &MembershipSpec{AbortAddition: intent.Aborting, OperationID: intent.RecoveryName, Remove: intent.Failed, RemovedPod: target.Pod, VoterPods: voters, ReplacementPod: intent.LearnerName, ReplacementSecret: intent.LearnerName + "-credentials", Fence: MembershipFence{NodeID: intent.Failed, WALIdentity: target.WALIdentity, WorkloadUID: target.PodUID, Confirmed: true, Evidence: intent.Proof.ProofID}}
-	}
+	desired := automaticRecoveryDesired(r, state, intent)
 	var child Resource
 	err := c.Kube.Get(ctx, c.resourcePath(intent.RecoveryName), &child)
 	if err != nil {
@@ -200,6 +205,81 @@ func (c *Controller) advanceAutomatic(ctx context.Context, r *ClusterResource, s
 		return err
 	}
 	return c.autoStatus(ctx, r, state, "Stabilizing", "recovery completed; verifying the active quorum")
+}
+
+func automaticRecoveryDesired(r *ClusterResource, state *autoControl, intent *autoIntent) Spec {
+	desired := Spec{StatefulSet: r.Spec.StatefulSet, Container: r.Spec.Container, SourceClusterID: state.ActiveClusterID, Durability: intent.Durability, RecoveryID: intent.RecoveryName, AllowDataLoss: intent.Policy.AllowDataLoss, AnchorID: r.Spec.AnchorID, Fence: Fence{RecoveryID: intent.RecoveryName, ClusterID: state.ActiveClusterID, StatefulSetUID: state.StatefulSetUID, Confirmed: true, Evidence: intent.Proof.ProofID}}
+	if intent.Failed == "" {
+		return desired
+	}
+	var voters []VoterPod
+	for _, ref := range intent.Voters {
+		if ref.NodeID != intent.Failed {
+			voters = append(voters, ref)
+		}
+	}
+	target := intent.Request.Targets[0]
+	desired.RecoveryID = ""
+	desired.Fence = Fence{}
+	desired.Membership = &MembershipSpec{AbortAddition: intent.Aborting, OperationID: intent.RecoveryName, Remove: intent.Failed, RemovedPod: target.Pod, VoterPods: voters, ReplacementPod: intent.LearnerName, ReplacementSecret: intent.LearnerName + "-credentials", Fence: MembershipFence{NodeID: intent.Failed, WALIdentity: target.WALIdentity, WorkloadUID: target.PodUID, Confirmed: true, Evidence: intent.Proof.ProofID}}
+	return desired
+}
+
+// advancePendingAbortRevision prioritizes the already-proven voter's exact
+// metadata-CAS and child PUT before generation escalation. A
+// failed PUT is observed by resource UID/spec readback, then returns control to
+// the existing bounded escalation assessment rather than extending a grace.
+func (c *Controller) advancePendingAbortRevision(ctx context.Context, r *ClusterResource, state *autoControl, version *objstore.ObjectVersion, child *Resource) (handled, attempted bool, resultErr error) {
+	intent := state.Intent
+	if intent == nil || !intent.Aborting || intent.Failed == "" || child == nil {
+		return false, false, nil
+	}
+	block := func(message string) (bool, bool, error) {
+		return true, false, c.autoStatus(ctx, r, state, "Blocked", message)
+	}
+	if intent.RecoveryUID == "" || str(child.Metadata["uid"]) != intent.RecoveryUID {
+		return block("journaled recovery resource was deleted or recreated")
+	}
+	if str(nested(child.Metadata, "annotations", automaticOwner)) != state.BindingUID || str(nested(child.Metadata, "annotations", automaticLogical)) != r.Spec.LogicalID {
+		return block("recovery resource differs from frozen automatic intent")
+	}
+	desired := automaticRecoveryDesired(r, state, intent)
+	if desired.Membership == nil || desired.Membership.OperationID != intent.RecoveryName || desired.Membership.Remove != intent.Failed || desired.Membership.ReplacementPod != intent.LearnerName || desired.Membership.Fence.Evidence != intent.Proof.ProofID {
+		return block("abort revision differs from the proven voter intent")
+	}
+	currentHash, desiredHash := hashJSON(child.Spec), hashJSON(desired)
+	if currentHash == desiredHash && intent.SpecHash == desiredHash {
+		return false, false, nil
+	}
+	if intent.SpecHash != desiredHash {
+		if currentHash != intent.SpecHash {
+			return block("recovery specification changed outside the durable intent")
+		}
+		intent.PreviousSpecHash, intent.SpecHash = intent.SpecHash, desiredHash
+		if err := c.saveAuto(ctx, r, state, version); err != nil {
+			return true, false, err
+		}
+		return true, false, c.autoStatus(ctx, r, state, "Recovering", "exact abort specification revision reserved")
+	}
+	if currentHash != intent.PreviousSpecHash || intent.PreviousSpecHash == "" {
+		return block("recovery specification differs from authorized abort revisions")
+	}
+	child.Spec = desired
+	if err := c.Kube.Put(ctx, c.resourcePath(intent.RecoveryName), child, child); err != nil {
+		putErr := err
+		var observed Resource
+		if readErr := c.Kube.Get(ctx, c.resourcePath(intent.RecoveryName), &observed); readErr != nil {
+			return true, false, errors.Join(putErr, readErr)
+		} else if str(observed.Metadata["uid"]) != intent.RecoveryUID || str(nested(observed.Metadata, "annotations", automaticOwner)) != state.BindingUID || str(nested(observed.Metadata, "annotations", automaticLogical)) != r.Spec.LogicalID {
+			return block("recovery resource changed after abort submission")
+		} else if hashJSON(observed.Spec) == desiredHash {
+			return true, false, c.autoStatus(ctx, r, state, "Recovering", "abort specification accepted despite a lost response")
+		} else if hashJSON(observed.Spec) != currentHash {
+			return block("recovery specification changed during abort submission")
+		}
+		return false, true, putErr
+	}
+	return true, false, c.autoStatus(ctx, r, state, "Recovering", "exact abort specification revision submitted")
 }
 
 // authorizeAutomaticChild is checked by the existing executor before any side

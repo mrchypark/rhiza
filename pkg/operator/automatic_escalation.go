@@ -15,7 +15,7 @@ import (
 // single-voter proof for DR. Reserve a new generation-wide fence first and
 // revoke the old child's execution authority in the same CAS.
 func (c *Controller) maybeEscalateAutomatic(ctx context.Context, r *ClusterResource, state *autoControl, version *objstore.ObjectVersion, sts object) (bool, error) {
-	disposition, err := c.assessAutomaticEscalation(ctx, r, state, version, sts)
+	disposition, err := c.assessAutomaticEscalation(ctx, r, state, version, sts, nil)
 	return disposition != automaticEscalationContinue, err
 }
 
@@ -27,7 +27,7 @@ const (
 	automaticEscalationStop
 )
 
-func (c *Controller) assessAutomaticEscalation(ctx context.Context, r *ClusterResource, state *autoControl, version *objstore.ObjectVersion, sts object) (automaticEscalationDisposition, error) {
+func (c *Controller) assessAutomaticEscalation(ctx context.Context, r *ClusterResource, state *autoControl, version *objstore.ObjectVersion, sts object, child *Resource) (automaticEscalationDisposition, error) {
 	intent := state.Intent
 	ctr, err := container(sts, r.Spec.Container)
 	if err != nil {
@@ -172,6 +172,20 @@ func (c *Controller) assessAutomaticEscalation(ctx context.Context, r *ClusterRe
 	}
 	if time.Since(intent.NoQuorumSince) < time.Duration(intent.Policy.FailureGraceSeconds)*time.Second {
 		return automaticEscalationWait, c.autoStatus(ctx, r, state, "Recovering", "surviving quorum unavailable; waiting before generation-wide fencing")
+	}
+	// The learner handler runs before these potentially slow voter probes. If
+	// its exact captured missing-incarnation grace expires while this assessment
+	// is in flight, revalidate that same learner and reserve its abort before a
+	// generation intent can supersede the original voter repair.
+	if child != nil && !intent.Aborting && intent.LearnerUID != "" && !intent.LearnerMissingSince.IsZero() && time.Since(intent.LearnerMissingSince) >= time.Duration(intent.Policy.FailureGraceSeconds)*time.Second {
+		if intent.RecoveryUID == "" || str(child.Metadata["uid"]) != intent.RecoveryUID || str(nested(child.Metadata, "annotations", automaticOwner)) != state.BindingUID || str(nested(child.Metadata, "annotations", automaticLogical)) != r.Spec.LogicalID {
+			return automaticEscalationStop, c.autoStatus(ctx, r, state, "Blocked", "recovery child identity changed before learner retirement recheck")
+		}
+		before := hashJSON(state)
+		handled, err := c.handleAutomaticLearner(ctx, r, state, version, sts, child)
+		if err != nil || handled || hashJSON(state) != before {
+			return automaticEscalationStop, err
+		}
 	}
 	if intent.Durability == "async" && !intent.Policy.AllowDataLoss {
 		return automaticEscalationStop, c.autoStatus(ctx, r, state, "Blocked", "async generation escalation requires allowDataLoss")
