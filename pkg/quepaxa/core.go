@@ -1418,6 +1418,13 @@ func (c *Core) record(ctx context.Context, request RecordRequest) (Summary, erro
 			if state == nil || request.Slot != state.terminal || tip != state.terminal-1 || control.Freeze != state.freeze || control.TerminalSlot != state.terminal || control.PrefixHash != tipPrefix || !sameCluster(control.Target, state.target) {
 				return Summary{}, fmt.Errorf("invalid reconfiguration terminal record")
 			}
+			c.mu.RLock()
+			freezeValue, freezeKnown := c.decided[state.freeze]
+			c.mu.RUnlock()
+			freezeControl, freezeOK, freezeErr := decodeReconfiguration(freezeValue.Value)
+			if !freezeKnown || freezeErr != nil || !freezeOK || freezeControl.Terminal || control.OperationDigest != freezeControl.OperationDigest {
+				return Summary{}, fmt.Errorf("terminal operation digest does not match its certified freeze")
+			}
 			if control.Abort && !reconfigurationAdds(cluster, state.target) {
 				return Summary{}, fmt.Errorf("only a pending addition may be aborted")
 			}
@@ -1531,6 +1538,14 @@ func (c *Core) record(ctx context.Context, request RecordRequest) (Summary, erro
 			if isControl && control.Terminal && !alreadyDecided && (request.Slot != state.terminal || c.tip != state.terminal-1 || control.Freeze != state.freeze || control.TerminalSlot != state.terminal || control.PrefixHash != c.prefixes[c.tip] || !sameCluster(control.Target, state.target)) {
 				c.mu.Unlock()
 				return Summary{}, fmt.Errorf("terminal control changed while request waited")
+			}
+			if isControl && control.Terminal && !alreadyDecided {
+				freezeValue, freezeKnown := c.decided[state.freeze]
+				freezeControl, freezeOK, freezeErr := decodeReconfiguration(freezeValue.Value)
+				if !freezeKnown || freezeErr != nil || !freezeOK || freezeControl.Terminal || control.OperationDigest != freezeControl.OperationDigest {
+					c.mu.Unlock()
+					return Summary{}, fmt.Errorf("terminal operation digest does not match its certified freeze")
+				}
 			}
 			if request.Slot > state.terminal || (request.Slot > state.freeze && request.ReconfigurationID != state.id) {
 				c.mu.Unlock()
@@ -2645,8 +2660,16 @@ func (c *Core) validateDecisionForRecovery(decision Decision, allowMissingLeader
 		} else {
 			c.mu.RLock()
 			freeze, known := c.decided[control.Freeze]
+			floor := c.floor
 			c.mu.RUnlock()
+			if !known && control.Freeze > floor {
+				return fmt.Errorf("terminal operation digest cannot be checked without its certified freeze")
+			}
 			if known {
+				freezeControl, freezeOK, freezeErr := decodeReconfiguration(freeze.Value)
+				if freezeErr != nil || !freezeOK || freezeControl.Terminal || control.OperationDigest != freezeControl.OperationDigest {
+					return fmt.Errorf("terminal operation digest does not match its certified freeze")
+				}
 				for _, summary := range decision.Summaries {
 					if summary.ReconfigurationID != freeze.Hash {
 						return fmt.Errorf("terminal quorum does not bind its freeze")

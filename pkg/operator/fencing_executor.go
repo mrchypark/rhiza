@@ -374,7 +374,7 @@ func (e *FencingExecutor) registerMembershipRepairLearner(ctx context.Context, c
 		assignment.RootUID != a.RootUID || assignment.StatefulSetUID != workloadUID || assignment.LedgerUID != ledgerUID ||
 		assignment.SourceClusterID != candidate.SourceClusterID || assignment.PodName != candidate.PodName ||
 		assignment.PodUID != candidate.PodUID || assignment.NodeID != canonical || assignment.NodeID != candidate.NodeID ||
-		assignment.MembershipHash != a.MembershipHash || assignment.CredentialName == "" || assignment.CredentialUID == "" ||
+		assignment.MembershipHash != a.BootstrapMembershipHash || assignment.CredentialName == "" || assignment.CredentialUID == "" ||
 		(candidate.CredentialName != "" && candidate.CredentialName != assignment.CredentialName) ||
 		(candidate.CredentialUID != "" && candidate.CredentialUID != assignment.CredentialUID) ||
 		fencing.PodNameForIdentity(a.OldIdentity) != candidate.PodName || candidate.PodUID == a.OldIdentity.PodUID {

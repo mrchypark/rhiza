@@ -308,6 +308,135 @@ func TestQualificationApplicationProvenance(t *testing.T) {
 	}
 }
 
+func TestLearnerFoundationWorkflowSelectorAndGatewayEvidence(t *testing.T) {
+	workflowBytes, err := os.ReadFile("../../../.github/workflows/ci.yml")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var workflow struct {
+		Jobs map[string]struct {
+			Steps []struct {
+				Name string `yaml:"name"`
+				Run  string `yaml:"run"`
+			} `yaml:"steps"`
+		} `yaml:"jobs"`
+	}
+	if err := yaml.Unmarshal(workflowBytes, &workflow); err != nil {
+		t.Fatal(err)
+	}
+	var run string
+	for _, step := range workflow.Jobs["learner-foundation-versity"].Steps {
+		if step.Name == "Run learner foundation normal and race tests" {
+			run = step.Run
+			break
+		}
+	}
+	if run == "" {
+		t.Fatal("learner foundation test step is missing")
+	}
+
+	tests := []struct {
+		name       string
+		mode       string
+		wantExit   string
+		wantRace   bool
+		wantSelect string
+		wantClean  string
+		wantDetail string
+	}{
+		{name: "selected test and reaped gateway", mode: "pass", wantExit: "learner-foundation-normal\t0", wantRace: true, wantSelect: "learner-foundation-race\tpass\tpass=1\tskip=0", wantClean: "learner-foundation-race\t0"},
+		{name: "skip rejected before race", mode: "skip", wantExit: "learner-foundation-normal\t0", wantSelect: "learner-foundation-normal\tfailed\tpass=0\tskip=1", wantClean: "learner-foundation-normal\t0"},
+		{name: "zero selected tests rejected before race", mode: "zero", wantExit: "learner-foundation-normal\t0", wantSelect: "learner-foundation-normal\tfailed\tpass=0\tskip=0", wantClean: "learner-foundation-normal\t0"},
+		{name: "missing gateway marker rejected", mode: "missing-marker", wantExit: "learner-foundation-normal\t0", wantClean: "learner-foundation-normal\t1"},
+		{name: "no new gateway directory rejected", mode: "no-directory", wantExit: "learner-foundation-normal\t0", wantClean: "learner-foundation-normal\t1", wantDetail: "no-new-gateway-directory"},
+		{name: "test failure retained separately from cleanup", mode: "test-failure", wantExit: "learner-foundation-normal\t7", wantClean: "learner-foundation-normal\t0"},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			root := t.TempDir()
+			temp := filepath.Join(root, "runner-temp")
+			bin := filepath.Join(root, "bin")
+			if err := os.MkdirAll(filepath.Join(temp, "learner-foundation-versity", "logs"), 0o755); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.MkdirAll(bin, 0o755); err != nil {
+				t.Fatal(err)
+			}
+			fakeGo := `#!/bin/sh
+count_file="$RUNNER_TEMP/go-count"
+count=0
+[ ! -f "$count_file" ] || count=$(cat "$count_file")
+count=$((count + 1))
+printf '%s' "$count" >"$count_file"
+run_dir="$RHIZA_VERSITY_EVIDENCE_DIR/versity-$count"
+if [ "$GO_TEST_MODE" != no-directory ]; then
+  mkdir -p "$run_dir"
+  if [ "$GO_TEST_MODE" != missing-marker ]; then
+    printf 'gateway_reaped=true\n' >"$run_dir/gateway-complete"
+  fi
+fi
+case "$GO_TEST_MODE" in
+  skip) printf '%s\n' '--- SKIP: TestNodeOpenStartsFreshLearnerWithoutFencingAuthority (0.00s)'; exit 0 ;;
+  zero) printf '%s\n' '--- PASS: TestOtherTest (0.00s)'; exit 0 ;;
+  test-failure) printf '%s\n' '--- FAIL: TestNodeOpenStartsFreshLearnerWithoutFencingAuthority (0.00s)'; exit 7 ;;
+  *) printf '%s\n' '--- PASS: TestNodeOpenStartsFreshLearnerWithoutFencingAuthority (0.00s)'; exit 0 ;;
+esac
+`
+			if err := os.WriteFile(filepath.Join(bin, "go"), []byte(fakeGo), 0o755); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(filepath.Join(bin, "sleep"), []byte("#!/bin/sh\nexit 0\n"), 0o755); err != nil {
+				t.Fatal(err)
+			}
+			cmd := exec.Command("/bin/bash", "-c", run)
+			cmd.Env = append(os.Environ(),
+				"PATH="+bin+":"+os.Getenv("PATH"),
+				"RUNNER_TEMP="+temp,
+				"RHIZA_VERSITY_EVIDENCE_DIR="+filepath.Join(temp, "learner-foundation-versity", "versity-raw"),
+				"RHIZA_VERSITYGW_BIN=/fixture/versitygw",
+				"GO_TEST_MODE="+test.mode,
+			)
+			output, runErr := cmd.CombinedOutput()
+			if test.mode == "pass" && runErr != nil {
+				t.Fatalf("workflow step failed: %v: %s", runErr, output)
+			}
+			if test.mode != "pass" && runErr == nil {
+				t.Fatalf("workflow step unexpectedly succeeded: %s", output)
+			}
+			evidence := filepath.Join(temp, "learner-foundation-versity")
+			read := func(name string) string {
+				t.Helper()
+				data, err := os.ReadFile(filepath.Join(evidence, name))
+				if err != nil {
+					t.Fatal(err)
+				}
+				return string(data)
+			}
+			if got := read("exits.tsv"); !strings.Contains(got, test.wantExit) {
+				t.Fatalf("actual exit record missing %q: %s", test.wantExit, got)
+			}
+			if got := read("cleanup-status.tsv"); !strings.Contains(got, test.wantClean) {
+				t.Fatalf("cleanup status missing %q: %s", test.wantClean, got)
+			}
+			if test.wantDetail != "" {
+				if got := read("cleanup.tsv"); !strings.Contains(got, test.wantDetail) {
+					t.Fatalf("cleanup evidence missing %q: %s", test.wantDetail, got)
+				}
+			}
+			if test.wantSelect != "" {
+				if got := read("selection.tsv"); !strings.Contains(got, test.wantSelect) {
+					t.Fatalf("selection record missing %q: %s", test.wantSelect, got)
+				}
+			}
+			if !test.wantRace {
+				if _, err := os.Stat(filepath.Join(evidence, "logs", "learner-foundation-race.log")); !os.IsNotExist(err) {
+					t.Fatalf("race ran after normal selector/cleanup failure: stat err=%v", err)
+				}
+			}
+		})
+	}
+}
+
 func TestObjectStoreCountersAllowlist(t *testing.T) {
 	handler := objectStoreCounters(func() (rhiza.ObjectStoreStats, bool) {
 		return rhiza.ObjectStoreStats{HTTPRequests: 17, BytesUploaded: 29, BytesPublished: 23,

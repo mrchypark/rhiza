@@ -387,12 +387,29 @@ func TestMembershipRepairSourceObservationIsBoundToRetainedSlotAndLivePodUID(t *
 			return
 		}
 		nonce := r.URL.Query().Get("nonce")
-		status := network.VoterRecoveryStatus{
-			NodeID: "rhiza-0", ClusterID: "source", ConfigID: 1, WALIdentity: sourceWAL,
-			Voters: []string{"rhiza-0", "rhiza-1"}, Voting: true, AbortSlot: 0,
-			Quorum: true, QuorumKnown: true, QuorumConfigID: 1, ReadIndexSlot: 1, CertifiedTip: 1,
+		excluded := r.URL.Query().Get("exclude")
+		sourceCoreMu.Lock()
+		defer sourceCoreMu.Unlock()
+		configID := uint(1)
+		voters := []string{"rhiza-0", "rhiza-1"}
+		readIndex, certifiedTip := uint64(1), uint64(1)
+		if sourceCore != nil {
+			configID = sourceCore.ConfigID()
+			voters = make([]string, 0, len(sourceMembers))
+			for _, member := range sourceMembers {
+				voters = append(voters, string(member.ID))
+			}
+			certifiedTip = uint64(sourceCore.Tip())
+			if certifiedTip > 0 {
+				readIndex = certifiedTip
+			}
 		}
-		observation := network.RecoveryProbe{Version: network.RecoveryProbeProtocolVersion, Excluded: "rhiza-1", Nonce: nonce, Status: status}
+		status := network.VoterRecoveryStatus{
+			NodeID: "rhiza-0", ClusterID: "source", ConfigID: configID, WALIdentity: sourceWAL,
+			Voters: voters, Voting: true, AbortSlot: 0,
+			Quorum: true, QuorumKnown: true, QuorumConfigID: configID, ReadIndexSlot: readIndex, CertifiedTip: certifiedTip,
+		}
+		observation := network.RecoveryProbe{Version: network.RecoveryProbeProtocolVersion, Excluded: excluded, Nonce: nonce, Status: status}
 		observation.MAC = peerClosureProbeMAC(observation, adminToken)
 		w.Header().Set("Content-Type", "application/json")
 		_ = json.NewEncoder(w).Encode(observation)
@@ -578,6 +595,7 @@ func TestMembershipRepairSourceObservationIsBoundToRetainedSlotAndLivePodUID(t *
 				http.Error(w, "simulated resourceVersion conflict after closure committed", http.StatusConflict)
 				return
 			}
+			ledger = fenceLedger{}
 			if err := json.Unmarshal([]byte(str(nested(updated, "data", "ledger.json"))), &ledger); err != nil {
 				http.Error(w, "invalid ledger", http.StatusBadRequest)
 				return
@@ -599,7 +617,7 @@ func TestMembershipRepairSourceObservationIsBoundToRetainedSlotAndLivePodUID(t *
 				}
 				metadata := asObject(secret["metadata"])
 				name := str(metadata["name"])
-				metadata["namespace"], metadata["uid"] = "test", "learner-secret-uid"
+				metadata["namespace"], metadata["uid"] = "test", "learner-secret-uid-"+hashJSON(name)[:12]
 				secretObjects[path.Join("/api/v1/namespaces/test/secrets", name)] = secret
 				w.Header().Set("Content-Type", "application/json")
 				_ = json.NewEncoder(w).Encode(secret)
@@ -713,7 +731,7 @@ func TestMembershipRepairSourceObservationIsBoundToRetainedSlotAndLivePodUID(t *
 	secretMu.Lock()
 	_, immutableCredentialReadBack := secretObjects[path.Join("/api/v1/namespaces/test/secrets", assignment.CredentialName)]
 	secretMu.Unlock()
-	if !immutableCredentialReadBack || assignment.CredentialUID != "learner-secret-uid" {
+	if !immutableCredentialReadBack || assignment.CredentialUID == "" {
 		t.Fatalf("candidate assignment did not bind read-back immutable credential: %+v", assignment)
 	}
 	ledgerMu.Lock()
@@ -880,6 +898,9 @@ func TestMembershipRepairSourceObservationIsBoundToRetainedSlotAndLivePodUID(t *
 	if addErr != nil {
 		t.Fatalf("certify and archive ADD transition: %v", addErr)
 	}
+	sourceCoreMu.Lock()
+	sourceMembers = append([]quepaxa.Member(nil), addTarget.Members...)
+	sourceCoreMu.Unlock()
 	addResult, err := client.ObserveMembershipRepairPhase(ctx, caller, fencing.MembershipRepairPhaseObserveRequest{OperationID: reserved.Repair.Authorization.OperationID,
 		PhaseHash: addPrepared.Phase.Hash, JournalOperationID: addPrepared.Phase.Change.OperationID, JournalRequestHash: hashJSON(addPrepared.Phase.Change), Target: addTarget, TerminalSlot: uint64(addFreeze + 16)})
 	if err != nil || addResult.Stage != fencing.MembershipRepairAdded {

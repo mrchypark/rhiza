@@ -118,6 +118,52 @@ func TestRunFinalExitReceiptFailurePreservesPrimaryStatusAndCleanup(t *testing.T
 	})
 }
 
+func TestSafeArtifactsPreservesSecondSameOrdinalReplacementAcceptance(t *testing.T) {
+	raw := t.TempDir()
+	for name, data := range map[string][]byte{
+		"source-head.txt": []byte(strings.Repeat("a", 40) + "\n"),
+		"image-ids.txt":   []byte("sha256:" + strings.Repeat("b", 64) + "\n"),
+		"actual-exit.txt": []byte("0\n"),
+	} {
+		if err := os.WriteFile(filepath.Join(raw, name), data, 0600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	old := operator.FenceTarget{NodeID: "pod-old", Pod: "rhiza-0", PodUID: "old-pod-uid", WALIdentity: "old-wal"}
+	next := operator.FenceTarget{NodeID: "pod-new", Pod: "rhiza-0", PodUID: "new-pod-uid", WALIdentity: "new-wal"}
+	events := []obj{
+		{"event": "podchaos_replacement_recovered", "oldUIDs": []string{old.PodUID}, "target": old, "rows": 1, "voters": 3, "configID": 2},
+		{"event": "podchaos_second_same_ordinal_cycle_accepted", "oldUIDs": []string{old.PodUID}, "target": next, "rows": 1, "voters": 3, "configID": 3},
+	}
+	var data []byte
+	for _, item := range events {
+		data = append(data, encoded(item)...)
+		data = append(data, '\n')
+	}
+	if err := os.WriteFile(filepath.Join(raw, "events.jsonl"), data, 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := safeArtifacts(raw); err != nil {
+		t.Fatalf("project replacement evidence: %v", err)
+	}
+	projected, err := os.ReadFile(filepath.Join(raw, "public", "events.jsonl"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var got []eventView
+	for _, line := range strings.Split(strings.TrimSpace(string(projected)), "\n") {
+		var event eventView
+		if err := json.Unmarshal([]byte(line), &event); err != nil {
+			t.Fatal(err)
+		}
+		got = append(got, event)
+	}
+	if len(got) != 2 || got[1].Event != "podchaos_second_same_ordinal_cycle_accepted" || string(got[1].Rows) != "1" ||
+		got[1].Voters != 3 || got[1].ConfigID != 3 || got[1].Target == nil || *got[1].Target != next || !reflect.DeepEqual(got[1].OldUIDs, []string{old.PodUID}) {
+		t.Fatalf("second replacement acceptance was not preserved in the public projection: %+v", got)
+	}
+}
+
 func TestRunPreCleanupReceiptFailureStillCleansUp(t *testing.T) {
 	result := runDiagnosticTrapFixture(t, 1, false, true, false)
 	if result.exit != 1 {
@@ -414,6 +460,107 @@ func TestOnlineRepairRequiresRetainedAcceptedCompletion(t *testing.T) {
 				t.Fatal("incomplete or mismatched authority completion accepted")
 			}
 		})
+	}
+	for name, mutate := range map[string]func(*fencing.MembershipRepairRecord){
+		"wrong ADD source config": func(r *fencing.MembershipRepairRecord) {
+			r.Progress.Completion.Request.SourceConfigID++
+			r.Progress.Completion.Request.Target.ConfigID++
+			r.Progress.Results[0].Target.ConfigID++
+		},
+		"wrong ADD abort slot": func(r *fencing.MembershipRepairRecord) {
+			wrong := *r.Progress.Completion.Request.AbortSlot + 1
+			r.Progress.Completion.Request.AbortSlot = &wrong
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			bad := record
+			bad.Progress = record.Progress
+			bad.Progress.Phases = append([]fencing.MembershipRepairPhase(nil), record.Progress.Phases...)
+			bad.Progress.Candidates = append([]fencing.MembershipRepairCandidate(nil), record.Progress.Candidates...)
+			bad.Progress.Results = append([]fencing.MembershipRepairPhaseResult(nil), record.Progress.Results...)
+			completion := *record.Progress.Completion
+			request := completion.Request
+			response := *completion.Accepted
+			completion.Request, completion.Accepted = request, &response
+			bad.Progress.Completion = &completion
+			mutate(&bad)
+			completion.Request.ScopeDigest = fencing.MembershipRepairCompletionScopeDigest(completion.Request)
+			digest, err := network.MembershipRepairCompletionRequestDigest(completion.Request)
+			if err != nil {
+				t.Fatal(err)
+			}
+			completion.Accepted.ScopeDigest = completion.Request.ScopeDigest
+			completion.Accepted.RequestDigest = digest
+			if membershipRepairCompletionAccepted(bad, "online-op", "sts-uid", "root-uid", old) {
+				t.Fatal("self-consistent completion for another ADD config/abort point accepted")
+			}
+		})
+	}
+}
+
+func TestReplacementCompletionIsScopedToExactUIDLedgerAndLiveQuorum(t *testing.T) {
+	record, old := completedOnlineRepairFixture(t)
+	newMember := *record.Progress.Candidates[0].Member
+	candidate := operator.FenceTarget{NodeID: string(newMember.ID), Pod: old.Pod, PodUID: "new-pod", WALIdentity: newMember.WALIdentity}
+	otherMember := record.Authorization.Membership.Members[1]
+	current := network.MembershipStatus{NodeID: newMember.ID, ClusterID: oldSourceClusterID, ConfigID: 3, Voters: []quepaxa.NodeID{otherMember.ID, newMember.ID}, WALIdentity: newMember.WALIdentity, Voting: true}
+	statuses := []network.MembershipStatus{
+		{NodeID: otherMember.ID, ClusterID: oldSourceClusterID, ConfigID: 3, Voters: append([]quepaxa.NodeID(nil), current.Voters...), WALIdentity: otherMember.WALIdentity, Voting: true},
+		current,
+	}
+	encode := func(t *testing.T, record fencing.MembershipRepairRecord) string {
+		t.Helper()
+		ledger := fencing.Ledger{SourceClusterID: oldSourceClusterID, MembershipRepairHistory: map[string]fencing.MembershipRepairRecord{record.Authorization.OperationID: record}}
+		data, err := json.Marshal(fenceLedgerState{StatefulSetUID: "sts-uid", Ledger: ledger})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return string(data)
+	}
+	item := func(uid string, record fencing.MembershipRepairRecord) any {
+		return obj{"metadata": obj{"uid": uid}, "data": obj{"ledger.json": encode(t, record)}}
+	}
+	good := obj{"items": []any{item(record.Authorization.LedgerUID, record)}}
+	if !retainedReplacementRepairCompletionFromMaps(good, "sts-uid", "root-uid", old, candidate, 1, 8, current, statuses) {
+		t.Fatal("exact pinned accepted ADD completion and current quorum were rejected")
+	}
+	cases := map[string]func(operator.FenceTarget, uint, quepaxa.Slot, network.MembershipStatus, []network.MembershipStatus) (operator.FenceTarget, uint, quepaxa.Slot, network.MembershipStatus, []network.MembershipStatus){
+		"wrong candidate UID": func(target operator.FenceTarget, cfg uint, abort quepaxa.Slot, live network.MembershipStatus, all []network.MembershipStatus) (operator.FenceTarget, uint, quepaxa.Slot, network.MembershipStatus, []network.MembershipStatus) {
+			target.PodUID = "different-pod"
+			return target, cfg, abort, live, all
+		},
+		"wrong source config": func(target operator.FenceTarget, cfg uint, abort quepaxa.Slot, live network.MembershipStatus, all []network.MembershipStatus) (operator.FenceTarget, uint, quepaxa.Slot, network.MembershipStatus, []network.MembershipStatus) {
+			return target, cfg + 1, abort, live, all
+		},
+		"wrong old abort slot": func(target operator.FenceTarget, cfg uint, abort quepaxa.Slot, live network.MembershipStatus, all []network.MembershipStatus) (operator.FenceTarget, uint, quepaxa.Slot, network.MembershipStatus, []network.MembershipStatus) {
+			return target, cfg, abort + 1, live, all
+		},
+		"wrong current candidate WAL": func(target operator.FenceTarget, cfg uint, abort quepaxa.Slot, live network.MembershipStatus, all []network.MembershipStatus) (operator.FenceTarget, uint, quepaxa.Slot, network.MembershipStatus, []network.MembershipStatus) {
+			live.WALIdentity = "different-wal"
+			return target, cfg, abort, live, all
+		},
+		"voter target config differs": func(target operator.FenceTarget, cfg uint, abort quepaxa.Slot, live network.MembershipStatus, all []network.MembershipStatus) (operator.FenceTarget, uint, quepaxa.Slot, network.MembershipStatus, []network.MembershipStatus) {
+			all[0].ConfigID++
+			return target, cfg, abort, live, all
+		},
+		"missing quorum voter": func(target operator.FenceTarget, cfg uint, abort quepaxa.Slot, live network.MembershipStatus, all []network.MembershipStatus) (operator.FenceTarget, uint, quepaxa.Slot, network.MembershipStatus, []network.MembershipStatus) {
+			return target, cfg, abort, live, all[:1]
+		},
+	}
+	for name, mutate := range cases {
+		t.Run(name, func(t *testing.T) {
+			all := append([]network.MembershipStatus(nil), statuses...)
+			target, cfg, abort, live, all := mutate(candidate, 1, 8, current, all)
+			if retainedReplacementRepairCompletionFromMaps(good, "sts-uid", "root-uid", old, target, cfg, abort, live, all) {
+				t.Fatal("mismatched per-cycle evidence accepted")
+			}
+		})
+	}
+	if retainedReplacementRepairCompletionFromMaps(obj{"items": []any{item("copied-ledger-uid", record)}}, "sts-uid", "root-uid", old, candidate, 1, 8, current, statuses) {
+		t.Fatal("copied completion under a different ConfigMap UID authorized recovery")
+	}
+	if retainedReplacementRepairCompletionFromMaps(obj{"items": []any{item(record.Authorization.LedgerUID, record), item(record.Authorization.LedgerUID, record)}}, "sts-uid", "root-uid", old, candidate, 1, 8, current, statuses) {
+		t.Fatal("ambiguous duplicate retained completions authorized recovery")
 	}
 }
 

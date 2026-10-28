@@ -461,7 +461,7 @@ func (a MembershipRepairAuthorization) Validate() error {
 	seen := make(map[quepaxa.NodeID]bool, len(a.Membership.Members))
 	oldMember := false
 	for _, member := range a.Membership.Members {
-		if member.ID == "" || seen[member.ID] || member.PublicKey == (quepaxa.PublicKey{}) || member.URL == "" || member.LogURL == "" {
+		if member.ID == "" || seen[member.ID] || member.PublicKey == (quepaxa.PublicKey{}) || member.URL == "" || member.PeerURL == "" {
 			return fmt.Errorf("fencing: invalid repair membership")
 		}
 		seen[member.ID] = true

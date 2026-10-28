@@ -115,6 +115,10 @@ func (c *Core) membershipHistoryLocked(through Slot) (MembershipRecord, error) {
 		if terminalControl.TerminalSlot != terminalSlot {
 			return MembershipRecord{}, fmt.Errorf("membership history: transition %d terminal slot=%d want %d", i, terminalControl.TerminalSlot, terminalSlot)
 		}
+		freezeControl, freezeOK, freezeErr := decodeReconfiguration(freezeDecision.Value)
+		if freezeErr != nil || !freezeOK || freezeControl.Terminal || terminalControl.OperationDigest != freezeControl.OperationDigest {
+			return MembershipRecord{}, fmt.Errorf("membership history: transition %d operation digest differs between freeze and terminal", i)
+		}
 		if sha256.Sum256(terminalDecision.Value) != terminalDecision.Hash {
 			return MembershipRecord{}, fmt.Errorf("membership history: transition %d terminal value hash mismatch", i)
 		}

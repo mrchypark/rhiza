@@ -11,16 +11,26 @@ import (
 // next fifteen slots are drained under that same configuration; FinishReconfiguration
 // then commits the terminal control record and activates target at T+1.
 func (c *Core) BeginReconfiguration(ctx context.Context, target Cluster) (Slot, error) {
-	return c.beginReconfiguration(ctx, target, nil)
+	return c.beginReconfiguration(ctx, target, nil, [32]byte{})
 }
 
 // BeginReconfigurationAt starts a new operation only when the latest durable
 // abort terminal still matches expectedAbortSlot. Zero means no prior abort.
 func (c *Core) BeginReconfigurationAt(ctx context.Context, target Cluster, expectedAbortSlot Slot) (Slot, error) {
-	return c.beginReconfiguration(ctx, target, &expectedAbortSlot)
+	return c.beginReconfiguration(ctx, target, &expectedAbortSlot, [32]byte{})
 }
 
-func (c *Core) beginReconfiguration(ctx context.Context, target Cluster, expectedAbortSlot *Slot) (Slot, error) {
+// BeginReconfigurationBoundAt certifies the caller's nonzero immutable
+// operation digest in the freeze control alongside the exact target and abort
+// revision. Existing unbound APIs remain available for legacy transitions.
+func (c *Core) BeginReconfigurationBoundAt(ctx context.Context, target Cluster, expectedAbortSlot Slot, operationDigest [32]byte) (Slot, error) {
+	if operationDigest == ([32]byte{}) {
+		return 0, fmt.Errorf("reconfiguration operation digest is required")
+	}
+	return c.beginReconfiguration(ctx, target, &expectedAbortSlot, operationDigest)
+}
+
+func (c *Core) beginReconfiguration(ctx context.Context, target Cluster, expectedAbortSlot *Slot, operationDigest [32]byte) (Slot, error) {
 	if !c.reconfigEnabled || c.observer {
 		return 0, ErrQuorumUnavailable
 	}
@@ -84,7 +94,7 @@ func (c *Core) beginReconfiguration(ctx context.Context, target Cluster, expecte
 			}
 			continue
 		}
-		value, err := encodeReconfiguration(reconfigurationValue{Freeze: freeze, TerminalSlot: freeze + 16, Target: cloneCluster(target), PrefixHash: prefix})
+		value, err := encodeReconfiguration(reconfigurationValue{Freeze: freeze, TerminalSlot: freeze + 16, Target: cloneCluster(target), PrefixHash: prefix, OperationDigest: operationDigest})
 		if err != nil {
 			return 0, err
 		}
@@ -127,31 +137,49 @@ func (c *Core) abortRevisionLocked() (Slot, error) {
 // FinishReconfiguration fills the bounded old-configuration drain and commits
 // its terminal record. It never changes membership before that record is durable.
 func (c *Core) FinishReconfiguration(ctx context.Context) error {
-	return c.finishReconfiguration(ctx, false, nil, nil)
+	return c.finishReconfiguration(ctx, false, nil, nil, [32]byte{})
 }
 
 // FinishReconfigurationAt commits a terminal only for the frozen target and
 // abort revision that the caller previously recorded. Zero means no prior
 // abort revision.
 func (c *Core) FinishReconfigurationAt(ctx context.Context, target Cluster, expectedAbortSlot Slot) error {
-	return c.finishReconfiguration(ctx, false, &target, &expectedAbortSlot)
+	return c.finishReconfiguration(ctx, false, &target, &expectedAbortSlot, [32]byte{})
+}
+
+// FinishReconfigurationBoundAt commits only the exact bound freeze identified
+// by target, abort revision, and operation digest.
+func (c *Core) FinishReconfigurationBoundAt(ctx context.Context, target Cluster, expectedAbortSlot Slot, operationDigest [32]byte) error {
+	if operationDigest == ([32]byte{}) {
+		return fmt.Errorf("reconfiguration operation digest is required")
+	}
+	return c.finishReconfiguration(ctx, false, &target, &expectedAbortSlot, operationDigest)
 }
 
 // AbortReconfiguration certifies the frozen terminal under the old voter
 // quorum without activating an added learner. It is only available for a
 // pending addition; the original learner identity remains untouched.
 func (c *Core) AbortReconfiguration(ctx context.Context) error {
-	return c.finishReconfiguration(ctx, true, nil, nil)
+	return c.finishReconfiguration(ctx, true, nil, nil, [32]byte{})
 }
 
 // AbortReconfigurationAt certifies an abort only for the frozen target and
 // abort revision that the caller previously recorded. It rejects a stale
 // management round before draining or proposing a terminal control.
 func (c *Core) AbortReconfigurationAt(ctx context.Context, target Cluster, expectedAbortSlot Slot) error {
-	return c.finishReconfiguration(ctx, true, &target, &expectedAbortSlot)
+	return c.finishReconfiguration(ctx, true, &target, &expectedAbortSlot, [32]byte{})
 }
 
-func (c *Core) finishReconfiguration(ctx context.Context, abort bool, expectedTarget *Cluster, expectedAbortSlot *Slot) error {
+// AbortReconfigurationBoundAt commits only the exact bound addition freeze
+// identified by target, abort revision, and operation digest.
+func (c *Core) AbortReconfigurationBoundAt(ctx context.Context, target Cluster, expectedAbortSlot Slot, operationDigest [32]byte) error {
+	if operationDigest == ([32]byte{}) {
+		return fmt.Errorf("reconfiguration operation digest is required")
+	}
+	return c.finishReconfiguration(ctx, true, &target, &expectedAbortSlot, operationDigest)
+}
+
+func (c *Core) finishReconfiguration(ctx context.Context, abort bool, expectedTarget *Cluster, expectedAbortSlot *Slot, operationDigest [32]byte) error {
 	if !c.reconfigEnabled || c.observer {
 		return ErrQuorumUnavailable
 	}
@@ -165,6 +193,26 @@ func (c *Core) finishReconfiguration(ctx context.Context, abort bool, expectedTa
 	var previousTerminal Slot
 	if len(c.configHistory) > 1 {
 		previousTerminal = c.configHistory[len(c.configHistory)-1].start - 1
+	}
+	if expectedAbortSlot != nil && expectedTarget != nil && operationDigest != ([32]byte{}) {
+		activeExact := false
+		if state != nil {
+			freeze, ok := c.decided[state.freeze]
+			control, configured, decodeErr := decodeReconfiguration(freeze.Value)
+			activeExact = ok && decodeErr == nil && configured && !control.Terminal && control.OperationDigest == operationDigest && sameCluster(state.target, *expectedTarget)
+		}
+		if !activeExact {
+			terminal, found, err := c.boundHistoricalTerminalLocked(*expectedTarget, *expectedAbortSlot, operationDigest, abort)
+			if err != nil || found {
+				c.mu.RUnlock()
+				c.releasePipeline()
+				if err != nil {
+					return err
+				}
+				_, err = c.CompleteDecision(ctx, terminal)
+				return err
+			}
+		}
 	}
 	if expectedAbortSlot != nil {
 		actual, err := c.abortRevisionLocked()
@@ -184,9 +232,21 @@ func (c *Core) finishReconfiguration(ctx context.Context, abort bool, expectedTa
 		c.releasePipeline()
 		return fmt.Errorf("reconfiguration target no longer matches the requested round")
 	}
+	if state != nil {
+		freeze, ok := c.decided[state.freeze]
+		control, configured, err := decodeReconfiguration(freeze.Value)
+		if !ok || err != nil || !configured || control.Terminal || control.OperationDigest != operationDigest {
+			c.mu.RUnlock()
+			c.releasePipeline()
+			return fmt.Errorf("reconfiguration operation digest does not match the frozen round")
+		}
+	}
 	c.mu.RUnlock()
 	if state == nil {
 		c.releasePipeline()
+		if operationDigest != ([32]byte{}) {
+			return fmt.Errorf("bound reconfiguration is not frozen")
+		}
 		if previousTerminal != 0 {
 			_, err := c.completeDecision(ctx, previousTerminal, true)
 			return err
@@ -230,7 +290,7 @@ func (c *Core) finishReconfiguration(ctx context.Context, abort bool, expectedTa
 	if !ok {
 		return fmt.Errorf("reconfiguration drain prefix is unavailable")
 	}
-	value, err := encodeReconfiguration(reconfigurationValue{Terminal: true, Abort: abort, Freeze: state.freeze, TerminalSlot: state.terminal, Target: cloneCluster(state.target), PrefixHash: prefix})
+	value, err := encodeReconfiguration(reconfigurationValue{Terminal: true, Abort: abort, Freeze: state.freeze, TerminalSlot: state.terminal, Target: cloneCluster(state.target), PrefixHash: prefix, OperationDigest: operationDigest})
 	if err != nil {
 		return err
 	}
@@ -246,6 +306,62 @@ func (c *Core) finishReconfiguration(ctx context.Context, abort bool, expectedTa
 		return fmt.Errorf("terminal slot was decided by another value")
 	}
 	return err
+}
+
+// boundHistoricalTerminalLocked finds a retained, certified terminal for an
+// exact completed bound operation. It deliberately refuses compacted history:
+// without the freeze and preceding abort revision, a retry cannot be
+// distinguished from a later or unrelated transition.
+func (c *Core) boundHistoricalTerminalLocked(target Cluster, expectedAbortSlot Slot, operationDigest [32]byte, abort bool) (Slot, bool, error) {
+	if c.floor != 0 {
+		return 0, false, fmt.Errorf("bound reconfiguration retry history is compacted")
+	}
+	history, err := c.membershipHistoryLocked(0)
+	if err != nil {
+		return 0, false, fmt.Errorf("bound reconfiguration retry history: %w", err)
+	}
+	var matches []ConfigTransition
+	matches = append(matches, history.Transitions...)
+	if history.Abort != nil {
+		matches = append(matches, *history.Abort)
+	}
+	var found *ConfigTransition
+	for i := range matches {
+		transition := &matches[i]
+		freeze, freezeOK, freezeErr := decodeReconfiguration(transition.Freeze.Value)
+		terminal, terminalOK, terminalErr := decodeReconfiguration(transition.Terminal.Value)
+		if freezeErr != nil || terminalErr != nil || !freezeOK || !terminalOK || freeze.Terminal || !terminal.Terminal {
+			continue
+		}
+		if freeze.OperationDigest != operationDigest || terminal.OperationDigest != operationDigest || !sameCluster(freeze.Target, target) || !sameCluster(terminal.Target, target) || terminal.Abort != abort {
+			continue
+		}
+		if found != nil {
+			return 0, false, fmt.Errorf("bound reconfiguration retry is ambiguous")
+		}
+		found = transition
+	}
+	if found == nil {
+		return 0, false, nil
+	}
+	freezeSlot := found.Freeze.Slot
+	if found.Freeze.Slot == 0 || found.Terminal.Slot <= freezeSlot || !c.durable[freezeSlot] || !c.durable[found.Terminal.Slot] {
+		return 0, false, fmt.Errorf("bound reconfiguration terminal is not durably retained")
+	}
+	var priorAbort Slot
+	for slot, value := range c.decided {
+		if slot >= freezeSlot {
+			continue
+		}
+		control, ok, decodeErr := decodeReconfiguration(value.Value)
+		if decodeErr == nil && ok && control.Terminal && control.Abort && slot > priorAbort {
+			priorAbort = slot
+		}
+	}
+	if priorAbort != expectedAbortSlot {
+		return 0, false, fmt.Errorf("bound reconfiguration retry abort revision %d does not match expected %d", priorAbort, expectedAbortSlot)
+	}
+	return found.Terminal.Slot, true, nil
 }
 
 func (c *Core) takePipeline(ctx context.Context) error {
@@ -370,6 +486,11 @@ func (c *Core) applyReconfigurationLocked(decision Decision) error {
 	state := c.reconfiguration
 	if state == nil || decision.Slot != state.terminal || control.Freeze != state.freeze || control.TerminalSlot != state.terminal || control.PrefixHash != c.prefixes[c.tip] || !sameCluster(control.Target, state.target) || c.tip+1 != decision.Slot {
 		return fmt.Errorf("invalid reconfiguration terminal")
+	}
+	freezeDecision, freezeOK := c.decided[state.freeze]
+	freezeControl, freezeConfigured, freezeErr := decodeReconfiguration(freezeDecision.Value)
+	if !freezeOK || freezeErr != nil || !freezeConfigured || freezeControl.Terminal || control.OperationDigest != freezeControl.OperationDigest {
+		return fmt.Errorf("reconfiguration terminal operation digest does not match its freeze")
 	}
 	for _, summary := range decision.Summaries {
 		if summary.ReconfigurationID != state.id {

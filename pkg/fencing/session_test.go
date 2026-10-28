@@ -132,7 +132,7 @@ func environmentValue(env []string, key string) (string, int) {
 func TestSessionTransient503AndConnectionFailureRemainDistinctFromIdentity(t *testing.T) {
 	var unavailable atomic.Bool
 	id := testIdentity()
-	socket := filepath.Join(t.TempDir(), "session.sock")
+	socket := shortUnixSocketPath(t, "session.sock")
 	listener, err := net.Listen("unix", socket)
 	if err != nil {
 		t.Fatal(err)
@@ -183,7 +183,7 @@ func TestSessionInterruptedSuccessfulBodyIsTransient(t *testing.T) {
 }
 
 func TestSupervisorSocketRestartKeepsLiveListenerAndOtherFiles(t *testing.T) {
-	path := filepath.Join(t.TempDir(), "control.sock")
+	path := shortUnixSocketPath(t, "control.sock")
 	live, err := listenSupervisor(path)
 	if err != nil {
 		t.Fatal(err)
@@ -405,6 +405,28 @@ type roundTripFunc func(*http.Request) (*http.Response, error)
 
 func (f roundTripFunc) RoundTrip(request *http.Request) (*http.Response, error) { return f(request) }
 
+func shortUnixSocketPath(t *testing.T, name string) string {
+	t.Helper()
+	dir, err := os.MkdirTemp("/tmp", "rhizaf-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		if err := os.RemoveAll(dir); err != nil {
+			t.Errorf("remove test socket directory: %v", err)
+			return
+		}
+		if _, err := os.Lstat(dir); !errors.Is(err, os.ErrNotExist) {
+			if err == nil {
+				t.Errorf("test socket directory still exists after cleanup")
+			} else {
+				t.Errorf("verify test socket directory cleanup: %v", err)
+			}
+		}
+	})
+	return filepath.Join(dir, name)
+}
+
 func TestParseBootstrapBarrierSlotRequiresCanonicalPositiveDecimal(t *testing.T) {
 	if got, err := ParseBootstrapBarrierSlot("42"); err != nil || got != 42 {
 		t.Fatalf("slot=%d err=%v", got, err)
@@ -422,7 +444,7 @@ func TestSupervisorSessionBindsExactRunAndStop(t *testing.T) {
 	id := testIdentity()
 	authority := &sessionAuthority{id: id}
 	s := &Supervisor{Authority: authority, Identity: id, bound: id, ticket: "private-ticket"}
-	socket := filepath.Join(t.TempDir(), "control.sock")
+	socket := shortUnixSocketPath(t, "control.sock")
 	listener, err := net.Listen("unix", socket)
 	if err != nil {
 		t.Fatal(err)
@@ -503,8 +525,8 @@ func TestSupervisorSessionRelaysMembershipRepairDiscoveryAndExactPhaseAuthorizat
 		t.Fatalf("no active repair status=%+v err=%v", status, err)
 	}
 	authority.mu.Lock()
-	oldMember := quepaxa.Member{ID: quepaxa.NodeID(bound.NodeID), URL: "http://old", LogURL: "http://old-log", PublicKey: quepaxa.PublicKey(sha256.Sum256([]byte("old"))), WALIdentity: bound.WALIdentity}
-	otherMember := quepaxa.Member{ID: "other", URL: "http://other", LogURL: "http://other-log", PublicKey: quepaxa.PublicKey(sha256.Sum256([]byte("other"))), WALIdentity: "other-wal"}
+	oldMember := quepaxa.Member{ID: quepaxa.NodeID(bound.NodeID), URL: "http://old", PeerURL: "quic://old-peer", LogURL: "http://old-log", PublicKey: quepaxa.PublicKey(sha256.Sum256([]byte("old"))), WALIdentity: bound.WALIdentity}
+	otherMember := quepaxa.Member{ID: "other", URL: "http://other", PeerURL: "quic://other-peer", LogURL: "http://other-log", PublicKey: quepaxa.PublicKey(sha256.Sum256([]byte("other"))), WALIdentity: "other-wal"}
 	members := []quepaxa.Member{oldMember, otherMember}
 	view := MembershipRepairView{
 		Authorization: MembershipRepairAuthorization{OperationID: "repair", RequestHash: strings.Repeat("a", 64), AuthorizationHash: strings.Repeat("b", 64), RootUID: "root", StatefulSetUID: "sts", LedgerUID: "ledger", SourceClusterID: bound.SourceClusterID, MembershipHash: canonicalJSONHash(members), OldIdentity: bound, Membership: quepaxa.Cluster{ConfigID: 1, Members: members}},

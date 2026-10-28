@@ -13,6 +13,36 @@ import (
 	"github.com/mrchypark/rhiza/pkg/quepaxa"
 )
 
+func TestMembershipRepairAuthorizationAcceptsEmptyLogURLButRequiresIdentityEndpoints(t *testing.T) {
+	old := Identity{SourceClusterID: "source", NodeID: "rhiza-0", PodUID: "old-pod", RunID: "old-run", WALIdentity: "old-wal"}
+	members := []quepaxa.Member{
+		{ID: "rhiza-0", URL: "http://old", PeerURL: "quic://old-peer", PublicKey: quepaxa.PublicKey(sha256.Sum256([]byte("old"))), WALIdentity: old.WALIdentity},
+		{ID: "rhiza-1", URL: "http://other", PeerURL: "quic://other-peer", PublicKey: quepaxa.PublicKey(sha256.Sum256([]byte("other"))), WALIdentity: "other-wal"},
+	}
+	makeAuthorization := func(membership []quepaxa.Member) MembershipRepairAuthorization {
+		return MembershipRepairAuthorization{
+			OperationID: "repair", RequestHash: strings.Repeat("a", 64), AuthorizationHash: strings.Repeat("b", 64),
+			RootUID: "root", StatefulSetUID: "sts", LedgerUID: "ledger", SourceClusterID: "source",
+			MembershipHash: canonicalJSONHash(membership), OldIdentity: old, Membership: quepaxa.Cluster{ConfigID: 1, Members: membership},
+		}
+	}
+	if err := makeAuthorization(members).Validate(); err != nil {
+		t.Fatalf("production empty-LogURL membership rejected: %v", err)
+	}
+	for name, mutate := range map[string]func([]quepaxa.Member) []quepaxa.Member{
+		"missing peer endpoint": func(m []quepaxa.Member) []quepaxa.Member { m[1].PeerURL = ""; return m },
+		"missing public key":    func(m []quepaxa.Member) []quepaxa.Member { m[1].PublicKey = quepaxa.PublicKey{}; return m },
+		"duplicate member ID":   func(m []quepaxa.Member) []quepaxa.Member { m[1].ID = m[0].ID; return m },
+	} {
+		t.Run(name, func(t *testing.T) {
+			bad := append([]quepaxa.Member(nil), members...)
+			if err := makeAuthorization(mutate(bad)).Validate(); err == nil {
+				t.Fatal("invalid membership accepted")
+			}
+		})
+	}
+}
+
 func TestLedgerMembershipRepairRetainsExactRoundsAndBoundSurvivorView(t *testing.T) {
 	oldID := Identity{SourceClusterID: "source", NodeID: "rhiza-0", PodUID: "old-pod", RunID: "old-run", WALIdentity: "old-wal"}
 	oldMember := quepaxa.Member{ID: "rhiza-0", URL: "http://old", PeerURL: "http://old-peer", LogURL: "http://old-log", PublicKey: quepaxa.PublicKey(sha256.Sum256([]byte("old-key"))), WALIdentity: "old-wal"}

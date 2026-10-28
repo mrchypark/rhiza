@@ -2,9 +2,9 @@
 
 - 작성일: 2026-10-27 (Asia/Seoul)
 - 출처: 사용자와의 사이드 대화에서 논의한 요구와 설계
-- 상태: 설계 초안과 현재 검증 경계. 준비 API/CLI 및 cooperative-fencing evidence는 전체 HA 복구 완료·안전성 검증·Pro 승인 기록이 아니다.
+- 상태: 설계 초안과 현재 검증 경계. 준비 API/CLI 및 cooperative-fencing evidence는 전체 HA 복구 완료·안전성 검증·Pro 승인 기록이 아니다. 원래 목표는 Deployment+NoPVC이며, 현재 StatefulSet 결합 구현은 제한 사항이지 목표 변경이 아니다.
 - 최초 설계 기준선: `a078cca81bd8c5a68d139eb2c12e04794cb44893`. HA 계약/상태 검토 기준선: `31e58ce` 및 `ccdafbe`.
-- 경계: 이 문서 작성 외에 코드, 실행 중인 작업, 다른 브랜치와 워커는 변경하지 않았다.
+- 당시 문서 작성 범위: 해당 설계 초안 작성 외에 코드, 실행 중인 작업, 다른 브랜치와 워커는 변경하지 않았다. 이는 현재 체크아웃의 변경 상태를 나타내지 않는다.
 
 ## 현재 구현 상태 — 2026-10-28
 
@@ -13,9 +13,9 @@
 - Go API는 `PrepareRestore(ctx, Config)`이며, 실행 파일은 `rhiza --prepare-restore`로 이를 호출하고 일반 서버 시작 전에 종료한다.
 - `Config.PreparedPodUID`는 `RHIZA_PREPARED_POD_UID`에서 읽는다. 이는 initContainer가 Downward API의 현재 Pod UID로 설정해야 하는 incarnation binding이다.
 - HA membership learner의 새 멤버 정보는 `RHIZA_LEARNER` JSON에서 `Config.Learner`로 파싱한다. 이는 앱 역할을 고르는 `RHIZA_ROLE`과 다른 설정이다. `RHIZA_ROLE=learner`는 read-replica 실행 경로이며 consensus membership learner나 voter 교체 역할이 아니다.
-- 준비 단계는 shared object store의 인증된 checkpoint와 연속 suffix를 DataDir에 오프라인 materialize하고, source/Pod-bound marker를 쓴다. 이는 재구성 가능한 HA learner 전용 경로이며 `Local` 모드나 단독 로컬 복구를 지원하는 공통 API가 아니다. 이후 정상 Node open은 설정된 Pod UID와 일치하는 marker를 요구한다. 준비 API 자체는 Node를 열거나 listener를 띄우거나 투표권·멤버십을 부여하지 않는다.
+- 준비 단계는 shared object store의 인증된 checkpoint와 연속 suffix를 DataDir에 오프라인 materialize하고, source/Pod-bound marker를 쓴다. 이는 재구성 가능한 HA learner 전용 경로이며 `Local` 모드가 아니다. Local archive restore와 HA certified archive view는 동등하거나 상호 교환 가능한 형식으로 보장되지 않으며, Local archive로 기존 voter identity/WAL을 되살리는 경로도 아니다. 이후 정상 Node open은 설정된 Pod UID와 일치하는 marker를 요구한다. 준비 API 자체는 Node를 열거나 listener를 띄우거나 투표권·멤버십을 부여하지 않는다.
 - marker intent, observer 생성, pending marker 기록 단계의 다섯 SIGKILL 경계에서 프로세스 재시작 테스트가 추가되었다. 종료된 자식 프로세스를 회수한 뒤 동일 Pod 준비 재개와 다른 Pod UID 거부를 검사한다. 실제 rename 이후의 별도 crash point나 전원 손실, Kubernetes initContainer, Chaos Mesh 검증을 뜻하지 않는다.
-- StatefulSet ordinary 흐름의 manifest/init wiring, 정상 quorum의 learner catch-up 및 Node coordinator, 분산 HA의 old-writer 게시/GC 차단은 아직 완료되지 않았다. 이 문서는 Deployment ordinary 교체 지원을 주장하지 않으며, 아래 authority 경계를 모의 coordinator로 대체하지 않는다.
+- 현재 ordinary 흐름은 StatefulSet ordinal/authority에 결합되어 있고, manifest/init wiring, 정상 quorum의 learner catch-up 및 Node coordinator, 분산 HA의 old-writer 게시/GC 차단은 아직 완료되지 않았다. Deployment+NoPVC 목표는 구현·검증되지 않았다. 아래 authority 경계를 모의 coordinator로 대체하지 않는다.
 - 실제 CI Kind + Chaos Mesh 흐름과 ACK readback end-to-end 결과는 아직 없다. `operator-chaos` 또는 직접 Pod 삭제 테스트를 해당 증거로 간주하지 않는다.
 - 조건부 설계 검토 기록과 기존 안전 조건은 이 문서의 원문대로 유지한다. 전체 HA 구현·운영 자격에 대한 최종 Pro 승인은 아직 없다. 이 변경은 미출시 feature branch 작업이며 Rhiza 0.21 release에 포함되지 않았다.
 
@@ -24,10 +24,18 @@
 Rhiza는 오브젝트 스토리지를 복구 데이터의 진실 원천으로 사용하며, HA에서는
 QuePaxa 합의를 사용한다. Kubernetes 배포는 NoPVC를 전제로 한다.
 
-이 설계의 ordinary replacement contract는 NoPVC StatefulSet을 대상으로 한다. 일반 Pod
-장애는 Kubernetes와 Rhiza 내부에서 처리하고, 오퍼레이터는 정상 quorum 복귀가 불가능할
-때의 전체 세대 재해 복구만 제어한다. Deployment 기반 voter identity·ordinal 대체 동작은
-여기서 정의하거나 지원한다고 주장하지 않는다.
+원래 ordinary replacement 목표는 NoPVC Deployment다. 건강한 quorum에서의 일반 Pod
+교체는 Rhiza 내부에서 처리되어야 하며, 이 acceptance scenario에서는 오퍼레이터와
+standalone authority 모두 사용할 수 없어도 완료되어야 한다. 오퍼레이터는 명시적으로
+승인된 전체 세대 DR만 담당한다. 이는 현재 구현이 아니라 목표 계약이다. 현재 코드는
+StatefulSet/ordinal 및 원격 authority 경로에 결합되어 있어 이 목표를 충족하지 않는다.
+
+Deployment 구성원은 Pod ordinal이나 이름이 아니라 실제 Pod UID 기반 incarnation과
+Deployment/ReplicaSet 소유 관계로 판별해야 한다. 각 후보의 owner chain, source configuration,
+assignment를 정확히 검증하고 desired voter 수 및 unavailable 범위를 제한해야 한다. rollout 중
+여러 ReplicaSet이 동시에 존재할 때의 허용 정책은 미확정이며, 세대 혼합을 일률적으로 금지하는
+계약으로 정하지 않는다. 정확한 API/schema 변경은 아직 미확정이므로 이 문서는 새 프로토콜이나
+호환성 보장을 정의하지 않는다.
 
 데이터 복원과 투표권 획득은 별개의 절차다. initContainer가 데이터를 복원했다고
 기존 voter의 투표권을 즉시 되살려서는 안 된다. 이전 identity의 합의 참여와
@@ -40,15 +48,17 @@ OS 파일 잠금만으로 분산 HA의 이전 writer 차단이 해결되는 것�
 
 | 구성 요소 | 책임 | 맡지 않는 일 |
 |---|---|---|
-| Kubernetes StatefulSet | 원하는 Pod 수 유지, 컨테이너 재시작, 같은 ordinal 이름의 새 Pod 인스턴스 생성 | Pod 이름을 identity로 간주, voter 투표권 부여, 합의 상태 복원 판단 |
+| Kubernetes Deployment + ReplicaSet (목표) | 원하는 Pod 수와 rollout 유지, 새 Pod 인스턴스 생성 | Pod 이름을 identity로 간주, voter 투표권 부여, 합의 상태 복원 판단 |
 | mandatory initContainer | trusted assignment를 확인하고 공통 Go `PrepareRestore` 경로로 같은 Pod의 emptyDir DataDir을 준비 | quorum 대기, identity 승인, 멤버십 변경, 자체 fencing 증명 |
 | Rhiza Node 런타임 | 새 Pod UID의 정확한 assignment로 시작, learner catch-up, 정상 quorum의 REMOVE/ADD 조율, 쓰기·readiness 판단 | 증거 없는 identity 재사용이나 새 세대 생성 |
 | authority / fencing ledger | immutable workload·credential binding, 정확한 incarnation 승인, old identity closure와 proof/status 보존 | 합의 mutation 대행 또는 데이터 복원 |
-| 오퍼레이터 | 명시적으로 승인된 quorum-loss 전체 세대 DR 조율 | 정상 quorum에서의 ordinary 단일 voter 교체 |
+| 오퍼레이터 (목표) | 명시적으로 승인된 quorum-loss 전체 세대 DR 조율 | ordinary 교체의 필수 의존성 또는 정상 quorum에서의 단일 voter 교체 |
 
 일반 장애와 quorum-loss DR은 서로 다른 실행 경로다. 기존 오퍼레이터의 ordinary
 membership mutation은 실제 Node 경로와 회귀를 통합·검증한 뒤에만 제거한다.
 이 표와 아래 단계는 목표 책임 계약이며, 현재 구현 상태는 §12에 별도로 표시한다.
+ordinary 목표에서는 별도 fencer/authority 서비스가 장애 교체의 선행조건이 아니다. 이 목표는
+old-writer 차단이나 미확정 저장소 작업의 안전 조건을 약화하지 않는다.
 
 ## 3. identity와 현재 코드의 제약
 
@@ -81,7 +91,8 @@ ledger를 재생성하지 않는다. 최초 unmanaged bootstrap의 명시적 승
 
 현재 합의 코어의 NodeID는 문자열이며 StatefulSet ordinal 자체를 요구하지 않는다.
 그러나 현재 오퍼레이터는 초기 NodeID와 Pod 이름을 `<StatefulSet>-<ordinal>`로
-생성하고, `RHIZA_NODE_ID`가 `metadata.name`을 사용하도록 요구한다.
+생성하고, `RHIZA_NODE_ID`가 `metadata.name`을 사용하도록 요구한다. 이는 현재
+StatefulSet 구현의 제약이며 Deployment 목표의 identity 규칙이 아니다.
 
 현재 voter 등록은 로컬 `qlog/voter-identity.json`, WAL binding과 원격 등록을
 대조한다. 원격 등록은 있지만 원래 WAL 또는 로컬 identity가 없으면 시작을 거부한다.
@@ -116,20 +127,23 @@ ledger를 재생성하지 않는다. 최초 unmanaged bootstrap의 명시적 승
 이 표는 Pod의 emptyDir에 DataDir을 두는 구성을 전제로 한다. 동일 Pod라도 WAL이
 손상·삭제됐다면 기존 구성원으로 재개할 수 있다고 판단해서는 안 된다.
 
-### 정상 quorum: Node 소유의 same-ordinal 교체
+### 정상 quorum: Node 소유의 Deployment Pod 교체 (목표)
 
-이 경로에서 Pod 이름은 Kubernetes의 조회 키일 뿐 identity가 아니다. 새 Pod는 같은
-ordinal 이름을 가질 수 있지만 새 UID와 emptyDir을 가진 별도 incarnation이다. 이전
-NodeID/WAL을 그 Pod에 재사용하지 않는다. 기존 assignment가 없거나 불일치·unknown인
-경우에는 새로운 승인 신호로 해석하지 않고 차단한다.
+이 목표 경로에서 Pod 이름은 Kubernetes의 조회 키일 뿐 identity가 아니다. 새 Pod는 새 UID와
+emptyDir을 가진 별도 incarnation이며, 이전 NodeID/WAL을 재사용하지 않는다. 현재
+StatefulSet 중심 구현으로는 이 Deployment 경로를 지원하지 않는다. 기존 assignment가
+없거나 불일치·unknown인 경우에는 새로운 승인 신호로 해석하지 않고 차단한다.
 
-목표 흐름은 다음과 같다.
+아래는 필요한 목표 동작을 설명한다. 현재 후보의 authority assignment 절차가 operator와
+standalone authority에 의존한다는 점은 이 목표와의 미해결 차이다. 둘 다 없는 조건에서
+사용할 승인·증거 경로는 아직 정의되지 않았으므로, 아래 현재 후보 절차를 해당 경로의
+완성된 설계로 간주하지 않는다.
 
 1. Kubernetes가 새 UID의 Pod를 만들고 mandatory init은 앱과 같은 image 및 DataDir에
    `rhiza --prepare-restore`를 실행한다. init은 고정 profile과 downward-API Pod UID를
    사용하고, authority의 projected token/CA를 통해 자기 assignment를 읽기만 한다.
    런타임 admin token, 전체 private peer-token map, store credential은 init에 전달하지 않는다.
-2. authority는 bootstrap 이후의 정확한 ordinal/PodUID, retained assignment, immutable
+2. 현재 후보에서는 authority가 bootstrap 이후의 정확한 ordinal/PodUID, retained assignment, immutable
    generated credential Secret UID, source/workload/profile binding을 검증한다. 실제
    credential handoff는 해당 assignment로 제한하며, Secret 404나 UID 교체는 재발급 허가가
    아니다. init은 shared Go `PrepareRestore`를 사용해 checkpoint와 인증된 suffix를 준비하고
@@ -137,8 +151,13 @@ NodeID/WAL을 그 Pod에 재사용하지 않는다. 기존 assignment가 없거�
 3. Node는 새 incarnation을 learner로 등록하고 certified prefix를 따라잡는다. 각 surviving
    voter는 같은 immutable repair/phase request를 재개할 수 있지만 각 Node에는 단일 worker만
    둔다. 별도 coordinator lease나 새 서비스는 필요하지 않다.
-4. authority는 정확한 이전 PodUID/NodeID/WAL의 closure 및 runtime·recreation·storage proof를
-   보존하고 승인한다. Node는 기존 합의 프로토콜로 3→2 REMOVE, 이후 2→3 ADD를 실행한다.
+4. ordinary 목표는 remote authority가 없는 상태에서도 이전 identity가 합의와 canonical
+   storage에 영향을 줄 수 없음을 보장한 뒤 교체를 진행하는 것이다. 이를 입증하는 데 물리적
+   프로세스 종료나 drain이 항상 필요한 구현 조건이라고 정하지 않는다. 그런 증거는 효과
+   배제가 독립적으로 보장되는 경우 사용할 수 있다. 관련 저장소 I/O가 진행 중이거나 결과가
+   unknown이면 해결될 때까지 성공 처리나 다음 단계 진행을 보류한다. 현재 후보의 authority 기반
+   closure/proof 절차는 목표와 다르며, Node는 기존 합의 프로토콜로 3→2 REMOVE, 이후 2→3 ADD를
+   실행한다.
    각 단계의 operation, request hash, abort revision, candidate assignment와 terminal ACK를
    분리해 보존하며 conflicting retry는 거부한다.
 5. 실제 voter 구성과 SQL/Graph ACK readback, archive durability가 확인된 뒤 readiness를
@@ -152,6 +171,10 @@ outcome은 main admission과 fencing proof에서 Pending으로 남는다. 완료
 실행의 원격 작업이 없었다는 뜻이지 과거 실행 정산을 대신하지 않는다.
 
 ## 5. initContainer 계약
+
+초기 설계의 “단독 노드 복구 API 재사용”은 API/코드 경로 재사용 목표로 유지하되, 이를
+Local archive 형식과 HA certified archive 형식의 호환성으로 해석하지 않는다. 그 재사용
+범위와 구현 가능성은 아직 검증 대상이며, 이 문서는 변환 경로나 새 복구 프로토콜을 정의하지 않는다.
 
 HA 전용 Go API `PrepareRestore(ctx, Config)`와 실행 파일의 `--prepare-restore`
 early-exit 경로는 unreleased feature candidate에 있다. 이 경로는 `Local` 모드를 거부하고,
@@ -254,7 +277,9 @@ Rhiza가 보고할 복구 상태의 의미는 다음처럼 구분한다. 필드�
 ## 8. 전체 복구와 이전 writer 차단
 
 정상 quorum이 복귀할 수 없고 명시적 정책/증거가 이를 승인한 경우에만 오퍼레이터가 다음
-whole-generation DR 경로를 조율한다. timeout, NotReady, 단일 peer의 성공/실패만으로 DR을
+whole-generation DR 경로를 조율한다. 목표 운영에서 오퍼레이터는 DR 전용이며 ordinary
+replacement의 필수 구성 요소가 아니다. 현재 remote-authority 의존 구현은 이 목표와 다르다.
+timeout, NotReady, 단일 peer의 성공/실패만으로 DR을
 선택하지 않는다. DR init은 ordinary public `PrepareRestore`의 learner/self-member 규칙을
 전역 완화하지 않으며, 정확한 Transition/source successor reservation, immutable target
 assignment/credential, selected archive view의 generation anchor, certified barrier를 대조한
@@ -279,7 +304,8 @@ anchor만으로 실제 materialization 또는 활성화를 완료했다고 간�
 차단 이후는 단순한 관측 철회와 다르다. 오퍼레이터 재시작이나 실패 시에도 저장된
 복구 단계에서 안전하게 재개해야 한다.
 
-별도 fencer 프로세스는 필수 구현 형태가 아니다. 필수인 것은 이전 세대가 정식
+별도 standalone fencer 프로세스는 ordinary recovery의 목표상 필수 의존성이 아니다.
+필수인 것은 이전 세대가 정식
 HEAD·체크포인트 등 활성 상태를 게시하거나 새 세대의 데이터를 GC하지 못한다는 보장이다.
 게시 전에 권한을 한 번 읽거나 오퍼레이터에게 중단 메시지를 보내는 것만으로는 부족하다.
 멈췄다가 재개한 프로세스와 늦게 완료되는 업로드도 처리해야 한다.
@@ -292,26 +318,35 @@ HEAD·체크포인트 등 활성 상태를 게시하거나 새 세대의 데이�
 Pod DELETE 성공, Pod 목록에서 사라짐, Node NotReady는 이전 프로세스의 종료나
 쓰기 차단을 증명하지 않는다.
 
-## 9. StatefulSet과 롤링 업데이트
+## 9. Deployment과 롤링 업데이트: 목표와 현재 제한
 
-ordinary replacement는 이 설계에서 StatefulSet의 ordinal·PodName lookup을 이용하되,
-consensus identity를 canonical NodeID와 실제 PodUID로 구분한다. 같은 PodName/new UID는
-같은 NodeID가 아니며, 주소 검색 결과만으로 멤버를 인증하지 않는다. 승격된 UID-derived
-learner도 보존된 assignment와 현재 membership을 통해 다음 survivor closure에 참여할 수
-있어야 한다. 미등록 또는 retired UID를 PodName만으로 inventory에 합치지 않는다.
+목표 workload는 NoPVC Deployment다. consensus identity는 ordinal이 아니라 canonical
+NodeID와 실제 PodUID/incarnation에 결합한다. Deployment UID 및 각 후보의 ReplicaSet owner chain을
+검증한다. 서로 다른 rollout generation의 후보를 함께 허용할지는 아직 정하지 않았다. 어느
+정책에서든 exact source configuration과 candidate authorization을 확인하고 unavailable 범위를
+제한해야 한다.
+같은 PodName/new UID는 같은 identity가 아니며, 주소 검색 결과만으로 멤버를 인증하지 않는다.
+승격된 UID-derived learner도 보존된 assignment와 현재 membership을 통해 다음 survivor
+closure에 참여할 수 있어야 한다. 미등록 또는 retired UID를 PodName만으로 inventory에
+합치지 않는다.
+
+현재 automatic/bootstrap 경로는 StatefulSet UID, ordinal, PodName을 사용한다. 이 경로는
+Deployment owner chain을 검증하지 않으며 Deployment 지원의 증거가 아니다. 이 문서는
+StatefulSet을 목표로 재정의하지 않는다.
 
 readiness는 프로세스 실행이 아니라 learner catch-up, 합의된 membership, 쓰기·readback과
 복구 settlement를 반영한다. 롤링 업데이트 중 동시 replacement가 여러 개의 voter 손실을
 만들지 않도록 동일 source repair를 직렬화하고, 같은 assignment/request만 재시도한다.
-구체적인 StatefulSet update strategy와 readiness 수치는 별도 qualification 전까지 확정하지
+구체적인 Deployment rollout strategy와 readiness 수치는 별도 qualification 전까지 확정하지
 않는다.
 
 ## 10. 기존 API와 durable state 경계
 
-새 CRD나 per-Pod repair controller를 ordinary 경로에 추가하지 않는다. 기존 immutable
-workload binding, auto-control 상태, authority ledger reservation과 Node membership journal을
-재사용한다. 관리 정책·상태 schema 확대가 필요하다는 근거가 검증되기 전까지는 기존 API 경계에
-머문다.
+기존 immutable workload binding, auto-control 상태, authority ledger reservation과 Node
+membership journal을 우선 재사용하며, 새 CRD나 일반 목적 framework를 전제하지 않는다. 현재
+이 상태는 StatefulSet 중심이다. Deployment UID/ReplicaSet generation을 기존 경계에 안전하게
+결합할 수 있는지는 검증해야 한다. 구체적인 API/state 확장은 특정 증거 요구로 꼭 필요한 최소
+변경임이 확인된 경우에만 고려하며, schema와 호환성 정책은 아직 정해지지 않았다.
 
 ## 11. 구현 순서와 합격 기준
 
@@ -321,19 +356,24 @@ workload binding, auto-control 상태, authority ledger reservation과 Node memb
    authority proof에 연결한다.
 3. 정상 quorum의 Node-owned learner catch-up, old identity closure, 3→2 REMOVE→2→3 ADD,
    exact retry와 ACK/archive readback을 완성한다.
-4. ordinary 경로를 operator replicas 0으로 검증한 뒤에만 operator membership mutation을
-   제거한다.
+4. Deployment+NoPVC ordinary 경로를 operator와 standalone authority replicas 모두 0인
+   조건에서 검증한다. 이 조건은 목표 합격 기준이며 현재 구현은 통과하지 못한다.
 5. 별도로 quorum-loss DR의 source closure, selected anchor/base/barrier 검증, 세대별 게시/GC
    차단과 재개 프로토콜을 검증한다.
 
 검증에는 다음을 포함한다.
 
-- 같은 Pod의 컨테이너 재시작과 새 Pod의 emptyDir 유실을 구분한다.
+- Deployment/ReplicaSet owner chain과 실제 Pod UID를 검증하고, 같은 Pod의 컨테이너 재시작과
+  새 Pod의 emptyDir 유실을 구분한다. StatefulSet 리소스에 의존하지 않는다.
+- healthy quorum의 Pod replacement가 operator와 standalone authority 모두 없는 상태에서
+  완료되고, operator는 DR 전용 경로로 남는다.
 - 단일 Pod 교체는 오퍼레이터의 멤버 교체 개입 없이 완료된다.
 - 동시 교체·롤링 업데이트 중 투표권 중복과 quorum 손실을 방지한다.
 - 생존 peer 하나의 데이터를 보존하며, 이를 정상 quorum으로 오인하지 않는다.
 - 네트워크 단절만으로 이전 세대가 죽었다고 판정하지 않는다.
-- 오래된 프로세스 복귀·늦은 업로드·GC가 새 세대에 영향을 주지 못한다.
+- 오래된 프로세스 복귀·늦은 업로드·GC가 새 세대에 영향을 주지 못한다. stale writer 차단,
+  미확정/unknown I/O 결과, 저장소 작업 quiescence 및 durable evidence 요구는 어떤 구성에서도
+  면제되지 않는다. 증거 부족이나 unknown은 성공으로 간주하지 않고 차단/Pending으로 남긴다.
 - 오퍼레이터 재시작·복구 중단 후에도 전체 복구가 중복 실행되지 않는다.
 - 실제 pinned Chaos Mesh 검증은 주입된 장애와 복구 양쪽을 확인한다.
 - VersityGW fixture는 실제 S3 SDK 경로에 한정한다. S3/GCS/Azure emulator qualification은
@@ -345,9 +385,11 @@ workload binding, auto-control 상태, authority ledger reservation과 Node memb
 - old incarnation의 정상 Stage/읽기 control과 replacement 뒤 실제 QUIC peer 인증 거부를
   구분한다. 정확한 request ID/value가 독립 archive에 없는 것은 그 범위의 기록 부재일 뿐,
   원격 WAL에 아무 효과도 없었다는 증거가 아니다.
-- 3→2→3의 Node-driven membership 결과, init의 retained settlement, old PodUID runtime의
-  실제 종료, old credential의 write 거부, ACK된 SQL/Graph의 archive와 readback을 각각 관측한다.
-  하나라도 unknown이면 qualification 결과는 Pending/Fail이다.
+- 3→2→3의 Node-driven membership 결과, init의 retained settlement, old identity의 consensus와
+  canonical-storage 효과 배제, old credential의 write 거부, ACK된 SQL/Graph의 archive와
+  readback을 각각 관측한다. 물리적 프로세스 종료는 독립된 효과 배제가 없는 경우 필요한
+  증거로 취급할 수 있지만, 보편적인 구현 계약은 아니다. 관련 I/O 결과가 unknown이면
+  qualification 결과는 Pending/Fail이다.
 
 최종 목표는 다음 두 가지다.
 
@@ -363,7 +405,10 @@ checkout의 fencing qualification fixture도 실제 CI/Kind/Chaos Mesh 실행이
 계약 검증으로 간주하지 않는다. GCS/Azure의 실제 SDK 계약이나 production cloud parity를
 로컬 VersityGW/S3 결과에서 추론하지 않는다.
 
-현재 fixture 후보는 기존 `examples/recovery-anchor` 서비스를 cooperative-fencing Kind job에
+현재 구현은 StatefulSet/ordinal 및 별도 remote authority 구성에 결합되어 있으며,
+Deployment+NoPVC ordinary recovery와 operator 및 authority 부재 조건은 구현·검증되지 않았다.
+이는 acceptance target의 변경이 아니라 구현 제한이다. 현재 fixture 후보는 기존
+`examples/recovery-anchor` 서비스를 cooperative-fencing Kind job에
 연결하고, completed recovery의 정확한 Request/Receipt, retained DR-successor assignment,
 init 대기 중의 retained assignment/immutable credential membership 관측, init 종료, actual
 runtime WAL binding 및 target quorum/readback을 확인하도록 확장 중이다.

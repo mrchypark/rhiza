@@ -148,11 +148,24 @@ func TestRecoveryAnchorDoesNotExpandFencerRBAC(t *testing.T) {
 		if metadata["name"] != "rhiza-fencer" {
 			continue
 		}
+		recoveryReadRules := 0
 		for _, raw := range doc["rules"].([]any) {
 			rule := yamlMap(t, raw)
-			for _, resource := range rule["resources"].([]any) {
+			resources := rule["resources"].([]any)
+			apiGroups := rule["apiGroups"].([]any)
+			verbs := rule["verbs"].([]any)
+			for _, resource := range resources {
 				if resource == "nodes" {
 					t.Fatal("recovery-anchor wiring must not grant node access")
+				}
+				if resource == "rhizarecoveries" {
+					recoveryReadRules++
+					if len(resources) != 1 || len(apiGroups) != 1 || apiGroups[0] != "rhiza.mrchypark.dev" || len(verbs) != 1 || verbs[0] != "get" {
+						t.Fatalf("fencer recovery access must be a separate exact GET-only rule: resources=%v apiGroups=%v verbs=%v", resources, apiGroups, verbs)
+					}
+				}
+				if resource == "rhizarecoveries/status" {
+					t.Fatal("fencer recovery access must not include status subresource permissions")
 				}
 				if resource == "pods" || resource == "secrets" {
 					allowed := map[string]bool{"get": true, "list": true}
@@ -166,6 +179,9 @@ func TestRecoveryAnchorDoesNotExpandFencerRBAC(t *testing.T) {
 					}
 				}
 			}
+		}
+		if recoveryReadRules != 1 {
+			t.Fatalf("fencer must have one separate GET-only rhizarecoveries rule, found %d", recoveryReadRules)
 		}
 		return
 	}

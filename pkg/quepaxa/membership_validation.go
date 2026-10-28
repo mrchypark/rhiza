@@ -53,7 +53,7 @@ func validateMembershipHistory(initial Cluster, history MembershipRecord) (*Core
 			return nil, fmt.Errorf("transition %d terminal: %w", i, err)
 		}
 		term, ok, err := decodeReconfiguration(terminal.Proposal.Value)
-		if err != nil || !ok || !term.Terminal || term.Abort || terminal.Slot != f.TerminalSlot || term.Freeze != f.Freeze || term.TerminalSlot != f.TerminalSlot || !sameCluster(term.Target, f.Target) {
+		if err != nil || !ok || !term.Terminal || term.Abort || terminal.Slot != f.TerminalSlot || term.Freeze != f.Freeze || term.TerminalSlot != f.TerminalSlot || term.OperationDigest != f.OperationDigest || !sameCluster(term.Target, f.Target) {
 			return nil, fmt.Errorf("transition %d has invalid terminal binding", i)
 		}
 		if err := verifier.validateDecisionForRecovery(terminal, true); err != nil {
@@ -110,7 +110,7 @@ func validateMembershipHistory(initial Cluster, history MembershipRecord) (*Core
 			return nil, fmt.Errorf("abort terminal: %w", err)
 		}
 		term, ok, err := decodeReconfiguration(terminal.Proposal.Value)
-		if err != nil || !ok || !term.Terminal || !term.Abort || terminal.Slot != f.TerminalSlot || term.Freeze != f.Freeze || term.TerminalSlot != f.TerminalSlot || !sameCluster(term.Target, f.Target) {
+		if err != nil || !ok || !term.Terminal || !term.Abort || terminal.Slot != f.TerminalSlot || term.Freeze != f.Freeze || term.TerminalSlot != f.TerminalSlot || term.OperationDigest != f.OperationDigest || !sameCluster(term.Target, f.Target) {
 			return nil, fmt.Errorf("abort has invalid terminal binding")
 		}
 		if err := verifier.validateDecisionForRecovery(terminal, true); err != nil {

@@ -933,7 +933,7 @@ func podChaosForTarget(targetUID string) (obj, error) {
 	}, nil
 }
 
-func replaceInitialPodWithChaos(ctx context.Context, oldMembership network.MembershipStatus, adminToken, out string, event func(string, obj)) (resultErr error) {
+func replaceInitialPodWithChaos(ctx context.Context, oldMembership network.MembershipStatus, stsUID, bindingUID, adminToken, out string, event func(string, obj)) (resultErr error) {
 	if err := requireOperatorStopped(ctx); err != nil {
 		return err
 	}
@@ -1077,10 +1077,21 @@ func replaceInitialPodWithChaos(ctx context.Context, oldMembership network.Membe
 	}); err != nil {
 		return err
 	}
+	if err := checkRows(ctx, newForward, adminToken, `[[1,"acknowledged"]]`); err != nil {
+		return fmt.Errorf("linearizable SQL readback after same-ordinal replacement: %w", err)
+	}
+	if err := checkGraphRows(ctx, newForward, adminToken, `[[1,"acknowledged"]]`); err != nil {
+		return fmt.Errorf("linearizable Graph readback after same-ordinal replacement: %w", err)
+	}
+	oldTarget := operator.FenceTarget{NodeID: string(oldMembership.NodeID), Pod: "rhiza-0", PodUID: oldUID, WALIdentity: oldMembership.WALIdentity}
+	newTarget := operator.FenceTarget{NodeID: string(currentMembership.NodeID), Pod: "rhiza-0", PodUID: newUID, WALIdentity: currentMembership.WALIdentity}
+	if !retainedReplacementRepairCompletion(ctx, stsUID, bindingUID, oldTarget, newTarget, oldMembership.ConfigID, oldMembership.AbortSlot, currentMembership, voterStatuses) {
+		return fmt.Errorf("same-ordinal replacement lacks one exact pinned-ledger accepted ADD completion")
+	}
 	if err := requireOperatorStopped(ctx); err != nil {
 		return err
 	}
-	event("podchaos_replacement_recovered", obj{"oldPodUID": oldUID, "newPodUID": newUID, "oldNodeID": oldMembership.NodeID, "newNodeID": currentMembership.NodeID, "clusterID": currentMembership.ClusterID, "configID": currentMembership.ConfigID, "voters": currentMembership.Voters, "voterStatuses": voterStatuses, "initOperationID": nested(replacement, "metadata", "annotations", "rhiza.mrchypark.dev/prepare-operation-id")})
+	event("podchaos_replacement_recovered", obj{"oldPodUID": oldUID, "newPodUID": newUID, "oldNodeID": oldMembership.NodeID, "newNodeID": currentMembership.NodeID, "clusterID": currentMembership.ClusterID, "configID": currentMembership.ConfigID, "voters": currentMembership.Voters, "voterStatuses": voterStatuses, "rows": 1, "initOperationID": nested(replacement, "metadata", "annotations", "rhiza.mrchypark.dev/prepare-operation-id")})
 	return nil
 }
 
@@ -1680,9 +1691,73 @@ func qualify(ctx context.Context) (resultErr error) {
 		return fmt.Errorf("pre-fault control did not use the captured old and survivor public identities")
 	}
 	event("retired_peer_probe_control", obj{"oldIdentity": oldIdentity, "peerProbe": controlProbe})
-	if err := replaceInitialPodWithChaos(ctx, oldMembership, adminToken, out, event); err != nil {
+	seedForward, err := startForward(ctx, "rhiza-0", out)
+	if err != nil {
 		return err
 	}
+	if _, err = call(ctx, seedForward, "/sql/execute", obj{"request_id": "fencing-create", "sql": "CREATE TABLE fencing_items (id INTEGER PRIMARY KEY, value TEXT)"}, adminToken); err == nil {
+		_, err = call(ctx, seedForward, "/sql/execute", obj{"request_id": "fencing-ack", "sql": "INSERT INTO fencing_items VALUES (1, 'acknowledged')"}, adminToken)
+	}
+	if err == nil {
+		_, err = call(ctx, seedForward, "/sql/execute", obj{"request_id": "anchor-evidence-create", "sql": "CREATE TABLE trust_state (id INTEGER PRIMARY KEY, epoch INTEGER NOT NULL, token TEXT NOT NULL)"}, adminToken)
+	}
+	if err == nil {
+		_, err = call(ctx, seedForward, "/sql/execute", obj{"request_id": "anchor-evidence-seed", "sql": "INSERT INTO trust_state VALUES (1, 1, 'initial')"}, adminToken)
+	}
+	if err == nil {
+		_, err = call(ctx, seedForward, "/graph/execute", obj{"request_id": "fencing-graph-ack", "cypher": "CREATE (:FencingItem {id: 1, value: 'acknowledged'})"}, adminToken)
+	}
+	if err != nil {
+		seedForward.close()
+		return fmt.Errorf("seed durable state before two replacement cycles: %w", err)
+	}
+	if err := checkRows(ctx, seedForward, adminToken, `[[1,"acknowledged"]]`); err != nil {
+		seedForward.close()
+		return fmt.Errorf("initial SQL ACK readback: %w", err)
+	}
+	if err := checkGraphRows(ctx, seedForward, adminToken, `[[1,"acknowledged"]]`); err != nil {
+		seedForward.close()
+		return fmt.Errorf("initial Graph ACK readback: %w", err)
+	}
+	seedForward.close()
+	if err := replaceInitialPodWithChaos(ctx, oldMembership, stsUID, bindingUID, adminToken, out, event); err != nil {
+		return err
+	}
+	secondForward, err := startForward(ctx, "rhiza-0", out)
+	if err != nil {
+		return err
+	}
+	secondOldMembership, err := readMembership(ctx, secondForward, adminToken)
+	secondForward.close()
+	if err != nil || secondOldMembership.NodeID == "" || !secondOldMembership.Voting || secondOldMembership.Pending || secondOldMembership.ConfigID <= oldMembership.ConfigID {
+		return fmt.Errorf("first replacement did not produce a live same-ordinal voter for the second cycle: %v", err)
+	}
+	secondOldPod, err := get(ctx, "pod", "rhiza-0")
+	if err != nil {
+		return err
+	}
+	secondOldUID := text(nested(secondOldPod, "metadata", "uid"))
+	if secondOldUID == "" || secondOldUID == oldIdentity.PodUID {
+		return fmt.Errorf("second cycle did not capture the first replacement Pod UID")
+	}
+	if err := replaceInitialPodWithChaos(ctx, secondOldMembership, stsUID, bindingUID, adminToken, out, event); err != nil {
+		return fmt.Errorf("second same-ordinal replacement cycle: %w", err)
+	}
+	secondResultPod, err := get(ctx, "pod", "rhiza-0")
+	if err != nil {
+		return err
+	}
+	secondResultForward, err := startForward(ctx, "rhiza-0", out)
+	if err != nil {
+		return err
+	}
+	secondResultMembership, err := readMembership(ctx, secondResultForward, adminToken)
+	secondResultForward.close()
+	if err != nil || secondResultMembership.ConfigID <= secondOldMembership.ConfigID || secondResultMembership.NodeID == secondOldMembership.NodeID {
+		return fmt.Errorf("second same-ordinal replacement lacks a new voter identity and config: %v", err)
+	}
+	secondResultTarget := operator.FenceTarget{NodeID: string(secondResultMembership.NodeID), Pod: "rhiza-0", PodUID: text(nested(secondResultPod, "metadata", "uid")), WALIdentity: secondResultMembership.WALIdentity}
+	event("podchaos_second_same_ordinal_cycle_accepted", obj{"oldUIDs": []string{secondOldUID}, "target": secondResultTarget, "rows": 1, "voters": len(secondResultMembership.Voters), "configID": secondResultMembership.ConfigID})
 	postFaultMembership, statusErr := membershipForNode(ctx, destination.ID, []string{"rhiza-1", "rhiza-2"}, adminToken, out)
 	if statusErr != nil || postFaultMembership.ClusterID != "chaos-source" || postFaultMembership.ConfigID <= oldMembership.ConfigID {
 		return fmt.Errorf("post-fault survivor membership could not be bound to the replaced incarnation: %v", statusErr)
@@ -1709,21 +1784,6 @@ func qualify(ctx context.Context) (resultErr error) {
 		return err
 	}
 	defer f.close()
-	if _, err = call(ctx, f, "/sql/execute", obj{"request_id": "fencing-create", "sql": "CREATE TABLE fencing_items (id INTEGER PRIMARY KEY, value TEXT)"}, adminToken); err != nil {
-		return err
-	}
-	if _, err = call(ctx, f, "/sql/execute", obj{"request_id": "fencing-ack", "sql": "INSERT INTO fencing_items VALUES (1, 'acknowledged')"}, adminToken); err != nil {
-		return err
-	}
-	if _, err = call(ctx, f, "/sql/execute", obj{"request_id": "anchor-evidence-create", "sql": "CREATE TABLE trust_state (id INTEGER PRIMARY KEY, epoch INTEGER NOT NULL, token TEXT NOT NULL)"}, adminToken); err != nil {
-		return err
-	}
-	if _, err = call(ctx, f, "/sql/execute", obj{"request_id": "anchor-evidence-seed", "sql": "INSERT INTO trust_state VALUES (1, 1, 'initial')"}, adminToken); err != nil {
-		return err
-	}
-	if _, err = call(ctx, f, "/graph/execute", obj{"request_id": "fencing-graph-ack", "cypher": "CREATE (:FencingItem {id: 1, value: 'acknowledged'})"}, adminToken); err != nil {
-		return err
-	}
 	if err := checkRows(ctx, f, adminToken, `[[1,"acknowledged"]]`); err != nil {
 		return fmt.Errorf("SQL ACK readback while operator is stopped: %w", err)
 	}
@@ -3253,6 +3313,88 @@ func retainedOnlineRepairCompletionFromMaps(maps obj, operationID, stsUID, bindi
 	return false
 }
 
+func retainedReplacementRepairCompletion(ctx context.Context, stsUID, bindingUID string, old, candidate operator.FenceTarget, sourceConfigID uint, abortSlot quepaxa.Slot, current network.MembershipStatus, voters []network.MembershipStatus) bool {
+	maps, err := get(ctx, "configmaps", "")
+	if err != nil {
+		return false
+	}
+	return retainedReplacementRepairCompletionFromMaps(maps, stsUID, bindingUID, old, candidate, sourceConfigID, abortSlot, current, voters)
+}
+
+func retainedReplacementRepairCompletionFromMaps(maps obj, stsUID, bindingUID string, old, candidate operator.FenceTarget, sourceConfigID uint, abortSlot quepaxa.Slot, current network.MembershipStatus, voters []network.MembershipStatus) bool {
+	if old.Pod == "" || candidate.Pod != old.Pod || old.PodUID == "" || candidate.PodUID == "" || candidate.PodUID == old.PodUID ||
+		old.NodeID == "" || candidate.NodeID == "" || candidate.NodeID == old.NodeID || old.WALIdentity == "" || candidate.WALIdentity == "" {
+		return false
+	}
+	items, _ := maps["items"].([]any)
+	matches := 0
+	for _, item := range items {
+		ledgerUID := text(nested(item, "metadata", "uid"))
+		data := text(nested(item, "data", "ledger.json"))
+		if ledgerUID == "" || data == "" {
+			continue
+		}
+		var state fenceLedgerState
+		if json.Unmarshal([]byte(data), &state) != nil || state.StatefulSetUID != stsUID || state.Ledger.SourceClusterID != oldSourceClusterID {
+			continue
+		}
+		records := make(map[string]fencing.MembershipRepairRecord, len(state.Ledger.MembershipRepairHistory)+1)
+		for operationID, record := range state.Ledger.MembershipRepairHistory {
+			records[operationID] = record
+		}
+		if state.Ledger.MembershipRepair != nil {
+			records[state.Ledger.MembershipRepair.Authorization.OperationID] = *state.Ledger.MembershipRepair
+		}
+		for operationID, record := range records {
+			auth := record.Authorization
+			if auth.LedgerUID != ledgerUID || auth.Membership.ConfigID != sourceConfigID || auth.ExpectedAbortSlot == nil || *auth.ExpectedAbortSlot != abortSlot ||
+				!membershipRepairCompletionAccepted(record, operationID, stsUID, bindingUID, old) ||
+				!replacementCompletionMatchesCurrent(record.Progress.Completion.Request, candidate, current, voters) {
+				continue
+			}
+			matches++
+		}
+	}
+	return matches == 1
+}
+
+func replacementCompletionMatchesCurrent(request network.MembershipRepairCompletionRequest, candidate operator.FenceTarget, current network.MembershipStatus, voters []network.MembershipStatus) bool {
+	if candidate.Pod == "" || candidate.PodUID == "" || candidate.NodeID == "" || candidate.WALIdentity == "" ||
+		request.CandidatePodUID != candidate.PodUID || string(request.CandidateMember.ID) != candidate.NodeID || request.CandidateMember.WALIdentity != candidate.WALIdentity ||
+		request.Target.ConfigID != current.ConfigID || current.NodeID != quepaxa.NodeID(candidate.NodeID) || current.WALIdentity != candidate.WALIdentity ||
+		current.ClusterID != oldSourceClusterID || !current.Voting || current.Pending || len(voters) != len(request.Target.Members) {
+		return false
+	}
+	members := make(map[quepaxa.NodeID]quepaxa.Member, len(request.Target.Members))
+	for _, member := range request.Target.Members {
+		if member.ID == "" || member.WALIdentity == "" {
+			return false
+		}
+		if _, exists := members[member.ID]; exists {
+			return false
+		}
+		members[member.ID] = member
+	}
+	seen := make(map[quepaxa.NodeID]bool, len(voters))
+	for _, status := range voters {
+		member, ok := members[status.NodeID]
+		if !ok || seen[status.NodeID] || status.ClusterID != oldSourceClusterID || status.ConfigID != request.Target.ConfigID || status.WALIdentity == "" ||
+			member.WALIdentity != status.WALIdentity || !status.Voting || status.Pending || !sameNodeSet(status.Voters, nodeSet(request.Target.Members)) {
+			return false
+		}
+		seen[status.NodeID] = true
+	}
+	return len(seen) == len(members)
+}
+
+func nodeSet(members []quepaxa.Member) map[quepaxa.NodeID]bool {
+	set := make(map[quepaxa.NodeID]bool, len(members))
+	for _, member := range members {
+		set[member.ID] = true
+	}
+	return set
+}
+
 func onlineRepairQualificationReady(child operator.Resource, authorityAccepted bool) bool {
 	return child.Status.Phase == "Complete" && child.Status.Membership != nil && child.Status.Membership.Phase == "Complete" && authorityAccepted
 }
@@ -3308,6 +3450,8 @@ func membershipRepairCompletionAccepted(record fencing.MembershipRepairRecord, o
 	}
 	return phase != nil && phase.Kind == fencing.MembershipRepairAdd && candidate != nil && candidate.Member != nil && *candidate.Member == request.CandidateMember &&
 		candidate.Assignment.PodName == old.Pod && candidate.Assignment.PodUID == request.CandidatePodUID && candidate.Assignment.NodeID == string(request.CandidateMember.ID) &&
+		request.SourceConfigID == phase.Change.ExpectedConfigID && request.AbortSlot != nil && phase.AbortSlot != nil &&
+		*request.AbortSlot == phase.Change.ExpectedAbortSlot && *request.AbortSlot == *phase.AbortSlot &&
 		phase.Change.Add != nil && *phase.Change.Add == request.CandidateMember && phase.Change.OperationID == request.JournalOperationID &&
 		phase.CandidatePodUID == request.CandidatePodUID && fencing.BootstrapAssignmentDigest(candidate.Assignment) == request.CandidateBindRef && result != nil && result.Outcome == "completed" &&
 		result.JournalOperationID == request.JournalOperationID && result.JournalRequestHash == request.JournalRequestHash && bytes.Equal(encoded(result.Target), encoded(request.Target)) &&

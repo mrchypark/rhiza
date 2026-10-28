@@ -3,8 +3,8 @@ package quepaxa
 import (
 	"bytes"
 	"crypto/sha256"
-	"encoding/binary"
 	"encoding/base64"
+	"encoding/binary"
 	"encoding/json"
 	"fmt"
 )
@@ -85,12 +85,13 @@ type Cluster struct {
 }
 
 type reconfigurationValue struct {
-	Terminal     bool     `json:"terminal,omitempty"`
-	Abort        bool     `json:"abort,omitempty"`
-	Freeze       Slot     `json:"freeze"`
-	TerminalSlot Slot     `json:"terminal_slot"`
-	Target       Cluster  `json:"target"`
-	PrefixHash   [32]byte `json:"prefix_hash"`
+	Terminal        bool     `json:"terminal,omitempty"`
+	Abort           bool     `json:"abort,omitempty"`
+	Freeze          Slot     `json:"freeze"`
+	TerminalSlot    Slot     `json:"terminal_slot"`
+	Target          Cluster  `json:"target"`
+	PrefixHash      [32]byte `json:"prefix_hash"`
+	OperationDigest [32]byte `json:"operation_digest,omitzero"`
 }
 
 func encodeReconfiguration(value reconfigurationValue) ([]byte, error) {

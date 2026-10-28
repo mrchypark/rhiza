@@ -837,3 +837,169 @@ func foregroundLearnEventKey(event string) string {
 	}
 	return node + ":" + slot
 }
+
+func TestNodeOpenStartsFreshLearnerWithoutFencingAuthority(t *testing.T) {
+	t.Setenv("RHIZA_FENCE_SOCKET", "")
+	t.Setenv("RHIZA_FENCE_TICKET", "")
+	binary := os.Getenv("RHIZA_VERSITYGW_BIN")
+	if binary == "" {
+		t.Skip("set RHIZA_VERSITYGW_BIN to a pinned local Versity Gateway binary")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+	t.Cleanup(cancel)
+
+	gateway, err := versityfixture.Start(ctx, binary, t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		closeCtx, stop := context.WithTimeout(context.Background(), 7*time.Second)
+		defer stop()
+		if err := gateway.Close(closeCtx); err != nil {
+			t.Errorf("stop local Versity Gateway: %v", err)
+		}
+	})
+
+	endpoint := strings.TrimPrefix(gateway.Endpoint, "http://")
+	const region = "us-east-1"
+	bucket := fmt.Sprintf("rhiza-learner-no-authority-%d", time.Now().UnixNano())
+	client, err := minio.New(endpoint, &minio.Options{
+		Creds: credentials.NewStaticV4(gateway.AccessKey, gateway.SecretKey, ""), Secure: false, Region: region,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := client.MakeBucket(ctx, bucket, minio.MakeBucketOptions{Region: region}); err != nil {
+		t.Fatal(err)
+	}
+
+	const clusterID = "learner-no-authority"
+	const adminToken = "learner-no-authority-admin"
+	ids := []quepaxa.NodeID{"source-a", "source-b", "source-c"}
+	tokens := []string{"learner-no-authority-peer-a", "learner-no-authority-peer-b", "learner-no-authority-peer-c"}
+	addresses := make([]string, len(ids))
+	members := make([]quepaxa.Member, len(ids))
+	for i, id := range ids {
+		addresses[i] = learnerFoundationUDPAddress(t)
+		members[i] = peerMember(clusterID, id, tokens[i])
+		members[i].PeerURL = "quic://" + addresses[i]
+	}
+
+	nodes := make([]*Node, 0, len(ids)+1)
+	t.Cleanup(func() {
+		for _, node := range nodes {
+			if err := node.Shutdown(); err != nil {
+				t.Errorf("shutdown node %q: %v", node.config.NodeID, err)
+			}
+		}
+	})
+	prefix := fmt.Sprintf("rhiza-learner-no-authority/%d", time.Now().UnixNano())
+	for i, id := range ids {
+		node := New(&types.ExecutionConfig{
+			DataDir: t.TempDir(), ClusterID: clusterID, NodeID: types.NodeID(id),
+			PeerAddr: addresses[i], PeerToken: tokens[i], AdminToken: adminToken,
+			Members: append([]quepaxa.Member(nil), members...), EnableReconfiguration: true,
+			ObjStoreProvider: "s3", ObjStoreEndpoint: endpoint, ObjStoreBucket: bucket,
+			ObjStorePrefix: prefix, ObjStoreRegion: region, ObjStoreInsecure: true,
+			ObjStoreAccessKey: gateway.AccessKey, ObjStoreSecretKey: gateway.SecretKey,
+			ObjStoreSyncInterval: time.Hour, ObjStoreDurability: types.ObjectStoreDurabilityAsync,
+		})
+		nodes = append(nodes, node)
+		if err := node.Open(ctx); err != nil {
+			t.Fatalf("open source voter %q: %v", id, err)
+		}
+	}
+	if err := waitForNodeReadiness(ctx, nodes); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := nodes[0].server.KVPut(ctx, network.KVMutationRequest{
+		RequestID: "certified-source-before-learner", Key: "learner-source-key", Value: []byte("source-value"),
+	}); err != nil {
+		t.Fatalf("write certified source value: %v", err)
+	}
+	sourceTip := nodes[0].core.Tip()
+	if err := waitForNodeTip(ctx, nodes, sourceTip); err != nil {
+		t.Fatalf("source quorum did not learn its certified value: %v", err)
+	}
+	sourceDecision, ok := nodes[0].core.CertifiedValue(sourceTip)
+	if !ok {
+		t.Fatalf("source slot %d is not certified", sourceTip)
+	}
+
+	learnerID := quepaxa.NodeID("fresh-learner")
+	learnerToken := "learner-no-authority-peer-fresh"
+	learnerAddress := learnerFoundationUDPAddress(t)
+	learnerMember := peerMember(clusterID, learnerID, learnerToken)
+	learnerMember.PeerURL = "quic://" + learnerAddress
+	learner := New(&types.ExecutionConfig{
+		DataDir: t.TempDir(), ClusterID: clusterID, NodeID: types.NodeID(learnerID),
+		PeerAddr: learnerAddress, PeerToken: learnerToken, AdminToken: adminToken,
+		Members: append([]quepaxa.Member(nil), members...), Learner: &learnerMember, EnableReconfiguration: true,
+		ObjStoreProvider: "s3", ObjStoreEndpoint: endpoint, ObjStoreBucket: bucket,
+		ObjStorePrefix: prefix, ObjStoreRegion: region, ObjStoreInsecure: true,
+		ObjStoreAccessKey: gateway.AccessKey, ObjStoreSecretKey: gateway.SecretKey,
+		ObjStoreSyncInterval: time.Hour, ObjStoreDurability: types.ObjectStoreDurabilityAsync,
+	})
+	nodes = append(nodes, learner)
+	if err := learner.Open(ctx); err != nil {
+		t.Fatalf("open fresh learner without fencing authority: %v", err)
+	}
+	if learner.fenceSession != nil {
+		t.Fatal("learner unexpectedly connected to a fencing session")
+	}
+	if learner.config.PreparedPodUID != "" {
+		t.Fatal("learner unexpectedly depends on a prepared Pod identity")
+	}
+	if learner.core.IsVoter() {
+		t.Fatal("fresh learner is voting before a certified membership transition")
+	}
+	walIdentity, hasWALIdentity := learner.wal.Identity()
+	if !hasWALIdentity || learner.core.WALIdentity() != hex.EncodeToString(walIdentity) {
+		t.Fatalf("learner core WAL identity=%q, WAL has identity=%t", learner.core.WALIdentity(), hasWALIdentity)
+	}
+	for _, source := range nodes[:len(ids)] {
+		if learner.core.WALIdentity() == source.core.WALIdentity() {
+			t.Fatalf("learner reused source voter %q WAL identity", source.core.NodeID())
+		}
+	}
+	if learnerMember.PublicKey != quepaxa.PublicKey(network.PeerPublicKey(types.ClusterID(clusterID), learnerID, learnerToken)) {
+		t.Fatal("learner public key does not match its fresh peer credential")
+	}
+	for _, source := range members {
+		if learnerMember.PublicKey == source.PublicKey {
+			t.Fatalf("fresh learner reused source voter %q public key", source.ID)
+		}
+	}
+	if err := waitForNodeTip(ctx, []*Node{learner}, sourceTip); err != nil {
+		t.Fatalf("learner did not catch up from the certified source: %v", err)
+	}
+	learnerDecision, ok := learner.core.CertifiedValue(sourceTip)
+	if !ok || learnerDecision.Hash != sourceDecision.Hash {
+		t.Fatalf("learner decision=%+v available=%t; want source hash %x", learnerDecision, ok, sourceDecision.Hash)
+	}
+	value, err := learner.server.KVGet(ctx, network.KVGetRequest{Key: "learner-source-key", Consistency: "local"})
+	if err != nil || string(value.Value) != "source-value" {
+		t.Fatalf("learner materialized value=%q err=%v", value.Value, err)
+	}
+	for _, source := range nodes[:len(ids)] {
+		if !source.core.IsVoter() || len(source.core.CurrentCluster().Members) != len(ids) {
+			t.Fatalf("source voter %q lost its voter role or membership", source.core.NodeID())
+		}
+		if _, _, err := source.core.ReadIndex(ctx); err != nil {
+			t.Fatalf("source voter %q could not read through source quorum: %v", source.core.NodeID(), err)
+		}
+	}
+}
+
+func learnerFoundationUDPAddress(t *testing.T) string {
+	t.Helper()
+	conn, err := net.ListenPacket("udp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	address := conn.LocalAddr().String()
+	if err := conn.Close(); err != nil {
+		t.Fatal(err)
+	}
+	return address
+}
