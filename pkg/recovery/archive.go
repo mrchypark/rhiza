@@ -123,6 +123,14 @@ type RecoverySnapshot struct {
 	pin     archiveRecoveryPin
 }
 
+// CertifiedArchiveView is an immutable copy of the selected archive head used
+// while validating generation lineage and initializing a passive observer.
+// Its fields are private so callers cannot construct a view from claimed data.
+type CertifiedArchiveView struct {
+	manager *Manager
+	head    archiveHead
+}
+
 type source interface {
 	DecisionsFromBounded(quepaxa.Slot, int, int) ([]quepaxa.DecidedValue, quepaxa.Slot, error)
 	PrefixHash(quepaxa.Slot) ([32]byte, bool)
@@ -584,6 +592,78 @@ func (m *Manager) RecoveryBase() (quepaxa.CheckpointSeal, quepaxa.DecidedValue, 
 		return quepaxa.CheckpointSeal{}, quepaxa.DecidedValue{}, false
 	}
 	return *m.head.BaseSeal, *m.head.BaseDecision, true
+}
+
+// CaptureCertifiedView copies the currently loaded archive head. Call Load
+// first; an empty or not-yet-loaded manager has no certified view.
+func (m *Manager) CaptureCertifiedView() (CertifiedArchiveView, error) {
+	if m == nil {
+		return CertifiedArchiveView{}, fmt.Errorf("certified archive view is unavailable")
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.head.Generation == 0 {
+		return CertifiedArchiveView{}, fmt.Errorf("certified archive view is unavailable")
+	}
+	return CertifiedArchiveView{manager: m, head: cloneArchiveHead(m.head)}, nil
+}
+
+// CaptureCertifiedView returns the pinned head selected by this snapshot.
+func (s *RecoverySnapshot) CaptureCertifiedView() (CertifiedArchiveView, error) {
+	if s == nil || s.manager == nil || s.head.Generation == 0 {
+		return CertifiedArchiveView{}, fmt.Errorf("certified archive view is unavailable")
+	}
+	return CertifiedArchiveView{manager: s.manager, head: cloneArchiveHead(s.head)}, nil
+}
+
+func cloneArchiveHead(head archiveHead) archiveHead {
+	if head.BaseSeal != nil {
+		seal := *head.BaseSeal
+		seal.NextLeaderOrder = slices.Clone(seal.NextLeaderOrder)
+		seal.FollowingLeaderOrder = slices.Clone(seal.FollowingLeaderOrder)
+		if seal.Membership != nil {
+			membership := *seal.Membership
+			seal.Membership = &membership
+		}
+		head.BaseSeal = &seal
+	}
+	if head.BaseDecision != nil {
+		decision := *head.BaseDecision
+		decision.Value = slices.Clone(decision.Value)
+		decision.Certificate = slices.Clone(decision.Certificate)
+		head.BaseDecision = &decision
+	}
+	if head.BaseAnchor != nil {
+		anchor := *head.BaseAnchor
+		head.BaseAnchor = &anchor
+	}
+	if head.LineageAnchor != nil {
+		anchor := *head.LineageAnchor
+		head.LineageAnchor = &anchor
+	}
+	return head
+}
+
+func (v CertifiedArchiveView) GenerationAnchor() ([32]byte, bool) {
+	if v.manager == nil {
+		return [32]byte{}, false
+	}
+	anchor := v.head.LineageAnchor
+	if anchor == nil {
+		anchor = v.head.BaseAnchor
+	}
+	if anchor == nil {
+		return [32]byte{}, false
+	}
+	return anchor.Hash, true
+}
+
+func (v CertifiedArchiveView) RecoveryBase() (quepaxa.CheckpointSeal, quepaxa.DecidedValue, bool) {
+	if v.manager == nil || v.head.BaseSeal == nil || v.head.BaseDecision == nil {
+		return quepaxa.CheckpointSeal{}, quepaxa.DecidedValue{}, false
+	}
+	head := cloneArchiveHead(v.head)
+	return *head.BaseSeal, *head.BaseDecision, true
 }
 
 // GenerationAnchor returns the immutable external base reference, if this

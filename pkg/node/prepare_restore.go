@@ -318,11 +318,6 @@ func prepareRestoreWithExecution(ctx context.Context, config *types.ExecutionCon
 	if err != nil {
 		return execution, fmt.Errorf("verify source generation anchor: %w", err)
 	}
-	if seal, decision, ok := snapshot.RecoveryBase(); ok && core.Tip() < seal.Index {
-		if err := core.RestoreCheckpointBase(guard.Context(), seal, decision); err != nil {
-			return execution, fmt.Errorf("verify certified source checkpoint base: %w", err)
-		}
-	}
 	if err := recovery.ReplayCertifiedThrough(guard.Context(), core, snapshot.Tip(), snapshot.DecisionsFrom); err != nil {
 		return execution, fmt.Errorf("verify certified source suffix: %w", err)
 	}

@@ -152,9 +152,29 @@ func PinGenerationAnchor(ctx context.Context, bucket objstore.Bucket, prefix, ow
 // intent/result bindings, but does not require the original anchor checkpoint
 // to remain present after a newer certified target checkpoint has superseded it.
 func VerifyGenerationAnchor(ctx context.Context, bucket objstore.Bucket, prefix string, expectedMembership MembershipRecord, expectedAnchorHash [32]byte) (GenerationAnchor, error) {
+	archive := NewManager(bucket, prefix, 1)
+	defer archive.Close()
+	if err := archive.Load(ctx); err != nil {
+		return GenerationAnchor{}, err
+	}
+	view, err := archive.CaptureCertifiedView()
+	if err != nil {
+		return GenerationAnchor{}, err
+	}
+	return VerifyGenerationAnchorForView(ctx, view, expectedMembership, expectedAnchorHash)
+}
+
+// VerifyGenerationAnchorForView validates lineage against the exact head
+// already selected by a snapshot or loaded Manager. The expected anchor hash
+// and membership must come from the caller's trusted registration/approval.
+func VerifyGenerationAnchorForView(ctx context.Context, view CertifiedArchiveView, expectedMembership MembershipRecord, expectedAnchorHash [32]byte) (GenerationAnchor, error) {
 	if expectedAnchorHash == ([32]byte{}) || expectedMembership.Version != MembershipRecordVersion {
 		return GenerationAnchor{}, fmt.Errorf("expected generation anchor and immutable membership are required")
 	}
+	if view.manager == nil || view.head.Generation == 0 {
+		return GenerationAnchor{}, fmt.Errorf("certified archive view is unavailable")
+	}
+	bucket, prefix := view.manager.bucket, view.manager.prefix
 	anchor, hash, err := ReadGenerationAnchor(ctx, bucket, prefix)
 	if err != nil || hash != expectedAnchorHash || anchor.TargetMembership != expectedMembership {
 		return GenerationAnchor{}, fmt.Errorf("generation anchor does not match target registration")
@@ -171,17 +191,10 @@ func VerifyGenerationAnchor(ctx context.Context, bucket objstore.Bucket, prefix 
 	if err != nil || !ok || result.Tip != anchor.SourceTip || result.ManifestHash != anchor.SourceManifest || result.PrefixHash != anchor.SourcePrefixHash {
 		return GenerationAnchor{}, fmt.Errorf("generation anchor does not match fork result")
 	}
-	archive := NewManager(bucket, prefix, 1)
-	defer archive.Close()
-	if err := archive.Load(ctx); err != nil {
-		return GenerationAnchor{}, err
-	}
-	if got, ok := archive.GenerationAnchor(); !ok || got != expectedAnchorHash {
+	if got, ok := view.GenerationAnchor(); !ok || got != expectedAnchorHash {
 		return GenerationAnchor{}, fmt.Errorf("target archive does not retain generation lineage")
 	}
-	archive.mu.Lock()
-	base, basePrefix, baseAnchor, baseSeal := archive.head.Base, archive.head.BasePrefix, archive.head.BaseAnchor, archive.head.BaseSeal
-	archive.mu.Unlock()
+	base, basePrefix, baseAnchor, baseSeal := view.head.Base, view.head.BasePrefix, view.head.BaseAnchor, view.head.BaseSeal
 	if base < quepaxa.Slot(anchor.SourceTip) {
 		return GenerationAnchor{}, fmt.Errorf("target archive base precedes generation anchor")
 	}
