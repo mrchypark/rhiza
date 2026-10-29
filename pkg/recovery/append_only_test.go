@@ -5,6 +5,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"io"
+	"sync"
 	"testing"
 
 	"github.com/thanos-io/objstore"
@@ -12,38 +13,74 @@ import (
 
 type appendOnlyRecordingBucket struct {
 	objstore.Bucket
+	mu        sync.Mutex
 	mutations int
 	reads     int
 }
 
+func (b *appendOnlyRecordingBucket) counts() (int, int) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.reads, b.mutations
+}
+
 func (b *appendOnlyRecordingBucket) Get(ctx context.Context, key string) (io.ReadCloser, error) {
+	b.mu.Lock()
 	b.reads++
+	b.mu.Unlock()
 	return b.Bucket.Get(ctx, key)
 }
 func (b *appendOnlyRecordingBucket) GetRange(ctx context.Context, key string, off, length int64) (io.ReadCloser, error) {
+	b.mu.Lock()
 	b.reads++
+	b.mu.Unlock()
 	return b.Bucket.GetRange(ctx, key, off, length)
 }
 func (b *appendOnlyRecordingBucket) Exists(ctx context.Context, key string) (bool, error) {
+	b.mu.Lock()
 	b.reads++
+	b.mu.Unlock()
 	return b.Bucket.Exists(ctx, key)
 }
 func (b *appendOnlyRecordingBucket) Attributes(ctx context.Context, key string) (objstore.ObjectAttributes, error) {
+	b.mu.Lock()
 	b.reads++
+	b.mu.Unlock()
 	return b.Bucket.Attributes(ctx, key)
 }
 func (b *appendOnlyRecordingBucket) Iter(ctx context.Context, dir string, f func(string) error, opts ...objstore.IterOption) error {
+	b.mu.Lock()
 	b.reads++
+	b.mu.Unlock()
 	return b.Bucket.Iter(ctx, dir, f, opts...)
 }
 
 func (b *appendOnlyRecordingBucket) Upload(ctx context.Context, key string, r io.Reader, opts ...objstore.ObjectUploadOption) error {
+	b.mu.Lock()
 	b.mutations++
+	b.mu.Unlock()
 	return b.Bucket.Upload(ctx, key, r, opts...)
 }
 func (b *appendOnlyRecordingBucket) Delete(ctx context.Context, key string) error {
+	b.mu.Lock()
 	b.mutations++
+	b.mu.Unlock()
 	return b.Bucket.Delete(ctx, key)
+}
+
+func TestHAAppendOnlyRecordingConcurrentReads(t *testing.T) {
+	b := &appendOnlyRecordingBucket{Bucket: objstore.NewInMemBucket()}
+	const count = 100
+	var wg sync.WaitGroup
+	for i := 0; i < count; i++ {
+		wg.Add(1)
+		go func() { defer wg.Done(); _, _ = b.Exists(context.Background(), "missing") }()
+	}
+	wg.Wait()
+	reads, _ := b.counts()
+	if reads != count {
+		t.Fatalf("reads=%d, want %d", reads, count)
+	}
 }
 
 func TestHAAppendOnlyArchive(t *testing.T) {
@@ -61,8 +98,10 @@ func TestHAAppendOnlyArchive(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer m.Close()
-	if err := m.Cleanup(ctx, 0); err == nil || b.mutations != 0 || b.reads != 0 {
-		t.Fatalf("GC err=%v mutations=%d reads=%d", err, b.mutations, b.reads)
+	err = m.Cleanup(ctx, 0)
+	reads, mutations := b.counts()
+	if err == nil || mutations != 0 || reads != 0 {
+		t.Fatalf("GC err=%v mutations=%d reads=%d", err, mutations, reads)
 	}
 	data := []byte("extent")
 	hash := sha256.Sum256(data)

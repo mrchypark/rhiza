@@ -50,8 +50,8 @@ func TestPreparedStartupCapturedHeadReverifiedAfterAdvance(t *testing.T) {
 	if !bytes.Equal(restored.CapturedHead(), head) {
 		t.Fatal("reopened different head")
 	}
-	if bucket.mutations != 0 {
-		t.Fatalf("source mutations: %d", bucket.mutations)
+	if _, mutations := bucket.counts(); mutations != 0 {
+		t.Fatalf("source mutations: %d", mutations)
 	}
 }
 
@@ -185,8 +185,8 @@ func TestPreparedStartupPublishLoadAndRejectTampering(t *testing.T) {
 	if err := load(identity); err == nil {
 		t.Fatal("partial preparation accepted")
 	}
-	if bucket.mutations != 0 {
-		t.Fatalf("source mutations: %d", bucket.mutations)
+	if _, mutations := bucket.counts(); mutations != 0 {
+		t.Fatalf("source mutations: %d", mutations)
 	}
 }
 
