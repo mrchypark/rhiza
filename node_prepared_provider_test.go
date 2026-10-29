@@ -64,6 +64,32 @@ func preparedRegistrationRequest(r *http.Request, provider, bucket, account, obj
 	}
 }
 
+func preparedEmulatorAuthRequest(r *http.Request, provider string) bool {
+	return provider == "gcs" && r.Method == http.MethodPost && r.URL.Path == "/token" && r.URL.RawQuery == "" && r.Header.Get("Content-Type") == "application/x-www-form-urlencoded"
+}
+
+func TestPreparedNodeEmulatorAuthScope(t *testing.T) {
+	req := httptest.NewRequest(http.MethodPost, "/token", nil)
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	if !preparedEmulatorAuthRequest(req, "gcs") {
+		t.Fatal("emulator token request rejected")
+	}
+	for _, target := range []string{"/other", "/token?other=1"} {
+		other := httptest.NewRequest(http.MethodPost, target, nil)
+		other.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+		if preparedEmulatorAuthRequest(other, "gcs") {
+			t.Fatal("unknown POST accepted")
+		}
+	}
+	if preparedEmulatorAuthRequest(req, "s3") {
+		t.Fatal("wrong provider accepted")
+	}
+	req.Header.Del("Content-Type")
+	if preparedEmulatorAuthRequest(req, "gcs") {
+		t.Fatal("missing content type accepted")
+	}
+}
+
 func TestPreparedNodeRegistrationRequestScope(t *testing.T) {
 	for _, tc := range []struct {
 		provider, method, target string
@@ -130,14 +156,20 @@ func TestEmbeddedObjectStorageNodePreparedRestore(t *testing.T) {
 		t.Fatal(err)
 	}
 	var inspect atomic.Bool
+	defer inspect.Store(false)
 	var forbidden atomic.Int64
 	var allowed atomic.Int64
+	var authRequests atomic.Int64
 	var learnerObject string
 	var bucketName, accountName string
 	proxy := httputil.NewSingleHostReverseProxy(upstream)
 	proxyServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if inspect.Load() && r.Method != http.MethodGet && r.Method != http.MethodHead {
-			if preparedRegistrationRequest(r, provider, bucketName, accountName, learnerObject) {
+			if preparedEmulatorAuthRequest(r, provider) {
+				authRequests.Add(1)
+				proxy.ServeHTTP(w, r)
+				return
+			} else if preparedRegistrationRequest(r, provider, bucketName, accountName, learnerObject) {
 				allowed.Add(1)
 			} else {
 				forbidden.Add(1)
@@ -312,7 +344,29 @@ func TestEmbeddedObjectStorageNodePreparedRestore(t *testing.T) {
 	if db != nil || !errors.Is(err, node.ErrPreparedWriteAdmissionUnavailable) {
 		t.Fatalf("prepared open: db=%v err=%v", db != nil, err)
 	}
-	wal, err := qlog.OpenReadOnly(filepath.Join(learner.DataDir, "qlog"))
+	if _, err := os.Stat(filepath.Join(learner.DataDir, "prepared-adoption.json")); err != nil {
+		t.Fatalf("adoption missing: %v", err)
+	}
+	learner.PreparedStartup.Prepared = nil
+	learner.PreparedStartup.Identity = identity
+	db, err = rhiza.Open(ctx, learner)
+	if db != nil || !errors.Is(err, node.ErrPreparedWriteAdmissionUnavailable) {
+		t.Fatalf("adopted WAL restart: db=%v err=%v", db != nil, err)
+	}
+	walDir := filepath.Join(learner.DataDir, "qlog")
+	_, walLock, err := qlog.Acquire(walDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	lockHeld := true
+	t.Cleanup(func() {
+		if lockHeld {
+			if err := walLock.Release(); err != nil {
+				t.Error(err)
+			}
+		}
+	})
+	wal, err := qlog.Open(walDir)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -352,6 +406,10 @@ func TestEmbeddedObjectStorageNodePreparedRestore(t *testing.T) {
 	if err := wal.Close(); err != nil {
 		t.Fatal(err)
 	}
+	if err := walLock.Release(); err != nil {
+		t.Fatal(err)
+	}
+	lockHeld = false
 	mat, err := materializer.Open(filepath.Join(learner.DataDir, "sqlite.db"), 1)
 	if err != nil {
 		t.Fatal(err)
@@ -398,15 +456,6 @@ func TestEmbeddedObjectStorageNodePreparedRestore(t *testing.T) {
 	if len(ids) != 2 || ids[0] != 7 || ids[1] != 8 {
 		t.Fatalf("checkpoint/suffix rows: %v", ids)
 	}
-	if _, err := os.Stat(filepath.Join(learner.DataDir, "prepared-adoption.json")); err != nil {
-		t.Fatalf("adoption missing: %v", err)
-	}
-	learner.PreparedStartup.Prepared = nil
-	learner.PreparedStartup.Identity = identity
-	db, err = rhiza.Open(ctx, learner)
-	if db != nil || !errors.Is(err, node.ErrPreparedWriteAdmissionUnavailable) {
-		t.Fatalf("adopted WAL restart: db=%v err=%v", db != nil, err)
-	}
 	if readonly.writes != 0 {
 		t.Fatalf("source-reader mutation attempts: %d", readonly.writes)
 	}
@@ -414,4 +463,5 @@ func TestEmbeddedObjectStorageNodePreparedRestore(t *testing.T) {
 	if forbidden.Load() != 0 || allowed.Load() == 0 {
 		t.Fatalf("target mutation audit: forbidden=%d learner-registration=%d", forbidden.Load(), allowed.Load())
 	}
+	t.Logf("target mutation audit: learner-registration=%d emulator-auth=%d", allowed.Load(), authRequests.Load())
 }

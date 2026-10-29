@@ -1,8 +1,10 @@
 package node
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
+	"encoding/json"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -171,4 +173,174 @@ func TestPreparedNodeAzureConnectionTrailingSemicolon(t *testing.T) {
 	if err != nil || first != second {
 		t.Fatalf("equivalent connection binding differs: %s %s %v", first, second, err)
 	}
+}
+
+func TestPreparedNodeAdoptionRestartGenuineWAL(t *testing.T) {
+	ctx := context.Background()
+	cluster := quepaxa.Cluster{ConfigID: 1, Members: []quepaxa.Member{peerMember("cluster", "a", "a-token"), peerMember("cluster", "b", "b-token")}}
+	transport := &membershipOperationTransport{cores: make(map[quepaxa.NodeID]*quepaxa.Core), disabled: make(map[quepaxa.NodeID]bool)}
+	for _, member := range cluster.Members {
+		wal, err := qlog.Open(filepath.Join(t.TempDir(), "qlog"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { _ = wal.Close() })
+		core, err := quepaxa.New(quepaxa.Config{NodeID: member.ID, Cluster: cluster, WAL: wal, Transport: transport, EnableReconfiguration: true})
+		if err != nil {
+			t.Fatal(err)
+		}
+		transport.cores[member.ID] = core
+		transport.ids = append(transport.ids, member.ID)
+	}
+	value, err := types.EncodeGraphCommand(types.GraphCommand{RequestID: "adoption", Events: []types.GraphStreamEvent{{Stream: "s", Kind: "created", Payload: "v"}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	core := transport.cores["a"]
+	if _, _, err := core.Propose(ctx, value); err != nil {
+		t.Fatal(err)
+	}
+	source := objstore.NewInMemBucket()
+	archive, err := recovery.NewAppendOnlyManager(source, "source", 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(archive.Close)
+	if err := archive.SyncThrough(ctx, core, core.Tip()); err != nil {
+		t.Fatal(err)
+	}
+	view, err := recovery.OpenReadOnlyView(ctx, source, "source", 1, cluster)
+	if err != nil {
+		t.Fatal(err)
+	}
+	learner := peerMember("cluster", "learner", "learner-token")
+	config := &types.ExecutionConfig{NodeID: "learner", ClusterID: "cluster", DataDir: t.TempDir(), Members: cluster.Members, Learner: &learner, PeerToken: "learner-token", AdminToken: "admin-token", EnableReconfiguration: true, ObjStoreProvider: "filesystem", ObjStoreDir: t.TempDir(), ObjStorePrefix: "target"}
+	state, err := loadVoterIdentity(config)
+	if err != nil {
+		t.Fatal(err)
+	}
+	wal, err := qlog.Open(filepath.Join(config.DataDir, "qlog"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	walOpen := true
+	t.Cleanup(func() {
+		if walOpen {
+			if err := wal.Close(); err != nil {
+				t.Errorf("close learner WAL: %v", err)
+			}
+		}
+	})
+	if err := ensureVoterIdentity(ctx, config, objstore.NewInMemBucket(), wal, state, false); err != nil {
+		t.Fatal(err)
+	}
+	learnerCore, err := quepaxa.NewLearner(quepaxa.Config{NodeID: "learner", Cluster: cluster, WAL: wal, Transport: transport})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := learnerCore.AcceptCertifiedValues(view.Decisions()); err != nil {
+		t.Fatal(err)
+	}
+	identity := recovery.PreparedStartupIdentity{ClusterUID: "uid", Generation: 2, DeploymentUID: "deployment", PodUID: "pod", NodeID: "learner", SourceBinding: "source", ConfigDigest: "config"}
+	if err := persistPreparedAdoption(config.DataDir, identity, learnerCore.WALIdentity(), view); err != nil {
+		t.Fatal(err)
+	}
+	err = wal.Close()
+	walOpen = false
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := New(config).verifyPreparedAdoption(ctx, identity); err != nil {
+		t.Fatalf("registered learner restart: %v", err)
+	}
+	t.Run("foreign bound identity preserves torn WAL", func(t *testing.T) {
+		other, err := qlog.Open(filepath.Join(t.TempDir(), "qlog"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		otherOpen := true
+		t.Cleanup(func() {
+			if otherOpen {
+				if err := other.Close(); err != nil {
+					t.Errorf("close foreign WAL: %v", err)
+				}
+			}
+		})
+		otherCore, err := quepaxa.NewLearner(quepaxa.Config{NodeID: "learner", Cluster: cluster, WAL: other, Transport: transport})
+		if err != nil {
+			t.Fatal(err)
+		}
+		foreign := otherCore.WALIdentity()
+		if foreign == learnerCore.WALIdentity() {
+			t.Fatal("fixture identities unexpectedly match")
+		}
+		err = other.Close()
+		otherOpen = false
+		if err != nil {
+			t.Fatal(err)
+		}
+		local, err := loadVoterIdentity(config)
+		if err != nil || local.identity == nil {
+			t.Fatalf("load local identity: %v", err)
+		}
+		local.identity.Nonce = foreign
+		if err := writeVoterIdentity(config.DataDir, *local.identity); err != nil {
+			t.Fatal(err)
+		}
+		marker := filepath.Join(config.DataDir, "prepared-adoption.json")
+		data, err := os.ReadFile(marker)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var adoption preparedAdoption
+		if err := json.Unmarshal(data, &adoption); err != nil {
+			t.Fatal(err)
+		}
+		adoption.WALIdentity = foreign
+		data, err = json.Marshal(adoption)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(marker, data, 0600); err != nil {
+			t.Fatal(err)
+		}
+		paths, err := filepath.Glob(filepath.Join(config.DataDir, "qlog", "seg_*.log"))
+		if err != nil || len(paths) != 1 {
+			t.Fatalf("segments=%v err=%v", paths, err)
+		}
+		f, err := os.OpenFile(paths[0], os.O_APPEND|os.O_WRONLY, 0600)
+		if err != nil {
+			t.Fatal(err)
+		}
+		fileOpen := true
+		t.Cleanup(func() {
+			if fileOpen {
+				if err := f.Close(); err != nil {
+					t.Errorf("close WAL segment: %v", err)
+				}
+			}
+		})
+		if _, err := f.Write([]byte{0x7f}); err != nil {
+			t.Fatal(err)
+		}
+		err = f.Close()
+		fileOpen = false
+		if err != nil {
+			t.Fatal(err)
+		}
+		before, err := os.ReadFile(paths[0])
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := New(config).verifyPreparedAdoption(ctx, identity); err == nil {
+			t.Fatal("foreign WAL identity accepted")
+		}
+		after, err := os.ReadFile(paths[0])
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !bytes.Equal(before, after) {
+			t.Fatal("foreign WAL was modified before identity validation")
+		}
+	})
 }

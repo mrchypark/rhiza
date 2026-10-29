@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -117,7 +118,25 @@ func (n *Node) verifyPreparedAdoption(ctx context.Context, identity recovery.Pre
 	if local.identity == nil || !local.identity.Registered || local.identity.Nonce != adoption.WALIdentity {
 		return fmt.Errorf("prepared WAL registration mismatch")
 	}
-	wal, err := qlog.OpenReadOnly(filepath.Join(dir, "qlog"))
+	expected, err := hex.DecodeString(adoption.WALIdentity)
+	if err != nil || len(expected) != 32 {
+		return fmt.Errorf("invalid prepared WAL identity")
+	}
+	inspection, err := qlog.OpenReadOnly(filepath.Join(dir, "qlog"))
+	if err != nil {
+		return fmt.Errorf("inspect prepared WAL: %w", err)
+	}
+	bound, exists := inspection.Identity()
+	closeErr := inspection.Close()
+	if !exists || !bytes.Equal(bound, expected) {
+		return errors.Join(fmt.Errorf("prepared WAL binding mismatch"), closeErr)
+	}
+	if closeErr != nil {
+		return fmt.Errorf("close prepared WAL inspection: %w", closeErr)
+	}
+	// Core recovery may durably restore the reconfiguration marker after WAL
+	// compaction. Keep old WAL files until a later fully admitted startup.
+	wal, err := qlog.OpenLocalDeferredCleanup(filepath.Join(dir, "qlog"))
 	if err != nil {
 		return err
 	}
