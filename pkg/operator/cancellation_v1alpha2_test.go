@@ -14,20 +14,21 @@ import (
 // cancellationServer models only the Kubernetes objects; no recovery effects
 // are available to the reconciler through this transport.
 type cancellationServer struct {
-	t                *testing.T
-	cluster, request string
-	later            string
-	writes           []string
-	version          int
-	missing          bool
-	fault            string
-	faultAt          int
-	puts             int
-	staleList        bool
-	incompleteList   bool
-	responseMutation func(string) string
-	failReadback     bool
-	failNextGet      bool
+	t                 *testing.T
+	cluster, request  string
+	later             string
+	writes            []string
+	version           int
+	missing           bool
+	fault             string
+	faultAt           int
+	puts              int
+	staleList         bool
+	incompleteList    bool
+	responseMutation  func(string) string
+	failReadback      bool
+	failNextGet       bool
+	finalizerResponse func(*cancellationServer, string, string) (*http.Response, error)
 }
 
 func newCancellationServer(t *testing.T, claim V1Alpha2QueueClaim) *cancellationServer {
@@ -144,6 +145,9 @@ func (s *cancellationServer) roundTrip(r *http.Request) (*http.Response, error) 
 		}
 		return nil, fmt.Errorf("connection lost after apply")
 	}
+	if fault && request && !strings.HasSuffix(r.URL.Path, "/status") && s.finalizerResponse != nil {
+		return s.finalizerResponse(s, current, string(body))
+	}
 	if fault && s.responseMutation != nil {
 		return phase2Response(200, s.responseMutation(string(updated))), nil
 	}
@@ -208,6 +212,88 @@ func TestPhase4CancellationUnknownClearReadbackNeverInfersComplete(t *testing.T)
 	result, err = ReconcileV1Alpha2Cancellation(ctx, store, phase2Ref, "old", claim)
 	if err == nil || result == V1Alpha2CancellationComplete || len(s.writes) != 5 {
 		t.Fatalf("missing evidence inferred complete: %s %v %v", result, err, s.writes)
+	}
+}
+
+func TestPhase4CancellationFinalizerUnknownRequiresFreshAbsenceAndDecision(t *testing.T) {
+	for _, mode := range []string{"absent", "timeout after deletion", "still present", "incomplete list", "binding changed", "queue changed", "read failed", "other finalizer"} {
+		t.Run(mode, func(t *testing.T) {
+			claim := phase3Claim()
+			claim.Phase = "CancelRequested"
+			s := newCancellationServer(t, claim)
+			if mode != "other finalizer" {
+				s.request = strings.Replace(s.request, `["other","rhiza.mrchypark.dev/recovery-record"]`, `["rhiza.mrchypark.dev/recovery-record"]`, 1)
+			}
+			s.faultAt = 4
+			s.finalizerResponse = func(s *cancellationServer, _, _ string) (*http.Response, error) {
+				s.missing = mode != "still present"
+				s.incompleteList = mode == "incomplete list"
+				if mode == "binding changed" {
+					s.cluster = strings.Replace(s.cluster, `"storageID":"storage"`, `"storageID":"other"`, 1)
+				}
+				if mode == "queue changed" {
+					s.cluster = strings.Replace(s.cluster, `"acknowledged":true`, `"acknowledged":false`, 1)
+				}
+				if mode == "read failed" {
+					s.failNextGet = true
+				}
+				if mode == "timeout after deletion" {
+					return nil, fmt.Errorf("connection lost after deletion")
+				}
+				return phase2Response(200, `{}`), nil
+			}
+			store := phase2Store(t, s.roundTrip)
+			ctx := context.Background()
+			for i := 0; i < 3; i++ {
+				if _, err := ReconcileV1Alpha2Cancellation(ctx, store, phase2Ref, "old", claim); err != nil {
+					t.Fatalf("step %d: %v", i, err)
+				}
+			}
+			result, err := ReconcileV1Alpha2Cancellation(ctx, store, phase2Ref, "old", claim)
+			if mode == "absent" || mode == "timeout after deletion" {
+				if err != nil || result != V1Alpha2CancellationPending {
+					t.Fatalf("verified absence: %s %v", result, err)
+				}
+				result, err = ReconcileV1Alpha2Cancellation(ctx, store, phase2Ref, "old", claim)
+				if err != nil || result != V1Alpha2CancellationComplete || len(s.writes) != 5 {
+					t.Fatalf("clear: %s %v %v", result, err, s.writes)
+				}
+			} else if !errors.Is(err, ErrV1Alpha2StatusOutcomeUnknown) || result == V1Alpha2CancellationComplete {
+				t.Fatalf("unproved postcondition accepted: %s %v", result, err)
+			}
+			if mode != "absent" && mode != "timeout after deletion" && len(s.writes) != 4 {
+				t.Fatalf("unexpected writes: %v", s.writes)
+			}
+		})
+	}
+}
+
+func TestPhase4CancellationLastFinalizerDeleteReturnsSubmittedObject(t *testing.T) {
+	claim := phase3Claim()
+	claim.Phase = "CancelRequested"
+	s := newCancellationServer(t, claim)
+	s.request = strings.Replace(s.request, `["other","rhiza.mrchypark.dev/recovery-record"]`, `["rhiza.mrchypark.dev/recovery-record"]`, 1)
+	s.faultAt = 4
+	s.finalizerResponse = func(s *cancellationServer, _, submitted string) (*http.Response, error) {
+		// Kubernetes deleteWithoutFinalizers returns the submitted object, not
+		// the newly revisioned object; storage has already deleted the request.
+		s.missing = true
+		return phase2Response(200, submitted), nil
+	}
+	store := phase2Store(t, s.roundTrip)
+	ctx := context.Background()
+	for i := 0; i < 3; i++ {
+		if _, err := ReconcileV1Alpha2Cancellation(ctx, store, phase2Ref, "old", claim); err != nil {
+			t.Fatalf("step %d: %v", i, err)
+		}
+	}
+	result, err := ReconcileV1Alpha2Cancellation(ctx, store, phase2Ref, "old", claim)
+	if err != nil || result != V1Alpha2CancellationPending || len(s.writes) != 4 {
+		t.Fatalf("delete response: %s %v %v", result, err, s.writes)
+	}
+	result, err = ReconcileV1Alpha2Cancellation(ctx, store, phase2Ref, "old", claim)
+	if err != nil || result != V1Alpha2CancellationComplete || len(s.writes) != 5 {
+		t.Fatalf("clear: %s %v %v", result, err, s.writes)
 	}
 }
 
