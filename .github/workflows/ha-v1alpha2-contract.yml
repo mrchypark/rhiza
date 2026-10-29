@@ -1,7 +1,7 @@
 name: HA v1alpha2 contract
 on:
   push:
-    branches: [feature/ha-v1alpha2-contract-phase1]
+    branches: [feature/ha-v1alpha2-contract-phase1, feature/ha-v1alpha2-status-queue-phase2]
   workflow_dispatch:
 permissions:
   contents: read
@@ -16,8 +16,10 @@ jobs:
           go-version-file: go.mod
       - name: Focused unit and manifest tests
         run: |
-          go test ./pkg/operator -run TestPhase1 -count=1 -timeout=60s
+          go test ./pkg/operator -run 'TestPhase[12]' -count=1 -timeout=60s
           go test ./deploy/operator -count=1 -timeout=60s
+      - name: Phase 2 race tests
+        run: go test -race ./pkg/operator -run '^TestPhase2' -count=1 -timeout=60s
       - name: Install kind
         run: go install sigs.k8s.io/kind@v0.32.0
       - name: API server admission contract

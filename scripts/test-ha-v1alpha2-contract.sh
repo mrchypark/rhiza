@@ -43,6 +43,8 @@ cluster="ha-contract-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-${nonce}"
 context="kind-$cluster"
 namespace="ha-contract-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
 kubeconfig="$RUNNER_TEMP/ha-contract-$nonce.kubeconfig"
+tokenfile="$RUNNER_TEMP/ha-contract-$nonce.token"
+cafile="$RUNNER_TEMP/ha-contract-$nonce.ca"
 owned=0
 
 cleanup() {
@@ -60,7 +62,8 @@ cleanup() {
     fi
   fi
   # The kubeconfig contains credentials and must not be uploaded.
-  rm -f "$kubeconfig"
+  rm -f "$kubeconfig" "$tokenfile" "$cafile"
+  if [ -e "$kubeconfig" ] || [ -e "$tokenfile" ] || [ -e "$cafile" ]; then result=1; fi
   exit "$result"
 }
 trap cleanup EXIT
@@ -163,3 +166,61 @@ fi
 if ! grep -F 'Error from server (NotFound)' "$logs/v1alpha1.txt" >/dev/null; then
   echo 'v1alpha1 check did not return NotFound' >&2; cat "$logs/v1alpha1.txt" >&2; exit 1
 fi
+
+# Administrative test fixtures only; this is not an authority genesis protocol.
+for name in status-contract queue-contract missing-authority; do
+  cluster_json "$name" 3 '' > "$logs/$name.json"
+  ok "$name-create" create --validate=strict -f "$logs/$name.json"
+done
+for name in status-contract queue-contract; do
+  uid=$(k get rhizacluster "$name" -n "$namespace" -o jsonpath='{.metadata.uid}')
+  [ -n "$uid" ] || exit 1
+  ok "$name-seed" patch rhizacluster "$name" -n "$namespace" --subresource=status --type=merge -p "{\"status\":{\"authority\":{\"owner\":{\"namespace\":\"$namespace\",\"name\":\"$name\",\"uid\":\"$uid\",\"logicalID\":\"test\"},\"generation\":2,\"binding\":{\"deploymentUID\":\"deployment\",\"storageID\":\"storage\"},\"pendingWrite\":false,\"transition\":null,\"receipt\":{\"opaque\":\"keep\"}},\"other\":{\"opaque\":\"keep\"}}}"
+done
+queue_uid=$(k get rhizacluster queue-contract -n "$namespace" -o jsonpath='{.metadata.uid}')
+for name in queue-first queue-second; do
+  printf '{"apiVersion":"rhiza.mrchypark.dev/v1alpha2","kind":"RhizaRecovery","metadata":{"name":"%s","namespace":"%s","finalizers":["rhiza.mrchypark.dev/recovery-record"]},"spec":{"target":{"name":"queue-contract","uid":"%s"},"expectedGeneration":2}}' "$name" "$namespace" "$queue_uid" > "$logs/$name.json"
+  ok "$name-create" create --validate=strict -f "$logs/$name.json"
+done
+k -n "$namespace" create serviceaccount phase2-contract > "$logs/serviceaccount.txt" 2>&1
+k -n "$namespace" apply -f - > "$logs/role.txt" 2>&1 <<EOF
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: phase2-contract
+  namespace: $namespace
+rules:
+- apiGroups: ["rhiza.mrchypark.dev"]
+  resources: ["rhizaclusters"]
+  verbs: ["get"]
+- apiGroups: ["rhiza.mrchypark.dev"]
+  resources: ["rhizaclusters/status"]
+  verbs: ["update"]
+- apiGroups: ["rhiza.mrchypark.dev"]
+  resources: ["rhizarecoveries"]
+  verbs: ["get", "list"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: phase2-contract
+  namespace: $namespace
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: phase2-contract
+subjects:
+- kind: ServiceAccount
+  name: phase2-contract
+  namespace: $namespace
+EOF
+umask 077
+k -n "$namespace" create token phase2-contract --duration=10m > "$tokenfile"
+k config view --raw --minify -o jsonpath='{.clusters[0].cluster.certificate-authority-data}' | base64 -d > "$cafile"
+server=$(k config view --raw --minify -o jsonpath='{.clusters[0].cluster.server}')
+status_uid=$(k get rhizacluster status-contract -n "$namespace" -o jsonpath='{.metadata.uid}')
+missing_uid=$(k get rhizacluster missing-authority -n "$namespace" -o jsonpath='{.metadata.uid}')
+: "${server:?}" "${status_uid:?}" "${missing_uid:?}" "${queue_uid:?}"
+[ -s "$tokenfile" ] && [ -s "$cafile" ] || exit 1
+export RHIZA_CONTRACT_SERVER="$server" RHIZA_CONTRACT_CA="$cafile" RHIZA_CONTRACT_TOKEN="$tokenfile" RHIZA_CONTRACT_NAMESPACE="$namespace" RHIZA_CONTRACT_STATUS_UID="$status_uid" RHIZA_CONTRACT_QUEUE_UID="$queue_uid" RHIZA_CONTRACT_MISSING_UID="$missing_uid"
+go test ./pkg/operator -run '^TestV1Alpha2StatusAPIServerContract$' -count=1 -timeout=60s

@@ -29,3 +29,20 @@ gates. Omitted TTL retains the record; it does not delete workloads or data.
 
 The existing `no-pvc/` inputs and fence manifests are retained separately;
 they do not implement this proposed contract or establish a safe recovery.
+
+## Phase-two status and queue components
+
+The status adapter updates only `status.recoveryQueue` with exact cluster UID
+and resourceVersion preconditions. Missing or mismatched authority refuses;
+ambiguous writes need exact readback, not a blind retry. Authority, pending
+writes and unrelated status fields are preserved.
+
+The queue selects from a complete current request list by creationTimestamp,
+using UID to break equal timestamps deterministically. An existing claim is
+never overtaken or released by these components. A protected request finalizer
+and fresh request/authority observations are required; unknown, deleted or
+changed records block. Finalizer installation, safe claim release and the
+trusted retention protocol are not implemented here. Two-resource observations
+are not atomic, and a claim is bookkeeping, not permission to perform recovery.
+`Controller.Run` remains unavailable. CI seeds authority only as a test fixture;
+that seed is not a production genesis or recovery procedure.
