@@ -18,6 +18,7 @@ type V1Alpha2QueueClaim struct {
 	IntentHash         string    `json:"intentHash"`
 	ExpectedGeneration int64     `json:"expectedGeneration"`
 	CreatedAt          time.Time `json:"createdAt"`
+	Phase              string    `json:"phase,omitempty"`
 }
 
 const V1Alpha2RecoveryRecordFinalizer = "rhiza.mrchypark.dev/recovery-record"
@@ -128,6 +129,9 @@ func ClaimV1Alpha2Recovery(ctx context.Context, store *V1Alpha2StatusStore, ref 
 		if err := decodeV1Alpha2(raw, &existing); err != nil || len(fields["expectedGeneration"]) == 0 || bytes.Equal(bytes.TrimSpace(fields["expectedGeneration"]), []byte("null")) || existing.RequestUID == "" || existing.OperationID == "" || existing.IntentHash == "" || existing.CreatedAt.IsZero() || existing.ExpectedGeneration < 0 {
 			return V1Alpha2QueueClaim{}, queueError(V1Alpha2QueueIncomplete, "unsupported or invalid queue claim")
 		}
+		if existing.Phase != "" && existing.Phase != "Claimed" {
+			return V1Alpha2QueueClaim{}, queueError(V1Alpha2QueueRequestBlocked, "claim requires lifecycle reconciliation")
+		}
 		for _, entry := range entries {
 			op := sha256.Sum256([]byte("rhiza-queue-v1\x00" + ref.UID + "\x00" + entry.uid + "\x00" + entry.hash))
 			if entry.uid == existing.RequestUID && entry.hash == existing.IntentHash && existing.OperationID == hex.EncodeToString(op[:]) && entry.request.Spec.ExpectedGeneration == existing.ExpectedGeneration && entry.created.Equal(existing.CreatedAt) {
@@ -156,7 +160,7 @@ func ClaimV1Alpha2Recovery(ctx context.Context, store *V1Alpha2StatusStore, ref 
 		return V1Alpha2QueueClaim{}, err
 	}
 	op := sha256.Sum256([]byte("rhiza-queue-v1\x00" + ref.UID + "\x00" + head.uid + "\x00" + head.hash))
-	claim := V1Alpha2QueueClaim{head.uid, hex.EncodeToString(op[:]), head.hash, head.request.Spec.ExpectedGeneration, head.created}
+	claim := V1Alpha2QueueClaim{RequestUID: head.uid, OperationID: hex.EncodeToString(op[:]), IntentHash: head.hash, ExpectedGeneration: head.request.Spec.ExpectedGeneration, CreatedAt: head.created, Phase: "Claimed"}
 	next, err := json.Marshal(claim)
 	if err != nil {
 		return V1Alpha2QueueClaim{}, err

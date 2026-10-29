@@ -150,6 +150,10 @@ func sameJSON(a, b json.RawMessage) bool {
 // bookkeeping; successful storage does not validate policy or authorize work.
 // Matching readback proves only the logical postcondition, not which write applied it.
 func (s *V1Alpha2StatusStore) CompareAndSwapQueue(ctx context.Context, old V1Alpha2StatusSnapshot, next json.RawMessage) (V1Alpha2StatusSnapshot, error) {
+	return s.compareAndSwapQueue(ctx, old, next, true)
+}
+
+func (s *V1Alpha2StatusStore) compareAndSwapQueue(ctx context.Context, old V1Alpha2StatusSnapshot, next json.RawMessage, allowReadback bool) (V1Alpha2StatusSnapshot, error) {
 	if old.store != s || old.object == nil || old.resourceVersion == "" {
 		return V1Alpha2StatusSnapshot{}, fmt.Errorf("invalid status snapshot")
 	}
@@ -185,6 +189,13 @@ func (s *V1Alpha2StatusStore) CompareAndSwapQueue(ctx context.Context, old V1Alp
 		if e == nil && sameJSON(result.authorityRaw, old.authorityRaw) && sameJSON(result.queue, next) && result.resourceVersion != old.resourceVersion {
 			return result, nil
 		}
+	}
+	if !allowReadback {
+		live, readErr := s.Load(ctx, old.ref)
+		if readErr == nil && live.resourceVersion != old.resourceVersion && sameJSON(live.authorityRaw, old.authorityRaw) && sameJSON(live.queue, next) {
+			return V1Alpha2StatusSnapshot{}, fmt.Errorf("%w: matching readback cannot identify the writer", ErrV1Alpha2StatusOutcomeUnknown)
+		}
+		return V1Alpha2StatusSnapshot{}, fmt.Errorf("%w: update and diagnostic readback did not establish the result", ErrV1Alpha2StatusOutcomeUnknown)
 	}
 	// A failed or malformed response may follow an applied write. Never retry it.
 	live, readErr := s.Load(ctx, old.ref)

@@ -168,15 +168,35 @@ if ! grep -F 'Error from server (NotFound)' "$logs/v1alpha1.txt" >/dev/null; the
 fi
 
 # Administrative test fixtures only; this is not an authority genesis protocol.
-for name in status-contract queue-contract missing-authority; do
+for name in status-contract queue-contract finalizer-contract lifecycle-cancel lifecycle-prepare missing-authority; do
   cluster_json "$name" 3 '' > "$logs/$name.json"
   ok "$name-create" create --validate=strict -f "$logs/$name.json"
 done
-for name in status-contract queue-contract; do
+for name in status-contract queue-contract finalizer-contract lifecycle-cancel lifecycle-prepare; do
   uid=$(k get rhizacluster "$name" -n "$namespace" -o jsonpath='{.metadata.uid}')
   [ -n "$uid" ] || exit 1
   ok "$name-seed" patch rhizacluster "$name" -n "$namespace" --subresource=status --type=merge -p "{\"status\":{\"authority\":{\"owner\":{\"namespace\":\"$namespace\",\"name\":\"$name\",\"uid\":\"$uid\",\"logicalID\":\"test\"},\"generation\":2,\"binding\":{\"deploymentUID\":\"deployment\",\"storageID\":\"storage\"},\"pendingWrite\":false,\"transition\":null,\"receipt\":{\"opaque\":\"keep\"}},\"other\":{\"opaque\":\"keep\"}}}"
 done
+for name in lifecycle-cancel lifecycle-prepare; do
+  target_uid=$(k get rhizacluster "$name" -n "$namespace" -o jsonpath='{.metadata.uid}')
+  [ -n "$target_uid" ] || exit 1
+  printf '{"apiVersion":"rhiza.mrchypark.dev/v1alpha2","kind":"RhizaRecovery","metadata":{"name":"%s","namespace":"%s","finalizers":["rhiza.mrchypark.dev/recovery-record","example.invalid/keep"]},"spec":{"target":{"name":"%s","uid":"%s"},"expectedGeneration":2}}' "$name" "$namespace" "$name" "$target_uid" > "$logs/$name-recovery.json"
+  ok "$name-recovery-create" create --validate=strict -f "$logs/$name-recovery.json"
+done
+finalizer_uid=$(k get rhizacluster finalizer-contract -n "$namespace" -o jsonpath='{.metadata.uid}')
+[ -n "$finalizer_uid" ] || exit 1
+for name in finalizer-deleting finalizer-install; do
+  target=finalizer-contract
+  target_uid=$finalizer_uid
+  if [ "$name" = finalizer-install ]; then
+    target=missing-authority
+    target_uid=$(k get rhizacluster "$target" -n "$namespace" -o jsonpath='{.metadata.uid}')
+  fi
+  [ -n "$target_uid" ] || exit 1
+  printf '{"apiVersion":"rhiza.mrchypark.dev/v1alpha2","kind":"RhizaRecovery","metadata":{"name":"%s","namespace":"%s","finalizers":["example.invalid/keep"]},"spec":{"target":{"name":"%s","uid":"%s"},"expectedGeneration":2}}' "$name" "$namespace" "$target" "$target_uid" > "$logs/$name.json"
+  ok "$name-create" create --validate=strict -f "$logs/$name.json"
+done
+ok finalizer-deleting-delete delete rhizarecovery finalizer-deleting -n "$namespace" --wait=false
 queue_uid=$(k get rhizacluster queue-contract -n "$namespace" -o jsonpath='{.metadata.uid}')
 for name in queue-first queue-second; do
   printf '{"apiVersion":"rhiza.mrchypark.dev/v1alpha2","kind":"RhizaRecovery","metadata":{"name":"%s","namespace":"%s","finalizers":["rhiza.mrchypark.dev/recovery-record"]},"spec":{"target":{"name":"queue-contract","uid":"%s"},"expectedGeneration":2}}' "$name" "$namespace" "$queue_uid" > "$logs/$name.json"
@@ -198,7 +218,7 @@ rules:
   verbs: ["update"]
 - apiGroups: ["rhiza.mrchypark.dev"]
   resources: ["rhizarecoveries"]
-  verbs: ["get", "list"]
+  verbs: ["get", "list", "update", "delete"]
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: RoleBinding
@@ -220,7 +240,9 @@ k config view --raw --minify -o jsonpath='{.clusters[0].cluster.certificate-auth
 server=$(k config view --raw --minify -o jsonpath='{.clusters[0].cluster.server}')
 status_uid=$(k get rhizacluster status-contract -n "$namespace" -o jsonpath='{.metadata.uid}')
 missing_uid=$(k get rhizacluster missing-authority -n "$namespace" -o jsonpath='{.metadata.uid}')
-: "${server:?}" "${status_uid:?}" "${missing_uid:?}" "${queue_uid:?}"
+cancel_uid=$(k get rhizacluster lifecycle-cancel -n "$namespace" -o jsonpath='{.metadata.uid}')
+prepare_uid=$(k get rhizacluster lifecycle-prepare -n "$namespace" -o jsonpath='{.metadata.uid}')
+: "${server:?}" "${status_uid:?}" "${missing_uid:?}" "${queue_uid:?}" "${cancel_uid:?}" "${prepare_uid:?}"
 [ -s "$tokenfile" ] && [ -s "$cafile" ] || exit 1
-export RHIZA_CONTRACT_SERVER="$server" RHIZA_CONTRACT_CA="$cafile" RHIZA_CONTRACT_TOKEN="$tokenfile" RHIZA_CONTRACT_NAMESPACE="$namespace" RHIZA_CONTRACT_STATUS_UID="$status_uid" RHIZA_CONTRACT_QUEUE_UID="$queue_uid" RHIZA_CONTRACT_MISSING_UID="$missing_uid"
-go test ./pkg/operator -run '^TestV1Alpha2StatusAPIServerContract$' -count=1 -timeout=60s
+export RHIZA_CONTRACT_REQUIRED=1 RHIZA_CONTRACT_SERVER="$server" RHIZA_CONTRACT_CA="$cafile" RHIZA_CONTRACT_TOKEN="$tokenfile" RHIZA_CONTRACT_NAMESPACE="$namespace" RHIZA_CONTRACT_STATUS_UID="$status_uid" RHIZA_CONTRACT_QUEUE_UID="$queue_uid" RHIZA_CONTRACT_MISSING_UID="$missing_uid" RHIZA_CONTRACT_FINALIZER_UID="$finalizer_uid" RHIZA_CONTRACT_CANCEL_UID="$cancel_uid" RHIZA_CONTRACT_PREPARE_UID="$prepare_uid"
+go test ./pkg/operator -run '^TestV1Alpha2(Status|Lifecycle)APIServerContract$' -count=1 -timeout=60s
