@@ -50,17 +50,47 @@ func TestAzureSupervisedConstructorDoesNotProvisionBeforeWALBind(t *testing.T) {
 		t.Fatalf("legacy control: bucket=%v error=%v properties=%d creates=%d", legacy != nil, err, properties.Load(), creates.Load())
 	}
 	t.Logf("legacy constructor lost-response control: properties=%d create attempts=%d", properties.Load(), creates.Load())
-	properties.Store(0)
-	creates.Store(0)
-	bucket, err := NewBucketForSupervisedStartup(WithReplayObservation(context.Background()), config)
-	if err != nil {
-		t.Fatalf("supervised constructor: %v", err)
+	for _, constructor := range []struct {
+		name string
+		open func(context.Context, Config) (*MeteredBucket, error)
+	}{{"without provisioning", NewBucketWithoutProvisioning}, {"supervised", NewBucketForSupervisedStartup}} {
+		t.Run(constructor.name, func(t *testing.T) {
+			properties.Store(0)
+			creates.Store(0)
+			bucket, err := constructor.open(WithReplayObservation(context.Background()), config)
+			if err != nil {
+				t.Fatalf("constructor: %v", err)
+			}
+			defer bucket.Close()
+			if properties.Load() != 0 || creates.Load() != 0 {
+				t.Fatalf("constructor requests: properties=%d creates=%d", properties.Load(), creates.Load())
+			}
+			if !bucket.Stats().ReplayGroupingEnabled {
+				t.Fatal("constructor dropped the context observer")
+			}
+		})
 	}
-	defer bucket.Close()
-	if properties.Load() != 0 || creates.Load() != 0 {
-		t.Fatalf("supervised pre-bind requests: properties=%d creates=%d", properties.Load(), creates.Load())
+}
+
+func TestNonProvisioningConstructorsRejectInvalidConfig(t *testing.T) {
+	for _, open := range []func(context.Context, Config) (*MeteredBucket, error){NewBucketWithoutProvisioning, NewBucketForSupervisedStartup} {
+		for _, cfg := range []Config{{}, {Provider: "unknown"}, {Provider: ProviderAzure}} {
+			bucket, err := open(nil, cfg)
+			if err == nil || bucket != nil {
+				t.Fatalf("config %+v: bucket=%v error=%v", cfg, bucket != nil, err)
+			}
+		}
 	}
-	if !bucket.Stats().ReplayGroupingEnabled {
-		t.Fatal("supervised constructor dropped the context observer")
+}
+
+func TestNonProvisioningConstructorsAcceptNilContext(t *testing.T) {
+	for _, open := range []func(context.Context, Config) (*MeteredBucket, error){NewBucketWithoutProvisioning, NewBucketForSupervisedStartup} {
+		bucket, err := open(nil, Config{Provider: ProviderFilesystem, FilesystemDir: t.TempDir()})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := bucket.Close(); err != nil {
+			t.Fatal(err)
+		}
 	}
 }

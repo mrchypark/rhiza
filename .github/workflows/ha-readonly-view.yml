@@ -6,6 +6,7 @@ on:
       - feature/ha-v1alpha2-readonly-view
       - feature/ha-v1alpha2-prepare-restore
       - feature/ha-v1alpha2-append-only
+      - feature/ha-existing-bucket
   workflow_dispatch:
 
 permissions:
@@ -22,13 +23,43 @@ jobs:
           go-version-file: go.mod
           cache: true
       - name: Verify HA packages
-        run: go test ./pkg/node ./pkg/checkpoint ./pkg/recovery -count=1 -timeout=180s
+        run: go test ./internal/objstore ./pkg/node ./pkg/checkpoint ./pkg/recovery -count=1 -timeout=180s
       - name: Verify fixed-head recovery view under race detector
         run: go test -race ./pkg/node ./pkg/checkpoint ./pkg/recovery -run '^TestHA' -count=1 -timeout=180s
       - name: Exercise fixed-head reads against pinned Floci providers
         run: |
           set -euo pipefail
-          RHIZA_EMBEDDED_TEST_PATTERN='^TestEmbeddedObjectStorageHAReadOnlyView$' sh scripts/test-embedded-object-providers.sh 2>&1 | tee "$RUNNER_TEMP/ha-readonly-providers.log"
+          check_provider_results() {
+            awk '
+              /^Testing (s3|gcs|azure) at / { provider=$2; seen[provider]++; next }
+              /^--- (PASS|SKIP|FAIL): TestEmbeddedObjectStorage(HAReadOnlyView|ExistingBucket) / {
+                key=provider SUBSEP $3
+                if ($2 == "PASS:") pass[key]++
+                else bad[key]++
+              }
+              END {
+                split("s3 gcs azure", providers)
+                split("TestEmbeddedObjectStorageHAReadOnlyView TestEmbeddedObjectStorageExistingBucket", tests)
+                for (i=1; i<=3; i++) {
+                  if (seen[providers[i]] != 1) { print "missing or duplicate provider scope: " providers[i] > "/dev/stderr"; failed=1 }
+                  for (j=1; j<=2; j++) {
+                    key=providers[i] SUBSEP tests[j]
+                    if (pass[key] != 1 || bad[key] != 0) { print "missing, skipped, failed, or duplicate test: " providers[i] " " tests[j] > "/dev/stderr"; failed=1 }
+                  }
+                }
+                exit failed
+              }'
+          }
+          sample=$(printf 'Testing %s at local\n--- PASS: TestEmbeddedObjectStorageHAReadOnlyView (0s)\n--- PASS: TestEmbeddedObjectStorageExistingBucket (0s)\n' s3 gcs azure)
+          printf '%s\n' "$sample" | check_provider_results
+          if printf '%s\n' "$sample" | awk '!done && /^--- PASS: TestEmbeddedObjectStorageExistingBucket / {sub("PASS:", "SKIP:"); done=1} {print}' | check_provider_results 2>/dev/null; then
+            echo 'provider result guard accepted a skipped test' >&2; exit 1
+          fi
+          if printf '%s\n' "$sample" | awk '!done && /^--- PASS: TestEmbeddedObjectStorageExistingBucket / {done=1; next} {print}' | check_provider_results 2>/dev/null; then
+            echo 'provider result guard accepted a missing test' >&2; exit 1
+          fi
+          RHIZA_EMBEDDED_TEST_PATTERN='^TestEmbeddedObjectStorage(HAReadOnlyView|ExistingBucket)$' sh scripts/test-embedded-object-providers.sh 2>&1 | tee "$RUNNER_TEMP/ha-readonly-providers.log"
+          check_provider_results < "$RUNNER_TEMP/ha-readonly-providers.log"
         shell: bash
       - name: Preserve provider diagnostics
         if: always()
