@@ -116,6 +116,8 @@ func TestEmbeddedCheckpointFixtureBaseline(t *testing.T) {
 func TestEmbeddedObjectStorageCheckpointAndTailTotalLoss(t *testing.T) {
 	cfg := embeddedCheckpointConfig(t)
 	cfg.ClusterID = "embedded-checkpoint-tail"
+	// Observe BeforeAck publication without racing unrelated periodic sync.
+	cfg.ObjStoreSyncInterval = 24 * time.Hour
 	h := newEmbeddedHistoryConfig(t, false, cfg)
 	names := []string{"original"}
 	checkpoint := embeddedAdvanceCheckpoint(h, h.original.Slot, "checkpoint-prefix", &names)
