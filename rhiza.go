@@ -76,6 +76,9 @@ type ObjectStoreDurability = types.ObjectStoreDurability
 
 // Config contains the durable local path, fixed membership, and peer endpoint.
 type Config struct {
+	// PreparedStartup selects non-serving, authority-checked prepared recovery.
+	// Application write admission is not yet available for this path.
+	PreparedStartup *node.PreparedStartupConfig
 	// Local disables peer networking and uses a standalone local store. When
 	// ObjStore settings are supplied, backups stream automatically and an empty
 	// DataDir restores from that archive. The deployment must ensure one writer,
@@ -217,7 +220,11 @@ func Open(ctx context.Context, config Config) (*DB, error) {
 	}
 	childCtx, cancel := context.WithCancel(ctx)
 	n := node.New(internalConfig)
-	if err := n.Open(childCtx); err != nil {
+	open := n.Open
+	if config.PreparedStartup != nil {
+		open = func(ctx context.Context) error { return n.OpenPrepared(ctx, *config.PreparedStartup) }
+	}
+	if err := open(childCtx); err != nil {
 		cancel()
 		return nil, err
 	}
@@ -228,6 +235,16 @@ func Open(ctx context.Context, config Config) (*DB, error) {
 		return nil, err
 	}
 	return &DB{node: n, api: api, cancel: cancel}, nil
+}
+
+// PreparedStartupBindingDigests derives non-secret handoff bindings from the
+// same configuration used by Open.
+func PreparedStartupBindingDigests(config Config) (string, string, error) {
+	internalConfig, err := executionConfig(config)
+	if err != nil {
+		return "", "", err
+	}
+	return node.New(internalConfig).PreparedStartupBindingDigests()
 }
 
 // EnrollExistingVoter performs one-time registration of an original pre-upgrade

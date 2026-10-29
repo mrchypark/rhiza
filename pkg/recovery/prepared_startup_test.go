@@ -7,6 +7,8 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+
+	"github.com/mrchypark/rhiza/pkg/materializer"
 )
 
 func TestPreparedStartupCapturedHeadReverifiedAfterAdvance(t *testing.T) {
@@ -69,9 +71,41 @@ func TestPreparedStartupPublishLoadAndRejectTampering(t *testing.T) {
 		t.Fatal(err)
 	}
 	haReadOnlyAppend(t, f, "second")
+	loadPrepared := func(expected PreparedStartupIdentity) (*VerifiedPreparedStartup, error) {
+		return LoadPreparedStartup(f.ctx, bucket, f.prefix, 1, f.bootstrap, dir, filepath.Join(t.TempDir(), "verified"), expected)
+	}
 	load := func(expected PreparedStartupIdentity) error {
-		_, err := LoadPreparedStartup(f.ctx, bucket, f.prefix, 1, f.bootstrap, dir, expected)
+		_, err := loadPrepared(expected)
 		return err
+	}
+	verifyReconstructed := func(p *VerifiedPreparedStartup) {
+		t.Helper()
+		if p.Directory() == dir {
+			t.Fatal("loaded mutable handoff directory")
+		}
+		state, err := materializer.Open(filepath.Join(p.Directory(), "sqlite.db"), 1)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer state.Close()
+		if state.Tip() != uint64(view.Tip()) {
+			t.Fatalf("tip=%d want=%d", state.Tip(), view.Tip())
+		}
+		if _, found, err := state.GraphMutationReceipt(f.ctx, "first"); err != nil || !found {
+			t.Fatalf("certified graph receipt: %v %v", found, err)
+		}
+	}
+	graphPath := func(root string) string {
+		t.Helper()
+		p := filepath.Join(root, "latticedb", "graph.ltdb")
+		info, err := os.Stat(p)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if info.IsDir() {
+			return filepath.Join(p, "state.json")
+		}
+		return p
 	}
 	if err := load(identity); err != nil {
 		t.Fatalf("valid captured preparation: %v", err)
@@ -139,12 +173,20 @@ func TestPreparedStartupPublishLoadAndRejectTampering(t *testing.T) {
 		if err := os.WriteFile(marker, encoded, 0600); err != nil {
 			t.Fatal(err)
 		}
-		if err := load(identity); err == nil {
-			t.Fatal("changed SQLite and matching forged marker accepted")
+		p, err := loadPrepared(identity)
+		if err == nil {
+			got, err := os.ReadFile(filepath.Join(p.Directory(), "sqlite.db"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if bytes.Equal(got, changed) {
+				t.Fatal("forged SQLite adopted")
+			}
+			verifyReconstructed(p)
 		}
 	})
 	t.Run("tampered graph data", func(t *testing.T) {
-		p := filepath.Join(dir, "latticedb", "graph.ltdb")
+		p := graphPath(dir)
 		original, err := os.ReadFile(p)
 		if err != nil {
 			t.Fatal(err)
@@ -157,12 +199,20 @@ func TestPreparedStartupPublishLoadAndRejectTampering(t *testing.T) {
 		if err := os.WriteFile(p, append(bytes.Clone(original), 1), 0600); err != nil {
 			t.Fatal(err)
 		}
-		if err := load(identity); err == nil {
-			t.Fatal("changed graph data accepted")
+		prepared, err := loadPrepared(identity)
+		if err == nil {
+			got, err := os.ReadFile(graphPath(prepared.Directory()))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if bytes.Equal(got, append(bytes.Clone(original), 1)) {
+				t.Fatal("forged graph adopted")
+			}
+			verifyReconstructed(prepared)
 		}
 	})
 	t.Run("missing graph data", func(t *testing.T) {
-		p := filepath.Join(dir, "latticedb", "graph.ltdb")
+		p := graphPath(dir)
 		original, err := os.ReadFile(p)
 		if err != nil {
 			t.Fatal(err)
@@ -175,8 +225,8 @@ func TestPreparedStartupPublishLoadAndRejectTampering(t *testing.T) {
 		if err := os.Remove(p); err != nil {
 			t.Fatal(err)
 		}
-		if err := load(identity); err == nil {
-			t.Fatal("missing graph data accepted")
+		if prepared, err := loadPrepared(identity); err == nil {
+			verifyReconstructed(prepared)
 		}
 	})
 	if err := os.Remove(filepath.Join(dir, "completed.json")); err != nil {

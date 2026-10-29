@@ -75,6 +75,7 @@ type Node struct {
 	terminalResult            TerminalDrainResult
 	terminalErr               error
 	fenceSession              *fencing.Session
+	preparedStartup           *PreparedStartupConfig
 }
 
 // nodeRecoveryPhases records the selected certified checkpoint restore path.
@@ -172,6 +173,9 @@ func validateVoterMembership(config *types.ExecutionConfig) error {
 
 // Open starts the embedded engine and its private peer transport without serving HTTP.
 func (n *Node) Open(ctx context.Context) error {
+	if n.preparedStartup != nil {
+		return n.openPrepared(ctx, *n.preparedStartup)
+	}
 	return n.open(ctx, false)
 }
 

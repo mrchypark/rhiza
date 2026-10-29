@@ -90,6 +90,10 @@ func voterIdentityFor(config *types.ExecutionConfig) voterIdentity {
 // ensureVoterIdentity runs before any archive replay or peer listener. An
 // archive contains decided values, not the lost voter's outstanding promises.
 func ensureVoterIdentity(ctx context.Context, config *types.ExecutionConfig, bucket objstore.Bucket, wal *qlog.WAL, local localVoterState, enroll bool, beforeWrite ...func(context.Context, string) error) error {
+	return ensureVoterIdentityManaged(ctx, config, bucket, wal, local, enroll, false, beforeWrite...)
+}
+
+func ensureVoterIdentityManaged(ctx context.Context, config *types.ExecutionConfig, bucket objstore.Bucket, wal *qlog.WAL, local localVoterState, enroll, preparedLearner bool, beforeWrite ...func(context.Context, string) error) error {
 	want := voterIdentityFor(config)
 	bound, hasBinding := wal.Identity()
 	if local.identity != nil {
@@ -121,11 +125,14 @@ func ensureVoterIdentity(ctx context.Context, config *types.ExecutionConfig, buc
 	}
 	// Single-voter archive recovery remains supported, but must never bypass
 	// a namespace that was registered for a multi-voter cluster.
-	if len(config.Members) <= 1 && clusterData == nil && local.identity == nil && !enroll {
+	if len(config.Members) <= 1 && clusterData == nil && local.identity == nil && !enroll && !preparedLearner {
 		return nil
 	}
-	if len(config.Members) <= 1 {
+	if len(config.Members) <= 1 && !preparedLearner {
 		return fmt.Errorf("%w: membership cannot be changed during startup", ErrVoterStateLost)
+	}
+	if preparedLearner && (config.Learner == nil || clusterData == nil) {
+		return fmt.Errorf("%w: prepared learner requires existing membership registration", ErrVoterStateLost)
 	}
 	if !slices.Contains(bucket.SupportedObjectUploadOptions(), objstore.IfNotExists) {
 		return fmt.Errorf("voter registration requires conditional object writes")

@@ -10,7 +10,6 @@ import (
 	"io"
 	"os"
 	"path/filepath"
-	"reflect"
 
 	"github.com/mrchypark/rhiza/pkg/quepaxa"
 	"github.com/thanos-io/objstore"
@@ -38,12 +37,14 @@ type preparedStartupManifest struct {
 
 // VerifiedPreparedStartup is verified local data, never startup authority.
 type VerifiedPreparedStartup struct {
-	dir  string
-	view *ReadOnlyView
+	dir      string
+	view     *ReadOnlyView
+	identity PreparedStartupIdentity
 }
 
-func (p *VerifiedPreparedStartup) Directory() string   { return p.dir }
-func (p *VerifiedPreparedStartup) View() *ReadOnlyView { return p.view }
+func (p *VerifiedPreparedStartup) Directory() string                 { return p.dir }
+func (p *VerifiedPreparedStartup) View() *ReadOnlyView               { return p.view }
+func (p *VerifiedPreparedStartup) Identity() PreparedStartupIdentity { return p.identity }
 
 func validPreparedIdentity(i PreparedStartupIdentity) bool {
 	return i.ClusterUID != "" && i.Generation >= 0 && i.DeploymentUID != "" && i.PodUID != "" && i.NodeID != "" && i.SourceBinding != "" && i.ConfigDigest != ""
@@ -118,18 +119,19 @@ func PublishPreparedStartup(ctx context.Context, view *ReadOnlyView, targetDir s
 	return nil
 }
 
-// LoadPreparedStartup verifies the captured history and integrity of prepared
-// files. It requires a caller-controlled directory, including against races;
-// it does not authenticate a mutable manifest or grant permission to write.
-func LoadPreparedStartup(ctx context.Context, bucket objstore.Bucket, prefix string, configID uint, bootstrap quepaxa.Cluster, targetDir string, expected PreparedStartupIdentity) (result *VerifiedPreparedStartup, resultErr error) {
+// LoadPreparedStartup verifies captured history and reconstructs it into a new
+// caller-controlled target. The init data is not adopted. Both parents must be
+// controlled against replacement; failed targets remain for inspection. This
+// does not authenticate the mutable manifest or grant permission to write.
+func LoadPreparedStartup(ctx context.Context, bucket objstore.Bucket, prefix string, configID uint, bootstrap quepaxa.Cluster, handoffDir, verifiedTargetDir string, expected PreparedStartupIdentity) (*VerifiedPreparedStartup, error) {
 	if !validPreparedIdentity(expected) {
 		return nil, fmt.Errorf("invalid expected identity")
 	}
-	info, err := os.Lstat(targetDir)
+	info, err := os.Lstat(handoffDir)
 	if err != nil || !info.IsDir() || info.Mode()&os.ModeSymlink != 0 {
 		return nil, fmt.Errorf("invalid preparation directory")
 	}
-	marker := filepath.Join(targetDir, "completed.json")
+	marker := filepath.Join(handoffDir, "completed.json")
 	data, err := readPreparedMarker(marker)
 	if err != nil {
 		return nil, err
@@ -153,37 +155,11 @@ func LoadPreparedStartup(ctx context.Context, bucket objstore.Bucket, prefix str
 	if err != nil {
 		return nil, err
 	}
-	sqlHash, err := preparedFileHash(filepath.Join(targetDir, "sqlite.db"), false)
+	sqlHash, err := preparedFileHash(filepath.Join(handoffDir, "sqlite.db"), false)
 	if err != nil || sqlHash != m.SQLiteHash {
 		return nil, fmt.Errorf("prepared SQLite integrity mismatch")
 	}
-	verifyDir, err := os.MkdirTemp("", "rhiza-prepared-verify-*")
-	if err != nil {
-		return nil, err
-	}
-	defer func() {
-		if err := os.RemoveAll(verifyDir); err != nil {
-			result = nil
-			resultErr = errors.Join(resultErr, fmt.Errorf("remove verification directory %s: %w", verifyDir, err))
-		}
-	}()
-	verified, err := PrepareReadOnlyRestore(ctx, view, filepath.Join(verifyDir, "data"))
-	if err != nil {
-		return nil, fmt.Errorf("reconstruct prepared state: %w", err)
-	}
-	verifiedHash, err := preparedFileHash(verified.SQLitePath, false)
-	if err != nil || verifiedHash != sqlHash {
-		return nil, fmt.Errorf("prepared SQLite differs from verified source")
-	}
-	graph, err := preparedGraphTree(targetDir, false)
-	if err != nil {
-		return nil, err
-	}
-	expectedGraph, err := preparedGraphTree(verified.TargetDir, false)
-	if err != nil || !reflect.DeepEqual(graph, expectedGraph) {
-		return nil, fmt.Errorf("prepared graph differs from verified source")
-	}
-	suffix := filepath.Join(targetDir, "certified-suffix.json")
+	suffix := filepath.Join(handoffDir, "certified-suffix.json")
 	suffixHash, err := preparedFileHash(suffix, false)
 	if err != nil || suffixHash != m.SuffixHash {
 		return nil, fmt.Errorf("prepared suffix integrity mismatch")
@@ -196,7 +172,29 @@ func LoadPreparedStartup(ctx context.Context, bucket objstore.Bucket, prefix str
 	if err != nil || !bytes.Equal(got, want) {
 		return nil, fmt.Errorf("prepared suffix differs from verified history")
 	}
-	return &VerifiedPreparedStartup{dir: targetDir, view: view}, nil
+	verified, err := PrepareReadOnlyRestore(ctx, view, verifiedTargetDir)
+	if err != nil {
+		return nil, fmt.Errorf("reconstruct prepared state in %s: %w", verifiedTargetDir, err)
+	}
+	if _, err = preparedFileHash(verified.SQLitePath, true); err != nil {
+		return nil, err
+	}
+	if _, err = preparedFileHash(verified.SuffixPath, true); err != nil {
+		return nil, err
+	}
+	if _, err = preparedGraphTree(verifiedTargetDir, true); err != nil {
+		return nil, err
+	}
+	for _, dir := range []string{verifiedTargetDir, filepath.Dir(verifiedTargetDir)} {
+		f, err := os.Open(dir)
+		if err != nil {
+			return nil, err
+		}
+		if err := errors.Join(f.Sync(), f.Close()); err != nil {
+			return nil, fmt.Errorf("sync reconstruction directory %s: %w", dir, err)
+		}
+	}
+	return &VerifiedPreparedStartup{dir: verifiedTargetDir, view: view, identity: expected}, nil
 }
 
 func readPreparedMarker(name string) (data []byte, resultErr error) {

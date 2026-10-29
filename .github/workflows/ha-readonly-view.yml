@@ -8,6 +8,7 @@ on:
       - feature/ha-v1alpha2-append-only
       - feature/ha-existing-bucket
       - feature/ha-prepared-startup
+      - feature/ha-node-prepared-restore
   workflow_dispatch:
 
 permissions:
@@ -24,26 +25,30 @@ jobs:
           go-version-file: go.mod
           cache: true
       - name: Verify HA packages
-        run: go test ./internal/objstore ./pkg/node ./pkg/checkpoint ./pkg/recovery -count=1 -timeout=180s
+        run: |
+          go test ./internal/objstore ./pkg/node ./pkg/checkpoint ./pkg/recovery -count=1 -timeout=180s
+          go test . -run '^TestPreparedNode(StageAvoidsLegacyRecoverySnapshot|RegistrationRequestScope)$' -count=1 -timeout=60s
       - name: Verify fixed-head recovery view under race detector
-        run: go test -race ./pkg/node ./pkg/checkpoint ./pkg/recovery -run '^Test(HA|PreparedStartup)' -count=1 -timeout=180s
+        run: |
+          go test -race ./pkg/node ./pkg/checkpoint ./pkg/recovery -run '^Test(HA|Prepared)' -count=1 -timeout=180s
+          go test -race . -run '^TestPreparedNodeRegistrationRequestScope$' -count=1 -timeout=60s
       - name: Exercise fixed-head reads against pinned Floci providers
         run: |
           set -euo pipefail
           check_provider_results() {
             awk '
               /^Testing (s3|gcs|azure) at / { provider=$2; seen[provider]++; next }
-              /^--- (PASS|SKIP|FAIL): TestEmbeddedObjectStorage(HAReadOnlyView|ExistingBucket) / {
+              /^--- (PASS|SKIP|FAIL): TestEmbeddedObjectStorage(HAReadOnlyView|ExistingBucket|NodePreparedRestore) / {
                 key=provider SUBSEP $3
                 if ($2 == "PASS:") pass[key]++
                 else bad[key]++
               }
               END {
                 split("s3 gcs azure", providers)
-                split("TestEmbeddedObjectStorageHAReadOnlyView TestEmbeddedObjectStorageExistingBucket", tests)
+                split("TestEmbeddedObjectStorageHAReadOnlyView TestEmbeddedObjectStorageExistingBucket TestEmbeddedObjectStorageNodePreparedRestore", tests)
                 for (i=1; i<=3; i++) {
                   if (seen[providers[i]] != 1) { print "missing or duplicate provider scope: " providers[i] > "/dev/stderr"; failed=1 }
-                  for (j=1; j<=2; j++) {
+                  for (j=1; j<=3; j++) {
                     key=providers[i] SUBSEP tests[j]
                     if (pass[key] != 1 || bad[key] != 0) { print "missing, skipped, failed, or duplicate test: " providers[i] " " tests[j] > "/dev/stderr"; failed=1 }
                   }
@@ -51,7 +56,7 @@ jobs:
                 exit failed
               }'
           }
-          sample=$(printf 'Testing %s at local\n--- PASS: TestEmbeddedObjectStorageHAReadOnlyView (0s)\n--- PASS: TestEmbeddedObjectStorageExistingBucket (0s)\n' s3 gcs azure)
+          sample=$(printf 'Testing %s at local\n--- PASS: TestEmbeddedObjectStorageHAReadOnlyView (0s)\n--- PASS: TestEmbeddedObjectStorageExistingBucket (0s)\n--- PASS: TestEmbeddedObjectStorageNodePreparedRestore (0s)\n' s3 gcs azure)
           printf '%s\n' "$sample" | check_provider_results
           if printf '%s\n' "$sample" | awk '!done && /^--- PASS: TestEmbeddedObjectStorageExistingBucket / {sub("PASS:", "SKIP:"); done=1} {print}' | check_provider_results 2>/dev/null; then
             echo 'provider result guard accepted a skipped test' >&2; exit 1
@@ -59,7 +64,7 @@ jobs:
           if printf '%s\n' "$sample" | awk '!done && /^--- PASS: TestEmbeddedObjectStorageExistingBucket / {done=1; next} {print}' | check_provider_results 2>/dev/null; then
             echo 'provider result guard accepted a missing test' >&2; exit 1
           fi
-          RHIZA_EMBEDDED_TEST_PATTERN='^TestEmbeddedObjectStorage(HAReadOnlyView|ExistingBucket)$' sh scripts/test-embedded-object-providers.sh 2>&1 | tee "$RUNNER_TEMP/ha-readonly-providers.log"
+          RHIZA_EMBEDDED_TEST_PATTERN='^TestEmbeddedObjectStorage(HAReadOnlyView|ExistingBucket|NodePreparedRestore)$' sh scripts/test-embedded-object-providers.sh 2>&1 | tee "$RUNNER_TEMP/ha-readonly-providers.log"
           check_provider_results < "$RUNNER_TEMP/ha-readonly-providers.log"
         shell: bash
       - name: Preserve provider diagnostics

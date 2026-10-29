@@ -264,11 +264,12 @@ func TestEmbeddedObjectStorageHAReadOnlyView(t *testing.T) {
 	if err := recovery.PublishPreparedStartup(ctx, view, handoffDir, identity); err != nil {
 		t.Fatalf("publish prepared handoff: %v", err)
 	}
-	handoff, err := recovery.LoadPreparedStartup(ctx, readonly, "ha-readonly", 1, bootstrap, handoffDir, identity)
+	verifiedDir := filepath.Join(t.TempDir(), "verified")
+	handoff, err := recovery.LoadPreparedStartup(ctx, readonly, "ha-readonly", 1, bootstrap, handoffDir, verifiedDir, identity)
 	if err != nil {
 		t.Fatalf("load prepared handoff: %v", err)
 	}
-	if handoff.Directory() != handoffDir || handoff.View().HeadHash() != view.HeadHash() || handoff.View().Tip() != view.Tip() || handoff.View().PrefixHash() != view.PrefixHash() {
+	if handoff.Directory() != verifiedDir || handoff.View().HeadHash() != view.HeadHash() || handoff.View().Tip() != view.Tip() || handoff.View().PrefixHash() != view.PrefixHash() {
 		t.Fatal("verified handoff differs from captured source")
 	}
 	restored, err := materializer.Open(prepared.SQLitePath, 1)
