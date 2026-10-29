@@ -1,6 +1,37 @@
 #!/bin/sh
 set -eu
 
+admission_error() {
+  file=$1 expected=$2
+  if grep -Ei 'connection refused|timed out|timeout|unable to connect|no such host|i/o timeout|EOF|Error from server \((Forbidden|NotFound)\)' "$file" >/dev/null; then return 1; fi
+  grep -F "$expected" "$file" >/dev/null || return 1
+  grep -E 'Error from server \((Invalid|BadRequest)\)|strict decoding error|^The (RhizaCluster|RhizaRecovery) "[^"]+" is invalid:' "$file" >/dev/null
+}
+
+if [ "${1:-}" = --self-test-oracle ]; then
+  tmp=$(mktemp -d "${TMPDIR:-/tmp}/ha-oracle.XXXXXXXX")
+  trap 'rm -f "$tmp/case"; rmdir "$tmp"' EXIT HUP INT TERM
+  printf '%s\n' 'The RhizaCluster "cluster" is invalid: spec.logicalID: Invalid value: "other": logicalID is immutable' > "$tmp/case"
+  admission_error "$tmp/case" 'logicalID is immutable' || exit 1
+  if admission_error "$tmp/case" 'target is immutable'; then exit 1; fi
+  for line in \
+    'Error from server (Invalid): target is immutable' \
+    'Error from server (BadRequest): strict decoding error: unknown field "spec.target.typo"'; do
+    printf '%s\n' "$line" > "$tmp/case"
+    case "$line" in *Invalid*) expected='target is immutable';; *) expected='spec.target.typo';; esac
+    admission_error "$tmp/case" "$expected" || exit 1
+  done
+  for line in \
+    'Error from server (NotFound): target is immutable' \
+    'Error from server (Forbidden): target is immutable' \
+    'connection refused: target is immutable' \
+    'timeout: target is immutable'; do
+    printf '%s\n' "$line" > "$tmp/case"
+    if admission_error "$tmp/case" 'target is immutable'; then exit 1; fi
+  done
+  exit 0
+fi
+
 : "${RUNNER_TEMP:?RUNNER_TEMP is required}"
 : "${GITHUB_RUN_ID:?GITHUB_RUN_ID is required}"
 : "${GITHUB_RUN_ATTEMPT:?GITHUB_RUN_ATTEMPT is required}"
@@ -59,7 +90,7 @@ ok() {
 reject() {
   label=$1; expected=$2; shift 2
   if k "$@" > "$logs/$label.txt" 2>&1; then echo "unexpected acceptance: $label" >&2; return 1; fi
-  if grep -Ei 'connection refused|timed out|timeout|unable to connect|no such host|i/o timeout|EOF' "$logs/$label.txt" >/dev/null || ! grep -Ei 'Error from server \((Invalid|BadRequest)\)|strict decoding error' "$logs/$label.txt" >/dev/null || ! grep -F "$expected" "$logs/$label.txt" >/dev/null; then
+  if ! admission_error "$logs/$label.txt" "$expected"; then
     echo "not an admission rejection: $label" >&2; cat "$logs/$label.txt" >&2; return 1
   fi
 }
