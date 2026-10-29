@@ -259,6 +259,18 @@ func TestEmbeddedObjectStorageHAReadOnlyView(t *testing.T) {
 	if prepared.HeadHash != view.HeadHash() || prepared.Base != view.Base() || prepared.Tip != view.Tip() || prepared.PrefixHash != view.PrefixHash() {
 		t.Fatalf("prepared identity differs from verified view: %+v", prepared)
 	}
+	identity := recovery.PreparedStartupIdentity{ClusterUID: "cluster", Generation: 0, DeploymentUID: "deployment", PodUID: "pod", NodeID: "node", SourceBinding: "ha-readonly", ConfigDigest: "fixture-config"}
+	handoffDir := filepath.Join(t.TempDir(), "handoff")
+	if err := recovery.PublishPreparedStartup(ctx, view, handoffDir, identity); err != nil {
+		t.Fatalf("publish prepared handoff: %v", err)
+	}
+	handoff, err := recovery.LoadPreparedStartup(ctx, readonly, "ha-readonly", 1, bootstrap, handoffDir, identity)
+	if err != nil {
+		t.Fatalf("load prepared handoff: %v", err)
+	}
+	if handoff.Directory() != handoffDir || handoff.View().HeadHash() != view.HeadHash() || handoff.View().Tip() != view.Tip() || handoff.View().PrefixHash() != view.PrefixHash() {
+		t.Fatal("verified handoff differs from captured source")
+	}
 	restored, err := materializer.Open(prepared.SQLitePath, 1)
 	if err != nil {
 		t.Fatalf("open prepared materializer: %v", err)
