@@ -11,7 +11,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"log"
 	"net"
 	"net/http"
 	"net/url"
@@ -67,22 +66,12 @@ type sourceState struct {
 	stateful        object
 }
 
+// ErrHARecoveryUnavailable prevents the legacy engine from running while the
+// v1alpha2 recovery implementation and its safety gates are incomplete.
+var ErrHARecoveryUnavailable = errors.New("HA recovery is unavailable")
+
 func (c *Controller) Run(ctx context.Context, interval time.Duration) error {
-	if c.Kube == nil || c.Bucket == nil || interval <= 0 {
-		return fmt.Errorf("Kubernetes client, bucket, and positive poll interval are required")
-	}
-	for {
-		if err := c.reconcileAll(ctx); err != nil && ctx.Err() == nil {
-			log.Printf("recovery reconciliation: %v", err)
-		}
-		timer := time.NewTimer(interval)
-		select {
-		case <-ctx.Done():
-			timer.Stop()
-			return ctx.Err()
-		case <-timer.C:
-		}
-	}
+	return ErrHARecoveryUnavailable
 }
 func (c *Controller) reconcileAll(ctx context.Context) error {
 	var resources recoveryList

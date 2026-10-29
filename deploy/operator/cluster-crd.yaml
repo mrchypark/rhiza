@@ -10,7 +10,7 @@ spec:
     singular: rhizacluster
     kind: RhizaCluster
   versions:
-    - name: v1alpha1
+    - name: v1alpha2
       served: true
       storage: true
       subresources:
@@ -22,86 +22,97 @@ spec:
           properties:
             spec:
               type: object
-              required: [logicalID, statefulSet, container, adoptClusterID, voterCount, automatic, policy]
+              required: [logicalID, voterCount, workload]
+              x-kubernetes-validations:
+                - rule: '!has(self.statefulSet) && !has(self.container) && !has(self.adoptClusterID) && !has(self.automatic) && !has(self.policy) && !has(self.bootstrap) && !has(self.clusterDomain) && !has(self.anchorID) && !has(self.httpPort) && !has(self.peerPort) && !has(self.voterPods)'
+                  message: legacy cluster fields are unsupported
+                - rule: self.voterCount == oldSelf.voterCount
+                  message: voterCount updates are unsupported
               properties:
+                statefulSet: {type: string}
+                container: {type: string}
+                adoptClusterID: {type: string}
+                automatic: {type: boolean}
+                policy: {type: object, x-kubernetes-preserve-unknown-fields: true}
+                bootstrap: {type: boolean}
+                clusterDomain: {type: string}
+                anchorID: {type: string}
+                httpPort: {type: integer}
+                peerPort: {type: integer}
+                voterPods: {type: array, items: {type: string}}
                 logicalID:
                   type: string
                   minLength: 1
-                statefulSet:
-                  type: string
-                  minLength: 1
-                container:
-                  type: string
-                  minLength: 1
-                adoptClusterID:
-                  type: string
-                  minLength: 1
-                anchorID:
-                  type: string
-                  description: >-
-                    External recovery anchor identifier for automatic child recovery
-                    resources. When set, every generated RhizaRecovery inherits this
-                    anchorID and the workload must export RHIZA_RECOVERY_ANCHOR_ID.
-                voterCount:
-                  description: >-
-                    Voter count for the source and replacement generation. The
-                    StatefulSet must declare the same number of desired replicas.
-                    When it exports RHIZA_CLUSTER_MEMBERS, that list must contain
-                    the same count and use the Pod names <statefulSet>-<ordinal>.
-                    The controller derives those names, the headless-service
-                    DNS names, and fresh credentials. The count cannot be changed
-                    in place. Generation fencing names every voter plus retained
-                    learner history within RhizaFence.spec.targets.maxItems (64).
-                  type: integer
-                  minimum: 3
-                  maximum: 64
-                httpPort:
-                  description: >-
-                    HTTP port used in generated voter URLs. Defaults to 8080.
-                  type: integer
-                  minimum: 1
-                  maximum: 65535
-                  default: 8080
-                peerPort:
-                  description: >-
-                    QUIC peer port used in generated voter URLs. Defaults to 9090.
-                  type: integer
-                  minimum: 1
-                  maximum: 65535
-                  default: 9090
-                clusterDomain:
-                  description: >-
-                    Kubernetes cluster DNS domain used in generated voter URLs.
-                    Defaults to cluster.local.
-                  type: string
-                  pattern: '^[a-z0-9]([-a-z0-9]*[a-z0-9])?(\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*$'
-                  default: cluster.local
-                bootstrap:
-                  description: >-
-                    Generate the initial membership for a workload that exports
-                    no RHIZA_CLUSTER_MEMBERS. Defaults to false. The controller
-                    refuses bootstrap when the adopted cluster ID already has a
-                    membership commitment in object storage.
-                  type: boolean
-                  default: false
-                automatic:
-                  type: boolean
-                  description: Explicit consent to fence an unreachable generation even when an observer-only partition might hide a healthy majority. False suspends new incidents, not an already reserved recovery.
-                policy:
+                  pattern: '[^\x{0009}-\x{000D}\x{0020}\x{0085}\x{00A0}\x{1680}\x{2000}-\x{200A}\x{2028}\x{2029}\x{202F}\x{205F}\x{3000}]'
+                  x-kubernetes-validations:
+                    - rule: self == oldSelf
+                      message: logicalID is immutable
+                voterCount: {type: integer, minimum: 3, maximum: 64}
+                workload:
                   type: object
-                  required: [failureGraceSeconds, cooldownSeconds, maxRecoveriesPerDay, allowDataLoss]
+                  required: [podTemplate]
                   properties:
-                    failureGraceSeconds: {type: integer, minimum: 1, maximum: 86400}
-                    cooldownSeconds: {type: integer, minimum: 1, maximum: 604800}
-                    maxRecoveriesPerDay: {type: integer, minimum: 1, maximum: 100}
-                    allowDataLoss:
-                      type: boolean
-                      description: Explicitly allow recovery of only the certified archived prefix for an async source. Unarchived acknowledged writes may be lost.
+                    podTemplate:
+                      type: object
+                      required: [spec]
+                      x-kubernetes-validations:
+                        - rule: '!has(self.metadata)'
+                          message: pod template metadata is unsupported
+                      properties:
+                        metadata: {type: object, x-kubernetes-preserve-unknown-fields: true}
+                        spec:
+                          type: object
+                          required: [containers]
+                          x-kubernetes-validations:
+                            - rule: '!has(self.volumes) && !has(self.initContainers) && !has(self.ephemeralContainers)'
+                              message: pod volumes and additional container types are unsupported
+                          properties:
+                            volumes: {type: array, items: {type: object, x-kubernetes-preserve-unknown-fields: true}}
+                            initContainers: {type: array, items: {type: object, x-kubernetes-preserve-unknown-fields: true}}
+                            ephemeralContainers: {type: array, items: {type: object, x-kubernetes-preserve-unknown-fields: true}}
+                            containers:
+                              type: array
+                              minItems: 1
+                              maxItems: 64
+                              x-kubernetes-validations:
+                                - rule: 'self.all(c, self.filter(d, d.name == c.name).size() == 1)'
+                                  message: container names must be unique
+                                - rule: 'self.map(c, [c.name, c.image]) == oldSelf.map(c, [c.name, c.image])'
+                                  message: workload updates are unsupported
+                              items:
+                                type: object
+                                required: [name, image]
+                                x-kubernetes-validations:
+                                  - rule: '!has(self.env) && !has(self.envFrom) && !has(self.volumeMounts) && !has(self.volumeDevices)'
+                                    message: container environment and volumes are unsupported
+                                properties:
+                                  name:
+                                    type: string
+                                    minLength: 1
+                                    maxLength: 63
+                                    pattern: '^[a-z0-9]([-a-z0-9]*[a-z0-9])?$'
+                                    x-kubernetes-validations:
+                                      - rule: '!self.startsWith("rhiza-")'
+                                        message: rhiza- container names are reserved
+                                  image: {type: string, minLength: 1, maxLength: 2048, pattern: '[^\x{0009}-\x{000D}\x{0020}\x{0085}\x{00A0}\x{1680}\x{2000}-\x{200A}\x{2028}\x{2029}\x{202F}\x{205F}\x{3000}]'}
+                                  env: {type: array, items: {type: object, x-kubernetes-preserve-unknown-fields: true}}
+                                  envFrom: {type: array, items: {type: object, x-kubernetes-preserve-unknown-fields: true}}
+                                  volumeMounts: {type: array, items: {type: object, x-kubernetes-preserve-unknown-fields: true}}
+                                  volumeDevices: {type: array, items: {type: object, x-kubernetes-preserve-unknown-fields: true}}
+                automaticRecovery:
+                  type: string
+                  enum: ["OFF", A, B]
+                  default: "OFF"
+                provisionalRetentionSeconds:
+                  type: integer
+                  format: int64
+                  minimum: 0
+                  maximum: 9223372036
+                  default: 172800
+                deletionPolicy:
+                  type: string
+                  enum: [Orphan, Delete]
+                  default: Orphan
             status:
               type: object
-              properties:
-                phase: {type: string}
-                message: {type: string}
-                activeClusterID: {type: string}
-                activeRecovery: {type: string}
-                observedGeneration: {type: integer, format: int64}
+              x-kubernetes-preserve-unknown-fields: true

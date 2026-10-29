@@ -1,0 +1,31 @@
+name: HA v1alpha2 contract
+on:
+  push:
+    branches: [feature/ha-v1alpha2-contract-phase1]
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  contract:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+      - name: Focused unit and manifest tests
+        run: |
+          go test ./pkg/operator -run TestPhase1 -count=1 -timeout=60s
+          go test ./deploy/operator -count=1 -timeout=60s
+      - name: Install kind
+        run: go install sigs.k8s.io/kind@v0.32.0
+      - name: API server admission contract
+        run: sh scripts/test-ha-v1alpha2-contract.sh
+      - name: Preserve diagnostics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ha-v1alpha2-contract-logs
+          path: ${{ runner.temp }}/ha-v1alpha2-contract
+          if-no-files-found: warn
