@@ -134,7 +134,15 @@ func (m *Manager) withLocalMaintenanceContextOnce(ctx context.Context, work func
 	free, _ := json.Marshal(localMaintenanceControl{Version: controlVersion, LocationHash: m.localControlLocationHash, BindingHash: m.localControlBindingHash})
 	releaseCtx = context.WithValue(releaseCtx, localOperationKey{}, &localOperation{request: context.Background(), timeout: 5 * time.Second})
 	if err := gate.bucket.Upload(releaseCtx, key, bytes.NewReader(free), objstore.WithIfMatch(heldVersion)); err != nil {
-		return fmt.Errorf("Local maintenance release (work: %v): %w", workErr, err)
+		// A lost release ACK is settled only by a stable, exact free-state readback.
+		verifyCtx, verifyCancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer verifyCancel()
+		verifyCtx = context.WithValue(verifyCtx, localOperationKey{}, &localOperation{request: verifyCtx, timeout: 5 * time.Second})
+		verifyCtx = context.WithValue(verifyCtx, localReadbackKey{}, true)
+		got, version, readErr := gate.readStableLeaseObject(verifyCtx, key, 4096)
+		if readErr != nil || version == nil || heldVersion == nil || *version == *heldVersion || !bytes.Equal(got, free) {
+			return fmt.Errorf("Local maintenance release (work: %v; readback: %v): %w", workErr, readErr, err)
+		}
 	}
 	if workErr != nil {
 		return workErr
