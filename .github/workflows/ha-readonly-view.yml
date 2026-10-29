@@ -1,0 +1,40 @@
+name: HA read-only view providers
+
+on:
+  push:
+    branches:
+      - feature/ha-v1alpha2-readonly-view
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  providers:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+          cache: true
+      - name: Verify recovery package
+        run: go test ./pkg/recovery -count=1 -timeout=180s
+      - name: Verify fixed-head recovery view under race detector
+        run: go test -race ./pkg/recovery -run '^TestHAReadOnlyView' -count=1
+      - name: Exercise fixed-head reads against pinned Floci providers
+        run: |
+          set -euo pipefail
+          RHIZA_EMBEDDED_TEST_PATTERN='^TestEmbeddedObjectStorageHAReadOnlyView$' sh scripts/test-embedded-object-providers.sh 2>&1 | tee "$RUNNER_TEMP/ha-readonly-providers.log"
+        shell: bash
+      - name: Preserve provider diagnostics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ha-readonly-providers-${{ github.run_id }}
+          path: |
+            ${{ runner.temp }}/ha-readonly-providers.log
+            /tmp/rhiza-embedded-providers.*/*.log
+            /tmp/rhiza-embedded-providers.*/*-image-digests.json
+            /tmp/rhiza-embedded-providers.*/selected-tests.txt

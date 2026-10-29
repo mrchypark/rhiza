@@ -152,6 +152,10 @@ func PinGenerationAnchor(ctx context.Context, bucket objstore.Bucket, prefix, ow
 // intent/result bindings, but does not require the original anchor checkpoint
 // to remain present after a newer certified target checkpoint has superseded it.
 func VerifyGenerationAnchor(ctx context.Context, bucket objstore.Bucket, prefix string, expectedMembership MembershipRecord, expectedAnchorHash [32]byte) (GenerationAnchor, error) {
+	return verifyGenerationAnchor(ctx, bucket, prefix, expectedMembership, expectedAnchorHash, nil)
+}
+
+func verifyGenerationAnchor(ctx context.Context, bucket objstore.Bucket, prefix string, expectedMembership MembershipRecord, expectedAnchorHash [32]byte, fixedHead *archiveHead) (GenerationAnchor, error) {
 	if expectedAnchorHash == ([32]byte{}) || expectedMembership.Version != MembershipRecordVersion {
 		return GenerationAnchor{}, fmt.Errorf("expected generation anchor and immutable membership are required")
 	}
@@ -171,17 +175,27 @@ func VerifyGenerationAnchor(ctx context.Context, bucket objstore.Bucket, prefix 
 	if err != nil || !ok || result.Tip != anchor.SourceTip || result.ManifestHash != anchor.SourceManifest || result.PrefixHash != anchor.SourcePrefixHash {
 		return GenerationAnchor{}, fmt.Errorf("generation anchor does not match fork result")
 	}
-	archive := NewManager(bucket, prefix, 1)
-	defer archive.Close()
-	if err := archive.Load(ctx); err != nil {
-		return GenerationAnchor{}, err
+	var head archiveHead
+	if fixedHead != nil {
+		head = *fixedHead
+	} else {
+		archive := NewManager(bucket, prefix, 1)
+		defer archive.Close()
+		if err := archive.Load(ctx); err != nil {
+			return GenerationAnchor{}, err
+		}
+		archive.mu.Lock()
+		head = archive.head
+		archive.mu.Unlock()
 	}
-	if got, ok := archive.GenerationAnchor(); !ok || got != expectedAnchorHash {
+	lineage := head.LineageAnchor
+	if lineage == nil {
+		lineage = head.BaseAnchor
+	}
+	if lineage == nil || lineage.Hash != expectedAnchorHash {
 		return GenerationAnchor{}, fmt.Errorf("target archive does not retain generation lineage")
 	}
-	archive.mu.Lock()
-	base, basePrefix, baseAnchor, baseSeal := archive.head.Base, archive.head.BasePrefix, archive.head.BaseAnchor, archive.head.BaseSeal
-	archive.mu.Unlock()
+	base, basePrefix, baseAnchor, baseSeal := head.Base, head.BasePrefix, head.BaseAnchor, head.BaseSeal
 	if base < quepaxa.Slot(anchor.SourceTip) {
 		return GenerationAnchor{}, fmt.Errorf("target archive base precedes generation anchor")
 	}
