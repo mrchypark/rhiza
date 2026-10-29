@@ -16,6 +16,7 @@ import (
 	"os"
 	"path"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -226,8 +227,33 @@ func TestEmbeddedObjectStorageNodePreparedRestore(t *testing.T) {
 	if _, err := voters[0].Execute(ctx, rhiza.ExecuteRequest{RequestID: "provider-prepared-create", SQL: "CREATE TABLE prepared_source (id INTEGER PRIMARY KEY)"}); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := voters[0].Execute(ctx, rhiza.ExecuteRequest{RequestID: "provider-prepared-insert", SQL: "INSERT INTO prepared_source VALUES (7)"}); err != nil {
+	insert := rhiza.ExecuteRequest{RequestID: "provider-prepared-insert", SQL: "INSERT INTO prepared_source VALUES (7)"}
+	applied, err := voters[0].Execute(ctx, insert)
+	if err != nil {
 		t.Fatal(err)
+	}
+	before, err := voters[0].Query(ctx, rhiza.QueryRequest{SQL: "SELECT id FROM prepared_source ORDER BY id", Consistency: rhiza.ConsistencyLinearizable})
+	if err != nil || len(before.Rows) != 1 {
+		t.Fatalf("initial row: %v %v", before.Rows, err)
+	}
+	resolved, err := voters[0].ResolveExecute(ctx, insert)
+	if err != nil || resolved.State != rhiza.ResolveExecuteRetained || resolved.Durability != rhiza.ResolveExecuteDurabilityConfirmed || resolved.Receipt == nil || !reflect.DeepEqual(*resolved.Receipt, applied.MutationReceipt) {
+		t.Fatalf("exact retained outcome: %+v %v", resolved, err)
+	}
+	changed := insert
+	changed.SQL = "INSERT INTO prepared_source VALUES (9)"
+	if _, err := voters[0].ResolveExecute(ctx, changed); !errors.Is(err, rhiza.ErrRequestConflict) {
+		t.Fatalf("changed request: %v", err)
+	}
+	missing := insert
+	missing.RequestID = "provider-prepared-absent"
+	unknown, err := voters[0].ResolveExecute(ctx, missing)
+	if err != nil || unknown.State != rhiza.ResolveExecuteUnknownOrExpired || unknown.Receipt != nil || unknown.Durability != rhiza.ResolveExecuteDurabilityUnknown {
+		t.Fatalf("absent request: %+v %v", unknown, err)
+	}
+	after, err := voters[0].Query(ctx, rhiza.QueryRequest{SQL: "SELECT id FROM prepared_source ORDER BY id", Consistency: rhiza.ConsistencyLinearizable})
+	if err != nil || !reflect.DeepEqual(before.Rows, after.Rows) {
+		t.Fatalf("outcome lookup changed rows: %v %v", after.Rows, err)
 	}
 	bucket := embeddedBucket(t, base)
 	readonly := &readonlyProviderBucket{Bucket: bucket}

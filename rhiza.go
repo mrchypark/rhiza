@@ -71,6 +71,18 @@ type GraphReachableResult = types.GraphReachableResult
 type GraphNodePropertyIndex = types.GraphNodePropertyIndex
 type RequestStatusRequest = network.RequestStatusRequest
 type RequestStatusResponse = network.RequestStatusResponse
+type ResolveExecuteResult = network.ResolveExecuteResult
+type ResolveExecuteState = network.ResolveExecuteState
+type ResolveExecuteDurability = network.ResolveExecuteDurability
+
+const (
+	ResolveExecuteRetained                = network.ResolveExecuteRetained
+	ResolveExecuteUnknownOrExpired        = network.ResolveExecuteUnknownOrExpired
+	ResolveExecuteDurabilityConfirmed     = network.ResolveExecuteDurabilityConfirmed
+	ResolveExecuteDurabilityNotConfigured = network.ResolveExecuteDurabilityNotConfigured
+	ResolveExecuteDurabilityUnknown       = network.ResolveExecuteDurabilityUnknown
+)
+
 type ObjectStoreStats = objstore.Stats
 type ObjectStoreDurability = types.ObjectStoreDurability
 
@@ -592,6 +604,13 @@ func (db *DB) NotificationDrops() uint64 {
 }
 func (db *DB) RequestStatus(ctx context.Context, req RequestStatusRequest) (RequestStatusResponse, error) {
 	return db.api.RequestStatus(ctx, req)
+}
+
+// ResolveExecute observes the retained result of the exact original request.
+// It does not submit a mutation; durability confirmation may publish existing data.
+// Confirmed durability describes the configured barrier, not a canonical-state proof.
+func (db *DB) ResolveExecute(ctx context.Context, req ExecuteRequest) (ResolveExecuteResult, error) {
+	return db.api.ResolveExecute(ctx, req)
 }
 
 func (db *DB) ObjectStoreStats() (ObjectStoreStats, bool) {
