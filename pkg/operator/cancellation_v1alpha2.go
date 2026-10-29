@@ -124,7 +124,15 @@ func ReconcileV1Alpha2Cancellation(ctx context.Context, store *V1Alpha2StatusSto
 	}
 	meta["finalizers"], _ = json.Marshal(filtered)
 	obj["metadata"], _ = json.Marshal(meta)
-	return pending, cancellationPut(ctx, store, ref, name, obj, false, decisionJSON)
+	err = cancellationPut(ctx, store, ref, name, obj, false, decisionJSON)
+	if errors.Is(err, ErrV1Alpha2StatusOutcomeUnknown) && len(filtered) == 0 {
+		present, listErr := cancellationUIDPresent(ctx, store, ref, claim.RequestUID)
+		confirmed, loadErr := store.Load(ctx, ref)
+		if listErr == nil && !present && loadErr == nil && sameJSON(confirmed.Queue(), acknowledgedJSON) && sameJSON(confirmed.authorityRaw, snap.authorityRaw) {
+			return pending, nil
+		}
+	}
+	return pending, err
 }
 
 func cancellationRequest(ctx context.Context, store *V1Alpha2StatusStore, ref V1Alpha2ClusterRef, name string, claim V1Alpha2QueueClaim) (map[string]json.RawMessage, error) {
@@ -250,7 +258,7 @@ func cancellationPut(ctx context.Context, store *V1Alpha2StatusStore, ref V1Alph
 	}
 	// A later reconciliation always performs exact fresh reads; never replay here.
 	if err != nil {
-		return ErrV1Alpha2StatusOutcomeUnknown
+		return fmt.Errorf("%w: request update failed", ErrV1Alpha2StatusOutcomeUnknown)
 	}
 	oldMeta, e1 := jsonObject(obj["metadata"])
 	var oldUID, oldRV string
@@ -261,8 +269,14 @@ func cancellationPut(ctx context.Context, store *V1Alpha2StatusStore, ref V1Alph
 	newMeta, _, newErr := finalizerMetadata(response, exact)
 	var newRV string
 	_ = json.Unmarshal(newMeta["resourceVersion"], &newRV)
-	if e1 != nil || oldErr != nil || newErr != nil || !v1alpha2NonBlank.MatchString(oldUID) || !v1alpha2NonBlank.MatchString(oldRV) || oldRV == newRV || !sameJSON(response["status"], decision) {
-		return ErrV1Alpha2StatusOutcomeUnknown
+	if e1 != nil || oldErr != nil || newErr != nil || !v1alpha2NonBlank.MatchString(oldUID) || !v1alpha2NonBlank.MatchString(oldRV) {
+		return fmt.Errorf("%w: response identity invalid", ErrV1Alpha2StatusOutcomeUnknown)
+	}
+	if oldRV == newRV {
+		return fmt.Errorf("%w: response resourceVersion unchanged", ErrV1Alpha2StatusOutcomeUnknown)
+	}
+	if !sameJSON(response["status"], decision) {
+		return fmt.Errorf("%w: response status mismatch", ErrV1Alpha2StatusOutcomeUnknown)
 	}
 	// Only the server-managed revision and managedFields may differ.
 	delete(oldMeta, "managedFields")
@@ -292,7 +306,7 @@ func cancellationPut(ctx context.Context, store *V1Alpha2StatusStore, ref V1Alph
 	expectedJSON, e1 := json.Marshal(expected)
 	actualJSON, e2 := json.Marshal(actual)
 	if e1 != nil || e2 != nil || !sameJSON(expectedJSON, actualJSON) {
-		return ErrV1Alpha2StatusOutcomeUnknown
+		return fmt.Errorf("%w: response object mismatch", ErrV1Alpha2StatusOutcomeUnknown)
 	}
 	return nil
 }
