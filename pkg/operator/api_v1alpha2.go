@@ -25,6 +25,7 @@ type V1Alpha2Cluster struct {
 }
 
 type V1Alpha2ClusterSpec struct {
+	GenesisIntent               *string          `json:"genesisIntent,omitempty"`
 	LogicalID                   string           `json:"logicalID"`
 	VoterCount                  int32            `json:"voterCount"`
 	Workload                    V1Alpha2Workload `json:"workload"`
@@ -77,8 +78,11 @@ func ValidateV1Alpha2Cluster(c V1Alpha2Cluster) error {
 	if c.APIVersion != V1Alpha2APIVersion || c.Kind != "RhizaCluster" {
 		return fmt.Errorf("expected v1alpha2 RhizaCluster")
 	}
-	if !v1alpha2NonBlank.MatchString(c.Spec.LogicalID) {
+	if !v1alpha2NonBlank.MatchString(c.Spec.LogicalID) || utf8.RuneCountInString(c.Spec.LogicalID) > 256 {
 		return fmt.Errorf("logicalID is required")
+	}
+	if c.Spec.GenesisIntent != nil && *c.Spec.GenesisIntent != "Create" {
+		return fmt.Errorf("invalid genesisIntent")
 	}
 	if c.Spec.VoterCount < 3 || c.Spec.VoterCount > 64 {
 		return fmt.Errorf("voterCount must be between 3 and 64")
@@ -139,7 +143,7 @@ func ValidateV1Alpha2ClusterUpdate(old, next V1Alpha2Cluster) error {
 	if err := validateV1Alpha2MetadataUpdate(old.Metadata, next.Metadata); err != nil {
 		return err
 	}
-	if old.Spec.LogicalID != next.Spec.LogicalID || old.Spec.VoterCount != next.Spec.VoterCount || !reflect.DeepEqual(old.Spec.Workload, next.Spec.Workload) {
+	if !reflect.DeepEqual(old.Spec.GenesisIntent, next.Spec.GenesisIntent) || old.Spec.LogicalID != next.Spec.LogicalID || old.Spec.VoterCount != next.Spec.VoterCount || !reflect.DeepEqual(old.Spec.Workload, next.Spec.Workload) {
 		return fmt.Errorf("unsupported cluster identity or workload update")
 	}
 	return nil

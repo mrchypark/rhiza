@@ -113,6 +113,12 @@ recovery_json() {
 }
 cluster_json cluster 3 '' > "$logs/cluster.json"
 ok cluster-create create --validate=strict -f "$logs/cluster.json"
+reject genesis-retrofit 'genesisIntent' patch rhizacluster cluster -n "$namespace" --type=merge -p '{"spec":{"genesisIntent":"Create"}}'
+cluster_json genesis-admission 3 ',"genesisIntent":"Create"' > "$logs/genesis-admission.json"
+ok genesis-create create --validate=strict -f "$logs/genesis-admission.json"
+reject genesis-remove 'genesisIntent' patch rhizacluster genesis-admission -n "$namespace" --type=merge -p '{"spec":{"genesisIntent":null}}'
+reject genesis-change 'genesisIntent' patch rhizacluster genesis-admission -n "$namespace" --type=merge -p '{"spec":{"genesisIntent":"other"}}'
+ok genesis-mutable-spec patch rhizacluster genesis-admission -n "$namespace" --type=merge -p '{"spec":{"automaticRecovery":"A"}}'
 reject cluster-logical 'logicalID is immutable' patch rhizacluster cluster -n "$namespace" --type=merge -p '{"spec":{"logicalID":"other"}}'
 reject cluster-voters 'voterCount updates are unsupported' patch rhizacluster cluster -n "$namespace" --type=merge -p '{"spec":{"voterCount":4}}'
 reject cluster-container-name 'workload updates are unsupported' patch rhizacluster cluster -n "$namespace" --type=merge -p '{"spec":{"workload":{"podTemplate":{"spec":{"containers":[{"name":"other","image":"example.invalid/app"}]}}}}}'
@@ -180,6 +186,8 @@ for name in status-contract queue-contract finalizer-contract lifecycle-cancel l
   cluster_json "$name" 3 '' > "$logs/$name.json"
   ok "$name-create" create --validate=strict -f "$logs/$name.json"
 done
+cluster_json genesis-contract 3 ',"genesisIntent":"Create"' > "$logs/genesis-contract.json"
+ok genesis-contract-create create --validate=strict -f "$logs/genesis-contract.json"
 for name in status-contract queue-contract finalizer-contract lifecycle-cancel lifecycle-prepare cancel-complete cancel-retained cancel-waiting; do
   uid=$(k get rhizacluster "$name" -n "$namespace" -o jsonpath='{.metadata.uid}')
   [ -n "$uid" ] || exit 1
@@ -229,6 +237,9 @@ metadata:
   name: phase2-contract
   namespace: $namespace
 rules:
+- apiGroups: ["apps"]
+  resources: ["deployments"]
+  verbs: ["get"]
 - apiGroups: ["rhiza.mrchypark.dev"]
   resources: ["rhizaclusters"]
   verbs: ["get"]
@@ -266,8 +277,14 @@ prepare_uid=$(k get rhizacluster lifecycle-prepare -n "$namespace" -o jsonpath='
 complete_uid=$(k get rhizacluster cancel-complete -n "$namespace" -o jsonpath='{.metadata.uid}')
 retained_uid=$(k get rhizacluster cancel-retained -n "$namespace" -o jsonpath='{.metadata.uid}')
 waiting_uid=$(k get rhizacluster cancel-waiting -n "$namespace" -o jsonpath='{.metadata.uid}')
+genesis_uid=$(k get rhizacluster genesis-contract -n "$namespace" -o jsonpath='{.metadata.uid}')
 : "${server:?}" "${status_uid:?}" "${missing_uid:?}" "${queue_uid:?}" "${cancel_uid:?}" "${prepare_uid:?}" "${complete_uid:?}" "${retained_uid:?}" "${waiting_uid:?}"
 [ -s "$tokenfile" ] && [ -s "$cafile" ] || exit 1
 export RHIZA_CONTRACT_REQUIRED=1 RHIZA_CONTRACT_SERVER="$server" RHIZA_CONTRACT_CA="$cafile" RHIZA_CONTRACT_TOKEN="$tokenfile" RHIZA_CONTRACT_NAMESPACE="$namespace" RHIZA_CONTRACT_STATUS_UID="$status_uid" RHIZA_CONTRACT_QUEUE_UID="$queue_uid" RHIZA_CONTRACT_MISSING_UID="$missing_uid" RHIZA_CONTRACT_FINALIZER_UID="$finalizer_uid" RHIZA_CONTRACT_CANCEL_UID="$cancel_uid" RHIZA_CONTRACT_PREPARE_UID="$prepare_uid"
 export RHIZA_CONTRACT_COMPLETE_UID="$complete_uid" RHIZA_CONTRACT_RETAINED_UID="$retained_uid" RHIZA_CONTRACT_WAITING_UID="$waiting_uid"
-go test ./pkg/operator -run '^TestV1Alpha2(Status|Lifecycle|Cancellation)APIServerContract$' -count=1 -timeout=60s
+export RHIZA_CONTRACT_GENESIS_UID="$genesis_uid" RHIZA_CONTRACT_KUBECONFIG="$kubeconfig" RHIZA_CONTRACT_CONTEXT="$context"
+go test ./pkg/operator -run '^TestV1Alpha2(Status|Lifecycle|Cancellation|Genesis)APIServerContract$' -count=1 -timeout=60s
+reject genesis-receipt-remove 'genesis receipt cannot be removed or changed and requires authority' patch rhizacluster genesis-contract -n "$namespace" --subresource=status --type=merge -p '{"status":{"genesis":null}}'
+reject genesis-receipt-change 'genesis receipt cannot be removed or changed and requires authority' patch rhizacluster genesis-contract -n "$namespace" --subresource=status --type=merge -p '{"status":{"genesis":{"logicalID":"different"}}}'
+reject genesis-status-wipe 'genesis receipt cannot be removed or changed and requires authority' patch rhizacluster genesis-contract -n "$namespace" --subresource=status --type=merge -p '{"status":null}'
+reject genesis-authority-remove 'genesis receipt cannot be removed or changed and requires authority' patch rhizacluster genesis-contract -n "$namespace" --subresource=status --type=merge -p '{"status":{"authority":null}}'

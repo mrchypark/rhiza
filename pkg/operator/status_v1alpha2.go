@@ -126,6 +126,19 @@ func (s *V1Alpha2StatusStore) snapshot(ref V1Alpha2ClusterRef, obj map[string]js
 	if view.Owner.Namespace != ref.Namespace || view.Owner.Name != ref.Name || view.Owner.UID != ref.UID || view.Owner.LogicalID != logicalID || len(auth["generation"]) == 0 || bytes.Equal(bytes.TrimSpace(auth["generation"]), []byte("null")) || json.Unmarshal(auth["generation"], &view.Generation) != nil || view.Generation < 0 {
 		return V1Alpha2StatusSnapshot{}, fmt.Errorf("invalid authority identity or generation")
 	}
+	if _, intent := spec["genesisIntent"]; intent {
+		var value string
+		if json.Unmarshal(spec["genesisIntent"], &value) != nil || value != "Create" || validateGenesisReceipt(status["genesis"], ref, logicalID) != nil {
+			return V1Alpha2StatusSnapshot{}, fmt.Errorf("missing or invalid genesis receipt")
+		}
+		var receipt v1alpha2Genesis
+		_ = json.Unmarshal(status["genesis"], &receipt)
+		if view.Generation == 0 && (view.Binding.DeploymentUID != receipt.DeploymentUID || view.Binding.StorageID != receipt.StorageID) {
+			return V1Alpha2StatusSnapshot{}, fmt.Errorf("genesis binding mismatch")
+		}
+	} else if _, present := status["genesis"]; present {
+		return V1Alpha2StatusSnapshot{}, fmt.Errorf("genesis receipt without creation intent")
+	}
 	return V1Alpha2StatusSnapshot{ref: ref, resourceVersion: rv, authority: view, authorityRaw: bytes.Clone(status["authority"]), queue: bytes.Clone(status["recoveryQueue"]), object: obj, store: s}, nil
 }
 

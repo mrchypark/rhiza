@@ -19,16 +19,24 @@ spec:
         openAPIV3Schema:
           type: object
           required: [spec]
+          x-kubernetes-validations:
+            - rule: '!has(oldSelf.status) || !has(oldSelf.status.genesis) || (has(self.status) && has(self.status.genesis) && self.status.genesis == oldSelf.status.genesis && has(self.status.authority))'
+              message: genesis receipt cannot be removed or changed and requires authority
+            - rule: '!has(self.status) || !has(self.status.genesis) || has(self.status.authority)'
+              message: genesis receipt requires authority
           properties:
             spec:
               type: object
               required: [logicalID, voterCount, workload]
               x-kubernetes-validations:
+                - rule: 'has(self.genesisIntent) == has(oldSelf.genesisIntent) && (!has(self.genesisIntent) || self.genesisIntent == oldSelf.genesisIntent)'
+                  message: genesisIntent is creation-only and immutable
                 - rule: '!has(self.statefulSet) && !has(self.container) && !has(self.adoptClusterID) && !has(self.automatic) && !has(self.policy) && !has(self.bootstrap) && !has(self.clusterDomain) && !has(self.anchorID) && !has(self.httpPort) && !has(self.peerPort) && !has(self.voterPods)'
                   message: legacy cluster fields are unsupported
                 - rule: self.voterCount == oldSelf.voterCount
                   message: voterCount updates are unsupported
               properties:
+                genesisIntent: {type: string, maxLength: 6, enum: [Create]}
                 statefulSet: {type: string}
                 container: {type: string}
                 adoptClusterID: {type: string}
@@ -43,6 +51,7 @@ spec:
                 logicalID:
                   type: string
                   minLength: 1
+                  maxLength: 256
                   pattern: '[^\x{0009}-\x{000D}\x{0020}\x{0085}\x{00A0}\x{1680}\x{2000}-\x{200A}\x{2028}\x{2029}\x{202F}\x{205F}\x{3000}]'
                   x-kubernetes-validations:
                     - rule: self == oldSelf
@@ -116,3 +125,16 @@ spec:
             status:
               type: object
               x-kubernetes-preserve-unknown-fields: true
+              properties:
+                authority:
+                  type: object
+                  x-kubernetes-preserve-unknown-fields: true
+                genesis:
+                  type: object
+                  required: [ownerUID, logicalID, deploymentUID, storageID, intentHash]
+                  properties:
+                    ownerUID: {type: string, minLength: 1, maxLength: 256}
+                    logicalID: {type: string, minLength: 1, maxLength: 256}
+                    deploymentUID: {type: string, minLength: 1, maxLength: 256}
+                    storageID: {type: string, minLength: 1, maxLength: 256}
+                    intentHash: {type: string, minLength: 64, maxLength: 64, pattern: '^[0-9a-f]{64}$'}
