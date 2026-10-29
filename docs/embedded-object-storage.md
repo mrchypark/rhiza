@@ -78,6 +78,12 @@ writes. The filesystem owner does not fence those providers. A held or
 uncertain remote maintenance token remains unresolved and blocks recovery; it
 is never cleared based on age or process state.
 
+If the active holder's release upload returns an error, the SDK can reconcile
+that release only after stable readback proves the exact expected free control
+at a changed object version. Work errors and cancellation remain errors. This
+does not authorize a new process to clear a held remote token, change identity,
+or disregard outstanding operations; an unreadable or held control still blocks.
+
 The automatic ownership guarantee applies to Local filesystem archives opened
 through `rhiza.Open`. Lower-level `pkg/recovery` APIs that accept a generic
 object-store bucket remain caller-fenced; they cannot infer or acquire a
