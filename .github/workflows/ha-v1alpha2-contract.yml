@@ -1,7 +1,7 @@
 name: HA v1alpha2 contract
 on:
   push:
-    branches: [feature/ha-v1alpha2-contract-phase1, feature/ha-v1alpha2-status-queue-phase2, feature/ha-v1alpha2-lifecycle-phase3, feature/ha-v1alpha2-cancel-phase4, feature/ha-v1alpha2-genesis, feature/ha-v1alpha2-initializer]
+    branches: [feature/ha-v1alpha2-contract-phase1, feature/ha-v1alpha2-status-queue-phase2, feature/ha-v1alpha2-lifecycle-phase3, feature/ha-v1alpha2-cancel-phase4, feature/ha-v1alpha2-genesis, feature/ha-v1alpha2-initializer, feature/ha-application-admission]
   workflow_dispatch:
 permissions:
   contents: read
@@ -16,11 +16,11 @@ jobs:
           go-version-file: go.mod
       - name: Focused unit and manifest tests
         run: |
-          go test ./pkg/operator -run 'TestPhase[123489]' -count=1 -timeout=60s
+          go test ./pkg/operator -run 'TestPhase[123489]|TestAuthorityV1Alpha2' -count=1 -timeout=60s
           go test ./deploy/operator -count=1 -timeout=60s
           go test ./cmd/rhiza-operator -count=1 -timeout=60s
       - name: Phase 2, 3, 4, 8 and 9 race tests
-        run: go test -race ./pkg/operator -run '^TestPhase[23489]' -count=1 -timeout=60s
+        run: go test -race ./pkg/operator -run '^(TestPhase[23489]|TestAuthorityV1Alpha2)' -count=1 -timeout=60s
       - name: Install kind
         run: go install sigs.k8s.io/kind@v0.32.0
       - name: API server admission contract
