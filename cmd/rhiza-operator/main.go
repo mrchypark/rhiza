@@ -2,13 +2,10 @@ package main
 
 import (
 	"context"
-	"crypto/tls"
-	"crypto/x509"
 	"errors"
 	"flag"
 	"fmt"
 	"log"
-	"net/http"
 	"net/url"
 	"os"
 	"os/signal"
@@ -19,12 +16,11 @@ import (
 
 	objectstore "github.com/mrchypark/rhiza/internal/objstore"
 	"github.com/mrchypark/rhiza/pkg/operator"
-	"github.com/mrchypark/rhiza/pkg/recoveryanchor"
 )
 
 func main() {
-	namespace := flag.String("namespace", os.Getenv("POD_NAMESPACE"), "namespace containing RhizaRecovery resources")
-	deleteNamespaces := flag.String("delete-namespaces", os.Getenv("RHIZA_OPERATOR_DELETE_NAMESPACES"), "Pod deletion namespaces: empty uses operator Pod namespace, CSV allowlist, or * for all")
+	namespace := flag.String("namespace", os.Getenv("POD_NAMESPACE"), "namespace containing RhizaCluster resources")
+	deleteNamespaces := flag.String("delete-namespaces", os.Getenv("RHIZA_OPERATOR_DELETE_NAMESPACES"), "legacy option; initialization does not delete Pods")
 	poll := flag.Duration("poll-interval", 10*time.Second, "Kubernetes reconciliation poll interval")
 	flag.Parse()
 	if *poll <= 0 {
@@ -38,102 +34,14 @@ func main() {
 }
 
 func run(ctx context.Context, namespace string, poll time.Duration, deleteNamespaces string) error {
+	if os.Getenv("RHIZA_AUTOMATIC_RECOVERY") == "true" {
+		return fmt.Errorf("legacy automatic recovery is unavailable")
+	}
 	kube, err := operator.NewInCluster(namespace)
 	if err != nil {
 		return fmt.Errorf("configure Kubernetes client: %w", err)
 	}
-	if err := configureDeletion(kube, deleteNamespaces, "/var/run/secrets/kubernetes.io/serviceaccount/namespace"); err != nil {
-		return fmt.Errorf("configure Pod deletion scope: %w", err)
-	}
-	bucketConfig, err := operatorBucketConfig()
-	if err != nil {
-		return err
-	}
-	bucket, err := objectstore.NewBucket(bucketConfig)
-	if err != nil {
-		return fmt.Errorf("open object store: %w", err)
-	}
-	if closer, ok := bucket.Bucket.(interface{ Close() error }); ok {
-		defer func() { _ = closer.Close() }()
-	}
-	environment := map[string]string{}
-	for _, entry := range os.Environ() {
-		key, value, _ := strings.Cut(entry, "=")
-		environment[key] = value
-	}
-	controller := &operator.Controller{
-		StoreIdentity: operator.StoreIdentity(environment),
-		Kube:          kube,
-		Bucket:        bucket,
-		Prefix:        bucketConfig.Prefix,
-		HTTP:          &http.Client{Timeout: 30 * time.Second},
-	}
-
-	if os.Getenv("RHIZA_AUTOMATIC_RECOVERY") == "true" {
-		backend, err := fencerBackend(os.Getenv("RHIZA_FENCER_BACKEND"), os.Getenv("RHIZA_FENCER_URL"), os.Getenv("RHIZA_FENCER_TOKEN_FILE"), os.Getenv("RHIZA_FENCER_CA_FILE"))
-		if err != nil {
-			return err
-		}
-		if os.Getenv("RHIZA_FENCER_BACKEND") == "" && backend == "http" {
-			log.Print("automatic recovery uses legacy implicit HTTP fencing configuration; set RHIZA_FENCER_BACKEND=http explicitly")
-		}
-		if backend == "kubernetes" {
-			controller.Fencer = &operator.KubernetesFencer{Kube: kube}
-		} else if backend == "http" {
-			endpoint, tokenFile := os.Getenv("RHIZA_FENCER_URL"), os.Getenv("RHIZA_FENCER_TOKEN_FILE")
-			if endpoint == "" || tokenFile == "" {
-				return fmt.Errorf("automatic recovery requires RHIZA_FENCER_URL and RHIZA_FENCER_TOKEN_FILE")
-			}
-			roots, err := x509.SystemCertPool()
-			if err != nil {
-				return err
-			}
-			if caFile := os.Getenv("RHIZA_FENCER_CA_FILE"); caFile != "" {
-				data, err := os.ReadFile(caFile)
-				if err != nil {
-					return fmt.Errorf("read fencing CA: %w", err)
-				}
-				if !roots.AppendCertsFromPEM(data) {
-					return fmt.Errorf("fencing CA contains no certificates")
-				}
-			}
-			controller.Fencer = &operator.FencingClient{URL: endpoint, TokenFile: tokenFile, Client: &http.Client{Timeout: 10 * time.Second, Transport: &http.Transport{TLSClientConfig: &tls.Config{MinVersion: tls.VersionTLS12, RootCAs: roots}}}}
-		} else {
-			return fmt.Errorf("unsupported RHIZA_FENCER_BACKEND")
-		}
-		controller.Automatic = true
-	}
-
-	// Configure recovery anchor client from environment.
-	anchorURL := os.Getenv("RHIZA_RECOVERY_ANCHOR_URL")
-	anchorTokenFile := os.Getenv("RHIZA_RECOVERY_ANCHOR_TOKEN_FILE")
-	if anchorURL != "" || anchorTokenFile != "" {
-		if anchorURL == "" || anchorTokenFile == "" {
-			return fmt.Errorf("RHIZA_RECOVERY_ANCHOR_URL and RHIZA_RECOVERY_ANCHOR_TOKEN_FILE must both be set")
-		}
-		if err := validateAnchorEndpoint(anchorURL); err != nil {
-			return err
-		}
-		anchorRoots, anchorErr := x509.SystemCertPool()
-		if anchorErr != nil {
-			return anchorErr
-		}
-		if caFile := os.Getenv("RHIZA_RECOVERY_ANCHOR_CA_FILE"); caFile != "" {
-			data, caErr := os.ReadFile(caFile)
-			if caErr != nil {
-				return fmt.Errorf("read anchor CA: %w", caErr)
-			}
-			if !anchorRoots.AppendCertsFromPEM(data) {
-				return fmt.Errorf("anchor CA contains no certificates")
-			}
-		}
-		controller.Anchor = &recoveryanchor.Client{
-			URL:       anchorURL,
-			TokenFile: anchorTokenFile,
-			Client:    &http.Client{Timeout: 10 * time.Second, Transport: &http.Transport{TLSClientConfig: &tls.Config{MinVersion: tls.VersionTLS12, RootCAs: anchorRoots}}},
-		}
-	}
-	return controller.Run(ctx, poll)
+	return operator.RunV1Alpha2Initialization(ctx, kube, poll)
 }
 
 func configureDeletion(kube *operator.Kubernetes, raw, namespaceFile string) error {

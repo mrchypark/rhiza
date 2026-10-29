@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"reflect"
 	"unicode/utf8"
 )
 
@@ -50,6 +51,10 @@ func validateGenesisReceipt(raw json.RawMessage, ref V1Alpha2ClusterRef, logical
 // InitializeV1Alpha2Authority initializes only a creation-intent cluster. The
 // storage ID is a logical namespace, not evidence of a provisioned bucket.
 func InitializeV1Alpha2Authority(ctx context.Context, s *V1Alpha2StatusStore, ref V1Alpha2ClusterRef, deploymentName string) (V1Alpha2StatusSnapshot, error) {
+	return initializeV1Alpha2Authority(ctx, s, ref, deploymentName, nil, "", "")
+}
+
+func initializeV1Alpha2Authority(ctx context.Context, s *V1Alpha2StatusStore, ref V1Alpha2ClusterRef, deploymentName string, expected *V1Alpha2ClusterSpec, expectedUID, expectedRV string) (V1Alpha2StatusSnapshot, error) {
 	p, err := s.path(ref)
 	if err != nil {
 		return V1Alpha2StatusSnapshot{}, err
@@ -66,8 +71,12 @@ func InitializeV1Alpha2Authority(ctx context.Context, s *V1Alpha2StatusStore, re
 	if err != nil {
 		return V1Alpha2StatusSnapshot{}, err
 	}
-	if _, err = DecodeV1Alpha2Cluster(clusterJSON); err != nil {
+	cluster, err := DecodeV1Alpha2Cluster(clusterJSON)
+	if err != nil {
 		return V1Alpha2StatusSnapshot{}, fmt.Errorf("invalid cluster: %w", err)
+	}
+	if expected != nil && !reflect.DeepEqual(cluster.Spec, *expected) {
+		return V1Alpha2StatusSnapshot{}, fmt.Errorf("cluster intent changed during candidate creation")
 	}
 	meta, err := jsonObject(obj["metadata"])
 	if err != nil {
@@ -132,6 +141,9 @@ func InitializeV1Alpha2Authority(ctx context.Context, s *V1Alpha2StatusStore, re
 		return V1Alpha2StatusSnapshot{}, err
 	}
 	d := deployment.Metadata
+	if expectedUID != "" && (d.UID != expectedUID || d.ResourceVersion != expectedRV) {
+		return V1Alpha2StatusSnapshot{}, fmt.Errorf("candidate changed")
+	}
 	owners := 0
 	for _, owner := range d.OwnerReferences {
 		if owner.Controller {
