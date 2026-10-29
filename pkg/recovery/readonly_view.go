@@ -25,6 +25,7 @@ type ReadOnlyView struct {
 	decisions            []quepaxa.DecidedValue
 	checkpointManager    *checkpoint.Manager
 	root                 *checkpoint.Checkpoint
+	verified             bool
 }
 
 // OpenReadOnlyView captures one stable head and verifies its complete suffix.
@@ -150,6 +151,7 @@ func OpenReadOnlyView(ctx context.Context, bucket objstore.Bucket, prefix string
 	if v.prefixHash != expected {
 		return nil, fmt.Errorf("verified archive prefix mismatch")
 	}
+	v.verified = true
 	return v, nil
 }
 

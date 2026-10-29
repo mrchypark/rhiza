@@ -54,7 +54,7 @@ func TestEmbeddedObjectStorageHAReadOnlyView(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	command, err := types.EncodeGraphCommand(types.GraphCommand{RequestID: "provider-checkpoint", Events: []types.GraphStreamEvent{{Stream: "provider", Kind: "created", Payload: "checkpointed"}}})
+	command, err := types.EncodeGraphCommand(types.GraphCommand{RequestID: "provider-checkpoint", Cypher: `CREATE (:Item {id: 'checkpoint'})`, Events: []types.GraphStreamEvent{{Stream: "provider", Kind: "created", Payload: "checkpointed"}}})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -141,7 +141,11 @@ func TestEmbeddedObjectStorageHAReadOnlyView(t *testing.T) {
 	if err := cp.ReleasePublisherClaim(ctx, claim); err != nil {
 		t.Fatal(err)
 	}
-	if _, _, err := core.Propose(ctx, []byte("provider-certified-value")); err != nil {
+	suffix, err := types.EncodeGraphCommand(types.GraphCommand{RequestID: "provider-suffix", Cypher: `CREATE (:Item {id: 'suffix'})`, Events: []types.GraphStreamEvent{{Stream: "provider", Kind: "updated", Payload: "replayed"}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := core.Propose(ctx, suffix); err != nil {
 		t.Fatal(err)
 	}
 	if err := archive.SyncThrough(ctx, core, core.Tip()); err != nil {
@@ -156,7 +160,7 @@ func TestEmbeddedObjectStorageHAReadOnlyView(t *testing.T) {
 	}
 	wantPrefix, ok := core.PrefixHash(core.Tip())
 	decisions := view.Decisions()
-	if !ok || view.Base() != seal.Index || view.Tip() != core.Tip() || view.PrefixHash() != wantPrefix || len(decisions) == 0 || string(decisions[len(decisions)-1].Value) != "provider-certified-value" {
+	if !ok || view.Base() != seal.Index || view.Tip() != core.Tip() || view.PrefixHash() != wantPrefix || len(decisions) == 0 || !bytes.Equal(decisions[len(decisions)-1].Value, suffix) {
 		t.Fatalf("unexpected verified view: base=%d tip=%d decisions=%d", view.Base(), view.Tip(), len(decisions))
 	}
 	downloaded, err := view.DownloadCheckpointFiles(ctx, t.TempDir())
@@ -170,6 +174,26 @@ func TestEmbeddedObjectStorageHAReadOnlyView(t *testing.T) {
 		data, err := os.ReadFile(file.Path)
 		if err != nil || !bytes.Equal(data, wantFiles[file.Role]) {
 			t.Fatalf("checkpoint role %s differs: %v", file.Role, err)
+		}
+	}
+	prepared, err := recovery.PrepareReadOnlyRestore(ctx, view, filepath.Join(t.TempDir(), "prepared"))
+	if err != nil {
+		t.Fatalf("prepare verified restore: %v", err)
+	}
+	if prepared.HeadHash != view.HeadHash() || prepared.Base != view.Base() || prepared.Tip != view.Tip() || prepared.PrefixHash != view.PrefixHash() {
+		t.Fatalf("prepared identity differs from verified view: %+v", prepared)
+	}
+	restored, err := materializer.Open(prepared.SQLitePath, 1)
+	if err != nil {
+		t.Fatalf("open prepared materializer: %v", err)
+	}
+	t.Cleanup(func() { _ = restored.Close() })
+	if restored.Tip() != uint64(view.Tip()) {
+		t.Fatalf("prepared materializer tip=%d want=%d", restored.Tip(), view.Tip())
+	}
+	for _, id := range []string{"provider-checkpoint", "provider-suffix"} {
+		if receipt, found, err := restored.GraphMutationReceipt(ctx, id); err != nil || !found || receipt.Status != types.MutationCommitted {
+			t.Fatalf("prepared application receipt %q: found=%t receipt=%+v err=%v", id, found, receipt, err)
 		}
 	}
 	if _, err := recovery.OpenReadOnlyView(ctx, readonly, "missing-head", 1, bootstrap); err == nil {
