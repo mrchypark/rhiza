@@ -2,7 +2,7 @@ name: CI
 
 on:
   push:
-    branches: [main]
+    branches: [main, feature/ha-node-prepared-restore]
   pull_request:
   workflow_dispatch:
     inputs:
