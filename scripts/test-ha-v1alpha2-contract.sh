@@ -1,5 +1,6 @@
 #!/bin/sh
 set -eu
+umask 077
 
 admission_error() {
   file=$1 expected=$2
@@ -53,8 +54,12 @@ cleanup() {
   if [ "$owned" -eq 1 ]; then
     kubectl --kubeconfig "$kubeconfig" --context "$context" get crd -o wide > "$logs/crds.txt" 2>&1 || :
     kubectl --kubeconfig "$kubeconfig" --context "$context" -n "$namespace" get rhizaclusters,rhizarecoveries -o yaml > "$logs/resources.yaml" 2>&1 || :
-    if ! kind delete cluster --name "$cluster" > "$logs/delete.txt" 2>&1; then result=1; fi
+    if ! kind delete cluster --name "$cluster" > "$logs/delete.txt" 2>&1; then
+      echo "failed to delete owned cluster $cluster; see delete.txt" >&2
+      result=1
+    fi
     if ! kind get clusters > "$logs/clusters-after.txt" 2>&1; then
+      echo "could not verify cleanup of owned cluster $cluster; see clusters-after.txt" >&2
       result=1
     elif grep -Fx "$cluster" "$logs/clusters-after.txt" >/dev/null; then
       echo "owned cluster remains: $cluster" >&2
@@ -63,7 +68,10 @@ cleanup() {
   fi
   # The kubeconfig contains credentials and must not be uploaded.
   rm -f "$kubeconfig" "$tokenfile" "$cafile"
-  if [ -e "$kubeconfig" ] || [ -e "$tokenfile" ] || [ -e "$cafile" ]; then result=1; fi
+  if [ -e "$kubeconfig" ] || [ -e "$tokenfile" ] || [ -e "$cafile" ]; then
+    echo "credential cleanup incomplete for contract $nonce" >&2
+    result=1
+  fi
   exit "$result"
 }
 trap cleanup EXIT
@@ -75,11 +83,11 @@ if grep -Fx "$cluster" "$logs/clusters-before.txt" >/dev/null; then
   echo "refusing existing cluster $cluster" >&2
   exit 1
 fi
+owned=1
 if ! kind create cluster --name "$cluster" --kubeconfig "$kubeconfig" --wait 120s > "$logs/create-cluster.txt" 2>&1; then
-  echo "cluster creation failed; possible partial cluster $cluster is not verified as owned and was not deleted" | tee "$logs/partial-cluster.txt" >&2
+  echo "cluster creation failed; cleaning up the exact preflight-absent cluster $cluster" | tee "$logs/partial-cluster.txt" >&2
   exit 1
 fi
-owned=1
 k() { kubectl --kubeconfig "$kubeconfig" --context "$context" --request-timeout=30s "$@"; }
 k version >> "$logs/versions.txt"
 k create namespace "$namespace" > "$logs/namespace.txt" 2>&1
@@ -168,14 +176,25 @@ if ! grep -F 'Error from server (NotFound)' "$logs/v1alpha1.txt" >/dev/null; the
 fi
 
 # Administrative test fixtures only; this is not an authority genesis protocol.
-for name in status-contract queue-contract finalizer-contract lifecycle-cancel lifecycle-prepare missing-authority; do
+for name in status-contract queue-contract finalizer-contract lifecycle-cancel lifecycle-prepare cancel-complete cancel-retained cancel-waiting missing-authority; do
   cluster_json "$name" 3 '' > "$logs/$name.json"
   ok "$name-create" create --validate=strict -f "$logs/$name.json"
 done
-for name in status-contract queue-contract finalizer-contract lifecycle-cancel lifecycle-prepare; do
+for name in status-contract queue-contract finalizer-contract lifecycle-cancel lifecycle-prepare cancel-complete cancel-retained cancel-waiting; do
   uid=$(k get rhizacluster "$name" -n "$namespace" -o jsonpath='{.metadata.uid}')
   [ -n "$uid" ] || exit 1
   ok "$name-seed" patch rhizacluster "$name" -n "$namespace" --subresource=status --type=merge -p "{\"status\":{\"authority\":{\"owner\":{\"namespace\":\"$namespace\",\"name\":\"$name\",\"uid\":\"$uid\",\"logicalID\":\"test\"},\"generation\":2,\"binding\":{\"deploymentUID\":\"deployment\",\"storageID\":\"storage\"},\"pendingWrite\":false,\"transition\":null,\"receipt\":{\"opaque\":\"keep\"}},\"other\":{\"opaque\":\"keep\"}}}"
+done
+for target in cancel-complete cancel-retained cancel-waiting; do
+  target_uid=$(k get rhizacluster "$target" -n "$namespace" -o jsonpath='{.metadata.uid}')
+  [ -n "$target_uid" ] || exit 1
+  for suffix in first next; do
+    finalizers='"rhiza.mrchypark.dev/recovery-record"'
+    if [ "$target-$suffix" = cancel-retained-first ]; then finalizers="$finalizers,\"example.invalid/keep\""; fi
+    printf '{"apiVersion":"rhiza.mrchypark.dev/v1alpha2","kind":"RhizaRecovery","metadata":{"name":"%s-%s","namespace":"%s","finalizers":[%s]},"spec":{"target":{"name":"%s","uid":"%s"},"expectedGeneration":2}}' "$target" "$suffix" "$namespace" "$finalizers" "$target" "$target_uid" > "$logs/$target-$suffix.json"
+    ok "$target-$suffix-create" create --validate=strict -f "$logs/$target-$suffix.json"
+    if [ "$suffix" = first ]; then sleep 2; fi
+  done
 done
 for name in lifecycle-cancel lifecycle-prepare; do
   target_uid=$(k get rhizacluster "$name" -n "$namespace" -o jsonpath='{.metadata.uid}')
@@ -219,6 +238,9 @@ rules:
 - apiGroups: ["rhiza.mrchypark.dev"]
   resources: ["rhizarecoveries"]
   verbs: ["get", "list", "update", "delete"]
+- apiGroups: ["rhiza.mrchypark.dev"]
+  resources: ["rhizarecoveries/status"]
+  verbs: ["update"]
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: RoleBinding
@@ -234,7 +256,6 @@ subjects:
   name: phase2-contract
   namespace: $namespace
 EOF
-umask 077
 k -n "$namespace" create token phase2-contract --duration=10m > "$tokenfile"
 k config view --raw --minify -o jsonpath='{.clusters[0].cluster.certificate-authority-data}' | base64 -d > "$cafile"
 server=$(k config view --raw --minify -o jsonpath='{.clusters[0].cluster.server}')
@@ -242,7 +263,11 @@ status_uid=$(k get rhizacluster status-contract -n "$namespace" -o jsonpath='{.m
 missing_uid=$(k get rhizacluster missing-authority -n "$namespace" -o jsonpath='{.metadata.uid}')
 cancel_uid=$(k get rhizacluster lifecycle-cancel -n "$namespace" -o jsonpath='{.metadata.uid}')
 prepare_uid=$(k get rhizacluster lifecycle-prepare -n "$namespace" -o jsonpath='{.metadata.uid}')
-: "${server:?}" "${status_uid:?}" "${missing_uid:?}" "${queue_uid:?}" "${cancel_uid:?}" "${prepare_uid:?}"
+complete_uid=$(k get rhizacluster cancel-complete -n "$namespace" -o jsonpath='{.metadata.uid}')
+retained_uid=$(k get rhizacluster cancel-retained -n "$namespace" -o jsonpath='{.metadata.uid}')
+waiting_uid=$(k get rhizacluster cancel-waiting -n "$namespace" -o jsonpath='{.metadata.uid}')
+: "${server:?}" "${status_uid:?}" "${missing_uid:?}" "${queue_uid:?}" "${cancel_uid:?}" "${prepare_uid:?}" "${complete_uid:?}" "${retained_uid:?}" "${waiting_uid:?}"
 [ -s "$tokenfile" ] && [ -s "$cafile" ] || exit 1
 export RHIZA_CONTRACT_REQUIRED=1 RHIZA_CONTRACT_SERVER="$server" RHIZA_CONTRACT_CA="$cafile" RHIZA_CONTRACT_TOKEN="$tokenfile" RHIZA_CONTRACT_NAMESPACE="$namespace" RHIZA_CONTRACT_STATUS_UID="$status_uid" RHIZA_CONTRACT_QUEUE_UID="$queue_uid" RHIZA_CONTRACT_MISSING_UID="$missing_uid" RHIZA_CONTRACT_FINALIZER_UID="$finalizer_uid" RHIZA_CONTRACT_CANCEL_UID="$cancel_uid" RHIZA_CONTRACT_PREPARE_UID="$prepare_uid"
-go test ./pkg/operator -run '^TestV1Alpha2(Status|Lifecycle)APIServerContract$' -count=1 -timeout=60s
+export RHIZA_CONTRACT_COMPLETE_UID="$complete_uid" RHIZA_CONTRACT_RETAINED_UID="$retained_uid" RHIZA_CONTRACT_WAITING_UID="$waiting_uid"
+go test ./pkg/operator -run '^TestV1Alpha2(Status|Lifecycle|Cancellation)APIServerContract$' -count=1 -timeout=60s

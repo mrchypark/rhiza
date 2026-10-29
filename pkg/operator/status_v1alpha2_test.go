@@ -77,12 +77,44 @@ func TestPhase2StatusCASPreservesObject(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	_, err = store.CompareAndSwapQueue(context.Background(), snap, json.RawMessage(`{"version":1,"claim":"ours"}`))
+	_, err = store.compareAndSwapQueueObserved(context.Background(), snap, json.RawMessage(`{"version":1,"claim":"ours"}`))
 	if err != nil {
 		t.Fatal(err)
 	}
 	if len(methods) != 2 {
 		t.Fatalf("requests: %v", methods)
+	}
+}
+
+func TestPhase2StatusCASRejectsLostUnrelatedStatus(t *testing.T) {
+	for _, missing := range []bool{false, true} {
+		t.Run(fmt.Sprintf("missing=%t", missing), func(t *testing.T) {
+			applied := strings.Replace(strings.Replace(phase2Object, `"resourceVersion":"1"`, `"resourceVersion":"2"`, 1), `"recoveryQueue":{"version":1}`, `"recoveryQueue":{"version":2}`, 1)
+			if missing {
+				applied = strings.Replace(applied, `"unrelated":{"keep":true},`, "", 1)
+			}
+			gets := 0
+			store := phase2Store(t, func(r *http.Request) (*http.Response, error) {
+				if r.Method == http.MethodGet {
+					gets++
+					if gets == 1 {
+						return phase2Response(200, phase2Object), nil
+					}
+				}
+				return phase2Response(200, applied), nil
+			})
+			snapshot, err := store.Load(context.Background(), phase2Ref)
+			if err != nil {
+				t.Fatal(err)
+			}
+			_, err = store.compareAndSwapQueueObserved(context.Background(), snapshot, json.RawMessage(`{"version":2}`))
+			if missing && !errors.Is(err, ErrV1Alpha2StatusOutcomeUnknown) {
+				t.Fatalf("missing unrelated status: %v", err)
+			}
+			if !missing && err != nil {
+				t.Fatalf("preserved unrelated status: %v", err)
+			}
+		})
 	}
 }
 
@@ -160,7 +192,7 @@ func TestPhase2StatusAmbiguousWrites(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			_, err = store.CompareAndSwapQueue(context.Background(), snap, queue)
+			_, err = store.compareAndSwapQueueObserved(context.Background(), snap, queue)
 			if (tt.want == nil && err != nil) || (tt.want != nil && !errors.Is(err, tt.want)) {
 				t.Fatalf("got error %v, want %v", err, tt.want)
 			}

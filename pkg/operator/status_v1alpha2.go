@@ -146,10 +146,10 @@ func sameJSON(a, b json.RawMessage) bool {
 	return e1 == nil && e2 == nil && bytes.Equal(xb, yb)
 }
 
-// CompareAndSwapQueue changes only status.recoveryQueue. Queue JSON is opaque
+// compareAndSwapQueueObserved changes only status.recoveryQueue. Queue JSON is opaque
 // bookkeeping; successful storage does not validate policy or authorize work.
 // Matching readback proves only the logical postcondition, not which write applied it.
-func (s *V1Alpha2StatusStore) CompareAndSwapQueue(ctx context.Context, old V1Alpha2StatusSnapshot, next json.RawMessage) (V1Alpha2StatusSnapshot, error) {
+func (s *V1Alpha2StatusStore) compareAndSwapQueueObserved(ctx context.Context, old V1Alpha2StatusSnapshot, next json.RawMessage) (V1Alpha2StatusSnapshot, error) {
 	return s.compareAndSwapQueue(ctx, old, next, true)
 }
 
@@ -157,8 +157,10 @@ func (s *V1Alpha2StatusStore) compareAndSwapQueue(ctx context.Context, old V1Alp
 	if old.store != s || old.object == nil || old.resourceVersion == "" {
 		return V1Alpha2StatusSnapshot{}, fmt.Errorf("invalid status snapshot")
 	}
-	if _, err := jsonObject(next); err != nil {
-		return V1Alpha2StatusSnapshot{}, fmt.Errorf("queue must be a JSON object")
+	if next != nil {
+		if _, err := jsonObject(next); err != nil {
+			return V1Alpha2StatusSnapshot{}, fmt.Errorf("queue must be a JSON object")
+		}
 	}
 	p, err := s.path(old.ref)
 	if err != nil {
@@ -168,7 +170,11 @@ func (s *V1Alpha2StatusStore) compareAndSwapQueue(ctx context.Context, old V1Alp
 	if err != nil {
 		return V1Alpha2StatusSnapshot{}, err
 	}
-	status["recoveryQueue"] = bytes.Clone(next)
+	if next == nil {
+		delete(status, "recoveryQueue")
+	} else {
+		status["recoveryQueue"] = bytes.Clone(next)
+	}
 	statusRaw, err := json.Marshal(status)
 	if err != nil {
 		return V1Alpha2StatusSnapshot{}, err
@@ -186,20 +192,20 @@ func (s *V1Alpha2StatusStore) compareAndSwapQueue(ctx context.Context, old V1Alp
 	}
 	if err == nil {
 		result, e := s.snapshot(old.ref, response)
-		if e == nil && sameJSON(result.authorityRaw, old.authorityRaw) && sameJSON(result.queue, next) && result.resourceVersion != old.resourceVersion {
+		if e == nil && sameJSON(result.object["status"], statusRaw) && result.resourceVersion != old.resourceVersion {
 			return result, nil
 		}
 	}
 	if !allowReadback {
 		live, readErr := s.Load(ctx, old.ref)
-		if readErr == nil && live.resourceVersion != old.resourceVersion && sameJSON(live.authorityRaw, old.authorityRaw) && sameJSON(live.queue, next) {
+		if readErr == nil && live.resourceVersion != old.resourceVersion && sameJSON(live.object["status"], statusRaw) {
 			return V1Alpha2StatusSnapshot{}, fmt.Errorf("%w: matching readback cannot identify the writer", ErrV1Alpha2StatusOutcomeUnknown)
 		}
 		return V1Alpha2StatusSnapshot{}, fmt.Errorf("%w: update and diagnostic readback did not establish the result", ErrV1Alpha2StatusOutcomeUnknown)
 	}
 	// A failed or malformed response may follow an applied write. Never retry it.
 	live, readErr := s.Load(ctx, old.ref)
-	if readErr == nil && live.resourceVersion != old.resourceVersion && sameJSON(live.authorityRaw, old.authorityRaw) && sameJSON(live.queue, next) {
+	if readErr == nil && live.resourceVersion != old.resourceVersion && sameJSON(live.object["status"], statusRaw) {
 		return live, nil
 	}
 	return V1Alpha2StatusSnapshot{}, fmt.Errorf("%w: update or readback could not establish the result", ErrV1Alpha2StatusOutcomeUnknown)

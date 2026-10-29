@@ -46,7 +46,7 @@ func TestV1Alpha2StatusAPIServerContract(t *testing.T) {
 		t.Fatal(err)
 	}
 	queue := json.RawMessage(`{"test":"winner"}`)
-	updated, err := store.CompareAndSwapQueue(ctx, old, queue)
+	updated, err := store.compareAndSwapQueueObserved(ctx, old, queue)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -63,7 +63,7 @@ func TestV1Alpha2StatusAPIServerContract(t *testing.T) {
 	if !sameJSON(before["other"], after["other"]) {
 		t.Fatal("unrelated status changed")
 	}
-	if _, err := store.CompareAndSwapQueue(ctx, old, json.RawMessage(`{"test":"loser"}`)); !errors.Is(err, ErrV1Alpha2StatusConflict) {
+	if _, err := store.compareAndSwapQueueObserved(ctx, old, json.RawMessage(`{"test":"loser"}`)); !errors.Is(err, ErrV1Alpha2StatusConflict) {
 		t.Fatalf("stale update: %v", err)
 	}
 	live, err := store.Load(ctx, ref)

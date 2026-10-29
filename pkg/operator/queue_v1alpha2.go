@@ -60,6 +60,16 @@ type v1alpha2QueueEntry struct {
 // not readiness or permission for effects. Downstream fresh authority and
 // storage-generation gates and the trusted finalizer protocol remain required.
 func ClaimV1Alpha2Recovery(ctx context.Context, store *V1Alpha2StatusStore, ref V1Alpha2ClusterRef) (V1Alpha2QueueClaim, error) {
+	return claimV1Alpha2Recovery(ctx, store, ref, false)
+}
+
+// ClaimV1Alpha2RecoveryCancellation registers the protected deleting FIFO head
+// as bookkeeping only. Separate request and cluster reads are not atomic.
+func ClaimV1Alpha2RecoveryCancellation(ctx context.Context, store *V1Alpha2StatusStore, ref V1Alpha2ClusterRef) (V1Alpha2QueueClaim, error) {
+	return claimV1Alpha2Recovery(ctx, store, ref, true)
+}
+
+func claimV1Alpha2Recovery(ctx context.Context, store *V1Alpha2StatusStore, ref V1Alpha2ClusterRef, cancel bool) (V1Alpha2QueueClaim, error) {
 	snapshot, err := store.Load(ctx, ref)
 	if err != nil {
 		return V1Alpha2QueueClaim{}, err
@@ -129,19 +139,19 @@ func ClaimV1Alpha2Recovery(ctx context.Context, store *V1Alpha2StatusStore, ref 
 		if err := decodeV1Alpha2(raw, &existing); err != nil || len(fields["expectedGeneration"]) == 0 || bytes.Equal(bytes.TrimSpace(fields["expectedGeneration"]), []byte("null")) || existing.RequestUID == "" || existing.OperationID == "" || existing.IntentHash == "" || existing.CreatedAt.IsZero() || existing.ExpectedGeneration < 0 {
 			return V1Alpha2QueueClaim{}, queueError(V1Alpha2QueueIncomplete, "unsupported or invalid queue claim")
 		}
-		if existing.Phase != "" && existing.Phase != "Claimed" {
+		if (!cancel && existing.Phase != "" && existing.Phase != "Claimed") || (cancel && existing.Phase != "CancelRequested") {
 			return V1Alpha2QueueClaim{}, queueError(V1Alpha2QueueRequestBlocked, "claim requires lifecycle reconciliation")
 		}
 		for _, entry := range entries {
 			op := sha256.Sum256([]byte("rhiza-queue-v1\x00" + ref.UID + "\x00" + entry.uid + "\x00" + entry.hash))
 			if entry.uid == existing.RequestUID && entry.hash == existing.IntentHash && existing.OperationID == hex.EncodeToString(op[:]) && entry.request.Spec.ExpectedGeneration == existing.ExpectedGeneration && entry.created.Equal(existing.CreatedAt) {
-				if err := checkQueueRequest(ctx, store, ref, entry); err != nil {
+				if err := checkQueueRequestMode(ctx, store, ref, entry, cancel); err != nil {
 					return V1Alpha2QueueClaim{}, err
 				}
 				if err := checkQueueAuthority(snapshot, existing.ExpectedGeneration); err != nil {
 					return V1Alpha2QueueClaim{}, err
 				}
-				if err := observeQueueClaim(ctx, store, snapshot, entry, existing); err != nil {
+				if err := observeQueueClaim(ctx, store, snapshot, entry, existing, cancel); err != nil {
 					return V1Alpha2QueueClaim{}, err
 				}
 				return existing, nil
@@ -153,7 +163,7 @@ func ClaimV1Alpha2Recovery(ctx context.Context, store *V1Alpha2StatusStore, ref 
 		return V1Alpha2QueueClaim{}, queueError(V1Alpha2QueueIncomplete, "no request available")
 	}
 	head := entries[0]
-	if err := checkQueueRequest(ctx, store, ref, head); err != nil {
+	if err := checkQueueRequestMode(ctx, store, ref, head, cancel); err != nil {
 		return V1Alpha2QueueClaim{}, err
 	}
 	if err := checkQueueAuthority(snapshot, head.request.Spec.ExpectedGeneration); err != nil {
@@ -161,22 +171,25 @@ func ClaimV1Alpha2Recovery(ctx context.Context, store *V1Alpha2StatusStore, ref 
 	}
 	op := sha256.Sum256([]byte("rhiza-queue-v1\x00" + ref.UID + "\x00" + head.uid + "\x00" + head.hash))
 	claim := V1Alpha2QueueClaim{RequestUID: head.uid, OperationID: hex.EncodeToString(op[:]), IntentHash: head.hash, ExpectedGeneration: head.request.Spec.ExpectedGeneration, CreatedAt: head.created, Phase: "Claimed"}
+	if cancel {
+		claim.Phase = "CancelRequested"
+	}
 	next, err := json.Marshal(claim)
 	if err != nil {
 		return V1Alpha2QueueClaim{}, err
 	}
-	if _, err := store.CompareAndSwapQueue(ctx, snapshot, next); err != nil {
+	if _, err := store.compareAndSwapQueue(ctx, snapshot, next, !cancel); err != nil {
 		return V1Alpha2QueueClaim{}, err
 	}
-	if err := observeQueueClaim(ctx, store, snapshot, head, claim); err != nil {
+	if err := observeQueueClaim(ctx, store, snapshot, head, claim, cancel); err != nil {
 		return V1Alpha2QueueClaim{}, err
 	}
 	return claim, nil
 }
 
 // An observation failure leaves the claim untouched for exact reconciliation.
-func observeQueueClaim(ctx context.Context, store *V1Alpha2StatusStore, initial V1Alpha2StatusSnapshot, entry v1alpha2QueueEntry, claim V1Alpha2QueueClaim) error {
-	if err := checkQueueRequest(ctx, store, initial.Ref(), entry); err != nil {
+func observeQueueClaim(ctx context.Context, store *V1Alpha2StatusStore, initial V1Alpha2StatusSnapshot, entry v1alpha2QueueEntry, claim V1Alpha2QueueClaim, cancel bool) error {
+	if err := checkQueueRequestMode(ctx, store, initial.Ref(), entry, cancel); err != nil {
 		return err
 	}
 	live, err := store.Load(ctx, initial.Ref())
@@ -213,8 +226,8 @@ func checkQueueAuthority(snapshot V1Alpha2StatusSnapshot, expected int64) error 
 	return nil
 }
 
-func checkQueueRequest(ctx context.Context, store *V1Alpha2StatusStore, ref V1Alpha2ClusterRef, entry v1alpha2QueueEntry) error {
-	if err := queueRequestReady(entry.request); err != nil {
+func checkQueueRequestMode(ctx context.Context, store *V1Alpha2StatusStore, ref V1Alpha2ClusterRef, entry v1alpha2QueueEntry, cancel bool) error {
+	if err := queueRequestReadyMode(entry.request, cancel); err != nil {
 		return err
 	}
 	var raw json.RawMessage
@@ -234,12 +247,24 @@ func checkQueueRequest(ctx context.Context, store *V1Alpha2StatusStore, ref V1Al
 	if uid != entry.uid || rv != entry.rv || name != entry.name || ns != ref.Namespace || ValidateV1Alpha2RecoveryUpdate(entry.request, live) != nil || !sameJSON(live.Metadata["creationTimestamp"], entry.request.Metadata["creationTimestamp"]) {
 		return queueError(V1Alpha2QueueRequestBlocked, "fresh request identity, revision or intent changed")
 	}
-	return queueRequestReady(live)
+	return queueRequestReadyMode(live, cancel)
 }
 
-func queueRequestReady(r V1Alpha2Recovery) error {
+func queueRequestReadyMode(r V1Alpha2Recovery, cancel bool) error {
 	if raw, ok := r.Metadata["deletionTimestamp"]; ok && !bytes.Equal(bytes.TrimSpace(raw), []byte("null")) {
-		return queueError(V1Alpha2QueueRequestBlocked, "request deletion requires reconciliation")
+		if !cancel {
+			return queueError(V1Alpha2QueueRequestBlocked, "request deletion requires reconciliation")
+		}
+		var value string
+		if json.Unmarshal(raw, &value) != nil {
+			return queueError(V1Alpha2QueueRequestBlocked, "invalid deletion timestamp")
+		}
+		parsed, err := time.Parse(time.RFC3339Nano, value)
+		if err != nil || parsed.IsZero() {
+			return queueError(V1Alpha2QueueRequestBlocked, "invalid deletion timestamp")
+		}
+	} else if cancel {
+		return queueError(V1Alpha2QueueRequestBlocked, "request is not deleting")
 	}
 	var finalizers []string
 	if json.Unmarshal(r.Metadata["finalizers"], &finalizers) != nil {
