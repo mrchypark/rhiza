@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"strings"
 	"testing"
 	"time"
 
@@ -23,6 +24,16 @@ import (
 type readonlyProviderBucket struct {
 	objstore.Bucket
 	writes int
+}
+
+type deleteCountingProviderBucket struct {
+	objstore.Bucket
+	deletes int
+}
+
+func (b *deleteCountingProviderBucket) Delete(ctx context.Context, name string) error {
+	b.deletes++
+	return b.Bucket.Delete(ctx, name)
 }
 
 func (b *readonlyProviderBucket) Upload(context.Context, string, io.Reader, ...objstore.ObjectUploadOption) error {
@@ -43,7 +54,7 @@ func TestEmbeddedObjectStorageHAReadOnlyView(t *testing.T) {
 	}
 	ctx := context.Background()
 	cfg := embeddedStoreConfig(t)
-	bucket := embeddedBucket(t, cfg)
+	bucket := &deleteCountingProviderBucket{Bucket: embeddedBucket(t, cfg)}
 	bootstrap := quepaxa.Cluster{ConfigID: 1, Members: []quepaxa.Member{{ID: "n1"}}}
 	wal, err := qlog.Open(t.TempDir())
 	if err != nil {
@@ -78,7 +89,10 @@ func TestEmbeddedObjectStorageHAReadOnlyView(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer cleanup()
-	cp := checkpoint.NewManager(bucket, "ha-readonly", "", 1)
+	cp, err := checkpoint.NewAppendOnlyManager(bucket, "ha-readonly", "", 1)
+	if err != nil {
+		t.Fatal(err)
+	}
 	claim, err := cp.AcquirePublisherClaim(ctx, "provider", 0, time.Minute)
 	if err != nil {
 		t.Fatal(err)
@@ -127,16 +141,45 @@ func TestEmbeddedObjectStorageHAReadOnlyView(t *testing.T) {
 	if !ok {
 		t.Fatal("missing certified checkpoint seal")
 	}
-	archive := recovery.NewManager(bucket, "ha-readonly", 1)
+	archive, err := recovery.NewAppendOnlyManager(bucket, "ha-readonly", 1)
+	if err != nil {
+		t.Fatal(err)
+	}
 	if err := archive.SyncThrough(ctx, core, core.Tip()); err != nil {
 		t.Fatal(err)
 	}
+	oldView, err := recovery.OpenReadOnlyView(ctx, bucket, "ha-readonly", 1, bootstrap)
+	if err != nil {
+		t.Fatal(err)
+	}
+	beforeTrim := embeddedRemoteImage(t, cfg)
 	sealed, ok, err := core.LatestCheckpointSeal()
 	if err != nil || !ok {
 		t.Fatalf("missing checkpoint seal: %v", err)
 	}
 	if err := archive.TrimThrough(ctx, sealed, sealDecision); err != nil {
 		t.Fatal(err)
+	}
+	if _, err := recovery.PrepareReadOnlyRestore(ctx, oldView, filepath.Join(t.TempDir(), "old-view")); err != nil {
+		t.Fatalf("pre-trim view after trim: %v", err)
+	}
+	beforeGC := embeddedRemoteImage(t, cfg)
+	for key, data := range beforeTrim {
+		if strings.Contains(key, "/archive/blocks/") && !bytes.Equal(beforeGC[key], data) {
+			t.Fatalf("trim removed or changed old extent %s", key)
+		}
+	}
+	if err := cp.GarbageCollectFrom(ctx, nil, 1, index, 0); err == nil {
+		t.Fatal("append-only checkpoint GC succeeded")
+	}
+	if err := archive.Cleanup(ctx, 0); err == nil {
+		t.Fatal("append-only archive cleanup succeeded")
+	}
+	if bucket.deletes != 0 {
+		t.Fatalf("append-only GC attempted %d deletes", bucket.deletes)
+	}
+	if after := embeddedRemoteImage(t, cfg); !reflect.DeepEqual(beforeGC, after) {
+		t.Fatal("append-only GC changed source objects")
 	}
 	if err := cp.ReleasePublisherClaim(ctx, claim); err != nil {
 		t.Fatal(err)
@@ -153,6 +196,39 @@ func TestEmbeddedObjectStorageHAReadOnlyView(t *testing.T) {
 	}
 	archive.Close()
 	before := embeddedRemoteImage(t, cfg)
+	seen := map[string]bool{}
+	for key, data := range before {
+		kind := ""
+		switch {
+		case strings.Contains(key, "/checkpoint/roots/"):
+			kind = "root"
+		case strings.Contains(key, "/checkpoint/blocks/"):
+			kind = "block"
+		case strings.Contains(key, "/archive/blocks/"):
+			kind = "extent"
+		}
+		if kind == "" || seen[kind] {
+			continue
+		}
+		seen[kind] = true
+		if err := bucket.Upload(ctx, key, bytes.NewReader([]byte("collision")), objstore.WithIfNotExists()); err == nil || !bucket.IsConditionNotMetErr(err) {
+			t.Fatalf("%s create-only collision: %v", kind, err)
+		}
+		r, err := bucket.Get(ctx, key)
+		if err != nil {
+			t.Fatal(err)
+		}
+		got, err := io.ReadAll(r)
+		closeErr := r.Close()
+		if err != nil || closeErr != nil || !bytes.Equal(got, data) {
+			t.Fatalf("%s collision overwrote object: read=%v close=%v", kind, err, closeErr)
+		}
+	}
+	for _, kind := range []string{"root", "block", "extent"} {
+		if !seen[kind] {
+			t.Fatalf("missing %s object", kind)
+		}
+	}
 	readonly := &readonlyProviderBucket{Bucket: bucket}
 	view, err := recovery.OpenReadOnlyView(ctx, readonly, "ha-readonly", 1, bootstrap)
 	if err != nil {

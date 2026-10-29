@@ -49,6 +49,9 @@ func (m *Manager) LocalRecoveryActive(ctx context.Context) (bool, error) {
 // mutations keep the gate held without automatic takeover; recovery requires
 // verified writer termination and resolution of outstanding storage operations.
 func (m *Manager) WithLocalMaintenanceContext(ctx context.Context, work func(context.Context) error) error {
+	if m.appendOnly {
+		return fmt.Errorf("Local maintenance is disabled for append-only manager")
+	}
 	timer := time.NewTimer(5 * time.Second)
 	defer timer.Stop()
 	for {
@@ -205,6 +208,9 @@ func (m *Manager) LocalMaintenanceResolved(ctx context.Context) (bool, error) {
 // GarbageCollectLocal is called inside WithLocalMaintenanceContext. Only explicitly
 // retired committed roots are deleted; prepared roots remain publication-safe.
 func (m *Manager) GarbageCollectLocal(ctx context.Context, retired, retain map[[32]byte]struct{}, grace time.Duration) error {
+	if m.appendOnly {
+		return fmt.Errorf("Local checkpoint garbage collection is disabled for append-only manager")
+	}
 	if _, wrapped := m.bucket.(*localBucket); !wrapped {
 		return NewManager(LocalBucket(m.bucket), m.prefix, m.localDir, m.configID).GarbageCollectLocal(ctx, retired, retain, grace)
 	}

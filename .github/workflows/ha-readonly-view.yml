@@ -5,6 +5,7 @@ on:
     branches:
       - feature/ha-v1alpha2-readonly-view
       - feature/ha-v1alpha2-prepare-restore
+      - feature/ha-v1alpha2-append-only
   workflow_dispatch:
 
 permissions:
@@ -20,10 +21,10 @@ jobs:
         with:
           go-version-file: go.mod
           cache: true
-      - name: Verify recovery package
-        run: go test ./pkg/recovery -count=1 -timeout=180s
+      - name: Verify HA packages
+        run: go test ./pkg/node ./pkg/checkpoint ./pkg/recovery -count=1 -timeout=180s
       - name: Verify fixed-head recovery view under race detector
-        run: go test -race ./pkg/recovery -run '^TestHA(ReadOnlyView|PrepareReadOnlyRestore)' -count=1
+        run: go test -race ./pkg/node ./pkg/checkpoint ./pkg/recovery -run '^TestHA' -count=1 -timeout=180s
       - name: Exercise fixed-head reads against pinned Floci providers
         run: |
           set -euo pipefail

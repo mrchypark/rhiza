@@ -141,6 +141,7 @@ type extentObject struct {
 }
 
 type Manager struct {
+	appendOnly   bool
 	bucket       objstore.Bucket
 	prefix       string
 	configID     uint
@@ -165,6 +166,20 @@ type Manager struct {
 	readMu       sync.Mutex
 	readCond     *sync.Cond
 	readers      int
+}
+
+// NewAppendOnlyManager opens an HA namespace without online deletion.
+func NewAppendOnlyManager(bucket objstore.Bucket, prefix string, configID uint) (*Manager, error) {
+	if bucket == nil {
+		return nil, fmt.Errorf("append-only archive requires an object store")
+	}
+	options := bucket.SupportedObjectUploadOptions()
+	if !slices.Contains(options, objstore.IfNotExists) || !slices.Contains(options, objstore.IfMatch) {
+		return nil, fmt.Errorf("append-only archive requires conditional object writes")
+	}
+	m := NewManager(bucket, prefix, configID)
+	m.appendOnly = true
+	return m, nil
 }
 
 // NewManager opens one archive namespace. configID is the immutable archive
@@ -1236,6 +1251,9 @@ func (m *Manager) Sealed() bool {
 // Cleanup removes obsolete immutable blocks after the grace period.
 // Every block reachable from the current head is always retained.
 func (m *Manager) Cleanup(ctx context.Context, grace time.Duration) error {
+	if m.appendOnly {
+		return fmt.Errorf("archive cleanup is disabled for append-only manager")
+	}
 	if grace < 0 {
 		return fmt.Errorf("archive GC grace period must not be negative")
 	}

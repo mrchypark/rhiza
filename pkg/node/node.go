@@ -440,11 +440,22 @@ func (n *Node) open(ctx context.Context, enroll bool) (err error) {
 			return n.Shutdown()
 		}
 		clusterPrefix := path.Join(n.config.ObjStorePrefix, string(n.config.ClusterID))
-		n.checkpoints = checkpoint.NewManager(bucket, clusterPrefix, n.config.DataDir, 1)
+		if n.config.Local {
+			n.checkpoints = checkpoint.NewManager(bucket, clusterPrefix, n.config.DataDir, 1)
+			n.archive = recovery.NewManager(bucket, clusterPrefix, 1)
+		} else {
+			n.checkpoints, err = checkpoint.NewAppendOnlyManager(bucket, clusterPrefix, n.config.DataDir, 1)
+			if err != nil {
+				return err
+			}
+			n.archive, err = recovery.NewAppendOnlyManager(bucket, clusterPrefix, 1)
+			if err != nil {
+				return err
+			}
+		}
 		if loadErr := n.checkpoints.Load(ctx); loadErr != nil {
 			return fmt.Errorf("load checkpoint manifest: %w", loadErr)
 		}
-		n.archive = recovery.NewManager(bucket, clusterPrefix, 1)
 		n.archive.SetGroupDelay(n.config.ObjStoreBatchDelay)
 		if len(n.config.Members) > 1 && !n.archive.CASSupported() {
 			return fmt.Errorf("multi-node shared archive requires conditional object writes")
@@ -1014,7 +1025,7 @@ func (n *Node) open(ctx context.Context, enroll bool) (err error) {
 			return nil
 		})
 	}
-	if n.checkpoints != nil && n.config.ObjStoreGCInterval > 0 {
+	if n.config.Local && n.checkpoints != nil && n.config.ObjStoreGCInterval > 0 {
 		n.wg.Add(1)
 		go func() {
 			defer n.wg.Done()
