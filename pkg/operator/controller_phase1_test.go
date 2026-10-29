@@ -4,11 +4,19 @@ import (
 	"context"
 	"errors"
 	"net/http"
+	"os/exec"
 	"testing"
 	"time"
 
 	"github.com/thanos-io/objstore"
 )
+
+func TestPhase1AdmissionOracle(t *testing.T) {
+	cmd := exec.Command("sh", "../../scripts/test-ha-v1alpha2-contract.sh", "--self-test-oracle")
+	if output, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("admission oracle self-test: %v\n%s", err, output)
+	}
+}
 
 type phase1Transport struct{ calls int }
 
