@@ -62,7 +62,7 @@ func (r *repairDiagnosticFault) Close() error { r.closed = true; return nil }
 
 type repairDiagnosticRoundTrip func(*http.Request) (*http.Response, error)
 
-type repairDiagnosticRule struct{ expression, id string }
+type repairDiagnosticRule struct{ expression, message, id string }
 
 func repairDiagnosticRules() []repairDiagnosticRule {
 	f, err := os.Open(filepath.Join("..", "..", "deploy", "operator", "cluster-crd.yaml"))
@@ -72,14 +72,22 @@ func repairDiagnosticRules() []repairDiagnosticRule {
 	defer f.Close()
 	var rules []repairDiagnosticRule
 	s := bufio.NewScanner(f)
+	pending := false
 	for line := 1; s.Scan(); line++ {
 		text := strings.TrimSpace(s.Text())
+		if strings.HasPrefix(text, "message: ") && pending {
+			rules[len(rules)-1].message = strings.Trim(strings.TrimSpace(strings.TrimPrefix(text, "message: ")), "\"'")
+			pending = false
+			continue
+		}
+		pending = false
 		if !strings.HasPrefix(text, "- rule: '") || !strings.HasSuffix(text, "'") {
 			continue
 		}
 		expression := strings.TrimSuffix(strings.TrimPrefix(text, "- rule: '"), "'")
 		sum := sha256.Sum256([]byte(expression))
 		rules = append(rules, repairDiagnosticRule{expression: expression, id: fmt.Sprintf("line-%d-%x", line, sum[:6])})
+		pending = true
 	}
 	if s.Err() != nil {
 		return nil
@@ -89,7 +97,7 @@ func repairDiagnosticRules() []repairDiagnosticRule {
 
 func repairDiagnosticCEL(message string, rules []repairDiagnosticRule) (classes, keys, ids []string) {
 	lower := strings.ToLower(message)
-	for _, class := range []struct{ needle, name string }{{"no such key", "missing-key"}, {"no such overload", "overload"}, {"type conversion", "type-conversion"}, {"cost budget", "cost-budget"}, {"cost limit", "cost-limit"}, {"validation failed due to running out of cost budget", "cost-budget"}} {
+	for _, class := range []struct{ needle, name string }{{"no such key", "missing-key"}, {"no such overload", "overload"}, {"type conversion", "type-conversion"}, {"cost budget", "cost-budget"}, {"cost limit", "cost-limit"}, {"cost could not be calculated", "cost-unavailable"}, {"call cost exceeds limit", "call-cost-limit"}, {"rule compile error", "compile-error"}, {"index out of bounds", "index-out-of-bounds"}, {"integer overflow", "integer-overflow"}, {"division by zero", "division-by-zero"}, {"evaluating rule", "rule-evaluation"}} {
 		if strings.Contains(lower, class.needle) {
 			classes = append(classes, class.name)
 		}
@@ -107,11 +115,61 @@ func repairDiagnosticCEL(message string, rules []repairDiagnosticRule) (classes,
 		}
 	}
 	for _, rule := range rules {
-		if strings.Contains(message, rule.expression) {
+		if strings.Contains(message, rule.expression) || rule.message != "" && strings.Contains(message, "evaluating rule: "+rule.message) || rule.message != "" && strings.Contains(message, "for rule: "+rule.message) {
 			ids = append(ids, rule.id)
 		}
 	}
 	return
+}
+
+// Only fixed words survive. Quoted scalars, numbers, and all other words are
+// replaced, so a Kubernetes response cannot inject SQL, credentials, or data.
+func repairDiagnosticSkeleton(message string) string {
+	allowed := map[string]bool{}
+	for _, word := range strings.Fields("validation failed due to running out of cost budget no further rules will be run runtime could not calculated for rule compile error evaluating such key overload operation cancelled actual limit exceeded call cost exceeds index bounds integer overflow division by zero invalid value status field type self oldSelf repair completion authority pendingWrite pendingRequest applicationInit bootstrapPlan plan state operationID generation binding owner configID slot") {
+		allowed[word] = true
+	}
+	var words []string
+	quoted := byte(0)
+	for i := 0; i < len(message) && len(words) < 96; {
+		c := message[i]
+		if quoted != 0 {
+			if c == '\\' && i+1 < len(message) {
+				i += 2
+				continue
+			}
+			if c == quoted {
+				quoted = 0
+			}
+			i++
+			continue
+		}
+		if c == '\'' || c == '"' {
+			quoted = c
+			words = append(words, "_")
+			i++
+			continue
+		}
+		if !(c >= 'a' && c <= 'z' || c >= 'A' && c <= 'Z' || c >= '0' && c <= '9' || c == '_') {
+			i++
+			continue
+		}
+		j := i + 1
+		for j < len(message) {
+			c = message[j]
+			if !(c >= 'a' && c <= 'z' || c >= 'A' && c <= 'Z' || c >= '0' && c <= '9' || c == '_') {
+				break
+			}
+			j++
+		}
+		word := message[i:j]
+		if !allowed[word] {
+			word = "_"
+		}
+		words = append(words, word)
+		i = j
+	}
+	return strings.Join(words, " ")
 }
 
 func (f repairDiagnosticRoundTrip) RoundTrip(req *http.Request) (*http.Response, error) {
@@ -225,6 +283,50 @@ func TestRepairDiagnosticCELClassification(t *testing.T) {
 	if len(keys) != 0 {
 		t.Fatal("non-allowlisted key matched by prefix")
 	}
+	classes, _, ids = repairDiagnosticCEL("no such key: repair evaluating rule: "+selected.message, rules)
+	if !slices.Contains(classes, "missing-key") || !slices.Contains(ids, selected.id) {
+		t.Fatal("rule message was not mapped to its static ID")
+	}
+}
+
+func TestRepairDiagnosticTopLevelAndTruncation(t *testing.T) {
+	for _, tc := range []struct {
+		name, body string
+		want       []string
+	}{
+		{"top", `{"reason":"Invalid","message":"validation failed due to running out of cost budget secretvalue 'private SQL 123'","details":{"causes":[]}}`, []string{"cost-budget", "body-truncated=false", "json-decode-complete=true"}},
+		{"truncated", `{"message":"private-value` + strings.Repeat("x", 20000), []string{"body-truncated=true", "json-decode-complete=false"}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var log string
+			d := repairDiagnosticTransport{base: repairDiagnosticRoundTrip(func(*http.Request) (*http.Response, error) {
+				return &http.Response{StatusCode: 422, Body: io.NopCloser(strings.NewReader(tc.body))}, nil
+			}), logf: func(format string, args ...any) { log = fmt.Sprintf(format, args...) }}
+			req, err := http.NewRequest(http.MethodPut, "https://example.invalid/apis/rhiza/namespaces/n/rhizaclusters/genesis-contract/status", nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			resp, err := d.RoundTrip(req)
+			if err != nil {
+				t.Fatal(err)
+			}
+			got, err := io.ReadAll(resp.Body)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := resp.Body.Close(); err != nil {
+				t.Fatal(err)
+			}
+			if string(got) != tc.body || strings.Contains(log, "secretvalue") || strings.Contains(log, "private") || strings.Contains(log, "123") {
+				t.Fatalf("unsafe diagnostic or changed body: %q", log)
+			}
+			for _, value := range tc.want {
+				if !strings.Contains(log, value) {
+					t.Fatalf("missing %q in %q", value, log)
+				}
+			}
+		})
+	}
 }
 
 func TestRepairPlanPublicKeyJSONSchemaShape(t *testing.T) {
@@ -271,7 +373,8 @@ func (d repairDiagnosticTransport) RoundTrip(req *http.Request) (*http.Response,
 	}
 	// Preserve the exact stream for the production client, including any bytes
 	// beyond the diagnostic bound. Never print request data or raw API bodies.
-	prefix, readErr := io.ReadAll(io.LimitReader(resp.Body, 16384))
+	prefix, readErr := io.ReadAll(io.LimitReader(resp.Body, 16385))
+	truncated := len(prefix) > 16384
 	readers := []io.Reader{bytes.NewReader(prefix)}
 	if readErr != nil && !errors.Is(readErr, io.EOF) {
 		readers = append(readers, &repairDiagnosticError{err: readErr})
@@ -280,6 +383,7 @@ func (d repairDiagnosticTransport) RoundTrip(req *http.Request) (*http.Response,
 	resp.Body = repairDiagnosticBody{Reader: io.MultiReader(readers...), Closer: resp.Body}
 	var status struct {
 		Reason  string `json:"reason"`
+		Message string `json:"message"`
 		Details struct {
 			Causes []struct {
 				Message string `json:"message"`
@@ -288,7 +392,7 @@ func (d repairDiagnosticTransport) RoundTrip(req *http.Request) (*http.Response,
 			} `json:"causes"`
 		} `json:"details"`
 	}
-	_ = json.Unmarshal(prefix, &status)
+	decodeErr := json.Unmarshal(prefix, &status)
 	reason := "other"
 	for _, allowed := range []string{"Invalid", "Forbidden", "Conflict", "BadRequest", "InternalError"} {
 		if status.Reason == allowed {
@@ -298,12 +402,21 @@ func (d repairDiagnosticTransport) RoundTrip(req *http.Request) (*http.Response,
 	matches := []string{}
 	causes := []string{}
 	var celClasses, celKeys, celRules []string
+	var skeletons []string
 	rules := repairDiagnosticRules()
-	for _, cause := range status.Details.Causes {
-		classes, keys, ids := repairDiagnosticCEL(cause.Message, rules)
+	classify := func(message string) {
+		if message == "" {
+			return
+		}
+		classes, keys, ids := repairDiagnosticCEL(message, rules)
 		celClasses = append(celClasses, classes...)
 		celKeys = append(celKeys, keys...)
 		celRules = append(celRules, ids...)
+		skeletons = append(skeletons, repairDiagnosticSkeleton(message))
+	}
+	classify(status.Message)
+	for _, cause := range status.Details.Causes {
+		classify(cause.Message)
 		field := "other"
 		for _, allowed := range []string{"status", "status.repair", "status.repair.state", "status.repair.plan", "status.repair.plan.operationID", "status.repair.plan.clusterUID", "status.repair.plan.generation", "status.repair.plan.deploymentUID", "status.repair.plan.storageID", "status.repair.plan.expectedConfigID", "status.repair.plan.expectedAbortSlot", "status.repair.plan.oldNodeID", "status.repair.plan.oldWALIdentity", "status.repair.plan.bootstrapPlanDigest", "status.repair.plan.finalVoterIDs", "status.repair.plan.replacement", "status.repair.plan.replacement.podName", "status.repair.plan.replacement.podUID", "status.repair.plan.replacement.nodeID", "status.repair.plan.replacement.publicKey", "status.repair.plan.replacement.peerURL", "status.repair.completion"} {
 			if cause.Field == allowed {
@@ -343,7 +456,7 @@ func (d repairDiagnosticTransport) RoundTrip(req *http.Request) (*http.Response,
 			}
 		}
 	}
-	d.logf("repair status PUT: HTTP %d reason=%s causes=%q known-validation=%q cel-class=%q cel-known-key=%q cel-rule=%q differing-status-fields=%q body-prefix-read-error=%t", resp.StatusCode, reason, causes, matches, celClasses, celKeys, celRules, different, readErr != nil)
+	d.logf("repair status PUT: HTTP %d reason=%s causes=%q known-validation=%q cel-class=%q cel-known-key=%q cel-rule=%q message-skeleton=%q differing-status-fields=%q body-prefix-read-error=%t body-truncated=%t json-decode-complete=%t", resp.StatusCode, reason, causes, matches, celClasses, celKeys, celRules, skeletons, different, readErr != nil, truncated, decodeErr == nil)
 	return resp, nil
 }
 
