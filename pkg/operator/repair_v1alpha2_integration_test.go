@@ -227,6 +227,21 @@ func repairDiagnosticWireTokenClasses(status json.RawMessage) (map[string]string
 	return classes, nil
 }
 
+func repairDiagnosticSchemaField(schema map[string]any) string {
+	get := func(value any, key string) any {
+		object, _ := value.(map[string]any)
+		return object[key]
+	}
+	field := get(get(get(get(get(schema, "properties"), "status"), "properties"), "repair"), "properties")
+	field = get(get(field, "plan"), "properties")
+	field = get(field, "expectedConfigID")
+	object, _ := field.(map[string]any)
+	if object == nil {
+		return "missing"
+	}
+	return fmt.Sprintf("type=%v format=%v minimum=%v maximum=%v", object["type"], object["format"], object["minimum"], object["maximum"])
+}
+
 func (f repairDiagnosticRoundTrip) RoundTrip(req *http.Request) (*http.Response, error) {
 	return f(req)
 }
@@ -364,6 +379,16 @@ func TestRepairDiagnosticWireTokenClassesUsePlanGeneration(t *testing.T) {
 	for field, expected := range want {
 		if classes[field] != expected {
 			t.Errorf("%s token class: got %q, want %q", field, classes[field], expected)
+		}
+	}
+}
+
+func TestRepairDiagnosticSchemaFieldFacts(t *testing.T) {
+	schema := map[string]any{"properties": map[string]any{"status": map[string]any{"properties": map[string]any{"repair": map[string]any{"properties": map[string]any{"plan": map[string]any{"properties": map[string]any{"expectedConfigID": map[string]any{"type": "integer", "format": "int64", "minimum": float64(1), "maximum": float64(9)}}}}}}}}}
+	got := repairDiagnosticSchemaField(schema)
+	for _, want := range []string{"type=integer", "format=int64", "minimum=1", "maximum=9"} {
+		if !strings.Contains(got, want) {
+			t.Errorf("schema fact %q missing from %q", want, got)
 		}
 	}
 }
@@ -649,7 +674,12 @@ func TestV1Alpha2RepairAPIServerContract(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	t.Logf("repair diagnostic v1alpha2 schema equal=%t deployed-sha256=%x local-sha256=%x", sameJSON(deployedSchema, localSchema), sha256.Sum256(deployedSchema), sha256.Sum256(localSchema))
+	t.Logf("repair diagnostic v1alpha2 schema equal=%t deployed-sha256=%x local-sha256=%x expectedConfigID deployed={%s} local={%s}", sameJSON(deployedSchema, localSchema), sha256.Sum256(deployedSchema), sha256.Sum256(localSchema), repairDiagnosticSchemaField(deployed.Spec.Versions[0].Schema.OpenAPI), repairDiagnosticSchemaField(local.Spec.Versions[0].Schema.OpenAPI))
+	if logDir := os.Getenv("RHIZA_CONTRACT_LOG_DIR"); logDir != "" {
+		if err := os.WriteFile(filepath.Join(logDir, "deployed-v1alpha2-schema.json"), deployedSchema, 0600); err != nil {
+			t.Fatalf("save public deployed schema artifact: %v", err)
+		}
+	}
 	depName, err := V1Alpha2GenesisDeploymentName(ref.UID)
 	if err != nil {
 		t.Fatal(err)

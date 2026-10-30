@@ -299,6 +299,7 @@ genesis_uid=$(k get rhizacluster genesis-contract -n "$namespace" -o jsonpath='{
 : "${server:?}" "${status_uid:?}" "${missing_uid:?}" "${queue_uid:?}" "${cancel_uid:?}" "${prepare_uid:?}" "${complete_uid:?}" "${retained_uid:?}" "${waiting_uid:?}"
 [ -s "$tokenfile" ] && [ -s "$cafile" ] || exit 1
 export RHIZA_CONTRACT_REQUIRED=1 RHIZA_CONTRACT_SERVER="$server" RHIZA_CONTRACT_CA="$cafile" RHIZA_CONTRACT_TOKEN="$tokenfile" RHIZA_CONTRACT_NAMESPACE="$namespace" RHIZA_CONTRACT_STATUS_UID="$status_uid" RHIZA_CONTRACT_QUEUE_UID="$queue_uid" RHIZA_CONTRACT_MISSING_UID="$missing_uid" RHIZA_CONTRACT_FINALIZER_UID="$finalizer_uid" RHIZA_CONTRACT_CANCEL_UID="$cancel_uid" RHIZA_CONTRACT_PREPARE_UID="$prepare_uid"
+export RHIZA_CONTRACT_LOG_DIR="$logs"
 export RHIZA_CONTRACT_COMPLETE_UID="$complete_uid" RHIZA_CONTRACT_RETAINED_UID="$retained_uid" RHIZA_CONTRACT_WAITING_UID="$waiting_uid"
 export RHIZA_CONTRACT_GENESIS_UID="$genesis_uid" RHIZA_CONTRACT_KUBECONFIG="$kubeconfig" RHIZA_CONTRACT_CONTEXT="$context"
 export RHIZA_CONTRACT_AUTHORITY_UID="$authority_uid"
