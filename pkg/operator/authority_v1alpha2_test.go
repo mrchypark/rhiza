@@ -42,6 +42,9 @@ func TestAuthorityV1Alpha2ReserveFinalizeAndRecoveryRead(t *testing.T) {
 	if err != nil || observation != V1Alpha2CASApplied {
 		t.Fatalf("reserve: %s %v", observation, err)
 	}
+	if initial.EverApplicationReserved() || !reserved.EverApplicationReserved() {
+		t.Fatal("reservation history was not atomically recorded")
+	}
 	if req, ok := reserved.Pending(); !ok || req != authorityTestRequest {
 		t.Fatalf("pending: %+v %v", req, ok)
 	}
@@ -109,6 +112,9 @@ func TestAuthorityV1Alpha2ProvenNoEffect(t *testing.T) {
 	if err != nil || observation != V1Alpha2CASApplied {
 		t.Fatalf("no-effect finalize: %s %v", observation, err)
 	}
+	if !final.EverApplicationReserved() {
+		t.Fatal("no-effect reset reservation history")
+	}
 	if _, pending := final.Pending(); pending || !sameJSON(final.Evidence(), authorityTestEvidence) || s.puts != 2 {
 		t.Fatalf("pending=%v evidence=%s puts=%d", pending, final.Evidence(), s.puts)
 	}
@@ -138,6 +144,9 @@ func TestAuthorityV1Alpha2IdenticalCompetingReservationDoesNotProveOwnership(t *
 	}
 	if req, pending := observed.Pending(); !pending || req != authorityTestRequest {
 		t.Fatalf("readback pending: %+v %v", req, pending)
+	}
+	if !observed.EverApplicationReserved() {
+		t.Fatal("matching readback lost reservation history")
 	}
 }
 

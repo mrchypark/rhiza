@@ -10,7 +10,48 @@ import (
 	"strings"
 	"sync"
 	"testing"
+
+	"github.com/mrchypark/rhiza/internal/types"
+	"github.com/mrchypark/rhiza/pkg/quepaxa"
 )
+
+func testBootstrapPlan(ref V1Alpha2ClusterRef) (V1Alpha2BootstrapPlan, string, error) {
+	cluster, err := types.ManagedClusterID(ref.UID, 0)
+	if err != nil {
+		return V1Alpha2BootstrapPlan{}, "", err
+	}
+	plan := V1Alpha2BootstrapPlan{ClusterID: cluster, PhysicalBinding: strings.Repeat("a", 64), EvidenceFormat: "sql/v1", Durability: types.ObjectStoreDurabilityBeforeAck}
+	var members []quepaxa.Member
+	for i := 1; i <= 3; i++ {
+		pod := fmt.Sprintf("pod-%d", i)
+		id, err := types.ManagedNodeID(pod)
+		if err != nil {
+			return V1Alpha2BootstrapPlan{}, "", err
+		}
+		var key quepaxa.PublicKey
+		key[0] = byte(i)
+		m := quepaxa.Member{ID: id, PeerURL: fmt.Sprintf("quic://127.0.0.%d:1234", i), PublicKey: key}
+		plan.Members = append(plan.Members, V1Alpha2BootstrapMember{PodUID: pod, Member: m})
+		members = append(members, m)
+	}
+	digest, err := types.ManagedBootstrapPlanDigest(string(cluster), members, plan.PhysicalBinding, plan.EvidenceFormat, plan.Durability, false)
+	return plan, digest, err
+}
+
+func TestPhase8BootstrapPlanValidation(t *testing.T) {
+	plan, digest, err := testBootstrapPlan(phase2Ref)
+	if err != nil {
+		t.Fatal(err)
+	}
+	assignment := V1Alpha2ApplicationInitPlan{PhysicalBinding: plan.PhysicalBinding, EvidenceFormat: plan.EvidenceFormat, BootstrapPlanDigest: digest}
+	if err := validateV1Alpha2BootstrapPlan(phase2Ref, assignment, plan, 3); err != nil {
+		t.Fatal(err)
+	}
+	plan.Members[0].Member.WALIdentity = "unexpected"
+	if err := validateV1Alpha2BootstrapPlan(phase2Ref, assignment, plan, 3); err == nil {
+		t.Fatal("accepted WAL identity")
+	}
+}
 
 const phase8Cluster = `{"apiVersion":"rhiza.mrchypark.dev/v1alpha2","kind":"RhizaCluster","metadata":{"name":"cluster","namespace":"ns","uid":"uid","resourceVersion":"47","labels":{"keep":"yes"}},"spec":{"logicalID":"logical","genesisIntent":"Create","voterCount":3,"workload":{"podTemplate":{"spec":{"containers":[{"name":"app","image":"image"}]}}}},"status":{"unrelated":{"keep":true}}}`
 
@@ -85,11 +126,15 @@ func phase8Setup(t *testing.T, cluster, deployment string) (*phase8Server, *V1Al
 }
 
 func phase8Initialize(ctx context.Context, store *V1Alpha2StatusStore, ref V1Alpha2ClusterRef, name string) (V1Alpha2StatusSnapshot, error) {
-	plan, err := NewV1Alpha2ApplicationInitPlan(ref, "logical", "deployment", "assignment", strings.Repeat("a", 64), strings.Repeat("b", 64), "app/v1")
+	bootstrap, digest, err := testBootstrapPlan(ref)
 	if err != nil {
 		return V1Alpha2StatusSnapshot{}, err
 	}
-	return InitializeV1Alpha2AuthorityWithPlan(ctx, store, ref, name, plan)
+	plan, err := NewV1Alpha2ApplicationInitPlan(ref, "logical", "deployment", "assignment", bootstrap.PhysicalBinding, digest, bootstrap.EvidenceFormat)
+	if err != nil {
+		return V1Alpha2StatusSnapshot{}, err
+	}
+	return InitializeV1Alpha2AuthorityWithBootstrap(ctx, store, ref, name, plan, bootstrap)
 }
 
 func TestPhase8GenesisAtomicAndPreservesFields(t *testing.T) {

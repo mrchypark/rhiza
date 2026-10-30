@@ -30,7 +30,7 @@ func phase2Store(t *testing.T, f phase2Transport) *V1Alpha2StatusStore {
 	return &V1Alpha2StatusStore{Kube: &Kubernetes{BaseURL: "https://kube.invalid", Namespace: "ns", TokenFile: token, Client: &http.Client{Transport: f}}}
 }
 
-const phase2Object = `{"apiVersion":"rhiza.mrchypark.dev/v1alpha2","kind":"RhizaCluster","metadata":{"name":"cluster","namespace":"ns","uid":"uid","resourceVersion":"1","labels":{"keep":"yes"}},"spec":{"logicalID":"logical","keep":true},"status":{"authority":{"owner":{"namespace":"ns","name":"cluster","uid":"uid","logicalID":"logical"},"generation":2,"binding":{"deploymentUID":"deployment","storageID":"storage"},"pendingWrite":{"keep":1},"transition":{"keep":2},"receipt":{"keep":3}},"unrelated":{"keep":true},"recoveryQueue":{"version":1}}}`
+const phase2Object = `{"apiVersion":"rhiza.mrchypark.dev/v1alpha2","kind":"RhizaCluster","metadata":{"name":"cluster","namespace":"ns","uid":"uid","resourceVersion":"1","labels":{"keep":"yes"}},"spec":{"logicalID":"logical","keep":true},"status":{"authority":{"owner":{"namespace":"ns","name":"cluster","uid":"uid","logicalID":"logical"},"generation":2,"binding":{"deploymentUID":"deployment","storageID":"storage"},"everApplicationReserved":false,"pendingWrite":{"keep":1},"transition":{"keep":2},"receipt":{"keep":3}},"unrelated":{"keep":true},"recoveryQueue":{"version":1}}}`
 
 var phase2Ref = V1Alpha2ClusterRef{Name: "cluster", Namespace: "ns", UID: "uid"}
 
@@ -120,15 +120,17 @@ func TestPhase2StatusCASRejectsLostUnrelatedStatus(t *testing.T) {
 
 func TestPhase2StatusRejectsInvalidIdentityAndAuthorityWithoutWrites(t *testing.T) {
 	tests := map[string]string{
-		"missing authority":        strings.Replace(phase2Object, `"authority":{`, `"notAuthority":{`, 1),
-		"null authority":           strings.Replace(phase2Object, `"authority":{`, `"authority":null,"notAuthority":{`, 1),
-		"corrupt authority":        strings.Replace(phase2Object, `"generation":2`, `"generation":"bad"`, 1),
-		"wrong uid":                strings.Replace(phase2Object, `"uid":"uid"`, `"uid":"other"`, 1),
-		"wrong namespace":          strings.Replace(phase2Object, `"namespace":"ns"`, `"namespace":"other"`, 1),
-		"wrong version":            strings.Replace(phase2Object, `v1alpha2`, `v1alpha1`, 1),
-		"missing resource version": strings.Replace(phase2Object, `"resourceVersion":"1",`, "", 1),
-		"wrong logical ID":         strings.Replace(phase2Object, `"spec":{"logicalID":"logical"`, `"spec":{"logicalID":"other"`, 1),
-		"deleting cluster":         strings.Replace(phase2Object, `"resourceVersion":"1"`, `"deletionTimestamp":"2026-01-01T00:00:00Z","resourceVersion":"1"`, 1),
+		"missing authority":           strings.Replace(phase2Object, `"authority":{`, `"notAuthority":{`, 1),
+		"null authority":              strings.Replace(phase2Object, `"authority":{`, `"authority":null,"notAuthority":{`, 1),
+		"corrupt authority":           strings.Replace(phase2Object, `"generation":2`, `"generation":"bad"`, 1),
+		"missing reservation history": strings.Replace(phase2Object, `"everApplicationReserved":false,`, "", 1),
+		"null reservation history":    strings.Replace(phase2Object, `"everApplicationReserved":false`, `"everApplicationReserved":null`, 1),
+		"wrong uid":                   strings.Replace(phase2Object, `"uid":"uid"`, `"uid":"other"`, 1),
+		"wrong namespace":             strings.Replace(phase2Object, `"namespace":"ns"`, `"namespace":"other"`, 1),
+		"wrong version":               strings.Replace(phase2Object, `v1alpha2`, `v1alpha1`, 1),
+		"missing resource version":    strings.Replace(phase2Object, `"resourceVersion":"1",`, "", 1),
+		"wrong logical ID":            strings.Replace(phase2Object, `"spec":{"logicalID":"logical"`, `"spec":{"logicalID":"other"`, 1),
+		"deleting cluster":            strings.Replace(phase2Object, `"resourceVersion":"1"`, `"deletionTimestamp":"2026-01-01T00:00:00Z","resourceVersion":"1"`, 1),
 	}
 	for name, body := range tests {
 		t.Run(name, func(t *testing.T) {

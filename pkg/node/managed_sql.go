@@ -35,13 +35,13 @@ func (n *Node) managedSQLBucket(ctx context.Context) (*objectstore.MeteredBucket
 	if provider == "" {
 		provider = objectstore.ProviderS3
 	}
-	return objectstore.NewBucketWithoutProvisioning(ctx, objectstore.Config{
+	return objectstore.NewBucketForNamespace(ctx, objectstore.Config{
 		Provider: provider, FilesystemDir: c.ObjStoreDir, Prefix: c.ObjStorePrefix,
 		Endpoint: c.ObjStoreEndpoint, Bucket: c.ObjStoreBucket, Region: c.ObjStoreRegion, Insecure: c.ObjStoreInsecure, MaxRetries: c.ObjStoreRetries,
 		AccessKey: c.ObjStoreAccessKey, SecretKey: c.ObjStoreSecretKey, SessionToken: c.ObjStoreSessionToken,
 		ServiceAccount: c.ObjStoreServiceAccount, AzureTenantID: c.ObjStoreAzureTenantID, AzureClientID: c.ObjStoreAzureClientID, AzureClientSecret: c.ObjStoreAzureClientSecret,
 		AzureStorageAccount: c.ObjStoreAzureStorageAccount, AzureStorageAccountKey: c.ObjStoreAzureStorageAccountKey, AzureConnectionString: c.ObjStoreAzureConnectionString, AzureUserAssignedID: c.ObjStoreAzureUserAssignedID,
-	})
+	}, path.Join(c.ObjStorePrefix, string(c.ClusterID)))
 }
 
 func (n *Node) managedSQLScope(i ManagedStartupIdentity) ([]byte, string, error) {
@@ -54,16 +54,16 @@ func (n *Node) managedSQLScope(i ManagedStartupIdentity) ([]byte, string, error)
 		return nil, "", errors.Join(fmt.Errorf("initial SQL bootstrap binding mismatch"), err)
 	}
 	b, err := json.Marshal(struct {
-		Version                                                                                                              int
-		ClusterUID, AssignmentID, IntentHash, DeploymentUID, StorageID, PhysicalBinding, BootstrapPlanDigest, EvidenceFormat string
-		Generation                                                                                                           int64
-	}{1, i.Member.ClusterUID, i.AssignmentID, i.IntentHash, i.Member.DeploymentUID, i.StorageID, i.PhysicalBinding, i.BootstrapPlanDigest, i.EvidenceFormat, i.Member.Generation})
+		Version                                                                                                                              int
+		ClusterUID, AssignmentID, IntentHash, DeploymentUID, StorageID, PhysicalBinding, BootstrapPlanDigest, EvidenceFormat, FinalNamespace string
+		Generation                                                                                                                           int64
+	}{1, i.Member.ClusterUID, i.AssignmentID, i.IntentHash, i.Member.DeploymentUID, i.StorageID, i.PhysicalBinding, i.BootstrapPlanDigest, i.EvidenceFormat, path.Join(n.config.ObjStorePrefix, string(n.config.ClusterID)), i.Member.Generation})
 	return b, path.Join(n.config.ObjStorePrefix, string(n.config.ClusterID)), err
 }
 
-// PrepareManagedSQLSource records once-new namespace provenance before voter
-// registration. Missing provenance plus any existing object is never bootstrap.
-// The immutable application-start marker closes this exception permanently.
+// PrepareManagedSQLSource creates/verifies exact birth intent, not prefix-wide
+// empty proof or execution ownership. The host separately requires canonical
+// never-reserved history; all managed writers have fixed disjoint namespaces.
 func (n *Node) PrepareManagedSQLSource(ctx context.Context, i ManagedStartupIdentity, allowNew bool) (empty bool, resultErr error) {
 	want, prefix, err := n.managedSQLScope(i)
 	if err != nil {
@@ -88,8 +88,8 @@ func (n *Node) PrepareManagedSQLSource(ctx context.Context, i ManagedStartupIden
 			if !errors.Is(err, notEmpty) {
 				return false, err
 			}
-			// Another initializer may have claimed the same empty scope since
-			// our first GET. Only its exact immutable receipt admits this race.
+			// Another initial member may have recorded the same birth intent
+			// since our GET. This is exact record readback, not a prefix claim.
 			claimed, readErr := readVoterRegistration(ctx, bucket, key)
 			if readErr != nil || !bytes.Equal(claimed, want) {
 				return false, errors.Join(err, readErr)
@@ -115,15 +115,20 @@ func (n *Node) PrepareManagedSQLSource(ctx context.Context, i ManagedStartupIden
 	if err != nil {
 		return false, err
 	}
-	if started != nil && !head {
-		return false, fmt.Errorf("application history requires existing archive HEAD")
-	}
 	return started == nil && !head, nil
 }
 
-// VerifyManagedSQLFreshSource checks actual retained source history before E0.
-// It requires neither quorum nor application readiness. Scope provenance was
-// created before registration and every private SQL execution marks start first.
+func (n *Node) ManagedArchiveAvailable(ctx context.Context) (bool, error) {
+	bucket, err := n.managedSQLBucket(ctx)
+	if err != nil {
+		return false, err
+	}
+	exists, checkErr := bucket.Exists(ctx, path.Join(n.config.ObjStorePrefix, string(n.config.ClusterID), "archive/head.bin"))
+	return exists, errors.Join(checkErr, bucket.Close())
+}
+
+// VerifyManagedSQLFreshSource checks the exact birth and retained source before
+// E0. It does not replace the host's canonical never-reserved history check.
 func (n *Node) VerifyManagedSQLFreshSource(ctx context.Context, i ManagedStartupIdentity) (resultErr error) {
 	want, prefix, err := n.managedSQLScope(i)
 	if err != nil {
@@ -155,7 +160,11 @@ func (n *Node) VerifyManagedSQLFreshSource(ctx context.Context, i ManagedStartup
 	if !exists {
 		return nil
 	}
-	view, err := recovery.OpenReadOnlyView(ctx, bucket, prefix, 1, *n.loadClusterConfig())
+	source, err := objectstore.BindReadOnlyNamespace(bucket, prefix)
+	if err != nil {
+		return err
+	}
+	view, err := recovery.OpenReadOnlyView(ctx, source, prefix, 1, *n.loadClusterConfig())
 	if err != nil {
 		return err
 	}

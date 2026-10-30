@@ -28,19 +28,34 @@ type V1Alpha2AuthorityView struct {
 // V1Alpha2StatusSnapshot is obtained only from Load or a successful CAS.
 // Its accessors return copies; the private preconditions cannot be forged by callers.
 type V1Alpha2StatusSnapshot struct {
-	ref             V1Alpha2ClusterRef
-	resourceVersion string
-	authority       V1Alpha2AuthorityView
-	authorityRaw    json.RawMessage
-	queue           json.RawMessage
-	object          map[string]json.RawMessage
-	store           *V1Alpha2StatusStore
+	ref                     V1Alpha2ClusterRef
+	resourceVersion         string
+	authority               V1Alpha2AuthorityView
+	everApplicationReserved bool
+	authorityRaw            json.RawMessage
+	queue                   json.RawMessage
+	object                  map[string]json.RawMessage
+	store                   *V1Alpha2StatusStore
 }
 
 func (s V1Alpha2StatusSnapshot) Ref() V1Alpha2ClusterRef          { return s.ref }
 func (s V1Alpha2StatusSnapshot) ResourceVersion() string          { return s.resourceVersion }
 func (s V1Alpha2StatusSnapshot) Authority() V1Alpha2AuthorityView { return s.authority }
+func (s V1Alpha2StatusSnapshot) EverApplicationReserved() bool    { return s.everApplicationReserved }
 func (s V1Alpha2StatusSnapshot) Queue() json.RawMessage           { return bytes.Clone(s.queue) }
+
+// BootstrapPlan returns a detached copy of the validated immutable public plan.
+func (s V1Alpha2StatusSnapshot) BootstrapPlan() (V1Alpha2BootstrapPlan, error) {
+	status, err := jsonObject(s.object["status"])
+	if err != nil {
+		return V1Alpha2BootstrapPlan{}, err
+	}
+	var p V1Alpha2BootstrapPlan
+	if decodeV1Alpha2(status["bootstrapPlan"], &p) != nil {
+		return p, fmt.Errorf("missing bootstrap plan")
+	}
+	return p, nil
+}
 
 func (s *V1Alpha2StatusStore) path(ref V1Alpha2ClusterRef) (string, error) {
 	if s == nil || s.Kube == nil || !validNamespace(ref.Namespace) || s.Kube.Namespace != ref.Namespace || len(ref.Name) == 0 || len(ref.Name) > 253 || !v1alpha2Name.MatchString(ref.Name) || !v1alpha2NonBlank.MatchString(ref.UID) {
@@ -104,6 +119,10 @@ func (s *V1Alpha2StatusStore) snapshot(ref V1Alpha2ClusterRef, obj map[string]js
 	if err != nil {
 		return V1Alpha2StatusSnapshot{}, fmt.Errorf("missing or invalid authority")
 	}
+	var ever bool
+	if len(auth["everApplicationReserved"]) == 0 || bytes.Equal(bytes.TrimSpace(auth["everApplicationReserved"]), []byte("null")) || json.Unmarshal(auth["everApplicationReserved"], &ever) != nil {
+		return V1Alpha2StatusSnapshot{}, fmt.Errorf("invalid application reservation history")
+	}
 	owner, err := jsonObject(auth["owner"])
 	if err != nil {
 		return V1Alpha2StatusSnapshot{}, fmt.Errorf("invalid authority owner")
@@ -131,6 +150,12 @@ func (s *V1Alpha2StatusStore) snapshot(ref V1Alpha2ClusterRef, obj map[string]js
 		if json.Unmarshal(spec["genesisIntent"], &value) != nil || value != "Create" || validateGenesisReceipt(status["genesis"], ref, logicalID) != nil {
 			return V1Alpha2StatusSnapshot{}, fmt.Errorf("missing or invalid genesis receipt")
 		}
+		if _, ok := status["applicationInit"]; !ok {
+			return V1Alpha2StatusSnapshot{}, fmt.Errorf("missing genesis assignment")
+		}
+		if _, ok := status["bootstrapPlan"]; !ok {
+			return V1Alpha2StatusSnapshot{}, fmt.Errorf("missing genesis bootstrap plan")
+		}
 		var receipt v1alpha2Genesis
 		_ = json.Unmarshal(status["genesis"], &receipt)
 		if view.Generation == 0 && (view.Binding.DeploymentUID != receipt.DeploymentUID || view.Binding.StorageID != receipt.StorageID) {
@@ -139,11 +164,21 @@ func (s *V1Alpha2StatusStore) snapshot(ref V1Alpha2ClusterRef, obj map[string]js
 	} else if _, present := status["genesis"]; present {
 		return V1Alpha2StatusSnapshot{}, fmt.Errorf("genesis receipt without creation intent")
 	}
-	snap := V1Alpha2StatusSnapshot{ref: ref, resourceVersion: rv, authority: view, authorityRaw: bytes.Clone(status["authority"]), queue: bytes.Clone(status["recoveryQueue"]), object: obj, store: s}
+	if _, plan := status["bootstrapPlan"]; plan {
+		if _, genesis := status["genesis"]; !genesis {
+			return V1Alpha2StatusSnapshot{}, fmt.Errorf("bootstrap plan without genesis")
+		}
+	}
+	snap := V1Alpha2StatusSnapshot{ref: ref, resourceVersion: rv, authority: view, everApplicationReserved: ever, authorityRaw: bytes.Clone(status["authority"]), queue: bytes.Clone(status["recoveryQueue"]), object: obj, store: s}
 	if _, present := status["applicationInit"]; present {
 		assignment, err := parseV1Alpha2ApplicationInit(snap)
 		if err != nil {
 			return V1Alpha2StatusSnapshot{}, err
+		}
+		var bootstrap V1Alpha2BootstrapPlan
+		var count int
+		if decodeV1Alpha2(status["bootstrapPlan"], &bootstrap) != nil || json.Unmarshal(spec["voterCount"], &count) != nil || validateV1Alpha2BootstrapPlan(ref, assignment.Plan, bootstrap, count) != nil {
+			return V1Alpha2StatusSnapshot{}, fmt.Errorf("invalid public bootstrap plan")
 		}
 		evidence, present := auth["evidence"]
 		if assignment.State == "Unused" && present || assignment.State == "Consumed" && (!present || bytes.Equal(bytes.TrimSpace(evidence), []byte("null")) || !json.Valid(evidence)) {

@@ -9,13 +9,11 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"net/url"
 	"os"
 	"path"
 	"path/filepath"
 	"reflect"
 	"slices"
-	"strings"
 
 	objectstore "github.com/mrchypark/rhiza/internal/objstore"
 	"github.com/mrchypark/rhiza/internal/types"
@@ -55,10 +53,11 @@ type ManagedStartupIdentity struct {
 
 // ManagedRuntimeState is local continuity, not application-state evidence.
 type ManagedRuntimeState struct {
-	WALIdentity  string
-	CertifiedTip uint64
-	AppliedTip   uint64
-	RecorderTip  uint64
+	WALIdentity           string
+	CertifiedTip          uint64
+	AppliedTip            uint64
+	RecorderTip           uint64
+	ExistingRegisteredWAL bool
 }
 
 // ManagedStartupChecker is implemented by the private application host. Startup
@@ -70,12 +69,36 @@ type ManagedStartupChecker interface {
 }
 
 type ManagedStartupConfig struct {
-	Identity ManagedStartupIdentity
-	Checker  ManagedStartupChecker
-	Prepared *recovery.VerifiedPreparedStartup
+	StorageRoot string
+	// PeerRecovery permits retaining a non-serving runtime when HEAD is
+	// unavailable. It never authorizes an empty application baseline.
+	PeerRecovery          bool
+	existingRegisteredWAL bool
+	Identity              ManagedStartupIdentity
+	Checker               ManagedStartupChecker
+	Prepared              *recovery.VerifiedPreparedStartup
 	// BootstrapMember opens an original member using immutable voter registration
 	// continuity instead of a learner adoption receipt. It grants no empty source.
 	BootstrapMember bool
+}
+
+type ManagedNamespace struct{ ConfigPrefix, FinalPrefix string }
+
+func ManagedNamespaceFor(root, clusterUID string, generation int64, assignmentID, clusterID string) (ManagedNamespace, error) {
+	prefix, final, err := objectstore.ManagedNamespacePrefixes(root, clusterUID, generation, assignmentID, clusterID)
+	return ManagedNamespace{ConfigPrefix: prefix, FinalPrefix: final}, err
+}
+
+// CloneManagedRuntimeConfig detaches mutable caller-owned membership/config
+// slices. Running handles never consult successor configuration on retry.
+func CloneManagedRuntimeConfig(c types.ExecutionConfig) types.ExecutionConfig {
+	c.Members = slices.Clone(c.Members)
+	if c.Learner != nil {
+		copy := *c.Learner
+		c.Learner = &copy
+	}
+	c.LocalGraphNodePropertyIndexes = slices.Clone(c.LocalGraphNodePropertyIndexes)
+	return c
 }
 
 // ManagedBootstrapPlanDigest is common to every initial voter. PhysicalBinding
@@ -89,28 +112,7 @@ func (n *Node) ManagedBootstrapPlanDigest(physicalBinding, evidenceFormat string
 	if err != nil || source != physicalBinding {
 		return "", errors.Join(fmt.Errorf("physical binding differs from configured storage"), err)
 	}
-	members := slices.Clone(n.config.Members)
-	for i := range members {
-		members[i].WALIdentity = ""
-	}
-	slices.SortFunc(members, func(a, b quepaxa.Member) int { return strings.Compare(string(a.ID), string(b.ID)) })
-	durability := n.config.ObjStoreDurability
-	if durability == "" {
-		durability = types.ObjectStoreDurabilityBeforeAck
-	}
-	data, err := json.Marshal(struct {
-		Version         int
-		ClusterID       string
-		Members         []quepaxa.Member
-		PhysicalBinding string
-		EvidenceFormat  string
-		Durability      types.ObjectStoreDurability
-		Reconfiguration bool
-	}{1, string(n.config.ClusterID), members, physicalBinding, evidenceFormat, durability, n.config.EnableReconfiguration})
-	if err != nil {
-		return "", err
-	}
-	return fmt.Sprintf("%x", sha256.Sum256(data)), nil
+	return types.ManagedBootstrapPlanDigest(string(n.config.ClusterID), n.config.Members, physicalBinding, evidenceFormat, n.config.ObjStoreDurability, n.config.EnableReconfiguration)
 }
 
 // OpenManaged starts an owned WAL/core/materializer and private peers while
@@ -120,7 +122,13 @@ func (n *Node) OpenManaged(ctx context.Context, cfg ManagedStartupConfig) error 
 	if n == nil || n.config == nil || n.config.Local || n.opened.Load() || n.preparedStartup != nil || n.managedStartup != nil || cfg.Checker == nil {
 		return fmt.Errorf("managed startup requires a new non-Local node and live checker")
 	}
+	configCopy := CloneManagedRuntimeConfig(*n.config)
+	n.config = &configCopy
 	i := cfg.Identity
+	namespace, err := ManagedNamespaceFor(cfg.StorageRoot, i.Member.ClusterUID, i.Member.Generation, i.AssignmentID, string(n.config.ClusterID))
+	if err != nil || n.config.ObjStorePrefix != namespace.ConfigPrefix {
+		return errors.Join(fmt.Errorf("managed runtime final namespace mismatch"), err)
+	}
 	if i.Member.ClusterUID == "" || i.Member.Generation < 0 || i.Member.DeploymentUID == "" || i.Member.PodUID == "" || i.Member.NodeID == "" || i.Member.NodeID != string(n.config.NodeID) || i.AssignmentID == "" || i.IntentHash == "" || i.StorageID == "" || i.PhysicalBinding == "" || i.BootstrapPlanDigest == "" || i.EvidenceFormat == "" {
 		return fmt.Errorf("managed startup requires exact member and assignment bindings")
 	}
@@ -151,6 +159,7 @@ func (n *Node) OpenManaged(ctx context.Context, cfg ManagedStartupConfig) error 
 	if err := cfg.Checker.ValidateManagedStartup(ctx, i); err != nil {
 		return fmt.Errorf("managed startup authority: %w", err)
 	}
+	n.managedStartup = &cfg
 	if cfg.Prepared != nil {
 		if i.Fresh || cfg.Prepared.Identity() != i.Member {
 			return fmt.Errorf("managed prepared identity mismatch")
@@ -163,12 +172,12 @@ func (n *Node) OpenManaged(ctx context.Context, cfg ManagedStartupConfig) error 
 			return err
 		}
 	}
-	n.managedStartup = &cfg
 	return n.open(ctx, false)
 }
 
 func (n *Node) managedRuntimeState() ManagedRuntimeState {
-	return ManagedRuntimeState{WALIdentity: n.core.WALIdentity(), CertifiedTip: uint64(n.core.Tip()), AppliedTip: n.material.Tip(), RecorderTip: uint64(n.core.RecorderTip())}
+	existing := n.managedStartup != nil && n.managedStartup.existingRegisteredWAL
+	return ManagedRuntimeState{WALIdentity: n.core.WALIdentity(), CertifiedTip: uint64(n.core.Tip()), AppliedTip: n.material.Tip(), RecorderTip: uint64(n.core.RecorderTip()), ExistingRegisteredWAL: existing}
 }
 
 func (n *Node) ManagedState() (ManagedRuntimeState, error) {
@@ -206,7 +215,7 @@ func (n *Node) AdmitManaged(ctx context.Context) error {
 // OpenPrepared performs bounded local recovery but cannot serve until the
 // actual application mutation gate is wired.
 func (n *Node) OpenPrepared(ctx context.Context, cfg PreparedStartupConfig) error {
-	if n == nil || n.opened.Load() || n.preparedStartup != nil {
+	if n == nil || n.opened.Load() || n.preparedStartup != nil || n.managedStartup != nil {
 		return fmt.Errorf("node already opened or configured")
 	}
 	n.preparedStartup = &cfg
@@ -376,7 +385,14 @@ func (n *Node) recoverPreparedV1Alpha2(ctx context.Context, prepared *recovery.V
 	if provider == "" {
 		provider = objectstore.ProviderS3
 	}
-	bucket, err := objectstore.NewBucketWithoutProvisioning(ctx, objectstore.Config{
+	newBucket := objectstore.NewBucketWithoutProvisioning
+	if n.managedStartup != nil {
+		finalPrefix := path.Join(n.config.ObjStorePrefix, string(n.config.ClusterID))
+		newBucket = func(ctx context.Context, cfg objectstore.Config) (*objectstore.MeteredBucket, error) {
+			return objectstore.NewBucketForNamespace(ctx, cfg, finalPrefix)
+		}
+	}
+	bucket, err := newBucket(ctx, objectstore.Config{
 		Provider: provider, FilesystemDir: n.config.ObjStoreDir, Prefix: n.config.ObjStorePrefix,
 		Endpoint: n.config.ObjStoreEndpoint, Bucket: n.config.ObjStoreBucket, Region: n.config.ObjStoreRegion,
 		Insecure: n.config.ObjStoreInsecure, MaxRetries: n.config.ObjStoreRetries,
@@ -551,56 +567,10 @@ func readPreparedAdoption(name string) (data []byte, resultErr error) {
 // PreparedBindingDigests identifies the configured source and consensus inputs;
 // no credentials are embedded in the returned digests.
 func (n *Node) preparedBindingDigests() (string, string, error) {
-	provider := n.config.ObjStoreProvider
-	if provider == "" {
-		provider = string(objectstore.ProviderS3)
+	source, err := types.ManagedStorageBinding(*n.config)
+	if err != nil {
+		return "", "", err
 	}
-	endpoint := n.config.ObjStoreEndpoint
-	account := n.config.ObjStoreAzureStorageAccount
-	fsDir := ""
-	if provider == string(objectstore.ProviderFilesystem) {
-		var err error
-		fsDir = n.config.ObjStoreDir
-		if fsDir == "" {
-			fsDir = "./objstore"
-		}
-		fsDir, err = filepath.Abs(fsDir)
-		if err != nil {
-			return "", "", err
-		}
-	}
-	if provider == string(objectstore.ProviderAzure) && n.config.ObjStoreAzureConnectionString != "" {
-		parts := map[string]string{}
-		items := strings.Split(n.config.ObjStoreAzureConnectionString, ";")
-		for i, item := range items {
-			if item == "" && i == len(items)-1 {
-				continue
-			}
-			key, value, ok := strings.Cut(item, "=")
-			if !ok {
-				return "", "", fmt.Errorf("invalid Azure connection descriptor")
-			}
-			key = strings.ToLower(strings.TrimSpace(key))
-			if _, exists := parts[key]; exists {
-				return "", "", fmt.Errorf("duplicate Azure connection field")
-			}
-			parts[key] = value
-		}
-		if parts["accountname"] == "" || parts["accountname"] != account || parts["blobendpoint"] == "" {
-			return "", "", fmt.Errorf("Azure connection requires matching account and explicit blob endpoint")
-		}
-		endpoint = parts["blobendpoint"]
-	}
-	if strings.Contains(endpoint, "://") {
-		u, err := url.Parse(endpoint)
-		if err != nil || u.Host == "" || u.User != nil || u.RawQuery != "" || u.ForceQuery || u.Fragment != "" {
-			return "", "", fmt.Errorf("invalid storage endpoint")
-		}
-	}
-	source, _ := json.Marshal(struct {
-		Provider, Endpoint, Bucket, Prefix, Account, FilesystemDir, Cluster, Region string
-		Insecure                                                                    bool
-	}{provider, endpoint, n.config.ObjStoreBucket, path.Clean(n.config.ObjStorePrefix), account, fsDir, string(n.config.ClusterID), n.config.ObjStoreRegion, n.config.ObjStoreInsecure})
 	config, _ := json.Marshal(struct {
 		Cluster         string
 		Node            string
@@ -609,7 +579,7 @@ func (n *Node) preparedBindingDigests() (string, string, error) {
 		Durability      string
 		Reconfiguration bool
 	}{string(n.config.ClusterID), string(n.config.NodeID), n.config.Members, n.config.Learner, string(n.config.ObjStoreDurability), n.config.EnableReconfiguration})
-	return fmt.Sprintf("%x", sha256.Sum256(source)), fmt.Sprintf("%x", sha256.Sum256(config)), nil
+	return source, fmt.Sprintf("%x", sha256.Sum256(config)), nil
 }
 
 func (n *Node) PreparedStartupBindingDigests() (string, string, error) {

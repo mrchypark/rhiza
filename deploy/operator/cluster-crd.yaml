@@ -31,6 +31,8 @@ spec:
               type: object
               required: [logicalID, voterCount, workload]
               x-kubernetes-validations:
+                - rule: '!has(oldSelf.authority) || !oldSelf.authority.everApplicationReserved || (has(self.authority) && self.authority.everApplicationReserved)'
+                  message: application reservation history cannot be removed or reset
                 - rule: 'has(self.genesisIntent) == has(oldSelf.genesisIntent) && (!has(self.genesisIntent) || self.genesisIntent == oldSelf.genesisIntent)'
                   message: genesisIntent is creation-only and immutable
                 - rule: '!has(self.statefulSet) && !has(self.container) && !has(self.adoptClusterID) && !has(self.automatic) && !has(self.policy) && !has(self.bootstrap) && !has(self.clusterDomain) && !has(self.anchorID) && !has(self.httpPort) && !has(self.peerPort) && !has(self.voterPods)'
@@ -128,8 +130,14 @@ spec:
               type: object
               x-kubernetes-preserve-unknown-fields: true
               x-kubernetes-validations:
-                - rule: 'has(oldSelf.genesis) || !has(self.genesis) || (has(self.applicationInit) && self.applicationInit.state == "Unused")'
+                - rule: 'has(oldSelf.genesis) || !has(self.genesis) || (has(self.applicationInit) && self.applicationInit.state == "Unused" && has(self.bootstrapPlan) && has(self.authority) && !self.authority.everApplicationReserved)'
                   message: new genesis requires an unused initialization assignment
+                - rule: '!has(oldSelf.genesis) || has(oldSelf.bootstrapPlan) || !has(self.bootstrapPlan)'
+                  message: existing genesis cannot acquire a bootstrap plan
+                - rule: '!has(oldSelf.bootstrapPlan) || (has(self.bootstrapPlan) && self.bootstrapPlan == oldSelf.bootstrapPlan)'
+                  message: bootstrap plan is immutable and cannot be removed
+                - rule: '!has(self.bootstrapPlan) || (has(self.genesis) && has(self.authority) && has(self.applicationInit))'
+                  message: bootstrap plan requires genesis, authority and assignment
                 - rule: '!has(oldSelf.genesis) || has(oldSelf.applicationInit) || !has(self.applicationInit)'
                   message: existing genesis cannot acquire an initialization assignment
                 - rule: '!has(oldSelf.applicationInit) || has(self.applicationInit)'
@@ -146,6 +154,39 @@ spec:
                 authority:
                   type: object
                   x-kubernetes-preserve-unknown-fields: true
+                  required: [everApplicationReserved]
+                  properties:
+                    everApplicationReserved: {type: boolean}
+                  x-kubernetes-validations:
+                    - rule: '!oldSelf.everApplicationReserved || self.everApplicationReserved'
+                      message: application reservation history cannot be reset
+                bootstrapPlan:
+                  type: object
+                  required: [clusterID, members, physicalBinding, evidenceFormat, durability, reconfiguration]
+                  properties:
+                    clusterID: {type: string, minLength: 1, maxLength: 256}
+                    physicalBinding: {type: string, minLength: 64, maxLength: 64, pattern: '^[0-9a-f]{64}$'}
+                    evidenceFormat: {type: string, minLength: 1, maxLength: 256}
+                    durability: {type: string, enum: [before-ack]}
+                    reconfiguration: {type: boolean}
+                    members:
+                      type: array
+                      minItems: 3
+                      maxItems: 64
+                      items:
+                        type: object
+                        required: [podUID, member]
+                        properties:
+                          podUID: {type: string, minLength: 1, maxLength: 256}
+                          member:
+                            type: object
+                            required: [node_id, url, log_url, public_key]
+                            properties:
+                              node_id: {type: string, minLength: 1, maxLength: 256}
+                              url: {type: string, maxLength: 2048}
+                              peer_url: {type: string, minLength: 1, maxLength: 2048}
+                              log_url: {type: string, maxLength: 2048}
+                              public_key: {type: string, minLength: 44, maxLength: 44}
                 genesis:
                   type: object
                   required: [ownerUID, logicalID, deploymentUID, storageID, intentHash]

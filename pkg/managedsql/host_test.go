@@ -20,6 +20,7 @@ import (
 	"testing"
 	"time"
 
+	objectstore "github.com/mrchypark/rhiza/internal/objstore"
 	"github.com/mrchypark/rhiza/internal/types"
 	"github.com/mrchypark/rhiza/pkg/network"
 	"github.com/mrchypark/rhiza/pkg/node"
@@ -31,13 +32,21 @@ import (
 // This bounded wire fixture exercises the actual S3 SDK, not provider parity.
 // Provider contract qualification remains in the emulator/CI suites.
 type sqlWireControl struct {
-	hideArchive                atomic.Bool
-	hideApplicationStart       atomic.Bool
-	injectForeignBeforeReceipt atomic.Bool
-	foreignStored              atomic.Bool
-	dropReceiptResponse        atomic.Bool
-	receiptPutReady            chan struct{}
-	receiptPutRelease          chan struct{}
+	hideArchive             atomic.Bool
+	hideBirth               atomic.Bool
+	hideApplicationStart    atomic.Bool
+	injectForeignBeforeList atomic.Bool
+	finalPrefix             string
+	foreignStored           atomic.Bool
+	dropReceiptResponse     atomic.Bool
+	receiptPutReady         chan struct{}
+	receiptPutRelease       chan struct{}
+	putReady                chan string
+	putRelease              chan struct{}
+	putSuffix               string
+	failFirstPut            atomic.Bool
+	keysMu                  sync.Mutex
+	putKeys                 []string
 }
 
 func sqlWireStore(t *testing.T) (*httptest.Server, *sqlWireControl) {
@@ -46,6 +55,19 @@ func sqlWireStore(t *testing.T) (*httptest.Server, *sqlWireControl) {
 	objects := map[string][]byte{}
 	control := &sqlWireControl{}
 	s := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodPut && control.putReady != nil && strings.HasSuffix(r.URL.Path, control.putSuffix) {
+			select {
+			case control.putReady <- r.URL.Path:
+			case <-control.putRelease:
+			case <-r.Context().Done():
+				return
+			}
+			select {
+			case <-control.putRelease:
+			case <-r.Context().Done():
+				return
+			}
+		}
 		if r.Method == http.MethodPut && strings.HasSuffix(r.URL.Path, "voters/managed-sql-initialization.json") && control.receiptPutReady != nil {
 			select {
 			case control.receiptPutReady <- struct{}{}:
@@ -62,6 +84,11 @@ func sqlWireStore(t *testing.T) (*httptest.Server, *sqlWireControl) {
 		mu.Lock()
 		defer mu.Unlock()
 		key := strings.TrimPrefix(r.URL.Path, "/bucket/")
+		if control.hideBirth.Load() && strings.HasSuffix(key, "voters/managed-sql-initialization.json") && (r.Method == http.MethodHead || r.Method == http.MethodGet) {
+			w.WriteHeader(404)
+			_, _ = io.WriteString(w, "<Error><Code>NoSuchKey</Code></Error>")
+			return
+		}
 		if control.hideApplicationStart.Load() && strings.HasSuffix(key, "voters/managed-sql-application-start.json") && (r.Method == http.MethodHead || r.Method == http.MethodGet) {
 			w.WriteHeader(404)
 			_, _ = io.WriteString(w, "<Error><Code>NoSuchKey</Code></Error>")
@@ -73,6 +100,10 @@ func sqlWireStore(t *testing.T) (*httptest.Server, *sqlWireControl) {
 			return
 		}
 		if r.Method == http.MethodGet && (r.URL.Query().Get("list-type") != "" || r.URL.Query().Has("prefix")) {
+			if control.injectForeignBeforeList.Swap(false) {
+				objects[control.finalPrefix+"/foreign-history.bin"] = []byte("unexpected existing object")
+				control.foreignStored.Store(true)
+			}
 			type item struct {
 				Key          string
 				Size         int
@@ -100,9 +131,13 @@ func sqlWireStore(t *testing.T) (*httptest.Server, *sqlWireControl) {
 		b, exists := objects[key]
 		etag := fmt.Sprintf("\"%x\"", md5.Sum(b))
 		if r.Method == http.MethodPut {
-			if strings.HasSuffix(key, "voters/managed-sql-initialization.json") && control.injectForeignBeforeReceipt.Swap(false) {
-				objects["consensus/foreign-history.bin"] = []byte("different-key writer after empty LIST")
-				control.foreignStored.Store(true)
+			control.keysMu.Lock()
+			control.putKeys = append(control.putKeys, key)
+			control.keysMu.Unlock()
+			if control.failFirstPut.Swap(false) {
+				w.WriteHeader(500)
+				_, _ = io.WriteString(w, "<Error><Code>InternalError</Code></Error>")
+				return
 			}
 			if r.Header.Get("If-None-Match") == "*" && exists || r.Header.Get("If-Match") != "" && (!exists || r.Header.Get("If-Match") != etag) {
 				w.WriteHeader(http.StatusPreconditionFailed)
@@ -232,6 +267,15 @@ func sqlCluster(t *testing.T) ([]Config, *sqlStatusFixture) {
 	s3, sourceControl := sqlWireStore(t)
 	configs := make([]Config, 3)
 	members := make([]quepaxa.Member, 3)
+	clusterID, err := types.ManagedClusterID("uid", 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	namespace, err := node.ManagedNamespaceFor("", "uid", 0, "assignment", string(clusterID))
+	if err != nil {
+		t.Fatal(err)
+	}
+	sourceControl.finalPrefix = namespace.FinalPrefix
 	for i := range members {
 		conn, err := net.ListenPacket("udp", "127.0.0.1:0")
 		if err != nil {
@@ -241,10 +285,13 @@ func sqlCluster(t *testing.T) ([]Config, *sqlStatusFixture) {
 		if err := conn.Close(); err != nil {
 			t.Fatal(err)
 		}
-		id := quepaxa.NodeID(fmt.Sprintf("n%d", i))
+		id, err := types.ManagedNodeID(fmt.Sprintf("pod-%d", i))
+		if err != nil {
+			t.Fatal(err)
+		}
 		token := fmt.Sprintf("peer-%d", i)
-		members[i] = quepaxa.Member{ID: id, PeerURL: "quic://" + addr, PublicKey: quepaxa.PublicKey(network.PeerPublicKey("consensus", id, token))}
-		configs[i].Runtime = RuntimeConfig{NodeID: id, ClusterID: "consensus", DataDir: t.TempDir(), PeerAddr: addr, PeerToken: token, AdminToken: "admin", ObjStoreProvider: "s3", ObjStoreEndpoint: strings.TrimPrefix(s3.URL, "http://"), ObjStoreInsecure: true, ObjStoreBucket: "bucket", ObjStoreRegion: "us-east-1", ObjStoreAccessKey: "test", ObjStoreSecretKey: "test", ObjStoreDurability: types.ObjectStoreDurabilityBeforeAck}
+		members[i] = quepaxa.Member{ID: id, PeerURL: "quic://" + addr, PublicKey: quepaxa.PublicKey(network.PeerPublicKey(clusterID, id, token))}
+		configs[i].Runtime = RuntimeConfig{NodeID: id, ClusterID: clusterID, ObjStorePrefix: namespace.ConfigPrefix, DataDir: t.TempDir(), PeerAddr: addr, PeerToken: token, AdminToken: "admin", ObjStoreProvider: "s3", ObjStoreEndpoint: strings.TrimPrefix(s3.URL, "http://"), ObjStoreInsecure: true, ObjStoreBucket: "bucket", ObjStoreRegion: "us-east-1", ObjStoreAccessKey: "test", ObjStoreSecretKey: "test", ObjStoreDurability: types.ObjectStoreDurabilityBeforeAck}
 	}
 	for i := range configs {
 		configs[i].Runtime.Members = members
@@ -273,7 +320,11 @@ func sqlCluster(t *testing.T) ([]Config, *sqlStatusFixture) {
 		t.Fatal(err)
 	}
 	name, _ := operator.V1Alpha2GenesisDeploymentName(ref.UID)
-	if _, err := operator.InitializeV1Alpha2AuthorityWithPlan(context.Background(), store, ref, name, plan); err != nil {
+	bootstrap := operator.V1Alpha2BootstrapPlan{ClusterID: clusterID, PhysicalBinding: source, EvidenceFormat: EvidenceFormat, Durability: types.ObjectStoreDurabilityBeforeAck}
+	for i, member := range members {
+		bootstrap.Members = append(bootstrap.Members, operator.V1Alpha2BootstrapMember{PodUID: fmt.Sprintf("pod-%d", i), Member: member})
+	}
+	if _, err := operator.InitializeV1Alpha2AuthorityWithBootstrap(context.Background(), store, ref, name, plan, bootstrap); err != nil {
 		t.Fatal(err)
 	}
 	for i := range configs {
@@ -554,6 +605,8 @@ func TestManagedSQLDDLReversalDoesNotRearmMissingSource(t *testing.T) {
 	}
 	f.source.hideArchive.Store(true)
 	defer f.source.hideArchive.Store(false)
+	f.source.hideApplicationStart.Store(true)
+	defer f.source.hideApplicationStart.Store(false)
 	reopened, err := Open(context.Background(), configs[0])
 	if reopened != nil {
 		t.Cleanup(func() {
@@ -562,8 +615,19 @@ func TestManagedSQLDDLReversalDoesNotRearmMissingSource(t *testing.T) {
 			}
 		})
 	}
-	if err == nil {
-		t.Fatal("consumed E0 logical digest rearmed missing-source bootstrap after real DDL")
+	if err != nil {
+		t.Fatalf("intact local WAL must retain non-serving recovery ownership: %v", err)
+	}
+	if reopened.identity.Fresh {
+		t.Fatal("consumed E0 logical digest rearmed missing-source fresh baseline")
+	}
+	state, err := reopened.node.ManagedState()
+	if err != nil || !state.ExistingRegisteredWAL || state.CertifiedTip == 0 {
+		t.Fatalf("recovery did not use actual pre-existing WAL: %+v %v", state, err)
+	}
+	live, err := operator.LoadV1Alpha2Admission(context.Background(), configs[0].Store, configs[0].Ref)
+	if err != nil || !live.EverApplicationReserved() {
+		t.Fatal("DDL reversal erased canonical reservation history")
 	}
 }
 
@@ -610,8 +674,8 @@ func TestManagedSQLUnusedAssignmentRejectsPreexistingCertifiedSource(t *testing.
 			if loadErr != nil || init.Assignment().State != "Unused" {
 				t.Fatalf("existing-source rejection changed assignment: %v", loadErr)
 			}
-			if !missingHead && !strings.Contains(err.Error(), "application source history") {
-				t.Fatalf("actual certified source was not inspected: %v", err)
+			if !missingHead && !strings.Contains(err.Error(), "application source history") && !strings.Contains(err.Error(), "application reservation history") {
+				t.Fatalf("neither certified source nor canonical reservation history blocked initialization: %v", err)
 			}
 		})
 	}
@@ -646,18 +710,29 @@ func TestManagedSQLSourceDefaultS3Provider(t *testing.T) {
 	if err := n.VerifyManagedSQLFreshSource(context.Background(), i); err != nil {
 		t.Fatal(err)
 	}
+	h, err := Open(context.Background(), cfg)
+	if h != nil {
+		t.Cleanup(func() {
+			if err := h.Close(); err != nil {
+				t.Error(err)
+			}
+		})
+	}
+	if err != nil {
+		t.Fatalf("public host did not normalize default S3 provider: %v", err)
+	}
 }
 
-func TestManagedSQLSourceForeignKeyInterleaveReviewHold(t *testing.T) {
+func TestManagedSQLSourceDiagnosticRejectsUnexpectedExistingObject(t *testing.T) {
 	configs, f := sqlCluster(t)
-	f.source.injectForeignBeforeReceipt.Store(true)
+	f.source.injectForeignBeforeList.Store(true)
 	n, i := sqlSourceNode(t, configs[0])
 	empty, err := n.PrepareManagedSQLSource(context.Background(), i, true)
 	if !f.source.foreignStored.Load() {
-		t.Fatal("fixture did not write distinct key between empty LIST and receipt CAS")
+		t.Fatal("fixture did not provide unexpected existing object")
 	}
 	if err == nil && empty {
-		t.Fatal("REVIEW HOLD: empty LIST plus receipt IfNotExists accepted a concurrent distinct-key write; this is not an atomic prefix claim")
+		t.Fatal("diagnostic LIST failed to reject unexpected existing object")
 	}
 }
 
@@ -672,6 +747,231 @@ func TestManagedSQLSourceLostReceiptResponseRetry(t *testing.T) {
 		t.Fatalf("exact receipt retry: empty=%v error=%v", empty, err)
 	}
 	if err := n.VerifyManagedSQLFreshSource(context.Background(), i); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestManagedSQLPendingReservationBeforeDelayedPutBlocksFreshJoin(t *testing.T) {
+	configs, hosts, f := openSQLQuorum(t)
+	control := f.source
+	control.putReady = make(chan string, 4)
+	control.putRelease = make(chan struct{})
+	control.putSuffix = "voters/managed-sql-application-start.json"
+	var release sync.Once
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	done := make(chan error, 1)
+	joined := false
+	t.Cleanup(func() {
+		release.Do(func() { close(control.putRelease) })
+		cancel()
+		if !joined {
+			select {
+			case <-done:
+			case <-time.After(5 * time.Second):
+				t.Error("delayed SQL execution did not finish after cancellation")
+			}
+		}
+	})
+	go func() {
+		_, err := hosts[0].Execute(ctx, ExecuteRequest{RequestID: "delayed-first", SQL: "CREATE TABLE delayed(value)"})
+		done <- err
+	}()
+	select {
+	case key := <-control.putReady:
+		if !strings.HasSuffix(key, control.putSuffix) {
+			t.Fatal("wrong delayed PUT boundary")
+		}
+	case <-ctx.Done():
+		t.Fatal(ctx.Err())
+	}
+	a, err := operator.LoadV1Alpha2Admission(ctx, configs[0].Store, configs[0].Ref)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, pending := a.Pending(); !pending || !a.EverApplicationReserved() {
+		t.Fatal("pending and canonical history were not committed before delayed PUT")
+	}
+	if available, err := hosts[0].node.ManagedArchiveAvailable(ctx); err != nil || available {
+		t.Fatal("test did not stop before first archive HEAD")
+	}
+	runtime := configs[0].Runtime
+	diagnostic, err := objectstore.NewBucketForNamespace(ctx, objectstore.Config{Provider: objectstore.ProviderS3, Endpoint: runtime.ObjStoreEndpoint, Bucket: runtime.ObjStoreBucket, Region: runtime.ObjStoreRegion, Insecure: runtime.ObjStoreInsecure, AccessKey: runtime.ObjStoreAccessKey, SecretKey: runtime.ObjStoreSecretKey}, control.finalPrefix)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		if err := diagnostic.Close(); err != nil {
+			t.Error(err)
+		}
+	})
+	objects := 0
+	if err := diagnostic.Iter(ctx, control.finalPrefix+"/archive/", func(string) error { objects++; return nil }); err != nil || objects != 0 {
+		t.Fatalf("actual SDK archive LIST was not empty: count=%d error=%v", objects, err)
+	}
+	late, err := Open(ctx, configs[2])
+	if late != nil {
+		t.Cleanup(func() {
+			if err := late.Close(); err != nil {
+				t.Error(err)
+			}
+		})
+	}
+	if err != nil {
+		t.Fatalf("pending blocked private peer recovery: %v", err)
+	}
+	if late.identity.Fresh {
+		t.Fatal("pending/everReserved plus missing HEAD admitted fresh baseline")
+	}
+	if late.Ready(ctx) == nil {
+		t.Fatal("pending first mutation opened late application admission")
+	}
+	release.Do(func() { close(control.putRelease) })
+	select {
+	case err := <-done:
+		joined = true
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-ctx.Done():
+		t.Fatal(ctx.Err())
+	}
+	a, err = operator.LoadV1Alpha2Admission(ctx, configs[0].Store, configs[0].Ref)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, pending := a.Pending(); pending || !a.EverApplicationReserved() {
+		t.Fatal("delayed effect did not finalize with monotonic history")
+	}
+	if available, err := hosts[0].node.ManagedArchiveAvailable(ctx); err != nil || !available {
+		t.Fatal("resumed SQL did not produce actual certified archive")
+	}
+	readySQL(t, late)
+}
+
+func TestManagedSQLConsumedMissingBirthIsNeverRecreated(t *testing.T) {
+	configs, hosts, f := openSQLQuorum(t)
+	if err := hosts[0].Close(); err != nil {
+		t.Fatal(err)
+	}
+	// A missing consumed receipt is an error, even before the first SQL/HEAD.
+	countBirth := func() int {
+		f.source.keysMu.Lock()
+		defer f.source.keysMu.Unlock()
+		count := 0
+		for _, key := range f.source.putKeys {
+			if strings.HasSuffix(key, "voters/managed-sql-initialization.json") {
+				count++
+			}
+		}
+		return count
+	}
+	before := countBirth()
+	f.source.hideBirth.Store(true)
+	defer f.source.hideBirth.Store(false)
+	h, err := Open(context.Background(), configs[0])
+	if h != nil {
+		t.Cleanup(func() { _ = h.Close() })
+	}
+	if err == nil {
+		t.Fatal("Consumed missing birth was recreated")
+	}
+	if countBirth() != before {
+		t.Fatal("Consumed missing birth triggered a new receipt PUT")
+	}
+}
+
+func TestManagedSQLSDKOldDelayedPutAndRetryStayOldNamespace(t *testing.T) {
+	source, control := sqlWireStore(t)
+	control.putReady = make(chan string, 4)
+	control.putRelease = make(chan struct{})
+	control.failFirstPut.Store(true)
+	var release sync.Once
+	t.Cleanup(func() { release.Do(func() { close(control.putRelease) }) })
+	oldCluster, _ := types.ManagedClusterID("uid", 0)
+	newCluster, _ := types.ManagedClusterID("uid", 1)
+	oldNS, _ := node.ManagedNamespaceFor("installed", "uid", 0, "old-assignment", string(oldCluster))
+	newNS, _ := node.ManagedNamespaceFor("installed", "uid", 1, "new-assignment", string(newCluster))
+	cfg := objectstore.Config{Provider: objectstore.ProviderS3, Endpoint: strings.TrimPrefix(source.URL, "http://"), Bucket: "bucket", Region: "us-east-1", Insecure: true, AccessKey: "test", SecretKey: "test", MaxRetries: 3, Prefix: oldNS.ConfigPrefix}
+	old, err := objectstore.NewBucketForNamespace(context.Background(), cfg, oldNS.FinalPrefix)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		if err := old.Close(); err != nil {
+			t.Error(err)
+		}
+	})
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	done := make(chan error, 1)
+	go func() {
+		done <- old.Upload(ctx, oldNS.FinalPrefix+"/archive/head.bin", strings.NewReader("old request"))
+	}()
+	select {
+	case key := <-control.putReady:
+		if !strings.Contains(key, oldNS.FinalPrefix) {
+			t.Fatal("wrong initial SDK dispatch")
+		}
+	case <-ctx.Done():
+		t.Fatal(ctx.Err())
+	}
+	// Constructor-input changes cannot retarget an already-selected SDK key.
+	cfg.Prefix = newNS.ConfigPrefix
+	successor, err := objectstore.NewBucketForNamespace(context.Background(), cfg, newNS.FinalPrefix)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		if err := successor.Close(); err != nil {
+			t.Error(err)
+		}
+	})
+	cfg.Endpoint = "127.0.0.1:1"
+	cfg.Bucket = "successor-bucket"
+	release.Do(func() { close(control.putRelease) })
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-ctx.Done():
+		t.Fatal(ctx.Err())
+	}
+	if err := old.Upload(ctx, newNS.FinalPrefix+"/archive/head.bin", strings.NewReader("cross-generation")); err == nil {
+		t.Fatal("old SDK handle accepted successor prefix")
+	}
+	control.keysMu.Lock()
+	keys := append([]string(nil), control.putKeys...)
+	control.keysMu.Unlock()
+	if len(keys) < 2 {
+		t.Fatal("fixture did not exercise an actual SDK retry")
+	}
+	for _, key := range keys {
+		if !strings.HasPrefix(key, oldNS.FinalPrefix+"/") {
+			t.Fatalf("old SDK retry reached successor: %s", key)
+		}
+	}
+	if exists, err := successor.Exists(ctx, newNS.FinalPrefix+"/archive/head.bin"); err != nil || exists {
+		t.Fatalf("successor affected: exists=%v error=%v", exists, err)
+	}
+}
+
+func TestManagedSQLCallerMutationCannotRepointRuntime(t *testing.T) {
+	configs, hosts, _ := openSQLQuorum(t)
+	h := hosts[0]
+	before, _, err := h.node.PreparedStartupBindingDigests()
+	if err != nil {
+		t.Fatal(err)
+	}
+	configs[0].Runtime.ObjStorePrefix = "successor"
+	configs[0].Runtime.ObjStoreEndpoint = "127.0.0.1:1"
+	configs[0].Runtime.Members[0].PeerURL = "quic://127.0.0.1:1"
+	configs[0].Runtime.Members[0].PublicKey = quepaxa.PublicKey{}
+	after, _, err := h.node.PreparedStartupBindingDigests()
+	if err != nil || before != after {
+		t.Fatal("caller mutated live runtime binding")
+	}
+	if _, err := h.Execute(context.Background(), ExecuteRequest{RequestID: "immutable-config", SQL: "CREATE TABLE app(value)"}); err != nil {
 		t.Fatal(err)
 	}
 }

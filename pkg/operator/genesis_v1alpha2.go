@@ -7,9 +7,15 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net"
 	"net/http"
+	"net/url"
 	"reflect"
+	"strconv"
 	"unicode/utf8"
+
+	"github.com/mrchypark/rhiza/internal/types"
+	"github.com/mrchypark/rhiza/pkg/quepaxa"
 )
 
 type v1alpha2Genesis struct {
@@ -63,7 +69,48 @@ func InitializeV1Alpha2AuthorityWithPlan(ctx context.Context, s *V1Alpha2StatusS
 	return initializeV1Alpha2AuthorityWithPlan(ctx, s, ref, deploymentName, nil, "", "", &plan)
 }
 
-func initializeV1Alpha2AuthorityWithPlan(ctx context.Context, s *V1Alpha2StatusStore, ref V1Alpha2ClusterRef, deploymentName string, expected *V1Alpha2ClusterSpec, expectedUID, expectedRV string, plan *V1Alpha2ApplicationInitPlan) (V1Alpha2StatusSnapshot, error) {
+// InitializeV1Alpha2AuthorityWithBootstrap commits the full public plan with genesis.
+func InitializeV1Alpha2AuthorityWithBootstrap(ctx context.Context, s *V1Alpha2StatusStore, ref V1Alpha2ClusterRef, deploymentName string, plan V1Alpha2ApplicationInitPlan, bootstrap V1Alpha2BootstrapPlan) (V1Alpha2StatusSnapshot, error) {
+	return initializeV1Alpha2AuthorityWithPlan(ctx, s, ref, deploymentName, nil, "", "", &plan, &bootstrap)
+}
+
+// InitializeV1Alpha2AuthorityWithExpectedBootstrap rejects a changed candidate.
+func InitializeV1Alpha2AuthorityWithExpectedBootstrap(ctx context.Context, s *V1Alpha2StatusStore, ref V1Alpha2ClusterRef, deploymentName string, expected V1Alpha2ClusterSpec, deploymentUID, deploymentRV string, plan V1Alpha2ApplicationInitPlan, bootstrap V1Alpha2BootstrapPlan) (V1Alpha2StatusSnapshot, error) {
+	if deploymentUID == "" || deploymentRV == "" {
+		return V1Alpha2StatusSnapshot{}, fmt.Errorf("candidate identity and resourceVersion required")
+	}
+	return initializeV1Alpha2AuthorityWithPlan(ctx, s, ref, deploymentName, &expected, deploymentUID, deploymentRV, &plan, &bootstrap)
+}
+
+func validateV1Alpha2BootstrapPlan(ref V1Alpha2ClusterRef, assignment V1Alpha2ApplicationInitPlan, p V1Alpha2BootstrapPlan, count int) error {
+	cluster, err := types.ManagedClusterID(ref.UID, 0)
+	if err != nil || p.ClusterID != cluster || len(p.Members) < 3 || len(p.Members) > 64 || count != len(p.Members) || p.PhysicalBinding != assignment.PhysicalBinding || p.EvidenceFormat != assignment.EvidenceFormat || p.Durability != types.ObjectStoreDurabilityBeforeAck {
+		return fmt.Errorf("invalid bootstrap plan binding")
+	}
+	members := make([]quepaxa.Member, 0, len(p.Members))
+	seen := map[string]bool{}
+	for _, entry := range p.Members {
+		id, err := types.ManagedNodeID(entry.PodUID)
+		u, urlErr := url.Parse(entry.Member.PeerURL)
+		if err != nil || entry.Member.ID != id || seen[entry.PodUID] || entry.Member.WALIdentity != "" || urlErr != nil || u.Scheme != "quic" || u.User != nil || u.Path != "" || u.RawQuery != "" || u.Fragment != "" {
+			return fmt.Errorf("invalid bootstrap member")
+		}
+		host, port, e := net.SplitHostPort(u.Host)
+		n, e2 := strconv.Atoi(port)
+		if e != nil || net.ParseIP(host) == nil || net.ParseIP(host).IsUnspecified() || e2 != nil || n < 1 || n > 65535 {
+			return fmt.Errorf("invalid bootstrap endpoint")
+		}
+		seen[entry.PodUID] = true
+		members = append(members, entry.Member)
+	}
+	digest, err := types.ManagedBootstrapPlanDigest(string(p.ClusterID), members, p.PhysicalBinding, p.EvidenceFormat, p.Durability, p.Reconfiguration)
+	if err != nil || digest != assignment.BootstrapPlanDigest {
+		return fmt.Errorf("bootstrap digest mismatch")
+	}
+	return nil
+}
+
+func initializeV1Alpha2AuthorityWithPlan(ctx context.Context, s *V1Alpha2StatusStore, ref V1Alpha2ClusterRef, deploymentName string, expected *V1Alpha2ClusterSpec, expectedUID, expectedRV string, plan *V1Alpha2ApplicationInitPlan, bootstraps ...*V1Alpha2BootstrapPlan) (V1Alpha2StatusSnapshot, error) {
 	p, err := s.path(ref)
 	if err != nil {
 		return V1Alpha2StatusSnapshot{}, err
@@ -119,13 +166,13 @@ func initializeV1Alpha2AuthorityWithPlan(ctx context.Context, s *V1Alpha2StatusS
 	if _, ok := status["genesis"]; ok {
 		return s.snapshot(ref, obj)
 	}
-	if plan == nil {
+	if plan == nil || len(bootstraps) != 1 || bootstraps[0] == nil {
 		return V1Alpha2StatusSnapshot{}, fmt.Errorf("genesis requires an explicit application initialization plan")
 	}
 	if _, ok := status["authority"]; ok {
 		return V1Alpha2StatusSnapshot{}, fmt.Errorf("authority without genesis receipt")
 	}
-	for _, key := range []string{"recoveryQueue", "pendingWrite", "transition", "receipt", "decision", "applicationInit"} {
+	for _, key := range []string{"recoveryQueue", "pendingWrite", "transition", "receipt", "decision", "applicationInit", "bootstrapPlan"} {
 		if _, ok := status[key]; ok {
 			return V1Alpha2StatusSnapshot{}, fmt.Errorf("existing %s prevents genesis", key)
 		}
@@ -173,10 +220,14 @@ func initializeV1Alpha2AuthorityWithPlan(ctx context.Context, s *V1Alpha2StatusS
 	if err := validateV1Alpha2ApplicationInitPlan(*plan, ref, receipt); err != nil {
 		return V1Alpha2StatusSnapshot{}, err
 	}
-	authority := map[string]any{"owner": map[string]any{"namespace": ref.Namespace, "name": ref.Name, "uid": ref.UID, "logicalID": logicalID}, "generation": 0, "binding": map[string]string{"deploymentUID": d.UID, "storageID": storageID}, "pendingWrite": false}
+	if err := validateV1Alpha2BootstrapPlan(ref, *plan, *bootstraps[0], int(cluster.Spec.VoterCount)); err != nil {
+		return V1Alpha2StatusSnapshot{}, err
+	}
+	authority := map[string]any{"owner": map[string]any{"namespace": ref.Namespace, "name": ref.Name, "uid": ref.UID, "logicalID": logicalID}, "generation": 0, "binding": map[string]string{"deploymentUID": d.UID, "storageID": storageID}, "pendingWrite": false, "everApplicationReserved": false}
 	status["genesis"], _ = json.Marshal(receipt)
 	status["authority"], _ = json.Marshal(authority)
 	status["applicationInit"], _ = json.Marshal(V1Alpha2ApplicationInitAssignment{Plan: *plan, State: "Unused"})
+	status["bootstrapPlan"], _ = json.Marshal(bootstraps[0])
 	statusRaw, _ := json.Marshal(status)
 	obj["status"] = statusRaw
 	var response map[string]json.RawMessage

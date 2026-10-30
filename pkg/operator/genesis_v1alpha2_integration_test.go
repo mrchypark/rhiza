@@ -71,17 +71,21 @@ func TestV1Alpha2GenesisAPIServerContract(t *testing.T) {
 	if err := store.Kube.Get(ctx, "/apis/apps/v1/namespaces/"+ns+"/deployments/"+name, &liveDeployment); err != nil {
 		t.Fatal(err)
 	}
-	plan, err := NewV1Alpha2ApplicationInitPlan(ref, "test", liveDeployment.Metadata.UID, "genesis-contract-assignment", strings.Repeat("a", 64), strings.Repeat("b", 64), "test/v1")
+	bootstrap, digest, err := testBootstrapPlan(ref)
+	if err != nil {
+		t.Fatal(err)
+	}
+	plan, err := NewV1Alpha2ApplicationInitPlan(ref, "test", liveDeployment.Metadata.UID, "genesis-contract-assignment", bootstrap.PhysicalBinding, digest, bootstrap.EvidenceFormat)
 	if err != nil {
 		t.Fatal(err)
 	}
 	genesis := v1alpha2Genesis{OwnerUID: uid, LogicalID: "test", DeploymentUID: liveDeployment.Metadata.UID, StorageID: plan.StorageID, IntentHash: plan.IntentHash}
-	bad, err := json.Marshal(map[string]any{"status": map[string]any{"genesis": genesis, "authority": map[string]any{"owner": map[string]string{"namespace": ns, "name": ref.Name, "uid": uid, "logicalID": "test"}, "generation": 0, "binding": map[string]string{"deploymentUID": liveDeployment.Metadata.UID, "storageID": plan.StorageID}, "pendingWrite": false}}})
+	bad, err := json.Marshal(map[string]any{"status": map[string]any{"genesis": genesis, "authority": map[string]any{"owner": map[string]string{"namespace": ns, "name": ref.Name, "uid": uid, "logicalID": "test"}, "generation": 0, "binding": map[string]string{"deploymentUID": liveDeployment.Metadata.UID, "storageID": plan.StorageID}, "pendingWrite": false, "everApplicationReserved": false}}})
 	if err != nil {
 		t.Fatal(err)
 	}
 	rejectStatusPatch(string(bad), "new genesis requires an unused initialization assignment")
-	first, err := InitializeV1Alpha2AuthorityWithPlan(ctx, store, ref, name, plan)
+	first, err := InitializeV1Alpha2AuthorityWithBootstrap(ctx, store, ref, name, plan, bootstrap)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -106,8 +110,13 @@ func TestV1Alpha2GenesisAPIServerContract(t *testing.T) {
 		t.Fatalf("consume assignment: %s %v", observation, err)
 	}
 	rejectStatusPatch(`{"status":{"applicationInit":null}}`, "initialization assignment cannot be removed")
+	rejectStatusPatch(`{"status":{"bootstrapPlan":null}}`, "bootstrap plan is immutable")
+	rejectStatusPatch(`{"status":{"bootstrapPlan":{"evidenceFormat":"changed"}}}`, "bootstrap plan is immutable")
 	rejectStatusPatch(`{"status":{"applicationInit":{"state":"Unused","initialEvidenceDigest":null}}}`, "consumed initialization cannot be changed or rearmed")
 	kubectl("", "patch", "rhizacluster", ref.Name, "--subresource=status", "--type=merge", "-p", `{"status":{"authority":{"evidence":{"value":"advanced"}}}}`)
+	kubectl("", "patch", "rhizacluster", ref.Name, "--subresource=status", "--type=merge", "-p", `{"status":{"authority":{"everApplicationReserved":true}}}`)
+	rejectStatusPatch(`{"status":{"authority":{"everApplicationReserved":false}}}`, "application reservation history cannot be reset")
+	rejectStatusPatch(`{"status":{"authority":{"everApplicationReserved":null}}}`, "everApplicationReserved")
 	advanced, err := LoadV1Alpha2ApplicationInit(ctx, store, ref)
 	if err != nil || advanced.Assignment() != consumed.Assignment() {
 		t.Fatalf("initial assignment changed after evidence advance: %v", err)

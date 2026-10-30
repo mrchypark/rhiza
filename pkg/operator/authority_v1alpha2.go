@@ -34,7 +34,10 @@ type V1Alpha2AdmissionSnapshot struct {
 }
 
 func (s V1Alpha2AdmissionSnapshot) Authority() V1Alpha2AuthorityView { return s.status.Authority() }
-func (s V1Alpha2AdmissionSnapshot) Evidence() json.RawMessage        { return bytes.Clone(s.evidence) }
+func (s V1Alpha2AdmissionSnapshot) EverApplicationReserved() bool {
+	return s.status.EverApplicationReserved()
+}
+func (s V1Alpha2AdmissionSnapshot) Evidence() json.RawMessage { return bytes.Clone(s.evidence) }
 func (s V1Alpha2AdmissionSnapshot) Pending() (V1Alpha2WriteRequest, bool) {
 	if s.pending == nil {
 		return V1Alpha2WriteRequest{}, false
@@ -122,6 +125,9 @@ func parseV1Alpha2Admission(s V1Alpha2StatusSnapshot) (V1Alpha2AdmissionSnapshot
 		return V1Alpha2AdmissionSnapshot{}, fmt.Errorf("invalid pending write")
 	}
 	var request *v1alpha2PendingRequest
+	if pending && !s.everApplicationReserved {
+		return V1Alpha2AdmissionSnapshot{}, fmt.Errorf("pending write lacks reservation history")
+	}
 	if raw, ok := auth["pendingRequest"]; ok {
 		var r v1alpha2PendingRequest
 		if !pending || decodeV1Alpha2(raw, &r) != nil || !validV1Alpha2WriteRequest(r.V1Alpha2WriteRequest) || !sameJSON(r.PriorEvidence, evidence) {
@@ -168,6 +174,7 @@ func ReserveV1Alpha2SQLWrite(ctx context.Context, store *V1Alpha2StatusStore, ol
 	}
 	return updateV1Alpha2Admission(ctx, store, old, func(auth map[string]json.RawMessage) {
 		auth["pendingWrite"] = json.RawMessage("true")
+		auth["everApplicationReserved"] = json.RawMessage("true")
 		auth["pendingRequest"], _ = json.Marshal(v1alpha2PendingRequest{V1Alpha2WriteRequest: request, PriorEvidence: bytes.Clone(old.evidence), OriginalSQL: raw})
 	})
 }
@@ -195,6 +202,7 @@ func ReserveV1Alpha2Write(ctx context.Context, store *V1Alpha2StatusStore, old V
 	}
 	return updateV1Alpha2Admission(ctx, store, old, func(auth map[string]json.RawMessage) {
 		auth["pendingWrite"] = json.RawMessage("true")
+		auth["everApplicationReserved"] = json.RawMessage("true")
 		auth["pendingRequest"], _ = json.Marshal(v1alpha2PendingRequest{V1Alpha2WriteRequest: request, PriorEvidence: bytes.Clone(old.evidence)})
 	})
 }

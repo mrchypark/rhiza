@@ -42,6 +42,9 @@ func (s V1Alpha2ApplicationInitSnapshot) Assignment() V1Alpha2ApplicationInitAss
 func (s V1Alpha2ApplicationInitSnapshot) Authority() V1Alpha2AuthorityView {
 	return s.status.Authority()
 }
+func (s V1Alpha2ApplicationInitSnapshot) EverApplicationReserved() bool {
+	return s.status.EverApplicationReserved()
+}
 
 // NewV1Alpha2ApplicationInitPlan binds caller-supplied physical and bootstrap
 // digests to the canonical genesis recipe. It does not verify physical storage.
@@ -126,7 +129,7 @@ func CommitV1Alpha2ApplicationInit(ctx context.Context, store *V1Alpha2StatusSto
 	if _, ok := auth["evidence"]; ok {
 		return V1Alpha2ApplicationInitSnapshot{}, "", fmt.Errorf("application evidence already exists")
 	}
-	if !bytes.Equal(bytes.TrimSpace(auth["pendingWrite"]), []byte("false")) {
+	if old.status.everApplicationReserved || !bytes.Equal(bytes.TrimSpace(auth["pendingWrite"]), []byte("false")) {
 		return V1Alpha2ApplicationInitSnapshot{}, "", fmt.Errorf("pendingWrite must be false")
 	}
 	if _, ok := auth["pendingRequest"]; ok {

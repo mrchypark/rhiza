@@ -16,6 +16,7 @@ import (
 	"github.com/mrchypark/rhiza/pkg/network"
 	"github.com/mrchypark/rhiza/pkg/node"
 	"github.com/mrchypark/rhiza/pkg/operator"
+	"github.com/mrchypark/rhiza/pkg/quepaxa"
 	"github.com/mrchypark/rhiza/pkg/recovery"
 )
 
@@ -28,12 +29,13 @@ type QueryRequest = network.QueryRequest
 type QueryResponse = network.QueryResponse
 
 type Config struct {
-	Runtime  RuntimeConfig
-	Store    *operator.V1Alpha2StatusStore
-	Ref      operator.V1Alpha2ClusterRef
-	Plan     operator.V1Alpha2ApplicationInitPlan
-	PodUID   string
-	Prepared *recovery.VerifiedPreparedStartup
+	StorageRoot string
+	Runtime     RuntimeConfig
+	Store       *operator.V1Alpha2StatusStore
+	Ref         operator.V1Alpha2ClusterRef
+	Plan        operator.V1Alpha2ApplicationInitPlan
+	PodUID      string
+	Prepared    *recovery.VerifiedPreparedStartup
 }
 
 type sqlEvidence struct {
@@ -57,6 +59,10 @@ type Host struct {
 // quorum. Evidence/CAS failures after runtime creation return the host as well:
 // callers must retain it for diagnosis/recovery or call Close.
 func Open(ctx context.Context, cfg Config) (*Host, error) {
+	cfg.Runtime = node.CloneManagedRuntimeConfig(cfg.Runtime)
+	if cfg.Runtime.ObjStoreProvider == "" {
+		cfg.Runtime.ObjStoreProvider = "s3"
+	}
 	if cfg.Plan.EvidenceFormat != EvidenceFormat || cfg.Store == nil || cfg.PodUID == "" {
 		return nil, fmt.Errorf("exact SQL initialization plan, store, and Pod UID required")
 	}
@@ -65,6 +71,15 @@ func Open(ctx context.Context, cfg Config) (*Host, error) {
 	}
 	if cfg.Runtime.ObjStoreDurability != types.ObjectStoreDurabilityBeforeAck {
 		return nil, fmt.Errorf("managed SQL requires configured before-ack durability")
+	}
+	namespace, err := node.ManagedNamespaceFor(cfg.StorageRoot, cfg.Ref.UID, cfg.Plan.Generation, cfg.Plan.AssignmentID, string(cfg.Runtime.ClusterID))
+	if err != nil || cfg.Runtime.ObjStorePrefix != namespace.ConfigPrefix {
+		return nil, errors.Join(fmt.Errorf("installed runtime final namespace differs from exact assignment"), err)
+	}
+	cluster, err := types.ManagedClusterID(cfg.Ref.UID, cfg.Plan.Generation)
+	memberID, memberErr := types.ManagedNodeID(cfg.PodUID)
+	if err != nil || memberErr != nil || cfg.Runtime.ClusterID != cluster || cfg.Runtime.NodeID != memberID {
+		return nil, errors.Join(fmt.Errorf("runtime member identity differs from CR generation or actual Pod UID"), err, memberErr)
 	}
 	h := &Host{cfg: cfg, node: node.New(&cfg.Runtime)}
 	source, member, err := h.node.PreparedStartupBindingDigests()
@@ -79,7 +94,31 @@ func Open(ctx context.Context, cfg Config) (*Host, error) {
 	if err != nil || initial.Assignment().Plan != cfg.Plan {
 		return nil, errors.Join(fmt.Errorf("live initialization assignment mismatch"), err)
 	}
+	status, err := cfg.Store.Load(ctx, cfg.Ref)
+	if err != nil {
+		return nil, err
+	}
+	bootstrap, err := status.BootstrapPlan()
+	if err != nil {
+		return nil, err
+	}
+	if bootstrap.ClusterID != cfg.Runtime.ClusterID || bootstrap.PhysicalBinding != source || bootstrap.EvidenceFormat != EvidenceFormat || bootstrap.Durability != cfg.Runtime.ObjStoreDurability || bootstrap.Reconfiguration != cfg.Runtime.EnableReconfiguration {
+		return nil, fmt.Errorf("installed runtime differs from full bootstrap plan")
+	}
+	initialMember := false
+	for _, m := range bootstrap.Members {
+		if m.PodUID == cfg.PodUID && m.Member.ID == cfg.Runtime.NodeID && m.Member.PublicKey == quepaxa.PublicKey(network.PeerPublicKey(cfg.Runtime.ClusterID, cfg.Runtime.NodeID, cfg.Runtime.PeerToken)) {
+			initialMember = true
+		}
+	}
+	if cfg.Runtime.Learner == nil && !initialMember {
+		return nil, fmt.Errorf("exact initial Pod/member/key is not in bootstrap plan")
+	}
+	if initial.Assignment().State == "Unused" && !initialMember {
+		return nil, fmt.Errorf("only an exact initial member may consume E0")
+	}
 	h.authority = initial.Authority()
+	ever := initial.EverApplicationReserved()
 	if h.authority.Generation != cfg.Plan.Generation || h.authority.Binding.DeploymentUID != cfg.Plan.DeploymentUID || h.authority.Binding.StorageID != cfg.Plan.StorageID {
 		return nil, fmt.Errorf("current authority differs from installed generation and storage binding")
 	}
@@ -93,17 +132,34 @@ func Open(ctx context.Context, cfg Config) (*Host, error) {
 	if err := h.ValidateManagedStartup(ctx, h.identity); err != nil {
 		return nil, err
 	}
-	emptySource, err := h.node.PrepareManagedSQLSource(ctx, h.identity, initial.Assignment().State == "Unused" && cfg.Prepared == nil)
+	birthAuthority, err := operator.LoadV1Alpha2ApplicationInit(ctx, cfg.Store, cfg.Ref)
+	if err != nil || birthAuthority.Assignment().Plan != cfg.Plan || birthAuthority.Authority() != h.authority {
+		return nil, errors.Join(fmt.Errorf("birth assignment changed"), err)
+	}
+	emptySource, err := h.node.PrepareManagedSQLSource(ctx, h.identity, birthAuthority.Assignment().State == "Unused" && !birthAuthority.EverApplicationReserved() && cfg.Prepared == nil)
 	if err != nil {
 		return nil, err
 	}
-	h.identity.Fresh = emptySource && cfg.Prepared == nil
+	h.identity.Fresh = emptySource && !ever && cfg.Prepared == nil && initialMember
+	if h.identity.Fresh && initial.Assignment().State == "Consumed" {
+		a, err := h.live(ctx)
+		if err != nil {
+			return nil, err
+		}
+		reserved := a.EverApplicationReserved()
+		if _, pending := a.Pending(); reserved || pending {
+			h.identity.Fresh = false
+		}
+	}
 	if initial.Assignment().State == "Unused" {
+		if ever {
+			return nil, fmt.Errorf("reserved application history prevents E0 consumption")
+		}
 		if err := h.node.VerifyManagedSQLFreshSource(ctx, h.identity); err != nil {
 			return nil, err
 		}
 	}
-	if err := h.node.OpenManaged(ctx, node.ManagedStartupConfig{Identity: h.identity, Checker: h, Prepared: cfg.Prepared, BootstrapMember: cfg.Runtime.Learner == nil}); err != nil {
+	if err := h.node.OpenManaged(ctx, node.ManagedStartupConfig{StorageRoot: cfg.StorageRoot, PeerRecovery: true, Identity: h.identity, Checker: h, Prepared: cfg.Prepared, BootstrapMember: cfg.Runtime.Learner == nil}); err != nil {
 		return nil, err
 	}
 	if initial.Assignment().State == "Unused" {
@@ -113,6 +169,15 @@ func Open(ctx context.Context, cfg Config) (*Host, error) {
 			return h, err
 		}
 		evidence := encodeEvidence(state)
+		liveInit, err := operator.LoadV1Alpha2ApplicationInit(ctx, cfg.Store, cfg.Ref)
+		if err != nil {
+			h.uncertain.Store(true)
+			return h, err
+		}
+		if liveInit.EverApplicationReserved() {
+			h.uncertain.Store(true)
+			return h, fmt.Errorf("reservation raced initial E0 inspection")
+		}
 		if err := h.node.VerifyManagedSQLFreshSource(ctx, h.identity); err != nil {
 			h.uncertain.Store(true)
 			return h, err
@@ -174,6 +239,9 @@ func (h *Host) ValidateManagedStartup(ctx context.Context, i node.ManagedStartup
 		return errors.Join(fmt.Errorf("live initialization binding changed"), err)
 	}
 	if s.Assignment().State == "Unused" {
+		if s.EverApplicationReserved() {
+			return fmt.Errorf("unused assignment cannot have application reservation history")
+		}
 		return nil
 	}
 	_, err = h.live(ctx)
@@ -181,12 +249,21 @@ func (h *Host) ValidateManagedStartup(ctx context.Context, i node.ManagedStartup
 		return err
 	}
 	if i.Fresh {
+		a, err := h.live(ctx)
+		if err != nil {
+			return err
+		}
+		if _, pending := a.Pending(); a.EverApplicationReserved() || pending {
+			// Keep the owner and private peers alive; live application admission
+			// below requires actual history rather than this stale startup hint.
+			return nil
+		}
 		return h.node.VerifyManagedSQLFreshSource(ctx, i)
 	}
 	return nil
 }
 
-func (h *Host) ValidateManagedAdmission(ctx context.Context, i node.ManagedStartupIdentity, _ node.ManagedRuntimeState) error {
+func (h *Host) ValidateManagedAdmission(ctx context.Context, i node.ManagedStartupIdentity, runtime node.ManagedRuntimeState) error {
 	if h.uncertain.Load() {
 		return fmt.Errorf("SQL outcome unknown; explicit pending recovery required")
 	}
@@ -205,6 +282,15 @@ func (h *Host) ValidateManagedAdmission(ctx context.Context, i node.ManagedStart
 			return fmt.Errorf("pending SQL blocks new admission")
 		}
 		return nil
+	}
+	if a.EverApplicationReserved() && !runtime.ExistingRegisteredWAL && runtime.CertifiedTip == 0 {
+		head, err := h.node.ManagedArchiveAvailable(ctx)
+		if err != nil {
+			return err
+		}
+		if !head {
+			return fmt.Errorf("reserved history cannot admit a new empty-source application baseline")
+		}
 	}
 	s, err := h.node.InspectManagedSQL(ctx, false)
 	if err != nil {

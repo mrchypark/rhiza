@@ -109,6 +109,13 @@ func TestManagedPausedRuntimeOwnsResourcesAndDoesNotConfuseCatchUpWithAdmission(
 func TestManagedAssignmentDenialPrecedesLocalMutation(t *testing.T) {
 	dir := filepath.Join(t.TempDir(), "must-remain-absent")
 	n := New(&types.ExecutionConfig{NodeID: "managed", ClusterID: "cluster", DataDir: dir, PeerToken: "managed-token", Members: []types.NodeConfig{peerMember("cluster", "managed", "managed-token"), peerMember("cluster", "other", "other-token")}, ObjStoreProvider: "s3", ObjStoreBucket: "test", ObjStoreEndpoint: "127.0.0.1:1", ObjStoreInsecure: true, ObjStoreDurability: types.ObjectStoreDurabilityBeforeAck})
+	n.config.Members[0].PeerURL = "quic://127.0.0.1:1"
+	n.config.Members[1].PeerURL = "quic://127.0.0.1:2"
+	namespace, err := ManagedNamespaceFor("", "uid", 0, "assignment", "cluster")
+	if err != nil {
+		t.Fatal(err)
+	}
+	n.config.ObjStorePrefix = namespace.ConfigPrefix
 	source, config, err := n.preparedBindingDigests()
 	if err != nil {
 		t.Fatal(err)
@@ -131,6 +138,8 @@ func TestManagedAssignmentDenialPrecedesLocalMutation(t *testing.T) {
 
 func TestManagedBootstrapPlanIsCommonButBindsActualStorageAndMembership(t *testing.T) {
 	a := New(&types.ExecutionConfig{NodeID: "a", ClusterID: "cluster", ObjStoreProvider: "s3", ObjStoreBucket: "bucket", Members: []types.NodeConfig{peerMember("cluster", "a", "a-token"), peerMember("cluster", "b", "b-token")}})
+	a.config.Members[0].PeerURL = "quic://127.0.0.1:1"
+	a.config.Members[1].PeerURL = "quic://127.0.0.1:2"
 	source, _, err := a.PreparedStartupBindingDigests()
 	if err != nil {
 		t.Fatal(err)

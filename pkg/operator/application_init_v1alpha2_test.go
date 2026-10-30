@@ -15,11 +15,24 @@ import (
 
 func initTestPlan(t *testing.T) V1Alpha2ApplicationInitPlan {
 	t.Helper()
-	p, err := NewV1Alpha2ApplicationInitPlan(phase2Ref, "logical", "deployment", "assignment", strings.Repeat("a", 64), strings.Repeat("b", 64), "app/v1")
+	b, digest, err := testBootstrapPlan(phase2Ref)
+	if err != nil {
+		t.Fatal(err)
+	}
+	p, err := NewV1Alpha2ApplicationInitPlan(phase2Ref, "logical", "deployment", "assignment", b.PhysicalBinding, digest, b.EvidenceFormat)
 	if err != nil {
 		t.Fatal(err)
 	}
 	return p
+}
+
+func initTestBootstrap(t *testing.T) V1Alpha2BootstrapPlan {
+	t.Helper()
+	b, _, err := testBootstrapPlan(phase2Ref)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return b
 }
 
 func TestApplicationInitRetainsOriginalSQL(t *testing.T) {
@@ -29,12 +42,43 @@ func TestApplicationInitRetainsOriginalSQL(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	if snap.EverApplicationReserved() || !reserved.EverApplicationReserved() {
+		t.Fatal("SQL reservation history was not atomically recorded")
+	}
 	got, ok, err := reserved.PendingSQL()
 	if err != nil || !ok || got.RequestID != req.RequestID || got.SQL != req.SQL || len(got.Args) != 1 || got.Args[0] != "value" {
 		t.Fatalf("pending SQL: %+v %v %v", got, ok, err)
 	}
 	if _, _, err := FinalizeV1Alpha2Write(context.Background(), store, reserved, snap.Authority(), V1Alpha2WriteRequest{Kind: "sql", ID: "write", Fingerprint: "wrong"}, V1Alpha2WriteCommitted, authorityTestEvidence); err == nil {
 		t.Fatal("mismatched request finalized")
+	}
+}
+
+func TestApplicationInitSQLHistorySurvivesEvidenceReversal(t *testing.T) {
+	server, store, current := authorityTestSetup(t)
+	ctx := context.Background()
+	for _, req := range []network.ExecuteRequest{{RequestID: "ddl-create", SQL: "CREATE TABLE t (v TEXT)"}, {RequestID: "ddl-drop", SQL: "DROP TABLE t"}} {
+		reserved, observed, err := ReserveV1Alpha2SQLWrite(ctx, store, current, current.Authority(), authorityTestEvidence, req)
+		if err != nil || observed != V1Alpha2CASApplied || !reserved.EverApplicationReserved() {
+			t.Fatalf("reserve: %s %v", observed, err)
+		}
+		request, ok := reserved.Pending()
+		if !ok {
+			t.Fatal("missing pending request")
+		}
+		current, observed, err = FinalizeV1Alpha2Write(ctx, store, reserved, reserved.Authority(), request, V1Alpha2WriteCommitted, authorityTestEvidence)
+		if err != nil || observed != V1Alpha2CASApplied || !current.EverApplicationReserved() {
+			t.Fatalf("finalize: %s %v", observed, err)
+		}
+		// The small in-memory fixture models only two successive RV values.
+		server.cluster = strings.Replace(server.cluster, `"resourceVersion":"49"`, `"resourceVersion":"47"`, 1)
+		current, err = LoadV1Alpha2Admission(ctx, store, phase2Ref)
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+	if !sameJSON(current.Evidence(), authorityTestEvidence) {
+		t.Fatal("reversed evidence differs")
 	}
 }
 
@@ -139,7 +183,7 @@ func TestApplicationInitGenesisAndCommit(t *testing.T) {
 	if _, err := InitializeV1Alpha2Authority(ctx, store, phase2Ref, name); err == nil || server.puts != 0 {
 		t.Fatal("unplanned genesis was accepted")
 	}
-	if _, err := InitializeV1Alpha2AuthorityWithPlan(ctx, store, phase2Ref, name, plan); err != nil {
+	if _, err := InitializeV1Alpha2AuthorityWithBootstrap(ctx, store, phase2Ref, name, plan, initTestBootstrap(t)); err != nil {
 		t.Fatal(err)
 	}
 	if server.puts != 1 || !strings.Contains(server.cluster, `"state":"Unused"`) || !strings.Contains(server.cluster, `"unrelated":{"keep":true}`) {
@@ -172,7 +216,7 @@ func TestApplicationInitGenesisAndCommit(t *testing.T) {
 func TestApplicationInitOldGenesisNeverBackfilled(t *testing.T) {
 	ctx := context.Background()
 	server, store, name := phase8Setup(t, phase8Cluster, "")
-	if _, err := InitializeV1Alpha2AuthorityWithPlan(ctx, store, phase2Ref, name, initTestPlan(t)); err != nil {
+	if _, err := InitializeV1Alpha2AuthorityWithBootstrap(ctx, store, phase2Ref, name, initTestPlan(t), initTestBootstrap(t)); err != nil {
 		t.Fatal(err)
 	}
 	var obj map[string]json.RawMessage
@@ -183,8 +227,8 @@ func TestApplicationInitOldGenesisNeverBackfilled(t *testing.T) {
 	b, _ := json.Marshal(obj)
 	server.cluster = string(b)
 	puts := server.puts
-	if _, err := InitializeV1Alpha2AuthorityWithPlan(ctx, store, phase2Ref, name, initTestPlan(t)); err != nil {
-		t.Fatal(err)
+	if _, err := InitializeV1Alpha2AuthorityWithBootstrap(ctx, store, phase2Ref, name, initTestPlan(t), initTestBootstrap(t)); err == nil {
+		t.Fatal("incomplete old genesis accepted")
 	}
 	if server.puts != puts {
 		t.Fatal("old genesis was rewritten")
@@ -198,7 +242,7 @@ func TestApplicationInitLostCommitRemainsUnknown(t *testing.T) {
 	ctx := context.Background()
 	server, store, name := phase8Setup(t, phase8Cluster, "")
 	plan := initTestPlan(t)
-	if _, err := InitializeV1Alpha2AuthorityWithPlan(ctx, store, phase2Ref, name, plan); err != nil {
+	if _, err := InitializeV1Alpha2AuthorityWithBootstrap(ctx, store, phase2Ref, name, plan, initTestBootstrap(t)); err != nil {
 		t.Fatal(err)
 	}
 	server.cluster = strings.Replace(server.cluster, `"resourceVersion":"48"`, `"resourceVersion":"47"`, 1)
@@ -227,7 +271,7 @@ func TestApplicationInitLostResponseWithAdvancedEvidence(t *testing.T) {
 		return resp, err
 	})
 	plan := initTestPlan(t)
-	if _, err := InitializeV1Alpha2AuthorityWithPlan(ctx, store, phase2Ref, name, plan); err != nil {
+	if _, err := InitializeV1Alpha2AuthorityWithBootstrap(ctx, store, phase2Ref, name, plan, initTestBootstrap(t)); err != nil {
 		t.Fatal(err)
 	}
 	server.cluster = strings.Replace(server.cluster, `"resourceVersion":"48"`, `"resourceVersion":"47"`, 1)
@@ -246,7 +290,7 @@ func TestApplicationInitStaleCASCannotConsume(t *testing.T) {
 	ctx := context.Background()
 	server, store, name := phase8Setup(t, phase8Cluster, "")
 	plan := initTestPlan(t)
-	if _, err := InitializeV1Alpha2AuthorityWithPlan(ctx, store, phase2Ref, name, plan); err != nil {
+	if _, err := InitializeV1Alpha2AuthorityWithBootstrap(ctx, store, phase2Ref, name, plan, initTestBootstrap(t)); err != nil {
 		t.Fatal(err)
 	}
 	old, err := LoadV1Alpha2ApplicationInit(ctx, store, phase2Ref)

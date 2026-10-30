@@ -297,6 +297,9 @@ func (n *Node) open(ctx context.Context, enroll bool) (err error) {
 	if err != nil {
 		return err
 	}
+	if n.managedStartup != nil {
+		n.managedStartup.existingRegisteredWAL = localVoter.identity != nil && localVoter.identity.Registered
+	}
 	if n.config.Local && localVoter.identity != nil {
 		return fmt.Errorf("%w: registered voter cannot be reopened as standalone Local data", ErrVoterStateLost)
 	}
@@ -416,11 +419,14 @@ func (n *Node) open(ctx context.Context, enroll bool) (err error) {
 			provider = objectstore.ProviderS3
 		}
 		newBucket := objectstore.NewBucketWithContext
-		if n.managedStartup != nil {
-			newBucket = objectstore.NewBucketWithoutProvisioning
-		}
 		if n.fenceSession != nil {
 			newBucket = objectstore.NewBucketForSupervisedStartup
+		}
+		if n.managedStartup != nil {
+			finalPrefix := path.Join(n.config.ObjStorePrefix, string(n.config.ClusterID))
+			newBucket = func(ctx context.Context, cfg objectstore.Config) (*objectstore.MeteredBucket, error) {
+				return objectstore.NewBucketForNamespace(ctx, cfg, finalPrefix)
+			}
 		}
 		bucket, bucketErr := newBucket(ctx, objectstore.Config{
 			Provider: provider, FilesystemDir: n.config.ObjStoreDir, Prefix: n.config.ObjStorePrefix,
@@ -446,7 +452,7 @@ func (n *Node) open(ctx context.Context, enroll bool) (err error) {
 			}
 			if !n.managedStartup.Identity.Fresh {
 				exists, err := bucket.Exists(ctx, path.Join(n.config.ObjStorePrefix, string(n.config.ClusterID), "archive/head.bin"))
-				if err != nil || !exists {
+				if err != nil || !exists && !n.managedStartup.PeerRecovery {
 					return errors.Join(fmt.Errorf("managed recovery requires existing archive head"), err)
 				}
 			}
@@ -481,11 +487,20 @@ func (n *Node) open(ctx context.Context, enroll bool) (err error) {
 		if len(n.config.Members) > 1 && !n.archive.CASSupported() {
 			return fmt.Errorf("multi-node shared archive requires conditional object writes")
 		}
-		if loadErr := n.archive.Load(ctx); loadErr != nil {
-			if n.managedStartup != nil || n.config.ObjStoreDurability == types.ObjectStoreDurabilityBeforeAck {
-				return fmt.Errorf("load shared decision archive: %w", loadErr)
+		loadArchive := true
+		if n.managedStartup != nil && n.managedStartup.PeerRecovery {
+			loadArchive, err = bucket.Exists(ctx, path.Join(clusterPrefix, "archive/head.bin"))
+			if err != nil {
+				return err
 			}
-			log.Printf("shared archive unavailable during async startup: %v", loadErr)
+		}
+		if loadArchive {
+			if loadErr := n.archive.Load(ctx); loadErr != nil {
+				if n.managedStartup != nil || n.config.ObjStoreDurability == types.ObjectStoreDurabilityBeforeAck {
+					return fmt.Errorf("load shared decision archive: %w", loadErr)
+				}
+				log.Printf("shared archive unavailable during async startup: %v", loadErr)
+			}
 		}
 		if n.archive.Sealed() {
 			return recovery.ErrArchiveSealed
