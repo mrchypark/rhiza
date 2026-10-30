@@ -124,7 +124,7 @@ reject cluster-voters 'voterCount updates are unsupported' patch rhizacluster cl
 reject cluster-container-name 'workload updates are unsupported' patch rhizacluster cluster -n "$namespace" --type=merge -p '{"spec":{"workload":{"podTemplate":{"spec":{"containers":[{"name":"other","image":"example.invalid/app"}]}}}}}'
 reject cluster-container-image 'workload updates are unsupported' patch rhizacluster cluster -n "$namespace" --type=merge -p '{"spec":{"workload":{"podTemplate":{"spec":{"containers":[{"name":"app","image":"other"}]}}}}}'
 reject cluster-container-list 'workload updates are unsupported' patch rhizacluster cluster -n "$namespace" --type=merge -p '{"spec":{"workload":{"podTemplate":{"spec":{"containers":[{"name":"app","image":"example.invalid/app"},{"name":"extra","image":"example.invalid/app"}]}}}}}'
-ok cluster-status patch rhizacluster cluster -n "$namespace" --subresource=status --type=merge -p '{"status":{"authority":{"opaque":"keep"}}}'
+ok cluster-status patch rhizacluster cluster -n "$namespace" --subresource=status --type=merge -p '{"status":{"authority":{"everApplicationReserved":false,"opaque":"keep"}}}'
 ok cluster-metadata patch rhizacluster cluster -n "$namespace" --type=merge -p '{"metadata":{"labels":{"test":"updated"}}}'
 ok cluster-authority get rhizacluster cluster -n "$namespace" -o jsonpath='{.status.authority.opaque}'
 [ "$(cat "$logs/cluster-authority.txt")" = keep ] || { echo 'cluster status authority lost' >&2; exit 1; }
@@ -188,13 +188,13 @@ for name in status-contract authority-contract queue-contract finalizer-contract
 done
 authority_uid=$(k get rhizacluster authority-contract -n "$namespace" -o jsonpath='{.metadata.uid}')
 : "${authority_uid:?}"
-ok authority-contract-seed patch rhizacluster authority-contract -n "$namespace" --subresource=status --type=merge -p "{\"status\":{\"authority\":{\"owner\":{\"namespace\":\"$namespace\",\"name\":\"authority-contract\",\"uid\":\"$authority_uid\",\"logicalID\":\"test\"},\"generation\":2,\"binding\":{\"deploymentUID\":\"deployment\",\"storageID\":\"storage\"},\"pendingWrite\":false,\"evidence\":{\"host\":\"before\"},\"receipt\":{\"opaque\":\"keep\"}},\"other\":{\"opaque\":\"keep\"}}}"
+ok authority-contract-seed patch rhizacluster authority-contract -n "$namespace" --subresource=status --type=merge -p "{\"status\":{\"authority\":{\"owner\":{\"namespace\":\"$namespace\",\"name\":\"authority-contract\",\"uid\":\"$authority_uid\",\"logicalID\":\"test\"},\"generation\":2,\"binding\":{\"deploymentUID\":\"deployment\",\"storageID\":\"storage\"},\"pendingWrite\":false,\"everApplicationReserved\":false,\"evidence\":{\"host\":\"before\"},\"receipt\":{\"opaque\":\"keep\"}},\"other\":{\"opaque\":\"keep\"}}}"
 cluster_json genesis-contract 3 ',"genesisIntent":"Create"' > "$logs/genesis-contract.json"
 ok genesis-contract-create create --validate=strict -f "$logs/genesis-contract.json"
 for name in status-contract queue-contract finalizer-contract lifecycle-cancel lifecycle-prepare cancel-complete cancel-retained cancel-waiting; do
   uid=$(k get rhizacluster "$name" -n "$namespace" -o jsonpath='{.metadata.uid}')
   [ -n "$uid" ] || exit 1
-  ok "$name-seed" patch rhizacluster "$name" -n "$namespace" --subresource=status --type=merge -p "{\"status\":{\"authority\":{\"owner\":{\"namespace\":\"$namespace\",\"name\":\"$name\",\"uid\":\"$uid\",\"logicalID\":\"test\"},\"generation\":2,\"binding\":{\"deploymentUID\":\"deployment\",\"storageID\":\"storage\"},\"pendingWrite\":false,\"transition\":null,\"receipt\":{\"opaque\":\"keep\"}},\"other\":{\"opaque\":\"keep\"}}}"
+  ok "$name-seed" patch rhizacluster "$name" -n "$namespace" --subresource=status --type=merge -p "{\"status\":{\"authority\":{\"owner\":{\"namespace\":\"$namespace\",\"name\":\"$name\",\"uid\":\"$uid\",\"logicalID\":\"test\"},\"generation\":2,\"binding\":{\"deploymentUID\":\"deployment\",\"storageID\":\"storage\"},\"pendingWrite\":false,\"everApplicationReserved\":false,\"transition\":null,\"receipt\":{\"opaque\":\"keep\"}},\"other\":{\"opaque\":\"keep\"}}}"
 done
 for target in cancel-complete cancel-retained cancel-waiting; do
   target_uid=$(k get rhizacluster "$target" -n "$namespace" -o jsonpath='{.metadata.uid}')
@@ -251,6 +251,10 @@ rules:
   verbs: ["get", "list"]
 - apiGroups: [""]
   resources: ["secrets"]
+  verbs: ["get"]
+- apiGroups: [""]
+  resources: ["serviceaccounts"]
+  resourceNames: ["rhiza-managed-host"]
   verbs: ["get"]
 # Controlled Pod status and Secret setup use the CI administrator kubeconfig,
 # never this operator ServiceAccount. In particular, no pods/status writes.

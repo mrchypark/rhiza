@@ -31,14 +31,14 @@ jobs:
           go test ./internal/objstore ./pkg/node ./pkg/network ./pkg/checkpoint ./pkg/recovery -count=1 -timeout=180s
           go test ./pkg/managedsql -count=1 -timeout=180s
           go test ./pkg/materializer -run '^TestSQLApplicationEvidence' -count=1 -timeout=60s
-          go test . -run '^TestPreparedNode(StageAvoidsLegacyRecoverySnapshot|RegistrationRequestScope|EmulatorAuthScope)$' -count=1 -timeout=60s
+          go test . -run '^TestPreparedNode(StageAvoidsLegacyRecoverySnapshot|RegistrationRequestScope|EmulatorAuthScope|ProviderAuthorityHistory)$' -count=1 -timeout=60s
       - name: Verify fixed-head recovery view under race detector
         run: |
           go test -race ./pkg/node ./pkg/checkpoint ./pkg/recovery -run '^Test(HA|Prepared|Managed)' -count=1 -timeout=180s
           go test -race ./pkg/managedsql -count=1 -timeout=300s
           go test -race ./pkg/network -run '^TestResolveExecute' -count=1 -timeout=60s
           go test -race ./pkg/materializer -run '^TestSQLApplicationEvidence' -count=1 -timeout=60s
-          go test -race . -run '^TestPreparedNode(RegistrationRequestScope|EmulatorAuthScope)$' -count=1 -timeout=60s
+          go test -race . -run '^TestPreparedNode(RegistrationRequestScope|EmulatorAuthScope|ProviderAuthorityHistory)$' -count=1 -timeout=60s
       - name: Exercise fixed-head reads against pinned Floci providers
         run: |
           set -euo pipefail

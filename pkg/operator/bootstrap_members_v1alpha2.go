@@ -27,6 +27,7 @@ const (
 	V1Alpha2ManagedRuntimeProfileKey    = "runtime.json"
 	V1Alpha2ManagedRuntimeProfileVolume = "rhiza-runtime-profile"
 	V1Alpha2BootstrapHandoffPath        = "/var/lib/rhiza/bootstrap.json"
+	V1Alpha2ManagedHostServiceAccount   = "rhiza-managed-host"
 )
 
 // V1Alpha2ManagedPodSecurity is the initial managed profile. Application
@@ -61,6 +62,8 @@ func V1Alpha2ManagedSQLPodSpec(ref V1Alpha2ClusterRef, profile V1Alpha2RuntimePr
 		return nil, err
 	}
 	init := pod["initContainers"].([]map[string]any)
+	pod["serviceAccountName"] = V1Alpha2ManagedHostServiceAccount
+	pod["automountServiceAccountToken"] = true
 	main := pod["containers"].([]map[string]any)[0]
 	main["command"] = []string{"/usr/local/bin/rhiza-ha-init"}
 	main["args"] = []string{"serve-managed-sql", "--runtime-profile", V1Alpha2ManagedRuntimeProfilePath, "--identity-file", V1Alpha2BootstrapIdentityPath, "--handoff-file", V1Alpha2BootstrapHandoffPath, "--listen", "0.0.0.0:8080"}
@@ -242,6 +245,9 @@ func CollectV1Alpha2BootstrapMembers(ctx context.Context, kube *Kubernetes, ref 
 		APIVersion, Kind string
 		Metadata         v1alpha2BootstrapMetadata
 		Spec             struct {
+			ServiceAccountName            string
+			ServiceAccount                string
+			AutomountServiceAccountToken  *bool
 			HostNetwork, HostPID, HostIPC bool
 			InitContainers                json.RawMessage
 			SecurityContext               json.RawMessage
@@ -353,6 +359,9 @@ func CollectV1Alpha2BootstrapMembers(ctx context.Context, kube *Kubernetes, ref 
 		if p.Spec.HostNetwork || p.Spec.HostPID || p.Spec.HostIPC || !sameJSON(p.Spec.SecurityContext, security) || len(p.Spec.Containers) != len(cluster.Spec.Workload.PodTemplate.Spec.Containers) {
 			return nil, fmt.Errorf("invalid managed pod security")
 		}
+		if expectedMain != nil && (p.Spec.ServiceAccountName != V1Alpha2ManagedHostServiceAccount || p.Spec.ServiceAccount != "" && p.Spec.ServiceAccount != V1Alpha2ManagedHostServiceAccount || p.Spec.AutomountServiceAccountToken == nil || !*p.Spec.AutomountServiceAccountToken) {
+			return nil, fmt.Errorf("invalid managed host service account")
+		}
 		dataVolumes, profileVolumes := 0, 0
 		projectionName := ""
 		for _, raw := range p.Spec.Volumes {
@@ -382,6 +391,31 @@ func CollectV1Alpha2BootstrapMembers(ctx context.Context, kube *Kubernetes, ref 
 		}
 		if dataVolumes != 1 || expectedMain != nil && profileVolumes != 1 {
 			return nil, fmt.Errorf("invalid bootstrap volume")
+		}
+		if expectedMain != nil {
+			if projectionName == "" {
+				return nil, fmt.Errorf("missing managed host token projection")
+			}
+			var inits []struct {
+				VolumeMounts []struct {
+					Name, MountPath string
+					ReadOnly        bool
+				}
+			}
+			if json.Unmarshal(p.Spec.InitContainers, &inits) != nil {
+				return nil, fmt.Errorf("invalid managed init mounts")
+			}
+			for _, init := range inits {
+				tokens := 0
+				for _, m := range init.VolumeMounts {
+					if m.Name == projectionName && m.MountPath == "/var/run/secrets/kubernetes.io/serviceaccount" && m.ReadOnly {
+						tokens++
+					}
+				}
+				if tokens != 1 {
+					return nil, fmt.Errorf("missing managed init token mount")
+				}
+			}
 		}
 		for i, c := range p.Spec.Containers {
 			want := cluster.Spec.Workload.PodTemplate.Spec.Containers[i]
@@ -415,7 +449,7 @@ func CollectV1Alpha2BootstrapMembers(ctx context.Context, kube *Kubernetes, ref 
 				}
 				return nil, fmt.Errorf("invalid managed main mount")
 			}
-			if data != 1 || projected > 1 || expectedMain != nil && profileMounts != 1 {
+			if data != 1 || projected > 1 || expectedMain != nil && (profileMounts != 1 || projected != 1) {
 				return nil, fmt.Errorf("invalid managed main mounts")
 			}
 		}

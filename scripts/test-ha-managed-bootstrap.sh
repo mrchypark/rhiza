@@ -19,10 +19,20 @@ kubeconfig="$private/kubeconfig"
 owned=0
 built=0
 k() { kubectl --kubeconfig "$kubeconfig" --context "kind-$cluster" --request-timeout=30s "$@"; }
+capture_floci() {
+  k -n "$namespace" get pods -l rhiza-ci-component=floci -o json > "$logs/floci-pods.json" 2> "$logs/floci-pods-errors.txt" || return 0
+  # Restrict metadata to emulator Pods: never inspect Secret data or runtime profile contents.
+  jq '[.items[]|{metadata:{name:.metadata.name,uid:.metadata.uid,labels:.metadata.labels},spec:{enableServiceLinks:.spec.enableServiceLinks,containers:[.spec.containers[]|{name,image}]},status:.status}]' "$logs/floci-pods.json" > "$logs/floci-status.json" || :
+  for floci_pod in $(jq -r '.items[].metadata.name' "$logs/floci-pods.json"); do
+    k -n "$namespace" logs "$floci_pod" -c floci > "$logs/$floci_pod-current.log" 2> "$logs/$floci_pod-current-errors.txt" || :
+    k -n "$namespace" logs "$floci_pod" -c floci --previous > "$logs/$floci_pod-previous.log" 2> "$logs/$floci_pod-previous-errors.txt" || :
+  done
+}
 cleanup() {
   result=$?
   trap - EXIT HUP INT TERM
   if [ "$owned" = 1 ]; then
+    capture_floci
     k -n "$namespace" get pods,deployments,replicasets,rhizaclusters,jobs,services,endpoints -o json > "$logs/final-state.json" 2>&1 || :
     for job in create-sql insert-sql query; do
       k -n "$namespace" logs "job/$job" > "$logs/$job.json" 2> "$logs/$job-log-errors.txt" || :
@@ -52,9 +62,26 @@ kind load docker-image --name "$cluster" "$image" > "$logs/load.txt" 2>&1
 k create namespace "$namespace"
 k apply -f deploy/operator/cluster-crd.yaml -f deploy/operator/crd.yaml
 k wait --for=condition=Established --timeout=90s crd/rhizaclusters.rhiza.mrchypark.dev crd/rhizarecoveries.rhiza.mrchypark.dev
-k -n "$namespace" create deployment floci --image=floci/floci:2.3.0
-k -n "$namespace" expose deployment floci --port=4566
+# Create the Service first so both variants see the same existing Service set.
+jq -n '{apiVersion:"v1",kind:"Service",metadata:{name:"floci"},spec:{selector:{app:"floci"},ports:[{port:4566,targetPort:4566}]}}' | k -n "$namespace" create -f -
+# Bounded diagnostic only: retain actual failure logs, never infer the Spring cause.
+jq -n '{apiVersion:"v1",kind:"Pod",metadata:{name:"floci-service-links-probe",labels:{"rhiza-ci-component":"floci","rhiza-ci-probe":"service-links"}},spec:{activeDeadlineSeconds:45,enableServiceLinks:true,automountServiceAccountToken:false,containers:[{name:"floci",image:"floci/floci:2.3.0",readinessProbe:{tcpSocket:{port:4566},periodSeconds:1}}]}}' | k -n "$namespace" create -f -
+if k -n "$namespace" wait --for=condition=Ready pod/floci-service-links-probe --timeout=45s > "$logs/floci-service-links-wait.txt" 2>&1; then
+  printf '%s\n' 'NOT REPRODUCED: serviceLinks=true diagnostic Pod reached TCP readiness; old startup cause remains unknown' > "$logs/floci-service-links-result.txt"
+else
+  k -n "$namespace" get pod floci-service-links-probe -o json > "$logs/floci-service-links-probe.json"
+  if jq -e 'any(.status.containerStatuses[]?; .restartCount>0 or (.state.terminated.exitCode//0)!=0)' "$logs/floci-service-links-probe.json" >/dev/null; then
+    printf '%s\n' 'OBSERVED: serviceLinks=true diagnostic Pod exited/restarted; inspect captured actual logs for cause (not assumed)' > "$logs/floci-service-links-result.txt"
+  else
+    printf '%s\n' 'INCONCLUSIVE: serviceLinks=true diagnostic Pod did not reach TCP readiness within 45s; old startup cause remains unknown' > "$logs/floci-service-links-result.txt"
+  fi
+fi
+capture_floci
+# The actual SDK fixture excludes injected Service environment and must be TCP-ready.
+jq -n '{apiVersion:"apps/v1",kind:"Deployment",metadata:{name:"floci"},spec:{replicas:1,selector:{matchLabels:{app:"floci"}},template:{metadata:{labels:{app:"floci","rhiza-ci-component":"floci"}},spec:{enableServiceLinks:false,automountServiceAccountToken:false,containers:[{name:"floci",image:"floci/floci:2.3.0",ports:[{containerPort:4566}],readinessProbe:{tcpSocket:{port:4566},periodSeconds:1}}]}}}}' | k -n "$namespace" create -f -
 k -n "$namespace" rollout status deployment/floci --timeout=120s
+k -n "$namespace" get pods -l app=floci -o json > "$logs/floci-sdk-ready.json"
+jq -e '.items|length==1 and all(.[]; .spec.enableServiceLinks==false and any(.status.conditions[]?; .type=="Ready" and .status=="True"))' "$logs/floci-sdk-ready.json" >/dev/null
 bucket="rhiza-managed-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT-$nonce"
 "$RHIZA_MANAGED_BUCKET_SETUP" "$kubeconfig" "kind-$cluster" "$namespace" "$bucket"
 admin=$(od -An -N32 -tx1 /dev/urandom | tr -d ' \n')
@@ -65,6 +92,13 @@ printf 'header = "Authorization: Bearer %s"\n' "$admin" > "$private/curl.conf"
 unset admin
 k -n "$namespace" create secret generic runtime --from-file="runtime.json=$private/runtime.json"
 k -n "$namespace" create serviceaccount operator
+k -n "$namespace" create serviceaccount rhiza-managed-host
+k -n "$namespace" create role runtime-read --verb=get --resource=rhizaclusters,pods,replicasets,deployments
+k -n "$namespace" create rolebinding runtime-read --role=runtime-read --serviceaccount="$namespace:rhiza-managed-host"
+k -n "$namespace" create role runtime-status --verb=get,update --resource=rhizaclusters/status --resource-name=sql
+k -n "$namespace" create rolebinding runtime-status --role=runtime-status --serviceaccount="$namespace:rhiza-managed-host"
+k -n "$namespace" create role managed-host-account-read --verb=get --resource=serviceaccounts --resource-name=rhiza-managed-host
+k -n "$namespace" create rolebinding managed-host-account-read --role=managed-host-account-read --serviceaccount="$namespace:operator"
 k -n "$namespace" create role bootstrap --verb=get,list --resource=rhizaclusters,pods,replicasets,deployments,secrets
 k -n "$namespace" create role create-deployment --verb=create --resource=deployments
 k -n "$namespace" create rolebinding bootstrap --role=bootstrap --serviceaccount="$namespace:operator"
@@ -80,9 +114,7 @@ until k -n "$namespace" get pods -l "$selector" -o json > "$logs/gated-pods.json
 done
 k -n "$namespace" create role status --verb=update --resource=rhizaclusters/status
 k -n "$namespace" create rolebinding status --role=status --serviceaccount="$namespace:operator"
-k -n "$namespace" create role runtime-read --verb=get --resource=rhizaclusters,pods,replicasets,deployments
-k -n "$namespace" create rolebinding runtime-read --role=runtime-read --serviceaccount="$namespace:default"
-k -n "$namespace" create rolebinding runtime-status --role=status --serviceaccount="$namespace:default"
+k -n "$namespace" get serviceaccounts,roles,rolebindings -o jsonpath='{range .items[*]}{.kind}{" "}{.metadata.name}{"\n"}{end}' > "$logs/public-rbac-names.txt"
 k -n "$namespace" wait --for=condition=Ready pod -l "$selector" --timeout=180s
 k -n "$namespace" get rhizacluster sql -o json > "$logs/committed.json"
 sh scripts/ha-managed-bucket-setup oracle-plan "$logs/gated-pods.json" "$logs/committed.json"

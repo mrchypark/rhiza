@@ -42,6 +42,15 @@ func TestV1Alpha2InitializerAPIServerContract(t *testing.T) {
 		}
 		return out
 	}
+	// Administrative fixture setup, never operator-created RBAC or credentials.
+	account := map[string]any{"apiVersion": "v1", "kind": "ServiceAccount", "metadata": map[string]any{"name": V1Alpha2ManagedHostServiceAccount, "namespace": ns}}
+	kubectl(string(mustManagedJSON(account)), "create", "-f", "-")
+	t.Cleanup(func() {
+		args := []string{"--kubeconfig", required("RHIZA_CONTRACT_KUBECONFIG"), "--context", required("RHIZA_CONTRACT_CONTEXT"), "--namespace", ns, "--request-timeout=10s", "delete", "serviceaccount", V1Alpha2ManagedHostServiceAccount, "--wait=false"}
+		if out, err := exec.Command("kubectl", args...).CombinedOutput(); err != nil {
+			t.Errorf("cleanup owned host ServiceAccount: %v %s", err, out)
+		}
+	})
 	cluster := fmt.Sprintf(`{"apiVersion":"rhiza.mrchypark.dev/v1alpha2","kind":"RhizaCluster","metadata":{"name":"initializer-contract","namespace":%q},"spec":{"logicalID":"initializer","genesisIntent":"Create","voterCount":3,"workload":{"podTemplate":{"spec":{"containers":[{"name":"app","image":"example.invalid/app"}]}}}}}`, ns)
 	var created struct {
 		Metadata struct {

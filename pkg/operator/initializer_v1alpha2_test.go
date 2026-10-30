@@ -19,14 +19,16 @@ import (
 // handles the real genesis status CAS and its resource-version checks.
 type phase9Server struct {
 	*phase8Server
-	mu9               sync.Mutex
-	posts             int
-	deployment        string
-	lostPost, failGet bool
-	arrived           chan struct{}
-	release           chan struct{}
-	committed         chan struct{}
-	onCreate          func()
+	mu9                  sync.Mutex
+	posts                int
+	deployment           string
+	lostPost, failGet    bool
+	arrived              chan struct{}
+	release              chan struct{}
+	committed            chan struct{}
+	onCreate             func()
+	serviceAccount       map[string]any
+	serviceAccountStatus int
 }
 
 func phase9RuntimeProfile() V1Alpha2RuntimeProfile {
@@ -113,6 +115,15 @@ func (s *phase9Server) roundTrip(r *http.Request) (*http.Response, error) {
 	respond := func(v any) (*http.Response, error) {
 		b, err := json.Marshal(v)
 		return phase2Response(200, string(b)), err
+	}
+	if strings.Contains(r.URL.Path, "/serviceaccounts/") {
+		if s.serviceAccountStatus != 0 {
+			return phase2Response(s.serviceAccountStatus, `{}`), nil
+		}
+		if s.serviceAccount != nil {
+			return respond(s.serviceAccount)
+		}
+		return respond(managedFixtureServiceAccount(phase2Ref))
 	}
 	if strings.Contains(r.URL.Path, "/secrets/") {
 		b, _ := json.Marshal(phase9RuntimeProfile())

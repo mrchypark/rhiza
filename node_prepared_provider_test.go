@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/sha256"
 	_ "embed"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"go/ast"
@@ -35,6 +36,47 @@ import (
 
 //go:embed pkg/node/startup_v1alpha2.go
 var preparedNodeSource string
+
+// This authority is seeded only after certified CREATE/INSERT history and its
+// retained receipt have been verified, never for an unused initialization.
+const preparedProviderAuthorityJSON = `{"apiVersion":"rhiza.mrchypark.dev/v1alpha2","kind":"RhizaCluster","metadata":{"name":"fixture","namespace":"ns","uid":"fixture-uid","resourceVersion":"1"},"spec":{"logicalID":"logical"},"status":{"authority":{"owner":{"namespace":"ns","name":"fixture","uid":"fixture-uid","logicalID":"logical"},"generation":2,"binding":{"deploymentUID":"fixture-deployment","storageID":"storage"},"pendingWrite":false,"everApplicationReserved":true,"evidence":{"host":"fixture"}}}}`
+
+func preparedProviderAuthorityHistoryError(body string) error {
+	var document struct {
+		Status struct {
+			Authority struct {
+				EverApplicationReserved *bool           `json:"everApplicationReserved"`
+				PendingWrite            *bool           `json:"pendingWrite"`
+				PendingRequest          json.RawMessage `json:"pendingRequest"`
+				Transition              json.RawMessage `json:"transition"`
+			} `json:"authority"`
+		} `json:"status"`
+	}
+	if err := json.Unmarshal([]byte(body), &document); err != nil {
+		return err
+	}
+	authority := document.Status.Authority
+	if authority.EverApplicationReserved == nil || !*authority.EverApplicationReserved {
+		return errors.New("certified SQL history requires explicit everApplicationReserved=true")
+	}
+	if authority.PendingWrite == nil || *authority.PendingWrite || len(authority.PendingRequest) != 0 || len(authority.Transition) != 0 {
+		return errors.New("finalized SQL fixture must have no pending write or transition")
+	}
+	return nil
+}
+
+func TestPreparedNodeProviderAuthorityHistory(t *testing.T) {
+	if err := preparedProviderAuthorityHistoryError(preparedProviderAuthorityJSON); err != nil {
+		t.Fatal(err)
+	}
+	pending := strings.Replace(preparedProviderAuthorityJSON, `"pendingWrite":false`, `"pendingWrite":false,"pendingRequest":{"requestID":"unexpected-pending"}`, 1)
+	if pending == preparedProviderAuthorityJSON {
+		t.Fatal("negative control did not inject pendingRequest")
+	}
+	if err := preparedProviderAuthorityHistoryError(pending); err == nil {
+		t.Fatal("history oracle accepted populated pendingRequest")
+	}
+}
 
 // This static guard covers only the prepared-stage source file; it is not an
 // SDK request trace and does not establish cloud-provider behavior.
@@ -354,7 +396,7 @@ func TestEmbeddedObjectStorageNodePreparedRestore(t *testing.T) {
 			return
 		}
 		w.Header().Set("Content-Type", "application/json")
-		_, _ = w.Write([]byte(`{"apiVersion":"rhiza.mrchypark.dev/v1alpha2","kind":"RhizaCluster","metadata":{"name":"fixture","namespace":"ns","uid":"fixture-uid","resourceVersion":"1"},"spec":{"logicalID":"logical"},"status":{"authority":{"owner":{"namespace":"ns","name":"fixture","uid":"fixture-uid","logicalID":"logical"},"generation":2,"binding":{"deploymentUID":"fixture-deployment","storageID":"storage"},"pendingWrite":false,"evidence":{"host":"fixture"}}}}`))
+		_, _ = w.Write([]byte(preparedProviderAuthorityJSON))
 	}))
 	t.Cleanup(server.Close)
 	tokenFile := filepath.Join(t.TempDir(), "token")

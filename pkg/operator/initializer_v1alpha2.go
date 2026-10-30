@@ -170,6 +170,16 @@ func ReconcileV1Alpha2ManagedInitialization(ctx context.Context, kube *Kubernete
 	if err != nil || secret.Metadata.Name != profile.ProfileSecretName || secret.Metadata.Namespace != ref.Namespace || secret.Metadata.UID == "" || secret.Metadata.DeletionTimestamp != nil || !reflect.DeepEqual(secretProfile, profile) {
 		return V1Alpha2StatusSnapshot{}, fmt.Errorf("managed profile Secret differs from installed profile")
 	}
+	var account struct {
+		APIVersion, Kind string
+		Metadata         v1alpha2BootstrapMetadata
+	}
+	if err := kube.Get(ctx, "/api/v1/namespaces/"+ref.Namespace+"/serviceaccounts/"+V1Alpha2ManagedHostServiceAccount, &account); err != nil {
+		return V1Alpha2StatusSnapshot{}, fmt.Errorf("managed host ServiceAccount unavailable")
+	}
+	if account.APIVersion != "v1" || account.Kind != "ServiceAccount" || account.Metadata.Name != V1Alpha2ManagedHostServiceAccount || account.Metadata.Namespace != ref.Namespace || account.Metadata.UID == "" || account.Metadata.DeletionTimestamp != nil {
+		return V1Alpha2StatusSnapshot{}, fmt.Errorf("invalid managed host ServiceAccount")
+	}
 	name, err := V1Alpha2GenesisDeploymentName(ref.UID)
 	if err != nil {
 		return V1Alpha2StatusSnapshot{}, err
@@ -266,6 +276,7 @@ func managedCandidateSpecMatches(raw, expected json.RawMessage) bool {
 		return false
 	}
 	strip(pod, map[string]string{"restartPolicy": `"Always"`, "dnsPolicy": `"ClusterFirst"`, "schedulerName": `"default-scheduler"`, "terminationGracePeriodSeconds": "30"})
+	strip(pod, map[string]string{"serviceAccount": `"rhiza-managed-host"`})
 	for _, key := range []string{"containers", "initContainers"} {
 		var containers []map[string]json.RawMessage
 		if json.Unmarshal(pod[key], &containers) != nil {

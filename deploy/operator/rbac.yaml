@@ -17,6 +17,10 @@ rules:
     resources: [secrets]
     verbs: [get, create, delete]
   - apiGroups: [""]
+    resources: [serviceaccounts]
+    resourceNames: [rhiza-managed-host]
+    verbs: [get]
+  - apiGroups: [""]
     resources: [configmaps]
     verbs: [get]
   - apiGroups: [""]
@@ -60,3 +64,46 @@ roleRef:
   apiGroup: rbac.authorization.k8s.io
   kind: Role
   name: rhiza-operator
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: rhiza-managed-host
+  namespace: rhiza
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: rhiza-managed-host
+  namespace: rhiza
+rules:
+  # This host is NOT read-only: E0 commit and reserve/finalize PUT CR status.
+  # This default trusts managed hosts within this namespace. Installers should
+  # add resourceNames: [<installed-cluster-name>] to BOTH CR rules below when
+  # cluster names are known; do not grant main-resource updates or other writes.
+  - apiGroups: [rhiza.mrchypark.dev]
+    resources: [rhizaclusters]
+    verbs: [get]
+  - apiGroups: [rhiza.mrchypark.dev]
+    resources: [rhizaclusters/status]
+    verbs: [get, update]
+  - apiGroups: [""]
+    resources: [pods]
+    verbs: [get]
+  - apiGroups: [apps]
+    resources: [replicasets, deployments]
+    verbs: [get]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: rhiza-managed-host
+  namespace: rhiza
+subjects:
+  - kind: ServiceAccount
+    name: rhiza-managed-host
+    namespace: rhiza
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: rhiza-managed-host
