@@ -145,6 +145,9 @@ func (e *FencingExecutor) drSuccessorAssignment(ctx context.Context, stsUID, roo
 	if !ok || assignment.Validate() != nil || assignment.Purpose != fencing.BootstrapDRSuccessor || assignment.OperationID != operationID || assignment.RootUID != rootUID || assignment.StatefulSetUID != stsUID || assignment.SourceClusterID != id.SourceClusterID || assignment.PodName != fencing.PodNameForIdentity(id) || assignment.PodUID != id.PodUID || assignment.NodeID != id.NodeID || assignment.LedgerUID != ledgerUID || assignment.RequestHash != operation.RequestHash || assignment.AuthorizationHash != operation.AuthorizationHash || fencing.BootstrapDRAuthorizationHash(assignment) != operation.AuthorizationHash {
 		return fencing.BootstrapAssignment{}, state, ledgerUID, fencing.ErrPending
 	}
+	if err := e.verifyDRSuccessorChildPin(ctx, rootUID, stsUID, id.SourceClusterID, assignment, ledgerUID); err != nil {
+		return fencing.BootstrapAssignment{}, state, ledgerUID, err
+	}
 	request, receipt := assignment.DRApproval.Request, assignment.DRApproval.Receipt
 	if request.TargetClusterID != id.SourceClusterID || receipt.Target.ClusterID != id.SourceClusterID {
 		return fencing.BootstrapAssignment{}, state, ledgerUID, fencing.ErrPending

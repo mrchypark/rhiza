@@ -20,7 +20,6 @@ import (
 	"github.com/mrchypark/rhiza/pkg/qlog"
 	"github.com/mrchypark/rhiza/pkg/quepaxa"
 	"github.com/mrchypark/rhiza/pkg/recovery"
-	"github.com/mrchypark/rhiza/pkg/recoveryanchor"
 	"github.com/thanos-io/objstore"
 )
 
@@ -234,42 +233,14 @@ func (e *FencingExecutor) verifyMembershipRepairBarrier(ctx context.Context, bin
 
 func (e *FencingExecutor) membershipRepairEvidenceOptions(ctx context.Context, binding peerClosureBinding, source string, initial []quepaxa.Member) (recovery.EvidenceOptions, bool, error) {
 	var options recovery.EvidenceOptions
-	state, ledgerUID, _, err := e.readWithUID(ctx, binding.workloadUID, source)
-	if err != nil || ledgerUID == "" || state.Ledger.Bootstrap == nil || state.Ledger.Bootstrap.RootUID != binding.rootUID || state.Ledger.Bootstrap.StatefulSetUID != binding.workloadUID {
-		return options, false, fencing.ErrPending
+	active, err := e.resolveActiveGenerationBinding(ctx, binding, source)
+	if err != nil {
+		return options, false, err
 	}
-	durability := binding.environment["RHIZA_OBJSTORE_DURABILITY"]
-	if durability == "" {
-		durability = "async"
-	}
-	var approved *recoveryanchor.Request
-	var approvedReceipt *recoveryanchor.Receipt
-	for operationID, operation := range state.Ledger.Bootstrap.Operations {
-		if operation.Purpose != fencing.BootstrapDRSuccessor || operation.OperationID != operationID || operation.RootUID != binding.rootUID || operation.StatefulSetUID != binding.workloadUID || operation.SourceClusterID != source {
-			continue
-		}
-		for podUID, assignment := range operation.Assignments {
-			request, receipt := assignment.DRApproval.Request, assignment.DRApproval.Receipt
-			if assignment.Validate() != nil || assignment.Purpose != fencing.BootstrapDRSuccessor || assignment.OperationID != operationID || assignment.PodUID != podUID || assignment.RootUID != binding.rootUID || assignment.StatefulSetUID != binding.workloadUID || assignment.SourceClusterID != source || assignment.AuthorizationHash != operation.AuthorizationHash || fencing.BootstrapDRAuthorizationHash(assignment) != operation.AuthorizationHash || request.TargetClusterID != source || request.StatefulSetUID != binding.workloadUID || path.Clean(request.TargetPrefix) != path.Join(e.Prefix, source) || receipt.Target.ClusterID != source {
-				return options, false, fencing.ErrPending
-			}
-			if approved != nil && (*approved != request || *approvedReceipt != receipt) {
-				return options, false, fmt.Errorf("membership-repair source has ambiguous retained DR approvals")
-			}
-			copyRequest, copyReceipt := request, receipt
-			approved, approvedReceipt = &copyRequest, &copyReceipt
-		}
-	}
-	if approved == nil {
+	if active.Origin != "dr" || active.DRApproval == nil {
 		return options, false, nil
 	}
-	wantBinding, bindingErr := expectedAnchorBinding(e.AnchorBindingConfig, e.AnchorStorageID, source)
-	if e.Anchor == nil || bindingErr != nil || approvedReceipt.Target != wantBinding {
-		return options, false, fmt.Errorf("membership-repair source DR storage binding is unavailable")
-	}
-	if err := e.Anchor.VerifyAdmission(ctx, *approved, *approvedReceipt, wantBinding, approvedReceipt.Generation); err != nil {
-		return options, false, fmt.Errorf("membership-repair source DR admission is no longer current: %w", err)
-	}
+	approved := active.DRApproval.Request
 	anchorHash, err := hex.DecodeString(approved.TargetAnchorHash)
 	if err != nil || len(anchorHash) != len(options.ExpectedAnchorHash) {
 		return options, false, fmt.Errorf("retained DR target anchor hash is invalid")
@@ -279,6 +250,7 @@ func (e *FencingExecutor) membershipRepairEvidenceOptions(ctx context.Context, b
 	options.ExpectedForkResult = approved.Fork
 	options.ExpectedSourcePrefix = approved.SourcePrefix
 	options.ExpectedOperationID = approved.OperationID
+	durability := active.Durability
 	if recovery.NewMembershipRecord(source, initial, durability) != options.ExpectedMembership {
 		return recovery.EvidenceOptions{}, false, fmt.Errorf("configured membership differs from retained DR target membership")
 	}
@@ -375,7 +347,7 @@ func (e *FencingExecutor) reserveMembershipRepair(ctx context.Context, caller fe
 	if err != nil {
 		return fencing.MembershipRepairReserveResult{}, err
 	}
-	pin, err := e.initBootstrapPin(ctx, binding, caller.SourceClusterID)
+	pin, err := e.resolveActiveGenerationBinding(ctx, binding, caller.SourceClusterID)
 	if err != nil {
 		return fencing.MembershipRepairReserveResult{}, err
 	}
@@ -383,7 +355,7 @@ func (e *FencingExecutor) reserveMembershipRepair(ctx context.Context, caller fe
 	if durability == "" {
 		durability = "async"
 	}
-	storeHash := fencing.BootstrapStoreIdentityHash(StoreIdentity(binding.environment))
+	storeHash := pin.StoreIdentityHash
 	expectedAbort := quepaxa.Slot(*request.ExpectedAbortSlot)
 	authorization := fencing.MembershipRepairAuthorization{
 		RootUID: binding.rootUID, StatefulSetUID: workloadUID, LedgerUID: pin.LedgerUID,
@@ -414,6 +386,10 @@ func (e *FencingExecutor) reserveMembershipRepair(ctx context.Context, caller fe
 	}
 	latestTarget, err := retainedRepairTarget(latest.Ledger, request.TargetNodeID, request.TargetWALIdentity, fencing.PodNameForIdentity(caller))
 	if err != nil || latestTarget != old {
+		return fencing.MembershipRepairReserveResult{}, fencing.ErrPending
+	}
+	latestGeneration, err := e.resolveActiveGenerationBinding(ctx, currentBinding, caller.SourceClusterID)
+	if err != nil || !sameActiveGenerationBinding(pin, latestGeneration) {
 		return fencing.MembershipRepairReserveResult{}, fencing.ErrPending
 	}
 	_, err = e.changeExisting(ctx, workloadUID, caller.SourceClusterID, latestUID, func(ledger *fencing.Ledger) error {
@@ -666,8 +642,8 @@ func (e *FencingExecutor) refreshCompletedRepairProjection(ctx context.Context, 
 	if err != nil {
 		return false, err
 	}
-	pin, err := e.controller().readBootstrapLedgerPin(ctx, &binding.root)
-	if err != nil || pin.StatefulSetUID != binding.workloadUID || pin.SourceClusterID != source || pin.LedgerUID != ledgerUID {
+	active, err := e.resolveActiveGenerationBinding(ctx, binding, source)
+	if err != nil || active.StatefulSetUID != binding.workloadUID || active.ClusterID != source || active.LedgerUID != ledgerUID {
 		return false, fencing.ErrPending
 	}
 	records := make([]fencing.MembershipRepairRecord, 0, 1+len(ledgerState.Ledger.MembershipRepairHistory))
@@ -735,6 +711,10 @@ func (e *FencingExecutor) refreshCompletedRepairProjection(ctx context.Context, 
 	control.Voters[idx] = VoterPod{NodeID: newID, Pod: podName}
 	control.Identities[newID] = target
 	controller := e.controller()
+	latestActive, err := e.resolveActiveGenerationBinding(ctx, binding, source)
+	if err != nil || latestActive.LedgerUID != active.LedgerUID || latestActive.AuthorizationHash != active.AuthorizationHash || latestActive.RecoveryUID != active.RecoveryUID || latestActive.RecoverySpecHash != active.RecoverySpecHash {
+		return false, fencing.ErrPending
+	}
 	if err := controller.saveAuto(ctx, &binding.root, control, version); err != nil {
 		return false, err
 	}
@@ -1715,10 +1695,13 @@ func (e *FencingExecutor) verifyMembershipRepairArchive(ctx context.Context, bin
 	if err != nil {
 		return err
 	}
-	if ledgerUID != authorization.LedgerUID || state.Ledger.MembershipRepair == nil ||
+	active, activeErr := e.resolveActiveGenerationBinding(ctx, binding, authorization.SourceClusterID)
+	if activeErr != nil || ledgerUID != active.LedgerUID || authorization.LedgerUID != active.LedgerUID ||
+		authorization.BootstrapMembershipHash != active.MembershipHash || authorization.ProfileHash != active.ProfileHash || authorization.StoreIdentityHash != active.StoreIdentityHash || authorization.Durability != active.Durability ||
+		state.Ledger.MembershipRepair == nil ||
 		!reflect.DeepEqual(state.Ledger.MembershipRepair.Authorization, authorization) ||
 		!reflect.DeepEqual(state.Ledger.MembershipRepair.Progress, view.Progress) ||
-		authorization.RootUID != binding.rootUID || authorization.StatefulSetUID != binding.workloadUID || authorization.SourceClusterID != binding.root.Spec.AdoptClusterID || state.Ledger.SourceClusterID != authorization.SourceClusterID {
+		authorization.RootUID != binding.rootUID || authorization.StatefulSetUID != binding.workloadUID || state.Ledger.SourceClusterID != authorization.SourceClusterID {
 		return fmt.Errorf("fencing: membership-repair immutable binding changed")
 	}
 	current, pending, abortSlot, err := e.membershipRepairArchiveState(ctx, binding, authorization)

@@ -94,6 +94,16 @@ type Status struct {
 	// fields expose anchor evidence; no application-sensitive data.
 	AnchorRequest *recoveryanchor.Request `json:"anchorRequest,omitempty"`
 	AnchorReceipt *recoveryanchor.Receipt `json:"anchorReceipt,omitempty"`
+	// DRSuccessorPin independently binds this exact child UID to the target
+	// fencing-ledger incarnation and its immutable bootstrap authorization.
+	DRSuccessorPin *DRSuccessorPin `json:"drSuccessorPin,omitempty"`
+}
+
+// DRSuccessorPin is written once before any successor Pod assignment or
+// scale-up. The containing recovery child's UID scopes this value.
+type DRSuccessorPin struct {
+	LedgerUID         string `json:"ledgerUID"`
+	AuthorizationHash string `json:"authorizationHash"`
 }
 
 // MembershipStatus is the CR's durable side-effect journal. The remove request

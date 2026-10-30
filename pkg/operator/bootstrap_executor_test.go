@@ -1,6 +1,7 @@
 package operator
 
 import (
+	"bytes"
 	"context"
 	"encoding/base64"
 	"encoding/json"
@@ -14,6 +15,7 @@ import (
 	"github.com/mrchypark/rhiza/pkg/quepaxa"
 	"github.com/mrchypark/rhiza/pkg/recovery"
 	"github.com/mrchypark/rhiza/pkg/recoveryanchor"
+	"github.com/thanos-io/objstore"
 )
 
 type drAdmissionTestBackend struct {
@@ -134,7 +136,7 @@ func TestDRSuccessorAssignmentUsesFreshTLSAnchorAdmissionAndConfiguredStorage(t 
 	coordinator := &recoveryanchor.Coordinator{Backend: backend, EvidenceFormat: "test/v1", Verifier: func(_ context.Context, _ recoveryanchor.Request, record recoveryanchor.Record) (recoveryanchor.Binding, []byte, error) {
 		return targetBinding, append([]byte(nil), record.Evidence...), nil
 	}}
-	request := recoveryanchor.Request{AnchorID: "ha", OperationID: "recover-1", StatefulSetUID: "sts-uid", SourceClusterID: "source", TargetClusterID: "target", SourcePrefix: "root/source", TargetPrefix: "root/target", SourceMembership: "source-membership", FenceHash: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", TargetAnchorHash: "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb", Fork: recovery.ForkResult{Tip: 3, ManifestHash: "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc", PrefixHash: "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"}, TargetMembership: targetMembership}
+	request := recoveryanchor.Request{AnchorID: "ha", OperationID: "recovery-child-uid:recover-1", StatefulSetUID: "sts-uid", SourceClusterID: "source", TargetClusterID: "target", SourcePrefix: "root/source", TargetPrefix: "root/target", SourceMembership: "source-membership", FenceHash: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", TargetAnchorHash: "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb", Fork: recovery.ForkResult{Tip: 3, ManifestHash: "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc", PrefixHash: "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"}, TargetMembership: targetMembership}
 	receipt, err := coordinator.Activate(ctx, request)
 	if err != nil {
 		t.Fatal(err)
@@ -147,13 +149,33 @@ func TestDRSuccessorAssignmentUsesFreshTLSAnchorAdmissionAndConfiguredStorage(t 
 	}
 	anchorClient := &recoveryanchor.Client{URL: server.URL, TokenFile: tokenPath, Client: server.Client()}
 
-	operationID := "dr-successor-operation"
 	rootUID, stsUID, ledgerUID := "root-uid", "sts-uid", "ledger-uid"
+	operationID := drSuccessorOperationID(request.OperationID, stsUID, "target")
 	credentialName, credentialUID := "target-credentials", "secret-uid"
-	membershipHash := hashJSON(ms)
-	assignment := fencing.BootstrapAssignment{OperationID: operationID, RequestHash: "bootstrap-request-hash", Purpose: fencing.BootstrapDRSuccessor, RootUID: rootUID, StatefulSetUID: stsUID, SourceClusterID: "target", PodName: "n1", PodUID: "pod-uid-1", NodeID: "n1", CredentialName: credentialName, CredentialUID: credentialUID, MembershipHash: membershipHash, ProfileHash: "profile-hash", StoreIdentityHash: fencing.BootstrapStoreIdentityHash(storeIdentity()), LedgerUID: ledgerUID, Durability: "before-ack", DRApproval: fencing.BootstrapDRApproval{Request: request, Receipt: receipt}}
+	membershipHash := fencing.BootstrapMembersHash(ms)
+	profileSTS := object{"spec": object{"template": object{"spec": object{"containers": []any{object{"image": "rhiza:test"}}, "initContainers": []any{object{"name": prepareInitContainerName, "image": "rhiza:init"}}, "volumes": []any{}}}}}
+	profileHash := prepareProfileHash(profileSTS)
+	bootstrapRequestHash := hashJSON(struct {
+		OperationID, RecoveryUID, StatefulSetUID, TargetClusterID  string
+		CredentialName, CredentialUID, MembershipHash, ProfileHash string
+	}{operationID, "recovery-child-uid", stsUID, "target", credentialName, credentialUID, membershipHash, profileHash})
+	assignment := fencing.BootstrapAssignment{OperationID: operationID, RequestHash: bootstrapRequestHash, Purpose: fencing.BootstrapDRSuccessor, RootUID: rootUID, StatefulSetUID: stsUID, SourceClusterID: "target", PodName: "n1", PodUID: "pod-uid-1", NodeID: "n1", CredentialName: credentialName, CredentialUID: credentialUID, MembershipHash: membershipHash, ProfileHash: profileHash, StoreIdentityHash: fencing.BootstrapStoreIdentityHash(StoreIdentity(storeIdentity())), LedgerUID: ledgerUID, Durability: "before-ack", DRApproval: fencing.BootstrapDRApproval{Request: request, Receipt: receipt}}
 	assignment.AuthorizationHash = fencing.BootstrapDRAuthorizationHash(assignment)
 	operation := fencing.BootstrapOperation{OperationID: operationID, RequestHash: assignment.RequestHash, AuthorizationHash: assignment.AuthorizationHash, Purpose: fencing.BootstrapDRSuccessor, RootUID: rootUID, StatefulSetUID: stsUID, SourceClusterID: "target", Assignments: map[string]fencing.BootstrapAssignment{assignment.PodUID: assignment}, Attempts: map[string]fencing.InitAttempt{}}
+	childName, childUID := "recovery-child", "recovery-child-uid"
+	child := Resource{Metadata: object{"name": childName, "uid": childUID, "annotations": object{automaticOwner: rootUID, automaticLogical: "logical"}}, Spec: Spec{RecoveryID: "recover-1", SourceClusterID: "source", AnchorID: "ha", Durability: "before-ack"}, Status: Status{Stage: "Complete", Source: "source", Target: "target", StatefulSetUID: stsUID, SpecHash: immutableSpecHash(Spec{RecoveryID: "recover-1", SourceClusterID: "source", AnchorID: "ha", Durability: "before-ack"}), RecoveryID: "recover-1", SecretName: credentialName, AnchorRequest: &request, AnchorReceipt: &receipt, DRSuccessorPin: &DRSuccessorPin{LedgerUID: ledgerUID, AuthorizationHash: assignment.AuthorizationHash}}}
+	childSpecHash := hashJSON(child.Spec)
+	root := &ClusterResource{Metadata: object{"name": "root", "uid": rootUID}, Spec: ClusterSpec{LogicalID: "logical", StatefulSet: "rhiza", AdoptClusterID: "source", Automatic: true}}
+	root.Status.ActiveClusterID = "target"
+	bucket := objstore.NewInMemBucket()
+	control := autoControl{Version: 1, BindingUID: rootUID, StatefulSetUID: stsUID, ActiveClusterID: "target", Identities: map[quepaxa.NodeID]FenceTarget{}, Completed: &autoCompletion{RecoveryName: childName, RecoveryUID: childUID, SpecHash: childSpecHash, ClusterID: "target"}}
+	controlBytes, err := json.Marshal(control)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := bucket.Upload(ctx, (&Controller{Prefix: "root", Kube: &Kubernetes{Namespace: "default"}}).autoKey(root), bytes.NewReader(controlBytes)); err != nil {
+		t.Fatal(err)
+	}
 	ledger := fencing.Ledger{SourceClusterID: "target", Bootstrap: &fencing.BootstrapHistory{RootUID: rootUID, StatefulSetUID: stsUID, Operations: map[string]fencing.BootstrapOperation{operationID: operation}}}
 	ledgerBytes, err := json.Marshal(fenceLedger{StatefulSetUID: stsUID, Ledger: ledger})
 	if err != nil {
@@ -210,9 +232,12 @@ func TestDRSuccessorAssignmentUsesFreshTLSAnchorAdmissionAndConfiguredStorage(t 
 		case "/api/v1/namespaces/default/nodes/worker-1":
 			_ = json.NewEncoder(w).Encode(object{"metadata": object{"name": "worker-1", "uid": "node-uid-1"}})
 		case "/apis/apps/v1/namespaces/default/statefulsets/rhiza":
-			_ = json.NewEncoder(w).Encode(object{"metadata": object{"name": "rhiza", "uid": stsUID}, "spec": object{"template": object{"spec": object{"serviceAccountName": "default"}}}})
+			profileSTS["metadata"] = object{"name": "rhiza", "uid": stsUID}
+			_ = json.NewEncoder(w).Encode(profileSTS)
 		case "/apis/rhiza.mrchypark.dev/v1alpha1/namespaces/default/rhizaclusters":
-			_ = json.NewEncoder(w).Encode(object{"items": []any{object{"metadata": object{"uid": rootUID}, "spec": object{"statefulSet": "rhiza", "automatic": true}}}})
+			_ = json.NewEncoder(w).Encode(object{"items": []any{object{"metadata": object{"name": "root", "uid": rootUID}, "spec": object{"logicalID": "logical", "statefulSet": "rhiza", "adoptClusterID": "source", "automatic": true}}}})
+		case "/apis/rhiza.mrchypark.dev/v1alpha1/namespaces/default/rhizarecoveries/" + childName:
+			_ = json.NewEncoder(w).Encode(child)
 		default:
 			http.NotFound(w, r)
 		}
@@ -222,7 +247,7 @@ func TestDRSuccessorAssignmentUsesFreshTLSAnchorAdmissionAndConfiguredStorage(t 
 	if err := os.WriteFile(kubeToken, []byte("kube-token"), 0600); err != nil {
 		t.Fatal(err)
 	}
-	e := &FencingExecutor{Kube: &Kubernetes{BaseURL: kubeAPI.URL, Namespace: "default", TokenFile: kubeToken, Client: kubeAPI.Client()}, Anchor: anchorClient, AnchorBindingConfig: &bindingConfig}
+	e := &FencingExecutor{Kube: &Kubernetes{BaseURL: kubeAPI.URL, Namespace: "default", TokenFile: kubeToken, Client: kubeAPI.Client()}, Bucket: bucket, Prefix: "root", StoreIdentity: StoreIdentity(storeIdentity()), Anchor: anchorClient, AnchorBindingConfig: &bindingConfig}
 	authority := httptest.NewTLSServer(e.Handler())
 	defer authority.Close()
 	client := &fencing.AuthorityClient{URL: authority.URL + "/v1/supervisor", TokenFile: kubeToken, Client: authority.Client()}
@@ -245,21 +270,33 @@ func TestDRSuccessorAssignmentUsesFreshTLSAnchorAdmissionAndConfiguredStorage(t 
 		t.Fatalf("assignment/ledger = %+v/%q, want %+v/%q", got, gotLedgerUID, assignment, ledgerUID)
 	}
 	e.Prefix = "root"
+	environment := storeIdentity()
+	environment["RHIZA_CLUSTER_MEMBERS"], environment["RHIZA_OBJSTORE_DURABILITY"] = string(secretBytes), "before-ack"
+	testBinding := peerClosureBinding{root: *root, rootUID: rootUID, workloadUID: stsUID, environment: environment}
+	if _, err := e.resolveActiveGenerationBinding(ctx, testBinding, "target"); err != nil {
+		t.Fatalf("active DR generation binding failed: %v", err)
+	}
+	retainedPin := *child.Status.DRSuccessorPin
+	child.Status.DRSuccessorPin = &DRSuccessorPin{LedgerUID: "copied-ledger-uid", AuthorizationHash: retainedPin.AuthorizationHash}
+	if _, err := e.resolveActiveGenerationBinding(ctx, testBinding, "target"); err == nil {
+		t.Fatal("active DR generation accepted a child pin copied from another ledger incarnation")
+	}
+	child.Status.DRSuccessorPin = &DRSuccessorPin{LedgerUID: retainedPin.LedgerUID, AuthorizationHash: "changed-authorization"}
+	if _, err := e.resolveActiveGenerationBinding(ctx, testBinding, "target"); err == nil {
+		t.Fatal("active DR generation accepted a changed child authorization pin")
+	}
+	child.Status.DRSuccessorPin = &retainedPin
 	initialMembers := make([]quepaxa.Member, len(ms))
 	for i := range ms {
 		initialMembers[i] = ms[i]
 	}
-	options, anchored, err := e.membershipRepairEvidenceOptions(ctx, peerClosureBinding{rootUID: rootUID, workloadUID: stsUID, environment: map[string]string{
-		"RHIZA_CLUSTER_MEMBERS": string(secretBytes), "RHIZA_OBJSTORE_DURABILITY": "before-ack",
-	}}, "target", initialMembers)
+	options, anchored, err := e.membershipRepairEvidenceOptions(ctx, testBinding, "target", initialMembers)
 	if err != nil || !anchored || options.ExpectedAnchorHash == ([32]byte{}) || options.ExpectedMembership != request.TargetMembership || options.ExpectedForkResult != request.Fork || options.ExpectedSourcePrefix != request.SourcePrefix || options.ExpectedOperationID != request.OperationID {
 		t.Fatalf("retained DR approval did not resolve anchored-source evidence options: options=%+v anchored=%t err=%v", options, anchored, err)
 	}
 	wrongInitial := append([]quepaxa.Member(nil), initialMembers...)
 	wrongInitial[0].PublicKey[0] ^= 1
-	if _, _, err := e.membershipRepairEvidenceOptions(ctx, peerClosureBinding{rootUID: rootUID, workloadUID: stsUID, environment: map[string]string{
-		"RHIZA_CLUSTER_MEMBERS": string(secretBytes), "RHIZA_OBJSTORE_DURABILITY": "before-ack",
-	}}, "target", wrongInitial); err == nil {
+	if _, _, err := e.membershipRepairEvidenceOptions(ctx, testBinding, "target", wrongInitial); err == nil {
 		t.Fatal("anchored source accepted configured membership that differs from retained DR target")
 	}
 	attempt, err := e.beginInit(ctx, "", "n1", id, fencing.BeginInitRequest{Assignment: assignment, AttemptID: "attempt-1"})

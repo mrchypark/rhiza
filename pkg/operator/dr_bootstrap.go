@@ -62,19 +62,38 @@ func (c *Controller) prepareDRSuccessor(ctx context.Context, r *Resource, sts ob
 	base.AuthorizationHash = fencing.BootstrapDRAuthorizationHash(base)
 	op := fencing.BootstrapOperation{OperationID: operationID, RequestHash: requestHash, AuthorizationHash: base.AuthorizationHash, Purpose: fencing.BootstrapDRSuccessor, RootUID: rootUID, StatefulSetUID: r.Status.StatefulSetUID, SourceClusterID: r.Status.Target}
 	executor := &FencingExecutor{Kube: c.Kube, Bucket: c.Bucket, Prefix: c.Prefix}
-	_, err := executor.change(ctx, r.Status.StatefulSetUID, r.Status.Target, func(l *fencing.Ledger) error {
-		return l.InstallBootstrapOperation(op)
-	})
-	if err != nil {
-		return "", fmt.Errorf("retain DR successor operation: %w", err)
+	var state fenceLedger
+	var ledgerUID string
+	var err error
+	if r.Status.DRSuccessorPin != nil {
+		state, ledgerUID, _, err = executor.readWithUID(ctx, r.Status.StatefulSetUID, r.Status.Target)
+	} else {
+		if assignPods || r.Status.Stage != "Starting" || number(nested(sts, "spec", "replicas")) != 0 {
+			return "", fmt.Errorf("DR successor ledger pin is missing outside pre-scale preparation")
+		}
+		_, err = executor.change(ctx, r.Status.StatefulSetUID, r.Status.Target, func(l *fencing.Ledger) error {
+			return l.InstallBootstrapOperation(op)
+		})
+		if err == nil {
+			state, ledgerUID, _, err = executor.readWithUID(ctx, r.Status.StatefulSetUID, r.Status.Target)
+		}
 	}
-	state, ledgerUID, _, err := executor.readWithUID(ctx, r.Status.StatefulSetUID, r.Status.Target)
 	if err != nil || ledgerUID == "" || state.Ledger.Bootstrap == nil {
 		return "", fmt.Errorf("DR successor ledger identity is unavailable")
 	}
 	operation, ok := state.Ledger.Bootstrap.Operations[operationID]
 	if !ok || operation.OperationID != op.OperationID || operation.RequestHash != op.RequestHash || operation.AuthorizationHash != op.AuthorizationHash || operation.Purpose != op.Purpose || operation.RootUID != op.RootUID || operation.StatefulSetUID != op.StatefulSetUID || operation.SourceClusterID != op.SourceClusterID {
 		return "", fmt.Errorf("retained DR successor operation differs")
+	}
+	if r.Status.DRSuccessorPin == nil {
+		if !emptyDRSuccessorReservation(state.Ledger, operation) {
+			return "", fmt.Errorf("unpinned DR successor ledger already contains admission or runtime history")
+		}
+		if err := c.retainDRSuccessorPin(ctx, r, ledgerUID, operation.AuthorizationHash); err != nil {
+			return "", err
+		}
+	} else if r.Status.DRSuccessorPin.LedgerUID != ledgerUID || r.Status.DRSuccessorPin.AuthorizationHash != operation.AuthorizationHash {
+		return "", fmt.Errorf("DR successor ledger differs from its retained child pin")
 	}
 	if !assignPods {
 		return operationID, nil
@@ -114,4 +133,19 @@ func (c *Controller) prepareDRSuccessor(ctx context.Context, r *Resource, sts ob
 		}
 	}
 	return operationID, nil
+}
+
+func emptyDRSuccessorReservation(ledger fencing.Ledger, operation fencing.BootstrapOperation) bool {
+	if ledger.SourceClusterID != operation.SourceClusterID || ledger.ClosedBy != "" || len(ledger.ClosedNodes) != 0 ||
+		len(ledger.Runs) != 0 || ledger.PeerClosure != nil || ledger.MembershipRepair != nil || len(ledger.MembershipRepairHistory) != 0 ||
+		ledger.Bootstrap == nil || ledger.Bootstrap.RootUID != operation.RootUID || ledger.Bootstrap.StatefulSetUID != operation.StatefulSetUID ||
+		len(ledger.Bootstrap.Operations) != 1 {
+		return false
+	}
+	retained, ok := ledger.Bootstrap.Operations[operation.OperationID]
+	return ok && retained.OperationID == operation.OperationID && retained.RequestHash == operation.RequestHash &&
+		retained.AuthorizationHash == operation.AuthorizationHash && retained.Purpose == operation.Purpose &&
+		retained.RootUID == operation.RootUID && retained.StatefulSetUID == operation.StatefulSetUID &&
+		retained.SourceClusterID == operation.SourceClusterID && len(retained.Assignments) == 0 &&
+		len(retained.Attempts) == 0 && !retained.AdmissionClosed && !retained.Complete
 }

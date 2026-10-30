@@ -196,7 +196,12 @@ func (c *Controller) advanceAutomatic(ctx context.Context, r *ClusterResource, s
 		}
 	}
 	state.Completions = recent
-	state.Completed = &autoCompletion{RecoveryName: intent.RecoveryName, RecoveryUID: intent.RecoveryUID, SpecHash: intent.SpecHash, FenceProofID: intent.Proof.ProofID, FenceRequestHash: intent.Proof.RequestHash, ClusterID: state.ActiveClusterID, Voters: append([]VoterPod(nil), state.Voters...), At: now}
+	// Keep the installed-generation completion as the immutable active-generation
+	// origin across ordinary online membership operations. Seed the record when
+	// older control state has none; a later full-generation install replaces it.
+	if intent.Failed == "" || state.Completed == nil {
+		state.Completed = &autoCompletion{RecoveryName: intent.RecoveryName, RecoveryUID: intent.RecoveryUID, SpecHash: intent.SpecHash, FenceProofID: intent.Proof.ProofID, FenceRequestHash: intent.Proof.RequestHash, ClusterID: state.ActiveClusterID, Voters: append([]VoterPod(nil), state.Voters...), At: now}
+	}
 	state.SuspectedSince = time.Time{}
 	state.Intent = nil
 	if err := c.saveAuto(ctx, r, state, version); err != nil {
