@@ -79,6 +79,7 @@ type Node struct {
 	preparedStartup           *PreparedStartupConfig
 	managedStartup            *ManagedStartupConfig
 	managedAdmitted           atomic.Bool
+	managedInitiallyAdmitted  atomic.Bool
 }
 
 // nodeRecoveryPhases records the selected certified checkpoint restore path.

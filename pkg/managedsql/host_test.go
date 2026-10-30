@@ -342,8 +342,11 @@ func readySQL(t *testing.T, h *Host) {
 	defer cancel()
 	var last error
 	for {
-		if last = h.Ready(ctx); last == nil {
-			return
+		// These write-oriented fixtures need quorum, unlike Service readiness.
+		if last = h.node.AdmitManaged(ctx); last == nil {
+			if last = h.Ready(ctx); last == nil {
+				return
+			}
 		}
 		select {
 		case <-ctx.Done():
@@ -377,8 +380,13 @@ func TestManagedSQLRealThreeNodeInitializationAndWrite(t *testing.T) {
 		}
 		if i == 0 {
 			ctx, cancel := context.WithTimeout(context.Background(), 75*time.Millisecond)
-			if h.Ready(ctx) == nil {
-				t.Fatal("single voter admitted without quorum")
+			if err := h.Ready(ctx); err == nil {
+				t.Fatal("never-admitted single voter became application ready")
+			}
+			cancel()
+			ctx, cancel = context.WithTimeout(context.Background(), 75*time.Millisecond)
+			if _, err := h.Query(ctx, QueryRequest{SQL: "SELECT 1", Consistency: "local"}); err == nil {
+				t.Fatal("local query bypassed initial quorum admission")
 			}
 			cancel()
 			s, err := operator.LoadV1Alpha2ApplicationInit(context.Background(), cfg.Store, cfg.Ref)

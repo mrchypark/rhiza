@@ -264,6 +264,14 @@ func (h *Host) ValidateManagedStartup(ctx context.Context, i node.ManagedStartup
 }
 
 func (h *Host) ValidateManagedAdmission(ctx context.Context, i node.ManagedStartupIdentity, runtime node.ManagedRuntimeState) error {
+	return h.validateManagedState(ctx, i, runtime, true)
+}
+
+func (h *Host) ValidateManagedSQLRead(ctx context.Context, i node.ManagedStartupIdentity, runtime node.ManagedRuntimeState) error {
+	return h.validateManagedState(ctx, i, runtime, false)
+}
+
+func (h *Host) validateManagedState(ctx context.Context, i node.ManagedStartupIdentity, runtime node.ManagedRuntimeState, allowActiveWrite bool) error {
 	if h.uncertain.Load() {
 		return fmt.Errorf("SQL outcome unknown; explicit pending recovery required")
 	}
@@ -275,6 +283,9 @@ func (h *Host) ValidateManagedAdmission(ctx context.Context, i node.ManagedStart
 		return err
 	}
 	if pending, ok := a.Pending(); ok {
+		if !allowActiveWrite {
+			return fmt.Errorf("pending SQL blocks local reads")
+		}
 		h.gateMu.RLock()
 		active := h.active
 		h.gateMu.RUnlock()
@@ -343,13 +354,7 @@ func (h *Host) Ready(ctx context.Context) error {
 	if h.closed {
 		return fmt.Errorf("SQL host closed")
 	}
-	if err := h.node.AdmitManaged(ctx); err != nil {
-		return err
-	}
-	if !h.node.Ready() {
-		return fmt.Errorf("runtime control catch-up not ready")
-	}
-	return nil
+	return h.node.CheckManagedLocalRead(ctx)
 }
 
 func (h *Host) Execute(ctx context.Context, req ExecuteRequest) (ExecuteResponse, error) {
@@ -455,9 +460,6 @@ func (h *Host) Query(ctx context.Context, req QueryRequest) (QueryResponse, erro
 	defer h.mu.Unlock()
 	if h.closed {
 		return QueryResponse{}, fmt.Errorf("SQL host closed")
-	}
-	if err := h.node.AdmitManaged(ctx); err != nil {
-		return QueryResponse{}, err
 	}
 	return h.node.QueryManagedSQL(ctx, req)
 }

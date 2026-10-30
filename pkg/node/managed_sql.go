@@ -24,6 +24,29 @@ type ManagedSQLWriteChecker interface {
 	ValidateManagedSQLWrite(context.Context, ManagedStartupIdentity, ManagedRuntimeState, network.ExecuteRequest) error
 }
 
+// ManagedSQLReadChecker validates live local-read authority without a quorum
+// round or the active-write reservation exception.
+type ManagedSQLReadChecker interface {
+	ValidateManagedSQLRead(context.Context, ManagedStartupIdentity, ManagedRuntimeState) error
+}
+
+func (n *Node) CheckManagedLocalRead(ctx context.Context) error {
+	if _, err := n.ManagedState(); err != nil {
+		return err
+	}
+	if !n.managedInitiallyAdmitted.Load() {
+		if err := n.AdmitManaged(ctx); err != nil {
+			return err
+		}
+	}
+	state := n.managedRuntimeState()
+	checker, ok := n.managedStartup.Checker.(ManagedSQLReadChecker)
+	if !ok {
+		return network.ErrNotReady
+	}
+	return checker.ValidateManagedSQLRead(ctx, n.managedStartup.Identity, state)
+}
+
 type ManagedSQLSnapshot struct {
 	Application materializer.SQLApplicationState
 	Runtime     ManagedRuntimeState
@@ -282,8 +305,13 @@ func (n *Node) ResolveManagedSQL(ctx context.Context, req network.ExecuteRequest
 }
 
 func (n *Node) QueryManagedSQL(ctx context.Context, req network.QueryRequest) (network.QueryResponse, error) {
-	if n.managedStartup == nil || !n.Ready() {
-		return network.QueryResponse{}, network.ErrNotReady
+	if req.Consistency != "" && req.Consistency != "local" && req.Consistency != "linearizable" {
+		return network.QueryResponse{}, fmt.Errorf("%w: consistency must be local or linearizable", network.ErrInvalidRequest)
 	}
+	if err := n.CheckManagedLocalRead(ctx); err != nil {
+		return network.QueryResponse{}, err
+	}
+	// The private server retains its lifecycle/read limits and enforces the
+	// quorum ReadIndex barrier only for explicit linearizable queries.
 	return n.server.Query(ctx, req)
 }

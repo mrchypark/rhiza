@@ -209,6 +209,10 @@ func (n *Node) AdmitManaged(ctx context.Context) error {
 		return err
 	}
 	n.managedAdmitted.Store(true)
+	// Initial application admission requires quorum/catch-up once per owned
+	// runtime. Later failed quorum rounds cannot revoke safe local reads;
+	// their live authority/history checks remain mandatory.
+	n.managedInitiallyAdmitted.Store(true)
 	return nil
 }
 

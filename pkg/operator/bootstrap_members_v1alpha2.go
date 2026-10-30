@@ -326,8 +326,23 @@ func CollectV1Alpha2BootstrapMembers(ctx context.Context, kube *Kubernetes, ref 
 	seenUID, seenKey, seenEndpoint := map[string]bool{}, map[quepaxa.PublicKey]bool{}, map[string]bool{}
 	members := make([]V1Alpha2BootstrapMember, 0, count)
 	for _, p := range pods {
-		if p.APIVersion != "v1" || p.Kind != "Pod" || p.Metadata.Namespace != ref.Namespace || p.Metadata.UID == "" || p.Metadata.Name == "" || p.Metadata.ResourceVersion == "" || p.Metadata.DeletionTimestamp != nil || seenUID[p.Metadata.UID] {
+		if p.Metadata.Namespace != ref.Namespace || p.Metadata.UID == "" || p.Metadata.Name == "" || p.Metadata.ResourceVersion == "" || p.Metadata.DeletionTimestamp != nil || seenUID[p.Metadata.UID] {
 			return nil, fmt.Errorf("invalid bootstrap pod")
+		}
+		// Native PodList items may omit TypeMeta (unlike kubectl's enriched
+		// output). Verify an exact live Pod instead of weakening type checks.
+		if p.APIVersion == "" && p.Kind == "" {
+			var live pod
+			if err := kube.Get(ctx, "/api/v1/namespaces/"+ref.Namespace+"/pods/"+url.PathEscape(p.Metadata.Name), &live); err != nil {
+				return nil, err
+			}
+			if live.Metadata.UID != p.Metadata.UID || live.Metadata.ResourceVersion != p.Metadata.ResourceVersion || live.Metadata.Name != p.Metadata.Name || live.Metadata.Namespace != ref.Namespace || live.Metadata.DeletionTimestamp != nil {
+				return nil, fmt.Errorf("bootstrap pod changed after list")
+			}
+			p = live
+		}
+		if p.APIVersion != "v1" || p.Kind != "Pod" {
+			return nil, fmt.Errorf("invalid bootstrap pod type")
 		}
 		var rsOwner *v1alpha2BootstrapOwner
 		for i := range p.Metadata.OwnerReferences {

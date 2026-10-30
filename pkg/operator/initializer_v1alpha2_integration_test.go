@@ -132,6 +132,7 @@ func TestV1Alpha2InitializerAPIServerContract(t *testing.T) {
 	}
 	var first V1Alpha2StatusSnapshot
 	var lastErr error
+	var lastPending error
 	for ctx.Err() == nil {
 		var page struct {
 			Items []struct {
@@ -147,7 +148,7 @@ func TestV1Alpha2InitializerAPIServerContract(t *testing.T) {
 		}
 		path := "/api/v1/namespaces/" + ns + "/pods?labelSelector=" + url.QueryEscape("rhiza.mrchypark.dev/cluster-uid="+ref.UID)
 		if err := kube.Get(ctx, path, &page); err != nil {
-			t.Fatal(err)
+			t.Fatalf("list controlled Pods: %v; last managed pending: %v", err, lastPending)
 		}
 		if len(page.Items) == 3 {
 			for i, pod := range page.Items {
@@ -173,8 +174,12 @@ func TestV1Alpha2InitializerAPIServerContract(t *testing.T) {
 				break
 			}
 			if !errors.Is(lastErr, ErrV1Alpha2BootstrapPending) {
-				t.Fatal(lastErr)
+				t.Fatalf("managed reconcile: %v; last pending: %v", lastErr, lastPending)
 			}
+			if lastPending == nil || lastPending.Error() != lastErr.Error() {
+				t.Logf("managed initialization pending: %v", lastErr)
+			}
+			lastPending = lastErr
 		}
 		select {
 		case <-ctx.Done():
@@ -182,7 +187,7 @@ func TestV1Alpha2InitializerAPIServerContract(t *testing.T) {
 		}
 	}
 	if lastErr != nil || first.ResourceVersion() == "" {
-		t.Fatalf("controlled identity bootstrap did not commit: %v context=%v", lastErr, ctx.Err())
+		t.Fatalf("controlled identity bootstrap did not commit: %v context=%v last pending=%v", lastErr, ctx.Err(), lastPending)
 	}
 	if first.Authority().Generation != 0 || first.Authority().Binding.DeploymentUID != deploy.Metadata.UID {
 		t.Fatal("initial authority does not match actual Deployment")

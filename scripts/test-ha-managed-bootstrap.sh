@@ -28,11 +28,27 @@ capture_floci() {
     k -n "$namespace" logs "$floci_pod" -c floci --previous > "$logs/$floci_pod-previous.log" 2> "$logs/$floci_pod-previous-errors.txt" || :
   done
 }
+capture_bootstrap_logs() {
+  for component in operator managed; do
+    if [ "$component" = operator ]; then log_selector=app=operator
+    elif [ -n "${uid-}" ]; then log_selector="rhiza.mrchypark.dev/cluster-uid=$uid"
+    else continue
+    fi
+    k -n "$namespace" get pods -l "$log_selector" -o json > "$logs/$component-log-pods.json" 2> "$logs/$component-log-pods-errors.txt" || continue
+    # Read only public Pod/container names. Never exec or read identity/profile/Secret files.
+    jq -r '.items[]|.metadata.name as $pod|(.spec.initContainers[]?,.spec.containers[]?)|[$pod,.name]|@tsv' "$logs/$component-log-pods.json" |
+    while IFS="$(printf '\t')" read -r log_pod log_container; do
+      k -n "$namespace" logs "$log_pod" -c "$log_container" --tail=200 --limit-bytes=65536 > "$logs/$log_pod-$log_container-current.log" 2> "$logs/$log_pod-$log_container-current-errors.txt" || :
+      k -n "$namespace" logs "$log_pod" -c "$log_container" --previous --tail=200 --limit-bytes=65536 > "$logs/$log_pod-$log_container-previous.log" 2> "$logs/$log_pod-$log_container-previous-errors.txt" || :
+    done
+  done
+}
 cleanup() {
   result=$?
   trap - EXIT HUP INT TERM
   if [ "$owned" = 1 ]; then
     capture_floci
+    capture_bootstrap_logs
     k -n "$namespace" get pods,deployments,replicasets,rhizaclusters,jobs,services,endpoints -o json > "$logs/final-state.json" 2>&1 || :
     for job in create-sql insert-sql query; do
       k -n "$namespace" logs "job/$job" > "$logs/$job.json" 2> "$logs/$job-log-errors.txt" || :
