@@ -51,6 +51,13 @@ func NewObserver(config Config) (*Core, error) {
 // its previously absent ID.
 func NewLearner(config Config) (*Core, error) { return newCoreFromConfig(config, false, true) }
 
+func installReconfigurationMarker(appendMarker, syncWAL func() error) error {
+	if err := appendMarker(); err != nil {
+		return err
+	}
+	return syncWAL()
+}
+
 func newCoreFromConfig(config Config, observer, learner bool) (*Core, error) {
 	if config.NodeID == "" {
 		return nil, fmt.Errorf("%w: node ID is required", ErrInvalidConfig)
@@ -159,10 +166,12 @@ func newCoreFromConfig(config Config, observer, learner bool) (*Core, error) {
 		if observer && config.WAL.ReadOnly() {
 			return core, nil
 		}
-		if err := config.WAL.Append(qlog.Entry{Type: qlog.EntryReceipt, Payload: append([]byte(nil), isrEntryV2Magic...)}); err != nil {
-			return nil, err
-		}
-		if err := config.WAL.Sync(); err != nil {
+		if err := installReconfigurationMarker(
+			func() error {
+				return config.WAL.Append(qlog.Entry{Type: qlog.EntryReceipt, Payload: append([]byte(nil), isrEntryV2Magic...)})
+			},
+			config.WAL.Sync,
+		); err != nil {
 			return nil, err
 		}
 		core.reconfigWAL = true

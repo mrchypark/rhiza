@@ -1,10 +1,15 @@
 package quepaxa
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
+	"encoding/hex"
+	"errors"
 	"fmt"
+	"os"
 	"path/filepath"
+	"reflect"
 	"testing"
 	"time"
 
@@ -221,6 +226,10 @@ func TestReadOnlyObserverWithReconfigurationNeverWritesMarker(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	identity := bytes.Repeat([]byte{0x5a}, 32)
+	if err := marked.BindIdentity(identity); err != nil {
+		t.Fatal(err)
+	}
 	if _, err := New(Config{NodeID: "voter", Cluster: cluster, WAL: marked, EnableReconfiguration: true}); err != nil {
 		t.Fatalf("writable voter did not initialize reconfiguration marker: %v", err)
 	}
@@ -230,6 +239,15 @@ func TestReadOnlyObserverWithReconfigurationNeverWritesMarker(t *testing.T) {
 	marked, err = qlog.OpenReadOnly(markedDir)
 	if err != nil {
 		t.Fatal(err)
+	}
+	if _, err := New(Config{NodeID: "voter", Cluster: cluster, WAL: marked, EnableReconfiguration: true}); err == nil {
+		t.Fatal("accepted identity-bound read-only WAL for a voter")
+	}
+	if _, err := NewLearner(Config{NodeID: "learner", Cluster: cluster, WAL: marked, EnableReconfiguration: true}); err == nil {
+		t.Fatal("accepted identity-bound read-only WAL for a learner")
+	}
+	if _, err := NewObserver(Config{NodeID: "observer", Cluster: cluster, WAL: marked}); err == nil {
+		t.Fatal("disabled read-only observer accepted a reconfiguration marker")
 	}
 	defer marked.Close()
 	observer, err = NewObserver(Config{NodeID: "observer", Cluster: cluster, WAL: marked, EnableReconfiguration: true})
@@ -282,6 +300,210 @@ func TestReadOnlyObserverWithReconfigurationNeverWritesMarker(t *testing.T) {
 	}
 	if _, err := observer.MembershipHistory(); err != nil {
 		t.Fatalf("read-only observer lost membership history: %v", err)
+	}
+}
+
+func TestWritableCoreRolesInstallReconfigurationMarkerOnce(t *testing.T) {
+	cluster := Cluster{ConfigID: 1, Members: []Member{{ID: "voter"}}}
+	for _, role := range []string{"voter", "learner", "observer"} {
+		t.Run(role, func(t *testing.T) {
+			dir := t.TempDir()
+			openCore := func(wal *qlog.WAL) (*Core, error) {
+				config := Config{NodeID: "voter", Cluster: cluster, WAL: wal, EnableReconfiguration: true}
+				switch role {
+				case "learner":
+					config.NodeID = "learner"
+					return NewLearner(config)
+				case "observer":
+					config.NodeID = "observer"
+					return NewObserver(config)
+				default:
+					return New(config)
+				}
+			}
+			wal, err := qlog.Open(dir)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err := openCore(wal); err != nil {
+				t.Fatalf("initial writable %s: %v", role, err)
+			}
+			if got := reconfigurationMarkerCount(t, wal); got != 1 {
+				t.Fatalf("initial marker count=%d, want 1", got)
+			}
+			if err := wal.Close(); err != nil {
+				t.Fatal(err)
+			}
+			wal, err = qlog.Open(dir)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer wal.Close()
+			if _, err := openCore(wal); err != nil {
+				t.Fatalf("writable %s restart: %v", role, err)
+			}
+			if got := reconfigurationMarkerCount(t, wal); got != 1 {
+				t.Fatalf("restart marker count=%d, want exactly 1", got)
+			}
+		})
+	}
+}
+
+func TestReconfigurationMarkerInstallPropagatesAppendAndSyncErrors(t *testing.T) {
+	appendErr := errors.New("marker append failed")
+	syncErr := errors.New("marker sync failed")
+	synced := false
+	if err := installReconfigurationMarker(func() error { return appendErr }, func() error {
+		synced = true
+		return nil
+	}); !errors.Is(err, appendErr) || synced {
+		t.Fatalf("append failure result=%v syncCalled=%v", err, synced)
+	}
+	appended := false
+	if err := installReconfigurationMarker(func() error { appended = true; return nil }, func() error { return syncErr }); !errors.Is(err, syncErr) || !appended {
+		t.Fatalf("sync failure result=%v appendCalled=%v", err, appended)
+	}
+}
+
+func reconfigurationMarkerCount(t *testing.T, wal *qlog.WAL) int {
+	t.Helper()
+	entries, err := wal.Read()
+	if err != nil {
+		t.Fatal(err)
+	}
+	count := 0
+	for _, entry := range entries {
+		if entry.Type == qlog.EntryReceipt && bytes.Equal(entry.Payload, isrEntryV2Magic) {
+			count++
+		}
+	}
+	return count
+}
+
+func TestRestoreCheckpointCompactsMarkerForReadOnlyObserver(t *testing.T) {
+	source, _, initial, seal, decision := checkpointMembershipSource(t)
+	sourceTransport := source.transport.(*clusterTransport)
+	for _, core := range sourceTransport.cores {
+		if err := core.wal.Close(); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	dir := t.TempDir()
+	wal, err := qlog.Open(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	nonce := bytes.Repeat([]byte{0x83}, 32)
+	if err := wal.BindIdentity(nonce); err != nil {
+		t.Fatal(err)
+	}
+	observer, err := NewObserver(Config{NodeID: "restore-observer", Cluster: initial, WAL: wal, EnableReconfiguration: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := reconfigurationMarkerCount(t, wal); got != 1 {
+		t.Fatalf("pre-restore marker count=%d, want 1", got)
+	}
+	observer.SetCheckpointValidator(func(_ context.Context, candidate CheckpointSeal) error {
+		if !reflect.DeepEqual(candidate, seal) {
+			return errors.New("checkpoint differs from fixture")
+		}
+		return nil
+	})
+	if err := observer.RestoreCheckpointBase(context.Background(), seal, decision); err != nil {
+		t.Fatalf("restore verified checkpoint base: %v", err)
+	}
+	if observer.Tip() != seal.Index {
+		t.Fatalf("restored tip=%d, want %d", observer.Tip(), seal.Index)
+	}
+	if err := wal.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	segments, err := filepath.Glob(filepath.Join(dir, "seg_*.log"))
+	if err != nil || len(segments) == 0 {
+		t.Fatalf("WAL segments=%v err=%v", segments, err)
+	}
+	active, err := os.OpenFile(segments[len(segments)-1], os.O_APPEND|os.O_WRONLY, 0600)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := active.Write([]byte{0xde, 0xad}); err != nil {
+		_ = active.Close()
+		t.Fatal(err)
+	}
+	if err := active.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	snapshot := func() map[string][32]byte {
+		t.Helper()
+		files, err := os.ReadDir(dir)
+		if err != nil {
+			t.Fatal(err)
+		}
+		result := make(map[string][32]byte, len(files))
+		for _, file := range files {
+			if file.IsDir() {
+				continue
+			}
+			data, err := os.ReadFile(filepath.Join(dir, file.Name()))
+			if err != nil {
+				t.Fatal(err)
+			}
+			result[file.Name()] = sha256.Sum256(data)
+		}
+		return result
+	}
+	before := snapshot()
+	readonly, err := qlog.OpenReadOnly(dir)
+	if err != nil {
+		t.Fatalf("open compacted WAL read-only with torn active tail: %v", err)
+	}
+	if !readonly.ReadOnly() {
+		t.Fatal("compacted WAL lost its read-only mode")
+	}
+	if got, ok := readonly.Identity(); !ok || !bytes.Equal(got, nonce) {
+		t.Fatalf("compacted WAL nonce=%x present=%v", got, ok)
+	}
+	restarted, err := NewObserver(Config{NodeID: "restore-observer", Cluster: initial, WAL: readonly, EnableReconfiguration: true})
+	if err != nil {
+		t.Fatalf("open read-only observer after checkpoint compaction: %v", err)
+	}
+	if restarted.WALIdentity() != hex.EncodeToString(nonce) {
+		t.Fatalf("observer WAL identity=%q, want nonce %x", restarted.WALIdentity(), nonce)
+	}
+	if got := reconfigurationMarkerCount(t, readonly); got != 0 {
+		t.Fatalf("restore compaction left %d marker entries, want none", got)
+	}
+	if restarted.reconfigWAL {
+		t.Fatal("observer inferred a marker from checkpoint membership")
+	}
+	if restarted.Tip() != seal.Index || restarted.ConfigID() != seal.ConfigID {
+		t.Fatalf("restored observer tip/config=%d/%d, want %d/%d", restarted.Tip(), restarted.ConfigID(), seal.Index, seal.ConfigID)
+	}
+	if prefix, ok := restarted.PrefixHash(seal.Index); !ok || prefix != seal.PrefixHash {
+		t.Fatalf("restored observer prefix=%x present=%v, want %x", prefix, ok, seal.PrefixHash)
+	}
+	membership, err := restarted.MembershipHistory()
+	if err != nil || !sameMembershipRecord(membership, *seal.Membership) {
+		t.Fatalf("restored membership=%+v err=%v", membership, err)
+	}
+	if _, err := NewObserver(Config{NodeID: "disabled-observer", Cluster: initial, WAL: readonly}); err == nil {
+		t.Fatal("disabled observer accepted compacted reconfiguration history")
+	}
+	if err := readonly.Close(); err != nil {
+		t.Fatal(err)
+	}
+	after := snapshot()
+	if len(after) != len(before) {
+		t.Fatalf("read-only observers changed WAL file set: before=%v after=%v", before, after)
+	}
+	for name, hash := range before {
+		if after[name] != hash {
+			t.Fatalf("read-only observer changed WAL file %s: before=%x after=%x", name, hash, after[name])
+		}
 	}
 }
 

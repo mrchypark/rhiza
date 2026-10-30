@@ -30,7 +30,7 @@ jobs:
         run: |
           go test ./internal/objstore ./pkg/node ./pkg/network ./pkg/checkpoint ./pkg/recovery -count=1 -timeout=180s
           go test ./pkg/managedsql -count=1 -timeout=180s
-          go test ./pkg/quepaxa -run '^TestReadOnlyObserverWithReconfigurationNeverWritesMarker$' -count=1 -timeout=60s
+          go test ./pkg/quepaxa -run '^Test(ReadOnlyObserverWithReconfigurationNeverWritesMarker|RestoreCheckpointCompactsMarkerForReadOnlyObserver|WritableCoreRolesInstallReconfigurationMarkerOnce|ReconfigurationMarkerInstallPropagatesAppendAndSyncErrors)$' -count=1 -timeout=60s
           go test ./pkg/materializer -run '^TestSQLApplicationEvidence' -count=1 -timeout=60s
           go test . -run '^TestPreparedNode(StageAvoidsLegacyRecoverySnapshot|RegistrationRequestScope|EmulatorAuthScope|ProviderAuthorityHistory)$' -count=1 -timeout=60s
       - name: Verify fixed-head recovery view under race detector
@@ -38,7 +38,7 @@ jobs:
           go test -race ./pkg/node ./pkg/checkpoint ./pkg/recovery -run '^Test(HA|Prepared|Managed)' -count=1 -timeout=180s
           go test -race ./pkg/node -run '^TestMembership(TerminalRetryRequiresDelivery|RetryRejectsEarlierAbortedSameTarget)$' -count=1 -timeout=60s
           go test -race ./pkg/managedsql -count=1 -timeout=300s
-          go test -race ./pkg/quepaxa -run '^TestReadOnlyObserverWithReconfigurationNeverWritesMarker$' -count=1 -timeout=60s
+          go test -race ./pkg/quepaxa -run '^Test(ReadOnlyObserverWithReconfigurationNeverWritesMarker|RestoreCheckpointCompactsMarkerForReadOnlyObserver|WritableCoreRolesInstallReconfigurationMarkerOnce|ReconfigurationMarkerInstallPropagatesAppendAndSyncErrors)$' -count=1 -timeout=60s
           go test -race ./pkg/network -run '^TestResolveExecute' -count=1 -timeout=60s
           go test -race ./pkg/network -run '^TestRemovedPeerCannotReuseLiveQUICOrReturnAfterReplay$' -count=1 -timeout=60s
           go test -race ./pkg/materializer -run '^TestSQLApplicationEvidence' -count=1 -timeout=60s
