@@ -14,9 +14,11 @@ import (
 	"path"
 	"path/filepath"
 	"reflect"
+	"slices"
 	"strings"
 
 	objectstore "github.com/mrchypark/rhiza/internal/objstore"
+	"github.com/mrchypark/rhiza/internal/types"
 	"github.com/mrchypark/rhiza/pkg/network"
 	"github.com/mrchypark/rhiza/pkg/qlog"
 	"github.com/mrchypark/rhiza/pkg/quepaxa"
@@ -37,6 +39,169 @@ type PreparedStartupConfig struct {
 }
 
 var ErrPreparedWriteAdmissionUnavailable = errors.New("prepared startup write admission is unavailable")
+
+// ManagedStartupIdentity binds an explicit, live initialization assignment to
+// this exact execution member. A missing archive is never an assignment.
+type ManagedStartupIdentity struct {
+	Member              recovery.PreparedStartupIdentity
+	AssignmentID        string
+	IntentHash          string
+	StorageID           string
+	PhysicalBinding     string
+	BootstrapPlanDigest string
+	EvidenceFormat      string
+	Fresh               bool
+}
+
+// ManagedRuntimeState is local continuity, not application-state evidence.
+type ManagedRuntimeState struct {
+	WALIdentity  string
+	CertifiedTip uint64
+	AppliedTip   uint64
+	RecorderTip  uint64
+}
+
+// ManagedStartupChecker is implemented by the private application host. Startup
+// validates the exact assignment without requiring application evidence; live
+// admission validates current evidence and binding, never a cached receipt.
+type ManagedStartupChecker interface {
+	ValidateManagedStartup(context.Context, ManagedStartupIdentity) error
+	ValidateManagedAdmission(context.Context, ManagedStartupIdentity, ManagedRuntimeState) error
+}
+
+type ManagedStartupConfig struct {
+	Identity ManagedStartupIdentity
+	Checker  ManagedStartupChecker
+	Prepared *recovery.VerifiedPreparedStartup
+	// BootstrapMember opens an original member using immutable voter registration
+	// continuity instead of a learner adoption receipt. It grants no empty source.
+	BootstrapMember bool
+}
+
+// ManagedBootstrapPlanDigest is common to every initial voter. PhysicalBinding
+// is the SourceBinding returned by PreparedStartupBindingDigests, not its
+// member-specific ConfigDigest. The host must also recognize evidenceFormat.
+func (n *Node) ManagedBootstrapPlanDigest(physicalBinding, evidenceFormat string) (string, error) {
+	if n == nil || n.config == nil || n.config.Local || physicalBinding == "" || evidenceFormat == "" {
+		return "", fmt.Errorf("invalid managed bootstrap binding")
+	}
+	source, _, err := n.preparedBindingDigests()
+	if err != nil || source != physicalBinding {
+		return "", errors.Join(fmt.Errorf("physical binding differs from configured storage"), err)
+	}
+	members := slices.Clone(n.config.Members)
+	for i := range members {
+		members[i].WALIdentity = ""
+	}
+	slices.SortFunc(members, func(a, b quepaxa.Member) int { return strings.Compare(string(a.ID), string(b.ID)) })
+	durability := n.config.ObjStoreDurability
+	if durability == "" {
+		durability = types.ObjectStoreDurabilityBeforeAck
+	}
+	data, err := json.Marshal(struct {
+		Version         int
+		ClusterID       string
+		Members         []quepaxa.Member
+		PhysicalBinding string
+		EvidenceFormat  string
+		Durability      types.ObjectStoreDurability
+		Reconfiguration bool
+	}{1, string(n.config.ClusterID), members, physicalBinding, evidenceFormat, durability, n.config.EnableReconfiguration})
+	if err != nil {
+		return "", err
+	}
+	return fmt.Sprintf("%x", sha256.Sum256(data)), nil
+}
+
+// OpenManaged starts an owned WAL/core/materializer and private peers while
+// application admission stays closed. The caller must Shutdown even when the
+// later evidence CAS or admission fails.
+func (n *Node) OpenManaged(ctx context.Context, cfg ManagedStartupConfig) error {
+	if n == nil || n.config == nil || n.config.Local || n.opened.Load() || n.preparedStartup != nil || n.managedStartup != nil || cfg.Checker == nil {
+		return fmt.Errorf("managed startup requires a new non-Local node and live checker")
+	}
+	i := cfg.Identity
+	if i.Member.ClusterUID == "" || i.Member.Generation < 0 || i.Member.DeploymentUID == "" || i.Member.PodUID == "" || i.Member.NodeID == "" || i.Member.NodeID != string(n.config.NodeID) || i.AssignmentID == "" || i.IntentHash == "" || i.StorageID == "" || i.PhysicalBinding == "" || i.BootstrapPlanDigest == "" || i.EvidenceFormat == "" {
+		return fmt.Errorf("managed startup requires exact member and assignment bindings")
+	}
+	if len(n.config.Members) < 2 || n.config.ClusterID == "" || n.config.PeerToken == "" || n.config.PeerToken == n.config.AdminToken {
+		return fmt.Errorf("managed startup requires explicit HA members and distinct peer identity")
+	}
+	if n.config.ObjStoreDurability == "" {
+		n.config.ObjStoreDurability = types.ObjectStoreDurabilityBeforeAck
+	}
+	source, config, err := n.preparedBindingDigests()
+	if err != nil {
+		return err
+	}
+	if i.Member.SourceBinding != source || i.Member.ConfigDigest != config {
+		return fmt.Errorf("managed storage or configuration binding mismatch")
+	}
+	bootstrap, err := n.ManagedBootstrapPlanDigest(i.PhysicalBinding, i.EvidenceFormat)
+	if err != nil || bootstrap != i.BootstrapPlanDigest {
+		return errors.Join(fmt.Errorf("managed common bootstrap plan mismatch"), err)
+	}
+	configured, err := validateObjectStoreConfig(n.config)
+	if err != nil || !configured {
+		return errors.Join(fmt.Errorf("managed startup requires object storage"), err)
+	}
+	if err := validateVoterMembership(n.config); err != nil {
+		return err
+	}
+	if err := cfg.Checker.ValidateManagedStartup(ctx, i); err != nil {
+		return fmt.Errorf("managed startup authority: %w", err)
+	}
+	if cfg.Prepared != nil {
+		if i.Fresh || cfg.Prepared.Identity() != i.Member {
+			return fmt.Errorf("managed prepared identity mismatch")
+		}
+		if err := n.recoverPreparedV1Alpha2(ctx, cfg.Prepared); err != nil {
+			return err
+		}
+	} else if !i.Fresh && !cfg.BootstrapMember {
+		if err := n.verifyPreparedAdoption(ctx, i.Member); err != nil {
+			return err
+		}
+	}
+	n.managedStartup = &cfg
+	return n.open(ctx, false)
+}
+
+func (n *Node) managedRuntimeState() ManagedRuntimeState {
+	return ManagedRuntimeState{WALIdentity: n.core.WALIdentity(), CertifiedTip: uint64(n.core.Tip()), AppliedTip: n.material.Tip(), RecorderTip: uint64(n.core.RecorderTip())}
+}
+
+func (n *Node) ManagedState() (ManagedRuntimeState, error) {
+	if n == nil || n.managedStartup == nil || !n.opened.Load() || n.core == nil || n.material == nil {
+		return ManagedRuntimeState{}, fmt.Errorf("managed runtime is not open")
+	}
+	return n.managedRuntimeState(), nil
+}
+
+// AdmitManaged performs a fresh quorum/replay round before checking current
+// application authority. Failure preserves the paused runtime and its data.
+func (n *Node) AdmitManaged(ctx context.Context) error {
+	if n == nil || n.managedStartup == nil || !n.opened.Load() || n.core == nil || n.material == nil {
+		return fmt.Errorf("managed runtime is not open")
+	}
+	n.managedAdmitted.Store(false)
+	target, _, err := n.core.ReadIndex(ctx)
+	if err != nil {
+		return err
+	}
+	if err := n.replayLocalDecisions(ctx); err != nil {
+		return err
+	}
+	state := n.managedRuntimeState()
+	if state.CertifiedTip < uint64(target) || state.AppliedTip != state.CertifiedTip || state.RecorderTip > state.CertifiedTip {
+		return fmt.Errorf("managed runtime has unapplied or unresolved history")
+	}
+	if err := n.managedStartup.Checker.ValidateManagedAdmission(ctx, n.managedStartup.Identity, state); err != nil {
+		return err
+	}
+	n.managedAdmitted.Store(true)
+	return nil
+}
 
 // OpenPrepared performs bounded local recovery but cannot serve until the
 // actual application mutation gate is wired.

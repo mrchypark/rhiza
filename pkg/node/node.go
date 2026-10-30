@@ -37,6 +37,7 @@ type Node struct {
 	core                      *quepaxa.Core
 	material                  *materializer.Materializer
 	server                    *network.Server
+	peerControl               *network.Server
 	peer                      *network.PeerServer
 	transport                 *network.Transport
 	catchUp                   *network.Transport
@@ -76,6 +77,8 @@ type Node struct {
 	terminalErr               error
 	fenceSession              *fencing.Session
 	preparedStartup           *PreparedStartupConfig
+	managedStartup            *ManagedStartupConfig
+	managedAdmitted           atomic.Bool
 }
 
 // nodeRecoveryPhases records the selected certified checkpoint restore path.
@@ -413,6 +416,9 @@ func (n *Node) open(ctx context.Context, enroll bool) (err error) {
 			provider = objectstore.ProviderS3
 		}
 		newBucket := objectstore.NewBucketWithContext
+		if n.managedStartup != nil {
+			newBucket = objectstore.NewBucketWithoutProvisioning
+		}
 		if n.fenceSession != nil {
 			newBucket = objectstore.NewBucketForSupervisedStartup
 		}
@@ -433,6 +439,17 @@ func (n *Node) open(ctx context.Context, enroll bool) (err error) {
 		var beforeWrite []func(context.Context, string) error
 		if n.fenceSession != nil {
 			beforeWrite = append(beforeWrite, n.fenceSession.BindWAL)
+		}
+		if n.managedStartup != nil {
+			if err := n.managedStartup.Checker.ValidateManagedStartup(ctx, n.managedStartup.Identity); err != nil {
+				return fmt.Errorf("managed registration authority: %w", err)
+			}
+			if !n.managedStartup.Identity.Fresh {
+				exists, err := bucket.Exists(ctx, path.Join(n.config.ObjStorePrefix, string(n.config.ClusterID), "archive/head.bin"))
+				if err != nil || !exists {
+					return errors.Join(fmt.Errorf("managed recovery requires existing archive head"), err)
+				}
+			}
 		}
 		if err := ensureVoterIdentity(ctx, n.config, bucket, n.wal, localVoter, enroll, beforeWrite...); err != nil {
 			return err
@@ -465,7 +482,7 @@ func (n *Node) open(ctx context.Context, enroll bool) (err error) {
 			return fmt.Errorf("multi-node shared archive requires conditional object writes")
 		}
 		if loadErr := n.archive.Load(ctx); loadErr != nil {
-			if n.config.ObjStoreDurability == types.ObjectStoreDurabilityBeforeAck {
+			if n.managedStartup != nil || n.config.ObjStoreDurability == types.ObjectStoreDurabilityBeforeAck {
 				return fmt.Errorf("load shared decision archive: %w", loadErr)
 			}
 			log.Printf("shared archive unavailable during async startup: %v", loadErr)
@@ -480,7 +497,7 @@ func (n *Node) open(ctx context.Context, enroll bool) (err error) {
 		}
 	}
 	startupRecovery := &startupRecoveryGuard{ctx: ctx}
-	if n.checkpoints != nil {
+	if n.checkpoints != nil && n.managedStartup == nil {
 		owner, ownerErr := startupRecoveryOwner(string(n.config.NodeID))
 		if ownerErr != nil {
 			return ownerErr
@@ -501,6 +518,9 @@ func (n *Node) open(ctx context.Context, enroll bool) (err error) {
 	if localRestoreAuthority == nil {
 		material, err = materializer.Open(filepath.Join(n.config.DataDir, "sqlite.db"), 4)
 		if err != nil {
+			if n.managedStartup != nil {
+				return fmt.Errorf("open managed materializer without replacing application evidence: %w", err)
+			}
 			if errors.Is(err, sqlpolicy.ErrIncompatible) {
 				return fmt.Errorf("open materializer: %w", err)
 			}
@@ -518,6 +538,9 @@ func (n *Node) open(ctx context.Context, enroll bool) (err error) {
 		if err := material.ConfigureLocalGraphNodePropertyIndexes(n.config.LocalGraphNodePropertyIndexes); err != nil {
 			_ = material.Close()
 			return fmt.Errorf("configure local graph indexes: %w", err)
+		}
+		if n.managedStartup != nil {
+			n.material = material
 		}
 	}
 
@@ -657,7 +680,7 @@ func (n *Node) open(ctx context.Context, enroll bool) (err error) {
 	}
 	// Record RPCs must be available while every replica is recovering. Public
 	// proposals and learned decisions remain gated by ready=false.
-	server := network.NewServer(core, material, n.config.ClusterID, true, transport, n.ready.Load)
+	server := network.NewServer(core, material, n.config.ClusterID, true, transport, n.Ready)
 	server.SetTerminalDrain(func(ctx context.Context, expected network.TerminalDrainRequest) (any, error) {
 		return n.TerminalDrain(ctx, expected)
 	})
@@ -721,7 +744,7 @@ func (n *Node) open(ctx context.Context, enroll bool) (err error) {
 			NodeID:       string(n.config.NodeID),
 			ClusterID:    string(n.config.ClusterID),
 			Durability:   string(n.config.ObjStoreDurability),
-			Ready:        n.ready.Load(),
+			Ready:        n.Ready(),
 			Quorum:       quorumErr == nil,
 			CertifiedTip: uint64(core.Tip()),
 			AppliedTip:   material.Tip(),
@@ -752,11 +775,22 @@ func (n *Node) open(ctx context.Context, enroll bool) (err error) {
 	}
 	n.server = server
 	server.SetCompactedHandler(n.wakeCatchUp)
+	peerServer := server
+	if n.managedStartup != nil {
+		// Peer ReadIndex and learned/control traffic must not depend on the
+		// application evidence CAS. This server is never returned by API/Handler.
+		peerServer = network.NewServer(core, material, n.config.ClusterID, false, transport, n.ready.Load)
+		peerServer.SetCompactedHandler(n.wakeCatchUp)
+		if n.checkpoints != nil {
+			peerServer.SetCheckpointPrepare(n.preparePeerCheckpoint)
+		}
+		n.peerControl = peerServer
+	}
 	var peer *network.PeerServer
 	if n.config.Learner != nil {
-		peer, err = network.StartLearnerPeerServer(ctx, n.peerAddr(), server, cluster.Members, n.config.PeerToken, n.config.AdminToken, *n.config.Learner)
+		peer, err = network.StartLearnerPeerServer(ctx, n.peerAddr(), peerServer, cluster.Members, n.config.PeerToken, n.config.AdminToken, *n.config.Learner)
 	} else if !n.config.Local {
-		peer, err = network.StartPeerServer(ctx, n.peerAddr(), server, cluster.Members, n.config.PeerToken, n.config.AdminToken)
+		peer, err = network.StartPeerServer(ctx, n.peerAddr(), peerServer, cluster.Members, n.config.PeerToken, n.config.AdminToken)
 	}
 	if err != nil {
 		return fmt.Errorf("listen peer QUIC: %w", err)
@@ -783,9 +817,11 @@ func (n *Node) open(ctx context.Context, enroll bool) (err error) {
 				}
 				return err
 			}
-			certifiedCheckpoint, err = startupRecovery.PinRoot(startupRecovery.Context(), n.checkpoints, certifiedCheckpoint, startupRecovery.Owner())
-			if err != nil {
-				return fmt.Errorf("pin certified checkpoint recovery root: %w", startupRecovery.Check(err))
+			if n.managedStartup == nil {
+				certifiedCheckpoint, err = startupRecovery.PinRoot(startupRecovery.Context(), n.checkpoints, certifiedCheckpoint, startupRecovery.Owner())
+				if err != nil {
+					return fmt.Errorf("pin certified checkpoint recovery root: %w", startupRecovery.Check(err))
+				}
 			}
 		} else if certifiedCheckpoint != nil {
 			certifiedCheckpoint, err = startupRecovery.PinRoot(startupRecovery.Context(), n.checkpoints, certifiedCheckpoint, startupRecovery.Owner())
@@ -872,7 +908,7 @@ func (n *Node) open(ctx context.Context, enroll bool) (err error) {
 	}
 	// The selected archive head and checkpoint root have been consumed. Release
 	// their GC pins before a newly sealed checkpoint attempts the next trim.
-	if n.checkpoints != nil {
+	if n.checkpoints != nil && n.managedStartup == nil {
 		startupRecovery.Close()
 	}
 	if certifiedCheckpoint != nil {
@@ -936,14 +972,18 @@ func (n *Node) open(ctx context.Context, enroll bool) (err error) {
 						log.Printf("shared archive catch-up error: %v", err)
 					} else if err := n.archive.SyncThrough(ctx, core, core.Tip()); err != nil {
 						log.Printf("shared archive sync error: %v", err)
-					} else if err := n.compactCertifiedCheckpoint(ctx); err != nil {
-						log.Printf("certified checkpoint compaction skipped: %v", err)
+					} else if n.managedStartup == nil {
+						if err := n.compactCertifiedCheckpoint(ctx); err != nil {
+							log.Printf("certified checkpoint compaction skipped: %v", err)
+						}
 					}
 				}
 			}
 		}()
 	}
-	if n.checkpoints != nil {
+	// Managed HA retains append-only evidence; legacy checkpoint maintenance
+	// requires GC leases and is deliberately not started by this runtime.
+	if n.checkpoints != nil && n.managedStartup == nil {
 		interval := n.config.CheckpointInterval
 		if interval <= 0 {
 			interval = 15 * time.Minute
@@ -1671,6 +1711,9 @@ func (n *Node) restoreArchiveCatchUp(ctx context.Context) (resultErr error) {
 
 // Start opens the embedded engine and serves the optional public HTTP adapter.
 func (n *Node) Start(ctx context.Context) error {
+	if n.managedStartup != nil {
+		return fmt.Errorf("managed runtime requires its private application host")
+	}
 	if n.config != nil && n.config.Local {
 		return fmt.Errorf("local mode does not support an HTTP listener; use Open")
 	}
@@ -1710,6 +1753,9 @@ func (n *Node) Handler() (http.Handler, error) {
 	if n.server == nil {
 		return nil, fmt.Errorf("node is not open")
 	}
+	if n.managedStartup != nil {
+		return nil, network.ErrNotReady
+	}
 	return n.server, nil
 }
 
@@ -1718,12 +1764,28 @@ func (n *Node) API() (*network.Server, error) {
 	if n.server == nil {
 		return nil, fmt.Errorf("node is not open")
 	}
+	if n.managedStartup != nil {
+		return nil, network.ErrNotReady
+	}
 	return n.server, nil
 }
 
 // Ready reports whether local startup recovery and catch-up have completed.
 // It does not prove current quorum availability.
-func (n *Node) Ready() bool { return n.ready.Load() }
+func (n *Node) Ready() bool {
+	if !n.ready.Load() {
+		return false
+	}
+	if n.managedStartup == nil {
+		return true
+	}
+	if !n.managedAdmitted.Load() || !n.opened.Load() {
+		return false
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	return n.managedStartup.Checker.ValidateManagedAdmission(ctx, n.managedStartup.Identity, n.managedRuntimeState()) == nil
+}
 
 func quarantineSQLite(path string) error {
 	if _, err := os.Stat(path); os.IsNotExist(err) {
@@ -2049,6 +2111,7 @@ func (n *Node) shutdown() error {
 }
 
 func (n *Node) shutdownEngine(closeBucket bool) error {
+	n.managedAdmitted.Store(false)
 	n.opened.Store(false)
 	n.ready.Store(false)
 	var shutdownErr error
@@ -2063,6 +2126,9 @@ func (n *Node) shutdownEngine(closeBucket bool) error {
 	// Keep the server reachable until the peer handlers that reference it join.
 	if n.server != nil {
 		n.server.Close()
+	}
+	if n.peerControl != nil {
+		n.peerControl.Close()
 	}
 	if n.checkpointer != nil {
 		n.checkpointer.Stop()
@@ -2088,6 +2154,7 @@ func (n *Node) shutdownEngine(closeBucket bool) error {
 		n.catchUp = nil
 	}
 	n.server = nil
+	n.peerControl = nil
 	n.ready.Store(false)
 	if n.core != nil {
 		n.core.StopPeriodicSync()
