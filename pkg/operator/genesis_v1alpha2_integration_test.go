@@ -5,6 +5,7 @@ import (
 	"crypto/tls"
 	"crypto/x509"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"os"
@@ -85,6 +86,40 @@ func TestV1Alpha2GenesisAPIServerContract(t *testing.T) {
 		t.Fatal(err)
 	}
 	rejectStatusPatch(string(bad), "new genesis requires an unused initialization assignment")
+	// Exercise the initial status PUT, when no old status object exists and
+	// transition rules attached beneath status may not be evaluated.
+	resourcePath := "/apis/rhiza.mrchypark.dev/v1alpha2/namespaces/" + ns + "/rhizaclusters/" + ref.Name
+	for _, tc := range []struct {
+		name   string
+		mutate func(map[string]any, map[string]any)
+	}{
+		{"missing plan", func(status, _ map[string]any) { delete(status, "bootstrapPlan") }},
+		{"missing history", func(_, auth map[string]any) { delete(auth, "everApplicationReserved") }},
+		{"null history", func(_, auth map[string]any) { auth["everApplicationReserved"] = nil }},
+		{"true history", func(_, auth map[string]any) { auth["everApplicationReserved"] = true }},
+		{"consumed assignment", func(status, _ map[string]any) {
+			status["applicationInit"] = V1Alpha2ApplicationInitAssignment{Plan: plan, State: "Consumed", InitialEvidenceDigest: strings.Repeat("a", 64)}
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var object map[string]json.RawMessage
+			if err := store.Kube.Get(ctx, resourcePath, &object); err != nil {
+				t.Fatal(err)
+			}
+			if len(object["status"]) != 0 && !sameJSON(object["status"], json.RawMessage(`{}`)) && !sameJSON(object["status"], json.RawMessage(`null`)) {
+				t.Fatal("rejected PUT changed initial status")
+			}
+			auth := map[string]any{"owner": map[string]string{"namespace": ns, "name": ref.Name, "uid": uid, "logicalID": "test"}, "generation": 0, "binding": map[string]string{"deploymentUID": liveDeployment.Metadata.UID, "storageID": plan.StorageID}, "pendingWrite": false, "everApplicationReserved": false}
+			status := map[string]any{"genesis": genesis, "authority": auth, "applicationInit": V1Alpha2ApplicationInitAssignment{Plan: plan, State: "Unused"}, "bootstrapPlan": bootstrap}
+			tc.mutate(status, auth)
+			object["status"], _ = json.Marshal(status)
+			err := store.Kube.Put(ctx, resourcePath+"/status", object, nil)
+			var apiErr *APIError
+			if !errors.As(err, &apiErr) || apiErr.StatusCode != http.StatusUnprocessableEntity {
+				t.Fatalf("expected validation rejection (422), got %v", err)
+			}
+		})
+	}
 	first, err := InitializeV1Alpha2AuthorityWithBootstrap(ctx, store, ref, name, plan, bootstrap)
 	if err != nil {
 		t.Fatal(err)

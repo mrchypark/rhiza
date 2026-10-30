@@ -1,7 +1,7 @@
 name: HA v1alpha2 contract
 on:
   push:
-    branches: [feature/ha-v1alpha2-contract-phase1, feature/ha-v1alpha2-status-queue-phase2, feature/ha-v1alpha2-lifecycle-phase3, feature/ha-v1alpha2-cancel-phase4, feature/ha-v1alpha2-genesis, feature/ha-v1alpha2-initializer, feature/ha-application-admission, feature/ha-exact-sql-outcome]
+    branches: [feature/ha-v1alpha2-contract-phase1, feature/ha-v1alpha2-status-queue-phase2, feature/ha-v1alpha2-lifecycle-phase3, feature/ha-v1alpha2-cancel-phase4, feature/ha-v1alpha2-genesis, feature/ha-v1alpha2-initializer, feature/ha-application-admission, feature/ha-exact-sql-outcome, feature/ha-managed-sql-recovery]
   workflow_dispatch:
 permissions:
   contents: read

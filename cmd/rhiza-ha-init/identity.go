@@ -62,6 +62,21 @@ func prepareIdentityFileWithHook(filename, clusterID, nodeID string, hook func(s
 			return "", err
 		}
 	}
+	token, err = readIdentityFile(filename, clusterID, nodeID)
+	if err != nil {
+		return "", err
+	}
+	dir, err := os.Open(filepath.Dir(filename))
+	if err != nil {
+		return "", err
+	}
+	if err := errors.Join(dir.Sync(), dir.Close()); err != nil {
+		return "", fmt.Errorf("sync identity directory: %w", err)
+	}
+	return token, nil
+}
+
+func readIdentityFile(filename, clusterID, nodeID string) (string, error) {
 	info, err := os.Lstat(filename)
 	if err != nil {
 		return "", err
@@ -69,7 +84,7 @@ func prepareIdentityFileWithHook(filename, clusterID, nodeID string, hook func(s
 	if !info.Mode().IsRegular() || info.Mode().Perm() != 0600 || info.Size() <= 0 || info.Size() > 4096 {
 		return "", errors.New("invalid identity file type, permissions, or size")
 	}
-	f, err = os.Open(filename)
+	f, err := os.Open(filename)
 	if err != nil {
 		return "", err
 	}
@@ -88,9 +103,6 @@ func prepareIdentityFileWithHook(filename, clusterID, nodeID string, hook func(s
 			err = errors.New("trailing identity data")
 		}
 	}
-	if err == nil {
-		err = f.Sync()
-	}
 	err = errors.Join(err, f.Close())
 	if err != nil {
 		return "", fmt.Errorf("invalid identity file: %w", err)
@@ -98,13 +110,6 @@ func prepareIdentityFileWithHook(filename, clusterID, nodeID string, hook func(s
 	decoded, err := hex.DecodeString(got.Token)
 	if got.Version != 1 || got.ClusterID != clusterID || got.NodeID != nodeID || err != nil || len(decoded) != 32 || hex.EncodeToString(decoded) != got.Token {
 		return "", errors.New("identity binding or token invalid")
-	}
-	dir, err := os.Open(filepath.Dir(filename))
-	if err != nil {
-		return "", err
-	}
-	if err := errors.Join(dir.Sync(), dir.Close()); err != nil {
-		return "", fmt.Errorf("sync identity directory: %w", err)
 	}
 	return got.Token, nil
 }

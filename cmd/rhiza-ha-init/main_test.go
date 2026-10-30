@@ -5,11 +5,70 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/mrchypark/rhiza"
 	"github.com/mrchypark/rhiza/internal/types"
+	"github.com/mrchypark/rhiza/pkg/operator"
 )
+
+func TestRenderedBootstrapTemplateMatchesCommands(t *testing.T) {
+	init, err := operator.V1Alpha2BootstrapInitContainers("example:v1", "uid", "cluster")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(init) != 2 {
+		t.Fatal("expected two init containers")
+	}
+	for i, c := range init {
+		env, ok := c["env"].([]any)
+		if !ok {
+			t.Fatal("missing template environment")
+		}
+		names := map[string]bool{}
+		for _, v := range env {
+			names[v.(map[string]any)["name"].(string)] = true
+		}
+		for _, name := range []string{"POD_UID", "POD_NAME", "POD_NAMESPACE", "RHIZA_CLUSTER_NAME"} {
+			if !names[name] {
+				t.Fatalf("missing %s", name)
+			}
+		}
+		args, ok := c["args"].([]string)
+		if !ok {
+			t.Fatal("invalid arguments")
+		}
+		args = append([]string(nil), args...)
+		for j := range args {
+			if args[j] == "$(POD_UID)" {
+				args[j] = "pod"
+			}
+		}
+		if i == 0 {
+			dir := t.TempDir()
+			for j := range args {
+				if args[j] == operator.V1Alpha2BootstrapIdentityPath {
+					args[j] = filepath.Join(dir, "identity")
+				}
+				if args[j] == "/dev/termination-log" {
+					args[j] = filepath.Join(dir, "message")
+				}
+			}
+			if err := run(args); err != nil {
+				t.Fatalf("rendered prepare arguments: %v", err)
+			}
+		} else {
+			t.Setenv("POD_NAMESPACE", "ns")
+			t.Setenv("POD_NAME", "pod-name")
+			t.Setenv("RHIZA_CLUSTER_NAME", "cluster")
+			t.Setenv("KUBERNETES_SERVICE_HOST", "")
+			if err := run(args); err == nil || !strings.Contains(err.Error(), "KUBERNETES_SERVICE_HOST") {
+				t.Fatalf("rendered await arguments: %v", err)
+			}
+		}
+	}
+}
 
 func TestPrepareIdentityCommand(t *testing.T) {
 	dir := t.TempDir()

@@ -18,11 +18,15 @@ import (
 )
 
 const (
-	V1Alpha2PrepareIdentityContainer = "rhiza-prepare-identity"
-	V1Alpha2AwaitBootstrapContainer  = "rhiza-await-bootstrap-plan"
-	V1Alpha2BootstrapVolume          = "rhiza-data"
-	V1Alpha2BootstrapDataDir         = "/var/lib/rhiza"
-	V1Alpha2BootstrapIdentityPath    = "/var/lib/rhiza/identity.json"
+	V1Alpha2PrepareIdentityContainer    = "rhiza-prepare-identity"
+	V1Alpha2AwaitBootstrapContainer     = "rhiza-await-bootstrap-plan"
+	V1Alpha2BootstrapVolume             = "rhiza-data"
+	V1Alpha2BootstrapDataDir            = "/var/lib/rhiza"
+	V1Alpha2BootstrapIdentityPath       = "/var/lib/rhiza/identity.json"
+	V1Alpha2ManagedRuntimeProfilePath   = "/etc/rhiza/managed/runtime.json"
+	V1Alpha2ManagedRuntimeProfileKey    = "runtime.json"
+	V1Alpha2ManagedRuntimeProfileVolume = "rhiza-runtime-profile"
+	V1Alpha2BootstrapHandoffPath        = "/var/lib/rhiza/bootstrap.json"
 )
 
 // V1Alpha2ManagedPodSecurity is the initial managed profile. Application
@@ -46,6 +50,28 @@ func V1Alpha2ManagedPodSpec(image, crUID string, containers []V1Alpha2Container,
 	return map[string]any{"securityContext": V1Alpha2ManagedPodSecurity(), "initContainers": init, "containers": main, "volumes": []any{map[string]any{"name": V1Alpha2BootstrapVolume, "emptyDir": map[string]any{}}}}, nil
 }
 
+// V1Alpha2ManagedSQLPodSpec is the first managed reference profile, not an
+// arbitrary image adapter. A missing reference-host executable fails closed.
+func V1Alpha2ManagedSQLPodSpec(ref V1Alpha2ClusterRef, profile V1Alpha2RuntimeProfile, containers []V1Alpha2Container) (map[string]any, error) {
+	if len(containers) != 1 || !validV1Alpha2ProfileSecretName(profile.ProfileSecretName) {
+		return nil, fmt.Errorf("managed SQL requires one container and a valid profile Secret name")
+	}
+	pod, err := V1Alpha2ManagedPodSpec(profile.InitImage, ref.UID, containers, ref.Name)
+	if err != nil {
+		return nil, err
+	}
+	init := pod["initContainers"].([]map[string]any)
+	main := pod["containers"].([]map[string]any)[0]
+	main["command"] = []string{"/usr/local/bin/rhiza-ha-init"}
+	main["args"] = []string{"serve-managed-sql", "--runtime-profile", V1Alpha2ManagedRuntimeProfilePath, "--identity-file", V1Alpha2BootstrapIdentityPath, "--handoff-file", V1Alpha2BootstrapHandoffPath, "--listen", "0.0.0.0:8080"}
+	main["readinessProbe"] = map[string]any{"exec": map[string]any{"command": []string{"/usr/local/bin/rhiza-ha-init", "check-ready", "--runtime-profile", V1Alpha2ManagedRuntimeProfilePath}}, "periodSeconds": 5, "timeoutSeconds": 2, "successThreshold": 1, "failureThreshold": 3}
+	main["env"] = append(append([]any{}, init[0]["env"].([]any)...), map[string]any{"name": "RHIZA_CLUSTER_UID", "value": ref.UID})
+	main["securityContext"] = map[string]any{"allowPrivilegeEscalation": false, "capabilities": map[string]any{"drop": []string{"ALL"}}}
+	main["volumeMounts"] = append(main["volumeMounts"].([]any), map[string]any{"name": V1Alpha2ManagedRuntimeProfileVolume, "mountPath": "/etc/rhiza/managed", "readOnly": true})
+	pod["volumes"] = append(pod["volumes"].([]any), map[string]any{"name": V1Alpha2ManagedRuntimeProfileVolume, "secret": map[string]any{"secretName": profile.ProfileSecretName, "defaultMode": 0440, "items": []any{map[string]any{"key": V1Alpha2ManagedRuntimeProfileKey, "path": V1Alpha2ManagedRuntimeProfileKey}}}})
+	return pod, nil
+}
+
 // V1Alpha2BootstrapInitContainers is the fixed operator-owned init contract.
 func V1Alpha2BootstrapInitContainers(image, crUID string, clusterName ...string) ([]map[string]any, error) {
 	if !validInitString(image) || !validInitString(crUID) {
@@ -57,7 +83,7 @@ func V1Alpha2BootstrapInitContainers(image, crUID string, clusterName ...string)
 	}
 	mount := []any{map[string]any{"name": V1Alpha2BootstrapVolume, "mountPath": V1Alpha2BootstrapDataDir}}
 	init := func(name string, args []string) map[string]any {
-		return map[string]any{"name": name, "image": image, "command": []string{"/usr/local/bin/rhiza-ha-init"}, "args": args, "env": env, "volumeMounts": mount, "terminationMessagePath": "/dev/termination-log", "terminationMessagePolicy": "File"}
+		return map[string]any{"name": name, "image": image, "command": []string{"/usr/local/bin/rhiza-ha-init"}, "args": args, "env": env, "volumeMounts": mount, "terminationMessagePath": "/dev/termination-log", "terminationMessagePolicy": "File", "securityContext": map[string]any{"allowPrivilegeEscalation": false, "capabilities": map[string]any{"drop": []string{"ALL"}}}}
 	}
 	return []map[string]any{
 		init(V1Alpha2PrepareIdentityContainer, []string{"prepare-identity", "--cr-uid", crUID, "--generation", "0", "--pod-uid", "$(POD_UID)", "--identity-file", V1Alpha2BootstrapIdentityPath, "--termination-message", "/dev/termination-log"}),
@@ -162,7 +188,10 @@ func bootstrapServiceAccountProjection(raw json.RawMessage) bool {
 
 // CollectV1Alpha2BootstrapMembers reads a complete live Pod list and verifies
 // each selected Pod's controller chain; it does not authorize application I/O.
-func CollectV1Alpha2BootstrapMembers(ctx context.Context, kube *Kubernetes, ref V1Alpha2ClusterRef, deploymentName, deploymentUID, image string, count, peerPort int) ([]V1Alpha2BootstrapMember, error) {
+func CollectV1Alpha2BootstrapMembers(ctx context.Context, kube *Kubernetes, ref V1Alpha2ClusterRef, deploymentName, deploymentUID, image string, count, peerPort int, profiles ...V1Alpha2RuntimeProfile) ([]V1Alpha2BootstrapMember, error) {
+	if len(profiles) > 1 {
+		return nil, fmt.Errorf("multiple managed profiles")
+	}
 	if kube == nil || count < 3 || count > 64 || peerPort < 1 || peerPort > 65535 || !validInitString(deploymentUID) {
 		return nil, fmt.Errorf("invalid bootstrap collection configuration")
 	}
@@ -188,6 +217,16 @@ func CollectV1Alpha2BootstrapMembers(ctx context.Context, kube *Kubernetes, ref 
 		return nil, err
 	}
 	expected, _ := json.Marshal(init)
+	var expectedMain map[string]any
+	var expectedProfileVolume json.RawMessage
+	if len(profiles) == 1 {
+		pod, err := V1Alpha2ManagedSQLPodSpec(ref, profiles[0], cluster.Spec.Workload.PodTemplate.Spec.Containers)
+		if err != nil {
+			return nil, err
+		}
+		expectedMain = pod["containers"].([]map[string]any)[0]
+		expectedProfileVolume, _ = json.Marshal(pod["volumes"].([]any)[1])
+	}
 	base := "/apis/apps/v1/namespaces/" + ref.Namespace
 	var dep struct {
 		APIVersion, Kind string
@@ -203,11 +242,15 @@ func CollectV1Alpha2BootstrapMembers(ctx context.Context, kube *Kubernetes, ref 
 		APIVersion, Kind string
 		Metadata         v1alpha2BootstrapMetadata
 		Spec             struct {
-			InitContainers  json.RawMessage
-			SecurityContext json.RawMessage
-			Containers      []struct {
-				Name, Image  string
-				VolumeMounts []struct {
+			HostNetwork, HostPID, HostIPC bool
+			InitContainers                json.RawMessage
+			SecurityContext               json.RawMessage
+			Containers                    []struct {
+				Name, Image        string
+				Command, Args, Env json.RawMessage
+				ReadinessProbe     json.RawMessage
+				LivenessProbe      json.RawMessage
+				VolumeMounts       []struct {
 					Name, MountPath string
 					ReadOnly        bool
 				}
@@ -307,12 +350,16 @@ func CollectV1Alpha2BootstrapMembers(ctx context.Context, kube *Kubernetes, ref 
 			return nil, fmt.Errorf("unexpected bootstrap init template")
 		}
 		security, _ := json.Marshal(V1Alpha2ManagedPodSecurity())
-		if !sameJSON(p.Spec.SecurityContext, security) || len(p.Spec.Containers) != len(cluster.Spec.Workload.PodTemplate.Spec.Containers) {
+		if p.Spec.HostNetwork || p.Spec.HostPID || p.Spec.HostIPC || !sameJSON(p.Spec.SecurityContext, security) || len(p.Spec.Containers) != len(cluster.Spec.Workload.PodTemplate.Spec.Containers) {
 			return nil, fmt.Errorf("invalid managed pod security")
 		}
-		dataVolumes := 0
+		dataVolumes, profileVolumes := 0, 0
 		projectionName := ""
 		for _, raw := range p.Spec.Volumes {
+			if expectedMain != nil && sameJSON(raw, expectedProfileVolume) {
+				profileVolumes++
+				continue
+			}
 			var v struct {
 				Name      string          `json:"name"`
 				EmptyDir  json.RawMessage `json:"emptyDir"`
@@ -333,16 +380,31 @@ func CollectV1Alpha2BootstrapMembers(ctx context.Context, kube *Kubernetes, ref 
 			}
 			projectionName = v.Name
 		}
-		if dataVolumes != 1 {
+		if dataVolumes != 1 || expectedMain != nil && profileVolumes != 1 {
 			return nil, fmt.Errorf("invalid bootstrap volume")
 		}
 		for i, c := range p.Spec.Containers {
 			want := cluster.Spec.Workload.PodTemplate.Spec.Containers[i]
-			if c.Name != want.Name || c.Image != want.Image || len(c.SecurityContext) > 0 && !sameJSON(c.SecurityContext, json.RawMessage(`{}`)) {
+			if c.Name != want.Name || c.Image != want.Image || expectedMain == nil && len(c.SecurityContext) > 0 && !sameJSON(c.SecurityContext, json.RawMessage(`{}`)) {
 				return nil, fmt.Errorf("invalid managed main container")
 			}
-			data, projected := 0, 0
+			if expectedMain != nil {
+				if len(c.LivenessProbe) > 0 && !sameJSON(c.LivenessProbe, json.RawMessage(`null`)) {
+					return nil, fmt.Errorf("managed bootstrap must not have a liveness probe")
+				}
+				for key, raw := range map[string]json.RawMessage{"command": c.Command, "args": c.Args, "env": c.Env, "securityContext": c.SecurityContext, "readinessProbe": c.ReadinessProbe} {
+					want, _ := json.Marshal(expectedMain[key])
+					if !sameJSON(raw, want) {
+						return nil, fmt.Errorf("invalid managed main contract")
+					}
+				}
+			}
+			data, projected, profileMounts := 0, 0, 0
 			for _, m := range c.VolumeMounts {
+				if expectedMain != nil && m.Name == V1Alpha2ManagedRuntimeProfileVolume && m.MountPath == "/etc/rhiza/managed" && m.ReadOnly {
+					profileMounts++
+					continue
+				}
 				if m.Name == V1Alpha2BootstrapVolume && m.MountPath == V1Alpha2BootstrapDataDir && !m.ReadOnly {
 					data++
 					continue
@@ -353,7 +415,7 @@ func CollectV1Alpha2BootstrapMembers(ctx context.Context, kube *Kubernetes, ref 
 				}
 				return nil, fmt.Errorf("invalid managed main mount")
 			}
-			if data != 1 || projected > 1 {
+			if data != 1 || projected > 1 || expectedMain != nil && profileMounts != 1 {
 				return nil, fmt.Errorf("invalid managed main mounts")
 			}
 		}

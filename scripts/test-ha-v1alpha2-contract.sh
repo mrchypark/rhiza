@@ -243,6 +243,17 @@ rules:
 - apiGroups: ["apps"]
   resources: ["deployments"]
   verbs: ["get", "list", "create"]
+- apiGroups: ["apps"]
+  resources: ["replicasets"]
+  verbs: ["get"]
+- apiGroups: [""]
+  resources: ["pods"]
+  verbs: ["get", "list"]
+- apiGroups: [""]
+  resources: ["secrets"]
+  verbs: ["get"]
+# Controlled Pod status and Secret setup use the CI administrator kubeconfig,
+# never this operator ServiceAccount. In particular, no pods/status writes.
 - apiGroups: ["rhiza.mrchypark.dev"]
   resources: ["rhizaclusters"]
   verbs: ["get", "list"]

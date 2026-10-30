@@ -10,6 +10,7 @@ on:
       - feature/ha-prepared-startup
       - feature/ha-node-prepared-restore
       - feature/ha-exact-sql-outcome
+      - feature/ha-managed-sql-recovery
   workflow_dispatch:
 
 permissions:

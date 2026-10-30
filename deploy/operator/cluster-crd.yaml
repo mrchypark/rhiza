@@ -24,15 +24,15 @@ spec:
               message: genesis receipt cannot be removed or changed and requires authority
             - rule: '!has(self.status) || !has(self.status.genesis) || has(self.status.authority)'
               message: genesis receipt requires authority
-            - rule: '!has(self.status) || !has(self.status.genesis) || (has(oldSelf.status) && has(oldSelf.status.genesis)) || (has(self.status.applicationInit) && self.status.applicationInit.state == "Unused")'
+            - rule: '!has(self.status) || !has(self.status.genesis) || (has(oldSelf.status) && has(oldSelf.status.genesis)) || (has(self.status.applicationInit) && self.status.applicationInit.state == "Unused" && has(self.status.bootstrapPlan) && has(self.status.authority) && has(self.status.authority.everApplicationReserved) && !self.status.authority.everApplicationReserved)'
               message: new genesis requires an unused initialization assignment
+            - rule: '!has(oldSelf.status) || !has(oldSelf.status.authority) || !has(oldSelf.status.authority.everApplicationReserved) || !oldSelf.status.authority.everApplicationReserved || (has(self.status) && has(self.status.authority) && has(self.status.authority.everApplicationReserved) && self.status.authority.everApplicationReserved)'
+              message: application reservation history cannot be removed or reset
           properties:
             spec:
               type: object
               required: [logicalID, voterCount, workload]
               x-kubernetes-validations:
-                - rule: '!has(oldSelf.authority) || !oldSelf.authority.everApplicationReserved || (has(self.authority) && self.authority.everApplicationReserved)'
-                  message: application reservation history cannot be removed or reset
                 - rule: 'has(self.genesisIntent) == has(oldSelf.genesisIntent) && (!has(self.genesisIntent) || self.genesisIntent == oldSelf.genesisIntent)'
                   message: genesisIntent is creation-only and immutable
                 - rule: '!has(self.statefulSet) && !has(self.container) && !has(self.adoptClusterID) && !has(self.automatic) && !has(self.policy) && !has(self.bootstrap) && !has(self.clusterDomain) && !has(self.anchorID) && !has(self.httpPort) && !has(self.peerPort) && !has(self.voterPods)'

@@ -1,0 +1,35 @@
+name: HA managed kubelet bootstrap
+on:
+  push:
+    branches: [feature/ha-managed-sql-recovery]
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  bootstrap:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+      - name: Install kind
+        run: go install sigs.k8s.io/kind@v0.32.0
+      - name: Static harness checks
+        run: |
+          sh -n scripts/test-ha-managed-bootstrap.sh
+          sh scripts/test-ha-managed-bootstrap.sh --oracle-self-test
+          sh -n scripts/ha-managed-bucket-setup
+          cd scripts/ha-managed-bucket-setup-src
+          go test -mod=readonly -timeout=45s ./...
+      - name: Real managed bootstrap
+        env:
+          RHIZA_MANAGED_BUCKET_SETUP: ./scripts/ha-managed-bucket-setup
+        run: sh scripts/test-ha-managed-bootstrap.sh
+      - name: Preserve non-secret diagnostics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ha-managed-bootstrap-${{ github.run_id }}
+          path: ${{ runner.temp }}/ha-managed-bootstrap

@@ -4,8 +4,10 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"github.com/mrchypark/rhiza/internal/types"
 	"io"
 	"net/http"
+	"net/http/httptest"
 	"strconv"
 	"strings"
 	"sync"
@@ -24,9 +26,22 @@ type phase9Server struct {
 	arrived           chan struct{}
 	release           chan struct{}
 	committed         chan struct{}
+	onCreate          func()
 }
 
-// The fixed digests here are test fixtures, not runtime storage evidence.
+func phase9RuntimeProfile() V1Alpha2RuntimeProfile {
+	return V1Alpha2RuntimeProfile{InitImage: "reference:v1", PeerPort: 9090, EvidenceFormat: V1Alpha2ManagedSQLEvidenceFormat, ProfileSecretName: "runtime", Storage: types.ExecutionConfig{AdminToken: "private-admin", ObjStoreProvider: "s3", ObjStoreBucket: "bucket", ObjStoreEndpoint: "s3.example.test"}}
+}
+
+func phase9ManagedList(ctx context.Context, kube *Kubernetes) error {
+	return initializeV1Alpha2ListWith(ctx, kube, func(ref V1Alpha2ClusterRef) error {
+		_, err := ReconcileV1Alpha2ManagedInitialization(ctx, kube, ref, phase9RuntimeProfile())
+		return err
+	})
+}
+
+// Only the legacy-negative test uses these fixed digests. Managed positives
+// always derive the full plan from actual API records and the canonicalizer.
 func phase9Plan(_ context.Context, ref V1Alpha2ClusterRef, logicalID, deploymentUID string) (V1Alpha2ApplicationInitPlan, error) {
 	return NewV1Alpha2ApplicationInitPlan(ref, logicalID, deploymentUID, "test-assignment", strings.Repeat("a", 64), strings.Repeat("b", 64), "test/v1")
 }
@@ -41,13 +56,24 @@ func TestPhase9InitializerRequiresPlanBeforeCreate(t *testing.T) {
 	}
 }
 
+func TestPhase9InitializerLegacyPlanRemainsInert(t *testing.T) {
+	s, kube := phase9Setup(t, phase8Cluster)
+	if _, err := ReconcileV1Alpha2Initialization(context.Background(), kube, phase2Ref, phase9Plan); err == nil {
+		t.Fatal("legacy plan-only path created genesis")
+	}
+	var dep struct{ Spec struct{ Replicas int } }
+	if json.Unmarshal([]byte(s.deployment), &dep) != nil || dep.Spec.Replicas != 0 || s.posts != 1 || s.puts != 0 {
+		t.Fatalf("legacy path was not inert: posts=%d puts=%d", s.posts, s.puts)
+	}
+}
+
 func TestPhase9InitializerRejectsAssignmentWithoutGenesisBeforeCreate(t *testing.T) {
 	cluster := strings.Replace(phase8Cluster, `"status":{`, `"status":{"applicationInit":{},`, 1)
 	if cluster == phase8Cluster {
 		t.Fatal("fixture has no status object")
 	}
 	s, kube := phase9Setup(t, cluster)
-	if _, err := ReconcileV1Alpha2Initialization(context.Background(), kube, phase2Ref, phase9Plan); err == nil {
+	if _, err := ReconcileV1Alpha2ManagedInitialization(context.Background(), kube, phase2Ref, phase9RuntimeProfile()); err == nil {
 		t.Fatal("orphaned assignment accepted")
 	}
 	if s.posts != 0 || s.puts != 0 {
@@ -73,7 +99,7 @@ func TestPhase9InitializerListPaginationGuards(t *testing.T) {
 				}
 				return s.roundTrip(r)
 			}).Kube
-			if err := initializeV1Alpha2List(context.Background(), kube, phase9Plan); err == nil {
+			if err := phase9ManagedList(context.Background(), kube); err == nil {
 				t.Fatal("incomplete or inconsistent list accepted")
 			}
 			if s.posts != 0 || s.puts != 0 {
@@ -84,6 +110,32 @@ func TestPhase9InitializerListPaginationGuards(t *testing.T) {
 }
 
 func (s *phase9Server) roundTrip(r *http.Request) (*http.Response, error) {
+	respond := func(v any) (*http.Response, error) {
+		b, err := json.Marshal(v)
+		return phase2Response(200, string(b)), err
+	}
+	if strings.Contains(r.URL.Path, "/secrets/") {
+		b, _ := json.Marshal(phase9RuntimeProfile())
+		return respond(map[string]any{"metadata": map[string]any{"name": "runtime", "namespace": "ns", "uid": "secretuid"}, "data": map[string][]byte{V1Alpha2ManagedRuntimeProfileKey: b}})
+	}
+	if strings.Contains(r.URL.Path, "/replicasets/") {
+		name, _ := V1Alpha2GenesisDeploymentName(phase2Ref.UID)
+		return respond(map[string]any{"apiVersion": "apps/v1", "kind": "ReplicaSet", "metadata": map[string]any{"name": "rs", "namespace": "ns", "uid": "rsuid", "resourceVersion": "8", "ownerReferences": []any{map[string]any{"apiVersion": "apps/v1", "kind": "Deployment", "name": name, "uid": "deployment", "controller": true}}}})
+	}
+	if strings.HasSuffix(r.URL.Path, "/pods") {
+		s.mu9.Lock()
+		defer s.mu9.Unlock()
+		var deployment struct {
+			Spec struct {
+				Template struct{ Spec json.RawMessage }
+			}
+		}
+		if json.Unmarshal([]byte(s.deployment), &deployment) != nil {
+			return phase2Response(404, `{}`), nil
+		}
+		pods := managedFixturePods(phase2Ref, "rs", "rsuid", deployment.Spec.Template.Spec)
+		return respond(map[string]any{"apiVersion": "v1", "kind": "PodList", "metadata": map[string]any{"resourceVersion": "4"}, "items": pods})
+	}
 	if strings.Contains(r.URL.Path, "/deployments") {
 		s.mu9.Lock()
 		defer s.mu9.Unlock()
@@ -92,7 +144,12 @@ func (s *phase9Server) roundTrip(r *http.Request) (*http.Response, error) {
 			if s.deployment != "" {
 				if s.committed != nil {
 					s.mu9.Unlock()
-					<-s.committed
+					select {
+					case <-s.committed:
+					case <-r.Context().Done():
+						s.mu9.Lock()
+						return nil, r.Context().Err()
+					}
 					s.mu9.Lock()
 				}
 				return phase2Response(409, "conflict"), nil
@@ -112,6 +169,9 @@ func (s *phase9Server) roundTrip(r *http.Request) (*http.Response, error) {
 				s.t.Fatal(err)
 			}
 			s.deployment = string(b)
+			if s.onCreate != nil {
+				s.onCreate()
+			}
 			if s.lostPost {
 				return nil, errors.New("lost create response")
 			}
@@ -132,7 +192,11 @@ func (s *phase9Server) roundTrip(r *http.Request) (*http.Response, error) {
 	if s.arrived != nil && r.Method == http.MethodGet && !strings.HasSuffix(r.URL.Path, "/status") {
 		select {
 		case s.arrived <- struct{}{}:
-			<-s.release
+			select {
+			case <-s.release:
+			case <-r.Context().Done():
+				return nil, r.Context().Err()
+			}
 		default:
 		}
 	}
@@ -145,12 +209,31 @@ func (s *phase9Server) roundTrip(r *http.Request) (*http.Response, error) {
 func phase9Setup(t *testing.T, cluster string) (*phase9Server, *Kubernetes) {
 	t.Helper()
 	s := &phase9Server{phase8Server: &phase8Server{t: t, cluster: cluster, apply: true}}
-	return s, phase2Store(t, s.roundTrip).Kube
+	kube := phase2Store(t, s.roundTrip).Kube
+	server := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		response, err := s.roundTrip(r)
+		if err != nil {
+			// Model an applied POST with a genuinely lost HTTP response.
+			conn, _, hijackErr := w.(http.Hijacker).Hijack()
+			if hijackErr == nil {
+				_ = conn.Close()
+			}
+			return
+		}
+		defer response.Body.Close()
+		w.WriteHeader(response.StatusCode)
+		_, _ = io.Copy(w, response.Body)
+	}))
+	t.Cleanup(server.Close)
+	kube.BaseURL = server.URL
+	kube.Client = server.Client()
+	kube.Client.Timeout = 5 * time.Second
+	return s, kube
 }
 
 func TestPhase9InitializerCreatesOnceAndPreservesStatus(t *testing.T) {
 	s, kube := phase9Setup(t, phase8Cluster)
-	first, err := ReconcileV1Alpha2Initialization(context.Background(), kube, phase2Ref, phase9Plan)
+	first, err := ReconcileV1Alpha2ManagedInitialization(context.Background(), kube, phase2Ref, phase9RuntimeProfile())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -165,10 +248,10 @@ func TestPhase9InitializerCreatesOnceAndPreservesStatus(t *testing.T) {
 	if err := json.Unmarshal([]byte(s.deployment), &deployment); err != nil {
 		t.Fatal(err)
 	}
-	if deployment.Spec.Replicas == nil || *deployment.Spec.Replicas != 0 {
+	if deployment.Spec.Replicas == nil || *deployment.Spec.Replicas != 3 {
 		t.Fatalf("replicas: %v", deployment.Spec.Replicas)
 	}
-	if _, err := ReconcileV1Alpha2Initialization(context.Background(), kube, phase2Ref, phase9Plan); err != nil {
+	if _, err := ReconcileV1Alpha2ManagedInitialization(context.Background(), kube, phase2Ref, phase9RuntimeProfile()); err != nil {
 		t.Fatal(err)
 	}
 	if s.posts != 1 || s.puts != 1 {
@@ -181,7 +264,7 @@ func TestPhase9InitializerCreatesOnceAndPreservesStatus(t *testing.T) {
 
 func TestPhase9InitializerRejectsMissingIntent(t *testing.T) {
 	s, kube := phase9Setup(t, strings.Replace(phase8Cluster, `"genesisIntent":"Create",`, "", 1))
-	if _, err := ReconcileV1Alpha2Initialization(context.Background(), kube, phase2Ref, phase9Plan); err == nil {
+	if _, err := ReconcileV1Alpha2ManagedInitialization(context.Background(), kube, phase2Ref, phase9RuntimeProfile()); err == nil {
 		t.Fatal("missing intent accepted")
 	}
 	if s.posts != 0 || s.puts != 0 {
@@ -193,7 +276,7 @@ func TestPhase9InitializerRejectsUnsafeExistingDeployment(t *testing.T) {
 	for _, mutation := range []string{"replicas", "owner", "template", "generation", "uid"} {
 		t.Run(mutation, func(t *testing.T) {
 			s, kube := phase9Setup(t, phase8Cluster)
-			if _, err := ReconcileV1Alpha2Initialization(context.Background(), kube, phase2Ref, phase9Plan); err != nil {
+			if _, err := ReconcileV1Alpha2ManagedInitialization(context.Background(), kube, phase2Ref, phase9RuntimeProfile()); err != nil {
 				t.Fatal(err)
 			}
 			var obj map[string]any
@@ -222,7 +305,7 @@ func TestPhase9InitializerRejectsUnsafeExistingDeployment(t *testing.T) {
 				t.Fatal("fixture mutation did not change deployment")
 			}
 			s.deployment, s.cluster, s.posts, s.puts = string(b), phase8Cluster, 0, 0
-			if _, err := ReconcileV1Alpha2Initialization(context.Background(), kube, phase2Ref, phase9Plan); err == nil {
+			if _, err := ReconcileV1Alpha2ManagedInitialization(context.Background(), kube, phase2Ref, phase9RuntimeProfile()); err == nil {
 				t.Fatal("unsafe deployment accepted")
 			}
 			if s.posts != 1 || s.puts != 0 {
@@ -244,17 +327,28 @@ func TestPhase9InitializerCreateConflictAndLostResponse(t *testing.T) {
 		t.Run(test.name, func(t *testing.T) {
 			s, kube := phase9Setup(t, phase8Cluster)
 			if test.preexisting {
-				if _, err := ReconcileV1Alpha2Initialization(context.Background(), kube, phase2Ref, phase9Plan); err != nil {
+				if _, err := ReconcileV1Alpha2ManagedInitialization(context.Background(), kube, phase2Ref, phase9RuntimeProfile()); err != nil {
 					t.Fatal(err)
 				}
 				s.cluster, s.posts, s.puts = phase8Cluster, 0, 0
 			}
 			s.lostPost, s.failGet = test.lost, test.failGet
-			_, err := ReconcileV1Alpha2Initialization(context.Background(), kube, phase2Ref, phase9Plan)
+			_, err := ReconcileV1Alpha2ManagedInitialization(context.Background(), kube, phase2Ref, phase9RuntimeProfile())
+			wantPosts := 1
+			if test.lost {
+				if err == nil || s.deployment == "" || s.puts != 0 {
+					t.Fatalf("uncertain POST did not preserve gated candidate: %v", err)
+				}
+				// The managed path returns uncertainty immediately. The next poll
+				// proves the same live candidate instead of deleting/recreating it.
+				s.lostPost = false
+				_, err = ReconcileV1Alpha2ManagedInitialization(context.Background(), kube, phase2Ref, phase9RuntimeProfile())
+				wantPosts = 2
+			}
 			if (err != nil) != test.wantErr {
 				t.Fatalf("error: %v", err)
 			}
-			if s.posts != 1 || (test.wantErr && s.puts != 0) || (!test.wantErr && s.puts != 1) {
+			if s.posts != wantPosts || (test.wantErr && s.puts != 0) || (!test.wantErr && s.puts != 1) {
 				t.Fatalf("posts=%d puts=%d", s.posts, s.puts)
 			}
 		})
@@ -276,7 +370,7 @@ func TestPhase9InitializerImagePullDefaults(t *testing.T) {
 					t.Fatal("cluster image mutation did not apply")
 				}
 				s, kube := phase9Setup(t, cluster)
-				if _, err := ReconcileV1Alpha2Initialization(context.Background(), kube, phase2Ref, phase9Plan); err != nil {
+				if _, err := ReconcileV1Alpha2ManagedInitialization(context.Background(), kube, phase2Ref, phase9RuntimeProfile()); err != nil {
 					t.Fatal(err)
 				}
 				var obj map[string]any
@@ -301,7 +395,7 @@ func TestPhase9InitializerImagePullDefaults(t *testing.T) {
 					t.Fatal("policy mutation did not apply")
 				}
 				s.deployment, s.cluster, s.posts, s.puts = string(b), cluster, 0, 0
-				_, err = ReconcileV1Alpha2Initialization(context.Background(), kube, phase2Ref, phase9Plan)
+				_, err = ReconcileV1Alpha2ManagedInitialization(context.Background(), kube, phase2Ref, phase9RuntimeProfile())
 				if (err == nil) != valid {
 					t.Fatalf("policy %s: %v", policy, err)
 				}
@@ -317,17 +411,32 @@ func TestPhase9InitializerConcurrentCreateCAS(t *testing.T) {
 	s, kube := phase9Setup(t, phase8Cluster)
 	s.arrived, s.release, s.committed = make(chan struct{}, 2), make(chan struct{}), make(chan struct{})
 	errs := make(chan error, 2)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
 	for i := 0; i < 2; i++ {
 		go func() {
-			_, err := ReconcileV1Alpha2Initialization(context.Background(), kube, phase2Ref, phase9Plan)
+			_, err := ReconcileV1Alpha2ManagedInitialization(ctx, kube, phase2Ref, phase9RuntimeProfile())
 			errs <- err
 		}()
 	}
-	<-s.arrived
-	<-s.arrived
+	for i := 0; i < 2; i++ {
+		select {
+		case <-s.arrived:
+		case <-ctx.Done():
+			close(s.release)
+			t.Fatal("concurrent initial GET barrier timed out")
+		}
+	}
 	close(s.release)
 	for i := 0; i < 2; i++ {
-		<-errs
+		select {
+		case err := <-errs:
+			if err != nil {
+				t.Errorf("concurrent reconcile: %v", err)
+			}
+		case <-ctx.Done():
+			t.Fatal("concurrent reconciliation timed out")
+		}
 	}
 	if s.posts != 2 || s.puts != 1 || s.deployment == "" {
 		t.Fatalf("posts=%d puts=%d deployment=%q", s.posts, s.puts, s.deployment)
@@ -357,7 +466,7 @@ func TestPhase9InitializerListGuards(t *testing.T) {
 				}
 				return s.roundTrip(r)
 			}).Kube
-			err := initializeV1Alpha2List(context.Background(), kube, phase9Plan)
+			err := phase9ManagedList(context.Background(), kube)
 			if (err != nil) != test.wantErr {
 				t.Fatalf("error: %v", err)
 			}
@@ -376,7 +485,7 @@ func TestPhase9InitializerListGuards(t *testing.T) {
 
 func TestPhase9InitializerNeverRecreatesLaterGeneration(t *testing.T) {
 	s, kube := phase9Setup(t, phase8Cluster)
-	if _, err := ReconcileV1Alpha2Initialization(context.Background(), kube, phase2Ref, phase9Plan); err != nil {
+	if _, err := ReconcileV1Alpha2ManagedInitialization(context.Background(), kube, phase2Ref, phase9RuntimeProfile()); err != nil {
 		t.Fatal(err)
 	}
 	var obj map[string]any
@@ -395,7 +504,7 @@ func TestPhase9InitializerNeverRecreatesLaterGeneration(t *testing.T) {
 		t.Fatal(err)
 	}
 	s.cluster, s.deployment, s.posts, s.puts = string(b), "", 0, 0
-	snap, err := ReconcileV1Alpha2Initialization(context.Background(), kube, phase2Ref, phase9Plan)
+	snap, err := ReconcileV1Alpha2ManagedInitialization(context.Background(), kube, phase2Ref, phase9RuntimeProfile())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -413,5 +522,86 @@ func TestPhase9InitializerIntervalAndCancellation(t *testing.T) {
 	cancel()
 	if err := RunV1Alpha2Initialization(ctx, kube, time.Second); err == nil {
 		t.Fatal("cancelled context accepted")
+	}
+	if err := RunV1Alpha2ManagedInitialization(context.Background(), kube, 0, phase9RuntimeProfile()); err == nil {
+		t.Fatal("managed zero interval accepted")
+	}
+	if err := RunV1Alpha2ManagedInitialization(ctx, kube, time.Second, phase9RuntimeProfile()); !errors.Is(err, context.Canceled) {
+		t.Fatalf("managed cancellation: %v", err)
+	}
+}
+
+func TestPhase9InitializerGenesisCASConflictAndLostResponse(t *testing.T) {
+	for _, tc := range []struct {
+		name                              string
+		conflict, timeout, apply, wantErr bool
+	}{
+		{"CAS conflict", true, false, true, true},
+		{"applied response lost", false, true, true, false},
+		{"unapplied response lost", false, true, false, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			s, kube := phase9Setup(t, phase8Cluster)
+			s.conflict, s.timeout, s.apply = tc.conflict, tc.timeout, tc.apply
+			_, err := ReconcileV1Alpha2ManagedInitialization(context.Background(), kube, phase2Ref, phase9RuntimeProfile())
+			if (err != nil) != tc.wantErr || s.puts != 1 {
+				t.Fatalf("CAS outcome: %v puts=%d", err, s.puts)
+			}
+			if tc.conflict && !errors.Is(err, ErrV1Alpha2StatusConflict) {
+				t.Fatalf("lost conflict type: %v", err)
+			}
+			if tc.timeout && !tc.apply && !errors.Is(err, ErrV1Alpha2StatusOutcomeUnknown) {
+				t.Fatalf("lost unknown outcome type: %v", err)
+			}
+			if s.deployment == "" {
+				t.Fatal("uncertain candidate removed")
+			}
+			s.conflict, s.timeout, s.apply = false, false, true
+			got, err := ReconcileV1Alpha2ManagedInitialization(context.Background(), kube, phase2Ref, phase9RuntimeProfile())
+			if err != nil {
+				t.Fatal(err)
+			}
+			p, err := got.BootstrapPlan()
+			if err != nil || len(p.Members) != 3 {
+				t.Fatalf("full committed plan: %v", err)
+			}
+			wantPuts := 2
+			if !tc.wantErr {
+				wantPuts = 1
+			}
+			if s.puts != wantPuts {
+				t.Fatalf("genesis recreated after readback: puts=%d", s.puts)
+			}
+		})
+	}
+}
+
+func TestPhase9InitializerRefusesSpecChangeBeforeCAS(t *testing.T) {
+	s, kube := phase9Setup(t, phase8Cluster)
+	s.onCreate = func() { s.cluster = strings.Replace(s.cluster, `"image":"image"`, `"image":"changed"`, 1) }
+	if _, err := ReconcileV1Alpha2ManagedInitialization(context.Background(), kube, phase2Ref, phase9RuntimeProfile()); err == nil || s.puts != 0 {
+		t.Fatalf("changed spec accepted: %v puts=%d", err, s.puts)
+	}
+}
+
+func TestPhase9InitializerManagedLoopCommitsAndCancels(t *testing.T) {
+	s, _ := phase9Setup(t, phase8Cluster)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	kube := phase2Store(t, func(r *http.Request) (*http.Response, error) {
+		if strings.HasSuffix(r.URL.Path, "/rhizaclusters") {
+			return phase2Response(200, `{"apiVersion":"rhiza.mrchypark.dev/v1alpha2","kind":"RhizaClusterList","metadata":{"resourceVersion":"1"},"items":[`+phase8Cluster+`]}`), nil
+		}
+		response, err := s.roundTrip(r)
+		if r.Method == http.MethodPut && err == nil && response.StatusCode == 200 {
+			cancel()
+		}
+		return response, err
+	}).Kube
+	if err := RunV1Alpha2ManagedInitialization(ctx, kube, time.Hour, phase9RuntimeProfile()); !errors.Is(err, context.Canceled) {
+		t.Fatalf("loop did not cancel: %v", err)
+	}
+	if s.posts != 1 || s.puts != 1 || !strings.Contains(s.cluster, `"bootstrapPlan"`) {
+		t.Fatalf("managed loop did not commit once: posts=%d puts=%d", s.posts, s.puts)
 	}
 }
