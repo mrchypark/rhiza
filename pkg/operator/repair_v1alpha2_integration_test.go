@@ -112,6 +112,69 @@ func TestRepairDiagnosticPreservesBodyReadError(t *testing.T) {
 	}
 }
 
+func TestRepairDiagnosticAllowlistedCause(t *testing.T) {
+	body := `{"reason":"Invalid","details":{"causes":[{"reason":"FieldValueInvalid","field":"status.repair.plan.replacement.publicKey","message":"private-value"},{"reason":"secret-type","field":"status.repair.secret-field","message":"private-value"}]}}`
+	var log string
+	d := repairDiagnosticTransport{base: repairDiagnosticRoundTrip(func(*http.Request) (*http.Response, error) {
+		return &http.Response{StatusCode: 422, Body: io.NopCloser(strings.NewReader(body))}, nil
+	}), logf: func(format string, args ...any) { log = fmt.Sprintf(format, args...) }}
+	req, err := http.NewRequest(http.MethodPut, "https://example.invalid/apis/rhiza/namespaces/n/rhizaclusters/genesis-contract/status", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp, err := d.RoundTrip(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := resp.Body.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if string(got) != body || !strings.Contains(log, "status.repair.plan.replacement.publicKey:FieldValueInvalid") || !strings.Contains(log, "other:other") || strings.Contains(log, "private-value") || strings.Contains(log, "secret-field") || strings.Contains(log, "secret-type") {
+		t.Fatalf("unsafe or missing cause diagnostic: %q", log)
+	}
+}
+
+func TestRepairPlanPublicKeyJSONSchemaShape(t *testing.T) {
+	var key quepaxa.PublicKey
+	key[0] = 1
+	b, err := json.Marshal(V1Alpha2RepairMember{PublicKey: key})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var decoded struct {
+		PublicKey string `json:"publicKey"`
+	}
+	if err := json.Unmarshal(b, &decoded); err != nil || len(decoded.PublicKey) != 44 {
+		t.Fatalf("public key is not a 44-character JSON string: %v", err)
+	}
+}
+
+func TestRepairDiagnosticMissingStatusFieldIsNotDifferent(t *testing.T) {
+	body := `{"status":{"authority":{"generation":0}}}`
+	var log string
+	d := repairDiagnosticTransport{base: repairDiagnosticRoundTrip(func(*http.Request) (*http.Response, error) {
+		return &http.Response{StatusCode: 200, Body: io.NopCloser(strings.NewReader(body))}, nil
+	}), logf: func(format string, args ...any) { log = fmt.Sprintf(format, args...) }}
+	req, err := http.NewRequest(http.MethodPut, "https://example.invalid/apis/rhiza/namespaces/n/rhizaclusters/genesis-contract/status", strings.NewReader(body))
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp, err := d.RoundTrip(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := resp.Body.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(log, "differing-status-fields=[]") {
+		t.Fatalf("absent repair incorrectly marked different: %s", log)
+	}
+}
+
 func (d repairDiagnosticTransport) RoundTrip(req *http.Request) (*http.Response, error) {
 	resp, err := d.base.RoundTrip(req)
 	if err != nil || resp == nil || req.Method != http.MethodPut || !strings.HasSuffix(req.URL.Path, "/rhizaclusters/genesis-contract/status") {
@@ -131,6 +194,8 @@ func (d repairDiagnosticTransport) RoundTrip(req *http.Request) (*http.Response,
 		Details struct {
 			Causes []struct {
 				Message string `json:"message"`
+				Field   string `json:"field"`
+				Type    string `json:"reason"`
 			} `json:"causes"`
 		} `json:"details"`
 	}
@@ -142,8 +207,22 @@ func (d repairDiagnosticTransport) RoundTrip(req *http.Request) (*http.Response,
 		}
 	}
 	matches := []string{}
+	causes := []string{}
 	for _, cause := range status.Details.Causes {
-		for _, message := range []string{"repair record cannot be removed", "repair requires consumed managed bootstrap history", "closed repair must match authority and cannot overlap a transition", "repair intent is immutable per operation", "terminal repair is immutable per operation", "a new repair must start closed", "replacement repair requires a terminal predecessor and advanced position", "repair CAS cannot overwrite application authority", "closed repair forbids new application reservations", "repair state and completion must agree", "repair completion must bind the exact operation and position", "REMOVE alone is not final repair completion"} {
+		field := "other"
+		for _, allowed := range []string{"status", "status.repair", "status.repair.state", "status.repair.plan", "status.repair.plan.operationID", "status.repair.plan.clusterUID", "status.repair.plan.generation", "status.repair.plan.deploymentUID", "status.repair.plan.storageID", "status.repair.plan.expectedConfigID", "status.repair.plan.expectedAbortSlot", "status.repair.plan.oldNodeID", "status.repair.plan.oldWALIdentity", "status.repair.plan.bootstrapPlanDigest", "status.repair.plan.finalVoterIDs", "status.repair.plan.replacement", "status.repair.plan.replacement.podName", "status.repair.plan.replacement.podUID", "status.repair.plan.replacement.nodeID", "status.repair.plan.replacement.publicKey", "status.repair.plan.replacement.peerURL", "status.repair.completion"} {
+			if cause.Field == allowed {
+				field = allowed
+			}
+		}
+		causeType := "other"
+		for _, allowed := range []string{"FieldValueInvalid", "FieldValueRequired", "FieldValueNotSupported", "FieldValueDuplicate", "FieldValueTooLong", "FieldValueTooMany", "UnexpectedServerResponse"} {
+			if cause.Type == allowed {
+				causeType = allowed
+			}
+		}
+		causes = append(causes, field+":"+causeType)
+		for _, message := range []string{"repair record cannot be removed", "repair requires consumed managed bootstrap history", "closed repair must match authority and cannot overlap a transition", "repair intent is immutable per operation", "terminal repair is immutable per operation", "a new repair must start closed", "replacement repair requires a terminal predecessor and advanced position", "repair CAS cannot overwrite application authority", "closed repair forbids new application reservations", "repair state and completion must agree", "repair completion must bind the exact operation and position", "REMOVE alone is not final repair completion", "final target must include replacement and exclude old voter"} {
 			if strings.Contains(cause.Message, message) {
 				matches = append(matches, message)
 			}
@@ -160,14 +239,16 @@ func (d repairDiagnosticTransport) RoundTrip(req *http.Request) (*http.Response,
 			}
 			if e == nil && json.Unmarshal(requestData, &requested) == nil && json.Unmarshal(prefix, &returned) == nil {
 				for _, key := range []string{"authority", "repair", "genesis", "applicationInit", "bootstrapPlan"} {
-					if !sameJSON(requested.Status[key], returned.Status[key]) {
+					left, leftOK := requested.Status[key]
+					right, rightOK := returned.Status[key]
+					if leftOK != rightOK || (leftOK && !sameJSON(left, right)) {
 						different = append(different, key)
 					}
 				}
 			}
 		}
 	}
-	d.logf("repair status PUT: HTTP %d reason=%s known-validation=%q differing-status-fields=%q body-prefix-read-error=%t", resp.StatusCode, reason, matches, different, readErr != nil)
+	d.logf("repair status PUT: HTTP %d reason=%s causes=%q known-validation=%q differing-status-fields=%q body-prefix-read-error=%t", resp.StatusCode, reason, causes, matches, different, readErr != nil)
 	return resp, nil
 }
 
