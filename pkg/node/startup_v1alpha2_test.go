@@ -33,6 +33,12 @@ import (
 	"github.com/thanos-io/objstore"
 )
 
+type preparedStartupAllowChecker struct{}
+
+func (preparedStartupAllowChecker) ValidatePreparedStartup(context.Context, recovery.PreparedStartupIdentity) error {
+	return nil
+}
+
 func TestPreparedNodeDenialBeforeTargetAndServing(t *testing.T) {
 	ctx := context.Background()
 	cluster := quepaxa.Cluster{ConfigID: 1, Members: []quepaxa.Member{peerMember("cluster", "a", "a-token"), peerMember("cluster", "b", "b-token")}}
@@ -252,7 +258,11 @@ func TestPreparedNodeAdoptionRestartGenuineWAL(t *testing.T) {
 	if err := learnerCore.AcceptCertifiedValues(view.Decisions()); err != nil {
 		t.Fatal(err)
 	}
-	identity := recovery.PreparedStartupIdentity{ClusterUID: "uid", Generation: 2, DeploymentUID: "deployment", PodUID: "pod", NodeID: "learner", SourceBinding: "source", ConfigDigest: "config"}
+	sourceBinding, configDigest, err := New(config).preparedBindingDigests()
+	if err != nil {
+		t.Fatal(err)
+	}
+	identity := recovery.PreparedStartupIdentity{ClusterUID: "uid", Generation: 2, DeploymentUID: "deployment", PodUID: "pod", NodeID: "learner", SourceBinding: sourceBinding, ConfigDigest: configDigest}
 	membership, err := learnerCore.MembershipHistory()
 	if err != nil {
 		t.Fatal(err)
@@ -267,6 +277,32 @@ func TestPreparedNodeAdoptionRestartGenuineWAL(t *testing.T) {
 	}
 	if err := New(config).verifyPreparedAdoption(ctx, identity); err != nil {
 		t.Fatalf("registered learner restart: %v", err)
+	}
+	walSnapshot := func() [32]byte {
+		t.Helper()
+		files, err := filepath.Glob(filepath.Join(config.DataDir, "qlog", "*"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		var contents bytes.Buffer
+		for _, file := range files {
+			data, err := os.ReadFile(file)
+			if err != nil {
+				t.Fatal(err)
+			}
+			contents.WriteString(filepath.Base(file))
+			contents.Write(data)
+		}
+		return sha256.Sum256(contents.Bytes())
+	}
+	beforeRestart := walSnapshot()
+	restartedNode := New(config)
+	restartErr := restartedNode.OpenPrepared(ctx, PreparedStartupConfig{Identity: identity, Checker: preparedStartupAllowChecker{}})
+	if !errors.Is(restartErr, ErrPreparedWriteAdmissionUnavailable) {
+		t.Fatalf("legacy prepared restart without marker: got %v, want %v", restartErr, ErrPreparedWriteAdmissionUnavailable)
+	}
+	if afterRestart := walSnapshot(); afterRestart != beforeRestart {
+		t.Fatalf("read-only prepared restart changed WAL: before=%x after=%x", beforeRestart, afterRestart)
 	}
 	marker := filepath.Join(config.DataDir, "prepared-adoption.json")
 	validMarker, err := os.ReadFile(marker)

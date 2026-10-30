@@ -180,6 +180,111 @@ func TestCheckpointMembershipModeMismatchFailsClosed(t *testing.T) {
 	}
 }
 
+func TestReadOnlyObserverWithReconfigurationNeverWritesMarker(t *testing.T) {
+	cluster := Cluster{ConfigID: 1, Members: []Member{{ID: "voter"}}}
+
+	legacyDir := t.TempDir()
+	legacy, err := qlog.Open(legacyDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := legacy.Close(); err != nil {
+		t.Fatal(err)
+	}
+	legacy, err = qlog.OpenReadOnly(legacyDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !legacy.ReadOnly() {
+		t.Fatal("OpenReadOnly WAL did not report its mode")
+	}
+	observer, err := NewObserver(Config{NodeID: "observer", Cluster: cluster, WAL: legacy, EnableReconfiguration: true})
+	if err != nil {
+		t.Fatalf("open read-only observer on legacy WAL: %v", err)
+	}
+	if observer.reconfigWAL {
+		t.Fatal("legacy WAL unexpectedly reports an absent marker")
+	}
+	entries, err := legacy.Read()
+	if err != nil || len(entries) != 0 {
+		t.Fatalf("read-only observer changed legacy WAL: entries=%d err=%v", len(entries), err)
+	}
+	if _, err := New(Config{NodeID: "voter", Cluster: cluster, WAL: legacy, EnableReconfiguration: true}); err == nil {
+		t.Fatal("accepted read-only WAL for a voter")
+	}
+	if err := legacy.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	markedDir := t.TempDir()
+	marked, err := qlog.Open(markedDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := New(Config{NodeID: "voter", Cluster: cluster, WAL: marked, EnableReconfiguration: true}); err != nil {
+		t.Fatalf("writable voter did not initialize reconfiguration marker: %v", err)
+	}
+	if err := marked.Close(); err != nil {
+		t.Fatal(err)
+	}
+	marked, err = qlog.OpenReadOnly(markedDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer marked.Close()
+	observer, err = NewObserver(Config{NodeID: "observer", Cluster: cluster, WAL: marked, EnableReconfiguration: true})
+	if err != nil || !observer.reconfigWAL {
+		t.Fatalf("read-only observer rejected marker/history: reconfigWAL=%v err=%v", observer != nil && observer.reconfigWAL, err)
+	}
+	entries, err = marked.Read()
+	if err != nil || len(entries) != 1 {
+		t.Fatalf("read-only observer changed marked WAL: entries=%d err=%v", len(entries), err)
+	}
+
+	initial := Cluster{ConfigID: 1, Members: []Member{{ID: "a"}, {ID: "b"}, {ID: "c"}}}
+	transport := &clusterTransport{cores: map[NodeID]*Core{}, down: map[NodeID]bool{}, dropDecision: map[NodeID]bool{}}
+	historyDirs := make(map[NodeID]string, len(initial.Members))
+	for _, member := range initial.Members {
+		dir := filepath.Join(t.TempDir(), string(member.ID))
+		wal, err := qlog.Open(dir)
+		if err != nil {
+			t.Fatal(err)
+		}
+		core := newCore(member.ID, &initial, wal, transport)
+		core.reconfigEnabled = true
+		core.reconfigAdmission = func(context.Context, Cluster, Slot, [32]byte) error { return nil }
+		transport.cores[member.ID] = core
+		historyDirs[member.ID] = dir
+	}
+	targetCluster := Cluster{ConfigID: 2, Members: []Member{{ID: "a"}, {ID: "b"}}}
+	if _, err := transport.cores["a"].BeginReconfiguration(context.Background(), targetCluster); err != nil {
+		t.Fatal(err)
+	}
+	if err := transport.cores["a"].FinishReconfiguration(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	for _, core := range transport.cores {
+		if err := core.wal.Close(); err != nil {
+			t.Fatal(err)
+		}
+	}
+	history, err := qlog.OpenReadOnly(historyDirs["a"])
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer history.Close()
+	observer, err = NewObserver(Config{NodeID: "history-observer", Cluster: initial, WAL: history, EnableReconfiguration: true})
+	if err != nil {
+		t.Fatalf("read-only observer rejected genuine reconfiguration history: %v", err)
+	}
+	if got := observer.ConfigID(); got != 2 {
+		t.Fatalf("read-only observer recovered config=%d, want genuine history config=2", got)
+	}
+	if _, err := observer.MembershipHistory(); err != nil {
+		t.Fatalf("read-only observer lost membership history: %v", err)
+	}
+}
+
 func TestCheckpointMembershipRejectsUnboundFreeze(t *testing.T) {
 	_, _, initial, seal, _ := checkpointMembershipSource(t)
 	history := cloneMembershipRecord(*seal.Membership)

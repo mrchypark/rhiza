@@ -58,6 +58,9 @@ func newCoreFromConfig(config Config, observer, learner bool) (*Core, error) {
 	if config.WAL == nil {
 		return nil, fmt.Errorf("%w: WAL is required", ErrInvalidConfig)
 	}
+	if config.WAL.ReadOnly() && !observer {
+		return nil, fmt.Errorf("%w: read-only WAL is only supported for observers", ErrInvalidConfig)
+	}
 	if len(config.Cluster.Members) == 0 {
 		return nil, fmt.Errorf("%w: at least one member is required", ErrInvalidConfig)
 	}
@@ -153,6 +156,9 @@ func newCoreFromConfig(config Config, observer, learner bool) (*Core, error) {
 		return nil, fmt.Errorf("recover QuePaxa: %w", err)
 	}
 	if config.EnableReconfiguration && !core.reconfigWAL {
+		if observer && config.WAL.ReadOnly() {
+			return core, nil
+		}
 		if err := config.WAL.Append(qlog.Entry{Type: qlog.EntryReceipt, Payload: append([]byte(nil), isrEntryV2Magic...)}); err != nil {
 			return nil, err
 		}

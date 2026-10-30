@@ -85,6 +85,13 @@ func (w *WAL) Bytes() int64 {
 	return w.bytesLocked()
 }
 
+// ReadOnly reports whether this handle was opened for inspection only.
+func (w *WAL) ReadOnly() bool {
+	w.mu.RLock()
+	defer w.mu.RUnlock()
+	return w.readOnly
+}
+
 func (w *WAL) bytesLocked() int64 {
 	return w.totalBytes
 }
