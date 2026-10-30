@@ -1,8 +1,10 @@
 package operator
 
 import (
+	"bufio"
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"crypto/tls"
 	"crypto/x509"
 	"encoding/json"
@@ -12,6 +14,8 @@ import (
 	"net/http"
 	"os"
 	"os/exec"
+	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -57,6 +61,58 @@ func (r *repairDiagnosticFault) Read(p []byte) (int, error) {
 func (r *repairDiagnosticFault) Close() error { r.closed = true; return nil }
 
 type repairDiagnosticRoundTrip func(*http.Request) (*http.Response, error)
+
+type repairDiagnosticRule struct{ expression, id string }
+
+func repairDiagnosticRules() []repairDiagnosticRule {
+	f, err := os.Open(filepath.Join("..", "..", "deploy", "operator", "cluster-crd.yaml"))
+	if err != nil {
+		return nil
+	}
+	defer f.Close()
+	var rules []repairDiagnosticRule
+	s := bufio.NewScanner(f)
+	for line := 1; s.Scan(); line++ {
+		text := strings.TrimSpace(s.Text())
+		if !strings.HasPrefix(text, "- rule: '") || !strings.HasSuffix(text, "'") {
+			continue
+		}
+		expression := strings.TrimSuffix(strings.TrimPrefix(text, "- rule: '"), "'")
+		sum := sha256.Sum256([]byte(expression))
+		rules = append(rules, repairDiagnosticRule{expression: expression, id: fmt.Sprintf("line-%d-%x", line, sum[:6])})
+	}
+	if s.Err() != nil {
+		return nil
+	}
+	return rules
+}
+
+func repairDiagnosticCEL(message string, rules []repairDiagnosticRule) (classes, keys, ids []string) {
+	lower := strings.ToLower(message)
+	for _, class := range []struct{ needle, name string }{{"no such key", "missing-key"}, {"no such overload", "overload"}, {"type conversion", "type-conversion"}, {"cost budget", "cost-budget"}, {"cost limit", "cost-limit"}, {"validation failed due to running out of cost budget", "cost-budget"}} {
+		if strings.Contains(lower, class.needle) {
+			classes = append(classes, class.name)
+		}
+	}
+	for _, key := range []string{"repair", "completion", "authority", "pendingWrite", "pendingRequest", "applicationInit", "bootstrapPlan", "plan", "state", "operationID", "generation", "binding", "owner", "configID", "slot"} {
+		for _, form := range []string{key, "'" + key + "'", "\"" + key + "\""} {
+			needle := "no such key: " + form
+			if at := strings.Index(message, needle); at >= 0 {
+				end := at + len(needle)
+				if end == len(message) || strings.ContainsRune(" \t\r\n,.;:)]}", rune(message[end])) {
+					keys = append(keys, key)
+					break
+				}
+			}
+		}
+	}
+	for _, rule := range rules {
+		if strings.Contains(message, rule.expression) {
+			ids = append(ids, rule.id)
+		}
+	}
+	return
+}
 
 func (f repairDiagnosticRoundTrip) RoundTrip(req *http.Request) (*http.Response, error) {
 	return f(req)
@@ -138,6 +194,39 @@ func TestRepairDiagnosticAllowlistedCause(t *testing.T) {
 	}
 }
 
+func TestRepairDiagnosticCELClassification(t *testing.T) {
+	rules := repairDiagnosticRules()
+	if len(rules) == 0 {
+		t.Fatal("CRD CEL rules unavailable")
+	}
+	var selected repairDiagnosticRule
+	for _, rule := range rules {
+		if strings.Contains(rule.expression, "oldSelf.repair") {
+			selected = rule
+			break
+		}
+	}
+	if selected.id == "" {
+		t.Fatal("repair CEL rule unavailable")
+	}
+	message := "no such key: repair evaluating rule " + selected.expression + " private-SQL-token-xyz"
+	classes, keys, ids := repairDiagnosticCEL(message, rules)
+	if !slices.Contains(classes, "missing-key") || !slices.Contains(keys, "repair") || !slices.Contains(ids, selected.id) {
+		t.Fatalf("missing expected CEL classification: %q %q %q", classes, keys, ids)
+	}
+	if strings.Contains(fmt.Sprint(classes, keys, ids), "private-SQL-token-xyz") || strings.Contains(fmt.Sprint(classes, keys, ids), selected.expression) {
+		t.Fatal("diagnostic leaked raw cause")
+	}
+	classes, _, _ = repairDiagnosticCEL("validation failed due to running out of cost budget", rules)
+	if !slices.Contains(classes, "cost-budget") {
+		t.Fatal("cost failure not classified")
+	}
+	_, keys, _ = repairDiagnosticCEL("no such key: repair-private-token", rules)
+	if len(keys) != 0 {
+		t.Fatal("non-allowlisted key matched by prefix")
+	}
+}
+
 func TestRepairPlanPublicKeyJSONSchemaShape(t *testing.T) {
 	var key quepaxa.PublicKey
 	key[0] = 1
@@ -208,7 +297,13 @@ func (d repairDiagnosticTransport) RoundTrip(req *http.Request) (*http.Response,
 	}
 	matches := []string{}
 	causes := []string{}
+	var celClasses, celKeys, celRules []string
+	rules := repairDiagnosticRules()
 	for _, cause := range status.Details.Causes {
+		classes, keys, ids := repairDiagnosticCEL(cause.Message, rules)
+		celClasses = append(celClasses, classes...)
+		celKeys = append(celKeys, keys...)
+		celRules = append(celRules, ids...)
 		field := "other"
 		for _, allowed := range []string{"status", "status.repair", "status.repair.state", "status.repair.plan", "status.repair.plan.operationID", "status.repair.plan.clusterUID", "status.repair.plan.generation", "status.repair.plan.deploymentUID", "status.repair.plan.storageID", "status.repair.plan.expectedConfigID", "status.repair.plan.expectedAbortSlot", "status.repair.plan.oldNodeID", "status.repair.plan.oldWALIdentity", "status.repair.plan.bootstrapPlanDigest", "status.repair.plan.finalVoterIDs", "status.repair.plan.replacement", "status.repair.plan.replacement.podName", "status.repair.plan.replacement.podUID", "status.repair.plan.replacement.nodeID", "status.repair.plan.replacement.publicKey", "status.repair.plan.replacement.peerURL", "status.repair.completion"} {
 			if cause.Field == allowed {
@@ -248,7 +343,7 @@ func (d repairDiagnosticTransport) RoundTrip(req *http.Request) (*http.Response,
 			}
 		}
 	}
-	d.logf("repair status PUT: HTTP %d reason=%s causes=%q known-validation=%q differing-status-fields=%q body-prefix-read-error=%t", resp.StatusCode, reason, causes, matches, different, readErr != nil)
+	d.logf("repair status PUT: HTTP %d reason=%s causes=%q known-validation=%q cel-class=%q cel-known-key=%q cel-rule=%q differing-status-fields=%q body-prefix-read-error=%t", resp.StatusCode, reason, causes, matches, celClasses, celKeys, celRules, different, readErr != nil)
 	return resp, nil
 }
 
