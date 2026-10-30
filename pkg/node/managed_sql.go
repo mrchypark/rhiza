@@ -39,6 +39,9 @@ func (n *Node) CheckManagedLocalRead(ctx context.Context) error {
 			return err
 		}
 	}
+	if !n.core.IsVoter() {
+		return network.ErrNotReady
+	}
 	state := n.managedRuntimeState()
 	checker, ok := n.managedStartup.Checker.(ManagedSQLReadChecker)
 	if !ok {
@@ -219,24 +222,44 @@ func managedSQLControlOnly(value []byte) error {
 // InspectManagedSQL rejects histories outside this bounded SQL-only host. An
 // unresolved recorder is never empty-state proof, even when SQLite is empty.
 func (n *Node) InspectManagedSQL(ctx context.Context, fresh bool) (ManagedSQLSnapshot, error) {
+	return n.inspectManagedSQL(ctx, fresh, false)
+}
+
+// InspectManagedSQLRead verifies only the materializer's actual applied,
+// certified prefix. It neither replays nor consumes an undecided suffix.
+func (n *Node) InspectManagedSQLRead(ctx context.Context) (ManagedSQLSnapshot, error) {
+	return n.inspectManagedSQL(ctx, false, true)
+}
+
+func (n *Node) inspectManagedSQL(ctx context.Context, fresh, localRead bool) (ManagedSQLSnapshot, error) {
 	if _, err := n.ManagedState(); err != nil {
 		return ManagedSQLSnapshot{}, err
 	}
-	if err := n.replayLocalDecisions(ctx); err != nil {
-		return ManagedSQLSnapshot{}, err
+	if !localRead {
+		if err := n.replayLocalDecisions(ctx); err != nil {
+			return ManagedSQLSnapshot{}, err
+		}
 	}
 	n.replayMu.Lock()
 	defer n.replayMu.Unlock()
 	before := n.managedRuntimeState()
-	if before.WALIdentity == "" || before.RecorderTip > before.CertifiedTip || before.AppliedTip != before.CertifiedTip || n.core.CompactionFloor() != 0 {
+	if before.WALIdentity == "" || before.AppliedTip > before.CertifiedTip || !localRead && (before.RecorderTip > before.CertifiedTip || before.AppliedTip != before.CertifiedTip) || n.core.CompactionFloor() != 0 {
 		return ManagedSQLSnapshot{}, fmt.Errorf("SQL host requires registered, resolved, uncompacted history")
 	}
-	for from := quepaxa.Slot(1); uint64(from) <= before.CertifiedTip; {
+	for from := quepaxa.Slot(1); uint64(from) <= before.AppliedTip; {
 		values, _, err := n.core.DecisionsFrom(from, 256)
 		if err != nil || len(values) == 0 {
 			return ManagedSQLSnapshot{}, fmt.Errorf("SQL history unavailable: %w", err)
 		}
 		for _, v := range values {
+			if uint64(v.Slot) > before.AppliedTip {
+				break
+			}
+			if uint64(v.Slot) == before.AppliedTip {
+				if err := n.material.ValidateTip(before.AppliedTip, v.Value); err != nil {
+					return ManagedSQLSnapshot{}, err
+				}
+			}
 			if len(v.Value) != 0 {
 				_, sql, err := types.DecodeSQLBatch(v.Value)
 				if err != nil || sql && fresh {
@@ -310,6 +333,11 @@ func (n *Node) QueryManagedSQL(ctx context.Context, req network.QueryRequest) (n
 	}
 	if err := n.CheckManagedLocalRead(ctx); err != nil {
 		return network.QueryResponse{}, err
+	}
+	if req.Consistency == "linearizable" {
+		if err := n.managedStartup.Checker.ValidateManagedAdmission(ctx, n.managedStartup.Identity, n.managedRuntimeState()); err != nil {
+			return network.QueryResponse{}, err
+		}
 	}
 	// The private server retains its lifecycle/read limits and enforces the
 	// quorum ReadIndex barrier only for explicit linearizable queries.

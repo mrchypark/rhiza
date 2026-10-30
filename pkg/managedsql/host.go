@@ -272,7 +272,7 @@ func (h *Host) ValidateManagedSQLRead(ctx context.Context, i node.ManagedStartup
 }
 
 func (h *Host) validateManagedState(ctx context.Context, i node.ManagedStartupIdentity, runtime node.ManagedRuntimeState, allowActiveWrite bool) error {
-	if h.uncertain.Load() {
+	if allowActiveWrite && h.uncertain.Load() {
 		return fmt.Errorf("SQL outcome unknown; explicit pending recovery required")
 	}
 	if i != h.identity {
@@ -282,10 +282,14 @@ func (h *Host) validateManagedState(ctx context.Context, i node.ManagedStartupId
 	if err != nil {
 		return err
 	}
+	if !allowActiveWrite {
+		// live() validates and preserves pending/original SQL and current
+		// authority. Neither an unresolved outcome nor newer canonical evidence
+		// invalidates this runtime's previously admitted certified snapshot.
+		_, err := h.node.InspectManagedSQLRead(ctx)
+		return err
+	}
 	if pending, ok := a.Pending(); ok {
-		if !allowActiveWrite {
-			return fmt.Errorf("pending SQL blocks local reads")
-		}
 		h.gateMu.RLock()
 		active := h.active
 		h.gateMu.RUnlock()

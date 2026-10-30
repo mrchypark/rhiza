@@ -1,6 +1,7 @@
 package node
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/json"
@@ -125,6 +126,55 @@ func (n *Node) changeMembership(ctx context.Context, request network.MembershipC
 		}
 		if !reflect.DeepEqual(n.core.CurrentCluster(), operation.Target) {
 			return network.ErrRequestConflict
+		}
+	} else {
+		// A locally durable terminal does not establish delivery/ACK completion.
+		history, err := n.core.MembershipHistory()
+		if err != nil {
+			return fmt.Errorf("membership completion history: %w", err)
+		}
+		var terminal *quepaxa.DecidedValue
+		var previous quepaxa.Slot
+		for _, transition := range history.Transitions {
+			if n.core.ClusterForSlot(transition.Freeze.Slot).ConfigID != request.ExpectedConfigID || !reflect.DeepEqual(n.core.ClusterForSlot(transition.Terminal.Slot+1), operation.Target) {
+				previous = transition.Terminal.Slot
+				continue
+			}
+			if terminal != nil {
+				return fmt.Errorf("ambiguous membership terminal")
+			}
+			if previous < n.core.CompactionFloor() {
+				return fmt.Errorf("membership revision history compacted")
+			}
+			var revision quepaxa.Slot
+			for slot := previous + 1; slot < transition.Freeze.Slot; slot++ {
+				value, ok := n.core.CertifiedValue(slot)
+				if !ok {
+					return fmt.Errorf("membership revision history unavailable")
+				}
+				control, err := quepaxa.DecodeReconfiguration(value.Value)
+				if err != nil {
+					return fmt.Errorf("invalid membership revision history: %w", err)
+				}
+				if control {
+					revision = slot
+				}
+			}
+			if revision != request.ExpectedAbortSlot {
+				return network.ErrRequestConflict
+			}
+			decision := transition.Terminal
+			terminal = &decision
+		}
+		if terminal == nil {
+			return fmt.Errorf("membership terminal unavailable")
+		}
+		completed, err := n.core.CompleteDecision(ctx, terminal.Slot)
+		if err != nil {
+			return fmt.Errorf("membership terminal completion: %w", err)
+		}
+		if completed.Hash != terminal.Hash || !bytes.Equal(completed.Value, terminal.Value) || !bytes.Equal(completed.Certificate, terminal.Certificate) {
+			return fmt.Errorf("membership terminal changed")
 		}
 	}
 	return n.persistMembership(ctx)

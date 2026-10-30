@@ -1,8 +1,12 @@
 package managedsql
 
 import (
+	"bytes"
 	"context"
+	"database/sql"
 	"encoding/json"
+	"fmt"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -27,7 +31,7 @@ func TestManagedSQLLocalReadsRemainReadyWithoutQuorum(t *testing.T) {
 		}
 		for _, consistency := range []string{"", "local"} {
 			response, err := h.Query(ctx, QueryRequest{SQL: "SELECT COUNT(*) FROM local_read", Consistency: consistency})
-			if err != nil || len(response.Rows) != 1 {
+			if err != nil || len(response.Rows) != 1 || len(response.Rows[0]) != 1 || fmt.Sprint(response.Rows[0][0]) != "0" || response.AppliedSlot > response.ConsensusTip {
 				t.Fatalf("local consistency %q: %+v %v", consistency, response, err)
 			}
 		}
@@ -66,7 +70,18 @@ func TestManagedSQLLocalReadsRemainReadyWithoutQuorum(t *testing.T) {
 		}
 	}
 	h.uncertain.Store(true)
-	rejectLocal("unknown SQL outcome")
+	beforeRead, err := h.node.ManagedState()
+	if err != nil {
+		t.Fatal(err)
+	}
+	checkLocal()
+	afterRead, err := h.node.ManagedState()
+	if err != nil || beforeRead != afterRead {
+		t.Fatalf("local snapshot reads changed runtime state: before=%+v after=%+v err=%v", beforeRead, afterRead, err)
+	}
+	if !h.uncertain.Load() {
+		t.Fatal("local reads cleared unknown outcome")
+	}
 	h.uncertain.Store(false)
 	fixture.mu.Lock()
 	original := append(json.RawMessage(nil), fixture.obj["status"]...)
@@ -81,10 +96,29 @@ func TestManagedSQLLocalReadsRemainReadyWithoutQuorum(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	rejectLocal("current evidence mismatch")
+	checkLocal() // Newer canonical evidence cannot invalidate the old snapshot.
 	fixture.mu.Lock()
 	fixture.obj["status"] = original
 	fixture.mu.Unlock()
+	checkLocal()
+	// Simulate actual local corruption through a second SQLite connection;
+	// unlike canonical evidence drift, an invalid internal schema must close reads.
+	db, err := sql.Open("sqlite3", filepath.Join(configs[0].Runtime.DataDir, "sqlite.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		if err := db.Close(); err != nil {
+			t.Error(err)
+		}
+	})
+	if _, err := db.ExecContext(ctx, "CREATE TABLE _rhiza_corrupt_internal(value)"); err != nil {
+		t.Fatal(err)
+	}
+	rejectLocal("corrupted local internal schema")
+	if _, err := db.ExecContext(ctx, "DROP TABLE _rhiza_corrupt_internal"); err != nil {
+		t.Fatal(err)
+	}
 	checkLocal()
 	fixture.mu.Lock()
 	if err := json.Unmarshal(original, &status); err != nil {
@@ -117,7 +151,17 @@ func TestManagedSQLLocalReadsRemainReadyWithoutQuorum(t *testing.T) {
 	h.gateMu.Lock()
 	h.active = &pending
 	h.gateMu.Unlock()
-	rejectLocal("pending SQL, even with active write exception")
+	fixture.mu.Lock()
+	pendingStatus := append(json.RawMessage(nil), fixture.obj["status"]...)
+	fixture.mu.Unlock()
+	h.uncertain.Store(true)
+	checkLocal()
+	fixture.mu.Lock()
+	unchanged := bytes.Equal(pendingStatus, fixture.obj["status"])
+	fixture.mu.Unlock()
+	if !unchanged || !h.uncertain.Load() {
+		t.Fatal("local reads mutated pending/evidence/unknown state")
+	}
 	if _, err := h.node.API(); err == nil {
 		t.Fatal("raw managed API exposed")
 	}

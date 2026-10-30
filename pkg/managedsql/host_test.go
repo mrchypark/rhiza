@@ -496,8 +496,8 @@ func TestManagedSQLPendingDurableOriginalResolvesWithoutNewExecution(t *testing.
 	if err != nil {
 		t.Fatal(err)
 	}
-	if h.Ready(context.Background()) == nil {
-		t.Fatal("unknown finalization reopened admission")
+	if err := h.Ready(context.Background()); err != nil {
+		t.Fatalf("unknown finalization blocked certified local snapshot: %v", err)
 	}
 	if _, err := h.Execute(context.Background(), ExecuteRequest{RequestID: "blocked", SQL: "INSERT INTO app VALUES (1)"}); err == nil {
 		t.Fatal("new write bypassed pending uncertainty")
@@ -540,7 +540,10 @@ func TestManagedSQLUnknownPendingIsNotNoEffectAndBlocksNewSQL(t *testing.T) {
 	if err := h.RecoverPending(context.Background()); err == nil {
 		t.Fatal("unknown request became no-effect proof")
 	}
-	if h.Ready(context.Background()) == nil {
+	if err := h.Ready(context.Background()); err != nil {
+		t.Fatalf("unknown request blocked previous certified snapshot: %v", err)
+	}
+	if err := h.node.AdmitManaged(context.Background()); err == nil {
 		t.Fatal("unknown request admitted new SQL")
 	}
 	a, err = operator.LoadV1Alpha2Admission(context.Background(), configs[0].Store, configs[0].Ref)
@@ -565,8 +568,11 @@ func TestManagedSQLLostFinalizeResponseRequiresFreshRecoveryAdmission(t *testing
 	if _, err := h.Execute(context.Background(), ExecuteRequest{RequestID: "lost-response", SQL: "CREATE TABLE app(value)"}); err == nil {
 		t.Fatal("lost response established writer ownership")
 	}
-	if h.Ready(context.Background()) == nil {
-		t.Fatal("unknown finalization automatically reopened")
+	if err := h.Ready(context.Background()); err != nil {
+		t.Fatalf("unknown finalization blocked local snapshot: %v", err)
+	}
+	if err := h.node.AdmitManaged(context.Background()); err == nil {
+		t.Fatal("unknown finalization automatically reopened write admission")
 	}
 	a, err := operator.LoadV1Alpha2Admission(context.Background(), configs[0].Store, configs[0].Ref)
 	if err != nil {
