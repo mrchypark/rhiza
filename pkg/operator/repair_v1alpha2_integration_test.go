@@ -5,12 +5,12 @@ import (
 	"crypto/tls"
 	"crypto/x509"
 	"encoding/json"
-	"fmt"
 	"net/http"
 	"os"
 	"os/exec"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/mrchypark/rhiza/internal/types"
 	"github.com/mrchypark/rhiza/pkg/quepaxa"
@@ -78,12 +78,24 @@ func TestV1Alpha2RepairAPIServerContract(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	rs := fmt.Sprintf(`{"apiVersion":"apps/v1","kind":"ReplicaSet","metadata":{"name":"repair-contract-rs","ownerReferences":[{"apiVersion":"apps/v1","kind":"Deployment","name":%q,"uid":%q,"controller":true}]},"spec":{"replicas":0,"selector":{"matchLabels":{"app":"repair-contract"}},"template":{"metadata":{"labels":{"app":"repair-contract"}},"spec":{"containers":[{"name":"app","image":"example.invalid/app"}]}}}}`, depName, a.Authority().Binding.DeploymentUID)
-	kubectl(rs, "create", "-f", "-")
-	rsUID := kubectl("", "get", "replicaset", "repair-contract-rs", "-o", "jsonpath={.metadata.uid}")
-	pod := fmt.Sprintf(`{"apiVersion":"v1","kind":"Pod","metadata":{"name":"repair-contract-pod","ownerReferences":[{"apiVersion":"apps/v1","kind":"ReplicaSet","name":"repair-contract-rs","uid":%q,"controller":true}]},"spec":{"nodeName":"repair-contract-no-such-node","initContainers":[{"name":%q,"image":"example.invalid/init"}],"containers":[{"name":"app","image":"example.invalid/app"}]}}`, rsUID, V1Alpha2PrepareIdentityContainer)
-	kubectl(pod, "create", "-f", "-")
-	podUID := kubectl("", "get", "pod", "repair-contract-pod", "-o", "jsonpath={.metadata.uid}")
+	deploymentPatch, err := json.Marshal(map[string]any{"spec": map[string]any{"replicas": 1, "template": map[string]any{"spec": map[string]any{"nodeName": "repair-contract-no-such-node", "initContainers": []any{map[string]any{"name": V1Alpha2PrepareIdentityContainer, "image": "example.invalid/init"}}}}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	kubectl("", "patch", "deployment", depName, "--type=merge", "-p", string(deploymentPatch))
+	var podName string
+	deadline := time.Now().Add(10 * time.Second)
+	for time.Now().Before(deadline) {
+		podName = kubectl("", "get", "pods", "-l", "app=genesis-contract", "-o", "jsonpath={.items[*].metadata.name}")
+		if podName != "" {
+			break
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+	if podName == "" {
+		t.Fatal("Deployment did not create its fixture Pod")
+	}
+	podUID := kubectl("", "get", "pod", podName, "-o", "jsonpath={.metadata.uid}")
 	nodeID, err := types.ManagedNodeID(podUID)
 	if err != nil {
 		t.Fatal(err)
@@ -96,9 +108,9 @@ func TestV1Alpha2RepairAPIServerContract(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	kubectl("", "patch", "pod", "repair-contract-pod", "--subresource=status", "--type=merge", "-p", string(status))
+	kubectl("", "patch", "pod", podName, "--subresource=status", "--type=merge", "-p", string(status))
 	voters := []types.NodeID{nodeID, "survivor"}
-	plan := V1Alpha2RepairPlan{OperationID: "repair-cel", ClusterUID: ref.UID, Generation: a.Authority().Generation, DeploymentUID: a.Authority().Binding.DeploymentUID, StorageID: a.Authority().Binding.StorageID, ExpectedConfigID: 1, OldNodeID: "old", OldWALIdentity: "registered-nonce", BootstrapPlanDigest: init.Assignment().Plan.BootstrapPlanDigest, FinalVoterIDs: voters, Replacement: V1Alpha2RepairMember{PodName: "repair-contract-pod", PodUID: podUID, NodeID: nodeID, PublicKey: key, PeerURL: "quic://10.0.0.1:9090"}}
+	plan := V1Alpha2RepairPlan{OperationID: "repair-cel", ClusterUID: ref.UID, Generation: a.Authority().Generation, DeploymentUID: a.Authority().Binding.DeploymentUID, StorageID: a.Authority().Binding.StorageID, ExpectedConfigID: 1, OldNodeID: "old", OldWALIdentity: "registered-nonce", BootstrapPlanDigest: init.Assignment().Plan.BootstrapPlanDigest, FinalVoterIDs: voters, Replacement: V1Alpha2RepairMember{PodName: podName, PodUID: podUID, NodeID: nodeID, PublicKey: key, PeerURL: "quic://10.0.0.1:9090"}}
 	patch := func(body any, want string) {
 		t.Helper()
 		b, e := json.Marshal(map[string]any{"status": body})
