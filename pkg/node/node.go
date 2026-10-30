@@ -1535,6 +1535,9 @@ func (n *Node) restoreArchiveCatchUp(ctx context.Context) (resultErr error) {
 	// A compacted peer means local history may no longer be sufficient for a
 	// linearizable operation. Reject new client traffic before any remote I/O.
 	n.ready.Store(false)
+	if n.managedStartup != nil {
+		return fmt.Errorf("managed checkpoint catch-up is unavailable until authorized restore is implemented")
+	}
 	if n.archive == nil || n.checkpoints == nil || n.core == nil || n.material == nil || n.server == nil {
 		return fmt.Errorf("live checkpoint recovery is unavailable")
 	}

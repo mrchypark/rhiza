@@ -83,22 +83,25 @@ func Open(ctx context.Context, cfg Config) (*Host, error) {
 	if h.authority.Generation != cfg.Plan.Generation || h.authority.Binding.DeploymentUID != cfg.Plan.DeploymentUID || h.authority.Binding.StorageID != cfg.Plan.StorageID {
 		return nil, fmt.Errorf("current authority differs from installed generation and storage binding")
 	}
-	fresh := initial.Assignment().State == "Unused"
-	if !fresh && cfg.Prepared == nil {
-		admission, e := operator.LoadV1Alpha2Admission(ctx, cfg.Store, cfg.Ref)
-		if e != nil {
-			return nil, e
-		}
-		// Only the explicit immutable initial-consumption record can identify
-		// the still-empty bootstrap. Advanced evidence needs existing history.
-		fresh = evidenceHash(admission.Evidence()) == initial.Assignment().InitialEvidenceDigest
-	}
-	h.identity = node.ManagedStartupIdentity{Member: recovery.PreparedStartupIdentity{ClusterUID: cfg.Ref.UID, Generation: cfg.Plan.Generation, DeploymentUID: cfg.Plan.DeploymentUID, PodUID: cfg.PodUID, NodeID: string(cfg.Runtime.NodeID), SourceBinding: source, ConfigDigest: member}, AssignmentID: cfg.Plan.AssignmentID, IntentHash: cfg.Plan.IntentHash, StorageID: cfg.Plan.StorageID, PhysicalBinding: source, BootstrapPlanDigest: common, EvidenceFormat: EvidenceFormat, Fresh: fresh}
+	h.identity = node.ManagedStartupIdentity{Member: recovery.PreparedStartupIdentity{ClusterUID: cfg.Ref.UID, Generation: cfg.Plan.Generation, DeploymentUID: cfg.Plan.DeploymentUID, PodUID: cfg.PodUID, NodeID: string(cfg.Runtime.NodeID), SourceBinding: source, ConfigDigest: member}, AssignmentID: cfg.Plan.AssignmentID, IntentHash: cfg.Plan.IntentHash, StorageID: cfg.Plan.StorageID, PhysicalBinding: source, BootstrapPlanDigest: common, EvidenceFormat: EvidenceFormat}
 	if cfg.Prepared != nil {
 		if cfg.Prepared.Identity() != h.identity.Member {
 			return nil, fmt.Errorf("prepared handoff differs from exact configured execution identity")
 		}
 		h.identity.Fresh = false
+	}
+	if err := h.ValidateManagedStartup(ctx, h.identity); err != nil {
+		return nil, err
+	}
+	emptySource, err := h.node.PrepareManagedSQLSource(ctx, h.identity, initial.Assignment().State == "Unused" && cfg.Prepared == nil)
+	if err != nil {
+		return nil, err
+	}
+	h.identity.Fresh = emptySource && cfg.Prepared == nil
+	if initial.Assignment().State == "Unused" {
+		if err := h.node.VerifyManagedSQLFreshSource(ctx, h.identity); err != nil {
+			return nil, err
+		}
 	}
 	if err := h.node.OpenManaged(ctx, node.ManagedStartupConfig{Identity: h.identity, Checker: h, Prepared: cfg.Prepared, BootstrapMember: cfg.Runtime.Learner == nil}); err != nil {
 		return nil, err
@@ -110,6 +113,10 @@ func Open(ctx context.Context, cfg Config) (*Host, error) {
 			return h, err
 		}
 		evidence := encodeEvidence(state)
+		if err := h.node.VerifyManagedSQLFreshSource(ctx, h.identity); err != nil {
+			h.uncertain.Store(true)
+			return h, err
+		}
 		_, _, err = operator.CommitV1Alpha2ApplicationInit(ctx, cfg.Store, initial, cfg.Plan, evidence)
 		if err != nil {
 			live, e := operator.LoadV1Alpha2ApplicationInit(ctx, cfg.Store, cfg.Ref)
@@ -169,12 +176,12 @@ func (h *Host) ValidateManagedStartup(ctx context.Context, i node.ManagedStartup
 	if s.Assignment().State == "Unused" {
 		return nil
 	}
-	a, err := h.live(ctx)
+	_, err = h.live(ctx)
 	if err != nil {
 		return err
 	}
-	if i.Fresh && evidenceHash(a.Evidence()) != s.Assignment().InitialEvidenceDigest {
-		return fmt.Errorf("advanced evidence requires existing source history")
+	if i.Fresh {
+		return h.node.VerifyManagedSQLFreshSource(ctx, i)
 	}
 	return nil
 }

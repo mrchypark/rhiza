@@ -1,13 +1,21 @@
 package node
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
+	"errors"
 	"fmt"
+	"path"
+	"slices"
 
+	objectstore "github.com/mrchypark/rhiza/internal/objstore"
 	"github.com/mrchypark/rhiza/internal/types"
 	"github.com/mrchypark/rhiza/pkg/materializer"
 	"github.com/mrchypark/rhiza/pkg/network"
 	"github.com/mrchypark/rhiza/pkg/quepaxa"
+	"github.com/mrchypark/rhiza/pkg/recovery"
+	"github.com/thanos-io/objstore"
 )
 
 // ManagedSQLWriteChecker must check the exact live pending request, not just
@@ -19,6 +27,161 @@ type ManagedSQLWriteChecker interface {
 type ManagedSQLSnapshot struct {
 	Application materializer.SQLApplicationState
 	Runtime     ManagedRuntimeState
+}
+
+func (n *Node) managedSQLBucket(ctx context.Context) (*objectstore.MeteredBucket, error) {
+	c := n.config
+	provider := objectstore.Provider(c.ObjStoreProvider)
+	if provider == "" {
+		provider = objectstore.ProviderS3
+	}
+	return objectstore.NewBucketWithoutProvisioning(ctx, objectstore.Config{
+		Provider: provider, FilesystemDir: c.ObjStoreDir, Prefix: c.ObjStorePrefix,
+		Endpoint: c.ObjStoreEndpoint, Bucket: c.ObjStoreBucket, Region: c.ObjStoreRegion, Insecure: c.ObjStoreInsecure, MaxRetries: c.ObjStoreRetries,
+		AccessKey: c.ObjStoreAccessKey, SecretKey: c.ObjStoreSecretKey, SessionToken: c.ObjStoreSessionToken,
+		ServiceAccount: c.ObjStoreServiceAccount, AzureTenantID: c.ObjStoreAzureTenantID, AzureClientID: c.ObjStoreAzureClientID, AzureClientSecret: c.ObjStoreAzureClientSecret,
+		AzureStorageAccount: c.ObjStoreAzureStorageAccount, AzureStorageAccountKey: c.ObjStoreAzureStorageAccountKey, AzureConnectionString: c.ObjStoreAzureConnectionString, AzureUserAssignedID: c.ObjStoreAzureUserAssignedID,
+	})
+}
+
+func (n *Node) managedSQLScope(i ManagedStartupIdentity) ([]byte, string, error) {
+	source, _, err := n.preparedBindingDigests()
+	if err != nil || source != i.PhysicalBinding {
+		return nil, "", errors.Join(fmt.Errorf("initial SQL physical binding mismatch"), err)
+	}
+	common, err := n.ManagedBootstrapPlanDigest(source, i.EvidenceFormat)
+	if err != nil || common != i.BootstrapPlanDigest {
+		return nil, "", errors.Join(fmt.Errorf("initial SQL bootstrap binding mismatch"), err)
+	}
+	b, err := json.Marshal(struct {
+		Version                                                                                                              int
+		ClusterUID, AssignmentID, IntentHash, DeploymentUID, StorageID, PhysicalBinding, BootstrapPlanDigest, EvidenceFormat string
+		Generation                                                                                                           int64
+	}{1, i.Member.ClusterUID, i.AssignmentID, i.IntentHash, i.Member.DeploymentUID, i.StorageID, i.PhysicalBinding, i.BootstrapPlanDigest, i.EvidenceFormat, i.Member.Generation})
+	return b, path.Join(n.config.ObjStorePrefix, string(n.config.ClusterID)), err
+}
+
+// PrepareManagedSQLSource records once-new namespace provenance before voter
+// registration. Missing provenance plus any existing object is never bootstrap.
+// The immutable application-start marker closes this exception permanently.
+func (n *Node) PrepareManagedSQLSource(ctx context.Context, i ManagedStartupIdentity, allowNew bool) (empty bool, resultErr error) {
+	want, prefix, err := n.managedSQLScope(i)
+	if err != nil {
+		return false, err
+	}
+	bucket, err := n.managedSQLBucket(ctx)
+	if err != nil {
+		return false, err
+	}
+	defer func() { resultErr = errors.Join(resultErr, bucket.Close()) }()
+	key := path.Join(prefix, "voters/managed-sql-initialization.json")
+	got, err := readVoterRegistration(ctx, bucket, key)
+	if err != nil {
+		return false, err
+	}
+	if got == nil {
+		if !allowNew {
+			return false, fmt.Errorf("managed SQL initialization provenance is missing")
+		}
+		notEmpty := errors.New("existing source cannot be initialized as a new SQL namespace")
+		if err := bucket.Iter(ctx, prefix+"/", func(string) error { return notEmpty }, objstore.WithRecursiveIter()); err != nil {
+			if !errors.Is(err, notEmpty) {
+				return false, err
+			}
+			// Another initializer may have claimed the same empty scope since
+			// our first GET. Only its exact immutable receipt admits this race.
+			claimed, readErr := readVoterRegistration(ctx, bucket, key)
+			if readErr != nil || !bytes.Equal(claimed, want) {
+				return false, errors.Join(err, readErr)
+			}
+		}
+		if !slices.Contains(bucket.SupportedObjectUploadOptions(), objstore.IfNotExists) {
+			return false, fmt.Errorf("initial SQL namespace requires conditional writes")
+		}
+		if err := matchVoterRegistration(ctx, bucket, key, want, nil); err != nil {
+			return false, err
+		}
+	} else if !bytes.Equal(got, want) {
+		return false, fmt.Errorf("initial SQL namespace belongs to another assignment")
+	}
+	started, err := readVoterRegistration(ctx, bucket, path.Join(prefix, "voters/managed-sql-application-start.json"))
+	if err != nil {
+		return false, err
+	}
+	if started != nil && !bytes.Equal(started, want) {
+		return false, fmt.Errorf("application-start binding mismatch")
+	}
+	head, err := bucket.Exists(ctx, path.Join(prefix, "archive/head.bin"))
+	if err != nil {
+		return false, err
+	}
+	if started != nil && !head {
+		return false, fmt.Errorf("application history requires existing archive HEAD")
+	}
+	return started == nil && !head, nil
+}
+
+// VerifyManagedSQLFreshSource checks actual retained source history before E0.
+// It requires neither quorum nor application readiness. Scope provenance was
+// created before registration and every private SQL execution marks start first.
+func (n *Node) VerifyManagedSQLFreshSource(ctx context.Context, i ManagedStartupIdentity) (resultErr error) {
+	want, prefix, err := n.managedSQLScope(i)
+	if err != nil {
+		return err
+	}
+	bucket, err := n.managedSQLBucket(ctx)
+	if err != nil {
+		return err
+	}
+	defer func() { resultErr = errors.Join(resultErr, bucket.Close()) }()
+	got, err := readVoterRegistration(ctx, bucket, path.Join(prefix, "voters/managed-sql-initialization.json"))
+	if err != nil {
+		return err
+	}
+	if !bytes.Equal(got, want) {
+		return fmt.Errorf("exact once-new SQL namespace provenance required")
+	}
+	started, err := readVoterRegistration(ctx, bucket, path.Join(prefix, "voters/managed-sql-application-start.json"))
+	if err != nil {
+		return err
+	}
+	if started != nil {
+		return fmt.Errorf("application-start history prevents fresh SQL initialization")
+	}
+	exists, err := bucket.Exists(ctx, path.Join(prefix, "archive/head.bin"))
+	if err != nil {
+		return err
+	}
+	if !exists {
+		return nil
+	}
+	view, err := recovery.OpenReadOnlyView(ctx, bucket, prefix, 1, *n.loadClusterConfig())
+	if err != nil {
+		return err
+	}
+	if view.Base() != 0 {
+		return fmt.Errorf("existing source base prevents fresh SQL initialization")
+	}
+	for _, v := range view.Decisions() {
+		if err := managedSQLControlOnly(v.Value); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func managedSQLControlOnly(value []byte) error {
+	if len(value) == 0 {
+		return nil
+	}
+	_, schedule, e1 := types.DecodeLeaderSchedule(value)
+	barrier, e2 := types.DecodeReadBarrier(value)
+	_, seal, e3 := types.DecodeCheckpointSeal(value)
+	reconfig, e4 := types.DecodeReconfiguration(value)
+	if e1 != nil || e2 != nil || e3 != nil || e4 != nil || !(schedule || barrier || seal || reconfig) {
+		return fmt.Errorf("application source history prevents fresh SQL initialization")
+	}
+	return nil
 }
 
 // InspectManagedSQL rejects histories outside this bounded SQL-only host. An
@@ -87,6 +250,17 @@ func (n *Node) ExecuteManagedSQL(ctx context.Context, req network.ExecuteRequest
 	}
 	if err := checker.ValidateManagedSQLWrite(ctx, n.managedStartup.Identity, state, req); err != nil {
 		return network.ExecuteResponse{}, err
+	}
+	want, prefix, err := n.managedSQLScope(n.managedStartup.Identity)
+	if err != nil {
+		return network.ExecuteResponse{}, err
+	}
+	claimed, err := readVoterRegistration(ctx, n.bucket, path.Join(prefix, "voters/managed-sql-initialization.json"))
+	if err != nil || !bytes.Equal(claimed, want) {
+		return network.ExecuteResponse{}, errors.Join(fmt.Errorf("exact initial SQL namespace provenance required before execution"), err)
+	}
+	if err := matchVoterRegistration(ctx, n.bucket, path.Join(prefix, "voters/managed-sql-application-start.json"), want, nil); err != nil {
+		return network.ExecuteResponse{}, fmt.Errorf("record irreversible SQL application start: %w", err)
 	}
 	return n.server.Execute(ctx, req)
 }
