@@ -22,11 +22,13 @@ import (
 
 	"github.com/mrchypark/rhiza/internal/types"
 	"github.com/mrchypark/rhiza/pkg/quepaxa"
+	"gopkg.in/yaml.v3"
 )
 
 type repairDiagnosticTransport struct {
-	base http.RoundTripper
-	logf func(string, ...any)
+	base   http.RoundTripper
+	logf   func(string, ...any)
+	before func(*http.Request) error
 }
 
 type repairDiagnosticBody struct {
@@ -115,7 +117,7 @@ func repairDiagnosticCEL(message string, rules []repairDiagnosticRule) (classes,
 		}
 	}
 	for _, rule := range rules {
-		if strings.Contains(message, rule.expression) || rule.message != "" && strings.Contains(message, "evaluating rule: "+rule.message) || rule.message != "" && strings.Contains(message, "for rule: "+rule.message) {
+		if strings.Contains(message, rule.expression) || rule.message != "" && strings.Contains(message, rule.message) {
 			ids = append(ids, rule.id)
 		}
 	}
@@ -126,7 +128,7 @@ func repairDiagnosticCEL(message string, rules []repairDiagnosticRule) (classes,
 // replaced, so a Kubernetes response cannot inject SQL, credentials, or data.
 func repairDiagnosticSkeleton(message string) string {
 	allowed := map[string]bool{}
-	for _, word := range strings.Fields("validation failed due to running out of cost budget no further rules will be run runtime could not calculated for rule compile error evaluating such key overload operation cancelled actual limit exceeded call cost exceeds index bounds integer overflow division by zero invalid value status field type self oldSelf repair completion authority pendingWrite pendingRequest applicationInit bootstrapPlan plan state operationID generation binding owner configID slot") {
+	for _, word := range strings.Fields("validation failed due to running out of cost budget no further rules will be run runtime could not calculated for rule compile error evaluating such key overload operation cancelled actual limit exceeded call cost exceeds index bounds integer overflow division by zero invalid value status field type self oldSelf repair completion authority pendingWrite pendingRequest applicationInit bootstrapPlan plan state operationID generation binding owner configID slot expectedConfigID expectedAbortSlot") {
 		allowed[word] = true
 	}
 	var words []string
@@ -170,6 +172,59 @@ func repairDiagnosticSkeleton(message string) string {
 		i = j
 	}
 	return strings.Join(words, " ")
+}
+
+func TestRepairDiagnosticSkeletonPreservesNumericFieldNamesAndRedactsValues(t *testing.T) {
+	got := repairDiagnosticSkeleton(`status.repair.plan.expectedConfigID expectedAbortSlot generation received "sensitive" 9007199254740993 private-value`)
+	for _, field := range []string{"expectedConfigID", "expectedAbortSlot", "generation"} {
+		if !strings.Contains(got, field) {
+			t.Errorf("numeric field name %q missing from skeleton %q", field, got)
+		}
+	}
+	for _, secret := range []string{"sensitive", "9007199254740993", "private-value"} {
+		if strings.Contains(got, secret) {
+			t.Errorf("skeleton leaked %q: %q", secret, got)
+		}
+	}
+}
+
+// Classify only the JSON token shape for the numeric fields implicated by
+// API-server type errors. Values are deliberately never returned or logged.
+func repairDiagnosticNumericToken(raw json.RawMessage) string {
+	if len(raw) == 0 {
+		return "missing"
+	}
+	s := strings.TrimSpace(string(raw))
+	if len(s) >= 2 && s[0] == '"' && s[len(s)-1] == '"' {
+		return "string"
+	}
+	if len(s) > 0 && (s[0] == '-' || s[0] >= '0' && s[0] <= '9') {
+		if strings.ContainsAny(s, ".eE") {
+			return "decimal-or-exponent"
+		}
+		return "integer"
+	}
+	return "other"
+}
+
+func repairDiagnosticWireTokenClasses(status json.RawMessage) (map[string]string, error) {
+	var decoded struct {
+		Repair struct {
+			Plan map[string]json.RawMessage `json:"plan"`
+		} `json:"repair"`
+		Authority struct {
+			Generation json.RawMessage `json:"generation"`
+		} `json:"authority"`
+	}
+	if err := json.Unmarshal(status, &decoded); err != nil {
+		return nil, err
+	}
+	classes := map[string]string{}
+	for _, field := range []string{"expectedConfigID", "expectedAbortSlot", "generation"} {
+		classes[field] = repairDiagnosticNumericToken(decoded.Repair.Plan[field])
+	}
+	classes["authority.generation"] = repairDiagnosticNumericToken(decoded.Authority.Generation)
+	return classes, nil
 }
 
 func (f repairDiagnosticRoundTrip) RoundTrip(req *http.Request) (*http.Response, error) {
@@ -289,6 +344,30 @@ func TestRepairDiagnosticCELClassification(t *testing.T) {
 	}
 }
 
+func TestRepairDiagnosticNumericTokenClassification(t *testing.T) {
+	for _, tc := range []struct {
+		token string
+		want  string
+	}{{`7`, "integer"}, {`7.0`, "decimal-or-exponent"}, {`7e0`, "decimal-or-exponent"}, {`"7"`, "string"}, {``, "missing"}, {`9007199254740993`, "integer"}} {
+		if got := repairDiagnosticNumericToken(json.RawMessage(tc.token)); got != tc.want {
+			t.Errorf("token class for %q: got %s, want %s", tc.token, got, tc.want)
+		}
+	}
+}
+
+func TestRepairDiagnosticWireTokenClassesUsePlanGeneration(t *testing.T) {
+	classes, err := repairDiagnosticWireTokenClasses(json.RawMessage(`{"repair":{"plan":{"generation":8e0,"expectedConfigID":"secret","expectedAbortSlot":7.0}},"authority":{"generation":9}}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := map[string]string{"generation": "decimal-or-exponent", "authority.generation": "integer", "expectedConfigID": "string", "expectedAbortSlot": "decimal-or-exponent"}
+	for field, expected := range want {
+		if classes[field] != expected {
+			t.Errorf("%s token class: got %q, want %q", field, classes[field], expected)
+		}
+	}
+}
+
 func TestRepairDiagnosticTopLevelAndTruncation(t *testing.T) {
 	for _, tc := range []struct {
 		name, body string
@@ -367,6 +446,11 @@ func TestRepairDiagnosticMissingStatusFieldIsNotDifferent(t *testing.T) {
 }
 
 func (d repairDiagnosticTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	if d.before != nil && req.Method == http.MethodPut && strings.HasSuffix(req.URL.Path, "/rhizaclusters/genesis-contract/status") && req.URL.Query().Get("dryRun") == "" {
+		if err := d.before(req); err != nil {
+			return nil, err
+		}
+	}
 	resp, err := d.base.RoundTrip(req)
 	if err != nil || resp == nil || req.Method != http.MethodPut || !strings.HasSuffix(req.URL.Path, "/rhizaclusters/genesis-contract/status") {
 		return resp, err
@@ -456,7 +540,7 @@ func (d repairDiagnosticTransport) RoundTrip(req *http.Request) (*http.Response,
 			}
 		}
 	}
-	d.logf("repair status PUT: HTTP %d reason=%s causes=%q known-validation=%q cel-class=%q cel-known-key=%q cel-rule=%q message-skeleton=%q differing-status-fields=%q body-prefix-read-error=%t body-truncated=%t json-decode-complete=%t", resp.StatusCode, reason, causes, matches, celClasses, celKeys, celRules, skeletons, different, readErr != nil, truncated, decodeErr == nil)
+	d.logf("repair status PUT: HTTP %d reason=%s causes-count=%d causes=%q known-validation=%q cel-class=%q cel-known-key=%q cel-rule=%q message-skeleton=%q differing-status-fields=%q body-prefix-read-error=%t body-truncated=%t json-decode-complete=%t", resp.StatusCode, reason, len(status.Details.Causes), causes, matches, celClasses, celKeys, celRules, skeletons, different, readErr != nil, truncated, decodeErr == nil)
 	return resp, nil
 }
 
@@ -487,7 +571,8 @@ func TestV1Alpha2RepairAPIServerContract(t *testing.T) {
 	}
 	transport := &http.Transport{TLSClientConfig: &tls.Config{RootCAs: roots, MinVersion: tls.VersionTLS12}}
 	t.Cleanup(transport.CloseIdleConnections)
-	store := &V1Alpha2StatusStore{Kube: &Kubernetes{BaseURL: server, Namespace: ns, TokenFile: required("RHIZA_CONTRACT_TOKEN"), Client: &http.Client{Transport: repairDiagnosticTransport{base: transport, logf: t.Logf}}}}
+	diagnostic := &repairDiagnosticTransport{base: transport, logf: t.Logf}
+	store := &V1Alpha2StatusStore{Kube: &Kubernetes{BaseURL: server, Namespace: ns, TokenFile: required("RHIZA_CONTRACT_TOKEN"), Client: &http.Client{Transport: diagnostic}}}
 	ctx := context.Background()
 	a, err := LoadV1Alpha2Admission(ctx, store, ref)
 	if err != nil {
@@ -518,6 +603,53 @@ func TestV1Alpha2RepairAPIServerContract(t *testing.T) {
 		}
 		return string(out)
 	}
+	var versions struct {
+		ServerVersion struct {
+			GitVersion string `json:"gitVersion"`
+		} `json:"serverVersion"`
+	}
+	if err := json.Unmarshal([]byte(kubectl("", "version", "-o", "json")), &versions); err != nil || versions.ServerVersion.GitVersion == "" {
+		t.Fatalf("read API server version: %v", err)
+	}
+	t.Logf("repair diagnostic API server version: %s", versions.ServerVersion.GitVersion)
+	type schemaDocument struct {
+		Spec struct {
+			Versions []struct {
+				Name   string `json:"name" yaml:"name"`
+				Schema struct {
+					OpenAPI map[string]any `json:"openAPIV3Schema" yaml:"openAPIV3Schema"`
+				} `json:"schema" yaml:"schema"`
+			} `json:"versions" yaml:"versions"`
+		} `json:"spec" yaml:"spec"`
+	}
+	var deployed, local schemaDocument
+	if err := json.Unmarshal([]byte(kubectl("", "get", "crd", "rhizaclusters.rhiza.mrchypark.dev", "-o", "json")), &deployed); err != nil {
+		t.Fatalf("decode deployed CRD: %v", err)
+	}
+	crd, err := os.ReadFile(filepath.Join("..", "..", "deploy", "operator", "cluster-crd.yaml"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := yaml.Unmarshal(crd, &local); err != nil {
+		t.Fatalf("decode local CRD: %v", err)
+	}
+	schema := func(doc schemaDocument) ([]byte, error) {
+		for _, version := range doc.Spec.Versions {
+			if version.Name == "v1alpha2" {
+				return json.Marshal(version.Schema.OpenAPI)
+			}
+		}
+		return nil, errors.New("v1alpha2 schema missing")
+	}
+	deployedSchema, err := schema(deployed)
+	if err != nil {
+		t.Fatal(err)
+	}
+	localSchema, err := schema(local)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Logf("repair diagnostic v1alpha2 schema equal=%t deployed-sha256=%x local-sha256=%x", sameJSON(deployedSchema, localSchema), sha256.Sum256(deployedSchema), sha256.Sum256(localSchema))
 	depName, err := V1Alpha2GenesisDeploymentName(ref.UID)
 	if err != nil {
 		t.Fatal(err)
@@ -570,13 +702,123 @@ func TestV1Alpha2RepairAPIServerContract(t *testing.T) {
 			t.Fatalf("expected %q: %v: %s", want, e, out)
 		}
 	}
+	// Diagnostic dry-runs use the actual Begin PUT body and the exact same
+	// pre-reservation snapshot. They never establish CAS ownership.
+	diagnostic.before = func(req *http.Request) error {
+		diagnostic.before = nil
+		if req.GetBody == nil {
+			return errors.New("Begin PUT has no replayable body")
+		}
+		body, err := req.GetBody()
+		if err != nil {
+			return err
+		}
+		actual, err := io.ReadAll(io.LimitReader(body, 1<<20))
+		closeErr := body.Close()
+		if err != nil || closeErr != nil {
+			return errors.Join(err, closeErr)
+		}
+		var proposed map[string]json.RawMessage
+		if err := json.Unmarshal(actual, &proposed); err != nil {
+			return err
+		}
+		tokenClasses, err := repairDiagnosticWireTokenClasses(proposed["status"])
+		if err != nil {
+			return err
+		}
+		for _, field := range []string{"expectedConfigID", "expectedAbortSlot", "generation", "authority.generation"} {
+			t.Logf("Begin wire token: %s=%s", field, tokenClasses[field])
+		}
+		oldStatus, err := jsonObject(pending.status.object["status"])
+		if err != nil {
+			return err
+		}
+		newStatus, err := jsonObject(proposed["status"])
+		if err != nil {
+			return err
+		}
+		for _, key := range []string{"authority", "genesis", "applicationInit", "bootstrapPlan"} {
+			unchanged := sameJSON(oldStatus[key], newStatus[key])
+			t.Logf("Begin dry-run comparison: %s unchanged=%t", key, unchanged)
+			if !unchanged {
+				return errors.New("Begin changed protected status")
+			}
+		}
+		if !sameJSON(pending.status.object["metadata"], proposed["metadata"]) {
+			return errors.New("Begin changed UID or resource version metadata")
+		}
+		delete(newStatus, "repair")
+		withoutRepair, err := json.Marshal(newStatus)
+		if err != nil {
+			return err
+		}
+		if !sameJSON(pending.status.object["status"], withoutRepair) {
+			return errors.New("Begin changed status beyond repair")
+		}
+		oldBody, err := json.Marshal(pending.status.object)
+		if err != nil {
+			return err
+		}
+		for _, item := range []struct {
+			name string
+			body []byte
+		}{{"unchanged", oldBody}, {"closed", actual}} {
+			probe := req.Clone(req.Context())
+			u := *req.URL
+			q := u.Query()
+			q.Set("dryRun", "All")
+			u.RawQuery = q.Encode()
+			probe.URL = &u
+			probe.Body = io.NopCloser(bytes.NewReader(item.body))
+			probe.ContentLength = int64(len(item.body))
+			probe.GetBody = func() (io.ReadCloser, error) { return io.NopCloser(bytes.NewReader(item.body)), nil }
+			resp, e := diagnostic.RoundTrip(probe)
+			if e != nil {
+				return fmt.Errorf("dry-run %s transport failed", item.name)
+			}
+			_, readErr := io.Copy(io.Discard, io.LimitReader(resp.Body, 1<<20))
+			closeErr := resp.Body.Close()
+			t.Logf("repair dry-run %s HTTP %d (diagnostic only)", item.name, resp.StatusCode)
+			if readErr != nil || closeErr != nil {
+				return errors.Join(readErr, closeErr)
+			}
+		}
+		var live map[string]json.RawMessage
+		if err := store.Kube.Get(req.Context(), "/apis/rhiza.mrchypark.dev/v1alpha2/namespaces/"+ns+"/rhizaclusters/"+ref.Name, &live); err != nil {
+			return err
+		}
+		if !sameJSON(live["metadata"], pending.status.object["metadata"]) || !sameJSON(live["status"], pending.status.object["status"]) {
+			return errors.New("dry-run changed live snapshot")
+		}
+		return nil
+	}
 	closed, obs, err := BeginV1Alpha2Repair(ctx, store, pending, pending.Authority(), plan)
 	if err != nil || obs != V1Alpha2CASApplied || !closed.SQLReservationsClosed() {
 		t.Fatalf("close: %s %v", obs, err)
 	}
+	statusPath := "/apis/rhiza.mrchypark.dev/v1alpha2/namespaces/" + ns + "/rhizaclusters/" + ref.Name + "/status"
+	var unchanged map[string]json.RawMessage
+	if err := store.Kube.Put(ctx, statusPath, closed.status.object, &unchanged); err != nil {
+		t.Fatalf("identical closed/pending PUT: %v", err)
+	}
+	unchangedSnapshot, err := store.snapshot(ref, unchanged)
+	if err != nil || !sameJSON(unchangedSnapshot.object["status"], closed.status.object["status"]) {
+		t.Fatalf("identical closed/pending changed status: %v", err)
+	}
 	patch(map[string]any{"repair": map[string]any{"plan": map[string]any{"oldWALIdentity": "changed"}}}, "repair intent is immutable per operation")
 	patch(map[string]any{"authority": map[string]any{"binding": map[string]any{"storageID": "changed"}}}, "closed repair must match authority")
 	patch(map[string]any{"authority": map[string]any{"transition": map[string]any{"id": "other"}}}, "closed repair must match authority")
+	const authorityRule = "closed repair must match authority"
+	patch(map[string]any{"authority": map[string]any{"owner": map[string]any{"uid": nil}}}, authorityRule)
+	patch(map[string]any{"authority": map[string]any{"binding": map[string]any{"deploymentUID": nil}}}, authorityRule)
+	patch(map[string]any{"authority": map[string]any{"binding": map[string]any{"storageID": nil}}}, authorityRule)
+	var afterMalformedLeaf map[string]json.RawMessage
+	if err := store.Kube.Get(ctx, "/apis/rhiza.mrchypark.dev/v1alpha2/namespaces/"+ns+"/rhizaclusters/"+ref.Name, &afterMalformedLeaf); err != nil {
+		t.Fatal(err)
+	}
+	if !sameJSON(afterMalformedLeaf["metadata"], unchangedSnapshot.object["metadata"]) || !sameJSON(afterMalformedLeaf["status"], unchangedSnapshot.object["status"]) {
+		t.Fatal("rejected malformed authority leaf patches changed the closed status")
+	}
 	patch(map[string]any{"repair": map[string]any{"state": "Completed"}}, "repair state and completion must agree")
 	patch(map[string]any{"repair": map[string]any{"plan": map[string]any{"operationID": "replacement"}}}, "replacement repair requires a terminal predecessor")
 	observed, err := LoadV1Alpha2Admission(ctx, store, ref)
@@ -611,4 +853,22 @@ func TestV1Alpha2RepairAPIServerContract(t *testing.T) {
 		t.Fatal("reader did not accept exact completion")
 	}
 	patch(map[string]any{"repair": map[string]any{"completion": map[string]any{"hash": strings.Repeat("c", 64)}}}, "terminal repair is immutable per operation")
+	next := plan
+	next.OperationID = "repair-cel-next"
+	next.ExpectedConfigID = completion.ConfigID
+	nextClosed, obs, err := BeginV1Alpha2Repair(ctx, store, loaded, loaded.Authority(), next)
+	if err != nil || obs != V1Alpha2CASApplied || !nextClosed.SQLReservationsClosed() {
+		t.Fatalf("close without pending: %s %v", obs, err)
+	}
+	if _, _, err := BeginV1Alpha2Repair(ctx, store, loaded, loaded.Authority(), next); !errors.Is(err, ErrV1Alpha2StatusConflict) {
+		t.Fatalf("stale Begin must conflict: %v", err)
+	}
+	abort := V1Alpha2RepairCompletion{OperationID: next.OperationID, PlanDigest: next.Digest(), ExpectedConfigID: next.ExpectedConfigID, ExpectedAbortSlot: next.ExpectedAbortSlot, Kind: "Abort", ConfigID: next.ExpectedConfigID, Slot: 2, Hash: strings.Repeat("d", 64)}
+	aborted, obs, err := FinishV1Alpha2Repair(ctx, store, nextClosed, nextClosed.Authority(), abort)
+	if err != nil || obs != V1Alpha2CASApplied || aborted.SQLReservationsClosed() {
+		t.Fatalf("finish aborted: %s %v", obs, err)
+	}
+	if record, ok := aborted.Repair(); !ok || record.State != "Aborted" || record.Completion == nil || record.Completion.PlanDigest != next.Digest() {
+		t.Fatal("reader did not accept exact abort")
+	}
 }
