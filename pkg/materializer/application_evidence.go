@@ -6,11 +6,18 @@ import (
 	"database/sql"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"io"
 	"math"
+	"net/url"
+	"os"
+	"path/filepath"
 	"sort"
 	"strconv"
 	"strings"
+
+	"github.com/mrchypark/rhiza/internal/sqlpolicy"
 )
 
 // SQLApplicationState describes SQL logical state, not WAL history or authority.
@@ -47,6 +54,100 @@ func (m *Materializer) InspectSQLApplicationState(ctx context.Context) (SQLAppli
 	if err != nil {
 		return SQLApplicationState{}, err
 	}
+	return inspectSQLApplicationTransaction(ctx, tx, m.stateTip)
+}
+
+// InspectSQLApplicationFile copies a stable SQLite database and its WAL into a
+// private directory, then inspects that copy read-only. Callers must ensure
+// source files remain stable during the copy (for example, by holding the
+// materializer's WAL exclusion). Source sidecars are never created, changed,
+// or removed by this function.
+func InspectSQLApplicationFile(ctx context.Context, dbPath string) (state SQLApplicationState, appliedTip uint64, resultErr error) {
+	absolute, err := filepath.Abs(dbPath)
+	if err != nil {
+		return state, 0, err
+	}
+	privateDir, err := os.MkdirTemp("", "rhiza-sql-evidence-")
+	if err != nil {
+		return state, 0, err
+	}
+	defer func() {
+		if err := os.RemoveAll(privateDir); err != nil {
+			resultErr = errors.Join(resultErr, fmt.Errorf("remove private SQL evidence snapshot: %w", err))
+		}
+	}()
+	privateDB := filepath.Join(privateDir, "application.sqlite")
+	if err := copyEvidenceFile(absolute, privateDB); err != nil {
+		return state, 0, err
+	}
+	if err := copyEvidenceFileIfPresent(absolute+"-wal", privateDB+"-wal"); err != nil {
+		return state, 0, err
+	}
+	dsn := (&url.URL{Scheme: "file", Path: filepath.ToSlash(privateDB)}).String() + "?mode=ro&_pragma=busy_timeout(5000)"
+	db, err := openSQLite(dsn, false)
+	if err != nil {
+		return state, 0, fmt.Errorf("open SQL state read-only: %w", err)
+	}
+	defer func() { resultErr = errors.Join(resultErr, db.Close()) }()
+	tx, err := db.BeginTx(ctx, &sql.TxOptions{ReadOnly: true})
+	if err != nil {
+		return state, 0, err
+	}
+	defer tx.Rollback()
+	var policy string
+	if err := tx.QueryRowContext(ctx, `SELECT value FROM _rhiza_meta WHERE key='sql_execution_policy'`).Scan(&policy); err != nil {
+		return state, 0, fmt.Errorf("read SQL materialization policy: %w", err)
+	}
+	if policy != sqlpolicy.Marker() {
+		return state, 0, fmt.Errorf("incompatible SQL materialization policy marker %q", policy)
+	}
+	var appliedValue, stateValue string
+	if err := tx.QueryRowContext(ctx, `SELECT value FROM _rhiza_meta WHERE key='applied_slot'`).Scan(&appliedValue); err != nil {
+		return state, 0, fmt.Errorf("read applied SQL tip: %w", err)
+	}
+	if err := tx.QueryRowContext(ctx, `SELECT value FROM _rhiza_meta WHERE key='state_slot'`).Scan(&stateValue); err != nil {
+		return state, 0, fmt.Errorf("read SQL state tip: %w", err)
+	}
+	appliedTip, err = strconv.ParseUint(appliedValue, 10, 64)
+	if err != nil {
+		return state, 0, fmt.Errorf("invalid applied SQL tip: %w", err)
+	}
+	stateTip, err := strconv.ParseUint(stateValue, 10, 64)
+	if err != nil || stateTip > appliedTip {
+		return state, 0, fmt.Errorf("invalid SQL state tip")
+	}
+	state, err = inspectSQLApplicationTransaction(ctx, tx, stateTip)
+	return state, appliedTip, err
+}
+
+func copyEvidenceFileIfPresent(source, destination string) error {
+	if _, err := os.Lstat(source); errors.Is(err, os.ErrNotExist) {
+		return nil
+	} else if err != nil {
+		return err
+	}
+	return copyEvidenceFile(source, destination)
+}
+
+func copyEvidenceFile(source, destination string) (resultErr error) {
+	in, err := os.Open(source)
+	if err != nil {
+		return fmt.Errorf("open SQL evidence source %s: %w", source, err)
+	}
+	defer func() { resultErr = errors.Join(resultErr, in.Close()) }()
+	out, err := os.OpenFile(destination, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o600)
+	if err != nil {
+		return fmt.Errorf("create private SQL evidence file: %w", err)
+	}
+	_, copyErr := io.Copy(out, in)
+	closeErr := out.Close()
+	if err := errors.Join(copyErr, closeErr); err != nil {
+		return fmt.Errorf("copy SQL evidence source %s: %w", source, err)
+	}
+	return nil
+}
+
+func inspectSQLApplicationTransaction(ctx context.Context, tx *sql.Tx, stateTip uint64) (SQLApplicationState, error) {
 	defer tx.Rollback()
 	rows, err := tx.QueryContext(ctx, `SELECT type,name,tbl_name,COALESCE(sql,'') FROM sqlite_schema ORDER BY type,name`)
 	if err != nil {
@@ -118,6 +219,9 @@ func (m *Materializer) InspectSQLApplicationState(ctx context.Context) (SQLAppli
 		}
 		if kind == "table" {
 			withoutRowID[name] = wr != 0
+		} else if kind == "virtual" || kind == "shadow" {
+			tableList.Close()
+			return SQLApplicationState{}, fmt.Errorf("unsupported SQLite table kind %q", kind)
 		}
 	}
 	if err := tableList.Err(); err != nil {
@@ -244,5 +348,5 @@ func (m *Materializer) InspectSQLApplicationState(ctx context.Context) (SQLAppli
 	if err != nil {
 		return SQLApplicationState{}, err
 	}
-	return SQLApplicationState{Digest: sha256.Sum256(b), FreshEmpty: len(objects) == 0 && receipts == 0 && kv == 0 && migrations == 0 && m.stateTip == 0}, nil
+	return SQLApplicationState{Digest: sha256.Sum256(b), FreshEmpty: len(objects) == 0 && receipts == 0 && kv == 0 && migrations == 0 && stateTip == 0}, nil
 }

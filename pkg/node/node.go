@@ -183,18 +183,48 @@ func (n *Node) Open(ctx context.Context) error {
 	return n.open(ctx, false)
 }
 
+func managedMaterializerFilesAbsent(dataDir string) (bool, error) {
+	for _, name := range []string{"sqlite.db", "sqlite.db-wal", "sqlite.db-shm", "sqlite.db-journal", "latticedb"} {
+		_, err := os.Lstat(filepath.Join(dataDir, name))
+		if err == nil {
+			return false, nil
+		}
+		if !errors.Is(err, os.ErrNotExist) {
+			return false, err
+		}
+	}
+	return true, nil
+}
+
 // EnrollExistingVoter registers a pre-registration WAL while all voters are
 // offline. It neither restores missing voting state nor starts any listeners.
 func (n *Node) EnrollExistingVoter(ctx context.Context) error {
 	return n.open(ctx, true)
 }
 
-func (n *Node) open(ctx context.Context, enroll bool) (err error) {
+func (n *Node) open(ctx context.Context, enroll bool) error {
+	return n.openInternal(ctx, enroll, nil, false)
+}
+
+func (n *Node) openWithWALLock(ctx context.Context, enroll, cleanStart bool, lock *qlog.LockFile) (err error) {
+	if lock == nil {
+		return fmt.Errorf("preacquired WAL lock is required")
+	}
+	defer func() {
+		if n.lock != lock {
+			err = errors.Join(err, lock.Release())
+		}
+	}()
+	return n.openInternal(ctx, enroll, lock, cleanStart)
+}
+
+func (n *Node) openInternal(ctx context.Context, enroll bool, prelocked *qlog.LockFile, cleanStart bool) (err error) {
 	if n.terminalRequested.Load() {
 		return fmt.Errorf("terminally drained node cannot reopen")
 	}
 	var localRestoreAuthority *materializer.LocalRestoreAuthority
 	var localRestoreFiles []materializer.CheckpointFile
+	managedMaterializerWasAbsent := false
 	if n.config == nil || n.config.NodeID == "" {
 		return fmt.Errorf("node ID is required")
 	}
@@ -289,9 +319,13 @@ func (n *Node) open(ctx context.Context, enroll bool) (err error) {
 	}()
 
 	// 1. Acquire lock file
-	cleanStart, lock, err := qlog.Acquire(n.config.DataDir + "/qlog")
-	if err != nil {
-		return fmt.Errorf("acquire lock: %w", err)
+	lock := prelocked
+	if lock == nil {
+		var acquireErr error
+		cleanStart, lock, acquireErr = qlog.Acquire(n.config.DataDir + "/qlog")
+		if acquireErr != nil {
+			return fmt.Errorf("acquire lock: %w", acquireErr)
+		}
 	}
 	n.lock = lock
 	localVoter, err := loadVoterIdentity(n.config)
@@ -532,6 +566,12 @@ func (n *Node) open(ctx context.Context, enroll bool) (err error) {
 
 	var material *materializer.Materializer
 	if localRestoreAuthority == nil {
+		if n.managedStartup != nil {
+			managedMaterializerWasAbsent, err = managedMaterializerFilesAbsent(n.config.DataDir)
+			if err != nil {
+				return err
+			}
+		}
 		material, err = materializer.Open(filepath.Join(n.config.DataDir, "sqlite.db"), 4)
 		if err != nil {
 			if n.managedStartup != nil {
@@ -814,6 +854,7 @@ func (n *Node) open(ctx context.Context, enroll bool) (err error) {
 	n.peer = peer
 
 	certifiedCheckpoint := generationCheckpoint
+	restoreCheckpoint := certifiedCheckpoint
 	if n.checkpoints != nil {
 		seal, sealed, sealErr := core.LatestCheckpointSeal()
 		if sealErr != nil {
@@ -846,6 +887,46 @@ func (n *Node) open(ctx context.Context, enroll bool) (err error) {
 			}
 		}
 	}
+	if n.managedStartup != nil && n.managedStartup.Prepared != nil {
+		view := n.managedStartup.Prepared.View()
+		if view == nil {
+			return fmt.Errorf("managed prepared checkpoint view is unavailable")
+		}
+		seal, decision, hasBase := view.RecoveryBase()
+		if !hasBase {
+			if core.CompactionFloor() != 0 {
+				return fmt.Errorf("managed prepared WAL has a checkpoint base absent from verified source")
+			}
+			restoreCheckpoint = nil
+		} else {
+			if n.checkpoints == nil {
+				return fmt.Errorf("managed prepared checkpoint store is unavailable")
+			}
+			floor, root, ok := core.RecoveryRoot()
+			prefix, prefixOK := core.PrefixHash(seal.Index)
+			if !ok || floor != seal.Index || root != seal.RootHash || !prefixOK || prefix != seal.PrefixHash {
+				return fmt.Errorf("managed prepared WAL base differs from verified checkpoint")
+			}
+			if err := core.ValidateCheckpointBase(startupRecovery.Context(), seal, decision); err != nil {
+				return fmt.Errorf("validate managed prepared checkpoint: %w", err)
+			}
+			preparedCheckpoint, openErr := n.checkpoints.OpenRoot(startupRecovery.Context(), uint64(seal.Index), seal.RootHash)
+			if openErr != nil || preparedCheckpoint.Hash != seal.StateHash {
+				if openErr == nil {
+					openErr = fmt.Errorf("managed prepared checkpoint state hash mismatch")
+				}
+				return openErr
+			}
+			restoreCheckpoint = preparedCheckpoint
+		}
+		if core.Tip() != view.Tip() {
+			return fmt.Errorf("managed prepared WAL tip differs from verified source")
+		}
+		prefix, prefixOK := core.PrefixHash(view.Tip())
+		if !prefixOK || prefix != view.PrefixHash() {
+			return fmt.Errorf("managed prepared WAL suffix differs from verified source")
+		}
+	}
 	if n.config.Local && localRestoreAuthority == nil {
 		if err := n.resumePreparedLocalCheckpoint(startupRecovery.Context()); err != nil {
 			return fmt.Errorf("resume prepared Local checkpoint: %w", startupRecovery.Check(err))
@@ -866,14 +947,23 @@ func (n *Node) open(ctx context.Context, enroll bool) (err error) {
 			return fmt.Errorf("recover certified log through %d: %w", recoveryTarget, startupRecovery.Check(err))
 		}
 	}
-	if certifiedCheckpoint != nil {
-		if certifiedCheckpoint.Index > material.Tip() {
-			if quepaxa.Slot(certifiedCheckpoint.Index) > core.Tip() {
-				return fmt.Errorf("checkpoint slot %d is ahead of certified log tip %d", certifiedCheckpoint.Index, core.Tip())
+	if restoreCheckpoint != nil {
+		if restoreCheckpoint.Index > material.Tip() {
+			if n.managedStartup != nil && (n.managedStartup.Prepared != nil || n.managedStartup.verifiedAdoption != nil) {
+				state, inspectErr := material.InspectSQLApplicationState(startupRecovery.Context())
+				if inspectErr != nil {
+					return fmt.Errorf("inspect existing managed SQLite before prepared restore: %w", inspectErr)
+				}
+				if !managedMaterializerWasAbsent || material.Tip() != 0 || !state.FreshEmpty {
+					return fmt.Errorf("refuse to replace non-empty managed SQLite with prepared checkpoint")
+				}
+			}
+			if quepaxa.Slot(restoreCheckpoint.Index) > core.Tip() {
+				return fmt.Errorf("checkpoint slot %d is ahead of certified log tip %d", restoreCheckpoint.Index, core.Tip())
 			}
 			n.recoveryPhases.selectedCheckpoint = true
-			n.recoveryPhases.checkpointIndex = certifiedCheckpoint.Index
-			n.recoveryPhases.checkpointRootHash = certifiedCheckpoint.RootHash
+			n.recoveryPhases.checkpointIndex = restoreCheckpoint.Index
+			n.recoveryPhases.checkpointRootHash = restoreCheckpoint.RootHash
 			dir, fileErr := os.MkdirTemp(n.config.DataDir, ".rhiza-checkpoint-restore-*")
 			if fileErr != nil {
 				return fileErr
@@ -881,7 +971,7 @@ func (n *Node) open(ctx context.Context, enroll bool) (err error) {
 			defer os.RemoveAll(dir)
 			n.recoveryPhases.checkpointDownloadVerifyStarted = true
 			downloadStarted := time.Now()
-			files, readErr := n.checkpoints.DownloadRootFiles(startupRecovery.Context(), certifiedCheckpoint.Index, certifiedCheckpoint.RootHash, dir)
+			files, readErr := n.checkpoints.DownloadRootFiles(startupRecovery.Context(), restoreCheckpoint.Index, restoreCheckpoint.RootHash, dir)
 			n.recoveryPhases.checkpointDownloadVerify = time.Since(downloadStarted)
 			n.recoveryPhases.checkpointDownloadVerifyComplete = readErr == nil
 			if readErr != nil {
@@ -895,7 +985,7 @@ func (n *Node) open(ctx context.Context, enroll bool) (err error) {
 			restoreStarted := time.Now()
 			if restoreErr := material.RestoreCheckpoint(startupRecovery.Context(), materialFiles); restoreErr != nil {
 				n.recoveryPhases.materializerRestore = time.Since(restoreStarted)
-				return fmt.Errorf("restore checkpoint %d: %w", certifiedCheckpoint.Index, restoreErr)
+				return fmt.Errorf("restore checkpoint %d: %w", restoreCheckpoint.Index, restoreErr)
 			}
 			n.recoveryPhases.materializerRestore = time.Since(restoreStarted)
 			n.recoveryPhases.materializerRestoreComplete = true

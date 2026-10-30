@@ -13,7 +13,6 @@ import (
 	"github.com/mrchypark/rhiza/internal/types"
 	"github.com/mrchypark/rhiza/pkg/materializer"
 	"github.com/mrchypark/rhiza/pkg/network"
-	"github.com/mrchypark/rhiza/pkg/quepaxa"
 	"github.com/mrchypark/rhiza/pkg/recovery"
 	"github.com/thanos-io/objstore"
 )
@@ -243,10 +242,25 @@ func (n *Node) inspectManagedSQL(ctx context.Context, fresh, localRead bool) (Ma
 	n.replayMu.Lock()
 	defer n.replayMu.Unlock()
 	before := n.managedRuntimeState()
-	if before.WALIdentity == "" || before.AppliedTip > before.CertifiedTip || !localRead && (before.RecorderTip > before.CertifiedTip || before.AppliedTip != before.CertifiedTip) || n.core.CompactionFloor() != 0 {
-		return ManagedSQLSnapshot{}, fmt.Errorf("SQL host requires registered, resolved, uncompacted history")
+	floor := n.core.CompactionFloor()
+	if floor > 0 {
+		adoption := n.managedStartup.verifiedAdoption
+		if adoption == nil || adoption.BaseSeal == nil || adoption.WALIdentity != before.WALIdentity {
+			return ManagedSQLSnapshot{}, fmt.Errorf("SQL host requires a verified prepared checkpoint adoption")
+		}
+		base, root, ok := n.core.RecoveryRoot()
+		prefix, prefixOK := n.core.PrefixHash(adoption.BaseSeal.Index)
+		adoptedPrefix, adoptedOK := n.core.PrefixHash(adoption.Tip)
+		membership, membershipErr := n.core.MembershipHistory()
+		if !ok || base != adoption.BaseSeal.Index || root != adoption.BaseSeal.RootHash || !prefixOK || prefix != adoption.BaseSeal.PrefixHash || !adoptedOK || adoptedPrefix != adoption.PrefixHash || n.core.Tip() < adoption.Tip || membershipErr != nil || adoption.Membership == nil || !membershipHistoryHasPrefix(*adoption.Membership, membership) {
+			return ManagedSQLSnapshot{}, errors.Join(fmt.Errorf("SQL host checkpoint adoption no longer matches actual WAL"), membershipErr)
+		}
 	}
-	for from := quepaxa.Slot(1); uint64(from) <= before.AppliedTip; {
+	if before.WALIdentity == "" || before.AppliedTip > before.CertifiedTip || !localRead && (before.RecorderTip > before.CertifiedTip || before.AppliedTip != before.CertifiedTip) {
+		return ManagedSQLSnapshot{}, fmt.Errorf("SQL host requires registered, resolved history")
+	}
+	from := floor + 1
+	for uint64(from) <= before.AppliedTip {
 		values, _, err := n.core.DecisionsFrom(from, 256)
 		if err != nil || len(values) == 0 {
 			return ManagedSQLSnapshot{}, fmt.Errorf("SQL history unavailable: %w", err)

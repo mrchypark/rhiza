@@ -2,8 +2,11 @@ package materializer
 
 import (
 	"context"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/mrchypark/rhiza/internal/types"
 )
@@ -64,6 +67,113 @@ func TestSQLApplicationEvidenceCanceledAndClosed(t *testing.T) {
 	cancel()
 	if _, err := m.InspectSQLApplicationState(ctx); err == nil {
 		t.Fatal("canceled inspection succeeded")
+	}
+}
+
+func TestInspectSQLApplicationFileReadOnlySnapshot(t *testing.T) {
+	ctx := context.Background()
+	m := evidenceMaterializer(t)
+	evidenceApply(t, m, 1, "schema", `CREATE TABLE item (id INTEGER PRIMARY KEY, value TEXT)`)
+	evidenceApply(t, m, 2, "insert", `INSERT INTO item(value) VALUES ('expected')`)
+	want, err := m.InspectSQLApplicationState(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, tip, err := InspectSQLApplicationFile(ctx, m.dbPath)
+	if err != nil || tip != 2 || got.Digest != want.Digest || got.FreshEmpty {
+		t.Fatalf("read-only file state=%+v tip=%d err=%v", got, tip, err)
+	}
+	missingPath := m.dbPath + ".missing"
+	if _, _, err := InspectSQLApplicationFile(ctx, missingPath); err == nil {
+		t.Fatal("missing database was created or accepted")
+	}
+	if _, err := os.Stat(missingPath); !os.IsNotExist(err) {
+		t.Fatalf("read-only inspection created missing database: %v", err)
+	}
+	canceled, cancel := context.WithCancel(ctx)
+	cancel()
+	if _, _, err := InspectSQLApplicationFile(canceled, m.dbPath); err == nil {
+		t.Fatal("canceled read-only inspection succeeded")
+	}
+}
+
+func TestInspectSQLApplicationFileNeverRemovesSourceSidecars(t *testing.T) {
+	ctx := context.Background()
+	m := evidenceMaterializer(t)
+	evidenceApply(t, m, 1, "schema", `CREATE TABLE item (id INTEGER PRIMARY KEY)`)
+	// Use a closed, standalone DB so this test can place a source-sidecar that
+	// SQLite itself is not managing. The inspector must never claim ownership.
+	source := filepath.Join(t.TempDir(), "source.sqlite")
+	if err := copyEvidenceFile(m.dbPath, source); err != nil {
+		t.Fatal(err)
+	}
+	if err := copyEvidenceFileIfPresent(m.dbPath+"-wal", source+"-wal"); err != nil {
+		t.Fatal(err)
+	}
+	// Make the source copy long enough for the creator goroutine to race the
+	// inspector after its private snapshot directory has been created.
+	if err := os.Truncate(source, 64<<20); err != nil {
+		t.Fatal(err)
+	}
+	foreignSidecar := source + "-shm"
+	if _, err := os.Lstat(foreignSidecar); !os.IsNotExist(err) {
+		t.Fatalf("source sidecar unexpectedly exists before race: %v", err)
+	}
+	entries, err := os.ReadDir(os.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	baseline := make(map[string]bool, len(entries))
+	for _, entry := range entries {
+		baseline[entry.Name()] = true
+	}
+	start := make(chan struct{})
+	created := make(chan error, 1)
+	finish := make(chan struct{})
+	go func() {
+		<-start
+		deadline := time.Now().Add(5 * time.Second)
+		for time.Now().Before(deadline) {
+			current, err := os.ReadDir(os.TempDir())
+			if err != nil {
+				created <- err
+				return
+			}
+			for _, entry := range current {
+				if strings.HasPrefix(entry.Name(), "rhiza-sql-evidence-") && !baseline[entry.Name()] {
+					created <- os.WriteFile(foreignSidecar, []byte("created during inspection by another connection"), 0o600)
+					<-finish
+					return
+				}
+			}
+			time.Sleep(time.Millisecond)
+		}
+		created <- os.ErrDeadlineExceeded
+		<-finish
+	}()
+	close(start)
+	inspected := make(chan error, 1)
+	go func() {
+		_, _, err := InspectSQLApplicationFile(ctx, source)
+		inspected <- err
+	}()
+	if err := <-created; err != nil {
+		close(finish)
+		t.Fatal(err)
+	}
+	before, err := os.ReadFile(foreignSidecar)
+	if err != nil {
+		close(finish)
+		t.Fatal(err)
+	}
+	inspectErr := <-inspected
+	close(finish)
+	if inspectErr != nil {
+		t.Fatal(inspectErr)
+	}
+	after, err := os.ReadFile(foreignSidecar)
+	if err != nil || string(after) != string(before) {
+		t.Fatalf("source sidecar changed or disappeared: before=%q after=%q err=%v", before, after, err)
 	}
 }
 
