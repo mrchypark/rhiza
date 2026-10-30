@@ -134,7 +134,7 @@ spec:
                   message: repair record cannot be removed
                 - rule: '!has(self.repair) || (has(self.authority) && has(self.applicationInit) && self.applicationInit.state == "Consumed" && self.repair.plan.bootstrapPlanDigest == self.applicationInit.plan.bootstrapPlanDigest)'
                   message: repair requires consumed managed bootstrap history
-                - rule: '!has(self.repair) || self.repair.state != "Closed" || (has(self.authority.owner) && has(self.authority.binding) && has(self.authority.generation) && !has(self.authority.transition) && self.repair.plan.clusterUID == self.authority.owner.uid && self.repair.plan.generation == self.authority.generation && self.repair.plan.deploymentUID == self.authority.binding.deploymentUID && self.repair.plan.storageID == self.authority.binding.storageID)'
+                - rule: '!has(self.repair) || self.repair.state != "Closed" || (has(self.authority.owner) && has(self.authority.owner.uid) && has(self.authority.binding) && has(self.authority.binding.deploymentUID) && has(self.authority.binding.storageID) && has(self.authority.generation) && !has(self.authority.transition) && self.repair.plan.clusterUID == self.authority.owner.uid && self.repair.plan.generation == self.authority.generation && self.repair.plan.deploymentUID == self.authority.binding.deploymentUID && self.repair.plan.storageID == self.authority.binding.storageID)'
                   message: closed repair must match authority and cannot overlap a transition
                 - rule: '!has(oldSelf.repair) || !has(self.repair) || self.repair.plan.operationID != oldSelf.repair.plan.operationID || self.repair.plan == oldSelf.repair.plan'
                   message: repair intent is immutable per operation
