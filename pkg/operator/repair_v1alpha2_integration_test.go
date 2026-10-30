@@ -11,6 +11,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"net/http"
 	"os"
 	"os/exec"
@@ -24,6 +25,58 @@ import (
 	"github.com/mrchypark/rhiza/pkg/quepaxa"
 	"gopkg.in/yaml.v3"
 )
+
+func TestRepairExpectedConfigIDOpenAPIMaxRoundTrip(t *testing.T) {
+	const schemaMax = int64(math.MaxInt64 - 2)
+	const twoTo63 = float64(1 << 63)
+	got := float64(schemaMax)
+	if got != twoTo63 {
+		t.Fatalf("expected OpenAPI max to round to 2^63: got %.0f, want %.0f", got, twoTo63)
+	}
+	below := math.Nextafter(twoTo63, 0)
+	if below != twoTo63-1024 || got <= below {
+		t.Fatalf("largest lower float64 neighbor = %.0f, rounded schema maximum = %.0f", below, got)
+	}
+}
+
+func TestRepairExpectedConfigIDLimitUsesExactCEL(t *testing.T) {
+	data, err := os.ReadFile(filepath.Join("..", "..", "deploy", "operator", "cluster-crd.yaml"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var document map[string]any
+	if err := yaml.Unmarshal(data, &document); err != nil {
+		t.Fatal(err)
+	}
+	get := func(v any, key string) any {
+		m, _ := v.(map[string]any)
+		return m[key]
+	}
+	// Assert the exact schema path with a narrow lookup over known keys.
+	spec := get(document, "spec")
+	versions, _ := get(spec, "versions").([]any)
+	var schema any
+	for _, version := range versions {
+		if get(version, "name") == "v1alpha2" {
+			schema = get(get(version, "schema"), "openAPIV3Schema")
+		}
+	}
+	field := get(get(get(get(get(get(get(schema, "properties"), "status"), "properties"), "repair"), "properties"), "plan"), "properties")
+	configID, _ := get(field, "expectedConfigID").(map[string]any)
+	if configID == nil || configID["type"] != "integer" || configID["format"] != "int64" || configID["minimum"] != 1 {
+		t.Fatalf("expectedConfigID schema type/format/minimum changed: %#v", configID)
+	}
+	if _, exists := configID["maximum"]; exists {
+		t.Fatalf("unsafe OpenAPI maximum still present: %#v", configID["maximum"])
+	}
+	validations, _ := configID["x-kubernetes-validations"].([]any)
+	for _, validation := range validations {
+		if get(validation, "rule") == "self <= 9223372036854775805" {
+			return
+		}
+	}
+	t.Fatalf("exact CEL upper bound missing from expectedConfigID validations: %#v", validations)
+}
 
 type repairDiagnosticTransport struct {
 	base   http.RoundTripper

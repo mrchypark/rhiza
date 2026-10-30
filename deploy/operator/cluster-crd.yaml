@@ -217,7 +217,13 @@ spec:
                         generation: {type: integer, format: int64, minimum: 0}
                         deploymentUID: {type: string, minLength: 1, maxLength: 256}
                         storageID: {type: string, minLength: 1, maxLength: 256}
-                        expectedConfigID: {type: integer, format: int64, minimum: 1, maximum: 9223372036854775805}
+                        expectedConfigID:
+                          type: integer
+                          format: int64
+                          minimum: 1
+                          x-kubernetes-validations:
+                            - rule: 'self <= 9223372036854775805'
+                              message: repair expectedConfigID exceeds supported signed integer range
                         expectedAbortSlot: {type: integer, format: int64, minimum: 0}
                         oldNodeID: {type: string, minLength: 1, maxLength: 256}
                         oldWALIdentity: {type: string, minLength: 1, maxLength: 256}

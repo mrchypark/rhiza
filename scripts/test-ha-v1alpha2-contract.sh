@@ -303,7 +303,7 @@ export RHIZA_CONTRACT_LOG_DIR="$logs"
 export RHIZA_CONTRACT_COMPLETE_UID="$complete_uid" RHIZA_CONTRACT_RETAINED_UID="$retained_uid" RHIZA_CONTRACT_WAITING_UID="$waiting_uid"
 export RHIZA_CONTRACT_GENESIS_UID="$genesis_uid" RHIZA_CONTRACT_KUBECONFIG="$kubeconfig" RHIZA_CONTRACT_CONTEXT="$context"
 export RHIZA_CONTRACT_AUTHORITY_UID="$authority_uid"
-go test ./pkg/operator -run '^TestV1Alpha2(Status|Authority|Lifecycle|Cancellation|Genesis|Initializer|Repair)APIServerContract$' -count=1 -timeout=60s
+go test ./pkg/operator -run '^TestV1Alpha2(Status|Authority|Lifecycle|Cancellation|Genesis|Initializer|Repair)APIServerContract$|^TestRepairIntegerBoundAPIServerContract$' -count=1 -timeout=60s
 reject genesis-receipt-remove 'genesis receipt cannot be removed or changed and requires authority' patch rhizacluster genesis-contract -n "$namespace" --subresource=status --type=merge -p '{"status":{"genesis":null}}'
 reject genesis-receipt-change 'genesis receipt cannot be removed or changed and requires authority' patch rhizacluster genesis-contract -n "$namespace" --subresource=status --type=merge -p '{"status":{"genesis":{"logicalID":"different"}}}'
 reject genesis-status-wipe 'genesis receipt cannot be removed or changed and requires authority' patch rhizacluster genesis-contract -n "$namespace" --subresource=status --type=merge -p '{"status":null}'
