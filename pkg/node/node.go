@@ -368,7 +368,7 @@ func (n *Node) openInternal(ctx context.Context, enroll bool, prelocked *qlog.Lo
 			maxWALBytes = 4 << 30
 		}
 		if inspectErr = readOnlyWAL.SetMaxBytes(maxWALBytes); inspectErr == nil {
-			inspectCore, coreErr := quepaxa.New(quepaxa.Config{NodeID: n.config.NodeID, Cluster: *n.loadClusterConfig(), WAL: readOnlyWAL, LocalMode: true})
+			inspectCore, coreErr := quepaxa.OpenLocalReadOnlyInspection(quepaxa.Config{NodeID: n.config.NodeID, Cluster: *n.loadClusterConfig(), WAL: readOnlyWAL, LocalMode: true})
 			inspectErr = coreErr
 			if inspectErr == nil {
 				inspectErr = n.validateLocalRoots(inspectCore)

@@ -38,18 +38,18 @@ type Config struct {
 
 // New validates and creates a QuePaxa core.
 func New(config Config) (*Core, error) {
-	return newCoreFromConfig(config, false, false)
+	return newCoreFromConfig(config, false, false, false)
 }
 
 // NewObserver creates a passive verifier whose node ID must not be a voter.
 func NewObserver(config Config) (*Core, error) {
-	return newCoreFromConfig(config, true, false)
+	return newCoreFromConfig(config, true, false, false)
 }
 
 // NewLearner creates a non-voting replica that can verify and durably catch
 // up. It becomes a voter only after a certified target configuration names
 // its previously absent ID.
-func NewLearner(config Config) (*Core, error) { return newCoreFromConfig(config, false, true) }
+func NewLearner(config Config) (*Core, error) { return newCoreFromConfig(config, false, true, false) }
 
 func installReconfigurationMarker(appendMarker, syncWAL func() error) error {
 	if err := appendMarker(); err != nil {
@@ -58,14 +58,14 @@ func installReconfigurationMarker(appendMarker, syncWAL func() error) error {
 	return syncWAL()
 }
 
-func newCoreFromConfig(config Config, observer, learner bool) (*Core, error) {
+func newCoreFromConfig(config Config, observer, learner, localReadOnlyInspection bool) (*Core, error) {
 	if config.NodeID == "" {
 		return nil, fmt.Errorf("%w: node ID is required", ErrInvalidConfig)
 	}
 	if config.WAL == nil {
 		return nil, fmt.Errorf("%w: WAL is required", ErrInvalidConfig)
 	}
-	if config.WAL.ReadOnly() && !observer {
+	if config.WAL.ReadOnly() && !observer && !localReadOnlyInspection {
 		return nil, fmt.Errorf("%w: read-only WAL is only supported for observers", ErrInvalidConfig)
 	}
 	if len(config.Cluster.Members) == 0 {

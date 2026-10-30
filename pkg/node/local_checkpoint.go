@@ -472,7 +472,11 @@ func (identity localCheckpointIdentity) Collect(roots []quepaxa.LocalCheckpointR
 	return syncLocalDir(identity.rootDir)
 }
 
-func (n *Node) validateLocalRoots(core *quepaxa.Core) error {
+type localCheckpointRootReader interface {
+	LocalCheckpointRoots(context.Context) ([]quepaxa.LocalCheckpointRoot, error)
+}
+
+func (n *Node) validateLocalRoots(core localCheckpointRootReader) error {
 	if n.localStore == nil {
 		return fmt.Errorf("Local checkpoint store is unavailable")
 	}
