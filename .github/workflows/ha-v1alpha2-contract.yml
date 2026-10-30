@@ -16,11 +16,11 @@ jobs:
           go-version-file: go.mod
       - name: Focused unit and manifest tests
         run: |
-          go test ./pkg/operator -run '^(TestPhase[123489]|TestAuthorityV1Alpha2|TestApplicationInit)' -count=1 -timeout=60s
+          go test ./pkg/operator -run '^(TestPhase[123489]|TestAuthorityV1Alpha2|TestApplicationInit|TestRepairV1Alpha2)' -count=1 -timeout=60s
           go test ./deploy/operator -count=1 -timeout=60s
           go test ./cmd/rhiza-operator -count=1 -timeout=60s
       - name: Phase 2, 3, 4, 8 and 9 race tests
-        run: go test -race ./pkg/operator -run '^(TestPhase[23489]|TestAuthorityV1Alpha2|TestApplicationInit)' -count=1 -timeout=60s
+        run: go test -race ./pkg/operator -run '^(TestPhase[23489]|TestAuthorityV1Alpha2|TestApplicationInit|TestRepairV1Alpha2)' -count=1 -timeout=60s
       - name: Install kind
         run: go install sigs.k8s.io/kind@v0.32.0
       - name: API server admission contract

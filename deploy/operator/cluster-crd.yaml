@@ -130,6 +130,24 @@ spec:
               type: object
               x-kubernetes-preserve-unknown-fields: true
               x-kubernetes-validations:
+                - rule: '!has(oldSelf.repair) || has(self.repair)'
+                  message: repair record cannot be removed
+                - rule: '!has(self.repair) || (has(self.authority) && has(self.applicationInit) && self.applicationInit.state == "Consumed" && self.repair.plan.bootstrapPlanDigest == self.applicationInit.plan.bootstrapPlanDigest)'
+                  message: repair requires consumed managed bootstrap history
+                - rule: '!has(self.repair) || self.repair.state != "Closed" || (has(self.authority.owner) && has(self.authority.binding) && has(self.authority.generation) && !has(self.authority.transition) && self.repair.plan.clusterUID == self.authority.owner.uid && self.repair.plan.generation == self.authority.generation && self.repair.plan.deploymentUID == self.authority.binding.deploymentUID && self.repair.plan.storageID == self.authority.binding.storageID)'
+                  message: closed repair must match authority and cannot overlap a transition
+                - rule: '!has(oldSelf.repair) || !has(self.repair) || self.repair.plan.operationID != oldSelf.repair.plan.operationID || self.repair.plan == oldSelf.repair.plan'
+                  message: repair intent is immutable per operation
+                - rule: '!has(oldSelf.repair) || !has(self.repair) || oldSelf.repair.state == "Closed" || self.repair.plan.operationID != oldSelf.repair.plan.operationID || self.repair == oldSelf.repair'
+                  message: terminal repair is immutable per operation
+                - rule: '!has(self.repair) || (has(oldSelf.repair) && self.repair.plan.operationID == oldSelf.repair.plan.operationID) || self.repair.state == "Closed"'
+                  message: a new repair must start closed
+                - rule: '!has(oldSelf.repair) || !has(self.repair) || self.repair.plan.operationID == oldSelf.repair.plan.operationID || (oldSelf.repair.state != "Closed" && self.repair.state == "Closed" && (self.repair.plan.generation > oldSelf.repair.plan.generation || (self.repair.plan.generation == oldSelf.repair.plan.generation && self.repair.plan.expectedConfigID >= oldSelf.repair.completion.configID && (self.repair.plan.expectedConfigID > oldSelf.repair.plan.expectedConfigID || (self.repair.plan.expectedConfigID == oldSelf.repair.plan.expectedConfigID && self.repair.plan.expectedAbortSlot > oldSelf.repair.plan.expectedAbortSlot)) && (oldSelf.repair.state != "Aborted" || self.repair.plan.expectedConfigID != oldSelf.repair.completion.configID || self.repair.plan.expectedAbortSlot >= oldSelf.repair.completion.slot))))'
+                  message: replacement repair requires a terminal predecessor and advanced position
+                - rule: '!has(self.repair) || (has(oldSelf.repair) && self.repair == oldSelf.repair) || (has(oldSelf.authority) && self.authority == oldSelf.authority)'
+                  message: repair CAS cannot overwrite application authority
+                - rule: '!has(oldSelf.repair) || oldSelf.repair.state != "Closed" || !has(self.authority.pendingWrite) || !self.authority.pendingWrite || (has(oldSelf.authority.pendingWrite) && oldSelf.authority.pendingWrite && has(oldSelf.authority.pendingRequest) && has(self.authority.pendingRequest) && self.authority.pendingRequest == oldSelf.authority.pendingRequest)'
+                  message: closed repair forbids new application reservations
                 - rule: 'has(oldSelf.genesis) || !has(self.genesis) || (has(self.applicationInit) && self.applicationInit.state == "Unused" && has(self.bootstrapPlan) && has(self.authority) && !self.authority.everApplicationReserved)'
                   message: new genesis requires an unused initialization assignment
                 - rule: '!has(oldSelf.genesis) || has(oldSelf.bootstrapPlan) || !has(self.bootstrapPlan)'
@@ -157,9 +175,86 @@ spec:
                   required: [everApplicationReserved]
                   properties:
                     everApplicationReserved: {type: boolean}
+                    generation: {type: integer, format: int64, minimum: 0}
+                    owner:
+                      type: object
+                      x-kubernetes-preserve-unknown-fields: true
+                      properties:
+                        uid: {type: string, maxLength: 256}
+                    binding:
+                      type: object
+                      x-kubernetes-preserve-unknown-fields: true
+                      properties:
+                        deploymentUID: {type: string, maxLength: 256}
+                        storageID: {type: string, maxLength: 256}
+                    transition: {type: object, x-kubernetes-preserve-unknown-fields: true}
+                    pendingWrite: {type: boolean}
+                    pendingRequest: {type: object, x-kubernetes-preserve-unknown-fields: true}
                   x-kubernetes-validations:
                     - rule: '!oldSelf.everApplicationReserved || self.everApplicationReserved'
                       message: application reservation history cannot be reset
+                repair:
+                  type: object
+                  required: [plan, state]
+                  x-kubernetes-validations:
+                    - rule: '(self.state == "Closed" && !has(self.completion)) || (self.state != "Closed" && has(self.completion))'
+                      message: repair state and completion must agree
+                    - rule: '!has(self.completion) || (self.completion.operationID == self.plan.operationID && self.completion.expectedConfigID == self.plan.expectedConfigID && self.completion.expectedAbortSlot == self.plan.expectedAbortSlot && self.completion.slot > self.plan.expectedAbortSlot)'
+                      message: repair completion must bind the exact operation and position
+                    - rule: '!has(self.completion) || (self.state == "Completed" && self.completion.kind == "Terminal" && self.completion.configID == self.plan.expectedConfigID + 2 && has(self.completion.finalVoterIDs) && self.completion.finalVoterIDs == self.plan.finalVoterIDs) || (self.state == "Aborted" && self.completion.kind == "Abort" && self.completion.configID >= self.plan.expectedConfigID && !has(self.completion.finalVoterIDs))'
+                      message: REMOVE alone is not final repair completion
+                  properties:
+                    state: {type: string, enum: [Closed, Completed, Aborted]}
+                    plan:
+                      type: object
+                      required: [operationID, clusterUID, generation, deploymentUID, storageID, expectedConfigID, expectedAbortSlot, oldNodeID, oldWALIdentity, replacement, bootstrapPlanDigest, finalVoterIDs]
+                      x-kubernetes-validations:
+                        - rule: 'self.replacement.nodeID in self.finalVoterIDs && !(self.oldNodeID in self.finalVoterIDs)'
+                          message: final target must include replacement and exclude old voter
+                      properties:
+                        operationID: {type: string, minLength: 1, maxLength: 256}
+                        clusterUID: {type: string, minLength: 1, maxLength: 256}
+                        generation: {type: integer, format: int64, minimum: 0}
+                        deploymentUID: {type: string, minLength: 1, maxLength: 256}
+                        storageID: {type: string, minLength: 1, maxLength: 256}
+                        expectedConfigID: {type: integer, format: int64, minimum: 1, maximum: 9223372036854775805}
+                        expectedAbortSlot: {type: integer, format: int64, minimum: 0}
+                        oldNodeID: {type: string, minLength: 1, maxLength: 256}
+                        oldWALIdentity: {type: string, minLength: 1, maxLength: 256}
+                        bootstrapPlanDigest: {type: string, pattern: '^[0-9a-f]{64}$', minLength: 64, maxLength: 64}
+                        finalVoterIDs:
+                          type: array
+                          minItems: 2
+                          maxItems: 64
+                          x-kubernetes-list-type: set
+                          items: {type: string, minLength: 1, maxLength: 256}
+                        replacement:
+                          type: object
+                          required: [podName, podUID, nodeID, publicKey, peerURL]
+                          properties:
+                            podName: {type: string, minLength: 1, maxLength: 253}
+                            podUID: {type: string, minLength: 1, maxLength: 256}
+                            nodeID: {type: string, minLength: 1, maxLength: 256}
+                            publicKey: {type: string, minLength: 44, maxLength: 44}
+                            peerURL: {type: string, minLength: 1, maxLength: 2048}
+                    completion:
+                      type: object
+                      required: [operationID, planDigest, expectedConfigID, expectedAbortSlot, kind, configID, slot, hash]
+                      properties:
+                        operationID: {type: string, minLength: 1, maxLength: 256}
+                        planDigest: {type: string, pattern: '^[0-9a-f]{64}$', minLength: 64, maxLength: 64}
+                        expectedConfigID: {type: integer, format: int64, minimum: 1}
+                        expectedAbortSlot: {type: integer, format: int64, minimum: 0}
+                        kind: {type: string, enum: [Terminal, Abort]}
+                        configID: {type: integer, format: int64, minimum: 1}
+                        slot: {type: integer, format: int64, minimum: 1}
+                        hash: {type: string, pattern: '^[0-9a-f]{64}$', minLength: 64, maxLength: 64}
+                        finalVoterIDs:
+                          type: array
+                          minItems: 2
+                          maxItems: 64
+                          x-kubernetes-list-type: set
+                          items: {type: string, minLength: 1, maxLength: 256}
                 bootstrapPlan:
                   type: object
                   required: [clusterID, members, physicalBinding, evidenceFormat, durability, reconfiguration]

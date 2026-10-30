@@ -370,18 +370,23 @@ func (h *Host) Execute(ctx context.Context, req ExecuteRequest) (ExecuteResponse
 	if err := network.ValidateExecuteRequest(req); err != nil {
 		return ExecuteResponse{}, err
 	}
+	// Retain the authority RV across quorum admission. Refreshing it afterward
+	// could carry an old quorum result across repair close/finish/open ABA.
+	a, err := h.live(ctx)
+	if err != nil {
+		return ExecuteResponse{}, err
+	}
+	if a.SQLReservationsClosed() {
+		return ExecuteResponse{}, fmt.Errorf("SQL reservations closed during repair")
+	}
+	if _, pending := a.Pending(); pending {
+		return ExecuteResponse{}, fmt.Errorf("pending SQL must be resolved first")
+	}
 	if err := h.node.AdmitManaged(ctx); err != nil {
 		return ExecuteResponse{}, err
 	}
 	if !h.node.Ready() {
 		return ExecuteResponse{}, fmt.Errorf("runtime control catch-up not ready")
-	}
-	a, err := h.live(ctx)
-	if err != nil {
-		return ExecuteResponse{}, err
-	}
-	if _, pending := a.Pending(); pending {
-		return ExecuteResponse{}, fmt.Errorf("pending SQL must be resolved first")
 	}
 	s, err := h.node.InspectManagedSQL(ctx, false)
 	if err != nil {

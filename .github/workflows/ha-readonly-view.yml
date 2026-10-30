@@ -38,6 +38,7 @@ jobs:
           go test -race ./pkg/node -run '^TestMembership(TerminalRetryRequiresDelivery|RetryRejectsEarlierAbortedSameTarget)$' -count=1 -timeout=60s
           go test -race ./pkg/managedsql -count=1 -timeout=300s
           go test -race ./pkg/network -run '^TestResolveExecute' -count=1 -timeout=60s
+          go test -race ./pkg/network -run '^TestRemovedPeerCannotReuseLiveQUICOrReturnAfterReplay$' -count=1 -timeout=60s
           go test -race ./pkg/materializer -run '^TestSQLApplicationEvidence' -count=1 -timeout=60s
           go test -race . -run '^TestPreparedNode(RegistrationRequestScope|EmulatorAuthScope|ProviderAuthorityHistory)$' -count=1 -timeout=60s
       - name: Exercise fixed-head reads against pinned Floci providers

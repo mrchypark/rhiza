@@ -36,6 +36,7 @@ type V1Alpha2StatusSnapshot struct {
 	queue                   json.RawMessage
 	object                  map[string]json.RawMessage
 	store                   *V1Alpha2StatusStore
+	repair                  *V1Alpha2RepairRecord
 }
 
 func (s V1Alpha2StatusSnapshot) Ref() V1Alpha2ClusterRef          { return s.ref }
@@ -184,6 +185,10 @@ func (s *V1Alpha2StatusStore) snapshot(ref V1Alpha2ClusterRef, obj map[string]js
 		if assignment.State == "Unused" && present || assignment.State == "Consumed" && (!present || bytes.Equal(bytes.TrimSpace(evidence), []byte("null")) || !json.Valid(evidence)) {
 			return V1Alpha2StatusSnapshot{}, fmt.Errorf("invalid assignment evidence state")
 		}
+	}
+	snap.repair, err = parseV1Alpha2Repair(snap)
+	if err != nil {
+		return V1Alpha2StatusSnapshot{}, err
 	}
 	return snap, nil
 }

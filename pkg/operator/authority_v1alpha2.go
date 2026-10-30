@@ -153,6 +153,8 @@ func parseV1Alpha2Admission(s V1Alpha2StatusSnapshot) (V1Alpha2AdmissionSnapshot
 
 // ReserveV1Alpha2SQLWrite retains the bounded original SQL request so a host
 // can resolve the exact pending operation after restart.
+// Capture old BEFORE quorum admission and pass that same snapshot here. Do not
+// reload it after quorum: its exact RV also detects repair close/finish/open ABA.
 func ReserveV1Alpha2SQLWrite(ctx context.Context, store *V1Alpha2StatusStore, old V1Alpha2AdmissionSnapshot, expected V1Alpha2AuthorityView, evidence json.RawMessage, req network.ExecuteRequest) (V1Alpha2AdmissionSnapshot, V1Alpha2CASObservation, error) {
 	if err := network.ValidateExecuteRequest(req); err != nil {
 		return V1Alpha2AdmissionSnapshot{}, "", err
@@ -169,7 +171,7 @@ func ReserveV1Alpha2SQLWrite(ctx context.Context, store *V1Alpha2StatusStore, ol
 	if _, err := decodePendingSQL(raw, request); err != nil {
 		return V1Alpha2AdmissionSnapshot{}, "", err
 	}
-	if old.status.store != store || old.Authority() != expected || old.pending != nil || hasV1Alpha2Transition(old.transition) || !sameJSON(old.evidence, evidence) || !validV1Alpha2WriteRequest(request) {
+	if old.status.store != store || old.Authority() != expected || old.pending != nil || old.SQLReservationsClosed() || hasV1Alpha2Transition(old.transition) || !sameJSON(old.evidence, evidence) || !validV1Alpha2WriteRequest(request) {
 		return V1Alpha2AdmissionSnapshot{}, "", fmt.Errorf("write reservation preconditions do not match")
 	}
 	return updateV1Alpha2Admission(ctx, store, old, func(auth map[string]json.RawMessage) {
@@ -197,7 +199,7 @@ const (
 )
 
 func ReserveV1Alpha2Write(ctx context.Context, store *V1Alpha2StatusStore, old V1Alpha2AdmissionSnapshot, expected V1Alpha2AuthorityView, evidence json.RawMessage, request V1Alpha2WriteRequest) (V1Alpha2AdmissionSnapshot, V1Alpha2CASObservation, error) {
-	if old.status.store != store || old.Authority() != expected || old.pending != nil || hasV1Alpha2Transition(old.transition) || !sameJSON(old.evidence, evidence) || !validV1Alpha2WriteRequest(request) {
+	if old.status.store != store || old.Authority() != expected || old.pending != nil || old.SQLReservationsClosed() || hasV1Alpha2Transition(old.transition) || !sameJSON(old.evidence, evidence) || !validV1Alpha2WriteRequest(request) {
 		return V1Alpha2AdmissionSnapshot{}, "", fmt.Errorf("write reservation preconditions do not match")
 	}
 	return updateV1Alpha2Admission(ctx, store, old, func(auth map[string]json.RawMessage) {
@@ -225,6 +227,10 @@ func hasV1Alpha2Transition(raw json.RawMessage) bool {
 }
 
 func updateV1Alpha2Admission(ctx context.Context, store *V1Alpha2StatusStore, old V1Alpha2AdmissionSnapshot, change func(map[string]json.RawMessage)) (V1Alpha2AdmissionSnapshot, V1Alpha2CASObservation, error) {
+	return updateV1Alpha2AdmissionStatus(ctx, store, old, func(status, auth map[string]json.RawMessage) { change(auth) })
+}
+
+func updateV1Alpha2AdmissionStatus(ctx context.Context, store *V1Alpha2StatusStore, old V1Alpha2AdmissionSnapshot, change func(map[string]json.RawMessage, map[string]json.RawMessage)) (V1Alpha2AdmissionSnapshot, V1Alpha2CASObservation, error) {
 	if store == nil || old.status.store != store || old.status.object == nil || old.status.resourceVersion == "" {
 		return V1Alpha2AdmissionSnapshot{}, "", fmt.Errorf("invalid admission snapshot")
 	}
@@ -240,7 +246,7 @@ func updateV1Alpha2Admission(ctx context.Context, store *V1Alpha2StatusStore, ol
 	if err != nil {
 		return V1Alpha2AdmissionSnapshot{}, "", err
 	}
-	change(auth)
+	change(status, auth)
 	status["authority"], err = json.Marshal(auth)
 	if err != nil {
 		return V1Alpha2AdmissionSnapshot{}, "", err
