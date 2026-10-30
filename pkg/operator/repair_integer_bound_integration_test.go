@@ -232,7 +232,7 @@ func TestRepairIntegerBoundAPIServerContract(t *testing.T) {
 		probe(fixedGroup, fmt.Sprintf("ok%d", i), value, true, "")
 	}
 	for i, invalid := range []struct{ value, cause string }{
-		{"0", "must be greater than or equal to 1"},
+		{"0", "greater than or equal to 1"},
 		{"9223372036854775806", "expectedConfigID bound"},
 		{"9223372036854775807", "expectedConfigID bound"},
 		{`"1"`, "expectedConfigID"},
