@@ -13,8 +13,12 @@ import (
 	"time"
 )
 
+// V1Alpha2InitializationPlanProvider derives a common plan from trusted runtime
+// storage and bootstrap configuration, bound to the live candidate identity.
+type V1Alpha2InitializationPlanProvider func(context.Context, V1Alpha2ClusterRef, string, string) (V1Alpha2ApplicationInitPlan, error)
+
 // ReconcileV1Alpha2Initialization creates only an inert generation-zero candidate.
-func ReconcileV1Alpha2Initialization(ctx context.Context, kube *Kubernetes, ref V1Alpha2ClusterRef) (V1Alpha2StatusSnapshot, error) {
+func ReconcileV1Alpha2Initialization(ctx context.Context, kube *Kubernetes, ref V1Alpha2ClusterRef, providers ...V1Alpha2InitializationPlanProvider) (V1Alpha2StatusSnapshot, error) {
 	store := &V1Alpha2StatusStore{Kube: kube}
 	p, err := store.path(ref)
 	if err != nil {
@@ -50,7 +54,10 @@ func ReconcileV1Alpha2Initialization(ctx context.Context, kube *Kubernetes, ref 
 	if _, ok := status["genesis"]; ok {
 		return store.snapshot(ref, obj)
 	}
-	for _, key := range []string{"authority", "recoveryQueue", "pendingWrite", "transition", "receipt", "decision"} {
+	if len(providers) != 1 || providers[0] == nil {
+		return V1Alpha2StatusSnapshot{}, fmt.Errorf("initialization requires a runtime common plan provider")
+	}
+	for _, key := range []string{"authority", "applicationInit", "recoveryQueue", "pendingWrite", "transition", "receipt", "decision"} {
 		if _, ok := status[key]; ok {
 			return V1Alpha2StatusSnapshot{}, fmt.Errorf("existing %s prevents genesis", key)
 		}
@@ -88,7 +95,11 @@ func ReconcileV1Alpha2Initialization(ctx context.Context, kube *Kubernetes, ref 
 			return V1Alpha2StatusSnapshot{}, fmt.Errorf("candidate creation UID mismatch")
 		}
 	}
-	return initializeV1Alpha2Authority(ctx, store, ref, depName, &c.Spec, deploymentUID, deploymentRV)
+	plan, err := providers[0](ctx, ref, c.Spec.LogicalID, deploymentUID)
+	if err != nil {
+		return V1Alpha2StatusSnapshot{}, fmt.Errorf("build initialization plan: %w", err)
+	}
+	return initializeV1Alpha2AuthorityWithPlan(ctx, store, ref, depName, &c.Spec, deploymentUID, deploymentRV, &plan)
 }
 
 func validateInertCandidate(live map[string]json.RawMessage, desired map[string]any, ref V1Alpha2ClusterRef, name string) error {
@@ -183,7 +194,7 @@ func defaultImagePullPolicy(image string) string {
 }
 
 // RunV1Alpha2Initialization polls complete namespace-scoped lists until canceled.
-func RunV1Alpha2Initialization(ctx context.Context, kube *Kubernetes, interval time.Duration) error {
+func RunV1Alpha2Initialization(ctx context.Context, kube *Kubernetes, interval time.Duration, providers ...V1Alpha2InitializationPlanProvider) error {
 	if kube == nil || !validNamespace(kube.Namespace) || interval <= 0 {
 		return fmt.Errorf("invalid initializer configuration")
 	}
@@ -191,7 +202,7 @@ func RunV1Alpha2Initialization(ctx context.Context, kube *Kubernetes, interval t
 		if err := ctx.Err(); err != nil {
 			return err
 		}
-		if err := initializeV1Alpha2List(ctx, kube); err != nil && ctx.Err() == nil {
+		if err := initializeV1Alpha2List(ctx, kube, providers...); err != nil && ctx.Err() == nil {
 			log.Printf("initializer scan failed: %v", err)
 		}
 		timer := time.NewTimer(interval)
@@ -204,7 +215,7 @@ func RunV1Alpha2Initialization(ctx context.Context, kube *Kubernetes, interval t
 	}
 }
 
-func initializeV1Alpha2List(ctx context.Context, kube *Kubernetes) error {
+func initializeV1Alpha2List(ctx context.Context, kube *Kubernetes, providers ...V1Alpha2InitializationPlanProvider) error {
 	base := "/apis/rhiza.mrchypark.dev/v1alpha2/namespaces/" + kube.Namespace + "/rhizaclusters"
 	var refs []V1Alpha2ClusterRef
 	seen := map[string]bool{}
@@ -264,7 +275,7 @@ func initializeV1Alpha2List(ctx context.Context, kube *Kubernetes) error {
 		if ctx.Err() != nil {
 			return ctx.Err()
 		}
-		if _, err := ReconcileV1Alpha2Initialization(ctx, kube, ref); err != nil {
+		if _, err := ReconcileV1Alpha2Initialization(ctx, kube, ref, providers...); err != nil {
 			log.Printf("initializer cluster %s failed: %v", ref.Name, err)
 		}
 	}

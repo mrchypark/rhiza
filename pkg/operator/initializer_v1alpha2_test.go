@@ -26,6 +26,35 @@ type phase9Server struct {
 	committed         chan struct{}
 }
 
+// The fixed digests here are test fixtures, not runtime storage evidence.
+func phase9Plan(_ context.Context, ref V1Alpha2ClusterRef, logicalID, deploymentUID string) (V1Alpha2ApplicationInitPlan, error) {
+	return NewV1Alpha2ApplicationInitPlan(ref, logicalID, deploymentUID, "test-assignment", strings.Repeat("a", 64), strings.Repeat("b", 64), "test/v1")
+}
+
+func TestPhase9InitializerRequiresPlanBeforeCreate(t *testing.T) {
+	s, kube := phase9Setup(t, phase8Cluster)
+	if _, err := ReconcileV1Alpha2Initialization(context.Background(), kube, phase2Ref); err == nil {
+		t.Fatal("missing runtime plan accepted")
+	}
+	if s.posts != 0 || s.puts != 0 {
+		t.Fatalf("missing plan wrote: posts=%d puts=%d", s.posts, s.puts)
+	}
+}
+
+func TestPhase9InitializerRejectsAssignmentWithoutGenesisBeforeCreate(t *testing.T) {
+	cluster := strings.Replace(phase8Cluster, `"status":{`, `"status":{"applicationInit":{},`, 1)
+	if cluster == phase8Cluster {
+		t.Fatal("fixture has no status object")
+	}
+	s, kube := phase9Setup(t, cluster)
+	if _, err := ReconcileV1Alpha2Initialization(context.Background(), kube, phase2Ref, phase9Plan); err == nil {
+		t.Fatal("orphaned assignment accepted")
+	}
+	if s.posts != 0 || s.puts != 0 {
+		t.Fatalf("orphaned assignment wrote: posts=%d puts=%d", s.posts, s.puts)
+	}
+}
+
 func TestPhase9InitializerListPaginationGuards(t *testing.T) {
 	first := `{"apiVersion":"rhiza.mrchypark.dev/v1alpha2","kind":"RhizaClusterList","metadata":{"resourceVersion":"1","continue":"next"},"items":[` + phase8Cluster + `]}`
 	for _, test := range []struct{ name, second string }{
@@ -44,7 +73,7 @@ func TestPhase9InitializerListPaginationGuards(t *testing.T) {
 				}
 				return s.roundTrip(r)
 			}).Kube
-			if err := initializeV1Alpha2List(context.Background(), kube); err == nil {
+			if err := initializeV1Alpha2List(context.Background(), kube, phase9Plan); err == nil {
 				t.Fatal("incomplete or inconsistent list accepted")
 			}
 			if s.posts != 0 || s.puts != 0 {
@@ -121,7 +150,7 @@ func phase9Setup(t *testing.T, cluster string) (*phase9Server, *Kubernetes) {
 
 func TestPhase9InitializerCreatesOnceAndPreservesStatus(t *testing.T) {
 	s, kube := phase9Setup(t, phase8Cluster)
-	first, err := ReconcileV1Alpha2Initialization(context.Background(), kube, phase2Ref)
+	first, err := ReconcileV1Alpha2Initialization(context.Background(), kube, phase2Ref, phase9Plan)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -139,7 +168,7 @@ func TestPhase9InitializerCreatesOnceAndPreservesStatus(t *testing.T) {
 	if deployment.Spec.Replicas == nil || *deployment.Spec.Replicas != 0 {
 		t.Fatalf("replicas: %v", deployment.Spec.Replicas)
 	}
-	if _, err := ReconcileV1Alpha2Initialization(context.Background(), kube, phase2Ref); err != nil {
+	if _, err := ReconcileV1Alpha2Initialization(context.Background(), kube, phase2Ref, phase9Plan); err != nil {
 		t.Fatal(err)
 	}
 	if s.posts != 1 || s.puts != 1 {
@@ -152,7 +181,7 @@ func TestPhase9InitializerCreatesOnceAndPreservesStatus(t *testing.T) {
 
 func TestPhase9InitializerRejectsMissingIntent(t *testing.T) {
 	s, kube := phase9Setup(t, strings.Replace(phase8Cluster, `"genesisIntent":"Create",`, "", 1))
-	if _, err := ReconcileV1Alpha2Initialization(context.Background(), kube, phase2Ref); err == nil {
+	if _, err := ReconcileV1Alpha2Initialization(context.Background(), kube, phase2Ref, phase9Plan); err == nil {
 		t.Fatal("missing intent accepted")
 	}
 	if s.posts != 0 || s.puts != 0 {
@@ -164,7 +193,7 @@ func TestPhase9InitializerRejectsUnsafeExistingDeployment(t *testing.T) {
 	for _, mutation := range []string{"replicas", "owner", "template", "generation", "uid"} {
 		t.Run(mutation, func(t *testing.T) {
 			s, kube := phase9Setup(t, phase8Cluster)
-			if _, err := ReconcileV1Alpha2Initialization(context.Background(), kube, phase2Ref); err != nil {
+			if _, err := ReconcileV1Alpha2Initialization(context.Background(), kube, phase2Ref, phase9Plan); err != nil {
 				t.Fatal(err)
 			}
 			var obj map[string]any
@@ -193,7 +222,7 @@ func TestPhase9InitializerRejectsUnsafeExistingDeployment(t *testing.T) {
 				t.Fatal("fixture mutation did not change deployment")
 			}
 			s.deployment, s.cluster, s.posts, s.puts = string(b), phase8Cluster, 0, 0
-			if _, err := ReconcileV1Alpha2Initialization(context.Background(), kube, phase2Ref); err == nil {
+			if _, err := ReconcileV1Alpha2Initialization(context.Background(), kube, phase2Ref, phase9Plan); err == nil {
 				t.Fatal("unsafe deployment accepted")
 			}
 			if s.posts != 1 || s.puts != 0 {
@@ -215,13 +244,13 @@ func TestPhase9InitializerCreateConflictAndLostResponse(t *testing.T) {
 		t.Run(test.name, func(t *testing.T) {
 			s, kube := phase9Setup(t, phase8Cluster)
 			if test.preexisting {
-				if _, err := ReconcileV1Alpha2Initialization(context.Background(), kube, phase2Ref); err != nil {
+				if _, err := ReconcileV1Alpha2Initialization(context.Background(), kube, phase2Ref, phase9Plan); err != nil {
 					t.Fatal(err)
 				}
 				s.cluster, s.posts, s.puts = phase8Cluster, 0, 0
 			}
 			s.lostPost, s.failGet = test.lost, test.failGet
-			_, err := ReconcileV1Alpha2Initialization(context.Background(), kube, phase2Ref)
+			_, err := ReconcileV1Alpha2Initialization(context.Background(), kube, phase2Ref, phase9Plan)
 			if (err != nil) != test.wantErr {
 				t.Fatalf("error: %v", err)
 			}
@@ -247,7 +276,7 @@ func TestPhase9InitializerImagePullDefaults(t *testing.T) {
 					t.Fatal("cluster image mutation did not apply")
 				}
 				s, kube := phase9Setup(t, cluster)
-				if _, err := ReconcileV1Alpha2Initialization(context.Background(), kube, phase2Ref); err != nil {
+				if _, err := ReconcileV1Alpha2Initialization(context.Background(), kube, phase2Ref, phase9Plan); err != nil {
 					t.Fatal(err)
 				}
 				var obj map[string]any
@@ -272,7 +301,7 @@ func TestPhase9InitializerImagePullDefaults(t *testing.T) {
 					t.Fatal("policy mutation did not apply")
 				}
 				s.deployment, s.cluster, s.posts, s.puts = string(b), cluster, 0, 0
-				_, err = ReconcileV1Alpha2Initialization(context.Background(), kube, phase2Ref)
+				_, err = ReconcileV1Alpha2Initialization(context.Background(), kube, phase2Ref, phase9Plan)
 				if (err == nil) != valid {
 					t.Fatalf("policy %s: %v", policy, err)
 				}
@@ -289,7 +318,10 @@ func TestPhase9InitializerConcurrentCreateCAS(t *testing.T) {
 	s.arrived, s.release, s.committed = make(chan struct{}, 2), make(chan struct{}), make(chan struct{})
 	errs := make(chan error, 2)
 	for i := 0; i < 2; i++ {
-		go func() { _, err := ReconcileV1Alpha2Initialization(context.Background(), kube, phase2Ref); errs <- err }()
+		go func() {
+			_, err := ReconcileV1Alpha2Initialization(context.Background(), kube, phase2Ref, phase9Plan)
+			errs <- err
+		}()
 	}
 	<-s.arrived
 	<-s.arrived
@@ -325,7 +357,7 @@ func TestPhase9InitializerListGuards(t *testing.T) {
 				}
 				return s.roundTrip(r)
 			}).Kube
-			err := initializeV1Alpha2List(context.Background(), kube)
+			err := initializeV1Alpha2List(context.Background(), kube, phase9Plan)
 			if (err != nil) != test.wantErr {
 				t.Fatalf("error: %v", err)
 			}
@@ -344,7 +376,7 @@ func TestPhase9InitializerListGuards(t *testing.T) {
 
 func TestPhase9InitializerNeverRecreatesLaterGeneration(t *testing.T) {
 	s, kube := phase9Setup(t, phase8Cluster)
-	if _, err := ReconcileV1Alpha2Initialization(context.Background(), kube, phase2Ref); err != nil {
+	if _, err := ReconcileV1Alpha2Initialization(context.Background(), kube, phase2Ref, phase9Plan); err != nil {
 		t.Fatal(err)
 	}
 	var obj map[string]any
@@ -352,6 +384,10 @@ func TestPhase9InitializerNeverRecreatesLaterGeneration(t *testing.T) {
 		t.Fatal(err)
 	}
 	authority := obj["status"].(map[string]any)["authority"].(map[string]any)
+	assignment := obj["status"].(map[string]any)["applicationInit"].(map[string]any)
+	assignment["state"] = "Consumed"
+	assignment["initialEvidenceDigest"] = strings.Repeat("a", 64)
+	authority["evidence"] = map[string]any{"tip": 7}
 	authority["generation"] = 2
 	authority["binding"].(map[string]any)["deploymentUID"] = "later-deployment"
 	b, err := json.Marshal(obj)
@@ -359,7 +395,7 @@ func TestPhase9InitializerNeverRecreatesLaterGeneration(t *testing.T) {
 		t.Fatal(err)
 	}
 	s.cluster, s.deployment, s.posts, s.puts = string(b), "", 0, 0
-	snap, err := ReconcileV1Alpha2Initialization(context.Background(), kube, phase2Ref)
+	snap, err := ReconcileV1Alpha2Initialization(context.Background(), kube, phase2Ref, phase9Plan)
 	if err != nil {
 		t.Fatal(err)
 	}

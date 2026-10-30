@@ -64,7 +64,7 @@ func TestV1Alpha2InitializerAPIServerContract(t *testing.T) {
 	t.Cleanup(transport.CloseIdleConnections)
 	kube := &Kubernetes{BaseURL: server, Namespace: ns, TokenFile: required("RHIZA_CONTRACT_TOKEN"), Client: &http.Client{Transport: transport}}
 	ctx := context.Background()
-	first, err := ReconcileV1Alpha2Initialization(ctx, kube, ref)
+	first, err := ReconcileV1Alpha2Initialization(ctx, kube, ref, phase9Plan)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -101,7 +101,7 @@ func TestV1Alpha2InitializerAPIServerContract(t *testing.T) {
 	if err := json.Unmarshal(status["genesis"], &receipt); err != nil || receipt.DeploymentUID != deploy.Metadata.UID || receipt.OwnerUID != ref.UID {
 		t.Fatalf("receipt mismatch: %v", err)
 	}
-	again, err := ReconcileV1Alpha2Initialization(ctx, kube, ref)
+	again, err := ReconcileV1Alpha2Initialization(ctx, kube, ref, phase9Plan)
 	if err != nil || again.ResourceVersion() != first.ResourceVersion() || !sameJSON(again.object["status"], first.object["status"]) {
 		t.Fatalf("repeat changed initialization: %v", err)
 	}

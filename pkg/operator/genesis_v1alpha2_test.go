@@ -84,9 +84,17 @@ func phase8Setup(t *testing.T, cluster, deployment string) (*phase8Server, *V1Al
 	return s, phase2Store(t, s.roundTrip), name
 }
 
+func phase8Initialize(ctx context.Context, store *V1Alpha2StatusStore, ref V1Alpha2ClusterRef, name string) (V1Alpha2StatusSnapshot, error) {
+	plan, err := NewV1Alpha2ApplicationInitPlan(ref, "logical", "deployment", "assignment", strings.Repeat("a", 64), strings.Repeat("b", 64), "app/v1")
+	if err != nil {
+		return V1Alpha2StatusSnapshot{}, err
+	}
+	return InitializeV1Alpha2AuthorityWithPlan(ctx, store, ref, name, plan)
+}
+
 func TestPhase8GenesisAtomicAndPreservesFields(t *testing.T) {
 	s, store, name := phase8Setup(t, phase8Cluster, "")
-	snap, err := InitializeV1Alpha2Authority(context.Background(), store, phase2Ref, name)
+	snap, err := phase8Initialize(context.Background(), store, phase2Ref, name)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -114,7 +122,7 @@ func TestPhase8GenesisAtomicAndPreservesFields(t *testing.T) {
 	if err := validateGenesisReceipt(status["genesis"], phase2Ref, "logical"); err != nil {
 		t.Fatalf("receipt: %v", err)
 	}
-	if _, err = InitializeV1Alpha2Authority(context.Background(), store, phase2Ref, name); err != nil || s.puts != 1 {
+	if _, err = phase8Initialize(context.Background(), store, phase2Ref, name); err != nil || s.puts != 1 {
 		t.Fatalf("repeat changed status: puts=%d err=%v", s.puts, err)
 	}
 }
@@ -132,7 +140,7 @@ func TestPhase8GenesisAmbiguousAndConflict(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			s, store, name := phase8Setup(t, phase8Cluster, "")
 			s.conflict, s.timeout, s.apply = tc.conflict, tc.timeout, tc.apply
-			_, err := InitializeV1Alpha2Authority(context.Background(), store, phase2Ref, name)
+			_, err := phase8Initialize(context.Background(), store, phase2Ref, name)
 			if (tc.want == nil && err != nil) || (tc.want != nil && !errors.Is(err, tc.want)) {
 				t.Fatalf("got %v, want %v", err, tc.want)
 			}
@@ -169,7 +177,7 @@ func TestPhase8GenesisRefusesUnsafeInputs(t *testing.T) {
 				t.Fatal("negative fixture did not change")
 			}
 			s, store, depName := phase8Setup(t, tc.cluster, tc.deployment)
-			if _, err := InitializeV1Alpha2Authority(context.Background(), store, phase2Ref, depName); err == nil {
+			if _, err := phase8Initialize(context.Background(), store, phase2Ref, depName); err == nil {
 				t.Fatal("unsafe genesis accepted")
 			}
 			if s.puts != 0 {
@@ -181,7 +189,7 @@ func TestPhase8GenesisRefusesUnsafeInputs(t *testing.T) {
 
 func TestPhase8GenesisLostReceiptOrAuthorityNeverResets(t *testing.T) {
 	s, store, name := phase8Setup(t, phase8Cluster, "")
-	if _, err := InitializeV1Alpha2Authority(context.Background(), store, phase2Ref, name); err != nil {
+	if _, err := phase8Initialize(context.Background(), store, phase2Ref, name); err != nil {
 		t.Fatal(err)
 	}
 	var obj map[string]json.RawMessage
@@ -202,7 +210,7 @@ func TestPhase8GenesisLostReceiptOrAuthorityNeverResets(t *testing.T) {
 			objCopy["status"], _ = json.Marshal(copyStatus)
 			body, _ := json.Marshal(objCopy)
 			srv, st, n := phase8Setup(t, string(body), "")
-			if _, err := InitializeV1Alpha2Authority(context.Background(), st, phase2Ref, n); err == nil {
+			if _, err := phase8Initialize(context.Background(), st, phase2Ref, n); err == nil {
 				t.Fatal("lost evidence accepted")
 			}
 			if _, err := st.Load(context.Background(), phase2Ref); err == nil {
@@ -227,7 +235,7 @@ func TestPhase8GenesisLostReceiptOrAuthorityNeverResets(t *testing.T) {
 			objCopy["status"], _ = json.Marshal(copyStatus)
 			body, _ := json.Marshal(objCopy)
 			srv, st, n := phase8Setup(t, string(body), "")
-			if _, err := InitializeV1Alpha2Authority(context.Background(), st, phase2Ref, n); err == nil {
+			if _, err := phase8Initialize(context.Background(), st, phase2Ref, n); err == nil {
 				t.Fatal("corrupt evidence accepted")
 			}
 			if _, err := st.Load(context.Background(), phase2Ref); err == nil {
@@ -262,7 +270,7 @@ func TestPhase8GenesisIntentUpdateImmutable(t *testing.T) {
 
 func TestPhase8GenesisRejectsNoncanonicalDeployment(t *testing.T) {
 	s, store, _ := phase8Setup(t, phase8Cluster, "")
-	if _, err := InitializeV1Alpha2Authority(context.Background(), store, phase2Ref, "other"); err == nil {
+	if _, err := phase8Initialize(context.Background(), store, phase2Ref, "other"); err == nil {
 		t.Fatal("arbitrary deployment accepted")
 	}
 	if s.puts != 0 {
@@ -279,7 +287,7 @@ func TestPhase8GenesisConcurrentControllers(t *testing.T) {
 	for i := 0; i < 2; i++ {
 		go func() {
 			<-start
-			_, err := InitializeV1Alpha2Authority(context.Background(), store, phase2Ref, name)
+			_, err := phase8Initialize(context.Background(), store, phase2Ref, name)
 			results <- err
 		}()
 	}

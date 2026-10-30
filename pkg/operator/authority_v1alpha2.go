@@ -7,6 +7,9 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+
+	"github.com/mrchypark/rhiza/internal/types"
+	"github.com/mrchypark/rhiza/pkg/network"
 )
 
 // V1Alpha2WriteRequest is the stable identity of one protected mutation.
@@ -19,6 +22,7 @@ type V1Alpha2WriteRequest struct {
 type v1alpha2PendingRequest struct {
 	V1Alpha2WriteRequest
 	PriorEvidence json.RawMessage `json:"priorEvidence"`
+	OriginalSQL   json.RawMessage `json:"originalSQL,omitempty"`
 }
 
 // V1Alpha2AdmissionSnapshot contains one observed authority, not future permission.
@@ -38,6 +42,45 @@ func (s V1Alpha2AdmissionSnapshot) Pending() (V1Alpha2WriteRequest, bool) {
 	return s.pending.V1Alpha2WriteRequest, true
 }
 func (s V1Alpha2AdmissionSnapshot) Transition() json.RawMessage { return bytes.Clone(s.transition) }
+
+// PendingSQL returns the retained original SQL request; old pending requests may
+// have no payload and need the original client to resubmit it.
+func (s V1Alpha2AdmissionSnapshot) PendingSQL() (network.ExecuteRequest, bool, error) {
+	if s.pending == nil || len(s.pending.OriginalSQL) == 0 {
+		return network.ExecuteRequest{}, false, nil
+	}
+	r, err := decodePendingSQL(s.pending.OriginalSQL, s.pending.V1Alpha2WriteRequest)
+	return r, err == nil, err
+}
+
+func sqlRequestFingerprint(req network.ExecuteRequest) ([32]byte, error) {
+	return types.SQLFingerprint(types.SQLCommand{RequestID: req.RequestID, SQL: req.SQL, Args: req.Args, WantRows: req.WantRows, RequireOne: req.RequireOne, Statements: req.Statements})
+}
+
+func decodePendingSQL(raw json.RawMessage, request V1Alpha2WriteRequest) (network.ExecuteRequest, error) {
+	var r network.ExecuteRequest
+	if len(raw) == 0 || len(raw) > 32<<10 {
+		return r, fmt.Errorf("invalid pending SQL size")
+	}
+	commands, ok, err := types.DecodeSQLBatch(types.AssembleSQLBatch([][]byte{raw}))
+	if err != nil || !ok || len(commands) != 1 || commands[0].Migration != nil {
+		return r, fmt.Errorf("invalid pending SQL command")
+	}
+	command := commands[0]
+	canonical, err := types.EncodeSQLBatchItem(command)
+	if err != nil || !sameJSON(canonical, raw) {
+		return r, fmt.Errorf("noncanonical pending SQL command")
+	}
+	r = network.ExecuteRequest{RequestID: command.RequestID, SQL: command.SQL, Args: command.Args, WantRows: command.WantRows, RequireOne: command.RequireOne, Statements: command.Statements}
+	if err := network.ValidateExecuteRequest(r); err != nil {
+		return r, err
+	}
+	f, err := sqlRequestFingerprint(r)
+	if err != nil || request.Kind != "sql" || request.ID != r.RequestID || request.Fingerprint != fmt.Sprintf("%x", f) {
+		return r, fmt.Errorf("pending SQL fingerprint mismatch")
+	}
+	return r, nil
+}
 
 // LoadV1Alpha2Admission allows inspection of pending state for recovery. It
 // never turns missing evidence into a fresh authority.
@@ -84,6 +127,11 @@ func parseV1Alpha2Admission(s V1Alpha2StatusSnapshot) (V1Alpha2AdmissionSnapshot
 		if !pending || decodeV1Alpha2(raw, &r) != nil || !validV1Alpha2WriteRequest(r.V1Alpha2WriteRequest) || !sameJSON(r.PriorEvidence, evidence) {
 			return V1Alpha2AdmissionSnapshot{}, fmt.Errorf("invalid pending request")
 		}
+		if len(r.OriginalSQL) > 0 {
+			if _, err := decodePendingSQL(r.OriginalSQL, r.V1Alpha2WriteRequest); err != nil {
+				return V1Alpha2AdmissionSnapshot{}, fmt.Errorf("invalid pending SQL: %w", err)
+			}
+		}
 		request = &r
 	} else if pending {
 		return V1Alpha2AdmissionSnapshot{}, fmt.Errorf("pending request identity missing")
@@ -95,6 +143,33 @@ func parseV1Alpha2Admission(s V1Alpha2StatusSnapshot) (V1Alpha2AdmissionSnapshot
 		}
 	}
 	return V1Alpha2AdmissionSnapshot{status: s, evidence: bytes.Clone(evidence), pending: request, transition: bytes.Clone(transition)}, nil
+}
+
+// ReserveV1Alpha2SQLWrite retains the bounded original SQL request so a host
+// can resolve the exact pending operation after restart.
+func ReserveV1Alpha2SQLWrite(ctx context.Context, store *V1Alpha2StatusStore, old V1Alpha2AdmissionSnapshot, expected V1Alpha2AuthorityView, evidence json.RawMessage, req network.ExecuteRequest) (V1Alpha2AdmissionSnapshot, V1Alpha2CASObservation, error) {
+	if err := network.ValidateExecuteRequest(req); err != nil {
+		return V1Alpha2AdmissionSnapshot{}, "", err
+	}
+	fingerprint, err := sqlRequestFingerprint(req)
+	if err != nil {
+		return V1Alpha2AdmissionSnapshot{}, "", err
+	}
+	request := V1Alpha2WriteRequest{Kind: "sql", ID: req.RequestID, Fingerprint: fmt.Sprintf("%x", fingerprint)}
+	raw, err := types.EncodeSQLBatchItem(types.SQLCommand{RequestID: req.RequestID, SQL: req.SQL, Args: req.Args, WantRows: req.WantRows, RequireOne: req.RequireOne, Statements: req.Statements})
+	if err != nil {
+		return V1Alpha2AdmissionSnapshot{}, "", err
+	}
+	if _, err := decodePendingSQL(raw, request); err != nil {
+		return V1Alpha2AdmissionSnapshot{}, "", err
+	}
+	if old.status.store != store || old.Authority() != expected || old.pending != nil || hasV1Alpha2Transition(old.transition) || !sameJSON(old.evidence, evidence) || !validV1Alpha2WriteRequest(request) {
+		return V1Alpha2AdmissionSnapshot{}, "", fmt.Errorf("write reservation preconditions do not match")
+	}
+	return updateV1Alpha2Admission(ctx, store, old, func(auth map[string]json.RawMessage) {
+		auth["pendingWrite"] = json.RawMessage("true")
+		auth["pendingRequest"], _ = json.Marshal(v1alpha2PendingRequest{V1Alpha2WriteRequest: request, PriorEvidence: bytes.Clone(old.evidence), OriginalSQL: raw})
+	})
 }
 
 type V1Alpha2WriteOutcome string

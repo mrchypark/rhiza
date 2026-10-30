@@ -55,6 +55,15 @@ func InitializeV1Alpha2Authority(ctx context.Context, s *V1Alpha2StatusStore, re
 }
 
 func initializeV1Alpha2Authority(ctx context.Context, s *V1Alpha2StatusStore, ref V1Alpha2ClusterRef, deploymentName string, expected *V1Alpha2ClusterSpec, expectedUID, expectedRV string) (V1Alpha2StatusSnapshot, error) {
+	return initializeV1Alpha2AuthorityWithPlan(ctx, s, ref, deploymentName, expected, expectedUID, expectedRV, nil)
+}
+
+// InitializeV1Alpha2AuthorityWithPlan creates an assignment atomically with genesis.
+func InitializeV1Alpha2AuthorityWithPlan(ctx context.Context, s *V1Alpha2StatusStore, ref V1Alpha2ClusterRef, deploymentName string, plan V1Alpha2ApplicationInitPlan) (V1Alpha2StatusSnapshot, error) {
+	return initializeV1Alpha2AuthorityWithPlan(ctx, s, ref, deploymentName, nil, "", "", &plan)
+}
+
+func initializeV1Alpha2AuthorityWithPlan(ctx context.Context, s *V1Alpha2StatusStore, ref V1Alpha2ClusterRef, deploymentName string, expected *V1Alpha2ClusterSpec, expectedUID, expectedRV string, plan *V1Alpha2ApplicationInitPlan) (V1Alpha2StatusSnapshot, error) {
 	p, err := s.path(ref)
 	if err != nil {
 		return V1Alpha2StatusSnapshot{}, err
@@ -110,10 +119,13 @@ func initializeV1Alpha2Authority(ctx context.Context, s *V1Alpha2StatusStore, re
 	if _, ok := status["genesis"]; ok {
 		return s.snapshot(ref, obj)
 	}
+	if plan == nil {
+		return V1Alpha2StatusSnapshot{}, fmt.Errorf("genesis requires an explicit application initialization plan")
+	}
 	if _, ok := status["authority"]; ok {
 		return V1Alpha2StatusSnapshot{}, fmt.Errorf("authority without genesis receipt")
 	}
-	for _, key := range []string{"recoveryQueue", "pendingWrite", "transition", "receipt", "decision"} {
+	for _, key := range []string{"recoveryQueue", "pendingWrite", "transition", "receipt", "decision", "applicationInit"} {
 		if _, ok := status[key]; ok {
 			return V1Alpha2StatusSnapshot{}, fmt.Errorf("existing %s prevents genesis", key)
 		}
@@ -158,9 +170,13 @@ func initializeV1Alpha2Authority(ctx context.Context, s *V1Alpha2StatusStore, re
 	}
 	storageID := genesisStorageID(ref.UID)
 	receipt := v1alpha2Genesis{ref.UID, logicalID, d.UID, storageID, genesisHash(ref, logicalID, d.UID, storageID)}
+	if err := validateV1Alpha2ApplicationInitPlan(*plan, ref, receipt); err != nil {
+		return V1Alpha2StatusSnapshot{}, err
+	}
 	authority := map[string]any{"owner": map[string]any{"namespace": ref.Namespace, "name": ref.Name, "uid": ref.UID, "logicalID": logicalID}, "generation": 0, "binding": map[string]string{"deploymentUID": d.UID, "storageID": storageID}, "pendingWrite": false}
 	status["genesis"], _ = json.Marshal(receipt)
 	status["authority"], _ = json.Marshal(authority)
+	status["applicationInit"], _ = json.Marshal(V1Alpha2ApplicationInitAssignment{Plan: *plan, State: "Unused"})
 	statusRaw, _ := json.Marshal(status)
 	obj["status"] = statusRaw
 	var response map[string]json.RawMessage

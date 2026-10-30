@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/tls"
 	"crypto/x509"
+	"encoding/json"
 	"fmt"
 	"net/http"
 	"os"
@@ -39,6 +40,14 @@ func TestV1Alpha2GenesisAPIServerContract(t *testing.T) {
 			t.Fatalf("kubectl: %v: %s", err, out)
 		}
 	}
+	rejectStatusPatch := func(patch, message string) {
+		t.Helper()
+		args := []string{"--kubeconfig", required("RHIZA_CONTRACT_KUBECONFIG"), "--context", required("RHIZA_CONTRACT_CONTEXT"), "--namespace", ns, "--request-timeout=30s", "patch", "rhizacluster", "genesis-contract", "--subresource=status", "--type=merge", "-p", patch}
+		out, err := exec.Command("kubectl", args...).CombinedOutput()
+		if err == nil || !strings.Contains(string(out), message) {
+			t.Fatalf("expected status rejection %q: %v %s", message, err, out)
+		}
+	}
 	deployment := fmt.Sprintf(`{"apiVersion":"apps/v1","kind":"Deployment","metadata":{"name":%q,"namespace":%q,"labels":{"rhiza.mrchypark.dev/cluster-uid":%q,"rhiza.mrchypark.dev/generation":"0"},"ownerReferences":[{"apiVersion":"rhiza.mrchypark.dev/v1alpha2","kind":"RhizaCluster","name":"genesis-contract","uid":%q,"controller":true}]},"spec":{"replicas":0,"selector":{"matchLabels":{"app":"genesis-contract"}},"template":{"metadata":{"labels":{"app":"genesis-contract"}},"spec":{"containers":[{"name":"app","image":"example.invalid/app"}]}}}}`, name, ns, uid, uid)
 	kubectl(deployment, "create", "-f", "-")
 	ca, err := os.ReadFile(required("RHIZA_CONTRACT_CA"))
@@ -54,7 +63,25 @@ func TestV1Alpha2GenesisAPIServerContract(t *testing.T) {
 	store := &V1Alpha2StatusStore{Kube: &Kubernetes{BaseURL: server, Namespace: ns, TokenFile: required("RHIZA_CONTRACT_TOKEN"), Client: &http.Client{Transport: transport}}}
 	ctx := context.Background()
 	ref := V1Alpha2ClusterRef{Name: "genesis-contract", Namespace: ns, UID: uid}
-	first, err := InitializeV1Alpha2Authority(ctx, store, ref, name)
+	var liveDeployment struct {
+		Metadata struct {
+			UID string `json:"uid"`
+		} `json:"metadata"`
+	}
+	if err := store.Kube.Get(ctx, "/apis/apps/v1/namespaces/"+ns+"/deployments/"+name, &liveDeployment); err != nil {
+		t.Fatal(err)
+	}
+	plan, err := NewV1Alpha2ApplicationInitPlan(ref, "test", liveDeployment.Metadata.UID, "genesis-contract-assignment", strings.Repeat("a", 64), strings.Repeat("b", 64), "test/v1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	genesis := v1alpha2Genesis{OwnerUID: uid, LogicalID: "test", DeploymentUID: liveDeployment.Metadata.UID, StorageID: plan.StorageID, IntentHash: plan.IntentHash}
+	bad, err := json.Marshal(map[string]any{"status": map[string]any{"genesis": genesis, "authority": map[string]any{"owner": map[string]string{"namespace": ns, "name": ref.Name, "uid": uid, "logicalID": "test"}, "generation": 0, "binding": map[string]string{"deploymentUID": liveDeployment.Metadata.UID, "storageID": plan.StorageID}, "pendingWrite": false}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	rejectStatusPatch(string(bad), "new genesis requires an unused initialization assignment")
+	first, err := InitializeV1Alpha2AuthorityWithPlan(ctx, store, ref, name, plan)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -69,6 +96,21 @@ func TestV1Alpha2GenesisAPIServerContract(t *testing.T) {
 	loaded, err := store.Load(ctx, ref)
 	if err != nil || !sameJSON(first.object["status"], loaded.object["status"]) {
 		t.Fatalf("mutable policy invalidated genesis: %v", err)
+	}
+	unused, err := LoadV1Alpha2ApplicationInit(ctx, store, ref)
+	if err != nil || unused.Assignment().State != "Unused" {
+		t.Fatalf("load unused assignment: %v", err)
+	}
+	consumed, observation, err := CommitV1Alpha2ApplicationInit(ctx, store, unused, plan, json.RawMessage(`{"value":"initial"}`))
+	if err != nil || observation != V1Alpha2CASApplied || consumed.Assignment().State != "Consumed" {
+		t.Fatalf("consume assignment: %s %v", observation, err)
+	}
+	rejectStatusPatch(`{"status":{"applicationInit":null}}`, "initialization assignment cannot be removed")
+	rejectStatusPatch(`{"status":{"applicationInit":{"state":"Unused","initialEvidenceDigest":null}}}`, "consumed initialization cannot be changed or rearmed")
+	kubectl("", "patch", "rhizacluster", ref.Name, "--subresource=status", "--type=merge", "-p", `{"status":{"authority":{"evidence":{"value":"advanced"}}}}`)
+	advanced, err := LoadV1Alpha2ApplicationInit(ctx, store, ref)
+	if err != nil || advanced.Assignment() != consumed.Assignment() {
+		t.Fatalf("initial assignment changed after evidence advance: %v", err)
 	}
 	wrong := ref
 	wrong.UID = uid + "-other"

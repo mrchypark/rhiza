@@ -24,6 +24,8 @@ spec:
               message: genesis receipt cannot be removed or changed and requires authority
             - rule: '!has(self.status) || !has(self.status.genesis) || has(self.status.authority)'
               message: genesis receipt requires authority
+            - rule: '!has(self.status) || !has(self.status.genesis) || (has(oldSelf.status) && has(oldSelf.status.genesis)) || (has(self.status.applicationInit) && self.status.applicationInit.state == "Unused")'
+              message: new genesis requires an unused initialization assignment
           properties:
             spec:
               type: object
@@ -125,6 +127,21 @@ spec:
             status:
               type: object
               x-kubernetes-preserve-unknown-fields: true
+              x-kubernetes-validations:
+                - rule: 'has(oldSelf.genesis) || !has(self.genesis) || (has(self.applicationInit) && self.applicationInit.state == "Unused")'
+                  message: new genesis requires an unused initialization assignment
+                - rule: '!has(oldSelf.genesis) || has(oldSelf.applicationInit) || !has(self.applicationInit)'
+                  message: existing genesis cannot acquire an initialization assignment
+                - rule: '!has(oldSelf.applicationInit) || has(self.applicationInit)'
+                  message: initialization assignment cannot be removed
+                - rule: '!has(oldSelf.applicationInit) || !has(self.applicationInit) || self.applicationInit.plan == oldSelf.applicationInit.plan'
+                  message: initialization plan is immutable
+                - rule: '!has(oldSelf.applicationInit) || !has(self.applicationInit) || oldSelf.applicationInit.state != "Consumed" || self.applicationInit == oldSelf.applicationInit'
+                  message: consumed initialization cannot be changed or rearmed
+                - rule: '!has(self.applicationInit) || (has(self.genesis) && has(self.authority))'
+                  message: initialization assignment requires genesis and authority
+                - rule: '!has(self.applicationInit) || (self.applicationInit.plan.clusterUID == self.genesis.ownerUID && self.applicationInit.plan.intentHash == self.genesis.intentHash && self.applicationInit.plan.deploymentUID == self.genesis.deploymentUID && self.applicationInit.plan.storageID == self.genesis.storageID)'
+                  message: initialization assignment must match genesis
               properties:
                 authority:
                   type: object
@@ -138,3 +155,25 @@ spec:
                     deploymentUID: {type: string, minLength: 1, maxLength: 256}
                     storageID: {type: string, minLength: 1, maxLength: 256}
                     intentHash: {type: string, minLength: 64, maxLength: 64, pattern: '^[0-9a-f]{64}$'}
+                applicationInit:
+                  type: object
+                  required: [plan, state]
+                  x-kubernetes-validations:
+                    - rule: '(self.state == "Unused" && !has(self.initialEvidenceDigest)) || (self.state == "Consumed" && has(self.initialEvidenceDigest))'
+                      message: assignment state and initial evidence digest must agree
+                  properties:
+                    state: {type: string, enum: [Unused, Consumed]}
+                    initialEvidenceDigest: {type: string, minLength: 64, maxLength: 64, pattern: '^[0-9a-f]{64}$'}
+                    plan:
+                      type: object
+                      required: [assignmentID, clusterUID, intentHash, generation, deploymentUID, storageID, physicalBinding, bootstrapPlanDigest, evidenceFormat]
+                      properties:
+                        assignmentID: {type: string, minLength: 1, maxLength: 256}
+                        clusterUID: {type: string, minLength: 1, maxLength: 256}
+                        intentHash: {type: string, minLength: 64, maxLength: 64, pattern: '^[0-9a-f]{64}$'}
+                        generation: {type: integer, format: int64, minimum: 0, maximum: 0}
+                        deploymentUID: {type: string, minLength: 1, maxLength: 256}
+                        storageID: {type: string, minLength: 1, maxLength: 256}
+                        physicalBinding: {type: string, minLength: 64, maxLength: 64, pattern: '^[0-9a-f]{64}$'}
+                        bootstrapPlanDigest: {type: string, minLength: 64, maxLength: 64, pattern: '^[0-9a-f]{64}$'}
+                        evidenceFormat: {type: string, minLength: 1, maxLength: 256}

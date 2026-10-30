@@ -139,7 +139,18 @@ func (s *V1Alpha2StatusStore) snapshot(ref V1Alpha2ClusterRef, obj map[string]js
 	} else if _, present := status["genesis"]; present {
 		return V1Alpha2StatusSnapshot{}, fmt.Errorf("genesis receipt without creation intent")
 	}
-	return V1Alpha2StatusSnapshot{ref: ref, resourceVersion: rv, authority: view, authorityRaw: bytes.Clone(status["authority"]), queue: bytes.Clone(status["recoveryQueue"]), object: obj, store: s}, nil
+	snap := V1Alpha2StatusSnapshot{ref: ref, resourceVersion: rv, authority: view, authorityRaw: bytes.Clone(status["authority"]), queue: bytes.Clone(status["recoveryQueue"]), object: obj, store: s}
+	if _, present := status["applicationInit"]; present {
+		assignment, err := parseV1Alpha2ApplicationInit(snap)
+		if err != nil {
+			return V1Alpha2StatusSnapshot{}, err
+		}
+		evidence, present := auth["evidence"]
+		if assignment.State == "Unused" && present || assignment.State == "Consumed" && (!present || bytes.Equal(bytes.TrimSpace(evidence), []byte("null")) || !json.Valid(evidence)) {
+			return V1Alpha2StatusSnapshot{}, fmt.Errorf("invalid assignment evidence state")
+		}
+	}
+	return snap, nil
 }
 
 func sameJSON(a, b json.RawMessage) bool {
