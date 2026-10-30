@@ -1,10 +1,14 @@
 package operator
 
 import (
+	"bytes"
 	"context"
 	"crypto/tls"
 	"crypto/x509"
 	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
 	"net/http"
 	"os"
 	"os/exec"
@@ -15,6 +19,157 @@ import (
 	"github.com/mrchypark/rhiza/internal/types"
 	"github.com/mrchypark/rhiza/pkg/quepaxa"
 )
+
+type repairDiagnosticTransport struct {
+	base http.RoundTripper
+	logf func(string, ...any)
+}
+
+type repairDiagnosticBody struct {
+	io.Reader
+	io.Closer
+}
+
+type repairDiagnosticError struct{ err error }
+
+func (r *repairDiagnosticError) Read([]byte) (int, error) {
+	if r.err == nil {
+		return 0, io.EOF
+	}
+	err := r.err
+	r.err = nil
+	return 0, err
+}
+
+type repairDiagnosticFault struct {
+	err    error
+	closed bool
+	read   bool
+}
+
+func (r *repairDiagnosticFault) Read(p []byte) (int, error) {
+	if r.read {
+		return 0, io.EOF
+	}
+	r.read = true
+	return copy(p, `{"valid":true}`), r.err
+}
+func (r *repairDiagnosticFault) Close() error { r.closed = true; return nil }
+
+type repairDiagnosticRoundTrip func(*http.Request) (*http.Response, error)
+
+func (f repairDiagnosticRoundTrip) RoundTrip(req *http.Request) (*http.Response, error) {
+	return f(req)
+}
+
+func TestRepairDiagnosticPreservesBodyAndRedacts(t *testing.T) {
+	secret := "fixture-secret-do-not-print"
+	body := `{"reason":"Invalid","details":{"causes":[{"message":"repair state and completion must agree ` + secret + `"}]}}` + strings.Repeat("x", 20000)
+	var log string
+	d := repairDiagnosticTransport{base: repairDiagnosticRoundTrip(func(*http.Request) (*http.Response, error) {
+		return &http.Response{StatusCode: 422, Body: io.NopCloser(strings.NewReader(body))}, nil
+	}), logf: func(format string, args ...any) { log = fmt.Sprintf(format, args...) }}
+	req, err := http.NewRequest(http.MethodPut, "https://example.invalid/apis/rhiza/namespaces/n/rhizaclusters/genesis-contract/status", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp, err := d.RoundTrip(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := resp.Body.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if string(got) != body || strings.Contains(log, secret) || !strings.Contains(log, "HTTP 422") {
+		t.Fatalf("diagnostic lost body or exposed data: %q", log)
+	}
+}
+
+func TestRepairDiagnosticPreservesBodyReadError(t *testing.T) {
+	want := errors.New("fixture read failure")
+	body := &repairDiagnosticFault{err: want}
+	d := repairDiagnosticTransport{base: repairDiagnosticRoundTrip(func(*http.Request) (*http.Response, error) {
+		return &http.Response{StatusCode: 200, Body: body}, nil
+	}), logf: func(string, ...any) {}}
+	req, err := http.NewRequest(http.MethodPut, "https://example.invalid/apis/rhiza/namespaces/n/rhizaclusters/genesis-contract/status", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp, err := d.RoundTrip(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, err := io.ReadAll(resp.Body)
+	if string(got) != `{"valid":true}` || !errors.Is(err, want) {
+		t.Fatalf("body or read error changed: %q %v", got, err)
+	}
+	if err := resp.Body.Close(); err != nil || !body.closed {
+		t.Fatalf("underlying body not closed: %v", err)
+	}
+}
+
+func (d repairDiagnosticTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	resp, err := d.base.RoundTrip(req)
+	if err != nil || resp == nil || req.Method != http.MethodPut || !strings.HasSuffix(req.URL.Path, "/rhizaclusters/genesis-contract/status") {
+		return resp, err
+	}
+	// Preserve the exact stream for the production client, including any bytes
+	// beyond the diagnostic bound. Never print request data or raw API bodies.
+	prefix, readErr := io.ReadAll(io.LimitReader(resp.Body, 16384))
+	readers := []io.Reader{bytes.NewReader(prefix)}
+	if readErr != nil && !errors.Is(readErr, io.EOF) {
+		readers = append(readers, &repairDiagnosticError{err: readErr})
+	}
+	readers = append(readers, resp.Body)
+	resp.Body = repairDiagnosticBody{Reader: io.MultiReader(readers...), Closer: resp.Body}
+	var status struct {
+		Reason  string `json:"reason"`
+		Details struct {
+			Causes []struct {
+				Message string `json:"message"`
+			} `json:"causes"`
+		} `json:"details"`
+	}
+	_ = json.Unmarshal(prefix, &status)
+	reason := "other"
+	for _, allowed := range []string{"Invalid", "Forbidden", "Conflict", "BadRequest", "InternalError"} {
+		if status.Reason == allowed {
+			reason = allowed
+		}
+	}
+	matches := []string{}
+	for _, cause := range status.Details.Causes {
+		for _, message := range []string{"repair record cannot be removed", "repair requires consumed managed bootstrap history", "closed repair must match authority and cannot overlap a transition", "repair intent is immutable per operation", "terminal repair is immutable per operation", "a new repair must start closed", "replacement repair requires a terminal predecessor and advanced position", "repair CAS cannot overwrite application authority", "closed repair forbids new application reservations", "repair state and completion must agree", "repair completion must bind the exact operation and position", "REMOVE alone is not final repair completion"} {
+			if strings.Contains(cause.Message, message) {
+				matches = append(matches, message)
+			}
+		}
+	}
+	var different []string
+	if resp.StatusCode >= 200 && resp.StatusCode < 300 && req.GetBody != nil {
+		requestBody, e := req.GetBody()
+		if e == nil {
+			requestData, e := io.ReadAll(io.LimitReader(requestBody, 1<<20))
+			_ = requestBody.Close()
+			var requested, returned struct {
+				Status map[string]json.RawMessage `json:"status"`
+			}
+			if e == nil && json.Unmarshal(requestData, &requested) == nil && json.Unmarshal(prefix, &returned) == nil {
+				for _, key := range []string{"authority", "repair", "genesis", "applicationInit", "bootstrapPlan"} {
+					if !sameJSON(requested.Status[key], returned.Status[key]) {
+						different = append(different, key)
+					}
+				}
+			}
+		}
+	}
+	d.logf("repair status PUT: HTTP %d reason=%s known-validation=%q differing-status-fields=%q body-prefix-read-error=%t", resp.StatusCode, reason, matches, different, readErr != nil)
+	return resp, nil
+}
 
 // This exercises API-server schema transitions, not consensus proof. The
 // genesis contract creates and consumes the assignment before this test.
@@ -43,7 +198,7 @@ func TestV1Alpha2RepairAPIServerContract(t *testing.T) {
 	}
 	transport := &http.Transport{TLSClientConfig: &tls.Config{RootCAs: roots, MinVersion: tls.VersionTLS12}}
 	t.Cleanup(transport.CloseIdleConnections)
-	store := &V1Alpha2StatusStore{Kube: &Kubernetes{BaseURL: server, Namespace: ns, TokenFile: required("RHIZA_CONTRACT_TOKEN"), Client: &http.Client{Transport: transport}}}
+	store := &V1Alpha2StatusStore{Kube: &Kubernetes{BaseURL: server, Namespace: ns, TokenFile: required("RHIZA_CONTRACT_TOKEN"), Client: &http.Client{Transport: repairDiagnosticTransport{base: transport, logf: t.Logf}}}}
 	ctx := context.Background()
 	a, err := LoadV1Alpha2Admission(ctx, store, ref)
 	if err != nil {
