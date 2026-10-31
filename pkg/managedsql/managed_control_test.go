@@ -129,6 +129,9 @@ func TestManagedSQLHostRemoveRepairVoterTerminal(t *testing.T) {
 		for i, h := range hosts {
 			state, stateErr := h.node.ManagedState()
 			t.Logf("control %s member=%s certified=%d applied=%d recorder=%d inspect-error=%t", stage, configs[i].Runtime.NodeID, state.CertifiedTip, state.AppliedTip, state.RecorderTip, stateErr != nil)
+			if stage == "remove-failed" {
+				t.Logf("control readiness member=%s error=%v", configs[i].Runtime.NodeID, h.ValidateManagedAdmission(ctx, h.identity, state))
+			}
 		}
 	}
 	logControlState("before-remove")
@@ -242,6 +245,22 @@ func TestManagedSQLHostRemoveRepairVoterTerminal(t *testing.T) {
 		t.Fatal(err)
 	}
 	learnerCfg.Prepared = prepared
+	originAdmission, err := operator.LoadV1Alpha2Admission(ctx, writer, learnerCfg.Ref)
+	if err != nil {
+		t.Fatal(err)
+	}
+	originRepair, ok := originAdmission.Repair()
+	if !ok {
+		t.Fatal("prepared learner lacks live repair")
+	}
+	originBinding, err := operator.ValidateV1Alpha2RepairPodBinding(ctx, writer, learnerCfg.Ref, originRepair.Plan)
+	if err != nil {
+		t.Fatal(err)
+	}
+	learnerCfg.RepairOrigin, err = json.Marshal(managedRepairOriginFile{Version: 1, Repair: originRepair, Binding: originBinding})
+	if err != nil {
+		t.Fatal(err)
+	}
 	learner, err := Open(ctx, learnerCfg)
 	if learner != nil {
 		t.Cleanup(func() {
