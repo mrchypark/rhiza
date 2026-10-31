@@ -40,6 +40,8 @@ type PreparedStartupConfig struct {
 
 var ErrPreparedWriteAdmissionUnavailable = errors.New("prepared startup write admission is unavailable")
 
+const managedRepairOriginMaxBytes = (128 << 10) + 4096
+
 // ManagedStartupIdentity binds an explicit, live initialization assignment to
 // this exact execution member. A missing archive is never an assignment.
 type ManagedStartupIdentity struct {
@@ -70,6 +72,13 @@ type ManagedStartupChecker interface {
 	ValidateManagedAdmission(context.Context, ManagedStartupIdentity, ManagedRuntimeState) error
 }
 
+// managedRepairOriginChecker validates an immutable repair handoff against the
+// current managed identity and Kubernetes owner chain. It is optional for
+// ordinary prepared startups; repair adoption requires it.
+type managedRepairOriginChecker interface {
+	ValidateManagedRepairOrigin(context.Context, []byte) error
+}
+
 type ManagedStartupConfig struct {
 	StorageRoot string
 	// PeerRecovery permits retaining a non-serving runtime when HEAD is
@@ -79,6 +88,10 @@ type ManagedStartupConfig struct {
 	Identity              ManagedStartupIdentity
 	Checker               ManagedStartupChecker
 	Prepared              *recovery.VerifiedPreparedStartup
+	// RepairOrigin is the exact bounded repair.json byte sequence. Its digest is
+	// bound to prepared-adoption.json so a later process cannot substitute it.
+	RepairOrigin   []byte
+	promotionReady chan struct{}
 	// BootstrapMember opens an original member using immutable voter registration
 	// continuity instead of a learner adoption receipt. It grants no empty source.
 	BootstrapMember  bool
@@ -162,6 +175,21 @@ func (n *Node) OpenManaged(ctx context.Context, cfg ManagedStartupConfig) (resul
 	if err := cfg.Checker.ValidateManagedStartup(ctx, i); err != nil {
 		return fmt.Errorf("managed startup authority: %w", err)
 	}
+	if len(cfg.RepairOrigin) > managedRepairOriginMaxBytes {
+		return fmt.Errorf("repair origin exceeds bounded file budget")
+	}
+	if n.config.Learner != nil && (cfg.Prepared != nil || !i.Fresh && !cfg.BootstrapMember) {
+		cfg.promotionReady = make(chan struct{})
+	}
+	if len(cfg.RepairOrigin) != 0 {
+		if n.config.Learner == nil || cfg.BootstrapMember || i.Fresh {
+			return fmt.Errorf("repair origin requires a non-fresh learner")
+		}
+		if _, ok := cfg.Checker.(managedRepairOriginChecker); !ok {
+			return fmt.Errorf("repair origin checker is unavailable")
+		}
+		cfg.RepairOrigin = bytes.Clone(cfg.RepairOrigin)
+	}
 	if cfg.Prepared != nil && (i.Fresh || cfg.Prepared.Identity() != i.Member) {
 		return fmt.Errorf("managed prepared identity mismatch")
 	}
@@ -180,6 +208,9 @@ func (n *Node) OpenManaged(ctx context.Context, cfg ManagedStartupConfig) (resul
 		}
 	}
 	if cfg.Prepared != nil {
+		if err := validateManagedRepairOrigin(ctx, cfg.Checker, cfg.RepairOrigin); err != nil {
+			return err
+		}
 		if err := n.verifyPreparedWALBeforeRestore(ctx, cfg.Prepared); err != nil {
 			return err
 		}
@@ -196,6 +227,9 @@ func (n *Node) OpenManaged(ctx context.Context, cfg ManagedStartupConfig) (resul
 			return err
 		}
 	} else if !i.Fresh && !cfg.BootstrapMember {
+		if err := validateManagedRepairOrigin(ctx, cfg.Checker, cfg.RepairOrigin); err != nil {
+			return err
+		}
 		if err := n.verifyPreparedAdoptionWithLock(ctx, i.Member); err != nil {
 			return err
 		}
@@ -203,7 +237,15 @@ func (n *Node) OpenManaged(ctx context.Context, cfg ManagedStartupConfig) (resul
 		if err != nil {
 			return err
 		}
+		if adoption.OriginDigest != managedRepairOriginDigest(cfg.RepairOrigin) {
+			return fmt.Errorf("prepared repair origin does not match durable adoption")
+		}
 		cfg.verifiedAdoption = &adoption
+	}
+	// Revalidate authority and owner-chain identity after read-only WAL/SQL
+	// preflight (or restore), immediately before opening writable runtime files.
+	if err := validateManagedRepairOrigin(ctx, cfg.Checker, cfg.RepairOrigin); err != nil {
+		return err
 	}
 	var openErr error
 	if startupLock == nil {
@@ -222,7 +264,7 @@ func (n *Node) OpenManaged(ctx context.Context, cfg ManagedStartupConfig) (resul
 		if err != nil {
 			return postOpenFailure(err)
 		}
-		if err := persistPreparedAdoption(n.config.DataDir, i.Member, n.core.WALIdentity(), cfg.Prepared.View(), adoption.Membership); err != nil {
+		if err := persistPreparedAdoption(n.config.DataDir, i.Member, n.core.WALIdentity(), cfg.Prepared.View(), adoption.Membership, managedRepairOriginDigest(cfg.RepairOrigin)); err != nil {
 			return postOpenFailure(fmt.Errorf("persist verified prepared adoption: %w", err))
 		}
 		cfg.verifiedAdoption = &adoption
@@ -231,8 +273,33 @@ func (n *Node) OpenManaged(ctx context.Context, cfg ManagedStartupConfig) (resul
 			return postOpenFailure(err)
 		}
 	}
+	if cfg.promotionReady != nil {
+		close(cfg.promotionReady)
+	}
 	n.managedStartup = &cfg
 	return nil
+}
+
+func validateManagedRepairOrigin(ctx context.Context, checker ManagedStartupChecker, raw []byte) error {
+	if len(raw) == 0 {
+		return nil
+	}
+	validator, ok := checker.(managedRepairOriginChecker)
+	if !ok {
+		return fmt.Errorf("repair origin checker is unavailable")
+	}
+	if err := validator.ValidateManagedRepairOrigin(ctx, raw); err != nil {
+		return fmt.Errorf("validate immutable managed repair origin: %w", err)
+	}
+	return nil
+}
+
+func managedRepairOriginDigest(raw []byte) string {
+	if len(raw) == 0 {
+		return ""
+	}
+	hash := sha256.Sum256(raw)
+	return hex.EncodeToString(hash[:])
 }
 
 func (n *Node) managedRuntimeState() ManagedRuntimeState {
@@ -938,7 +1005,7 @@ func (n *Node) recoverPreparedV1Alpha2WithLock(ctx context.Context, prepared *re
 		if err != nil {
 			return err
 		}
-		return persistPreparedAdoption(dataDir, prepared.Identity(), core.WALIdentity(), view, &membership)
+		return persistPreparedAdoption(dataDir, prepared.Identity(), core.WALIdentity(), view, &membership, "")
 	}
 	if core.Tip() > view.Tip() {
 		return fmt.Errorf("existing WAL is ahead of prepared history; preserve it for restart")
@@ -1015,16 +1082,17 @@ type preparedAdoption struct {
 	BaseSeal     *quepaxa.CheckpointSeal          `json:"baseSeal,omitempty"`
 	BaseDecision *quepaxa.DecidedValue            `json:"baseDecision,omitempty"`
 	Membership   *quepaxa.MembershipRecord        `json:"membership,omitempty"`
+	OriginDigest string                           `json:"originDigest,omitempty"`
 }
 
-func persistPreparedAdoption(dir string, identity recovery.PreparedStartupIdentity, walID string, view *recovery.ReadOnlyView, membership *quepaxa.MembershipRecord) error {
+func persistPreparedAdoption(dir string, identity recovery.PreparedStartupIdentity, walID string, view *recovery.ReadOnlyView, membership *quepaxa.MembershipRecord, originDigest string) error {
 	if walID == "" {
 		return fmt.Errorf("real WAL identity is missing")
 	}
 	if membership == nil {
 		return fmt.Errorf("verified membership history is missing")
 	}
-	adoption := preparedAdoption{Identity: identity, WALIdentity: walID, Tip: view.Tip(), PrefixHash: view.PrefixHash(), Membership: membership}
+	adoption := preparedAdoption{Identity: identity, WALIdentity: walID, Tip: view.Tip(), PrefixHash: view.PrefixHash(), Membership: membership, OriginDigest: originDigest}
 	if seal, decision, ok := view.RecoveryBase(); ok {
 		adoption.BaseSeal = &seal
 		adoption.BaseDecision = &decision

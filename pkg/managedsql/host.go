@@ -9,6 +9,9 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"path"
+	"reflect"
+	"slices"
 	"sync"
 	"sync/atomic"
 
@@ -36,6 +39,9 @@ type Config struct {
 	Plan        operator.V1Alpha2ApplicationInitPlan
 	PodUID      string
 	Prepared    *recovery.VerifiedPreparedStartup
+	// RepairOrigin carries the exact immutable repair.json bytes, never a path
+	// that could be replaced between verification and adoption.
+	RepairOrigin []byte
 }
 
 type sqlEvidence struct {
@@ -60,6 +66,7 @@ type Host struct {
 // callers must retain it for diagnosis/recovery or call Close.
 func Open(ctx context.Context, cfg Config) (*Host, error) {
 	cfg.Runtime = node.CloneManagedRuntimeConfig(cfg.Runtime)
+	cfg.RepairOrigin = bytes.Clone(cfg.RepairOrigin)
 	if cfg.Runtime.ObjStoreProvider == "" {
 		cfg.Runtime.ObjStoreProvider = "s3"
 	}
@@ -114,6 +121,20 @@ func Open(ctx context.Context, cfg Config) (*Host, error) {
 	if cfg.Runtime.Learner == nil && !initialMember {
 		return nil, fmt.Errorf("exact initial Pod/member/key is not in bootstrap plan")
 	}
+	if cfg.Prepared != nil && cfg.Runtime.Learner != nil {
+		admission, err := operator.LoadV1Alpha2Admission(ctx, cfg.Store, cfg.Ref)
+		if err != nil {
+			return nil, err
+		}
+		if repair, ok := admission.Repair(); ok && repairPlanMatchesConfiguredLearner(repair.Plan, cfg) {
+			if repair.State != "Closed" {
+				return nil, fmt.Errorf("prepared repair learner requires the exact current closed repair")
+			}
+			if len(cfg.RepairOrigin) == 0 {
+				return nil, fmt.Errorf("closed repair learner requires immutable repair origin")
+			}
+		}
+	}
 	if initial.Assignment().State == "Unused" && !initialMember {
 		return nil, fmt.Errorf("only an exact initial member may consume E0")
 	}
@@ -159,7 +180,7 @@ func Open(ctx context.Context, cfg Config) (*Host, error) {
 			return nil, err
 		}
 	}
-	if err := h.node.OpenManaged(ctx, node.ManagedStartupConfig{StorageRoot: cfg.StorageRoot, PeerRecovery: true, Identity: h.identity, Checker: h, Prepared: cfg.Prepared, BootstrapMember: cfg.Runtime.Learner == nil}); err != nil {
+	if err := h.node.OpenManaged(ctx, node.ManagedStartupConfig{StorageRoot: cfg.StorageRoot, PeerRecovery: true, Identity: h.identity, Checker: h, Prepared: cfg.Prepared, RepairOrigin: cfg.RepairOrigin, BootstrapMember: cfg.Runtime.Learner == nil}); err != nil {
 		return nil, err
 	}
 	if initial.Assignment().State == "Unused" {
@@ -194,6 +215,10 @@ func Open(ctx context.Context, cfg Config) (*Host, error) {
 		}
 	}
 	return h, nil
+}
+
+func repairPlanMatchesConfiguredLearner(plan operator.V1Alpha2RepairPlan, cfg Config) bool {
+	return cfg.Runtime.Learner != nil && plan.ClusterUID == cfg.Ref.UID && plan.Generation == cfg.Plan.Generation && plan.DeploymentUID == cfg.Plan.DeploymentUID && plan.StorageID == cfg.Plan.StorageID && plan.BootstrapPlanDigest == cfg.Plan.BootstrapPlanDigest && plan.Replacement.PodUID == cfg.PodUID && plan.Replacement.NodeID == cfg.Runtime.NodeID && plan.Replacement.PublicKey == cfg.Runtime.Learner.PublicKey && plan.Replacement.PeerURL == cfg.Runtime.Learner.PeerURL
 }
 
 func encodeEvidence(s node.ManagedSQLSnapshot) json.RawMessage {
@@ -259,6 +284,16 @@ func (h *Host) ValidateManagedStartup(ctx context.Context, i node.ManagedStartup
 			return nil
 		}
 		return h.node.VerifyManagedSQLFreshSource(ctx, i)
+	}
+	if h.cfg.Runtime.Learner != nil && h.cfg.Prepared != nil {
+		a, err := h.live(ctx)
+		if err != nil {
+			return err
+		}
+		r, ok := a.Repair()
+		if !ok || r.PreparedHandoff == nil || r.Plan.Replacement.PodUID != h.cfg.PodUID || r.Plan.Replacement.NodeID != h.cfg.Runtime.NodeID || r.Plan.Replacement.PublicKey != h.cfg.Runtime.Learner.PublicKey || r.Plan.Replacement.PeerURL != h.cfg.Runtime.Learner.PeerURL || r.PreparedHandoff.PhysicalBinding != i.PhysicalBinding || r.PreparedHandoff.SourceRoot != h.cfg.StorageRoot || r.PreparedHandoff.SourcePrefix != path.Join(h.cfg.Runtime.ObjStorePrefix, string(h.cfg.Runtime.ClusterID)) || !bytes.Equal(r.PreparedHandoff.Head, h.cfg.Prepared.View().CapturedHead()) || (r.State != "Closed" && r.State != "Completed") {
+			return fmt.Errorf("prepared learner lacks exact live repair handoff")
+		}
 	}
 	return nil
 }
@@ -359,6 +394,157 @@ func (h *Host) Ready(ctx context.Context) error {
 		return fmt.Errorf("SQL host closed")
 	}
 	return h.node.CheckManagedLocalRead(ctx)
+}
+
+// RemoveRepairVoter excludes the old voter from consensus only. It does not
+// claim physical process death, stop old I/O, publish a learner handoff, or
+// complete/open the logical repair after its REMOVE-only intermediate state.
+func (h *Host) RemoveRepairVoter(ctx context.Context, repairID string) error {
+	h.mu.Lock()
+	closed := h.closed
+	h.mu.Unlock()
+	if closed {
+		return fmt.Errorf("SQL host closed")
+	}
+	r, err := h.closedRepair(ctx, repairID)
+	if err != nil {
+		return err
+	}
+	request := node.ManagedMembershipRequest{RepairOperationID: repairID, Action: node.ManagedMembershipRemove, ExpectedConfigID: uint(r.Plan.ExpectedConfigID), ExpectedAbortSlot: quepaxa.Slot(r.Plan.ExpectedAbortSlot), OldNodeID: r.Plan.OldNodeID, OldWALIdentity: r.Plan.OldWALIdentity}
+	return h.node.ChangeManagedMembership(ctx, request)
+}
+
+// CaptureRepairHandoff pins the verified post-REMOVE source in the same closed
+// repair. A later live HEAD is never substituted for an already captured one.
+func (h *Host) CaptureRepairHandoff(ctx context.Context, repairID string) (operator.V1Alpha2RepairHandoff, error) {
+	a, err := h.live(ctx)
+	if err != nil {
+		return operator.V1Alpha2RepairHandoff{}, err
+	}
+	r, err := h.closedRepair(ctx, repairID)
+	if err != nil {
+		return operator.V1Alpha2RepairHandoff{}, err
+	}
+	if r.PreparedHandoff != nil {
+		return *r.PreparedHandoff, nil
+	}
+	request := node.ManagedMembershipRequest{RepairOperationID: repairID, Action: node.ManagedMembershipRemove, ExpectedConfigID: uint(r.Plan.ExpectedConfigID), ExpectedAbortSlot: quepaxa.Slot(r.Plan.ExpectedAbortSlot), OldNodeID: r.Plan.OldNodeID, OldWALIdentity: r.Plan.OldWALIdentity}
+	source, err := h.node.CaptureManagedRepairSource(ctx, request)
+	if err != nil {
+		return operator.V1Alpha2RepairHandoff{}, err
+	}
+	namespace, err := node.ManagedNamespaceFor(h.cfg.StorageRoot, h.cfg.Ref.UID, r.Plan.Generation, h.cfg.Plan.AssignmentID, string(h.cfg.Runtime.ClusterID))
+	if err != nil {
+		return operator.V1Alpha2RepairHandoff{}, err
+	}
+	capture := operator.V1Alpha2RepairHandoff{PlanDigest: r.Plan.Digest(), SourceRoot: h.cfg.StorageRoot, SourcePrefix: namespace.FinalPrefix, PhysicalBinding: h.identity.PhysicalBinding, Head: source.Head, HeadHash: fmt.Sprintf("%x", source.HeadHash), RemoveTerminalSlot: uint64(source.RemoveTerminal.Slot), RemoveTerminalHash: fmt.Sprintf("%x", source.RemoveTerminal.Hash), Survivors: source.Survivors}
+	_, observation, err := operator.CaptureV1Alpha2RepairHandoff(ctx, h.cfg.Store, a, h.authority, capture)
+	if err != nil {
+		return operator.V1Alpha2RepairHandoff{}, err
+	}
+	if observation != operator.V1Alpha2CASApplied {
+		return operator.V1Alpha2RepairHandoff{}, fmt.Errorf("repair capture CAS outcome %s", observation)
+	}
+	return capture, nil
+}
+
+// AddRepairVoter accepts only the real learner's already registered nonce. The
+// Node independently checks that registration and its QUIC durable-prefix proof.
+func (h *Host) AddRepairVoter(ctx context.Context, repairID, registeredWALIdentity string) error {
+	h.mu.Lock()
+	closed := h.closed
+	h.mu.Unlock()
+	if closed {
+		return fmt.Errorf("SQL host closed")
+	}
+	r, err := h.closedRepair(ctx, repairID)
+	if err != nil {
+		return err
+	}
+	if r.PreparedHandoff == nil || registeredWALIdentity == "" {
+		return fmt.Errorf("captured handoff and registered learner WAL required")
+	}
+	member := quepaxa.Member{ID: r.Plan.Replacement.NodeID, PublicKey: r.Plan.Replacement.PublicKey, PeerURL: r.Plan.Replacement.PeerURL, WALIdentity: registeredWALIdentity}
+	return h.node.ChangeManagedMembership(ctx, node.ManagedMembershipRequest{RepairOperationID: repairID, Action: node.ManagedMembershipAdd, ExpectedConfigID: r.PreparedHandoff.Survivors.ConfigID, OldNodeID: r.Plan.OldNodeID, OldWALIdentity: r.Plan.OldWALIdentity, Addition: &member, HandoffHeadHash: r.PreparedHandoff.HeadHash})
+}
+
+func (h *Host) closedRepair(ctx context.Context, repairID string) (operator.V1Alpha2RepairRecord, error) {
+	a, err := h.live(ctx)
+	if err != nil {
+		return operator.V1Alpha2RepairRecord{}, err
+	}
+	r, ok := a.Repair()
+	if !ok || !a.SQLReservationsClosed() || r.Plan.OperationID != repairID || r.Plan.BootstrapPlanDigest != h.cfg.Plan.BootstrapPlanDigest || uint64(uint(r.Plan.ExpectedConfigID)) != r.Plan.ExpectedConfigID {
+		return operator.V1Alpha2RepairRecord{}, fmt.Errorf("exact live closed repair required")
+	}
+	namespace, err := node.ManagedNamespaceFor(h.cfg.StorageRoot, h.cfg.Ref.UID, r.Plan.Generation, h.cfg.Plan.AssignmentID, string(h.cfg.Runtime.ClusterID))
+	if err != nil || h.cfg.Runtime.ObjStorePrefix != namespace.ConfigPrefix {
+		return operator.V1Alpha2RepairRecord{}, fmt.Errorf("managed membership namespace changed")
+	}
+	if r.PreparedHandoff != nil && (r.PreparedHandoff.SourceRoot != h.cfg.StorageRoot || r.PreparedHandoff.SourcePrefix != namespace.FinalPrefix || r.PreparedHandoff.PhysicalBinding != h.identity.PhysicalBinding) {
+		return operator.V1Alpha2RepairRecord{}, fmt.Errorf("captured repair physical profile changed")
+	}
+	return r, nil
+}
+
+// ValidateManagedMembership is the private Node checker, not a bearer handler.
+// Pending SQL/uncertain outcomes deliberately do not require new write admission.
+func (h *Host) ValidateManagedMembership(ctx context.Context, i node.ManagedStartupIdentity, request node.ManagedMembershipRequest, current quepaxa.Cluster, abortSlot quepaxa.Slot) error {
+	if i != h.identity {
+		return fmt.Errorf("managed membership execution identity changed")
+	}
+	r, err := h.closedRepair(ctx, request.RepairOperationID)
+	if err != nil {
+		return err
+	}
+	p := r.Plan
+	if request.OldNodeID != p.OldNodeID || request.OldWALIdentity != p.OldWALIdentity || i.Member.Generation != p.Generation || i.Member.DeploymentUID != p.DeploymentUID || i.StorageID != p.StorageID {
+		return fmt.Errorf("managed membership repair binding changed")
+	}
+	foundOld := false
+	ids := make([]types.NodeID, 0, len(current.Members)+1)
+	for _, member := range current.Members {
+		if member.ID == p.OldNodeID {
+			foundOld = true
+			if member.WALIdentity != "" && member.WALIdentity != p.OldWALIdentity {
+				return fmt.Errorf("old voter WAL identity changed")
+			}
+			continue
+		}
+		if member.ID == p.Replacement.NodeID {
+			if request.Action != node.ManagedMembershipAdd || request.Addition == nil || member != *request.Addition {
+				return fmt.Errorf("replacement already differs from exact managed ADD")
+			}
+			continue
+		}
+		ids = append(ids, member.ID)
+	}
+	ids = append(ids, p.Replacement.NodeID)
+	slices.Sort(ids)
+	if !slices.Equal(ids, p.FinalVoterIDs) {
+		return fmt.Errorf("current membership differs from repair target")
+	}
+	switch request.Action {
+	case node.ManagedMembershipRemove:
+		if uint64(request.ExpectedConfigID) != p.ExpectedConfigID || uint64(request.ExpectedAbortSlot) != p.ExpectedAbortSlot || (current.ConfigID != request.ExpectedConfigID && current.ConfigID != request.ExpectedConfigID+1) || (current.ConfigID == request.ExpectedConfigID) != foundOld || current.ConfigID == request.ExpectedConfigID && abortSlot != request.ExpectedAbortSlot {
+			return fmt.Errorf("managed REMOVE configuration/revision changed")
+		}
+	case node.ManagedMembershipAdd:
+		handoff := r.PreparedHandoff
+		if handoff == nil || request.HandoffHeadHash != handoff.HeadHash || request.Addition == nil || request.Addition.ID != p.Replacement.NodeID || request.Addition.PublicKey != p.Replacement.PublicKey || request.Addition.PeerURL != p.Replacement.PeerURL || request.Addition.WALIdentity == "" || request.Addition.URL != "" || request.Addition.LogURL != "" || request.ExpectedConfigID != handoff.Survivors.ConfigID || request.ExpectedAbortSlot != 0 || foundOld {
+			return fmt.Errorf("managed ADD handoff or learner binding changed")
+		}
+		if current.ConfigID == request.ExpectedConfigID {
+			if abortSlot != request.ExpectedAbortSlot || !reflect.DeepEqual(current, handoff.Survivors) {
+				return fmt.Errorf("managed ADD survivor configuration/revision changed")
+			}
+		} else if current.ConfigID != request.ExpectedConfigID+1 || len(current.Members) != len(p.FinalVoterIDs) {
+			return fmt.Errorf("managed ADD terminal configuration changed")
+		}
+	default:
+		return fmt.Errorf("unsupported managed membership action")
+	}
+	return nil
 }
 
 func (h *Host) Execute(ctx context.Context, req ExecuteRequest) (ExecuteResponse, error) {

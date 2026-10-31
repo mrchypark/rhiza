@@ -16,14 +16,18 @@ import (
 )
 
 type membershipOperation struct {
-	Request network.MembershipChange `json:"request"`
-	Target  quepaxa.Cluster          `json:"target"`
+	Request             network.MembershipChange `json:"request"`
+	Target              quepaxa.Cluster          `json:"target"`
+	ManagedExcludedRead bool                     `json:"managedExcludedRead,omitempty"`
 }
 
 func (n *Node) changeMembership(ctx context.Context, request network.MembershipChange) error {
 	n.membershipMu.Lock()
 	defer n.membershipMu.Unlock()
 	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if err := n.validateManagedMembership(ctx, request, false); err != nil {
 		return err
 	}
 	if !n.config.EnableReconfiguration || n.bucket == nil || !n.core.IsVoter() {
@@ -44,6 +48,9 @@ func (n *Node) changeMembership(ctx context.Context, request network.MembershipC
 			return err
 		}
 		if !reflect.DeepEqual(operation.Request, request) {
+			return network.ErrRequestConflict
+		}
+		if n.managedStartup != nil && request.Remove != "" && !operation.ManagedExcludedRead {
 			return network.ErrRequestConflict
 		}
 	} else {
@@ -83,7 +90,7 @@ func (n *Node) changeMembership(ctx context.Context, request network.MembershipC
 			if !found || len(operation.Target.Members) == 0 || request.Remove == n.config.NodeID {
 				return network.ErrInvalidRequest
 			}
-			if err := n.validateMembershipFence(ctx, request); err != nil {
+			if err := n.validateRemovalAuthority(ctx, request); err != nil {
 				return err
 			}
 		}
@@ -92,6 +99,17 @@ func (n *Node) changeMembership(ctx context.Context, request network.MembershipC
 		}
 		if pending, ok := n.core.PendingReconfiguration(); ok && !reflect.DeepEqual(pending, operation.Target) {
 			return network.ErrRequestConflict
+		}
+		if n.managedStartup != nil && request.Remove != "" {
+			if _, _, err := n.core.ReadIndexExcluding(ctx, request.Remove); err != nil {
+				return fmt.Errorf("managed membership excluded-old read-index config=%d local_tip=%d: %w", request.ExpectedConfigID, n.core.Tip(), err)
+			}
+			if err := n.validateManagedMembership(ctx, request, false); err != nil {
+				return err
+			}
+			// Retain the initial exclusion proof in this exact CAS journal: a
+			// frozen configuration cannot obtain another ordinary ReadIndex.
+			operation.ManagedExcludedRead = true
 		}
 		encoded, err := json.Marshal(operation)
 		if err != nil {
@@ -107,6 +125,9 @@ func (n *Node) changeMembership(ctx context.Context, request network.MembershipC
 			return err
 		}
 	}
+	if err := n.validateManagedMembership(ctx, request, false); err != nil {
+		return err
+	}
 	if !reflect.DeepEqual(current, operation.Target) {
 		if current.ConfigID != request.ExpectedConfigID {
 			return network.ErrRequestConflict
@@ -119,55 +140,22 @@ func (n *Node) changeMembership(ctx context.Context, request network.MembershipC
 				return network.ErrRequestConflict
 			}
 		} else if _, err := n.core.BeginReconfigurationAt(ctx, operation.Target, request.ExpectedAbortSlot); err != nil {
+			return fmt.Errorf("membership begin config=%d local_tip=%d: %w", request.ExpectedConfigID, n.core.Tip(), err)
+		}
+		if err := n.validateManagedMembership(ctx, request, false); err != nil {
 			return err
 		}
 		if err := n.core.FinishReconfigurationAt(ctx, operation.Target, request.ExpectedAbortSlot); err != nil {
-			return err
+			return fmt.Errorf("membership finish config=%d local_tip=%d: %w", request.ExpectedConfigID, n.core.Tip(), err)
 		}
 		if !reflect.DeepEqual(n.core.CurrentCluster(), operation.Target) {
 			return network.ErrRequestConflict
 		}
 	} else {
 		// A locally durable terminal does not establish delivery/ACK completion.
-		history, err := n.core.MembershipHistory()
+		terminal, err := n.retainedMembershipTerminal(operation)
 		if err != nil {
-			return fmt.Errorf("membership completion history: %w", err)
-		}
-		var terminal *quepaxa.DecidedValue
-		var previous quepaxa.Slot
-		for _, transition := range history.Transitions {
-			if n.core.ClusterForSlot(transition.Freeze.Slot).ConfigID != request.ExpectedConfigID || !reflect.DeepEqual(n.core.ClusterForSlot(transition.Terminal.Slot+1), operation.Target) {
-				previous = transition.Terminal.Slot
-				continue
-			}
-			if terminal != nil {
-				return fmt.Errorf("ambiguous membership terminal")
-			}
-			if previous < n.core.CompactionFloor() {
-				return fmt.Errorf("membership revision history compacted")
-			}
-			var revision quepaxa.Slot
-			for slot := previous + 1; slot < transition.Freeze.Slot; slot++ {
-				value, ok := n.core.CertifiedValue(slot)
-				if !ok {
-					return fmt.Errorf("membership revision history unavailable")
-				}
-				control, err := quepaxa.DecodeReconfiguration(value.Value)
-				if err != nil {
-					return fmt.Errorf("invalid membership revision history: %w", err)
-				}
-				if control {
-					revision = slot
-				}
-			}
-			if revision != request.ExpectedAbortSlot {
-				return network.ErrRequestConflict
-			}
-			decision := transition.Terminal
-			terminal = &decision
-		}
-		if terminal == nil {
-			return fmt.Errorf("membership terminal unavailable")
+			return err
 		}
 		completed, err := n.core.CompleteDecision(ctx, terminal.Slot)
 		if err != nil {
@@ -177,7 +165,63 @@ func (n *Node) changeMembership(ctx context.Context, request network.MembershipC
 			return fmt.Errorf("membership terminal changed")
 		}
 	}
-	return n.persistMembership(ctx)
+	if err := n.persistMembership(ctx); err != nil {
+		return err
+	}
+	if permit, ok := ctx.Value(managedMembershipPermitKey{}).(managedMembershipPermit); ok && permit.capture != nil {
+		result, err := n.captureManagedRepairSource(ctx, permit.request)
+		if err != nil {
+			return err
+		}
+		*permit.capture = result
+	}
+	return nil
+}
+
+// Selects the retained terminal for a journal's exact target and abort round.
+// OperationID provenance is checked against the immutable journal by callers.
+func (n *Node) retainedMembershipTerminal(operation membershipOperation) (quepaxa.DecidedValue, error) {
+	history, err := n.core.MembershipHistory()
+	if err != nil {
+		return quepaxa.DecidedValue{}, fmt.Errorf("membership completion history: %w", err)
+	}
+	var terminal *quepaxa.DecidedValue
+	var previous quepaxa.Slot
+	for _, transition := range history.Transitions {
+		if n.core.ClusterForSlot(transition.Freeze.Slot).ConfigID != operation.Request.ExpectedConfigID || !reflect.DeepEqual(n.core.ClusterForSlot(transition.Terminal.Slot+1), operation.Target) {
+			previous = transition.Terminal.Slot
+			continue
+		}
+		if terminal != nil {
+			return quepaxa.DecidedValue{}, fmt.Errorf("ambiguous membership terminal")
+		}
+		if previous < n.core.CompactionFloor() {
+			return quepaxa.DecidedValue{}, fmt.Errorf("membership revision history compacted")
+		}
+		var revision quepaxa.Slot
+		for slot := previous + 1; slot < transition.Freeze.Slot; slot++ {
+			value, ok := n.core.CertifiedValue(slot)
+			if !ok {
+				return quepaxa.DecidedValue{}, fmt.Errorf("membership revision history unavailable")
+			}
+			control, err := quepaxa.DecodeReconfiguration(value.Value)
+			if err != nil {
+				return quepaxa.DecidedValue{}, fmt.Errorf("invalid membership revision history: %w", err)
+			}
+			if control {
+				revision = slot
+			}
+		}
+		if revision != operation.Request.ExpectedAbortSlot {
+			return quepaxa.DecidedValue{}, network.ErrRequestConflict
+		}
+		decision := transition.Terminal
+		terminal = &decision
+	}
+	if terminal == nil {
+		return quepaxa.DecidedValue{}, fmt.Errorf("membership terminal unavailable")
+	}
+	return *terminal, nil
 }
 
 func (n *Node) membershipOperationKey(request network.MembershipChange) string {
@@ -192,6 +236,9 @@ func (n *Node) abortMembership(ctx context.Context, request network.MembershipCh
 	n.membershipMu.Lock()
 	defer n.membershipMu.Unlock()
 	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if err := n.validateManagedMembership(ctx, request, true); err != nil {
 		return err
 	}
 	if !n.config.EnableReconfiguration || n.bucket == nil || !n.core.IsVoter() {
@@ -222,6 +269,9 @@ func (n *Node) abortMembership(ctx context.Context, request network.MembershipCh
 	if !ok || !reflect.DeepEqual(pending, operation.Target) {
 		return network.ErrRequestConflict
 	}
+	if err := n.validateManagedMembership(ctx, request, true); err != nil {
+		return err
+	}
 	if err := n.core.AbortReconfigurationAt(ctx, operation.Target, request.ExpectedAbortSlot); err != nil {
 		return err
 	}
@@ -248,13 +298,17 @@ func (n *Node) validateMembershipFence(ctx context.Context, request network.Memb
 	if fence == nil || !fence.Confirmed || fence.NodeID != request.Remove || fence.WorkloadUID == "" || fence.WALIdentity == "" || fence.Evidence == "" {
 		return network.ErrInvalidRequest
 	}
-	key := path.Join(n.config.ObjStorePrefix, string(n.config.ClusterID), "voters", fmt.Sprintf("%x.json", sha256.Sum256([]byte(request.Remove))))
+	return n.validateRegisteredVoterWAL(ctx, request.Remove, fence.WALIdentity)
+}
+
+func (n *Node) validateRegisteredVoterWAL(ctx context.Context, id quepaxa.NodeID, identity string) error {
+	key := path.Join(n.config.ObjStorePrefix, string(n.config.ClusterID), "voters", fmt.Sprintf("%x.json", sha256.Sum256([]byte(id))))
 	data, err := readVoterRegistration(ctx, n.bucket, key)
 	if err != nil {
 		return err
 	}
 	var registration voterIdentity
-	if len(data) == 0 || json.Unmarshal(data, &registration) != nil || registration.Version != voterIdentityVersion || registration.Node != string(request.Remove) || registration.Cluster != request.ClusterID || registration.Nonce != fence.WALIdentity {
+	if len(data) == 0 || json.Unmarshal(data, &registration) != nil || registration.Version != voterIdentityVersion || registration.Node != string(id) || registration.Cluster != string(n.config.ClusterID) || registration.Nonce != identity {
 		return network.ErrInvalidRequest
 	}
 	return nil

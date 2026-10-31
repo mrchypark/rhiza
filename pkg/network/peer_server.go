@@ -46,14 +46,19 @@ type PeerServer struct {
 	closeOnce      sync.Once
 	closeErr       error
 	closeTransport func() error
+	promotionReady <-chan struct{}
 	// Installed only by package tests; nil leaves ordinary serving unchanged.
 	diagnostic atomic.Pointer[func(string, error)]
 }
 
 func StartPeerServer(ctx context.Context, addr string, server *Server, members []quepaxa.Member, peerToken, adminToken string) (*PeerServer, error) {
+	return startPeerServerOnAddr(ctx, addr, server, members, peerToken, adminToken, nil)
+}
+
+func startPeerServerOnAddr(ctx context.Context, addr string, server *Server, members []quepaxa.Member, peerToken, adminToken string, promotionReady <-chan struct{}) (*PeerServer, error) {
 	var conn net.PacketConn
 	var transport *quic.Transport
-	peer, err := startPeerServer(ctx, server, members, peerToken, adminToken, func(tlsConfig *tls.Config, config *quic.Config) (*quic.EarlyListener, error) {
+	peer, err := startPeerServer(ctx, server, members, peerToken, adminToken, promotionReady, func(tlsConfig *tls.Config, config *quic.Config) (*quic.EarlyListener, error) {
 		var err error
 		conn, err = net.ListenPacket("udp", addr)
 		if err != nil {
@@ -82,10 +87,10 @@ func StartPeerServerOnTransport(ctx context.Context, transport *quic.Transport, 
 	if transport == nil {
 		return nil, fmt.Errorf("peer QUIC transport is required")
 	}
-	return startPeerServer(ctx, server, members, peerToken, adminToken, transport.ListenEarly)
+	return startPeerServer(ctx, server, members, peerToken, adminToken, nil, transport.ListenEarly)
 }
 
-func startPeerServer(ctx context.Context, server *Server, members []quepaxa.Member, peerToken, adminToken string, listen func(*tls.Config, *quic.Config) (*quic.EarlyListener, error)) (*PeerServer, error) {
+func startPeerServer(ctx context.Context, server *Server, members []quepaxa.Member, peerToken, adminToken string, promotionReady <-chan struct{}, listen func(*tls.Config, *quic.Config) (*quic.EarlyListener, error)) (*PeerServer, error) {
 	local, hasLocal := peerMember(quepaxa.Cluster{Members: members}, server.core.NodeID())
 	for _, member := range members {
 		if len(members) > 1 && member.PublicKey == (quepaxa.PublicKey{}) {
@@ -135,7 +140,7 @@ func startPeerServer(ctx context.Context, server *Server, members []quepaxa.Memb
 	runCtx, cancel := context.WithCancel(ctx)
 	peer := &PeerServer{
 		listener: listener, server: server, members: make(map[quepaxa.NodeID]quepaxa.Member, len(members)), adminToken: adminToken,
-		connections: make(chan struct{}, maxPeerConnections), streams: make(chan struct{}, maxPeerStreams), cancel: cancel,
+		connections: make(chan struct{}, maxPeerConnections), streams: make(chan struct{}, maxPeerStreams), cancel: cancel, promotionReady: promotionReady,
 	}
 	for _, member := range members {
 		peer.members[member.ID] = member
@@ -149,6 +154,13 @@ func startPeerServer(ctx context.Context, server *Server, members []quepaxa.Memb
 // TLS identity. The learner is not admitted as a voter until its core applies
 // the reconfiguration, so its certificate cannot authenticate voting RPCs.
 func StartLearnerPeerServer(ctx context.Context, addr string, server *Server, voters []quepaxa.Member, peerToken, adminToken string, learner quepaxa.Member) (*PeerServer, error) {
+	return StartLearnerPeerServerWithPromotionGate(ctx, addr, server, voters, peerToken, adminToken, learner, nil)
+}
+
+// StartLearnerPeerServerWithPromotionGate gates only VerifyPrefix, which is
+// the admission proof used to promote this learner. Other peer recovery RPCs
+// remain available while managed startup is completing its durable adoption.
+func StartLearnerPeerServerWithPromotionGate(ctx context.Context, addr string, server *Server, voters []quepaxa.Member, peerToken, adminToken string, learner quepaxa.Member, promotionReady <-chan struct{}) (*PeerServer, error) {
 	if learner.ID == "" {
 		return nil, fmt.Errorf("learner ID is required")
 	}
@@ -165,7 +177,7 @@ func StartLearnerPeerServer(ctx context.Context, addr string, server *Server, vo
 	}
 	members := append(append([]quepaxa.Member(nil), voters...), learner)
 	// startPeerServer validates that the local public key matches the token.
-	return StartPeerServer(ctx, addr, server, members, peerToken, adminToken)
+	return startPeerServerOnAddr(ctx, addr, server, members, peerToken, adminToken, promotionReady)
 }
 
 func (s *PeerServer) Close() error {
@@ -524,6 +536,13 @@ func (s *PeerServer) handle(ctx context.Context, certificateKey ed25519.PublicKe
 		}
 		return &peerfb.ResponseT{Value: value}, nil
 	case peerfb.OperationVerifyPrefix:
+		if s.promotionReady != nil {
+			select {
+			case <-ctx.Done():
+				return nil, ctx.Err()
+			case <-s.promotionReady:
+			}
+		}
 		if request.From == 0 || len(request.Hash) != sha256.Size || len(request.Value) != sha256.Size {
 			return nil, fmt.Errorf("invalid durable-prefix request")
 		}

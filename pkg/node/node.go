@@ -844,7 +844,11 @@ func (n *Node) openInternal(ctx context.Context, enroll bool, prelocked *qlog.Lo
 	}
 	var peer *network.PeerServer
 	if n.config.Learner != nil {
-		peer, err = network.StartLearnerPeerServer(ctx, n.peerAddr(), peerServer, cluster.Members, n.config.PeerToken, n.config.AdminToken, *n.config.Learner)
+		if n.managedStartup != nil && n.managedStartup.promotionReady != nil {
+			peer, err = network.StartLearnerPeerServerWithPromotionGate(ctx, n.peerAddr(), peerServer, cluster.Members, n.config.PeerToken, n.config.AdminToken, *n.config.Learner, n.managedStartup.promotionReady)
+		} else {
+			peer, err = network.StartLearnerPeerServer(ctx, n.peerAddr(), peerServer, cluster.Members, n.config.PeerToken, n.config.AdminToken, *n.config.Learner)
+		}
 	} else if !n.config.Local {
 		peer, err = network.StartPeerServer(ctx, n.peerAddr(), peerServer, cluster.Members, n.config.PeerToken, n.config.AdminToken)
 	}

@@ -134,6 +134,10 @@ spec:
                   message: repair record cannot be removed
                 - rule: '!has(self.repair) || (has(self.authority) && has(self.applicationInit) && self.applicationInit.state == "Consumed" && self.repair.plan.bootstrapPlanDigest == self.applicationInit.plan.bootstrapPlanDigest)'
                   message: repair requires consumed managed bootstrap history
+                - rule: '!has(self.repair) || !has(self.repair.preparedHandoff) || (has(oldSelf.repair) && self.repair.plan.operationID == oldSelf.repair.plan.operationID && (has(oldSelf.repair.preparedHandoff) || (oldSelf.repair.state == "Closed" && self.repair.state == "Closed")))'
+                  message: handoff capture requires an existing closed repair operation
+                - rule: '!has(self.repair) || !has(self.repair.preparedHandoff) || (has(self.applicationInit) && self.repair.preparedHandoff.physicalBinding == self.applicationInit.plan.physicalBinding)'
+                  message: handoff physical binding must match immutable initialization
                 - rule: '!has(self.repair) || self.repair.state != "Closed" || (has(self.authority.owner) && has(self.authority.owner.uid) && has(self.authority.binding) && has(self.authority.binding.deploymentUID) && has(self.authority.binding.storageID) && has(self.authority.generation) && !has(self.authority.transition) && self.repair.plan.clusterUID == self.authority.owner.uid && self.repair.plan.generation == self.authority.generation && self.repair.plan.deploymentUID == self.authority.binding.deploymentUID && self.repair.plan.storageID == self.authority.binding.storageID)'
                   message: closed repair must match authority and cannot overlap a transition
                 - rule: '!has(oldSelf.repair) || !has(self.repair) || self.repair.plan.operationID != oldSelf.repair.plan.operationID || self.repair.plan == oldSelf.repair.plan'
@@ -197,6 +201,12 @@ spec:
                   type: object
                   required: [plan, state]
                   x-kubernetes-validations:
+                    - rule: 'self.plan.operationID != oldSelf.plan.operationID || !has(oldSelf.preparedHandoff) || (has(self.preparedHandoff) && self.preparedHandoff == oldSelf.preparedHandoff)'
+                      message: captured handoff is immutable within an operation
+                    - rule: '!has(self.preparedHandoff) || (self.preparedHandoff.survivors.config_id == self.plan.expectedConfigID + 1 && self.preparedHandoff.removeTerminalSlot > self.plan.expectedAbortSlot)'
+                      message: handoff must bind the post-REMOVE configuration and terminal position
+                    - rule: '!has(self.preparedHandoff) || (self.preparedHandoff.survivors.members.size() + 1 == self.plan.finalVoterIDs.size() && self.preparedHandoff.survivors.members.all(m, m.node_id != self.plan.oldNodeID && m.node_id != self.plan.replacement.nodeID && m.node_id in self.plan.finalVoterIDs && self.preparedHandoff.survivors.members.filter(other, other.node_id == m.node_id).size() == 1))'
+                      message: handoff survivor set must exactly precede the intended ADD
                     - rule: '(self.state == "Closed" && !has(self.completion)) || (self.state != "Closed" && has(self.completion))'
                       message: repair state and completion must agree
                     - rule: '!has(self.completion) || (self.completion.operationID == self.plan.operationID && self.completion.expectedConfigID == self.plan.expectedConfigID && self.completion.expectedAbortSlot == self.plan.expectedAbortSlot && self.completion.slot > self.plan.expectedAbortSlot)'
@@ -205,6 +215,44 @@ spec:
                       message: REMOVE alone is not final repair completion
                   properties:
                     state: {type: string, enum: [Closed, Completed, Aborted]}
+                    preparedHandoff:
+                      type: object
+                      required: [planDigest, sourceRoot, sourcePrefix, physicalBinding, head, headHash, removeTerminalSlot, removeTerminalHash, survivors]
+                      x-kubernetes-validations:
+                        - rule: 'self.head.size() < 87384 || self.head.endsWith("==")'
+                          message: captured HEAD exceeds the decoded 64 KiB limit
+                      properties:
+                        planDigest: {type: string, pattern: '^[0-9a-f]{64}$', minLength: 64, maxLength: 64}
+                        sourceRoot: {type: string, maxLength: 4096}
+                        sourcePrefix: {type: string, minLength: 1, maxLength: 8192}
+                        physicalBinding: {type: string, pattern: '^[0-9a-f]{64}$', minLength: 64, maxLength: 64}
+                        head:
+                          type: string
+                          minLength: 4
+                          maxLength: 87384
+                          pattern: '^([A-Za-z0-9+/]{4})*([A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$'
+                        headHash: {type: string, pattern: '^[0-9a-f]{64}$', minLength: 64, maxLength: 64}
+                        removeTerminalSlot: {type: integer, format: int64, minimum: 1}
+                        removeTerminalHash: {type: string, pattern: '^[0-9a-f]{64}$', minLength: 64, maxLength: 64}
+                        survivors:
+                          type: object
+                          required: [config_id, members]
+                          properties:
+                            config_id: {type: integer, format: int64, minimum: 1}
+                            members:
+                              type: array
+                              minItems: 1
+                              maxItems: 63
+                              items:
+                                type: object
+                                required: [node_id, url, log_url, public_key]
+                                properties:
+                                  node_id: {type: string, minLength: 1, maxLength: 256}
+                                  url: {type: string, maxLength: 2048}
+                                  peer_url: {type: string, maxLength: 2048}
+                                  log_url: {type: string, maxLength: 2048}
+                                  public_key: {type: string, minLength: 44, maxLength: 44}
+                                  wal_identity: {type: string, pattern: '^[0-9a-f]{64}$', minLength: 64, maxLength: 64}
                     plan:
                       type: object
                       required: [operationID, clusterUID, generation, deploymentUID, storageID, expectedConfigID, expectedAbortSlot, oldNodeID, oldWALIdentity, replacement, bootstrapPlanDigest, finalVoterIDs]

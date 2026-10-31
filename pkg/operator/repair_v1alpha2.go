@@ -5,9 +5,11 @@ import (
 	"crypto/sha256"
 	"encoding/json"
 	"fmt"
+	objectstore "github.com/mrchypark/rhiza/internal/objstore"
 	"math"
 	"net"
 	"net/url"
+	"path"
 	"slices"
 	"strconv"
 	"strings"
@@ -66,9 +68,74 @@ type V1Alpha2RepairCompletion struct {
 }
 
 type V1Alpha2RepairRecord struct {
-	Plan       V1Alpha2RepairPlan        `json:"plan"`
-	State      string                    `json:"state"`
-	Completion *V1Alpha2RepairCompletion `json:"completion,omitempty"`
+	Plan            V1Alpha2RepairPlan        `json:"plan"`
+	State           string                    `json:"state"`
+	Completion      *V1Alpha2RepairCompletion `json:"completion,omitempty"`
+	PreparedHandoff *V1Alpha2RepairHandoff    `json:"preparedHandoff,omitempty"`
+}
+
+const V1Alpha2RepairHeadLimit = 64 << 10
+const V1Alpha2RepairRecordLimit = 128 << 10
+
+// Status capture is provenance only; the private runtime verifies source and
+// REMOVE certificate before publishing the handoff.
+type V1Alpha2RepairHandoff struct {
+	PlanDigest         string          `json:"planDigest"`
+	SourceRoot         string          `json:"sourceRoot"`
+	SourcePrefix       string          `json:"sourcePrefix"`
+	PhysicalBinding    string          `json:"physicalBinding"`
+	Head               []byte          `json:"head"`
+	HeadHash           string          `json:"headHash"`
+	RemoveTerminalSlot uint64          `json:"removeTerminalSlot"`
+	RemoveTerminalHash string          `json:"removeTerminalHash"`
+	Survivors          quepaxa.Cluster `json:"survivors"`
+}
+
+func validateRepairHandoff(s V1Alpha2StatusSnapshot, p V1Alpha2RepairPlan, h V1Alpha2RepairHandoff) error {
+	var assignment V1Alpha2ApplicationInitAssignment
+	status, _ := jsonObject(s.object["status"])
+	if decodeV1Alpha2(status["applicationInit"], &assignment) != nil {
+		return fmt.Errorf("handoff assignment missing")
+	}
+	cluster, err := types.ManagedClusterID(p.ClusterUID, p.Generation)
+	_, prefix, namespaceErr := objectstore.ManagedNamespacePrefixes(h.SourceRoot, p.ClusterUID, p.Generation, assignment.Plan.AssignmentID, string(cluster))
+	if err != nil || namespaceErr != nil || h.SourcePrefix != prefix || path.Clean(h.SourcePrefix) != h.SourcePrefix || h.PhysicalBinding != assignment.Plan.PhysicalBinding || h.PlanDigest != p.Digest() || len(h.Head) == 0 || len(h.Head) > V1Alpha2RepairHeadLimit || h.HeadHash != fmt.Sprintf("%x", sha256.Sum256(h.Head)) || h.RemoveTerminalSlot <= p.ExpectedAbortSlot || h.RemoveTerminalSlot > math.MaxInt64 || !validInitDigest(h.RemoveTerminalHash) || uint64(h.Survivors.ConfigID) != p.ExpectedConfigID+1 {
+		return fmt.Errorf("invalid repair handoff binding or budget")
+	}
+	ids := make([]types.NodeID, 0, len(h.Survivors.Members)+1)
+	seen := map[types.NodeID]bool{}
+	for _, m := range h.Survivors.Members {
+		if m.ID == p.OldNodeID || m.ID == p.Replacement.NodeID || seen[m.ID] || !validRepairText(string(m.ID), 256) || m.PublicKey == (quepaxa.PublicKey{}) {
+			return fmt.Errorf("invalid repair survivors")
+		}
+		seen[m.ID] = true
+		ids = append(ids, m.ID)
+	}
+	ids = append(ids, p.Replacement.NodeID)
+	slices.Sort(ids)
+	if !slices.Equal(ids, p.FinalVoterIDs) {
+		return fmt.Errorf("repair survivors differ from final target")
+	}
+	return nil
+}
+
+func CaptureV1Alpha2RepairHandoff(ctx context.Context, store *V1Alpha2StatusStore, old V1Alpha2AdmissionSnapshot, expected V1Alpha2AuthorityView, h V1Alpha2RepairHandoff) (V1Alpha2AdmissionSnapshot, V1Alpha2CASObservation, error) {
+	r, ok := old.Repair()
+	if !ok || old.status.store != store || old.Authority() != expected || !old.SQLReservationsClosed() || r.PreparedHandoff != nil || !repairMatchesAuthority(r.Plan, expected) || hasV1Alpha2Transition(old.transition) {
+		return V1Alpha2AdmissionSnapshot{}, "", fmt.Errorf("repair handoff requires exact uncaptured closed intent")
+	}
+	if err := validateRepairHandoff(old.status, r.Plan, h); err != nil {
+		return V1Alpha2AdmissionSnapshot{}, "", err
+	}
+	if err := validateV1Alpha2RepairPod(ctx, store, old.status.ref, r.Plan); err != nil {
+		return V1Alpha2AdmissionSnapshot{}, "", err
+	}
+	r.PreparedHandoff = &h
+	encoded, err := json.Marshal(r)
+	if err != nil || len(encoded) > V1Alpha2RepairRecordLimit {
+		return V1Alpha2AdmissionSnapshot{}, "", fmt.Errorf("repair record exceeds bounded budget")
+	}
+	return updateV1Alpha2AdmissionStatus(ctx, store, old, func(status, auth map[string]json.RawMessage) { status["repair"] = encoded })
 }
 
 func (s V1Alpha2AdmissionSnapshot) ResourceVersion() string { return s.status.ResourceVersion() }
@@ -81,6 +148,12 @@ func (s V1Alpha2AdmissionSnapshot) Repair() (V1Alpha2RepairRecord, bool) {
 	}
 	r := *s.status.repair
 	r.Plan.FinalVoterIDs = slices.Clone(r.Plan.FinalVoterIDs)
+	if r.PreparedHandoff != nil {
+		h := *r.PreparedHandoff
+		h.Head = slices.Clone(h.Head)
+		h.Survivors.Members = slices.Clone(h.Survivors.Members)
+		r.PreparedHandoff = &h
+	}
 	if r.Completion != nil {
 		c := *r.Completion
 		c.FinalVoterIDs = slices.Clone(c.FinalVoterIDs)
@@ -153,8 +226,13 @@ func parseV1Alpha2Repair(s V1Alpha2StatusSnapshot) (*V1Alpha2RepairRecord, error
 		return nil, nil
 	}
 	var r V1Alpha2RepairRecord
-	if len(raw) > 16<<10 || decodeV1Alpha2(raw, &r) != nil || validateV1Alpha2RepairPlan(s, r.Plan) != nil {
+	if len(raw) > V1Alpha2RepairRecordLimit || decodeV1Alpha2(raw, &r) != nil || validateV1Alpha2RepairPlan(s, r.Plan) != nil {
 		return nil, fmt.Errorf("invalid repair record")
+	}
+	if r.PreparedHandoff != nil {
+		if err := validateRepairHandoff(s, r.Plan, *r.PreparedHandoff); err != nil {
+			return nil, err
+		}
 	}
 	if r.Plan.Generation > s.authority.Generation {
 		return nil, fmt.Errorf("repair belongs to a future authority")
@@ -212,22 +290,26 @@ func FinishV1Alpha2Repair(ctx context.Context, store *V1Alpha2StatusStore, old V
 		r.State = "Aborted"
 	}
 	r.Completion = &completion
+	if encoded, _ := json.Marshal(r); len(encoded) > V1Alpha2RepairRecordLimit {
+		return V1Alpha2AdmissionSnapshot{}, "", fmt.Errorf("repair record exceeds bounded budget")
+	}
 	return updateV1Alpha2AdmissionStatus(ctx, store, old, func(status, auth map[string]json.RawMessage) { status["repair"], _ = json.Marshal(r) })
 }
 
 func validateV1Alpha2RepairPod(ctx context.Context, store *V1Alpha2StatusStore, ref V1Alpha2ClusterRef, p V1Alpha2RepairPlan) error {
+	if err := validateV1Alpha2RepairPodIdentity(ctx, store, ref, p); err != nil {
+		return err
+	}
 	var pod struct {
 		APIVersion, Kind string
 		Metadata         v1alpha2BootstrapMetadata
 		Status           struct {
-			PodIP                 string
-			InitContainerStatuses []struct {
-				Name  string
-				State struct {
-					Terminated *struct {
-						ExitCode int
-						Message  string
-					}
+			PodIP             string
+			ContainerStatuses []struct {
+				RestartCount int
+				State        struct {
+					Running    *struct{}
+					Terminated *struct{}
 				}
 			}
 		}
@@ -237,61 +319,15 @@ func validateV1Alpha2RepairPod(ctx context.Context, store *V1Alpha2StatusStore, 
 	}
 	u, _ := url.Parse(p.Replacement.PeerURL)
 	if pod.APIVersion != "v1" || pod.Kind != "Pod" || pod.Metadata.Namespace != ref.Namespace || pod.Metadata.Name != p.Replacement.PodName || pod.Metadata.UID != p.Replacement.PodUID || pod.Metadata.ResourceVersion == "" || pod.Metadata.DeletionTimestamp != nil || net.ParseIP(pod.Status.PodIP) == nil || !net.ParseIP(pod.Status.PodIP).Equal(net.ParseIP(u.Hostname())) {
-		return fmt.Errorf("repair Pod identity or endpoint mismatch")
+		return fmt.Errorf("repair candidate identity changed before authorization")
 	}
-	if len(pod.Status.InitContainerStatuses) == 0 || pod.Status.InitContainerStatuses[0].Name != V1Alpha2PrepareIdentityContainer || pod.Status.InitContainerStatuses[0].State.Terminated == nil || pod.Status.InitContainerStatuses[0].State.Terminated.ExitCode != 0 {
-		return fmt.Errorf("repair Pod identity is not prepared")
-	}
-	key, err := DecodeV1Alpha2BootstrapReport(pod.Status.InitContainerStatuses[0].State.Terminated.Message)
-	if err != nil || key != p.Replacement.PublicKey {
-		return fmt.Errorf("repair Pod public key mismatch")
-	}
-	var owner *v1alpha2BootstrapOwner
-	for i := range pod.Metadata.OwnerReferences {
-		o := &pod.Metadata.OwnerReferences[i]
-		if o.Controller != nil && *o.Controller {
-			if owner != nil {
-				return fmt.Errorf("ambiguous repair Pod owner")
-			}
-			owner = o
+	for _, container := range pod.Status.ContainerStatuses {
+		if container.RestartCount != 0 || container.State.Running != nil || container.State.Terminated != nil {
+			return fmt.Errorf("repair candidate main container has already started")
 		}
 	}
-	if owner == nil || owner.APIVersion != "apps/v1" || owner.Kind != "ReplicaSet" || owner.Name == "" || owner.UID == "" {
-		return fmt.Errorf("invalid repair Pod owner")
-	}
-	var rs struct {
-		APIVersion, Kind string
-		Metadata         v1alpha2BootstrapMetadata
-	}
-	base := "/apis/apps/v1/namespaces/" + ref.Namespace
-	if err := store.Kube.Get(ctx, base+"/replicasets/"+url.PathEscape(owner.Name), &rs); err != nil {
+	if _, err := ValidateV1Alpha2RepairPodBinding(ctx, store, ref, p); err != nil {
 		return err
-	}
-	if rs.APIVersion != "apps/v1" || rs.Kind != "ReplicaSet" || rs.Metadata.Name != owner.Name || rs.Metadata.ResourceVersion == "" || rs.Metadata.UID != owner.UID || rs.Metadata.Namespace != ref.Namespace || rs.Metadata.DeletionTimestamp != nil {
-		return fmt.Errorf("invalid repair ReplicaSet")
-	}
-	var deploymentOwner *v1alpha2BootstrapOwner
-	for i := range rs.Metadata.OwnerReferences {
-		o := &rs.Metadata.OwnerReferences[i]
-		if o.Controller != nil && *o.Controller {
-			if deploymentOwner != nil {
-				return fmt.Errorf("ambiguous repair Deployment owner")
-			}
-			deploymentOwner = o
-		}
-	}
-	if deploymentOwner == nil || deploymentOwner.APIVersion != "apps/v1" || deploymentOwner.Kind != "Deployment" || deploymentOwner.UID != p.DeploymentUID || deploymentOwner.Name == "" {
-		return fmt.Errorf("invalid repair Deployment owner")
-	}
-	var dep struct {
-		APIVersion, Kind string
-		Metadata         v1alpha2BootstrapMetadata
-	}
-	if err := store.Kube.Get(ctx, base+"/deployments/"+url.PathEscape(deploymentOwner.Name), &dep); err != nil {
-		return err
-	}
-	if dep.APIVersion != "apps/v1" || dep.Kind != "Deployment" || dep.Metadata.Name != deploymentOwner.Name || dep.Metadata.ResourceVersion == "" || dep.Metadata.UID != p.DeploymentUID || dep.Metadata.Namespace != ref.Namespace || dep.Metadata.DeletionTimestamp != nil || !bootstrapOwner(dep.Metadata, V1Alpha2APIVersion, "RhizaCluster", ref.Name, ref.UID) {
-		return fmt.Errorf("invalid repair Deployment binding")
 	}
 	return nil
 }

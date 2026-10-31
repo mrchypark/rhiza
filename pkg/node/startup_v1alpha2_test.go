@@ -267,7 +267,7 @@ func TestPreparedNodeAdoptionRestartGenuineWAL(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := persistPreparedAdoption(config.DataDir, identity, learnerCore.WALIdentity(), view, &membership); err != nil {
+	if err := persistPreparedAdoption(config.DataDir, identity, learnerCore.WALIdentity(), view, &membership, ""); err != nil {
 		t.Fatal(err)
 	}
 	err = wal.Close()
@@ -831,13 +831,22 @@ func TestManagedPreparedCheckpointSQLSuffixAdoptionAndRestart(t *testing.T) {
 		t.Fatal(err)
 	}
 	identity := ManagedStartupIdentity{Member: preparedIdentity, AssignmentID: "assignment", IntentHash: "intent", StorageID: "storage", PhysicalBinding: sourceBinding, BootstrapPlanDigest: bootstrapPlan, EvidenceFormat: "sql-v1"}
+	repairOrigin := []byte(`{"version":1,"repair":{"state":"Closed"}}`)
 	checker := &managedTestChecker{}
-	startup := ManagedStartupConfig{StorageRoot: storageRoot, Identity: identity, Checker: checker, Prepared: prepared}
+	startup := ManagedStartupConfig{StorageRoot: storageRoot, Identity: identity, Checker: checker, Prepared: prepared, RepairOrigin: repairOrigin}
 	if err := node.OpenManaged(ctx, startup); err != nil {
 		objectStore.mu.RLock()
 		requests := append([]string(nil), objectStore.requests...)
 		objectStore.mu.RUnlock()
 		t.Fatalf("open prepared managed node: %v; requests=%v", err, requests)
+	}
+	if node.managedStartup == nil || node.managedStartup.promotionReady == nil {
+		t.Fatal("prepared learner did not install its promotion gate")
+	}
+	select {
+	case <-node.managedStartup.promotionReady:
+	default:
+		t.Fatal("promotion gate opened before verified adoption completed")
 	}
 	if _, err := node.InspectManagedSQL(ctx, false); err != nil {
 		t.Fatalf("inspect prepared SQL history: %v", err)
@@ -868,7 +877,7 @@ func TestManagedPreparedCheckpointSQLSuffixAdoptionAndRestart(t *testing.T) {
 	beforePreparedCorrupt, beforePreparedCorruptFiles := managedStartupDataDigest(t, dataDir)
 	writesBeforePreparedCorrupt := objectStore.writeCount()
 	preparedCorrupt := New(config)
-	if err := preparedCorrupt.OpenManaged(ctx, ManagedStartupConfig{StorageRoot: storageRoot, Identity: identity, Checker: checker, Prepared: prepared}); err == nil || !strings.Contains(err.Error(), "actual SQLite contents differ") {
+	if err := preparedCorrupt.OpenManaged(ctx, ManagedStartupConfig{StorageRoot: storageRoot, Identity: identity, Checker: checker, Prepared: prepared, RepairOrigin: repairOrigin}); err == nil || !strings.Contains(err.Error(), "actual SQLite contents differ") {
 		t.Fatalf("prepared-target corruption result: %v", err)
 	}
 	if preparedCorrupt.opened.Load() || preparedCorrupt.peer != nil || preparedCorrupt.wal != nil || preparedCorrupt.lock != nil {
@@ -892,7 +901,7 @@ func TestManagedPreparedCheckpointSQLSuffixAdoptionAndRestart(t *testing.T) {
 		t.Fatal(err)
 	}
 	preparedNeighbor := New(config)
-	if err := preparedNeighbor.OpenManaged(ctx, ManagedStartupConfig{StorageRoot: storageRoot, Identity: identity, Checker: checker}); err != nil {
+	if err := preparedNeighbor.OpenManaged(ctx, ManagedStartupConfig{StorageRoot: storageRoot, Identity: identity, Checker: checker, RepairOrigin: repairOrigin}); err != nil {
 		t.Fatalf("valid prepared neighbor after rejected corruption: %v", err)
 	}
 	if _, err := preparedNeighbor.InspectManagedSQL(ctx, false); err != nil {
@@ -902,8 +911,16 @@ func TestManagedPreparedCheckpointSQLSuffixAdoptionAndRestart(t *testing.T) {
 		t.Fatal(err)
 	}
 	restart := New(config)
-	if err := restart.OpenManaged(ctx, ManagedStartupConfig{StorageRoot: storageRoot, Identity: identity, Checker: checker}); err != nil {
+	if err := restart.OpenManaged(ctx, ManagedStartupConfig{StorageRoot: storageRoot, Identity: identity, Checker: checker, RepairOrigin: repairOrigin}); err != nil {
 		t.Fatalf("restart adopted prepared node: %v", err)
+	}
+	if restart.managedStartup == nil || restart.managedStartup.promotionReady == nil {
+		t.Fatal("adopted learner restart did not install its promotion gate")
+	}
+	select {
+	case <-restart.managedStartup.promotionReady:
+	default:
+		t.Fatal("adopted restart gate did not open after verification")
 	}
 	if got := managedSQLIdempotencyRows(t, filepath.Join(dataDir, "sqlite.db")); got != receiptsBeforeRestart {
 		t.Fatalf("retained SQL receipt rows changed across restart:\nbefore:\n%s\nafter:\n%s", receiptsBeforeRestart, got)
@@ -913,6 +930,28 @@ func TestManagedPreparedCheckpointSQLSuffixAdoptionAndRestart(t *testing.T) {
 	}
 	if err := restart.Shutdown(); err != nil {
 		t.Fatal(err)
+	}
+	beforeMissingOrigin, _ := managedStartupDataDigest(t, dataDir)
+	missingOrigin := New(config)
+	if err := missingOrigin.OpenManaged(ctx, ManagedStartupConfig{StorageRoot: storageRoot, Identity: identity, Checker: checker}); err == nil || !strings.Contains(err.Error(), "repair origin") {
+		t.Fatalf("missing historical repair origin result: %v", err)
+	}
+	if missingOrigin.opened.Load() || missingOrigin.peer != nil || missingOrigin.wal != nil || missingOrigin.lock != nil {
+		t.Fatal("missing-origin restart retained runtime resources")
+	}
+	if afterMissingOrigin, _ := managedStartupDataDigest(t, dataDir); afterMissingOrigin != beforeMissingOrigin {
+		t.Fatalf("missing-origin restart mutated existing data: before=%s after=%s", beforeMissingOrigin, afterMissingOrigin)
+	}
+	beforeWrongOrigin, _ := managedStartupDataDigest(t, dataDir)
+	wrongOrigin := New(config)
+	if err := wrongOrigin.OpenManaged(ctx, ManagedStartupConfig{StorageRoot: storageRoot, Identity: identity, Checker: checker, RepairOrigin: []byte(`{"version":2}`)}); err == nil || !strings.Contains(err.Error(), "repair origin") {
+		t.Fatalf("substituted repair origin result: %v", err)
+	}
+	if wrongOrigin.opened.Load() || wrongOrigin.peer != nil || wrongOrigin.wal != nil || wrongOrigin.lock != nil {
+		t.Fatal("wrong-origin restart retained runtime resources")
+	}
+	if afterWrongOrigin, _ := managedStartupDataDigest(t, dataDir); afterWrongOrigin != beforeWrongOrigin {
+		t.Fatalf("wrong-origin restart mutated existing data: before=%s after=%s", beforeWrongOrigin, afterWrongOrigin)
 	}
 
 	marker := filepath.Join(dataDir, "prepared-adoption.json")
@@ -948,7 +987,7 @@ func TestManagedPreparedCheckpointSQLSuffixAdoptionAndRestart(t *testing.T) {
 				t.Fatal(err)
 			}
 			candidate := New(config)
-			if err := candidate.OpenManaged(ctx, ManagedStartupConfig{StorageRoot: storageRoot, Identity: identity, Checker: checker}); err == nil {
+			if err := candidate.OpenManaged(ctx, ManagedStartupConfig{StorageRoot: storageRoot, Identity: identity, Checker: checker, RepairOrigin: repairOrigin}); err == nil {
 				t.Fatal("corrupted adoption accepted")
 			}
 			if candidate.opened.Load() || candidate.peer != nil || candidate.wal != nil {
@@ -969,7 +1008,7 @@ func TestManagedPreparedCheckpointSQLSuffixAdoptionAndRestart(t *testing.T) {
 	if err := os.Remove(marker); err != nil {
 		t.Fatal(err)
 	}
-	if err := New(config).OpenManaged(ctx, ManagedStartupConfig{StorageRoot: storageRoot, Identity: identity, Checker: checker}); err == nil {
+	if err := New(config).OpenManaged(ctx, ManagedStartupConfig{StorageRoot: storageRoot, Identity: identity, Checker: checker, RepairOrigin: repairOrigin}); err == nil {
 		t.Fatal("missing adoption accepted")
 	}
 	if err := os.WriteFile(marker, validMarker, 0600); err != nil {
@@ -982,7 +1021,7 @@ func TestManagedPreparedCheckpointSQLSuffixAdoptionAndRestart(t *testing.T) {
 		t.Fatal(err)
 	}
 	persistFailure := New(config)
-	if err := persistFailure.OpenManaged(ctx, ManagedStartupConfig{StorageRoot: storageRoot, Identity: identity, Checker: checker, Prepared: prepared}); err == nil || !strings.Contains(err.Error(), "persist verified prepared adoption") {
+	if err := persistFailure.OpenManaged(ctx, ManagedStartupConfig{StorageRoot: storageRoot, Identity: identity, Checker: checker, Prepared: prepared, RepairOrigin: repairOrigin}); err == nil || !strings.Contains(err.Error(), "persist verified prepared adoption") {
 		t.Fatalf("prepared adoption persistence failure result: %v", err)
 	}
 	if persistFailure.opened.Load() || persistFailure.peer != nil || persistFailure.wal != nil || persistFailure.lock != nil {
@@ -1005,7 +1044,7 @@ func TestManagedPreparedCheckpointSQLSuffixAdoptionAndRestart(t *testing.T) {
 	// Advance the adopted WAL after the prepared view was captured, then verify
 	// the exact applied SQL cut from the certified local suffix on restart.
 	advanceNode := New(config)
-	if err := advanceNode.OpenManaged(ctx, ManagedStartupConfig{StorageRoot: storageRoot, Identity: identity, Checker: checker}); err != nil {
+	if err := advanceNode.OpenManaged(ctx, ManagedStartupConfig{StorageRoot: storageRoot, Identity: identity, Checker: checker, RepairOrigin: repairOrigin}); err != nil {
 		t.Fatalf("open adopted node before certified WAL advance: %v", err)
 	}
 	advancedSQL, err := types.EncodeSQLBatch([]types.SQLCommand{{RequestID: "after-captured-view", SQL: "UPDATE managed_items SET value = 'beyond-view-tip' WHERE id = 1"}})
@@ -1051,7 +1090,7 @@ func TestManagedPreparedCheckpointSQLSuffixAdoptionAndRestart(t *testing.T) {
 	beforeMissingBridge, beforeMissingBridgeFiles := managedStartupDataDigest(t, dataDir)
 	writesBeforeMissingBridge := objectStore.writeCount()
 	missingBridge := New(config)
-	if err := missingBridge.OpenManaged(ctx, ManagedStartupConfig{StorageRoot: storageRoot, Identity: identity, Checker: checker}); err == nil || !strings.Contains(err.Error(), "ahead of certified WAL tip") {
+	if err := missingBridge.OpenManaged(ctx, ManagedStartupConfig{StorageRoot: storageRoot, Identity: identity, Checker: checker, RepairOrigin: repairOrigin}); err == nil || !strings.Contains(err.Error(), "ahead of certified WAL tip") {
 		t.Fatalf("unbridged actual SQL tip result: %v", err)
 	}
 	if after, files := managedStartupDataDigest(t, dataDir); after != beforeMissingBridge {
@@ -1072,7 +1111,7 @@ func TestManagedPreparedCheckpointSQLSuffixAdoptionAndRestart(t *testing.T) {
 		t.Fatal(err)
 	}
 	advancedRestart := New(config)
-	if err := advancedRestart.OpenManaged(ctx, ManagedStartupConfig{StorageRoot: storageRoot, Identity: identity, Checker: checker}); err != nil {
+	if err := advancedRestart.OpenManaged(ctx, ManagedStartupConfig{StorageRoot: storageRoot, Identity: identity, Checker: checker, RepairOrigin: repairOrigin}); err != nil {
 		t.Fatalf("restart adopted WAL beyond captured prepared view: %v", err)
 	}
 	if got := managedSQLIdempotencyRows(t, filepath.Join(dataDir, "sqlite.db")); got != advancedReceipts {
@@ -1115,7 +1154,7 @@ func TestManagedPreparedCheckpointSQLSuffixAdoptionAndRestart(t *testing.T) {
 	beforeCorruptDigest, beforeCorruptFiles := managedStartupDataDigest(t, dataDir)
 	beforeCorruptWrites := objectStore.writeCount()
 	existingCorrupt := New(config)
-	if err := existingCorrupt.OpenManaged(ctx, ManagedStartupConfig{StorageRoot: storageRoot, Identity: identity, Checker: checker}); err == nil || !strings.Contains(err.Error(), "actual SQLite contents differ") {
+	if err := existingCorrupt.OpenManaged(ctx, ManagedStartupConfig{StorageRoot: storageRoot, Identity: identity, Checker: checker, RepairOrigin: repairOrigin}); err == nil || !strings.Contains(err.Error(), "actual SQLite contents differ") {
 		t.Fatalf("existing managed-target corruption result: %v", err)
 	}
 	if existingCorrupt.opened.Load() || existingCorrupt.peer != nil || existingCorrupt.wal != nil || existingCorrupt.lock != nil {
@@ -1127,7 +1166,7 @@ func TestManagedPreparedCheckpointSQLSuffixAdoptionAndRestart(t *testing.T) {
 	if after := objectStore.writeCount(); after != beforeCorruptWrites {
 		t.Fatalf("prepared-target preflight wrote object storage: before=%d after=%d", beforeCorruptWrites, after)
 	}
-	if err := corrupt.OpenManaged(ctx, ManagedStartupConfig{StorageRoot: storageRoot, Identity: identity, Checker: checker}); err == nil || !strings.Contains(err.Error(), "actual SQLite contents differ") {
+	if err := corrupt.OpenManaged(ctx, ManagedStartupConfig{StorageRoot: storageRoot, Identity: identity, Checker: checker, RepairOrigin: repairOrigin}); err == nil || !strings.Contains(err.Error(), "actual SQLite contents differ") {
 		t.Fatalf("pre-replay SQLite corruption result: %v", err)
 	}
 	if afterDigest, afterFiles := managedStartupDataDigest(t, dataDir); afterDigest != beforeCorruptDigest {
@@ -1186,7 +1225,7 @@ func TestManagedPreparedCheckpointSQLSuffixAdoptionAndRestart(t *testing.T) {
 		t.Fatal(err)
 	}
 	baseCorrupt := New(config)
-	if err := baseCorrupt.OpenManaged(ctx, ManagedStartupConfig{StorageRoot: storageRoot, Identity: identity, Checker: checker}); err == nil || !strings.Contains(err.Error(), "actual SQLite contents differ") {
+	if err := baseCorrupt.OpenManaged(ctx, ManagedStartupConfig{StorageRoot: storageRoot, Identity: identity, Checker: checker, RepairOrigin: repairOrigin}); err == nil || !strings.Contains(err.Error(), "actual SQLite contents differ") {
 		t.Fatalf("checkpoint-tip SQLite corruption result: %v", err)
 	}
 	if baseCorrupt.opened.Load() || baseCorrupt.peer != nil || baseCorrupt.wal != nil || baseCorrupt.lock != nil {
@@ -1220,7 +1259,7 @@ func TestManagedPreparedCheckpointSQLSuffixAdoptionAndRestart(t *testing.T) {
 		t.Fatal(err)
 	}
 	missingSuffix := New(config)
-	if err := missingSuffix.OpenManaged(ctx, ManagedStartupConfig{StorageRoot: storageRoot, Identity: identity, Checker: checker}); err == nil || !strings.Contains(err.Error(), "ahead of certified WAL tip") {
+	if err := missingSuffix.OpenManaged(ctx, ManagedStartupConfig{StorageRoot: storageRoot, Identity: identity, Checker: checker, RepairOrigin: repairOrigin}); err == nil || !strings.Contains(err.Error(), "ahead of certified WAL tip") {
 		t.Fatalf("missing certified SQL suffix result: %v", err)
 	}
 	if missingSuffix.opened.Load() || missingSuffix.peer != nil || missingSuffix.wal != nil || missingSuffix.lock != nil {
