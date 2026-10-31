@@ -103,7 +103,7 @@ bucket="rhiza-managed-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT-$nonce"
 admin=$(od -An -N32 -tx1 /dev/urandom | tr -d ' \n')
 umask 077
 printf '%s' "$admin" > "$private/admin.token"
-jq -n --arg image "$image" --rawfile admin "$private/admin.token" --arg bucket "$bucket" --arg root "ci-$nonce" '{InitImage:$image,PeerPort:9090,EvidenceFormat:"rhiza-managed-sql/v1",ProfileSecretName:"runtime",Storage:{admin_token:$admin,objstore_provider:"s3",objstore_endpoint:"floci:4566",objstore_bucket:$bucket,objstore_prefix:$root,objstore_region:"us-east-1",objstore_insecure:true,objstore_access_key:"rhiza-local-test",objstore_secret_key:"rhiza-local-test",objstore_durability:"before-ack"}}' > "$private/runtime.json"
+jq -n --arg image "$image" --rawfile admin "$private/admin.token" --arg bucket "$bucket" --arg root "ci-$nonce" '{InitImage:$image,PeerPort:9090,EvidenceFormat:"rhiza-managed-sql/v1",ProfileSecretName:"runtime",Storage:{enable_reconfiguration:true,admin_token:$admin,objstore_provider:"s3",objstore_endpoint:"floci:4566",objstore_bucket:$bucket,objstore_prefix:$root,objstore_region:"us-east-1",objstore_insecure:true,objstore_access_key:"rhiza-local-test",objstore_secret_key:"rhiza-local-test",objstore_durability:"before-ack"}}' > "$private/runtime.json"
 printf 'header = "Authorization: Bearer %s"\n' "$admin" > "$private/curl.conf"
 unset admin
 k -n "$namespace" create secret generic runtime --from-file="runtime.json=$private/runtime.json"
@@ -136,6 +136,7 @@ k -n "$namespace" create rolebinding status --role=status --serviceaccount="$nam
 k -n "$namespace" get serviceaccounts,roles,rolebindings -o jsonpath='{range .items[*]}{.kind}{" "}{.metadata.name}{"\n"}{end}' > "$logs/public-rbac-names.txt"
 k -n "$namespace" wait --for=condition=Ready pod -l "$selector" --timeout=180s
 k -n "$namespace" get rhizacluster sql -o json > "$logs/committed.json"
+jq -e '.status.bootstrapPlan.reconfiguration==true' "$logs/committed.json" >/dev/null
 sh scripts/ha-managed-bucket-setup oracle-plan "$logs/gated-pods.json" "$logs/committed.json"
 k -n "$namespace" get pods -l "$selector" -o json > "$logs/ready-pods.json"
 # Test-owned route only: this does not qualify operator-managed Service ownership.
