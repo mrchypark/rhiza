@@ -183,4 +183,21 @@ run_client query-after-replacement query '{"sql":"SELECT id, value FROM bootstra
 jq -e '.rows==[[1,"real-kubelet"]]' "$logs/query-after-replacement.json" >/dev/null
 jq -S '.status|{bootstrapPlan,genesis,plan:.applicationInit.plan}' "$logs/replacement-status.json" > "$logs/immutable-replacement.json"
 cmp "$logs/immutable-before.json" "$logs/immutable-replacement.json"
-printf '%s\n' 'PASS: actual kubelet initial bootstrap, graceful Deployment Pod replacement with completed certified repair, two initContainers, NoPVC and ACK readback' 'GAP: isolated-process physical fencing, operator-managed Service ownership, same-Pod historical restart and Chaos Mesh qualification remain pending; no NetworkPolicy claim' > "$logs/result.txt"
+replacement_uid=$(jq -r '.status.repair.plan.replacement.podUID' "$logs/replacement-status.json")
+replacement_pod=$(jq -r --arg uid "$replacement_uid" '.items[]|select(.metadata.uid==$uid)|.metadata.name' "$logs/replacement-pods.json")
+[ -n "$replacement_pod" ]
+restart_before=$(jq -r --arg uid "$replacement_uid" '.items[]|select(.metadata.uid==$uid)|.status.containerStatuses[]|select(.name=="sql")|.restartCount' "$logs/replacement-pods.json")
+k -n "$namespace" exec "$replacement_pod" -c sql -- sha256sum /var/lib/rhiza/repair.json /var/lib/rhiza/data/prepared-adoption.json /var/lib/rhiza/data/voter-identity.json > "$logs/restart-identity-before.txt"
+# The application handles TERM; kubelet restarts main without replacing the
+# Pod or rerunning its completed initContainers and keeps the same emptyDir.
+k -n "$namespace" exec "$replacement_pod" -c sql -- sh -c 'kill -TERM 1'
+attempt=0
+until k -n "$namespace" get pod "$replacement_pod" -o json > "$logs/restarted-pod.json" &&
+  jq -e --arg uid "$replacement_uid" --argjson before "$restart_before" '.metadata.uid==$uid and any(.status.containerStatuses[]; .name=="sql" and .restartCount>$before and .ready==true) and ([.status.initContainerStatuses[]|select(.state.terminated.exitCode==0)]|length)==2' "$logs/restarted-pod.json" >/dev/null; do
+  attempt=$((attempt+1)); [ "$attempt" -lt 120 ] || exit 1; sleep 1
+done
+k -n "$namespace" exec "$replacement_pod" -c sql -- sha256sum /var/lib/rhiza/repair.json /var/lib/rhiza/data/prepared-adoption.json /var/lib/rhiza/data/voter-identity.json > "$logs/restart-identity-after.txt"
+cmp "$logs/restart-identity-before.txt" "$logs/restart-identity-after.txt"
+run_client query-after-restart query '{"sql":"SELECT id, value FROM bootstrap_ci"}'
+jq -e '.rows==[[1,"real-kubelet"]]' "$logs/query-after-restart.json" >/dev/null
+printf '%s\n' 'PASS: actual kubelet bootstrap, Deployment Pod replacement, same-Pod main restart preserving origin/adoption/voter identity, NoPVC and ACK readback' 'GAP: later-operation rollover main restart, isolated-process physical fencing, operator-managed Service ownership and Chaos Mesh qualification remain pending; no NetworkPolicy claim' > "$logs/result.txt"
