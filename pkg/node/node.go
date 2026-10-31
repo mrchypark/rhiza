@@ -80,6 +80,7 @@ type Node struct {
 	managedStartup            *ManagedStartupConfig
 	managedAdmitted           atomic.Bool
 	managedInitiallyAdmitted  atomic.Bool
+	managedPeerVerified       atomic.Bool
 }
 
 // nodeRecoveryPhases records the selected certified checkpoint restore path.
@@ -737,9 +738,6 @@ func (n *Node) openInternal(ctx context.Context, enroll bool, prelocked *qlog.Lo
 	// Record RPCs must be available while every replica is recovering. Public
 	// proposals and learned decisions remain gated by ready=false.
 	server := network.NewServer(core, material, n.config.ClusterID, true, transport, n.Ready)
-	if n.managedStartup != nil {
-		server.SetLearnReady(n.managedLearnReady)
-	}
 	server.SetTerminalDrain(func(ctx context.Context, expected network.TerminalDrainRequest) (any, error) {
 		return n.TerminalDrain(ctx, expected)
 	})
@@ -839,6 +837,7 @@ func (n *Node) openInternal(ctx context.Context, enroll bool, prelocked *qlog.Lo
 		// Peer ReadIndex and learned/control traffic must not depend on the
 		// application evidence CAS. This server is never returned by API/Handler.
 		peerServer = network.NewServer(core, material, n.config.ClusterID, false, transport, n.ready.Load)
+		peerServer.SetLearnReady(n.managedLearnReady)
 		peerServer.SetCompactedHandler(n.wakeCatchUp)
 		if n.checkpoints != nil {
 			peerServer.SetCheckpointPrepare(n.preparePeerCheckpoint)
@@ -2227,6 +2226,7 @@ func (n *Node) shutdown() error {
 }
 
 func (n *Node) shutdownEngine(closeBucket bool) error {
+	n.managedPeerVerified.Store(false)
 	n.managedAdmitted.Store(false)
 	n.opened.Store(false)
 	n.ready.Store(false)

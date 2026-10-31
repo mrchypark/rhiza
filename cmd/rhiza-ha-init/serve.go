@@ -142,21 +142,15 @@ func serveManaged(ctx context.Context, cfg managedsql.Config, listen string) (re
 func runManagedReplacementLoop(ctx context.Context, host *managedsql.Host, cfg managedsql.Config) {
 	ticker := time.NewTicker(2 * time.Second)
 	defer ticker.Stop()
-	admitted, last := false, ""
+	last := ""
 	for {
 		if ctx.Err() != nil {
 			return
 		}
 		attempt, cancel := context.WithTimeout(ctx, 30*time.Second)
-		stage := "initial-admission"
-		var err error
-		if !admitted {
-			err = host.Ready(attempt)
-			admitted = err == nil
-		}
-		if admitted {
-			stage, err = reconcileManagedReplacement(attempt, host, cfg)
-		}
+		// Control has its own current-voter/live-authority checks; pending SQL
+		// must not prevent resuming the exact already-closed repair.
+		stage, err := reconcileManagedReplacement(attempt, host, cfg)
 		cancel()
 		outcome := stage + ":ok"
 		if err != nil {

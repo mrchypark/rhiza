@@ -277,6 +277,7 @@ func (n *Node) OpenManaged(ctx context.Context, cfg ManagedStartupConfig) (resul
 		close(cfg.promotionReady)
 	}
 	n.managedStartup = &cfg
+	n.managedPeerVerified.Store(true)
 	return nil
 }
 

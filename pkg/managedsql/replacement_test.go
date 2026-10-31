@@ -1,8 +1,11 @@
 package managedsql
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
+	"io"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -10,6 +13,7 @@ import (
 	"reflect"
 	"slices"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -92,7 +96,22 @@ func TestReplaceVoterCoordinatesActualPreparedLearner(t *testing.T) {
 	}
 	plan.Replacement.PeerURL = "quic://" + peerAddr
 	originalTransport := writer.Kube.Client.Transport
+	var rejectFinish atomic.Bool
+	rejectFinish.Store(true)
 	writer.Kube.Client.Transport = repairGateTransport(func(request *http.Request) (*http.Response, error) {
+		if request.Method == http.MethodPut && request.Body != nil {
+			body, err := io.ReadAll(request.Body)
+			if err != nil {
+				return nil, err
+			}
+			request.Body = io.NopCloser(bytes.NewReader(body))
+			var update struct {
+				Status struct{ Repair operator.V1Alpha2RepairRecord }
+			}
+			if json.Unmarshal(body, &update) == nil && update.Status.Repair.State == "Completed" && rejectFinish.CompareAndSwap(true, false) {
+				return nil, errors.New("injected Finish failure after committed ADD")
+			}
+		}
 		response, err := originalTransport.RoundTrip(request)
 		if err != nil || !strings.Contains(request.URL.Path, "/pods/") {
 			return response, err
@@ -249,11 +268,23 @@ func TestReplaceVoterCoordinatesActualPreparedLearner(t *testing.T) {
 	}
 	select {
 	case err := <-coordination:
-		if err != nil {
-			t.Fatalf("actual managed replacement: %v", err)
+		if err == nil || rejectFinish.Load() {
+			t.Fatalf("expected injected post-ADD Finish failure: %v", err)
 		}
 	case <-ctx.Done():
 		t.Fatalf("replacement coordinator timed out: %v", ctx.Err())
+	}
+	closedAfterADD, err := operator.LoadV1Alpha2Admission(ctx, writer, configs[0].Ref)
+	if err != nil {
+		t.Fatal(err)
+	}
+	closedRecord, ok := closedAfterADD.Repair()
+	committed, snapshotErr := hosts[0].node.ManagedRepairSnapshot(ctx, "", quepaxa.PublicKey{})
+	if !ok || closedRecord.State != "Closed" || snapshotErr != nil || uint64(committed.Current.ConfigID) != plan.ExpectedConfigID+2 {
+		t.Fatalf("injection did not preserve Closed after actual ADD: state=%s config=%d err=%v", closedRecord.State, committed.Current.ConfigID, snapshotErr)
+	}
+	if err := hosts[0].ReplaceVoter(ctx, plan); err != nil {
+		t.Fatalf("resume exact committed ADD without repeating REMOVE: %v", err)
 	}
 	after, err := operator.LoadV1Alpha2Admission(ctx, writer, configs[0].Ref)
 	if err != nil {

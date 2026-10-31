@@ -35,7 +35,7 @@ type ManagedPeerLearnChecker interface {
 }
 
 func (n *Node) managedLearnReady() bool {
-	if !n.ready.Load() || !n.opened.Load() || !n.managedInitiallyAdmitted.Load() {
+	if !n.ready.Load() || !n.opened.Load() || !n.managedPeerVerified.Load() {
 		return false
 	}
 	checker, ok := n.managedStartup.Checker.(ManagedPeerLearnChecker)

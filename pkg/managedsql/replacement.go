@@ -74,13 +74,22 @@ func (h *Host) ReplaceVoter(ctx context.Context, plan operator.V1Alpha2RepairPla
 		if !closedSnapshot.SQLReservationsClosed() {
 			return fmt.Errorf("repair close did not persist the reservation gate")
 		}
+		a = closedSnapshot
 	}
-	if err := h.RemoveRepairVoter(ctx, plan.OperationID); err != nil {
-		return fmt.Errorf("remove old voter: %w", err)
-	}
-	handoff, err := h.CaptureRepairHandoff(ctx, plan.OperationID)
-	if err != nil {
-		return fmt.Errorf("capture post-REMOVE handoff: %w", err)
+	var handoff operator.V1Alpha2RepairHandoff
+	existing, ok := a.Repair()
+	if ok && existing.PreparedHandoff != nil {
+		// ADD may already be committed while its completion CAS is still Closed.
+		// Resume the exact typed ADD and terminal proof, never repeat REMOVE.
+		handoff = *existing.PreparedHandoff
+	} else {
+		if err := h.RemoveRepairVoter(ctx, plan.OperationID); err != nil {
+			return fmt.Errorf("remove old voter: %w", err)
+		}
+		handoff, err = h.CaptureRepairHandoff(ctx, plan.OperationID)
+		if err != nil {
+			return fmt.Errorf("capture post-REMOVE handoff: %w", err)
+		}
 	}
 	learnerIdentity, err := h.waitRegisteredRepairLearner(ctx, plan.Replacement.NodeID, plan.Replacement.PublicKey)
 	if err != nil {
