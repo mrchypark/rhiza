@@ -291,6 +291,10 @@ func (h *Host) ValidateManagedStartup(ctx context.Context, i node.ManagedStartup
 			return err
 		}
 		r, ok := a.Repair()
+		if !ok && len(h.cfg.RepairOrigin) == 0 {
+			// Trusted prepared startup is also used outside managed replacement.
+			return nil
+		}
 		if !ok || r.PreparedHandoff == nil || r.Plan.Replacement.PodUID != h.cfg.PodUID || r.Plan.Replacement.NodeID != h.cfg.Runtime.NodeID || r.Plan.Replacement.PublicKey != h.cfg.Runtime.Learner.PublicKey || r.Plan.Replacement.PeerURL != h.cfg.Runtime.Learner.PeerURL || r.PreparedHandoff.PhysicalBinding != i.PhysicalBinding || r.PreparedHandoff.SourceRoot != h.cfg.StorageRoot || r.PreparedHandoff.SourcePrefix != path.Join(h.cfg.Runtime.ObjStorePrefix, string(h.cfg.Runtime.ClusterID)) || !bytes.Equal(r.PreparedHandoff.Head, h.cfg.Prepared.View().CapturedHead()) || (r.State != "Closed" && r.State != "Completed") {
 			return fmt.Errorf("prepared learner lacks exact live repair handoff")
 		}
