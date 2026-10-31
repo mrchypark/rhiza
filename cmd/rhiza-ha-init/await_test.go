@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -11,6 +12,8 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"reflect"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
@@ -19,9 +22,19 @@ import (
 	"github.com/mrchypark/rhiza"
 	"github.com/mrchypark/rhiza/internal/types"
 	"github.com/mrchypark/rhiza/pkg/managedsql"
+	nodepkg "github.com/mrchypark/rhiza/pkg/node"
 	"github.com/mrchypark/rhiza/pkg/operator"
 	"github.com/mrchypark/rhiza/pkg/quepaxa"
 )
+
+func mustRepairJSON(t *testing.T, value any) []byte {
+	t.Helper()
+	data, err := json.Marshal(value)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return data
+}
 
 func TestAwaitCommittedPlanAndLiveGuards(t *testing.T) {
 	ref := operator.V1Alpha2ClusterRef{Name: "cluster", Namespace: "ns", UID: "uid"}
@@ -46,6 +59,14 @@ func TestAwaitCommittedPlanAndLiveGuards(t *testing.T) {
 		m := quepaxa.Member{ID: id, PeerURL: fmt.Sprintf("quic://127.0.0.%d:1234", i), PublicKey: key}
 		members = append(members, m)
 		plan.Members = append(plan.Members, operator.V1Alpha2BootstrapMember{PodUID: pod, Member: m})
+	}
+	namespace, err := nodepkg.ManagedNamespaceFor("root", ref.UID, 0, "assignment", string(cluster))
+	if err != nil {
+		t.Fatal(err)
+	}
+	plan.PhysicalBinding, err = types.ManagedStorageBinding(types.ExecutionConfig{ClusterID: cluster, ObjStorePrefix: namespace.ConfigPrefix})
+	if err != nil {
+		t.Fatal(err)
 	}
 	digest, err := types.ManagedBootstrapPlanDigest(string(cluster), members, plan.PhysicalBinding, plan.EvidenceFormat, plan.Durability, false)
 	if err != nil {
@@ -127,6 +148,7 @@ func TestAwaitCommittedPlanAndLiveGuards(t *testing.T) {
 	if _, err := managedConfig(context.Background(), k, ref, "pod-name", "pod-1", identity, output, profile); err == nil {
 		t.Fatal("mismatched evidence profile accepted")
 	}
+	profile.EvidenceFormat = managedsql.EvidenceFormat
 	var advanced map[string]any
 	if err := json.Unmarshal(clusterJSON, &advanced); err != nil {
 		t.Fatal(err)
@@ -154,6 +176,135 @@ func TestAwaitCommittedPlanAndLiveGuards(t *testing.T) {
 	if _, err := os.Stat(replacementOutput); !errors.Is(err, os.ErrNotExist) {
 		t.Fatal("replacement received handoff")
 	}
+	t.Run("repair captured gate", func(t *testing.T) {
+		oldPod, oldCluster := pod, bytes.Clone(clusterJSON)
+		defer func() { pod, clusterJSON = oldPod, oldCluster }()
+		replacementIdentity := filepath.Join(dir, "replacement-identity")
+		replacementID, _ := types.ManagedNodeID("replacement-uid")
+		replacementToken, err := prepareIdentityFile(replacementIdentity, string(cluster), string(replacementID))
+		if err != nil {
+			t.Fatal(err)
+		}
+		key := rhiza.PeerPublicKey(string(cluster), string(replacementID), replacementToken)
+		report, _ := json.Marshal(map[string]any{"version": 1, "publicKey": key})
+		var livePod map[string]any
+		_ = json.Unmarshal([]byte(pod), &livePod)
+		livePod["metadata"].(map[string]any)["uid"] = "replacement-uid"
+		livePod["status"].(map[string]any)["initContainerStatuses"] = []any{map[string]any{"name": operator.V1Alpha2PrepareIdentityContainer, "state": map[string]any{"terminated": map[string]any{"exitCode": 0, "message": string(report)}}}}
+		pod = string(mustRepairJSON(t, livePod))
+		a, err := operator.LoadV1Alpha2Admission(context.Background(), store, ref)
+		if err != nil {
+			t.Fatal(err)
+		}
+		intent := operator.V1Alpha2RepairPlan{OperationID: "repair-gate", ClusterUID: ref.UID, Generation: 0, DeploymentUID: assignment.DeploymentUID, StorageID: assignment.StorageID, ExpectedConfigID: 1, OldNodeID: members[0].ID, OldWALIdentity: "trusted-runtime-registered-wal", Replacement: operator.V1Alpha2RepairMember{PodName: "pod-name", PodUID: "replacement-uid", NodeID: replacementID, PublicKey: key, PeerURL: "quic://127.0.0.1:1234"}, BootstrapPlanDigest: assignment.BootstrapPlanDigest, FinalVoterIDs: []types.NodeID{members[1].ID, members[2].ID, replacementID}}
+		slices.Sort(intent.FinalVoterIDs)
+		closed, _, err := operator.BeginV1Alpha2Repair(context.Background(), store, a, a.Authority(), intent)
+		if err != nil {
+			t.Fatal(err)
+		}
+		// Gate fixture only: these bytes are not presented as a certificate.
+		head := []byte("gate-only-fixture")
+		namespace, err := nodepkg.ManagedNamespaceFor("root", ref.UID, 0, assignment.AssignmentID, string(cluster))
+		if err != nil {
+			t.Fatal(err)
+		}
+		capture := operator.V1Alpha2RepairHandoff{PlanDigest: intent.Digest(), SourceRoot: "root", SourcePrefix: namespace.FinalPrefix, PhysicalBinding: assignment.PhysicalBinding, Head: head, HeadHash: fmt.Sprintf("%x", sha256.Sum256(head)), RemoveTerminalSlot: 17, RemoveTerminalHash: strings.Repeat("b", 64), Survivors: quepaxa.Cluster{ConfigID: 2, Members: members[1:]}}
+		if _, _, err := operator.CaptureV1Alpha2RepairHandoff(context.Background(), store, closed, closed.Authority(), capture); err != nil {
+			t.Fatal(err)
+		}
+		bootstrapOutput, repairOutput := filepath.Join(dir, "original-bootstrap.json"), filepath.Join(dir, "repair.json")
+		if err := awaitBootstrapWithRepair(context.Background(), k, ref, 0, "pod-name", "replacement-uid", replacementIdentity, bootstrapOutput, repairOutput); err != nil {
+			t.Fatal(err)
+		}
+		var original operator.V1Alpha2BootstrapPlan
+		if err := readGateFile(bootstrapOutput, &original, 65536, false); err != nil || !reflect.DeepEqual(original, plan) {
+			t.Fatal("repair mutated original bootstrap plan")
+		}
+		var saved repairGateFile
+		if err := readGateFile(repairOutput, &saved, repairFileLimit, true); err != nil || saved.Repair.Plan.OperationID != intent.OperationID {
+			t.Fatalf("repair handoff: %v", err)
+		}
+		data, _ := os.ReadFile(repairOutput)
+		if bytes.Contains(data, []byte(replacementToken)) {
+			t.Fatal("repair file exposed private token")
+		}
+		if saved.Binding.PodUID != "replacement-uid" || saved.Binding.ReplicaSetUID == "" || saved.Binding.PodIP != "127.0.0.1" {
+			t.Fatal("origin omitted live owner-chain binding")
+		}
+		// This HTTP gate fixture establishes no consensus proof. A later valid
+		// status shape must not retarget D's local origin to the E replacement.
+		beforeRollover := bytes.Clone(clusterJSON)
+		later := saved.Repair
+		later.Plan.OperationID = "later-repair-E"
+		later.Plan.ExpectedConfigID = 3
+		later.Plan.OldNodeID = members[1].ID
+		later.Plan.Replacement.PodUID = "later-E"
+		later.Plan.Replacement.PodName = "later-e"
+		later.Plan.Replacement.NodeID, _ = types.ManagedNodeID("later-E")
+		later.Plan.Replacement.PublicKey = rhiza.PeerPublicKey(string(cluster), string(later.Plan.Replacement.NodeID), "separate-E-key")
+		later.Plan.FinalVoterIDs = []types.NodeID{members[2].ID, replacementID, later.Plan.Replacement.NodeID}
+		slices.Sort(later.Plan.FinalVoterIDs)
+		later.PreparedHandoff = nil
+		var rollover map[string]any
+		if err := json.Unmarshal(clusterJSON, &rollover); err != nil {
+			t.Fatal(err)
+		}
+		rollover["status"].(map[string]any)["repair"] = later
+		clusterJSON = mustRepairJSON(t, rollover)
+		if _, err := checkSavedRepairGate(context.Background(), k, ref, 0, "pod-name", "replacement-uid", replacementIdentity, saved); err != nil {
+			t.Fatalf("historical D origin rejected after E rollover: %v", err)
+		}
+		liveE, err := operator.LoadV1Alpha2Admission(context.Background(), store, ref)
+		if err != nil || !liveE.SQLReservationsClosed() {
+			t.Fatalf("historical gate reopened E SQL reservations: %v", err)
+		}
+		wrongBinding := saved
+		wrongBinding.Binding.ReplicaSetUID = "foreign"
+		if _, err := checkSavedRepairGate(context.Background(), k, ref, 0, "pod-name", "replacement-uid", replacementIdentity, wrongBinding); err == nil {
+			t.Fatal("historical origin ignored owner-chain change")
+		}
+		if err := awaitBootstrapWithRepair(context.Background(), k, ref, 0, "pod-name", "replacement-uid", replacementIdentity, bootstrapOutput, repairOutput); err != nil {
+			t.Fatal(err)
+		}
+		afterRollover, _ := os.ReadFile(repairOutput)
+		if !bytes.Equal(data, afterRollover) {
+			t.Fatal("later repair replaced immutable origin")
+		}
+		var afterBootstrap operator.V1Alpha2BootstrapPlan
+		if err := readGateFile(bootstrapOutput, &afterBootstrap, 65536, false); err != nil || !reflect.DeepEqual(afterBootstrap, original) {
+			t.Fatal("historical await rewrote bootstrap")
+		}
+		if _, _, err := managedRepairConfig(context.Background(), k, ref, "pod-name", "replacement-uid", replacementIdentity, bootstrapOutput, repairOutput, profile); err == nil || !strings.Contains(err.Error(), "historical repair requires existing adoption and WAL") {
+			t.Fatalf("historical origin without adoption did not fail at no-backfill boundary: %v", err)
+		}
+		if _, err := checkSavedRepairGate(context.Background(), k, ref, 0, "pod-name", "new-uid", replacementIdentity, saved); err == nil {
+			t.Fatal("historical origin authorized new Pod UID")
+		}
+		clusterJSON = beforeRollover
+		if _, err := checkGate(context.Background(), k, ref, 0, "pod-name", "replacement-uid", replacementIdentity); !errors.Is(err, errLearnerAdmissionPending) {
+			t.Fatal("replacement became an original bootstrap member")
+		}
+		saved.Repair.PreparedHandoff.Head[0] ^= 1
+		if err := writeGateFile(replacementIdentity, repairOutput, saved); err != nil {
+			t.Fatal(err)
+		}
+		if _, cleanup, err := managedRepairConfig(context.Background(), k, ref, "pod-name", "replacement-uid", replacementIdentity, bootstrapOutput, repairOutput, profile); err == nil {
+			_ = cleanup()
+			t.Fatal("tampered repair bytes accepted")
+		}
+		corruptBytes, _ := os.ReadFile(repairOutput)
+		if err := awaitBootstrapWithRepair(context.Background(), k, ref, 0, "pod-name", "replacement-uid", replacementIdentity, bootstrapOutput, repairOutput); err == nil {
+			t.Fatal("await accepted corrupted existing origin")
+		}
+		preserved, _ := os.ReadFile(repairOutput)
+		if !bytes.Equal(corruptBytes, preserved) {
+			t.Fatal("await repaired or replaced corrupted origin")
+		}
+		pod = strings.Replace(pod, `"uid":"replacement-uid"`, `"uid":"foreign"`, 1)
+		if _, _, err := checkRepairGate(context.Background(), k, ref, 0, "pod-name", "replacement-uid", replacementIdentity, false); err == nil {
+			t.Fatal("repair gate accepted foreign live Pod")
+		}
+	})
 	for _, tc := range []struct {
 		name   string
 		mutate func()

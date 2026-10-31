@@ -89,7 +89,9 @@ rules:
     verbs: [get, update]
   - apiGroups: [""]
     resources: [pods]
-    verbs: [get]
+    # Namespace-wide metadata discovery is trusted here; label selection is
+    # not an RBAC restriction. No Pod or Secret mutation is granted.
+    verbs: [get, list]
   - apiGroups: [apps]
     resources: [replicasets, deployments]
     verbs: [get]

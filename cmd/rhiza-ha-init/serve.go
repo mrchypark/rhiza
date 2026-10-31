@@ -8,11 +8,13 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"net"
 	"net/http"
 	"net/url"
 	"os"
 	"reflect"
+	"strconv"
 	"strings"
 	"time"
 
@@ -43,6 +45,11 @@ func managedConfig(ctx context.Context, kube *operator.Kubernetes, ref operator.
 	if d.Decode(&handoff) != nil || d.Decode(new(any)) != io.EOF || !reflect.DeepEqual(handoff, plan) {
 		return result, errors.New("public handoff differs from live plan")
 	}
+	return managedRuntimeConfig(ctx, kube, ref, podUID, identityPath, profile, plan)
+}
+
+func managedRuntimeConfig(ctx context.Context, kube *operator.Kubernetes, ref operator.V1Alpha2ClusterRef, podUID, identityPath string, profile operator.V1Alpha2RuntimeProfile, plan operator.V1Alpha2BootstrapPlan) (managedsql.Config, error) {
+	var result managedsql.Config
 	store := &operator.V1Alpha2StatusStore{Kube: kube}
 	init, err := operator.LoadV1Alpha2ApplicationInit(ctx, store, ref)
 	if err != nil {
@@ -116,6 +123,9 @@ func serveManaged(ctx context.Context, cfg managedsql.Config, listen string) (re
 	server := &http.Server{Handler: handler, ReadHeaderTimeout: 5 * time.Second, ReadTimeout: 30 * time.Second, WriteTimeout: 60 * time.Second}
 	serveCtx, cancelServe := context.WithCancel(ctx)
 	defer cancelServe()
+	repairDone := make(chan struct{})
+	go func() { defer close(repairDone); runManagedReplacementLoop(serveCtx, host, cfg) }()
+	defer func() { cancelServe(); <-repairDone }()
 	go func() {
 		<-serveCtx.Done()
 		shutdown, cancel := context.WithTimeout(context.Background(), 10*time.Second)
@@ -127,6 +137,89 @@ func serveManaged(ctx context.Context, cfg managedsql.Config, listen string) (re
 		return nil
 	}
 	return err
+}
+
+func runManagedReplacementLoop(ctx context.Context, host *managedsql.Host, cfg managedsql.Config) {
+	ticker := time.NewTicker(2 * time.Second)
+	defer ticker.Stop()
+	admitted, last := false, ""
+	for {
+		if ctx.Err() != nil {
+			return
+		}
+		attempt, cancel := context.WithTimeout(ctx, 30*time.Second)
+		stage := "initial-admission"
+		var err error
+		if !admitted {
+			err = host.Ready(attempt)
+			admitted = err == nil
+		}
+		if admitted {
+			stage, err = reconcileManagedReplacement(attempt, host, cfg)
+		}
+		cancel()
+		outcome := stage + ":ok"
+		if err != nil {
+			outcome = fmt.Sprintf("%s:%T", stage, err)
+		}
+		if outcome != last && ctx.Err() == nil {
+			// Only fixed stage/error type is logged, never SDK/profile contents.
+			log.Printf("managed replacement %s", outcome)
+			last = outcome
+		}
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+		}
+	}
+}
+
+func reconcileManagedReplacement(ctx context.Context, host *managedsql.Host, cfg managedsql.Config) (string, error) {
+	a, err := operator.LoadV1Alpha2Admission(ctx, cfg.Store, cfg.Ref)
+	if err != nil {
+		return "authority", err
+	}
+	if r, ok := a.Repair(); ok && r.State == "Closed" {
+		plan, err := host.PlanVoterReplacement(ctx, operator.V1Alpha2RepairPodRequest{}, nil)
+		if err != nil {
+			return "closed-candidate-blocked", err
+		}
+		stage := "closed-remove"
+		if r.PreparedHandoff != nil {
+			stage = "closed-learner-add"
+		}
+		return stage, host.ReplaceVoter(ctx, *plan)
+	}
+	_, port, err := net.SplitHostPort(cfg.Runtime.PeerAddr)
+	if err != nil {
+		return "discovery", err
+	}
+	peerPort, err := strconv.Atoi(port)
+	if err != nil {
+		return "discovery", err
+	}
+	pods, err := operator.ObserveV1Alpha2ManagedPods(ctx, cfg.Store, cfg.Ref, peerPort)
+	if err != nil {
+		return "discovery", err
+	}
+	present := make([]types.NodeID, 0, len(pods))
+	for _, pod := range pods {
+		present = append(present, pod.Member.NodeID)
+	}
+	for _, pod := range pods {
+		if !pod.Candidate {
+			continue
+		}
+		plan, err := host.PlanVoterReplacement(ctx, pod.Member, present)
+		if err != nil {
+			return "plan", err
+		}
+		if plan != nil {
+			return "replace", host.ReplaceVoter(ctx, *plan)
+		}
+	}
+	return "idle", nil
 }
 
 func checkReady(ctx context.Context, client *http.Client, endpoint, token string) error {

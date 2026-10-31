@@ -10,6 +10,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strconv"
 	"time"
 
@@ -47,6 +48,10 @@ func gateController(m gateMeta, api, kind string) (gateOwner, error) {
 }
 
 func checkGate(ctx context.Context, kube *operator.Kubernetes, ref operator.V1Alpha2ClusterRef, generation int64, podName, podUID, identityPath string) (operator.V1Alpha2BootstrapPlan, error) {
+	return checkGateMember(ctx, kube, ref, generation, podName, podUID, identityPath, nil)
+}
+
+func checkGateMember(ctx context.Context, kube *operator.Kubernetes, ref operator.V1Alpha2ClusterRef, generation int64, podName, podUID, identityPath string, replacement *operator.V1Alpha2BootstrapMember) (operator.V1Alpha2BootstrapPlan, error) {
 	var empty operator.V1Alpha2BootstrapPlan
 	cluster, err := types.ManagedClusterID(ref.UID, generation)
 	if err != nil {
@@ -85,6 +90,9 @@ func checkGate(ctx context.Context, kube *operator.Kubernetes, ref operator.V1Al
 			entry = &plan.Members[i]
 			break
 		}
+	}
+	if entry == nil && replacement != nil && replacement.PodUID == podUID {
+		entry = replacement
 	}
 	if entry == nil {
 		return empty, errLearnerAdmissionPending
@@ -151,38 +159,47 @@ func checkGate(ctx context.Context, kube *operator.Kubernetes, ref operator.V1Al
 }
 
 func awaitBootstrap(ctx context.Context, kube *operator.Kubernetes, ref operator.V1Alpha2ClusterRef, generation int64, podName, podUID, identityPath, output string) error {
+	return awaitBootstrapWithRepair(ctx, kube, ref, generation, podName, podUID, identityPath, output, filepath.Join(filepath.Dir(output), "repair.json"))
+}
+
+func awaitBootstrapWithRepair(ctx context.Context, kube *operator.Kubernetes, ref operator.V1Alpha2ClusterRef, generation int64, podName, podUID, identityPath, output, repairOutput string) error {
+	if _, err := os.Lstat(repairOutput); err == nil {
+		var saved repairGateFile
+		if err := readGateFile(repairOutput, &saved, repairFileLimit, true); err != nil {
+			return err
+		}
+		plan, err := checkSavedRepairGate(ctx, kube, ref, generation, podName, podUID, identityPath, saved)
+		if err != nil {
+			return err
+		}
+		var original operator.V1Alpha2BootstrapPlan
+		if err := readGateFile(output, &original, 65536, false); err != nil || !reflect.DeepEqual(original, plan) {
+			return errors.New("original bootstrap handoff missing or changed")
+		}
+		return nil
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return err
+	}
 	for {
 		plan, err := checkGate(ctx, kube, ref, generation, podName, podUID, identityPath)
-		if err == nil {
-			if err := validateHandoffPath(identityPath, output); err != nil {
-				return err
-			}
-			data, err := json.Marshal(plan)
-			if err != nil {
-				return err
-			}
-			f, err := os.CreateTemp(filepath.Dir(output), ".bootstrap-*")
-			if err != nil {
-				return err
-			}
-			tmp := f.Name()
-			defer os.Remove(tmp)
-			_, err = f.Write(data)
+		if errors.Is(err, errLearnerAdmissionPending) {
+			var repair repairGateFile
+			plan, repair, err = checkRepairGate(ctx, kube, ref, generation, podName, podUID, identityPath, false)
 			if err == nil {
-				err = f.Sync()
+				if filepath.Clean(output) == filepath.Clean(repairOutput) {
+					return errors.New("distinct bootstrap and repair handoffs required")
+				}
+				if err := writeImmutableGateFile(identityPath, output, plan); err != nil {
+					return err
+				}
+				if err := validateHandoffPath(output, repairOutput); err != nil {
+					return err
+				}
+				return writeImmutableRepairFile(identityPath, repairOutput, repair)
 			}
-			err = errors.Join(err, f.Close())
-			if err != nil {
-				return err
-			}
-			if err := os.Rename(tmp, output); err != nil {
-				return err
-			}
-			d, err := os.Open(filepath.Dir(output))
-			if err != nil {
-				return err
-			}
-			return errors.Join(d.Sync(), d.Close())
+		}
+		if err == nil {
+			return writeGateFile(identityPath, output, plan)
 		}
 		if !errors.Is(err, errBootstrapPending) && !errors.Is(err, errLearnerAdmissionPending) {
 			return err

@@ -111,6 +111,9 @@ k -n "$namespace" create serviceaccount operator
 k -n "$namespace" create serviceaccount rhiza-managed-host
 k -n "$namespace" create role runtime-read --verb=get --resource=rhizaclusters,pods,replicasets,deployments
 k -n "$namespace" create rolebinding runtime-read --role=runtime-read --serviceaccount="$namespace:rhiza-managed-host"
+# Pod LIST is namespace-scoped discovery, not field/label-scoped RBAC.
+k -n "$namespace" create role runtime-pod-discovery --verb=list --resource=pods
+k -n "$namespace" create rolebinding runtime-pod-discovery --role=runtime-pod-discovery --serviceaccount="$namespace:rhiza-managed-host"
 k -n "$namespace" create role runtime-status --verb=get,update --resource=rhizaclusters/status --resource-name=sql
 k -n "$namespace" create rolebinding runtime-status --role=runtime-status --serviceaccount="$namespace:rhiza-managed-host"
 k -n "$namespace" create role managed-host-account-read --verb=get --resource=serviceaccounts --resource-name=rhiza-managed-host
@@ -162,4 +165,21 @@ k -n "$namespace" get rhizacluster sql -o json > "$logs/after-sql.json"
 jq -S '.status|{bootstrapPlan,genesis,plan:.applicationInit.plan}' "$logs/committed.json" > "$logs/immutable-before.json"
 jq -S '.status|{bootstrapPlan,genesis,plan:.applicationInit.plan}' "$logs/after-sql.json" > "$logs/immutable-after.json"
 cmp "$logs/immutable-before.json" "$logs/immutable-after.json"
-printf '%s\n' 'PASS: actual kubelet three-Pod initial bootstrap and authenticated in-cluster SQL via test-owned Service DNS/ClusterIP' 'GAP: operator-managed Service ownership, replacement learner pipeline and Chaos Mesh recovery qualification remain pending; no NetworkPolicy claim' > "$logs/result.txt"
+# Graceful deletion exercises Deployment replacement, not proof that an isolated
+# process or outstanding object-store request has physically terminated.
+old_pod=$(jq -r '.items|sort_by(.metadata.name)|.[0].metadata.name' "$logs/ready-pods.json")
+old_uid=$(jq -r --arg name "$old_pod" '.items[]|select(.metadata.name==$name)|.metadata.uid' "$logs/ready-pods.json")
+k -n "$namespace" delete pod "$old_pod" --wait=true --timeout=90s
+attempt=0
+until k -n "$namespace" get rhizacluster sql -o json > "$logs/replacement-status.json" &&
+  jq -e --arg old "$old_uid" '.status.repair.state=="Completed" and .status.repair.plan.replacement.podUID!=$old' "$logs/replacement-status.json" >/dev/null; do
+  attempt=$((attempt+1)); [ "$attempt" -lt 180 ] || exit 1; sleep 1
+done
+k -n "$namespace" wait --for=condition=Ready pod -l "$selector" --timeout=180s
+k -n "$namespace" get pods -l "$selector" -o json > "$logs/replacement-pods.json"
+jq -e --arg old "$old_uid" '.items|length==3 and all(.[]; .metadata.uid!=$old and ([.status.initContainerStatuses[]?|select(.state.terminated.exitCode==0)]|length)==2 and all(.spec.volumes[]?; has("persistentVolumeClaim")|not))' "$logs/replacement-pods.json" >/dev/null
+run_client query-after-replacement query '{"sql":"SELECT id, value FROM bootstrap_ci"}'
+jq -e '.rows==[[1,"real-kubelet"]]' "$logs/query-after-replacement.json" >/dev/null
+jq -S '.status|{bootstrapPlan,genesis,plan:.applicationInit.plan}' "$logs/replacement-status.json" > "$logs/immutable-replacement.json"
+cmp "$logs/immutable-before.json" "$logs/immutable-replacement.json"
+printf '%s\n' 'PASS: actual kubelet initial bootstrap, graceful Deployment Pod replacement with completed certified repair, two initContainers, NoPVC and ACK readback' 'GAP: isolated-process physical fencing, operator-managed Service ownership, same-Pod historical restart and Chaos Mesh qualification remain pending; no NetworkPolicy claim' > "$logs/result.txt"

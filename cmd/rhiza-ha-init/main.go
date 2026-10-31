@@ -95,6 +95,7 @@ func runServe(args []string) error {
 	listen := flags.String("listen", "127.0.0.1:8080", "")
 	identity := flags.String("identity-file", operator.V1Alpha2BootstrapIdentityPath, "")
 	handoff := flags.String("handoff-file", operator.V1Alpha2BootstrapHandoffPath, "")
+	repairHandoff := flags.String("repair-handoff-file", repairHandoffPath, "")
 	if err := flags.Parse(args); err != nil || flags.NArg() != 0 {
 		return errors.New("invalid serve-managed-sql arguments")
 	}
@@ -122,10 +123,14 @@ func runServe(args []string) error {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 	cfg, err := managedConfig(ctx, kube, ref, pod, podUID, *identity, *handoff, profile)
+	cleanup := func() error { return nil }
+	if errors.Is(err, errLearnerAdmissionPending) {
+		cfg, cleanup, err = managedRepairConfig(ctx, kube, ref, pod, podUID, *identity, *handoff, *repairHandoff, profile)
+	}
 	if err != nil {
 		return err
 	}
-	return serveManaged(ctx, cfg, *listen)
+	return errors.Join(serveManaged(ctx, cfg, *listen), cleanup())
 }
 
 func runCheckReady(args []string) error {
@@ -161,6 +166,7 @@ func runAwait(args []string) error {
 	pod := flags.String("pod-name", os.Getenv("POD_NAME"), "")
 	identity := flags.String("identity-file", "/var/lib/rhiza/identity.json", "")
 	output := flags.String("handoff-file", "/var/lib/rhiza/bootstrap.json", "")
+	repairOutput := flags.String("repair-handoff-file", repairHandoffPath, "")
 	if err := flags.Parse(args); err != nil || flags.NArg() != 0 || *ns == "" || *name == "" || *pod == "" || *identity == "" || *output == "" || filepath.Clean(*identity) == filepath.Clean(*output) {
 		return errors.New("invalid await-bootstrap-plan arguments")
 	}
@@ -170,7 +176,7 @@ func runAwait(args []string) error {
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Minute)
 	defer cancel()
-	return awaitBootstrap(ctx, kube, operator.V1Alpha2ClusterRef{Name: *name, Namespace: *ns, UID: *uid}, *generation, *pod, *podUID, *identity, *output)
+	return awaitBootstrapWithRepair(ctx, kube, operator.V1Alpha2ClusterRef{Name: *name, Namespace: *ns, UID: *uid}, *generation, *pod, *podUID, *identity, *output, *repairOutput)
 }
 
 func main() {
