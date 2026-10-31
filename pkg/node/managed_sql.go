@@ -36,8 +36,12 @@ type ManagedPeerLearnChecker interface {
 }
 
 func (n *Node) managedLearnReady() bool {
-	if !n.ready.Load() || !n.opened.Load() || !n.managedPeerVerified.Load() {
-		log.Printf("managed QUIC Learned refused stage=runtime ready=%t opened=%t verified=%t", n.ready.Load(), n.opened.Load(), n.managedPeerVerified.Load())
+	// Client catch-up readiness is separate from accepting a certified peer
+	// decision: the latter can be needed to resolve a recorded slot. Keep the
+	// verified managed runtime and live authority gates, while ordinary client
+	// traffic remains gated by n.ready and the admission checks.
+	if !n.opened.Load() || !n.managedPeerVerified.Load() {
+		log.Printf("managed QUIC Learned refused stage=runtime opened=%t verified=%t", n.opened.Load(), n.managedPeerVerified.Load())
 		return false
 	}
 	checker, ok := n.managedStartup.Checker.(ManagedPeerLearnChecker)
