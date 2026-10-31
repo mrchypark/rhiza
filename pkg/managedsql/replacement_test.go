@@ -163,6 +163,32 @@ func TestReplaceVoterCoordinatesActualPreparedLearner(t *testing.T) {
 	if err != nil || !hasPending || !hasSQL {
 		t.Fatalf("fixture pending request: %v", err)
 	}
+	beforeRestart, err := hosts[0].node.ManagedState()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := hosts[0].Close(); err != nil {
+		t.Fatal(err)
+	}
+	cold, err := Open(ctx, configs[0])
+	if cold != nil {
+		t.Cleanup(func() {
+			if err := cold.Close(); err != nil {
+				t.Error(err)
+			}
+		})
+	}
+	if err != nil {
+		t.Fatalf("cold survivor with original pending SQL: %v", err)
+	}
+	hosts[0] = cold
+	afterRestart, err := cold.node.ManagedState()
+	if err != nil || afterRestart.WALIdentity != beforeRestart.WALIdentity {
+		t.Fatalf("cold restart changed voter WAL identity: %v", err)
+	}
+	if err := cold.Ready(ctx); err == nil {
+		t.Fatal("cold pending survivor admitted new SQL before recovery")
+	}
 
 	coordination := make(chan error, 1)
 	go func() { coordination <- hosts[0].ReplaceVoter(ctx, plan) }()

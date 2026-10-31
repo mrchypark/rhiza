@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log"
 	"path"
 	"slices"
 	"time"
@@ -36,6 +37,7 @@ type ManagedPeerLearnChecker interface {
 
 func (n *Node) managedLearnReady() bool {
 	if !n.ready.Load() || !n.opened.Load() || !n.managedPeerVerified.Load() {
+		log.Printf("managed QUIC Learned refused stage=runtime ready=%t opened=%t verified=%t", n.ready.Load(), n.opened.Load(), n.managedPeerVerified.Load())
 		return false
 	}
 	checker, ok := n.managedStartup.Checker.(ManagedPeerLearnChecker)
@@ -44,7 +46,11 @@ func (n *Node) managedLearnReady() bool {
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	return checker.ValidateManagedPeerLearn(ctx, n.managedStartup.Identity) == nil
+	if err := checker.ValidateManagedPeerLearn(ctx, n.managedStartup.Identity); err != nil {
+		log.Printf("managed QUIC Learned refused stage=live-authority error_type=%T", err)
+		return false
+	}
+	return true
 }
 
 func (n *Node) CheckManagedLocalRead(ctx context.Context) error {

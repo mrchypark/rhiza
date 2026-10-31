@@ -41,6 +41,7 @@ jobs:
           go test -race ./pkg/quepaxa -run '^Test(ReadOnlyObserverWithReconfigurationNeverWritesMarker|RestoreCheckpointCompactsMarkerForReadOnlyObserver|WritableCoreRolesInstallReconfigurationMarkerOnce|ReconfigurationMarkerInstallPropagatesAppendAndSyncErrors|OpenLocalReadOnlyInspectionRequiresReadOnlyLocalWAL|LocalReadOnlyInspectionPreservesNormalAndCheckpointWALs)$' -count=1 -timeout=60s
           go test -race ./pkg/network -run '^TestResolveExecute' -count=1 -timeout=60s
           go test -race ./pkg/network -run '^TestRemovedPeerCannotReuseLiveQUICOrReturnAfterReplay$' -count=1 -timeout=60s
+          go test -race ./pkg/network -run '^TestActualRecordedProposalLearnsCertificateBeforeSQLReadiness$' -count=1 -timeout=60s
           go test -race ./pkg/network -run '^TestCatchUp(TipAdvanceDoesNotFetchBeyondThrough|TipSnapshotStillRejectsMissingDecision|SameSourceMixedDurability|DurablePromotesAlreadyHintedPrefix|CanceledOwnerDoesNotCancelWaiter|DifferentSourceProgresses|ControlPageIsDurableEvenAsHint)$' -count=1 -timeout=60s
           go test -race ./pkg/materializer -run '^TestSQLApplicationEvidence' -count=1 -timeout=60s
           go test -race . -run '^TestPreparedNode(RegistrationRequestScope|EmulatorAuthScope|ProviderAuthorityHistory)$' -count=1 -timeout=60s
