@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"path"
 	"slices"
+	"time"
 
 	objectstore "github.com/mrchypark/rhiza/internal/objstore"
 	"github.com/mrchypark/rhiza/internal/types"
@@ -27,6 +28,23 @@ type ManagedSQLWriteChecker interface {
 // round or the active-write reservation exception.
 type ManagedSQLReadChecker interface {
 	ValidateManagedSQLRead(context.Context, ManagedStartupIdentity, ManagedRuntimeState) error
+}
+
+type ManagedPeerLearnChecker interface {
+	ValidateManagedPeerLearn(context.Context, ManagedStartupIdentity) error
+}
+
+func (n *Node) managedLearnReady() bool {
+	if !n.ready.Load() || !n.opened.Load() || !n.managedInitiallyAdmitted.Load() {
+		return false
+	}
+	checker, ok := n.managedStartup.Checker.(ManagedPeerLearnChecker)
+	if !ok {
+		return n.Ready()
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	return checker.ValidateManagedPeerLearn(ctx, n.managedStartup.Identity) == nil
 }
 
 func (n *Node) CheckManagedLocalRead(ctx context.Context) error {

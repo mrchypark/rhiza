@@ -397,7 +397,7 @@ func (s *PeerServer) handle(ctx context.Context, certificateKey ed25519.PublicKe
 		}
 		return &peerfb.ResponseT{Summary: summaryToWire(summary)}, nil
 	case peerfb.OperationLearned:
-		if !s.server.Ready() {
+		if !s.server.readyToLearn() {
 			return nil, ErrNotReady
 		}
 		decision, err := decisionFromWire(request.Decision)

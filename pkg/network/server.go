@@ -76,6 +76,7 @@ type Server struct {
 	cluster              types.ClusterID
 	mux                  *http.ServeMux
 	ready                func() bool
+	learnReady           func() bool
 	writable             bool
 	sqlBatcher           *mutationBatcher[types.SQLCommand]
 	graphBatcher         *mutationBatcher[types.GraphCommand]
@@ -366,6 +367,17 @@ func (s *Server) FailLocalLifecycle(err error) {
 }
 
 // Ready reports root readiness, including a sticky Local lifecycle failure.
+// SetLearnReady separates certified decision delivery from new client admission.
+// Install it before publishing the peer listener; absent means Ready as before.
+func (s *Server) SetLearnReady(ready func() bool) { s.learnReady = ready }
+
+func (s *Server) readyToLearn() bool {
+	if s.learnReady != nil {
+		return s.learnReady()
+	}
+	return s.Ready()
+}
+
 func (s *Server) Ready() bool {
 	if s.ready == nil || !s.ready() {
 		return false

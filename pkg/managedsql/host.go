@@ -306,6 +306,16 @@ func (h *Host) ValidateManagedAdmission(ctx context.Context, i node.ManagedStart
 	return h.validateManagedState(ctx, i, runtime, true)
 }
 
+func (h *Host) ValidateManagedPeerLearn(ctx context.Context, i node.ManagedStartupIdentity) error {
+	if i != h.identity {
+		return fmt.Errorf("execution identity changed")
+	}
+	// A recorded, not-yet-learned slot must not block delivery of its certificate.
+	// SQL readiness and pending-write admission keep their stricter checks.
+	_, err := h.live(ctx)
+	return err
+}
+
 func (h *Host) ValidateManagedSQLRead(ctx context.Context, i node.ManagedStartupIdentity, runtime node.ManagedRuntimeState) error {
 	return h.validateManagedState(ctx, i, runtime, false)
 }

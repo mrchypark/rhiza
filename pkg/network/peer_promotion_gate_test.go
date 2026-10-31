@@ -57,3 +57,19 @@ func TestLearnerPromotionGateBlocksOnlyAdmissionPrefix(t *testing.T) {
 		t.Fatalf("learner did not persist verified prefix after gate: tip=%d", core.Tip())
 	}
 }
+
+func TestCertifiedLearnReadinessDoesNotOpenClientAdmission(t *testing.T) {
+	server := &Server{ready: func() bool { return false }}
+	if server.readyToLearn() {
+		t.Fatal("default learning bypassed ordinary readiness")
+	}
+	allowed := false
+	server.SetLearnReady(func() bool { return allowed })
+	if server.readyToLearn() {
+		t.Fatal("closed peer authority admitted learning")
+	}
+	allowed = true
+	if !server.readyToLearn() || server.Ready() {
+		t.Fatal("certified delivery did not remain separate from client admission")
+	}
+}
