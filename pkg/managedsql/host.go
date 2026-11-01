@@ -322,7 +322,7 @@ func (h *Host) ValidateManagedSQLRead(ctx context.Context, i node.ManagedStartup
 
 func (h *Host) validateManagedState(ctx context.Context, i node.ManagedStartupIdentity, runtime node.ManagedRuntimeState, allowActiveWrite bool) error {
 	if allowActiveWrite && h.uncertain.Load() {
-		return fmt.Errorf("SQL outcome unknown; explicit pending recovery required")
+		return ErrSQLRecoveryRequired
 	}
 	if i != h.identity {
 		return fmt.Errorf("execution identity changed")
@@ -343,7 +343,7 @@ func (h *Host) validateManagedState(ctx context.Context, i node.ManagedStartupId
 		active := h.active
 		h.gateMu.RUnlock()
 		if active == nil || *active != pending {
-			return fmt.Errorf("pending SQL blocks new admission")
+			return ErrSQLPending
 		}
 		return nil
 	}
@@ -389,6 +389,33 @@ func (h *Host) ValidateManagedSQLWrite(ctx context.Context, i node.ManagedStartu
 	h.gateMu.RUnlock()
 	if !ok || p != w || active == nil || *active != w {
 		return fmt.Errorf("exact locally owned pending SQL reservation required")
+	}
+	original, ok, err := a.PendingSQL()
+	if err != nil || !ok {
+		return errors.Join(fmt.Errorf("original pending SQL missing"), err)
+	}
+	originalID, err := requestIdentity(original)
+	if err != nil || originalID != w {
+		return fmt.Errorf("original SQL fingerprint mismatch")
+	}
+	return nil
+}
+
+func (h *Host) ValidateManagedSQLRecovery(ctx context.Context, i node.ManagedStartupIdentity, req network.ExecuteRequest) error {
+	if i != h.identity {
+		return fmt.Errorf("execution identity changed")
+	}
+	w, err := requestIdentity(req)
+	if err != nil {
+		return err
+	}
+	a, err := h.live(ctx)
+	if err != nil {
+		return err
+	}
+	pending, ok := a.Pending()
+	if !ok || pending != w {
+		return fmt.Errorf("exact pending SQL recovery required")
 	}
 	original, ok, err := a.PendingSQL()
 	if err != nil || !ok {
@@ -565,43 +592,46 @@ func (h *Host) Execute(ctx context.Context, req ExecuteRequest) (ExecuteResponse
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	if h.closed {
-		return ExecuteResponse{}, fmt.Errorf("SQL host closed")
+		return ExecuteResponse{}, &SQLNotSubmittedError{Stage: SQLStageAuthority, Cause: fmt.Errorf("SQL host closed")}
 	}
 	if err := network.ValidateExecuteRequest(req); err != nil {
-		return ExecuteResponse{}, err
+		return ExecuteResponse{}, &SQLNotSubmittedError{Stage: SQLStageValidation, Cause: err}
 	}
 	// Retain the authority RV across quorum admission. Refreshing it afterward
 	// could carry an old quorum result across repair close/finish/open ABA.
 	a, err := h.live(ctx)
 	if err != nil {
-		return ExecuteResponse{}, err
+		return ExecuteResponse{}, &SQLNotSubmittedError{Stage: SQLStageAuthority, Cause: err}
 	}
 	if a.SQLReservationsClosed() {
-		return ExecuteResponse{}, fmt.Errorf("SQL reservations closed during repair")
+		return ExecuteResponse{}, &SQLNotSubmittedError{Stage: SQLStageRepair, Cause: fmt.Errorf("SQL reservations closed during repair")}
 	}
 	if _, pending := a.Pending(); pending {
-		return ExecuteResponse{}, fmt.Errorf("pending SQL must be resolved first")
+		return ExecuteResponse{}, &SQLNotSubmittedError{Stage: SQLStagePending, RecoveryRequired: true, Cause: ErrSQLPending}
 	}
 	if err := h.node.AdmitManaged(ctx); err != nil {
-		return ExecuteResponse{}, err
+		return ExecuteResponse{}, &SQLNotSubmittedError{Stage: SQLStageAdmission, RecoveryRequired: errors.Is(err, ErrSQLPending) || errors.Is(err, ErrSQLRecoveryRequired), Cause: err}
 	}
 	if !h.node.Ready() {
-		return ExecuteResponse{}, fmt.Errorf("runtime control catch-up not ready")
+		return ExecuteResponse{}, &SQLNotSubmittedError{Stage: SQLStageAdmission, Cause: network.ErrNotReady}
 	}
 	s, err := h.node.InspectManagedSQL(ctx, false)
 	if err != nil {
-		return ExecuteResponse{}, err
+		return ExecuteResponse{}, &SQLNotSubmittedError{Stage: SQLStageAdmission, Cause: err}
 	}
 	reserved, observed, err := operator.ReserveV1Alpha2SQLWrite(ctx, h.cfg.Store, a, h.authority, encodeEvidence(s), req)
 	if err != nil || observed != operator.V1Alpha2CASApplied {
-		h.uncertain.Store(true)
-		return ExecuteResponse{}, errors.Join(fmt.Errorf("SQL reservation not owned"), err)
+		ambiguous := observed == operator.V1Alpha2CASUnknown || observed == operator.V1Alpha2CASMatchingReadback || errors.Is(err, operator.ErrV1Alpha2StatusOutcomeUnknown)
+		if ambiguous {
+			h.uncertain.Store(true)
+		}
+		return ExecuteResponse{}, &SQLNotSubmittedError{Stage: SQLStageReservation, RecoveryRequired: ambiguous, Cause: errors.Join(fmt.Errorf("SQL reservation not owned"), err)}
 	}
 	w, _ := reserved.Pending()
 	original, ok, err := reserved.PendingSQL()
 	if err != nil || !ok {
 		h.uncertain.Store(true)
-		return ExecuteResponse{}, errors.Join(fmt.Errorf("reserved original SQL unavailable"), err)
+		return ExecuteResponse{}, &SQLNotSubmittedError{Stage: SQLStageReservation, RecoveryRequired: true, Cause: errors.Join(fmt.Errorf("reserved original SQL unavailable"), err)}
 	}
 	h.gateMu.Lock()
 	h.active = &w
@@ -610,18 +640,38 @@ func (h *Host) Execute(ctx context.Context, req ExecuteRequest) (ExecuteResponse
 	response, executeErr := h.node.ExecuteManagedSQL(ctx, original)
 	if err := h.finalize(ctx, original, reserved); err != nil {
 		h.uncertain.Store(true)
-		return response, errors.Join(executeErr, err)
+		return response, sqlOutcomeUnknown(original, response, errors.Join(executeErr, err))
 	}
 	return response, executeErr
 }
 
+func sqlOutcomeUnknown(req ExecuteRequest, response ExecuteResponse, cause error) error {
+	slot, retry := quepaxa.Slot(response.Slot), response.RetryThroughSlot
+	var previous *network.CommitUnknownError
+	if errors.As(cause, &previous) && previous.RequestID == req.RequestID {
+		if slot == 0 {
+			slot = previous.Slot
+		}
+		if retry == 0 {
+			retry = previous.RetryThroughSlot
+		}
+	}
+	return &network.CommitUnknownError{RequestID: req.RequestID, Slot: slot, RetryThroughSlot: retry, Cause: cause}
+}
+
 func (h *Host) finalize(ctx context.Context, req ExecuteRequest, a operator.V1Alpha2AdmissionSnapshot) error {
+	if err := h.ValidateManagedSQLRecovery(ctx, h.identity, req); err != nil {
+		return err
+	}
 	result, err := h.node.ResolveManagedSQL(ctx, req)
 	if err != nil || result.State != network.ResolveExecuteRetained || result.Receipt == nil || result.Durability != network.ResolveExecuteDurabilityConfirmed {
 		return errors.Join(fmt.Errorf("SQL outcome or configured durability remains unknown"), err)
 	}
 	s, err := h.node.InspectManagedSQL(ctx, false)
 	if err != nil {
+		return err
+	}
+	if err := h.ValidateManagedSQLRecovery(ctx, h.identity, req); err != nil {
 		return err
 	}
 	w, _ := a.Pending()
@@ -658,7 +708,7 @@ func (h *Host) RecoverPending(ctx context.Context) error {
 	}
 	if err := h.finalize(ctx, req, a); err != nil {
 		h.uncertain.Store(true)
-		return err
+		return sqlOutcomeUnknown(req, ExecuteResponse{}, err)
 	}
 	h.uncertain.Store(false)
 	return nil

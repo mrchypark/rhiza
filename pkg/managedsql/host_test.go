@@ -276,15 +276,9 @@ func sqlCluster(t *testing.T) ([]Config, *sqlStatusFixture) {
 		t.Fatal(err)
 	}
 	sourceControl.finalPrefix = namespace.FinalPrefix
+	addresses := sqlPeerAddresses(t, len(members), net.ListenPacket)
 	for i := range members {
-		conn, err := net.ListenPacket("udp", "127.0.0.1:0")
-		if err != nil {
-			t.Fatal(err)
-		}
-		addr := conn.LocalAddr().String()
-		if err := conn.Close(); err != nil {
-			t.Fatal(err)
-		}
+		addr := addresses[i]
 		id, err := types.ManagedNodeID(fmt.Sprintf("pod-%d", i))
 		if err != nil {
 			t.Fatal(err)
@@ -334,6 +328,64 @@ func sqlCluster(t *testing.T) ([]Config, *sqlStatusFixture) {
 		configs[i].PodUID = fmt.Sprintf("pod-%d", i)
 	}
 	return configs, f
+}
+
+// Retain all allocations until the complete fixture membership is chosen.
+// Closing each ephemeral socket before the next allocation permits the OS to
+// choose the same endpoint twice, which the real bootstrap validator rejects.
+func sqlPeerAddresses(t *testing.T, count int, listen func(string, string) (net.PacketConn, error)) []string {
+	t.Helper()
+	var sockets []net.PacketConn
+	defer func() {
+		for _, socket := range sockets {
+			if err := socket.Close(); err != nil {
+				t.Error(err)
+			}
+		}
+	}()
+	addresses := make([]string, count)
+	for i := range addresses {
+		socket, err := listen("udp", "127.0.0.1:0")
+		if err != nil {
+			t.Fatal(err)
+		}
+		sockets = append(sockets, socket)
+		addresses[i] = socket.LocalAddr().String()
+	}
+	return addresses
+}
+
+func TestManagedSQLPeerAddressAllocationRetainsDistinctSockets(t *testing.T) {
+	var allocated []string
+	addresses := sqlPeerAddresses(t, 3, func(network, address string) (net.PacketConn, error) {
+		for _, previous := range allocated {
+			probe, err := net.ListenPacket(network, previous)
+			if err == nil {
+				_ = probe.Close()
+				t.Fatal("earlier endpoint released before membership allocation completed")
+			}
+		}
+		conn, err := net.ListenPacket(network, address)
+		if err == nil {
+			allocated = append(allocated, conn.LocalAddr().String())
+		}
+		return conn, err
+	})
+	seen := make(map[string]bool)
+	for _, address := range addresses {
+		if seen[address] {
+			t.Fatal("duplicate allocated endpoint")
+		}
+		seen[address] = true
+		// The helper must release only its own sockets before Host binds.
+		conn, err := net.ListenPacket("udp", address)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := conn.Close(); err != nil {
+			t.Fatal(err)
+		}
+	}
 }
 
 func readySQL(t *testing.T, h *Host) {
