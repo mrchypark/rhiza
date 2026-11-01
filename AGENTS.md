@@ -27,8 +27,11 @@ worker's files to make a check pass. Report the conflicting path and evidence.
 Never equate a Kubernetes Pod deletion response with termination of an isolated
 process. Recovery requires evidence for the complete requested identity scope,
 recreation prevention, and outstanding storage work. Missing evidence must block
-recovery. Run performance measurements and actual chaos qualification in CI;
-local functional tests are appropriate. Do not use Google Cloud Build.
+recovery. Run performance measurements in CI. Run actual chaos qualification in
+CI by default; local actual chaos requires explicit user authorization for an
+isolated cluster, target scope, fault type and duration, required permissions,
+and verified cleanup. Never silently fall back from CI to local execution.
+Local functional tests are appropriate. Do not use Google Cloud Build.
 
 ## External recovery anchor contract
 
