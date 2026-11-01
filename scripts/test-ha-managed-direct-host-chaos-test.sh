@@ -120,7 +120,7 @@ grep -Fq 'podSpec, err := V1Alpha2ManagedSQLPodSpec' "$operator_initializer"
 grep -Fq 'name=="rhizaclusters" and .kind=="RhizaCluster"' "$direct"
 grep -Fq 'create podchaos.chaos-mesh.org' "$direct"
 grep -Fq 'AllInjected' "$direct"
-grep -Fq 'AllRecovered' "$direct"
+if grep -Fq 'AllRecovered' "$direct"; then echo 'one-shot kill waits for unsupported pre-delete recovery condition' >&2; exit 1; fi
 grep -Fq 'metadata.uid!=$old_uid' "$direct"
 grep -Fq 'containerID!=$old' "$direct"
 grep -Fq 'voter-identity.json' "$direct"

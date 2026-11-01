@@ -10,6 +10,14 @@ cleanup() {
   unlink "$scratch/test-virtual-before.json" 2>/dev/null || :
   unlink "$scratch/test-host-before.json" 2>/dev/null || :
   unlink "$scratch/fault.json" 2>/dev/null || :
+  for kill in pod-kill container-kill; do
+    for suffix in request.json pod-before.json pod-after.json pods-after.json host-before.json host-after.json injected.json before-delete.json after-delete.json; do
+      unlink "$scratch/$kill-$suffix" 2>/dev/null || :
+    done
+  done
+  for file in fault-valid.json fault-invalid.json fault-events.json capture-trace.txt pod-kill-AllInjected-wait.exit pod-kill-AllInjected-failure.json pod-kill-AllInjected-failure-events.json chaos-failure.json driver-original.exit driver.exit; do
+    unlink "$scratch/$file" 2>/dev/null || :
+  done
   for file in dns-pods-input.json dns-services-input.json dns-endpoints-input.json dns-endpointslices-input.json dns-pods-output.json dns-services-output.json dns-endpoints-output.json dns-endpointslices-output.json coredns-log-input.txt coredns-log-output.json coredns-log-unavailable.json; do
     unlink "$scratch/$file" 2>/dev/null || :
   done
@@ -41,14 +49,103 @@ for invalid in \
   replay "$invalid" || code=$?
   [ "$code" -ne 0 ] || { echo 'unsafe host mapping accepted' >&2; exit 1; }
 done
-oracle=$(sed -n '/^chaos_record_oracle() {/,/^}/p' scripts/test-ha-managed-cluster-chaos.sh)
-[ -n "$oracle" ]
-for target in test-ns/host-1 test-ns/host-1/sql; do
-  jq -n --arg id "$target" '{status:{conditions:[{type:"AllInjected",status:"True"}],experiment:{containerRecords:[{id:$id,injectedCount:1}]}}}' > "$scratch/fault.json"
-  sh -c 'set -eu; eval "$1"; chaos_record_oracle "$2" "$3"' fixture "$oracle" "$scratch/fault.json" "$target"
-  code=0
-  sh -c 'set -eu; eval "$1"; chaos_record_oracle "$2" "$3"' fixture "$oracle" "$scratch/fault.json" wrong-ns/other-pod || code=$?
-  [ "$code" -ne 0 ] || { echo 'wrong Chaos target accepted' >&2; exit 1; }
+for driver in scripts/test-ha-managed-cluster-chaos.sh scripts/test-ha-managed-direct-host-chaos.sh; do
+  oracle=$(sed -n '/^chaos_record_oracle() {/,/^}/p' "$driver")
+  [ -n "$oracle" ]
+  for target in test-ns/host-1 test-ns/host-1/sql; do
+    for condition in AllInjected AllRecovered; do
+      phase=Injected recovered=0
+      if [ "$condition" = AllRecovered ]; then phase='Not Injected'; recovered=1; fi
+      jq -n --arg id "$target" --arg condition "$condition" --arg phase "$phase" --argjson recovered "$recovered" '{status:{conditions:[{type:$condition,status:"True"}],experiment:{containerRecords:[{id:$id,phase:$phase,injectedCount:1,recoveredCount:$recovered}]}}}' > "$scratch/fault-valid.json"
+      code=0
+      sh -c 'set -eu; eval "$1"; chaos_record_oracle "$2" "$3"' fixture "$oracle" "$scratch/fault-valid.json" "$target" || code=$?
+      if [ "$condition" = AllRecovered ]; then
+        [ "$code" -ne 0 ] || { echo 'recovered record accepted as injected' >&2; exit 1; }
+        continue
+      fi
+      [ "$code" -eq 0 ]
+      for invalid in '.status.experiment.containerRecords[0].id="wrong-ns/other-pod"' 'del(.status.experiment.containerRecords[0].injectedCount)' 'del(.status.experiment.containerRecords[0].recoveredCount)' '.status.experiment.containerRecords[0].injectedCount=0' '.status.experiment.containerRecords[0].recoveredCount=4' '.status.experiment.containerRecords[0].phase="wrong"' '.status.conditions[0].status="False"' '.status.experiment.containerRecords+=.status.experiment.containerRecords'; do
+        jq "$invalid" "$scratch/fault-valid.json" > "$scratch/fault-invalid.json"
+        code=0
+        sh -c 'set -eu; eval "$1"; chaos_record_oracle "$2" "$3"' fixture "$oracle" "$scratch/fault-invalid.json" "$target" || code=$?
+        [ "$code" -ne 0 ] || { echo 'invalid Chaos phase/target/count evidence accepted' >&2; exit 1; }
+      done
+    done
+  done
+  capture=$(sed -n '/^capture_chaos_failure() {/,/^}/p' "$driver")
+  waiter=$(sed -n '/^wait_chaos_injected() {/,/^}/p' "$driver")
+  [ -n "$capture" ] && [ -n "$waiter" ]
+  jq -n '{apiVersion:"chaos-mesh.org/v1alpha1",kind:"PodChaos",metadata:{name:"pod-kill",namespace:"test-ns",uid:"fault-uid",labels:{"rhiza-ci-run":"test-run"}},status:{conditions:[{type:"AllInjected",status:"False"}]}}' > "$scratch/fault.json"
+  jq -n '{items:[{reason:"Failed",message:("x" * 70000),involvedObject:{kind:"PodChaos",name:"pod-kill",uid:"fault-uid"}}]}' > "$scratch/fault-events.json"
+  sh -c 'set -eu
+    private=$1 logs=$1; RHIZA_HOST_NAMESPACE=test-ns; release=test-run
+    host_guard() { return 0; }
+    hn() {
+      printf "%s\n" "$*" >> "$logs/capture-trace.txt"
+      case "$1/$2" in wait/*) return 7 ;; get/podchaos/pod-kill) cat "$logs/fault.json" ;; get/events) cat "$logs/fault-events.json" ;; *) return 9 ;; esac
+    }
+    eval "$2"; eval "$3"
+    code=0; wait_chaos_injected pod-kill || code=$?
+    [ "$code" -eq 7 ] && [ "$(cat "$logs/pod-kill-AllInjected-wait.exit")" -eq 7 ]
+    jq -e ".metadata.uid==\"fault-uid\" and .status.conditions[0].status==\"False\"" "$logs/pod-kill-AllInjected-failure.json" >/dev/null
+    [ "$(wc -c < "$logs/pod-kill-AllInjected-failure-events.json")" -le 65536 ]
+    grep -Fq "involvedObject.uid=fault-uid" "$logs/capture-trace.txt"
+    [ ! -e "$private/chaos-failure.json" ]
+    before=$(wc -l < "$logs/capture-trace.txt")
+    code=0; capture_chaos_failure arbitrary cleanup || code=$?
+    [ "$code" -eq 2 ] && [ "$(wc -l < "$logs/capture-trace.txt")" -eq "$before" ]
+    host_guard() { return 1; }
+    code=0; capture_chaos_failure pod-kill cleanup || code=$?
+    [ "$code" -eq 1 ] && [ "$(wc -l < "$logs/capture-trace.txt")" -eq "$before" ]
+  ' fixture "$scratch" "$capture" "$waiter"
+  cleanup_helper=$(sed -n '/^cleanup() {/,/^}/p' "$driver")
+  mkdir "$scratch/cleanup-private"
+  cleanup_code=0
+  sh -c 'set +e
+    private=$1/cleanup-private logs=$1 RUNNER_TEMP=$1
+    owned=0 installed=0 bucket_pid= forward_pid=
+    eval "$2"
+    (exit 7)
+    cleanup
+  ' fixture "$scratch" "$cleanup_helper" || cleanup_code=$?
+  [ "$cleanup_code" -eq 7 ] && [ "$(cat "$scratch/driver-original.exit")" -eq 7 ] && [ "$(cat "$scratch/driver.exit")" -eq 7 ]
+  [ ! -e "$scratch/cleanup-private" ]
+  if grep -Fq 'AllRecovered' "$driver"; then echo 'one-shot kill waits for unsupported pre-delete recovery condition' >&2; exit 1; fi
+  fault_function=chaos_fault
+  case "$driver" in *direct-host*) fault_function=direct_chaos_fault ;; esac
+  runner=$(sed -n "/^$fault_function() {/,/^}/p" "$driver")
+  for kill in pod-kill container-kill; do
+    sh -c 'set -eu
+      logs=$1; namespace=test-ns RHIZA_HOST_NAMESPACE=test-ns release=test-run uid=cluster-uid
+      event_deleted=0 pod_reads=0
+      : > "$logs/capture-trace.txt"
+      hn() {
+        printf "%s\n" "$*" >> "$logs/capture-trace.txt"
+        case "$1/$2" in
+          create/*|wait/*) return 0 ;;
+          get/pod)
+            pod_reads=$((pod_reads+1)); cid=old; [ "$pod_reads" -eq 1 ] || cid=new
+            jq -n --arg cid "$cid" "{metadata:{name:\"host-1\",uid:\"pod-uid\",labels:{\"rhiza.mrchypark.dev/cluster-uid\":\"cluster-uid\"}},status:{containerStatuses:[{name:\"sql\",ready:true,containerID:\$cid,lastState:{terminated:{containerID:\"old\"}}}]}}" ;;
+          get/pods) printf "%s\n" "{\"items\":[]}" ;;
+          get/podchaos/*)
+            [ "$event_deleted" -eq 0 ] || return 0
+            record=test-ns/host-1; [ "$action" != container-kill ] || record=$record/sql
+            jq -n --arg id "$record" "{status:{conditions:[{type:\"AllInjected\",status:\"True\"}],experiment:{containerRecords:[{id:\$id,phase:\"Injected\",injectedCount:1,recoveredCount:0}]}}}" ;;
+          delete/podchaos/*) event_deleted=1 ;;
+          *) return 9 ;;
+        esac
+      }
+      mapped_host_pod() { host_pod=host-1 host_uid=pod-uid; hn get pod host-1 -o json | jq "[.]" > "$logs/$fault-host-before.json"; }
+      eval "$2"; eval "$3"; eval "$4"
+      "$5" "$6" "$6" host-1 pod-uid
+      [ "$event_deleted" -eq 1 ]
+      printf "%s\n" app-recovery-check >> "$logs/capture-trace.txt"
+      deleted=$(grep -n "^delete podchaos/$6 " "$logs/capture-trace.txt" | cut -d: -f1)
+      absence=$(grep -n "^get podchaos/$6 --ignore-not-found " "$logs/capture-trace.txt" | cut -d: -f1)
+      app=$(grep -n "^app-recovery-check$" "$logs/capture-trace.txt" | cut -d: -f1)
+      [ "$deleted" -lt "$absence" ] && [ "$absence" -lt "$app" ]
+    ' fixture "$scratch" "$oracle" "$waiter" "$runner" "$fault_function" "$kill"
+  done
 done
 [ "$(grep -c 'set-json "sync.fromHost.nodes.selector.labels=' scripts/test-ha-managed-cluster-chaos.sh)" -eq 2 ]
 if grep -q 'podTemplate.spec.nodeSelector' scripts/test-ha-managed-cluster-chaos.sh; then echo 'unsupported RhizaCluster node pin' >&2; exit 1; fi

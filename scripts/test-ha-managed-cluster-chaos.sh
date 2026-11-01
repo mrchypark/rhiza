@@ -240,9 +240,12 @@ run_floci_dns_probe() {
 }
 cleanup() {
   result=$?
+  original_result=$result
+  printf '%s\n' "$original_result" > "$logs/driver-original.exit"
   trap - EXIT HUP INT TERM
   if [ "$installed" = 1 ]; then
     if host_guard; then
+      if [ "$result" -ne 0 ] && [ -n "${fault-}" ]; then capture_chaos_failure "$fault" cleanup || :; fi
       hn get podchaos -o json > "$logs/faults-final.json" 2>&1 || result=1
       hn delete podchaos -l "rhiza-ci-run=$release" --wait=true --timeout=60s > "$logs/fault-cleanup.txt" 2>&1 || result=1
       if [ -f "$kubeconfig" ]; then
@@ -275,6 +278,7 @@ cleanup() {
   # Only this private run directory: credentials are never uploaded as artifacts.
   rm -f "$private/virtual.config" "$private/runtime.json" "$private/admin.token" "$private/curl.conf" "$private/request.body" "$private/chart.tgz" "$private/values.yaml" "$private/rendered.yaml" "$private/forward.log" "$private/bucket-forward.log" "$private/dns-probe.json" "$private/dns-probe-status.raw.json" "$private/floci-endpoints.raw.json" "$private/floci-endpoints.stderr" "$private/coredns-current.raw.log" "$private/coredns-previous.raw.log" "$private/virtual-dns-pods.raw.json" "$private/virtual-dns-services.raw.json" "$private/virtual-dns-endpoints.raw.json" "$private/virtual-dns-endpointslices.raw.json" "$private/virtual-dns-pods.stderr" "$private/virtual-dns-services.stderr" "$private/virtual-dns-endpoints.stderr" "$private/virtual-dns-endpointslices.stderr" "$RUNNER_TEMP/ha-managed-cluster-bucket-setup"
   rmdir "$private" || result=1
+  [ "$original_result" -eq 0 ] || result=$original_result
   printf '%s\n' "$result" > "$logs/driver.exit"
   exit "$result"
 }
@@ -403,7 +407,40 @@ mapped_host_pod() {
   host_uid=$(jq -r '.[0].metadata.uid' "$logs/$fault-host-before.json")
 }
 chaos_record_oracle() {
-  jq -e --arg id "$2" 'any(.status.conditions[]?; .type=="AllInjected" and .status=="True") and (.status.experiment.containerRecords|length)==1 and all(.status.experiment.containerRecords[]; .id==$id and .injectedCount>0)' "$1" >/dev/null
+  jq -e --arg id "$2" '
+    any(.status.conditions[]?; .type=="AllInjected" and .status=="True") and
+    (.status.experiment.containerRecords|length)==1 and
+    all(.status.experiment.containerRecords[];
+      .id==$id and .phase=="Injected" and
+      (.injectedCount|type)=="number" and (.recoveredCount|type)=="number" and
+      .injectedCount>0 and .recoveredCount>=0 and .injectedCount>.recoveredCount)
+  ' "$1" >/dev/null
+}
+capture_chaos_failure() {
+  case "$1" in pod-kill|container-kill) ;; *) return 2 ;; esac
+  case "$2" in AllInjected|cleanup) ;; *) return 2 ;; esac
+  host_guard || return 1
+  failure_json="$private/chaos-failure.json"
+  if hn get "podchaos/$1" -o json > "$failure_json" 2>/dev/null; then
+    if jq -e --arg ns "$RHIZA_HOST_NAMESPACE" --arg run "$release" '.metadata.namespace==$ns and .metadata.labels["rhiza-ci-run"]==$run' "$failure_json" >/dev/null; then
+      jq '{apiVersion,kind,metadata:{name:.metadata.name,namespace:.metadata.namespace,uid:.metadata.uid,generation:.metadata.generation},spec,status}' "$failure_json" | head -c 65536 > "$logs/$1-$2-failure.json"
+      failure_uid=$(jq -r '.metadata.uid' "$failure_json")
+      hn get events --field-selector "involvedObject.kind=PodChaos,involvedObject.uid=$failure_uid" -o json 2>/dev/null |
+        jq '{items:[.items[]? | {reason,message,count,firstTimestamp,lastTimestamp,involvedObject}] | .[-20:]}' |
+        head -c 65536 > "$logs/$1-$2-failure-events.json" || :
+    fi
+  fi
+  rm -f "$failure_json"
+}
+wait_chaos_injected() {
+  if hn wait --for=condition=AllInjected "podchaos/$1" --timeout=90s; then
+    return 0
+  else
+    wait_failure_exit=$?
+    printf '%s\n' "$wait_failure_exit" > "$logs/$1-AllInjected-wait.exit"
+    capture_chaos_failure "$1" AllInjected || :
+    return "$wait_failure_exit"
+  fi
 }
 chaos_fault() {
   action=$1 fault=$2
@@ -414,12 +451,9 @@ chaos_fault() {
   if [ "$action" = container-kill ]; then expected_record="$expected_record/sql"; fi
   jq -n --arg fault "$fault" --arg ns "$RHIZA_HOST_NAMESPACE" --arg run "$release" --arg action "$action" --arg pod "$host_pod" --arg uid "$4" '{apiVersion:"chaos-mesh.org/v1alpha1",kind:"PodChaos",metadata:{name:$fault,namespace:$ns,labels:{"rhiza-ci-run":$run}},spec:{action:$action,mode:"one",duration:"10s",containerNames:["sql"],selector:{namespaces:[$ns],pods:{($ns):[$pod]},annotationSelectors:{"vcluster.loft.sh/object-uid":$uid}}}}' > "$logs/$fault-request.json"
   hn create -f "$logs/$fault-request.json"
-  hn wait --for=condition=AllInjected "podchaos/$fault" --timeout=90s
+  wait_chaos_injected "$fault"
   hn get "podchaos/$fault" -o json > "$logs/$fault-injected.json"
   chaos_record_oracle "$logs/$fault-injected.json" "$expected_record"
-  hn wait --for=condition=AllRecovered "podchaos/$fault" --timeout=90s
-  hn get "podchaos/$fault" -o json > "$logs/$fault-recovered.json"
-  chaos_record_oracle "$logs/$fault-recovered.json" "$expected_record"
   if [ "$action" = container-kill ]; then
     tries=0
     until hn get pod "$host_pod" -o json > "$logs/$fault-host-after.json" &&
@@ -430,7 +464,12 @@ chaos_fault() {
     hn get pods --field-selector "metadata.name=$host_pod" -o json > "$logs/$fault-host-after.json"
     jq -e '.items|length==0' "$logs/$fault-host-after.json" >/dev/null
   fi
+  # Kill actions are one-shot: remove their object before application recovery checks.
+  hn get "podchaos/$fault" -o json > "$logs/$fault-before-delete.json"
   hn delete "podchaos/$fault" --wait=true --timeout=60s
+  hn get "podchaos/$fault" --ignore-not-found -o json > "$logs/$fault-after-delete.json"
+  [ ! -s "$logs/$fault-after-delete.json" ]
+  fault=
 }
 managed_pod_fault() {
   k -n "$namespace" exec "$1" -c sql -- sha256sum /var/lib/rhiza/data/qlog/voter-identity.json > "$logs/old-voter-identity.txt"
