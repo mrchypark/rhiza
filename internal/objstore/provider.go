@@ -76,6 +76,12 @@ func NewBucketWithContext(ctx context.Context, cfg Config) (*MeteredBucket, erro
 // NewBucketForSupervisedStartup forbids remote provisioning before WAL admission.
 // Azure containers must already exist; ordinary startup retains auto-creation.
 func NewBucketForSupervisedStartup(ctx context.Context, cfg Config) (*MeteredBucket, error) {
+	return NewBucketWithoutProvisioning(ctx, cfg)
+}
+
+// NewBucketWithoutProvisioning disables Azure container auto-creation and does
+// not check existence. The returned writable bucket can mutate storage later.
+func NewBucketWithoutProvisioning(ctx context.Context, cfg Config) (*MeteredBucket, error) {
 	return newBucketWithContext(ctx, cfg, true)
 }
 

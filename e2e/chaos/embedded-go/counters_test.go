@@ -264,45 +264,85 @@ func TestQualificationLocalAuthSanitizesKubeEvidence(t *testing.T) {
 }
 
 func TestQualificationApplicationProvenance(t *testing.T) {
-	workflow, err := os.ReadFile("../../../.github/workflows/ci.yml")
+	workflow, err := os.ReadFile("../../../.github/workflows/ha-managed-bootstrap.yml")
 	if err != nil {
 		t.Fatal(err)
 	}
-	script, err := os.ReadFile("../run-gcs-postrelease.sh")
-	if err != nil {
+	var definition struct {
+		Jobs map[string]struct {
+			Steps []struct {
+				Uses string            `yaml:"uses"`
+				Run  string            `yaml:"run"`
+				With map[string]string `yaml:"with"`
+			} `yaml:"steps"`
+		} `yaml:"jobs"`
+	}
+	if err := yaml.Unmarshal(workflow, &definition); err != nil {
 		t.Fatal(err)
 	}
-	for _, forbidden := range []string{"APPLICATION_SHA:", "$APPLICATION_SHA", `test "$APPLICATION_SHA" != "$GITHUB_SHA"`} {
-		if bytes.Contains(workflow, []byte(forbidden)) {
-			t.Fatalf("qualification image provenance must not pin a split application source: %s", forbidden)
+	checkouts, harnesses := 0, 0
+	for _, step := range definition.Jobs["bootstrap"].Steps {
+		if strings.HasPrefix(step.Uses, "actions/checkout@") {
+			checkouts++
+			if len(step.With) != 0 {
+				t.Fatal("managed image checkout must not override the event repository, SHA or source path")
+			}
+		}
+		if step.Run == "sh scripts/test-ha-managed-bootstrap.sh" {
+			harnesses++
 		}
 	}
-	if bytes.Contains(script, []byte("application_sha=")) {
-		t.Fatal("qualification runtime must not pin a split application source")
+	if checkouts != 1 || harnesses != 1 {
+		t.Fatal("managed qualification requires one event-SHA checkout and its actual harness")
 	}
+	script, err := os.ReadFile("../../../scripts/test-ha-managed-bootstrap.sh")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Contains(script, []byte(". scripts/ha-managed-bootstrap-fixture.sh\nmanaged_fixture")) {
+		t.Fatal("managed qualification must execute the shared fixture")
+	}
+	fixture, err := os.ReadFile("../../../scripts/ha-managed-bootstrap-fixture.sh")
+	if err != nil {
+		t.Fatal(err)
+	}
+	script = append(script, fixture...)
+	// Local build, loaded image, init profile and application use one event-SHA tag.
 	for _, required := range []string{
-		`git fetch --no-tags --depth=1 origin "$GITHUB_REF"`,
-		`test "$(git rev-parse HEAD)" = "$GITHUB_SHA"`,
-		`test "$(git rev-parse FETCH_HEAD)" = "$GITHUB_SHA"`,
-		`test -z "$(git status --porcelain --untracked-files=all)"`,
-		`--label "org.opencontainers.image.revision=$GITHUB_SHA"`,
-		`--label "io.rhiza.qualification.harness=$GITHUB_SHA"`,
-		`--label "io.rhiza.qualification.application=$GITHUB_SHA"`,
-		`.Config.Labels["org.opencontainers.image.revision"] == $revision`,
-		`.Config.Labels["io.rhiza.qualification.harness"] == $revision`,
-		`.Config.Labels["io.rhiza.qualification.application"] == $revision`,
+		`cd "$(CDPATH='' cd -- "$(dirname -- "$0")/.." && pwd)"`,
+		`image="rhiza-managed:$GITHUB_SHA-$nonce"`,
+		`docker build -f Dockerfile.operator -t "$image" .`,
+		`kind load docker-image --name "$cluster" "$image"`,
+		`--arg image "$image" --rawfile admin`,
+		`InitImage:$image`,
+		`kind:"RhizaCluster"`,
+		`containers:[{name:"sql",image:$image}]`,
 	} {
-		if !bytes.Contains(workflow, []byte(required)) {
-			t.Fatalf("qualification image must bind checkout and all provenance labels to GITHUB_SHA: %s", required)
+		if !bytes.Contains(script, []byte(required)) {
+			t.Fatalf("managed qualification image source binding missing: %s", required)
 		}
+	}
+	ci, err := os.ReadFile("../../../.github/workflows/ci.yml")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, forbidden := range []string{"publish-chaos-image:", "qualification-host-", "APPLICATION_SHA:", "$APPLICATION_SHA"} {
+		if bytes.Contains(ci, []byte(forbidden)) || bytes.Contains(workflow, []byte(forbidden)) {
+			t.Fatalf("retired legacy or split-source publication path remains: %s", forbidden)
+		}
+	}
+	// Historical local-cloud tooling still refuses split application/harness revisions.
+	legacy, err := os.ReadFile("../run-gcs-postrelease.sh")
+	if err != nil {
+		t.Fatal(err)
 	}
 	for _, required := range []string{
 		`source_sha=$GITHUB_SHA`,
 		`source_sha=$RHIZA_HARNESS_SHA`,
 		`[ "${RHIZA_APPLICATION_SHA:-}" = "$source_sha" ] || die 'candidate application mismatch'`,
 	} {
-		if !bytes.Contains(script, []byte(required)) {
-			t.Fatalf("qualification runtime must derive application provenance from verified source: %s", required)
+		if !bytes.Contains(legacy, []byte(required)) {
+			t.Fatalf("historical runtime split-source rejection changed: %s", required)
 		}
 	}
 }

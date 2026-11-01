@@ -117,6 +117,7 @@ type RecoveryPin struct {
 }
 
 type Manager struct {
+	appendOnly               bool
 	bucket                   objstore.Bucket
 	prefix                   string
 	localDir                 string
@@ -129,6 +130,20 @@ type Manager struct {
 	verifiedMu               sync.Mutex
 	verified                 map[string]int64
 	verifiedRoots            map[[32]byte]verifiedRoot
+}
+
+// NewAppendOnlyManager opens an HA namespace without online deletion.
+func NewAppendOnlyManager(bucket objstore.Bucket, prefix, localDir string, configID ...uint) (*Manager, error) {
+	if bucket == nil {
+		return nil, fmt.Errorf("append-only checkpoint requires an object store")
+	}
+	options := bucket.SupportedObjectUploadOptions()
+	if !slices.Contains(options, objstore.IfNotExists) || !slices.Contains(options, objstore.IfMatch) {
+		return nil, fmt.Errorf("append-only checkpoint requires conditional object writes")
+	}
+	m := NewManager(bucket, prefix, localDir, configID...)
+	m.appendOnly = true
+	return m, nil
 }
 
 func NewManager(bucket objstore.Bucket, prefix, localDir string, configID ...uint) *Manager {
@@ -577,8 +592,27 @@ func (m *Manager) createFilesWithScanObserver(ctx context.Context, claim *Publis
 	if conditional {
 		uploadOptions = append(uploadOptions, objstore.WithIfNotExists())
 	}
-	if err := m.bucket.Upload(ctx, rootKey, bytes.NewReader(data), uploadOptions...); err != nil && !(conditional && m.bucket.IsConditionNotMetErr(err)) {
-		return nil, fmt.Errorf("publish checkpoint root: %w", err)
+	if err := m.bucket.Upload(ctx, rootKey, bytes.NewReader(data), uploadOptions...); err != nil {
+		if !conditional || !m.bucket.IsConditionNotMetErr(err) {
+			return nil, fmt.Errorf("publish checkpoint root: %w", err)
+		}
+		if m.appendOnly {
+			existing, readErr := m.bucket.Get(ctx, rootKey)
+			if readErr != nil {
+				return nil, fmt.Errorf("verify existing checkpoint root: %w", readErr)
+			}
+			stored, readErr := io.ReadAll(io.LimitReader(existing, int64(len(data))+1))
+			closeErr := existing.Close()
+			if readErr != nil {
+				return nil, fmt.Errorf("verify existing checkpoint root: %w", readErr)
+			}
+			if closeErr != nil {
+				return nil, fmt.Errorf("verify existing checkpoint root: %w", closeErr)
+			}
+			if !bytes.Equal(stored, data) {
+				return nil, fmt.Errorf("existing checkpoint root does not match its content")
+			}
+		}
 	}
 	log.Printf("checkpoint candidate published: index=%d size=%d files=%d", index, root.Size, len(root.Files))
 	root.claim = claim
@@ -805,7 +839,28 @@ func (m *Manager) uploadFile(ctx context.Context, source Source, generation uint
 			err = m.bucket.Upload(ctx, key, reader, objstore.WithIfNotExists())
 			if m.bucket.IsConditionNotMetErr(err) {
 				generations[index] = generation
-				err = m.bucket.Upload(ctx, m.key(blockGenerationKey(upload.hash, generation)), io.NewSectionReader(input, upload.offset, upload.block.Size))
+				if m.appendOnly {
+					generationKey := m.key(blockGenerationKey(upload.hash, generation))
+					err = m.bucket.Upload(ctx, generationKey, io.NewSectionReader(input, upload.offset, upload.block.Size), objstore.WithIfNotExists())
+					if m.bucket.IsConditionNotMetErr(err) {
+						var existing io.ReadCloser
+						existing, err = m.bucket.Get(ctx, generationKey)
+						if err == nil {
+							hasher := sha256.New()
+							var size int64
+							size, err = io.Copy(hasher, io.LimitReader(existing, upload.block.Size+1))
+							closeErr := existing.Close()
+							if err == nil {
+								err = closeErr
+							}
+							if err == nil && (size != upload.block.Size || !bytes.Equal(hasher.Sum(nil), upload.hash[:])) {
+								err = fmt.Errorf("existing checkpoint block does not match its hash")
+							}
+						}
+					}
+				} else {
+					err = m.bucket.Upload(ctx, m.key(blockGenerationKey(upload.hash, generation)), io.NewSectionReader(input, upload.offset, upload.block.Size))
+				}
 			}
 		} else {
 			generations[index] = generation
@@ -1326,6 +1381,9 @@ func (m *Manager) activeRecoveryRoots(ctx context.Context) (map[[32]byte]Checkpo
 // supply the validated, published archive RecoveryBase floor and retain its
 // root. A zero floor has no authoritative recovery base and is rejected.
 func (m *Manager) GarbageCollectFrom(ctx context.Context, retain map[[32]byte]struct{}, keep int, floor uint64, grace time.Duration) error {
+	if m.appendOnly {
+		return fmt.Errorf("checkpoint garbage collection is disabled for append-only manager")
+	}
 	if floor == 0 {
 		return ErrAuthoritativeRecoveryBaseRequired
 	}

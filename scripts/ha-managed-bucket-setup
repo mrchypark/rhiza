@@ -1,0 +1,55 @@
+#!/bin/sh
+set -eu
+if [ "${1-}" = oracle-gated ] || [ "${1-}" = oracle-plan ]; then
+  src="$(CDPATH='' cd -- "$(dirname -- "$0")/ha-managed-bucket-setup-src" && pwd)"
+  cache="${RUNNER_TEMP:?}/ha-managed-helper-cache"
+  mkdir -p "$cache"
+  digest=$(cd "$src" && shasum -a 256 go.mod go.sum main.go oracle.go | shasum -a 256 | awk '{print $1}')
+  bin="$cache/bucket-setup-$digest"
+  if [ ! -x "$bin" ]; then (cd "$src" && go build -mod=readonly -o "$bin" .); fi
+  exec "$bin" "$@"
+fi
+[ "$#" -eq 4 ] || { echo 'expected kubeconfig context namespace run-scoped bucket' >&2; exit 1; }
+: "${GITHUB_ACTIONS:?}" "${GITHUB_RUN_ID:?}" "${GITHUB_RUN_ATTEMPT:?}" "${RUNNER_TEMP:?}"
+[ "$GITHUB_ACTIONS" = true ] || exit 1
+kubeconfig=$1 context=$2 namespace=$3 bucket=$4
+case "$context" in "kind-ha-managed-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT-"*) ;; *) echo 'unexpected owned Kind context' >&2; exit 1;; esac
+[ "$namespace" = managed-bootstrap ] || exit 1
+case "$bucket" in "rhiza-managed-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT-"*) ;; *) echo 'unexpected test bucket scope' >&2; exit 1;; esac
+src="$(CDPATH='' cd -- "$(dirname -- "$0")/ha-managed-bucket-setup-src" && pwd)"
+cache="$RUNNER_TEMP/ha-managed-helper-cache"
+mkdir -p "$cache"
+digest=$(cd "$src" && shasum -a 256 go.mod go.sum main.go oracle.go | shasum -a 256 | awk '{print $1}')
+bin="$cache/bucket-setup-$digest"
+if [ ! -x "$bin" ]; then (cd "$src" && go build -mod=readonly -o "$bin" .); fi
+scratch=$(mktemp -d "$RUNNER_TEMP/ha-managed-forward.XXXXXX")
+pid=
+cleanup() {
+  result=$?
+  trap - EXIT HUP INT TERM
+  if [ -n "$pid" ]; then
+    kill "$pid" 2>/dev/null || :
+    wait "$pid" 2>/dev/null || :
+    if kill -0 "$pid" 2>/dev/null; then echo 'owned port-forward remains' >&2; result=1; fi
+  fi
+  if [ "$result" -ne 0 ] && [ -f "$scratch/forward.log" ]; then
+    mkdir -p "$RUNNER_TEMP/ha-managed-bootstrap"
+    cp "$scratch/forward.log" "$RUNNER_TEMP/ha-managed-bootstrap/bucket-forward.txt" || result=1
+  fi
+  rm -f "$scratch/forward.log"
+  rmdir "$scratch" || result=1
+  exit "$result"
+}
+trap cleanup EXIT
+trap 'exit 1' HUP INT TERM
+kubectl --kubeconfig "$kubeconfig" --context "$context" --request-timeout=30s -n "$namespace" get deployment floci -o jsonpath='{.spec.template.spec.containers[0].image}' | { read -r image || :; [ "$image" = floci/floci:2.3.0 ]; }
+kubectl --kubeconfig "$kubeconfig" --context "$context" --request-timeout=30s -n "$namespace" port-forward --address=127.0.0.1 service/floci :4566 > "$scratch/forward.log" 2>&1 &
+pid=$!
+attempt=0
+while :; do
+  port=$(sed -n 's/^Forwarding from 127\.0\.0\.1:\([0-9]*\) -> 4566$/\1/p' "$scratch/forward.log" | head -1)
+  [ -z "$port" ] || break
+  kill -0 "$pid" 2>/dev/null || { cat "$scratch/forward.log" >&2; exit 1; }
+  attempt=$((attempt+1)); [ "$attempt" -lt 30 ] || exit 1; sleep 1
+done
+"$bin" "http://127.0.0.1:$port" "$bucket"

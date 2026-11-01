@@ -38,25 +38,35 @@ type Config struct {
 
 // New validates and creates a QuePaxa core.
 func New(config Config) (*Core, error) {
-	return newCoreFromConfig(config, false, false)
+	return newCoreFromConfig(config, false, false, false)
 }
 
 // NewObserver creates a passive verifier whose node ID must not be a voter.
 func NewObserver(config Config) (*Core, error) {
-	return newCoreFromConfig(config, true, false)
+	return newCoreFromConfig(config, true, false, false)
 }
 
 // NewLearner creates a non-voting replica that can verify and durably catch
 // up. It becomes a voter only after a certified target configuration names
 // its previously absent ID.
-func NewLearner(config Config) (*Core, error) { return newCoreFromConfig(config, false, true) }
+func NewLearner(config Config) (*Core, error) { return newCoreFromConfig(config, false, true, false) }
 
-func newCoreFromConfig(config Config, observer, learner bool) (*Core, error) {
+func installReconfigurationMarker(appendMarker, syncWAL func() error) error {
+	if err := appendMarker(); err != nil {
+		return err
+	}
+	return syncWAL()
+}
+
+func newCoreFromConfig(config Config, observer, learner, localReadOnlyInspection bool) (*Core, error) {
 	if config.NodeID == "" {
 		return nil, fmt.Errorf("%w: node ID is required", ErrInvalidConfig)
 	}
 	if config.WAL == nil {
 		return nil, fmt.Errorf("%w: WAL is required", ErrInvalidConfig)
+	}
+	if config.WAL.ReadOnly() && !observer && !localReadOnlyInspection {
+		return nil, fmt.Errorf("%w: read-only WAL is only supported for observers", ErrInvalidConfig)
 	}
 	if len(config.Cluster.Members) == 0 {
 		return nil, fmt.Errorf("%w: at least one member is required", ErrInvalidConfig)
@@ -153,10 +163,15 @@ func newCoreFromConfig(config Config, observer, learner bool) (*Core, error) {
 		return nil, fmt.Errorf("recover QuePaxa: %w", err)
 	}
 	if config.EnableReconfiguration && !core.reconfigWAL {
-		if err := config.WAL.Append(qlog.Entry{Type: qlog.EntryReceipt, Payload: append([]byte(nil), isrEntryV2Magic...)}); err != nil {
-			return nil, err
+		if observer && config.WAL.ReadOnly() {
+			return core, nil
 		}
-		if err := config.WAL.Sync(); err != nil {
+		if err := installReconfigurationMarker(
+			func() error {
+				return config.WAL.Append(qlog.Entry{Type: qlog.EntryReceipt, Payload: append([]byte(nil), isrEntryV2Magic...)})
+			},
+			config.WAL.Sync,
+		); err != nil {
 			return nil, err
 		}
 		core.reconfigWAL = true

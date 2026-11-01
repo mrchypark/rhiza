@@ -141,6 +141,7 @@ type extentObject struct {
 }
 
 type Manager struct {
+	appendOnly   bool
 	bucket       objstore.Bucket
 	prefix       string
 	configID     uint
@@ -165,6 +166,20 @@ type Manager struct {
 	readMu       sync.Mutex
 	readCond     *sync.Cond
 	readers      int
+}
+
+// NewAppendOnlyManager opens an HA namespace without online deletion.
+func NewAppendOnlyManager(bucket objstore.Bucket, prefix string, configID uint) (*Manager, error) {
+	if bucket == nil {
+		return nil, fmt.Errorf("append-only archive requires an object store")
+	}
+	options := bucket.SupportedObjectUploadOptions()
+	if !slices.Contains(options, objstore.IfNotExists) || !slices.Contains(options, objstore.IfMatch) {
+		return nil, fmt.Errorf("append-only archive requires conditional object writes")
+	}
+	m := NewManager(bucket, prefix, configID)
+	m.appendOnly = true
+	return m, nil
 }
 
 // NewManager opens one archive namespace. configID is the immutable archive
@@ -211,12 +226,19 @@ func (m *Manager) Load(ctx context.Context) error {
 }
 
 func (m *Manager) loadLocked(ctx context.Context, verified map[extentObject]Extent) error {
+	return m.loadHead(ctx, verified, false)
+}
+
+func (m *Manager) loadHead(ctx context.Context, verified map[extentObject]Extent, fixed bool) error {
 	m.mu.Lock()
 	oldExtents, oldHead, oldCAS := slices.Clone(m.extents), m.head, m.headCAS
 	m.mu.Unlock()
 	name := m.key("archive/head.bin")
 	attributes, headData, unchanged, err := m.readStableObject(ctx, name, oldCAS, oldHead.Tip == 0, maxArchiveHeadSize)
 	if err != nil {
+		if fixed {
+			return fmt.Errorf("read required archive head: %w", err)
+		}
 		if !m.bucket.IsObjNotFoundErr(err) {
 			return err
 		}
@@ -249,6 +271,9 @@ func (m *Manager) loadLocked(ctx context.Context, verified map[extentObject]Exte
 	if head.ConfigID != m.configID || head.Generation == 0 || head.Tip < head.Base || (head.Tip > head.Base) != (head.TailHash != [32]byte{}) {
 		return fmt.Errorf("invalid shared archive head")
 	}
+	if fixed && head.Tip-head.Base > maxReadOnlyDecisions {
+		return fmt.Errorf("read-only archive suffix exceeds decision limit")
+	}
 	if head.BaseAnchor != nil && (head.BaseSeal != nil || head.BaseDecision != nil) {
 		return fmt.Errorf("invalid shared archive mixed recovery base")
 	}
@@ -267,7 +292,11 @@ func (m *Manager) loadLocked(ctx context.Context, verified map[extentObject]Exte
 	}
 	hash, object, end := head.TailHash, head.TailObject, head.Tip
 	reused := false
+	readOnlyBytes := 0
 	for end > head.Base {
+		if fixed && len(extents) >= maxReadOnlyDecisions {
+			return fmt.Errorf("read-only archive suffix exceeds extent limit")
+		}
 		if hash == ([32]byte{}) {
 			return fmt.Errorf("invalid shared archive block chain")
 		}
@@ -290,6 +319,14 @@ func (m *Manager) loadLocked(ctx context.Context, verified map[extentObject]Exte
 			extent, err = m.readExtent(ctx, hash, object)
 			if err != nil {
 				return err
+			}
+			if fixed {
+				for _, decision := range extent.Decisions {
+					readOnlyBytes += len(decision.Value) + len(decision.Certificate)
+					if readOnlyBytes > maxReadOnlyPayloadBytes {
+						return fmt.Errorf("read-only archive suffix exceeds byte limit")
+					}
+				}
 			}
 			extent = extentRef(extent)
 			verified[key] = extent
@@ -329,8 +366,11 @@ func (m *Manager) loadLocked(ctx context.Context, verified map[extentObject]Exte
 	if next-1 != head.Tip {
 		return fmt.Errorf("shared archive head tip mismatch")
 	}
-	finalAttributes, err := m.bucket.Attributes(ctx, name)
-	if err != nil || !sameObjectVersion(attributes.Version, finalAttributes.Version) {
+	finalAttributes := attributes
+	if !fixed {
+		finalAttributes, err = m.bucket.Attributes(ctx, name)
+	}
+	if err != nil || !fixed && !sameObjectVersion(attributes.Version, finalAttributes.Version) {
 		if err != nil {
 			return err
 		}
@@ -1211,6 +1251,9 @@ func (m *Manager) Sealed() bool {
 // Cleanup removes obsolete immutable blocks after the grace period.
 // Every block reachable from the current head is always retained.
 func (m *Manager) Cleanup(ctx context.Context, grace time.Duration) error {
+	if m.appendOnly {
+		return fmt.Errorf("archive cleanup is disabled for append-only manager")
+	}
 	if grace < 0 {
 		return fmt.Errorf("archive GC grace period must not be negative")
 	}

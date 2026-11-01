@@ -288,17 +288,19 @@ func (n *Node) prepareLocalBackup(ctx context.Context) (resultErr error) {
 		_ = wal.Close()
 		return err
 	}
-	core, err := quepaxa.New(quepaxa.Config{NodeID: n.config.NodeID, Cluster: *n.loadClusterConfig(), WAL: wal, LocalMode: true})
+	view, err := quepaxa.OpenLocalReadOnlyInspection(quepaxa.Config{NodeID: n.config.NodeID, Cluster: *n.loadClusterConfig(), WAL: wal, LocalMode: true})
 	if err == nil {
-		err = n.validateLocalRoots(core)
+		err = n.validateLocalRoots(view)
 	}
 	if err != nil {
 		_ = wal.Close()
 		return err
 	}
+	var core *quepaxa.Core
+	var inspected localBackupCoreReader = view
 	// Pending recorder state belongs to local recovery; never replace it with a
 	// remote snapshot that could erase uncertainty from an interrupted write.
-	if core.RecorderTip() > core.Tip() {
+	if view.RecorderTip() > view.Tip() {
 		if err := wal.Close(); err != nil {
 			return err
 		}
@@ -321,9 +323,10 @@ func (n *Node) prepareLocalBackup(ctx context.Context) (resultErr error) {
 			_ = wal.Close()
 			return fmt.Errorf("recover original Local recorder before archive reconciliation: %w", err)
 		}
+		inspected = core
 	}
-	common := min(core.Tip(), archive.Tip())
-	localPrefix, localOK := core.PrefixHash(common)
+	common := min(inspected.Tip(), archive.Tip())
+	localPrefix, localOK := inspected.PrefixHash(common)
 	if common == 0 {
 		localPrefix, localOK = [32]byte{}, true
 	}
@@ -332,9 +335,9 @@ func (n *Node) prepareLocalBackup(ctx context.Context) (resultErr error) {
 		_ = wal.Close()
 		return fmt.Errorf("Local and remote histories diverge or prefix proof is unavailable")
 	}
-	localTip := core.Tip()
+	localTip := inspected.Tip()
 	if archive.Tip() > localTip {
-		if err := n.validateLocalBackupMaterialized(ctx, core); err != nil {
+		if err := n.validateLocalBackupMaterialized(ctx, inspected); err != nil {
 			return errors.Join(err, wal.Close())
 		}
 	}
@@ -371,7 +374,15 @@ func (n *Node) recoverStagedLocalMaintenance(ctx context.Context, archive *recov
 
 // Inspect a copy, including any uncheckpointed SQLite WAL, so even SQLite's
 // read-only sidecar handling cannot change the surviving evidence.
-func (n *Node) validateLocalBackupMaterialized(ctx context.Context, core *quepaxa.Core) error {
+type localBackupCoreReader interface {
+	Tip() quepaxa.Slot
+	RecorderTip() quepaxa.Slot
+	PrefixHash(quepaxa.Slot) ([32]byte, bool)
+	CompactionFloor() quepaxa.Slot
+	CertifiedValue(quepaxa.Slot) (quepaxa.DecidedValue, bool)
+}
+
+func (n *Node) validateLocalBackupMaterialized(ctx context.Context, core localBackupCoreReader) error {
 	source := filepath.Join(n.config.DataDir, "sqlite.db")
 	if _, err := os.Lstat(source); errors.Is(err, os.ErrNotExist) {
 		return nil

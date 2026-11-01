@@ -1,23 +1,14 @@
-apiVersion: rhiza.mrchypark.dev/v1alpha1
+# Illustrative only. Read the live binding and exact fresh cluster UID before
+# creating a request; generation 0 and this UID are placeholders, not authority.
+# When supported, submit with strict server-side field validation.
+apiVersion: rhiza.mrchypark.dev/v1alpha2
 kind: RhizaRecovery
 metadata:
-  name: rhiza-recovery-20260909
+  name: rhiza-recovery
   namespace: rhiza
 spec:
-  # An existing StatefulSet of at least three voters. This resource never creates a new
-  # database or PVCs.
-  statefulSet: rhiza
-  sourceClusterID: production-rhiza
-  durability: before-ack
-  # Empty recoveryID observes only. Set an explicit ID only after the fence is
-  # confirmed; it is used to derive a distinct target generation.
-  recoveryID: ""
-  allowDataLoss: false
-  fence:
-    # This is a trusted administrator attestation from outside Kubernetes. Pod
-    # disappearance is not evidence that the old voters are fenced.
-    recoveryID: ""
-    clusterID: production-rhiza
-    statefulSetUID: ""
-    confirmed: false
-    evidence: ""
+  target:
+    name: rhiza
+    uid: REPLACE_WITH_FRESH_LIVE_CLUSTER_UID
+  expectedGeneration: 0
+  backoffLimit: 6

@@ -76,6 +76,7 @@ type Server struct {
 	cluster              types.ClusterID
 	mux                  *http.ServeMux
 	ready                func() bool
+	learnReady           func() bool
 	writable             bool
 	sqlBatcher           *mutationBatcher[types.SQLCommand]
 	graphBatcher         *mutationBatcher[types.GraphCommand]
@@ -366,6 +367,17 @@ func (s *Server) FailLocalLifecycle(err error) {
 }
 
 // Ready reports root readiness, including a sticky Local lifecycle failure.
+// SetLearnReady separates certified decision delivery from new client admission.
+// Install it before publishing the peer listener; absent means Ready as before.
+func (s *Server) SetLearnReady(ready func() bool) { s.learnReady = ready }
+
+func (s *Server) readyToLearn() bool {
+	if s.learnReady != nil {
+		return s.learnReady()
+	}
+	return s.Ready()
+}
+
 func (s *Server) Ready() bool {
 	if s.ready == nil || !s.ready() {
 		return false
@@ -1090,6 +1102,12 @@ func (s *Server) lockCatchUp(ctx context.Context, source quepaxa.NodeID) (func()
 }
 
 func (s *Server) catchUpFrom(ctx context.Context, source quepaxa.NodeID, through quepaxa.Slot, durable bool) error {
+	return s.catchUpFromTip(ctx, source, through, durable, s.core.Tip)
+}
+
+// The per-call reader keeps the fetch-range calculation independently testable
+// with a real Core advancing between observations; production reads Core.Tip.
+func (s *Server) catchUpFromTip(ctx context.Context, source quepaxa.NodeID, through quepaxa.Slot, durable bool, tip func() quepaxa.Slot) error {
 	unlock, err := s.lockCatchUp(ctx, source)
 	if err != nil {
 		return err
@@ -1110,8 +1128,12 @@ func (s *Server) catchUpFrom(ctx context.Context, source quepaxa.NodeID, through
 	if err := ctx.Err(); err != nil {
 		return err
 	}
-	for s.core.Tip() < through {
-		from := s.core.Tip() + 1
+	for {
+		current := tip()
+		if current >= through {
+			break
+		}
+		from := current + 1
 		response, err := fetchDecisionsWithRetry(ctx, s.transport.FetchDecisions, source, from)
 		if err != nil {
 			return s.handleCatchUpFetchError(err)

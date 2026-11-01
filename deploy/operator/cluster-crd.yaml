@@ -10,7 +10,7 @@ spec:
     singular: rhizacluster
     kind: RhizaCluster
   versions:
-    - name: v1alpha1
+    - name: v1alpha2
       served: true
       storage: true
       subresources:
@@ -19,89 +19,351 @@ spec:
         openAPIV3Schema:
           type: object
           required: [spec]
+          x-kubernetes-validations:
+            - rule: '!has(oldSelf.status) || !has(oldSelf.status.genesis) || (has(self.status) && has(self.status.genesis) && self.status.genesis == oldSelf.status.genesis && has(self.status.authority))'
+              message: genesis receipt cannot be removed or changed and requires authority
+            - rule: '!has(self.status) || !has(self.status.genesis) || has(self.status.authority)'
+              message: genesis receipt requires authority
+            - rule: '!has(self.status) || !has(self.status.genesis) || (has(oldSelf.status) && has(oldSelf.status.genesis)) || (has(self.status.applicationInit) && self.status.applicationInit.state == "Unused" && has(self.status.bootstrapPlan) && has(self.status.authority) && has(self.status.authority.everApplicationReserved) && !self.status.authority.everApplicationReserved)'
+              message: new genesis requires an unused initialization assignment
+            - rule: '!has(oldSelf.status) || !has(oldSelf.status.authority) || !has(oldSelf.status.authority.everApplicationReserved) || !oldSelf.status.authority.everApplicationReserved || (has(self.status) && has(self.status.authority) && has(self.status.authority.everApplicationReserved) && self.status.authority.everApplicationReserved)'
+              message: application reservation history cannot be removed or reset
           properties:
             spec:
               type: object
-              required: [logicalID, statefulSet, container, adoptClusterID, voterCount, automatic, policy]
+              required: [logicalID, voterCount, workload]
+              x-kubernetes-validations:
+                - rule: 'has(self.genesisIntent) == has(oldSelf.genesisIntent) && (!has(self.genesisIntent) || self.genesisIntent == oldSelf.genesisIntent)'
+                  message: genesisIntent is creation-only and immutable
+                - rule: '!has(self.statefulSet) && !has(self.container) && !has(self.adoptClusterID) && !has(self.automatic) && !has(self.policy) && !has(self.bootstrap) && !has(self.clusterDomain) && !has(self.anchorID) && !has(self.httpPort) && !has(self.peerPort) && !has(self.voterPods)'
+                  message: legacy cluster fields are unsupported
+                - rule: self.voterCount == oldSelf.voterCount
+                  message: voterCount updates are unsupported
               properties:
+                genesisIntent: {type: string, maxLength: 6, enum: [Create]}
+                statefulSet: {type: string}
+                container: {type: string}
+                adoptClusterID: {type: string}
+                automatic: {type: boolean}
+                policy: {type: object, x-kubernetes-preserve-unknown-fields: true}
+                bootstrap: {type: boolean}
+                clusterDomain: {type: string}
+                anchorID: {type: string}
+                httpPort: {type: integer}
+                peerPort: {type: integer}
+                voterPods: {type: array, items: {type: string}}
                 logicalID:
                   type: string
                   minLength: 1
-                statefulSet:
-                  type: string
-                  minLength: 1
-                container:
-                  type: string
-                  minLength: 1
-                adoptClusterID:
-                  type: string
-                  minLength: 1
-                anchorID:
-                  type: string
-                  description: >-
-                    External recovery anchor identifier for automatic child recovery
-                    resources. When set, every generated RhizaRecovery inherits this
-                    anchorID and the workload must export RHIZA_RECOVERY_ANCHOR_ID.
-                voterCount:
-                  description: >-
-                    Voter count for the source and replacement generation. The
-                    StatefulSet must declare the same number of desired replicas.
-                    When it exports RHIZA_CLUSTER_MEMBERS, that list must contain
-                    the same count and use the Pod names <statefulSet>-<ordinal>.
-                    The controller derives those names, the headless-service
-                    DNS names, and fresh credentials. The count cannot be changed
-                    in place. Generation fencing names every voter plus retained
-                    learner history within RhizaFence.spec.targets.maxItems (64).
-                  type: integer
-                  minimum: 3
-                  maximum: 64
-                httpPort:
-                  description: >-
-                    HTTP port used in generated voter URLs. Defaults to 8080.
-                  type: integer
-                  minimum: 1
-                  maximum: 65535
-                  default: 8080
-                peerPort:
-                  description: >-
-                    QUIC peer port used in generated voter URLs. Defaults to 9090.
-                  type: integer
-                  minimum: 1
-                  maximum: 65535
-                  default: 9090
-                clusterDomain:
-                  description: >-
-                    Kubernetes cluster DNS domain used in generated voter URLs.
-                    Defaults to cluster.local.
-                  type: string
-                  pattern: '^[a-z0-9]([-a-z0-9]*[a-z0-9])?(\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*$'
-                  default: cluster.local
-                bootstrap:
-                  description: >-
-                    Generate the initial membership for a workload that exports
-                    no RHIZA_CLUSTER_MEMBERS. Defaults to false. The controller
-                    refuses bootstrap when the adopted cluster ID already has a
-                    membership commitment in object storage.
-                  type: boolean
-                  default: false
-                automatic:
-                  type: boolean
-                  description: Explicit consent to fence an unreachable generation even when an observer-only partition might hide a healthy majority. False suspends new incidents, not an already reserved recovery.
-                policy:
+                  maxLength: 256
+                  pattern: '[^\x{0009}-\x{000D}\x{0020}\x{0085}\x{00A0}\x{1680}\x{2000}-\x{200A}\x{2028}\x{2029}\x{202F}\x{205F}\x{3000}]'
+                  x-kubernetes-validations:
+                    - rule: self == oldSelf
+                      message: logicalID is immutable
+                voterCount: {type: integer, minimum: 3, maximum: 64}
+                workload:
                   type: object
-                  required: [failureGraceSeconds, cooldownSeconds, maxRecoveriesPerDay, allowDataLoss]
+                  required: [podTemplate]
                   properties:
-                    failureGraceSeconds: {type: integer, minimum: 1, maximum: 86400}
-                    cooldownSeconds: {type: integer, minimum: 1, maximum: 604800}
-                    maxRecoveriesPerDay: {type: integer, minimum: 1, maximum: 100}
-                    allowDataLoss:
-                      type: boolean
-                      description: Explicitly allow recovery of only the certified archived prefix for an async source. Unarchived acknowledged writes may be lost.
+                    podTemplate:
+                      type: object
+                      required: [spec]
+                      x-kubernetes-validations:
+                        - rule: '!has(self.metadata)'
+                          message: pod template metadata is unsupported
+                      properties:
+                        metadata: {type: object, x-kubernetes-preserve-unknown-fields: true}
+                        spec:
+                          type: object
+                          required: [containers]
+                          x-kubernetes-validations:
+                            - rule: '!has(self.volumes) && !has(self.initContainers) && !has(self.ephemeralContainers)'
+                              message: pod volumes and additional container types are unsupported
+                          properties:
+                            volumes: {type: array, items: {type: object, x-kubernetes-preserve-unknown-fields: true}}
+                            initContainers: {type: array, items: {type: object, x-kubernetes-preserve-unknown-fields: true}}
+                            ephemeralContainers: {type: array, items: {type: object, x-kubernetes-preserve-unknown-fields: true}}
+                            containers:
+                              type: array
+                              minItems: 1
+                              maxItems: 64
+                              x-kubernetes-validations:
+                                - rule: 'self.all(c, self.filter(d, d.name == c.name).size() == 1)'
+                                  message: container names must be unique
+                                - rule: 'self.map(c, [c.name, c.image]) == oldSelf.map(c, [c.name, c.image])'
+                                  message: workload updates are unsupported
+                              items:
+                                type: object
+                                required: [name, image]
+                                x-kubernetes-validations:
+                                  - rule: '!has(self.env) && !has(self.envFrom) && !has(self.volumeMounts) && !has(self.volumeDevices)'
+                                    message: container environment and volumes are unsupported
+                                properties:
+                                  name:
+                                    type: string
+                                    minLength: 1
+                                    maxLength: 63
+                                    pattern: '^[a-z0-9]([-a-z0-9]*[a-z0-9])?$'
+                                    x-kubernetes-validations:
+                                      - rule: '!self.startsWith("rhiza-")'
+                                        message: rhiza- container names are reserved
+                                  image: {type: string, minLength: 1, maxLength: 2048, pattern: '[^\x{0009}-\x{000D}\x{0020}\x{0085}\x{00A0}\x{1680}\x{2000}-\x{200A}\x{2028}\x{2029}\x{202F}\x{205F}\x{3000}]'}
+                                  env: {type: array, items: {type: object, x-kubernetes-preserve-unknown-fields: true}}
+                                  envFrom: {type: array, items: {type: object, x-kubernetes-preserve-unknown-fields: true}}
+                                  volumeMounts: {type: array, items: {type: object, x-kubernetes-preserve-unknown-fields: true}}
+                                  volumeDevices: {type: array, items: {type: object, x-kubernetes-preserve-unknown-fields: true}}
+                automaticRecovery:
+                  type: string
+                  enum: ["OFF", A, B]
+                  default: "OFF"
+                provisionalRetentionSeconds:
+                  type: integer
+                  format: int64
+                  minimum: 0
+                  maximum: 9223372036
+                  default: 172800
+                deletionPolicy:
+                  type: string
+                  enum: [Orphan, Delete]
+                  default: Orphan
             status:
               type: object
+              x-kubernetes-preserve-unknown-fields: true
+              x-kubernetes-validations:
+                - rule: '!has(oldSelf.repair) || has(self.repair)'
+                  message: repair record cannot be removed
+                - rule: '!has(self.repair) || (has(self.authority) && has(self.applicationInit) && self.applicationInit.state == "Consumed" && self.repair.plan.bootstrapPlanDigest == self.applicationInit.plan.bootstrapPlanDigest)'
+                  message: repair requires consumed managed bootstrap history
+                - rule: '!has(self.repair) || !has(self.repair.preparedHandoff) || (has(oldSelf.repair) && self.repair.plan.operationID == oldSelf.repair.plan.operationID && (has(oldSelf.repair.preparedHandoff) || (oldSelf.repair.state == "Closed" && self.repair.state == "Closed")))'
+                  message: handoff capture requires an existing closed repair operation
+                - rule: '!has(self.repair) || !has(self.repair.preparedHandoff) || (has(self.applicationInit) && self.repair.preparedHandoff.physicalBinding == self.applicationInit.plan.physicalBinding)'
+                  message: handoff physical binding must match immutable initialization
+                - rule: '!has(self.repair) || self.repair.state != "Closed" || (has(self.authority.owner) && has(self.authority.owner.uid) && has(self.authority.binding) && has(self.authority.binding.deploymentUID) && has(self.authority.binding.storageID) && has(self.authority.generation) && !has(self.authority.transition) && self.repair.plan.clusterUID == self.authority.owner.uid && self.repair.plan.generation == self.authority.generation && self.repair.plan.deploymentUID == self.authority.binding.deploymentUID && self.repair.plan.storageID == self.authority.binding.storageID)'
+                  message: closed repair must match authority and cannot overlap a transition
+                - rule: '!has(oldSelf.repair) || !has(self.repair) || self.repair.plan.operationID != oldSelf.repair.plan.operationID || self.repair.plan == oldSelf.repair.plan'
+                  message: repair intent is immutable per operation
+                - rule: '!has(oldSelf.repair) || !has(self.repair) || oldSelf.repair.state == "Closed" || self.repair.plan.operationID != oldSelf.repair.plan.operationID || self.repair == oldSelf.repair'
+                  message: terminal repair is immutable per operation
+                - rule: '!has(self.repair) || (has(oldSelf.repair) && self.repair.plan.operationID == oldSelf.repair.plan.operationID) || self.repair.state == "Closed"'
+                  message: a new repair must start closed
+                - rule: '!has(oldSelf.repair) || !has(self.repair) || self.repair.plan.operationID == oldSelf.repair.plan.operationID || (oldSelf.repair.state != "Closed" && self.repair.state == "Closed" && (self.repair.plan.generation > oldSelf.repair.plan.generation || (self.repair.plan.generation == oldSelf.repair.plan.generation && self.repair.plan.expectedConfigID >= oldSelf.repair.completion.configID && (self.repair.plan.expectedConfigID > oldSelf.repair.plan.expectedConfigID || (self.repair.plan.expectedConfigID == oldSelf.repair.plan.expectedConfigID && self.repair.plan.expectedAbortSlot > oldSelf.repair.plan.expectedAbortSlot)) && (oldSelf.repair.state != "Aborted" || self.repair.plan.expectedConfigID != oldSelf.repair.completion.configID || self.repair.plan.expectedAbortSlot >= oldSelf.repair.completion.slot))))'
+                  message: replacement repair requires a terminal predecessor and advanced position
+                - rule: '!has(self.repair) || (has(oldSelf.repair) && self.repair == oldSelf.repair) || (has(oldSelf.authority) && self.authority == oldSelf.authority)'
+                  message: repair CAS cannot overwrite application authority
+                - rule: '!has(oldSelf.repair) || oldSelf.repair.state != "Closed" || !has(self.authority.pendingWrite) || !self.authority.pendingWrite || (has(oldSelf.authority.pendingWrite) && oldSelf.authority.pendingWrite && has(oldSelf.authority.pendingRequest) && has(self.authority.pendingRequest) && self.authority.pendingRequest == oldSelf.authority.pendingRequest)'
+                  message: closed repair forbids new application reservations
+                - rule: 'has(oldSelf.genesis) || !has(self.genesis) || (has(self.applicationInit) && self.applicationInit.state == "Unused" && has(self.bootstrapPlan) && has(self.authority) && !self.authority.everApplicationReserved)'
+                  message: new genesis requires an unused initialization assignment
+                - rule: '!has(oldSelf.genesis) || has(oldSelf.bootstrapPlan) || !has(self.bootstrapPlan)'
+                  message: existing genesis cannot acquire a bootstrap plan
+                - rule: '!has(oldSelf.bootstrapPlan) || (has(self.bootstrapPlan) && self.bootstrapPlan == oldSelf.bootstrapPlan)'
+                  message: bootstrap plan is immutable and cannot be removed
+                - rule: '!has(self.bootstrapPlan) || (has(self.genesis) && has(self.authority) && has(self.applicationInit))'
+                  message: bootstrap plan requires genesis, authority and assignment
+                - rule: '!has(oldSelf.genesis) || has(oldSelf.applicationInit) || !has(self.applicationInit)'
+                  message: existing genesis cannot acquire an initialization assignment
+                - rule: '!has(oldSelf.applicationInit) || has(self.applicationInit)'
+                  message: initialization assignment cannot be removed
+                - rule: '!has(oldSelf.applicationInit) || !has(self.applicationInit) || self.applicationInit.plan == oldSelf.applicationInit.plan'
+                  message: initialization plan is immutable
+                - rule: '!has(oldSelf.applicationInit) || !has(self.applicationInit) || oldSelf.applicationInit.state != "Consumed" || self.applicationInit == oldSelf.applicationInit'
+                  message: consumed initialization cannot be changed or rearmed
+                - rule: '!has(self.applicationInit) || (has(self.genesis) && has(self.authority))'
+                  message: initialization assignment requires genesis and authority
+                - rule: '!has(self.applicationInit) || (self.applicationInit.plan.clusterUID == self.genesis.ownerUID && self.applicationInit.plan.intentHash == self.genesis.intentHash && self.applicationInit.plan.deploymentUID == self.genesis.deploymentUID && self.applicationInit.plan.storageID == self.genesis.storageID)'
+                  message: initialization assignment must match genesis
               properties:
-                phase: {type: string}
-                message: {type: string}
-                activeClusterID: {type: string}
-                activeRecovery: {type: string}
-                observedGeneration: {type: integer, format: int64}
+                authority:
+                  type: object
+                  x-kubernetes-preserve-unknown-fields: true
+                  required: [everApplicationReserved]
+                  properties:
+                    everApplicationReserved: {type: boolean}
+                    generation: {type: integer, format: int64, minimum: 0}
+                    owner:
+                      type: object
+                      x-kubernetes-preserve-unknown-fields: true
+                      properties:
+                        uid: {type: string, maxLength: 256}
+                    binding:
+                      type: object
+                      x-kubernetes-preserve-unknown-fields: true
+                      properties:
+                        deploymentUID: {type: string, maxLength: 256}
+                        storageID: {type: string, maxLength: 256}
+                    transition: {type: object, x-kubernetes-preserve-unknown-fields: true}
+                    pendingWrite: {type: boolean}
+                    pendingRequest: {type: object, x-kubernetes-preserve-unknown-fields: true}
+                  x-kubernetes-validations:
+                    - rule: '!oldSelf.everApplicationReserved || self.everApplicationReserved'
+                      message: application reservation history cannot be reset
+                repair:
+                  type: object
+                  required: [plan, state]
+                  x-kubernetes-validations:
+                    - rule: 'self.plan.operationID != oldSelf.plan.operationID || !has(oldSelf.preparedHandoff) || (has(self.preparedHandoff) && self.preparedHandoff == oldSelf.preparedHandoff)'
+                      message: captured handoff is immutable within an operation
+                    - rule: '!has(self.preparedHandoff) || (self.preparedHandoff.survivors.config_id == self.plan.expectedConfigID + 1 && self.preparedHandoff.removeTerminalSlot > self.plan.expectedAbortSlot)'
+                      message: handoff must bind the post-REMOVE configuration and terminal position
+                    - rule: '!has(self.preparedHandoff) || (self.preparedHandoff.survivors.members.size() + 1 == self.plan.finalVoterIDs.size() && self.preparedHandoff.survivors.members.all(m, m.node_id != self.plan.oldNodeID && m.node_id != self.plan.replacement.nodeID && m.node_id in self.plan.finalVoterIDs && self.preparedHandoff.survivors.members.filter(other, other.node_id == m.node_id).size() == 1))'
+                      message: handoff survivor set must exactly precede the intended ADD
+                    - rule: '(self.state == "Closed" && !has(self.completion)) || (self.state != "Closed" && has(self.completion))'
+                      message: repair state and completion must agree
+                    - rule: '!has(self.completion) || (self.completion.operationID == self.plan.operationID && self.completion.expectedConfigID == self.plan.expectedConfigID && self.completion.expectedAbortSlot == self.plan.expectedAbortSlot && self.completion.slot > self.plan.expectedAbortSlot)'
+                      message: repair completion must bind the exact operation and position
+                    - rule: '!has(self.completion) || (self.state == "Completed" && self.completion.kind == "Terminal" && self.completion.configID == self.plan.expectedConfigID + 2 && has(self.completion.finalVoterIDs) && self.completion.finalVoterIDs == self.plan.finalVoterIDs) || (self.state == "Aborted" && self.completion.kind == "Abort" && self.completion.configID >= self.plan.expectedConfigID && !has(self.completion.finalVoterIDs))'
+                      message: REMOVE alone is not final repair completion
+                  properties:
+                    state: {type: string, enum: [Closed, Completed, Aborted]}
+                    preparedHandoff:
+                      type: object
+                      required: [planDigest, sourceRoot, sourcePrefix, physicalBinding, head, headHash, removeTerminalSlot, removeTerminalHash, survivors]
+                      x-kubernetes-validations:
+                        - rule: 'self.head.size() < 87384 || self.head.endsWith("==")'
+                          message: captured HEAD exceeds the decoded 64 KiB limit
+                      properties:
+                        planDigest: {type: string, pattern: '^[0-9a-f]{64}$', minLength: 64, maxLength: 64}
+                        sourceRoot: {type: string, maxLength: 4096}
+                        sourcePrefix: {type: string, minLength: 1, maxLength: 8192}
+                        physicalBinding: {type: string, pattern: '^[0-9a-f]{64}$', minLength: 64, maxLength: 64}
+                        head:
+                          type: string
+                          minLength: 4
+                          maxLength: 87384
+                          pattern: '^([A-Za-z0-9+/]{4})*([A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$'
+                        headHash: {type: string, pattern: '^[0-9a-f]{64}$', minLength: 64, maxLength: 64}
+                        removeTerminalSlot: {type: integer, format: int64, minimum: 1}
+                        removeTerminalHash: {type: string, pattern: '^[0-9a-f]{64}$', minLength: 64, maxLength: 64}
+                        survivors:
+                          type: object
+                          required: [config_id, members]
+                          properties:
+                            config_id: {type: integer, format: int64, minimum: 1}
+                            members:
+                              type: array
+                              minItems: 1
+                              maxItems: 63
+                              items:
+                                type: object
+                                required: [node_id, url, log_url, public_key]
+                                properties:
+                                  node_id: {type: string, minLength: 1, maxLength: 256}
+                                  url: {type: string, maxLength: 2048}
+                                  peer_url: {type: string, maxLength: 2048}
+                                  log_url: {type: string, maxLength: 2048}
+                                  public_key: {type: string, minLength: 44, maxLength: 44}
+                                  wal_identity: {type: string, pattern: '^[0-9a-f]{64}$', minLength: 64, maxLength: 64}
+                    plan:
+                      type: object
+                      required: [operationID, clusterUID, generation, deploymentUID, storageID, expectedConfigID, expectedAbortSlot, oldNodeID, oldWALIdentity, replacement, bootstrapPlanDigest, finalVoterIDs]
+                      x-kubernetes-validations:
+                        - rule: 'self.replacement.nodeID in self.finalVoterIDs && !(self.oldNodeID in self.finalVoterIDs)'
+                          message: final target must include replacement and exclude old voter
+                      properties:
+                        operationID: {type: string, minLength: 1, maxLength: 256}
+                        clusterUID: {type: string, minLength: 1, maxLength: 256}
+                        generation: {type: integer, format: int64, minimum: 0}
+                        deploymentUID: {type: string, minLength: 1, maxLength: 256}
+                        storageID: {type: string, minLength: 1, maxLength: 256}
+                        expectedConfigID:
+                          type: integer
+                          format: int64
+                          minimum: 1
+                          x-kubernetes-validations:
+                            - rule: 'self <= 9223372036854775805'
+                              message: repair expectedConfigID exceeds supported signed integer range
+                        expectedAbortSlot: {type: integer, format: int64, minimum: 0}
+                        oldNodeID: {type: string, minLength: 1, maxLength: 256}
+                        oldWALIdentity: {type: string, minLength: 1, maxLength: 256}
+                        bootstrapPlanDigest: {type: string, pattern: '^[0-9a-f]{64}$', minLength: 64, maxLength: 64}
+                        finalVoterIDs:
+                          type: array
+                          minItems: 2
+                          maxItems: 64
+                          x-kubernetes-list-type: set
+                          items: {type: string, minLength: 1, maxLength: 256}
+                        replacement:
+                          type: object
+                          required: [podName, podUID, nodeID, publicKey, peerURL]
+                          properties:
+                            podName: {type: string, minLength: 1, maxLength: 253}
+                            podUID: {type: string, minLength: 1, maxLength: 256}
+                            nodeID: {type: string, minLength: 1, maxLength: 256}
+                            publicKey: {type: string, minLength: 44, maxLength: 44}
+                            peerURL: {type: string, minLength: 1, maxLength: 2048}
+                    completion:
+                      type: object
+                      required: [operationID, planDigest, expectedConfigID, expectedAbortSlot, kind, configID, slot, hash]
+                      properties:
+                        operationID: {type: string, minLength: 1, maxLength: 256}
+                        planDigest: {type: string, pattern: '^[0-9a-f]{64}$', minLength: 64, maxLength: 64}
+                        expectedConfigID: {type: integer, format: int64, minimum: 1}
+                        expectedAbortSlot: {type: integer, format: int64, minimum: 0}
+                        kind: {type: string, enum: [Terminal, Abort]}
+                        configID: {type: integer, format: int64, minimum: 1}
+                        slot: {type: integer, format: int64, minimum: 1}
+                        hash: {type: string, pattern: '^[0-9a-f]{64}$', minLength: 64, maxLength: 64}
+                        finalVoterIDs:
+                          type: array
+                          minItems: 2
+                          maxItems: 64
+                          x-kubernetes-list-type: set
+                          items: {type: string, minLength: 1, maxLength: 256}
+                bootstrapPlan:
+                  type: object
+                  required: [clusterID, members, physicalBinding, evidenceFormat, durability, reconfiguration]
+                  properties:
+                    clusterID: {type: string, minLength: 1, maxLength: 256}
+                    physicalBinding: {type: string, minLength: 64, maxLength: 64, pattern: '^[0-9a-f]{64}$'}
+                    evidenceFormat: {type: string, minLength: 1, maxLength: 256}
+                    durability: {type: string, enum: [before-ack]}
+                    reconfiguration: {type: boolean}
+                    members:
+                      type: array
+                      minItems: 3
+                      maxItems: 64
+                      items:
+                        type: object
+                        required: [podUID, member]
+                        properties:
+                          podUID: {type: string, minLength: 1, maxLength: 256}
+                          member:
+                            type: object
+                            required: [node_id, url, log_url, public_key]
+                            properties:
+                              node_id: {type: string, minLength: 1, maxLength: 256}
+                              url: {type: string, maxLength: 2048}
+                              peer_url: {type: string, minLength: 1, maxLength: 2048}
+                              log_url: {type: string, maxLength: 2048}
+                              public_key: {type: string, minLength: 44, maxLength: 44}
+                genesis:
+                  type: object
+                  required: [ownerUID, logicalID, deploymentUID, storageID, intentHash]
+                  properties:
+                    ownerUID: {type: string, minLength: 1, maxLength: 256}
+                    logicalID: {type: string, minLength: 1, maxLength: 256}
+                    deploymentUID: {type: string, minLength: 1, maxLength: 256}
+                    storageID: {type: string, minLength: 1, maxLength: 256}
+                    intentHash: {type: string, minLength: 64, maxLength: 64, pattern: '^[0-9a-f]{64}$'}
+                applicationInit:
+                  type: object
+                  required: [plan, state]
+                  x-kubernetes-validations:
+                    - rule: '(self.state == "Unused" && !has(self.initialEvidenceDigest)) || (self.state == "Consumed" && has(self.initialEvidenceDigest))'
+                      message: assignment state and initial evidence digest must agree
+                  properties:
+                    state: {type: string, enum: [Unused, Consumed]}
+                    initialEvidenceDigest: {type: string, minLength: 64, maxLength: 64, pattern: '^[0-9a-f]{64}$'}
+                    plan:
+                      type: object
+                      required: [assignmentID, clusterUID, intentHash, generation, deploymentUID, storageID, physicalBinding, bootstrapPlanDigest, evidenceFormat]
+                      properties:
+                        assignmentID: {type: string, minLength: 1, maxLength: 256}
+                        clusterUID: {type: string, minLength: 1, maxLength: 256}
+                        intentHash: {type: string, minLength: 64, maxLength: 64, pattern: '^[0-9a-f]{64}$'}
+                        generation: {type: integer, format: int64, minimum: 0, maximum: 0}
+                        deploymentUID: {type: string, minLength: 1, maxLength: 256}
+                        storageID: {type: string, minLength: 1, maxLength: 256}
+                        physicalBinding: {type: string, minLength: 64, maxLength: 64, pattern: '^[0-9a-f]{64}$'}
+                        bootstrapPlanDigest: {type: string, minLength: 64, maxLength: 64, pattern: '^[0-9a-f]{64}$'}
+                        evidenceFormat: {type: string, minLength: 1, maxLength: 256}
