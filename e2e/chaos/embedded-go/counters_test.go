@@ -368,8 +368,8 @@ func TestQualificationApplicationProvenance(t *testing.T) {
 	for _, required := range []string{
 		`-test.run='^TestRustContractRunStartedMarker$'`,
 		`-test.run='^TestManagedFFIInClusterSQLLifecycle$'`,
-		"if [ \"$rust_initial\" = 0 ]; then\n    # A prior start with a lost ACK never authorizes another initial mutation.\n    /usr/local/libexec/rhiza-rust-managed-contract\n",
-		"if [ \"$rust_initial\" = 1 ]; then\n    /usr/local/libexec/rhiza-rust-managed-contract --initial-run\n",
+		"if [ \"$rust_initial\" = 0 ]; then\n    # A prior start with a lost ACK never authorizes another initial mutation.\n    run_contract rust-restart /usr/local/libexec/rhiza-rust-managed-contract\n",
+		"if [ \"$rust_initial\" = 1 ]; then\n    run_contract rust-initial /usr/local/libexec/rhiza-rust-managed-contract --initial-run\n",
 		`exec /usr/local/libexec/rhiza-ha-init "$@"`,
 	} {
 		if !bytes.Contains(entrypoint, []byte(required)) {
