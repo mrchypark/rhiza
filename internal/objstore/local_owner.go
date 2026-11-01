@@ -19,14 +19,15 @@ import (
 // LocalFilesystemOwner serializes all Local archives rooted in one filesystem
 // directory. The root-wide scope intentionally avoids prefix-alias ambiguity.
 type LocalFilesystemOwner struct {
-	mu      sync.Mutex
-	changed chan struct{}
-	active  int
-	closing bool
-	poison  bool
-	root    *os.File
-	anchor  *os.File
-	rootDir string
+	mu       sync.Mutex
+	changed  chan struct{}
+	active   int
+	closing  bool
+	poison   bool
+	root     *os.File
+	anchor   *os.File
+	rootDir  string
+	mutation chan struct{}
 }
 
 // AcquireLocalFilesystemOwner requires a dedicated filesystem root outside
@@ -80,6 +81,34 @@ func (o *LocalFilesystemOwner) enter() (func(), error) {
 		}
 		o.mu.Unlock()
 	}, nil
+}
+
+// The filesystem provider uses a fixed swap pathname and Delete can remove
+// parent directories. Serialize complete mutation calls across every wrapper,
+// including provider defers, rather than treating the caller's wait as completion.
+func (o *LocalFilesystemOwner) enterMutation(ctx context.Context) (func(), error) {
+	done, err := o.enter()
+	if err != nil {
+		return nil, err
+	}
+	o.mu.Lock()
+	if o.mutation == nil {
+		o.mutation = make(chan struct{}, 1)
+	}
+	gate := o.mutation
+	o.mu.Unlock()
+	select {
+	case gate <- struct{}{}:
+		if err := ctx.Err(); err != nil {
+			<-gate
+			done()
+			return nil, err
+		}
+		return func() { <-gate; done() }, nil
+	case <-ctx.Done():
+		done()
+		return nil, ctx.Err()
+	}
 }
 
 // Wrap counts actual bucket calls, not caller waits. A timed-out LocalBucket
@@ -191,7 +220,7 @@ func ownerAnchorPath(root string) string {
 }
 
 func (b *localOwnerBucket) Upload(ctx context.Context, name string, r io.Reader, opts ...objstore.ObjectUploadOption) error {
-	done, err := b.owner.enter()
+	done, err := b.owner.enterMutation(ctx)
 	if err != nil {
 		return err
 	}
@@ -203,7 +232,7 @@ func (b *localOwnerBucket) Upload(ctx context.Context, name string, r io.Reader,
 	return err
 }
 func (b *localOwnerBucket) Delete(ctx context.Context, name string) error {
-	done, err := b.owner.enter()
+	done, err := b.owner.enterMutation(ctx)
 	if err != nil {
 		return err
 	}
