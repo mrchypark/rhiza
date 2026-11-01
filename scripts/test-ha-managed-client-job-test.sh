@@ -116,7 +116,11 @@ ready_curl() {
     set -- "$@" "$arg"
   done < "$scratch/args"
   case "$ready_test_mode" in
-    dns) curl "$@" --connect-to "127.0.0.1:$port:rhiza-unresolvable.invalid:$port" ;;
+    dns) (
+      # Resolver failure propagation is a contract replay; real HTTP stays loopback-only.
+      curl() { printf '%s\n' resolver-exit6 >> "$scratch/resolver-calls"; return 6; }
+      curl "$@"
+    ) ;;
     invalid) curl "$@" --invalid-option ;;
     *) curl "$@" ;;
   esac
@@ -166,7 +170,9 @@ for mode in dns invalid; do
   start=$(date +%s)
   code=0; ready_curl "$mode" > "$scratch/$mode.log" 2>&1 || code=$?
   [ "$code" -ne 0 ] || printf '%s\n' SQL-once >> "$scratch/business"
-  if [ "$mode" = dns ]; then [ "$code" -eq 6 ]; else [ "$code" -eq 2 ]; fi
+  if [ "$mode" = dns ]; then
+    [ "$code" -eq 6 ] && [ "$(wc -l < "$scratch/resolver-calls")" -eq 1 ]
+  else [ "$code" -eq 2 ]; fi
   [ "$(( $(date +%s) - start ))" -le 3 ] && [ ! -s "$scratch/business" ]
 done
 printf '%s\n' 'PASS: common client Job completion/failure/deadline/UID-bound diagnostics; original failures retained without request retries or secret contents'

@@ -70,9 +70,12 @@ func concurrentSQLHosts(t *testing.T, wrap func(int, http.RoundTripper) http.Rou
 func TestManagedSQLThreeHostsSubmittedUnknownRetainsExactOriginal(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 25*time.Second)
 	defer cancel()
-	configs, hosts, fixture, heldLearn := heldCertifiedRecoveryHosts(t)
-	ctx = context.WithValue(ctx, certifiedRecoveryControlKey{}, true)
-	heldLearn.Store(true)
+	configs, hosts, fixture := concurrentSQLHosts(t, nil)
+	testManagedSQLSubmittedUnknown(t, ctx, configs, hosts, fixture, nil, nil, nil)
+}
+
+func testManagedSQLSubmittedUnknown(t *testing.T, ctx context.Context, configs []Config, hosts []*Host, fixture *sqlStatusFixture, pushSeen, pullSeen <-chan struct{}, release func()) {
+	forceGap := pullSeen != nil
 	fixture.mu.Lock()
 	fixture.failFinalize = true
 	fixture.mu.Unlock()
@@ -82,9 +85,23 @@ func TestManagedSQLThreeHostsSubmittedUnknownRetainsExactOriginal(t *testing.T) 
 	if response.Status != types.MutationCommitted || !errors.As(err, &unknown) || !errors.Is(err, network.ErrCommitUnknown) || errors.Is(err, ErrSQLNotSubmitted) || unknown.RequestID != req.RequestID || uint64(unknown.Slot) != response.Slot {
 		t.Fatalf("submitted/finalize outcome classification: response=%+v error=%v", response, err)
 	}
-	lag, err := hosts[1].node.ManagedState()
-	if err != nil || lag.RecorderTip < response.Slot || lag.CertifiedTip >= response.Slot || lag.AppliedTip >= response.Slot {
-		t.Fatalf("actual peer certificate delivery gap missing: recorder=%d certified=%d applied=%d slot=%d error=%v", lag.RecorderTip, lag.CertifiedTip, lag.AppliedTip, response.Slot, err)
+	if forceGap {
+		for _, observed := range []struct {
+			name string
+			done <-chan struct{}
+		}{{"rejected Learned push", pushSeen}, {"held periodic certificate pull", pullSeen}} {
+			select {
+			case <-observed.done:
+				t.Logf("observed %s", observed.name)
+			case <-ctx.Done():
+				state, _ := hosts[1].node.ManagedState()
+				t.Fatalf("missing %s: recorder=%d certified=%d applied=%d: %v", observed.name, state.RecorderTip, state.CertifiedTip, state.AppliedTip, ctx.Err())
+			}
+		}
+		lag, err := hosts[1].node.ManagedState()
+		if err != nil || lag.RecorderTip < response.Slot || lag.CertifiedTip >= response.Slot || lag.AppliedTip >= response.Slot {
+			t.Fatalf("actual peer certificate delivery gap missing after periodic pull: recorder=%d certified=%d applied=%d slot=%d error=%v", lag.RecorderTip, lag.CertifiedTip, lag.AppliedTip, response.Slot, err)
+		}
 	}
 	retained, err := hosts[0].node.ResolveManagedSQL(ctx, req)
 	if err != nil || retained.State != network.ResolveExecuteRetained || retained.Receipt == nil || retained.Receipt.Slot != response.Slot || retained.Durability != network.ResolveExecuteDurabilityConfirmed {
@@ -118,23 +135,27 @@ func TestManagedSQLThreeHostsSubmittedUnknownRetainsExactOriginal(t *testing.T) 
 	fixture.mu.Lock()
 	fixture.failFinalize = false
 	fixture.mu.Unlock()
-	logCertifiedRecoveryState(t, ctx, hosts, configs[0], req, "before-immediate-original-recovery")
-	if err := hosts[1].ValidateManagedSQLRecovery(ctx, hosts[1].identity, req); err != nil {
-		t.Fatalf("explicit recovery live authority rejected before certified gap check: %v", err)
-	}
-	if err := hosts[1].RecoverPending(ctx); err == nil || !errors.Is(err, network.ErrCommitUnknown) || errors.Is(err, ErrSQLNotSubmitted) || !strings.Contains(err.Error(), "managed SQL recovery has unresolved certified history") {
-		t.Fatalf("uncertified target did not preserve unknown original: %v", err)
-	}
-	stillPending, err := operator.LoadV1Alpha2Admission(ctx, configs[0].Store, configs[0].Ref)
-	if err != nil {
-		t.Fatal(err)
-	}
-	stillOriginal, ok := stillPending.Pending()
-	if !ok || stillOriginal != beforePending || !bytes.Equal(before.Evidence(), stillPending.Evidence()) {
-		t.Fatal("uncertified recovery changed original pending fingerprint or evidence")
+	if forceGap {
+		logCertifiedRecoveryState(t, ctx, hosts, configs[0], req, "after-held-periodic-pull-before-recovery")
+		if err := hosts[1].ValidateManagedSQLRecovery(ctx, hosts[1].identity, req); err != nil {
+			t.Fatalf("explicit recovery live authority rejected before certified gap check: %v", err)
+		}
+		if err := hosts[1].RecoverPending(ctx); err == nil || !errors.Is(err, network.ErrCommitUnknown) || errors.Is(err, ErrSQLNotSubmitted) || !strings.Contains(err.Error(), "managed SQL recovery has unresolved certified history") {
+			t.Fatalf("uncertified target did not preserve unknown original: %v", err)
+		}
+		stillPending, err := operator.LoadV1Alpha2Admission(ctx, configs[0].Store, configs[0].Ref)
+		if err != nil {
+			t.Fatal(err)
+		}
+		stillOriginal, ok := stillPending.Pending()
+		if !ok || stillOriginal != beforePending || !bytes.Equal(before.Evidence(), stillPending.Evidence()) {
+			t.Fatal("uncertified recovery changed original pending fingerprint or evidence")
+		}
 	}
 	// A quorum ReadIndex is not delivery of that certificate to this peer.
-	heldLearn.Store(false)
+	if forceGap {
+		release()
+	}
 	waitSQLCertifiedApplication(t, ctx, hosts[1], response.Slot)
 	if err := hosts[1].RecoverPending(ctx); err != nil {
 		t.Fatalf("retained original recovery: %v", err)
@@ -166,6 +187,36 @@ func TestManagedSQLThreeHostsSubmittedUnknownRetainsExactOriginal(t *testing.T) 
 			t.Fatalf("recovery submitted another SQL slot: recorder=%d original=%d error=%v", state.RecorderTip, response.Slot, err)
 		}
 	}
+}
+
+func logCertifiedRecoveryState(t *testing.T, ctx context.Context, hosts []*Host, cfg Config, request ExecuteRequest, stage string) {
+	t.Helper()
+	for i, h := range hosts {
+		state, err := h.node.ManagedState()
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Logf("%s host=%d recorder=%d certified=%d applied=%d uncertain=%t", stage, i, state.RecorderTip, state.CertifiedTip, state.AppliedTip, h.uncertain.Load())
+	}
+	admission, err := operator.LoadV1Alpha2Admission(ctx, cfg.Store, cfg.Ref)
+	if err != nil {
+		t.Fatal(err)
+	}
+	pending, ok := admission.Pending()
+	original, originalOK, err := admission.PendingSQL()
+	if err != nil {
+		t.Fatal(err)
+	}
+	want, err := requestIdentity(request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	originalExact := false
+	if originalOK {
+		got, identityErr := requestIdentity(original)
+		originalExact = identityErr == nil && got == want
+	}
+	t.Logf("%s pending=%t fingerprint-exact=%t original-exact=%t", stage, ok, ok && pending == want, originalExact)
 }
 
 // Observe the normal private peer catch-up worker, not repeated SQL resolution

@@ -2209,6 +2209,9 @@ func (n *Node) catchUpPeer(ctx context.Context, transport *network.Transport, so
 				return err
 			}
 		}
+		if localtesthooks.Enabled {
+			localtesthooks.Hit(fmt.Sprintf("node:catchup-peer:phase=before-accept:node=%s:source=%s:from=%d:tip=%d", n.core.NodeID(), source, from, response.Tip))
+		}
 		if err := n.core.AcceptCertifiedValues(response.Decisions); err != nil {
 			return err
 		}

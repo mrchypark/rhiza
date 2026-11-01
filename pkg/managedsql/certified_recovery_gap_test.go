@@ -1,21 +1,26 @@
+//go:build rhiza_local_testhooks
+
 package managedsql
 
 import (
 	"context"
+	"fmt"
 	"io"
 	"net/http"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
+	"time"
 
-	"github.com/mrchypark/rhiza/pkg/operator"
+	"github.com/mrchypark/rhiza/internal/localtesthooks"
 )
 
 type certifiedRecoveryControlKey struct{}
 
 // Status reads from the real peer-learning path fail while explicit recovery
 // still uses the real live authority API. No SQL or consensus result is mocked.
-func heldCertifiedRecoveryHosts(t *testing.T) ([]Config, []*Host, *sqlStatusFixture, *atomic.Bool) {
+func heldCertifiedRecoveryHosts(t *testing.T) ([]Config, []*Host, *sqlStatusFixture, *atomic.Bool, <-chan struct{}, <-chan struct{}, func()) {
 	t.Helper()
 	held := &atomic.Bool{}
 	configs, hosts, fixture := concurrentSQLHosts(t, func(i int, base http.RoundTripper) http.RoundTripper {
@@ -29,36 +34,35 @@ func heldCertifiedRecoveryHosts(t *testing.T) ([]Config, []*Host, *sqlStatusFixt
 			return base.RoundTrip(r)
 		})
 	})
-	t.Cleanup(func() { held.Store(false) })
-	return configs, hosts, fixture, held
+	pushSeen, pullSeen, releasePull := make(chan struct{}), make(chan struct{}), make(chan struct{})
+	var pushOnce, pullOnce, releaseOnce sync.Once
+	target := configs[1].Runtime.NodeID
+	restore := localtesthooks.Set(func(event string) {
+		if !held.Load() {
+			return
+		}
+		if strings.HasPrefix(event, fmt.Sprintf("network:learned:phase=handler-result:node=%s:", target)) && strings.Contains(event, ":slot=1:") && !strings.HasSuffix(event, `error=""`) {
+			pushOnce.Do(func() { close(pushSeen) })
+		}
+		if strings.HasPrefix(event, fmt.Sprintf("node:catchup-peer:phase=before-accept:node=%s:", target)) && strings.Contains(event, ":from=1:") {
+			pullOnce.Do(func() { close(pullSeen) })
+			<-releasePull
+		}
+	})
+	release := func() {
+		held.Store(false)
+		releaseOnce.Do(func() { close(releasePull) })
+	}
+	// Release the periodic worker before the Host cleanup waits for shutdown.
+	t.Cleanup(func() { release(); restore() })
+	return configs, hosts, fixture, held, pushSeen, pullSeen, release
 }
 
-func logCertifiedRecoveryState(t *testing.T, ctx context.Context, hosts []*Host, cfg Config, request ExecuteRequest, stage string) {
-	t.Helper()
-	for i, h := range hosts {
-		state, err := h.node.ManagedState()
-		if err != nil {
-			t.Fatal(err)
-		}
-		t.Logf("%s host=%d recorder=%d certified=%d applied=%d uncertain=%t", stage, i, state.RecorderTip, state.CertifiedTip, state.AppliedTip, h.uncertain.Load())
-	}
-	admission, err := operator.LoadV1Alpha2Admission(ctx, cfg.Store, cfg.Ref)
-	if err != nil {
-		t.Fatal(err)
-	}
-	pending, ok := admission.Pending()
-	original, originalOK, err := admission.PendingSQL()
-	if err != nil {
-		t.Fatal(err)
-	}
-	want, err := requestIdentity(request)
-	if err != nil {
-		t.Fatal(err)
-	}
-	originalExact := false
-	if originalOK {
-		got, identityErr := requestIdentity(original)
-		originalExact = identityErr == nil && got == want
-	}
-	t.Logf("%s pending=%t fingerprint-exact=%t original-exact=%t", stage, ok, ok && pending == want, originalExact)
+func TestManagedSQLCertifiedRecoveryGapHoldsPushAndPeriodicPull(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 25*time.Second)
+	defer cancel()
+	configs, hosts, fixture, held, pushSeen, pullSeen, release := heldCertifiedRecoveryHosts(t)
+	ctx = context.WithValue(ctx, certifiedRecoveryControlKey{}, true)
+	held.Store(true)
+	testManagedSQLSubmittedUnknown(t, ctx, configs, hosts, fixture, pushSeen, pullSeen, release)
 }
