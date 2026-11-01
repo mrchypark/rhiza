@@ -8,6 +8,8 @@ import (
 	"errors"
 	"math"
 	"os"
+	"sync"
+	"time"
 
 	"github.com/mrchypark/rhiza/pkg/managedbootstrap"
 	"github.com/mrchypark/rhiza/pkg/managedsql"
@@ -57,15 +59,16 @@ func goOpenManaged(input []byte) []byte {
 		return marshalError("not_ready", "managed Kubernetes client unavailable")
 	}
 	ctx, cancel := context.WithCancel(context.Background())
-	opening, stop := context.WithTimeout(ctx, defaultTimeout)
-	defer stop()
+	opening, finishOpening := managedStartupContext(ctx, defaultTimeout)
 	cfg, cleanup, err := managedbootstrap.LoadConfig(opening, managedbootstrap.ConfigRequest{Kube: kube, Ref: ref, PodName: pod, PodUID: uid, IdentityPath: request.IdentityFile, BootstrapPath: request.HandoffFile, RepairPath: request.RepairHandoffFile, Profile: profile})
 	if err != nil {
+		err = errors.Join(err, finishOpening())
 		cancel()
 		_ = cleanup()
 		return marshalError(errorCode(err), "managed startup inputs rejected")
 	}
 	host, err := managedsql.Open(opening, cfg)
+	err = errors.Join(err, finishOpening())
 	if err != nil {
 		cancel()
 		if host != nil {
@@ -75,6 +78,25 @@ func goOpenManaged(input []byte) []byte {
 		return marshalError(errorCode(err), "managed startup rejected")
 	}
 	return registerEntry(&ffiEntry{managed: host, cleanup: cleanup, ctx: ctx, cancel: cancel, drained: make(chan struct{})})
+}
+
+// Node derives its background lifetime from Open's context. Retire only the
+// startup timer on success; handle cancellation must still reach that context.
+func managedStartupContext(parent context.Context, budget time.Duration) (context.Context, func() error) {
+	ctx, cancel := context.WithCancelCause(parent)
+	timer := time.AfterFunc(budget, func() { cancel(context.DeadlineExceeded) })
+	var once sync.Once
+	var result error
+	finish := func() error {
+		once.Do(func() {
+			if !timer.Stop() {
+				cancel(context.DeadlineExceeded)
+			}
+			result = context.Cause(ctx)
+		})
+		return result
+	}
+	return ctx, finish
 }
 
 func registerEntry(entry *ffiEntry) []byte {
