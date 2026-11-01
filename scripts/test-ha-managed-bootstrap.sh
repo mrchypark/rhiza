@@ -73,7 +73,7 @@ if grep -Fx "$cluster" "$logs/clusters-before.txt" >/dev/null; then exit 1; fi
 owned=1
 kind create cluster --name "$cluster" --kubeconfig "$kubeconfig" --wait 120s > "$logs/create.txt" 2>&1
 built=1
-docker build -f Dockerfile.operator -t "$image" . > "$logs/build.txt" 2>&1
+docker build -f "${RHIZA_MANAGED_TEST_DOCKERFILE:-Dockerfile.operator}" -t "$image" . > "$logs/build.txt" 2>&1
 kind load docker-image --name "$cluster" "$image" > "$logs/load.txt" 2>&1
 k create namespace "$namespace"
 k apply -f deploy/operator/cluster-crd.yaml -f deploy/operator/crd.yaml

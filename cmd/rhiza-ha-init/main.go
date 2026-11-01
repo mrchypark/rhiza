@@ -17,6 +17,7 @@ import (
 
 	"github.com/mrchypark/rhiza"
 	"github.com/mrchypark/rhiza/internal/types"
+	"github.com/mrchypark/rhiza/pkg/managedbootstrap"
 	"github.com/mrchypark/rhiza/pkg/operator"
 )
 
@@ -122,11 +123,7 @@ func runServe(args []string) error {
 	}
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
-	cfg, err := managedConfig(ctx, kube, ref, pod, podUID, *identity, *handoff, profile)
-	cleanup := func() error { return nil }
-	if errors.Is(err, errLearnerAdmissionPending) {
-		cfg, cleanup, err = managedRepairConfig(ctx, kube, ref, pod, podUID, *identity, *handoff, *repairHandoff, profile)
-	}
+	cfg, cleanup, err := managedbootstrap.LoadConfig(ctx, managedbootstrap.ConfigRequest{Kube: kube, Ref: ref, PodName: pod, PodUID: podUID, IdentityPath: *identity, BootstrapPath: *handoff, RepairPath: *repairHandoff, Profile: profile})
 	if err != nil {
 		return err
 	}

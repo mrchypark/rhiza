@@ -24,6 +24,7 @@ import (
 	"unsafe"
 
 	"github.com/mrchypark/rhiza"
+	"github.com/mrchypark/rhiza/pkg/managedsql"
 	"github.com/mrchypark/rhiza/pkg/network"
 )
 
@@ -37,6 +38,8 @@ const (
 type ffiEntry struct {
 	local         bool
 	db            *rhiza.DB
+	managed       *managedsql.Host
+	cleanup       func() error
 	ctx           context.Context
 	cancel        context.CancelFunc
 	mu            sync.Mutex
@@ -86,6 +89,14 @@ func main() {}
 //export RhizaOpen
 func RhizaOpen(data unsafe.Pointer, length C.size_t) C.RhizaBuffer {
 	return cBuffer(goOpen(copiedInput(data, length)))
+}
+
+// RhizaOpenManaged opens only the verified in-cluster managed SQL profile.
+// It does not start an application or legacy operator HTTP listener.
+//
+//export RhizaOpenManaged
+func RhizaOpenManaged(data unsafe.Pointer, length C.size_t) C.RhizaBuffer {
+	return cBuffer(goOpenManaged(copiedInput(data, length)))
 }
 
 // RhizaOpenFromEnv opens an embedded DB from the process RHIZA_* configuration.
@@ -156,18 +167,7 @@ func goOpen(input []byte) []byte {
 	ctx, cancel := context.WithCancel(context.Background())
 	entry := &ffiEntry{db: db, ctx: ctx, cancel: cancel, drained: make(chan struct{}), nextSub: 1, subscriptions: make(map[uint64]*ffiSubscription)}
 	entry.local = config.Local
-	ffiRegistry.Lock()
-	handle := ffiRegistry.next
-	if handle == 0 || handle == math.MaxUint64 {
-		ffiRegistry.Unlock()
-		cancel()
-		_ = db.Close()
-		return errorJSON(&ffiError{Code: "handle_exhausted", Message: "Rhiza handle space exhausted"})
-	}
-	ffiRegistry.next++
-	ffiRegistry.m[handle] = entry
-	ffiRegistry.Unlock()
-	return dataJSON(map[string]uint64{"handle": handle})
+	return registerEntry(entry)
 }
 
 func goOpenFromEnv() []byte {
@@ -205,6 +205,9 @@ func goStartOperator(handle uint64, input []byte) []byte {
 	}
 	if entry.local {
 		return errorJSON(&ffiError{Code: "invalid_request", Message: "local mode does not support an operator listener"})
+	}
+	if entry.managed != nil {
+		return marshalError("invalid_request", "managed SQL handle has no legacy operator listener")
 	}
 	listener, err := net.Listen("tcp", address)
 	if err != nil {
@@ -253,6 +256,13 @@ func goCall(handle uint64, input []byte, timeoutMS uint64) []byte {
 	}
 	result, err := dispatch(ctx, entry, call)
 	if err != nil {
+		if entry.managed != nil {
+			var typed *ffiError
+			if errors.As(err, &typed) {
+				return errorJSON(typed)
+			}
+			return marshalError(errorCode(err), "managed operation rejected")
+		}
 		var syntax *json.SyntaxError
 		var typeError *json.UnmarshalTypeError
 		if errors.As(err, &syntax) || errors.As(err, &typeError) {
@@ -300,7 +310,10 @@ func goClose(handle uint64) []byte {
 		sub.cancel()
 	}
 	<-entry.drained
-	if err := entry.db.Close(); err != nil {
+	if err := entry.closeOwned(); err != nil {
+		if entry.managed != nil {
+			return marshalError(errorCode(err), "managed close failed")
+		}
 		return errorJSON(err)
 	}
 	return dataJSON(nil)
@@ -366,6 +379,9 @@ func decodeStrict(input []byte, value any) error {
 }
 
 func dispatch(ctx context.Context, entry *ffiEntry, call callEnvelope) (any, error) {
+	if entry.managed != nil {
+		return dispatchManaged(ctx, entry, call)
+	}
 	db := entry.db
 	decode := func(target any) error {
 		if err := decodeStrict(call.Request, target); err != nil {
