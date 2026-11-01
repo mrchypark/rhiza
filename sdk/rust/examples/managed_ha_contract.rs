@@ -95,9 +95,9 @@ fn run(initial_run: bool) -> Result<(), String> {
             .as_nanos(),
     )
     .map_err(|_| "row_id_range")?;
-    let request_id = format!("rust-managed-contract-{}-{row_id}", pod_uid);
+    let (request_id, schema_request_id) = contract_request_ids(&pod_uid, row_id);
     let schema = ManagedExecuteRequest::sql(
-        format!("{request_id}-schema"),
+        schema_request_id,
         "CREATE TABLE IF NOT EXISTS rust_managed_contract (id INTEGER PRIMARY KEY, value TEXT NOT NULL)",
     );
     execute_committed_or_resolve(&mut db, &schema)?;
@@ -118,6 +118,13 @@ fn run(initial_run: bool) -> Result<(), String> {
     db.close().map_err(|error| error.code)?;
     println!("PASS: managed Rust FFI SQL contract");
     Ok(())
+}
+
+fn contract_request_ids(pod_uid: &str, row_id: i64) -> (String, String) {
+    let pod_tag: String = pod_uid.chars().take(8).collect();
+    let request_id = format!("rust-{pod_tag}-{row_id}");
+    let schema_request_id = format!("{request_id}-schema");
+    (request_id, schema_request_id)
 }
 
 #[derive(serde::Deserialize, serde::Serialize)]
@@ -185,4 +192,21 @@ fn execute_committed_or_resolve(
         Err(error) => return Err(error.code),
     };
     receipt.require_committed().map_err(|error| error.code)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::contract_request_ids;
+
+    #[test]
+    fn managed_request_ids_fit_go_limit_and_are_pod_scoped() {
+        let (write, schema) =
+            contract_request_ids("12345678-1234-1234-1234-123456789abc", i64::MAX);
+        assert!(write.len() <= 64, "write request ID exceeds Go limit");
+        assert!(schema.len() <= 64, "schema request ID exceeds Go limit");
+        assert_ne!(
+            write,
+            contract_request_ids("87654321-1234-1234-1234-123456789abc", i64::MAX).0
+        );
+    }
 }
