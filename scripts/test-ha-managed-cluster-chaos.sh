@@ -183,6 +183,12 @@ capture_virtual_dns() {
     done
   done
 }
+write_floci_dns_probe_manifest() {
+  manifest_phase=$1
+  case "$manifest_phase" in after-floci-rollout|before-vcluster-uninstall) ;; *) return 2 ;; esac
+  probe_name="rhiza-dns-probe-$manifest_phase"
+  jq -n --arg name "$probe_name" '{apiVersion:"v1",kind:"Pod",metadata:{name:$name,labels:{"rhiza-ci-component":"dns-probe"}},spec:{activeDeadlineSeconds:15,automountServiceAccountToken:false,enableServiceLinks:false,dnsPolicy:"ClusterFirst",restartPolicy:"Never",securityContext:{runAsUser:65532,runAsGroup:65532,runAsNonRoot:true},containers:[{name:"probe",image:"curlimages/curl:8.12.1@sha256:94e9e444bcba979c2ea12e27ae39bee4cd10bc7041a472c4727a558e213744e6",imagePullPolicy:"IfNotPresent",command:["curl"],args:["--silent","--show-error","--noproxy","*","--connect-timeout","3","--max-time","8","--output","/dev/null","--write-out","curl_writeout remote_ip=%{remote_ip} remote_port=%{remote_port} http_code=%{http_code}\\n","http://floci.managed-bootstrap.svc.cluster.local:4566/"],resources:{requests:{cpu:"10m",memory:"32Mi","ephemeral-storage":"8Mi"},limits:{cpu:"100m",memory:"64Mi","ephemeral-storage":"32Mi"}},securityContext:{allowPrivilegeEscalation:false,readOnlyRootFilesystem:true,capabilities:{drop:["ALL"]}}}]}}'
+}
 run_floci_dns_probe() {
   phase=$1
   case "$phase" in after-floci-rollout|before-vcluster-uninstall) ;; *) return 2 ;; esac
@@ -202,7 +208,7 @@ run_floci_dns_probe() {
     printf '%s\n' '{"phase":"SkippedNoReadyFlociEndpoint"}' > "$logs/virtual-dns-$phase-probe-status.json"
     return 0
   fi
-  if ! jq -n --arg name "$name" '{apiVersion:"v1",kind:"Pod",metadata:{name:$name,labels:{"rhiza-ci-component":"dns-probe"}},spec:{activeDeadlineSeconds:15,automountServiceAccountToken:false,enableServiceLinks:false,dnsPolicy:"ClusterFirst",restartPolicy:"Never",securityContext:{runAsUser:65532,runAsGroup:65532,runAsNonRoot:true},containers:[{name:"probe",image:"curlimages/curl:8.12.1@sha256:94e9e444bcba979c2ea12e27ae39bee4cd10bc7041a472c4727a558e213744e6",imagePullPolicy:"IfNotPresent",command:["curl"],args:["--silent","--show-error","--noproxy","*","--connect-timeout","3","--max-time","8","--output","/dev/null","--write-out","curl_writeout remote_ip=%{remote_ip} remote_port=%{remote_port} http_code=%{http_code}\\n","http://floci.managed-bootstrap.svc.cluster.local:4566/"],resources:{requests:{cpu:"10m",memory:"32Mi",ephemeral-storage:"8Mi"},limits:{cpu:"100m",memory:"64Mi",ephemeral-storage:"32Mi"}},securityContext:{allowPrivilegeEscalation:false,readOnlyRootFilesystem:true,capabilities:{drop:["ALL"]}}}]}}' > "$private/dns-probe.json"; then
+  if ! write_floci_dns_probe_manifest "$phase" > "$private/dns-probe.json"; then
     printf '%s\n' '{"phase":"ManifestCreationFailed"}' > "$logs/virtual-dns-$phase-probe-status.json"
     return 0
   fi

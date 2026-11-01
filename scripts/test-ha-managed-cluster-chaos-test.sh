@@ -13,6 +13,8 @@ cleanup() {
   for file in dns-pods-input.json dns-services-input.json dns-endpoints-input.json dns-endpointslices-input.json dns-pods-output.json dns-services-output.json dns-endpoints-output.json dns-endpointslices-output.json coredns-log-input.txt coredns-log-output.json coredns-log-unavailable.json; do
     unlink "$scratch/$file" 2>/dev/null || :
   done
+  unlink "$scratch/dns-probe-manifest.json" 2>/dev/null || :
+  unlink "$scratch/dns-probe-invalid-manifest.json" 2>/dev/null || :
   rmdir "$scratch"
 }
 trap cleanup EXIT HUP INT TERM
@@ -109,12 +111,27 @@ grep -q 'run_floci_dns_probe after-floci-rollout' scripts/test-ha-managed-cluste
 probe=$(sed -n '/^run_floci_dns_probe() {/,/^}/p' scripts/test-ha-managed-cluster-chaos.sh)
 printf '%s\n' "$probe" | grep -Fq 'ready=$(jq'
 printf '%s\n' "$probe" | grep -Fq '.subsets[]?.addresses[]?'
-printf '%s\n' "$probe" | grep -q 'activeDeadlineSeconds:15'
-printf '%s\n' "$probe" | grep -q 'enableServiceLinks:false,dnsPolicy:"ClusterFirst"'
-printf '%s\n' "$probe" | grep -q 'automountServiceAccountToken:false'
-printf '%s\n' "$probe" | grep -q 'curl_writeout remote_ip=%{remote_ip} remote_port=%{remote_port} http_code=%{http_code}'
-printf '%s\n' "$probe" | grep -q 'image:"curlimages/curl:8.12.1@sha256:94e9e444bcba979c2ea12e27ae39bee4cd10bc7041a472c4727a558e213744e6"'
-if printf '%s\n' "$probe" | grep -q -- '--fail'; then echo 'DNS curl probe must record 404 rather than gate on HTTP status' >&2; exit 1; fi
+manifest_writer=$(sed -n '/^write_floci_dns_probe_manifest() {/,/^}/p' scripts/test-ha-managed-cluster-chaos.sh)
+[ -n "$manifest_writer" ]
+sh -c 'set -eu; eval "$1"; write_floci_dns_probe_manifest after-floci-rollout' fixture "$manifest_writer" > "$scratch/dns-probe-manifest.json"
+jq -e '
+  .apiVersion=="v1" and .kind=="Pod" and .metadata.name=="rhiza-dns-probe-after-floci-rollout" and
+  .spec.activeDeadlineSeconds==15 and .spec.automountServiceAccountToken==false and
+  .spec.enableServiceLinks==false and .spec.dnsPolicy=="ClusterFirst" and
+  .spec.securityContext.runAsNonRoot==true and (.spec.containers|length)==1 and
+  .spec.containers[0].image=="curlimages/curl:8.12.1@sha256:94e9e444bcba979c2ea12e27ae39bee4cd10bc7041a472c4727a558e213744e6" and
+  .spec.containers[0].command==["curl"] and
+  .spec.containers[0].args[-1]=="http://floci.managed-bootstrap.svc.cluster.local:4566/" and
+  (.spec.containers[0].args|index("--fail")==null) and
+  (.spec.containers[0].args|index("curl_writeout remote_ip=%{remote_ip} remote_port=%{remote_port} http_code=%{http_code}\\n")!=null) and
+  .spec.containers[0].resources.requests["ephemeral-storage"]=="8Mi" and
+  .spec.containers[0].resources.limits["ephemeral-storage"]=="32Mi" and
+  .spec.containers[0].securityContext.readOnlyRootFilesystem==true and
+  (.spec|has("hostNetwork")|not)
+' "$scratch/dns-probe-manifest.json" >/dev/null
+probe_manifest_code=0
+sh -c 'set -eu; eval "$1"; write_floci_dns_probe_manifest invalid-phase' fixture "$manifest_writer" > "$scratch/dns-probe-invalid-manifest.json" || probe_manifest_code=$?
+[ "$probe_manifest_code" -ne 0 ] && [ ! -s "$scratch/dns-probe-invalid-manifest.json" ] || { echo 'invalid DNS probe phase produced a Pod manifest' >&2; exit 1; }
 grep -q -- '--tail=100 --limit-bytes=32768' scripts/test-ha-managed-cluster-chaos.sh
 grep -q '2>/dev/null | head -4' scripts/test-ha-managed-cluster-chaos.sh
 grep -q 'summarize_coredns_log "$phase" "$pod" "$stream" "$retrieved" "$raw"' scripts/test-ha-managed-cluster-chaos.sh
