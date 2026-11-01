@@ -2,7 +2,20 @@
 # Direct-host managed HA qualification, restricted to a pre-created namespace.
 set -eu
 cd "$(CDPATH='' cd -- "$(dirname -- "$0")/.." && pwd)"
-[ "${GITHUB_ACTIONS-}" = true ] || { echo 'GitHub Actions only' >&2; exit 1; }
+execution_mode=${RHIZA_CHAOS_EXECUTION_MODE:-github-actions}
+case "$execution_mode" in
+  github-actions) [ "${GITHUB_ACTIONS-}" = true ] || { echo 'GitHub Actions required for github-actions mode' >&2; exit 1; } ;;
+  local)
+    [ "${GITHUB_ACTIONS-}" != true ] || { echo 'local mode cannot run in GitHub Actions' >&2; exit 1; }
+    : "${RHIZA_LOCAL_RUN_ID:?}"
+    printf '%s\n' "$RHIZA_LOCAL_RUN_ID" | grep -Eq '^[a-z0-9][a-z0-9-]{0,33}$'
+    # The shared fixture uses these names for unique bucket naming, not CI authorization.
+    GITHUB_RUN_ID=$RHIZA_LOCAL_RUN_ID
+    GITHUB_RUN_ATTEMPT=1
+    GITHUB_SHA=$(git rev-parse HEAD)
+    ;;
+  *) echo 'unsupported Chaos execution mode' >&2; exit 1 ;;
+esac
 : "${RUNNER_TEMP:?}" "${GITHUB_RUN_ID:?}" "${GITHUB_RUN_ATTEMPT:?}" "${GITHUB_SHA:?}"
 : "${RHIZA_HOST_KUBECONFIG:?}" "${RHIZA_HOST_CONTEXT:?}" "${RHIZA_HOST_NAMESPACE:?}"
 : "${RHIZA_HOST_NAMESPACE_UID:?}" "${RHIZA_HOST_SERVICEACCOUNT_UID:?}" "${RHIZA_HOST_NODE:?}"
@@ -14,6 +27,7 @@ printf '%s\n' "$RHIZA_HOST_NODE" | grep -Eq '^[a-z0-9][a-z0-9.-]{0,252}$'
 case "$RHIZA_HOST_NAMESPACE" in rhiza-ha-chaos-*) ;; *) echo 'isolated test namespace required' >&2; exit 1;; esac
 logs="$RUNNER_TEMP/ha-managed-cluster-chaos"
 mkdir -p "$logs"
+printf '%s\n' "$execution_mode" "$GITHUB_SHA" "$GITHUB_RUN_ID" "$GITHUB_RUN_ATTEMPT" > "$logs/execution-source.txt"
 private=$(mktemp -d "$RUNNER_TEMP/ha-managed-direct-host-private.XXXXXX")
 chmod 700 "$private"
 nonce=$(od -An -N6 -tx1 /dev/urandom | tr -d ' \n')
