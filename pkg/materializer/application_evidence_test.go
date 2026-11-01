@@ -1,15 +1,159 @@
 package materializer
 
 import (
+	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json"
 	"os"
 	"path/filepath"
+	"sort"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/mrchypark/rhiza/internal/types"
 )
+
+func TestSQLApplicationEvidenceLegacyDigestCompatibility(t *testing.T) {
+	m := evidenceMaterializer(t)
+	ctx := context.Background()
+	for _, statement := range []string{`CREATE TABLE empty (x TEXT)`, `CREATE TABLE typed (n, i, f, s, b)`, `CREATE INDEX typed_i ON typed(i)`, `CREATE VIEW visible AS SELECT i FROM typed`} {
+		if _, err := m.writer.ExecContext(ctx, statement); err != nil {
+			t.Fatal(err)
+		}
+	}
+	text := "<>&\u2028\u2029\x00\n\"\\한글"
+	for _, id := range []int64{2, 10} {
+		if _, err := m.writer.ExecContext(ctx, `INSERT INTO typed(rowid,n,i,f,s,b) VALUES (?,NULL,?,1.5,?,?)`, id, id, text, []byte{0, 255}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	var encodedRows []string
+	for _, id := range []int64{2, 10} {
+		row, err := json.Marshal([][2]string{{"integer", strconv.FormatInt(id, 10)}, {"null", ""}, {"integer", strconv.FormatInt(id, 10)}, {"real", "3ff8000000000000"}, {"text", text}, {"blob", "00ff"}})
+		if err != nil {
+			t.Fatal(err)
+		}
+		encodedRows = append(encodedRows, string(row))
+	}
+	sort.Strings(encodedRows)
+	// This is the exact historical encoding, independently assembled in memory.
+	objects := []sqlEvidenceObject{
+		{Type: "index", Name: "typed_i", Table: "typed", SQL: `CREATE INDEX typed_i ON typed(i)`},
+		{Type: "table", Name: "empty", Table: "empty", SQL: `CREATE TABLE empty (x TEXT)`},
+		{Type: "table", Name: "typed", Table: "typed", SQL: `CREATE TABLE typed (n, i, f, s, b)`, Rows: encodedRows},
+		{Type: "view", Name: "visible", Table: "visible", SQL: `CREATE VIEW visible AS SELECT i FROM typed`},
+	}
+	canonical, err := json.Marshal(struct {
+		Version string
+		Objects []sqlEvidenceObject
+	}{"rhiza-sql-state-v1", objects})
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, err := m.InspectSQLApplicationState(ctx)
+	if err != nil || got.FreshEmpty || got.Digest != sha256.Sum256(canonical) {
+		t.Fatalf("canonical digest mismatch: %+v %v", got, err)
+	}
+}
+
+func TestSQLApplicationEvidenceBeyondFormerLimit(t *testing.T) {
+	ctx := context.Background()
+	m := evidenceMaterializer(t)
+	evidenceApply(t, m, 1, "schema", `CREATE TABLE large (v BLOB)`)
+	payload := bytes.Repeat([]byte{0xAB}, 128<<10)
+	batch, err := types.EncodeSQLBatch([]types.SQLCommand{{RequestID: "large", SQL: `WITH RECURSIVE n(x) AS (VALUES(1) UNION ALL SELECT x+1 FROM n WHERE x<257) INSERT INTO large(v) SELECT ? FROM n`, Args: []any{payload}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := m.Apply(ctx, 2, batch); err != nil {
+		t.Fatal(err)
+	}
+	var count, size int64
+	if err := m.writer.QueryRowContext(ctx, `SELECT COUNT(*),SUM(length(v)) FROM large`).Scan(&count, &size); err != nil {
+		t.Fatal(err)
+	}
+	if count != 257 || size != 257*int64(len(payload)) {
+		t.Fatalf("committed payload mismatch: %d %d", count, size)
+	}
+	got, err := m.InspectSQLApplicationState(ctx)
+	if err != nil || got.FreshEmpty {
+		t.Fatalf("committed >64MiB canonical evidence must remain inspectable: %+v %v", got, err)
+	}
+	// Hash the old canonical format independently without collecting large rows.
+	h := sha256.New()
+	h.Write([]byte(`{"Version":"rhiza-sql-state-v1","Objects":[{"Type":"table","Name":"large","Table":"large","SQL":"CREATE TABLE large (v BLOB)","Rows":[`))
+	ids := make([]string, 257)
+	for i := range ids {
+		ids[i] = strconv.Itoa(i + 1)
+	}
+	sort.Strings(ids)
+	for i, id := range ids {
+		if i != 0 {
+			h.Write([]byte(","))
+		}
+		row, err := json.Marshal([][2]string{{"integer", id}, {"blob", hex.EncodeToString(payload)}})
+		if err != nil {
+			t.Fatal(err)
+		}
+		quoted, err := json.Marshal(string(row))
+		if err != nil {
+			t.Fatal(err)
+		}
+		h.Write(quoted)
+	}
+	h.Write([]byte(`]}]}`))
+	if !bytes.Equal(got.Digest[:], h.Sum(nil)) {
+		t.Fatal("large canonical digest changed")
+	}
+	if err := m.writer.QueryRowContext(ctx, `SELECT COUNT(*),SUM(length(v)) FROM large`).Scan(&count, &size); err != nil || count != 257 || size != 257*int64(len(payload)) {
+		t.Fatalf("inspection changed data: %d %d %v", count, size, err)
+	}
+}
+
+func TestSQLApplicationEvidenceSpoolCleanupAndFailures(t *testing.T) {
+	m := evidenceMaterializer(t)
+	evidenceApply(t, m, 1, "schema", `CREATE TABLE item (v TEXT)`)
+	evidenceApply(t, m, 2, "insert", `INSERT INTO item VALUES ('retained')`)
+	root := t.TempDir()
+	t.Setenv("TMPDIR", root)
+	assertClean := func() {
+		t.Helper()
+		entries, err := os.ReadDir(root)
+		if err != nil || len(entries) != 0 {
+			t.Fatalf("private evidence files remain: %v %v", entries, err)
+		}
+		var value string
+		if err := m.writer.QueryRow(`SELECT v FROM item`).Scan(&value); err != nil || value != "retained" {
+			t.Fatalf("inspection changed source: %q %v", value, err)
+		}
+	}
+	if _, err := m.InspectSQLApplicationState(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	assertClean()
+	canceled, cancel := context.WithCancel(context.Background())
+	cancel()
+	if state, err := m.InspectSQLApplicationState(canceled); err == nil || state != (SQLApplicationState{}) {
+		t.Fatalf("canceled evidence accepted: %+v %v", state, err)
+	}
+	assertClean()
+	if _, err := m.writer.Exec(`CREATE TABLE aliases (rowid, _rowid_, oid)`); err != nil {
+		t.Fatal(err)
+	}
+	if state, err := m.InspectSQLApplicationState(context.Background()); err == nil || !strings.Contains(err.Error(), "rowid unavailable") || state != (SQLApplicationState{}) {
+		t.Fatalf("unsupported row identity accepted: %+v %v", state, err)
+	}
+	assertClean()
+	t.Setenv("TMPDIR", filepath.Join(root, "missing"))
+	if state, err := m.InspectSQLApplicationState(context.Background()); err == nil || state != (SQLApplicationState{}) {
+		t.Fatalf("unavailable spool accepted: %+v %v", state, err)
+	}
+	assertClean()
+}
 
 func evidenceMaterializer(t *testing.T) *Materializer {
 	t.Helper()

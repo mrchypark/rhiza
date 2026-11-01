@@ -13,11 +13,11 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
-	"sort"
 	"strconv"
 	"strings"
 
 	"github.com/mrchypark/rhiza/internal/sqlpolicy"
+	sqlite3driver "github.com/ncruces/go-sqlite3/driver"
 )
 
 // SQLApplicationState describes SQL logical state, not WAL history or authority.
@@ -25,8 +25,6 @@ type SQLApplicationState struct {
 	Digest     [32]byte
 	FreshEmpty bool
 }
-
-const maxSQLEvidenceBytes = 64 << 20
 
 type sqlEvidenceObject struct {
 	Type, Name, Table, SQL string
@@ -147,8 +145,39 @@ func copyEvidenceFile(source, destination string) (resultErr error) {
 	return nil
 }
 
-func inspectSQLApplicationTransaction(ctx context.Context, tx *sql.Tx, stateTip uint64) (SQLApplicationState, error) {
+func inspectSQLApplicationTransaction(ctx context.Context, tx *sql.Tx, stateTip uint64) (state SQLApplicationState, resultErr error) {
 	defer tx.Rollback()
+	// Keep canonical sorting on disk, not in a total-database-sized Go slice.
+	private, err := os.MkdirTemp("", "rhiza-sql-evidence-sort-")
+	if err != nil {
+		return state, err
+	}
+	defer func() { resultErr = errors.Join(resultErr, os.RemoveAll(private)) }()
+	dsn := (&url.URL{Scheme: "file", Path: filepath.ToSlash(filepath.Join(private, "sort.sqlite"))}).String() + "?_pragma=cache_size(-2048)&_pragma=mmap_size(0)&_pragma=temp_store(FILE)"
+	spool, err := sqlite3driver.Open(dsn)
+	if err != nil {
+		return state, err
+	}
+	defer func() { resultErr = errors.Join(resultErr, spool.Close()) }()
+	spool.SetMaxOpenConns(1)
+	sortTx, err := spool.BeginTx(ctx, nil)
+	if err != nil {
+		return state, err
+	}
+	defer sortTx.Rollback()
+	if _, err := sortTx.ExecContext(ctx, `CREATE TABLE objects (id INTEGER PRIMARY KEY, metadata BLOB NOT NULL, kind TEXT NOT NULL, name TEXT NOT NULL); CREATE TABLE evidence_rows (object INTEGER NOT NULL, data BLOB NOT NULL); CREATE INDEX evidence_order ON evidence_rows(object,data)`); err != nil {
+		return state, err
+	}
+	insertObject, err := sortTx.PrepareContext(ctx, `INSERT INTO objects(id,metadata,kind,name) VALUES(?,?,?,?)`)
+	if err != nil {
+		return state, err
+	}
+	defer insertObject.Close()
+	insertRow, err := sortTx.PrepareContext(ctx, `INSERT INTO evidence_rows(object,data) VALUES(?,?)`)
+	if err != nil {
+		return state, err
+	}
+	defer insertRow.Close()
 	rows, err := tx.QueryContext(ctx, `SELECT type,name,tbl_name,COALESCE(sql,'') FROM sqlite_schema ORDER BY type,name`)
 	if err != nil {
 		return SQLApplicationState{}, err
@@ -161,8 +190,7 @@ func inspectSQLApplicationTransaction(ctx context.Context, tx *sql.Tx, stateTip 
 		"_rhiza_kv_expiry":        `CREATE INDEX _rhiza_kv_expiry ON _rhiza_kv(expires_at_unix_ms) WHERE expires_at_unix_ms > 0`,
 		"_rhiza_idempotency_slot": `CREATE INDEX _rhiza_idempotency_slot ON _rhiza_idempotency(commit_slot)`,
 	}
-	var objects []sqlEvidenceObject
-	totalBytes := 0
+	objectCount := 0
 	for rows.Next() {
 		var o sqlEvidenceObject
 		if err := rows.Scan(&o.Type, &o.Name, &o.Table, &o.SQL); err != nil {
@@ -188,12 +216,16 @@ func inspectSQLApplicationTransaction(ctx context.Context, tx *sql.Tx, stateTip 
 			rows.Close()
 			return SQLApplicationState{}, fmt.Errorf("unsupported SQLite schema %q", o.Name)
 		}
-		objects = append(objects, o)
-		totalBytes += len(o.Type) + len(o.Name) + len(o.Table) + len(o.SQL)
-		if totalBytes > maxSQLEvidenceBytes {
+		metadata, err := json.Marshal(o)
+		if err != nil {
 			rows.Close()
-			return SQLApplicationState{}, fmt.Errorf("SQL evidence exceeds size limit")
+			return state, err
 		}
+		if _, err := insertObject.ExecContext(ctx, objectCount, metadata, o.Type, o.Name); err != nil {
+			rows.Close()
+			return state, err
+		}
+		objectCount++
 	}
 	if err := rows.Err(); err != nil {
 		rows.Close()
@@ -209,7 +241,6 @@ func inspectSQLApplicationTransaction(ctx context.Context, tx *sql.Tx, stateTip 
 	if err != nil {
 		return SQLApplicationState{}, err
 	}
-	withoutRowID := make(map[string]bool)
 	for tableList.Next() {
 		var schema, name, kind string
 		var columns, wr, strict int
@@ -217,9 +248,7 @@ func inspectSQLApplicationTransaction(ctx context.Context, tx *sql.Tx, stateTip 
 			tableList.Close()
 			return SQLApplicationState{}, err
 		}
-		if kind == "table" {
-			withoutRowID[name] = wr != 0
-		} else if kind == "virtual" || kind == "shadow" {
+		if kind == "virtual" || kind == "shadow" {
 			tableList.Close()
 			return SQLApplicationState{}, fmt.Errorf("unsupported SQLite table kind %q", kind)
 		}
@@ -231,17 +260,27 @@ func inspectSQLApplicationTransaction(ctx context.Context, tx *sql.Tx, stateTip 
 	if err := tableList.Close(); err != nil {
 		return SQLApplicationState{}, err
 	}
-	for i := range objects {
-		if objects[i].Type != "table" {
+	objectRows, err := sortTx.QueryContext(ctx, `SELECT id,kind,name FROM objects ORDER BY id`)
+	if err != nil {
+		return state, err
+	}
+	defer objectRows.Close()
+	for objectRows.Next() {
+		var id int
+		var kind, objectName string
+		if err := objectRows.Scan(&id, &kind, &objectName); err != nil {
+			return state, err
+		}
+		if kind != "table" {
 			continue
 		}
-		name := `"` + strings.ReplaceAll(objects[i].Name, `"`, `""`) + `"`
-		wr, ok := withoutRowID[objects[i].Name]
-		if !ok {
-			return SQLApplicationState{}, fmt.Errorf("unsupported table %q", objects[i].Name)
+		name := `"` + strings.ReplaceAll(objectName, `"`, `""`) + `"`
+		var wr int
+		if err := tx.QueryRowContext(ctx, `SELECT wr FROM pragma_table_list WHERE schema='main' AND type='table' AND name=?`, objectName).Scan(&wr); err != nil {
+			return state, fmt.Errorf("unsupported table %q: %w", objectName, err)
 		}
 		projection := "*"
-		if !wr {
+		if wr == 0 {
 			info, err := tx.QueryContext(ctx, "PRAGMA main.table_xinfo("+name+")")
 			if err != nil {
 				return SQLApplicationState{}, err
@@ -272,7 +311,7 @@ func inspectSQLApplicationTransaction(ctx context.Context, tx *sql.Tx, stateTip 
 				}
 			}
 			if alias == "" {
-				return SQLApplicationState{}, fmt.Errorf("rowid unavailable for table %q", objects[i].Name)
+				return SQLApplicationState{}, fmt.Errorf("rowid unavailable for table %q", objectName)
 			}
 			projection = alias + ",*"
 		}
@@ -318,11 +357,9 @@ func inspectSQLApplicationTransaction(ctx context.Context, tx *sql.Tx, stateTip 
 				r.Close()
 				return SQLApplicationState{}, err
 			}
-			objects[i].Rows = append(objects[i].Rows, string(b))
-			totalBytes += len(b)
-			if totalBytes > maxSQLEvidenceBytes {
+			if _, err := insertRow.ExecContext(ctx, id, b); err != nil {
 				r.Close()
-				return SQLApplicationState{}, fmt.Errorf("SQL evidence exceeds size limit")
+				return state, err
 			}
 		}
 		if err := r.Err(); err != nil {
@@ -332,7 +369,12 @@ func inspectSQLApplicationTransaction(ctx context.Context, tx *sql.Tx, stateTip 
 		if err := r.Close(); err != nil {
 			return SQLApplicationState{}, err
 		}
-		sort.Strings(objects[i].Rows)
+	}
+	if err := objectRows.Err(); err != nil {
+		return state, err
+	}
+	if err := objectRows.Close(); err != nil {
+		return state, err
 	}
 	var receipts, kv, migrations int64
 	if err := tx.QueryRowContext(ctx, `SELECT (SELECT COUNT(*) FROM _rhiza_idempotency), (SELECT COUNT(*) FROM _rhiza_kv), (SELECT COUNT(*) FROM _rhiza_migrations)`).Scan(&receipts, &kv, &migrations); err != nil {
@@ -341,12 +383,90 @@ func inspectSQLApplicationTransaction(ctx context.Context, tx *sql.Tx, stateTip 
 	if err := tx.Commit(); err != nil {
 		return SQLApplicationState{}, err
 	}
-	b, err := json.Marshal(struct {
-		Version string
-		Objects []sqlEvidenceObject
-	}{"rhiza-sql-state-v1", objects})
+	digest, err := hashSQLApplicationEvidence(ctx, sortTx, objectCount)
 	if err != nil {
 		return SQLApplicationState{}, err
 	}
-	return SQLApplicationState{Digest: sha256.Sum256(b), FreshEmpty: len(objects) == 0 && receipts == 0 && kv == 0 && migrations == 0 && stateTip == 0}, nil
+	return SQLApplicationState{Digest: digest, FreshEmpty: objectCount == 0 && receipts == 0 && kv == 0 && migrations == 0 && stateTip == 0}, nil
+}
+
+// hashSQLApplicationEvidence emits exactly encoding/json's historical v1 bytes.
+// BLOB ordering is bytewise, matching sort.Strings on canonical row JSON.
+func hashSQLApplicationEvidence(ctx context.Context, tx *sql.Tx, objectCount int) ([32]byte, error) {
+	var digest [32]byte
+	h := sha256.New()
+	io.WriteString(h, `{"Version":"rhiza-sql-state-v1","Objects":`)
+	if objectCount == 0 {
+		io.WriteString(h, "null}")
+		copy(digest[:], h.Sum(nil))
+		return digest, ctx.Err()
+	}
+	io.WriteString(h, "[")
+	objects, err := tx.QueryContext(ctx, `SELECT id,metadata FROM objects ORDER BY id`)
+	if err != nil {
+		return digest, err
+	}
+	defer objects.Close()
+	count := 0
+	for objects.Next() {
+		var id int
+		var metadata []byte
+		if err := objects.Scan(&id, &metadata); err != nil {
+			return digest, err
+		}
+		if !strings.HasSuffix(string(metadata), `,"Rows":null}`) {
+			return digest, fmt.Errorf("invalid SQL evidence metadata")
+		}
+		if count != 0 {
+			io.WriteString(h, ",")
+		}
+		h.Write(metadata[:len(metadata)-len("null}")])
+		rows, err := tx.QueryContext(ctx, `SELECT data FROM evidence_rows WHERE object=? ORDER BY data`, id)
+		if err != nil {
+			return digest, err
+		}
+		hasRows := false
+		for rows.Next() {
+			var row []byte
+			if err := rows.Scan(&row); err != nil {
+				rows.Close()
+				return digest, err
+			}
+			if hasRows {
+				io.WriteString(h, ",")
+			} else {
+				io.WriteString(h, "[")
+			}
+			hasRows = true
+			encoded, err := json.Marshal(string(row))
+			if err != nil {
+				rows.Close()
+				return digest, err
+			}
+			h.Write(encoded)
+		}
+		if err := rows.Err(); err != nil {
+			rows.Close()
+			return digest, err
+		}
+		if err := rows.Close(); err != nil {
+			return digest, err
+		}
+		if hasRows {
+			io.WriteString(h, "]")
+		} else {
+			io.WriteString(h, "null")
+		}
+		io.WriteString(h, "}")
+		count++
+	}
+	if err := objects.Err(); err != nil {
+		return digest, err
+	}
+	if count != objectCount {
+		return digest, fmt.Errorf("SQL evidence object count changed")
+	}
+	io.WriteString(h, "]}")
+	copy(digest[:], h.Sum(nil))
+	return digest, ctx.Err()
 }

@@ -285,6 +285,19 @@ func managedHandler(host *managedsql.Host, token string) (http.Handler, error) {
 		w.Header().Set("Content-Type", "application/json")
 		_ = json.NewEncoder(w).Encode(result)
 	})
+	mux.HandleFunc("/recover-pending", func(w http.ResponseWriter, r *http.Request) {
+		var req struct{}
+		if !decode(w, r, &req) {
+			return
+		}
+		// Resolve only the durable original; never accept replacement SQL or
+		// replay the canceled mutation. Unknown outcomes stay write-blocked.
+		if err := host.RecoverPending(r.Context()); err != nil {
+			http.Error(w, "operation unavailable", http.StatusServiceUnavailable)
+			return
+		}
+		w.WriteHeader(http.StatusNoContent)
+	})
 	mux.HandleFunc("/query", func(w http.ResponseWriter, r *http.Request) {
 		var req managedsql.QueryRequest
 		if !decode(w, r, &req) {
