@@ -19,6 +19,7 @@ struct RhizaBuffer {
 
 extern "C" {
     fn RhizaOpen(data: *mut c_void, len: usize) -> RhizaBuffer;
+    fn RhizaOpenManaged(data: *mut c_void, len: usize) -> RhizaBuffer;
     fn RhizaOpenFromEnv() -> RhizaBuffer;
     fn RhizaCall(handle: u64, data: *mut c_void, len: usize, timeout_ms: u64) -> RhizaBuffer;
     fn RhizaStartOperator(handle: u64, address: *mut c_void, len: usize) -> RhizaBuffer;
@@ -98,6 +99,41 @@ impl fmt::Debug for Config {
         f.debug_struct("Config")
             .field("field_names", &fields)
             .finish()
+    }
+}
+
+/// Paths for opening the verified in-cluster managed SQL runtime. Cluster and
+/// Pod identity are read from the process environment by the native runtime.
+#[derive(Clone, Debug, Default, Serialize)]
+pub struct ManagedOpenConfig {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub runtime_profile: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub identity_file: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub handoff_file: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub repair_handoff_file: Option<String>,
+}
+impl ManagedOpenConfig {
+    pub fn runtime_profile(mut self, path: impl Into<String>) -> Self {
+        self.runtime_profile = Some(path.into());
+        self
+    }
+    pub fn identity_file(mut self, path: impl Into<String>) -> Self {
+        self.identity_file = Some(path.into());
+        self
+    }
+    pub fn handoff_file(mut self, path: impl Into<String>) -> Self {
+        self.handoff_file = Some(path.into());
+        self
+    }
+    pub fn repair_handoff_file(mut self, path: impl Into<String>) -> Self {
+        self.repair_handoff_file = Some(path.into());
+        self
+    }
+    fn into_json(self) -> Value {
+        serde_json::to_value(self).expect("managed open config is serializable")
     }
 }
 
@@ -338,6 +374,201 @@ impl Db {
         self.call("notification_drops", json!({}))
     }
 }
+
+/// An in-cluster managed SQL handle. Unlike [`Db`], it exposes only the
+/// managed SQL operations and never the generic local/legacy call surface.
+pub struct ManagedDb {
+    handle: u64,
+    closed: bool,
+}
+impl ManagedDb {
+    pub fn open(config: ManagedOpenConfig) -> Result<Self> {
+        let value = native_open_managed(config.into_json())?;
+        let handle = value
+            .get("handle")
+            .and_then(Value::as_u64)
+            .ok_or_else(|| Error {
+                code: "invalid_response".into(),
+                message: "managed open response has no handle".into(),
+            })?;
+        Ok(Self {
+            handle,
+            closed: false,
+        })
+    }
+    /// Uses the standard installed profile and handoff paths. Pod and cluster
+    /// identity come from the Rhiza environment variables in this process.
+    pub fn open_from_env() -> Result<Self> {
+        Self::open(ManagedOpenConfig::default())
+    }
+    pub fn execute(&self, request: &ManagedExecuteRequest) -> Result<ExecuteReturningResult> {
+        self.call("execute", serde_json::to_value(request).map_err(internal)?)
+    }
+    pub fn query(&self, request: &ManagedQueryRequest) -> Result<QueryResult> {
+        self.call("query", serde_json::to_value(request).map_err(internal)?)
+    }
+    pub fn ready(&self) -> Result<bool> {
+        self.call("ready", json!({}))
+    }
+    /// Checks managed admission with a caller-selected bound, capped at the
+    /// native bridge's 30-second default so managed calls cannot extend it.
+    pub fn ready_with_timeout(&self, timeout: std::time::Duration) -> Result<bool> {
+        let timeout_ms = timeout.as_millis().clamp(1, DEFAULT_TIMEOUT_MS as u128) as u64;
+        self.call_with_timeout("ready", json!({}), timeout_ms)
+    }
+    /// Resolves only the retained original pending request; it does not submit
+    /// a replacement write.
+    pub fn recover_pending(&self) -> Result<()> {
+        self.call("recover_pending", json!({}))
+    }
+    pub fn close(&mut self) -> Result<()> {
+        if self.closed {
+            return Ok(());
+        }
+        let result = native_close(self.handle);
+        self.closed = true;
+        result
+    }
+    fn call<T: DeserializeOwned>(&self, operation: &str, request: Value) -> Result<T> {
+        self.call_with_timeout(operation, request, DEFAULT_TIMEOUT_MS)
+    }
+    fn call_with_timeout<T: DeserializeOwned>(
+        &self,
+        operation: &str,
+        request: Value,
+        timeout_ms: u64,
+    ) -> Result<T> {
+        if self.closed {
+            return Err(Error {
+                code: "closed".into(),
+                message: "Rhiza managed DB is closed".into(),
+            });
+        }
+        native_call(
+            self.handle,
+            json!({"operation": operation, "request": request}),
+            timeout_ms,
+        )
+    }
+}
+impl Drop for ManagedDb {
+    fn drop(&mut self) {
+        let _ = self.close();
+    }
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct ManagedExecuteRequest {
+    pub request_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sql: Option<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub args: Vec<Value>,
+    #[serde(skip_serializing_if = "is_false")]
+    pub want_rows: bool,
+    #[serde(skip_serializing_if = "is_false")]
+    pub require_one: bool,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub statements: Vec<ManagedSqlStatement>,
+}
+impl ManagedExecuteRequest {
+    pub fn sql(request_id: impl Into<String>, sql: impl Into<String>) -> Self {
+        Self {
+            request_id: request_id.into(),
+            sql: Some(sql.into()),
+            args: Vec::new(),
+            want_rows: false,
+            require_one: false,
+            statements: Vec::new(),
+        }
+    }
+    pub fn args(mut self, args: impl IntoIterator<Item = Value>) -> Self {
+        self.args = args.into_iter().collect();
+        self
+    }
+    pub fn want_rows(mut self, yes: bool) -> Self {
+        self.want_rows = yes;
+        self
+    }
+    pub fn require_one(mut self, yes: bool) -> Self {
+        self.require_one = yes;
+        self
+    }
+    pub fn statements(mut self, statements: Vec<ManagedSqlStatement>) -> Self {
+        self.sql = None;
+        self.args.clear();
+        self.statements = statements;
+        self
+    }
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct ManagedSqlStatement {
+    pub sql: String,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub args: Vec<Value>,
+    #[serde(skip_serializing_if = "is_false")]
+    pub want_rows: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub expected_rows_affected: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub expected_returned_rows: Option<i64>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub output_refs: Vec<ManagedSqlStatementOutputRef>,
+}
+impl ManagedSqlStatement {
+    pub fn new(sql: impl Into<String>) -> Self {
+        Self {
+            sql: sql.into(),
+            args: Vec::new(),
+            want_rows: false,
+            expected_rows_affected: None,
+            expected_returned_rows: None,
+            output_refs: Vec::new(),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct ManagedSqlStatementOutputRef {
+    pub arg_index: usize,
+    pub statement_index: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub column_name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub column_index: Option<usize>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct ManagedQueryRequest {
+    pub sql: String,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub args: Vec<Value>,
+    pub consistency: String,
+}
+impl ManagedQueryRequest {
+    pub fn new(sql: impl Into<String>) -> Self {
+        Self {
+            sql: sql.into(),
+            args: Vec::new(),
+            consistency: managed_local_consistency(),
+        }
+    }
+    pub fn args(mut self, args: impl IntoIterator<Item = Value>) -> Self {
+        self.args = args.into_iter().collect();
+        self
+    }
+    pub fn consistency(mut self, consistency: impl Into<String>) -> Self {
+        self.consistency = consistency.into();
+        self
+    }
+}
+fn managed_local_consistency() -> String {
+    "local".into()
+}
+fn is_false(value: &bool) -> bool {
+    !value
+}
 impl Drop for Db {
     fn drop(&mut self) {
         let _ = self.close();
@@ -519,6 +750,10 @@ fn native_open(value: Value) -> Result<Value> {
     let mut input = encode(value)?;
     decode(unsafe { RhizaOpen(input.as_mut_ptr().cast(), input.len()) })
 }
+fn native_open_managed(value: Value) -> Result<Value> {
+    let mut input = encode(value)?;
+    decode(unsafe { RhizaOpenManaged(input.as_mut_ptr().cast(), input.len()) })
+}
 fn native_open_from_env() -> Result<Value> {
     decode(unsafe { RhizaOpenFromEnv() })
 }
@@ -630,6 +865,36 @@ pub struct MembershipStatus {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn managed_requests_match_managed_ffi_wire() {
+        assert_eq!(ManagedOpenConfig::default().into_json(), json!({}));
+        assert_eq!(
+            ManagedOpenConfig::default()
+                .runtime_profile("/profile")
+                .identity_file("/identity")
+                .handoff_file("/handoff")
+                .repair_handoff_file("/repair")
+                .into_json(),
+            json!({"runtime_profile":"/profile","identity_file":"/identity","handoff_file":"/handoff","repair_handoff_file":"/repair"})
+        );
+        let request = ManagedExecuteRequest::sql("write-1", "INSERT INTO t VALUES (?)")
+            .args([json!(7)])
+            .require_one(true);
+        assert_eq!(
+            serde_json::to_value(request).unwrap(),
+            json!({"request_id":"write-1","sql":"INSERT INTO t VALUES (?)","args":[7],"require_one":true})
+        );
+        assert_eq!(
+            serde_json::to_value(
+                ManagedQueryRequest::new("SELECT value FROM t WHERE id = ?")
+                    .args([json!(7)])
+                    .consistency("linearizable")
+            )
+            .unwrap(),
+            json!({"sql":"SELECT value FROM t WHERE id = ?","args":[7],"consistency":"linearizable"})
+        );
+    }
 
     #[test]
     fn local_mode_reopens_without_operator_listener() {

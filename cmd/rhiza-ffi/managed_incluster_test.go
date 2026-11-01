@@ -1,0 +1,179 @@
+//go:build cgo
+
+package main
+
+import (
+	"bytes"
+	"context"
+	"crypto/sha256"
+	"encoding/json"
+	"fmt"
+	"os"
+	"path/filepath"
+	"testing"
+	"time"
+
+	"github.com/mrchypark/rhiza/internal/types"
+	"github.com/mrchypark/rhiza/pkg/operator"
+)
+
+// This contract runs as the replacement Pod's main process, not beside a live
+// owner of its WAL. The existing identity/await init containers supply the real
+// files; surviving managed voters perform the actual certified membership work.
+func TestManagedFFIInClusterSQLLifecycle(t *testing.T) {
+	if os.Getenv("RHIZA_FFI_IN_CLUSTER_CONTRACT") != "1" {
+		t.Skip("requires the actual in-cluster managed replacement fixture; no local Host substitute")
+	}
+	paths := []string{"/var/lib/rhiza/identity.json", "/var/lib/rhiza/bootstrap.json", "/var/lib/rhiza/repair.json"}
+	before := make(map[string][32]byte)
+	for _, path := range paths {
+		data, err := os.ReadFile(path)
+		if err != nil {
+			t.Fatalf("required current replacement input unavailable: %s", filepath.Base(path))
+		}
+		before[path] = sha256.Sum256(data)
+	}
+	// This is the production FFI opener: actual NewInCluster, shared validation,
+	// SDK source verifier, managedsql.Open, registration, WAL, and promotion gate.
+	var opened struct {
+		Data struct {
+			Handle uint64 `json:"handle"`
+		} `json:"data"`
+		Error *ffiError `json:"error"`
+	}
+	if err := json.Unmarshal(goOpenManaged([]byte(`{}`)), &opened); err != nil {
+		t.Fatal("invalid FFI open response")
+	}
+	if opened.Error != nil {
+		t.Fatalf("real managed FFI open failed, code=%s", opened.Error.Code)
+	}
+	handle := opened.Data.Handle
+	if handle == 0 {
+		t.Fatal("real managed FFI open returned no handle")
+	}
+	closed := false
+	t.Cleanup(func() {
+		if !closed {
+			_ = goClose(handle)
+		}
+	})
+	invoke := func(operation string, request any) json.RawMessage {
+		t.Helper()
+		wire, err := json.Marshal(map[string]any{"operation": operation, "request": request})
+		if err != nil {
+			t.Fatal(err)
+		}
+		var result struct {
+			Data  json.RawMessage `json:"data"`
+			Error *ffiError       `json:"error"`
+		}
+		if err := json.Unmarshal(goCall(handle, wire, 30000), &result); err != nil {
+			t.Fatal("invalid FFI call response")
+		}
+		if result.Error != nil {
+			t.Fatalf("real managed FFI %s failed, code=%s (no mutation retry)", operation, result.Error.Code)
+		}
+		return result.Data
+	}
+	deadline := time.Now().Add(75 * time.Second)
+	kube, err := operator.NewInCluster(os.Getenv("POD_NAMESPACE"))
+	if err != nil {
+		t.Fatal("actual in-cluster status client unavailable")
+	}
+	store := &operator.V1Alpha2StatusStore{Kube: kube}
+	ref := operator.V1Alpha2ClusterRef{Name: os.Getenv("RHIZA_CLUSTER_NAME"), Namespace: os.Getenv("POD_NAMESPACE"), UID: os.Getenv("RHIZA_CLUSTER_UID")}
+	for {
+		var ready bool
+		if err := json.Unmarshal(invoke("ready", struct{}{}), &ready); err != nil {
+			t.Fatal("invalid managed readiness response")
+		}
+		statusCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		admission, statusErr := operator.LoadV1Alpha2Admission(statusCtx, store, ref)
+		cancel()
+		if statusErr != nil {
+			t.Fatal("actual repair status could not be verified")
+		}
+		repair, exists := admission.Repair()
+		if !exists || repair.Plan.Replacement.PodUID != os.Getenv("POD_UID") {
+			t.Fatal("actual closed repair candidate changed during FFI admission")
+		}
+		if ready && repair.State == "Completed" && !admission.SQLReservationsClosed() {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("actual replacement never reached managed application admission")
+		}
+		time.Sleep(100 * time.Millisecond) // Read-only readiness polling, not mutation retry.
+	}
+	entry, release, err := acquire(handle)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if entry.managed == nil || entry.db != nil {
+		release()
+		t.Fatal("FFI open did not own an actual managed Host")
+	}
+	release()
+	identityPath := "/var/lib/rhiza/data/qlog/voter-identity.json"
+	registered, err := os.ReadFile(identityPath)
+	if err != nil {
+		t.Fatal("actual registered voter identity missing after admission")
+	}
+	var registration struct {
+		Registered bool   `json:"registered"`
+		Nonce      string `json:"nonce"`
+	}
+	if json.Unmarshal(registered, &registration) != nil || !registration.Registered || len(registration.Nonce) != 64 {
+		t.Fatal("actual voter registration is invalid")
+	}
+	requestID := fmt.Sprintf("ffi-contract-%d", time.Now().UnixNano())
+	if !committedFFIReceipt(invoke("execute", map[string]any{"request_id": requestID + "-schema", "sql": "CREATE TABLE IF NOT EXISTS managed_ffi_contract (id TEXT PRIMARY KEY, value TEXT NOT NULL)"})) {
+		t.Fatal("schema mutation did not return a committed receipt; no retry")
+	}
+	if !committedFFIReceipt(invoke("execute", map[string]any{"request_id": requestID + "-insert", "sql": "INSERT INTO managed_ffi_contract (id, value) VALUES (?, ?)", "args": []any{requestID, "ffi-live"}})) {
+		t.Fatal("insert mutation did not return a committed receipt; no retry")
+	}
+	var query struct {
+		Rows [][]string `json:"rows"`
+	}
+	if json.Unmarshal(invoke("query", map[string]any{"sql": "SELECT id, value FROM managed_ffi_contract WHERE id = ?", "args": []any{requestID}, "consistency": "linearizable"}), &query) != nil || len(query.Rows) != 1 || len(query.Rows[0]) != 2 || query.Rows[0][0] != requestID || query.Rows[0][1] != "ffi-live" {
+		t.Fatal("real FFI SQL ACK readback mismatch")
+	}
+	var closeResult struct {
+		Error *ffiError `json:"error"`
+	}
+	if json.Unmarshal(goClose(handle), &closeResult) != nil || closeResult.Error != nil {
+		t.Fatal("real managed FFI close failed")
+	}
+	closed = true
+	if code := responseErrorCode(t, goCall(handle, []byte(`{"operation":"ready","request":{}}`), 1000)); code != "invalid_handle" {
+		t.Fatal("closed managed FFI handle remained usable")
+	}
+	for _, path := range paths {
+		data, err := os.ReadFile(path)
+		if err != nil || sha256.Sum256(data) != before[path] {
+			t.Fatalf("FFI startup/SQL/close changed immutable input: %s", filepath.Base(path))
+		}
+	}
+	after, err := os.ReadFile(identityPath)
+	if err != nil || !bytes.Equal(registered, after) {
+		t.Fatal("FFI SQL/close replaced the actual voter registration")
+	}
+	t.Log("actual in-cluster Go FFI -> managed Host -> SQL ACK readback -> close passed; no Rust or physical-fencing claim")
+}
+
+func committedFFIReceipt(raw json.RawMessage) bool {
+	var receipt types.MutationReceipt
+	return json.Unmarshal(raw, &receipt) == nil && receipt.Status == types.MutationCommitted && receipt.Slot != 0 && receipt.ErrorCode == ""
+}
+
+func TestManagedContractReceiptOracle(t *testing.T) {
+	for _, raw := range []string{`{}`, `null`, `{"status":"rejected","slot":1}`, `{"status":"committed","slot":0}`, `{"status":"committed","slot":1,"error_code":"commit_unknown"}`, `{"status":"pending","slot":1}`} {
+		if committedFFIReceipt(json.RawMessage(raw)) {
+			t.Fatal("noncommitted receipt counted as ACK")
+		}
+	}
+	if !committedFFIReceipt(json.RawMessage(`{"status":"committed","slot":1}`)) {
+		t.Fatal("committed receipt was rejected")
+	}
+}

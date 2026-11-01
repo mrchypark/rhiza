@@ -129,6 +129,68 @@ to 16 MiB before it enters the native bridge. Responses use the Go engine's
 existing result limits. JSON encoding, C buffers, and owned Rust results incur
 copies; this is not a zero-copy interface or a process-wide memory limit.
 
+## Managed SQL hosts
+
+For an application running inside a Rhiza-managed Pod, use the separate managed
+handle. It loads the verified runtime profile, Pod identity, bootstrap handoff,
+and optional repair handoff; cluster and Pod identity are taken from the
+process environment. The default paths are the installed paths:
+
+```rust
+let mut db = rhizadb::ManagedDb::open_from_env()?;
+let result = db.execute(
+    &rhizadb::ManagedExecuteRequest::sql("insert-42", "INSERT INTO app VALUES (?)")
+        .args([serde_json::json!("value")]),
+)?;
+result.require_committed()?;
+let rows = db.query(&rhizadb::ManagedQueryRequest::new("SELECT value FROM app"))?;
+db.close()?;
+```
+
+`statements` runs a transaction as one managed write. An output reference fills
+a `NULL` argument from an earlier statement's returned row:
+
+```rust
+let request = rhizadb::ManagedExecuteRequest {
+    request_id: "parent-and-child".into(),
+    sql: None,
+    args: vec![],
+    want_rows: false,
+    require_one: false,
+    statements: vec![
+        rhizadb::ManagedSqlStatement {
+            args: vec![serde_json::json!("parent")],
+            want_rows: true,
+            expected_returned_rows: Some(1),
+            ..rhizadb::ManagedSqlStatement::new(
+                "INSERT INTO parent(name) VALUES (?) RETURNING id",
+            )
+        },
+        rhizadb::ManagedSqlStatement {
+            args: vec![serde_json::Value::Null, serde_json::json!("child")],
+            output_refs: vec![rhizadb::ManagedSqlStatementOutputRef {
+                arg_index: 0,
+                statement_index: 0,
+                column_name: Some("id".into()),
+                column_index: None,
+            }],
+            ..rhizadb::ManagedSqlStatement::new(
+                "INSERT INTO child(parent_id, name) VALUES (?, ?)",
+            )
+        },
+    ],
+};
+db.execute(&request)?.require_committed()?;
+```
+
+`ManagedDb` deliberately has no generic operation escape hatch, local mode,
+legacy operator listener, or KV/graph/membership methods. `ready()` checks
+managed admission; `recover_pending()` resolves the retained original SQL
+request. Writes are never automatically retried with a new request ID. An
+`Error` such as `commit_unknown` does not establish rollback; preserve the
+original request ID and use `recover_pending()` before deciding what to submit
+next. Calls use the native bridge's 30-second default timeout.
+
 ## Prebuilt native archives
 
 Every release attaches stripped archives built from that release tag, with a

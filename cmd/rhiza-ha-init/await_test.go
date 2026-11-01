@@ -21,6 +21,7 @@ import (
 
 	"github.com/mrchypark/rhiza"
 	"github.com/mrchypark/rhiza/internal/types"
+	"github.com/mrchypark/rhiza/pkg/managedbootstrap"
 	"github.com/mrchypark/rhiza/pkg/managedsql"
 	nodepkg "github.com/mrchypark/rhiza/pkg/node"
 	"github.com/mrchypark/rhiza/pkg/operator"
@@ -143,6 +144,13 @@ func TestAwaitCommittedPlanAndLiveGuards(t *testing.T) {
 	cfg, err := managedConfig(context.Background(), k, ref, "pod-name", "pod-1", identity, output, profile)
 	if err != nil || cfg.StorageRoot != "root" || cfg.Runtime.NodeID != node || cfg.Runtime.PeerToken != token || cfg.Runtime.PeerAddr != "127.0.0.1:1234" || len(cfg.Runtime.Members) != 3 || cfg.Runtime.ObjStorePrefix == "root" {
 		t.Fatalf("bad managed configuration: %v", err)
+	}
+	loaded, cleanup, err := managedbootstrap.LoadConfig(context.Background(), managedbootstrap.ConfigRequest{Kube: k, Ref: ref, PodName: "pod-name", PodUID: "pod-1", IdentityPath: identity, BootstrapPath: output, RepairPath: filepath.Join(dir, "repair.json"), Profile: profile})
+	if err != nil || !reflect.DeepEqual(loaded, cfg) {
+		t.Fatalf("shared loader differs from verified CLI config: %v", err)
+	}
+	if err := cleanup(); err != nil {
+		t.Fatal(err)
 	}
 	profile.EvidenceFormat = "wrong"
 	if _, err := managedConfig(context.Background(), k, ref, "pod-name", "pod-1", identity, output, profile); err == nil {

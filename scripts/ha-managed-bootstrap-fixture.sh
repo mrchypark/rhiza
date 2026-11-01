@@ -110,6 +110,13 @@ replacement_uid=$(jq -r '.status.repair.plan.replacement.podUID' "$logs/replacem
 replacement_pod=$(jq -r --arg uid "$replacement_uid" '.items[]|select(.metadata.uid==$uid)|.metadata.name' "$logs/replacement-pods.json")
 [ -n "$replacement_pod" ]
 restart_before=$(jq -r --arg uid "$replacement_uid" '.items[]|select(.metadata.uid==$uid)|.status.containerStatuses[]|select(.name=="sql")|.restartCount' "$logs/replacement-pods.json")
+if [ "${RHIZA_MANAGED_TEST_DOCKERFILE-}" = Dockerfile.managed-ffi-contract ]; then
+  # A failed test must not become a pass through kubelet retries/new request IDs.
+  [ "$restart_before" = 0 ] || { echo 'FFI contract initial main restarted; retain first failure' >&2; return 1; }
+  k -n "$namespace" logs "$replacement_pod" -c sql > "$logs/go-ffi-contract-first.log"
+  grep -F 'actual in-cluster Go FFI -> managed Host -> SQL ACK readback -> close passed' "$logs/go-ffi-contract-first.log" >/dev/null
+  grep -Fx 'PASS: managed Rust FFI SQL contract' "$logs/go-ffi-contract-first.log" >/dev/null
+fi
 k -n "$namespace" exec "$replacement_pod" -c sql -- sha256sum /var/lib/rhiza/repair.json /var/lib/rhiza/data/prepared-adoption.json /var/lib/rhiza/data/qlog/voter-identity.json > "$logs/restart-identity-before.txt"
 # The application handles TERM; kubelet restarts main without replacing the
 # Pod or rerunning its completed initContainers and keeps the same emptyDir.
@@ -119,6 +126,12 @@ until k -n "$namespace" get pod "$replacement_pod" -o json > "$logs/restarted-po
   jq -e --arg uid "$replacement_uid" --argjson before "$restart_before" '.metadata.uid==$uid and any(.status.containerStatuses[]; .name=="sql" and .restartCount>$before and .ready==true) and ([.status.initContainerStatuses[]|select(.state.terminated.exitCode==0)]|length)==2' "$logs/restarted-pod.json" >/dev/null; do
   attempt=$((attempt+1)); [ "$attempt" -lt 120 ] || exit 1; sleep 1
 done
+if [ "${RHIZA_MANAGED_TEST_DOCKERFILE-}" = Dockerfile.managed-ffi-contract ]; then
+  jq -e --argjson before "$restart_before" 'any(.status.containerStatuses[]; .name=="sql" and .restartCount==($before+1))' "$logs/restarted-pod.json" >/dev/null
+  k -n "$namespace" logs "$replacement_pod" -c sql > "$logs/go-ffi-contract-restart.log"
+  grep -F 'actual in-cluster Go FFI -> managed Host -> SQL ACK readback -> close passed' "$logs/go-ffi-contract-restart.log" >/dev/null
+  grep -Fx 'PASS: managed Rust FFI SQL contract' "$logs/go-ffi-contract-restart.log" >/dev/null
+fi
 k -n "$namespace" exec "$replacement_pod" -c sql -- sha256sum /var/lib/rhiza/repair.json /var/lib/rhiza/data/prepared-adoption.json /var/lib/rhiza/data/qlog/voter-identity.json > "$logs/restart-identity-after.txt"
 cmp "$logs/restart-identity-before.txt" "$logs/restart-identity-after.txt"
 run_client query-after-restart query '{"sql":"SELECT id, value FROM bootstrap_ci"}'

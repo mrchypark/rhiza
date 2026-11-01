@@ -2,13 +2,27 @@ name: HA managed Kubernetes Chaos Mesh
 on:
   workflow_dispatch:
     inputs:
+      mode:
+        description: Test a published release or a protected-main CI candidate image
+        required: true
+        type: choice
+        options: [release, candidate]
+        default: release
       release_tag:
         description: Published release tag containing this harness
-        required: true
+        required: false
         type: string
       image:
         description: Released rhiza-operator image pinned by sha256
-        required: true
+        required: false
+        type: string
+      source_sha:
+        description: Exact protected-main SHA for candidate mode; dispatch this workflow at that SHA
+        required: false
+        type: string
+      image_run_id:
+        description: Successful HA managed candidate-image workflow run ID for source_sha
+        required: false
         type: string
       namespace:
         description: Fresh pre-created rhiza-ha-chaos-* host namespace
@@ -39,19 +53,16 @@ jobs:
   qualification:
     runs-on: ubuntu-latest
     timeout-minutes: 20
+    permissions:
+      actions: read
+      contents: read
+      packages: read
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: ${{ inputs.release_tag }}
-      - uses: actions/setup-go@v6
-        with:
-          go-version-file: go.mod
-      - uses: azure/setup-helm@v4
-        with:
-          version: v3.19.0
-      - name: Offline identity guard regressions
-        run: sh scripts/test-ha-managed-cluster-chaos-test.sh
+          ref: ${{ inputs.mode == 'candidate' && inputs.source_sha || inputs.release_tag }}
       - name: Validate published release and immutable image source
+        if: inputs.mode == 'release'
         env:
           GH_TOKEN: ${{ github.token }}
           RELEASE_TAG: ${{ inputs.release_tag }}
@@ -66,6 +77,78 @@ jobs:
           test "$(docker image inspect "$RELEASE_IMAGE" --format '{{ index .Config.Labels "org.opencontainers.image.revision" }}')" = "$(git rev-parse HEAD)"
           mkdir -p "$RUNNER_TEMP/ha-managed-cluster-chaos"
           printf '%s\n' "$RELEASE_TAG" "$RELEASE_IMAGE" "$(git rev-parse HEAD)" > "$RUNNER_TEMP/ha-managed-cluster-chaos/release-source.txt"
+      - name: Validate exact candidate source and successful image publication
+        id: candidate_image
+        if: inputs.mode == 'candidate'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SOURCE_SHA: ${{ inputs.source_sha }}
+          IMAGE_RUN_ID: ${{ inputs.image_run_id }}
+        run: |
+          set -eu
+          printf '%s\n' "$SOURCE_SHA" | grep -Eq '^[0-9a-f]{40}$'
+          printf '%s\n' "$IMAGE_RUN_ID" | grep -Eq '^[1-9][0-9]{0,19}$'
+          test "$GITHUB_REF" = refs/heads/main
+          test "$GITHUB_SHA" = "$SOURCE_SHA"
+          test "$(git rev-parse HEAD)" = "$SOURCE_SHA"
+          git fetch --no-tags origin main
+          git merge-base --is-ancestor "$SOURCE_SHA" origin/main
+
+          workflow=$(gh api "repos/$GITHUB_REPOSITORY/actions/workflows/ha-managed-candidate-image.yml")
+          workflow_id=$(printf '%s' "$workflow" | jq -er '.id | numbers')
+          run=$(gh api "repos/$GITHUB_REPOSITORY/actions/runs/$IMAGE_RUN_ID")
+          printf '%s' "$run" | jq -e \
+            --arg repo "$GITHUB_REPOSITORY" \
+            --arg sha "$SOURCE_SHA" \
+            --argjson workflow_id "$workflow_id" \
+            '.repository.full_name==$repo and .head_repository.full_name==$repo and .head_branch=="main" and .head_sha==$sha and .event=="workflow_dispatch" and .status=="completed" and .conclusion=="success" and .workflow_id==$workflow_id' \
+            >/dev/null
+          run_attempt=$(printf '%s' "$run" | jq -er '.run_attempt | numbers')
+
+          provenance_dir="$RUNNER_TEMP/candidate-image-provenance"
+          mkdir -p "$provenance_dir"
+          gh run download "$IMAGE_RUN_ID" --repo "$GITHUB_REPOSITORY" \
+            --name "ha-candidate-image-$IMAGE_RUN_ID-$run_attempt" --dir "$provenance_dir"
+          provenance="$provenance_dir/provenance.json"
+          jq -e \
+            --arg repo "$GITHUB_REPOSITORY" \
+            --arg sha "$SOURCE_SHA" \
+            --arg path ".github/workflows/ha-managed-candidate-image.yml" \
+            --arg image "ghcr.io/${GITHUB_REPOSITORY_OWNER}/rhiza-operator" \
+            --arg tag "chaos-$SOURCE_SHA-$IMAGE_RUN_ID-$run_attempt" \
+            --argjson run_id "$IMAGE_RUN_ID" \
+            --argjson run_attempt "$run_attempt" \
+            '.schema=="rhiza-candidate-image/v1" and .repository==$repo and .source_sha==$sha and .workflow_path==$path and .workflow_run_id==$run_id and .workflow_run_attempt==$run_attempt and .image==$image and .tag==($image+":"+$tag) and (.digest|test("^sha256:[0-9a-f]{64}$")) and .image_ref==(.image+"@"+.digest)' \
+            "$provenance" >/dev/null
+
+          image_ref=$(jq -er '.image_ref' "$provenance")
+          printf 'image_ref=%s\n' "$image_ref" >> "$GITHUB_OUTPUT"
+          mkdir -p "$RUNNER_TEMP/ha-managed-cluster-chaos"
+          printf '%s\n' "$SOURCE_SHA" "$IMAGE_RUN_ID" "$run_attempt" "$image_ref" > "$RUNNER_TEMP/ha-managed-cluster-chaos/candidate-source.txt"
+      - uses: docker/login-action@v3
+        if: inputs.mode == 'candidate'
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Pull and verify candidate image provenance
+        if: inputs.mode == 'candidate'
+        env:
+          SOURCE_SHA: ${{ inputs.source_sha }}
+          IMAGE_REF: ${{ steps.candidate_image.outputs.image_ref }}
+        run: |
+          set -eu
+          docker pull "$IMAGE_REF"
+          test "$(docker image inspect "$IMAGE_REF" --format '{{ index .Config.Labels "org.opencontainers.image.revision" }}')" = "$SOURCE_SHA"
+          test "$(docker image inspect "$IMAGE_REF" --format '{{ index .Config.Labels "org.opencontainers.image.source" }}')" = "https://github.com/$GITHUB_REPOSITORY"
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+      - uses: azure/setup-helm@v4
+        with:
+          version: v3.19.0
+      - name: Offline identity guard regressions
+        run: sh scripts/test-ha-managed-cluster-chaos-test.sh
       - name: Actual namespace-isolated Kubernetes Chaos Mesh qualification
         env:
           HOST_CONFIG: ${{ secrets.RHIZA_CLUSTER_CHAOS_KUBECONFIG }}
@@ -74,7 +157,7 @@ jobs:
           RHIZA_HOST_NAMESPACE_UID: ${{ inputs.namespace_uid }}
           RHIZA_HOST_SERVICEACCOUNT_UID: ${{ inputs.serviceaccount_uid }}
           RHIZA_HOST_NODE: ${{ inputs.node }}
-          RHIZA_RELEASE_IMAGE: ${{ inputs.image }}
+          RHIZA_RELEASE_IMAGE: ${{ inputs.mode == 'candidate' && steps.candidate_image.outputs.image_ref || inputs.image }}
         run: |
           set -eu
           umask 077
