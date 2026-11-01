@@ -1,9 +1,16 @@
-# Rhiza recovery operator: phase 1 contract
+# Rhiza recovery operator: v1alpha2 managed HA
 
-The v1alpha2 manifests describe a proposed Deployment and NoPVC HA contract.
-The public operator Run path is blocked until the safe engine is implemented;
-these examples are illustrative, not deployment instructions or a release.
-Existing private HA code and its internal tests do not provide legacy API support.
+The v1alpha2 managed runtime uses Deployment Pods, two init containers and no PVC.
+The managed initialization route is selected with a private runtime profile;
+CI verifies actual bootstrap, Pod replacement, main restart and ACK readback.
+The legacy `Controller.Run` recovery engine remains unavailable. The old alpha1
+success-recovery CI and qualification-image publication paths are retired,
+not passed or carried forward as alpha2 evidence. Their Go protocol regressions
+and explicit no-side-effect rejection tests remain in CI. The current managed
+contract, provider and kubelet workflows run on pull requests and main.
+These examples are not a claim of complete disaster recovery qualification:
+Chaos Mesh, isolated-process physical fencing and live-cloud parity require
+separate evidence. Existing private HA code does not provide legacy API support.
 Both HA kinds serve and store v1alpha2 only; there is no v1alpha1 conversion or
 compatibility path. Existing object lifecycle is an installation prerequisite;
 these files do not authorize deletion, adoption, or migration.

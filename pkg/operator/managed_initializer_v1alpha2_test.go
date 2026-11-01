@@ -415,12 +415,8 @@ func TestManagedHostInstallOnlyWritesCRStatus(t *testing.T) {
 						for _, verb := range verbs {
 							grants[name][verb.(string)] = true
 						}
-						if name == "rhizaclusters/status" {
-							if len(verbs) != 2 || !grants[name]["get"] || !grants[name]["update"] {
-								t.Fatal("host status permissions must be get/update only")
-							}
-						} else if len(verbs) != 1 || verbs[0] != "get" {
-							t.Fatalf("host writes non-status resource %s", name)
+						if !managedHostVerbsAllowed(name, grants[name]) {
+							t.Fatalf("host has unexpected permissions for %s: %v", name, verbs)
 						}
 					}
 				}
@@ -456,6 +452,46 @@ func TestManagedHostInstallOnlyWritesCRStatus(t *testing.T) {
 		if !grants[resource]["get"] {
 			t.Fatalf("host missing GET %s", resource)
 		}
+	}
+}
+
+func managedHostVerbsAllowed(resource string, verbs map[string]bool) bool {
+	want := []string{"get"}
+	switch resource {
+	case "rhizaclusters/status":
+		want = append(want, "update")
+	case "pods":
+		want = append(want, "list")
+	}
+	if len(verbs) != len(want) {
+		return false
+	}
+	for _, verb := range want {
+		if !verbs[verb] {
+			return false
+		}
+	}
+	return true
+}
+
+func TestManagedHostInstallRejectsNonStatusWriteGrants(t *testing.T) {
+	for _, resource := range []string{"pods", "rhizaclusters", "replicasets", "deployments"} {
+		for _, verb := range []string{"create", "update", "patch", "delete", "deletecollection", "*"} {
+			t.Run(resource+"/"+verb, func(t *testing.T) {
+				verbs := map[string]bool{"get": true, verb: true}
+				if resource == "pods" {
+					verbs["list"] = true
+				}
+				if managedHostVerbsAllowed(resource, verbs) {
+					t.Fatalf("host accepted non-status write grant: %s %v", resource, verbs)
+				}
+			})
+		}
+	}
+	if managedHostVerbsAllowed("deployments", map[string]bool{"get": true, "list": true}) ||
+		managedHostVerbsAllowed("pods", map[string]bool{"get": true, "watch": true}) ||
+		managedHostVerbsAllowed("rhizaclusters/status", map[string]bool{"get": true, "patch": true}) {
+		t.Fatal("host accepted unexpected read or status verbs")
 	}
 }
 

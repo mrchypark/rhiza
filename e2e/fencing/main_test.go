@@ -22,6 +22,9 @@ func TestWorkflowExcludesRawKindArtifacts(t *testing.T) {
 		t.Fatal(err)
 	}
 	var workflow struct {
+		On map[string]struct {
+			Branches []string `yaml:"branches"`
+		} `yaml:"on"`
 		Jobs map[string]struct {
 			Steps []struct {
 				Uses string `yaml:"uses"`
@@ -34,16 +37,56 @@ func TestWorkflowExcludesRawKindArtifacts(t *testing.T) {
 	if err := yaml.Unmarshal(data, &workflow); err != nil {
 		t.Fatal(err)
 	}
-	for job, root := range map[string]string{"operator-chaos": "operator-chaos-results", "automatic-operator-chaos": "automatic-chaos-results", "anchor-operator-chaos": "anchor-chaos-results"} {
+	for _, job := range []string{"operator-chaos", "automatic-operator-chaos", "anchor-operator-chaos", "publish-chaos-image", "cooperative-fencing"} {
+		if _, exists := workflow.Jobs[job]; exists {
+			t.Fatalf("retired alpha1 recovery job %s must not qualify alpha2", job)
+		}
+	}
+	for _, job := range []string{"go", "containers", "rust-sdk", "membership-e2e", "embedded-object-storage-providers", "legacy-recovery-rejection"} {
+		if _, exists := workflow.Jobs[job]; !exists {
+			t.Fatalf("required existing coverage %s is missing", job)
+		}
+	}
+	for file, allowed := range map[string]string{
+		"ha-managed-bootstrap.yml": "${{ runner.temp }}/ha-managed-bootstrap",
+		"ha-v1alpha2-contract.yml": "${{ runner.temp }}/ha-v1alpha2-contract",
+		"ha-readonly-view.yml":     "${{ runner.temp }}/ha-readonly-providers.log\n/tmp/rhiza-embedded-providers.*/*.log\n/tmp/rhiza-embedded-providers.*/*-image-digests.json\n/tmp/rhiza-embedded-providers.*/selected-tests.txt",
+	} {
+		data, err := os.ReadFile("../../.github/workflows/" + file)
+		if err != nil {
+			t.Fatal(err)
+		}
+		workflow.Jobs = nil
+		workflow.On = nil
+		if err := yaml.Unmarshal(data, &workflow); err != nil {
+			t.Fatal(err)
+		}
+		if _, ok := workflow.On["pull_request"]; !ok {
+			t.Fatalf("%s must qualify pull requests", file)
+		}
+		main := false
+		for _, branch := range workflow.On["push"].Branches {
+			main = main || branch == "main"
+		}
+		if !main {
+			t.Fatalf("%s must qualify main", file)
+		}
 		found := false
-		for _, step := range workflow.Jobs[job].Steps {
-			if strings.HasPrefix(step.Uses, "actions/upload-artifact@") && strings.TrimSpace(step.With.Path) == root+"\n!"+root+"/kind/**" {
+		for _, job := range workflow.Jobs {
+			for _, step := range job.Steps {
+				if !strings.HasPrefix(step.Uses, "actions/upload-artifact@") {
+					continue
+				}
+				if strings.TrimSpace(step.With.Path) != allowed {
+					t.Fatalf("%s artifact upload escaped the diagnostic allowlist: %q", file, step.With.Path)
+				}
 				found = true
 			}
 		}
 		if !found {
-			t.Fatalf("%s upload must exclude the entire raw Kind subtree", job)
+			t.Fatalf("%s must retain allowlisted diagnostics", file)
 		}
+		workflow.Jobs = nil
 	}
 }
 

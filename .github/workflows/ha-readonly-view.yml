@@ -1,8 +1,10 @@
 name: HA read-only view providers
 
 on:
+  pull_request:
   push:
     branches:
+      - main
       - feature/ha-v1alpha2-readonly-view
       - feature/ha-v1alpha2-prepare-restore
       - feature/ha-v1alpha2-append-only

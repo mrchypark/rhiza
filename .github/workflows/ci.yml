@@ -5,12 +5,6 @@ on:
     branches: [main, feature/ha-node-prepared-restore]
   pull_request:
   workflow_dispatch:
-    inputs:
-      publish_chaos_image:
-        description: Publish the tested qualification host image for a local run
-        type: boolean
-        required: false
-        default: false
 
 permissions:
   contents: read
@@ -41,7 +35,7 @@ jobs:
             /tmp/rhiza-embedded-providers.*/*-image-digests.json
             /tmp/rhiza-embedded-providers.*/selected-tests.txt
 
-  cooperative-fencing:
+  legacy-recovery-rejection:
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
@@ -50,143 +44,13 @@ jobs:
         with:
           go-version-file: go.mod
           cache: true
-      - name: Check cooperative protocol and engine regression tests
+      - name: Retain fencing protocol and engine regressions
+        run: go test -race ./pkg/fencing ./pkg/operator ./pkg/node ./pkg/network ./internal/objstore ./e2e/fencing -count=1 -timeout=5m
+      - name: Reject unsupported legacy recovery before side effects
         run: |
-          go test -race ./pkg/fencing ./pkg/operator ./pkg/node ./pkg/network ./internal/objstore ./e2e/fencing -count=1 -timeout=5m
-      - name: Qualify actual cooperative executor in disposable Kubernetes
-        env:
-          CGO_ENABLED: 0
-          FENCING_E2E_OUT: cooperative-fencing-results
-        run: |
-          go install sigs.k8s.io/kind@v0.32.0
-          mkdir -p "$RUNNER_TEMP/fencing-images" cooperative-fencing-results
-          go build -o "$RUNNER_TEMP/fencing-images/rhiza" ./cmd/rhiza
-          go build -o "$RUNNER_TEMP/fencing-images/rhiza-operator" ./cmd/rhiza-operator
-          go build -o "$RUNNER_TEMP/fencing-images/rhiza-fencer" ./cmd/rhiza-fencer
-          go build -o "$RUNNER_TEMP/fencing-e2e" ./e2e/fencing
-          docker build -f Dockerfile.fencing-test -t rhiza-fencing-host:local -t rhiza-fencing-operator:local "$RUNNER_TEMP/fencing-images"
-          if kind get clusters | grep -Fx rhiza-generic-fencing; then exit 1; fi
-          printf '%s\n' rhiza-generic-fencing > cooperative-fencing-results/owned-cluster.txt
-          FENCING_E2E_BIN="$RUNNER_TEMP/fencing-e2e" sh e2e/fencing/run.sh
-      - name: Collect owned runtime diagnostics
-        if: always()
-        run: |
-          mkdir -p cooperative-fencing-results
-          kubectl --context kind-rhiza-generic-fencing -n rhiza-fencing-e2e get pods,events,configmaps,rhizafences -o yaml > cooperative-fencing-results/resources.yaml 2>&1 || true
-          kubectl --context kind-rhiza-generic-fencing -n rhiza-fencing-e2e logs -l app.kubernetes.io/name=rhiza-fencer --all-containers --prefix > cooperative-fencing-results/post-cleanup-authority.log 2>&1 || true
-          kind export logs cooperative-fencing-results/post-step-kind --name rhiza-generic-fencing || true
-      - name: Prepare allowlisted public fencing evidence
-        id: fencing_public
-        if: always()
-        run: |
-          test -x "$RUNNER_TEMP/fencing-e2e"
-          FENCING_E2E_OUT=cooperative-fencing-results "$RUNNER_TEMP/fencing-e2e" safe-artifacts
-          find cooperative-fencing-results/public -type f ! -name SHA256SUMS -exec sha256sum {} + > cooperative-fencing-results/public/SHA256SUMS
-      - uses: actions/upload-artifact@v4
-        if: always() && steps.fencing_public.outcome == 'success'
-        with:
-          name: cooperative-fencing-${{ github.run_id }}
-          path: cooperative-fencing-results/public
-      - name: Remove only this job's test cluster
-        if: always()
-        run: |
-          if test -f cooperative-fencing-results/owned-cluster.txt && command -v kind >/dev/null 2>&1; then
-            kind delete cluster --name rhiza-generic-fencing
-            if kind get clusters | grep -Fx rhiza-generic-fencing; then exit 1; fi
-          fi
+          go test ./cmd/rhiza-operator -run '^TestPhase9InitializerRejectsLegacyAutomaticRecoveryBeforeKubernetes$' -count=1 -timeout=60s
+          go test ./pkg/operator -run '^TestPhase1ControllerRunUnavailable(BeforeSideEffects|WithNilConfiguration)$' -count=1 -timeout=60s
 
-  operator-chaos:
-    runs-on: ubuntu-latest
-    timeout-minutes: 30
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-go@v6
-        with:
-          go-version-file: go.mod
-          cache: true
-      - name: Build test images and Kubernetes cluster
-        env:
-          CGO_ENABLED: 0
-        run: |
-          go install sigs.k8s.io/kind@v0.32.0
-          mkdir -p "$RUNNER_TEMP/chaos-images"
-          go build -o "$RUNNER_TEMP/chaos-images/rhiza" ./cmd/rhiza
-          go build -o "$RUNNER_TEMP/chaos-images/operator" ./cmd/rhiza-operator
-          docker build -f e2e/chaos/Dockerfile --build-arg BINARY=rhiza -t rhiza-chaos:local "$RUNNER_TEMP/chaos-images"
-          docker build -f e2e/chaos/Dockerfile --build-arg BINARY=operator -t rhiza-operator-chaos:local "$RUNNER_TEMP/chaos-images"
-          kind create cluster --name rhiza-operator-chaos --wait 120s
-          kind load docker-image rhiza-chaos:local rhiza-operator-chaos:local --name rhiza-operator-chaos
-      - name: Inject faults and verify Operator recovery
-        run: python3 -u e2e/chaos/operator_recovery.py
-      - name: Collect cluster diagnostics
-        if: always()
-        run: kind export logs operator-chaos-results/kind --name rhiza-operator-chaos || true
-      - uses: actions/upload-artifact@v4
-        if: always()
-        with:
-          name: operator-chaos-${{ github.run_id }}
-          path: |
-            operator-chaos-results
-            !operator-chaos-results/kind/**
-      - name: Remove test cluster
-        if: always()
-        run: kind delete cluster --name rhiza-operator-chaos
-
-  automatic-operator-chaos:
-    runs-on: ubuntu-latest
-    timeout-minutes: 30
-    strategy:
-      fail-fast: false
-      matrix:
-        host: [server, go, rust]
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-go@v6
-        with:
-          go-version-file: go.mod
-          cache: true
-      - uses: dtolnay/rust-toolchain@stable
-        if: matrix.host == 'rust'
-      - name: Fencing executor regression checks
-        run: python3 e2e/chaos/kind_fencer_test.py
-      - name: Build test images and Kubernetes cluster
-        env:
-          CGO_ENABLED: 0
-        run: |
-          go install sigs.k8s.io/kind@v0.32.0
-          mkdir -p "$RUNNER_TEMP/chaos-images"
-          case "${{ matrix.host }}" in
-            server) go build -o "$RUNNER_TEMP/chaos-images/rhiza" ./cmd/rhiza ;;
-            go) go build -o "$RUNNER_TEMP/chaos-images/rhiza" ./e2e/chaos/embedded-go ;;
-            rust)
-              cargo build --manifest-path sdk/rust/Cargo.toml --locked --example operator_chaos
-              cp sdk/rust/target/debug/examples/operator_chaos "$RUNNER_TEMP/chaos-images/rhiza"
-              ;;
-          esac
-          go build -o "$RUNNER_TEMP/chaos-images/operator" ./cmd/rhiza-operator
-          if [[ "${{ matrix.host }}" == rust ]]; then
-            docker build -f e2e/chaos/Dockerfile.rust -t rhiza-chaos:local "$RUNNER_TEMP/chaos-images"
-          else
-            docker build -f e2e/chaos/Dockerfile --build-arg BINARY=rhiza -t rhiza-chaos:local "$RUNNER_TEMP/chaos-images"
-          fi
-          docker build -f e2e/chaos/Dockerfile --build-arg BINARY=operator -t rhiza-operator-chaos:local "$RUNNER_TEMP/chaos-images"
-          kind create cluster --name rhiza-operator-chaos --wait 120s
-          kind load docker-image rhiza-chaos:local rhiza-operator-chaos:local --name rhiza-operator-chaos
-      - name: Inject faults and verify unattended Operator recovery
-        run: python3 -u e2e/chaos/automatic_recovery.py --embedded-host "${{ matrix.host }}"
-      - name: Collect cluster diagnostics
-        if: always()
-        run: kind export logs automatic-chaos-results/kind --name rhiza-operator-chaos || true
-      - uses: actions/upload-artifact@v4
-        if: always()
-        with:
-          name: automatic-operator-chaos-${{ matrix.host }}-${{ github.run_id }}
-          path: |
-            automatic-chaos-results
-            !automatic-chaos-results/kind/**
-      - name: Remove test cluster
-        if: always()
-        run: kind delete cluster --name rhiza-operator-chaos
   membership-e2e:
     runs-on: ubuntu-24.04
     timeout-minutes: 15
@@ -464,140 +328,3 @@ jobs:
           file: Dockerfile.operator
           push: false
           tags: rhiza-operator:ci
-
-  anchor-operator-chaos:
-    runs-on: ubuntu-latest
-    timeout-minutes: 30
-    env:
-      PUBLISH_CHAOS_IMAGE: ${{ github.repository == 'mrchypark/rhiza' && github.event_name == 'workflow_dispatch' && inputs.publish_chaos_image }}
-    steps:
-      - uses: actions/checkout@v4
-      - name: Require exact candidate source for image export
-        if: env.PUBLISH_CHAOS_IMAGE == 'true'
-        run: |
-          git fetch --no-tags --depth=1 origin "$GITHUB_REF"
-          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
-          test "$(git rev-parse FETCH_HEAD)" = "$GITHUB_SHA"
-          test -z "$(git status --porcelain --untracked-files=all)"
-      - uses: actions/setup-go@v6
-        with:
-          go-version-file: go.mod
-          cache: true
-      - name: Build test images and Kubernetes cluster
-        env:
-          CGO_ENABLED: 0
-        run: |
-          go install sigs.k8s.io/kind@v0.32.0
-          mkdir -p "$RUNNER_TEMP/chaos-images"
-          go build -o "$RUNNER_TEMP/chaos-images/rhiza" ./e2e/chaos/embedded-go
-          go build -o "$RUNNER_TEMP/chaos-images/operator" ./cmd/rhiza-operator
-          go build -o "$RUNNER_TEMP/chaos-images/anchor-service" ./examples/recovery-anchor
-          labels=()
-          if [ "$PUBLISH_CHAOS_IMAGE" = true ]; then
-            labels=(--label "org.opencontainers.image.source=https://github.com/mrchypark/rhiza"
-              --label "org.opencontainers.image.revision=$GITHUB_SHA"
-              --label "io.rhiza.qualification.harness=$GITHUB_SHA"
-              --label "io.rhiza.qualification.application=$GITHUB_SHA")
-          fi
-          docker build -f e2e/chaos/Dockerfile --build-arg BINARY=rhiza "${labels[@]}" -t rhiza-chaos:local "$RUNNER_TEMP/chaos-images"
-          docker build -f e2e/chaos/Dockerfile --build-arg BINARY=operator -t rhiza-operator-chaos:local "$RUNNER_TEMP/chaos-images"
-          docker build -f e2e/chaos/Dockerfile --build-arg BINARY=anchor-service -t rhiza-anchor-service:local "$RUNNER_TEMP/chaos-images"
-          kind create cluster --name rhiza-anchor-chaos --wait 120s
-          kind load docker-image rhiza-chaos:local rhiza-operator-chaos:local rhiza-anchor-service:local --name rhiza-anchor-chaos
-      - name: Fencing executor regression checks
-        run: python3 e2e/chaos/kind_fencer_test.py
-      - name: Inject faults and verify anchor-gated recovery
-        run: python3 -u e2e/chaos/anchor_recovery.py --embedded-host go
-      - name: Collect cluster diagnostics
-        if: always()
-        run: kind export logs anchor-chaos-results/kind --name rhiza-anchor-chaos || true
-      - uses: actions/upload-artifact@v4
-        if: always()
-        with:
-          name: anchor-operator-chaos-${{ github.run_id }}
-          path: |
-            anchor-chaos-results
-            !anchor-chaos-results/kind/**
-      - name: Remove test cluster
-        if: always()
-        run: kind delete cluster --name rhiza-anchor-chaos
-      - name: Export the tested qualification host
-        if: env.PUBLISH_CHAOS_IMAGE == 'true'
-        run: |
-          export_dir="$RUNNER_TEMP/qualification-host"
-          mkdir -p "$export_dir"
-          docker image inspect rhiza-chaos:local > "$export_dir/image.json"
-          jq -e --arg revision "$GITHUB_SHA" '
-            .[0] | .Os == "linux" and .Architecture == "amd64" and .Size < 134217728 and
-            .Config.User == "65532:65532" and
-            .Config.Labels["org.opencontainers.image.source"] == "https://github.com/mrchypark/rhiza" and
-            .Config.Labels["org.opencontainers.image.revision"] == $revision and
-            .Config.Labels["io.rhiza.qualification.harness"] == $revision and
-            .Config.Labels["io.rhiza.qualification.application"] == $revision
-          ' "$export_dir/image.json"
-          container=$(docker create rhiza-chaos:local)
-          trap 'docker rm "$container" >/dev/null' EXIT
-          docker cp "$container:/usr/local/bin/rhiza-entrypoint" "$export_dir/rhiza-entrypoint"
-          cmp "$RUNNER_TEMP/chaos-images/rhiza" "$export_dir/rhiza-entrypoint"
-          (cd "$export_dir" && sha256sum rhiza-entrypoint > binary.sha256)
-          rm "$export_dir/rhiza-entrypoint"
-          docker save rhiza-chaos:local -o "$export_dir/host.tar"
-          (cd "$export_dir" && sha256sum host.tar image.json binary.sha256 > SHA256SUMS)
-      - uses: actions/upload-artifact@v4
-        if: env.PUBLISH_CHAOS_IMAGE == 'true'
-        with:
-          name: qualification-host-${{ github.sha }}-${{ github.run_id }}-${{ github.run_attempt }}
-          path: ${{ runner.temp }}/qualification-host
-          if-no-files-found: error
-          retention-days: 7
-
-  publish-chaos-image:
-    if: github.repository == 'mrchypark/rhiza' && github.event_name == 'workflow_dispatch' && inputs.publish_chaos_image
-    needs: [anchor-operator-chaos, go, containers]
-    runs-on: ubuntu-latest
-    timeout-minutes: 10
-    permissions:
-      contents: read
-      packages: write
-    steps:
-      - uses: actions/download-artifact@v4
-        with:
-          name: qualification-host-${{ github.sha }}-${{ github.run_id }}-${{ github.run_attempt }}
-          path: qualification-host
-      - name: Verify and load the tested host image
-        working-directory: qualification-host
-        run: |
-          sha256sum -c SHA256SUMS
-          docker load -i host.tar
-          test "$(docker image inspect rhiza-chaos:local --format '{{.Id}}')" = "$(jq -r '.[0].Id' image.json)"
-          container=$(docker create rhiza-chaos:local)
-          trap 'docker rm "$container" >/dev/null' EXIT
-          docker cp "$container:/usr/local/bin/rhiza-entrypoint" rhiza-entrypoint
-          sha256sum -c binary.sha256
-      - uses: docker/login-action@v3
-        with:
-          registry: ghcr.io
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
-      - name: Publish only the immutable run tag
-        shell: bash
-        run: |
-          target="ghcr.io/mrchypark/rhiza-sql:ci-$GITHUB_SHA-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
-          docker tag rhiza-chaos:local "$target"
-          docker push "$target" | tee qualification-host/push.log
-          docker image inspect "$target" > qualification-host/published-image.json
-          # shellcheck disable=SC2016 # Markdown backticks are literal output.
-          printf 'Qualification host: `%s`\n\n' "$target" >> "$GITHUB_STEP_SUMMARY"
-          jq -r '.[0].RepoDigests[]' qualification-host/published-image.json >> "$GITHUB_STEP_SUMMARY"
-      - uses: actions/upload-artifact@v4
-        if: always()
-        with:
-          name: qualification-publication-${{ github.sha }}-${{ github.run_id }}-${{ github.run_attempt }}
-          path: |
-            qualification-host/image.json
-            qualification-host/binary.sha256
-            qualification-host/SHA256SUMS
-            qualification-host/push.log
-            qualification-host/published-image.json
-          if-no-files-found: error
-          retention-days: 7

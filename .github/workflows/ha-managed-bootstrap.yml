@@ -1,7 +1,8 @@
 name: HA managed kubelet bootstrap
 on:
+  pull_request:
   push:
-    branches: [feature/ha-managed-sql-recovery]
+    branches: [main, feature/ha-managed-sql-recovery]
   workflow_dispatch:
 permissions:
   contents: read
