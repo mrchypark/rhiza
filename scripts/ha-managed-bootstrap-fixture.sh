@@ -4,7 +4,9 @@ capture_client_job() {
   client_capture_name=$1 client_capture_uid=$2
   client_capture_gap=0
   if client_pods=$(k -n "$namespace" get pods -l "job-name=$client_capture_name" -o json 2>/dev/null); then
-    printf '%s\n' "$client_pods" | jq --arg uid "$client_capture_uid" --arg ns "$namespace" '{items:[.items[] | select(.metadata.namespace==$ns and any(.metadata.ownerReferences[]?; .kind=="Job" and .uid==$uid and .controller==true)) | {metadata:{name:.metadata.name,namespace:.metadata.namespace,uid:.metadata.uid,ownerReferences:.metadata.ownerReferences},status:{phase:.status.phase,conditions:[.status.conditions[]? | {type,status,reason}],containerStatuses:[.status.containerStatuses[]? | select(.name=="client") | {name,ready,restartCount,state:{waiting:(.state.waiting | if .==null then null else {reason} end),running:.state.running,terminated:(.state.terminated | if .==null then null else {reason,exitCode,signal,startedAt,finishedAt} end)},lastState:{terminated:(.lastState.terminated | if .==null then null else {reason,exitCode,signal,startedAt,finishedAt} end)}}]}}]}' > "$logs/$client_capture_name-pods.json" || client_capture_gap=1
+    printf '%s\n' "$client_pods" | jq --arg uid "$client_capture_uid" --arg ns "$namespace" '
+      def safeStatus: {name,ready,restartCount,state:{waiting:(.state.waiting | if .==null then null else {reason} end),running:.state.running,terminated:(.state.terminated | if .==null then null else {reason,exitCode,signal,startedAt,finishedAt} end)},lastState:{terminated:(.lastState.terminated | if .==null then null else {reason,exitCode,signal,startedAt,finishedAt} end)}};
+      {items:[.items[] | select(.metadata.namespace==$ns and any(.metadata.ownerReferences[]?; .kind=="Job" and .uid==$uid and .controller==true)) | {metadata:{name:.metadata.name,namespace:.metadata.namespace,uid:.metadata.uid,ownerReferences:.metadata.ownerReferences},status:{phase:.status.phase,conditions:[.status.conditions[]? | {type,status,reason}],initContainerStatuses:[.status.initContainerStatuses[]? | select(.name=="ready") | safeStatus],containerStatuses:[.status.containerStatuses[]? | select(.name=="client") | safeStatus]}}]}' > "$logs/$client_capture_name-pods.json" || client_capture_gap=1
   else
     printf '%s\n' 'client Pod discovery unavailable' > "$logs/$client_capture_name-evidence-gap.txt"
     return 1
@@ -14,6 +16,16 @@ capture_client_job() {
     return 1
   fi
   client_capture_pod=$(jq -r '.items[0].metadata.name' "$logs/$client_capture_name-pods.json")
+  jq -e '.items[0].status.initContainerStatuses|length==1' "$logs/$client_capture_name-pods.json" >/dev/null || client_capture_gap=1
+  # The prerequisite and SQL run in the same Pod; retain init failure before cleanup.
+  for client_stream in current previous; do
+    if [ "$client_stream" = previous ]; then client_previous=--previous; else client_previous=; fi
+    client_log_exit=0
+    client_log=$(k -n "$namespace" logs "$client_capture_pod" -c ready --tail=200 --limit-bytes=65536 $client_previous 2>&1) || client_log_exit=$?
+    printf '%s\n' "$client_log" | head -c 65536 > "$logs/$client_capture_name-ready-$client_stream.log"
+    printf '%s\n' "$client_log_exit" > "$logs/$client_capture_name-ready-$client_stream.exit"
+    if [ "$client_stream" = current ] && [ "$client_log_exit" -ne 0 ]; then client_capture_gap=1; fi
+  done
   for client_stream in current previous; do
     if [ "$client_stream" = previous ]; then client_previous=--previous; else client_previous=; fi
     client_log_exit=0
@@ -144,7 +156,8 @@ run_client() {
   job=$1 route=$2 body=$3
   printf '%s\n' "$body" > "$private/request.body"
   k -n "$namespace" create secret generic "request-$job" --from-file="config=$private/curl.conf" --from-file="body=$private/request.body" || return $?
-  client_created=$(jq -n --arg job "$job" --arg route "http://bootstrap-client.$namespace.svc.cluster.local:8080/$route" '{apiVersion:"batch/v1",kind:"Job",metadata:{name:$job,labels:{"rhiza-ci-owner":"harness"}},spec:{backoffLimit:0,activeDeadlineSeconds:90,template:{spec:{restartPolicy:"Never",automountServiceAccountToken:false,securityContext:{runAsUser:65532,runAsGroup:65532,fsGroup:65532,runAsNonRoot:true},containers:[{name:"client",image:"curlimages/curl:8.12.1@sha256:94e9e444bcba979c2ea12e27ae39bee4cd10bc7041a472c4727a558e213744e6",command:["curl"],args:["--silent","--show-error","--fail-with-body","--write-out","\nRHIZA_HTTP_CODE=%{http_code}\n","--max-time","60","--noproxy","*","--config","/request/config","--header","Content-Type: application/json","--data-binary","@/request/body",$route],securityContext:{allowPrivilegeEscalation:false,readOnlyRootFilesystem:true,capabilities:{drop:["ALL"]}},volumeMounts:[{name:"request",mountPath:"/request",readOnly:true}]}],volumes:[{name:"request",secret:{secretName:("request-"+$job),defaultMode:288}}]}}}}' | k -n "$namespace" create -f - -o json) || return $?
+  client_created=$(jq -n --arg job "$job" --arg route "http://bootstrap-client.$namespace.svc.cluster.local:8080/$route" --arg ready "http://bootstrap-client.$namespace.svc.cluster.local:8080/readyz" '{apiVersion:"batch/v1",kind:"Job",metadata:{name:$job,labels:{"rhiza-ci-owner":"harness"}},spec:{backoffLimit:0,activeDeadlineSeconds:90,template:{spec:{restartPolicy:"Never",automountServiceAccountToken:false,securityContext:{runAsUser:65532,runAsGroup:65532,fsGroup:65532,runAsNonRoot:true},containers:[{name:"client",image:"curlimages/curl:8.12.1@sha256:94e9e444bcba979c2ea12e27ae39bee4cd10bc7041a472c4727a558e213744e6",command:["curl"],args:["--silent","--show-error","--fail-with-body","--write-out","\nRHIZA_HTTP_CODE=%{http_code}\n","--max-time","60","--noproxy","*","--config","/request/config","--header","Content-Type: application/json","--data-binary","@/request/body",$route],securityContext:{allowPrivilegeEscalation:false,readOnlyRootFilesystem:true,capabilities:{drop:["ALL"]}},volumeMounts:[{name:"request",mountPath:"/request",readOnly:true}]}],volumes:[{name:"request",secret:{secretName:("request-"+$job),defaultMode:288}}]}}}}
+    | .spec.template.spec.initContainers=[(.spec.template.spec.containers[0] | .name="ready" | .args=["--silent","--show-error","--fail","--output","/dev/null","--write-out","RHIZA_READY_HTTP_CODE=%{http_code}\n","--connect-timeout","2","--max-time","2","--retry","15","--retry-delay","1","--retry-max-time","15","--retry-connrefused","--noproxy","*","--config","/request/config",$ready])]' | k -n "$namespace" create -f - -o json) || return $?
   client_job_uid=$(printf '%s\n' "$client_created" | jq -er '.metadata.uid | select(type=="string" and length>0)') || return 1
   printf '%s\n' "$client_created" | jq '{apiVersion,kind,metadata:{name:.metadata.name,namespace:.metadata.namespace,uid:.metadata.uid},spec:{backoffLimit:.spec.backoffLimit,activeDeadlineSeconds:.spec.activeDeadlineSeconds},status}' > "$logs/$job-job.json"
   if wait_client_job "$job" "$client_job_uid"; then client_wait_exit=0; else client_wait_exit=$?; fi
