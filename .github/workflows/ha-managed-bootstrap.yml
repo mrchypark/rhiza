@@ -21,8 +21,8 @@ jobs:
         run: |
           sh -n scripts/test-ha-managed-bootstrap.sh
           sh -n scripts/ha-managed-bootstrap-fixture.sh
-          sh -n scripts/test-ha-managed-ied-chaos.sh
-          sh scripts/test-ha-managed-ied-chaos-test.sh
+          sh -n scripts/test-ha-managed-cluster-chaos.sh
+          sh scripts/test-ha-managed-cluster-chaos-test.sh
           sh scripts/test-ha-managed-bootstrap.sh --oracle-self-test
           sh -n scripts/ha-managed-bucket-setup
           cd scripts/ha-managed-bucket-setup-src

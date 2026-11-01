@@ -9,9 +9,9 @@ cd "$(CDPATH='' cd -- "$(dirname -- "$0")/.." && pwd)"
 printf '%s\n' "$RHIZA_HOST_NODE" | grep -Eq '^[a-z0-9][a-z0-9.-]{0,252}$'
 case "$RHIZA_HOST_NAMESPACE" in rhiza-ha-chaos-*) ;; *) echo 'isolated test namespace required' >&2; exit 1;; esac
 printf '%s\n' "$RHIZA_RELEASE_IMAGE" | grep -Eq '^ghcr\.io/mrchypark/rhiza-operator@sha256:[0-9a-f]{64}$'
-logs="$RUNNER_TEMP/ha-managed-ied-chaos"
+logs="$RUNNER_TEMP/ha-managed-cluster-chaos"
 mkdir -p "$logs"
-private=$(mktemp -d "$RUNNER_TEMP/ha-managed-ied-private.XXXXXX")
+private=$(mktemp -d "$RUNNER_TEMP/ha-managed-cluster-private.XXXXXX")
 chmod 700 "$private"
 nonce=$(od -An -N6 -tx1 /dev/urandom | tr -d ' \n')
 namespace=managed-bootstrap
@@ -57,7 +57,7 @@ cleanup() {
     if kill -0 "$pid" 2>/dev/null; then result=1; fi
   done
   # Only this private run directory: credentials are never uploaded as artifacts.
-  rm -f "$private/virtual.config" "$private/runtime.json" "$private/admin.token" "$private/curl.conf" "$private/request.body" "$private/chart.tgz" "$private/values.yaml" "$private/rendered.yaml" "$private/forward.log" "$private/bucket-forward.log" "$RUNNER_TEMP/ha-managed-ied-bucket-setup"
+  rm -f "$private/virtual.config" "$private/runtime.json" "$private/admin.token" "$private/curl.conf" "$private/request.body" "$private/chart.tgz" "$private/values.yaml" "$private/rendered.yaml" "$private/forward.log" "$private/bucket-forward.log" "$RUNNER_TEMP/ha-managed-cluster-bucket-setup"
   rmdir "$private" || result=1
   printf '%s\n' "$result" > "$logs/driver.exit"
   exit "$result"
@@ -128,8 +128,8 @@ managed_bucket_setup() {
   bucket_pid=$!
   forward_port "$private/bucket-forward.log" "$bucket_pid"
   # Reuse the exact actual SDK helper; no ambient provider credentials or cloud.
-  (cd scripts/ha-managed-bucket-setup-src && go build -mod=readonly -o "$RUNNER_TEMP/ha-managed-ied-bucket-setup" .)
-  "$RUNNER_TEMP/ha-managed-ied-bucket-setup" "http://127.0.0.1:$port" "$bucket"
+  (cd scripts/ha-managed-bucket-setup-src && go build -mod=readonly -o "$RUNNER_TEMP/ha-managed-cluster-bucket-setup" .)
+  "$RUNNER_TEMP/ha-managed-cluster-bucket-setup" "http://127.0.0.1:$port" "$bucket"
   kill "$bucket_pid"
   wait "$bucket_pid" 2>/dev/null || :
   bucket_pid=
@@ -193,4 +193,4 @@ managed_fixture
 run_client insert-after-chaos execute '{"request_id":"chaos-final-insert","sql":"INSERT INTO bootstrap_ci VALUES (2, '\''after-chaos'\'')"}'
 run_client query-after-chaos query '{"sql":"SELECT id, value FROM bootstrap_ci ORDER BY id"}'
 jq -e '.rows==[[1,"real-kubelet"],[2,"after-chaos"]]' "$logs/query-after-chaos.json" >/dev/null
-printf '%s\n' 'PASS: released-image managed HA in isolated IED vcluster; actual host Chaos Mesh pod-kill/container-kill, certified replacement, same-Pod identity retention, NoPVC, ACK readback and new write' 'SCOPE: pinned in-namespace Floci S3; not live GCS, network partition, physical fencing, whole-quorum disaster recovery or performance qualification' > "$logs/result.txt"
+printf '%s\n' 'PASS: released-image managed HA in isolated Kubernetes vcluster; actual host Chaos Mesh pod-kill/container-kill, certified replacement, same-Pod identity retention, NoPVC, ACK readback and new write' 'SCOPE: pinned in-namespace Floci S3; not live GCS, network partition, physical fencing, whole-quorum disaster recovery or performance qualification' > "$logs/result.txt"

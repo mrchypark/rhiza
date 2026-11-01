@@ -1,4 +1,4 @@
-name: HA managed IED Chaos Mesh
+name: HA managed Kubernetes Chaos Mesh
 on:
   workflow_dispatch:
     inputs:
@@ -33,7 +33,7 @@ on:
 permissions:
   contents: read
 concurrency:
-  group: rhiza-ied-chaos
+  group: rhiza-cluster-chaos
   cancel-in-progress: false
 jobs:
   qualification:
@@ -50,7 +50,7 @@ jobs:
         with:
           version: v3.19.0
       - name: Offline identity guard regressions
-        run: sh scripts/test-ha-managed-ied-chaos-test.sh
+        run: sh scripts/test-ha-managed-cluster-chaos-test.sh
       - name: Validate published release and immutable image source
         env:
           GH_TOKEN: ${{ github.token }}
@@ -64,11 +64,11 @@ jobs:
           test "$(git describe --tags --exact-match)" = "$RELEASE_TAG"
           docker pull "$RELEASE_IMAGE"
           test "$(docker image inspect "$RELEASE_IMAGE" --format '{{ index .Config.Labels "org.opencontainers.image.revision" }}')" = "$(git rev-parse HEAD)"
-          mkdir -p "$RUNNER_TEMP/ha-managed-ied-chaos"
-          printf '%s\n' "$RELEASE_TAG" "$RELEASE_IMAGE" "$(git rev-parse HEAD)" > "$RUNNER_TEMP/ha-managed-ied-chaos/release-source.txt"
-      - name: Actual namespace-isolated IED Chaos Mesh qualification
+          mkdir -p "$RUNNER_TEMP/ha-managed-cluster-chaos"
+          printf '%s\n' "$RELEASE_TAG" "$RELEASE_IMAGE" "$(git rev-parse HEAD)" > "$RUNNER_TEMP/ha-managed-cluster-chaos/release-source.txt"
+      - name: Actual namespace-isolated Kubernetes Chaos Mesh qualification
         env:
-          HOST_CONFIG: ${{ secrets.RHIZA_IED_CHAOS_KUBECONFIG }}
+          HOST_CONFIG: ${{ secrets.RHIZA_CLUSTER_CHAOS_KUBECONFIG }}
           RHIZA_HOST_CONTEXT: ${{ inputs.context }}
           RHIZA_HOST_NAMESPACE: ${{ inputs.namespace }}
           RHIZA_HOST_NAMESPACE_UID: ${{ inputs.namespace_uid }}
@@ -79,15 +79,15 @@ jobs:
           set -eu
           umask 077
           test -n "$HOST_CONFIG"
-          host_config=$(mktemp "$RUNNER_TEMP/ied-host.XXXXXX")
+          host_config=$(mktemp "$RUNNER_TEMP/cluster-host.XXXXXX")
           trap 'rm -f "$host_config"' EXIT HUP INT TERM
           printf '%s' "$HOST_CONFIG" > "$host_config"
           unset HOST_CONFIG
           export RHIZA_HOST_KUBECONFIG="$host_config"
-          sh scripts/test-ha-managed-ied-chaos.sh
+          sh scripts/test-ha-managed-cluster-chaos.sh
       - name: Preserve non-secret qualification evidence
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: ha-managed-ied-chaos-${{ github.run_id }}
-          path: ${{ runner.temp }}/ha-managed-ied-chaos
+          name: ha-managed-cluster-chaos-${{ github.run_id }}
+          path: ${{ runner.temp }}/ha-managed-cluster-chaos

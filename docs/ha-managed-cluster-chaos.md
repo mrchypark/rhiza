@@ -1,12 +1,12 @@
-# Released managed HA: isolated IED Chaos Mesh qualification
+# Released managed HA: isolated Kubernetes Chaos Mesh qualification
 
-The manual `HA managed IED Chaos Mesh` workflow tests the published release and
+The manual `HA managed Kubernetes Chaos Mesh` workflow tests the published release and
 its immutable operator image. It does not rebuild an application image or use a
 different harness revision. Run it only after the release image has published.
 
 The administrator creates a fresh `rhiza-ha-chaos-*` namespace and short-lived
 namespace-only Kubernetes service account. Upload its kubeconfig as temporary
-repository secret `RHIZA_IED_CHAOS_KUBECONFIG`; supply its context, namespace,
+repository secret `RHIZA_CLUSTER_CHAOS_KUBECONFIG`; supply its context, namespace,
 namespace UID and `rhiza-chaos-runner` ServiceAccount UID to the workflow. Do not commit credentials, cluster addresses or personal
 cloud configuration. The administrator must delete this secret and the owned
 namespace/RBAC after the terminal run and verify absence. Existing shared Rhiza
@@ -45,7 +45,7 @@ checked again.
 An unavailable pinned node causes pending/failure, not scheduling on new nodes.
 The parent creates a namespace ResourceQuota and LimitRange before dispatch to
 bound Pod count, CPU and memory for containers without explicit requests.
-The KRW 10,000 ceiling is a safety maximum, not a spending target.
+The administrator must set and monitor a bounded runtime and cost budget; the maximum is not a spending target.
 
 The existing managed bootstrap fixture is shared with Kind qualification. Its
 runtime, init and main containers all use the exact released digest. Storage is

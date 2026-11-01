@@ -2,10 +2,10 @@
 # Offline replay of the production virtual-to-host identity guard. No API calls.
 set -eu
 cd "$(CDPATH='' cd -- "$(dirname -- "$0")/.." && pwd)"
-for source in scripts/test-ha-managed-bootstrap.sh scripts/ha-managed-bootstrap-fixture.sh scripts/test-ha-managed-ied-chaos.sh; do sh -n "$source"; done
-helper=$(sed -n '/^mapped_host_pod() {/,/^}/p' scripts/test-ha-managed-ied-chaos.sh)
+for source in scripts/test-ha-managed-bootstrap.sh scripts/ha-managed-bootstrap-fixture.sh scripts/test-ha-managed-cluster-chaos.sh; do sh -n "$source"; done
+helper=$(sed -n '/^mapped_host_pod() {/,/^}/p' scripts/test-ha-managed-cluster-chaos.sh)
 [ -n "$helper" ]
-scratch=$(mktemp -d "${TMPDIR:-/tmp}/rhiza-ied-mapping.XXXXXX")
+scratch=$(mktemp -d "${TMPDIR:-/tmp}/rhiza-cluster-mapping.XXXXXX")
 cleanup() {
   unlink "$scratch/test-virtual-before.json" 2>/dev/null || :
   unlink "$scratch/test-host-before.json" 2>/dev/null || :
@@ -36,7 +36,7 @@ for invalid in \
   replay "$invalid" || code=$?
   [ "$code" -ne 0 ] || { echo 'unsafe host mapping accepted' >&2; exit 1; }
 done
-oracle=$(sed -n '/^chaos_record_oracle() {/,/^}/p' scripts/test-ha-managed-ied-chaos.sh)
+oracle=$(sed -n '/^chaos_record_oracle() {/,/^}/p' scripts/test-ha-managed-cluster-chaos.sh)
 [ -n "$oracle" ]
 for target in test-ns/host-1 test-ns/host-1/sql; do
   jq -n --arg id "$target" '{status:{conditions:[{type:"AllInjected",status:"True"}],experiment:{containerRecords:[{id:$id,injectedCount:1}]}}}' > "$scratch/fault.json"
@@ -45,6 +45,6 @@ for target in test-ns/host-1 test-ns/host-1/sql; do
   sh -c 'set -eu; eval "$1"; chaos_record_oracle "$2" "$3"' fixture "$oracle" "$scratch/fault.json" wrong-ns/other-pod || code=$?
   [ "$code" -ne 0 ] || { echo 'wrong Chaos target accepted' >&2; exit 1; }
 done
-[ "$(grep -c 'set-json "sync.fromHost.nodes.selector.labels=' scripts/test-ha-managed-ied-chaos.sh)" -eq 2 ]
-if grep -q 'podTemplate.spec.nodeSelector' scripts/test-ha-managed-ied-chaos.sh; then echo 'unsupported RhizaCluster node pin' >&2; exit 1; fi
+[ "$(grep -c 'set-json "sync.fromHost.nodes.selector.labels=' scripts/test-ha-managed-cluster-chaos.sh)" -eq 2 ]
+if grep -q 'podTemplate.spec.nodeSelector' scripts/test-ha-managed-cluster-chaos.sh; then echo 'unsupported RhizaCluster node pin' >&2; exit 1; fi
 printf '%s\n' 'PASS: exact ready host mapping; duplicate, wrong virtual UID, unpinned node and unready Pod rejected'
