@@ -3,10 +3,10 @@ on:
   workflow_dispatch:
     inputs:
       mode:
-        description: Test a published release or a protected-main CI candidate image
+        description: Test a release, protected-main candidate, or direct-host contract candidate
         required: true
         type: choice
-        options: [release, candidate]
+        options: [release, candidate, candidate-direct-host]
         default: release
       release_tag:
         description: Published release tag containing this harness
@@ -60,7 +60,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: ${{ inputs.mode == 'candidate' && inputs.source_sha || inputs.release_tag }}
+          ref: ${{ inputs.mode != 'release' && inputs.source_sha || inputs.release_tag }}
       - name: Validate published release and immutable image source
         if: inputs.mode == 'release'
         env:
@@ -79,13 +79,19 @@ jobs:
           printf '%s\n' "$RELEASE_TAG" "$RELEASE_IMAGE" "$(git rev-parse HEAD)" > "$RUNNER_TEMP/ha-managed-cluster-chaos/release-source.txt"
       - name: Validate exact candidate source and successful image publication
         id: candidate_image
-        if: inputs.mode == 'candidate'
+        if: inputs.mode != 'release'
         env:
           GH_TOKEN: ${{ github.token }}
           SOURCE_SHA: ${{ inputs.source_sha }}
           IMAGE_RUN_ID: ${{ inputs.image_run_id }}
+          MODE: ${{ inputs.mode }}
         run: |
           set -eu
+          case "$MODE" in
+            candidate) IMAGE_VARIANT=operator ;;
+            candidate-direct-host) IMAGE_VARIANT=managed-ffi-contract ;;
+            *) echo 'invalid candidate mode' >&2; exit 1 ;;
+          esac
           printf '%s\n' "$SOURCE_SHA" | grep -Eq '^[0-9a-f]{40}$'
           printf '%s\n' "$IMAGE_RUN_ID" | grep -Eq '^[1-9][0-9]{0,19}$'
           test "$GITHUB_REF" = refs/heads/main
@@ -115,32 +121,42 @@ jobs:
             --arg sha "$SOURCE_SHA" \
             --arg path ".github/workflows/ha-managed-candidate-image.yml" \
             --arg image "ghcr.io/${GITHUB_REPOSITORY_OWNER}/rhiza-operator" \
-            --arg tag "chaos-$SOURCE_SHA-$IMAGE_RUN_ID-$run_attempt" \
+            --arg variant "$IMAGE_VARIANT" \
+            --arg dockerfile "$(if [ "$IMAGE_VARIANT" = managed-ffi-contract ]; then printf '%s' Dockerfile.managed-ffi-contract; else printf '%s' Dockerfile.operator; fi)" \
+            --arg tag "chaos-$IMAGE_VARIANT-$SOURCE_SHA-$IMAGE_RUN_ID-$run_attempt" \
             --argjson run_id "$IMAGE_RUN_ID" \
             --argjson run_attempt "$run_attempt" \
-            '.schema=="rhiza-candidate-image/v1" and .repository==$repo and .source_sha==$sha and .workflow_path==$path and .workflow_run_id==$run_id and .workflow_run_attempt==$run_attempt and .image==$image and .tag==($image+":"+$tag) and (.digest|test("^sha256:[0-9a-f]{64}$")) and .image_ref==(.image+"@"+.digest)' \
+            '.schema=="rhiza-candidate-image/v2" and .repository==$repo and .source_sha==$sha and .workflow_path==$path and .workflow_run_id==$run_id and .workflow_run_attempt==$run_attempt and .variant==$variant and .dockerfile==$dockerfile and .image==$image and .tag==($image+":"+$tag) and (.digest|test("^sha256:[0-9a-f]{64}$")) and .image_ref==(.image+"@"+.digest)' \
             "$provenance" >/dev/null
 
           image_ref=$(jq -er '.image_ref' "$provenance")
           printf 'image_ref=%s\n' "$image_ref" >> "$GITHUB_OUTPUT"
           mkdir -p "$RUNNER_TEMP/ha-managed-cluster-chaos"
           printf '%s\n' "$SOURCE_SHA" "$IMAGE_RUN_ID" "$run_attempt" "$image_ref" > "$RUNNER_TEMP/ha-managed-cluster-chaos/candidate-source.txt"
+          printf '%s\n' "$IMAGE_VARIANT" > "$RUNNER_TEMP/ha-managed-cluster-chaos/candidate-variant.txt"
       - uses: docker/login-action@v3
-        if: inputs.mode == 'candidate'
+        if: inputs.mode != 'release'
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
       - name: Pull and verify candidate image provenance
-        if: inputs.mode == 'candidate'
+        if: inputs.mode != 'release'
         env:
           SOURCE_SHA: ${{ inputs.source_sha }}
           IMAGE_REF: ${{ steps.candidate_image.outputs.image_ref }}
+          MODE: ${{ inputs.mode }}
         run: |
           set -eu
+          case "$MODE" in
+            candidate) IMAGE_VARIANT=operator ;;
+            candidate-direct-host) IMAGE_VARIANT=managed-ffi-contract ;;
+            *) echo 'invalid candidate mode' >&2; exit 1 ;;
+          esac
           docker pull "$IMAGE_REF"
           test "$(docker image inspect "$IMAGE_REF" --format '{{ index .Config.Labels "org.opencontainers.image.revision" }}')" = "$SOURCE_SHA"
           test "$(docker image inspect "$IMAGE_REF" --format '{{ index .Config.Labels "org.opencontainers.image.source" }}')" = "https://github.com/$GITHUB_REPOSITORY"
+          test "$(docker image inspect "$IMAGE_REF" --format '{{ index .Config.Labels "io.rhiza.candidate.variant" }}')" = "$IMAGE_VARIANT"
       - uses: actions/setup-go@v6
         with:
           go-version-file: go.mod
@@ -157,7 +173,8 @@ jobs:
           RHIZA_HOST_NAMESPACE_UID: ${{ inputs.namespace_uid }}
           RHIZA_HOST_SERVICEACCOUNT_UID: ${{ inputs.serviceaccount_uid }}
           RHIZA_HOST_NODE: ${{ inputs.node }}
-          RHIZA_RELEASE_IMAGE: ${{ inputs.mode == 'candidate' && steps.candidate_image.outputs.image_ref || inputs.image }}
+          RHIZA_RELEASE_IMAGE: ${{ inputs.mode != 'release' && steps.candidate_image.outputs.image_ref || inputs.image }}
+          RHIZA_CHAOS_TOPOLOGY: ${{ inputs.mode == 'candidate-direct-host' && 'direct-host' || 'vcluster' }}
         run: |
           set -eu
           umask 077
@@ -167,7 +184,12 @@ jobs:
           printf '%s' "$HOST_CONFIG" > "$host_config"
           unset HOST_CONFIG
           export RHIZA_HOST_KUBECONFIG="$host_config"
-          sh scripts/test-ha-managed-cluster-chaos.sh
+          if [ "$RHIZA_CHAOS_TOPOLOGY" = direct-host ]; then
+            export RHIZA_MANAGED_TEST_DOCKERFILE=Dockerfile.managed-ffi-contract
+            sh scripts/test-ha-managed-direct-host-chaos.sh
+          else
+            sh scripts/test-ha-managed-cluster-chaos.sh
+          fi
       - name: Preserve non-secret qualification evidence
         if: always()
         uses: actions/upload-artifact@v4

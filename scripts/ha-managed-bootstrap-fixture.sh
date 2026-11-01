@@ -1,10 +1,26 @@
 #!/bin/sh
 # Shared actual managed bootstrap/replacement checks. Drivers own API, image and cleanup.
+managed_replacement_identity_oracle() {
+  if cmp -s "$1" "$2"; then
+    echo 'replacement Pod incorrectly reused the deleted voter identity' >&2
+    return 1
+  fi
+}
+managed_same_pod_identity_oracle() {
+  cmp -s "$1" "$2" || { echo 'same-Pod restart changed voter identity' >&2; return 1; }
+}
 managed_fixture() {
+floci_node_selector='{}'
+if [ -n "${RHIZA_MANAGED_FIXTURE_NODE-}" ]; then
+  printf '%s\n' "$RHIZA_MANAGED_FIXTURE_NODE" | grep -Eq '^[a-z0-9][a-z0-9.-]{0,252}$' || {
+    echo 'invalid optional Floci fixture node hostname' >&2; return 1;
+  }
+  floci_node_selector=$(jq -cn --arg node "$RHIZA_MANAGED_FIXTURE_NODE" '{"kubernetes.io/hostname":$node}')
+fi
 # Create the Service first so both variants see the same existing Service set.
 jq -n '{apiVersion:"v1",kind:"Service",metadata:{name:"floci"},spec:{selector:{app:"floci"},ports:[{port:4566,targetPort:4566}]}}' | k -n "$namespace" create -f -
 # Bounded diagnostic only: retain actual failure logs, never infer the Spring cause.
-jq -n '{apiVersion:"v1",kind:"Pod",metadata:{name:"floci-service-links-probe",labels:{"rhiza-ci-component":"floci","rhiza-ci-probe":"service-links"}},spec:{activeDeadlineSeconds:45,enableServiceLinks:true,automountServiceAccountToken:false,containers:[{name:"floci",image:"floci/floci:2.3.0",readinessProbe:{tcpSocket:{port:4566},periodSeconds:1}}]}}' | k -n "$namespace" create -f -
+jq -n --argjson nodeSelector "$floci_node_selector" '{apiVersion:"v1",kind:"Pod",metadata:{name:"floci-service-links-probe",labels:{"rhiza-ci-component":"floci","rhiza-ci-probe":"service-links"}},spec:{nodeSelector:$nodeSelector,activeDeadlineSeconds:45,enableServiceLinks:true,automountServiceAccountToken:false,containers:[{name:"floci",image:"floci/floci:2.3.0",readinessProbe:{tcpSocket:{port:4566},periodSeconds:1}}]}}' | k -n "$namespace" create -f -
 if k -n "$namespace" wait --for=condition=Ready pod/floci-service-links-probe --timeout=45s > "$logs/floci-service-links-wait.txt" 2>&1; then
   printf '%s\n' 'NOT REPRODUCED: serviceLinks=true diagnostic Pod reached TCP readiness; old startup cause remains unknown' > "$logs/floci-service-links-result.txt"
 else
@@ -17,10 +33,13 @@ else
 fi
 capture_floci
 # The actual SDK fixture excludes injected Service environment and must be TCP-ready.
-jq -n '{apiVersion:"apps/v1",kind:"Deployment",metadata:{name:"floci"},spec:{replicas:1,selector:{matchLabels:{app:"floci"}},template:{metadata:{labels:{app:"floci","rhiza-ci-component":"floci"}},spec:{enableServiceLinks:false,automountServiceAccountToken:false,containers:[{name:"floci",image:"floci/floci:2.3.0",ports:[{containerPort:4566}],readinessProbe:{tcpSocket:{port:4566},periodSeconds:1}}]}}}}' | k -n "$namespace" create -f -
+jq -n --argjson nodeSelector "$floci_node_selector" '{apiVersion:"apps/v1",kind:"Deployment",metadata:{name:"floci"},spec:{replicas:1,selector:{matchLabels:{app:"floci"}},template:{metadata:{labels:{app:"floci","rhiza-ci-component":"floci"}},spec:{nodeSelector:$nodeSelector,enableServiceLinks:false,automountServiceAccountToken:false,containers:[{name:"floci",image:"floci/floci:2.3.0",ports:[{containerPort:4566}],readinessProbe:{tcpSocket:{port:4566},periodSeconds:1}}]}}}}' | k -n "$namespace" create -f -
 k -n "$namespace" rollout status deployment/floci --timeout=120s
 k -n "$namespace" get pods -l app=floci -o json > "$logs/floci-sdk-ready.json"
 jq -e '.items|length==1 and all(.[]; .spec.enableServiceLinks==false and any(.status.conditions[]?; .type=="Ready" and .status=="True"))' "$logs/floci-sdk-ready.json" >/dev/null
+if [ -n "${RHIZA_MANAGED_FIXTURE_NODE-}" ]; then
+  jq -e --arg node "$RHIZA_MANAGED_FIXTURE_NODE" '.items|length==1 and all(.[]; .spec.nodeSelector["kubernetes.io/hostname"]==$node and .spec.nodeName==$node)' "$logs/floci-sdk-ready.json" >/dev/null
+fi
 bucket="rhiza-managed-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT-$nonce"
 managed_bucket_setup
 admin=$(od -An -N32 -tx1 /dev/urandom | tr -d ' \n')
@@ -133,7 +152,7 @@ if [ "${RHIZA_MANAGED_TEST_DOCKERFILE-}" = Dockerfile.managed-ffi-contract ]; th
   grep -Fx 'PASS: managed Rust FFI SQL contract' "$logs/go-ffi-contract-restart.log" >/dev/null
 fi
 k -n "$namespace" exec "$replacement_pod" -c sql -- sha256sum /var/lib/rhiza/repair.json /var/lib/rhiza/data/prepared-adoption.json /var/lib/rhiza/data/qlog/voter-identity.json > "$logs/restart-identity-after.txt"
-cmp "$logs/restart-identity-before.txt" "$logs/restart-identity-after.txt"
+managed_same_pod_identity_oracle "$logs/restart-identity-before.txt" "$logs/restart-identity-after.txt"
 run_client query-after-restart query '{"sql":"SELECT id, value FROM bootstrap_ci"}'
 jq -e '.rows==[[1,"real-kubelet"]]' "$logs/query-after-restart.json" >/dev/null
 printf '%s\n' 'PASS: actual kubelet bootstrap, Deployment Pod replacement, same-Pod main restart preserving origin/adoption/voter identity, NoPVC and ACK readback' 'GAP: later-operation rollover main restart, isolated-process physical fencing, operator-managed Service ownership and Chaos Mesh qualification remain pending; no NetworkPolicy claim' > "$logs/result.txt"
