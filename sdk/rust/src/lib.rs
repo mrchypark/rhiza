@@ -410,6 +410,12 @@ impl ManagedDb {
     pub fn ready(&self) -> Result<bool> {
         self.call("ready", json!({}))
     }
+    /// Checks managed admission with a caller-selected bound, capped at the
+    /// native bridge's 30-second default so managed calls cannot extend it.
+    pub fn ready_with_timeout(&self, timeout: std::time::Duration) -> Result<bool> {
+        let timeout_ms = timeout.as_millis().clamp(1, DEFAULT_TIMEOUT_MS as u128) as u64;
+        self.call_with_timeout("ready", json!({}), timeout_ms)
+    }
     /// Resolves only the retained original pending request; it does not submit
     /// a replacement write.
     pub fn recover_pending(&self) -> Result<()> {
@@ -424,6 +430,14 @@ impl ManagedDb {
         result
     }
     fn call<T: DeserializeOwned>(&self, operation: &str, request: Value) -> Result<T> {
+        self.call_with_timeout(operation, request, DEFAULT_TIMEOUT_MS)
+    }
+    fn call_with_timeout<T: DeserializeOwned>(
+        &self,
+        operation: &str,
+        request: Value,
+        timeout_ms: u64,
+    ) -> Result<T> {
         if self.closed {
             return Err(Error {
                 code: "closed".into(),
@@ -433,7 +447,7 @@ impl ManagedDb {
         native_call(
             self.handle,
             json!({"operation": operation, "request": request}),
-            DEFAULT_TIMEOUT_MS,
+            timeout_ms,
         )
     }
 }

@@ -274,6 +274,7 @@ func TestQualificationApplicationProvenance(t *testing.T) {
 				Uses string            `yaml:"uses"`
 				Run  string            `yaml:"run"`
 				With map[string]string `yaml:"with"`
+				Env  map[string]string `yaml:"env"`
 			} `yaml:"steps"`
 		} `yaml:"jobs"`
 	}
@@ -290,6 +291,9 @@ func TestQualificationApplicationProvenance(t *testing.T) {
 		}
 		if step.Run == "sh scripts/test-ha-managed-bootstrap.sh" {
 			harnesses++
+			if step.Env["RHIZA_MANAGED_TEST_DOCKERFILE"] != "Dockerfile.managed-ffi-contract" {
+				t.Fatal("managed qualification must select its source-built Go/Rust contract image")
+			}
 		}
 	}
 	if checkouts != 1 || harnesses != 1 {
@@ -311,7 +315,7 @@ func TestQualificationApplicationProvenance(t *testing.T) {
 	for _, required := range []string{
 		`cd "$(CDPATH='' cd -- "$(dirname -- "$0")/.." && pwd)"`,
 		`image="rhiza-managed:$GITHUB_SHA-$nonce"`,
-		`docker build -f Dockerfile.operator -t "$image" .`,
+		`docker build -f "${RHIZA_MANAGED_TEST_DOCKERFILE:-Dockerfile.operator}" -t "$image" .`,
 		`kind load docker-image --name "$cluster" "$image"`,
 		`--arg image "$image" --rawfile admin`,
 		`InitImage:$image`,
@@ -320,6 +324,56 @@ func TestQualificationApplicationProvenance(t *testing.T) {
 	} {
 		if !bytes.Contains(script, []byte(required)) {
 			t.Fatalf("managed qualification image source binding missing: %s", required)
+		}
+	}
+	contract, err := os.ReadFile("../../../Dockerfile.managed-ffi-contract")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, required := range []string{
+		`FROM mirror.gcr.io/library/golang:1.27.3-alpine@sha256:b8c9b82affbbb82a020bbcf998dad2ba9516944ac7e883524642a481a9505e9c AS builder`,
+		`FROM mirror.gcr.io/library/rust:1.98.0-bookworm@sha256:82150a52ec202c1b14d7817e14516c392bb7f5cfebd88f1ed531cb37ebd39922 AS rust-builder`,
+		`FROM mirror.gcr.io/library/ubuntu:24.04@sha256:534baea6a22c03a63003dbc8dbe78fe34bc0d7e595d9a9dc9834884ff530eb55`,
+		`RUN CGO_ENABLED=0 GOOS=linux go build -o rhiza-operator ./cmd/rhiza-operator`,
+		`RUN CGO_ENABLED=0 GOOS=linux go build -o rhiza-ha-init ./cmd/rhiza-ha-init`,
+		`RUN CGO_ENABLED=1 go test -c -o rhiza-managed-ffi-contract ./cmd/rhiza-ffi`,
+		`RUN cargo build --manifest-path sdk/rust/Cargo.toml --locked --release --example managed_ha_contract`,
+		`COPY --from=rust-builder /app/sdk/rust/target/release/examples/managed_ha_contract /usr/local/libexec/rhiza-rust-managed-contract`,
+	} {
+		if !bytes.Contains(contract, []byte(required+"\n")) {
+			t.Fatalf("managed source-built contract image binding missing: %s", required)
+		}
+	}
+	if bytes.Count(contract, []byte("\nCOPY . .\n")) != 2 {
+		t.Fatal("both Go and Rust builders must consume the same event checkout context")
+	}
+	for _, forbidden := range []string{"APPLICATION_SHA", "RHIZA_NATIVE_LIB_DIR", "git clone", "ADD http"} {
+		if bytes.Contains(contract, []byte(forbidden)) {
+			t.Fatalf("managed contract image must not substitute a split or prebuilt application: %s", forbidden)
+		}
+	}
+	build, err := os.ReadFile("../../../sdk/rust/build.rs")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, required := range []string{`let adjacent = manifest_dir.join("../..");`, `let repo = if adjacent.join("cmd/rhiza-ffi").is_dir()`, `.current_dir(&repo)`, `.args(["build", "-buildmode=c-archive", "-o"])`, `.arg("./cmd/rhiza-ffi")`} {
+		if !bytes.Contains(build, []byte(required)) {
+			t.Fatalf("Rust contract must link this checkout's actual Go C archive: %s", required)
+		}
+	}
+	entrypoint, err := os.ReadFile("../../../scripts/managed-ffi-contract-entrypoint.sh")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, required := range []string{
+		`-test.run='^TestRustContractRunStartedMarker$'`,
+		`-test.run='^TestManagedFFIInClusterSQLLifecycle$'`,
+		"if [ \"$rust_initial\" = 0 ]; then\n    # A prior start with a lost ACK never authorizes another initial mutation.\n    /usr/local/libexec/rhiza-rust-managed-contract\n",
+		"if [ \"$rust_initial\" = 1 ]; then\n    /usr/local/libexec/rhiza-rust-managed-contract --initial-run\n",
+		`exec /usr/local/libexec/rhiza-ha-init "$@"`,
+	} {
+		if !bytes.Contains(entrypoint, []byte(required)) {
+			t.Fatalf("actual Go/Rust contract invocation or initial-run guard missing: %s", required)
 		}
 	}
 	ci, err := os.ReadFile("../../../.github/workflows/ci.yml")

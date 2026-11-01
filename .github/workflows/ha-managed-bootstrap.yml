@@ -24,6 +24,7 @@ jobs:
           sh -n scripts/managed-ffi-contract-entrypoint.sh
           sh -n scripts/test-ha-managed-cluster-chaos.sh
           sh scripts/test-ha-managed-cluster-chaos-test.sh
+          sh scripts/test-ha-managed-cluster-chaos-diagnostics-test.sh
           sh scripts/test-ha-managed-bootstrap.sh --oracle-self-test
           sh -n scripts/ha-managed-bucket-setup
           cd scripts/ha-managed-bucket-setup-src

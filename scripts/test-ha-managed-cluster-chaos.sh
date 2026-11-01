@@ -37,6 +37,7 @@ cleanup() {
       hn get podchaos -o json > "$logs/faults-final.json" 2>&1 || result=1
       hn delete podchaos -l "rhiza-ci-run=$release" --wait=true --timeout=60s > "$logs/fault-cleanup.txt" 2>&1 || result=1
       if [ -f "$kubeconfig" ]; then
+        capture_managed_logs
         k -n "$namespace" get pods,rhizaclusters,jobs,deployments -o json > "$logs/virtual-final.json" 2>&1 || :
         k -n "$namespace" get events > "$logs/virtual-events.txt" 2>&1 || :
       fi
@@ -135,6 +136,47 @@ managed_bucket_setup() {
   bucket_pid=
 }
 capture_floci() { k -n "$namespace" logs deployment/floci --tail=80 > "$logs/floci.log" 2>&1 || :; }
+capture_managed_logs() {
+  capture_selector_logs() {
+    source=$1 selector=$2
+    pod_json=$(k -n "$namespace" get pods -l "$selector" -o json 2>/dev/null) || return 0
+    if [ "$source" = operator ]; then
+      records=$(printf '%s' "$pod_json" | jq -r '
+        .items[] | select(.metadata.name | type == "string")
+        | select(any(.spec.containers[]?; .name == "operator"))
+        | [.metadata.name, "operator"] | join("/")
+      ') || return 0
+    else
+      records=$(printf '%s' "$pod_json" | jq -r '
+        .items[] as $pod | select($pod.metadata.name | type == "string")
+        | ($pod.spec.containers[]? | select(.name == "sql") | [$pod.metadata.name, .name] | join("/")),
+          ($pod.spec.initContainers[]? | select(.name == "rhiza-prepare-identity") | [$pod.metadata.name, .name] | join("/")),
+          ($pod.spec.initContainers[]? | select(.name == "rhiza-await-bootstrap-plan") | [$pod.metadata.name, .name] | join("/"))
+      ') || return 0
+    fi
+    for record in $records; do
+      pod=${record%%/*}
+      container=${record#*/}
+      case "$pod" in *[!a-z0-9.-]*|'') continue ;; esac
+      case "$container" in operator|sql|rhiza-prepare-identity|rhiza-await-bootstrap-plan) ;; *) continue ;; esac
+      for version in current previous; do
+        destination="$logs/$source-$pod-$container-$version.log"
+        if [ "$version" = previous ]; then
+          k -n "$namespace" logs "$pod" -c "$container" --tail=200 --limit-bytes=65536 --previous > "$destination" 2>/dev/null || :
+        else
+          k -n "$namespace" logs "$pod" -c "$container" --tail=200 --limit-bytes=65536 > "$destination" 2>/dev/null || :
+        fi
+      done
+    done
+  }
+
+  # Extract only Pod/container names from API responses; never save Pod specs,
+  # environment values, Secret references or projected profile data.
+  capture_selector_logs operator 'app=operator'
+  if [ -n "${uid-}" ]; then
+    capture_selector_logs managed "rhiza.mrchypark.dev/cluster-uid=$uid"
+  fi
+}
 mapped_host_pod() {
   virtual_pod=$1 virtual_uid=$2
   host_guard
