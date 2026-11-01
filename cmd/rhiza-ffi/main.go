@@ -641,6 +641,12 @@ func errorCode(err error) string {
 	switch {
 	case errors.Is(err, rhiza.ErrCommitUnknown):
 		return "commit_unknown"
+	case errors.Is(err, managedsql.ErrSQLNotSubmitted):
+		var pre *managedsql.SQLNotSubmittedError
+		if errors.As(err, &pre) && pre.RecoveryRequired {
+			return "sql_recovery_required"
+		}
+		return "sql_not_submitted"
 	case errors.Is(err, context.DeadlineExceeded):
 		return "timeout"
 	case errors.Is(err, context.Canceled):

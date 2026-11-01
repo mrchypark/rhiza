@@ -25,6 +25,12 @@ type ManagedSQLWriteChecker interface {
 	ValidateManagedSQLWrite(context.Context, ManagedStartupIdentity, ManagedRuntimeState, network.ExecuteRequest) error
 }
 
+// ManagedSQLRecoveryChecker authorizes learning the exact pending original,
+// not submitting it or admitting a new application write.
+type ManagedSQLRecoveryChecker interface {
+	ValidateManagedSQLRecovery(context.Context, ManagedStartupIdentity, network.ExecuteRequest) error
+}
+
 // ManagedSQLReadChecker validates live local-read authority without a quorum
 // round or the active-write reservation exception.
 type ManagedSQLReadChecker interface {
@@ -365,6 +371,31 @@ func (n *Node) ExecuteManagedSQL(ctx context.Context, req network.ExecuteRequest
 func (n *Node) ResolveManagedSQL(ctx context.Context, req network.ExecuteRequest) (network.ResolveExecuteResult, error) {
 	if _, err := n.ManagedState(); err != nil {
 		return network.ResolveExecuteResult{}, err
+	}
+	result, err := n.server.ResolveExecute(ctx, req)
+	if err != nil || result.State != network.ResolveExecuteUnknownOrExpired {
+		return result, err
+	}
+	checker, ok := n.managedStartup.Checker.(ManagedSQLRecoveryChecker)
+	if !ok {
+		return result, fmt.Errorf("exact managed SQL recovery checker unavailable")
+	}
+	if err := checker.ValidateManagedSQLRecovery(ctx, n.managedStartup.Identity, req); err != nil {
+		return result, err
+	}
+	target, _, err := n.core.ReadIndex(ctx)
+	if err != nil {
+		return result, err
+	}
+	if err := n.replayLocalDecisions(ctx); err != nil {
+		return result, err
+	}
+	state := n.managedRuntimeState()
+	if state.CertifiedTip < uint64(target) || state.AppliedTip != state.CertifiedTip || state.RecorderTip > state.CertifiedTip {
+		return result, fmt.Errorf("managed SQL recovery has unresolved certified history")
+	}
+	if err := checker.ValidateManagedSQLRecovery(ctx, n.managedStartup.Identity, req); err != nil {
+		return result, err
 	}
 	return n.server.ResolveExecute(ctx, req)
 }
