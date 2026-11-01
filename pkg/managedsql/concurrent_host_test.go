@@ -7,6 +7,7 @@ import (
 	"errors"
 	"io"
 	"net/http"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -69,7 +70,9 @@ func concurrentSQLHosts(t *testing.T, wrap func(int, http.RoundTripper) http.Rou
 func TestManagedSQLThreeHostsSubmittedUnknownRetainsExactOriginal(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 25*time.Second)
 	defer cancel()
-	configs, hosts, fixture := concurrentSQLHosts(t, nil)
+	configs, hosts, fixture, heldLearn := heldCertifiedRecoveryHosts(t)
+	ctx = context.WithValue(ctx, certifiedRecoveryControlKey{}, true)
+	heldLearn.Store(true)
 	fixture.mu.Lock()
 	fixture.failFinalize = true
 	fixture.mu.Unlock()
@@ -78,6 +81,14 @@ func TestManagedSQLThreeHostsSubmittedUnknownRetainsExactOriginal(t *testing.T) 
 	var unknown *network.CommitUnknownError
 	if response.Status != types.MutationCommitted || !errors.As(err, &unknown) || !errors.Is(err, network.ErrCommitUnknown) || errors.Is(err, ErrSQLNotSubmitted) || unknown.RequestID != req.RequestID || uint64(unknown.Slot) != response.Slot {
 		t.Fatalf("submitted/finalize outcome classification: response=%+v error=%v", response, err)
+	}
+	lag, err := hosts[1].node.ManagedState()
+	if err != nil || lag.RecorderTip < response.Slot || lag.CertifiedTip >= response.Slot || lag.AppliedTip >= response.Slot {
+		t.Fatalf("actual peer certificate delivery gap missing: recorder=%d certified=%d applied=%d slot=%d error=%v", lag.RecorderTip, lag.CertifiedTip, lag.AppliedTip, response.Slot, err)
+	}
+	retained, err := hosts[0].node.ResolveManagedSQL(ctx, req)
+	if err != nil || retained.State != network.ResolveExecuteRetained || retained.Receipt == nil || retained.Receipt.Slot != response.Slot || retained.Durability != network.ResolveExecuteDurabilityConfirmed {
+		t.Fatalf("origin exact durable receipt missing despite target gap: %+v %v", retained, err)
 	}
 	before, err := operator.LoadV1Alpha2Admission(ctx, configs[0].Store, configs[0].Ref)
 	if err != nil {
@@ -107,6 +118,24 @@ func TestManagedSQLThreeHostsSubmittedUnknownRetainsExactOriginal(t *testing.T) 
 	fixture.mu.Lock()
 	fixture.failFinalize = false
 	fixture.mu.Unlock()
+	logCertifiedRecoveryState(t, ctx, hosts, configs[0], req, "before-immediate-original-recovery")
+	if err := hosts[1].ValidateManagedSQLRecovery(ctx, hosts[1].identity, req); err != nil {
+		t.Fatalf("explicit recovery live authority rejected before certified gap check: %v", err)
+	}
+	if err := hosts[1].RecoverPending(ctx); err == nil || !errors.Is(err, network.ErrCommitUnknown) || errors.Is(err, ErrSQLNotSubmitted) || !strings.Contains(err.Error(), "managed SQL recovery has unresolved certified history") {
+		t.Fatalf("uncertified target did not preserve unknown original: %v", err)
+	}
+	stillPending, err := operator.LoadV1Alpha2Admission(ctx, configs[0].Store, configs[0].Ref)
+	if err != nil {
+		t.Fatal(err)
+	}
+	stillOriginal, ok := stillPending.Pending()
+	if !ok || stillOriginal != beforePending || !bytes.Equal(before.Evidence(), stillPending.Evidence()) {
+		t.Fatal("uncertified recovery changed original pending fingerprint or evidence")
+	}
+	// A quorum ReadIndex is not delivery of that certificate to this peer.
+	heldLearn.Store(false)
+	waitSQLCertifiedApplication(t, ctx, hosts[1], response.Slot)
 	if err := hosts[1].RecoverPending(ctx); err != nil {
 		t.Fatalf("retained original recovery: %v", err)
 	}
@@ -131,6 +160,12 @@ func TestManagedSQLThreeHostsSubmittedUnknownRetainsExactOriginal(t *testing.T) 
 	if err != nil || resolved.Receipt == nil || resolved.Receipt.Slot != response.Slot {
 		t.Fatalf("recovery changed/re-executed original receipt: %v", err)
 	}
+	for _, h := range hosts {
+		state, err := h.node.ManagedState()
+		if err != nil || state.RecorderTip != response.Slot {
+			t.Fatalf("recovery submitted another SQL slot: recorder=%d original=%d error=%v", state.RecorderTip, response.Slot, err)
+		}
+	}
 }
 
 // Observe the normal private peer catch-up worker, not repeated SQL resolution
@@ -146,7 +181,7 @@ func waitSQLCertifiedApplication(t *testing.T, ctx context.Context, h *Host, thr
 		if err != nil {
 			t.Fatal(err)
 		}
-		if state.CertifiedTip >= through && state.AppliedTip >= through {
+		if state.CertifiedTip >= through && state.AppliedTip == state.CertifiedTip && state.RecorderTip <= state.CertifiedTip {
 			return
 		}
 		select {
