@@ -8,7 +8,8 @@ case "$execution_mode" in
   local)
     [ "${GITHUB_ACTIONS-}" != true ] || { echo 'local mode cannot run in GitHub Actions' >&2; exit 1; }
     : "${RHIZA_LOCAL_RUN_ID:?}"
-    printf '%s\n' "$RHIZA_LOCAL_RUN_ID" | grep -Eq '^[a-z0-9][a-z0-9-]{0,33}$'
+    case "$RHIZA_LOCAL_RUN_ID" in ''|*[!0-9]*) echo 'local run ID must contain only digits' >&2; exit 1 ;; esac
+    [ "${#RHIZA_LOCAL_RUN_ID}" -le 34 ]
     # The shared fixture uses these names for unique bucket naming, not CI authorization.
     GITHUB_RUN_ID=$RHIZA_LOCAL_RUN_ID
     GITHUB_RUN_ATTEMPT=1
@@ -78,10 +79,15 @@ capture_managed_logs() {
 }
 cleanup() {
   result=$?
+  original_result=$result
+  printf '%s\n' "$original_result" > "$logs/driver-original.exit"
   trap - EXIT HUP INT TERM
   if [ "$owned" = 1 ] && host_guard; then
     capture_managed_logs || :
-    if [ -n "$fault_name" ]; then hn delete podchaos "$fault_name" --wait=true --timeout=45s > "$logs/fault-cleanup.txt" 2>&1 || result=1; fi
+    if [ -n "$fault_name" ]; then
+      if [ "$result" -ne 0 ]; then capture_chaos_failure "$fault_name" cleanup || :; fi
+      hn delete podchaos "$fault_name" --wait=true --timeout=45s > "$logs/fault-cleanup.txt" 2>&1 || result=1
+    fi
     hn delete rhizacluster sql --wait=true --timeout=45s --ignore-not-found > "$logs/cluster-cleanup.txt" 2>&1 || result=1
     if [ -n "${uid-}" ]; then hn delete pods,deployments -l "rhiza.mrchypark.dev/cluster-uid=$uid" --wait=true --timeout=45s --ignore-not-found > "$logs/sql-workload-cleanup.txt" 2>&1 || result=1; fi
     hn delete deployment/operator deployment/floci service/floci service/bootstrap-client pod/floci-service-links-probe --wait=true --timeout=45s --ignore-not-found > "$logs/workload-cleanup.txt" 2>&1 || result=1
@@ -97,6 +103,7 @@ cleanup() {
   if [ -n "$bucket_pid" ]; then kill "$bucket_pid" 2>/dev/null || :; wait "$bucket_pid" 2>/dev/null || :; kill -0 "$bucket_pid" 2>/dev/null && result=1 || :; fi
   rm -f "$private/runtime.json" "$private/admin.token" "$private/curl.conf" "$private/request.body" "$private/forward.log" "$private/port-forward.log" "$private/preflight-list.json" "$RUNNER_TEMP/ha-managed-direct-host-bucket-setup"
   rmdir "$private" || result=1
+  [ "$original_result" -eq 0 ] || result=$original_result
   printf '%s\n' "$result" > "$logs/driver.exit"
   exit "$result"
 }
@@ -140,7 +147,40 @@ managed_bucket_setup() {
 }
 capture_floci() { hn logs deployment/floci --tail=80 > "$logs/floci.log" 2>&1 || :; }
 chaos_record_oracle() {
-  jq -e --arg id "$2" 'any(.status.conditions[]?; .type=="AllInjected" and .status=="True") and (.status.experiment.containerRecords|length)==1 and all(.status.experiment.containerRecords[]; .id==$id and .injectedCount>0)' "$1" >/dev/null
+  jq -e --arg id "$2" '
+    any(.status.conditions[]?; .type=="AllInjected" and .status=="True") and
+    (.status.experiment.containerRecords|length)==1 and
+    all(.status.experiment.containerRecords[];
+      .id==$id and .phase=="Injected" and
+      (.injectedCount|type)=="number" and (.recoveredCount|type)=="number" and
+      .injectedCount>0 and .recoveredCount>=0 and .injectedCount>.recoveredCount)
+  ' "$1" >/dev/null
+}
+capture_chaos_failure() {
+  case "$1" in pod-kill|container-kill) ;; *) return 2 ;; esac
+  case "$2" in AllInjected|cleanup) ;; *) return 2 ;; esac
+  host_guard || return 1
+  failure_json="$private/chaos-failure.json"
+  if hn get "podchaos/$1" -o json > "$failure_json" 2>/dev/null; then
+    if jq -e --arg ns "$RHIZA_HOST_NAMESPACE" --arg run "$release" '.metadata.namespace==$ns and .metadata.labels["rhiza-ci-run"]==$run' "$failure_json" >/dev/null; then
+      jq '{apiVersion,kind,metadata:{name:.metadata.name,namespace:.metadata.namespace,uid:.metadata.uid,generation:.metadata.generation},spec,status}' "$failure_json" | head -c 65536 > "$logs/$1-$2-failure.json"
+      failure_uid=$(jq -r '.metadata.uid' "$failure_json")
+      hn get events --field-selector "involvedObject.kind=PodChaos,involvedObject.uid=$failure_uid" -o json 2>/dev/null |
+        jq '{items:[.items[]? | {reason,message,count,firstTimestamp,lastTimestamp,involvedObject}] | .[-20:]}' |
+        head -c 65536 > "$logs/$1-$2-failure-events.json" || :
+    fi
+  fi
+  rm -f "$failure_json"
+}
+wait_chaos_injected() {
+  if hn wait --for=condition=AllInjected "podchaos/$1" --timeout=90s; then
+    return 0
+  else
+    wait_failure_exit=$?
+    printf '%s\n' "$wait_failure_exit" > "$logs/$1-AllInjected-wait.exit"
+    capture_chaos_failure "$1" AllInjected || :
+    return "$wait_failure_exit"
+  fi
 }
 direct_chaos_fault() {
   action=$1
@@ -155,12 +195,9 @@ direct_chaos_fault() {
   jq -n --arg name "$fault_name" --arg ns "$namespace" --arg run "$release" --arg action "$action" --arg pod "$pod" \
     '{apiVersion:"chaos-mesh.org/v1alpha1",kind:"PodChaos",metadata:{name:$name,namespace:$ns,labels:{"rhiza-ci-run":$run}},spec:{action:$action,mode:"one",duration:"10s",containerNames:["sql"],selector:{namespaces:[$ns],pods:{($ns):[$pod]}}}}' > "$logs/$fault_name-request.json"
   hn create -f "$logs/$fault_name-request.json"
-  hn wait --for=condition=AllInjected "podchaos/$fault_name" --timeout=90s
+  wait_chaos_injected "$fault_name"
   hn get "podchaos/$fault_name" -o json > "$logs/$fault_name-injected.json"
   chaos_record_oracle "$logs/$fault_name-injected.json" "$expected_record"
-  hn wait --for=condition=AllRecovered "podchaos/$fault_name" --timeout=90s
-  hn get "podchaos/$fault_name" -o json > "$logs/$fault_name-recovered.json"
-  chaos_record_oracle "$logs/$fault_name-recovered.json" "$expected_record"
   if [ "$action" = container-kill ]; then
     tries=0
     until hn get pod "$pod" -o json > "$logs/$fault_name-pod-after.json" &&
@@ -171,7 +208,11 @@ direct_chaos_fault() {
     hn get pods -o json > "$logs/$fault_name-pods-after.json"
     jq -e --arg old_uid "$pod_uid" 'all(.items[]; .metadata.uid!=$old_uid)' "$logs/$fault_name-pods-after.json" >/dev/null
   fi
+  # Kill actions are one-shot: remove their object before application recovery checks.
+  hn get "podchaos/$fault_name" -o json > "$logs/$fault_name-before-delete.json"
   hn delete "podchaos/$fault_name" --wait=true --timeout=45s
+  hn get "podchaos/$fault_name" --ignore-not-found -o json > "$logs/$fault_name-after-delete.json"
+  [ ! -s "$logs/$fault_name-after-delete.json" ]
   fault_name=
 }
 managed_pod_fault() {
