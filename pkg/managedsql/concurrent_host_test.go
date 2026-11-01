@@ -3,6 +3,7 @@ package managedsql
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"io"
 	"net/http"
@@ -159,73 +160,148 @@ func waitSQLCertifiedApplication(t *testing.T, ctx context.Context, h *Host, thr
 func TestManagedSQLConcurrentSnapshotLoserIsNotSubmitted(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 	defer cancel()
-	captured, release := make(chan struct{}), make(chan struct{})
-	var releaseOnce sync.Once
-	t.Cleanup(func() { releaseOnce.Do(func() { close(release) }) })
-	gets := 0
+	type reservation struct {
+		host   int
+		rv, id string
+	}
+	captured := make(chan reservation, 2)
+	release := [2]chan struct{}{make(chan struct{}), make(chan struct{})}
+	var releaseOnce [2]sync.Once
+	t.Cleanup(func() {
+		for i := range release {
+			releaseOnce[i].Do(func() { close(release[i]) })
+		}
+	})
 	configs, hosts, _ := concurrentSQLHosts(t, func(i int, base http.RoundTripper) http.RoundTripper {
-		if i != 1 {
+		if i > 1 {
 			return base
 		}
 		return repairGateTransport(func(r *http.Request) (*http.Response, error) {
-			response, err := base.RoundTrip(r)
-			if err != nil || r.Method != http.MethodGet || r.Context().Value(concurrentSQLContextKey{}) != true {
-				return response, err
+			if r.Method != http.MethodPut || r.Context().Value(concurrentSQLContextKey{}) != true {
+				return base.RoundTrip(r)
 			}
-			gets++
-			if gets != 2 {
-				return response, nil
-			}
-			body, err := io.ReadAll(response.Body)
-			_ = response.Body.Close()
+			body, err := io.ReadAll(r.Body)
+			_ = r.Body.Close()
 			if err != nil {
 				return nil, err
 			}
-			response.Body = io.NopCloser(bytes.NewReader(body))
-			close(captured)
+			r.Body = io.NopCloser(bytes.NewReader(body))
+			var object struct {
+				Metadata struct{ ResourceVersion string }
+				Status   struct {
+					Authority struct {
+						PendingWrite   bool
+						PendingRequest struct{ ID string }
+					}
+				}
+			}
+			if err := json.Unmarshal(body, &object); err != nil {
+				return nil, err
+			}
+			// The actual reservation PUT exists only after quorum admission,
+			// write readiness, SQL inspection and reservation preconditions pass.
+			if !object.Status.Authority.PendingWrite {
+				return base.RoundTrip(r)
+			}
 			select {
-			case <-release:
+			case captured <- reservation{i, object.Metadata.ResourceVersion, object.Status.Authority.PendingRequest.ID}:
 			case <-r.Context().Done():
 				return nil, r.Context().Err()
 			}
-			return response, nil
+			select {
+			case <-release[i]:
+			case <-r.Context().Done():
+				return nil, r.Context().Err()
+			}
+			return base.RoundTrip(r)
 		})
 	})
-	if response, err := hosts[0].Execute(ctx, ExecuteRequest{RequestID: "concurrent-schema", SQL: "CREATE TABLE concurrent_proof (id INTEGER PRIMARY KEY)"}); err != nil || response.Status != types.MutationCommitted {
+	schema, err := hosts[0].Execute(ctx, ExecuteRequest{RequestID: "concurrent-schema", SQL: "CREATE TABLE concurrent_proof (id INTEGER PRIMARY KEY)"})
+	if err != nil || schema.Status != types.MutationCommitted {
 		t.Fatalf("schema: %v", err)
 	}
+	for _, h := range hosts {
+		waitSQLCertifiedApplication(t, ctx, h, schema.Slot)
+		readySQL(t, h)
+	}
 	loser := ExecuteRequest{RequestID: "snapshot-loser", SQL: "INSERT INTO concurrent_proof VALUES (2)"}
-	done := make(chan error, 1)
-	go func() {
-		_, err := hosts[1].Execute(context.WithValue(ctx, concurrentSQLContextKey{}, true), loser)
-		done <- err
-	}()
+	winner := ExecuteRequest{RequestID: "snapshot-winner", SQL: "INSERT INTO concurrent_proof VALUES (1)"}
+	type outcome struct {
+		response ExecuteResponse
+		err      error
+	}
+	done := [2]chan outcome{make(chan outcome, 1), make(chan outcome, 1)}
+	for i, req := range []ExecuteRequest{winner, loser} {
+		go func() {
+			response, err := hosts[i].Execute(context.WithValue(ctx, concurrentSQLContextKey{}, true), req)
+			done[i] <- outcome{response, err}
+		}()
+	}
+	var reservations [2]reservation
+	for range 2 {
+		select {
+		case value := <-captured:
+			reservations[value.host] = value
+		case <-ctx.Done():
+			t.Fatal(ctx.Err())
+		}
+	}
+	if reservations[0].rv == "" || reservations[0].rv != reservations[1].rv || reservations[0].id != winner.RequestID || reservations[1].id != loser.RequestID {
+		t.Fatalf("both exact reservations did not reach same-RV CAS: %+v", reservations)
+	}
+	before, err := operator.LoadV1Alpha2Admission(ctx, configs[0].Store, configs[0].Ref)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, pending := before.Pending(); pending || before.ResourceVersion() != reservations[0].rv {
+		t.Fatal("blocked reservation PUT escaped before release")
+	}
+	for i := range done {
+		select {
+		case result := <-done[i]:
+			t.Fatalf("host %d completed before CAS release: %v", i, result.err)
+		default:
+		}
+	}
+	releaseOnce[0].Do(func() { close(release[0]) })
+	var committed outcome
 	select {
-	case <-captured:
+	case committed = <-done[0]:
 	case <-ctx.Done():
 		t.Fatal(ctx.Err())
 	}
-	if response, err := hosts[0].Execute(ctx, ExecuteRequest{RequestID: "snapshot-winner", SQL: "INSERT INTO concurrent_proof VALUES (1)"}); err != nil || response.Status != types.MutationCommitted {
-		t.Fatalf("winner: %v", err)
+	if committed.err != nil || committed.response.Status != types.MutationCommitted {
+		t.Fatalf("winner: %v", committed.err)
 	}
-	releaseOnce.Do(func() { close(release) })
-	var err error
 	select {
-	case err = <-done:
+	case result := <-done[1]:
+		t.Fatalf("loser escaped blocked CAS: %v", result.err)
+	default:
+	}
+	releaseOnce[1].Do(func() { close(release[1]) })
+	select {
+	case result := <-done[1]:
+		err = result.err
 	case <-ctx.Done():
 		t.Fatal(ctx.Err())
 	}
 	var pre *SQLNotSubmittedError
-	if !errors.Is(err, ErrSQLNotSubmitted) || !errors.As(err, &pre) || pre.Stage != SQLStageReservation || pre.RecoveryRequired || errors.Is(err, network.ErrCommitUnknown) {
+	if !errors.Is(err, ErrSQLNotSubmitted) || !errors.As(err, &pre) || pre.Stage != SQLStageReservation || pre.RecoveryRequired || errors.Is(err, network.ErrCommitUnknown) || !errors.Is(err, operator.ErrV1Alpha2StatusConflict) {
 		t.Fatalf("loser classification: %v", err)
 	}
 	if hosts[1].uncertain.Load() {
 		t.Fatal("known pre-submission contention poisoned the Host")
 	}
+	rows, err := hosts[0].Query(ctx, QueryRequest{SQL: "SELECT id FROM concurrent_proof ORDER BY id", Consistency: "linearizable"})
+	if err != nil || len(rows.Rows) != 1 {
+		t.Fatalf("blocked CAS loser submitted SQL: rows=%d error=%v", len(rows.Rows), err)
+	}
 	resolved, err := hosts[1].node.ResolveManagedSQL(ctx, loser)
 	if err == nil || resolved.State != network.ResolveExecuteUnknownOrExpired || resolved.Receipt != nil {
 		t.Fatalf("unreserved loser gained recovery authority: %v", err)
 	}
+	waitSQLCertifiedApplication(t, ctx, hosts[1], committed.response.Slot)
+	readySQL(t, hosts[1])
 	if response, err := hosts[1].Execute(ctx, loser); err != nil || response.Status != types.MutationCommitted {
 		t.Fatalf("fresh invocation after known non-submission failed: %v", err)
 	}
@@ -241,21 +317,57 @@ func TestManagedSQLConcurrentSnapshotLoserIsNotSubmitted(t *testing.T) {
 func TestManagedSQLThreeHostsConcurrentExecuteAndRecoverPreserveOriginal(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 25*time.Second)
 	defer cancel()
-	configs, hosts, fixture := concurrentSQLHosts(t, nil)
-	if _, err := hosts[0].Execute(ctx, ExecuteRequest{RequestID: "pending-schema", SQL: "CREATE TABLE pending_proof (id INTEGER PRIMARY KEY)"}); err != nil {
+	reserved, releaseReservation := make(chan struct{}), make(chan struct{})
+	configs, hosts, _ := concurrentSQLHosts(t, func(i int, base http.RoundTripper) http.RoundTripper {
+		if i != 0 {
+			return base
+		}
+		return repairGateTransport(func(r *http.Request) (*http.Response, error) {
+			if r.Method != http.MethodPut || r.Context().Value(concurrentSQLContextKey{}) != true {
+				return base.RoundTrip(r)
+			}
+			body, err := io.ReadAll(r.Body)
+			_ = r.Body.Close()
+			if err != nil {
+				return nil, err
+			}
+			r.Body = io.NopCloser(bytes.NewReader(body))
+			var object struct {
+				Status struct{ Authority struct{ PendingWrite bool } }
+			}
+			if err := json.Unmarshal(body, &object); err != nil {
+				return nil, err
+			}
+			response, err := base.RoundTrip(r)
+			if err != nil || !object.Status.Authority.PendingWrite || response.StatusCode != http.StatusOK {
+				return response, err
+			}
+			// The real API has accepted the original reservation, but the owner
+			// cannot enter ExecuteManagedSQL until this response is released.
+			close(reserved)
+			select {
+			case <-releaseReservation:
+				return response, nil
+			case <-r.Context().Done():
+				_ = response.Body.Close()
+				return nil, r.Context().Err()
+			}
+		})
+	})
+	schema, err := hosts[0].Execute(ctx, ExecuteRequest{RequestID: "pending-schema", SQL: "CREATE TABLE pending_proof (id INTEGER PRIMARY KEY)"})
+	if err != nil {
 		t.Fatal(err)
 	}
 	for _, h := range hosts {
+		waitSQLCertifiedApplication(t, ctx, h, schema.Slot)
 		readySQL(t, h)
 	}
-	control := fixture.source
-	control.putReady, control.putRelease = make(chan string, 4), make(chan struct{})
-	control.putSuffix = "voters/managed-sql-application-start.json"
 	var release sync.Once
 	ownerDone := make(chan error, 1)
+	var ownerResponse ExecuteResponse
 	joined := false
 	t.Cleanup(func() {
-		release.Do(func() { close(control.putRelease) })
+		release.Do(func() { close(releaseReservation) })
 		if !joined {
 			cancel()
 			select {
@@ -266,9 +378,16 @@ func TestManagedSQLThreeHostsConcurrentExecuteAndRecoverPreserveOriginal(t *test
 		}
 	})
 	owner := ExecuteRequest{RequestID: "pending-owner", SQL: "INSERT INTO pending_proof VALUES (1)"}
-	go func() { _, err := hosts[0].Execute(ctx, owner); ownerDone <- err }()
+	go func() {
+		var err error
+		ownerResponse, err = hosts[0].Execute(context.WithValue(ctx, concurrentSQLContextKey{}, true), owner)
+		ownerDone <- err
+	}()
 	select {
-	case <-control.putReady:
+	case <-reserved:
+	case err := <-ownerDone:
+		joined = true
+		t.Fatalf("owner completed before reservation barrier: %v", err)
 	case <-ctx.Done():
 		t.Fatal(ctx.Err())
 	}
@@ -302,7 +421,7 @@ func TestManagedSQLThreeHostsConcurrentExecuteAndRecoverPreserveOriginal(t *test
 	if err != nil || !ok || retained.RequestID != owner.RequestID || !bytes.Equal(before.Evidence(), after.Evidence()) || before.ResourceVersion() != after.ResourceVersion() {
 		t.Fatal("concurrent recovery cleared/replaced unknown original or evidence")
 	}
-	release.Do(func() { close(control.putRelease) })
+	release.Do(func() { close(releaseReservation) })
 	select {
 	case err = <-ownerDone:
 		joined = true
@@ -313,6 +432,7 @@ func TestManagedSQLThreeHostsConcurrentExecuteAndRecoverPreserveOriginal(t *test
 		t.Fatalf("actual owner execution: %v", err)
 	}
 	for _, h := range hosts[1:] {
+		waitSQLCertifiedApplication(t, ctx, h, ownerResponse.Slot)
 		if err := h.RecoverPending(ctx); err != nil {
 			t.Fatalf("explicit recovery after observed owner completion: %v", err)
 		}
