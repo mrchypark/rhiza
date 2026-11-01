@@ -13,6 +13,12 @@ on:
         type: choice
         options: [operator, managed-ffi-contract]
         default: operator
+      architecture:
+        description: Native runner and candidate image architecture
+        required: true
+        type: choice
+        options: [amd64, arm64]
+        default: amd64
 
 permissions:
   contents: read
@@ -23,7 +29,7 @@ concurrency:
 
 jobs:
   candidate-image:
-    runs-on: ubuntu-latest
+    runs-on: ${{ inputs.architecture == 'arm64' && 'ubuntu-24.04-arm' || 'ubuntu-latest' }}
     timeout-minutes: 20
     permissions:
       contents: read
@@ -55,6 +61,7 @@ jobs:
         id: variant
         env:
           IMAGE_VARIANT: ${{ inputs.image_variant }}
+          ARCHITECTURE: ${{ inputs.architecture }}
         run: |
           set -eu
           case "$IMAGE_VARIANT" in
@@ -62,7 +69,9 @@ jobs:
             managed-ffi-contract) dockerfile=Dockerfile.managed-ffi-contract ;;
             *) echo 'unsupported candidate image variant' >&2; exit 1 ;;
           esac
+          case "$ARCHITECTURE" in amd64|arm64) ;; *) echo 'unsupported candidate architecture' >&2; exit 1 ;; esac
           printf 'dockerfile=%s\n' "$dockerfile" >> "$GITHUB_OUTPUT"
+          printf 'platform=linux/%s\n' "$ARCHITECTURE" >> "$GITHUB_OUTPUT"
       - name: Build and publish run-unique candidate image
         id: image_tag
         env:
@@ -77,7 +86,7 @@ jobs:
         with:
           context: .
           file: ${{ steps.variant.outputs.dockerfile }}
-          platforms: linux/amd64
+          platforms: ${{ steps.variant.outputs.platform }}
           push: true
           tags: ${{ steps.image_tag.outputs.image }}
           labels: |
@@ -90,6 +99,7 @@ jobs:
           SOURCE_SHA: ${{ inputs.source_sha }}
           IMAGE_VARIANT: ${{ inputs.image_variant }}
           DOCKERFILE: ${{ steps.variant.outputs.dockerfile }}
+          PLATFORM: ${{ steps.variant.outputs.platform }}
           IMAGE_NAME: ghcr.io/${{ github.repository_owner }}/rhiza-operator
           IMAGE_TAG: ${{ steps.image_tag.outputs.image }}
           IMAGE_DIGEST: ${{ steps.build.outputs.digest }}
@@ -97,9 +107,9 @@ jobs:
           set -eu
           printf '%s\n' "$IMAGE_DIGEST" | grep -Eq '^sha256:[0-9a-f]{64}$'
           mkdir -p "$RUNNER_TEMP/candidate-image-provenance"
-          printf '{"schema":"rhiza-candidate-image/v2","repository":"%s","source_sha":"%s","workflow_path":".github/workflows/ha-managed-candidate-image.yml","workflow_run_id":%s,"workflow_run_attempt":%s,"variant":"%s","dockerfile":"%s","image":"%s","tag":"%s","digest":"%s","image_ref":"%s@%s"}\n' \
+          printf '{"schema":"rhiza-candidate-image/v2","repository":"%s","source_sha":"%s","workflow_path":".github/workflows/ha-managed-candidate-image.yml","workflow_run_id":%s,"workflow_run_attempt":%s,"variant":"%s","dockerfile":"%s","platform":"%s","image":"%s","tag":"%s","digest":"%s","image_ref":"%s@%s"}\n' \
             "$GITHUB_REPOSITORY" "$SOURCE_SHA" "$GITHUB_RUN_ID" "$GITHUB_RUN_ATTEMPT" \
-            "$IMAGE_VARIANT" "$DOCKERFILE" \
+            "$IMAGE_VARIANT" "$DOCKERFILE" "$PLATFORM" \
             "$IMAGE_NAME" "$IMAGE_TAG" "$IMAGE_DIGEST" "$IMAGE_NAME" "$IMAGE_DIGEST" \
             > "$RUNNER_TEMP/candidate-image-provenance/provenance.json"
       - uses: actions/upload-artifact@v4

@@ -660,8 +660,14 @@ func sqlOutcomeUnknown(req ExecuteRequest, response ExecuteResponse, cause error
 }
 
 func (h *Host) finalize(ctx context.Context, req ExecuteRequest, a operator.V1Alpha2AdmissionSnapshot) error {
+	remoteFinalization := func(cause error) error {
+		if err := h.verifyRemoteFinalization(ctx, req, a); err != nil {
+			return errors.Join(cause, err)
+		}
+		return nil
+	}
 	if err := h.ValidateManagedSQLRecovery(ctx, h.identity, req); err != nil {
-		return err
+		return remoteFinalization(err)
 	}
 	result, err := h.node.ResolveManagedSQL(ctx, req)
 	if err != nil || result.State != network.ResolveExecuteRetained || result.Receipt == nil || result.Durability != network.ResolveExecuteDurabilityConfirmed {
@@ -672,12 +678,55 @@ func (h *Host) finalize(ctx context.Context, req ExecuteRequest, a operator.V1Al
 		return err
 	}
 	if err := h.ValidateManagedSQLRecovery(ctx, h.identity, req); err != nil {
-		return err
+		return remoteFinalization(err)
 	}
 	w, _ := a.Pending()
 	_, observed, err := operator.FinalizeV1Alpha2Write(ctx, h.cfg.Store, a, h.authority, w, operator.V1Alpha2WriteCommitted, encodeEvidence(s))
+	if errors.Is(err, operator.ErrV1Alpha2StatusConflict) {
+		return remoteFinalization(err)
+	}
 	if err != nil || observed != operator.V1Alpha2CASApplied {
 		return errors.Join(fmt.Errorf("SQL finalization not directly confirmed"), err)
+	}
+	return nil
+}
+
+func (h *Host) verifyRemoteFinalization(ctx context.Context, req ExecuteRequest, reserved operator.V1Alpha2AdmissionSnapshot) error {
+	want, err := requestIdentity(req)
+	pending, ok := reserved.Pending()
+	if err != nil || !ok || pending != want || reserved.Authority() != h.authority {
+		return fmt.Errorf("exact original reservation required for remote finalization")
+	}
+	before, err := h.live(ctx)
+	if err != nil {
+		return err
+	}
+	oldRepair, oldRepairOK := reserved.Repair()
+	repair, repairOK := before.Repair()
+	if _, pending := before.Pending(); pending || oldRepairOK != repairOK || !reflect.DeepEqual(oldRepair, repair) {
+		return fmt.Errorf("pending SQL or repair changed during remote finalization")
+	}
+	if err := h.node.AdmitManaged(ctx); err != nil {
+		return err
+	}
+	result, err := h.node.ResolveManagedSQL(ctx, req)
+	if err != nil || result.State != network.ResolveExecuteRetained || result.Receipt == nil || result.Durability != network.ResolveExecuteDurabilityConfirmed {
+		return errors.Join(fmt.Errorf("remote finalization lacks exact durable receipt"), err)
+	}
+	state, err := h.node.ManagedState()
+	if err != nil {
+		return err
+	}
+	if result.Receipt.Slot == 0 || result.Receipt.Slot > state.CertifiedTip || state.AppliedTip != state.CertifiedTip || state.RecorderTip > state.CertifiedTip || (result.Receipt.Status != types.MutationCommitted && result.Receipt.Status != types.MutationRejected) {
+		return fmt.Errorf("remote finalization receipt is outside terminal certified history")
+	}
+	snapshot, err := h.node.InspectManagedSQL(ctx, false)
+	if err != nil || evidenceHash(before.Evidence()) != evidenceHash(encodeEvidence(snapshot)) {
+		return errors.Join(fmt.Errorf("remote finalization differs from canonical SQL evidence"), err)
+	}
+	after, err := h.live(ctx)
+	if err != nil || after.ResourceVersion() != before.ResourceVersion() {
+		return errors.Join(fmt.Errorf("remote finalization authority changed during proof"), err)
 	}
 	return nil
 }

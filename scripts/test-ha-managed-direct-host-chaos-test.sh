@@ -49,6 +49,24 @@ run_preflight_case error '{}' fail
 grep -Fq 'operator) dockerfile=Dockerfile.operator' "$candidate"
 grep -Fq 'managed-ffi-contract) dockerfile=Dockerfile.managed-ffi-contract' "$candidate"
 grep -Fq 'rhiza-candidate-image/v2' "$candidate"
+grep -Fq 'options: [amd64, arm64]' "$candidate"
+grep -Fq "'ubuntu-24.04-arm'" "$candidate"
+grep -Fq 'platforms: ${{ steps.variant.outputs.platform }}' "$candidate"
+grep -Fq '"platform":"%s"' "$candidate"
+mode_guard=$(sed -n '/^execution_mode=/,/^esac/p' "$direct")
+[ -n "$mode_guard" ]
+sh -c 'set -eu; git() { printf "%s\n" test-source; }; RHIZA_CHAOS_EXECUTION_MODE=local RHIZA_LOCAL_RUN_ID=local-test; unset GITHUB_ACTIONS; eval "$1"; [ "$execution_mode" = local ]; [ "$GITHUB_RUN_ID" = local-test ]; [ "$GITHUB_SHA" = test-source ]; [ "${GITHUB_ACTIONS-}" != true ]' guard "$mode_guard"
+local_id_34=1234567890123456789012345678901234
+sh -c 'set -eu; git() { printf "%s\n" test-source; }; RHIZA_CHAOS_EXECUTION_MODE=local RHIZA_LOCAL_RUN_ID=$2; unset GITHUB_ACTIONS; eval "$1"; bucket="rhiza-managed-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT-123456789012"; [ "${#bucket}" -le 63 ]' guard "$mode_guard" "$local_id_34"
+if sh -c 'set -eu; git() { printf "%s\n" test-source; }; RHIZA_CHAOS_EXECUTION_MODE=local RHIZA_LOCAL_RUN_ID=$2; unset GITHUB_ACTIONS; eval "$1"' guard "$mode_guard" "${local_id_34}5" 2>/dev/null; then
+  echo 'local mode accepted an ID exceeding the bucket naming budget' >&2; exit 1
+fi
+if sh -c 'set -eu; RHIZA_CHAOS_EXECUTION_MODE=local RHIZA_LOCAL_RUN_ID=local-test GITHUB_ACTIONS=true; eval "$1"' guard "$mode_guard" 2>/dev/null; then
+  echo 'local mode accepted a GitHub Actions execution' >&2; exit 1
+fi
+if sh -c 'set -eu; unset GITHUB_ACTIONS RHIZA_CHAOS_EXECUTION_MODE; eval "$1"' guard "$mode_guard" 2>/dev/null; then
+  echo 'default mode accepted a non-CI execution' >&2; exit 1
+fi
 grep -Fq 'io.rhiza.candidate.variant=' "$candidate"
 grep -Fq 'options: [release, candidate, candidate-direct-host]' "$chaos"
 grep -Fq 'candidate-direct-host) IMAGE_VARIANT=managed-ffi-contract' "$chaos"
