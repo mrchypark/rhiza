@@ -23,11 +23,214 @@ forward_pid=
 bucket_pid=
 h() { kubectl --kubeconfig "$RHIZA_HOST_KUBECONFIG" --context "$RHIZA_HOST_CONTEXT" --request-timeout=30s "$@"; }
 hn() { h -n "$RHIZA_HOST_NAMESPACE" "$@"; }
-k() { kubectl --kubeconfig "$kubeconfig" --request-timeout=30s "$@"; }
+k() {
+  if kubectl --kubeconfig "$kubeconfig" --request-timeout=30s "$@"; then
+    if [ "$1" = "-n" ] && [ "$2" = "$namespace" ] &&
+       [ "$3" = rollout ] && [ "$4" = status ] && [ "$5" = deployment/floci ]; then
+      run_floci_dns_probe after-floci-rollout || :
+    fi
+    return 0
+  else
+    kubectl_status=$?
+    return "$kubectl_status"
+  fi
+}
 host_guard() {
   # A recreated namespace cannot recreate the token's original ServiceAccount UID.
   # This avoids granting the namespace-only CI account cluster-scoped Namespace GET.
   [ "$(hn get serviceaccount rhiza-chaos-runner -o jsonpath='{.metadata.uid}')" = "$RHIZA_HOST_SERVICEACCOUNT_UID" ]
+}
+project_virtual_dns_json() {
+  resource=$1
+  case "$resource" in
+    pods)
+      jq -c '
+        def dnsname: test("(^|[-])(coredns|kube-dns)([-]|$)"; "i");
+        def dnspod:
+          ((.metadata.name // "") | dnsname) or
+          ((.metadata.labels // {}) | .["k8s-app"] == "kube-dns" or
+            .["app.kubernetes.io/name"] == "coredns" or .app == "coredns");
+        {kind:"PodList",items:[.items[] | select(dnspod) | {
+          name:.metadata.name,createdAt:.metadata.creationTimestamp,
+          nodeName:.spec.nodeName,nodeSelectorHostname:(.spec.nodeSelector["kubernetes.io/hostname"] // null),
+          dnsPolicy:.spec.dnsPolicy,podIP:.status.podIP,phase:.status.phase,
+          conditions:[.status.conditions[]? | {type,status,reason}],
+          containers:[.status.containerStatuses[]? | {
+            name,ready,restartCount,started,
+            state:{running:(.state.running // null | if . == null then null else {startedAt} end),
+              waiting:(.state.waiting // null | if . == null then null else {reason} end),
+              terminated:(.state.terminated // null | if . == null then null else {reason,exitCode,startedAt,finishedAt} end)},
+            lastTermination:(.lastState.terminated // null | if . == null then null else {reason,exitCode,startedAt,finishedAt} end)
+          }]
+        }]}'
+      ;;
+    services)
+      jq -c '
+        def dnsname: test("(^|[-])(coredns|kube-dns)([-]|$)"; "i");
+        def dnsservice:
+          ((.metadata.name // "") | dnsname) or
+          ((.metadata.labels // {}) | .["k8s-app"] == "kube-dns" or
+            .["app.kubernetes.io/name"] == "coredns" or .app == "coredns") or
+          ((.spec.selector // {}) | .["k8s-app"] == "kube-dns" or .app == "coredns");
+        {kind:"ServiceList",items:[.items[] | select(dnsservice) | {
+          name:.metadata.name,type:.spec.type,clusterIP:.spec.clusterIP,clusterIPs:.spec.clusterIPs,
+          selector:{k8sApp:.spec.selector["k8s-app"],app:.spec.selector.app,
+            appName:.spec.selector["app.kubernetes.io/name"]},
+          ports:[.spec.ports[]? | {name,port,targetPort,protocol}]
+        }]}'
+      ;;
+    endpoints)
+      jq -c '
+        def dnsname: test("(^|[-])(coredns|kube-dns)([-]|$)"; "i");
+        {kind:"EndpointsList",items:[.items[] | select(((.metadata.name // "") | dnsname)) | {
+          name:.metadata.name,
+          subsets:[.subsets[]? | {
+            addresses:[.addresses[]? | {ip,nodeName,targetRef:{kind:.targetRef.kind,name:.targetRef.name,namespace:.targetRef.namespace}}],
+            notReadyAddresses:[.notReadyAddresses[]? | {ip,nodeName,targetRef:{kind:.targetRef.kind,name:.targetRef.name,namespace:.targetRef.namespace}}],
+            ports:[.ports[]? | {name,port,protocol}]
+          }]
+        }]}'
+      ;;
+    endpointslices)
+      jq -c '
+        def dnsname: test("(^|[-])(coredns|kube-dns)([-]|$)"; "i");
+        {kind:"EndpointSliceList",items:[.items[] | select(((.metadata.labels // {})["kubernetes.io/service-name"] // "") | dnsname) | {
+          name:.metadata.name,serviceName:.metadata.labels["kubernetes.io/service-name"],addressType:.addressType,
+          ports:[.ports[]? | {name,port,protocol}],
+          endpoints:[.endpoints[]? | {
+            addresses,conditions:{ready:.conditions.ready,serving:.conditions.serving,terminating:.conditions.terminating},
+            targetRef:{kind:.targetRef.kind,name:.targetRef.name,namespace:.targetRef.namespace}
+          }]
+        }]}'
+      ;;
+    *) return 2 ;;
+  esac
+}
+summarize_coredns_log() {
+  stage=$1
+  pod=$2
+  stream=$3
+  retrieved=$4
+  raw=$5
+  destination=$6
+  case "$stage" in before-sql-fixture|before-vcluster-uninstall) ;; *) return 2 ;; esac
+  case "$pod" in *[!a-zA-Z0-9.-]*|'') return 2 ;; esac
+  case "$stream" in current|previous) ;; *) return 2 ;; esac
+  if [ "$retrieved" != true ]; then
+    jq -n --arg stage "$stage" --arg pod "$pod" --arg stream "$stream" \
+      '{component:"coredns",stage:$stage,pod:$pod,stream:$stream,retrieved:false,lines:0,counts:{connection_refused:0,timeout:0,servfail:0,nxdomain:0,dns_refused:0,no_route:0,not_ready:0,ready:0,plugin_error:0,other:0}}' > "$destination"
+    return 0
+  fi
+  counts=$(awk '
+    BEGIN { refused=timeout=servfail=nxdomain=dnsrefused=noroute=notready=ready=pluginerror=other=lines=0 }
+    {
+      lines++
+      message=tolower($0)
+      if (message ~ /connection refused/) refused++
+      else if (message ~ /(i\/o timeout|timed out|timeout)/) timeout++
+      else if (message ~ /servfail/) servfail++
+      else if (message ~ /nxdomain/) nxdomain++
+      else if (message ~ /(^|[^a-z])refused([^a-z]|$)/) dnsrefused++
+      else if (message ~ /(no route to host|network is unreachable)/) noroute++
+      else if (message ~ /(still waiting|not ready)/) notready++
+      else if (message ~ /plugin\/ready/ && message ~ /ready/) ready++
+      else if (message ~ /plugin\/errors/) pluginerror++
+      else other++
+    }
+    END { printf "%d %d %d %d %d %d %d %d %d %d %d\n", lines, refused, timeout, servfail, nxdomain, dnsrefused, noroute, notready, ready, pluginerror, other }
+  ' "$raw")
+  IFS=' ' read -r lines refused timeout servfail nxdomain dnsrefused noroute notready ready pluginerror other <<EOF
+$counts
+EOF
+  jq -n --arg stage "$stage" --arg pod "$pod" --arg stream "$stream" \
+    --argjson lines "$lines" --argjson refused "$refused" --argjson timeout "$timeout" \
+    --argjson servfail "$servfail" --argjson nxdomain "$nxdomain" --argjson dnsrefused "$dnsrefused" \
+    --argjson noroute "$noroute" --argjson notready "$notready" --argjson ready "$ready" \
+    --argjson pluginerror "$pluginerror" --argjson other "$other" \
+    '{component:"coredns",stage:$stage,pod:$pod,stream:$stream,retrieved:true,lines:$lines,counts:{connection_refused:$refused,timeout:$timeout,servfail:$servfail,nxdomain:$nxdomain,dns_refused:$dnsrefused,no_route:$noroute,not_ready:$notready,ready:$ready,plugin_error:$pluginerror,other:$other}}' > "$destination"
+}
+capture_virtual_dns() {
+  phase=$1
+  printf '%s\n' "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" > "$logs/virtual-dns-$phase-captured-at.txt"
+  for resource in pods services endpoints endpointslices; do
+    raw="$private/virtual-dns-$resource.raw.json"
+    destination="$logs/virtual-dns-$phase-$resource.json"
+    if k -n kube-system get "$resource" -o json > "$raw" 2> "$private/virtual-dns-$resource.stderr"; then
+      if ! project_virtual_dns_json "$resource" < "$raw" > "$destination"; then
+        printf '%s\n' 'projection failed' > "$destination"
+      fi
+      rm -f "$private/virtual-dns-$resource.stderr"
+    else
+      printf '%s\n' 'API collection failed; see bounded collection error' > "$destination"
+      sed -n '1,8p' "$private/virtual-dns-$resource.stderr" > "$logs/virtual-dns-$phase-$resource.error.txt"
+      rm -f "$private/virtual-dns-$resource.stderr"
+    fi
+    rm -f "$raw"
+  done
+  for pod in $(jq -r '.items[] | select(any(.containers[]?; .name == "coredns")) | .name' "$logs/virtual-dns-$phase-pods.json" 2>/dev/null | head -4); do
+    case "$pod" in *[!a-zA-Z0-9.-]*|'') continue ;; esac
+    for stream in current previous; do
+      raw="$private/coredns-$stream.raw.log"
+      if [ "$stream" = previous ]; then
+        if k -n kube-system logs "$pod" -c coredns --previous --tail=100 --limit-bytes=32768 > "$raw" 2>&1; then retrieved=true; else retrieved=false; fi
+      else
+        if k -n kube-system logs "$pod" -c coredns --tail=100 --limit-bytes=32768 > "$raw" 2>&1; then retrieved=true; else retrieved=false; fi
+      fi
+      if ! summarize_coredns_log "$phase" "$pod" "$stream" "$retrieved" "$raw" "$logs/virtual-dns-$phase-$pod-$stream.json"; then
+        printf '{"component":"coredns","stage":"%s","pod":"%s","stream":"%s","summary":"unavailable"}\n' "$phase" "$pod" "$stream" > "$logs/virtual-dns-$phase-$pod-$stream.json"
+      fi
+      rm -f "$raw"
+    done
+  done
+}
+run_floci_dns_probe() {
+  phase=$1
+  case "$phase" in after-floci-rollout|before-vcluster-uninstall) ;; *) return 2 ;; esac
+  name="rhiza-dns-probe-$phase"
+  raw="$private/floci-endpoints.raw.json"
+  if k -n "$namespace" get endpoints floci -o json > "$raw" 2> "$private/floci-endpoints.stderr"; then
+    jq -c '{name:.metadata.name,subsets:[.subsets[]? | {addresses:[.addresses[]? | {ip,nodeName,targetRef:{kind:.targetRef.kind,name:.targetRef.name,namespace:.targetRef.namespace}}],notReadyAddresses:[.notReadyAddresses[]? | {ip,nodeName}],ports:[.ports[]? | {name,port,protocol}]}]}' "$raw" > "$logs/virtual-dns-$phase-floci-endpoints.json"
+    ready=$(jq '[.subsets[]?.addresses[]?] | length' "$raw")
+    rm -f "$private/floci-endpoints.stderr"
+  else
+    printf '%s\n' 'API collection failed' > "$logs/virtual-dns-$phase-floci-endpoints.json"
+    sed -n '1,8p' "$private/floci-endpoints.stderr" > "$logs/virtual-dns-$phase-floci-endpoints.error.txt"
+    ready=0
+  fi
+  rm -f "$raw" "$private/floci-endpoints.stderr"
+  if [ "$ready" -eq 0 ]; then
+    printf '%s\n' '{"phase":"SkippedNoReadyFlociEndpoint"}' > "$logs/virtual-dns-$phase-probe-status.json"
+    return 0
+  fi
+  if ! jq -n --arg name "$name" '{apiVersion:"v1",kind:"Pod",metadata:{name:$name,labels:{"rhiza-ci-component":"dns-probe"}},spec:{activeDeadlineSeconds:15,automountServiceAccountToken:false,enableServiceLinks:false,dnsPolicy:"ClusterFirst",restartPolicy:"Never",securityContext:{runAsUser:65532,runAsGroup:65532,runAsNonRoot:true},containers:[{name:"probe",image:"curlimages/curl:8.12.1@sha256:94e9e444bcba979c2ea12e27ae39bee4cd10bc7041a472c4727a558e213744e6",imagePullPolicy:"IfNotPresent",command:["curl"],args:["--silent","--show-error","--noproxy","*","--connect-timeout","3","--max-time","8","--output","/dev/null","--write-out","curl_writeout remote_ip=%{remote_ip} remote_port=%{remote_port} http_code=%{http_code}\\n","http://floci.managed-bootstrap.svc.cluster.local:4566/"],resources:{requests:{cpu:"10m",memory:"32Mi",ephemeral-storage:"8Mi"},limits:{cpu:"100m",memory:"64Mi",ephemeral-storage:"32Mi"}},securityContext:{allowPrivilegeEscalation:false,readOnlyRootFilesystem:true,capabilities:{drop:["ALL"]}}}]}}' > "$private/dns-probe.json"; then
+    printf '%s\n' '{"phase":"ManifestCreationFailed"}' > "$logs/virtual-dns-$phase-probe-status.json"
+    return 0
+  fi
+  if ! k -n "$namespace" create -f "$private/dns-probe.json" > "$logs/virtual-dns-$phase-probe-create.txt" 2>&1; then
+    printf '%s\n' '{"phase":"NotCreated"}' > "$logs/virtual-dns-$phase-probe-status.json"
+    rm -f "$private/dns-probe.json"
+    return 0
+  fi
+  rm -f "$private/dns-probe.json"
+  raw="$private/dns-probe-status.raw.json"
+  probe_status=Unknown
+  tries=0
+  while [ "$tries" -lt 20 ]; do
+    if k -n "$namespace" get pod "$name" -o json > "$raw" 2>/dev/null; then
+      probe_status=$(jq -r '.status.phase // "Unknown"' "$raw" 2>/dev/null || printf '%s' Unknown)
+      case "$probe_status" in Succeeded|Failed) break ;; esac
+    fi
+    tries=$((tries + 1))
+    sleep 1
+  done
+  if [ -f "$raw" ]; then
+    jq -c '{name:.metadata.name,phase:.status.phase,conditions:[.status.conditions[]? | {type,status,reason}],containers:[.status.containerStatuses[]? | {name,ready,restartCount,state:{waiting:(.state.waiting // null | if . == null then null else {reason} end),terminated:(.state.terminated // null | if . == null then null else {reason,exitCode,startedAt,finishedAt} end)} }]}' "$raw" > "$logs/virtual-dns-$phase-probe-status.json" 2>/dev/null || printf '%s\n' '{"phase":"StatusProjectionFailed"}' > "$logs/virtual-dns-$phase-probe-status.json"
+    rm -f "$raw"
+  else
+    printf '%s\n' '{"phase":"StatusUnavailable"}' > "$logs/virtual-dns-$phase-probe-status.json"
+  fi
+  k -n "$namespace" logs "$name" -c probe --tail=40 --limit-bytes=8192 > "$logs/virtual-dns-$phase-probe.log" 2>&1 || :
+  k -n "$namespace" delete pod "$name" --wait=true --timeout=10s > "$logs/virtual-dns-$phase-probe-delete.txt" 2>&1 || :
 }
 cleanup() {
   result=$?
@@ -40,6 +243,12 @@ cleanup() {
         capture_managed_logs
         k -n "$namespace" get pods,rhizaclusters,jobs,deployments -o json > "$logs/virtual-final.json" 2>&1 || :
         k -n "$namespace" get events > "$logs/virtual-events.txt" 2>&1 || :
+        # Preserve DNS service/backend evidence before Helm removes the
+        # virtual control plane. This is diagnostic only, not a readiness gate.
+        if [ "$result" -ne 0 ]; then
+          run_floci_dns_probe before-vcluster-uninstall || :
+        fi
+        capture_virtual_dns before-vcluster-uninstall
       fi
       helm uninstall "$release" --kubeconfig "$RHIZA_HOST_KUBECONFIG" --kube-context "$RHIZA_HOST_CONTEXT" --namespace "$RHIZA_HOST_NAMESPACE" --wait --timeout=3m > "$logs/helm-cleanup.txt" 2>&1 || result=1
       hn get pods -o json > "$logs/host-pods-after.json" 2>&1 || result=1
@@ -58,7 +267,7 @@ cleanup() {
     if kill -0 "$pid" 2>/dev/null; then result=1; fi
   done
   # Only this private run directory: credentials are never uploaded as artifacts.
-  rm -f "$private/virtual.config" "$private/runtime.json" "$private/admin.token" "$private/curl.conf" "$private/request.body" "$private/chart.tgz" "$private/values.yaml" "$private/rendered.yaml" "$private/forward.log" "$private/bucket-forward.log" "$RUNNER_TEMP/ha-managed-cluster-bucket-setup"
+  rm -f "$private/virtual.config" "$private/runtime.json" "$private/admin.token" "$private/curl.conf" "$private/request.body" "$private/chart.tgz" "$private/values.yaml" "$private/rendered.yaml" "$private/forward.log" "$private/bucket-forward.log" "$private/dns-probe.json" "$private/dns-probe-status.raw.json" "$private/floci-endpoints.raw.json" "$private/floci-endpoints.stderr" "$private/coredns-current.raw.log" "$private/coredns-previous.raw.log" "$private/virtual-dns-pods.raw.json" "$private/virtual-dns-services.raw.json" "$private/virtual-dns-endpoints.raw.json" "$private/virtual-dns-endpointslices.raw.json" "$private/virtual-dns-pods.stderr" "$private/virtual-dns-services.stderr" "$private/virtual-dns-endpoints.stderr" "$private/virtual-dns-endpointslices.stderr" "$RUNNER_TEMP/ha-managed-cluster-bucket-setup"
   rmdir "$private" || result=1
   printf '%s\n' "$result" > "$logs/driver.exit"
   exit "$result"
@@ -229,6 +438,7 @@ managed_container_fault() {
   chaos_fault container-kill container-kill "$1" "$2"
 }
 . scripts/ha-managed-bootstrap-fixture.sh
+capture_virtual_dns before-sql-fixture || :
 managed_fixture
 # No synthetic virtual delete fallback: common oracle requires new virtual UID
 # and a Completed certified replacement after the host Chaos Mesh pod-kill.
