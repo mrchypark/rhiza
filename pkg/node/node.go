@@ -893,6 +893,13 @@ func (n *Node) openInternal(ctx context.Context, enroll bool, prelocked *qlog.Lo
 			}
 		}
 	}
+	// Normal startup must restore from the checkpoint selected by certified
+	// recovery evidence, not the generation anchor captured before the seal was
+	// opened. Replay begins after materializer.Tip and cannot cross a compacted
+	// WAL floor to reconstruct that missing base.
+	if n.managedStartup == nil {
+		restoreCheckpoint = certifiedCheckpoint
+	}
 	if n.managedStartup != nil && n.managedStartup.Prepared != nil {
 		view := n.managedStartup.Prepared.View()
 		if view == nil {
