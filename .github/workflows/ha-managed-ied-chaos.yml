@@ -1,0 +1,93 @@
+name: HA managed IED Chaos Mesh
+on:
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: Published release tag containing this harness
+        required: true
+        type: string
+      image:
+        description: Released rhiza-operator image pinned by sha256
+        required: true
+        type: string
+      namespace:
+        description: Fresh pre-created rhiza-ha-chaos-* host namespace
+        required: true
+        type: string
+      namespace_uid:
+        description: Exact pre-created host namespace UID
+        required: true
+        type: string
+      serviceaccount_uid:
+        description: Exact rhiza-chaos-runner ServiceAccount UID in that namespace
+        required: true
+        type: string
+      context:
+        description: Context inside the short-lived namespace-only kubeconfig
+        required: true
+        type: string
+      node:
+        description: Administrator-verified existing Ready node hostname label
+        required: true
+        type: string
+permissions:
+  contents: read
+concurrency:
+  group: rhiza-ied-chaos
+  cancel-in-progress: false
+jobs:
+  qualification:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.release_tag }}
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+      - uses: azure/setup-helm@v4
+        with:
+          version: v3.19.0
+      - name: Offline identity guard regressions
+        run: sh scripts/test-ha-managed-ied-chaos-test.sh
+      - name: Validate published release and immutable image source
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ inputs.release_tag }}
+          RELEASE_IMAGE: ${{ inputs.image }}
+        run: |
+          set -eu
+          printf '%s\n' "$RELEASE_TAG" | grep -Eq '^v[0-9]+\.[0-9]+\.[0-9]+$'
+          printf '%s\n' "$RELEASE_IMAGE" | grep -Eq '^ghcr\.io/mrchypark/rhiza-operator@sha256:[0-9a-f]{64}$'
+          gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" --json isDraft,publishedAt | jq -e '.isDraft==false and .publishedAt!=null'
+          test "$(git describe --tags --exact-match)" = "$RELEASE_TAG"
+          docker pull "$RELEASE_IMAGE"
+          test "$(docker image inspect "$RELEASE_IMAGE" --format '{{ index .Config.Labels "org.opencontainers.image.revision" }}')" = "$(git rev-parse HEAD)"
+          mkdir -p "$RUNNER_TEMP/ha-managed-ied-chaos"
+          printf '%s\n' "$RELEASE_TAG" "$RELEASE_IMAGE" "$(git rev-parse HEAD)" > "$RUNNER_TEMP/ha-managed-ied-chaos/release-source.txt"
+      - name: Actual namespace-isolated IED Chaos Mesh qualification
+        env:
+          HOST_CONFIG: ${{ secrets.RHIZA_IED_CHAOS_KUBECONFIG }}
+          RHIZA_HOST_CONTEXT: ${{ inputs.context }}
+          RHIZA_HOST_NAMESPACE: ${{ inputs.namespace }}
+          RHIZA_HOST_NAMESPACE_UID: ${{ inputs.namespace_uid }}
+          RHIZA_HOST_SERVICEACCOUNT_UID: ${{ inputs.serviceaccount_uid }}
+          RHIZA_HOST_NODE: ${{ inputs.node }}
+          RHIZA_RELEASE_IMAGE: ${{ inputs.image }}
+        run: |
+          set -eu
+          umask 077
+          test -n "$HOST_CONFIG"
+          host_config=$(mktemp "$RUNNER_TEMP/ied-host.XXXXXX")
+          trap 'rm -f "$host_config"' EXIT HUP INT TERM
+          printf '%s' "$HOST_CONFIG" > "$host_config"
+          unset HOST_CONFIG
+          export RHIZA_HOST_KUBECONFIG="$host_config"
+          sh scripts/test-ha-managed-ied-chaos.sh
+      - name: Preserve non-secret qualification evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ha-managed-ied-chaos-${{ github.run_id }}
+          path: ${{ runner.temp }}/ha-managed-ied-chaos

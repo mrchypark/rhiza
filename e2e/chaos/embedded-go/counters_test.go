@@ -299,6 +299,14 @@ func TestQualificationApplicationProvenance(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	if !bytes.Contains(script, []byte(". scripts/ha-managed-bootstrap-fixture.sh\nmanaged_fixture")) {
+		t.Fatal("managed qualification must execute the shared fixture")
+	}
+	fixture, err := os.ReadFile("../../../scripts/ha-managed-bootstrap-fixture.sh")
+	if err != nil {
+		t.Fatal(err)
+	}
+	script = append(script, fixture...)
 	// Local build, loaded image, init profile and application use one event-SHA tag.
 	for _, required := range []string{
 		`cd "$(CDPATH='' cd -- "$(dirname -- "$0")/.." && pwd)"`,

@@ -5,14 +5,6 @@ on:
   push:
     branches:
       - main
-      - feature/ha-v1alpha2-readonly-view
-      - feature/ha-v1alpha2-prepare-restore
-      - feature/ha-v1alpha2-append-only
-      - feature/ha-existing-bucket
-      - feature/ha-prepared-startup
-      - feature/ha-node-prepared-restore
-      - feature/ha-exact-sql-outcome
-      - feature/ha-managed-sql-recovery
   workflow_dispatch:
 
 permissions:
