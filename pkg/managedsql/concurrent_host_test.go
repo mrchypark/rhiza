@@ -110,9 +110,20 @@ func TestManagedSQLThreeHostsSubmittedUnknownRetainsExactOriginal(t *testing.T) 
 		t.Fatalf("retained original recovery: %v", err)
 	}
 	for _, h := range hosts {
-		if err := h.RecoverPending(ctx); err != nil {
-			t.Fatalf("fresh explicit recovery admission: %v", err)
+		// Recovery of the pending original is distinct from fresh admission.
+		// ReadIndex may observe a newer peer tip than this Core has learned;
+		// that admission must remain closed, not become a recovery failure.
+		resolved, err := h.node.ResolveManagedSQL(ctx, req)
+		if err != nil || resolved.Receipt == nil || resolved.Receipt.Slot != response.Slot || resolved.Receipt.Status != types.MutationCommitted {
+			t.Fatalf("original retained receipt changed: %+v %v", resolved, err)
 		}
+	}
+	final, err := operator.LoadV1Alpha2Admission(ctx, configs[0].Store, configs[0].Ref)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, pending := final.Pending(); pending {
+		t.Fatal("explicit recovery left original pending")
 	}
 	resolved, err := hosts[0].node.ResolveManagedSQL(ctx, req)
 	if err != nil || resolved.Receipt == nil || resolved.Receipt.Slot != response.Slot {

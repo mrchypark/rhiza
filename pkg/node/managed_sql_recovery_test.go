@@ -19,6 +19,61 @@ type lagRecoveryChecker struct {
 	denyAfter bool
 }
 
+func TestManagedSQLFreshAdmissionRequiresLearnedPeerHistory(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	n, _, tr, _ := terminalRetryFixture(t, nil)
+	m, err := materializer.Open(filepath.Join(t.TempDir(), "sql.db"), 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = m.Close() })
+	checker := &managedTestChecker{}
+	n.material = m
+	n.managedStartup = &ManagedStartupConfig{Checker: checker}
+	n.opened.Store(true)
+	// Preserve a genuine quorum commit while withholding its decision from a.
+	tr.disable("a")
+	value, err := types.EncodeSQLBatch([]types.SQLCommand{{RequestID: "peer-only", SQL: "CREATE TABLE peer_only (id INTEGER)"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	slot, _, err := tr.cores["b"].Propose(ctx, value)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n.core.Tip() != 0 || m.Tip() != 0 {
+		t.Fatal("target did not retain controlled certified lag")
+	}
+	target, _, err := n.core.ReadIndex(ctx)
+	if err != nil || target != slot {
+		t.Fatalf("quorum did not expose peer tip: %d %v", target, err)
+	}
+	if err := n.AdmitManaged(ctx); err == nil || n.managedAdmitted.Load() || checker.admissionCalls.Load() != 0 {
+		t.Fatalf("unlearned peer history admitted application: %v", err)
+	}
+	// Deliver the actual certified decision, not fabricated evidence or SQL.
+	values, _, err := tr.cores["b"].DecisionsFrom(1, 256)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, v := range values {
+		decision, ok := tr.cores["b"].CertifiedValue(v.Slot)
+		if !ok {
+			t.Fatal("actual certified decision unavailable")
+		}
+		if err := n.core.AcceptCertifiedValue(decision); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := n.AdmitManaged(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if n.core.Tip() != slot || m.Tip() != uint64(slot) || !n.managedAdmitted.Load() {
+		t.Fatal("certified learning failed or resubmitted SQL")
+	}
+}
+
 func (c *lagRecoveryChecker) ValidateManagedSQLRecovery(_ context.Context, _ ManagedStartupIdentity, req network.ExecuteRequest) error {
 	c.calls++
 	if req.RequestID != c.req.RequestID || req.SQL != c.req.SQL || c.denyAfter && c.calls > 1 {
