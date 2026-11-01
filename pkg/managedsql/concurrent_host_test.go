@@ -113,6 +113,7 @@ func TestManagedSQLThreeHostsSubmittedUnknownRetainsExactOriginal(t *testing.T) 
 		// Recovery of the pending original is distinct from fresh admission.
 		// ReadIndex may observe a newer peer tip than this Core has learned;
 		// that admission must remain closed, not become a recovery failure.
+		waitSQLCertifiedApplication(t, ctx, h, response.Slot)
 		resolved, err := h.node.ResolveManagedSQL(ctx, req)
 		if err != nil || resolved.Receipt == nil || resolved.Receipt.Slot != response.Slot || resolved.Receipt.Status != types.MutationCommitted {
 			t.Fatalf("original retained receipt changed: %+v %v", resolved, err)
@@ -128,6 +129,30 @@ func TestManagedSQLThreeHostsSubmittedUnknownRetainsExactOriginal(t *testing.T) 
 	resolved, err := hosts[0].node.ResolveManagedSQL(ctx, req)
 	if err != nil || resolved.Receipt == nil || resolved.Receipt.Slot != response.Slot {
 		t.Fatalf("recovery changed/re-executed original receipt: %v", err)
+	}
+}
+
+// Observe the normal private peer catch-up worker, not repeated SQL resolution
+// or submission. A shared status CAS does not synchronously apply its SQL on
+// every peer. Only after the actual certified and materialized tips include
+// that slot is it valid to demand a peer-local retained receipt.
+func waitSQLCertifiedApplication(t *testing.T, ctx context.Context, h *Host, through uint64) {
+	t.Helper()
+	tick := time.NewTicker(10 * time.Millisecond)
+	defer tick.Stop()
+	for {
+		state, err := h.node.ManagedState()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if state.CertifiedTip >= through && state.AppliedTip >= through {
+			return
+		}
+		select {
+		case <-ctx.Done():
+			t.Fatalf("normal certified catch-up did not reach original slot=%d certified=%d applied=%d recorder=%d: %v", through, state.CertifiedTip, state.AppliedTip, state.RecorderTip, ctx.Err())
+		case <-tick.C:
+		}
 	}
 }
 

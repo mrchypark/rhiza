@@ -32,6 +32,8 @@ func TestManagedSQLFreshAdmissionRequiresLearnedPeerHistory(t *testing.T) {
 	n.material = m
 	n.managedStartup = &ManagedStartupConfig{Checker: checker}
 	n.opened.Store(true)
+	n.server = network.NewServer(n.core, m, "cluster", false, nil)
+	t.Cleanup(n.server.Close)
 	// Preserve a genuine quorum commit while withholding its decision from a.
 	tr.disable("a")
 	value, err := types.EncodeSQLBatch([]types.SQLCommand{{RequestID: "peer-only", SQL: "CREATE TABLE peer_only (id INTEGER)"}})
@@ -44,6 +46,13 @@ func TestManagedSQLFreshAdmissionRequiresLearnedPeerHistory(t *testing.T) {
 	}
 	if n.core.Tip() != 0 || m.Tip() != 0 {
 		t.Fatal("target did not retain controlled certified lag")
+	}
+	req := network.ExecuteRequest{RequestID: "peer-only", SQL: "CREATE TABLE peer_only (id INTEGER)"}
+	// With no pending-recovery authority, a committed peer receipt cannot be
+	// demanded before normal certified catch-up reaches this local materializer.
+	absent, err := n.ResolveManagedSQL(ctx, req)
+	if err == nil || absent.Receipt != nil || absent.State != network.ResolveExecuteUnknownOrExpired {
+		t.Fatalf("unlearned receipt bypassed recovery authority: %+v %v", absent, err)
 	}
 	target, _, err := n.core.ReadIndex(ctx)
 	if err != nil || target != slot {
@@ -71,6 +80,10 @@ func TestManagedSQLFreshAdmissionRequiresLearnedPeerHistory(t *testing.T) {
 	}
 	if n.core.Tip() != slot || m.Tip() != uint64(slot) || !n.managedAdmitted.Load() {
 		t.Fatal("certified learning failed or resubmitted SQL")
+	}
+	retained, err := n.ResolveManagedSQL(ctx, req)
+	if err != nil || retained.Receipt == nil || retained.Receipt.Status != types.MutationCommitted || retained.Receipt.Slot != uint64(slot) || n.core.Tip() != slot || m.Tip() != uint64(slot) {
+		t.Fatalf("normal certified catch-up did not expose exact retained original: %+v %v", retained, err)
 	}
 }
 
