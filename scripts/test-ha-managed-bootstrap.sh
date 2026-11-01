@@ -51,7 +51,7 @@ cleanup() {
     capture_bootstrap_logs
     k -n "$namespace" get pods,deployments,replicasets,rhizaclusters,jobs,services,endpoints -o json > "$logs/final-state.json" 2>&1 || :
     for job in create-sql insert-sql query; do
-      k -n "$namespace" logs "job/$job" > "$logs/$job.json" 2> "$logs/$job-log-errors.txt" || :
+      k -n "$namespace" logs "job/$job" --tail=200 --limit-bytes=65536 > "$logs/$job-cleanup.log" 2> "$logs/$job-log-errors.txt" || :
     done
     k -n "$namespace" get events > "$logs/events.txt" 2>&1 || :
     kind delete cluster --name "$cluster" > "$logs/delete.txt" 2>&1 || result=1

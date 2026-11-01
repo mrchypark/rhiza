@@ -2,6 +2,7 @@
 # Offline allowlist check for sanitized managed-cluster log capture.
 set -eu
 cd "$(CDPATH='' cd -- "$(dirname -- "$0")/.." && pwd)"
+sh scripts/test-ha-managed-client-job-test.sh
 sh -n scripts/test-ha-managed-cluster-chaos.sh
 capture=$(sed -n '/^capture_managed_logs() {/,/^}/p' scripts/test-ha-managed-cluster-chaos.sh)
 [ -n "$capture" ]

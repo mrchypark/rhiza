@@ -17,7 +17,9 @@ import (
 	"github.com/mrchypark/rhiza/internal/types"
 	"github.com/mrchypark/rhiza/pkg/managedbootstrap"
 	"github.com/mrchypark/rhiza/pkg/managedsql"
+	"github.com/mrchypark/rhiza/pkg/network"
 	"github.com/mrchypark/rhiza/pkg/operator"
+	"github.com/mrchypark/rhiza/pkg/quepaxa"
 )
 
 func managedConfig(ctx context.Context, kube *operator.Kubernetes, ref operator.V1Alpha2ClusterRef, podName, podUID, identityPath, handoffPath string, profile operator.V1Alpha2RuntimeProfile) (managedsql.Config, error) {
@@ -160,6 +162,51 @@ func checkReady(ctx context.Context, client *http.Client, endpoint, token string
 	return nil
 }
 
+func managedOperationUnavailable(w http.ResponseWriter, operation string, err error) {
+	switch operation {
+	case "execute", "query", "recover-pending":
+	default:
+		operation = "unknown"
+	}
+	code, stage, recoveryRequired := "internal", "unknown", false
+	switch {
+	case errors.Is(err, network.ErrCommitUnknown):
+		code, recoveryRequired = "commit_unknown", true
+	case errors.Is(err, managedsql.ErrSQLNotSubmitted):
+		code = "sql_not_submitted"
+		var pre *managedsql.SQLNotSubmittedError
+		if errors.As(err, &pre) {
+			recoveryRequired = pre.RecoveryRequired
+			if recoveryRequired {
+				code = "sql_recovery_required"
+			}
+			switch pre.Stage {
+			case managedsql.SQLStageValidation, managedsql.SQLStageAuthority, managedsql.SQLStagePending, managedsql.SQLStageRepair, managedsql.SQLStageAdmission, managedsql.SQLStageReservation:
+				stage = string(pre.Stage)
+			}
+		}
+	case errors.Is(err, context.DeadlineExceeded):
+		code = "timeout"
+	case errors.Is(err, context.Canceled):
+		code = "canceled"
+	case errors.Is(err, network.ErrInvalidRequest):
+		code = "invalid_request"
+	case errors.Is(err, network.ErrNotReady):
+		code = "not_ready"
+	case errors.Is(err, quepaxa.ErrQuorumUnavailable):
+		code = "quorum_unavailable"
+	case errors.Is(err, network.ErrRequestConflict):
+		code = "request_conflict"
+	case errors.Is(err, network.ErrDurabilityUnavailable):
+		code = "durability_unavailable"
+	case errors.Is(err, network.ErrOverloaded):
+		code = "overloaded"
+	}
+	// Only allowlisted values: causes may contain SQL, request IDs or credentials.
+	log.Printf("managed SQL unavailable operation=%s code=%s stage=%s recovery_required=%t", operation, code, stage, recoveryRequired)
+	http.Error(w, "operation unavailable", http.StatusServiceUnavailable)
+}
+
 // managedHandler exposes only the private reference host's guarded SQL API.
 func managedHandler(host *managedsql.Host, token string) (http.Handler, error) {
 	if host == nil || token == "" {
@@ -203,7 +250,7 @@ func managedHandler(host *managedsql.Host, token string) (http.Handler, error) {
 		}
 		result, err := host.Execute(r.Context(), req)
 		if err != nil {
-			http.Error(w, "operation unavailable", http.StatusServiceUnavailable)
+			managedOperationUnavailable(w, "execute", err)
 			return
 		}
 		w.Header().Set("Content-Type", "application/json")
@@ -217,7 +264,7 @@ func managedHandler(host *managedsql.Host, token string) (http.Handler, error) {
 		// Resolve only the durable original; never accept replacement SQL or
 		// replay the canceled mutation. Unknown outcomes stay write-blocked.
 		if err := host.RecoverPending(r.Context()); err != nil {
-			http.Error(w, "operation unavailable", http.StatusServiceUnavailable)
+			managedOperationUnavailable(w, "recover-pending", err)
 			return
 		}
 		w.WriteHeader(http.StatusNoContent)
@@ -229,7 +276,7 @@ func managedHandler(host *managedsql.Host, token string) (http.Handler, error) {
 		}
 		result, err := host.Query(r.Context(), req)
 		if err != nil {
-			http.Error(w, "operation unavailable", http.StatusServiceUnavailable)
+			managedOperationUnavailable(w, "query", err)
 			return
 		}
 		w.Header().Set("Content-Type", "application/json")
