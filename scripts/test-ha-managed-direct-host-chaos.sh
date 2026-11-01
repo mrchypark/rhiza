@@ -8,7 +8,8 @@ case "$execution_mode" in
   local)
     [ "${GITHUB_ACTIONS-}" != true ] || { echo 'local mode cannot run in GitHub Actions' >&2; exit 1; }
     : "${RHIZA_LOCAL_RUN_ID:?}"
-    printf '%s\n' "$RHIZA_LOCAL_RUN_ID" | grep -Eq '^[a-z0-9][a-z0-9-]{0,33}$'
+    case "$RHIZA_LOCAL_RUN_ID" in ''|*[!0-9]*) echo 'local run ID must contain only digits' >&2; exit 1 ;; esac
+    [ "${#RHIZA_LOCAL_RUN_ID}" -le 34 ]
     # The shared fixture uses these names for unique bucket naming, not CI authorization.
     GITHUB_RUN_ID=$RHIZA_LOCAL_RUN_ID
     GITHUB_RUN_ATTEMPT=1

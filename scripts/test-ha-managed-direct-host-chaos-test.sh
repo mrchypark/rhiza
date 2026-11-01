@@ -11,7 +11,7 @@ operator_initializer=pkg/operator/initializer_v1alpha2.go
 for source in "$direct" "$fixture" scripts/test-ha-managed-direct-host-chaos-test.sh; do sh -n "$source"; done
 scratch=$(mktemp -d "${TMPDIR:-/tmp}/rhiza-direct-chaos-oracles.XXXXXX")
 cleanup_test() {
-  rm -f "$scratch/old-id" "$scratch/new-id" "$scratch/same-a" "$scratch/same-b" "$scratch/preflight-list.json"
+  rm -f "$scratch/old-id" "$scratch/new-id" "$scratch/same-a" "$scratch/same-b" "$scratch/preflight-list.json" "$scratch/bucket-contract_test.go" "$scratch/bucket-overlay.json"
   rmdir "$scratch"
 }
 trap cleanup_test EXIT HUP INT TERM
@@ -55,13 +55,47 @@ grep -Fq 'platforms: ${{ steps.variant.outputs.platform }}' "$candidate"
 grep -Fq '"platform":"%s"' "$candidate"
 mode_guard=$(sed -n '/^execution_mode=/,/^esac/p' "$direct")
 [ -n "$mode_guard" ]
-sh -c 'set -eu; git() { printf "%s\n" test-source; }; RHIZA_CHAOS_EXECUTION_MODE=local RHIZA_LOCAL_RUN_ID=local-test; unset GITHUB_ACTIONS; eval "$1"; [ "$execution_mode" = local ]; [ "$GITHUB_RUN_ID" = local-test ]; [ "$GITHUB_SHA" = test-source ]; [ "${GITHUB_ACTIONS-}" != true ]' guard "$mode_guard"
+sh -c 'set -eu; git() { printf "%s\n" test-source; }; RHIZA_CHAOS_EXECUTION_MODE=local RHIZA_LOCAL_RUN_ID=123; unset GITHUB_ACTIONS; eval "$1"; [ "$execution_mode" = local ]; [ "$GITHUB_RUN_ID" = 123 ]; [ "$GITHUB_SHA" = test-source ]; [ "${GITHUB_ACTIONS-}" != true ]' guard "$mode_guard"
 local_id_34=1234567890123456789012345678901234
-sh -c 'set -eu; git() { printf "%s\n" test-source; }; RHIZA_CHAOS_EXECUTION_MODE=local RHIZA_LOCAL_RUN_ID=$2; unset GITHUB_ACTIONS; eval "$1"; bucket="rhiza-managed-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT-123456789012"; [ "${#bucket}" -le 63 ]' guard "$mode_guard" "$local_id_34"
+bucket_assignment=$(sed -n '/^bucket=/p' "$fixture")
+[ -n "$bucket_assignment" ]
+generated_buckets=
+for local_id in 123 "$local_id_34"; do
+  generated_bucket=$(sh -c 'set -eu; git() { printf "%s\n" test-source; }; RHIZA_CHAOS_EXECUTION_MODE=local RHIZA_LOCAL_RUN_ID=$2; unset GITHUB_ACTIONS; eval "$1"; nonce=012345abcdef; eval "$3"; [ "${#bucket}" -le 63 ]; printf "%s\n" "$bucket"' guard "$mode_guard" "$local_id" "$bucket_assignment")
+  generated_buckets="$generated_buckets $generated_bucket"
+done
+cat > "$scratch/bucket-contract_test.go" <<'GO'
+package main
+
+import (
+  "os"
+  "strings"
+  "testing"
+)
+
+func TestGeneratedLocalChaosBucketContract(t *testing.T) {
+  buckets := strings.Fields(os.Getenv("RHIZA_GENERATED_TEST_BUCKETS"))
+  if len(buckets) != 2 {
+    t.Fatal("expected short and maximum-length generated buckets")
+  }
+  for _, bucket := range buckets {
+    if err := validate("http://127.0.0.1:1234", bucket); err != nil {
+      t.Fatalf("driver-generated bucket %q rejected by real setup validator: %v", bucket, err)
+    }
+  }
+}
+GO
+jq -n --arg source "$(pwd)/scripts/ha-managed-bucket-setup-src/main_test.go" --arg replacement "$scratch/bucket-contract_test.go" '{Replace:{($source):$replacement}}' > "$scratch/bucket-overlay.json"
+(cd scripts/ha-managed-bucket-setup-src && RHIZA_GENERATED_TEST_BUCKETS="$generated_buckets" go test -mod=readonly -overlay "$scratch/bucket-overlay.json" -run '^TestGeneratedLocalChaosBucketContract$' -count=1 -timeout=30s)
+for invalid_id in local-test "$(printf '123\nbad')" "$(printf '123\n456')" "$(printf '123\t456')"; do
+  if sh -c 'set -eu; git() { printf "%s\n" test-source; }; RHIZA_CHAOS_EXECUTION_MODE=local RHIZA_LOCAL_RUN_ID=$2; unset GITHUB_ACTIONS; eval "$1"' guard "$mode_guard" "$invalid_id" 2>/dev/null; then
+    echo 'local mode accepted a nonnumeric or multiline ID rejected by the bucket helper' >&2; exit 1
+  fi
+done
 if sh -c 'set -eu; git() { printf "%s\n" test-source; }; RHIZA_CHAOS_EXECUTION_MODE=local RHIZA_LOCAL_RUN_ID=$2; unset GITHUB_ACTIONS; eval "$1"' guard "$mode_guard" "${local_id_34}5" 2>/dev/null; then
   echo 'local mode accepted an ID exceeding the bucket naming budget' >&2; exit 1
 fi
-if sh -c 'set -eu; RHIZA_CHAOS_EXECUTION_MODE=local RHIZA_LOCAL_RUN_ID=local-test GITHUB_ACTIONS=true; eval "$1"' guard "$mode_guard" 2>/dev/null; then
+if sh -c 'set -eu; RHIZA_CHAOS_EXECUTION_MODE=local RHIZA_LOCAL_RUN_ID=123 GITHUB_ACTIONS=true; eval "$1"' guard "$mode_guard" 2>/dev/null; then
   echo 'local mode accepted a GitHub Actions execution' >&2; exit 1
 fi
 if sh -c 'set -eu; unset GITHUB_ACTIONS RHIZA_CHAOS_EXECUTION_MODE; eval "$1"' guard "$mode_guard" 2>/dev/null; then
