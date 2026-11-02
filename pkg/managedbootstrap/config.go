@@ -49,8 +49,15 @@ func ManagedRuntimeConfig(ctx context.Context, kube *operator.Kubernetes, ref op
 	if err != nil {
 		return result, err
 	}
-	if init.Assignment().Plan.EvidenceFormat != profile.EvidenceFormat || profile.EvidenceFormat != managedsql.EvidenceFormat {
-		return result, errors.New("unsupported evidence profile")
+	if init.Assignment().Plan.Generation != init.Authority().Generation || init.Assignment().Plan.DeploymentUID != init.Authority().Binding.DeploymentUID || init.Assignment().Plan.StorageID != init.Authority().Binding.StorageID {
+		return result, errors.New("live initialization authority differs from assignment")
+	}
+	if err := validateManagedProfileBinding(ref, profile, init.Assignment().Plan, plan); err != nil {
+		return result, err
+	}
+	// Do not reach legacy restore/open paths with an explicitly mixed assignment.
+	if profile.ApplicationProtocol != "" {
+		return result, errors.New("mixed managed runtime activation is not supported")
 	}
 	cluster, err := types.ManagedClusterID(ref.UID, 0)
 	if err != nil {
@@ -96,4 +103,43 @@ func ManagedRuntimeConfig(ctx context.Context, kube *operator.Kubernetes, ref op
 		return result, errors.New("private API authentication token required")
 	}
 	return managedsql.Config{StorageRoot: root, Runtime: cfg, Store: store, Ref: ref, Plan: init.Assignment().Plan, PodUID: podUID}, nil
+}
+
+func validateManagedProfileBinding(ref operator.V1Alpha2ClusterRef, profile operator.V1Alpha2RuntimeProfile, assignment operator.V1Alpha2ApplicationInitPlan, plan operator.V1Alpha2BootstrapPlan) error {
+	if err := operator.ValidateV1Alpha2ApplicationProfile(profile.ApplicationProtocol, profile.EvidenceFormat); err != nil {
+		return err
+	}
+	if assignment.ApplicationProtocol != profile.ApplicationProtocol || assignment.ClusterUID != ref.UID || assignment.Generation != 0 || assignment.EvidenceFormat != profile.EvidenceFormat || plan.EvidenceFormat != profile.EvidenceFormat {
+		return errors.New("live managed application profile differs from installed capability")
+	}
+	cluster, err := types.ManagedClusterID(ref.UID, assignment.Generation)
+	if err != nil || plan.ClusterID != cluster {
+		return errors.New("managed bootstrap cluster mismatch")
+	}
+	namespace, err := node.ManagedNamespaceFor(profile.Storage.ObjStorePrefix, ref.UID, assignment.Generation, assignment.AssignmentID, string(cluster))
+	if err != nil {
+		return err
+	}
+	config := node.CloneManagedRuntimeConfig(profile.Storage)
+	config.ClusterID, config.ObjStorePrefix = cluster, namespace.ConfigPrefix
+	binding, err := types.ManagedStorageBinding(config)
+	if err != nil || binding != assignment.PhysicalBinding || binding != plan.PhysicalBinding {
+		return errors.New("managed physical profile mismatch")
+	}
+	durability := config.ObjStoreDurability
+	if durability == "" {
+		durability = types.ObjectStoreDurabilityBeforeAck
+	}
+	if plan.Durability != durability || plan.Reconfiguration != config.EnableReconfiguration {
+		return errors.New("managed bootstrap configuration mismatch")
+	}
+	members := make([]types.NodeConfig, 0, len(plan.Members))
+	for _, member := range plan.Members {
+		members = append(members, member.Member)
+	}
+	digest, err := types.ManagedBootstrapPlanDigestForProtocol(string(cluster), members, binding, profile.EvidenceFormat, durability, config.EnableReconfiguration, profile.ApplicationProtocol)
+	if err != nil || digest != assignment.BootstrapPlanDigest {
+		return errors.New("managed bootstrap profile digest mismatch")
+	}
+	return nil
 }

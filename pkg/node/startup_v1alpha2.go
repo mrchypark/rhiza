@@ -45,6 +45,7 @@ const managedRepairOriginMaxBytes = (128 << 10) + 4096
 // ManagedStartupIdentity binds an explicit, live initialization assignment to
 // this exact execution member. A missing archive is never an assignment.
 type ManagedStartupIdentity struct {
+	ApplicationProtocol string `json:",omitempty"`
 	Member              recovery.PreparedStartupIdentity
 	AssignmentID        string
 	IntentHash          string
@@ -121,6 +122,10 @@ func CloneManagedRuntimeConfig(c types.ExecutionConfig) types.ExecutionConfig {
 // is the SourceBinding returned by PreparedStartupBindingDigests, not its
 // member-specific ConfigDigest. The host must also recognize evidenceFormat.
 func (n *Node) ManagedBootstrapPlanDigest(physicalBinding, evidenceFormat string) (string, error) {
+	return n.ManagedBootstrapPlanDigestForProtocol(physicalBinding, evidenceFormat, "")
+}
+
+func (n *Node) ManagedBootstrapPlanDigestForProtocol(physicalBinding, evidenceFormat, protocol string) (string, error) {
 	if n == nil || n.config == nil || n.config.Local || physicalBinding == "" || evidenceFormat == "" {
 		return "", fmt.Errorf("invalid managed bootstrap binding")
 	}
@@ -128,7 +133,7 @@ func (n *Node) ManagedBootstrapPlanDigest(physicalBinding, evidenceFormat string
 	if err != nil || source != physicalBinding {
 		return "", errors.Join(fmt.Errorf("physical binding differs from configured storage"), err)
 	}
-	return types.ManagedBootstrapPlanDigest(string(n.config.ClusterID), n.config.Members, physicalBinding, evidenceFormat, n.config.ObjStoreDurability, n.config.EnableReconfiguration)
+	return types.ManagedBootstrapPlanDigestForProtocol(string(n.config.ClusterID), n.config.Members, physicalBinding, evidenceFormat, n.config.ObjStoreDurability, n.config.EnableReconfiguration, protocol)
 }
 
 // OpenManaged starts an owned WAL/core/materializer and private peers while
@@ -141,6 +146,10 @@ func (n *Node) OpenManaged(ctx context.Context, cfg ManagedStartupConfig) (resul
 	configCopy := CloneManagedRuntimeConfig(*n.config)
 	n.config = &configCopy
 	i := cfg.Identity
+	// Profile plumbing is available, but mixed runtime opens are not connected yet.
+	if i.ApplicationProtocol != "" {
+		return fmt.Errorf("managed application protocol runtime is not supported")
+	}
 	namespace, err := ManagedNamespaceFor(cfg.StorageRoot, i.Member.ClusterUID, i.Member.Generation, i.AssignmentID, string(n.config.ClusterID))
 	if err != nil || n.config.ObjStorePrefix != namespace.ConfigPrefix {
 		return errors.Join(fmt.Errorf("managed runtime final namespace mismatch"), err)
@@ -1165,19 +1174,23 @@ func readPreparedAdoption(name string) (data []byte, resultErr error) {
 // PreparedBindingDigests identifies the configured source and consensus inputs;
 // no credentials are embedded in the returned digests.
 func (n *Node) preparedBindingDigests() (string, string, error) {
+	return n.preparedBindingDigestsForProtocol("")
+}
+
+func (n *Node) PreparedStartupBindingDigestsForProtocol(protocol string) (string, string, error) {
+	if n == nil || n.config == nil || n.config.Local || n.config.NodeID == "" || n.config.ClusterID == "" {
+		return "", "", fmt.Errorf("invalid prepared startup configuration")
+	}
+	return n.preparedBindingDigestsForProtocol(protocol)
+}
+
+func (n *Node) preparedBindingDigestsForProtocol(protocol string) (string, string, error) {
 	source, err := types.ManagedStorageBinding(*n.config)
 	if err != nil {
 		return "", "", err
 	}
-	config, _ := json.Marshal(struct {
-		Cluster         string
-		Node            string
-		Members         []quepaxa.Member
-		Learner         *quepaxa.Member
-		Durability      string
-		Reconfiguration bool
-	}{string(n.config.ClusterID), string(n.config.NodeID), n.config.Members, n.config.Learner, string(n.config.ObjStoreDurability), n.config.EnableReconfiguration})
-	return source, fmt.Sprintf("%x", sha256.Sum256(config)), nil
+	config, err := types.ManagedMemberConfigDigest(*n.config, protocol)
+	return source, config, err
 }
 
 func (n *Node) PreparedStartupBindingDigests() (string, string, error) {

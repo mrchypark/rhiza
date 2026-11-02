@@ -9,6 +9,7 @@ import (
 	"strings"
 	"unicode/utf8"
 
+	"github.com/mrchypark/rhiza/internal/sqlpolicy"
 	"github.com/mrchypark/rhiza/pkg/quepaxa"
 )
 
@@ -37,6 +38,30 @@ func validManagedUID(uid string) bool {
 // ManagedBootstrapPlanDigest matches the managed Node's common bootstrap
 // digest; member-specific WAL identities do not belong to the common plan.
 func ManagedBootstrapPlanDigest(clusterID string, members []quepaxa.Member, physicalBinding, evidenceFormat string, durability ObjectStoreDurability, reconfiguration bool) (string, error) {
+	return ManagedBootstrapPlanDigestForProtocol(clusterID, members, physicalBinding, evidenceFormat, durability, reconfiguration, "")
+}
+
+// ManagedApplicationPolicy selects only from the caller's trusted protocol.
+// Managed startup has no configurable retention window.
+func ManagedApplicationPolicy(protocol string) (sqlpolicy.MaterializationPolicy, uint64, error) {
+	switch protocol {
+	case "":
+		return sqlpolicy.LegacyMaterializationPolicy, DefaultIdempotencyWindowSlots, nil
+	case ManagedApplicationProtocolSQLKV:
+		return sqlpolicy.ManagedSQLKVMaterializationPolicy, DefaultIdempotencyWindowSlots, nil
+	default:
+		return 0, 0, fmt.Errorf("unsupported managed application protocol")
+	}
+}
+
+func ManagedBootstrapPlanDigestForProtocol(clusterID string, members []quepaxa.Member, physicalBinding, evidenceFormat string, durability ObjectStoreDurability, reconfiguration bool, protocol string) (string, error) {
+	_, window, err := ManagedApplicationPolicy(protocol)
+	if err != nil {
+		return "", err
+	}
+	if protocol == "" {
+		window = 0 // Preserve the original serialized digest byte for byte.
+	}
 	if clusterID == "" || physicalBinding == "" || evidenceFormat == "" {
 		return "", fmt.Errorf("invalid managed bootstrap binding")
 	}
@@ -55,14 +80,41 @@ func ManagedBootstrapPlanDigest(clusterID string, members []quepaxa.Member, phys
 		durability = ObjectStoreDurabilityBeforeAck
 	}
 	data, err := json.Marshal(struct {
-		Version         int
-		ClusterID       string
-		Members         []quepaxa.Member
-		PhysicalBinding string
-		EvidenceFormat  string
-		Durability      ObjectStoreDurability
-		Reconfiguration bool
-	}{1, clusterID, members, physicalBinding, evidenceFormat, durability, reconfiguration})
+		Version             int
+		ClusterID           string
+		Members             []quepaxa.Member
+		PhysicalBinding     string
+		EvidenceFormat      string
+		Durability          ObjectStoreDurability
+		Reconfiguration     bool
+		ApplicationProtocol string `json:",omitempty"`
+		IdempotencyWindow   uint64 `json:",omitempty"`
+	}{1, clusterID, members, physicalBinding, evidenceFormat, durability, reconfiguration, protocol, window})
+	if err != nil {
+		return "", err
+	}
+	return fmt.Sprintf("%x", sha256.Sum256(data)), nil
+}
+
+// ManagedMemberConfigDigest is shared by pure bootstrap binding checks.
+func ManagedMemberConfigDigest(config ExecutionConfig, protocol string) (string, error) {
+	_, window, err := ManagedApplicationPolicy(protocol)
+	if err != nil {
+		return "", err
+	}
+	if protocol == "" {
+		window = 0
+	}
+	data, err := json.Marshal(struct {
+		Cluster             string
+		Node                string
+		Members             []quepaxa.Member
+		Learner             *quepaxa.Member
+		Durability          string
+		Reconfiguration     bool
+		ApplicationProtocol string `json:",omitempty"`
+		IdempotencyWindow   uint64 `json:",omitempty"`
+	}{string(config.ClusterID), string(config.NodeID), config.Members, config.Learner, string(config.ObjStoreDurability), config.EnableReconfiguration, protocol, window})
 	if err != nil {
 		return "", err
 	}

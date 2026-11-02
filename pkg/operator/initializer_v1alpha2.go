@@ -24,16 +24,34 @@ import (
 // may contain credentials: keep its JSON in a private file/Secret, never status
 // or logs. The selected main image must contain /usr/local/bin/rhiza-ha-init.
 type V1Alpha2RuntimeProfile struct {
-	InitImage         string
-	PeerPort          int
-	EvidenceFormat    string
-	Storage           types.ExecutionConfig
-	ProfileSecretName string
+	ApplicationProtocol string `json:",omitempty"`
+	InitImage           string
+	PeerPort            int
+	EvidenceFormat      string
+	Storage             types.ExecutionConfig
+	ProfileSecretName   string
 }
 
 // V1Alpha2ManagedSQLEvidenceFormat is the sole supported reference-host format.
 // The CLI parity test binds it to managedsql without creating an import cycle.
 const V1Alpha2ManagedSQLEvidenceFormat = "rhiza-managed-sql/v1"
+
+const V1Alpha2ManagedSQLKVEvidenceFormat = "rhiza-managed-sql-kv/v1"
+
+// ValidateV1Alpha2ApplicationProfile checks installed capability, not authority.
+func ValidateV1Alpha2ApplicationProfile(protocol, evidenceFormat string) error {
+	if _, _, err := types.ManagedApplicationPolicy(protocol); err != nil {
+		return err
+	}
+	expected := V1Alpha2ManagedSQLEvidenceFormat
+	if protocol != "" {
+		expected = V1Alpha2ManagedSQLKVEvidenceFormat
+	}
+	if evidenceFormat != expected {
+		return fmt.Errorf("managed application evidence profile mismatch")
+	}
+	return nil
+}
 
 func validV1Alpha2ProfileSecretName(name string) bool {
 	if len(name) == 0 || len(name) > 253 {
@@ -119,6 +137,13 @@ func ReconcileV1Alpha2ManagedInitialization(ctx context.Context, kube *Kubernete
 	c, err := DecodeV1Alpha2Cluster(raw)
 	if err != nil {
 		return V1Alpha2StatusSnapshot{}, err
+	}
+	if c.Spec.ApplicationProtocol != profile.ApplicationProtocol {
+		return V1Alpha2StatusSnapshot{}, fmt.Errorf("installed application protocol differs from cluster")
+	}
+	// This phase provides capability binding only, not mixed runtime deployment.
+	if profile.ApplicationProtocol != "" {
+		return V1Alpha2StatusSnapshot{}, fmt.Errorf("mixed managed runtime activation is not supported")
 	}
 	var meta v1alpha2BootstrapMetadata
 	b, _ := json.Marshal(c.Metadata)
@@ -313,8 +338,11 @@ func managedCandidateSpecMatches(raw, expected json.RawMessage) bool {
 func BuildV1Alpha2RuntimePlan(ref V1Alpha2ClusterRef, logicalID, deploymentUID string, profile V1Alpha2RuntimeProfile, members []V1Alpha2BootstrapMember) (V1Alpha2ApplicationInitPlan, V1Alpha2BootstrapPlan, error) {
 	var assignment V1Alpha2ApplicationInitPlan
 	var plan V1Alpha2BootstrapPlan
-	if profile.Storage.AdminToken == "" || profile.EvidenceFormat != V1Alpha2ManagedSQLEvidenceFormat {
-		return assignment, plan, fmt.Errorf("managed SQL requires an admin token and the reference evidence format")
+	if profile.Storage.AdminToken == "" {
+		return assignment, plan, fmt.Errorf("managed application requires an admin token")
+	}
+	if err := ValidateV1Alpha2ApplicationProfile(profile.ApplicationProtocol, profile.EvidenceFormat); err != nil {
+		return assignment, plan, err
 	}
 	if profile.InitImage == "" || profile.PeerPort < 1 || profile.PeerPort > 65535 || profile.EvidenceFormat == "" || profile.Storage.ObjStoreBucket == "" {
 		return assignment, plan, fmt.Errorf("incomplete managed runtime profile")
@@ -366,7 +394,7 @@ func BuildV1Alpha2RuntimePlan(ref V1Alpha2ClusterRef, logicalID, deploymentUID s
 	for _, member := range members {
 		common = append(common, member.Member)
 	}
-	digest, err := types.ManagedBootstrapPlanDigest(string(cluster), common, binding, profile.EvidenceFormat, durability, config.EnableReconfiguration)
+	digest, err := types.ManagedBootstrapPlanDigestForProtocol(string(cluster), common, binding, profile.EvidenceFormat, durability, config.EnableReconfiguration, profile.ApplicationProtocol)
 	if err != nil {
 		return assignment, plan, err
 	}
@@ -374,6 +402,7 @@ func BuildV1Alpha2RuntimePlan(ref V1Alpha2ClusterRef, logicalID, deploymentUID s
 	if err != nil {
 		return assignment, plan, err
 	}
+	assignment.ApplicationProtocol = profile.ApplicationProtocol
 	plan = V1Alpha2BootstrapPlan{ClusterID: cluster, Members: members, PhysicalBinding: binding, EvidenceFormat: profile.EvidenceFormat, Durability: durability, Reconfiguration: config.EnableReconfiguration}
 	return assignment, plan, nil
 }
