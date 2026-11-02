@@ -583,8 +583,11 @@ func (s *managedProviderStatusFixture) ServeHTTP(w http.ResponseWriter, r *http.
 	_ = json.NewEncoder(w).Encode(s.cluster)
 }
 
-func managedProviderStatusStore(t *testing.T, ref operator.V1Alpha2ClusterRef) (*operator.V1Alpha2StatusStore, string) {
+func managedProviderStatusStore(t *testing.T, ref operator.V1Alpha2ClusterRef, protocol ...string) (*operator.V1Alpha2StatusStore, string) {
 	t.Helper()
+	if len(protocol) > 1 || len(protocol) == 1 && protocol[0] != types.ManagedApplicationProtocolSQLKV {
+		t.Fatal("unsupported provider fixture application protocol")
+	}
 	deploymentName, err := operator.V1Alpha2GenesisDeploymentName(ref.UID)
 	if err != nil {
 		t.Fatal(err)
@@ -600,6 +603,9 @@ func managedProviderStatusStore(t *testing.T, ref operator.V1Alpha2ClusterRef) (
 			"apiVersion": "apps/v1", "kind": "Deployment",
 			"metadata": map[string]any{"name": deploymentName, "namespace": ref.Namespace, "uid": "managed-provider-deployment", "resourceVersion": "1", "labels": map[string]string{"rhiza.mrchypark.dev/cluster-uid": ref.UID, "rhiza.mrchypark.dev/generation": "0"}, "ownerReferences": []any{map[string]any{"apiVersion": "rhiza.mrchypark.dev/v1alpha2", "kind": "RhizaCluster", "name": ref.Name, "uid": ref.UID, "controller": true}}},
 		},
+	}
+	if len(protocol) == 1 {
+		fixture.cluster["spec"].(map[string]any)["applicationProtocol"] = protocol[0]
 	}
 	server := httptest.NewTLSServer(fixture)
 	t.Cleanup(server.Close)
