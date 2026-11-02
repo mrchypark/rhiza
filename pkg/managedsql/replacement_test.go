@@ -6,7 +6,6 @@ import (
 	"encoding/json"
 	"errors"
 	"io"
-	"net"
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
@@ -71,7 +70,7 @@ func TestReplaceVoterCoordinatesActualPreparedLearner(t *testing.T) {
 	hosts := make([]*Host, 3)
 	for _, i := range []int{1, 2} {
 		configs[i].Plan = initPlan
-		hosts[i], err = Open(ctx, configs[i])
+		hosts[i], err = seed.open(ctx, configs[i])
 		if hosts[i] != nil {
 			h := hosts[i]
 			t.Cleanup(func() {
@@ -86,14 +85,7 @@ func TestReplaceVoterCoordinatesActualPreparedLearner(t *testing.T) {
 	}
 	configs[0].Plan = initPlan
 	writer, plan := hostRepairWriter(t, configs, hosts)
-	peer, err := net.ListenPacket("udp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatal(err)
-	}
-	peerAddr := peer.LocalAddr().String()
-	if err := peer.Close(); err != nil {
-		t.Fatal(err)
-	}
+	peerAddr := seed.reservePeer(t, plan.Replacement.NodeID)
 	plan.Replacement.PeerURL = "quic://" + peerAddr
 	originalTransport := writer.Kube.Client.Transport
 	var rejectFinish atomic.Bool
@@ -125,7 +117,7 @@ func TestReplaceVoterCoordinatesActualPreparedLearner(t *testing.T) {
 		return repairGateJSON(pod), nil
 	})
 	configs[0].Store = writer
-	hosts[0], err = Open(ctx, configs[0])
+	hosts[0], err = seed.open(ctx, configs[0])
 	if hosts[0] != nil {
 		h := hosts[0]
 		t.Cleanup(func() {
@@ -170,7 +162,7 @@ func TestReplaceVoterCoordinatesActualPreparedLearner(t *testing.T) {
 	if err := hosts[0].Close(); err != nil {
 		t.Fatal(err)
 	}
-	cold, err := Open(ctx, configs[0])
+	cold, err := seed.open(ctx, configs[0])
 	if cold != nil {
 		t.Cleanup(func() {
 			if err := cold.Close(); err != nil {
@@ -275,13 +267,13 @@ func TestReplaceVoterCoordinatesActualPreparedLearner(t *testing.T) {
 	}
 	badHandoffCfg := learnerCfg
 	badHandoffCfg.RepairOrigin = badHandoffBytes
-	if badLearner, err := Open(ctx, badHandoffCfg); err == nil {
+	if badLearner, err := seed.open(ctx, badHandoffCfg); err == nil {
 		_ = badLearner.Close()
 		t.Fatal("prepared adoption accepted an origin whose REMOVE terminal differed from the full live handoff")
 	} else if !strings.Contains(err.Error(), "prepared learner no longer matches the closed repair intent") {
 		t.Fatalf("prepared handoff mismatch failed at an unexpected boundary: %v", err)
 	}
-	learner, err := Open(ctx, learnerCfg)
+	learner, err := seed.open(ctx, learnerCfg)
 	if learner != nil {
 		t.Cleanup(func() {
 			if err := learner.Close(); err != nil {
@@ -338,7 +330,7 @@ func TestReplaceVoterCoordinatesActualPreparedLearner(t *testing.T) {
 	}
 	completedWithoutOrigin := learnerCfg
 	completedWithoutOrigin.RepairOrigin = nil
-	if _, err := Open(ctx, completedWithoutOrigin); err == nil || !strings.Contains(err.Error(), "prepared repair learner requires the exact current closed repair") {
+	if _, err := seed.open(ctx, completedWithoutOrigin); err == nil || !strings.Contains(err.Error(), "prepared repair learner requires the exact current closed repair") {
 		t.Fatalf("completed D record accepted a fresh prepared adoption without its closed origin: %v", err)
 	}
 	if err := hosts[0].RecoverPending(ctx); err != nil {
@@ -353,7 +345,7 @@ func TestReplaceVoterCoordinatesActualPreparedLearner(t *testing.T) {
 	}
 	historicalCfg := learnerCfg
 	historicalCfg.Prepared = nil
-	historical, err := Open(ctx, historicalCfg)
+	historical, err := seed.open(ctx, historicalCfg)
 	if historical != nil {
 		t.Cleanup(func() {
 			if err := historical.Close(); err != nil {
@@ -388,14 +380,7 @@ func TestReplaceVoterCoordinatesActualPreparedLearner(t *testing.T) {
 	}
 	eToken := "replacement-e-token"
 	eKey := quepaxa.PublicKey(network.PeerPublicKey(rolloverRuntime.ClusterID, eNodeID, eToken))
-	eConn, err := net.ListenPacket("udp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatal(err)
-	}
-	eAddr := eConn.LocalAddr().String()
-	if err := eConn.Close(); err != nil {
-		t.Fatal(err)
-	}
+	eAddr := seed.reservePeer(t, eNodeID)
 	ePeerURL := "quic://" + eAddr
 	eIdentityMessage, _ := json.Marshal(map[string]any{"version": 1, "publicKey": eKey})
 	baseTransport := writer.Kube.Client.Transport
@@ -453,7 +438,7 @@ func TestReplaceVoterCoordinatesActualPreparedLearner(t *testing.T) {
 		t.Fatalf("roll current repair record from D to E: observation=%s err=%v", observation, err)
 	}
 	eClosedVersion := eClosed.ResourceVersion()
-	historicalE, err := Open(ctx, historicalCfg)
+	historicalE, err := seed.open(ctx, historicalCfg)
 	if historicalE != nil {
 		t.Cleanup(func() {
 			if err := historicalE.Close(); err != nil {

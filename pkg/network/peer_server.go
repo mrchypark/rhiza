@@ -19,6 +19,7 @@ import (
 	"time"
 
 	"github.com/mrchypark/rhiza/internal/localtesthooks"
+	"github.com/mrchypark/rhiza/internal/peertest"
 	"github.com/mrchypark/rhiza/internal/types"
 	"github.com/mrchypark/rhiza/pkg/network/peerfb"
 	"github.com/mrchypark/rhiza/pkg/quepaxa"
@@ -56,6 +57,13 @@ func StartPeerServer(ctx context.Context, addr string, server *Server, members [
 }
 
 func startPeerServerOnAddr(ctx context.Context, addr string, server *Server, members []quepaxa.Member, peerToken, adminToken string, promotionReady <-chan struct{}) (*PeerServer, error) {
+	borrowed, present, err := peertest.Transport(ctx, string(server.cluster), string(server.core.NodeID()), addr)
+	if err != nil {
+		return nil, err
+	}
+	if present {
+		return startPeerServer(ctx, server, members, peerToken, adminToken, promotionReady, borrowed.ListenEarly)
+	}
 	var conn net.PacketConn
 	var transport *quic.Transport
 	peer, err := startPeerServer(ctx, server, members, peerToken, adminToken, promotionReady, func(tlsConfig *tls.Config, config *quic.Config) (*quic.EarlyListener, error) {
