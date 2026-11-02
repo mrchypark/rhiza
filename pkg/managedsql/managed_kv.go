@@ -266,7 +266,9 @@ func (h *Host) KVMutate(ctx context.Context, operation string, req network.KVMut
 			return notSubmitted(SQLStageAdmission, false, err)
 		}
 		response, err := h.node.ExecuteManagedKV(ctx, original.Operation, kvRequest(original))
-		h.rememberRequestOutcome("kv", original.RequestID, err)
+		p := applicationOriginal{kind: "kv", kv: original}
+		err = internalRequestOutcome(p, response.MutationReceipt, err)
+		h.rememberRequestOutcome(p, err)
 		return response, err
 	}
 	a, err := h.live(ctx)
@@ -559,8 +561,11 @@ func (h *Host) RecoverPendingDetailed(ctx context.Context) (RecoveryResult, erro
 		if h.recoveryTargetOverflow || len(h.recoveryTargets) != 1 {
 			return RecoveryResult{}, &network.CommitUnknownError{Cause: fmt.Errorf("exact recovery target required or ambiguous")}
 		}
-		for selector := range h.recoveryTargets {
-			return h.recoverRequestLocked(ctx, selector)
+		for selector, hint := range h.recoveryTargets {
+			if hint.ambiguous {
+				return RecoveryResult{}, &network.CommitUnknownError{Cause: fmt.Errorf("recovery target intent is ambiguous")}
+			}
+			return h.recoverRequestLocked(ctx, selector, &hint.fingerprint)
 		}
 		return RecoveryResult{}, &network.CommitUnknownError{Cause: fmt.Errorf("exact recovery target required")}
 	}

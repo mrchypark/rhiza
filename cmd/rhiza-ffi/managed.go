@@ -8,6 +8,7 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"errors"
+	"io"
 	"math"
 	"os"
 	"sync"
@@ -226,17 +227,45 @@ func decodeManagedRequestSelector(raw json.RawMessage, allowEmpty bool) (*networ
 		Kind      *string `json:"kind"`
 		RequestID *string `json:"request_id_b64"`
 	}
-	if decodeStrict(raw, &wire) != nil || bytes.Equal(bytes.TrimSpace(raw), []byte("null")) {
+	decoder := json.NewDecoder(bytes.NewReader(raw))
+	first, err := decoder.Token()
+	if err != nil || first != json.Delim('{') {
 		return nil, invalidManagedKVRequest()
 	}
-	var fields map[string]json.RawMessage
-	if json.Unmarshal(raw, &fields) != nil {
+	var seen uint8
+	for decoder.More() {
+		token, err := decoder.Token()
+		key, ok := token.(string)
+		if err != nil || !ok {
+			return nil, invalidManagedKVRequest()
+		}
+		var bit uint8
+		var target **string
+		switch key {
+		case "kind":
+			bit, target = 1, &wire.Kind
+		case "request_id_b64":
+			bit, target = 2, &wire.RequestID
+		default:
+			return nil, invalidManagedKVRequest()
+		}
+		if seen&bit != 0 || decoder.Decode(target) != nil {
+			return nil, invalidManagedKVRequest()
+		}
+		seen |= bit
+	}
+	last, err := decoder.Token()
+	if err != nil || last != json.Delim('}') {
 		return nil, invalidManagedKVRequest()
 	}
-	if len(fields) == 0 && allowEmpty {
+	var trailing any
+	if decoder.Decode(&trailing) != io.EOF {
+		return nil, invalidManagedKVRequest()
+	}
+	if seen == 0 && allowEmpty {
 		return nil, nil
 	}
-	if wire.Kind == nil || (*wire.Kind != "sql" && *wire.Kind != "kv") {
+	if seen != 3 || wire.Kind == nil || (*wire.Kind != "sql" && *wire.Kind != "kv") {
 		return nil, invalidManagedKVRequest()
 	}
 	id, err := managedRawBytes(wire.RequestID, 64)

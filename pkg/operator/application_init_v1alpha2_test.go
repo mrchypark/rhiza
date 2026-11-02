@@ -9,9 +9,31 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/mrchypark/rhiza/internal/sqlpolicy"
 	"github.com/mrchypark/rhiza/internal/types"
 	"github.com/mrchypark/rhiza/pkg/network"
 )
+
+func TestApplicationInitExplicitProtocolBoundary(t *testing.T) {
+	for _, protocol := range []string{"", types.ManagedApplicationProtocolSQLKV, sqlpolicy.ManagedRequestApplicationProtocol, "rhiza-managed-request/v2", "rhiza-managed-graph/v1", "unknown"} {
+		p := initTestPlan(t)
+		p.ApplicationProtocol = protocol
+		if protocol != "" {
+			p.EvidenceFormat = protocol
+		}
+		g := v1alpha2Genesis{OwnerUID: p.ClusterUID, DeploymentUID: p.DeploymentUID, StorageID: p.StorageID, IntentHash: p.IntentHash}
+		valid := protocol == "" || protocol == types.ManagedApplicationProtocolSQLKV || protocol == sqlpolicy.ManagedRequestApplicationProtocol
+		if err := validateV1Alpha2ApplicationInitPlan(p, phase2Ref, g); (err == nil) != valid {
+			t.Fatalf("protocol=%q valid=%t error=%v", protocol, valid, err)
+		}
+		if valid && protocol != "" {
+			p.EvidenceFormat = V1Alpha2ManagedSQLEvidenceFormat
+			if err := ValidateV1Alpha2ApplicationProfile(protocol, p.EvidenceFormat); err == nil {
+				t.Fatal("nonlegacy protocol accepted legacy evidence marker")
+			}
+		}
+	}
+}
 
 func initTestPlan(t *testing.T) V1Alpha2ApplicationInitPlan {
 	t.Helper()

@@ -78,7 +78,7 @@ var v1alpha2Name = regexp.MustCompile(`^[a-z0-9]([-a-z0-9]*[a-z0-9])?(\.[a-z0-9]
 var v1alpha2NonBlank = regexp.MustCompile(`[^\t\n\v\f\r \x{0085}\x{00A0}\x{1680}\x{2000}-\x{200A}\x{2028}\x{2029}\x{202F}\x{205F}\x{3000}]`)
 
 func ValidateV1Alpha2Cluster(c V1Alpha2Cluster) error {
-	if c.Spec.ApplicationProtocol != "" && c.Spec.ApplicationProtocol != types.ManagedApplicationProtocolSQLKV {
+	if _, _, err := types.ManagedApplicationPolicy(c.Spec.ApplicationProtocol); err != nil {
 		return fmt.Errorf("unsupported application protocol")
 	}
 	if c.Spec.ApplicationProtocol != "" && (c.Spec.GenesisIntent == nil || *c.Spec.GenesisIntent != "Create") {

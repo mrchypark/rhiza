@@ -72,7 +72,7 @@ func managedKVTransportEndpoint(t *testing.T, alpn string) (quepaxa.Member, <-ch
 }
 
 func TestManagedKVTransportPolicy(t *testing.T) {
-	for _, bad := range []sqlpolicy.MaterializationPolicy{0, -1, 9} {
+	for _, bad := range []sqlpolicy.MaterializationPolicy{0, -1, 999} {
 		if got, err := NewTransportForPolicy("cluster", "a", nil, "", bad); got != nil || !errors.Is(err, sqlpolicy.ErrIncompatible) {
 			t.Fatal("unknown transport profile", got, err)
 		}
@@ -81,6 +81,15 @@ func TestManagedKVTransportPolicy(t *testing.T) {
 		}
 	}
 	config := quepaxa.Cluster{ConfigID: 1}
+	requestConfig := quepaxa.Cluster{ConfigID: 1, Members: []quepaxa.Member{testMember("cluster", "a", "a-token")}}
+	request, err := NewTransportForPolicy("cluster", "a", &requestConfig, "a-token", sqlpolicy.ManagedRequestMaterializationPolicy)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer request.Close()
+	if request.expectedPolicy != sqlpolicy.ManagedRequestMaterializationPolicy || len(request.tls.NextProtos) != 1 || request.tls.NextProtos[0] != managedRequestPeerALPN || request.tls.MinVersion != tls.VersionTLS13 {
+		t.Fatal("supported request profile or ALPN was not selected")
+	}
 	legacy := NewTransport("cluster", "a", &config, "")
 	defer legacy.Close()
 	if legacy.expectedPolicy != 7 || len(legacy.tls.NextProtos) != 1 || legacy.tls.NextProtos[0] != peerALPN {

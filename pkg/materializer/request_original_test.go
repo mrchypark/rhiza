@@ -5,8 +5,10 @@ import (
 	"context"
 	"errors"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/mrchypark/rhiza/internal/sqlpolicy"
 	"github.com/mrchypark/rhiza/internal/types"
@@ -123,7 +125,7 @@ func TestRequestOriginalFirstEffectAndResult(t *testing.T) {
 func TestRequestOriginalCheckpointReplayAndReopen(t *testing.T) {
 	ctx := context.Background()
 	m := requestMaterializer(t)
-	requestKV(t, m, 1, types.KVCommand{RequestID: "before", Key: "key", Operation: "put", Value: []byte("before")})
+	requestKV(t, m, 1, types.KVCommand{RequestID: "before", Key: "key", Operation: "put", Value: []byte("before"), TTLMS: 1000, ObservedAtUnixMS: 10, ExpiresAtUnixMS: 1010})
 	files, tip, cleanup, err := m.CheckpointFilesAt(ctx)
 	if err != nil {
 		t.Fatal(err)
@@ -140,7 +142,9 @@ func TestRequestOriginalCheckpointReplayAndReopen(t *testing.T) {
 		t.Fatal("checkpoint lost original")
 	}
 	// This is an actual same-slot suffix Apply, not a replacement proposal.
-	requestKV(t, n, 2, types.KVCommand{RequestID: "suffix", Key: "key", Operation: "cas", Expected: []byte("wrong"), ExpectedExists: true, Value: []byte("after"), ObservedAtUnixMS: 20})
+	suffix := types.KVCommand{RequestID: "suffix", Key: "key", Operation: "cas", Expected: []byte("wrong"), ExpectedExists: true, Value: []byte("after"), ObservedAtUnixMS: 20}
+	requestKV(t, n, 2, suffix)
+	requestKV(t, m, 2, suffix)
 	if got := retainedOriginal(t, n, types.MutationKV, "suffix"); got.Receipt.Applied || got.Slot != 2 {
 		t.Fatal("suffix false CAS changed")
 	}
@@ -159,17 +163,48 @@ func TestRequestOriginalCheckpointReplayAndReopen(t *testing.T) {
 	if got := retainedOriginal(t, reopened, types.MutationKV, "suffix"); got.KV.ObservedAtUnixMS != 20 || got.Receipt.Applied {
 		t.Fatal("reopen changed metadata/result")
 	}
+	for _, id := range []string{"before", "suffix"} {
+		if !reflect.DeepEqual(retainedOriginal(t, m, types.MutationKV, id), retainedOriginal(t, reopened, types.MutationKV, id)) {
+			t.Fatalf("whole replay and checkpoint/suffix/reopen original differ: %s", id)
+		}
+	}
+	whole, err := m.InspectManagedApplicationState(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	restored, err := reopened.InspectManagedApplicationState(ctx)
+	if err != nil || whole != restored {
+		t.Fatalf("whole replay and restored evidence differ: %v", err)
+	}
 }
 
 func TestRequestOriginalLogicalAndPhysicalPruning(t *testing.T) {
 	m := requestMaterializer(t)
 	requestKV(t, m, 1, types.KVCommand{RequestID: "expired", Key: "key", Operation: "put", Value: []byte("value")})
 	var controls []quepaxa.DecidedValue
-	for slot := 2; slot <= 1026; slot++ {
+	for slot := 2; slot <= 1024; slot++ {
 		controls = append(controls, quepaxa.DecidedValue{Slot: quepaxa.Slot(slot), Value: types.EncodeReadBarrier([types.ReadBarrierNonceSize]byte{})})
 	}
 	if err := m.ApplyBatch(context.Background(), controls); err != nil {
 		t.Fatal(err)
+	}
+	boundary := retainedOriginal(t, m, types.MutationKV, "expired")
+	if boundary.Slot != 1 || boundary.Receipt.RetryThroughSlot != 1024 {
+		t.Fatal("original expired before its inclusive retained-window end")
+	}
+	if receipt, found, matches, err := m.KVRequestStatusFingerprint(context.Background(), "expired", boundary.Fingerprint); err != nil || !found || !matches || receipt != boundary.Receipt {
+		t.Fatalf("receipt missing at inclusive retained-window end: found=%t matches=%t error=%v", found, matches, err)
+	}
+	for slot := uint64(1025); slot <= 1026; slot++ {
+		if err := m.Apply(context.Background(), slot, types.EncodeReadBarrier([types.ReadBarrierNonceSize]byte{})); err != nil {
+			t.Fatal(err)
+		}
+		if _, found, err := m.RetainedRequestOriginal(context.Background(), types.MutationKV, "expired"); err != nil || found {
+			t.Fatalf("original remains visible immediately after slot %d: found=%t error=%v", slot, found, err)
+		}
+		if _, found, _, err := m.KVRequestStatusFingerprint(context.Background(), "expired", boundary.Fingerprint); err != nil || found {
+			t.Fatalf("receipt remains visible immediately after slot %d: found=%t error=%v", slot, found, err)
+		}
 	}
 	if _, found, err := m.RetainedRequestOriginal(context.Background(), types.MutationKV, "expired"); err != nil || found {
 		t.Fatalf("logical expiry revived result: %v %v", found, err)
@@ -193,6 +228,53 @@ func TestRequestOriginalLogicalAndPhysicalPruning(t *testing.T) {
 	requestKV(t, m, 1027, types.KVCommand{RequestID: "next", Key: "key", Operation: "delete"})
 	if err := m.writer.QueryRow(`SELECT COUNT(*) FROM _rhiza_request_original WHERE request_id='expired'`).Scan(&count); err != nil || count != 0 {
 		t.Fatal("original not pruned with receipt")
+	}
+	if _, err := m.InspectManagedApplicationState(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestRequestOriginalConflictingItemKeepsActualBatchOrdinal(t *testing.T) {
+	m := requestMaterializer(t)
+	requestSQL(t, m, 1, types.SQLCommand{RequestID: "schema", SQL: `CREATE TABLE batch_item(v INTEGER)`})
+	a := types.SQLCommand{RequestID: "A", SQL: `INSERT INTO batch_item VALUES(1)`}
+	conflict := types.SQLCommand{RequestID: "A", SQL: `DELETE FROM batch_item`}
+	b := types.SQLCommand{RequestID: "B", SQL: `INSERT INTO batch_item VALUES(2)`}
+	requestSQL(t, m, 2, a, conflict, b)
+	for _, tc := range []struct {
+		command types.SQLCommand
+		index   uint32
+	}{{a, 0}, {b, 2}} {
+		got := retainedOriginal(t, m, types.MutationSQL, tc.command.RequestID)
+		want, err := types.EncodeSQLBatchItem(tc.command)
+		if err != nil || got.Slot != 2 || got.BatchIndex != tc.index || !bytes.Equal(got.ExecutionItem, want) || got.Receipt.Status != types.MutationCommitted {
+			t.Fatalf("certified item ordinal/original changed: index=%d error=%v", tc.index, err)
+		}
+	}
+	var count, sum int
+	if err := m.writer.QueryRow(`SELECT COUNT(*),SUM(v) FROM batch_item`).Scan(&count, &sum); err != nil || count != 2 || sum != 3 {
+		t.Fatalf("conflicting item changed effects or stopped B: count=%d sum=%d error=%v", count, sum, err)
+	}
+	ka := types.KVCommand{RequestID: "KA", Operation: "put", Key: "first", Value: []byte("A"), TTLMS: 100, ObservedAtUnixMS: 10, ExpiresAtUnixMS: 110}
+	kconflict := ka
+	kconflict.Key, kconflict.Value, kconflict.ObservedAtUnixMS, kconflict.ExpiresAtUnixMS = "forbidden", []byte("changed"), 20, 120
+	kb := types.KVCommand{RequestID: "KB", Operation: "put", Key: "second", Value: []byte("B")}
+	requestKV(t, m, 3, ka, kconflict, kb)
+	for _, tc := range []struct {
+		command types.KVCommand
+		index   uint32
+	}{{ka, 0}, {kb, 2}} {
+		got := retainedOriginal(t, m, types.MutationKV, tc.command.RequestID)
+		want, err := types.EncodeManagedKVBatchItem(tc.command)
+		if err != nil || got.Slot != 3 || got.BatchIndex != tc.index || !bytes.Equal(got.ExecutionItem, want) || !got.Receipt.Applied {
+			t.Fatalf("certified KV ordinal/first metadata changed: index=%d error=%v", tc.index, err)
+		}
+	}
+	if value, found, err := m.KVGet(context.Background(), "first", time.UnixMilli(20)); err != nil || !found || string(value) != "A" {
+		t.Fatalf("first KV effect changed: found=%t error=%v", found, err)
+	}
+	if _, found, err := m.KVGet(context.Background(), "forbidden", time.UnixMilli(20)); err != nil || found {
+		t.Fatalf("conflicting KV effect executed: found=%t error=%v", found, err)
 	}
 	if _, err := m.InspectManagedApplicationState(context.Background()); err != nil {
 		t.Fatal(err)

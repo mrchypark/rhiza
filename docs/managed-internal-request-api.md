@@ -14,13 +14,24 @@ Missing/expired original and lookup uncertainty remain UNKNOWN, not no-effect.
 
 Profile9 `RecoverPendingDetailed` / Rust `recover_pending` are no-argument
 compatibility facades over this handle's known error target. Exactly one known
-selector may resolve; unknown or ambiguous target returns UNKNOWN, never a
+selector and owned attempted-intent fingerprint may resolve; unknown or ambiguous target returns UNKNOWN, never a
 success `none` or an arbitrarily latest retained request. Independent successful
 Y does not replace lost-response X. RAM selectors disappear on process restart
 and are not execution authority or durable discovery. Once more than two
 different uncertain targets overflow bounded hint storage, no-arg recovery
 remains ambiguous for this handle; use explicit selectors. Runtime poison still
 blocks requests; a request-specific lost ACK does not globally poison the Host.
+
+The no-arg facade must compare the attempted fingerprint with the engine's
+canonical original. A slot-zero UNKNOWN for intent A must not resolve as a
+different intent B that won under the same kind/ID. Two different UNKNOWN
+intents on one selector remain ambiguous. Fingerprint-equivalent nil/empty
+representations remain eligible; a duplicate submit slot is not required to
+equal the canonical first slot. Explicit `recover_request(kind, ID)` observes
+the canonical owner, not an old attempted payload, and does not clear an
+incompatible no-arg hint. CommitUnknown errors from SQL/KV preserve the existing
+mutation-context kind/raw ID/known slot/retry/cause chain; validation, admission
+and intent-conflict errors are not reclassified as CommitUnknown.
 
 The existing C ABI operation `recover_pending_detailed` accepts either `{}` or
 the exact pair `{"kind":"kv","request_id_b64":"/w=="}`. Half-pairs, null,

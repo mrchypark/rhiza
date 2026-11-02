@@ -14,11 +14,61 @@ import (
 	"testing"
 
 	objectstore "github.com/mrchypark/rhiza/internal/objstore"
+	"github.com/mrchypark/rhiza/internal/sqlpolicy"
 	"github.com/mrchypark/rhiza/internal/types"
 	"github.com/mrchypark/rhiza/pkg/network"
 	"github.com/mrchypark/rhiza/pkg/quepaxa"
 	"gopkg.in/yaml.v3"
 )
+
+func TestManagedApplicationExplicitProfileLoaders(t *testing.T) {
+	for _, protocol := range []string{types.ManagedApplicationProtocolSQLKV, sqlpolicy.ManagedRequestApplicationProtocol} {
+		t.Run(protocol, func(t *testing.T) {
+			cluster := strings.Replace(phase8Cluster, `"genesisIntent":"Create"`, `"genesisIntent":"Create","applicationProtocol":"`+protocol+`"`, 1)
+			server, store, name := phase8Setup(t, cluster, "")
+			bootstrap := initTestBootstrap(t)
+			bootstrap.EvidenceFormat = protocol
+			members := make([]quepaxa.Member, len(bootstrap.Members))
+			for i, member := range bootstrap.Members {
+				members[i] = member.Member
+			}
+			digest, err := types.ManagedBootstrapPlanDigestForProtocol(string(bootstrap.ClusterID), members, bootstrap.PhysicalBinding, protocol, bootstrap.Durability, bootstrap.Reconfiguration, protocol)
+			if err != nil {
+				t.Fatal(err)
+			}
+			plan, err := NewV1Alpha2ApplicationInitPlan(phase2Ref, "logical", "deployment", "assignment", bootstrap.PhysicalBinding, digest, protocol)
+			if err != nil {
+				t.Fatal(err)
+			}
+			plan.ApplicationProtocol = protocol
+			ctx := context.Background()
+			if _, err := InitializeV1Alpha2AuthorityWithBootstrap(ctx, store, phase2Ref, name, plan, bootstrap); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := LoadV1Alpha2ApplicationInit(ctx, store, phase2Ref); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := LoadV1Alpha2Admission(ctx, store, phase2Ref); err != nil {
+				t.Fatal(err)
+			}
+			// Changing only the spec marker cannot relabel the bound plan.
+			other := types.ManagedApplicationProtocolSQLKV
+			if protocol == other {
+				other = sqlpolicy.ManagedRequestApplicationProtocol
+			}
+			server.cluster = strings.Replace(server.cluster, `"applicationProtocol":"`+protocol+`"`, `"applicationProtocol":"`+other+`"`, 1)
+			if _, err := LoadV1Alpha2ApplicationInit(ctx, store, phase2Ref); err == nil {
+				t.Fatal("mismatched spec/assignment profile accepted")
+			}
+		})
+	}
+	for _, raw := range []string{`null`, `""`, `"unknown"`, `"rhiza-managed-graph/v1"`, `"rhiza-managed-request/v2"`} {
+		obj := map[string]json.RawMessage{"spec": json.RawMessage(`{"applicationProtocol":` + raw + `}`)}
+		if _, err := mixedApplicationProtocol(obj); err == nil {
+			t.Fatalf("unsupported explicit profile %s accepted", raw)
+		}
+	}
+}
 
 func TestManagedMixedProfileCELReservationSelectors(t *testing.T) {
 	raw, err := os.ReadFile("../../deploy/operator/cluster-crd.yaml")

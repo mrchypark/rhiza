@@ -15,7 +15,7 @@ import (
 )
 
 func TestManagedKVProfileConstructorRefusal(t *testing.T) {
-	for _, bad := range []sqlpolicy.MaterializationPolicy{0, -1, 9} {
+	for _, bad := range []sqlpolicy.MaterializationPolicy{0, -1, 999} {
 		if s, err := NewServerForPolicy(nil, nil, "cluster", false, nil, bad); s != nil || !errors.Is(err, sqlpolicy.ErrIncompatible) {
 			t.Fatal("unknown profile", s, err)
 		}
@@ -45,12 +45,15 @@ func TestManagedKVProfileConstructorRefusal(t *testing.T) {
 }
 
 func TestManagedKVProfileProductionPeer(t *testing.T) {
-	for _, policy := range []sqlpolicy.MaterializationPolicy{7, 8} {
+	for _, policy := range []sqlpolicy.MaterializationPolicy{7, 8, sqlpolicy.ManagedRequestMaterializationPolicy} {
 		member := testMember("cluster", "n1", "token")
 		core := mustCore(t, "n1", []quepaxa.Member{member}, nil, nil)
 		s, err := NewServerForPolicy(core, nil, "cluster", true, nil, policy)
 		if err != nil {
 			t.Fatal(err)
+		}
+		if s.expectedPolicy != policy {
+			t.Fatal("production peer selected a different policy")
 		}
 		t.Cleanup(s.Close)
 		peer, err := StartPeerServer(context.Background(), "127.0.0.1:0", s, []quepaxa.Member{member}, "token", "admin")
@@ -71,7 +74,7 @@ func TestManagedKVProfileProductionPeer(t *testing.T) {
 			t.Fatal("matching production peer failed", err)
 		}
 		cancel()
-		if policy == 8 {
+		if managedKVExecutionPolicy(policy) {
 			legacy, _ := types.EncodeKVCommand(types.KVCommand{RequestID: "i", Operation: "put", Key: "k"})
 			legacyItem, _ := types.EncodeKVBatchItem(types.KVCommand{RequestID: "i", Operation: "put", Key: "k"})
 			graph, _ := types.EncodeGraphBatch([]types.GraphCommand{{RequestID: "g", Cypher: "RETURN 1"}})
@@ -111,7 +114,10 @@ func TestManagedKVProfileProductionPeer(t *testing.T) {
 				t.Fatal("valid mixed staged value rejected or advanced history", err)
 			}
 		}
-		other := sqlpolicy.MaterializationPolicy(15 - int(policy))
+		other := sqlpolicy.LegacyMaterializationPolicy
+		if policy == sqlpolicy.LegacyMaterializationPolicy {
+			other = sqlpolicy.ManagedSQLKVMaterializationPolicy
+		}
 		wrong, err := NewTransportForPolicy("cluster", "n1", &config, "token", other)
 		if err != nil {
 			t.Fatal(err)

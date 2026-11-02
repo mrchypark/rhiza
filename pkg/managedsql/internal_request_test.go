@@ -14,26 +14,146 @@ import (
 	"github.com/mrchypark/rhiza/internal/types"
 	"github.com/mrchypark/rhiza/pkg/network"
 	"github.com/mrchypark/rhiza/pkg/operator"
+	"github.com/mrchypark/rhiza/pkg/quepaxa"
 )
+
+func testHintOriginal(kind, id string) applicationOriginal {
+	if kind == "kv" {
+		return applicationOriginal{kind: kind, kv: types.KVCommand{RequestID: id, Operation: "put", Key: "key"}}
+	}
+	return applicationOriginal{kind: kind, sql: ExecuteRequest{RequestID: id, SQL: "SELECT 1"}}
+}
+
+func TestInternalRequestUnknownContextPreservesOriginal(t *testing.T) {
+	for _, kind := range []string{"sql", "kv"} {
+		for _, slot := range []uint64{0, 17} {
+			for _, id := range []string{"\xff", "\xfe", "\ufffd"} {
+				p := testHintOriginal(kind, id)
+				cause := &network.CommitUnknownError{RequestID: p.rawID(), Slot: quepaxa.Slot(slot), RetryThroughSlot: 65552, Cause: context.Canceled}
+				err := internalRequestOutcome(p, types.MutationReceipt{}, cause)
+				metadata, ok := MutationErrorContext(err)
+				if !ok || metadata.Kind != kind || string(metadata.RequestID) != p.rawID() || metadata.Slot != slot || metadata.RetryThroughSlot != 65552 || !errors.Is(err, context.Canceled) || !errors.Is(err, network.ErrCommitUnknown) {
+					t.Fatalf("kind=%s slot=%d lost mutation context: %+v %v", kind, slot, metadata, err)
+				}
+			}
+		}
+	}
+	for _, err := range []error{nil, context.Canceled, network.ErrInvalidRequest, network.ErrRequestConflict, &SQLNotSubmittedError{Stage: SQLStageAdmission, Cause: network.ErrNotReady}} {
+		if got := internalRequestOutcome(testHintOriginal("sql", "x"), types.MutationReceipt{}, err); got != err {
+			t.Fatal("non-UNKNOWN error was reclassified")
+		}
+	}
+}
+
+func TestInternalRequestSameSelectorConflictingUnknownIsAmbiguous(t *testing.T) {
+	h := &Host{cfg: Config{Plan: operator.V1Alpha2ApplicationInitPlan{ApplicationProtocol: sqlpolicy.ManagedRequestApplicationProtocol}}}
+	a := testHintOriginal("sql", "same")
+	b := a
+	b.sql.SQL = "SELECT 2"
+	h.rememberRequestOutcome(a, &network.CommitUnknownError{RequestID: "same", Cause: context.Canceled})
+	h.rememberRequestOutcome(b, &network.CommitUnknownError{RequestID: "same", Cause: context.Canceled})
+	if len(h.recoveryTargets) != 1 {
+		t.Fatal("same selector changed key count")
+	}
+	if _, err := h.RecoverPendingDetailed(context.Background()); !errors.Is(err, network.ErrCommitUnknown) {
+		t.Fatal("conflicting intents picked an arbitrary one", err)
+	}
+	h.rememberRequestOutcome(b, nil)
+	if len(h.recoveryTargets) != 1 {
+		t.Fatal("success for B erased ambiguity about A")
+	}
+}
+
+func TestInternalRequestInvalidFingerprintNonUnknownPreservesHint(t *testing.T) {
+	h := &Host{}
+	p := testHintOriginal("sql", "X")
+	h.rememberRequestOutcome(p, &network.CommitUnknownError{RequestID: "X", Cause: context.Canceled})
+	selector := network.RequestStatusRequest{Kind: "sql", RequestID: "X"}
+	before := h.recoveryTargets[selector]
+	invalid := testHintOriginal("sql", "invalid")
+	invalid.sql.Args = []any{func() {}}
+	if _, err := originalFingerprint(invalid); err == nil {
+		t.Fatal("fixture fingerprint unexpectedly encodes function")
+	}
+	for _, err := range []error{network.ErrInvalidRequest, network.ErrRequestConflict, &SQLNotSubmittedError{Stage: SQLStageAdmission, Cause: network.ErrNotReady}} {
+		h.rememberRequestOutcome(invalid, err)
+		if h.recoveryTargetOverflow || len(h.recoveryTargets) != 1 || h.recoveryTargets[selector] != before {
+			t.Fatal("non-UNKNOWN invalid input changed existing hint")
+		}
+	}
+}
+
+func TestInternalRequestHintIntentMustMatchCanonicalOwner(t *testing.T) {
+	var outage atomic.Bool
+	var attempts atomic.Int64
+	configs, hosts, _ := openInternalRequestHosts(t, &outage, &attempts)
+	ctx, cancel := context.WithTimeout(context.Background(), 25*time.Second)
+	defer cancel()
+	for _, h := range hosts {
+		awaitPublicInternalReady(t, ctx, h)
+	}
+	a := applicationOriginal{kind: "sql", sql: ExecuteRequest{RequestID: "contested", SQL: "CREATE TABLE attempted_a(n INTEGER)"}}
+	hosts[0].mu.Lock()
+	hosts[0].rememberRequestOutcome(a, &network.CommitUnknownError{RequestID: a.rawID(), Cause: context.Canceled})
+	hosts[0].mu.Unlock()
+	b, err := hosts[1].Execute(ctx, ExecuteRequest{RequestID: "contested", SQL: "CREATE TABLE canonical_b(n INTEGER)"})
+	if err != nil || b.Status != types.MutationCommitted {
+		t.Fatal("canonical B", err)
+	}
+	before := hostApplicationDecisionCount(t, ctx, configs[0], sqlpolicy.ManagedRequestMaterializationPolicy)
+	got, err := hosts[0].RecoverPendingDetailed(ctx)
+	if !errors.Is(err, network.ErrCommitUnknown) || got.SQL != nil || got.KV != nil {
+		t.Fatalf("A hint falsely recovered B: %+v %v", got, err)
+	}
+	explicit, err := hosts[0].RecoverRequest(ctx, network.RequestStatusRequest{Kind: "sql", RequestID: "contested"})
+	if err != nil || explicit.SQL == nil || explicit.SQL.Slot != b.Slot {
+		t.Fatal("explicit canonical selector was changed", err)
+	}
+	if _, err := hosts[0].RecoverPendingDetailed(ctx); !errors.Is(err, network.ErrCommitUnknown) {
+		t.Fatal("explicit B resolution erased A's incompatible hint", err)
+	}
+	if after := hostApplicationDecisionCount(t, ctx, configs[0], sqlpolicy.ManagedRequestMaterializationPolicy); after != before {
+		t.Fatal("intent checking/recovery submitted application command")
+	}
+	// Fingerprint-equivalent nil/empty intent is allowed; neither a duplicate
+	// submit slot nor caller representation replaces the canonical original.
+	request := network.KVMutationRequest{RequestID: "equivalent", Key: "key", Value: []byte{}, Expected: []byte{}}
+	canonical, err := hosts[1].KVMutate(ctx, "put", request)
+	if err != nil || !canonical.Applied {
+		t.Fatal("canonical empty KV", err)
+	}
+	p := applicationOriginal{kind: "kv", kv: types.KVCommand{RequestID: request.RequestID, Operation: "put", Key: request.Key}}
+	hosts[2].mu.Lock()
+	hosts[2].rememberRequestOutcome(p, &network.CommitUnknownError{RequestID: p.rawID(), Slot: quepaxa.Slot(canonical.Slot + 100), Cause: context.Canceled})
+	hosts[2].mu.Unlock()
+	before = hostApplicationDecisionCount(t, ctx, configs[0], sqlpolicy.ManagedRequestMaterializationPolicy)
+	recovered, err := hosts[2].RecoverPendingDetailed(ctx)
+	if err != nil || recovered.KV == nil || recovered.KV.Slot != canonical.Slot {
+		t.Fatalf("equivalent intent or noncanonical submit slot rejected: %+v %v", recovered, err)
+	}
+	if after := hostApplicationDecisionCount(t, ctx, configs[0], sqlpolicy.ManagedRequestMaterializationPolicy); after != before {
+		t.Fatal("equivalent recovery submitted another command")
+	}
+}
 
 func TestInternalRequestHintsDoNotSelectLatestOrPoisonRuntime(t *testing.T) {
 	h := &Host{}
 	x := network.RequestStatusRequest{Kind: "sql", RequestID: "X"}
 	y := network.RequestStatusRequest{Kind: "kv", RequestID: "\xff"}
-	h.rememberRequestOutcome(x.Kind, x.RequestID, &network.CommitUnknownError{RequestID: x.RequestID, Cause: context.DeadlineExceeded})
-	h.rememberRequestOutcome(y.Kind, y.RequestID, nil)
+	h.rememberRequestOutcome(testHintOriginal(x.Kind, x.RequestID), &network.CommitUnknownError{RequestID: x.RequestID, Cause: context.DeadlineExceeded})
+	h.rememberRequestOutcome(testHintOriginal(y.Kind, y.RequestID), nil)
 	if _, ok := h.recoveryTargets[x]; !ok || len(h.recoveryTargets) != 1 || h.uncertain.Load() {
 		t.Fatal("independent successful Y must not erase X or poison runtime")
 	}
-	h.rememberRequestOutcome(y.Kind, y.RequestID, &network.CommitUnknownError{RequestID: y.RequestID, Cause: context.Canceled})
+	h.rememberRequestOutcome(testHintOriginal(y.Kind, y.RequestID), &network.CommitUnknownError{RequestID: y.RequestID, Cause: context.Canceled})
 	if len(h.recoveryTargets) != 2 {
 		t.Fatal("ambiguous targets collapsed to latest")
 	}
-	h.rememberRequestOutcome(x.Kind, x.RequestID, errors.New("lookup failed"))
+	h.rememberRequestOutcome(testHintOriginal(x.Kind, x.RequestID), errors.New("lookup failed"))
 	if len(h.recoveryTargets) != 2 {
 		t.Fatal("nonterminal error erased unresolved target")
 	}
-	h.rememberRequestOutcome(x.Kind, x.RequestID, nil)
+	h.rememberRequestOutcome(testHintOriginal(x.Kind, x.RequestID), nil)
 	if len(h.recoveryTargets) != 1 {
 		t.Fatal("exact successful result did not clear only its own hint")
 	}
@@ -43,7 +163,7 @@ func TestInternalRequestNoArgUnknownOrAmbiguous(t *testing.T) {
 	for _, targets := range []int{0, 2, 3} {
 		h := &Host{cfg: Config{Plan: operator.V1Alpha2ApplicationInitPlan{ApplicationProtocol: sqlpolicy.ManagedRequestApplicationProtocol}}}
 		for i := 0; i < targets; i++ {
-			h.rememberRequestOutcome("sql", string(rune('X'+i)), &network.CommitUnknownError{Cause: context.Canceled})
+			h.rememberRequestOutcome(testHintOriginal("sql", string(rune('X'+i))), &network.CommitUnknownError{Cause: context.Canceled})
 		}
 		result, err := h.RecoverPendingDetailed(context.Background())
 		if !errors.Is(err, network.ErrCommitUnknown) || result.Kind != "" {
@@ -136,7 +256,7 @@ func TestInternalRequestHostOperationsWithoutKube(t *testing.T) {
 	// Model loss at the caller response-delivery boundary after actual commit.
 	// This tests hint selection, not an injected storage/network timeout.
 	host.mu.Lock()
-	host.rememberRequestOutcome("sql", "X", &network.CommitUnknownError{RequestID: "X", Cause: context.DeadlineExceeded})
+	host.rememberRequestOutcome(applicationOriginal{kind: "sql", sql: ExecuteRequest{RequestID: "X", SQL: "CREATE TABLE internal_request_proof (id INTEGER PRIMARY KEY)"}}, &network.CommitUnknownError{RequestID: "X", Cause: context.DeadlineExceeded})
 	host.mu.Unlock()
 	attempts.Store(0)
 	outage.Store(true)
@@ -296,6 +416,10 @@ func TestInternalRequestActualPostApplyCancellationRecoversExactOriginal(t *test
 	var unknown *network.CommitUnknownError
 	if !errors.As(observed.err, &unknown) || !errors.Is(observed.err, context.Canceled) || unknown.RequestID != id || errors.Is(observed.err, ErrKVNotSubmitted) || (unknown.Slot != 0 && uint64(unknown.Slot) != receipt.Slot) {
 		t.Fatalf("actual post-Apply cancellation did not retain UNKNOWN: response=%+v error=%v", observed.response, observed.err)
+	}
+	metadata, ok := MutationErrorContext(observed.err)
+	if !ok || metadata.Kind != "kv" || string(metadata.RequestID) != id || metadata.Slot != uint64(unknown.Slot) || metadata.RetryThroughSlot != unknown.RetryThroughSlot {
+		t.Fatalf("actual post-Apply Host error lost ABI mutation context: %+v %v", metadata, observed.err)
 	}
 	releaseOnce.Do(func() { close(release) })
 	y, err := hosts[0].KVMutate(ctx, "put", network.KVMutationRequest{RequestID: "Y", Key: "neighbor", Value: []byte("healthy")})

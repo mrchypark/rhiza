@@ -70,7 +70,7 @@ func validInitDigest(s string) bool {
 	return err == nil && len(b) == sha256.Size && hex.EncodeToString(b) == s
 }
 func validateV1Alpha2ApplicationInitPlan(p V1Alpha2ApplicationInitPlan, ref V1Alpha2ClusterRef, g v1alpha2Genesis) error {
-	if p.ApplicationProtocol != "" && p.ApplicationProtocol != types.ManagedApplicationProtocolSQLKV {
+	if _, _, err := types.ManagedApplicationPolicy(p.ApplicationProtocol); err != nil {
 		return fmt.Errorf("unsupported initialization protocol")
 	}
 	if !validInitString(p.AssignmentID) || p.ClusterUID != ref.UID || p.IntentHash != g.IntentHash || p.Generation != 0 || p.DeploymentUID != g.DeploymentUID || p.StorageID != g.StorageID || !validInitDigest(p.PhysicalBinding) || !validInitDigest(p.BootstrapPlanDigest) || !validInitString(p.EvidenceFormat) {

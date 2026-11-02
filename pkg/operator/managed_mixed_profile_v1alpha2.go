@@ -90,7 +90,10 @@ func mixedApplicationProtocol(obj map[string]json.RawMessage) (string, error) {
 	}
 	var protocol string
 	if raw, present := spec["applicationProtocol"]; present {
-		if json.Unmarshal(raw, &protocol) != nil || protocol != types.ManagedApplicationProtocolSQLKV {
+		if json.Unmarshal(raw, &protocol) != nil || protocol == "" {
+			return "", fmt.Errorf("unsupported application protocol")
+		}
+		if _, _, err := types.ManagedApplicationPolicy(protocol); err != nil {
 			return "", fmt.Errorf("unsupported application protocol")
 		}
 	}

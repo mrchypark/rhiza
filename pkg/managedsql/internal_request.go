@@ -24,13 +24,46 @@ func (h *Host) ensureInitialRequestAdmission(ctx context.Context) error {
 	return nil
 }
 
-// Called with h.mu held. A hint selects an original; it never supplies it.
-func (h *Host) rememberRequestOutcome(kind, id string, err error) {
-	selector := network.RequestStatusRequest{Kind: kind, RequestID: id}
+type requestRecoveryHint struct {
+	fingerprint [32]byte
+	ambiguous   bool
+}
+
+func originalFingerprint(p applicationOriginal) ([32]byte, error) {
+	if p.kind == "sql" {
+		r := p.sql
+		return types.SQLFingerprint(types.SQLCommand{RequestID: r.RequestID, SQL: r.SQL, Args: r.Args, WantRows: r.WantRows, RequireOne: r.RequireOne, Statements: r.Statements})
+	}
+	if p.kind == "kv" {
+		return types.ManagedKVFingerprint(p.kv)
+	}
+	return [32]byte{}, network.ErrInvalidRequest
+}
+
+func internalRequestOutcome(p applicationOriginal, receipt types.MutationReceipt, err error) error {
+	if errors.Is(err, network.ErrCommitUnknown) {
+		return applicationOutcomeUnknown(p, receipt, err)
+	}
+	return err
+}
+
+// Called with h.mu held. The owned fingerprint identifies attempted intent;
+// it is not original storage or execution authority.
+func (h *Host) rememberRequestOutcome(p applicationOriginal, err error) {
 	var unknown *network.CommitUnknownError
-	if errors.As(err, &unknown) {
+	isUnknown := errors.As(err, &unknown)
+	if err != nil && !isUnknown {
+		return // Validation/admission/conflict must not mutate recovery hints.
+	}
+	selector := network.RequestStatusRequest{Kind: p.kind, RequestID: p.rawID()}
+	fingerprint, fingerprintErr := originalFingerprint(p)
+	if fingerprintErr != nil {
+		h.recoveryTargetOverflow = true // never guess an unrepresentable hint
+		return
+	}
+	if isUnknown {
 		if h.recoveryTargets == nil {
-			h.recoveryTargets = make(map[network.RequestStatusRequest]struct{})
+			h.recoveryTargets = make(map[network.RequestStatusRequest]requestRecoveryHint)
 		}
 		if _, known := h.recoveryTargets[selector]; !known && len(h.recoveryTargets) == 2 {
 			// Two already prove ambiguity. Do not grow a RAM history with
@@ -38,8 +71,21 @@ func (h *Host) rememberRequestOutcome(kind, id string, err error) {
 			h.recoveryTargetOverflow = true
 			return
 		}
-		h.recoveryTargets[selector] = struct{}{}
+		hint, known := h.recoveryTargets[selector]
+		if known && hint.fingerprint != fingerprint {
+			hint.ambiguous = true
+		}
+		if !known {
+			hint.fingerprint = fingerprint
+		}
+		h.recoveryTargets[selector] = hint
 	} else if err == nil {
+		h.clearRequestHint(selector, fingerprint)
+	}
+}
+
+func (h *Host) clearRequestHint(selector network.RequestStatusRequest, fingerprint [32]byte) {
+	if hint, ok := h.recoveryTargets[selector]; ok && !hint.ambiguous && hint.fingerprint == fingerprint {
 		delete(h.recoveryTargets, selector)
 	}
 }
@@ -52,12 +98,10 @@ func (h *Host) RecoverRequest(ctx context.Context, selector network.RequestStatu
 	if h.closed || !h.internalRequests() {
 		return RecoveryResult{}, fmt.Errorf("internal-request managed Host required")
 	}
-	result, err := h.recoverRequestLocked(ctx, selector)
-	h.rememberRequestOutcome(selector.Kind, selector.RequestID, err)
-	return result, err
+	return h.recoverRequestLocked(ctx, selector, nil)
 }
 
-func (h *Host) recoverRequestLocked(ctx context.Context, selector network.RequestStatusRequest) (RecoveryResult, error) {
+func (h *Host) recoverRequestLocked(ctx context.Context, selector network.RequestStatusRequest, expected *[32]byte) (RecoveryResult, error) {
 	kind := types.MutationSQL
 	if selector.Kind == "kv" {
 		kind = types.MutationKV
@@ -75,6 +119,9 @@ func (h *Host) recoverRequestLocked(ctx context.Context, selector network.Reques
 	// and post-barrier binding/original checks in one fixed-target invocation.
 	resolved, err := h.node.ResolveRequest(ctx, selector.Kind, selector.RequestID)
 	result := RecoveryResult{Kind: selector.Kind, RequestID: []byte(selector.RequestID)}
+	if expected != nil && resolved.Original.Slot != 0 && resolved.Original.Fingerprint != *expected {
+		return result, applicationOutcomeUnknown(p, types.MutationReceipt{}, errors.Join(fmt.Errorf("retained original differs from attempted recovery intent"), err))
+	}
 	if resolved.Receipt.Slot != 0 {
 		if kind == types.MutationSQL {
 			result.SQL = &ExecuteResponse{MutationReceipt: resolved.Receipt, Statements: resolved.Statements}
@@ -88,6 +135,6 @@ func (h *Host) recoverRequestLocked(ctx context.Context, selector network.Reques
 	if resolved.Original.Kind != kind || resolved.Original.RequestID != selector.RequestID || resolved.Receipt.Slot == 0 || resolved.Receipt.Slot != resolved.Original.Slot {
 		return result, applicationOutcomeUnknown(p, resolved.Original.Receipt, fmt.Errorf("retained original selector or result slot changed"))
 	}
-	delete(h.recoveryTargets, selector)
+	h.clearRequestHint(selector, resolved.Original.Fingerprint)
 	return result, nil
 }

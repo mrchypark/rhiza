@@ -60,7 +60,7 @@ type Host struct {
 	closed    bool
 	uncertain atomic.Bool
 	// recoveryTargets are caller-local selectors, never execution authority.
-	recoveryTargets        map[network.RequestStatusRequest]struct{}
+	recoveryTargets        map[network.RequestStatusRequest]requestRecoveryHint
 	recoveryTargetOverflow bool
 }
 
@@ -643,7 +643,9 @@ func (h *Host) Execute(ctx context.Context, req ExecuteRequest) (ExecuteResponse
 			return ExecuteResponse{}, &SQLNotSubmittedError{Stage: SQLStageAdmission, Cause: err}
 		}
 		response, err := h.node.ExecuteManagedSQL(ctx, req)
-		h.rememberRequestOutcome("sql", req.RequestID, err)
+		p := applicationOriginal{kind: "sql", sql: req}
+		err = internalRequestOutcome(p, response.MutationReceipt, err)
+		h.rememberRequestOutcome(p, err)
 		return response, err
 	}
 	// Retain the authority RV across quorum admission. Refreshing it afterward
