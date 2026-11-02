@@ -18,6 +18,10 @@ on:
       - .github/workflows/performance.yml
   workflow_dispatch:
     inputs:
+      json_optimization:
+        description: Focused FFI envelope and evidence scan costs (no server or ACK workloads)
+        type: boolean
+        default: false
       refresh_hiqlite_reference:
         description: Measure the pinned Hiqlite reference on the CI runner
         type: boolean
@@ -51,9 +55,9 @@ concurrency:
 
 jobs:
   paired-go-benchmarks:
-    if: ${{ !inputs.refresh_hiqlite_reference && !inputs.issue185_cost_evidence }}
+    if: ${{ inputs.json_optimization || (!inputs.refresh_hiqlite_reference && !inputs.issue185_cost_evidence) }}
     runs-on: ubuntu-24.04
-    timeout-minutes: 60
+    timeout-minutes: ${{ inputs.json_optimization && 20 || 60 }}
     env:
       CGO_ENABLED: 0
       RHIZA_BENCH_COUNT: 10
@@ -64,6 +68,17 @@ jobs:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
+
+      - name: Validate focused JSON mode
+        if: ${{ inputs.json_optimization }}
+        env:
+          REFRESH_REFERENCE: ${{ inputs.refresh_hiqlite_reference }}
+          COST_EVIDENCE: ${{ inputs.issue185_cost_evidence }}
+          NETWORK_MODE: ${{ inputs.network_optimization || 'none' }}
+        run: |
+          test "$REFRESH_REFERENCE" != true
+          test "$COST_EVIDENCE" != true
+          test "$NETWORK_MODE" = none
 
       - uses: actions/setup-go@v6
         with:
@@ -126,13 +141,24 @@ jobs:
           printf '%s\n' "$GOBIN" >>"$GITHUB_PATH"
 
       - name: Run interleaved base and candidate benchmarks
+        env:
+          JSON_OPTIMIZATION: ${{ inputs.json_optimization }}
         run: |
-          benchmarks/run-ci-benchmarks.sh \
-            "${{ steps.revisions.outputs.base_sha }}" \
-            "${{ steps.revisions.outputs.candidate_sha }}" \
-            "$RUNNER_TEMP/rhiza-performance"
+          if [[ "$JSON_OPTIMIZATION" == true ]]; then
+            sh benchmarks/run-json-ci-benchmarks.sh \
+              "${{ steps.revisions.outputs.base_sha }}" \
+              "${{ steps.revisions.outputs.candidate_sha }}" \
+              "$RUNNER_TEMP/rhiza-performance"
+          else
+            benchmarks/run-ci-benchmarks.sh \
+              "${{ steps.revisions.outputs.base_sha }}" \
+              "${{ steps.revisions.outputs.candidate_sha }}" \
+              "$RUNNER_TEMP/rhiza-performance"
+          fi
 
       - name: Compare results
+        env:
+          JSON_OPTIMIZATION: ${{ inputs.json_optimization }}
         run: |
           benchstat \
             "base=$RUNNER_TEMP/rhiza-performance/base.txt" \
@@ -143,13 +169,16 @@ jobs:
             printf '## Paired performance benchmarks\n\n'
             printf 'Fixed `ubuntu-24.04`, `GOMAXPROCS=2`; 10 interleaved samples per revision.\n\n'
             printf 'Baseline mode: `%s`.\n\n' '${{ steps.revisions.outputs.baseline_mode }}'
+            if [[ "$JSON_OPTIMIZATION" == true ]]; then
+              printf 'Scope: FFI envelope 250ms/case; evidence scan 1s/case; CGO=1. Evidence includes SQLite sort/hash/IO/cleanup, not JSON alone. Rust native/runtime and whole-server performance are not measured.\n\n'
+            fi
             printf '```text\n'
             cat "$RUNNER_TEMP/rhiza-performance/benchstat.txt"
             printf '```\n'
           } >>"$GITHUB_STEP_SUMMARY"
 
       - name: Reuse pinned Hiqlite reference
-        if: ${{ !inputs.network_optimization || inputs.network_optimization == 'none' }}
+        if: ${{ !inputs.json_optimization && (!inputs.network_optimization || inputs.network_optimization == 'none') }}
         env:
           HIQLITE_COMMIT: 493f980562766f0ce5645e015557bc39501f9a5b
         run: |
@@ -172,7 +201,7 @@ jobs:
           } >>"$GITHUB_STEP_SUMMARY"
 
       - name: Run Rhiza real-server reference
-        if: ${{ !inputs.network_optimization || inputs.network_optimization == 'none' }}
+        if: ${{ !inputs.json_optimization && (!inputs.network_optimization || inputs.network_optimization == 'none') }}
         env:
           RHIZA_SERVER_BENCH_REQUESTS: 100000
           RHIZA_SERVER_BENCH_CONCURRENCY: 16
@@ -238,7 +267,7 @@ jobs:
           } >>"$GITHUB_STEP_SUMMARY"
 
       - name: Record runner environment
-        if: ${{ !inputs.network_optimization || inputs.network_optimization == 'none' }}
+        if: ${{ !inputs.json_optimization && (!inputs.network_optimization || inputs.network_optimization == 'none') }}
         run: |
           {
             printf '\nbaseline_mode=%s\n' '${{ steps.revisions.outputs.baseline_mode }}'
@@ -267,13 +296,13 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: paired-performance-${{ github.run_id }}
+          name: paired-performance-${{ inputs.json_optimization && 'json-' || '' }}${{ github.run_id }}
           path: ${{ runner.temp }}/rhiza-performance
           if-no-files-found: error
           retention-days: 30
 
   issue185-cost-evidence:
-    if: ${{ inputs.issue185_cost_evidence }}
+    if: ${{ inputs.issue185_cost_evidence && !inputs.json_optimization }}
     runs-on: macos-15
     timeout-minutes: 80
     steps:
@@ -454,7 +483,7 @@ jobs:
           retention-days: 30
 
   refresh-hiqlite-reference:
-    if: ${{ inputs.refresh_hiqlite_reference }}
+    if: ${{ inputs.refresh_hiqlite_reference && !inputs.json_optimization }}
     runs-on: ubuntu-24.04
     timeout-minutes: 60
     env:
