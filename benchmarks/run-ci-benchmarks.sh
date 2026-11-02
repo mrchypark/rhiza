@@ -153,6 +153,48 @@ for ((sample = 1; sample <= bench_count; sample++)); do
 	fi
 done
 
+profile_codec_revision() {
+	local label=$1
+	local source=$2
+	local profile_dir="$output_dir/profiles"
+	local binary="$work_root/bin/$label-internal-types.test"
+	local status
+	mkdir -p "$profile_dir"
+	# Profiling is a separate diagnostic run, never another paired sample.
+	if (
+		cd "$source"
+		GOMAXPROCS=$bench_procs "$binary" \
+			-test.run '^$' \
+			-test.bench '^BenchmarkSQLBatchCodec$/^blob_1k_encode$' \
+			-test.benchtime 3s \
+			-test.count 1 \
+			-test.benchmem \
+			-test.cpu "$bench_procs" \
+			-test.cpuprofile "$profile_dir/$label-cpu.pprof" \
+			-test.memprofile "$profile_dir/$label-heap.pprof" \
+			-test.timeout 1m
+	) >"$profile_dir/$label.txt" 2>&1; then
+		printf '0\n' >"$profile_dir/$label.exit"
+	else
+		status=$?
+		printf '%s\n' "$status" >"$profile_dir/$label.exit"
+		cat "$profile_dir/$label.txt" >&2
+		return "$status"
+	fi
+	# Go exits successfully when no benchmark matches, which is not evidence.
+	grep -Eq '^BenchmarkSQLBatchCodec/blob_1k_encode(-[1-9][0-9]*)?[[:space:]]' "$profile_dir/$label.txt"
+	test -s "$profile_dir/$label-cpu.pprof"
+	test -s "$profile_dir/$label-heap.pprof"
+	go tool pprof -top "$binary" "$profile_dir/$label-cpu.pprof" >"$profile_dir/$label-cpu-top.txt"
+	go tool pprof -top -alloc_space "$binary" "$profile_dir/$label-heap.pprof" >"$profile_dir/$label-alloc-space-top.txt"
+	go tool pprof -top -alloc_objects "$binary" "$profile_dir/$label-heap.pprof" >"$profile_dir/$label-alloc-objects-top.txt"
+}
+
+if [[ $network_optimization == none ]]; then
+	profile_codec_revision base "$work_root/base"
+	profile_codec_revision candidate "$work_root/candidate"
+fi
+
 {
 	printf 'base_sha=%s\n' "$base_sha"
 	printf 'candidate_sha=%s\n' "$head_sha"
