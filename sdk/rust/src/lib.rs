@@ -674,10 +674,7 @@ impl ManagedDb {
             tip: u64,
             receipt: Option<Value>,
         }
-        let wire: Wire = self.call(
-            "request_status",
-            json!({"kind":kind.wire(),"request_id_b64":STANDARD.encode(request_id)}),
-        )?;
+        let wire: Wire = self.call("request_status", managed_request_selector(kind, request_id))?;
         let receipt = wire
             .receipt
             .map(|value| match kind {
@@ -698,6 +695,19 @@ impl ManagedDb {
     ) -> std::result::Result<ManagedRecoveryResult, ManagedMutationError> {
         let wire: ManagedRecoveryWire =
             self.call_detailed("recover_pending_detailed", json!({}))?;
+        wire.result().map_err(Into::into)
+    }
+    /// Resolve one exact engine-retained original. The selector is not a retry
+    /// permit and no replacement payload is submitted.
+    pub fn recover_request(
+        &self,
+        kind: MutationKind,
+        request_id: &[u8],
+    ) -> std::result::Result<ManagedRecoveryResult, ManagedMutationError> {
+        let wire: ManagedRecoveryWire = self.call_detailed(
+            "recover_pending_detailed",
+            managed_request_selector(kind, request_id),
+        )?;
         wire.result().map_err(Into::into)
     }
     fn call_detailed<T: DeserializeOwned>(
@@ -1083,9 +1093,35 @@ fn parse_mutation_context(value: &Value) -> Option<MutationContext> {
     })
 }
 
+fn managed_request_selector(kind: MutationKind, request_id: &[u8]) -> Value {
+    json!({"kind":kind.wire(),"request_id_b64":STANDARD.encode(request_id)})
+}
+
 #[cfg(test)]
 mod managed_kv_wire_tests {
     use super::*;
+
+    #[test]
+    fn exact_recovery_selector_preserves_kind_and_raw_id() {
+        assert_eq!(
+            managed_request_selector(MutationKind::Sql, b"X"),
+            json!({"kind":"sql","request_id_b64":"WA=="})
+        );
+        assert_eq!(
+            managed_request_selector(MutationKind::Kv, &[0xff]),
+            json!({"kind":"kv","request_id_b64":"/w=="})
+        );
+        assert_ne!(
+            managed_request_selector(MutationKind::Kv, &[0xff]),
+            managed_request_selector(MutationKind::Kv, "\u{fffd}".as_bytes())
+        );
+        let _: fn(
+            &ManagedDb,
+            MutationKind,
+            &[u8],
+        ) -> std::result::Result<ManagedRecoveryResult, ManagedMutationError> =
+            ManagedDb::recover_request;
+    }
 
     #[test]
     fn original_has_seven_lossless_fields() {

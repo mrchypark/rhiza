@@ -45,7 +45,9 @@ func ValidateV1Alpha2ApplicationProfile(protocol, evidenceFormat string) error {
 	}
 	expected := V1Alpha2ManagedSQLEvidenceFormat
 	if protocol != "" {
-		expected = V1Alpha2ManagedSQLKVEvidenceFormat
+		// ManagedApplicationPolicy above accepts only explicit installed
+		// capabilities. Each nonlegacy profile carries its own evidence marker.
+		expected = protocol
 	}
 	if evidenceFormat != expected {
 		return fmt.Errorf("managed application evidence profile mismatch")

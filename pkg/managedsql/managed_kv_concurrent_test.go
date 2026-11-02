@@ -50,10 +50,17 @@ func mixedHostQuorum(t *testing.T, wrappers ...func(int, http.RoundTripper) http
 
 // Count actual certified application decisions over the real private QUIC
 // protocol. A deduplicated second proposal would still increase this count.
-func hostApplicationDecisionCount(t *testing.T, ctx context.Context, cfg Config) int {
+func hostApplicationDecisionCount(t *testing.T, ctx context.Context, cfg Config, policies ...sqlpolicy.MaterializationPolicy) int {
 	t.Helper()
+	policy := sqlpolicy.ManagedSQLKVMaterializationPolicy
+	if len(policies) > 1 {
+		t.Fatal("one explicit peer policy expected")
+	}
+	if len(policies) == 1 {
+		policy = policies[0]
+	}
 	cluster := quepaxa.Cluster{ConfigID: 1, Members: cfg.Runtime.Members}
-	client, err := network.NewTransportForPolicy(cfg.Runtime.ClusterID, cfg.Runtime.NodeID, &cluster, cfg.Runtime.PeerToken, sqlpolicy.ManagedSQLKVMaterializationPolicy)
+	client, err := network.NewTransportForPolicy(cfg.Runtime.ClusterID, cfg.Runtime.NodeID, &cluster, cfg.Runtime.PeerToken, policy)
 	if err != nil {
 		t.Fatal(err)
 	}

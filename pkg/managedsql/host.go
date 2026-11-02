@@ -59,6 +59,9 @@ type Host struct {
 	authority operator.V1Alpha2AuthorityView
 	closed    bool
 	uncertain atomic.Bool
+	// recoveryTargets are caller-local selectors, never execution authority.
+	recoveryTargets        map[network.RequestStatusRequest]struct{}
+	recoveryTargetOverflow bool
 }
 
 // Open returns an owned paused host after initialization, without waiting for
@@ -305,12 +308,31 @@ func (h *Host) ValidateManagedStartup(ctx context.Context, i node.ManagedStartup
 }
 
 func (h *Host) ValidateManagedAdmission(ctx context.Context, i node.ManagedStartupIdentity, runtime node.ManagedRuntimeState) error {
+	if h.internalRequests() {
+		if i != h.identity {
+			return fmt.Errorf("execution identity changed")
+		}
+		// Profile 9 Node calls this external boundary for initial admission,
+		// not normal requests. Keep live assignment and full inspection here.
+		a, err := h.live(ctx)
+		if err != nil {
+			return err
+		}
+		if _, pending := a.Pending(); pending || a.SQLReservationsClosed() {
+			return fmt.Errorf("initial admission has pending control or closed repair")
+		}
+		_, err = h.inspectEvidence(ctx, false, false)
+		return err
+	}
 	return h.validateManagedState(ctx, i, runtime, true)
 }
 
 func (h *Host) ValidateManagedPeerLearn(ctx context.Context, i node.ManagedStartupIdentity) error {
 	if i != h.identity {
 		return fmt.Errorf("execution identity changed")
+	}
+	if h.internalRequests() {
+		return ctx.Err()
 	}
 	// A recorded, not-yet-learned slot must not block delivery of its certificate.
 	// SQL readiness and pending-write admission keep their stricter checks.
@@ -323,6 +345,14 @@ func (h *Host) ValidateManagedSQLRead(ctx context.Context, i node.ManagedStartup
 }
 
 func (h *Host) validateManagedState(ctx context.Context, i node.ManagedStartupIdentity, runtime node.ManagedRuntimeState, allowActiveWrite bool) error {
+	if h.internalRequests() {
+		if i != h.identity {
+			return fmt.Errorf("execution identity changed")
+		}
+		// Profile 9 Node owns live runtime/membership/poison checks. This
+		// callback checks the installed Host binding, not cached CR authority.
+		return ctx.Err()
+	}
 	if allowActiveWrite && h.uncertain.Load() {
 		return ErrSQLRecoveryRequired
 	}
@@ -377,6 +407,9 @@ func (h *Host) ValidateManagedSQLWrite(ctx context.Context, i node.ManagedStartu
 	if i != h.identity {
 		return fmt.Errorf("execution identity changed")
 	}
+	if h.internalRequests() {
+		return network.ValidateExecuteRequest(req)
+	}
 	w, err := requestIdentity(req)
 	if err != nil {
 		return err
@@ -407,6 +440,9 @@ func (h *Host) ValidateManagedSQLRecovery(ctx context.Context, i node.ManagedSta
 	if i != h.identity {
 		return fmt.Errorf("execution identity changed")
 	}
+	if h.internalRequests() {
+		return network.ValidateExecuteRequest(req)
+	}
 	w, err := requestIdentity(req)
 	if err != nil {
 		return err
@@ -435,6 +471,9 @@ func (h *Host) Ready(ctx context.Context) error {
 	defer h.mu.Unlock()
 	if h.closed {
 		return fmt.Errorf("SQL host closed")
+	}
+	if err := h.ensureInitialRequestAdmission(ctx); err != nil {
+		return err
 	}
 	return h.node.CheckManagedLocalRead(ctx)
 }
@@ -599,6 +638,14 @@ func (h *Host) Execute(ctx context.Context, req ExecuteRequest) (ExecuteResponse
 	if err := network.ValidateExecuteRequest(req); err != nil {
 		return ExecuteResponse{}, &SQLNotSubmittedError{Stage: SQLStageValidation, Cause: err}
 	}
+	if h.internalRequests() {
+		if err := h.ensureInitialRequestAdmission(ctx); err != nil {
+			return ExecuteResponse{}, &SQLNotSubmittedError{Stage: SQLStageAdmission, Cause: err}
+		}
+		response, err := h.node.ExecuteManagedSQL(ctx, req)
+		h.rememberRequestOutcome("sql", req.RequestID, err)
+		return response, err
+	}
 	// Retain the authority RV across quorum admission. Refreshing it afterward
 	// could carry an old quorum result across repair close/finish/open ABA.
 	a, err := h.live(ctx)
@@ -673,6 +720,9 @@ func (h *Host) Query(ctx context.Context, req QueryRequest) (QueryResponse, erro
 	defer h.mu.Unlock()
 	if h.closed {
 		return QueryResponse{}, fmt.Errorf("SQL host closed")
+	}
+	if err := h.ensureInitialRequestAdmission(ctx); err != nil {
+		return QueryResponse{}, err
 	}
 	return h.node.QueryManagedSQL(ctx, req)
 }

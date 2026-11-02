@@ -163,10 +163,16 @@ func dispatchManaged(ctx context.Context, entry *ffiEntry, call callEnvelope) (a
 		}
 		return nil, entry.managed.RecoverPending(ctx)
 	case "recover_pending_detailed":
-		if err := decode(&struct{}{}); err != nil {
+		selector, err := decodeManagedRequestSelector(call.Request, true)
+		if err != nil {
 			return nil, err
 		}
-		result, err := entry.managed.RecoverPendingDetailed(ctx)
+		var result managedsql.RecoveryResult
+		if selector == nil {
+			result, err = entry.managed.RecoverPendingDetailed(ctx)
+		} else {
+			result, err = entry.managed.RecoverRequest(ctx, *selector)
+		}
 		if err != nil {
 			return nil, err
 		}
@@ -199,25 +205,45 @@ func dispatchManaged(ctx context.Context, entry *ffiEntry, call callEnvelope) (a
 		}
 		return managedKVGetWire(result), nil
 	case "request_status":
-		var wire struct {
-			Kind      string  `json:"kind"`
-			RequestID *string `json:"request_id_b64"`
-		}
-		if err := decode(&wire); err != nil {
-			return nil, err
-		}
-		id, err := managedRawBytes(wire.RequestID, 64)
-		if err != nil || (wire.Kind != "sql" && wire.Kind != "kv") {
-			return nil, invalidManagedKVRequest()
-		}
-		result, err := entry.managed.RequestStatus(ctx, network.RequestStatusRequest{Kind: wire.Kind, RequestID: string(id)})
+		selector, err := decodeManagedRequestSelector(call.Request, false)
 		if err != nil {
 			return nil, err
 		}
-		return managedStatusWire(wire.Kind, result), nil
+		result, err := entry.managed.RequestStatus(ctx, *selector)
+		if err != nil {
+			return nil, err
+		}
+		return managedStatusWire(selector.Kind, result), nil
 	default:
 		return nil, &ffiError{Code: "invalid_request", Message: "operation unavailable on managed SQL handle"}
 	}
+}
+
+// A selector is either the exact pair or, only for the compatibility recovery
+// facade, an empty object. Explicit null is not an omitted selector.
+func decodeManagedRequestSelector(raw json.RawMessage, allowEmpty bool) (*network.RequestStatusRequest, error) {
+	var wire struct {
+		Kind      *string `json:"kind"`
+		RequestID *string `json:"request_id_b64"`
+	}
+	if decodeStrict(raw, &wire) != nil || bytes.Equal(bytes.TrimSpace(raw), []byte("null")) {
+		return nil, invalidManagedKVRequest()
+	}
+	var fields map[string]json.RawMessage
+	if json.Unmarshal(raw, &fields) != nil {
+		return nil, invalidManagedKVRequest()
+	}
+	if len(fields) == 0 && allowEmpty {
+		return nil, nil
+	}
+	if wire.Kind == nil || (*wire.Kind != "sql" && *wire.Kind != "kv") {
+		return nil, invalidManagedKVRequest()
+	}
+	id, err := managedRawBytes(wire.RequestID, 64)
+	if err != nil {
+		return nil, invalidManagedKVRequest()
+	}
+	return &network.RequestStatusRequest{Kind: *wire.Kind, RequestID: string(id)}, nil
 }
 
 func invalidManagedKVRequest() error {

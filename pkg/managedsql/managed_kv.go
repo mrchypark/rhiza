@@ -134,7 +134,7 @@ func kvRequest(command types.KVCommand) network.KVMutationRequest {
 }
 
 func (h *Host) mixed() bool {
-	return h.cfg.Plan.ApplicationProtocol == types.ManagedApplicationProtocolSQLKV
+	return h.cfg.Plan.ApplicationProtocol == types.ManagedApplicationProtocolSQLKV || h.internalRequests()
 }
 
 func (h *Host) inspectEvidence(ctx context.Context, fresh, localRead bool) (json.RawMessage, error) {
@@ -155,7 +155,7 @@ func (h *Host) inspectEvidenceSnapshot(ctx context.Context, fresh, localRead boo
 		if err != nil {
 			return nil, node.ManagedRuntimeState{}, err
 		}
-		evidence, err := json.Marshal(sqlEvidence{types.ManagedApplicationProtocolSQLKV, fmt.Sprintf("%x", state.Application.Digest)})
+		evidence, err := json.Marshal(sqlEvidence{h.cfg.Plan.EvidenceFormat, fmt.Sprintf("%x", state.Application.Digest)})
 		return evidence, state.Runtime, err
 	}
 	var state node.ManagedSQLSnapshot
@@ -193,6 +193,9 @@ func (h *Host) validateKVOriginal(ctx context.Context, i node.ManagedStartupIden
 	w, err := (applicationOriginal{kind: "kv", kv: command}).identity()
 	if err != nil {
 		return err
+	}
+	if h.internalRequests() {
+		return nil // Actual Node runtime gate and canonical resolver own profile 9.
 	}
 	if !activeRequired {
 		if value := ctx.Value(remoteRecoveryContextKey{}); value != nil {
@@ -258,6 +261,14 @@ func (h *Host) KVMutate(ctx context.Context, operation string, req network.KVMut
 	if _, err := types.ManagedKVExecutionSizeBound(original); err != nil {
 		return notSubmitted(SQLStageValidation, false, err)
 	}
+	if h.internalRequests() {
+		if err := h.ensureInitialRequestAdmission(ctx); err != nil {
+			return notSubmitted(SQLStageAdmission, false, err)
+		}
+		response, err := h.node.ExecuteManagedKV(ctx, original.Operation, kvRequest(original))
+		h.rememberRequestOutcome("kv", original.RequestID, err)
+		return response, err
+	}
 	a, err := h.live(ctx)
 	if err != nil {
 		return notSubmitted(SQLStageAuthority, false, err)
@@ -314,6 +325,9 @@ func (h *Host) KVGet(ctx context.Context, req network.KVGetRequest) (network.KVG
 	if h.closed || !h.mixed() {
 		return network.KVGetResponse{}, fmt.Errorf("mixed managed Host required")
 	}
+	if err := h.ensureInitialRequestAdmission(ctx); err != nil {
+		return network.KVGetResponse{}, err
+	}
 	return h.node.KVGetManaged(ctx, req)
 }
 
@@ -324,6 +338,9 @@ func (h *Host) RequestStatus(ctx context.Context, req network.RequestStatusReque
 	defer h.mu.Unlock()
 	if h.closed || !h.mixed() {
 		return network.RequestStatusResponse{}, fmt.Errorf("mixed managed Host required")
+	}
+	if err := h.ensureInitialRequestAdmission(ctx); err != nil {
+		return network.RequestStatusResponse{}, err
 	}
 	return h.node.RequestStatusManaged(ctx, req)
 }
@@ -537,6 +554,15 @@ func (h *Host) RecoverPendingDetailed(ctx context.Context) (RecoveryResult, erro
 	defer h.mu.Unlock()
 	if h.closed {
 		return RecoveryResult{}, fmt.Errorf("SQL host closed")
+	}
+	if h.internalRequests() {
+		if h.recoveryTargetOverflow || len(h.recoveryTargets) != 1 {
+			return RecoveryResult{}, &network.CommitUnknownError{Cause: fmt.Errorf("exact recovery target required or ambiguous")}
+		}
+		for selector := range h.recoveryTargets {
+			return h.recoverRequestLocked(ctx, selector)
+		}
+		return RecoveryResult{}, &network.CommitUnknownError{Cause: fmt.Errorf("exact recovery target required")}
 	}
 	a, err := h.live(ctx)
 	if err != nil {
