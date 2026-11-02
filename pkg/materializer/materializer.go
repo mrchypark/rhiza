@@ -100,6 +100,7 @@ type Materializer struct {
 	walCheckpointStop        chan struct{}
 	walCheckpointOnce        sync.Once
 	walCheckpointWG          sync.WaitGroup
+	walCheckpointIO          sync.WaitGroup
 }
 
 type notificationSubscription struct {
@@ -1234,9 +1235,13 @@ func (m *Materializer) runSQLiteCheckpoints() {
 		case <-ticker.C:
 			m.mu.RLock()
 			db := m.db
+			if db != nil {
+				m.walCheckpointIO.Add(1)
+			}
 			m.mu.RUnlock()
 			if db != nil {
 				_, _ = db.Exec(`PRAGMA wal_checkpoint(PASSIVE)`)
+				m.walCheckpointIO.Done()
 			}
 		}
 	}
@@ -2932,6 +2937,8 @@ func (m *Materializer) reopen() error {
 	return nil
 }
 
+// adopt requires m.mu's write lock and already-closed previous target handles.
+// source must be a distinct temporary materializer exclusively owned by caller.
 func (m *Materializer) adopt(source *Materializer) {
 	source.stopSQLiteCheckpoints()
 	m.db, m.writer, m.readers, m.graph = source.db, source.writer, source.readers, source.graph
@@ -2975,6 +2982,9 @@ func (m *Materializer) Close() error {
 }
 
 func (m *Materializer) closeConnections() error {
+	// Caller owns m.mu exclusively, so no new checkpoint can register while
+	// retirement waits. Completion does not need m.mu or the whole worker.
+	m.walCheckpointIO.Wait()
 	if m.graph != nil {
 		m.graph.close()
 		m.graph = nil

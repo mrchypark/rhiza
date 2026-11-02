@@ -1719,7 +1719,38 @@ func TestAdoptStopsTemporaryDispatcher(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	oldDB, oldWriter, oldReaders, oldGraph := target.db, target.writer, append([]*sql.DB(nil), target.readers...), target.graph
+	sourceDB, sourceWriter, sourceReaders, sourceGraph := source.db, source.writer, append([]*sql.DB(nil), source.readers...), source.graph
+	target.mu.Lock()
+	if err := target.closeConnections(); err != nil {
+		target.mu.Unlock()
+		_ = source.Close()
+		t.Fatal(err)
+	}
 	target.adopt(source)
+	target.mu.Unlock()
+	if target.db != sourceDB || target.writer != sourceWriter || target.graph != sourceGraph || !reflect.DeepEqual(target.readers, sourceReaders) {
+		t.Fatal("target did not take exact source handle ownership")
+	}
+	for _, db := range append([]*sql.DB{oldDB, oldWriter}, oldReaders...) {
+		if err := db.Ping(); err == nil {
+			_ = db.Close()
+			t.Error("adopt fixture leaked an original target SQLite handle")
+		}
+	}
+	oldGraph.mu.RLock()
+	graphClosed := oldGraph.db == nil
+	oldGraph.mu.RUnlock()
+	if !graphClosed {
+		oldGraph.close()
+		t.Error("adopt fixture leaked original target Graph handle")
+	}
+	if source.db != nil || source.writer != nil || source.readers != nil || source.graph != nil {
+		t.Fatal("temporary source retained transferred handles")
+	}
+	if err := source.Close(); err != nil {
+		t.Fatalf("closing detached source: %v", err)
+	}
 	select {
 	case <-source.notifyStop:
 	default:
