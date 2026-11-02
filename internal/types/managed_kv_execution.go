@@ -5,6 +5,9 @@ import (
 	"encoding/json"
 	"errors"
 	"io"
+
+	"github.com/mrchypark/rhiza/internal/sqlpolicy"
+	"github.com/mrchypark/rhiza/pkg/quepaxa"
 )
 
 const MaxManagedKVExecutionBytes = MaxManagedKVOriginalBytes + 128
@@ -178,4 +181,35 @@ func ManagedKVFingerprint(command KVCommand) ([32]byte, error) {
 		return [32]byte{}, err
 	}
 	return FingerprintBatchItem("rhiza/managed-kv/v1", item), nil
+}
+
+// ValidateManagedKVExecutionPolicy is the explicit mixed-profile allowlist.
+// SQL semantics remain unchanged; legacy KV, Graph and Notify are not admitted.
+// The execution limit is the consensus limit, not the codec's parsing ceiling.
+func ValidateManagedKVExecutionPolicy(value []byte) error {
+	if len(value) == 0 || len(value) > quepaxa.MaxReplicatedValueBytes {
+		return sqlpolicy.ErrIncompatible
+	}
+	if _, ok, err := DecodeSQLBatch(value); ok || err != nil {
+		return err
+	}
+	if _, ok, err := DecodeManagedKVCommand(value); ok || err != nil {
+		return err
+	}
+	if _, ok, err := DecodeManagedKVBatch(value); ok || err != nil {
+		return err
+	}
+	if ok, err := DecodeReadBarrier(value); ok || err != nil {
+		return err
+	}
+	if _, ok, err := DecodeCheckpointSeal(value); ok || err != nil {
+		return err
+	}
+	if _, ok, err := DecodeLeaderSchedule(value); ok || err != nil {
+		return err
+	}
+	if ok, err := DecodeReconfiguration(value); ok || err != nil {
+		return err
+	}
+	return sqlpolicy.ErrIncompatible
 }

@@ -3,10 +3,14 @@ package types
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
 	"math"
 	"reflect"
 	"strings"
 	"testing"
+
+	"github.com/mrchypark/rhiza/internal/sqlpolicy"
+	"github.com/mrchypark/rhiza/pkg/quepaxa"
 )
 
 func TestManagedKVExecutionRoundTrip(t *testing.T) {
@@ -178,5 +182,89 @@ func TestManagedKVExecutionLegacyGolden(t *testing.T) {
 	want := FingerprintBatchItem("rhiza/kv", []byte(`{"request_id":"","operation":"put","key":"k"}`))
 	if got != want {
 		t.Fatal("legacy fingerprint changed")
+	}
+}
+
+func TestManagedKVExecutionPolicy(t *testing.T) {
+	c := KVCommand{RequestID: "i", Operation: "put", Key: "k"}
+	single, err := EncodeManagedKVCommand(c)
+	if err != nil {
+		t.Fatal(err)
+	}
+	item, err := EncodeManagedKVBatchItem(c)
+	if err != nil {
+		t.Fatal(err)
+	}
+	batch, err := AssembleManagedKVBatch([][]byte{item})
+	if err != nil {
+		t.Fatal(err)
+	}
+	sql, err := EncodeSQLBatch([]SQLCommand{{RequestID: "s", SQL: "SELECT 1"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	leaders, err := EncodeLeaderSchedule([]NodeID{"n"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	seal, err := quepaxa.EncodeCheckpointSeal(quepaxa.CheckpointSeal{Index: 1, RootHash: [32]byte{1}, StateHash: [32]byte{2}, PrefixHash: [32]byte{3}, NextLeaderOrder: []NodeID{"n"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	reconfig := []byte("QRCF\x00" + `{"freeze":1,"terminal_slot":17,"target":{"config_id":2,"members":[{"node_id":"n","url":"u","log_url":"l","public_key":""}]},"prefix_hash":[0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0]}`)
+	// PublicKey uses its existing base64 decoder; encode an actual zero key.
+	reconfig = bytes.ReplaceAll(reconfig, []byte(`"public_key":""`), []byte(`"public_key":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="`))
+	for name, value := range map[string][]byte{"single": single, "batch": batch, "sql": sql, "schedule": leaders, "seal": seal, "barrier": EncodeReadBarrier([ReadBarrierNonceSize]byte{}), "reconfiguration": reconfig} {
+		if err := ValidateManagedKVExecutionPolicy(value); err != nil {
+			t.Fatalf("%s: %v", name, err)
+		}
+	}
+	legacy, _ := EncodeKVCommand(c)
+	legacyItem, _ := EncodeKVBatchItem(c)
+	graph, _ := EncodeGraphBatch([]GraphCommand{{RequestID: "g", Cypher: "RETURN 1"}})
+	notify, _ := EncodeNotifyCommand(NotifyCommand{RequestID: "n", Topic: "t"})
+	for name, value := range map[string][]byte{"empty": nil, "unknown": []byte("garbage"), "futureSingleton": []byte("QKVC\x02{}"), "futureBatch": []byte("QKVB\x02[]"), "legacySingleton": legacy, "legacyBatch": AssembleKVBatch([][]byte{legacyItem}), "graph": graph, "notify": notify} {
+		if !errors.Is(ValidateManagedKVExecutionPolicy(value), sqlpolicy.ErrIncompatible) {
+			t.Fatalf("%s accepted", name)
+		}
+	}
+	for _, value := range [][]byte{[]byte("QKVC\x01{}"), []byte("QKVB\x01[]"), []byte("QBAT\x07["), []byte("QRDB\x00"), []byte("QCKP\x00{}"), []byte("QLDR\x00[]"), []byte("QRCF\x00{}")} {
+		err := ValidateManagedKVExecutionPolicy(value)
+		if err == nil {
+			t.Fatalf("malformed recognized value accepted %q", value)
+		}
+		if bytes.HasPrefix(value, managedKVCommandMagic) {
+			_, _, direct := DecodeManagedKVCommand(value)
+			if direct.Error() != err.Error() {
+				t.Fatal("decoder error replaced")
+			}
+		}
+	}
+	if sqlpolicy.Version != 7 {
+		t.Fatal("SQL semantics changed")
+	}
+	// The legacy gate still rejects the new wire and retains its own allowlist.
+	if ValidateExecutionPolicy(single) == nil || ValidateExecutionPolicy(legacy) != nil || ValidateExecutionPolicy(graph) != nil || ValidateExecutionPolicy(notify) != nil {
+		t.Fatal("legacy policy changed")
+	}
+}
+
+func TestManagedKVExecutionPolicyConsensusBoundary(t *testing.T) {
+	wire, err := EncodeManagedKVCommand(KVCommand{RequestID: "i", Operation: "put", Key: "k"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Legal JSON whitespace makes an exact byte boundary independent of base64
+	// quantization. The parser ceiling is deliberately larger than execution.
+	atLimit := append(bytes.Clone(wire), bytes.Repeat([]byte{' '}, quepaxa.MaxReplicatedValueBytes-len(wire))...)
+	if len(atLimit) != 128<<10 || ValidateManagedKVExecutionPolicy(atLimit) != nil {
+		t.Fatal("exact consensus boundary rejected")
+	}
+	over := append(bytes.Clone(atLimit), ' ')
+	if _, ok, err := DecodeManagedKVCommand(over); !ok || err != nil {
+		t.Fatal("parser safety ceiling confused with eligibility")
+	}
+	if !errors.Is(ValidateManagedKVExecutionPolicy(over), sqlpolicy.ErrIncompatible) {
+		t.Fatal("over-limit execution accepted")
 	}
 }
