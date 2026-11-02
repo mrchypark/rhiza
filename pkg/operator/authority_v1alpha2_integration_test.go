@@ -123,7 +123,7 @@ func verifyMixedReservationCEL(ctx context.Context, t *testing.T, store *V1Alpha
 	if err != nil {
 		t.Fatal(err)
 	}
-	fingerprint, err := types.KVFingerprint(owned)
+	fingerprint, err := types.ManagedKVFingerprint(owned)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -423,8 +423,8 @@ func TestV1Alpha2MixedBudgetAPIServerContract(t *testing.T) {
 				if err != nil || !found || got.Value != nil || got.Expected == nil || len(got.Expected) != 0 {
 					t.Fatalf("nullable API intent changed: found=%v error=%v", found, err)
 				}
-				fingerprint, _ := types.KVFingerprint(got)
-				want, _ := types.KVFingerprint(nullable)
+				fingerprint, _ := types.ManagedKVFingerprint(got)
+				want, _ := types.ManagedKVFingerprint(nullable)
 				if fingerprint != want || got.RequestID != nullable.RequestID {
 					t.Fatal("nullable original identity changed")
 				}

@@ -156,6 +156,148 @@ func TestManagedMixedProfileSQLAndLegacy(t *testing.T) {
 	}
 }
 
+func TestManagedMixedProfilePendingRawFingerprint(t *testing.T) {
+	var previous []string
+	for _, key := range []string{string([]byte{0xff}), string([]byte{0xfe}), "\ufffd"} {
+		_, store, old := mixedAuthoritySetup(t)
+		command := types.KVCommand{RequestID: string([]byte{'i', 0xff}), Operation: "delete", Key: key}
+		reserved, obs, err := ReserveV1Alpha2KVWrite(context.Background(), store, old, old.Authority(), old.Evidence(), command)
+		if err != nil || obs != V1Alpha2CASApplied {
+			t.Fatalf("reserve %s %v", obs, err)
+		}
+		request, _ := reserved.Pending()
+		want, _ := types.ManagedKVFingerprint(command)
+		legacy, _ := types.KVFingerprint(command)
+		if request.Fingerprint != fmt.Sprintf("%x", want) || request.Fingerprint == fmt.Sprintf("%x", legacy) {
+			t.Fatal("pending still uses legacy JSON fingerprint")
+		}
+		for _, seen := range previous {
+			if request.Fingerprint == seen {
+				t.Fatal("raw key identities collided")
+			}
+		}
+		previous = append(previous, request.Fingerprint)
+		loaded, err := LoadV1Alpha2Admission(context.Background(), store, phase2Ref)
+		if err != nil {
+			t.Fatal(err)
+		}
+		got, found, err := loaded.PendingKV()
+		if err != nil || !found || !reflect.DeepEqual(got, command) {
+			t.Fatalf("fresh load lost raw original %#v %v", got, err)
+		}
+	}
+}
+
+func TestManagedMixedProfilePendingRawKeySwapRejected(t *testing.T) {
+	server, store, old := mixedAuthoritySetup(t)
+	command := types.KVCommand{RequestID: "same", Operation: "put", Key: string([]byte{0xff})}
+	reserved, _, err := ReserveV1Alpha2KVWrite(context.Background(), store, old, old.Authority(), old.Evidence(), command)
+	if err != nil {
+		t.Fatal(err)
+	}
+	request, _ := reserved.Pending()
+	loaded, err := LoadV1Alpha2Admission(context.Background(), store, phase2Ref)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, key := range []string{string([]byte{0xfe}), "\ufffd"} {
+		changed := command
+		changed.Key = key
+		raw, _, err := types.EncodeManagedKVOriginal(changed)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := decodePendingKV(raw, request); err == nil {
+			t.Fatal("same ID legacy-colliding raw key swap accepted")
+		}
+		before := server.puts
+		if _, _, err := ReserveV1Alpha2KVWrite(context.Background(), store, loaded, loaded.Authority(), loaded.Evidence(), changed); err == nil || server.puts != before {
+			t.Fatal("pending conflict reached status API")
+		}
+	}
+}
+
+func TestManagedMixedProfilePendingIntentAndExactOriginal(t *testing.T) {
+	server, store, old := mixedAuthoritySetup(t)
+	command := types.KVCommand{RequestID: "same", Operation: "delete", Key: "key"}
+	reserved, obs, err := ReserveV1Alpha2KVWrite(context.Background(), store, old, old.Authority(), old.Evidence(), command)
+	if err != nil || obs != V1Alpha2CASApplied {
+		t.Fatal(obs, err)
+	}
+	request, _ := reserved.Pending()
+	for _, change := range []func(*types.KVCommand){
+		func(c *types.KVCommand) { c.Value = []byte{1} },
+		func(c *types.KVCommand) { c.Expected = []byte{2} },
+		func(c *types.KVCommand) { c.ExpectedExists = true },
+		func(c *types.KVCommand) { c.Operation = "cas" },
+		func(c *types.KVCommand) { c.TTLMS = 13 },
+		func(c *types.KVCommand) { c.RequestID = "other" },
+	} {
+		changed := command
+		change(&changed)
+		raw, _, err := types.EncodeManagedKVOriginal(changed)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := decodePendingKV(raw, request); err == nil {
+			t.Fatal("different intent/identity reused pending identity")
+		}
+	}
+	// Fingerprint equivalence is NOT permission to replace the exact retained
+	// original. Normal status mutation must reject even null/empty-only changes.
+	equivalent := command
+	equivalent.Value = []byte{}
+	equivalent.Expected = []byte{}
+	fp, _ := types.ManagedKVFingerprint(equivalent)
+	if fmt.Sprintf("%x", fp) != request.Fingerprint {
+		t.Fatal("nil/empty logical equivalence changed")
+	}
+	raw, _, err := types.EncodeManagedKVOriginal(equivalent)
+	if err != nil {
+		t.Fatal(err)
+	}
+	before := server.puts
+	_, _, err = updateV1Alpha2AdmissionStatus(context.Background(), store, reserved, func(_ map[string]json.RawMessage, auth map[string]json.RawMessage) {
+		var pending v1alpha2PendingRequest
+		_ = json.Unmarshal(auth["pendingRequest"], &pending)
+		pending.OriginalKV = raw
+		auth["pendingRequest"], _ = json.Marshal(pending)
+	})
+	if err == nil || server.puts != before {
+		t.Fatal("equivalent fingerprint authorized original swap")
+	}
+	got, found, err := reserved.PendingKV()
+	if err != nil || !found || got.Value != nil || got.Expected != nil {
+		t.Fatal("retained exact null original changed")
+	}
+}
+
+func TestManagedMixedProfilePendingRejectsLegacyDomain(t *testing.T) {
+	server, store, old := mixedAuthoritySetup(t)
+	command := types.KVCommand{RequestID: "domain", Operation: "put", Key: "key"}
+	if _, _, err := ReserveV1Alpha2KVWrite(context.Background(), store, old, old.Authority(), old.Evidence(), command); err != nil {
+		t.Fatal(err)
+	}
+	var object map[string]json.RawMessage
+	if err := json.Unmarshal([]byte(server.cluster), &object); err != nil {
+		t.Fatal(err)
+	}
+	status, _ := jsonObject(object["status"])
+	auth, _ := jsonObject(status["authority"])
+	var pending v1alpha2PendingRequest
+	_ = json.Unmarshal(auth["pendingRequest"], &pending)
+	legacy, _ := types.KVFingerprint(command)
+	pending.Fingerprint = fmt.Sprintf("%x", legacy)
+	auth["pendingRequest"], _ = json.Marshal(pending)
+	status["authority"], _ = json.Marshal(auth)
+	object["status"], _ = json.Marshal(status)
+	b, _ := json.Marshal(object)
+	server.cluster = string(b)
+	if _, err := LoadV1Alpha2Admission(context.Background(), store, phase2Ref); err == nil {
+		t.Fatal("legacy domain silently accepted as mixed")
+	}
+}
+
 func TestManagedMixedProfileAmbiguousReservation(t *testing.T) {
 	server, store, old := mixedAuthoritySetup(t)
 	server.timeout = true

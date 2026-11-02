@@ -81,7 +81,7 @@ func decodePendingKV(raw json.RawMessage, request V1Alpha2WriteRequest) (types.K
 	if err != nil {
 		return types.KVCommand{}, err
 	}
-	fingerprint, err := types.KVFingerprint(command)
+	fingerprint, err := types.ManagedKVFingerprint(command)
 	if err != nil || request.Kind != "kv" || request.ID != id || request.Fingerprint != fmt.Sprintf("%x", fingerprint) {
 		return types.KVCommand{}, fmt.Errorf("pending KV fingerprint mismatch")
 	}
@@ -107,7 +107,7 @@ func ReserveV1Alpha2KVWrite(ctx context.Context, store *V1Alpha2StatusStore, old
 	if err != nil {
 		return V1Alpha2AdmissionSnapshot{}, "", err
 	}
-	fingerprint, err := types.KVFingerprint(owned)
+	fingerprint, err := types.ManagedKVFingerprint(owned)
 	if err != nil {
 		return V1Alpha2AdmissionSnapshot{}, "", err
 	}
