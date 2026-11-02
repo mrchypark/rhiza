@@ -182,7 +182,7 @@ profile_codec_revision() {
 		return "$status"
 	fi
 	# Go exits successfully when no benchmark matches, which is not evidence.
-	grep -Eq '^BenchmarkSQLBatchCodec/blob_1k_encode-[0-9]+[[:space:]]' "$profile_dir/$label.txt"
+	grep -Eq '^BenchmarkSQLBatchCodec/blob_1k_encode(-[1-9][0-9]*)?[[:space:]]' "$profile_dir/$label.txt"
 	test -s "$profile_dir/$label-cpu.pprof"
 	test -s "$profile_dir/$label-heap.pprof"
 	go tool pprof -top "$binary" "$profile_dir/$label-cpu.pprof" >"$profile_dir/$label-cpu-top.txt"
