@@ -30,6 +30,110 @@ type getCountingBucket struct {
 	uploads   atomic.Uint64
 }
 
+func TestCheckpointMaterializationPolicyExact(t *testing.T) {
+	ctx := context.Background()
+	bucket := &getCountingBucket{Bucket: objstore.NewInMemBucket()}
+	mixed, err := NewManagerForPolicy(bucket, "mixed", t.TempDir(), sqlpolicy.ManagedSQLKVMaterializationPolicy, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	legacy := NewManager(bucket, "legacy", t.TempDir(), 1)
+	appendOnly, err := NewAppendOnlyManagerForPolicy(bucket, "mixed-append", t.TempDir(), sqlpolicy.ManagedSQLKVMaterializationPolicy, 1)
+	if err != nil || !appendOnly.appendOnly || appendOnly.expectedPolicy != sqlpolicy.ManagedSQLKVMaterializationPolicy {
+		t.Fatalf("mixed append-only constructor: %v", err)
+	}
+	for _, policy := range []sqlpolicy.MaterializationPolicy{0, 6, 9, -1} {
+		if _, err := NewManagerForPolicy(bucket, "invalid", "", policy); !errors.Is(err, sqlpolicy.ErrIncompatible) {
+			t.Fatalf("constructor unknown policy %d: %v", policy, err)
+		}
+		if _, err := NewAppendOnlyManagerForPolicy(bucket, "invalid", "", policy); !errors.Is(err, sqlpolicy.ErrIncompatible) {
+			t.Fatalf("append constructor unknown policy %d: %v", policy, err)
+		}
+	}
+	for _, sources := range [][]Source{nil, {{Role: RoleGraphData, Path: "absent"}}, {{Role: RoleSQLite, Path: "absent"}, {Role: RoleGraphData, Path: "absent"}}, {{Role: RoleSQLite, Path: "absent"}, {Role: RoleSQLite, Path: "absent"}}, {{Role: "unknown", Path: "absent"}}} {
+		if _, err := mixed.CreateFiles(ctx, nil, sources, 1); err == nil {
+			t.Fatal("mixed invalid roles accepted")
+		}
+	}
+	if bucket.gets.Load() != 0 || bucket.uploads.Load() != 0 {
+		t.Fatal("role/profile constructor rejection touched object store")
+	}
+	legacySource := source(t, RoleSQLite, "legacy")
+	beforeGets, beforeUploads := bucket.gets.Load(), bucket.uploads.Load()
+	if _, err := mixed.CreateFiles(ctx, nil, []Source{legacySource}, 1); !errors.Is(err, sqlpolicy.ErrIncompatible) {
+		t.Fatalf("mixed accepted legacy SQLite source: %v", err)
+	}
+	if bucket.gets.Load() != beforeGets || bucket.uploads.Load() != beforeUploads {
+		t.Fatal("source profile rejection touched object store")
+	}
+	path := filepath.Join(t.TempDir(), "mixed.db")
+	db, err := driver.Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`CREATE TABLE _rhiza_meta(key TEXT PRIMARY KEY,value TEXT);INSERT INTO _rhiza_meta VALUES('sql_execution_policy','8');CREATE TABLE application(value)`); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := legacy.CreateFiles(ctx, nil, []Source{{Role: RoleSQLite, Path: path}}, 1); !errors.Is(err, sqlpolicy.ErrIncompatible) {
+		t.Fatalf("legacy accepted mixed source: %v", err)
+	}
+	claim, err := mixed.AcquirePublisherClaim(ctx, "test", 0, time.Minute)
+	if err != nil {
+		t.Fatal(err)
+	}
+	root, err := mixed.CreateFiles(ctx, claim, []Source{{Role: RoleSQLite, Path: path}}, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if root.SQLExecutionPolicy != 8 || len(root.Files) != 1 || root.Files[0].Role != RoleSQLite {
+		t.Fatalf("wrong mixed root profile: %+v", root)
+	}
+	if err := legacy.validateRoot(*root); !errors.Is(err, sqlpolicy.ErrIncompatible) {
+		t.Fatalf("legacy root checker accepted mixed: %v", err)
+	}
+	if _, err := mixed.DownloadAndVerifyRootFiles(ctx, root, t.TempDir()); err != nil {
+		t.Fatal(err)
+	}
+	for _, policy := range []int{7, 9, 0} {
+		changed := *root
+		changed.SQLExecutionPolicy = policy
+		before := bucket.gets.Load()
+		if _, err := mixed.DownloadAndVerifyRootFiles(ctx, &changed, t.TempDir()); !errors.Is(err, sqlpolicy.ErrIncompatible) {
+			t.Fatalf("mismatched root policy %d: %v", policy, err)
+		}
+		if bucket.gets.Load() != before {
+			t.Fatal("root policy rejected after download")
+		}
+	}
+	bad := *root
+	bad.Files = append(append([]File(nil), root.Files...), File{Role: RoleGraphData, Size: 1})
+	before := bucket.gets.Load()
+	if _, err := mixed.DownloadAndVerifyRootFiles(ctx, &bad, t.TempDir()); err == nil {
+		t.Fatal("Graph role accepted")
+	}
+	if bucket.gets.Load() != before {
+		t.Fatal("role rejection touched object store")
+	}
+	// A syntactically valid mixed root must not bless legacy SQLite bytes.
+	oldCreator := NewManager(bucket, "wrong-sqlite", t.TempDir(), 1)
+	oldRoot := createFiles(t, oldCreator, ctx, []Source{legacySource}, 1)
+	wrongSQLite := *oldRoot
+	wrongSQLite.SQLExecutionPolicy = 8
+	verifier, err := NewManagerForPolicy(bucket, "wrong-sqlite", t.TempDir(), sqlpolicy.ManagedSQLKVMaterializationPolicy, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := verifier.DownloadAndVerifyRootFiles(ctx, &wrongSQLite, t.TempDir()); !errors.Is(err, sqlpolicy.ErrIncompatible) {
+		t.Fatalf("root8 accepted SQLite7: %v", err)
+	}
+	if len(verifier.verifiedRoots) != 0 {
+		t.Fatal("rejected SQLite marked verified")
+	}
+}
+
 func TestGarbageCollectRequiresRecoveryBaseBeforeStorageAccess(t *testing.T) {
 	bucket := &getCountingBucket{Bucket: objstore.NewInMemBucket()}
 	manager := NewManager(bucket, "cluster", t.TempDir(), 9)

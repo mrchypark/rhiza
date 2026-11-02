@@ -1,4 +1,4 @@
-// Package sqlpolicy identifies the single supported materialization policy.
+// Package sqlpolicy fixes SQL semantics and exact durable materialization profiles.
 package sqlpolicy
 
 import (
@@ -16,31 +16,64 @@ import (
 const Version = 7
 const PeerALPN = "rhiza-peer-v7"
 
+// MaterializationPolicy identifies durable state, not the SQL parser version.
+type MaterializationPolicy int
+
+const (
+	LegacyMaterializationPolicy       MaterializationPolicy = Version
+	ManagedSQLKVMaterializationPolicy MaterializationPolicy = 8
+)
+
+func (p MaterializationPolicy) Validate() error {
+	if p != LegacyMaterializationPolicy && p != ManagedSQLKVMaterializationPolicy {
+		return ErrIncompatible
+	}
+	return nil
+}
+
 func Marker() string { return strconv.Itoa(Version) }
 
 var ErrIncompatible = errors.New("incompatible SQL execution policy: preserve the old installation and migrate logically to a new cluster")
 
 func CheckExisting(ctx context.Context, path string) error {
+	return CheckExistingForPolicy(ctx, path, LegacyMaterializationPolicy)
+}
+
+func CheckExistingForPolicy(ctx context.Context, path string, expected MaterializationPolicy) error {
+	if err := expected.Validate(); err != nil {
+		return err
+	}
 	if _, err := os.Stat(path); os.IsNotExist(err) {
 		return nil
 	} else if err != nil {
 		return err
 	}
-	return CheckFile(ctx, path)
+	return CheckFileForPolicy(ctx, path, expected)
 }
 
 // CheckFile inspects provenance without opening a writer or upgrading the file.
 func CheckFile(ctx context.Context, path string) error {
-	return checkFile(ctx, path, false)
+	return CheckFileForPolicy(ctx, path, LegacyMaterializationPolicy)
 }
 
 // CheckSnapshotFile inspects a standalone checkpoint SQLite image without
 // allowing SQLite to create WAL/SHM sidecars beside the immutable source.
 func CheckSnapshotFile(ctx context.Context, path string) error {
-	return checkFile(ctx, path, true)
+	return CheckSnapshotFileForPolicy(ctx, path, LegacyMaterializationPolicy)
 }
 
-func checkFile(ctx context.Context, path string, immutable bool) error {
+func CheckFileForPolicy(ctx context.Context, path string, expected MaterializationPolicy) error {
+	return checkFile(ctx, path, false, expected)
+}
+
+func CheckSnapshotFileForPolicy(ctx context.Context, path string, expected MaterializationPolicy) error {
+	return checkFile(ctx, path, true, expected)
+}
+
+func checkFile(ctx context.Context, path string, immutable bool, expected MaterializationPolicy) error {
+	if err := expected.Validate(); err != nil {
+		return err
+	}
 	path, err := filepath.Abs(path)
 	if err != nil {
 		return err
@@ -58,7 +91,7 @@ func checkFile(ctx context.Context, path string, immutable bool) error {
 	if err := db.QueryRowContext(ctx, `SELECT value FROM _rhiza_meta WHERE key='sql_execution_policy'`).Scan(&policy); err != nil {
 		return fmt.Errorf("%w: missing materialization marker: %v", ErrIncompatible, err)
 	}
-	if policy != Marker() {
+	if policy != strconv.Itoa(int(expected)) {
 		return fmt.Errorf("%w: marker %q", ErrIncompatible, policy)
 	}
 	rows, err := db.QueryContext(ctx, `PRAGMA main.table_list`)

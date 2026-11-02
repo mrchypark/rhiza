@@ -117,6 +117,7 @@ type RecoveryPin struct {
 }
 
 type Manager struct {
+	expectedPolicy           sqlpolicy.MaterializationPolicy
 	appendOnly               bool
 	bucket                   objstore.Bucket
 	prefix                   string
@@ -134,6 +135,13 @@ type Manager struct {
 
 // NewAppendOnlyManager opens an HA namespace without online deletion.
 func NewAppendOnlyManager(bucket objstore.Bucket, prefix, localDir string, configID ...uint) (*Manager, error) {
+	return NewAppendOnlyManagerForPolicy(bucket, prefix, localDir, sqlpolicy.LegacyMaterializationPolicy, configID...)
+}
+
+func NewAppendOnlyManagerForPolicy(bucket objstore.Bucket, prefix, localDir string, expected sqlpolicy.MaterializationPolicy, configID ...uint) (*Manager, error) {
+	if err := expected.Validate(); err != nil {
+		return nil, err
+	}
 	if bucket == nil {
 		return nil, fmt.Errorf("append-only checkpoint requires an object store")
 	}
@@ -141,13 +149,24 @@ func NewAppendOnlyManager(bucket objstore.Bucket, prefix, localDir string, confi
 	if !slices.Contains(options, objstore.IfNotExists) || !slices.Contains(options, objstore.IfMatch) {
 		return nil, fmt.Errorf("append-only checkpoint requires conditional object writes")
 	}
-	m := NewManager(bucket, prefix, localDir, configID...)
+	m := newManagerForPolicy(bucket, prefix, localDir, expected, configID...)
 	m.appendOnly = true
 	return m, nil
 }
 
 func NewManager(bucket objstore.Bucket, prefix, localDir string, configID ...uint) *Manager {
-	m := &Manager{bucket: bucket, prefix: prefix, localDir: localDir, verifiedRoots: make(map[[32]byte]verifiedRoot)}
+	return newManagerForPolicy(bucket, prefix, localDir, sqlpolicy.LegacyMaterializationPolicy, configID...)
+}
+
+func NewManagerForPolicy(bucket objstore.Bucket, prefix, localDir string, expected sqlpolicy.MaterializationPolicy, configID ...uint) (*Manager, error) {
+	if err := expected.Validate(); err != nil {
+		return nil, err
+	}
+	return newManagerForPolicy(bucket, prefix, localDir, expected, configID...), nil
+}
+
+func newManagerForPolicy(bucket objstore.Bucket, prefix, localDir string, expected sqlpolicy.MaterializationPolicy, configID ...uint) *Manager {
+	m := &Manager{bucket: bucket, prefix: prefix, localDir: localDir, expectedPolicy: expected, verifiedRoots: make(map[[32]byte]verifiedRoot)}
 	if len(configID) > 0 {
 		m.configID = configID[0]
 	}
@@ -528,9 +547,12 @@ func (m *Manager) CreateFiles(ctx context.Context, claim *PublisherClaim, source
 // createFilesWithScanObserver is the opt-in cost-test path. The callback reports
 // the block scan/hash phase only; it does not include block uploads.
 func (m *Manager) createFilesWithScanObserver(ctx context.Context, claim *PublisherClaim, sources []Source, index uint64, onScan func(role string, elapsed time.Duration)) (*Checkpoint, error) {
+	if err := m.validateSourceProfile(sources); err != nil {
+		return nil, err
+	}
 	for _, source := range sources {
 		if source.Role == RoleSQLite {
-			if err := sqlpolicy.CheckFile(ctx, source.Path); err != nil {
+			if err := sqlpolicy.CheckFileForPolicy(ctx, source.Path, m.expectedPolicy); err != nil {
 				return nil, err
 			}
 		}
@@ -549,7 +571,7 @@ func (m *Manager) createFilesWithScanObserver(ctx context.Context, claim *Publis
 	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	root := Checkpoint{SQLExecutionPolicy: sqlpolicy.Version, ConfigID: m.configID, Generation: claim.Generation, Index: index}
+	root := Checkpoint{SQLExecutionPolicy: int(m.expectedPolicy), ConfigID: m.configID, Generation: claim.Generation, Index: index}
 	conditional := false
 	for _, option := range m.bucket.SupportedObjectUploadOptions() {
 		conditional = conditional || option == objstore.IfNotExists
@@ -936,6 +958,19 @@ func validateSources(sources []Source) error {
 	return nil
 }
 
+func (m *Manager) validateSourceProfile(sources []Source) error {
+	if err := m.expectedPolicy.Validate(); err != nil {
+		return err
+	}
+	if err := validateSources(sources); err != nil {
+		return err
+	}
+	if m.expectedPolicy == sqlpolicy.ManagedSQLKVMaterializationPolicy && (len(sources) != 1 || sources[0].Role != RoleSQLite) {
+		return fmt.Errorf("mixed checkpoint requires exactly one SQLite file")
+	}
+	return nil
+}
+
 func (m *Manager) Latest() *Checkpoint {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -988,7 +1023,7 @@ func (m *Manager) DownloadAndVerifyRootFiles(ctx context.Context, root *Checkpoi
 	}
 	for _, file := range files {
 		if file.Role == RoleSQLite {
-			if err := sqlpolicy.CheckFile(ctx, file.Path); err != nil {
+			if err := sqlpolicy.CheckFileForPolicy(ctx, file.Path, m.expectedPolicy); err != nil {
 				return nil, err
 			}
 		}
@@ -1640,8 +1675,11 @@ func (m *Manager) readRoot(ctx context.Context, name string, expected [32]byte) 
 }
 
 func (m *Manager) validateRoot(root Checkpoint) error {
-	if root.SQLExecutionPolicy != sqlpolicy.Version {
+	if m.expectedPolicy.Validate() != nil || root.SQLExecutionPolicy != int(m.expectedPolicy) {
 		return sqlpolicy.ErrIncompatible
+	}
+	if m.expectedPolicy == sqlpolicy.ManagedSQLKVMaterializationPolicy && (len(root.Files) != 1 || root.Files[0].Role != RoleSQLite) {
+		return fmt.Errorf("mixed checkpoint requires exactly one SQLite file")
 	}
 	if root.ConfigID != m.configID || root.Generation == 0 || root.Index == 0 || root.Size <= 0 || root.Size > maxCheckpointSize || len(root.Files) < 1 || len(root.Files) > 2 {
 		return fmt.Errorf("invalid checkpoint root")
