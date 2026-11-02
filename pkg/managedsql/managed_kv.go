@@ -138,6 +138,12 @@ func (h *Host) mixed() bool {
 }
 
 func (h *Host) inspectEvidence(ctx context.Context, fresh, localRead bool) (json.RawMessage, error) {
+	evidence, _, err := h.inspectEvidenceSnapshot(ctx, fresh, localRead)
+	return evidence, err
+}
+
+// Keep the evidence and the exact runtime validated by its inspector together.
+func (h *Host) inspectEvidenceSnapshot(ctx context.Context, fresh, localRead bool) (json.RawMessage, node.ManagedRuntimeState, error) {
 	if h.mixed() {
 		var state node.ManagedKVSnapshot
 		var err error
@@ -147,9 +153,10 @@ func (h *Host) inspectEvidence(ctx context.Context, fresh, localRead bool) (json
 			state, err = h.node.InspectManagedKV(ctx, fresh)
 		}
 		if err != nil {
-			return nil, err
+			return nil, node.ManagedRuntimeState{}, err
 		}
-		return json.Marshal(sqlEvidence{types.ManagedApplicationProtocolSQLKV, fmt.Sprintf("%x", state.Application.Digest)})
+		evidence, err := json.Marshal(sqlEvidence{types.ManagedApplicationProtocolSQLKV, fmt.Sprintf("%x", state.Application.Digest)})
+		return evidence, state.Runtime, err
 	}
 	var state node.ManagedSQLSnapshot
 	var err error
@@ -159,9 +166,9 @@ func (h *Host) inspectEvidence(ctx context.Context, fresh, localRead bool) (json
 		state, err = h.node.InspectManagedSQL(ctx, fresh)
 	}
 	if err != nil {
-		return nil, err
+		return nil, node.ManagedRuntimeState{}, err
 	}
-	return encodeEvidence(state), nil
+	return encodeEvidence(state), state.Runtime, nil
 }
 
 func (h *Host) ValidateManagedKVWrite(ctx context.Context, i node.ManagedStartupIdentity, _ node.ManagedRuntimeState, operation string, req network.KVMutationRequest) error {
@@ -375,15 +382,16 @@ func (h *Host) resolveOriginal(ctx context.Context, p applicationOriginal) (Reco
 	if receipt == nil || !confirmed {
 		return result, fmt.Errorf("application outcome or configured durability remains unknown")
 	}
-	state, err := h.node.ManagedState()
-	if err != nil {
-		return result, err
-	}
+	return result, nil
+}
+
+func validateResolvedHistory(p applicationOriginal, result RecoveryResult, state node.ManagedRuntimeState) error {
+	receipt := result.receipt()
 	terminal := receipt.Status == types.MutationCommitted || p.kind == "sql" && receipt.Status == types.MutationRejected
 	if receipt.Slot == 0 || receipt.Slot > state.CertifiedTip || state.AppliedTip != state.CertifiedTip || state.RecorderTip > state.CertifiedTip || !terminal {
-		return result, fmt.Errorf("receipt is outside terminal certified history")
+		return fmt.Errorf("receipt is outside terminal certified history: slot=%d certified=%d applied=%d recorder=%d terminal=%t sql=%t", receipt.Slot, state.CertifiedTip, state.AppliedTip, state.RecorderTip, terminal, p.kind == "sql")
 	}
-	return result, nil
+	return nil
 }
 
 func (r RecoveryResult) receipt() types.MutationReceipt {
@@ -414,8 +422,11 @@ func (h *Host) finalizeApplication(ctx context.Context, p applicationOriginal, a
 		}
 		return result, err
 	}
-	evidence, err := h.inspectEvidence(ctx, false, false)
+	evidence, runtime, err := h.inspectEvidenceSnapshot(ctx, false, false)
 	if err != nil {
+		return result, err
+	}
+	if err := validateResolvedHistory(p, result, runtime); err != nil {
 		return result, err
 	}
 	if err := h.validateOriginalRecovery(ctx, p); err != nil {
@@ -502,8 +513,14 @@ func (h *Host) verifyRemoteApplication(ctx context.Context, p applicationOrigina
 	if err != nil {
 		return result, errors.Join(fmt.Errorf("remote finalization lacks exact durable receipt"), err)
 	}
-	evidence, err := h.inspectEvidence(ctx, false, false)
-	if err != nil || evidenceHash(before.Evidence()) != evidenceHash(evidence) {
+	evidence, runtime, err := h.inspectEvidenceSnapshot(ctx, false, false)
+	if err != nil {
+		return result, errors.Join(fmt.Errorf("remote finalization differs from canonical SQL evidence"), err)
+	}
+	if err := validateResolvedHistory(p, result, runtime); err != nil {
+		return result, err
+	}
+	if evidenceHash(before.Evidence()) != evidenceHash(evidence) {
 		return result, errors.Join(fmt.Errorf("remote finalization differs from canonical SQL evidence"), err)
 	}
 	after, err := h.live(ctx)
