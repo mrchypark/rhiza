@@ -1600,7 +1600,7 @@ func (s *Server) query(ctx context.Context, req QueryRequest) (QueryResponse, er
 	}
 	result, appliedSlot, err := s.material.QueryResultAt(ctx, req.SQL, req.Args)
 	if err != nil {
-		return QueryResponse{}, fmt.Errorf("%w: %v", ErrInvalidRequest, err)
+		return QueryResponse{}, fmt.Errorf("%w: %w", ErrInvalidRequest, err)
 	}
 	return QueryResponse{Columns: result.Columns, Rows: result.Rows, AppliedSlot: appliedSlot, ConsensusTip: uint64(s.core.Tip())}, nil
 }
