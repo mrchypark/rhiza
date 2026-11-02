@@ -11,6 +11,8 @@ import (
 
 const MaxManagedKVOriginalBytes = 300 << 10
 
+const ManagedApplicationProtocolSQLKV = "rhiza-managed-sql-kv/v1"
+
 // ManagedKVOriginal is the typed mixed-protocol intent, not a timestamped
 // execution command. Byte fields use JSON's base64 representation exactly once.
 // Value and Expected deliberately retain null versus non-nil empty bytes.
