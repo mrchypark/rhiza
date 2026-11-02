@@ -343,6 +343,10 @@ func EncodeSQLBatchItem(command SQLCommand) ([]byte, error) {
 	return json.Marshal(wire)
 }
 
+type sqlBlobArgument struct {
+	Value string `json:"$rhiza_blob"`
+}
+
 func encodeSQLArgs(args []any) ([]any, bool) {
 	var result []any
 	for i, arg := range args {
@@ -350,7 +354,7 @@ func encodeSQLArgs(args []any) ([]any, bool) {
 			if result == nil {
 				result = append([]any(nil), args...)
 			}
-			result[i] = map[string]string{"$rhiza_blob": base64.StdEncoding.EncodeToString(value)}
+			result[i] = sqlBlobArgument{Value: base64.StdEncoding.EncodeToString(value)}
 		}
 	}
 	if result == nil {

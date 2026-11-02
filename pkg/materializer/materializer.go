@@ -100,6 +100,7 @@ type Materializer struct {
 	walCheckpointStop        chan struct{}
 	walCheckpointOnce        sync.Once
 	walCheckpointWG          sync.WaitGroup
+	walCheckpointIO          sync.WaitGroup
 }
 
 type notificationSubscription struct {
@@ -1234,9 +1235,13 @@ func (m *Materializer) runSQLiteCheckpoints() {
 		case <-ticker.C:
 			m.mu.RLock()
 			db := m.db
+			if db != nil {
+				m.walCheckpointIO.Add(1)
+			}
 			m.mu.RUnlock()
 			if db != nil {
 				_, _ = db.Exec(`PRAGMA wal_checkpoint(PASSIVE)`)
+				m.walCheckpointIO.Done()
 			}
 		}
 	}
@@ -2311,6 +2316,15 @@ func (m *Materializer) Query(ctx context.Context, query string, args ...interfac
 	return reader.QueryContext(ctx, query, args...)
 }
 
+// queryContextCause preserves both actual SQLite interruption and its completed
+// call context. Other driver errors must not become cancellation after the fact.
+func queryContextCause(ctx context.Context, err error) error {
+	if errors.Is(err, sqlite3.INTERRUPT) && ctx.Err() != nil {
+		return errors.Join(err, ctx.Err())
+	}
+	return err
+}
+
 // QueryResult executes a bounded read query and materializes its result.
 func (m *Materializer) QueryResult(ctx context.Context, query string, args []any) (types.SQLStatementResult, error) {
 	if strings.TrimSpace(query) == "" || len(query) > MaxSQLBytes {
@@ -2325,12 +2339,12 @@ func (m *Materializer) QueryResult(ctx context.Context, query string, args []any
 	}
 	rows, err := m.Query(ctx, query, normalized...)
 	if err != nil {
-		return types.SQLStatementResult{}, err
+		return types.SQLStatementResult{}, queryContextCause(ctx, err)
 	}
 	defer rows.Close()
 	result, err := collectRows(rows, MaxReturningRows)
 	if err != nil {
-		return types.SQLStatementResult{}, err
+		return types.SQLStatementResult{}, queryContextCause(ctx, err)
 	}
 	encodedBytes, err := encodedJSONSize(result)
 	if err != nil {
@@ -2357,17 +2371,17 @@ func (m *Materializer) QueryResultAt(ctx context.Context, query string, args []a
 	}
 	snapshot, err := m.beginSQLiteReadSnapshot(ctx)
 	if err != nil {
-		return types.SQLStatementResult{}, 0, err
+		return types.SQLStatementResult{}, 0, queryContextCause(ctx, err)
 	}
 	defer snapshot.Close()
 	rows, err := snapshot.conn.QueryContext(ctx, query, normalized...)
 	if err != nil {
-		return types.SQLStatementResult{}, 0, err
+		return types.SQLStatementResult{}, 0, queryContextCause(ctx, err)
 	}
 	defer rows.Close()
 	result, err := collectRows(rows, MaxReturningRows)
 	if err != nil {
-		return types.SQLStatementResult{}, 0, err
+		return types.SQLStatementResult{}, 0, queryContextCause(ctx, err)
 	}
 	encodedBytes, err := encodedJSONSize(result)
 	if err != nil {
@@ -2923,6 +2937,8 @@ func (m *Materializer) reopen() error {
 	return nil
 }
 
+// adopt requires m.mu's write lock and already-closed previous target handles.
+// source must be a distinct temporary materializer exclusively owned by caller.
 func (m *Materializer) adopt(source *Materializer) {
 	source.stopSQLiteCheckpoints()
 	m.db, m.writer, m.readers, m.graph = source.db, source.writer, source.readers, source.graph
@@ -2966,6 +2982,9 @@ func (m *Materializer) Close() error {
 }
 
 func (m *Materializer) closeConnections() error {
+	// Caller owns m.mu exclusively, so no new checkpoint can register while
+	// retirement waits. Completion does not need m.mu or the whole worker.
+	m.walCheckpointIO.Wait()
 	if m.graph != nil {
 		m.graph.close()
 		m.graph = nil
