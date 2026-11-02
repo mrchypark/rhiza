@@ -107,6 +107,99 @@ func TestV1Alpha2AuthorityAPIServerContract(t *testing.T) {
 	}
 }
 
+// Verify each reservation binding on pending=false -> true. Testing these on
+// an already-pending object would let immutable-pending rules mask a missing
+// binding equality. All requests are server dry runs, not execution authority.
+func verifyMixedReservationCEL(ctx context.Context, t *testing.T, store *V1Alpha2StatusStore, old V1Alpha2AdmissionSnapshot, command types.KVCommand) {
+	t.Helper()
+	if _, pending := old.Pending(); pending {
+		t.Fatal("reservation CEL fixture must start without pending")
+	}
+	original, owned, err := types.EncodeManagedKVOriginal(command)
+	if err != nil {
+		t.Fatal(err)
+	}
+	id, err := types.ManagedKVPendingWireID(owned.RequestID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	fingerprint, err := types.KVFingerprint(owned)
+	if err != nil {
+		t.Fatal(err)
+	}
+	pending := v1alpha2PendingRequest{V1Alpha2WriteRequest: V1Alpha2WriteRequest{Kind: "kv", ID: id, Fingerprint: fmt.Sprintf("%x", fingerprint)}, PriorEvidence: old.Evidence(), OriginalKV: original, Reservation: reservationContext(old.Authority())}
+	base, _ := json.Marshal(old.status.object)
+	request := func(change func(map[string]json.RawMessage, map[string]json.RawMessage)) error {
+		var object map[string]json.RawMessage
+		if err := json.Unmarshal(base, &object); err != nil {
+			return err
+		}
+		status, _ := jsonObject(object["status"])
+		auth, _ := jsonObject(status["authority"])
+		auth["pendingWrite"], auth["everApplicationReserved"] = json.RawMessage("true"), json.RawMessage("true")
+		auth["pendingRequest"], _ = json.Marshal(pending)
+		contextObject, _ := jsonObject(auth["pendingRequest"])
+		reservation, _ := jsonObject(contextObject["reservation"])
+		owner, _ := jsonObject(auth["owner"])
+		if change != nil {
+			change(reservation, owner)
+		}
+		contextObject["reservation"], _ = json.Marshal(reservation)
+		auth["pendingRequest"], _ = json.Marshal(contextObject)
+		auth["owner"], _ = json.Marshal(owner)
+		status["authority"], _ = json.Marshal(auth)
+		object["status"], _ = json.Marshal(status)
+		var response map[string]json.RawMessage
+		ref := old.status.ref
+		return store.Kube.Put(ctx, "/apis/"+V1Alpha2APIVersion+"/namespaces/"+ref.Namespace+"/rhizaclusters/"+ref.Name+"/status?dryRun=All", object, &response)
+	}
+	if err := request(nil); err != nil {
+		t.Fatalf("matching reservation dry-run rejected: %v", err)
+	}
+	for _, field := range []string{"generation", "deploymentUID", "storageID", "namespace", "name", "uid", "logicalID"} {
+		t.Run("reservation-mismatch-"+field, func(t *testing.T) {
+			err := request(func(reservation, _ map[string]json.RawMessage) {
+				if field == "generation" {
+					reservation[field] = json.RawMessage("1")
+				} else {
+					reservation[field] = json.RawMessage(`"other"`)
+				}
+			})
+			var api *APIError
+			if !errors.As(err, &api) || api.StatusCode != 422 {
+				t.Fatalf("exact reservation equality did not reject %s: %v", field, err)
+			}
+		})
+	}
+	for _, side := range []string{"reservation", "owner"} {
+		for _, kind := range []string{"missing", "null", "literal-escaped-only", "overlong"} {
+			t.Run(side+"-namespace-"+kind, func(t *testing.T) {
+				err := request(func(reservation, owner map[string]json.RawMessage) {
+					object := reservation
+					if side == "owner" {
+						object = owner
+					}
+					switch kind {
+					case "missing":
+						delete(object, "namespace")
+					case "null":
+						object["namespace"] = json.RawMessage("null")
+					case "literal-escaped-only":
+						object["__namespace__"] = object["namespace"]
+						delete(object, "namespace")
+					case "overlong":
+						object["namespace"], _ = json.Marshal(strings.Repeat("n", 64))
+					}
+				})
+				var api *APIError
+				if !errors.As(err, &api) || api.StatusCode != 422 {
+					t.Fatalf("invalid namespace accepted or non-admission failure: %v", err)
+				}
+			})
+		}
+	}
+}
+
 // This qualifies API storage/CEL and normal shared status writes, not runtime
 // REMOVE/ADD certificates. Administrative fixture evidence is never a DB ACK.
 func TestV1Alpha2MixedBudgetAPIServerContract(t *testing.T) {
@@ -199,6 +292,7 @@ func TestV1Alpha2MixedBudgetAPIServerContract(t *testing.T) {
 			}
 			// Exactly the ordinary pure admission charge maximum, not a reduced blob cap.
 			command := types.KVCommand{RequestID: string([]byte{0xff}), Operation: "put", Key: string([]byte{0xfe, 'k', 'k', 'k'}), Value: make([]byte, 209656), Expected: []byte{}}
+			verifyMixedReservationCEL(ctx, t, store, old, command)
 			reserved, obs, err := ReserveV1Alpha2KVWrite(ctx, store, old, old.Authority(), old.Evidence(), command)
 			if err != nil || obs != V1Alpha2CASApplied {
 				t.Fatalf("max reserve %s %v", obs, err)

@@ -9,6 +9,15 @@ admission_error() {
   grep -E 'Error from server \((Invalid|BadRequest)\)|strict decoding error|^The (RhizaCluster|RhizaRecovery) "[^"]+" is invalid:' "$file" >/dev/null
 }
 
+cel_namespace_cost_error() {
+  file=$1
+  if grep -Ei 'connection refused|timed out|timeout|unable to connect|no such host|i/o timeout|EOF|Error from server \((Forbidden|NotFound)\)' "$file" >/dev/null; then return 1; fi
+  # Bind path and reason to the same error item, even when kubectl joins
+  # multiple validation errors on one line.
+  grep -F 'openAPIV3Schema.x-kubernetes-validations[1].rule: Forbidden: estimated rule cost exceeds budget' "$file" >/dev/null || return 1
+  grep -E 'Error from server \(Invalid\)|^The CustomResourceDefinition "[^"]+" is invalid:' "$file" >/dev/null
+}
+
 if [ "${1:-}" = --self-test-oracle ]; then
   tmp=$(mktemp -d "${TMPDIR:-/tmp}/ha-oracle.XXXXXXXX")
   trap 'rm -f "$tmp/case"; rmdir "$tmp"' EXIT HUP INT TERM
@@ -30,6 +39,33 @@ if [ "${1:-}" = --self-test-oracle ]; then
     printf '%s\n' "$line" > "$tmp/case"
     if admission_error "$tmp/case" 'target is immutable'; then exit 1; fi
   done
+  cost='spec.validation.openAPIV3Schema.x-kubernetes-validations[1].rule: Forbidden: estimated rule cost exceeds budget by factor of more than 100x'
+  printf '%s\n' "The CustomResourceDefinition \"rhizaclusters.rhiza.mrchypark.dev\" is invalid: $cost" > "$tmp/case"
+  cel_namespace_cost_error "$tmp/case" || exit 1
+  for line in \
+    "Error from server (Forbidden): $cost" \
+    "timeout: $cost" \
+    'The CustomResourceDefinition "cluster" is invalid: spec.validation.openAPIV3Schema.x-kubernetes-validations[2].rule: estimated rule cost exceeds budget' \
+    'The CustomResourceDefinition "cluster" is invalid: spec.validation.openAPIV3Schema.x-kubernetes-validations[1].rule: undeclared reference'; do
+    printf '%s\n' "$line" > "$tmp/case"
+    if cel_namespace_cost_error "$tmp/case"; then exit 1; fi
+  done
+  printf '%s\n' \
+    'The CustomResourceDefinition "cluster" is invalid: spec.validation.openAPIV3Schema.x-kubernetes-validations[1].rule: undeclared reference' \
+    'spec.validation.openAPIV3Schema.x-kubernetes-validations[2].rule: Forbidden: estimated rule cost exceeds budget' > "$tmp/case"
+  if cel_namespace_cost_error "$tmp/case"; then
+    echo 'cost oracle combined unrelated rule[1] and rule[2] errors' >&2
+    exit 1
+  fi
+  printf '%s\n' 'The CustomResourceDefinition "cluster" is invalid: spec.validation.openAPIV3Schema.x-kubernetes-validations[1].rule: undeclared reference, spec.validation.openAPIV3Schema.x-kubernetes-validations[2].rule: Forbidden: estimated rule cost exceeds budget' > "$tmp/case"
+  if cel_namespace_cost_error "$tmp/case"; then
+    echo 'cost oracle combined unrelated errors on one line' >&2
+    exit 1
+  fi
+  printf '%s\n' \
+    "The CustomResourceDefinition \"cluster\" is invalid: $cost" \
+    'spec.validation.openAPIV3Schema: Forbidden: estimated rule cost exceeds budget for the entire schema' > "$tmp/case"
+  cel_namespace_cost_error "$tmp/case" || exit 1
   exit 0
 fi
 
@@ -96,6 +132,19 @@ fi
 k() { kubectl --kubeconfig "$kubeconfig" --context "$context" --request-timeout=30s "$@"; }
 k version >> "$logs/versions.txt"
 k create namespace "$namespace" > "$logs/namespace.txt" 2>&1
+# Same API server and schema: preserve the original failure, then qualify the
+# corrected spelling. This observes compilation rejection, not numeric MaxCost.
+sed 's/self.status.authority.pendingRequest.reservation.__namespace__/self.status.authority.pendingRequest.reservation.namespace/g; s/self.status.authority.owner.__namespace__/self.status.authority.owner.namespace/g' deploy/operator/cluster-crd.yaml > "$logs/cel-original-namespace-crd.yaml"
+if k apply --validate=strict --dry-run=server -f "$logs/cel-original-namespace-crd.yaml" > "$logs/cel-original-namespace.txt" 2>&1; then
+  echo 'original namespace selectors unexpectedly compiled; inspect the pinned API environment' >&2
+  exit 1
+fi
+if ! cel_namespace_cost_error "$logs/cel-original-namespace.txt"; then
+  cat "$logs/cel-original-namespace.txt" >&2
+  echo 'original CRD failed for a different reason, not the expected CEL cost rejection' >&2
+  exit 1
+fi
+k apply --validate=strict --dry-run=server -f deploy/operator/cluster-crd.yaml > "$logs/cel-fixed-namespace.txt" 2>&1
 k apply --validate=strict -f deploy/operator/cluster-crd.yaml -f deploy/operator/crd.yaml > "$logs/apply-crds.txt" 2>&1
 k wait --for=condition=Established --timeout=90s crd/rhizaclusters.rhiza.mrchypark.dev crd/rhizarecoveries.rhiza.mrchypark.dev > "$logs/established.txt" 2>&1
 

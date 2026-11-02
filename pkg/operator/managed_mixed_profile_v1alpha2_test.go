@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"os"
 	"reflect"
 	"strings"
 	"testing"
@@ -16,7 +17,59 @@ import (
 	"github.com/mrchypark/rhiza/internal/types"
 	"github.com/mrchypark/rhiza/pkg/network"
 	"github.com/mrchypark/rhiza/pkg/quepaxa"
+	"gopkg.in/yaml.v3"
 )
+
+func TestManagedMixedProfileCELReservationSelectors(t *testing.T) {
+	raw, err := os.ReadFile("../../deploy/operator/cluster-crd.yaml")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var doc map[string]any
+	if err := yaml.Unmarshal(raw, &doc); err != nil {
+		t.Fatal(err)
+	}
+	get := func(value any, key string) any { object, _ := value.(map[string]any); return object[key] }
+	versions, _ := get(get(doc, "spec"), "versions").([]any)
+	var schema any
+	for _, version := range versions {
+		if get(version, "name") == "v1alpha2" {
+			schema = get(get(version, "schema"), "openAPIV3Schema")
+		}
+	}
+	rules, _ := get(schema, "x-kubernetes-validations").([]any)
+	if len(rules) < 3 {
+		t.Fatal("root validation rules missing")
+	}
+	guard := `!has(self.spec.applicationProtocol) || !has(self.status) || !has(self.status.authority) || !has(self.status.authority.pendingWrite) || !self.status.authority.pendingWrite || `
+	var equalities []string
+	for _, pair := range [][2]string{{"generation", "generation"}, {"deploymentUID", "binding.deploymentUID"}, {"storageID", "binding.storageID"}, {"__namespace__", "owner.__namespace__"}, {"name", "owner.name"}, {"uid", "owner.uid"}, {"logicalID", "owner.logicalID"}} {
+		equalities = append(equalities, "self.status.authority.pendingRequest.reservation."+pair[0]+" == self.status.authority."+pair[1])
+	}
+	want := guard + "(has(self.status.authority.pendingRequest) && has(self.status.authority.pendingRequest.reservation) && " + strings.Join(equalities, " && ") + ")"
+	if get(rules[1], "rule") != want || get(rules[1], "message") != "mixed pending must retain its exact authority reservation" {
+		t.Fatal("bounded escaped reservation equality or its guards changed")
+	}
+	wantPending := `!has(self.spec.applicationProtocol) || !has(oldSelf.status) || !has(oldSelf.status.authority) || !has(oldSelf.status.authority.pendingWrite) || !oldSelf.status.authority.pendingWrite || !has(self.status) || !has(self.status.authority) || !has(self.status.authority.pendingWrite) || !self.status.authority.pendingWrite || (has(self.status.authority.pendingRequest) && has(oldSelf.status.authority.pendingRequest) && self.status.authority.pendingRequest == oldSelf.status.authority.pendingRequest)`
+	if get(rules[2], "rule") != wantPending {
+		t.Fatal("whole pending transition equality changed")
+	}
+	properties := get(get(get(get(schema, "properties"), "status"), "properties"), "authority")
+	authority := get(properties, "properties")
+	owner := get(authority, "owner")
+	reservation := get(get(get(authority, "pendingRequest"), "properties"), "reservation")
+	for _, object := range []any{owner, reservation} {
+		fields := get(object, "properties")
+		leaf := get(fields, "namespace")
+		if get(leaf, "type") != "string" || get(leaf, "maxLength") != 63 || get(fields, "__namespace__") != nil {
+			t.Fatal("JSON namespace property or 63-character bound changed")
+		}
+	}
+	wantRequired := []any{"namespace", "name", "uid", "logicalID", "generation", "deploymentUID", "storageID"}
+	if !reflect.DeepEqual(get(reservation, "required"), wantRequired) {
+		t.Fatal("reservation required fields changed")
+	}
+}
 
 func mixedAuthoritySetup(t *testing.T) (*phase8Server, *V1Alpha2StatusStore, V1Alpha2AdmissionSnapshot) {
 	t.Helper()
