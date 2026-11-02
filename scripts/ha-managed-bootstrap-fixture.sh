@@ -334,5 +334,11 @@ k -n "$namespace" exec "$replacement_pod" -c sql -- sha256sum /var/lib/rhiza/rep
 managed_same_pod_identity_oracle "$logs/restart-identity-before.txt" "$logs/restart-identity-after.txt"
 run_client query-after-restart query '{"sql":"SELECT id, value FROM bootstrap_ci"}'
 jq -e '.rows==[[1,"real-kubelet"]]' "$logs/query-after-restart.json" >/dev/null
-printf '%s\n' 'PASS: actual kubelet bootstrap, Deployment Pod replacement, same-Pod main restart preserving origin/adoption/voter identity, NoPVC and ACK readback' 'GAP: later-operation rollover main restart, isolated-process physical fencing, operator-managed Service ownership and Chaos Mesh qualification remain pending; no NetworkPolicy claim' > "$logs/result.txt"
+printf '%s\n' 'PASS: actual kubelet bootstrap, Deployment Pod replacement, same-Pod main restart preserving origin/adoption/voter identity, NoPVC and ACK readback' > "$logs/result.txt"
+if [ "${managed_chaos_verified-0}" = 1 ]; then
+  printf '%s\n' 'PASS: scoped Chaos Mesh pod-kill and container-kill injection, runtime effects and one-shot deletion verified' >> "$logs/result.txt"
+else
+  printf '%s\n' 'GAP: Chaos Mesh qualification remains pending' >> "$logs/result.txt"
+fi
+printf '%s\n' 'GAP: later-operation rollover main restart, isolated-process physical fencing and operator-managed Service ownership remain pending; no NetworkPolicy claim' >> "$logs/result.txt"
 }
