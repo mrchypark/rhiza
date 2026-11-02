@@ -12,17 +12,40 @@
 # go to stderr.
 set -eu
 
-script_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
-sdk_dir=$(CDPATH= cd -- "$script_dir/.." && pwd)
-repo_dir=$(CDPATH= cd -- "$sdk_dir/../.." && pwd)
+script_dir=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)
+sdk_dir=$(CDPATH='' cd -- "$script_dir/.." && pwd)
+repo_dir=$(CDPATH='' cd -- "$sdk_dir/../.." && pwd)
 
 ref=${1:-HEAD}
 commit=$(git -C "$repo_dir" rev-parse --verify "${ref}^{commit}")
+if [ -n "${RHIZA_CRATE_STATE_DIR:-}" ]; then
+    [ -d "$RHIZA_CRATE_STATE_DIR" ]
+fi
 
 worktree_dir=$(mktemp -d "${TMPDIR:-/tmp}/rhiza-crate-src.XXXXXX")
 stage_dir=$(mktemp -d "${TMPDIR:-/tmp}/rhiza-crate-stage.XXXXXX")
 
-trap 'git -C "$repo_dir" worktree remove --force "$worktree_dir" >/dev/null 2>&1 || true' EXIT HUP INT TERM
+# Optional caller-owned state directory lets CI clean retained stages on failure.
+if [ -n "${RHIZA_CRATE_STATE_DIR:-}" ]; then
+    printf '%s\n' "$worktree_dir" > "$RHIZA_CRATE_STATE_DIR/worktree"
+    printf '%s\n' "$stage_dir" > "$RHIZA_CRATE_STATE_DIR/stage"
+fi
+cleanup() {
+    result=$?
+    trap - EXIT HUP INT TERM
+    if ! git -C "$repo_dir" worktree remove --force "$worktree_dir" >&2; then
+        echo "FAIL retained worktree: $worktree_dir" >&2
+        [ "$result" -ne 0 ] || result=1
+    elif [ -e "$worktree_dir" ]; then
+        echo "FAIL worktree removal incomplete: $worktree_dir" >&2
+        [ "$result" -ne 0 ] || result=1
+    fi
+    exit "$result"
+}
+trap cleanup EXIT
+trap 'exit 129' HUP
+trap 'exit 130' INT
+trap 'exit 143' TERM
 
 git -C "$repo_dir" worktree add --detach --quiet "$worktree_dir" "$commit"
 if [ -n "$(git -C "$worktree_dir" status --porcelain --untracked-files=no)" ]; then
