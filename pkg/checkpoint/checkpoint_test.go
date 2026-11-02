@@ -42,7 +42,15 @@ func TestCheckpointMaterializationPolicyExact(t *testing.T) {
 	if err != nil || !appendOnly.appendOnly || appendOnly.expectedPolicy != sqlpolicy.ManagedSQLKVMaterializationPolicy {
 		t.Fatalf("mixed append-only constructor: %v", err)
 	}
-	for _, policy := range []sqlpolicy.MaterializationPolicy{0, 6, 9, -1} {
+	request, err := NewManagerForPolicy(bucket, "request", t.TempDir(), sqlpolicy.ManagedRequestMaterializationPolicy, 1)
+	if err != nil || request.expectedPolicy != sqlpolicy.ManagedRequestMaterializationPolicy {
+		t.Fatalf("request-profile constructor: %v", err)
+	}
+	requestAppend, err := NewAppendOnlyManagerForPolicy(bucket, "request-append", t.TempDir(), sqlpolicy.ManagedRequestMaterializationPolicy, 1)
+	if err != nil || !requestAppend.appendOnly || requestAppend.expectedPolicy != sqlpolicy.ManagedRequestMaterializationPolicy {
+		t.Fatalf("request-profile append-only constructor: %v", err)
+	}
+	for _, policy := range []sqlpolicy.MaterializationPolicy{0, 6, 999, -1} {
 		if _, err := NewManagerForPolicy(bucket, "invalid", "", policy); !errors.Is(err, sqlpolicy.ErrIncompatible) {
 			t.Fatalf("constructor unknown policy %d: %v", policy, err)
 		}
