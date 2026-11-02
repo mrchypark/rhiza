@@ -567,6 +567,22 @@ func TestPipelineCompletesConcurrentSlots(t *testing.T) {
 	if returned["second"].slot > maxSlot {
 		maxSlot = returned["second"].slot
 	}
+	var diagnosticTip Slot
+	defer func() {
+		if !t.Failed() {
+			return
+		}
+		observedTip := diagnosticTip
+		if observedTip == 0 {
+			observedTip = cores["n2"].Tip()
+		}
+		t.Logf("returned=%+v maxSlot=%d firstObservedTip=%d", returned, maxSlot, observedTip)
+		for slot := maxSlot + 1; slot <= observedTip; slot++ {
+			decision, ok := cores["n2"].CertifiedValue(slot)
+			barrier, barrierErr := DecodeReadBarrier(decision.Value)
+			t.Logf("suffix slot=%d found=%v hash=%x readBarrier=%v decodeErr=%v certificate=%x", slot, ok, decision.Hash, barrier, barrierErr, decision.Certificate)
+		}
+	}()
 	for value, result := range returned {
 		certified, ok := cores["n2"].CertifiedValue(result.slot)
 		if !ok || string(certified.Value) != value || certified.Hash != sha256.Sum256([]byte(value)) {
@@ -576,7 +592,7 @@ func TestPipelineCompletesConcurrentSlots(t *testing.T) {
 			t.Fatalf("returned value %q receipts=%+v, want accepted quorum", value, result.receipts)
 		}
 		for _, receipt := range result.receipts {
-			if receipt.Slot != result.slot || !receipt.Accepted {
+			if receipt.Slot != result.slot || !receipt.Accepted || receipt.Hash != sha256.Sum256([]byte(value)) {
 				t.Fatalf("returned value %q receipt=%+v slot=%d", value, receipt, result.slot)
 			}
 		}
@@ -585,11 +601,15 @@ func TestPipelineCompletesConcurrentSlots(t *testing.T) {
 		t.Fatal(err)
 	}
 	decisions, tip, err := cores["n2"].DecisionsFrom(1, int(maxSlot))
-	if err != nil || tip != maxSlot || Slot(len(decisions)) != maxSlot {
-		t.Fatalf("contiguous prefix tip=%d decisions=%d err=%v", tip, len(decisions), err)
+	diagnosticTip = tip
+	if err != nil || tip < maxSlot || Slot(len(decisions)) != maxSlot {
+		t.Fatalf("contiguous prefix globalTip=%d pageEnd=%d decisions=%+v err=%v", tip, maxSlot, decisions, err)
 	}
 	seen := make(map[string]struct{}, len(decisions))
-	for _, decision := range decisions {
+	for i, decision := range decisions {
+		if decision.Slot != Slot(i+1) {
+			t.Fatalf("noncontiguous page index=%d slot=%d globalTip=%d", i, decision.Slot, tip)
+		}
 		if _, duplicate := seen[string(decision.Value)]; duplicate {
 			t.Fatalf("duplicate certified prefix value %q", decision.Value)
 		}

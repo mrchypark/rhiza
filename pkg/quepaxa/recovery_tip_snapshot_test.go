@@ -2,6 +2,7 @@ package quepaxa
 
 import (
 	"context"
+	"crypto/sha256"
 	"sync"
 	"testing"
 	"time"
@@ -17,6 +18,36 @@ type recoveryTipContext struct {
 	once    sync.Once
 	entered chan struct{}
 	release chan struct{}
+}
+
+func TestDecisionsFromReturnsBoundedPageAndGlobalTip(t *testing.T) {
+	cores, _ := newTestCluster(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	core := cores["n2"]
+	values := []string{"first", "second", "third"}
+	for i, value := range values {
+		slot, receipts, err := core.Propose(ctx, []byte(value))
+		if err != nil || slot != Slot(i+1) || !core.IsQuorum(receipts) {
+			t.Fatalf("proposal slot=%d receipts=%+v err=%v", slot, receipts, err)
+		}
+	}
+	for _, tc := range []struct {
+		from Slot
+		want int
+	}{{1, 2}, {3, 1}, {4, 0}} {
+		page, tip, err := core.DecisionsFrom(tc.from, 2)
+		if err != nil || tip != 3 || len(page) != tc.want {
+			t.Fatalf("from=%d page=%+v globalTip=%d err=%v", tc.from, page, tip, err)
+		}
+		for i, decision := range page {
+			slot := tc.from + Slot(i)
+			value := values[int(slot)-1]
+			if decision.Slot != slot || string(decision.Value) != value || decision.Hash != sha256.Sum256([]byte(value)) || len(decision.Certificate) == 0 {
+				t.Fatalf("from=%d index=%d decision=%+v globalTip=%d", tc.from, i, decision, tip)
+			}
+		}
+	}
 }
 
 func (c *recoveryTipContext) Err() error {
