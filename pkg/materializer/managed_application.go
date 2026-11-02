@@ -63,6 +63,10 @@ func validateManagedArtifacts(path string) error {
 	return validateManagedArtifactsExcept(path, "")
 }
 
+// ValidateManagedRestoreState only inspects existing paths. It never repairs,
+// opens a writer, or removes interrupted recovery evidence.
+func ValidateManagedRestoreState(path string) error { return validateManagedArtifacts(path) }
+
 func validateManagedArtifactsExcept(path, checkpointSource string) error {
 	if err := validateManagedGraphAbsence(path); err != nil {
 		return err

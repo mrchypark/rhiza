@@ -8,6 +8,8 @@ import (
 	"os"
 	"path/filepath"
 
+	"github.com/mrchypark/rhiza/internal/sqlpolicy"
+	"github.com/mrchypark/rhiza/internal/types"
 	"github.com/mrchypark/rhiza/pkg/materializer"
 	"github.com/mrchypark/rhiza/pkg/quepaxa"
 )
@@ -29,8 +31,19 @@ type PreparedReadOnlyRestore struct {
 // The caller must control the parent and prevent directory replacement during
 // preparation. The result is data, not a consensus WAL or admission authority.
 func PrepareReadOnlyRestore(ctx context.Context, view *ReadOnlyView, targetDir string) (result PreparedReadOnlyRestore, resultErr error) {
+	return PrepareReadOnlyRestoreForPolicy(ctx, view, targetDir, sqlpolicy.LegacyMaterializationPolicy, types.DefaultIdempotencyWindowSlots)
+}
+
+// PrepareReadOnlyRestoreForPolicy keeps the trusted pair through reconstruction.
+func PrepareReadOnlyRestoreForPolicy(ctx context.Context, view *ReadOnlyView, targetDir string, expected sqlpolicy.MaterializationPolicy, window uint64) (result PreparedReadOnlyRestore, resultErr error) {
+	if err := validateReadOnlyPolicy(expected, window); err != nil {
+		return result, err
+	}
 	if view == nil || !view.verified {
 		return result, fmt.Errorf("read-only view is not verified")
+	}
+	if view.expectedPolicy != expected || view.idempotencyWindow != window {
+		return result, fmt.Errorf("read-only view policy/window mismatch")
 	}
 	if err := ctx.Err(); err != nil {
 		return result, err
@@ -47,7 +60,11 @@ func PrepareReadOnlyRestore(ctx context.Context, view *ReadOnlyView, targetDir s
 		return result, fmt.Errorf("download checkpoint: %w", err)
 	}
 	sqlitePath := filepath.Join(targetDir, "sqlite.db")
-	mat, err := materializer.Open(sqlitePath, 1)
+	open := materializer.Open
+	if expected == sqlpolicy.ManagedSQLKVMaterializationPolicy {
+		open = materializer.OpenManagedSQLKV
+	}
+	mat, err := open(sqlitePath, 1, window)
 	if err != nil {
 		return result, fmt.Errorf("open materializer: %w", err)
 	}
@@ -95,4 +112,14 @@ func PrepareReadOnlyRestore(ctx context.Context, view *ReadOnlyView, targetDir s
 		return result, fmt.Errorf("write certified suffix: %w", err)
 	}
 	return PreparedReadOnlyRestore{TargetDir: targetDir, SQLitePath: sqlitePath, SuffixPath: suffixPath, HeadHash: view.headHash, Base: view.base, Tip: view.tip, PrefixHash: view.prefixHash}, nil
+}
+
+func validateReadOnlyPolicy(expected sqlpolicy.MaterializationPolicy, window uint64) error {
+	if err := expected.Validate(); err != nil {
+		return err
+	}
+	if window < 1024 || window > 1_048_576 {
+		return fmt.Errorf("invalid read-only idempotency window")
+	}
+	return nil
 }

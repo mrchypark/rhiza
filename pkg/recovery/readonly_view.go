@@ -12,7 +12,11 @@ import (
 	"path"
 	"path/filepath"
 
+	"github.com/mrchypark/rhiza/internal/localtesthooks"
+	"github.com/mrchypark/rhiza/internal/sqlpolicy"
+	"github.com/mrchypark/rhiza/internal/types"
 	"github.com/mrchypark/rhiza/pkg/checkpoint"
+	"github.com/mrchypark/rhiza/pkg/materializer"
 	"github.com/mrchypark/rhiza/pkg/qlog"
 	"github.com/mrchypark/rhiza/pkg/quepaxa"
 	"github.com/thanos-io/objstore"
@@ -33,21 +37,34 @@ type ReadOnlyView struct {
 	checkpointManager    *checkpoint.Manager
 	root                 *checkpoint.Checkpoint
 	verified             bool
+	expectedPolicy       sqlpolicy.MaterializationPolicy
+	idempotencyWindow    uint64
 }
 
 // OpenReadOnlyView captures one stable head and verifies its complete suffix.
 func OpenReadOnlyView(ctx context.Context, bucket objstore.Bucket, prefix string, configID uint, bootstrap quepaxa.Cluster) (result *ReadOnlyView, resultErr error) {
-	return openReadOnlyView(ctx, bucket, prefix, configID, bootstrap)
+	return OpenReadOnlyViewForPolicy(ctx, bucket, prefix, configID, bootstrap, sqlpolicy.LegacyMaterializationPolicy, types.DefaultIdempotencyWindowSlots)
+}
+
+func OpenReadOnlyViewForPolicy(ctx context.Context, bucket objstore.Bucket, prefix string, configID uint, bootstrap quepaxa.Cluster, expected sqlpolicy.MaterializationPolicy, window uint64) (*ReadOnlyView, error) {
+	return openReadOnlyView(ctx, bucket, prefix, configID, bootstrap, expected, window)
 }
 
 // OpenReadOnlyViewAtHead verifies the captured head and its immutable source
 // objects, independently of subsequent changes to the live HEAD. The caller
 // must establish the captured head's provenance and source binding separately.
 func OpenReadOnlyViewAtHead(ctx context.Context, bucket objstore.Bucket, prefix string, configID uint, bootstrap quepaxa.Cluster, capturedHead []byte) (*ReadOnlyView, error) {
+	return OpenReadOnlyViewAtHeadForPolicy(ctx, bucket, prefix, configID, bootstrap, capturedHead, sqlpolicy.LegacyMaterializationPolicy, types.DefaultIdempotencyWindowSlots)
+}
+
+func OpenReadOnlyViewAtHeadForPolicy(ctx context.Context, bucket objstore.Bucket, prefix string, configID uint, bootstrap quepaxa.Cluster, capturedHead []byte, expected sqlpolicy.MaterializationPolicy, window uint64) (*ReadOnlyView, error) {
+	if err := validateReadOnlyPolicy(expected, window); err != nil {
+		return nil, err
+	}
 	if bucket == nil || len(capturedHead) == 0 || len(capturedHead) > maxArchiveHeadSize {
 		return nil, fmt.Errorf("invalid captured archive head")
 	}
-	return openReadOnlyView(ctx, &capturedHeadBucket{Bucket: bucket, name: path.Join(prefix, "archive/head.bin"), head: bytes.Clone(capturedHead)}, prefix, configID, bootstrap)
+	return openReadOnlyView(ctx, &capturedHeadBucket{Bucket: bucket, name: path.Join(prefix, "archive/head.bin"), head: bytes.Clone(capturedHead)}, prefix, configID, bootstrap, expected, window)
 }
 
 // Only the mutable HEAD is substituted. Every immutable object is fetched from
@@ -78,7 +95,10 @@ func (b *capturedHeadBucket) Get(ctx context.Context, name string) (io.ReadClose
 	return io.NopCloser(bytes.NewReader(b.head)), nil
 }
 
-func openReadOnlyView(ctx context.Context, bucket objstore.Bucket, prefix string, configID uint, bootstrap quepaxa.Cluster) (result *ReadOnlyView, resultErr error) {
+func openReadOnlyView(ctx context.Context, bucket objstore.Bucket, prefix string, configID uint, bootstrap quepaxa.Cluster, expectedPolicy sqlpolicy.MaterializationPolicy, window uint64) (result *ReadOnlyView, resultErr error) {
+	if err := validateReadOnlyPolicy(expectedPolicy, window); err != nil {
+		return nil, err
+	}
 	if bucket == nil || len(bootstrap.Members) == 0 {
 		return nil, fmt.Errorf("read-only view requires a bucket and trusted bootstrap")
 	}
@@ -92,8 +112,11 @@ func openReadOnlyView(ctx context.Context, bucket objstore.Bucket, prefix string
 	if err != nil {
 		return nil, err
 	}
-	v := &ReadOnlyView{headHash: sha256.Sum256(encoded), headBytes: encoded, base: head.Base, tip: head.Tip}
-	cp := checkpoint.NewManager(bucket, prefix, "", configID)
+	v := &ReadOnlyView{headHash: sha256.Sum256(encoded), headBytes: encoded, base: head.Base, tip: head.Tip, expectedPolicy: expectedPolicy, idempotencyWindow: window}
+	cp, err := checkpoint.NewManagerForPolicy(bucket, prefix, "", expectedPolicy, configID)
+	if err != nil {
+		return nil, err
+	}
 	v.checkpointManager = cp
 	snapshot := &RecoverySnapshot{manager: m, head: head, refs: m.extents}
 	seal, decision, hasCheckpoint := snapshot.RecoveryBase()
@@ -115,7 +138,7 @@ func openReadOnlyView(ctx context.Context, bucket objstore.Bucket, prefix string
 			return nil, fmt.Errorf("source anchored lineage does not match archive")
 		}
 		membership := NewMembershipRecord(stored.TargetMembership.Cluster, bootstrap.Members, stored.TargetMembership.Durability)
-		anchor, err = verifyGenerationAnchor(ctx, bucket, prefix, membership, anchorHash, &head)
+		anchor, err = verifyGenerationAnchorForPolicy(ctx, bucket, prefix, membership, anchorHash, &head, expectedPolicy)
 		if err != nil {
 			return nil, fmt.Errorf("verify source lineage: %w", err)
 		}
@@ -140,7 +163,7 @@ func openReadOnlyView(ctx context.Context, bucket objstore.Bucket, prefix string
 	if err != nil {
 		return nil, err
 	}
-	if v.root != nil {
+	if v.root != nil && expectedPolicy == sqlpolicy.LegacyMaterializationPolicy {
 		if err := cp.Verify(ctx, v.root.Index, v.root.RootHash, v.root.Hash); err != nil {
 			return nil, err
 		}
@@ -155,6 +178,11 @@ func openReadOnlyView(ctx context.Context, bucket objstore.Bucket, prefix string
 			resultErr = errors.Join(resultErr, fmt.Errorf("remove verification directory %s: %w", dir, err))
 		}
 	}()
+	if v.root != nil && expectedPolicy == sqlpolicy.ManagedSQLKVMaterializationPolicy {
+		if err := verifyMixedReadOnlyCheckpoint(ctx, cp, v.root, v.base, window, filepath.Join(dir, "checkpoint")); err != nil {
+			return nil, err
+		}
+	}
 	wal, err := qlog.Open(filepath.Join(dir, "wal"))
 	if err != nil {
 		return nil, err
@@ -172,6 +200,9 @@ func openReadOnlyView(ctx context.Context, bucket objstore.Bucket, prefix string
 	core.SetCheckpointValidator(func(ctx context.Context, candidate quepaxa.CheckpointSeal) error {
 		return cp.Verify(ctx, uint64(candidate.Index), candidate.RootHash, candidate.StateHash)
 	})
+	if localtesthooks.Enabled && (anchored || hasCheckpoint) {
+		localtesthooks.Hit("recovery:readonly:before-base-install")
+	}
 	if anchored {
 		if err := core.InstallFencedGenerationBase(ctx, quepaxa.FencedGenerationBase{ConfigID: bootstrap.ConfigID, Index: quepaxa.Slot(anchor.SourceTip), PrefixHash: mustGenerationHash(anchor.SourcePrefixHash), RootHash: mustGenerationHash(anchor.Checkpoint.RootHash), AnchorHash: anchorHash}); err != nil {
 			return nil, err
@@ -192,6 +223,11 @@ func openReadOnlyView(ctx context.Context, bucket objstore.Bucket, prefix string
 			return nil, fmt.Errorf("archive suffix ends before head")
 		}
 		for _, value := range values {
+			if expectedPolicy == sqlpolicy.ManagedSQLKVMaterializationPolicy {
+				if err := types.ValidateManagedKVExecutionPolicy(value.Value); err != nil {
+					return nil, err
+				}
+			}
 			bytes += len(value.Value) + len(value.Certificate)
 			if bytes > maxReadOnlyPayloadBytes {
 				return nil, fmt.Errorf("read-only archive suffix exceeds byte limit")
@@ -212,6 +248,32 @@ func openReadOnlyView(ctx context.Context, bucket objstore.Bucket, prefix string
 	}
 	v.verified = true
 	return v, nil
+}
+
+func verifyMixedReadOnlyCheckpoint(ctx context.Context, cp *checkpoint.Manager, root *checkpoint.Checkpoint, base quepaxa.Slot, window uint64, dir string) error {
+	if err := os.Mkdir(dir, 0700); err != nil {
+		return err
+	}
+	files, err := cp.DownloadAndVerifyRootFiles(ctx, root, dir)
+	if err != nil {
+		return fmt.Errorf("verify mixed checkpoint files: %w", err)
+	}
+	// The actual manager already validated the exact single-SQLite role set.
+	if len(files) != 1 || files[0].Role != checkpoint.RoleSQLite {
+		return fmt.Errorf("mixed checkpoint requires one SQLite file")
+	}
+	_, tip, err := materializer.InspectManagedApplicationFile(ctx, files[0].Path, window)
+	if err != nil {
+		return fmt.Errorf("inspect mixed checkpoint: %w", err)
+	}
+	if tip != root.Index || tip != uint64(base) {
+		return fmt.Errorf("mixed checkpoint applied tip differs from selected base")
+	}
+	return nil
+}
+
+func (v *ReadOnlyView) MaterializationPolicy() sqlpolicy.MaterializationPolicy {
+	return v.expectedPolicy
 }
 
 func (v *ReadOnlyView) HeadHash() [32]byte   { return v.headHash }

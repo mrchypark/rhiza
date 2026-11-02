@@ -2929,7 +2929,7 @@ func (m *Materializer) restoreParts(ctx context.Context, parts snapshotParts) er
 	if closeErr != nil {
 		return fmt.Errorf("close snapshot: %w", closeErr)
 	}
-	check, err := openSQLite((&url.URL{Scheme: "file", Path: filepath.ToSlash(tempPath)}).String()+"?mode=ro", false)
+	check, err := openSQLite((&url.URL{Scheme: "file", Path: filepath.ToSlash(tempPath)}).String()+"?mode=ro&immutable=1", false)
 	if err != nil {
 		return fmt.Errorf("open snapshot: %w", err)
 	}
@@ -2940,7 +2940,7 @@ func (m *Materializer) restoreParts(ctx context.Context, parts snapshotParts) er
 		return fmt.Errorf("invalid snapshot: quick_check=%q err=%v", status, err)
 	}
 	backupPath := m.dbPath + ".restore-backup"
-	if err := sqlpolicy.CheckFileForPolicy(ctx, tempPath, m.materializationPolicy); err != nil {
+	if err := sqlpolicy.CheckSnapshotFileForPolicy(ctx, tempPath, m.materializationPolicy); err != nil {
 		return err
 	}
 	graphPath := filepath.Join(dir, "latticedb")

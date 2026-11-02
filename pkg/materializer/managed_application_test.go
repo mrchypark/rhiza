@@ -159,6 +159,48 @@ func TestManagedApplicationArtifactBeforeEffects(t *testing.T) {
 	}
 }
 
+func TestManagedApplicationReadonlyRestoreState(t *testing.T) {
+	for _, name := range []string{"latticedb", "latticedb.restore-backup", "sqlite.db.restore-state.json", "sqlite.db.restore-backup", "sqlite.db.local-restore.json", ".rhiza-local-restore-left", ".rhiza-restore-left", ".rhiza-graph-restore-left", ".rhiza-checkpoint-graph-left"} {
+		t.Run(name, func(t *testing.T) {
+			dir := t.TempDir()
+			entry := filepath.Join(dir, name)
+			if err := os.WriteFile(entry, []byte("retained"), 0600); err != nil {
+				t.Fatal(err)
+			}
+			if err := ValidateManagedRestoreState(filepath.Join(dir, "sqlite.db")); err == nil {
+				t.Fatal("residue accepted")
+			}
+			data, err := os.ReadFile(entry)
+			if err != nil || string(data) != "retained" {
+				t.Fatal("readonly check changed evidence", err)
+			}
+			if _, err := os.Lstat(filepath.Join(dir, "sqlite.db")); !os.IsNotExist(err) {
+				t.Fatal("readonly check opened writer", err)
+			}
+		})
+	}
+	if err := ValidateManagedRestoreState(filepath.Join(t.TempDir(), "sqlite.db")); err != nil {
+		t.Fatal("clean state rejected", err)
+	}
+}
+
+func TestManagedApplicationRestoreLeavesNoArtifacts(t *testing.T) {
+	m := managedMaterializer(t)
+	managedKVApply(t, m, types.KVCommand{RequestID: "restore", Operation: "put", Key: "key", Value: []byte("v")})
+	files, _, cleanup, err := m.CheckpointFilesAt(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer cleanup()
+	if err := m.RestoreCheckpoint(context.Background(), files); err != nil {
+		t.Fatal(err)
+	}
+	cleanup()
+	if err := ValidateManagedRestoreState(m.dbPath); err != nil {
+		t.Fatalf("successful restore left its own interrupted artifacts: %v", err)
+	}
+}
+
 func TestManagedApplicationSnapshotPoisonBoundary(t *testing.T) {
 	m := managedMaterializer(t)
 	ctx := context.Background()

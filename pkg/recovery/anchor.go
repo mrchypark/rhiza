@@ -11,6 +11,7 @@ import (
 	"os"
 	"time"
 
+	"github.com/mrchypark/rhiza/internal/sqlpolicy"
 	"github.com/mrchypark/rhiza/pkg/checkpoint"
 	"github.com/mrchypark/rhiza/pkg/materializer"
 	"github.com/mrchypark/rhiza/pkg/qlog"
@@ -152,10 +153,23 @@ func PinGenerationAnchor(ctx context.Context, bucket objstore.Bucket, prefix, ow
 // intent/result bindings, but does not require the original anchor checkpoint
 // to remain present after a newer certified target checkpoint has superseded it.
 func VerifyGenerationAnchor(ctx context.Context, bucket objstore.Bucket, prefix string, expectedMembership MembershipRecord, expectedAnchorHash [32]byte) (GenerationAnchor, error) {
-	return verifyGenerationAnchor(ctx, bucket, prefix, expectedMembership, expectedAnchorHash, nil)
+	return VerifyGenerationAnchorForPolicy(ctx, bucket, prefix, expectedMembership, expectedAnchorHash, sqlpolicy.LegacyMaterializationPolicy)
+}
+
+// VerifyGenerationAnchorForPolicy retains the same lineage/GC contract while
+// checking the selected root against the caller's trusted policy.
+func VerifyGenerationAnchorForPolicy(ctx context.Context, bucket objstore.Bucket, prefix string, expectedMembership MembershipRecord, expectedAnchorHash [32]byte, expected sqlpolicy.MaterializationPolicy) (GenerationAnchor, error) {
+	return verifyGenerationAnchorForPolicy(ctx, bucket, prefix, expectedMembership, expectedAnchorHash, nil, expected)
 }
 
 func verifyGenerationAnchor(ctx context.Context, bucket objstore.Bucket, prefix string, expectedMembership MembershipRecord, expectedAnchorHash [32]byte, fixedHead *archiveHead) (GenerationAnchor, error) {
+	return verifyGenerationAnchorForPolicy(ctx, bucket, prefix, expectedMembership, expectedAnchorHash, fixedHead, sqlpolicy.LegacyMaterializationPolicy)
+}
+
+func verifyGenerationAnchorForPolicy(ctx context.Context, bucket objstore.Bucket, prefix string, expectedMembership MembershipRecord, expectedAnchorHash [32]byte, fixedHead *archiveHead, expected sqlpolicy.MaterializationPolicy) (GenerationAnchor, error) {
+	if err := expected.Validate(); err != nil {
+		return GenerationAnchor{}, err
+	}
 	if expectedAnchorHash == ([32]byte{}) || expectedMembership.Version != MembershipRecordVersion {
 		return GenerationAnchor{}, fmt.Errorf("expected generation anchor and immutable membership are required")
 	}
@@ -219,7 +233,10 @@ func verifyGenerationAnchor(ctx context.Context, bucket objstore.Bucket, prefix 
 			if err != nil {
 				return GenerationAnchor{}, err
 			}
-			checkpoints := checkpoint.NewManager(bucket, prefix, "", 1)
+			checkpoints, err := checkpoint.NewManagerForPolicy(bucket, prefix, "", expected, 1)
+			if err != nil {
+				return GenerationAnchor{}, err
+			}
 			root, err := checkpoints.OpenRoot(ctx, anchor.Checkpoint.Index, rootHash)
 			if err != nil || checkpoints.Verify(ctx, root.Index, root.RootHash, stateHash) != nil {
 				return GenerationAnchor{}, fmt.Errorf("generation anchor checkpoint is unavailable or invalid")

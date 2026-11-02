@@ -26,6 +26,11 @@ jobs:
         run: go test -race ./pkg/operator -run '^(TestPhase[23489]|TestAuthorityV1Alpha2|TestApplicationInit|TestRepairV1Alpha2|TestManagedMixedProfile)' -count=1 -timeout=60s
       - name: Install kind
         run: go install sigs.k8s.io/kind@v0.32.0
+      - name: Actual baseline managed handoff qualification
+        run: |
+          go test -tags rhiza_local_testhooks ./pkg/recovery -run '^TestManagedRecoveryBeforeCoreBase$' -count=1 -timeout=60s
+          go test -race -tags rhiza_local_testhooks ./pkg/recovery -run '^TestManagedRecoveryBeforeCoreBase$' -count=1 -timeout=60s
+          sh scripts/ci/ha-managed-kv-old-handoff.sh
       - name: API server admission contract
         run: sh scripts/test-ha-v1alpha2-contract.sh
       - name: Preserve diagnostics
