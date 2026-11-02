@@ -27,7 +27,7 @@ func (n *Node) managedKVState(ctx context.Context) (ManagedRuntimeState, error) 
 	if err != nil {
 		return state, err
 	}
-	if n.materializationPolicy() != sqlpolicy.ManagedSQLKVMaterializationPolicy || n.server == nil {
+	if n.materializationPolicy() != sqlpolicy.ManagedSQLKVMaterializationPolicy && !n.internalApplicationProfile() || n.server == nil {
 		return state, sqlpolicy.ErrIncompatible
 	}
 	return state, nil
@@ -43,9 +43,30 @@ func ownedManagedKVRequest(operation string, req network.KVMutationRequest) (net
 
 // ExecuteManagedKV is an exact reserved-write boundary, not a raw Server API.
 func (n *Node) ExecuteManagedKV(ctx context.Context, operation string, req network.KVMutationRequest) (network.KVMutationResponse, error) {
+	if n.internalApplicationProfile() {
+		_, scoped, release, err := n.borrowInternalApplication(ctx)
+		if err != nil {
+			return network.KVMutationResponse{}, err
+		}
+		defer release()
+		ctx = scoped
+	}
 	state, err := n.managedKVState(ctx)
 	if err != nil {
 		return network.KVMutationResponse{}, err
+	}
+	if n.internalApplicationProfile() {
+		owned, err := ownedManagedKVRequest(operation, req)
+		if err != nil {
+			return network.KVMutationResponse{}, err
+		}
+		if err := n.admitInternalApplication(ctx); err != nil {
+			return network.KVMutationResponse{}, err
+		}
+		if err := n.recordManagedApplicationStart(ctx); err != nil {
+			return network.KVMutationResponse{}, err
+		}
+		return n.server.KVMutate(ctx, operation, owned)
 	}
 	req, err = ownedManagedKVRequest(operation, req)
 	if err != nil {
@@ -68,6 +89,32 @@ func (n *Node) ExecuteManagedKV(ctx context.Context, operation string, req netwo
 // Exact authority is checked before any configured durability barrier, including
 // a retained receipt; public status deliberately uses a different path below.
 func (n *Node) ResolveManagedKV(ctx context.Context, operation string, req network.KVMutationRequest) (network.ResolveKVResult, error) {
+	if n.internalApplicationProfile() {
+		_, scoped, release, err := n.borrowInternalApplication(ctx)
+		if err != nil {
+			return network.ResolveKVResult{}, err
+		}
+		defer release()
+		ctx = scoped
+	}
+	if n.internalApplicationProfile() {
+		owned, err := ownedManagedKVRequest(operation, req)
+		if err != nil {
+			return network.ResolveKVResult{}, err
+		}
+		resolved, err := n.ResolveRequest(ctx, "kv", owned.RequestID)
+		if err != nil {
+			return network.ResolveKVResult{State: network.ResolveKVUnknownOrExpired, Durability: network.ResolveKVDurabilityUnknown}, err
+		}
+		fingerprint, err := types.ManagedKVFingerprint(types.KVCommand{RequestID: owned.RequestID, Operation: operation, Key: owned.Key, Value: owned.Value, Expected: owned.Expected, ExpectedExists: owned.ExpectedExists, TTLMS: owned.TTLMS})
+		if err != nil {
+			return network.ResolveKVResult{}, err
+		}
+		if fingerprint != resolved.Original.Fingerprint {
+			return network.ResolveKVResult{}, network.ErrRequestConflict
+		}
+		return network.ResolveKVResult{State: network.ResolveKVRetained, Receipt: &resolved.Receipt, Durability: network.ResolveKVDurabilityConfirmed}, nil
+	}
 	if _, err := n.managedKVState(ctx); err != nil {
 		return network.ResolveKVResult{}, err
 	}
@@ -131,6 +178,14 @@ func (n *Node) ResolveManagedKV(ctx context.Context, operation string, req netwo
 }
 
 func (n *Node) KVGetManaged(ctx context.Context, req network.KVGetRequest) (network.KVGetResponse, error) {
+	if n.internalApplicationProfile() {
+		_, scoped, release, err := n.borrowInternalApplication(ctx)
+		if err != nil {
+			return network.KVGetResponse{}, err
+		}
+		defer release()
+		ctx = scoped
+	}
 	if _, err := n.managedKVState(ctx); err != nil {
 		return network.KVGetResponse{}, err
 	}
@@ -141,6 +196,12 @@ func (n *Node) KVGetManaged(ctx context.Context, req network.KVGetRequest) (netw
 		return network.KVGetResponse{}, err
 	}
 	if req.Consistency == "linearizable" {
+		if n.internalApplicationProfile() {
+			if err := n.admitInternalApplication(ctx); err != nil {
+				return network.KVGetResponse{}, err
+			}
+			return n.server.KVGet(ctx, req)
+		}
 		if err := n.managedStartup.Checker.ValidateManagedAdmission(ctx, n.managedStartup.Identity, n.managedRuntimeState()); err != nil {
 			return network.KVGetResponse{}, err
 		}
@@ -151,6 +212,14 @@ func (n *Node) KVGetManaged(ctx context.Context, req network.KVGetRequest) (netw
 // RequestStatusManaged observes a local retained receipt. It cannot publish a
 // durability barrier, authorize recovery, finalize, or resubmit a mutation.
 func (n *Node) RequestStatusManaged(ctx context.Context, req network.RequestStatusRequest) (network.RequestStatusResponse, error) {
+	if n.internalApplicationProfile() {
+		_, scoped, release, err := n.borrowInternalApplication(ctx)
+		if err != nil {
+			return network.RequestStatusResponse{}, err
+		}
+		defer release()
+		ctx = scoped
+	}
 	if _, err := n.managedKVState(ctx); err != nil {
 		return network.RequestStatusResponse{}, err
 	}

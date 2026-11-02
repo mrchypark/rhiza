@@ -108,7 +108,7 @@ func TestManagedKVTransportPolicy(t *testing.T) {
 }
 
 func TestManagedKVTransportHandshakeAndDerivedPaths(t *testing.T) {
-	for _, policy := range []sqlpolicy.MaterializationPolicy{7, 8} {
+	for _, policy := range []sqlpolicy.MaterializationPolicy{7, 8, sqlpolicy.ManagedRequestMaterializationPolicy} {
 		alpn, _ := peerALPNForPolicy(policy)
 		member, ops := managedKVTransportEndpoint(t, alpn)
 		a := testMember("cluster", "a", "a-token")
@@ -153,17 +153,21 @@ func TestManagedKVTransportHandshakeAndDerivedPaths(t *testing.T) {
 		if <-ops != peerfb.OperationVerifyPrefix {
 			t.Fatal("learner probe path not reached")
 		}
-		other := sqlpolicy.MaterializationPolicy(15 - int(policy)) // 7 <-> 8
-		mismatch, err := NewTransportForPolicy("cluster", "a", &config, "a-token", other)
-		if err != nil {
-			t.Fatal(err)
-		}
-		ctx, cancel = context.WithTimeout(context.Background(), time.Second)
-		_, err = mismatch.ReadTip(ctx, "b")
-		cancel()
-		_ = mismatch.Close()
-		if err == nil {
-			t.Fatal("mismatched ALPN connected")
+		for _, other := range []sqlpolicy.MaterializationPolicy{7, 8, sqlpolicy.ManagedRequestMaterializationPolicy} {
+			if other == policy {
+				continue
+			}
+			mismatch, err := NewTransportForPolicy("cluster", "a", &config, "a-token", other)
+			if err != nil {
+				t.Fatal(err)
+			}
+			ctx, cancel = context.WithTimeout(context.Background(), time.Second)
+			_, err = mismatch.ReadTip(ctx, "b")
+			cancel()
+			_ = mismatch.Close()
+			if err == nil {
+				t.Fatal("mismatched ALPN connected")
+			}
 		}
 	}
 }

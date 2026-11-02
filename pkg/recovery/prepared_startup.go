@@ -177,11 +177,11 @@ func LoadPreparedStartupForPolicy(ctx context.Context, bucket objstore.Bucket, p
 	}
 	var handoffState materializer.ManagedApplicationState
 	var handoffTip uint64
-	if policy == sqlpolicy.ManagedSQLKVMaterializationPolicy {
+	if managedSQLKVPolicy(policy) {
 		if err := validateMixedPreparedInventory(handoffDir, true); err != nil {
 			return nil, err
 		}
-		handoffState, handoffTip, err = materializer.InspectManagedApplicationFile(ctx, filepath.Join(handoffDir, "sqlite.db"), window)
+		handoffState, handoffTip, err = inspectManagedFileForPolicy(ctx, filepath.Join(handoffDir, "sqlite.db"), window, policy)
 		if err != nil {
 			return nil, fmt.Errorf("inspect mixed handoff: %w", err)
 		}
@@ -190,7 +190,7 @@ func LoadPreparedStartupForPolicy(ctx context.Context, bucket objstore.Bucket, p
 	if err != nil {
 		return nil, err
 	}
-	if policy == sqlpolicy.ManagedSQLKVMaterializationPolicy && handoffTip != uint64(view.Tip()) {
+	if managedSQLKVPolicy(policy) && handoffTip != uint64(view.Tip()) {
 		return nil, fmt.Errorf("mixed handoff tip differs from verified history")
 	}
 	sqlHash, err := preparedFileHash(filepath.Join(handoffDir, "sqlite.db"), false)
@@ -228,7 +228,7 @@ func LoadPreparedStartupForPolicy(ctx context.Context, bucket objstore.Bucket, p
 		if err := validateMixedPreparedInventory(verifiedTargetDir, false); err != nil {
 			return nil, err
 		}
-		state, tip, err := materializer.InspectManagedApplicationFile(ctx, verified.SQLitePath, window)
+		state, tip, err := inspectManagedFileForPolicy(ctx, verified.SQLitePath, window, policy)
 		if err != nil {
 			return nil, err
 		}
@@ -252,7 +252,10 @@ func preparedVersion(policy sqlpolicy.MaterializationPolicy, window uint64) (int
 	if err := validateReadOnlyPolicy(policy, window); err != nil {
 		return 0, err
 	}
-	if policy == sqlpolicy.ManagedSQLKVMaterializationPolicy {
+	if policy == sqlpolicy.ManagedRequestMaterializationPolicy {
+		return 3, nil
+	}
+	if managedSQLKVPolicy(policy) {
 		return 2, nil
 	}
 	if window != types.DefaultIdempotencyWindowSlots {

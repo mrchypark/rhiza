@@ -28,6 +28,12 @@ import (
 
 const peerALPN = sqlpolicy.PeerALPN
 const managedKVPeerALPN = "rhiza-peer-managed-sql-kv-v1"
+const managedRequestPeerALPN = "rhiza-peer-managed-request-v1"
+
+func managedKVExecutionPolicy(policy sqlpolicy.MaterializationPolicy) bool {
+	return policy == sqlpolicy.ManagedSQLKVMaterializationPolicy || policy == sqlpolicy.ManagedRequestMaterializationPolicy
+}
+
 const peerRPCTimeout = 5 * time.Second
 const checkpointPrepareTimeout = 5 * time.Minute
 
@@ -135,6 +141,9 @@ func NewLearnerTransportForPolicy(clusterID types.ClusterID, localID quepaxa.Nod
 func peerALPNForPolicy(expected sqlpolicy.MaterializationPolicy) (string, error) {
 	if err := expected.Validate(); err != nil {
 		return "", err
+	}
+	if expected == sqlpolicy.ManagedRequestMaterializationPolicy {
+		return managedRequestPeerALPN, nil
 	}
 	if expected == sqlpolicy.ManagedSQLKVMaterializationPolicy {
 		return managedKVPeerALPN, nil

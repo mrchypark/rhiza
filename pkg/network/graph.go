@@ -8,7 +8,6 @@ import (
 	"net/http"
 	"time"
 
-	"github.com/mrchypark/rhiza/internal/sqlpolicy"
 	"github.com/mrchypark/rhiza/internal/types"
 	"github.com/mrchypark/rhiza/pkg/materializer"
 )
@@ -81,7 +80,7 @@ func (s *Server) handleGraphExecute(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) GraphExecute(ctx context.Context, command types.GraphCommand) (GraphExecuteResponse, error) {
-	if s.expectedPolicy == sqlpolicy.ManagedSQLKVMaterializationPolicy {
+	if managedKVExecutionPolicy(s.expectedPolicy) {
 		return GraphExecuteResponse{}, ErrInvalidRequest
 	}
 	if !s.writable || !s.Ready() {

@@ -61,8 +61,11 @@ func PrepareReadOnlyRestoreForPolicy(ctx context.Context, view *ReadOnlyView, ta
 	}
 	sqlitePath := filepath.Join(targetDir, "sqlite.db")
 	open := materializer.Open
-	if expected == sqlpolicy.ManagedSQLKVMaterializationPolicy {
+	if managedSQLKVPolicy(expected) {
 		open = materializer.OpenManagedSQLKV
+	}
+	if expected == sqlpolicy.ManagedRequestMaterializationPolicy {
+		open = materializer.OpenManagedSQLKVWithOriginals
 	}
 	mat, err := open(sqlitePath, 1, window)
 	if err != nil {
@@ -122,4 +125,19 @@ func validateReadOnlyPolicy(expected sqlpolicy.MaterializationPolicy, window uin
 		return fmt.Errorf("invalid read-only idempotency window")
 	}
 	return nil
+}
+
+func inspectManagedFileForPolicy(ctx context.Context, file string, window uint64, expected sqlpolicy.MaterializationPolicy) (materializer.ManagedApplicationState, uint64, error) {
+	switch expected {
+	case sqlpolicy.ManagedRequestMaterializationPolicy:
+		return materializer.InspectManagedRequestFile(ctx, file, window)
+	case sqlpolicy.ManagedSQLKVMaterializationPolicy:
+		return materializer.InspectManagedApplicationFile(ctx, file, window)
+	default:
+		return materializer.ManagedApplicationState{}, 0, sqlpolicy.ErrIncompatible
+	}
+}
+
+func managedSQLKVPolicy(policy sqlpolicy.MaterializationPolicy) bool {
+	return policy == sqlpolicy.ManagedSQLKVMaterializationPolicy || policy == sqlpolicy.ManagedRequestMaterializationPolicy
 }

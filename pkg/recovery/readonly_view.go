@@ -178,8 +178,8 @@ func openReadOnlyView(ctx context.Context, bucket objstore.Bucket, prefix string
 			resultErr = errors.Join(resultErr, fmt.Errorf("remove verification directory %s: %w", dir, err))
 		}
 	}()
-	if v.root != nil && expectedPolicy == sqlpolicy.ManagedSQLKVMaterializationPolicy {
-		if err := verifyMixedReadOnlyCheckpoint(ctx, cp, v.root, v.base, window, filepath.Join(dir, "checkpoint")); err != nil {
+	if v.root != nil && managedSQLKVPolicy(expectedPolicy) {
+		if err := verifyMixedReadOnlyCheckpointForPolicy(ctx, cp, v.root, v.base, window, filepath.Join(dir, "checkpoint"), expectedPolicy); err != nil {
 			return nil, err
 		}
 	}
@@ -223,7 +223,7 @@ func openReadOnlyView(ctx context.Context, bucket objstore.Bucket, prefix string
 			return nil, fmt.Errorf("archive suffix ends before head")
 		}
 		for _, value := range values {
-			if expectedPolicy == sqlpolicy.ManagedSQLKVMaterializationPolicy {
+			if managedSQLKVPolicy(expectedPolicy) {
 				if err := types.ValidateManagedKVExecutionPolicy(value.Value); err != nil {
 					return nil, err
 				}
@@ -251,6 +251,10 @@ func openReadOnlyView(ctx context.Context, bucket objstore.Bucket, prefix string
 }
 
 func verifyMixedReadOnlyCheckpoint(ctx context.Context, cp *checkpoint.Manager, root *checkpoint.Checkpoint, base quepaxa.Slot, window uint64, dir string) error {
+	return verifyMixedReadOnlyCheckpointForPolicy(ctx, cp, root, base, window, dir, sqlpolicy.ManagedSQLKVMaterializationPolicy)
+}
+
+func verifyMixedReadOnlyCheckpointForPolicy(ctx context.Context, cp *checkpoint.Manager, root *checkpoint.Checkpoint, base quepaxa.Slot, window uint64, dir string, expected sqlpolicy.MaterializationPolicy) error {
 	if err := os.Mkdir(dir, 0700); err != nil {
 		return err
 	}
@@ -262,7 +266,7 @@ func verifyMixedReadOnlyCheckpoint(ctx context.Context, cp *checkpoint.Manager, 
 	if len(files) != 1 || files[0].Role != checkpoint.RoleSQLite {
 		return fmt.Errorf("mixed checkpoint requires one SQLite file")
 	}
-	_, tip, err := materializer.InspectManagedApplicationFile(ctx, files[0].Path, window)
+	_, tip, err := inspectManagedFileForPolicy(ctx, files[0].Path, window, expected)
 	if err != nil {
 		return fmt.Errorf("inspect mixed checkpoint: %w", err)
 	}

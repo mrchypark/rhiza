@@ -83,6 +83,7 @@ type Node struct {
 	managedAdmitted           atomic.Bool
 	managedInitiallyAdmitted  atomic.Bool
 	managedPeerVerified       atomic.Bool
+	internalApplication       atomic.Pointer[internalApplicationBinding]
 }
 
 // nodeRecoveryPhases records the selected certified checkpoint restore path.
@@ -707,7 +708,7 @@ func (n *Node) openInternal(ctx context.Context, enroll bool, prelocked *qlog.Lo
 			return n.checkpoints.Verify(ctx, uint64(seal.Index), seal.RootHash, seal.StateHash)
 		})
 	}
-	if n.materializationPolicy() == sqlpolicy.ManagedSQLKVMaterializationPolicy {
+	if managedSQLKVPolicy(n.materializationPolicy()) {
 		if core.GenerationAnchorHash() != ([32]byte{}) {
 			return fmt.Errorf("mixed generation anchors are not supported")
 		}
@@ -731,7 +732,7 @@ func (n *Node) openInternal(ctx context.Context, enroll bool, prelocked *qlog.Lo
 			archiveBase = snapshot.RecoveryBase
 		}
 		if seal, decision, ok := archiveBase(); ok && core.Tip() < seal.Index {
-			if n.materializationPolicy() == sqlpolicy.ManagedSQLKVMaterializationPolicy {
+			if managedSQLKVPolicy(n.materializationPolicy()) {
 				dir, err := os.MkdirTemp(n.config.DataDir, ".rhiza-managed-base-*")
 				if err != nil {
 					return err
@@ -1942,6 +1943,11 @@ func (n *Node) Ready() bool {
 	if n.managedStartup == nil {
 		return true
 	}
+	if n.internalApplicationProfile() {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		return n.CheckManagedLocalRead(ctx) == nil
+	}
 	if !n.managedAdmitted.Load() || !n.opened.Load() {
 		return false
 	}
@@ -2418,6 +2424,7 @@ func (n *Node) shutdown() error {
 }
 
 func (n *Node) shutdownEngine(closeBucket bool) error {
+	internal := n.stopInternalApplication()
 	n.managedPeerVerified.Store(false)
 	n.managedAdmitted.Store(false)
 	n.opened.Store(false)
@@ -2434,6 +2441,9 @@ func (n *Node) shutdownEngine(closeBucket bool) error {
 	// Keep the server reachable until the peer handlers that reference it join.
 	if n.server != nil {
 		n.server.Close()
+	}
+	if internal != nil {
+		internal.active.Wait()
 	}
 	if n.peerControl != nil {
 		n.peerControl.Close()

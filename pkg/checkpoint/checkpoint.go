@@ -965,7 +965,7 @@ func (m *Manager) validateSourceProfile(sources []Source) error {
 	if err := validateSources(sources); err != nil {
 		return err
 	}
-	if m.expectedPolicy == sqlpolicy.ManagedSQLKVMaterializationPolicy && (len(sources) != 1 || sources[0].Role != RoleSQLite) {
+	if (m.expectedPolicy == sqlpolicy.ManagedSQLKVMaterializationPolicy || m.expectedPolicy == sqlpolicy.ManagedRequestMaterializationPolicy) && (len(sources) != 1 || sources[0].Role != RoleSQLite) {
 		return fmt.Errorf("mixed checkpoint requires exactly one SQLite file")
 	}
 	return nil
@@ -1678,7 +1678,7 @@ func (m *Manager) validateRoot(root Checkpoint) error {
 	if m.expectedPolicy.Validate() != nil || root.SQLExecutionPolicy != int(m.expectedPolicy) {
 		return sqlpolicy.ErrIncompatible
 	}
-	if m.expectedPolicy == sqlpolicy.ManagedSQLKVMaterializationPolicy && (len(root.Files) != 1 || root.Files[0].Role != RoleSQLite) {
+	if (m.expectedPolicy == sqlpolicy.ManagedSQLKVMaterializationPolicy || m.expectedPolicy == sqlpolicy.ManagedRequestMaterializationPolicy) && (len(root.Files) != 1 || root.Files[0].Role != RoleSQLite) {
 		return fmt.Errorf("mixed checkpoint requires exactly one SQLite file")
 	}
 	if root.ConfigID != m.configID || root.Generation == 0 || root.Index == 0 || root.Size <= 0 || root.Size > maxCheckpointSize || len(root.Files) < 1 || len(root.Files) > 2 {

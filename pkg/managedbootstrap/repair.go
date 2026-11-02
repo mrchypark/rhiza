@@ -15,6 +15,7 @@ import (
 	"reflect"
 
 	objectstore "github.com/mrchypark/rhiza/internal/objstore"
+	"github.com/mrchypark/rhiza/internal/sqlpolicy"
 	"github.com/mrchypark/rhiza/internal/types"
 	"github.com/mrchypark/rhiza/pkg/checkpoint"
 	"github.com/mrchypark/rhiza/pkg/managedsql"
@@ -265,6 +266,9 @@ func ManagedRepairConfig(ctx context.Context, kube *operator.Kubernetes, ref ope
 	cfg, err := ManagedRuntimeConfig(ctx, kube, ref, podUID, identity, profile, plan)
 	if err != nil {
 		return empty, noop, err
+	}
+	if cfg.Plan.ApplicationProtocol == sqlpolicy.ManagedRequestApplicationProtocol && (cfg.Plan.Generation != 0 || cfg.Plan.EvidenceFormat != sqlpolicy.ManagedRequestApplicationProtocol) {
+		return empty, noop, errors.New("unsupported managed request repair profile or generation")
 	}
 	cfg.RepairOrigin, err = os.ReadFile(repairPath)
 	if err != nil {

@@ -167,6 +167,9 @@ func verifyGenerationAnchor(ctx context.Context, bucket objstore.Bucket, prefix 
 }
 
 func verifyGenerationAnchorForPolicy(ctx context.Context, bucket objstore.Bucket, prefix string, expectedMembership MembershipRecord, expectedAnchorHash [32]byte, fixedHead *archiveHead, expected sqlpolicy.MaterializationPolicy) (GenerationAnchor, error) {
+	if expected == sqlpolicy.ManagedRequestMaterializationPolicy {
+		return GenerationAnchor{}, fmt.Errorf("managed request generation anchors are not supported")
+	}
 	if err := expected.Validate(); err != nil {
 		return GenerationAnchor{}, err
 	}

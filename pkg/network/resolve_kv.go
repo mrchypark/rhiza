@@ -36,7 +36,7 @@ func (s *Server) ResolveKV(ctx context.Context, operation string, req KVMutation
 	if err := ctx.Err(); err != nil {
 		return ResolveKVResult{}, err
 	}
-	if s.expectedPolicy != sqlpolicy.ManagedSQLKVMaterializationPolicy {
+	if !managedKVExecutionPolicy(s.expectedPolicy) {
 		return ResolveKVResult{}, sqlpolicy.ErrIncompatible
 	}
 	if s.material == nil {

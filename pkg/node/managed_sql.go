@@ -51,6 +51,12 @@ func (n *Node) managedLearnReady() bool {
 		log.Printf("managed QUIC Learned refused stage=runtime opened=%t verified=%t", n.opened.Load(), n.managedPeerVerified.Load())
 		return false
 	}
+	if n.internalApplicationProfile() {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		_, err := n.checkInternalApplicationRuntime(ctx)
+		return err == nil
+	}
 	checker, ok := n.managedStartup.Checker.(ManagedPeerLearnChecker)
 	if !ok {
 		return n.Ready()
@@ -65,6 +71,23 @@ func (n *Node) managedLearnReady() bool {
 }
 
 func (n *Node) CheckManagedLocalRead(ctx context.Context) error {
+	if n.internalApplicationProfile() {
+		_, scoped, release, err := n.borrowInternalApplication(ctx)
+		if err != nil {
+			return err
+		}
+		defer release()
+		ctx = scoped
+	}
+	if n.internalApplicationProfile() {
+		if _, err := n.checkInternalApplicationRuntime(ctx); err != nil {
+			return err
+		}
+		if !n.managedInitiallyAdmitted.Load() || !n.core.IsVoter() {
+			return network.ErrNotReady
+		}
+		return nil
+	}
 	if _, err := n.ManagedState(); err != nil {
 		return err
 	}
@@ -109,7 +132,7 @@ func (n *Node) managedSQLScope(i ManagedStartupIdentity) ([]byte, string, error)
 	if err != nil {
 		return nil, "", err
 	}
-	if policy == sqlpolicy.ManagedSQLKVMaterializationPolicy && (i.Member.Generation != 0 || i.EvidenceFormat != types.ManagedApplicationProtocolSQLKV) {
+	if managedSQLKVPolicy(policy) && (i.Member.Generation != 0 || i.EvidenceFormat != i.ApplicationProtocol) {
 		return nil, "", fmt.Errorf("unsupported managed application generation or evidence format")
 	}
 	source, _, err := n.preparedBindingDigestsForProtocol(i.ApplicationProtocol)
@@ -295,7 +318,7 @@ func (n *Node) InspectManagedKVRead(ctx context.Context) (ManagedKVSnapshot, err
 }
 
 func (n *Node) inspectManagedKV(ctx context.Context, fresh, localRead bool) (ManagedKVSnapshot, error) {
-	if n.materializationPolicy() != sqlpolicy.ManagedSQLKVMaterializationPolicy {
+	if !managedSQLKVPolicy(n.materializationPolicy()) {
 		return ManagedKVSnapshot{}, fmt.Errorf("mixed evidence requires the mixed application profile")
 	}
 	digest, empty, runtime, err := n.inspectManagedApplication(ctx, fresh, localRead)
@@ -303,7 +326,10 @@ func (n *Node) inspectManagedKV(ctx context.Context, fresh, localRead bool) (Man
 }
 
 func (n *Node) inspectApplicationState(ctx context.Context, m *materializer.Materializer) ([32]byte, bool, error) {
-	if n.materializationPolicy() == sqlpolicy.ManagedSQLKVMaterializationPolicy {
+	if managedSQLKVPolicy(n.materializationPolicy()) {
+		if m.MaterializationPolicy() != n.materializationPolicy() {
+			return [32]byte{}, false, sqlpolicy.ErrIncompatible
+		}
 		state, err := m.InspectManagedApplicationState(ctx)
 		return state.Digest, state.FreshEmpty, err
 	}
@@ -312,6 +338,14 @@ func (n *Node) inspectApplicationState(ctx context.Context, m *materializer.Mate
 }
 
 func (n *Node) inspectManagedApplication(ctx context.Context, fresh, localRead bool) (digest [32]byte, empty bool, runtime ManagedRuntimeState, resultErr error) {
+	if n.internalApplicationProfile() {
+		_, scoped, release, err := n.borrowInternalApplication(ctx)
+		if err != nil {
+			return [32]byte{}, false, ManagedRuntimeState{}, err
+		}
+		defer release()
+		ctx = scoped
+	}
 	// Keep one certified-prefix/adoption check for both evidence domains.
 	fail := func(err error) ([32]byte, bool, ManagedRuntimeState, error) {
 		return [32]byte{}, false, ManagedRuntimeState{}, err
@@ -328,7 +362,7 @@ func (n *Node) inspectManagedApplication(ctx context.Context, fresh, localRead b
 	defer n.replayMu.Unlock()
 	before := n.managedRuntimeState()
 	floor := n.core.CompactionFloor()
-	if fresh && n.materializationPolicy() == sqlpolicy.ManagedSQLKVMaterializationPolicy && floor != 0 {
+	if fresh && managedSQLKVPolicy(n.materializationPolicy()) && floor != 0 {
 		return fail(fmt.Errorf("compacted application history is not fresh-state proof"))
 	}
 	if floor > 0 {
@@ -363,7 +397,7 @@ func (n *Node) inspectManagedApplication(ctx context.Context, fresh, localRead b
 				}
 			}
 			if len(v.Value) != 0 {
-				if n.materializationPolicy() == sqlpolicy.ManagedSQLKVMaterializationPolicy {
+				if managedSQLKVPolicy(n.materializationPolicy()) {
 					if err := n.validateExecutionPolicy(v.Value); err != nil {
 						return fail(err)
 					}
@@ -406,6 +440,26 @@ func (n *Node) inspectManagedApplication(ctx context.Context, fresh, localRead b
 }
 
 func (n *Node) ExecuteManagedSQL(ctx context.Context, req network.ExecuteRequest) (network.ExecuteResponse, error) {
+	if n.internalApplicationProfile() {
+		_, scoped, release, err := n.borrowInternalApplication(ctx)
+		if err != nil {
+			return network.ExecuteResponse{}, err
+		}
+		defer release()
+		ctx = scoped
+	}
+	if n.internalApplicationProfile() {
+		if err := network.ValidateExecuteRequest(req); err != nil {
+			return network.ExecuteResponse{}, err
+		}
+		if err := n.admitInternalApplication(ctx); err != nil {
+			return network.ExecuteResponse{}, err
+		}
+		if err := n.recordManagedApplicationStart(ctx); err != nil {
+			return network.ExecuteResponse{}, err
+		}
+		return n.server.Execute(ctx, req)
+	}
 	state, err := n.ManagedState()
 	if err != nil {
 		return network.ExecuteResponse{}, err
@@ -442,6 +496,31 @@ func (n *Node) recordManagedApplicationStart(ctx context.Context) error {
 }
 
 func (n *Node) ResolveManagedSQL(ctx context.Context, req network.ExecuteRequest) (network.ResolveExecuteResult, error) {
+	if n.internalApplicationProfile() {
+		_, scoped, release, err := n.borrowInternalApplication(ctx)
+		if err != nil {
+			return network.ResolveExecuteResult{}, err
+		}
+		defer release()
+		ctx = scoped
+	}
+	if n.internalApplicationProfile() {
+		if err := network.ValidateExecuteRequest(req); err != nil {
+			return network.ResolveExecuteResult{}, err
+		}
+		resolved, err := n.ResolveRequest(ctx, "sql", req.RequestID)
+		if err != nil {
+			return network.ResolveExecuteResult{State: network.ResolveExecuteUnknownOrExpired, Durability: network.ResolveExecuteDurabilityUnknown}, err
+		}
+		fingerprint, err := types.SQLFingerprint(types.SQLCommand{RequestID: req.RequestID, SQL: req.SQL, Args: req.Args, WantRows: req.WantRows, RequireOne: req.RequireOne, Statements: req.Statements})
+		if err != nil {
+			return network.ResolveExecuteResult{}, err
+		}
+		if fingerprint != resolved.Original.Fingerprint {
+			return network.ResolveExecuteResult{}, network.ErrRequestConflict
+		}
+		return network.ResolveExecuteResult{State: network.ResolveExecuteRetained, Receipt: &resolved.Receipt, Statements: resolved.Statements, Durability: network.ResolveExecuteDurabilityConfirmed}, nil
+	}
 	if _, err := n.ManagedState(); err != nil {
 		return network.ResolveExecuteResult{}, err
 	}
@@ -474,6 +553,14 @@ func (n *Node) ResolveManagedSQL(ctx context.Context, req network.ExecuteRequest
 }
 
 func (n *Node) QueryManagedSQL(ctx context.Context, req network.QueryRequest) (network.QueryResponse, error) {
+	if n.internalApplicationProfile() {
+		_, scoped, release, err := n.borrowInternalApplication(ctx)
+		if err != nil {
+			return network.QueryResponse{}, err
+		}
+		defer release()
+		ctx = scoped
+	}
 	if req.Consistency != "" && req.Consistency != "local" && req.Consistency != "linearizable" {
 		return network.QueryResponse{}, fmt.Errorf("%w: consistency must be local or linearizable", network.ErrInvalidRequest)
 	}
@@ -481,6 +568,12 @@ func (n *Node) QueryManagedSQL(ctx context.Context, req network.QueryRequest) (n
 		return network.QueryResponse{}, err
 	}
 	if req.Consistency == "linearizable" {
+		if n.internalApplicationProfile() {
+			if err := n.admitInternalApplication(ctx); err != nil {
+				return network.QueryResponse{}, err
+			}
+			return n.server.Query(ctx, req)
+		}
 		if err := n.managedStartup.Checker.ValidateManagedAdmission(ctx, n.managedStartup.Identity, n.managedRuntimeState()); err != nil {
 			return network.QueryResponse{}, err
 		}

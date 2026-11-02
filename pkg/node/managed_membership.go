@@ -93,11 +93,11 @@ func (n *Node) captureManagedRepairSource(ctx context.Context, r ManagedMembersh
 	}
 	prefix := path.Join(n.config.ObjStorePrefix, string(n.config.ClusterID))
 	bootstrap := quepaxa.Cluster{ConfigID: 1, Members: n.config.Members}
-	view, err := recovery.OpenReadOnlyView(ctx, n.bucket, prefix, 1, bootstrap)
+	view, err := recovery.OpenReadOnlyViewForPolicy(ctx, n.bucket, prefix, 1, bootstrap, n.materializationPolicy(), n.receiptWindow())
 	if err != nil {
 		return ManagedRepairSource{}, err
 	}
-	view, err = recovery.OpenReadOnlyViewAtHead(ctx, n.bucket, prefix, 1, bootstrap, view.CapturedHead())
+	view, err = recovery.OpenReadOnlyViewAtHeadForPolicy(ctx, n.bucket, prefix, 1, bootstrap, view.CapturedHead(), n.materializationPolicy(), n.receiptWindow())
 	if err != nil {
 		return ManagedRepairSource{}, err
 	}

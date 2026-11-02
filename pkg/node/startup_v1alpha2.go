@@ -14,6 +14,7 @@ import (
 	"path/filepath"
 	"reflect"
 	"slices"
+	"sync"
 
 	objectstore "github.com/mrchypark/rhiza/internal/objstore"
 	"github.com/mrchypark/rhiza/internal/sqlpolicy"
@@ -64,6 +65,200 @@ type ManagedRuntimeState struct {
 	AppliedTip            uint64
 	RecorderTip           uint64
 	ExistingRegisteredWAL bool
+}
+
+// internalApplicationBinding is published only after actual startup/adoption
+// validation. It is a runtime identity, not a substitute for quorum or ACK.
+type internalApplicationBinding struct {
+	mu       sync.Mutex
+	closing  bool
+	active   sync.WaitGroup
+	lifetime context.Context
+	cancel   context.CancelFunc
+	identity ManagedStartupIdentity
+	policy   sqlpolicy.MaterializationPolicy
+	window   uint64
+	wal      string
+	walStore *qlog.WAL
+	member   quepaxa.Member
+	core     *quepaxa.Core
+	material *materializer.Materializer
+}
+
+// Borrowing is scoped to one operation, not permission to skip its runtime
+// checks. Closing cancels borrowers and drains them before objects are closed.
+func (n *Node) borrowInternalApplication(ctx context.Context) (*internalApplicationBinding, context.Context, func(), error) {
+	if err := ctx.Err(); err != nil {
+		return nil, ctx, nil, err
+	}
+	if !n.internalApplicationProfile() {
+		return nil, ctx, nil, fmt.Errorf("internal application profile required")
+	}
+	b := n.internalApplication.Load()
+	if b == nil {
+		return nil, ctx, nil, fmt.Errorf("internal application binding unavailable")
+	}
+	b.mu.Lock()
+	if b.closing || n.internalApplication.Load() != b {
+		b.mu.Unlock()
+		return nil, ctx, nil, fmt.Errorf("internal application is closing")
+	}
+	b.active.Add(1)
+	b.mu.Unlock()
+	op, cancel := context.WithCancel(ctx)
+	stop := context.AfterFunc(b.lifetime, cancel)
+	return b, op, func() { stop(); cancel(); b.active.Done() }, nil
+}
+
+func (n *Node) stopInternalApplication() *internalApplicationBinding {
+	b := n.internalApplication.Swap(nil)
+	if b != nil {
+		b.mu.Lock()
+		b.closing = true
+		b.cancel()
+		b.mu.Unlock()
+	}
+	return b
+}
+
+func (n *Node) internalApplicationProfile() bool {
+	return n != nil && n.managedStartup != nil && n.materializationPolicy() == sqlpolicy.ManagedRequestMaterializationPolicy
+}
+
+func inspectManagedFileForPolicy(ctx context.Context, file string, window uint64, expected sqlpolicy.MaterializationPolicy) (materializer.ManagedApplicationState, uint64, error) {
+	switch expected {
+	case sqlpolicy.ManagedRequestMaterializationPolicy:
+		return materializer.InspectManagedRequestFile(ctx, file, window)
+	case sqlpolicy.ManagedSQLKVMaterializationPolicy:
+		return materializer.InspectManagedApplicationFile(ctx, file, window)
+	default:
+		return materializer.ManagedApplicationState{}, 0, sqlpolicy.ErrIncompatible
+	}
+}
+
+func managedSQLKVPolicy(policy sqlpolicy.MaterializationPolicy) bool {
+	return policy == sqlpolicy.ManagedSQLKVMaterializationPolicy || policy == sqlpolicy.ManagedRequestMaterializationPolicy
+}
+
+func (n *Node) installInternalApplicationBinding(ctx context.Context) error {
+	if !n.internalApplicationProfile() || n.internalApplication.Load() != nil || n.core == nil || n.material == nil || n.wal == nil || !n.opened.Load() {
+		return fmt.Errorf("internal application binding cannot be installed")
+	}
+	i := n.managedStartup.Identity
+	if i.Member.Generation != 0 || i.ApplicationProtocol != sqlpolicy.ManagedRequestApplicationProtocol || n.material.MaterializationPolicy() != sqlpolicy.ManagedRequestMaterializationPolicy || n.core.WALIdentity() == "" {
+		return fmt.Errorf("internal application startup identity or profile differs")
+	}
+	source, config, err := n.preparedBindingDigestsForProtocol(i.ApplicationProtocol)
+	if err != nil || source != i.Member.SourceBinding || config != i.Member.ConfigDigest {
+		return errors.Join(fmt.Errorf("internal application source binding differs"), err)
+	}
+	var member quepaxa.Member
+	for _, candidate := range n.config.Members {
+		if candidate.ID == n.config.NodeID {
+			member = candidate
+		}
+	}
+	if n.config.Learner != nil && n.config.Learner.ID == n.config.NodeID {
+		member = *n.config.Learner
+	}
+	if member.ID == "" || member.PublicKey == (quepaxa.PublicKey{}) {
+		return fmt.Errorf("internal application member identity unavailable")
+	}
+	if err := errors.Join(n.core.Health(), n.material.Health(ctx)); err != nil {
+		return err
+	}
+	if fatal := n.wal.Capacity().Fatal; fatal != nil {
+		return fatal
+	}
+	nonce, registered := n.wal.Identity()
+	if !registered || hex.EncodeToString(nonce) != n.core.WALIdentity() {
+		return fmt.Errorf("internal application WAL manifest is not registered")
+	}
+	lifetime, cancel := context.WithCancel(context.Background())
+	b := &internalApplicationBinding{identity: i, policy: n.materializationPolicy(), window: n.receiptWindow(), wal: n.core.WALIdentity(), walStore: n.wal, member: member, core: n.core, material: n.material, lifetime: lifetime, cancel: cancel}
+	if !n.internalApplication.CompareAndSwap(nil, b) {
+		cancel()
+		return fmt.Errorf("internal application binding already installed")
+	}
+	return nil
+}
+
+func (n *Node) checkInternalApplicationRuntime(ctx context.Context) (ManagedRuntimeState, error) {
+	_, ctx, release, err := n.borrowInternalApplication(ctx)
+	if err != nil {
+		return ManagedRuntimeState{}, err
+	}
+	defer release()
+	if err := ctx.Err(); err != nil {
+		return ManagedRuntimeState{}, err
+	}
+	if !n.internalApplicationProfile() || !n.opened.Load() || n.terminalRequested.Load() || n.wal == nil || n.config == nil || n.core == nil || n.material == nil {
+		return ManagedRuntimeState{}, fmt.Errorf("internal application runtime unavailable")
+	}
+	b := n.internalApplication.Load()
+	if b == nil || n.core != b.core || n.material != b.material || n.wal != b.walStore || n.managedStartup.Identity != b.identity || n.materializationPolicy() != b.policy || n.receiptWindow() != b.window || n.core.WALIdentity() != b.wal || n.material.MaterializationPolicy() != b.policy {
+		return ManagedRuntimeState{}, fmt.Errorf("internal application runtime binding changed")
+	}
+	nonce, registered := n.wal.Identity()
+	if !registered || hex.EncodeToString(nonce) != b.wal {
+		return ManagedRuntimeState{}, fmt.Errorf("internal application WAL manifest identity changed")
+	}
+	source, config, err := n.preparedBindingDigestsForProtocol(b.identity.ApplicationProtocol)
+	if err != nil || source != b.identity.Member.SourceBinding || config != b.identity.Member.ConfigDigest {
+		return ManagedRuntimeState{}, errors.Join(fmt.Errorf("internal application current source differs"), err)
+	}
+	memberFound := false
+	for _, member := range n.core.CurrentCluster().Members {
+		if member.ID == b.member.ID {
+			if member.PublicKey != b.member.PublicKey || member.WALIdentity != "" && member.WALIdentity != b.wal {
+				return ManagedRuntimeState{}, fmt.Errorf("internal application current member differs")
+			}
+			memberFound = true
+		}
+	}
+	if !memberFound && (n.managedInitiallyAdmitted.Load() || n.config.Learner == nil || n.config.Learner.ID != b.member.ID || n.config.Learner.PublicKey != b.member.PublicKey) {
+		return ManagedRuntimeState{}, fmt.Errorf("internal application member is retired")
+	}
+	if err := errors.Join(n.core.Health(), n.material.Health(ctx)); err != nil {
+		return ManagedRuntimeState{}, err
+	}
+	if fatal := n.wal.Capacity().Fatal; fatal != nil {
+		return ManagedRuntimeState{}, fatal
+	}
+	state := n.managedRuntimeState()
+	if state.WALIdentity != b.wal || state.AppliedTip > state.CertifiedTip {
+		return state, fmt.Errorf("internal application applied prefix is invalid")
+	}
+	return state, nil
+}
+
+func (n *Node) admitInternalApplication(ctx context.Context) error {
+	_, ctx, release, err := n.borrowInternalApplication(ctx)
+	if err != nil {
+		return err
+	}
+	defer release()
+	if _, err := n.checkInternalApplicationRuntime(ctx); err != nil {
+		return err
+	}
+	if !n.managedInitiallyAdmitted.Load() || !n.core.CanParticipateReadIndex() {
+		return fmt.Errorf("internal application has no active voter admission")
+	}
+	target, _, err := n.core.ReadIndex(ctx)
+	if err != nil {
+		return err
+	}
+	if err := n.replayLocalDecisions(ctx); err != nil {
+		return err
+	}
+	state, err := n.checkInternalApplicationRuntime(ctx)
+	if err != nil {
+		return err
+	}
+	if state.CertifiedTip < uint64(target) || state.AppliedTip != state.CertifiedTip || state.RecorderTip > state.CertifiedTip {
+		return fmt.Errorf("internal application has unresolved certified history")
+	}
+	return nil
 }
 
 // ManagedStartupChecker is implemented by the private application host. Startup
@@ -153,7 +348,10 @@ func (n *Node) OpenManaged(ctx context.Context, cfg ManagedStartupConfig) (resul
 	if err != nil {
 		return err
 	}
-	if policy == sqlpolicy.ManagedSQLKVMaterializationPolicy && (i.Member.Generation != 0 || i.EvidenceFormat != types.ManagedApplicationProtocolSQLKV) {
+	if policy == sqlpolicy.ManagedRequestMaterializationPolicy && (i.Member.Generation != 0 || i.ApplicationProtocol != sqlpolicy.ManagedRequestApplicationProtocol || i.EvidenceFormat != i.ApplicationProtocol) {
+		return fmt.Errorf("unsupported internal application generation or evidence format")
+	}
+	if managedSQLKVPolicy(policy) && (i.Member.Generation != 0 || i.EvidenceFormat != i.ApplicationProtocol) {
 		return fmt.Errorf("unsupported managed application generation or evidence format")
 	}
 	cfg.expectedPolicy, cfg.idempotencyWindow = policy, window
@@ -212,8 +410,8 @@ func (n *Node) OpenManaged(ctx context.Context, cfg ManagedStartupConfig) (resul
 	if cfg.Prepared != nil && (cfg.Prepared.View() == nil || cfg.Prepared.View().MaterializationPolicy() != policy) {
 		return fmt.Errorf("managed prepared application profile mismatch")
 	}
-	if cfg.Prepared != nil && policy == sqlpolicy.ManagedSQLKVMaterializationPolicy {
-		_, tip, err := materializer.InspectManagedApplicationFile(ctx, filepath.Join(cfg.Prepared.Directory(), "sqlite.db"), window)
+	if cfg.Prepared != nil && managedSQLKVPolicy(policy) {
+		_, tip, err := inspectManagedFileForPolicy(ctx, filepath.Join(cfg.Prepared.Directory(), "sqlite.db"), window, policy)
 		if err != nil || tip != uint64(cfg.Prepared.View().Tip()) {
 			return errors.Join(fmt.Errorf("managed prepared application window or tip mismatch"), err)
 		}
@@ -305,6 +503,11 @@ func (n *Node) OpenManaged(ctx context.Context, cfg ManagedStartupConfig) (resul
 		close(cfg.promotionReady)
 	}
 	n.managedPeerVerified.Store(true)
+	if n.internalApplicationProfile() {
+		if err := n.installInternalApplicationBinding(ctx); err != nil {
+			return postOpenFailure(err)
+		}
+	}
 	return nil
 }
 
@@ -325,14 +528,17 @@ func (n *Node) receiptWindow() uint64 {
 }
 
 func (n *Node) validateExecutionPolicy(value []byte) error {
-	if n.materializationPolicy() == sqlpolicy.ManagedSQLKVMaterializationPolicy {
+	if managedSQLKVPolicy(n.materializationPolicy()) {
 		return types.ValidateManagedKVExecutionPolicy(value)
 	}
 	return types.ValidateExecutionPolicy(value)
 }
 
 func (n *Node) openMaterializer(path string, readers int) (*materializer.Materializer, error) {
-	if n.materializationPolicy() == sqlpolicy.ManagedSQLKVMaterializationPolicy {
+	if n.internalApplicationProfile() {
+		return materializer.OpenManagedSQLKVWithOriginals(path, readers, n.receiptWindow())
+	}
+	if managedSQLKVPolicy(n.materializationPolicy()) {
 		return materializer.OpenManagedSQLKV(path, readers, n.receiptWindow())
 	}
 	return materializer.Open(path, readers)
@@ -340,13 +546,13 @@ func (n *Node) openMaterializer(path string, readers int) (*materializer.Materia
 
 // Actual file semantics must precede every mixed Core checkpoint base install.
 func (n *Node) validateCheckpointFiles(ctx context.Context, files []checkpoint.File, tip uint64) error {
-	if n.materializationPolicy() != sqlpolicy.ManagedSQLKVMaterializationPolicy {
+	if !managedSQLKVPolicy(n.materializationPolicy()) {
 		return nil
 	}
 	if len(files) != 1 || files[0].Role != checkpoint.RoleSQLite {
 		return fmt.Errorf("mixed checkpoint requires exactly one SQLite file")
 	}
-	_, actual, err := materializer.InspectManagedApplicationFile(ctx, files[0].Path, n.receiptWindow())
+	_, actual, err := inspectManagedFileForPolicy(ctx, files[0].Path, n.receiptWindow(), n.materializationPolicy())
 	if err != nil {
 		return err
 	}
@@ -384,15 +590,47 @@ func (n *Node) managedRuntimeState() ManagedRuntimeState {
 }
 
 func (n *Node) ManagedState() (ManagedRuntimeState, error) {
+	if n.internalApplicationProfile() {
+		return n.checkInternalApplicationRuntime(context.Background())
+	}
 	if n == nil || n.managedStartup == nil || !n.opened.Load() || n.core == nil || n.material == nil {
 		return ManagedRuntimeState{}, fmt.Errorf("managed runtime is not open")
 	}
 	return n.managedRuntimeState(), nil
 }
 
+// EnsureInitialManagedAdmission preserves the first real quorum/live-authority
+// boundary without requiring a new quorum round for already admitted local
+// reads/status/readiness. It installs no caller-supplied permission.
+func (n *Node) EnsureInitialManagedAdmission(ctx context.Context) error {
+	_, ctx, release, err := n.borrowInternalApplication(ctx)
+	if err != nil {
+		return err
+	}
+	defer release()
+	if _, err := n.checkInternalApplicationRuntime(ctx); err != nil {
+		return err
+	}
+	if n.managedInitiallyAdmitted.Load() {
+		return nil
+	}
+	return n.AdmitManaged(ctx)
+}
+
 // AdmitManaged performs a fresh quorum/replay round before checking current
 // application authority. Failure preserves the paused runtime and its data.
 func (n *Node) AdmitManaged(ctx context.Context) error {
+	if n.internalApplicationProfile() {
+		_, scoped, release, err := n.borrowInternalApplication(ctx)
+		if err != nil {
+			return err
+		}
+		defer release()
+		ctx = scoped
+	}
+	if n.internalApplicationProfile() && n.managedInitiallyAdmitted.Load() {
+		return n.admitInternalApplication(ctx)
+	}
 	if n == nil || n.managedStartup == nil || !n.opened.Load() || n.core == nil || n.material == nil {
 		return fmt.Errorf("managed runtime is not open")
 	}
@@ -773,8 +1011,8 @@ func (n *Node) verifyExistingManagedPreparedSQLBeforeOpen(ctx context.Context, p
 }
 
 func (n *Node) inspectApplicationFile(ctx context.Context, path string) ([32]byte, uint64, error) {
-	if n.materializationPolicy() == sqlpolicy.ManagedSQLKVMaterializationPolicy {
-		state, tip, err := materializer.InspectManagedApplicationFile(ctx, path, n.receiptWindow())
+	if managedSQLKVPolicy(n.materializationPolicy()) {
+		state, tip, err := inspectManagedFileForPolicy(ctx, path, n.receiptWindow(), n.materializationPolicy())
 		return state.Digest, tip, err
 	}
 	state, tip, err := materializer.InspectSQLApplicationFile(ctx, path)
@@ -1119,7 +1357,7 @@ func (n *Node) recoverPreparedV1Alpha2WithLock(ctx context.Context, prepared *re
 		if !hasBase {
 			return fmt.Errorf("prepared history requires an unsupported generation base")
 		}
-		if n.materializationPolicy() == sqlpolicy.ManagedSQLKVMaterializationPolicy {
+		if managedSQLKVPolicy(n.materializationPolicy()) {
 			dir, err := os.MkdirTemp(dataDir, ".rhiza-prepared-base-*")
 			if err != nil {
 				return err

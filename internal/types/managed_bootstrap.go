@@ -49,6 +49,8 @@ func ManagedApplicationPolicy(protocol string) (sqlpolicy.MaterializationPolicy,
 		return sqlpolicy.LegacyMaterializationPolicy, DefaultIdempotencyWindowSlots, nil
 	case ManagedApplicationProtocolSQLKV:
 		return sqlpolicy.ManagedSQLKVMaterializationPolicy, DefaultIdempotencyWindowSlots, nil
+	case sqlpolicy.ManagedRequestApplicationProtocol:
+		return sqlpolicy.ManagedRequestMaterializationPolicy, DefaultIdempotencyWindowSlots, nil
 	default:
 		return 0, 0, fmt.Errorf("unsupported managed application protocol")
 	}
