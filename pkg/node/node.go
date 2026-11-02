@@ -2357,6 +2357,7 @@ func (n *Node) catchUpPeer(ctx context.Context, transport *network.Transport, so
 	}()
 	for {
 		stage, from, remoteTip, remoteTipKnown = "local-replay", quepaxa.Slot(n.material.Tip())+1, 0, false
+		localtesthooks.Hit("node:catchup-peer:phase=before-local-replay:node=" + string(n.config.NodeID))
 		if replayFrom, err := n.replayLocalDecisionsFrom(ctx); err != nil {
 			from = replayFrom
 			return err

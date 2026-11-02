@@ -249,7 +249,7 @@ jobs:
         run: |
           go test -tags rhiza_local_testhooks ./pkg/network -run '^TestTerminalDecisionCancelsUnneededPeerHandshake$' -count=1 -timeout=30s
           go test -tags rhiza_local_testhooks ./pkg/network -run '^TestPostSubmitKVSecondLookupFailureIsUnknown$' -count=1 -timeout=30s
-          go test -tags rhiza_local_testhooks ./pkg/managedsql -run '^TestManagedSQLCertifiedRecoveryGapHoldsPushAndPeriodicPull$' -count=1 -timeout=60s
+          go test -tags rhiza_local_testhooks ./pkg/managedsql -run '^(TestManagedSQLCertifiedRecoveryGapHoldsPushAndPeriodicPull|TestManagedSQLRetainedOriginalAppliesCertifiedSuffixBeforeFinalize)$' -count=1 -timeout=60s
           go test -tags rhiza_local_testhooks ./pkg/network -run '^TestOverload(MutationAdmissionEmitsFixedSite|QueueReservationEmitsFixedSite|InputChannelFullEmitsFixedSite|WorkerInflightBytesEmitsFixedSite|ProposalAdmissionSubtypeEmitsFixedSite)$' -count=1 -timeout=30s
           go test -tags rhiza_local_testhooks ./pkg/node -run '^TestAdvanceCheckpointReadBarriersRetriesRealPreAdmissionRefusal$' -count=1 -timeout=30s
           go test -tags rhiza_local_testhooks ./pkg/recovery -run '^(TestArchiveCleanupReusesUnchangedPrefixAfterRealHeadConflict|TestArchiveCleanupReuseRequiresExactBaseAndRefPrefix|TestArchiveCleanupIncrementalPackingMatchesFullAtBoundaries|TestArchiveCleanupAmbiguousPublicationReloadsCommittedHead|TestArchiveCleanupCanceledAfterHeadConflictDoesNotRepublish)$' -count=1 -timeout=2m
@@ -259,7 +259,7 @@ jobs:
         run: |
           go test -race -tags rhiza_local_testhooks ./pkg/network -run '^TestTerminalDecisionCancelsUnneededPeerHandshake$' -count=1 -timeout=30s
           go test -race -tags rhiza_local_testhooks ./pkg/network -run '^TestPostSubmitKVSecondLookupFailureIsUnknown$' -count=1 -timeout=30s
-          go test -race -tags rhiza_local_testhooks ./pkg/managedsql -run '^TestManagedSQLCertifiedRecoveryGapHoldsPushAndPeriodicPull$' -count=1 -timeout=60s
+          go test -race -tags rhiza_local_testhooks ./pkg/managedsql -run '^(TestManagedSQLCertifiedRecoveryGapHoldsPushAndPeriodicPull|TestManagedSQLRetainedOriginalAppliesCertifiedSuffixBeforeFinalize)$' -count=1 -timeout=60s
           go test -race -tags rhiza_local_testhooks ./pkg/network -run '^TestOverload(MutationAdmissionEmitsFixedSite|QueueReservationEmitsFixedSite|InputChannelFullEmitsFixedSite|WorkerInflightBytesEmitsFixedSite|ProposalAdmissionSubtypeEmitsFixedSite)$' -count=1 -timeout=30s
           go test -race -tags rhiza_local_testhooks ./pkg/node -run '^TestAdvanceCheckpointReadBarriersRetriesRealPreAdmissionRefusal$' -count=1 -timeout=30s
           go test -race -tags rhiza_local_testhooks ./pkg/recovery -run '^(TestArchiveCleanupReusesUnchangedPrefixAfterRealHeadConflict|TestArchiveCleanupReuseRequiresExactBaseAndRefPrefix|TestArchiveCleanupIncrementalPackingMatchesFullAtBoundaries|TestArchiveCleanupAmbiguousPublicationReloadsCommittedHead|TestArchiveCleanupCanceledAfterHeadConflictDoesNotRepublish)$' -count=1 -timeout=2m
