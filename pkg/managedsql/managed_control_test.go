@@ -4,7 +4,6 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
-	"net"
 	"net/http"
 	"net/http/httptest"
 	"path"
@@ -65,7 +64,7 @@ func TestManagedSQLHostRemoveRepairVoterTerminal(t *testing.T) {
 	hosts := make([]*Host, 3)
 	for _, i := range []int{1, 2} {
 		configs[i].Plan = plan
-		h, err := Open(ctx, configs[i])
+		h, err := seed.open(ctx, configs[i])
 		if h != nil {
 			t.Cleanup(func() {
 				if err := h.Close(); err != nil {
@@ -80,14 +79,7 @@ func TestManagedSQLHostRemoveRepairVoterTerminal(t *testing.T) {
 	}
 	configs[0].Plan = plan
 	writer, repair := hostRepairWriter(t, configs, hosts)
-	peer, err := net.ListenPacket("udp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatal(err)
-	}
-	peerAddr := peer.LocalAddr().String()
-	if err := peer.Close(); err != nil {
-		t.Fatal(err)
-	}
+	peerAddr := seed.reservePeer(t, repair.Replacement.NodeID)
 	repair.Replacement.PeerURL = "quic://" + peerAddr
 	originalTransport := writer.Kube.Client.Transport
 	writer.Kube.Client.Transport = repairGateTransport(func(req *http.Request) (*http.Response, error) {
@@ -104,7 +96,7 @@ func TestManagedSQLHostRemoveRepairVoterTerminal(t *testing.T) {
 		return repairGateJSON(pod), nil
 	})
 	configs[0].Store = writer
-	hosts[0], err = Open(ctx, configs[0])
+	hosts[0], err = seed.open(ctx, configs[0])
 	if hosts[0] != nil {
 		t.Cleanup(func() {
 			if err := hosts[0].Close(); err != nil {
@@ -261,7 +253,7 @@ func TestManagedSQLHostRemoveRepairVoterTerminal(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	learner, err := Open(ctx, learnerCfg)
+	learner, err := seed.open(ctx, learnerCfg)
 	if learner != nil {
 		t.Cleanup(func() {
 			if err := learner.Close(); err != nil {
@@ -334,7 +326,7 @@ func TestManagedSQLHostRemoveRepairVoterTerminal(t *testing.T) {
 		t.Fatal(err)
 	}
 	learnerCfg.Prepared = nil
-	restarted, err := Open(ctx, learnerCfg)
+	restarted, err := seed.open(ctx, learnerCfg)
 	if restarted != nil {
 		t.Cleanup(func() {
 			if err := restarted.Close(); err != nil {

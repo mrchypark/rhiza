@@ -20,12 +20,14 @@ import (
 	"testing"
 	"time"
 
+	"github.com/mrchypark/rhiza/internal/peertest"
 	"github.com/mrchypark/rhiza/internal/types"
 	"github.com/mrchypark/rhiza/pkg/managedsql"
 	"github.com/mrchypark/rhiza/pkg/network"
 	"github.com/mrchypark/rhiza/pkg/node"
 	"github.com/mrchypark/rhiza/pkg/operator"
 	"github.com/mrchypark/rhiza/pkg/quepaxa"
+	"github.com/quic-go/quic-go"
 )
 
 func TestCheckReadyUsesPrivateBearerAndRequiresNoContent(t *testing.T) {
@@ -64,15 +66,23 @@ func managedHTTPQuorum(t *testing.T) (*managedsql.Host, managedsql.Config, *http
 	archive := managedHTTPWireStore(t)
 	configs := make([]managedsql.Config, 3)
 	members := make([]quepaxa.Member, 3)
+	transports := make([]*quic.Transport, 3)
 	for i := range configs {
 		conn, err := net.ListenPacket("udp", "127.0.0.1:0")
 		if err != nil {
 			t.Fatal(err)
 		}
 		addr := conn.LocalAddr().String()
-		if err := conn.Close(); err != nil {
-			t.Fatal(err)
-		}
+		transport := &quic.Transport{Conn: conn}
+		transports[i] = transport
+		t.Cleanup(func() {
+			if err := transport.Close(); err != nil {
+				t.Error(err)
+			}
+			if err := conn.Close(); err != nil {
+				t.Error(err)
+			}
+		})
 		id, _ := types.ManagedNodeID(fmt.Sprintf("pod-%d", i))
 		token := fmt.Sprintf("peer-%d", i)
 		members[i] = quepaxa.Member{ID: id, PeerURL: "quic://" + addr, PublicKey: quepaxa.PublicKey(network.PeerPublicKey(cluster, id, token))}
@@ -81,6 +91,17 @@ func managedHTTPQuorum(t *testing.T) (*managedsql.Host, managedsql.Config, *http
 	for i := range configs {
 		configs[i].Runtime.Members = members
 	}
+	assertEndpointsHeld := func() {
+		t.Helper()
+		for _, config := range configs {
+			conn, err := net.ListenPacket("udp", config.Runtime.PeerAddr)
+			if err == nil {
+				_ = conn.Close()
+				t.Fatal("CLI fixture endpoint released")
+			}
+		}
+	}
+	assertEndpointsHeld()
 	var mu sync.Mutex
 	var obj map[string]json.RawMessage
 	if err := json.Unmarshal([]byte(`{"apiVersion":"rhiza.mrchypark.dev/v1alpha2","kind":"RhizaCluster","metadata":{"name":"cluster","namespace":"ns","uid":"uid","resourceVersion":"1"},"spec":{"logicalID":"logical","genesisIntent":"Create","voterCount":3,"workload":{"podTemplate":{"spec":{"containers":[{"name":"app","image":"image"}]}}}},"status":{}}`), &obj); err != nil {
@@ -159,7 +180,8 @@ func managedHTTPQuorum(t *testing.T) (*managedsql.Host, managedsql.Config, *http
 	var hosts []*managedsql.Host
 	for i := 0; i < 2; i++ {
 		configs[i].Store, configs[i].Ref, configs[i].Plan, configs[i].PodUID = store, ref, plan, fmt.Sprintf("pod-%d", i)
-		h, err := managedsql.Open(ctx, configs[i])
+		peerCtx := peertest.WithTransport(ctx, string(cluster), string(configs[i].Runtime.NodeID), configs[i].Runtime.PeerAddr, transports[i])
+		h, err := managedsql.Open(peerCtx, configs[i])
 		if h != nil {
 			t.Cleanup(func() {
 				if err := h.Close(); err != nil {
@@ -186,6 +208,7 @@ func managedHTTPQuorum(t *testing.T) (*managedsql.Host, managedsql.Config, *http
 	if err != nil {
 		t.Fatal(err)
 	}
+	assertEndpointsHeld()
 	httpServer := httptest.NewServer(handler)
 	t.Cleanup(httpServer.Close)
 	return hosts[0], configs[0], httpServer, blockFinalize, finalizeStarted

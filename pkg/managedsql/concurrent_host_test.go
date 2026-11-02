@@ -32,7 +32,7 @@ func concurrentSQLHosts(t *testing.T, wrap func(int, http.RoundTripper) http.Rou
 		kube.Client = &client
 		configs[i].Store = &operator.V1Alpha2StatusStore{Kube: &kube}
 		ctx, cancel := context.WithCancel(context.Background())
-		host, err := Open(ctx, configs[i])
+		host, err := fixture.open(ctx, configs[i])
 		// Runtime owns ctx: don't cancel a successful Open until cleanup.
 		if host != nil {
 			t.Cleanup(func() {

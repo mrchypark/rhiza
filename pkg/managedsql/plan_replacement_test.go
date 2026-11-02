@@ -49,7 +49,7 @@ func TestPlanVoterReplacementActualBootstrapNonceAndClosedPrecedence(t *testing.
 	hosts := make([]*Host, 3)
 	for _, i := range []int{1, 2} {
 		configs[i].Plan = init
-		hosts[i], err = Open(ctx, configs[i])
+		hosts[i], err = fixture.open(ctx, configs[i])
 		if hosts[i] != nil {
 			h := hosts[i]
 			t.Cleanup(func() {
@@ -65,7 +65,7 @@ func TestPlanVoterReplacementActualBootstrapNonceAndClosedPrecedence(t *testing.
 	configs[0].Plan = init
 	writer, expected := hostRepairWriter(t, configs, hosts)
 	configs[0].Store = writer
-	hosts[0], err = Open(ctx, configs[0])
+	hosts[0], err = fixture.open(ctx, configs[0])
 	if hosts[0] != nil {
 		h := hosts[0]
 		t.Cleanup(func() {
