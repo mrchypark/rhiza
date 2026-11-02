@@ -6,6 +6,7 @@ import (
 	"crypto/md5"
 	"encoding/json"
 	"encoding/xml"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -21,12 +22,14 @@ import (
 	"time"
 
 	objectstore "github.com/mrchypark/rhiza/internal/objstore"
+	"github.com/mrchypark/rhiza/internal/peertest"
 	"github.com/mrchypark/rhiza/internal/types"
 	"github.com/mrchypark/rhiza/pkg/network"
 	"github.com/mrchypark/rhiza/pkg/node"
 	"github.com/mrchypark/rhiza/pkg/operator"
 	"github.com/mrchypark/rhiza/pkg/quepaxa"
 	"github.com/mrchypark/rhiza/pkg/recovery"
+	"github.com/quic-go/quic-go"
 )
 
 // This bounded wire fixture exercises the actual S3 SDK, not provider parity.
@@ -207,6 +210,61 @@ type sqlStatusFixture struct {
 	failFinalize bool
 	dropFinalize bool
 	source       *sqlWireControl
+	peers        map[types.NodeID]*sqlFixturePeer
+	cluster      types.ClusterID
+}
+
+type sqlFixturePeer struct {
+	conn      net.PacketConn
+	transport *quic.Transport
+	once      sync.Once
+	err       error
+}
+
+func (p *sqlFixturePeer) close() error {
+	p.once.Do(func() { p.err = errors.Join(p.transport.Close(), p.conn.Close()) })
+	return p.err
+}
+
+func (f *sqlStatusFixture) reservePeer(t *testing.T, id types.NodeID) string {
+	t.Helper()
+	conn, err := net.ListenPacket("udp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	p := &sqlFixturePeer{conn: conn, transport: &quic.Transport{Conn: conn}}
+	f.mu.Lock()
+	if f.peers == nil {
+		f.peers = make(map[types.NodeID]*sqlFixturePeer)
+	}
+	if f.peers[id] != nil {
+		f.mu.Unlock()
+		_ = p.close()
+		t.Fatal("duplicate fixture peer")
+	}
+	f.peers[id] = p
+	f.mu.Unlock()
+	t.Cleanup(func() {
+		if err := p.close(); err != nil {
+			t.Error(err)
+		}
+	})
+	return conn.LocalAddr().String()
+}
+
+func (f *sqlStatusFixture) open(ctx context.Context, cfg Config) (*Host, error) {
+	f.mu.Lock()
+	p := f.peers[cfg.Runtime.NodeID]
+	f.mu.Unlock()
+	if p == nil {
+		return nil, fmt.Errorf("fixture peer is not reserved")
+	}
+	ctx = peertest.WithTransport(ctx, string(f.cluster), string(cfg.Runtime.NodeID), p.conn.LocalAddr().String(), p.transport)
+	host, err := Open(ctx, cfg)
+	if err != nil && host != nil {
+		err = errors.Join(err, host.Close())
+	}
+	return host, err
 }
 
 func (f *sqlStatusFixture) serve(w http.ResponseWriter, r *http.Request) {
@@ -276,13 +334,13 @@ func sqlCluster(t *testing.T) ([]Config, *sqlStatusFixture) {
 		t.Fatal(err)
 	}
 	sourceControl.finalPrefix = namespace.FinalPrefix
-	addresses := sqlPeerAddresses(t, len(members), net.ListenPacket)
+	f := &sqlStatusFixture{source: sourceControl, cluster: clusterID}
 	for i := range members {
-		addr := addresses[i]
 		id, err := types.ManagedNodeID(fmt.Sprintf("pod-%d", i))
 		if err != nil {
 			t.Fatal(err)
 		}
+		addr := f.reservePeer(t, id)
 		token := fmt.Sprintf("peer-%d", i)
 		members[i] = quepaxa.Member{ID: id, PeerURL: "quic://" + addr, PublicKey: quepaxa.PublicKey(network.PeerPublicKey(clusterID, id, token))}
 		configs[i].Runtime = RuntimeConfig{NodeID: id, ClusterID: clusterID, ObjStorePrefix: namespace.ConfigPrefix, DataDir: t.TempDir(), PeerAddr: addr, PeerToken: token, AdminToken: "admin", ObjStoreProvider: "s3", ObjStoreEndpoint: strings.TrimPrefix(s3.URL, "http://"), ObjStoreInsecure: true, ObjStoreBucket: "bucket", ObjStoreRegion: "us-east-1", ObjStoreAccessKey: "test", ObjStoreSecretKey: "test", ObjStoreDurability: types.ObjectStoreDurabilityBeforeAck}
@@ -290,7 +348,6 @@ func sqlCluster(t *testing.T) ([]Config, *sqlStatusFixture) {
 	for i := range configs {
 		configs[i].Runtime.Members = members
 	}
-	f := &sqlStatusFixture{source: sourceControl}
 	_ = json.Unmarshal([]byte(`{"apiVersion":"rhiza.mrchypark.dev/v1alpha2","kind":"RhizaCluster","metadata":{"name":"cluster","namespace":"ns","uid":"uid","resourceVersion":"1"},"spec":{"logicalID":"logical","genesisIntent":"Create","voterCount":3,"workload":{"podTemplate":{"spec":{"containers":[{"name":"app","image":"image"}]}}}},"status":{}}`), &f.obj)
 	kube := httptest.NewTLSServer(http.HandlerFunc(f.serve))
 	t.Cleanup(kube.Close)
@@ -330,62 +387,54 @@ func sqlCluster(t *testing.T) ([]Config, *sqlStatusFixture) {
 	return configs, f
 }
 
-// Retain all allocations until the complete fixture membership is chosen.
-// Closing each ephemeral socket before the next allocation permits the OS to
-// choose the same endpoint twice, which the real bootstrap validator rejects.
-func sqlPeerAddresses(t *testing.T, count int, listen func(string, string) (net.PacketConn, error)) []string {
-	t.Helper()
-	var sockets []net.PacketConn
-	defer func() {
-		for _, socket := range sockets {
-			if err := socket.Close(); err != nil {
-				t.Error(err)
-			}
-		}
-	}()
-	addresses := make([]string, count)
-	for i := range addresses {
-		socket, err := listen("udp", "127.0.0.1:0")
-		if err != nil {
-			t.Fatal(err)
-		}
-		sockets = append(sockets, socket)
-		addresses[i] = socket.LocalAddr().String()
+func TestManagedSQLFixtureRetainsPeerSocketUntilHostOpen(t *testing.T) {
+	configs, f := sqlCluster(t)
+	// A competing owner must not be able to acquire the advertised endpoint
+	// between fixture membership selection and the real Host listener.
+	competitor, bindErr := net.ListenPacket("udp", configs[0].Runtime.PeerAddr)
+	if bindErr == nil {
+		t.Cleanup(func() { _ = competitor.Close() })
 	}
-	return addresses
-}
-
-func TestManagedSQLPeerAddressAllocationRetainsDistinctSockets(t *testing.T) {
-	var allocated []string
-	addresses := sqlPeerAddresses(t, 3, func(network, address string) (net.PacketConn, error) {
-		for _, previous := range allocated {
-			probe, err := net.ListenPacket(network, previous)
-			if err == nil {
-				_ = probe.Close()
-				t.Fatal("earlier endpoint released before membership allocation completed")
-			}
-		}
-		conn, err := net.ListenPacket(network, address)
-		if err == nil {
-			allocated = append(allocated, conn.LocalAddr().String())
-		}
-		return conn, err
-	})
-	seen := make(map[string]bool)
-	for _, address := range addresses {
-		if seen[address] {
-			t.Fatal("duplicate allocated endpoint")
-		}
-		seen[address] = true
-		// The helper must release only its own sockets before Host binds.
-		conn, err := net.ListenPacket("udp", address)
-		if err != nil {
-			t.Fatal(err)
-		}
-		if err := conn.Close(); err != nil {
-			t.Fatal(err)
-		}
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+	host, err := f.open(ctx, configs[0])
+	if host != nil {
+		t.Cleanup(func() { _ = host.Close() })
 	}
+	if err != nil {
+		t.Fatalf("fixture endpoint must remain owned through actual Host Open (competitor_bind=%v): %v", bindErr, err)
+	}
+	if bindErr == nil {
+		t.Fatal("competing socket acquired the fixture's advertised endpoint")
+	}
+	if err := host.Close(); err != nil {
+		t.Fatal(err)
+	}
+	cancel()
+	between, err := net.ListenPacket("udp", configs[0].Runtime.PeerAddr)
+	if err == nil {
+		_ = between.Close()
+		t.Fatal("Host.Close released fixture socket")
+	}
+	// Restart uses a fresh parent, not the cancelled previous execution context.
+	restarted, err := f.open(context.Background(), configs[0])
+	if restarted != nil {
+		t.Cleanup(func() { _ = restarted.Close() })
+	}
+	if err != nil {
+		t.Fatalf("same transport restart: %v", err)
+	}
+	if err := restarted.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := f.peers[configs[0].Runtime.NodeID].close(); err != nil {
+		t.Fatal(err)
+	}
+	rebound, err := net.ListenPacket("udp", configs[0].Runtime.PeerAddr)
+	if err != nil {
+		t.Fatalf("owner cleanup retained socket: %v", err)
+	}
+	_ = rebound.Close()
 }
 
 func readySQL(t *testing.T, h *Host) {
@@ -409,10 +458,10 @@ func readySQL(t *testing.T, h *Host) {
 }
 
 func TestManagedSQLRealThreeNodeInitializationAndWrite(t *testing.T) {
-	configs, _ := sqlCluster(t)
+	configs, f := sqlCluster(t)
 	hosts := make([]*Host, 3)
 	for i, cfg := range configs[:2] {
-		h, err := Open(context.Background(), cfg)
+		h, err := f.open(context.Background(), cfg)
 		if h != nil {
 			hosts[i] = h
 			t.Cleanup(func() {
@@ -472,7 +521,7 @@ func TestManagedSQLRealThreeNodeInitializationAndWrite(t *testing.T) {
 	if evidenceHash(a.Evidence()) == init.Assignment().InitialEvidenceDigest {
 		t.Fatal("write did not advance application evidence")
 	}
-	late, err := Open(context.Background(), configs[2])
+	late, err := f.open(context.Background(), configs[2])
 	if late != nil {
 		hosts[2] = late
 		t.Cleanup(func() {
@@ -504,7 +553,7 @@ func openSQLQuorum(t *testing.T) ([]Config, []*Host, *sqlStatusFixture) {
 	configs, f := sqlCluster(t)
 	hosts := make([]*Host, 2)
 	for i := range hosts {
-		h, err := Open(context.Background(), configs[i])
+		h, err := f.open(context.Background(), configs[i])
 		if h != nil {
 			hosts[i] = h
 			t.Cleanup(func() {
@@ -673,7 +722,7 @@ func TestManagedSQLDDLReversalDoesNotRearmMissingSource(t *testing.T) {
 	defer f.source.hideArchive.Store(false)
 	f.source.hideApplicationStart.Store(true)
 	defer f.source.hideApplicationStart.Store(false)
-	reopened, err := Open(context.Background(), configs[0])
+	reopened, err := f.open(context.Background(), configs[0])
 	if reopened != nil {
 		t.Cleanup(func() {
 			if err := reopened.Close(); err != nil {
@@ -725,7 +774,7 @@ func TestManagedSQLUnusedAssignmentRejectsPreexistingCertifiedSource(t *testing.
 			f.mu.Unlock()
 			f.source.hideArchive.Store(missingHead)
 			f.source.hideApplicationStart.Store(!missingHead)
-			h, err := Open(context.Background(), configs[2])
+			h, err := f.open(context.Background(), configs[2])
 			if h != nil {
 				t.Cleanup(func() {
 					if err := h.Close(); err != nil {
@@ -762,7 +811,7 @@ func sqlSourceNode(t *testing.T, cfg Config) (*node.Node, node.ManagedStartupIde
 }
 
 func TestManagedSQLSourceDefaultS3Provider(t *testing.T) {
-	configs, _ := sqlCluster(t)
+	configs, f := sqlCluster(t)
 	cfg := configs[0]
 	cfg.Runtime.ObjStoreProvider = ""
 	n, i := sqlSourceNode(t, cfg)
@@ -776,7 +825,7 @@ func TestManagedSQLSourceDefaultS3Provider(t *testing.T) {
 	if err := n.VerifyManagedSQLFreshSource(context.Background(), i); err != nil {
 		t.Fatal(err)
 	}
-	h, err := Open(context.Background(), cfg)
+	h, err := f.open(context.Background(), cfg)
 	if h != nil {
 		t.Cleanup(func() {
 			if err := h.Close(); err != nil {
@@ -874,7 +923,7 @@ func TestManagedSQLPendingReservationBeforeDelayedPutBlocksFreshJoin(t *testing.
 	if err := diagnostic.Iter(ctx, control.finalPrefix+"/archive/", func(string) error { objects++; return nil }); err != nil || objects != 0 {
 		t.Fatalf("actual SDK archive LIST was not empty: count=%d error=%v", objects, err)
 	}
-	late, err := Open(ctx, configs[2])
+	late, err := f.open(ctx, configs[2])
 	if late != nil {
 		t.Cleanup(func() {
 			if err := late.Close(); err != nil {
@@ -934,7 +983,7 @@ func TestManagedSQLConsumedMissingBirthIsNeverRecreated(t *testing.T) {
 	before := countBirth()
 	f.source.hideBirth.Store(true)
 	defer f.source.hideBirth.Store(false)
-	h, err := Open(context.Background(), configs[0])
+	h, err := f.open(context.Background(), configs[0])
 	if h != nil {
 		t.Cleanup(func() { _ = h.Close() })
 	}
@@ -1077,7 +1126,7 @@ func TestManagedSQLConcurrentLegitimateInitialMembers(t *testing.T) {
 		}
 	})
 	for _, cfg := range configs {
-		go func() { h, err := Open(ctx, cfg); results <- result{h, err} }()
+		go func() { h, err := f.open(ctx, cfg); results <- result{h, err} }()
 	}
 	for range 2 {
 		select {

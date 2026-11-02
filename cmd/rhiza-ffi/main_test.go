@@ -16,6 +16,8 @@ import (
 	"time"
 
 	"github.com/mrchypark/rhiza"
+	"github.com/mrchypark/rhiza/internal/peertest"
+	"github.com/quic-go/quic-go"
 )
 
 func openTestDB(t *testing.T) uint64 {
@@ -29,13 +31,27 @@ func openConfig(t *testing.T, config rhiza.Config) uint64 {
 	if err != nil {
 		t.Fatal(err)
 	}
+	return openedConfig(t, goOpen(input))
+}
+
+func openConfigContext(t *testing.T, ctx context.Context, config rhiza.Config) uint64 {
+	t.Helper()
+	input, err := json.Marshal(config)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return openedConfig(t, goOpenContext(ctx, input))
+}
+
+func openedConfig(t *testing.T, result []byte) uint64 {
+	t.Helper()
 	var response struct {
 		Data struct {
 			Handle uint64 `json:"handle"`
 		} `json:"data"`
 		Error *ffiError `json:"error"`
 	}
-	if err := json.Unmarshal(goOpen(input), &response); err != nil {
+	if err := json.Unmarshal(result, &response); err != nil {
 		t.Fatal(err)
 	}
 	if response.Error != nil || response.Data.Handle == 0 {
@@ -45,17 +61,26 @@ func openConfig(t *testing.T, config rhiza.Config) uint64 {
 	return response.Data.Handle
 }
 
-func freeUDPAddr(t testing.TB) string {
-	t.Helper()
-	listener, err := net.ListenPacket("udp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatal(err)
+func TestGoOpenContextPreservesParent(t *testing.T) {
+	type contextKey struct{}
+	deadline := time.Now().Add(time.Minute)
+	parent, cancel := context.WithDeadline(context.WithValue(context.Background(), contextKey{}, "retained"), deadline)
+	t.Cleanup(cancel)
+	handle := openConfigContext(t, parent, rhiza.Config{Local: true, NodeID: "ffi-context", DataDir: t.TempDir()})
+	ffiRegistry.Lock()
+	entry := ffiRegistry.m[handle]
+	ffiRegistry.Unlock()
+	if entry == nil {
+		t.Fatal("context open did not register handle")
 	}
-	addr := listener.LocalAddr().String()
-	if err := listener.Close(); err != nil {
-		t.Fatal(err)
+	got, ok := entry.ctx.Deadline()
+	if !ok || got != deadline || entry.ctx.Value(contextKey{}) != "retained" {
+		t.Fatal("FFI open lost parent context")
 	}
-	return addr
+	cancel()
+	if entry.ctx.Err() != context.Canceled {
+		t.Fatal("FFI open lost parent cancellation")
+	}
 }
 
 func call(t *testing.T, handle uint64, operation string, request any) map[string]json.RawMessage {
@@ -409,7 +434,24 @@ func TestNotificationFFIThreeNode(t *testing.T) {
 	if endpoint == "" || bucket == "" {
 		t.Skip("RHIZA_E2E_S3_ENDPOINT and RHIZA_E2E_S3_BUCKET are required")
 	}
-	addresses := []string{freeUDPAddr(t), freeUDPAddr(t), freeUDPAddr(t)}
+	addresses := make([]string, 3)
+	transports := make([]*quic.Transport, 3)
+	for i := range addresses {
+		conn, err := net.ListenPacket("udp", "127.0.0.1:0")
+		if err != nil {
+			t.Fatal(err)
+		}
+		transport := &quic.Transport{Conn: conn}
+		addresses[i], transports[i] = conn.LocalAddr().String(), transport
+		t.Cleanup(func() {
+			if err := transport.Close(); err != nil {
+				t.Error(err)
+			}
+			if err := conn.Close(); err != nil {
+				t.Error(err)
+			}
+		})
+	}
 	cluster := fmt.Sprintf("ffi-notify-%d", time.Now().UnixNano())
 	tokens := make([]string, len(addresses))
 	members := make([]rhiza.Member, len(addresses))
@@ -425,9 +467,18 @@ func TestNotificationFFIThreeNode(t *testing.T) {
 			ObjStoreAccessKey: os.Getenv("RHIZA_E2E_S3_ACCESS_KEY"), ObjStoreSecretKey: os.Getenv("RHIZA_E2E_S3_SECRET_KEY"),
 		}
 	}
-	hA := openConfig(t, config(0))
-	hB := openConfig(t, config(1))
-	_ = openConfig(t, config(2))
+	openMember := func(i int) uint64 {
+		competitor, err := net.ListenPacket("udp", addresses[i])
+		if err == nil {
+			_ = competitor.Close()
+			t.Fatal("FFI fixture endpoint released before Open")
+		}
+		ctx := peertest.WithTransport(context.Background(), cluster, string(members[i].ID), addresses[i], transports[i])
+		return openConfigContext(t, ctx, config(i))
+	}
+	hA := openMember(0)
+	hB := openMember(1)
+	_ = openMember(2)
 
 	subscribe := requireData(t, call(t, hB, "notify_subscribe", map[string]any{"topic": "jobs"}))
 	var subscription struct {

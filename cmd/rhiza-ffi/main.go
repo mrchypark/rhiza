@@ -150,6 +150,10 @@ func cBuffer(data []byte) C.RhizaBuffer {
 }
 
 func goOpen(input []byte) []byte {
+	return goOpenContext(context.Background(), input)
+}
+
+func goOpenContext(parent context.Context, input []byte) []byte {
 	if err := validInput(input); err != nil {
 		return errorJSON(err)
 	}
@@ -160,11 +164,14 @@ func goOpen(input []byte) []byte {
 	if err := decodeStrict(input, &config); err != nil {
 		return errorJSON(&ffiError{Code: "invalid_request", Message: "invalid open request: " + err.Error()})
 	}
-	db, err := rhiza.Open(context.Background(), config)
+	db, err := rhiza.Open(parent, config)
 	if err != nil {
+		if db != nil {
+			_ = db.Close()
+		}
 		return errorJSON(err)
 	}
-	ctx, cancel := context.WithCancel(context.Background())
+	ctx, cancel := context.WithCancel(parent)
 	entry := &ffiEntry{db: db, ctx: ctx, cancel: cancel, drained: make(chan struct{}), nextSub: 1, subscriptions: make(map[uint64]*ffiSubscription)}
 	entry.local = config.Local
 	return registerEntry(entry)
