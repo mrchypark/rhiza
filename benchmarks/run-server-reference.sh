@@ -19,6 +19,17 @@ max_fault_latency_ms=${RHIZA_SERVER_BENCH_MAX_FAULT_LATENCY_MS:-1500}
 base_http_port=${RHIZA_SERVER_BENCH_HTTP_PORT:-18100}
 base_peer_port=${RHIZA_SERVER_BENCH_PEER_PORT:-19100}
 s3_port=${RHIZA_SERVER_BENCH_S3_PORT:-19000}
+diagnostic=${RHIZA_BEFORE_ACK_DIAGNOSTIC:-0}
+case "$diagnostic" in
+	0) ;;
+	1)
+		[[ ${GITHUB_ACTIONS-} == true && $(uname -s) == Linux ]]
+		[[ $requests == 10000 && $concurrency == 16 && $failed_node == none && $durability == before-ack ]]
+		[[ ${RHIZA_DIAGNOSTIC_SOURCE_SHA-} =~ ^[0-9a-f]{40}$ && ${RHIZA_DIAGNOSTIC_PATCH_SHA256-} =~ ^[0-9a-f]{64}$ ]]
+		[[ $(git -C "$source_dir" rev-parse HEAD) == "$RHIZA_DIAGNOSTIC_SOURCE_SHA" ]]
+		;;
+	*) exit 2 ;;
+esac
 if [[ ! $requests =~ ^[1-9][0-9]*$ || ! $concurrency =~ ^[1-9][0-9]*$ || $concurrency -gt $requests ]]; then
 	printf 'request count and concurrency must be positive, with concurrency <= requests\n' >&2
 	exit 2
@@ -48,17 +59,123 @@ if [[ ! $max_fault_latency_ms =~ ^[1-9][0-9]*([.][0-9]+)?$ ]]; then
 	exit 2
 fi
 
+proc_root=/proc
+proc_start() {
+	sed 's/.*) //' "$proc_root/$1/stat" | awk '{print $20}'
+}
+diagnostic_ports() {
+	local output=$1 protocol port
+	: > "$output"
+	for protocol in tcp udp; do
+		for port in "$base_http_port" "$((base_http_port+1))" "$((base_http_port+2))" "$base_peer_port" "$((base_peer_port+1))" "$((base_peer_port+2))" "$s3_port"; do
+			if [[ $protocol == tcp ]]; then ss -H -ltn "sport = :$port" >> "$output"
+			else ss -H -lun "sport = :$port" >> "$output"; fi
+		done
+	done
+	[[ ! -s $output ]]
+}
+diagnostic_snapshot() {
+	local phase=$1 pid cgroup
+	date -u '+%Y-%m-%dT%H:%M:%S.%NZ' > "$evidence/$phase.time"
+	cat /proc/stat > "$evidence/$phase.host-stat"
+	for pid in "${node_pids[@]}" "$gateway_pid"; do
+		[[ $(proc_start "$pid") == $(cat "$evidence/$pid.start") ]]
+		cat "/proc/$pid/stat" > "$evidence/$phase.$pid.stat"
+		cat "/proc/$pid/io" > "$evidence/$phase.$pid.io"
+		cgroup=$(awk -F: '$1=="0" {print $3}' "/proc/$pid/cgroup")
+		[[ -n $cgroup && -f /sys/fs/cgroup"$cgroup"/cpu.stat ]] || {
+			printf 'GAP cgroup-v2 cpu.stat unavailable pid=%s\n' "$pid" >> "$evidence/system-gaps.txt"
+			return 1
+		}
+		cat "/sys/fs/cgroup$cgroup/cpu.stat" > "$evidence/$phase.$pid.cpu-stat"
+	done
+}
+diagnostic_wait_file() {
+	local pid=$1 suffix=$2
+	for _ in {1..100}; do
+		[[ ! -f $run_dir/collector/$pid.invalid ]]
+		if [[ -s $run_dir/collector/$pid.$suffix ]]; then return 0; fi
+		kill -0 "$pid"
+		sleep 0.05
+	done
+	return 1
+}
+diagnostic_cleanup() {
+	local failed=0 pid_file pid start remaining
+	for pid_file in "$run_dir"/bench.pid "$run_dir"/node-*.pid; do
+		[[ -f $pid_file ]] || continue
+		pid=$(<"$pid_file")
+		start=$(cat "$evidence/$pid.start") || { failed=1; continue; }
+		if [[ -d $proc_root/$pid ]]; then
+			[[ $(proc_start "$pid") == "$start" ]] || { failed=1; continue; }
+			kill "$pid" 2>/dev/null || failed=1
+			for _ in {1..100}; do
+				[[ -d $proc_root/$pid ]] || break
+				sleep 0.05
+			done
+			if [[ -d $proc_root/$pid ]]; then
+				[[ $(proc_start "$pid") == "$start" ]] || { failed=1; continue; }
+				kill -KILL "$pid" 2>/dev/null || failed=1
+				for _ in {1..100}; do
+					[[ -d $proc_root/$pid ]] || break
+					sleep 0.05
+				done
+			fi
+		elif [[ $pid_file == */node-* ]]; then
+			printf 'unexpected node exit pid=%s\n' "$pid" >> "$evidence/cleanup-gaps.txt"
+			failed=1
+		fi
+		if [[ ! -d $proc_root/$pid ]]; then
+			wait "$pid" 2>/dev/null || : # Signal exit is expected during owned teardown.
+		else failed=1; fi
+	done
+	if [[ -n $container_id ]]; then
+		if remaining=$(docker ps -aq --no-trunc --filter "id=$container_id"); then
+			if [[ -n $remaining ]]; then
+				[[ $remaining == "$container_id" ]] && docker rm -f "$container_id" > "$evidence/container-remove.txt" 2>&1 || failed=1
+			fi
+		else failed=1; fi
+		if remaining=$(docker ps -aq --no-trunc --filter "id=$container_id"); then
+			[[ -z $remaining ]] || failed=1
+		else failed=1; fi
+	fi
+	diagnostic_ports "$evidence/endpoints-after.txt" || failed=1
+	printf '%s\n' "$failed" > "$evidence/cleanup-failed.txt"
+	return "$failed"
+}
+
+if [[ $diagnostic == 1 ]]; then
+	[[ ! -e ${output_file%.json}-diagnostic ]]
+fi
 run_dir=$(mktemp -d "${TMPDIR:-/tmp}/rhiza-server-bench.XXXXXX")
 container="rhiza-bench-s3-$$"
+container_id=''
+evidence=''
+node_pids=()
+[[ $diagnostic == 0 ]] || evidence="${output_file%.json}-diagnostic"
 cleanup() {
+	original_exit=$?
+	trap - EXIT
+	set +e
+	cleanup_failed=0
 	output_stem=$(basename "$output_file" .json)
 	for log in "$run_dir"/node-*.log; do
 		[[ -f $log ]] || continue
-		cp "$log" "$(dirname "$output_file")/$output_stem-$(basename "$log")"
+		cp "$log" "$(dirname "$output_file")/$output_stem-$(basename "$log")" || cleanup_failed=1
 	done
 	if [[ -f $run_dir/fault-metadata.txt ]]; then
 		cp "$run_dir/fault-metadata.txt" "$(dirname "$output_file")/$output_stem-fault-metadata.txt"
 	fi
+	if [[ $diagnostic == 1 ]]; then
+		if [[ -f $run_dir/result.json ]]; then
+			cp "$run_dir/result.json" "$evidence/client-result.json" || cleanup_failed=1
+		fi
+		for trace_file in "$run_dir"/collector/*; do
+			[[ -f $trace_file ]] || continue
+			cp "$trace_file" "$evidence/" || cleanup_failed=1
+		done
+		diagnostic_cleanup || cleanup_failed=1
+	else
 	for pid_file in "$run_dir"/node-*.pid; do
 		[[ -f $pid_file ]] || continue
 		pid=$(<"$pid_file")
@@ -66,21 +183,53 @@ cleanup() {
 		wait "$pid" 2>/dev/null || true
 	done
 	docker rm -f "$container" >/dev/null 2>&1 || true
+	fi
+	if [[ $cleanup_failed == 0 ]]; then
 	case "$run_dir" in
 		"${TMPDIR:-/tmp}"/rhiza-server-bench.*) rm -rf -- "$run_dir" ;;
 	esac
+	[[ ! -e $run_dir ]] || cleanup_failed=1
+	fi
+	if [[ $diagnostic == 1 ]]; then
+		printf 'original_exit=%s\ncleanup_failed=%s\nowned_run_dir=%s\n' "$original_exit" "$cleanup_failed" "$run_dir" > "$evidence/cleanup.txt" || cleanup_failed=1
+	fi
+	[[ $original_exit == 0 ]] || exit "$original_exit"
+	exit "$cleanup_failed"
 }
 trap cleanup EXIT
+if [[ $diagnostic == 1 ]]; then
+	trap 'exit 129' HUP
+	trap 'exit 130' INT
+	trap 'exit 143' TERM
+	mkdir -m 700 "$evidence"
+	mkdir -m 700 "$run_dir/collector"
+	diagnostic_ports "$evidence/endpoints-before.txt"
+fi
 
-(cd "$source_dir" && CGO_ENABLED=0 go build -o "$run_dir/rhiza" ./cmd/rhiza)
+build_tags=()
+[[ $diagnostic == 0 ]] || build_tags=(-tags "rhiza_local_testhooks,rhiza_ack_diagnostic")
+(cd "$source_dir" && CGO_ENABLED=0 go build "${build_tags[@]}" -o "$run_dir/rhiza" ./cmd/rhiza)
 (cd "$source_dir" && CGO_ENABLED=0 go build -o "$run_dir/rhiza-bench" ./cmd/rhiza-bench)
+if [[ $diagnostic == 1 ]]; then
+	printf 'original_source=%s\ninstrumentation_patch_sha256=%s\n' "$RHIZA_DIAGNOSTIC_SOURCE_SHA" "$RHIZA_DIAGNOSTIC_PATCH_SHA256" > "$evidence/build.txt"
+	go version -m "$run_dir/rhiza" >> "$evidence/build.txt"
+	shasum -a 256 "$run_dir/rhiza" "$run_dir/rhiza-bench" >> "$evidence/build.txt"
+	getconf CLK_TCK > "$evidence/clock-ticks.txt"
+fi
 
 mkdir -p "$run_dir/s3-data"
-docker run --rm -d --name "$container" -p "$s3_port:9000" --user "$(id -u):$(id -g)" \
+created_id=$(docker run --rm -d --name "$container" -p "$s3_port:9000" --user "$(id -u):$(id -g)" \
 	-v "$run_dir/s3-data:/data" \
 	-e ROOT_ACCESS_KEY=rhiza-e2e -e ROOT_SECRET_KEY=rhiza-e2e-secret \
 	ghcr.io/versity/versitygw@sha256:30292fc2eeacc67a36993b01f7a7a5e3361a19cced0e80c1d71cfa2a4b0a2499 \
-	--port :9000 --health /_/health posix /data >/dev/null
+	--port :9000 --health /_/health posix /data)
+if [[ $diagnostic == 1 ]]; then
+	[[ $created_id =~ ^[0-9a-f]{64}$ ]]
+	container_id=$created_id
+	docker inspect "$container_id" > "$evidence/gateway.json"
+	gateway_pid=$(jq -er '.[0].State.Pid|select(.>0)' "$evidence/gateway.json")
+	proc_start "$gateway_pid" > "$evidence/$gateway_pid.start"
+fi
 for _ in {1..100}; do
 	curl -fsS "http://127.0.0.1:$s3_port/_/health" >/dev/null 2>&1 && break
 	sleep 0.1
@@ -108,7 +257,9 @@ fi
 for i in 0 1 2; do
 	peer_token_env=()
 	[[ $legacy_membership -eq 1 ]] || peer_token_env=(RHIZA_PEER_TOKEN="n$i-token")
-	env RHIZA_CLUSTER_ID=server-bench RHIZA_NODE_ID="n$i" \
+	diagnostic_env=()
+	[[ $diagnostic == 0 ]] || diagnostic_env=(RHIZA_ACK_DIAGNOSTIC_DIR="$run_dir/collector")
+	env "${diagnostic_env[@]}" RHIZA_CLUSTER_ID=server-bench RHIZA_NODE_ID="n$i" \
 		RHIZA_BIND_ADDR="127.0.0.1:$((base_http_port + i))" RHIZA_PEER_ADDR="127.0.0.1:$((base_peer_port + i))" \
 		RHIZA_DATA_DIR="$run_dir/node-$i" RHIZA_CLUSTER_MEMBERS="$members" "${peer_token_env[@]+${peer_token_env[@]}}" \
 		RHIZA_OBJSTORE_PROVIDER=s3 RHIZA_OBJSTORE_ENDPOINT="127.0.0.1:$s3_port" RHIZA_OBJSTORE_BUCKET=rhiza \
@@ -117,6 +268,11 @@ for i in 0 1 2; do
 		RHIZA_OBJSTORE_DURABILITY="$durability" RHIZA_OBJSTORE_SYNC_INTERVAL=1h RHIZA_CHECKPOINT_INTERVAL=0 \
 		"$run_dir/rhiza" >"$run_dir/node-$i.log" 2>&1 &
 	printf '%s' "$!" >"$run_dir/node-$i.pid"
+	if [[ $diagnostic == 1 ]]; then
+		node_pids+=("$!")
+		proc_start "$!" > "$evidence/$!.start"
+		printf 'node=%s pid=%s start=%s\n' "$i" "$!" "$(cat "$evidence/$!.start")" >> "$evidence/processes.txt"
+	fi
 done
 for i in 0 1 2; do
 	port=$((base_http_port + i))
@@ -150,11 +306,25 @@ object_stats() {
 	done | jq -sc 'reduce .[] as $item ({}; reduce ($item.stats | to_entries[]) as $entry (. ; .[$entry.key] = ((.[$entry.key] // 0) + $entry.value)))'
 }
 object_before=$(object_stats)
+if [[ $diagnostic == 1 ]]; then
+	diagnostic_snapshot before
+	for pid in "${node_pids[@]}"; do
+		diagnostic_wait_file "$pid" ready
+		[[ $(cat "$run_dir/collector/$pid.ready") == "$pid" ]]
+		kill -USR1 "$pid"
+		diagnostic_wait_file "$pid" started
+	done
+	date -u '+%Y-%m-%dT%H:%M:%S.%NZ' > "$evidence/timed-start.txt"
+fi
 result_file="$run_dir/result.json"
 "$run_dir/rhiza-bench" -url "$target" -path /sql/execute \
 	-body '{"request_id":"bench-{{id}}","sql":"INSERT INTO benchmark_writes(id) VALUES ({{id}})"}' \
 	-n "$requests" -c "$concurrency" -commit-unknown-retries 3 >"$result_file" &
 bench_pid=$!
+if [[ $diagnostic == 1 ]]; then
+	printf '%s\n' "$bench_pid" > "$run_dir/bench.pid"
+	proc_start "$bench_pid" > "$evidence/$bench_pid.start"
+fi
 if [[ $failed_node != none ]]; then
 	sleep "$fault_after"
 	if ! kill -0 "$bench_pid" 2>/dev/null; then
@@ -169,6 +339,21 @@ if [[ $failed_node != none ]]; then
 	wait "$failed_pid" 2>/dev/null || true
 fi
 wait "$bench_pid"
+if [[ $diagnostic == 1 ]]; then
+	date -u '+%Y-%m-%dT%H:%M:%S.%NZ' > "$evidence/timed-end.txt"
+	diagnostic_snapshot after
+	for pid in "${node_pids[@]}"; do
+		kill -USR2 "$pid"
+		diagnostic_wait_file "$pid" json
+		jq -e --argjson pid "$pid" '.PID==$pid and .Invalid==0 and .StartedAt!="" and .StoppedAt!=""' "$run_dir/collector/$pid.json" >/dev/null
+	done
+	jq -se --argjson requests "$requests" '
+	  length==3 and all(.[]; .Invalid==0 and .StartedAt!="" and .StoppedAt!="") and
+	  ([.[].Phases.queue_oldest.Commands]|add)==$requests' "$run_dir"/collector/*.json >/dev/null
+	for phase in queue_oldest dispatch_wait batch_execute propose apply ack_barrier wal_durable object_durable; do
+		jq -se --arg phase "$phase" '[.[].Phases[$phase].Samples]|add>0' "$run_dir"/collector/*.json >/dev/null
+	done
+fi
 result=$(<"$result_file")
 # Preserve the client result even when the subsequent correctness gate fails.
 tee "$output_file" <<<"$result" >/dev/null

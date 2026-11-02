@@ -932,12 +932,19 @@ func (s *Server) runProposalAttempt(ctx context.Context, value []byte) (quepaxa.
 			return 0, fmt.Errorf("%w: %v", ErrInvalidRequest, err), false, false
 		}
 	}
+	proposeTrace := localtesthooks.NewACKPhaseTrace()
 	slot, err := s.proposeOnce(ctx, value)
+	proposeTrace.Finish("propose", err != nil)
 	if err != nil {
 		return slot, err, true, s.localMode && quepaxa.IsLocalAdmissionDenial(err)
 	}
-	if err = s.applyDecisions(ctx, slot); err == nil {
+	applyTrace := localtesthooks.NewACKPhaseTrace()
+	err = s.applyDecisions(ctx, slot)
+	applyTrace.Finish("apply", err != nil)
+	if err == nil {
+		durableTrace := localtesthooks.NewACKPhaseTrace()
 		err = s.waitDurable(ctx, slot)
+		durableTrace.Finish("ack_barrier", err != nil)
 	}
 	return slot, err, true, false
 }

@@ -1,0 +1,106 @@
+name: One-shot before-ACK diagnostic
+
+# This exact diagnostic branch is published once after independent review.
+# A new workflow need not be merged into main to trigger this one push run.
+on:
+  push:
+    branches: [diagnostic/before-ack-once]
+
+permissions:
+  contents: read
+  actions: read
+
+jobs:
+  diagnostic:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    env:
+      GOTOOLCHAIN: local
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+          cache: true
+      - name: Verify one authorized execution and the fixed comparison
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          test "$GITHUB_RUN_ATTEMPT" = 1
+          test "$GITHUB_REF" = refs/heads/diagnostic/before-ack-once
+          workflow_id=$(gh api "repos/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID" --jq .workflow_id)
+          gh api "repos/$GITHUB_REPOSITORY/actions/workflows/$workflow_id/runs?branch=diagnostic%2Fbefore-ack-once&event=push" |
+            jq -e --argjson id "$GITHUB_RUN_ID" '.total_count==1 and .workflow_runs[0].id==$id'
+          mkdir -p "$RUNNER_TEMP/before-ack-once"
+          git rev-parse HEAD > "$RUNNER_TEMP/before-ack-once/runner-source.txt"
+          sha256sum benchmarks/run-server-reference.sh > "$RUNNER_TEMP/before-ack-once/runner.sha256"
+      - name: Verify the diagnostic controls without a workload
+        run: |
+          go test ./internal/localtesthooks -run '^TestACK' -count=1 -timeout=60s
+          go test -race -tags rhiza_local_testhooks,rhiza_ack_diagnostic ./cmd/rhiza ./internal/localtesthooks -run '^TestACK' -count=1 -timeout=60s
+          go test -race -tags rhiza_local_testhooks,rhiza_ack_diagnostic ./pkg/network -run '^Test(CachedReceiptsWaitForDurabilityBeforeAcknowledging|PostSubmitActualConflictRemainsConflict|SQLBatcherCancellationAfterDispatchReportsCommitUnknown)$' -count=1 -timeout=60s
+          bash benchmarks/run-server-reference-diagnostic-test.sh
+      - name: Fixed six reverse-order samples
+        run: |
+          set -euo pipefail
+          output="$RUNNER_TEMP/before-ack-once"
+          base=647dfc2466f359a31c64ec661e234fc2314f1189
+          candidate=ae275881ef3a9acb2393597618b4ce6428200af3
+          git diff --binary "$candidate" "$GITHUB_SHA" -- \
+            pkg/network/batcher.go pkg/network/server.go pkg/node/node.go \
+            internal/localtesthooks/hooks_enabled.go internal/localtesthooks/hooks_disabled.go \
+            internal/localtesthooks/ack_phase_test.go cmd/rhiza/ack_diagnostic.go cmd/rhiza/ack_diagnostic_test.go \
+            > "$output/instrumentation.patch"
+          test -s "$output/instrumentation.patch"
+          patch_sha=$(sha256sum "$output/instrumentation.patch" | cut -d ' ' -f 1)
+          base_dir="$RUNNER_TEMP/ack-base-$GITHUB_RUN_ID"
+          candidate_dir="$RUNNER_TEMP/ack-candidate-$GITHUB_RUN_ID"
+          base_owned=0
+          candidate_owned=0
+          cleanup() {
+            original=$?
+            trap - EXIT
+            set +e
+            failed=0
+            if test "$base_owned" = 1; then git worktree remove --force "$base_dir" || failed=1; fi
+            if test "$candidate_owned" = 1; then git worktree remove --force "$candidate_dir" || failed=1; fi
+            git worktree list --porcelain > "$output/worktrees-after.txt" || failed=1
+            if grep -Fx -e "worktree $base_dir" -e "worktree $candidate_dir" "$output/worktrees-after.txt"; then failed=1; fi
+            test ! -e "$base_dir" && test ! -e "$candidate_dir" || failed=1
+            printf 'original_exit=%s\ncleanup_failed=%s\n' "$original" "$failed" > "$output/worktree-cleanup.txt"
+            test "$original" = 0 || exit "$original"
+            exit "$failed"
+          }
+          trap cleanup EXIT
+          test ! -e "$base_dir" && test ! -e "$candidate_dir"
+          base_owned=1
+          git worktree add --detach "$base_dir" "$base"
+          candidate_owned=1
+          git worktree add --detach "$candidate_dir" "$candidate"
+          for dir in "$base_dir" "$candidate_dir"; do
+            git -C "$dir" apply --check "$output/instrumentation.patch"
+            git -C "$dir" apply "$output/instrumentation.patch"
+          done
+          printf 'base=%s\ncandidate=%s\npatch_sha256=%s\norder=C1 B1 B2 C2 C3 B3\n' "$base" "$candidate" "$patch_sha" > "$output/comparison.txt"
+          for label in candidate-1 base-1 base-2 candidate-2 candidate-3 base-3; do
+            if [[ $label == base-* ]]; then source=$base_dir; revision=$base
+            else source=$candidate_dir; revision=$candidate; fi
+            printf 'START %s\n' "$label" | tee -a "$output/order.txt"
+            RHIZA_BEFORE_ACK_DIAGNOSTIC=1 RHIZA_DIAGNOSTIC_SOURCE_SHA="$revision" \
+              RHIZA_DIAGNOSTIC_PATCH_SHA256="$patch_sha" RHIZA_SERVER_BENCH_DURABILITY=before-ack \
+              RHIZA_SERVER_BENCH_REQUESTS=10000 RHIZA_SERVER_BENCH_CONCURRENCY=16 \
+              bash benchmarks/run-server-reference.sh "$source" "$output/$label.json" 2>&1 |
+              tee "$output/$label.log"
+            printf 'COMPLETE %s\n' "$label" | tee -a "$output/order.txt"
+          done
+          test "$(find "$output" -maxdepth 1 -name '*.json' | wc -l)" -eq 6
+      - name: Preserve every result and first failure
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: before-ack-once-${{ github.run_id }}
+          path: ${{ runner.temp }}/before-ack-once
+          if-no-files-found: error

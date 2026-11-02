@@ -2,7 +2,10 @@
 
 package localtesthooks
 
-import "context"
+import (
+	"context"
+	"time"
+)
 
 // ArchiveBusyEvent has no production fields; all calls are compiled out.
 type ArchiveBusyEvent struct {
@@ -83,6 +86,20 @@ func HitArchiveGCPhase(context.Context, string) {}
 
 // Enabled is false when test boundary callbacks are compiled out.
 const Enabled = false
+
+type ACKPhaseEvent struct {
+	Phase    string
+	Nanos    int64
+	Commands int
+	Bytes    int
+	Failed   bool
+}
+type ACKPhaseTrace struct{}
+
+func NewACKPhaseTrace() ACKPhaseTrace        { return ACKPhaseTrace{} }
+func (ACKPhaseTrace) Finish(string, bool)    {}
+func ObserveACKBatch(time.Time, int, int)    {}
+func SetACKPhase(func(ACKPhaseEvent)) func() { return func() {} }
 
 // BatchAdmissionEvent matches the tagged test-hook contract. Calls retain no
 // request, key, value, slot, or error identity outside tagged test binaries.

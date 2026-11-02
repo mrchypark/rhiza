@@ -820,13 +820,19 @@ func (n *Node) openInternal(ctx context.Context, enroll bool, prelocked *qlog.Lo
 	}
 	if n.config.ObjStoreDurability == types.ObjectStoreDurabilityBeforeAck {
 		server.SetDurabilityBarrier(func(ctx context.Context, slot quepaxa.Slot) error {
-			if err := core.EnsureDurable(slot); err != nil {
+			walTrace := localtesthooks.NewACKPhaseTrace()
+			err := core.EnsureDurable(slot)
+			walTrace.Finish("wal_durable", err != nil)
+			if err != nil {
 				return err
 			}
 			if n.config.Local {
 				return n.syncLocalBackup(ctx)
 			}
-			if err := n.archive.SyncThrough(ctx, core, slot); err != nil {
+			objectTrace := localtesthooks.NewACKPhaseTrace()
+			err = n.archive.SyncThrough(ctx, core, slot)
+			objectTrace.Finish("object_durable", err != nil)
+			if err != nil {
 				return err
 			}
 			return nil

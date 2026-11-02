@@ -290,3 +290,48 @@ func HitBatchAdmission(event BatchAdmissionEvent) {
 		hook(event)
 	}
 }
+
+// ACKPhaseEvent is diagnostic aggregate input, never a request identity.
+type ACKPhaseEvent struct {
+	Phase    string
+	Nanos    int64
+	Commands int
+	Bytes    int
+	Failed   bool
+}
+
+var ackPhaseState struct {
+	sync.RWMutex
+	hook func(ACKPhaseEvent)
+}
+
+func SetACKPhase(hook func(ACKPhaseEvent)) func() {
+	ackPhaseState.Lock()
+	old := ackPhaseState.hook
+	ackPhaseState.hook = hook
+	ackPhaseState.Unlock()
+	return func() {
+		ackPhaseState.Lock()
+		ackPhaseState.hook = old
+		ackPhaseState.Unlock()
+	}
+}
+
+func hitACKPhase(event ACKPhaseEvent) {
+	ackPhaseState.RLock()
+	hook := ackPhaseState.hook
+	ackPhaseState.RUnlock()
+	if hook != nil {
+		hook(event)
+	}
+}
+
+type ACKPhaseTrace struct{ started time.Time }
+
+func NewACKPhaseTrace() ACKPhaseTrace { return ACKPhaseTrace{time.Now()} }
+func (t ACKPhaseTrace) Finish(phase string, failed bool) {
+	hitACKPhase(ACKPhaseEvent{Phase: phase, Nanos: time.Since(t.started).Nanoseconds(), Failed: failed})
+}
+func ObserveACKBatch(enqueued time.Time, commands, bytes int) {
+	hitACKPhase(ACKPhaseEvent{Phase: "queue_oldest", Nanos: time.Since(enqueued).Nanoseconds(), Commands: commands, Bytes: bytes})
+}

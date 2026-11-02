@@ -323,6 +323,8 @@ func (b *mutationBatcher[T]) dispatch(items []*batchItem, encoded [][]byte) {
 		return
 	}
 	value := b.assemble(activeEncoded)
+	localtesthooks.ObserveACKBatch(active[0].enqueued, len(active), len(value))
+	dispatchTrace := localtesthooks.NewACKPhaseTrace()
 	b.inflight <- struct{}{}
 	b.budgetMu.Lock()
 	if len(value) > maxInflightEncodedByte-b.inflightB {
@@ -330,13 +332,16 @@ func (b *mutationBatcher[T]) dispatch(items []*batchItem, encoded [][]byte) {
 		<-b.inflight
 		localtesthooks.Hit("network:mutation-queue:worker-inflight-bytes-rejected")
 		b.fail(active, ErrOverloaded)
+		dispatchTrace.Finish("dispatch_wait", true)
 		return
 	}
 	b.inflightB += len(value)
 	b.budgetMu.Unlock()
 	select {
 	case b.jobs <- batchJob{items: active, value: value}:
+		dispatchTrace.Finish("dispatch_wait", false)
 	case <-b.ctx.Done():
+		dispatchTrace.Finish("dispatch_wait", true)
 		b.releaseInflight(len(value))
 		b.fail(active, ErrNotReady)
 	}
@@ -359,9 +364,13 @@ func (b *mutationBatcher[T]) releaseInflight(size int) {
 
 func (b *mutationBatcher[T]) execute(items []*batchItem, value []byte) {
 	ctx, cancel := context.WithTimeout(b.ctx, 30*time.Second)
+	proposeTrace := localtesthooks.NewACKPhaseTrace()
 	slot, err := b.propose(ctx, value)
+	proposeTrace.Finish("batch_execute", err != nil)
 	if err == nil && b.apply != nil {
+		applyTrace := localtesthooks.NewACKPhaseTrace()
 		err = b.apply(ctx, slot)
+		applyTrace.Finish("batch_apply_callback", err != nil)
 	}
 	cancel()
 	for _, item := range items {
