@@ -10,36 +10,264 @@ permissions:
 
 jobs:
   image:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            runner: ubuntu-latest
+          - arch: arm64
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 20
+    permissions:
+      contents: read
+    env:
+      LOCAL_IMAGE: rhiza-operator:smoke-${{ matrix.arch }}
+      ARCH: ${{ matrix.arch }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+      - name: Resolve exact image source
+        id: source
+        run: |
+          set -eu
+          mkdir -p "$RUNNER_TEMP/operator-$ARCH"
+          case "$ARCH:$(uname -m)" in amd64:x86_64|arm64:aarch64) ;; *) echo 'runner is not native for the requested image' >&2; exit 1 ;; esac
+          uname -m > "$RUNNER_TEMP/operator-$ARCH/runner.txt"
+          printf 'EVIDENCE=%s/operator-%s\n' "$RUNNER_TEMP" "$ARCH" >> "$GITHUB_ENV"
+          printf 'revision=%s\n' "$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+          version=$(sed -n 's/^version = "\(.*\)"/\1/p' sdk/rust/Cargo.toml | head -n 1)
+          test -n "$version"
+          printf 'version=%s\n' "$version" >> "$GITHUB_OUTPUT"
+      - name: Check the smoke harness without Docker
+        run: sh scripts/test-operator-image-test.sh
+      - uses: docker/setup-buildx-action@v3
+        with:
+          driver-opts: image=mirror.gcr.io/moby/buildkit:buildx-stable-1@sha256:cec9f139f45e93c5c69c60f8b07cfad9f43f4ef6b6a6cd917527fea5ff2e3dea
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: Dockerfile.operator
+          platforms: linux/${{ matrix.arch }}
+          load: true
+          push: false
+          tags: ${{ env.LOCAL_IMAGE }}
+          labels: |
+            org.opencontainers.image.source=https://github.com/${{ github.repository }}
+            org.opencontainers.image.revision=${{ steps.source.outputs.revision }}
+            org.opencontainers.image.version=${{ steps.source.outputs.version }}
+          cache-from: type=gha,scope=operator-${{ matrix.arch }}
+          cache-to: type=gha,scope=operator-${{ matrix.arch }},mode=max
+      - name: Verify the actual image and all three binaries
+        env:
+          ARCH: ${{ matrix.arch }}
+          REVISION: ${{ steps.source.outputs.revision }}
+          VERSION: ${{ steps.source.outputs.version }}
+        run: |
+          set -eu
+          if sh scripts/test-operator-image.sh "$LOCAL_IMAGE" "$ARCH" "$REVISION" "$VERSION" > "$EVIDENCE/smoke.log" 2>&1; then
+            cat "$EVIDENCE/smoke.log"
+          else
+            status=$?
+            cat "$EVIDENCE/smoke.log"
+            exit "$status"
+          fi
+          docker image inspect "$LOCAL_IMAGE" | jq '.[0] | {Id,Os,Architecture,user:.Config.User,labels:.Config.Labels}' > "$EVIDENCE/image-$ARCH.json"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: operator-evidence-${{ matrix.arch }}-${{ github.run_id }}
+          path: |
+            ${{ env.EVIDENCE }}/smoke.log
+            ${{ env.EVIDENCE }}/image-*.json
+            ${{ env.EVIDENCE }}/runner.txt
+          if-no-files-found: error
+          retention-days: 14
+  release-image:
+    if: github.event_name == 'release'
+    needs: image
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            runner: ubuntu-latest
+          - arch: arm64
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 20
+    permissions:
+      contents: read
+      packages: write
+    env:
+      IMAGE: ghcr.io/${{ github.repository_owner }}/rhiza-operator
+      ARCH: ${{ matrix.arch }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+      - name: Resolve the release source
+        id: source
+        env:
+          RELEASE_TAG: ${{ github.event.release.tag_name }}
+        run: |
+          set -eu
+          case "$ARCH:$(uname -m)" in amd64:x86_64|arm64:aarch64) ;; *) exit 1 ;; esac
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+          version=$(sed -n 's/^version = "\(.*\)"/\1/p' sdk/rust/Cargo.toml | head -n 1)
+          test "$RELEASE_TAG" = "v$version"
+          printf 'version=%s\n' "$version" >> "$GITHUB_OUTPUT"
+          mkdir -p "$RUNNER_TEMP/operator-release-$ARCH"
+          printf 'EVIDENCE=%s/operator-release-%s\n' "$RUNNER_TEMP" "$ARCH" >> "$GITHUB_ENV"
+      - uses: docker/setup-buildx-action@v3
+        with:
+          driver-opts: image=mirror.gcr.io/moby/buildkit:buildx-stable-1@sha256:cec9f139f45e93c5c69c60f8b07cfad9f43f4ef6b6a6cd917527fea5ff2e3dea
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Build and push an attested index without release aliases
+        id: build
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: Dockerfile.operator
+          platforms: linux/${{ matrix.arch }}
+          tags: ${{ env.IMAGE }}
+          outputs: type=image,push-by-digest=true,name-canonical=true,push=true
+          provenance: mode=max
+          labels: |
+            org.opencontainers.image.source=https://github.com/${{ github.repository }}
+            org.opencontainers.image.revision=${{ github.sha }}
+            org.opencontainers.image.version=${{ steps.source.outputs.version }}
+          cache-from: type=gha,scope=operator-${{ matrix.arch }}
+          cache-to: type=gha,scope=operator-${{ matrix.arch }},mode=max
+      - name: Verify the pushed index and execute its actual native image
+        env:
+          DIGEST: ${{ steps.build.outputs.digest }}
+          VERSION: ${{ steps.source.outputs.version }}
+        run: |
+          set -eu
+          printf '%s\n' "$DIGEST" | grep -Eq '^sha256:[0-9a-f]{64}$'
+          ref="$IMAGE@$DIGEST"
+          docker buildx imagetools inspect "$ref" --raw > "$EVIDENCE/index-$ARCH.json"
+          jq -e --arg arch "$ARCH" '
+            [.manifests[] | select(.platform.os == "linux" and .platform.architecture == $arch)] as $run |
+            [.manifests[] | select(.platform.os == "unknown" and .platform.architecture == "unknown" and
+              .annotations["vnd.docker.reference.type"] == "attestation-manifest")] as $attest |
+            (.manifests | length) == 2 and ($run | length) == 1 and ($attest | length) == 1 and
+            $attest[0].annotations["vnd.docker.reference.digest"] == $run[0].digest
+          ' "$EVIDENCE/index-$ARCH.json"
+          docker buildx imagetools inspect "$ref" --format '{{json .Provenance.SLSA}}' > "$EVIDENCE/provenance-$ARCH.json"
+          jq -e --arg revision "$GITHUB_SHA" '
+            .buildDefinition.buildType == "https://github.com/moby/buildkit/blob/master/docs/attestations/slsa-definitions.md" and
+            .buildDefinition.externalParameters.request.args["label:org.opencontainers.image.revision"] == $revision
+          ' "$EVIDENCE/provenance-$ARCH.json"
+          docker pull --platform "linux/$ARCH" "$ref"
+          docker image inspect "$ref" | jq '.[0] | {Id,Os,Architecture,user:.Config.User,labels:.Config.Labels}' > "$EVIDENCE/image-$ARCH.json"
+          if sh scripts/test-operator-image.sh "$ref" "$ARCH" "$GITHUB_SHA" "$VERSION" > "$EVIDENCE/smoke.log" 2>&1; then
+            cat "$EVIDENCE/smoke.log"
+          else
+            status=$?
+            cat "$EVIDENCE/smoke.log"
+            exit "$status"
+          fi
+          jq -n --arg digest "$DIGEST" --arg arch "$ARCH" --arg revision "$GITHUB_SHA" --arg version "$VERSION" \
+            '{digest:$digest,architecture:$arch,revision:$revision,version:$version}' > "$EVIDENCE/digest-$ARCH.json"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: operator-release-evidence-${{ matrix.arch }}-${{ github.run_id }}
+          path: ${{ env.EVIDENCE }}
+          if-no-files-found: error
+          retention-days: 14
+      - uses: actions/upload-artifact@v4
+        with:
+          name: operator-digest-${{ matrix.arch }}-${{ github.run_id }}
+          path: ${{ env.EVIDENCE }}/digest-*.json
+          if-no-files-found: error
+          retention-days: 1
+
+  publish:
+    if: github.event_name == 'release'
+    needs: release-image
     runs-on: ubuntu-latest
     timeout-minutes: 20
     permissions:
       contents: read
       packages: write
+    env:
+      IMAGE: ghcr.io/${{ github.repository_owner }}/rhiza-operator
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: operator-digest-*-${{ github.run_id }}
+          path: ${{ runner.temp }}/operator-digests
+          merge-multiple: true
       - uses: docker/setup-buildx-action@v3
         with:
           driver-opts: image=mirror.gcr.io/moby/buildkit:buildx-stable-1@sha256:cec9f139f45e93c5c69c60f8b07cfad9f43f4ef6b6a6cd917527fea5ff2e3dea
       - uses: docker/metadata-action@v5
         id: meta
         with:
-          images: ghcr.io/${{ github.repository_owner }}/rhiza-operator
+          images: ${{ env.IMAGE }}
           tags: |
-            type=ref,event=pr
-            type=ref,event=tag
-            type=raw,value=latest,enable=${{ github.event_name == 'release' && !github.event.release.prerelease }}
+            type=raw,value=${{ github.event.release.tag_name }}
+            type=raw,value=latest,enable=${{ !github.event.release.prerelease }}
           flavor: latest=false
       - uses: docker/login-action@v3
-        if: github.event_name == 'release'
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
-      - uses: docker/build-push-action@v6
+      - name: Preserve both attestation indices and publish the formal aliases
+        env:
+          META_JSON: ${{ steps.meta.outputs.json }}
+        working-directory: ${{ runner.temp }}/operator-digests
+        run: |
+          set -eu
+          version=$(sed -n 's/^version = "\(.*\)"/\1/p' "$GITHUB_WORKSPACE/sdk/rust/Cargo.toml" | head -n 1)
+          for arch in amd64 arm64; do
+            jq -e --arg arch "$arch" --arg revision "$GITHUB_SHA" --arg version "$version" '
+              .architecture == $arch and .revision == $revision and .version == $version and
+              (.digest | test("^sha256:[0-9a-f]{64}$"))
+            ' "digest-$arch.json"
+          done
+          amd64="$IMAGE@$(jq -r .digest digest-amd64.json)"
+          arm64="$IMAGE@$(jq -r .digest digest-arm64.json)"
+          docker buildx imagetools create --dry-run "$amd64" "$arm64" > combined-index.json
+          jq -e '
+            [.manifests[] | select(.platform.os == "linux")] as $run |
+            [.manifests[] | select(.platform.os == "unknown" and .platform.architecture == "unknown" and
+              .annotations["vnd.docker.reference.type"] == "attestation-manifest")] as $attest |
+            (.manifests | length) == 4 and
+            ([$run[].platform.architecture] | sort) == ["amd64","arm64"] and ($attest | length) == 2 and
+            ([$attest[].annotations["vnd.docker.reference.digest"]] | sort) == ([$run[].digest] | sort)
+          ' combined-index.json
+          set --
+          for tag in $(printf '%s' "$META_JSON" | jq -r '.tags[]'); do
+            set -- "$@" --tag "$tag"
+          done
+          docker buildx imagetools create "$@" "$amd64" "$arm64"
+          first_tag=$(printf '%s' "$META_JSON" | jq -er '.tags[0]')
+          docker buildx imagetools inspect "$first_tag" --raw > published-index.json
+          jq -S . combined-index.json > combined.sorted.json
+          jq -S . published-index.json > published.sorted.json
+          cmp combined.sorted.json published.sorted.json
+          docker buildx imagetools inspect "$first_tag" --format '{{json .Manifest}}' | jq -er .digest > release.digest
+          for tag in $(printf '%s' "$META_JSON" | jq -r '.tags[]'); do
+            test "$(docker buildx imagetools inspect "$tag" --format '{{json .Manifest}}' | jq -er .digest)" = "$(cat release.digest)"
+          done
+      - uses: actions/upload-artifact@v4
+        if: always()
         with:
-          context: .
-          file: Dockerfile.operator
-          platforms: linux/amd64
-          push: ${{ github.event_name == 'release' }}
-          tags: ${{ steps.meta.outputs.tags }}
-          labels: ${{ steps.meta.outputs.labels }}
+          name: operator-published-index-${{ github.run_id }}
+          path: ${{ runner.temp }}/operator-digests
+          if-no-files-found: error
+          retention-days: 14

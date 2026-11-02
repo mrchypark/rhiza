@@ -20,9 +20,12 @@ jobs:
           go-version-file: go.mod
           cache: true
       - name: Qualify embedded storage against all three pinned Floci providers
+        env:
+          RHIZA_EMBEDDED_FFI_REQUIRED: "1"
         shell: bash
         run: |
           unset RHIZA_EMBEDDED_TEST_PATTERN
+          sh scripts/test-embedded-object-providers-contract.sh
           sh scripts/test-embedded-object-providers.sh 2>&1 | tee "$RUNNER_TEMP/embedded-object-storage-providers.log"
       - name: Preserve provider qualification logs and failure diagnostics
         uses: actions/upload-artifact@v4
@@ -34,6 +37,7 @@ jobs:
             /tmp/rhiza-embedded-providers.*/*.log
             /tmp/rhiza-embedded-providers.*/*-image-digests.json
             /tmp/rhiza-embedded-providers.*/selected-tests.txt
+            ${{ runner.temp }}/rhiza-embedded-ffi.*/*
 
   legacy-recovery-rejection:
     runs-on: ubuntu-latest
