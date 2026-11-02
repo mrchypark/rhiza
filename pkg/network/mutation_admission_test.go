@@ -138,6 +138,41 @@ func TestMutationLeaseLivesUntilQueuedProposalFinishesAfterCancel(t *testing.T) 
 	}
 }
 
+func retainedMutationHeapGrowth(before, after uint64) uint64 {
+	// HeapAlloc is process-wide and may decrease between collected snapshots.
+	// Only positive growth is retained heap; compare before unsigned subtraction.
+	if after <= before {
+		return 0
+	}
+	return after - before
+}
+
+func TestRetainedMutationHeapGrowth(t *testing.T) {
+	const largest = ^uint64(0)
+	for _, test := range []struct {
+		name                string
+		before, after, want uint64
+		wantOver            bool
+	}{
+		{"observed-decrease", 50000, 29888, 0, false},
+		{"equal", 50000, 50000, 0, false},
+		{"below-budget", 10, 10 + maxAdmittedBytes - 1, maxAdmittedBytes - 1, false},
+		{"at-budget", 10, 10 + maxAdmittedBytes, maxAdmittedBytes, false},
+		{"over-budget", 10, 10 + maxAdmittedBytes + 1, maxAdmittedBytes + 1, true},
+		{"largest-growth", 0, largest, largest, true},
+		{"near-largest-small-growth", largest - 10, largest, 10, false},
+		{"near-largest-decrease", largest, largest - 1, 0, false},
+		{"largest-decrease", largest, 0, 0, false},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			got := retainedMutationHeapGrowth(test.before, test.after)
+			if got != test.want || (got > maxAdmittedBytes) != test.wantOver {
+				t.Fatalf("before=%d after=%d growth=%d want=%d over=%t wantOver=%t", test.before, test.after, got, test.want, got > maxAdmittedBytes, test.wantOver)
+			}
+		})
+	}
+}
+
 func TestBlockedStripeRetainsOnlyAdmittedMutationInputs(t *testing.T) {
 	server := NewServer(nil, nil, "cluster", true, nil)
 	defer server.Close()
@@ -193,7 +228,7 @@ func TestBlockedStripeRetainsOnlyAdmittedMutationInputs(t *testing.T) {
 	runtime.GC()
 	var blocked runtime.MemStats
 	runtime.ReadMemStats(&blocked)
-	if retained := blocked.HeapAlloc - baseline.HeapAlloc; retained > maxAdmittedBytes {
+	if retained := retainedMutationHeapGrowth(baseline.HeapAlloc, blocked.HeapAlloc); retained > maxAdmittedBytes {
 		t.Fatalf("blocked engine-retained heap=%d exceeds mutation byte budget %d", retained, maxAdmittedBytes)
 	}
 	_, err = server.KVPut(context.Background(), KVMutationRequest{RequestID: "blocked-overflow", Key: "k", Value: make([]byte, payloadBytes)})
