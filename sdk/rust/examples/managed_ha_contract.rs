@@ -214,6 +214,14 @@ fn exact_mixed_recovery(
     }
 }
 
+fn mixed_sql_ack_slot(slot: Option<u64>) -> Result<u64, String> {
+    match slot {
+        Some(0) => Err("mixed_sql_slot_zero".into()),
+        Some(slot) => Ok(slot),
+        None => Err("mixed_sql_slot_missing".into()),
+    }
+}
+
 fn mixed_sql(
     db: &ManagedDb,
     request: &ManagedExecuteRequest,
@@ -225,9 +233,7 @@ fn mixed_sql(
     receipt
         .require_committed()
         .map_err(|_| "mixed_sql_ack_missing")?;
-    if receipt.receipt.slot == 0 {
-        return Err("mixed_sql_slot_zero".into());
-    }
+    mixed_sql_ack_slot(receipt.receipt.slot)?;
     Ok(receipt)
 }
 
@@ -387,7 +393,7 @@ fn run_mixed(initial: bool) -> Result<(), String> {
             return Err("mixed_sql_row_readback_mismatch".into());
         }
         // The row intentionally does not contain its own INSERT slot.
-        (tuple, Some(ack.receipt.slot))
+        (tuple, Some(mixed_sql_ack_slot(ack.receipt.slot)?))
     } else {
         let raw = mixed_row(&db)?;
         if raw.len() > 16384 {
@@ -591,6 +597,20 @@ fn execute_committed_or_resolve(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn mixed_sql_ack_requires_present_nonzero_slot() {
+        assert_eq!(
+            mixed_sql_ack_slot(None).unwrap_err(),
+            "mixed_sql_slot_missing"
+        );
+        assert_eq!(
+            mixed_sql_ack_slot(Some(0)).unwrap_err(),
+            "mixed_sql_slot_zero"
+        );
+        assert_eq!(mixed_sql_ack_slot(Some(17)).unwrap(), 17);
+        assert_eq!(mixed_sql_ack_slot(Some(u64::MAX)).unwrap(), u64::MAX);
+    }
 
     #[test]
     fn mixed_unknown_requires_exact_original_not_none_or_observation() {
