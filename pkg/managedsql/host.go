@@ -1,5 +1,5 @@
-// Package managedsql owns a private SQL-only managed HA runtime. It exposes no
-// Node, raw network server, graph, KV, notification, migration, or HTTP surface.
+// Package managedsql owns a private managed application runtime. It exposes no
+// Node, raw network server, graph, notification, migration, or HTTP surface.
 package managedsql
 
 import (
@@ -70,8 +70,11 @@ func Open(ctx context.Context, cfg Config) (*Host, error) {
 	if cfg.Runtime.ObjStoreProvider == "" {
 		cfg.Runtime.ObjStoreProvider = "s3"
 	}
-	if cfg.Plan.EvidenceFormat != EvidenceFormat || cfg.Store == nil || cfg.PodUID == "" {
+	if operator.ValidateV1Alpha2ApplicationProfile(cfg.Plan.ApplicationProtocol, cfg.Plan.EvidenceFormat) != nil || cfg.Store == nil || cfg.PodUID == "" {
 		return nil, fmt.Errorf("exact SQL initialization plan, store, and Pod UID required")
+	}
+	if cfg.Plan.ApplicationProtocol != "" && cfg.Plan.Generation != 0 {
+		return nil, fmt.Errorf("mixed managed generation is not supported")
 	}
 	if cfg.Runtime.ObjStoreDurability == "" {
 		cfg.Runtime.ObjStoreDurability = types.ObjectStoreDurabilityBeforeAck
@@ -89,11 +92,11 @@ func Open(ctx context.Context, cfg Config) (*Host, error) {
 		return nil, errors.Join(fmt.Errorf("runtime member identity differs from CR generation or actual Pod UID"), err, memberErr)
 	}
 	h := &Host{cfg: cfg, node: node.New(&cfg.Runtime)}
-	source, member, err := h.node.PreparedStartupBindingDigests()
+	source, member, err := h.node.PreparedStartupBindingDigestsForProtocol(cfg.Plan.ApplicationProtocol)
 	if err != nil {
 		return nil, err
 	}
-	common, err := h.node.ManagedBootstrapPlanDigest(source, EvidenceFormat)
+	common, err := h.node.ManagedBootstrapPlanDigestForProtocol(source, cfg.Plan.EvidenceFormat, cfg.Plan.ApplicationProtocol)
 	if err != nil || cfg.Plan.PhysicalBinding != source || cfg.Plan.BootstrapPlanDigest != common || cfg.Plan.ClusterUID != cfg.Ref.UID {
 		return nil, errors.Join(fmt.Errorf("installed runtime differs from initialization plan"), err)
 	}
@@ -109,7 +112,7 @@ func Open(ctx context.Context, cfg Config) (*Host, error) {
 	if err != nil {
 		return nil, err
 	}
-	if bootstrap.ClusterID != cfg.Runtime.ClusterID || bootstrap.PhysicalBinding != source || bootstrap.EvidenceFormat != EvidenceFormat || bootstrap.Durability != cfg.Runtime.ObjStoreDurability || bootstrap.Reconfiguration != cfg.Runtime.EnableReconfiguration {
+	if bootstrap.ClusterID != cfg.Runtime.ClusterID || bootstrap.PhysicalBinding != source || bootstrap.EvidenceFormat != cfg.Plan.EvidenceFormat || bootstrap.Durability != cfg.Runtime.ObjStoreDurability || bootstrap.Reconfiguration != cfg.Runtime.EnableReconfiguration {
 		return nil, fmt.Errorf("installed runtime differs from full bootstrap plan")
 	}
 	initialMember := false
@@ -143,7 +146,7 @@ func Open(ctx context.Context, cfg Config) (*Host, error) {
 	if h.authority.Generation != cfg.Plan.Generation || h.authority.Binding.DeploymentUID != cfg.Plan.DeploymentUID || h.authority.Binding.StorageID != cfg.Plan.StorageID {
 		return nil, fmt.Errorf("current authority differs from installed generation and storage binding")
 	}
-	h.identity = node.ManagedStartupIdentity{Member: recovery.PreparedStartupIdentity{ClusterUID: cfg.Ref.UID, Generation: cfg.Plan.Generation, DeploymentUID: cfg.Plan.DeploymentUID, PodUID: cfg.PodUID, NodeID: string(cfg.Runtime.NodeID), SourceBinding: source, ConfigDigest: member}, AssignmentID: cfg.Plan.AssignmentID, IntentHash: cfg.Plan.IntentHash, StorageID: cfg.Plan.StorageID, PhysicalBinding: source, BootstrapPlanDigest: common, EvidenceFormat: EvidenceFormat}
+	h.identity = node.ManagedStartupIdentity{Member: recovery.PreparedStartupIdentity{ClusterUID: cfg.Ref.UID, Generation: cfg.Plan.Generation, DeploymentUID: cfg.Plan.DeploymentUID, PodUID: cfg.PodUID, NodeID: string(cfg.Runtime.NodeID), SourceBinding: source, ConfigDigest: member}, AssignmentID: cfg.Plan.AssignmentID, IntentHash: cfg.Plan.IntentHash, StorageID: cfg.Plan.StorageID, PhysicalBinding: source, BootstrapPlanDigest: common, EvidenceFormat: cfg.Plan.EvidenceFormat, ApplicationProtocol: cfg.Plan.ApplicationProtocol}
 	if cfg.Prepared != nil {
 		if cfg.Prepared.Identity() != h.identity.Member {
 			return nil, fmt.Errorf("prepared handoff differs from exact configured execution identity")
@@ -184,12 +187,11 @@ func Open(ctx context.Context, cfg Config) (*Host, error) {
 		return nil, err
 	}
 	if initial.Assignment().State == "Unused" {
-		state, err := h.node.InspectManagedSQL(ctx, true)
+		evidence, err := h.inspectEvidence(ctx, true, false)
 		if err != nil {
 			h.uncertain.Store(true)
 			return h, err
 		}
-		evidence := encodeEvidence(state)
 		liveInit, err := operator.LoadV1Alpha2ApplicationInit(ctx, cfg.Store, cfg.Ref)
 		if err != nil {
 			h.uncertain.Store(true)
@@ -335,7 +337,7 @@ func (h *Host) validateManagedState(ctx context.Context, i node.ManagedStartupId
 		// live() validates and preserves pending/original SQL and current
 		// authority. Neither an unresolved outcome nor newer canonical evidence
 		// invalidates this runtime's previously admitted certified snapshot.
-		_, err := h.node.InspectManagedSQLRead(ctx)
+		_, err := h.inspectEvidence(ctx, false, true)
 		return err
 	}
 	if pending, ok := a.Pending(); ok {
@@ -356,11 +358,11 @@ func (h *Host) validateManagedState(ctx context.Context, i node.ManagedStartupId
 			return fmt.Errorf("reserved history cannot admit a new empty-source application baseline")
 		}
 	}
-	s, err := h.node.InspectManagedSQL(ctx, false)
+	evidence, err := h.inspectEvidence(ctx, false, false)
 	if err != nil {
 		return err
 	}
-	if evidenceHash(a.Evidence()) != evidenceHash(encodeEvidence(s)) {
+	if evidenceHash(a.Evidence()) != evidenceHash(evidence) {
 		return fmt.Errorf("local SQL state differs from current evidence")
 	}
 	return nil
@@ -615,11 +617,11 @@ func (h *Host) Execute(ctx context.Context, req ExecuteRequest) (ExecuteResponse
 	if !h.node.Ready() {
 		return ExecuteResponse{}, &SQLNotSubmittedError{Stage: SQLStageAdmission, Cause: network.ErrNotReady}
 	}
-	s, err := h.node.InspectManagedSQL(ctx, false)
+	evidence, err := h.inspectEvidence(ctx, false, false)
 	if err != nil {
 		return ExecuteResponse{}, &SQLNotSubmittedError{Stage: SQLStageAdmission, Cause: err}
 	}
-	reserved, observed, err := operator.ReserveV1Alpha2SQLWrite(ctx, h.cfg.Store, a, h.authority, encodeEvidence(s), req)
+	reserved, observed, err := operator.ReserveV1Alpha2SQLWrite(ctx, h.cfg.Store, a, h.authority, evidence, req)
 	if err != nil || observed != operator.V1Alpha2CASApplied {
 		ambiguous := observed == operator.V1Alpha2CASUnknown || observed == operator.V1Alpha2CASMatchingReadback || errors.Is(err, operator.ErrV1Alpha2StatusOutcomeUnknown)
 		if ambiguous {
@@ -646,121 +648,24 @@ func (h *Host) Execute(ctx context.Context, req ExecuteRequest) (ExecuteResponse
 }
 
 func sqlOutcomeUnknown(req ExecuteRequest, response ExecuteResponse, cause error) error {
-	slot, retry := quepaxa.Slot(response.Slot), response.RetryThroughSlot
-	var previous *network.CommitUnknownError
-	if errors.As(cause, &previous) && previous.RequestID == req.RequestID {
-		if slot == 0 {
-			slot = previous.Slot
-		}
-		if retry == 0 {
-			retry = previous.RetryThroughSlot
-		}
-	}
-	return &network.CommitUnknownError{RequestID: req.RequestID, Slot: slot, RetryThroughSlot: retry, Cause: cause}
+	return applicationOutcomeUnknown(applicationOriginal{kind: "sql", sql: req}, response.MutationReceipt, cause)
 }
 
 func (h *Host) finalize(ctx context.Context, req ExecuteRequest, a operator.V1Alpha2AdmissionSnapshot) error {
-	remoteFinalization := func(cause error) error {
-		if err := h.verifyRemoteFinalization(ctx, req, a); err != nil {
-			return errors.Join(cause, err)
-		}
-		return nil
-	}
-	if err := h.ValidateManagedSQLRecovery(ctx, h.identity, req); err != nil {
-		return remoteFinalization(err)
-	}
-	result, err := h.node.ResolveManagedSQL(ctx, req)
-	if err != nil || result.State != network.ResolveExecuteRetained || result.Receipt == nil || result.Durability != network.ResolveExecuteDurabilityConfirmed {
-		return errors.Join(fmt.Errorf("SQL outcome or configured durability remains unknown"), err)
-	}
-	s, err := h.node.InspectManagedSQL(ctx, false)
-	if err != nil {
-		return err
-	}
-	if err := h.ValidateManagedSQLRecovery(ctx, h.identity, req); err != nil {
-		return remoteFinalization(err)
-	}
-	w, _ := a.Pending()
-	_, observed, err := operator.FinalizeV1Alpha2Write(ctx, h.cfg.Store, a, h.authority, w, operator.V1Alpha2WriteCommitted, encodeEvidence(s))
-	if errors.Is(err, operator.ErrV1Alpha2StatusConflict) {
-		return remoteFinalization(err)
-	}
-	if err != nil || observed != operator.V1Alpha2CASApplied {
-		return errors.Join(fmt.Errorf("SQL finalization not directly confirmed"), err)
-	}
-	return nil
+	_, err := h.finalizeApplication(ctx, applicationOriginal{kind: "sql", sql: req}, a)
+	return err
 }
 
 func (h *Host) verifyRemoteFinalization(ctx context.Context, req ExecuteRequest, reserved operator.V1Alpha2AdmissionSnapshot) error {
-	want, err := requestIdentity(req)
-	pending, ok := reserved.Pending()
-	if err != nil || !ok || pending != want || reserved.Authority() != h.authority {
-		return fmt.Errorf("exact original reservation required for remote finalization")
-	}
-	before, err := h.live(ctx)
-	if err != nil {
-		return err
-	}
-	oldRepair, oldRepairOK := reserved.Repair()
-	repair, repairOK := before.Repair()
-	if _, pending := before.Pending(); pending || oldRepairOK != repairOK || !reflect.DeepEqual(oldRepair, repair) {
-		return fmt.Errorf("pending SQL or repair changed during remote finalization")
-	}
-	if err := h.node.AdmitManaged(ctx); err != nil {
-		return err
-	}
-	result, err := h.node.ResolveManagedSQL(ctx, req)
-	if err != nil || result.State != network.ResolveExecuteRetained || result.Receipt == nil || result.Durability != network.ResolveExecuteDurabilityConfirmed {
-		return errors.Join(fmt.Errorf("remote finalization lacks exact durable receipt"), err)
-	}
-	state, err := h.node.ManagedState()
-	if err != nil {
-		return err
-	}
-	if result.Receipt.Slot == 0 || result.Receipt.Slot > state.CertifiedTip || state.AppliedTip != state.CertifiedTip || state.RecorderTip > state.CertifiedTip || (result.Receipt.Status != types.MutationCommitted && result.Receipt.Status != types.MutationRejected) {
-		return fmt.Errorf("remote finalization receipt is outside terminal certified history")
-	}
-	snapshot, err := h.node.InspectManagedSQL(ctx, false)
-	if err != nil || evidenceHash(before.Evidence()) != evidenceHash(encodeEvidence(snapshot)) {
-		return errors.Join(fmt.Errorf("remote finalization differs from canonical SQL evidence"), err)
-	}
-	after, err := h.live(ctx)
-	if err != nil || after.ResourceVersion() != before.ResourceVersion() {
-		return errors.Join(fmt.Errorf("remote finalization authority changed during proof"), err)
-	}
-	return nil
+	_, err := h.verifyRemoteApplication(ctx, applicationOriginal{kind: "sql", sql: req}, reserved)
+	return err
 }
 
 // RecoverPending never re-executes an unknown request or treats absence as no
 // effect. It resolves only the durable original request and configured barrier.
 func (h *Host) RecoverPending(ctx context.Context) error {
-	h.mu.Lock()
-	defer h.mu.Unlock()
-	if h.closed {
-		return fmt.Errorf("SQL host closed")
-	}
-	a, err := h.live(ctx)
-	if err != nil {
-		return err
-	}
-	if _, ok := a.Pending(); !ok {
-		h.uncertain.Store(false)
-		err := h.node.AdmitManaged(ctx)
-		if err != nil {
-			h.uncertain.Store(true)
-		}
-		return err
-	}
-	req, ok, err := a.PendingSQL()
-	if err != nil || !ok {
-		return errors.Join(fmt.Errorf("original pending SQL required"), err)
-	}
-	if err := h.finalize(ctx, req, a); err != nil {
-		h.uncertain.Store(true)
-		return sqlOutcomeUnknown(req, ExecuteResponse{}, err)
-	}
-	h.uncertain.Store(false)
-	return nil
+	_, err := h.RecoverPendingDetailed(ctx)
+	return err
 }
 
 func (h *Host) Query(ctx context.Context, req QueryRequest) (QueryResponse, error) {

@@ -322,6 +322,18 @@ func (f *sqlStatusFixture) serve(w http.ResponseWriter, r *http.Request) {
 
 func sqlCluster(t *testing.T) ([]Config, *sqlStatusFixture) {
 	t.Helper()
+	return sqlClusterForProtocol(t, "")
+}
+
+func sqlClusterForProtocol(t *testing.T, protocol string) ([]Config, *sqlStatusFixture) {
+	t.Helper()
+	format := EvidenceFormat
+	if protocol != "" {
+		format = protocol
+	}
+	if err := operator.ValidateV1Alpha2ApplicationProfile(protocol, format); err != nil {
+		t.Fatal(err)
+	}
 	s3, sourceControl := sqlWireStore(t)
 	configs := make([]Config, 3)
 	members := make([]quepaxa.Member, 3)
@@ -349,6 +361,14 @@ func sqlCluster(t *testing.T) ([]Config, *sqlStatusFixture) {
 		configs[i].Runtime.Members = members
 	}
 	_ = json.Unmarshal([]byte(`{"apiVersion":"rhiza.mrchypark.dev/v1alpha2","kind":"RhizaCluster","metadata":{"name":"cluster","namespace":"ns","uid":"uid","resourceVersion":"1"},"spec":{"logicalID":"logical","genesisIntent":"Create","voterCount":3,"workload":{"podTemplate":{"spec":{"containers":[{"name":"app","image":"image"}]}}}},"status":{}}`), &f.obj)
+	if protocol != "" {
+		var spec map[string]json.RawMessage
+		if err := json.Unmarshal(f.obj["spec"], &spec); err != nil {
+			t.Fatal(err)
+		}
+		spec["applicationProtocol"], _ = json.Marshal(protocol)
+		f.obj["spec"], _ = json.Marshal(spec)
+	}
 	kube := httptest.NewTLSServer(http.HandlerFunc(f.serve))
 	t.Cleanup(kube.Close)
 	tokenFile := filepath.Join(t.TempDir(), "token")
@@ -358,20 +378,23 @@ func sqlCluster(t *testing.T) ([]Config, *sqlStatusFixture) {
 	store := &operator.V1Alpha2StatusStore{Kube: &operator.Kubernetes{BaseURL: kube.URL, Namespace: "ns", TokenFile: tokenFile, Client: kube.Client()}}
 	ref := operator.V1Alpha2ClusterRef{Name: "cluster", Namespace: "ns", UID: "uid"}
 	n := node.New(&configs[0].Runtime)
-	source, _, err := n.PreparedStartupBindingDigests()
+	source, _, err := n.PreparedStartupBindingDigestsForProtocol(protocol)
 	if err != nil {
 		t.Fatal(err)
 	}
-	common, err := n.ManagedBootstrapPlanDigest(source, EvidenceFormat)
+	common, err := n.ManagedBootstrapPlanDigestForProtocol(source, format, protocol)
 	if err != nil {
 		t.Fatal(err)
 	}
-	plan, err := operator.NewV1Alpha2ApplicationInitPlan(ref, "logical", "deployment", "assignment", source, common, EvidenceFormat)
+	plan, err := operator.NewV1Alpha2ApplicationInitPlan(ref, "logical", "deployment", "assignment", source, common, format)
 	if err != nil {
 		t.Fatal(err)
 	}
+	// The checked public plan field and CR marker agree before the first
+	// authority write; no legacy assignment is converted after creation.
+	plan.ApplicationProtocol = protocol
 	name, _ := operator.V1Alpha2GenesisDeploymentName(ref.UID)
-	bootstrap := operator.V1Alpha2BootstrapPlan{ClusterID: clusterID, PhysicalBinding: source, EvidenceFormat: EvidenceFormat, Durability: types.ObjectStoreDurabilityBeforeAck}
+	bootstrap := operator.V1Alpha2BootstrapPlan{ClusterID: clusterID, PhysicalBinding: source, EvidenceFormat: format, Durability: types.ObjectStoreDurabilityBeforeAck}
 	for i, member := range members {
 		bootstrap.Members = append(bootstrap.Members, operator.V1Alpha2BootstrapMember{PodUID: fmt.Sprintf("pod-%d", i), Member: member})
 	}

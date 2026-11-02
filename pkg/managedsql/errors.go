@@ -38,3 +38,17 @@ func (e *SQLNotSubmittedError) Error() string {
 	return fmt.Sprintf("%v: stage=%s recovery_required=%t: %v", ErrSQLNotSubmitted, e.Stage, e.RecoveryRequired, e.Cause)
 }
 func (e *SQLNotSubmittedError) Unwrap() []error { return []error{ErrSQLNotSubmitted, e.Cause} }
+
+// ErrKVNotSubmitted describes this call only, never an older pending outcome.
+var ErrKVNotSubmitted = errors.New("managed KV not submitted")
+
+type KVNotSubmittedError struct {
+	Stage            SQLSubmissionStage
+	RecoveryRequired bool
+	Cause            error
+}
+
+func (e *KVNotSubmittedError) Error() string {
+	return fmt.Sprintf("%v: stage=%s recovery_required=%t: %v", ErrKVNotSubmitted, e.Stage, e.RecoveryRequired, e.Cause)
+}
+func (e *KVNotSubmittedError) Unwrap() []error { return []error{ErrKVNotSubmitted, e.Cause} }
