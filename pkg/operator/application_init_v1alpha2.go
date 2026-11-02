@@ -9,11 +9,14 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+
+	"github.com/mrchypark/rhiza/internal/types"
 )
 
 // V1Alpha2ApplicationInitPlan identifies shared genesis inputs, not a member's
 // Pod, Node, public key, or WAL identity. PhysicalBinding is a trusted host input.
 type V1Alpha2ApplicationInitPlan struct {
+	ApplicationProtocol string `json:"applicationProtocol,omitempty"`
 	AssignmentID        string `json:"assignmentID"`
 	ClusterUID          string `json:"clusterUID"`
 	IntentHash          string `json:"intentHash"`
@@ -67,6 +70,9 @@ func validInitDigest(s string) bool {
 	return err == nil && len(b) == sha256.Size && hex.EncodeToString(b) == s
 }
 func validateV1Alpha2ApplicationInitPlan(p V1Alpha2ApplicationInitPlan, ref V1Alpha2ClusterRef, g v1alpha2Genesis) error {
+	if p.ApplicationProtocol != "" && p.ApplicationProtocol != types.ManagedApplicationProtocolSQLKV {
+		return fmt.Errorf("unsupported initialization protocol")
+	}
 	if !validInitString(p.AssignmentID) || p.ClusterUID != ref.UID || p.IntentHash != g.IntentHash || p.Generation != 0 || p.DeploymentUID != g.DeploymentUID || p.StorageID != g.StorageID || !validInitDigest(p.PhysicalBinding) || !validInitDigest(p.BootstrapPlanDigest) || !validInitString(p.EvidenceFormat) {
 		return fmt.Errorf("invalid application initialization plan")
 	}
@@ -85,6 +91,10 @@ func parseV1Alpha2ApplicationInit(s V1Alpha2StatusSnapshot) (V1Alpha2Application
 	var assignment V1Alpha2ApplicationInitAssignment
 	if decodeV1Alpha2(status["applicationInit"], &assignment) != nil || validateV1Alpha2ApplicationInitPlan(assignment.Plan, s.ref, receipt) != nil {
 		return assignment, fmt.Errorf("invalid application initialization assignment")
+	}
+	protocol, err := mixedApplicationProtocol(s.object)
+	if err != nil || assignment.Plan.ApplicationProtocol != protocol {
+		return assignment, fmt.Errorf("application protocol markers disagree")
 	}
 	if assignment.State == "Unused" {
 		if assignment.InitialEvidenceDigest != "" || s.authority.Generation != 0 || s.authority.Binding.DeploymentUID != assignment.Plan.DeploymentUID || s.authority.Binding.StorageID != assignment.Plan.StorageID {
@@ -164,6 +174,9 @@ func CommitV1Alpha2ApplicationInit(ctx context.Context, store *V1Alpha2StatusSto
 		obj[k] = v
 	}
 	obj["status"] = statusRaw
+	if err := validateManagedMixedProfile(obj); err != nil {
+		return V1Alpha2ApplicationInitSnapshot{}, "", err
+	}
 	p, err := store.path(old.status.ref)
 	if err != nil {
 		return V1Alpha2ApplicationInitSnapshot{}, "", err

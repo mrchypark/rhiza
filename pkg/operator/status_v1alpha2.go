@@ -86,6 +86,9 @@ func jsonObject(raw json.RawMessage) (map[string]json.RawMessage, error) {
 }
 
 func (s *V1Alpha2StatusStore) snapshot(ref V1Alpha2ClusterRef, obj map[string]json.RawMessage) (V1Alpha2StatusSnapshot, error) {
+	if err := validateManagedMixedProfile(obj); err != nil {
+		return V1Alpha2StatusSnapshot{}, err
+	}
 	var version, kind string
 	_ = json.Unmarshal(obj["apiVersion"], &version)
 	_ = json.Unmarshal(obj["kind"], &kind)
@@ -248,6 +251,12 @@ func (s *V1Alpha2StatusStore) compareAndSwapQueue(ctx context.Context, old V1Alp
 		obj[k] = v
 	}
 	obj["status"] = statusRaw
+	if err := validateManagedMixedTransition(old.object, obj); err != nil {
+		return V1Alpha2StatusSnapshot{}, err
+	}
+	if err := validateManagedMixedProfile(obj); err != nil {
+		return V1Alpha2StatusSnapshot{}, err
+	}
 	var response map[string]json.RawMessage
 	err = s.Kube.Put(ctx, p+"/status", obj, &response)
 	var apiErr *APIError

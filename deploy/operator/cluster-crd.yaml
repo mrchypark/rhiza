@@ -20,6 +20,18 @@ spec:
           type: object
           required: [spec]
           x-kubernetes-validations:
+            - rule: '!has(self.spec.applicationProtocol) || !has(oldSelf.status) || !has(oldSelf.status.authority) || !has(oldSelf.status.authority.pendingWrite) || !oldSelf.status.authority.pendingWrite || !has(self.status) || !has(self.status.authority) || !has(self.status.authority.pendingWrite) || !self.status.authority.pendingWrite || (self.status.authority.generation == oldSelf.status.authority.generation && self.status.authority.binding == oldSelf.status.authority.binding && self.status.authority.owner == oldSelf.status.authority.owner)'
+              message: mixed pending authority context is immutable
+            - rule: '!has(self.spec.applicationProtocol) || !has(self.status) || !has(self.status.authority) || !has(self.status.authority.pendingWrite) || !self.status.authority.pendingWrite || (has(self.status.authority.pendingRequest) && has(self.status.authority.pendingRequest.reservation) && self.status.authority.pendingRequest.reservation.generation == self.status.authority.generation && self.status.authority.pendingRequest.reservation.deploymentUID == self.status.authority.binding.deploymentUID && self.status.authority.pendingRequest.reservation.storageID == self.status.authority.binding.storageID && self.status.authority.pendingRequest.reservation.namespace == self.status.authority.owner.namespace && self.status.authority.pendingRequest.reservation.name == self.status.authority.owner.name && self.status.authority.pendingRequest.reservation.uid == self.status.authority.owner.uid && self.status.authority.pendingRequest.reservation.logicalID == self.status.authority.owner.logicalID)'
+              message: mixed pending must retain its exact authority reservation
+            - rule: '!has(self.spec.applicationProtocol) || !has(oldSelf.status) || !has(oldSelf.status.authority) || !has(oldSelf.status.authority.pendingWrite) || !oldSelf.status.authority.pendingWrite || !has(self.status) || !has(self.status.authority) || !has(self.status.authority.pendingWrite) || !self.status.authority.pendingWrite || (has(self.status.authority.pendingRequest) && has(oldSelf.status.authority.pendingRequest) && self.status.authority.pendingRequest == oldSelf.status.authority.pendingRequest)'
+              message: a mixed pending request cannot be replaced in place
+            - rule: '!has(self.spec.applicationProtocol) || !has(self.status) || !has(self.status.authority) || has(self.status.applicationInit)'
+              message: mixed authority requires initialization marker
+            - rule: '!has(self.status) || !has(self.status.applicationInit) || (has(self.spec.applicationProtocol) == has(self.status.applicationInit.plan.applicationProtocol) && (!has(self.spec.applicationProtocol) || self.spec.applicationProtocol == self.status.applicationInit.plan.applicationProtocol))'
+              message: application protocol markers must agree
+            - rule: '!has(self.spec.applicationProtocol) || !has(self.status) || !has(self.status.authority) || !has(self.status.authority.pendingWrite) || !self.status.authority.pendingWrite || (has(self.status.authority.pendingRequest) && ((self.status.authority.pendingRequest.kind == "sql" && has(self.status.authority.pendingRequest.originalSQL) && !has(self.status.authority.pendingRequest.originalKV)) || (self.status.authority.pendingRequest.kind == "kv" && has(self.status.authority.pendingRequest.originalKV) && !has(self.status.authority.pendingRequest.originalSQL))))'
+              message: mixed pending requires exactly one typed original
             - rule: '!has(oldSelf.status) || !has(oldSelf.status.genesis) || (has(self.status) && has(self.status.genesis) && self.status.genesis == oldSelf.status.genesis && has(self.status.authority))'
               message: genesis receipt cannot be removed or changed and requires authority
             - rule: '!has(self.status) || !has(self.status.genesis) || has(self.status.authority)'
@@ -33,6 +45,10 @@ spec:
               type: object
               required: [logicalID, voterCount, workload]
               x-kubernetes-validations:
+                - rule: '!has(self.applicationProtocol) || (has(self.genesisIntent) && self.genesisIntent == "Create")'
+                  message: mixed application protocol requires new genesis intent
+                - rule: 'has(self.applicationProtocol) == has(oldSelf.applicationProtocol) && (!has(self.applicationProtocol) || self.applicationProtocol == oldSelf.applicationProtocol)'
+                  message: applicationProtocol is creation-only and immutable
                 - rule: 'has(self.genesisIntent) == has(oldSelf.genesisIntent) && (!has(self.genesisIntent) || self.genesisIntent == oldSelf.genesisIntent)'
                   message: genesisIntent is creation-only and immutable
                 - rule: '!has(self.statefulSet) && !has(self.container) && !has(self.adoptClusterID) && !has(self.automatic) && !has(self.policy) && !has(self.bootstrap) && !has(self.clusterDomain) && !has(self.anchorID) && !has(self.httpPort) && !has(self.peerPort) && !has(self.voterPods)'
@@ -40,6 +56,7 @@ spec:
                 - rule: self.voterCount == oldSelf.voterCount
                   message: voterCount updates are unsupported
               properties:
+                applicationProtocol: {type: string, maxLength: 23, enum: [rhiza-managed-sql-kv/v1]}
                 genesisIntent: {type: string, maxLength: 6, enum: [Create]}
                 statefulSet: {type: string}
                 container: {type: string}
@@ -184,6 +201,9 @@ spec:
                       type: object
                       x-kubernetes-preserve-unknown-fields: true
                       properties:
+                        namespace: {type: string, maxLength: 63}
+                        name: {type: string, maxLength: 253}
+                        logicalID: {type: string, maxLength: 256}
                         uid: {type: string, maxLength: 256}
                     binding:
                       type: object
@@ -193,7 +213,36 @@ spec:
                         storageID: {type: string, maxLength: 256}
                     transition: {type: object, x-kubernetes-preserve-unknown-fields: true}
                     pendingWrite: {type: boolean}
-                    pendingRequest: {type: object, x-kubernetes-preserve-unknown-fields: true}
+                    pendingRequest:
+                      type: object
+                      x-kubernetes-preserve-unknown-fields: true
+                      properties:
+                        kind: {type: string, maxLength: 128}
+                        id: {type: string, maxLength: 256}
+                        fingerprint: {type: string, maxLength: 256}
+                        reservation:
+                          type: object
+                          required: [namespace, name, uid, logicalID, generation, deploymentUID, storageID]
+                          properties:
+                            namespace: {type: string, maxLength: 63}
+                            name: {type: string, maxLength: 253}
+                            uid: {type: string, maxLength: 256}
+                            logicalID: {type: string, maxLength: 256}
+                            generation: {type: integer, format: int64, minimum: 0}
+                            deploymentUID: {type: string, maxLength: 256}
+                            storageID: {type: string, maxLength: 256}
+                        originalSQL: {type: object, x-kubernetes-preserve-unknown-fields: true}
+                        originalKV:
+                          type: object
+                          required: [request_id_b64, operation, key_b64, value, expected, expected_exists, ttl_ms]
+                          properties:
+                            request_id_b64: {type: string, minLength: 4, maxLength: 88}
+                            operation: {type: string, enum: [put, delete, cas]}
+                            key_b64: {type: string, minLength: 4, maxLength: 1368}
+                            value: {type: string, nullable: true, maxLength: 279620}
+                            expected: {type: string, nullable: true, maxLength: 279620}
+                            expected_exists: {type: boolean}
+                            ttl_ms: {type: integer, format: int64, minimum: 0}
                   x-kubernetes-validations:
                     - rule: '!oldSelf.everApplicationReserved || self.everApplicationReserved'
                       message: application reservation history cannot be reset
@@ -358,6 +407,7 @@ spec:
                       type: object
                       required: [assignmentID, clusterUID, intentHash, generation, deploymentUID, storageID, physicalBinding, bootstrapPlanDigest, evidenceFormat]
                       properties:
+                        applicationProtocol: {type: string, maxLength: 23, enum: [rhiza-managed-sql-kv/v1]}
                         assignmentID: {type: string, minLength: 1, maxLength: 256}
                         clusterUID: {type: string, minLength: 1, maxLength: 256}
                         intentHash: {type: string, minLength: 64, maxLength: 64, pattern: '^[0-9a-f]{64}$'}

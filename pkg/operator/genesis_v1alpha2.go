@@ -220,6 +220,9 @@ func initializeV1Alpha2AuthorityWithPlan(ctx context.Context, s *V1Alpha2StatusS
 	if err := validateV1Alpha2ApplicationInitPlan(*plan, ref, receipt); err != nil {
 		return V1Alpha2StatusSnapshot{}, err
 	}
+	if plan.ApplicationProtocol != cluster.Spec.ApplicationProtocol {
+		return V1Alpha2StatusSnapshot{}, fmt.Errorf("genesis application protocol markers disagree")
+	}
 	if err := validateV1Alpha2BootstrapPlan(ref, *plan, *bootstraps[0], int(cluster.Spec.VoterCount)); err != nil {
 		return V1Alpha2StatusSnapshot{}, err
 	}
@@ -230,6 +233,14 @@ func initializeV1Alpha2AuthorityWithPlan(ctx context.Context, s *V1Alpha2StatusS
 	status["bootstrapPlan"], _ = json.Marshal(bootstraps[0])
 	statusRaw, _ := json.Marshal(status)
 	obj["status"] = statusRaw
+	if cluster.Spec.ApplicationProtocol != "" {
+		if err := mixedComponentSize(obj["metadata"], 64<<10); err != nil {
+			return V1Alpha2StatusSnapshot{}, err
+		}
+	}
+	if err := validateManagedMixedProfile(obj); err != nil {
+		return V1Alpha2StatusSnapshot{}, err
+	}
 	var response map[string]json.RawMessage
 	err = s.Kube.Put(ctx, p+"/status", obj, &response)
 	var apiErr *APIError
