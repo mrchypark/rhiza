@@ -632,7 +632,9 @@ func (entry *ffiEntry) unsubscribe(id uint64) error {
 }
 
 func dataJSON(value any) []byte {
-	b, err := json.Marshal(map[string]any{"data": value})
+	b, err := json.Marshal(struct {
+		Data any `json:"data"`
+	}{value})
 	if err != nil {
 		return marshalError("internal", "encode response: "+err.Error())
 	}

@@ -402,7 +402,10 @@ impl Db {
         }
         native_call(
             self.handle,
-            json!({"operation": operation, "request": request}),
+            &CallEnvelope {
+                operation,
+                request: &request,
+            },
             timeout_ms,
         )
     }
@@ -714,7 +717,10 @@ impl ManagedDb {
         }
         native_call_detailed(
             self.handle,
-            json!({"operation":operation,"request":request}),
+            &CallEnvelope {
+                operation,
+                request: &request,
+            },
             DEFAULT_TIMEOUT_MS,
         )
     }
@@ -743,7 +749,10 @@ impl ManagedDb {
         }
         native_call(
             self.handle,
-            json!({"operation": operation, "request": request}),
+            &CallEnvelope {
+                operation,
+                request: &request,
+            },
             timeout_ms,
         )
     }
@@ -1020,7 +1029,13 @@ impl Drop for BufferGuard {
         unsafe { RhizaFree(self.0) }
     }
 }
-fn encode(value: Value) -> Result<Vec<u8>> {
+#[derive(Serialize)]
+struct CallEnvelope<'a> {
+    operation: &'a str,
+    request: &'a Value,
+}
+
+fn encode(value: &impl Serialize) -> Result<Vec<u8>> {
     let data = serde_json::to_vec(&value).map_err(internal)?;
     if data.len() > MAX_INPUT_BYTES {
         return Err(Error {
@@ -1196,11 +1211,11 @@ mod managed_kv_wire_tests {
     }
 }
 fn native_open(value: Value) -> Result<Value> {
-    let mut input = encode(value)?;
+    let mut input = encode(&value)?;
     decode(unsafe { RhizaOpen(input.as_mut_ptr().cast(), input.len()) })
 }
 fn native_open_managed(value: Value) -> Result<Value> {
-    let mut input = encode(value)?;
+    let mut input = encode(&value)?;
     decode(unsafe { RhizaOpenManaged(input.as_mut_ptr().cast(), input.len()) })
 }
 fn native_open_from_env() -> Result<Value> {
@@ -1225,12 +1240,16 @@ fn native_start_operator(handle: u64, address: &str) -> Result<String> {
             message: "operator start response has no address".into(),
         })
 }
-fn native_call<T: DeserializeOwned>(handle: u64, value: Value, timeout_ms: u64) -> Result<T> {
+fn native_call<T: DeserializeOwned>(
+    handle: u64,
+    value: &impl Serialize,
+    timeout_ms: u64,
+) -> Result<T> {
     native_call_detailed(handle, value, timeout_ms).map_err(ManagedMutationError::into_error)
 }
 fn native_call_detailed<T: DeserializeOwned>(
     handle: u64,
-    value: Value,
+    value: &impl Serialize,
     timeout_ms: u64,
 ) -> std::result::Result<T, ManagedMutationError> {
     let mut input = encode(value)?;
@@ -1323,6 +1342,61 @@ pub struct MembershipStatus {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn borrowed_call_envelope_matches_old_value_bytes() {
+        for request in [
+            Value::Null,
+            json!(false),
+            json!(""),
+            json!([]),
+            json!({}),
+            json!({"args":[null,true,9007199254740993_u64,u64::MAX,"<>&\u{2028}\u{2029}\n\"\\"],"sql":"SELECT ?"}),
+            json!({"request_id_b64":"/w==","key_b64":"/g==","value":"","expected":null,"expected_exists":false,"ttl_ms":7,"operation":"cas"}),
+        ] {
+            let before = request.clone();
+            let old = json!({"operation":"execute","request":request});
+            let new = encode(&CallEnvelope {
+                operation: "execute",
+                request: &before,
+            })
+            .unwrap();
+            assert_eq!(new, serde_json::to_vec(&old).unwrap());
+            assert_eq!(before, old["request"]);
+        }
+        assert_eq!(
+            encode(&CallEnvelope {
+                operation: "ready",
+                request: &Value::Null
+            })
+            .unwrap(),
+            br#"{"operation":"ready","request":null}"#
+        );
+    }
+
+    #[test]
+    fn borrowed_call_envelope_preserves_encoded_size_boundary() {
+        let overhead = serde_json::to_vec(&json!({"operation":"execute","request":""}))
+            .unwrap()
+            .len();
+        for size in [MAX_INPUT_BYTES - 1, MAX_INPUT_BYTES, MAX_INPUT_BYTES + 1] {
+            let request = Value::String("a".repeat(size - overhead));
+            let old =
+                serde_json::to_vec(&json!({"operation":"execute","request":&request})).unwrap();
+            assert_eq!(old.len(), size);
+            let result = encode(&CallEnvelope {
+                operation: "execute",
+                request: &request,
+            });
+            if size <= MAX_INPUT_BYTES {
+                assert_eq!(result.unwrap(), old);
+            } else {
+                let error = result.unwrap_err();
+                assert_eq!(error.code, "invalid_request");
+                assert_eq!(error.message, "encoded FFI input exceeds 16 MiB");
+            }
+        }
+    }
 
     #[test]
     fn managed_requests_match_managed_ffi_wire() {
