@@ -43,6 +43,195 @@ impl std::error::Error for Error {}
 
 type Result<T> = std::result::Result<T, Error>;
 
+/// The authoritative original's namespace, not a permission to retry it.
+#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum MutationKind {
+    Sql,
+    Kv,
+}
+impl MutationKind {
+    fn wire(self) -> &'static str {
+        match self {
+            Self::Sql => "sql",
+            Self::Kv => "kv",
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MutationContext {
+    kind: MutationKind,
+    request_id: Vec<u8>,
+    slot: u64,
+    retry_through_slot: u64,
+}
+impl MutationContext {
+    pub fn kind(&self) -> MutationKind {
+        self.kind
+    }
+    pub fn request_id(&self) -> &[u8] {
+        &self.request_id
+    }
+    pub fn slot(&self) -> u64 {
+        self.slot
+    }
+    pub fn retry_through_slot(&self) -> u64 {
+        self.retry_through_slot
+    }
+}
+
+/// Preserves a captured original identity without changing the existing Error
+/// struct. Missing context, including on commit_unknown, never permits retry.
+#[derive(Clone, Debug)]
+pub struct ManagedMutationError {
+    error: Error,
+    context: Option<MutationContext>,
+}
+impl ManagedMutationError {
+    pub fn error(&self) -> &Error {
+        &self.error
+    }
+    pub fn mutation_context(&self) -> Option<&MutationContext> {
+        self.context.as_ref()
+    }
+    pub fn into_error(self) -> Error {
+        self.error
+    }
+}
+impl From<Error> for ManagedMutationError {
+    fn from(error: Error) -> Self {
+        Self {
+            error,
+            context: None,
+        }
+    }
+}
+impl fmt::Display for ManagedMutationError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.error.fmt(f)
+    }
+}
+impl std::error::Error for ManagedMutationError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.error)
+    }
+}
+
+/// All caller intent fields are retained, including fields ignored by an
+/// operation. None and Some(empty) remain distinct on the original wire.
+#[derive(Clone, Debug)]
+pub struct ManagedKVRequest {
+    pub request_id: Vec<u8>,
+    pub key: Vec<u8>,
+    pub value: Option<Vec<u8>>,
+    pub expected: Option<Vec<u8>>,
+    pub expected_exists: bool,
+    pub ttl_ms: i64,
+}
+impl ManagedKVRequest {
+    fn wire(&self, operation: &str) -> Value {
+        json!({"request_id_b64": STANDARD.encode(&self.request_id), "operation": operation,
+            "key_b64": STANDARD.encode(&self.key), "value": self.value.as_ref().map(|v| STANDARD.encode(v)),
+            "expected": self.expected.as_ref().map(|v| STANDARD.encode(v)),
+            "expected_exists": self.expected_exists, "ttl_ms": self.ttl_ms})
+    }
+}
+
+#[derive(Clone, Debug, Deserialize)]
+pub struct ManagedKVReceipt {
+    pub slot: u64,
+    pub status: String,
+    pub applied: bool,
+    pub error_code: Option<String>,
+    pub retry_through_slot: Option<u64>,
+}
+impl ManagedKVReceipt {
+    pub fn require_committed(&self) -> Result<()> {
+        if self.status == "committed" {
+            return Ok(());
+        }
+        Err(Error {
+            code: self
+                .error_code
+                .clone()
+                .unwrap_or_else(|| self.status.clone()),
+            message: "managed KV mutation is not committed".into(),
+        })
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct ManagedKVRead {
+    pub found: bool,
+    pub value: Option<Vec<u8>>,
+    pub applied_slot: u64,
+    pub consensus_tip: u64,
+}
+#[derive(Clone, Debug)]
+pub enum ManagedRequestReceipt {
+    Sql(MutationReceipt),
+    Kv(ManagedKVReceipt),
+}
+#[derive(Clone, Debug)]
+pub struct ManagedRequestStatus {
+    pub state: String,
+    pub tip: u64,
+    pub receipt: Option<ManagedRequestReceipt>,
+}
+#[derive(Clone, Debug)]
+pub enum ManagedRecoveryResult {
+    None,
+    Sql {
+        request_id: Vec<u8>,
+        result: ExecuteReturningResult,
+    },
+    Kv {
+        request_id: Vec<u8>,
+        receipt: ManagedKVReceipt,
+    },
+}
+
+#[derive(Deserialize)]
+#[serde(tag = "kind", rename_all = "lowercase", deny_unknown_fields)]
+enum ManagedRecoveryWire {
+    None,
+    Sql {
+        request_id_b64: String,
+        sql: ExecuteReturningResult,
+    },
+    Kv {
+        request_id_b64: String,
+        kv: ManagedKVReceipt,
+    },
+}
+impl ManagedRecoveryWire {
+    fn result(self) -> Result<ManagedRecoveryResult> {
+        Ok(match self {
+            Self::None => ManagedRecoveryResult::None,
+            Self::Sql {
+                request_id_b64,
+                sql,
+            } => ManagedRecoveryResult::Sql {
+                request_id: managed_base64(&request_id_b64)?,
+                result: sql,
+            },
+            Self::Kv { request_id_b64, kv } => ManagedRecoveryResult::Kv {
+                request_id: managed_base64(&request_id_b64)?,
+                receipt: kv,
+            },
+        })
+    }
+}
+
+fn managed_base64(value: &str) -> Result<Vec<u8>> {
+    let decoded = STANDARD.decode(value).map_err(internal)?;
+    if STANDARD.encode(&decoded) != value {
+        return Err(internal("noncanonical managed base64"));
+    }
+    Ok(decoded)
+}
+
 /// JSON-backed Go `rhiza.Config`. Keys are Go exported field names such as
 /// `DataDir`, `NodeID`, and `ObjStoreAccessKey`.
 pub struct Config {
@@ -421,6 +610,114 @@ impl ManagedDb {
     pub fn recover_pending(&self) -> Result<()> {
         self.call("recover_pending", json!({}))
     }
+    pub fn kv_put(
+        &self,
+        request: &ManagedKVRequest,
+    ) -> std::result::Result<ManagedKVReceipt, ManagedMutationError> {
+        self.kv_mutate("put", request)
+    }
+    pub fn kv_delete(
+        &self,
+        request: &ManagedKVRequest,
+    ) -> std::result::Result<ManagedKVReceipt, ManagedMutationError> {
+        self.kv_mutate("delete", request)
+    }
+    pub fn kv_cas(
+        &self,
+        request: &ManagedKVRequest,
+    ) -> std::result::Result<ManagedKVReceipt, ManagedMutationError> {
+        self.kv_mutate("cas", request)
+    }
+    fn kv_mutate(
+        &self,
+        operation: &str,
+        request: &ManagedKVRequest,
+    ) -> std::result::Result<ManagedKVReceipt, ManagedMutationError> {
+        self.call_detailed(&format!("kv_{operation}"), request.wire(operation))
+    }
+    pub fn kv_get(&self, key: &[u8], consistency: &str) -> Result<ManagedKVRead> {
+        #[derive(Deserialize)]
+        struct Wire {
+            found: bool,
+            value: Option<String>,
+            applied_slot: u64,
+            consensus_tip: u64,
+        }
+        let wire: Wire = self.call(
+            "kv_get",
+            json!({"key_b64":STANDARD.encode(key),"consistency":consistency}),
+        )?;
+        let value = match wire.value {
+            Some(v) => Some(managed_base64(&v)?),
+            None => None,
+        };
+        Ok(ManagedKVRead {
+            found: wire.found,
+            value: if wire.found {
+                Some(value.unwrap_or_default())
+            } else {
+                None
+            },
+            applied_slot: wire.applied_slot,
+            consensus_tip: wire.consensus_tip,
+        })
+    }
+    /// Observational status is not a durability acknowledgement or retry permit.
+    pub fn request_status(
+        &self,
+        kind: MutationKind,
+        request_id: &[u8],
+    ) -> Result<ManagedRequestStatus> {
+        #[derive(Deserialize)]
+        struct Wire {
+            state: String,
+            tip: u64,
+            receipt: Option<Value>,
+        }
+        let wire: Wire = self.call(
+            "request_status",
+            json!({"kind":kind.wire(),"request_id_b64":STANDARD.encode(request_id)}),
+        )?;
+        let receipt = wire
+            .receipt
+            .map(|value| match kind {
+                MutationKind::Sql => serde_json::from_value(value).map(ManagedRequestReceipt::Sql),
+                MutationKind::Kv => serde_json::from_value(value).map(ManagedRequestReceipt::Kv),
+            })
+            .transpose()
+            .map_err(internal)?;
+        Ok(ManagedRequestStatus {
+            state: wire.state,
+            tip: wire.tip,
+            receipt,
+        })
+    }
+    /// Resolves the authoritative retained original, never a replacement write.
+    pub fn recover_pending_detailed(
+        &self,
+    ) -> std::result::Result<ManagedRecoveryResult, ManagedMutationError> {
+        let wire: ManagedRecoveryWire =
+            self.call_detailed("recover_pending_detailed", json!({}))?;
+        wire.result().map_err(Into::into)
+    }
+    fn call_detailed<T: DeserializeOwned>(
+        &self,
+        operation: &str,
+        request: Value,
+    ) -> std::result::Result<T, ManagedMutationError> {
+        if self.closed {
+            return Err(Error {
+                code: "closed".into(),
+                message: "Rhiza managed DB is closed".into(),
+            }
+            .into());
+        }
+        native_call_detailed(
+            self.handle,
+            json!({"operation":operation,"request":request}),
+            DEFAULT_TIMEOUT_MS,
+        )
+    }
     pub fn close(&mut self) -> Result<()> {
         if self.closed {
             return Ok(());
@@ -734,16 +1031,168 @@ fn encode(value: Value) -> Result<Vec<u8>> {
     Ok(data)
 }
 fn decode<T: DeserializeOwned>(buffer: RhizaBuffer) -> Result<T> {
+    decode_detailed(buffer).map_err(ManagedMutationError::into_error)
+}
+fn decode_detailed<T: DeserializeOwned>(
+    buffer: RhizaBuffer,
+) -> std::result::Result<T, ManagedMutationError> {
     let guard = BufferGuard(buffer);
-    let mut envelope: Map<String, Value> =
-        serde_json::from_slice(unsafe { guard.bytes() }).map_err(internal)?;
+    decode_detailed_bytes(unsafe { guard.bytes() })
+}
+fn decode_detailed_bytes<T: DeserializeOwned>(
+    bytes: &[u8],
+) -> std::result::Result<T, ManagedMutationError> {
+    let mut envelope: Map<String, Value> = serde_json::from_slice(bytes).map_err(internal)?;
     match (envelope.remove("data"), envelope.remove("error")) {
-        (Some(data), None) => serde_json::from_value(data).map_err(internal),
-        (None, Some(error)) => Err(serde_json::from_value(error).map_err(internal)?),
+        (Some(data), None) => serde_json::from_value(data).map_err(|e| internal(e).into()),
+        (None, Some(value)) => {
+            let error: Error = serde_json::from_value(value.clone()).map_err(internal)?;
+            // Context is optional: malformed context must not erase the received
+            // commit_unknown classification or turn it into retry permission.
+            let context = value
+                .get("mutation_context")
+                .and_then(parse_mutation_context);
+            Err(ManagedMutationError { error, context })
+        }
         _ => Err(Error {
             code: "invalid_response".into(),
             message: "native response must contain exactly one of data or error".into(),
-        }),
+        }
+        .into()),
+    }
+}
+fn parse_mutation_context(value: &Value) -> Option<MutationContext> {
+    #[derive(Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct Wire {
+        kind: MutationKind,
+        request_id_b64: String,
+        slot: u64,
+        retry_through_slot: u64,
+    }
+    let wire: Wire = serde_json::from_value(value.clone()).ok()?;
+    let request_id = managed_base64(&wire.request_id_b64).ok()?;
+    if request_id.is_empty() || request_id.len() > 64 {
+        return None;
+    }
+    Some(MutationContext {
+        kind: wire.kind,
+        request_id,
+        slot: wire.slot,
+        retry_through_slot: wire.retry_through_slot,
+    })
+}
+
+#[cfg(test)]
+mod managed_kv_wire_tests {
+    use super::*;
+
+    #[test]
+    fn original_has_seven_lossless_fields() {
+        let request = ManagedKVRequest {
+            request_id: vec![0xff],
+            key: vec![0xfe],
+            value: Some(vec![]),
+            expected: None,
+            expected_exists: false,
+            ttl_ms: 7,
+        };
+        for operation in ["put", "delete", "cas"] {
+            let value = request.wire(operation);
+            assert_eq!(value.as_object().unwrap().len(), 7);
+            assert_eq!(value["request_id_b64"], "/w==");
+            assert_eq!(value["key_b64"], "/g==");
+            assert_eq!(value["value"], "");
+            assert!(value["expected"].is_null());
+            assert_eq!(value["expected_exists"], false);
+            assert_eq!(value["operation"], operation);
+            assert_eq!(value["ttl_ms"], 7);
+        }
+        let mut distinct = request.clone();
+        distinct.request_id = "\u{fffd}".as_bytes().to_vec();
+        assert_ne!(
+            request.wire("put")["request_id_b64"],
+            distinct.wire("put")["request_id_b64"]
+        );
+        distinct.value = None;
+        distinct.expected = Some(vec![]);
+        distinct.expected_exists = true;
+        assert!(distinct.wire("cas")["value"].is_null());
+        assert_eq!(distinct.wire("cas")["expected"], "");
+        assert_eq!(distinct.wire("cas")["expected_exists"], true);
+    }
+
+    #[test]
+    fn detailed_error_keeps_unknown_even_with_missing_or_bad_context() {
+        for context in [
+            Value::Null,
+            json!({"kind":"kv"}),
+            json!({"kind":"kv","request_id_b64":"/w","slot":0,"retry_through_slot":5}),
+        ] {
+            let raw=serde_json::to_vec(&json!({"error":{"code":"commit_unknown","message":"managed operation rejected","mutation_context":context}})).unwrap();
+            let error = decode_detailed_bytes::<Value>(&raw).unwrap_err();
+            assert_eq!(error.error().code, "commit_unknown");
+            assert!(error.mutation_context().is_none());
+            assert_eq!(error.into_error().code, "commit_unknown");
+        }
+        let raw=br#"{"error":{"code":"commit_unknown","message":"managed operation rejected","mutation_context":{"kind":"kv","request_id_b64":"/w==","slot":0,"retry_through_slot":1040}}}"#;
+        let error = decode_detailed_bytes::<Value>(raw).unwrap_err();
+        let context = error.mutation_context().unwrap();
+        assert_eq!(context.kind(), MutationKind::Kv);
+        assert_eq!(context.request_id(), &[0xff]);
+        assert_eq!(context.slot(), 0);
+        assert_eq!(context.retry_through_slot(), 1040);
+        let old =
+            decode_detailed_bytes::<Value>(br#"{"error":{"code":"closed","message":"closed"}}"#)
+                .unwrap_err();
+        assert_eq!(old.error().code, "closed");
+        assert!(old.mutation_context().is_none());
+    }
+
+    #[test]
+    fn false_receipts_and_original_recovery_results_are_explicit() {
+        let receipt =
+            json!({"slot":17,"status":"committed","applied":false,"retry_through_slot":900});
+        let decoded: ManagedKVReceipt = serde_json::from_value(receipt.clone()).unwrap();
+        decoded.require_committed().unwrap();
+        assert!(!decoded.applied);
+        let mut missing = receipt.clone();
+        missing.as_object_mut().unwrap().remove("applied");
+        assert!(serde_json::from_value::<ManagedKVReceipt>(missing).is_err());
+        let raw =
+            serde_json::to_vec(&json!({"data":{"kind":"kv","request_id_b64":"/w==","kv":receipt}}))
+                .unwrap();
+        let wire: ManagedRecoveryWire = decode_detailed_bytes(&raw).unwrap();
+        match wire.result().unwrap() {
+            ManagedRecoveryResult::Kv {
+                request_id,
+                receipt,
+            } => {
+                assert_eq!(request_id, vec![0xff]);
+                assert!(!receipt.applied);
+                assert_eq!(receipt.slot, 17)
+            }
+            _ => panic!("wrong original kind"),
+        }
+        let raw=br#"{"data":{"kind":"sql","request_id_b64":"c3FsLWlk","sql":{"slot":18,"status":"committed","statements":[{"columns":["value"],"rows":[[123]]}]}}}"#;
+        let wire: ManagedRecoveryWire = decode_detailed_bytes(raw).unwrap();
+        match wire.result().unwrap() {
+            ManagedRecoveryResult::Sql { request_id, result } => {
+                assert_eq!(request_id, b"sql-id");
+                assert_eq!(result.statements[0].rows[0][0], 123)
+            }
+            _ => panic!("SQL result lost"),
+        }
+        let wire: ManagedRecoveryWire =
+            decode_detailed_bytes(br#"{"data":{"kind":"none"}}"#).unwrap();
+        assert!(matches!(
+            wire.result().unwrap(),
+            ManagedRecoveryResult::None
+        ));
+        assert!(decode_detailed_bytes::<Value>(
+            br#"{"data":null,"error":{"code":"x","message":"x"}}"#
+        )
+        .is_err());
     }
 }
 fn native_open(value: Value) -> Result<Value> {
@@ -777,8 +1226,17 @@ fn native_start_operator(handle: u64, address: &str) -> Result<String> {
         })
 }
 fn native_call<T: DeserializeOwned>(handle: u64, value: Value, timeout_ms: u64) -> Result<T> {
+    native_call_detailed(handle, value, timeout_ms).map_err(ManagedMutationError::into_error)
+}
+fn native_call_detailed<T: DeserializeOwned>(
+    handle: u64,
+    value: Value,
+    timeout_ms: u64,
+) -> std::result::Result<T, ManagedMutationError> {
     let mut input = encode(value)?;
-    decode(unsafe { RhizaCall(handle, input.as_mut_ptr().cast(), input.len(), timeout_ms) })
+    decode_detailed(unsafe {
+        RhizaCall(handle, input.as_mut_ptr().cast(), input.len(), timeout_ms)
+    })
 }
 fn native_close(handle: u64) -> Result<()> {
     decode(unsafe { RhizaClose(handle) })

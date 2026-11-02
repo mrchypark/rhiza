@@ -5,14 +5,18 @@ package main
 import (
 	"bytes"
 	"context"
+	"encoding/base64"
+	"encoding/json"
 	"errors"
 	"math"
 	"os"
 	"sync"
 	"time"
 
+	"github.com/mrchypark/rhiza/internal/types"
 	"github.com/mrchypark/rhiza/pkg/managedbootstrap"
 	"github.com/mrchypark/rhiza/pkg/managedsql"
+	"github.com/mrchypark/rhiza/pkg/network"
 	"github.com/mrchypark/rhiza/pkg/operator"
 )
 
@@ -158,7 +162,155 @@ func dispatchManaged(ctx context.Context, entry *ffiEntry, call callEnvelope) (a
 			return nil, err
 		}
 		return nil, entry.managed.RecoverPending(ctx)
+	case "recover_pending_detailed":
+		if err := decode(&struct{}{}); err != nil {
+			return nil, err
+		}
+		result, err := entry.managed.RecoverPendingDetailed(ctx)
+		if err != nil {
+			return nil, err
+		}
+		return managedRecoveryWire(result)
+	case "kv_put", "kv_delete", "kv_cas":
+		operation, request, err := decodeManagedKVMutation(call.Operation, call.Request)
+		if err != nil {
+			return nil, err
+		}
+		result, err := entry.managed.KVMutate(ctx, operation, request)
+		if err != nil {
+			return nil, err
+		}
+		return managedKVReceiptWire(result.MutationReceipt), nil
+	case "kv_get":
+		var wire struct {
+			Key         *string `json:"key_b64"`
+			Consistency *string `json:"consistency"`
+		}
+		if err := decode(&wire); err != nil {
+			return nil, err
+		}
+		key, err := managedRawBytes(wire.Key, 1024)
+		if err != nil || wire.Consistency == nil || (*wire.Consistency != "local" && *wire.Consistency != "linearizable") {
+			return nil, invalidManagedKVRequest()
+		}
+		result, err := entry.managed.KVGet(ctx, network.KVGetRequest{Key: string(key), Consistency: *wire.Consistency})
+		if err != nil {
+			return nil, err
+		}
+		return managedKVGetWire(result), nil
+	case "request_status":
+		var wire struct {
+			Kind      string  `json:"kind"`
+			RequestID *string `json:"request_id_b64"`
+		}
+		if err := decode(&wire); err != nil {
+			return nil, err
+		}
+		id, err := managedRawBytes(wire.RequestID, 64)
+		if err != nil || (wire.Kind != "sql" && wire.Kind != "kv") {
+			return nil, invalidManagedKVRequest()
+		}
+		result, err := entry.managed.RequestStatus(ctx, network.RequestStatusRequest{Kind: wire.Kind, RequestID: string(id)})
+		if err != nil {
+			return nil, err
+		}
+		return managedStatusWire(wire.Kind, result), nil
 	default:
 		return nil, &ffiError{Code: "invalid_request", Message: "operation unavailable on managed SQL handle"}
 	}
+}
+
+func invalidManagedKVRequest() error {
+	return &ffiError{Code: "invalid_request", Message: "invalid managed request"}
+}
+
+func managedRawBytes(value *string, limit int) ([]byte, error) {
+	if value == nil || len(*value) > base64.StdEncoding.EncodedLen(limit) {
+		return nil, invalidManagedKVRequest()
+	}
+	decoded, err := base64.StdEncoding.Strict().DecodeString(*value)
+	if err != nil || len(decoded) == 0 || len(decoded) > limit || base64.StdEncoding.EncodeToString(decoded) != *value {
+		return nil, invalidManagedKVRequest()
+	}
+	return decoded, nil
+}
+
+func decodeManagedKVMutation(outer string, raw json.RawMessage) (string, network.KVMutationRequest, error) {
+	// This must consume original bytes before a generic decoder can discard
+	// duplicate/missing fields or normalize a raw-byte identity.
+	command, err := types.DecodeManagedKVOriginal(raw)
+	if err != nil || outer != "kv_"+command.Operation {
+		return "", network.KVMutationRequest{}, invalidManagedKVRequest()
+	}
+	return command.Operation, network.KVMutationRequest{RequestID: command.RequestID, Key: command.Key, Value: command.Value, Expected: command.Expected, ExpectedExists: command.ExpectedExists, TTLMS: command.TTLMS}, nil
+}
+
+type managedKVReceipt struct {
+	Slot             uint64               `json:"slot"`
+	Status           types.MutationStatus `json:"status"`
+	Applied          bool                 `json:"applied"`
+	ErrorCode        string               `json:"error_code,omitempty"`
+	RetryThroughSlot uint64               `json:"retry_through_slot"`
+}
+
+func managedKVReceiptWire(receipt types.MutationReceipt) managedKVReceipt {
+	return managedKVReceipt{receipt.Slot, receipt.Status, receipt.Applied, receipt.ErrorCode, receipt.RetryThroughSlot}
+}
+
+type managedKVRead struct {
+	Found        bool   `json:"found"`
+	Value        []byte `json:"value"`
+	AppliedSlot  uint64 `json:"applied_slot"`
+	ConsensusTip uint64 `json:"consensus_tip"`
+}
+
+func managedKVGetWire(result network.KVGetResponse) managedKVRead {
+	// Found is authoritative: present nil/empty storage is logical empty bytes,
+	// not absence. Original mutation intent still retains nil versus empty.
+	var value []byte
+	if result.Found {
+		value = append([]byte{}, result.Value...)
+	}
+	return managedKVRead{result.Found, value, result.AppliedSlot, result.ConsensusTip}
+}
+
+func managedStatusWire(kind string, result network.RequestStatusResponse) any {
+	var receipt any
+	if result.Receipt != nil {
+		if kind == "kv" {
+			receipt = managedKVReceiptWire(*result.Receipt)
+		} else {
+			receipt = result.Receipt
+		}
+	}
+	return struct {
+		State   string `json:"state"`
+		Tip     uint64 `json:"tip"`
+		Receipt any    `json:"receipt,omitempty"`
+	}{result.State, result.Tip, receipt}
+}
+
+func managedRecoveryWire(result managedsql.RecoveryResult) (any, error) {
+	if result.Kind == "" && result.SQL == nil && result.KV == nil && len(result.RequestID) == 0 {
+		return struct {
+			Kind string `json:"kind"`
+		}{"none"}, nil
+	}
+	var sql *managedsql.ExecuteResponse
+	var kv *managedKVReceipt
+	switch {
+	case result.Kind == "sql" && result.SQL != nil && result.KV == nil && len(result.RequestID) > 0:
+		sql = result.SQL
+	case result.Kind == "kv" && result.KV != nil && result.SQL == nil && len(result.RequestID) > 0:
+		receipt := managedKVReceiptWire(result.KV.MutationReceipt)
+		kv = &receipt
+	default:
+		return nil, &ffiError{Code: "internal", Message: "invalid managed recovery result"}
+	}
+	return struct {
+		Kind      string                      `json:"kind"`
+		RequestID []byte                      `json:"request_id_b64"`
+		SQL       *managedsql.ExecuteResponse `json:"sql,omitempty"`
+		KV        *managedKVReceipt           `json:"kv,omitempty"`
+	}{result.Kind, result.RequestID, sql, kv}, nil
 }

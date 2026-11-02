@@ -71,8 +71,16 @@ type ffiEnvelope struct {
 }
 
 type ffiError struct {
-	Code    string `json:"code"`
-	Message string `json:"message"`
+	Code            string              `json:"code"`
+	Message         string              `json:"message"`
+	MutationContext *ffiMutationContext `json:"mutation_context,omitempty"`
+}
+
+type ffiMutationContext struct {
+	Kind             string `json:"kind"`
+	RequestID        []byte `json:"request_id_b64"`
+	Slot             uint64 `json:"slot"`
+	RetryThroughSlot uint64 `json:"retry_through_slot"`
 }
 
 func (e *ffiError) Error() string { return e.Message }
@@ -268,7 +276,7 @@ func goCall(handle uint64, input []byte, timeoutMS uint64) []byte {
 			if errors.As(err, &typed) {
 				return errorJSON(typed)
 			}
-			return marshalError(errorCode(err), "managed operation rejected")
+			return marshalFFIError(managedError(err))
 		}
 		var syntax *json.SyntaxError
 		var typeError *json.UnmarshalTypeError
@@ -633,12 +641,22 @@ func dataJSON(value any) []byte {
 func errorJSON(err error) []byte {
 	var typed *ffiError
 	if errors.As(err, &typed) {
-		return marshalError(typed.Code, typed.Message)
+		return marshalFFIError(typed)
 	}
 	return marshalError(errorCode(err), err.Error())
 }
 func marshalError(code, message string) []byte {
-	b, err := json.Marshal(ffiEnvelope{Error: &ffiError{Code: code, Message: message}})
+	return marshalFFIError(&ffiError{Code: code, Message: message})
+}
+func managedError(err error) *ffiError {
+	result := &ffiError{Code: errorCode(err), Message: "managed operation rejected"}
+	if captured, ok := managedsql.MutationErrorContext(err); ok {
+		result.MutationContext = &ffiMutationContext{Kind: captured.Kind, RequestID: bytes.Clone(captured.RequestID), Slot: captured.Slot, RetryThroughSlot: captured.RetryThroughSlot}
+	}
+	return result
+}
+func marshalFFIError(value *ffiError) []byte {
+	b, err := json.Marshal(ffiEnvelope{Error: value})
 	if err != nil {
 		return []byte(`{"error":{"code":"internal","message":"encode error"}}`)
 	}
@@ -648,6 +666,12 @@ func errorCode(err error) string {
 	switch {
 	case errors.Is(err, rhiza.ErrCommitUnknown):
 		return "commit_unknown"
+	case errors.Is(err, managedsql.ErrKVNotSubmitted):
+		var pre *managedsql.KVNotSubmittedError
+		if errors.As(err, &pre) && pre.RecoveryRequired {
+			return "kv_recovery_required"
+		}
+		return "kv_not_submitted"
 	case errors.Is(err, managedsql.ErrSQLNotSubmitted):
 		var pre *managedsql.SQLNotSubmittedError
 		if errors.As(err, &pre) && pre.RecoveryRequired {
