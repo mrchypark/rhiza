@@ -56,6 +56,9 @@ cleanup() {
 		[[ -f $log ]] || continue
 		cp "$log" "$(dirname "$output_file")/$output_stem-$(basename "$log")"
 	done
+	if [[ -f $run_dir/fault-metadata.txt ]]; then
+		cp "$run_dir/fault-metadata.txt" "$(dirname "$output_file")/$output_stem-fault-metadata.txt"
+	fi
 	for pid_file in "$run_dir"/node-*.pid; do
 		[[ -f $pid_file ]] || continue
 		pid=$(<"$pid_file")
@@ -160,7 +163,9 @@ if [[ $failed_node != none ]]; then
 	fi
 	failed_index=${failed_node#n}
 	failed_pid=$(<"$run_dir/node-$failed_index.pid")
+	printf 'target=%s\npid=%s\nsignal=SIGKILL\nbefore=%s\n' "$failed_node" "$failed_pid" "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" > "$run_dir/fault-metadata.txt"
 	kill -KILL "$failed_pid"
+	printf 'after=%s\n' "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" >> "$run_dir/fault-metadata.txt"
 	wait "$failed_pid" 2>/dev/null || true
 fi
 wait "$bench_pid"

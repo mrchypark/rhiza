@@ -16,6 +16,7 @@ import (
 	"path/filepath"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"time"
 
 	"github.com/mrchypark/rhiza/internal/localtesthooks"
@@ -29,6 +30,7 @@ import (
 	"github.com/mrchypark/rhiza/pkg/qlog"
 	"github.com/mrchypark/rhiza/pkg/quepaxa"
 	"github.com/mrchypark/rhiza/pkg/recovery"
+	sqlite3 "github.com/ncruces/go-sqlite3"
 )
 
 // Node is the main runtime container.
@@ -1928,6 +1930,13 @@ func quarantineSQLite(path string) error {
 }
 
 func (n *Node) replayLocalDecisions(ctx context.Context) error {
+	_, err := n.replayLocalDecisionsFrom(ctx)
+	return err
+}
+
+// The diagnostic variant retains the exact failed local replay page under the
+// same replay owner; callers must not reconstruct it from a later live tip.
+func (n *Node) replayLocalDecisionsFrom(ctx context.Context) (quepaxa.Slot, error) {
 	// Archive catch-up and checkpoint verification can both request local
 	// replay. Keep the tip read, decision selection, apply, and restore-suffix
 	// state transition under one owner so neither path races or replays stale
@@ -1938,21 +1947,21 @@ func (n *Node) replayLocalDecisions(ctx context.Context) error {
 		from := quepaxa.Slot(n.material.Tip() + 1)
 		decisions, tip, err := n.core.DecisionsFrom(from, 256)
 		if err != nil {
-			return err
+			return from, err
 		}
 		if n.localRestoreSuffixPending && localRestoreSuffixCrashBoundary != nil {
 			for _, decision := range decisions {
 				if err := n.material.ApplyBatch(ctx, []quepaxa.DecidedValue{decision}); err != nil {
-					return err
+					return decision.Slot, err
 				}
 				localRestoreSuffixCrashBoundary(uint64(decision.Slot))
 			}
 		} else if err := n.material.ApplyBatch(ctx, decisions); err != nil {
-			return err
+			return from, err
 		}
 		if quepaxa.Slot(n.material.Tip()) >= tip {
 			n.localRestoreSuffixPending = false
-			return nil
+			return 0, nil
 		}
 	}
 }
@@ -2013,14 +2022,11 @@ func (n *Node) startCatchUp(ctx context.Context, transport *network.Transport, c
 		if !n.ready.Load() {
 			n.observeCatchUp(n.catchUpMembership(ctx, transport, cluster))
 		} else if sources := syncSources(n.config.NodeID, cluster.Members, round); len(sources) > 0 {
-			var syncErr error
-			for _, source := range sources {
-				if syncErr = n.catchUpPeer(ctx, transport, source); syncErr == nil {
-					break
-				}
-			}
+			attempts, syncErr := runOperationSyncRound(sources, func(source quepaxa.NodeID) error {
+				return n.catchUpPeer(ctx, transport, source)
+			}, n.material.Tip)
 			if syncErr != nil {
-				log.Printf("operation sync deferred: %v", syncErr)
+				logOperationSyncFailure(n.config.NodeID, round, attempts, log.Print)
 			}
 			// A compacted peer can force checkpoint recovery from catchUpPeer.
 			// Only a fresh quorum round may make that node ready again.
@@ -2029,6 +2035,127 @@ func (n *Node) startCatchUp(ctx context.Context, transport *network.Transport, c
 			}
 		}
 		round++
+	}
+}
+
+type catchUpDiagnosticError struct {
+	stage           string
+	from, remoteTip quepaxa.Slot
+	remoteTipKnown  bool
+	cause           error
+}
+
+func (e *catchUpDiagnosticError) Error() string {
+	return fmt.Sprintf("catch-up stage=%s from=%d remote_tip_known=%t remote_tip=%d: %v", e.stage, e.from, e.remoteTipKnown, e.remoteTip, e.cause)
+}
+func (e *catchUpDiagnosticError) Unwrap() error { return e.cause }
+
+type catchUpAttempt struct {
+	source           quepaxa.NodeID
+	startTip, endTip uint64
+	elapsed          time.Duration
+	err              error
+}
+
+// This is the existing sequential loop: no retry, shared cursor or new policy.
+func runOperationSyncRound(sources []quepaxa.NodeID, attempt func(quepaxa.NodeID) error, tip func() uint64) ([]catchUpAttempt, error) {
+	var attempts []catchUpAttempt
+	var last error
+	for _, source := range sources {
+		startTip, started := tip(), time.Now()
+		last = attempt(source)
+		if last == nil {
+			return nil, nil
+		}
+		attempts = append(attempts, catchUpAttempt{source: source, startTip: startTip, endTip: tip(), elapsed: time.Since(started), err: last})
+	}
+	return attempts, last
+}
+
+func catchUpErrorClass(err error) string {
+	switch {
+	case errors.Is(err, context.Canceled):
+		return "canceled"
+	case errors.Is(err, context.DeadlineExceeded):
+		return "deadline"
+	case errors.Is(err, quepaxa.ErrCompacted):
+		return "compacted"
+	case errors.Is(err, quepaxa.ErrQuorumUnavailable):
+		return "quorum"
+	case errors.Is(err, sqlpolicy.ErrIncompatible):
+		return "policy"
+	default:
+		var sqlite sqlite3.ExtendedErrorCode
+		var path *os.PathError
+		switch {
+		case errors.As(err, &sqlite):
+			return "sqlite"
+		case errors.As(err, &path):
+			return "filesystem"
+		case errors.Is(err, network.ErrOverloaded):
+			return "overloaded"
+		case errors.Is(err, network.ErrInvalidRequest):
+			return "invalid-request"
+		default:
+			return "unknown"
+		}
+	}
+}
+
+func catchUpCauseCode(err error) (code, extended int, known bool, fileOp string) {
+	var sqlite sqlite3.ExtendedErrorCode
+	if errors.As(err, &sqlite) {
+		return int(sqlite.Code()), int(sqlite), true, "none"
+	}
+	var path *os.PathError
+	if errors.As(err, &path) {
+		fileOp = "unknown"
+		switch path.Op {
+		case "open", "read", "write", "close", "rename", "remove", "stat", "lstat", "mkdir", "sync":
+			fileOp = path.Op
+		}
+		var errno syscall.Errno
+		if errors.As(path.Err, &errno) {
+			return int(errno), 0, true, fileOp
+		}
+		return 0, 0, false, fileOp
+	}
+	return 0, 0, false, "none"
+}
+
+func logOperationSyncFailure(local quepaxa.NodeID, round uint64, attempts []catchUpAttempt, emit func(...any)) {
+	for i, attempt := range attempts {
+		stage, from, remoteTip, known := "unknown", quepaxa.Slot(0), quepaxa.Slot(0), false
+		var failure *catchUpDiagnosticError
+		if errors.As(attempt.err, &failure) {
+			switch failure.stage {
+			case "local-replay", "fetch", "restore-archive", "validate", "accept", "apply":
+				stage = failure.stage
+			}
+			from, remoteTip, known = failure.from, failure.remoteTip, failure.remoteTipKnown
+		}
+		rpc := network.PeerRPCDiagnostic{Phase: "unknown"}
+		rpcKnown := false
+		var transport interface {
+			RPCDiagnostic() network.PeerRPCDiagnostic
+		}
+		if errors.As(attempt.err, &transport) {
+			rpcKnown = true
+			rpc = transport.RPCDiagnostic()
+			switch rpc.Phase {
+			case "connection-gate", "peer-identity", "dial", "handshake", "stream-open", "request-write", "request-close", "response-read", "response-decode", "response-code":
+			default:
+				rpc.Phase = "unknown"
+			}
+		}
+		// One bounded record per source, emitted ONLY for the existing all-failed
+		// event. Ordinary clusters have no 64-member bound; never truncate peers.
+		class := catchUpErrorClass(attempt.err)
+		code, extended, codeKnown, fileOp := 0, 0, false, "none"
+		if class == "sqlite" || class == "filesystem" {
+			code, extended, codeKnown, fileOp = catchUpCauseCode(attempt.err)
+		}
+		emit(fmt.Sprintf("operation sync deferred: error_class=%s error_code_known=%t error_code=%d error_extended=%d file_op=%s node_hash=%x round=%d attempt=%d count=%d source_hash=%x start_tip=%d end_tip=%d elapsed_us=%d stage=%s from=%d remote_tip_known=%t remote_tip=%d rpc_known=%t rpc_phase=%s rpc_elapsed_us=%d connection_known=%t connection_us=%d request_known=%t request_us=%d rpc_total_known=%t rpc_total_us=%d gate_wait_known=%t gate_wait_us=%d mutex_wait_known=%t mutex_wait_us=%d dial_measured=%t dial_us=%d dial_deadline_known=%t dial_remaining_us=%d", class, codeKnown, code, extended, fileOp, sha256.Sum256([]byte(local)), round, i+1, len(attempts), sha256.Sum256([]byte(attempt.source)), attempt.startTip, attempt.endTip, attempt.elapsed.Microseconds(), stage, from, known, remoteTip, rpcKnown, rpc.Phase, rpc.Elapsed.Microseconds(), rpc.ConnectionKnown, rpc.ConnectionElapsed.Microseconds(), rpc.RequestKnown, rpc.RequestElapsed.Microseconds(), rpc.TotalKnown, rpc.TotalElapsed.Microseconds(), rpc.GateWaitKnown, rpc.GateWait.Microseconds(), rpc.MutexWaitKnown, rpc.MutexWait.Microseconds(), rpc.DialMeasured, rpc.DialElapsed.Microseconds(), rpc.DialDeadlineKnown, rpc.DialRemaining.Microseconds()))
 	}
 }
 
@@ -2180,17 +2307,28 @@ func (n *Node) catchUpQuorum(ctx context.Context, transport *network.Transport, 
 	}
 }
 
-func (n *Node) catchUpPeer(ctx context.Context, transport *network.Transport, source quepaxa.NodeID) error {
+func (n *Node) catchUpPeer(ctx context.Context, transport *network.Transport, source quepaxa.NodeID) (result error) {
+	stage, from := "local-replay", quepaxa.Slot(0)
+	var remoteTip quepaxa.Slot
+	var remoteTipKnown bool
+	defer func() {
+		if result != nil {
+			result = &catchUpDiagnosticError{stage: stage, from: from, remoteTip: remoteTip, remoteTipKnown: remoteTipKnown, cause: result}
+		}
+	}()
 	for {
-		if err := n.replayLocalDecisions(ctx); err != nil {
+		stage, from, remoteTip, remoteTipKnown = "local-replay", quepaxa.Slot(n.material.Tip())+1, 0, false
+		if replayFrom, err := n.replayLocalDecisionsFrom(ctx); err != nil {
+			from = replayFrom
 			return err
 		}
-		from := quepaxa.Slot(n.material.Tip()) + 1
+		stage, from = "fetch", quepaxa.Slot(n.material.Tip())+1
 		pageCtx, cancel := context.WithTimeout(ctx, 250*time.Millisecond)
 		response, err := transport.FetchDecisions(pageCtx, source, from, 128)
 		cancel()
 		if err != nil {
 			if errors.Is(err, quepaxa.ErrCompacted) {
+				stage = "restore-archive"
 				if err := n.restoreArchiveCatchUp(ctx); err != nil {
 					return err
 				}
@@ -2198,9 +2336,11 @@ func (n *Node) catchUpPeer(ctx context.Context, transport *network.Transport, so
 			}
 			return err
 		}
+		remoteTip, remoteTipKnown = response.Tip, true
 		if response.Tip < from {
 			return nil
 		}
+		stage = "validate"
 		if len(response.Decisions) == 0 || response.Decisions[0].Slot != from {
 			return fmt.Errorf("operation sync source %s omitted slot %d", source, from)
 		}
@@ -2212,9 +2352,11 @@ func (n *Node) catchUpPeer(ctx context.Context, transport *network.Transport, so
 		if localtesthooks.Enabled {
 			localtesthooks.Hit(fmt.Sprintf("node:catchup-peer:phase=before-accept:node=%s:source=%s:from=%d:tip=%d", n.core.NodeID(), source, from, response.Tip))
 		}
+		stage = "accept"
 		if err := n.core.AcceptCertifiedValues(response.Decisions); err != nil {
 			return err
 		}
+		stage = "apply"
 		if err := n.material.ApplyBatch(ctx, response.Decisions); err != nil {
 			return err
 		}
