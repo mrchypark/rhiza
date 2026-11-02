@@ -23,6 +23,9 @@ import (
 const managedApplicationPolicy = "application-prune-raw-state/v1"
 
 func policyForProtocol(protocol string) sqlpolicy.MaterializationPolicy {
+	if protocol == sqlpolicy.ManagedRequestApplicationProtocol {
+		return sqlpolicy.ManagedRequestMaterializationPolicy
+	}
 	if protocol == types.ManagedApplicationProtocolSQLKV {
 		return sqlpolicy.ManagedSQLKVMaterializationPolicy
 	}
@@ -153,6 +156,12 @@ func (m *Materializer) managedCheckpointFilesAt(ctx context.Context) ([]Checkpoi
 		cleanup()
 		return nil, 0, nil, err
 	}
+	if m.materializationPolicy == sqlpolicy.ManagedRequestMaterializationPolicy {
+		if _, _, err := inspectApplicationFile(ctx, path, m.idempotencyWindow, m.managedProtocol); err != nil {
+			cleanup()
+			return nil, 0, nil, err
+		}
+	}
 	return []CheckpointFile{{Role: CheckpointSQLite, Path: path}}, snapshot.index, cleanup, nil
 }
 
@@ -169,7 +178,7 @@ func (m *Materializer) restoreManagedCheckpoint(ctx context.Context, files []Che
 	if err := sqlpolicy.CheckSnapshotFileForPolicy(ctx, files[0].Path, m.materializationPolicy); err != nil {
 		return err
 	}
-	if _, _, err := inspectApplicationFile(ctx, files[0].Path, m.idempotencyWindow); err != nil {
+	if _, _, err := inspectApplicationFile(ctx, files[0].Path, m.idempotencyWindow, m.managedProtocol); err != nil {
 		return err
 	}
 	return m.restoreParts(ctx, snapshotParts{sqlitePath: files[0].Path})
@@ -243,12 +252,12 @@ func checkManagedPolicy(ctx context.Context, reader policyReader, protocol strin
 		}
 		return fmt.Errorf("managed application policy requires explicit mixed open")
 	}
-	if err != nil || stored != types.ManagedApplicationProtocolSQLKV || stored != protocol {
+	if err != nil || (protocol != types.ManagedApplicationProtocolSQLKV && protocol != sqlpolicy.ManagedRequestApplicationProtocol) || stored != protocol {
 		return fmt.Errorf("missing or incompatible managed application protocol")
 	}
 	for _, item := range []struct{ key, want string }{
 		{"managed_application_policy", managedApplicationPolicy},
-		{"sql_execution_policy", strconv.Itoa(int(sqlpolicy.ManagedSQLKVMaterializationPolicy))},
+		{"sql_execution_policy", strconv.Itoa(int(policyForProtocol(protocol)))},
 		{"sql_idempotency_window", strconv.FormatUint(window, 10)},
 	} {
 		if err := reader.QueryRowContext(ctx, `SELECT value FROM _rhiza_meta WHERE key=?`, item.key).Scan(&stored); err != nil || stored != item.want {
@@ -342,7 +351,7 @@ func (m *Materializer) InspectManagedApplicationState(ctx context.Context) (Mana
 	if m.writer == nil {
 		return ManagedApplicationState{}, sql.ErrConnDone
 	}
-	if m.managedProtocol != types.ManagedApplicationProtocolSQLKV {
+	if m.managedProtocol != types.ManagedApplicationProtocolSQLKV && m.managedProtocol != sqlpolicy.ManagedRequestApplicationProtocol {
 		return ManagedApplicationState{}, fmt.Errorf("mixed materialization not selected")
 	}
 	if err := m.sqlReceiptReadLocked(); err != nil {
@@ -355,7 +364,7 @@ func (m *Materializer) InspectManagedApplicationState(ctx context.Context) (Mana
 	if err != nil {
 		return ManagedApplicationState{}, err
 	}
-	state, err := inspectApplicationTransaction(ctx, tx, m.stateTip, m.idempotencyWindow)
+	state, err := inspectApplicationTransaction(ctx, tx, m.stateTip, m.idempotencyWindow, m.managedProtocol)
 	return ManagedApplicationState(state), err
 }
 
@@ -372,7 +381,7 @@ func InspectManagedApplicationFile(ctx context.Context, path string, window uint
 	return ManagedApplicationState(state), tip, err
 }
 
-func validateManagedReceipts(ctx context.Context, tx *sql.Tx, tip, window uint64) error {
+func validateManagedReceipts(ctx context.Context, tx *sql.Tx, tip, window uint64, protocols ...string) error {
 	var appliedText, stateText, hashText string
 	if err := tx.QueryRowContext(ctx, `SELECT (SELECT value FROM _rhiza_meta WHERE key='applied_slot'),(SELECT value FROM _rhiza_meta WHERE key='state_slot'),(SELECT value FROM _rhiza_meta WHERE key='applied_hash')`).Scan(&appliedText, &stateText, &hashText); err != nil {
 		return err
@@ -384,7 +393,11 @@ func validateManagedReceipts(ctx context.Context, tx *sql.Tx, tip, window uint64
 		return fmt.Errorf("invalid mixed snapshot position")
 	}
 	var unknown int
-	if err := tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM _rhiza_meta WHERE key NOT IN ('managed_application_protocol','managed_application_policy','sql_execution_policy','sql_idempotency_window','sql_receipt_result_bytes','sql_receipt_count','applied_slot','state_slot','applied_hash')`).Scan(&unknown); err != nil {
+	query := `SELECT COUNT(*) FROM _rhiza_meta WHERE key NOT IN ('managed_application_protocol','managed_application_policy','sql_execution_policy','sql_idempotency_window','sql_receipt_result_bytes','sql_receipt_count','applied_slot','state_slot','applied_hash')`
+	if len(protocols) > 0 && protocols[0] == sqlpolicy.ManagedRequestApplicationProtocol {
+		query += ` AND key!='request_original_bytes'`
+	}
+	if err := tx.QueryRowContext(ctx, query).Scan(&unknown); err != nil {
 		return err
 	}
 	if unknown != 0 {

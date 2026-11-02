@@ -68,7 +68,7 @@ func InspectSQLApplicationFile(ctx context.Context, dbPath string) (state SQLApp
 	return inspectApplicationFile(ctx, dbPath, 0)
 }
 
-func inspectApplicationFile(ctx context.Context, dbPath string, mixedWindow uint64) (state SQLApplicationState, appliedTip uint64, resultErr error) {
+func inspectApplicationFile(ctx context.Context, dbPath string, mixedWindow uint64, protocols ...string) (state SQLApplicationState, appliedTip uint64, resultErr error) {
 	absolute, err := filepath.Abs(dbPath)
 	if err != nil {
 		return state, 0, err
@@ -103,6 +103,9 @@ func inspectApplicationFile(ctx context.Context, dbPath string, mixedWindow uint
 	protocol := ""
 	if mixedWindow != 0 {
 		protocol = types.ManagedApplicationProtocolSQLKV
+		if len(protocols) > 0 {
+			protocol = protocols[0]
+		}
 	}
 	if err := checkManagedPolicy(ctx, tx, protocol, mixedWindow); err != nil {
 		return state, 0, err
@@ -129,7 +132,7 @@ func inspectApplicationFile(ctx context.Context, dbPath string, mixedWindow uint
 	if err != nil || stateTip > appliedTip {
 		return state, 0, fmt.Errorf("invalid SQL state tip")
 	}
-	state, err = inspectApplicationTransaction(ctx, tx, stateTip, mixedWindow)
+	state, err = inspectApplicationTransaction(ctx, tx, stateTip, mixedWindow, protocol)
 	return state, appliedTip, err
 }
 
@@ -164,14 +167,23 @@ func inspectSQLApplicationTransaction(ctx context.Context, tx *sql.Tx, stateTip 
 	return inspectApplicationTransaction(ctx, tx, stateTip, 0)
 }
 
-func inspectApplicationTransaction(ctx context.Context, tx *sql.Tx, stateTip, mixedWindow uint64) (state SQLApplicationState, resultErr error) {
+func inspectApplicationTransaction(ctx context.Context, tx *sql.Tx, stateTip, mixedWindow uint64, protocols ...string) (state SQLApplicationState, resultErr error) {
 	defer tx.Rollback()
+	protocol := types.ManagedApplicationProtocolSQLKV
+	if len(protocols) > 0 {
+		protocol = protocols[0]
+	}
 	if mixedWindow != 0 {
-		if err := checkManagedPolicy(ctx, tx, types.ManagedApplicationProtocolSQLKV, mixedWindow); err != nil {
+		if err := checkManagedPolicy(ctx, tx, protocol, mixedWindow); err != nil {
 			return state, err
 		}
-		if err := validateManagedReceipts(ctx, tx, stateTip, mixedWindow); err != nil {
+		if err := validateManagedReceipts(ctx, tx, stateTip, mixedWindow, protocol); err != nil {
 			return state, err
+		}
+		if protocol == sqlpolicy.ManagedRequestApplicationProtocol {
+			if err := validateRequestOriginals(ctx, tx, stateTip, mixedWindow); err != nil {
+				return state, err
+			}
 		}
 	}
 	// Keep canonical sorting on disk, not in a total-database-sized Go slice.
@@ -216,6 +228,9 @@ func inspectApplicationTransaction(ctx context.Context, tx *sql.Tx, stateTip, mi
 		"_rhiza_migrations":       `CREATE TABLE _rhiza_migrations ( version INTEGER PRIMARY KEY CHECK(version > 0), name TEXT NOT NULL, checksum TEXT NOT NULL CHECK(length(checksum) = 64) ) STRICT`,
 		"_rhiza_kv_expiry":        `CREATE INDEX _rhiza_kv_expiry ON _rhiza_kv(expires_at_unix_ms) WHERE expires_at_unix_ms > 0`,
 		"_rhiza_idempotency_slot": `CREATE INDEX _rhiza_idempotency_slot ON _rhiza_idempotency(commit_slot)`,
+	}
+	if protocol == sqlpolicy.ManagedRequestApplicationProtocol && mixedWindow != 0 {
+		internal["_rhiza_request_original"] = strings.Join(strings.Fields(strings.Replace(requestOriginalDDL, "IF NOT EXISTS ", "", 1)), " ")
 	}
 	objectCount := 0
 	for rows.Next() {
@@ -267,7 +282,11 @@ func inspectApplicationTransaction(ctx context.Context, tx *sql.Tx, stateTip, mi
 	if mixedWindow != 0 {
 		// These are application data, not all of _rhiza_meta: control-slot tip
 		// and hash advancement must not change mixed application evidence.
-		for _, name := range []string{"_rhiza_kv", "_rhiza_idempotency"} {
+		tables := []string{"_rhiza_kv", "_rhiza_idempotency"}
+		if protocol == sqlpolicy.ManagedRequestApplicationProtocol {
+			tables = append(tables, "_rhiza_request_original")
+		}
+		for _, name := range tables {
 			o := sqlEvidenceObject{Type: "table", Name: name, Table: name}
 			metadata, err := applicationObjectMetadata(o, true)
 			if err != nil {
@@ -285,7 +304,7 @@ func inspectApplicationTransaction(ctx context.Context, tx *sql.Tx, stateTip, mi
 		if _, err := insertObject.ExecContext(ctx, objectCount, metadata, "policy", "mixed-policy"); err != nil {
 			return state, err
 		}
-		for _, value := range []string{types.ManagedApplicationProtocolSQLKV, managedApplicationPolicy, strconv.Itoa(int(sqlpolicy.ManagedSQLKVMaterializationPolicy)), strconv.FormatUint(mixedWindow, 10)} {
+		for _, value := range []string{protocol, managedApplicationPolicy, strconv.Itoa(int(policyForProtocol(protocol))), strconv.FormatUint(mixedWindow, 10)} {
 			if _, err := insertRow.ExecContext(ctx, objectCount, []byte(value)); err != nil {
 				return state, err
 			}
@@ -444,7 +463,7 @@ func inspectApplicationTransaction(ctx context.Context, tx *sql.Tx, stateTip, mi
 	}
 	version := "rhiza-sql-state-v1"
 	if mixedWindow != 0 {
-		version = types.ManagedApplicationProtocolSQLKV
+		version = protocol
 	}
 	digest, err := hashApplicationEvidence(ctx, sortTx, objectCount, version)
 	if err != nil {
@@ -453,6 +472,9 @@ func inspectApplicationTransaction(ctx context.Context, tx *sql.Tx, stateTip, mi
 	userObjects := objectCount
 	if mixedWindow != 0 {
 		userObjects -= 3
+		if protocol == sqlpolicy.ManagedRequestApplicationProtocol {
+			userObjects--
+		}
 	}
 	return SQLApplicationState{Digest: digest, FreshEmpty: userObjects == 0 && receipts == 0 && kv == 0 && migrations == 0 && stateTip == 0}, nil
 }

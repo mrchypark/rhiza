@@ -281,7 +281,7 @@ func openMaterializerPolicy(dbPath string, readerCount int, protocol string, ide
 			return nil, err
 		}
 		if existing {
-			if _, _, err := inspectApplicationFile(context.Background(), dbPath, window); err != nil {
+			if _, _, err := inspectApplicationFile(context.Background(), dbPath, window, protocol); err != nil {
 				return nil, fmt.Errorf("validate stored mixed application: %w", err)
 			}
 		}
@@ -450,6 +450,9 @@ func (m *Materializer) loadTip(existing bool) error {
 			query += `, ('managed_application_protocol', ?), ('managed_application_policy', ?)`
 			args = append(args, m.managedProtocol, managedApplicationPolicy)
 		}
+		if m.materializationPolicy == sqlpolicy.ManagedRequestMaterializationPolicy {
+			query += `, ('request_original_bytes','0')`
+		}
 		if _, err := m.writer.Exec(query, args...); err != nil {
 			return err
 		}
@@ -556,6 +559,10 @@ func (m *Materializer) initSchema() error {
 	}
 	if incompatible != 0 {
 		return fmt.Errorf("incompatible idempotency schema; rebuild from the certified log")
+	}
+	if m.materializationPolicy == sqlpolicy.ManagedRequestMaterializationPolicy {
+		_, err = m.db.Exec(requestOriginalDDL)
+		return err
 	}
 	return nil
 }
@@ -1129,6 +1136,18 @@ func (m *Materializer) pruneReceipts(ctx context.Context, tx *sql.Tx, tip uint64
 	if err := m.sqlReceiptRetention.remove(uint64(resultBytes), uint64(receipts)); err != nil {
 		return err
 	}
+	if m.materializationPolicy == sqlpolicy.ManagedRequestMaterializationPolicy {
+		var expiredBytes int64
+		if err := tx.QueryRowContext(ctx, `SELECT COALESCE(SUM(length(execution)),0) FROM _rhiza_request_original WHERE commit_slot < ?`, floor).Scan(&expiredBytes); err != nil {
+			return err
+		}
+		if err := adjustOriginalBytes(ctx, tx, -expiredBytes); err != nil {
+			return err
+		}
+		if _, err := tx.ExecContext(ctx, `DELETE FROM _rhiza_request_original WHERE commit_slot < ?`, floor); err != nil {
+			return err
+		}
+	}
 	_, err := tx.ExecContext(ctx, `DELETE FROM _rhiza_idempotency WHERE commit_slot < ?`, floor)
 	return err
 }
@@ -1139,9 +1158,11 @@ type pendingNotification struct {
 }
 
 type pendingSQLReceipt struct {
-	requestID string
-	record    storedReceipt
-	persisted bool
+	requestID     string
+	record        storedReceipt
+	persisted     bool
+	executionItem []byte
+	batchIndex    uint32
 }
 
 // Apply applies one decided value.
@@ -1432,14 +1453,14 @@ func (m *Materializer) applyValueLocked(ctx context.Context, conn *sql.Conn, tx 
 		commands = nil
 		batched = true
 	} else if kv {
-		if err := m.applyKV(ctx, tx, slot, kvCommand); err != nil {
+		if err := m.applyKV(ctx, tx, slot, kvCommand, 0); err != nil {
 			return err
 		}
 		commands = nil
 		batched = true
 	} else if kvBatch {
-		for _, command := range kvCommands {
-			if err := m.applyKV(ctx, tx, slot, command); err != nil {
+		for index, command := range kvCommands {
+			if err := m.applyKV(ctx, tx, slot, command, uint32(index)); err != nil {
 				return err
 			}
 		}
@@ -1449,7 +1470,7 @@ func (m *Materializer) applyValueLocked(ctx context.Context, conn *sql.Conn, tx 
 		return sqlpolicy.ErrIncompatible
 	}
 	pendingStart := len(m.pendingSQLReceipts)
-	for _, command := range commands {
+	for commandIndex, command := range commands {
 		if err := ValidateSQLCommand(command); err != nil {
 			return fmt.Errorf("validate SQL request %q: %w", command.RequestID, err)
 		}
@@ -1544,7 +1565,15 @@ func (m *Materializer) applyValueLocked(ctx context.Context, conn *sql.Conn, tx 
 				receipt = types.MutationReceipt{Slot: slot, Status: types.MutationRejected, ErrorCode: types.MutationErrorCodeResultRetentionFull, RetryThroughSlot: slot + m.idempotencyWindow - 1}
 			}
 			m.sqlReceiptRetention.add(uint64(len(encodedResult)))
-			m.pendingSQLReceipts = append(m.pendingSQLReceipts, pendingSQLReceipt{requestID: command.RequestID, record: storedReceipt{fingerprint: fingerprint, receipt: receipt, sqlResult: storedResult}})
+			pendingReceipt := pendingSQLReceipt{requestID: command.RequestID, record: storedReceipt{fingerprint: fingerprint, receipt: receipt, sqlResult: storedResult}}
+			if m.materializationPolicy == sqlpolicy.ManagedRequestMaterializationPolicy {
+				pendingReceipt.executionItem, err = types.EncodeSQLBatchItem(command)
+				if err != nil {
+					return err
+				}
+				pendingReceipt.batchIndex = uint32(commandIndex)
+			}
+			m.pendingSQLReceipts = append(m.pendingSQLReceipts, pendingReceipt)
 			m.pendingSQLResultBytes += sqlResultWorkingBytes(storedResult)
 			if m.pendingSQLResultBytes >= MaxMutationResultBytes {
 				if err := m.flushPendingSQLReceipts(ctx, tx, statements); err != nil {
@@ -1625,7 +1654,7 @@ func (m *Materializer) NotificationDrops() uint64 {
 	return m.notifyDrops.Load()
 }
 
-func (m *Materializer) applyKV(ctx context.Context, tx *sql.Tx, slot uint64, command types.KVCommand) error {
+func (m *Materializer) applyKV(ctx context.Context, tx *sql.Tx, slot uint64, command types.KVCommand, batchIndex uint32) error {
 	if command.RequestID == "" || len(command.RequestID) > types.MaxRequestIDBytes || command.Key == "" || len(command.Key) > 1024 || len(command.Value) > 16<<20 {
 		return fmt.Errorf("invalid KV command")
 	}
@@ -1673,7 +1702,17 @@ func (m *Materializer) applyKV(ctx context.Context, tx *sql.Tx, slot uint64, com
 	if err != nil {
 		return err
 	}
-	return insertReceipt(ctx, tx, types.MutationKV, command.RequestID, fingerprint, receipt)
+	if err := insertReceipt(ctx, tx, types.MutationKV, command.RequestID, fingerprint, receipt); err != nil {
+		return err
+	}
+	if m.materializationPolicy == sqlpolicy.ManagedRequestMaterializationPolicy {
+		item, err := types.EncodeManagedKVBatchItem(command)
+		if err != nil {
+			return err
+		}
+		return insertRequestOriginal(ctx, tx, types.MutationKV, command.RequestID, slot, batchIndex, item)
+	}
+	return nil
 }
 
 // KVGet reads a non-expired value from the local materialized state.
@@ -2255,6 +2294,12 @@ func (m *Materializer) flushPendingSQLReceipts(ctx context.Context, tx *sql.Tx, 
 		return fmt.Errorf("SQL request appeared during apply")
 	}
 	for i := start; i < len(m.pendingSQLReceipts); i++ {
+		pending := &m.pendingSQLReceipts[i]
+		if m.materializationPolicy == sqlpolicy.ManagedRequestMaterializationPolicy {
+			if err := insertRequestOriginal(ctx, tx, types.MutationSQL, pending.requestID, pending.record.receipt.Slot, pending.batchIndex, pending.executionItem); err != nil {
+				return err
+			}
+		}
 		m.pendingSQLReceipts[i].record.sqlResult = types.SQLCommandResult{}
 		m.pendingSQLReceipts[i].persisted = true
 	}
