@@ -103,7 +103,7 @@ func validateV1Alpha2BootstrapPlan(ref V1Alpha2ClusterRef, assignment V1Alpha2Ap
 		seen[entry.PodUID] = true
 		members = append(members, entry.Member)
 	}
-	digest, err := types.ManagedBootstrapPlanDigest(string(p.ClusterID), members, p.PhysicalBinding, p.EvidenceFormat, p.Durability, p.Reconfiguration)
+	digest, err := types.ManagedBootstrapPlanDigestForProtocol(string(p.ClusterID), members, p.PhysicalBinding, p.EvidenceFormat, p.Durability, p.Reconfiguration, assignment.ApplicationProtocol)
 	if err != nil || digest != assignment.BootstrapPlanDigest {
 		return fmt.Errorf("bootstrap digest mismatch")
 	}

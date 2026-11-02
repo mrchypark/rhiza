@@ -287,10 +287,18 @@ type ManagedKVSnapshot struct {
 
 // InspectManagedKV is mixed evidence only, not public request status or ACK.
 func (n *Node) InspectManagedKV(ctx context.Context, fresh bool) (ManagedKVSnapshot, error) {
+	return n.inspectManagedKV(ctx, fresh, false)
+}
+
+func (n *Node) InspectManagedKVRead(ctx context.Context) (ManagedKVSnapshot, error) {
+	return n.inspectManagedKV(ctx, false, true)
+}
+
+func (n *Node) inspectManagedKV(ctx context.Context, fresh, localRead bool) (ManagedKVSnapshot, error) {
 	if n.materializationPolicy() != sqlpolicy.ManagedSQLKVMaterializationPolicy {
 		return ManagedKVSnapshot{}, fmt.Errorf("mixed evidence requires the mixed application profile")
 	}
-	digest, empty, runtime, err := n.inspectManagedApplication(ctx, fresh, false)
+	digest, empty, runtime, err := n.inspectManagedApplication(ctx, fresh, localRead)
 	return ManagedKVSnapshot{Application: materializer.ManagedApplicationState{Digest: digest, FreshEmpty: empty}, Runtime: runtime}, err
 }
 
@@ -412,18 +420,25 @@ func (n *Node) ExecuteManagedSQL(ctx context.Context, req network.ExecuteRequest
 	if err := checker.ValidateManagedSQLWrite(ctx, n.managedStartup.Identity, state, req); err != nil {
 		return network.ExecuteResponse{}, err
 	}
+	if err := n.recordManagedApplicationStart(ctx); err != nil {
+		return network.ExecuteResponse{}, err
+	}
+	return n.server.Execute(ctx, req)
+}
+
+func (n *Node) recordManagedApplicationStart(ctx context.Context) error {
 	want, prefix, err := n.managedSQLScope(n.managedStartup.Identity)
 	if err != nil {
-		return network.ExecuteResponse{}, err
+		return err
 	}
 	claimed, err := readVoterRegistration(ctx, n.bucket, path.Join(prefix, "voters/managed-sql-initialization.json"))
 	if err != nil || !bytes.Equal(claimed, want) {
-		return network.ExecuteResponse{}, errors.Join(fmt.Errorf("exact initial SQL namespace provenance required before execution"), err)
+		return errors.Join(fmt.Errorf("exact initial SQL namespace provenance required before execution"), err)
 	}
 	if err := matchVoterRegistration(ctx, n.bucket, path.Join(prefix, "voters/managed-sql-application-start.json"), want, nil); err != nil {
-		return network.ExecuteResponse{}, fmt.Errorf("record irreversible SQL application start: %w", err)
+		return fmt.Errorf("record irreversible SQL application start: %w", err)
 	}
-	return n.server.Execute(ctx, req)
+	return nil
 }
 
 func (n *Node) ResolveManagedSQL(ctx context.Context, req network.ExecuteRequest) (network.ResolveExecuteResult, error) {
