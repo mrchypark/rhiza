@@ -1526,16 +1526,19 @@ func (s *Server) executeSQLCommand(ctx context.Context, command types.SQLCommand
 		}
 		return ExecuteResponse{MutationReceipt: receipt, Statements: sqlResult.Statements}, nil
 	}
-	_, err = s.sqlBatcher.submitEncoded(ctx, command, encoded, lease)
+	submitSlot, err := s.sqlBatcher.submitEncoded(ctx, command, encoded, lease)
 	if err != nil {
 		return ExecuteResponse{}, err
 	}
 	receipt, sqlResult, found, matches, err = s.material.SQLRequestResultFingerprint(ctx, command.RequestID, fingerprint, wantRows)
-	if err != nil || !matches {
+	if err != nil {
+		return ExecuteResponse{}, commitUnknown(submitSlot, command.RequestID, err)
+	}
+	if !matches {
 		return ExecuteResponse{}, ErrRequestConflict
 	}
 	if !found {
-		return ExecuteResponse{}, fmt.Errorf("SQL mutation receipt is unavailable")
+		return ExecuteResponse{}, commitUnknown(submitSlot, command.RequestID, fmt.Errorf("SQL mutation receipt is unavailable"))
 	}
 	return ExecuteResponse{MutationReceipt: receipt, Statements: sqlResult.Statements}, nil
 }
@@ -1910,19 +1913,24 @@ func (s *Server) KVMutate(ctx context.Context, operation string, req KVMutationR
 	if req.TTLMS > 0 {
 		command.ExpiresAtUnixMS = now + req.TTLMS
 	}
-	_, err = s.kvBatcher.submit(ctx, command, lease)
+	submitSlot, err := s.kvBatcher.submit(ctx, command, lease)
 	if err != nil {
 		return KVMutationResponse{}, err
 	}
-	if matches, err := s.material.KVRequestMatches(ctx, intent); err != nil || !matches {
+	if matches, err := s.material.KVRequestMatches(ctx, intent); err != nil {
+		return KVMutationResponse{}, commitUnknown(submitSlot, req.RequestID, err)
+	} else if !matches {
 		return KVMutationResponse{}, ErrRequestConflict
+	}
+	if localtesthooks.Enabled {
+		localtesthooks.Hit("network:kv-postsubmit:before-receipt")
 	}
 	receipt, found, err := s.material.MutationReceipt(ctx, types.MutationKV, req.RequestID)
 	if err != nil {
-		return KVMutationResponse{}, err
+		return KVMutationResponse{}, commitUnknown(submitSlot, req.RequestID, err)
 	}
 	if !found {
-		return KVMutationResponse{}, fmt.Errorf("KV mutation receipt is unavailable")
+		return KVMutationResponse{}, commitUnknown(submitSlot, req.RequestID, fmt.Errorf("KV mutation receipt is unavailable"))
 	}
 	return KVMutationResponse{MutationReceipt: receipt}, nil
 }

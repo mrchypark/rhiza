@@ -6,14 +6,17 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"net"
 	"testing"
 	"testing/synctest"
 	"time"
 
+	"github.com/mrchypark/rhiza/internal/peertest"
 	"github.com/mrchypark/rhiza/internal/types"
 	"github.com/mrchypark/rhiza/pkg/network"
 	"github.com/mrchypark/rhiza/pkg/node"
 	"github.com/mrchypark/rhiza/pkg/quepaxa"
+	"github.com/quic-go/quic-go"
 )
 
 func TestManagedStartupBudgetRetiresWithoutCancelingLifetime(t *testing.T) {
@@ -86,8 +89,31 @@ func TestManagedStartupBudgetKeepsRealCorePeerUntilClose(t *testing.T) {
 	lifetime, closeHandle := context.WithCancel(context.Background())
 	defer closeHandle()
 	opening, finish := managedStartupContext(lifetime, 30*time.Second)
-	addr := freeUDPAddr(t)
+	conn, err := net.ListenPacket("udp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	transport := &quic.Transport{Conn: conn}
+	t.Cleanup(func() {
+		if err := transport.Close(); err != nil {
+			t.Error(err)
+		}
+		if err := conn.Close(); err != nil {
+			t.Error(err)
+		}
+	})
+	addr := conn.LocalAddr().String()
+	assertHeld := func() {
+		t.Helper()
+		other, err := net.ListenPacket("udp", addr)
+		if err == nil {
+			_ = other.Close()
+			t.Fatal("managed FFI context fixture released endpoint")
+		}
+	}
+	assertHeld()
 	cluster, id, token := types.ClusterID("ffi-context"), types.NodeID("ffi-peer"), "ffi-context-peer-token"
+	opening = peertest.WithTransport(opening, string(cluster), string(id), addr, transport)
 	member := quepaxa.Member{ID: id, PublicKey: quepaxa.PublicKey(network.PeerPublicKey(cluster, id, token)), PeerURL: "quic://" + addr}
 	actual := node.New(&types.ExecutionConfig{DataDir: t.TempDir(), ClusterID: cluster, NodeID: id, Members: []quepaxa.Member{member}, PeerAddr: addr, PeerToken: token})
 	if err := actual.Open(opening); err != nil {
@@ -119,6 +145,7 @@ func TestManagedStartupBudgetKeepsRealCorePeerUntilClose(t *testing.T) {
 		t.Fatal("failed to register owned runtime lifetime")
 	}
 	requireData(t, mustResponse(t, goClose(result.Data.Handle)))
+	assertHeld()
 	if opening.Err() == nil {
 		t.Fatal("close did not cancel actual runtime context")
 	}

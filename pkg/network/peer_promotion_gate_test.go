@@ -3,8 +3,12 @@ package network
 import (
 	"context"
 	"encoding/json"
+	"net"
 	"testing"
 	"time"
+
+	"github.com/mrchypark/rhiza/internal/peertest"
+	"github.com/quic-go/quic-go"
 
 	"github.com/mrchypark/rhiza/pkg/materializer"
 	"github.com/mrchypark/rhiza/pkg/network/peerfb"
@@ -13,6 +17,11 @@ import (
 )
 
 func TestLearnerPromotionGateBlocksOnlyAdmissionPrefix(t *testing.T) {
+	t.Run("owned", func(t *testing.T) { testLearnerPromotionGate(t, false) })
+	t.Run("borrowed", func(t *testing.T) { testLearnerPromotionGate(t, true) })
+}
+
+func testLearnerPromotionGate(t *testing.T, borrowed bool) {
 	config, values := catchUpValues(t, 2)
 	source := startCatchUpPeer(t, "a", values, nil)
 	config.Members[0] = source.member
@@ -32,7 +41,19 @@ func TestLearnerPromotionGateBlocksOnlyAdmissionPrefix(t *testing.T) {
 	ready := make(chan struct{})
 	learner := testMember("cluster", "learner", "learner-token")
 	learner.WALIdentity = core.WALIdentity()
-	peer, err := StartLearnerPeerServerWithPromotionGate(context.Background(), "127.0.0.1:0", server, config.Members, "learner-token", "admin", learner, ready)
+	ctxStart, address := context.Background(), "127.0.0.1:0"
+	if borrowed {
+		conn, err := net.ListenPacket("udp", address)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer conn.Close()
+		transport := &quic.Transport{Conn: conn}
+		defer transport.Close()
+		address = conn.LocalAddr().String()
+		ctxStart = peertest.WithTransport(ctxStart, "cluster", "learner", address, transport)
+	}
+	peer, err := StartLearnerPeerServerWithPromotionGate(ctxStart, address, server, config.Members, "learner-token", "admin", learner, ready)
 	if err != nil {
 		t.Fatal(err)
 	}
