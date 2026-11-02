@@ -218,6 +218,9 @@ func (n *Node) OpenManaged(ctx context.Context, cfg ManagedStartupConfig) (resul
 			return errors.Join(fmt.Errorf("managed prepared application window or tip mismatch"), err)
 		}
 	}
+	// Publish once before restore/open can start runtime readers. The pointer,
+	// expectedPolicy and idempotencyWindow stay fixed for this Node; adoption
+	// and admission state still follow their existing lifecycle.
 	n.managedStartup = &cfg
 	var startupLock *qlog.LockFile
 	var cleanStart bool
@@ -301,7 +304,6 @@ func (n *Node) OpenManaged(ctx context.Context, cfg ManagedStartupConfig) (resul
 	if cfg.promotionReady != nil {
 		close(cfg.promotionReady)
 	}
-	n.managedStartup = &cfg
 	n.managedPeerVerified.Store(true)
 	return nil
 }
