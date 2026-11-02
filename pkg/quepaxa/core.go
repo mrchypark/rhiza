@@ -2403,11 +2403,15 @@ func (c *Core) recoverThroughOwnedAdmitted(ctx context.Context, through Slot) er
 	case <-ctx.Done():
 		return ctx.Err()
 	}
-	for c.Tip() < through {
+	for {
+		tip := c.Tip()
+		if tip >= through {
+			return nil
+		}
 		if err := ctx.Err(); err != nil {
 			return err
 		}
-		slot := c.Tip() + 1
+		slot := tip + 1
 		var decision Decision
 		if decided, ok := c.decision(slot); ok {
 			var err error
@@ -2438,7 +2442,6 @@ func (c *Core) recoverThroughOwnedAdmitted(ctx context.Context, through Slot) er
 			return fmt.Errorf("recover slot %d made no checked prefix progress", slot)
 		}
 	}
-	return nil
 }
 
 func (c *Core) acquireLocalExecution(ctx context.Context) error {
