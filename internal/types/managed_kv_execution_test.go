@@ -268,3 +268,103 @@ func TestManagedKVExecutionPolicyConsensusBoundary(t *testing.T) {
 		t.Fatal("over-limit execution accepted")
 	}
 }
+
+func TestManagedKVExecutionSizeBoundPreservesOriginal(t *testing.T) {
+	for _, id := range []string{string([]byte{255}), string([]byte{254}), "\ufffd", "a\x00b"} {
+		for _, blob := range [][]byte{nil, {}, {0, 255}} {
+			for _, ttl := range []int64{0, 1, math.MaxInt64} {
+				command := KVCommand{RequestID: id, Operation: "delete", Key: id, Value: bytes.Clone(blob), Expected: bytes.Clone(blob), ExpectedExists: true, TTLMS: ttl, ObservedAtUnixMS: 77, ExpiresAtUnixMS: 99}
+				before := command
+				before.Value = bytes.Clone(command.Value)
+				before.Expected = bytes.Clone(command.Expected)
+				bound, err := ManagedKVExecutionSizeBound(command)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if !reflect.DeepEqual(command, before) {
+					t.Fatal("preflight modified original")
+				}
+				// These are deterministic legal first-submit samples, not probes.
+				for _, observed := range []int64{0, 1, 1_700_000_000_000, math.MaxInt64} {
+					if ttl > math.MaxInt64-observed {
+						continue
+					}
+					actual := command
+					actual.ObservedAtUnixMS = observed
+					actual.ExpiresAtUnixMS = 0
+					if ttl > 0 {
+						actual.ExpiresAtUnixMS = observed + ttl
+					}
+					item, err := EncodeManagedKVBatchItem(actual)
+					if err != nil {
+						t.Fatal(err)
+					}
+					batch, err := AssembleManagedKVBatch([][]byte{item})
+					if err != nil {
+						t.Fatal(err)
+					}
+					if len(batch) > bound {
+						t.Fatal("legal timestamp exceeded conservative bound", len(batch), bound)
+					}
+				}
+			}
+		}
+	}
+}
+
+func TestManagedKVExecutionSizeBoundCanonicalBoundary(t *testing.T) {
+	for _, ttl := range []int64{0, 1} {
+		command := KVCommand{RequestID: "i", Operation: "put", Key: "k", TTLMS: ttl}
+		low, high := 0, 128<<10
+		for low < high {
+			mid := (low + high + 1) / 2
+			command.Value = make([]byte, mid)
+			if _, err := ManagedKVExecutionSizeBound(command); err != nil {
+				high = mid - 1
+			} else {
+				low = mid
+			}
+		}
+		command.Value = make([]byte, low)
+		bound, err := ManagedKVExecutionSizeBound(command)
+		if err != nil || bound > quepaxa.MaxReplicatedValueBytes {
+			t.Fatal("nearest canonical boundary rejected", bound, err)
+		}
+		metadata := command
+		metadata.ObservedAtUnixMS = math.MaxInt64
+		if ttl > 0 {
+			metadata.ExpiresAtUnixMS = math.MaxInt64
+		}
+		item, err := EncodeManagedKVBatchItem(metadata)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if bound != len(item)+len(managedKVBatchMagic)+2 {
+			t.Fatal("bound used singleton or wrong envelope")
+		}
+		command.Value = make([]byte, low+1)
+		over, err := ManagedKVExecutionSizeBound(command)
+		if err == nil || over <= quepaxa.MaxReplicatedValueBytes || over-bound > 4 {
+			t.Fatal("canonical base64 boundary not enforced", bound, over, err)
+		}
+		t.Logf("ttl=%d accepted_raw=%d bound=%d next_bound=%d cap=%d (canonical base64 quantization)", ttl, low, bound, over, quepaxa.MaxReplicatedValueBytes)
+		// Ignored fields remain part of the bound even for delete.
+		command.Operation = "delete"
+		command.Value = nil
+		command.Expected = make([]byte, 128<<10)
+		if size, err := ManagedKVExecutionSizeBound(command); err == nil || size <= quepaxa.MaxReplicatedValueBytes {
+			t.Fatal("ignored expected blob omitted", size, err)
+		}
+	}
+}
+
+func TestManagedKVExecutionSizeBoundRejectsInvalidOriginal(t *testing.T) {
+	valid := KVCommand{RequestID: "i", Operation: "put", Key: "k"}
+	for _, mutate := range []func(*KVCommand){func(c *KVCommand) { c.RequestID = "" }, func(c *KVCommand) { c.Key = "" }, func(c *KVCommand) { c.TTLMS = -1 }, func(c *KVCommand) { c.Operation = "get" }, func(c *KVCommand) { c.Value = make([]byte, 1<<20) }, func(c *KVCommand) { c.Expected = make([]byte, 1<<20) }} {
+		invalid := valid
+		mutate(&invalid)
+		if _, err := ManagedKVExecutionSizeBound(invalid); err == nil {
+			t.Fatal("invalid original accepted")
+		}
+	}
+}

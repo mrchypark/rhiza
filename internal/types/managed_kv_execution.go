@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"io"
+	"math"
 
 	"github.com/mrchypark/rhiza/internal/sqlpolicy"
 	"github.com/mrchypark/rhiza/pkg/quepaxa"
@@ -15,6 +16,30 @@ const MaxManagedKVCommandsPerDecidedValue = 64
 
 var managedKVCommandMagic = []byte("QKVC\x01")
 var managedKVBatchMagic = []byte("QKVB\x01")
+
+// ManagedKVExecutionSizeBound validates the original intent and conservatively
+// bounds its single-item QKVB1 execution, including first-submit timestamps.
+// It is a NEW-pending preflight, not full admission or an exact current-time
+// size. Never submit its synthetic metadata, or use this check to discard an
+// existing unknown pending write during load or resolution.
+func ManagedKVExecutionSizeBound(command KVCommand) (int, error) {
+	// Work on the value copy only. The actual encoder owns/validates all seven
+	// original fields and retains raw identity bytes and nil/empty blobs.
+	command.ObservedAtUnixMS = math.MaxInt64
+	command.ExpiresAtUnixMS = 0
+	if command.TTLMS > 0 {
+		command.ExpiresAtUnixMS = math.MaxInt64
+	}
+	item, err := EncodeManagedKVBatchItem(command)
+	if err != nil {
+		return 0, err
+	}
+	size := len(managedKVBatchMagic) + 2 + len(item)
+	if size > quepaxa.MaxReplicatedValueBytes {
+		return size, errors.New("managed KV execution exceeds replicated value limit")
+	}
+	return size, nil
+}
 
 // EncodeManagedKVBatchItem encodes the explicit mixed-profile execution record.
 // It does not select a profile or change legacy encoders.
