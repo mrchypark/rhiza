@@ -226,41 +226,81 @@ func memberQUICAddr(member quepaxa.Member) (string, error) {
 	return endpoint.Host, nil
 }
 
+// PeerRPCDiagnostic contains bounded transport observations, never payloads.
+type PeerRPCDiagnostic struct {
+	Phase                                                    string
+	Elapsed, GateWait, MutexWait, DialElapsed, DialRemaining time.Duration
+	DialDeadlineKnown                                        bool
+	ConnectionElapsed, RequestElapsed, TotalElapsed          time.Duration
+	ConnectionKnown, RequestKnown, TotalKnown                bool
+	GateWaitKnown, MutexWaitKnown, DialMeasured              bool
+}
+
+type peerRPCError struct {
+	diagnostic PeerRPCDiagnostic
+	cause      error
+}
+
+func (e *peerRPCError) Error() string {
+	return fmt.Sprintf("peer RPC phase=%s elapsed=%s cause_type=%T: %v", e.diagnostic.Phase, e.diagnostic.Elapsed, e.cause, e.cause)
+}
+func (e *peerRPCError) Unwrap() error                    { return e.cause }
+func (e *peerRPCError) RPCPhase() string                 { return e.diagnostic.Phase }
+func (e *peerRPCError) RPCDiagnostic() PeerRPCDiagnostic { return e.diagnostic }
+
 func peerRPCPhaseError(phase string, started time.Time, err error) error {
 	if err == nil {
 		return nil
 	}
-	return fmt.Errorf("peer RPC phase=%s elapsed=%s cause_type=%T: %w", phase, time.Since(started), err, err)
+	return &peerRPCError{diagnostic: PeerRPCDiagnostic{Phase: phase, Elapsed: time.Since(started)}, cause: err}
 }
 
 func (t *Transport) connection(ctx context.Context, to quepaxa.NodeID) (conn *quic.Conn, err error) {
+	conn, _, err = t.connectionDiagnostic(ctx, to)
+	return conn, err
+}
+
+func (t *Transport) connectionDiagnostic(ctx context.Context, to quepaxa.NodeID) (conn *quic.Conn, diagnostic PeerRPCDiagnostic, err error) {
 	started, phase := time.Now(), "connection-gate"
-	defer func() { err = peerRPCPhaseError(phase, started, err) }()
+	diagnostic.ConnectionKnown = true
+	defer func() {
+		diagnostic.ConnectionElapsed = time.Since(started)
+		if err != nil {
+			diagnostic.Phase, diagnostic.Elapsed = phase, time.Since(started)
+			err = &peerRPCError{diagnostic: diagnostic, cause: err}
+		}
+	}()
 	member, ok := t.members[to]
 	if !ok {
-		return nil, fmt.Errorf("unknown node: %s", to)
+		return nil, diagnostic, fmt.Errorf("unknown node: %s", to)
 	}
 	peer := t.peers[to]
+	diagnostic.GateWaitKnown = true
 	select {
 	case peer.gate <- struct{}{}:
 		defer func() { <-peer.gate }()
 	case <-ctx.Done():
-		return nil, ctx.Err()
+		diagnostic.GateWait = time.Since(started)
+		return nil, diagnostic, ctx.Err()
 	}
+	diagnostic.GateWait = time.Since(started)
+	mutexStarted := time.Now()
 	peer.mu.Lock()
+	diagnostic.MutexWait = time.Since(mutexStarted)
+	diagnostic.MutexWaitKnown = true
 	defer peer.mu.Unlock()
 	if peer.conn == nil || peer.conn.Context().Err() != nil {
 		phase = "peer-identity"
 		addr, err := memberQUICAddr(member)
 		if err != nil {
-			return nil, err
+			return nil, diagnostic, err
 		}
 		tlsConfig := t.tls.Clone()
 		tlsConfig.ServerName = string(to)
 		expectedKey := t.peerKeys[to]
 		if len(expectedKey) == 0 {
 			if member.PublicKey == (quepaxa.PublicKey{}) {
-				return nil, fmt.Errorf("peer public key is required for %s", to)
+				return nil, diagnostic, fmt.Errorf("peer public key is required for %s", to)
 			}
 			expectedKey = ed25519.PublicKey(member.PublicKey[:])
 		}
@@ -269,7 +309,7 @@ func (t *Transport) connection(ctx context.Context, to quepaxa.NodeID) (conn *qu
 		if t.peerToken != "" {
 			certificate, err := peerCertificate(t.clusterID, t.localID, t.peerToken)
 			if err != nil {
-				return nil, err
+				return nil, diagnostic, err
 			}
 			tlsConfig.Certificates = []tls.Certificate{certificate}
 		}
@@ -285,21 +325,27 @@ func (t *Transport) connection(ctx context.Context, to quepaxa.NodeID) (conn *qu
 			return nil
 		}
 		phase = "dial"
+		if deadline, ok := ctx.Deadline(); ok {
+			diagnostic.DialRemaining, diagnostic.DialDeadlineKnown = time.Until(deadline), true
+		}
+		dialStarted := time.Now()
+		diagnostic.DialMeasured = true
 		peer.conn, err = quic.DialAddrEarly(ctx, addr, tlsConfig, t.quic)
+		diagnostic.DialElapsed = time.Since(dialStarted)
 		if err != nil {
 			peer.conn = nil
-			return nil, err
+			return nil, diagnostic, err
 		}
 	}
 	phase = "handshake"
 	select {
 	case <-ctx.Done():
-		return nil, ctx.Err()
+		return nil, diagnostic, ctx.Err()
 	case <-peer.conn.HandshakeComplete():
 	}
 	conn = peer.conn
 	peer.active[conn]++
-	return conn, nil
+	return conn, diagnostic, nil
 }
 
 func (t *Transport) call(ctx context.Context, to quepaxa.NodeID, request *peerfb.RequestT) (*peerfb.ResponseT, error) {
@@ -321,12 +367,30 @@ func (t *Transport) callQuorum(ctx context.Context, to quepaxa.NodeID, request *
 // callContext always waits for the TLS handshake. Voting authorization is
 // bound to the certificate the peer presents during the handshake, so a
 // request must never be accepted (or sent) as replayable early data.
-func (t *Transport) callContext(ctx context.Context, to quepaxa.NodeID, request *peerfb.RequestT) (*peerfb.ResponseT, error) {
-	conn, err := t.connection(ctx, to)
+func (t *Transport) callContext(ctx context.Context, to quepaxa.NodeID, request *peerfb.RequestT) (response *peerfb.ResponseT, err error) {
+	started := time.Now()
+	conn, observation, err := t.connectionDiagnostic(ctx, to)
+	defer func() {
+		if err == nil {
+			return
+		}
+		diagnostic := observation
+		diagnostic.Phase = "response-code"
+		diagnostic.Elapsed = observation.RequestElapsed
+		var inner interface{ RPCDiagnostic() PeerRPCDiagnostic }
+		if errors.As(err, &inner) {
+			diagnostic.Phase = inner.RPCDiagnostic().Phase
+			diagnostic.Elapsed = inner.RPCDiagnostic().Elapsed
+		}
+		diagnostic.TotalElapsed, diagnostic.TotalKnown = time.Since(started), true
+		err = &peerRPCError{diagnostic: diagnostic, cause: err}
+	}()
 	if err != nil {
 		return nil, err
 	}
-	response, err := t.callConnection(ctx, conn, request)
+	requestStarted := time.Now()
+	response, err = t.callConnection(ctx, conn, request)
+	observation.RequestElapsed, observation.RequestKnown = time.Since(requestStarted), true
 	if err != nil && response == nil && ctx.Err() == nil {
 		t.invalidate(to, conn)
 	}
@@ -485,7 +549,12 @@ func (t *Transport) release(to quepaxa.NodeID, conn *quic.Conn) {
 	}
 }
 
-func (t *Transport) FetchDecisions(ctx context.Context, source quepaxa.NodeID, from quepaxa.Slot, limit int) (DecisionsResponse, error) {
+func (t *Transport) FetchDecisions(ctx context.Context, source quepaxa.NodeID, from quepaxa.Slot, limit int) (result DecisionsResponse, resultErr error) {
+	defer func() {
+		if resultErr != nil {
+			resultErr = fmt.Errorf("peer operation=sync source_hash=%x: %w", sha256.Sum256([]byte(source)), resultErr)
+		}
+	}()
 	// Sync is a read-only transfer. Route to a current voter even when the
 	// requested page begins before that voter was admitted; Core validates every
 	// returned certificate against the configuration for its own slot.
@@ -502,7 +571,7 @@ func (t *Transport) FetchDecisions(ctx context.Context, source quepaxa.NodeID, f
 	if err != nil {
 		return DecisionsResponse{}, err
 	}
-	result := DecisionsResponse{ClusterID: types.ClusterID(response.ClusterId), ProposerID: quepaxa.NodeID(response.ProposerId), ConfigID: uint(response.ConfigId), Tip: quepaxa.Slot(response.Tip), Decisions: make([]quepaxa.DecidedValue, len(response.Decisions))}
+	result = DecisionsResponse{ClusterID: types.ClusterID(response.ClusterId), ProposerID: quepaxa.NodeID(response.ProposerId), ConfigID: uint(response.ConfigId), Tip: quepaxa.Slot(response.Tip), Decisions: make([]quepaxa.DecidedValue, len(response.Decisions))}
 	for i := range response.Decisions {
 		result.Decisions[i], err = decidedFromWire(response.Decisions[i])
 		if err != nil {
