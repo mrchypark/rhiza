@@ -16,6 +16,7 @@ import (
 	"time"
 
 	"github.com/mrchypark/rhiza/internal/localtesthooks"
+	"github.com/mrchypark/rhiza/internal/sqlpolicy"
 	"github.com/mrchypark/rhiza/internal/types"
 	"github.com/mrchypark/rhiza/pkg/materializer"
 	"github.com/mrchypark/rhiza/pkg/quepaxa"
@@ -71,6 +72,7 @@ func commitUnknown(slot quepaxa.Slot, requestID string, err error) error {
 
 // Server is the HTTP server for client API.
 type Server struct {
+	expectedPolicy       sqlpolicy.MaterializationPolicy
 	core                 *quepaxa.Core
 	material             *materializer.Materializer
 	cluster              types.ClusterID
@@ -286,8 +288,24 @@ type proposalCall struct {
 	leases      []*mutationLease
 }
 
-// NewServer creates a new HTTP server.
+// NewServer creates a legacy-policy HTTP server. Incompatible explicit
+// dependencies return nil; use NewServerForPolicy to inspect that error.
 func NewServer(core *quepaxa.Core, material *materializer.Materializer, cluster types.ClusterID, writable bool, transport *Transport, ready ...func() bool) *Server {
+	s, _ := NewServerForPolicy(core, material, cluster, writable, transport, sqlpolicy.LegacyMaterializationPolicy, ready...)
+	return s
+}
+
+// NewServerForPolicy fixes execution and peer semantics before batchers start.
+func NewServerForPolicy(core *quepaxa.Core, material *materializer.Materializer, cluster types.ClusterID, writable bool, transport *Transport, expected sqlpolicy.MaterializationPolicy, ready ...func() bool) (*Server, error) {
+	if err := expected.Validate(); err != nil {
+		return nil, err
+	}
+	if material != nil && material.MaterializationPolicy() != expected {
+		return nil, sqlpolicy.ErrIncompatible
+	}
+	if transport != nil && transport.expectedPolicy != expected {
+		return nil, sqlpolicy.ErrIncompatible
+	}
 	proposalCtx, proposalStop := context.WithCancel(context.Background())
 	localMode := core != nil && core.LocalMode()
 	localLimit := maxLocalProposals
@@ -295,6 +313,7 @@ func NewServer(core *quepaxa.Core, material *materializer.Materializer, cluster 
 		localLimit = 1
 	}
 	s := &Server{
+		expectedPolicy:   expected,
 		core:             core,
 		material:         material,
 		cluster:          cluster,
@@ -324,9 +343,13 @@ func NewServer(core *quepaxa.Core, material *materializer.Materializer, cluster 
 	}
 	s.sqlBatcher = newSQLBatcher(s.proposeInternalBatch, nil)
 	s.graphBatcher = newGraphBatcher(s.proposeInternalBatch, nil)
-	s.kvBatcher = newKVBatcher(s.proposeInternalBatch, nil)
+	if expected == sqlpolicy.ManagedSQLKVMaterializationPolicy {
+		s.kvBatcher = newManagedKVBatcher(s.proposeInternalBatch, nil)
+	} else {
+		s.kvBatcher = newKVBatcher(s.proposeInternalBatch, nil)
+	}
 	s.routes()
-	return s
+	return s, nil
 }
 
 // SetLocalFailureHandler installs the root-readiness hook before the server is
@@ -925,10 +948,10 @@ func (s *Server) proposalWorkContext(call *proposalCall) (context.Context, conte
 
 func (s *Server) runProposalAttempt(ctx context.Context, value []byte) (quepaxa.Slot, error, bool, bool) {
 	if s.localMode {
-		if err := types.ValidateExecutionPolicy(value); err != nil {
+		if err := s.validateExecutionPolicy(value); err != nil {
 			return 0, fmt.Errorf("%w: %v", ErrInvalidRequest, err), false, false
 		}
-		if err := validateReplicatedMutation(value); err != nil {
+		if err := s.validateReplicatedMutation(value); err != nil {
 			return 0, fmt.Errorf("%w: %v", ErrInvalidRequest, err), false, false
 		}
 	}
@@ -1042,7 +1065,7 @@ func (s *Server) finishLocalLifecycle(err error) {
 	s.proposalWG.Done()
 }
 func (s *Server) proposeOnce(ctx context.Context, value []byte) (quepaxa.Slot, error) {
-	if err := types.ValidateExecutionPolicy(value); err != nil {
+	if err := s.validateExecutionPolicy(value); err != nil {
 		return 0, err
 	}
 	if slot, ok := s.core.DecidedSlot(value); ok {
@@ -1143,7 +1166,7 @@ func (s *Server) catchUpFromTip(ctx context.Context, source quepaxa.NodeID, thro
 		}
 		accept := s.core.AcceptCertifiedValues
 		for _, decision := range response.Decisions {
-			if err := types.ValidateExecutionPolicy(decision.Value); err != nil {
+			if err := s.validateExecutionPolicy(decision.Value); err != nil {
 				return err
 			}
 		}
@@ -1424,6 +1447,9 @@ func (s *Server) execute(ctx context.Context, req ExecuteRequest, oneStatement b
 
 // Migrate applies one engine-owned migration atomically with its ledger row.
 func (s *Server) Migrate(ctx context.Context, req MigrationRequest) (ExecuteResponse, error) {
+	if s.expectedPolicy == sqlpolicy.ManagedSQLKVMaterializationPolicy {
+		return ExecuteResponse{}, ErrInvalidRequest
+	}
 	if !s.writable || !s.Ready() {
 		return ExecuteResponse{}, ErrNotReady
 	}
@@ -1447,6 +1473,9 @@ func (s *Server) Migrate(ctx context.Context, req MigrationRequest) (ExecuteResp
 // AdmitMigration reserves bounded capacity before the embedded wrapper
 // computes a checksum or validates/encodes caller-owned statements.
 func (s *Server) AdmitMigration(ctx context.Context, version int64, name string, statements []types.SQLStatement) (*MigrationAdmission, error) {
+	if s.expectedPolicy == sqlpolicy.ManagedSQLKVMaterializationPolicy {
+		return nil, ErrInvalidRequest
+	}
 	if !s.writable || !s.Ready() {
 		return nil, ErrNotReady
 	}
@@ -1468,6 +1497,9 @@ func (s *Server) AdmitMigration(ctx context.Context, version int64, name string,
 // MigrateAdmitted submits a migration using a reservation acquired before
 // checksum construction and request validation.
 func (s *Server) MigrateAdmitted(ctx context.Context, req MigrationRequest, admission *MigrationAdmission) (ExecuteResponse, error) {
+	if s.expectedPolicy == sqlpolicy.ManagedSQLKVMaterializationPolicy {
+		return ExecuteResponse{}, ErrInvalidRequest
+	}
 	if admission == nil || admission.lease == nil {
 		return ExecuteResponse{}, ErrInvalidRequest
 	}
@@ -1526,11 +1558,23 @@ func (s *Server) executeSQLCommand(ctx context.Context, command types.SQLCommand
 		}
 		return ExecuteResponse{MutationReceipt: receipt, Statements: sqlResult.Statements}, nil
 	}
-	_, err = s.sqlBatcher.submitEncoded(ctx, command, encoded, lease)
+	slot, err := s.sqlBatcher.submitEncoded(ctx, command, encoded, lease)
 	if err != nil {
 		return ExecuteResponse{}, err
 	}
 	receipt, sqlResult, found, matches, err = s.material.SQLRequestResultFingerprint(ctx, command.RequestID, fingerprint, wantRows)
+	if s.expectedPolicy == sqlpolicy.ManagedSQLKVMaterializationPolicy {
+		if err != nil {
+			return ExecuteResponse{}, commitUnknown(slot, command.RequestID, err)
+		}
+		if !found {
+			return ExecuteResponse{}, commitUnknown(slot, command.RequestID, fmt.Errorf("SQL mutation receipt is unavailable"))
+		}
+		if !matches {
+			return ExecuteResponse{}, ErrRequestConflict
+		}
+		return ExecuteResponse{MutationReceipt: receipt, Statements: sqlResult.Statements}, nil
+	}
 	if err != nil || !matches {
 		return ExecuteResponse{}, ErrRequestConflict
 	}
@@ -1875,7 +1919,11 @@ func (s *Server) KVMutate(ctx context.Context, operation string, req KVMutationR
 	}
 	defer lease.releaseCaller()
 	intent.RequestID, intent.Operation, intent.Key = cloneMutationString(intent.RequestID), cloneMutationString(intent.Operation), cloneMutationString(intent.Key)
-	intent.Value, intent.Expected = append([]byte(nil), intent.Value...), append([]byte(nil), intent.Expected...)
+	if s.expectedPolicy == sqlpolicy.ManagedSQLKVMaterializationPolicy {
+		intent.Value, intent.Expected = bytes.Clone(intent.Value), bytes.Clone(intent.Expected)
+	} else {
+		intent.Value, intent.Expected = append([]byte(nil), intent.Value...), append([]byte(nil), intent.Expected...)
+	}
 	req.RequestID, req.Key, req.Value, req.Expected = intent.RequestID, intent.Key, intent.Value, intent.Expected
 	if operation != "put" && operation != "delete" && operation != "cas" {
 		return KVMutationResponse{}, ErrInvalidRequest
@@ -1888,18 +1936,39 @@ func (s *Server) KVMutate(ctx context.Context, operation string, req KVMutationR
 		return KVMutationResponse{}, err
 	}
 	defer unlock()
-	if matches, err := s.material.KVRequestMatches(ctx, intent); err != nil {
-		return KVMutationResponse{}, err
-	} else if !matches {
-		return KVMutationResponse{}, ErrRequestConflict
-	}
-	if receipt, found, err := s.material.MutationReceipt(ctx, types.MutationKV, req.RequestID); err != nil {
-		return KVMutationResponse{}, err
-	} else if found {
-		if err := s.waitReceiptDurable(ctx, receipt, req.RequestID); err != nil {
+	var mixedFingerprint [32]byte
+	if s.expectedPolicy == sqlpolicy.ManagedSQLKVMaterializationPolicy {
+		mixedFingerprint, err = types.ManagedKVFingerprint(intent)
+		if err != nil {
 			return KVMutationResponse{}, err
 		}
-		return KVMutationResponse{MutationReceipt: receipt}, nil
+		receipt, found, matches, err := s.material.KVRequestStatusFingerprint(ctx, req.RequestID, mixedFingerprint)
+		if err != nil {
+			return KVMutationResponse{}, err
+		}
+		if !matches {
+			return KVMutationResponse{}, ErrRequestConflict
+		}
+		if found {
+			if err := s.waitReceiptDurable(ctx, receipt, req.RequestID); err != nil {
+				return KVMutationResponse{}, err
+			}
+			return KVMutationResponse{MutationReceipt: receipt}, nil
+		}
+	} else {
+		if matches, err := s.material.KVRequestMatches(ctx, intent); err != nil {
+			return KVMutationResponse{}, err
+		} else if !matches {
+			return KVMutationResponse{}, ErrRequestConflict
+		}
+		if receipt, found, err := s.material.MutationReceipt(ctx, types.MutationKV, req.RequestID); err != nil {
+			return KVMutationResponse{}, err
+		} else if found {
+			if err := s.waitReceiptDurable(ctx, receipt, req.RequestID); err != nil {
+				return KVMutationResponse{}, err
+			}
+			return KVMutationResponse{MutationReceipt: receipt}, nil
+		}
 	}
 	command := intent
 	now := time.Now().UnixMilli()
@@ -1910,9 +1979,22 @@ func (s *Server) KVMutate(ctx context.Context, operation string, req KVMutationR
 	if req.TTLMS > 0 {
 		command.ExpiresAtUnixMS = now + req.TTLMS
 	}
-	_, err = s.kvBatcher.submit(ctx, command, lease)
+	slot, err := s.kvBatcher.submit(ctx, command, lease)
 	if err != nil {
 		return KVMutationResponse{}, err
+	}
+	if s.expectedPolicy == sqlpolicy.ManagedSQLKVMaterializationPolicy {
+		receipt, found, matches, err := s.material.KVRequestStatusFingerprint(ctx, req.RequestID, mixedFingerprint)
+		if err != nil {
+			return KVMutationResponse{}, commitUnknown(slot, req.RequestID, err)
+		}
+		if !found {
+			return KVMutationResponse{}, commitUnknown(slot, req.RequestID, fmt.Errorf("KV mutation receipt is unavailable"))
+		}
+		if !matches {
+			return KVMutationResponse{}, ErrRequestConflict
+		}
+		return KVMutationResponse{MutationReceipt: receipt}, nil
 	}
 	if matches, err := s.material.KVRequestMatches(ctx, intent); err != nil || !matches {
 		return KVMutationResponse{}, ErrRequestConflict
@@ -1994,6 +2076,9 @@ func (s *Server) handleNotifyPublish(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) NotifyPublish(ctx context.Context, req types.NotifyCommand) (types.MutationReceipt, error) {
+	if s.expectedPolicy == sqlpolicy.ManagedSQLKVMaterializationPolicy {
+		return types.MutationReceipt{}, ErrInvalidRequest
+	}
 	if !s.writable || !s.Ready() {
 		return types.MutationReceipt{}, ErrNotReady
 	}
@@ -2061,6 +2146,9 @@ func (s *Server) NotifyPublish(ctx context.Context, req types.NotifyCommand) (ty
 }
 
 func (s *Server) NotifySubscribe(topic string) (<-chan []byte, func(), error) {
+	if s.expectedPolicy == sqlpolicy.ManagedSQLKVMaterializationPolicy {
+		return nil, nil, ErrInvalidRequest
+	}
 	if s.localFailure() != nil {
 		return nil, nil, ErrNotReady
 	}
@@ -2126,7 +2214,7 @@ func (s *Server) handleNotifySubscribe(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) proposeLocal(ctx context.Context, value []byte) (quepaxa.DecidedValue, error) {
-	if err := validateReplicatedMutation(value); err != nil {
+	if err := s.validateReplicatedMutation(value); err != nil {
 		return quepaxa.DecidedValue{}, fmt.Errorf("%w: %v", ErrInvalidRequest, err)
 	}
 	if slot, ok := s.core.DecidedSlot(value); ok {
@@ -2151,6 +2239,63 @@ func (s *Server) proposeLocal(ctx context.Context, value []byte) (quepaxa.Decide
 		return quepaxa.DecidedValue{}, errors.New("decision unavailable")
 	}
 	return decision, nil
+}
+
+func (s *Server) validateExecutionPolicy(value []byte) error {
+	if s.expectedPolicy == sqlpolicy.ManagedSQLKVMaterializationPolicy {
+		return s.validateReplicatedMutation(value)
+	}
+	return types.ValidateExecutionPolicy(value)
+}
+
+func (s *Server) validateReplicatedMutation(value []byte) error {
+	if s.expectedPolicy != sqlpolicy.ManagedSQLKVMaterializationPolicy {
+		return validateReplicatedMutation(value)
+	}
+	if err := types.ValidateManagedKVExecutionPolicy(value); err != nil {
+		return err
+	}
+	if commands, ok, err := types.DecodeSQLBatch(value); ok || err != nil {
+		if err != nil {
+			return err
+		}
+		for _, command := range commands {
+			if command.RequestID == "" || command.Migration != nil {
+				return ErrInvalidRequest
+			}
+			if err := materializer.ValidateSQLCommand(command); err != nil {
+				return err
+			}
+		}
+		return nil
+	}
+	commands, ok, err := types.DecodeManagedKVBatch(value)
+	if err != nil {
+		return err
+	}
+	if !ok {
+		command, singleton, err := types.DecodeManagedKVCommand(value)
+		if err != nil {
+			return err
+		}
+		if !singleton {
+			return nil
+		} // Already allowlisted control only.
+		commands = []types.KVCommand{command}
+	}
+	for _, command := range commands {
+		if command.ObservedAtUnixMS < 0 || command.ExpiresAtUnixMS < 0 {
+			return ErrInvalidRequest
+		}
+		if command.TTLMS == 0 {
+			if command.ExpiresAtUnixMS != 0 {
+				return ErrInvalidRequest
+			}
+		} else if command.TTLMS > math.MaxInt64-command.ObservedAtUnixMS || command.ExpiresAtUnixMS != command.ObservedAtUnixMS+command.TTLMS {
+			return ErrInvalidRequest
+		}
+	}
+	return nil
 }
 
 func validateReplicatedMutation(value []byte) error {
