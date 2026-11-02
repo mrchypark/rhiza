@@ -21,6 +21,14 @@ import (
 // owner of its WAL. The existing identity/await init containers supply the real
 // files; surviving managed voters perform the actual certified membership work.
 func TestManagedFFIInClusterSQLLifecycle(t *testing.T) {
+	runManagedFFIInClusterLifecycle(t, false)
+}
+
+func TestManagedFFIInClusterMixedLifecycle(t *testing.T) {
+	runManagedFFIInClusterLifecycle(t, true)
+}
+
+func runManagedFFIInClusterLifecycle(t *testing.T, mixed bool) {
 	if os.Getenv("RHIZA_FFI_IN_CLUSTER_CONTRACT") != "1" {
 		t.Skip("requires the actual in-cluster managed replacement fixture; no local Host substitute")
 	}
@@ -139,6 +147,21 @@ func TestManagedFFIInClusterSQLLifecycle(t *testing.T) {
 	if json.Unmarshal(invoke("query", map[string]any{"sql": "SELECT id, value FROM managed_ffi_contract WHERE id = ?", "args": []any{requestID}, "consistency": "linearizable"}), &query) != nil || len(query.Rows) != 1 || len(query.Rows[0]) != 2 || query.Rows[0][0] != requestID || query.Rows[0][1] != "ffi-live" {
 		t.Fatal("real FFI SQL ACK readback mismatch")
 	}
+	if mixed {
+		original := types.KVCommand{RequestID: string([]byte{0xfd}) + requestID, Operation: "put", Key: string([]byte{0xfc}) + requestID, Value: []byte("ffi-live"), Expected: []byte{}, TTLMS: 0}
+		raw, _, err := types.EncodeManagedKVOriginal(original)
+		if err != nil {
+			t.Fatal("invalid mixed FFI original")
+		}
+		var receipt managedKVReceipt
+		if json.Unmarshal(invoke("kv_put", raw), &receipt) != nil || receipt.Slot == 0 || receipt.Status != types.MutationCommitted || !receipt.Applied {
+			t.Fatal("mixed FFI ACK unavailable")
+		}
+		var found managedKVRead
+		if json.Unmarshal(invoke("kv_get", map[string]any{"key_b64": []byte(original.Key), "consistency": "linearizable"}), &found) != nil || !found.Found || !bytes.Equal(found.Value, original.Value) || found.AppliedSlot < receipt.Slot {
+			t.Fatal("mixed FFI ACK readback mismatch")
+		}
+	}
 	var closeResult struct {
 		Error *ffiError `json:"error"`
 	}
@@ -159,7 +182,11 @@ func TestManagedFFIInClusterSQLLifecycle(t *testing.T) {
 	if err != nil || !bytes.Equal(registered, after) {
 		t.Fatal("FFI SQL/close replaced the actual voter registration")
 	}
-	t.Log("actual in-cluster Go FFI -> managed Host -> SQL ACK readback -> close passed; no Rust or physical-fencing claim")
+	if mixed {
+		t.Log("actual in-cluster Go FFI -> mixed managed Host -> SQL KV ACK readback -> close passed")
+	} else {
+		t.Log("actual in-cluster Go FFI -> managed Host -> SQL ACK readback -> close passed; no Rust or physical-fencing claim")
+	}
 }
 
 func committedFFIReceipt(raw json.RawMessage) bool {

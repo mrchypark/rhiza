@@ -8,6 +8,10 @@ permissions:
   contents: read
 jobs:
   bootstrap:
+    strategy:
+      fail-fast: false
+      matrix:
+        fixture: [legacy, mixed]
     runs-on: ubuntu-latest
     timeout-minutes: 25
     steps:
@@ -23,6 +27,7 @@ jobs:
           sh -n scripts/ha-managed-bootstrap-fixture.sh
           sh -n scripts/managed-ffi-contract-entrypoint.sh
           sh scripts/managed-ffi-contract-entrypoint.sh --diagnostic-self-test
+          sh -c '. scripts/ha-managed-bootstrap-fixture.sh; managed_mixed_tuple_self_test'
           sh -n scripts/test-ha-managed-cluster-chaos.sh
           sh scripts/test-ha-managed-cluster-chaos-test.sh
           sh scripts/test-ha-managed-direct-host-chaos-test.sh
@@ -35,10 +40,11 @@ jobs:
         env:
           RHIZA_MANAGED_BUCKET_SETUP: ./scripts/ha-managed-bucket-setup
           RHIZA_MANAGED_TEST_DOCKERFILE: Dockerfile.managed-ffi-contract
+          RHIZA_MANAGED_FIXTURE_CASE: ${{ matrix.fixture }}
         run: sh scripts/test-ha-managed-bootstrap.sh
       - name: Preserve non-secret diagnostics
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: ha-managed-bootstrap-${{ github.run_id }}
+          name: ha-managed-bootstrap-${{ matrix.fixture }}-${{ github.run_id }}
           path: ${{ runner.temp }}/ha-managed-bootstrap

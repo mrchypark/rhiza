@@ -41,17 +41,22 @@ run_contract() {
     printf '%s\n' "$code" > "$diag_dir/$stage.exit"
   ) 2>&1 | awk '
     function emit(s) { if (used+length(s)+1<=65536) { print s; used+=length(s)+1 } }
-    /^=== RUN   TestManagedFFIInClusterSQLLifecycle$/ { emit($0); next }
-    /^--- (PASS|FAIL): TestManagedFFIInClusterSQLLifecycle / { emit(substr($0,1,160)); next }
+    /^=== RUN   TestManagedFFIInCluster(SQL|Mixed)Lifecycle$/ { emit($0); next }
+    /^--- (PASS|FAIL): TestManagedFFIInCluster(SQL|Mixed)Lifecycle / { emit(substr($0,1,160)); next }
     /^[[:space:]]*managed_incluster_test.go:[0-9]+:/ {
       emit("GO_CONTRACT_SOURCE " $1)
       if (match($0,/code=[a-z_]+/)) emit(substr($0,RSTART,RLENGTH))
       if (index($0,"actual in-cluster Go FFI -> managed Host -> SQL ACK readback -> close passed")) emit("actual in-cluster Go FFI -> managed Host -> SQL ACK readback -> close passed")
+      if (index($0,"actual in-cluster Go FFI -> mixed managed Host -> SQL KV ACK readback -> close passed")) emit("actual in-cluster Go FFI -> mixed managed Host -> SQL KV ACK readback -> close passed")
       next
     }
     /^FAIL: managed-ha-contract [a-z_]+$/ { emit(substr($0,1,160)); next }
     /^PASS: managed Rust FFI SQL contract$/ { emit($0); next }
     /^PASS: prior managed Rust ACK verified$/ { emit($0); next }
+    /^PASS: managed Rust FFI mixed (initial|verify) contract$/ { emit($0); next }
+    /^RUST_MIXED_ROW_ACK_SLOT=[0-9]+$/ { emit($0); next }
+    /^RUST_MIXED_CURRENT_UID=[0-9a-fA-F-]+$/ { emit($0); next }
+    /^RUST_MIXED_TUPLE=/ { if (length($0)<=16384) emit($0); next }
     /^panic: test timed out after [0-9hms.]+$/ { emit($0); next }
     /^(PASS|FAIL)$/ { emit($0) }
   ' > "$diag_dir/active.log"
@@ -85,9 +90,36 @@ if [ "${1-}" = --diagnostic-self-test ]; then
   grep -Fx 'GO_CONTRACT_SOURCE managed_incluster_test.go:123:' "$diag_dir/first.log" >/dev/null
   exit 0
 fi
-if [ "${1-}" = serve-managed-sql ] && [ -e /var/lib/rhiza/repair.json ]; then
+if [ "${1-}" = serve-managed-sql ]; then
   marker_output=$(RHIZA_RUST_CONTRACT_MARKER=1 /usr/local/libexec/rhiza-managed-ffi-contract \
     -test.run='^TestRustContractRunStartedMarker$' -test.count=1 -test.v -test.timeout=10s)
+  if printf '%s\n' "$marker_output" | grep -Fx 'RHIZA_RUST_FIXTURE_PROFILE=mixed' >/dev/null; then
+    mixed_mode=$(printf '%s\n' "$marker_output" | sed -n 's/^RHIZA_RUST_CONTRACT_MODE=//p')
+    producer_uid=$(printf '%s\n' "$marker_output" | sed -n 's/^RHIZA_RUST_CONTRACT_PRODUCER_UID=//p')
+    printf '%s\n' "$producer_uid" | grep -Eq '^[0-9a-fA-F-]{16,64}$' || { echo 'FAIL: invalid mixed producer UID' >&2; exit 1; }
+    export RHIZA_RUST_PRODUCER_UID="$producer_uid"
+    case "$mixed_mode" in
+      skip) ;;
+      initial|verify)
+        if [ -d "$diag_dir" ]; then
+          [ "$mixed_mode" = verify ] || { emit_first_contract; exit 125; }
+          go_stage=go-restart rust_stage=rust-restart
+        else
+          mkdir -m 700 "$diag_dir"
+          (set -C; : > "$diag_dir/first.log")
+          sync
+          go_stage=go-initial rust_stage=rust-initial
+        fi
+        if [ -e /var/lib/rhiza/repair.json ]; then
+          [ "$mixed_mode" = verify ] || { echo 'FAIL: replacement cannot run initial mixed writes' >&2; exit 1; }
+          RHIZA_FFI_IN_CLUSTER_CONTRACT=1 run_contract "$go_stage" /usr/local/libexec/rhiza-managed-ffi-contract \
+            -test.run='^TestManagedFFIInClusterMixedLifecycle$' -test.count=1 -test.v -test.timeout=120s
+        fi
+        run_contract "$rust_stage" /usr/local/libexec/rhiza-rust-managed-contract "--mixed-$mixed_mode"
+        ;;
+      *) echo 'FAIL: mixed contract phase unavailable' >&2; exit 1 ;;
+    esac
+  elif [ -e /var/lib/rhiza/repair.json ]; then
   case "$marker_output" in
     *RHIZA_RUST_CONTRACT_MODE=initial*) rust_initial=1 ;;
     *RHIZA_RUST_CONTRACT_MODE=restart*) rust_initial=0 ;;
@@ -109,6 +141,7 @@ if [ "${1-}" = serve-managed-sql ] && [ -e /var/lib/rhiza/repair.json ]; then
     -test.run='^TestManagedFFIInClusterSQLLifecycle$' -test.count=1 -test.v -test.timeout=120s
   if [ "$rust_initial" = 1 ]; then
     run_contract rust-initial /usr/local/libexec/rhiza-rust-managed-contract --initial-run
+  fi
   fi
 fi
 # The contract closes its real FFI Host before normal same-Pod adopted startup.
