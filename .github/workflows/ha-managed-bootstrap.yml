@@ -20,6 +20,12 @@ jobs:
             provider: gcs
           - fixture: mixed
             provider: azure
+          - fixture: internal
+            provider: s3
+          - fixture: internal
+            provider: gcs
+          - fixture: internal
+            provider: azure
     runs-on: ubuntu-latest
     timeout-minutes: 25
     steps:

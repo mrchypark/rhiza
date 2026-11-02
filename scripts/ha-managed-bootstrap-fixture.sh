@@ -138,6 +138,7 @@ fixture_case=${RHIZA_MANAGED_FIXTURE_CASE:-legacy}
 case "$fixture_case" in
   legacy) fixture_protocol='' fixture_evidence=rhiza-managed-sql/v1 ;;
   mixed) fixture_protocol=rhiza-managed-sql-kv/v1 fixture_evidence=rhiza-managed-sql-kv/v1 ;;
+  internal) fixture_protocol=rhiza-managed-request/v1 fixture_evidence=rhiza-managed-request/v1 ;;
   *) echo 'invalid managed fixture case' >&2; return 1 ;;
 esac
 floci_node_selector='{}'
@@ -151,7 +152,7 @@ esac
 if [ "$fixture_case" = legacy ] && [ "$fixture_provider" != s3 ]; then
   echo 'legacy runtime qualification is S3-only' >&2; return 1
 fi
-printf 'case=%s\nprovider=%s\nemulator=%s\nport=%s\n' "$fixture_case" "$fixture_provider" "$floci_image" "$floci_port" > "$logs/fixture-provider.txt"
+printf 'case=%s\nprovider=%s\nemulator=%s\nport=%s\nprotocol=%s\n' "$fixture_case" "$fixture_provider" "$floci_image" "$floci_port" "$fixture_protocol" > "$logs/fixture-provider.txt"
 if [ -n "${RHIZA_MANAGED_FIXTURE_NODE-}" ]; then
   printf '%s\n' "$RHIZA_MANAGED_FIXTURE_NODE" | grep -Eq '^[a-z0-9][a-z0-9.-]{0,252}$' || {
     echo 'invalid optional Floci fixture node hostname' >&2; return 1;
@@ -261,11 +262,14 @@ run_client create-sql execute '{"request_id":"bootstrap-create","sql":"CREATE TA
 run_client insert-sql execute '{"request_id":"bootstrap-insert","sql":"INSERT INTO bootstrap_ci VALUES (1, '\''real-kubelet'\'')"}'
 run_client query query '{"sql":"SELECT id, value FROM bootstrap_ci"}'
 jq -e '.rows==[[1,"real-kubelet"]]' "$logs/query.json" >/dev/null
-if [ "$fixture_case" = mixed ]; then
+if [ "$fixture_case" != legacy ]; then
   producer_uid=$(jq -er '.status.bootstrapPlan.members|sort_by(.member.node_id)|.[0].podUID' "$logs/committed.json")
   producer_pod=$(jq -er --arg uid "$producer_uid" '.items[]|select(.metadata.uid==$uid)|.metadata.name' "$logs/ready-pods.json")
   jq -e 'all(.items[]; all(.status.containerStatuses[]; .restartCount==0))' "$logs/ready-pods.json" >/dev/null
   k -n "$namespace" logs "$producer_pod" -c sql > "$logs/rust-mixed-prefault.log"
+  if [ "$fixture_case" = internal ]; then
+    [ "$(grep -Fxc 'RHIZA_ACTUAL_MATERIALIZATION_PROFILE=9' "$logs/rust-mixed-prefault.log")" = 1 ]
+  fi
   managed_mixed_tuple_oracle "$logs/rust-mixed-prefault.log" initial "$producer_uid" "$logs/rust-mixed-prefault-tuple.json"
   [ "$(grep -c '^RUST_MIXED_ROW_ACK_SLOT=[1-9][0-9]*$' "$logs/rust-mixed-prefault.log")" = 1 ]
   run_client mixed-prefault query '{"sql":"SELECT tuple FROM rust_mixed_contract WHERE id=1","consistency":"linearizable"}'
@@ -281,7 +285,7 @@ cmp "$logs/immutable-before.json" "$logs/immutable-after.json"
 # process or outstanding object-store request has physically terminated.
 old_pod=$(jq -r '.items|sort_by(.metadata.name)|.[0].metadata.name' "$logs/ready-pods.json")
 old_uid=$(jq -r --arg name "$old_pod" '.items[]|select(.metadata.name==$name)|.metadata.uid' "$logs/ready-pods.json")
-if [ "$fixture_case" = mixed ]; then
+if [ "$fixture_case" != legacy ]; then
   old_pod=$producer_pod old_uid=$producer_uid
   k -n "$namespace" get pod "$old_pod" -o json > "$logs/rust-mixed-producer-before.json"
   jq -e --arg uid "$producer_uid" '.metadata.uid==$uid and any(.status.containerStatuses[]; .name=="sql" and .ready==true and .restartCount==0)' "$logs/rust-mixed-producer-before.json" >/dev/null
@@ -307,7 +311,10 @@ if [ "${RHIZA_MANAGED_TEST_DOCKERFILE-}" = Dockerfile.managed-ffi-contract ]; th
   # A failed test must not become a pass through kubelet retries/new request IDs.
   [ "$restart_before" = 0 ] || { echo 'FFI contract initial main restarted; retain first failure' >&2; return 1; }
   k -n "$namespace" logs "$replacement_pod" -c sql > "$logs/go-ffi-contract-first.log"
-  if [ "$fixture_case" = mixed ]; then
+  if [ "$fixture_case" = internal ]; then
+    [ "$(grep -Fxc 'RHIZA_ACTUAL_MATERIALIZATION_PROFILE=9' "$logs/go-ffi-contract-first.log")" = 1 ]
+  fi
+  if [ "$fixture_case" != legacy ]; then
     grep -F 'actual in-cluster Go FFI -> mixed managed Host -> SQL KV ACK readback -> close passed' "$logs/go-ffi-contract-first.log" >/dev/null
     managed_mixed_tuple_oracle "$logs/go-ffi-contract-first.log" verify "$replacement_uid" "$logs/rust-mixed-replacement-tuple.json"
     cmp "$logs/rust-mixed-prefault-tuple.json" "$logs/rust-mixed-replacement-tuple.json"
@@ -331,7 +338,10 @@ done
 if [ "${RHIZA_MANAGED_TEST_DOCKERFILE-}" = Dockerfile.managed-ffi-contract ]; then
   jq -e --argjson before "$restart_before" 'any(.status.containerStatuses[]; .name=="sql" and .restartCount==($before+1))' "$logs/restarted-pod.json" >/dev/null
   k -n "$namespace" logs "$replacement_pod" -c sql > "$logs/go-ffi-contract-restart.log"
-  if [ "$fixture_case" = mixed ]; then
+  if [ "$fixture_case" = internal ]; then
+    [ "$(grep -Fxc 'RHIZA_ACTUAL_MATERIALIZATION_PROFILE=9' "$logs/go-ffi-contract-restart.log")" = 1 ]
+  fi
+  if [ "$fixture_case" != legacy ]; then
     grep -F 'actual in-cluster Go FFI -> mixed managed Host -> SQL KV ACK readback -> close passed' "$logs/go-ffi-contract-restart.log" >/dev/null
     managed_mixed_tuple_oracle "$logs/go-ffi-contract-restart.log" verify "$replacement_uid" "$logs/rust-mixed-restart-tuple.json"
     cmp "$logs/rust-mixed-prefault-tuple.json" "$logs/rust-mixed-restart-tuple.json"

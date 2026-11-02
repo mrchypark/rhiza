@@ -7,7 +7,7 @@ emit_first_contract() {
   if [ -f "$diag_dir/first.log" ]; then
     printf '%s\n' 'FIRST_CONTRACT_DIAGNOSTIC_BEGIN' >&2
     sed -n '1,200p' "$diag_dir/first.log" >&2
-    for first_stage in go-initial rust-initial; do
+    for first_stage in go-initial rust-initial internal-profile-initial; do
       if [ -f "$diag_dir/$first_stage.exit" ]; then
         first_code=$(cat "$diag_dir/$first_stage.exit")
         case "$first_code" in ''|*[!0-9]*) first_code=unknown ;; esac
@@ -23,12 +23,12 @@ run_contract() {
   stage=$1
   shift
   case "$stage" in
-    go-initial|rust-initial)
+    go-initial|rust-initial|internal-profile-initial)
       [ ! -e "$diag_dir/$stage.exit" ] || { emit_first_contract; return 125; }
       printf 'FIRST_CONTRACT_STAGE %s started\n' "$stage" >> "$diag_dir/first.log"
       sync
       ;;
-    go-restart|rust-restart) rm -f "$diag_dir/$stage.exit" ;;
+    go-restart|rust-restart|internal-profile-restart) rm -f "$diag_dir/$stage.exit" ;;
     *) echo 'FAIL: invalid contract diagnostic stage' >&2; return 125 ;;
   esac
   # Drain all child output without SIGPIPE or limits on its WAL/SQLite files.
@@ -57,13 +57,14 @@ run_contract() {
     /^RUST_MIXED_ROW_ACK_SLOT=[0-9]+$/ { emit($0); next }
     /^RUST_MIXED_CURRENT_UID=[0-9a-fA-F-]+$/ { emit($0); next }
     /^RUST_MIXED_TUPLE=/ { if (length($0)<=16384) emit($0); next }
+    /^RHIZA_ACTUAL_MATERIALIZATION_PROFILE=9$/ { emit($0); next }
     /^panic: test timed out after [0-9hms.]+$/ { emit($0); next }
     /^(PASS|FAIL)$/ { emit($0) }
   ' > "$diag_dir/active.log"
   code=$(cat "$diag_dir/$stage.exit")
   case "$code" in ''|*[!0-9]*) echo 'FAIL: contract exit outcome unavailable' >&2; return 125 ;; esac
   case "$stage" in
-    go-initial|rust-initial)
+    go-initial|rust-initial|internal-profile-initial)
       remaining=32600
       awk -v remaining="$remaining" '{ if (remaining>0) { text=substr($0,1,remaining-1); print text; remaining-=length(text)+1 } }' "$diag_dir/active.log" >> "$diag_dir/first.log"
       ;;
@@ -93,7 +94,9 @@ fi
 if [ "${1-}" = serve-managed-sql ]; then
   marker_output=$(RHIZA_RUST_CONTRACT_MARKER=1 /usr/local/libexec/rhiza-managed-ffi-contract \
     -test.run='^TestRustContractRunStartedMarker$' -test.count=1 -test.v -test.timeout=10s)
-  if printf '%s\n' "$marker_output" | grep -Fx 'RHIZA_RUST_FIXTURE_PROFILE=mixed' >/dev/null; then
+  fixture_profile=$(printf '%s\n' "$marker_output" | sed -n 's/^RHIZA_RUST_FIXTURE_PROFILE=//p')
+  case "$fixture_profile" in sql|mixed|internal) ;; *) echo 'FAIL: explicit fixture profile unavailable' >&2; exit 1 ;; esac
+  if [ "$fixture_profile" = mixed ] || [ "$fixture_profile" = internal ]; then
     mixed_mode=$(printf '%s\n' "$marker_output" | sed -n 's/^RHIZA_RUST_CONTRACT_MODE=//p')
     producer_uid=$(printf '%s\n' "$marker_output" | sed -n 's/^RHIZA_RUST_CONTRACT_PRODUCER_UID=//p')
     printf '%s\n' "$producer_uid" | grep -Eq '^[0-9a-fA-F-]{16,64}$' || { echo 'FAIL: invalid mixed producer UID' >&2; exit 1; }
@@ -116,6 +119,10 @@ if [ "${1-}" = serve-managed-sql ]; then
             -test.run='^TestManagedFFIInClusterMixedLifecycle$' -test.count=1 -test.v -test.timeout=120s
         fi
         run_contract "$rust_stage" /usr/local/libexec/rhiza-rust-managed-contract "--mixed-$mixed_mode"
+        if [ "$fixture_profile" = internal ]; then
+          RHIZA_INTERNAL_MATERIALIZATION_MARKER=1 run_contract "internal-profile-${rust_stage#rust-}" /usr/local/libexec/rhiza-managed-ffi-contract \
+            -test.run='^TestManagedInternalMaterializationMarker$' -test.count=1 -test.v -test.timeout=10s
+        fi
         ;;
       *) echo 'FAIL: mixed contract phase unavailable' >&2; exit 1 ;;
     esac

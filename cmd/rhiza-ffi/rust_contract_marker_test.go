@@ -19,6 +19,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/mrchypark/rhiza/internal/sqlpolicy"
 	"github.com/mrchypark/rhiza/internal/types"
 	"github.com/mrchypark/rhiza/pkg/managedbootstrap"
 	"github.com/mrchypark/rhiza/pkg/operator"
@@ -72,6 +73,51 @@ func rustContractRunMode(path string) (bool, error) {
 	return initial, nil
 }
 
+func rustFixtureProfile(protocol string) (string, error) {
+	switch protocol {
+	case "":
+		return "sql", nil
+	case types.ManagedApplicationProtocolSQLKV:
+		return "mixed", nil
+	case sqlpolicy.ManagedRequestApplicationProtocol:
+		return "internal", nil
+	default:
+		return "", errors.New("unsupported explicit Rust fixture protocol")
+	}
+}
+
+func TestRustFixtureProfileSelection(t *testing.T) {
+	for _, tc := range []struct{ protocol, want string }{{"", "sql"}, {types.ManagedApplicationProtocolSQLKV, "mixed"}, {sqlpolicy.ManagedRequestApplicationProtocol, "internal"}} {
+		got, err := rustFixtureProfile(tc.protocol)
+		if err != nil || got != tc.want {
+			t.Fatalf("profile selection %q: %q %v", tc.protocol, got, err)
+		}
+	}
+	if _, err := rustFixtureProfile("rhiza-managed-request/v2"); err == nil {
+		t.Fatal("unknown profile fell back")
+	}
+}
+
+// The profile in the fixture secret alone is not proof that native code opened
+// the requested materializer. Inspect the actual file after the contract closes.
+func TestManagedInternalMaterializationMarker(t *testing.T) {
+	if os.Getenv("RHIZA_INTERNAL_MATERIALIZATION_MARKER") != "1" {
+		t.Skip("CI-only actual internal materialization check")
+	}
+	file, err := os.Open(operator.V1Alpha2ManagedRuntimeProfilePath)
+	if err != nil {
+		t.Fatal("internal runtime profile unavailable")
+	}
+	profile, decodeErr := operator.DecodeV1Alpha2RuntimeProfile(file)
+	if err := errors.Join(decodeErr, file.Close()); err != nil || profile.ApplicationProtocol != sqlpolicy.ManagedRequestApplicationProtocol {
+		t.Fatal("actual runtime profile is not internal")
+	}
+	if err := sqlpolicy.CheckFileForPolicy(context.Background(), filepath.Join(operator.V1Alpha2BootstrapDataDir, "data", "sqlite.db"), sqlpolicy.ManagedRequestMaterializationPolicy); err != nil {
+		t.Fatal("actual internal materialization marker mismatch")
+	}
+	fmt.Println("RHIZA_ACTUAL_MATERIALIZATION_PROFILE=9")
+}
+
 func TestRustContractRunStartedMarker(t *testing.T) {
 	if os.Getenv("RHIZA_RUST_CONTRACT_MARKER") != "1" {
 		t.Skip("CI-only durable Rust initial-run selection")
@@ -84,7 +130,11 @@ func TestRustContractRunStartedMarker(t *testing.T) {
 	if err := errors.Join(decodeErr, profileFile.Close()); err != nil {
 		t.Fatal("invalid contract profile")
 	}
-	if profile.ApplicationProtocol == types.ManagedApplicationProtocolSQLKV {
+	fixtureProfile, err := rustFixtureProfile(profile.ApplicationProtocol)
+	if err != nil {
+		t.Fatal("invalid Rust fixture profile")
+	}
+	if fixtureProfile == "mixed" || fixtureProfile == "internal" {
 		var plan operator.V1Alpha2BootstrapPlan
 		if err := managedbootstrap.ReadGateFile(operator.V1Alpha2BootstrapHandoffPath, &plan, 65536, false); err != nil {
 			t.Fatal("contract bootstrap unavailable")
@@ -106,7 +156,7 @@ func TestRustContractRunStartedMarker(t *testing.T) {
 				role = "verify"
 			}
 		}
-		fmt.Println("RHIZA_RUST_FIXTURE_PROFILE=mixed")
+		fmt.Println("RHIZA_RUST_FIXTURE_PROFILE=" + fixtureProfile)
 		fmt.Println("RHIZA_RUST_CONTRACT_MODE=" + role)
 		fmt.Println("RHIZA_RUST_CONTRACT_PRODUCER_UID=" + producer)
 		return
