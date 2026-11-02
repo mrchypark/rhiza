@@ -236,7 +236,7 @@ func TestOverloadInputChannelFullEmitsFixedSite(t *testing.T) {
 	// arm instead of the channel-full default arm, so keep this context live.
 	batcher := &mutationBatcher[KVMutationRequest]{
 		encodeItem: func(KVMutationRequest) ([]byte, error) { return []byte("v"), nil },
-		assemble:   func([][]byte) []byte { return []byte("v") },
+		assemble:   func([][]byte) ([]byte, error) { return []byte("v"), nil },
 		requestID:  func(KVMutationRequest) string { return "request" },
 		input:      make(chan *batchItem, maxQueuedRequests),
 		ctx:        context.Background(),
