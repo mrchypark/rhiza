@@ -16,7 +16,7 @@ func TestManagedBootstrapProfileRefusesActivationBeforeEffects(t *testing.T) {
 		n := New(&types.ExecutionConfig{ClusterID: "cluster", NodeID: "member", DataDir: dir, PeerAddr: "127.0.0.1:0"})
 		checker := &managedTestChecker{}
 		err := n.OpenManaged(context.Background(), ManagedStartupConfig{Checker: checker, Identity: ManagedStartupIdentity{ApplicationProtocol: protocol}})
-		if err == nil || !strings.Contains(err.Error(), "protocol runtime is not supported") {
+		if err == nil {
 			t.Fatalf("activation guard: %v", err)
 		}
 		files, err := os.ReadDir(dir)

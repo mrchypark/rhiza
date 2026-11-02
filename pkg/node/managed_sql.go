@@ -12,6 +12,7 @@ import (
 	"time"
 
 	objectstore "github.com/mrchypark/rhiza/internal/objstore"
+	"github.com/mrchypark/rhiza/internal/sqlpolicy"
 	"github.com/mrchypark/rhiza/internal/types"
 	"github.com/mrchypark/rhiza/pkg/materializer"
 	"github.com/mrchypark/rhiza/pkg/network"
@@ -104,11 +105,18 @@ func (n *Node) managedSQLBucket(ctx context.Context) (*objectstore.MeteredBucket
 }
 
 func (n *Node) managedSQLScope(i ManagedStartupIdentity) ([]byte, string, error) {
-	source, _, err := n.preparedBindingDigests()
+	policy, _, err := types.ManagedApplicationPolicy(i.ApplicationProtocol)
+	if err != nil {
+		return nil, "", err
+	}
+	if policy == sqlpolicy.ManagedSQLKVMaterializationPolicy && (i.Member.Generation != 0 || i.EvidenceFormat != types.ManagedApplicationProtocolSQLKV) {
+		return nil, "", fmt.Errorf("unsupported managed application generation or evidence format")
+	}
+	source, _, err := n.preparedBindingDigestsForProtocol(i.ApplicationProtocol)
 	if err != nil || source != i.PhysicalBinding {
 		return nil, "", errors.Join(fmt.Errorf("initial SQL physical binding mismatch"), err)
 	}
-	common, err := n.ManagedBootstrapPlanDigest(source, i.EvidenceFormat)
+	common, err := n.ManagedBootstrapPlanDigestForProtocol(source, i.EvidenceFormat, i.ApplicationProtocol)
 	if err != nil || common != i.BootstrapPlanDigest {
 		return nil, "", errors.Join(fmt.Errorf("initial SQL bootstrap binding mismatch"), err)
 	}
@@ -223,7 +231,7 @@ func (n *Node) VerifyManagedSQLFreshSource(ctx context.Context, i ManagedStartup
 	if err != nil {
 		return err
 	}
-	view, err := recovery.OpenReadOnlyView(ctx, source, prefix, 1, *n.loadClusterConfig())
+	view, err := recovery.OpenReadOnlyViewForPolicy(ctx, source, prefix, 1, *n.loadClusterConfig(), n.materializationPolicy(), n.receiptWindow())
 	if err != nil {
 		return err
 	}
@@ -265,39 +273,77 @@ func (n *Node) InspectManagedSQLRead(ctx context.Context) (ManagedSQLSnapshot, e
 }
 
 func (n *Node) inspectManagedSQL(ctx context.Context, fresh, localRead bool) (ManagedSQLSnapshot, error) {
+	if n.materializationPolicy() != sqlpolicy.LegacyMaterializationPolicy {
+		return ManagedSQLSnapshot{}, fmt.Errorf("mixed runtime requires mixed application evidence")
+	}
+	digest, empty, runtime, err := n.inspectManagedApplication(ctx, fresh, localRead)
+	return ManagedSQLSnapshot{Application: materializer.SQLApplicationState{Digest: digest, FreshEmpty: empty}, Runtime: runtime}, err
+}
+
+type ManagedKVSnapshot struct {
+	Application materializer.ManagedApplicationState
+	Runtime     ManagedRuntimeState
+}
+
+// InspectManagedKV is mixed evidence only, not public request status or ACK.
+func (n *Node) InspectManagedKV(ctx context.Context, fresh bool) (ManagedKVSnapshot, error) {
+	if n.materializationPolicy() != sqlpolicy.ManagedSQLKVMaterializationPolicy {
+		return ManagedKVSnapshot{}, fmt.Errorf("mixed evidence requires the mixed application profile")
+	}
+	digest, empty, runtime, err := n.inspectManagedApplication(ctx, fresh, false)
+	return ManagedKVSnapshot{Application: materializer.ManagedApplicationState{Digest: digest, FreshEmpty: empty}, Runtime: runtime}, err
+}
+
+func (n *Node) inspectApplicationState(ctx context.Context, m *materializer.Materializer) ([32]byte, bool, error) {
+	if n.materializationPolicy() == sqlpolicy.ManagedSQLKVMaterializationPolicy {
+		state, err := m.InspectManagedApplicationState(ctx)
+		return state.Digest, state.FreshEmpty, err
+	}
+	state, err := m.InspectSQLApplicationState(ctx)
+	return state.Digest, state.FreshEmpty, err
+}
+
+func (n *Node) inspectManagedApplication(ctx context.Context, fresh, localRead bool) (digest [32]byte, empty bool, runtime ManagedRuntimeState, resultErr error) {
+	// Keep one certified-prefix/adoption check for both evidence domains.
+	fail := func(err error) ([32]byte, bool, ManagedRuntimeState, error) {
+		return [32]byte{}, false, ManagedRuntimeState{}, err
+	}
 	if _, err := n.ManagedState(); err != nil {
-		return ManagedSQLSnapshot{}, err
+		return fail(err)
 	}
 	if !localRead {
 		if err := n.replayLocalDecisions(ctx); err != nil {
-			return ManagedSQLSnapshot{}, err
+			return fail(err)
 		}
 	}
 	n.replayMu.Lock()
 	defer n.replayMu.Unlock()
 	before := n.managedRuntimeState()
 	floor := n.core.CompactionFloor()
+	if fresh && n.materializationPolicy() == sqlpolicy.ManagedSQLKVMaterializationPolicy && floor != 0 {
+		return fail(fmt.Errorf("compacted application history is not fresh-state proof"))
+	}
 	if floor > 0 {
 		adoption := n.managedStartup.verifiedAdoption
 		if adoption == nil || adoption.BaseSeal == nil || adoption.WALIdentity != before.WALIdentity {
-			return ManagedSQLSnapshot{}, fmt.Errorf("SQL host requires a verified prepared checkpoint adoption")
+			return fail(fmt.Errorf("managed host requires a verified prepared checkpoint adoption"))
 		}
 		base, root, ok := n.core.RecoveryRoot()
 		prefix, prefixOK := n.core.PrefixHash(adoption.BaseSeal.Index)
 		adoptedPrefix, adoptedOK := n.core.PrefixHash(adoption.Tip)
 		membership, membershipErr := n.core.MembershipHistory()
 		if !ok || base != adoption.BaseSeal.Index || root != adoption.BaseSeal.RootHash || !prefixOK || prefix != adoption.BaseSeal.PrefixHash || !adoptedOK || adoptedPrefix != adoption.PrefixHash || n.core.Tip() < adoption.Tip || membershipErr != nil || adoption.Membership == nil || !membershipHistoryHasPrefix(*adoption.Membership, membership) {
-			return ManagedSQLSnapshot{}, errors.Join(fmt.Errorf("SQL host checkpoint adoption no longer matches actual WAL"), membershipErr)
+			return fail(errors.Join(fmt.Errorf("managed host checkpoint adoption no longer matches actual WAL"), membershipErr))
 		}
 	}
 	if before.WALIdentity == "" || before.AppliedTip > before.CertifiedTip || !localRead && (before.RecorderTip > before.CertifiedTip || before.AppliedTip != before.CertifiedTip) {
-		return ManagedSQLSnapshot{}, fmt.Errorf("SQL host requires registered, resolved history")
+		return fail(fmt.Errorf("managed host requires registered, resolved history"))
 	}
 	from := floor + 1
 	for uint64(from) <= before.AppliedTip {
 		values, _, err := n.core.DecisionsFrom(from, 256)
 		if err != nil || len(values) == 0 {
-			return ManagedSQLSnapshot{}, fmt.Errorf("SQL history unavailable: %w", err)
+			return fail(fmt.Errorf("managed history unavailable: %w", err))
 		}
 		for _, v := range values {
 			if uint64(v.Slot) > before.AppliedTip {
@@ -305,13 +351,25 @@ func (n *Node) inspectManagedSQL(ctx context.Context, fresh, localRead bool) (Ma
 			}
 			if uint64(v.Slot) == before.AppliedTip {
 				if err := n.material.ValidateTip(before.AppliedTip, v.Value); err != nil {
-					return ManagedSQLSnapshot{}, err
+					return fail(err)
 				}
 			}
 			if len(v.Value) != 0 {
+				if n.materializationPolicy() == sqlpolicy.ManagedSQLKVMaterializationPolicy {
+					if err := n.validateExecutionPolicy(v.Value); err != nil {
+						return fail(err)
+					}
+					if fresh {
+						if err := managedSQLControlOnly(v.Value); err != nil {
+							return fail(err)
+						}
+					}
+					from = v.Slot + 1
+					continue
+				}
 				_, sql, err := types.DecodeSQLBatch(v.Value)
 				if err != nil || sql && fresh {
-					return ManagedSQLSnapshot{}, fmt.Errorf("application history prevents fresh SQL initialization")
+					return fail(fmt.Errorf("application history prevents fresh SQL initialization"))
 				}
 				if !sql {
 					_, schedule, e1 := types.DecodeLeaderSchedule(v.Value)
@@ -319,24 +377,24 @@ func (n *Node) inspectManagedSQL(ctx context.Context, fresh, localRead bool) (Ma
 					_, seal, e3 := types.DecodeCheckpointSeal(v.Value)
 					reconfig, e4 := types.DecodeReconfiguration(v.Value)
 					if e1 != nil || e2 != nil || e3 != nil || e4 != nil || !(schedule || barrier || seal || reconfig) {
-						return ManagedSQLSnapshot{}, fmt.Errorf("non-SQL application history")
+						return fail(fmt.Errorf("non-SQL application history"))
 					}
 				}
 			}
 			from = v.Slot + 1
 		}
 	}
-	app, err := n.material.InspectSQLApplicationState(ctx)
+	digest, empty, err := n.inspectApplicationState(ctx, n.material)
 	if err != nil {
-		return ManagedSQLSnapshot{}, err
+		return fail(err)
 	}
-	if fresh && !app.FreshEmpty {
-		return ManagedSQLSnapshot{}, fmt.Errorf("application state is not fresh empty")
+	if fresh && !empty {
+		return fail(fmt.Errorf("application state is not fresh empty"))
 	}
 	if before != n.managedRuntimeState() {
-		return ManagedSQLSnapshot{}, fmt.Errorf("history changed during SQL inspection")
+		return fail(fmt.Errorf("history changed during application inspection"))
 	}
-	return ManagedSQLSnapshot{Application: app, Runtime: before}, nil
+	return digest, empty, before, nil
 }
 
 func (n *Node) ExecuteManagedSQL(ctx context.Context, req network.ExecuteRequest) (network.ExecuteResponse, error) {

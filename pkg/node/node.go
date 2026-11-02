@@ -245,7 +245,7 @@ func (n *Node) openInternal(ctx context.Context, enroll bool, prelocked *qlog.Lo
 		return fmt.Errorf("local mode requires standalone storage without listeners, membership, or enrollment")
 	}
 	if !n.config.Local {
-		if err := sqlpolicy.CheckExisting(ctx, n.config.DataDir+"/sqlite.db"); err != nil {
+		if err := sqlpolicy.CheckExistingForPolicy(ctx, n.config.DataDir+"/sqlite.db", n.materializationPolicy()); err != nil {
 			return err
 		}
 	}
@@ -509,7 +509,7 @@ func (n *Node) openInternal(ctx context.Context, enroll bool, prelocked *qlog.Lo
 			n.checkpoints = checkpoint.NewManager(bucket, clusterPrefix, n.config.DataDir, 1)
 			n.archive = recovery.NewManager(bucket, clusterPrefix, 1)
 		} else {
-			n.checkpoints, err = checkpoint.NewAppendOnlyManager(bucket, clusterPrefix, n.config.DataDir, 1)
+			n.checkpoints, err = checkpoint.NewAppendOnlyManagerForPolicy(bucket, clusterPrefix, n.config.DataDir, n.materializationPolicy(), 1)
 			if err != nil {
 				return err
 			}
@@ -575,7 +575,7 @@ func (n *Node) openInternal(ctx context.Context, enroll bool, prelocked *qlog.Lo
 				return err
 			}
 		}
-		material, err = materializer.Open(filepath.Join(n.config.DataDir, "sqlite.db"), 4)
+		material, err = n.openMaterializer(filepath.Join(n.config.DataDir, "sqlite.db"), 4)
 		if err != nil {
 			if n.managedStartup != nil {
 				return fmt.Errorf("open managed materializer without replacing application evidence: %w", err)
@@ -589,7 +589,7 @@ func (n *Node) openInternal(ctx context.Context, enroll bool, prelocked *qlog.Lo
 			if rebuildErr := quarantineGraph(n.config.DataDir + "/latticedb"); rebuildErr != nil {
 				return fmt.Errorf("open materializer: %w; quarantine graph: %v", err, rebuildErr)
 			}
-			material, err = materializer.Open(filepath.Join(n.config.DataDir, "sqlite.db"), 4)
+			material, err = n.openMaterializer(filepath.Join(n.config.DataDir, "sqlite.db"), 4)
 			if err != nil {
 				return fmt.Errorf("rebuild materializer: %w", err)
 			}
@@ -608,13 +608,19 @@ func (n *Node) openInternal(ctx context.Context, enroll bool, prelocked *qlog.Lo
 	var transport *network.Transport
 	var coreTransport quepaxa.Transport
 	if !n.config.Local {
-		transport = network.NewTransport(n.config.ClusterID, n.config.NodeID, cluster, n.config.PeerToken)
+		transport, err = network.NewTransportForPolicy(n.config.ClusterID, n.config.NodeID, cluster, n.config.PeerToken, n.materializationPolicy())
+		if err != nil {
+			return err
+		}
 		coreTransport = transport
 	}
 	n.transport = transport
 	if len(cluster.Members) > 1 {
 		n.catchUpWake = make(chan struct{}, 1)
-		n.catchUp = network.NewTransport(n.config.ClusterID, n.config.NodeID, cluster, n.config.PeerToken)
+		n.catchUp, err = network.NewTransportForPolicy(n.config.ClusterID, n.config.NodeID, cluster, n.config.PeerToken, n.materializationPolicy())
+		if err != nil {
+			return err
+		}
 	}
 	// An unpromoted learner holds no voting identity, so it authenticates its
 	// read-only sync with the cluster admin token until its promotion applies.
@@ -701,6 +707,16 @@ func (n *Node) openInternal(ctx context.Context, enroll bool, prelocked *qlog.Lo
 			return n.checkpoints.Verify(ctx, uint64(seal.Index), seal.RootHash, seal.StateHash)
 		})
 	}
+	if n.materializationPolicy() == sqlpolicy.ManagedSQLKVMaterializationPolicy {
+		if core.GenerationAnchorHash() != ([32]byte{}) {
+			return fmt.Errorf("mixed generation anchors are not supported")
+		}
+		if n.archive != nil {
+			if _, anchored := n.archive.GenerationAnchor(); anchored {
+				return fmt.Errorf("mixed generation anchors are not supported")
+			}
+		}
+	}
 	generationCheckpoint, err := n.installGenerationAnchor(startupRecovery)
 	if err != nil {
 		return fmt.Errorf("restore generation anchor: %w", startupRecovery.Check(err))
@@ -715,6 +731,20 @@ func (n *Node) openInternal(ctx context.Context, enroll bool, prelocked *qlog.Lo
 			archiveBase = snapshot.RecoveryBase
 		}
 		if seal, decision, ok := archiveBase(); ok && core.Tip() < seal.Index {
+			if n.materializationPolicy() == sqlpolicy.ManagedSQLKVMaterializationPolicy {
+				dir, err := os.MkdirTemp(n.config.DataDir, ".rhiza-managed-base-*")
+				if err != nil {
+					return err
+				}
+				files, readErr := n.checkpoints.DownloadRootFiles(startupRecovery.Context(), uint64(seal.Index), seal.RootHash, dir)
+				if readErr == nil {
+					readErr = n.validateCheckpointFiles(startupRecovery.Context(), files, uint64(seal.Index))
+				}
+				cleanupErr := os.RemoveAll(dir)
+				if err := errors.Join(readErr, cleanupErr); err != nil {
+					return err
+				}
+			}
 			if err := core.RestoreCheckpointBase(startupRecovery.Context(), seal, decision); err != nil {
 				return fmt.Errorf("restore checkpoint recovery base: %w", startupRecovery.Check(err))
 			}
@@ -728,7 +758,7 @@ func (n *Node) openInternal(ctx context.Context, enroll bool, prelocked *qlog.Lo
 				return startupRecovery.Check(archiveErr)
 			}
 			for _, decision := range values {
-				if err := types.ValidateExecutionPolicy(decision.Value); err != nil {
+				if err := n.validateExecutionPolicy(decision.Value); err != nil {
 					return err
 				}
 			}
@@ -739,7 +769,10 @@ func (n *Node) openInternal(ctx context.Context, enroll bool, prelocked *qlog.Lo
 	}
 	// Record RPCs must be available while every replica is recovering. Public
 	// proposals and learned decisions remain gated by ready=false.
-	server := network.NewServer(core, material, n.config.ClusterID, true, transport, n.Ready)
+	server, err := network.NewServerForPolicy(core, material, n.config.ClusterID, true, transport, n.materializationPolicy(), n.Ready)
+	if err != nil {
+		return err
+	}
 	server.SetTerminalDrain(func(ctx context.Context, expected network.TerminalDrainRequest) (any, error) {
 		return n.TerminalDrain(ctx, expected)
 	})
@@ -838,7 +871,10 @@ func (n *Node) openInternal(ctx context.Context, enroll bool, prelocked *qlog.Lo
 	if n.managedStartup != nil {
 		// Peer ReadIndex and learned/control traffic must not depend on the
 		// application evidence CAS. This server is never returned by API/Handler.
-		peerServer = network.NewServer(core, material, n.config.ClusterID, false, transport, n.ready.Load)
+		peerServer, err = network.NewServerForPolicy(core, material, n.config.ClusterID, false, transport, n.materializationPolicy(), n.ready.Load)
+		if err != nil {
+			return err
+		}
 		peerServer.SetLearnReady(n.managedLearnReady)
 		peerServer.SetCompactedHandler(n.wakeCatchUp)
 		if n.checkpoints != nil {
@@ -965,11 +1001,11 @@ func (n *Node) openInternal(ctx context.Context, enroll bool, prelocked *qlog.Lo
 	if restoreCheckpoint != nil {
 		if restoreCheckpoint.Index > material.Tip() {
 			if n.managedStartup != nil && (n.managedStartup.Prepared != nil || n.managedStartup.verifiedAdoption != nil) {
-				state, inspectErr := material.InspectSQLApplicationState(startupRecovery.Context())
+				_, freshEmpty, inspectErr := n.inspectApplicationState(startupRecovery.Context(), material)
 				if inspectErr != nil {
 					return fmt.Errorf("inspect existing managed SQLite before prepared restore: %w", inspectErr)
 				}
-				if !managedMaterializerWasAbsent || material.Tip() != 0 || !state.FreshEmpty {
+				if !managedMaterializerWasAbsent || material.Tip() != 0 || !freshEmpty {
 					return fmt.Errorf("refuse to replace non-empty managed SQLite with prepared checkpoint")
 				}
 			}
@@ -1634,7 +1670,7 @@ func (n *Node) catchUpArchive(ctx context.Context) error {
 			return err
 		}
 		for _, decision := range values {
-			if err := types.ValidateExecutionPolicy(decision.Value); err != nil {
+			if err := n.validateExecutionPolicy(decision.Value); err != nil {
 				return err
 			}
 		}
@@ -1757,6 +1793,9 @@ func (n *Node) restoreArchiveCatchUp(ctx context.Context) (resultErr error) {
 	if err != nil {
 		return checkRenewFailure(err)
 	}
+	if err := n.validateCheckpointFiles(workCtx, files, uint64(seal.Index)); err != nil {
+		return err
+	}
 	materialFiles := make([]materializer.CheckpointFile, 0, len(files))
 	for _, file := range files {
 		materialFiles = append(materialFiles, materializer.CheckpointFile{Role: materializer.CheckpointRole(file.Role), Path: file.Path})
@@ -1787,7 +1826,7 @@ func (n *Node) restoreArchiveCatchUp(ctx context.Context) (resultErr error) {
 			return err
 		}
 		for _, decision := range values {
-			if err := types.ValidateExecutionPolicy(decision.Value); err != nil {
+			if err := n.validateExecutionPolicy(decision.Value); err != nil {
 				return err
 			}
 		}
@@ -1807,7 +1846,7 @@ func (n *Node) restoreArchiveCatchUp(ctx context.Context) (resultErr error) {
 			return err
 		}
 		for _, decision := range values {
-			if err := types.ValidateExecutionPolicy(decision.Value); err != nil {
+			if err := n.validateExecutionPolicy(decision.Value); err != nil {
 				return err
 			}
 		}
@@ -2291,7 +2330,7 @@ func (n *Node) catchUpQuorum(ctx context.Context, transport *network.Transport, 
 			expected++
 		}
 		for _, decision := range best.Decisions {
-			if err := types.ValidateExecutionPolicy(decision.Value); err != nil {
+			if err := n.validateExecutionPolicy(decision.Value); err != nil {
 				return err
 			}
 		}
@@ -2345,7 +2384,7 @@ func (n *Node) catchUpPeer(ctx context.Context, transport *network.Transport, so
 			return fmt.Errorf("operation sync source %s omitted slot %d", source, from)
 		}
 		for _, decision := range response.Decisions {
-			if err := types.ValidateExecutionPolicy(decision.Value); err != nil {
+			if err := n.validateExecutionPolicy(decision.Value); err != nil {
 				return err
 			}
 		}

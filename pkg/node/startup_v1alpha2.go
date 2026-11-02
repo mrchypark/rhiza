@@ -16,6 +16,7 @@ import (
 	"slices"
 
 	objectstore "github.com/mrchypark/rhiza/internal/objstore"
+	"github.com/mrchypark/rhiza/internal/sqlpolicy"
 	"github.com/mrchypark/rhiza/internal/types"
 	"github.com/mrchypark/rhiza/pkg/checkpoint"
 	"github.com/mrchypark/rhiza/pkg/materializer"
@@ -81,7 +82,9 @@ type managedRepairOriginChecker interface {
 }
 
 type ManagedStartupConfig struct {
-	StorageRoot string
+	expectedPolicy    sqlpolicy.MaterializationPolicy
+	idempotencyWindow uint64
+	StorageRoot       string
 	// PeerRecovery permits retaining a non-serving runtime when HEAD is
 	// unavailable. It never authorizes an empty application baseline.
 	PeerRecovery          bool
@@ -146,10 +149,14 @@ func (n *Node) OpenManaged(ctx context.Context, cfg ManagedStartupConfig) (resul
 	configCopy := CloneManagedRuntimeConfig(*n.config)
 	n.config = &configCopy
 	i := cfg.Identity
-	// Profile plumbing is available, but mixed runtime opens are not connected yet.
-	if i.ApplicationProtocol != "" {
-		return fmt.Errorf("managed application protocol runtime is not supported")
+	policy, window, err := types.ManagedApplicationPolicy(i.ApplicationProtocol)
+	if err != nil {
+		return err
 	}
+	if policy == sqlpolicy.ManagedSQLKVMaterializationPolicy && (i.Member.Generation != 0 || i.EvidenceFormat != types.ManagedApplicationProtocolSQLKV) {
+		return fmt.Errorf("unsupported managed application generation or evidence format")
+	}
+	cfg.expectedPolicy, cfg.idempotencyWindow = policy, window
 	namespace, err := ManagedNamespaceFor(cfg.StorageRoot, i.Member.ClusterUID, i.Member.Generation, i.AssignmentID, string(n.config.ClusterID))
 	if err != nil || n.config.ObjStorePrefix != namespace.ConfigPrefix {
 		return errors.Join(fmt.Errorf("managed runtime final namespace mismatch"), err)
@@ -163,14 +170,14 @@ func (n *Node) OpenManaged(ctx context.Context, cfg ManagedStartupConfig) (resul
 	if n.config.ObjStoreDurability == "" {
 		n.config.ObjStoreDurability = types.ObjectStoreDurabilityBeforeAck
 	}
-	source, config, err := n.preparedBindingDigests()
+	source, config, err := n.preparedBindingDigestsForProtocol(i.ApplicationProtocol)
 	if err != nil {
 		return err
 	}
 	if i.Member.SourceBinding != source || i.Member.ConfigDigest != config {
 		return fmt.Errorf("managed storage or configuration binding mismatch")
 	}
-	bootstrap, err := n.ManagedBootstrapPlanDigest(i.PhysicalBinding, i.EvidenceFormat)
+	bootstrap, err := n.ManagedBootstrapPlanDigestForProtocol(i.PhysicalBinding, i.EvidenceFormat, i.ApplicationProtocol)
 	if err != nil || bootstrap != i.BootstrapPlanDigest {
 		return errors.Join(fmt.Errorf("managed common bootstrap plan mismatch"), err)
 	}
@@ -201,6 +208,15 @@ func (n *Node) OpenManaged(ctx context.Context, cfg ManagedStartupConfig) (resul
 	}
 	if cfg.Prepared != nil && (i.Fresh || cfg.Prepared.Identity() != i.Member) {
 		return fmt.Errorf("managed prepared identity mismatch")
+	}
+	if cfg.Prepared != nil && (cfg.Prepared.View() == nil || cfg.Prepared.View().MaterializationPolicy() != policy) {
+		return fmt.Errorf("managed prepared application profile mismatch")
+	}
+	if cfg.Prepared != nil && policy == sqlpolicy.ManagedSQLKVMaterializationPolicy {
+		_, tip, err := materializer.InspectManagedApplicationFile(ctx, filepath.Join(cfg.Prepared.Directory(), "sqlite.db"), window)
+		if err != nil || tip != uint64(cfg.Prepared.View().Tip()) {
+			return errors.Join(fmt.Errorf("managed prepared application window or tip mismatch"), err)
+		}
 	}
 	n.managedStartup = &cfg
 	var startupLock *qlog.LockFile
@@ -287,6 +303,54 @@ func (n *Node) OpenManaged(ctx context.Context, cfg ManagedStartupConfig) (resul
 	}
 	n.managedStartup = &cfg
 	n.managedPeerVerified.Store(true)
+	return nil
+}
+
+// Ordinary nodes retain policy7. Managed selection is frozen before open and
+// never inferred from files, a handoff Version, or successor configuration.
+func (n *Node) materializationPolicy() sqlpolicy.MaterializationPolicy {
+	if n.managedStartup != nil && n.managedStartup.expectedPolicy != 0 {
+		return n.managedStartup.expectedPolicy
+	}
+	return sqlpolicy.LegacyMaterializationPolicy
+}
+
+func (n *Node) receiptWindow() uint64 {
+	if n.managedStartup != nil && n.managedStartup.idempotencyWindow != 0 {
+		return n.managedStartup.idempotencyWindow
+	}
+	return types.DefaultIdempotencyWindowSlots
+}
+
+func (n *Node) validateExecutionPolicy(value []byte) error {
+	if n.materializationPolicy() == sqlpolicy.ManagedSQLKVMaterializationPolicy {
+		return types.ValidateManagedKVExecutionPolicy(value)
+	}
+	return types.ValidateExecutionPolicy(value)
+}
+
+func (n *Node) openMaterializer(path string, readers int) (*materializer.Materializer, error) {
+	if n.materializationPolicy() == sqlpolicy.ManagedSQLKVMaterializationPolicy {
+		return materializer.OpenManagedSQLKV(path, readers, n.receiptWindow())
+	}
+	return materializer.Open(path, readers)
+}
+
+// Actual file semantics must precede every mixed Core checkpoint base install.
+func (n *Node) validateCheckpointFiles(ctx context.Context, files []checkpoint.File, tip uint64) error {
+	if n.materializationPolicy() != sqlpolicy.ManagedSQLKVMaterializationPolicy {
+		return nil
+	}
+	if len(files) != 1 || files[0].Role != checkpoint.RoleSQLite {
+		return fmt.Errorf("mixed checkpoint requires exactly one SQLite file")
+	}
+	_, actual, err := materializer.InspectManagedApplicationFile(ctx, files[0].Path, n.receiptWindow())
+	if err != nil {
+		return err
+	}
+	if actual != tip {
+		return fmt.Errorf("mixed checkpoint applied tip differs from certified base")
+	}
 	return nil
 }
 
@@ -577,7 +641,7 @@ func (n *Node) verifyExistingManagedSQLBeforeOpen(ctx context.Context, core *que
 	if err := materializer.ValidateCleanRestoreState(dbPath); err != nil {
 		return fmt.Errorf("managed materializer has an interrupted restore; preserve it: %w", err)
 	}
-	actual, appliedTip, err := materializer.InspectSQLApplicationFile(ctx, dbPath)
+	actual, appliedTip, err := n.inspectApplicationFile(ctx, dbPath)
 	if err != nil {
 		return fmt.Errorf("inspect existing managed SQL before startup: %w", err)
 	}
@@ -625,7 +689,10 @@ func (n *Node) verifyExistingManagedSQLBeforeOpen(ctx context.Context, core *que
 		if err := os.Mkdir(cacheDir, 0o700); err != nil {
 			return err
 		}
-		manager := checkpoint.NewManager(bucket, clusterPrefix, cacheDir, 1)
+		manager, err := checkpoint.NewManagerForPolicy(bucket, clusterPrefix, cacheDir, n.materializationPolicy(), 1)
+		if err != nil {
+			return err
+		}
 		root, err := manager.OpenRoot(ctx, uint64(adoption.BaseSeal.Index), adoption.BaseSeal.RootHash)
 		if err != nil || root.Hash != adoption.BaseSeal.StateHash {
 			if err == nil {
@@ -647,7 +714,7 @@ func (n *Node) verifyExistingManagedSQLBeforeOpen(ctx context.Context, core *que
 	if err != nil {
 		return fmt.Errorf("verify certified SQL prefix at applied tip %d: %w", appliedTip, err)
 	}
-	return compareManagedSQLFileAtTip(ctx, dbPath, actual, appliedTip, checkpointFiles, suffix, filepath.Join(tmp, "expected.db"))
+	return n.compareManagedFileAtTip(ctx, actual, appliedTip, checkpointFiles, suffix, filepath.Join(tmp, "expected.db"))
 }
 
 func (n *Node) verifyExistingManagedPreparedSQLBeforeOpen(ctx context.Context, prepared *recovery.VerifiedPreparedStartup) (resultErr error) {
@@ -659,7 +726,7 @@ func (n *Node) verifyExistingManagedPreparedSQLBeforeOpen(ctx context.Context, p
 	if err := materializer.ValidateCleanRestoreState(dbPath); err != nil {
 		return fmt.Errorf("managed materializer has an interrupted restore; preserve it: %w", err)
 	}
-	actual, appliedTip, err := materializer.InspectSQLApplicationFile(ctx, dbPath)
+	actual, appliedTip, err := n.inspectApplicationFile(ctx, dbPath)
 	if err != nil {
 		return fmt.Errorf("inspect existing managed SQL before prepared restore: %w", err)
 	}
@@ -700,11 +767,20 @@ func (n *Node) verifyExistingManagedPreparedSQLBeforeOpen(ctx context.Context, p
 	if last != quepaxa.Slot(appliedTip) {
 		return fmt.Errorf("verified prepared history does not reach existing SQL tip %d", appliedTip)
 	}
-	return compareManagedSQLFileAtTip(ctx, dbPath, actual, appliedTip, checkpointFiles, suffix, filepath.Join(tmp, "expected.db"))
+	return n.compareManagedFileAtTip(ctx, actual, appliedTip, checkpointFiles, suffix, filepath.Join(tmp, "expected.db"))
 }
 
-func compareManagedSQLFileAtTip(ctx context.Context, dbPath string, actual materializer.SQLApplicationState, appliedTip uint64, checkpointFiles []materializer.CheckpointFile, suffix []quepaxa.DecidedValue, expectedPath string) (resultErr error) {
-	expected, err := materializer.Open(expectedPath, 4)
+func (n *Node) inspectApplicationFile(ctx context.Context, path string) ([32]byte, uint64, error) {
+	if n.materializationPolicy() == sqlpolicy.ManagedSQLKVMaterializationPolicy {
+		state, tip, err := materializer.InspectManagedApplicationFile(ctx, path, n.receiptWindow())
+		return state.Digest, tip, err
+	}
+	state, tip, err := materializer.InspectSQLApplicationFile(ctx, path)
+	return state.Digest, tip, err
+}
+
+func (n *Node) compareManagedFileAtTip(ctx context.Context, actual [32]byte, appliedTip uint64, checkpointFiles []materializer.CheckpointFile, suffix []quepaxa.DecidedValue, expectedPath string) (resultErr error) {
+	expected, err := n.openMaterializer(expectedPath, 4)
 	if err != nil {
 		return fmt.Errorf("open isolated managed SQL verifier: %w", err)
 	}
@@ -722,11 +798,11 @@ func compareManagedSQLFileAtTip(ctx context.Context, dbPath string, actual mater
 	if expected.Tip() != appliedTip {
 		return fmt.Errorf("reconstructed SQL tip %d differs from actual applied tip %d", expected.Tip(), appliedTip)
 	}
-	want, err := expected.InspectSQLApplicationState(ctx)
+	want, _, err := n.inspectApplicationState(ctx, expected)
 	if err != nil {
 		return fmt.Errorf("inspect reconstructed managed SQL: %w", err)
 	}
-	if actual.Digest != want.Digest {
+	if actual != want {
 		return fmt.Errorf("actual SQLite contents differ from verified checkpoint and certified WAL prefix at tip %d", appliedTip)
 	}
 	return nil
@@ -921,6 +997,10 @@ func (n *Node) recoverPreparedV1Alpha2(ctx context.Context, prepared *recovery.V
 }
 
 func (n *Node) recoverPreparedV1Alpha2WithLock(ctx context.Context, prepared *recovery.VerifiedPreparedStartup, heldLock *qlog.LockFile) (resultErr error) {
+	if n == nil || prepared == nil || prepared.View() == nil || prepared.View().MaterializationPolicy() != n.materializationPolicy() {
+		return fmt.Errorf("prepared application profile mismatch")
+	}
+	view := prepared.View()
 	if n == nil || n.config == nil || n.config.Local || n.config.NodeID == "" || n.config.DataDir == "" || prepared == nil || prepared.View() == nil || n.opened.Load() {
 		return fmt.Errorf("invalid non-serving prepared recovery")
 	}
@@ -995,7 +1075,10 @@ func (n *Node) recoverPreparedV1Alpha2WithLock(ctx context.Context, prepared *re
 		return err
 	}
 	cluster := n.loadClusterConfig()
-	transport := network.NewTransport(n.config.ClusterID, n.config.NodeID, cluster, n.config.PeerToken)
+	transport, err := network.NewTransportForPolicy(n.config.ClusterID, n.config.NodeID, cluster, n.config.PeerToken, n.materializationPolicy())
+	if err != nil {
+		return err
+	}
 	transport.SetAdminToken(n.config.AdminToken)
 	defer func() { resultErr = errors.Join(resultErr, transport.Close()) }()
 	newCore := quepaxa.New
@@ -1006,7 +1089,6 @@ func (n *Node) recoverPreparedV1Alpha2WithLock(ctx context.Context, prepared *re
 	if err != nil {
 		return err
 	}
-	view := prepared.View()
 	persistLegacyAdoption := func() error {
 		if n.managedStartup != nil {
 			return nil
@@ -1034,6 +1116,19 @@ func (n *Node) recoverPreparedV1Alpha2WithLock(ctx context.Context, prepared *re
 		}
 		if !hasBase {
 			return fmt.Errorf("prepared history requires an unsupported generation base")
+		}
+		if n.materializationPolicy() == sqlpolicy.ManagedSQLKVMaterializationPolicy {
+			dir, err := os.MkdirTemp(dataDir, ".rhiza-prepared-base-*")
+			if err != nil {
+				return err
+			}
+			files, readErr := view.DownloadCheckpointFiles(ctx, dir)
+			if readErr == nil {
+				readErr = n.validateCheckpointFiles(ctx, files, uint64(view.Base()))
+			}
+			if err := errors.Join(readErr, os.RemoveAll(dir)); err != nil {
+				return err
+			}
 		}
 		core.SetCheckpointValidator(func(ctx context.Context, candidate quepaxa.CheckpointSeal) error {
 			if err := ctx.Err(); err != nil {

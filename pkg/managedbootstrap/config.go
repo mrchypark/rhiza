@@ -55,10 +55,6 @@ func ManagedRuntimeConfig(ctx context.Context, kube *operator.Kubernetes, ref op
 	if err := validateManagedProfileBinding(ref, profile, init.Assignment().Plan, plan); err != nil {
 		return result, err
 	}
-	// Do not reach legacy restore/open paths with an explicitly mixed assignment.
-	if profile.ApplicationProtocol != "" {
-		return result, errors.New("mixed managed runtime activation is not supported")
-	}
 	cluster, err := types.ManagedClusterID(ref.UID, 0)
 	if err != nil {
 		return result, err

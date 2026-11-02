@@ -15,6 +15,7 @@ import (
 	"reflect"
 
 	objectstore "github.com/mrchypark/rhiza/internal/objstore"
+	"github.com/mrchypark/rhiza/internal/types"
 	"github.com/mrchypark/rhiza/pkg/checkpoint"
 	"github.com/mrchypark/rhiza/pkg/managedsql"
 	"github.com/mrchypark/rhiza/pkg/node"
@@ -285,7 +286,7 @@ func ManagedRepairConfig(ctx context.Context, kube *operator.Kubernetes, ref ope
 	}
 	cfg.Runtime.PeerAddr = u.Host
 	cfg.Runtime.Learner = &quepaxa.Member{ID: replacement.NodeID, PublicKey: replacement.PublicKey, PeerURL: replacement.PeerURL}
-	physical, member, err := node.New(&cfg.Runtime).PreparedStartupBindingDigests()
+	physical, member, err := node.New(&cfg.Runtime).PreparedStartupBindingDigestsForProtocol(cfg.Plan.ApplicationProtocol)
 	if err != nil {
 		return empty, noop, err
 	}
@@ -326,7 +327,11 @@ func ManagedRepairConfig(ctx context.Context, kube *operator.Kubernetes, ref ope
 		return fail(err)
 	}
 	trusted := quepaxa.Cluster{ConfigID: 1, Members: cfg.Runtime.Members}
-	view, err := recovery.OpenReadOnlyViewAtHead(ctx, readonly, capture.SourcePrefix, 1, trusted, capture.Head)
+	policy, window, err := types.ManagedApplicationPolicy(cfg.Plan.ApplicationProtocol)
+	if err != nil {
+		return fail(err)
+	}
+	view, err := recovery.OpenReadOnlyViewAtHeadForPolicy(ctx, readonly, capture.SourcePrefix, 1, trusted, capture.Head, policy, window)
 	if err != nil {
 		return fail(errors.New("fixed repair source verification failed"))
 	}
@@ -336,13 +341,13 @@ func ManagedRepairConfig(ctx context.Context, kube *operator.Kubernetes, ref ope
 	expected := recovery.PreparedStartupIdentity{ClusterUID: ref.UID, Generation: cfg.Plan.Generation, DeploymentUID: cfg.Plan.DeploymentUID, PodUID: podUID, NodeID: string(cfg.Runtime.NodeID), SourceBinding: physical, ConfigDigest: member}
 	preparedDir := filepath.Join(filepath.Dir(cfg.Runtime.DataDir), "repair-prepared-"+capture.PlanDigest)
 	if _, err := os.Lstat(preparedDir); errors.Is(err, os.ErrNotExist) {
-		if err := recovery.PublishPreparedStartup(ctx, view, preparedDir, expected); err != nil {
+		if err := recovery.PublishPreparedStartupForPolicy(ctx, view, preparedDir, expected, policy, window); err != nil {
 			return fail(errors.New("repair preparation failed"))
 		}
 	} else if err != nil {
 		return fail(err)
 	}
-	prepared, err := recovery.LoadPreparedStartup(ctx, readonly, capture.SourcePrefix, 1, trusted, preparedDir, cfg.Runtime.DataDir, expected)
+	prepared, err := recovery.LoadPreparedStartupForPolicy(ctx, readonly, capture.SourcePrefix, 1, trusted, preparedDir, cfg.Runtime.DataDir, expected, policy, window)
 	if err != nil {
 		return fail(errors.New("repair prepared data verification failed"))
 	}
@@ -367,7 +372,10 @@ func VerifyRepairControl(ctx context.Context, bucket thanosobjstore.Bucket, boot
 	if err != nil {
 		return err
 	}
-	manager := checkpoint.NewManager(bucket, capture.SourcePrefix, "", 1)
+	manager, err := checkpoint.NewManagerForPolicy(bucket, capture.SourcePrefix, "", view.MaterializationPolicy(), 1)
+	if err != nil {
+		return err
+	}
 	core.SetCheckpointValidator(func(ctx context.Context, seal quepaxa.CheckpointSeal) error {
 		return manager.Verify(ctx, uint64(seal.Index), seal.RootHash, seal.StateHash)
 	})
