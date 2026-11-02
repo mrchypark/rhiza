@@ -15,6 +15,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/minio/minio-go/v7"
+	"github.com/minio/minio-go/v7/pkg/credentials"
 	"github.com/mrchypark/rhiza"
 	"github.com/mrchypark/rhiza/internal/peertest"
 	"github.com/quic-go/quic-go"
@@ -431,8 +433,28 @@ func TestNotificationFFISubscriptionLimitAndReuse(t *testing.T) {
 func TestNotificationFFIThreeNode(t *testing.T) {
 	endpoint := os.Getenv("RHIZA_E2E_S3_ENDPOINT")
 	bucket := os.Getenv("RHIZA_E2E_S3_BUCKET")
+	required := os.Getenv("RHIZA_EMBEDDED_FFI_REQUIRED") == "1"
 	if endpoint == "" || bucket == "" {
+		if required {
+			t.Fatal("required S3 FFI fixture is unavailable")
+		}
 		t.Skip("RHIZA_E2E_S3_ENDPOINT and RHIZA_E2E_S3_BUCKET are required")
+	}
+	if required {
+		access, secret := os.Getenv("RHIZA_E2E_S3_ACCESS_KEY"), os.Getenv("RHIZA_E2E_S3_SECRET_KEY")
+		if os.Getenv("GITHUB_ACTIONS") != "true" || validateRequiredFFIS3(endpoint, bucket, access, secret) != nil {
+			t.Fatal("invalid owned S3 FFI fixture")
+		}
+		client, err := minio.New(endpoint, &minio.Options{Creds: credentials.NewStaticV4(access, secret, ""), Secure: false, Region: "us-east-1", BucketLookup: minio.BucketLookupPath})
+		if err != nil {
+			t.Fatal(err)
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+		err = client.MakeBucket(ctx, bucket, minio.MakeBucketOptions{Region: "us-east-1"})
+		cancel()
+		if err != nil {
+			t.Fatalf("create disposable Floci bucket: %v", err)
+		}
 	}
 	addresses := make([]string, 3)
 	transports := make([]*quic.Transport, 3)
@@ -517,6 +539,37 @@ func TestNotificationFFIThreeNode(t *testing.T) {
 	}
 	if code := responseErrorCode(t, goCall(hB, mustCall(t, "notify_recv", map[string]any{"subscription_id": subscription.ID}), 50)); code != "timeout" {
 		t.Fatalf("duplicate delivery code=%q", code)
+	}
+}
+
+func validateRequiredFFIS3(endpoint, bucket, access, secret string) error {
+	host, port, err := net.SplitHostPort(endpoint)
+	ip := net.ParseIP(host)
+	if err != nil || port != "4566" || ip == nil || ip.To4() == nil || !ip.IsPrivate() || access != "rhiza-local-test" || secret != "rhiza-local-test" || !strings.HasPrefix(bucket, "rhiza-ffi-") || len(bucket) > 63 {
+		return fmt.Errorf("invalid owned S3 FFI fixture")
+	}
+	for _, c := range bucket {
+		if !(c >= 'a' && c <= 'z' || c >= '0' && c <= '9' || c == '-') {
+			return fmt.Errorf("invalid owned S3 FFI bucket")
+		}
+	}
+	return nil
+}
+
+func TestRequiredFFIS3RejectsUnownedConfiguration(t *testing.T) {
+	if err := validateRequiredFFIS3("172.18.0.2:4566", "rhiza-ffi-123", "rhiza-local-test", "rhiza-local-test"); err != nil {
+		t.Fatal(err)
+	}
+	for _, endpoint := range []string{"floci:4566", "8.8.8.8:4566", "172.18.0.2:443", "127.0.0.1:4566", "http://172.18.0.2:4566"} {
+		if validateRequiredFFIS3(endpoint, "rhiza-ffi-123", "rhiza-local-test", "rhiza-local-test") == nil {
+			t.Fatal("unowned endpoint accepted")
+		}
+	}
+	if validateRequiredFFIS3("172.18.0.2:4566", "existing-bucket", "rhiza-local-test", "rhiza-local-test") == nil {
+		t.Fatal("existing bucket accepted")
+	}
+	if validateRequiredFFIS3("172.18.0.2:4566", "rhiza-ffi-123", "ambient", "credential") == nil {
+		t.Fatal("ambient credentials accepted")
 	}
 }
 
