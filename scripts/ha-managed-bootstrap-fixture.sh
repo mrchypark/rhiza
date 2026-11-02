@@ -141,6 +141,17 @@ case "$fixture_case" in
   *) echo 'invalid managed fixture case' >&2; return 1 ;;
 esac
 floci_node_selector='{}'
+fixture_provider=${fixture_provider-s3}
+case "$fixture_provider" in
+  s3) floci_image=floci/floci:2.3.0; floci_port=4566 ;;
+  gcs) floci_image=floci/floci-gcp:0.11.0; floci_port=4588 ;;
+  azure) floci_image=floci/floci-az:0.15.0; floci_port=4577 ;;
+  *) echo 'unsupported explicit emulator provider' >&2; return 1 ;;
+esac
+if [ "$fixture_case" = legacy ] && [ "$fixture_provider" != s3 ]; then
+  echo 'legacy runtime qualification is S3-only' >&2; return 1
+fi
+printf 'case=%s\nprovider=%s\nemulator=%s\nport=%s\n' "$fixture_case" "$fixture_provider" "$floci_image" "$floci_port" > "$logs/fixture-provider.txt"
 if [ -n "${RHIZA_MANAGED_FIXTURE_NODE-}" ]; then
   printf '%s\n' "$RHIZA_MANAGED_FIXTURE_NODE" | grep -Eq '^[a-z0-9][a-z0-9.-]{0,252}$' || {
     echo 'invalid optional Floci fixture node hostname' >&2; return 1;
@@ -148,9 +159,9 @@ if [ -n "${RHIZA_MANAGED_FIXTURE_NODE-}" ]; then
   floci_node_selector=$(jq -cn --arg node "$RHIZA_MANAGED_FIXTURE_NODE" '{"kubernetes.io/hostname":$node}')
 fi
 # Create the Service first so both variants see the same existing Service set.
-jq -n '{apiVersion:"v1",kind:"Service",metadata:{name:"floci"},spec:{selector:{app:"floci"},ports:[{port:4566,targetPort:4566}]}}' | k -n "$namespace" create -f -
+jq -n --argjson port "$floci_port" '{apiVersion:"v1",kind:"Service",metadata:{name:"floci"},spec:{selector:{app:"floci"},ports:[{port:$port,targetPort:$port}]}}' | k -n "$namespace" create -f -
 # Bounded diagnostic only: retain actual failure logs, never infer the Spring cause.
-jq -n --argjson nodeSelector "$floci_node_selector" '{apiVersion:"v1",kind:"Pod",metadata:{name:"floci-service-links-probe",labels:{"rhiza-ci-component":"floci","rhiza-ci-probe":"service-links"}},spec:{nodeSelector:$nodeSelector,activeDeadlineSeconds:45,enableServiceLinks:true,automountServiceAccountToken:false,containers:[{name:"floci",image:"floci/floci:2.3.0",readinessProbe:{tcpSocket:{port:4566},periodSeconds:1}}]}}' | k -n "$namespace" create -f -
+jq -n --argjson nodeSelector "$floci_node_selector" --arg image "$floci_image" --argjson port "$floci_port" '{apiVersion:"v1",kind:"Pod",metadata:{name:"floci-service-links-probe",labels:{"rhiza-ci-component":"floci","rhiza-ci-probe":"service-links"}},spec:{nodeSelector:$nodeSelector,activeDeadlineSeconds:45,enableServiceLinks:true,automountServiceAccountToken:false,containers:[{name:"floci",image:$image,readinessProbe:{tcpSocket:{port:$port},periodSeconds:1}}]}}' | k -n "$namespace" create -f -
 if k -n "$namespace" wait --for=condition=Ready pod/floci-service-links-probe --timeout=45s > "$logs/floci-service-links-wait.txt" 2>&1; then
   printf '%s\n' 'NOT REPRODUCED: serviceLinks=true diagnostic Pod reached TCP readiness; old startup cause remains unknown' > "$logs/floci-service-links-result.txt"
 else
@@ -163,7 +174,7 @@ else
 fi
 capture_floci
 # The actual SDK fixture excludes injected Service environment and must be TCP-ready.
-jq -n --argjson nodeSelector "$floci_node_selector" '{apiVersion:"apps/v1",kind:"Deployment",metadata:{name:"floci"},spec:{replicas:1,selector:{matchLabels:{app:"floci"}},template:{metadata:{labels:{app:"floci","rhiza-ci-component":"floci"}},spec:{nodeSelector:$nodeSelector,enableServiceLinks:false,automountServiceAccountToken:false,containers:[{name:"floci",image:"floci/floci:2.3.0",ports:[{containerPort:4566}],readinessProbe:{tcpSocket:{port:4566},periodSeconds:1}}]}}}}' | k -n "$namespace" create -f -
+jq -n --argjson nodeSelector "$floci_node_selector" --arg image "$floci_image" --argjson port "$floci_port" '{apiVersion:"apps/v1",kind:"Deployment",metadata:{name:"floci"},spec:{replicas:1,selector:{matchLabels:{app:"floci"}},template:{metadata:{labels:{app:"floci","rhiza-ci-component":"floci"}},spec:{nodeSelector:$nodeSelector,enableServiceLinks:false,automountServiceAccountToken:false,containers:[{name:"floci",image:$image,ports:[{containerPort:$port}],readinessProbe:{tcpSocket:{port:$port},periodSeconds:1}}]}}}}' | k -n "$namespace" create -f -
 k -n "$namespace" rollout status deployment/floci --timeout=120s
 k -n "$namespace" get pods -l app=floci -o json > "$logs/floci-sdk-ready.json"
 jq -e '.items|length==1 and all(.[]; .spec.enableServiceLinks==false and any(.status.conditions[]?; .type=="Ready" and .status=="True"))' "$logs/floci-sdk-ready.json" >/dev/null
@@ -175,7 +186,9 @@ managed_bucket_setup
 admin=$(od -An -N32 -tx1 /dev/urandom | tr -d ' \n')
 umask 077
 printf '%s' "$admin" > "$private/admin.token"
-jq -n --arg image "$image" --rawfile admin "$private/admin.token" --arg bucket "$bucket" --arg root "ci-$nonce" --arg protocol "$fixture_protocol" --arg evidence "$fixture_evidence" '{InitImage:$image,PeerPort:9090,EvidenceFormat:$evidence,ProfileSecretName:"runtime",Storage:{enable_reconfiguration:true,admin_token:$admin,objstore_provider:"s3",objstore_endpoint:"floci:4566",objstore_bucket:$bucket,objstore_prefix:$root,objstore_region:"us-east-1",objstore_insecure:true,objstore_access_key:"rhiza-local-test",objstore_secret_key:"rhiza-local-test",objstore_durability:"before-ack"}} | if $protocol=="" then . else .ApplicationProtocol=$protocol end' > "$private/runtime.json"
+fixture_gcs_credentials=/dev/null
+if [ "$fixture_provider" = gcs ]; then fixture_gcs_credentials=$private/gcs-emulator.json; fi
+jq -n --arg image "$image" --rawfile admin "$private/admin.token" --rawfile gcs "$fixture_gcs_credentials" --arg provider "$fixture_provider" --arg bucket "$bucket" --arg root "ci-$nonce" --arg protocol "$fixture_protocol" --arg evidence "$fixture_evidence" '{InitImage:$image,PeerPort:9090,EvidenceFormat:$evidence,ProfileSecretName:"runtime",Storage:{enable_reconfiguration:true,admin_token:$admin,objstore_provider:$provider,objstore_bucket:$bucket,objstore_prefix:$root,objstore_durability:"before-ack"}} | .Storage += (if $provider=="s3" then {objstore_endpoint:"floci:4566",objstore_region:"us-east-1",objstore_insecure:true,objstore_access_key:"rhiza-local-test",objstore_secret_key:"rhiza-local-test"} elif $provider=="gcs" then {objstore_insecure:false,objstore_service_account:$gcs} else {objstore_insecure:false,objstore_azure_storage_account:"rhizatest",objstore_azure_connection_string:("DefaultEndpointsProtocol=http;AccountName=rhizatest;AccountKey="+("rhiza-local-test-key-only-32bytes!"|@base64)+";BlobEndpoint=http://floci:4577/rhizatest;")} end) | if $protocol=="" then . else .ApplicationProtocol=$protocol end' > "$private/runtime.json"
 printf 'header = "Authorization: Bearer %s"\n' "$admin" > "$private/curl.conf"
 unset admin
 k -n "$namespace" create secret generic runtime --from-file="runtime.json=$private/runtime.json"

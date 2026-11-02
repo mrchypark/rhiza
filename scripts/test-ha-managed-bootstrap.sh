@@ -8,6 +8,8 @@ if [ "${1-}" = --oracle-self-test ]; then
 fi
 [ "${GITHUB_ACTIONS-}" = true ] || { echo 'GitHub Actions only' >&2; exit 1; }
 : "${RUNNER_TEMP:?}" "${GITHUB_SHA:?}" "${GITHUB_RUN_ID:?}" "${GITHUB_RUN_ATTEMPT:?}"
+fixture_provider=${RHIZA_MANAGED_FIXTURE_PROVIDER-s3}
+case "$fixture_provider" in s3|gcs|azure) ;; *) echo 'unsupported explicit emulator provider' >&2; exit 1 ;; esac
 logs="$RUNNER_TEMP/ha-managed-bootstrap"
 mkdir -p "$logs"
 private=$(mktemp -d "$RUNNER_TEMP/ha-managed-private.XXXXXX")
@@ -171,7 +173,7 @@ cleanup() {
     docker image rm "$image" > "$logs/image-cleanup.txt" 2>&1 || result=1
     if docker image inspect "$image" >/dev/null 2>&1; then result=1; fi
   fi
-  rm -f "$private/runtime.json" "$private/kubeconfig" "$private/curl.conf" "$private/request.body" "$private/admin.token" "$private/runtime-before.json" "$private/runtime-after.json" "$private/chaos-chart.yaml" "$private/chaos-render.jsonl" "$private/chaos-failure.json"
+  rm -f "$private/runtime.json" "$private/kubeconfig" "$private/curl.conf" "$private/request.body" "$private/admin.token" "$private/runtime-before.json" "$private/runtime-after.json" "$private/chaos-chart.yaml" "$private/chaos-render.jsonl" "$private/chaos-failure.json" "$private/gcs-emulator.json"
   rmdir "$private" || result=1
   printf '%s\n' "$result" > "$logs/driver.exit"
   exit "$result"
@@ -190,7 +192,12 @@ chaos_namespace_uid=$(k get namespace "$namespace" -o jsonpath='{.metadata.uid}'
 install_kind_chaos
 k apply -f deploy/operator/cluster-crd.yaml -f deploy/operator/crd.yaml
 k wait --for=condition=Established --timeout=90s crd/rhizaclusters.rhiza.mrchypark.dev crd/rhizarecoveries.rhiza.mrchypark.dev
-managed_bucket_setup() { "$RHIZA_MANAGED_BUCKET_SETUP" "$kubeconfig" "kind-$cluster" "$namespace" "$bucket"; }
+managed_bucket_setup() {
+  "$RHIZA_MANAGED_BUCKET_SETUP" "$kubeconfig" "kind-$cluster" "$namespace" "$bucket" "$fixture_provider"
+  if [ "$fixture_provider" = gcs ]; then
+    "$RHIZA_MANAGED_BUCKET_SETUP" emulator-service-account "$private/gcs-emulator.json"
+  fi
+}
 managed_pod_fault() {
   kind_runtime_before "$1" "$2" pod-kill
   direct_chaos_fault pod-kill pod-kill "$1" "$2"

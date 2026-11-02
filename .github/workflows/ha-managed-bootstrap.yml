@@ -11,7 +11,15 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        fixture: [legacy, mixed]
+        include:
+          - fixture: legacy
+            provider: s3
+          - fixture: mixed
+            provider: s3
+          - fixture: mixed
+            provider: gcs
+          - fixture: mixed
+            provider: azure
     runs-on: ubuntu-latest
     timeout-minutes: 25
     steps:
@@ -54,12 +62,13 @@ jobs:
           RHIZA_MANAGED_BUCKET_SETUP: ./scripts/ha-managed-bucket-setup
           RHIZA_MANAGED_TEST_DOCKERFILE: Dockerfile.managed-ffi-contract
           RHIZA_MANAGED_FIXTURE_CASE: ${{ matrix.fixture }}
+          RHIZA_MANAGED_FIXTURE_PROVIDER: ${{ matrix.provider }}
         run: sh scripts/test-ha-managed-bootstrap.sh
       - name: Preserve non-secret diagnostics
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: ha-managed-bootstrap-${{ matrix.fixture }}-${{ github.run_id }}
+          name: ha-managed-bootstrap-${{ matrix.fixture }}-${{ matrix.provider }}-${{ github.run_id }}
           path: ${{ runner.temp }}/ha-managed-bootstrap
       - name: Remove owned YAML renderer
         if: always()
