@@ -197,10 +197,10 @@ type mixedProviderNodeChecker struct {
 }
 
 func mixedProviderEvidence(state node.ManagedKVSnapshot) json.RawMessage {
-	raw, _ := json.Marshal(struct {
-		Format string
-		Digest string
-	}{types.ManagedApplicationProtocolSQLKV, fmt.Sprintf("%x", state.Application.Digest)})
+	raw, _ := json.Marshal(map[string]string{
+		"Format": types.ManagedApplicationProtocolSQLKV,
+		"Digest": fmt.Sprintf("%x", state.Application.Digest),
+	})
 	return raw
 }
 
@@ -407,15 +407,52 @@ func TestEmbeddedObjectStorageManagedKVNode(t *testing.T) {
 	}
 	waitAdmission := func(n *node.Node) {
 		t.Helper()
+		classify := func(err error) string {
+			switch {
+			case errors.Is(err, context.Canceled):
+				return "context-canceled"
+			case errors.Is(err, context.DeadlineExceeded):
+				return "context-deadline"
+			}
+			switch err.Error() {
+			case "provider exact identity changed", "provider live assignment or authority changed":
+				return "startup-assignment"
+			case "managed runtime has unapplied or unresolved history", "provider unresolved runtime", "managed host requires registered, resolved history":
+				return "unresolved-history"
+			case "provider another active reservation":
+				return "pending-reservation"
+			case "provider canonical evidence mismatch":
+				return "canonical-evidence"
+			default:
+				return "other"
+			}
+		}
+		var first, lastMeaningful error
+		attempts := 0
 		for {
-			if err := n.AdmitManaged(ctx); err == nil {
+			err := n.AdmitManaged(ctx)
+			if err == nil {
 				return
+			}
+			attempts++
+			if first == nil {
+				first = err
+				state, stateErr := n.ManagedState()
+				t.Logf("mixed admission first stage=%s error_type=%T wal_present=%t certified=%d applied=%d recorder=%d state_error=%t", classify(err), err, state.WALIdentity != "", state.CertifiedTip, state.AppliedTip, state.RecorderTip, stateErr != nil)
+			}
+			if !errors.Is(err, context.Canceled) && !errors.Is(err, context.DeadlineExceeded) {
+				lastMeaningful = err
 			}
 			timer := time.NewTimer(20 * time.Millisecond)
 			select {
 			case <-ctx.Done():
 				timer.Stop()
-				t.Fatal("mixed admission deadline", ctx.Err())
+				state, stateErr := n.ManagedState()
+				lastStage := "none"
+				if lastMeaningful != nil {
+					lastStage = classify(lastMeaningful)
+				}
+				t.Fatalf("mixed admission deadline: attempts=%d first_stage=%s first_type=%T last_meaningful_stage=%s last_meaningful_type=%T terminal_stage=%s wal_present=%t certified=%d applied=%d recorder=%d state_error=%t", attempts, classify(first), first, lastStage, lastMeaningful, classify(err), state.WALIdentity != "", state.CertifiedTip, state.AppliedTip, state.RecorderTip, stateErr != nil)
 			case <-timer.C:
 			}
 		}
@@ -721,6 +758,37 @@ func TestManagedKVNodeProviderGenesisBinding(t *testing.T) {
 					loaded, err := operator.LoadV1Alpha2ApplicationInit(context.Background(), store, ref)
 					if err != nil || loaded.Assignment().Plan != assignment {
 						t.Fatal("initialized plan changed", err)
+					}
+					if protocol == types.ManagedApplicationProtocolSQLKV {
+						t.Run("evidence-status-roundtrip", func(t *testing.T) {
+							// Serialization-layer probe only: no Node or provider is opened.
+							input := mixedProviderEvidence(node.ManagedKVSnapshot{Application: materializer.ManagedApplicationState{Digest: [32]byte{1}}})
+							if _, observation, err := operator.CommitV1Alpha2ApplicationInit(context.Background(), store, loaded, assignment, input); err != nil || observation != operator.V1Alpha2CASApplied {
+								t.Fatal("E0 evidence commit", observation, err)
+							}
+							admission, err := operator.LoadV1Alpha2Admission(context.Background(), store, ref)
+							if err != nil {
+								t.Fatal(err)
+							}
+							output := admission.Evidence()
+							var before, after struct{ Format, Digest string }
+							if json.Unmarshal(input, &before) != nil || json.Unmarshal(output, &after) != nil {
+								t.Fatal("invalid evidence JSON")
+							}
+							semanticEqual := before == after
+							t.Logf("serializer probe semantic_equal=%t format_equal=%t digest_equal=%t input_format_first=%t output_digest_first=%t bytes_equal=%t", semanticEqual, before.Format == after.Format, before.Digest == after.Digest, bytes.HasPrefix(input, []byte(`{"Format":`)), bytes.HasPrefix(output, []byte(`{"Digest":`)), bytes.Equal(input, output))
+							if !semanticEqual || !bytes.Equal(input, output) {
+								t.Fatal("provider byte-equality evidence predicate rejects status roundtrip")
+							}
+							for _, field := range []string{"Format", "Digest"} {
+								changed := map[string]string{"Format": before.Format, "Digest": before.Digest}
+								changed[field] = "changed"
+								wrong, err := json.Marshal(changed)
+								if err != nil || bytes.Equal(output, wrong) {
+									t.Fatalf("changed %s passed exact evidence predicate", field)
+								}
+							}
+						})
 					}
 				})
 			}
