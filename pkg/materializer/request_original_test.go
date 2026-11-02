@@ -5,11 +5,13 @@ import (
 	"context"
 	"errors"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/mrchypark/rhiza/internal/sqlpolicy"
 	"github.com/mrchypark/rhiza/internal/types"
 	"github.com/mrchypark/rhiza/pkg/quepaxa"
+	"github.com/ncruces/go-sqlite3/driver"
 )
 
 func requestMaterializer(t *testing.T) *Materializer {
@@ -273,15 +275,35 @@ func TestRequestOriginalProfileBoundary(t *testing.T) {
 func TestRequestOriginalInsertFailureRollsBackEffectAndReceipt(t *testing.T) {
 	m := requestMaterializer(t)
 	requestSQL(t, m, 1, types.SQLCommand{RequestID: "schema", SQL: `CREATE TABLE item(v INTEGER)`})
-	if _, err := m.writer.Exec(`CREATE TEMP TRIGGER fail_original BEFORE INSERT ON main._rhiza_request_original WHEN NEW.request_id='failure' BEGIN SELECT RAISE(ABORT,'forced projection failure'); END`); err != nil {
+	// Install/remove the test-only TEMP fixture through the existing native
+	// connection seam. Restore the real writer authorizer before any Apply.
+	fixtureDDL := func(query string) error {
+		conn, err := m.writer.Conn(context.Background())
+		if err != nil {
+			return err
+		}
+		err = conn.Raw(func(raw any) error { return raw.(driver.Conn).Raw().SetAuthorizer(nil) })
+		if err != nil {
+			return errors.Join(err, conn.Close())
+		}
+		_, execErr := conn.ExecContext(context.Background(), query)
+		restoreErr := conn.Raw(func(raw any) error {
+			return setSQLAuthorizer(raw.(driver.Conn).Raw(), true, false, false)
+		})
+		return errors.Join(execErr, restoreErr, conn.Close())
+	}
+	if err := fixtureDDL(`CREATE TEMP TRIGGER fail_original BEFORE INSERT ON main._rhiza_request_original WHEN NEW.request_id='failure' BEGIN SELECT RAISE(ABORT,'forced projection failure'); END`); err != nil {
 		t.Fatal(err)
+	}
+	if _, err := m.writer.Exec(`CREATE TEMP TABLE forbidden_fixture_escape(v)`); err == nil || !strings.Contains(strings.ToLower(err.Error()), "authoriz") {
+		t.Fatalf("writer TEMP protection was not restored: %v", err)
 	}
 	value, err := types.EncodeSQLBatch([]types.SQLCommand{{RequestID: "failure", SQL: `INSERT INTO item VALUES(17)`}})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := m.Apply(context.Background(), 2, value); err == nil {
-		t.Fatal("projection failure hidden")
+	if err := m.Apply(context.Background(), 2, value); err == nil || !strings.Contains(err.Error(), "forced projection failure") {
+		t.Fatalf("expected actual projection insert failure, got %v", err)
 	}
 	var effects, receipts, originals int
 	if err := m.writer.QueryRow(`SELECT (SELECT COUNT(*) FROM item),(SELECT COUNT(*) FROM _rhiza_idempotency WHERE request_id='failure'),(SELECT COUNT(*) FROM _rhiza_request_original WHERE request_id='failure')`).Scan(&effects, &receipts, &originals); err != nil {
@@ -290,8 +312,16 @@ func TestRequestOriginalInsertFailureRollsBackEffectAndReceipt(t *testing.T) {
 	if effects != 0 || receipts != 0 || originals != 0 || m.Tip() != 1 {
 		t.Fatal("partial effect/receipt/original committed")
 	}
-	if _, err := m.writer.Exec(`DROP TRIGGER fail_original`); err != nil {
+	if err := fixtureDDL(`DROP TRIGGER fail_original`); err != nil {
 		t.Fatal(err)
+	}
+	requestSQL(t, m, 2, types.SQLCommand{RequestID: "neighbor", SQL: `INSERT INTO item VALUES(23)`})
+	if got := retainedOriginal(t, m, types.MutationSQL, "neighbor"); got.Slot != 2 || got.Receipt.Status != types.MutationCommitted {
+		t.Fatal("valid neighbor lost its original/receipt after rollback")
+	}
+	var valueAfter int
+	if err := m.writer.QueryRow(`SELECT v FROM item`).Scan(&valueAfter); err != nil || valueAfter != 23 {
+		t.Fatalf("valid neighbor effect differs: value=%d error=%v", valueAfter, err)
 	}
 	if _, err := m.InspectManagedApplicationState(context.Background()); err != nil {
 		t.Fatal(err)
