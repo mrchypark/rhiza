@@ -45,8 +45,18 @@ func TestManagedApplicationExplicitProfileLoaders(t *testing.T) {
 			if _, err := InitializeV1Alpha2AuthorityWithBootstrap(ctx, store, phase2Ref, name, plan, bootstrap); err != nil {
 				t.Fatal(err)
 			}
-			if _, err := LoadV1Alpha2ApplicationInit(ctx, store, phase2Ref); err != nil {
+			if _, err := LoadV1Alpha2Admission(ctx, store, phase2Ref); err == nil || !strings.Contains(err.Error(), "missing application evidence") {
+				t.Fatalf("unused initialization must not admit without evidence: %v", err)
+			}
+			// The existing phase8 HTTP fixture models one 47->48 CAS. Reset
+			// only its RV between the two real writes, as mixedAuthoritySetup does.
+			server.cluster = strings.Replace(server.cluster, `"resourceVersion":"48"`, `"resourceVersion":"47"`, 1)
+			initial, err := LoadV1Alpha2ApplicationInit(ctx, store, phase2Ref)
+			if err != nil {
 				t.Fatal(err)
+			}
+			if _, result, err := CommitV1Alpha2ApplicationInit(ctx, store, initial, plan, authorityTestEvidence); err != nil || result != V1Alpha2CASApplied {
+				t.Fatalf("E0 consumption must publish evidence: observation=%s error=%v", result, err)
 			}
 			if _, err := LoadV1Alpha2Admission(ctx, store, phase2Ref); err != nil {
 				t.Fatal(err)

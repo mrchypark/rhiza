@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"path/filepath"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -12,6 +13,7 @@ import (
 
 	"github.com/mrchypark/rhiza/internal/sqlpolicy"
 	"github.com/mrchypark/rhiza/internal/types"
+	"github.com/mrchypark/rhiza/pkg/materializer"
 	"github.com/mrchypark/rhiza/pkg/network"
 	"github.com/mrchypark/rhiza/pkg/operator"
 	"github.com/mrchypark/rhiza/pkg/quepaxa"
@@ -50,15 +52,15 @@ func TestInternalRequestSameSelectorConflictingUnknownIsAmbiguous(t *testing.T) 
 	a := testHintOriginal("sql", "same")
 	b := a
 	b.sql.SQL = "SELECT 2"
-	h.rememberRequestOutcome(a, &network.CommitUnknownError{RequestID: "same", Cause: context.Canceled})
-	h.rememberRequestOutcome(b, &network.CommitUnknownError{RequestID: "same", Cause: context.Canceled})
+	h.rememberRequestOutcome(a, &network.CommitUnknownError{RequestID: "same", Cause: context.Canceled}, types.MutationReceipt{})
+	h.rememberRequestOutcome(b, &network.CommitUnknownError{RequestID: "same", Cause: context.Canceled}, types.MutationReceipt{})
 	if len(h.recoveryTargets) != 1 {
 		t.Fatal("same selector changed key count")
 	}
 	if _, err := h.RecoverPendingDetailed(context.Background()); !errors.Is(err, network.ErrCommitUnknown) {
 		t.Fatal("conflicting intents picked an arbitrary one", err)
 	}
-	h.rememberRequestOutcome(b, nil)
+	h.rememberRequestOutcome(b, nil, types.MutationReceipt{Slot: 1})
 	if len(h.recoveryTargets) != 1 {
 		t.Fatal("success for B erased ambiguity about A")
 	}
@@ -67,7 +69,7 @@ func TestInternalRequestSameSelectorConflictingUnknownIsAmbiguous(t *testing.T) 
 func TestInternalRequestInvalidFingerprintNonUnknownPreservesHint(t *testing.T) {
 	h := &Host{}
 	p := testHintOriginal("sql", "X")
-	h.rememberRequestOutcome(p, &network.CommitUnknownError{RequestID: "X", Cause: context.Canceled})
+	h.rememberRequestOutcome(p, &network.CommitUnknownError{RequestID: "X", Cause: context.Canceled}, types.MutationReceipt{})
 	selector := network.RequestStatusRequest{Kind: "sql", RequestID: "X"}
 	before := h.recoveryTargets[selector]
 	invalid := testHintOriginal("sql", "invalid")
@@ -76,7 +78,7 @@ func TestInternalRequestInvalidFingerprintNonUnknownPreservesHint(t *testing.T) 
 		t.Fatal("fixture fingerprint unexpectedly encodes function")
 	}
 	for _, err := range []error{network.ErrInvalidRequest, network.ErrRequestConflict, &SQLNotSubmittedError{Stage: SQLStageAdmission, Cause: network.ErrNotReady}} {
-		h.rememberRequestOutcome(invalid, err)
+		h.rememberRequestOutcome(invalid, err, types.MutationReceipt{})
 		if h.recoveryTargetOverflow || len(h.recoveryTargets) != 1 || h.recoveryTargets[selector] != before {
 			t.Fatal("non-UNKNOWN invalid input changed existing hint")
 		}
@@ -94,7 +96,7 @@ func TestInternalRequestHintIntentMustMatchCanonicalOwner(t *testing.T) {
 	}
 	a := applicationOriginal{kind: "sql", sql: ExecuteRequest{RequestID: "contested", SQL: "CREATE TABLE attempted_a(n INTEGER)"}}
 	hosts[0].mu.Lock()
-	hosts[0].rememberRequestOutcome(a, &network.CommitUnknownError{RequestID: a.rawID(), Cause: context.Canceled})
+	hosts[0].rememberRequestOutcome(a, &network.CommitUnknownError{RequestID: a.rawID(), Cause: context.Canceled}, types.MutationReceipt{})
 	hosts[0].mu.Unlock()
 	b, err := hosts[1].Execute(ctx, ExecuteRequest{RequestID: "contested", SQL: "CREATE TABLE canonical_b(n INTEGER)"})
 	if err != nil || b.Status != types.MutationCommitted {
@@ -124,7 +126,7 @@ func TestInternalRequestHintIntentMustMatchCanonicalOwner(t *testing.T) {
 	}
 	p := applicationOriginal{kind: "kv", kv: types.KVCommand{RequestID: request.RequestID, Operation: "put", Key: request.Key}}
 	hosts[2].mu.Lock()
-	hosts[2].rememberRequestOutcome(p, &network.CommitUnknownError{RequestID: p.rawID(), Slot: quepaxa.Slot(canonical.Slot + 100), Cause: context.Canceled})
+	hosts[2].rememberRequestOutcome(p, &network.CommitUnknownError{RequestID: p.rawID(), Slot: quepaxa.Slot(canonical.Slot + 100), Cause: context.Canceled}, types.MutationReceipt{})
 	hosts[2].mu.Unlock()
 	before = hostApplicationDecisionCount(t, ctx, configs[0], sqlpolicy.ManagedRequestMaterializationPolicy)
 	recovered, err := hosts[2].RecoverPendingDetailed(ctx)
@@ -140,22 +142,109 @@ func TestInternalRequestHintsDoNotSelectLatestOrPoisonRuntime(t *testing.T) {
 	h := &Host{}
 	x := network.RequestStatusRequest{Kind: "sql", RequestID: "X"}
 	y := network.RequestStatusRequest{Kind: "kv", RequestID: "\xff"}
-	h.rememberRequestOutcome(testHintOriginal(x.Kind, x.RequestID), &network.CommitUnknownError{RequestID: x.RequestID, Cause: context.DeadlineExceeded})
-	h.rememberRequestOutcome(testHintOriginal(y.Kind, y.RequestID), nil)
+	h.rememberRequestOutcome(testHintOriginal(x.Kind, x.RequestID), &network.CommitUnknownError{RequestID: x.RequestID, Cause: context.DeadlineExceeded}, types.MutationReceipt{})
+	h.rememberRequestOutcome(testHintOriginal(y.Kind, y.RequestID), nil, types.MutationReceipt{Slot: 1})
 	if _, ok := h.recoveryTargets[x]; !ok || len(h.recoveryTargets) != 1 || h.uncertain.Load() {
 		t.Fatal("independent successful Y must not erase X or poison runtime")
 	}
-	h.rememberRequestOutcome(testHintOriginal(y.Kind, y.RequestID), &network.CommitUnknownError{RequestID: y.RequestID, Cause: context.Canceled})
+	h.rememberRequestOutcome(testHintOriginal(y.Kind, y.RequestID), &network.CommitUnknownError{RequestID: y.RequestID, Cause: context.Canceled}, types.MutationReceipt{})
 	if len(h.recoveryTargets) != 2 {
 		t.Fatal("ambiguous targets collapsed to latest")
 	}
-	h.rememberRequestOutcome(testHintOriginal(x.Kind, x.RequestID), errors.New("lookup failed"))
+	h.rememberRequestOutcome(testHintOriginal(x.Kind, x.RequestID), errors.New("lookup failed"), types.MutationReceipt{})
 	if len(h.recoveryTargets) != 2 {
 		t.Fatal("nonterminal error erased unresolved target")
 	}
-	h.rememberRequestOutcome(testHintOriginal(x.Kind, x.RequestID), nil)
+	h.rememberRequestOutcome(testHintOriginal(x.Kind, x.RequestID), nil, types.MutationReceipt{Slot: 1})
 	if len(h.recoveryTargets) != 1 {
 		t.Fatal("exact successful result did not clear only its own hint")
+	}
+}
+
+// This separates actual materializer retention from Host's private hint gate.
+// Direct Apply is not a certified Host, network expiry or recovery execution.
+func TestInternalRequestKnownSlotRejectsExpiredSameIntentResult(t *testing.T) {
+	ctx := context.Background()
+	m, err := materializer.OpenManagedSQLKVWithOriginals(filepath.Join(t.TempDir(), "original.sqlite"), 1, 1024)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		if err := m.Close(); err != nil {
+			t.Error(err)
+		}
+	})
+	command := types.KVCommand{RequestID: "X", Operation: "cas", Key: "key", Value: []byte("first"), ExpectedExists: false, TTLMS: 10000, ObservedAtUnixMS: 10, ExpiresAtUnixMS: 10010}
+	value, err := types.EncodeManagedKVCommand(command)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := m.Apply(ctx, 1, value); err != nil {
+		t.Fatal(err)
+	}
+	first, found, err := m.RetainedRequestOriginal(ctx, types.MutationKV, "X")
+	if err != nil || !found || !first.Receipt.Applied {
+		t.Fatal("first actual CAS was not true", err)
+	}
+	controls := make([]quepaxa.DecidedValue, 0, 1024)
+	for slot := 2; slot <= 1025; slot++ {
+		controls = append(controls, quepaxa.DecidedValue{Slot: quepaxa.Slot(slot), Value: types.EncodeReadBarrier([types.ReadBarrierNonceSize]byte{})})
+	}
+	if err := m.ApplyBatch(ctx, controls); err != nil {
+		t.Fatal(err)
+	}
+	if _, found, err := m.RetainedRequestOriginal(ctx, types.MutationKV, "X"); err != nil || found {
+		t.Fatal("original did not expire", err)
+	}
+	command.ObservedAtUnixMS = 20
+	command.ExpiresAtUnixMS = 10020
+	value, err = types.EncodeManagedKVCommand(command)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := m.Apply(ctx, 1026, value); err != nil {
+		t.Fatal(err)
+	}
+	later, found, err := m.RetainedRequestOriginal(ctx, types.MutationKV, "X")
+	if err != nil || !found || later.Receipt.Applied || later.Fingerprint != first.Fingerprint {
+		t.Fatal("same-intent actual reexecution did not produce false CAS", err)
+	}
+	h := &Host{}
+	p := applicationOriginal{kind: "kv", kv: command}
+	selector := network.RequestStatusRequest{Kind: "kv", RequestID: "X"}
+	h.rememberRequestOutcome(p, &network.CommitUnknownError{RequestID: "X", Slot: quepaxa.Slot(first.Slot), Cause: context.Canceled}, types.MutationReceipt{})
+	h.rememberRequestOutcome(p, &network.CommitUnknownError{RequestID: "X", Cause: context.Canceled}, types.MutationReceipt{})
+	hint := h.recoveryTargets[selector]
+	if hint.knownAttemptSlot != first.Slot || hint.matches(later.Fingerprint, later.Slot) {
+		t.Fatal("no-arg gate accepted newer retained result or erased known upper bound")
+	}
+	h.rememberRequestOutcome(p, nil, types.MutationReceipt{})
+	if len(h.recoveryTargets) != 1 {
+		t.Fatal("zero-slot success cleared known UNKNOWN")
+	}
+	h.clearRequestHint(selector, later.Fingerprint, later.Slot) // same rule used after explicit canonical recovery
+	if len(h.recoveryTargets) != 1 {
+		t.Fatal("explicit T result cleared old S hint")
+	}
+	h.rememberRequestOutcome(p, nil, later.Receipt) // actual ordinary-success receipt, not guessed submit slot
+	if len(h.recoveryTargets) != 1 {
+		t.Fatal("ordinary newer success cleared old S hint")
+	}
+	unchanged, found, err := m.RetainedRequestOriginal(ctx, types.MutationKV, "X")
+	if err != nil || !found || string(unchanged.ExecutionItem) != string(later.ExecutionItem) || unchanged.Receipt != later.Receipt {
+		t.Fatal("hint checks changed canonical result/TTL", err)
+	}
+	// A duplicate's successful canonical record may precede its submit slot.
+	duplicate := &Host{}
+	duplicate.rememberRequestOutcome(p, &network.CommitUnknownError{RequestID: "X", Slot: 40, Cause: context.Canceled}, types.MutationReceipt{})
+	duplicate.rememberRequestOutcome(p, &network.CommitUnknownError{RequestID: "X", Slot: 30, Cause: context.Canceled}, types.MutationReceipt{})
+	duplicate.rememberRequestOutcome(p, &network.CommitUnknownError{RequestID: "X", Cause: context.Canceled}, types.MutationReceipt{})
+	if duplicate.recoveryTargets[selector].knownAttemptSlot != 30 || !duplicate.recoveryTargets[selector].matches(first.Fingerprint, first.Slot) {
+		t.Fatal("earlier canonical duplicate rejected or earliest bound lost")
+	}
+	duplicate.clearRequestHint(selector, first.Fingerprint, first.Slot)
+	if len(duplicate.recoveryTargets) != 0 {
+		t.Fatal("earlier canonical result did not clear compatible hint")
 	}
 }
 
@@ -163,7 +252,7 @@ func TestInternalRequestNoArgUnknownOrAmbiguous(t *testing.T) {
 	for _, targets := range []int{0, 2, 3} {
 		h := &Host{cfg: Config{Plan: operator.V1Alpha2ApplicationInitPlan{ApplicationProtocol: sqlpolicy.ManagedRequestApplicationProtocol}}}
 		for i := 0; i < targets; i++ {
-			h.rememberRequestOutcome(testHintOriginal("sql", string(rune('X'+i))), &network.CommitUnknownError{Cause: context.Canceled})
+			h.rememberRequestOutcome(testHintOriginal("sql", string(rune('X'+i))), &network.CommitUnknownError{Cause: context.Canceled}, types.MutationReceipt{})
 		}
 		result, err := h.RecoverPendingDetailed(context.Background())
 		if !errors.Is(err, network.ErrCommitUnknown) || result.Kind != "" {
@@ -256,7 +345,7 @@ func TestInternalRequestHostOperationsWithoutKube(t *testing.T) {
 	// Model loss at the caller response-delivery boundary after actual commit.
 	// This tests hint selection, not an injected storage/network timeout.
 	host.mu.Lock()
-	host.rememberRequestOutcome(applicationOriginal{kind: "sql", sql: ExecuteRequest{RequestID: "X", SQL: "CREATE TABLE internal_request_proof (id INTEGER PRIMARY KEY)"}}, &network.CommitUnknownError{RequestID: "X", Cause: context.DeadlineExceeded})
+	host.rememberRequestOutcome(applicationOriginal{kind: "sql", sql: ExecuteRequest{RequestID: "X", SQL: "CREATE TABLE internal_request_proof (id INTEGER PRIMARY KEY)"}}, &network.CommitUnknownError{RequestID: "X", Cause: context.DeadlineExceeded}, types.MutationReceipt{})
 	host.mu.Unlock()
 	attempts.Store(0)
 	outage.Store(true)

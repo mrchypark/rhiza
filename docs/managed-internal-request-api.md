@@ -33,6 +33,12 @@ incompatible no-arg hint. CommitUnknown errors from SQL/KV preserve the existing
 mutation-context kind/raw ID/known slot/retry/cause chain; validation, admission
 and intent-conflict errors are not reclassified as CommitUnknown.
 
+When an UNKNOWN includes a nonzero submission slot, the handle keeps the
+earliest such slot as an upper bound on its canonical first result. A later
+same-ID/same-intent result after retention must not resolve or clear that older
+hint. The canonical slot may be **earlier** than a duplicate submit slot; exact
+equality is not required. A later slot-zero error never erases a known bound.
+
 The existing C ABI operation `recover_pending_detailed` accepts either `{}` or
 the exact pair `{"kind":"kv","request_id_b64":"/w=="}`. Half-pairs, null,
 unsupported kind, noncanonical/empty/oversized base64 ID and extra fields fail.

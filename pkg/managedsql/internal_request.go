@@ -27,6 +27,13 @@ func (h *Host) ensureInitialRequestAdmission(ctx context.Context) error {
 type requestRecoveryHint struct {
 	fingerprint [32]byte
 	ambiguous   bool
+	// Earliest known nonzero submission slot bounds the original's first
+	// canonical position; duplicates may submit after that original position.
+	knownAttemptSlot uint64
+}
+
+func (h requestRecoveryHint) matches(fingerprint [32]byte, canonicalSlot uint64) bool {
+	return !h.ambiguous && h.fingerprint == fingerprint && canonicalSlot != 0 && (h.knownAttemptSlot == 0 || canonicalSlot <= h.knownAttemptSlot)
 }
 
 func originalFingerprint(p applicationOriginal) ([32]byte, error) {
@@ -49,7 +56,7 @@ func internalRequestOutcome(p applicationOriginal, receipt types.MutationReceipt
 
 // Called with h.mu held. The owned fingerprint identifies attempted intent;
 // it is not original storage or execution authority.
-func (h *Host) rememberRequestOutcome(p applicationOriginal, err error) {
+func (h *Host) rememberRequestOutcome(p applicationOriginal, err error, actualReceipt types.MutationReceipt) {
 	var unknown *network.CommitUnknownError
 	isUnknown := errors.As(err, &unknown)
 	if err != nil && !isUnknown {
@@ -78,14 +85,17 @@ func (h *Host) rememberRequestOutcome(p applicationOriginal, err error) {
 		if !known {
 			hint.fingerprint = fingerprint
 		}
+		if !hint.ambiguous && unknown.Slot != 0 && (hint.knownAttemptSlot == 0 || uint64(unknown.Slot) < hint.knownAttemptSlot) {
+			hint.knownAttemptSlot = uint64(unknown.Slot)
+		}
 		h.recoveryTargets[selector] = hint
 	} else if err == nil {
-		h.clearRequestHint(selector, fingerprint)
+		h.clearRequestHint(selector, fingerprint, actualReceipt.Slot)
 	}
 }
 
-func (h *Host) clearRequestHint(selector network.RequestStatusRequest, fingerprint [32]byte) {
-	if hint, ok := h.recoveryTargets[selector]; ok && !hint.ambiguous && hint.fingerprint == fingerprint {
+func (h *Host) clearRequestHint(selector network.RequestStatusRequest, fingerprint [32]byte, canonicalSlot uint64) {
+	if hint, ok := h.recoveryTargets[selector]; ok && hint.matches(fingerprint, canonicalSlot) {
 		delete(h.recoveryTargets, selector)
 	}
 }
@@ -119,7 +129,7 @@ func (h *Host) recoverRequestLocked(ctx context.Context, selector network.Reques
 	// and post-barrier binding/original checks in one fixed-target invocation.
 	resolved, err := h.node.ResolveRequest(ctx, selector.Kind, selector.RequestID)
 	result := RecoveryResult{Kind: selector.Kind, RequestID: []byte(selector.RequestID)}
-	if expected != nil && resolved.Original.Slot != 0 && resolved.Original.Fingerprint != *expected {
+	if expected != nil && resolved.Original.Slot != 0 && (resolved.Original.Fingerprint != *expected || !h.recoveryTargets[selector].matches(resolved.Original.Fingerprint, resolved.Original.Slot)) {
 		return result, applicationOutcomeUnknown(p, types.MutationReceipt{}, errors.Join(fmt.Errorf("retained original differs from attempted recovery intent"), err))
 	}
 	if resolved.Receipt.Slot != 0 {
@@ -135,6 +145,6 @@ func (h *Host) recoverRequestLocked(ctx context.Context, selector network.Reques
 	if resolved.Original.Kind != kind || resolved.Original.RequestID != selector.RequestID || resolved.Receipt.Slot == 0 || resolved.Receipt.Slot != resolved.Original.Slot {
 		return result, applicationOutcomeUnknown(p, resolved.Original.Receipt, fmt.Errorf("retained original selector or result slot changed"))
 	}
-	h.clearRequestHint(selector, resolved.Original.Fingerprint)
+	h.clearRequestHint(selector, resolved.Original.Fingerprint, resolved.Original.Slot)
 	return result, nil
 }

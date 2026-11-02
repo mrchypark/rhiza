@@ -268,7 +268,7 @@ func (h *Host) KVMutate(ctx context.Context, operation string, req network.KVMut
 		response, err := h.node.ExecuteManagedKV(ctx, original.Operation, kvRequest(original))
 		p := applicationOriginal{kind: "kv", kv: original}
 		err = internalRequestOutcome(p, response.MutationReceipt, err)
-		h.rememberRequestOutcome(p, err)
+		h.rememberRequestOutcome(p, err, response.MutationReceipt)
 		return response, err
 	}
 	a, err := h.live(ctx)

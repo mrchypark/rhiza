@@ -645,7 +645,7 @@ func (h *Host) Execute(ctx context.Context, req ExecuteRequest) (ExecuteResponse
 		response, err := h.node.ExecuteManagedSQL(ctx, req)
 		p := applicationOriginal{kind: "sql", sql: req}
 		err = internalRequestOutcome(p, response.MutationReceipt, err)
-		h.rememberRequestOutcome(p, err)
+		h.rememberRequestOutcome(p, err, response.MutationReceipt)
 		return response, err
 	}
 	// Retain the authority RV across quorum admission. Refreshing it afterward
