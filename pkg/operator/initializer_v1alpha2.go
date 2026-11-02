@@ -141,10 +141,6 @@ func ReconcileV1Alpha2ManagedInitialization(ctx context.Context, kube *Kubernete
 	if c.Spec.ApplicationProtocol != profile.ApplicationProtocol {
 		return V1Alpha2StatusSnapshot{}, fmt.Errorf("installed application protocol differs from cluster")
 	}
-	// This phase provides capability binding only, not mixed runtime deployment.
-	if profile.ApplicationProtocol != "" {
-		return V1Alpha2StatusSnapshot{}, fmt.Errorf("mixed managed runtime activation is not supported")
-	}
 	var meta v1alpha2BootstrapMetadata
 	b, _ := json.Marshal(c.Metadata)
 	if json.Unmarshal(b, &meta) != nil || meta.Name != ref.Name || meta.Namespace != ref.Namespace || meta.UID != ref.UID || meta.ResourceVersion == "" || meta.DeletionTimestamp != nil {

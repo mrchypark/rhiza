@@ -29,6 +29,7 @@ type phase9Server struct {
 	onCreate             func()
 	serviceAccount       map[string]any
 	serviceAccountStatus int
+	runtimeProfile       V1Alpha2RuntimeProfile
 }
 
 func phase9RuntimeProfile() V1Alpha2RuntimeProfile {
@@ -126,7 +127,7 @@ func (s *phase9Server) roundTrip(r *http.Request) (*http.Response, error) {
 		return respond(managedFixtureServiceAccount(phase2Ref))
 	}
 	if strings.Contains(r.URL.Path, "/secrets/") {
-		b, _ := json.Marshal(phase9RuntimeProfile())
+		b, _ := json.Marshal(s.runtimeProfile)
 		return respond(map[string]any{"metadata": map[string]any{"name": "runtime", "namespace": "ns", "uid": "secretuid"}, "data": map[string][]byte{V1Alpha2ManagedRuntimeProfileKey: b}})
 	}
 	if strings.Contains(r.URL.Path, "/replicasets/") {
@@ -217,9 +218,16 @@ func (s *phase9Server) roundTrip(r *http.Request) (*http.Response, error) {
 	return response, err
 }
 
-func phase9Setup(t *testing.T, cluster string) (*phase9Server, *Kubernetes) {
+func phase9Setup(t *testing.T, cluster string, profiles ...V1Alpha2RuntimeProfile) (*phase9Server, *Kubernetes) {
 	t.Helper()
-	s := &phase9Server{phase8Server: &phase8Server{t: t, cluster: cluster, apply: true}}
+	profile := phase9RuntimeProfile()
+	if len(profiles) > 1 {
+		t.Fatal("one installed fixture profile required")
+	}
+	if len(profiles) == 1 {
+		profile = profiles[0]
+	}
+	s := &phase9Server{phase8Server: &phase8Server{t: t, cluster: cluster, apply: true}, runtimeProfile: profile}
 	kube := phase2Store(t, s.roundTrip).Kube
 	server := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		response, err := s.roundTrip(r)

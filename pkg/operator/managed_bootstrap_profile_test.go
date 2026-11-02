@@ -1,46 +1,82 @@
 package operator
 
 import (
-	"context"
 	"encoding/json"
-	"net/http"
-	"net/http/httptest"
 	"strings"
 	"testing"
 
 	"github.com/mrchypark/rhiza/internal/types"
 )
 
-func TestManagedBootstrapProfileInstalledMismatchBeforeWrites(t *testing.T) {
-	for _, liveMixed := range []bool{false, true} {
-		writes := 0
-		cluster := phase8Cluster
-		if liveMixed {
-			cluster = strings.Replace(cluster, `"genesisIntent":"Create"`, `"genesisIntent":"Create","applicationProtocol":"rhiza-managed-sql-kv/v1"`, 1)
-		}
-		server := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			if r.Method != http.MethodGet {
-				writes++
-				t.Errorf("unexpected write %s", r.Method)
+func phase9ClusterWithProtocol(protocol string) string {
+	if protocol == "" {
+		return phase8Cluster
+	}
+	return strings.Replace(phase8Cluster, "\"genesisIntent\":\"Create\"", "\"genesisIntent\":\"Create\",\"applicationProtocol\":\""+protocol+"\"", 1)
+}
+
+func phase9MixedRuntimeProfile() V1Alpha2RuntimeProfile {
+	profile := phase9RuntimeProfile()
+	profile.ApplicationProtocol = types.ManagedApplicationProtocolSQLKV
+	profile.EvidenceFormat = V1Alpha2ManagedSQLKVEvidenceFormat
+	return profile
+}
+
+func TestManagedBootstrapKnownProfilesCreateOnce(t *testing.T) {
+	for _, profile := range []V1Alpha2RuntimeProfile{phase9RuntimeProfile(), phase9MixedRuntimeProfile()} {
+		t.Run(profile.EvidenceFormat, func(t *testing.T) {
+			s, kube := phase9Setup(t, phase9ClusterWithProtocol(profile.ApplicationProtocol), profile)
+			first, err := ReconcileV1Alpha2ManagedInitialization(t.Context(), kube, phase2Ref, profile)
+			if err != nil {
+				t.Fatal(err)
 			}
-			w.Header().Set("Content-Type", "application/json")
-			_, _ = w.Write([]byte(cluster))
-		}))
-		_, store, _ := phase8Setup(t, cluster, "")
-		store.Kube.BaseURL, store.Kube.Client = server.URL, server.Client()
-		profile := V1Alpha2RuntimeProfile{ApplicationProtocol: types.ManagedApplicationProtocolSQLKV, EvidenceFormat: V1Alpha2ManagedSQLKVEvidenceFormat}
-		_, err := ReconcileV1Alpha2ManagedInitialization(context.Background(), store.Kube, phase2Ref, profile)
-		server.Close()
-		if err == nil || writes != 0 {
-			t.Fatalf("mixed activation or mismatch accepted: %v writes=%d", err, writes)
-		}
-		want := "installed application protocol differs"
-		if liveMixed {
-			want = "mixed managed runtime activation"
-		}
-		if !strings.Contains(err.Error(), want) {
-			t.Fatalf("wrong refusal boundary: %v", err)
-		}
+			plan, err := first.BootstrapPlan()
+			if err != nil || len(plan.Members) != 3 || plan.EvidenceFormat != profile.EvidenceFormat || first.Authority().Generation != 0 || first.Authority().Binding.DeploymentUID != "deployment" || s.posts != 1 || s.puts != 1 {
+				t.Fatalf("normal genesis failed: plan=%+v err=%v posts=%d puts=%d", plan, err, s.posts, s.puts)
+			}
+			var cluster struct {
+				Status struct {
+					ApplicationInit V1Alpha2ApplicationInitAssignment
+				}
+			}
+			if err := json.Unmarshal([]byte(s.cluster), &cluster); err != nil || cluster.Status.ApplicationInit.Plan.ApplicationProtocol != profile.ApplicationProtocol {
+				t.Fatalf("explicit protocol not preserved: %v", err)
+			}
+			if _, err := ReconcileV1Alpha2ManagedInitialization(t.Context(), kube, phase2Ref, profile); err != nil || s.posts != 1 || s.puts != 1 {
+				t.Fatalf("repeat changed genesis: %v posts=%d puts=%d", err, s.posts, s.puts)
+			}
+		})
+	}
+}
+
+func TestManagedBootstrapProfileInstalledMismatchBeforeWrites(t *testing.T) {
+	for _, test := range []struct {
+		name string
+		live string
+		edit func(*V1Alpha2RuntimeProfile)
+	}{
+		{"legacy live mixed installed", "", func(*V1Alpha2RuntimeProfile) {}},
+		{"mixed live legacy installed", types.ManagedApplicationProtocolSQLKV, func(p *V1Alpha2RuntimeProfile) { *p = phase9RuntimeProfile() }},
+		{"unknown protocol", "unknown/v1", func(p *V1Alpha2RuntimeProfile) { p.ApplicationProtocol = "unknown/v1" }},
+		{"wrong evidence", types.ManagedApplicationProtocolSQLKV, func(p *V1Alpha2RuntimeProfile) { p.EvidenceFormat = V1Alpha2ManagedSQLEvidenceFormat }},
+		{"missing image", types.ManagedApplicationProtocolSQLKV, func(p *V1Alpha2RuntimeProfile) { p.InitImage = "" }},
+		{"local storage", types.ManagedApplicationProtocolSQLKV, func(p *V1Alpha2RuntimeProfile) { p.Storage.ObjStoreDir = "local" }},
+		{"invalid Secret", types.ManagedApplicationProtocolSQLKV, func(p *V1Alpha2RuntimeProfile) { p.ProfileSecretName = "invalid/name" }},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			profile := phase9MixedRuntimeProfile()
+			test.edit(&profile)
+			s, kube := phase9Setup(t, phase9ClusterWithProtocol(test.live), profile)
+			if _, err := ReconcileV1Alpha2ManagedInitialization(t.Context(), kube, phase2Ref, profile); err == nil || s.posts != 0 || s.puts != 0 {
+				t.Fatalf("invalid profile wrote: err=%v posts=%d puts=%d", err, s.posts, s.puts)
+			}
+		})
+	}
+	profile := phase9MixedRuntimeProfile()
+	s, kube := phase9Setup(t, phase9ClusterWithProtocol(profile.ApplicationProtocol), profile)
+	s.runtimeProfile.InitImage = "different:v1"
+	if _, err := ReconcileV1Alpha2ManagedInitialization(t.Context(), kube, phase2Ref, profile); err == nil || s.posts != 0 || s.puts != 0 {
+		t.Fatalf("different installed Secret wrote: %v posts=%d puts=%d", err, s.posts, s.puts)
 	}
 	b, err := json.Marshal(V1Alpha2RuntimeProfile{})
 	if err != nil || strings.Contains(string(b), "ApplicationProtocol") {
