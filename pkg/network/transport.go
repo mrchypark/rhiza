@@ -27,6 +27,7 @@ import (
 )
 
 const peerALPN = sqlpolicy.PeerALPN
+const managedKVPeerALPN = "rhiza-peer-managed-sql-kv-v1"
 const peerRPCTimeout = 5 * time.Second
 const checkpointPrepareTimeout = 5 * time.Minute
 
@@ -49,11 +50,12 @@ type clusterResolver interface {
 
 // Transport sends private peer RPCs over persistent raw QUIC connections.
 type Transport struct {
-	members   map[quepaxa.NodeID]quepaxa.Member
-	peerKeys  map[quepaxa.NodeID]ed25519.PublicKey
-	clusterID types.ClusterID
-	configID  uint
-	localID   quepaxa.NodeID
+	expectedPolicy sqlpolicy.MaterializationPolicy
+	members        map[quepaxa.NodeID]quepaxa.Member
+	peerKeys       map[quepaxa.NodeID]ed25519.PublicKey
+	clusterID      types.ClusterID
+	configID       uint
+	localID        quepaxa.NodeID
 	// peerToken is the local process's private identity secret. It never
 	// travels on the wire and is not part of any replicated configuration.
 	peerToken string
@@ -73,7 +75,13 @@ type Transport struct {
 }
 
 func NewTransport(clusterID types.ClusterID, localID quepaxa.NodeID, config *quepaxa.Cluster, peerToken string) *Transport {
-	return newTransport(clusterID, localID, config, peerToken, nil)
+	t, _ := NewTransportForPolicy(clusterID, localID, config, peerToken, sqlpolicy.LegacyMaterializationPolicy)
+	return t
+}
+
+// NewTransportForPolicy fixes the peer protocol before any connections exist.
+func NewTransportForPolicy(clusterID types.ClusterID, localID quepaxa.NodeID, config *quepaxa.Cluster, peerToken string, expected sqlpolicy.MaterializationPolicy) (*Transport, error) {
+	return newTransport(clusterID, localID, config, peerToken, nil, expected)
 }
 
 // SetAdminToken lets a process without voter identity (a learner before its
@@ -102,31 +110,57 @@ func NewPeerIdentity(clusterID types.ClusterID, member quepaxa.Member) (PeerIden
 
 // NewLearnerTransport creates a read-only transport without retaining voter tokens.
 func NewLearnerTransport(clusterID types.ClusterID, localID quepaxa.NodeID, configID uint, peers []PeerIdentity, adminToken string) *Transport {
+	t, _ := NewLearnerTransportForPolicy(clusterID, localID, configID, peers, adminToken, sqlpolicy.LegacyMaterializationPolicy)
+	return t
+}
+
+func NewLearnerTransportForPolicy(clusterID types.ClusterID, localID quepaxa.NodeID, configID uint, peers []PeerIdentity, adminToken string, expected sqlpolicy.MaterializationPolicy) (*Transport, error) {
+	if err := expected.Validate(); err != nil {
+		return nil, err
+	}
 	members := make([]quepaxa.Member, 0, len(peers))
 	keys := make(map[quepaxa.NodeID]ed25519.PublicKey, len(peers))
 	for _, peer := range peers {
 		members = append(members, quepaxa.Member{ID: peer.ID, PeerURL: peer.PeerURL, PublicKey: quepaxa.PublicKey(peer.PublicKey)})
 		keys[peer.ID] = append(ed25519.PublicKey(nil), peer.PublicKey[:]...)
 	}
-	learner := newTransport(clusterID, localID, &quepaxa.Cluster{ConfigID: configID, Members: members}, "", keys)
+	learner, err := newTransport(clusterID, localID, &quepaxa.Cluster{ConfigID: configID, Members: members}, "", keys, expected)
+	if err != nil {
+		return nil, err
+	}
 	learner.adminToken = adminToken
-	return learner
+	return learner, nil
 }
 
-func newTransport(clusterID types.ClusterID, localID quepaxa.NodeID, config *quepaxa.Cluster, peerToken string, keys map[quepaxa.NodeID]ed25519.PublicKey) *Transport {
+func peerALPNForPolicy(expected sqlpolicy.MaterializationPolicy) (string, error) {
+	if err := expected.Validate(); err != nil {
+		return "", err
+	}
+	if expected == sqlpolicy.ManagedSQLKVMaterializationPolicy {
+		return managedKVPeerALPN, nil
+	}
+	return peerALPN, nil
+}
+
+func newTransport(clusterID types.ClusterID, localID quepaxa.NodeID, config *quepaxa.Cluster, peerToken string, keys map[quepaxa.NodeID]ed25519.PublicKey, expected sqlpolicy.MaterializationPolicy) (*Transport, error) {
+	alpn, err := peerALPNForPolicy(expected)
+	if err != nil {
+		return nil, err
+	}
 	peers := make(map[quepaxa.NodeID]*peerConnection, len(config.Members))
 	for _, member := range config.Members {
 		peers[member.ID] = &peerConnection{gate: make(chan struct{}, 1), active: make(map[*quic.Conn]int)}
 	}
 	return &Transport{
-		members: config.MemberSet(), clusterID: clusterID, configID: config.ConfigID,
+		expectedPolicy: expected,
+		members:        config.MemberSet(), clusterID: clusterID, configID: config.ConfigID,
 		localID: localID, peerToken: peerToken, peers: peers, peerKeys: keys,
 		tls: &tls.Config{
-			MinVersion: tls.VersionTLS13, NextProtos: []string{peerALPN},
+			MinVersion: tls.VersionTLS13, NextProtos: []string{alpn},
 			ClientSessionCache: tls.NewLRUClientSessionCache(len(config.Members)),
 		},
 		quic: &quic.Config{HandshakeIdleTimeout: 5 * time.Second, MaxIdleTimeout: 30 * time.Second, KeepAlivePeriod: 10 * time.Second, MaxIncomingStreams: 256}, dynamic: make(map[uint]*Transport),
-	}
+	}, nil
 }
 
 // BindCore makes requests resolve the immutable configuration for their slot.
@@ -190,7 +224,10 @@ func (t *Transport) transportForID(id uint, snapshot func() quepaxa.Cluster) (*T
 	// Each immutable configuration owns its pools and TLS session cache. A
 	// changed voter token therefore cannot reuse a previous configuration's
 	// connection or 0-RTT ticket.
-	peer := newTransport(t.clusterID, t.localID, &config, t.peerToken, nil)
+	peer, err := newTransport(t.clusterID, t.localID, &config, t.peerToken, nil, t.expectedPolicy)
+	if err != nil {
+		return nil, err
+	}
 	peer.adminToken = t.adminToken
 	t.dynamic[config.ConfigID] = peer
 	return peer, nil
@@ -827,7 +864,10 @@ func (t *Transport) sendTerminalDecision(ctx context.Context, decision quepaxa.D
 			union.Members = append(union.Members, member)
 		}
 	}
-	peer := newTransport(t.clusterID, t.localID, &union, t.peerToken, nil)
+	peer, err := newTransport(t.clusterID, t.localID, &union, t.peerToken, nil, t.expectedPolicy)
+	if err != nil {
+		return err
+	}
 	peer.quic = t.quic
 	defer peer.Close()
 	callCtx, cancel := context.WithCancel(ctx)
@@ -1014,7 +1054,10 @@ func (t *Transport) VerifyLearner(ctx context.Context, learner quepaxa.Member, t
 	}
 	probeConfig := config
 	probeConfig.Members = append(append([]quepaxa.Member(nil), config.Members...), learner)
-	probe := newTransport(t.clusterID, t.localID, &probeConfig, t.peerToken, nil)
+	probe, err := newTransport(t.clusterID, t.localID, &probeConfig, t.peerToken, nil, t.expectedPolicy)
+	if err != nil {
+		return err
+	}
 	defer probe.Close()
 	request := probe.request(peerfb.OperationVerifyPrefix)
 	request.ConfigId = uint64(config.ConfigID)

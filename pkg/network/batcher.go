@@ -51,7 +51,7 @@ type mutationBatcher[T any] struct {
 	propose    func(context.Context, []byte) (quepaxa.Slot, error)
 	apply      func(context.Context, quepaxa.Slot) error
 	encodeItem func(T) ([]byte, error)
-	assemble   func([][]byte) []byte
+	assemble   func([][]byte) ([]byte, error)
 	requestID  func(T) string
 	baseSize   int
 	input      chan *batchItem
@@ -68,10 +68,14 @@ type mutationBatcher[T any] struct {
 }
 
 func newMutationBatcher[T any](propose func(context.Context, []byte) (quepaxa.Slot, error), apply func(context.Context, quepaxa.Slot) error, encodeItem func(T) ([]byte, error), assemble func([][]byte) []byte, requestID func(T) string) *mutationBatcher[T] {
+	return newMutationBatcherWithAssembly(propose, apply, encodeItem, func(items [][]byte) ([]byte, error) { return assemble(items), nil }, len(assemble(nil)), requestID)
+}
+
+func newMutationBatcherWithAssembly[T any](propose func(context.Context, []byte) (quepaxa.Slot, error), apply func(context.Context, quepaxa.Slot) error, encodeItem func(T) ([]byte, error), assemble func([][]byte) ([]byte, error), envelopeBytes int, requestID func(T) string) *mutationBatcher[T] {
 	ctx, cancel := context.WithCancel(context.Background())
 	b := &mutationBatcher[T]{
 		propose: propose, apply: apply, encodeItem: encodeItem, assemble: assemble, requestID: requestID,
-		baseSize: len(assemble(nil)),
+		baseSize: envelopeBytes,
 		input:    make(chan *batchItem, maxQueuedRequests), jobs: make(chan batchJob), inflight: make(chan struct{}, maxInflightBatches),
 		ctx: ctx, cancel: cancel,
 	}
@@ -93,6 +97,10 @@ func newGraphBatcher(propose func(context.Context, []byte) (quepaxa.Slot, error)
 
 func newKVBatcher(propose func(context.Context, []byte) (quepaxa.Slot, error), apply func(context.Context, quepaxa.Slot) error) *mutationBatcher[types.KVCommand] {
 	return newMutationBatcher(propose, apply, types.EncodeKVBatchItem, types.AssembleKVBatch, func(command types.KVCommand) string { return command.RequestID })
+}
+
+func newManagedKVBatcher(propose func(context.Context, []byte) (quepaxa.Slot, error), apply func(context.Context, quepaxa.Slot) error) *mutationBatcher[types.KVCommand] {
+	return newMutationBatcherWithAssembly(propose, apply, types.EncodeManagedKVBatchItem, types.AssembleManagedKVBatch, 7, func(command types.KVCommand) string { return command.RequestID })
 }
 
 func (b *mutationBatcher[T]) submit(ctx context.Context, command T, leases ...*mutationLease) (quepaxa.Slot, error) {
@@ -322,7 +330,15 @@ func (b *mutationBatcher[T]) dispatch(items []*batchItem, encoded [][]byte) {
 	if len(active) == 0 {
 		return
 	}
-	value := b.assemble(activeEncoded)
+	value, err := b.assemble(activeEncoded)
+	if err != nil {
+		b.fail(active, err)
+		return
+	}
+	if len(value) == 0 || len(value) > quepaxa.MaxReplicatedValueBytes {
+		b.fail(active, ErrInvalidRequest)
+		return
+	}
 	b.inflight <- struct{}{}
 	b.budgetMu.Lock()
 	if len(value) > maxInflightEncodedByte-b.inflightB {
