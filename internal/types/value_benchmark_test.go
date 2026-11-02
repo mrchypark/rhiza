@@ -32,5 +32,30 @@ func BenchmarkSQLBatchCodec(b *testing.B) {
 				}
 			}
 		})
+		b.Run(payload.name+"_encode", func(b *testing.B) {
+			command := SQLCommand{RequestID: "benchmark-request", SQL: "INSERT INTO records (id, value) VALUES (?, ?)", Args: []any{int64(1), payload.value}}
+			b.ReportAllocs()
+			b.ResetTimer()
+			for range b.N {
+				if _, err := EncodeSQLBatchItem(command); err != nil {
+					b.Fatal(err)
+				}
+			}
+		})
+		b.Run(payload.name+"_decode", func(b *testing.B) {
+			command := SQLCommand{RequestID: "benchmark-request", SQL: "INSERT INTO records (id, value) VALUES (?, ?)", Args: []any{int64(1), payload.value}}
+			encoded, err := EncodeSQLBatch([]SQLCommand{command})
+			if err != nil {
+				b.Fatal(err)
+			}
+			b.ReportAllocs()
+			b.ResetTimer()
+			for range b.N {
+				decoded, recognized, err := DecodeSQLBatch(encoded)
+				if err != nil || !recognized || len(decoded) != 1 {
+					b.Fatalf("SQL batch decode: recognized=%t commands=%d err=%v", recognized, len(decoded), err)
+				}
+			}
+		})
 	}
 }
