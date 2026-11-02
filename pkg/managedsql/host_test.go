@@ -47,9 +47,12 @@ type sqlWireControl struct {
 	putReady                chan string
 	putRelease              chan struct{}
 	putSuffix               string
-	failFirstPut            atomic.Bool
-	keysMu                  sync.Mutex
-	putKeys                 []string
+	// Optional arm is installed before runtime startup. Nil retains the
+	// existing unconditional gate; tests may atomically arm a later failure.
+	putEnabled   *atomic.Bool
+	failFirstPut atomic.Bool
+	keysMu       sync.Mutex
+	putKeys      []string
 }
 
 func sqlWireStore(t *testing.T) (*httptest.Server, *sqlWireControl) {
@@ -58,7 +61,7 @@ func sqlWireStore(t *testing.T) (*httptest.Server, *sqlWireControl) {
 	objects := map[string][]byte{}
 	control := &sqlWireControl{}
 	s := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.Method == http.MethodPut && control.putReady != nil && strings.HasSuffix(r.URL.Path, control.putSuffix) {
+		if r.Method == http.MethodPut && control.putReady != nil && (control.putEnabled == nil || control.putEnabled.Load()) && strings.HasSuffix(r.URL.Path, control.putSuffix) {
 			select {
 			case control.putReady <- r.URL.Path:
 			case <-control.putRelease:

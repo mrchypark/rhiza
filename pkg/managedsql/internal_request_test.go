@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -59,9 +60,15 @@ func TestInternalRequestNoArgUnknownOrAmbiguous(t *testing.T) {
 
 // This uses the real three-Host/Core/WAL/SQLite/S3-wire fixture. The transport
 // fault is Kubernetes-only, not a real-cloud or process-termination experiment.
-func openInternalRequestHosts(t *testing.T, outage *atomic.Bool, attempts *atomic.Int64) ([]Config, []*Host) {
+func openInternalRequestHosts(t *testing.T, outage *atomic.Bool, attempts *atomic.Int64, setup ...func(*sqlWireControl)) ([]Config, []*Host, *sqlStatusFixture) {
 	t.Helper()
 	configs, fixture := sqlClusterForProtocol(t, sqlpolicy.ManagedRequestApplicationProtocol)
+	if len(setup) > 1 {
+		t.Fatal("one optional source fixture setup expected")
+	}
+	if len(setup) == 1 {
+		setup[0](fixture.source)
+	}
 	hosts := make([]*Host, len(configs))
 	for i, config := range configs {
 		kube := *config.Store.Kube
@@ -89,7 +96,7 @@ func openInternalRequestHosts(t *testing.T, outage *atomic.Bool, attempts *atomi
 		}
 		hosts[i] = host
 	}
-	return configs, hosts
+	return configs, hosts, fixture
 }
 
 func awaitPublicInternalReady(t *testing.T, ctx context.Context, host *Host) {
@@ -111,7 +118,7 @@ func awaitPublicInternalReady(t *testing.T, ctx context.Context, host *Host) {
 func TestInternalRequestHostOperationsWithoutKube(t *testing.T) {
 	var outage atomic.Bool
 	var attempts atomic.Int64
-	configs, hosts := openInternalRequestHosts(t, &outage, &attempts)
+	configs, hosts, _ := openInternalRequestHosts(t, &outage, &attempts)
 	ctx, cancel := context.WithTimeout(context.Background(), 25*time.Second)
 	defer cancel()
 	beforeAdmission := attempts.Load()
@@ -179,7 +186,7 @@ func TestInternalRequestHostOperationsWithoutKube(t *testing.T) {
 func TestInternalRequestFirstExecuteWithoutPrivateAdmissionOrReady(t *testing.T) {
 	var outage atomic.Bool
 	var attempts atomic.Int64
-	_, hosts := openInternalRequestHosts(t, &outage, &attempts)
+	_, hosts, _ := openInternalRequestHosts(t, &outage, &attempts)
 	ctx, cancel := context.WithTimeout(context.Background(), 25*time.Second)
 	defer cancel()
 	before := attempts.Load()
@@ -202,5 +209,141 @@ func TestInternalRequestFirstExecuteWithoutPrivateAdmissionOrReady(t *testing.T)
 	}
 	if attempts.Load() != 0 {
 		t.Fatal("post-admission local calls accessed Kubernetes")
+	}
+}
+
+// No manual error hint is installed here: the actual KVMutate call must return
+// CommitUnknown after Apply while the real SDK archive request is held.
+func TestInternalRequestActualPostApplyCancellationRecoversExactOriginal(t *testing.T) {
+	var outage, armed atomic.Bool
+	var attempts atomic.Int64
+	entered := make(chan string, 8)
+	release := make(chan struct{})
+	var releaseOnce sync.Once
+	configs, hosts, fixture := openInternalRequestHosts(t, &outage, &attempts, func(source *sqlWireControl) {
+		source.putReady = entered
+		source.putRelease = release
+		source.putSuffix = "archive/head.bin"
+		source.putEnabled = &armed
+	})
+	ctx, cancel := context.WithTimeout(context.Background(), 25*time.Second)
+	defer cancel()
+	for _, host := range hosts {
+		awaitPublicInternalReady(t, ctx, host)
+	}
+	xctx, cancelX := context.WithCancel(ctx)
+	defer cancelX()
+	var caller sync.WaitGroup
+	t.Cleanup(func() {
+		releaseOnce.Do(func() { close(release) })
+		cancelX()
+		caller.Wait() // release SDK work before any Host/server cleanup waits
+	})
+	id, key := "\xff", "\xfe"
+	request := network.KVMutationRequest{RequestID: id, Key: key, Value: []byte("original-X"), Expected: []byte{}, TTLMS: 60000}
+	type outcome struct {
+		response network.KVMutationResponse
+		err      error
+	}
+	done := make(chan outcome, 1)
+	armed.Store(true)
+	caller.Add(1)
+	go func() {
+		defer caller.Done()
+		response, err := hosts[0].KVMutate(xctx, "put", request)
+		done <- outcome{response, err}
+	}()
+	select {
+	case <-entered:
+	case observed := <-done:
+		t.Fatalf("caller completed before controlled archive HEAD: %+v %v", observed.response, observed.err)
+	case <-ctx.Done():
+		t.Fatal("archive HEAD gate not reached", ctx.Err())
+	}
+	// A HEAD can also be publishing an earlier control slot. Require actual X
+	// receipt/Apply before cancellation rather than inferring it from the PUT.
+	var receipt types.MutationReceipt
+	tick := time.NewTicker(10 * time.Millisecond)
+	defer tick.Stop()
+	for receipt.Slot == 0 {
+		status, err := hosts[0].node.RequestStatusManaged(ctx, network.RequestStatusRequest{Kind: "kv", RequestID: id})
+		if err == nil && status.Receipt != nil && status.State == string(types.MutationCommitted) {
+			receipt = *status.Receipt
+			break
+		}
+		select {
+		case observed := <-done:
+			t.Fatalf("caller completed before actual applied X: %+v %v", observed.response, observed.err)
+		case <-ctx.Done():
+			t.Fatalf("actual X receipt not applied before cancellation: %v (last status error %v)", ctx.Err(), err)
+		case <-tick.C:
+		}
+	}
+	beforeOriginal, found, err := hosts[0].node.RetainedRequest(ctx, "kv", id)
+	if err != nil || !found || beforeOriginal.Slot != receipt.Slot || beforeOriginal.KV == nil {
+		t.Fatalf("applied canonical X missing: found=%t error=%v", found, err)
+	}
+	if beforeOriginal.KV.RequestID != id || beforeOriginal.KV.Key != key || string(beforeOriginal.KV.Value) != "original-X" || beforeOriginal.KV.Expected == nil || beforeOriginal.KV.TTLMS != request.TTLMS || beforeOriginal.KV.ExpiresAtUnixMS-beforeOriginal.KV.ObservedAtUnixMS != request.TTLMS {
+		t.Fatal("actual applied X did not preserve raw original/TTL")
+	}
+	cancelX()
+	var observed outcome
+	select {
+	case observed = <-done:
+	case <-ctx.Done():
+		t.Fatal("canceled caller did not return", ctx.Err())
+	}
+	var unknown *network.CommitUnknownError
+	if !errors.As(observed.err, &unknown) || !errors.Is(observed.err, context.Canceled) || unknown.RequestID != id || errors.Is(observed.err, ErrKVNotSubmitted) || (unknown.Slot != 0 && uint64(unknown.Slot) != receipt.Slot) {
+		t.Fatalf("actual post-Apply cancellation did not retain UNKNOWN: response=%+v error=%v", observed.response, observed.err)
+	}
+	releaseOnce.Do(func() { close(release) })
+	y, err := hosts[0].KVMutate(ctx, "put", network.KVMutationRequest{RequestID: "Y", Key: "neighbor", Value: []byte("healthy")})
+	if err != nil || y.Status != types.MutationCommitted || !y.Applied || y.Slot <= receipt.Slot {
+		t.Fatalf("X UNKNOWN globally blocked healthy Y: %+v %v", y, err)
+	}
+	neighbor, err := hosts[0].KVGet(ctx, network.KVGetRequest{Key: "neighbor", Consistency: "local"})
+	if err != nil || !neighbor.Found || string(neighbor.Value) != "healthy" {
+		t.Fatalf("Y readback: %+v %v", neighbor, err)
+	}
+	before := hostApplicationDecisionCount(t, ctx, configs[0], sqlpolicy.ManagedRequestMaterializationPolicy)
+	recovered, err := hosts[0].RecoverRequest(ctx, network.RequestStatusRequest{Kind: "kv", RequestID: id})
+	if err != nil || recovered.KV == nil || recovered.KV.Slot != receipt.Slot || !recovered.KV.Applied || string(recovered.RequestID) != id {
+		t.Fatalf("exact X recovery: %+v %v", recovered, err)
+	}
+	xvalue, err := hosts[0].KVGet(ctx, network.KVGetRequest{Key: key, Consistency: "local"})
+	if err != nil || !xvalue.Found || string(xvalue.Value) != "original-X" {
+		t.Fatal("X readback differs after exact recovery", err)
+	}
+	afterOriginal, found, err := hosts[0].node.RetainedRequest(ctx, "kv", id)
+	if err != nil || !found || afterOriginal.Slot != beforeOriginal.Slot || string(afterOriginal.ExecutionItem) != string(beforeOriginal.ExecutionItem) {
+		t.Fatal("recovery changed original execution/TTL", err)
+	}
+	if after := hostApplicationDecisionCount(t, ctx, configs[0], sqlpolicy.ManagedRequestMaterializationPolicy); after != before {
+		t.Fatal("exact recovery submitted another application command")
+	}
+	if err := hosts[0].Close(); err != nil {
+		t.Fatal(err)
+	}
+	reopened, err := fixture.open(context.Background(), configs[0])
+	if reopened != nil {
+		t.Cleanup(func() {
+			if err := reopened.Close(); err != nil {
+				t.Error(err)
+			}
+		})
+	}
+	if err != nil {
+		t.Fatal("same-DataDir public Host reopen", err)
+	}
+	if _, err := reopened.RecoverPendingDetailed(ctx); !errors.Is(err, network.ErrCommitUnknown) {
+		t.Fatal("new handle invented a no-arg target", err)
+	}
+	recovered, err = reopened.RecoverRequest(ctx, network.RequestStatusRequest{Kind: "kv", RequestID: id})
+	if err != nil || recovered.KV == nil || recovered.KV.Slot != receipt.Slot || !recovered.KV.Applied {
+		t.Fatalf("new handle exact original recovery: %+v %v", recovered, err)
+	}
+	if after := hostApplicationDecisionCount(t, ctx, configs[0], sqlpolicy.ManagedRequestMaterializationPolicy); after != before {
+		t.Fatal("reopen recovery submitted another application command")
 	}
 }
