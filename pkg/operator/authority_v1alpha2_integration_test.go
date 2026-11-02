@@ -265,7 +265,7 @@ func TestV1Alpha2MixedBudgetAPIServerContract(t *testing.T) {
 				members = append(members, m)
 				bootstrap.Members = append(bootstrap.Members, V1Alpha2BootstrapMember{PodUID: podUID, Member: m})
 			}
-			digest, err := types.ManagedBootstrapPlanDigest(string(clusterID), members, bootstrap.PhysicalBinding, bootstrap.EvidenceFormat, bootstrap.Durability, false)
+			digest, err := types.ManagedBootstrapPlanDigestForProtocol(string(clusterID), members, bootstrap.PhysicalBinding, bootstrap.EvidenceFormat, bootstrap.Durability, false, types.ManagedApplicationProtocolSQLKV)
 			if err != nil {
 				t.Fatal(err)
 			}

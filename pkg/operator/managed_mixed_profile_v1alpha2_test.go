@@ -75,10 +75,9 @@ func mixedAuthoritySetup(t *testing.T) (*phase8Server, *V1Alpha2StatusStore, V1A
 	t.Helper()
 	cluster := strings.Replace(phase8Cluster, `"genesisIntent":"Create"`, `"genesisIntent":"Create","applicationProtocol":"rhiza-managed-sql-kv/v1"`, 1)
 	server, store, name := phase8Setup(t, cluster, "")
-	plan := initTestPlan(t)
-	plan.ApplicationProtocol = types.ManagedApplicationProtocolSQLKV
+	plan, bootstrap := mixedTestBootstrapBinding(t, "deployment", "assignment", initTestBootstrap(t))
 	ctx := context.Background()
-	if _, err := InitializeV1Alpha2AuthorityWithBootstrap(ctx, store, phase2Ref, name, plan, initTestBootstrap(t)); err != nil {
+	if _, err := InitializeV1Alpha2AuthorityWithBootstrap(ctx, store, phase2Ref, name, plan, bootstrap); err != nil {
 		t.Fatal(err)
 	}
 	server.cluster = strings.Replace(server.cluster, `"resourceVersion":"48"`, `"resourceVersion":"47"`, 1)
@@ -95,6 +94,46 @@ func mixedAuthoritySetup(t *testing.T) (*phase8Server, *V1Alpha2StatusStore, V1A
 		t.Fatal(err)
 	}
 	return server, store, snapshot
+}
+
+// The explicit protocol, evidence format and bootstrap digest are one binding.
+// Build it with the production canonicalizer before handing the fixture to any
+// status loader; changing only a legacy assignment's marker is invalid.
+func mixedTestBootstrapBinding(t *testing.T, deploymentUID, assignmentID string, bootstrap V1Alpha2BootstrapPlan) (V1Alpha2ApplicationInitPlan, V1Alpha2BootstrapPlan) {
+	t.Helper()
+	bootstrap.EvidenceFormat = V1Alpha2ManagedSQLKVEvidenceFormat
+	members := make([]quepaxa.Member, len(bootstrap.Members))
+	for i, member := range bootstrap.Members {
+		members[i] = member.Member
+	}
+	digest, err := types.ManagedBootstrapPlanDigestForProtocol(string(bootstrap.ClusterID), members, bootstrap.PhysicalBinding, bootstrap.EvidenceFormat, bootstrap.Durability, bootstrap.Reconfiguration, types.ManagedApplicationProtocolSQLKV)
+	if err != nil {
+		t.Fatal(err)
+	}
+	plan, err := NewV1Alpha2ApplicationInitPlan(phase2Ref, "logical", deploymentUID, assignmentID, bootstrap.PhysicalBinding, digest, bootstrap.EvidenceFormat)
+	if err != nil {
+		t.Fatal(err)
+	}
+	plan.ApplicationProtocol = types.ManagedApplicationProtocolSQLKV
+	return plan, bootstrap
+}
+
+func TestManagedMixedProfileRejectsLegacyBootstrapDigestBeforeWrite(t *testing.T) {
+	cluster := strings.Replace(phase8Cluster, `"genesisIntent":"Create"`, `"genesisIntent":"Create","applicationProtocol":"rhiza-managed-sql-kv/v1"`, 1)
+	server, store, name := phase8Setup(t, cluster, "")
+	plan, bootstrap := mixedTestBootstrapBinding(t, "deployment", "assignment", initTestBootstrap(t))
+	members := make([]quepaxa.Member, len(bootstrap.Members))
+	for i, member := range bootstrap.Members {
+		members[i] = member.Member
+	}
+	legacyDigest, err := types.ManagedBootstrapPlanDigest(string(bootstrap.ClusterID), members, bootstrap.PhysicalBinding, bootstrap.EvidenceFormat, bootstrap.Durability, bootstrap.Reconfiguration)
+	if err != nil || legacyDigest == plan.BootstrapPlanDigest {
+		t.Fatalf("mixed and legacy bootstrap domains did not differ: %v", err)
+	}
+	plan.BootstrapPlanDigest = legacyDigest
+	if _, err := InitializeV1Alpha2AuthorityWithBootstrap(context.Background(), store, phase2Ref, name, plan, bootstrap); err == nil || !strings.Contains(err.Error(), "bootstrap digest mismatch") || server.puts != 0 {
+		t.Fatalf("legacy digest reached mixed genesis write: err=%v puts=%d", err, server.puts)
+	}
 }
 
 func TestManagedMixedProfileKVReservation(t *testing.T) {
@@ -552,7 +591,14 @@ func TestManagedMixedProfileRepairPreservesReservation(t *testing.T) {
 	status, _ := jsonObject(f.cluster["status"])
 	var assignment V1Alpha2ApplicationInitAssignment
 	_ = json.Unmarshal(status["applicationInit"], &assignment)
-	assignment.Plan.ApplicationProtocol = types.ManagedApplicationProtocolSQLKV
+	var sourceBootstrap V1Alpha2BootstrapPlan
+	if err := json.Unmarshal(status["bootstrapPlan"], &sourceBootstrap); err != nil {
+		t.Fatal(err)
+	}
+	var mixedBootstrap V1Alpha2BootstrapPlan
+	assignment.Plan, mixedBootstrap = mixedTestBootstrapBinding(t, assignment.Plan.DeploymentUID, assignment.Plan.AssignmentID, sourceBootstrap)
+	status["bootstrapPlan"], _ = json.Marshal(mixedBootstrap)
+	f.plan.BootstrapPlanDigest = assignment.Plan.BootstrapPlanDigest
 	status["applicationInit"], _ = json.Marshal(assignment)
 	f.cluster["status"], _ = json.Marshal(status)
 	raw, _ := json.Marshal(f.cluster)
