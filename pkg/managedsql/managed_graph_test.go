@@ -27,18 +27,12 @@ func TestManagedGraphActualPublicHost(t *testing.T) {
 		}
 		hosts[i] = h
 	}
+	// The first public mutation itself must complete initial-root admission.
+	// No Ready, checkpoint polling or private admission precedes this call.
 	original := types.GraphCommand{RequestID: "\xff", Cypher: "CREATE (:Item {n: 9})"}
 	result, err := hosts[0].GraphExecute(ctx, original)
 	if err != nil || result.Slot == 0 || result.Status != types.MutationCommitted {
 		t.Fatalf("public Graph write: receipt=%+v error=%v", result, err)
-	}
-	rows, err := hosts[0].GraphQuery(ctx, network.GraphQueryRequest{Cypher: "MATCH (n:Item) RETURN n.n", Consistency: "linearizable"})
-	if err != nil || len(rows.Rows) != 1 {
-		t.Fatalf("public Graph read: rows=%+v error=%v", rows, err)
-	}
-	recovered, err := hosts[0].RecoverRequest(ctx, network.RequestStatusRequest{Kind: "graph", RequestID: original.RequestID})
-	if err != nil || recovered.Graph == nil || recovered.Graph.MutationReceipt != result.MutationReceipt {
-		t.Fatalf("public Graph recovery: result=%+v error=%v", recovered, err)
 	}
 	if err := hosts[0].Close(); err != nil {
 		t.Fatal(err)
@@ -50,11 +44,12 @@ func TestManagedGraphActualPublicHost(t *testing.T) {
 	if err != nil {
 		t.Fatalf("same-directory nonempty WAL Graph reopen: %v", err)
 	}
-	rows, err = reopened.GraphQuery(ctx, network.GraphQueryRequest{Cypher: "MATCH (n:Item) RETURN n.n", Consistency: "linearizable"})
+	waitGraphHostPublicReady(t, ctx, reopened)
+	rows, err := reopened.GraphQuery(ctx, network.GraphQueryRequest{Cypher: "MATCH (n:Item) RETURN n.n", Consistency: "linearizable"})
 	if err != nil || len(rows.Rows) != 1 {
 		t.Fatalf("reopened Graph effect changed: rows=%+v error=%v", rows, err)
 	}
-	recovered, err = reopened.RecoverRequest(ctx, network.RequestStatusRequest{Kind: "graph", RequestID: original.RequestID})
+	recovered, err := reopened.RecoverRequest(ctx, network.RequestStatusRequest{Kind: "graph", RequestID: original.RequestID})
 	if err != nil || recovered.Graph == nil || recovered.Graph.MutationReceipt != result.MutationReceipt {
 		t.Fatalf("reopened original receipt changed: result=%+v error=%v", recovered, err)
 	}

@@ -87,6 +87,9 @@ func (n *Node) CheckManagedLocalRead(ctx context.Context) error {
 			return network.ErrNotReady
 		}
 		if n.materializationPolicy() == sqlpolicy.ManagedGraphRequestMaterializationPolicy {
+			if !n.managedGraphInitialRootComplete() {
+				return network.ErrNotReady
+			}
 			return n.material.ProjectionReadable(ctx)
 		}
 		return nil

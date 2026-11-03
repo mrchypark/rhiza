@@ -342,9 +342,10 @@ func NewServerForPolicy(core *quepaxa.Core, material *materializer.Materializer,
 		s.ready = ready[0]
 	}
 	s.sqlBatcher = newSQLBatcher(s.proposeInternalBatch, nil)
-	s.graphBatcher = newGraphBatcher(s.proposeInternalBatch, nil)
 	if expected == sqlpolicy.ManagedGraphRequestMaterializationPolicy {
 		s.graphBatcher = newManagedGraphBatcher(s.proposeInternalBatch, nil)
+	} else {
+		s.graphBatcher = newGraphBatcher(s.proposeInternalBatch, nil)
 	}
 	if managedKVExecutionPolicy(expected) {
 		s.kvBatcher = newManagedKVBatcher(s.proposeInternalBatch, nil)

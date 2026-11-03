@@ -70,7 +70,7 @@ func runManagedFFIInClusterLifecycle(t *testing.T, mixed bool, graphMode ...bool
 		t.Fatal("invalid FFI open response")
 	}
 	if opened.Error != nil {
-		t.Fatalf("real managed FFI open failed, code=%s", opened.Error.Code)
+		t.Fatalf("real managed FFI open failed, code=%s message=%s", opened.Error.Code, opened.Error.Message)
 	}
 	handle := opened.Data.Handle
 	if handle == 0 {

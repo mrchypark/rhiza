@@ -169,9 +169,33 @@ func TestInternalApplicationCancelledAndInvalidSelector(t *testing.T) {
 	if _, err := n.checkInternalApplicationRuntime(ctx); !errors.Is(err, context.Canceled) {
 		t.Fatal(err)
 	}
-	for _, kind := range []string{"", "graph", "notify", "SQL"} {
+	// This helper recognizes canonical selector syntax, not profile permission.
+	for kind, want := range map[string]types.MutationKind{"sql": types.MutationSQL, "kv": types.MutationKV, "graph": types.MutationGraph} {
+		if got, err := retainedRequestKind(kind); err != nil || got != want {
+			t.Fatalf("canonical original kind changed: %q %v", kind, err)
+		}
+	}
+	for _, kind := range []string{"", "notify", "SQL", "Graph"} {
 		if _, err := retainedRequestKind(kind); !errors.Is(err, network.ErrInvalidRequest) {
 			t.Fatalf("invalid original kind accepted: %q", kind)
+		}
+	}
+	for _, graphProfile := range []bool{false, true} {
+		path := filepath.Join(t.TempDir(), "sqlite.db")
+		var m *materializer.Materializer
+		var err error
+		if graphProfile {
+			m, err = materializer.OpenManagedSQLKVGraphWithOriginals(path, 1)
+		} else {
+			m, err = materializer.OpenManagedSQLKVWithOriginals(path, 1)
+		}
+		if err != nil {
+			t.Fatal(err)
+		}
+		_, found, lookupErr := m.RetainedRequestOriginal(context.Background(), types.MutationGraph, "original")
+		closeErr := m.Close()
+		if closeErr != nil || found || graphProfile && lookupErr != nil || !graphProfile && lookupErr == nil {
+			t.Fatalf("profile-aware Graph original lookup changed: graph=%t found=%t lookup=%v close=%v", graphProfile, found, lookupErr, closeErr)
 		}
 	}
 }

@@ -114,10 +114,16 @@ func newSQLBatcher(propose func(context.Context, []byte) (quepaxa.Slot, error), 
 }
 
 func newGraphBatcher(propose func(context.Context, []byte) (quepaxa.Slot, error), apply func(context.Context, quepaxa.Slot) error) *mutationBatcher[types.GraphCommand] {
+	if localtesthooks.Enabled {
+		localtesthooks.Hit("network:graph-batcher:ordinary-constructor")
+	}
 	return newMutationBatcher(propose, apply, types.EncodeGraphBatchItem, types.AssembleGraphBatch, func(command types.GraphCommand) string { return command.RequestID })
 }
 
 func newManagedGraphBatcher(propose func(context.Context, []byte) (quepaxa.Slot, error), apply func(context.Context, quepaxa.Slot) error) *mutationBatcher[types.GraphCommand] {
+	if localtesthooks.Enabled {
+		localtesthooks.Hit("network:graph-batcher:managed-constructor")
+	}
 	return newMutationBatcherWithLimits(propose, apply, PrepareManagedGraphExecution, func(items [][]byte) ([]byte, error) {
 		if len(items) != 1 {
 			return nil, ErrInvalidRequest

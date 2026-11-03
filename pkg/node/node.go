@@ -83,6 +83,8 @@ type Node struct {
 	managedAdmitted              atomic.Bool
 	managedInitiallyAdmitted     atomic.Bool
 	managedGraphPublisherStarted atomic.Bool
+	managedGraphInitialRootDone  chan struct{}
+	managedGraphInitialRootOnce  sync.Once
 	managedPeerVerified          atomic.Bool
 	internalApplication          atomic.Pointer[internalApplicationBinding]
 }
@@ -104,7 +106,8 @@ type nodeRecoveryPhases struct {
 // New creates a new Node.
 func New(config *types.ExecutionConfig) *Node {
 	return &Node{
-		config: config,
+		managedGraphInitialRootDone: make(chan struct{}),
+		config:                      config,
 	}
 }
 

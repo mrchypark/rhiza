@@ -376,8 +376,10 @@ mod tests {
             ManagedGraphValue::Number("x".repeat(BODY_LIMIT + 1)),
             ManagedGraphValue::Float64Bits(f64::INFINITY.to_bits()),
         ] {
-            let mut command = ManagedGraphCommand::default();
-            command.args = Some(BTreeMap::from([(b"x".to_vec(), value)]));
+            let command = ManagedGraphCommand {
+                args: Some(BTreeMap::from([(b"x".to_vec(), value)])),
+                ..Default::default()
+            };
             assert!(command.encode_original().is_err());
         }
     }

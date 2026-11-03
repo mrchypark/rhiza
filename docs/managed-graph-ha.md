@@ -126,6 +126,12 @@ or prefix, poison, and incomplete/ambiguous installation must fail closed.
 Validated first genesis is distinct from a missing required recovery root.
 NoPVC does not remove those checks or turn missing evidence into bootstrap.
 
+Initial application readiness/ACK requires the engine's producer root: actual
+quorum Prepare, certified seal, fixed archived decision, and verified CURRENT.
+The background publisher and first request share completion; `Open` and
+peer/control remain nonblocking. Later ACKs need no new root. Cancelling the
+initial wait proposes no application data; callers need no manual root polling.
+Close also cancels and drains this wait without requiring the upload to finish.
 Focused Go tests have exercised public startup through the actual pair installer
 at the original database path, with certified suffix data, original receipts,
 and a fresh SQLite file rather than only reopening the existing pair. A separate
@@ -144,6 +150,8 @@ After a focused Core certified-redelivery repair, changed-candidate public
 publisher and suffix-restart checks pass normally and under the race detector.
 Earlier root-preparation failures remain recorded; their precise historical
 schedule is not established by those passes.
+Focused initial-root checks cover ACK then immediate Close/reopen without root
+polling. Historical pre-root failures remain recorded, not explained by this pass.
 
 **Remaining gaps:** the materializer's wider crash-phase tests do not establish
 all those phases through public Node startup. Final-head CI and runtime gates

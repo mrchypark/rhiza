@@ -9,8 +9,10 @@ import (
 	"encoding/json"
 	"errors"
 	"io"
+	"log"
 	"math"
 	"os"
+	"strings"
 	"sync"
 	"time"
 
@@ -72,7 +74,7 @@ func goOpenManaged(input []byte) []byte {
 		err = errors.Join(err, finishOpening())
 		cancel()
 		_ = cleanup()
-		return marshalError(errorCode(err), "managed startup inputs rejected")
+		return managedOpenError(false, err)
 	}
 	host, err := managedsql.Open(opening, cfg)
 	err = errors.Join(err, finishOpening())
@@ -82,9 +84,74 @@ func goOpenManaged(input []byte) []byte {
 			_ = host.Close()
 		}
 		_ = cleanup()
-		return marshalError(errorCode(err), "managed startup rejected")
+		return managedOpenError(true, err)
 	}
 	return registerEntry(&ffiEntry{managed: host, cleanup: cleanup, ctx: ctx, cancel: cancel, drained: make(chan struct{})})
+}
+
+// Only fixed labels are logged: underlying errors can contain credentials,
+// source paths, SQL, and request identities. Unknown remains unknown.
+func managedOpenError(hostOpen bool, err error) []byte {
+	stage, message := "load_config", "managed startup inputs rejected"
+	if hostOpen {
+		stage, message = "host_open", "managed startup rejected"
+	}
+	cause := "unclassified"
+	switch {
+	case errors.Is(err, context.DeadlineExceeded):
+		cause = "deadline"
+	case errors.Is(err, context.Canceled):
+		cause = "canceled"
+	case errors.Is(err, managedbootstrap.ErrBootstrapPending):
+		cause = "bootstrap_pending"
+	case errors.Is(err, managedbootstrap.ErrLearnerAdmissionPending):
+		cause = "learner_pending"
+	case errors.Is(err, managedsql.ErrSQLPending):
+		cause = "application_pending"
+	default:
+		cause = managedStartupLiteralCause(err)
+	}
+	code := errorCode(err)
+	log.Printf("managed startup unavailable stage=%s code=%s cause=%s", stage, code, cause)
+	return marshalError(code, message)
+}
+
+// Literal matching is diagnostic only, never an authorization or error-code
+// decision. Match only source-defined phrases; never emit the original text.
+func managedStartupLiteralCause(err error) string {
+	if err == nil {
+		return "unclassified"
+	}
+	text := err.Error()
+	switch {
+	case strings.Contains(text, "managed Graph required recovery root is unavailable"):
+		return "required_root_unavailable"
+	case strings.Contains(text, "managed Graph certified target prefix unavailable"),
+		strings.Contains(text, "managed Graph checkpoint lies outside certified source"),
+		strings.Contains(text, "actual managed Graph Core/source cut changed before installation"),
+		strings.Contains(text, "verified archive prefix mismatch"):
+		return "source_prefix_mismatch"
+	case strings.Contains(text, "managed Graph reconstruction requires registered WAL identity"),
+		strings.Contains(text, "runtime member identity differs from CR generation or actual Pod UID"),
+		strings.Contains(text, "internal application startup identity or profile differs"),
+		strings.Contains(text, "internal application WAL manifest identity changed"):
+		return "identity_mismatch"
+	case strings.Contains(text, "internal application has unresolved certified history:"),
+		strings.Contains(text, "managed runtime has unapplied or unresolved history"):
+		return "unresolved_certified_history"
+	case strings.Contains(text, "previous Graph publication is pending or ambiguous"),
+		strings.Contains(text, "previous Graph journal is unresolved"):
+		return "pending_graph_state"
+	case strings.Contains(text, "graph commit outcome is unknown; reopen before use"):
+		return "graph_commit_unknown"
+	case strings.Contains(text, "repair origin exceeds bounded file budget"),
+		strings.Contains(text, "ordinary Graph execution exceeds existing value limit"),
+		strings.Contains(text, "graph original exceeds body budget"),
+		strings.Contains(text, "read-only archive suffix exceeds byte limit"):
+		return "budget_refusal"
+	default:
+		return "unclassified"
+	}
 }
 
 // Node derives its background lifetime from Open's context. Retire only the

@@ -345,6 +345,70 @@ func TestManagedGraphInstallCancellationRestoresAbsence(t *testing.T) {
 	if _, err := os.Lstat(path); !os.IsNotExist(err) {
 		t.Fatalf("cancelled installation produced target: %v", err)
 	}
+	if entries, err := os.ReadDir(filepath.Dir(path)); err != nil || len(entries) != 0 {
+		t.Fatalf("pre-canceled install created restore artifacts: entries=%v error=%v", entries, err)
+	}
+}
+
+func TestManagedGraphInstallPreCanceledPreservesUnknownState(t *testing.T) {
+	input := managedGraphInstallFixture(t)
+	path := filepath.Join(t.TempDir(), "sqlite.db")
+	journal := []byte("unknown pre-existing restore state")
+	if err := os.WriteFile(localRestoreJournalPath(path), journal, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if opened, err := OpenManagedGraphFromVerifiedPair(ctx, path, 1, input); opened != nil || !errors.Is(err, context.Canceled) {
+		if opened != nil {
+			opened.Close()
+		}
+		t.Fatalf("pre-canceled unknown-state install: %v", err)
+	}
+	after, err := os.ReadFile(localRestoreJournalPath(path))
+	if err != nil || !bytes.Equal(after, journal) {
+		t.Fatal("pre-canceled call changed unknown journal", err)
+	}
+	if err := ValidateNoLocalRestore(path); err == nil {
+		t.Fatal("unknown journal no longer blocks startup")
+	}
+}
+
+func TestManagedGraphInstallPreflightCancellationCreatesNoIntent(t *testing.T) {
+	input := managedGraphInstallFixture(t)
+	path := filepath.Join(t.TempDir(), "sqlite.db")
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	previous := localRestoreFailpoint
+	observed := false
+	localRestoreFailpoint = func(site string) error {
+		if site == "managed:before-intent" {
+			observed = true
+			cancel()
+		}
+		return nil
+	}
+	opened, err := OpenManagedGraphFromVerifiedPair(ctx, path, 1, input)
+	localRestoreFailpoint = previous
+	if opened != nil {
+		opened.Close()
+	}
+	if !observed || opened != nil || !errors.Is(err, context.Canceled) {
+		t.Fatalf("actual preflight cancellation was not preserved: observed=%t error=%v", observed, err)
+	}
+	if entries, err := os.ReadDir(filepath.Dir(path)); err != nil || len(entries) != 0 {
+		t.Fatalf("preflight cancellation created intent/artifacts: %v %v", entries, err)
+	}
+	// A fresh, non-canceled caller must still install the actual same pair.
+	installed, err := OpenManagedGraphFromVerifiedPair(context.Background(), path, 1, input)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer installed.Close()
+	retainedOriginal(t, installed, types.MutationGraph, "verified")
+	if err := ValidateNoLocalRestore(path); err != nil {
+		t.Fatal(err)
+	}
 }
 
 func TestManagedGraphTargetInspectionReturnsActualNativeAhead(t *testing.T) {

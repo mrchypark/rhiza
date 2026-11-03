@@ -58,7 +58,11 @@ type Host struct {
 	identity  node.ManagedStartupIdentity
 	authority operator.V1Alpha2AuthorityView
 	closed    bool
-	uncertain atomic.Bool
+	// Immutable after Open publishes the Host. Close cancels admission waits
+	// before acquiring mu, then retains the existing serialized Node drain.
+	admissionLifetime context.Context
+	stopAdmission     context.CancelFunc
+	uncertain         atomic.Bool
 	// recoveryTargets are caller-local selectors, never execution authority.
 	recoveryTargets        map[network.RequestStatusRequest]requestRecoveryHint
 	recoveryTargetOverflow bool
@@ -95,6 +99,7 @@ func Open(ctx context.Context, cfg Config) (*Host, error) {
 		return nil, errors.Join(fmt.Errorf("runtime member identity differs from CR generation or actual Pod UID"), err, memberErr)
 	}
 	h := &Host{cfg: cfg, node: node.New(&cfg.Runtime)}
+	h.admissionLifetime, h.stopAdmission = context.WithCancel(context.Background())
 	source, member, err := h.node.PreparedStartupBindingDigestsForProtocol(cfg.Plan.ApplicationProtocol)
 	if err != nil {
 		return nil, err
@@ -730,6 +735,9 @@ func (h *Host) Query(ctx context.Context, req QueryRequest) (QueryResponse, erro
 }
 
 func (h *Host) Close() error {
+	if h.stopAdmission != nil {
+		h.stopAdmission()
+	}
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	if h.closed {

@@ -19,6 +19,17 @@ func (h *Host) internalRequests() bool {
 // each operation then uses its own actual runtime/read/write gate.
 func (h *Host) ensureInitialRequestAdmission(ctx context.Context) error {
 	if h.internalRequests() {
+		if h.admissionLifetime != nil {
+			scope, cancel := context.WithCancel(ctx)
+			stop := context.AfterFunc(h.admissionLifetime, cancel)
+			defer stop()
+			defer cancel()
+			if h.admissionLifetime.Err() != nil {
+				return network.ErrNotReady
+			}
+			err := h.node.EnsureInitialManagedAdmission(scope)
+			return errors.Join(err, scope.Err(), h.admissionLifetime.Err())
+		}
 		return h.node.EnsureInitialManagedAdmission(ctx)
 	}
 	return nil

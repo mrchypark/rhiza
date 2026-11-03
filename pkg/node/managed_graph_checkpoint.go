@@ -59,6 +59,24 @@ func (n *Node) startManagedGraphCheckpointPublisher(ctx context.Context) {
 	}()
 }
 
+// The existing owned publisher is the only producer of this notification. A
+// caller waits without holding compactionMu, so peer/control publication and
+// Node cancellation can continue while the application is not yet admitted.
+func (n *Node) ensureManagedGraphInitialRoot(ctx context.Context) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if n == nil || n.managedGraphInitialRootDone == nil {
+		return fmt.Errorf("managed Graph initial root completion is unavailable")
+	}
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-n.managedGraphInitialRootDone:
+		return ctx.Err()
+	}
+}
+
 func (n *Node) publishManagedGraphCheckpoint(ctx context.Context) error {
 	if n.managedStartup == nil || n.materializationPolicy() != sqlpolicy.ManagedGraphRequestMaterializationPolicy || n.core == nil || n.checkpoints == nil || n.archive == nil || n.material == nil {
 		return fmt.Errorf("managed Graph checkpoint runtime unavailable")
@@ -66,7 +84,7 @@ func (n *Node) publishManagedGraphCheckpoint(ctx context.Context) error {
 	// Local single-flight only. No external publisher/GC lease is acquired.
 	n.compactionMu.Lock()
 	defer n.compactionMu.Unlock()
-	if err := n.EnsureInitialManagedAdmission(ctx); err != nil {
+	if err := n.ensureInitialManagedAdmission(ctx); err != nil {
 		return err
 	}
 	if !n.core.IsVoter() {
@@ -287,6 +305,10 @@ func (n *Node) promoteManagedGraphSeal(ctx context.Context, seal quepaxa.SealedC
 		return err
 	}
 	err = n.checkpoints.PromoteManagedGraphLocator(ctx, checkpoint.ManagedGraphLocator{Policy: int(sqlpolicy.ManagedGraphRequestMaterializationPolicy), Index: uint64(seal.Index), RootHash: seal.RootHash, SealDecisionSlot: uint64(d.Slot), SealDecisionHash: d.Hash})
+	if err == nil {
+		n.markManagedGraphInitialRootComplete()
+		return nil
+	}
 	if !errors.Is(err, checkpoint.ErrStaleCheckpoint) {
 		return err
 	}
@@ -313,6 +335,7 @@ func (n *Node) promoteManagedGraphSeal(ctx context.Context, seal quepaxa.SealedC
 	if proofErr := n.core.ValidateCheckpointBase(ctx, newSeal, newer); proofErr != nil {
 		return errors.Join(err, proofErr)
 	}
+	n.markManagedGraphInitialRootComplete()
 	return nil
 }
 

@@ -336,7 +336,7 @@ func TestQualificationApplicationProvenance(t *testing.T) {
 		`FROM mirror.gcr.io/library/ubuntu:24.04@sha256:534baea6a22c03a63003dbc8dbe78fe34bc0d7e595d9a9dc9834884ff530eb55`,
 		`RUN CGO_ENABLED=0 GOOS=linux go build -o rhiza-operator ./cmd/rhiza-operator`,
 		`RUN CGO_ENABLED=0 GOOS=linux go build -o rhiza-ha-init ./cmd/rhiza-ha-init`,
-		`RUN CGO_ENABLED=1 go test -c -o rhiza-managed-ffi-contract ./cmd/rhiza-ffi`,
+		`RUN CGO_ENABLED=1 go test -tags rhiza_local_testhooks -c -o rhiza-managed-ffi-contract ./cmd/rhiza-ffi`,
 		`RUN cargo build --manifest-path sdk/rust/Cargo.toml --locked --release --example managed_ha_contract`,
 		`COPY --from=rust-builder /app/sdk/rust/target/release/examples/managed_ha_contract /usr/local/libexec/rhiza-rust-managed-contract`,
 	} {

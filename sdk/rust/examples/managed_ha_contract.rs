@@ -231,10 +231,10 @@ fn run_graph(initial: bool) -> Result<(), String> {
     if uid.is_empty() || producer.is_empty() || initial && uid != producer {
         return Err("graph_producer_identity_mismatch".into());
     }
-    let mut db = ManagedDb::open_from_env().map_err(|e| e.code)?;
+    let mut db = ManagedDb::open_from_env().map_err(|e| format!("graph_open {}", e))?;
     if !db
         .ready_with_timeout(Duration::from_secs(90))
-        .map_err(|e| e.code)?
+        .map_err(|e| format!("graph_ready {}", e))?
     {
         return Err("graph_not_ready".into());
     }
@@ -346,10 +346,7 @@ fn run_graph(initial: bool) -> Result<(), String> {
             .map_err(|e| e.code)?;
         match status.receipt {
             Some(ManagedRequestReceipt::Graph(receipt))
-                if graph_receipt_json(&receipt)? == case["receipt"] =>
-            {
-                ()
-            }
+                if graph_receipt_json(&receipt)? == case["receipt"] => {}
             _ => return Err("graph_status_receipt_mismatch".into()),
         }
     }

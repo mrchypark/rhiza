@@ -41,6 +41,15 @@ run_contract() {
     printf '%s\n' "$code" > "$diag_dir/$stage.exit"
   ) 2>&1 | awk '
     function emit(s) { if (used+length(s)+1<=65536) { print s; used+=length(s)+1 } }
+    function knowncode(s) { return s ~ /^(internal|commit_unknown|kv_recovery_required|kv_not_submitted|sql_recovery_required|sql_not_submitted|timeout|canceled|invalid_request|not_ready|quorum_unavailable|request_conflict|durability_unavailable|overloaded)$/ }
+    /managed startup unavailable / {
+      tuple=$0; sub(/^.*managed startup unavailable /,"",tuple)
+      if (tuple ~ /^stage=(load_config|host_open) code=[a-z_]+ cause=(unclassified|deadline|canceled|bootstrap_pending|learner_pending|application_pending|required_root_unavailable|source_prefix_mismatch|identity_mismatch|unresolved_certified_history|pending_graph_state|graph_commit_unknown|budget_refusal)$/) {
+        split(tuple,fields," "); code=fields[2]; sub(/^code=/,"",code)
+        if (knowncode(code)) emit("MANAGED_STARTUP_DIAGNOSTIC " tuple)
+      }
+      next
+    }
     /^=== RUN   TestManagedFFIInCluster(SQL|Mixed|Graph)Lifecycle$/ { emit($0); next }
     /^--- (PASS|FAIL): TestManagedFFIInCluster(SQL|Mixed|Graph)Lifecycle / { emit(substr($0,1,160)); next }
     /^=== RUN   TestManagedGraphMaterializationMarker$/ { emit($0); next }
@@ -53,12 +62,21 @@ run_contract() {
     /^[[:space:]]*managed_incluster_test.go:[0-9]+:/ {
       emit("GO_CONTRACT_SOURCE " $1)
       if (match($0,/code=[a-z_]+/)) emit(substr($0,RSTART,RLENGTH))
+      detail=$0; sub(/^.*real managed FFI open failed, code=/,"",detail)
+      split(detail,fields," "); code=fields[1]
+      if (knowncode(code) && detail ~ /^[a-z_]+ message=managed startup (inputs rejected|rejected)$/) emit("GO_MANAGED_OPEN code=" code " " substr(detail,length(code)+2))
       if (index($0,"actual in-cluster Go FFI -> managed Host -> SQL ACK readback -> close passed")) emit("actual in-cluster Go FFI -> managed Host -> SQL ACK readback -> close passed")
       if (index($0,"actual in-cluster Go FFI -> mixed managed Host -> SQL KV ACK readback -> close passed")) emit("actual in-cluster Go FFI -> mixed managed Host -> SQL KV ACK readback -> close passed")
       if (index($0,"actual in-cluster Go FFI -> Graph managed Host -> raw original ACK/readback/status/recovery -> close passed")) emit("actual in-cluster Go FFI -> Graph managed Host -> raw original ACK/readback/status/recovery -> close passed")
       next
     }
     /^FAIL: managed-ha-contract [a-z_]+$/ { emit(substr($0,1,160)); next }
+    /^FAIL: managed-ha-contract graph_(open|ready) / {
+      detail=$0; sub(/^FAIL: managed-ha-contract /,"",detail)
+      split(detail,fields," "); code=fields[2]; sub(/:$/,"",code)
+      if (knowncode(code) && detail ~ /^graph_(open|ready) [a-z_]+: managed (startup inputs rejected|startup rejected|operation rejected)$/) emit("FAIL: managed-ha-contract " detail)
+      next
+    }
     /^PASS: managed Rust FFI SQL contract$/ { emit($0); next }
     /^PASS: prior managed Rust ACK verified$/ { emit($0); next }
     /^PASS: managed Rust FFI mixed (initial|verify) contract$/ { emit($0); next }
@@ -118,6 +136,24 @@ if [ "${1-}" = --diagnostic-self-test ]; then
   if run_contract rust-restart sh -c 'echo "FAIL: managed-ha-contract prior_ack_marker_missing"; exit 1'; then exit 1; fi
   [ "$before" = "$(cksum "$diag_dir/first.log")" ]
   [ "$(cat "$diag_dir/go-initial.exit")" = 7 ]
+  run_contract rust-restart sh -c 'printf "%s\n" \
+    "2026/11/03 12:00:00 managed startup unavailable stage=host_open code=internal cause=required_root_unavailable" \
+    "    managed_incluster_test.go:73: real managed FFI open failed, code=internal message=managed startup rejected" \
+    "FAIL: managed-ha-contract graph_open internal: managed startup rejected" \
+    "FAIL: managed-ha-contract graph_ready not_ready: managed operation rejected" \
+    "managed startup unavailable stage=other code=internal cause=unclassified" \
+    "managed startup unavailable stage=host_open code=internal cause=unclassified secret-DO-NOT-RETAIN" \
+    "FAIL: managed-ha-contract graph_open internal: managed startup rejected secret-DO-NOT-RETAIN" \
+    "    managed_incluster_test.go:74: real managed FFI open failed, code=internal message=managed startup rejected secret-DO-NOT-RETAIN"'
+  grep -Fx 'MANAGED_STARTUP_DIAGNOSTIC stage=host_open code=internal cause=required_root_unavailable' "$diag_dir/active.log" >/dev/null
+  grep -Fx 'GO_MANAGED_OPEN code=internal message=managed startup rejected' "$diag_dir/active.log" >/dev/null
+  grep -Fx 'FAIL: managed-ha-contract graph_open internal: managed startup rejected' "$diag_dir/active.log" >/dev/null
+  grep -Fx 'FAIL: managed-ha-contract graph_ready not_ready: managed operation rejected' "$diag_dir/active.log" >/dev/null
+  if grep -E 'DO-NOT-RETAIN|stage=other' "$diag_dir/active.log"; then exit 1; fi
+  for cause in unclassified deadline canceled bootstrap_pending learner_pending application_pending required_root_unavailable source_prefix_mismatch identity_mismatch unresolved_certified_history pending_graph_state graph_commit_unknown budget_refusal; do
+    run_contract rust-restart sh -c 'printf "managed startup unavailable stage=load_config code=internal cause=%s\n" "$1"' sh "$cause"
+    grep -Fx "MANAGED_STARTUP_DIAGNOSTIC stage=load_config code=internal cause=$cause" "$diag_dir/active.log" >/dev/null
+  done
   if run_contract rust-initial sh -c 'i=0; while [ "$i" -lt 4000 ]; do echo "FAIL: managed-ha-contract prior_ack_marker_missing"; i=$((i+1)); done; exit 9' >/dev/null 2>&1; then exit 1; else [ "$?" = 9 ]; fi
   [ "$(wc -c < "$diag_dir/first.log")" -le 65536 ]
   [ "$(cat "$diag_dir/rust-initial.exit")" = 9 ]

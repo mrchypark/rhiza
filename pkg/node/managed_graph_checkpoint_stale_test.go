@@ -105,8 +105,14 @@ func TestManagedGraphStalePromotionAuthenticatesNewerLocator(t *testing.T) {
 	newer := makeSeal("new")
 	n := New(&types.ExecutionConfig{})
 	n.core, n.checkpoints, n.archive = core, cp, archive
+	if n.managedGraphInitialRootComplete() {
+		t.Fatal("new runtime claims initial root before authentication")
+	}
 	if err := n.promoteManagedGraphSeal(ctx, newer); err != nil {
 		t.Fatal(err)
+	}
+	if err := n.ensureManagedGraphInitialRoot(ctx); err != nil || !n.managedGraphInitialRootComplete() {
+		t.Fatal("authenticated archived promotion did not complete initial root", err)
 	}
 	want, found, err := cp.LoadManagedGraphLocator(ctx)
 	if err != nil || !found || want.Index <= uint64(old.Index) {
@@ -129,8 +135,13 @@ func TestManagedGraphStalePromotionAuthenticatesNewerLocator(t *testing.T) {
 	if err := bucket.Upload(ctx, "stale/checkpoint/CURRENT", bytes.NewReader(raw)); err != nil {
 		t.Fatal(err)
 	}
-	if err := n.promoteManagedGraphSeal(ctx, old); err == nil {
+	unproven := New(&types.ExecutionConfig{})
+	unproven.core, unproven.checkpoints, unproven.archive = core, cp, archive
+	if err := unproven.promoteManagedGraphSeal(ctx, old); err == nil {
 		t.Fatal("larger unauthenticated CURRENT was accepted")
+	}
+	if unproven.managedGraphInitialRootComplete() {
+		t.Fatal("unauthenticated CURRENT marked initial root complete")
 	}
 	// An ordinary same-cut conflict is not the monotonic higher-cut case.
 	bad.Index = uint64(old.Index)

@@ -63,6 +63,9 @@ type managedGraphInstallJournal struct {
 // target using an authenticated closed snapshot pair. It never opens the old
 // target writable. Missing/ambiguous provenance is not a genesis signal.
 func OpenManagedGraphFromVerifiedPair(ctx context.Context, dbPath string, readers int, input ManagedGraphInstall) (*Materializer, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	if err := validateManagedGraphInstall(input.Cut, readers); err != nil {
 		return nil, err
 	}
@@ -120,6 +123,12 @@ func OpenManagedGraphFromVerifiedPair(ctx context.Context, dbPath string, reader
 	j := localRestoreJournal{Version: 1, AttemptID: hex.EncodeToString(random[:]), Phase: "intent", Files: descriptors,
 		OriginalSQL: originalSQL, OriginalGraph: originalGraph, HadGraph: hadGraph,
 		ManagedGraph: &managedGraphInstallJournal{Version: 1, Protocol: sqlpolicy.ManagedGraphRequestApplicationProtocol, Cut: input.Cut, Digest: sha256.Sum256(encoded)}}
+	if err := hitLocalRestoreBoundary("managed:before-intent"); err != nil {
+		return nil, err
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	if err := writeLocalRestoreJournal(path, j); err != nil {
 		return nil, err
 	}

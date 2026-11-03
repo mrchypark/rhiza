@@ -18,7 +18,7 @@ func (h *Host) graphReadNode(ctx context.Context) (*node.Node, error) {
 	if h.closed || h.cfg.Plan.ApplicationProtocol != sqlpolicy.ManagedGraphRequestApplicationProtocol || h.node == nil {
 		return nil, fmt.Errorf("managed Graph Host required")
 	}
-	if err := h.node.EnsureInitialManagedAdmission(ctx); err != nil {
+	if err := h.ensureInitialRequestAdmission(ctx); err != nil {
 		return nil, err
 	}
 	return h.node, nil

@@ -262,6 +262,11 @@ func (n *Node) admitInternalApplication(ctx context.Context) error {
 	if !n.managedInitiallyAdmitted.Load() || !n.core.CanParticipateReadIndex() {
 		return fmt.Errorf("internal application has no active voter admission")
 	}
+	if n.materializationPolicy() == sqlpolicy.ManagedGraphRequestMaterializationPolicy {
+		if err := n.ensureManagedGraphInitialRoot(ctx); err != nil {
+			return err
+		}
+	}
 	target, _, err := n.core.ReadIndex(ctx)
 	if err != nil {
 		return err
@@ -663,6 +668,23 @@ func (n *Node) ManagedState() (ManagedRuntimeState, error) {
 // boundary without requiring a new quorum round for already admitted local
 // reads/status/readiness. It installs no caller-supplied permission.
 func (n *Node) EnsureInitialManagedAdmission(ctx context.Context) error {
+	_, scoped, release, err := n.borrowInternalApplication(ctx)
+	if err != nil {
+		return err
+	}
+	defer release()
+	if err := n.ensureInitialManagedAdmission(scoped); err != nil {
+		return err
+	}
+	if n.materializationPolicy() == sqlpolicy.ManagedGraphRequestMaterializationPolicy {
+		return n.ensureManagedGraphInitialRoot(scoped)
+	}
+	return nil
+}
+
+// ensureInitialManagedAdmission is also used by the Graph publisher. It must
+// not wait for that publisher's own initial-root completion.
+func (n *Node) ensureInitialManagedAdmission(ctx context.Context) error {
 	_, ctx, release, err := n.borrowInternalApplication(ctx)
 	if err != nil {
 		return err
@@ -675,6 +697,21 @@ func (n *Node) EnsureInitialManagedAdmission(ctx context.Context) error {
 		return nil
 	}
 	return n.AdmitManaged(ctx)
+}
+
+// markManagedGraphInitialRootComplete is called only after the publisher has
+// authenticated the certified seal, archived decision, pair and CURRENT.
+func (n *Node) markManagedGraphInitialRootComplete() {
+	n.managedGraphInitialRootOnce.Do(func() { close(n.managedGraphInitialRootDone) })
+}
+
+func (n *Node) managedGraphInitialRootComplete() bool {
+	select {
+	case <-n.managedGraphInitialRootDone:
+		return true
+	default:
+		return false
+	}
 }
 
 // AdmitManaged performs a fresh quorum/replay round before checking current
