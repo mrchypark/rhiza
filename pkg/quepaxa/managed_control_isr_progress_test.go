@@ -7,6 +7,8 @@ import (
 	"context"
 	"crypto/sha256"
 	"errors"
+	"log"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -247,5 +249,36 @@ func TestObserveManagedControlRejectsNewOrdinaryReferenceDuringISRAdvance(t *tes
 	case <-proposalDone:
 	case <-ctx.Done():
 		t.Fatalf("held original proposal did not terminate after cleanup: %v", ctx.Err())
+	}
+}
+
+func TestObserveManagedControlRecheckDiagnosticIsFixedAndBounded(t *testing.T) {
+	var output bytes.Buffer
+	previous := log.Writer()
+	log.SetOutput(&output)
+	defer log.SetOutput(previous)
+	diagnostic := managedControlRecheckDiagnostic{
+		cause: "refs_uncovered", oldCommitted: 8, oldObserved: 9, oldStep: 4,
+		freshCommitted: 8, freshObserved: 9, freshStep: 5, freshKnown: true, freshStepKnown: true,
+		authoritySame: true, authoritySameKnown: true, refsCovered: false, refsCoveredKnown: true,
+	}
+	logManagedControlRecheckDiagnostic(diagnostic)
+	line := output.String()
+	for _, field := range []string{
+		"MANAGED_CONTROL_OBSERVATION_REJECTED reason=refs_uncovered",
+		"prefix_recheck=false authority_same_known=true authority_same=true refs_covered_known=true refs_covered=false",
+		"old_known=true old_c=8 old_r=9 old_step=4 fresh_known=true fresh_c=8 fresh_r=9 fresh_step_known=true fresh_step=5",
+	} {
+		if !strings.Contains(line, field) {
+			t.Fatalf("bounded diagnostic omitted %q: %q", field, line)
+		}
+	}
+	for _, reason := range []string{"runtime_role_or_profile", "slot_not_next", "isr_shape", "voter_configuration", "proposal_value"} {
+		if managedControlReaderCause(reason) != reason {
+			t.Fatalf("fixed reader cause %q was not preserved", reason)
+		}
+	}
+	if managedControlReaderCause("raw private error text") != "final_snapshot_mismatch" {
+		t.Fatal("unrecognized reader text escaped fixed cause classification")
 	}
 }

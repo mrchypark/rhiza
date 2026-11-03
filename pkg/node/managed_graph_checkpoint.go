@@ -352,6 +352,7 @@ func (n *Node) waitManagedAppendOnlyControl(ctx context.Context, binding *intern
 				localtesthooks.Hit("node:managed-control:validated-prefix-rechecked")
 				return n.refuseSpentManagedControlObservationBudget(ctx)
 			}
+			return n.refuseManagedGraphAdmissionAtReason("observation_prefix_recheck_failed", progress.RecorderTip, progress)
 		}
 		return n.refuseManagedGraphAdmissionAtReason("core_observation_rejected", progress.RecorderTip, progress)
 	}

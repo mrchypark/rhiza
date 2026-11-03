@@ -247,6 +247,9 @@ func (n *Node) openInternal(ctx context.Context, enroll bool, prelocked *qlog.Lo
 	var localRestoreFiles []materializer.CheckpointFile
 	managedMaterializerWasAbsent := false
 	var managedGraphTarget materializer.ManagedGraphTargetState
+	var managedGraphSelectedSeal *quepaxa.SealedCheckpoint
+	var managedGraphSelectedCheckpoint *checkpoint.Checkpoint
+	var managedGraphReplayThrough quepaxa.Slot
 	if n.config == nil || n.config.NodeID == "" {
 		return fmt.Errorf("node ID is required")
 	}
@@ -857,19 +860,36 @@ func (n *Node) openInternal(ctx context.Context, enroll bool, prelocked *qlog.Lo
 		}
 		hasSeal := false
 		if managedPeerProfile != nil {
-			_, selected, selectErr := n.selectManagedAppendOnlyRoot(ctx)
+			selectedRoot, selected, selectErr := n.selectManagedAppendOnlyRoot(ctx)
 			if selectErr != nil {
 				return selectErr
 			}
 			hasSeal = selected != nil
+			if selected != nil {
+				selectedCopy := *selected
+				managedGraphSelectedSeal = &selectedCopy
+				managedGraphSelectedCheckpoint = selectedRoot
+			}
 		} else {
-			_, hasSeal, err = core.LatestCheckpointSeal()
-			if err != nil {
-				return err
+			selected, found, selectErr := core.LatestCheckpointSeal()
+			if selectErr != nil {
+				return selectErr
+			}
+			hasSeal = found
+			if found {
+				selectedCopy := selected
+				managedGraphSelectedSeal = &selectedCopy
+				managedGraphSelectedCheckpoint, err = n.checkpoints.OpenRoot(ctx, uint64(selected.Index), selected.RootHash)
+				if err != nil || managedGraphSelectedCheckpoint == nil || managedGraphSelectedCheckpoint.Hash != selected.StateHash {
+					if err == nil {
+						err = fmt.Errorf("selected managed Graph checkpoint state hash mismatch")
+					}
+					return err
+				}
 			}
 		}
 		if hasSeal {
-			material, err = n.installManagedGraphStartup(ctx, core, managedGraphTarget)
+			material, managedGraphReplayThrough, err = n.installManagedGraphStartup(ctx, core, managedGraphTarget, managedGraphSelectedSeal)
 		} else {
 			// Only an explicitly verified original bootstrap may create fresh
 			// application files. A registered restart, required root or observed
@@ -887,6 +907,7 @@ func (n *Node) openInternal(ctx context.Context, enroll bool, prelocked *qlog.Lo
 				return historyErr
 			}
 			material, err = n.openMaterializer(filepath.Join(n.config.DataDir, "sqlite.db"), 4)
+			managedGraphReplayThrough = core.Tip()
 		}
 		if err != nil {
 			return fmt.Errorf("open actual reconstructed managed Graph pair: %w", err)
@@ -1035,7 +1056,9 @@ func (n *Node) openInternal(ctx context.Context, enroll bool, prelocked *qlog.Lo
 	certifiedCheckpoint := generationCheckpoint
 	restoreCheckpoint := certifiedCheckpoint
 	if n.checkpoints != nil {
-		if managedPeerProfile != nil {
+		if deferredManagedGraph {
+			certifiedCheckpoint = managedGraphSelectedCheckpoint
+		} else if managedPeerProfile != nil {
 			certifiedCheckpoint, _, err = n.selectManagedAppendOnlyRoot(startupRecovery.Context())
 			if err != nil {
 				return err
@@ -1079,6 +1102,11 @@ func (n *Node) openInternal(ctx context.Context, enroll bool, prelocked *qlog.Lo
 	// WAL floor to reconstruct that missing base.
 	if n.managedStartup == nil {
 		restoreCheckpoint = certifiedCheckpoint
+	}
+	if deferredManagedGraph {
+		// The exact selected root and its fixed certified cut were already
+		// consumed by the paired Graph reconstruction above.
+		restoreCheckpoint = nil
 	}
 	if n.managedStartup != nil && n.managedStartup.Prepared != nil {
 		view := n.managedStartup.Prepared.View()
@@ -1199,7 +1227,13 @@ func (n *Node) openInternal(ctx context.Context, enroll bool, prelocked *qlog.Lo
 			return err
 		}
 	}
-	if err := n.replayLocalDecisions(startupRecovery.Context()); err != nil {
+	if deferredManagedGraph {
+		if managedGraphReplayThrough > 0 {
+			if err := n.replayLocalDecisionsThrough(startupRecovery.Context(), managedGraphReplayThrough); err != nil {
+				return fmt.Errorf("replay managed Graph startup prefix through %d: %w", managedGraphReplayThrough, startupRecovery.Check(err))
+			}
+		}
+	} else if err := n.replayLocalDecisions(startupRecovery.Context()); err != nil {
 		return fmt.Errorf("replay local decisions: %w", startupRecovery.Check(err))
 	}
 	if err := startupRecovery.Check(nil); err != nil {
@@ -1212,20 +1246,35 @@ func (n *Node) openInternal(ctx context.Context, enroll bool, prelocked *qlog.Lo
 	}
 	if certifiedCheckpoint != nil {
 		if n.materializationPolicy() == sqlpolicy.ManagedGraphRequestMaterializationPolicy {
-			if managedPeerProfile != nil {
-				seal, exists, err := core.LatestManagedCheckpointSeal()
-				if err != nil || !exists || uint64(seal.Index) != certifiedCheckpoint.Index || seal.RootHash != certifiedCheckpoint.RootHash {
-					return errors.Join(fmt.Errorf("managed append-only Graph startup certified root differs from exact QCKP"), err)
+			if deferredManagedGraph {
+				if managedGraphSelectedSeal == nil {
+					return fmt.Errorf("managed Graph startup lost its fixed selected checkpoint")
 				}
-				if err := n.promoteManagedAppendOnlySeal(ctx, seal); err != nil {
+				// Root selection and archive verification were completed before
+				// the captured cut. Do not refresh or promote CURRENT after that cut.
+				n.markManagedGraphInitialRootComplete()
+			} else if managedPeerProfile != nil {
+				seal := managedGraphSelectedSeal
+				if seal == nil {
+					latest, exists, err := core.LatestManagedCheckpointSeal()
+					if err != nil || !exists || uint64(latest.Index) != certifiedCheckpoint.Index || latest.RootHash != certifiedCheckpoint.RootHash {
+						return errors.Join(fmt.Errorf("managed append-only Graph startup certified root differs from exact QCKP"), err)
+					}
+					seal = &latest
+				}
+				if err := n.promoteManagedAppendOnlySeal(ctx, *seal); err != nil {
 					return fmt.Errorf("promote managed append-only Graph checkpoint: %w", err)
 				}
 			} else {
-				seal, exists, err := core.LatestCheckpointSeal()
-				if err != nil || !exists || uint64(seal.Index) != certifiedCheckpoint.Index || seal.RootHash != certifiedCheckpoint.RootHash {
-					return errors.Join(fmt.Errorf("managed Graph startup certified root differs from exact seal"), err)
+				seal := managedGraphSelectedSeal
+				if seal == nil {
+					latest, exists, err := core.LatestCheckpointSeal()
+					if err != nil || !exists || uint64(latest.Index) != certifiedCheckpoint.Index || latest.RootHash != certifiedCheckpoint.RootHash {
+						return errors.Join(fmt.Errorf("managed Graph startup certified root differs from exact seal"), err)
+					}
+					seal = &latest
 				}
-				if err := n.promoteManagedGraphSeal(ctx, seal); err != nil {
+				if err := n.promoteManagedGraphSeal(ctx, *seal); err != nil {
 					return fmt.Errorf("promote managed Graph certified checkpoint: %w", err)
 				}
 			}

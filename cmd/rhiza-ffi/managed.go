@@ -96,6 +96,12 @@ func managedOpenError(hostOpen bool, err error) []byte {
 	if hostOpen {
 		stage, message = "host_open", "managed startup rejected"
 	}
+	code := errorCode(err)
+	log.Printf("managed startup unavailable stage=%s code=%s cause=%s", stage, code, managedStartupCause(err))
+	return marshalError(code, message)
+}
+
+func managedStartupCause(err error) string {
 	cause := "unclassified"
 	switch {
 	case errors.Is(err, context.DeadlineExceeded):
@@ -111,9 +117,7 @@ func managedOpenError(hostOpen bool, err error) []byte {
 	default:
 		cause = managedStartupLiteralCause(err)
 	}
-	code := errorCode(err)
-	log.Printf("managed startup unavailable stage=%s code=%s cause=%s", stage, code, cause)
-	return marshalError(code, message)
+	return cause
 }
 
 // Literal matching is diagnostic only, never an authorization or error-code
@@ -128,6 +132,7 @@ func managedStartupLiteralCause(err error) string {
 		return "required_root_unavailable"
 	case strings.Contains(text, "managed Graph certified target prefix unavailable"),
 		strings.Contains(text, "managed Graph checkpoint lies outside certified source"),
+		strings.Contains(text, "managed Graph reconstruction source moved"),
 		strings.Contains(text, "actual managed Graph Core/source cut changed before installation"),
 		strings.Contains(text, "verified archive prefix mismatch"):
 		return "source_prefix_mismatch"
@@ -152,6 +157,13 @@ func managedStartupLiteralCause(err error) string {
 	default:
 		return "unclassified"
 	}
+}
+
+func managedReadyResult(err error) (bool, error) {
+	if err != nil {
+		log.Printf("managed startup unavailable stage=ready code=%s cause=%s", errorCode(err), managedStartupCause(err))
+	}
+	return err == nil, nil
 }
 
 // Node derives its background lifetime from Open's context. Retire only the
@@ -226,7 +238,7 @@ func dispatchManaged(ctx context.Context, entry *ffiEntry, call callEnvelope) (a
 		if err := decode(&struct{}{}); err != nil {
 			return nil, err
 		}
-		return entry.managed.Ready(ctx) == nil, nil
+		return managedReadyResult(entry.managed.Ready(ctx))
 	case "recover_pending":
 		if err := decode(&struct{}{}); err != nil {
 			return nil, err

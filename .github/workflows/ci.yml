@@ -249,7 +249,7 @@ jobs:
         run: |
           go test -tags rhiza_local_testhooks ./pkg/network -run '^(TestTerminalDecisionCancelsUnneededPeerHandshake|TestServerGraphBatcherConstructedExactlyOnce|TestServerGraphBatcherPolicyAndClose)$' -count=1 -timeout=30s
           go test -tags rhiza_local_testhooks ./pkg/network -run '^TestPostSubmitKVSecondLookupFailureIsUnknown$' -count=1 -timeout=30s
-          go test -tags rhiza_local_testhooks ./cmd/rhiza-ffi -run '^(TestManagedGraphStartupObserverPreservesFailureBoundary|TestManagedMutationDiagnosticPreservesWireAndRedacts|TestManagedStartupDiagnosticPreservesCodeAndRedactsCause)$' -count=1 -timeout=30s
+          go test -tags rhiza_local_testhooks ./cmd/rhiza-ffi -run '^(TestManagedGraphStartupObserverPreservesFailureBoundary|TestManagedMutationDiagnosticPreservesWireAndRedacts|TestManagedStartupDiagnosticPreservesCodeAndRedactsCause|TestManagedReadyDiagnosticPreservesBoolABIAndRedactsCause)$' -count=1 -timeout=30s
           go test -tags rhiza_local_testhooks ./pkg/managedsql -run '^(TestManagedSQLCertifiedRecoveryGapHoldsPushAndPeriodicPull|TestManagedSQLRetainedOriginalAppliesCertifiedSuffixBeforeFinalize)$' -count=1 -timeout=60s
           go test -tags rhiza_local_testhooks ./pkg/managedsql -run '^(TestManagedGraphLongPollCloseCancelsBorrow|TestManagedGraphActualUnknownRetainsNativeOriginal|TestManagedGraphInitialRootBlocksApplicationAndHonorsCancellation|TestManagedGraphInitialRootCloseCancelsBackgroundWait)$' -count=1 -timeout=60s
           go test -tags rhiza_local_testhooks ./pkg/managedsql -run '^(TestManagedGraphPendingLearnedSlotMatchesExactTarget|TestManagedGraphPublic(RecoveryHealsPendingWithoutProposal|LinearizableReadHealsPendingWithoutProposal|NewWriteHealsPendingWithoutResubmission|RestartHealsCertifiedNativePending))$' -count=1 -timeout=60s
@@ -265,7 +265,7 @@ jobs:
         run: |
           go test -race -tags rhiza_local_testhooks ./pkg/network -run '^(TestTerminalDecisionCancelsUnneededPeerHandshake|TestServerGraphBatcherConstructedExactlyOnce|TestServerGraphBatcherPolicyAndClose)$' -count=1 -timeout=30s
           go test -race -tags rhiza_local_testhooks ./pkg/network -run '^TestPostSubmitKVSecondLookupFailureIsUnknown$' -count=1 -timeout=30s
-          go test -race -tags rhiza_local_testhooks ./cmd/rhiza-ffi -run '^(TestManagedGraphStartupObserverPreservesFailureBoundary|TestManagedMutationDiagnosticPreservesWireAndRedacts|TestManagedStartupDiagnosticPreservesCodeAndRedactsCause)$' -count=1 -timeout=30s
+          go test -race -tags rhiza_local_testhooks ./cmd/rhiza-ffi -run '^(TestManagedGraphStartupObserverPreservesFailureBoundary|TestManagedMutationDiagnosticPreservesWireAndRedacts|TestManagedStartupDiagnosticPreservesCodeAndRedactsCause|TestManagedReadyDiagnosticPreservesBoolABIAndRedactsCause)$' -count=1 -timeout=30s
           go test -race -tags rhiza_local_testhooks ./pkg/managedsql -run '^(TestManagedSQLCertifiedRecoveryGapHoldsPushAndPeriodicPull|TestManagedSQLRetainedOriginalAppliesCertifiedSuffixBeforeFinalize)$' -count=1 -timeout=60s
           go test -race -tags rhiza_local_testhooks ./pkg/managedsql -run '^(TestManagedGraphLongPollCloseCancelsBorrow|TestManagedGraphActualUnknownRetainsNativeOriginal|TestManagedGraphInitialRootBlocksApplicationAndHonorsCancellation|TestManagedGraphInitialRootCloseCancelsBackgroundWait)$' -count=1 -timeout=60s
           go test -race -tags rhiza_local_testhooks ./pkg/managedsql -run '^(TestManagedGraphPendingLearnedSlotMatchesExactTarget|TestManagedGraphPublic(RecoveryHealsPendingWithoutProposal|LinearizableReadHealsPendingWithoutProposal|NewWriteHealsPendingWithoutResubmission|RestartHealsCertifiedNativePending))$' -count=1 -timeout=60s
@@ -280,14 +280,14 @@ jobs:
           CGO_ENABLED: 1
         run: >-
           go test -tags rhiza_local_testhooks ./pkg/node ./pkg/managedsql ./pkg/quepaxa ./cmd/rhiza-ffi
-          -run '^(TestManagedGraphAdmission.*|TestManagedGraphInitialAdmission.*|TestManagedControlObservationBudget.*|TestObserveManagedControl.*|TestManagedNoPVC.*|TestManagedStateWithoutContextRejectsUnstableProgressOnce|TestManagedGraphCloseCancelsActiveBackgroundAdmissionResampling|TestRuntimeProgressSnapshotIncludesActualPendingRecorder|TestPreparedCheckpointMarkersReopenAcrossCertifiedMembershipChanges|TestManagedGraphRustOffsetMaxOnPublicHost|TestManagedGraphAppliedPrefixFailureUsesOrdinaryFFIDiagnosticShape)$'
+          -run '^(TestManagedGraphAdmission.*|TestManagedGraphInitialAdmission.*|TestManagedGraphStartupReconstruction.*|TestManagedGraphHostOperationContextSharesNodeObservationBudget|TestManagedControlObservationBudget.*|TestObserveManagedControl.*|TestManagedNoPVC.*|TestManagedStateWithoutContextRejectsUnstableProgressOnce|TestManagedGraphCloseCancelsActiveBackgroundAdmissionResampling|TestRuntimeProgressSnapshotIncludesActualPendingRecorder|TestPreparedCheckpointMarkersReopenAcrossCertifiedMembershipChanges|TestManagedGraphRustOffsetMaxOnPublicHost|TestManagedGraphAppliedPrefixFailureUsesOrdinaryFFIDiagnosticShape)$'
           -count=1 -timeout=60s
       - name: Managed Graph certified-progress admission and marker regressions (race)
         env:
           CGO_ENABLED: 1
         run: >-
           go test -race -tags rhiza_local_testhooks ./pkg/node ./pkg/managedsql ./pkg/quepaxa ./cmd/rhiza-ffi
-          -run '^(TestManagedGraphAdmission.*|TestManagedGraphInitialAdmission.*|TestManagedControlObservationBudget.*|TestObserveManagedControl.*|TestManagedNoPVC.*|TestManagedStateWithoutContextRejectsUnstableProgressOnce|TestManagedGraphCloseCancelsActiveBackgroundAdmissionResampling|TestRuntimeProgressSnapshotIncludesActualPendingRecorder|TestPreparedCheckpointMarkersReopenAcrossCertifiedMembershipChanges|TestManagedGraphRustOffsetMaxOnPublicHost|TestManagedGraphAppliedPrefixFailureUsesOrdinaryFFIDiagnosticShape)$'
+          -run '^(TestManagedGraphAdmission.*|TestManagedGraphInitialAdmission.*|TestManagedGraphStartupReconstruction.*|TestManagedGraphHostOperationContextSharesNodeObservationBudget|TestManagedControlObservationBudget.*|TestObserveManagedControl.*|TestManagedNoPVC.*|TestManagedStateWithoutContextRejectsUnstableProgressOnce|TestManagedGraphCloseCancelsActiveBackgroundAdmissionResampling|TestRuntimeProgressSnapshotIncludesActualPendingRecorder|TestPreparedCheckpointMarkersReopenAcrossCertifiedMembershipChanges|TestManagedGraphRustOffsetMaxOnPublicHost|TestManagedGraphAppliedPrefixFailureUsesOrdinaryFFIDiagnosticShape)$'
           -count=1 -timeout=60s
       - name: Vet
         env:

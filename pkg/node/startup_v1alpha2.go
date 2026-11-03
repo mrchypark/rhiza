@@ -861,8 +861,8 @@ func (n *Node) ensureInitialManagedAdmission(ctx context.Context) error {
 	return n.AdmitManaged(ctx)
 }
 
-// markManagedGraphInitialRootComplete is called only after the publisher has
-// authenticated the certified seal, archived decision, pair and CURRENT.
+// markManagedGraphInitialRootComplete is called only after startup or the
+// publisher has authenticated the certified seal and paired root.
 func (n *Node) markManagedGraphInitialRootComplete() {
 	n.managedGraphInitialRootOnce.Do(func() { close(n.managedGraphInitialRootDone) })
 }

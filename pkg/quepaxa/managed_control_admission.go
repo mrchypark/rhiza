@@ -90,6 +90,23 @@ type managedControlSnapshot struct {
 	config      *ManagedAppendOnlyConfig
 }
 
+type managedControlRecheckDiagnostic struct {
+	cause               string
+	oldCommitted        Slot
+	oldObserved         Slot
+	oldStep             Step
+	freshCommitted      Slot
+	freshObserved       Slot
+	freshStep           Step
+	freshKnown          bool
+	freshStepKnown      bool
+	authoritySame       bool
+	authoritySameKnown  bool
+	refsCovered         bool
+	refsCoveredKnown    bool
+	prefixRecheckPassed bool
+}
+
 type managedControlPrefixAdvanceError struct {
 	snapshot managedControlSnapshot
 }
@@ -171,7 +188,7 @@ func (c *Core) ObserveManagedAppendOnlyControl(ctx context.Context) (ManagedAppe
 	if err := ctx.Err(); err != nil {
 		return ManagedAppendOnlyControlObservation{}, err
 	}
-	current, reclassified, prefixAdvanced, reason, currentErr := c.recheckManagedControlSnapshot(snapshot, validated)
+	current, reclassified, prefixAdvanced, diagnostic, currentErr := c.recheckManagedControlSnapshot(snapshot, validated)
 	if err := ctx.Err(); err != nil {
 		return ManagedAppendOnlyControlObservation{}, err
 	}
@@ -179,7 +196,8 @@ func (c *Core) ObserveManagedAppendOnlyControl(ctx context.Context) (ManagedAppe
 		return ManagedAppendOnlyControlObservation{}, managedControlObservationRejected("validated_prefix_advance", &managedControlPrefixAdvanceError{snapshot: snapshot})
 	}
 	if currentErr != nil {
-		return ManagedAppendOnlyControlObservation{}, fmt.Errorf("%w: Core state changed during validation", managedControlObservationRejected(reason, ErrManagedControlObservationUnavailable))
+		logManagedControlRecheckDiagnostic(diagnostic)
+		return ManagedAppendOnlyControlObservation{}, fmt.Errorf("%w: Core state changed during validation", ErrManagedControlObservationUnavailable)
 	}
 	if reclassified {
 		return current, nil
@@ -279,32 +297,88 @@ func (c *Core) managedControlSnapshotLocked(rejectionReason *string) (snapshot m
 // recheckManagedControlSnapshot performs the final fresh read in one lock
 // section. It distinguishes a newly certified prefix from a same-slot ISR
 // change without invoking verifiers or performing I/O under the lock.
-func (c *Core) recheckManagedControlSnapshot(before managedControlSnapshot, validated []ManagedAppendOnlyControlProposal) (ManagedAppendOnlyControlObservation, bool, bool, string, error) {
+func (c *Core) recheckManagedControlSnapshot(before managedControlSnapshot, validated []ManagedAppendOnlyControlProposal) (ManagedAppendOnlyControlObservation, bool, bool, managedControlRecheckDiagnostic, error) {
 	if c == nil {
-		return ManagedAppendOnlyControlObservation{}, false, false, "final_snapshot_mismatch", ErrManagedControlObservationUnavailable
+		return ManagedAppendOnlyControlObservation{}, false, false, managedControlRecheckDiagnostic{
+			cause: "final_snapshot_mismatch", oldCommitted: before.committed, oldObserved: before.observed, oldStep: before.step,
+		}, ErrManagedControlObservationUnavailable
 	}
 	readerReason := ""
 	c.mu.RLock()
 	defer c.mu.RUnlock()
+	diagnostic := managedControlRecheckDiagnostic{
+		oldCommitted: before.committed, oldObserved: before.observed, oldStep: before.step,
+		freshCommitted: c.tip, freshObserved: c.highestKnownSlotLocked(),
+	}
+	if state, ok := c.recorders[before.observed]; ok {
+		diagnostic.freshStep, diagnostic.freshStepKnown = state.Step, true
+	}
 	after, err := c.managedControlSnapshotLocked(&readerReason)
 	if err != nil {
+		diagnostic.cause = managedControlReaderCause(readerReason)
 		if c.managedControlPrefixAdvancedLocked(before) {
-			return ManagedAppendOnlyControlObservation{}, false, true, "validated_prefix_advance", err
+			diagnostic.prefixRecheckPassed = true
+			return ManagedAppendOnlyControlObservation{}, false, true, diagnostic, err
 		}
-		return ManagedAppendOnlyControlObservation{}, false, false, "final_snapshot_mismatch", err
+		return ManagedAppendOnlyControlObservation{}, false, false, diagnostic, err
 	}
+	diagnostic.freshKnown = true
 	if sameManagedControlSnapshotValues(before, after) {
-		return currentObservationFromSnapshotWithValidated(after, validated), false, false, "", nil
+		return currentObservationFromSnapshotWithValidated(after, validated), false, false, diagnostic, nil
 	}
 	if c.managedControlPrefixAdvancedLocked(before) {
-		return ManagedAppendOnlyControlObservation{}, false, true, "validated_prefix_advance", nil
+		diagnostic.prefixRecheckPassed = true
+		return ManagedAppendOnlyControlObservation{}, false, true, diagnostic, nil
 	}
+	diagnostic.authoritySame = sameManagedControlAuthority(before, after)
+	diagnostic.authoritySameKnown = true
+	diagnostic.refsCovered = managedControlRefsCovered(before, after, validated)
+	diagnostic.refsCoveredKnown = true
 	if after.step != before.step {
-		if observation, ok := c.reclassifiedManagedControlObservationLocked(before, after, validated); ok {
-			return observation, true, false, "", nil
+		if observation, ok, cause := c.reclassifiedManagedControlObservationLocked(before, after, diagnostic.authoritySame, diagnostic.refsCovered); ok {
+			return observation, true, false, diagnostic, nil
+		} else {
+			diagnostic.cause = cause
 		}
 	}
-	return ManagedAppendOnlyControlObservation{}, false, false, "final_snapshot_mismatch", ErrManagedControlObservationUnavailable
+	if diagnostic.cause == "" {
+		diagnostic.cause = managedControlSnapshotMismatchCause(before, after, diagnostic.authoritySame, diagnostic.refsCovered)
+	}
+	return ManagedAppendOnlyControlObservation{}, false, false, diagnostic, ErrManagedControlObservationUnavailable
+}
+
+func managedControlReaderCause(reason string) string {
+	switch reason {
+	case "runtime_role_or_profile", "slot_not_next", "isr_shape", "voter_configuration", "proposal_value":
+		return reason
+	default:
+		return "final_snapshot_mismatch"
+	}
+}
+
+func managedControlSnapshotMismatchCause(before, after managedControlSnapshot, authoritySame, refsCovered bool) string {
+	if !authoritySame {
+		return "authority_changed"
+	}
+	if !refsCovered {
+		return "refs_uncovered"
+	}
+	if before.committed != after.committed || before.observed != after.observed || before.configID != after.configID {
+		return "slot_changed"
+	}
+	if after.step < before.step {
+		return "step_regressed"
+	}
+	return "final_snapshot_mismatch"
+}
+
+func logManagedControlRecheckDiagnostic(d managedControlRecheckDiagnostic) {
+	if d.cause == "" {
+		d.cause = "final_snapshot_mismatch"
+	}
+	log.Printf("MANAGED_CONTROL_OBSERVATION_REJECTED reason=%s prefix_recheck=%t authority_same_known=%t authority_same=%t refs_covered_known=%t refs_covered=%t old_known=true old_c=%d old_r=%d old_step=%d fresh_known=%t fresh_c=%d fresh_r=%d fresh_step_known=%t fresh_step=%d",
+		d.cause, d.prefixRecheckPassed, d.authoritySameKnown, d.authoritySame, d.refsCoveredKnown, d.refsCovered,
+		d.oldCommitted, d.oldObserved, d.oldStep, d.freshKnown, d.freshCommitted, d.freshObserved, d.freshStepKnown, d.freshStep)
 }
 
 func sameManagedControlSnapshotValues(before, after managedControlSnapshot) bool {
@@ -320,41 +394,54 @@ func sameManagedControlSnapshotValues(before, after managedControlSnapshot) bool
 	return true
 }
 
-func (c *Core) reclassifiedManagedControlObservationLocked(before, current managedControlSnapshot, validated []ManagedAppendOnlyControlProposal) (ManagedAppendOnlyControlObservation, bool) {
-	if before.core != c || current.core != c || before.committed != current.committed || before.observed != current.observed || before.configID != current.configID || before.protocol != current.protocol || before.generation != current.generation || before.binding != current.binding || before.walIdentity != current.walIdentity || before.anchor != current.anchor || before.membership != current.membership || before.config != current.config || !sameCluster(before.cluster, current.cluster) || current.step < before.step || len(before.refs) != len(validated) {
-		return ManagedAppendOnlyControlObservation{}, false
+func sameManagedControlAuthority(before, current managedControlSnapshot) bool {
+	return before.core == current.core && before.configID == current.configID && before.protocol == current.protocol && before.generation == current.generation && before.binding == current.binding && before.walIdentity == current.walIdentity && before.anchor == current.anchor && before.membership == current.membership && before.config == current.config && sameCluster(before.cluster, current.cluster)
+}
+
+func managedControlRefsCovered(before, current managedControlSnapshot, validated []ManagedAppendOnlyControlProposal) bool {
+	if len(before.refs) != len(validated) {
+		return false
 	}
 	validatedByValue := make(map[ValueHash][]byte, len(before.refs))
 	for index, ref := range before.refs {
 		if validated[index].Hash != ref.proposal.Hash || validated[index].Role != ref.role {
-			return ManagedAppendOnlyControlObservation{}, false
+			return false
 		}
 		validatedByValue[ref.proposal.Hash] = ref.value
 	}
-	proposals := make([]ManagedAppendOnlyControlProposal, 0, len(current.refs))
 	for _, ref := range current.refs {
 		validatedValue, ok := validatedByValue[ref.proposal.Hash]
 		if !ok || !bytes.Equal(validatedValue, ref.value) || sha256.Sum256(ref.value) != ref.proposal.Hash {
-			return ManagedAppendOnlyControlObservation{}, false
+			return false
 		}
+	}
+	return true
+}
+
+func (c *Core) reclassifiedManagedControlObservationLocked(before, current managedControlSnapshot, authoritySame, refsCovered bool) (ManagedAppendOnlyControlObservation, bool, string) {
+	if before.core != c || current.core != c || before.committed != current.committed || before.observed != current.observed || !authoritySame || current.step < before.step || !refsCovered {
+		return ManagedAppendOnlyControlObservation{}, false, managedControlSnapshotMismatchCause(before, current, authoritySame, refsCovered)
+	}
+	proposals := make([]ManagedAppendOnlyControlProposal, 0, len(current.refs))
+	for _, ref := range current.refs {
 		kind := ManagedAppendOnlyControlKind(0)
 		if barrier, err := DecodeReadBarrier(ref.value); barrier && err == nil {
 			kind = ManagedAppendOnlyReadBarrier
 		} else {
 			_, checkpoint, err := DecodeCheckpointSeal(ref.value)
 			if err != nil || !checkpoint {
-				return ManagedAppendOnlyControlObservation{}, false
+				return ManagedAppendOnlyControlObservation{}, false, "fresh_reference_invalid"
 			}
 			kind = ManagedAppendOnlyCheckpointSeal
 			seal, _, _ := DecodeCheckpointSeal(ref.value)
 			candidate := ManagedCheckpointCandidate{Value: ref.value, Hash: ref.proposal.Hash, Seal: seal, DecisionSlot: current.observed, ConfigID: current.configID}
 			if err := c.validateManagedCandidateLocalLocked(candidate); err != nil {
-				return ManagedAppendOnlyControlObservation{}, false
+				return ManagedAppendOnlyControlObservation{}, false, "qckp_local_guard"
 			}
 		}
 		proposals = append(proposals, ManagedAppendOnlyControlProposal{Role: ref.role, Kind: kind, Priority: ref.proposal.Priority, ProposerID: ref.proposal.ProposerID, Hash: ref.proposal.Hash})
 	}
-	return ManagedAppendOnlyControlObservation{CommittedTip: current.committed, ObservedSlot: current.observed, ConfigID: current.configID, Step: current.step, ApplicationProtocol: current.protocol, Generation: current.generation, Proposals: proposals, core: c}, true
+	return ManagedAppendOnlyControlObservation{CommittedTip: current.committed, ObservedSlot: current.observed, ConfigID: current.configID, Step: current.step, ApplicationProtocol: current.protocol, Generation: current.generation, Proposals: proposals, core: c}, true, ""
 }
 
 func (c *Core) validateManagedControlRef(ctx context.Context, snapshot managedControlSnapshot, ref managedControlRefSnapshot) (ManagedAppendOnlyControlKind, error) {

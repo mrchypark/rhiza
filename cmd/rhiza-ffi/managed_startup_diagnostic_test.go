@@ -63,3 +63,40 @@ func TestManagedStartupDiagnosticPreservesCodeAndRedactsCause(t *testing.T) {
 		}
 	}
 }
+
+func TestManagedReadyDiagnosticPreservesBoolABIAndRedactsCause(t *testing.T) {
+	const secret = "secret-SQL-password-https://private/path-request-ID"
+	for _, tc := range []struct {
+		name, code, cause string
+		err               error
+		ready             bool
+	}{
+		{name: "ready", ready: true},
+		{name: "source moved", code: "internal", cause: "source_prefix_mismatch", err: fmt.Errorf("%s: %w", secret, errors.New("managed Graph reconstruction source moved"))},
+		{name: "wrapped cancellation", code: "canceled", cause: "canceled", err: errors.Join(context.Canceled, errors.New("managed Graph reconstruction source moved"))},
+		{name: "unknown", code: "internal", cause: "unclassified", err: errors.New(secret)},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var output bytes.Buffer
+			old := log.Writer()
+			log.SetOutput(&output)
+			defer log.SetOutput(old)
+
+			ready, resultErr := managedReadyResult(tc.err)
+			if ready != tc.ready || resultErr != nil {
+				t.Fatalf("changed ready bool/error ABI: ready=%t err=%v", ready, resultErr)
+			}
+			line := output.String()
+			if tc.err == nil {
+				if line != "" {
+					t.Fatalf("successful Ready emitted a diagnostic: %q", line)
+				}
+				return
+			}
+			want := "managed startup unavailable stage=ready code=" + errorCode(tc.err) + " cause=" + tc.cause
+			if errorCode(tc.err) != tc.code || strings.Count(line, "managed startup unavailable") != 1 || !strings.Contains(line, want) || strings.Contains(line, secret) {
+				t.Fatalf("ready diagnostic changed code/classification or leaked data: %q", line)
+			}
+		})
+	}
+}

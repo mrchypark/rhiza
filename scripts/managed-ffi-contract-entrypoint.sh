@@ -81,7 +81,7 @@ run_contract() {
     }
     /managed startup unavailable / {
       tuple=$0; sub(/^.*managed startup unavailable /,"",tuple)
-      if (tuple ~ /^stage=(load_config|host_open) code=[a-z_]+ cause=(unclassified|deadline|canceled|bootstrap_pending|learner_pending|application_pending|required_root_unavailable|source_prefix_mismatch|identity_mismatch|unresolved_certified_history|pending_graph_state|graph_commit_unknown|budget_refusal)$/) {
+      if (tuple ~ /^stage=(load_config|host_open|ready) code=[a-z_]+ cause=(unclassified|deadline|canceled|bootstrap_pending|learner_pending|application_pending|required_root_unavailable|source_prefix_mismatch|identity_mismatch|unresolved_certified_history|pending_graph_state|graph_commit_unknown|budget_refusal)$/) {
         split(tuple,fields," "); code=fields[2]; sub(/^code=/,"",code)
         if (knowncode(code)) emit("MANAGED_STARTUP_DIAGNOSTIC " tuple)
       }
@@ -178,6 +178,8 @@ if [ "${1-}" = --diagnostic-self-test ]; then
     "    managed_incluster_test.go:73: real managed FFI open failed, code=internal message=managed startup rejected" \
     "FAIL: managed-ha-contract graph_open internal: managed startup rejected" \
     "FAIL: managed-ha-contract graph_ready not_ready: managed operation rejected" \
+    "managed startup unavailable stage=ready code=internal cause=source_prefix_mismatch" \
+    "managed startup unavailable stage=ready code=internal cause=source_prefix_mismatch secret-DO-NOT-RETAIN" \
     "managed startup unavailable stage=other code=internal cause=unclassified" \
     "managed startup unavailable stage=host_open code=internal cause=unclassified secret-DO-NOT-RETAIN" \
     "FAIL: managed-ha-contract graph_open internal: managed startup rejected secret-DO-NOT-RETAIN" \
@@ -186,6 +188,7 @@ if [ "${1-}" = --diagnostic-self-test ]; then
   grep -Fx 'GO_MANAGED_OPEN code=internal message=managed startup rejected' "$diag_dir/active.log" >/dev/null
   grep -Fx 'FAIL: managed-ha-contract graph_open internal: managed startup rejected' "$diag_dir/active.log" >/dev/null
   grep -Fx 'FAIL: managed-ha-contract graph_ready not_ready: managed operation rejected' "$diag_dir/active.log" >/dev/null
+  grep -Fx 'MANAGED_STARTUP_DIAGNOSTIC stage=ready code=internal cause=source_prefix_mismatch' "$diag_dir/active.log" >/dev/null
   if grep -E 'DO-NOT-RETAIN|stage=other' "$diag_dir/active.log"; then exit 1; fi
   for cause in unclassified deadline canceled bootstrap_pending learner_pending application_pending required_root_unavailable source_prefix_mismatch identity_mismatch unresolved_certified_history pending_graph_state graph_commit_unknown budget_refusal; do
     run_contract rust-restart sh -c 'printf "managed startup unavailable stage=load_config code=internal cause=%s\n" "$1"' sh "$cause"
