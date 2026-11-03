@@ -6,12 +6,22 @@ import (
 	"crypto/sha256"
 	"errors"
 	"fmt"
+	"log"
 	"math"
+
+	"github.com/mrchypark/rhiza/internal/localtesthooks"
 )
 
 // ErrManagedControlObservationUnavailable means the current local recorder
 // state cannot be safely classified as one pending managed control.
 var ErrManagedControlObservationUnavailable = errors.New("managed control observation unavailable")
+
+func managedControlObservationRejected(reason string, err error) error {
+	if err != nil {
+		log.Printf("MANAGED_CONTROL_OBSERVATION_REJECTED reason=%s", reason)
+	}
+	return err
+}
 
 type ManagedAppendOnlyControlProposalRole uint8
 
@@ -86,7 +96,7 @@ type managedControlSnapshot struct {
 // same Core state and binding to remain current. It performs no WAL writes.
 func (c *Core) ObserveManagedAppendOnlyControl(ctx context.Context) (ManagedAppendOnlyControlObservation, error) {
 	if c == nil {
-		return ManagedAppendOnlyControlObservation{}, ErrManagedControlObservationUnavailable
+		return ManagedAppendOnlyControlObservation{}, managedControlObservationRejected("runtime_role_or_profile", ErrManagedControlObservationUnavailable)
 	}
 	if err := ctx.Err(); err != nil {
 		return ManagedAppendOnlyControlObservation{}, err
@@ -105,7 +115,7 @@ func (c *Core) ObserveManagedAppendOnlyControl(ctx context.Context) (ManagedAppe
 			if ctxErr := ctx.Err(); ctxErr != nil {
 				return ManagedAppendOnlyControlObservation{}, ctxErr
 			}
-			return ManagedAppendOnlyControlObservation{}, fmt.Errorf("%w: %v", ErrManagedControlObservationUnavailable, err)
+			return ManagedAppendOnlyControlObservation{}, fmt.Errorf("%w: %v", ErrManagedControlObservationUnavailable, managedControlObservationRejected("reference_validation", err))
 		}
 		validated = append(validated, ManagedAppendOnlyControlProposal{
 			Role: ref.role, Kind: kind, Priority: ref.proposal.Priority,
@@ -115,8 +125,9 @@ func (c *Core) ObserveManagedAppendOnlyControl(ctx context.Context) (ManagedAppe
 	if err := ctx.Err(); err != nil {
 		return ManagedAppendOnlyControlObservation{}, err
 	}
+	localtesthooks.Hit("core:managed-control:before-snapshot-recheck")
 	if !c.sameManagedControlSnapshot(snapshot) {
-		return ManagedAppendOnlyControlObservation{}, fmt.Errorf("%w: Core state changed during validation", ErrManagedControlObservationUnavailable)
+		return ManagedAppendOnlyControlObservation{}, fmt.Errorf("%w: Core state changed during validation", managedControlObservationRejected("snapshot_changed", ErrManagedControlObservationUnavailable))
 	}
 	return ManagedAppendOnlyControlObservation{
 		CommittedTip: snapshot.committed, ObservedSlot: snapshot.observed,
@@ -126,34 +137,48 @@ func (c *Core) ObserveManagedAppendOnlyControl(ctx context.Context) (ManagedAppe
 	}, nil
 }
 
-func (c *Core) managedControlSnapshot() (managedControlSnapshot, error) {
+func (c *Core) managedControlSnapshot() (snapshot managedControlSnapshot, resultErr error) {
+	rejectionReason := ""
+	// Register diagnostics before the unlock defer so logging always runs after
+	// the Core read lock is released.
+	defer func() {
+		if rejectionReason != "" {
+			managedControlObservationRejected(rejectionReason, resultErr)
+		}
+	}()
 	c.mu.RLock()
 	defer c.mu.RUnlock()
 	if c.localMode || c.managedAppendOnly == nil || c.managedAppendOnly.Verify == nil || c.observer || c.learner {
+		rejectionReason = "runtime_role_or_profile"
 		return managedControlSnapshot{}, ErrManagedControlObservationUnavailable
 	}
 	binding := c.managedAppendOnly.Binding
 	if binding.ApplicationProtocol != managedRequestAppendOnlyApplicationProtocol && binding.ApplicationProtocol != managedGraphRequestAppendOnlyApplicationProtocol {
+		rejectionReason = "runtime_role_or_profile"
 		return managedControlSnapshot{}, ErrManagedControlObservationUnavailable
 	}
 	committed := c.tip
 	if committed == Slot(math.MaxUint64) {
+		rejectionReason = "slot_not_next"
 		return managedControlSnapshot{}, ErrManagedControlObservationUnavailable
 	}
 	observed := c.highestKnownSlotLocked()
 	_, isDecided := c.decided[observed]
 	if observed != committed+1 || isDecided {
+		rejectionReason = "slot_not_next"
 		return managedControlSnapshot{}, ErrManagedControlObservationUnavailable
 	}
 	state, ok := c.recorders[observed]
 	if !ok || state.Step < 4 || state.FirstCurrent == nil || state.AggregateCurrent == nil || compareProposal(state.AggregateCurrent, state.FirstCurrent) < 0 || (state.Step == 4 && state.AggregatePrior != nil) {
+		rejectionReason = "isr_shape"
 		return managedControlSnapshot{}, ErrManagedControlObservationUnavailable
 	}
 	cluster := cloneCluster(c.clusterForSlotLocked(observed))
 	if cluster.ConfigID == 0 || !c.voterForClusterLocked(cluster) {
+		rejectionReason = "voter_configuration"
 		return managedControlSnapshot{}, ErrManagedControlObservationUnavailable
 	}
-	snapshot := managedControlSnapshot{
+	snapshot = managedControlSnapshot{
 		core: c, committed: committed, observed: observed, configID: cluster.ConfigID,
 		step: state.Step, protocol: binding.ApplicationProtocol, generation: binding.Generation,
 		binding:     binding,
@@ -169,6 +194,7 @@ func (c *Core) managedControlSnapshot() (managedControlSnapshot, error) {
 		}
 		value, exists := c.values[item.proposal.Hash]
 		if !exists || len(value) == 0 || sha256.Sum256(value) != item.proposal.Hash || (len(item.proposal.Value) != 0 && !bytes.Equal(item.proposal.Value, value)) {
+			rejectionReason = "proposal_value"
 			return managedControlSnapshot{}, ErrManagedControlObservationUnavailable
 		}
 		snapshot.refs = append(snapshot.refs, managedControlRefSnapshot{role: item.role, proposal: *cloneProposal(item.proposal), value: bytes.Clone(value)})
@@ -181,7 +207,7 @@ func (c *Core) validateManagedControlRef(ctx context.Context, snapshot managedCo
 		return 0, err
 	}
 	if sha256.Sum256(ref.value) != ref.proposal.Hash {
-		return 0, fmt.Errorf("proposal value hash mismatch")
+		return 0, managedControlObservationRejected("reference_validation", fmt.Errorf("proposal value hash mismatch"))
 	}
 	if barrier, err := DecodeReadBarrier(ref.value); barrier {
 		if err != nil {
@@ -194,14 +220,14 @@ func (c *Core) validateManagedControlRef(ctx context.Context, snapshot managedCo
 		if err == nil {
 			err = fmt.Errorf("proposal is not a recognized managed control")
 		}
-		return 0, err
+		return 0, managedControlObservationRejected("reference_validation", err)
 	}
 	if snapshot.config == nil || snapshot.config != c.managedAppendOnly {
-		return 0, ErrManagedAppendOnlyUnavailable
+		return 0, managedControlObservationRejected("reference_validation", ErrManagedAppendOnlyUnavailable)
 	}
 	candidate := ManagedCheckpointCandidate{Value: ref.value, Hash: ref.proposal.Hash, Seal: seal, DecisionSlot: snapshot.observed, ConfigID: snapshot.configID}
 	if err := c.ValidateManagedCheckpointCandidate(ctx, candidate); err != nil {
-		return 0, err
+		return 0, managedControlObservationRejected("reference_validation", err)
 	}
 	return ManagedAppendOnlyCheckpointSeal, nil
 }

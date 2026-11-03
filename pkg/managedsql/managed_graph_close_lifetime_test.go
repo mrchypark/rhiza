@@ -6,6 +6,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -50,7 +51,11 @@ func TestManagedGraphCloseCancelsActiveBackgroundAdmissionResampling(t *testing.
 	var injecting atomic.Bool
 	var observedHooks atomic.Int64
 	var progressCount atomic.Int64
+	var progressPaused atomic.Bool
 	progressed := make(chan struct{}, 1)
+	resumeProgress := make(chan struct{})
+	var resumeProgressOnce sync.Once
+	releaseProgress := func() { resumeProgressOnce.Do(func() { close(resumeProgress) }) }
 	var hookErr atomic.Value
 	restore := localtesthooks.Set(func(event string) {
 		if event != "node:managed-runtime-state:after-certified-tip" || !armed.Load() || closing.Load() || !injecting.CompareAndSwap(false, true) {
@@ -68,14 +73,35 @@ func TestManagedGraphCloseCancelsActiveBackgroundAdmissionResampling(t *testing.
 			return
 		}
 		count := progressCount.Add(1)
-		if count >= 3 {
+		if count >= 3 && progressPaused.CompareAndSwap(false, true) {
 			select {
 			case progressed <- struct{}{}:
 			default:
 			}
+			<-resumeProgress
 		}
 	})
 	t.Cleanup(restore)
+	t.Cleanup(releaseProgress)
+
+	var captureArmed atomic.Bool
+	var captured atomic.Bool
+	entered := make(chan context.Context, 1)
+	canceled := make(chan struct{})
+	releaseOperation := make(chan struct{})
+	var releaseOperationOnce sync.Once
+	releaseBorrower := func() { releaseOperationOnce.Do(func() { close(releaseOperation) }) }
+	restoreContext := localtesthooks.SetManagedRuntimeStateContext(func(operationCtx context.Context) {
+		if !captureArmed.Load() || !captured.CompareAndSwap(false, true) {
+			return
+		}
+		entered <- operationCtx
+		<-operationCtx.Done()
+		close(canceled)
+		<-releaseOperation
+	})
+	t.Cleanup(restoreContext)
+	t.Cleanup(releaseBorrower)
 
 	armed.Store(true)
 	type executeResult struct {
@@ -101,8 +127,28 @@ func TestManagedGraphCloseCancelsActiveBackgroundAdmissionResampling(t *testing.
 	}
 
 	closing.Store(true)
+	captureArmed.Store(true)
+	releaseProgress()
+	var operationCtx context.Context
+	select {
+	case operationCtx = <-entered:
+	case <-time.After(10 * time.Second):
+		t.Fatal("active Graph admission did not reach the captured runtime-state boundary")
+	}
+
 	closed := make(chan error, 1)
 	go func() { closed <- hosts[0].Close() }()
+	select {
+	case <-operationCtx.Done():
+	case <-time.After(10 * time.Second):
+		t.Fatal("Host.Close did not cancel the captured operation context")
+	}
+	select {
+	case <-canceled:
+	case <-time.After(10 * time.Second):
+		t.Fatal("runtime-state hook did not observe operation-context cancellation")
+	}
+	releaseBorrower()
 	select {
 	case err := <-executed:
 		if !errors.Is(err.err, context.Canceled) {

@@ -5,12 +5,14 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log"
 	"net/http"
 	"time"
 
 	"github.com/mrchypark/rhiza/internal/sqlpolicy"
 	"github.com/mrchypark/rhiza/internal/types"
 	"github.com/mrchypark/rhiza/pkg/materializer"
+	"github.com/mrchypark/rhiza/pkg/quepaxa"
 )
 
 type GraphExecuteResponse struct {
@@ -148,65 +150,94 @@ func (s *Server) GraphExecute(ctx context.Context, command types.GraphCommand) (
 
 func (s *Server) graphExecuteManaged(ctx context.Context, command types.GraphCommand) (GraphExecuteResponse, error) {
 	if !s.writable || !s.Ready() || s.material == nil {
-		return GraphExecuteResponse{}, ErrNotReady
+		return GraphExecuteResponse{}, managedGraphExecuteFailure("network_readiness", ErrNotReady)
 	}
 	if err := ctx.Err(); err != nil {
-		return GraphExecuteResponse{}, err
+		return GraphExecuteResponse{}, managedGraphExecuteFailure("network_context", err)
 	}
 	frame, err := PrepareManagedGraphExecution(command)
 	if err != nil {
-		return GraphExecuteResponse{}, err
+		return GraphExecuteResponse{}, managedGraphExecuteFailure("network_prepare", err)
 	}
 	owned, recognized, err := types.DecodeManagedGraphExecution(frame)
 	if err != nil || !recognized {
-		return GraphExecuteResponse{}, ErrInvalidRequest
+		return GraphExecuteResponse{}, managedGraphExecuteFailure("network_decode", ErrInvalidRequest)
 	}
 	fingerprint, err := types.ManagedGraphIntentFingerprint(owned)
 	if err != nil {
-		return GraphExecuteResponse{}, err
+		return GraphExecuteResponse{}, managedGraphExecuteFailure("network_fingerprint", err)
 	}
 	charge, err := mutationCharge(owned)
 	if err != nil {
-		return GraphExecuteResponse{}, err
+		return GraphExecuteResponse{}, managedGraphExecuteFailure("network_charge", err)
 	}
 	lease, err := s.admitMutation(charge)
 	if err != nil {
-		return GraphExecuteResponse{}, err
+		return GraphExecuteResponse{}, managedGraphExecuteFailure("network_admission", err)
 	}
 	defer lease.releaseCaller()
 	unlock, err := s.lockRequest(ctx, owned.RequestID)
 	if err != nil {
-		return GraphExecuteResponse{}, err
+		return GraphExecuteResponse{}, managedGraphExecuteFailure("network_request_lock", err)
 	}
 	defer unlock()
 	receipt, found, matches, err := s.material.GraphRequestStatusFingerprint(ctx, owned.RequestID, fingerprint)
 	if err != nil {
-		return GraphExecuteResponse{}, err
+		return GraphExecuteResponse{}, managedGraphExecuteFailure("network_receipt_lookup", err)
 	}
 	if found && !matches {
-		return GraphExecuteResponse{}, ErrRequestConflict
+		return GraphExecuteResponse{}, managedGraphExecuteFailure("network_receipt_lookup", ErrRequestConflict)
 	}
 	if found {
 		if err := s.waitReceiptDurable(ctx, receipt, owned.RequestID); err != nil {
-			return GraphExecuteResponse{}, err
+			return GraphExecuteResponse{}, managedGraphExecuteFailure("network_receipt_durability", err)
 		}
 		return GraphExecuteResponse{MutationReceipt: receipt}, nil
 	}
 	slot, err := s.graphBatcher.submitEncoded(ctx, owned, frame, lease)
 	if err != nil {
-		return GraphExecuteResponse{}, commitUnknown(slot, owned.RequestID, err)
+		return GraphExecuteResponse{}, managedGraphExecuteFailure("network_submit", commitUnknown(slot, owned.RequestID, err))
 	}
 	receipt, found, matches, err = s.material.GraphRequestStatusFingerprint(ctx, owned.RequestID, fingerprint)
 	if err != nil {
-		return GraphExecuteResponse{}, commitUnknown(slot, owned.RequestID, err)
+		return GraphExecuteResponse{}, managedGraphExecuteFailure("network_receipt_lookup", commitUnknown(slot, owned.RequestID, err))
 	}
 	if !found {
-		return GraphExecuteResponse{}, commitUnknown(slot, owned.RequestID, fmt.Errorf("graph mutation receipt is unavailable"))
+		return GraphExecuteResponse{}, managedGraphExecuteFailure("network_receipt_lookup", commitUnknown(slot, owned.RequestID, fmt.Errorf("graph mutation receipt is unavailable")))
 	}
 	if !matches {
-		return GraphExecuteResponse{}, ErrRequestConflict
+		return GraphExecuteResponse{}, managedGraphExecuteFailure("network_receipt_lookup", ErrRequestConflict)
 	}
 	return GraphExecuteResponse{MutationReceipt: receipt}, nil
+}
+
+func managedGraphExecuteFailure(stage string, err error) error {
+	if err == nil {
+		return nil
+	}
+	cause := "other"
+	switch {
+	case errors.Is(err, context.Canceled):
+		cause = "canceled"
+	case errors.Is(err, context.DeadlineExceeded):
+		cause = "deadline"
+	case errors.Is(err, ErrNotReady):
+		cause = "not_ready"
+	case errors.Is(err, ErrInvalidRequest):
+		cause = "invalid_request"
+	case errors.Is(err, ErrRequestConflict):
+		cause = "request_conflict"
+	case errors.Is(err, ErrOverloaded):
+		cause = "overloaded"
+	case errors.Is(err, ErrDurabilityUnavailable):
+		cause = "durability_unavailable"
+	case errors.Is(err, ErrCommitUnknown):
+		cause = "commit_unknown"
+	case errors.Is(err, quepaxa.ErrQuorumUnavailable):
+		cause = "quorum_unavailable"
+	}
+	log.Printf("MANAGED_GRAPH_EXECUTE_FAILURE stage=%s cause=%s", stage, cause)
+	return err
 }
 
 func (s *Server) handleGraphQuery(w http.ResponseWriter, r *http.Request) {

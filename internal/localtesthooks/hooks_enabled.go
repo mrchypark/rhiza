@@ -167,6 +167,36 @@ var state struct {
 	hook func(string)
 }
 
+var managedRuntimeStateContext struct {
+	sync.RWMutex
+	hook func(context.Context)
+}
+
+// SetManagedRuntimeStateContext installs one tagged observer for the context
+// active at the managed runtime-state observation boundary.
+func SetManagedRuntimeStateContext(hook func(context.Context)) func() {
+	managedRuntimeStateContext.Lock()
+	previous := managedRuntimeStateContext.hook
+	managedRuntimeStateContext.hook = hook
+	managedRuntimeStateContext.Unlock()
+	return func() {
+		managedRuntimeStateContext.Lock()
+		managedRuntimeStateContext.hook = previous
+		managedRuntimeStateContext.Unlock()
+	}
+}
+
+// HitManagedRuntimeStateContext invokes the tagged observer without holding
+// the callback registry lock.
+func HitManagedRuntimeStateContext(ctx context.Context) {
+	managedRuntimeStateContext.RLock()
+	hook := managedRuntimeStateContext.hook
+	managedRuntimeStateContext.RUnlock()
+	if hook != nil {
+		hook(ctx)
+	}
+}
+
 // BatchAdmissionEvent contains only bounded aggregate fields for an internal
 // mutation batch admission attempt. It retains no request, key, value, slot,
 // or error identity.

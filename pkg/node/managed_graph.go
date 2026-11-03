@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log"
 
 	"github.com/mrchypark/rhiza/internal/localtesthooks"
 	"github.com/mrchypark/rhiza/internal/sqlpolicy"
@@ -129,19 +130,27 @@ func (n *Node) finishManagedGraphRead(ctx context.Context, err error) error {
 func (n *Node) ExecuteManagedGraph(ctx context.Context, original types.GraphCommand) (network.GraphExecuteResponse, error) {
 	_, ctx, release, err := n.borrowInternalApplication(ctx)
 	if err != nil {
-		return network.GraphExecuteResponse{}, err
+		return network.GraphExecuteResponse{}, managedGraphExecuteFailure("node_binding", err)
 	}
 	defer release()
 	if !isManagedGraphApplicationProtocol(n.managedStartup.Identity.ApplicationProtocol) || n.server == nil {
-		return network.GraphExecuteResponse{}, network.ErrNotReady
+		return network.GraphExecuteResponse{}, managedGraphExecuteFailure("node_protocol", network.ErrNotReady)
 	}
 	if err := n.admitInternalApplication(ctx); err != nil {
-		return network.GraphExecuteResponse{}, err
+		return network.GraphExecuteResponse{}, managedGraphExecuteFailure("node_admission", err)
 	}
 	if err := n.recordManagedApplicationStart(ctx); err != nil {
-		return network.GraphExecuteResponse{}, err
+		return network.GraphExecuteResponse{}, managedGraphExecuteFailure("node_application_start", err)
 	}
 	return n.server.GraphExecute(ctx, original)
+}
+
+func managedGraphExecuteFailure(stage string, err error) error {
+	if err == nil {
+		return nil
+	}
+	log.Printf("MANAGED_GRAPH_EXECUTE_FAILURE stage=%s cause=%s", stage, managedMembershipCauseClass(err))
+	return err
 }
 
 func (n *Node) GraphQueryManaged(ctx context.Context, request network.GraphQueryRequest) (types.GraphCommandResult, error) {

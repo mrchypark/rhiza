@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log"
 	"path"
 	"reflect"
 	"slices"
@@ -21,12 +22,40 @@ type membershipOperation struct {
 	ManagedExcludedRead bool                     `json:"managedExcludedRead,omitempty"`
 }
 
-func (n *Node) changeMembership(ctx context.Context, request network.MembershipChange) error {
+type managedMembershipStage string
+
+const (
+	managedMembershipStageContext          managedMembershipStage = "context"
+	managedMembershipStageLiveGuard        managedMembershipStage = "live_guard"
+	managedMembershipStageRegistration     managedMembershipStage = "registration"
+	managedMembershipStageTargetValidation managedMembershipStage = "target_validation"
+	managedMembershipStageStorageCAS       managedMembershipStage = "storage_cas"
+	managedMembershipStageReconfiguration  managedMembershipStage = "reconfiguration"
+	managedMembershipStageCompletion       managedMembershipStage = "completion"
+	managedMembershipStagePersist          managedMembershipStage = "persist"
+)
+
+func logManagedMembershipStageFailure(ctx context.Context, request network.MembershipChange, stage managedMembershipStage, err error) {
+	if err == nil || request.Add == nil {
+		return
+	}
+	permit, ok := ctx.Value(managedMembershipPermitKey{}).(managedMembershipPermit)
+	if !ok || permit.request.Action != ManagedMembershipAdd || !reflect.DeepEqual(permit.change, request) {
+		return
+	}
+	log.Printf("MANAGED_MEMBERSHIP_STAGE_FAILURE action=add stage=%s cause=%s", stage, managedMembershipCauseClass(err))
+}
+
+func (n *Node) changeMembership(ctx context.Context, request network.MembershipChange) (err error) {
+	stage := managedMembershipStageContext
+	defer func() { logManagedMembershipStageFailure(ctx, request, stage, err) }()
+
 	n.membershipMu.Lock()
 	defer n.membershipMu.Unlock()
 	if err := ctx.Err(); err != nil {
 		return err
 	}
+	stage = managedMembershipStageLiveGuard
 	if err := n.validateManagedMembership(ctx, request, false); err != nil {
 		return err
 	}
@@ -37,6 +66,7 @@ func (n *Node) changeMembership(ctx context.Context, request network.MembershipC
 		return network.ErrInvalidRequest
 	}
 	key := n.membershipOperationKey(request)
+	stage = managedMembershipStageStorageCAS
 	stored, err := readVoterRegistration(ctx, n.bucket, key)
 	if err != nil {
 		return err
@@ -77,6 +107,7 @@ func (n *Node) changeMembership(ctx context.Context, request network.MembershipC
 				return network.ErrInvalidRequest
 			}
 			operation.Target.Members = append(operation.Target.Members, *request.Add)
+			stage = managedMembershipStageRegistration
 			registrationKey := path.Join(n.config.ObjStorePrefix, string(n.config.ClusterID), "voters", fmt.Sprintf("%x.json", sha256.Sum256([]byte(request.Add.ID))))
 			data, err := readVoterRegistration(ctx, n.bucket, registrationKey)
 			if err != nil {
@@ -104,6 +135,7 @@ func (n *Node) changeMembership(ctx context.Context, request network.MembershipC
 				return err
 			}
 		}
+		stage = managedMembershipStageTargetValidation
 		if err := n.core.ValidateReconfigurationTarget(operation.Target); err != nil {
 			return fmt.Errorf("%w: %v", network.ErrInvalidRequest, err)
 		}
@@ -121,6 +153,7 @@ func (n *Node) changeMembership(ctx context.Context, request network.MembershipC
 			// frozen configuration cannot obtain another ordinary ReadIndex.
 			operation.ManagedExcludedRead = true
 		}
+		stage = managedMembershipStageStorageCAS
 		encoded, err := json.Marshal(operation)
 		if err != nil {
 			return err
@@ -135,6 +168,7 @@ func (n *Node) changeMembership(ctx context.Context, request network.MembershipC
 			return err
 		}
 	}
+	stage = managedMembershipStageLiveGuard
 	if err := n.validateManagedMembership(ctx, request, false); err != nil {
 		return err
 	}
@@ -149,12 +183,17 @@ func (n *Node) changeMembership(ctx context.Context, request network.MembershipC
 			if !reflect.DeepEqual(pending, operation.Target) {
 				return network.ErrRequestConflict
 			}
-		} else if _, err := n.core.BeginReconfigurationAt(ctx, operation.Target, request.ExpectedAbortSlot); err != nil {
-			return fmt.Errorf("membership begin config=%d local_tip=%d: %w", request.ExpectedConfigID, n.core.Tip(), err)
+		} else {
+			stage = managedMembershipStageReconfiguration
+			if _, err := n.core.BeginReconfigurationAt(ctx, operation.Target, request.ExpectedAbortSlot); err != nil {
+				return fmt.Errorf("membership begin config=%d local_tip=%d: %w", request.ExpectedConfigID, n.core.Tip(), err)
+			}
 		}
+		stage = managedMembershipStageLiveGuard
 		if err := n.validateManagedMembership(ctx, request, false); err != nil {
 			return err
 		}
+		stage = managedMembershipStageReconfiguration
 		if err := n.core.FinishReconfigurationAt(ctx, operation.Target, request.ExpectedAbortSlot); err != nil {
 			return fmt.Errorf("membership finish config=%d local_tip=%d: %w", request.ExpectedConfigID, n.core.Tip(), err)
 		}
@@ -162,6 +201,7 @@ func (n *Node) changeMembership(ctx context.Context, request network.MembershipC
 			return network.ErrRequestConflict
 		}
 	} else {
+		stage = managedMembershipStageCompletion
 		// A locally durable terminal does not establish delivery/ACK completion.
 		terminal, err := n.retainedMembershipTerminal(operation)
 		if err != nil {
@@ -175,10 +215,12 @@ func (n *Node) changeMembership(ctx context.Context, request network.MembershipC
 			return fmt.Errorf("membership terminal changed")
 		}
 	}
+	stage = managedMembershipStagePersist
 	if err := n.persistMembership(ctx); err != nil {
 		return err
 	}
 	if permit, ok := ctx.Value(managedMembershipPermitKey{}).(managedMembershipPermit); ok && permit.capture != nil {
+		stage = managedMembershipStageCompletion
 		result, err := n.captureManagedRepairSource(ctx, permit.request)
 		if err != nil {
 			return err

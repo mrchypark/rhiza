@@ -174,11 +174,12 @@ func testManagedNoPVCFirstKVAdmissionFixedPrefix(t *testing.T, test managedNoPVC
 				}
 			case test.pending:
 				transport.down["n2"], transport.down["n3"] = true, true
-				var next [types.ReadBarrierNonceSize]byte
-				for i := range next {
-					next[i] = byte(181 + i)
+				ordinary, err := types.EncodeManagedKVCommand(types.KVCommand{RequestID: "unquorate-ordinary", Operation: "put", Key: "unquorate-key", Value: []byte("unquorate-value")})
+				if err != nil {
+					t.Errorf("encode ordinary unquorate request: %v", err)
+					return
 				}
-				if slot, _, err := n.core.Propose(ctx, types.EncodeReadBarrier(next)); err == nil || slot != 2 {
+				if slot, _, err := n.core.Propose(ctx, ordinary); err == nil || slot != 2 {
 					t.Errorf("ordinary next-slot proposal unexpectedly certified: slot=%d error=%v", slot, err)
 				}
 			case test.cancel:
@@ -188,6 +189,11 @@ func testManagedNoPVCFirstKVAdmissionFixedPrefix(t *testing.T, test managedNoPVC
 			case test.nodeClose:
 				nodeShutdown.Store(true)
 				go func() { closeDone <- n.Shutdown() }()
+				select {
+				case <-binding.lifetime.Done():
+				case <-ctx.Done():
+					t.Errorf("Node.Close did not cancel the borrowed application binding before releasing the replay hook: %v", ctx.Err())
+				}
 			}
 		}
 	})

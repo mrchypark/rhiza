@@ -163,7 +163,7 @@ func TestManagedGraphPublicNodeRecoversRetainedInstallAndLaterSuffix(t *testing.
 	}
 	t.Logf("actual Node installer child PID=%d reaped exit=73", child.Process.Pid)
 	dbPath := filepath.Join(cfg.Runtime.DataDir, "sqlite.db")
-	observed, err := materializer.InspectManagedGraphInstallTarget(ctx, dbPath, types.DefaultIdempotencyWindowSlots)
+	observed, err := materializer.InspectManagedGraphInstallTarget(ctx, dbPath, types.DefaultIdempotencyWindowSlots, cfg.Plan.ApplicationProtocol)
 	if err != nil || observed.InstallAttempt == nil || len(observed.InstallAttempt.Files) != 2 {
 		t.Fatalf("actual retained inputs unavailable: %v", err)
 	}

@@ -287,7 +287,7 @@ func (n *Node) checkInternalApplicationRuntimeObserved(ctx context.Context, retr
 		}
 	} else {
 		var stable bool
-		state, stable = n.managedRuntimeStateOnce()
+		state, stable = n.managedRuntimeStateOnce(ctx)
 		if err := ctx.Err(); err != nil {
 			return state, err
 		}
@@ -762,12 +762,13 @@ func managedRepairOriginDigest(raw []byte) string {
 	return hex.EncodeToString(hash[:])
 }
 
-func (n *Node) managedRuntimeStateOnce() (ManagedRuntimeState, bool) {
+func (n *Node) managedRuntimeStateOnce(ctx context.Context) (ManagedRuntimeState, bool) {
 	existing := n.managedStartup != nil && n.managedStartup.existingRegisteredWAL
 	wal := n.core.WALIdentity()
 	before := n.core.RuntimeProgressSnapshot()
 	if localtesthooks.Enabled {
 		localtesthooks.Hit("node:managed-runtime-state:after-certified-tip")
+		localtesthooks.HitManagedRuntimeStateContext(ctx)
 	}
 	applied := n.material.Tip()
 	after := n.core.RuntimeProgressSnapshot()
@@ -784,7 +785,7 @@ func (n *Node) managedRuntimeStateWithContext(ctx context.Context) (ManagedRunti
 		if err := ctx.Err(); err != nil {
 			return ManagedRuntimeState{}, err
 		}
-		state, stable := n.managedRuntimeStateOnce()
+		state, stable := n.managedRuntimeStateOnce(ctx)
 		if !stable {
 			continue
 		}
@@ -802,7 +803,7 @@ func (n *Node) ManagedState() (ManagedRuntimeState, error) {
 	if n == nil || n.managedStartup == nil || !n.opened.Load() || n.core == nil || n.material == nil {
 		return ManagedRuntimeState{}, fmt.Errorf("managed runtime is not open")
 	}
-	state, stable := n.managedRuntimeStateOnce()
+	state, stable := n.managedRuntimeStateOnce(context.Background())
 	if !stable {
 		return ManagedRuntimeState{}, network.ErrNotReady
 	}

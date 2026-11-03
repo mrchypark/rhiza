@@ -3,6 +3,7 @@ package managedsql
 import (
 	"context"
 	"fmt"
+	"log"
 
 	"github.com/mrchypark/rhiza/internal/sqlpolicy"
 	"github.com/mrchypark/rhiza/internal/types"
@@ -41,13 +42,21 @@ func (h *Host) GraphExecute(ctx context.Context, request types.GraphCommand) (ne
 	operationCtx, release := h.internalRequestContext(ctx)
 	defer release()
 	if err := h.ensureInitialRequestAdmission(operationCtx); err != nil {
-		return network.GraphExecuteResponse{}, err
+		return network.GraphExecuteResponse{}, managedGraphExecuteFailure("host_initial_admission", err)
 	}
 	result, err := h.node.ExecuteManagedGraph(operationCtx, owned)
 	p := applicationOriginal{kind: "graph", graph: owned}
 	err = internalRequestOutcome(p, result.MutationReceipt, err)
 	h.rememberRequestOutcome(p, err, result.MutationReceipt)
 	return result, err
+}
+
+func managedGraphExecuteFailure(stage string, err error) error {
+	if err == nil {
+		return nil
+	}
+	log.Printf("MANAGED_GRAPH_EXECUTE_FAILURE stage=%s cause=%s", stage, managedRepairCauseClass(err))
+	return err
 }
 
 func (h *Host) SetGraphStreamOffset(ctx context.Context, request network.GraphStreamOffsetRequest) (network.GraphExecuteResponse, error) {
