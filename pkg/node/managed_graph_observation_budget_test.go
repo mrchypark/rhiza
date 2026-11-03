@@ -204,7 +204,7 @@ func TestManagedGraphAdmissionRefusesSecondGapAfterActualPrefixFallback(t *testi
 		t.Fatalf("spent fallback performed another observation/quorum/barrier/application or replay: observers=%d read_tips=%d barriers=%d graph_proposals=%d certified=%d applied=%d", observerCalls.Load(), fixture.transport.readTipCalls.Load(), barriers.Load(), graphProposals.Load(), fixture.node.core.Tip(), fixture.node.material.Tip())
 	}
 	logs := logOutput.String()
-	if strings.Count(logs, "MANAGED_CONTROL_OBSERVATION_REJECTED reason=snapshot_changed") != 1 || strings.Contains(logs, "MANAGED_CONTROL_OBSERVATION_REJECTED reason=reference_validation") || strings.Count(logs, "reason=observation_recheck_budget_exhausted") != 1 {
+	if strings.Count(logs, "MANAGED_CONTROL_OBSERVATION_REJECTED reason=validated_prefix_advance") != 1 || strings.Contains(logs, "MANAGED_CONTROL_OBSERVATION_REJECTED reason=reference_validation") || strings.Count(logs, "reason=observation_recheck_budget_exhausted") != 1 {
 		t.Fatalf("refusal did not come from the spent-budget guard before another observer: %s", logs)
 	}
 }

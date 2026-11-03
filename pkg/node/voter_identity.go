@@ -60,6 +60,32 @@ type managedVoterProfileBinding struct {
 	Generation          int64
 }
 
+type managedLearnerProfilePurpose uint8
+
+const (
+	managedLearnerProfileForRepairAdd managedLearnerProfilePurpose = iota + 1
+	managedLearnerProfileForFormerVoterLookup
+)
+
+// managedLearnerIntentProfileFor projects only the runtime WAL identity out of
+// a verified learner intent. Callers must already have validated the exact
+// registration nonce (ADD) or certified member/registration binding (lookup).
+func (n *Node) managedLearnerIntentProfileFor(config *types.ExecutionConfig, purpose managedLearnerProfilePurpose) (*managedVoterProfileBinding, error) {
+	switch purpose {
+	case managedLearnerProfileForRepairAdd, managedLearnerProfileForFormerVoterLookup:
+	default:
+		return nil, fmt.Errorf("invalid managed learner profile purpose")
+	}
+	if config == nil || config.Learner == nil || n == nil || n.managedStartup == nil || !isManagedAppendOnlyProtocol(n.managedApplicationProtocol()) {
+		return nil, fmt.Errorf("verified managed learner intent required")
+	}
+	profileConfig := *config
+	profileLearner := *config.Learner
+	profileLearner.WALIdentity = ""
+	profileConfig.Learner = &profileLearner
+	return n.managedVoterProfileFor(&profileConfig)
+}
+
 func (n *Node) managedVoterProfileFor(config *types.ExecutionConfig) (*managedVoterProfileBinding, error) {
 	if n == nil || n.managedStartup == nil || config == nil {
 		return nil, nil

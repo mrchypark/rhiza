@@ -25,14 +25,18 @@ type membershipOperation struct {
 type managedMembershipStage string
 
 const (
-	managedMembershipStageContext          managedMembershipStage = "context"
-	managedMembershipStageLiveGuard        managedMembershipStage = "live_guard"
-	managedMembershipStageRegistration     managedMembershipStage = "registration"
-	managedMembershipStageTargetValidation managedMembershipStage = "target_validation"
-	managedMembershipStageStorageCAS       managedMembershipStage = "storage_cas"
-	managedMembershipStageReconfiguration  managedMembershipStage = "reconfiguration"
-	managedMembershipStageCompletion       managedMembershipStage = "completion"
-	managedMembershipStagePersist          managedMembershipStage = "persist"
+	managedMembershipStageContext                      managedMembershipStage = "context"
+	managedMembershipStageLiveGuard                    managedMembershipStage = "live_guard"
+	managedMembershipStageRegistration                 managedMembershipStage = "registration"
+	managedMembershipStageRegistrationRead             managedMembershipStage = "registration_read"
+	managedMembershipStageRegistrationRecordValidation managedMembershipStage = "registration_record_validation"
+	managedMembershipStageRegistrationProfileCompute   managedMembershipStage = "registration_profile_compute"
+	managedMembershipStageRegistrationProfileMatch     managedMembershipStage = "registration_profile_match"
+	managedMembershipStageTargetValidation             managedMembershipStage = "target_validation"
+	managedMembershipStageStorageCAS                   managedMembershipStage = "storage_cas"
+	managedMembershipStageReconfiguration              managedMembershipStage = "reconfiguration"
+	managedMembershipStageCompletion                   managedMembershipStage = "completion"
+	managedMembershipStagePersist                      managedMembershipStage = "persist"
 )
 
 func logManagedMembershipStageFailure(ctx context.Context, request network.MembershipChange, stage managedMembershipStage, err error) {
@@ -107,12 +111,13 @@ func (n *Node) changeMembership(ctx context.Context, request network.MembershipC
 				return network.ErrInvalidRequest
 			}
 			operation.Target.Members = append(operation.Target.Members, *request.Add)
-			stage = managedMembershipStageRegistration
+			stage = managedMembershipStageRegistrationRead
 			registrationKey := path.Join(n.config.ObjStorePrefix, string(n.config.ClusterID), "voters", fmt.Sprintf("%x.json", sha256.Sum256([]byte(request.Add.ID))))
 			data, err := readVoterRegistration(ctx, n.bucket, registrationKey)
 			if err != nil {
 				return err
 			}
+			stage = managedMembershipStageRegistrationRecordValidation
 			var registration voterIdentity
 			if len(data) == 0 || json.Unmarshal(data, &registration) != nil || registration.Version != voterIdentityVersion || registration.Node != string(request.Add.ID) || registration.Cluster != request.ClusterID || registration.Nonce != request.Add.WALIdentity || registration.LearnerPublicKey != fmt.Sprintf("%x", request.Add.PublicKey[:]) {
 				return network.ErrInvalidRequest
@@ -120,10 +125,15 @@ func (n *Node) changeMembership(ctx context.Context, request network.MembershipC
 			candidateConfig := *n.config
 			candidateConfig.NodeID = request.Add.ID
 			candidateConfig.Learner = request.Add
+			stage = managedMembershipStageRegistrationProfileCompute
 			profile, profileErr := n.managedVoterProfileFor(&candidateConfig)
+			if isManagedAppendOnlyProtocol(n.managedApplicationProtocol()) {
+				profile, profileErr = n.managedLearnerIntentProfileFor(&candidateConfig, managedLearnerProfileForRepairAdd)
+			}
 			if profileErr != nil {
 				return profileErr
 			}
+			stage = managedMembershipStageRegistrationProfileMatch
 			if profile != nil && (registration.ApplicationProtocol != profile.ApplicationProtocol || registration.BootstrapPlanDigest != profile.BootstrapPlanDigest || registration.MemberConfigDigest != profile.MemberConfigDigest || registration.Generation == nil || *registration.Generation != profile.Generation) {
 				return fmt.Errorf("candidate voter append-only profile differs from the trusted group")
 			}

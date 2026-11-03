@@ -171,26 +171,33 @@ func (c *Core) ObserveManagedAppendOnlyControl(ctx context.Context) (ManagedAppe
 	if err := ctx.Err(); err != nil {
 		return ManagedAppendOnlyControlObservation{}, err
 	}
-	if !c.sameManagedControlSnapshot(snapshot) {
-		if c.managedControlPrefixAdvanced(snapshot) {
-			return ManagedAppendOnlyControlObservation{}, managedControlObservationRejected("snapshot_changed", &managedControlPrefixAdvanceError{snapshot: snapshot})
-		}
-		return ManagedAppendOnlyControlObservation{}, fmt.Errorf("%w: Core state changed during validation", managedControlObservationRejected("snapshot_changed", ErrManagedControlObservationUnavailable))
+	current, reclassified, prefixAdvanced, reason, currentErr := c.recheckManagedControlSnapshot(snapshot, validated)
+	if err := ctx.Err(); err != nil {
+		return ManagedAppendOnlyControlObservation{}, err
 	}
-	return ManagedAppendOnlyControlObservation{
-		CommittedTip: snapshot.committed, ObservedSlot: snapshot.observed,
-		ConfigID: snapshot.configID, Step: snapshot.step,
-		ApplicationProtocol: snapshot.protocol, Generation: snapshot.generation,
-		Proposals: validated, core: c,
-	}, nil
+	if prefixAdvanced {
+		return ManagedAppendOnlyControlObservation{}, managedControlObservationRejected("validated_prefix_advance", &managedControlPrefixAdvanceError{snapshot: snapshot})
+	}
+	if currentErr != nil {
+		return ManagedAppendOnlyControlObservation{}, fmt.Errorf("%w: Core state changed during validation", managedControlObservationRejected(reason, ErrManagedControlObservationUnavailable))
+	}
+	if reclassified {
+		return current, nil
+	}
+	return current, nil
 }
 
-func (c *Core) managedControlPrefixAdvanced(snapshot managedControlSnapshot) bool {
-	if c == nil {
-		return false
-	}
-	c.mu.RLock()
-	defer c.mu.RUnlock()
+func currentObservationFromSnapshot(snapshot managedControlSnapshot) ManagedAppendOnlyControlObservation {
+	return ManagedAppendOnlyControlObservation{CommittedTip: snapshot.committed, ObservedSlot: snapshot.observed, ConfigID: snapshot.configID, Step: snapshot.step, ApplicationProtocol: snapshot.protocol, Generation: snapshot.generation, core: snapshot.core}
+}
+
+func currentObservationFromSnapshotWithValidated(snapshot managedControlSnapshot, validated []ManagedAppendOnlyControlProposal) ManagedAppendOnlyControlObservation {
+	observation := currentObservationFromSnapshot(snapshot)
+	observation.Proposals = validated
+	return observation
+}
+
+func (c *Core) managedControlPrefixAdvancedLocked(snapshot managedControlSnapshot) bool {
 	if snapshot.core != c || snapshot.committed >= snapshot.observed || c.tip < snapshot.observed || c.highestKnownSlotLocked() > c.tip || c.localMode || c.managedAppendOnly == nil || c.managedAppendOnly != snapshot.config || c.managedAppendOnly.Verify == nil || c.observer || c.learner || c.managedAppendOnly.Binding != snapshot.binding || c.walIdentity != snapshot.walIdentity || c.generationAnchorHash != snapshot.anchor || c.membershipVersion != snapshot.membership || !sameCluster(c.clusterForSlotLocked(snapshot.observed), snapshot.cluster) || !c.voterForClusterLocked(snapshot.cluster) {
 		return false
 	}
@@ -209,34 +216,40 @@ func (c *Core) managedControlSnapshot() (snapshot managedControlSnapshot, result
 	}()
 	c.mu.RLock()
 	defer c.mu.RUnlock()
+	return c.managedControlSnapshotLocked(&rejectionReason)
+}
+
+// managedControlSnapshotLocked reads the complete current ISR without acquiring
+// Core locks. Callers must hold at least c.mu.RLock.
+func (c *Core) managedControlSnapshotLocked(rejectionReason *string) (snapshot managedControlSnapshot, resultErr error) {
 	if c.localMode || c.managedAppendOnly == nil || c.managedAppendOnly.Verify == nil || c.observer || c.learner {
-		rejectionReason = "runtime_role_or_profile"
+		*rejectionReason = "runtime_role_or_profile"
 		return managedControlSnapshot{}, ErrManagedControlObservationUnavailable
 	}
 	binding := c.managedAppendOnly.Binding
 	if binding.ApplicationProtocol != managedRequestAppendOnlyApplicationProtocol && binding.ApplicationProtocol != managedGraphRequestAppendOnlyApplicationProtocol {
-		rejectionReason = "runtime_role_or_profile"
+		*rejectionReason = "runtime_role_or_profile"
 		return managedControlSnapshot{}, ErrManagedControlObservationUnavailable
 	}
 	committed := c.tip
 	if committed == Slot(math.MaxUint64) {
-		rejectionReason = "slot_not_next"
+		*rejectionReason = "slot_not_next"
 		return managedControlSnapshot{}, ErrManagedControlObservationUnavailable
 	}
 	observed := c.highestKnownSlotLocked()
 	_, isDecided := c.decided[observed]
 	if observed != committed+1 || isDecided {
-		rejectionReason = "slot_not_next"
+		*rejectionReason = "slot_not_next"
 		return managedControlSnapshot{}, ErrManagedControlObservationUnavailable
 	}
 	state, ok := c.recorders[observed]
 	if !ok || state.Step < 4 || state.FirstCurrent == nil || state.AggregateCurrent == nil || compareProposal(state.AggregateCurrent, state.FirstCurrent) < 0 || (state.Step == 4 && state.AggregatePrior != nil) {
-		rejectionReason = "isr_shape"
+		*rejectionReason = "isr_shape"
 		return managedControlSnapshot{}, ErrManagedControlObservationUnavailable
 	}
 	cluster := cloneCluster(c.clusterForSlotLocked(observed))
 	if cluster.ConfigID == 0 || !c.voterForClusterLocked(cluster) {
-		rejectionReason = "voter_configuration"
+		*rejectionReason = "voter_configuration"
 		return managedControlSnapshot{}, ErrManagedControlObservationUnavailable
 	}
 	snapshot = managedControlSnapshot{
@@ -255,12 +268,93 @@ func (c *Core) managedControlSnapshot() (snapshot managedControlSnapshot, result
 		}
 		value, exists := c.values[item.proposal.Hash]
 		if !exists || len(value) == 0 || sha256.Sum256(value) != item.proposal.Hash || (len(item.proposal.Value) != 0 && !bytes.Equal(item.proposal.Value, value)) {
-			rejectionReason = "proposal_value"
+			*rejectionReason = "proposal_value"
 			return managedControlSnapshot{}, ErrManagedControlObservationUnavailable
 		}
 		snapshot.refs = append(snapshot.refs, managedControlRefSnapshot{role: item.role, proposal: *cloneProposal(item.proposal), value: bytes.Clone(value)})
 	}
 	return snapshot, nil
+}
+
+// recheckManagedControlSnapshot performs the final fresh read in one lock
+// section. It distinguishes a newly certified prefix from a same-slot ISR
+// change without invoking verifiers or performing I/O under the lock.
+func (c *Core) recheckManagedControlSnapshot(before managedControlSnapshot, validated []ManagedAppendOnlyControlProposal) (ManagedAppendOnlyControlObservation, bool, bool, string, error) {
+	if c == nil {
+		return ManagedAppendOnlyControlObservation{}, false, false, "final_snapshot_mismatch", ErrManagedControlObservationUnavailable
+	}
+	readerReason := ""
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	after, err := c.managedControlSnapshotLocked(&readerReason)
+	if err != nil {
+		if c.managedControlPrefixAdvancedLocked(before) {
+			return ManagedAppendOnlyControlObservation{}, false, true, "validated_prefix_advance", err
+		}
+		return ManagedAppendOnlyControlObservation{}, false, false, "final_snapshot_mismatch", err
+	}
+	if sameManagedControlSnapshotValues(before, after) {
+		return currentObservationFromSnapshotWithValidated(after, validated), false, false, "", nil
+	}
+	if c.managedControlPrefixAdvancedLocked(before) {
+		return ManagedAppendOnlyControlObservation{}, false, true, "validated_prefix_advance", nil
+	}
+	if after.step != before.step {
+		if observation, ok := c.reclassifiedManagedControlObservationLocked(before, after, validated); ok {
+			return observation, true, false, "", nil
+		}
+	}
+	return ManagedAppendOnlyControlObservation{}, false, false, "final_snapshot_mismatch", ErrManagedControlObservationUnavailable
+}
+
+func sameManagedControlSnapshotValues(before, after managedControlSnapshot) bool {
+	if before.core != after.core || before.committed != after.committed || before.observed != after.observed || before.configID != after.configID || before.step != after.step || before.protocol != after.protocol || before.generation != after.generation || before.binding != after.binding || before.walIdentity != after.walIdentity || before.anchor != after.anchor || before.membership != after.membership || before.config != after.config || !sameCluster(before.cluster, after.cluster) || len(before.refs) != len(after.refs) {
+		return false
+	}
+	for index := range before.refs {
+		left, right := before.refs[index], after.refs[index]
+		if left.role != right.role || !sameProposal(&left.proposal, &right.proposal) || !bytes.Equal(left.value, right.value) {
+			return false
+		}
+	}
+	return true
+}
+
+func (c *Core) reclassifiedManagedControlObservationLocked(before, current managedControlSnapshot, validated []ManagedAppendOnlyControlProposal) (ManagedAppendOnlyControlObservation, bool) {
+	if before.core != c || current.core != c || before.committed != current.committed || before.observed != current.observed || before.configID != current.configID || before.protocol != current.protocol || before.generation != current.generation || before.binding != current.binding || before.walIdentity != current.walIdentity || before.anchor != current.anchor || before.membership != current.membership || before.config != current.config || !sameCluster(before.cluster, current.cluster) || current.step < before.step || len(before.refs) != len(validated) {
+		return ManagedAppendOnlyControlObservation{}, false
+	}
+	validatedByValue := make(map[ValueHash][]byte, len(before.refs))
+	for index, ref := range before.refs {
+		if validated[index].Hash != ref.proposal.Hash || validated[index].Role != ref.role {
+			return ManagedAppendOnlyControlObservation{}, false
+		}
+		validatedByValue[ref.proposal.Hash] = ref.value
+	}
+	proposals := make([]ManagedAppendOnlyControlProposal, 0, len(current.refs))
+	for _, ref := range current.refs {
+		validatedValue, ok := validatedByValue[ref.proposal.Hash]
+		if !ok || !bytes.Equal(validatedValue, ref.value) || sha256.Sum256(ref.value) != ref.proposal.Hash {
+			return ManagedAppendOnlyControlObservation{}, false
+		}
+		kind := ManagedAppendOnlyControlKind(0)
+		if barrier, err := DecodeReadBarrier(ref.value); barrier && err == nil {
+			kind = ManagedAppendOnlyReadBarrier
+		} else {
+			_, checkpoint, err := DecodeCheckpointSeal(ref.value)
+			if err != nil || !checkpoint {
+				return ManagedAppendOnlyControlObservation{}, false
+			}
+			kind = ManagedAppendOnlyCheckpointSeal
+			seal, _, _ := DecodeCheckpointSeal(ref.value)
+			candidate := ManagedCheckpointCandidate{Value: ref.value, Hash: ref.proposal.Hash, Seal: seal, DecisionSlot: current.observed, ConfigID: current.configID}
+			if err := c.validateManagedCandidateLocalLocked(candidate); err != nil {
+				return ManagedAppendOnlyControlObservation{}, false
+			}
+		}
+		proposals = append(proposals, ManagedAppendOnlyControlProposal{Role: ref.role, Kind: kind, Priority: ref.proposal.Priority, ProposerID: ref.proposal.ProposerID, Hash: ref.proposal.Hash})
+	}
+	return ManagedAppendOnlyControlObservation{CommittedTip: current.committed, ObservedSlot: current.observed, ConfigID: current.configID, Step: current.step, ApplicationProtocol: current.protocol, Generation: current.generation, Proposals: proposals, core: c}, true
 }
 
 func (c *Core) validateManagedControlRef(ctx context.Context, snapshot managedControlSnapshot, ref managedControlRefSnapshot) (ManagedAppendOnlyControlKind, error) {
@@ -291,18 +385,4 @@ func (c *Core) validateManagedControlRef(ctx context.Context, snapshot managedCo
 		return 0, managedControlObservationRejected("reference_validation", err)
 	}
 	return ManagedAppendOnlyCheckpointSeal, nil
-}
-
-func (c *Core) sameManagedControlSnapshot(before managedControlSnapshot) bool {
-	after, err := c.managedControlSnapshot()
-	if err != nil || before.core != after.core || before.committed != after.committed || before.observed != after.observed || before.configID != after.configID || before.step != after.step || before.protocol != after.protocol || before.generation != after.generation || before.binding != after.binding || before.walIdentity != after.walIdentity || before.anchor != after.anchor || before.membership != after.membership || before.config != after.config || !sameCluster(before.cluster, after.cluster) || len(before.refs) != len(after.refs) {
-		return false
-	}
-	for index := range before.refs {
-		left, right := before.refs[index], after.refs[index]
-		if left.role != right.role || !sameProposal(&left.proposal, &right.proposal) || !bytes.Equal(left.value, right.value) {
-			return false
-		}
-	}
-	return true
 }

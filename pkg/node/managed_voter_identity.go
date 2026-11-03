@@ -65,7 +65,13 @@ func (n *Node) ManagedVoterWALIdentity(ctx context.Context, configID uint, abort
 	}) {
 		return "", fmt.Errorf("bootstrap voter key differs from current certified member")
 	}
-	profile, profileErr := n.managedVoterProfileFor(&cfg)
+	var profile *managedVoterProfileBinding
+	var profileErr error
+	if got.LearnerPublicKey != "" && isManagedAppendOnlyProtocol(n.managedApplicationProtocol()) {
+		profile, profileErr = n.managedLearnerIntentProfileFor(&cfg, managedLearnerProfileForFormerVoterLookup)
+	} else {
+		profile, profileErr = n.managedVoterProfileFor(&cfg)
+	}
 	if profileErr != nil {
 		return "", profileErr
 	}
