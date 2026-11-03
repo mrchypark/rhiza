@@ -2,6 +2,7 @@ package managedsql
 
 import (
 	"context"
+	"errors"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -74,6 +75,10 @@ func TestInternalRequestHostSerializesCloseBehindExecute(t *testing.T) {
 		case <-tick.C:
 		}
 	}
+	original, found, err := host.node.RetainedRequest(ctx, "sql", "close-execute")
+	if err != nil || !found || original.Slot == 0 || original.SQL == nil || original.SQL.RequestID != "close-execute" || original.SQL.SQL != "CREATE TABLE close_execute(id INTEGER)" {
+		t.Fatalf("applied exact original missing before Close cancellation: found=%t original=%+v error=%v", found, original, err)
+	}
 	callers.Add(1)
 	go func() {
 		defer callers.Done()
@@ -93,8 +98,9 @@ func TestInternalRequestHostSerializesCloseBehindExecute(t *testing.T) {
 	releaseOnce.Do(func() { close(release) })
 	select {
 	case result := <-operation:
-		if result.err != nil || result.response.Status != types.MutationCommitted || result.response.Slot == 0 {
-			t.Fatalf("released Execute did not ACK: %+v %v", result.response, result.err)
+		var unknown *network.CommitUnknownError
+		if !errors.As(result.err, &unknown) || !errors.Is(result.err, context.Canceled) || unknown.RequestID != "close-execute" || result.response.Status == types.MutationCommitted {
+			t.Fatalf("Close cancellation did not preserve exact committed-but-unknown outcome: response=%+v error=%v", result.response, result.err)
 		}
 	case <-ctx.Done():
 		t.Fatal("Execute did not drain", ctx.Err())

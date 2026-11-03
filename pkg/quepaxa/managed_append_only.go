@@ -54,7 +54,7 @@ type ManagedAppendOnlyConfig struct {
 	Verify  ManagedCheckpointCandidateVerifier
 }
 
-func validateManagedAppendOnlyConfig(config *ManagedAppendOnlyConfig, wal *qlog.WAL, nodeID NodeID, localMember Member, localMode bool) (*ManagedAppendOnlyConfig, error) {
+func validateManagedAppendOnlyConfig(config *ManagedAppendOnlyConfig, wal *qlog.WAL, nodeID NodeID, localMember Member, localMode, learner bool) (*ManagedAppendOnlyConfig, error) {
 	if config == nil {
 		return nil, nil
 	}
@@ -78,7 +78,7 @@ func validateManagedAppendOnlyConfig(config *ManagedAppendOnlyConfig, wal *qlog.
 	if !registered || len(identity) != len(binding.WALIdentity) || !bytes.Equal(identity, binding.WALIdentity[:]) {
 		return nil, fmt.Errorf("binding WAL identity does not match registered WAL identity")
 	}
-	if localMember.ID != nodeID || (localMember.WALIdentity != "" && localMember.WALIdentity != hex.EncodeToString(binding.WALIdentity[:])) {
+	if (learner && localMember.ID != "") || (!learner && (localMember.ID != nodeID || localMember.WALIdentity != "" && localMember.WALIdentity != hex.EncodeToString(binding.WALIdentity[:]))) {
 		return nil, fmt.Errorf("current member registration does not bind this WAL identity")
 	}
 	if config.Verify == nil {
@@ -86,6 +86,103 @@ func validateManagedAppendOnlyConfig(config *ManagedAppendOnlyConfig, wal *qlog.
 	}
 	copy := &ManagedAppendOnlyConfig{Binding: binding, Verify: config.Verify}
 	return copy, nil
+}
+
+// ValidateManagedCheckpointRoot authenticates an already-decided checkpoint
+// for read-only root selection. Proposal/record eligibility remains stricter.
+func (c *Core) ValidateManagedCheckpointRoot(ctx context.Context, candidate ManagedCheckpointCandidate) error {
+	if c == nil || c.managedAppendOnly == nil || c.managedAppendOnly.Verify == nil {
+		return ErrManagedAppendOnlyUnavailable
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	candidate.Value = bytes.Clone(candidate.Value)
+	seal, checkpoint, err := DecodeCheckpointSeal(candidate.Value)
+	if err != nil || !checkpoint {
+		if err == nil {
+			err = fmt.Errorf("candidate value is not a QCKP")
+		}
+		return err
+	}
+	if sha256.Sum256(candidate.Value) != candidate.Hash || !sameManagedCheckpointSeal(seal, candidate.Seal) || candidate.DecisionSlot <= seal.Index || candidate.ConfigID == 0 {
+		return fmt.Errorf("managed checkpoint root identity is invalid")
+	}
+	candidate.Seal = cloneManagedCheckpointSeal(seal)
+	if err := c.validateManagedCheckpointRootLocal(candidate); err != nil {
+		return err
+	}
+	if _, err := c.checkpointMembershipForSeal(seal); err != nil {
+		return err
+	}
+	decision, ok := c.CertifiedValue(candidate.DecisionSlot)
+	if !ok || decision.Hash != candidate.Hash || !bytes.Equal(decision.Value, candidate.Value) {
+		return fmt.Errorf("managed checkpoint root is not the exact locally certified decision")
+	}
+	configID, certificate, err := decodeCertificate(decision.Certificate)
+	if err != nil || certificate.Slot != candidate.DecisionSlot || certificate.Proposal.Hash != decision.Hash || configID != candidate.ConfigID {
+		return fmt.Errorf("managed checkpoint root certificate identity is invalid")
+	}
+	certified, err := c.certifiedDecision(decision)
+	if err != nil {
+		return err
+	}
+	if err := c.validateDecisionForRecovery(certified, true); err != nil {
+		return fmt.Errorf("validate managed checkpoint root certificate: %w", err)
+	}
+	certificateBytes := bytes.Clone(decision.Certificate)
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if err := c.managedAppendOnly.Verify(ctx, candidate); err != nil {
+		return err
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if err := c.validateManagedCheckpointRootLocal(candidate); err != nil {
+		return err
+	}
+	decision, ok = c.CertifiedValue(candidate.DecisionSlot)
+	if !ok || decision.Hash != candidate.Hash || !bytes.Equal(decision.Value, candidate.Value) || !bytes.Equal(decision.Certificate, certificateBytes) {
+		return fmt.Errorf("managed checkpoint decision changed during root verification")
+	}
+	return nil
+}
+
+func (c *Core) validateManagedCheckpointRootLocal(candidate ManagedCheckpointCandidate) error {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	seal := candidate.Seal
+	if c.managedAppendOnly == nil || c.walIdentity != hex.EncodeToString(c.managedAppendOnly.Binding.WALIdentity[:]) || seal.GenerationAnchorHash != c.generationAnchorHash {
+		return fmt.Errorf("managed checkpoint binding or generation lineage changed")
+	}
+	if candidate.DecisionSlot <= c.floor || candidate.ConfigID == 0 || c.clusterForSlotLocked(candidate.DecisionSlot).ConfigID != candidate.ConfigID {
+		return fmt.Errorf("managed checkpoint decision is outside retained certified history")
+	}
+	if c.floor > seal.Index {
+		return fmt.Errorf("managed checkpoint root is below the recovery floor")
+	}
+	if prefix, ok := c.prefixes[seal.Index]; ok && prefix != seal.PrefixHash {
+		return fmt.Errorf("managed checkpoint prefix differs from available local history")
+	}
+	if order, following, err := c.checkpointLeaderOrdersLocked(seal.Index); err == nil && (!slices.Equal(order, seal.NextLeaderOrder) || !slices.Equal(following, seal.FollowingLeaderOrder)) {
+		return fmt.Errorf("managed checkpoint leader order differs from available local history")
+	}
+	if c.reconfigEnabled {
+		if seal.Membership == nil {
+			return fmt.Errorf("managed checkpoint lacks historical membership proof")
+		}
+		if localMembership, err := c.checkpointMembershipAtLocked(seal.Index); err == nil && !sameMembershipRecord(localMembership, *seal.Membership) {
+			return fmt.Errorf("managed checkpoint membership differs from available local history")
+		}
+		if seal.ConfigID != c.clusterForSlotLocked(seal.Index+1).ConfigID {
+			return fmt.Errorf("managed checkpoint cut config differs from available local history")
+		}
+	} else if seal.Membership != nil || seal.ConfigID != c.config.ConfigID || !c.validateCheckpointLeaderOrders(seal.Index, seal.NextLeaderOrder, seal.FollowingLeaderOrder) {
+		return fmt.Errorf("managed checkpoint cut differs from fixed historical membership")
+	}
+	return nil
 }
 
 func validateManagedDigest(name, value string) error {

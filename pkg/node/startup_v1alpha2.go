@@ -318,7 +318,7 @@ func (n *Node) admitInternalApplication(ctx context.Context) error {
 			return err
 		}
 	}
-	if n.materializationPolicy() == sqlpolicy.ManagedGraphRequestMaterializationPolicy && !isManagedAppendOnlyProtocol(n.managedStartup.Identity.ApplicationProtocol) {
+	if n.materializationPolicy() == sqlpolicy.ManagedGraphRequestMaterializationPolicy {
 		if err := n.ensureManagedGraphInitialRoot(ctx); err != nil {
 			return err
 		}
@@ -1608,7 +1608,14 @@ func (n *Node) recoverPreparedV1Alpha2WithLock(ctx context.Context, prepared *re
 	if n.config.Learner != nil {
 		newCore = quepaxa.NewLearner
 	}
-	core, err := newCore(quepaxa.Config{NodeID: n.config.NodeID, Cluster: *cluster, WAL: wal, Transport: transport, EnableReconfiguration: n.config.EnableReconfiguration, ValidateValue: validateValue})
+	coreConfig := quepaxa.Config{NodeID: n.config.NodeID, Cluster: *cluster, WAL: wal, Transport: transport, EnableReconfiguration: n.config.EnableReconfiguration, ValidateValue: validateValue}
+	if peerProfile != nil {
+		coreConfig.ManagedAppendOnly, err = n.managedAppendOnlyCoreConfig()
+		if err != nil {
+			return err
+		}
+	}
+	core, err := newCore(coreConfig)
 	if err != nil {
 		return err
 	}

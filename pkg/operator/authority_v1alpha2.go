@@ -265,6 +265,10 @@ func ReserveV1Alpha2SQLWrite(ctx context.Context, store *V1Alpha2StatusStore, ol
 	if _, err := decodePendingSQL(raw, request); err != nil {
 		return V1Alpha2AdmissionSnapshot{}, "", err
 	}
+	reservationRequired, err := managedSQLReservationContextRequired(old.status.object)
+	if err != nil {
+		return V1Alpha2AdmissionSnapshot{}, "", err
+	}
 	if old.status.store != store || old.Authority() != expected || old.pending != nil || old.SQLReservationsClosed() || hasV1Alpha2Transition(old.transition) || !sameJSON(old.evidence, evidence) || !validV1Alpha2WriteRequest(request) {
 		return V1Alpha2AdmissionSnapshot{}, "", fmt.Errorf("write reservation preconditions do not match")
 	}
@@ -272,7 +276,7 @@ func ReserveV1Alpha2SQLWrite(ctx context.Context, store *V1Alpha2StatusStore, ol
 		auth["pendingWrite"] = json.RawMessage("true")
 		auth["everApplicationReserved"] = json.RawMessage("true")
 		pending := v1alpha2PendingRequest{V1Alpha2WriteRequest: request, PriorEvidence: bytes.Clone(old.evidence), OriginalSQL: raw}
-		if old.mixed() {
+		if reservationRequired {
 			pending.Reservation = reservationContext(old.Authority())
 		}
 		auth["pendingRequest"], _ = json.Marshal(pending)

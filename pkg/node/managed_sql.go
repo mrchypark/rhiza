@@ -263,7 +263,12 @@ func (n *Node) VerifyManagedSQLFreshSource(ctx context.Context, i ManagedStartup
 	if err != nil {
 		return err
 	}
-	view, err := recovery.OpenReadOnlyViewForPolicyWithReconfiguration(ctx, source, prefix, 1, *n.loadClusterConfig(), n.materializationPolicy(), n.receiptWindow(), n.config.EnableReconfiguration)
+	var view *recovery.ReadOnlyView
+	if isManagedAppendOnlyProtocol(n.managedApplicationProtocol()) {
+		view, err = recovery.OpenReadOnlyViewForApplicationProtocol(ctx, source, prefix, 1, *n.loadClusterConfig(), n.materializationPolicy(), n.receiptWindow(), n.managedApplicationProtocol(), n.config.EnableReconfiguration)
+	} else {
+		view, err = recovery.OpenReadOnlyViewForPolicyWithReconfiguration(ctx, source, prefix, 1, *n.loadClusterConfig(), n.materializationPolicy(), n.receiptWindow(), n.config.EnableReconfiguration)
+	}
 	if err != nil {
 		return err
 	}

@@ -22,6 +22,9 @@ import (
 	"github.com/thanos-io/objstore"
 )
 
+const preparedGraphApplicationProtocol = sqlpolicy.ManagedGraphRequestAppendOnlyApplicationProtocol
+const preparedGraphWindow = types.DefaultIdempotencyWindowSlots
+
 // Reuse the existing real Core/apply/archive fixture and its certified proposal
 // helper; only the trusted profile, paired source roles and Graph commands differ.
 func newGraphPreparedFixture(t *testing.T) *mixedRecoveryFixture {
@@ -31,7 +34,7 @@ func newGraphPreparedFixture(t *testing.T) *mixedRecoveryFixture {
 func newGraphPreparedFixtureForMembership(t *testing.T, reconfiguration bool) *mixedRecoveryFixture {
 	t.Helper()
 	ctx := context.Background()
-	f := &mixedRecoveryFixture{ctx: ctx, bucket: objstore.NewInMemBucket(), window: 1024}
+	f := &mixedRecoveryFixture{ctx: ctx, bucket: objstore.NewInMemBucket(), window: preparedGraphWindow}
 	f.bootstrap = quepaxa.Cluster{ConfigID: 1, Members: []quepaxa.Member{{ID: "mixed", PublicKey: testPublicKey("mixed")}}}
 	wal, err := qlog.Open(t.TempDir())
 	if err != nil {
@@ -42,7 +45,7 @@ func newGraphPreparedFixtureForMembership(t *testing.T, reconfiguration bool) *m
 	if err != nil {
 		t.Fatal(err)
 	}
-	f.state, err = materializer.OpenManagedSQLKVGraphWithOriginals(filepath.Join(t.TempDir(), "sqlite.db"), 1, 1024)
+	f.state, err = materializer.OpenManagedSQLKVGraphWithAppendOnlyOriginals(filepath.Join(t.TempDir(), "sqlite.db"), 1, preparedGraphWindow)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -148,7 +151,7 @@ func TestManagedGraphPreparedV4PairedRootAndCertifiedSuffix(t *testing.T) {
 		t.Fatalf("default reader did not reject exact >128KiB payload boundary: %v", err)
 	}
 	readonly := &haReadOnlyRecordingBucket{Bucket: f.bucket}
-	view, err := OpenReadOnlyViewForPolicyWithReconfiguration(f.ctx, readonly, "mixed", 1, f.bootstrap, sqlpolicy.ManagedGraphRequestMaterializationPolicy, 1024, true)
+	view, err := OpenReadOnlyViewForApplicationProtocol(f.ctx, readonly, "mixed", 1, f.bootstrap, sqlpolicy.ManagedGraphRequestMaterializationPolicy, preparedGraphWindow, preparedGraphApplicationProtocol, true)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -161,7 +164,7 @@ func TestManagedGraphPreparedV4PairedRootAndCertifiedSuffix(t *testing.T) {
 	identity := mixedPreparedIdentity()
 	identity.Generation = 0
 	handoff := filepath.Join(t.TempDir(), "prepared")
-	if err := PublishPreparedStartupForPolicy(f.ctx, view, handoff, identity, sqlpolicy.ManagedGraphRequestMaterializationPolicy, 1024); err != nil {
+	if err := PublishPreparedStartupForPolicy(f.ctx, view, handoff, identity, sqlpolicy.ManagedGraphRequestMaterializationPolicy, preparedGraphWindow); err != nil {
 		_ = filepath.WalkDir(handoff, func(name string, entry os.DirEntry, walkErr error) error {
 			if walkErr != nil {
 				return walkErr
@@ -213,14 +216,14 @@ func TestManagedGraphPreparedV4PairedRootAndCertifiedSuffix(t *testing.T) {
 		t.Fatal(err)
 	}
 	target := filepath.Join(t.TempDir(), "verified")
-	verified, err := LoadPreparedStartupForPolicyWithReconfiguration(f.ctx, readonly, "mixed", 1, f.bootstrap, handoff, target, identity, sqlpolicy.ManagedGraphRequestMaterializationPolicy, 1024, true)
+	verified, err := LoadPreparedStartupForApplicationProtocol(f.ctx, readonly, "mixed", 1, f.bootstrap, handoff, target, identity, sqlpolicy.ManagedGraphRequestMaterializationPolicy, preparedGraphWindow, preparedGraphApplicationProtocol, true)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if verified.Directory() != target || target == handoff {
 		t.Fatal("loader selected untrusted handoff instead of independently reconstructed directory")
 	}
-	actual, err := materializer.OpenManagedSQLKVGraphWithOriginals(filepath.Join(verified.Directory(), "sqlite.db"), 1, 1024)
+	actual, err := materializer.OpenManagedSQLKVGraphWithAppendOnlyOriginals(filepath.Join(verified.Directory(), "sqlite.db"), 1, preparedGraphWindow)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -257,10 +260,13 @@ func TestManagedGraphPreparedV4PairedRootAndCertifiedSuffix(t *testing.T) {
 	if readonly.mutations != 0 {
 		t.Fatal("read-only reconstruction mutated source")
 	}
-	for _, policy := range []sqlpolicy.MaterializationPolicy{7, 8, 9} {
-		if _, err := LoadPreparedStartupForPolicy(f.ctx, readonly, "mixed", 1, f.bootstrap, handoff, filepath.Join(t.TempDir(), "wrong"), identity, policy, 1024); err == nil {
+	for _, policy := range []sqlpolicy.MaterializationPolicy{7, 8} {
+		if _, err := LoadPreparedStartupForPolicy(f.ctx, readonly, "mixed", 1, f.bootstrap, handoff, filepath.Join(t.TempDir(), "wrong"), identity, policy, preparedGraphWindow); err == nil {
 			t.Fatalf("v4 loaded under policy%d", policy)
 		}
+	}
+	if _, err := LoadPreparedStartupForApplicationProtocol(f.ctx, readonly, "mixed", 1, f.bootstrap, handoff, filepath.Join(t.TempDir(), "wrong"), identity, sqlpolicy.ManagedRequestMaterializationPolicy, preparedGraphWindow, sqlpolicy.ManagedRequestAppendOnlyApplicationProtocol, true); err == nil {
+		t.Fatal("Graph v4 loaded under the final SQL request profile")
 	}
 	for _, change := range []struct {
 		name  string
@@ -287,7 +293,7 @@ func TestManagedGraphPreparedV4PairedRootAndCertifiedSuffix(t *testing.T) {
 					t.Error(err)
 				}
 			}()
-			if _, err := LoadPreparedStartupForPolicyWithReconfiguration(f.ctx, readonly, "mixed", 1, f.bootstrap, handoff, filepath.Join(t.TempDir(), "rejected"), identity, sqlpolicy.ManagedGraphRequestMaterializationPolicy, 1024, true); err == nil {
+			if _, err := LoadPreparedStartupForApplicationProtocol(f.ctx, readonly, "mixed", 1, f.bootstrap, handoff, filepath.Join(t.TempDir(), "rejected"), identity, sqlpolicy.ManagedGraphRequestMaterializationPolicy, preparedGraphWindow, preparedGraphApplicationProtocol, true); err == nil {
 				t.Fatal("altered descriptor accepted")
 			}
 		})
@@ -308,7 +314,7 @@ func TestManagedGraphPreparedV4PairedRootAndCertifiedSuffix(t *testing.T) {
 				t.Error(err)
 			}
 		}()
-		if _, err := LoadPreparedStartupForPolicyWithReconfiguration(f.ctx, readonly, "mixed", 1, f.bootstrap, handoff, filepath.Join(t.TempDir(), "rejected"), identity, sqlpolicy.ManagedGraphRequestMaterializationPolicy, 1024, true); err == nil {
+		if _, err := LoadPreparedStartupForApplicationProtocol(f.ctx, readonly, "mixed", 1, f.bootstrap, handoff, filepath.Join(t.TempDir(), "rejected"), identity, sqlpolicy.ManagedGraphRequestMaterializationPolicy, preparedGraphWindow, preparedGraphApplicationProtocol, true); err == nil {
 			t.Fatal("native page hash corruption accepted")
 		}
 	})
@@ -327,7 +333,7 @@ func TestManagedGraphPreparedV4PairedRootAndCertifiedSuffix(t *testing.T) {
 		if err := os.Symlink(saved, name); err != nil {
 			t.Fatal(err)
 		}
-		if _, err := LoadPreparedStartupForPolicyWithReconfiguration(f.ctx, readonly, "mixed", 1, f.bootstrap, handoff, filepath.Join(t.TempDir(), "rejected"), identity, sqlpolicy.ManagedGraphRequestMaterializationPolicy, 1024, true); err == nil {
+		if _, err := LoadPreparedStartupForApplicationProtocol(f.ctx, readonly, "mixed", 1, f.bootstrap, handoff, filepath.Join(t.TempDir(), "rejected"), identity, sqlpolicy.ManagedGraphRequestMaterializationPolicy, preparedGraphWindow, preparedGraphApplicationProtocol, true); err == nil {
 			t.Fatal("native symlink accepted")
 		}
 	})
@@ -335,7 +341,7 @@ func TestManagedGraphPreparedV4PairedRootAndCertifiedSuffix(t *testing.T) {
 
 func TestManagedGraphReadOnlyLocatorCapturedCut(t *testing.T) {
 	f := newGraphPreparedFixture(t)
-	view, err := OpenReadOnlyViewForPolicyWithReconfiguration(f.ctx, f.bucket, "mixed", 1, f.bootstrap, sqlpolicy.ManagedGraphRequestMaterializationPolicy, 1024, true)
+	view, err := OpenReadOnlyViewForApplicationProtocol(f.ctx, f.bucket, "mixed", 1, f.bootstrap, sqlpolicy.ManagedGraphRequestMaterializationPolicy, preparedGraphWindow, preparedGraphApplicationProtocol, true)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -364,14 +370,14 @@ func TestManagedGraphReadOnlyLocatorCapturedCut(t *testing.T) {
 		if err := f.bucket.Upload(f.ctx, key, bytes.NewReader(data)); err != nil {
 			t.Fatal(err)
 		}
-		if _, err := OpenReadOnlyViewAtHeadForPolicyWithReconfiguration(f.ctx, f.bucket, "mixed", 1, f.bootstrap, view.CapturedHead(), sqlpolicy.ManagedGraphRequestMaterializationPolicy, 1024, true); err == nil {
+		if _, err := OpenReadOnlyViewAtHeadForApplicationProtocol(f.ctx, f.bucket, "mixed", 1, f.bootstrap, view.CapturedHead(), sqlpolicy.ManagedGraphRequestMaterializationPolicy, preparedGraphWindow, preparedGraphApplicationProtocol, true); err == nil {
 			t.Fatal("unbound locator accepted against captured HEAD")
 		}
 	}
 	if err := f.bucket.Delete(f.ctx, key); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := OpenReadOnlyViewForPolicyWithReconfiguration(f.ctx, f.bucket, "mixed", 1, f.bootstrap, sqlpolicy.ManagedGraphRequestMaterializationPolicy, 1024, true); err == nil {
+	if _, err := OpenReadOnlyViewForApplicationProtocol(f.ctx, f.bucket, "mixed", 1, f.bootstrap, sqlpolicy.ManagedGraphRequestMaterializationPolicy, preparedGraphWindow, preparedGraphApplicationProtocol, true); err == nil {
 		t.Fatal("missing locator fell back to genesis or archive Base0")
 	}
 	if f.archive.head.Base != 0 {
@@ -417,28 +423,29 @@ func TestManagedGraphReaderTrustedMembershipMode(t *testing.T) {
 			if mode != (f.seal.Membership != nil) {
 				t.Fatal("fixture fabricated membership mode")
 			}
-			if _, err := OpenReadOnlyViewForPolicy(f.ctx, f.bucket, "mixed", 1, f.bootstrap, sqlpolicy.ManagedGraphRequestMaterializationPolicy, 1024); err == nil {
+			if _, err := OpenReadOnlyViewForPolicy(f.ctx, f.bucket, "mixed", 1, f.bootstrap, sqlpolicy.ManagedGraphRequestMaterializationPolicy, preparedGraphWindow); err == nil || !strings.Contains(err.Error(), "explicit application protocol") {
 				t.Fatal("Graph trust mode inferred without configuration")
 			}
-			view, err := OpenReadOnlyViewForPolicyWithReconfiguration(f.ctx, f.bucket, "mixed", 1, f.bootstrap, sqlpolicy.ManagedGraphRequestMaterializationPolicy, 1024, mode)
+			view, err := OpenReadOnlyViewForApplicationProtocol(f.ctx, f.bucket, "mixed", 1, f.bootstrap, sqlpolicy.ManagedGraphRequestMaterializationPolicy, preparedGraphWindow, preparedGraphApplicationProtocol, mode)
 			if err != nil {
 				t.Fatal(err)
 			}
 			if view.Base() != f.seal.Index || view.Tip() != f.core.Tip() || len(view.Decisions()) == 0 {
 				t.Fatal("trusted mode lost actual root/suffix")
 			}
-			if _, err := OpenReadOnlyViewForPolicyWithReconfiguration(f.ctx, f.bucket, "mixed", 1, f.bootstrap, sqlpolicy.ManagedGraphRequestMaterializationPolicy, 1024, !mode); err == nil || !strings.Contains(err.Error(), "membership") {
+			if _, err := OpenReadOnlyViewForApplicationProtocol(f.ctx, f.bucket, "mixed", 1, f.bootstrap, sqlpolicy.ManagedGraphRequestMaterializationPolicy, preparedGraphWindow, preparedGraphApplicationProtocol, !mode); err == nil || !strings.Contains(err.Error(), "membership") {
 				t.Fatalf("wrong trusted mode did not preserve membership validator: %v", err)
 			}
 			identity := mixedPreparedIdentity()
+			identity.Generation = 0
 			handoff := filepath.Join(t.TempDir(), "handoff")
-			if err := PublishPreparedStartupForPolicy(f.ctx, view, handoff, identity, sqlpolicy.ManagedGraphRequestMaterializationPolicy, 1024); err != nil {
+			if err := PublishPreparedStartupForPolicy(f.ctx, view, handoff, identity, sqlpolicy.ManagedGraphRequestMaterializationPolicy, preparedGraphWindow); err != nil {
 				t.Fatal(err)
 			}
-			if _, err := LoadPreparedStartupForPolicyWithReconfiguration(f.ctx, f.bucket, "mixed", 1, f.bootstrap, handoff, filepath.Join(t.TempDir(), "right"), identity, sqlpolicy.ManagedGraphRequestMaterializationPolicy, 1024, mode); err != nil {
+			if _, err := LoadPreparedStartupForApplicationProtocol(f.ctx, f.bucket, "mixed", 1, f.bootstrap, handoff, filepath.Join(t.TempDir(), "right"), identity, sqlpolicy.ManagedGraphRequestMaterializationPolicy, preparedGraphWindow, preparedGraphApplicationProtocol, mode); err != nil {
 				t.Fatal(err)
 			}
-			if _, err := LoadPreparedStartupForPolicyWithReconfiguration(f.ctx, f.bucket, "mixed", 1, f.bootstrap, handoff, filepath.Join(t.TempDir(), "wrong"), identity, sqlpolicy.ManagedGraphRequestMaterializationPolicy, 1024, !mode); err == nil || !strings.Contains(err.Error(), "membership") {
+			if _, err := LoadPreparedStartupForApplicationProtocol(f.ctx, f.bucket, "mixed", 1, f.bootstrap, handoff, filepath.Join(t.TempDir(), "wrong"), identity, sqlpolicy.ManagedGraphRequestMaterializationPolicy, preparedGraphWindow, preparedGraphApplicationProtocol, !mode); err == nil || !strings.Contains(err.Error(), "membership") {
 				t.Fatalf("prepared source overrode trusted membership mode: %v", err)
 			}
 		})

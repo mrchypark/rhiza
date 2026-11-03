@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"net/http"
 	"path/filepath"
+	"reflect"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -124,20 +125,51 @@ func TestInternalRequestHintIntentMustMatchCanonicalOwner(t *testing.T) {
 	if err != nil || b.Status != types.MutationCommitted {
 		t.Fatal("canonical B", err)
 	}
-	before := hostApplicationDecisionCount(t, ctx, configs[0], sqlpolicy.ManagedRequestMaterializationPolicy)
+	selector := network.RequestStatusRequest{Kind: "sql", RequestID: "contested"}
+	// Resolve B on every exact observer before taking the baseline. The public
+	// receipt proves the original is retained; it also synchronizes any follower
+	// that had not yet learned B. This prevents catch-up of B from looking like a
+	// new SQL decision caused by the later incompatible-A hint check.
+	before := make([][]managedApplicationDecision, len(hosts))
+	for i, h := range hosts {
+		resolved, resolveErr := h.RecoverRequest(ctx, selector)
+		if resolveErr != nil || resolved.SQL == nil || resolved.SQL.Slot != b.Slot {
+			t.Fatalf("pre-baseline canonical B resolution on %s: %+v %v", configs[i].Runtime.NodeID, resolved, resolveErr)
+		}
+		before[i] = hostApplicationDecisionSnapshot(t, ctx, configs[i], sqlpolicy.ManagedRequestMaterializationPolicy)
+		found := false
+		for _, decision := range before[i] {
+			if decision.slot == quepaxa.Slot(b.Slot) && decision.kind == "sql" && decision.requestID == "contested" {
+				found = true
+			}
+		}
+		if !found {
+			t.Fatalf("canonical B missing from %s exact decision snapshot: %+v", configs[i].Runtime.NodeID, before[i])
+		}
+		t.Logf("canonical SQL baseline %s: %+v", configs[i].Runtime.NodeID, before[i])
+	}
+	for i := 1; i < len(before); i++ {
+		if !reflect.DeepEqual(before[0], before[i]) {
+			t.Fatalf("application decision prefixes did not converge before hint check: %s=%+v %s=%+v", configs[0].Runtime.NodeID, before[0], configs[i].Runtime.NodeID, before[i])
+		}
+	}
 	got, err := hosts[0].RecoverPendingDetailed(ctx)
 	if !errors.Is(err, network.ErrCommitUnknown) || got.SQL != nil || got.KV != nil {
 		t.Fatalf("A hint falsely recovered B: %+v %v", got, err)
 	}
-	explicit, err := hosts[0].RecoverRequest(ctx, network.RequestStatusRequest{Kind: "sql", RequestID: "contested"})
+	explicit, err := hosts[0].RecoverRequest(ctx, selector)
 	if err != nil || explicit.SQL == nil || explicit.SQL.Slot != b.Slot {
 		t.Fatal("explicit canonical selector was changed", err)
 	}
 	if _, err := hosts[0].RecoverPendingDetailed(ctx); !errors.Is(err, network.ErrCommitUnknown) {
 		t.Fatal("explicit B resolution erased A's incompatible hint", err)
 	}
-	if after := hostApplicationDecisionCount(t, ctx, configs[0], sqlpolicy.ManagedRequestMaterializationPolicy); after != before {
-		t.Fatal("intent checking/recovery submitted application command")
+	for i := range hosts {
+		after := hostApplicationDecisionSnapshot(t, ctx, configs[i], sqlpolicy.ManagedRequestMaterializationPolicy)
+		if !reflect.DeepEqual(after, before[i]) {
+			t.Fatalf("intent checking/recovery changed certified application decisions on %s: before=%+v after=%+v", configs[i].Runtime.NodeID, before[i], after)
+		}
+		t.Logf("canonical SQL after recovery %s: %+v", configs[i].Runtime.NodeID, after)
 	}
 	// Fingerprint-equivalent nil/empty intent is allowed; neither a duplicate
 	// submit slot nor caller representation replaces the canonical original.
@@ -146,17 +178,44 @@ func TestInternalRequestHintIntentMustMatchCanonicalOwner(t *testing.T) {
 	if err != nil || !canonical.Applied {
 		t.Fatal("canonical empty KV", err)
 	}
+	kvSelector := network.RequestStatusRequest{Kind: "kv", RequestID: request.RequestID}
+	beforeKV := make([][]managedApplicationDecision, len(hosts))
+	for i, h := range hosts {
+		resolved, resolveErr := h.RecoverRequest(ctx, kvSelector)
+		if resolveErr != nil || resolved.KV == nil || resolved.KV.Slot != canonical.Slot {
+			t.Fatalf("pre-baseline canonical KV resolution on %s: %+v %v", configs[i].Runtime.NodeID, resolved, resolveErr)
+		}
+		beforeKV[i] = hostApplicationDecisionSnapshot(t, ctx, configs[i], sqlpolicy.ManagedRequestMaterializationPolicy)
+		found := false
+		for _, decision := range beforeKV[i] {
+			if decision.slot == quepaxa.Slot(canonical.Slot) && decision.kind == "kv" && decision.requestID == request.RequestID {
+				found = true
+			}
+		}
+		if !found {
+			t.Fatalf("canonical KV missing from %s exact decision snapshot: %+v", configs[i].Runtime.NodeID, beforeKV[i])
+		}
+		t.Logf("canonical KV baseline %s: %+v", configs[i].Runtime.NodeID, beforeKV[i])
+	}
+	for i := 1; i < len(beforeKV); i++ {
+		if !reflect.DeepEqual(beforeKV[0], beforeKV[i]) {
+			t.Fatalf("application decision prefixes did not converge before KV hint check: %s=%+v %s=%+v", configs[0].Runtime.NodeID, beforeKV[0], configs[i].Runtime.NodeID, beforeKV[i])
+		}
+	}
 	p := applicationOriginal{kind: "kv", kv: types.KVCommand{RequestID: request.RequestID, Operation: "put", Key: request.Key}}
 	hosts[2].mu.Lock()
 	hosts[2].rememberRequestOutcome(p, &network.CommitUnknownError{RequestID: p.rawID(), Slot: quepaxa.Slot(canonical.Slot + 100), Cause: context.Canceled}, types.MutationReceipt{})
 	hosts[2].mu.Unlock()
-	before = hostApplicationDecisionCount(t, ctx, configs[0], sqlpolicy.ManagedRequestMaterializationPolicy)
 	recovered, err := hosts[2].RecoverPendingDetailed(ctx)
 	if err != nil || recovered.KV == nil || recovered.KV.Slot != canonical.Slot {
 		t.Fatalf("equivalent intent or noncanonical submit slot rejected: %+v %v", recovered, err)
 	}
-	if after := hostApplicationDecisionCount(t, ctx, configs[0], sqlpolicy.ManagedRequestMaterializationPolicy); after != before {
-		t.Fatal("equivalent recovery submitted another command")
+	for i := range hosts {
+		after := hostApplicationDecisionSnapshot(t, ctx, configs[i], sqlpolicy.ManagedRequestMaterializationPolicy)
+		if !reflect.DeepEqual(after, beforeKV[i]) {
+			t.Fatalf("equivalent KV recovery changed certified application decisions on %s: before=%+v after=%+v", configs[i].Runtime.NodeID, beforeKV[i], after)
+		}
+		t.Logf("canonical KV after recovery %s: %+v", configs[i].Runtime.NodeID, after)
 	}
 }
 

@@ -335,7 +335,13 @@ func ManagedRepairConfig(ctx context.Context, kube *operator.Kubernetes, ref ope
 	if err != nil {
 		return fail(err)
 	}
-	view, err := recovery.OpenReadOnlyViewAtHeadForPolicyWithReconfiguration(ctx, readonly, capture.SourcePrefix, 1, trusted, capture.Head, policy, window, c.EnableReconfiguration)
+	protocol := cfg.Plan.ApplicationProtocol
+	var view *recovery.ReadOnlyView
+	if sqlpolicy.IsManagedAppendOnlyApplicationProtocol(protocol) {
+		view, err = recovery.OpenReadOnlyViewAtHeadForApplicationProtocol(ctx, readonly, capture.SourcePrefix, 1, trusted, capture.Head, policy, window, protocol, c.EnableReconfiguration)
+	} else {
+		view, err = recovery.OpenReadOnlyViewAtHeadForPolicyWithReconfiguration(ctx, readonly, capture.SourcePrefix, 1, trusted, capture.Head, policy, window, c.EnableReconfiguration)
+	}
 	if err != nil {
 		return fail(errors.New("fixed repair source verification failed"))
 	}
@@ -351,7 +357,12 @@ func ManagedRepairConfig(ctx context.Context, kube *operator.Kubernetes, ref ope
 	} else if err != nil {
 		return fail(err)
 	}
-	prepared, err := recovery.LoadPreparedStartupForPolicyWithReconfiguration(ctx, readonly, capture.SourcePrefix, 1, trusted, preparedDir, cfg.Runtime.DataDir, expected, policy, window, c.EnableReconfiguration)
+	var prepared *recovery.VerifiedPreparedStartup
+	if sqlpolicy.IsManagedAppendOnlyApplicationProtocol(protocol) {
+		prepared, err = recovery.LoadPreparedStartupForApplicationProtocol(ctx, readonly, capture.SourcePrefix, 1, trusted, preparedDir, cfg.Runtime.DataDir, expected, policy, window, protocol, c.EnableReconfiguration)
+	} else {
+		prepared, err = recovery.LoadPreparedStartupForPolicyWithReconfiguration(ctx, readonly, capture.SourcePrefix, 1, trusted, preparedDir, cfg.Runtime.DataDir, expected, policy, window, c.EnableReconfiguration)
+	}
 	if err != nil {
 		return fail(errors.New("repair prepared data verification failed"))
 	}

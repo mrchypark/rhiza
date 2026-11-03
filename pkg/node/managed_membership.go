@@ -93,11 +93,20 @@ func (n *Node) captureManagedRepairSource(ctx context.Context, r ManagedMembersh
 	}
 	prefix := path.Join(n.config.ObjStorePrefix, string(n.config.ClusterID))
 	bootstrap := quepaxa.Cluster{ConfigID: 1, Members: n.config.Members}
-	view, err := recovery.OpenReadOnlyViewForPolicyWithReconfiguration(ctx, n.bucket, prefix, 1, bootstrap, n.materializationPolicy(), n.receiptWindow(), n.config.EnableReconfiguration)
+	var view *recovery.ReadOnlyView
+	if isManagedAppendOnlyProtocol(n.managedApplicationProtocol()) {
+		view, err = recovery.OpenReadOnlyViewForApplicationProtocol(ctx, n.bucket, prefix, 1, bootstrap, n.materializationPolicy(), n.receiptWindow(), n.managedApplicationProtocol(), n.config.EnableReconfiguration)
+	} else {
+		view, err = recovery.OpenReadOnlyViewForPolicyWithReconfiguration(ctx, n.bucket, prefix, 1, bootstrap, n.materializationPolicy(), n.receiptWindow(), n.config.EnableReconfiguration)
+	}
 	if err != nil {
 		return ManagedRepairSource{}, err
 	}
-	view, err = recovery.OpenReadOnlyViewAtHeadForPolicyWithReconfiguration(ctx, n.bucket, prefix, 1, bootstrap, view.CapturedHead(), n.materializationPolicy(), n.receiptWindow(), n.config.EnableReconfiguration)
+	if isManagedAppendOnlyProtocol(n.managedApplicationProtocol()) {
+		view, err = recovery.OpenReadOnlyViewAtHeadForApplicationProtocol(ctx, n.bucket, prefix, 1, bootstrap, view.CapturedHead(), n.materializationPolicy(), n.receiptWindow(), n.managedApplicationProtocol(), n.config.EnableReconfiguration)
+	} else {
+		view, err = recovery.OpenReadOnlyViewAtHeadForPolicyWithReconfiguration(ctx, n.bucket, prefix, 1, bootstrap, view.CapturedHead(), n.materializationPolicy(), n.receiptWindow(), n.config.EnableReconfiguration)
+	}
 	if err != nil {
 		return ManagedRepairSource{}, err
 	}

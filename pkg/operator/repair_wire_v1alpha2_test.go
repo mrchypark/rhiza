@@ -10,13 +10,15 @@ import (
 	"regexp"
 	"strconv"
 	"testing"
+
+	"github.com/mrchypark/rhiza/pkg/network"
 )
 
 func TestRepairV1Alpha2ActualWireIntegerTokens(t *testing.T) {
 	for _, large := range []bool{false, true} {
 		t.Run(strconv.FormatBool(large), func(t *testing.T) {
 			f, old := repairTestSetup(t)
-			pending, observation, err := ReserveV1Alpha2Write(context.Background(), f.store, old, old.Authority(), old.Evidence(), V1Alpha2WriteRequest{Kind: "fixture", ID: "repair-pending", Fingerprint: "repair-pending-fingerprint"})
+			pending, observation, err := ReserveV1Alpha2SQLWrite(context.Background(), f.store, old, old.Authority(), old.Evidence(), network.ExecuteRequest{RequestID: "repair-pending", SQL: "CREATE TABLE repair_pending(value INTEGER)"})
 			if err != nil || observation != V1Alpha2CASApplied {
 				t.Fatalf("reserve before wire Begin: %s %v", observation, err)
 			}

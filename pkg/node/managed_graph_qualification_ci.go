@@ -80,7 +80,7 @@ func (n *Node) ObserveManagedGraphQualificationArchive(ctx context.Context, sele
 	}
 	prefix := path.Join(n.config.ObjStorePrefix, string(n.config.ClusterID))
 	bucket := graphQualificationLocatorBucket{Bucket: n.bucket, key: path.Join(prefix, "checkpoint/CURRENT"), locator: data}
-	view, err := recovery.OpenReadOnlyViewForPolicyWithReconfiguration(ctx, bucket, prefix, 1, *n.loadClusterConfig(), sqlpolicy.ManagedGraphRequestMaterializationPolicy, n.receiptWindow(), n.config.EnableReconfiguration)
+	view, err := recovery.OpenReadOnlyViewForApplicationProtocol(ctx, bucket, prefix, 1, *n.loadClusterConfig(), sqlpolicy.ManagedGraphRequestMaterializationPolicy, n.receiptWindow(), n.managedApplicationProtocol(), n.config.EnableReconfiguration)
 	if err != nil {
 		return out, err
 	}

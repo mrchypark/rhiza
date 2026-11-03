@@ -76,8 +76,31 @@ func (n *Node) beginManagedGraphRead(ctx context.Context, consistency string) (c
 			return ctx, nil, network.ErrNotReady
 		}
 	} else if err := n.CheckManagedLocalRead(scoped); err != nil {
-		release()
-		return ctx, nil, fmt.Errorf("managed Graph read local-projection: %w", err)
+		// A local read must not perform ReadIndex or wait for quorum, but an
+		// append-only runtime also cannot expose its projection until the first
+		// certified root is durable. Once normal local-read admission checks
+		// establish a live voter, wait on the publisher's completion signal and
+		// revalidate the projection. The publisher does not call this public read
+		// path, so this wait cannot wait on its own completion.
+		if isManagedAppendOnlyProtocol(n.managedStartup.Identity.ApplicationProtocol) && !n.managedGraphInitialRootComplete() {
+			if _, runtimeErr := n.checkInternalApplicationRuntime(scoped); runtimeErr != nil {
+				release()
+				return ctx, nil, runtimeErr
+			}
+			if !n.managedInitiallyAdmitted.Load() || !n.core.IsVoter() {
+				release()
+				return ctx, nil, network.ErrNotReady
+			}
+			if waitErr := n.ensureManagedGraphInitialRoot(scoped); waitErr != nil {
+				release()
+				return ctx, nil, waitErr
+			}
+			err = n.CheckManagedLocalRead(scoped)
+		}
+		if err != nil {
+			release()
+			return ctx, nil, fmt.Errorf("managed Graph read local-projection: %w", err)
+		}
 	}
 	return scoped, release, nil
 }

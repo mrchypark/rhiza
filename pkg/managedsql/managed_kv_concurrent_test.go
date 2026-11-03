@@ -3,6 +3,7 @@ package managedsql
 import (
 	"bytes"
 	"context"
+	"encoding/hex"
 	"errors"
 	"net/http"
 	"reflect"
@@ -53,6 +54,22 @@ func mixedHostQuorum(t *testing.T, wrappers ...func(int, http.RoundTripper) http
 // protocol. A deduplicated second proposal would still increase this count.
 func hostApplicationDecisionCount(t *testing.T, ctx context.Context, cfg Config, policies ...sqlpolicy.MaterializationPolicy) int {
 	t.Helper()
+	return len(hostApplicationDecisionSnapshot(t, ctx, cfg, policies...))
+}
+
+type managedApplicationDecision struct {
+	slot      quepaxa.Slot
+	hash      string
+	kind      string
+	requestID string
+}
+
+// Snapshot actual certified SQL/KV application decisions over the real
+// private QUIC protocol. Including slot, kind, request ID, and proposal hash
+// distinguishes a new intent from a previously decided value becoming visible
+// on a lagging observer.
+func hostApplicationDecisionSnapshot(t *testing.T, ctx context.Context, cfg Config, policies ...sqlpolicy.MaterializationPolicy) []managedApplicationDecision {
+	t.Helper()
 	policy := sqlpolicy.ManagedSQLKVMaterializationPolicy
 	if len(policies) > 1 {
 		t.Fatal("one explicit peer policy expected")
@@ -86,7 +103,7 @@ func hostApplicationDecisionCount(t *testing.T, ctx context.Context, cfg Config,
 	if err != nil {
 		t.Fatal(err)
 	}
-	count := 0
+	decisions := make([]managedApplicationDecision, 0)
 	for from := quepaxa.Slot(1); from <= tip; {
 		page, err := client.FetchDecisions(ctx, cfg.Runtime.NodeID, from, 128)
 		if err != nil || len(page.Decisions) == 0 {
@@ -96,21 +113,28 @@ func hostApplicationDecisionCount(t *testing.T, ctx context.Context, cfg Config,
 			if decision.Slot > tip {
 				break
 			}
-			_, sql, err := types.DecodeSQLBatch(decision.Value)
+			sqlCommands, sql, err := types.DecodeSQLBatch(decision.Value)
 			if err != nil {
 				t.Fatal(err)
 			}
-			_, kv, err := types.DecodeManagedKVBatch(decision.Value)
+			kvCommands, kv, err := types.DecodeManagedKVBatch(decision.Value)
 			if err != nil {
 				t.Fatal(err)
 			}
-			if sql || kv {
-				count++
+			if sql {
+				for _, command := range sqlCommands {
+					decisions = append(decisions, managedApplicationDecision{slot: decision.Slot, hash: hex.EncodeToString(decision.Hash[:]), kind: "sql", requestID: command.RequestID})
+				}
+			}
+			if kv {
+				for _, command := range kvCommands {
+					decisions = append(decisions, managedApplicationDecision{slot: decision.Slot, hash: hex.EncodeToString(decision.Hash[:]), kind: "kv", requestID: command.RequestID})
+				}
 			}
 			from = decision.Slot + 1
 		}
 	}
-	return count
+	return decisions
 }
 
 func TestManagedKVHostMixedRoundTripAndDetailedRecovery(t *testing.T) {

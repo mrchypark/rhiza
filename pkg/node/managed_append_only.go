@@ -303,10 +303,7 @@ func (n *Node) selectManagedAppendOnlyRoot(ctx context.Context) (*checkpoint.Che
 	if value, found := n.core.CertifiedValue(sealed.DecisionSlot); !found || value.Hash != decision.Hash || !bytes.Equal(value.Value, decision.Value) || sha256.Sum256(decision.Value) != decision.Hash || len(decision.Certificate) == 0 {
 		return nil, nil, fmt.Errorf("selected managed append-only QCKP certificate differs from Core")
 	}
-	if err := n.core.ValidateCheckpointBase(ctx, sealed.CheckpointSeal, decision); err != nil {
-		return nil, nil, err
-	}
-	if err := n.core.ValidateManagedCheckpointCandidate(ctx, quepaxa.ManagedCheckpointCandidate{
+	if err := n.core.ValidateManagedCheckpointRoot(ctx, quepaxa.ManagedCheckpointCandidate{
 		Value: decision.Value, Hash: decision.Hash, Seal: sealed.CheckpointSeal,
 		DecisionSlot: sealed.DecisionSlot, ConfigID: n.core.ConfigIDForSlot(sealed.DecisionSlot),
 	}); err != nil {
@@ -377,7 +374,10 @@ func (n *Node) promoteManagedAppendOnlySeal(ctx context.Context, sealed quepaxa.
 	if err != nil || !checkpointValue || decoded.Index != sealed.Index || decoded.RootHash != sealed.RootHash || !exists || local.Hash != d.Hash || !bytes.Equal(local.Value, d.Value) {
 		return fmt.Errorf("managed append-only archive does not contain the selected exact QCKP")
 	}
-	if err := n.core.ValidateCheckpointBase(ctx, sealed.CheckpointSeal, d); err != nil {
+	if err := n.core.ValidateManagedCheckpointRoot(ctx, quepaxa.ManagedCheckpointCandidate{
+		Value: d.Value, Hash: d.Hash, Seal: sealed.CheckpointSeal,
+		DecisionSlot: sealed.DecisionSlot, ConfigID: n.core.ConfigIDForSlot(sealed.DecisionSlot),
+	}); err != nil {
 		return err
 	}
 	locator := checkpoint.ManagedAppendOnlyLocator{Policy: int(n.materializationPolicy()), Index: uint64(sealed.Index), RootHash: sealed.RootHash, SealDecisionSlot: uint64(d.Slot), SealDecisionHash: d.Hash}

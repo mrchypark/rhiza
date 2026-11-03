@@ -14,6 +14,7 @@ import (
 	"os/exec"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -77,11 +78,14 @@ func TestSQLWireStoreInterruptedPutAndSDKControls(t *testing.T) {
 	// Hold an actual SDK PUT before the mock consumes its body. Caller
 	// cancellation must return to the SDK caller; after releasing the existing
 	// gate, the mock reads the real interrupted request body and stores nothing.
+	// The reader's remaining-byte counter makes this a proven partial upload,
+	// rather than relying on a payload size to outrun local buffering.
 	cancelKey := control.finalPrefix + "/request-cancel/caller.block"
 	callerCtx, cancelCaller := context.WithCancel(ctx)
+	callerBody := newObservedSDKUploadReader(bytes.Repeat([]byte("c"), 4<<20))
 	callerResult := make(chan error, 1)
 	go func() {
-		callerResult <- bucket.Upload(callerCtx, cancelKey, bytes.NewReader(bytes.Repeat([]byte("c"), 1<<20)))
+		callerResult <- bucket.Upload(callerCtx, cancelKey, callerBody)
 	}()
 	select {
 	case path := <-control.putReady:
@@ -91,6 +95,11 @@ func TestSQLWireStoreInterruptedPutAndSDKControls(t *testing.T) {
 	case <-ctx.Done():
 		cancelCaller()
 		t.Fatalf("SDK PUT did not reach caller-cancel gate: %v", ctx.Err())
+	}
+	if remaining := callerBody.remaining.Load(); remaining == 0 {
+		cancelCaller()
+		release()
+		t.Fatalf("SDK source was exhausted before server reached the partial-body gate")
 	}
 	cancelCaller()
 	select {
@@ -142,6 +151,29 @@ func TestSQLWireStoreInterruptedPutAndSDKControls(t *testing.T) {
 	if _, ok := readObject(freshKey); ok {
 		t.Fatal("truncated fresh-key PUT stored a partial object")
 	}
+}
+
+// observedSDKUploadReader exposes known size and atomic source progress for the
+// real SDK. The caller can prove bytes remain unsent when the server has read
+// only its gated prefix and the request is canceled.
+type observedSDKUploadReader struct {
+	reader    *bytes.Reader
+	size      int64
+	remaining atomic.Int64
+}
+
+func newObservedSDKUploadReader(data []byte) *observedSDKUploadReader {
+	r := &observedSDKUploadReader{reader: bytes.NewReader(data), size: int64(len(data))}
+	r.remaining.Store(r.size)
+	return r
+}
+
+func (r *observedSDKUploadReader) ObjectSize() (int64, error) { return r.size, nil }
+
+func (r *observedSDKUploadReader) Read(p []byte) (int, error) {
+	n, err := r.reader.Read(p)
+	r.remaining.Store(int64(r.reader.Len()))
+	return n, err
 }
 
 func TestSQLWireStoreNilObserverPreservesFailureSignal(t *testing.T) {

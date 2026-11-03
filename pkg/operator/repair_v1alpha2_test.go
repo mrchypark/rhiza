@@ -29,8 +29,9 @@ type repairFixture struct {
 func repairTestSetup(t *testing.T) (*repairFixture, V1Alpha2AdmissionSnapshot) {
 	t.Helper()
 	ctx := context.Background()
-	server, kube := phase9Setup(t, phase8Cluster)
-	seed, err := ReconcileV1Alpha2ManagedInitialization(ctx, kube, phase2Ref, phase9RuntimeProfile())
+	profile := phase9RuntimeProfile()
+	server, kube := phase9Setup(t, phase9ClusterWithProtocol(profile.ApplicationProtocol), profile)
+	seed, err := ReconcileV1Alpha2ManagedInitialization(ctx, kube, phase2Ref, profile)
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -37,6 +37,10 @@ func phase9RuntimeProfile() V1Alpha2RuntimeProfile {
 	return V1Alpha2RuntimeProfile{InitImage: "reference:v1", PeerPort: 9090, EvidenceFormat: sqlpolicy.ManagedRequestAppendOnlyApplicationProtocol, ApplicationProtocol: sqlpolicy.ManagedRequestAppendOnlyApplicationProtocol, ProfileSecretName: "runtime", Storage: types.ExecutionConfig{AdminToken: "private-admin", ObjStoreProvider: "s3", ObjStoreBucket: "bucket", ObjStoreEndpoint: "s3.example.test"}}
 }
 
+func phase9CurrentManagedCluster() string {
+	return phase9ClusterWithProtocol(phase9RuntimeProfile().ApplicationProtocol)
+}
+
 func phase9ManagedList(ctx context.Context, kube *Kubernetes) error {
 	return initializeV1Alpha2ListWith(ctx, kube, func(ref V1Alpha2ClusterRef) error {
 		_, err := ReconcileV1Alpha2ManagedInitialization(ctx, kube, ref, phase9RuntimeProfile())
@@ -51,7 +55,7 @@ func phase9Plan(_ context.Context, ref V1Alpha2ClusterRef, logicalID, deployment
 }
 
 func TestPhase9InitializerRequiresPlanBeforeCreate(t *testing.T) {
-	s, kube := phase9Setup(t, phase8Cluster)
+	s, kube := phase9Setup(t, phase9CurrentManagedCluster())
 	if _, err := ReconcileV1Alpha2Initialization(context.Background(), kube, phase2Ref); err == nil {
 		t.Fatal("missing runtime plan accepted")
 	}
@@ -72,7 +76,7 @@ func TestPhase9InitializerLegacyPlanRemainsInert(t *testing.T) {
 }
 
 func TestPhase9InitializerRejectsAssignmentWithoutGenesisBeforeCreate(t *testing.T) {
-	cluster := strings.Replace(phase8Cluster, `"status":{`, `"status":{"applicationInit":{},`, 1)
+	cluster := strings.Replace(phase9CurrentManagedCluster(), `"status":{`, `"status":{"applicationInit":{},`, 1)
 	if cluster == phase8Cluster {
 		t.Fatal("fixture has no status object")
 	}
@@ -86,14 +90,15 @@ func TestPhase9InitializerRejectsAssignmentWithoutGenesisBeforeCreate(t *testing
 }
 
 func TestPhase9InitializerListPaginationGuards(t *testing.T) {
-	first := `{"apiVersion":"rhiza.mrchypark.dev/v1alpha2","kind":"RhizaClusterList","metadata":{"resourceVersion":"1","continue":"next"},"items":[` + phase8Cluster + `]}`
+	currentCluster := phase9CurrentManagedCluster()
+	first := `{"apiVersion":"rhiza.mrchypark.dev/v1alpha2","kind":"RhizaClusterList","metadata":{"resourceVersion":"1","continue":"next"},"items":[` + currentCluster + `]}`
 	for _, test := range []struct{ name, second string }{
 		{"continuation loop", `{"apiVersion":"rhiza.mrchypark.dev/v1alpha2","kind":"RhizaClusterList","metadata":{"resourceVersion":"1","continue":"next"},"items":[]}`},
 		{"version change", `{"apiVersion":"rhiza.mrchypark.dev/v1alpha2","kind":"RhizaClusterList","metadata":{"resourceVersion":"2"},"items":[]}`},
-		{"duplicate uid across pages", `{"apiVersion":"rhiza.mrchypark.dev/v1alpha2","kind":"RhizaClusterList","metadata":{"resourceVersion":"1"},"items":[` + strings.Replace(phase8Cluster, `"name":"cluster"`, `"name":"other"`, 1) + `]}`},
+		{"duplicate uid across pages", `{"apiVersion":"rhiza.mrchypark.dev/v1alpha2","kind":"RhizaClusterList","metadata":{"resourceVersion":"1"},"items":[` + strings.Replace(currentCluster, `"name":"cluster"`, `"name":"other"`, 1) + `]}`},
 	} {
 		t.Run(test.name, func(t *testing.T) {
-			s, _ := phase9Setup(t, phase8Cluster)
+			s, _ := phase9Setup(t, currentCluster)
 			kube := phase2Store(t, func(r *http.Request) (*http.Response, error) {
 				if strings.HasSuffix(r.URL.Path, "/rhizaclusters") {
 					if r.URL.Query().Get("continue") != "" {
@@ -252,7 +257,7 @@ func phase9Setup(t *testing.T, cluster string, profiles ...V1Alpha2RuntimeProfil
 }
 
 func TestPhase9InitializerCreatesOnceAndPreservesStatus(t *testing.T) {
-	s, kube := phase9Setup(t, phase8Cluster)
+	s, kube := phase9Setup(t, phase9CurrentManagedCluster())
 	first, err := ReconcileV1Alpha2ManagedInitialization(context.Background(), kube, phase2Ref, phase9RuntimeProfile())
 	if err != nil {
 		t.Fatal(err)
@@ -283,7 +288,7 @@ func TestPhase9InitializerCreatesOnceAndPreservesStatus(t *testing.T) {
 }
 
 func TestPhase9InitializerRejectsMissingIntent(t *testing.T) {
-	s, kube := phase9Setup(t, strings.Replace(phase8Cluster, `"genesisIntent":"Create",`, "", 1))
+	s, kube := phase9Setup(t, strings.Replace(phase9CurrentManagedCluster(), `"genesisIntent":"Create",`, "", 1))
 	if _, err := ReconcileV1Alpha2ManagedInitialization(context.Background(), kube, phase2Ref, phase9RuntimeProfile()); err == nil {
 		t.Fatal("missing intent accepted")
 	}
@@ -295,7 +300,7 @@ func TestPhase9InitializerRejectsMissingIntent(t *testing.T) {
 func TestPhase9InitializerRejectsUnsafeExistingDeployment(t *testing.T) {
 	for _, mutation := range []string{"replicas", "owner", "template", "generation", "uid"} {
 		t.Run(mutation, func(t *testing.T) {
-			s, kube := phase9Setup(t, phase8Cluster)
+			s, kube := phase9Setup(t, phase9CurrentManagedCluster())
 			if _, err := ReconcileV1Alpha2ManagedInitialization(context.Background(), kube, phase2Ref, phase9RuntimeProfile()); err != nil {
 				t.Fatal(err)
 			}
@@ -324,7 +329,7 @@ func TestPhase9InitializerRejectsUnsafeExistingDeployment(t *testing.T) {
 			if sameJSON(b, []byte(s.deployment)) {
 				t.Fatal("fixture mutation did not change deployment")
 			}
-			s.deployment, s.cluster, s.posts, s.puts = string(b), phase8Cluster, 0, 0
+			s.deployment, s.cluster, s.posts, s.puts = string(b), phase9CurrentManagedCluster(), 0, 0
 			if _, err := ReconcileV1Alpha2ManagedInitialization(context.Background(), kube, phase2Ref, phase9RuntimeProfile()); err == nil {
 				t.Fatal("unsafe deployment accepted")
 			}
@@ -345,12 +350,12 @@ func TestPhase9InitializerCreateConflictAndLostResponse(t *testing.T) {
 		{"lost response without proof", false, true, true, true},
 	} {
 		t.Run(test.name, func(t *testing.T) {
-			s, kube := phase9Setup(t, phase8Cluster)
+			s, kube := phase9Setup(t, phase9CurrentManagedCluster())
 			if test.preexisting {
 				if _, err := ReconcileV1Alpha2ManagedInitialization(context.Background(), kube, phase2Ref, phase9RuntimeProfile()); err != nil {
 					t.Fatal(err)
 				}
-				s.cluster, s.posts, s.puts = phase8Cluster, 0, 0
+				s.cluster, s.posts, s.puts = phase9CurrentManagedCluster(), 0, 0
 			}
 			s.lostPost, s.failGet = test.lost, test.failGet
 			_, err := ReconcileV1Alpha2ManagedInitialization(context.Background(), kube, phase2Ref, phase9RuntimeProfile())
@@ -385,8 +390,8 @@ func TestPhase9InitializerImagePullDefaults(t *testing.T) {
 	} {
 		for _, valid := range []bool{true, false} {
 			t.Run(test.image+"/valid="+strconv.FormatBool(valid), func(t *testing.T) {
-				cluster := strings.Replace(phase8Cluster, `"image":"image"`, `"image":`+strconv.Quote(test.image), 1)
-				if cluster == phase8Cluster {
+				cluster := strings.Replace(phase9CurrentManagedCluster(), `"image":"image"`, `"image":`+strconv.Quote(test.image), 1)
+				if cluster == phase9CurrentManagedCluster() {
 					t.Fatal("cluster image mutation did not apply")
 				}
 				s, kube := phase9Setup(t, cluster)
@@ -428,7 +433,7 @@ func TestPhase9InitializerImagePullDefaults(t *testing.T) {
 }
 
 func TestPhase9InitializerConcurrentCreateCAS(t *testing.T) {
-	s, kube := phase9Setup(t, phase8Cluster)
+	s, kube := phase9Setup(t, phase9CurrentManagedCluster())
 	s.arrived, s.release, s.committed = make(chan struct{}, 2), make(chan struct{}), make(chan struct{})
 	errs := make(chan error, 2)
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
@@ -464,19 +469,20 @@ func TestPhase9InitializerConcurrentCreateCAS(t *testing.T) {
 }
 
 func TestPhase9InitializerListGuards(t *testing.T) {
+	currentCluster := phase9CurrentManagedCluster()
 	for _, test := range []struct {
 		name, body string
 		wantErr    bool
 	}{
-		{"complete", `{"apiVersion":"rhiza.mrchypark.dev/v1alpha2","kind":"RhizaClusterList","metadata":{"resourceVersion":"1"},"items":[` + phase8Cluster + `]}`, false},
+		{"complete", `{"apiVersion":"rhiza.mrchypark.dev/v1alpha2","kind":"RhizaClusterList","metadata":{"resourceVersion":"1"},"items":[` + currentCluster + `]}`, false},
 		{"missing items", `{"apiVersion":"rhiza.mrchypark.dev/v1alpha2","kind":"RhizaClusterList","metadata":{"resourceVersion":"1"}}`, true},
-		{"duplicate", `{"apiVersion":"rhiza.mrchypark.dev/v1alpha2","kind":"RhizaClusterList","metadata":{"resourceVersion":"1"},"items":[` + phase8Cluster + `,` + phase8Cluster + `]}`, true},
-		{"duplicate uid", `{"apiVersion":"rhiza.mrchypark.dev/v1alpha2","kind":"RhizaClusterList","metadata":{"resourceVersion":"1"},"items":[` + phase8Cluster + `,` + strings.Replace(phase8Cluster, `"name":"cluster"`, `"name":"other"`, 1) + `]}`, true},
+		{"duplicate", `{"apiVersion":"rhiza.mrchypark.dev/v1alpha2","kind":"RhizaClusterList","metadata":{"resourceVersion":"1"},"items":[` + currentCluster + `,` + currentCluster + `]}`, true},
+		{"duplicate uid", `{"apiVersion":"rhiza.mrchypark.dev/v1alpha2","kind":"RhizaClusterList","metadata":{"resourceVersion":"1"},"items":[` + currentCluster + `,` + strings.Replace(currentCluster, `"name":"cluster"`, `"name":"other"`, 1) + `]}`, true},
 		{"missing intent", `{"apiVersion":"rhiza.mrchypark.dev/v1alpha2","kind":"RhizaClusterList","metadata":{"resourceVersion":"1"},"items":[` + strings.Replace(phase8Cluster, `"genesisIntent":"Create",`, "", 1) + `]}`, false},
-		{"partial page", `{"apiVersion":"rhiza.mrchypark.dev/v1alpha2","kind":"RhizaClusterList","metadata":{"resourceVersion":"1","continue":"next"},"items":[` + phase8Cluster + `]}`, true},
+		{"partial page", `{"apiVersion":"rhiza.mrchypark.dev/v1alpha2","kind":"RhizaClusterList","metadata":{"resourceVersion":"1","continue":"next"},"items":[` + currentCluster + `]}`, true},
 	} {
 		t.Run(test.name, func(t *testing.T) {
-			s, _ := phase9Setup(t, phase8Cluster)
+			s, _ := phase9Setup(t, currentCluster)
 			kube := phase2Store(t, func(r *http.Request) (*http.Response, error) {
 				if strings.HasSuffix(r.URL.Path, "/rhizaclusters") {
 					if r.URL.Query().Get("continue") != "" {
@@ -504,7 +510,7 @@ func TestPhase9InitializerListGuards(t *testing.T) {
 }
 
 func TestPhase9InitializerNeverRecreatesLaterGeneration(t *testing.T) {
-	s, kube := phase9Setup(t, phase8Cluster)
+	s, kube := phase9Setup(t, phase9CurrentManagedCluster())
 	if _, err := ReconcileV1Alpha2ManagedInitialization(context.Background(), kube, phase2Ref, phase9RuntimeProfile()); err != nil {
 		t.Fatal(err)
 	}
@@ -534,7 +540,7 @@ func TestPhase9InitializerNeverRecreatesLaterGeneration(t *testing.T) {
 }
 
 func TestPhase9InitializerIntervalAndCancellation(t *testing.T) {
-	_, kube := phase9Setup(t, phase8Cluster)
+	_, kube := phase9Setup(t, phase9CurrentManagedCluster())
 	if err := RunV1Alpha2Initialization(context.Background(), kube, 0); err == nil {
 		t.Fatal("zero interval accepted")
 	}
@@ -561,7 +567,7 @@ func TestPhase9InitializerGenesisCASConflictAndLostResponse(t *testing.T) {
 		{"unapplied response lost", false, true, false, true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			s, kube := phase9Setup(t, phase8Cluster)
+			s, kube := phase9Setup(t, phase9CurrentManagedCluster())
 			s.conflict, s.timeout, s.apply = tc.conflict, tc.timeout, tc.apply
 			_, err := ReconcileV1Alpha2ManagedInitialization(context.Background(), kube, phase2Ref, phase9RuntimeProfile())
 			if (err != nil) != tc.wantErr || s.puts != 1 {
@@ -597,7 +603,7 @@ func TestPhase9InitializerGenesisCASConflictAndLostResponse(t *testing.T) {
 }
 
 func TestPhase9InitializerRefusesSpecChangeBeforeCAS(t *testing.T) {
-	s, kube := phase9Setup(t, phase8Cluster)
+	s, kube := phase9Setup(t, phase9CurrentManagedCluster())
 	s.onCreate = func() { s.cluster = strings.Replace(s.cluster, `"image":"image"`, `"image":"changed"`, 1) }
 	if _, err := ReconcileV1Alpha2ManagedInitialization(context.Background(), kube, phase2Ref, phase9RuntimeProfile()); err == nil || s.puts != 0 {
 		t.Fatalf("changed spec accepted: %v puts=%d", err, s.puts)
@@ -605,12 +611,12 @@ func TestPhase9InitializerRefusesSpecChangeBeforeCAS(t *testing.T) {
 }
 
 func TestPhase9InitializerManagedLoopCommitsAndCancels(t *testing.T) {
-	s, _ := phase9Setup(t, phase8Cluster)
+	s, _ := phase9Setup(t, phase9CurrentManagedCluster())
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	kube := phase2Store(t, func(r *http.Request) (*http.Response, error) {
 		if strings.HasSuffix(r.URL.Path, "/rhizaclusters") {
-			return phase2Response(200, `{"apiVersion":"rhiza.mrchypark.dev/v1alpha2","kind":"RhizaClusterList","metadata":{"resourceVersion":"1"},"items":[`+phase8Cluster+`]}`), nil
+			return phase2Response(200, `{"apiVersion":"rhiza.mrchypark.dev/v1alpha2","kind":"RhizaClusterList","metadata":{"resourceVersion":"1"},"items":[`+phase9CurrentManagedCluster()+`]}`), nil
 		}
 		response, err := s.roundTrip(r)
 		if r.Method == http.MethodPut && err == nil && response.StatusCode == 200 {

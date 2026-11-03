@@ -57,6 +57,16 @@ func validPreparedIdentity(i PreparedStartupIdentity) bool {
 	return i.ClusterUID != "" && i.Generation >= 0 && i.DeploymentUID != "" && i.PodUID != "" && i.NodeID != "" && i.SourceBinding != "" && i.ConfigDigest != ""
 }
 
+func validatePreparedProfile(identity PreparedStartupIdentity, policy sqlpolicy.MaterializationPolicy, window uint64, applicationProtocol string) error {
+	if err := validateReadOnlyProfile(policy, window, applicationProtocol); err != nil {
+		return err
+	}
+	if (policy == sqlpolicy.ManagedRequestMaterializationPolicy || policy == sqlpolicy.ManagedGraphRequestMaterializationPolicy) && identity.Generation != 0 {
+		return fmt.Errorf("final managed recovery requires generation 0")
+	}
+	return nil
+}
+
 // PublishPreparedStartup prepares a new directory, then syncs data and writes a
 // completion marker. The caller controls its parent and excludes replacement.
 // A failed attempt remains in place. An error after marker publication is an
@@ -69,6 +79,12 @@ func PublishPreparedStartup(ctx context.Context, view *ReadOnlyView, targetDir s
 func PublishPreparedStartupForPolicy(ctx context.Context, view *ReadOnlyView, targetDir string, identity PreparedStartupIdentity, expected sqlpolicy.MaterializationPolicy, window uint64) error {
 	version, err := preparedVersion(expected, window)
 	if err != nil {
+		return err
+	}
+	if view == nil {
+		return fmt.Errorf("read-only view is not verified")
+	}
+	if err := validatePreparedProfile(identity, expected, window, view.applicationProtocol); err != nil {
 		return err
 	}
 	if !validPreparedIdentity(identity) {
@@ -165,14 +181,27 @@ func LoadPreparedStartup(ctx context.Context, bucket objstore.Bucket, prefix str
 }
 
 func LoadPreparedStartupForPolicy(ctx context.Context, bucket objstore.Bucket, prefix string, configID uint, bootstrap quepaxa.Cluster, handoffDir, verifiedTargetDir string, expected PreparedStartupIdentity, policy sqlpolicy.MaterializationPolicy, window uint64) (*VerifiedPreparedStartup, error) {
-	return loadPreparedStartupForPolicy(ctx, bucket, prefix, configID, bootstrap, handoffDir, verifiedTargetDir, expected, policy, window, nil)
+	return loadPreparedStartupForPolicy(ctx, bucket, prefix, configID, bootstrap, handoffDir, verifiedTargetDir, expected, policy, window, nil, "")
 }
 
 func LoadPreparedStartupForPolicyWithReconfiguration(ctx context.Context, bucket objstore.Bucket, prefix string, configID uint, bootstrap quepaxa.Cluster, handoffDir, verifiedTargetDir string, expected PreparedStartupIdentity, policy sqlpolicy.MaterializationPolicy, window uint64, reconfiguration bool) (*VerifiedPreparedStartup, error) {
-	return loadPreparedStartupForPolicy(ctx, bucket, prefix, configID, bootstrap, handoffDir, verifiedTargetDir, expected, policy, window, &reconfiguration)
+	return loadPreparedStartupForPolicy(ctx, bucket, prefix, configID, bootstrap, handoffDir, verifiedTargetDir, expected, policy, window, &reconfiguration, "")
 }
 
-func loadPreparedStartupForPolicy(ctx context.Context, bucket objstore.Bucket, prefix string, configID uint, bootstrap quepaxa.Cluster, handoffDir, verifiedTargetDir string, expected PreparedStartupIdentity, policy sqlpolicy.MaterializationPolicy, window uint64, trustedReconfiguration *bool) (*VerifiedPreparedStartup, error) {
+// LoadPreparedStartupForApplicationProtocol verifies the handoff and captured
+// source head against a trusted final append-only protocol before independent
+// reconstruction. The protocol is never inferred from files or manifest data.
+func LoadPreparedStartupForApplicationProtocol(ctx context.Context, bucket objstore.Bucket, prefix string, configID uint, bootstrap quepaxa.Cluster, handoffDir, verifiedTargetDir string, expected PreparedStartupIdentity, policy sqlpolicy.MaterializationPolicy, window uint64, applicationProtocol string, reconfiguration bool) (*VerifiedPreparedStartup, error) {
+	if err := validatePreparedProfile(expected, policy, window, applicationProtocol); err != nil {
+		return nil, err
+	}
+	return loadPreparedStartupForPolicy(ctx, bucket, prefix, configID, bootstrap, handoffDir, verifiedTargetDir, expected, policy, window, &reconfiguration, applicationProtocol)
+}
+
+func loadPreparedStartupForPolicy(ctx context.Context, bucket objstore.Bucket, prefix string, configID uint, bootstrap quepaxa.Cluster, handoffDir, verifiedTargetDir string, expected PreparedStartupIdentity, policy sqlpolicy.MaterializationPolicy, window uint64, trustedReconfiguration *bool, applicationProtocol string) (*VerifiedPreparedStartup, error) {
+	if err := validatePreparedProfile(expected, policy, window, applicationProtocol); err != nil {
+		return nil, err
+	}
 	version, err := preparedVersion(policy, window)
 	if err != nil {
 		return nil, err
@@ -241,12 +270,12 @@ func loadPreparedStartupForPolicy(ctx context.Context, bucket objstore.Bucket, p
 		if err := validateMixedPreparedInventory(handoffDir, true); err != nil {
 			return nil, err
 		}
-		handoffState, handoffTip, err = inspectManagedFileForPolicy(ctx, filepath.Join(handoffDir, "sqlite.db"), window, policy)
+		handoffState, handoffTip, err = inspectManagedFileForPolicy(ctx, filepath.Join(handoffDir, "sqlite.db"), window, policy, applicationProtocol)
 		if err != nil {
 			return nil, fmt.Errorf("inspect mixed handoff: %w", err)
 		}
 	}
-	view, err := openReadOnlyViewAtHeadForPolicy(ctx, bucket, prefix, configID, bootstrap, m.Head, policy, window, m.GraphLocator, trustedReconfiguration)
+	view, err := openReadOnlyViewAtHeadForPolicy(ctx, bucket, prefix, configID, bootstrap, m.Head, policy, window, m.GraphLocator, trustedReconfiguration, applicationProtocol)
 	if err != nil {
 		return nil, err
 	}
@@ -301,7 +330,7 @@ func loadPreparedStartupForPolicy(ctx context.Context, bucket objstore.Bucket, p
 		if err := validateMixedPreparedInventory(verifiedTargetDir, false); err != nil {
 			return nil, err
 		}
-		state, tip, err := inspectManagedFileForPolicy(ctx, verified.SQLitePath, window, policy)
+		state, tip, err := inspectManagedFileForPolicy(ctx, verified.SQLitePath, window, policy, applicationProtocol)
 		if err != nil {
 			return nil, err
 		}

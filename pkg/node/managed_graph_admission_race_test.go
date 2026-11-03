@@ -1,6 +1,7 @@
 package node
 
 import (
+	"bytes"
 	"context"
 	"encoding/hex"
 	"errors"
@@ -13,11 +14,12 @@ import (
 
 	"github.com/mrchypark/rhiza/internal/sqlpolicy"
 	"github.com/mrchypark/rhiza/internal/types"
-	"github.com/mrchypark/rhiza/pkg/materializer"
+	"github.com/mrchypark/rhiza/pkg/checkpoint"
 	"github.com/mrchypark/rhiza/pkg/network"
 	"github.com/mrchypark/rhiza/pkg/qlog"
 	"github.com/mrchypark/rhiza/pkg/quepaxa"
 	"github.com/mrchypark/rhiza/pkg/recovery"
+	thanosobjstore "github.com/thanos-io/objstore"
 )
 
 // graphAdmissionRaceTransport uses real Core.Record calls. For the actual
@@ -78,60 +80,55 @@ func (p *graphAdmissionRaceTransport) releaseHeldUncertified() {
 	p.releaseHeld()
 }
 
-func TestManagedGraphAdmissionRejectsStableActualPendingControl(t *testing.T) {
+func TestManagedGraphAdmissionJoinsStableActualPendingControl(t *testing.T) {
 	fixture := newManagedGraphAdmissionRaceFixture(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 	proposal := fixture.startHeldControl(ctx)
 	fixture.awaitPendingControl(t)
+	wantControl := managedGraphRaceControlValue()
 	gate := make(chan error, 1)
 	go func() { gate <- fixture.node.admitInternalApplication(ctx) }()
-
-	// A stable pending recorder entry must retain the current rejection. The
-	// root fix must not turn this state into an unconditional wait/retry.
-	var admissionErr error
-	select {
-	case admissionErr = <-gate:
-	case <-time.After(2 * time.Second):
-		t.Fatal("admission waited on a stable pending recorder entry")
-	}
-	if admissionErr == nil || !strings.Contains(admissionErr.Error(), "target=8 recorded=9 certified=8 applied=8") {
-		t.Fatalf("stable pending state did not preserve exact unresolved-history rejection: %v", admissionErr)
-	}
+	awaitManagedGraphAdmissionObservation(t, fixture, gate, 9)
 
 	fixture.transport.releaseHeld()
 	if err := awaitProposal(t, proposal); err != nil {
 		t.Fatalf("actual control did not certify after release: %v", err)
 	}
-	if fixture.node.core.Tip() != 9 || fixture.node.material.Tip() != 8 {
-		t.Fatalf("unexpected state after released control: certified=%d applied=%d", fixture.node.core.Tip(), fixture.node.material.Tip())
+	select {
+	case err := <-gate:
+		if err != nil {
+			t.Fatalf("admission did not complete after the exact owned barrier: %v", err)
+		}
+	case <-ctx.Done():
+		t.Fatal("admission did not complete after barrier release", ctx.Err())
 	}
+	assertManagedGraphRaceBarrierSuffix(t, fixture, wantControl)
 }
 
-func TestManagedGraphAdmissionPendingControlRejectsWithoutProposal(t *testing.T) {
+func TestManagedGraphAdmissionPendingControlCompletesSeparateBarrier(t *testing.T) {
 	fixture := newManagedGraphAdmissionRaceFixture(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 	proposal := fixture.startHeldControl(ctx)
 	fixture.awaitPendingControl(t)
+	wantControl := managedGraphRaceControlValue()
 	gate := make(chan error, 1)
 	go func() { gate <- fixture.node.admitInternalApplication(ctx) }()
-	var admissionErr error
-	select {
-	case admissionErr = <-gate:
-	case <-time.After(2 * time.Second):
-		t.Fatal("admission waited on a stable pending recorder entry")
-	}
-	if admissionErr == nil || !strings.Contains(admissionErr.Error(), "target=8 recorded=9 certified=8 applied=8") {
-		t.Fatalf("stable pending state did not preserve exact unresolved-history rejection: %v", admissionErr)
-	}
+	awaitManagedGraphAdmissionObservation(t, fixture, gate, 9)
 	fixture.transport.releaseHeld()
 	if err := awaitProposal(t, proposal); err != nil {
 		t.Fatalf("actual control did not certify after cleanup release: %v", err)
 	}
-	if got := fixture.node.core.Tip(); got != 9 {
-		t.Fatalf("admission submitted an extra proposal: certified tip=%d, want only existing control at 9", got)
+	select {
+	case err := <-gate:
+		if err != nil {
+			t.Fatalf("admission failed after pending barrier completed: %v", err)
+		}
+	case <-ctx.Done():
+		t.Fatal("admission did not finish", ctx.Err())
 	}
+	assertManagedGraphRaceBarrierSuffix(t, fixture, wantControl)
 }
 
 func TestManagedGraphAdmissionReplaysStableCertifiedApplyGap(t *testing.T) {
@@ -473,11 +470,12 @@ func TestManagedGraphAdmissionOwnedControlWithoutCertificateRemainsFailClosed(t 
 	if _, ok := fixture.node.core.CertifiedValue(9); ok {
 		t.Fatal("test unexpectedly certified the pending control")
 	}
-	if err := fixture.node.admitInternalApplication(ctx); err == nil || !strings.Contains(err.Error(), "target=8 recorded=9 certified=8 applied=8") {
+	if err := fixture.node.admitInternalApplication(ctx); err == nil || !strings.Contains(err.Error(), "target=9 recorded=9 certified=8 applied=8") {
 		t.Fatalf("uncertified owned control did not preserve fail-closed refusal: %v", err)
 	}
-	if fixture.node.core.Tip() != 8 {
-		t.Fatalf("admission submitted after uncertified control: tip=%d", fixture.node.core.Tip())
+	progress := fixture.node.core.RuntimeProgressSnapshot()
+	if fixture.node.core.Tip() != 8 || progress.RecorderTip != 9 || progress.CertifiedTip != 8 || fixture.node.material.Tip() != 8 {
+		t.Fatalf("admission changed uncertified control state: progress=%+v applied=%d", progress, fixture.node.material.Tip())
 	}
 }
 
@@ -493,6 +491,14 @@ func TestManagedGraphAdmissionRejectsEarlyUnknownOwnerReturn(t *testing.T) {
 	owner := make(chan error, 1)
 	go func() { owner <- fixture.node.advanceManagedGraphCheckpointCut(ownerCtx) }()
 	fixture.awaitPendingControl(t)
+	fixture.node.managedGraphControlMu.Lock()
+	owned := fixture.node.managedGraphControl
+	if owned == nil {
+		fixture.node.managedGraphControlMu.Unlock()
+		t.Fatal("owner did not publish its actual control operation")
+	}
+	wantControl := append([]byte(nil), owned.value...)
+	fixture.node.managedGraphControlMu.Unlock()
 	cancelOwner()
 	ownerErr := awaitProposal(t, owner)
 	if !errors.Is(ownerErr, network.ErrCommitUnknown) {
@@ -501,26 +507,23 @@ func TestManagedGraphAdmissionRejectsEarlyUnknownOwnerReturn(t *testing.T) {
 
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	if err := fixture.node.admitInternalApplication(ctx); err == nil || !strings.Contains(err.Error(), "target=8 recorded=9 certified=8 applied=8") {
-		t.Fatalf("admission trusted early owner return without terminal success: %v", err)
+	progress := fixture.node.core.RuntimeProgressSnapshot()
+	if fixture.node.core.Tip() != 8 || progress.RecorderTip != 9 || progress.CertifiedTip != 8 || fixture.node.material.Tip() != 8 {
+		t.Fatalf("foreground advanced before worker completion: progress=%+v applied=%d", progress, fixture.node.material.Tip())
 	}
-	if fixture.node.core.Tip() != 8 {
-		t.Fatalf("foreground advanced before worker completion: tip=%d", fixture.node.core.Tip())
-	}
+	gate := make(chan error, 1)
+	go func() { gate <- fixture.node.admitInternalApplication(ctx) }()
+	awaitManagedGraphAdmissionObservation(t, fixture, gate, 9)
 	fixture.transport.releaseHeld()
-	deadline := time.Now().Add(3 * time.Second)
-	for time.Now().Before(deadline) {
-		if fixture.node.core.Tip() == 9 && fixture.node.material.Tip() == 9 {
-			break
+	select {
+	case err := <-gate:
+		if err != nil {
+			t.Fatalf("admission did not complete after actual owner recovery: %v", err)
 		}
-		time.Sleep(time.Millisecond)
+	case <-ctx.Done():
+		t.Fatal("admission did not finish after release", ctx.Err())
 	}
-	if fixture.node.core.Tip() != 9 || fixture.node.material.Tip() != 9 {
-		t.Fatalf("detached actual worker did not complete after release: certified=%d applied=%d", fixture.node.core.Tip(), fixture.node.material.Tip())
-	}
-	if err := fixture.node.admitInternalApplication(ctx); err != nil {
-		t.Fatalf("future request was poisoned by the prior UNKNOWN call despite recovered state: %v", err)
-	}
+	assertManagedGraphRaceBarrierSuffix(t, fixture, wantControl)
 }
 
 type managedGraphAdmissionRaceFixture struct {
@@ -531,7 +534,11 @@ type managedGraphAdmissionRaceFixture struct {
 func newManagedGraphAdmissionRaceFixture(t *testing.T) *managedGraphAdmissionRaceFixture {
 	t.Helper()
 	transport := &graphAdmissionRaceTransport{graphReviewTransport: graphReviewTransport{}, held: make(chan struct{}), release: make(chan struct{})}
+	protocol := sqlpolicy.ManagedGraphRequestAppendOnlyApplicationProtocol
+	clusterID := types.ClusterID("managed-graph-race")
 	cluster := quepaxa.Cluster{ConfigID: 1}
+	bucket := thanosobjstore.NewInMemBucket()
+	var node1 *Node
 	walByNode := make(map[quepaxa.NodeID]*qlog.WAL, 3)
 	for i, id := range []quepaxa.NodeID{"n1", "n2", "n3"} {
 		identity := []byte(strings.Repeat(fmt.Sprintf("%d", i), 32))
@@ -548,25 +555,72 @@ func newManagedGraphAdmissionRaceFixture(t *testing.T) *managedGraphAdmissionRac
 		}
 		t.Cleanup(func() { _ = wal.Close() })
 		walByNode[id] = wal
-		member := peerMember("managed-graph-race", id, string(id)+"-token")
+		member := peerMember(string(clusterID), id, string(id)+"-token")
+		member.PeerURL = "quic://" + string(id) + ":9090"
 		member.WALIdentity = hex.EncodeToString(identity)
 		cluster.Members = append(cluster.Members, member)
 	}
 	for _, member := range cluster.Members {
-		core, err := quepaxa.New(quepaxa.Config{NodeID: member.ID, Cluster: cluster, WAL: walByNode[member.ID], Transport: transport, ValidateValue: types.ValidateManagedGraphExecutionPolicy})
+		config := &types.ExecutionConfig{NodeID: member.ID, ClusterID: clusterID, Members: cluster.Members, DataDir: t.TempDir(), ObjStorePrefix: "managed-graph-race", ObjStoreProvider: "memory", ObjStoreBucket: "test", ObjStoreRegion: "local"}
+		n := New(config)
+		n.managedStartup = &ManagedStartupConfig{expectedPolicy: sqlpolicy.ManagedGraphRequestMaterializationPolicy, Identity: ManagedStartupIdentity{ApplicationProtocol: protocol, EvidenceFormat: protocol, Member: recovery.PreparedStartupIdentity{ClusterUID: string(clusterID), NodeID: string(member.ID)}}}
+		source, memberDigest, err := n.preparedBindingDigestsForProtocol(protocol)
 		if err != nil {
 			t.Fatal(err)
 		}
+		planDigest, err := n.ManagedBootstrapPlanDigestForProtocol(source, protocol, protocol)
+		if err != nil {
+			t.Fatal(err)
+		}
+		n.managedStartup.Identity.PhysicalBinding = source
+		n.managedStartup.Identity.BootstrapPlanDigest = planDigest
+		n.managedStartup.Identity.Member.SourceBinding = source
+		n.managedStartup.Identity.Member.ConfigDigest = memberDigest
+		manager, err := checkpoint.NewAppendOnlyManagerForPolicy(bucket, string(clusterID), t.TempDir(), sqlpolicy.ManagedGraphRequestMaterializationPolicy, 1)
+		if err != nil {
+			t.Fatal(err)
+		}
+		archive, err := recovery.NewAppendOnlyManagerWithValueValidator(bucket, string(clusterID), 1, types.ValidateManagedGraphExecutionPolicy)
+		if err != nil {
+			t.Fatal(err)
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		if err := archive.Load(ctx); err != nil {
+			cancel()
+			t.Fatal(err)
+		}
+		cancel()
+		n.checkpoints, n.archive = manager, archive
+		walIdentity, err := hex.DecodeString(member.WALIdentity)
+		if err != nil || len(walIdentity) != 32 {
+			t.Fatalf("invalid fixture WAL identity: %v", err)
+		}
+		var identity [32]byte
+		copy(identity[:], walIdentity)
+		core, err := quepaxa.New(quepaxa.Config{
+			NodeID: member.ID, Cluster: cluster, WAL: walByNode[member.ID], Transport: transport,
+			ValidateValue: types.ValidateManagedGraphExecutionPolicy,
+			ManagedAppendOnly: &quepaxa.ManagedAppendOnlyConfig{Binding: quepaxa.ManagedAppendOnlyBinding{
+				ApplicationProtocol: protocol, BootstrapPlanDigest: planDigest, MemberConfigDigest: memberDigest, Generation: 0, WALIdentity: identity,
+			}, Verify: n.verifyManagedAppendOnlyCandidate},
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		core.SetCheckpointValidator(func(ctx context.Context, seal quepaxa.CheckpointSeal) error {
+			return manager.Verify(ctx, uint64(seal.Index), seal.RootHash, seal.StateHash)
+		})
 		transport.graphReviewTransport[member.ID] = core
+		n.core, n.wal = core, walByNode[member.ID]
+		if member.ID == "n1" {
+			node1 = n
+		}
 	}
-
-	n := New(&types.ExecutionConfig{NodeID: "n1", ClusterID: "managed-graph-race", Members: cluster.Members})
-	n.core = transport.graphReviewTransport["n1"]
-	n.wal = walByNode["n1"]
-	n.opened.Store(true)
-	n.managedPeerVerified.Store(true)
-	n.managedStartup = &ManagedStartupConfig{expectedPolicy: sqlpolicy.ManagedGraphRequestMaterializationPolicy}
-	mat, err := materializer.OpenManagedSQLKVGraphWithOriginals(filepath.Join(t.TempDir(), "sqlite.db"), 1, n.receiptWindow())
+	n := node1
+	if n == nil {
+		t.Fatal("managed Graph test node missing")
+	}
+	mat, err := n.openMaterializer(filepath.Join(t.TempDir(), "sqlite.db"), 1)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -591,18 +645,18 @@ func newManagedGraphAdmissionRaceFixture(t *testing.T) *managedGraphAdmissionRac
 		t.Fatalf("fixture did not establish actual aligned prefix: certified=%d recorded=%d applied=%d", n.core.Tip(), n.core.RecorderTip(), n.material.Tip())
 	}
 
-	protocol := sqlpolicy.ManagedGraphRequestApplicationProtocol
-	source, configDigest, err := n.preparedBindingDigestsForProtocol(protocol)
-	if err != nil {
-		t.Fatal(err)
-	}
-	n.managedStartup.Identity = ManagedStartupIdentity{
-		ApplicationProtocol: protocol,
-		Member:              recovery.PreparedStartupIdentity{ClusterUID: "managed-graph-race", NodeID: "n1", SourceBinding: source, ConfigDigest: configDigest},
-	}
+	n.opened.Store(true)
+	n.managedPeerVerified.Store(true)
 	if err := n.installInternalApplicationBinding(context.Background()); err != nil {
 		t.Fatal(err)
 	}
+	profile := network.ManagedPeerProfile{ApplicationProtocol: protocol, BootstrapPlanDigest: n.managedStartup.Identity.BootstrapPlanDigest, Generation: 0}
+	server, err := network.NewServerForManagedProfile(n.core, mat, clusterID, true, nil, profile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	n.server = server
+	t.Cleanup(server.Close)
 	n.managedInitiallyAdmitted.Store(true)
 	n.managedGraphInitialRootDone = make(chan struct{})
 	close(n.managedGraphInitialRootDone)
@@ -613,11 +667,7 @@ func newManagedGraphAdmissionRaceFixture(t *testing.T) *managedGraphAdmissionRac
 func (f *managedGraphAdmissionRaceFixture) startHeldControl(ctx context.Context) <-chan error {
 	result := make(chan error, 1)
 	go func() {
-		var nonce [types.ReadBarrierNonceSize]byte
-		for i := range nonce {
-			nonce[i] = byte(200 + i)
-		}
-		slot, _, err := f.node.core.Propose(ctx, types.EncodeReadBarrier(nonce))
+		slot, _, err := f.node.core.Propose(ctx, managedGraphRaceControlValue())
 		if err == nil && slot != 9 {
 			err = fmt.Errorf("control proposal used slot %d, want 9", slot)
 		}
@@ -631,6 +681,64 @@ func (f *managedGraphAdmissionRaceFixture) startHeldControl(ctx context.Context)
 		return result
 	}
 	return result
+}
+
+func managedGraphRaceControlValue() []byte {
+	var nonce [types.ReadBarrierNonceSize]byte
+	for i := range nonce {
+		nonce[i] = byte(200 + i)
+	}
+	return types.EncodeReadBarrier(nonce)
+}
+
+func awaitManagedGraphAdmissionObservation(t *testing.T, fixture *managedGraphAdmissionRaceFixture, result <-chan error, observedSlot uint64) {
+	t.Helper()
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		select {
+		case err := <-result:
+			t.Fatalf("admission returned before the exact observed barrier completed: %v", err)
+		default:
+		}
+		fixture.node.managedGraphControlMu.Lock()
+		operation := fixture.node.managedGraphControl
+		observed := operation != nil && operation.observation != nil && operation.observation.ObservedSlot == quepaxa.Slot(observedSlot) && operation.observation.BelongsTo(fixture.node.core)
+		fixture.node.managedGraphControlMu.Unlock()
+		if observed {
+			return
+		}
+		time.Sleep(time.Millisecond) // Poll for the concrete operation state; silence alone is never evidence.
+	}
+	fixture.node.managedGraphControlMu.Lock()
+	operation := fixture.node.managedGraphControl
+	fixture.node.managedGraphControlMu.Unlock()
+	progress := fixture.node.core.RuntimeProgressSnapshot()
+	t.Fatalf("admission did not retain the exact R=%d observation: operation=%+v progress=%+v", observedSlot, operation, progress)
+}
+
+func assertManagedGraphRaceBarrierSuffix(t *testing.T, fixture *managedGraphAdmissionRaceFixture, original []byte) {
+	t.Helper()
+	if isBarrier, err := types.DecodeReadBarrier(original); err != nil || !isBarrier {
+		t.Fatalf("original owner value is not a pure read barrier: %x, %v", original, err)
+	}
+	decision, ok := fixture.node.core.CertifiedValue(9)
+	if !ok || !bytes.Equal(decision.Value, original) {
+		t.Fatalf("slot 9 did not preserve the exact original control: found=%t value=%x want=%x", ok, decision.Value, original)
+	}
+	if isBarrier, err := types.DecodeReadBarrier(decision.Value); err != nil || !isBarrier {
+		t.Fatalf("slot 9 is not a pure read barrier: %v", err)
+	}
+	second, ok := fixture.node.core.CertifiedValue(10)
+	if !ok || bytes.Equal(second.Value, original) {
+		t.Fatalf("admission did not use a distinct certified slot-10 barrier: found=%t value=%x", ok, second.Value)
+	}
+	if isBarrier, err := types.DecodeReadBarrier(second.Value); err != nil || !isBarrier {
+		t.Fatalf("slot 10 is not a pure read barrier: %v", err)
+	}
+	progress := fixture.node.core.RuntimeProgressSnapshot()
+	if fixture.node.core.Tip() != 10 || progress.RecorderTip != 10 || fixture.node.material.Tip() != 10 {
+		t.Fatalf("expected exact original-plus-fresh-barrier suffix, progress=%+v applied=%d", progress, fixture.node.material.Tip())
+	}
 }
 
 func (f *managedGraphAdmissionRaceFixture) awaitPendingControl(t *testing.T) {

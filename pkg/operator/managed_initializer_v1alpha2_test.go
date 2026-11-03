@@ -227,6 +227,7 @@ func testManagedCapturedKubeletObjectsReconcile(t *testing.T, nativeList bool, f
 	_ = json.Unmarshal(cluster["spec"], &spec)
 	profile := phase9RuntimeProfile()
 	profile.InitImage = spec.Workload.PodTemplate.Spec.Containers[0].Image
+	cluster = managedCapturedClusterForProfile(t, cluster, profile.ApplicationProtocol)
 	puts := 0
 	podGets := 0
 	store := phase2Store(t, func(r *http.Request) (*http.Response, error) {
@@ -323,6 +324,50 @@ func testManagedCapturedKubeletObjectsReconcile(t *testing.T, nativeList bool, f
 	}
 }
 
+// The captured kubelet snapshot predates applicationProtocol in the Rhiza
+// spec. Port its original user intent into the current wire contract while
+// retaining the captured Deployment, ReplicaSet, and Pod objects unchanged.
+func managedCapturedClusterForProfile(t *testing.T, raw map[string]json.RawMessage, protocol string) map[string]json.RawMessage {
+	t.Helper()
+	var cluster map[string]any
+	if err := json.Unmarshal(mustManagedJSON(raw), &cluster); err != nil {
+		t.Fatal("decode captured cluster", err)
+	}
+	spec, ok := cluster["spec"].(map[string]any)
+	if !ok {
+		t.Fatal("captured cluster spec missing")
+	}
+	spec["applicationProtocol"] = protocol
+	metadata, ok := cluster["metadata"].(map[string]any)
+	if !ok {
+		t.Fatal("captured cluster metadata missing")
+	}
+	annotations, ok := metadata["annotations"].(map[string]any)
+	if !ok {
+		t.Fatal("captured cluster annotations missing")
+	}
+	const lastAppliedKey = "kubectl.kubernetes.io/last-applied-configuration"
+	lastAppliedText, ok := annotations[lastAppliedKey].(string)
+	if !ok {
+		t.Fatal("captured last-applied configuration missing")
+	}
+	var lastApplied map[string]any
+	if err := json.Unmarshal([]byte(lastAppliedText), &lastApplied); err != nil {
+		t.Fatal("decode captured last-applied configuration", err)
+	}
+	lastSpec, ok := lastApplied["spec"].(map[string]any)
+	if !ok {
+		t.Fatal("captured last-applied spec missing")
+	}
+	lastSpec["applicationProtocol"] = protocol
+	annotations[lastAppliedKey] = string(mustManagedJSON(lastApplied))
+	var current map[string]json.RawMessage
+	if err := json.Unmarshal(mustManagedJSON(cluster), &current); err != nil {
+		t.Fatal("encode current captured cluster", err)
+	}
+	return current
+}
+
 // managedFixturePods supplies public status on exact API-owned Pods. It does
 // not simulate kubelet execution or prove the init binary ran.
 func managedFixturePods(ref V1Alpha2ClusterRef, rsName, rsUID string, spec json.RawMessage) []any {
@@ -357,7 +402,7 @@ func managedFixtureAdmitPodToken(spec map[string]any) {
 func TestManagedInitializationRequiresInstalledHostAccountBeforePost(t *testing.T) {
 	for _, name := range []string{"absent", "deleting", "wrong namespace", "wrong name", "missing UID"} {
 		t.Run(name, func(t *testing.T) {
-			s, kube := phase9Setup(t, phase8Cluster)
+			s, kube := phase9Setup(t, phase9CurrentManagedCluster())
 			s.serviceAccount = managedFixtureServiceAccount(phase2Ref)
 			meta := s.serviceAccount["metadata"].(map[string]any)
 			switch name {

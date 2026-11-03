@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"math"
 
+	"github.com/mrchypark/rhiza/internal/sqlpolicy"
 	"github.com/mrchypark/rhiza/internal/types"
 )
 
@@ -100,6 +101,43 @@ func mixedApplicationProtocol(obj map[string]json.RawMessage) (string, error) {
 	return protocol, nil
 }
 
+func managedControlProfile(obj map[string]json.RawMessage) (string, string, error) {
+	protocol, err := mixedApplicationProtocol(obj)
+	if err != nil {
+		return "", "", err
+	}
+	if protocol == "" {
+		return "", V1Alpha2ManagedSQLEvidenceFormat, nil
+	}
+	status, err := jsonObject(obj["status"])
+	if err != nil {
+		return "", "", err
+	}
+	var assignment V1Alpha2ApplicationInitAssignment
+	if decodeV1Alpha2(status["applicationInit"], &assignment) != nil || assignment.Plan.ApplicationProtocol != protocol {
+		return "", "", fmt.Errorf("application protocol markers disagree")
+	}
+	if err := ValidateV1Alpha2ApplicationProfile(protocol, assignment.Plan.EvidenceFormat); err != nil {
+		return "", "", err
+	}
+	return protocol, assignment.Plan.EvidenceFormat, nil
+}
+
+func managedSQLReservationContextRequired(obj map[string]json.RawMessage) (bool, error) {
+	protocol, _, err := managedControlProfile(obj)
+	if err != nil {
+		return false, err
+	}
+	switch protocol {
+	case types.ManagedApplicationProtocolSQLKV, sqlpolicy.ManagedRequestAppendOnlyApplicationProtocol, sqlpolicy.ManagedGraphRequestAppendOnlyApplicationProtocol:
+		return true, nil
+	case "":
+		return false, nil
+	default:
+		return false, fmt.Errorf("unsupported application protocol")
+	}
+}
+
 func mixedComponentSize(value any, limit int) error {
 	raw, err := json.Marshal(value)
 	if err != nil || len(raw) > limit {
@@ -109,7 +147,7 @@ func mixedComponentSize(value any, limit int) error {
 }
 
 func validateManagedMixedProfile(obj map[string]json.RawMessage) error {
-	protocol, err := mixedApplicationProtocol(obj)
+	protocol, evidenceFormat, err := managedControlProfile(obj)
 	if err != nil {
 		return err
 	}
@@ -119,7 +157,7 @@ func validateManagedMixedProfile(obj map[string]json.RawMessage) error {
 	}
 	var assignment V1Alpha2ApplicationInitAssignment
 	if raw, exists := status["applicationInit"]; exists {
-		if decodeV1Alpha2(raw, &assignment) != nil || assignment.Plan.ApplicationProtocol != protocol {
+		if decodeV1Alpha2(raw, &assignment) != nil || assignment.Plan.ApplicationProtocol != protocol || protocol != "" && assignment.Plan.EvidenceFormat != evidenceFormat {
 			return fmt.Errorf("application protocol markers disagree")
 		}
 	} else if protocol != "" {

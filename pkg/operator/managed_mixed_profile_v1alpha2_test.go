@@ -255,6 +255,155 @@ func TestManagedMixedProfileSQLAndLegacy(t *testing.T) {
 	}
 }
 
+func TestManagedAppendOnlySQLReservationBindsCurrentProfileAndEvidence(t *testing.T) {
+	profiles := []V1Alpha2RuntimeProfile{phase9RuntimeProfile()}
+	graph := phase9RuntimeProfile()
+	graph.ApplicationProtocol = sqlpolicy.ManagedGraphRequestAppendOnlyApplicationProtocol
+	graph.EvidenceFormat = graph.ApplicationProtocol
+	profiles = append(profiles, graph)
+	for _, profile := range profiles {
+		t.Run(profile.ApplicationProtocol, func(t *testing.T) {
+			server, kube := phase9Setup(t, phase9ClusterWithProtocol(profile.ApplicationProtocol), profile)
+			if _, err := ReconcileV1Alpha2ManagedInitialization(context.Background(), kube, phase2Ref, profile); err != nil {
+				t.Fatal(err)
+			}
+			// This fixture API models an original RV 47 with each successful
+			// status write advancing to 48; reset before the separate evidence CAS.
+			server.cluster = strings.Replace(server.cluster, `"resourceVersion":"48"`, `"resourceVersion":"47"`, 1)
+			store := &V1Alpha2StatusStore{Kube: kube}
+			initial, err := LoadV1Alpha2ApplicationInit(context.Background(), store, phase2Ref)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, _, err := CommitV1Alpha2ApplicationInit(context.Background(), store, initial, initial.Assignment().Plan, json.RawMessage(`{"schema":"append-only-fixture"}`)); err != nil {
+				t.Fatal(err)
+			}
+			server.cluster = strings.Replace(server.cluster, `"resourceVersion":"48"`, `"resourceVersion":"47"`, 1)
+			old, err := LoadV1Alpha2Admission(context.Background(), store, phase2Ref)
+			if err != nil {
+				t.Fatal(err)
+			}
+			beforeReservation := server.puts
+			if _, _, err := ReserveV1Alpha2KVWrite(context.Background(), store, old, old.Authority(), old.Evidence(), types.KVCommand{RequestID: "kv-still-policy8", Operation: "put", Key: "key"}); err == nil || server.puts != beforeReservation {
+				t.Fatalf("profile %q expanded KV reservation beyond policy 8: err=%v puts=%d", profile.ApplicationProtocol, err, server.puts)
+			}
+			reserved, result, err := ReserveV1Alpha2SQLWrite(context.Background(), store, old, old.Authority(), old.Evidence(), network.ExecuteRequest{RequestID: "repair-profile-bound", SQL: "CREATE TABLE repair_profile_bound(v INTEGER)"})
+			if err != nil || result != V1Alpha2CASApplied {
+				t.Fatalf("explicit append-only repair reservation %s: %v", result, err)
+			}
+			request, pending := reserved.Pending()
+			if !pending || request.Kind != "sql" {
+				t.Fatalf("reservation did not retain SQL identity: %+v pending=%t", request, pending)
+			}
+			got := reserved.pending.Reservation
+			if got == nil || *got != *reservationContext(old.Authority()) {
+				t.Fatalf("reservation context differs from same-snapshot owner/binding: got=%+v", got)
+			}
+			encodedPending, err := json.Marshal(reserved.pending)
+			if err != nil {
+				t.Fatal(err)
+			}
+			pendingFields, err := jsonObject(encodedPending)
+			if err != nil {
+				t.Fatal(err)
+			}
+			wantReservation, _ := json.Marshal(reservationContext(old.Authority()))
+			if !sameJSON(pendingFields["reservation"], wantReservation) || !sameJSON(pendingFields["priorEvidence"], old.Evidence()) {
+				t.Fatalf("serialized control reservation changed existing context/evidence fields: %s", encodedPending)
+			}
+			pendingSQL, ok, err := reserved.PendingSQL()
+			if err != nil || !ok || pendingSQL.RequestID != "repair-profile-bound" || pendingSQL.SQL != "CREATE TABLE repair_profile_bound(v INTEGER)" {
+				t.Fatalf("retained repair SQL changed: request=%+v present=%t error=%v", pendingSQL, ok, err)
+			}
+			beforeNegativeWrites := server.puts
+
+			for name, mutate := range map[string]func(map[string]json.RawMessage, map[string]json.RawMessage){
+				"wrong reservation owner": func(_, auth map[string]json.RawMessage) {
+					var req v1alpha2PendingRequest
+					_ = json.Unmarshal(auth["pendingRequest"], &req)
+					req.Reservation.UID = "foreign-uid"
+					auth["pendingRequest"], _ = json.Marshal(req)
+				},
+				"wrong reservation generation": func(_, auth map[string]json.RawMessage) {
+					var req v1alpha2PendingRequest
+					_ = json.Unmarshal(auth["pendingRequest"], &req)
+					req.Reservation.Generation++
+					auth["pendingRequest"], _ = json.Marshal(req)
+				},
+				"wrong assigned evidence": func(status, _ map[string]json.RawMessage) {
+					var assignment V1Alpha2ApplicationInitAssignment
+					_ = json.Unmarshal(status["applicationInit"], &assignment)
+					assignment.Plan.EvidenceFormat = V1Alpha2ManagedSQLKVEvidenceFormat
+					status["applicationInit"], _ = json.Marshal(assignment)
+				},
+			} {
+				t.Run(name, func(t *testing.T) {
+					object := make(map[string]json.RawMessage, len(reserved.status.object))
+					for key, raw := range reserved.status.object {
+						object[key] = bytes.Clone(raw)
+					}
+					status, err := jsonObject(object["status"])
+					if err != nil {
+						t.Fatal(err)
+					}
+					auth, err := jsonObject(status["authority"])
+					if err != nil {
+						t.Fatal(err)
+					}
+					mutate(status, auth)
+					status["authority"], _ = json.Marshal(auth)
+					object["status"], _ = json.Marshal(status)
+					if err := validateManagedMixedProfile(object); err == nil {
+						t.Fatal("mismatched profile/evidence reservation accepted")
+					}
+				})
+			}
+			for _, protocol := range []string{sqlpolicy.ManagedRequestApplicationProtocol, sqlpolicy.ManagedGraphRequestApplicationProtocol, "unknown/v1", ""} {
+				object := make(map[string]json.RawMessage, len(reserved.status.object))
+				for key, raw := range reserved.status.object {
+					object[key] = bytes.Clone(raw)
+				}
+				spec, err := jsonObject(object["spec"])
+				if err != nil {
+					t.Fatal(err)
+				}
+				spec["applicationProtocol"], _ = json.Marshal(protocol)
+				object["spec"], _ = json.Marshal(spec)
+				if err := validateManagedMixedProfile(object); err == nil {
+					t.Fatalf("unsupported/retired protocol %q accepted", protocol)
+				}
+				bad := old
+				bad.status.object = object
+				if _, _, err := ReserveV1Alpha2SQLWrite(context.Background(), store, bad, bad.Authority(), bad.Evidence(), network.ExecuteRequest{RequestID: "bad-profile", SQL: "CREATE TABLE must_not_reserve(v INTEGER)"}); err == nil {
+					t.Fatalf("reservation accepted unsupported/retired protocol %q", protocol)
+				}
+			}
+			badEvidence := old
+			badEvidence.status.object = make(map[string]json.RawMessage, len(old.status.object))
+			for key, raw := range old.status.object {
+				badEvidence.status.object[key] = bytes.Clone(raw)
+			}
+			badStatus, err := jsonObject(badEvidence.status.object["status"])
+			if err != nil {
+				t.Fatal(err)
+			}
+			var badAssignment V1Alpha2ApplicationInitAssignment
+			if err := json.Unmarshal(badStatus["applicationInit"], &badAssignment); err != nil {
+				t.Fatal(err)
+			}
+			badAssignment.Plan.EvidenceFormat = V1Alpha2ManagedSQLKVEvidenceFormat
+			badStatus["applicationInit"], _ = json.Marshal(badAssignment)
+			badEvidence.status.object["status"], _ = json.Marshal(badStatus)
+			if _, _, err := ReserveV1Alpha2SQLWrite(context.Background(), store, badEvidence, badEvidence.Authority(), badEvidence.Evidence(), network.ExecuteRequest{RequestID: "bad-evidence", SQL: "CREATE TABLE must_not_reserve(v INTEGER)"}); err == nil {
+				t.Fatal("reservation accepted a wrong assigned evidence marker")
+			}
+			if server.puts != beforeNegativeWrites {
+				t.Fatalf("validation-only negative cases wrote status: before=%d after=%d", beforeNegativeWrites, server.puts)
+			}
+		})
+	}
+}
+
 func TestManagedMixedProfilePendingRawFingerprint(t *testing.T) {
 	var previous []string
 	for _, key := range []string{string([]byte{0xff}), string([]byte{0xfe}), "\ufffd"} {

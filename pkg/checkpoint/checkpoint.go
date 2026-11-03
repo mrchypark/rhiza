@@ -175,6 +175,33 @@ func newManagerForPolicy(bucket objstore.Bucket, prefix, localDir string, expect
 
 // Load performs two exact GETs: CURRENT and its immutable root.
 func (m *Manager) Load(ctx context.Context) error {
+	if m.expectedPolicy == sqlpolicy.ManagedRequestMaterializationPolicy {
+		if !m.appendOnly {
+			return fmt.Errorf("managed request checkpoint CURRENT requires its append-only profile")
+		}
+		locator, exists, err := m.LoadManagedAppendOnlyLocator(ctx, sqlpolicy.ManagedRequestMaterializationPolicy)
+		if err != nil {
+			return err
+		}
+		if !exists {
+			m.mu.Lock()
+			known := m.certified != nil
+			m.mu.Unlock()
+			if known {
+				return fmt.Errorf("managed request checkpoint locator disappeared")
+			}
+			return nil
+		}
+		root, err := m.OpenRoot(ctx, locator.Index, locator.RootHash)
+		if err != nil {
+			return err
+		}
+		if root.Generation != locator.Index {
+			return fmt.Errorf("managed request checkpoint generation differs from locator cut")
+		}
+		m.rememberCertified(*root)
+		return nil
+	}
 	if m.expectedPolicy == sqlpolicy.ManagedGraphRequestMaterializationPolicy {
 		locator, exists, err := m.LoadManagedGraphLocator(ctx)
 		if err != nil {

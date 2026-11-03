@@ -181,10 +181,19 @@ func TestManagedGraphAdmissionRejectsWrongHashDuringOwnedOperation(t *testing.T)
 	fixture.node.server = server
 	t.Cleanup(server.Close)
 	entered, resume := make(chan struct{}), make(chan struct{})
+	var resumeOnce sync.Once
+	releaseResume := func() { resumeOnce.Do(func() { close(resume) }) }
+	t.Cleanup(releaseResume)
+	t.Cleanup(fixture.transport.releaseHeld)
 	var captured atomic.Bool
+	var ownerValueMu sync.Mutex
+	var ownerValue []byte
 	restore := localtesthooks.SetProposalEntry(func(value []byte) {
 		isBarrier, decodeErr := types.DecodeReadBarrier(value)
 		if decodeErr == nil && isBarrier && captured.CompareAndSwap(false, true) {
+			ownerValueMu.Lock()
+			ownerValue = append([]byte(nil), value...)
+			ownerValueMu.Unlock()
 			close(entered)
 			<-resume
 		}
@@ -201,20 +210,30 @@ func TestManagedGraphAdmissionRejectsWrongHashDuringOwnedOperation(t *testing.T)
 	}
 	competitorCtx, cancelCompetitor := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancelCompetitor()
+	var competitorNonce [types.ReadBarrierNonceSize]byte
+	for i := range competitorNonce {
+		competitorNonce[i] = byte(77 + i)
+	}
+	competitorValue := types.EncodeReadBarrier(competitorNonce)
 	competitor := make(chan error, 1)
 	go func() {
-		var nonce [types.ReadBarrierNonceSize]byte
-		for i := range nonce {
-			nonce[i] = byte(77 + i)
-		}
-		_, _, err := fixture.node.core.Propose(competitorCtx, types.EncodeReadBarrier(nonce))
+		_, _, err := fixture.node.core.Propose(competitorCtx, competitorValue)
 		competitor <- err
 	}()
 	fixture.awaitPendingControl(t)
+	ownerValueMu.Lock()
+	owned := append([]byte(nil), ownerValue...)
+	ownerValueMu.Unlock()
+	progress := fixture.node.core.RuntimeProgressSnapshot()
+	if len(owned) == 0 || bytes.Equal(owned, competitorValue) || progress.RecorderHash != sha256.Sum256(competitorValue) || progress.RecorderHashIsCertified {
+		t.Fatalf("actual pending recorder state is not the distinct competing proposal: owner=%x competitor=%x progress=%+v", owned, competitorValue, progress)
+	}
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	if err := fixture.node.admitInternalApplication(ctx); err == nil || !strings.Contains(err.Error(), "target=8 recorded=9 certified=8 applied=8") {
-		t.Fatalf("active operation accepted a different pending value hash: %v", err)
+	admissionErr := fixture.node.admitInternalApplication(ctx)
+	if admissionErr == nil || !strings.Contains(admissionErr.Error(), "target=9 recorded=9 certified=8 applied=8") {
+		progress := fixture.node.core.RuntimeProgressSnapshot()
+		t.Fatalf("active operation accepted a different pending recorder hash or reported an unexpected gate: err=%v progress=%+v", admissionErr, progress)
 	}
 	if fixture.node.core.Tip() != 8 {
 		t.Fatalf("wrong-hash refusal submitted foreground work: C=%d", fixture.node.core.Tip())
@@ -223,7 +242,7 @@ func TestManagedGraphAdmissionRejectsWrongHashDuringOwnedOperation(t *testing.T)
 	if err := awaitProposal(t, competitor); err != nil {
 		t.Fatalf("actual competing proposal failed after release: %v", err)
 	}
-	close(resume)
+	releaseResume()
 	if err := awaitProposal(t, owner); err != nil {
 		t.Fatalf("owner did not complete after its candidate was displaced: %v", err)
 	}

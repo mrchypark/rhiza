@@ -127,7 +127,7 @@ func newCoreFromConfig(config Config, observer, learner, localReadOnlyInspection
 	if len(config.Cluster.Members) > 1 && config.Transport == nil && !observer {
 		return nil, fmt.Errorf("%w: transport is required for multiple members", ErrInvalidConfig)
 	}
-	managedAppendOnly, err := validateManagedAppendOnlyConfig(config.ManagedAppendOnly, config.WAL, config.NodeID, localMember, config.LocalMode)
+	managedAppendOnly, err := validateManagedAppendOnlyConfig(config.ManagedAppendOnly, config.WAL, config.NodeID, localMember, config.LocalMode, learner)
 	if err != nil {
 		return nil, fmt.Errorf("%w: managed append-only binding: %w", ErrInvalidConfig, err)
 	}

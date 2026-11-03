@@ -45,6 +45,9 @@ func PrepareReadOnlyRestoreForPolicy(ctx context.Context, view *ReadOnlyView, ta
 	if view.expectedPolicy != expected || view.idempotencyWindow != window {
 		return result, fmt.Errorf("read-only view policy/window mismatch")
 	}
+	if err := validateReadOnlyProfile(expected, window, view.applicationProtocol); err != nil {
+		return result, err
+	}
 	if err := ctx.Err(); err != nil {
 		return result, err
 	}
@@ -68,7 +71,14 @@ func PrepareReadOnlyRestoreForPolicy(ctx context.Context, view *ReadOnlyView, ta
 		open = materializer.OpenManagedSQLKVWithOriginals
 	}
 	if expected == sqlpolicy.ManagedGraphRequestMaterializationPolicy {
-		open = materializer.OpenManagedSQLKVGraphWithOriginals
+		if view.applicationProtocol == sqlpolicy.ManagedGraphRequestAppendOnlyApplicationProtocol {
+			open = materializer.OpenManagedSQLKVGraphWithAppendOnlyOriginals
+		} else {
+			open = materializer.OpenManagedSQLKVGraphWithOriginals
+		}
+	}
+	if expected == sqlpolicy.ManagedRequestMaterializationPolicy && view.applicationProtocol == sqlpolicy.ManagedRequestAppendOnlyApplicationProtocol {
+		open = materializer.OpenManagedSQLKVWithAppendOnlyOriginals
 	}
 	mat, err := open(sqlitePath, 1, window)
 	if err != nil {
@@ -135,15 +145,46 @@ func validateReadOnlyPolicy(expected sqlpolicy.MaterializationPolicy, window uin
 	return nil
 }
 
-func inspectManagedFileForPolicy(ctx context.Context, file string, window uint64, expected sqlpolicy.MaterializationPolicy) (materializer.ManagedApplicationState, uint64, error) {
+func inspectManagedFileForPolicy(ctx context.Context, file string, window uint64, expected sqlpolicy.MaterializationPolicy, applicationProtocol string) (materializer.ManagedApplicationState, uint64, error) {
 	switch expected {
 	case sqlpolicy.ManagedRequestMaterializationPolicy:
+		if applicationProtocol == sqlpolicy.ManagedRequestAppendOnlyApplicationProtocol {
+			return materializer.InspectManagedAppendOnlyRequestFile(ctx, file, window)
+		}
 		return materializer.InspectManagedRequestFile(ctx, file, window)
 	case sqlpolicy.ManagedSQLKVMaterializationPolicy:
 		return materializer.InspectManagedApplicationFile(ctx, file, window)
+	case sqlpolicy.ManagedGraphRequestMaterializationPolicy:
+		if applicationProtocol == sqlpolicy.ManagedGraphRequestAppendOnlyApplicationProtocol {
+			return materializer.InspectManagedAppendOnlyGraphSQLFile(ctx, file, window)
+		}
+		return materializer.InspectManagedGraphSQLFile(ctx, file, window)
 	default:
 		return materializer.ManagedApplicationState{}, 0, sqlpolicy.ErrIncompatible
 	}
+}
+
+func validateReadOnlyProfile(expected sqlpolicy.MaterializationPolicy, window uint64, applicationProtocol string) error {
+	if err := validateReadOnlyPolicy(expected, window); err != nil {
+		return err
+	}
+	if expected != sqlpolicy.ManagedRequestMaterializationPolicy && expected != sqlpolicy.ManagedGraphRequestMaterializationPolicy {
+		if applicationProtocol != "" {
+			return fmt.Errorf("application protocol is incompatible with recovery policy")
+		}
+		return nil
+	}
+	if applicationProtocol == "" {
+		return fmt.Errorf("final managed recovery requires an explicit application protocol")
+	}
+	policy, trustedWindow, err := types.ManagedApplicationPolicy(applicationProtocol)
+	if err != nil || policy != expected || trustedWindow != window {
+		return fmt.Errorf("application protocol does not match recovery policy/window")
+	}
+	if applicationProtocol != sqlpolicy.ManagedRequestAppendOnlyApplicationProtocol && applicationProtocol != sqlpolicy.ManagedGraphRequestAppendOnlyApplicationProtocol {
+		return fmt.Errorf("retired application protocol is not valid for recovery")
+	}
+	return nil
 }
 
 func managedSQLKVPolicy(policy sqlpolicy.MaterializationPolicy) bool {
