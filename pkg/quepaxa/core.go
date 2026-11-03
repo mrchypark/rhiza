@@ -112,6 +112,7 @@ type Core struct {
 	checkpointMu        sync.Mutex
 	checkpointValidator func(context.Context, CheckpointSeal) error
 	preparedCheckpoints map[Slot][32]byte
+	pendingPrepares     map[Slot]pendingCheckpointPrepare
 	sealedRoots         map[[32]byte]SealedCheckpoint
 	recorders           map[Slot]ISR
 	recordLocks         [64]sync.Mutex
@@ -126,6 +127,17 @@ type Core struct {
 	healthMu            sync.Mutex
 	periodicErr         error
 }
+
+type pendingCheckpointPrepare struct {
+	identity ValueHash
+	root     [32]byte
+	durable  []SlotValue
+}
+
+// ErrCheckpointPreparePending means a higher candidate is constrained by an
+// older checkpoint proposal, or by a candidate whose marker durability is not
+// yet known. It does not mean the candidate is prepared or certified.
+var ErrCheckpointPreparePending = errors.New("checkpoint prepare is blocked by pending checkpoint state")
 
 type configEpoch struct {
 	start   Slot
@@ -143,7 +155,7 @@ func newCore(nodeID NodeID, config *Cluster, wal *qlog.WAL, transport Transport)
 		nodeID: nodeID, config: config, wal: wal, transport: transport,
 		priority: randomPriority,
 		nextSlot: 1, pipeline: make(chan struct{}, 16), pipelineExclusive: make(chan struct{}, 1), recoveryGate: make(chan struct{}, 1), localExecutionOwner: make(chan struct{}, 1), tipChanged: make(chan struct{}),
-		decided: make(map[Slot]DecidedValue), durable: make(map[Slot]bool), logged: make(map[Slot]bool), byHash: make(map[ValueHash]Slot), values: make(map[ValueHash][]byte), valueDurable: make(map[ValueHash]bool), prefixes: make(map[Slot][32]byte), preparedCheckpoints: make(map[Slot][32]byte), sealedRoots: make(map[[32]byte]SealedCheckpoint), recorders: make(map[Slot]ISR),
+		decided: make(map[Slot]DecidedValue), durable: make(map[Slot]bool), logged: make(map[Slot]bool), byHash: make(map[ValueHash]Slot), values: make(map[ValueHash][]byte), valueDurable: make(map[ValueHash]bool), prefixes: make(map[Slot][32]byte), preparedCheckpoints: make(map[Slot][32]byte), pendingPrepares: make(map[Slot]pendingCheckpointPrepare), sealedRoots: make(map[[32]byte]SealedCheckpoint), recorders: make(map[Slot]ISR),
 		now: time.Now, epochStart: make(map[uint64]time.Time), timings: make(map[NodeID]leaderTiming), commits: newGroupCommit(wal.Sync),
 	}
 	core.configHistory = []configEpoch{{start: 1, cluster: cloneCluster(*config)}}
@@ -1348,6 +1360,10 @@ func (c *Core) recordLocalOwned(ctx context.Context, request RecordRequest) (Sum
 			return Summary{}, err
 		}
 	}
+	if err := c.checkCheckpointRecordEligibilityLocked(request.Proposal.Hash); err != nil {
+		c.mu.Unlock()
+		return Summary{}, err
+	}
 	if c.recordBeforeAppend != nil {
 		c.recordBeforeAppend()
 	}
@@ -1560,7 +1576,14 @@ func (c *Core) record(ctx context.Context, request RecordRequest) (Summary, erro
 		// and repeat mutable guards after releasing mu for fallback validation.
 		decided, exists := c.decided[request.Slot]
 		exactCertified := exists && len(request.Proposal.Value) != 0 && decided.Hash == request.Proposal.Hash && bytes.Equal(decided.Value, request.Proposal.Value)
-		if checkpointValidated || exactCertified {
+		if checkpointValidated {
+			if err := c.checkCheckpointRecordEligibilityLocked(request.Proposal.Hash); err != nil {
+				c.mu.Unlock()
+				return Summary{}, err
+			}
+			break
+		}
+		if exactCertified {
 			break
 		}
 		c.mu.Unlock()
@@ -1568,6 +1591,7 @@ func (c *Core) record(ctx context.Context, request RecordRequest) (Summary, erro
 			return Summary{}, err
 		}
 		checkpointValidated = true
+		localtesthooks.Hit("core:after-checkpoint-record-validation")
 	}
 	if decided, ok := c.decided[request.Slot]; ok {
 		needsSync := !c.durable[request.Slot]
@@ -1759,6 +1783,127 @@ func (c *Core) checkpointIdentityWithLag(seal CheckpointSeal) (bool, func(contex
 	return false, validator, false, nil
 }
 
+// checkCheckpointRecordEligibilityLocked repeats only the local identity and
+// fence checks needed at the receipt-append linearization point. Full object
+// and membership-proof validation remains outside c.mu in validateCheckpointValue.
+func (c *Core) checkCheckpointRecordEligibilityLocked(hash ValueHash) error {
+	value, ok := c.values[hash]
+	if !ok {
+		return fmt.Errorf("proposal value is unavailable")
+	}
+	seal, checkpoint, err := DecodeCheckpointSeal(value)
+	if err != nil || !checkpoint {
+		return err
+	}
+	if err := c.checkCheckpointIdentityLocked(seal); err != nil {
+		return err
+	}
+	preparedIndex, preparedRoot, prepared := c.latestPreparedCheckpointLocked()
+	if prepared && seal.Index < preparedIndex {
+		return fmt.Errorf("checkpoint index %d is below prepared fence %d", seal.Index, preparedIndex)
+	}
+	if prepared && seal.Index == preparedIndex && preparedRoot != seal.RootHash {
+		return fmt.Errorf("checkpoint index %d is already prepared with another root", seal.Index)
+	}
+	for index, pending := range c.pendingPrepares {
+		if index > seal.Index || index == seal.Index && pending.identity != hash {
+			return fmt.Errorf("%w: checkpoint record is below an unresolved prepared candidate", ErrCheckpointPreparePending)
+		}
+		if index == seal.Index {
+			return fmt.Errorf("%w: checkpoint candidate marker is not yet durable", ErrCheckpointPreparePending)
+		}
+	}
+	return nil
+}
+
+// checkCheckpointIdentityLocked validates the immutable local history fields
+// under the caller's c.mu lock without invoking the object validator.
+func (c *Core) checkCheckpointIdentityLocked(seal CheckpointSeal) error {
+	if c.reconfigEnabled {
+		if c.reconfiguration != nil {
+			return fmt.Errorf("checkpoint membership is not stable during reconfiguration")
+		}
+	} else if seal.Membership != nil {
+		return fmt.Errorf("fixed-membership checkpoint includes membership history")
+	}
+	prefix, prefixOK := c.prefixes[seal.Index]
+	if seal.GenerationAnchorHash != c.generationAnchorHash || seal.ConfigID != c.clusterForSlotLocked(seal.Index+1).ConfigID || !prefixOK || prefix != seal.PrefixHash || c.tip < seal.Index {
+		return fmt.Errorf("checkpoint seal does not match local certified prefix")
+	}
+	next, following, err := c.checkpointLeaderOrdersLocked(seal.Index)
+	if err != nil || !slices.Equal(next, seal.NextLeaderOrder) || !slices.Equal(following, seal.FollowingLeaderOrder) {
+		return fmt.Errorf("checkpoint seal does not match local certified prefix")
+	}
+	if c.reconfigEnabled {
+		expected, err := c.membershipHistoryLocked(seal.Index)
+		if err != nil {
+			return fmt.Errorf("checkpoint membership is not stable during reconfiguration")
+		}
+		if seal.Membership == nil || !sameMembershipRecord(expected, *seal.Membership) {
+			return fmt.Errorf("checkpoint seal has stale membership history")
+		}
+	}
+	if _, err := c.checkpointMembershipForSeal(seal); err != nil {
+		return err
+	}
+	return nil
+}
+
+// pendingCheckpointSealLocked rejects undecided older checkpoint proposals
+// and returns actual older certificates whose decision markers must share the
+// candidate marker's Sync.
+func (c *Core) pendingCheckpointSealLocked(candidate CheckpointSeal) ([]SlotValue, error) {
+	candidateValue, err := EncodeCheckpointSeal(candidate)
+	if err != nil {
+		return nil, err
+	}
+	candidateHash := ValueHash(sha256.Sum256(candidateValue))
+	for slot, state := range c.recorders {
+		if _, decided := c.decided[slot]; decided {
+			continue
+		}
+		for _, proposal := range []*Proposal{state.FirstCurrent, state.AggregateCurrent, state.AggregatePrior} {
+			if proposal == nil {
+				continue
+			}
+			value, ok := c.values[proposal.Hash]
+			if !ok {
+				return nil, fmt.Errorf("%w: recorder proposal identity is unavailable", ErrCheckpointPreparePending)
+			}
+			pending, checkpoint, err := DecodeCheckpointSeal(value)
+			if err != nil {
+				return nil, fmt.Errorf("%w: recorder checkpoint identity is invalid", ErrCheckpointPreparePending)
+			}
+			if checkpoint && (pending.Index < candidate.Index || pending.Index == candidate.Index && proposal.Hash != candidateHash) {
+				return nil, fmt.Errorf("%w: an older checkpoint seal remains in an undecided recorder", ErrCheckpointPreparePending)
+			}
+		}
+	}
+	var pendingDurability []SlotValue
+	for slot, decision := range c.decided {
+		if c.durable[slot] {
+			continue
+		}
+		pending, checkpoint, err := DecodeCheckpointSeal(decision.Value)
+		if err != nil {
+			return nil, fmt.Errorf("%w: certified checkpoint identity is invalid", ErrCheckpointPreparePending)
+		}
+		if checkpoint && pending.Index == candidate.Index && decision.Hash != candidateHash {
+			return nil, fmt.Errorf("%w: a conflicting certified checkpoint exists at the candidate cut", ErrCheckpointPreparePending)
+		}
+		if checkpoint && (pending.Index < candidate.Index || pending.Index == candidate.Index && decision.Hash == candidateHash) {
+			if !c.logged[slot] {
+				if err := c.appendDecision(decision); err != nil {
+					return nil, err
+				}
+				c.markDecisionLoggedLocked(slot)
+			}
+			pendingDurability = append(pendingDurability, SlotValue{Slot: slot, Hash: decision.Hash})
+		}
+	}
+	return pendingDurability, nil
+}
+
 // validateRecoveredPreparedCheckpoint checks a durable marker against the
 // recovered history at its own cut. Unlike new prepare/record eligibility,
 // later transitions (including an incomplete freeze) do not rewrite history
@@ -1830,6 +1975,33 @@ func (c *Core) prepareCheckpointOwned(ctx context.Context, seal CheckpointSeal) 
 func (c *Core) prepareCheckpointOwnedWithAdmission(ctx context.Context, seal CheckpointSeal, admission bool) error {
 	c.checkpointMu.Lock()
 	defer c.checkpointMu.Unlock()
+	payload, err := EncodeCheckpointSeal(seal)
+	if err != nil {
+		return err
+	}
+	identity := ValueHash(sha256.Sum256(payload))
+	for {
+		c.mu.RLock()
+		var previousIndex Slot
+		var previous *pendingCheckpointPrepare
+		for index, pending := range c.pendingPrepares {
+			copy := pending
+			copy.durable = append([]SlotValue(nil), pending.durable...)
+			previousIndex, previous = index, &copy
+			break
+		}
+		c.mu.RUnlock()
+		if previous == nil {
+			break
+		}
+		pendingSeal := CheckpointSeal{Index: previousIndex, RootHash: previous.root}
+		if previousIndex == seal.Index && previous.identity == identity {
+			return c.finishPendingCheckpointPrepare(ctx, pendingSeal, identity, previous.durable)
+		}
+		if err := c.finishPendingCheckpointPrepare(ctx, pendingSeal, previous.identity, previous.durable); err != nil {
+			return fmt.Errorf("%w: prior candidate marker durability is unresolved: %w", ErrCheckpointPreparePending, err)
+		}
+	}
 	verified, validator, err := c.checkpointIdentity(seal)
 	if err != nil {
 		return err
@@ -1839,10 +2011,6 @@ func (c *Core) prepareCheckpointOwnedWithAdmission(ctx context.Context, seal Che
 	}
 	if validator == nil {
 		return fmt.Errorf("checkpoint validation is unavailable")
-	}
-	payload, err := EncodeCheckpointSeal(seal)
-	if err != nil {
-		return err
 	}
 	if c.localMode && admission {
 		if err := c.localValidateDecisionPrefixOwned(seal.Index); err != nil {
@@ -1868,9 +2036,62 @@ func (c *Core) prepareCheckpointOwnedWithAdmission(ctx context.Context, seal Che
 	if err != nil {
 		return err
 	}
-	if err := c.wal.Append(qlog.Entry{Slot: uint64(seal.Index), Hash: seal.RootHash, Type: qlog.EntryCheckpointVerified, Payload: payload}); err != nil {
+	if err := ctx.Err(); err != nil {
 		return err
 	}
+	c.mu.Lock()
+	if err := c.checkCheckpointIdentityLocked(seal); err != nil {
+		c.mu.Unlock()
+		return err
+	}
+	if preparedIndex, preparedRoot, prepared := c.latestPreparedCheckpointLocked(); prepared && seal.Index < preparedIndex {
+		c.mu.Unlock()
+		return fmt.Errorf("checkpoint index %d is below prepared fence %d", seal.Index, preparedIndex)
+	} else if prepared && seal.Index == preparedIndex && preparedRoot != seal.RootHash {
+		c.mu.Unlock()
+		return fmt.Errorf("checkpoint index %d is already prepared with another root", seal.Index)
+	}
+	if len(c.pendingPrepares) != 0 {
+		c.mu.Unlock()
+		return fmt.Errorf("%w: another prepared candidate has unresolved marker durability", ErrCheckpointPreparePending)
+	}
+	extra, err := c.pendingCheckpointSealLocked(seal)
+	if err != nil {
+		c.mu.Unlock()
+		return err
+	}
+	if c.localMode && len(extra) != 0 {
+		c.mu.Unlock()
+		return fmt.Errorf("%w: local checkpoint prepare found an undurable certified seal", ErrCheckpointPreparePending)
+	}
+	pending = mergePendingSlotValues(pending, extra)
+	marker := qlog.Entry{Slot: uint64(seal.Index), Hash: seal.RootHash, Type: qlog.EntryCheckpointVerified, Payload: payload}
+	if err := c.wal.Append(marker); err != nil {
+		c.mu.Unlock()
+		return err
+	}
+	c.pendingPrepares[seal.Index] = pendingCheckpointPrepare{identity: identity, root: seal.RootHash, durable: append([]SlotValue(nil), pending...)}
+	c.mu.Unlock()
+	return c.finishPendingCheckpointPrepare(ctx, seal, identity, pending)
+}
+
+func mergePendingSlotValues(prefix, extra []SlotValue) []SlotValue {
+	bySlot := make(map[Slot]ValueHash, len(prefix)+len(extra))
+	for _, value := range prefix {
+		bySlot[value.Slot] = value.Hash
+	}
+	for _, value := range extra {
+		bySlot[value.Slot] = value.Hash
+	}
+	merged := make([]SlotValue, 0, len(bySlot))
+	for slot, hash := range bySlot {
+		merged = append(merged, SlotValue{Slot: slot, Hash: hash})
+	}
+	sort.Slice(merged, func(i, j int) bool { return merged[i].Slot < merged[j].Slot })
+	return merged
+}
+
+func (c *Core) finishPendingCheckpointPrepare(ctx context.Context, seal CheckpointSeal, identity ValueHash, durable []SlotValue) error {
 	if err := c.commits.Sync(ctx); err != nil {
 		return err
 	}
@@ -1880,14 +2101,20 @@ func (c *Core) prepareCheckpointOwnedWithAdmission(ctx context.Context, seal Che
 		localtesthooks.Hit("core:after-prepared-marker-sync-before-seal")
 	}
 	c.mu.Lock()
-	for _, value := range pending {
-		if decided, ok := c.decided[value.Slot]; ok && decided.Hash == value.Hash {
+	pending, ok := c.pendingPrepares[seal.Index]
+	if !ok || pending.identity != identity || pending.root != seal.RootHash {
+		c.mu.Unlock()
+		return fmt.Errorf("%w: prepared candidate identity changed before durable acknowledgement", ErrCheckpointPreparePending)
+	}
+	for _, value := range durable {
+		if decided, exists := c.decided[value.Slot]; exists && decided.Hash == value.Hash {
 			c.durable[value.Slot] = true
 			c.valueDurable[value.Hash] = true
 		}
 	}
 	clear(c.preparedCheckpoints)
 	c.preparedCheckpoints[seal.Index] = seal.RootHash
+	delete(c.pendingPrepares, seal.Index)
 	c.mu.Unlock()
 	return nil
 }

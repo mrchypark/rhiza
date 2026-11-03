@@ -161,6 +161,12 @@ func (n *Node) publishManagedGraphCheckpoint(ctx context.Context) error {
 		return fmt.Errorf("managed Graph prepared cut conflict retained; advanced certified control cut")
 	}
 	if err := n.core.PrepareCheckpoint(ctx, seal); err != nil {
+		if errors.Is(err, quepaxa.ErrCheckpointPreparePending) {
+			if controlErr := n.advanceManagedGraphCheckpointCut(ctx); controlErr != nil {
+				return errors.Join(err, controlErr)
+			}
+			return fmt.Errorf("managed Graph pending checkpoint preserved; advanced certified control cut for a fresh capture: %w", err)
+		}
 		return n.reconcileManagedGraphCapturedFence(ctx, seal.Index, err)
 	}
 	if err := n.transport.PrepareCheckpoint(ctx, seal); err != nil {

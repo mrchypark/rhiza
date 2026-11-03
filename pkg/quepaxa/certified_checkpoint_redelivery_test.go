@@ -60,6 +60,7 @@ func testCertifiedCheckpointRedeliveryDurability(t *testing.T, cancelSync bool) 
 		}
 	}
 	transport.mu.Lock()
+	transport.down["n3"] = true
 	transport.dropDecision["n3"] = true
 	transport.mu.Unlock()
 	value, err := EncodeCheckpointSeal(old)
@@ -67,8 +68,17 @@ func testCertifiedCheckpointRedeliveryDurability(t *testing.T, cancelSync bool) 
 		t.Fatal(err)
 	}
 	slot, _, err := source.Propose(ctx, value)
+	transport.mu.Lock()
+	transport.down["n3"] = false
+	transport.mu.Unlock()
 	if err != nil || slot != 6 {
 		t.Fatal("actual retained seal certification", slot, err)
+	}
+	target.mu.RLock()
+	recorder := target.recorders[slot]
+	target.mu.RUnlock()
+	if recorder.Step != 0 || recorder.FirstCurrent != nil {
+		t.Fatalf("n3 received the old checkpoint Record before its higher prepare: %+v", recorder)
 	}
 	stored, ok := source.CertifiedValue(slot)
 	if !ok {
