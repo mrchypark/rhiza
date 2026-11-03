@@ -281,10 +281,12 @@ func (h *Host) KVMutate(ctx context.Context, operation string, req network.KVMut
 		return notSubmitted(SQLStageValidation, false, err)
 	}
 	if h.internalRequests() {
-		if err := h.ensureInitialRequestAdmission(ctx); err != nil {
+		operationCtx, release := h.internalRequestContext(ctx)
+		defer release()
+		if err := h.ensureInitialRequestAdmission(operationCtx); err != nil {
 			return notSubmitted(SQLStageAdmission, false, err)
 		}
-		response, err := h.node.ExecuteManagedKV(ctx, original.Operation, kvRequest(original))
+		response, err := h.node.ExecuteManagedKV(operationCtx, original.Operation, kvRequest(original))
 		p := applicationOriginal{kind: "kv", kv: original}
 		err = internalRequestOutcome(p, response.MutationReceipt, err)
 		h.rememberRequestOutcome(p, err, response.MutationReceipt)
@@ -346,10 +348,12 @@ func (h *Host) KVGet(ctx context.Context, req network.KVGetRequest) (network.KVG
 	if h.closed || !h.mixed() {
 		return network.KVGetResponse{}, fmt.Errorf("mixed managed Host required")
 	}
-	if err := h.ensureInitialRequestAdmission(ctx); err != nil {
+	operationCtx, release := h.internalRequestContext(ctx)
+	defer release()
+	if err := h.ensureInitialRequestAdmission(operationCtx); err != nil {
 		return network.KVGetResponse{}, err
 	}
-	return h.node.KVGetManaged(ctx, req)
+	return h.node.KVGetManaged(operationCtx, req)
 }
 
 // RequestStatus observes local retained history, not a durability ACK or write
@@ -360,13 +364,15 @@ func (h *Host) RequestStatus(ctx context.Context, req network.RequestStatusReque
 	if h.closed || !h.mixed() {
 		return network.RequestStatusResponse{}, fmt.Errorf("mixed managed Host required")
 	}
-	if err := h.ensureInitialRequestAdmission(ctx); err != nil {
+	operationCtx, release := h.internalRequestContext(ctx)
+	defer release()
+	if err := h.ensureInitialRequestAdmission(operationCtx); err != nil {
 		return network.RequestStatusResponse{}, err
 	}
 	if req.Kind == "graph" {
-		return h.node.GraphRequestStatusManaged(ctx, req)
+		return h.node.GraphRequestStatusManaged(operationCtx, req)
 	}
-	return h.node.RequestStatusManaged(ctx, req)
+	return h.node.RequestStatusManaged(operationCtx, req)
 }
 
 func applicationOutcomeUnknown(p applicationOriginal, receipt types.MutationReceipt, cause error) error {
@@ -580,6 +586,8 @@ func (h *Host) RecoverPendingDetailed(ctx context.Context) (RecoveryResult, erro
 		return RecoveryResult{}, fmt.Errorf("SQL host closed")
 	}
 	if h.internalRequests() {
+		operationCtx, release := h.internalRequestContext(ctx)
+		defer release()
 		if h.recoveryTargetOverflow || len(h.recoveryTargets) != 1 {
 			return RecoveryResult{}, &network.CommitUnknownError{Cause: fmt.Errorf("exact recovery target required or ambiguous")}
 		}
@@ -587,7 +595,7 @@ func (h *Host) RecoverPendingDetailed(ctx context.Context) (RecoveryResult, erro
 			if hint.ambiguous {
 				return RecoveryResult{}, &network.CommitUnknownError{Cause: fmt.Errorf("recovery target intent is ambiguous")}
 			}
-			return h.recoverRequestLocked(ctx, selector, &hint.fingerprint)
+			return h.recoverRequestLocked(operationCtx, selector, &hint.fingerprint)
 		}
 		return RecoveryResult{}, &network.CommitUnknownError{Cause: fmt.Errorf("exact recovery target required")}
 	}

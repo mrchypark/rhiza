@@ -38,10 +38,12 @@ func (h *Host) GraphExecute(ctx context.Context, request types.GraphCommand) (ne
 	if err != nil || !recognized {
 		return network.GraphExecuteResponse{}, network.ErrInvalidRequest
 	}
-	if err := h.ensureInitialRequestAdmission(ctx); err != nil {
+	operationCtx, release := h.internalRequestContext(ctx)
+	defer release()
+	if err := h.ensureInitialRequestAdmission(operationCtx); err != nil {
 		return network.GraphExecuteResponse{}, err
 	}
-	result, err := h.node.ExecuteManagedGraph(ctx, owned)
+	result, err := h.node.ExecuteManagedGraph(operationCtx, owned)
 	p := applicationOriginal{kind: "graph", graph: owned}
 	err = internalRequestOutcome(p, result.MutationReceipt, err)
 	h.rememberRequestOutcome(p, err, result.MutationReceipt)

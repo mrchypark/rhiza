@@ -9,6 +9,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"os"
 	"path"
 	"path/filepath"
@@ -203,6 +204,14 @@ func (n *Node) installInternalApplicationBinding(ctx context.Context) error {
 }
 
 func (n *Node) checkInternalApplicationRuntime(ctx context.Context) (ManagedRuntimeState, error) {
+	return n.checkInternalApplicationRuntimeObserved(ctx, true)
+}
+
+func (n *Node) checkInternalApplicationRuntimeOnce(ctx context.Context) (ManagedRuntimeState, error) {
+	return n.checkInternalApplicationRuntimeObserved(ctx, false)
+}
+
+func (n *Node) checkInternalApplicationRuntimeObserved(ctx context.Context, retryProgress bool) (ManagedRuntimeState, error) {
 	_, ctx, release, err := n.borrowInternalApplication(ctx)
 	if err != nil {
 		return ManagedRuntimeState{}, err
@@ -244,7 +253,22 @@ func (n *Node) checkInternalApplicationRuntime(ctx context.Context) (ManagedRunt
 	if fatal := n.wal.Capacity().Fatal; fatal != nil {
 		return ManagedRuntimeState{}, fatal
 	}
-	state := n.managedRuntimeState()
+	var state ManagedRuntimeState
+	if retryProgress {
+		state, err = n.managedRuntimeStateWithContext(ctx)
+		if err != nil {
+			return state, err
+		}
+	} else {
+		var stable bool
+		state, stable = n.managedRuntimeStateOnce()
+		if err := ctx.Err(); err != nil {
+			return state, err
+		}
+		if !stable {
+			return ManagedRuntimeState{}, network.ErrNotReady
+		}
+	}
 	if state.WALIdentity != b.wal || state.AppliedTip > state.CertifiedTip {
 		return state, fmt.Errorf("internal application applied prefix is invalid")
 	}
@@ -252,7 +276,7 @@ func (n *Node) checkInternalApplicationRuntime(ctx context.Context) (ManagedRunt
 }
 
 func (n *Node) admitInternalApplication(ctx context.Context) error {
-	_, ctx, release, err := n.borrowInternalApplication(ctx)
+	binding, ctx, release, err := n.borrowInternalApplication(ctx)
 	if err != nil {
 		return err
 	}
@@ -272,6 +296,11 @@ func (n *Node) admitInternalApplication(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
+	if n.materializationPolicy() == sqlpolicy.ManagedGraphRequestMaterializationPolicy {
+		if err := n.waitManagedGraphOwnedControl(ctx, binding, target); err != nil {
+			return err
+		}
+	}
 	// ReadIndex may observe a peer's certified tip before its Learned delivery
 	// reaches this Core. Replay must not finish against an older local tip and
 	// then reject the very target it was meant to synchronize. Wait only for
@@ -287,6 +316,9 @@ func (n *Node) admitInternalApplication(ctx context.Context) error {
 		return err
 	}
 	if state.CertifiedTip < uint64(target) || state.AppliedTip != state.CertifiedTip || state.RecorderTip > state.CertifiedTip {
+		if n.materializationPolicy() == sqlpolicy.ManagedGraphRequestMaterializationPolicy {
+			log.Printf("MANAGED_GRAPH_ADMISSION_REFUSED target=%d recorded=%d certified=%d applied=%d", target, state.RecorderTip, state.CertifiedTip, state.AppliedTip)
+		}
 		return fmt.Errorf("internal application has unresolved certified history: target=%d recorded=%d certified=%d applied=%d", target, state.RecorderTip, state.CertifiedTip, state.AppliedTip)
 	}
 	return nil
@@ -656,19 +688,61 @@ func managedRepairOriginDigest(raw []byte) string {
 	return hex.EncodeToString(hash[:])
 }
 
-func (n *Node) managedRuntimeState() ManagedRuntimeState {
+func (n *Node) managedRuntimeStateOnce() (ManagedRuntimeState, bool) {
 	existing := n.managedStartup != nil && n.managedStartup.existingRegisteredWAL
-	return ManagedRuntimeState{WALIdentity: n.core.WALIdentity(), CertifiedTip: uint64(n.core.Tip()), AppliedTip: n.material.Tip(), RecorderTip: uint64(n.core.RecorderTip()), ExistingRegisteredWAL: existing}
+	wal := n.core.WALIdentity()
+	before := n.core.RuntimeProgressSnapshot()
+	if localtesthooks.Enabled {
+		localtesthooks.Hit("node:managed-runtime-state:after-certified-tip")
+	}
+	applied := n.material.Tip()
+	after := n.core.RuntimeProgressSnapshot()
+	state := ManagedRuntimeState{WALIdentity: wal, CertifiedTip: uint64(after.CertifiedTip), AppliedTip: applied, RecorderTip: uint64(after.RecorderTip), ExistingRegisteredWAL: existing}
+	return state, before.CertifiedTip == after.CertifiedTip
+}
+
+// managedRuntimeStateWithContext brackets the materializer tip with two
+// observations from the same Core. If the certified prefix advanced during
+// that interval, it discards the mixed sample and observes again under the
+// caller's context. Recorder-only advancement remains visible and fail-closed.
+func (n *Node) managedRuntimeStateWithContext(ctx context.Context) (ManagedRuntimeState, error) {
+	for {
+		if err := ctx.Err(); err != nil {
+			return ManagedRuntimeState{}, err
+		}
+		state, stable := n.managedRuntimeStateOnce()
+		if !stable {
+			continue
+		}
+		if err := ctx.Err(); err != nil {
+			return state, err
+		}
+		return state, nil
+	}
 }
 
 func (n *Node) ManagedState() (ManagedRuntimeState, error) {
 	if n.internalApplicationProfile() {
-		return n.checkInternalApplicationRuntime(context.Background())
+		return n.checkInternalApplicationRuntimeOnce(context.Background())
 	}
 	if n == nil || n.managedStartup == nil || !n.opened.Load() || n.core == nil || n.material == nil {
 		return ManagedRuntimeState{}, fmt.Errorf("managed runtime is not open")
 	}
-	return n.managedRuntimeState(), nil
+	state, stable := n.managedRuntimeStateOnce()
+	if !stable {
+		return ManagedRuntimeState{}, network.ErrNotReady
+	}
+	return state, nil
+}
+
+func (n *Node) managedStateWithContext(ctx context.Context) (ManagedRuntimeState, error) {
+	if n.internalApplicationProfile() {
+		return n.checkInternalApplicationRuntime(ctx)
+	}
+	if n == nil || n.managedStartup == nil || !n.opened.Load() || n.core == nil || n.material == nil {
+		return ManagedRuntimeState{}, fmt.Errorf("managed runtime is not open")
+	}
+	return n.managedRuntimeStateWithContext(ctx)
 }
 
 // EnsureInitialManagedAdmission preserves the first real quorum/live-authority
@@ -748,7 +822,10 @@ func (n *Node) AdmitManaged(ctx context.Context) error {
 	if err := n.replayLocalDecisions(ctx); err != nil {
 		return err
 	}
-	state := n.managedRuntimeState()
+	state, err := n.managedRuntimeStateWithContext(ctx)
+	if err != nil {
+		return err
+	}
 	if state.CertifiedTip < uint64(target) || state.AppliedTip != state.CertifiedTip || state.RecorderTip > state.CertifiedTip {
 		return fmt.Errorf("managed runtime has unapplied or unresolved history")
 	}

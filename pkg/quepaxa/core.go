@@ -1759,6 +1759,45 @@ func (c *Core) checkpointIdentityWithLag(seal CheckpointSeal) (bool, func(contex
 	return false, validator, false, nil
 }
 
+// validateRecoveredPreparedCheckpoint checks a durable marker against the
+// recovered history at its own cut. Unlike new prepare/record eligibility,
+// later transitions (including an incomplete freeze) do not rewrite history
+// before the marker's cut or make the marker current authority.
+func (c *Core) validateRecoveredPreparedCheckpoint(seal CheckpointSeal) error {
+	c.mu.RLock()
+	prefix, prefixOK := c.prefixes[seal.Index]
+	preparedIndex, preparedRoot, prepared := c.latestPreparedCheckpointLocked()
+	order, following, orderErr := c.checkpointLeaderOrdersLocked(seal.Index)
+	tip := c.tip
+	anchor := c.generationAnchorHash
+	configID := c.clusterForSlotLocked(seal.Index + 1).ConfigID
+	var expected MembershipRecord
+	var membershipErr error
+	if c.reconfigEnabled {
+		expected, membershipErr = c.checkpointMembershipAtLocked(seal.Index)
+	}
+	c.mu.RUnlock()
+	if membershipErr != nil {
+		return fmt.Errorf("checkpoint membership at recovered cut: %w", membershipErr)
+	}
+	if seal.GenerationAnchorHash != anchor || seal.ConfigID != configID || !prefixOK || prefix != seal.PrefixHash || tip < seal.Index || orderErr != nil || !slices.Equal(order, seal.NextLeaderOrder) || !slices.Equal(following, seal.FollowingLeaderOrder) {
+		return fmt.Errorf("checkpoint marker does not match recovered historical cut")
+	}
+	if c.reconfigEnabled && (seal.Membership == nil || !sameMembershipRecord(expected, *seal.Membership)) {
+		return fmt.Errorf("checkpoint marker membership differs from recovered historical cut")
+	}
+	if _, err := c.checkpointMembershipForSeal(seal); err != nil {
+		return err
+	}
+	if prepared && seal.Index < preparedIndex {
+		return fmt.Errorf("checkpoint index %d is below prepared fence %d", seal.Index, preparedIndex)
+	}
+	if prepared && seal.Index == preparedIndex && preparedRoot != seal.RootHash {
+		return fmt.Errorf("checkpoint index %d is already prepared with another root", seal.Index)
+	}
+	return nil
+}
+
 // RequirePreparedCheckpoint is the bounded Record-path check. Full object
 // verification happens before consensus through PrepareCheckpoint.
 func (c *Core) RequirePreparedCheckpoint(seal CheckpointSeal) error {
@@ -3217,7 +3256,11 @@ func (c *Core) recover() error {
 			if decodeErr == nil && checkpoint {
 				_, decodeErr = c.checkpointMembershipForSeal(seal)
 			}
-			if decodeErr != nil || !checkpoint || uint64(seal.Index) != entry.Slot || seal.RootHash != entry.Hash || seal.ConfigID != c.ConfigID() || !c.validateCheckpointLeaderOrders(seal.Index, seal.NextLeaderOrder, seal.FollowingLeaderOrder) {
+			// The marker's wire identity is checked in WAL order here. Epoch,
+			// membership and leader-order checks depend on certified membership
+			// history, which is replayed only after this scan; validate local
+			// recovered-cut consistency below at the marker's own cut.
+			if decodeErr != nil || !checkpoint || uint64(seal.Index) != entry.Slot || seal.RootHash != entry.Hash {
 				if decodeErr == nil {
 					decodeErr = fmt.Errorf("checkpoint verification identity mismatch")
 				}
@@ -3351,7 +3394,7 @@ func (c *Core) recover() error {
 		c.mu.Unlock()
 	}
 	for _, seal := range prepared {
-		if _, _, err := c.checkpointIdentity(seal); err != nil {
+		if err := c.validateRecoveredPreparedCheckpoint(seal); err != nil {
 			return fmt.Errorf("recover verified checkpoint: %w", err)
 		}
 		c.mu.Lock()

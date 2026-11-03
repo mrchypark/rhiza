@@ -14,23 +14,39 @@ func (h *Host) internalRequests() bool {
 	return h.cfg.Plan.ApplicationProtocol == sqlpolicy.ManagedRequestApplicationProtocol || h.cfg.Plan.ApplicationProtocol == sqlpolicy.ManagedGraphRequestApplicationProtocol
 }
 
+// internalRequestContext scopes the complete lock-held operation to both its
+// caller and this Host's close lifetime. The initial-admission scope alone is
+// insufficient: Node may re-observe certified progress later in the request.
+func (h *Host) internalRequestContext(ctx context.Context) (context.Context, func()) {
+	if !h.internalRequests() || h.admissionLifetime == nil {
+		return ctx, func() {}
+	}
+	scope, cancel := context.WithCancel(ctx)
+	stop := context.AfterFunc(h.admissionLifetime, cancel)
+	if h.admissionLifetime.Err() != nil {
+		cancel()
+	}
+	return scope, func() {
+		stop()
+		cancel()
+	}
+}
+
 // The first public operation drives real initial quorum/live startup admission.
 // Once admitted, Node returns without repeating quorum or Kubernetes checks;
 // each operation then uses its own actual runtime/read/write gate.
 func (h *Host) ensureInitialRequestAdmission(ctx context.Context) error {
 	if h.internalRequests() {
-		if h.admissionLifetime != nil {
-			scope, cancel := context.WithCancel(ctx)
-			stop := context.AfterFunc(h.admissionLifetime, cancel)
-			defer stop()
-			defer cancel()
-			if h.admissionLifetime.Err() != nil {
-				return network.ErrNotReady
-			}
-			err := h.node.EnsureInitialManagedAdmission(scope)
-			return errors.Join(err, scope.Err(), h.admissionLifetime.Err())
+		if h.admissionLifetime == nil {
+			return h.node.EnsureInitialManagedAdmission(ctx)
 		}
-		return h.node.EnsureInitialManagedAdmission(ctx)
+		scope, release := h.internalRequestContext(ctx)
+		defer release()
+		if h.admissionLifetime.Err() != nil {
+			return network.ErrNotReady
+		}
+		err := h.node.EnsureInitialManagedAdmission(scope)
+		return errors.Join(err, scope.Err(), h.admissionLifetime.Err())
 	}
 	return nil
 }
@@ -122,7 +138,9 @@ func (h *Host) RecoverRequest(ctx context.Context, selector network.RequestStatu
 	if h.closed || !h.internalRequests() {
 		return RecoveryResult{}, fmt.Errorf("internal-request managed Host required")
 	}
-	return h.recoverRequestLocked(ctx, selector, nil)
+	scope, release := h.internalRequestContext(ctx)
+	defer release()
+	return h.recoverRequestLocked(scope, selector, nil)
 }
 
 func (h *Host) recoverRequestLocked(ctx context.Context, selector network.RequestStatusRequest, expected *[32]byte) (RecoveryResult, error) {

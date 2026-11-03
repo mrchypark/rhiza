@@ -151,3 +151,55 @@ func (c *Core) membershipHistoryLocked(through Slot) (MembershipRecord, error) {
 	}
 	return record, nil
 }
+
+// checkpointMembershipAtLocked returns the already-recovered membership prefix
+// that existed at a checkpoint cut. Later certified transitions must not
+// invalidate an older marker; the seal is independently checked against this
+// exact prefix and its own genesis-bound certificates.
+func (c *Core) checkpointMembershipAtLocked(through Slot) (MembershipRecord, error) {
+	if through == 0 {
+		return MembershipRecord{}, fmt.Errorf("checkpoint membership cut is zero")
+	}
+	record, err := c.membershipHistoryLocked(0)
+	if err != nil {
+		return MembershipRecord{}, err
+	}
+	cut := 0
+	for cut < len(record.Transitions) && record.Transitions[cut].Terminal.Slot < through {
+		cut++
+	}
+	record.Transitions = record.Transitions[:cut]
+	var lastSuccess Slot
+	if len(record.Transitions) != 0 {
+		lastSuccess = record.Transitions[len(record.Transitions)-1].Terminal.Slot
+	}
+	var abort *ConfigTransition
+	// CheckpointMembership includes an abort decision at the exact checkpoint
+	// cut: aborts do not change the active epoch, unlike successful transitions
+	// whose terminal must remain strictly before the cut.
+	if record.Abort != nil && record.Abort.Terminal.Slot <= through && record.Abort.Terminal.Slot > lastSuccess {
+		copy := cloneMembershipRecord(MembershipRecord{Abort: record.Abort}).Abort
+		abort = copy
+	}
+	for slot, decision := range c.decided {
+		if slot <= lastSuccess || slot > through || !c.durable[slot] {
+			continue
+		}
+		control, ok, err := decodeReconfiguration(decision.Value)
+		if err != nil || !ok || !control.Terminal || !control.Abort {
+			continue
+		}
+		freeze, found := c.decided[control.Freeze]
+		if !found || !c.durable[control.Freeze] {
+			return MembershipRecord{}, fmt.Errorf("membership history: abort freeze slot %d is not durable", control.Freeze)
+		}
+		if abort == nil || abort.Terminal.Slot < slot {
+			abort = &ConfigTransition{
+				Freeze:   cloneDecidedValue(freeze),
+				Terminal: cloneDecidedValue(decision),
+			}
+		}
+	}
+	record.Abort = abort
+	return record, nil
+}

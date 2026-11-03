@@ -275,6 +275,20 @@ jobs:
           go test -race -tags rhiza_local_testhooks ./pkg/network -run '^TestOverload(MutationAdmissionEmitsFixedSite|QueueReservationEmitsFixedSite|InputChannelFullEmitsFixedSite|WorkerInflightBytesEmitsFixedSite|ProposalAdmissionSubtypeEmitsFixedSite)$' -count=1 -timeout=30s
           go test -race -tags rhiza_local_testhooks ./pkg/node -run '^TestAdvanceCheckpointReadBarriersRetriesRealPreAdmissionRefusal$' -count=1 -timeout=30s
           go test -race -tags rhiza_local_testhooks ./pkg/recovery -run '^(TestArchiveCleanupReusesUnchangedPrefixAfterRealHeadConflict|TestArchiveCleanupReuseRequiresExactBaseAndRefPrefix|TestArchiveCleanupIncrementalPackingMatchesFullAtBoundaries|TestArchiveCleanupAmbiguousPublicationReloadsCommittedHead|TestArchiveCleanupCanceledAfterHeadConflictDoesNotRepublish)$' -count=1 -timeout=2m
+      - name: Managed Graph certified-progress admission and marker regressions
+        env:
+          CGO_ENABLED: 1
+        run: >-
+          go test -tags rhiza_local_testhooks ./pkg/node ./pkg/managedsql ./pkg/quepaxa ./cmd/rhiza-ffi
+          -run '^(TestManagedGraphAdmission.*|TestManagedStateWithoutContextRejectsUnstableProgressOnce|TestManagedGraphCloseCancelsActiveBackgroundAdmissionResampling|TestRuntimeProgressSnapshotIncludesActualPendingRecorder|TestPreparedCheckpointMarkersReopenAcrossCertifiedMembershipChanges|TestManagedGraphRustOffsetMaxOnPublicHost|TestManagedGraphAppliedPrefixFailureUsesOrdinaryFFIDiagnosticShape)$'
+          -count=1 -timeout=60s
+      - name: Managed Graph certified-progress admission and marker regressions (race)
+        env:
+          CGO_ENABLED: 1
+        run: >-
+          go test -race -tags rhiza_local_testhooks ./pkg/node ./pkg/managedsql ./pkg/quepaxa ./cmd/rhiza-ffi
+          -run '^(TestManagedGraphAdmission.*|TestManagedStateWithoutContextRejectsUnstableProgressOnce|TestManagedGraphCloseCancelsActiveBackgroundAdmissionResampling|TestRuntimeProgressSnapshotIncludesActualPendingRecorder|TestPreparedCheckpointMarkersReopenAcrossCertifiedMembershipChanges|TestManagedGraphRustOffsetMaxOnPublicHost|TestManagedGraphAppliedPrefixFailureUsesOrdinaryFFIDiagnosticShape)$'
+          -count=1 -timeout=60s
       - name: Vet
         env:
           CGO_ENABLED: 0

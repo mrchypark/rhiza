@@ -477,10 +477,12 @@ func (h *Host) Ready(ctx context.Context) error {
 	if h.closed {
 		return fmt.Errorf("SQL host closed")
 	}
-	if err := h.ensureInitialRequestAdmission(ctx); err != nil {
+	operationCtx, release := h.internalRequestContext(ctx)
+	defer release()
+	if err := h.ensureInitialRequestAdmission(operationCtx); err != nil {
 		return err
 	}
-	return h.node.CheckManagedLocalRead(ctx)
+	return h.node.CheckManagedLocalRead(operationCtx)
 }
 
 // RemoveRepairVoter excludes the old voter from consensus only. It does not
@@ -644,10 +646,12 @@ func (h *Host) Execute(ctx context.Context, req ExecuteRequest) (ExecuteResponse
 		return ExecuteResponse{}, &SQLNotSubmittedError{Stage: SQLStageValidation, Cause: err}
 	}
 	if h.internalRequests() {
-		if err := h.ensureInitialRequestAdmission(ctx); err != nil {
+		operationCtx, release := h.internalRequestContext(ctx)
+		defer release()
+		if err := h.ensureInitialRequestAdmission(operationCtx); err != nil {
 			return ExecuteResponse{}, &SQLNotSubmittedError{Stage: SQLStageAdmission, Cause: err}
 		}
-		response, err := h.node.ExecuteManagedSQL(ctx, req)
+		response, err := h.node.ExecuteManagedSQL(operationCtx, req)
 		p := applicationOriginal{kind: "sql", sql: req}
 		err = internalRequestOutcome(p, response.MutationReceipt, err)
 		h.rememberRequestOutcome(p, err, response.MutationReceipt)
@@ -728,10 +732,12 @@ func (h *Host) Query(ctx context.Context, req QueryRequest) (QueryResponse, erro
 	if h.closed {
 		return QueryResponse{}, fmt.Errorf("SQL host closed")
 	}
-	if err := h.ensureInitialRequestAdmission(ctx); err != nil {
+	operationCtx, release := h.internalRequestContext(ctx)
+	defer release()
+	if err := h.ensureInitialRequestAdmission(operationCtx); err != nil {
 		return QueryResponse{}, err
 	}
-	return h.node.QueryManagedSQL(ctx, req)
+	return h.node.QueryManagedSQL(operationCtx, req)
 }
 
 func (h *Host) Close() error {

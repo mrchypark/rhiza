@@ -34,8 +34,15 @@ func (n *Node) InspectManagedGraph(ctx context.Context, fresh, localRead bool) (
 		return ManagedGraphSnapshot{}, err
 	}
 	history, err := n.material.ManagedGraphHistory(ctx)
-	if err != nil || runtime != n.managedRuntimeState() || fresh && history.LastGraphSlot != 0 {
+	if err != nil {
 		return ManagedGraphSnapshot{}, errors.Join(fmt.Errorf("Graph lineage changed or is not fresh"), err)
+	}
+	current, err := n.managedRuntimeStateWithContext(ctx)
+	if err != nil {
+		return ManagedGraphSnapshot{}, errors.Join(fmt.Errorf("Graph lineage changed or is not fresh"), err)
+	}
+	if runtime != current || fresh && history.LastGraphSlot != 0 {
+		return ManagedGraphSnapshot{}, fmt.Errorf("Graph lineage changed or is not fresh")
 	}
 	return ManagedGraphSnapshot{Application: materializer.ManagedApplicationState{Digest: digest, FreshEmpty: empty && history.LastGraphSlot == 0}, History: history, Runtime: runtime}, nil
 }

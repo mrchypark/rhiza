@@ -94,7 +94,7 @@ func (n *Node) CheckManagedLocalRead(ctx context.Context) error {
 		}
 		return nil
 	}
-	if _, err := n.ManagedState(); err != nil {
+	if _, err := n.managedStateWithContext(ctx); err != nil {
 		return err
 	}
 	if !n.managedInitiallyAdmitted.Load() {
@@ -105,7 +105,10 @@ func (n *Node) CheckManagedLocalRead(ctx context.Context) error {
 	if !n.core.IsVoter() {
 		return network.ErrNotReady
 	}
-	state := n.managedRuntimeState()
+	state, err := n.managedRuntimeStateWithContext(ctx)
+	if err != nil {
+		return err
+	}
 	checker, ok := n.managedStartup.Checker.(ManagedSQLReadChecker)
 	if !ok {
 		return network.ErrNotReady
@@ -356,7 +359,7 @@ func (n *Node) inspectManagedApplication(ctx context.Context, fresh, localRead b
 	fail := func(err error) ([32]byte, bool, ManagedRuntimeState, error) {
 		return [32]byte{}, false, ManagedRuntimeState{}, err
 	}
-	if _, err := n.ManagedState(); err != nil {
+	if _, err := n.managedStateWithContext(ctx); err != nil {
 		return fail(err)
 	}
 	if !localRead {
@@ -366,7 +369,10 @@ func (n *Node) inspectManagedApplication(ctx context.Context, fresh, localRead b
 	}
 	n.replayMu.Lock()
 	defer n.replayMu.Unlock()
-	before := n.managedRuntimeState()
+	before, err := n.managedRuntimeStateWithContext(ctx)
+	if err != nil {
+		return fail(err)
+	}
 	floor := n.core.CompactionFloor()
 	if fresh && managedSQLKVPolicy(n.materializationPolicy()) && floor != 0 {
 		return fail(fmt.Errorf("compacted application history is not fresh-state proof"))
@@ -432,14 +438,18 @@ func (n *Node) inspectManagedApplication(ctx context.Context, fresh, localRead b
 			from = v.Slot + 1
 		}
 	}
-	digest, empty, err := n.inspectApplicationState(ctx, n.material)
+	digest, empty, err = n.inspectApplicationState(ctx, n.material)
 	if err != nil {
 		return fail(err)
 	}
 	if fresh && !empty {
 		return fail(fmt.Errorf("application state is not fresh empty"))
 	}
-	if before != n.managedRuntimeState() {
+	after, err := n.managedRuntimeStateWithContext(ctx)
+	if err != nil {
+		return fail(err)
+	}
+	if before != after {
 		return fail(fmt.Errorf("history changed during application inspection"))
 	}
 	return digest, empty, before, nil
@@ -466,7 +476,7 @@ func (n *Node) ExecuteManagedSQL(ctx context.Context, req network.ExecuteRequest
 		}
 		return n.server.Execute(ctx, req)
 	}
-	state, err := n.ManagedState()
+	state, err := n.managedStateWithContext(ctx)
 	if err != nil {
 		return network.ExecuteResponse{}, err
 	}
@@ -527,7 +537,7 @@ func (n *Node) ResolveManagedSQL(ctx context.Context, req network.ExecuteRequest
 		}
 		return network.ResolveExecuteResult{State: network.ResolveExecuteRetained, Receipt: &resolved.Receipt, Statements: resolved.Statements, Durability: network.ResolveExecuteDurabilityConfirmed}, nil
 	}
-	if _, err := n.ManagedState(); err != nil {
+	if _, err := n.managedStateWithContext(ctx); err != nil {
 		return network.ResolveExecuteResult{}, err
 	}
 	result, err := n.server.ResolveExecute(ctx, req)
@@ -548,7 +558,10 @@ func (n *Node) ResolveManagedSQL(ctx context.Context, req network.ExecuteRequest
 	if err := n.replayLocalDecisions(ctx); err != nil {
 		return result, err
 	}
-	state := n.managedRuntimeState()
+	state, err := n.managedRuntimeStateWithContext(ctx)
+	if err != nil {
+		return result, err
+	}
 	if state.CertifiedTip < uint64(target) || state.AppliedTip != state.CertifiedTip || state.RecorderTip > state.CertifiedTip {
 		return result, fmt.Errorf("managed SQL recovery has unresolved certified history")
 	}
@@ -580,7 +593,11 @@ func (n *Node) QueryManagedSQL(ctx context.Context, req network.QueryRequest) (n
 			}
 			return n.server.Query(ctx, req)
 		}
-		if err := n.managedStartup.Checker.ValidateManagedAdmission(ctx, n.managedStartup.Identity, n.managedRuntimeState()); err != nil {
+		state, err := n.managedRuntimeStateWithContext(ctx)
+		if err != nil {
+			return network.QueryResponse{}, err
+		}
+		if err := n.managedStartup.Checker.ValidateManagedAdmission(ctx, n.managedStartup.Identity, state); err != nil {
 			return network.QueryResponse{}, err
 		}
 	}

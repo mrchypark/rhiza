@@ -48,6 +48,8 @@ type sqlWireControl struct {
 	putRelease              chan struct{}
 	putSuffix               string
 	putPrefix               string
+	putReadGateBytes        int
+	putReadErrors           chan error
 	// Optional arm is installed before runtime startup. Nil retains the
 	// existing unconditional gate; tests may atomically arm a later failure.
 	putEnabled     *atomic.Bool
@@ -66,7 +68,27 @@ func sqlWireStore(t *testing.T) (*httptest.Server, *sqlWireControl) {
 		if r.Method == http.MethodDelete {
 			control.deleteRequests.Add(1)
 		}
-		if r.Method == http.MethodPut && control.putReady != nil && (control.putEnabled == nil || control.putEnabled.Load()) && strings.Contains(r.URL.Path, control.putPrefix) && strings.HasSuffix(r.URL.Path, control.putSuffix) {
+		var gatedBodyPrefix []byte
+		gatePut := r.Method == http.MethodPut && control.putReady != nil && (control.putEnabled == nil || control.putEnabled.Load()) && strings.Contains(r.URL.Path, control.putPrefix) && strings.HasSuffix(r.URL.Path, control.putSuffix)
+		if gatePut && control.putReadGateBytes > 0 {
+			gatedBodyPrefix = make([]byte, control.putReadGateBytes)
+			n, err := io.ReadFull(r.Body, gatedBodyPrefix)
+			gatedBodyPrefix = gatedBodyPrefix[:n]
+			if err != nil {
+				if control.putReadErrors != nil {
+					select {
+					case control.putReadErrors <- fmt.Errorf("%s: read gate: %w", r.URL.Path, err):
+						w.WriteHeader(http.StatusBadRequest)
+						return
+					default:
+					}
+				}
+				t.Error(err)
+				w.WriteHeader(http.StatusInternalServerError)
+				return
+			}
+		}
+		if gatePut {
 			select {
 			case control.putReady <- r.URL.Path:
 			case <-control.putRelease:
@@ -76,7 +98,9 @@ func sqlWireStore(t *testing.T) (*httptest.Server, *sqlWireControl) {
 			select {
 			case <-control.putRelease:
 			case <-r.Context().Done():
-				return
+				if control.putReadGateBytes == 0 {
+					return
+				}
 			}
 		}
 		if r.Method == http.MethodPut && strings.HasSuffix(r.URL.Path, "voters/managed-sql-initialization.json") && control.receiptPutReady != nil {
@@ -157,9 +181,20 @@ func sqlWireStore(t *testing.T) (*httptest.Server, *sqlWireControl) {
 			}
 			body, err := io.ReadAll(r.Body)
 			if err != nil {
+				if control.putReadErrors != nil {
+					select {
+					case control.putReadErrors <- fmt.Errorf("%s: %w", r.URL.Path, err):
+						w.WriteHeader(http.StatusBadRequest)
+						return
+					default:
+					}
+				}
 				t.Error(err)
-				w.WriteHeader(500)
+				w.WriteHeader(http.StatusInternalServerError)
 				return
+			}
+			if len(gatedBodyPrefix) != 0 {
+				body = append(gatedBodyPrefix, body...)
 			}
 			if strings.HasPrefix(r.Header.Get("X-Amz-Content-Sha256"), "STREAMING-") {
 				var decoded []byte

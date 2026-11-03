@@ -55,6 +55,51 @@ func TestManagedGraphActualPublicHost(t *testing.T) {
 	}
 }
 
+func TestManagedGraphRustOffsetMaxOnPublicHost(t *testing.T) {
+	configs, fixture := sqlClusterForProtocol(t, sqlpolicy.ManagedGraphRequestApplicationProtocol)
+	ctx, cancel := context.WithTimeout(context.Background(), 25*time.Second)
+	t.Cleanup(cancel)
+	hosts := make([]*Host, len(configs))
+	for i, cfg := range configs {
+		h, err := fixture.open(ctx, cfg)
+		if h != nil {
+			t.Cleanup(func() { _ = h.Close() })
+		}
+		if err != nil {
+			t.Fatalf("open public Graph Host %d: %v", i, err)
+		}
+		hosts[i] = h
+	}
+	event := func(n int64) types.GraphStreamEvent {
+		return types.GraphStreamEvent{Stream: "graph-ci-events", Kind: "ordered", Payload: n}
+	}
+	commands := []types.GraphCommand{
+		{RequestID: string([]byte{0xff, 1}), Cypher: "CREATE (:GraphCI {id:'a', label:$label, n:$n})", Args: map[string]any{"label": "alpha", "n": float32(0.1)}, Events: []types.GraphStreamEvent{event(1), {Stream: "graph-ci-trim", Kind: "trimmed", Payload: int64(1)}}},
+		{RequestID: string([]byte{0xfe, 2}), Cypher: "CREATE (:GraphCI {id:'b', label:'beta', n:2})", Events: []types.GraphStreamEvent{event(2), {Stream: "graph-ci-trim", Kind: "trimmed", Payload: int64(2)}}},
+		{RequestID: "\ufffd", Cypher: "MATCH (a:GraphCI {id:'a'}), (b:GraphCI {id:'b'}) CREATE (a)-[:LINK]->(b)", Events: []types.GraphStreamEvent{event(3)}},
+		{RequestID: "graph-offset-max", StreamOffset: &types.GraphStreamOffsetMutation{Stream: "graph-ci-events", Consumer: "graph-ci-consumer", Sequence: ^uint64(0)}},
+		{RequestID: "graph-trim-max", StreamTrim: &types.GraphStreamTrimMutation{Stream: "graph-ci-trim", ThroughSequence: ^uint64(0)}},
+	}
+	for i, command := range commands[:4] {
+		result, err := hosts[0].GraphExecute(ctx, command)
+		if err != nil || result.Slot == 0 || result.Status != types.MutationCommitted || !result.Applied {
+			t.Fatalf("Rust Graph command %d did not return a committed receipt", i+1)
+		}
+	}
+	trimStream, err := hosts[0].GraphStreamRead(ctx, network.GraphStreamReadRequest{Stream: "graph-ci-trim", Limit: 10, Consistency: "linearizable"})
+	if err != nil || len(trimStream.Records) != 2 || trimStream.Records[0].Sequence >= trimStream.Records[1].Sequence || trimStream.Records[0].Kind != "trimmed" || trimStream.Records[1].Kind != "trimmed" || trimStream.Records[0].Payload != int64(1) || trimStream.Records[1].Payload != int64(2) {
+		t.Fatalf("Rust trim precondition: records=%+v error=%v", trimStream.Records, err)
+	}
+	trim, err := hosts[0].GraphExecute(ctx, commands[4])
+	if err != nil || trim.Slot == 0 || trim.Status != types.MutationCommitted || !trim.Applied {
+		t.Fatal("Rust Graph trim-max did not return a committed receipt")
+	}
+	offset, err := hosts[0].GraphStreamOffset(ctx, network.GraphStreamOffsetRequest{Stream: "graph-ci-events", Consumer: "graph-ci-consumer"})
+	if err != nil || !offset.Found || offset.Sequence != ^uint64(0) {
+		t.Fatal("max stream offset readback differs")
+	}
+}
+
 // This checks the existing outcome helper, not an actual submitted Graph Host.
 func TestManagedGraphOutcomeContextPreservesRawIdentity(t *testing.T) {
 	for _, id := range []string{"\xff", "\xfe", "\ufffd"} {

@@ -44,6 +44,23 @@ run_contract() {
     function knowncode(s) { return s ~ /^(internal|commit_unknown|kv_recovery_required|kv_not_submitted|sql_recovery_required|sql_not_submitted|timeout|canceled|invalid_request|not_ready|quorum_unavailable|request_conflict|durability_unavailable|overloaded|unclassified)$/ }
     function uint(s) { return s ~ /^[0-9]+$/ && length(s)<=20 }
     /^GRAPH_STARTUP_DIAGNOSTIC last_stage=(target_inspect|core_open|archive_recover|pair_select|pair_reconstruct|pair_install|runtime_verify|open_complete|not_observed)$/ { emit($0); next }
+    {
+      refusal=$0
+      if (refusal ~ /^[0-9][0-9][0-9][0-9]\/[0-9][0-9]\/[0-9][0-9] [0-9][0-9]:[0-9][0-9]:[0-9][0-9] MANAGED_GRAPH_ADMISSION_REFUSED /)
+        sub(/^[0-9][0-9][0-9][0-9]\/[0-9][0-9]\/[0-9][0-9] [0-9][0-9]:[0-9][0-9]:[0-9][0-9] /,"",refusal)
+      if (refusal ~ /^MANAGED_GRAPH_ADMISSION_REFUSED/) {
+        if (refusal ~ /^MANAGED_GRAPH_ADMISSION_REFUSED target=[0-9]+ recorded=[0-9]+ certified=[0-9]+ applied=[0-9]+$/) {
+          split(refusal, refusal_fields, " ")
+          target=refusal_fields[2]; sub(/^target=/,"",target)
+          recorded=refusal_fields[3]; sub(/^recorded=/,"",recorded)
+          certified=refusal_fields[4]; sub(/^certified=/,"",certified)
+          applied=refusal_fields[5]; sub(/^applied=/,"",applied)
+          if (uint(target) && uint(recorded) && uint(certified) && uint(applied))
+            emit("MANAGED_GRAPH_ADMISSION_REFUSED target=" target " recorded=" recorded " certified=" certified " applied=" applied)
+        }
+        next
+      }
+    }
     /managed operation unavailable / {
       tuple=$0; sub(/^.*managed operation unavailable /,"",tuple)
       if (tuple ~ /^operation=(execute|query|ready|request_status|recover_pending|recover_pending_detailed|kv_put|kv_delete|kv_cas|kv_get|graph_execute|graph_query|graph_reachable|graph_changes|graph_stream_read|graph_stream_offset|unsupported) code=[a-z_]+ cause=(unclassified|deadline|canceled|quorum_unavailable|durability_unavailable|not_ready|overloaded|request_conflict) context_known=(true|false) slot=[0-9]+ retry=[0-9]+$/) {
@@ -191,6 +208,16 @@ if [ "${1-}" = --diagnostic-self-test ]; then
   grep -Fx 'RUST_GRAPH_OPERATION_DIAGNOSTIC stage=graph_execute ordinal=2 code=commit_unknown context_known=true slot=0 retry=18446744073709551615' "$diag_dir/active.log" >/dev/null
   grep -Fx 'RUST_GRAPH_OPERATION_DIAGNOSTIC stage=sql_tuple ordinal=0 code=commit_unknown context_known=false slot=0 retry=0' "$diag_dir/active.log" >/dev/null
   if grep -E 'DO-NOT-RETAIN|stage=private|last_stage=invalid|last_stage=pair_install' "$diag_dir/active.log"; then exit 1; fi
+  run_contract rust-restart sh -c 'printf "%s\n" \
+    "MANAGED_GRAPH_ADMISSION_REFUSED target=17 recorded=15 certified=15 applied=14" \
+    "2026/11/03 12:00:00 MANAGED_GRAPH_ADMISSION_REFUSED target=17 recorded=15 certified=15 applied=14" \
+    "MANAGED_GRAPH_ADMISSION_REFUSED target=17 recorded=15 certified=15 applied=14 secret-DO-NOT-RETAIN" \
+    "2026/11/03 12:00:00 MANAGED_GRAPH_ADMISSION_REFUSED target=17 recorded=15 certified=15 applied=14 secret-DO-NOT-RETAIN" \
+    "MANAGED_GRAPH_ADMISSION_REFUSED target=-1 recorded=15 certified=15 applied=14" \
+    "MANAGED_GRAPH_ADMISSION_REFUSED target=17 recorded=15x certified=15 applied=14" \
+    "garbage-prefix MANAGED_GRAPH_ADMISSION_REFUSED target=17 recorded=15 certified=15 applied=14"'
+  [ "$(grep -Fc 'MANAGED_GRAPH_ADMISSION_REFUSED target=17 recorded=15 certified=15 applied=14' "$diag_dir/active.log")" = 2 ]
+  if grep -E 'DO-NOT-RETAIN|MANAGED_GRAPH_ADMISSION_REFUSED.*(target=-1|recorded=15x)|^garbage-prefix MANAGED_GRAPH_ADMISSION_REFUSED' "$diag_dir/active.log"; then exit 1; fi
   [ "$before" = "$(cksum "$diag_dir/first.log")" ]
   if run_contract rust-initial sh -c 'i=0; while [ "$i" -lt 4000 ]; do echo "FAIL: managed-ha-contract prior_ack_marker_missing"; i=$((i+1)); done; exit 9' >/dev/null 2>&1; then exit 1; else [ "$?" = 9 ]; fi
   [ "$(wc -c < "$diag_dir/first.log")" -le 65536 ]

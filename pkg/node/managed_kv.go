@@ -23,7 +23,7 @@ func (n *Node) managedKVState(ctx context.Context) (ManagedRuntimeState, error) 
 	if err := ctx.Err(); err != nil {
 		return ManagedRuntimeState{}, err
 	}
-	state, err := n.ManagedState()
+	state, err := n.managedStateWithContext(ctx)
 	if err != nil {
 		return state, err
 	}
@@ -132,7 +132,10 @@ func (n *Node) ResolveManagedKV(ctx context.Context, operation string, req netwo
 	}
 	// A retained receipt does not excuse an unresolved newer recorder entry.
 	// Try the same certified catch-up path, never a second application proposal.
-	state := n.managedRuntimeState()
+	state, err := n.managedRuntimeStateWithContext(ctx)
+	if err != nil {
+		return network.ResolveKVResult{State: network.ResolveKVUnknownOrExpired, Durability: network.ResolveKVDurabilityUnknown}, err
+	}
 	if state.AppliedTip != state.CertifiedTip || state.RecorderTip > state.CertifiedTip {
 		target, _, err := n.core.ReadIndex(ctx)
 		if err != nil {
@@ -141,7 +144,10 @@ func (n *Node) ResolveManagedKV(ctx context.Context, operation string, req netwo
 		if err := n.replayLocalDecisions(ctx); err != nil {
 			return network.ResolveKVResult{}, err
 		}
-		state = n.managedRuntimeState()
+		state, err = n.managedRuntimeStateWithContext(ctx)
+		if err != nil {
+			return network.ResolveKVResult{State: network.ResolveKVUnknownOrExpired, Durability: network.ResolveKVDurabilityUnknown}, err
+		}
 		if state.CertifiedTip < uint64(target) || state.AppliedTip != state.CertifiedTip || state.RecorderTip > state.CertifiedTip {
 			return network.ResolveKVResult{State: network.ResolveKVUnknownOrExpired, Durability: network.ResolveKVDurabilityUnknown}, &network.CommitUnknownError{RequestID: req.RequestID, Cause: errors.New("managed KV recovery has unresolved certified history")}
 		}
@@ -158,7 +164,10 @@ func (n *Node) ResolveManagedKV(ctx context.Context, operation string, req netwo
 		if err := n.replayLocalDecisions(ctx); err != nil {
 			return result, err
 		}
-		state := n.managedRuntimeState()
+		state, err := n.managedRuntimeStateWithContext(ctx)
+		if err != nil {
+			return result, err
+		}
 		if state.CertifiedTip < uint64(target) || state.AppliedTip != state.CertifiedTip || state.RecorderTip > state.CertifiedTip {
 			return result, &network.CommitUnknownError{RequestID: req.RequestID, Cause: errors.New("managed KV recovery has unresolved certified history")}
 		}
@@ -202,7 +211,11 @@ func (n *Node) KVGetManaged(ctx context.Context, req network.KVGetRequest) (netw
 			}
 			return n.server.KVGet(ctx, req)
 		}
-		if err := n.managedStartup.Checker.ValidateManagedAdmission(ctx, n.managedStartup.Identity, n.managedRuntimeState()); err != nil {
+		state, err := n.managedRuntimeStateWithContext(ctx)
+		if err != nil {
+			return network.KVGetResponse{}, err
+		}
+		if err := n.managedStartup.Checker.ValidateManagedAdmission(ctx, n.managedStartup.Identity, state); err != nil {
 			return network.KVGetResponse{}, err
 		}
 	}

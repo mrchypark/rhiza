@@ -232,10 +232,92 @@ func (n *Node) advanceManagedGraphCheckpointCut(ctx context.Context) error {
 	if _, err := rand.Read(nonce[:]); err != nil {
 		return err
 	}
-	if _, err := n.server.ProposeCheckpointBarrier(ctx, types.EncodeReadBarrier(nonce)); err != nil {
-		return err
+	value := types.EncodeReadBarrier(nonce)
+	ownerBinding := n.managedGraphPublisherBinding.Load()
+	if ownerBinding == nil {
+		ownerBinding = n.internalApplication.Load()
 	}
-	return n.replayLocalDecisions(ctx)
+	op := &managedGraphControlOperation{value: append([]byte(nil), value...), hash: sha256.Sum256(value), binding: ownerBinding, done: make(chan struct{})}
+	n.managedGraphControlMu.Lock()
+	if n.managedGraphControl != nil {
+		n.managedGraphControlMu.Unlock()
+		return fmt.Errorf("managed Graph checkpoint control already active")
+	}
+	n.managedGraphControl = op
+	n.managedGraphControlMu.Unlock()
+	op.slot, op.err = n.server.ProposeCheckpointBarrier(ctx, value)
+	if op.err == nil {
+		if decision, ok := n.core.CertifiedValue(op.slot); !ok || decision.Hash != op.hash || !bytes.Equal(decision.Value, op.value) {
+			op.err = fmt.Errorf("managed Graph owned checkpoint control certificate did not match its proposal")
+		} else {
+			op.err = n.replayLocalDecisions(ctx)
+		}
+	}
+	n.managedGraphControlMu.Lock()
+	close(op.done)
+	n.managedGraphControl = nil
+	n.managedGraphControlMu.Unlock()
+	return op.err
+}
+
+// Wait only when the exact highest recorder value is the live checkpoint
+// publisher's operation. Recorder state by itself never grants admission.
+func (n *Node) waitManagedGraphOwnedControl(ctx context.Context, binding *internalApplicationBinding, target quepaxa.Slot) error {
+	progress := n.core.RuntimeProgressSnapshot()
+	n.managedGraphControlMu.Lock()
+	op := n.managedGraphControl
+	if op == nil {
+		n.managedGraphControlMu.Unlock()
+		if progress.RecorderTip > progress.CertifiedTip {
+			return n.refuseManagedGraphAdmissionAt(target, progress)
+		}
+		return nil
+	}
+	isBarrier, decodeErr := types.DecodeReadBarrier(op.value)
+	if decodeErr != nil || !isBarrier || op.binding != binding {
+		n.managedGraphControlMu.Unlock()
+		return n.refuseManagedGraphAdmissionAt(target, progress)
+	}
+	switch {
+	case progress.RecorderTip > progress.CertifiedTip:
+		if progress.RecorderTip-progress.CertifiedTip != 1 || !progress.RecorderHashPresent || progress.RecorderHashIsCertified || progress.RecorderHash != op.hash {
+			n.managedGraphControlMu.Unlock()
+			return n.refuseManagedGraphAdmissionAt(target, progress)
+		}
+		observedSlot := progress.RecorderTip
+		done := op.done
+		n.managedGraphControlMu.Unlock()
+		return n.waitAndVerifyManagedGraphOwnedControl(ctx, target, op, done, observedSlot)
+	case progress.RecorderTip == progress.CertifiedTip:
+		done := op.done
+		n.managedGraphControlMu.Unlock()
+		return n.waitAndVerifyManagedGraphOwnedControl(ctx, target, op, done, 0)
+	default:
+		n.managedGraphControlMu.Unlock()
+		return n.refuseManagedGraphAdmissionAt(target, progress)
+	}
+}
+
+func (n *Node) waitAndVerifyManagedGraphOwnedControl(ctx context.Context, target quepaxa.Slot, op *managedGraphControlOperation, done <-chan struct{}, observedSlot quepaxa.Slot) error {
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-done:
+	}
+	if op.err != nil || op.slot == 0 || observedSlot != 0 && op.slot != observedSlot {
+		return n.refuseManagedGraphAdmissionAt(target, n.core.RuntimeProgressSnapshot())
+	}
+	decision, ok := n.core.CertifiedValue(op.slot)
+	if !ok || decision.Hash != op.hash || !bytes.Equal(decision.Value, op.value) {
+		return n.refuseManagedGraphAdmissionAt(target, n.core.RuntimeProgressSnapshot())
+	}
+	return nil
+}
+
+func (n *Node) refuseManagedGraphAdmissionAt(target quepaxa.Slot, progress quepaxa.RuntimeProgress) error {
+	applied := uint64(n.material.Tip())
+	log.Printf("MANAGED_GRAPH_ADMISSION_REFUSED target=%d recorded=%d certified=%d applied=%d", target, progress.RecorderTip, progress.CertifiedTip, applied)
+	return fmt.Errorf("internal application has unresolved certified history: target=%d recorded=%d certified=%d applied=%d", target, progress.RecorderTip, progress.CertifiedTip, applied)
 }
 
 // Called only from the authenticated existing checkpoint prepare RPC. Unlike

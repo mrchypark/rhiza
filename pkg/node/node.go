@@ -83,10 +83,22 @@ type Node struct {
 	managedAdmitted              atomic.Bool
 	managedInitiallyAdmitted     atomic.Bool
 	managedGraphPublisherStarted atomic.Bool
+	managedGraphPublisherBinding atomic.Pointer[internalApplicationBinding]
 	managedGraphInitialRootDone  chan struct{}
 	managedGraphInitialRootOnce  sync.Once
+	managedGraphControlMu        sync.Mutex
+	managedGraphControl          *managedGraphControlOperation
 	managedPeerVerified          atomic.Bool
 	internalApplication          atomic.Pointer[internalApplicationBinding]
+}
+
+type managedGraphControlOperation struct {
+	value   []byte
+	hash    quepaxa.ValueHash
+	binding *internalApplicationBinding
+	done    chan struct{}
+	slot    quepaxa.Slot
+	err     error
 }
 
 // nodeRecoveryPhases records the selected certified checkpoint restore path.
@@ -1388,6 +1400,7 @@ func (n *Node) preparePeerCheckpoint(ctx context.Context, sender quepaxa.NodeID,
 // before a startup-only binding has acquired its actual admission.
 func (n *Node) startManagedGraphPublisherAfterAdmission(binding *internalApplicationBinding) {
 	if binding != nil && n.materializationPolicy() == sqlpolicy.ManagedGraphRequestMaterializationPolicy && n.managedGraphPublisherStarted.CompareAndSwap(false, true) {
+		n.managedGraphPublisherBinding.Store(binding)
 		n.startManagedGraphCheckpointPublisher(binding.lifetime)
 	}
 }
@@ -2048,7 +2061,11 @@ func (n *Node) Ready() bool {
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	return n.managedStartup.Checker.ValidateManagedAdmission(ctx, n.managedStartup.Identity, n.managedRuntimeState()) == nil
+	state, err := n.managedRuntimeStateWithContext(ctx)
+	if err != nil {
+		return false
+	}
+	return n.managedStartup.Checker.ValidateManagedAdmission(ctx, n.managedStartup.Identity, state) == nil
 }
 
 func quarantineSQLite(path string) error {
