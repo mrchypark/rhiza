@@ -59,6 +59,7 @@ type Transport interface {
 
 // Core runs one QuePaxa proposer and recorder per replica.
 type Core struct {
+	validateValue           func([]byte) error
 	nodeID                  NodeID
 	config                  *Cluster
 	wal                     *qlog.WAL
@@ -311,11 +312,14 @@ func (c *Core) propose(ctx context.Context, value []byte, complete bool) (Slot, 
 }
 
 func (c *Core) proposeOwned(ctx context.Context, value []byte, complete, executionOwned, capacityPreflightDone bool) (Slot, []Receipt, error) {
+	if localtesthooks.Enabled {
+		localtesthooks.HitProposalEntry(value)
+	}
 	if c.observer || ((c.reconfigEnabled || c.learner) && !c.IsVoter()) {
 		return 0, nil, ErrQuorumUnavailable
 	}
-	if len(value) > MaxReplicatedValueBytes {
-		return 0, nil, fmt.Errorf("QuePaxa value exceeds %d bytes", MaxReplicatedValueBytes)
+	if err := c.checkValue(value); err != nil {
+		return 0, nil, err
 	}
 	if _, control, err := decodeReconfiguration(value); err != nil {
 		return 0, nil, err
@@ -451,7 +455,7 @@ func (c *Core) StageValue(hash ValueHash, value []byte) error {
 var errLocalExternalMutation = errors.New("local QuePaxa mutation requires the execution owner")
 
 func (c *Core) stageValue(hash ValueHash, value []byte) error {
-	if len(value) == 0 || len(value) > MaxReplicatedValueBytes || sha256.Sum256(value) != hash {
+	if len(value) == 0 || c.checkValue(value) != nil || sha256.Sum256(value) != hash {
 		return fmt.Errorf("invalid QuePaxa value")
 	}
 	c.mu.Lock()
@@ -1436,13 +1440,13 @@ func (c *Core) record(ctx context.Context, request RecordRequest) (Summary, erro
 	if err := c.rejectCompacted(request.Slot); err != nil {
 		return Summary{}, err
 	}
-	if len(request.Proposal.Value) != 0 && len(request.Proposal.Value) <= MaxReplicatedValueBytes {
+	if len(request.Proposal.Value) != 0 {
+		if err := c.checkValue(request.Proposal.Value); err != nil {
+			return Summary{}, err
+		}
 		if err := c.stageValue(request.Proposal.Hash, request.Proposal.Value); err != nil {
 			return Summary{}, err
 		}
-	}
-	if err := c.validateCheckpointValue(ctx, request.Proposal.Hash); err != nil {
-		return Summary{}, err
 	}
 	if !c.reconfigEnabled && len(request.Proposal.Value) == 0 {
 		c.mu.RLock()
@@ -1460,94 +1464,110 @@ func (c *Core) record(ctx context.Context, request RecordRequest) (Summary, erro
 	if c.recordBeforeAppend != nil {
 		c.recordBeforeAppend()
 	}
-	c.mu.Lock()
-	if err := c.compactedErrorLocked(request.Slot); err != nil {
-		c.mu.Unlock()
-		return Summary{}, err
-	}
-	if c.reconfigEnabled {
-		cluster := c.clusterForSlotLocked(request.Slot)
-		if request.ConfigID != cluster.ConfigID {
+	checkpointValidated := false
+	for {
+		c.mu.Lock()
+		if err := c.compactedErrorLocked(request.Slot); err != nil {
 			c.mu.Unlock()
-			return Summary{}, fmt.Errorf("record config ID changed while request waited")
+			return Summary{}, err
 		}
-		if !c.voterForClusterLocked(cluster) {
-			c.mu.Unlock()
-			return Summary{}, ErrQuorumUnavailable
-		}
-		if request.Slot > c.tip+16 {
-			c.mu.Unlock()
-			return Summary{}, fmt.Errorf("record slot exceeds bounded reconfiguration pipeline")
-		}
-		controlValue := c.values[request.Proposal.Hash]
-		control, isControl, decodeErr := decodeReconfiguration(controlValue)
-		_, alreadyDecided := c.decided[request.Slot]
-		if decodeErr != nil {
-			c.mu.Unlock()
-			return Summary{}, decodeErr
-		}
-		if isControl && !control.Terminal && (c.reconfiguration == nil || request.Slot == c.reconfiguration.freeze) && c.highestKnownSlotLocked() >= control.TerminalSlot {
-			promised := false
-			if existing, ok := c.decided[request.Slot]; ok && existing.Hash == request.Proposal.Hash {
-				if certified, err := decodeDecision(existing.Certificate); err == nil {
-					for _, summary := range certified.Summaries {
-						promised = promised || summary.RecorderID == c.nodeID && summary.ReconfigurationID == existing.Hash
+		if c.reconfigEnabled {
+			cluster := c.clusterForSlotLocked(request.Slot)
+			if request.ConfigID != cluster.ConfigID {
+				c.mu.Unlock()
+				return Summary{}, fmt.Errorf("record config ID changed while request waited")
+			}
+			if !c.voterForClusterLocked(cluster) {
+				c.mu.Unlock()
+				return Summary{}, ErrQuorumUnavailable
+			}
+			if request.Slot > c.tip+16 {
+				c.mu.Unlock()
+				return Summary{}, fmt.Errorf("record slot exceeds bounded reconfiguration pipeline")
+			}
+			controlValue := c.values[request.Proposal.Hash]
+			control, isControl, decodeErr := decodeReconfiguration(controlValue)
+			_, alreadyDecided := c.decided[request.Slot]
+			if decodeErr != nil {
+				c.mu.Unlock()
+				return Summary{}, decodeErr
+			}
+			if isControl && !control.Terminal && (c.reconfiguration == nil || request.Slot == c.reconfiguration.freeze) && c.highestKnownSlotLocked() >= control.TerminalSlot {
+				promised := false
+				if existing, ok := c.decided[request.Slot]; ok && existing.Hash == request.Proposal.Hash {
+					if certified, err := decodeDecision(existing.Certificate); err == nil {
+						for _, summary := range certified.Summaries {
+							promised = promised || summary.RecorderID == c.nodeID && summary.ReconfigurationID == existing.Hash
+						}
 					}
 				}
-			}
-			if !promised {
-				c.mu.Unlock()
-				return Summary{}, fmt.Errorf("recorder has no bounded promise before its legacy terminal state")
-			}
-		}
-		if isControl && !control.Terminal && c.reconfiguration == nil {
-			if err := c.validateReconfigurationSlotsLocked(control.Freeze, control.TerminalSlot); err != nil && request.Slot == c.tip+1 {
-				c.mu.Unlock()
-				return Summary{}, err
-			}
-			if control.Freeze != request.Slot {
-				c.mu.Unlock()
-				return Summary{}, fmt.Errorf("freeze control slot mismatch")
-			}
-			if err := validateReconfigurationTarget(cluster, control.Target, c.retiredIDs); err != nil {
-				c.mu.Unlock()
-				return Summary{}, err
-			}
-			if c.tip >= request.Slot-1 && c.prefixes[request.Slot-1] != control.PrefixHash {
-				c.mu.Unlock()
-				return Summary{}, fmt.Errorf("freeze prefix mismatch")
-			}
-		}
-		if state := c.reconfiguration; state != nil {
-			if isControl && control.Terminal && !alreadyDecided {
-				prior := c.recorders[request.Slot]
-				for _, proposal := range []*Proposal{prior.FirstCurrent, prior.AggregateCurrent, prior.AggregatePrior} {
-					if proposal != nil && proposal.Hash != request.Proposal.Hash {
-						c.mu.Unlock()
-						return Summary{}, fmt.Errorf("terminal recorder contains incompatible prior state")
-					}
+				if !promised {
+					c.mu.Unlock()
+					return Summary{}, fmt.Errorf("recorder has no bounded promise before its legacy terminal state")
 				}
 			}
-			if isControl && control.Terminal && !alreadyDecided && (request.Slot != state.terminal || c.tip != state.terminal-1 || control.Freeze != state.freeze || control.TerminalSlot != state.terminal || control.PrefixHash != c.prefixes[c.tip] || !sameCluster(control.Target, state.target)) {
-				c.mu.Unlock()
-				return Summary{}, fmt.Errorf("terminal control changed while request waited")
-			}
-			if request.Slot > state.terminal || (request.Slot > state.freeze && request.ReconfigurationID != state.id) {
-				c.mu.Unlock()
-				return Summary{}, fmt.Errorf("record is outside frozen reconfiguration drain")
-			}
-			controlValue := request.Proposal.Value
-			if len(controlValue) == 0 {
-				controlValue = c.values[request.Proposal.Hash]
-			}
-			if control, ok, err := decodeReconfiguration(controlValue); err != nil || (request.Slot == state.terminal && (!ok || !control.Terminal)) {
-				c.mu.Unlock()
-				if err != nil {
+			if isControl && !control.Terminal && c.reconfiguration == nil {
+				if err := c.validateReconfigurationSlotsLocked(control.Freeze, control.TerminalSlot); err != nil && request.Slot == c.tip+1 {
+					c.mu.Unlock()
 					return Summary{}, err
 				}
-				return Summary{}, fmt.Errorf("only terminal control may use frozen terminal slot")
+				if control.Freeze != request.Slot {
+					c.mu.Unlock()
+					return Summary{}, fmt.Errorf("freeze control slot mismatch")
+				}
+				if err := validateReconfigurationTarget(cluster, control.Target, c.retiredIDs); err != nil {
+					c.mu.Unlock()
+					return Summary{}, err
+				}
+				if c.tip >= request.Slot-1 && c.prefixes[request.Slot-1] != control.PrefixHash {
+					c.mu.Unlock()
+					return Summary{}, fmt.Errorf("freeze prefix mismatch")
+				}
+			}
+			if state := c.reconfiguration; state != nil {
+				if isControl && control.Terminal && !alreadyDecided {
+					prior := c.recorders[request.Slot]
+					for _, proposal := range []*Proposal{prior.FirstCurrent, prior.AggregateCurrent, prior.AggregatePrior} {
+						if proposal != nil && proposal.Hash != request.Proposal.Hash {
+							c.mu.Unlock()
+							return Summary{}, fmt.Errorf("terminal recorder contains incompatible prior state")
+						}
+					}
+				}
+				if isControl && control.Terminal && !alreadyDecided && (request.Slot != state.terminal || c.tip != state.terminal-1 || control.Freeze != state.freeze || control.TerminalSlot != state.terminal || control.PrefixHash != c.prefixes[c.tip] || !sameCluster(control.Target, state.target)) {
+					c.mu.Unlock()
+					return Summary{}, fmt.Errorf("terminal control changed while request waited")
+				}
+				if request.Slot > state.terminal || (request.Slot > state.freeze && request.ReconfigurationID != state.id) {
+					c.mu.Unlock()
+					return Summary{}, fmt.Errorf("record is outside frozen reconfiguration drain")
+				}
+				controlValue := request.Proposal.Value
+				if len(controlValue) == 0 {
+					controlValue = c.values[request.Proposal.Hash]
+				}
+				if control, ok, err := decodeReconfiguration(controlValue); err != nil || (request.Slot == state.terminal && (!ok || !control.Terminal)) {
+					c.mu.Unlock()
+					if err != nil {
+						return Summary{}, err
+					}
+					return Summary{}, fmt.Errorf("only terminal control may use frozen terminal slot")
+				}
 			}
 		}
+		// Only an explicit, exact redelivery of this immutable certified value
+		// may avoid today's preparation eligibility. Keep the actual slot lock
+		// and repeat mutable guards after releasing mu for fallback validation.
+		decided, exists := c.decided[request.Slot]
+		exactCertified := exists && len(request.Proposal.Value) != 0 && decided.Hash == request.Proposal.Hash && bytes.Equal(decided.Value, request.Proposal.Value)
+		if checkpointValidated || exactCertified {
+			break
+		}
+		c.mu.Unlock()
+		if err := c.validateCheckpointValue(ctx, request.Proposal.Hash); err != nil {
+			return Summary{}, err
+		}
+		checkpointValidated = true
 	}
 	if decided, ok := c.decided[request.Slot]; ok {
 		needsSync := !c.durable[request.Slot]
@@ -2592,6 +2612,9 @@ func (c *Core) validateFreezeBindingLocked(decision Decision) error {
 }
 
 func (c *Core) validateDecisionForRecovery(decision Decision, allowMissingLeader bool) error {
+	if err := c.checkValue(decision.Proposal.Value); err != nil {
+		return err
+	}
 	if decision.Slot == 0 || sha256.Sum256(decision.Proposal.Value) != decision.Proposal.Hash {
 		return fmt.Errorf("invalid QuePaxa decision value")
 	}
@@ -3202,6 +3225,9 @@ func (c *Core) recover() error {
 			}
 			prepared = append(prepared, seal)
 		case qlog.EntryProposal:
+			if err := c.checkValue(entry.Payload); err != nil {
+				return fmt.Errorf("recover QuePaxa proposal: %w", err)
+			}
 			if len(entry.Payload) == 0 || sha256.Sum256(entry.Payload) != entry.Hash {
 				return fmt.Errorf("recover QuePaxa value identity mismatch")
 			}
@@ -3211,6 +3237,13 @@ func (c *Core) recover() error {
 			persisted, err := decodeRecorderEntry(entry.Payload)
 			if err != nil {
 				return fmt.Errorf("recover QuePaxa ISR: %w", err)
+			}
+			for _, proposal := range []*Proposal{persisted.State.FirstCurrent, persisted.State.AggregateCurrent, persisted.State.AggregatePrior} {
+				if proposal != nil && len(proposal.Value) != 0 {
+					if err := c.checkValue(proposal.Value); err != nil {
+						return fmt.Errorf("recover QuePaxa ISR value: %w", err)
+					}
+				}
 			}
 			if persisted.Reconfiguration && !c.reconfigEnabled {
 				return fmt.Errorf("recover QuePaxa ISR: WAL requires reconfiguration protocol")

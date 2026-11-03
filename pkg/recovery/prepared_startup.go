@@ -10,9 +10,11 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"strings"
 
 	"github.com/mrchypark/rhiza/internal/sqlpolicy"
 	"github.com/mrchypark/rhiza/internal/types"
+	"github.com/mrchypark/rhiza/pkg/checkpoint"
 	"github.com/mrchypark/rhiza/pkg/materializer"
 	"github.com/mrchypark/rhiza/pkg/quepaxa"
 	"github.com/thanos-io/objstore"
@@ -31,11 +33,13 @@ type PreparedStartupIdentity struct {
 }
 
 type preparedStartupManifest struct {
-	Version    int                     `json:"version"`
-	Identity   PreparedStartupIdentity `json:"identity"`
-	Head       []byte                  `json:"head"`
-	SQLiteHash [32]byte                `json:"sqliteHash"`
-	SuffixHash [32]byte                `json:"suffixHash"`
+	Version      int                             `json:"version"`
+	Identity     PreparedStartupIdentity         `json:"identity"`
+	Head         []byte                          `json:"head"`
+	SQLiteHash   [32]byte                        `json:"sqliteHash"`
+	SuffixHash   [32]byte                        `json:"suffixHash"`
+	Files        []preparedGraphArtifact         `json:"files,omitempty"`
+	GraphLocator *checkpoint.ManagedGraphLocator `json:"graphLocator,omitempty"`
 }
 
 // VerifiedPreparedStartup is verified local data, never startup authority.
@@ -82,13 +86,30 @@ func PublishPreparedStartupForPolicy(ctx context.Context, view *ReadOnlyView, ta
 		return fmt.Errorf("sync preparation parent: %w", err)
 	}
 	m := preparedStartupManifest{Version: version, Identity: identity, Head: view.CapturedHead()}
-	if m.SQLiteHash, err = preparedFileHash(result.SQLitePath, true); err != nil {
+	if expected == sqlpolicy.ManagedGraphRequestMaterializationPolicy {
+		if view.graphLocator == nil {
+			return fmt.Errorf("prepared Graph source lacks exact certified locator")
+		}
+		selected := *view.graphLocator
+		m.GraphLocator = &selected
+	}
+	if expected == sqlpolicy.ManagedGraphRequestMaterializationPolicy {
+		m.Files, err = preparedGraphArtifacts(ctx, targetDir, true)
+		if err != nil {
+			return err
+		}
+		m.SQLiteHash = m.Files[0].SHA256
+	} else if m.SQLiteHash, err = preparedFileHash(result.SQLitePath, true); err != nil {
 		return err
 	}
 	if m.SuffixHash, err = preparedFileHash(result.SuffixPath, true); err != nil {
 		return err
 	}
-	if expected == sqlpolicy.LegacyMaterializationPolicy {
+	if expected == sqlpolicy.ManagedGraphRequestMaterializationPolicy {
+		if err := validateGraphPreparedInventory(targetDir, false); err != nil {
+			return err
+		}
+	} else if expected == sqlpolicy.LegacyMaterializationPolicy {
 		if _, err = preparedGraphTree(targetDir, true); err != nil {
 			return err
 		}
@@ -144,6 +165,14 @@ func LoadPreparedStartup(ctx context.Context, bucket objstore.Bucket, prefix str
 }
 
 func LoadPreparedStartupForPolicy(ctx context.Context, bucket objstore.Bucket, prefix string, configID uint, bootstrap quepaxa.Cluster, handoffDir, verifiedTargetDir string, expected PreparedStartupIdentity, policy sqlpolicy.MaterializationPolicy, window uint64) (*VerifiedPreparedStartup, error) {
+	return loadPreparedStartupForPolicy(ctx, bucket, prefix, configID, bootstrap, handoffDir, verifiedTargetDir, expected, policy, window, nil)
+}
+
+func LoadPreparedStartupForPolicyWithReconfiguration(ctx context.Context, bucket objstore.Bucket, prefix string, configID uint, bootstrap quepaxa.Cluster, handoffDir, verifiedTargetDir string, expected PreparedStartupIdentity, policy sqlpolicy.MaterializationPolicy, window uint64, reconfiguration bool) (*VerifiedPreparedStartup, error) {
+	return loadPreparedStartupForPolicy(ctx, bucket, prefix, configID, bootstrap, handoffDir, verifiedTargetDir, expected, policy, window, &reconfiguration)
+}
+
+func loadPreparedStartupForPolicy(ctx context.Context, bucket objstore.Bucket, prefix string, configID uint, bootstrap quepaxa.Cluster, handoffDir, verifiedTargetDir string, expected PreparedStartupIdentity, policy sqlpolicy.MaterializationPolicy, window uint64, trustedReconfiguration *bool) (*VerifiedPreparedStartup, error) {
 	version, err := preparedVersion(policy, window)
 	if err != nil {
 		return nil, err
@@ -175,6 +204,37 @@ func LoadPreparedStartupForPolicy(ctx context.Context, bucket objstore.Bucket, p
 	if m.Version != version || m.Identity != expected {
 		return nil, fmt.Errorf("preparation identity mismatch")
 	}
+	if policy != sqlpolicy.ManagedGraphRequestMaterializationPolicy && len(m.Files) != 0 {
+		return nil, fmt.Errorf("unexpected prepared artifact inventory")
+	}
+	if (policy == sqlpolicy.ManagedGraphRequestMaterializationPolicy) != (m.GraphLocator != nil) {
+		return nil, fmt.Errorf("prepared Graph locator/profile mismatch")
+	}
+	// The field is new only in v4. Preserve the old strict rejection even if a
+	// legacy marker explicitly supplies null (which decodes to a nil pointer).
+	if policy != sqlpolicy.ManagedGraphRequestMaterializationPolicy {
+		var fields map[string]json.RawMessage
+		if err := json.Unmarshal(data, &fields); err != nil {
+			return nil, err
+		}
+		for field := range fields {
+			if strings.EqualFold(field, "graphLocator") {
+				return nil, fmt.Errorf("unexpected Graph locator in legacy preparation")
+			}
+		}
+	}
+	if policy == sqlpolicy.ManagedGraphRequestMaterializationPolicy {
+		if err := validateGraphPreparedInventory(handoffDir, true); err != nil {
+			return nil, err
+		}
+		actual, err := preparedGraphArtifacts(ctx, handoffDir, false)
+		if err != nil {
+			return nil, err
+		}
+		if !equalGraphArtifacts(actual, m.Files) {
+			return nil, fmt.Errorf("prepared Graph artifact inventory differs")
+		}
+	}
 	var handoffState materializer.ManagedApplicationState
 	var handoffTip uint64
 	if managedSQLKVPolicy(policy) {
@@ -186,14 +246,19 @@ func LoadPreparedStartupForPolicy(ctx context.Context, bucket objstore.Bucket, p
 			return nil, fmt.Errorf("inspect mixed handoff: %w", err)
 		}
 	}
-	view, err := OpenReadOnlyViewAtHeadForPolicy(ctx, bucket, prefix, configID, bootstrap, m.Head, policy, window)
+	view, err := openReadOnlyViewAtHeadForPolicy(ctx, bucket, prefix, configID, bootstrap, m.Head, policy, window, m.GraphLocator, trustedReconfiguration)
 	if err != nil {
 		return nil, err
 	}
 	if managedSQLKVPolicy(policy) && handoffTip != uint64(view.Tip()) {
 		return nil, fmt.Errorf("mixed handoff tip differs from verified history")
 	}
-	sqlHash, err := preparedFileHash(filepath.Join(handoffDir, "sqlite.db"), false)
+	var sqlHash [32]byte
+	if policy == sqlpolicy.ManagedGraphRequestMaterializationPolicy {
+		sqlHash = m.Files[0].SHA256
+	} else {
+		sqlHash, err = preparedFileHash(filepath.Join(handoffDir, "sqlite.db"), false)
+	}
 	if err != nil || sqlHash != m.SQLiteHash {
 		return nil, fmt.Errorf("prepared SQLite integrity mismatch")
 	}
@@ -214,13 +279,21 @@ func LoadPreparedStartupForPolicy(ctx context.Context, bucket objstore.Bucket, p
 	if err != nil {
 		return nil, fmt.Errorf("reconstruct prepared state in %s: %w", verifiedTargetDir, err)
 	}
-	if _, err = preparedFileHash(verified.SQLitePath, true); err != nil {
+	if policy == sqlpolicy.ManagedGraphRequestMaterializationPolicy {
+		if _, err := preparedGraphArtifacts(ctx, verifiedTargetDir, true); err != nil {
+			return nil, err
+		}
+	} else if _, err = preparedFileHash(verified.SQLitePath, true); err != nil {
 		return nil, err
 	}
 	if _, err = preparedFileHash(verified.SuffixPath, true); err != nil {
 		return nil, err
 	}
-	if policy == sqlpolicy.LegacyMaterializationPolicy {
+	if policy == sqlpolicy.ManagedGraphRequestMaterializationPolicy {
+		if err := validateGraphPreparedInventory(verifiedTargetDir, false); err != nil {
+			return nil, err
+		}
+	} else if policy == sqlpolicy.LegacyMaterializationPolicy {
 		if _, err = preparedGraphTree(verifiedTargetDir, true); err != nil {
 			return nil, err
 		}
@@ -251,6 +324,9 @@ func LoadPreparedStartupForPolicy(ctx context.Context, bucket objstore.Bucket, p
 func preparedVersion(policy sqlpolicy.MaterializationPolicy, window uint64) (int, error) {
 	if err := validateReadOnlyPolicy(policy, window); err != nil {
 		return 0, err
+	}
+	if policy == sqlpolicy.ManagedGraphRequestMaterializationPolicy {
+		return 4, nil
 	}
 	if policy == sqlpolicy.ManagedRequestMaterializationPolicy {
 		return 3, nil

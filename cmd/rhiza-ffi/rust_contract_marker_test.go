@@ -81,20 +81,28 @@ func rustFixtureProfile(protocol string) (string, error) {
 		return "mixed", nil
 	case sqlpolicy.ManagedRequestApplicationProtocol:
 		return "internal", nil
+	case sqlpolicy.ManagedGraphRequestApplicationProtocol:
+		return "graph", nil
 	default:
 		return "", errors.New("unsupported explicit Rust fixture protocol")
 	}
 }
 
 func TestRustFixtureProfileSelection(t *testing.T) {
-	for _, tc := range []struct{ protocol, want string }{{"", "sql"}, {types.ManagedApplicationProtocolSQLKV, "mixed"}, {sqlpolicy.ManagedRequestApplicationProtocol, "internal"}} {
+	for _, tc := range []struct{ protocol, want string }{{"", "sql"}, {types.ManagedApplicationProtocolSQLKV, "mixed"}, {sqlpolicy.ManagedRequestApplicationProtocol, "internal"}, {sqlpolicy.ManagedGraphRequestApplicationProtocol, "graph"}} {
 		got, err := rustFixtureProfile(tc.protocol)
 		if err != nil || got != tc.want {
 			t.Fatalf("profile selection %q: %q %v", tc.protocol, got, err)
 		}
 	}
-	if _, err := rustFixtureProfile("rhiza-managed-request/v2"); err == nil {
-		t.Fatal("unknown profile fell back")
+	for _, unknown := range []string{"rhiza-managed-request/v2", "rhiza-managed-request-graph/v2", "rhiza-managed-request-graph", "graph", "10"} {
+		if _, err := rustFixtureProfile(unknown); err == nil {
+			t.Fatal("unknown profile fell back")
+		}
+	}
+	policy, _, err := types.ManagedApplicationPolicy(sqlpolicy.ManagedGraphRequestApplicationProtocol)
+	if err != nil || policy != sqlpolicy.ManagedGraphRequestMaterializationPolicy {
+		t.Fatalf("Graph selector is not the exact installed profile10: policy=%d error=%v", policy, err)
 	}
 }
 
@@ -134,7 +142,7 @@ func TestRustContractRunStartedMarker(t *testing.T) {
 	if err != nil {
 		t.Fatal("invalid Rust fixture profile")
 	}
-	if fixtureProfile == "mixed" || fixtureProfile == "internal" {
+	if fixtureProfile == "mixed" || fixtureProfile == "internal" || fixtureProfile == "graph" {
 		var plan operator.V1Alpha2BootstrapPlan
 		if err := managedbootstrap.ReadGateFile(operator.V1Alpha2BootstrapHandoffPath, &plan, 65536, false); err != nil {
 			t.Fatal("contract bootstrap unavailable")

@@ -32,7 +32,7 @@ func TestManagedBootstrapProfileLegacyBytesAndMixedBinding(t *testing.T) {
 	for _, tc := range []struct {
 		protocol string
 		policy   sqlpolicy.MaterializationPolicy
-	}{{"", sqlpolicy.LegacyMaterializationPolicy}, {ManagedApplicationProtocolSQLKV, sqlpolicy.ManagedSQLKVMaterializationPolicy}, {sqlpolicy.ManagedRequestApplicationProtocol, sqlpolicy.ManagedRequestMaterializationPolicy}} {
+	}{{"", sqlpolicy.LegacyMaterializationPolicy}, {ManagedApplicationProtocolSQLKV, sqlpolicy.ManagedSQLKVMaterializationPolicy}, {sqlpolicy.ManagedRequestApplicationProtocol, sqlpolicy.ManagedRequestMaterializationPolicy}, {sqlpolicy.ManagedGraphRequestApplicationProtocol, sqlpolicy.ManagedGraphRequestMaterializationPolicy}} {
 		policy, window, err := ManagedApplicationPolicy(tc.protocol)
 		if err != nil || policy != tc.policy || window != 65536 {
 			t.Fatalf("profile: %v %d %v", policy, window, err)
@@ -41,6 +41,10 @@ func TestManagedBootstrapProfileLegacyBytesAndMixedBinding(t *testing.T) {
 	requestDigest, err := ManagedMemberConfigDigest(config, sqlpolicy.ManagedRequestApplicationProtocol)
 	if err != nil || requestDigest == member || requestDigest == mixedMember {
 		t.Fatalf("request profile member binding is not distinct: %v", err)
+	}
+	graphDigest, err := ManagedMemberConfigDigest(config, sqlpolicy.ManagedGraphRequestApplicationProtocol)
+	if err != nil || graphDigest == requestDigest || graphDigest == member || graphDigest == mixedMember {
+		t.Fatalf("Graph profile member binding is not distinct: %v", err)
 	}
 	if _, _, err := ManagedApplicationPolicy("unknown"); err == nil {
 		t.Fatal("unknown protocol accepted")

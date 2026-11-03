@@ -16,7 +16,6 @@ import (
 	"strconv"
 	"strings"
 
-	"github.com/mrchypark/rhiza/internal/sqlpolicy"
 	"github.com/mrchypark/rhiza/internal/types"
 	sqlite3driver "github.com/ncruces/go-sqlite3/driver"
 )
@@ -180,7 +179,7 @@ func inspectApplicationTransaction(ctx context.Context, tx *sql.Tx, stateTip, mi
 		if err := validateManagedReceipts(ctx, tx, stateTip, mixedWindow, protocol); err != nil {
 			return state, err
 		}
-		if protocol == sqlpolicy.ManagedRequestApplicationProtocol {
+		if originalsProtocol(protocol) {
 			if err := validateRequestOriginals(ctx, tx, stateTip, mixedWindow); err != nil {
 				return state, err
 			}
@@ -229,7 +228,7 @@ func inspectApplicationTransaction(ctx context.Context, tx *sql.Tx, stateTip, mi
 		"_rhiza_kv_expiry":        `CREATE INDEX _rhiza_kv_expiry ON _rhiza_kv(expires_at_unix_ms) WHERE expires_at_unix_ms > 0`,
 		"_rhiza_idempotency_slot": `CREATE INDEX _rhiza_idempotency_slot ON _rhiza_idempotency(commit_slot)`,
 	}
-	if protocol == sqlpolicy.ManagedRequestApplicationProtocol && mixedWindow != 0 {
+	if originalsProtocol(protocol) && mixedWindow != 0 {
 		internal["_rhiza_request_original"] = strings.Join(strings.Fields(strings.Replace(requestOriginalDDL, "IF NOT EXISTS ", "", 1)), " ")
 	}
 	objectCount := 0
@@ -283,7 +282,7 @@ func inspectApplicationTransaction(ctx context.Context, tx *sql.Tx, stateTip, mi
 		// These are application data, not all of _rhiza_meta: control-slot tip
 		// and hash advancement must not change mixed application evidence.
 		tables := []string{"_rhiza_kv", "_rhiza_idempotency"}
-		if protocol == sqlpolicy.ManagedRequestApplicationProtocol {
+		if originalsProtocol(protocol) {
 			tables = append(tables, "_rhiza_request_original")
 		}
 		for _, name := range tables {
@@ -307,6 +306,17 @@ func inspectApplicationTransaction(ctx context.Context, tx *sql.Tx, stateTip, mi
 		for _, value := range []string{protocol, managedApplicationPolicy, strconv.Itoa(int(policyForProtocol(protocol))), strconv.FormatUint(mixedWindow, 10)} {
 			if _, err := insertRow.ExecContext(ctx, objectCount, []byte(value)); err != nil {
 				return state, err
+			}
+		}
+		if graphProtocol(protocol) {
+			history, err := sqliteGraphHistory(ctx, tx)
+			if err != nil {
+				return state, err
+			}
+			for _, value := range []string{strconv.FormatUint(history.LastGraphSlot, 10), hex.EncodeToString(history.Hash[:])} {
+				if _, err := insertRow.ExecContext(ctx, objectCount, []byte(value)); err != nil {
+					return state, err
+				}
 			}
 		}
 		objectCount++
@@ -472,7 +482,7 @@ func inspectApplicationTransaction(ctx context.Context, tx *sql.Tx, stateTip, mi
 	userObjects := objectCount
 	if mixedWindow != 0 {
 		userObjects -= 3
-		if protocol == sqlpolicy.ManagedRequestApplicationProtocol {
+		if originalsProtocol(protocol) {
 			userObjects--
 		}
 	}

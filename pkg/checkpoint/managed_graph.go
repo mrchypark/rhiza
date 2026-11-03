@@ -1,0 +1,164 @@
+package checkpoint
+
+import (
+	"bytes"
+	"context"
+	"crypto/sha256"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
+
+	objmetrics "github.com/mrchypark/rhiza/internal/objstore"
+	"github.com/mrchypark/rhiza/internal/sqlpolicy"
+	"github.com/thanos-io/objstore"
+)
+
+// ManagedGraphLocator is an untrusted discovery hint. A reader must bind its
+// exact seal decision to a captured certified archive before using the root.
+// Index is the actual paired snapshot cut, not the Kubernetes generation.
+type ManagedGraphLocator struct {
+	Policy           int      `json:"policy"`
+	Index            uint64   `json:"index"`
+	RootHash         [32]byte `json:"root_hash"`
+	SealDecisionSlot uint64   `json:"seal_decision_slot"`
+	SealDecisionHash [32]byte `json:"seal_decision_hash"`
+}
+
+func (l ManagedGraphLocator) validate() error {
+	if l.Policy != int(sqlpolicy.ManagedGraphRequestMaterializationPolicy) || l.Index == 0 || l.Index >= l.SealDecisionSlot || l.RootHash == ([32]byte{}) || l.SealDecisionHash == ([32]byte{}) {
+		return fmt.Errorf("invalid managed Graph checkpoint locator")
+	}
+	return nil
+}
+
+// CreateManagedGraphCandidate uploads only immutable objects. The owner must
+// supply a clean, provenance-verified pair captured at cut; this is not a seal
+// or CURRENT publication. Legacy CreateFiles still requires its original claim.
+func (m *Manager) CreateManagedGraphCandidate(ctx context.Context, sources []Source, cut uint64) (*Checkpoint, error) {
+	if !m.appendOnly || m.expectedPolicy != sqlpolicy.ManagedGraphRequestMaterializationPolicy || cut == 0 {
+		return nil, fmt.Errorf("managed Graph candidate requires its append-only profile and positive cut")
+	}
+	if err := m.validateSourceProfile(sources); err != nil {
+		return nil, err
+	}
+	for _, source := range sources {
+		if source.Role == RoleSQLite {
+			if err := sqlpolicy.CheckFileForPolicy(ctx, source.Path, m.expectedPolicy); err != nil {
+				return nil, err
+			}
+		}
+	}
+	return m.uploadCandidate(ctx, sources, cut, cut, nil, nil)
+}
+
+// Every failed conditional upload, including a lost ACK, requires exact bounded
+// readback. An unavailable/mismatching readback preserves the original failure.
+func (m *Manager) uploadManagedGraphImmutable(ctx context.Context, key string, data io.Reader, size int64, hash [32]byte) error {
+	err := m.bucket.Upload(ctx, key, data, objstore.WithIfNotExists())
+	if err == nil {
+		return nil
+	}
+	r, readErr := m.bucket.Get(ctx, key)
+	if readErr != nil {
+		return errors.Join(err, readErr)
+	}
+	h := sha256.New()
+	n, readErr := io.Copy(h, io.LimitReader(r, size+1))
+	readErr = errors.Join(readErr, r.Close())
+	if readErr != nil || n != size || !bytes.Equal(h.Sum(nil), hash[:]) {
+		return errors.Join(err, readErr, fmt.Errorf("immutable managed Graph object readback mismatch"))
+	}
+	return nil
+}
+
+func (m *Manager) readManagedGraphLocator(ctx context.Context) (ManagedGraphLocator, bool, error) {
+	var l ManagedGraphLocator
+	r, err := m.bucket.Get(objmetrics.WithExpectedNotFound(ctx), m.key("checkpoint/CURRENT"))
+	if err != nil {
+		if m.bucket.IsObjNotFoundErr(err) {
+			return l, false, nil
+		}
+		return l, false, err
+	}
+	data, readErr := io.ReadAll(io.LimitReader(r, maxRootSize+1))
+	readErr = errors.Join(readErr, r.Close())
+	if readErr != nil || len(data) > maxRootSize {
+		return l, false, errors.Join(readErr, fmt.Errorf("invalid managed Graph locator size"))
+	}
+	if err := decodePersistedJSON(data, &l); err != nil {
+		return l, false, err
+	}
+	return l, true, l.validate()
+}
+
+func (m *Manager) LoadManagedGraphLocator(ctx context.Context) (ManagedGraphLocator, bool, error) {
+	if m.expectedPolicy != sqlpolicy.ManagedGraphRequestMaterializationPolicy {
+		return ManagedGraphLocator{}, false, sqlpolicy.ErrIncompatible
+	}
+	return m.readManagedGraphLocator(ctx)
+}
+
+// PromoteManagedGraphLocator advances only the discovery hint. The caller must
+// first authenticate the exact seal and read it from the durable archive.
+// Readers must repeat that authentication; this method grants no authority.
+func (m *Manager) PromoteManagedGraphLocator(ctx context.Context, l ManagedGraphLocator) error {
+	if !m.appendOnly || m.expectedPolicy != sqlpolicy.ManagedGraphRequestMaterializationPolicy {
+		return sqlpolicy.ErrIncompatible
+	}
+	if err := l.validate(); err != nil {
+		return err
+	}
+	if _, err := m.OpenRoot(ctx, l.Index, l.RootHash); err != nil {
+		return err
+	}
+	data, err := json.Marshal(l)
+	if err != nil {
+		return err
+	}
+	key := m.key("checkpoint/CURRENT")
+	for range 4 {
+		attr, attrErr := m.bucket.Attributes(objmetrics.WithExpectedNotFound(ctx), key)
+		options := []objstore.ObjectUploadOption{objstore.WithIfNotExists()}
+		if attrErr != nil && !m.bucket.IsObjNotFoundErr(attrErr) {
+			return attrErr
+		}
+		if attrErr == nil {
+			if attr.Version == nil {
+				return fmt.Errorf("managed Graph CURRENT lacks conditional version")
+			}
+			prior, exists, err := m.readManagedGraphLocator(ctx)
+			if err != nil || !exists {
+				return errors.Join(err, fmt.Errorf("managed Graph CURRENT changed during read"))
+			}
+			after, err := m.bucket.Attributes(ctx, key)
+			if err != nil {
+				return err
+			}
+			if after.Version == nil || *after.Version != *attr.Version {
+				continue
+			}
+			if prior.Index > l.Index {
+				return ErrStaleCheckpoint
+			}
+			if prior.Index == l.Index {
+				if prior != l {
+					return fmt.Errorf("conflicting managed Graph locator at same cut")
+				}
+				return nil
+			}
+			options = []objstore.ObjectUploadOption{objstore.WithIfMatch(attr.Version)}
+		}
+		err = m.bucket.Upload(ctx, key, bytes.NewReader(data), options...)
+		if err == nil {
+			return nil
+		}
+		if stored, exists, readErr := m.readManagedGraphLocator(ctx); readErr == nil && exists && stored == l {
+			return nil
+		}
+		if !m.bucket.IsConditionNotMetErr(err) {
+			return err
+		}
+	}
+	return fmt.Errorf("managed Graph CURRENT CAS did not converge")
+}

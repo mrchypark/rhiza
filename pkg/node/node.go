@@ -35,55 +35,56 @@ import (
 
 // Node is the main runtime container.
 type Node struct {
-	config                    *types.ExecutionConfig
-	core                      *quepaxa.Core
-	material                  *materializer.Materializer
-	server                    *network.Server
-	peerControl               *network.Server
-	peer                      *network.PeerServer
-	transport                 *network.Transport
-	catchUp                   *network.Transport
-	wal                       *qlog.WAL
-	lock                      *qlog.LockFile
-	bucket                    *objectstore.MeteredBucket
-	checkpoints               *checkpoint.Manager
-	archive                   *recovery.Manager
-	checkpointer              *checkpoint.AutoCheckpointer
-	localStore                *localCheckpointIdentity
-	localBackup               *recovery.LocalArchive
-	localOwner                *objectstore.LocalFilesystemOwner
-	localBackupReady          bool
-	localBackupNeedsSnapshot  bool
-	localGCContext            context.Context
-	localGCCancel             context.CancelFunc
-	localSnapshotMu           sync.Mutex
-	localBackupRestorePins    *localRestorePins
-	localRoot                 *localCheckpointDescriptor
-	localRestoreSuffixPending bool
-	recoveryPhases            nodeRecoveryPhases
-	ready                     atomic.Bool
-	membershipMu              sync.Mutex
-	opened                    atomic.Bool
-	cancel                    context.CancelFunc
-	wg                        sync.WaitGroup
-	recoveryMu                sync.Mutex
-	replayMu                  sync.Mutex
-	compactionMu              sync.Mutex
-	catchUpWake               chan struct{}
-	shutdownMu                sync.Mutex
-	terminalMu                sync.Mutex
-	terminalIdentity          network.TerminalDrainRequest
-	terminalRequested         atomic.Bool
-	terminalDone              chan struct{}
-	terminalResult            TerminalDrainResult
-	terminalErr               error
-	fenceSession              *fencing.Session
-	preparedStartup           *PreparedStartupConfig
-	managedStartup            *ManagedStartupConfig
-	managedAdmitted           atomic.Bool
-	managedInitiallyAdmitted  atomic.Bool
-	managedPeerVerified       atomic.Bool
-	internalApplication       atomic.Pointer[internalApplicationBinding]
+	config                       *types.ExecutionConfig
+	core                         *quepaxa.Core
+	material                     *materializer.Materializer
+	server                       *network.Server
+	peerControl                  *network.Server
+	peer                         *network.PeerServer
+	transport                    *network.Transport
+	catchUp                      *network.Transport
+	wal                          *qlog.WAL
+	lock                         *qlog.LockFile
+	bucket                       *objectstore.MeteredBucket
+	checkpoints                  *checkpoint.Manager
+	archive                      *recovery.Manager
+	checkpointer                 *checkpoint.AutoCheckpointer
+	localStore                   *localCheckpointIdentity
+	localBackup                  *recovery.LocalArchive
+	localOwner                   *objectstore.LocalFilesystemOwner
+	localBackupReady             bool
+	localBackupNeedsSnapshot     bool
+	localGCContext               context.Context
+	localGCCancel                context.CancelFunc
+	localSnapshotMu              sync.Mutex
+	localBackupRestorePins       *localRestorePins
+	localRoot                    *localCheckpointDescriptor
+	localRestoreSuffixPending    bool
+	recoveryPhases               nodeRecoveryPhases
+	ready                        atomic.Bool
+	membershipMu                 sync.Mutex
+	opened                       atomic.Bool
+	cancel                       context.CancelFunc
+	wg                           sync.WaitGroup
+	recoveryMu                   sync.Mutex
+	replayMu                     sync.Mutex
+	compactionMu                 sync.Mutex
+	catchUpWake                  chan struct{}
+	shutdownMu                   sync.Mutex
+	terminalMu                   sync.Mutex
+	terminalIdentity             network.TerminalDrainRequest
+	terminalRequested            atomic.Bool
+	terminalDone                 chan struct{}
+	terminalResult               TerminalDrainResult
+	terminalErr                  error
+	fenceSession                 *fencing.Session
+	preparedStartup              *PreparedStartupConfig
+	managedStartup               *ManagedStartupConfig
+	managedAdmitted              atomic.Bool
+	managedInitiallyAdmitted     atomic.Bool
+	managedGraphPublisherStarted atomic.Bool
+	managedPeerVerified          atomic.Bool
+	internalApplication          atomic.Pointer[internalApplicationBinding]
 }
 
 // nodeRecoveryPhases records the selected certified checkpoint restore path.
@@ -229,6 +230,7 @@ func (n *Node) openInternal(ctx context.Context, enroll bool, prelocked *qlog.Lo
 	var localRestoreAuthority *materializer.LocalRestoreAuthority
 	var localRestoreFiles []materializer.CheckpointFile
 	managedMaterializerWasAbsent := false
+	var managedGraphTarget materializer.ManagedGraphTargetState
 	if n.config == nil || n.config.NodeID == "" {
 		return fmt.Errorf("node ID is required")
 	}
@@ -514,7 +516,11 @@ func (n *Node) openInternal(ctx context.Context, enroll bool, prelocked *qlog.Lo
 			if err != nil {
 				return err
 			}
-			n.archive, err = recovery.NewAppendOnlyManager(bucket, clusterPrefix, 1)
+			var validateValue func([]byte) error
+			if n.materializationPolicy() == sqlpolicy.ManagedGraphRequestMaterializationPolicy {
+				validateValue = types.ValidateManagedGraphExecutionPolicy
+			}
+			n.archive, err = recovery.NewAppendOnlyManagerWithValueValidator(bucket, clusterPrefix, 1, validateValue)
 			if err != nil {
 				return err
 			}
@@ -569,7 +575,18 @@ func (n *Node) openInternal(ctx context.Context, enroll bool, prelocked *qlog.Lo
 	}
 
 	var material *materializer.Materializer
-	if localRestoreAuthority == nil {
+	deferredManagedGraph := n.managedStartup != nil && n.materializationPolicy() == sqlpolicy.ManagedGraphRequestMaterializationPolicy
+	if deferredManagedGraph {
+		managedMaterializerWasAbsent, err = managedMaterializerFilesAbsent(n.config.DataDir)
+		if err != nil {
+			return err
+		}
+		managedGraphTarget, err = materializer.InspectManagedGraphInstallTarget(ctx, filepath.Join(n.config.DataDir, "sqlite.db"), n.receiptWindow())
+		if err != nil {
+			return err
+		}
+	}
+	if localRestoreAuthority == nil && !deferredManagedGraph {
 		if n.managedStartup != nil {
 			managedMaterializerWasAbsent, err = managedMaterializerFilesAbsent(n.config.DataDir)
 			if err != nil {
@@ -635,10 +652,22 @@ func (n *Node) openInternal(ctx context.Context, enroll bool, prelocked *qlog.Lo
 	if n.config.Learner != nil {
 		makeCore = quepaxa.NewLearner
 	}
+	var validateValue func([]byte) error
+	if n.materializationPolicy() == sqlpolicy.ManagedGraphRequestMaterializationPolicy {
+		validateValue = types.ValidateManagedGraphExecutionPolicy
+		for _, peer := range []*network.Transport{transport, n.catchUp} {
+			if peer != nil {
+				if err := peer.ValidateManagedGraphWireBudget(); err != nil {
+					return fmt.Errorf("managed Graph wire budget: %w", err)
+				}
+			}
+		}
+	}
 	core, err := makeCore(quepaxa.Config{
 		NodeID: n.config.NodeID, Cluster: *cluster, WAL: wal, Transport: coreTransport, LocalMode: n.config.Local,
 		EnableReconfiguration:    n.config.EnableReconfiguration,
 		ReconfigurationAdmission: n.verifyMembershipAdmission,
+		ValidateValue:            validateValue,
 	})
 	if err != nil {
 		return fmt.Errorf("create QuePaxa core: %w", err)
@@ -688,7 +717,7 @@ func (n *Node) openInternal(ctx context.Context, enroll bool, prelocked *qlog.Lo
 			return fmt.Errorf("writable WAL recovery base differs from authorized Local restore")
 		}
 		material, err = materializer.OpenLocalFromBase(filepath.Join(n.config.DataDir, "sqlite.db"), 4, *localRestoreAuthority, localRestoreFiles, n.config.LocalGraphNodePropertyIndexes)
-	} else if material == nil {
+	} else if material == nil && !deferredManagedGraph {
 		return fmt.Errorf("materializer was not opened before Core initialization")
 	}
 	n.material = material
@@ -767,6 +796,36 @@ func (n *Node) openInternal(ctx context.Context, enroll bool, prelocked *qlog.Lo
 				return fmt.Errorf("recover shared archive: %w", archiveErr)
 			}
 		}
+	}
+	if deferredManagedGraph {
+		_, hasSeal, sealErr := core.LatestCheckpointSeal()
+		if sealErr != nil {
+			return sealErr
+		}
+		if hasSeal {
+			material, err = n.installManagedGraphStartup(ctx, core, managedGraphTarget)
+		} else {
+			// Only an explicitly verified original bootstrap may create fresh
+			// application files. A registered restart, required root or observed
+			// locator can never be reinterpreted as empty genesis.
+			_, hasLocator, locatorErr := n.checkpoints.LoadManagedGraphLocator(ctx)
+			if locatorErr != nil {
+				return locatorErr
+			}
+			if !managedMaterializerWasAbsent || n.managedStartup.existingRegisteredWAL || !n.managedStartup.Identity.Fresh || !n.managedStartup.BootstrapMember || core.CompactionFloor() != 0 || hasLocator {
+				return fmt.Errorf("managed Graph recovery requires an authenticated producer root")
+			}
+			// Actual Core has authenticated the complete genesis prefix. No old
+			// native target exists and no installer authority is fabricated.
+			if _, historyErr := certifiedSuffixThrough(core, 1, core.Tip()); historyErr != nil {
+				return historyErr
+			}
+			material, err = n.openMaterializer(filepath.Join(n.config.DataDir, "sqlite.db"), 4)
+		}
+		if err != nil {
+			return fmt.Errorf("open actual reconstructed managed Graph pair: %w", err)
+		}
+		n.material = material
 	}
 	// Record RPCs must be available while every replica is recovering. Public
 	// proposals and learned decisions remain gated by ready=false.
@@ -1070,7 +1129,15 @@ func (n *Node) openInternal(ctx context.Context, enroll bool, prelocked *qlog.Lo
 		startupRecovery.Close()
 	}
 	if certifiedCheckpoint != nil {
-		if err := n.publishCertifiedCheckpoint(ctx, certifiedCheckpoint); err != nil {
+		if n.materializationPolicy() == sqlpolicy.ManagedGraphRequestMaterializationPolicy {
+			seal, exists, err := core.LatestCheckpointSeal()
+			if err != nil || !exists || uint64(seal.Index) != certifiedCheckpoint.Index || seal.RootHash != certifiedCheckpoint.RootHash {
+				return errors.Join(fmt.Errorf("managed Graph startup certified root differs from exact seal"), err)
+			}
+			if err := n.promoteManagedGraphSeal(ctx, seal); err != nil {
+				return fmt.Errorf("promote managed Graph certified checkpoint: %w", err)
+			}
+		} else if err := n.publishCertifiedCheckpoint(ctx, certifiedCheckpoint); err != nil {
 			return fmt.Errorf("publish certified checkpoint: %w", err)
 		}
 	}
@@ -1277,6 +1344,9 @@ func (n *Node) openInternal(ctx context.Context, enroll bool, prelocked *qlog.Lo
 }
 
 func (n *Node) preparePeerCheckpoint(ctx context.Context, sender quepaxa.NodeID, seal quepaxa.CheckpointSeal) error {
+	if n.materializationPolicy() == sqlpolicy.ManagedGraphRequestMaterializationPolicy {
+		return n.prepareManagedGraphPeerCheckpoint(ctx, sender, seal)
+	}
 	if err := n.checkpoints.ValidatePublisherClaim(ctx, string(sender), uint64(seal.Index), seal.RootHash); err != nil {
 		return err
 	}
@@ -1295,6 +1365,16 @@ func (n *Node) preparePeerCheckpoint(ctx context.Context, sender quepaxa.NodeID,
 	}
 	log.Printf("checkpoint prepared: index=%d root=%x", seal.Index, seal.RootHash)
 	return nil
+}
+
+// Initial admission owns a real runtime borrow. Shutdown cancels that binding
+// and drains its borrowers before wg.Wait, so this Add cannot race a completed
+// Wait or outlive native resources. Starting here avoids losing the first tick
+// before a startup-only binding has acquired its actual admission.
+func (n *Node) startManagedGraphPublisherAfterAdmission(binding *internalApplicationBinding) {
+	if binding != nil && n.materializationPolicy() == sqlpolicy.ManagedGraphRequestMaterializationPolicy && n.managedGraphPublisherStarted.CompareAndSwap(false, true) {
+		n.startManagedGraphCheckpointPublisher(binding.lifetime)
+	}
 }
 
 func advanceCheckpointReadBarriers(ctx context.Context, reserved uint64, material *materializer.Materializer, server *network.Server) error {

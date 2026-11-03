@@ -20,15 +20,18 @@ const PeerALPN = "rhiza-peer-v7"
 type MaterializationPolicy int
 
 const (
-	LegacyMaterializationPolicy         MaterializationPolicy = Version
-	ManagedSQLKVMaterializationPolicy   MaterializationPolicy = 8
-	ManagedRequestMaterializationPolicy MaterializationPolicy = 9
+	LegacyMaterializationPolicy              MaterializationPolicy = Version
+	ManagedSQLKVMaterializationPolicy        MaterializationPolicy = 8
+	ManagedRequestMaterializationPolicy      MaterializationPolicy = 9
+	ManagedGraphRequestMaterializationPolicy MaterializationPolicy = 10
 )
 
 const ManagedRequestApplicationProtocol = "rhiza-managed-request/v1"
+const ManagedGraphRequestApplicationProtocol = "rhiza-managed-request-graph/v1"
+const ManagedGraphRequestPeerALPN = "rhiza-peer-managed-request-graph-v1"
 
 func (p MaterializationPolicy) Validate() error {
-	if p != LegacyMaterializationPolicy && p != ManagedSQLKVMaterializationPolicy && p != ManagedRequestMaterializationPolicy {
+	if p != LegacyMaterializationPolicy && p != ManagedSQLKVMaterializationPolicy && p != ManagedRequestMaterializationPolicy && p != ManagedGraphRequestMaterializationPolicy {
 		return ErrIncompatible
 	}
 	return nil

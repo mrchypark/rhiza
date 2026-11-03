@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"reflect"
 
+	"github.com/mrchypark/rhiza/internal/sqlpolicy"
 	"github.com/mrchypark/rhiza/internal/types"
 	"github.com/mrchypark/rhiza/pkg/network"
 	"github.com/mrchypark/rhiza/pkg/node"
@@ -22,6 +23,7 @@ type RecoveryResult struct {
 	RequestID []byte
 	SQL       *ExecuteResponse
 	KV        *network.KVMutationResponse
+	Graph     *network.GraphExecuteResponse
 }
 
 // MutationContext identifies the original processed by the failed invocation.
@@ -53,9 +55,10 @@ func MutationErrorContext(err error) (MutationContext, bool) {
 }
 
 type applicationOriginal struct {
-	kind string
-	sql  ExecuteRequest
-	kv   types.KVCommand
+	kind  string
+	sql   ExecuteRequest
+	kv    types.KVCommand
+	graph types.GraphCommand
 }
 
 // Exists only while proving an already-completed remote finalization. It does
@@ -85,6 +88,9 @@ func proofScopeOpen(p remoteRecoveryProof) bool {
 }
 
 func (p applicationOriginal) rawID() string {
+	if p.kind == "graph" {
+		return p.graph.RequestID
+	}
 	if p.kind == "kv" {
 		return p.kv.RequestID
 	}
@@ -144,6 +150,19 @@ func (h *Host) inspectEvidence(ctx context.Context, fresh, localRead bool) (json
 
 // Keep the evidence and the exact runtime validated by its inspector together.
 func (h *Host) inspectEvidenceSnapshot(ctx context.Context, fresh, localRead bool) (json.RawMessage, node.ManagedRuntimeState, error) {
+	if h.cfg.Plan.ApplicationProtocol == sqlpolicy.ManagedGraphRequestApplicationProtocol {
+		state, err := h.node.InspectManagedGraph(ctx, fresh, localRead)
+		if err != nil {
+			return nil, node.ManagedRuntimeState{}, err
+		}
+		evidence, err := json.Marshal(struct {
+			Format        string `json:"format"`
+			SQLDigest     string `json:"sql_digest"`
+			LastGraphSlot uint64 `json:"last_graph_slot"`
+			GraphHistory  string `json:"graph_history"`
+		}{h.cfg.Plan.EvidenceFormat, fmt.Sprintf("%x", state.Application.Digest), state.History.LastGraphSlot, fmt.Sprintf("%x", state.History.Hash)})
+		return evidence, state.Runtime, err
+	}
 	if h.mixed() {
 		var state node.ManagedKVSnapshot
 		var err error
@@ -343,6 +362,9 @@ func (h *Host) RequestStatus(ctx context.Context, req network.RequestStatusReque
 	}
 	if err := h.ensureInitialRequestAdmission(ctx); err != nil {
 		return network.RequestStatusResponse{}, err
+	}
+	if req.Kind == "graph" {
+		return h.node.GraphRequestStatusManaged(ctx, req)
 	}
 	return h.node.RequestStatusManaged(ctx, req)
 }

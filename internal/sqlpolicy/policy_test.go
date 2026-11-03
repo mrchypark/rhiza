@@ -16,7 +16,7 @@ func TestMaterializationPolicyExactExpected(t *testing.T) {
 		t.Fatal("legacy SQL semantics changed")
 	}
 	ctx := context.Background()
-	for _, stored := range []string{"7", "8", "08", "9", ""} {
+	for _, stored := range []string{"7", "8", "08", "9", "10", "010", ""} {
 		t.Run("stored-"+stored, func(t *testing.T) {
 			path := filepath.Join(t.TempDir(), "state.db")
 			db, err := driver.Open(path)
@@ -37,7 +37,7 @@ func TestMaterializationPolicyExactExpected(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			for _, expected := range []MaterializationPolicy{LegacyMaterializationPolicy, ManagedSQLKVMaterializationPolicy, ManagedRequestMaterializationPolicy} {
+			for _, expected := range []MaterializationPolicy{LegacyMaterializationPolicy, ManagedSQLKVMaterializationPolicy, ManagedRequestMaterializationPolicy, ManagedGraphRequestMaterializationPolicy} {
 				wantOK := stored == strconv.Itoa(int(expected))
 				for _, check := range []func(context.Context, string, MaterializationPolicy) error{CheckFileForPolicy, CheckSnapshotFileForPolicy, CheckExistingForPolicy} {
 					err := check(ctx, path, expected)
@@ -61,7 +61,7 @@ func TestMaterializationPolicyExactExpected(t *testing.T) {
 			t.Fatalf("unknown expected policy accepted: %d %v", bad, err)
 		}
 	}
-	for _, valid := range []MaterializationPolicy{ManagedSQLKVMaterializationPolicy, ManagedRequestMaterializationPolicy} {
+	for _, valid := range []MaterializationPolicy{ManagedSQLKVMaterializationPolicy, ManagedRequestMaterializationPolicy, ManagedGraphRequestMaterializationPolicy} {
 		if err := CheckExistingForPolicy(ctx, missing, valid); err != nil {
 			t.Fatal(err)
 		}

@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"time"
 
+	"github.com/mrchypark/rhiza/internal/sqlpolicy"
 	"github.com/mrchypark/rhiza/internal/types"
 	"github.com/mrchypark/rhiza/pkg/materializer"
 )
@@ -80,6 +81,9 @@ func (s *Server) handleGraphExecute(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) GraphExecute(ctx context.Context, command types.GraphCommand) (GraphExecuteResponse, error) {
+	if s.expectedPolicy == sqlpolicy.ManagedGraphRequestMaterializationPolicy {
+		return s.graphExecuteManaged(ctx, command)
+	}
 	if managedKVExecutionPolicy(s.expectedPolicy) {
 		return GraphExecuteResponse{}, ErrInvalidRequest
 	}
@@ -123,18 +127,83 @@ func (s *Server) GraphExecute(ctx context.Context, command types.GraphCommand) (
 		}
 		return GraphExecuteResponse{MutationReceipt: receipt}, nil
 	}
-	_, err = s.graphBatcher.submit(ctx, command, lease)
+	submitSlot, err := s.graphBatcher.submit(ctx, command, lease)
 	if err != nil {
-		return GraphExecuteResponse{}, err
+		return GraphExecuteResponse{}, commitUnknown(submitSlot, command.RequestID, err)
 	}
 	receipt, found, err := s.material.GraphMutationReceipt(ctx, command.RequestID)
 	if err != nil {
-		return GraphExecuteResponse{}, err
+		return GraphExecuteResponse{}, commitUnknown(submitSlot, command.RequestID, err)
 	}
 	if !found {
-		return GraphExecuteResponse{}, fmt.Errorf("graph mutation receipt is unavailable")
+		return GraphExecuteResponse{}, commitUnknown(submitSlot, command.RequestID, fmt.Errorf("graph mutation receipt is unavailable"))
 	}
-	if matches, err := s.material.GraphRequestMatches(ctx, command); err != nil || !matches {
+	if matches, err := s.material.GraphRequestMatches(ctx, command); err != nil {
+		return GraphExecuteResponse{}, commitUnknown(submitSlot, command.RequestID, err)
+	} else if !matches {
+		return GraphExecuteResponse{}, ErrRequestConflict
+	}
+	return GraphExecuteResponse{MutationReceipt: receipt}, nil
+}
+
+func (s *Server) graphExecuteManaged(ctx context.Context, command types.GraphCommand) (GraphExecuteResponse, error) {
+	if !s.writable || !s.Ready() || s.material == nil {
+		return GraphExecuteResponse{}, ErrNotReady
+	}
+	if err := ctx.Err(); err != nil {
+		return GraphExecuteResponse{}, err
+	}
+	frame, err := PrepareManagedGraphExecution(command)
+	if err != nil {
+		return GraphExecuteResponse{}, err
+	}
+	owned, recognized, err := types.DecodeManagedGraphExecution(frame)
+	if err != nil || !recognized {
+		return GraphExecuteResponse{}, ErrInvalidRequest
+	}
+	fingerprint, err := types.ManagedGraphIntentFingerprint(owned)
+	if err != nil {
+		return GraphExecuteResponse{}, err
+	}
+	charge, err := mutationCharge(owned)
+	if err != nil {
+		return GraphExecuteResponse{}, err
+	}
+	lease, err := s.admitMutation(charge)
+	if err != nil {
+		return GraphExecuteResponse{}, err
+	}
+	defer lease.releaseCaller()
+	unlock, err := s.lockRequest(ctx, owned.RequestID)
+	if err != nil {
+		return GraphExecuteResponse{}, err
+	}
+	defer unlock()
+	receipt, found, matches, err := s.material.GraphRequestStatusFingerprint(ctx, owned.RequestID, fingerprint)
+	if err != nil {
+		return GraphExecuteResponse{}, err
+	}
+	if found && !matches {
+		return GraphExecuteResponse{}, ErrRequestConflict
+	}
+	if found {
+		if err := s.waitReceiptDurable(ctx, receipt, owned.RequestID); err != nil {
+			return GraphExecuteResponse{}, err
+		}
+		return GraphExecuteResponse{MutationReceipt: receipt}, nil
+	}
+	slot, err := s.graphBatcher.submitEncoded(ctx, owned, frame, lease)
+	if err != nil {
+		return GraphExecuteResponse{}, commitUnknown(slot, owned.RequestID, err)
+	}
+	receipt, found, matches, err = s.material.GraphRequestStatusFingerprint(ctx, owned.RequestID, fingerprint)
+	if err != nil {
+		return GraphExecuteResponse{}, commitUnknown(slot, owned.RequestID, err)
+	}
+	if !found {
+		return GraphExecuteResponse{}, commitUnknown(slot, owned.RequestID, fmt.Errorf("graph mutation receipt is unavailable"))
+	}
+	if !matches {
 		return GraphExecuteResponse{}, ErrRequestConflict
 	}
 	return GraphExecuteResponse{MutationReceipt: receipt}, nil
@@ -179,7 +248,7 @@ func (s *Server) graphQuery(ctx context.Context, request GraphQueryRequest) (typ
 		return types.GraphCommandResult{}, ErrInvalidRequest
 	}
 	if err := s.readBarrier(ctx, request.Consistency); err != nil {
-		return types.GraphCommandResult{}, err
+		return types.GraphCommandResult{}, fmt.Errorf("Graph query certified read barrier: %w", err)
 	}
 	result, err := s.material.GraphQuery(ctx, request.Cypher, request.Args)
 	if err != nil {

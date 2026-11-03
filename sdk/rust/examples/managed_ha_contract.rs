@@ -3,7 +3,12 @@ use rhizadb::{
     ExecuteReturningResult, ManagedDb, ManagedExecuteRequest, ManagedKVReceipt, ManagedKVRequest,
     ManagedQueryRequest, ManagedRecoveryResult, ManagedRequestReceipt, MutationKind,
 };
+use rhizadb::{
+    ManagedGraphCommand, ManagedGraphEvent, ManagedGraphOffset, ManagedGraphReceipt,
+    ManagedGraphStreamRequest, ManagedGraphTrim, ManagedGraphValue,
+};
 use serde_json::json;
+use std::collections::BTreeMap;
 use std::{
     env,
     fs::{self, OpenOptions},
@@ -18,6 +23,13 @@ const VALUE: &str = "rust-managed-ffi-ack";
 
 fn main() {
     let arguments = env::args().skip(1).collect::<Vec<_>>();
+    if arguments == ["--graph-initial"] || arguments == ["--graph-verify"] {
+        if let Err(code) = run_graph(arguments[0] == "--graph-initial") {
+            eprintln!("FAIL: managed-ha-contract {code}");
+            std::process::exit(1);
+        }
+        return;
+    }
     if arguments == ["--mixed-initial"] || arguments == ["--mixed-verify"] {
         if let Err(code) = run_mixed(arguments[0] == "--mixed-initial") {
             eprintln!("FAIL: managed-ha-contract {code}");
@@ -37,6 +49,320 @@ fn main() {
         eprintln!("FAIL: managed-ha-contract {code}");
         std::process::exit(1);
     }
+}
+
+fn graph_commands() -> Vec<ManagedGraphCommand> {
+    let event = |n| ManagedGraphEvent {
+        stream: b"graph-ci-events".to_vec(),
+        kind: b"ordered".to_vec(),
+        payload: ManagedGraphValue::Integer(n),
+    };
+    vec![
+        ManagedGraphCommand {
+            request_id: vec![0xff, 1],
+            cypher: b"CREATE (:GraphCI {id:'a', label:$label, n:$n})".to_vec(),
+            args: Some(BTreeMap::from([
+                (
+                    b"label".to_vec(),
+                    ManagedGraphValue::Bytes(b"alpha".to_vec()),
+                ),
+                (
+                    b"n".to_vec(),
+                    ManagedGraphValue::Float32Bits(0.1f32.to_bits()),
+                ),
+            ])),
+            events: Some(vec![
+                event(1),
+                ManagedGraphEvent {
+                    stream: b"graph-ci-trim".to_vec(),
+                    kind: b"trimmed".to_vec(),
+                    payload: ManagedGraphValue::Integer(1),
+                },
+            ]),
+            ..Default::default()
+        },
+        ManagedGraphCommand {
+            request_id: vec![0xfe, 2],
+            cypher: b"CREATE (:GraphCI {id:'b', label:'beta', n:2})".to_vec(),
+            events: Some(vec![
+                event(2),
+                ManagedGraphEvent {
+                    stream: b"graph-ci-trim".to_vec(),
+                    kind: b"trimmed".to_vec(),
+                    payload: ManagedGraphValue::Integer(2),
+                },
+            ]),
+            ..Default::default()
+        },
+        ManagedGraphCommand {
+            request_id: "\u{fffd}".as_bytes().to_vec(),
+            cypher: b"MATCH (a:GraphCI {id:'a'}), (b:GraphCI {id:'b'}) CREATE (a)-[:LINK]->(b)"
+                .to_vec(),
+            events: Some(vec![event(3)]),
+            ..Default::default()
+        },
+        ManagedGraphCommand {
+            request_id: b"graph-offset-max".to_vec(),
+            stream_offset: Some(ManagedGraphOffset {
+                stream: b"graph-ci-events".to_vec(),
+                consumer: b"graph-ci-consumer".to_vec(),
+                sequence: u64::MAX,
+            }),
+            ..Default::default()
+        },
+        ManagedGraphCommand {
+            request_id: b"graph-trim-max".to_vec(),
+            stream_trim: Some(ManagedGraphTrim {
+                stream: b"graph-ci-trim".to_vec(),
+                through_sequence: u64::MAX,
+            }),
+            ..Default::default()
+        },
+    ]
+}
+
+fn graph_receipt_json(receipt: &ManagedGraphReceipt) -> Result<serde_json::Value, String> {
+    if receipt.slot == 0
+        || receipt.status != "committed"
+        || !receipt.applied
+        || receipt.error_code.as_deref().is_some_and(|v| !v.is_empty())
+        || receipt.retry_through_slot.is_none_or(|v| v < receipt.slot)
+    {
+        return Err("graph_receipt_not_ack".into());
+    }
+    Ok(
+        json!({"slot":receipt.slot,"status":receipt.status,"applied":receipt.applied,"retry_through_slot":receipt.retry_through_slot}),
+    )
+}
+
+fn graph_recover_exact(
+    db: &ManagedDb,
+    command: &ManagedGraphCommand,
+    upper: u64,
+) -> Result<ManagedGraphReceipt, String> {
+    match db
+        .recover_request(MutationKind::Graph, &command.request_id)
+        .map_err(|e| e.error().code.clone())?
+    {
+        ManagedRecoveryResult::Graph {
+            request_id,
+            receipt,
+        } if request_id == command.request_id && (upper == 0 || receipt.slot <= upper) => {
+            Ok(receipt)
+        }
+        _ => Err("graph_original_recovery_mismatch".into()),
+    }
+}
+
+fn graph_state(db: &ManagedDb) -> Result<serde_json::Value, String> {
+    let nodes = db
+        .graph_query(
+            "MATCH (n:GraphCI) RETURN n.id,n.label,n.n ORDER BY n.id",
+            json!({}),
+            "linearizable",
+        )
+        .map_err(|e| e.code)?;
+    if nodes.rows
+        != vec![
+            vec![json!("a"), json!("alpha"), json!(0.1)],
+            vec![json!("b"), json!("beta"), json!(2)],
+        ]
+    {
+        return Err("graph_properties_mismatch".into());
+    }
+    let edges = db
+        .graph_query(
+            "MATCH (a:GraphCI)-[:LINK]->(b:GraphCI) RETURN a.id,b.id",
+            json!({}),
+            "linearizable",
+        )
+        .map_err(|e| e.code)?;
+    if edges.rows != vec![vec![json!("a"), json!("b")]] {
+        return Err("graph_edges_mismatch".into());
+    }
+    let events = db
+        .graph_stream_read(&ManagedGraphStreamRequest {
+            stream: "graph-ci-events".into(),
+            after_sequence: 0,
+            limit: 10,
+            wait_ms: 0,
+            consistency: "linearizable".into(),
+        })
+        .map_err(|e| e.code)?;
+    if events.records.len() != 3
+        || events
+            .records
+            .windows(2)
+            .any(|v| v[0].sequence >= v[1].sequence)
+        || events
+            .records
+            .iter()
+            .enumerate()
+            .any(|(i, v)| v.kind != "ordered" || v.payload != json!(i + 1))
+    {
+        return Err("graph_events_mismatch".into());
+    }
+    let offset = db
+        .graph_stream_offset("graph-ci-events", "graph-ci-consumer", "linearizable")
+        .map_err(|e| e.code)?;
+    if !offset.found || offset.sequence != u64::MAX {
+        return Err("graph_offset_u64_mismatch".into());
+    }
+    let trimmed = db
+        .graph_stream_read(&ManagedGraphStreamRequest {
+            stream: "graph-ci-trim".into(),
+            after_sequence: 0,
+            limit: 10,
+            wait_ms: 0,
+            consistency: "linearizable".into(),
+        })
+        .map_err(|e| e.code)?;
+    if !trimmed.records.is_empty() {
+        return Err("graph_trim_mismatch".into());
+    }
+    Ok(
+        json!({"nodes":nodes.rows,"edges":edges.rows,"events":events.records.iter().map(|v|json!({"sequence":v.sequence,"kind":v.kind,"payload":v.payload})).collect::<Vec<_>>(),"offset":"18446744073709551615","trim_empty":true}),
+    )
+}
+
+fn run_graph(initial: bool) -> Result<(), String> {
+    let uid = env::var("POD_UID").map_err(|_| "pod_identity_missing")?;
+    let producer = env::var("RHIZA_RUST_PRODUCER_UID").map_err(|_| "producer_identity_missing")?;
+    if uid.is_empty() || producer.is_empty() || initial && uid != producer {
+        return Err("graph_producer_identity_mismatch".into());
+    }
+    let mut db = ManagedDb::open_from_env().map_err(|e| e.code)?;
+    if !db
+        .ready_with_timeout(Duration::from_secs(90))
+        .map_err(|e| e.code)?
+    {
+        return Err("graph_not_ready".into());
+    }
+    let commands = graph_commands();
+    let tuple = if initial {
+        let mut cases = Vec::new();
+        for command in &commands {
+            if command.request_id == b"graph-trim-max" {
+                let before = db
+                    .graph_stream_read(&ManagedGraphStreamRequest {
+                        stream: "graph-ci-trim".into(),
+                        after_sequence: 0,
+                        limit: 10,
+                        wait_ms: 0,
+                        consistency: "linearizable".into(),
+                    })
+                    .map_err(|e| e.code)?;
+                if before.records.len() != 2
+                    || before.records[0].sequence >= before.records[1].sequence
+                    || before
+                        .records
+                        .iter()
+                        .enumerate()
+                        .any(|(i, r)| r.kind != "trimmed" || r.payload != json!(i + 1))
+                {
+                    return Err("graph_trim_nonempty_precondition_missing".into());
+                }
+            }
+            let (receipt, recovered) = match db.graph_execute(command) {
+                Ok(receipt) => (receipt, false),
+                Err(e) if e.error().code == "commit_unknown" => {
+                    let context = e
+                        .mutation_context()
+                        .ok_or("graph_unknown_context_missing")?;
+                    if context.kind() != MutationKind::Graph
+                        || context.request_id() != command.request_id
+                    {
+                        return Err("graph_unknown_context_mismatch".into());
+                    }
+                    (graph_recover_exact(&db, command, context.slot())?, true)
+                }
+                Err(e) => return Err(e.error().code.clone()),
+            };
+            cases.push(json!({"request_id_b64":STANDARD.encode(&command.request_id),"expected_original_b64":STANDARD.encode(command.encode_original().map_err(|e|e.code)?),"frame_b64":STANDARD.encode(command.encode_execution().map_err(|e|e.code)?),"receipt":graph_receipt_json(&receipt)?,"recovered":recovered}));
+        }
+        let tuple = json!({"version":1,"producer_uid":producer,"cases":cases,"trim_before_count":2,"state":graph_state(&db)?});
+        mixed_sql(
+            &db,
+            &ManagedExecuteRequest::sql(
+                "graph-ci-schema",
+                "CREATE TABLE rust_graph_contract(id INTEGER PRIMARY KEY,tuple TEXT NOT NULL)",
+            ),
+        )?;
+        mixed_sql(
+            &db,
+            &ManagedExecuteRequest::sql(
+                "graph-ci-row",
+                "INSERT INTO rust_graph_contract VALUES(1,?)",
+            )
+            .args([json!(tuple.to_string())]),
+        )?;
+        tuple
+    } else {
+        let row = db
+            .query(
+                &ManagedQueryRequest::new("SELECT tuple FROM rust_graph_contract WHERE id=1")
+                    .consistency("linearizable"),
+            )
+            .map_err(|e| e.code)?;
+        let text = row
+            .rows
+            .first()
+            .and_then(|r| r.first())
+            .and_then(|v| v.as_str())
+            .ok_or("graph_tuple_missing")?;
+        if row.rows.len() != 1 || row.rows[0].len() != 1 || text.len() > 32768 {
+            return Err("graph_tuple_invalid".into());
+        }
+        serde_json::from_str::<serde_json::Value>(text).map_err(|_| "graph_tuple_invalid")?
+    };
+    if tuple["version"] != json!(1)
+        || tuple["trim_before_count"] != json!(2)
+        || tuple["producer_uid"] != json!(producer)
+        || tuple["cases"]
+            .as_array()
+            .is_none_or(|v| v.len() != commands.len())
+        || tuple["state"] != graph_state(&db)?
+    {
+        return Err("graph_tuple_state_mismatch".into());
+    }
+    for (command, case) in commands
+        .iter()
+        .zip(tuple["cases"].as_array().ok_or("graph_cases_missing")?)
+    {
+        if case["request_id_b64"] != json!(STANDARD.encode(&command.request_id))
+            || case["expected_original_b64"]
+                != json!(STANDARD.encode(command.encode_original().map_err(|e| e.code)?))
+            || case["frame_b64"]
+                != json!(STANDARD.encode(command.encode_execution().map_err(|e| e.code)?))
+        {
+            return Err("graph_expected_original_changed".into());
+        }
+        let recovered = graph_recover_exact(&db, command, 0)?;
+        if case["receipt"] != graph_receipt_json(&recovered)? {
+            return Err("graph_first_receipt_changed".into());
+        }
+        let status = db
+            .request_status(MutationKind::Graph, &command.request_id)
+            .map_err(|e| e.code)?;
+        match status.receipt {
+            Some(ManagedRequestReceipt::Graph(receipt))
+                if graph_receipt_json(&receipt)? == case["receipt"] =>
+            {
+                ()
+            }
+            _ => return Err("graph_status_receipt_mismatch".into()),
+        }
+    }
+    db.close().map_err(|e| e.code)?;
+    println!("RUST_GRAPH_CURRENT_UID={uid}");
+    println!("RUST_GRAPH_TUPLE={tuple}");
+    println!(
+        "PASS: managed Rust FFI Graph {} state contract",
+        if initial { "initial" } else { "verify" }
+    );
+    // This is state/receipt verification only. Forced UNKNOWN, canonical native
+    // inspection and checkpoint/counter qualification are separate CI gates.
+    Ok(())
 }
 
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize, PartialEq, Eq)]

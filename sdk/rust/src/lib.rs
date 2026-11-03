@@ -7,6 +7,13 @@ use base64::{engine::general_purpose::STANDARD, Engine as _};
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use serde_json::{json, Map, Value};
 
+mod managed_graph;
+pub use managed_graph::{
+    ManagedGraphCommand, ManagedGraphEvent, ManagedGraphOffset, ManagedGraphOffsetRead,
+    ManagedGraphReceipt, ManagedGraphStreamRead, ManagedGraphStreamRecord,
+    ManagedGraphStreamRequest, ManagedGraphTrim, ManagedGraphValue,
+};
+
 const MAX_INPUT_BYTES: usize = 16 << 20;
 const DEFAULT_TIMEOUT_MS: u64 = 30_000;
 
@@ -49,12 +56,14 @@ type Result<T> = std::result::Result<T, Error>;
 pub enum MutationKind {
     Sql,
     Kv,
+    Graph,
 }
 impl MutationKind {
     fn wire(self) -> &'static str {
         match self {
             Self::Sql => "sql",
             Self::Kv => "kv",
+            Self::Graph => "graph",
         }
     }
 }
@@ -172,6 +181,7 @@ pub struct ManagedKVRead {
 pub enum ManagedRequestReceipt {
     Sql(MutationReceipt),
     Kv(ManagedKVReceipt),
+    Graph(ManagedGraphReceipt),
 }
 #[derive(Clone, Debug)]
 pub struct ManagedRequestStatus {
@@ -190,6 +200,10 @@ pub enum ManagedRecoveryResult {
         request_id: Vec<u8>,
         receipt: ManagedKVReceipt,
     },
+    Graph {
+        request_id: Vec<u8>,
+        receipt: ManagedGraphReceipt,
+    },
 }
 
 #[derive(Deserialize)]
@@ -203,6 +217,10 @@ enum ManagedRecoveryWire {
     Kv {
         request_id_b64: String,
         kv: ManagedKVReceipt,
+    },
+    Graph {
+        request_id_b64: String,
+        graph: ManagedGraphReceipt,
     },
 }
 impl ManagedRecoveryWire {
@@ -219,6 +237,13 @@ impl ManagedRecoveryWire {
             Self::Kv { request_id_b64, kv } => ManagedRecoveryResult::Kv {
                 request_id: managed_base64(&request_id_b64)?,
                 receipt: kv,
+            },
+            Self::Graph {
+                request_id_b64,
+                graph,
+            } => ManagedRecoveryResult::Graph {
+                request_id: managed_base64(&request_id_b64)?,
+                receipt: graph,
             },
         })
     }
@@ -571,6 +596,101 @@ pub struct ManagedDb {
     closed: bool,
 }
 impl ManagedDb {
+    pub fn graph_execute(
+        &self,
+        original: &ManagedGraphCommand,
+    ) -> std::result::Result<ManagedGraphReceipt, ManagedMutationError> {
+        let frame = original
+            .encode_execution()
+            .map_err(ManagedMutationError::from)?;
+        self.call_detailed(
+            "graph_execute",
+            json!({"frame_b64": STANDARD.encode(frame)}),
+        )
+    }
+
+    /// Query arguments follow the existing ordinary read JSON semantics; they
+    /// are not a mutation original or input to the intent fingerprint.
+    pub fn graph_query(&self, cypher: &str, args: Value, consistency: &str) -> Result<QueryResult> {
+        self.call(
+            "graph_query",
+            json!({"cypher":cypher,"args":args,"consistency":consistency}),
+        )
+    }
+
+    pub fn graph_reachable(&self, request: GraphReachableRequest) -> Result<Value> {
+        self.call(
+            "graph_reachable",
+            serde_json::to_value(request).map_err(internal)?,
+        )
+    }
+
+    pub fn graph_changes(
+        &self,
+        request: &ManagedGraphStreamRequest,
+    ) -> Result<ManagedGraphStreamRead> {
+        self.call(
+            "graph_changes",
+            serde_json::to_value(request).map_err(internal)?,
+        )
+    }
+
+    pub fn graph_stream_read(
+        &self,
+        request: &ManagedGraphStreamRequest,
+    ) -> Result<ManagedGraphStreamRead> {
+        self.call(
+            "graph_stream_read",
+            serde_json::to_value(request).map_err(internal)?,
+        )
+    }
+
+    pub fn graph_stream_offset(
+        &self,
+        stream: &str,
+        consumer: &str,
+        consistency: &str,
+    ) -> Result<ManagedGraphOffsetRead> {
+        self.call(
+            "graph_stream_offset",
+            json!({"stream":stream,"consumer":consumer,"consistency":consistency}),
+        )
+    }
+
+    pub fn set_graph_stream_offset(
+        &self,
+        request_id: &[u8],
+        stream: &str,
+        consumer: &str,
+        sequence: u64,
+    ) -> std::result::Result<ManagedGraphReceipt, ManagedMutationError> {
+        self.graph_execute(&ManagedGraphCommand {
+            request_id: request_id.to_vec(),
+            stream_offset: Some(ManagedGraphOffset {
+                stream: stream.as_bytes().to_vec(),
+                consumer: consumer.as_bytes().to_vec(),
+                sequence,
+            }),
+            ..Default::default()
+        })
+    }
+
+    pub fn trim_graph_stream(
+        &self,
+        request_id: &[u8],
+        stream: &str,
+        through_sequence: u64,
+    ) -> std::result::Result<ManagedGraphReceipt, ManagedMutationError> {
+        self.graph_execute(&ManagedGraphCommand {
+            request_id: request_id.to_vec(),
+            stream_trim: Some(ManagedGraphTrim {
+                stream: stream.as_bytes().to_vec(),
+                through_sequence,
+            }),
+            ..Default::default()
+        })
+    }
+
     pub fn open(config: ManagedOpenConfig) -> Result<Self> {
         let value = native_open_managed(config.into_json())?;
         let handle = value
@@ -680,6 +800,9 @@ impl ManagedDb {
             .map(|value| match kind {
                 MutationKind::Sql => serde_json::from_value(value).map(ManagedRequestReceipt::Sql),
                 MutationKind::Kv => serde_json::from_value(value).map(ManagedRequestReceipt::Kv),
+                MutationKind::Graph => {
+                    serde_json::from_value(value).map(ManagedRequestReceipt::Graph)
+                }
             })
             .transpose()
             .map_err(internal)?;

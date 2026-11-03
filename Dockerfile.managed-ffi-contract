@@ -15,7 +15,8 @@ COPY --from=builder /usr/local/go /usr/local/go
 ENV PATH="/usr/local/go/bin:${PATH}"
 WORKDIR /app
 COPY . .
-RUN CGO_ENABLED=1 go test -c -o rhiza-managed-ffi-contract ./cmd/rhiza-ffi
+RUN CGO_ENABLED=1 go test -tags rhiza_local_testhooks -c -o rhiza-managed-ffi-contract ./cmd/rhiza-ffi
+RUN CGO_ENABLED=1 go test -c -o rhiza-managed-materializer-contract ./pkg/materializer
 # This links the actual adjacent Go C archive, not a prebuilt substitute.
 RUN cargo build --manifest-path sdk/rust/Cargo.toml --locked --release --example managed_ha_contract
 
@@ -27,6 +28,7 @@ COPY --from=builder /app/rhiza-operator /usr/local/bin/rhiza-operator
 COPY --from=builder /app/rhiza-fencer /usr/local/bin/rhiza-fencer
 COPY --from=builder /app/rhiza-ha-init /usr/local/libexec/rhiza-ha-init
 COPY --from=rust-builder /app/rhiza-managed-ffi-contract /usr/local/libexec/rhiza-managed-ffi-contract
+COPY --from=rust-builder /app/rhiza-managed-materializer-contract /usr/local/libexec/rhiza-managed-materializer-contract
 COPY --from=rust-builder /app/sdk/rust/target/release/examples/managed_ha_contract /usr/local/libexec/rhiza-rust-managed-contract
 COPY --chmod=0755 scripts/managed-ffi-contract-entrypoint.sh /usr/local/bin/rhiza-ha-init
 USER 65532:65532

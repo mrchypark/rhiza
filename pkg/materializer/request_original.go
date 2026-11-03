@@ -30,6 +30,8 @@ type RequestOriginal struct {
 	CanonicalOriginal, ExecutionItem []byte
 	SQL                              *types.SQLCommand
 	KV                               *types.KVCommand
+	Graph                            *types.GraphCommand
+	DecisionHash                     [32]byte
 	Receipt                          types.MutationReceipt
 	SQLResult                        types.SQLCommandResult
 }
@@ -154,7 +156,7 @@ func scanRequestOriginal(scanner interface{ Scan(...any) error }, tip, window ui
 func (m *Materializer) RetainedRequestOriginal(ctx context.Context, kind types.MutationKind, rawID string) (RequestOriginal, bool, error) {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
-	if m.materializationPolicy != sqlpolicy.ManagedRequestMaterializationPolicy {
+	if !originalsPolicy(m.materializationPolicy) {
 		return RequestOriginal{}, false, sqlpolicy.ErrIncompatible
 	}
 	if m.writer == nil || len(m.readers) == 0 {
@@ -162,6 +164,9 @@ func (m *Materializer) RetainedRequestOriginal(ctx context.Context, kind types.M
 	}
 	if err := m.sqlReceiptReadLocked(); err != nil {
 		return RequestOriginal{}, false, err
+	}
+	if graphProtocol(m.managedProtocol) && kind == types.MutationGraph {
+		return m.retainedGraphOriginalLocked(ctx, rawID)
 	}
 	if (kind != types.MutationSQL && kind != types.MutationKV) || rawID == "" || len(rawID) > types.MaxRequestIDBytes {
 		return RequestOriginal{}, false, fmt.Errorf("invalid original lookup")

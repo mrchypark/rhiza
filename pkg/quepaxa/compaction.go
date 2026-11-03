@@ -403,6 +403,7 @@ func (c *Core) estimateLocalCompactionOwned(seal CheckpointSeal) (uint64, error)
 // replacing the WAL. A rejected decision must remain evidence, not become tip.
 func (c *Core) verifyBaseSuffixLocked(base consensusBase) (*Core, error) {
 	v := newCore(c.nodeID, c.config, nil, nil)
+	v.validateValue = c.validateValue
 	v.reconfigEnabled = c.reconfigEnabled
 	v.generationAnchorHash = c.generationAnchorHash
 	if err := v.installGenerationAnchorBaseLocked(base.GenerationAnchorHash); err != nil {

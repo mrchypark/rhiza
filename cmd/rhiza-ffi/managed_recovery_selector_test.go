@@ -35,7 +35,7 @@ func TestManagedRecoverySelectorStrictPair(t *testing.T) {
 		{"null-id", `{"kind":"sql","request_id_b64":null}`, true, false, false},
 		{"kind-only", `{"kind":"sql"}`, true, false, false},
 		{"id-only", `{"request_id_b64":"eA=="}`, true, false, false},
-		{"bad-kind", `{"kind":"graph","request_id_b64":"eA=="}`, true, false, false},
+		{"bad-kind", `{"kind":"notify","request_id_b64":"eA=="}`, true, false, false},
 		{"bad-base64", `{"kind":"kv","request_id_b64":"!"}`, true, false, false},
 		{"extra", `{"kind":"kv","request_id_b64":"eA==","original":{}}`, true, false, false},
 	} {

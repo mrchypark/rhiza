@@ -27,6 +27,10 @@ type Config struct {
 	// share the WAL while Core is active. Close it only after Core has stopped.
 	WAL       *qlog.WAL
 	Transport Transport
+	// ValidateValue is fixed by trusted startup before WAL recovery. Nil keeps
+	// the legacy 128KiB contract. An explicit profile validator may recognize
+	// its own bounded larger frame, but must preserve old control limits.
+	ValidateValue func([]byte) error
 	// EnableReconfiguration opts into the bounded, in-band prototype. It is
 	// deliberately off by default while checkpoint snapshots lack certified
 	// membership state.
@@ -59,6 +63,9 @@ func installReconfigurationMarker(appendMarker, syncWAL func() error) error {
 }
 
 func newCoreFromConfig(config Config, observer, learner, localReadOnlyInspection bool) (*Core, error) {
+	if config.LocalMode && config.ValidateValue != nil {
+		return nil, fmt.Errorf("%w: Local value limits cannot be overridden", ErrInvalidConfig)
+	}
 	if config.NodeID == "" {
 		return nil, fmt.Errorf("%w: node ID is required", ErrInvalidConfig)
 	}
@@ -120,6 +127,7 @@ func newCoreFromConfig(config Config, observer, learner, localReadOnlyInspection
 	cluster := config.Cluster
 	cluster.Members = append([]Member(nil), config.Cluster.Members...)
 	core := newCore(config.NodeID, &cluster, config.WAL, config.Transport)
+	core.validateValue = config.ValidateValue
 	core.localMode = config.LocalMode
 	core.localCost = localCost
 	core.observer = observer

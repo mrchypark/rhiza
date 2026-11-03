@@ -2,12 +2,41 @@ package network
 
 import (
 	"encoding/json"
+	"fmt"
 	"strings"
 	"sync/atomic"
 
 	"github.com/mrchypark/rhiza/internal/localtesthooks"
 	"github.com/mrchypark/rhiza/internal/types"
+	"github.com/mrchypark/rhiza/pkg/materializer"
 )
+
+// PrepareManagedGraphExecution checks the existing ordinary admission domain
+// before creating a new-profile singleton. It does not acquire a lease or
+// select a profile, and cannot authorize an old-policy Core to accept it.
+func PrepareManagedGraphExecution(command types.GraphCommand) ([]byte, error) {
+	charge, err := mutationCharge(command)
+	if err != nil {
+		return nil, err
+	}
+	clone, err := cloneGraphCommand(command)
+	if err != nil {
+		return nil, err
+	}
+	if err := materializer.ValidateGraphCommandAdmission(clone); err != nil {
+		return nil, err
+	}
+	value, err := types.EncodeManagedGraphExecution(command)
+	if err != nil {
+		return nil, err
+	}
+	// Field accounting is tested against this actual charge implementation.
+	// This assertion detects a grammar/accounting drift, not a new input cap.
+	if (len(value)-9)*16 > charge*3 || len(value)*4 > charge {
+		return nil, fmt.Errorf("managed Graph frame exceeds proven charge bound")
+	}
+	return value, nil
+}
 
 const (
 	maxAdmittedMutations = 128

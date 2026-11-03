@@ -175,6 +175,27 @@ func newManagerForPolicy(bucket objstore.Bucket, prefix, localDir string, expect
 
 // Load performs two exact GETs: CURRENT and its immutable root.
 func (m *Manager) Load(ctx context.Context) error {
+	if m.expectedPolicy == sqlpolicy.ManagedGraphRequestMaterializationPolicy {
+		locator, exists, err := m.LoadManagedGraphLocator(ctx)
+		if err != nil {
+			return err
+		}
+		if !exists {
+			m.mu.Lock()
+			known := m.certified != nil
+			m.mu.Unlock()
+			if known {
+				return fmt.Errorf("managed Graph checkpoint locator disappeared")
+			}
+			return nil
+		}
+		root, err := m.OpenRoot(ctx, locator.Index, locator.RootHash)
+		if err != nil {
+			return err
+		}
+		m.rememberCertified(*root)
+		return nil
+	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	// A new cluster has no certified checkpoint yet. Mark only this initial
@@ -569,9 +590,15 @@ func (m *Manager) createFilesWithScanObserver(ctx context.Context, claim *Publis
 	if err := validateSources(sources); err != nil {
 		return nil, err
 	}
+	return m.uploadCandidate(ctx, sources, index, claim.Generation, claim, onScan)
+}
+
+// uploadCandidate shares immutable block/root encoding, not publication
+// authority. Its callers must establish their profile-specific prerequisites.
+func (m *Manager) uploadCandidate(ctx context.Context, sources []Source, index, generation uint64, claim *PublisherClaim, onScan func(string, time.Duration)) (*Checkpoint, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	root := Checkpoint{SQLExecutionPolicy: int(m.expectedPolicy), ConfigID: m.configID, Generation: claim.Generation, Index: index}
+	root := Checkpoint{SQLExecutionPolicy: int(m.expectedPolicy), ConfigID: m.configID, Generation: generation, Index: index}
 	conditional := false
 	for _, option := range m.bucket.SupportedObjectUploadOptions() {
 		conditional = conditional || option == objstore.IfNotExists
@@ -586,7 +613,7 @@ func (m *Manager) createFilesWithScanObserver(ctx context.Context, claim *Publis
 	}
 	blocks := 0
 	for _, source := range sources {
-		file, err := m.uploadFile(ctx, source, claim.Generation, conditional, knownBlocks, onScan)
+		file, err := m.uploadFile(ctx, source, generation, conditional, knownBlocks, onScan)
 		if err != nil {
 			return nil, err
 		}
@@ -613,6 +640,13 @@ func (m *Manager) createFilesWithScanObserver(ctx context.Context, claim *Publis
 	var uploadOptions []objstore.ObjectUploadOption
 	if conditional {
 		uploadOptions = append(uploadOptions, objstore.WithIfNotExists())
+	}
+	if m.expectedPolicy == sqlpolicy.ManagedGraphRequestMaterializationPolicy {
+		if err := m.uploadManagedGraphImmutable(ctx, rootKey, bytes.NewReader(data), int64(len(data)), root.RootHash); err != nil {
+			return nil, fmt.Errorf("publish managed Graph root: %w", err)
+		}
+		copy := root
+		return &copy, nil
 	}
 	if err := m.bucket.Upload(ctx, rootKey, bytes.NewReader(data), uploadOptions...); err != nil {
 		if !conditional || !m.bucket.IsConditionNotMetErr(err) {
@@ -857,6 +891,9 @@ func (m *Manager) uploadFile(ctx context.Context, source Source, generation uint
 		reader := io.NewSectionReader(input, upload.offset, upload.block.Size)
 		key := m.key(blockKey(upload.hash))
 		var err error
+		if m.expectedPolicy == sqlpolicy.ManagedGraphRequestMaterializationPolicy {
+			return m.uploadManagedGraphImmutable(ctx, key, reader, upload.block.Size, upload.hash)
+		}
 		if conditional {
 			err = m.bucket.Upload(ctx, key, reader, objstore.WithIfNotExists())
 			if m.bucket.IsConditionNotMetErr(err) {
@@ -964,6 +1001,9 @@ func (m *Manager) validateSourceProfile(sources []Source) error {
 	}
 	if err := validateSources(sources); err != nil {
 		return err
+	}
+	if m.expectedPolicy == sqlpolicy.ManagedGraphRequestMaterializationPolicy && (len(sources) != 2 || sources[0].Role != RoleSQLite || sources[1].Role != RoleGraphData) {
+		return fmt.Errorf("managed Graph checkpoint requires the exact SQLite/Graph pair")
 	}
 	if (m.expectedPolicy == sqlpolicy.ManagedSQLKVMaterializationPolicy || m.expectedPolicy == sqlpolicy.ManagedRequestMaterializationPolicy) && (len(sources) != 1 || sources[0].Role != RoleSQLite) {
 		return fmt.Errorf("mixed checkpoint requires exactly one SQLite file")
@@ -1677,6 +1717,9 @@ func (m *Manager) readRoot(ctx context.Context, name string, expected [32]byte) 
 func (m *Manager) validateRoot(root Checkpoint) error {
 	if m.expectedPolicy.Validate() != nil || root.SQLExecutionPolicy != int(m.expectedPolicy) {
 		return sqlpolicy.ErrIncompatible
+	}
+	if m.expectedPolicy == sqlpolicy.ManagedGraphRequestMaterializationPolicy && (len(root.Files) != 2 || root.Files[0].Role != RoleSQLite || root.Files[1].Role != RoleGraphData) {
+		return fmt.Errorf("managed Graph checkpoint requires the exact SQLite/Graph pair")
 	}
 	if (m.expectedPolicy == sqlpolicy.ManagedSQLKVMaterializationPolicy || m.expectedPolicy == sqlpolicy.ManagedRequestMaterializationPolicy) && (len(root.Files) != 1 || root.Files[0].Role != RoleSQLite) {
 		return fmt.Errorf("mixed checkpoint requires exactly one SQLite file")

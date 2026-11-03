@@ -11,7 +11,7 @@ import (
 )
 
 func (h *Host) internalRequests() bool {
-	return h.cfg.Plan.ApplicationProtocol == sqlpolicy.ManagedRequestApplicationProtocol
+	return h.cfg.Plan.ApplicationProtocol == sqlpolicy.ManagedRequestApplicationProtocol || h.cfg.Plan.ApplicationProtocol == sqlpolicy.ManagedGraphRequestApplicationProtocol
 }
 
 // The first public operation drives real initial quorum/live startup admission.
@@ -43,6 +43,9 @@ func originalFingerprint(p applicationOriginal) ([32]byte, error) {
 	}
 	if p.kind == "kv" {
 		return types.ManagedKVFingerprint(p.kv)
+	}
+	if p.kind == "graph" {
+		return types.ManagedGraphIntentFingerprint(p.graph)
 	}
 	return [32]byte{}, network.ErrInvalidRequest
 }
@@ -115,13 +118,15 @@ func (h *Host) recoverRequestLocked(ctx context.Context, selector network.Reques
 	kind := types.MutationSQL
 	if selector.Kind == "kv" {
 		kind = types.MutationKV
+	} else if selector.Kind == "graph" && h.cfg.Plan.ApplicationProtocol == sqlpolicy.ManagedGraphRequestApplicationProtocol {
+		kind = types.MutationGraph
 	} else if selector.Kind != "sql" {
 		return RecoveryResult{}, network.ErrInvalidRequest
 	}
 	if selector.RequestID == "" || len(selector.RequestID) > types.MaxRequestIDBytes {
 		return RecoveryResult{}, network.ErrInvalidRequest
 	}
-	p := applicationOriginal{kind: selector.Kind, sql: ExecuteRequest{RequestID: selector.RequestID}, kv: types.KVCommand{RequestID: selector.RequestID}}
+	p := applicationOriginal{kind: selector.Kind, sql: ExecuteRequest{RequestID: selector.RequestID}, kv: types.KVCommand{RequestID: selector.RequestID}, graph: types.GraphCommand{RequestID: selector.RequestID}}
 	if err := h.ensureInitialRequestAdmission(ctx); err != nil {
 		return RecoveryResult{Kind: selector.Kind, RequestID: []byte(selector.RequestID)}, applicationOutcomeUnknown(p, types.MutationReceipt{}, err)
 	}
@@ -135,8 +140,10 @@ func (h *Host) recoverRequestLocked(ctx context.Context, selector network.Reques
 	if resolved.Receipt.Slot != 0 {
 		if kind == types.MutationSQL {
 			result.SQL = &ExecuteResponse{MutationReceipt: resolved.Receipt, Statements: resolved.Statements}
-		} else {
+		} else if kind == types.MutationKV {
 			result.KV = &network.KVMutationResponse{MutationReceipt: resolved.Receipt}
+		} else {
+			result.Graph = &network.GraphExecuteResponse{MutationReceipt: resolved.Receipt}
 		}
 	}
 	if err != nil {

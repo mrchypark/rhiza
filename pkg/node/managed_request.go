@@ -26,6 +26,8 @@ func retainedRequestKind(kind string) (types.MutationKind, error) {
 		return types.MutationSQL, nil
 	case "kv":
 		return types.MutationKV, nil
+	case "graph":
+		return types.MutationGraph, nil
 	default:
 		return 0, network.ErrInvalidRequest
 	}
@@ -92,7 +94,7 @@ func (n *Node) ResolveRequest(ctx context.Context, kind, rawID string) (ManagedR
 			return fail(errors.Join(fmt.Errorf("original SQL result is not durably confirmed"), err))
 		}
 		result.Receipt, result.Statements = *resolved.Receipt, resolved.Statements
-	} else {
+	} else if k == types.MutationKV {
 		if original.KV == nil || original.SQL != nil {
 			return fail(fmt.Errorf("stored KV original is unavailable"))
 		}
@@ -102,13 +104,22 @@ func (n *Node) ResolveRequest(ctx context.Context, kind, rawID string) (ManagedR
 			return fail(errors.Join(fmt.Errorf("original KV result is not durably confirmed"), err))
 		}
 		result.Receipt = *resolved.Receipt
+	} else {
+		if original.Graph == nil || original.SQL != nil || original.KV != nil {
+			return fail(fmt.Errorf("stored Graph original is unavailable"))
+		}
+		resolved, err := n.server.ResolveGraph(ctx, *original.Graph)
+		if err != nil || resolved.State != network.ResolveKVRetained || resolved.Durability != network.ResolveKVDurabilityConfirmed || resolved.Receipt == nil || *resolved.Receipt != original.Receipt {
+			return fail(errors.Join(fmt.Errorf("original Graph result is not durably confirmed"), err))
+		}
+		result.Receipt = *resolved.Receipt
 	}
 	state, err := n.checkInternalApplicationRuntime(ctx)
 	if err != nil || bound == nil || bound != n.internalApplication.Load() || !n.core.IsVoter() || original.Slot > state.CertifiedTip || state.AppliedTip != state.CertifiedTip || state.RecorderTip > state.CertifiedTip {
 		return fail(errors.Join(fmt.Errorf("request runtime changed during resolution"), err))
 	}
 	after, found, err := n.material.RetainedRequestOriginal(ctx, k, rawID)
-	if err != nil || !found || after.Kind != original.Kind || after.RequestID != original.RequestID || after.Slot != original.Slot || after.BatchIndex != original.BatchIndex || after.Fingerprint != original.Fingerprint || after.Receipt != original.Receipt || !bytes.Equal(after.ExecutionItem, original.ExecutionItem) || !bytes.Equal(after.CanonicalOriginal, original.CanonicalOriginal) {
+	if err != nil || !found || after.Kind != original.Kind || after.RequestID != original.RequestID || after.Slot != original.Slot || after.BatchIndex != original.BatchIndex || after.Fingerprint != original.Fingerprint || after.Receipt != original.Receipt || after.DecisionHash != original.DecisionHash || !bytes.Equal(after.ExecutionItem, original.ExecutionItem) || !bytes.Equal(after.CanonicalOriginal, original.CanonicalOriginal) {
 		return fail(errors.Join(fmt.Errorf("exact retained original changed during resolution"), err))
 	}
 	return result, nil

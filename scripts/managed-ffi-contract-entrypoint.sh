@@ -7,7 +7,7 @@ emit_first_contract() {
   if [ -f "$diag_dir/first.log" ]; then
     printf '%s\n' 'FIRST_CONTRACT_DIAGNOSTIC_BEGIN' >&2
     sed -n '1,200p' "$diag_dir/first.log" >&2
-    for first_stage in go-initial rust-initial internal-profile-initial; do
+    for first_stage in go-initial rust-initial internal-profile-initial graph-initial graph-profile-initial graph-qualification-initial; do
       if [ -f "$diag_dir/$first_stage.exit" ]; then
         first_code=$(cat "$diag_dir/$first_stage.exit")
         case "$first_code" in ''|*[!0-9]*) first_code=unknown ;; esac
@@ -23,12 +23,12 @@ run_contract() {
   stage=$1
   shift
   case "$stage" in
-    go-initial|rust-initial|internal-profile-initial)
+    go-initial|rust-initial|internal-profile-initial|graph-initial|graph-profile-initial|graph-qualification-initial)
       [ ! -e "$diag_dir/$stage.exit" ] || { emit_first_contract; return 125; }
       printf 'FIRST_CONTRACT_STAGE %s started\n' "$stage" >> "$diag_dir/first.log"
       sync
       ;;
-    go-restart|rust-restart|internal-profile-restart) rm -f "$diag_dir/$stage.exit" ;;
+    go-restart|rust-restart|internal-profile-restart|graph-restart|graph-profile-restart|graph-qualification-restart) rm -f "$diag_dir/$stage.exit" ;;
     *) echo 'FAIL: invalid contract diagnostic stage' >&2; return 125 ;;
   esac
   # Drain all child output without SIGPIPE or limits on its WAL/SQLite files.
@@ -41,13 +41,21 @@ run_contract() {
     printf '%s\n' "$code" > "$diag_dir/$stage.exit"
   ) 2>&1 | awk '
     function emit(s) { if (used+length(s)+1<=65536) { print s; used+=length(s)+1 } }
-    /^=== RUN   TestManagedFFIInCluster(SQL|Mixed)Lifecycle$/ { emit($0); next }
-    /^--- (PASS|FAIL): TestManagedFFIInCluster(SQL|Mixed)Lifecycle / { emit(substr($0,1,160)); next }
+    /^=== RUN   TestManagedFFIInCluster(SQL|Mixed|Graph)Lifecycle$/ { emit($0); next }
+    /^--- (PASS|FAIL): TestManagedFFIInCluster(SQL|Mixed|Graph)Lifecycle / { emit(substr($0,1,160)); next }
+    /^=== RUN   TestManagedGraphMaterializationMarker$/ { emit($0); next }
+    /^--- (PASS|FAIL): TestManagedGraphMaterializationMarker / { emit(substr($0,1,160)); next }
+    /^=== RUN   TestManagedFFIInClusterGraphQualification$/ { emit($0); next }
+    /^--- (PASS|FAIL): TestManagedFFIInClusterGraphQualification / { emit(substr($0,1,160)); next }
+    /^[[:space:]]*managed_graph_qualification_ci_test.go:[0-9]+:/ { emit("GO_QUALIFICATION_SOURCE " $1); next }
+    /^GRAPH_CABI_QUALIFICATION=/ { if (length($0)<=2048) emit($0); next }
+    /^PASS: actual Go CABI Graph native\/root\/counter qualification$/ { emit($0); next }
     /^[[:space:]]*managed_incluster_test.go:[0-9]+:/ {
       emit("GO_CONTRACT_SOURCE " $1)
       if (match($0,/code=[a-z_]+/)) emit(substr($0,RSTART,RLENGTH))
       if (index($0,"actual in-cluster Go FFI -> managed Host -> SQL ACK readback -> close passed")) emit("actual in-cluster Go FFI -> managed Host -> SQL ACK readback -> close passed")
       if (index($0,"actual in-cluster Go FFI -> mixed managed Host -> SQL KV ACK readback -> close passed")) emit("actual in-cluster Go FFI -> mixed managed Host -> SQL KV ACK readback -> close passed")
+      if (index($0,"actual in-cluster Go FFI -> Graph managed Host -> raw original ACK/readback/status/recovery -> close passed")) emit("actual in-cluster Go FFI -> Graph managed Host -> raw original ACK/readback/status/recovery -> close passed")
       next
     }
     /^FAIL: managed-ha-contract [a-z_]+$/ { emit(substr($0,1,160)); next }
@@ -58,13 +66,38 @@ run_contract() {
     /^RUST_MIXED_CURRENT_UID=[0-9a-fA-F-]+$/ { emit($0); next }
     /^RUST_MIXED_TUPLE=/ { if (length($0)<=16384) emit($0); next }
     /^RHIZA_ACTUAL_MATERIALIZATION_PROFILE=9$/ { emit($0); next }
+    /^RHIZA_ACTUAL_MATERIALIZATION_PROFILE=10$/ { emit($0); next }
+    /^PASS: managed Rust FFI Graph (initial|verify) state contract$/ { emit($0); next }
+    /^RUST_GRAPH_CURRENT_UID=[0-9a-fA-F-]+$/ { emit($0); next }
+    /^RUST_GRAPH_TUPLE=/ { if (length($0)<=32768) emit($0); next }
     /^panic: test timed out after [0-9hms.]+$/ { emit($0); next }
     /^(PASS|FAIL)$/ { emit($0) }
   ' > "$diag_dir/active.log"
   code=$(cat "$diag_dir/$stage.exit")
   case "$code" in ''|*[!0-9]*) echo 'FAIL: contract exit outcome unavailable' >&2; return 125 ;; esac
+  case "$stage:$code" in
+    graph-qualification-*:0)
+      if ! grep -Fx '=== RUN   TestManagedFFIInClusterGraphQualification' "$diag_dir/active.log" >/dev/null ||
+         ! grep -E '^--- PASS: TestManagedFFIInClusterGraphQualification ' "$diag_dir/active.log" >/dev/null ||
+         [ "$(grep -c '^GRAPH_CABI_QUALIFICATION=' "$diag_dir/active.log")" != 1 ] ||
+         ! grep -Fx 'PASS: actual Go CABI Graph native/root/counter qualification' "$diag_dir/active.log" >/dev/null; then
+        code=1
+        printf '%s\n' "$code" > "$diag_dir/$stage.exit"
+        printf '%s\n' 'FAIL: managed-ha-contract graph_qualification_not_executed' >> "$diag_dir/active.log"
+      fi
+      ;;
+    graph-profile-*:0)
+      if ! grep -Fx '=== RUN   TestManagedGraphMaterializationMarker' "$diag_dir/active.log" >/dev/null ||
+         ! grep -E '^--- PASS: TestManagedGraphMaterializationMarker ' "$diag_dir/active.log" >/dev/null ||
+         ! grep -Fx 'RHIZA_ACTUAL_MATERIALIZATION_PROFILE=10' "$diag_dir/active.log" >/dev/null; then
+        code=1
+        printf '%s\n' "$code" > "$diag_dir/$stage.exit"
+        printf '%s\n' 'FAIL: managed-ha-contract graph_profile_test_not_executed' >> "$diag_dir/active.log"
+      fi
+      ;;
+  esac
   case "$stage" in
-    go-initial|rust-initial|internal-profile-initial)
+    go-initial|rust-initial|internal-profile-initial|graph-initial|graph-profile-initial|graph-qualification-initial)
       remaining=32600
       awk -v remaining="$remaining" '{ if (remaining>0) { text=substr($0,1,remaining-1); print text; remaining-=length(text)+1 } }' "$diag_dir/active.log" >> "$diag_dir/first.log"
       ;;
@@ -75,7 +108,7 @@ run_contract() {
 }
 if [ "${1-}" = --diagnostic-self-test ]; then
   diag_test_dir=$(mktemp -d)
-  trap 'rm -f "$diag_test_dir/first.log" "$diag_test_dir/active.log" "$diag_test_dir/go-initial.exit" "$diag_test_dir/rust-initial.exit" "$diag_test_dir/rust-restart.exit"; rmdir "$diag_test_dir"' EXIT HUP INT TERM
+  trap 'rm -f "$diag_test_dir/first.log" "$diag_test_dir/active.log" "$diag_test_dir/go-initial.exit" "$diag_test_dir/rust-initial.exit" "$diag_test_dir/rust-restart.exit" "$diag_test_dir/graph-profile-restart.exit" "$diag_test_dir/graph-qualification-restart.exit"; rmdir "$diag_test_dir"' EXIT HUP INT TERM
   diag_dir=$diag_test_dir
   : > "$diag_dir/first.log"
   if run_contract go-initial sh -c 'printf "%s\n" "private-profile-DO-NOT-RETAIN" "    managed_incluster_test.go:123: private-profile-DO-NOT-RETAIN"; exit 7'; then exit 1; else [ "$?" = 7 ]; fi
@@ -89,14 +122,20 @@ if [ "${1-}" = --diagnostic-self-test ]; then
   [ "$(wc -c < "$diag_dir/first.log")" -le 65536 ]
   [ "$(cat "$diag_dir/rust-initial.exit")" = 9 ]
   grep -Fx 'GO_CONTRACT_SOURCE managed_incluster_test.go:123:' "$diag_dir/first.log" >/dev/null
+  if run_contract graph-profile-restart sh -c 'echo PASS'; then exit 1; else [ "$?" = 1 ]; fi
+  run_contract graph-profile-restart sh -c 'printf "%s\n" "=== RUN   TestManagedGraphMaterializationMarker" "--- PASS: TestManagedGraphMaterializationMarker (0.01s)" "RHIZA_ACTUAL_MATERIALIZATION_PROFILE=10" "PASS"'
+  if run_contract graph-profile-restart sh -c 'printf "%s\n" "=== RUN   TestManagedGraphMaterializationMarker" "--- PASS: TestManagedGraphMaterializationMarker (0.01s)" "RHIZA_ACTUAL_MATERIALIZATION_PROFILE=10"; exit 7'; then exit 1; else [ "$?" = 7 ]; fi
+  if run_contract graph-qualification-restart sh -c 'echo PASS'; then exit 1; else [ "$?" = 1 ]; fi
+  run_contract graph-qualification-restart sh -c 'printf "%s\n" "=== RUN   TestManagedFFIInClusterGraphQualification" "--- PASS: TestManagedFFIInClusterGraphQualification (0.01s)" "GRAPH_CABI_QUALIFICATION={}" "PASS: actual Go CABI Graph native/root/counter qualification" "PASS"'
+  if run_contract graph-qualification-restart sh -c 'echo PASS; exit 7'; then exit 1; else [ "$?" = 7 ]; fi
   exit 0
 fi
 if [ "${1-}" = serve-managed-sql ]; then
   marker_output=$(RHIZA_RUST_CONTRACT_MARKER=1 /usr/local/libexec/rhiza-managed-ffi-contract \
     -test.run='^TestRustContractRunStartedMarker$' -test.count=1 -test.v -test.timeout=10s)
   fixture_profile=$(printf '%s\n' "$marker_output" | sed -n 's/^RHIZA_RUST_FIXTURE_PROFILE=//p')
-  case "$fixture_profile" in sql|mixed|internal) ;; *) echo 'FAIL: explicit fixture profile unavailable' >&2; exit 1 ;; esac
-  if [ "$fixture_profile" = mixed ] || [ "$fixture_profile" = internal ]; then
+  case "$fixture_profile" in sql|mixed|internal|graph) ;; *) echo 'FAIL: explicit fixture profile unavailable' >&2; exit 1 ;; esac
+  if [ "$fixture_profile" = mixed ] || [ "$fixture_profile" = internal ] || [ "$fixture_profile" = graph ]; then
     mixed_mode=$(printf '%s\n' "$marker_output" | sed -n 's/^RHIZA_RUST_CONTRACT_MODE=//p')
     producer_uid=$(printf '%s\n' "$marker_output" | sed -n 's/^RHIZA_RUST_CONTRACT_PRODUCER_UID=//p')
     printf '%s\n' "$producer_uid" | grep -Eq '^[0-9a-fA-F-]{16,64}$' || { echo 'FAIL: invalid mixed producer UID' >&2; exit 1; }
@@ -115,10 +154,19 @@ if [ "${1-}" = serve-managed-sql ]; then
         fi
         if [ -e /var/lib/rhiza/repair.json ]; then
           [ "$mixed_mode" = verify ] || { echo 'FAIL: replacement cannot run initial mixed writes' >&2; exit 1; }
+          lifecycle=Mixed
+          [ "$fixture_profile" != graph ] || lifecycle=Graph
           RHIZA_FFI_IN_CLUSTER_CONTRACT=1 run_contract "$go_stage" /usr/local/libexec/rhiza-managed-ffi-contract \
-            -test.run='^TestManagedFFIInClusterMixedLifecycle$' -test.count=1 -test.v -test.timeout=120s
+            -test.run="^TestManagedFFIInCluster${lifecycle}Lifecycle$" -test.count=1 -test.v -test.timeout=120s
         fi
         run_contract "$rust_stage" /usr/local/libexec/rhiza-rust-managed-contract "--mixed-$mixed_mode"
+        if [ "$fixture_profile" = graph ]; then
+          run_contract "graph-${rust_stage#rust-}" /usr/local/libexec/rhiza-rust-managed-contract "--graph-$mixed_mode"
+          run_contract "graph-profile-${rust_stage#rust-}" /usr/local/libexec/rhiza-managed-materializer-contract \
+            -test.run='^TestManagedGraphMaterializationMarker$' -test.count=1 -test.v -test.timeout=10s
+          RHIZA_FFI_GRAPH_QUALIFICATION=1 run_contract "graph-qualification-${rust_stage#rust-}" /usr/local/libexec/rhiza-managed-ffi-contract \
+            -test.run='^TestManagedFFIInClusterGraphQualification$' -test.count=1 -test.v -test.timeout=120s
+        fi
         if [ "$fixture_profile" = internal ]; then
           RHIZA_INTERNAL_MATERIALIZATION_MARKER=1 run_contract "internal-profile-${rust_stage#rust-}" /usr/local/libexec/rhiza-managed-ffi-contract \
             -test.run='^TestManagedInternalMaterializationMarker$' -test.count=1 -test.v -test.timeout=10s

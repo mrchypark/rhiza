@@ -86,6 +86,9 @@ func (n *Node) CheckManagedLocalRead(ctx context.Context) error {
 		if !n.managedInitiallyAdmitted.Load() || !n.core.IsVoter() {
 			return network.ErrNotReady
 		}
+		if n.materializationPolicy() == sqlpolicy.ManagedGraphRequestMaterializationPolicy {
+			return n.material.ProjectionReadable(ctx)
+		}
 		return nil
 	}
 	if _, err := n.ManagedState(); err != nil {
@@ -254,7 +257,7 @@ func (n *Node) VerifyManagedSQLFreshSource(ctx context.Context, i ManagedStartup
 	if err != nil {
 		return err
 	}
-	view, err := recovery.OpenReadOnlyViewForPolicy(ctx, source, prefix, 1, *n.loadClusterConfig(), n.materializationPolicy(), n.receiptWindow())
+	view, err := recovery.OpenReadOnlyViewForPolicyWithReconfiguration(ctx, source, prefix, 1, *n.loadClusterConfig(), n.materializationPolicy(), n.receiptWindow(), n.config.EnableReconfiguration)
 	if err != nil {
 		return err
 	}

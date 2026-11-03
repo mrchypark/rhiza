@@ -26,6 +26,12 @@ jobs:
             provider: gcs
           - fixture: internal
             provider: azure
+          - fixture: graph
+            provider: s3
+          - fixture: graph
+            provider: gcs
+          - fixture: graph
+            provider: azure
     runs-on: ubuntu-latest
     timeout-minutes: 25
     steps:
@@ -55,6 +61,8 @@ jobs:
           sh -n scripts/ha-managed-podchaos.sh
           sh scripts/managed-ffi-contract-entrypoint.sh --diagnostic-self-test
           sh -c '. scripts/ha-managed-bootstrap-fixture.sh; managed_mixed_tuple_self_test'
+          sh -c '. scripts/ha-managed-bootstrap-fixture.sh; managed_graph_tuple_self_test'
+          sh -c '. scripts/ha-managed-bootstrap-fixture.sh; managed_graph_cabi_self_test'
           sh -n scripts/test-ha-managed-cluster-chaos.sh
           sh scripts/test-ha-managed-cluster-chaos-test.sh
           sh scripts/test-ha-managed-direct-host-chaos-test.sh

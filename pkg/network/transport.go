@@ -31,7 +31,7 @@ const managedKVPeerALPN = "rhiza-peer-managed-sql-kv-v1"
 const managedRequestPeerALPN = "rhiza-peer-managed-request-v1"
 
 func managedKVExecutionPolicy(policy sqlpolicy.MaterializationPolicy) bool {
-	return policy == sqlpolicy.ManagedSQLKVMaterializationPolicy || policy == sqlpolicy.ManagedRequestMaterializationPolicy
+	return policy == sqlpolicy.ManagedSQLKVMaterializationPolicy || policy == sqlpolicy.ManagedRequestMaterializationPolicy || policy == sqlpolicy.ManagedGraphRequestMaterializationPolicy
 }
 
 const peerRPCTimeout = 5 * time.Second
@@ -87,7 +87,14 @@ func NewTransport(clusterID types.ClusterID, localID quepaxa.NodeID, config *que
 
 // NewTransportForPolicy fixes the peer protocol before any connections exist.
 func NewTransportForPolicy(clusterID types.ClusterID, localID quepaxa.NodeID, config *quepaxa.Cluster, peerToken string, expected sqlpolicy.MaterializationPolicy) (*Transport, error) {
-	return newTransport(clusterID, localID, config, peerToken, nil, expected)
+	t, err := newTransport(clusterID, localID, config, peerToken, nil, expected)
+	if err == nil && expected == sqlpolicy.ManagedGraphRequestMaterializationPolicy {
+		err = t.ValidateManagedGraphWireBudget()
+	}
+	if err != nil {
+		return nil, err
+	}
+	return t, nil
 }
 
 // SetAdminToken lets a process without voter identity (a learner before its
@@ -135,12 +142,20 @@ func NewLearnerTransportForPolicy(clusterID types.ClusterID, localID quepaxa.Nod
 		return nil, err
 	}
 	learner.adminToken = adminToken
+	if expected == sqlpolicy.ManagedGraphRequestMaterializationPolicy {
+		if err := learner.ValidateManagedGraphWireBudget(); err != nil {
+			return nil, err
+		}
+	}
 	return learner, nil
 }
 
 func peerALPNForPolicy(expected sqlpolicy.MaterializationPolicy) (string, error) {
 	if err := expected.Validate(); err != nil {
 		return "", err
+	}
+	if expected == sqlpolicy.ManagedGraphRequestMaterializationPolicy {
+		return sqlpolicy.ManagedGraphRequestPeerALPN, nil
 	}
 	if expected == sqlpolicy.ManagedRequestMaterializationPolicy {
 		return managedRequestPeerALPN, nil
@@ -238,6 +253,11 @@ func (t *Transport) transportForID(id uint, snapshot func() quepaxa.Cluster) (*T
 		return nil, err
 	}
 	peer.adminToken = t.adminToken
+	if peer.expectedPolicy == sqlpolicy.ManagedGraphRequestMaterializationPolicy {
+		if err := peer.ValidateManagedGraphWireBudget(); err != nil {
+			return nil, err
+		}
+	}
 	t.dynamic[config.ConfigID] = peer
 	return peer, nil
 }
@@ -879,6 +899,12 @@ func (t *Transport) sendTerminalDecision(ctx context.Context, decision quepaxa.D
 	}
 	peer.quic = t.quic
 	defer peer.Close()
+	peer.adminToken = t.adminToken
+	if peer.expectedPolicy == sqlpolicy.ManagedGraphRequestMaterializationPolicy {
+		if err := peer.ValidateManagedGraphWireBudget(); err != nil {
+			return err
+		}
+	}
 	callCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
 	type result struct {
@@ -1068,6 +1094,12 @@ func (t *Transport) VerifyLearner(ctx context.Context, learner quepaxa.Member, t
 		return err
 	}
 	defer probe.Close()
+	probe.adminToken = t.adminToken
+	if probe.expectedPolicy == sqlpolicy.ManagedGraphRequestMaterializationPolicy {
+		if err := probe.ValidateManagedGraphWireBudget(); err != nil {
+			return err
+		}
+	}
 	request := probe.request(peerfb.OperationVerifyPrefix)
 	request.ConfigId = uint64(config.ConfigID)
 	request.From, request.Hash = uint64(through), append([]byte(nil), prefix[:]...)

@@ -133,12 +133,81 @@ managed_mixed_tuple_self_test() (
   cmp "$tuple_test_dir/actual" "$tuple_test_dir/verified"
   printf '%s\n' 'PASS: mixed tuple initial/verify oracle and failure controls'
 )
+managed_graph_tuple_oracle() {
+  graph_log=$1 graph_phase=$2 graph_uid=$3 graph_output=$4
+  case "$graph_phase" in initial|verify) ;; *) return 2 ;; esac
+  [ "$(grep -Fxc "PASS: managed Rust FFI Graph $graph_phase state contract" "$graph_log")" = 1 ] || return 1
+  [ "$(grep -Fxc "RUST_GRAPH_CURRENT_UID=$graph_uid" "$graph_log")" = 1 ] || return 1
+  [ "$(grep -c '^RUST_GRAPH_TUPLE=' "$graph_log")" = 1 ] || return 1
+  sed -n 's/^RUST_GRAPH_TUPLE=//p' "$graph_log" > "$graph_output.raw"
+  [ "$(wc -c < "$graph_output.raw")" -le 32768 ] || return 1
+  jq -e '.version==1 and .trim_before_count==2 and (.producer_uid|type)=="string" and (.cases|length)==5 and
+    ([.cases[].request_id_b64]==["/wE=","/gI=","77+9","Z3JhcGgtb2Zmc2V0LW1heA==","Z3JhcGgtdHJpbS1tYXg="]) and
+    all(.cases[]; (.expected_original_b64|type)=="string" and (.expected_original_b64|length)>0 and (.frame_b64|type)=="string" and (.frame_b64|length)>0 and
+      (.recovered|type)=="boolean" and .receipt.status=="committed" and .receipt.applied==true and
+      (.receipt.slot|type)=="number" and .receipt.slot>0 and .receipt.retry_through_slot>=.receipt.slot) and
+    .state.nodes==[["a","alpha",0.1],["b","beta",2]] and .state.edges==[["a","b"]] and
+    ([.state.events[].payload]==[1,2,3]) and all(.state.events[]; .kind=="ordered" and .sequence>0) and
+    .state.events[0].sequence<.state.events[1].sequence and .state.events[1].sequence<.state.events[2].sequence and
+    .state.offset=="18446744073709551615" and .state.trim_empty==true' "$graph_output.raw" >/dev/null || return 1
+  jq -S . "$graph_output.raw" > "$graph_output"
+}
+
+managed_graph_tuple_self_test() (
+  graph_test_dir=$(mktemp -d "${TMPDIR:-/tmp}/rhiza-graph-oracle.XXXXXX")
+  trap 'rm -f "$graph_test_dir/tuple" "$graph_test_dir/good" "$graph_test_dir/bad" "$graph_test_dir/out.raw" "$graph_test_dir/out"; rmdir "$graph_test_dir"' EXIT HUP INT TERM
+  jq -cn '{version:1,producer_uid:"producer",trim_before_count:2,cases:["/wE=","/gI=","77+9","Z3JhcGgtb2Zmc2V0LW1heA==","Z3JhcGgtdHJpbS1tYXg="]|map({request_id_b64:.,expected_original_b64:"TQ==",frame_b64:"UQ==",receipt:{slot:7,status:"committed",applied:true,retry_through_slot:99},recovered:false}),state:{nodes:[["a","alpha",0.1],["b","beta",2]],edges:[["a","b"]],events:[range(1;4)|{sequence:.,kind:"ordered",payload:.}],offset:"18446744073709551615",trim_empty:true}}' > "$graph_test_dir/tuple"
+  { printf '%s\n' 'PASS: managed Rust FFI Graph initial state contract' 'RUST_GRAPH_CURRENT_UID=producer'; printf 'RUST_GRAPH_TUPLE='; cat "$graph_test_dir/tuple"; } > "$graph_test_dir/good"
+  managed_graph_tuple_oracle "$graph_test_dir/good" initial producer "$graph_test_dir/out"
+  for graph_bad in missing-pass wrong-uid duplicate-pass wrong-edge missing-event wrong-u64 unacked; do
+    case "$graph_bad" in
+      missing-pass) sed '/^PASS:/d' "$graph_test_dir/good" > "$graph_test_dir/bad" ;;
+      wrong-uid) sed 's/CURRENT_UID=producer/CURRENT_UID=other/' "$graph_test_dir/good" > "$graph_test_dir/bad" ;;
+      duplicate-pass) cat "$graph_test_dir/good" > "$graph_test_dir/bad"; printf '%s\n' 'PASS: managed Rust FFI Graph initial state contract' >> "$graph_test_dir/bad" ;;
+      *)
+        case "$graph_bad" in wrong-edge) graph_filter='.state.edges=[]' ;; missing-event) graph_filter='.state.events|=.[0:2]' ;; wrong-u64) graph_filter='.state.offset="18446744073709551614"' ;; unacked) graph_filter='.cases[0].receipt.slot=0' ;; esac
+        { printf '%s\n' 'PASS: managed Rust FFI Graph initial state contract' 'RUST_GRAPH_CURRENT_UID=producer'; printf 'RUST_GRAPH_TUPLE='; jq -c "$graph_filter" "$graph_test_dir/tuple"; } > "$graph_test_dir/bad" ;;
+    esac
+    if managed_graph_tuple_oracle "$graph_test_dir/bad" initial producer "$graph_test_dir/out" >/dev/null 2>&1; then echo 'Graph oracle accepted invalid evidence' >&2; exit 1; fi
+  done
+)
+
+managed_graph_cabi_oracle() {
+  cabi_log=$1 cabi_uid=$2 cabi_out=$3
+  [ "$(grep -Fxc 'PASS: actual Go CABI Graph native/root/counter qualification' "$cabi_log")" = 1 ] || return 1
+  [ "$(grep -c '^GRAPH_CABI_QUALIFICATION=' "$cabi_log")" = 1 ] || return 1
+  sed -n 's/^GRAPH_CABI_QUALIFICATION=//p' "$cabi_log" > "$cabi_out.raw"
+  [ "$(wc -c < "$cabi_out.raw")" -le 2048 ] || return 1
+  jq -e --arg uid "$cabi_uid" '.version==1 and .scope=="go-cabi-incluster" and .pod_uid==$uid and
+    ([.base,.seal_slot,.tip,.graph_suffix,.native_originals,.normal_kube_requests,.recovery_application_proposal_entries,.positive_graph_proposal_entries,.positive_kv_proposal_entries,.positive_sql_proposal_entries,.logical_deletes,.http_deletes,.sdk_http_requests,.startup_kube_requests]|all(type=="number" and .>=0 and floor==.)) and
+    .base>0 and .base<.seal_slot and .seal_slot<=.tip and .graph_suffix>0 and .native_originals==5 and
+    (.root_hash|test("^[0-9a-f]{64}$")) and (.seal_hash|test("^[0-9a-f]{64}$")) and
+    .normal_kube_requests==0 and .recovery_application_proposal_entries==0 and .positive_graph_proposal_entries>0 and .positive_kv_proposal_entries>0 and .positive_sql_proposal_entries>0 and
+    .logical_deletes==0 and .http_deletes==0 and .sdk_http_requests>0 and .startup_kube_requests>0' "$cabi_out.raw" >/dev/null || return 1
+  jq -S . "$cabi_out.raw" > "$cabi_out"
+}
+
+managed_graph_cabi_self_test() (
+  cabi_dir=$(mktemp -d "${TMPDIR:-/tmp}/rhiza-graph-cabi-oracle.XXXXXX")
+  trap 'rm -f "$cabi_dir/data" "$cabi_dir/log" "$cabi_dir/out.raw" "$cabi_dir/out"; rmdir "$cabi_dir"' EXIT HUP INT TERM
+  jq -cn '{version:1,scope:"go-cabi-incluster",pod_uid:"owned",base:2,seal_slot:3,tip:5,root_hash:("a"*64),seal_hash:("b"*64),graph_suffix:1,native_originals:5,normal_kube_requests:0,recovery_application_proposal_entries:0,positive_graph_proposal_entries:1,positive_kv_proposal_entries:1,positive_sql_proposal_entries:1,logical_deletes:0,http_deletes:0,sdk_http_requests:4,startup_kube_requests:2}' > "$cabi_dir/data"
+  for cabi_filter in '.' '.scope="rust"' '.pod_uid="other"' '.base=0' '.graph_suffix=0' '.normal_kube_requests=1' '.recovery_application_proposal_entries=1' '.positive_graph_proposal_entries=0' '.positive_kv_proposal_entries=0' '.positive_sql_proposal_entries=0' '.positive_sql_proposal_entries="1"' '.http_deletes=1' '.native_originals=4'; do
+    { printf '%s\n' 'PASS: actual Go CABI Graph native/root/counter qualification'; printf 'GRAPH_CABI_QUALIFICATION='; jq -c "$cabi_filter" "$cabi_dir/data"; } > "$cabi_dir/log"
+    if managed_graph_cabi_oracle "$cabi_dir/log" owned "$cabi_dir/out"; then
+      [ "$cabi_filter" = . ] || exit 1
+    else
+      [ "$cabi_filter" != . ] || exit 1
+    fi
+  done
+)
+
 managed_fixture() {
 fixture_case=${RHIZA_MANAGED_FIXTURE_CASE:-legacy}
 case "$fixture_case" in
   legacy) fixture_protocol='' fixture_evidence=rhiza-managed-sql/v1 ;;
   mixed) fixture_protocol=rhiza-managed-sql-kv/v1 fixture_evidence=rhiza-managed-sql-kv/v1 ;;
   internal) fixture_protocol=rhiza-managed-request/v1 fixture_evidence=rhiza-managed-request/v1 ;;
+  graph) fixture_protocol=rhiza-managed-request-graph/v1 fixture_evidence=rhiza-managed-request-graph/v1 ;;
   *) echo 'invalid managed fixture case' >&2; return 1 ;;
 esac
 floci_node_selector='{}'
@@ -190,6 +259,11 @@ printf '%s' "$admin" > "$private/admin.token"
 fixture_gcs_credentials=/dev/null
 if [ "$fixture_provider" = gcs ]; then fixture_gcs_credentials=$private/gcs-emulator.json; fi
 jq -n --arg image "$image" --rawfile admin "$private/admin.token" --rawfile gcs "$fixture_gcs_credentials" --arg provider "$fixture_provider" --arg bucket "$bucket" --arg root "ci-$nonce" --arg protocol "$fixture_protocol" --arg evidence "$fixture_evidence" '{InitImage:$image,PeerPort:9090,EvidenceFormat:$evidence,ProfileSecretName:"runtime",Storage:{enable_reconfiguration:true,admin_token:$admin,objstore_provider:$provider,objstore_bucket:$bucket,objstore_prefix:$root,objstore_durability:"before-ack"}} | .Storage += (if $provider=="s3" then {objstore_endpoint:"floci:4566",objstore_region:"us-east-1",objstore_insecure:true,objstore_access_key:"rhiza-local-test",objstore_secret_key:"rhiza-local-test"} elif $provider=="gcs" then {objstore_insecure:false,objstore_service_account:$gcs} else {objstore_insecure:false,objstore_azure_storage_account:"rhizatest",objstore_azure_connection_string:("DefaultEndpointsProtocol=http;AccountName=rhizatest;AccountKey="+("rhiza-local-test-key-only-32bytes!"|@base64)+";BlobEndpoint=http://floci:4577/rhizatest;")} end) | if $protocol=="" then . else .ApplicationProtocol=$protocol end' > "$private/runtime.json"
+if [ "$fixture_case" = graph ]; then
+  # This exercises the real policy10 product worker, not a test-only publisher.
+  jq '.Storage.checkpoint_interval=1000000000 | .Storage.checkpoint_tail_bytes=1' "$private/runtime.json" > "$private/runtime.graph.json"
+  mv "$private/runtime.graph.json" "$private/runtime.json"
+fi
 printf 'header = "Authorization: Bearer %s"\n' "$admin" > "$private/curl.conf"
 unset admin
 k -n "$namespace" create secret generic runtime --from-file="runtime.json=$private/runtime.json"
@@ -276,6 +350,14 @@ if [ "$fixture_case" != legacy ]; then
   jq -e '.rows|length==1 and (.[0]|length)==1' "$logs/mixed-prefault.json" >/dev/null
   jq -S '.rows[0][0]|fromjson' "$logs/mixed-prefault.json" > "$logs/rust-mixed-prefault-row.json"
   cmp "$logs/rust-mixed-prefault-tuple.json" "$logs/rust-mixed-prefault-row.json"
+  if [ "$fixture_case" = graph ]; then
+    [ "$(grep -Fxc 'RHIZA_ACTUAL_MATERIALIZATION_PROFILE=10' "$logs/rust-mixed-prefault.log")" = 1 ]
+    managed_graph_tuple_oracle "$logs/rust-mixed-prefault.log" initial "$producer_uid" "$logs/rust-graph-prefault-tuple.json"
+    managed_graph_cabi_oracle "$logs/rust-mixed-prefault.log" "$producer_uid" "$logs/graph-cabi-prefault.json"
+    run_client graph-prefault query '{"sql":"SELECT tuple FROM rust_graph_contract WHERE id=1","consistency":"linearizable"}'
+    jq -S '.rows[0][0]|fromjson' "$logs/graph-prefault.json" > "$logs/rust-graph-prefault-row.json"
+    cmp "$logs/rust-graph-prefault-tuple.json" "$logs/rust-graph-prefault-row.json"
+  fi
 fi
 k -n "$namespace" get rhizacluster sql -o json > "$logs/after-sql.json"
 jq -S '.status|{bootstrapPlan,genesis,plan:.applicationInit.plan}' "$logs/committed.json" > "$logs/immutable-before.json"
@@ -315,7 +397,14 @@ if [ "${RHIZA_MANAGED_TEST_DOCKERFILE-}" = Dockerfile.managed-ffi-contract ]; th
     [ "$(grep -Fxc 'RHIZA_ACTUAL_MATERIALIZATION_PROFILE=9' "$logs/go-ffi-contract-first.log")" = 1 ]
   fi
   if [ "$fixture_case" != legacy ]; then
-    grep -F 'actual in-cluster Go FFI -> mixed managed Host -> SQL KV ACK readback -> close passed' "$logs/go-ffi-contract-first.log" >/dev/null
+    if [ "$fixture_case" = graph ]; then
+      [ "$(grep -Fxc 'RHIZA_ACTUAL_MATERIALIZATION_PROFILE=10' "$logs/go-ffi-contract-first.log")" = 1 ]
+      managed_graph_tuple_oracle "$logs/go-ffi-contract-first.log" verify "$replacement_uid" "$logs/rust-graph-replacement-tuple.json"
+      managed_graph_cabi_oracle "$logs/go-ffi-contract-first.log" "$replacement_uid" "$logs/graph-cabi-replacement.json"
+      cmp "$logs/rust-graph-prefault-tuple.json" "$logs/rust-graph-replacement-tuple.json"
+    else
+      grep -F 'actual in-cluster Go FFI -> mixed managed Host -> SQL KV ACK readback -> close passed' "$logs/go-ffi-contract-first.log" >/dev/null
+    fi
     managed_mixed_tuple_oracle "$logs/go-ffi-contract-first.log" verify "$replacement_uid" "$logs/rust-mixed-replacement-tuple.json"
     cmp "$logs/rust-mixed-prefault-tuple.json" "$logs/rust-mixed-replacement-tuple.json"
     run_client mixed-replacement query '{"sql":"SELECT tuple FROM rust_mixed_contract WHERE id=1","consistency":"linearizable"}'
@@ -342,7 +431,14 @@ if [ "${RHIZA_MANAGED_TEST_DOCKERFILE-}" = Dockerfile.managed-ffi-contract ]; th
     [ "$(grep -Fxc 'RHIZA_ACTUAL_MATERIALIZATION_PROFILE=9' "$logs/go-ffi-contract-restart.log")" = 1 ]
   fi
   if [ "$fixture_case" != legacy ]; then
-    grep -F 'actual in-cluster Go FFI -> mixed managed Host -> SQL KV ACK readback -> close passed' "$logs/go-ffi-contract-restart.log" >/dev/null
+    if [ "$fixture_case" = graph ]; then
+      [ "$(grep -Fxc 'RHIZA_ACTUAL_MATERIALIZATION_PROFILE=10' "$logs/go-ffi-contract-restart.log")" = 1 ]
+      managed_graph_tuple_oracle "$logs/go-ffi-contract-restart.log" verify "$replacement_uid" "$logs/rust-graph-restart-tuple.json"
+      managed_graph_cabi_oracle "$logs/go-ffi-contract-restart.log" "$replacement_uid" "$logs/graph-cabi-restart.json"
+      cmp "$logs/rust-graph-prefault-tuple.json" "$logs/rust-graph-restart-tuple.json"
+    else
+      grep -F 'actual in-cluster Go FFI -> mixed managed Host -> SQL KV ACK readback -> close passed' "$logs/go-ffi-contract-restart.log" >/dev/null
+    fi
     managed_mixed_tuple_oracle "$logs/go-ffi-contract-restart.log" verify "$replacement_uid" "$logs/rust-mixed-restart-tuple.json"
     cmp "$logs/rust-mixed-prefault-tuple.json" "$logs/rust-mixed-restart-tuple.json"
     run_client mixed-restart query '{"sql":"SELECT tuple FROM rust_mixed_contract WHERE id=1","consistency":"linearizable"}'

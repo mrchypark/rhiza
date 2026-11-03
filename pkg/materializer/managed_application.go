@@ -23,6 +23,9 @@ import (
 const managedApplicationPolicy = "application-prune-raw-state/v1"
 
 func policyForProtocol(protocol string) sqlpolicy.MaterializationPolicy {
+	if graphProtocol(protocol) {
+		return sqlpolicy.ManagedGraphRequestMaterializationPolicy
+	}
 	if protocol == sqlpolicy.ManagedRequestApplicationProtocol {
 		return sqlpolicy.ManagedRequestMaterializationPolicy
 	}
@@ -38,6 +41,9 @@ func (m *Materializer) MaterializationPolicy() sqlpolicy.MaterializationPolicy {
 }
 
 func (m *Materializer) validateExecutionPolicy(value []byte) error {
+	if graphProtocol(m.managedProtocol) {
+		return types.ValidateManagedGraphExecutionPolicy(value)
+	}
 	if m.managedProtocol != "" {
 		return types.ValidateManagedKVExecutionPolicy(value)
 	}
@@ -252,7 +258,7 @@ func checkManagedPolicy(ctx context.Context, reader policyReader, protocol strin
 		}
 		return fmt.Errorf("managed application policy requires explicit mixed open")
 	}
-	if err != nil || (protocol != types.ManagedApplicationProtocolSQLKV && protocol != sqlpolicy.ManagedRequestApplicationProtocol) || stored != protocol {
+	if err != nil || (protocol != types.ManagedApplicationProtocolSQLKV && !originalsProtocol(protocol)) || stored != protocol {
 		return fmt.Errorf("missing or incompatible managed application protocol")
 	}
 	for _, item := range []struct{ key, want string }{
@@ -351,13 +357,17 @@ func (m *Materializer) InspectManagedApplicationState(ctx context.Context) (Mana
 	if m.writer == nil {
 		return ManagedApplicationState{}, sql.ErrConnDone
 	}
-	if m.managedProtocol != types.ManagedApplicationProtocolSQLKV && m.managedProtocol != sqlpolicy.ManagedRequestApplicationProtocol {
+	if m.managedProtocol != types.ManagedApplicationProtocolSQLKV && !originalsProtocol(m.managedProtocol) {
 		return ManagedApplicationState{}, fmt.Errorf("mixed materialization not selected")
 	}
 	if err := m.sqlReceiptReadLocked(); err != nil {
 		return ManagedApplicationState{}, err
 	}
-	if err := validateManagedGraphAbsence(m.dbPath); err != nil {
+	if graphProtocol(m.managedProtocol) {
+		if err := m.graphReadableLocked(); err != nil {
+			return ManagedApplicationState{}, err
+		}
+	} else if err := validateManagedGraphAbsence(m.dbPath); err != nil {
 		return ManagedApplicationState{}, err
 	}
 	tx, err := m.writer.BeginTx(ctx, &sql.TxOptions{ReadOnly: true})
@@ -394,8 +404,15 @@ func validateManagedReceipts(ctx context.Context, tx *sql.Tx, tip, window uint64
 	}
 	var unknown int
 	query := `SELECT COUNT(*) FROM _rhiza_meta WHERE key NOT IN ('managed_application_protocol','managed_application_policy','sql_execution_policy','sql_idempotency_window','sql_receipt_result_bytes','sql_receipt_count','applied_slot','state_slot','applied_hash')`
-	if len(protocols) > 0 && protocols[0] == sqlpolicy.ManagedRequestApplicationProtocol {
+	if len(protocols) > 0 && originalsProtocol(protocols[0]) {
 		query += ` AND key!='request_original_bytes'`
+	}
+	if len(protocols) > 0 && graphProtocol(protocols[0]) {
+		query += ` AND key NOT IN ('last_graph_slot','graph_history_hash')`
+		history, err := sqliteGraphHistory(ctx, tx)
+		if err != nil || history.LastGraphSlot > appliedTip {
+			return fmt.Errorf("invalid SQLite graph history position")
+		}
 	}
 	if err := tx.QueryRowContext(ctx, query).Scan(&unknown); err != nil {
 		return err

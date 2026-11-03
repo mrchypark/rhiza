@@ -267,7 +267,7 @@ func ManagedRepairConfig(ctx context.Context, kube *operator.Kubernetes, ref ope
 	if err != nil {
 		return empty, noop, err
 	}
-	if cfg.Plan.ApplicationProtocol == sqlpolicy.ManagedRequestApplicationProtocol && (cfg.Plan.Generation != 0 || cfg.Plan.EvidenceFormat != sqlpolicy.ManagedRequestApplicationProtocol) {
+	if (cfg.Plan.ApplicationProtocol == sqlpolicy.ManagedRequestApplicationProtocol || cfg.Plan.ApplicationProtocol == sqlpolicy.ManagedGraphRequestApplicationProtocol) && (cfg.Plan.Generation != 0 || cfg.Plan.EvidenceFormat != cfg.Plan.ApplicationProtocol) {
 		return empty, noop, errors.New("unsupported managed request repair profile or generation")
 	}
 	cfg.RepairOrigin, err = os.ReadFile(repairPath)
@@ -335,7 +335,7 @@ func ManagedRepairConfig(ctx context.Context, kube *operator.Kubernetes, ref ope
 	if err != nil {
 		return fail(err)
 	}
-	view, err := recovery.OpenReadOnlyViewAtHeadForPolicy(ctx, readonly, capture.SourcePrefix, 1, trusted, capture.Head, policy, window)
+	view, err := recovery.OpenReadOnlyViewAtHeadForPolicyWithReconfiguration(ctx, readonly, capture.SourcePrefix, 1, trusted, capture.Head, policy, window, c.EnableReconfiguration)
 	if err != nil {
 		return fail(errors.New("fixed repair source verification failed"))
 	}
@@ -351,7 +351,7 @@ func ManagedRepairConfig(ctx context.Context, kube *operator.Kubernetes, ref ope
 	} else if err != nil {
 		return fail(err)
 	}
-	prepared, err := recovery.LoadPreparedStartupForPolicy(ctx, readonly, capture.SourcePrefix, 1, trusted, preparedDir, cfg.Runtime.DataDir, expected, policy, window)
+	prepared, err := recovery.LoadPreparedStartupForPolicyWithReconfiguration(ctx, readonly, capture.SourcePrefix, 1, trusted, preparedDir, cfg.Runtime.DataDir, expected, policy, window, c.EnableReconfiguration)
 	if err != nil {
 		return fail(errors.New("repair prepared data verification failed"))
 	}
@@ -372,7 +372,13 @@ func VerifyRepairControl(ctx context.Context, bucket thanosobjstore.Bucket, boot
 		return err
 	}
 	defer func() { resultErr = errors.Join(resultErr, wal.Close()) }()
-	core, err := quepaxa.NewObserver(quepaxa.Config{NodeID: "repair-control-verifier", Cluster: bootstrap, WAL: wal, EnableReconfiguration: true})
+	// The view's expected policy was selected from the already authenticated
+	// runtime protocol during source verification, not inferred from wire magic.
+	var validateValue func([]byte) error
+	if view.MaterializationPolicy() == sqlpolicy.ManagedGraphRequestMaterializationPolicy {
+		validateValue = types.ValidateManagedGraphExecutionPolicy
+	}
+	core, err := quepaxa.NewObserver(quepaxa.Config{NodeID: "repair-control-verifier", Cluster: bootstrap, WAL: wal, EnableReconfiguration: true, ValidateValue: validateValue})
 	if err != nil {
 		return err
 	}

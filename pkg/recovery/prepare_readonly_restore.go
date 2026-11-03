@@ -67,6 +67,9 @@ func PrepareReadOnlyRestoreForPolicy(ctx context.Context, view *ReadOnlyView, ta
 	if expected == sqlpolicy.ManagedRequestMaterializationPolicy {
 		open = materializer.OpenManagedSQLKVWithOriginals
 	}
+	if expected == sqlpolicy.ManagedGraphRequestMaterializationPolicy {
+		open = materializer.OpenManagedSQLKVGraphWithOriginals
+	}
 	mat, err := open(sqlitePath, 1, window)
 	if err != nil {
 		return result, fmt.Errorf("open materializer: %w", err)
@@ -97,6 +100,11 @@ func PrepareReadOnlyRestoreForPolicy(ctx context.Context, view *ReadOnlyView, ta
 	}
 	if mat.Tip() != uint64(view.tip) {
 		return result, fmt.Errorf("materialized tip %d does not match captured tip %d", mat.Tip(), view.tip)
+	}
+	if expected == sqlpolicy.ManagedGraphRequestMaterializationPolicy {
+		if _, err := mat.ManagedGraphHistory(ctx); err != nil {
+			return result, err
+		}
 	}
 	if err := mat.Close(); err != nil {
 		mat = nil

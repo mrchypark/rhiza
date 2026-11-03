@@ -122,11 +122,15 @@ func (n *Node) stopInternalApplication() *internalApplicationBinding {
 }
 
 func (n *Node) internalApplicationProfile() bool {
-	return n != nil && n.managedStartup != nil && n.materializationPolicy() == sqlpolicy.ManagedRequestMaterializationPolicy
+	return n != nil && n.managedStartup != nil && (n.materializationPolicy() == sqlpolicy.ManagedRequestMaterializationPolicy || n.materializationPolicy() == sqlpolicy.ManagedGraphRequestMaterializationPolicy)
 }
 
 func inspectManagedFileForPolicy(ctx context.Context, file string, window uint64, expected sqlpolicy.MaterializationPolicy) (materializer.ManagedApplicationState, uint64, error) {
 	switch expected {
+	case sqlpolicy.ManagedGraphRequestMaterializationPolicy:
+		// This inspects only the SQLite component. Paired native validation
+		// remains mandatory at the checkpoint/source boundary.
+		return materializer.InspectManagedGraphSQLFile(ctx, file, window)
 	case sqlpolicy.ManagedRequestMaterializationPolicy:
 		return materializer.InspectManagedRequestFile(ctx, file, window)
 	case sqlpolicy.ManagedSQLKVMaterializationPolicy:
@@ -137,7 +141,14 @@ func inspectManagedFileForPolicy(ctx context.Context, file string, window uint64
 }
 
 func managedSQLKVPolicy(policy sqlpolicy.MaterializationPolicy) bool {
-	return policy == sqlpolicy.ManagedSQLKVMaterializationPolicy || policy == sqlpolicy.ManagedRequestMaterializationPolicy
+	return policy == sqlpolicy.ManagedSQLKVMaterializationPolicy || policy == sqlpolicy.ManagedRequestMaterializationPolicy || policy == sqlpolicy.ManagedGraphRequestMaterializationPolicy
+}
+
+func (n *Node) managedRuntimeHealth(ctx context.Context) error {
+	if n.materializationPolicy() == sqlpolicy.ManagedGraphRequestMaterializationPolicy {
+		return n.material.RuntimeHealth(ctx)
+	}
+	return n.material.Health(ctx)
 }
 
 func (n *Node) installInternalApplicationBinding(ctx context.Context) error {
@@ -145,7 +156,14 @@ func (n *Node) installInternalApplicationBinding(ctx context.Context) error {
 		return fmt.Errorf("internal application binding cannot be installed")
 	}
 	i := n.managedStartup.Identity
-	if i.Member.Generation != 0 || i.ApplicationProtocol != sqlpolicy.ManagedRequestApplicationProtocol || n.material.MaterializationPolicy() != sqlpolicy.ManagedRequestMaterializationPolicy || n.core.WALIdentity() == "" {
+	expectedProtocol := sqlpolicy.ManagedRequestApplicationProtocol
+	if n.materializationPolicy() == sqlpolicy.ManagedGraphRequestMaterializationPolicy {
+		expectedProtocol = sqlpolicy.ManagedGraphRequestApplicationProtocol
+		if err := n.material.ProjectionReadable(ctx); err != nil {
+			return err
+		}
+	}
+	if i.Member.Generation != 0 || i.ApplicationProtocol != expectedProtocol || n.material.MaterializationPolicy() != n.materializationPolicy() || n.core.WALIdentity() == "" {
 		return fmt.Errorf("internal application startup identity or profile differs")
 	}
 	source, config, err := n.preparedBindingDigestsForProtocol(i.ApplicationProtocol)
@@ -164,7 +182,7 @@ func (n *Node) installInternalApplicationBinding(ctx context.Context) error {
 	if member.ID == "" || member.PublicKey == (quepaxa.PublicKey{}) {
 		return fmt.Errorf("internal application member identity unavailable")
 	}
-	if err := errors.Join(n.core.Health(), n.material.Health(ctx)); err != nil {
+	if err := errors.Join(n.core.Health(), n.managedRuntimeHealth(ctx)); err != nil {
 		return err
 	}
 	if fatal := n.wal.Capacity().Fatal; fatal != nil {
@@ -219,7 +237,7 @@ func (n *Node) checkInternalApplicationRuntime(ctx context.Context) (ManagedRunt
 	if !memberFound && (n.managedInitiallyAdmitted.Load() || n.config.Learner == nil || n.config.Learner.ID != b.member.ID || n.config.Learner.PublicKey != b.member.PublicKey) {
 		return ManagedRuntimeState{}, fmt.Errorf("internal application member is retired")
 	}
-	if err := errors.Join(n.core.Health(), n.material.Health(ctx)); err != nil {
+	if err := errors.Join(n.core.Health(), n.managedRuntimeHealth(ctx)); err != nil {
 		return ManagedRuntimeState{}, err
 	}
 	if fatal := n.wal.Capacity().Fatal; fatal != nil {
@@ -248,6 +266,13 @@ func (n *Node) admitInternalApplication(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
+	// ReadIndex may observe a peer's certified tip before its Learned delivery
+	// reaches this Core. Replay must not finish against an older local tip and
+	// then reject the very target it was meant to synchronize. Wait only for
+	// actual local certification; never reinterpret recorder data as decided.
+	if err := n.core.WaitTip(ctx, target); err != nil {
+		return err
+	}
 	if err := n.replayLocalDecisions(ctx); err != nil {
 		return err
 	}
@@ -256,7 +281,7 @@ func (n *Node) admitInternalApplication(ctx context.Context) error {
 		return err
 	}
 	if state.CertifiedTip < uint64(target) || state.AppliedTip != state.CertifiedTip || state.RecorderTip > state.CertifiedTip {
-		return fmt.Errorf("internal application has unresolved certified history")
+		return fmt.Errorf("internal application has unresolved certified history: target=%d recorded=%d certified=%d applied=%d", target, state.RecorderTip, state.CertifiedTip, state.AppliedTip)
 	}
 	return nil
 }
@@ -350,6 +375,9 @@ func (n *Node) OpenManaged(ctx context.Context, cfg ManagedStartupConfig) (resul
 	}
 	if policy == sqlpolicy.ManagedRequestMaterializationPolicy && (i.Member.Generation != 0 || i.ApplicationProtocol != sqlpolicy.ManagedRequestApplicationProtocol || i.EvidenceFormat != i.ApplicationProtocol) {
 		return fmt.Errorf("unsupported internal application generation or evidence format")
+	}
+	if policy == sqlpolicy.ManagedGraphRequestMaterializationPolicy && (i.Member.Generation != 0 || i.ApplicationProtocol != sqlpolicy.ManagedGraphRequestApplicationProtocol || i.EvidenceFormat != i.ApplicationProtocol) {
+		return fmt.Errorf("unsupported Graph application generation or evidence format")
 	}
 	if managedSQLKVPolicy(policy) && (i.Member.Generation != 0 || i.EvidenceFormat != i.ApplicationProtocol) {
 		return fmt.Errorf("unsupported managed application generation or evidence format")
@@ -528,6 +556,9 @@ func (n *Node) receiptWindow() uint64 {
 }
 
 func (n *Node) validateExecutionPolicy(value []byte) error {
+	if n.materializationPolicy() == sqlpolicy.ManagedGraphRequestMaterializationPolicy {
+		return types.ValidateManagedGraphExecutionPolicy(value)
+	}
 	if managedSQLKVPolicy(n.materializationPolicy()) {
 		return types.ValidateManagedKVExecutionPolicy(value)
 	}
@@ -535,6 +566,9 @@ func (n *Node) validateExecutionPolicy(value []byte) error {
 }
 
 func (n *Node) openMaterializer(path string, readers int) (*materializer.Materializer, error) {
+	if n.materializationPolicy() == sqlpolicy.ManagedGraphRequestMaterializationPolicy {
+		return materializer.OpenManagedSQLKVGraphWithOriginals(path, readers, n.receiptWindow())
+	}
 	if n.internalApplicationProfile() {
 		return materializer.OpenManagedSQLKVWithOriginals(path, readers, n.receiptWindow())
 	}
@@ -545,7 +579,33 @@ func (n *Node) openMaterializer(path string, readers int) (*materializer.Materia
 }
 
 // Actual file semantics must precede every mixed Core checkpoint base install.
-func (n *Node) validateCheckpointFiles(ctx context.Context, files []checkpoint.File, tip uint64) error {
+func (n *Node) validateCheckpointFiles(ctx context.Context, files []checkpoint.File, tip uint64) (resultErr error) {
+	if n.materializationPolicy() == sqlpolicy.ManagedGraphRequestMaterializationPolicy {
+		if len(files) != 2 || files[0].Role != checkpoint.RoleSQLite || files[1].Role != checkpoint.RoleGraphData {
+			return fmt.Errorf("managed Graph checkpoint requires exact SQLite and Graph roles")
+		}
+		stage, err := os.MkdirTemp("", "rhiza-graph-checkpoint-validation-*")
+		if err != nil {
+			return err
+		}
+		defer func() { resultErr = errors.Join(resultErr, os.RemoveAll(stage)) }()
+		mat, err := materializer.OpenManagedSQLKVGraphWithOriginals(filepath.Join(stage, "sqlite.db"), 1, n.receiptWindow())
+		if err != nil {
+			return err
+		}
+		restore := make([]materializer.CheckpointFile, len(files))
+		for i, file := range files {
+			restore[i] = materializer.CheckpointFile{Role: materializer.CheckpointRole(file.Role), Path: file.Path}
+		}
+		if err := mat.RestoreCheckpoint(ctx, restore); err != nil {
+			return errors.Join(err, mat.Close())
+		}
+		_, historyErr := mat.ManagedGraphHistory(ctx)
+		if mat.Tip() != tip {
+			historyErr = errors.Join(historyErr, fmt.Errorf("managed Graph checkpoint tip differs from certified base"))
+		}
+		return errors.Join(historyErr, mat.ProjectionReadable(ctx), mat.Close())
+	}
 	if !managedSQLKVPolicy(n.materializationPolicy()) {
 		return nil
 	}
@@ -620,12 +680,14 @@ func (n *Node) EnsureInitialManagedAdmission(ctx context.Context) error {
 // AdmitManaged performs a fresh quorum/replay round before checking current
 // application authority. Failure preserves the paused runtime and its data.
 func (n *Node) AdmitManaged(ctx context.Context) error {
+	var binding *internalApplicationBinding
 	if n.internalApplicationProfile() {
-		_, scoped, release, err := n.borrowInternalApplication(ctx)
+		borrowed, scoped, release, err := n.borrowInternalApplication(ctx)
 		if err != nil {
 			return err
 		}
 		defer release()
+		binding = borrowed
 		ctx = scoped
 	}
 	if n.internalApplicationProfile() && n.managedInitiallyAdmitted.Load() {
@@ -654,6 +716,7 @@ func (n *Node) AdmitManaged(ctx context.Context) error {
 	// runtime. Later failed quorum rounds cannot revoke safe local reads;
 	// their live authority/history checks remain mandatory.
 	n.managedInitiallyAdmitted.Store(true)
+	n.startManagedGraphPublisherAfterAdmission(binding)
 	return nil
 }
 
@@ -746,7 +809,7 @@ func (n *Node) verifyPreparedWALBeforeRestore(ctx context.Context, prepared *rec
 		return nil
 	}
 	cluster := n.loadClusterConfig()
-	core, err := newManagedReadOnlyCore(quepaxa.NodeID("prepared-wal-verifier"), *cluster, wal, n.config.EnableReconfiguration)
+	core, err := newManagedReadOnlyCore(quepaxa.NodeID("prepared-wal-verifier"), *cluster, wal, n.config.EnableReconfiguration, n.materializationPolicy())
 	if err != nil {
 		return fmt.Errorf("verify existing prepared WAL: %w", err)
 	}
@@ -779,15 +842,19 @@ func (n *Node) verifyPreparedWALBeforeRestore(ctx context.Context, prepared *rec
 	return nil
 }
 
-func newManagedReadOnlyCore(nodeID quepaxa.NodeID, cluster quepaxa.Cluster, wal *qlog.WAL, enableReconfiguration bool) (*quepaxa.Core, error) {
-	core, err := quepaxa.NewObserver(quepaxa.Config{NodeID: nodeID, Cluster: cluster, WAL: wal})
+func newManagedReadOnlyCore(nodeID quepaxa.NodeID, cluster quepaxa.Cluster, wal *qlog.WAL, enableReconfiguration bool, expected sqlpolicy.MaterializationPolicy) (*quepaxa.Core, error) {
+	var validateValue func([]byte) error
+	if expected == sqlpolicy.ManagedGraphRequestMaterializationPolicy {
+		validateValue = types.ValidateManagedGraphExecutionPolicy
+	}
+	core, err := quepaxa.NewObserver(quepaxa.Config{NodeID: nodeID, Cluster: cluster, WAL: wal, ValidateValue: validateValue})
 	if err == nil || !enableReconfiguration {
 		return core, err
 	}
 	// An old but otherwise compatible WAL may not yet contain the protocol
 	// marker. Keep this preflight read-only; normal startup may add the marker
 	// only after all existing SQL/WAL validation has passed.
-	return quepaxa.NewObserver(quepaxa.Config{NodeID: nodeID, Cluster: cluster, WAL: wal, EnableReconfiguration: true})
+	return quepaxa.NewObserver(quepaxa.Config{NodeID: nodeID, Cluster: cluster, WAL: wal, EnableReconfiguration: true, ValidateValue: validateValue})
 }
 
 func (n *Node) verifyPreparedAdoption(ctx context.Context, identity recovery.PreparedStartupIdentity) (resultErr error) {
@@ -851,7 +918,7 @@ func (n *Node) verifyPreparedAdoptionWithLock(ctx context.Context, identity reco
 		return err
 	}
 	cluster := n.loadClusterConfig()
-	core, err := newManagedReadOnlyCore(quepaxa.NodeID("managed-adoption-verifier"), *cluster, wal, n.config.EnableReconfiguration)
+	core, err := newManagedReadOnlyCore(quepaxa.NodeID("managed-adoption-verifier"), *cluster, wal, n.config.EnableReconfiguration, n.materializationPolicy())
 	if err != nil {
 		return err
 	}
@@ -1321,11 +1388,18 @@ func (n *Node) recoverPreparedV1Alpha2WithLock(ctx context.Context, prepared *re
 	}
 	transport.SetAdminToken(n.config.AdminToken)
 	defer func() { resultErr = errors.Join(resultErr, transport.Close()) }()
+	var validateValue func([]byte) error
+	if n.materializationPolicy() == sqlpolicy.ManagedGraphRequestMaterializationPolicy {
+		validateValue = types.ValidateManagedGraphExecutionPolicy
+		if err := transport.ValidateManagedGraphWireBudget(); err != nil {
+			return err
+		}
+	}
 	newCore := quepaxa.New
 	if n.config.Learner != nil {
 		newCore = quepaxa.NewLearner
 	}
-	core, err := newCore(quepaxa.Config{NodeID: n.config.NodeID, Cluster: *cluster, WAL: wal, Transport: transport, EnableReconfiguration: n.config.EnableReconfiguration})
+	core, err := newCore(quepaxa.Config{NodeID: n.config.NodeID, Cluster: *cluster, WAL: wal, Transport: transport, EnableReconfiguration: n.config.EnableReconfiguration, ValidateValue: validateValue})
 	if err != nil {
 		return err
 	}

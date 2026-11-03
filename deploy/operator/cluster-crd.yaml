@@ -56,7 +56,7 @@ spec:
                 - rule: self.voterCount == oldSelf.voterCount
                   message: voterCount updates are unsupported
               properties:
-                applicationProtocol: {type: string, maxLength: 24, enum: [rhiza-managed-sql-kv/v1, rhiza-managed-request/v1]}
+                applicationProtocol: {type: string, maxLength: 30, enum: [rhiza-managed-sql-kv/v1, rhiza-managed-request/v1, rhiza-managed-request-graph/v1]}
                 genesisIntent: {type: string, maxLength: 6, enum: [Create]}
                 statefulSet: {type: string}
                 container: {type: string}
@@ -407,7 +407,7 @@ spec:
                       type: object
                       required: [assignmentID, clusterUID, intentHash, generation, deploymentUID, storageID, physicalBinding, bootstrapPlanDigest, evidenceFormat]
                       properties:
-                        applicationProtocol: {type: string, maxLength: 24, enum: [rhiza-managed-sql-kv/v1, rhiza-managed-request/v1]}
+                        applicationProtocol: {type: string, maxLength: 30, enum: [rhiza-managed-sql-kv/v1, rhiza-managed-request/v1, rhiza-managed-request-graph/v1]}
                         assignmentID: {type: string, minLength: 1, maxLength: 256}
                         clusterUID: {type: string, minLength: 1, maxLength: 256}
                         intentHash: {type: string, minLength: 64, maxLength: 64, pattern: '^[0-9a-f]{64}$'}

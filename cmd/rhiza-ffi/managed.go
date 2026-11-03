@@ -14,6 +14,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/mrchypark/rhiza/internal/localtesthooks"
 	"github.com/mrchypark/rhiza/internal/types"
 	"github.com/mrchypark/rhiza/pkg/managedbootstrap"
 	"github.com/mrchypark/rhiza/pkg/managedsql"
@@ -63,6 +64,7 @@ func goOpenManaged(input []byte) []byte {
 	if err != nil {
 		return marshalError("not_ready", "managed Kubernetes client unavailable")
 	}
+	localtesthooks.HitManagedKubeClient(kube.Client)
 	ctx, cancel := context.WithCancel(context.Background())
 	opening, finishOpening := managedStartupContext(ctx, defaultTimeout)
 	cfg, cleanup, err := managedbootstrap.LoadConfig(opening, managedbootstrap.ConfigRequest{Kube: kube, Ref: ref, PodName: pod, PodUID: uid, IdentityPath: request.IdentityFile, BootstrapPath: request.HandoffFile, RepairPath: request.RepairHandoffFile, Profile: profile})
@@ -215,6 +217,47 @@ func dispatchManaged(ctx context.Context, entry *ffiEntry, call callEnvelope) (a
 			return nil, err
 		}
 		return managedStatusWire(selector.Kind, result), nil
+	case "graph_execute":
+		frame, err := decodeManagedGraphFrame(call.Request)
+		if err != nil {
+			return nil, err
+		}
+		original, recognized, err := types.DecodeManagedGraphExecution(frame)
+		if err != nil || !recognized {
+			return nil, invalidManagedKVRequest()
+		}
+		result, err := entry.managed.GraphExecute(ctx, original)
+		if err != nil {
+			return nil, err
+		}
+		return managedKVReceiptWire(result.MutationReceipt), nil
+	case "graph_query":
+		var request network.GraphQueryRequest
+		if err := decode(&request); err != nil {
+			return nil, err
+		}
+		return entry.managed.GraphQuery(ctx, request)
+	case "graph_reachable":
+		var request types.GraphReachableRequest
+		if err := decode(&request); err != nil {
+			return nil, err
+		}
+		return entry.managed.GraphReachable(ctx, request)
+	case "graph_changes", "graph_stream_read":
+		var request network.GraphStreamReadRequest
+		if err := decode(&request); err != nil {
+			return nil, err
+		}
+		if call.Operation == "graph_changes" {
+			return entry.managed.GraphChanges(ctx, request)
+		}
+		return entry.managed.GraphStreamRead(ctx, request)
+	case "graph_stream_offset":
+		var request network.GraphStreamOffsetRequest
+		if err := decode(&request); err != nil {
+			return nil, err
+		}
+		return entry.managed.GraphStreamOffset(ctx, request)
 	default:
 		return nil, &ffiError{Code: "invalid_request", Message: "operation unavailable on managed SQL handle"}
 	}
@@ -265,7 +308,7 @@ func decodeManagedRequestSelector(raw json.RawMessage, allowEmpty bool) (*networ
 	if seen == 0 && allowEmpty {
 		return nil, nil
 	}
-	if seen != 3 || wire.Kind == nil || (*wire.Kind != "sql" && *wire.Kind != "kv") {
+	if seen != 3 || wire.Kind == nil || (*wire.Kind != "sql" && *wire.Kind != "kv" && *wire.Kind != "graph") {
 		return nil, invalidManagedKVRequest()
 	}
 	id, err := managedRawBytes(wire.RequestID, 64)
@@ -332,7 +375,7 @@ func managedKVGetWire(result network.KVGetResponse) managedKVRead {
 func managedStatusWire(kind string, result network.RequestStatusResponse) any {
 	var receipt any
 	if result.Receipt != nil {
-		if kind == "kv" {
+		if kind == "kv" || kind == "graph" {
 			receipt = managedKVReceiptWire(*result.Receipt)
 		} else {
 			receipt = result.Receipt
@@ -346,19 +389,23 @@ func managedStatusWire(kind string, result network.RequestStatusResponse) any {
 }
 
 func managedRecoveryWire(result managedsql.RecoveryResult) (any, error) {
-	if result.Kind == "" && result.SQL == nil && result.KV == nil && len(result.RequestID) == 0 {
+	if result.Kind == "" && result.SQL == nil && result.KV == nil && result.Graph == nil && len(result.RequestID) == 0 {
 		return struct {
 			Kind string `json:"kind"`
 		}{"none"}, nil
 	}
 	var sql *managedsql.ExecuteResponse
 	var kv *managedKVReceipt
+	var graph *managedKVReceipt
 	switch {
-	case result.Kind == "sql" && result.SQL != nil && result.KV == nil && len(result.RequestID) > 0:
+	case result.Kind == "sql" && result.SQL != nil && result.KV == nil && result.Graph == nil && len(result.RequestID) > 0:
 		sql = result.SQL
-	case result.Kind == "kv" && result.KV != nil && result.SQL == nil && len(result.RequestID) > 0:
+	case result.Kind == "kv" && result.KV != nil && result.SQL == nil && result.Graph == nil && len(result.RequestID) > 0:
 		receipt := managedKVReceiptWire(result.KV.MutationReceipt)
 		kv = &receipt
+	case result.Kind == "graph" && result.Graph != nil && result.SQL == nil && result.KV == nil && len(result.RequestID) > 0:
+		receipt := managedKVReceiptWire(result.Graph.MutationReceipt)
+		graph = &receipt
 	default:
 		return nil, &ffiError{Code: "internal", Message: "invalid managed recovery result"}
 	}
@@ -367,5 +414,6 @@ func managedRecoveryWire(result managedsql.RecoveryResult) (any, error) {
 		RequestID []byte                      `json:"request_id_b64"`
 		SQL       *managedsql.ExecuteResponse `json:"sql,omitempty"`
 		KV        *managedKVReceipt           `json:"kv,omitempty"`
-	}{result.Kind, result.RequestID, sql, kv}, nil
+		Graph     *managedKVReceipt           `json:"graph,omitempty"`
+	}{result.Kind, result.RequestID, sql, kv, graph}, nil
 }

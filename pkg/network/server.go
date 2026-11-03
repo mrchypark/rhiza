@@ -343,6 +343,9 @@ func NewServerForPolicy(core *quepaxa.Core, material *materializer.Materializer,
 	}
 	s.sqlBatcher = newSQLBatcher(s.proposeInternalBatch, nil)
 	s.graphBatcher = newGraphBatcher(s.proposeInternalBatch, nil)
+	if expected == sqlpolicy.ManagedGraphRequestMaterializationPolicy {
+		s.graphBatcher = newManagedGraphBatcher(s.proposeInternalBatch, nil)
+	}
 	if managedKVExecutionPolicy(expected) {
 		s.kvBatcher = newManagedKVBatcher(s.proposeInternalBatch, nil)
 	} else {
@@ -2257,6 +2260,14 @@ func (s *Server) validateExecutionPolicy(value []byte) error {
 }
 
 func (s *Server) validateReplicatedMutation(value []byte) error {
+	if s.expectedPolicy == sqlpolicy.ManagedGraphRequestMaterializationPolicy {
+		if err := types.ValidateManagedGraphExecutionPolicy(value); err != nil {
+			return err
+		}
+		if _, graph, err := types.DecodeManagedGraphExecution(value); graph || err != nil {
+			return err
+		}
+	}
 	if !managedKVExecutionPolicy(s.expectedPolicy) {
 		return validateReplicatedMutation(value)
 	}
@@ -2426,7 +2437,7 @@ func (s *Server) applyDecisions(ctx context.Context, through quepaxa.Slot) error
 			}
 		}
 		if err := s.material.ApplyBatch(ctx, decisions[:end]); err != nil {
-			return err
+			return fmt.Errorf("certified replay apply first_slot=%d last_slot=%d last_hash=%x ctx_canceled=%t: %w", decisions[0].Slot, decisions[end-1].Slot, decisions[end-1].Hash, ctx.Err() != nil, err)
 		}
 		if end < len(decisions) {
 			return nil
