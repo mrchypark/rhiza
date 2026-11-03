@@ -55,19 +55,26 @@ before=$(hash_files "$native_dir/go.mod" "$native_dir/go.sum")
 # Markdown is compiler-unread here: this generated native tree has no
 # go:embed directive targeting Markdown. Preserve legal/notice Markdown names;
 # keep any Markdown in a package containing go:embed conservatively rather than
-# attempting to parse embed patterns.
+# attempting to parse embed patterns. x/sys/unix/mkerrors.sh only regenerates
+# the already bundled syscall Go tables; native compilation never runs it.
+# Apply the same conservative embed preservation to that exact generator.
 NATIVE_VENDOR=$native_dir/vendor
 export NATIVE_VENDOR
 find "$native_dir/vendor" -type f -exec sh -eu -c '
     for source do
         base=${source##*/}
-        case "$base" in
-            *.[mM][dD]) ;;
-            *) continue ;;
+        case "$source" in
+            "$NATIVE_VENDOR/golang.org/x/sys/unix/mkerrors.sh") ;;
+            *)
+                case "$base" in
+                    *.[mM][dD]) ;;
+                    *) continue ;;
+                esac
+                ;;
         esac
         lower=$(printf "%s" "$base" | tr "[:upper:]" "[:lower:]")
         case "$lower" in
-            *license*|*notice*|*copying*|*copyright*) continue ;;
+            *license*|*legal*|*notice*|*copying*|*copyright*) continue ;;
         esac
         dir=$(dirname "$source")
         keep=0

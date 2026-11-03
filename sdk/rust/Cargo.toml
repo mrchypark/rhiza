@@ -16,7 +16,8 @@ include = [
     "build.rs",
     # The HA/operator examples are repository-only CI fixture executables.
     "examples/embedded.rs",
-    "scripts/**",
+    # Native snapshot preparation/staging requires the repository, not a crate.
+    "scripts/fetch-native.sh",
     "src/**",
     "native/**",
 ]
