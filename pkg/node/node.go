@@ -580,6 +580,9 @@ func (n *Node) openInternal(ctx context.Context, enroll bool, prelocked *qlog.Lo
 	var material *materializer.Materializer
 	deferredManagedGraph := n.managedStartup != nil && n.materializationPolicy() == sqlpolicy.ManagedGraphRequestMaterializationPolicy
 	if deferredManagedGraph {
+		if localtesthooks.Enabled {
+			localtesthooks.Hit("node:managed-graph-startup:target_inspect")
+		}
 		managedMaterializerWasAbsent, err = managedMaterializerFilesAbsent(n.config.DataDir)
 		if err != nil {
 			return err
@@ -665,6 +668,9 @@ func (n *Node) openInternal(ctx context.Context, enroll bool, prelocked *qlog.Lo
 				}
 			}
 		}
+	}
+	if deferredManagedGraph && localtesthooks.Enabled {
+		localtesthooks.Hit("node:managed-graph-startup:core_open")
 	}
 	core, err := makeCore(quepaxa.Config{
 		NodeID: n.config.NodeID, Cluster: *cluster, WAL: wal, Transport: coreTransport, LocalMode: n.config.Local,
@@ -755,6 +761,9 @@ func (n *Node) openInternal(ctx context.Context, enroll bool, prelocked *qlog.Lo
 		return fmt.Errorf("restore generation anchor: %w", startupRecovery.Check(err))
 	}
 	if n.archive != nil {
+		if deferredManagedGraph && localtesthooks.Enabled {
+			localtesthooks.Hit("node:managed-graph-startup:archive_recover")
+		}
 		archiveTip := n.archive.Tip()
 		archiveDecisions := n.archive.DecisionsFrom
 		archiveBase := n.archive.RecoveryBase
@@ -801,6 +810,9 @@ func (n *Node) openInternal(ctx context.Context, enroll bool, prelocked *qlog.Lo
 		}
 	}
 	if deferredManagedGraph {
+		if localtesthooks.Enabled {
+			localtesthooks.Hit("node:managed-graph-startup:pair_select")
+		}
 		_, hasSeal, sealErr := core.LatestCheckpointSeal()
 		if sealErr != nil {
 			return sealErr

@@ -16,6 +16,7 @@ import (
 	"slices"
 	"sync"
 
+	"github.com/mrchypark/rhiza/internal/localtesthooks"
 	objectstore "github.com/mrchypark/rhiza/internal/objstore"
 	"github.com/mrchypark/rhiza/internal/sqlpolicy"
 	"github.com/mrchypark/rhiza/internal/types"
@@ -517,6 +518,9 @@ func (n *Node) OpenManaged(ctx context.Context, cfg ManagedStartupConfig) (resul
 	if openErr != nil {
 		return openErr
 	}
+	if policy == sqlpolicy.ManagedGraphRequestMaterializationPolicy && localtesthooks.Enabled {
+		localtesthooks.Hit("node:managed-graph-startup:runtime_verify")
+	}
 	postOpenFailure := func(err error) error { return errors.Join(err, n.Shutdown()) }
 	if cfg.Prepared != nil {
 		adoption, err := n.verifyManagedPreparedRestore(ctx, cfg.Prepared)
@@ -540,6 +544,9 @@ func (n *Node) OpenManaged(ctx context.Context, cfg ManagedStartupConfig) (resul
 		if err := n.installInternalApplicationBinding(ctx); err != nil {
 			return postOpenFailure(err)
 		}
+	}
+	if policy == sqlpolicy.ManagedGraphRequestMaterializationPolicy && localtesthooks.Enabled {
+		localtesthooks.Hit("node:managed-graph-startup:open_complete")
 	}
 	return nil
 }

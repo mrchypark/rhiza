@@ -66,10 +66,15 @@ func runManagedFFIInClusterLifecycle(t *testing.T, mixed bool, graphMode ...bool
 		} `json:"data"`
 		Error *ffiError `json:"error"`
 	}
-	if err := json.Unmarshal(goOpenManaged([]byte(`{}`)), &opened); err != nil {
+	lastStartupStage, stopStartupObservation := observeManagedGraphStartup()
+	openResponse := goOpenManaged([]byte(`{}`))
+	stopStartupObservation()
+	startupStage := lastStartupStage()
+	if err := json.Unmarshal(openResponse, &opened); err != nil {
 		t.Fatal("invalid FFI open response")
 	}
 	if opened.Error != nil {
+		fmt.Printf("GRAPH_STARTUP_DIAGNOSTIC last_stage=%s\n", startupStage)
 		t.Fatalf("real managed FFI open failed, code=%s message=%s", opened.Error.Code, opened.Error.Message)
 	}
 	handle := opened.Data.Handle

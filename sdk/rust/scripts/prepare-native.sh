@@ -20,8 +20,17 @@ cp "$repo_dir/go.mod" "$repo_dir/go.sum" "$repo_dir/rhiza.go" "$repo_dir/replica
 (
     cd "$repo_dir"
     export NATIVE_OUTPUT="$temporary_dir"
-    find cmd/rhiza-ffi internal pkg -type f ! -name '*_test.go' -exec sh -c '
+    # These two directories are used only by repository Go tests. The crate
+    # builds cmd/rhiza-ffi; it does not run the repository qualification suite.
+    find cmd/rhiza-ffi internal pkg -type f ! -name '*_test.go' \
+        ! -path 'pkg/materializer/testdata/*' \
+        ! -path 'internal/objstore/versityfixture/*' -exec sh -c '
         for source do
+            # Retain all ordinary/platform sources and disabled counterparts.
+            # Only the explicit repository qualification tag is excluded.
+            first=
+            IFS= read -r first < "$source" || :
+            [ "$first" != "//go:build rhiza_local_testhooks" ] || continue
             target="$NATIVE_OUTPUT/$source"
             mkdir -p "$(dirname "$target")"
             cp "$source" "$target"

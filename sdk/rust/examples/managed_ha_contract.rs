@@ -139,11 +139,19 @@ fn graph_recover_exact(
     db: &ManagedDb,
     command: &ManagedGraphCommand,
     upper: u64,
+    ordinal: usize,
 ) -> Result<ManagedGraphReceipt, String> {
     match db
         .recover_request(MutationKind::Graph, &command.request_id)
-        .map_err(|e| e.error().code.clone())?
-    {
+        .map_err(|e| {
+            graph_step_error(
+                "graph_recover",
+                ordinal,
+                &e.error().code,
+                e.mutation_context()
+                    .map(|c| (c.slot(), c.retry_through_slot())),
+            )
+        })? {
         ManagedRecoveryResult::Graph {
             request_id,
             receipt,
@@ -154,6 +162,53 @@ fn graph_recover_exact(
     }
 }
 
+// A diagnostic must never interpolate Error.message, raw identity, or input.
+// Missing context is not a known zero-slot outcome or permission to resubmit.
+fn graph_step_error(
+    stage: &str,
+    ordinal: usize,
+    code: &str,
+    context: Option<(u64, u64)>,
+) -> String {
+    let stage = match stage {
+        "graph_execute"
+        | "graph_recover"
+        | "graph_query"
+        | "graph_stream_read"
+        | "graph_stream_offset"
+        | "graph_status"
+        | "graph_encode_original"
+        | "graph_encode_execution"
+        | "sql_schema"
+        | "sql_tuple"
+        | "sql_query"
+        | "close" => stage,
+        _ => "unclassified",
+    };
+    let code = match code {
+        "internal"
+        | "commit_unknown"
+        | "kv_recovery_required"
+        | "kv_not_submitted"
+        | "sql_recovery_required"
+        | "sql_not_submitted"
+        | "timeout"
+        | "canceled"
+        | "invalid_request"
+        | "not_ready"
+        | "quorum_unavailable"
+        | "request_conflict"
+        | "durability_unavailable"
+        | "overloaded"
+        | "mixed_sql_ack_missing"
+        | "mixed_sql_slot_missing"
+        | "mixed_sql_slot_zero" => code,
+        _ => "unclassified",
+    };
+    let (slot, retry) = context.unwrap_or((0, 0));
+    format!("graph_step stage={stage} ordinal={ordinal} code={code} context_known={} slot={slot} retry={retry}", context.is_some())
+}
+
 fn graph_state(db: &ManagedDb) -> Result<serde_json::Value, String> {
     let nodes = db
         .graph_query(
@@ -161,7 +216,7 @@ fn graph_state(db: &ManagedDb) -> Result<serde_json::Value, String> {
             json!({}),
             "linearizable",
         )
-        .map_err(|e| e.code)?;
+        .map_err(|e| graph_step_error("graph_query", 1, &e.code, None))?;
     if nodes.rows
         != vec![
             vec![json!("a"), json!("alpha"), json!(0.1)],
@@ -176,7 +231,7 @@ fn graph_state(db: &ManagedDb) -> Result<serde_json::Value, String> {
             json!({}),
             "linearizable",
         )
-        .map_err(|e| e.code)?;
+        .map_err(|e| graph_step_error("graph_query", 2, &e.code, None))?;
     if edges.rows != vec![vec![json!("a"), json!("b")]] {
         return Err("graph_edges_mismatch".into());
     }
@@ -188,7 +243,7 @@ fn graph_state(db: &ManagedDb) -> Result<serde_json::Value, String> {
             wait_ms: 0,
             consistency: "linearizable".into(),
         })
-        .map_err(|e| e.code)?;
+        .map_err(|e| graph_step_error("graph_stream_read", 1, &e.code, None))?;
     if events.records.len() != 3
         || events
             .records
@@ -204,7 +259,7 @@ fn graph_state(db: &ManagedDb) -> Result<serde_json::Value, String> {
     }
     let offset = db
         .graph_stream_offset("graph-ci-events", "graph-ci-consumer", "linearizable")
-        .map_err(|e| e.code)?;
+        .map_err(|e| graph_step_error("graph_stream_offset", 0, &e.code, None))?;
     if !offset.found || offset.sequence != u64::MAX {
         return Err("graph_offset_u64_mismatch".into());
     }
@@ -216,7 +271,7 @@ fn graph_state(db: &ManagedDb) -> Result<serde_json::Value, String> {
             wait_ms: 0,
             consistency: "linearizable".into(),
         })
-        .map_err(|e| e.code)?;
+        .map_err(|e| graph_step_error("graph_stream_read", 2, &e.code, None))?;
     if !trimmed.records.is_empty() {
         return Err("graph_trim_mismatch".into());
     }
@@ -241,7 +296,8 @@ fn run_graph(initial: bool) -> Result<(), String> {
     let commands = graph_commands();
     let tuple = if initial {
         let mut cases = Vec::new();
-        for command in &commands {
+        for (index, command) in commands.iter().enumerate() {
+            let ordinal = index + 1;
             if command.request_id == b"graph-trim-max" {
                 let before = db
                     .graph_stream_read(&ManagedGraphStreamRequest {
@@ -251,7 +307,7 @@ fn run_graph(initial: bool) -> Result<(), String> {
                         wait_ms: 0,
                         consistency: "linearizable".into(),
                     })
-                    .map_err(|e| e.code)?;
+                    .map_err(|e| graph_step_error("graph_stream_read", ordinal, &e.code, None))?;
                 if before.records.len() != 2
                     || before.records[0].sequence >= before.records[1].sequence
                     || before
@@ -266,6 +322,16 @@ fn run_graph(initial: bool) -> Result<(), String> {
             let (receipt, recovered) = match db.graph_execute(command) {
                 Ok(receipt) => (receipt, false),
                 Err(e) if e.error().code == "commit_unknown" => {
+                    eprintln!(
+                        "GRAPH_STEP_DIAGNOSTIC {}",
+                        graph_step_error(
+                            "graph_execute",
+                            ordinal,
+                            &e.error().code,
+                            e.mutation_context()
+                                .map(|c| (c.slot(), c.retry_through_slot()))
+                        )
+                    );
                     let context = e
                         .mutation_context()
                         .ok_or("graph_unknown_context_missing")?;
@@ -274,11 +340,22 @@ fn run_graph(initial: bool) -> Result<(), String> {
                     {
                         return Err("graph_unknown_context_mismatch".into());
                     }
-                    (graph_recover_exact(&db, command, context.slot())?, true)
+                    (
+                        graph_recover_exact(&db, command, context.slot(), ordinal)?,
+                        true,
+                    )
                 }
-                Err(e) => return Err(e.error().code.clone()),
+                Err(e) => {
+                    return Err(graph_step_error(
+                        "graph_execute",
+                        ordinal,
+                        &e.error().code,
+                        e.mutation_context()
+                            .map(|c| (c.slot(), c.retry_through_slot())),
+                    ))
+                }
             };
-            cases.push(json!({"request_id_b64":STANDARD.encode(&command.request_id),"expected_original_b64":STANDARD.encode(command.encode_original().map_err(|e|e.code)?),"frame_b64":STANDARD.encode(command.encode_execution().map_err(|e|e.code)?),"receipt":graph_receipt_json(&receipt)?,"recovered":recovered}));
+            cases.push(json!({"request_id_b64":STANDARD.encode(&command.request_id),"expected_original_b64":STANDARD.encode(command.encode_original().map_err(|e|graph_step_error("graph_encode_original",ordinal,&e.code,None))?),"frame_b64":STANDARD.encode(command.encode_execution().map_err(|e|graph_step_error("graph_encode_execution",ordinal,&e.code,None))?),"receipt":graph_receipt_json(&receipt)?,"recovered":recovered}));
         }
         let tuple = json!({"version":1,"producer_uid":producer,"cases":cases,"trim_before_count":2,"state":graph_state(&db)?});
         mixed_sql(
@@ -287,7 +364,8 @@ fn run_graph(initial: bool) -> Result<(), String> {
                 "graph-ci-schema",
                 "CREATE TABLE rust_graph_contract(id INTEGER PRIMARY KEY,tuple TEXT NOT NULL)",
             ),
-        )?;
+        )
+        .map_err(|code| graph_step_error("sql_schema", 0, &code, None))?;
         mixed_sql(
             &db,
             &ManagedExecuteRequest::sql(
@@ -295,7 +373,8 @@ fn run_graph(initial: bool) -> Result<(), String> {
                 "INSERT INTO rust_graph_contract VALUES(1,?)",
             )
             .args([json!(tuple.to_string())]),
-        )?;
+        )
+        .map_err(|code| graph_step_error("sql_tuple", 0, &code, None))?;
         tuple
     } else {
         let row = db
@@ -303,7 +382,7 @@ fn run_graph(initial: bool) -> Result<(), String> {
                 &ManagedQueryRequest::new("SELECT tuple FROM rust_graph_contract WHERE id=1")
                     .consistency("linearizable"),
             )
-            .map_err(|e| e.code)?;
+            .map_err(|e| graph_step_error("sql_query", 0, &e.code, None))?;
         let text = row
             .rows
             .first()
@@ -325,32 +404,39 @@ fn run_graph(initial: bool) -> Result<(), String> {
     {
         return Err("graph_tuple_state_mismatch".into());
     }
-    for (command, case) in commands
+    for (index, (command, case)) in commands
         .iter()
         .zip(tuple["cases"].as_array().ok_or("graph_cases_missing")?)
+        .enumerate()
     {
+        let ordinal = index + 1;
         if case["request_id_b64"] != json!(STANDARD.encode(&command.request_id))
             || case["expected_original_b64"]
-                != json!(STANDARD.encode(command.encode_original().map_err(|e| e.code)?))
+                != json!(STANDARD.encode(command.encode_original().map_err(|e| {
+                    graph_step_error("graph_encode_original", ordinal, &e.code, None)
+                })?))
             || case["frame_b64"]
-                != json!(STANDARD.encode(command.encode_execution().map_err(|e| e.code)?))
+                != json!(STANDARD.encode(command.encode_execution().map_err(|e| {
+                    graph_step_error("graph_encode_execution", ordinal, &e.code, None)
+                })?))
         {
             return Err("graph_expected_original_changed".into());
         }
-        let recovered = graph_recover_exact(&db, command, 0)?;
+        let recovered = graph_recover_exact(&db, command, 0, ordinal)?;
         if case["receipt"] != graph_receipt_json(&recovered)? {
             return Err("graph_first_receipt_changed".into());
         }
         let status = db
             .request_status(MutationKind::Graph, &command.request_id)
-            .map_err(|e| e.code)?;
+            .map_err(|e| graph_step_error("graph_status", ordinal, &e.code, None))?;
         match status.receipt {
             Some(ManagedRequestReceipt::Graph(receipt))
                 if graph_receipt_json(&receipt)? == case["receipt"] => {}
             _ => return Err("graph_status_receipt_mismatch".into()),
         }
     }
-    db.close().map_err(|e| e.code)?;
+    db.close()
+        .map_err(|e| graph_step_error("close", 0, &e.code, None))?;
     println!("RUST_GRAPH_CURRENT_UID={uid}");
     println!("RUST_GRAPH_TUPLE={tuple}");
     println!(
@@ -920,6 +1006,18 @@ fn execute_committed_or_resolve(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn graph_step_diagnostic_is_fixed_and_context_is_explicit() {
+        assert_eq!(graph_step_error("graph_execute", 2, "commit_unknown", Some((0, u64::MAX))),
+            "graph_step stage=graph_execute ordinal=2 code=commit_unknown context_known=true slot=0 retry=18446744073709551615");
+        assert_eq!(graph_step_error("sql_tuple", 0, "commit_unknown", None),
+            "graph_step stage=sql_tuple ordinal=0 code=commit_unknown context_known=false slot=0 retry=0");
+        let private = "secret-SQL-https://private/path-raw-ID";
+        let diagnostic = graph_step_error(private, 1, private, None);
+        assert_eq!(diagnostic, "graph_step stage=unclassified ordinal=1 code=unclassified context_known=false slot=0 retry=0");
+        assert!(!diagnostic.contains(private));
+    }
 
     #[test]
     fn mixed_sql_ack_requires_present_nonzero_slot() {

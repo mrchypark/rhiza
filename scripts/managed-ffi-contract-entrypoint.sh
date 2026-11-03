@@ -41,7 +41,27 @@ run_contract() {
     printf '%s\n' "$code" > "$diag_dir/$stage.exit"
   ) 2>&1 | awk '
     function emit(s) { if (used+length(s)+1<=65536) { print s; used+=length(s)+1 } }
-    function knowncode(s) { return s ~ /^(internal|commit_unknown|kv_recovery_required|kv_not_submitted|sql_recovery_required|sql_not_submitted|timeout|canceled|invalid_request|not_ready|quorum_unavailable|request_conflict|durability_unavailable|overloaded)$/ }
+    function knowncode(s) { return s ~ /^(internal|commit_unknown|kv_recovery_required|kv_not_submitted|sql_recovery_required|sql_not_submitted|timeout|canceled|invalid_request|not_ready|quorum_unavailable|request_conflict|durability_unavailable|overloaded|unclassified)$/ }
+    function uint(s) { return s ~ /^[0-9]+$/ && length(s)<=20 }
+    /^GRAPH_STARTUP_DIAGNOSTIC last_stage=(target_inspect|core_open|archive_recover|pair_select|pair_reconstruct|pair_install|runtime_verify|open_complete|not_observed)$/ { emit($0); next }
+    /managed operation unavailable / {
+      tuple=$0; sub(/^.*managed operation unavailable /,"",tuple)
+      if (tuple ~ /^operation=(execute|query|ready|request_status|recover_pending|recover_pending_detailed|kv_put|kv_delete|kv_cas|kv_get|graph_execute|graph_query|graph_reachable|graph_changes|graph_stream_read|graph_stream_offset|unsupported) code=[a-z_]+ cause=(unclassified|deadline|canceled|quorum_unavailable|durability_unavailable|not_ready|overloaded|request_conflict) context_known=(true|false) slot=[0-9]+ retry=[0-9]+$/) {
+        split(tuple,fields," "); code=fields[2]; sub(/^code=/,"",code)
+        slot=fields[5]; sub(/^slot=/,"",slot); retry=fields[6]; sub(/^retry=/,"",retry)
+        if (knowncode(code) && uint(slot) && uint(retry)) emit("MANAGED_OPERATION_DIAGNOSTIC " tuple)
+      }
+      next
+    }
+    /^(GRAPH_STEP_DIAGNOSTIC |FAIL: managed-ha-contract )graph_step / {
+      tuple=$0; sub(/^(GRAPH_STEP_DIAGNOSTIC |FAIL: managed-ha-contract )graph_step /,"",tuple)
+      if (tuple ~ /^stage=(graph_execute|graph_recover|graph_query|graph_stream_read|graph_stream_offset|graph_status|graph_encode_original|graph_encode_execution|sql_schema|sql_tuple|sql_query|close|unclassified) ordinal=[0-9]+ code=[a-z_]+ context_known=(true|false) slot=[0-9]+ retry=[0-9]+$/) {
+        split(tuple,fields," "); ordinal=fields[2]; sub(/^ordinal=/,"",ordinal); code=fields[3]; sub(/^code=/,"",code)
+        slot=fields[5]; sub(/^slot=/,"",slot); retry=fields[6]; sub(/^retry=/,"",retry)
+        if ((knowncode(code) || code ~ /^mixed_sql_(ack_missing|slot_missing|slot_zero)$/) && uint(ordinal) && uint(slot) && uint(retry)) emit("RUST_GRAPH_OPERATION_DIAGNOSTIC " tuple)
+      }
+      next
+    }
     /managed startup unavailable / {
       tuple=$0; sub(/^.*managed startup unavailable /,"",tuple)
       if (tuple ~ /^stage=(load_config|host_open) code=[a-z_]+ cause=(unclassified|deadline|canceled|bootstrap_pending|learner_pending|application_pending|required_root_unavailable|source_prefix_mismatch|identity_mismatch|unresolved_certified_history|pending_graph_state|graph_commit_unknown|budget_refusal)$/) {
@@ -154,6 +174,24 @@ if [ "${1-}" = --diagnostic-self-test ]; then
     run_contract rust-restart sh -c 'printf "managed startup unavailable stage=load_config code=internal cause=%s\n" "$1"' sh "$cause"
     grep -Fx "MANAGED_STARTUP_DIAGNOSTIC stage=load_config code=internal cause=$cause" "$diag_dir/active.log" >/dev/null
   done
+  for startup_stage in target_inspect core_open archive_recover pair_select pair_reconstruct pair_install runtime_verify open_complete not_observed; do
+    run_contract rust-restart sh -c 'printf "GRAPH_STARTUP_DIAGNOSTIC last_stage=%s\n" "$1"' sh "$startup_stage"
+    grep -Fx "GRAPH_STARTUP_DIAGNOSTIC last_stage=$startup_stage" "$diag_dir/active.log" >/dev/null
+  done
+  run_contract rust-restart sh -c 'printf "%s\n" \
+    "2026/11/03 12:00:00 managed operation unavailable operation=graph_execute code=commit_unknown cause=canceled context_known=true slot=17 retry=1041" \
+    "GRAPH_STEP_DIAGNOSTIC graph_step stage=graph_execute ordinal=2 code=commit_unknown context_known=true slot=0 retry=18446744073709551615" \
+    "FAIL: managed-ha-contract graph_step stage=sql_tuple ordinal=0 code=commit_unknown context_known=false slot=0 retry=0" \
+    "GRAPH_STARTUP_DIAGNOSTIC last_stage=pair_install secret-DO-NOT-RETAIN" \
+    "GRAPH_STARTUP_DIAGNOSTIC last_stage=invalid" \
+    "managed operation unavailable operation=graph_execute code=commit_unknown cause=canceled context_known=true slot=17 retry=1041 secret-DO-NOT-RETAIN" \
+    "FAIL: managed-ha-contract graph_step stage=sql_tuple ordinal=0 code=commit_unknown context_known=false slot=0 retry=0 secret-DO-NOT-RETAIN" \
+    "GRAPH_STEP_DIAGNOSTIC graph_step stage=private ordinal=1 code=internal context_known=false slot=0 retry=0"'
+  grep -Fx 'MANAGED_OPERATION_DIAGNOSTIC operation=graph_execute code=commit_unknown cause=canceled context_known=true slot=17 retry=1041' "$diag_dir/active.log" >/dev/null
+  grep -Fx 'RUST_GRAPH_OPERATION_DIAGNOSTIC stage=graph_execute ordinal=2 code=commit_unknown context_known=true slot=0 retry=18446744073709551615' "$diag_dir/active.log" >/dev/null
+  grep -Fx 'RUST_GRAPH_OPERATION_DIAGNOSTIC stage=sql_tuple ordinal=0 code=commit_unknown context_known=false slot=0 retry=0' "$diag_dir/active.log" >/dev/null
+  if grep -E 'DO-NOT-RETAIN|stage=private|last_stage=invalid|last_stage=pair_install' "$diag_dir/active.log"; then exit 1; fi
+  [ "$before" = "$(cksum "$diag_dir/first.log")" ]
   if run_contract rust-initial sh -c 'i=0; while [ "$i" -lt 4000 ]; do echo "FAIL: managed-ha-contract prior_ack_marker_missing"; i=$((i+1)); done; exit 9' >/dev/null 2>&1; then exit 1; else [ "$?" = 9 ]; fi
   [ "$(wc -c < "$diag_dir/first.log")" -le 65536 ]
   [ "$(cat "$diag_dir/rust-initial.exit")" = 9 ]

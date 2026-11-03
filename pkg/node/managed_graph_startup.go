@@ -10,6 +10,7 @@ import (
 	"os"
 	"path/filepath"
 
+	"github.com/mrchypark/rhiza/internal/localtesthooks"
 	"github.com/mrchypark/rhiza/internal/sqlpolicy"
 	"github.com/mrchypark/rhiza/pkg/materializer"
 	"github.com/mrchypark/rhiza/pkg/quepaxa"
@@ -37,6 +38,9 @@ func (n *Node) reconstructManagedGraphStartup(ctx context.Context, core *quepaxa
 }
 
 func (n *Node) reconstructManagedGraphStartupAt(ctx context.Context, core *quepaxa.Core, expected *materializer.ManagedGraphInstallCut) (result *managedGraphStartupProjection, resultErr error) {
+	if localtesthooks.Enabled {
+		localtesthooks.Hit("node:managed-graph-startup:pair_reconstruct")
+	}
 	if n.lock == nil || n.wal == nil || core == nil || n.core != core || n.managedStartup == nil || n.materializationPolicy() != sqlpolicy.ManagedGraphRequestMaterializationPolicy {
 		return nil, fmt.Errorf("managed Graph reconstruction requires locked startup")
 	}
@@ -245,6 +249,9 @@ func (n *Node) installManagedGraphStartup(ctx context.Context, core *quepaxa.Cor
 	if err := n.validateManagedGraphProjectionCut(core, projection); err != nil {
 		return nil, err
 	}
+	if localtesthooks.Enabled {
+		localtesthooks.Hit("node:managed-graph-startup:pair_install")
+	}
 	return materializer.OpenManagedGraphFromVerifiedPair(ctx, filepath.Join(n.config.DataDir, "sqlite.db"), 4, materializer.ManagedGraphInstall{Cut: projection.cut, Files: projection.files})
 }
 
@@ -331,6 +338,9 @@ func (n *Node) resumeManagedGraphStartupInstall(ctx context.Context, core *quepa
 	}
 	// These are the observed fixed owned input files, not freshly reconstructed
 	// physical snapshots. The reconstruction above authenticates original C/T.
+	if localtesthooks.Enabled {
+		localtesthooks.Hit("node:managed-graph-startup:pair_install")
+	}
 	opened, err = materializer.OpenManagedGraphFromVerifiedPair(ctx, dbPath, 4, materializer.ManagedGraphInstall{Cut: attempt.Cut, Files: current.InstallAttempt.Files})
 	if err != nil {
 		return nil, err

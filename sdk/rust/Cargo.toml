@@ -14,7 +14,8 @@ include = [
     "LICENSE",
     "README.md",
     "build.rs",
-    "examples/**",
+    # The HA/operator examples are repository-only CI fixture executables.
+    "examples/embedded.rs",
     "scripts/**",
     "src/**",
     "native/**",
