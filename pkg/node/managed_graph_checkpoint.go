@@ -275,6 +275,9 @@ func (n *Node) waitManagedAppendOnlyControl(ctx context.Context, binding *intern
 		return fmt.Errorf("managed append-only admission binding unavailable")
 	}
 	progress := n.core.RuntimeProgressSnapshot()
+	if budget := managedControlObservationBudgetFromContext(ctx); budget != nil && budget.used.Load() && progress.RecorderTip > progress.CertifiedTip {
+		return n.refuseManagedGraphAdmissionAtReason("observation_recheck_budget_exhausted", progress.RecorderTip, progress)
+	}
 	n.managedGraphControlMu.Lock()
 	if settled := n.managedGraphControl; settled != nil {
 		select {
@@ -335,7 +338,7 @@ func (n *Node) waitManagedAppendOnlyControl(ctx context.Context, binding *intern
 			if !bindingCurrent || binding.lifetime.Err() != nil || ctx.Err() != nil || !n.opened.Load() || n.terminalRequested.Load() || !n.core.CanParticipateReadIndex() || n.server == nil || n.material == nil || n.wal == nil {
 				return n.refuseManagedGraphAdmissionAtReason("observation_recheck_binding_unavailable", progress.RecorderTip, progress)
 			}
-			if _, runtimeErr := n.checkInternalApplicationRuntime(ctx); runtimeErr != nil {
+			if _, runtimeErr := n.checkInternalApplicationRuntimeOnce(ctx); runtimeErr != nil {
 				return errors.Join(err, runtimeErr)
 			}
 			if progress.RecorderTip != progress.CertifiedTip+1 || progress.RecorderTip == 0 {
@@ -347,7 +350,7 @@ func (n *Node) waitManagedAppendOnlyControl(ctx context.Context, binding *intern
 			}
 			if advanced {
 				localtesthooks.Hit("node:managed-control:validated-prefix-rechecked")
-				return nil
+				return n.refuseSpentManagedControlObservationBudget(ctx)
 			}
 		}
 		return n.refuseManagedGraphAdmissionAtReason("core_observation_rejected", progress.RecorderTip, progress)
@@ -517,13 +520,16 @@ func (n *Node) waitManagedAppendOnlyBarrier(ctx context.Context, target quepaxa.
 	if !ok || decision.Hash != op.hash || !bytes.Equal(decision.Value, op.value) {
 		return n.refuseManagedGraphAdmissionAtReason("observed_control_certificate_mismatch", target, n.core.RuntimeProgressSnapshot())
 	}
-	return nil
+	return n.refuseSpentManagedControlObservationBudget(ctx)
 }
 
 // Wait only when the exact highest recorder value is the live checkpoint
 // publisher's operation. Recorder state by itself never grants admission.
 func (n *Node) waitManagedGraphOwnedControl(ctx context.Context, binding *internalApplicationBinding, target quepaxa.Slot) error {
 	progress := n.core.RuntimeProgressSnapshot()
+	if budget := managedControlObservationBudgetFromContext(ctx); budget != nil && budget.used.Load() && progress.RecorderTip > progress.CertifiedTip {
+		return n.refuseManagedGraphAdmissionAtReason("observation_recheck_budget_exhausted", progress.RecorderTip, progress)
+	}
 	n.managedGraphControlMu.Lock()
 	op := n.managedGraphControl
 	if op == nil {
@@ -575,7 +581,7 @@ func (n *Node) waitAndVerifyManagedGraphOwnedControl(ctx context.Context, target
 	if !ok || decision.Hash != op.hash || !bytes.Equal(decision.Value, op.value) {
 		return n.refuseManagedGraphAdmissionAtReason("owned_checkpoint_certificate_mismatch", target, n.core.RuntimeProgressSnapshot())
 	}
-	return nil
+	return n.refuseSpentManagedControlObservationBudget(ctx)
 }
 
 func (n *Node) refuseManagedGraphAdmissionAt(target quepaxa.Slot, progress quepaxa.RuntimeProgress) error {

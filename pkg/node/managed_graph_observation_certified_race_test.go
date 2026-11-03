@@ -15,6 +15,7 @@ import (
 	"github.com/mrchypark/rhiza/internal/localtesthooks"
 	"github.com/mrchypark/rhiza/internal/types"
 	"github.com/mrchypark/rhiza/pkg/checkpoint"
+	"github.com/mrchypark/rhiza/pkg/network"
 	"github.com/mrchypark/rhiza/pkg/quepaxa"
 )
 
@@ -264,6 +265,74 @@ func testManagedGraphBindingDriftAfterPrefixAdvance(t *testing.T, initial bool) 
 	}
 	if graphProposals.Load() != 0 || fixture.node.core.Tip() != 9 || fixture.node.material.Tip() != 8 {
 		t.Fatalf("binding drift allowed application work or replay: proposals=%d certified=%d applied=%d", graphProposals.Load(), fixture.node.core.Tip(), fixture.node.material.Tip())
+	}
+}
+
+func TestManagedGraphAdmissionPrefixFallbackFailsClosedOnUnstableRuntimeSample(t *testing.T) {
+	fixture := newManagedGraphAdmissionRaceFixture(t)
+	t.Cleanup(fixture.transport.releaseHeld)
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	ctx = WithManagedControlObservationBudget(ctx)
+	budget := managedControlObservationBudgetFromContext(ctx)
+
+	barrier := managedGraphRaceControlValue()
+	owner := fixture.startHeldValue(ctx, barrier)
+	fixture.awaitPendingControl(t)
+	entered, resume := make(chan struct{}), make(chan struct{})
+	var enteredOnce, resumeOnce sync.Once
+	defer resumeOnce.Do(func() { close(resume) })
+	var runtimeSamples atomic.Int32
+	var proposalSlot quepaxa.Slot
+	var proposalErr error
+	var readTipsAtFallback atomic.Int32
+	restore := localtesthooks.Set(func(event string) {
+		switch event {
+		case "core:managed-control:before-snapshot-recheck":
+			enteredOnce.Do(func() { close(entered) })
+			<-resume
+		case "node:managed-runtime-state:after-certified-tip":
+			if runtimeSamples.Add(1) == 2 {
+				readTipsAtFallback.Store(fixture.transport.readTipCalls.Load())
+				var nonce [types.ReadBarrierNonceSize]byte
+				nonce[0] = 0x7f
+				proposalSlot, _, proposalErr = fixture.node.core.Propose(ctx, types.EncodeReadBarrier(nonce))
+			}
+		}
+	})
+	t.Cleanup(restore)
+
+	result := make(chan error, 1)
+	go func() { result <- fixture.node.admitInternalApplication(ctx) }()
+	select {
+	case <-entered:
+	case <-ctx.Done():
+		t.Fatal("actual observer did not reach its final validation boundary", ctx.Err())
+	}
+	fixture.transport.releaseHeld()
+	if err := awaitProposal(t, owner); err != nil {
+		t.Fatalf("actual slot-9 control did not certify: %v", err)
+	}
+	decision, ok := fixture.node.core.CertifiedValue(9)
+	if !ok || decision.Hash != quepaxa.ValueHash(sha256.Sum256(barrier)) || !bytes.Equal(decision.Value, barrier) {
+		t.Fatalf("fallback lacks exact actual slot-9 certificate: found=%t decision=%+v", ok, decision)
+	}
+	resumeOnce.Do(func() { close(resume) })
+	var err error
+	select {
+	case err = <-result:
+	case <-ctx.Done():
+		t.Fatal("unstable fallback sample did not fail promptly", ctx.Err())
+	}
+	if proposalErr != nil || proposalSlot != 10 || !errors.Is(err, network.ErrNotReady) || runtimeSamples.Load() != 2 || !budget.used.Load() {
+		t.Fatalf("fallback did not stop on its first unstable runtime sample: slot=%d proposal_err=%v err=%v samples=%d budget_used=%t", proposalSlot, proposalErr, err, runtimeSamples.Load(), budget.used.Load())
+	}
+	certified, ok := fixture.node.core.CertifiedValue(10)
+	if !ok || certified.Hash != quepaxa.ValueHash(sha256.Sum256(types.EncodeReadBarrier([types.ReadBarrierNonceSize]byte{0x7f}))) || fixture.node.core.Tip() != 10 || fixture.node.material.Tip() != 8 {
+		t.Fatalf("inter-sample certification or fail-closed no-replay state differs: found=%t tip=%d applied=%d", ok, fixture.node.core.Tip(), fixture.node.material.Tip())
+	}
+	if fixture.transport.readTipCalls.Load() != readTipsAtFallback.Load() {
+		t.Fatalf("unstable fallback performed another ReadIndex: before=%d after=%d", readTipsAtFallback.Load(), fixture.transport.readTipCalls.Load())
 	}
 }
 
