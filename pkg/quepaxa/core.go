@@ -874,6 +874,13 @@ func (c *Core) checkpointEpochLocked(index Slot) (uint64, Slot, uint64) {
 func (c *Core) validateCheckpointLeaderOrders(index Slot, next, following []NodeID) bool {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
+	return c.validateCheckpointLeaderOrdersLocked(index, next, following)
+}
+
+// validateCheckpointLeaderOrdersLocked validates the same historical schedule
+// for callers that already hold c.mu. Keeping this separate avoids recursive
+// RWMutex reads, which can deadlock when a writer queues between acquisitions.
+func (c *Core) validateCheckpointLeaderOrdersLocked(index Slot, next, following []NodeID) bool {
 	cluster := c.clusterForSlotLocked(index + 1)
 	if !validateLeaderSchedule(cluster, next) {
 		return false

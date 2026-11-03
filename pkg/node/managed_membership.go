@@ -4,7 +4,9 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"log"
 	"path"
 	"reflect"
 	"strings"
@@ -194,7 +196,30 @@ func (n *Node) runManagedMembership(ctx context.Context, r ManagedMembershipRequ
 	}
 	change := r.change(string(n.config.ClusterID))
 	ctx = context.WithValue(ctx, managedMembershipPermitKey{}, managedMembershipPermit{request: r, change: change, capture: capture})
-	return n.server.ChangeMembership(ctx, change)
+	err := n.server.ChangeMembership(ctx, change)
+	if err != nil && r.Action == ManagedMembershipAdd {
+		log.Printf("MANAGED_MEMBERSHIP_FAILURE action=add cause=%s", managedMembershipCauseClass(err))
+	}
+	return err
+}
+
+func managedMembershipCauseClass(err error) string {
+	switch {
+	case errors.Is(err, context.Canceled):
+		return "canceled"
+	case errors.Is(err, context.DeadlineExceeded):
+		return "deadline"
+	case errors.Is(err, network.ErrNotReady):
+		return "not_ready"
+	case errors.Is(err, network.ErrInvalidRequest):
+		return "invalid_request"
+	case errors.Is(err, network.ErrRequestConflict):
+		return "request_conflict"
+	case errors.Is(err, quepaxa.ErrQuorumUnavailable):
+		return "quorum_unavailable"
+	default:
+		return "other"
+	}
 }
 
 // A package-private capability routes this operation through Server's existing

@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"slices"
 
+	"github.com/mrchypark/rhiza/internal/localtesthooks"
 	"github.com/mrchypark/rhiza/pkg/qlog"
 )
 
@@ -179,8 +180,14 @@ func (c *Core) validateManagedCheckpointRootLocal(candidate ManagedCheckpointCan
 		if seal.ConfigID != c.clusterForSlotLocked(seal.Index+1).ConfigID {
 			return fmt.Errorf("managed checkpoint cut config differs from available local history")
 		}
-	} else if seal.Membership != nil || seal.ConfigID != c.config.ConfigID || !c.validateCheckpointLeaderOrders(seal.Index, seal.NextLeaderOrder, seal.FollowingLeaderOrder) {
-		return fmt.Errorf("managed checkpoint cut differs from fixed historical membership")
+	} else {
+		if seal.Membership != nil || seal.ConfigID != c.config.ConfigID {
+			return fmt.Errorf("managed checkpoint cut differs from fixed historical membership")
+		}
+		localtesthooks.Hit("core:managed-checkpoint-fixed-membership-under-read-lock")
+		if !c.validateCheckpointLeaderOrdersLocked(seal.Index, seal.NextLeaderOrder, seal.FollowingLeaderOrder) {
+			return fmt.Errorf("managed checkpoint cut differs from fixed historical membership")
+		}
 	}
 	return nil
 }

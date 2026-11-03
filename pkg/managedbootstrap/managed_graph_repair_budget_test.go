@@ -34,7 +34,7 @@ func TestManagedGraphRepairControlRetainsTrustedLargeValueBudget(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	mat, err := materializer.OpenManagedSQLKVGraphWithOriginals(filepath.Join(t.TempDir(), "sqlite.db"), 1, 1024)
+	mat, err := materializer.OpenManagedSQLKVGraphWithOriginals(filepath.Join(t.TempDir(), "sqlite.db"), 1, types.DefaultIdempotencyWindowSlots)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -124,7 +124,7 @@ func TestManagedGraphRepairControlRetainsTrustedLargeValueBudget(t *testing.T) {
 	if err := archive.SyncThrough(ctx, core, core.Tip()); err != nil {
 		t.Fatal(err)
 	}
-	view, err := recovery.OpenReadOnlyViewForPolicyWithReconfiguration(ctx, bucket, "graph-repair", 1, cluster, sqlpolicy.ManagedGraphRequestMaterializationPolicy, 1024, true)
+	view, err := recovery.OpenReadOnlyViewForApplicationProtocol(ctx, bucket, "graph-repair", 1, cluster, sqlpolicy.ManagedGraphRequestMaterializationPolicy, types.DefaultIdempotencyWindowSlots, sqlpolicy.ManagedGraphRequestAppendOnlyApplicationProtocol, true)
 	if err != nil {
 		t.Fatal(err)
 	}

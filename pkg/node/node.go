@@ -2178,9 +2178,24 @@ func (n *Node) replayLocalDecisions(ctx context.Context) error {
 	return err
 }
 
+// replayLocalDecisionsThrough applies one fixed continuous certified prefix.
+// It is used by admission recovery after observing a stable Core tip; callers
+// must not extend the bound if consensus advances while replay is in progress.
+func (n *Node) replayLocalDecisionsThrough(ctx context.Context, through quepaxa.Slot) error {
+	if through == 0 {
+		return fmt.Errorf("bounded local replay requires a positive certified prefix")
+	}
+	_, err := n.replayLocalDecisionsTo(ctx, through)
+	return err
+}
+
 // The diagnostic variant retains the exact failed local replay page under the
 // same replay owner; callers must not reconstruct it from a later live tip.
 func (n *Node) replayLocalDecisionsFrom(ctx context.Context) (quepaxa.Slot, error) {
+	return n.replayLocalDecisionsTo(ctx, 0)
+}
+
+func (n *Node) replayLocalDecisionsTo(ctx context.Context, through quepaxa.Slot) (quepaxa.Slot, error) {
 	// Archive catch-up and checkpoint verification can both request local
 	// replay. Keep the tip read, decision selection, apply, and restore-suffix
 	// state transition under one owner so neither path races or replays stale
@@ -2189,9 +2204,23 @@ func (n *Node) replayLocalDecisionsFrom(ctx context.Context) (quepaxa.Slot, erro
 	defer n.replayMu.Unlock()
 	for {
 		from := quepaxa.Slot(n.material.Tip() + 1)
-		decisions, tip, err := n.core.DecisionsFrom(from, 256)
+		if through != 0 && from > through {
+			localtesthooks.Hit("node:replay-local-decisions-through:applied")
+			return 0, nil
+		}
+		limit := 256
+		if through != 0 {
+			remaining := through - from + 1
+			if remaining < quepaxa.Slot(limit) {
+				limit = int(remaining)
+			}
+		}
+		decisions, tip, err := n.core.DecisionsFrom(from, limit)
 		if err != nil {
 			return from, err
+		}
+		if len(decisions) == 0 && through != 0 && from <= through {
+			return from, fmt.Errorf("certified local replay made no progress through slot %d", through)
 		}
 		if n.localRestoreSuffixPending && localRestoreSuffixCrashBoundary != nil {
 			for _, decision := range decisions {
@@ -2203,9 +2232,22 @@ func (n *Node) replayLocalDecisionsFrom(ctx context.Context) (quepaxa.Slot, erro
 		} else if err := n.material.ApplyBatch(ctx, decisions); err != nil {
 			return from, err
 		}
-		if quepaxa.Slot(n.material.Tip()) >= tip {
-			n.localRestoreSuffixPending = false
+		applied := quepaxa.Slot(n.material.Tip())
+		if through != 0 && applied >= through {
+			if applied >= tip {
+				n.localRestoreSuffixPending = false
+			}
+			localtesthooks.Hit("node:replay-local-decisions-through:applied")
 			return 0, nil
+		}
+		if applied >= tip {
+			n.localRestoreSuffixPending = false
+			if through == 0 {
+				return 0, nil
+			}
+			if applied < through {
+				return from, fmt.Errorf("certified local history ended before fixed replay prefix %d", through)
+			}
 		}
 	}
 }

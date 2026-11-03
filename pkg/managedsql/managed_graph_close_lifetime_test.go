@@ -31,10 +31,18 @@ func TestManagedGraphCloseCancelsActiveBackgroundAdmissionResampling(t *testing.
 		}
 		hosts[i] = h
 	}
-	for _, h := range hosts {
-		if err := h.Ready(openCtx); err != nil {
-			t.Fatalf("initial Graph admission: %v", err)
-		}
+	// A policy-10 Graph Host is not locally Ready until the actual initial
+	// immutable root has been published. Drive that contract through a real
+	// first public mutation before testing cancellation of later admission.
+	warmup, err := hosts[0].GraphExecute(openCtx, types.GraphCommand{
+		RequestID: "close-resampling-initial-root",
+		Cypher:    "CREATE (:CloseResamplingInitialRoot {n:1})",
+	})
+	if err != nil || warmup.Slot == 0 || warmup.Status != types.MutationCommitted {
+		t.Fatalf("actual first Graph write did not publish the initial root: slot=%d status=%s err=%v", warmup.Slot, warmup.Status, err)
+	}
+	if err := hosts[0].Ready(openCtx); err != nil {
+		t.Fatalf("Graph Host not ready after its actual initial-root write: %v", err)
 	}
 
 	var armed atomic.Bool

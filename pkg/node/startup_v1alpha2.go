@@ -346,12 +346,9 @@ func (n *Node) admitInternalApplication(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	// The append-only publisher starts immediately after initial admission. A
-	// caller may pass the pre-ReadIndex check just before that publisher records
-	// its owned read barrier, then observe an older ReadIndex target. Recheck only
-	// when the fresh runtime snapshot proves a recorder/certificate gap; the
-	// existing helper joins or validates one exact control, after which we take a
-	// fresh quorum target, replay, and repeat the strict binding/history check.
+	// Preserve the existing recovery path for a real recorder/certificate gap.
+	// Certified but unapplied decisions are handled separately below with a
+	// fixed local prefix, so recorder data never becomes admission authority.
 	if state.RecorderTip > state.CertifiedTip && isManagedAppendOnlyProtocol(n.managedApplicationProtocol()) {
 		if err := n.waitManagedAppendOnlyControl(ctx, binding); err != nil {
 			return err
@@ -367,6 +364,19 @@ func (n *Node) admitInternalApplication(ctx context.Context) error {
 			return err
 		}
 		state, err = n.checkInternalApplicationRuntime(ctx)
+		if err != nil {
+			return err
+		}
+	}
+	if isManagedAppendOnlyProtocol(n.managedApplicationProtocol()) &&
+		state.RecorderTip == state.CertifiedTip && state.AppliedTip < state.CertifiedTip && uint64(target) <= state.CertifiedTip {
+		// ReadIndex is a lower bound, not an upper bound, on a safe local replay.
+		// Capture one continuous certified tip and never chase a later one here.
+		through := quepaxa.Slot(state.CertifiedTip)
+		if err := n.replayLocalDecisionsThrough(ctx, through); err != nil {
+			return err
+		}
+		state, err = n.checkInternalApplicationRuntimeOnce(ctx)
 		if err != nil {
 			return err
 		}

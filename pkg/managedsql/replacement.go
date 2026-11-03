@@ -2,16 +2,57 @@ package managedsql
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"log"
 	"reflect"
 	"slices"
 	"time"
 
 	"github.com/mrchypark/rhiza/internal/types"
+	"github.com/mrchypark/rhiza/pkg/network"
 	"github.com/mrchypark/rhiza/pkg/node"
 	"github.com/mrchypark/rhiza/pkg/operator"
 	"github.com/mrchypark/rhiza/pkg/quepaxa"
 )
+
+type repairResumeStage string
+
+const (
+	repairResumeRegistration repairResumeStage = "registration"
+	repairResumeMembership   repairResumeStage = "membership_add"
+	repairResumeVerification repairResumeStage = "verification"
+	repairResumeCompletion   repairResumeStage = "completion"
+)
+
+func managedRepairCauseClass(err error) string {
+	switch {
+	case errors.Is(err, context.Canceled):
+		return "canceled"
+	case errors.Is(err, context.DeadlineExceeded):
+		return "deadline"
+	case errors.Is(err, network.ErrNotReady):
+		return "not_ready"
+	case errors.Is(err, network.ErrInvalidRequest):
+		return "invalid_request"
+	case errors.Is(err, network.ErrRequestConflict):
+		return "request_conflict"
+	case errors.Is(err, quepaxa.ErrQuorumUnavailable):
+		return "quorum_unavailable"
+	default:
+		return "other"
+	}
+}
+
+func repairResumeFailure(stage repairResumeStage, err error) error {
+	if err == nil {
+		return nil
+	}
+	class := managedRepairCauseClass(err)
+	log.Printf("MANAGED_REPAIR_RESUME_FAILURE stage=%s cause=%s", stage, class)
+	// Keep the original public error value, message, and errors.Is behavior.
+	return err
+}
 
 // ReplaceVoter resumes only the exact closed replacement intent supplied by
 // the caller. It never proves physical death, executes pending SQL, or creates
@@ -93,42 +134,42 @@ func (h *Host) ReplaceVoter(ctx context.Context, plan operator.V1Alpha2RepairPla
 	}
 	learnerIdentity, err := h.waitRegisteredRepairLearner(ctx, plan.Replacement.NodeID, plan.Replacement.PublicKey)
 	if err != nil {
-		return err
+		return repairResumeFailure(repairResumeRegistration, err)
 	}
 	if err := h.AddRepairVoter(ctx, plan.OperationID, learnerIdentity); err != nil {
-		return fmt.Errorf("add registered learner: %w", err)
+		return repairResumeFailure(repairResumeMembership, fmt.Errorf("add registered learner: %w", err))
 	}
 	record := operator.V1Alpha2RepairRecord{Plan: plan, PreparedHandoff: &handoff}
 	request, err := managedRepairAddRequest(record, &handoff, learnerIdentity)
 	if err != nil {
-		return err
+		return repairResumeFailure(repairResumeVerification, err)
 	}
 	proof, err := h.node.VerifyManagedRepairCompletion(ctx, request)
 	if err != nil {
-		return err
+		return repairResumeFailure(repairResumeVerification, err)
 	}
 	completion, err := repairCompletion(plan, proof)
 	if err != nil {
-		return err
+		return repairResumeFailure(repairResumeVerification, err)
 	}
 	latest, err := h.live(ctx)
 	if err != nil {
-		return err
+		return repairResumeFailure(repairResumeCompletion, err)
 	}
 	closedRepair, ok := latest.Repair()
 	if !ok || closedRepair.State != "Closed" || !latest.SQLReservationsClosed() || !reflect.DeepEqual(closedRepair.Plan, plan) || closedRepair.PreparedHandoff == nil || !reflect.DeepEqual(*closedRepair.PreparedHandoff, handoff) {
-		return fmt.Errorf("exact live closed repair changed before completion")
+		return repairResumeFailure(repairResumeCompletion, fmt.Errorf("exact live closed repair changed before completion"))
 	}
 	finished, observation, err := operator.FinishV1Alpha2Repair(ctx, h.cfg.Store, latest, latest.Authority(), completion)
 	if err != nil {
-		return err
+		return repairResumeFailure(repairResumeCompletion, err)
 	}
 	if observation != operator.V1Alpha2CASApplied {
-		return fmt.Errorf("repair completion CAS outcome %s; refusing to report completion", observation)
+		return repairResumeFailure(repairResumeCompletion, fmt.Errorf("repair completion CAS outcome %s; refusing to report completion", observation))
 	}
 	finishedRepair, ok := finished.Repair()
 	if !ok || finishedRepair.State != "Completed" || finishedRepair.Completion == nil || !reflect.DeepEqual(*finishedRepair.Completion, completion) {
-		return fmt.Errorf("repair completion readback mismatch")
+		return repairResumeFailure(repairResumeCompletion, fmt.Errorf("repair completion readback mismatch"))
 	}
 	return nil
 }
