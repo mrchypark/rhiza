@@ -17,7 +17,7 @@ import (
 )
 
 func TestManagedGraphCloseCancelsActiveBackgroundAdmissionResampling(t *testing.T) {
-	configs, fixture := sqlClusterForProtocol(t, sqlpolicy.ManagedGraphRequestApplicationProtocol)
+	configs, fixture := sqlClusterForProtocol(t, sqlpolicy.ManagedGraphRequestAppendOnlyApplicationProtocol)
 	openCtx, openCancel := context.WithTimeout(context.Background(), 25*time.Second)
 	t.Cleanup(openCancel)
 	hosts := make([]*Host, len(configs))

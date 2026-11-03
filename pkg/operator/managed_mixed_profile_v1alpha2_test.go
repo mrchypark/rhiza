@@ -22,7 +22,7 @@ import (
 )
 
 func TestManagedApplicationExplicitProfileLoaders(t *testing.T) {
-	for _, protocol := range []string{types.ManagedApplicationProtocolSQLKV, sqlpolicy.ManagedRequestApplicationProtocol} {
+	for _, protocol := range []string{types.ManagedApplicationProtocolSQLKV, sqlpolicy.ManagedRequestAppendOnlyApplicationProtocol} {
 		t.Run(protocol, func(t *testing.T) {
 			cluster := strings.Replace(phase8Cluster, `"genesisIntent":"Create"`, `"genesisIntent":"Create","applicationProtocol":"`+protocol+`"`, 1)
 			server, store, name := phase8Setup(t, cluster, "")
@@ -64,7 +64,7 @@ func TestManagedApplicationExplicitProfileLoaders(t *testing.T) {
 			// Changing only the spec marker cannot relabel the bound plan.
 			other := types.ManagedApplicationProtocolSQLKV
 			if protocol == other {
-				other = sqlpolicy.ManagedRequestApplicationProtocol
+				other = sqlpolicy.ManagedRequestAppendOnlyApplicationProtocol
 			}
 			server.cluster = strings.Replace(server.cluster, `"applicationProtocol":"`+protocol+`"`, `"applicationProtocol":"`+other+`"`, 1)
 			if _, err := LoadV1Alpha2ApplicationInit(ctx, store, phase2Ref); err == nil {

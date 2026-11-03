@@ -127,13 +127,32 @@ func (n *Node) internalApplicationProfile() bool {
 	return n != nil && n.managedStartup != nil && (n.materializationPolicy() == sqlpolicy.ManagedRequestMaterializationPolicy || n.materializationPolicy() == sqlpolicy.ManagedGraphRequestMaterializationPolicy)
 }
 
-func inspectManagedFileForPolicy(ctx context.Context, file string, window uint64, expected sqlpolicy.MaterializationPolicy) (materializer.ManagedApplicationState, uint64, error) {
+func inspectManagedFileForPolicy(ctx context.Context, file string, window uint64, expected sqlpolicy.MaterializationPolicy, protocols ...string) (materializer.ManagedApplicationState, uint64, error) {
+	protocol := ""
+	if len(protocols) > 1 {
+		return materializer.ManagedApplicationState{}, 0, sqlpolicy.ErrIncompatible
+	}
+	if len(protocols) == 1 {
+		protocol = protocols[0]
+	}
 	switch expected {
 	case sqlpolicy.ManagedGraphRequestMaterializationPolicy:
 		// This inspects only the SQLite component. Paired native validation
 		// remains mandatory at the checkpoint/source boundary.
+		if protocol == sqlpolicy.ManagedGraphRequestAppendOnlyApplicationProtocol {
+			return materializer.InspectManagedAppendOnlyGraphSQLFile(ctx, file, window)
+		}
+		if protocol != "" && protocol != sqlpolicy.ManagedGraphRequestApplicationProtocol {
+			return materializer.ManagedApplicationState{}, 0, sqlpolicy.ErrIncompatible
+		}
 		return materializer.InspectManagedGraphSQLFile(ctx, file, window)
 	case sqlpolicy.ManagedRequestMaterializationPolicy:
+		if protocol == sqlpolicy.ManagedRequestAppendOnlyApplicationProtocol {
+			return materializer.InspectManagedAppendOnlyRequestFile(ctx, file, window)
+		}
+		if protocol != "" && protocol != sqlpolicy.ManagedRequestApplicationProtocol {
+			return materializer.ManagedApplicationState{}, 0, sqlpolicy.ErrIncompatible
+		}
 		return materializer.InspectManagedRequestFile(ctx, file, window)
 	case sqlpolicy.ManagedSQLKVMaterializationPolicy:
 		return materializer.InspectManagedApplicationFile(ctx, file, window)
@@ -159,8 +178,15 @@ func (n *Node) installInternalApplicationBinding(ctx context.Context) error {
 	}
 	i := n.managedStartup.Identity
 	expectedProtocol := sqlpolicy.ManagedRequestApplicationProtocol
-	if n.materializationPolicy() == sqlpolicy.ManagedGraphRequestMaterializationPolicy {
+	switch {
+	case n.materializationPolicy() == sqlpolicy.ManagedGraphRequestMaterializationPolicy:
 		expectedProtocol = sqlpolicy.ManagedGraphRequestApplicationProtocol
+	}
+	switch i.ApplicationProtocol {
+	case sqlpolicy.ManagedRequestAppendOnlyApplicationProtocol, sqlpolicy.ManagedGraphRequestAppendOnlyApplicationProtocol:
+		expectedProtocol = i.ApplicationProtocol
+	}
+	if n.materializationPolicy() == sqlpolicy.ManagedGraphRequestMaterializationPolicy {
 		if err := n.material.ProjectionReadable(ctx); err != nil {
 			return err
 		}
@@ -287,7 +313,12 @@ func (n *Node) admitInternalApplication(ctx context.Context) error {
 	if !n.managedInitiallyAdmitted.Load() || !n.core.CanParticipateReadIndex() {
 		return fmt.Errorf("internal application has no active voter admission")
 	}
-	if n.materializationPolicy() == sqlpolicy.ManagedGraphRequestMaterializationPolicy {
+	if isManagedAppendOnlyProtocol(n.managedApplicationProtocol()) {
+		if err := n.waitManagedAppendOnlyControl(ctx, binding); err != nil {
+			return err
+		}
+	}
+	if n.materializationPolicy() == sqlpolicy.ManagedGraphRequestMaterializationPolicy && !isManagedAppendOnlyProtocol(n.managedStartup.Identity.ApplicationProtocol) {
 		if err := n.ensureManagedGraphInitialRoot(ctx); err != nil {
 			return err
 		}
@@ -314,6 +345,31 @@ func (n *Node) admitInternalApplication(ctx context.Context) error {
 	state, err := n.checkInternalApplicationRuntime(ctx)
 	if err != nil {
 		return err
+	}
+	// The append-only publisher starts immediately after initial admission. A
+	// caller may pass the pre-ReadIndex check just before that publisher records
+	// its owned read barrier, then observe an older ReadIndex target. Recheck only
+	// when the fresh runtime snapshot proves a recorder/certificate gap; the
+	// existing helper joins or validates one exact control, after which we take a
+	// fresh quorum target, replay, and repeat the strict binding/history check.
+	if state.RecorderTip > state.CertifiedTip && isManagedAppendOnlyProtocol(n.managedApplicationProtocol()) {
+		if err := n.waitManagedAppendOnlyControl(ctx, binding); err != nil {
+			return err
+		}
+		target, _, err = n.core.ReadIndex(ctx)
+		if err != nil {
+			return err
+		}
+		if err := n.core.WaitTip(ctx, target); err != nil {
+			return err
+		}
+		if err := n.replayLocalDecisions(ctx); err != nil {
+			return err
+		}
+		state, err = n.checkInternalApplicationRuntime(ctx)
+		if err != nil {
+			return err
+		}
 	}
 	if state.CertifiedTip < uint64(target) || state.AppliedTip != state.CertifiedTip || state.RecorderTip > state.CertifiedTip {
 		if n.materializationPolicy() == sqlpolicy.ManagedGraphRequestMaterializationPolicy {
@@ -411,10 +467,12 @@ func (n *Node) OpenManaged(ctx context.Context, cfg ManagedStartupConfig) (resul
 	if err != nil {
 		return err
 	}
-	if policy == sqlpolicy.ManagedRequestMaterializationPolicy && (i.Member.Generation != 0 || i.ApplicationProtocol != sqlpolicy.ManagedRequestApplicationProtocol || i.EvidenceFormat != i.ApplicationProtocol) {
+	requestProtocol := i.ApplicationProtocol == sqlpolicy.ManagedRequestApplicationProtocol || i.ApplicationProtocol == sqlpolicy.ManagedRequestAppendOnlyApplicationProtocol
+	graphProtocol := i.ApplicationProtocol == sqlpolicy.ManagedGraphRequestApplicationProtocol || i.ApplicationProtocol == sqlpolicy.ManagedGraphRequestAppendOnlyApplicationProtocol
+	if policy == sqlpolicy.ManagedRequestMaterializationPolicy && (i.Member.Generation != 0 || !requestProtocol || i.EvidenceFormat != i.ApplicationProtocol) {
 		return fmt.Errorf("unsupported internal application generation or evidence format")
 	}
-	if policy == sqlpolicy.ManagedGraphRequestMaterializationPolicy && (i.Member.Generation != 0 || i.ApplicationProtocol != sqlpolicy.ManagedGraphRequestApplicationProtocol || i.EvidenceFormat != i.ApplicationProtocol) {
+	if policy == sqlpolicy.ManagedGraphRequestMaterializationPolicy && (i.Member.Generation != 0 || !graphProtocol || i.EvidenceFormat != i.ApplicationProtocol) {
 		return fmt.Errorf("unsupported Graph application generation or evidence format")
 	}
 	if managedSQLKVPolicy(policy) && (i.Member.Generation != 0 || i.EvidenceFormat != i.ApplicationProtocol) {
@@ -477,7 +535,7 @@ func (n *Node) OpenManaged(ctx context.Context, cfg ManagedStartupConfig) (resul
 		return fmt.Errorf("managed prepared application profile mismatch")
 	}
 	if cfg.Prepared != nil && managedSQLKVPolicy(policy) {
-		_, tip, err := inspectManagedFileForPolicy(ctx, filepath.Join(cfg.Prepared.Directory(), "sqlite.db"), window, policy)
+		_, tip, err := inspectManagedFileForPolicy(ctx, filepath.Join(cfg.Prepared.Directory(), "sqlite.db"), window, policy, i.ApplicationProtocol)
 		if err != nil || tip != uint64(cfg.Prepared.View().Tip()) {
 			return errors.Join(fmt.Errorf("managed prepared application window or tip mismatch"), err)
 		}
@@ -611,9 +669,15 @@ func (n *Node) validateExecutionPolicy(value []byte) error {
 
 func (n *Node) openMaterializer(path string, readers int) (*materializer.Materializer, error) {
 	if n.materializationPolicy() == sqlpolicy.ManagedGraphRequestMaterializationPolicy {
+		if n.managedApplicationProtocol() == sqlpolicy.ManagedGraphRequestAppendOnlyApplicationProtocol {
+			return materializer.OpenManagedSQLKVGraphWithAppendOnlyOriginals(path, readers, n.receiptWindow())
+		}
 		return materializer.OpenManagedSQLKVGraphWithOriginals(path, readers, n.receiptWindow())
 	}
 	if n.internalApplicationProfile() {
+		if n.managedApplicationProtocol() == sqlpolicy.ManagedRequestAppendOnlyApplicationProtocol {
+			return materializer.OpenManagedSQLKVWithAppendOnlyOriginals(path, readers, n.receiptWindow())
+		}
 		return materializer.OpenManagedSQLKVWithOriginals(path, readers, n.receiptWindow())
 	}
 	if managedSQLKVPolicy(n.materializationPolicy()) {
@@ -633,7 +697,7 @@ func (n *Node) validateCheckpointFiles(ctx context.Context, files []checkpoint.F
 			return err
 		}
 		defer func() { resultErr = errors.Join(resultErr, os.RemoveAll(stage)) }()
-		mat, err := materializer.OpenManagedSQLKVGraphWithOriginals(filepath.Join(stage, "sqlite.db"), 1, n.receiptWindow())
+		mat, err := n.openMaterializer(filepath.Join(stage, "sqlite.db"), 1)
 		if err != nil {
 			return err
 		}
@@ -656,7 +720,7 @@ func (n *Node) validateCheckpointFiles(ctx context.Context, files []checkpoint.F
 	if len(files) != 1 || files[0].Role != checkpoint.RoleSQLite {
 		return fmt.Errorf("mixed checkpoint requires exactly one SQLite file")
 	}
-	_, actual, err := inspectManagedFileForPolicy(ctx, files[0].Path, n.receiptWindow(), n.materializationPolicy())
+	_, actual, err := inspectManagedFileForPolicy(ctx, files[0].Path, n.receiptWindow(), n.materializationPolicy(), n.managedApplicationProtocol())
 	if err != nil {
 		return err
 	}
@@ -757,7 +821,7 @@ func (n *Node) EnsureInitialManagedAdmission(ctx context.Context) error {
 	if err := n.ensureInitialManagedAdmission(scoped); err != nil {
 		return err
 	}
-	if n.materializationPolicy() == sqlpolicy.ManagedGraphRequestMaterializationPolicy {
+	if n.materializationPolicy() == sqlpolicy.ManagedGraphRequestMaterializationPolicy && !isManagedAppendOnlyProtocol(n.managedStartup.Identity.ApplicationProtocol) {
 		return n.ensureManagedGraphInitialRoot(scoped)
 	}
 	return nil
@@ -815,6 +879,11 @@ func (n *Node) AdmitManaged(ctx context.Context) error {
 		return fmt.Errorf("managed runtime is not open")
 	}
 	n.managedAdmitted.Store(false)
+	if binding != nil && isManagedAppendOnlyProtocol(n.managedApplicationProtocol()) {
+		if err := n.waitManagedAppendOnlyControl(ctx, binding); err != nil {
+			return err
+		}
+	}
 	target, _, err := n.core.ReadIndex(ctx)
 	if err != nil {
 		return err
@@ -1200,7 +1269,7 @@ func (n *Node) verifyExistingManagedPreparedSQLBeforeOpen(ctx context.Context, p
 
 func (n *Node) inspectApplicationFile(ctx context.Context, path string) ([32]byte, uint64, error) {
 	if managedSQLKVPolicy(n.materializationPolicy()) {
-		state, tip, err := inspectManagedFileForPolicy(ctx, path, n.receiptWindow(), n.materializationPolicy())
+		state, tip, err := inspectManagedFileForPolicy(ctx, path, n.receiptWindow(), n.materializationPolicy(), n.managedApplicationProtocol())
 		return state.Digest, tip, err
 	}
 	state, tip, err := materializer.InspectSQLApplicationFile(ctx, path)
@@ -1499,11 +1568,30 @@ func (n *Node) recoverPreparedV1Alpha2WithLock(ctx context.Context, prepared *re
 		return fmt.Errorf("open target store: %w", err)
 	}
 	defer func() { resultErr = errors.Join(resultErr, bucket.Close()) }()
-	if err := ensureVoterIdentityManaged(ctx, n.config, bucket, wal, localVoter, false, true); err != nil {
-		return err
+	profile, profileErr := n.managedVoterProfileFor(n.config)
+	if profileErr != nil {
+		return profileErr
+	}
+	var identityErr error
+	if profile == nil {
+		identityErr = ensureVoterIdentityManaged(ctx, n.config, bucket, wal, localVoter, false, true)
+	} else {
+		identityErr = ensureVoterIdentityWithProfile(ctx, n.config, bucket, wal, localVoter, false, true, profile)
+	}
+	if identityErr != nil {
+		return identityErr
 	}
 	cluster := n.loadClusterConfig()
-	transport, err := network.NewTransportForPolicy(n.config.ClusterID, n.config.NodeID, cluster, n.config.PeerToken, n.materializationPolicy())
+	var transport *network.Transport
+	peerProfile, err := n.managedAppendOnlyProfile()
+	if err != nil {
+		return err
+	}
+	if peerProfile != nil {
+		transport, err = network.NewTransportForManagedProfile(n.config.ClusterID, n.config.NodeID, cluster, n.config.PeerToken, *peerProfile)
+	} else {
+		transport, err = network.NewTransportForPolicy(n.config.ClusterID, n.config.NodeID, cluster, n.config.PeerToken, n.materializationPolicy())
+	}
 	if err != nil {
 		return err
 	}

@@ -13,6 +13,7 @@ import (
 	"github.com/mrchypark/rhiza/internal/sqlpolicy"
 	"github.com/mrchypark/rhiza/internal/types"
 	"github.com/mrchypark/rhiza/pkg/network"
+	"github.com/mrchypark/rhiza/pkg/node"
 	"github.com/mrchypark/rhiza/pkg/operator"
 	"github.com/mrchypark/rhiza/pkg/quepaxa"
 )
@@ -60,7 +61,23 @@ func hostApplicationDecisionCount(t *testing.T, ctx context.Context, cfg Config,
 		policy = policies[0]
 	}
 	cluster := quepaxa.Cluster{ConfigID: 1, Members: cfg.Runtime.Members}
-	client, err := network.NewTransportForPolicy(cfg.Runtime.ClusterID, cfg.Runtime.NodeID, &cluster, cfg.Runtime.PeerToken, policy)
+	var client *network.Transport
+	var err error
+	if sqlpolicy.IsManagedAppendOnlyApplicationProtocol(cfg.Plan.ApplicationProtocol) {
+		identity := node.New(&cfg.Runtime)
+		physicalBinding, _, bindingErr := identity.PreparedStartupBindingDigestsForProtocol(cfg.Plan.ApplicationProtocol)
+		if bindingErr != nil {
+			t.Fatal("derive exact trusted profile binding for peer observer", bindingErr)
+		}
+		bootstrapDigest, digestErr := identity.ManagedBootstrapPlanDigestForProtocol(physicalBinding, cfg.Plan.EvidenceFormat, cfg.Plan.ApplicationProtocol)
+		if digestErr != nil || bootstrapDigest != cfg.Plan.BootstrapPlanDigest {
+			t.Fatalf("peer observer profile differs from exact public plan: digest=%q plan=%q err=%v", bootstrapDigest, cfg.Plan.BootstrapPlanDigest, digestErr)
+		}
+		profile := network.ManagedPeerProfile{ApplicationProtocol: cfg.Plan.ApplicationProtocol, BootstrapPlanDigest: bootstrapDigest, Generation: int64(cfg.Plan.Generation)}
+		client, err = network.NewTransportForManagedProfile(cfg.Runtime.ClusterID, cfg.Runtime.NodeID, &cluster, cfg.Runtime.PeerToken, profile)
+	} else {
+		client, err = network.NewTransportForPolicy(cfg.Runtime.ClusterID, cfg.Runtime.NodeID, &cluster, cfg.Runtime.PeerToken, policy)
+	}
 	if err != nil {
 		t.Fatal(err)
 	}

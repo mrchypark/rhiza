@@ -15,7 +15,7 @@ import (
 func (h *Host) graphReadNode(ctx context.Context) (*node.Node, error) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
-	if h.closed || h.cfg.Plan.ApplicationProtocol != sqlpolicy.ManagedGraphRequestApplicationProtocol || h.node == nil {
+	if h.closed || !sqlpolicy.IsManagedGraphRequestApplicationProtocol(h.cfg.Plan.ApplicationProtocol) || h.node == nil {
 		return nil, fmt.Errorf("managed Graph Host required")
 	}
 	if err := h.ensureInitialRequestAdmission(ctx); err != nil {
@@ -27,7 +27,7 @@ func (h *Host) graphReadNode(ctx context.Context) (*node.Node, error) {
 func (h *Host) GraphExecute(ctx context.Context, request types.GraphCommand) (network.GraphExecuteResponse, error) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
-	if h.closed || h.cfg.Plan.ApplicationProtocol != sqlpolicy.ManagedGraphRequestApplicationProtocol || h.node == nil {
+	if h.closed || !sqlpolicy.IsManagedGraphRequestApplicationProtocol(h.cfg.Plan.ApplicationProtocol) || h.node == nil {
 		return network.GraphExecuteResponse{}, network.ErrNotReady
 	}
 	frame, err := network.PrepareManagedGraphExecution(request)

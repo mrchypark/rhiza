@@ -28,7 +28,27 @@ const (
 
 const ManagedRequestApplicationProtocol = "rhiza-managed-request/v1"
 const ManagedGraphRequestApplicationProtocol = "rhiza-managed-request-graph/v1"
+const ManagedRequestAppendOnlyApplicationProtocol = "rhiza-managed-request-append-only/v1"
+const ManagedGraphRequestAppendOnlyApplicationProtocol = "rhiza-managed-request-graph-append-only/v1"
+
+// IsRetiredExperimentalApplicationProtocol identifies unreleased prototypes
+// that remain decodable for diagnosis but are not valid public startup profiles.
+func IsRetiredExperimentalApplicationProtocol(protocol string) bool {
+	return protocol == ManagedRequestApplicationProtocol || protocol == ManagedGraphRequestApplicationProtocol
+}
 const ManagedGraphRequestPeerALPN = "rhiza-peer-managed-request-graph-v1"
+
+func IsManagedRequestApplicationProtocol(protocol string) bool {
+	return protocol == ManagedRequestApplicationProtocol || protocol == ManagedRequestAppendOnlyApplicationProtocol
+}
+
+func IsManagedGraphRequestApplicationProtocol(protocol string) bool {
+	return protocol == ManagedGraphRequestApplicationProtocol || protocol == ManagedGraphRequestAppendOnlyApplicationProtocol
+}
+
+func IsManagedAppendOnlyApplicationProtocol(protocol string) bool {
+	return protocol == ManagedRequestAppendOnlyApplicationProtocol || protocol == ManagedGraphRequestAppendOnlyApplicationProtocol
+}
 
 func (p MaterializationPolicy) Validate() error {
 	if p != LegacyMaterializationPolicy && p != ManagedSQLKVMaterializationPolicy && p != ManagedRequestMaterializationPolicy && p != ManagedGraphRequestMaterializationPolicy {

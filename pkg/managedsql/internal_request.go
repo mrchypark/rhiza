@@ -11,7 +11,7 @@ import (
 )
 
 func (h *Host) internalRequests() bool {
-	return h.cfg.Plan.ApplicationProtocol == sqlpolicy.ManagedRequestApplicationProtocol || h.cfg.Plan.ApplicationProtocol == sqlpolicy.ManagedGraphRequestApplicationProtocol
+	return sqlpolicy.IsManagedRequestApplicationProtocol(h.cfg.Plan.ApplicationProtocol) || sqlpolicy.IsManagedGraphRequestApplicationProtocol(h.cfg.Plan.ApplicationProtocol)
 }
 
 // internalRequestContext scopes the complete lock-held operation to both its
@@ -147,7 +147,7 @@ func (h *Host) recoverRequestLocked(ctx context.Context, selector network.Reques
 	kind := types.MutationSQL
 	if selector.Kind == "kv" {
 		kind = types.MutationKV
-	} else if selector.Kind == "graph" && h.cfg.Plan.ApplicationProtocol == sqlpolicy.ManagedGraphRequestApplicationProtocol {
+	} else if selector.Kind == "graph" && sqlpolicy.IsManagedGraphRequestApplicationProtocol(h.cfg.Plan.ApplicationProtocol) {
 		kind = types.MutationGraph
 	} else if selector.Kind != "sql" {
 		return RecoveryResult{}, network.ErrInvalidRequest

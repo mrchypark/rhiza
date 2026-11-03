@@ -15,6 +15,7 @@ import (
 	"sync"
 	"sync/atomic"
 
+	"github.com/mrchypark/rhiza/internal/sqlpolicy"
 	"github.com/mrchypark/rhiza/internal/types"
 	"github.com/mrchypark/rhiza/pkg/network"
 	"github.com/mrchypark/rhiza/pkg/node"
@@ -77,7 +78,13 @@ func Open(ctx context.Context, cfg Config) (*Host, error) {
 	if cfg.Runtime.ObjStoreProvider == "" {
 		cfg.Runtime.ObjStoreProvider = "s3"
 	}
-	if operator.ValidateV1Alpha2ApplicationProfile(cfg.Plan.ApplicationProtocol, cfg.Plan.EvidenceFormat) != nil || cfg.Store == nil || cfg.PodUID == "" {
+	if err := operator.ValidateV1Alpha2ApplicationProfile(cfg.Plan.ApplicationProtocol, cfg.Plan.EvidenceFormat); err != nil {
+		if sqlpolicy.IsRetiredExperimentalApplicationProtocol(cfg.Plan.ApplicationProtocol) {
+			return nil, fmt.Errorf("unsupported managed startup profile: %w", err)
+		}
+		return nil, fmt.Errorf("exact SQL initialization plan, store, and Pod UID required")
+	}
+	if cfg.Store == nil || cfg.PodUID == "" {
 		return nil, fmt.Errorf("exact SQL initialization plan, store, and Pod UID required")
 	}
 	if cfg.Plan.ApplicationProtocol != "" && cfg.Plan.Generation != 0 {

@@ -86,6 +86,16 @@ func (n *Node) changeMembership(ctx context.Context, request network.MembershipC
 			if len(data) == 0 || json.Unmarshal(data, &registration) != nil || registration.Version != voterIdentityVersion || registration.Node != string(request.Add.ID) || registration.Cluster != request.ClusterID || registration.Nonce != request.Add.WALIdentity || registration.LearnerPublicKey != fmt.Sprintf("%x", request.Add.PublicKey[:]) {
 				return network.ErrInvalidRequest
 			}
+			candidateConfig := *n.config
+			candidateConfig.NodeID = request.Add.ID
+			candidateConfig.Learner = request.Add
+			profile, profileErr := n.managedVoterProfileFor(&candidateConfig)
+			if profileErr != nil {
+				return profileErr
+			}
+			if profile != nil && (registration.ApplicationProtocol != profile.ApplicationProtocol || registration.BootstrapPlanDigest != profile.BootstrapPlanDigest || registration.MemberConfigDigest != profile.MemberConfigDigest || registration.Generation == nil || *registration.Generation != profile.Generation) {
+				return fmt.Errorf("candidate voter append-only profile differs from the trusted group")
+			}
 		} else {
 			if !found || len(operation.Target.Members) == 0 || request.Remove == n.config.NodeID {
 				return network.ErrInvalidRequest
@@ -309,6 +319,13 @@ func (n *Node) validateRegisteredVoterWAL(ctx context.Context, id quepaxa.NodeID
 	}
 	var registration voterIdentity
 	if len(data) == 0 || json.Unmarshal(data, &registration) != nil || registration.Version != voterIdentityVersion || registration.Node != string(id) || registration.Cluster != string(n.config.ClusterID) || registration.Nonce != identity {
+		return network.ErrInvalidRequest
+	}
+	profile, err := n.managedVoterProfileFor(n.config)
+	if err != nil {
+		return err
+	}
+	if profile != nil && (registration.ApplicationProtocol != profile.ApplicationProtocol || registration.BootstrapPlanDigest != profile.BootstrapPlanDigest || registration.Generation == nil || *registration.Generation != profile.Generation || registration.MemberConfigDigest == "") {
 		return network.ErrInvalidRequest
 	}
 	return nil

@@ -124,6 +124,43 @@ func TestManagedGraphImmutableCandidateAndLocator(t *testing.T) {
 	if b.deletes != 0 {
 		t.Fatal("append-only publication deleted an object")
 	}
+	directBucket := &managedGraphPublicationBucket{Bucket: objstore.NewInMemBucket(), lostACK: true}
+	directManager, err := NewAppendOnlyManagerForPolicy(directBucket, "direct", t.TempDir(), sqlpolicy.ManagedGraphRequestMaterializationPolicy, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	appendOnlyRoot, err := directManager.CreateManagedAppendOnlyCandidate(ctx, sources, cut)
+	if err != nil || appendOnlyRoot.RootHash != root.RootHash {
+		t.Fatalf("direct candidate differs from immutable root: root=%v err=%v", appendOnlyRoot, err)
+	}
+	direct := ManagedAppendOnlyLocator{Policy: 10, Index: cut, RootHash: root.RootHash, SealDecisionSlot: cut + 1, SealDecisionHash: sha256.Sum256([]byte("direct-seal-1"))}
+	if err := directManager.PromoteManagedAppendOnlyLocator(ctx, direct); err != nil {
+		t.Fatalf("direct CURRENT lost-ACK readback failed: %v", err)
+	}
+	loaded, exists, err := directManager.LoadManagedAppendOnlyLocator(ctx, sqlpolicy.ManagedGraphRequestMaterializationPolicy)
+	if err != nil || !exists || loaded != direct {
+		t.Fatalf("direct locator differs: %+v %v", loaded, err)
+	}
+	// This is a pointer-CAS unit test only, not certificate evidence. It proves
+	// that distinct decision-slot ranks at one cut are ordered without allowing
+	// a lower locator to roll the discovery hint back.
+	higherSlot := direct
+	higherSlot.SealDecisionSlot++
+	higherSlot.SealDecisionHash = sha256.Sum256([]byte("direct-seal-2"))
+	if err := directManager.PromoteManagedAppendOnlyLocator(ctx, higherSlot); err != nil {
+		t.Fatalf("same-cut higher decision slot was rejected: %v", err)
+	}
+	if err := directManager.PromoteManagedAppendOnlyLocator(ctx, direct); !errors.Is(err, ErrStaleCheckpoint) {
+		t.Fatalf("late lower decision slot error=%v, want stale", err)
+	}
+	corruptRank := higherSlot
+	corruptRank.SealDecisionHash[0] ^= 1
+	if err := directManager.PromoteManagedAppendOnlyLocator(ctx, corruptRank); err == nil {
+		t.Fatal("equal-rank different decision hash was accepted")
+	}
+	if _, _, err := directManager.LoadManagedAppendOnlyLocator(ctx, sqlpolicy.ManagedRequestMaterializationPolicy); err == nil {
+		t.Fatal("locator crossed request and Graph profiles")
+	}
 	corrupt := []byte("bad")
 	key := "graph/checkpoint/blocks/corrupt"
 	if err := b.Bucket.Upload(ctx, key, bytes.NewReader(corrupt)); err != nil {

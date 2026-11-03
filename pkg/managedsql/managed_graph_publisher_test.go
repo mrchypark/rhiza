@@ -24,11 +24,11 @@ import (
 // Public Open/admission starts the product publisher. No test calls the
 // publisher directly or creates a claim/candidate/seal on its behalf.
 func TestManagedGraphPublicPublisherCreatesCertifiedPairAndSuffix(t *testing.T) {
-	testManagedGraphPublicPublisher(t, false)
+	testManagedGraphPublicPublisherWithProtocol(t, false, sqlpolicy.ManagedGraphRequestAppendOnlyApplicationProtocol)
 }
 
 func TestManagedGraphPublicRestartInstallsCertifiedPairAndSuffix(t *testing.T) {
-	testManagedGraphPublicPublisher(t, true)
+	testManagedGraphPublicPublisherWithProtocol(t, true, sqlpolicy.ManagedGraphRequestAppendOnlyApplicationProtocol)
 }
 
 func waitGraphHostPublicReady(t *testing.T, ctx context.Context, h *Host) {
@@ -47,8 +47,8 @@ func waitGraphHostPublicReady(t *testing.T, ctx context.Context, h *Host) {
 	}
 }
 
-func testManagedGraphPublicPublisher(t *testing.T, restart bool) {
-	configs, fixture := sqlClusterForProtocol(t, sqlpolicy.ManagedGraphRequestApplicationProtocol)
+func testManagedGraphPublicPublisherWithProtocol(t *testing.T, restart bool, protocol string) {
+	configs, fixture := sqlClusterForProtocol(t, protocol)
 	var holdNewRoots atomic.Bool
 	rootRelease := make(chan struct{})
 	var releaseRoots sync.Once

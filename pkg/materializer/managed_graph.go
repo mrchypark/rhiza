@@ -23,16 +23,35 @@ func OpenManagedSQLKVGraphWithOriginals(path string, readers int, window ...uint
 	return openWithProtocol(path, readers, sqlpolicy.ManagedGraphRequestApplicationProtocol, window...)
 }
 
+// OpenManagedSQLKVGraphWithAppendOnlyOriginals selects the explicit
+// append-only Graph profile while preserving policy 10 materialization.
+func OpenManagedSQLKVGraphWithAppendOnlyOriginals(path string, readers int, window ...uint64) (*Materializer, error) {
+	return openWithProtocol(path, readers, sqlpolicy.ManagedGraphRequestAppendOnlyApplicationProtocol, window...)
+}
+
 // InspectManagedGraphSQLFile validates only the SQLite component. It does not
 // establish native Graph provenance; startup must reconstruct the actual pair.
 func InspectManagedGraphSQLFile(ctx context.Context, path string, window uint64) (ManagedApplicationState, uint64, error) {
+	return inspectManagedGraphSQLFile(ctx, path, window, sqlpolicy.ManagedGraphRequestApplicationProtocol)
+}
+
+// InspectManagedAppendOnlyGraphSQLFile validates the SQLite component under
+// the exact append-only Graph protocol without upgrading or adopting files.
+func InspectManagedAppendOnlyGraphSQLFile(ctx context.Context, path string, window uint64) (ManagedApplicationState, uint64, error) {
+	return inspectManagedGraphSQLFile(ctx, path, window, sqlpolicy.ManagedGraphRequestAppendOnlyApplicationProtocol)
+}
+
+func inspectManagedGraphSQLFile(ctx context.Context, path string, window uint64, protocol string) (ManagedApplicationState, uint64, error) {
 	if window < 1024 || window > 1_048_576 {
 		return ManagedApplicationState{}, 0, fmt.Errorf("invalid Graph receipt window")
+	}
+	if !graphProtocol(protocol) {
+		return ManagedApplicationState{}, 0, fmt.Errorf("invalid Graph application protocol")
 	}
 	if err := ValidateCleanRestoreState(path); err != nil {
 		return ManagedApplicationState{}, 0, err
 	}
-	state, tip, err := inspectApplicationFile(ctx, path, window, sqlpolicy.ManagedGraphRequestApplicationProtocol)
+	state, tip, err := inspectApplicationFile(ctx, path, window, protocol)
 	return ManagedApplicationState(state), tip, err
 }
 
@@ -52,10 +71,10 @@ func (m *Materializer) ProjectionReadable(ctx context.Context) error {
 }
 
 func graphProtocol(protocol string) bool {
-	return protocol == sqlpolicy.ManagedGraphRequestApplicationProtocol
+	return sqlpolicy.IsManagedGraphRequestApplicationProtocol(protocol)
 }
 func originalsProtocol(protocol string) bool {
-	return protocol == sqlpolicy.ManagedRequestApplicationProtocol || graphProtocol(protocol)
+	return sqlpolicy.IsManagedRequestApplicationProtocol(protocol) || graphProtocol(protocol)
 }
 func originalsPolicy(policy sqlpolicy.MaterializationPolicy) bool {
 	return policy == sqlpolicy.ManagedRequestMaterializationPolicy || policy == sqlpolicy.ManagedGraphRequestMaterializationPolicy

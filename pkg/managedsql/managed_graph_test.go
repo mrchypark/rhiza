@@ -13,7 +13,7 @@ import (
 )
 
 func TestManagedGraphActualPublicHost(t *testing.T) {
-	configs, fixture := sqlClusterForProtocol(t, sqlpolicy.ManagedGraphRequestApplicationProtocol)
+	configs, fixture := sqlClusterForProtocol(t, sqlpolicy.ManagedGraphRequestAppendOnlyApplicationProtocol)
 	ctx, cancel := context.WithTimeout(context.Background(), 25*time.Second)
 	t.Cleanup(cancel)
 	hosts := make([]*Host, len(configs))
@@ -56,7 +56,7 @@ func TestManagedGraphActualPublicHost(t *testing.T) {
 }
 
 func TestManagedGraphRustOffsetMaxOnPublicHost(t *testing.T) {
-	configs, fixture := sqlClusterForProtocol(t, sqlpolicy.ManagedGraphRequestApplicationProtocol)
+	configs, fixture := sqlClusterForProtocol(t, sqlpolicy.ManagedGraphRequestAppendOnlyApplicationProtocol)
 	ctx, cancel := context.WithTimeout(context.Background(), 25*time.Second)
 	t.Cleanup(cancel)
 	hosts := make([]*Host, len(configs))

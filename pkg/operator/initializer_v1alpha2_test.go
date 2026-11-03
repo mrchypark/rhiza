@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"github.com/mrchypark/rhiza/internal/sqlpolicy"
 	"github.com/mrchypark/rhiza/internal/types"
 	"io"
 	"net/http"
@@ -33,7 +34,7 @@ type phase9Server struct {
 }
 
 func phase9RuntimeProfile() V1Alpha2RuntimeProfile {
-	return V1Alpha2RuntimeProfile{InitImage: "reference:v1", PeerPort: 9090, EvidenceFormat: V1Alpha2ManagedSQLEvidenceFormat, ProfileSecretName: "runtime", Storage: types.ExecutionConfig{AdminToken: "private-admin", ObjStoreProvider: "s3", ObjStoreBucket: "bucket", ObjStoreEndpoint: "s3.example.test"}}
+	return V1Alpha2RuntimeProfile{InitImage: "reference:v1", PeerPort: 9090, EvidenceFormat: sqlpolicy.ManagedRequestAppendOnlyApplicationProtocol, ApplicationProtocol: sqlpolicy.ManagedRequestAppendOnlyApplicationProtocol, ProfileSecretName: "runtime", Storage: types.ExecutionConfig{AdminToken: "private-admin", ObjStoreProvider: "s3", ObjStoreBucket: "bucket", ObjStoreEndpoint: "s3.example.test"}}
 }
 
 func phase9ManagedList(ctx context.Context, kube *Kubernetes) error {

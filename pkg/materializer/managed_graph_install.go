@@ -42,8 +42,22 @@ type ManagedGraphInstallCut struct {
 }
 
 type ManagedGraphInstall struct {
-	Cut   ManagedGraphInstallCut
-	Files []CheckpointFile
+	// ApplicationProtocol is exact profile evidence selected by the trusted
+	// caller. Empty preserves the existing request-Graph protocol.
+	ApplicationProtocol string
+	Cut                 ManagedGraphInstallCut
+	Files               []CheckpointFile
+}
+
+func managedGraphInstallProtocol(input ManagedGraphInstall) (string, error) {
+	protocol := input.ApplicationProtocol
+	if protocol == "" {
+		protocol = sqlpolicy.ManagedGraphRequestApplicationProtocol
+	}
+	if !graphProtocol(protocol) {
+		return "", fmt.Errorf("unsupported managed Graph install protocol")
+	}
+	return protocol, nil
 }
 
 // The optional journal branch leaves existing Local journal bytes unchanged.
@@ -69,6 +83,10 @@ func OpenManagedGraphFromVerifiedPair(ctx context.Context, dbPath string, reader
 	if err := validateManagedGraphInstall(input.Cut, readers); err != nil {
 		return nil, err
 	}
+	protocol, err := managedGraphInstallProtocol(input)
+	if err != nil {
+		return nil, err
+	}
 	path, err := filepath.Abs(dbPath)
 	if err != nil {
 		return nil, err
@@ -90,7 +108,7 @@ func OpenManagedGraphFromVerifiedPair(ctx context.Context, dbPath string, reader
 	if err := ValidateNoLocalRestore(path); err != nil {
 		return nil, err
 	}
-	if err := validateManagedGraphInstallTarget(ctx, path, input.Cut.IdempotencyWindow); err != nil {
+	if err := validateManagedGraphInstallTarget(ctx, path, input.Cut.IdempotencyWindow, protocol); err != nil {
 		return nil, err
 	}
 	files, descriptors, err := managedGraphInstallSources(path, input.Files)
@@ -116,13 +134,13 @@ func OpenManagedGraphFromVerifiedPair(ctx context.Context, dbPath string, reader
 		Protocol string
 		Cut      ManagedGraphInstallCut
 		Files    []localRestoreFile
-	}{sqlpolicy.ManagedGraphRequestApplicationProtocol, input.Cut, descriptors})
+	}{protocol, input.Cut, descriptors})
 	if err != nil {
 		return nil, err
 	}
 	j := localRestoreJournal{Version: 1, AttemptID: hex.EncodeToString(random[:]), Phase: "intent", Files: descriptors,
 		OriginalSQL: originalSQL, OriginalGraph: originalGraph, HadGraph: hadGraph,
-		ManagedGraph: &managedGraphInstallJournal{Version: 1, Protocol: sqlpolicy.ManagedGraphRequestApplicationProtocol, Cut: input.Cut, Digest: sha256.Sum256(encoded)}}
+		ManagedGraph: &managedGraphInstallJournal{Version: 1, Protocol: protocol, Cut: input.Cut, Digest: sha256.Sum256(encoded)}}
 	if err := hitLocalRestoreBoundary("managed:before-intent"); err != nil {
 		return nil, err
 	}
@@ -195,11 +213,11 @@ func runManagedGraphInstall(ctx context.Context, path string, readers int, input
 		}
 	}
 	// Only the owned stage is opened writable. The original target is untouched.
-	check, err := OpenManagedSQLKVGraphWithOriginals(filepath.Join(stage, "sqlite.db"), readers, input.Cut.IdempotencyWindow)
+	check, err := openWithProtocol(filepath.Join(stage, "sqlite.db"), readers, j.ManagedGraph.Protocol, input.Cut.IdempotencyWindow)
 	if err != nil {
 		return rollback(err)
 	}
-	err = validateManagedGraphInstalled(ctx, check, input.Cut)
+	err = validateManagedGraphInstalled(ctx, check, input.Cut, j.ManagedGraph.Protocol)
 	err = errors.Join(err, check.Close())
 	if err != nil {
 		return rollback(err)
@@ -267,9 +285,9 @@ func runManagedGraphInstall(ctx context.Context, path string, readers int, input
 	if err := hitLocalRestoreBoundary("managed:before-open"); err != nil {
 		return rollback(err)
 	}
-	opened, err := openMaterializerPolicy(path, readers, sqlpolicy.ManagedGraphRequestApplicationProtocol, input.Cut.IdempotencyWindow)
+	opened, err := openMaterializerPolicy(path, readers, j.ManagedGraph.Protocol, input.Cut.IdempotencyWindow)
 	if err == nil {
-		err = validateManagedGraphInstalled(ctx, opened, input.Cut)
+		err = validateManagedGraphInstalled(ctx, opened, input.Cut, j.ManagedGraph.Protocol)
 	}
 	if err != nil {
 		if opened != nil {
@@ -346,9 +364,9 @@ func finishManagedGraphInstall(ctx context.Context, path string, readers int, in
 	if err != nil {
 		return nil, err
 	}
-	opened, err := openMaterializerPolicy(path, readers, sqlpolicy.ManagedGraphRequestApplicationProtocol, input.Cut.IdempotencyWindow)
+	opened, err := openMaterializerPolicy(path, readers, j.ManagedGraph.Protocol, input.Cut.IdempotencyWindow)
 	if err == nil {
-		err = validateManagedGraphInstalled(ctx, opened, input.Cut)
+		err = validateManagedGraphInstalled(ctx, opened, input.Cut, j.ManagedGraph.Protocol)
 	}
 	if err != nil {
 		if opened != nil {
@@ -408,8 +426,8 @@ func validateManagedGraphInstall(cut ManagedGraphInstallCut, readers int) error 
 	return nil
 }
 
-func validateManagedGraphInstalled(ctx context.Context, m *Materializer, cut ManagedGraphInstallCut) error {
-	if m.Tip() != cut.CertifiedTip || m.idempotencyWindow != cut.IdempotencyWindow || !graphProtocol(m.managedProtocol) {
+func validateManagedGraphInstalled(ctx context.Context, m *Materializer, cut ManagedGraphInstallCut, protocol string) error {
+	if m.Tip() != cut.CertifiedTip || m.idempotencyWindow != cut.IdempotencyWindow || m.managedProtocol != protocol || !graphProtocol(protocol) {
 		return fmt.Errorf("installed Graph cut does not match certified tip/profile/window")
 	}
 	if err := m.ProjectionReadable(ctx); err != nil {
@@ -521,8 +539,8 @@ func verifyManagedGraphOriginals(path string, j localRestoreJournal) error {
 
 // Validate only recovery markers in the old pair. It is never the provenance
 // source and is not opened writable or silently healed by this installer.
-func validateManagedGraphInstallTarget(ctx context.Context, path string, window uint64) error {
-	state, err := InspectManagedGraphInstallTarget(ctx, path, window)
+func validateManagedGraphInstallTarget(ctx context.Context, path string, window uint64, protocol string) error {
+	state, err := InspectManagedGraphInstallTarget(ctx, path, window, protocol)
 	if err != nil {
 		return err
 	}
@@ -568,7 +586,17 @@ type ManagedGraphInstallAttemptObservation struct {
 // The caller excludes replacement and authenticates every Replay record against
 // its actual Core before allowing same-slot reconciliation. Absent is not a
 // genesis/admission signal; InventoryHash is observation, not authority.
-func InspectManagedGraphInstallTarget(ctx context.Context, dbPath string, window uint64) (state ManagedGraphTargetState, resultErr error) {
+func InspectManagedGraphInstallTarget(ctx context.Context, dbPath string, window uint64, protocols ...string) (state ManagedGraphTargetState, resultErr error) {
+	protocol := sqlpolicy.ManagedGraphRequestApplicationProtocol
+	if len(protocols) > 1 {
+		return state, fmt.Errorf("multiple managed Graph install protocols")
+	}
+	if len(protocols) == 1 {
+		protocol = protocols[0]
+	}
+	if !graphProtocol(protocol) {
+		return state, fmt.Errorf("unsupported managed Graph install protocol")
+	}
 	path, err := filepath.Abs(dbPath)
 	if err != nil {
 		return state, err
@@ -580,6 +608,9 @@ func InspectManagedGraphInstallTarget(ctx context.Context, dbPath string, window
 		j, err := readManagedGraphInstallJournal(path)
 		if err != nil {
 			return state, err
+		}
+		if j.ManagedGraph.Protocol != protocol {
+			return state, fmt.Errorf("managed install observation protocol differs")
 		}
 		if j.ManagedGraph.Cut.IdempotencyWindow != window {
 			return state, fmt.Errorf("managed install observation window differs")
@@ -604,7 +635,7 @@ func InspectManagedGraphInstallTarget(ctx context.Context, dbPath string, window
 	if window < 1024 || window > 1_048_576 {
 		return state, fmt.Errorf("invalid Graph receipt window")
 	}
-	if err := inspectManagedGraphInstallTarget(ctx, path, window, &state); err != nil {
+	if err := inspectManagedGraphInstallTarget(ctx, path, window, protocol, &state); err != nil {
 		return state, err
 	}
 	sql, err := inspectLocalOriginalSQL(path)
@@ -626,7 +657,7 @@ func InspectManagedGraphInstallTarget(ctx context.Context, dbPath string, window
 	return state, nil
 }
 
-func inspectManagedGraphInstallTarget(ctx context.Context, path string, window uint64, state *ManagedGraphTargetState) error {
+func inspectManagedGraphInstallTarget(ctx context.Context, path string, window uint64, protocol string, state *ManagedGraphTargetState) error {
 	info, statErr := os.Lstat(path)
 	graphPath := filepath.Join(filepath.Dir(path), "latticedb", "graph.ltdb")
 	_, graphErr := os.Lstat(graphPath)
@@ -651,7 +682,12 @@ func inspectManagedGraphInstallTarget(ctx context.Context, path string, window u
 			return fmt.Errorf("unrecognised previous native artifact %q; preserve it", item.Name)
 		}
 	}
-	_, tip, err := InspectManagedGraphSQLFile(ctx, path, window)
+	var tip uint64
+	if protocol == sqlpolicy.ManagedGraphRequestAppendOnlyApplicationProtocol {
+		_, tip, err = InspectManagedAppendOnlyGraphSQLFile(ctx, path, window)
+	} else {
+		_, tip, err = InspectManagedGraphSQLFile(ctx, path, window)
+	}
 	if err != nil {
 		return err
 	}
@@ -896,7 +932,7 @@ func readManagedGraphInstallJournal(path string) (localRestoreJournal, error) {
 	if err := decoder.Decode(new(any)); err != io.EOF {
 		return j, fmt.Errorf("managed install journal trailing data")
 	}
-	if j.ManagedGraph == nil || j.ManagedGraph.Version != 1 || j.ManagedGraph.Protocol != sqlpolicy.ManagedGraphRequestApplicationProtocol || j.LocalVersion != 0 || j.Version != 1 || len(j.AttemptID) != 32 || !isLowerHex(j.AttemptID) {
+	if j.ManagedGraph == nil || j.ManagedGraph.Version != 1 || !graphProtocol(j.ManagedGraph.Protocol) || j.LocalVersion != 0 || j.Version != 1 || len(j.AttemptID) != 32 || !isLowerHex(j.AttemptID) {
 		return j, fmt.Errorf("invalid managed install journal identity")
 	}
 	if err := validateManagedGraphInstall(j.ManagedGraph.Cut, 1); err != nil {
@@ -955,6 +991,10 @@ func recoverManagedGraphInstall(ctx context.Context, path string, readers int, i
 	if err != nil {
 		return nil, false, fmt.Errorf("preserve unverified managed install: %w", err)
 	}
+	protocol, err := managedGraphInstallProtocol(input)
+	if err != nil || protocol != j.ManagedGraph.Protocol {
+		return nil, false, fmt.Errorf("preserve managed install bound to a different application protocol")
+	}
 	files, descriptors, err := managedGraphInstallSources(path, input.Files)
 	if err != nil {
 		return nil, false, err
@@ -963,7 +1003,7 @@ func recoverManagedGraphInstall(ctx context.Context, path string, readers int, i
 		Protocol string
 		Cut      ManagedGraphInstallCut
 		Files    []localRestoreFile
-	}{sqlpolicy.ManagedGraphRequestApplicationProtocol, input.Cut, descriptors})
+	}{protocol, input.Cut, descriptors})
 	if err != nil {
 		return nil, false, err
 	}
@@ -1002,7 +1042,7 @@ func recoverManagedGraphInstall(ctx context.Context, path string, readers int, i
 	}
 	if j.Phase == "committed" || j.Phase == "final-opened" {
 		var state ManagedGraphTargetState
-		if err := inspectManagedGraphInstallTarget(ctx, path, input.Cut.IdempotencyWindow, &state); err != nil {
+		if err := inspectManagedGraphInstallTarget(ctx, path, input.Cut.IdempotencyWindow, protocol, &state); err != nil {
 			return nil, false, err
 		}
 		if len(state.Replay) != 0 || state.SQLiteTip != input.Cut.CertifiedTip || state.NativeHistory != input.Cut.ExpectedGraphHistory {
@@ -1156,6 +1196,10 @@ func validateManagedGraphAttemptTree(path, attempt string, j localRestoreJournal
 // inputs. Journal checksums are corruption detection, never a substitute for
 // producer provenance or permission to trust arbitrary native bytes.
 func verifyManagedGraphPhaseProjection(ctx context.Context, path string, readers int, input ManagedGraphInstall, j localRestoreJournal, files []CheckpointFile) (resultErr error) {
+	protocol, err := managedGraphInstallProtocol(input)
+	if err != nil || protocol != j.ManagedGraph.Protocol {
+		return fmt.Errorf("preserve Graph install projection bound to a different protocol")
+	}
 	attempt := localRestoreAttemptPath(path, j.AttemptID)
 	if err := ensureLocalRestoreDir(attempt); err != nil {
 		return err
@@ -1198,11 +1242,11 @@ func verifyManagedGraphPhaseProjection(ctx context.Context, path string, readers
 		}
 	}()
 	for i := 0; i < cycles; i++ {
-		opened, err = OpenManagedSQLKVGraphWithOriginals(filepath.Join(dir, "sqlite.db"), readers, input.Cut.IdempotencyWindow)
+		opened, err = openWithProtocol(filepath.Join(dir, "sqlite.db"), readers, protocol, input.Cut.IdempotencyWindow)
 		if err != nil {
 			return err
 		}
-		if err := validateManagedGraphInstalled(ctx, opened, input.Cut); err != nil {
+		if err := validateManagedGraphInstalled(ctx, opened, input.Cut, protocol); err != nil {
 			return err
 		}
 		if i+1 == cycles && live {

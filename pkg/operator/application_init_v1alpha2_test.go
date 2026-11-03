@@ -15,14 +15,14 @@ import (
 )
 
 func TestApplicationInitExplicitProtocolBoundary(t *testing.T) {
-	for _, protocol := range []string{"", types.ManagedApplicationProtocolSQLKV, sqlpolicy.ManagedRequestApplicationProtocol, "rhiza-managed-request/v2", "rhiza-managed-graph/v1", "unknown"} {
+	for _, protocol := range []string{"", types.ManagedApplicationProtocolSQLKV, sqlpolicy.ManagedRequestAppendOnlyApplicationProtocol, sqlpolicy.ManagedGraphRequestAppendOnlyApplicationProtocol, sqlpolicy.ManagedRequestApplicationProtocol, sqlpolicy.ManagedGraphRequestApplicationProtocol, "rhiza-managed-request/v2", "rhiza-managed-graph/v1", "unknown"} {
 		p := initTestPlan(t)
 		p.ApplicationProtocol = protocol
 		if protocol != "" {
 			p.EvidenceFormat = protocol
 		}
 		g := v1alpha2Genesis{OwnerUID: p.ClusterUID, DeploymentUID: p.DeploymentUID, StorageID: p.StorageID, IntentHash: p.IntentHash}
-		valid := protocol == "" || protocol == types.ManagedApplicationProtocolSQLKV || protocol == sqlpolicy.ManagedRequestApplicationProtocol
+		valid := protocol == "" || protocol == types.ManagedApplicationProtocolSQLKV || protocol == sqlpolicy.ManagedRequestAppendOnlyApplicationProtocol || protocol == sqlpolicy.ManagedGraphRequestAppendOnlyApplicationProtocol
 		if err := validateV1Alpha2ApplicationInitPlan(p, phase2Ref, g); (err == nil) != valid {
 			t.Fatalf("protocol=%q valid=%t error=%v", protocol, valid, err)
 		}

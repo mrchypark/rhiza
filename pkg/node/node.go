@@ -93,12 +93,13 @@ type Node struct {
 }
 
 type managedGraphControlOperation struct {
-	value   []byte
-	hash    quepaxa.ValueHash
-	binding *internalApplicationBinding
-	done    chan struct{}
-	slot    quepaxa.Slot
-	err     error
+	value       []byte
+	hash        quepaxa.ValueHash
+	binding     *internalApplicationBinding
+	observation *quepaxa.ManagedAppendOnlyControlObservation
+	done        chan struct{}
+	slot        quepaxa.Slot
+	err         error
 }
 
 // nodeRecoveryPhases records the selected certified checkpoint restore path.
@@ -513,8 +514,18 @@ func (n *Node) openInternal(ctx context.Context, enroll bool, prelocked *qlog.Lo
 				}
 			}
 		}
-		if err := ensureVoterIdentity(ctx, n.config, bucket, n.wal, localVoter, enroll, beforeWrite...); err != nil {
-			return err
+		profile, profileErr := n.managedVoterProfileFor(n.config)
+		if profileErr != nil {
+			return profileErr
+		}
+		var identityErr error
+		if profile == nil {
+			identityErr = ensureVoterIdentity(ctx, n.config, bucket, n.wal, localVoter, enroll, beforeWrite...)
+		} else {
+			identityErr = ensureVoterIdentityWithProfile(ctx, n.config, bucket, n.wal, localVoter, enroll, false, profile, beforeWrite...)
+		}
+		if identityErr != nil {
+			return identityErr
 		}
 		if n.fenceSession != nil && n.fenceSession.Identity().WALIdentity == "" {
 			return fmt.Errorf("supervised fencing requires registered voter WAL identity")
@@ -599,7 +610,7 @@ func (n *Node) openInternal(ctx context.Context, enroll bool, prelocked *qlog.Lo
 		if err != nil {
 			return err
 		}
-		managedGraphTarget, err = materializer.InspectManagedGraphInstallTarget(ctx, filepath.Join(n.config.DataDir, "sqlite.db"), n.receiptWindow())
+		managedGraphTarget, err = materializer.InspectManagedGraphInstallTarget(ctx, filepath.Join(n.config.DataDir, "sqlite.db"), n.receiptWindow(), n.managedGraphInstallProtocol())
 		if err != nil {
 			return err
 		}
@@ -643,8 +654,16 @@ func (n *Node) openInternal(ctx context.Context, enroll bool, prelocked *qlog.Lo
 	cluster := n.loadClusterConfig()
 	var transport *network.Transport
 	var coreTransport quepaxa.Transport
+	managedPeerProfile, profileErr := n.managedAppendOnlyProfile()
+	if profileErr != nil {
+		return profileErr
+	}
 	if !n.config.Local {
-		transport, err = network.NewTransportForPolicy(n.config.ClusterID, n.config.NodeID, cluster, n.config.PeerToken, n.materializationPolicy())
+		if managedPeerProfile != nil {
+			transport, err = network.NewTransportForManagedProfile(n.config.ClusterID, n.config.NodeID, cluster, n.config.PeerToken, *managedPeerProfile)
+		} else {
+			transport, err = network.NewTransportForPolicy(n.config.ClusterID, n.config.NodeID, cluster, n.config.PeerToken, n.materializationPolicy())
+		}
 		if err != nil {
 			return err
 		}
@@ -653,7 +672,11 @@ func (n *Node) openInternal(ctx context.Context, enroll bool, prelocked *qlog.Lo
 	n.transport = transport
 	if len(cluster.Members) > 1 {
 		n.catchUpWake = make(chan struct{}, 1)
-		n.catchUp, err = network.NewTransportForPolicy(n.config.ClusterID, n.config.NodeID, cluster, n.config.PeerToken, n.materializationPolicy())
+		if managedPeerProfile != nil {
+			n.catchUp, err = network.NewTransportForManagedProfile(n.config.ClusterID, n.config.NodeID, cluster, n.config.PeerToken, *managedPeerProfile)
+		} else {
+			n.catchUp, err = network.NewTransportForPolicy(n.config.ClusterID, n.config.NodeID, cluster, n.config.PeerToken, n.materializationPolicy())
+		}
 		if err != nil {
 			return err
 		}
@@ -684,12 +707,19 @@ func (n *Node) openInternal(ctx context.Context, enroll bool, prelocked *qlog.Lo
 	if deferredManagedGraph && localtesthooks.Enabled {
 		localtesthooks.Hit("node:managed-graph-startup:core_open")
 	}
-	core, err := makeCore(quepaxa.Config{
+	coreConfig := quepaxa.Config{
 		NodeID: n.config.NodeID, Cluster: *cluster, WAL: wal, Transport: coreTransport, LocalMode: n.config.Local,
 		EnableReconfiguration:    n.config.EnableReconfiguration,
 		ReconfigurationAdmission: n.verifyMembershipAdmission,
 		ValidateValue:            validateValue,
-	})
+	}
+	if managedPeerProfile != nil {
+		coreConfig.ManagedAppendOnly, err = n.managedAppendOnlyCoreConfig()
+		if err != nil {
+			return err
+		}
+	}
+	core, err := makeCore(coreConfig)
 	if err != nil {
 		return fmt.Errorf("create QuePaxa core: %w", err)
 	}
@@ -825,9 +855,18 @@ func (n *Node) openInternal(ctx context.Context, enroll bool, prelocked *qlog.Lo
 		if localtesthooks.Enabled {
 			localtesthooks.Hit("node:managed-graph-startup:pair_select")
 		}
-		_, hasSeal, sealErr := core.LatestCheckpointSeal()
-		if sealErr != nil {
-			return sealErr
+		hasSeal := false
+		if managedPeerProfile != nil {
+			_, selected, selectErr := n.selectManagedAppendOnlyRoot(ctx)
+			if selectErr != nil {
+				return selectErr
+			}
+			hasSeal = selected != nil
+		} else {
+			_, hasSeal, err = core.LatestCheckpointSeal()
+			if err != nil {
+				return err
+			}
 		}
 		if hasSeal {
 			material, err = n.installManagedGraphStartup(ctx, core, managedGraphTarget)
@@ -856,7 +895,12 @@ func (n *Node) openInternal(ctx context.Context, enroll bool, prelocked *qlog.Lo
 	}
 	// Record RPCs must be available while every replica is recovering. Public
 	// proposals and learned decisions remain gated by ready=false.
-	server, err := network.NewServerForPolicy(core, material, n.config.ClusterID, true, transport, n.materializationPolicy(), n.Ready)
+	var server *network.Server
+	if managedPeerProfile != nil {
+		server, err = network.NewServerForManagedProfile(core, material, n.config.ClusterID, true, transport, *managedPeerProfile, n.Ready)
+	} else {
+		server, err = network.NewServerForPolicy(core, material, n.config.ClusterID, true, transport, n.materializationPolicy(), n.Ready)
+	}
 	if err != nil {
 		return err
 	}
@@ -958,7 +1002,11 @@ func (n *Node) openInternal(ctx context.Context, enroll bool, prelocked *qlog.Lo
 	if n.managedStartup != nil {
 		// Peer ReadIndex and learned/control traffic must not depend on the
 		// application evidence CAS. This server is never returned by API/Handler.
-		peerServer, err = network.NewServerForPolicy(core, material, n.config.ClusterID, false, transport, n.materializationPolicy(), n.ready.Load)
+		if managedPeerProfile != nil {
+			peerServer, err = network.NewServerForManagedProfile(core, material, n.config.ClusterID, false, transport, *managedPeerProfile, n.ready.Load)
+		} else {
+			peerServer, err = network.NewServerForPolicy(core, material, n.config.ClusterID, false, transport, n.materializationPolicy(), n.ready.Load)
+		}
 		if err != nil {
 			return err
 		}
@@ -987,34 +1035,41 @@ func (n *Node) openInternal(ctx context.Context, enroll bool, prelocked *qlog.Lo
 	certifiedCheckpoint := generationCheckpoint
 	restoreCheckpoint := certifiedCheckpoint
 	if n.checkpoints != nil {
-		seal, sealed, sealErr := core.LatestCheckpointSeal()
-		if sealErr != nil {
-			return sealErr
-		}
-		if current := n.checkpoints.Latest(); current != nil {
-			anchorCurrent := !sealed && generationCheckpoint != nil && current.Index == generationCheckpoint.Index && current.RootHash == generationCheckpoint.RootHash
-			if !anchorCurrent && (!sealed || current.Index > uint64(seal.Index) || current.Index == uint64(seal.Index) && current.RootHash != seal.RootHash) {
-				return fmt.Errorf("checkpoint CURRENT is not backed by certified recovery evidence")
-			}
-		}
-		if sealed {
-			certifiedCheckpoint, err = n.checkpoints.OpenRoot(startupRecovery.Context(), uint64(seal.Index), seal.RootHash)
-			if err != nil || certifiedCheckpoint.Hash != seal.StateHash {
-				if err == nil {
-					err = fmt.Errorf("certified checkpoint state hash mismatch")
-				}
+		if managedPeerProfile != nil {
+			certifiedCheckpoint, _, err = n.selectManagedAppendOnlyRoot(startupRecovery.Context())
+			if err != nil {
 				return err
 			}
-			if n.managedStartup == nil {
-				certifiedCheckpoint, err = startupRecovery.PinRoot(startupRecovery.Context(), n.checkpoints, certifiedCheckpoint, startupRecovery.Owner())
-				if err != nil {
-					return fmt.Errorf("pin certified checkpoint recovery root: %w", startupRecovery.Check(err))
+		} else {
+			seal, sealed, sealErr := core.LatestCheckpointSeal()
+			if sealErr != nil {
+				return sealErr
+			}
+			if current := n.checkpoints.Latest(); current != nil {
+				anchorCurrent := !sealed && generationCheckpoint != nil && current.Index == generationCheckpoint.Index && current.RootHash == generationCheckpoint.RootHash
+				if !anchorCurrent && (!sealed || current.Index > uint64(seal.Index) || current.Index == uint64(seal.Index) && current.RootHash != seal.RootHash) {
+					return fmt.Errorf("checkpoint CURRENT is not backed by certified recovery evidence")
 				}
 			}
-		} else if certifiedCheckpoint != nil {
-			certifiedCheckpoint, err = startupRecovery.PinRoot(startupRecovery.Context(), n.checkpoints, certifiedCheckpoint, startupRecovery.Owner())
-			if err != nil {
-				return fmt.Errorf("pin generation recovery root: %w", startupRecovery.Check(err))
+			if sealed {
+				certifiedCheckpoint, err = n.checkpoints.OpenRoot(startupRecovery.Context(), uint64(seal.Index), seal.RootHash)
+				if err != nil || certifiedCheckpoint.Hash != seal.StateHash {
+					if err == nil {
+						err = fmt.Errorf("certified checkpoint state hash mismatch")
+					}
+					return err
+				}
+				if n.managedStartup == nil {
+					certifiedCheckpoint, err = startupRecovery.PinRoot(startupRecovery.Context(), n.checkpoints, certifiedCheckpoint, startupRecovery.Owner())
+					if err != nil {
+						return fmt.Errorf("pin certified checkpoint recovery root: %w", startupRecovery.Check(err))
+					}
+				}
+			} else if certifiedCheckpoint != nil {
+				certifiedCheckpoint, err = startupRecovery.PinRoot(startupRecovery.Context(), n.checkpoints, certifiedCheckpoint, startupRecovery.Owner())
+				if err != nil {
+					return fmt.Errorf("pin generation recovery root: %w", startupRecovery.Check(err))
+				}
 			}
 		}
 	}
@@ -1157,12 +1212,30 @@ func (n *Node) openInternal(ctx context.Context, enroll bool, prelocked *qlog.Lo
 	}
 	if certifiedCheckpoint != nil {
 		if n.materializationPolicy() == sqlpolicy.ManagedGraphRequestMaterializationPolicy {
-			seal, exists, err := core.LatestCheckpointSeal()
-			if err != nil || !exists || uint64(seal.Index) != certifiedCheckpoint.Index || seal.RootHash != certifiedCheckpoint.RootHash {
-				return errors.Join(fmt.Errorf("managed Graph startup certified root differs from exact seal"), err)
+			if managedPeerProfile != nil {
+				seal, exists, err := core.LatestManagedCheckpointSeal()
+				if err != nil || !exists || uint64(seal.Index) != certifiedCheckpoint.Index || seal.RootHash != certifiedCheckpoint.RootHash {
+					return errors.Join(fmt.Errorf("managed append-only Graph startup certified root differs from exact QCKP"), err)
+				}
+				if err := n.promoteManagedAppendOnlySeal(ctx, seal); err != nil {
+					return fmt.Errorf("promote managed append-only Graph checkpoint: %w", err)
+				}
+			} else {
+				seal, exists, err := core.LatestCheckpointSeal()
+				if err != nil || !exists || uint64(seal.Index) != certifiedCheckpoint.Index || seal.RootHash != certifiedCheckpoint.RootHash {
+					return errors.Join(fmt.Errorf("managed Graph startup certified root differs from exact seal"), err)
+				}
+				if err := n.promoteManagedGraphSeal(ctx, seal); err != nil {
+					return fmt.Errorf("promote managed Graph certified checkpoint: %w", err)
+				}
 			}
-			if err := n.promoteManagedGraphSeal(ctx, seal); err != nil {
-				return fmt.Errorf("promote managed Graph certified checkpoint: %w", err)
+		} else if managedPeerProfile != nil {
+			seal, exists, err := core.LatestManagedCheckpointSeal()
+			if err != nil || !exists || uint64(seal.Index) != certifiedCheckpoint.Index || seal.RootHash != certifiedCheckpoint.RootHash {
+				return errors.Join(fmt.Errorf("managed request startup certified root differs from exact QCKP"), err)
+			}
+			if err := n.promoteManagedAppendOnlySeal(ctx, seal); err != nil {
+				return fmt.Errorf("promote managed append-only checkpoint: %w", err)
 			}
 		} else if err := n.publishCertifiedCheckpoint(ctx, certifiedCheckpoint); err != nil {
 			return fmt.Errorf("publish certified checkpoint: %w", err)
@@ -1371,6 +1444,9 @@ func (n *Node) openInternal(ctx context.Context, enroll bool, prelocked *qlog.Lo
 }
 
 func (n *Node) preparePeerCheckpoint(ctx context.Context, sender quepaxa.NodeID, seal quepaxa.CheckpointSeal) error {
+	if n.managedStartup != nil && isManagedAppendOnlyProtocol(n.managedStartup.Identity.ApplicationProtocol) {
+		return fmt.Errorf("managed append-only checkpoint profile does not use prepared-fence RPCs")
+	}
 	if n.materializationPolicy() == sqlpolicy.ManagedGraphRequestMaterializationPolicy {
 		return n.prepareManagedGraphPeerCheckpoint(ctx, sender, seal)
 	}
@@ -1399,7 +1475,18 @@ func (n *Node) preparePeerCheckpoint(ctx context.Context, sender quepaxa.NodeID,
 // Wait or outlive native resources. Starting here avoids losing the first tick
 // before a startup-only binding has acquired its actual admission.
 func (n *Node) startManagedGraphPublisherAfterAdmission(binding *internalApplicationBinding) {
-	if binding != nil && n.materializationPolicy() == sqlpolicy.ManagedGraphRequestMaterializationPolicy && n.managedGraphPublisherStarted.CompareAndSwap(false, true) {
+	if binding == nil || n.managedStartup == nil {
+		return
+	}
+	if isManagedAppendOnlyProtocol(n.managedStartup.Identity.ApplicationProtocol) {
+		if !n.managedGraphPublisherStarted.CompareAndSwap(false, true) {
+			return
+		}
+		n.managedGraphPublisherBinding.Store(binding)
+		n.startManagedAppendOnlyPublisher(binding.lifetime)
+		return
+	}
+	if n.materializationPolicy() == sqlpolicy.ManagedGraphRequestMaterializationPolicy && n.managedGraphPublisherStarted.CompareAndSwap(false, true) {
 		n.managedGraphPublisherBinding.Store(binding)
 		n.startManagedGraphCheckpointPublisher(binding.lifetime)
 	}

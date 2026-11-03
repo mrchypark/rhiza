@@ -99,7 +99,7 @@ func StartPeerServerOnTransport(ctx context.Context, transport *quic.Transport, 
 }
 
 func startPeerServer(ctx context.Context, server *Server, members []quepaxa.Member, peerToken, adminToken string, promotionReady <-chan struct{}, listen func(*tls.Config, *quic.Config) (*quic.EarlyListener, error)) (*PeerServer, error) {
-	alpn, err := peerALPNForPolicy(server.expectedPolicy)
+	alpn, err := peerALPNForProfile(server.expectedPolicy, server.managedProfile)
 	if err != nil {
 		return nil, err
 	}

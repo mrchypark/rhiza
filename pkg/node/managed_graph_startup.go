@@ -63,7 +63,7 @@ func (n *Node) reconstructManagedGraphStartupAt(ctx context.Context, core *quepa
 	if tip != 0 && !ok {
 		return nil, fmt.Errorf("managed Graph certified target prefix unavailable")
 	}
-	seal, hasSeal, err := core.LatestCheckpointSeal()
+	seal, hasSeal, err := n.latestManagedGraphStartupSeal(ctx, core)
 	if err != nil {
 		return nil, err
 	}
@@ -99,7 +99,7 @@ func (n *Node) reconstructManagedGraphStartupAt(ctx context.Context, core *quepa
 			resultErr = errors.Join(resultErr, cleanup())
 		}
 	}()
-	mat, err = materializer.OpenManagedSQLKVGraphWithOriginals(filepath.Join(stage, "sqlite.db"), 1, n.receiptWindow())
+	mat, err = n.openMaterializer(filepath.Join(stage, "sqlite.db"), 1)
 	if err != nil {
 		return nil, err
 	}
@@ -252,7 +252,7 @@ func (n *Node) installManagedGraphStartup(ctx context.Context, core *quepaxa.Cor
 	if localtesthooks.Enabled {
 		localtesthooks.Hit("node:managed-graph-startup:pair_install")
 	}
-	return materializer.OpenManagedGraphFromVerifiedPair(ctx, filepath.Join(n.config.DataDir, "sqlite.db"), 4, materializer.ManagedGraphInstall{Cut: projection.cut, Files: projection.files})
+	return materializer.OpenManagedGraphFromVerifiedPair(ctx, filepath.Join(n.config.DataDir, "sqlite.db"), 4, materializer.ManagedGraphInstall{ApplicationProtocol: n.managedGraphInstallProtocol(), Cut: projection.cut, Files: projection.files})
 }
 
 func (n *Node) validateManagedGraphProjectionCut(core *quepaxa.Core, projection *managedGraphStartupProjection) error {
@@ -296,6 +296,7 @@ func (n *Node) managedGraphSealForCut(ctx context.Context, core *quepaxa.Core, c
 	core.SetCheckpointValidator(func(ctx context.Context, seal quepaxa.CheckpointSeal) error {
 		return n.checkpoints.Verify(ctx, uint64(seal.Index), seal.RootHash, seal.StateHash)
 	})
+	var selected quepaxa.SealedCheckpoint
 	for _, value := range values {
 		seal, isSeal, err := quepaxa.DecodeCheckpointSeal(value.Value)
 		if err != nil || sha256.Sum256(value.Value) != value.Hash {
@@ -307,9 +308,34 @@ func (n *Node) managedGraphSealForCut(ctx context.Context, core *quepaxa.Core, c
 		if err := core.ValidateCheckpointBase(ctx, seal, value); err != nil {
 			return quepaxa.SealedCheckpoint{}, err
 		}
-		return quepaxa.SealedCheckpoint{CheckpointSeal: seal, DecisionSlot: value.Slot}, nil
+		if n.managedStartup != nil && isManagedAppendOnlyProtocol(n.managedStartup.Identity.ApplicationProtocol) {
+			if err := core.ValidateManagedCheckpointCandidate(ctx, quepaxa.ManagedCheckpointCandidate{
+				Value: value.Value, Hash: value.Hash, Seal: seal, DecisionSlot: value.Slot,
+				ConfigID: core.ConfigIDForSlot(value.Slot),
+			}); err != nil {
+				return quepaxa.SealedCheckpoint{}, err
+			}
+		}
+		candidate := quepaxa.SealedCheckpoint{CheckpointSeal: seal, DecisionSlot: value.Slot}
+		if selected.Index == 0 || candidate.DecisionSlot > selected.DecisionSlot {
+			selected = candidate
+		}
 	}
-	return quepaxa.SealedCheckpoint{}, fmt.Errorf("retained managed Graph cut has no exact certified producer seal")
+	if selected.Index == 0 {
+		return quepaxa.SealedCheckpoint{}, fmt.Errorf("retained managed Graph cut has no exact certified producer seal")
+	}
+	return selected, nil
+}
+
+func (n *Node) latestManagedGraphStartupSeal(ctx context.Context, core *quepaxa.Core) (quepaxa.SealedCheckpoint, bool, error) {
+	if n.managedStartup != nil && isManagedAppendOnlyProtocol(n.managedStartup.Identity.ApplicationProtocol) {
+		_, seal, err := n.selectManagedAppendOnlyRoot(ctx)
+		if err != nil || seal == nil {
+			return quepaxa.SealedCheckpoint{}, false, err
+		}
+		return *seal, true, nil
+	}
+	return core.LatestCheckpointSeal()
 }
 
 func (n *Node) resumeManagedGraphStartupInstall(ctx context.Context, core *quepaxa.Core, observed materializer.ManagedGraphTargetState) (opened *materializer.Materializer, resultErr error) {
@@ -332,7 +358,7 @@ func (n *Node) resumeManagedGraphStartupInstall(ctx context.Context, core *quepa
 		return nil, err
 	}
 	dbPath := filepath.Join(n.config.DataDir, "sqlite.db")
-	current, err := materializer.InspectManagedGraphInstallTarget(ctx, dbPath, n.receiptWindow())
+	current, err := materializer.InspectManagedGraphInstallTarget(ctx, dbPath, n.receiptWindow(), n.managedGraphInstallProtocol())
 	if err != nil || current.InstallAttempt == nil || current.InventoryHash != observed.InventoryHash {
 		return nil, errors.Join(fmt.Errorf("retained managed Graph install changed before authenticated resume"), err)
 	}
@@ -341,7 +367,7 @@ func (n *Node) resumeManagedGraphStartupInstall(ctx context.Context, core *quepa
 	if localtesthooks.Enabled {
 		localtesthooks.Hit("node:managed-graph-startup:pair_install")
 	}
-	opened, err = materializer.OpenManagedGraphFromVerifiedPair(ctx, dbPath, 4, materializer.ManagedGraphInstall{Cut: attempt.Cut, Files: current.InstallAttempt.Files})
+	opened, err = materializer.OpenManagedGraphFromVerifiedPair(ctx, dbPath, 4, materializer.ManagedGraphInstall{ApplicationProtocol: n.managedGraphInstallProtocol(), Cut: attempt.Cut, Files: current.InstallAttempt.Files})
 	if err != nil {
 		return nil, err
 	}
@@ -373,7 +399,7 @@ func (n *Node) reconcileManagedGraphTarget(ctx context.Context, core *quepaxa.Co
 		}
 	}
 	dbPath := filepath.Join(n.config.DataDir, "sqlite.db")
-	current, err := materializer.InspectManagedGraphInstallTarget(ctx, dbPath, n.receiptWindow())
+	current, err := materializer.InspectManagedGraphInstallTarget(ctx, dbPath, n.receiptWindow(), n.managedGraphInstallProtocol())
 	if err != nil || current.InventoryHash != observed.InventoryHash {
 		return errors.Join(fmt.Errorf("previous managed Graph target changed before certified reconciliation"), err)
 	}
@@ -381,7 +407,7 @@ func (n *Node) reconcileManagedGraphTarget(ctx context.Context, core *quepaxa.Co
 	if err != nil {
 		return err
 	}
-	old, err := materializer.OpenManagedSQLKVGraphWithOriginals(dbPath, 1, n.receiptWindow())
+	old, err := n.openMaterializer(dbPath, 1)
 	if err != nil {
 		return err
 	}

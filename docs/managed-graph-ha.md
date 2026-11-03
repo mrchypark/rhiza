@@ -1,200 +1,116 @@
-# Managed SQL/KV/Graph HA — candidate
+# Managed SQL/KV/Graph HA
 
-This document describes an **unreleased, incompletely qualified candidate**.
-It is not a claim that the new profile has passed CI, all providers, Pod
-replacement, Rust native execution, or Chaos Mesh qualification.
+Status: unreleased final explicit append-only profile candidate. Local focused
+tests are not final CI, provider, or production qualification. The support
+table states the intended boundary, not proof that runtime enforcement is
+complete.
 
-## Explicit profile
+## Profile support
 
-`rhiza-managed-request-graph/v1` selects materialization policy **10** and the
-dedicated peer protocol `rhiza-peer-managed-request-graph-v1`. The same managed
-Host can execute SQL, KV, and Graph operations. It uses the existing validated
-bootstrap/runtime configuration; there is no new per-request CR option.
+| Profile | Policy | HA startup contract |
+|---|---:|---|
+| Local | Local | Existing Local contract; unchanged |
+| Legacy managed SQL | 7 | Existing contract; unchanged |
+| Managed SQL/KV | 8 | Existing contract; unchanged |
+| Retired request prototype `rhiza-managed-request/v1` | 9 | Reject for HA startup; preserve its WAL and bytes |
+| Retired Graph prototype `rhiza-managed-request-graph/v1` | 10 | Reject for HA startup; preserve its WAL and bytes |
+| Final managed request `rhiza-managed-request-append-only/v1` | 9 | Explicit append-only identity required |
+| Final Graph `rhiza-managed-request-graph-append-only/v1` | 10 | Explicit append-only identity required |
 
-Profiles 7, 8, and 9 keep their existing semantics. Their database files,
-archives, prepared handoffs, and peer protocols are **not automatically
-converted** to profile10. Selecting a different profile is not a migration or
-permission to relabel existing data. Unknown profiles and incompatible peers
-must be refused before application effects.
+Policy 9 or 10 alone does not select a supported profile. The exact protocol,
+evidence format, policy, generation, bootstrap-plan and member-config binding,
+and registered WAL identity must match the persisted/runtime binding. These
+profiles are restricted to generation 0; generation changes and membership
+maintenance remain separately authorized control paths. A retired, unknown,
+missing, or mismatched profile must fail before application writers/native
+state, checkpoint publication, new application intent, or object upload begins.
 
-The current scope is **generation0 with quorum preserved**. Whole-generation
-disaster recovery and arbitrary network-partition recovery are not qualified
-by this candidate.
+No automatic old-WAL migration or relabeling is supported. Preserve original
+bytes, source anchors, and UNKNOWN outcomes. Do not fall back to another
+protocol because a file happens to carry policy 9 or 10. Low-level read-only
+inspection may be used to diagnose old data, but does not enable HA startup.
+Legacy-7, SQL/KV-8, and Local signatures, defaults, eligibility, and tests stay
+unchanged.
 
-## Go API
+## Go, Rust, and C ABI
 
-The existing `pkg/managedsql.Host` adds these Graph methods:
+The existing Go `managedsql.Host` owns execution. Its Graph surface includes:
 
-- `GraphExecute`, `GraphQuery`, and `GraphReachable`;
-- `GraphChanges`, `GraphStreamRead`, and `GraphStreamOffset`;
-- `SetGraphStreamOffset` and `TrimGraphStream`.
+- Mutations: `GraphExecute`, `SetGraphStreamOffset`, `TrimGraphStream`.
+- Reads: `GraphQuery`, `GraphReachable`, `GraphChanges`, `GraphStreamRead`,
+  `GraphStreamOffset`.
+- Status and exact recovery: `RequestStatus` and `RecoverRequest` with
+  `Kind: "graph"` and the original request ID.
 
-`GraphExecute` accepts `rhiza.GraphCommand` (the public alias of the actual
-command type) and returns `network.GraphExecuteResponse`, including its real
-`MutationReceipt`. Queries and reachable operations return actual Graph
-results. Stream methods use the existing `network.GraphStreamReadRequest`,
-`GraphStreamReadResponse`, `GraphStreamOffsetRequest`, and
-`GraphStreamOffsetResponse` types. Offset/trim mutations also return the actual
-Graph mutation receipt.
+Rust `rhizadb::ManagedDb` exposes the corresponding `graph_execute`,
+`graph_query`, `graph_reachable`, stream methods, and
+`recover_request(MutationKind::Graph, original_id)`. Graph mutations cross the
+existing C ABI `graph_execute` operation as the typed `frame_b64` execution
+frame; the ordinary JSON Graph mutation DTO is not a second original. The
+Rust API keeps request IDs and typed string/map-key bytes lossless, returns the
+actual mutation receipt, and preserves `commit_unknown` context through
+`ManagedMutationError`. Existing C symbols and response/error types are not
+replaced.
 
-For example, with an already opened, validated profile10 Host:
+Use the existing typed Graph validators and resource limits. The managed C ABI
+execution frame decoder currently allows at most 256 KiB; the ordinary Graph
+projection and engine validation retain their own existing constraints. This
+document adds no alternative limit or larger-payload promise.
 
-```go
-receipt, err := host.GraphExecute(ctx, rhiza.GraphCommand{
-    RequestID: string([]byte{0xff, 1}),
-    Cypher:    "CREATE (:Item {name: 'one'})",
-})
+## Normal requests and control path
+
+```text
+operator startup / policy / bootstrap / repair authority
+                      │
+                      ▼
+     exact profile + generation + WAL binding + initial admission
+                      │
+                      ▼
+     normal Go Host / Rust ManagedDb request → engine-owned Node
+
+separate control path: membership, repair, certified checkpoint/archive,
+                       object durability, startup recovery
 ```
 
-This fragment does not construct authority, bootstrap a cluster, or substitute
-for checking `err` and the receipt. Do not resubmit it to resolve an uncertain
-outcome.
+After initial admission, normal reads, writes, status, and exact recovery use
+the engine runtime; they do not create a per-request Kubernetes CR
+reservation/finalization or a second application-intent log. This does not
+bypass operator authority at startup, repair, policy, or membership boundaries,
+and is not a request-latency or Kube-request-count claim.
 
-SQL `Execute`/`Query`, KV `KVMutate`/`KVGet`, and local `RequestStatus` retain
-their existing public methods. Graph status uses
-`network.RequestStatusRequest{Kind: "graph", RequestID: originalRawID}`.
-Status is a local observation, not proof of object-store ACK durability.
+An uncertain mutation may have committed. Keep its original kind, raw ID,
+payload, and known slot; use exact recovery to resolve the canonical retained
+original. Do not resubmit it, generate a new ID, or treat missing evidence as
+proof of no effect. Recovery itself adds zero application proposals and does
+not refresh retention or clear poison. A duplicate submission may be assigned
+a later slot than the canonical first receipt.
 
-## Rust and the C ABI
+The public managed Host requires `before_ack` object-store durability. An
+asynchronous success ACK beyond the remote archive head is outside this
+contract; a certified-only or uncertain result must not be reported as a
+durable ACK.
 
-`rhizadb::ManagedDb` adds `graph_execute`, `graph_query`, `graph_reachable`,
-`graph_changes`, `graph_stream_read`, `graph_stream_offset`,
-`set_graph_stream_offset`, and `trim_graph_stream`.
+## NoPVC and recovery boundary
 
-Mutation inputs use `ManagedGraphCommand`, `ManagedGraphValue`,
-`ManagedGraphEvent`, `ManagedGraphOffset`, and `ManagedGraphTrim`. Request IDs
-are `Vec<u8>`; they are not coerced through UTF-8 strings. Typed values preserve
-raw string/map-key bytes, number lexemes, floating-point bit patterns, and
-nil-versus-empty containers in the original representation. This does not make
-invalid Cypher or unsupported execution values valid: existing engine
-validation still applies.
+With no PVC, startup reconstructs the verified SQLite/native Graph pair from
+the selected immutable checkpoint and replays the contiguous certified suffix
+through the registered local WAL's captured certified ACK tip. Checkpoint
+selection requires the exact QCKP, actual archive certificate/history, full
+object hashes, and pair validation; a CURRENT locator is a hint, not authority.
+Missing roots, identity/prefix drift, incomplete installation, poison, or
+ambiguous evidence fail closed rather than creating a new baseline.
 
-`ManagedGraphReceipt` carries the actual slot/status/applied fields. Stream
-read/offset results use `ManagedGraphStreamRead`, `ManagedGraphStreamRecord`,
-and `ManagedGraphOffsetRead`. Event order is retained. Offset sequences and trim
-boundaries use the full `u64` range, not JavaScript-number rounding.
-
-The C ABI transports mutations as the typed execution frame in `frame_b64`.
-The ordinary JSON Graph mutation DTO is not an alternative original. Rust
-read-only query DTOs continue to use the existing JSON read semantics; they
-are not mutation intent fingerprints.
-
-## Uncertain outcomes and exact recovery
-
-A submitted mutation can return `commit_unknown` even when its effect committed.
-Keep the original kind/raw ID and the error's known slot/cause context. Do not
-generate a new ID, replace the payload, or submit the mutation again as a
-recovery strategy.
-
-Use Go `Host.RecoverRequest` with the exact Graph selector, or Rust
-`ManagedDb::recover_request(MutationKind::Graph, &original_id)`. These resolve
-the engine's retained canonical original, replay certified history, and check
-the configured durability barrier. They must add **zero application proposals**.
-They do not refresh retention or accept a replacement payload as the original.
-Go `RecoveryResult.Graph` and Rust `ManagedRecoveryResult::Graph` return the
-original Graph receipt and raw request ID.
-
-Missing/expired originals, lookup uncertainty, and conflicting intent remain
-unresolved or rejected; absence is not proof of no effect. The existing
-no-argument recovery facade uses only this handle's bounded recovery hint and
-can remain ambiguous. An explicit selector is required after its hint is lost.
-Known submission slots bound the canonical first result; a duplicate submit
-can have a later slot than the original. See [the internal request API](managed-internal-request-api.md).
-
-## Normal requests versus the operator
-
-After actual startup and initial admission, normal profile10 reads, writes,
-status, and exact recovery use the engine runtime. They do not add CR
-reservation/finalization records or a second application intent log. This is a
-control-path boundary, not a measured latency or Kube-request-count claim.
-
-CRs remain responsible for policy, bootstrap/repair authority, observation, and
-disaster-recovery coordination. Initial admission, repair, and generation
-changes still require their actual authority checks. Normal operation is not
-permission to bypass membership, registered WAL identity, lifecycle, poison,
-quorum, or object-store durability checks.
-
-## NoPVC startup contract and remaining gaps
-
-The required startup path is a **verified SQLite/native Graph pair plus the
-contiguous, full-hash-checked certified suffix**, reaching the registered local
-WAL's captured certified ACK tip. The Node must open that reconstructed pair,
-not merely check a separate reconstruction and then trust old native files.
-
-A required missing root, wrong root/full hash/certificate, changed WAL identity
-or prefix, poison, and incomplete/ambiguous installation must fail closed.
-Validated first genesis is distinct from a missing required recovery root.
-NoPVC does not remove those checks or turn missing evidence into bootstrap.
-
-Initial application readiness/ACK requires the engine's producer root: actual
-quorum Prepare, certified seal, fixed archived decision, and verified CURRENT.
-The background publisher and first request share completion; `Open` and
-peer/control remain nonblocking. Later ACKs need no new root. Cancelling the
-initial wait proposes no application data; callers need no manual root polling.
-Close also cancels and drains this wait without requiring the upload to finish.
-Focused Go tests have exercised public startup through the actual pair installer
-at the original database path, with certified suffix data, original receipts,
-and a fresh SQLite file rather than only reopening the existing pair. A separate
-public restart test leaves a real native-ahead/SQLite-pending state and verifies
-authenticated same-slot reconciliation before installation. These are local
-functional results, not completed NoPVC Pod or cross-provider qualification.
-
-An actual child-process test exits during the Node installer's `after-staged`
-phase. Public reopen reauthenticates the original cut and retained physical input
-pair, finishes that attempt, and applies a later certified ACK suffix. Normal
-and race checks cover this one Node crash phase, not every installer instruction.
-Unknown input bytes remain preserved and refused; an unidentifiable old external
-reconstruction temp is not automatically deleted.
-
-After a focused Core certified-redelivery repair, changed-candidate public
-publisher and suffix-restart checks pass normally and under the race detector.
-Earlier root-preparation failures remain recorded; their precise historical
-schedule is not established by those passes.
-Focused initial-root checks cover ACK then immediate Close/reopen without root
-polling. Historical pre-root failures remain recorded, not explained by this pass.
-
-**Remaining gaps:** the materializer's wider crash-phase tests do not establish
-all those phases through public Node startup. Final-head CI and runtime gates
-below must still complete. This candidate is not a completed policy10 recovery
-guarantee.
-
-Native-ahead/SQLite-pending publication blocks local reads and status. Exact
-recovery and linearizable reads first use their real certified replay boundary
-and may finish the same slot before taking a clean read snapshot. Fatal
-commit-unknown/poison is different and must not be cleared by a retry.
-Graph long-poll reads borrow the real Node runtime; Close cancels and
-drains them before native resources close, without holding the Host mutex for
-the entire wait.
-
-## Storage and resource limits
-
-HA immutable data remains append-only with no online deletion GC. No new lease
-system is introduced; the existing archive publication lock remains in use.
-Do not equate Pod API deletion with termination of an isolated old process or
-with completion of outstanding storage work.
-
-Existing mutation admission, typed depth/node/count/body bounds, receipt
-retention/accounting, and peer framing checks remain. Only strictly validated
-Graph frames under trusted profile10 receive the enlarged 256KiB execution
-frame budget; legacy values keep their existing bounds. This is not a proof of
-a continuous physical-memory peak.
-
-Existing checkpoint size and prepared-Graph aggregate artifact limits remain
-32GiB. They are restore/fixture boundaries, not a claim about total database
-capacity, RAM use, or production-cloud parity. Large restore resource behavior
-still needs explicit qualification.
+Object data is append-only. Online delete GC is not part of this profile. Pod
+API deletion is not proof that an isolated old process ended or that outstanding
+object-store work completed. This candidate does not qualify whole-cluster
+disaster recovery or fencing every arbitrary network partition; those remain
+explicit gaps.
 
 ## Qualification status
 
-Focused Go tests cover actual Core/WAL/native effects, raw-ID receipts,
-proposal-free exact recovery, public fresh-pair startup, pending healing,
-and long-poll Close. They do not replace final-head CI, all three provider SDK
-paths (S3, GCS, Azure), native Rust/C ABI runtime, Pod replacement/restart,
-and both scoped Chaos Mesh faults. A synthetic S3 wire-fixture pass is not
-three-provider emulator or production-cloud parity. No release or production
-readiness is asserted here.
-
-The current public managed Host requires `before_ack` durability. An async
-success ACK beyond the remote archive HEAD is outside that public contract;
-an uncertain outcome or a certified-only decision must not be reported as such
-an ACK. No new durability option is introduced by this candidate.
+Focused Go normal/race checks cover candidate APIs, actual Core/WAL effects,
+original receipts, public pair publication/restart, and control admission.
+They do not replace final-head Actions or the three object-store provider-SDK checks,
+native Rust/C ABI execution, Pod replacement, or scoped Chaos Mesh
+qualification. Emulator or unit success is not production-cloud parity. No
+release-version support or full HA pass is claimed.

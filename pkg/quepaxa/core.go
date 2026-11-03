@@ -60,6 +60,7 @@ type Transport interface {
 // Core runs one QuePaxa proposer and recorder per replica.
 type Core struct {
 	validateValue           func([]byte) error
+	managedAppendOnly       *ManagedAppendOnlyConfig
 	nodeID                  NodeID
 	config                  *Cluster
 	wal                     *qlog.WAL
@@ -1474,13 +1475,41 @@ func (c *Core) record(ctx context.Context, request RecordRequest) (Summary, erro
 			return Summary{}, fmt.Errorf("reconfiguration control is disabled")
 		}
 	}
+	checkpointValidated := false
+	var managedCandidate *ManagedCheckpointCandidate
+	if c.managedAppendOnly != nil {
+		value := request.Proposal.Value
+		if len(value) == 0 {
+			value, _ = c.stagedValue(request.Proposal.Hash)
+		}
+		if len(value) == 0 {
+			c.mu.RLock()
+			if decided, exists := c.decided[request.Slot]; exists && decided.Hash == request.Proposal.Hash {
+				value = bytes.Clone(decided.Value)
+			}
+			c.mu.RUnlock()
+		}
+		if len(value) == 0 {
+			return Summary{}, ErrManagedAppendOnlyCandidateBytesUnavailable
+		}
+		seal, isCheckpoint, err := DecodeCheckpointSeal(value)
+		if err != nil {
+			return Summary{}, err
+		}
+		if isCheckpoint {
+			candidate := ManagedCheckpointCandidate{Value: bytes.Clone(value), Hash: request.Proposal.Hash, Seal: seal, DecisionSlot: request.Slot, ConfigID: request.ConfigID}
+			if err := c.ValidateManagedCheckpointCandidate(ctx, candidate); err != nil {
+				return Summary{}, err
+			}
+			managedCandidate = &candidate
+		}
+	}
 	lock := &c.recordLocks[uint64(request.Slot)%uint64(len(c.recordLocks))]
 	lock.Lock()
 	defer lock.Unlock()
 	if c.recordBeforeAppend != nil {
 		c.recordBeforeAppend()
 	}
-	checkpointValidated := false
 	for {
 		c.mu.Lock()
 		if err := c.compactedErrorLocked(request.Slot); err != nil {
@@ -1576,6 +1605,13 @@ func (c *Core) record(ctx context.Context, request RecordRequest) (Summary, erro
 		// and repeat mutable guards after releasing mu for fallback validation.
 		decided, exists := c.decided[request.Slot]
 		exactCertified := exists && len(request.Proposal.Value) != 0 && decided.Hash == request.Proposal.Hash && bytes.Equal(decided.Value, request.Proposal.Value)
+		if managedCandidate != nil {
+			if err := c.checkManagedCheckpointRecordEligibilityLocked(*managedCandidate); err != nil {
+				c.mu.Unlock()
+				return Summary{}, err
+			}
+			break
+		}
 		if checkpointValidated {
 			if err := c.checkCheckpointRecordEligibilityLocked(request.Proposal.Hash); err != nil {
 				c.mu.Unlock()
@@ -3453,6 +3489,7 @@ func (c *Core) IsQuorum(receipts []Receipt) bool {
 
 func (c *Core) recover() error {
 	var prepared []CheckpointSeal
+	var previousManagedMarker *CheckpointSeal
 	if err := c.wal.Scan(func(entry qlog.Entry) error {
 		switch entry.Type {
 		case qlog.EntryCheckpoint:
@@ -3492,6 +3529,13 @@ func (c *Core) recover() error {
 					decodeErr = fmt.Errorf("checkpoint verification identity mismatch")
 				}
 				return fmt.Errorf("recover verified checkpoint: %w", decodeErr)
+			}
+			if c.managedAppendOnly != nil {
+				if previousManagedMarker != nil && (seal.Index < previousManagedMarker.Index || seal.Index == previousManagedMarker.Index && seal.RootHash != previousManagedMarker.RootHash) {
+					return fmt.Errorf("recover verified checkpoint: managed marker ordering or identity regressed")
+				}
+				copy := seal
+				previousManagedMarker = &copy
 			}
 			prepared = append(prepared, seal)
 		case qlog.EntryProposal:
@@ -3620,17 +3664,19 @@ func (c *Core) recover() error {
 		c.advanceTipLocked()
 		c.mu.Unlock()
 	}
-	for _, seal := range prepared {
-		if err := c.validateRecoveredPreparedCheckpoint(seal); err != nil {
-			return fmt.Errorf("recover verified checkpoint: %w", err)
-		}
-		c.mu.Lock()
-		if root, exists := c.preparedCheckpoints[seal.Index]; exists && root != seal.RootHash {
+	if c.managedAppendOnly == nil {
+		for _, seal := range prepared {
+			if err := c.validateRecoveredPreparedCheckpoint(seal); err != nil {
+				return fmt.Errorf("recover verified checkpoint: %w", err)
+			}
+			c.mu.Lock()
+			if root, exists := c.preparedCheckpoints[seal.Index]; exists && root != seal.RootHash {
+				c.mu.Unlock()
+				return fmt.Errorf("recover verified checkpoint: conflicting roots at index %d", seal.Index)
+			}
+			c.preparedCheckpoints[seal.Index] = seal.RootHash
 			c.mu.Unlock()
-			return fmt.Errorf("recover verified checkpoint: conflicting roots at index %d", seal.Index)
 		}
-		c.preparedCheckpoints[seal.Index] = seal.RootHash
-		c.mu.Unlock()
 	}
 	if c.reconfigEnabled {
 		c.mu.Lock()

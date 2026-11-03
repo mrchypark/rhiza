@@ -266,6 +266,218 @@ func (n *Node) advanceManagedGraphCheckpointCut(ctx context.Context) error {
 	return op.err
 }
 
+// waitManagedAppendOnlyControl handles only a Core-validated, exact next-slot
+// pure-control recorder. The observation is a hint: admission still requires
+// the normal certified barrier, prefix replay, and fresh runtime checks.
+func (n *Node) waitManagedAppendOnlyControl(ctx context.Context, binding *internalApplicationBinding) error {
+	if binding == nil || binding.core == nil || binding.core != n.core || n.server == nil || n.managedStartup == nil || !isManagedAppendOnlyProtocol(n.managedApplicationProtocol()) {
+		return fmt.Errorf("managed append-only admission binding unavailable")
+	}
+	progress := n.core.RuntimeProgressSnapshot()
+	n.managedGraphControlMu.Lock()
+	if settled := n.managedGraphControl; settled != nil {
+		select {
+		case <-settled.done:
+			// Existing waiters retain the operation and its original result.
+			// A later admission gets a fresh observation, but an unresolved
+			// recorder value is never retried or reinterpreted as success.
+			n.managedGraphControl = nil
+			if progress.RecorderTip > progress.CertifiedTip {
+				n.managedGraphControlMu.Unlock()
+				return n.refuseManagedGraphAdmissionAt(progress.RecorderTip, progress)
+			}
+		default:
+		}
+	}
+	if op := n.managedGraphControl; op != nil {
+		if op.observation == nil {
+			isBarrier, decodeErr := types.DecodeReadBarrier(op.value)
+			if op.binding == binding && decodeErr == nil && isBarrier && (progress.RecorderTip <= progress.CertifiedTip || progress.RecorderTip == progress.CertifiedTip+1 && progress.RecorderHashPresent && progress.RecorderHash == op.hash) {
+				done := op.done
+				target := progress.RecorderTip
+				if target <= progress.CertifiedTip {
+					target = progress.CertifiedTip
+				}
+				n.managedGraphControlMu.Unlock()
+				return n.waitManagedAppendOnlyBarrier(ctx, target, op, done)
+			}
+			n.managedGraphControlMu.Unlock()
+			return n.refuseManagedGraphAdmissionAt(progress.RecorderTip, progress)
+		}
+		if managedAppendOnlyOperationMatchesProgress(op, binding, n.core, progress) {
+			done := op.done
+			target := op.observation.ObservedSlot
+			n.managedGraphControlMu.Unlock()
+			return n.waitManagedAppendOnlyBarrier(ctx, target, op, done)
+		}
+		n.managedGraphControlMu.Unlock()
+		return n.refuseManagedGraphAdmissionAt(progress.RecorderTip, progress)
+	}
+	n.managedGraphControlMu.Unlock()
+	if progress.RecorderTip <= progress.CertifiedTip {
+		n.clearCompletedManagedAppendOnlyControl(progress.CertifiedTip)
+		return nil
+	}
+	observation, err := n.core.ObserveManagedAppendOnlyControl(ctx)
+	if err != nil {
+		return n.refuseManagedGraphAdmissionAt(progress.RecorderTip, progress)
+	}
+	if !observation.BelongsTo(n.core) || observation.ApplicationProtocol != binding.identity.ApplicationProtocol || observation.Generation != binding.identity.Member.Generation || observation.CommittedTip != progress.CertifiedTip || observation.ObservedSlot != progress.RecorderTip || observation.ObservedSlot != observation.CommittedTip+1 || len(observation.Proposals) == 0 {
+		return n.refuseManagedGraphAdmissionAt(progress.RecorderTip, progress)
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+
+	n.managedGraphControlMu.Lock()
+	if err := ctx.Err(); err != nil {
+		n.managedGraphControlMu.Unlock()
+		return err
+	}
+	op := n.managedGraphControl
+	if op != nil && op.observation == nil {
+		isBarrier, decodeErr := types.DecodeReadBarrier(op.value)
+		if op.binding == binding && decodeErr == nil && isBarrier && (progress.RecorderTip <= progress.CertifiedTip || progress.RecorderTip == progress.CertifiedTip+1 && progress.RecorderHashPresent && progress.RecorderHash == op.hash) {
+			done := op.done
+			target := progress.RecorderTip
+			if target <= progress.CertifiedTip {
+				target = progress.CertifiedTip
+			}
+			n.managedGraphControlMu.Unlock()
+			return n.waitManagedAppendOnlyBarrier(ctx, target, op, done)
+		}
+		n.managedGraphControlMu.Unlock()
+		return n.refuseManagedGraphAdmissionAt(progress.RecorderTip, progress)
+	}
+	if op != nil && op.observation != nil && progress.CertifiedTip >= op.observation.ObservedSlot {
+		select {
+		case <-op.done:
+			n.managedGraphControl = nil
+			op = nil
+		default:
+		}
+	}
+	if op != nil {
+		if !managedAppendOnlyOperationMatchesProgress(op, binding, n.core, progress) {
+			n.managedGraphControlMu.Unlock()
+			return n.refuseManagedGraphAdmissionAt(progress.RecorderTip, progress)
+		}
+		done := op.done
+		n.managedGraphControlMu.Unlock()
+		return n.waitManagedAppendOnlyBarrier(ctx, progress.RecorderTip, op, done)
+	}
+	var nonce [types.ReadBarrierNonceSize]byte
+	if _, err := rand.Read(nonce[:]); err != nil {
+		n.managedGraphControlMu.Unlock()
+		return err
+	}
+	value := types.EncodeReadBarrier(nonce)
+	op = &managedGraphControlOperation{
+		value: append([]byte(nil), value...), hash: sha256.Sum256(value), binding: binding,
+		observation: &observation, done: make(chan struct{}),
+	}
+	n.managedGraphControl = op
+	n.wg.Add(1) // caller still holds a binding borrower; Shutdown drains it before Wait.
+	n.managedGraphControlMu.Unlock()
+	go n.runManagedAppendOnlyBarrier(ctx, binding, op)
+	return n.waitManagedAppendOnlyBarrier(ctx, progress.RecorderTip, op, op.done)
+}
+
+func managedAppendOnlyOperationMatchesProgress(op *managedGraphControlOperation, binding *internalApplicationBinding, core *quepaxa.Core, progress quepaxa.RuntimeProgress) bool {
+	if op == nil || op.observation == nil || op.binding != binding || !op.observation.BelongsTo(core) || op.observation.ObservedSlot != op.observation.CommittedTip+1 {
+		return false
+	}
+	if progress.CertifiedTip < op.observation.CommittedTip {
+		return false
+	}
+	if progress.CertifiedTip < op.observation.ObservedSlot {
+		if progress.RecorderTip == op.observation.ObservedSlot {
+			return true
+		}
+		return progress.RecorderTip > op.observation.ObservedSlot && progress.RecorderHashPresent && progress.RecorderHash == op.hash
+	}
+	return true
+}
+
+func (n *Node) clearCompletedManagedAppendOnlyControl(certified quepaxa.Slot) {
+	n.managedGraphControlMu.Lock()
+	defer n.managedGraphControlMu.Unlock()
+	op := n.managedGraphControl
+	if op == nil || op.observation == nil || certified < op.observation.ObservedSlot {
+		return
+	}
+	select {
+	case <-op.done:
+		n.managedGraphControl = nil
+	default:
+	}
+}
+
+func (n *Node) runManagedAppendOnlyBarrier(startCtx context.Context, binding *internalApplicationBinding, op *managedGraphControlOperation) {
+	defer n.wg.Done()
+	ctx, cancel := context.WithCancel(startCtx)
+	stopLifetime := context.AfterFunc(binding.lifetime, cancel)
+	defer func() {
+		stopLifetime()
+		cancel()
+	}()
+	started := false
+	if startCtx.Err() != nil {
+		op.err = startCtx.Err()
+	} else if ctx.Err() != nil {
+		op.err = ctx.Err()
+	} else {
+		started = true
+		op.slot, op.err = n.server.ProposeCheckpointBarrier(ctx, op.value)
+	}
+	if !started {
+		n.managedGraphControlMu.Lock()
+		if n.managedGraphControl == op {
+			n.managedGraphControl = nil
+		}
+		close(op.done)
+		n.managedGraphControlMu.Unlock()
+		return
+	}
+	if op.err == nil && op.slot < op.observation.ObservedSlot {
+		op.err = fmt.Errorf("managed append-only barrier did not cover observed control slot")
+	}
+	if op.err == nil {
+		op.err = n.core.WaitTip(ctx, op.slot)
+	}
+	if op.err == nil {
+		decision, ok := n.core.CertifiedValue(op.slot)
+		if !ok || decision.Hash != op.hash || !bytes.Equal(decision.Value, op.value) {
+			op.err = fmt.Errorf("managed append-only barrier certificate did not match its proposal")
+		}
+	}
+	if op.err == nil {
+		op.err = n.replayLocalDecisions(ctx)
+	}
+	n.managedGraphControlMu.Lock()
+	close(op.done)
+	n.managedGraphControlMu.Unlock()
+}
+
+func (n *Node) waitManagedAppendOnlyBarrier(ctx context.Context, target quepaxa.Slot, op *managedGraphControlOperation, done <-chan struct{}) error {
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-done:
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if op.err != nil || op.slot < target {
+		return n.refuseManagedGraphAdmissionAt(target, n.core.RuntimeProgressSnapshot())
+	}
+	decision, ok := n.core.CertifiedValue(op.slot)
+	if !ok || decision.Hash != op.hash || !bytes.Equal(decision.Value, op.value) {
+		return n.refuseManagedGraphAdmissionAt(target, n.core.RuntimeProgressSnapshot())
+	}
+	return nil
+}
+
 // Wait only when the exact highest recorder value is the live checkpoint
 // publisher's operation. Recorder state by itself never grants admission.
 func (n *Node) waitManagedGraphOwnedControl(ctx context.Context, binding *internalApplicationBinding, target quepaxa.Slot) error {
@@ -322,7 +534,9 @@ func (n *Node) waitAndVerifyManagedGraphOwnedControl(ctx context.Context, target
 
 func (n *Node) refuseManagedGraphAdmissionAt(target quepaxa.Slot, progress quepaxa.RuntimeProgress) error {
 	applied := uint64(n.material.Tip())
-	log.Printf("MANAGED_GRAPH_ADMISSION_REFUSED target=%d recorded=%d certified=%d applied=%d", target, progress.RecorderTip, progress.CertifiedTip, applied)
+	if n.managedApplicationProtocol() == sqlpolicy.ManagedGraphRequestAppendOnlyApplicationProtocol {
+		log.Printf("MANAGED_GRAPH_ADMISSION_REFUSED target=%d recorded=%d certified=%d applied=%d", target, progress.RecorderTip, progress.CertifiedTip, applied)
+	}
 	return fmt.Errorf("internal application has unresolved certified history: target=%d recorded=%d certified=%d applied=%d", target, progress.RecorderTip, progress.CertifiedTip, applied)
 }
 

@@ -54,7 +54,7 @@ func (n *Node) beginManagedGraphRead(ctx context.Context, consistency string) (c
 	if err != nil {
 		return ctx, nil, err
 	}
-	if n.managedStartup.Identity.ApplicationProtocol != sqlpolicy.ManagedGraphRequestApplicationProtocol || n.server == nil {
+	if !isManagedGraphApplicationProtocol(n.managedStartup.Identity.ApplicationProtocol) || n.server == nil {
 		release()
 		return ctx, nil, network.ErrNotReady
 	}
@@ -100,7 +100,7 @@ func (n *Node) ExecuteManagedGraph(ctx context.Context, original types.GraphComm
 		return network.GraphExecuteResponse{}, err
 	}
 	defer release()
-	if n.managedStartup.Identity.ApplicationProtocol != sqlpolicy.ManagedGraphRequestApplicationProtocol || n.server == nil {
+	if !isManagedGraphApplicationProtocol(n.managedStartup.Identity.ApplicationProtocol) || n.server == nil {
 		return network.GraphExecuteResponse{}, network.ErrNotReady
 	}
 	if err := n.admitInternalApplication(ctx); err != nil {

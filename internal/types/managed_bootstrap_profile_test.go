@@ -32,19 +32,30 @@ func TestManagedBootstrapProfileLegacyBytesAndMixedBinding(t *testing.T) {
 	for _, tc := range []struct {
 		protocol string
 		policy   sqlpolicy.MaterializationPolicy
-	}{{"", sqlpolicy.LegacyMaterializationPolicy}, {ManagedApplicationProtocolSQLKV, sqlpolicy.ManagedSQLKVMaterializationPolicy}, {sqlpolicy.ManagedRequestApplicationProtocol, sqlpolicy.ManagedRequestMaterializationPolicy}, {sqlpolicy.ManagedGraphRequestApplicationProtocol, sqlpolicy.ManagedGraphRequestMaterializationPolicy}} {
+	}{{"", sqlpolicy.LegacyMaterializationPolicy}, {ManagedApplicationProtocolSQLKV, sqlpolicy.ManagedSQLKVMaterializationPolicy}, {sqlpolicy.ManagedRequestAppendOnlyApplicationProtocol, sqlpolicy.ManagedRequestMaterializationPolicy}, {sqlpolicy.ManagedGraphRequestAppendOnlyApplicationProtocol, sqlpolicy.ManagedGraphRequestMaterializationPolicy}} {
 		policy, window, err := ManagedApplicationPolicy(tc.protocol)
 		if err != nil || policy != tc.policy || window != 65536 {
 			t.Fatalf("profile: %v %d %v", policy, window, err)
 		}
 	}
-	requestDigest, err := ManagedMemberConfigDigest(config, sqlpolicy.ManagedRequestApplicationProtocol)
+	requestDigest, err := ManagedMemberConfigDigest(config, sqlpolicy.ManagedRequestAppendOnlyApplicationProtocol)
 	if err != nil || requestDigest == member || requestDigest == mixedMember {
 		t.Fatalf("request profile member binding is not distinct: %v", err)
 	}
-	graphDigest, err := ManagedMemberConfigDigest(config, sqlpolicy.ManagedGraphRequestApplicationProtocol)
+	graphDigest, err := ManagedMemberConfigDigest(config, sqlpolicy.ManagedGraphRequestAppendOnlyApplicationProtocol)
 	if err != nil || graphDigest == requestDigest || graphDigest == member || graphDigest == mixedMember {
 		t.Fatalf("Graph profile member binding is not distinct: %v", err)
+	}
+	for _, retired := range []string{sqlpolicy.ManagedRequestApplicationProtocol, sqlpolicy.ManagedGraphRequestApplicationProtocol} {
+		if _, _, err := ManagedApplicationPolicy(retired); err == nil || !sqlpolicy.IsRetiredExperimentalApplicationProtocol(retired) {
+			t.Fatalf("retired protocol %q remains selectable: %v", retired, err)
+		}
+		if _, err := ManagedMemberConfigDigest(config, retired); err == nil {
+			t.Fatalf("retired protocol %q was accepted for member binding", retired)
+		}
+		if _, err := ManagedBootstrapPlanDigestForProtocol("cluster", nil, "source", retired, "", false, retired); err == nil {
+			t.Fatalf("retired protocol %q was accepted for plan binding", retired)
+		}
 	}
 	if _, _, err := ManagedApplicationPolicy("unknown"); err == nil {
 		t.Fatal("unknown protocol accepted")

@@ -79,7 +79,7 @@ func TestManagedGraphNodeInstallCrashChild(t *testing.T) {
 func TestManagedGraphPublicNodeRecoversRetainedInstallAndLaterSuffix(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 25*time.Second)
 	defer cancel()
-	configs, fixture := sqlClusterForProtocol(t, sqlpolicy.ManagedGraphRequestApplicationProtocol)
+	configs, fixture := sqlClusterForProtocol(t, sqlpolicy.ManagedGraphRequestAppendOnlyApplicationProtocol)
 	hosts := make([]*Host, 3)
 	for i := range configs {
 		configs[i].Runtime.CheckpointInterval = 200 * time.Millisecond

@@ -73,6 +73,7 @@ func commitUnknown(slot quepaxa.Slot, requestID string, err error) error {
 // Server is the HTTP server for client API.
 type Server struct {
 	expectedPolicy       sqlpolicy.MaterializationPolicy
+	managedProfile       *ManagedPeerProfile
 	core                 *quepaxa.Core
 	material             *materializer.Materializer
 	cluster              types.ClusterID
@@ -297,14 +298,38 @@ func NewServer(core *quepaxa.Core, material *materializer.Materializer, cluster 
 
 // NewServerForPolicy fixes execution and peer semantics before batchers start.
 func NewServerForPolicy(core *quepaxa.Core, material *materializer.Materializer, cluster types.ClusterID, writable bool, transport *Transport, expected sqlpolicy.MaterializationPolicy, ready ...func() bool) (*Server, error) {
+	return newServerForProfile(core, material, cluster, writable, transport, expected, nil, ready...)
+}
+
+// NewServerForManagedProfile fixes append-only execution semantics and requires
+// the peer transport to carry the same common generation/plan binding.
+func NewServerForManagedProfile(core *quepaxa.Core, material *materializer.Materializer, cluster types.ClusterID, writable bool, transport *Transport, profile ManagedPeerProfile, ready ...func() bool) (*Server, error) {
+	expected, _, err := types.ManagedApplicationPolicy(profile.ApplicationProtocol)
+	if err != nil {
+		return nil, err
+	}
+	return newServerForProfile(core, material, cluster, writable, transport, expected, &profile, ready...)
+}
+
+func newServerForProfile(core *quepaxa.Core, material *materializer.Materializer, cluster types.ClusterID, writable bool, transport *Transport, expected sqlpolicy.MaterializationPolicy, profile *ManagedPeerProfile, ready ...func() bool) (*Server, error) {
 	if err := expected.Validate(); err != nil {
 		return nil, err
+	}
+	var profileCopy *ManagedPeerProfile
+	if profile != nil {
+		if err := profile.validate(expected); err != nil {
+			return nil, err
+		}
+		copy := *profile
+		profileCopy = &copy
 	}
 	if material != nil && material.MaterializationPolicy() != expected {
 		return nil, sqlpolicy.ErrIncompatible
 	}
-	if transport != nil && transport.expectedPolicy != expected {
-		return nil, sqlpolicy.ErrIncompatible
+	if transport != nil {
+		if transport.expectedPolicy != expected || !sameManagedPeerProfile(transport.managedProfile, profileCopy) {
+			return nil, sqlpolicy.ErrIncompatible
+		}
 	}
 	proposalCtx, proposalStop := context.WithCancel(context.Background())
 	localMode := core != nil && core.LocalMode()
@@ -313,7 +338,7 @@ func NewServerForPolicy(core *quepaxa.Core, material *materializer.Materializer,
 		localLimit = 1
 	}
 	s := &Server{
-		expectedPolicy:   expected,
+		expectedPolicy: expected, managedProfile: profileCopy,
 		core:             core,
 		material:         material,
 		cluster:          cluster,

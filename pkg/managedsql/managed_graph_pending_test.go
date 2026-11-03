@@ -21,13 +21,24 @@ import (
 	"github.com/mrchypark/rhiza/pkg/checkpoint"
 	"github.com/mrchypark/rhiza/pkg/materializer"
 	"github.com/mrchypark/rhiza/pkg/network"
+	"github.com/mrchypark/rhiza/pkg/node"
 	"github.com/mrchypark/rhiza/pkg/quepaxa"
 )
 
 func managedGraphCertifiedCounts(t *testing.T, ctx context.Context, cfg Config, id string) (int, int) {
 	t.Helper()
 	cluster := quepaxa.Cluster{ConfigID: 1, Members: cfg.Runtime.Members}
-	peer, err := network.NewTransportForPolicy(cfg.Runtime.ClusterID, cfg.Runtime.NodeID, &cluster, cfg.Runtime.PeerToken, sqlpolicy.ManagedGraphRequestMaterializationPolicy)
+	identity := node.New(&cfg.Runtime)
+	physicalBinding, _, err := identity.PreparedStartupBindingDigestsForProtocol(cfg.Plan.ApplicationProtocol)
+	if err != nil {
+		t.Fatal("derive exact trusted profile binding for peer observer", err)
+	}
+	bootstrapDigest, err := identity.ManagedBootstrapPlanDigestForProtocol(physicalBinding, cfg.Plan.EvidenceFormat, cfg.Plan.ApplicationProtocol)
+	if err != nil || bootstrapDigest != cfg.Plan.BootstrapPlanDigest {
+		t.Fatalf("peer observer profile differs from exact public plan: digest=%q plan=%q err=%v", bootstrapDigest, cfg.Plan.BootstrapPlanDigest, err)
+	}
+	profile := network.ManagedPeerProfile{ApplicationProtocol: cfg.Plan.ApplicationProtocol, BootstrapPlanDigest: bootstrapDigest, Generation: int64(cfg.Plan.Generation)}
+	peer, err := network.NewTransportForManagedProfile(cfg.Runtime.ClusterID, cfg.Runtime.NodeID, &cluster, cfg.Runtime.PeerToken, profile)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -79,7 +90,7 @@ func TestManagedGraphPublicRestartHealsCertifiedNativePending(t *testing.T) {
 }
 
 func testManagedGraphPublicPending(t *testing.T, mode string) {
-	configs, fixture := sqlClusterForProtocol(t, sqlpolicy.ManagedGraphRequestApplicationProtocol)
+	configs, fixture := sqlClusterForProtocol(t, sqlpolicy.ManagedGraphRequestAppendOnlyApplicationProtocol)
 	ctx, cancel := context.WithTimeout(context.Background(), 25*time.Second)
 	defer cancel()
 	hosts := make([]*Host, len(configs))
@@ -264,7 +275,7 @@ func testManagedGraphPublicPending(t *testing.T, mode string) {
 		if err := hosts[1].Close(); err != nil {
 			t.Fatal(err)
 		}
-		observed, err := materializer.InspectManagedGraphInstallTarget(ctx, filepath.Join(configs[1].Runtime.DataDir, "sqlite.db"), types.DefaultIdempotencyWindowSlots)
+		observed, err := materializer.InspectManagedGraphInstallTarget(ctx, filepath.Join(configs[1].Runtime.DataDir, "sqlite.db"), types.DefaultIdempotencyWindowSlots, configs[1].Plan.ApplicationProtocol)
 		if err != nil || len(observed.Replay) == 0 {
 			t.Fatalf("restart fixture did not preserve actual native pending: state=%+v error=%v", observed, err)
 		}

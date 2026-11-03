@@ -13,6 +13,7 @@ import (
 	"io"
 	"net/url"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -29,6 +30,7 @@ import (
 const peerALPN = sqlpolicy.PeerALPN
 const managedKVPeerALPN = "rhiza-peer-managed-sql-kv-v1"
 const managedRequestPeerALPN = "rhiza-peer-managed-request-v1"
+const managedAppendOnlyPeerALPNPrefix = "rhiza-peer-managed-append-only-v1"
 
 func managedKVExecutionPolicy(policy sqlpolicy.MaterializationPolicy) bool {
 	return policy == sqlpolicy.ManagedSQLKVMaterializationPolicy || policy == sqlpolicy.ManagedRequestMaterializationPolicy || policy == sqlpolicy.ManagedGraphRequestMaterializationPolicy
@@ -57,6 +59,7 @@ type clusterResolver interface {
 // Transport sends private peer RPCs over persistent raw QUIC connections.
 type Transport struct {
 	expectedPolicy sqlpolicy.MaterializationPolicy
+	managedProfile *ManagedPeerProfile
 	members        map[quepaxa.NodeID]quepaxa.Member
 	peerKeys       map[quepaxa.NodeID]ed25519.PublicKey
 	clusterID      types.ClusterID
@@ -80,6 +83,44 @@ type Transport struct {
 	closed     bool
 }
 
+// ManagedPeerProfile binds a new append-only peer protocol to the common
+// trusted bootstrap plan. It deliberately excludes member-local WAL nonces.
+type ManagedPeerProfile struct {
+	ApplicationProtocol string
+	BootstrapPlanDigest string
+	Generation          int64
+}
+
+func (p ManagedPeerProfile) validate(expected sqlpolicy.MaterializationPolicy) error {
+	policy, _, err := types.ManagedApplicationPolicy(p.ApplicationProtocol)
+	if err != nil || !sqlpolicy.IsManagedAppendOnlyApplicationProtocol(p.ApplicationProtocol) || policy != expected || p.Generation < 0 {
+		return fmt.Errorf("invalid managed append-only peer profile")
+	}
+	digest, err := hex.DecodeString(p.BootstrapPlanDigest)
+	if err != nil || len(digest) != sha256.Size || hex.EncodeToString(digest) != p.BootstrapPlanDigest {
+		return fmt.Errorf("invalid managed append-only bootstrap plan digest")
+	}
+	return nil
+}
+
+func managedProfileALPN(profile ManagedPeerProfile, expected sqlpolicy.MaterializationPolicy) (string, error) {
+	if err := profile.validate(expected); err != nil {
+		return "", err
+	}
+	alpn := managedAppendOnlyPeerALPNPrefix + "/" + profile.ApplicationProtocol + "/g" + strconv.FormatInt(profile.Generation, 10) + "/" + profile.BootstrapPlanDigest
+	if len(alpn) == 0 || len(alpn) > 255 {
+		return "", fmt.Errorf("managed append-only ALPN exceeds protocol limit")
+	}
+	return alpn, nil
+}
+
+func sameManagedPeerProfile(a, b *ManagedPeerProfile) bool {
+	if a == nil || b == nil {
+		return a == nil && b == nil
+	}
+	return *a == *b
+}
+
 func NewTransport(clusterID types.ClusterID, localID quepaxa.NodeID, config *quepaxa.Cluster, peerToken string) *Transport {
 	t, _ := NewTransportForPolicy(clusterID, localID, config, peerToken, sqlpolicy.LegacyMaterializationPolicy)
 	return t
@@ -93,6 +134,25 @@ func NewTransportForPolicy(clusterID types.ClusterID, localID quepaxa.NodeID, co
 	}
 	if err != nil {
 		return nil, err
+	}
+	return t, nil
+}
+
+// NewTransportForManagedProfile fixes append-only peer semantics and binds
+// every TLS connection to the same trusted plan digest and generation.
+func NewTransportForManagedProfile(clusterID types.ClusterID, localID quepaxa.NodeID, config *quepaxa.Cluster, peerToken string, profile ManagedPeerProfile) (*Transport, error) {
+	expected, _, err := types.ManagedApplicationPolicy(profile.ApplicationProtocol)
+	if err != nil {
+		return nil, err
+	}
+	t, err := newTransportWithProfile(clusterID, localID, config, peerToken, nil, expected, &profile)
+	if err != nil {
+		return nil, err
+	}
+	if expected == sqlpolicy.ManagedGraphRequestMaterializationPolicy {
+		if err := t.ValidateManagedGraphWireBudget(); err != nil {
+			return nil, err
+		}
 	}
 	return t, nil
 }
@@ -128,6 +188,20 @@ func NewLearnerTransport(clusterID types.ClusterID, localID quepaxa.NodeID, conf
 }
 
 func NewLearnerTransportForPolicy(clusterID types.ClusterID, localID quepaxa.NodeID, configID uint, peers []PeerIdentity, adminToken string, expected sqlpolicy.MaterializationPolicy) (*Transport, error) {
+	return newLearnerTransportForProfile(clusterID, localID, configID, peers, adminToken, expected, nil)
+}
+
+// NewLearnerTransportForManagedProfile fixes append-only ALPN for a learner
+// joining the same bootstrap profile as its existing voters.
+func NewLearnerTransportForManagedProfile(clusterID types.ClusterID, localID quepaxa.NodeID, configID uint, peers []PeerIdentity, adminToken string, profile ManagedPeerProfile) (*Transport, error) {
+	expected, _, err := types.ManagedApplicationPolicy(profile.ApplicationProtocol)
+	if err != nil {
+		return nil, err
+	}
+	return newLearnerTransportForProfile(clusterID, localID, configID, peers, adminToken, expected, &profile)
+}
+
+func newLearnerTransportForProfile(clusterID types.ClusterID, localID quepaxa.NodeID, configID uint, peers []PeerIdentity, adminToken string, expected sqlpolicy.MaterializationPolicy, profile *ManagedPeerProfile) (*Transport, error) {
 	if err := expected.Validate(); err != nil {
 		return nil, err
 	}
@@ -137,7 +211,7 @@ func NewLearnerTransportForPolicy(clusterID types.ClusterID, localID quepaxa.Nod
 		members = append(members, quepaxa.Member{ID: peer.ID, PeerURL: peer.PeerURL, PublicKey: quepaxa.PublicKey(peer.PublicKey)})
 		keys[peer.ID] = append(ed25519.PublicKey(nil), peer.PublicKey[:]...)
 	}
-	learner, err := newTransport(clusterID, localID, &quepaxa.Cluster{ConfigID: configID, Members: members}, "", keys, expected)
+	learner, err := newTransportWithProfile(clusterID, localID, &quepaxa.Cluster{ConfigID: configID, Members: members}, "", keys, expected, profile)
 	if err != nil {
 		return nil, err
 	}
@@ -167,17 +241,29 @@ func peerALPNForPolicy(expected sqlpolicy.MaterializationPolicy) (string, error)
 }
 
 func newTransport(clusterID types.ClusterID, localID quepaxa.NodeID, config *quepaxa.Cluster, peerToken string, keys map[quepaxa.NodeID]ed25519.PublicKey, expected sqlpolicy.MaterializationPolicy) (*Transport, error) {
-	alpn, err := peerALPNForPolicy(expected)
+	return newTransportWithProfile(clusterID, localID, config, peerToken, keys, expected, nil)
+}
+
+func newTransportWithProfile(clusterID types.ClusterID, localID quepaxa.NodeID, config *quepaxa.Cluster, peerToken string, keys map[quepaxa.NodeID]ed25519.PublicKey, expected sqlpolicy.MaterializationPolicy, profile *ManagedPeerProfile) (*Transport, error) {
+	alpn, err := peerALPNForProfile(expected, profile)
 	if err != nil {
 		return nil, err
+	}
+	var profileCopy *ManagedPeerProfile
+	if profile != nil {
+		if err := profile.validate(expected); err != nil {
+			return nil, err
+		}
+		copy := *profile
+		profileCopy = &copy
 	}
 	peers := make(map[quepaxa.NodeID]*peerConnection, len(config.Members))
 	for _, member := range config.Members {
 		peers[member.ID] = &peerConnection{gate: make(chan struct{}, 1), active: make(map[*quic.Conn]int)}
 	}
 	return &Transport{
-		expectedPolicy: expected,
-		members:        config.MemberSet(), clusterID: clusterID, configID: config.ConfigID,
+		expectedPolicy: expected, managedProfile: profileCopy,
+		members: config.MemberSet(), clusterID: clusterID, configID: config.ConfigID,
 		localID: localID, peerToken: peerToken, peers: peers, peerKeys: keys,
 		tls: &tls.Config{
 			MinVersion: tls.VersionTLS13, NextProtos: []string{alpn},
@@ -185,6 +271,13 @@ func newTransport(clusterID types.ClusterID, localID quepaxa.NodeID, config *que
 		},
 		quic: &quic.Config{HandshakeIdleTimeout: 5 * time.Second, MaxIdleTimeout: 30 * time.Second, KeepAlivePeriod: 10 * time.Second, MaxIncomingStreams: 256}, dynamic: make(map[uint]*Transport),
 	}, nil
+}
+
+func peerALPNForProfile(expected sqlpolicy.MaterializationPolicy, profile *ManagedPeerProfile) (string, error) {
+	if profile != nil {
+		return managedProfileALPN(*profile, expected)
+	}
+	return peerALPNForPolicy(expected)
 }
 
 // BindCore makes requests resolve the immutable configuration for their slot.
@@ -248,7 +341,7 @@ func (t *Transport) transportForID(id uint, snapshot func() quepaxa.Cluster) (*T
 	// Each immutable configuration owns its pools and TLS session cache. A
 	// changed voter token therefore cannot reuse a previous configuration's
 	// connection or 0-RTT ticket.
-	peer, err := newTransport(t.clusterID, t.localID, &config, t.peerToken, nil, t.expectedPolicy)
+	peer, err := newTransportWithProfile(t.clusterID, t.localID, &config, t.peerToken, nil, t.expectedPolicy, t.managedProfile)
 	if err != nil {
 		return nil, err
 	}
@@ -893,7 +986,7 @@ func (t *Transport) sendTerminalDecision(ctx context.Context, decision quepaxa.D
 			union.Members = append(union.Members, member)
 		}
 	}
-	peer, err := newTransport(t.clusterID, t.localID, &union, t.peerToken, nil, t.expectedPolicy)
+	peer, err := newTransportWithProfile(t.clusterID, t.localID, &union, t.peerToken, nil, t.expectedPolicy, t.managedProfile)
 	if err != nil {
 		return err
 	}
@@ -1089,7 +1182,7 @@ func (t *Transport) VerifyLearner(ctx context.Context, learner quepaxa.Member, t
 	}
 	probeConfig := config
 	probeConfig.Members = append(append([]quepaxa.Member(nil), config.Members...), learner)
-	probe, err := newTransport(t.clusterID, t.localID, &probeConfig, t.peerToken, nil, t.expectedPolicy)
+	probe, err := newTransportWithProfile(t.clusterID, t.localID, &probeConfig, t.peerToken, nil, t.expectedPolicy, t.managedProfile)
 	if err != nil {
 		return err
 	}

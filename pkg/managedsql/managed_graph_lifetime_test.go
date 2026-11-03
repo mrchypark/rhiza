@@ -16,7 +16,7 @@ import (
 )
 
 func TestManagedGraphLongPollCloseCancelsBorrow(t *testing.T) {
-	configs, fixture := sqlClusterForProtocol(t, sqlpolicy.ManagedGraphRequestApplicationProtocol)
+	configs, fixture := sqlClusterForProtocol(t, sqlpolicy.ManagedGraphRequestAppendOnlyApplicationProtocol)
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 	defer cancel() // Cancel an unfinished read before Host cleanup on any failure.
 	hosts := make([]*Host, len(configs))

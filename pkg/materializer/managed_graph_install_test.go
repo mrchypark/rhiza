@@ -18,12 +18,32 @@ import (
 	"time"
 
 	latticedb "github.com/mrchypark/latticedb-go"
+	"github.com/mrchypark/rhiza/internal/sqlpolicy"
 	"github.com/mrchypark/rhiza/internal/types"
 )
 
 func managedGraphInstallFixture(t *testing.T) ManagedGraphInstall {
+	return managedGraphInstallFixtureForProtocol(t, "")
+}
+
+func managedGraphInstallFixtureForProtocol(t *testing.T, protocol string) ManagedGraphInstall {
 	t.Helper()
-	m := graphOriginalMaterializer(t, filepath.Join(t.TempDir(), "sqlite.db"))
+	path := filepath.Join(t.TempDir(), "sqlite.db")
+	var m *Materializer
+	var err error
+	if protocol == "" || protocol == sqlpolicy.ManagedGraphRequestApplicationProtocol {
+		m, err = OpenManagedSQLKVGraphWithOriginals(path, 1, 1024)
+	} else {
+		m, err = OpenManagedSQLKVGraphWithAppendOnlyOriginals(path, 1, 1024)
+	}
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		if err := m.Close(); err != nil {
+			t.Error(err)
+		}
+	})
 	if err := m.Apply(context.Background(), 1, graphOriginalValue(t, types.GraphCommand{RequestID: "verified", Cypher: `CREATE (:Item {id: 'verified'})`})); err != nil {
 		t.Fatal(err)
 	}
@@ -46,9 +66,35 @@ func managedGraphInstallFixture(t *testing.T) ManagedGraphInstall {
 	// This is an installer unit boundary, not a Core certificate fixture.
 	// Node authenticates the cut in its separate public startup qualification.
 	h := sha256.Sum256([]byte("unit-owner-authenticated-cut"))
-	return ManagedGraphInstall{Cut: ManagedGraphInstallCut{BindingHash: h, WALBindingHash: h, ConfigID: 1,
+	return ManagedGraphInstall{ApplicationProtocol: protocol, Cut: ManagedGraphInstallCut{BindingHash: h, WALBindingHash: h, ConfigID: 1,
 		CheckpointSlot: tip, CheckpointRoot: h, CheckpointStateHash: h, CheckpointPrefixHash: h,
 		CertifiedTip: tip, CertifiedPrefixHash: h, ExpectedGraphHistory: history, IdempotencyWindow: 1024}, Files: files}
+}
+
+func TestManagedAppendOnlyGraphInstallAndInspection(t *testing.T) {
+	protocol := sqlpolicy.ManagedGraphRequestAppendOnlyApplicationProtocol
+	input := managedGraphInstallFixtureForProtocol(t, protocol)
+	path := filepath.Join(t.TempDir(), "sqlite.db")
+	m, err := OpenManagedGraphFromVerifiedPair(context.Background(), path, 1, input)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if m.managedProtocol != protocol || m.MaterializationPolicy() != sqlpolicy.ManagedGraphRequestMaterializationPolicy {
+		t.Fatalf("installed profile mismatch: protocol=%q policy=%d", m.managedProtocol, m.MaterializationPolicy())
+	}
+	if err := m.Close(); err != nil {
+		t.Fatal(err)
+	}
+	state, err := InspectManagedGraphInstallTarget(context.Background(), path, 1024, protocol)
+	if err != nil || state.SQLiteTip != input.Cut.CertifiedTip || state.NativeHistory != input.Cut.ExpectedGraphHistory {
+		t.Fatalf("append-only Graph target inspection: state=%+v err=%v", state, err)
+	}
+	if _, err := InspectManagedGraphInstallTarget(context.Background(), path, 1024); err == nil {
+		t.Fatal("legacy Graph target inspection accepted append-only protocol")
+	}
+	if _, err := OpenManagedGraphFromVerifiedPair(context.Background(), path, 1, ManagedGraphInstall{Cut: input.Cut, Files: input.Files}); err == nil {
+		t.Fatal("legacy Graph install recovery accepted append-only protocol")
+	}
 }
 
 func TestManagedGraphInstallPairActualTarget(t *testing.T) {
@@ -142,7 +188,7 @@ func TestManagedGraphInstallDirtyWALRollback(t *testing.T) {
 		t.Fatalf("no actual dirty WAL: %v %v", info, err)
 	}
 	// Preflight may create reader sidecars but must not discard committed WAL.
-	if err := validateManagedGraphInstallTarget(context.Background(), path, 1024); err != nil {
+	if err := validateManagedGraphInstallTarget(context.Background(), path, 1024, sqlpolicy.ManagedGraphRequestApplicationProtocol); err != nil {
 		t.Fatal(err)
 	}
 	beforeSQL, err := inspectLocalOriginalSQL(path)
@@ -440,7 +486,7 @@ func TestManagedGraphTargetInspectionReturnsActualNativeAhead(t *testing.T) {
 	if !record.NativeCompleted || record.Slot != 1 || record.DecisionHash != sha256.Sum256(value) {
 		t.Fatalf("not actual full decision identity: %+v", record)
 	}
-	if err := validateManagedGraphInstallTarget(context.Background(), path, 1024); !errors.Is(err, ErrGraphApplyPending) {
+	if err := validateManagedGraphInstallTarget(context.Background(), path, 1024, sqlpolicy.ManagedGraphRequestApplicationProtocol); !errors.Is(err, ErrGraphApplyPending) {
 		t.Fatalf("installer did not preserve pending state: %v", err)
 	}
 	m, err = OpenManagedSQLKVGraphWithOriginals(path, 1, 1024)
@@ -537,7 +583,7 @@ func TestManagedGraphInstallAuthenticatedCrashRecovery(t *testing.T) {
 					if err != nil {
 						t.Fatalf("dirty child: %v %s", err, output)
 					}
-					if err := validateManagedGraphInstallTarget(context.Background(), path, 1024); err != nil {
+					if err := validateManagedGraphInstallTarget(context.Background(), path, 1024, sqlpolicy.ManagedGraphRequestApplicationProtocol); err != nil {
 						t.Fatal(err)
 					}
 				}

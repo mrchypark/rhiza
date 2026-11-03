@@ -11,11 +11,11 @@ import (
 )
 
 func TestV1Alpha2ClusterExplicitApplicationProtocols(t *testing.T) {
-	for _, protocol := range []string{"", types.ManagedApplicationProtocolSQLKV, sqlpolicy.ManagedRequestApplicationProtocol, "rhiza-managed-request/v2", "rhiza-managed-graph/v1", "unknown"} {
+	for _, protocol := range []string{"", types.ManagedApplicationProtocolSQLKV, sqlpolicy.ManagedRequestAppendOnlyApplicationProtocol, sqlpolicy.ManagedGraphRequestAppendOnlyApplicationProtocol, sqlpolicy.ManagedRequestApplicationProtocol, sqlpolicy.ManagedGraphRequestApplicationProtocol, "rhiza-managed-request/v2", "rhiza-managed-graph/v1", "unknown"} {
 		c := phase1Cluster()
 		create := "Create"
 		c.Spec.GenesisIntent, c.Spec.ApplicationProtocol = &create, protocol
-		valid := protocol == "" || protocol == types.ManagedApplicationProtocolSQLKV || protocol == sqlpolicy.ManagedRequestApplicationProtocol
+		valid := protocol == "" || protocol == types.ManagedApplicationProtocolSQLKV || protocol == sqlpolicy.ManagedRequestAppendOnlyApplicationProtocol || protocol == sqlpolicy.ManagedGraphRequestAppendOnlyApplicationProtocol
 		if err := ValidateV1Alpha2Cluster(c); (err == nil) != valid {
 			t.Fatalf("protocol=%q valid=%t error=%v", protocol, valid, err)
 		}

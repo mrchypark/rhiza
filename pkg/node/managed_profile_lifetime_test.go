@@ -2,6 +2,7 @@ package node
 
 import (
 	"context"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"net"
@@ -18,6 +19,7 @@ import (
 	"github.com/mrchypark/rhiza/internal/peertest"
 	"github.com/mrchypark/rhiza/internal/sqlpolicy"
 	"github.com/mrchypark/rhiza/internal/types"
+	"github.com/mrchypark/rhiza/pkg/qlog"
 	"github.com/mrchypark/rhiza/pkg/recovery"
 	"github.com/quic-go/quic-go"
 )
@@ -92,7 +94,7 @@ func (c *managedProfileLifetimeChecker) stop() error {
 }
 
 func TestManagedProfileStableAcrossPublicOpen(t *testing.T) {
-	for _, protocol := range []string{"", types.ManagedApplicationProtocolSQLKV} {
+	for _, protocol := range []string{"", types.ManagedApplicationProtocolSQLKV, sqlpolicy.ManagedRequestAppendOnlyApplicationProtocol, sqlpolicy.ManagedGraphRequestAppendOnlyApplicationProtocol} {
 		t.Run(protocol, func(t *testing.T) {
 			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 			defer cancel()
@@ -118,6 +120,11 @@ func TestManagedProfileStableAcrossPublicOpen(t *testing.T) {
 			config := &types.ExecutionConfig{NodeID: "member", ClusterID: "cluster", DataDir: filepath.Join(t.TempDir(), "node"), PeerAddr: conn.LocalAddr().String(), PeerToken: "peer", AdminToken: "admin", ObjStoreProvider: "s3", ObjStoreBucket: "test", ObjStoreEndpoint: strings.TrimPrefix(server.URL, "http://"), ObjStoreInsecure: true, ObjStoreAccessKey: "fixture", ObjStoreSecretKey: "fixture", ObjStoreRegion: "us-east-1", ObjStorePrefix: namespace.ConfigPrefix, ObjStoreDurability: types.ObjectStoreDurabilityBeforeAck, EnableReconfiguration: true, Members: []types.NodeConfig{peerMember("cluster", "member", "peer"), peerMember("cluster", "other", "other")}}
 			config.Members[0].PeerURL = "quic://" + conn.LocalAddr().String()
 			config.Members[1].PeerURL = "quic://" + other.LocalAddr().String()
+			if isManagedAppendOnlyProtocol(protocol) {
+				for i := range config.Members {
+					config.Members[i].WALIdentity = fmt.Sprintf("%064x", i+1)
+				}
+			}
 			n := New(config)
 			defer func() {
 				if err := n.Shutdown(); err != nil {
@@ -137,6 +144,33 @@ func TestManagedProfileStableAcrossPublicOpen(t *testing.T) {
 				t.Fatal(err)
 			}
 			identity := ManagedStartupIdentity{ApplicationProtocol: protocol, EvidenceFormat: format, Member: recovery.PreparedStartupIdentity{ClusterUID: "uid", DeploymentUID: "deployment", PodUID: "pod", NodeID: "member", SourceBinding: physical, ConfigDigest: member}, AssignmentID: "assignment", IntentHash: "intent", StorageID: "storage", PhysicalBinding: physical, BootstrapPlanDigest: common, Fresh: true}
+			if isManagedAppendOnlyProtocol(protocol) {
+				localNonce, err := hex.DecodeString(config.Members[0].WALIdentity)
+				if err != nil {
+					t.Fatal(err)
+				}
+				wal, err := qlog.Open(filepath.Join(config.DataDir, "qlog"))
+				if err != nil {
+					t.Fatal(err)
+				}
+				if err := wal.BindIdentity(localNonce); err != nil {
+					_ = wal.Close()
+					t.Fatal(err)
+				}
+				if err := wal.Close(); err != nil {
+					t.Fatal(err)
+				}
+				memberDigest, err := types.ManagedMemberConfigDigest(*config, protocol)
+				if err != nil {
+					t.Fatal(err)
+				}
+				profile := &managedVoterProfileBinding{ApplicationProtocol: protocol, BootstrapPlanDigest: common, MemberConfigDigest: memberDigest, Generation: 0}
+				localIdentity := voterIdentityForProfile(config, profile)
+				localIdentity.Nonce = config.Members[0].WALIdentity
+				if err := writeVoterIdentity(config.DataDir, localIdentity); err != nil {
+					t.Fatal(err)
+				}
+			}
 			if _, err := n.PrepareManagedSQLSource(ctx, identity, true); err != nil {
 				t.Fatal(err)
 			}

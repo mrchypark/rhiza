@@ -150,7 +150,7 @@ func (h *Host) inspectEvidence(ctx context.Context, fresh, localRead bool) (json
 
 // Keep the evidence and the exact runtime validated by its inspector together.
 func (h *Host) inspectEvidenceSnapshot(ctx context.Context, fresh, localRead bool) (json.RawMessage, node.ManagedRuntimeState, error) {
-	if h.cfg.Plan.ApplicationProtocol == sqlpolicy.ManagedGraphRequestApplicationProtocol {
+	if sqlpolicy.IsManagedGraphRequestApplicationProtocol(h.cfg.Plan.ApplicationProtocol) {
 		state, err := h.node.InspectManagedGraph(ctx, fresh, localRead)
 		if err != nil {
 			return nil, node.ManagedRuntimeState{}, err

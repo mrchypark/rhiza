@@ -19,6 +19,28 @@ import (
 	"github.com/mrchypark/rhiza/pkg/quepaxa"
 )
 
+func TestAppendOnlyHostProfileClassification(t *testing.T) {
+	for _, tc := range []struct {
+		protocol string
+		internal bool
+		graph    bool
+	}{
+		{sqlpolicy.ManagedRequestApplicationProtocol, true, false},
+		{sqlpolicy.ManagedRequestAppendOnlyApplicationProtocol, true, false},
+		{sqlpolicy.ManagedGraphRequestApplicationProtocol, true, true},
+		{sqlpolicy.ManagedGraphRequestAppendOnlyApplicationProtocol, true, true},
+		{sqlpolicy.ManagedRequestAppendOnlyApplicationProtocol + "-unknown", false, false},
+	} {
+		h := &Host{cfg: Config{Plan: operator.V1Alpha2ApplicationInitPlan{ApplicationProtocol: tc.protocol}}}
+		if got := h.internalRequests(); got != tc.internal {
+			t.Fatalf("protocol %q internal=%t want %t", tc.protocol, got, tc.internal)
+		}
+		if got := sqlpolicy.IsManagedGraphRequestApplicationProtocol(tc.protocol); got != tc.graph {
+			t.Fatalf("protocol %q graph=%t want %t", tc.protocol, got, tc.graph)
+		}
+	}
+}
+
 func testHintOriginal(kind, id string) applicationOriginal {
 	if kind == "kv" {
 		return applicationOriginal{kind: kind, kv: types.KVCommand{RequestID: id, Operation: "put", Key: "key"}}
@@ -271,7 +293,7 @@ func TestInternalRequestNoArgUnknownOrAmbiguous(t *testing.T) {
 // fault is Kubernetes-only, not a real-cloud or process-termination experiment.
 func openInternalRequestHosts(t *testing.T, outage *atomic.Bool, attempts *atomic.Int64, setup ...func(*sqlWireControl)) ([]Config, []*Host, *sqlStatusFixture) {
 	t.Helper()
-	configs, fixture := sqlClusterForProtocol(t, sqlpolicy.ManagedRequestApplicationProtocol)
+	configs, fixture := sqlClusterForProtocol(t, sqlpolicy.ManagedRequestAppendOnlyApplicationProtocol)
 	if len(setup) > 1 {
 		t.Fatal("one optional source fixture setup expected")
 	}

@@ -55,6 +55,7 @@ jobs:
           printf '%s\n' "$RUNNER_TEMP/ha-managed-tools" >> "$GITHUB_PATH"
       - name: Static harness checks
         run: |
+          sh scripts/test-ha-managed-fixture-profile-selectors.sh
           sh -n scripts/test-ha-managed-bootstrap.sh
           sh -n scripts/ha-managed-bootstrap-fixture.sh
           sh -n scripts/managed-ffi-contract-entrypoint.sh

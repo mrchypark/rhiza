@@ -38,6 +38,9 @@ type Config struct {
 	// ReconfigurationAdmission must approve every added voter after it has
 	// caught up durably. A nil callback rejects additions.
 	ReconfigurationAdmission func(context.Context, Cluster, Slot, [32]byte) error
+	// ManagedAppendOnly fixes the V1 managed checkpoint policy at construction.
+	// Nil preserves the legacy and Local checkpoint protocols.
+	ManagedAppendOnly *ManagedAppendOnlyConfig
 }
 
 // New validates and creates a QuePaxa core.
@@ -124,10 +127,15 @@ func newCoreFromConfig(config Config, observer, learner, localReadOnlyInspection
 	if len(config.Cluster.Members) > 1 && config.Transport == nil && !observer {
 		return nil, fmt.Errorf("%w: transport is required for multiple members", ErrInvalidConfig)
 	}
+	managedAppendOnly, err := validateManagedAppendOnlyConfig(config.ManagedAppendOnly, config.WAL, config.NodeID, localMember, config.LocalMode)
+	if err != nil {
+		return nil, fmt.Errorf("%w: managed append-only binding: %w", ErrInvalidConfig, err)
+	}
 	cluster := config.Cluster
 	cluster.Members = append([]Member(nil), config.Cluster.Members...)
 	core := newCore(config.NodeID, &cluster, config.WAL, config.Transport)
 	core.validateValue = config.ValidateValue
+	core.managedAppendOnly = managedAppendOnly
 	core.localMode = config.LocalMode
 	core.localCost = localCost
 	core.observer = observer

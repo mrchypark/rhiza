@@ -150,6 +150,9 @@ func Open(dbPath string, readerCount int, idempotencyWindow ...uint64) (*Materia
 }
 
 func openWithProtocol(dbPath string, readerCount int, protocol string, idempotencyWindow ...uint64) (*Materializer, error) {
+	if protocol != "" && protocol != types.ManagedApplicationProtocolSQLKV && !originalsProtocol(protocol) {
+		return nil, fmt.Errorf("unsupported managed application protocol")
+	}
 	// SQLite receives this path as a file: URL, where a relative path lands in the
 	// authority part and resolves against the filesystem root. Resolve it first so
 	// a relative data directory stays where the caller's working directory is.

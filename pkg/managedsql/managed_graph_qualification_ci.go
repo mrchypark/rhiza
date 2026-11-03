@@ -56,7 +56,7 @@ func (h *Host) ObserveManagedGraphQualification(ctx context.Context, rawID strin
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	var out ManagedGraphQualificationObservation
-	if h.closed || h.node == nil || h.cfg.Plan.ApplicationProtocol != sqlpolicy.ManagedGraphRequestApplicationProtocol {
+	if h.closed || h.node == nil || !sqlpolicy.IsManagedGraphRequestApplicationProtocol(h.cfg.Plan.ApplicationProtocol) {
 		return out, fmt.Errorf("open policy10 Host required")
 	}
 	if err := h.node.EnsureInitialManagedAdmission(ctx); err != nil {

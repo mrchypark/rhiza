@@ -12,7 +12,10 @@ func TestManagedRequestProfileRequiresOwnEvidence(t *testing.T) {
 	}{
 		{"", V1Alpha2ManagedSQLEvidenceFormat, true},
 		{V1Alpha2ManagedSQLKVEvidenceFormat, V1Alpha2ManagedSQLKVEvidenceFormat, true},
-		{sqlpolicy.ManagedRequestApplicationProtocol, sqlpolicy.ManagedRequestApplicationProtocol, true},
+		{sqlpolicy.ManagedRequestAppendOnlyApplicationProtocol, sqlpolicy.ManagedRequestAppendOnlyApplicationProtocol, true},
+		{sqlpolicy.ManagedGraphRequestAppendOnlyApplicationProtocol, sqlpolicy.ManagedGraphRequestAppendOnlyApplicationProtocol, true},
+		{sqlpolicy.ManagedRequestApplicationProtocol, sqlpolicy.ManagedRequestApplicationProtocol, false},
+		{sqlpolicy.ManagedGraphRequestApplicationProtocol, sqlpolicy.ManagedGraphRequestApplicationProtocol, false},
 		{sqlpolicy.ManagedRequestApplicationProtocol, V1Alpha2ManagedSQLKVEvidenceFormat, false},
 		{V1Alpha2ManagedSQLKVEvidenceFormat, sqlpolicy.ManagedRequestApplicationProtocol, false},
 		{"unknown", "unknown", false},

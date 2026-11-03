@@ -42,6 +42,12 @@ func OpenManagedSQLKVWithOriginals(path string, readers int, window ...uint64) (
 	return openWithProtocol(path, readers, sqlpolicy.ManagedRequestApplicationProtocol, window...)
 }
 
+// OpenManagedSQLKVWithAppendOnlyOriginals selects the explicit append-only
+// request profile while preserving policy 9 materialization.
+func OpenManagedSQLKVWithAppendOnlyOriginals(path string, readers int, window ...uint64) (*Materializer, error) {
+	return openWithProtocol(path, readers, sqlpolicy.ManagedRequestAppendOnlyApplicationProtocol, window...)
+}
+
 func insertRequestOriginal(ctx context.Context, tx *sql.Tx, kind types.MutationKind, id string, slot uint64, index uint32, execution []byte) error {
 	if _, err := tx.ExecContext(ctx, `INSERT INTO _rhiza_request_original(kind,request_id,commit_slot,batch_index,execution) VALUES(?,?,?,?,?)`, kind, id, slot, index, execution); err != nil {
 		return err
@@ -232,12 +238,25 @@ func validateRequestOriginals(ctx context.Context, tx *sql.Tx, tip, window uint6
 // InspectManagedRequestFile validates a stable profile 9 file using the same
 // complete evidence path as live inspection. It never upgrades source files.
 func InspectManagedRequestFile(ctx context.Context, path string, window uint64) (ManagedApplicationState, uint64, error) {
+	return inspectManagedRequestFile(ctx, path, window, sqlpolicy.ManagedRequestApplicationProtocol)
+}
+
+// InspectManagedAppendOnlyRequestFile validates an exact append-only request
+// file using the complete evidence path. It never upgrades source files.
+func InspectManagedAppendOnlyRequestFile(ctx context.Context, path string, window uint64) (ManagedApplicationState, uint64, error) {
+	return inspectManagedRequestFile(ctx, path, window, sqlpolicy.ManagedRequestAppendOnlyApplicationProtocol)
+}
+
+func inspectManagedRequestFile(ctx context.Context, path string, window uint64, protocol string) (ManagedApplicationState, uint64, error) {
 	if window < 1024 || window > 1_048_576 {
 		return ManagedApplicationState{}, 0, fmt.Errorf("invalid request receipt window")
+	}
+	if !sqlpolicy.IsManagedRequestApplicationProtocol(protocol) || sqlpolicy.IsManagedGraphRequestApplicationProtocol(protocol) {
+		return ManagedApplicationState{}, 0, fmt.Errorf("invalid request application protocol")
 	}
 	if err := validateManagedArtifacts(path); err != nil {
 		return ManagedApplicationState{}, 0, err
 	}
-	state, tip, err := inspectApplicationFile(ctx, path, window, sqlpolicy.ManagedRequestApplicationProtocol)
+	state, tip, err := inspectApplicationFile(ctx, path, window, protocol)
 	return ManagedApplicationState(state), tip, err
 }

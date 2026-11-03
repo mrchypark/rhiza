@@ -24,7 +24,7 @@ import (
 func TestManagedGraphActualUnknownRetainsNativeOriginal(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 25*time.Second)
 	defer cancel()
-	configs, fixture := sqlClusterForProtocol(t, sqlpolicy.ManagedGraphRequestApplicationProtocol)
+	configs, fixture := sqlClusterForProtocol(t, sqlpolicy.ManagedGraphRequestAppendOnlyApplicationProtocol)
 	var armed, outage atomic.Bool
 	var kubeRequests atomic.Int64
 	entered, release := make(chan string, 8), make(chan struct{})

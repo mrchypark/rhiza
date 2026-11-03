@@ -2,9 +2,11 @@ package operator
 
 import (
 	"encoding/json"
+	"os"
 	"strings"
 	"testing"
 
+	"github.com/mrchypark/rhiza/internal/sqlpolicy"
 	"github.com/mrchypark/rhiza/internal/types"
 )
 
@@ -13,6 +15,22 @@ func phase9ClusterWithProtocol(protocol string) string {
 		return phase8Cluster
 	}
 	return strings.Replace(phase8Cluster, "\"genesisIntent\":\"Create\"", "\"genesisIntent\":\"Create\",\"applicationProtocol\":\""+protocol+"\"", 1)
+}
+
+func TestManagedProfileCRDEnumRetiresExperimentalProtocols(t *testing.T) {
+	raw, err := os.ReadFile("../../deploy/operator/cluster-crd.yaml")
+	if err != nil {
+		t.Fatal(err)
+	}
+	const enum = "enum: [rhiza-managed-sql-kv/v1, rhiza-managed-request-append-only/v1, rhiza-managed-request-graph-append-only/v1]"
+	if strings.Count(string(raw), enum) != 2 {
+		t.Fatal("cluster and assigned-plan protocol enums must retain SQLKV and only final append-only profiles")
+	}
+	for _, retired := range []string{"rhiza-managed-request/v1", "rhiza-managed-request-graph/v1"} {
+		if strings.Contains(string(raw), retired) {
+			t.Fatalf("CRD still advertises retired experimental protocol %q", retired)
+		}
+	}
 }
 
 func phase9MixedRuntimeProfile() V1Alpha2RuntimeProfile {
@@ -57,6 +75,12 @@ func TestManagedBootstrapProfileInstalledMismatchBeforeWrites(t *testing.T) {
 	}{
 		{"legacy live mixed installed", "", func(*V1Alpha2RuntimeProfile) {}},
 		{"mixed live legacy installed", types.ManagedApplicationProtocolSQLKV, func(p *V1Alpha2RuntimeProfile) { *p = phase9RuntimeProfile() }},
+		{"retired request protocol", sqlpolicy.ManagedRequestApplicationProtocol, func(p *V1Alpha2RuntimeProfile) {
+			p.ApplicationProtocol, p.EvidenceFormat = sqlpolicy.ManagedRequestApplicationProtocol, sqlpolicy.ManagedRequestApplicationProtocol
+		}},
+		{"retired graph protocol", sqlpolicy.ManagedGraphRequestApplicationProtocol, func(p *V1Alpha2RuntimeProfile) {
+			p.ApplicationProtocol, p.EvidenceFormat = sqlpolicy.ManagedGraphRequestApplicationProtocol, sqlpolicy.ManagedGraphRequestApplicationProtocol
+		}},
 		{"unknown protocol", "unknown/v1", func(p *V1Alpha2RuntimeProfile) { p.ApplicationProtocol = "unknown/v1" }},
 		{"wrong evidence", types.ManagedApplicationProtocolSQLKV, func(p *V1Alpha2RuntimeProfile) { p.EvidenceFormat = V1Alpha2ManagedSQLEvidenceFormat }},
 		{"missing image", types.ManagedApplicationProtocolSQLKV, func(p *V1Alpha2RuntimeProfile) { p.InitImage = "" }},

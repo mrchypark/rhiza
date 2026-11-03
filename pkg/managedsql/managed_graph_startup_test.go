@@ -12,7 +12,7 @@ import (
 // Explicit original genesis is allowed without inventing a checkpoint. A later
 // registered restart is not that first genesis and cannot bypass required roots.
 func TestManagedGraphRegisteredRestartRequiresProducerRoot(t *testing.T) {
-	configs, fixture := sqlClusterForProtocol(t, sqlpolicy.ManagedGraphRequestApplicationProtocol)
+	configs, fixture := sqlClusterForProtocol(t, sqlpolicy.ManagedGraphRequestAppendOnlyApplicationProtocol)
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
 	first, err := fixture.open(ctx, configs[0])

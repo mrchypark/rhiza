@@ -19,7 +19,7 @@ import (
 func TestManagedGraphInitialRootCloseCancelsBackgroundWait(t *testing.T) {
 	for _, operation := range []string{"execute", "query"} {
 		t.Run(operation, func(t *testing.T) {
-			configs, fixture := sqlClusterForProtocol(t, sqlpolicy.ManagedGraphRequestApplicationProtocol)
+			configs, fixture := sqlClusterForProtocol(t, sqlpolicy.ManagedGraphRequestAppendOnlyApplicationProtocol)
 			rootRelease := make(chan struct{})
 			var releaseOnce sync.Once
 			releaseRoot := func() { releaseOnce.Do(func() { close(rootRelease) }) }
@@ -95,7 +95,7 @@ func TestManagedGraphInitialRootCloseCancelsBackgroundWait(t *testing.T) {
 }
 
 func TestManagedGraphInitialRootBlocksApplicationAndHonorsCancellation(t *testing.T) {
-	configs, fixture := sqlClusterForProtocol(t, sqlpolicy.ManagedGraphRequestApplicationProtocol)
+	configs, fixture := sqlClusterForProtocol(t, sqlpolicy.ManagedGraphRequestAppendOnlyApplicationProtocol)
 	rootRelease := make(chan struct{})
 	var releaseOnce sync.Once
 	releaseRoot := func() { releaseOnce.Do(func() { close(rootRelease) }) }

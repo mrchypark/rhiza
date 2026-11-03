@@ -65,9 +65,13 @@ func (n *Node) ManagedVoterWALIdentity(ctx context.Context, configID uint, abort
 	}) {
 		return "", fmt.Errorf("bootstrap voter key differs from current certified member")
 	}
-	want := voterIdentityFor(&cfg)
+	profile, profileErr := n.managedVoterProfileFor(&cfg)
+	if profileErr != nil {
+		return "", profileErr
+	}
+	want := voterIdentityForProfile(&cfg, profile)
 	want.Nonce, want.Registered = got.Nonce, true
-	if got != want || member.WALIdentity != "" && member.WALIdentity != got.Nonce {
+	if !sameVoterIdentity(got, want) || member.WALIdentity != "" && member.WALIdentity != got.Nonce {
 		return "", ErrVoterStateLost
 	}
 	if err := check(); err != nil {

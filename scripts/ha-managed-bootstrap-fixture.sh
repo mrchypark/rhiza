@@ -201,15 +201,34 @@ managed_graph_cabi_self_test() (
   done
 )
 
+managed_fixture_profile_family() {
+  case "$1" in
+    internal|internal-append-only) printf '%s\n' internal ;;
+    graph|graph-append-only) printf '%s\n' graph ;;
+    *) printf '%s\n' other ;;
+  esac
+}
+
+managed_fixture_profile_protocol() {
+  case "$1" in
+    internal|internal-append-only) printf '%s\n' rhiza-managed-request-append-only/v1 ;;
+    graph|graph-append-only) printf '%s\n' rhiza-managed-request-graph-append-only/v1 ;;
+    *) return 1 ;;
+  esac
+}
+
 managed_fixture() {
 fixture_case=${RHIZA_MANAGED_FIXTURE_CASE:-legacy}
 case "$fixture_case" in
   legacy) fixture_protocol='' fixture_evidence=rhiza-managed-sql/v1 ;;
   mixed) fixture_protocol=rhiza-managed-sql-kv/v1 fixture_evidence=rhiza-managed-sql-kv/v1 ;;
-  internal) fixture_protocol=rhiza-managed-request/v1 fixture_evidence=rhiza-managed-request/v1 ;;
-  graph) fixture_protocol=rhiza-managed-request-graph/v1 fixture_evidence=rhiza-managed-request-graph/v1 ;;
+  internal|internal-append-only|graph|graph-append-only)
+    fixture_protocol=$(managed_fixture_profile_protocol "$fixture_case") || return 1
+    fixture_evidence=$fixture_protocol
+    ;;
   *) echo 'invalid managed fixture case' >&2; return 1 ;;
 esac
+fixture_family=$(managed_fixture_profile_family "$fixture_case")
 floci_node_selector='{}'
 fixture_provider=${fixture_provider-s3}
 case "$fixture_provider" in
@@ -259,7 +278,7 @@ printf '%s' "$admin" > "$private/admin.token"
 fixture_gcs_credentials=/dev/null
 if [ "$fixture_provider" = gcs ]; then fixture_gcs_credentials=$private/gcs-emulator.json; fi
 jq -n --arg image "$image" --rawfile admin "$private/admin.token" --rawfile gcs "$fixture_gcs_credentials" --arg provider "$fixture_provider" --arg bucket "$bucket" --arg root "ci-$nonce" --arg protocol "$fixture_protocol" --arg evidence "$fixture_evidence" '{InitImage:$image,PeerPort:9090,EvidenceFormat:$evidence,ProfileSecretName:"runtime",Storage:{enable_reconfiguration:true,admin_token:$admin,objstore_provider:$provider,objstore_bucket:$bucket,objstore_prefix:$root,objstore_durability:"before-ack"}} | .Storage += (if $provider=="s3" then {objstore_endpoint:"floci:4566",objstore_region:"us-east-1",objstore_insecure:true,objstore_access_key:"rhiza-local-test",objstore_secret_key:"rhiza-local-test"} elif $provider=="gcs" then {objstore_insecure:false,objstore_service_account:$gcs} else {objstore_insecure:false,objstore_azure_storage_account:"rhizatest",objstore_azure_connection_string:("DefaultEndpointsProtocol=http;AccountName=rhizatest;AccountKey="+("rhiza-local-test-key-only-32bytes!"|@base64)+";BlobEndpoint=http://floci:4577/rhizatest;")} end) | if $protocol=="" then . else .ApplicationProtocol=$protocol end' > "$private/runtime.json"
-if [ "$fixture_case" = graph ]; then
+if [ "$fixture_family" = graph ]; then
   # This exercises the real policy10 product worker, not a test-only publisher.
   jq '.Storage.checkpoint_interval=1000000000 | .Storage.checkpoint_tail_bytes=1' "$private/runtime.json" > "$private/runtime.graph.json"
   mv "$private/runtime.graph.json" "$private/runtime.json"
@@ -332,6 +351,7 @@ run_client() {
   sed '/^RHIZA_HTTP_CODE=[0-9][0-9][0-9]$/d' "$client_raw" > "$logs/$job.json"
   jq -e . "$logs/$job.json" >/dev/null
 }
+
 run_client create-sql execute '{"request_id":"bootstrap-create","sql":"CREATE TABLE bootstrap_ci (id INTEGER PRIMARY KEY, value TEXT)"}'
 run_client insert-sql execute '{"request_id":"bootstrap-insert","sql":"INSERT INTO bootstrap_ci VALUES (1, '\''real-kubelet'\'')"}'
 run_client query query '{"sql":"SELECT id, value FROM bootstrap_ci"}'
@@ -341,7 +361,7 @@ if [ "$fixture_case" != legacy ]; then
   producer_pod=$(jq -er --arg uid "$producer_uid" '.items[]|select(.metadata.uid==$uid)|.metadata.name' "$logs/ready-pods.json")
   jq -e 'all(.items[]; all(.status.containerStatuses[]; .restartCount==0))' "$logs/ready-pods.json" >/dev/null
   k -n "$namespace" logs "$producer_pod" -c sql > "$logs/rust-mixed-prefault.log"
-  if [ "$fixture_case" = internal ]; then
+  if [ "$fixture_family" = internal ]; then
     [ "$(grep -Fxc 'RHIZA_ACTUAL_MATERIALIZATION_PROFILE=9' "$logs/rust-mixed-prefault.log")" = 1 ]
   fi
   managed_mixed_tuple_oracle "$logs/rust-mixed-prefault.log" initial "$producer_uid" "$logs/rust-mixed-prefault-tuple.json"
@@ -350,7 +370,7 @@ if [ "$fixture_case" != legacy ]; then
   jq -e '.rows|length==1 and (.[0]|length)==1' "$logs/mixed-prefault.json" >/dev/null
   jq -S '.rows[0][0]|fromjson' "$logs/mixed-prefault.json" > "$logs/rust-mixed-prefault-row.json"
   cmp "$logs/rust-mixed-prefault-tuple.json" "$logs/rust-mixed-prefault-row.json"
-  if [ "$fixture_case" = graph ]; then
+  if [ "$fixture_family" = graph ]; then
     [ "$(grep -Fxc 'RHIZA_ACTUAL_MATERIALIZATION_PROFILE=10' "$logs/rust-mixed-prefault.log")" = 1 ]
     managed_graph_tuple_oracle "$logs/rust-mixed-prefault.log" initial "$producer_uid" "$logs/rust-graph-prefault-tuple.json"
     managed_graph_cabi_oracle "$logs/rust-mixed-prefault.log" "$producer_uid" "$logs/graph-cabi-prefault.json"
@@ -393,11 +413,11 @@ if [ "${RHIZA_MANAGED_TEST_DOCKERFILE-}" = Dockerfile.managed-ffi-contract ]; th
   # A failed test must not become a pass through kubelet retries/new request IDs.
   [ "$restart_before" = 0 ] || { echo 'FFI contract initial main restarted; retain first failure' >&2; return 1; }
   k -n "$namespace" logs "$replacement_pod" -c sql > "$logs/go-ffi-contract-first.log"
-  if [ "$fixture_case" = internal ]; then
+  if [ "$fixture_family" = internal ]; then
     [ "$(grep -Fxc 'RHIZA_ACTUAL_MATERIALIZATION_PROFILE=9' "$logs/go-ffi-contract-first.log")" = 1 ]
   fi
   if [ "$fixture_case" != legacy ]; then
-    if [ "$fixture_case" = graph ]; then
+    if [ "$fixture_family" = graph ]; then
       [ "$(grep -Fxc 'RHIZA_ACTUAL_MATERIALIZATION_PROFILE=10' "$logs/go-ffi-contract-first.log")" = 1 ]
       managed_graph_tuple_oracle "$logs/go-ffi-contract-first.log" verify "$replacement_uid" "$logs/rust-graph-replacement-tuple.json"
       managed_graph_cabi_oracle "$logs/go-ffi-contract-first.log" "$replacement_uid" "$logs/graph-cabi-replacement.json"
@@ -427,11 +447,11 @@ done
 if [ "${RHIZA_MANAGED_TEST_DOCKERFILE-}" = Dockerfile.managed-ffi-contract ]; then
   jq -e --argjson before "$restart_before" 'any(.status.containerStatuses[]; .name=="sql" and .restartCount==($before+1))' "$logs/restarted-pod.json" >/dev/null
   k -n "$namespace" logs "$replacement_pod" -c sql > "$logs/go-ffi-contract-restart.log"
-  if [ "$fixture_case" = internal ]; then
+  if [ "$fixture_family" = internal ]; then
     [ "$(grep -Fxc 'RHIZA_ACTUAL_MATERIALIZATION_PROFILE=9' "$logs/go-ffi-contract-restart.log")" = 1 ]
   fi
   if [ "$fixture_case" != legacy ]; then
-    if [ "$fixture_case" = graph ]; then
+    if [ "$fixture_family" = graph ]; then
       [ "$(grep -Fxc 'RHIZA_ACTUAL_MATERIALIZATION_PROFILE=10' "$logs/go-ffi-contract-restart.log")" = 1 ]
       managed_graph_tuple_oracle "$logs/go-ffi-contract-restart.log" verify "$replacement_uid" "$logs/rust-graph-restart-tuple.json"
       managed_graph_cabi_oracle "$logs/go-ffi-contract-restart.log" "$replacement_uid" "$logs/graph-cabi-restart.json"

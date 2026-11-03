@@ -79,9 +79,9 @@ func rustFixtureProfile(protocol string) (string, error) {
 		return "sql", nil
 	case types.ManagedApplicationProtocolSQLKV:
 		return "mixed", nil
-	case sqlpolicy.ManagedRequestApplicationProtocol:
+	case sqlpolicy.ManagedRequestAppendOnlyApplicationProtocol:
 		return "internal", nil
-	case sqlpolicy.ManagedGraphRequestApplicationProtocol:
+	case sqlpolicy.ManagedGraphRequestAppendOnlyApplicationProtocol:
 		return "graph", nil
 	default:
 		return "", errors.New("unsupported explicit Rust fixture protocol")
@@ -89,20 +89,22 @@ func rustFixtureProfile(protocol string) (string, error) {
 }
 
 func TestRustFixtureProfileSelection(t *testing.T) {
-	for _, tc := range []struct{ protocol, want string }{{"", "sql"}, {types.ManagedApplicationProtocolSQLKV, "mixed"}, {sqlpolicy.ManagedRequestApplicationProtocol, "internal"}, {sqlpolicy.ManagedGraphRequestApplicationProtocol, "graph"}} {
+	for _, tc := range []struct{ protocol, want string }{{"", "sql"}, {types.ManagedApplicationProtocolSQLKV, "mixed"}, {sqlpolicy.ManagedRequestAppendOnlyApplicationProtocol, "internal"}, {sqlpolicy.ManagedGraphRequestAppendOnlyApplicationProtocol, "graph"}} {
 		got, err := rustFixtureProfile(tc.protocol)
 		if err != nil || got != tc.want {
 			t.Fatalf("profile selection %q: %q %v", tc.protocol, got, err)
 		}
 	}
-	for _, unknown := range []string{"rhiza-managed-request/v2", "rhiza-managed-request-graph/v2", "rhiza-managed-request-graph", "graph", "10"} {
+	for _, unknown := range []string{sqlpolicy.ManagedRequestApplicationProtocol, sqlpolicy.ManagedGraphRequestApplicationProtocol, "rhiza-managed-request/v2", "rhiza-managed-request-graph/v2", "rhiza-managed-request-graph", "graph", "10"} {
 		if _, err := rustFixtureProfile(unknown); err == nil {
 			t.Fatal("unknown profile fell back")
 		}
 	}
-	policy, _, err := types.ManagedApplicationPolicy(sqlpolicy.ManagedGraphRequestApplicationProtocol)
-	if err != nil || policy != sqlpolicy.ManagedGraphRequestMaterializationPolicy {
-		t.Fatalf("Graph selector is not the exact installed profile10: policy=%d error=%v", policy, err)
+	for _, protocol := range []string{sqlpolicy.ManagedGraphRequestAppendOnlyApplicationProtocol} {
+		policy, _, err := types.ManagedApplicationPolicy(protocol)
+		if err != nil || policy != sqlpolicy.ManagedGraphRequestMaterializationPolicy {
+			t.Fatalf("Graph selector is not the exact installed profile10: protocol=%q policy=%d error=%v", protocol, policy, err)
+		}
 	}
 }
 
@@ -117,7 +119,7 @@ func TestManagedInternalMaterializationMarker(t *testing.T) {
 		t.Fatal("internal runtime profile unavailable")
 	}
 	profile, decodeErr := operator.DecodeV1Alpha2RuntimeProfile(file)
-	if err := errors.Join(decodeErr, file.Close()); err != nil || profile.ApplicationProtocol != sqlpolicy.ManagedRequestApplicationProtocol {
+	if err := errors.Join(decodeErr, file.Close()); err != nil || profile.ApplicationProtocol != sqlpolicy.ManagedRequestAppendOnlyApplicationProtocol {
 		t.Fatal("actual runtime profile is not internal")
 	}
 	if err := sqlpolicy.CheckFileForPolicy(context.Background(), filepath.Join(operator.V1Alpha2BootstrapDataDir, "data", "sqlite.db"), sqlpolicy.ManagedRequestMaterializationPolicy); err != nil {

@@ -26,7 +26,7 @@ func policyForProtocol(protocol string) sqlpolicy.MaterializationPolicy {
 	if graphProtocol(protocol) {
 		return sqlpolicy.ManagedGraphRequestMaterializationPolicy
 	}
-	if protocol == sqlpolicy.ManagedRequestApplicationProtocol {
+	if sqlpolicy.IsManagedRequestApplicationProtocol(protocol) {
 		return sqlpolicy.ManagedRequestMaterializationPolicy
 	}
 	if protocol == types.ManagedApplicationProtocolSQLKV {

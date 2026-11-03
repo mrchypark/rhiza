@@ -23,6 +23,7 @@ import (
 
 	objectstore "github.com/mrchypark/rhiza/internal/objstore"
 	"github.com/mrchypark/rhiza/internal/peertest"
+	"github.com/mrchypark/rhiza/internal/sqlpolicy"
 	"github.com/mrchypark/rhiza/internal/types"
 	"github.com/mrchypark/rhiza/pkg/network"
 	"github.com/mrchypark/rhiza/pkg/node"
@@ -451,6 +452,91 @@ func sqlClusterForProtocol(t *testing.T, protocol string) ([]Config, *sqlStatusF
 		configs[i].PodUID = fmt.Sprintf("pod-%d", i)
 	}
 	return configs, f
+}
+
+func TestManagedSQLPublicStartupRejectsRetiredPrototypeBeforeRuntimeEffects(t *testing.T) {
+	for _, tc := range []struct {
+		name       string
+		configured string
+		retired    string
+	}{
+		{"request", sqlpolicy.ManagedRequestAppendOnlyApplicationProtocol, sqlpolicy.ManagedRequestApplicationProtocol},
+		{"graph", sqlpolicy.ManagedGraphRequestAppendOnlyApplicationProtocol, sqlpolicy.ManagedGraphRequestApplicationProtocol},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			configs, fixture := sqlClusterForProtocol(t, tc.configured)
+			cfg := configs[0]
+			installedPlan := cfg.Plan
+			cfg.Plan.ApplicationProtocol = tc.retired
+			cfg.Plan.EvidenceFormat = tc.retired
+
+			// Existing local bytes model a previously installed prototype WAL and
+			// materializer. Public startup must reject the profile before opening,
+			// rewriting, or rebinding either file.
+			walPath := filepath.Join(cfg.Runtime.DataDir, "qlog")
+			dbPath := filepath.Join(cfg.Runtime.DataDir, "sqlite.db")
+			walBefore := []byte("retired-prototype-wal-bytes")
+			dbBefore := []byte("retired-prototype-materializer-bytes")
+			if err := os.WriteFile(walPath, walBefore, 0o600); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(dbPath, dbBefore, 0o600); err != nil {
+				t.Fatal(err)
+			}
+
+			host, err := fixture.open(context.Background(), cfg)
+			if err == nil || host != nil || !strings.Contains(err.Error(), "unsupported managed startup profile") {
+				if host != nil {
+					_ = host.Close()
+				}
+				t.Fatalf("retired profile was not explicitly rejected before startup: host=%v err=%v", host, err)
+			}
+			for path, want := range map[string][]byte{walPath: walBefore, dbPath: dbBefore} {
+				got, readErr := os.ReadFile(path)
+				if readErr != nil || !bytes.Equal(got, want) {
+					t.Fatalf("retired startup changed existing bytes at %s: got=%q err=%v", path, got, readErr)
+				}
+			}
+			entries, readErr := os.ReadDir(cfg.Runtime.DataDir)
+			if readErr != nil || len(entries) != 2 {
+				t.Fatalf("retired startup created runtime files: entries=%v err=%v", entries, readErr)
+			}
+			fixture.source.keysMu.Lock()
+			putCount := len(fixture.source.putKeys)
+			fixture.source.keysMu.Unlock()
+			if putCount != 0 {
+				t.Fatalf("retired startup uploaded %d objects before rejection", putCount)
+			}
+			state, loadErr := operator.LoadV1Alpha2ApplicationInit(context.Background(), cfg.Store, cfg.Ref)
+			if loadErr != nil || state.Assignment().State != "Unused" || state.Assignment().Plan != installedPlan {
+				t.Fatalf("retired startup changed initialization authority: state=%+v err=%v", state.Assignment(), loadErr)
+			}
+		})
+	}
+}
+
+func TestManagedSQLPublicStartupPreservesSupportedProfileEvidenceError(t *testing.T) {
+	for _, protocol := range []string{"", types.ManagedApplicationProtocolSQLKV} {
+		name := protocol
+		if name == "" {
+			name = "legacy"
+		}
+		t.Run(name, func(t *testing.T) {
+			configs, fixture := sqlClusterForProtocol(t, protocol)
+			cfg := configs[0]
+			cfg.Plan.EvidenceFormat = "wrong-supported-profile-evidence"
+
+			host, err := fixture.open(context.Background(), cfg)
+			if host != nil {
+				_ = host.Close()
+				t.Fatal("invalid evidence unexpectedly opened a Host")
+			}
+			const want = "exact SQL initialization plan, store, and Pod UID required"
+			if err == nil || err.Error() != want {
+				t.Fatalf("supported profile evidence mismatch changed error contract: got %v, want %q", err, want)
+			}
+		})
+	}
 }
 
 func TestManagedSQLFixtureRetainsPeerSocketUntilHostOpen(t *testing.T) {
