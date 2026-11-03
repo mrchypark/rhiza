@@ -1,0 +1,210 @@
+//go:build rhiza_local_testhooks
+
+package node
+
+import (
+	"bytes"
+	"context"
+	"crypto/sha256"
+	"errors"
+	"log"
+	"strings"
+	"sync"
+	"sync/atomic"
+	"testing"
+	"time"
+
+	"github.com/mrchypark/rhiza/internal/localtesthooks"
+	"github.com/mrchypark/rhiza/internal/types"
+	"github.com/mrchypark/rhiza/pkg/network"
+	"github.com/mrchypark/rhiza/pkg/quepaxa"
+)
+
+type managedGraphAdmissionLogBuffer struct {
+	mu sync.Mutex
+	b  bytes.Buffer
+}
+
+func (b *managedGraphAdmissionLogBuffer) Write(p []byte) (int, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.b.Write(p)
+}
+
+func (b *managedGraphAdmissionLogBuffer) String() string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.b.String()
+}
+
+func TestManagedControlObservationBudgetIsSharedAndOneShot(t *testing.T) {
+	ctx := WithManagedControlObservationBudget(context.Background())
+	budget := managedControlObservationBudgetFromContext(ctx)
+	if budget == nil {
+		t.Fatal("managed control observation budget was not installed")
+	}
+	if nested := WithManagedControlObservationBudget(ctx); managedControlObservationBudgetFromContext(nested) != budget {
+		t.Fatal("nested initial/execution scope replaced the public operation budget")
+	}
+	if !budget.consume() || budget.consume() {
+		t.Fatal("managed control observation fallback budget was not one-shot")
+	}
+}
+
+func TestManagedGraphAdmissionDoesNotReobserveAfterBudgetIsSpent(t *testing.T) {
+	fixture := newManagedGraphAdmissionRaceFixture(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	value, err := types.EncodeManagedGraphExecution(types.GraphCommand{RequestID: "second-gap-ordinary", Cypher: "CREATE (:SecondGap {n:1})"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var priority quepaxa.Priority
+	for i := range priority {
+		priority[i] = 0xff
+	}
+	proposal := quepaxa.Proposal{Priority: priority, ProposerID: "n2", Hash: quepaxa.ValueHash(sha256.Sum256(value)), Value: bytes.Clone(value)}
+	if _, err := fixture.node.core.Record(ctx, quepaxa.RecordRequest{Slot: 9, Step: 4, ConfigID: 1, Proposal: proposal}); err != nil {
+		t.Fatalf("record second-gap ordinary proposal locally: %v", err)
+	}
+	ctx = WithManagedControlObservationBudget(ctx)
+	if !managedControlObservationBudgetFromContext(ctx).consume() {
+		t.Fatal("failed to spend operation budget")
+	}
+	var observerRechecks atomic.Int32
+	restoreObserver := localtesthooks.Set(func(event string) {
+		if event == "core:managed-control:before-snapshot-recheck" {
+			observerRechecks.Add(1)
+		}
+	})
+	t.Cleanup(restoreObserver)
+	var barriers atomic.Int32
+	restoreProposal := localtesthooks.SetProposalEntry(func(value []byte) {
+		if isBarrier, err := types.DecodeReadBarrier(value); err == nil && isBarrier {
+			barriers.Add(1)
+		}
+	})
+	t.Cleanup(restoreProposal)
+	response, err := fixture.node.ExecuteManagedGraph(ctx, types.GraphCommand{RequestID: "must-not-pass-second-gap", Cypher: "CREATE (:MustNotPass {n:1})"})
+	if err == nil || response.MutationReceipt.Slot != 0 {
+		t.Fatalf("second unresolved gap was admitted: response=%+v err=%v", response, err)
+	}
+	if observerRechecks.Load() != 0 || barriers.Load() != 0 || fixture.node.core.Tip() != 8 || fixture.node.material.Tip() != 8 {
+		t.Fatalf("spent budget caused another observer/control round: observer_rechecks=%d barriers=%d certified=%d applied=%d", observerRechecks.Load(), barriers.Load(), fixture.node.core.Tip(), fixture.node.material.Tip())
+	}
+}
+
+func TestManagedGraphAdmissionRefusesSecondGapAfterActualPrefixFallback(t *testing.T) {
+	fixture := newManagedGraphAdmissionRaceFixture(t)
+	t.Cleanup(fixture.transport.releaseHeld)
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	ctx = WithManagedControlObservationBudget(ctx)
+	budget := managedControlObservationBudgetFromContext(ctx)
+	logOutput := &managedGraphAdmissionLogBuffer{}
+	previousLogOutput := log.Writer()
+	log.SetOutput(logOutput)
+	defer log.SetOutput(previousLogOutput)
+	barrier := managedGraphRaceControlValue()
+	owner := fixture.startHeldValue(ctx, barrier)
+	fixture.awaitPendingControl(t)
+	pending := fixture.node.core.RuntimeProgressSnapshot()
+	if pending.CertifiedTip != 8 || pending.RecorderTip != 9 || pending.RecorderHash != quepaxa.ValueHash(sha256.Sum256(barrier)) {
+		t.Fatalf("fixture lacks actual pending slot-9 control: %+v", pending)
+	}
+
+	entered, resume := make(chan struct{}), make(chan struct{})
+	var resumeOnce sync.Once
+	defer resumeOnce.Do(func() { close(resume) })
+	var observerCalls, barriers, graphProposals atomic.Int32
+	var injected atomic.Bool
+	var injectedErr error
+	var ordinary []byte
+	restoreObserver := localtesthooks.Set(func(event string) {
+		switch event {
+		case "core:managed-control:before-snapshot-recheck":
+			observerCalls.Add(1)
+			select {
+			case <-entered:
+			default:
+				close(entered)
+				<-resume
+			}
+		case "node:managed-control:validated-prefix-rechecked":
+			if !injected.CompareAndSwap(false, true) {
+				return
+			}
+			var err error
+			ordinary, err = types.EncodeManagedGraphExecution(types.GraphCommand{RequestID: "second-gap-original", Cypher: "CREATE (:SecondGap {original:true})"})
+			if err != nil {
+				injectedErr = err
+				return
+			}
+			var priority quepaxa.Priority
+			for i := range priority {
+				priority[i] = 0xff
+			}
+			_, injectedErr = fixture.node.core.Record(ctx, quepaxa.RecordRequest{Slot: 10, Step: 4, ConfigID: 1, Proposal: quepaxa.Proposal{Priority: priority, ProposerID: "n2", Hash: quepaxa.ValueHash(sha256.Sum256(ordinary)), Value: bytes.Clone(ordinary)}})
+		}
+	})
+	t.Cleanup(restoreObserver)
+	restoreProposal := localtesthooks.SetProposalEntry(func(value []byte) {
+		if isBarrier, err := types.DecodeReadBarrier(value); err == nil && isBarrier {
+			barriers.Add(1)
+		}
+		if _, graph, err := types.DecodeManagedGraphExecution(value); err == nil && graph {
+			graphProposals.Add(1)
+		}
+	})
+	t.Cleanup(restoreProposal)
+
+	type outcome struct {
+		response network.GraphExecuteResponse
+		err      error
+	}
+	result := make(chan outcome, 1)
+	go func() {
+		response, err := fixture.node.ExecuteManagedGraph(ctx, types.GraphCommand{RequestID: "must-stop-after-second-gap", Cypher: "CREATE (:MustNotSubmit {n:1})"})
+		result <- outcome{response: response, err: err}
+	}()
+	select {
+	case <-entered:
+	case <-ctx.Done():
+		t.Fatal("actual observer did not reach its final validation boundary", ctx.Err())
+	}
+	fixture.transport.releaseHeld()
+	if err := awaitProposal(t, owner); err != nil {
+		t.Fatalf("actual slot-9 control did not certify: %v", err)
+	}
+	decision, ok := fixture.node.core.CertifiedValue(9)
+	if !ok || decision.Hash != pending.RecorderHash || !bytes.Equal(decision.Value, barrier) {
+		t.Fatalf("slot 9 did not certify the exact original control: found=%t hash=%x", ok, decision.Hash)
+	}
+	resumeOnce.Do(func() { close(resume) })
+	var got outcome
+	select {
+	case got = <-result:
+	case <-ctx.Done():
+		t.Fatal("admission did not refuse the second gap", ctx.Err())
+	}
+	if injectedErr != nil || !injected.Load() || !budget.used.Load() {
+		t.Fatalf("actual fallback or ordinary second-gap injection did not complete: injected=%t budget_used=%t err=%v", injected.Load(), budget.used.Load(), injectedErr)
+	}
+	if got.err == nil || errors.Is(got.err, network.ErrCommitUnknown) || got.response.MutationReceipt.Slot != 0 {
+		t.Fatalf("second-gap refusal was reported as success or UNKNOWN: response=%+v err=%v", got.response, got.err)
+	}
+	progress := fixture.node.core.RuntimeProgressSnapshot()
+	ordinaryHash := quepaxa.ValueHash(sha256.Sum256(ordinary))
+	stored, storedOK := fixture.node.core.Value(ordinaryHash)
+	_, secondGapDecided := fixture.node.core.CertifiedValue(10)
+	if progress.CertifiedTip != 9 || progress.RecorderTip != 10 || !progress.RecorderHashPresent || progress.RecorderHash != ordinaryHash || progress.RecorderHashIsCertified || secondGapDecided || !storedOK || !bytes.Equal(stored, ordinary) {
+		t.Fatalf("second-gap original was lost or recast: progress=%+v stored=%t exact=%t", progress, storedOK, bytes.Equal(stored, ordinary))
+	}
+	if observerCalls.Load() != 1 || barriers.Load() != 0 || graphProposals.Load() != 0 || fixture.transport.readTipCalls.Load() != 0 || fixture.node.core.Tip() != 9 || fixture.node.material.Tip() != 8 {
+		t.Fatalf("spent fallback performed another observation/quorum/barrier/application or replay: observers=%d read_tips=%d barriers=%d graph_proposals=%d certified=%d applied=%d", observerCalls.Load(), fixture.transport.readTipCalls.Load(), barriers.Load(), graphProposals.Load(), fixture.node.core.Tip(), fixture.node.material.Tip())
+	}
+	logs := logOutput.String()
+	if strings.Count(logs, "MANAGED_CONTROL_OBSERVATION_REJECTED reason=snapshot_changed") != 1 || strings.Contains(logs, "MANAGED_CONTROL_OBSERVATION_REJECTED reason=reference_validation") || strings.Count(logs, "reason=observation_recheck_budget_exhausted") != 1 {
+		t.Fatalf("refusal did not come from the spent-budget guard before another observer: %s", logs)
+	}
+}

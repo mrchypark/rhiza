@@ -11,6 +11,7 @@ import (
 	"os"
 	"time"
 
+	"github.com/mrchypark/rhiza/internal/localtesthooks"
 	"github.com/mrchypark/rhiza/internal/sqlpolicy"
 	"github.com/mrchypark/rhiza/internal/types"
 	"github.com/mrchypark/rhiza/pkg/checkpoint"
@@ -318,8 +319,37 @@ func (n *Node) waitManagedAppendOnlyControl(ctx context.Context, binding *intern
 		n.clearCompletedManagedAppendOnlyControl(progress.CertifiedTip)
 		return nil
 	}
+	if budget := managedControlObservationBudgetFromContext(ctx); budget != nil && budget.used.Load() {
+		return n.refuseManagedGraphAdmissionAtReason("observation_recheck_budget_exhausted", progress.RecorderTip, progress)
+	}
 	observation, err := n.core.ObserveManagedAppendOnlyControl(ctx)
 	if err != nil {
+		if quepaxa.IsManagedControlPrefixAdvance(err) {
+			budget := managedControlObservationBudgetFromContext(ctx)
+			if !budget.consume() {
+				return n.refuseManagedGraphAdmissionAtReason("observation_recheck_budget_exhausted", progress.RecorderTip, progress)
+			}
+			binding.mu.Lock()
+			bindingCurrent := !binding.closing && n.internalApplication.Load() == binding && binding.core == n.core
+			binding.mu.Unlock()
+			if !bindingCurrent || binding.lifetime.Err() != nil || ctx.Err() != nil || !n.opened.Load() || n.terminalRequested.Load() || !n.core.CanParticipateReadIndex() || n.server == nil || n.material == nil || n.wal == nil {
+				return n.refuseManagedGraphAdmissionAtReason("observation_recheck_binding_unavailable", progress.RecorderTip, progress)
+			}
+			if _, runtimeErr := n.checkInternalApplicationRuntime(ctx); runtimeErr != nil {
+				return errors.Join(err, runtimeErr)
+			}
+			if progress.RecorderTip != progress.CertifiedTip+1 || progress.RecorderTip == 0 {
+				return n.refuseManagedGraphAdmissionAtReason("observation_recheck_shape_mismatch", progress.RecorderTip, progress)
+			}
+			advanced, recheckErr := n.core.RecheckManagedControlPrefixAdvance(ctx, err, quepaxa.Slot(progress.CertifiedTip), quepaxa.Slot(progress.RecorderTip), binding.identity.ApplicationProtocol, uint64(binding.identity.Member.Generation))
+			if recheckErr != nil {
+				return errors.Join(err, recheckErr)
+			}
+			if advanced {
+				localtesthooks.Hit("node:managed-control:validated-prefix-rechecked")
+				return nil
+			}
+		}
 		return n.refuseManagedGraphAdmissionAtReason("core_observation_rejected", progress.RecorderTip, progress)
 	}
 	if !observation.BelongsTo(n.core) || observation.ApplicationProtocol != binding.identity.ApplicationProtocol || observation.Generation != binding.identity.Member.Generation || observation.CommittedTip != progress.CertifiedTip || observation.ObservedSlot != progress.RecorderTip || observation.ObservedSlot != observation.CommittedTip+1 || len(observation.Proposals) == 0 {
@@ -381,6 +411,18 @@ func (n *Node) waitManagedAppendOnlyControl(ctx context.Context, binding *intern
 	n.managedGraphControlMu.Unlock()
 	go n.runManagedAppendOnlyBarrier(ctx, binding, op)
 	return n.waitManagedAppendOnlyBarrier(ctx, progress.RecorderTip, op, op.done)
+}
+
+func (n *Node) refuseSpentManagedControlObservationBudget(ctx context.Context) error {
+	budget := managedControlObservationBudgetFromContext(ctx)
+	if budget == nil || !budget.used.Load() {
+		return nil
+	}
+	progress := n.core.RuntimeProgressSnapshot()
+	if progress.RecorderTip > progress.CertifiedTip {
+		return n.refuseManagedGraphAdmissionAtReason("observation_recheck_budget_exhausted", progress.RecorderTip, progress)
+	}
+	return nil
 }
 
 func managedAppendOnlyOperationMatchesProgress(op *managedGraphControlOperation, binding *internalApplicationBinding, core *quepaxa.Core, progress quepaxa.RuntimeProgress) bool {

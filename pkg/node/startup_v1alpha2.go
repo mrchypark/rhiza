@@ -96,6 +96,9 @@ func (n *Node) borrowInternalApplication(ctx context.Context) (*internalApplicat
 	if !n.internalApplicationProfile() {
 		return nil, ctx, nil, fmt.Errorf("internal application profile required")
 	}
+	if isManagedAppendOnlyProtocol(n.managedApplicationProtocol()) {
+		ctx = WithManagedControlObservationBudget(ctx)
+	}
 	b := n.internalApplication.Load()
 	if b == nil {
 		return nil, ctx, nil, fmt.Errorf("internal application binding unavailable")
@@ -315,6 +318,9 @@ func (n *Node) admitInternalApplication(ctx context.Context) error {
 	}
 	if isManagedAppendOnlyProtocol(n.managedApplicationProtocol()) {
 		if err := n.waitManagedAppendOnlyControl(ctx, binding); err != nil {
+			return err
+		}
+		if err := n.refuseSpentManagedControlObservationBudget(ctx); err != nil {
 			return err
 		}
 	}
@@ -892,6 +898,9 @@ func (n *Node) AdmitManaged(ctx context.Context) error {
 	n.managedAdmitted.Store(false)
 	if binding != nil && isManagedAppendOnlyProtocol(n.managedApplicationProtocol()) {
 		if err := n.waitManagedAppendOnlyControl(ctx, binding); err != nil {
+			return err
+		}
+		if err := n.refuseSpentManagedControlObservationBudget(ctx); err != nil {
 			return err
 		}
 	}

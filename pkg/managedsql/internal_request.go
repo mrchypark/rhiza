@@ -8,6 +8,7 @@ import (
 	"github.com/mrchypark/rhiza/internal/sqlpolicy"
 	"github.com/mrchypark/rhiza/internal/types"
 	"github.com/mrchypark/rhiza/pkg/network"
+	"github.com/mrchypark/rhiza/pkg/node"
 )
 
 func (h *Host) internalRequests() bool {
@@ -18,7 +19,13 @@ func (h *Host) internalRequests() bool {
 // caller and this Host's close lifetime. The initial-admission scope alone is
 // insufficient: Node may re-observe certified progress later in the request.
 func (h *Host) internalRequestContext(ctx context.Context) (context.Context, func()) {
-	if !h.internalRequests() || h.admissionLifetime == nil {
+	if !h.internalRequests() {
+		return ctx, func() {}
+	}
+	if h.node != nil && sqlpolicy.IsManagedAppendOnlyApplicationProtocol(h.cfg.Plan.ApplicationProtocol) {
+		ctx = node.WithManagedControlObservationBudget(ctx)
+	}
+	if h.admissionLifetime == nil {
 		return ctx, func() {}
 	}
 	scope, cancel := context.WithCancel(ctx)

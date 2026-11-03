@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"sync/atomic"
 
 	"github.com/mrchypark/rhiza/internal/localtesthooks"
 	"github.com/mrchypark/rhiza/internal/sqlpolicy"
@@ -12,6 +13,28 @@ import (
 	"github.com/mrchypark/rhiza/pkg/materializer"
 	"github.com/mrchypark/rhiza/pkg/network"
 )
+
+type managedControlObservationBudgetKey struct{}
+
+type managedControlObservationBudget struct{ used atomic.Bool }
+
+func (b *managedControlObservationBudget) consume() bool {
+	return b != nil && b.used.CompareAndSwap(false, true)
+}
+
+// WithManagedControlObservationBudget shares one fallback allowance across
+// nested Host admission and execution calls.
+func WithManagedControlObservationBudget(ctx context.Context) context.Context {
+	if ctx.Value(managedControlObservationBudgetKey{}) != nil {
+		return ctx
+	}
+	return context.WithValue(ctx, managedControlObservationBudgetKey{}, &managedControlObservationBudget{})
+}
+
+func managedControlObservationBudgetFromContext(ctx context.Context) *managedControlObservationBudget {
+	budget, _ := ctx.Value(managedControlObservationBudgetKey{}).(*managedControlObservationBudget)
+	return budget
+}
 
 type ManagedGraphSnapshot struct {
 	Application materializer.ManagedApplicationState

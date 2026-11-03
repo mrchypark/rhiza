@@ -26,6 +26,7 @@ import (
 type managedNoPVCFirstKVCase struct {
 	name        string
 	application bool
+	budgetScope bool
 	advance     bool
 	pending     bool
 	cancel      bool
@@ -36,6 +37,7 @@ type managedNoPVCFirstKVCase struct {
 func TestManagedNoPVCFirstKVAdmissionReplaysFixedCertifiedPrefix(t *testing.T) {
 	for _, test := range []managedNoPVCFirstKVCase{
 		{name: "pure-control"},
+		{name: "direct-entry-budget-scope", budgetScope: true},
 		{name: "certified-application", application: true},
 		{name: "reject-growth-after-fixed-prefix", advance: true},
 		{name: "reject-new-ordinary-recorder-gap", pending: true},
@@ -153,6 +155,28 @@ func testManagedNoPVCFirstKVAdmissionFixedPrefix(t *testing.T, test managedNoPVC
 	}
 	n.server = server
 	t.Cleanup(server.Close)
+	if test.budgetScope {
+		marker := &struct{}{}
+		type markerKey struct{}
+		ctx = context.WithValue(ctx, markerKey{}, marker)
+		var observations atomic.Int32
+		var budgetSeen atomic.Bool
+		restoreContext := localtesthooks.SetManagedRuntimeStateContext(func(observed context.Context) {
+			if observed.Value(markerKey{}) != marker {
+				return
+			}
+			observations.Add(1)
+			if managedControlObservationBudgetFromContext(observed) != nil {
+				budgetSeen.Store(true)
+			}
+		})
+		_, err := n.ExecuteManagedKV(ctx, "put", network.KVMutationRequest{})
+		restoreContext()
+		if err == nil || observations.Load() == 0 || !budgetSeen.Load() {
+			t.Fatalf("direct KV public entry did not carry its append-only operation budget: err=%v observations=%d budget=%t", err, observations.Load(), budgetSeen.Load())
+		}
+		return
+	}
 
 	entered, resume := make(chan struct{}), make(chan struct{})
 	var stateCalls atomic.Int32

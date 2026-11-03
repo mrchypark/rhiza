@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -28,11 +29,17 @@ import (
 // recorder quorum/certificate. No decision state is injected by the test.
 type graphAdmissionRaceTransport struct {
 	graphReviewTransport
-	held        chan struct{}
-	release     chan struct{}
-	uncertified bool
-	heldOnce    sync.Once
-	releaseOnce sync.Once
+	held         chan struct{}
+	release      chan struct{}
+	uncertified  bool
+	heldOnce     sync.Once
+	releaseOnce  sync.Once
+	readTipCalls atomic.Int32
+}
+
+func (p *graphAdmissionRaceTransport) ReadTip(ctx context.Context, id quepaxa.NodeID) (quepaxa.Slot, error) {
+	p.readTipCalls.Add(1)
+	return p.graphReviewTransport.ReadTip(ctx, id)
 }
 
 func (p *graphAdmissionRaceTransport) SendRecord(ctx context.Context, to quepaxa.NodeID, request quepaxa.RecordRequest) (quepaxa.Summary, error) {
@@ -40,7 +47,11 @@ func (p *graphAdmissionRaceTransport) SendRecord(ctx context.Context, to quepaxa
 	if err != nil {
 		return quepaxa.Summary{}, err
 	}
-	if request.Slot == 9 && isHeldBarrier {
+	_, isHeldSeal, sealErr := quepaxa.DecodeCheckpointSeal(request.Proposal.Value)
+	if sealErr != nil {
+		return quepaxa.Summary{}, sealErr
+	}
+	if request.Slot == 9 && (isHeldBarrier || isHeldSeal) {
 		if to == "n3" {
 			select {
 			case <-p.release:
@@ -665,9 +676,13 @@ func newManagedGraphAdmissionRaceFixture(t *testing.T) *managedGraphAdmissionRac
 }
 
 func (f *managedGraphAdmissionRaceFixture) startHeldControl(ctx context.Context) <-chan error {
+	return f.startHeldValue(ctx, managedGraphRaceControlValue())
+}
+
+func (f *managedGraphAdmissionRaceFixture) startHeldValue(ctx context.Context, value []byte) <-chan error {
 	result := make(chan error, 1)
 	go func() {
-		slot, _, err := f.node.core.Propose(ctx, managedGraphRaceControlValue())
+		slot, _, err := f.node.core.Propose(ctx, value)
 		if err == nil && slot != 9 {
 			err = fmt.Errorf("control proposal used slot %d, want 9", slot)
 		}

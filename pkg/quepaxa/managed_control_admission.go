@@ -90,6 +90,51 @@ type managedControlSnapshot struct {
 	config      *ManagedAppendOnlyConfig
 }
 
+type managedControlPrefixAdvanceError struct {
+	snapshot managedControlSnapshot
+}
+
+func (e *managedControlPrefixAdvanceError) Error() string {
+	return ErrManagedControlObservationUnavailable.Error() + ": Core state changed during validation"
+}
+
+func (e *managedControlPrefixAdvanceError) Unwrap() error {
+	return ErrManagedControlObservationUnavailable
+}
+
+// IsManagedControlPrefixAdvance reports only the observer's validated-prefix
+// race; other unavailable observations remain ordinary fail-closed errors.
+func IsManagedControlPrefixAdvance(err error) bool {
+	var advance *managedControlPrefixAdvanceError
+	return errors.As(err, &advance)
+}
+
+// RecheckManagedControlPrefixAdvance verifies the captured observer authority
+// and current continuous prefix in one read-lock section. It never authorizes
+// admission by itself.
+func (c *Core) RecheckManagedControlPrefixAdvance(ctx context.Context, observationErr error, expectedCommitted, expectedObserved Slot, applicationProtocol string, generation uint64) (bool, error) {
+	if err := ctx.Err(); err != nil {
+		return false, err
+	}
+	var advance *managedControlPrefixAdvanceError
+	if c == nil || !errors.As(observationErr, &advance) {
+		return false, nil
+	}
+	snapshot := advance.snapshot
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	if err := ctx.Err(); err != nil {
+		return false, err
+	}
+	if snapshot.core != c || snapshot.committed != expectedCommitted || snapshot.observed != expectedObserved || snapshot.protocol != applicationProtocol || snapshot.generation < 0 || uint64(snapshot.generation) != generation || c.localMode || c.managedAppendOnly == nil || c.managedAppendOnly != snapshot.config || c.managedAppendOnly.Verify == nil || c.observer || c.learner || c.managedAppendOnly.Binding != snapshot.binding || c.managedAppendOnly.Binding.ApplicationProtocol != snapshot.protocol || c.managedAppendOnly.Binding.Generation != snapshot.generation || c.walIdentity != snapshot.walIdentity || c.generationAnchorHash != snapshot.anchor || c.membershipVersion != snapshot.membership || !sameCluster(c.clusterForSlotLocked(snapshot.observed), snapshot.cluster) || !c.voterForClusterLocked(snapshot.cluster) || c.tip < snapshot.observed || c.highestKnownSlotLocked() > c.tip {
+		return false, nil
+	}
+	if _, ok := c.prefixes[snapshot.observed]; !ok {
+		return false, nil
+	}
+	return true, nil
+}
+
 // ObserveManagedAppendOnlyControl classifies a single unresolved next-slot ISR
 // in a managed Core. It reads the complete Step/F/A/P summary under one lock,
 // validates exact original value bytes outside Core locks, then requires the
@@ -122,11 +167,14 @@ func (c *Core) ObserveManagedAppendOnlyControl(ctx context.Context) (ManagedAppe
 			ProposerID: ref.proposal.ProposerID, Hash: ref.proposal.Hash,
 		})
 	}
+	localtesthooks.Hit("core:managed-control:before-snapshot-recheck")
 	if err := ctx.Err(); err != nil {
 		return ManagedAppendOnlyControlObservation{}, err
 	}
-	localtesthooks.Hit("core:managed-control:before-snapshot-recheck")
 	if !c.sameManagedControlSnapshot(snapshot) {
+		if c.managedControlPrefixAdvanced(snapshot) {
+			return ManagedAppendOnlyControlObservation{}, managedControlObservationRejected("snapshot_changed", &managedControlPrefixAdvanceError{snapshot: snapshot})
+		}
 		return ManagedAppendOnlyControlObservation{}, fmt.Errorf("%w: Core state changed during validation", managedControlObservationRejected("snapshot_changed", ErrManagedControlObservationUnavailable))
 	}
 	return ManagedAppendOnlyControlObservation{
@@ -135,6 +183,19 @@ func (c *Core) ObserveManagedAppendOnlyControl(ctx context.Context) (ManagedAppe
 		ApplicationProtocol: snapshot.protocol, Generation: snapshot.generation,
 		Proposals: validated, core: c,
 	}, nil
+}
+
+func (c *Core) managedControlPrefixAdvanced(snapshot managedControlSnapshot) bool {
+	if c == nil {
+		return false
+	}
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	if snapshot.core != c || snapshot.committed >= snapshot.observed || c.tip < snapshot.observed || c.highestKnownSlotLocked() > c.tip || c.localMode || c.managedAppendOnly == nil || c.managedAppendOnly != snapshot.config || c.managedAppendOnly.Verify == nil || c.observer || c.learner || c.managedAppendOnly.Binding != snapshot.binding || c.walIdentity != snapshot.walIdentity || c.generationAnchorHash != snapshot.anchor || c.membershipVersion != snapshot.membership || !sameCluster(c.clusterForSlotLocked(snapshot.observed), snapshot.cluster) || !c.voterForClusterLocked(snapshot.cluster) {
+		return false
+	}
+	_, ok := c.prefixes[snapshot.observed]
+	return ok
 }
 
 func (c *Core) managedControlSnapshot() (snapshot managedControlSnapshot, resultErr error) {
