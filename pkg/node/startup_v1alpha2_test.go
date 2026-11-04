@@ -1017,7 +1017,9 @@ func TestManagedPreparedCheckpointSQLSuffixAdoptionAndRestart(t *testing.T) {
 	if err := os.Remove(marker); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.Mkdir(marker, 0700); err != nil {
+	pending := filepath.Join(dataDir, "prepared-adoption.pending")
+	pendingSentinel := []byte("preserve unknown adoption outcome")
+	if err := os.WriteFile(pending, pendingSentinel, 0600); err != nil {
 		t.Fatal(err)
 	}
 	persistFailure := New(config)
@@ -1034,7 +1036,13 @@ func TestManagedPreparedCheckpointSQLSuffixAdoptionAndRestart(t *testing.T) {
 	if err := persistLock.Release(); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.Remove(marker); err != nil {
+	if pendingAfter, err := os.ReadFile(pending); err != nil || !bytes.Equal(pendingAfter, pendingSentinel) {
+		t.Fatalf("persistence failure changed pending adoption outcome: bytes=%q err=%v", pendingAfter, err)
+	}
+	if _, err := os.Lstat(marker); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("persistence failure unexpectedly created durable adoption: %v", err)
+	}
+	if err := os.Remove(pending); err != nil {
 		t.Fatal(err)
 	}
 	if err := os.WriteFile(marker, validMarker, 0600); err != nil {

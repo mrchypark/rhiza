@@ -9,10 +9,36 @@ script_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 sdk_dir=$(CDPATH= cd -- "$script_dir/.." && pwd)
 repo_dir=$(CDPATH= cd -- "$sdk_dir/../.." && pwd)
 native_dir="$sdk_dir/native"
-temporary_dir="$sdk_dir/.native.tmp.$$"
-
-cleanup() { rm -rf "$temporary_dir"; }
-trap cleanup EXIT HUP INT TERM
+temporary_dir=$(mktemp -d "$sdk_dir/.native.tmp.XXXXXX")
+filter_dir=
+cleanup_owned_dir() {
+    owned_dir=$1
+    case "$owned_dir" in
+        "$sdk_dir"/.native.tmp.*|"$sdk_dir"/.native-vendor-filter.*) ;;
+        *) echo 'FAIL refusing to clean a directory outside the owned temporary prefixes' >&2; return 1 ;;
+    esac
+    if [ -e "$owned_dir" ] || [ -L "$owned_dir" ]; then
+        rm -rf "$owned_dir" || { echo "FAIL unable to clean owned temporary directory" >&2; return 1; }
+    fi
+    if [ -e "$owned_dir" ] || [ -L "$owned_dir" ]; then
+        echo 'FAIL owned temporary directory remains after cleanup' >&2
+        return 1
+    fi
+}
+cleanup() {
+    cleanup_status=0
+    cleanup_owned_dir "$temporary_dir" || cleanup_status=1
+    if [ -n "$filter_dir" ]; then
+        cleanup_owned_dir "$filter_dir" || cleanup_status=1
+    fi
+    [ "$cleanup_status" -eq 0 ] || return "$cleanup_status"
+}
+trap cleanup EXIT
+trap 'exit 1' HUP INT TERM
+case "$temporary_dir" in
+    "$sdk_dir"/.native.tmp.*) ;;
+    *) echo 'FAIL mktemp returned a path outside the owned temporary prefix' >&2; exit 1 ;;
+esac
 
 mkdir -p "$temporary_dir"
 cp "$repo_dir/go.mod" "$repo_dir/go.sum" "$repo_dir/rhiza.go" "$repo_dir/replica.go" "$repo_dir/config_env.go" "$repo_dir/operator_handler.go" "$repo_dir/membership.go" "$temporary_dir/"
@@ -41,7 +67,6 @@ cp "$repo_dir/go.mod" "$repo_dir/go.sum" "$repo_dir/rhiza.go" "$repo_dir/replica
 
 rm -rf "$native_dir"
 mv "$temporary_dir" "$native_dir"
-trap - EXIT HUP INT TERM
 
 hash_files() {
     if command -v sha256sum >/dev/null 2>&1; then
@@ -194,6 +219,154 @@ find "$native_dir/vendor" -type f -exec sh -eu -c '
     done
 ' sh {} +
 # END native-vendor compiler-unread input filter
+
+# Build the union of vendored package directories needed by every archive
+# target. The FFI archive is always built with cgo enabled and no extra tags.
+filter_dir=$(mktemp -d "$sdk_dir/.native-vendor-filter.XXXXXX")
+case "$filter_dir" in
+    "$sdk_dir"/.native-vendor-filter.*) ;;
+    *) echo 'FAIL mktemp returned a filter path outside the owned temporary prefix' >&2; exit 1 ;;
+esac
+for target in linux-amd64 linux-arm64 darwin-amd64 darwin-arm64; do
+    case "$target" in
+        linux-amd64) target_os=linux; target_arch=amd64 ;;
+        linux-arm64) target_os=linux; target_arch=arm64 ;;
+        darwin-amd64) target_os=darwin; target_arch=amd64 ;;
+        darwin-arm64) target_os=darwin; target_arch=arm64 ;;
+    esac
+    package_list="$filter_dir/$target.tsv"
+    (
+        cd "$native_dir"
+        CGO_ENABLED=1 GOOS="$target_os" GOARCH="$target_arch" GOWORK=off \
+            go list -mod=vendor -deps -f '{{printf "%s\t%s" .ImportPath .Dir}}' ./cmd/rhiza-ffi
+    ) > "$package_list"
+    awk -F '\t' 'NF != 2 || $1 == "" || $2 == "" { bad=1 } END { if (NR == 0 || bad) exit 1 }' "$package_list" || {
+        echo "FAIL invalid Go package metadata for $target" >&2
+        exit 1
+    }
+    cut -f 1 "$package_list" > "$filter_dir/$target.imports.raw"
+    sort -u "$filter_dir/$target.imports.raw" > "$filter_dir/$target.imports"
+    rm -f "$filter_dir/$target.imports.raw"
+done
+
+expected_vendor_dir=$(CDPATH= cd -P -- "$native_dir/vendor" && pwd -P)
+# BEGIN native-vendor unreachable Go source filter
+vendor_dir_from_go_list() {
+    if [ "$#" -ne 2 ]; then
+        echo 'FAIL expected generated vendor directory and Go package metadata path' >&2
+        return 1
+    fi
+    if [ -z "$1" ] || [ -z "$2" ]; then
+        echo 'FAIL expected generated vendor directory and Go package metadata path' >&2
+        return 1
+    fi
+    expected_vendor_dir_arg=$1
+    package_list=$2
+    actual_vendor_dir=$(awk -F '\t' '
+        NF != 2 || $1 == "" || $2 == "" { bad=1 }
+        index($2, "/vendor/") {
+            path=$2
+            search=1
+            while (search <= length(path)) {
+                relative=index(substr(path, search), "/vendor/")
+                if (relative == 0) break
+                at=search+relative-1
+                found=substr(path, 1, at+6)
+                search=at+8
+            }
+            if (root != "" && root != found) bad=1
+            root=found
+        }
+        END { if (NR == 0 || bad || root == "") exit 1; print root }
+    ' "$package_list") || { echo 'FAIL unable to derive vendor root from go list metadata' >&2; return 1; }
+    [ "$actual_vendor_dir" = "$expected_vendor_dir_arg" ] || {
+        echo 'FAIL go list vendor root differs from the generated native/vendor directory' >&2
+        return 1
+    }
+    [ -d "$actual_vendor_dir" ] || { echo 'FAIL go list vendor directory is missing' >&2; return 1; }
+    printf '%s\n' "$actual_vendor_dir"
+}
+filter_unreachable_vendor_go() {
+    if [ "$#" -ne 2 ]; then
+        echo 'FAIL expected generated vendor directory and reachable package list' >&2
+        return 1
+    fi
+    if [ -z "$1" ] || [ -z "$2" ]; then
+        echo 'FAIL expected generated vendor directory and reachable package list' >&2
+        return 1
+    fi
+    vendor_dir=$1
+    reachable_dirs=$2
+    [ -s "$reachable_dirs" ] || { echo 'FAIL empty reachable Go package set' >&2; return 1; }
+    find "$vendor_dir" -type f -name '*.go' -exec sh -eu -c '
+        vendor_dir=$1
+        reachable_dirs=$2
+        shift 2
+        while [ "$#" -gt 0 ]; do
+            source=$1
+            shift
+            source_dir=$(dirname "$source")
+            keep=0
+            while IFS= read -r package_dir; do
+                case "$package_dir" in
+                    "$vendor_dir"/*) ;;
+                    *) echo "FAIL Go package path is outside vendor directory" >&2; exit 1 ;;
+                esac
+                case "$source_dir/" in
+                    "$package_dir/"*) keep=1; break ;;
+                esac
+            done < "$reachable_dirs"
+            if [ "$keep" -eq 0 ]; then
+                rm -f "$source" || { echo "FAIL unable to remove unreachable Go source" >&2; exit 1; }
+            fi
+        done
+    ' sh "$vendor_dir" "$reachable_dirs" {} +
+}
+# END native-vendor unreachable Go source filter
+
+vendor_dir=$(vendor_dir_from_go_list "$expected_vendor_dir" "$filter_dir/linux-amd64.tsv")
+for target in linux-arm64 darwin-amd64 darwin-arm64; do
+    candidate_vendor=$(vendor_dir_from_go_list "$expected_vendor_dir" "$filter_dir/$target.tsv")
+    [ "$candidate_vendor" = "$vendor_dir" ] || { echo "FAIL inconsistent vendor metadata for $target" >&2; exit 1; }
+done
+
+for target in linux-amd64 linux-arm64 darwin-amd64 darwin-arm64; do
+    cut -f 2 "$filter_dir/$target.tsv" > "$filter_dir/$target.dirs.raw"
+    awk -F '\t' -v prefix="$vendor_dir/" 'substr($1, 1, length(prefix)) == prefix { print $1 }' "$filter_dir/$target.dirs.raw" >> "$filter_dir/reachable-dirs.raw"
+done
+[ -s "$filter_dir/reachable-dirs.raw" ] || { echo 'FAIL no vendored Go package roots found in FFI closure' >&2; exit 1; }
+sort -u "$filter_dir/reachable-dirs.raw" > "$filter_dir/reachable-dirs"
+
+filter_unreachable_vendor_go "$vendor_dir" "$filter_dir/reachable-dirs"
+
+# Re-list all four actual FFI target closures after filtering. Any import
+# failure or package-set drift fails closed before the native tree is accepted.
+for target in linux-amd64 linux-arm64 darwin-amd64 darwin-arm64; do
+    case "$target" in
+        linux-amd64) target_os=linux; target_arch=amd64 ;;
+        linux-arm64) target_os=linux; target_arch=arm64 ;;
+        darwin-amd64) target_os=darwin; target_arch=amd64 ;;
+        darwin-arm64) target_os=darwin; target_arch=arm64 ;;
+    esac
+    package_list="$filter_dir/$target.after.tsv"
+    (
+        cd "$native_dir"
+        CGO_ENABLED=1 GOOS="$target_os" GOARCH="$target_arch" GOWORK=off \
+            go list -mod=vendor -deps -f '{{printf "%s\t%s" .ImportPath .Dir}}' ./cmd/rhiza-ffi
+    ) > "$package_list"
+    awk -F '\t' 'NF != 2 || $1 == "" || $2 == "" { bad=1 } END { if (NR == 0 || bad) exit 1 }' "$package_list" || {
+        echo "FAIL invalid post-filter Go package metadata for $target" >&2
+        exit 1
+    }
+    cut -f 1 "$package_list" > "$filter_dir/$target.after.imports.raw"
+    sort -u "$filter_dir/$target.after.imports.raw" > "$filter_dir/$target.after.imports"
+    rm -f "$filter_dir/$target.after.imports.raw"
+    if ! cmp -s "$filter_dir/$target.imports" "$filter_dir/$target.after.imports"; then
+        echo "FAIL Go import set changed after vendor source filtering for $target" >&2
+        exit 1
+    fi
+done
+
 after=$(hash_files "$native_dir/go.mod" "$native_dir/go.sum")
 if [ "$before" != "$after" ]; then
     echo "FAIL go.mod or go.sum changed while vendoring; run go mod tidy on the module and retry" >&2

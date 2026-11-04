@@ -16,6 +16,22 @@ awk '
 ' "$prepare_script" > "$filter_block"
 [ -s "$filter_block" ] || { echo 'FAIL unable to extract actual prepare-native filter' >&2; exit 1; }
 grep -Fq "! -path 'internal/foregroundcosttest/*'" "$prepare_script" || { echo 'FAIL test-only foreground cost package is staged into native snapshot' >&2; exit 1; }
+go_filter_block="$scratch/go-filter-block.sh"
+awk '
+    /^# BEGIN native-vendor unreachable Go source filter$/ { active=1; next }
+    /^# END native-vendor unreachable Go source filter$/ { active=0; exit }
+    active { print }
+' "$prepare_script" > "$go_filter_block"
+[ -s "$go_filter_block" ] || { echo 'FAIL unable to extract actual vendor Go source filter' >&2; exit 1; }
+
+run_go_source_filter() (
+    . "$go_filter_block"
+    filter_unreachable_vendor_go "$@"
+)
+run_vendor_root_check() (
+    . "$go_filter_block"
+    vendor_dir_from_go_list "$@"
+)
 
 run_filter() (
     native_dir=$1
@@ -98,6 +114,50 @@ fi
 [ -f "$matching/vendor/embed/asset.md" ] || { echo 'FAIL go:embed input was removed' >&2; exit 1; }
 [ ! -e "$matching/vendor/golang.org/x/sys/unix/mkerrors.sh" ] || { echo 'FAIL exact generator was retained' >&2; exit 1; }
 [ -f "$matching/vendor/golang.org/x/sys/unix/mkerrors-neighbor.sh" ] || { echo 'FAIL neighboring script was removed' >&2; exit 1; }
+
+go_vendor="$scratch/workspace/vendor/source/sdk/rust/native/vendor"
+go_keep="$go_vendor/github.com/example/kept"
+go_reachable="$scratch/reachable-go-packages"
+mkdir -p "$go_keep/child" "$go_vendor/github.com/example/unreachable"
+printf 'package kept\n' > "$go_keep/kept.go"
+printf 'package child\n//go:embed child.asset\nvar asset string\n' > "$go_keep/child/child.go"
+printf 'embedded bytes\n' > "$go_keep/child/child.asset"
+printf 'package unreachable\n' > "$go_vendor/github.com/example/unreachable/unreachable.go"
+printf 'license bytes\n' > "$go_vendor/github.com/example/unreachable/LICENSE"
+printf 'C source bytes\n' > "$go_vendor/github.com/example/unreachable/source.c"
+printf 'C header bytes\n' > "$go_vendor/github.com/example/unreachable/source.h"
+printf 'asset bytes\n' > "$go_vendor/github.com/example/unreachable/asset.bin"
+printf '%s\n' "$go_keep" > "$go_reachable"
+metadata="$scratch/go-list-metadata.tsv"
+printf 'example/kept\t%s\n' "$go_keep" > "$metadata"
+reported_vendor=$(run_vendor_root_check "$go_vendor" "$metadata")
+[ "$reported_vendor" = "$go_vendor" ] || { echo 'FAIL vendor derivation selected an ancestor named vendor' >&2; exit 1; }
+if run_vendor_root_check 2>/dev/null; then
+    echo 'FAIL missing vendor-root inputs were accepted' >&2
+    exit 1
+fi
+if run_vendor_root_check "$scratch/workspace/vendor" "$metadata" >/dev/null 2>&1; then
+    echo 'FAIL ancestor vendor path was accepted as the generated vendor directory' >&2
+    exit 1
+fi
+printf 'malformed metadata\n' > "$scratch/malformed-metadata.tsv"
+if run_vendor_root_check "$go_vendor" "$scratch/malformed-metadata.tsv" >/dev/null 2>&1; then
+    echo 'FAIL malformed Go package metadata was accepted' >&2
+    exit 1
+fi
+run_go_source_filter "$go_vendor" "$go_reachable"
+[ -f "$go_keep/kept.go" ] && [ -f "$go_keep/child/child.go" ] || { echo 'FAIL reachable Go package or descendant was removed' >&2; exit 1; }
+[ -f "$go_keep/child/child.asset" ] || { echo 'FAIL embedded asset was removed' >&2; exit 1; }
+[ ! -e "$go_vendor/github.com/example/unreachable/unreachable.go" ] || { echo 'FAIL unreachable Go package source was retained' >&2; exit 1; }
+[ -f "$go_vendor/github.com/example/unreachable/LICENSE" ] && [ -f "$go_vendor/github.com/example/unreachable/source.c" ] && [ -f "$go_vendor/github.com/example/unreachable/source.h" ] && [ -f "$go_vendor/github.com/example/unreachable/asset.bin" ] || { echo 'FAIL non-Go, C, header, or license asset was removed' >&2; exit 1; }
+if run_go_source_filter "$go_vendor" "$scratch/empty-reachable" 2>/dev/null; then
+    echo 'FAIL empty reachable package metadata was accepted' >&2
+    exit 1
+fi
+if run_go_source_filter 2>/dev/null; then
+    echo 'FAIL missing Go source filter inputs were accepted' >&2
+    exit 1
+fi
 
 unknown="$scratch/unknown"
 unknown_doc="$unknown/vendor/cloud.google.com/go/storage/doc.go"
