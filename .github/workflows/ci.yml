@@ -203,6 +203,13 @@ jobs:
           install -D src/timeout "$RUNNER_TEMP/gnu-timeout/bin/timeout"
           "$RUNNER_TEMP/gnu-timeout/bin/timeout" --version
           echo "$RUNNER_TEMP/gnu-timeout/bin" >> "$GITHUB_PATH"
+      - name: Managed archive and observed-barrier regression evidence
+        env:
+          CGO_ENABLED: 0
+        run: >-
+          go test -tags rhiza_local_testhooks ./pkg/node
+          -run '^TestManaged(AppendOnlyRootSelector(SameFloorSuffixIsCacheIndependent|RejectsSealedArchiveOnRefreshAndCacheHit)|ObservedBarrierDoesNotAdoptUnobservedNextSlot)$'
+          -count=1 -timeout=60s -v
       - name: Test
         env:
           CGO_ENABLED: 0
