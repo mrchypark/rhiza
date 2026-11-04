@@ -143,7 +143,7 @@ func (c *Core) RecheckManagedControlPrefixAdvance(ctx context.Context, observati
 	if err := ctx.Err(); err != nil {
 		return false, err
 	}
-	if snapshot.core != c || snapshot.committed != expectedCommitted || snapshot.observed != expectedObserved || snapshot.protocol != applicationProtocol || snapshot.generation < 0 || uint64(snapshot.generation) != generation || c.localMode || c.managedAppendOnly == nil || c.managedAppendOnly != snapshot.config || c.managedAppendOnly.Verify == nil || c.observer || c.learner || c.managedAppendOnly.Binding != snapshot.binding || c.managedAppendOnly.Binding.ApplicationProtocol != snapshot.protocol || c.managedAppendOnly.Binding.Generation != snapshot.generation || c.walIdentity != snapshot.walIdentity || c.generationAnchorHash != snapshot.anchor || c.membershipVersion != snapshot.membership || !sameCluster(c.clusterForSlotLocked(snapshot.observed), snapshot.cluster) || !c.voterForClusterLocked(snapshot.cluster) || c.tip < snapshot.observed || c.highestKnownSlotLocked() > c.tip {
+	if snapshot.core != c || snapshot.committed != expectedCommitted || snapshot.observed != expectedObserved || snapshot.protocol != applicationProtocol || snapshot.generation < 0 || uint64(snapshot.generation) != generation || c.localMode || c.managedAppendOnly == nil || c.managedAppendOnly != snapshot.config || c.managedAppendOnly.Verify == nil || c.observer || c.managedAppendOnly.Binding != snapshot.binding || c.managedAppendOnly.Binding.ApplicationProtocol != snapshot.protocol || c.managedAppendOnly.Binding.Generation != snapshot.generation || c.walIdentity != snapshot.walIdentity || c.generationAnchorHash != snapshot.anchor || c.membershipVersion != snapshot.membership || !sameCluster(c.clusterForSlotLocked(snapshot.observed), snapshot.cluster) || !c.voterForClusterLocked(snapshot.cluster) || c.tip < snapshot.observed || c.highestKnownSlotLocked() > c.tip {
 		return false, nil
 	}
 	if _, ok := c.prefixes[snapshot.observed]; !ok {
@@ -216,7 +216,7 @@ func currentObservationFromSnapshotWithValidated(snapshot managedControlSnapshot
 }
 
 func (c *Core) managedControlPrefixAdvancedLocked(snapshot managedControlSnapshot) bool {
-	if snapshot.core != c || snapshot.committed >= snapshot.observed || c.tip < snapshot.observed || c.highestKnownSlotLocked() > c.tip || c.localMode || c.managedAppendOnly == nil || c.managedAppendOnly != snapshot.config || c.managedAppendOnly.Verify == nil || c.observer || c.learner || c.managedAppendOnly.Binding != snapshot.binding || c.walIdentity != snapshot.walIdentity || c.generationAnchorHash != snapshot.anchor || c.membershipVersion != snapshot.membership || !sameCluster(c.clusterForSlotLocked(snapshot.observed), snapshot.cluster) || !c.voterForClusterLocked(snapshot.cluster) {
+	if snapshot.core != c || snapshot.committed >= snapshot.observed || c.tip < snapshot.observed || c.highestKnownSlotLocked() > c.tip || c.localMode || c.managedAppendOnly == nil || c.managedAppendOnly != snapshot.config || c.managedAppendOnly.Verify == nil || c.observer || c.managedAppendOnly.Binding != snapshot.binding || c.walIdentity != snapshot.walIdentity || c.generationAnchorHash != snapshot.anchor || c.membershipVersion != snapshot.membership || !sameCluster(c.clusterForSlotLocked(snapshot.observed), snapshot.cluster) || !c.voterForClusterLocked(snapshot.cluster) {
 		return false
 	}
 	_, ok := c.prefixes[snapshot.observed]
@@ -240,7 +240,7 @@ func (c *Core) managedControlSnapshot() (snapshot managedControlSnapshot, result
 // managedControlSnapshotLocked reads the complete current ISR without acquiring
 // Core locks. Callers must hold at least c.mu.RLock.
 func (c *Core) managedControlSnapshotLocked(rejectionReason *string) (snapshot managedControlSnapshot, resultErr error) {
-	if c.localMode || c.managedAppendOnly == nil || c.managedAppendOnly.Verify == nil || c.observer || c.learner {
+	if c.localMode || c.managedAppendOnly == nil || c.managedAppendOnly.Verify == nil || c.observer {
 		*rejectionReason = "runtime_role_or_profile"
 		return managedControlSnapshot{}, ErrManagedControlObservationUnavailable
 	}

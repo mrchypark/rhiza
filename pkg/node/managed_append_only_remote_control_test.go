@@ -336,6 +336,17 @@ func TestManagedGraphAppendOnlyAdmissionWaitsForRemoteQCKPAndReadBarrier(t *test
 		}
 		time.Sleep(time.Millisecond)
 	}
+	for {
+		secondProgress := remoteCore.RuntimeProgressSnapshot()
+		secondValue, secondValuePresent := remoteCore.Value(candidate.Hash)
+		if secondProgress.RecorderTip == 10 && secondProgress.CertifiedTip == 9 && secondProgress.RecorderHashPresent && secondProgress.RecorderHash == candidate.Hash && secondValuePresent && bytes.Equal(secondValue, value) {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("actual QCKP proposer did not retain exact uncertified self-record at R=10: progress=%+v value_present=%t value_matches=%t", secondProgress, secondValuePresent, bytes.Equal(secondValue, value))
+		}
+		time.Sleep(time.Millisecond)
+	}
 	admission := make(chan error, 1)
 	go func() { admission <- fixture.node.admitInternalApplication(ctx) }()
 	var owned *managedGraphControlOperation
