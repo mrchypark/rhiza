@@ -256,6 +256,7 @@ jobs:
           go test -tags rhiza_local_testhooks ./pkg/managedsql -run '^TestManagedGraphPublic(PublisherCreatesCertifiedPairAndSuffix|RestartInstallsCertifiedPairAndSuffix)$' -count=1 -timeout=60s
           go test -tags rhiza_local_testhooks ./pkg/managedsql -run '^TestManagedGraphPublicNodeRecoversRetainedInstallAndLaterSuffix$' -count=1 -timeout=60s -v
           go test -tags rhiza_local_testhooks ./pkg/node -run '^TestManagedGraphStartupInstallPreparedLearner' -count=1 -timeout=60s -v
+          go test -tags rhiza_local_testhooks ./pkg/node -run '^TestManagedAppendOnly(OpenFailureDoesNotPublishDuringAbortCleanup|NormalShutdownArchivesExistingCertifiedSuffix)$' -count=1 -timeout=60s -v
           go test -tags rhiza_local_testhooks ./pkg/node ./pkg/quepaxa -run '^(TestManagedGraphHigherFenceWithOlderRecordedSealMakesCertifiedProgress|TestCertifiedCheckpointRedeliveryPreservesFailedSync|TestCertifiedCheckpointRedeliveryPreservesCanceledSync|TestManagedGraphStalePromotionAuthenticatesNewerLocator|TestManagedGraphReconcileRefusesUncertifiedNativeStateBeforeOpen)$' -count=1 -timeout=60s
           go test -tags rhiza_local_testhooks ./pkg/network -run '^TestOverload(MutationAdmissionEmitsFixedSite|QueueReservationEmitsFixedSite|InputChannelFullEmitsFixedSite|WorkerInflightBytesEmitsFixedSite|ProposalAdmissionSubtypeEmitsFixedSite)$' -count=1 -timeout=30s
           go test -tags rhiza_local_testhooks ./pkg/node -run '^TestAdvanceCheckpointReadBarriersRetriesRealPreAdmissionRefusal$' -count=1 -timeout=30s
@@ -273,6 +274,7 @@ jobs:
           go test -race -tags rhiza_local_testhooks ./pkg/managedsql -run '^TestManagedGraphPublic(PublisherCreatesCertifiedPairAndSuffix|RestartInstallsCertifiedPairAndSuffix)$' -count=1 -timeout=60s
           go test -race -tags rhiza_local_testhooks ./pkg/managedsql -run '^TestManagedGraphPublicNodeRecoversRetainedInstallAndLaterSuffix$' -count=1 -timeout=60s -v
           go test -race -tags rhiza_local_testhooks ./pkg/node -run '^TestManagedGraphStartupInstallPreparedLearner' -count=1 -timeout=60s -v
+          go test -race -tags rhiza_local_testhooks ./pkg/node -run '^TestManagedAppendOnly(OpenFailureDoesNotPublishDuringAbortCleanup|NormalShutdownArchivesExistingCertifiedSuffix)$' -count=1 -timeout=60s -v
           go test -race -tags rhiza_local_testhooks ./pkg/node ./pkg/quepaxa -run '^(TestManagedGraphHigherFenceWithOlderRecordedSealMakesCertifiedProgress|TestCertifiedCheckpointRedeliveryPreservesFailedSync|TestCertifiedCheckpointRedeliveryPreservesCanceledSync|TestManagedGraphStalePromotionAuthenticatesNewerLocator|TestManagedGraphReconcileRefusesUncertifiedNativeStateBeforeOpen)$' -count=1 -timeout=60s
           go test -race -tags rhiza_local_testhooks ./pkg/network -run '^TestOverload(MutationAdmissionEmitsFixedSite|QueueReservationEmitsFixedSite|InputChannelFullEmitsFixedSite|WorkerInflightBytesEmitsFixedSite|ProposalAdmissionSubtypeEmitsFixedSite)$' -count=1 -timeout=30s
           go test -race -tags rhiza_local_testhooks ./pkg/node -run '^TestAdvanceCheckpointReadBarriersRetriesRealPreAdmissionRefusal$' -count=1 -timeout=30s

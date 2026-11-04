@@ -89,6 +89,27 @@ func validateManagedAppendOnlyConfig(config *ManagedAppendOnlyConfig, wal *qlog.
 	return copy, nil
 }
 
+// ValidateCertifiedValue verifies a value's QuePaxa certificate against this
+// Core's slot configuration and recovery decision rules without importing or
+// persisting the value. It is suitable for authenticating externally supplied
+// certified evidence during read-only recovery.
+func (c *Core) ValidateCertifiedValue(ctx context.Context, value DecidedValue) error {
+	if c == nil {
+		return fmt.Errorf("QuePaxa Core unavailable")
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	decision, err := c.certifiedDecision(value)
+	if err != nil {
+		return err
+	}
+	if err := c.validateDecisionForRecovery(decision, true); err != nil {
+		return err
+	}
+	return ctx.Err()
+}
+
 // ValidateManagedCheckpointRoot authenticates an already-decided checkpoint
 // for read-only root selection. Proposal/record eligibility remains stricter.
 func (c *Core) ValidateManagedCheckpointRoot(ctx context.Context, candidate ManagedCheckpointCandidate) error {

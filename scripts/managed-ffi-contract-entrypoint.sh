@@ -65,7 +65,7 @@ run_contract() {
           fresh_c=control_fields[13]; sub(/^fresh_c=/,"",fresh_c)
           fresh_r=control_fields[14]; sub(/^fresh_r=/,"",fresh_r)
           fresh_step=control_fields[16]; sub(/^fresh_step=/,"",fresh_step)
-          if (knowncontrolreason(reason) && uint(old_c) && uint(old_r) && uint(old_step) && uint(fresh_c) && uint(fresh_r) && uint(fresh_step)) emit(diagnostic)
+          if ((knowncontrolreason(reason) || reason=="fresh_reference_invalid" || reason=="qckp_local_guard") && uint(old_c) && uint(old_r) && uint(old_step) && uint(fresh_c) && uint(fresh_r) && uint(fresh_step)) emit(diagnostic)
         }
         next
       }
@@ -357,6 +357,13 @@ if [ "${1-}" = --diagnostic-self-test ]; then
   grep -Fx 'MANAGED_CONTROL_OBSERVATION_REJECTED reason=reference_validation' "$diag_dir/active.log" >/dev/null
   grep -Fx 'MANAGED_CONTROL_OBSERVATION_REJECTED reason=refs_uncovered prefix_recheck=false authority_same_known=true authority_same=true refs_covered_known=true refs_covered=false old_known=true old_c=4 old_r=5 old_step=6 fresh_known=true fresh_c=4 fresh_r=5 fresh_step_known=true fresh_step=7' "$diag_dir/active.log" >/dev/null
   if grep -E 'private_cause|extra=DO-NOT-RETAIN|authority_same_known=yes|fresh_step=7x|secret-DO-NOT-RETAIN' "$diag_dir/active.log"; then exit 1; fi
+  for reason in fresh_reference_invalid qckp_local_guard; do
+    detailed="MANAGED_CONTROL_OBSERVATION_REJECTED reason=$reason prefix_recheck=false authority_same_known=true authority_same=true refs_covered_known=true refs_covered=false old_known=true old_c=4 old_r=5 old_step=6 fresh_known=true fresh_c=4 fresh_r=5 fresh_step_known=true fresh_step=7"
+    run_contract rust-restart sh -c 'printf "%s\n" "$1" "$1 secret-DO-NOT-RETAIN" "$2"' sh "$detailed" "MANAGED_CONTROL_OBSERVATION_REJECTED reason=$reason"
+    [ "$(grep -Fxc "$detailed" "$diag_dir/active.log")" = 1 ]
+    if grep -Fx "MANAGED_CONTROL_OBSERVATION_REJECTED reason=$reason" "$diag_dir/active.log"; then exit 1; fi
+    if grep -F 'secret-DO-NOT-RETAIN' "$diag_dir/active.log"; then exit 1; fi
+  done
   run_contract rust-restart sh -c 'printf "%s\n" \
     "MANAGED_CONTROL_WAIT_FAILURE leaf=observe cause=quorum_unavailable" \
     "2026/11/03 12:00:00 MANAGED_CONTROL_WAIT_FAILURE leaf=waiter_slot cause=deadline" \
