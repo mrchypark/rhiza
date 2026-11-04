@@ -1,12 +1,16 @@
 package node
 
 import (
+	"bytes"
 	"context"
 	"database/sql"
+	"io"
+	"strings"
 	"testing"
 
 	"github.com/mrchypark/rhiza/internal/types"
 	"github.com/mrchypark/rhiza/pkg/checkpoint"
+	"github.com/mrchypark/rhiza/pkg/quepaxa"
 	"github.com/mrchypark/rhiza/pkg/recovery"
 )
 
@@ -62,6 +66,10 @@ func TestManagedAppendOnlyRootSelectorSameFloorSuffixIsCacheIndependent(t *testi
 	}
 	sealB := sealedA.CheckpointSeal
 	sealB.RootHash, sealB.StateHash = rootB.RootHash, rootB.Hash
+	wrongBase := sealB
+	if err := core.ValidateCheckpointBase(ctx, wrongBase, decisionA); err == nil {
+		t.Fatal("Core accepted the actual A certificate paired with the different actual B root")
+	}
 	valueB, err := quepaxa.EncodeCheckpointSeal(sealB)
 	if err != nil {
 		t.Fatal("encode actual B checkpoint seal:", err)
@@ -157,5 +165,51 @@ func TestManagedAppendOnlyRootSelectorRejectsSealedArchiveOnRefreshAndCacheHit(t
 	}
 	if secondErr == nil || secondRoot != nil || secondSeal != nil {
 		t.Errorf("selector accepted sealed head on cache hit: root=%+v seal=%+v err=%v", secondRoot, secondSeal, secondErr)
+	}
+}
+
+func TestManagedAppendOnlyRootSelectorRefusesKnownBaseAndGenerationRegression(t *testing.T) {
+	ctx := context.Background()
+	n, core, archive, bucket := newManagedAppendOnlySelectorFixture(t)
+	if err := archive.SyncThrough(ctx, core, 2); err != nil {
+		t.Fatal("publish actual QCKP before capturing unbased HEAD:", err)
+	}
+	headKey := "readonly-selector/archive/head.bin"
+	headReader, err := bucket.Get(ctx, headKey)
+	if err != nil {
+		t.Fatal("read actual unbased archive HEAD:", err)
+	}
+	unbasedHead, readErr := io.ReadAll(headReader)
+	closeErr := headReader.Close()
+	if readErr != nil || closeErr != nil || len(unbasedHead) == 0 {
+		t.Fatalf("capture exact pre-base HEAD: read=%v close=%v bytes=%d", readErr, closeErr, len(unbasedHead))
+	}
+	sealed, ok, err := core.LatestManagedCheckpointSeal()
+	if err != nil || !ok {
+		t.Fatalf("actual QCKP unavailable for physical base: seal=%+v ok=%t err=%v", sealed, ok, err)
+	}
+	decision, ok := core.CertifiedValue(sealed.DecisionSlot)
+	if !ok {
+		t.Fatal("actual QCKP certificate unavailable for physical base")
+	}
+	if err := archive.TrimThrough(ctx, sealed, decision); err != nil {
+		t.Fatal("establish actual recovery base:", err)
+	}
+	if _, _, hasBase := archive.RecoveryBase(); !hasBase {
+		t.Fatal("fixture failed to establish a known physical base")
+	}
+	// Restore only a previously valid, generation-lower pre-base HEAD to model
+	// loss of the known base behind this reader; no archive fields are fabricated.
+	if err := bucket.Upload(ctx, headKey, bytes.NewReader(unbasedHead)); err != nil {
+		t.Fatal("restore exact prior HEAD to model base loss:", err)
+	}
+	before := bucket.mutationSnapshot()
+	root, selected, selectErr := n.selectManagedAppendOnlyRoot(ctx)
+	after := bucket.mutationSnapshot()
+	if selectErr == nil || root != nil || selected != nil || !strings.Contains(selectErr.Error(), "head regressed") {
+		t.Fatalf("selector accepted loss of known base/generation: root=%+v selected=%+v err=%v", root, selected, selectErr)
+	}
+	if len(after) != len(before) || core.Tip() != 2 {
+		t.Fatalf("selector changed archive/Core while refusing base loss: provider=%+v CoreTip=%d", after[len(before):], core.Tip())
 	}
 }

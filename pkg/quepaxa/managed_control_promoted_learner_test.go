@@ -5,6 +5,7 @@ package quepaxa
 import (
 	"context"
 	"encoding/hex"
+	"fmt"
 	"path/filepath"
 	"sync"
 	"sync/atomic"
@@ -97,6 +98,7 @@ func TestObserveManagedControlAcceptsDurablyPromotedLearner(t *testing.T) {
 			t.Fatalf("voter %s WAL identity was not registered", member.ID)
 		}
 		managed := managedNoPVCBinding(identity, managedGraphRequestAppendOnlyApplicationProtocol)
+		managed.Binding.Generation = 0
 		core, err := New(Config{
 			NodeID: member.ID, Cluster: initial, WAL: wal, Transport: transport,
 			EnableReconfiguration: true, ManagedAppendOnly: managed,
@@ -109,15 +111,42 @@ func TestObserveManagedControlAcceptsDurablyPromotedLearner(t *testing.T) {
 	}
 	learnerWAL, learnerIdentity := openRegisteredWAL("n4")
 	wals["n4"] = learnerWAL
+	learnerManaged := managedNoPVCBinding(learnerIdentity, managedGraphRequestAppendOnlyApplicationProtocol)
+	learnerManaged.Binding.Generation = 0
 	learner, err := NewLearner(Config{
 		NodeID: "n4", Cluster: initial, WAL: learnerWAL, Transport: transport,
 		EnableReconfiguration: true,
-		ManagedAppendOnly:     managedNoPVCBinding(learnerIdentity, managedGraphRequestAppendOnlyApplicationProtocol),
+		ManagedAppendOnly:     learnerManaged,
 	})
 	if err != nil {
 		t.Fatalf("create real managed learner: %v", err)
 	}
 	base.cores["n4"] = learner
+	for _, core := range cores {
+		core.reconfigAdmission = func(ctx context.Context, target Cluster, through Slot, prefix [32]byte) error {
+			var added *Member
+			for i := range target.Members {
+				if target.Members[i].ID == "n4" {
+					added = &target.Members[i]
+					break
+				}
+			}
+			if added == nil || added.WALIdentity != learner.WALIdentity() {
+				return fmt.Errorf("target lacks the actual learner WAL identity")
+			}
+			if err := learner.WaitTip(ctx, through); err != nil {
+				return err
+			}
+			if err := learner.EnsureDurableThrough(ctx, through); err != nil {
+				return err
+			}
+			got, ok := learner.PrefixHash(through)
+			if !ok || got != prefix {
+				return fmt.Errorf("actual learner prefix differs from reconfiguration prefix")
+			}
+			return nil
+		}
+	}
 
 	target := Cluster{ConfigID: 2, Members: append(append([]Member(nil), initial.Members...), Member{
 		ID: "n4", WALIdentity: learner.WALIdentity(),
