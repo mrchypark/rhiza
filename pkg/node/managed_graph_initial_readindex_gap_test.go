@@ -31,6 +31,12 @@ type managedGraphInitialGapTransport struct {
 	cores             map[quepaxa.NodeID]*quepaxa.Core
 	local             quepaxa.NodeID
 	heldDecision      chan quepaxa.Decision
+	blockRecordTo     quepaxa.NodeID
+	recordGateSlot    quepaxa.Slot
+	recordGateEnabled atomic.Bool
+	recordEntered     chan struct{}
+	recordRelease     chan struct{}
+	localRecordResult chan error
 	readTipCalls      atomic.Int32
 	maxReadTip        atomic.Uint64
 	allowLocalRecords atomic.Bool
@@ -39,6 +45,18 @@ type managedGraphInitialGapTransport struct {
 }
 
 func (p *managedGraphInitialGapTransport) SendRecord(ctx context.Context, to quepaxa.NodeID, request quepaxa.RecordRequest) (quepaxa.Summary, error) {
+	gateRecord := p.recordGateEnabled.Load() && request.Slot == p.recordGateSlot
+	if gateRecord && to == p.blockRecordTo {
+		select {
+		case p.recordEntered <- struct{}{}:
+		default:
+		}
+		select {
+		case <-p.recordRelease:
+		case <-ctx.Done():
+			return quepaxa.Summary{}, ctx.Err()
+		}
+	}
 	if to == p.local && !p.allowLocalRecords.Load() {
 		return quepaxa.Summary{}, quepaxa.ErrQuorumUnavailable
 	}
@@ -46,7 +64,11 @@ func (p *managedGraphInitialGapTransport) SendRecord(ctx context.Context, to que
 	if core == nil {
 		return quepaxa.Summary{}, quepaxa.ErrQuorumUnavailable
 	}
-	return core.Record(ctx, request)
+	summary, err := core.Record(ctx, request)
+	if gateRecord && to == p.local && p.localRecordResult != nil {
+		p.localRecordResult <- err
+	}
+	return summary, err
 }
 
 func (p *managedGraphInitialGapTransport) SendDecision(_ context.Context, decision quepaxa.Decision) error {
@@ -136,7 +158,12 @@ func newManagedGraphInitialGapFixture(t *testing.T) *managedGraphInitialGapFixtu
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 
-	transport := &managedGraphInitialGapTransport{cores: make(map[quepaxa.NodeID]*quepaxa.Core), local: "n1", heldDecision: make(chan quepaxa.Decision, 1), readIndexRounds: make(map[context.Context]struct{})}
+	transport := &managedGraphInitialGapTransport{
+		cores: make(map[quepaxa.NodeID]*quepaxa.Core), local: "n1", heldDecision: make(chan quepaxa.Decision, 1),
+		blockRecordTo: "n3", recordGateSlot: 2, recordEntered: make(chan struct{}, 1),
+		recordRelease: make(chan struct{}), localRecordResult: make(chan error, 1),
+		readIndexRounds: make(map[context.Context]struct{}),
+	}
 	clusterID := types.ClusterID("managed-graph-initial-readindex-gap")
 	protocol := sqlpolicy.ManagedGraphRequestAppendOnlyApplicationProtocol
 	cluster := quepaxa.Cluster{ConfigID: 1}
@@ -234,8 +261,6 @@ func newManagedGraphInitialGapFixture(t *testing.T) *managedGraphInitialGapFixtu
 	})
 	n.opened.Store(true)
 	n.managedPeerVerified.Store(true)
-	n.managedGraphInitialRootDone = make(chan struct{})
-	close(n.managedGraphInitialRootDone)
 	if err := n.installInternalApplicationBinding(ctx); err != nil {
 		t.Fatal(err)
 	}
@@ -323,6 +348,10 @@ func TestManagedGraphInitialAdmissionStillChecksAuthorityAfterLocalDelivery(t *t
 func TestManagedGraphInitialAdmissionRejectsNewOrdinaryRecorderGapAfterFixedTarget(t *testing.T) {
 	fixture := newManagedGraphInitialGapFixture(t)
 	n, transport, mat, checker := fixture.node, fixture.transport, fixture.material, fixture.checker
+	recordRelease := transport.recordRelease
+	var releaseRecordOnce sync.Once
+	releaseRecord := func() { releaseRecordOnce.Do(func() { close(recordRelease) }) }
+	t.Cleanup(releaseRecord)
 	waitEntered, resumeWait := make(chan struct{}), make(chan struct{})
 	var resumeOnce sync.Once
 	resume := func() { resumeOnce.Do(func() { close(resumeWait) }) }
@@ -353,7 +382,39 @@ func TestManagedGraphInitialAdmissionRejectsNewOrdinaryRecorderGapAfterFixedTarg
 		t.Fatal(err)
 	}
 	transport.allowLocalRecords.Store(true)
-	slot, _, err := fixture.nodes["n2"].core.Propose(ctx, value)
+	transport.recordGateEnabled.Store(true)
+	proposalResult := make(chan struct {
+		slot quepaxa.Slot
+		err  error
+	}, 1)
+	go func() {
+		slot, _, err := fixture.nodes["n2"].core.Propose(ctx, value)
+		proposalResult <- struct {
+			slot quepaxa.Slot
+			err  error
+		}{slot: slot, err: err}
+	}()
+	select {
+	case <-transport.recordEntered:
+	case <-ctx.Done():
+		t.Fatal("slot-2 proposal did not reach the gated remote record")
+	}
+	select {
+	case err := <-transport.localRecordResult:
+		if err != nil {
+			t.Fatalf("actual n1 slot-2 Record failed: %v", err)
+		}
+	case <-ctx.Done():
+		t.Fatal("slot-2 proposal did not Record on n1 before releasing WaitTip")
+	}
+	releaseRecord()
+	var slot quepaxa.Slot
+	select {
+	case result := <-proposalResult:
+		slot, err = result.slot, result.err
+	case <-ctx.Done():
+		t.Fatal("slot-2 proposal did not finish after n1 Record")
+	}
 	if err != nil || slot != 2 {
 		t.Fatalf("create actual later ordinary Graph recorder/certificate after target capture: slot=%d err=%v", slot, err)
 	}

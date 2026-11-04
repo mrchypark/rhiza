@@ -679,7 +679,7 @@ func (n *Node) OpenManaged(ctx context.Context, cfg ManagedStartupConfig) (resul
 	if policy == sqlpolicy.ManagedGraphRequestMaterializationPolicy && localtesthooks.Enabled {
 		localtesthooks.Hit("node:managed-graph-startup:runtime_verify")
 	}
-	postOpenFailure := func(err error) error { return errors.Join(err, n.Shutdown()) }
+	postOpenFailure := func(err error) error { return errors.Join(err, n.abortOpen()) }
 	if cfg.Prepared != nil {
 		adoption, err := n.verifyManagedPreparedRestore(ctx, cfg.Prepared)
 		if err != nil {

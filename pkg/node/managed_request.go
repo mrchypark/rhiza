@@ -140,6 +140,18 @@ func managedRequestResolutionStageFailure(stage string, err error) error {
 	return err
 }
 
+func logManagedControlWaitFailure(leaf string, err error) error {
+	if err == nil {
+		return nil
+	}
+	switch leaf {
+	case "binding", "budget", "context", "observe", "prefix_recheck_error", "prefix_recheck_false",
+		"worker_propose", "worker_wait_tip", "worker_certificate", "worker_replay", "waiter_error", "waiter_slot":
+		log.Printf("MANAGED_CONTROL_WAIT_FAILURE leaf=%s cause=%s", leaf, managedMembershipCauseClass(err))
+	}
+	return err
+}
+
 func logManagedRequestOriginalLookupError(err error) {
 	log.Printf("MANAGED_REQUEST_RESOLUTION_FAILURE stage=original_lookup lookup=error cause=%s", managedMembershipCauseClass(err))
 }

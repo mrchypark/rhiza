@@ -332,7 +332,7 @@ func (n *Node) openInternal(ctx context.Context, enroll bool, prelocked *qlog.Lo
 	n.recoveryPhases = nodeRecoveryPhases{}
 	defer func() {
 		if err != nil {
-			_ = n.Shutdown()
+			_ = n.abortOpen()
 		}
 	}()
 	ctx, n.cancel = context.WithCancel(ctx)
@@ -2714,6 +2714,19 @@ func (n *Node) shutdown() error {
 }
 
 func (n *Node) shutdownEngine(closeBucket bool) error {
+	return n.shutdownEngineWithArchiveSync(closeBucket, true)
+}
+
+// abortOpen closes a failed append-only startup without publishing local
+// decisions that its read-only archive selection rejected.
+func (n *Node) abortOpen() error {
+	n.shutdownMu.Lock()
+	defer n.shutdownMu.Unlock()
+	syncArchive := n.managedStartup == nil || !isManagedAppendOnlyProtocol(n.managedApplicationProtocol())
+	return n.shutdownEngineWithArchiveSync(true, syncArchive)
+}
+
+func (n *Node) shutdownEngineWithArchiveSync(closeBucket, syncArchive bool) error {
 	internal := n.stopInternalApplication()
 	n.managedPeerVerified.Store(false)
 	n.managedAdmitted.Store(false)
@@ -2777,7 +2790,7 @@ func (n *Node) shutdownEngine(closeBucket bool) error {
 	// Creating a new checkpoint here would instead require new consensus and
 	// make simultaneous or last-voter shutdown depend on peers staying alive.
 	if n.archive != nil {
-		if n.core != nil && (!n.config.EnableReconfiguration || n.core.IsVoter()) {
+		if syncArchive && n.core != nil && (!n.config.EnableReconfiguration || n.core.IsVoter()) {
 			shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 			shutdownErr = errors.Join(shutdownErr, n.archive.SyncThrough(shutdownCtx, n.core, n.core.Tip()))
 			cancel()

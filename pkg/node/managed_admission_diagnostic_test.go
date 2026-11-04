@@ -2,6 +2,7 @@ package node
 
 import (
 	"bytes"
+	"context"
 	"errors"
 	"fmt"
 	"log"
@@ -62,5 +63,52 @@ func TestManagedAdmissionDiagnosticsAreFixedAndRedacted(t *testing.T) {
 		if strings.Contains(line, secretText) {
 			t.Fatalf("diagnostic leaked %q: %q", secretText, line)
 		}
+	}
+}
+
+func TestManagedControlWaitFailureIsAllowlistedAndPreservesError(t *testing.T) {
+	oldWriter, oldFlags, oldPrefix := log.Writer(), log.Flags(), log.Prefix()
+	log.SetFlags(0)
+	log.SetPrefix("")
+	t.Cleanup(func() {
+		log.SetOutput(oldWriter)
+		log.SetFlags(oldFlags)
+		log.SetPrefix(oldPrefix)
+	})
+
+	var output bytes.Buffer
+	log.SetOutput(&output)
+	secret := fmt.Errorf("private object identity and peer detail: %w", network.ErrNotReady)
+	leaves := []string{
+		"binding", "budget", "context", "observe", "prefix_recheck_error", "prefix_recheck_false",
+		"worker_propose", "worker_wait_tip", "worker_certificate", "worker_replay", "waiter_error", "waiter_slot",
+	}
+	for _, leaf := range leaves {
+		if got := logManagedControlWaitFailure(leaf, secret); got != secret || !errors.Is(got, network.ErrNotReady) {
+			t.Fatalf("leaf %q changed the original error: got=%v", leaf, got)
+		}
+	}
+	if got := logManagedControlWaitFailure("private_leaf", secret); got != secret || !errors.Is(got, network.ErrNotReady) {
+		t.Fatalf("unknown leaf changed the original error: got=%v", got)
+	}
+	if got := logManagedControlWaitFailure("observe", nil); got != nil {
+		t.Fatalf("nil error changed: got=%v", got)
+	}
+
+	lines := strings.Split(strings.TrimSpace(output.String()), "\n")
+	if len(lines) != len(leaves) {
+		t.Fatalf("emitted %d diagnostics for %d allowlisted non-nil failures: %q", len(lines), len(leaves), output.String())
+	}
+	for i, leaf := range leaves {
+		want := "MANAGED_CONTROL_WAIT_FAILURE leaf=" + leaf + " cause=not_ready"
+		if lines[i] != want {
+			t.Fatalf("diagnostic[%d]=%q, want %q", i, lines[i], want)
+		}
+	}
+	if strings.Contains(output.String(), "private object identity") || strings.Contains(output.String(), "private_leaf") {
+		t.Fatalf("diagnostic leaked raw error or unknown leaf: %q", output.String())
+	}
+	if managedMembershipCauseClass(context.Canceled) != "canceled" {
+		t.Fatal("wait diagnostic must reuse the existing fixed cause classifier")
 	}
 }

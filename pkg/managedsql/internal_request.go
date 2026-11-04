@@ -51,17 +51,12 @@ func (h *Host) ensureInitialRequestAdmission(ctx context.Context) error {
 		scope, release := h.internalRequestContext(ctx)
 		defer release()
 		if h.admissionLifetime.Err() != nil {
-			logManagedHostRequestRecoveryPrecheckFailure()
 			return network.ErrNotReady
 		}
 		err := h.node.EnsureInitialManagedAdmission(scope)
 		return errors.Join(err, scope.Err(), h.admissionLifetime.Err())
 	}
 	return nil
-}
-
-func logManagedHostRequestRecoveryPrecheckFailure() {
-	log.Printf("MANAGED_HOST_REQUEST_RECOVERY_FAILURE stage=host_precheck cause=not_ready")
 }
 
 type requestRecoveryHint struct {
@@ -170,6 +165,7 @@ func (h *Host) recoverRequestLocked(ctx context.Context, selector network.Reques
 	}
 	p := applicationOriginal{kind: selector.Kind, sql: ExecuteRequest{RequestID: selector.RequestID}, kv: types.KVCommand{RequestID: selector.RequestID}, graph: types.GraphCommand{RequestID: selector.RequestID}}
 	if err := h.ensureInitialRequestAdmission(ctx); err != nil {
+		logManagedHostRequestRecoveryFailure(err)
 		return RecoveryResult{Kind: selector.Kind, RequestID: []byte(selector.RequestID)}, applicationOutcomeUnknown(p, types.MutationReceipt{}, err)
 	}
 	// The actual Node resolver owns quorum/replay, canonical lookup, barrier
@@ -196,4 +192,8 @@ func (h *Host) recoverRequestLocked(ctx context.Context, selector network.Reques
 	}
 	h.clearRequestHint(selector, resolved.Original.Fingerprint, resolved.Original.Slot)
 	return result, nil
+}
+
+func logManagedHostRequestRecoveryFailure(err error) {
+	log.Printf("MANAGED_HOST_REQUEST_RECOVERY_FAILURE stage=request_recovery_admission cause=%s", managedRepairCauseClass(err))
 }
