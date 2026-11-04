@@ -347,6 +347,24 @@ func TestManagedGraphAppendOnlyAdmissionWaitsForRemoteQCKPAndReadBarrier(t *test
 		}
 		time.Sleep(time.Millisecond)
 	}
+	// Put the exact QCKP at Step-5 FirstCurrent on every real recorder before
+	// admission can race its own barrier into R=10. These are actual durable
+	// Record calls, not a synthesized certificate; the remote proposer below
+	// still has to drive the QCKP through normal consensus at R=10.
+	var qckpPriority quepaxa.Priority
+	for index := range qckpPriority {
+		qckpPriority[index] = 0xff
+	}
+	for id, peer := range fixture.transport.graphReviewTransport {
+		summary, err := peer.Record(ctx, quepaxa.RecordRequest{
+			Slot: 10, Step: 5, ConfigID: 1,
+			Proposal: quepaxa.Proposal{Priority: qckpPriority, ProposerID: "n2", Hash: candidate.Hash, Value: bytes.Clone(value)},
+		})
+		stored, present := peer.Value(candidate.Hash)
+		if err != nil || summary.Step != 5 || summary.FirstCurrent == nil || summary.FirstCurrent.Hash != candidate.Hash || !present || !bytes.Equal(stored, value) {
+			t.Fatalf("recorder %s did not durably retain the exact QCKP as Step-5 FirstCurrent: summary=%+v err=%v", id, summary, err)
+		}
+	}
 	admission := make(chan error, 1)
 	go func() { admission <- fixture.node.admitInternalApplication(ctx) }()
 	var owned *managedGraphControlOperation

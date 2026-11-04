@@ -60,11 +60,51 @@ type ManagedAppendOnlyControlObservation struct {
 	Generation          int64
 	Proposals           []ManagedAppendOnlyControlProposal
 	core                *Core
+	seal                *managedControlObservationSeal
+	binding             ManagedAppendOnlyBinding
+	walIdentity         string
+	anchor              [32]byte
+	membership          uint64
+	cluster             Cluster
+	config              *ManagedAppendOnlyConfig
+}
+
+type managedControlObservationSeal struct {
+	committedTip        Slot
+	observedSlot        Slot
+	configID            uint
+	step                Step
+	applicationProtocol string
+	generation          int64
+	proposals           []ManagedAppendOnlyControlProposal
+}
+
+func sealManagedControlObservation(observation ManagedAppendOnlyControlObservation) ManagedAppendOnlyControlObservation {
+	observation.seal = &managedControlObservationSeal{
+		committedTip: observation.CommittedTip, observedSlot: observation.ObservedSlot,
+		configID: observation.ConfigID, step: observation.Step,
+		applicationProtocol: observation.ApplicationProtocol, generation: observation.Generation,
+		proposals: append([]ManagedAppendOnlyControlProposal(nil), observation.Proposals...),
+	}
+	return observation
+}
+
+func (o ManagedAppendOnlyControlObservation) matchesSeal() bool {
+	seal := o.seal
+	if seal == nil || o.CommittedTip != seal.committedTip || o.ObservedSlot != seal.observedSlot || o.ConfigID != seal.configID || o.Step != seal.step || o.ApplicationProtocol != seal.applicationProtocol || o.Generation != seal.generation || len(o.Proposals) != len(seal.proposals) {
+		return false
+	}
+	for index, proposal := range o.Proposals {
+		if proposal != seal.proposals[index] {
+			return false
+		}
+	}
+	return true
 }
 
 // BelongsTo prevents accidentally applying an observation to another Core.
 func (o ManagedAppendOnlyControlObservation) BelongsTo(core *Core) bool {
-	return core != nil && o.core == core
+	return core != nil && o.core == core && o.matchesSeal()
 }
 
 type managedControlRefSnapshot struct {
@@ -206,13 +246,18 @@ func (c *Core) ObserveManagedAppendOnlyControl(ctx context.Context) (ManagedAppe
 }
 
 func currentObservationFromSnapshot(snapshot managedControlSnapshot) ManagedAppendOnlyControlObservation {
-	return ManagedAppendOnlyControlObservation{CommittedTip: snapshot.committed, ObservedSlot: snapshot.observed, ConfigID: snapshot.configID, Step: snapshot.step, ApplicationProtocol: snapshot.protocol, Generation: snapshot.generation, core: snapshot.core}
+	return ManagedAppendOnlyControlObservation{
+		CommittedTip: snapshot.committed, ObservedSlot: snapshot.observed, ConfigID: snapshot.configID,
+		Step: snapshot.step, ApplicationProtocol: snapshot.protocol, Generation: snapshot.generation,
+		core: snapshot.core, binding: snapshot.binding, walIdentity: snapshot.walIdentity,
+		anchor: snapshot.anchor, membership: snapshot.membership, cluster: cloneCluster(snapshot.cluster), config: snapshot.config,
+	}
 }
 
 func currentObservationFromSnapshotWithValidated(snapshot managedControlSnapshot, validated []ManagedAppendOnlyControlProposal) ManagedAppendOnlyControlObservation {
 	observation := currentObservationFromSnapshot(snapshot)
 	observation.Proposals = validated
-	return observation
+	return sealManagedControlObservation(observation)
 }
 
 func (c *Core) managedControlPrefixAdvancedLocked(snapshot managedControlSnapshot) bool {
@@ -468,7 +513,13 @@ func (c *Core) reclassifiedManagedControlObservationLocked(before, current manag
 		}
 		proposals = append(proposals, ManagedAppendOnlyControlProposal{Role: ref.role, Kind: kind, Priority: ref.proposal.Priority, ProposerID: ref.proposal.ProposerID, Hash: ref.proposal.Hash})
 	}
-	return ManagedAppendOnlyControlObservation{CommittedTip: current.committed, ObservedSlot: current.observed, ConfigID: current.configID, Step: current.step, ApplicationProtocol: current.protocol, Generation: current.generation, Proposals: proposals, core: c}, true, ""
+	observation := ManagedAppendOnlyControlObservation{
+		CommittedTip: current.committed, ObservedSlot: current.observed, ConfigID: current.configID,
+		Step: current.step, ApplicationProtocol: current.protocol, Generation: current.generation,
+		Proposals: proposals, core: c, binding: current.binding, walIdentity: current.walIdentity,
+		anchor: current.anchor, membership: current.membership, cluster: cloneCluster(current.cluster), config: current.config,
+	}
+	return sealManagedControlObservation(observation), true, ""
 }
 
 func (c *Core) validateManagedControlRef(ctx context.Context, snapshot managedControlSnapshot, ref managedControlRefSnapshot) (ManagedAppendOnlyControlKind, error) {

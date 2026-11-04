@@ -35,10 +35,29 @@ type graphAdmissionRaceTransport struct {
 	heldOnce     sync.Once
 	releaseOnce  sync.Once
 	readTipCalls atomic.Int32
+	readTipGate  atomic.Pointer[graphAdmissionReadTipGate]
+}
+
+// graphAdmissionReadTipGate is immutable after installation. It blocks only
+// the first calls so a test can hold one real ReadIndex while later callers
+// use the same transport normally.
+type graphAdmissionReadTipGate struct {
+	blockCalls int32
+	entered    chan struct{}
+	release    <-chan struct{}
+	calls      atomic.Int32
 }
 
 func (p *graphAdmissionRaceTransport) ReadTip(ctx context.Context, id quepaxa.NodeID) (quepaxa.Slot, error) {
 	p.readTipCalls.Add(1)
+	if gate := p.readTipGate.Load(); gate != nil && gate.calls.Add(1) <= gate.blockCalls {
+		gate.entered <- struct{}{}
+		select {
+		case <-gate.release:
+		case <-ctx.Done():
+			return 0, ctx.Err()
+		}
+	}
 	return p.graphReviewTransport.ReadTip(ctx, id)
 }
 

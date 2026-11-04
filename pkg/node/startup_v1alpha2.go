@@ -602,12 +602,6 @@ func (n *Node) OpenManaged(ctx context.Context, cfg ManagedStartupConfig) (resul
 	if cfg.Prepared != nil && (cfg.Prepared.View() == nil || cfg.Prepared.View().MaterializationPolicy() != policy) {
 		return fmt.Errorf("managed prepared application profile mismatch")
 	}
-	if cfg.Prepared != nil && managedSQLKVPolicy(policy) {
-		_, tip, err := inspectManagedFileForPolicy(ctx, filepath.Join(cfg.Prepared.Directory(), "sqlite.db"), window, policy, i.ApplicationProtocol)
-		if err != nil || tip != uint64(cfg.Prepared.View().Tip()) {
-			return errors.Join(fmt.Errorf("managed prepared application window or tip mismatch"), err)
-		}
-	}
 	// Publish once before restore/open can start runtime readers. The pointer,
 	// expectedPolicy and idempotencyWindow stay fixed for this Node; adoption
 	// and admission state still follow their existing lifecycle.
@@ -629,20 +623,57 @@ func (n *Node) OpenManaged(ctx context.Context, cfg ManagedStartupConfig) (resul
 		if err := validateManagedRepairOrigin(ctx, cfg.Checker, cfg.RepairOrigin); err != nil {
 			return err
 		}
-		if err := n.verifyPreparedWALBeforeRestore(ctx, cfg.Prepared); err != nil {
-			return err
-		}
-		absent, err := managedMaterializerFilesAbsent(n.config.DataDir)
-		if err != nil {
-			return err
-		}
-		if !absent {
-			if err := n.verifyExistingManagedPreparedSQLBeforeOpen(ctx, cfg.Prepared); err != nil {
+		adoptionPath := filepath.Join(n.config.DataDir, "prepared-adoption.json")
+		_, adoptionErr := os.Lstat(adoptionPath)
+		if adoptionErr == nil {
+			// A durable H receipt distinguishes a retry from first installation.
+			// Verify it under the WAL lock before any exact-H preflight can reject
+			// certified local suffix progress or inspect a partially replayed DB.
+			if err := n.verifyPreparedAdoptionWithLock(ctx, i.Member); err != nil {
 				return err
 			}
-		}
-		if err := n.recoverPreparedV1Alpha2WithLock(ctx, cfg.Prepared, startupLock); err != nil {
-			return err
+			adoption, err := loadPreparedAdoption(adoptionPath)
+			if err != nil {
+				return err
+			}
+			view := cfg.Prepared.View()
+			if view == nil || adoption.Tip != view.Tip() || adoption.PrefixHash != view.PrefixHash() || adoption.OriginDigest != managedRepairOriginDigest(cfg.RepairOrigin) {
+				return fmt.Errorf("prepared retry differs from durable adoption")
+			}
+			seal, decision, hasBase := view.RecoveryBase()
+			baseMismatch := hasBase != (adoption.BaseSeal != nil) ||
+				(hasBase && (!reflect.DeepEqual(seal, *adoption.BaseSeal) || adoption.BaseDecision == nil || !reflect.DeepEqual(decision, *adoption.BaseDecision))) ||
+				(!hasBase && adoption.BaseDecision != nil)
+			if baseMismatch {
+				return fmt.Errorf("prepared retry checkpoint differs from durable adoption")
+			}
+			cfg.verifiedAdoption = &adoption
+		} else if errors.Is(adoptionErr, os.ErrNotExist) {
+			// Only an absent durable receipt permits the original exact-H install
+			// path. Any present but unreadable or malformed receipt fails closed.
+			if err := n.verifyPreparedWALBeforeRestore(ctx, cfg.Prepared); err != nil {
+				return err
+			}
+			if managedSQLKVPolicy(policy) {
+				_, tip, err := inspectManagedFileForPolicy(ctx, filepath.Join(cfg.Prepared.Directory(), "sqlite.db"), window, policy, i.ApplicationProtocol)
+				if err != nil || tip != uint64(cfg.Prepared.View().Tip()) {
+					return errors.Join(fmt.Errorf("managed prepared application window or tip mismatch"), err)
+				}
+			}
+			absent, err := managedMaterializerFilesAbsent(n.config.DataDir)
+			if err != nil {
+				return err
+			}
+			if !absent {
+				if err := n.verifyExistingManagedPreparedSQLBeforeOpen(ctx, cfg.Prepared); err != nil {
+					return err
+				}
+			}
+			if err := n.recoverPreparedV1Alpha2WithLock(ctx, cfg.Prepared, startupLock); err != nil {
+				return err
+			}
+		} else {
+			return fmt.Errorf("inspect durable prepared adoption: %w", adoptionErr)
 		}
 	} else if !i.Fresh && !cfg.BootstrapMember {
 		if err := validateManagedRepairOrigin(ctx, cfg.Checker, cfg.RepairOrigin); err != nil {
@@ -680,7 +711,7 @@ func (n *Node) OpenManaged(ctx context.Context, cfg ManagedStartupConfig) (resul
 		localtesthooks.Hit("node:managed-graph-startup:runtime_verify")
 	}
 	postOpenFailure := func(err error) error { return errors.Join(err, n.abortOpen()) }
-	if cfg.Prepared != nil {
+	if cfg.Prepared != nil && cfg.verifiedAdoption == nil {
 		adoption, err := n.verifyManagedPreparedRestore(ctx, cfg.Prepared)
 		if err != nil {
 			return postOpenFailure(err)
@@ -689,9 +720,22 @@ func (n *Node) OpenManaged(ctx context.Context, cfg ManagedStartupConfig) (resul
 			return postOpenFailure(fmt.Errorf("persist verified prepared adoption: %w", err))
 		}
 		cfg.verifiedAdoption = &adoption
+		if n.config.Learner != nil && isManagedAppendOnlyProtocol(i.ApplicationProtocol) {
+			if localtesthooks.Enabled {
+				localtesthooks.Hit("node:managed-prepared:adopted-before-suffix-catchup")
+			}
+			if err := n.catchUpPreparedArchiveSuffix(ctx, cfg.Prepared.View().Tip()); err != nil {
+				return postOpenFailure(fmt.Errorf("catch up prepared learner certified suffix: %w", err))
+			}
+		}
 	} else if cfg.verifiedAdoption != nil {
 		if err := n.verifyManagedAdoptionAfterOpen(ctx, *cfg.verifiedAdoption); err != nil {
 			return postOpenFailure(err)
+		}
+		if cfg.Prepared != nil && n.config.Learner != nil && isManagedAppendOnlyProtocol(i.ApplicationProtocol) {
+			if err := n.replayAdoptedCertifiedSuffix(ctx, *cfg.verifiedAdoption); err != nil {
+				return postOpenFailure(err)
+			}
 		}
 	}
 	if cfg.promotionReady != nil {
@@ -1588,6 +1632,10 @@ func (n *Node) verifyManagedAdoptionAfterOpen(ctx context.Context, adoption prep
 	if n == nil || n.core == nil || n.material == nil || !n.opened.Load() || n.core.WALIdentity() != adoption.WALIdentity {
 		return fmt.Errorf("managed adoption WAL is not open")
 	}
+	prefix, ok := n.core.PrefixHash(adoption.Tip)
+	if n.core.Tip() < adoption.Tip || !ok || prefix != adoption.PrefixHash {
+		return fmt.Errorf("managed adoption certified prefix changed after open")
+	}
 	if err := verifyAdoptedWALBase(n.core, adoption); err != nil {
 		return err
 	}
@@ -1609,6 +1657,60 @@ func (n *Node) verifyManagedAdoptionAfterOpen(ctx context.Context, adoption prep
 		}
 		if err := n.material.ValidateTip(n.material.Tip(), decision.Value); err != nil {
 			return err
+		}
+	}
+	return nil
+}
+
+// replayAdoptedCertifiedSuffix resumes only the contiguous certified prefix
+// already present in the adopted WAL. The bound is captured once; ordinary
+// recorder progress must not extend startup recovery.
+func (n *Node) replayAdoptedCertifiedSuffix(ctx context.Context, adoption preparedAdoption) error {
+	if n == nil || n.core == nil || n.material == nil || !n.opened.Load() || n.core.WALIdentity() != adoption.WALIdentity {
+		return fmt.Errorf("managed adopted suffix is unavailable")
+	}
+	if err := verifyAdoptedWALBase(n.core, adoption); err != nil {
+		return err
+	}
+	through := n.core.Tip()
+	if through < adoption.Tip {
+		return fmt.Errorf("managed adopted WAL is behind its durable H receipt")
+	}
+	if n.core.RecorderTip() > through {
+		return fmt.Errorf("managed adopted WAL has uncertified recorded progress beyond its fixed recovery prefix")
+	}
+	floor := n.core.CompactionFloor()
+	applied := quepaxa.Slot(n.material.Tip())
+	if applied < floor || applied > through {
+		return fmt.Errorf("managed materialized tip is outside the certified recovery prefix")
+	}
+	for slot := applied + 1; slot <= through; slot++ {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		decision, ok := n.core.CertifiedValue(slot)
+		if !ok || decision.Slot != slot {
+			return fmt.Errorf("managed adopted certified suffix is unavailable at slot %d", slot)
+		}
+		if err := n.validateExecutionPolicy(decision.Value); err != nil {
+			return fmt.Errorf("validate managed adopted suffix slot %d: %w", slot, err)
+		}
+	}
+	if applied < through {
+		if err := n.replayLocalDecisionsThrough(ctx, through); err != nil {
+			return fmt.Errorf("replay managed adopted certified suffix through %d: %w", through, err)
+		}
+	}
+	if quepaxa.Slot(n.material.Tip()) != through {
+		return fmt.Errorf("managed adopted suffix replay stopped before fixed certified tip %d", through)
+	}
+	if through > floor {
+		decision, ok := n.core.CertifiedValue(through)
+		if !ok {
+			return fmt.Errorf("managed adopted tip has no certified decision")
+		}
+		if err := n.material.ValidateTip(uint64(through), decision.Value); err != nil {
+			return fmt.Errorf("validate managed adopted materialized tip: %w", err)
 		}
 	}
 	return nil

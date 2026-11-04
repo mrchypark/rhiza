@@ -324,7 +324,83 @@ func (c *Core) propose(ctx context.Context, value []byte, complete bool) (Slot, 
 	return c.proposeOwned(ctx, value, complete, false, false)
 }
 
+// ProposeManagedObservedControl advances only through the slot classified by
+// the supplied Core observation and returns only its own barrier certificate.
+func (c *Core) ProposeManagedObservedControl(ctx context.Context, value []byte, observation ManagedAppendOnlyControlObservation) (Slot, []Receipt, error) {
+	barrier, decodeErr := DecodeReadBarrier(value)
+	if decodeErr != nil || !barrier || !observation.BelongsTo(c) || observation.ObservedSlot == 0 || observation.ObservedSlot != observation.CommittedTip+1 || len(observation.Proposals) == 0 {
+		return 0, nil, fmt.Errorf("managed control observation is unavailable")
+	}
+	observation.Proposals = append([]ManagedAppendOnlyControlProposal(nil), observation.Proposals...)
+	if err := c.checkValue(value); err != nil {
+		return 0, nil, err
+	}
+	if err := ctx.Err(); err != nil {
+		return 0, nil, err
+	}
+	observedSlotCertified := false
+	if decisionValue, ok := c.CertifiedValue(observation.ObservedSlot); ok {
+		decision, err := c.certifiedDecision(decisionValue)
+		if err != nil || !c.managedControlObservationAuthorityMatches(observation) || !observationAllowsManagedControlDecision(observation, decision.Proposal.Hash) || !isManagedReadBarrierValue(decision.Proposal.Value) {
+			return 0, nil, fmt.Errorf("managed control observation is no longer current")
+		}
+		observedSlotCertified = true
+	}
+	if !c.managedControlObservationAuthorityMatches(observation) || !observedSlotCertified && !c.managedControlObservationIsCurrent(observation) {
+		return 0, nil, fmt.Errorf("managed control observation is no longer current")
+	}
+	return c.proposeOwnedObserved(ctx, value, true, false, false, &observation)
+}
+
+func (c *Core) managedControlObservationIsCurrent(observation ManagedAppendOnlyControlObservation) bool {
+	snapshot, err := c.managedControlSnapshot()
+	if err != nil || snapshot.core != c || snapshot.committed != observation.CommittedTip || snapshot.observed != observation.ObservedSlot || snapshot.configID != observation.ConfigID || snapshot.step != observation.Step || snapshot.protocol != observation.ApplicationProtocol || snapshot.generation != observation.Generation || snapshot.binding != observation.binding || snapshot.walIdentity != observation.walIdentity || snapshot.anchor != observation.anchor || snapshot.membership != observation.membership || !sameCluster(snapshot.cluster, observation.cluster) || snapshot.config != observation.config || len(snapshot.refs) != len(observation.Proposals) {
+		return false
+	}
+	for index, ref := range snapshot.refs {
+		proposal := observation.Proposals[index]
+		kind, err := managedControlProposalKind(ref.value)
+		if err != nil || proposal.Role != ref.role || proposal.Kind != kind || proposal.Priority != ref.proposal.Priority || proposal.ProposerID != ref.proposal.ProposerID || proposal.Hash != ref.proposal.Hash {
+			return false
+		}
+	}
+	return true
+}
+
+func (c *Core) managedControlObservationAuthorityMatches(observation ManagedAppendOnlyControlObservation) bool {
+	if c == nil {
+		return false
+	}
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	if c.localMode || c.managedAppendOnly == nil || c.managedAppendOnly.Verify == nil || c.observer || c.managedAppendOnly != observation.config || c.managedAppendOnly.Binding != observation.binding || c.walIdentity != observation.walIdentity || c.generationAnchorHash != observation.anchor || c.membershipVersion != observation.membership || c.managedAppendOnly.Binding.ApplicationProtocol != observation.ApplicationProtocol || c.managedAppendOnly.Binding.Generation != observation.Generation || c.reconfigEnabled && c.reconfiguration != nil {
+		return false
+	}
+	cluster := c.clusterForSlotLocked(observation.ObservedSlot)
+	return cluster.ConfigID == observation.ConfigID && sameCluster(cluster, observation.cluster) && c.voterForClusterLocked(cluster)
+}
+
+func managedControlProposalKind(value []byte) (ManagedAppendOnlyControlKind, error) {
+	if barrier, err := DecodeReadBarrier(value); barrier && err == nil {
+		return ManagedAppendOnlyReadBarrier, nil
+	}
+	_, checkpoint, err := DecodeCheckpointSeal(value)
+	if err != nil || !checkpoint {
+		return 0, fmt.Errorf("proposal is not a recognized managed control")
+	}
+	return ManagedAppendOnlyCheckpointSeal, nil
+}
+
+func isManagedReadBarrierValue(value []byte) bool {
+	barrier, err := DecodeReadBarrier(value)
+	return err == nil && barrier
+}
+
 func (c *Core) proposeOwned(ctx context.Context, value []byte, complete, executionOwned, capacityPreflightDone bool) (Slot, []Receipt, error) {
+	return c.proposeOwnedObserved(ctx, value, complete, executionOwned, capacityPreflightDone, nil)
+}
+
+func (c *Core) proposeOwnedObserved(ctx context.Context, value []byte, complete, executionOwned, capacityPreflightDone bool, observation *ManagedAppendOnlyControlObservation) (Slot, []Receipt, error) {
 	if localtesthooks.Enabled {
 		localtesthooks.HitProposalEntry(value)
 	}
@@ -383,6 +459,14 @@ func (c *Core) proposeOwned(ctx context.Context, value []byte, complete, executi
 	}
 
 	offeredHash := sha256.Sum256(value)
+	var observedConstraint *managedObservedControlConstraint
+	if observation != nil {
+		observedConstraint = &managedObservedControlConstraint{
+			observation:  observation,
+			barrierValue: bytes.Clone(value),
+			barrierHash:  offeredHash,
+		}
+	}
 	for {
 		if err := ctx.Err(); err != nil {
 			return 0, nil, err
@@ -396,7 +480,13 @@ func (c *Core) proposeOwned(ctx context.Context, value []byte, complete, executi
 		}
 		slot, reused := c.reserveSlot()
 		if c.reconfigEnabled && slot > c.Tip()+16 {
-			if err := c.recoverThroughOwned(ctx, slot-16); err != nil {
+			var err error
+			if observedConstraint == nil {
+				err = c.recoverThroughOwned(ctx, slot-16)
+			} else {
+				err = c.recoverThroughOwnedGuarded(ctx, slot-16, observedConstraint)
+			}
+			if err != nil {
 				c.releaseSlot(slot)
 				return slot, nil, err
 			}
@@ -424,7 +514,7 @@ func (c *Core) proposeOwned(ctx context.Context, value []byte, complete, executi
 			return 0, nil, err
 		}
 		c.markEpochStarted(slot)
-		decision, err := c.runSlot(ctx, slot, proposed, !reused)
+		decision, err := c.runSlotGuarded(ctx, slot, proposed, !reused, observedConstraint)
 		if err != nil {
 			c.releaseSlot(slot)
 			return slot, nil, err
@@ -438,7 +528,13 @@ func (c *Core) proposeOwned(ctx context.Context, value []byte, complete, executi
 		}
 		if complete {
 			if tip := c.Tip(); tip+1 < decision.Slot {
-				if err := c.recoverThroughOwnedAdmitted(ctx, decision.Slot-1); err != nil {
+				var err error
+				if observedConstraint == nil {
+					err = c.recoverThroughOwnedAdmitted(ctx, decision.Slot-1)
+				} else {
+					err = c.recoverThroughOwnedAdmittedGuarded(ctx, decision.Slot-1, observedConstraint)
+				}
+				if err != nil {
 					return decision.Slot, nil, err
 				}
 			}
@@ -453,9 +549,21 @@ func (c *Core) proposeOwned(ctx context.Context, value []byte, complete, executi
 			}
 		}
 		if decision.Proposal.Hash == offeredHash && bytes.Equal(decision.Proposal.Value, value) {
+			if observation != nil && !c.managedControlObservationAuthorityMatches(*observation) {
+				return decision.Slot, nil, fmt.Errorf("managed control observation authority changed during proposal")
+			}
 			return proposalResult(decision)
 		}
 	}
+}
+
+func observationAllowsManagedControlDecision(observation ManagedAppendOnlyControlObservation, hash ValueHash) bool {
+	for _, proposal := range observation.Proposals {
+		if proposal.Kind == ManagedAppendOnlyReadBarrier && proposal.Hash == hash {
+			return true
+		}
+	}
+	return false
 }
 
 func (c *Core) StageValue(hash ValueHash, value []byte) error {
@@ -704,12 +812,13 @@ func (c *Core) reserveSlot() (Slot, bool) {
 	defer c.mu.RUnlock()
 	for len(c.vacant) > 0 {
 		slot := c.vacant[0]
-		c.vacant = c.vacant[1:]
 		if slot > c.floor {
 			if _, decided := c.decided[slot]; !decided {
+				c.vacant = c.vacant[1:]
 				return slot, true
 			}
 		}
+		c.vacant = c.vacant[1:]
 	}
 	next := c.tip + 1
 	if floorNext := c.floor + 1; next < floorNext {
@@ -1007,6 +1116,82 @@ func (c *Core) releaseSlot(slot Slot) {
 }
 
 func (c *Core) runSlot(ctx context.Context, slot Slot, value []byte, allowLeaderFastPath bool) (Decision, error) {
+	return c.runSlotGuarded(ctx, slot, value, allowLeaderFastPath, nil)
+}
+
+type managedObservedControlConstraint struct {
+	observation  *ManagedAppendOnlyControlObservation
+	barrierValue []byte
+	barrierHash  ValueHash
+}
+
+func (c *Core) managedObservedCandidateAllowed(slot Slot, proposal Proposal, constraint *managedObservedControlConstraint) bool {
+	if constraint == nil {
+		return true
+	}
+	if constraint.observation == nil || !c.managedControlObservationAuthorityMatches(*constraint.observation) {
+		return false
+	}
+	if slot <= constraint.observation.ObservedSlot {
+		return true
+	}
+	if proposal.Hash == constraint.barrierHash && bytes.Equal(proposal.Value, constraint.barrierValue) && isManagedReadBarrierValue(proposal.Value) {
+		return true
+	}
+	if !c.isLeaderScheduleSlot(slot) {
+		return false
+	}
+	order, scheduled, err := DecodeLeaderSchedule(proposal.Value)
+	if err != nil || !scheduled {
+		return false
+	}
+	return validateLeaderSchedule(c.clusterForSlot(slot), order)
+}
+
+func (c *Core) managedObservedRecorderStateAllowed(slot Slot, constraint *managedObservedControlConstraint) bool {
+	if constraint == nil || constraint.observation == nil || slot <= constraint.observation.ObservedSlot {
+		return true
+	}
+	c.mu.RLock()
+	if _, decided := c.decided[slot]; decided {
+		c.mu.RUnlock()
+		return true
+	}
+	state, found := c.recorders[slot]
+	proposals := make([]Proposal, 0, 3)
+	for _, proposal := range []*Proposal{state.FirstCurrent, state.AggregateCurrent, state.AggregatePrior} {
+		if proposal == nil {
+			continue
+		}
+		copy := *cloneProposal(proposal)
+		value, ok := c.values[copy.Hash]
+		if !ok || len(value) == 0 || sha256.Sum256(value) != copy.Hash {
+			c.mu.RUnlock()
+			return false
+		}
+		copy.Value = bytes.Clone(value)
+		proposals = append(proposals, copy)
+	}
+	c.mu.RUnlock()
+	if !found {
+		return true
+	}
+	if len(proposals) == 0 {
+		return false
+	}
+	for _, proposal := range proposals {
+		if !c.managedObservedCandidateAllowed(slot, proposal, constraint) {
+			return false
+		}
+	}
+	return true
+}
+
+func (c *Core) managedObservedCandidateError(slot Slot) error {
+	return fmt.Errorf("managed observed barrier refused unobserved proposal at slot %d", slot)
+}
+
+func (c *Core) runSlotGuarded(ctx context.Context, slot Slot, value []byte, allowLeaderFastPath bool, constraint *managedObservedControlConstraint) (Decision, error) {
 	leaderOrder, err := c.LeaderOrder(slot)
 	if err != nil {
 		return Decision{}, err
@@ -1016,10 +1201,16 @@ func (c *Core) runSlot(ctx context.Context, slot Slot, value []byte, allowLeader
 	step := Step(4)
 	localRecordAttempts := 0
 	for {
+		if constraint != nil && (constraint.observation == nil || !c.managedControlObservationAuthorityMatches(*constraint.observation)) {
+			return Decision{}, fmt.Errorf("managed control observation authority changed during proposal")
+		}
 		if decided, ok := c.decision(slot); ok {
 			decision, err := decodeDecision(decided.Certificate)
 			decision.Proposal.Value = append([]byte(nil), decided.Value...)
 			return decision, err
+		}
+		if !c.managedObservedRecorderStateAllowed(slot, constraint) {
+			return Decision{}, c.managedObservedCandidateError(slot)
 		}
 		if c.localMode {
 			if err := c.validateLocalPendingISR(slot); err != nil {
@@ -1034,6 +1225,9 @@ func (c *Core) runSlot(ctx context.Context, slot Slot, value []byte, allowLeader
 				return Decision{}, err
 			}
 			candidate.Priority = priority
+		}
+		if !c.managedObservedCandidateAllowed(slot, candidate, constraint) {
+			return Decision{}, c.managedObservedCandidateError(slot)
 		}
 		cluster := *c.config
 		if c.reconfigEnabled {
@@ -1105,6 +1299,9 @@ func (c *Core) runSlot(ctx context.Context, slot Slot, value []byte, allowLeader
 			if err := c.hydrateProposal(ctx, &proposal, caught.RecorderID); err != nil {
 				return Decision{}, err
 			}
+			if !c.managedObservedCandidateAllowed(slot, proposal, constraint) {
+				return Decision{}, c.managedObservedCandidateError(slot)
+			}
 			continue
 		}
 
@@ -1127,6 +1324,9 @@ func (c *Core) runSlot(ctx context.Context, slot Slot, value []byte, allowLeader
 				if err := c.hydrateProposal(ctx, &proposal, summarySources(summaries)...); err != nil {
 					return Decision{}, err
 				}
+				if !c.managedObservedCandidateAllowed(slot, proposal, constraint) {
+					return Decision{}, c.managedObservedCandidateError(slot)
+				}
 				return Decision{Slot: slot, Step: step, Proposal: proposal, Summaries: summaries}, nil
 			}
 			best := maxFirst(summaries)
@@ -1136,6 +1336,9 @@ func (c *Core) runSlot(ctx context.Context, slot Slot, value []byte, allowLeader
 			proposal = *best
 			if err := c.hydrateProposal(ctx, &proposal, summarySources(summaries)...); err != nil {
 				return Decision{}, err
+			}
+			if !c.managedObservedCandidateAllowed(slot, proposal, constraint) {
+				return Decision{}, c.managedObservedCandidateError(slot)
 			}
 		case 1:
 			// Algorithm 4 has no phase-specific action.
@@ -1151,6 +1354,9 @@ func (c *Core) runSlot(ctx context.Context, slot Slot, value []byte, allowLeader
 			proposal = *best
 			if err := c.hydrateProposal(ctx, &proposal, summarySources(summaries)...); err != nil {
 				return Decision{}, err
+			}
+			if !c.managedObservedCandidateAllowed(slot, proposal, constraint) {
+				return Decision{}, c.managedObservedCandidateError(slot)
 			}
 		}
 		step++
@@ -2705,6 +2911,10 @@ func (c *Core) RecoverThrough(ctx context.Context, through Slot) error {
 // recoverThroughOwned is used when the caller already owns local execution or
 // when ordinary clustered proposal internals recover a gap themselves.
 func (c *Core) recoverThroughOwned(ctx context.Context, through Slot) error {
+	return c.recoverThroughOwnedGuarded(ctx, through, nil)
+}
+
+func (c *Core) recoverThroughOwnedGuarded(ctx context.Context, through Slot, constraint *managedObservedControlConstraint) error {
 	if c.localMode {
 		if through <= c.Tip() {
 			return nil
@@ -2717,10 +2927,14 @@ func (c *Core) recoverThroughOwned(ctx context.Context, through Slot) error {
 			return err
 		}
 	}
-	return c.recoverThroughOwnedAdmitted(ctx, through)
+	return c.recoverThroughOwnedAdmittedGuarded(ctx, through, constraint)
 }
 
 func (c *Core) recoverThroughOwnedAdmitted(ctx context.Context, through Slot) error {
+	return c.recoverThroughOwnedAdmittedGuarded(ctx, through, nil)
+}
+
+func (c *Core) recoverThroughOwnedAdmittedGuarded(ctx context.Context, through Slot, constraint *managedObservedControlConstraint) error {
 	if c.observer {
 		return ErrQuorumUnavailable
 	}
@@ -2759,7 +2973,11 @@ func (c *Core) recoverThroughOwnedAdmitted(ctx context.Context, through Slot) er
 			if err != nil {
 				return fmt.Errorf("recover slot %d value: %w", slot, err)
 			}
-			decision, err = c.runSlot(ctx, slot, value, false)
+			candidate := newProposal(highestPriority, c.nodeID, value)
+			if !c.managedObservedCandidateAllowed(slot, candidate, constraint) {
+				return c.managedObservedCandidateError(slot)
+			}
+			decision, err = c.runSlotGuarded(ctx, slot, value, false, constraint)
 			if err != nil {
 				return fmt.Errorf("recover slot %d: %w", slot, err)
 			}
