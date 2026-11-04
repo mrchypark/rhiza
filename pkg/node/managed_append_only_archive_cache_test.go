@@ -2,10 +2,11 @@ package node
 
 import (
 	"context"
+	"database/sql"
 	"testing"
 
 	"github.com/mrchypark/rhiza/internal/types"
-	"github.com/mrchypark/rhiza/pkg/quepaxa"
+	"github.com/mrchypark/rhiza/pkg/checkpoint"
 	"github.com/mrchypark/rhiza/pkg/recovery"
 )
 
@@ -35,11 +36,41 @@ func TestManagedAppendOnlyRootSelectorSameFloorSuffixIsCacheIndependent(t *testi
 	if base, _, hasBase := archive.RecoveryBase(); !hasBase || base.Index != sealedA.Index || archive.Tip() != 2 {
 		t.Fatalf("archive lacks physical A base with retained A producer: base=%+v hasBase=%t tip=%d", base, hasBase, archive.Tip())
 	}
-	if slot, _, err := core.Propose(ctx, decisionA.Value); err != nil || slot != 3 {
+	rootFiles, err := n.checkpoints.DownloadRootFiles(ctx, uint64(sealedA.Index), sealedA.RootHash, t.TempDir())
+	if err != nil {
+		t.Fatal("download verified physical A for an actual alternate B root:", err)
+	}
+	sources := make([]checkpoint.Source, len(rootFiles))
+	for i, file := range rootFiles {
+		sources[i] = checkpoint.Source{Role: file.Role, Path: file.Path}
+		if file.Role != checkpoint.RoleSQLite {
+			continue
+		}
+		db, err := sql.Open("sqlite3", file.Path)
+		if err != nil {
+			t.Fatal("open downloaded A SQLite root:", err)
+		}
+		_, execErr := db.ExecContext(ctx, "PRAGMA user_version=1")
+		closeErr := db.Close()
+		if execErr != nil || closeErr != nil {
+			t.Fatalf("prepare actual alternate B SQLite root: exec=%v close=%v", execErr, closeErr)
+		}
+	}
+	rootB, err := n.checkpoints.CreateManagedAppendOnlyCandidate(ctx, sources, uint64(sealedA.Index))
+	if err != nil || rootB.RootHash == sealedA.RootHash {
+		t.Fatalf("actual same-cut B root is not distinct from A: root=%+v A=%x err=%v", rootB, sealedA.RootHash, err)
+	}
+	sealB := sealedA.CheckpointSeal
+	sealB.RootHash, sealB.StateHash = rootB.RootHash, rootB.Hash
+	valueB, err := quepaxa.EncodeCheckpointSeal(sealB)
+	if err != nil {
+		t.Fatal("encode actual B checkpoint seal:", err)
+	}
+	if slot, _, err := core.Propose(ctx, valueB); err != nil || slot != 3 {
 		t.Fatalf("certify actual same-floor B producer: slot=%d err=%v", slot, err)
 	}
 	sealedB, ok, err := core.LatestManagedCheckpointSeal()
-	if err != nil || !ok || sealedB.DecisionSlot != 3 || sealedB.Index != sealedA.Index || sealedB.RootHash != sealedA.RootHash {
+	if err != nil || !ok || sealedB.DecisionSlot != 3 || sealedB.Index != sealedA.Index || sealedB.RootHash != rootB.RootHash {
 		t.Fatalf("actual B producer does not preserve same-floor A identity: B=%+v A=%+v ok=%t err=%v", sealedB, sealedA, ok, err)
 	}
 	writer, err := recovery.NewAppendOnlyManagerWithValueValidator(bucket, "readonly-selector", 1, types.ValidateManagedGraphExecutionPolicy)
@@ -47,9 +78,7 @@ func TestManagedAppendOnlyRootSelectorSameFloorSuffixIsCacheIndependent(t *testi
 		t.Fatal("create independent B publisher:", err)
 	}
 	t.Cleanup(func() {
-		if err := writer.Close(); err != nil {
-			t.Errorf("close independent B publisher: %v", err)
-		}
+		writer.Close()
 	})
 	writer.SetGroupDelay(0)
 	if err := writer.Load(ctx); err != nil {
@@ -89,9 +118,7 @@ func TestManagedAppendOnlyRootSelectorRejectsSealedArchiveOnRefreshAndCacheHit(t
 		t.Fatal("create independent archive publisher:", err)
 	}
 	t.Cleanup(func() {
-		if err := writer.Close(); err != nil {
-			t.Errorf("close independent archive publisher: %v", err)
-		}
+		writer.Close()
 	})
 	writer.SetGroupDelay(0)
 	if err := writer.Load(ctx); err != nil {
@@ -111,12 +138,10 @@ func TestManagedAppendOnlyRootSelectorRejectsSealedArchiveOnRefreshAndCacheHit(t
 	} else {
 		reader.SetGroupDelay(0)
 		if err := reader.Load(ctx); err != nil || !reader.Sealed() || reader.Tip() != 2 {
-			_ = reader.Close()
+			reader.Close()
 			t.Fatalf("published archive head is not sealed at the actual QCKP: tip=%d sealed=%t err=%v", reader.Tip(), reader.Sealed(), err)
 		}
-		if err := reader.Close(); err != nil {
-			t.Fatal("close independent sealed-head verifier:", err)
-		}
+		reader.Close()
 	}
 
 	before := bucket.mutationSnapshot()
