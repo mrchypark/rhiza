@@ -660,6 +660,9 @@ func TestManagedGraphAppendOnlyCandidateAuthenticatesActualPair(t *testing.T) {
 	if _, _, err := core.Propose(ctx, value); err != nil {
 		t.Fatal("direct Graph QCKP proposal with object-backed pair validator", err)
 	}
+	if err := archive.SyncThrough(ctx, core, core.Tip()); err != nil {
+		t.Fatal("explicitly archive actual certified Graph QCKP before selection", err)
+	}
 	selectedRoot, selected, err := n.selectManagedAppendOnlyRoot(ctx)
 	if err != nil || selected == nil || selectedRoot == nil || selected.Index != seal.Index || selected.RootHash != seal.RootHash {
 		t.Fatalf("actual paired root not selected: root=%+v seal=%+v err=%v", selectedRoot, selected, err)

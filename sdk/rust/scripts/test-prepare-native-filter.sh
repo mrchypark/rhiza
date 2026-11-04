@@ -15,6 +15,7 @@ awk '
     active { print }
 ' "$prepare_script" > "$filter_block"
 [ -s "$filter_block" ] || { echo 'FAIL unable to extract actual prepare-native filter' >&2; exit 1; }
+grep -Fq "! -path 'internal/foregroundcosttest/*'" "$prepare_script" || { echo 'FAIL test-only foreground cost package is staged into native snapshot' >&2; exit 1; }
 
 run_filter() (
     native_dir=$1

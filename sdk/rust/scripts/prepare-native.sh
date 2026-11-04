@@ -20,10 +20,11 @@ cp "$repo_dir/go.mod" "$repo_dir/go.sum" "$repo_dir/rhiza.go" "$repo_dir/replica
 (
     cd "$repo_dir"
     export NATIVE_OUTPUT="$temporary_dir"
-    # These two directories are used only by repository Go tests. The crate
+    # These directories are used only by repository Go tests. The crate
     # builds cmd/rhiza-ffi; it does not run the repository qualification suite.
     find cmd/rhiza-ffi internal pkg -type f ! -name '*_test.go' \
         ! -path 'pkg/materializer/testdata/*' \
+        ! -path 'internal/foregroundcosttest/*' \
         ! -path 'internal/objstore/versityfixture/*' -exec sh -c '
         for source do
             # Retain all ordinary/platform sources and disabled counterparts.
