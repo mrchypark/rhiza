@@ -190,12 +190,31 @@ jobs:
       - name: Select runner GNU timeout
         run: |
           set -eu
-          native_timeout=/usr/bin/timeout
-          version=$("$native_timeout" --version)
-          case "$version" in
-            *"timeout (GNU coreutils)"*) ;;
-            *) echo "runner timeout is not verified GNU coreutils timeout" >&2; exit 1 ;;
-          esac
+          native_timeout=
+          for candidate in timeout gtimeout gnutimeout /usr/bin/timeout /bin/timeout; do
+            case "$candidate" in
+              /*) candidate_path=$candidate ;;
+              *) candidate_path=$(command -v "$candidate" 2>/dev/null || true) ;;
+            esac
+            [ -n "$candidate_path" ] || continue
+            [ -x "$candidate_path" ] || continue
+            case "$candidate_path" in
+              /*) ;;
+              *) candidate_path="$(cd "$(dirname "$candidate_path")" && pwd -P)/$(basename "$candidate_path")" ;;
+            esac
+            if version=$("$candidate_path" --version 2>&1); then
+              case "$version" in
+                *"GNU coreutils"*) native_timeout=$candidate_path; break ;;
+                *) printf 'timeout candidate %s is not GNU coreutils: %s\n' "$candidate_path" "$version" >&2 ;;
+              esac
+            else
+              printf 'timeout candidate %s could not be verified: %s\n' "$candidate_path" "$version" >&2
+            fi
+          done
+          if [ -z "$native_timeout" ]; then
+            echo "no verified GNU coreutils timeout found in the runner candidates" >&2
+            exit 1
+          fi
           timeout_bin="$RUNNER_TEMP/gnu-timeout/bin"
           mkdir -p "$timeout_bin"
           ln -sf "$native_timeout" "$timeout_bin/timeout"
