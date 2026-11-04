@@ -53,14 +53,6 @@ func TestObserveManagedControlAllowsSameValidatedValueISRStepAdvance(t *testing.
 	cores, base := newManagedControlRaceCluster(t, nil)
 	core := cores["n1"] // observe the actual remote recorder, not the proposer-local Record path
 	proposer := cores["n2"]
-	managedControlRacePrefix(t, core)
-	if core.Tip() != 8 || proposer.Tip() != 8 {
-		t.Fatalf("observer/proposer do not share certified prefix 8: observer=%d proposer=%d", core.Tip(), proposer.Tip())
-	}
-	leaders, err := proposer.LeaderOrder(9)
-	if err != nil || len(leaders) == 0 || leaders[0] == proposer.nodeID {
-		t.Fatalf("slot 9 must use the actual non-leader proposal path: leaders=%v err=%v", leaders, err)
-	}
 	gate := &managedControlStepGate{
 		clusterTransport: base.clusterTransport,
 		step4Held:        make(chan struct{}, 2), step4Release: make(chan struct{}),
@@ -68,6 +60,14 @@ func TestObserveManagedControlAllowsSameValidatedValueISRStepAdvance(t *testing.
 	}
 	for _, memberCore := range cores {
 		memberCore.transport = gate
+	}
+	managedControlRacePrefix(t, core)
+	if core.Tip() != 8 || proposer.Tip() != 8 {
+		t.Fatalf("observer/proposer do not share certified prefix 8: observer=%d proposer=%d", core.Tip(), proposer.Tip())
+	}
+	leaders, err := proposer.LeaderOrder(9)
+	if err != nil || len(leaders) == 0 || leaders[0] == proposer.nodeID {
+		t.Fatalf("slot 9 must use the actual non-leader proposal path: leaders=%v err=%v", leaders, err)
 	}
 	t.Cleanup(func() {
 		select {
@@ -166,7 +166,6 @@ func TestObserveManagedControlRejectsNewOrdinaryReferenceDuringISRAdvance(t *tes
 	defer cancel()
 	cores, base := newManagedControlRaceCluster(t, nil)
 	core := cores["n2"]
-	managedControlRacePrefix(t, core)
 	gate := &managedControlStepGate{
 		clusterTransport: base.clusterTransport,
 		step4Held:        make(chan struct{}, 2), step4Release: make(chan struct{}),
@@ -175,6 +174,7 @@ func TestObserveManagedControlRejectsNewOrdinaryReferenceDuringISRAdvance(t *tes
 	for _, memberCore := range cores {
 		memberCore.transport = gate
 	}
+	managedControlRacePrefix(t, core)
 	proposalCtx, cancelProposal := context.WithCancel(ctx)
 	t.Cleanup(func() {
 		cancelProposal()

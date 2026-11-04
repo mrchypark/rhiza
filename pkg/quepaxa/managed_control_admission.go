@@ -340,6 +340,12 @@ func (c *Core) recheckManagedControlSnapshot(before managedControlSnapshot, vali
 		} else {
 			diagnostic.cause = cause
 		}
+	} else if sameStepAggregateCurrentAdvanced(before, after) {
+		if observation, ok, cause := c.reclassifiedManagedControlObservationLocked(before, after, diagnostic.authoritySame, diagnostic.refsCovered); ok {
+			return observation, true, false, diagnostic, nil
+		} else {
+			diagnostic.cause = cause
+		}
 	}
 	if diagnostic.cause == "" {
 		diagnostic.cause = managedControlSnapshotMismatchCause(before, after, diagnostic.authoritySame, diagnostic.refsCovered)
@@ -396,6 +402,27 @@ func sameManagedControlSnapshotValues(before, after managedControlSnapshot) bool
 
 func sameManagedControlAuthority(before, current managedControlSnapshot) bool {
 	return before.core == current.core && before.configID == current.configID && before.protocol == current.protocol && before.generation == current.generation && before.binding == current.binding && before.walIdentity == current.walIdentity && before.anchor == current.anchor && before.membership == current.membership && before.config == current.config && sameCluster(before.cluster, current.cluster)
+}
+
+func sameStepAggregateCurrentAdvanced(before, current managedControlSnapshot) bool {
+	if before.step == 0 || current.step != before.step || len(before.refs) < 2 || len(before.refs) != len(current.refs) {
+		return false
+	}
+	for index := range before.refs {
+		if before.refs[index].role != current.refs[index].role {
+			return false
+		}
+		if before.refs[index].role != ManagedAppendOnlyAggregateCurrent && !bytes.Equal(before.refs[index].value, current.refs[index].value) {
+			return false
+		}
+	}
+	if before.refs[0].role != ManagedAppendOnlyFirstCurrent || before.refs[1].role != ManagedAppendOnlyAggregateCurrent || !sameProposal(&before.refs[0].proposal, &current.refs[0].proposal) || compareProposal(&current.refs[1].proposal, &before.refs[1].proposal) <= 0 {
+		return false
+	}
+	if len(before.refs) == 3 && (before.refs[2].role != ManagedAppendOnlyAggregatePrior || !sameProposal(&before.refs[2].proposal, &current.refs[2].proposal) || !bytes.Equal(before.refs[2].value, current.refs[2].value)) {
+		return false
+	}
+	return true
 }
 
 func managedControlRefsCovered(before, current managedControlSnapshot, validated []ManagedAppendOnlyControlProposal) bool {

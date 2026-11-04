@@ -42,10 +42,91 @@ run_contract() {
   ) 2>&1 | awk '
     function emit(s) { if (used+length(s)+1<=65536) { print s; used+=length(s)+1 } }
     function knowncode(s) { return s ~ /^(internal|commit_unknown|kv_recovery_required|kv_not_submitted|sql_recovery_required|sql_not_submitted|timeout|canceled|invalid_request|not_ready|quorum_unavailable|request_conflict|durability_unavailable|overloaded|unclassified)$/ }
+    function knownadmissioncause(s) { return s ~ /^(canceled|deadline|not_ready|invalid_request|request_conflict|quorum_unavailable|other)$/ }
     function uint(s) { return s ~ /^[0-9]+$/ && length(s)<=20 }
+    function bit(s) { return s ~ /^(true|false)$/ }
+    function stripgotimestamp(s) { sub(/^[^ ]+ [0-9][0-9]:[0-9][0-9]:[0-9][0-9] /,"",s); return s }
     /^GRAPH_STARTUP_DIAGNOSTIC last_stage=(target_inspect|core_open|archive_recover|pair_select|pair_reconstruct|pair_install|runtime_verify|open_complete|not_observed)$/ { emit($0); next }
     {
       refusal=$0
+      diagnostic=stripgotimestamp($0)
+      if (diagnostic ~ /^MANAGED_GRAPH_ADMISSION_FAILURE/) {
+        if (diagnostic ~ /^MANAGED_GRAPH_ADMISSION_FAILURE route=(initial|admitted) stage=(runtime_pre|pre_control|read_index|owned_wait|wait_tip|replay|runtime_post|fixed_replay|authority) read_target_known=false cause=[a-z_]+$/) {
+          split(diagnostic, admission_fields, " ")
+          cause=admission_fields[5]; sub(/^cause=/,"",cause)
+          if (knownadmissioncause(cause)) emit(diagnostic)
+        } else if (diagnostic ~ /^MANAGED_GRAPH_ADMISSION_FAILURE route=(initial|admitted) stage=(owned_wait|wait_tip|replay|runtime_post|fixed_replay|authority) read_target_known=true target=[0-9]+ cause=[a-z_]+$/) {
+          split(diagnostic, admission_fields, " ")
+          target=admission_fields[5]; sub(/^target=/,"",target)
+          cause=admission_fields[6]; sub(/^cause=/,"",cause)
+          if (uint(target) && knownadmissioncause(cause)) emit(diagnostic)
+        } else if (diagnostic ~ /^MANAGED_GRAPH_ADMISSION_FAILURE route=admitted stage=(pre_control|read_index) round=2 read_target_known=false cause=[a-z_]+$/) {
+          split(diagnostic, admission_fields, " ")
+          cause=admission_fields[6]; sub(/^cause=/,"",cause)
+          if (knownadmissioncause(cause)) emit(diagnostic)
+        } else if (diagnostic ~ /^MANAGED_GRAPH_ADMISSION_FAILURE route=admitted stage=(wait_tip|replay|runtime_post) round=2 read_target_known=true target=[0-9]+ cause=[a-z_]+$/) {
+          split(diagnostic, admission_fields, " ")
+          target=admission_fields[6]; sub(/^target=/,"",target)
+          cause=admission_fields[7]; sub(/^cause=/,"",cause)
+          if (uint(target) && knownadmissioncause(cause)) emit(diagnostic)
+        }
+        next
+      }
+      if (diagnostic ~ /^MANAGED_GRAPH_ADMISSION_REFUSED stage=history_compare/) {
+        if (diagnostic ~ /^MANAGED_GRAPH_ADMISSION_REFUSED stage=history_compare route=(initial|admitted) read_target_known=true target=[0-9]+ recorded=[0-9]+ certified=[0-9]+ applied=[0-9]+ c_below_target=(true|false) applied_differs_certified=(true|false) recorded_above_certified=(true|false)$/) {
+          split(diagnostic, history_fields, " ")
+          target=history_fields[5]; sub(/^target=/,"",target)
+          recorded=history_fields[6]; sub(/^recorded=/,"",recorded)
+          certified=history_fields[7]; sub(/^certified=/,"",certified)
+          applied=history_fields[8]; sub(/^applied=/,"",applied)
+          if (uint(target) && uint(recorded) && uint(certified) && uint(applied)) emit(diagnostic)
+        }
+        next
+      }
+      if (diagnostic ~ /^MANAGED_HOST_REQUEST_RECOVERY_FAILURE/) {
+        if (diagnostic == "MANAGED_HOST_REQUEST_RECOVERY_FAILURE stage=host_precheck cause=not_ready") emit(diagnostic)
+        next
+      }
+      if (diagnostic ~ /^MANAGED_REQUEST_RESOLUTION_FAILURE/) {
+        if (diagnostic ~ /^MANAGED_REQUEST_RESOLUTION_FAILURE stage=(resolve_borrow|resolve_admit) cause=[a-z_]+$/) {
+          split(diagnostic, request_fields, " ")
+          cause=request_fields[3]; sub(/^cause=/,"",cause)
+          if (knownadmissioncause(cause)) emit(diagnostic)
+        } else if (diagnostic ~ /^MANAGED_REQUEST_RESOLUTION_FAILURE stage=original_lookup lookup=error cause=[a-z_]+$/) {
+          split(diagnostic, request_fields, " ")
+          cause=request_fields[4]; sub(/^cause=/,"",cause)
+          if (knownadmissioncause(cause)) emit(diagnostic)
+        } else if (diagnostic == "MANAGED_REQUEST_RESOLUTION_FAILURE stage=original_lookup lookup=not_found" || diagnostic == "MANAGED_REQUEST_RESOLUTION_FAILURE stage=original_lookup lookup=found slot_known=false") {
+          emit(diagnostic)
+        } else if (diagnostic ~ /^MANAGED_REQUEST_RESOLUTION_FAILURE stage=original_lookup lookup=found slot_known=true slot=[1-9][0-9]*$/) {
+          split(diagnostic, request_fields, " ")
+          slot=request_fields[5]; sub(/^slot=/,"",slot)
+          if (uint(slot)) emit(diagnostic)
+        }
+        next
+      }
+      if (diagnostic ~ /^MANAGED_GRAPH_ADMISSION_REFUSED stage=initial_admission/) {
+        if (diagnostic ~ /^MANAGED_GRAPH_ADMISSION_REFUSED stage=initial_admission target=[0-9]+ recorded=[0-9]+ certified=[0-9]+ applied=[0-9]+$/) {
+          split(diagnostic, initial_fields, " ")
+          target=initial_fields[3]; sub(/^target=/,"",target)
+          recorded=initial_fields[4]; sub(/^recorded=/,"",recorded)
+          certified=initial_fields[5]; sub(/^certified=/,"",certified)
+          applied=initial_fields[6]; sub(/^applied=/,"",applied)
+          if (uint(target) && uint(recorded) && uint(certified) && uint(applied))
+            emit(diagnostic)
+        }
+        next
+      }
+      request_admission=diagnostic
+      if (request_admission ~ /^MANAGED_REQUEST_RESOLUTION_ADMISSION_FAILURE/) {
+        if (request_admission ~ /^MANAGED_REQUEST_RESOLUTION_ADMISSION_FAILURE stage=request_recovery_admission cause=[a-z_]+$/) {
+          split(request_admission, request_fields, " ")
+          cause=request_fields[3]; sub(/^cause=/,"",cause)
+          if (knownadmissioncause(cause)) emit(request_admission)
+        }
+        next
+      }
+      refusal=diagnostic
       if (refusal ~ /^[0-9][0-9][0-9][0-9]\/[0-9][0-9]\/[0-9][0-9] [0-9][0-9]:[0-9][0-9]:[0-9][0-9] MANAGED_GRAPH_ADMISSION_REFUSED /)
         sub(/^[0-9][0-9][0-9][0-9]\/[0-9][0-9]\/[0-9][0-9] [0-9][0-9]:[0-9][0-9]:[0-9][0-9] /,"",refusal)
       if (refusal ~ /^MANAGED_GRAPH_ADMISSION_REFUSED/) {
@@ -221,6 +302,67 @@ if [ "${1-}" = --diagnostic-self-test ]; then
     "garbage-prefix MANAGED_GRAPH_ADMISSION_REFUSED target=17 recorded=15 certified=15 applied=14"'
   [ "$(grep -Fc 'MANAGED_GRAPH_ADMISSION_REFUSED target=17 recorded=15 certified=15 applied=14' "$diag_dir/active.log")" = 2 ]
   if grep -E 'DO-NOT-RETAIN|MANAGED_GRAPH_ADMISSION_REFUSED.*(target=-1|recorded=15x)|^garbage-prefix MANAGED_GRAPH_ADMISSION_REFUSED' "$diag_dir/active.log"; then exit 1; fi
+  run_contract rust-restart sh -c 'printf "%s\n" \
+    "MANAGED_GRAPH_ADMISSION_REFUSED stage=initial_admission target=17 recorded=15 certified=14 applied=13" \
+    "2026/11/03 12:00:00 MANAGED_GRAPH_ADMISSION_REFUSED stage=initial_admission target=18 recorded=16 certified=15 applied=14" \
+    "MANAGED_GRAPH_ADMISSION_REFUSED stage=initial_admission target=17 recorded=15 certified=14 applied=13 secret-DO-NOT-RETAIN" \
+    "MANAGED_GRAPH_ADMISSION_REFUSED stage=other target=17 recorded=15 certified=14 applied=13" \
+    "MANAGED_GRAPH_ADMISSION_REFUSED stage=initial_admission target=17 recorded=15x certified=14 applied=13" \
+    "MANAGED_REQUEST_RESOLUTION_ADMISSION_FAILURE stage=request_recovery_admission cause=not_ready" \
+    "2026/11/03 12:00:00 MANAGED_REQUEST_RESOLUTION_ADMISSION_FAILURE stage=request_recovery_admission cause=quorum_unavailable" \
+    "MANAGED_REQUEST_RESOLUTION_ADMISSION_FAILURE stage=other cause=not_ready" \
+    "MANAGED_REQUEST_RESOLUTION_ADMISSION_FAILURE stage=request_recovery_admission cause=private_cause" \
+    "MANAGED_REQUEST_RESOLUTION_ADMISSION_FAILURE stage=request_recovery_admission cause=not_ready secret-DO-NOT-RETAIN"'
+  grep -Fx 'MANAGED_GRAPH_ADMISSION_REFUSED stage=initial_admission target=17 recorded=15 certified=14 applied=13' "$diag_dir/active.log" >/dev/null
+  grep -Fx 'MANAGED_GRAPH_ADMISSION_REFUSED stage=initial_admission target=18 recorded=16 certified=15 applied=14' "$diag_dir/active.log" >/dev/null
+  [ "$(grep -Fc 'MANAGED_REQUEST_RESOLUTION_ADMISSION_FAILURE stage=request_recovery_admission cause=not_ready' "$diag_dir/active.log")" = 1 ]
+  grep -Fx 'MANAGED_REQUEST_RESOLUTION_ADMISSION_FAILURE stage=request_recovery_admission cause=quorum_unavailable' "$diag_dir/active.log" >/dev/null
+  if grep -E 'DO-NOT-RETAIN|stage=other|private_cause|stage=initial_admission.*recorded=15x' "$diag_dir/active.log"; then exit 1; fi
+  run_contract rust-restart sh -c 'printf "%s\n" \
+    "MANAGED_GRAPH_ADMISSION_FAILURE route=initial stage=pre_control read_target_known=false cause=quorum_unavailable" \
+    "2026/11/03 12:00:00 MANAGED_GRAPH_ADMISSION_FAILURE route=initial stage=read_index read_target_known=false cause=deadline" \
+    "MANAGED_GRAPH_ADMISSION_FAILURE route=admitted stage=wait_tip read_target_known=true target=29 cause=deadline" \
+    "MANAGED_GRAPH_ADMISSION_FAILURE route=admitted stage=read_index round=2 read_target_known=false cause=quorum_unavailable" \
+    "MANAGED_GRAPH_ADMISSION_FAILURE route=admitted stage=replay round=2 read_target_known=true target=31 cause=not_ready" \
+    "MANAGED_GRAPH_ADMISSION_REFUSED stage=history_compare route=initial read_target_known=true target=17 recorded=15 certified=14 applied=13 c_below_target=true applied_differs_certified=true recorded_above_certified=true" \
+    "MANAGED_HOST_REQUEST_RECOVERY_FAILURE stage=host_precheck cause=not_ready" \
+    "MANAGED_REQUEST_RESOLUTION_FAILURE stage=resolve_borrow cause=canceled" \
+    "MANAGED_REQUEST_RESOLUTION_FAILURE stage=resolve_admit cause=other" \
+    "MANAGED_REQUEST_RESOLUTION_FAILURE stage=original_lookup lookup=error cause=not_ready" \
+    "MANAGED_REQUEST_RESOLUTION_FAILURE stage=original_lookup lookup=not_found" \
+    "MANAGED_REQUEST_RESOLUTION_FAILURE stage=original_lookup lookup=found slot_known=true slot=7" \
+    "MANAGED_REQUEST_RESOLUTION_FAILURE stage=original_lookup lookup=found slot_known=false" \
+    "MANAGED_GRAPH_ADMISSION_FAILURE route=private stage=pre_control read_target_known=false cause=not_ready" \
+    "MANAGED_GRAPH_ADMISSION_FAILURE route=initial stage=private read_target_known=false cause=not_ready" \
+    "MANAGED_GRAPH_ADMISSION_FAILURE route=initial stage=pre_control read_target_known=false cause=private_cause" \
+    "MANAGED_GRAPH_ADMISSION_FAILURE route=initial stage=pre_control read_target_known=true target=17 cause=not_ready" \
+    "MANAGED_GRAPH_ADMISSION_FAILURE route=admitted stage=read_index round=3 read_target_known=false cause=not_ready" \
+    "MANAGED_GRAPH_ADMISSION_REFUSED stage=history_compare route=private read_target_known=true target=17 recorded=15 certified=14 applied=13 c_below_target=true applied_differs_certified=true recorded_above_certified=true" \
+    "MANAGED_GRAPH_ADMISSION_REFUSED stage=history_compare route=initial read_target_known=true target=17x recorded=15 certified=14 applied=13 c_below_target=true applied_differs_certified=true recorded_above_certified=true" \
+    "MANAGED_HOST_REQUEST_RECOVERY_FAILURE stage=host_precheck cause=private_cause" \
+    "MANAGED_HOST_REQUEST_RECOVERY_FAILURE stage=host_precheck cause=not_ready secret-DO-NOT-RETAIN" \
+    "MANAGED_REQUEST_RESOLUTION_FAILURE stage=private cause=not_ready" \
+    "MANAGED_REQUEST_RESOLUTION_FAILURE stage=resolve_admit cause=private_cause" \
+    "MANAGED_REQUEST_RESOLUTION_FAILURE stage=original_lookup lookup=other" \
+    "MANAGED_REQUEST_RESOLUTION_FAILURE stage=original_lookup lookup=found slot_known=true slot=0" \
+    "MANAGED_REQUEST_RESOLUTION_FAILURE stage=original_lookup lookup=not_found secret-DO-NOT-RETAIN"'
+  for fixed in \
+    'MANAGED_GRAPH_ADMISSION_FAILURE route=initial stage=pre_control read_target_known=false cause=quorum_unavailable' \
+    'MANAGED_GRAPH_ADMISSION_FAILURE route=initial stage=read_index read_target_known=false cause=deadline' \
+    'MANAGED_GRAPH_ADMISSION_FAILURE route=admitted stage=wait_tip read_target_known=true target=29 cause=deadline' \
+    'MANAGED_GRAPH_ADMISSION_FAILURE route=admitted stage=read_index round=2 read_target_known=false cause=quorum_unavailable' \
+    'MANAGED_GRAPH_ADMISSION_FAILURE route=admitted stage=replay round=2 read_target_known=true target=31 cause=not_ready' \
+    'MANAGED_GRAPH_ADMISSION_REFUSED stage=history_compare route=initial read_target_known=true target=17 recorded=15 certified=14 applied=13 c_below_target=true applied_differs_certified=true recorded_above_certified=true' \
+    'MANAGED_HOST_REQUEST_RECOVERY_FAILURE stage=host_precheck cause=not_ready' \
+    'MANAGED_REQUEST_RESOLUTION_FAILURE stage=resolve_borrow cause=canceled' \
+    'MANAGED_REQUEST_RESOLUTION_FAILURE stage=resolve_admit cause=other' \
+    'MANAGED_REQUEST_RESOLUTION_FAILURE stage=original_lookup lookup=error cause=not_ready' \
+    'MANAGED_REQUEST_RESOLUTION_FAILURE stage=original_lookup lookup=not_found' \
+    'MANAGED_REQUEST_RESOLUTION_FAILURE stage=original_lookup lookup=found slot_known=true slot=7' \
+    'MANAGED_REQUEST_RESOLUTION_FAILURE stage=original_lookup lookup=found slot_known=false'; do
+    grep -Fx "$fixed" "$diag_dir/active.log" >/dev/null
+  done
+  if grep -E 'DO-NOT-RETAIN|route=private|stage=private|private_cause|round=3|target=17x|slot_known=true slot=0|lookup=other' "$diag_dir/active.log"; then exit 1; fi
   [ "$before" = "$(cksum "$diag_dir/first.log")" ]
   if run_contract rust-initial sh -c 'i=0; while [ "$i" -lt 4000 ]; do echo "FAIL: managed-ha-contract prior_ack_marker_missing"; i=$((i+1)); done; exit 9' >/dev/null 2>&1; then exit 1; else [ "$?" = 9 ]; fi
   [ "$(wc -c < "$diag_dir/first.log")" -le 65536 ]

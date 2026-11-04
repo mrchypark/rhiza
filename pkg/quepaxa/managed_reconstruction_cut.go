@@ -47,7 +47,7 @@ func (c *Core) CaptureManagedReconstructionCut(sealed SealedCheckpoint, through 
 	if through == 0 {
 		through = c.tip
 	}
-	if sealed.Index == 0 || sealed.DecisionSlot <= sealed.Index || sealed.DecisionSlot > through || through > c.tip || sealed.Index < c.floor || c.floor == sealed.Index && c.floorRoot != sealed.RootHash {
+	if sealed.Index == 0 || sealed.DecisionSlot <= sealed.Index || sealed.DecisionSlot > through || through > c.tip || sealed.Index < c.floor {
 		return nil, fmt.Errorf("managed reconstruction root lies outside certified cut")
 	}
 	decision, ok := c.decided[sealed.DecisionSlot]
@@ -73,7 +73,7 @@ func (c *Core) CaptureManagedReconstructionCut(sealed SealedCheckpoint, through 
 		binding = c.managedAppendOnly.Binding
 	}
 	return &ManagedReconstructionCut{
-		core: c, tip: through, prefix: prefix, seal: sealed.CheckpointSeal,
+		core: c, tip: through, prefix: prefix, seal: cloneManagedCheckpointSeal(decoded),
 		sealSlot: sealed.DecisionSlot, sealHash: decision.Hash, sealCert: sha256.Sum256(decision.Certificate), floor: c.floor,
 		floorRoot: c.floorRoot, config: c.managedAppendOnly, binding: binding,
 		walIdentity: c.walIdentity,

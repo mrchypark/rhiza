@@ -69,6 +69,10 @@ func newManagedNoPVCReconstructionCutFixture(t *testing.T) (*Core, SealedCheckpo
 	if err != nil {
 		t.Fatal(err)
 	}
+	core.SetCheckpointValidator(func(context.Context, CheckpointSeal) error { return nil })
+	if err := core.PrepareCheckpoint(context.Background(), seal); err != nil {
+		t.Fatalf("locally verify and prepare actual checkpoint root: %v", err)
+	}
 	if slot, _, err := core.Propose(context.Background(), sealBytes); err != nil || slot != 2 {
 		t.Fatalf("certify actual checkpoint producer: slot=%d err=%v", slot, err)
 	}
@@ -106,6 +110,116 @@ func TestManagedNoPVCReconstructionCutCapturesCertifiedExtension(t *testing.T) {
 	cancel()
 	if _, err := core.RecheckManagedReconstructionCut(canceled, cut); !errors.Is(err, context.Canceled) {
 		t.Fatalf("canceled cut recheck error=%v", err)
+	}
+}
+
+func TestManagedNoPVCReconstructionCutAllowsAlternateRootAtPhysicalFloor(t *testing.T) {
+	core, physicalRoot, _ := newManagedNoPVCReconstructionCutFixture(t)
+	core.SetCheckpointValidator(func(context.Context, CheckpointSeal) error { return nil })
+	if err := core.CompactThrough(physicalRoot.Index, physicalRoot.RootHash); err != nil {
+		t.Fatalf("install physical recovery floor A: %v", err)
+	}
+	floor, floorRoot, ok := core.RecoveryRoot()
+	if !ok || floor != physicalRoot.Index || floorRoot != physicalRoot.RootHash {
+		t.Fatalf("physical recovery root=%d/%x, want %d/%x", floor, floorRoot, physicalRoot.Index, physicalRoot.RootHash)
+	}
+
+	logicalRoot := physicalRoot.CheckpointSeal
+	logicalRoot.RootHash = sha256.Sum256([]byte("same-index-certified-logical-root-B"))
+	logicalRoot.StateHash = sha256.Sum256([]byte("same-index-certified-logical-state-B"))
+	logicalValue, err := EncodeCheckpointSeal(logicalRoot)
+	if err != nil {
+		t.Fatal(err)
+	}
+	producer, _, err := core.Propose(context.Background(), logicalValue)
+	if err != nil || producer <= physicalRoot.Index {
+		t.Fatalf("certify alternate same-index logical root B: producer=%d err=%v", producer, err)
+	}
+	selected, found, err := core.LatestManagedCheckpointSeal()
+	if err != nil || !found || selected.Index != floor || selected.RootHash != logicalRoot.RootHash || selected.DecisionSlot != producer {
+		t.Fatalf("selected logical root=%+v found=%t err=%v", selected, found, err)
+	}
+	cut, err := core.CaptureManagedReconstructionCut(selected, 0, [32]byte{})
+	if err != nil {
+		t.Fatalf("capture logical B over unchanged physical A: %v", err)
+	}
+	if cut.CompactionFloor() != floor || cut.RecoveryRoot() != floorRoot || cut.seal.RootHash != logicalRoot.RootHash || cut.ProducerDecisionSlot() != producer {
+		t.Fatalf("cut mixed logical and physical roots: floor=%d/%x logical=%x producer=%d", cut.CompactionFloor(), cut.RecoveryRoot(), cut.seal.RootHash, cut.ProducerDecisionSlot())
+	}
+	if _, err := core.RecheckManagedReconstructionCut(context.Background(), cut); err != nil {
+		t.Fatalf("recheck unchanged physical A and certified logical B: %v", err)
+	}
+	if gotFloor, gotRoot, ok := core.RecoveryRoot(); !ok || gotFloor != floor || gotRoot != floorRoot {
+		t.Fatalf("logical root selection changed physical recovery root: %d/%x ok=%t", gotFloor, gotRoot, ok)
+	}
+}
+
+func TestManagedNoPVCReconstructionCutOwnsCapturedSealSlices(t *testing.T) {
+	core, selected, _ := newManagedNoPVCReconstructionCutFixture(t)
+	cut, err := core.CaptureManagedReconstructionCut(selected, 0, [32]byte{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	selected.CheckpointSeal.NextLeaderOrder[0] = "caller-mutated-next-leader"
+	if len(selected.CheckpointSeal.FollowingLeaderOrder) > 0 {
+		selected.CheckpointSeal.FollowingLeaderOrder[0] = "caller-mutated-following-leader"
+	}
+	if _, err := core.RecheckManagedReconstructionCut(context.Background(), cut); err != nil {
+		t.Fatalf("caller mutation of captured seal slices invalidated unchanged Core cut: %v", err)
+	}
+}
+
+func TestManagedNoPVCReconstructionCutOwnsCapturedNestedMembership(t *testing.T) {
+	config, wal := managedAppendOnlyTestConfig(t, managedGraphRequestAppendOnlyApplicationProtocol, func(context.Context, ManagedCheckpointCandidate) error { return nil })
+	config.EnableReconfiguration = true
+	core, err := New(config)
+	if err != nil {
+		_ = wal.Close()
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		if err := wal.Close(); err != nil {
+			t.Errorf("close membership reconstruction-cut WAL: %v", err)
+		}
+	})
+	if slot, _, err := core.Propose(context.Background(), []byte("membership-reconstruction-prefix")); err != nil || slot != 1 {
+		t.Fatalf("certify membership reconstruction prefix: slot=%d err=%v", slot, err)
+	}
+	prefix, ok := core.PrefixHash(1)
+	if !ok {
+		t.Fatal("membership reconstruction prefix hash unavailable")
+	}
+	next, following, err := core.CheckpointLeaderOrders(1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	membership, err := core.CheckpointMembership(1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	seal := CheckpointSeal{
+		ConfigID: 1, Index: 1,
+		RootHash: sha256.Sum256([]byte("membership-reconstruction-root")), StateHash: sha256.Sum256([]byte("membership-reconstruction-state")),
+		PrefixHash: prefix, NextLeaderOrder: next, FollowingLeaderOrder: following, Membership: &membership,
+	}
+	value, err := EncodeCheckpointSeal(seal)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if slot, _, err := core.Propose(context.Background(), value); err != nil || slot != 2 {
+		t.Fatalf("certify membership reconstruction producer: slot=%d err=%v", slot, err)
+	}
+	selected, found, err := core.LatestManagedCheckpointSeal()
+	if err != nil || !found || selected.DecisionSlot != 2 || selected.Membership == nil {
+		t.Fatalf("select membership-bearing checkpoint: selected=%+v found=%t err=%v", selected, found, err)
+	}
+	cut, err := core.CaptureManagedReconstructionCut(selected, 0, [32]byte{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	selected.CheckpointSeal.Membership.Genesis.Members[0].WALIdentity = "caller-mutated-membership"
+	if _, err := core.RecheckManagedReconstructionCut(context.Background(), cut); err != nil {
+		t.Fatalf("caller mutation of nested membership invalidated unchanged Core cut: %v", err)
 	}
 }
 

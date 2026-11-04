@@ -307,34 +307,55 @@ func (n *Node) checkInternalApplicationRuntimeObserved(ctx context.Context, retr
 func (n *Node) admitInternalApplication(ctx context.Context) error {
 	binding, ctx, release, err := n.borrowInternalApplication(ctx)
 	if err != nil {
+		if n != nil && n.materializationPolicy() == sqlpolicy.ManagedGraphRequestMaterializationPolicy {
+			logManagedGraphAdmissionStageFailure("admitted", "runtime_pre", err)
+		}
 		return err
 	}
 	defer release()
 	if _, err := n.checkInternalApplicationRuntime(ctx); err != nil {
+		if n.materializationPolicy() == sqlpolicy.ManagedGraphRequestMaterializationPolicy {
+			logManagedGraphAdmissionStageFailure("admitted", "runtime_pre", err)
+		}
 		return err
 	}
 	if !n.managedInitiallyAdmitted.Load() || !n.core.CanParticipateReadIndex() {
-		return fmt.Errorf("internal application has no active voter admission")
+		err := fmt.Errorf("internal application has no active voter admission")
+		if n.materializationPolicy() == sqlpolicy.ManagedGraphRequestMaterializationPolicy {
+			logManagedGraphAdmissionStageFailure("admitted", "runtime_pre", err)
+		}
+		return err
 	}
 	if isManagedAppendOnlyProtocol(n.managedApplicationProtocol()) {
 		if err := n.waitManagedAppendOnlyControl(ctx, binding); err != nil {
+			if n.materializationPolicy() == sqlpolicy.ManagedGraphRequestMaterializationPolicy {
+				logManagedGraphAdmissionStageFailure("admitted", "pre_control", err)
+			}
 			return err
 		}
 		if err := n.refuseSpentManagedControlObservationBudget(ctx); err != nil {
+			if n.materializationPolicy() == sqlpolicy.ManagedGraphRequestMaterializationPolicy {
+				logManagedGraphAdmissionStageFailure("admitted", "pre_control", err)
+			}
 			return err
 		}
 	}
 	if n.materializationPolicy() == sqlpolicy.ManagedGraphRequestMaterializationPolicy {
 		if err := n.ensureManagedGraphInitialRoot(ctx); err != nil {
+			logManagedGraphAdmissionStageFailure("admitted", "owned_wait", err)
 			return err
 		}
 	}
 	target, _, err := n.core.ReadIndex(ctx)
 	if err != nil {
+		if n.materializationPolicy() == sqlpolicy.ManagedGraphRequestMaterializationPolicy {
+			logManagedGraphAdmissionStageFailure("admitted", "read_index", err)
+		}
 		return err
 	}
 	if n.materializationPolicy() == sqlpolicy.ManagedGraphRequestMaterializationPolicy {
 		if err := n.waitManagedGraphOwnedControl(ctx, binding, target); err != nil {
+			logManagedGraphAdmissionTargetFailure("admitted", "owned_wait", target, err)
 			return err
 		}
 	}
@@ -343,13 +364,22 @@ func (n *Node) admitInternalApplication(ctx context.Context) error {
 	// then reject the very target it was meant to synchronize. Wait only for
 	// actual local certification; never reinterpret recorder data as decided.
 	if err := n.core.WaitTip(ctx, target); err != nil {
+		if n.materializationPolicy() == sqlpolicy.ManagedGraphRequestMaterializationPolicy {
+			logManagedGraphAdmissionTargetFailure("admitted", "wait_tip", target, err)
+		}
 		return err
 	}
 	if err := n.replayLocalDecisions(ctx); err != nil {
+		if n.materializationPolicy() == sqlpolicy.ManagedGraphRequestMaterializationPolicy {
+			logManagedGraphAdmissionTargetFailure("admitted", "replay", target, err)
+		}
 		return err
 	}
 	state, err := n.checkInternalApplicationRuntime(ctx)
 	if err != nil {
+		if n.materializationPolicy() == sqlpolicy.ManagedGraphRequestMaterializationPolicy {
+			logManagedGraphAdmissionTargetFailure("admitted", "runtime_post", target, err)
+		}
 		return err
 	}
 	// Preserve the existing recovery path for a real recorder/certificate gap.
@@ -357,20 +387,35 @@ func (n *Node) admitInternalApplication(ctx context.Context) error {
 	// fixed local prefix, so recorder data never becomes admission authority.
 	if state.RecorderTip > state.CertifiedTip && isManagedAppendOnlyProtocol(n.managedApplicationProtocol()) {
 		if err := n.waitManagedAppendOnlyControl(ctx, binding); err != nil {
+			if n.materializationPolicy() == sqlpolicy.ManagedGraphRequestMaterializationPolicy {
+				logManagedGraphAdmissionStageFailureRound("admitted", "pre_control", 2, err)
+			}
 			return err
 		}
 		target, _, err = n.core.ReadIndex(ctx)
 		if err != nil {
+			if n.materializationPolicy() == sqlpolicy.ManagedGraphRequestMaterializationPolicy {
+				logManagedGraphAdmissionStageFailureRound("admitted", "read_index", 2, err)
+			}
 			return err
 		}
 		if err := n.core.WaitTip(ctx, target); err != nil {
+			if n.materializationPolicy() == sqlpolicy.ManagedGraphRequestMaterializationPolicy {
+				logManagedGraphAdmissionTargetFailureRound("admitted", "wait_tip", 2, target, err)
+			}
 			return err
 		}
 		if err := n.replayLocalDecisions(ctx); err != nil {
+			if n.materializationPolicy() == sqlpolicy.ManagedGraphRequestMaterializationPolicy {
+				logManagedGraphAdmissionTargetFailureRound("admitted", "replay", 2, target, err)
+			}
 			return err
 		}
 		state, err = n.checkInternalApplicationRuntime(ctx)
 		if err != nil {
+			if n.materializationPolicy() == sqlpolicy.ManagedGraphRequestMaterializationPolicy {
+				logManagedGraphAdmissionTargetFailureRound("admitted", "runtime_post", 2, target, err)
+			}
 			return err
 		}
 	}
@@ -380,16 +425,23 @@ func (n *Node) admitInternalApplication(ctx context.Context) error {
 		// Capture one continuous certified tip and never chase a later one here.
 		through := quepaxa.Slot(state.CertifiedTip)
 		if err := n.replayLocalDecisionsThrough(ctx, through); err != nil {
+			if n.materializationPolicy() == sqlpolicy.ManagedGraphRequestMaterializationPolicy {
+				logManagedGraphAdmissionTargetFailure("admitted", "fixed_replay", target, err)
+			}
 			return err
 		}
 		state, err = n.checkInternalApplicationRuntimeOnce(ctx)
 		if err != nil {
+			if n.materializationPolicy() == sqlpolicy.ManagedGraphRequestMaterializationPolicy {
+				logManagedGraphAdmissionTargetFailure("admitted", "runtime_post", target, err)
+			}
 			return err
 		}
 	}
 	if state.CertifiedTip < uint64(target) || state.AppliedTip != state.CertifiedTip || state.RecorderTip > state.CertifiedTip {
 		if n.materializationPolicy() == sqlpolicy.ManagedGraphRequestMaterializationPolicy {
 			log.Printf("MANAGED_GRAPH_ADMISSION_REFUSED target=%d recorded=%d certified=%d applied=%d", target, state.RecorderTip, state.CertifiedTip, state.AppliedTip)
+			logManagedGraphHistoryRefused("admitted", uint64(target), state)
 		}
 		return fmt.Errorf("internal application has unresolved certified history: target=%d recorded=%d certified=%d applied=%d", target, state.RecorderTip, state.CertifiedTip, state.AppliedTip)
 	}
@@ -832,6 +884,9 @@ func (n *Node) managedStateWithContext(ctx context.Context) (ManagedRuntimeState
 func (n *Node) EnsureInitialManagedAdmission(ctx context.Context) error {
 	_, scoped, release, err := n.borrowInternalApplication(ctx)
 	if err != nil {
+		if n != nil && n.materializationPolicy() == sqlpolicy.ManagedGraphRequestMaterializationPolicy {
+			logManagedGraphAdmissionStageFailure("initial", "runtime_pre", err)
+		}
 		return err
 	}
 	defer release()
@@ -849,10 +904,24 @@ func (n *Node) EnsureInitialManagedAdmission(ctx context.Context) error {
 func (n *Node) ensureInitialManagedAdmission(ctx context.Context) error {
 	_, ctx, release, err := n.borrowInternalApplication(ctx)
 	if err != nil {
+		if n != nil && n.materializationPolicy() == sqlpolicy.ManagedGraphRequestMaterializationPolicy {
+			route := "initial"
+			if n.managedInitiallyAdmitted.Load() {
+				route = "admitted"
+			}
+			logManagedGraphAdmissionStageFailure(route, "runtime_pre", err)
+		}
 		return err
 	}
 	defer release()
 	if _, err := n.checkInternalApplicationRuntime(ctx); err != nil {
+		if n.materializationPolicy() == sqlpolicy.ManagedGraphRequestMaterializationPolicy {
+			route := "initial"
+			if n.managedInitiallyAdmitted.Load() {
+				route = "admitted"
+			}
+			logManagedGraphAdmissionStageFailure(route, "runtime_pre", err)
+		}
 		return err
 	}
 	if n.managedInitiallyAdmitted.Load() {
@@ -883,6 +952,9 @@ func (n *Node) AdmitManaged(ctx context.Context) error {
 	if n.internalApplicationProfile() {
 		borrowed, scoped, release, err := n.borrowInternalApplication(ctx)
 		if err != nil {
+			if n.materializationPolicy() == sqlpolicy.ManagedGraphRequestMaterializationPolicy {
+				logManagedGraphAdmissionStageFailure("initial", "runtime_pre", err)
+			}
 			return err
 		}
 		defer release()
@@ -893,32 +965,80 @@ func (n *Node) AdmitManaged(ctx context.Context) error {
 		return n.admitInternalApplication(ctx)
 	}
 	if n == nil || n.managedStartup == nil || !n.opened.Load() || n.core == nil || n.material == nil {
-		return fmt.Errorf("managed runtime is not open")
+		err := fmt.Errorf("managed runtime is not open")
+		if n != nil && n.materializationPolicy() == sqlpolicy.ManagedGraphRequestMaterializationPolicy {
+			logManagedGraphAdmissionStageFailure("initial", "runtime_pre", err)
+		}
+		return err
 	}
 	n.managedAdmitted.Store(false)
 	if binding != nil && isManagedAppendOnlyProtocol(n.managedApplicationProtocol()) {
 		if err := n.waitManagedAppendOnlyControl(ctx, binding); err != nil {
+			if n.materializationPolicy() == sqlpolicy.ManagedGraphRequestMaterializationPolicy {
+				logManagedGraphAdmissionStageFailure("initial", "pre_control", err)
+			}
 			return err
 		}
 		if err := n.refuseSpentManagedControlObservationBudget(ctx); err != nil {
+			if n.materializationPolicy() == sqlpolicy.ManagedGraphRequestMaterializationPolicy {
+				logManagedGraphAdmissionStageFailure("initial", "pre_control", err)
+			}
 			return err
 		}
 	}
 	target, _, err := n.core.ReadIndex(ctx)
 	if err != nil {
+		if n.materializationPolicy() == sqlpolicy.ManagedGraphRequestMaterializationPolicy {
+			logManagedGraphAdmissionStageFailure("initial", "read_index", err)
+		}
 		return err
 	}
+	if binding != nil && isManagedAppendOnlyProtocol(n.managedApplicationProtocol()) {
+		if err := n.core.WaitTip(ctx, target); err != nil {
+			if n.materializationPolicy() == sqlpolicy.ManagedGraphRequestMaterializationPolicy {
+				logManagedGraphAdmissionTargetFailure("initial", "wait_tip", target, err)
+			}
+			return err
+		}
+		if err := ctx.Err(); err != nil {
+			if n.materializationPolicy() == sqlpolicy.ManagedGraphRequestMaterializationPolicy {
+				logManagedGraphAdmissionTargetFailure("initial", "wait_tip", target, err)
+			}
+			return err
+		}
+		binding.mu.Lock()
+		bindingCurrent := !binding.closing && n.internalApplication.Load() == binding
+		binding.mu.Unlock()
+		if !bindingCurrent || !n.core.CanParticipateReadIndex() {
+			if n.materializationPolicy() == sqlpolicy.ManagedGraphRequestMaterializationPolicy {
+				logManagedGraphAdmissionTargetFailure("initial", "runtime_post", target, network.ErrNotReady)
+			}
+			return network.ErrNotReady
+		}
+	}
 	if err := n.replayLocalDecisions(ctx); err != nil {
+		if n.materializationPolicy() == sqlpolicy.ManagedGraphRequestMaterializationPolicy {
+			logManagedGraphAdmissionTargetFailure("initial", "replay", target, err)
+		}
 		return err
 	}
 	state, err := n.managedRuntimeStateWithContext(ctx)
 	if err != nil {
+		if n.materializationPolicy() == sqlpolicy.ManagedGraphRequestMaterializationPolicy {
+			logManagedGraphAdmissionTargetFailure("initial", "runtime_post", target, err)
+		}
 		return err
 	}
 	if state.CertifiedTip < uint64(target) || state.AppliedTip != state.CertifiedTip || state.RecorderTip > state.CertifiedTip {
+		if n.materializationPolicy() == sqlpolicy.ManagedGraphRequestMaterializationPolicy {
+			logManagedGraphHistoryRefused("initial", uint64(target), state)
+		}
 		return fmt.Errorf("managed runtime has unapplied or unresolved history")
 	}
 	if err := n.managedStartup.Checker.ValidateManagedAdmission(ctx, n.managedStartup.Identity, state); err != nil {
+		if n.materializationPolicy() == sqlpolicy.ManagedGraphRequestMaterializationPolicy {
+			logManagedGraphAdmissionTargetFailure("initial", "authority", target, err)
+		}
 		return err
 	}
 	n.managedAdmitted.Store(true)
@@ -928,6 +1048,28 @@ func (n *Node) AdmitManaged(ctx context.Context) error {
 	n.managedInitiallyAdmitted.Store(true)
 	n.startManagedGraphPublisherAfterAdmission(binding)
 	return nil
+}
+
+func logManagedGraphAdmissionStageFailure(route, stage string, err error) {
+	log.Printf("MANAGED_GRAPH_ADMISSION_FAILURE route=%s stage=%s read_target_known=false cause=%s", route, stage, managedMembershipCauseClass(err))
+}
+
+func logManagedGraphAdmissionTargetFailure(route, stage string, target quepaxa.Slot, err error) {
+	log.Printf("MANAGED_GRAPH_ADMISSION_FAILURE route=%s stage=%s read_target_known=true target=%d cause=%s", route, stage, target, managedMembershipCauseClass(err))
+}
+
+func logManagedGraphAdmissionStageFailureRound(route, stage string, round int, err error) {
+	log.Printf("MANAGED_GRAPH_ADMISSION_FAILURE route=%s stage=%s round=%d read_target_known=false cause=%s", route, stage, round, managedMembershipCauseClass(err))
+}
+
+func logManagedGraphAdmissionTargetFailureRound(route, stage string, round int, target quepaxa.Slot, err error) {
+	log.Printf("MANAGED_GRAPH_ADMISSION_FAILURE route=%s stage=%s round=%d read_target_known=true target=%d cause=%s", route, stage, round, target, managedMembershipCauseClass(err))
+}
+
+func logManagedGraphHistoryRefused(route string, target uint64, state ManagedRuntimeState) {
+	log.Printf("MANAGED_GRAPH_ADMISSION_REFUSED stage=history_compare route=%s read_target_known=true target=%d recorded=%d certified=%d applied=%d c_below_target=%t applied_differs_certified=%t recorded_above_certified=%t",
+		route, target, state.RecorderTip, state.CertifiedTip, state.AppliedTip,
+		state.CertifiedTip < target, state.AppliedTip != state.CertifiedTip, state.RecorderTip > state.CertifiedTip)
 }
 
 // OpenPrepared performs bounded local recovery but cannot serve until the

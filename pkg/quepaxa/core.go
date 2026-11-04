@@ -3460,6 +3460,9 @@ func (c *Core) WaitTip(ctx context.Context, slot Slot) error {
 		}
 		changed := c.tipChanged
 		c.mu.RUnlock()
+		if localtesthooks.Enabled {
+			localtesthooks.Hit("core:wait-tip:waiting")
+		}
 		select {
 		case <-ctx.Done():
 			return ctx.Err()

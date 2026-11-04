@@ -129,7 +129,7 @@ func (n *Node) reconstructManagedGraphStartupAt(ctx context.Context, core *quepa
 	if !found {
 		return nil, fmt.Errorf("managed Graph checkpoint certificate is unavailable")
 	}
-	if err := core.ValidateCheckpointBase(ctx, seal.CheckpointSeal, decision); err != nil {
+	if err := n.validateManagedGraphCheckpoint(ctx, core, seal, decision); err != nil {
 		return nil, err
 	}
 	dir := filepath.Join(stage, "checkpoint")
@@ -271,9 +271,12 @@ func (n *Node) installManagedGraphStartup(ctx context.Context, core *quepaxa.Cor
 	if err != nil {
 		return nil, 0, err
 	}
+	if localtesthooks.Enabled {
+		localtesthooks.Hit("node:managed-graph-startup:pair_opened-before-final-recheck")
+	}
 	replayThrough, err = core.RecheckManagedReconstructionCut(ctx, projection.coreCut)
 	if err != nil {
-		return nil, 0, err
+		return opened, 0, err
 	}
 	return opened, replayThrough, nil
 }
@@ -347,16 +350,17 @@ func (n *Node) validateManagedGraphSealForCut(ctx context.Context, core *quepaxa
 	if !found || decision.Hash != quepaxa.ValueHash(sha256.Sum256(decision.Value)) {
 		return fmt.Errorf("retained managed Graph checkpoint producer changed")
 	}
-	if err := core.ValidateCheckpointBase(ctx, seal.CheckpointSeal, decision); err != nil {
-		return err
-	}
+	return n.validateManagedGraphCheckpoint(ctx, core, seal, decision)
+}
+
+func (n *Node) validateManagedGraphCheckpoint(ctx context.Context, core *quepaxa.Core, seal quepaxa.SealedCheckpoint, decision quepaxa.DecidedValue) error {
 	if n.managedStartup != nil && isManagedAppendOnlyProtocol(n.managedStartup.Identity.ApplicationProtocol) {
-		return core.ValidateManagedCheckpointCandidate(ctx, quepaxa.ManagedCheckpointCandidate{
+		return core.ValidateManagedCheckpointRoot(ctx, quepaxa.ManagedCheckpointCandidate{
 			Value: decision.Value, Hash: decision.Hash, Seal: seal.CheckpointSeal, DecisionSlot: seal.DecisionSlot,
 			ConfigID: core.ConfigIDForSlot(seal.DecisionSlot),
 		})
 	}
-	return nil
+	return core.ValidateCheckpointBase(ctx, seal.CheckpointSeal, decision)
 }
 
 func (n *Node) resumeManagedGraphStartupInstall(ctx context.Context, core *quepaxa.Core, observed materializer.ManagedGraphTargetState) (opened *materializer.Materializer, replayThrough quepaxa.Slot, resultErr error) {
@@ -396,9 +400,12 @@ func (n *Node) resumeManagedGraphStartupInstall(ctx context.Context, core *quepa
 	if err != nil {
 		return nil, 0, err
 	}
+	if localtesthooks.Enabled {
+		localtesthooks.Hit("node:managed-graph-startup:pair_opened-before-final-recheck")
+	}
 	replayThrough, err = core.RecheckManagedReconstructionCut(ctx, projection.coreCut)
 	if err != nil {
-		return nil, 0, err
+		return opened, 0, err
 	}
 	return opened, replayThrough, nil
 }

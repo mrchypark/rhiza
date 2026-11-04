@@ -257,9 +257,6 @@ func (n *Node) selectManagedAppendOnlyRoot(ctx context.Context) (*checkpoint.Che
 	if n == nil || n.core == nil || n.checkpoints == nil || n.archive == nil || !isManagedAppendOnlyProtocol(n.managedStartup.Identity.ApplicationProtocol) {
 		return nil, nil, fmt.Errorf("managed append-only checkpoint selection unavailable")
 	}
-	if err := n.archive.SyncThrough(ctx, n.core, n.core.Tip()); err != nil {
-		return nil, nil, err
-	}
 	sealed, ok, err := n.core.LatestManagedCheckpointSeal()
 	if err != nil {
 		return nil, nil, err

@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log"
 
 	"github.com/mrchypark/rhiza/internal/sqlpolicy"
 	"github.com/mrchypark/rhiza/internal/types"
@@ -50,12 +51,17 @@ func (h *Host) ensureInitialRequestAdmission(ctx context.Context) error {
 		scope, release := h.internalRequestContext(ctx)
 		defer release()
 		if h.admissionLifetime.Err() != nil {
+			logManagedHostRequestRecoveryPrecheckFailure()
 			return network.ErrNotReady
 		}
 		err := h.node.EnsureInitialManagedAdmission(scope)
 		return errors.Join(err, scope.Err(), h.admissionLifetime.Err())
 	}
 	return nil
+}
+
+func logManagedHostRequestRecoveryPrecheckFailure() {
+	log.Printf("MANAGED_HOST_REQUEST_RECOVERY_FAILURE stage=host_precheck cause=not_ready")
 }
 
 type requestRecoveryHint struct {

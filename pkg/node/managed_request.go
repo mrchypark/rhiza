@@ -5,6 +5,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log"
 
 	"github.com/mrchypark/rhiza/internal/types"
 	"github.com/mrchypark/rhiza/pkg/materializer"
@@ -69,19 +70,25 @@ func (n *Node) ResolveRequest(ctx context.Context, kind, rawID string) (ManagedR
 	}
 	_, ctx, release, err := n.borrowInternalApplication(ctx)
 	if err != nil {
-		return unknown(err)
+		return unknown(managedRequestResolutionStageFailure("resolve_borrow", err))
 	}
 	defer release()
 	if err := n.admitInternalApplication(ctx); err != nil {
-		return unknown(err)
+		return unknown(managedRequestResolutionStageFailure("resolve_admit", err))
 	}
 	bound := n.internalApplication.Load()
 	original, found, err := n.material.RetainedRequestOriginal(ctx, k, rawID)
-	if err != nil || !found {
+	if err != nil {
+		logManagedRequestOriginalLookupError(err)
+		return unknown(errors.Join(fmt.Errorf("request original is unknown or expired"), err))
+	}
+	if !found {
+		logManagedRequestOriginalNotFound()
 		return unknown(errors.Join(fmt.Errorf("request original is unknown or expired"), err))
 	}
 	result := ManagedRequestResolution{Original: original}
 	fail := func(cause error) (ManagedRequestResolution, error) {
+		logManagedRequestOriginalFound(original, k, rawID)
 		return result, &network.CommitUnknownError{RequestID: rawID, Slot: quepaxa.Slot(original.Slot), RetryThroughSlot: original.Receipt.RetryThroughSlot, Cause: cause}
 	}
 	if k == types.MutationSQL {
@@ -123,4 +130,28 @@ func (n *Node) ResolveRequest(ctx context.Context, kind, rawID string) (ManagedR
 		return fail(errors.Join(fmt.Errorf("exact retained original changed during resolution"), err))
 	}
 	return result, nil
+}
+
+func managedRequestResolutionStageFailure(stage string, err error) error {
+	if err == nil {
+		return nil
+	}
+	log.Printf("MANAGED_REQUEST_RESOLUTION_FAILURE stage=%s cause=%s", stage, managedMembershipCauseClass(err))
+	return err
+}
+
+func logManagedRequestOriginalLookupError(err error) {
+	log.Printf("MANAGED_REQUEST_RESOLUTION_FAILURE stage=original_lookup lookup=error cause=%s", managedMembershipCauseClass(err))
+}
+
+func logManagedRequestOriginalNotFound() {
+	log.Printf("MANAGED_REQUEST_RESOLUTION_FAILURE stage=original_lookup lookup=not_found")
+}
+
+func logManagedRequestOriginalFound(original materializer.RequestOriginal, kind types.MutationKind, requestID string) {
+	if original.Slot == 0 || original.Receipt.Slot != original.Slot || original.Kind != kind || original.RequestID != requestID {
+		log.Printf("MANAGED_REQUEST_RESOLUTION_FAILURE stage=original_lookup lookup=found slot_known=false")
+		return
+	}
+	log.Printf("MANAGED_REQUEST_RESOLUTION_FAILURE stage=original_lookup lookup=found slot_known=true slot=%d", original.Slot)
 }

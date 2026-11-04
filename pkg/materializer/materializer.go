@@ -3232,7 +3232,11 @@ func (m *Materializer) Close() error {
 		delete(m.subs, id)
 	}
 	m.notifyMu.Unlock()
-	return m.closeConnections()
+	err := m.closeConnections()
+	if localtesthooks.Enabled {
+		localtesthooks.Hit("materializer:close:complete")
+	}
+	return err
 }
 
 func (m *Materializer) closeConnections() error {

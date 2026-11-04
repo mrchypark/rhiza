@@ -20,6 +20,7 @@ import (
 	"sync"
 
 	latticedb "github.com/mrchypark/latticedb-go"
+	"github.com/mrchypark/rhiza/internal/localtesthooks"
 	"github.com/mrchypark/rhiza/internal/sqlpolicy"
 )
 
@@ -316,6 +317,9 @@ func runManagedGraphInstall(ctx context.Context, path string, readers int, input
 	j.Phase = "opened"
 	if err := writeLocalRestoreJournal(path, j); err != nil {
 		return nil, errors.Join(err, opened.Close())
+	}
+	if localtesthooks.Enabled {
+		localtesthooks.Hit("materializer:managed-graph-install:after-open-inventory-written")
 	}
 	if err := hitLocalRestoreBoundary("managed:after-open"); err != nil {
 		err = errors.Join(err, opened.Close())
