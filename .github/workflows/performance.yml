@@ -243,7 +243,7 @@ jobs:
           {
             printf '\nbaseline_mode=%s\n' '${{ steps.revisions.outputs.baseline_mode }}'
             printf '\nrunner_image=%s\n' "$ImageOS-$ImageVersion"
-            printf 'hiqlite_commit=%s\n' 493f980562766f0ce5645e015557bc39501f9a5b
+            printf 'hiqlite_commit=%s\n' fd45e758af9ab2ff976813a6a511772d676562f1
             printf 'hiqlite_result=reused-verified-reference\n'
             printf 'hiqlite_official_log_sync=interval_200\n'
             printf 'hiqlite_durable_log_sync=immediate\n'
