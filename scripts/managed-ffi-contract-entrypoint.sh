@@ -70,6 +70,26 @@ run_contract() {
         }
         next
       }
+      if (diagnostic ~ /^MANAGED_INITIAL_AUTHORITY_FAILURE/) {
+        if (diagnostic ~ /^MANAGED_INITIAL_AUTHORITY_FAILURE leaf=(identity|live|pending_closed|evidence)$/) emit(diagnostic)
+        next
+      }
+      if (diagnostic ~ /^MANAGED_EVIDENCE_RUNTIME_FAILURE/) {
+        valid_evidence=0
+        if (diagnostic ~ /^MANAGED_EVIDENCE_RUNTIME_FAILURE reason=unresolved_history recorded=[0-9]+ certified=[0-9]+ applied=[0-9]+$/) {
+          split(diagnostic,evidence_fields," "); valid_evidence=1; evidence_last=5
+        } else if (diagnostic ~ /^MANAGED_EVIDENCE_RUNTIME_FAILURE reason=snapshot_changed before_recorded=[0-9]+ before_certified=[0-9]+ before_applied=[0-9]+ after_recorded=[0-9]+ after_certified=[0-9]+ after_applied=[0-9]+$/) {
+          split(diagnostic,evidence_fields," "); valid_evidence=1; evidence_last=8
+        }
+        if (valid_evidence) {
+          for(evidence_i=3;evidence_i<=evidence_last;evidence_i++) {
+            evidence_value=evidence_fields[evidence_i]; sub(/^[a-z_]+=/,"",evidence_value)
+            if (!uint64(evidence_value)) valid_evidence=0
+          }
+          if (valid_evidence) emit(diagnostic)
+        }
+        next
+      }
       if (diagnostic ~ /^MANAGED_CHECKPOINT_CURRENT_READ_FAILURE/) {
         if (diagnostic ~ /^MANAGED_CHECKPOINT_CURRENT_READ_FAILURE stage=(attributes_before|get|body|close|attributes_after|version_changed|decode|policy)$/) emit(diagnostic)
         next
@@ -355,6 +375,16 @@ if [ "${1-}" = --diagnostic-self-test ]; then
     [ "$before" = "$(cksum "$diag_dir/first.log")" ]
   done
   [ "$(cat "$diag_dir/go-initial.exit")" = 7 ]
+  for authority_leaf in identity live pending_closed evidence; do
+    run_contract rust-restart sh -c 'printf "MANAGED_INITIAL_AUTHORITY_FAILURE leaf=%s\n" "$1"' sh "$authority_leaf"
+    grep -Fx "MANAGED_INITIAL_AUTHORITY_FAILURE leaf=$authority_leaf" "$diag_dir/active.log" >/dev/null
+    [ "$before" = "$(cksum "$diag_dir/first.log")" ]
+  done
+  run_contract rust-restart sh -c 'printf "%s\n" "MANAGED_EVIDENCE_RUNTIME_FAILURE reason=unresolved_history recorded=13 certified=12 applied=12" "MANAGED_EVIDENCE_RUNTIME_FAILURE reason=snapshot_changed before_recorded=12 before_certified=12 before_applied=12 after_recorded=18446744073709551615 after_certified=12 after_applied=12"'
+  grep -Fx "MANAGED_EVIDENCE_RUNTIME_FAILURE reason=unresolved_history recorded=13 certified=12 applied=12" "$diag_dir/active.log" >/dev/null
+  grep -Fx "MANAGED_EVIDENCE_RUNTIME_FAILURE reason=snapshot_changed before_recorded=12 before_certified=12 before_applied=12 after_recorded=18446744073709551615 after_certified=12 after_applied=12" "$diag_dir/active.log" >/dev/null
+  run_contract rust-restart sh -c 'printf "%s\n" "MANAGED_INITIAL_AUTHORITY_FAILURE leaf=evidence payload=DO-NOT-RETAIN" "MANAGED_EVIDENCE_RUNTIME_FAILURE reason=unresolved_history recorded=18446744073709551616 certified=12 applied=12" "MANAGED_EVIDENCE_RUNTIME_FAILURE reason=private recorded=1 certified=1 applied=1"'
+  if grep -E 'MANAGED_INITIAL_AUTHORITY_FAILURE|MANAGED_EVIDENCE_RUNTIME_FAILURE|DO-NOT-RETAIN' "$diag_dir/active.log"; then exit 1; fi
   for current_stage in attributes_before get body close attributes_after version_changed decode policy; do
     run_contract rust-restart sh -c 'printf "2026/11/03 12:00:00 MANAGED_CHECKPOINT_CURRENT_READ_FAILURE stage=%s\n" "$1"' sh "$current_stage"
     grep -Fx "MANAGED_CHECKPOINT_CURRENT_READ_FAILURE stage=$current_stage" "$diag_dir/active.log" >/dev/null

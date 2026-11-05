@@ -337,19 +337,39 @@ func (h *Host) ValidateManagedStartup(ctx context.Context, i node.ManagedStartup
 	return nil
 }
 
+func managedInitialAuthorityDiagnostic(leaf string, err error) string {
+	if err == nil {
+		return ""
+	}
+	switch leaf {
+	case "identity", "live", "pending_closed", "evidence":
+		return "MANAGED_INITIAL_AUTHORITY_FAILURE leaf=" + leaf
+	default:
+		return ""
+	}
+}
+func (h *Host) logInitialAuthorityFailure(leaf string, err error) error {
+	if h != nil && h.internalRequests() {
+		if line := managedInitialAuthorityDiagnostic(leaf, err); line != "" {
+			log.Print(line)
+		}
+	}
+	return err
+}
+
 func (h *Host) ValidateManagedAdmission(ctx context.Context, i node.ManagedStartupIdentity, _ node.ManagedRuntimeState) error {
 	if i != h.identity {
-		return fmt.Errorf("execution identity changed")
+		return h.logInitialAuthorityFailure("identity", fmt.Errorf("execution identity changed"))
 	}
 	a, err := h.live(ctx)
 	if err != nil {
-		return err
+		return h.logInitialAuthorityFailure("live", err)
 	}
 	if _, pending := a.Pending(); pending || a.SQLReservationsClosed() {
-		return fmt.Errorf("initial admission has pending control or closed repair")
+		return h.logInitialAuthorityFailure("pending_closed", fmt.Errorf("initial admission has pending control or closed repair"))
 	}
 	_, err = h.inspectEvidence(ctx, false, false)
-	return err
+	return h.logInitialAuthorityFailure("evidence", err)
 }
 
 func (h *Host) ValidateManagedPeerLearn(ctx context.Context, i node.ManagedStartupIdentity) error {

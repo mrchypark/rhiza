@@ -354,6 +354,27 @@ func (n *Node) inspectApplicationState(ctx context.Context, m *materializer.Mate
 	return state.Digest, state.FreshEmpty, err
 }
 
+// This reports only the inspector's observed progress, never application data.
+func managedEvidenceRuntimeDiagnostic(reason string, before, after ManagedRuntimeState, err error) string {
+	if err == nil {
+		return ""
+	}
+	switch reason {
+	case "unresolved_history":
+		return fmt.Sprintf("MANAGED_EVIDENCE_RUNTIME_FAILURE reason=%s recorded=%d certified=%d applied=%d", reason, before.RecorderTip, before.CertifiedTip, before.AppliedTip)
+	case "snapshot_changed":
+		return fmt.Sprintf("MANAGED_EVIDENCE_RUNTIME_FAILURE reason=%s before_recorded=%d before_certified=%d before_applied=%d after_recorded=%d after_certified=%d after_applied=%d", reason, before.RecorderTip, before.CertifiedTip, before.AppliedTip, after.RecorderTip, after.CertifiedTip, after.AppliedTip)
+	default:
+		return ""
+	}
+}
+func logManagedEvidenceRuntimeFailure(reason string, before, after ManagedRuntimeState, err error) error {
+	if line := managedEvidenceRuntimeDiagnostic(reason, before, after, err); line != "" {
+		log.Print(line)
+	}
+	return err
+}
+
 func (n *Node) inspectManagedApplication(ctx context.Context, fresh, localRead bool) (digest [32]byte, empty bool, runtime ManagedRuntimeState, resultErr error) {
 	if n.internalApplicationProfile() {
 		_, scoped, release, err := n.borrowInternalApplication(ctx)
@@ -399,7 +420,7 @@ func (n *Node) inspectManagedApplication(ctx context.Context, fresh, localRead b
 		}
 	}
 	if before.WALIdentity == "" || before.AppliedTip > before.CertifiedTip || !localRead && (before.RecorderTip > before.CertifiedTip || before.AppliedTip != before.CertifiedTip) {
-		return fail(fmt.Errorf("managed host requires registered, resolved history"))
+		return fail(logManagedEvidenceRuntimeFailure("unresolved_history", before, ManagedRuntimeState{}, fmt.Errorf("managed host requires registered, resolved history")))
 	}
 	from := floor + 1
 	for uint64(from) <= before.AppliedTip {
@@ -458,7 +479,7 @@ func (n *Node) inspectManagedApplication(ctx context.Context, fresh, localRead b
 		return fail(err)
 	}
 	if before != after {
-		return fail(fmt.Errorf("history changed during application inspection"))
+		return fail(logManagedEvidenceRuntimeFailure("snapshot_changed", before, after, fmt.Errorf("history changed during application inspection")))
 	}
 	return digest, empty, before, nil
 }

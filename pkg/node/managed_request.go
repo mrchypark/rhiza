@@ -83,7 +83,17 @@ func managedRequestCertifiedOriginalMatches(decision quepaxa.DecidedValue, origi
 		return err == nil && fingerprint == original.Fingerprint && command.RequestID == original.RequestID
 	case types.MutationKV:
 		commands, ok, err := types.DecodeManagedKVBatch(decision.Value)
-		if err != nil || !ok || uint64(original.BatchIndex) >= uint64(len(commands)) {
+		if err != nil {
+			return false
+		}
+		if !ok {
+			command, single, err := types.DecodeManagedKVCommand(decision.Value)
+			if err != nil || !single || original.BatchIndex != 0 {
+				return false
+			}
+			commands = []types.KVCommand{command}
+		}
+		if uint64(original.BatchIndex) >= uint64(len(commands)) {
 			return false
 		}
 		command := commands[original.BatchIndex]
