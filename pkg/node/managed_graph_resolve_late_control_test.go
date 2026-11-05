@@ -62,12 +62,12 @@ func TestManagedGraphResolutionCutTrustBoundaries(t *testing.T) {
 	if err != nil || !found {
 		t.Fatal(err)
 	}
-	cut, err := n.captureManagedGraphResolutionCut(ctx, original)
+	cut, err := n.captureManagedRequestResolutionCut(ctx, original)
 	if err != nil {
 		t.Fatal(err)
 	}
 	state := ManagedRuntimeState{CertifiedTip: uint64(n.core.Tip()), AppliedTip: n.material.Tip()}
-	if !n.managedGraphResolutionCutCovered(cut, state) {
+	if !n.managedRequestResolutionCutCovered(cut, state) {
 		t.Fatal("valid original cut was not covered")
 	}
 	for _, name := range []string{"missing-certificate", "wrong-decision-hash", "wrong-execution"} {
@@ -83,7 +83,7 @@ func TestManagedGraphResolutionCutTrustBoundaries(t *testing.T) {
 				bad.ExecutionItem = bytes.Clone(bad.ExecutionItem)
 				bad.ExecutionItem[0] ^= 1
 			}
-			if _, err := n.captureManagedGraphResolutionCut(ctx, bad); err == nil {
+			if _, err := n.captureManagedRequestResolutionCut(ctx, bad); err == nil {
 				t.Fatal("uncertified or mismatched original established a cut")
 			}
 		})
@@ -99,11 +99,11 @@ func TestManagedGraphResolutionCutTrustBoundaries(t *testing.T) {
 			case "floor-drift":
 				bad.floor++
 			case "empty-proof":
-				bad = managedGraphResolutionCut{}
+				bad = managedRequestResolutionCut{}
 			case "unapplied-original":
 				s.AppliedTip = uint64(cut.through - 1)
 			}
-			if n.managedGraphResolutionCutCovered(bad, s) {
+			if n.managedRequestResolutionCutCovered(bad, s) {
 				t.Fatal("changed trust anchor or unapplied original was covered")
 			}
 		})
@@ -156,8 +156,8 @@ func TestManagedGraphResolutionCutTrustBoundaries(t *testing.T) {
 	}
 	probe := New(n.config)
 	probe.core = observer
-	covered, err := probe.captureManagedGraphResolutionCut(ctx, original)
-	if err != nil || covered.through != observer.CompactionFloor() || !probe.managedGraphResolutionCutCovered(covered, ManagedRuntimeState{CertifiedTip: uint64(observer.Tip()), AppliedTip: n.material.Tip()}) {
+	covered, err := probe.captureManagedRequestResolutionCut(ctx, original)
+	if err != nil || covered.through != observer.CompactionFloor() || !probe.managedRequestResolutionCutCovered(covered, ManagedRuntimeState{CertifiedTip: uint64(observer.Tip()), AppliedTip: n.material.Tip()}) {
 		t.Fatal("verified compacted original lost its root/prefix proof", err)
 	}
 }

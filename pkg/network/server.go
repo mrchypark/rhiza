@@ -2490,6 +2490,13 @@ func (s *Server) applyDecisions(ctx context.Context, through quepaxa.Slot) error
 				break
 			}
 		}
+		// A certified catch-up hint is not necessarily logged yet. Application
+		// persistence must follow WAL persistence of this exact replay page.
+		if end > 0 {
+			if err := s.core.EnsureDurableThrough(ctx, decisions[end-1].Slot); err != nil {
+				return err
+			}
+		}
 		if err := s.material.ApplyBatch(ctx, decisions[:end]); err != nil {
 			return fmt.Errorf("certified replay apply first_slot=%d last_slot=%d last_hash=%x ctx_canceled=%t: %w", decisions[0].Slot, decisions[end-1].Slot, decisions[end-1].Hash, ctx.Err() != nil, err)
 		}

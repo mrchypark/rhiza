@@ -6,6 +6,7 @@ import (
 	"crypto/md5"
 	"encoding/json"
 	"encoding/xml"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -64,7 +65,31 @@ func managedHTTPQuorum(t *testing.T) (*managedsql.Host, managedsql.Config, *http
 	if err != nil {
 		t.Fatal(err)
 	}
-	archive := managedHTTPWireStore(t)
+	var closing atomic.Bool
+	var readMu sync.Mutex
+	type readFailure struct {
+		path              string
+		err               error
+		canceled, closing bool
+	}
+	var readFailures []readFailure
+	ownedPrefix := "/bucket/" + ns.FinalPrefix + "/"
+	// Registered before the server and Hosts: inspect after all handlers join.
+	t.Cleanup(func() {
+		readMu.Lock()
+		defer readMu.Unlock()
+		for _, failure := range readFailures {
+			if !managedHTTPExpectedCanceledPUT(ownedPrefix, failure.path, failure.err, failure.canceled, failure.closing) {
+				t.Errorf("unexpected object PUT body read failure path=%s canceled=%t closing=%t: %v", failure.path, failure.canceled, failure.closing, failure.err)
+			}
+		}
+	})
+	archive := managedHTTPWireStore(t, func(r *http.Request, err error) {
+		failure := readFailure{r.URL.Path, err, errors.Is(r.Context().Err(), context.Canceled), closing.Load()}
+		readMu.Lock()
+		readFailures = append(readFailures, failure)
+		readMu.Unlock()
+	})
 	configs := make([]managedsql.Config, 3)
 	members := make([]quepaxa.Member, 3)
 	transports := make([]*quic.Transport, 3)
@@ -190,6 +215,7 @@ func managedHTTPQuorum(t *testing.T) (*managedsql.Host, managedsql.Config, *http
 		h, err := managedsql.Open(peerCtx, configs[i])
 		if h != nil {
 			t.Cleanup(func() {
+				closing.Store(true)
 				if err := h.Close(); err != nil {
 					t.Error(err)
 				}
@@ -222,7 +248,65 @@ func managedHTTPQuorum(t *testing.T) (*managedsql.Host, managedsql.Config, *http
 	return hosts[0], configs[0], httpServer, blockFinalize, finalizeStarted
 }
 
-func managedHTTPWireStore(t *testing.T) *httptest.Server {
+func managedHTTPExpectedCanceledPUT(prefix, requestPath string, err error, canceled, closing bool) bool {
+	return closing && canceled && errors.Is(err, io.ErrUnexpectedEOF) && strings.HasPrefix(requestPath, prefix) && len(requestPath) > len(prefix)
+}
+
+func TestManagedHTTPWireReadFailureBeforeCleanup(t *testing.T) {
+	type observation struct {
+		path     string
+		err      error
+		canceled bool
+	}
+	observed := make(chan observation, 1)
+	server := managedHTTPWireStore(t, func(r *http.Request, err error) {
+		observed <- observation{r.URL.Path, err, errors.Is(r.Context().Err(), context.Canceled)}
+	})
+	conn, err := net.DialTimeout("tcp", strings.TrimPrefix(server.URL, "http://"), 5*time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := io.WriteString(conn, "PUT /bucket/owned/archive/head.bin HTTP/1.1\r\nHost: fixture\r\nContent-Length: 10\r\n\r\nx"); err != nil {
+		_ = conn.Close()
+		t.Fatal(err)
+	}
+	if err := conn.Close(); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case failure := <-observed:
+		if !errors.Is(failure.err, io.ErrUnexpectedEOF) {
+			t.Fatal("actual truncated PUT did not reach the body-read failure", failure.err)
+		}
+		if managedHTTPExpectedCanceledPUT("/bucket/owned/", failure.path, failure.err, failure.canceled, false) {
+			t.Fatal("actual pre-cleanup body failure was silently allowed")
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("actual truncated PUT was not observed")
+	}
+}
+
+func TestManagedHTTPWireReadFailureScope(t *testing.T) {
+	for _, tc := range []struct {
+		name, path              string
+		err                     error
+		canceled, closing, want bool
+	}{
+		{"owned-canceled-cleanup", "/bucket/owned/archive/head.bin", io.ErrUnexpectedEOF, true, true, true},
+		{"live-request", "/bucket/owned/archive/head.bin", io.ErrUnexpectedEOF, true, false, false},
+		{"not-canceled", "/bucket/owned/archive/head.bin", io.ErrUnexpectedEOF, false, true, false},
+		{"other-prefix", "/bucket/other/archive/head.bin", io.ErrUnexpectedEOF, true, true, false},
+		{"other-error", "/bucket/owned/archive/head.bin", io.EOF, true, true, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := managedHTTPExpectedCanceledPUT("/bucket/owned/", tc.path, tc.err, tc.canceled, tc.closing); got != tc.want {
+				t.Fatalf("read failure scope = %t, want %t", got, tc.want)
+			}
+		})
+	}
+}
+
+func managedHTTPWireStore(t *testing.T, readFailure func(*http.Request, error)) *httptest.Server {
 	t.Helper()
 	var mu sync.Mutex
 	objects := map[string][]byte{}
@@ -261,7 +345,7 @@ func managedHTTPWireStore(t *testing.T) *httptest.Server {
 			}
 			body, err := io.ReadAll(r.Body)
 			if err != nil {
-				t.Error(err)
+				readFailure(r, err)
 				w.WriteHeader(500)
 				return
 			}
@@ -341,10 +425,14 @@ func TestManagedHandlerCommittedWriteAndRecoveryDoNotReserveCR(t *testing.T) {
 	if code, body := managedHTTPPost(t, server, "/execute", managedsql.ExecuteRequest{RequestID: "schema", SQL: "CREATE TABLE pending_http(value)"}); code != http.StatusOK {
 		t.Fatalf("schema: %d %s", code, body)
 	}
-	if code, body := managedHTTPPost(t, server, "/execute", managedsql.ExecuteRequest{RequestID: "write", SQL: "INSERT INTO pending_http VALUES (1)"}); code != http.StatusOK {
+	code, body := managedHTTPPost(t, server, "/execute", managedsql.ExecuteRequest{RequestID: "write", SQL: "INSERT INTO pending_http VALUES (1)"})
+	var ack network.ExecuteResponse
+	if code != http.StatusOK || json.Unmarshal(body, &ack) != nil || ack.Status != types.MutationCommitted || ack.Slot == 0 {
 		t.Fatalf("write: %d %s", code, body)
 	}
-	if code, body := managedHTTPPost(t, server, "/query", managedsql.QueryRequest{SQL: "SELECT COUNT(*) FROM pending_http", Consistency: "local"}); code != http.StatusOK || !bytes.Contains(body, []byte(`"rows":[[1]]`)) {
+	code, body = managedHTTPPost(t, server, "/query", managedsql.QueryRequest{SQL: "SELECT COUNT(*) FROM pending_http", Consistency: "linearizable"})
+	var readback network.QueryResponse
+	if code != http.StatusOK || json.Unmarshal(body, &readback) != nil || readback.AppliedSlot < ack.Slot || !bytes.Contains(body, []byte(`"rows":[[1]]`)) {
 		t.Fatalf("exactly-once result: %d %s", code, body)
 	}
 	after, err := operator.LoadV1Alpha2Admission(context.Background(), cfg.Store, cfg.Ref)

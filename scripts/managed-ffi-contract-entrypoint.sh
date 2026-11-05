@@ -174,7 +174,7 @@ run_contract() {
         next
       }
       if (diagnostic ~ /^MANAGED_REQUEST_RESOLUTION_FAILURE/) {
-        if (diagnostic ~ /^MANAGED_REQUEST_RESOLUTION_FAILURE stage=(resolve_borrow|resolve_admit) cause=[a-z_]+$/) {
+        if (diagnostic ~ /^MANAGED_REQUEST_RESOLUTION_FAILURE stage=(resolve_borrow|resolve_admit|resolve_original_certificate|resolve_durability_result|resolve_runtime_post|resolve_original_recheck) cause=[a-z_]+$/) {
           split(diagnostic, request_fields, " ")
           cause=request_fields[3]; sub(/^cause=/,"",cause)
           if (knownadmissioncause(cause)) emit(diagnostic)
@@ -512,6 +512,10 @@ if [ "${1-}" = --diagnostic-self-test ]; then
     "MANAGED_HOST_REQUEST_RECOVERY_FAILURE stage=host_precheck cause=not_ready" \
     "MANAGED_REQUEST_RESOLUTION_FAILURE stage=resolve_borrow cause=canceled" \
     "MANAGED_REQUEST_RESOLUTION_FAILURE stage=resolve_admit cause=other" \
+    "MANAGED_REQUEST_RESOLUTION_FAILURE stage=resolve_original_certificate cause=other" \
+    "MANAGED_REQUEST_RESOLUTION_FAILURE stage=resolve_durability_result cause=other" \
+    "MANAGED_REQUEST_RESOLUTION_FAILURE stage=resolve_runtime_post cause=other" \
+    "MANAGED_REQUEST_RESOLUTION_FAILURE stage=resolve_original_recheck cause=canceled" \
     "MANAGED_REQUEST_RESOLUTION_FAILURE stage=original_lookup lookup=error cause=not_ready" \
     "MANAGED_REQUEST_RESOLUTION_FAILURE stage=original_lookup lookup=not_found" \
     "MANAGED_REQUEST_RESOLUTION_FAILURE stage=original_lookup lookup=found slot_known=true slot=7" \

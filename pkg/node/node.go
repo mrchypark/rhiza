@@ -2338,6 +2338,13 @@ func (n *Node) replayLocalDecisionsTo(ctx context.Context, through quepaxa.Slot)
 		if len(decisions) == 0 && through != 0 && from <= through {
 			return from, fmt.Errorf("certified local replay made no progress through slot %d", through)
 		}
+		// Certified hints may be memory-only. Persist this fixed page before
+		// durable application state can advance beyond its recoverable WAL.
+		if len(decisions) != 0 {
+			if err := n.core.EnsureDurableThrough(ctx, decisions[len(decisions)-1].Slot); err != nil {
+				return from, err
+			}
+		}
 		if n.localRestoreSuffixPending && localRestoreSuffixCrashBoundary != nil {
 			for _, decision := range decisions {
 				if err := n.material.ApplyBatch(ctx, []quepaxa.DecidedValue{decision}); err != nil {

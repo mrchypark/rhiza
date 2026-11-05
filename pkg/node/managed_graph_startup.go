@@ -140,6 +140,11 @@ func (n *Node) reconstructManagedGraphStartupAt(ctx context.Context, core *quepa
 	if err != nil {
 		return nil, err
 	}
+	// These staged files can become the permanent pair. Preserve their fixed
+	// certified cut in the WAL before materializing or installing that state.
+	if err := core.EnsureDurableThrough(ctx, tip); err != nil {
+		return nil, err
+	}
 	if err := mat.RestoreCheckpoint(ctx, checkpointMaterializerFiles(rootFiles)); err != nil {
 		return nil, err
 	}
@@ -431,6 +436,9 @@ func (n *Node) reconcileManagedGraphTarget(ctx context.Context, core *quepaxa.Co
 	}
 	values, err := certifiedSuffixThrough(core, quepaxa.Slot(observed.SQLiteTip)+1, projection.tip)
 	if err != nil {
+		return err
+	}
+	if err := core.EnsureDurableThrough(ctx, projection.tip); err != nil {
 		return err
 	}
 	old, err := n.openMaterializer(dbPath, 1)
