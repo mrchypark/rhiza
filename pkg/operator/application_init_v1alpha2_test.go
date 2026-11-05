@@ -5,17 +5,46 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
 	"strings"
 	"testing"
 
+	"github.com/mrchypark/rhiza/internal/sqlpolicy"
 	"github.com/mrchypark/rhiza/internal/types"
 	"github.com/mrchypark/rhiza/pkg/network"
+	"github.com/mrchypark/rhiza/pkg/quepaxa"
 )
+
+func TestApplicationInitExplicitProtocolBoundary(t *testing.T) {
+	for _, protocol := range []string{"", types.ManagedApplicationProtocolSQLKV, sqlpolicy.ManagedRequestAppendOnlyApplicationProtocol, sqlpolicy.ManagedGraphRequestAppendOnlyApplicationProtocol, sqlpolicy.ManagedRequestApplicationProtocol, sqlpolicy.ManagedGraphRequestApplicationProtocol, "rhiza-managed-request/v2", "rhiza-managed-graph/v1", "unknown"} {
+		p := initTestPlan(t)
+		p.ApplicationProtocol = protocol
+		if protocol != "" {
+			p.EvidenceFormat = protocol
+		}
+		g := v1alpha2Genesis{OwnerUID: p.ClusterUID, DeploymentUID: p.DeploymentUID, StorageID: p.StorageID, IntentHash: p.IntentHash}
+		valid := protocol == "" || protocol == types.ManagedApplicationProtocolSQLKV || protocol == sqlpolicy.ManagedRequestAppendOnlyApplicationProtocol || protocol == sqlpolicy.ManagedGraphRequestAppendOnlyApplicationProtocol
+		if err := validateV1Alpha2ApplicationInitPlan(p, phase2Ref, g); (err == nil) != valid {
+			t.Fatalf("protocol=%q valid=%t error=%v", protocol, valid, err)
+		}
+		if valid && protocol != "" {
+			p.EvidenceFormat = V1Alpha2ManagedSQLEvidenceFormat
+			if err := ValidateV1Alpha2ApplicationProfile(protocol, p.EvidenceFormat); err == nil {
+				t.Fatal("nonlegacy protocol accepted legacy evidence marker")
+			}
+		}
+	}
+}
 
 func initTestPlan(t *testing.T) V1Alpha2ApplicationInitPlan {
 	t.Helper()
-	b, digest, err := testBootstrapPlan(phase2Ref)
+	b := initTestBootstrap(t)
+	members := make([]quepaxa.Member, len(b.Members))
+	for i, member := range b.Members {
+		members[i] = member.Member
+	}
+	digest, err := types.ManagedBootstrapPlanDigestForProtocol(string(b.ClusterID), members, b.PhysicalBinding, b.EvidenceFormat, b.Durability, b.Reconfiguration, b.EvidenceFormat)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -23,6 +52,7 @@ func initTestPlan(t *testing.T) V1Alpha2ApplicationInitPlan {
 	if err != nil {
 		t.Fatal(err)
 	}
+	p.ApplicationProtocol = b.EvidenceFormat
 	return p
 }
 
@@ -32,16 +62,14 @@ func initTestBootstrap(t *testing.T) V1Alpha2BootstrapPlan {
 	if err != nil {
 		t.Fatal(err)
 	}
+	b.EvidenceFormat = sqlpolicy.ManagedRequestAppendOnlyApplicationProtocol
 	return b
 }
 
 func TestApplicationInitRetainsOriginalSQL(t *testing.T) {
-	_, store, snap := authorityTestSetup(t)
+	server, store, snap := authorityTestSetup(t)
 	req := network.ExecuteRequest{RequestID: "write", SQL: "INSERT INTO t VALUES (?)", Args: []any{"value"}}
-	reserved, _, err := ReserveV1Alpha2SQLWrite(context.Background(), store, snap, snap.Authority(), authorityTestEvidence, req)
-	if err != nil {
-		t.Fatal(err)
-	}
+	reserved := historicalPhase8Pending(t, server, store, snap, req)
 	if snap.EverApplicationReserved() || !reserved.EverApplicationReserved() {
 		t.Fatal("SQL reservation history was not atomically recorded")
 	}
@@ -49,46 +77,13 @@ func TestApplicationInitRetainsOriginalSQL(t *testing.T) {
 	if err != nil || !ok || got.RequestID != req.RequestID || got.SQL != req.SQL || len(got.Args) != 1 || got.Args[0] != "value" {
 		t.Fatalf("pending SQL: %+v %v %v", got, ok, err)
 	}
-	if _, _, err := FinalizeV1Alpha2Write(context.Background(), store, reserved, snap.Authority(), V1Alpha2WriteRequest{Kind: "sql", ID: "write", Fingerprint: "wrong"}, V1Alpha2WriteCommitted, authorityTestEvidence); err == nil {
-		t.Fatal("mismatched request finalized")
-	}
-}
 
-func TestApplicationInitSQLHistorySurvivesEvidenceReversal(t *testing.T) {
-	server, store, current := authorityTestSetup(t)
-	ctx := context.Background()
-	for _, req := range []network.ExecuteRequest{{RequestID: "ddl-create", SQL: "CREATE TABLE t (v TEXT)"}, {RequestID: "ddl-drop", SQL: "DROP TABLE t"}} {
-		reserved, observed, err := ReserveV1Alpha2SQLWrite(ctx, store, current, current.Authority(), authorityTestEvidence, req)
-		if err != nil || observed != V1Alpha2CASApplied || !reserved.EverApplicationReserved() {
-			t.Fatalf("reserve: %s %v", observed, err)
-		}
-		request, ok := reserved.Pending()
-		if !ok {
-			t.Fatal("missing pending request")
-		}
-		current, observed, err = FinalizeV1Alpha2Write(ctx, store, reserved, reserved.Authority(), request, V1Alpha2WriteCommitted, authorityTestEvidence)
-		if err != nil || observed != V1Alpha2CASApplied || !current.EverApplicationReserved() {
-			t.Fatalf("finalize: %s %v", observed, err)
-		}
-		// The small in-memory fixture models only two successive RV values.
-		server.cluster = strings.Replace(server.cluster, `"resourceVersion":"49"`, `"resourceVersion":"47"`, 1)
-		current, err = LoadV1Alpha2Admission(ctx, store, phase2Ref)
-		if err != nil {
-			t.Fatal(err)
-		}
-	}
-	if !sameJSON(current.Evidence(), authorityTestEvidence) {
-		t.Fatal("reversed evidence differs")
-	}
 }
 
 func TestApplicationInitRetainsSQLBlob(t *testing.T) {
-	_, store, snap := authorityTestSetup(t)
+	server, store, snap := authorityTestSetup(t)
 	req := network.ExecuteRequest{RequestID: "blob", SQL: "INSERT INTO t VALUES (?)", Args: []any{[]byte{0, 1, 255}}}
-	reserved, _, err := ReserveV1Alpha2SQLWrite(context.Background(), store, snap, snap.Authority(), authorityTestEvidence, req)
-	if err != nil {
-		t.Fatal(err)
-	}
+	reserved := historicalPhase8Pending(t, server, store, snap, req)
 	got, ok, err := reserved.PendingSQL()
 	if err != nil || !ok || len(got.Args) != 1 {
 		t.Fatalf("pending: %v %v", ok, err)
@@ -114,28 +109,21 @@ func TestApplicationInitPendingSQLSizeBoundary(t *testing.T) {
 		}
 		return req
 	}
-	server, store, old := authorityTestSetup(t)
-	tooLarge := makeRequest(limit + 1)
-	before := server.cluster
-	if _, _, err := ReserveV1Alpha2SQLWrite(context.Background(), store, old, old.Authority(), authorityTestEvidence, tooLarge); err == nil || !strings.Contains(err.Error(), "invalid pending SQL size") {
-		t.Fatalf("oversize request: %v", err)
-	}
-	if server.puts != 0 || server.cluster != before {
-		t.Fatal("oversize request changed status")
-	}
-	reserved, _, err := ReserveV1Alpha2SQLWrite(context.Background(), store, old, old.Authority(), authorityTestEvidence, makeRequest(limit))
-	if err != nil || server.puts != 1 {
-		t.Fatalf("boundary reservation: puts=%d err=%v", server.puts, err)
-	}
-	before = server.cluster
-	if _, _, err := ReserveV1Alpha2SQLWrite(context.Background(), store, reserved, reserved.Authority(), authorityTestEvidence, tooLarge); err == nil {
-		t.Fatal("oversize request replaced pending write")
-	}
-	if server.puts != 1 || server.cluster != before {
-		t.Fatal("oversize request changed pending status")
-	}
-	if _, ok, err := reserved.PendingSQL(); err != nil || !ok {
-		t.Fatalf("boundary pending request: present=%v err=%v", ok, err)
+	for _, size := range []int{limit, limit + 1} {
+		req := makeRequest(size)
+		raw, err := types.EncodeSQLBatchItem(types.SQLCommand{RequestID: req.RequestID, SQL: req.SQL, Args: req.Args})
+		if err != nil {
+			t.Fatal(err)
+		}
+		fingerprint, err := sqlRequestFingerprint(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		request := V1Alpha2WriteRequest{Kind: "sql", ID: req.RequestID, Fingerprint: fmt.Sprintf("%x", fingerprint)}
+		_, err = decodePendingSQL(raw, request)
+		if (err == nil) != (size == limit) {
+			t.Fatalf("historical SQL size=%d: %v", size, err)
+		}
 	}
 }
 
@@ -146,15 +134,12 @@ func TestApplicationInitRetainsSQLCanonicalArguments(t *testing.T) {
 	}
 	for _, req := range cases {
 		t.Run(req.RequestID, func(t *testing.T) {
-			_, store, old := authorityTestSetup(t)
+			server, store, old := authorityTestSetup(t)
 			before, err := sqlRequestFingerprint(req)
 			if err != nil {
 				t.Fatal(err)
 			}
-			reserved, _, err := ReserveV1Alpha2SQLWrite(context.Background(), store, old, old.Authority(), authorityTestEvidence, req)
-			if err != nil {
-				t.Fatal(err)
-			}
+			reserved := historicalPhase8Pending(t, server, store, old, req)
 			got, ok, err := reserved.PendingSQL()
 			if err != nil || !ok {
 				t.Fatalf("pending: %v %v", ok, err)
@@ -178,7 +163,7 @@ func TestApplicationInitRetainsSQLCanonicalArguments(t *testing.T) {
 
 func TestApplicationInitGenesisAndCommit(t *testing.T) {
 	ctx := context.Background()
-	server, store, name := phase8Setup(t, phase8Cluster, "")
+	server, store, name := phase8Setup(t, phase9CurrentManagedCluster(), "")
 	plan := initTestPlan(t)
 	if _, err := InitializeV1Alpha2Authority(ctx, store, phase2Ref, name); err == nil || server.puts != 0 {
 		t.Fatal("unplanned genesis was accepted")
@@ -215,7 +200,7 @@ func TestApplicationInitGenesisAndCommit(t *testing.T) {
 
 func TestApplicationInitOldGenesisNeverBackfilled(t *testing.T) {
 	ctx := context.Background()
-	server, store, name := phase8Setup(t, phase8Cluster, "")
+	server, store, name := phase8Setup(t, phase9CurrentManagedCluster(), "")
 	if _, err := InitializeV1Alpha2AuthorityWithBootstrap(ctx, store, phase2Ref, name, initTestPlan(t), initTestBootstrap(t)); err != nil {
 		t.Fatal(err)
 	}
@@ -239,27 +224,45 @@ func TestApplicationInitOldGenesisNeverBackfilled(t *testing.T) {
 }
 
 func TestApplicationInitLostCommitRemainsUnknown(t *testing.T) {
-	ctx := context.Background()
-	server, store, name := phase8Setup(t, phase8Cluster, "")
-	plan := initTestPlan(t)
-	if _, err := InitializeV1Alpha2AuthorityWithBootstrap(ctx, store, phase2Ref, name, plan, initTestBootstrap(t)); err != nil {
-		t.Fatal(err)
-	}
-	server.cluster = strings.Replace(server.cluster, `"resourceVersion":"48"`, `"resourceVersion":"47"`, 1)
-	old, err := LoadV1Alpha2ApplicationInit(ctx, store, phase2Ref)
-	if err != nil {
-		t.Fatal(err)
-	}
-	server.timeout = true
-	result, observation, err := CommitV1Alpha2ApplicationInit(ctx, store, old, plan, json.RawMessage(`{"schema":"empty"}`))
-	if !errors.Is(err, ErrV1Alpha2StatusOutcomeUnknown) || observation != V1Alpha2CASMatchingReadback || result.Assignment().State != "Consumed" {
-		t.Fatalf("lost response: %s %v", observation, err)
+	for _, protocol := range []string{sqlpolicy.ManagedRequestAppendOnlyApplicationProtocol, sqlpolicy.ManagedGraphRequestAppendOnlyApplicationProtocol} {
+		t.Run(protocol, func(t *testing.T) {
+			ctx := context.Background()
+			server, store, name := phase8Setup(t, phase9ClusterWithProtocol(protocol), "")
+			bootstrap := initTestBootstrap(t)
+			bootstrap.EvidenceFormat = protocol
+			members := make([]quepaxa.Member, len(bootstrap.Members))
+			for i, member := range bootstrap.Members {
+				members[i] = member.Member
+			}
+			digest, err := types.ManagedBootstrapPlanDigestForProtocol(string(bootstrap.ClusterID), members, bootstrap.PhysicalBinding, protocol, bootstrap.Durability, bootstrap.Reconfiguration, protocol)
+			if err != nil {
+				t.Fatal(err)
+			}
+			plan, err := NewV1Alpha2ApplicationInitPlan(phase2Ref, "logical", "deployment", "assignment", bootstrap.PhysicalBinding, digest, protocol)
+			if err != nil {
+				t.Fatal(err)
+			}
+			plan.ApplicationProtocol = protocol
+			if _, err := InitializeV1Alpha2AuthorityWithBootstrap(ctx, store, phase2Ref, name, plan, bootstrap); err != nil {
+				t.Fatal(err)
+			}
+			server.cluster = strings.Replace(server.cluster, `"resourceVersion":"48"`, `"resourceVersion":"47"`, 1)
+			old, err := LoadV1Alpha2ApplicationInit(ctx, store, phase2Ref)
+			if err != nil {
+				t.Fatal(err)
+			}
+			server.timeout = true
+			result, observation, err := CommitV1Alpha2ApplicationInit(ctx, store, old, plan, json.RawMessage(`{"schema":"empty"}`))
+			if !errors.Is(err, ErrV1Alpha2StatusOutcomeUnknown) || observation != V1Alpha2CASMatchingReadback || result.Assignment().State != "Consumed" {
+				t.Fatalf("lost E0 response protocol=%s: %s %v", protocol, observation, err)
+			}
+		})
 	}
 }
 
 func TestApplicationInitLostResponseWithAdvancedEvidence(t *testing.T) {
 	ctx := context.Background()
-	server, _, name := phase8Setup(t, phase8Cluster, "")
+	server, _, name := phase8Setup(t, phase9CurrentManagedCluster(), "")
 	advanced := false
 	store := phase2Store(t, func(req *http.Request) (*http.Response, error) {
 		resp, err := server.roundTrip(req)
@@ -288,7 +291,7 @@ func TestApplicationInitLostResponseWithAdvancedEvidence(t *testing.T) {
 
 func TestApplicationInitStaleCASCannotConsume(t *testing.T) {
 	ctx := context.Background()
-	server, store, name := phase8Setup(t, phase8Cluster, "")
+	server, store, name := phase8Setup(t, phase9CurrentManagedCluster(), "")
 	plan := initTestPlan(t)
 	if _, err := InitializeV1Alpha2AuthorityWithBootstrap(ctx, store, phase2Ref, name, plan, initTestBootstrap(t)); err != nil {
 		t.Fatal(err)
@@ -301,5 +304,36 @@ func TestApplicationInitStaleCASCannotConsume(t *testing.T) {
 	_, _, err = CommitV1Alpha2ApplicationInit(ctx, store, old, plan, json.RawMessage(`{"schema":"empty"}`))
 	if !errors.Is(err, ErrV1Alpha2StatusConflict) || !strings.Contains(server.cluster, `"state":"Unused"`) {
 		t.Fatalf("stale commit: %v", err)
+	}
+}
+
+func TestApplicationInitHistoricalUnusedCannotActivateRetiredProfile(t *testing.T) {
+	for _, protocol := range []string{"", types.ManagedApplicationProtocolSQLKV} {
+		t.Run(protocol, func(t *testing.T) {
+			server, store, _ := phase8Setup(t, phase9ClusterWithProtocol(protocol), "")
+			seeded := historicalUnusedFixture(t, server, store, protocol)
+			plan := seeded.Assignment().Plan
+			// An unresolved retained transition must not be cleared by refusal.
+			var object map[string]json.RawMessage
+			_ = json.Unmarshal([]byte(server.cluster), &object)
+			status, _ := jsonObject(object["status"])
+			auth, _ := jsonObject(status["authority"])
+			auth["transition"] = json.RawMessage(`{"historical":"unresolved"}`)
+			status["authority"], _ = json.Marshal(auth)
+			object["status"], _ = json.Marshal(status)
+			raw, _ := json.Marshal(object)
+			server.cluster = string(raw)
+			old, err := LoadV1Alpha2ApplicationInit(context.Background(), store, phase2Ref)
+			if err != nil || old.Assignment().State != "Unused" || old.Assignment().Plan != plan {
+				t.Fatalf("historical Unused must remain inspectable: %v", err)
+			}
+			before, puts := server.cluster, server.puts
+			if _, _, err := CommitV1Alpha2ApplicationInit(context.Background(), store, old, plan, json.RawMessage(`{"must":"not-activate"}`)); err == nil || !strings.Contains(err.Error(), "profiles 7/8 are retired") {
+				t.Fatalf("retired E0 commit not explicitly refused: %v", err)
+			}
+			if server.puts != puts || server.cluster != before {
+				t.Fatal("retired commit changed retained pending/original/evidence/Transition bytes")
+			}
+		})
 	}
 }

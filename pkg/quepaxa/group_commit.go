@@ -32,6 +32,12 @@ func newGroupCommit(syncFn func() error) *groupCommit {
 }
 
 func (g *groupCommit) Sync(ctx context.Context) error {
+	return g.syncBatch(ctx, false)
+}
+
+// syncBatch joins the pending batch before requesting an early flush. The
+// existing worker still serializes WAL Sync and publishes the shared result.
+func (g *groupCommit) syncBatch(ctx context.Context, immediate bool) error {
 	g.mu.Lock()
 	if g.pending == nil {
 		g.pending = &commitBatch{done: make(chan struct{})}
@@ -42,7 +48,7 @@ func (g *groupCommit) Sync(ctx context.Context) error {
 		g.running = true
 		go g.flush()
 	}
-	if batch.waiters >= g.max {
+	if immediate || batch.waiters >= g.max {
 		select {
 		case g.wake <- struct{}{}:
 		default:

@@ -9,6 +9,7 @@ import (
 	"strings"
 	"unicode/utf8"
 
+	"github.com/mrchypark/rhiza/internal/sqlpolicy"
 	"github.com/mrchypark/rhiza/pkg/quepaxa"
 )
 
@@ -34,9 +35,48 @@ func validManagedUID(uid string) bool {
 	return len(uid) > 0 && len(uid) <= 256 && utf8.ValidString(uid) && strings.TrimSpace(uid) == uid && !strings.ContainsRune(uid, '\x00')
 }
 
-// ManagedBootstrapPlanDigest matches the managed Node's common bootstrap
+// ManagedBootstrapPlanDigest preserves historical binding bytes for inspection.
+// It does not select or authorize a managed runtime.
+// It matches the managed Node's common bootstrap
 // digest; member-specific WAL identities do not belong to the common plan.
 func ManagedBootstrapPlanDigest(clusterID string, members []quepaxa.Member, physicalBinding, evidenceFormat string, durability ObjectStoreDurability, reconfiguration bool) (string, error) {
+	return ManagedBootstrapPlanDigestForProtocol(clusterID, members, physicalBinding, evidenceFormat, durability, reconfiguration, "")
+}
+
+// ManagedApplicationPolicy selects only from the caller's trusted protocol.
+// Managed startup has no configurable retention window.
+func ManagedApplicationPolicy(protocol string) (sqlpolicy.MaterializationPolicy, uint64, error) {
+	switch protocol {
+	case "", ManagedApplicationProtocolSQLKV:
+		return 0, 0, fmt.Errorf("managed application profiles 7/8 are retired; select an explicit append-only profile for a new cluster")
+	case sqlpolicy.ManagedRequestAppendOnlyApplicationProtocol:
+		return sqlpolicy.ManagedRequestMaterializationPolicy, DefaultIdempotencyWindowSlots, nil
+	case sqlpolicy.ManagedGraphRequestAppendOnlyApplicationProtocol:
+		return sqlpolicy.ManagedGraphRequestMaterializationPolicy, DefaultIdempotencyWindowSlots, nil
+	default:
+		return 0, 0, fmt.Errorf("unsupported managed application protocol")
+	}
+}
+
+// Historical digests remain readable after their execution profiles are retired.
+// Startup must call ManagedApplicationPolicy independently.
+func managedBindingWindow(protocol string) (uint64, error) {
+	switch protocol {
+	case "":
+		return 0, nil
+	case ManagedApplicationProtocolSQLKV:
+		return DefaultIdempotencyWindowSlots, nil
+	default:
+		_, window, err := ManagedApplicationPolicy(protocol)
+		return window, err
+	}
+}
+
+func ManagedBootstrapPlanDigestForProtocol(clusterID string, members []quepaxa.Member, physicalBinding, evidenceFormat string, durability ObjectStoreDurability, reconfiguration bool, protocol string) (string, error) {
+	window, err := managedBindingWindow(protocol)
+	if err != nil {
+		return "", err
+	}
 	if clusterID == "" || physicalBinding == "" || evidenceFormat == "" {
 		return "", fmt.Errorf("invalid managed bootstrap binding")
 	}
@@ -55,14 +95,38 @@ func ManagedBootstrapPlanDigest(clusterID string, members []quepaxa.Member, phys
 		durability = ObjectStoreDurabilityBeforeAck
 	}
 	data, err := json.Marshal(struct {
-		Version         int
-		ClusterID       string
-		Members         []quepaxa.Member
-		PhysicalBinding string
-		EvidenceFormat  string
-		Durability      ObjectStoreDurability
-		Reconfiguration bool
-	}{1, clusterID, members, physicalBinding, evidenceFormat, durability, reconfiguration})
+		Version             int
+		ClusterID           string
+		Members             []quepaxa.Member
+		PhysicalBinding     string
+		EvidenceFormat      string
+		Durability          ObjectStoreDurability
+		Reconfiguration     bool
+		ApplicationProtocol string `json:",omitempty"`
+		IdempotencyWindow   uint64 `json:",omitempty"`
+	}{1, clusterID, members, physicalBinding, evidenceFormat, durability, reconfiguration, protocol, window})
+	if err != nil {
+		return "", err
+	}
+	return fmt.Sprintf("%x", sha256.Sum256(data)), nil
+}
+
+// ManagedMemberConfigDigest is shared by pure bootstrap binding checks.
+func ManagedMemberConfigDigest(config ExecutionConfig, protocol string) (string, error) {
+	window, err := managedBindingWindow(protocol)
+	if err != nil {
+		return "", err
+	}
+	data, err := json.Marshal(struct {
+		Cluster             string
+		Node                string
+		Members             []quepaxa.Member
+		Learner             *quepaxa.Member
+		Durability          string
+		Reconfiguration     bool
+		ApplicationProtocol string `json:",omitempty"`
+		IdempotencyWindow   uint64 `json:",omitempty"`
+	}{string(config.ClusterID), string(config.NodeID), config.Members, config.Learner, string(config.ObjStoreDurability), config.EnableReconfiguration, protocol, window})
 	if err != nil {
 		return "", err
 	}

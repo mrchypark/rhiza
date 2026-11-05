@@ -16,7 +16,7 @@ import (
 	"strconv"
 	"strings"
 
-	"github.com/mrchypark/rhiza/internal/sqlpolicy"
+	"github.com/mrchypark/rhiza/internal/types"
 	sqlite3driver "github.com/ncruces/go-sqlite3/driver"
 )
 
@@ -38,6 +38,9 @@ func (m *Materializer) InspectSQLApplicationState(ctx context.Context) (SQLAppli
 	defer m.mu.RUnlock()
 	if m.writer == nil {
 		return SQLApplicationState{}, sql.ErrConnDone
+	}
+	if m.managedProtocol != "" {
+		return SQLApplicationState{}, fmt.Errorf("mixed materialization requires mixed evidence")
 	}
 	if m.graph == nil {
 		return SQLApplicationState{}, fmt.Errorf("graph state unavailable")
@@ -61,6 +64,10 @@ func (m *Materializer) InspectSQLApplicationState(ctx context.Context) (SQLAppli
 // materializer's WAL exclusion). Source sidecars are never created, changed,
 // or removed by this function.
 func InspectSQLApplicationFile(ctx context.Context, dbPath string) (state SQLApplicationState, appliedTip uint64, resultErr error) {
+	return inspectApplicationFile(ctx, dbPath, 0)
+}
+
+func inspectApplicationFile(ctx context.Context, dbPath string, mixedWindow uint64, protocols ...string) (state SQLApplicationState, appliedTip uint64, resultErr error) {
 	absolute, err := filepath.Abs(dbPath)
 	if err != nil {
 		return state, 0, err
@@ -92,11 +99,21 @@ func InspectSQLApplicationFile(ctx context.Context, dbPath string) (state SQLApp
 		return state, 0, err
 	}
 	defer tx.Rollback()
+	protocol := ""
+	if mixedWindow != 0 {
+		protocol = types.ManagedApplicationProtocolSQLKV
+		if len(protocols) > 0 {
+			protocol = protocols[0]
+		}
+	}
+	if err := checkManagedPolicy(ctx, tx, protocol, mixedWindow); err != nil {
+		return state, 0, err
+	}
 	var policy string
 	if err := tx.QueryRowContext(ctx, `SELECT value FROM _rhiza_meta WHERE key='sql_execution_policy'`).Scan(&policy); err != nil {
 		return state, 0, fmt.Errorf("read SQL materialization policy: %w", err)
 	}
-	if policy != sqlpolicy.Marker() {
+	if policy != strconv.Itoa(int(policyForProtocol(protocol))) {
 		return state, 0, fmt.Errorf("incompatible SQL materialization policy marker %q", policy)
 	}
 	var appliedValue, stateValue string
@@ -114,7 +131,7 @@ func InspectSQLApplicationFile(ctx context.Context, dbPath string) (state SQLApp
 	if err != nil || stateTip > appliedTip {
 		return state, 0, fmt.Errorf("invalid SQL state tip")
 	}
-	state, err = inspectSQLApplicationTransaction(ctx, tx, stateTip)
+	state, err = inspectApplicationTransaction(ctx, tx, stateTip, mixedWindow, protocol)
 	return state, appliedTip, err
 }
 
@@ -146,7 +163,43 @@ func copyEvidenceFile(source, destination string) (resultErr error) {
 }
 
 func inspectSQLApplicationTransaction(ctx context.Context, tx *sql.Tx, stateTip uint64) (state SQLApplicationState, resultErr error) {
+	return inspectApplicationTransaction(ctx, tx, stateTip, 0)
+}
+
+func managedInternalSchema(protocol string, mixedWindow uint64) map[string]string {
+	internal := map[string]string{
+		"_rhiza_meta":             `CREATE TABLE _rhiza_meta ( key TEXT PRIMARY KEY, value TEXT )`,
+		"_rhiza_kv":               `CREATE TABLE _rhiza_kv ( key TEXT PRIMARY KEY, value BLOB NOT NULL, expires_at_unix_ms INTEGER NOT NULL DEFAULT 0 )`,
+		"_rhiza_idempotency":      `CREATE TABLE _rhiza_idempotency ( kind INTEGER NOT NULL, request_id BLOB NOT NULL, fingerprint BLOB NOT NULL CHECK(length(fingerprint) = 32), commit_slot INTEGER NOT NULL, status TEXT NOT NULL, error_code TEXT NOT NULL, rows_affected INTEGER NOT NULL, last_insert_id INTEGER NOT NULL, applied INTEGER NOT NULL, sql_result BLOB NOT NULL DEFAULT X'', PRIMARY KEY(kind, request_id) ) WITHOUT ROWID`,
+		"_rhiza_migrations":       `CREATE TABLE _rhiza_migrations ( version INTEGER PRIMARY KEY CHECK(version > 0), name TEXT NOT NULL, checksum TEXT NOT NULL CHECK(length(checksum) = 64) ) STRICT`,
+		"_rhiza_kv_expiry":        `CREATE INDEX _rhiza_kv_expiry ON _rhiza_kv(expires_at_unix_ms) WHERE expires_at_unix_ms > 0`,
+		"_rhiza_idempotency_slot": `CREATE INDEX _rhiza_idempotency_slot ON _rhiza_idempotency(commit_slot)`,
+	}
+	if originalsProtocol(protocol) && mixedWindow != 0 {
+		internal["_rhiza_request_original"] = strings.Join(strings.Fields(strings.Replace(requestOriginalDDL, "IF NOT EXISTS ", "", 1)), " ")
+	}
+	return internal
+}
+
+func inspectApplicationTransaction(ctx context.Context, tx *sql.Tx, stateTip, mixedWindow uint64, protocols ...string) (state SQLApplicationState, resultErr error) {
 	defer tx.Rollback()
+	protocol := types.ManagedApplicationProtocolSQLKV
+	if len(protocols) > 0 {
+		protocol = protocols[0]
+	}
+	if mixedWindow != 0 {
+		if err := checkManagedPolicy(ctx, tx, protocol, mixedWindow); err != nil {
+			return state, err
+		}
+		if err := validateManagedReceipts(ctx, tx, stateTip, mixedWindow, protocol); err != nil {
+			return state, err
+		}
+		if originalsProtocol(protocol) {
+			if err := validateRequestOriginals(ctx, tx, stateTip, mixedWindow); err != nil {
+				return state, err
+			}
+		}
+	}
 	// Keep canonical sorting on disk, not in a total-database-sized Go slice.
 	private, err := os.MkdirTemp("", "rhiza-sql-evidence-sort-")
 	if err != nil {
@@ -182,14 +235,7 @@ func inspectSQLApplicationTransaction(ctx context.Context, tx *sql.Tx, stateTip 
 	if err != nil {
 		return SQLApplicationState{}, err
 	}
-	internal := map[string]string{
-		"_rhiza_meta":             `CREATE TABLE _rhiza_meta ( key TEXT PRIMARY KEY, value TEXT )`,
-		"_rhiza_kv":               `CREATE TABLE _rhiza_kv ( key TEXT PRIMARY KEY, value BLOB NOT NULL, expires_at_unix_ms INTEGER NOT NULL DEFAULT 0 )`,
-		"_rhiza_idempotency":      `CREATE TABLE _rhiza_idempotency ( kind INTEGER NOT NULL, request_id BLOB NOT NULL, fingerprint BLOB NOT NULL CHECK(length(fingerprint) = 32), commit_slot INTEGER NOT NULL, status TEXT NOT NULL, error_code TEXT NOT NULL, rows_affected INTEGER NOT NULL, last_insert_id INTEGER NOT NULL, applied INTEGER NOT NULL, sql_result BLOB NOT NULL DEFAULT X'', PRIMARY KEY(kind, request_id) ) WITHOUT ROWID`,
-		"_rhiza_migrations":       `CREATE TABLE _rhiza_migrations ( version INTEGER PRIMARY KEY CHECK(version > 0), name TEXT NOT NULL, checksum TEXT NOT NULL CHECK(length(checksum) = 64) ) STRICT`,
-		"_rhiza_kv_expiry":        `CREATE INDEX _rhiza_kv_expiry ON _rhiza_kv(expires_at_unix_ms) WHERE expires_at_unix_ms > 0`,
-		"_rhiza_idempotency_slot": `CREATE INDEX _rhiza_idempotency_slot ON _rhiza_idempotency(commit_slot)`,
-	}
+	internal := managedInternalSchema(protocol, mixedWindow)
 	objectCount := 0
 	for rows.Next() {
 		var o sqlEvidenceObject
@@ -216,7 +262,7 @@ func inspectSQLApplicationTransaction(ctx context.Context, tx *sql.Tx, stateTip 
 			rows.Close()
 			return SQLApplicationState{}, fmt.Errorf("unsupported SQLite schema %q", o.Name)
 		}
-		metadata, err := json.Marshal(o)
+		metadata, err := applicationObjectMetadata(o, mixedWindow != 0)
 		if err != nil {
 			rows.Close()
 			return state, err
@@ -236,6 +282,49 @@ func inspectSQLApplicationTransaction(ctx context.Context, tx *sql.Tx, stateTip 
 	}
 	if len(internal) != 0 {
 		return SQLApplicationState{}, fmt.Errorf("missing internal schema")
+	}
+	if mixedWindow != 0 {
+		// These are application data, not all of _rhiza_meta: control-slot tip
+		// and hash advancement must not change mixed application evidence.
+		tables := []string{"_rhiza_kv", "_rhiza_idempotency"}
+		if originalsProtocol(protocol) {
+			tables = append(tables, "_rhiza_request_original")
+		}
+		for _, name := range tables {
+			o := sqlEvidenceObject{Type: "table", Name: name, Table: name}
+			metadata, err := applicationObjectMetadata(o, true)
+			if err != nil {
+				return state, err
+			}
+			if _, err := insertObject.ExecContext(ctx, objectCount, metadata, o.Type, name); err != nil {
+				return state, err
+			}
+			objectCount++
+		}
+		metadata, err := applicationObjectMetadata(sqlEvidenceObject{Type: "policy", Name: "mixed-policy"}, true)
+		if err != nil {
+			return state, err
+		}
+		if _, err := insertObject.ExecContext(ctx, objectCount, metadata, "policy", "mixed-policy"); err != nil {
+			return state, err
+		}
+		for _, value := range []string{protocol, managedApplicationPolicy, strconv.Itoa(int(policyForProtocol(protocol))), strconv.FormatUint(mixedWindow, 10)} {
+			if _, err := insertRow.ExecContext(ctx, objectCount, []byte(value)); err != nil {
+				return state, err
+			}
+		}
+		if graphProtocol(protocol) {
+			history, err := sqliteGraphHistory(ctx, tx)
+			if err != nil {
+				return state, err
+			}
+			for _, value := range []string{strconv.FormatUint(history.LastGraphSlot, 10), hex.EncodeToString(history.Hash[:])} {
+				if _, err := insertRow.ExecContext(ctx, objectCount, []byte(value)); err != nil {
+					return state, err
+				}
+			}
+		}
+		objectCount++
 	}
 	tableList, err := tx.QueryContext(ctx, `PRAGMA main.table_list`)
 	if err != nil {
@@ -344,7 +433,11 @@ func inspectSQLApplicationTransaction(ctx context.Context, tx *sql.Tx, stateTip 
 				case float64:
 					encoded[j] = [2]string{"real", fmt.Sprintf("%016x", math.Float64bits(v))}
 				case string:
-					encoded[j] = [2]string{"text", v}
+					if mixedWindow != 0 {
+						encoded[j] = [2]string{"text-bytes", hex.EncodeToString([]byte(v))}
+					} else {
+						encoded[j] = [2]string{"text", v}
+					}
 				case []byte:
 					encoded[j] = [2]string{"blob", hex.EncodeToString(v)}
 				default:
@@ -383,19 +476,40 @@ func inspectSQLApplicationTransaction(ctx context.Context, tx *sql.Tx, stateTip 
 	if err := tx.Commit(); err != nil {
 		return SQLApplicationState{}, err
 	}
-	digest, err := hashSQLApplicationEvidence(ctx, sortTx, objectCount)
+	version := "rhiza-sql-state-v1"
+	if mixedWindow != 0 {
+		version = protocol
+	}
+	digest, err := hashApplicationEvidence(ctx, sortTx, objectCount, version)
 	if err != nil {
 		return SQLApplicationState{}, err
 	}
-	return SQLApplicationState{Digest: digest, FreshEmpty: objectCount == 0 && receipts == 0 && kv == 0 && migrations == 0 && stateTip == 0}, nil
+	userObjects := objectCount
+	if mixedWindow != 0 {
+		userObjects -= 3
+		if originalsProtocol(protocol) {
+			userObjects--
+		}
+	}
+	return SQLApplicationState{Digest: digest, FreshEmpty: userObjects == 0 && receipts == 0 && kv == 0 && migrations == 0 && stateTip == 0}, nil
 }
 
 // hashSQLApplicationEvidence emits exactly encoding/json's historical v1 bytes.
 // BLOB ordering is bytewise, matching sort.Strings on canonical row JSON.
 func hashSQLApplicationEvidence(ctx context.Context, tx *sql.Tx, objectCount int) ([32]byte, error) {
+	return hashApplicationEvidence(ctx, tx, objectCount, "rhiza-sql-state-v1")
+}
+
+func hashApplicationEvidence(ctx context.Context, tx *sql.Tx, objectCount int, version string) ([32]byte, error) {
 	var digest [32]byte
 	h := sha256.New()
-	io.WriteString(h, `{"Version":"rhiza-sql-state-v1","Objects":`)
+	encodedVersion, err := json.Marshal(version)
+	if err != nil {
+		return digest, err
+	}
+	io.WriteString(h, `{"Version":`)
+	h.Write(encodedVersion)
+	io.WriteString(h, `,"Objects":`)
 	if objectCount == 0 {
 		io.WriteString(h, "null}")
 		copy(digest[:], h.Sum(nil))

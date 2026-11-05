@@ -103,7 +103,7 @@ func validateV1Alpha2BootstrapPlan(ref V1Alpha2ClusterRef, assignment V1Alpha2Ap
 		seen[entry.PodUID] = true
 		members = append(members, entry.Member)
 	}
-	digest, err := types.ManagedBootstrapPlanDigest(string(p.ClusterID), members, p.PhysicalBinding, p.EvidenceFormat, p.Durability, p.Reconfiguration)
+	digest, err := types.ManagedBootstrapPlanDigestForProtocol(string(p.ClusterID), members, p.PhysicalBinding, p.EvidenceFormat, p.Durability, p.Reconfiguration, assignment.ApplicationProtocol)
 	if err != nil || digest != assignment.BootstrapPlanDigest {
 		return fmt.Errorf("bootstrap digest mismatch")
 	}
@@ -111,6 +111,11 @@ func validateV1Alpha2BootstrapPlan(ref V1Alpha2ClusterRef, assignment V1Alpha2Ap
 }
 
 func initializeV1Alpha2AuthorityWithPlan(ctx context.Context, s *V1Alpha2StatusStore, ref V1Alpha2ClusterRef, deploymentName string, expected *V1Alpha2ClusterSpec, expectedUID, expectedRV string, plan *V1Alpha2ApplicationInitPlan, bootstraps ...*V1Alpha2BootstrapPlan) (V1Alpha2StatusSnapshot, error) {
+	if plan != nil {
+		if err := ValidateV1Alpha2ApplicationProfile(plan.ApplicationProtocol, plan.EvidenceFormat); err != nil {
+			return V1Alpha2StatusSnapshot{}, err
+		}
+	}
 	p, err := s.path(ref)
 	if err != nil {
 		return V1Alpha2StatusSnapshot{}, err
@@ -220,6 +225,9 @@ func initializeV1Alpha2AuthorityWithPlan(ctx context.Context, s *V1Alpha2StatusS
 	if err := validateV1Alpha2ApplicationInitPlan(*plan, ref, receipt); err != nil {
 		return V1Alpha2StatusSnapshot{}, err
 	}
+	if plan.ApplicationProtocol != cluster.Spec.ApplicationProtocol {
+		return V1Alpha2StatusSnapshot{}, fmt.Errorf("genesis application protocol markers disagree")
+	}
 	if err := validateV1Alpha2BootstrapPlan(ref, *plan, *bootstraps[0], int(cluster.Spec.VoterCount)); err != nil {
 		return V1Alpha2StatusSnapshot{}, err
 	}
@@ -230,6 +238,14 @@ func initializeV1Alpha2AuthorityWithPlan(ctx context.Context, s *V1Alpha2StatusS
 	status["bootstrapPlan"], _ = json.Marshal(bootstraps[0])
 	statusRaw, _ := json.Marshal(status)
 	obj["status"] = statusRaw
+	if cluster.Spec.ApplicationProtocol != "" {
+		if err := mixedComponentSize(obj["metadata"], 64<<10); err != nil {
+			return V1Alpha2StatusSnapshot{}, err
+		}
+	}
+	if err := validateManagedMixedProfile(obj); err != nil {
+		return V1Alpha2StatusSnapshot{}, err
+	}
 	var response map[string]json.RawMessage
 	err = s.Kube.Put(ctx, p+"/status", obj, &response)
 	var apiErr *APIError

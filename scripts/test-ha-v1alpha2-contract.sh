@@ -9,6 +9,15 @@ admission_error() {
   grep -E 'Error from server \((Invalid|BadRequest)\)|strict decoding error|^The (RhizaCluster|RhizaRecovery) "[^"]+" is invalid:' "$file" >/dev/null
 }
 
+cel_namespace_cost_error() {
+  file=$1
+  if grep -Ei 'connection refused|timed out|timeout|unable to connect|no such host|i/o timeout|EOF|Error from server \((Forbidden|NotFound)\)' "$file" >/dev/null; then return 1; fi
+  # Bind path and reason to the same error item, even when kubectl joins
+  # multiple validation errors on one line.
+  grep -F 'openAPIV3Schema.x-kubernetes-validations[1].rule: Forbidden: estimated rule cost exceeds budget' "$file" >/dev/null || return 1
+  grep -E 'Error from server \(Invalid\)|^The CustomResourceDefinition "[^"]+" is invalid:' "$file" >/dev/null
+}
+
 if [ "${1:-}" = --self-test-oracle ]; then
   tmp=$(mktemp -d "${TMPDIR:-/tmp}/ha-oracle.XXXXXXXX")
   trap 'rm -f "$tmp/case"; rmdir "$tmp"' EXIT HUP INT TERM
@@ -30,6 +39,33 @@ if [ "${1:-}" = --self-test-oracle ]; then
     printf '%s\n' "$line" > "$tmp/case"
     if admission_error "$tmp/case" 'target is immutable'; then exit 1; fi
   done
+  cost='spec.validation.openAPIV3Schema.x-kubernetes-validations[1].rule: Forbidden: estimated rule cost exceeds budget by factor of more than 100x'
+  printf '%s\n' "The CustomResourceDefinition \"rhizaclusters.rhiza.mrchypark.dev\" is invalid: $cost" > "$tmp/case"
+  cel_namespace_cost_error "$tmp/case" || exit 1
+  for line in \
+    "Error from server (Forbidden): $cost" \
+    "timeout: $cost" \
+    'The CustomResourceDefinition "cluster" is invalid: spec.validation.openAPIV3Schema.x-kubernetes-validations[2].rule: estimated rule cost exceeds budget' \
+    'The CustomResourceDefinition "cluster" is invalid: spec.validation.openAPIV3Schema.x-kubernetes-validations[1].rule: undeclared reference'; do
+    printf '%s\n' "$line" > "$tmp/case"
+    if cel_namespace_cost_error "$tmp/case"; then exit 1; fi
+  done
+  printf '%s\n' \
+    'The CustomResourceDefinition "cluster" is invalid: spec.validation.openAPIV3Schema.x-kubernetes-validations[1].rule: undeclared reference' \
+    'spec.validation.openAPIV3Schema.x-kubernetes-validations[2].rule: Forbidden: estimated rule cost exceeds budget' > "$tmp/case"
+  if cel_namespace_cost_error "$tmp/case"; then
+    echo 'cost oracle combined unrelated rule[1] and rule[2] errors' >&2
+    exit 1
+  fi
+  printf '%s\n' 'The CustomResourceDefinition "cluster" is invalid: spec.validation.openAPIV3Schema.x-kubernetes-validations[1].rule: undeclared reference, spec.validation.openAPIV3Schema.x-kubernetes-validations[2].rule: Forbidden: estimated rule cost exceeds budget' > "$tmp/case"
+  if cel_namespace_cost_error "$tmp/case"; then
+    echo 'cost oracle combined unrelated errors on one line' >&2
+    exit 1
+  fi
+  printf '%s\n' \
+    "The CustomResourceDefinition \"cluster\" is invalid: $cost" \
+    'spec.validation.openAPIV3Schema: Forbidden: estimated rule cost exceeds budget for the entire schema' > "$tmp/case"
+  cel_namespace_cost_error "$tmp/case" || exit 1
   exit 0
 fi
 
@@ -91,6 +127,19 @@ fi
 k() { kubectl --kubeconfig "$kubeconfig" --context "$context" --request-timeout=30s "$@"; }
 k version >> "$logs/versions.txt"
 k create namespace "$namespace" > "$logs/namespace.txt" 2>&1
+# Same API server and schema: preserve the original failure, then qualify the
+# corrected spelling. This observes compilation rejection, not numeric MaxCost.
+sed 's/self.status.authority.pendingRequest.reservation.__namespace__/self.status.authority.pendingRequest.reservation.namespace/g; s/self.status.authority.owner.__namespace__/self.status.authority.owner.namespace/g' deploy/operator/cluster-crd.yaml > "$logs/cel-original-namespace-crd.yaml"
+if k apply --validate=strict --dry-run=server -f "$logs/cel-original-namespace-crd.yaml" > "$logs/cel-original-namespace.txt" 2>&1; then
+  echo 'original namespace selectors unexpectedly compiled; inspect the pinned API environment' >&2
+  exit 1
+fi
+if ! cel_namespace_cost_error "$logs/cel-original-namespace.txt"; then
+  cat "$logs/cel-original-namespace.txt" >&2
+  echo 'original CRD failed for a different reason, not the expected CEL cost rejection' >&2
+  exit 1
+fi
+k apply --validate=strict --dry-run=server -f deploy/operator/cluster-crd.yaml > "$logs/cel-fixed-namespace.txt" 2>&1
 k apply --validate=strict -f deploy/operator/cluster-crd.yaml -f deploy/operator/crd.yaml > "$logs/apply-crds.txt" 2>&1
 k wait --for=condition=Established --timeout=90s crd/rhizaclusters.rhiza.mrchypark.dev crd/rhizarecoveries.rhiza.mrchypark.dev > "$logs/established.txt" 2>&1
 
@@ -114,8 +163,18 @@ recovery_json() {
 cluster_json cluster 3 '' > "$logs/cluster.json"
 ok cluster-create create --validate=strict -f "$logs/cluster.json"
 reject genesis-retrofit 'genesisIntent' patch rhizacluster cluster -n "$namespace" --type=merge -p '{"spec":{"genesisIntent":"Create"}}'
-cluster_json genesis-admission 3 ',"genesisIntent":"Create"' > "$logs/genesis-admission.json"
+cluster_json genesis-admission 3 ',"genesisIntent":"Create","applicationProtocol":"rhiza-managed-request-append-only/v1"' > "$logs/genesis-admission.json"
 ok genesis-create create --validate=strict -f "$logs/genesis-admission.json"
+for retired in empty mixed request graph; do
+  case "$retired" in
+    empty) protocol='' ;;
+    mixed) protocol=rhiza-managed-sql-kv/v1 ;;
+    request) protocol=rhiza-managed-request/v1 ;;
+    graph) protocol=rhiza-managed-request-graph/v1 ;;
+  esac
+  cluster_json "retired-profile-$retired" 3 ",\"genesisIntent\":\"Create\",\"applicationProtocol\":\"$protocol\"" > "$logs/retired-profile-$retired.json"
+  reject "retired-profile-$retired" 'applicationProtocol' create --validate=strict --dry-run=server -f "$logs/retired-profile-$retired.json"
+done
 reject genesis-remove 'genesisIntent' patch rhizacluster genesis-admission -n "$namespace" --type=merge -p '{"spec":{"genesisIntent":null}}'
 reject genesis-change 'genesisIntent' patch rhizacluster genesis-admission -n "$namespace" --type=merge -p '{"spec":{"genesisIntent":"other"}}'
 ok genesis-mutable-spec patch rhizacluster genesis-admission -n "$namespace" --type=merge -p '{"spec":{"automaticRecovery":"A"}}'
@@ -189,7 +248,7 @@ done
 authority_uid=$(k get rhizacluster authority-contract -n "$namespace" -o jsonpath='{.metadata.uid}')
 : "${authority_uid:?}"
 ok authority-contract-seed patch rhizacluster authority-contract -n "$namespace" --subresource=status --type=merge -p "{\"status\":{\"authority\":{\"owner\":{\"namespace\":\"$namespace\",\"name\":\"authority-contract\",\"uid\":\"$authority_uid\",\"logicalID\":\"test\"},\"generation\":2,\"binding\":{\"deploymentUID\":\"deployment\",\"storageID\":\"storage\"},\"pendingWrite\":false,\"everApplicationReserved\":false,\"evidence\":{\"host\":\"before\"},\"receipt\":{\"opaque\":\"keep\"}},\"other\":{\"opaque\":\"keep\"}}}"
-cluster_json genesis-contract 3 ',"genesisIntent":"Create"' > "$logs/genesis-contract.json"
+cluster_json genesis-contract 3 ',"genesisIntent":"Create","applicationProtocol":"rhiza-managed-request-append-only/v1"' > "$logs/genesis-contract.json"
 ok genesis-contract-create create --validate=strict -f "$logs/genesis-contract.json"
 for name in status-contract queue-contract finalizer-contract lifecycle-cancel lifecycle-prepare cancel-complete cancel-retained cancel-waiting; do
   uid=$(k get rhizacluster "$name" -n "$namespace" -o jsonpath='{.metadata.uid}')
@@ -303,7 +362,7 @@ export RHIZA_CONTRACT_LOG_DIR="$logs"
 export RHIZA_CONTRACT_COMPLETE_UID="$complete_uid" RHIZA_CONTRACT_RETAINED_UID="$retained_uid" RHIZA_CONTRACT_WAITING_UID="$waiting_uid"
 export RHIZA_CONTRACT_GENESIS_UID="$genesis_uid" RHIZA_CONTRACT_KUBECONFIG="$kubeconfig" RHIZA_CONTRACT_CONTEXT="$context"
 export RHIZA_CONTRACT_AUTHORITY_UID="$authority_uid"
-go test ./pkg/operator -run '^TestV1Alpha2(Status|Authority|Lifecycle|Cancellation|Genesis|Initializer|Repair)APIServerContract$|^TestRepairIntegerBoundAPIServerContract$' -count=1 -timeout=60s
+go test ./pkg/operator -run '^TestV1Alpha2(Status|Authority|Lifecycle|Cancellation|Genesis|Initializer|Repair)APIServerContract$|^TestRepairIntegerBoundAPIServerContract$|^TestAuthorityV1Alpha2HistoricalUnknownRemainsReadOnly$|^TestApplicationInitHistoricalUnusedCannotActivateRetiredProfile$|^TestGenesisRetiredProfilesRejectBeforeKubernetes$' -count=1 -timeout=60s
 reject genesis-receipt-remove 'genesis receipt cannot be removed or changed and requires authority' patch rhizacluster genesis-contract -n "$namespace" --subresource=status --type=merge -p '{"status":{"genesis":null}}'
 reject genesis-receipt-change 'genesis receipt cannot be removed or changed and requires authority' patch rhizacluster genesis-contract -n "$namespace" --subresource=status --type=merge -p '{"status":{"genesis":{"logicalID":"different"}}}'
 reject genesis-status-wipe 'genesis receipt cannot be removed or changed and requires authority' patch rhizacluster genesis-contract -n "$namespace" --subresource=status --type=merge -p '{"status":null}'

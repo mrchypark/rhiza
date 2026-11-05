@@ -107,8 +107,9 @@ type Config struct {
 	// only public identity, so a replicated membership never holds a secret.
 	PeerToken string
 	Members   []Member
-	// EnableReconfiguration enables externally fenced voter replacement.
-	// All voters must opt in; workload fencing and learner provisioning are external.
+	// EnableReconfiguration enables certified voter replacement; all voters must opt in.
+	// Managed append-only HA uses quorum-authorized learner admission. Unmanaged
+	// replacement requires external fencing and learner provisioning.
 	EnableReconfiguration bool
 	// Learner supplies a new identity absent from the immutable bootstrap members.
 	Learner                        *Member

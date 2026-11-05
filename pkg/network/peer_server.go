@@ -12,6 +12,7 @@ import (
 	"crypto/x509/pkix"
 	"errors"
 	"fmt"
+	"log"
 	"math/big"
 	"net"
 	"sync"
@@ -99,6 +100,10 @@ func StartPeerServerOnTransport(ctx context.Context, transport *quic.Transport, 
 }
 
 func startPeerServer(ctx context.Context, server *Server, members []quepaxa.Member, peerToken, adminToken string, promotionReady <-chan struct{}, listen func(*tls.Config, *quic.Config) (*quic.EarlyListener, error)) (*PeerServer, error) {
+	alpn, err := peerALPNForProfile(server.expectedPolicy, server.managedProfile)
+	if err != nil {
+		return nil, err
+	}
 	local, hasLocal := peerMember(quepaxa.Cluster{Members: members}, server.core.NodeID())
 	for _, member := range members {
 		if len(members) > 1 && member.PublicKey == (quepaxa.PublicKey{}) {
@@ -133,7 +138,7 @@ func startPeerServer(ctx context.Context, server *Server, members []quepaxa.Memb
 		}
 	}
 	listener, err := listen(&tls.Config{
-		MinVersion: tls.VersionTLS13, NextProtos: []string{peerALPN}, Certificates: []tls.Certificate{certificate},
+		MinVersion: tls.VersionTLS13, NextProtos: []string{alpn}, Certificates: []tls.Certificate{certificate},
 		// Voters authenticate with a certificate derived from their private
 		// peer token. Requesting (not requiring) it keeps the admin-token
 		// read-only sync path working for clients without a peer identity.
@@ -354,6 +359,9 @@ func peerCertificateKey(conn *quic.Conn) ed25519.PublicKey {
 func (s *PeerServer) handle(ctx context.Context, certificateKey ed25519.PublicKey, request *peerfb.RequestT) (*peerfb.ResponseT, error) {
 	config, err := s.configurationFor(request)
 	if err != nil || request.ClusterId != string(s.server.cluster) || request.ConfigId != uint64(config.ConfigID) {
+		if request.Operation == peerfb.OperationReadIndex {
+			log.Printf("read-index peer refused reason=identity node_hash=%x sender_hash=%x requested_config=%d current_config=%d", sha256.Sum256([]byte(s.server.core.NodeID())), sha256.Sum256([]byte(request.SenderId)), request.ConfigId, s.server.core.ConfigID())
+		}
 		return nil, fmt.Errorf("cluster identity mismatch")
 	}
 	historical, historicalOK := peerMember(config, quepaxa.NodeID(request.SenderId))
@@ -369,6 +377,9 @@ func (s *PeerServer) handle(ctx context.Context, certificateKey ed25519.PublicKe
 	// the cluster admin token and never enter the fixed voter membership.
 	admin := s.adminToken != "" && subtle.ConstantTimeCompare([]byte(request.AdminToken), []byte(s.adminToken)) == 1
 	if !voter && !(admin && request.Operation == peerfb.OperationSync) {
+		if request.Operation == peerfb.OperationReadIndex {
+			log.Printf("read-index peer refused reason=authentication node_hash=%x sender_hash=%x requested_config=%d current_config=%d", sha256.Sum256([]byte(s.server.core.NodeID())), sha256.Sum256([]byte(request.SenderId)), request.ConfigId, s.server.core.ConfigID())
+		}
 		return nil, fmt.Errorf("peer authentication failed")
 	}
 	switch request.Operation {
@@ -381,7 +392,7 @@ func (s *PeerServer) handle(ctx context.Context, certificateKey ed25519.PublicKe
 			return nil, err
 		}
 		if len(proposal.Value) != 0 {
-			if err := types.ValidateExecutionPolicy(proposal.Value); err != nil {
+			if err := s.server.validateExecutionPolicy(proposal.Value); err != nil {
 				return nil, err
 			}
 		}
@@ -413,7 +424,7 @@ func (s *PeerServer) handle(ctx context.Context, certificateKey ed25519.PublicKe
 			return nil, err
 		}
 		if len(decision.Proposal.Value) != 0 {
-			if err := types.ValidateExecutionPolicy(decision.Proposal.Value); err != nil {
+			if err := s.server.validateExecutionPolicy(decision.Proposal.Value); err != nil {
 				return nil, err
 			}
 		}
@@ -510,14 +521,17 @@ func (s *PeerServer) handle(ctx context.Context, certificateKey ed25519.PublicKe
 		return response, nil
 	case peerfb.OperationReadIndex:
 		if !s.server.core.CanParticipateReadIndex() {
+			_, frozen := s.server.core.PendingReconfiguration()
+			log.Printf("read-index peer refused reason=participation node_hash=%x sender_hash=%x requested_config=%d current_config=%d voter=%t frozen=%t", sha256.Sum256([]byte(s.server.core.NodeID())), sha256.Sum256([]byte(request.SenderId)), request.ConfigId, s.server.core.ConfigID(), s.server.core.IsVoter(), frozen)
 			return nil, quepaxa.ErrQuorumUnavailable
 		}
 		if !s.server.Ready() {
+			log.Printf("read-index peer refused reason=readiness node_hash=%x sender_hash=%x requested_config=%d current_config=%d voter=%t ready=false tip=%d", sha256.Sum256([]byte(s.server.core.NodeID())), sha256.Sum256([]byte(request.SenderId)), request.ConfigId, s.server.core.ConfigID(), s.server.core.IsVoter(), s.server.core.Tip())
 			return nil, ErrNotReady
 		}
 		return &peerfb.ResponseT{ClusterId: string(s.server.cluster), ProposerId: string(s.server.core.NodeID()), ConfigId: uint64(s.server.core.ConfigID()), Tip: uint64(s.server.core.Tip())}, nil
 	case peerfb.OperationStageValue:
-		if err := types.ValidateExecutionPolicy(request.Value); err != nil {
+		if err := s.server.validateExecutionPolicy(request.Value); err != nil {
 			return nil, err
 		}
 		if len(request.Hash) != sha256.Size {

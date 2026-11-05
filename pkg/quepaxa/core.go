@@ -6,6 +6,7 @@ import (
 	"crypto/sha256"
 	"errors"
 	"fmt"
+	"log"
 	"slices"
 	"sort"
 	"sync"
@@ -59,6 +60,8 @@ type Transport interface {
 
 // Core runs one QuePaxa proposer and recorder per replica.
 type Core struct {
+	validateValue           func([]byte) error
+	managedAppendOnly       *ManagedAppendOnlyConfig
 	nodeID                  NodeID
 	config                  *Cluster
 	wal                     *qlog.WAL
@@ -102,6 +105,7 @@ type Core struct {
 	tipChanged          chan struct{}
 	decided             map[Slot]DecidedValue
 	durable             map[Slot]bool
+	durableThrough      Slot // contiguous verified durable prefix; protected by mu
 	logged              map[Slot]bool
 	byHash              map[ValueHash]Slot
 	values              map[ValueHash][]byte
@@ -111,6 +115,7 @@ type Core struct {
 	checkpointMu        sync.Mutex
 	checkpointValidator func(context.Context, CheckpointSeal) error
 	preparedCheckpoints map[Slot][32]byte
+	pendingPrepares     map[Slot]pendingCheckpointPrepare
 	sealedRoots         map[[32]byte]SealedCheckpoint
 	recorders           map[Slot]ISR
 	recordLocks         [64]sync.Mutex
@@ -125,6 +130,17 @@ type Core struct {
 	healthMu            sync.Mutex
 	periodicErr         error
 }
+
+type pendingCheckpointPrepare struct {
+	identity ValueHash
+	root     [32]byte
+	durable  []SlotValue
+}
+
+// ErrCheckpointPreparePending means a higher candidate is constrained by an
+// older checkpoint proposal, or by a candidate whose marker durability is not
+// yet known. It does not mean the candidate is prepared or certified.
+var ErrCheckpointPreparePending = errors.New("checkpoint prepare is blocked by pending checkpoint state")
 
 type configEpoch struct {
 	start   Slot
@@ -142,7 +158,7 @@ func newCore(nodeID NodeID, config *Cluster, wal *qlog.WAL, transport Transport)
 		nodeID: nodeID, config: config, wal: wal, transport: transport,
 		priority: randomPriority,
 		nextSlot: 1, pipeline: make(chan struct{}, 16), pipelineExclusive: make(chan struct{}, 1), recoveryGate: make(chan struct{}, 1), localExecutionOwner: make(chan struct{}, 1), tipChanged: make(chan struct{}),
-		decided: make(map[Slot]DecidedValue), durable: make(map[Slot]bool), logged: make(map[Slot]bool), byHash: make(map[ValueHash]Slot), values: make(map[ValueHash][]byte), valueDurable: make(map[ValueHash]bool), prefixes: make(map[Slot][32]byte), preparedCheckpoints: make(map[Slot][32]byte), sealedRoots: make(map[[32]byte]SealedCheckpoint), recorders: make(map[Slot]ISR),
+		decided: make(map[Slot]DecidedValue), durable: make(map[Slot]bool), logged: make(map[Slot]bool), byHash: make(map[ValueHash]Slot), values: make(map[ValueHash][]byte), valueDurable: make(map[ValueHash]bool), prefixes: make(map[Slot][32]byte), preparedCheckpoints: make(map[Slot][32]byte), pendingPrepares: make(map[Slot]pendingCheckpointPrepare), sealedRoots: make(map[[32]byte]SealedCheckpoint), recorders: make(map[Slot]ISR),
 		now: time.Now, epochStart: make(map[uint64]time.Time), timings: make(map[NodeID]leaderTiming), commits: newGroupCommit(wal.Sync),
 	}
 	core.configHistory = []configEpoch{{start: 1, cluster: cloneCluster(*config)}}
@@ -311,11 +327,14 @@ func (c *Core) propose(ctx context.Context, value []byte, complete bool) (Slot, 
 }
 
 func (c *Core) proposeOwned(ctx context.Context, value []byte, complete, executionOwned, capacityPreflightDone bool) (Slot, []Receipt, error) {
+	if localtesthooks.Enabled {
+		localtesthooks.HitProposalEntry(value)
+	}
 	if c.observer || ((c.reconfigEnabled || c.learner) && !c.IsVoter()) {
 		return 0, nil, ErrQuorumUnavailable
 	}
-	if len(value) > MaxReplicatedValueBytes {
-		return 0, nil, fmt.Errorf("QuePaxa value exceeds %d bytes", MaxReplicatedValueBytes)
+	if err := c.checkValue(value); err != nil {
+		return 0, nil, err
 	}
 	if _, control, err := decodeReconfiguration(value); err != nil {
 		return 0, nil, err
@@ -451,7 +470,7 @@ func (c *Core) StageValue(hash ValueHash, value []byte) error {
 var errLocalExternalMutation = errors.New("local QuePaxa mutation requires the execution owner")
 
 func (c *Core) stageValue(hash ValueHash, value []byte) error {
-	if len(value) == 0 || len(value) > MaxReplicatedValueBytes || sha256.Sum256(value) != hash {
+	if len(value) == 0 || c.checkValue(value) != nil || sha256.Sum256(value) != hash {
 		return fmt.Errorf("invalid QuePaxa value")
 	}
 	c.mu.Lock()
@@ -602,6 +621,10 @@ func (c *Core) ReadIndexExcluding(ctx context.Context, excluded NodeID) (Slot, N
 }
 func (c *Core) readIndexExcluding(ctx context.Context, excluded NodeID) (Slot, NodeID, error) {
 	if c.observer || !c.CanParticipateReadIndex() {
+		c.mu.RLock()
+		frozen := c.reconfiguration != nil
+		c.mu.RUnlock()
+		log.Printf("read-index refused node_hash=%x excluded_hash=%x current_config=%d voter=%t observer=%t frozen=%t", sha256.Sum256([]byte(c.nodeID)), sha256.Sum256([]byte(excluded)), c.ConfigID(), c.IsVoter(), c.observer, frozen)
 		return 0, "", ErrQuorumUnavailable
 	}
 	cluster := *c.config
@@ -623,9 +646,10 @@ func (c *Core) readIndexExcluding(ctx context.Context, excluded NodeID) (Slot, N
 	readCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
 	results := make(chan result, len(cluster.Members))
+	observed := make([]result, 0, len(cluster.Members))
 	for _, member := range cluster.Members {
 		if member.ID == excluded {
-			results <- result{err: ErrQuorumUnavailable}
+			results <- result{id: member.ID, err: ErrQuorumUnavailable}
 			continue
 		}
 		if member.ID == c.nodeID {
@@ -639,11 +663,29 @@ func (c *Core) readIndexExcluding(ctx context.Context, excluded NodeID) (Slot, N
 	}
 	var best result
 	successes := 0
+	logFailure := func(reason string) {
+		log.Printf("read-index failed reason=%s node_hash=%x excluded_hash=%x requested_config=%d current_config=%d required=%d actual=%d completed=%d participants=%d context_done=%t", reason, sha256.Sum256([]byte(c.nodeID)), sha256.Sum256([]byte(excluded)), cluster.ConfigID, c.ConfigID(), cluster.QuorumSize(), successes, len(observed), len(cluster.Members), ctx.Err() != nil)
+		for _, item := range observed {
+			phase := "none"
+			var diagnostic interface{ RPCPhase() string }
+			if errors.As(item.err, &diagnostic) {
+				phase = diagnostic.RPCPhase()
+			}
+			log.Printf("read-index participant node_hash=%x peer_hash=%x requested_config=%d excluded=%t success=%t tip=%d error_type=%T quorum_unavailable=%t canceled=%t deadline=%t rpc_phase=%s", sha256.Sum256([]byte(c.nodeID)), sha256.Sum256([]byte(item.id)), cluster.ConfigID, item.id == excluded, item.err == nil, item.tip, item.err, errors.Is(item.err, ErrQuorumUnavailable), errors.Is(item.err, context.Canceled), errors.Is(item.err, context.DeadlineExceeded), phase)
+		}
+		for _, member := range cluster.Members {
+			if !slices.ContainsFunc(observed, func(item result) bool { return item.id == member.ID }) {
+				log.Printf("read-index participant node_hash=%x peer_hash=%x requested_config=%d pending=true excluded=%t", sha256.Sum256([]byte(c.nodeID)), sha256.Sum256([]byte(member.ID)), cluster.ConfigID, member.ID == excluded)
+			}
+		}
+	}
 	for completed := 0; completed < len(cluster.Members); completed++ {
 		select {
 		case <-ctx.Done():
+			logFailure("context")
 			return 0, "", ctx.Err()
 		case item := <-results:
+			observed = append(observed, item)
 			if item.err != nil {
 				continue
 			}
@@ -656,6 +698,7 @@ func (c *Core) readIndexExcluding(ctx context.Context, excluded NodeID) (Slot, N
 			}
 		}
 	}
+	logFailure("results-exhausted")
 	return 0, "", ErrQuorumUnavailable
 }
 
@@ -687,12 +730,13 @@ func (c *Core) reserveSlot() (Slot, bool) {
 	defer c.mu.RUnlock()
 	for len(c.vacant) > 0 {
 		slot := c.vacant[0]
-		c.vacant = c.vacant[1:]
 		if slot > c.floor {
 			if _, decided := c.decided[slot]; !decided {
+				c.vacant = c.vacant[1:]
 				return slot, true
 			}
 		}
+		c.vacant = c.vacant[1:]
 	}
 	next := c.tip + 1
 	if floorNext := c.floor + 1; next < floorNext {
@@ -857,6 +901,13 @@ func (c *Core) checkpointEpochLocked(index Slot) (uint64, Slot, uint64) {
 func (c *Core) validateCheckpointLeaderOrders(index Slot, next, following []NodeID) bool {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
+	return c.validateCheckpointLeaderOrdersLocked(index, next, following)
+}
+
+// validateCheckpointLeaderOrdersLocked validates the same historical schedule
+// for callers that already hold c.mu. Keeping this separate avoids recursive
+// RWMutex reads, which can deadlock when a writer queues between acquisitions.
+func (c *Core) validateCheckpointLeaderOrdersLocked(index Slot, next, following []NodeID) bool {
 	cluster := c.clusterForSlotLocked(index + 1)
 	if !validateLeaderSchedule(cluster, next) {
 		return false
@@ -1344,6 +1395,10 @@ func (c *Core) recordLocalOwned(ctx context.Context, request RecordRequest) (Sum
 			return Summary{}, err
 		}
 	}
+	if err := c.checkCheckpointRecordEligibilityLocked(request.Proposal.Hash); err != nil {
+		c.mu.Unlock()
+		return Summary{}, err
+	}
 	if c.recordBeforeAppend != nil {
 		c.recordBeforeAppend()
 	}
@@ -1436,13 +1491,13 @@ func (c *Core) record(ctx context.Context, request RecordRequest) (Summary, erro
 	if err := c.rejectCompacted(request.Slot); err != nil {
 		return Summary{}, err
 	}
-	if len(request.Proposal.Value) != 0 && len(request.Proposal.Value) <= MaxReplicatedValueBytes {
+	if len(request.Proposal.Value) != 0 {
+		if err := c.checkValue(request.Proposal.Value); err != nil {
+			return Summary{}, err
+		}
 		if err := c.stageValue(request.Proposal.Hash, request.Proposal.Value); err != nil {
 			return Summary{}, err
 		}
-	}
-	if err := c.validateCheckpointValue(ctx, request.Proposal.Hash); err != nil {
-		return Summary{}, err
 	}
 	if !c.reconfigEnabled && len(request.Proposal.Value) == 0 {
 		c.mu.RLock()
@@ -1454,100 +1509,159 @@ func (c *Core) record(ctx context.Context, request RecordRequest) (Summary, erro
 			return Summary{}, fmt.Errorf("reconfiguration control is disabled")
 		}
 	}
+	checkpointValidated := false
+	var managedCandidate *ManagedCheckpointCandidate
+	if c.managedAppendOnly != nil {
+		value := request.Proposal.Value
+		if len(value) == 0 {
+			value, _ = c.stagedValue(request.Proposal.Hash)
+		}
+		if len(value) == 0 {
+			c.mu.RLock()
+			if decided, exists := c.decided[request.Slot]; exists && decided.Hash == request.Proposal.Hash {
+				value = bytes.Clone(decided.Value)
+			}
+			c.mu.RUnlock()
+		}
+		if len(value) == 0 {
+			return Summary{}, ErrManagedAppendOnlyCandidateBytesUnavailable
+		}
+		seal, isCheckpoint, err := DecodeCheckpointSeal(value)
+		if err != nil {
+			return Summary{}, err
+		}
+		if isCheckpoint {
+			candidate := ManagedCheckpointCandidate{Value: bytes.Clone(value), Hash: request.Proposal.Hash, Seal: seal, DecisionSlot: request.Slot, ConfigID: request.ConfigID}
+			if err := c.ValidateManagedCheckpointCandidate(ctx, candidate); err != nil {
+				return Summary{}, err
+			}
+			managedCandidate = &candidate
+		}
+	}
 	lock := &c.recordLocks[uint64(request.Slot)%uint64(len(c.recordLocks))]
 	lock.Lock()
 	defer lock.Unlock()
 	if c.recordBeforeAppend != nil {
 		c.recordBeforeAppend()
 	}
-	c.mu.Lock()
-	if err := c.compactedErrorLocked(request.Slot); err != nil {
-		c.mu.Unlock()
-		return Summary{}, err
-	}
-	if c.reconfigEnabled {
-		cluster := c.clusterForSlotLocked(request.Slot)
-		if request.ConfigID != cluster.ConfigID {
+	for {
+		c.mu.Lock()
+		if err := c.compactedErrorLocked(request.Slot); err != nil {
 			c.mu.Unlock()
-			return Summary{}, fmt.Errorf("record config ID changed while request waited")
+			return Summary{}, err
 		}
-		if !c.voterForClusterLocked(cluster) {
-			c.mu.Unlock()
-			return Summary{}, ErrQuorumUnavailable
-		}
-		if request.Slot > c.tip+16 {
-			c.mu.Unlock()
-			return Summary{}, fmt.Errorf("record slot exceeds bounded reconfiguration pipeline")
-		}
-		controlValue := c.values[request.Proposal.Hash]
-		control, isControl, decodeErr := decodeReconfiguration(controlValue)
-		_, alreadyDecided := c.decided[request.Slot]
-		if decodeErr != nil {
-			c.mu.Unlock()
-			return Summary{}, decodeErr
-		}
-		if isControl && !control.Terminal && (c.reconfiguration == nil || request.Slot == c.reconfiguration.freeze) && c.highestKnownSlotLocked() >= control.TerminalSlot {
-			promised := false
-			if existing, ok := c.decided[request.Slot]; ok && existing.Hash == request.Proposal.Hash {
-				if certified, err := decodeDecision(existing.Certificate); err == nil {
-					for _, summary := range certified.Summaries {
-						promised = promised || summary.RecorderID == c.nodeID && summary.ReconfigurationID == existing.Hash
+		if c.reconfigEnabled {
+			cluster := c.clusterForSlotLocked(request.Slot)
+			if request.ConfigID != cluster.ConfigID {
+				c.mu.Unlock()
+				return Summary{}, fmt.Errorf("record config ID changed while request waited")
+			}
+			if !c.voterForClusterLocked(cluster) {
+				c.mu.Unlock()
+				return Summary{}, ErrQuorumUnavailable
+			}
+			if request.Slot > c.tip+16 {
+				c.mu.Unlock()
+				return Summary{}, fmt.Errorf("record slot exceeds bounded reconfiguration pipeline")
+			}
+			controlValue := c.values[request.Proposal.Hash]
+			control, isControl, decodeErr := decodeReconfiguration(controlValue)
+			_, alreadyDecided := c.decided[request.Slot]
+			if decodeErr != nil {
+				c.mu.Unlock()
+				return Summary{}, decodeErr
+			}
+			if isControl && !control.Terminal && (c.reconfiguration == nil || request.Slot == c.reconfiguration.freeze) && c.highestKnownSlotLocked() >= control.TerminalSlot {
+				promised := false
+				if existing, ok := c.decided[request.Slot]; ok && existing.Hash == request.Proposal.Hash {
+					if certified, err := decodeDecision(existing.Certificate); err == nil {
+						for _, summary := range certified.Summaries {
+							promised = promised || summary.RecorderID == c.nodeID && summary.ReconfigurationID == existing.Hash
+						}
 					}
 				}
-			}
-			if !promised {
-				c.mu.Unlock()
-				return Summary{}, fmt.Errorf("recorder has no bounded promise before its legacy terminal state")
-			}
-		}
-		if isControl && !control.Terminal && c.reconfiguration == nil {
-			if err := c.validateReconfigurationSlotsLocked(control.Freeze, control.TerminalSlot); err != nil && request.Slot == c.tip+1 {
-				c.mu.Unlock()
-				return Summary{}, err
-			}
-			if control.Freeze != request.Slot {
-				c.mu.Unlock()
-				return Summary{}, fmt.Errorf("freeze control slot mismatch")
-			}
-			if err := validateReconfigurationTarget(cluster, control.Target, c.retiredIDs); err != nil {
-				c.mu.Unlock()
-				return Summary{}, err
-			}
-			if c.tip >= request.Slot-1 && c.prefixes[request.Slot-1] != control.PrefixHash {
-				c.mu.Unlock()
-				return Summary{}, fmt.Errorf("freeze prefix mismatch")
-			}
-		}
-		if state := c.reconfiguration; state != nil {
-			if isControl && control.Terminal && !alreadyDecided {
-				prior := c.recorders[request.Slot]
-				for _, proposal := range []*Proposal{prior.FirstCurrent, prior.AggregateCurrent, prior.AggregatePrior} {
-					if proposal != nil && proposal.Hash != request.Proposal.Hash {
-						c.mu.Unlock()
-						return Summary{}, fmt.Errorf("terminal recorder contains incompatible prior state")
-					}
+				if !promised {
+					c.mu.Unlock()
+					return Summary{}, fmt.Errorf("recorder has no bounded promise before its legacy terminal state")
 				}
 			}
-			if isControl && control.Terminal && !alreadyDecided && (request.Slot != state.terminal || c.tip != state.terminal-1 || control.Freeze != state.freeze || control.TerminalSlot != state.terminal || control.PrefixHash != c.prefixes[c.tip] || !sameCluster(control.Target, state.target)) {
-				c.mu.Unlock()
-				return Summary{}, fmt.Errorf("terminal control changed while request waited")
-			}
-			if request.Slot > state.terminal || (request.Slot > state.freeze && request.ReconfigurationID != state.id) {
-				c.mu.Unlock()
-				return Summary{}, fmt.Errorf("record is outside frozen reconfiguration drain")
-			}
-			controlValue := request.Proposal.Value
-			if len(controlValue) == 0 {
-				controlValue = c.values[request.Proposal.Hash]
-			}
-			if control, ok, err := decodeReconfiguration(controlValue); err != nil || (request.Slot == state.terminal && (!ok || !control.Terminal)) {
-				c.mu.Unlock()
-				if err != nil {
+			if isControl && !control.Terminal && c.reconfiguration == nil {
+				if err := c.validateReconfigurationSlotsLocked(control.Freeze, control.TerminalSlot); err != nil && request.Slot == c.tip+1 {
+					c.mu.Unlock()
 					return Summary{}, err
 				}
-				return Summary{}, fmt.Errorf("only terminal control may use frozen terminal slot")
+				if control.Freeze != request.Slot {
+					c.mu.Unlock()
+					return Summary{}, fmt.Errorf("freeze control slot mismatch")
+				}
+				if err := validateReconfigurationTarget(cluster, control.Target, c.retiredIDs); err != nil {
+					c.mu.Unlock()
+					return Summary{}, err
+				}
+				if c.tip >= request.Slot-1 && c.prefixes[request.Slot-1] != control.PrefixHash {
+					c.mu.Unlock()
+					return Summary{}, fmt.Errorf("freeze prefix mismatch")
+				}
+			}
+			if state := c.reconfiguration; state != nil {
+				if isControl && control.Terminal && !alreadyDecided {
+					prior := c.recorders[request.Slot]
+					for _, proposal := range []*Proposal{prior.FirstCurrent, prior.AggregateCurrent, prior.AggregatePrior} {
+						if proposal != nil && proposal.Hash != request.Proposal.Hash {
+							c.mu.Unlock()
+							return Summary{}, fmt.Errorf("terminal recorder contains incompatible prior state")
+						}
+					}
+				}
+				if isControl && control.Terminal && !alreadyDecided && (request.Slot != state.terminal || c.tip != state.terminal-1 || control.Freeze != state.freeze || control.TerminalSlot != state.terminal || control.PrefixHash != c.prefixes[c.tip] || !sameCluster(control.Target, state.target)) {
+					c.mu.Unlock()
+					return Summary{}, fmt.Errorf("terminal control changed while request waited")
+				}
+				if request.Slot > state.terminal || (request.Slot > state.freeze && request.ReconfigurationID != state.id) {
+					c.mu.Unlock()
+					return Summary{}, fmt.Errorf("record is outside frozen reconfiguration drain")
+				}
+				controlValue := request.Proposal.Value
+				if len(controlValue) == 0 {
+					controlValue = c.values[request.Proposal.Hash]
+				}
+				if control, ok, err := decodeReconfiguration(controlValue); err != nil || (request.Slot == state.terminal && (!ok || !control.Terminal)) {
+					c.mu.Unlock()
+					if err != nil {
+						return Summary{}, err
+					}
+					return Summary{}, fmt.Errorf("only terminal control may use frozen terminal slot")
+				}
 			}
 		}
+		// Only an explicit, exact redelivery of this immutable certified value
+		// may avoid today's preparation eligibility. Keep the actual slot lock
+		// and repeat mutable guards after releasing mu for fallback validation.
+		decided, exists := c.decided[request.Slot]
+		exactCertified := exists && len(request.Proposal.Value) != 0 && decided.Hash == request.Proposal.Hash && bytes.Equal(decided.Value, request.Proposal.Value)
+		if managedCandidate != nil {
+			if err := c.checkManagedCheckpointRecordEligibilityLocked(*managedCandidate); err != nil {
+				c.mu.Unlock()
+				return Summary{}, err
+			}
+			break
+		}
+		if checkpointValidated {
+			if err := c.checkCheckpointRecordEligibilityLocked(request.Proposal.Hash); err != nil {
+				c.mu.Unlock()
+				return Summary{}, err
+			}
+			break
+		}
+		if exactCertified {
+			break
+		}
+		c.mu.Unlock()
+		if err := c.validateCheckpointValue(ctx, request.Proposal.Hash); err != nil {
+			return Summary{}, err
+		}
+		checkpointValidated = true
+		localtesthooks.Hit("core:after-checkpoint-record-validation")
 	}
 	if decided, ok := c.decided[request.Slot]; ok {
 		needsSync := !c.durable[request.Slot]
@@ -1739,6 +1853,166 @@ func (c *Core) checkpointIdentityWithLag(seal CheckpointSeal) (bool, func(contex
 	return false, validator, false, nil
 }
 
+// checkCheckpointRecordEligibilityLocked repeats only the local identity and
+// fence checks needed at the receipt-append linearization point. Full object
+// and membership-proof validation remains outside c.mu in validateCheckpointValue.
+func (c *Core) checkCheckpointRecordEligibilityLocked(hash ValueHash) error {
+	value, ok := c.values[hash]
+	if !ok {
+		return fmt.Errorf("proposal value is unavailable")
+	}
+	seal, checkpoint, err := DecodeCheckpointSeal(value)
+	if err != nil || !checkpoint {
+		return err
+	}
+	if err := c.checkCheckpointIdentityLocked(seal); err != nil {
+		return err
+	}
+	preparedIndex, preparedRoot, prepared := c.latestPreparedCheckpointLocked()
+	if prepared && seal.Index < preparedIndex {
+		return fmt.Errorf("checkpoint index %d is below prepared fence %d", seal.Index, preparedIndex)
+	}
+	if prepared && seal.Index == preparedIndex && preparedRoot != seal.RootHash {
+		return fmt.Errorf("checkpoint index %d is already prepared with another root", seal.Index)
+	}
+	for index, pending := range c.pendingPrepares {
+		if index > seal.Index || index == seal.Index && pending.identity != hash {
+			return fmt.Errorf("%w: checkpoint record is below an unresolved prepared candidate", ErrCheckpointPreparePending)
+		}
+		if index == seal.Index {
+			return fmt.Errorf("%w: checkpoint candidate marker is not yet durable", ErrCheckpointPreparePending)
+		}
+	}
+	return nil
+}
+
+// checkCheckpointIdentityLocked validates the immutable local history fields
+// under the caller's c.mu lock without invoking the object validator.
+func (c *Core) checkCheckpointIdentityLocked(seal CheckpointSeal) error {
+	if c.reconfigEnabled {
+		if c.reconfiguration != nil {
+			return fmt.Errorf("checkpoint membership is not stable during reconfiguration")
+		}
+	} else if seal.Membership != nil {
+		return fmt.Errorf("fixed-membership checkpoint includes membership history")
+	}
+	prefix, prefixOK := c.prefixes[seal.Index]
+	if seal.GenerationAnchorHash != c.generationAnchorHash || seal.ConfigID != c.clusterForSlotLocked(seal.Index+1).ConfigID || !prefixOK || prefix != seal.PrefixHash || c.tip < seal.Index {
+		return fmt.Errorf("checkpoint seal does not match local certified prefix")
+	}
+	next, following, err := c.checkpointLeaderOrdersLocked(seal.Index)
+	if err != nil || !slices.Equal(next, seal.NextLeaderOrder) || !slices.Equal(following, seal.FollowingLeaderOrder) {
+		return fmt.Errorf("checkpoint seal does not match local certified prefix")
+	}
+	if c.reconfigEnabled {
+		expected, err := c.membershipHistoryLocked(seal.Index)
+		if err != nil {
+			return fmt.Errorf("checkpoint membership is not stable during reconfiguration")
+		}
+		if seal.Membership == nil || !sameMembershipRecord(expected, *seal.Membership) {
+			return fmt.Errorf("checkpoint seal has stale membership history")
+		}
+	}
+	if _, err := c.checkpointMembershipForSeal(seal); err != nil {
+		return err
+	}
+	return nil
+}
+
+// pendingCheckpointSealLocked rejects undecided older checkpoint proposals
+// and returns actual older certificates whose decision markers must share the
+// candidate marker's Sync.
+func (c *Core) pendingCheckpointSealLocked(candidate CheckpointSeal) ([]SlotValue, error) {
+	candidateValue, err := EncodeCheckpointSeal(candidate)
+	if err != nil {
+		return nil, err
+	}
+	candidateHash := ValueHash(sha256.Sum256(candidateValue))
+	for slot, state := range c.recorders {
+		if _, decided := c.decided[slot]; decided {
+			continue
+		}
+		for _, proposal := range []*Proposal{state.FirstCurrent, state.AggregateCurrent, state.AggregatePrior} {
+			if proposal == nil {
+				continue
+			}
+			value, ok := c.values[proposal.Hash]
+			if !ok {
+				return nil, fmt.Errorf("%w: recorder proposal identity is unavailable", ErrCheckpointPreparePending)
+			}
+			pending, checkpoint, err := DecodeCheckpointSeal(value)
+			if err != nil {
+				return nil, fmt.Errorf("%w: recorder checkpoint identity is invalid", ErrCheckpointPreparePending)
+			}
+			if checkpoint && (pending.Index < candidate.Index || pending.Index == candidate.Index && proposal.Hash != candidateHash) {
+				return nil, fmt.Errorf("%w: an older checkpoint seal remains in an undecided recorder", ErrCheckpointPreparePending)
+			}
+		}
+	}
+	var pendingDurability []SlotValue
+	for slot, decision := range c.decided {
+		if c.durable[slot] {
+			continue
+		}
+		pending, checkpoint, err := DecodeCheckpointSeal(decision.Value)
+		if err != nil {
+			return nil, fmt.Errorf("%w: certified checkpoint identity is invalid", ErrCheckpointPreparePending)
+		}
+		if checkpoint && pending.Index == candidate.Index && decision.Hash != candidateHash {
+			return nil, fmt.Errorf("%w: a conflicting certified checkpoint exists at the candidate cut", ErrCheckpointPreparePending)
+		}
+		if checkpoint && (pending.Index < candidate.Index || pending.Index == candidate.Index && decision.Hash == candidateHash) {
+			if !c.logged[slot] {
+				if err := c.appendDecision(decision); err != nil {
+					return nil, err
+				}
+				c.markDecisionLoggedLocked(slot)
+			}
+			pendingDurability = append(pendingDurability, SlotValue{Slot: slot, Hash: decision.Hash})
+		}
+	}
+	return pendingDurability, nil
+}
+
+// validateRecoveredPreparedCheckpoint checks a durable marker against the
+// recovered history at its own cut. Unlike new prepare/record eligibility,
+// later transitions (including an incomplete freeze) do not rewrite history
+// before the marker's cut or make the marker current authority.
+func (c *Core) validateRecoveredPreparedCheckpoint(seal CheckpointSeal) error {
+	c.mu.RLock()
+	prefix, prefixOK := c.prefixes[seal.Index]
+	preparedIndex, preparedRoot, prepared := c.latestPreparedCheckpointLocked()
+	order, following, orderErr := c.checkpointLeaderOrdersLocked(seal.Index)
+	tip := c.tip
+	anchor := c.generationAnchorHash
+	configID := c.clusterForSlotLocked(seal.Index + 1).ConfigID
+	var expected MembershipRecord
+	var membershipErr error
+	if c.reconfigEnabled {
+		expected, membershipErr = c.checkpointMembershipAtLocked(seal.Index)
+	}
+	c.mu.RUnlock()
+	if membershipErr != nil {
+		return fmt.Errorf("checkpoint membership at recovered cut: %w", membershipErr)
+	}
+	if seal.GenerationAnchorHash != anchor || seal.ConfigID != configID || !prefixOK || prefix != seal.PrefixHash || tip < seal.Index || orderErr != nil || !slices.Equal(order, seal.NextLeaderOrder) || !slices.Equal(following, seal.FollowingLeaderOrder) {
+		return fmt.Errorf("checkpoint marker does not match recovered historical cut")
+	}
+	if c.reconfigEnabled && (seal.Membership == nil || !sameMembershipRecord(expected, *seal.Membership)) {
+		return fmt.Errorf("checkpoint marker membership differs from recovered historical cut")
+	}
+	if _, err := c.checkpointMembershipForSeal(seal); err != nil {
+		return err
+	}
+	if prepared && seal.Index < preparedIndex {
+		return fmt.Errorf("checkpoint index %d is below prepared fence %d", seal.Index, preparedIndex)
+	}
+	if prepared && seal.Index == preparedIndex && preparedRoot != seal.RootHash {
+		return fmt.Errorf("checkpoint index %d is already prepared with another root", seal.Index)
+	}
+	return nil
+}
+
 // RequirePreparedCheckpoint is the bounded Record-path check. Full object
 // verification happens before consensus through PrepareCheckpoint.
 func (c *Core) RequirePreparedCheckpoint(seal CheckpointSeal) error {
@@ -1771,6 +2045,33 @@ func (c *Core) prepareCheckpointOwned(ctx context.Context, seal CheckpointSeal) 
 func (c *Core) prepareCheckpointOwnedWithAdmission(ctx context.Context, seal CheckpointSeal, admission bool) error {
 	c.checkpointMu.Lock()
 	defer c.checkpointMu.Unlock()
+	payload, err := EncodeCheckpointSeal(seal)
+	if err != nil {
+		return err
+	}
+	identity := ValueHash(sha256.Sum256(payload))
+	for {
+		c.mu.RLock()
+		var previousIndex Slot
+		var previous *pendingCheckpointPrepare
+		for index, pending := range c.pendingPrepares {
+			copy := pending
+			copy.durable = append([]SlotValue(nil), pending.durable...)
+			previousIndex, previous = index, &copy
+			break
+		}
+		c.mu.RUnlock()
+		if previous == nil {
+			break
+		}
+		pendingSeal := CheckpointSeal{Index: previousIndex, RootHash: previous.root}
+		if previousIndex == seal.Index && previous.identity == identity {
+			return c.finishPendingCheckpointPrepare(ctx, pendingSeal, identity, previous.durable)
+		}
+		if err := c.finishPendingCheckpointPrepare(ctx, pendingSeal, previous.identity, previous.durable); err != nil {
+			return fmt.Errorf("%w: prior candidate marker durability is unresolved: %w", ErrCheckpointPreparePending, err)
+		}
+	}
 	verified, validator, err := c.checkpointIdentity(seal)
 	if err != nil {
 		return err
@@ -1780,10 +2081,6 @@ func (c *Core) prepareCheckpointOwnedWithAdmission(ctx context.Context, seal Che
 	}
 	if validator == nil {
 		return fmt.Errorf("checkpoint validation is unavailable")
-	}
-	payload, err := EncodeCheckpointSeal(seal)
-	if err != nil {
-		return err
 	}
 	if c.localMode && admission {
 		if err := c.localValidateDecisionPrefixOwned(seal.Index); err != nil {
@@ -1809,9 +2106,62 @@ func (c *Core) prepareCheckpointOwnedWithAdmission(ctx context.Context, seal Che
 	if err != nil {
 		return err
 	}
-	if err := c.wal.Append(qlog.Entry{Slot: uint64(seal.Index), Hash: seal.RootHash, Type: qlog.EntryCheckpointVerified, Payload: payload}); err != nil {
+	if err := ctx.Err(); err != nil {
 		return err
 	}
+	c.mu.Lock()
+	if err := c.checkCheckpointIdentityLocked(seal); err != nil {
+		c.mu.Unlock()
+		return err
+	}
+	if preparedIndex, preparedRoot, prepared := c.latestPreparedCheckpointLocked(); prepared && seal.Index < preparedIndex {
+		c.mu.Unlock()
+		return fmt.Errorf("checkpoint index %d is below prepared fence %d", seal.Index, preparedIndex)
+	} else if prepared && seal.Index == preparedIndex && preparedRoot != seal.RootHash {
+		c.mu.Unlock()
+		return fmt.Errorf("checkpoint index %d is already prepared with another root", seal.Index)
+	}
+	if len(c.pendingPrepares) != 0 {
+		c.mu.Unlock()
+		return fmt.Errorf("%w: another prepared candidate has unresolved marker durability", ErrCheckpointPreparePending)
+	}
+	extra, err := c.pendingCheckpointSealLocked(seal)
+	if err != nil {
+		c.mu.Unlock()
+		return err
+	}
+	if c.localMode && len(extra) != 0 {
+		c.mu.Unlock()
+		return fmt.Errorf("%w: local checkpoint prepare found an undurable certified seal", ErrCheckpointPreparePending)
+	}
+	pending = mergePendingSlotValues(pending, extra)
+	marker := qlog.Entry{Slot: uint64(seal.Index), Hash: seal.RootHash, Type: qlog.EntryCheckpointVerified, Payload: payload}
+	if err := c.wal.Append(marker); err != nil {
+		c.mu.Unlock()
+		return err
+	}
+	c.pendingPrepares[seal.Index] = pendingCheckpointPrepare{identity: identity, root: seal.RootHash, durable: append([]SlotValue(nil), pending...)}
+	c.mu.Unlock()
+	return c.finishPendingCheckpointPrepare(ctx, seal, identity, pending)
+}
+
+func mergePendingSlotValues(prefix, extra []SlotValue) []SlotValue {
+	bySlot := make(map[Slot]ValueHash, len(prefix)+len(extra))
+	for _, value := range prefix {
+		bySlot[value.Slot] = value.Hash
+	}
+	for _, value := range extra {
+		bySlot[value.Slot] = value.Hash
+	}
+	merged := make([]SlotValue, 0, len(bySlot))
+	for slot, hash := range bySlot {
+		merged = append(merged, SlotValue{Slot: slot, Hash: hash})
+	}
+	sort.Slice(merged, func(i, j int) bool { return merged[i].Slot < merged[j].Slot })
+	return merged
+}
+
+func (c *Core) finishPendingCheckpointPrepare(ctx context.Context, seal CheckpointSeal, identity ValueHash, durable []SlotValue) error {
 	if err := c.commits.Sync(ctx); err != nil {
 		return err
 	}
@@ -1821,21 +2171,27 @@ func (c *Core) prepareCheckpointOwnedWithAdmission(ctx context.Context, seal Che
 		localtesthooks.Hit("core:after-prepared-marker-sync-before-seal")
 	}
 	c.mu.Lock()
-	for _, value := range pending {
-		if decided, ok := c.decided[value.Slot]; ok && decided.Hash == value.Hash {
+	pending, ok := c.pendingPrepares[seal.Index]
+	if !ok || pending.identity != identity || pending.root != seal.RootHash {
+		c.mu.Unlock()
+		return fmt.Errorf("%w: prepared candidate identity changed before durable acknowledgement", ErrCheckpointPreparePending)
+	}
+	for _, value := range durable {
+		if decided, exists := c.decided[value.Slot]; exists && decided.Hash == value.Hash {
 			c.durable[value.Slot] = true
 			c.valueDurable[value.Hash] = true
 		}
 	}
 	clear(c.preparedCheckpoints)
 	c.preparedCheckpoints[seal.Index] = seal.RootHash
+	delete(c.pendingPrepares, seal.Index)
 	c.mu.Unlock()
 	return nil
 }
 
 func (c *Core) appendUndurablePrefix(ctx context.Context, through Slot) ([]SlotValue, error) {
 	c.mu.RLock()
-	floor := c.floor
+	floor := max(c.floor, c.durableThrough)
 	c.mu.RUnlock()
 	pending := make([]SlotValue, 0)
 	if floor >= through {
@@ -1990,17 +2346,21 @@ func (c *Core) ensureDurableThroughOwned(ctx context.Context, through Slot) erro
 	if err := ctx.Err(); err != nil {
 		return err
 	}
-	// ponytail: scans the retained prefix; add a durable watermark if long WALs
-	// make repeated catch-up checks costly.
+	c.mu.RLock()
+	floor, root := c.floor, c.floorRoot
+	c.mu.RUnlock()
 	pending, err := c.appendUndurablePrefix(ctx, through)
 	if err != nil {
 		return err
 	}
 	if len(pending) == 0 {
-		return ctx.Err()
-	}
-	if err := c.commits.Sync(ctx); err != nil {
-		return err
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+	} else {
+		if err := c.commits.syncBatch(ctx, !c.localMode); err != nil {
+			return err
+		}
 	}
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -2009,6 +2369,20 @@ func (c *Core) ensureDurableThroughOwned(ctx context.Context, through Slot) erro
 			c.durable[value.Slot] = true
 			c.valueDurable[value.Hash] = true
 		}
+	}
+	// A base change owns its own frontier reset. Never extend an old scan's
+	// frontier across it, even when the old sync completed successfully.
+	if c.floor == floor && c.floorRoot == root {
+		for c.durableThrough < through {
+			next := c.durableThrough + 1
+			if _, ok := c.decided[next]; !ok || !c.logged[next] || !c.durable[next] {
+				break
+			}
+			c.durableThrough = next
+		}
+	}
+	if len(pending) == 0 {
+		return ctx.Err()
 	}
 	return nil
 }
@@ -2403,11 +2777,15 @@ func (c *Core) recoverThroughOwnedAdmitted(ctx context.Context, through Slot) er
 	case <-ctx.Done():
 		return ctx.Err()
 	}
-	for c.Tip() < through {
+	for {
+		tip := c.Tip()
+		if tip >= through {
+			return nil
+		}
 		if err := ctx.Err(); err != nil {
 			return err
 		}
-		slot := c.Tip() + 1
+		slot := tip + 1
 		var decision Decision
 		if decided, ok := c.decision(slot); ok {
 			var err error
@@ -2438,7 +2816,6 @@ func (c *Core) recoverThroughOwnedAdmitted(ctx context.Context, through Slot) er
 			return fmt.Errorf("recover slot %d made no checked prefix progress", slot)
 		}
 	}
-	return nil
 }
 
 func (c *Core) acquireLocalExecution(ctx context.Context) error {
@@ -2589,6 +2966,9 @@ func (c *Core) validateFreezeBindingLocked(decision Decision) error {
 }
 
 func (c *Core) validateDecisionForRecovery(decision Decision, allowMissingLeader bool) error {
+	if err := c.checkValue(decision.Proposal.Value); err != nil {
+		return err
+	}
 	if decision.Slot == 0 || sha256.Sum256(decision.Proposal.Value) != decision.Proposal.Hash {
 		return fmt.Errorf("invalid QuePaxa decision value")
 	}
@@ -3125,6 +3505,9 @@ func (c *Core) WaitTip(ctx context.Context, slot Slot) error {
 		}
 		changed := c.tipChanged
 		c.mu.RUnlock()
+		if localtesthooks.Enabled {
+			localtesthooks.Hit("core:wait-tip:waiting")
+		}
 		select {
 		case <-ctx.Done():
 			return ctx.Err()
@@ -3161,6 +3544,7 @@ func (c *Core) IsQuorum(receipts []Receipt) bool {
 
 func (c *Core) recover() error {
 	var prepared []CheckpointSeal
+	var previousManagedMarker *CheckpointSeal
 	if err := c.wal.Scan(func(entry qlog.Entry) error {
 		switch entry.Type {
 		case qlog.EntryCheckpoint:
@@ -3191,14 +3575,28 @@ func (c *Core) recover() error {
 			if decodeErr == nil && checkpoint {
 				_, decodeErr = c.checkpointMembershipForSeal(seal)
 			}
-			if decodeErr != nil || !checkpoint || uint64(seal.Index) != entry.Slot || seal.RootHash != entry.Hash || seal.ConfigID != c.ConfigID() || !c.validateCheckpointLeaderOrders(seal.Index, seal.NextLeaderOrder, seal.FollowingLeaderOrder) {
+			// The marker's wire identity is checked in WAL order here. Epoch,
+			// membership and leader-order checks depend on certified membership
+			// history, which is replayed only after this scan; validate local
+			// recovered-cut consistency below at the marker's own cut.
+			if decodeErr != nil || !checkpoint || uint64(seal.Index) != entry.Slot || seal.RootHash != entry.Hash {
 				if decodeErr == nil {
 					decodeErr = fmt.Errorf("checkpoint verification identity mismatch")
 				}
 				return fmt.Errorf("recover verified checkpoint: %w", decodeErr)
 			}
+			if c.managedAppendOnly != nil {
+				if previousManagedMarker != nil && (seal.Index < previousManagedMarker.Index || seal.Index == previousManagedMarker.Index && seal.RootHash != previousManagedMarker.RootHash) {
+					return fmt.Errorf("recover verified checkpoint: managed marker ordering or identity regressed")
+				}
+				copy := seal
+				previousManagedMarker = &copy
+			}
 			prepared = append(prepared, seal)
 		case qlog.EntryProposal:
+			if err := c.checkValue(entry.Payload); err != nil {
+				return fmt.Errorf("recover QuePaxa proposal: %w", err)
+			}
 			if len(entry.Payload) == 0 || sha256.Sum256(entry.Payload) != entry.Hash {
 				return fmt.Errorf("recover QuePaxa value identity mismatch")
 			}
@@ -3208,6 +3606,13 @@ func (c *Core) recover() error {
 			persisted, err := decodeRecorderEntry(entry.Payload)
 			if err != nil {
 				return fmt.Errorf("recover QuePaxa ISR: %w", err)
+			}
+			for _, proposal := range []*Proposal{persisted.State.FirstCurrent, persisted.State.AggregateCurrent, persisted.State.AggregatePrior} {
+				if proposal != nil && len(proposal.Value) != 0 {
+					if err := c.checkValue(proposal.Value); err != nil {
+						return fmt.Errorf("recover QuePaxa ISR value: %w", err)
+					}
+				}
 			}
 			if persisted.Reconfiguration && !c.reconfigEnabled {
 				return fmt.Errorf("recover QuePaxa ISR: WAL requires reconfiguration protocol")
@@ -3314,17 +3719,19 @@ func (c *Core) recover() error {
 		c.advanceTipLocked()
 		c.mu.Unlock()
 	}
-	for _, seal := range prepared {
-		if _, _, err := c.checkpointIdentity(seal); err != nil {
-			return fmt.Errorf("recover verified checkpoint: %w", err)
-		}
-		c.mu.Lock()
-		if root, exists := c.preparedCheckpoints[seal.Index]; exists && root != seal.RootHash {
+	if c.managedAppendOnly == nil {
+		for _, seal := range prepared {
+			if err := c.validateRecoveredPreparedCheckpoint(seal); err != nil {
+				return fmt.Errorf("recover verified checkpoint: %w", err)
+			}
+			c.mu.Lock()
+			if root, exists := c.preparedCheckpoints[seal.Index]; exists && root != seal.RootHash {
+				c.mu.Unlock()
+				return fmt.Errorf("recover verified checkpoint: conflicting roots at index %d", seal.Index)
+			}
+			c.preparedCheckpoints[seal.Index] = seal.RootHash
 			c.mu.Unlock()
-			return fmt.Errorf("recover verified checkpoint: conflicting roots at index %d", seal.Index)
 		}
-		c.preparedCheckpoints[seal.Index] = seal.RootHash
-		c.mu.Unlock()
 	}
 	if c.reconfigEnabled {
 		c.mu.Lock()

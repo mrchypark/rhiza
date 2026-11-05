@@ -27,6 +27,10 @@ type Config struct {
 	// share the WAL while Core is active. Close it only after Core has stopped.
 	WAL       *qlog.WAL
 	Transport Transport
+	// ValidateValue is fixed by trusted startup before WAL recovery. Nil keeps
+	// the legacy 128KiB contract. An explicit profile validator may recognize
+	// its own bounded larger frame, but must preserve old control limits.
+	ValidateValue func([]byte) error
 	// EnableReconfiguration opts into the bounded, in-band prototype. It is
 	// deliberately off by default while checkpoint snapshots lack certified
 	// membership state.
@@ -34,6 +38,9 @@ type Config struct {
 	// ReconfigurationAdmission must approve every added voter after it has
 	// caught up durably. A nil callback rejects additions.
 	ReconfigurationAdmission func(context.Context, Cluster, Slot, [32]byte) error
+	// ManagedAppendOnly fixes the V1 managed checkpoint policy at construction.
+	// Nil preserves the legacy and Local checkpoint protocols.
+	ManagedAppendOnly *ManagedAppendOnlyConfig
 }
 
 // New validates and creates a QuePaxa core.
@@ -59,6 +66,9 @@ func installReconfigurationMarker(appendMarker, syncWAL func() error) error {
 }
 
 func newCoreFromConfig(config Config, observer, learner, localReadOnlyInspection bool) (*Core, error) {
+	if config.LocalMode && config.ValidateValue != nil {
+		return nil, fmt.Errorf("%w: Local value limits cannot be overridden", ErrInvalidConfig)
+	}
 	if config.NodeID == "" {
 		return nil, fmt.Errorf("%w: node ID is required", ErrInvalidConfig)
 	}
@@ -117,9 +127,15 @@ func newCoreFromConfig(config Config, observer, learner, localReadOnlyInspection
 	if len(config.Cluster.Members) > 1 && config.Transport == nil && !observer {
 		return nil, fmt.Errorf("%w: transport is required for multiple members", ErrInvalidConfig)
 	}
+	managedAppendOnly, err := validateManagedAppendOnlyConfig(config.ManagedAppendOnly, config.WAL, config.NodeID, localMember, config.LocalMode, learner)
+	if err != nil {
+		return nil, fmt.Errorf("%w: managed append-only binding: %w", ErrInvalidConfig, err)
+	}
 	cluster := config.Cluster
 	cluster.Members = append([]Member(nil), config.Cluster.Members...)
 	core := newCore(config.NodeID, &cluster, config.WAL, config.Transport)
+	core.validateValue = config.ValidateValue
+	core.managedAppendOnly = managedAppendOnly
 	core.localMode = config.LocalMode
 	core.localCost = localCost
 	core.observer = observer

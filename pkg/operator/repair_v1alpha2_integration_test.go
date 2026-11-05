@@ -21,7 +21,9 @@ import (
 	"testing"
 	"time"
 
+	objectstore "github.com/mrchypark/rhiza/internal/objstore"
 	"github.com/mrchypark/rhiza/internal/types"
+	"github.com/mrchypark/rhiza/pkg/network"
 	"github.com/mrchypark/rhiza/pkg/quepaxa"
 	"gopkg.in/yaml.v3"
 )
@@ -350,7 +352,7 @@ func TestRepairDiagnosticPreservesBodyReadError(t *testing.T) {
 }
 
 func TestRepairDiagnosticAllowlistedCause(t *testing.T) {
-	body := `{"reason":"Invalid","details":{"causes":[{"reason":"FieldValueInvalid","field":"status.repair.plan.replacement.publicKey","message":"private-value"},{"reason":"secret-type","field":"status.repair.secret-field","message":"private-value"}]}}`
+	body := `{"reason":"Invalid","details":{"causes":[{"reason":"FieldValueInvalid","field":"status.repair.plan.replacement.publicKey","message":"private-value"},{"reason":"secret-type","field":"status.repair.secret-field","message":"private-value"},{"reason":"FieldValueInvalid","field":"status.repair.preparedHandoff.preparedConfig.members[0].wal_identity","message":"private-value"},{"reason":"FieldValueInvalid","field":"status.repair","message":"Invalid value: PRIVATE_RESOURCE: ADD-first prepared source must bind the current roster and exact old WAL"}]}}`
 	var log string
 	d := repairDiagnosticTransport{base: repairDiagnosticRoundTrip(func(*http.Request) (*http.Response, error) {
 		return &http.Response{StatusCode: 422, Body: io.NopCloser(strings.NewReader(body))}, nil
@@ -370,7 +372,7 @@ func TestRepairDiagnosticAllowlistedCause(t *testing.T) {
 	if err := resp.Body.Close(); err != nil {
 		t.Fatal(err)
 	}
-	if string(got) != body || !strings.Contains(log, "status.repair.plan.replacement.publicKey:FieldValueInvalid") || !strings.Contains(log, "other:other") || strings.Contains(log, "private-value") || strings.Contains(log, "secret-field") || strings.Contains(log, "secret-type") {
+	if string(got) != body || !strings.Contains(log, "status.repair.plan.replacement.publicKey:FieldValueInvalid") || !strings.Contains(log, "status.repair.preparedHandoff.preparedConfig.members[0].wal_identity:FieldValueInvalid") || !strings.Contains(log, "ADD-first prepared source must bind the current roster and exact old WAL") || !strings.Contains(log, "other:other") || strings.Contains(log, "private-value") || strings.Contains(log, "PRIVATE_RESOURCE") || strings.Contains(log, "secret-field") || strings.Contains(log, "secret-type") {
 		t.Fatalf("unsafe or missing cause diagnostic: %q", log)
 	}
 }
@@ -585,6 +587,13 @@ func (d repairDiagnosticTransport) RoundTrip(req *http.Request) (*http.Response,
 				field = allowed
 			}
 		}
+		// Fixed fields of this two-member administrative source fixture only;
+		// arbitrary API field paths and resource values are never logged.
+		for _, allowed := range []string{"status.repair.preparedHandoff", "status.repair.preparedHandoff.preparedConfig", "status.repair.preparedHandoff.preparedSlot", "status.repair.preparedHandoff.preparedHash", "status.repair.preparedHandoff.preparedConfig.members[0].wal_identity", "status.repair.preparedHandoff.preparedConfig.members[1].wal_identity"} {
+			if cause.Field == allowed {
+				field = allowed
+			}
+		}
 		causeType := "other"
 		for _, allowed := range []string{"FieldValueInvalid", "FieldValueRequired", "FieldValueNotSupported", "FieldValueDuplicate", "FieldValueTooLong", "FieldValueTooMany", "UnexpectedServerResponse"} {
 			if cause.Type == allowed {
@@ -592,9 +601,9 @@ func (d repairDiagnosticTransport) RoundTrip(req *http.Request) (*http.Response,
 			}
 		}
 		causes = append(causes, field+":"+causeType)
-		for _, message := range []string{"repair record cannot be removed", "repair requires consumed managed bootstrap history", "closed repair must match authority and cannot overlap a transition", "repair intent is immutable per operation", "terminal repair is immutable per operation", "a new repair must start closed", "replacement repair requires a terminal predecessor and advanced position", "repair CAS cannot overwrite application authority", "closed repair forbids new application reservations", "repair state and completion must agree", "repair completion must bind the exact operation and position", "REMOVE alone is not final repair completion", "final target must include replacement and exclude old voter"} {
-			if strings.Contains(cause.Message, message) {
-				matches = append(matches, message)
+		for _, rule := range rules {
+			if rule.message != "" && (cause.Message == rule.message || strings.HasSuffix(cause.Message, ": "+rule.message)) {
+				matches = append(matches, rule.message)
 			}
 		}
 	}
@@ -663,11 +672,8 @@ func TestV1Alpha2RepairAPIServerContract(t *testing.T) {
 	if init.Assignment().State != "Consumed" {
 		t.Fatal("genesis fixture not consumed")
 	}
-	request := V1Alpha2WriteRequest{Kind: "fixture", ID: "repair-pending", Fingerprint: "repair-pending-fingerprint"}
-	pending, obs, err := ReserveV1Alpha2Write(ctx, store, a, a.Authority(), a.Evidence(), request)
-	if err != nil || obs != V1Alpha2CASApplied {
-		t.Fatalf("reserve: %s %v", obs, err)
-	}
+	verifyMixedReservationCEL(ctx, t, store, a, network.ExecuteRequest{RequestID: "repair-pending", SQL: "SELECT 1"})
+	pending := a // Ordinary append-only CRs must remain without application pending.
 	var key quepaxa.PublicKey
 	key[0] = 1
 	kubectl := func(input string, args ...string) string {
@@ -769,7 +775,10 @@ func TestV1Alpha2RepairAPIServerContract(t *testing.T) {
 	}
 	kubectl("", "patch", "pod", podName, "--subresource=status", "--type=merge", "-p", string(status))
 	voters := []types.NodeID{nodeID, "survivor"}
-	plan := V1Alpha2RepairPlan{OperationID: "repair-cel", ClusterUID: ref.UID, Generation: a.Authority().Generation, DeploymentUID: a.Authority().Binding.DeploymentUID, StorageID: a.Authority().Binding.StorageID, ExpectedConfigID: 1, OldNodeID: "old", OldWALIdentity: "registered-nonce", BootstrapPlanDigest: init.Assignment().Plan.BootstrapPlanDigest, FinalVoterIDs: voters, Replacement: V1Alpha2RepairMember{PodName: podName, PodUID: podUID, NodeID: nodeID, PublicKey: key, PeerURL: "quic://10.0.0.1:9090"}}
+	// Administrative identity evidence must use the same 32-byte hex nonce
+	// shape as actual WAL registrations. Capture first exposes it in the typed
+	// preparedConfig, whose CRD wal_identity schema rejects arbitrary labels.
+	plan := V1Alpha2RepairPlan{Sequence: V1Alpha2RepairAddThenRemove, OperationID: "repair-cel", ClusterUID: ref.UID, Generation: a.Authority().Generation, DeploymentUID: a.Authority().Binding.DeploymentUID, StorageID: a.Authority().Binding.StorageID, ExpectedConfigID: 1, OldNodeID: "old", OldWALIdentity: strings.Repeat("1", 64), BootstrapPlanDigest: init.Assignment().Plan.BootstrapPlanDigest, FinalVoterIDs: voters, Replacement: V1Alpha2RepairMember{PodName: podName, PodUID: podUID, NodeID: nodeID, PublicKey: key, PeerURL: "quic://10.0.0.1:9090"}}
 	patch := func(body any, want string) {
 		t.Helper()
 		b, e := json.Marshal(map[string]any{"status": body})
@@ -908,22 +917,54 @@ func TestV1Alpha2RepairAPIServerContract(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	got, ok := observed.Pending()
-	if !ok || got != request || !sameJSON(observed.Evidence(), pending.Evidence()) {
-		t.Fatal("closing repair lost pending request or evidence")
+	if _, exists := observed.Pending(); exists || !sameJSON(observed.Evidence(), pending.Evidence()) {
+		t.Fatal("repair created CR pending or overwrote E0 evidence")
 	}
-	final, obs, err := FinalizeV1Alpha2Write(ctx, store, observed, observed.Authority(), request, V1Alpha2WriteCommitted, json.RawMessage(`{"host":"after-repair"}`))
-	if err != nil || obs != V1Alpha2CASApplied {
-		t.Fatalf("pending finalization: %s %v", obs, err)
-	}
-	if _, ok := final.Pending(); ok || !sameJSON(final.Evidence(), json.RawMessage(`{"host":"after-repair"}`)) {
-		t.Fatal("finalization lost evidence")
-	}
-	patch(map[string]any{"authority": map[string]any{"pendingWrite": true, "pendingRequest": map[string]any{"kind": "fixture", "id": "new", "fingerprint": "new"}}}, "closed repair forbids new application reservations")
 	completion := V1Alpha2RepairCompletion{OperationID: plan.OperationID, PlanDigest: plan.Digest(), ExpectedConfigID: plan.ExpectedConfigID, ExpectedAbortSlot: plan.ExpectedAbortSlot, Kind: "Terminal", ConfigID: 2, Slot: 1, Hash: strings.Repeat("b", 64), FinalVoterIDs: voters}
 	patch(map[string]any{"repair": map[string]any{"state": "Completed", "completion": completion}}, "REMOVE alone is not final repair completion")
+	// Administrative status evidence only, not a claimed consensus outcome.
+	clusterID, err := types.ManagedClusterID(ref.UID, plan.Generation)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, prefix, err := objectstore.ManagedNamespacePrefixes("", ref.UID, plan.Generation, init.Assignment().Plan.AssignmentID, string(clusterID))
+	if err != nil {
+		t.Fatal(err)
+	}
+	head := []byte("fixed CEL prepared source")
+	oldKey, survivorKey := quepaxa.PublicKey{2}, quepaxa.PublicKey{3}
+	source := quepaxa.Cluster{ConfigID: 1, Members: []quepaxa.Member{
+		{ID: plan.OldNodeID, PublicKey: oldKey, PeerURL: "quic://10.0.0.2:9090", WALIdentity: plan.OldWALIdentity},
+		{ID: "survivor", PublicKey: survivorKey, PeerURL: "quic://10.0.0.3:9090"},
+	}}
+	handoff := V1Alpha2RepairHandoff{PlanDigest: plan.Digest(), SourcePrefix: prefix, PhysicalBinding: init.Assignment().Plan.PhysicalBinding, Head: head, HeadHash: fmt.Sprintf("%x", sha256.Sum256(head)), PreparedConfig: &source, PreparedSlot: 1, PreparedHash: strings.Repeat("a", 64)}
+	captured, obs, err := CaptureV1Alpha2RepairHandoff(ctx, store, observed, observed.Authority(), handoff)
+	if err != nil || obs != V1Alpha2CASApplied {
+		t.Fatalf("capture ADD-first source: %s %v", obs, err)
+	}
+	addProof := addFirstCompletion(plan, handoff)
+	added, obs, err := RecordV1Alpha2RepairAddition(ctx, store, captured, captured.Authority(), addProof)
+	if err != nil || obs != V1Alpha2CASApplied {
+		t.Fatalf("record ADD terminal: %s %v", obs, err)
+	}
+	observed = added
+	completion.Slot = addProof.Slot + 1
 	completion.ConfigID = 3
-	finished, obs, err := FinishV1Alpha2Repair(ctx, store, final, final.Authority(), completion)
+	for name, slot := range map[string]uint64{"equal": addProof.Slot, "before": addProof.Slot - 1} {
+		t.Run("final-slot-"+name, func(t *testing.T) {
+			bad := completion
+			bad.Slot = slot
+			patch(map[string]any{"repair": map[string]any{"state": "Completed", "completion": bad}}, "final REMOVE terminal must follow ADD terminal")
+			var after map[string]json.RawMessage
+			if err := store.Kube.Get(ctx, "/apis/rhiza.mrchypark.dev/v1alpha2/namespaces/"+ns+"/rhizaclusters/"+ref.Name, &after); err != nil {
+				t.Fatal(err)
+			}
+			if !sameJSON(after["metadata"], added.status.object["metadata"]) || !sameJSON(after["status"], added.status.object["status"]) {
+				t.Fatal("rejected out-of-order final terminal changed live snapshot")
+			}
+		})
+	}
+	finished, obs, err := FinishV1Alpha2Repair(ctx, store, observed, observed.Authority(), completion)
 	if err != nil || obs != V1Alpha2CASApplied || finished.SQLReservationsClosed() {
 		t.Fatalf("finish: %s %v", obs, err)
 	}
@@ -941,7 +982,7 @@ func TestV1Alpha2RepairAPIServerContract(t *testing.T) {
 	next.ExpectedConfigID = completion.ConfigID
 	nextClosed, obs, err := BeginV1Alpha2Repair(ctx, store, loaded, loaded.Authority(), next)
 	if err != nil || obs != V1Alpha2CASApplied || !nextClosed.SQLReservationsClosed() {
-		t.Fatalf("close without pending: %s %v", obs, err)
+		t.Fatalf("close while preserving historical pending: %s %v", obs, err)
 	}
 	if _, _, err := BeginV1Alpha2Repair(ctx, store, loaded, loaded.Authority(), next); !errors.Is(err, ErrV1Alpha2StatusConflict) {
 		t.Fatalf("stale Begin must conflict: %v", err)

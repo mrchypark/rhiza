@@ -1,7 +1,6 @@
 package managedsql
 
 import (
-	"bytes"
 	"context"
 	"database/sql"
 	"encoding/json"
@@ -69,7 +68,6 @@ func TestManagedSQLLocalReadsRemainReadyWithoutQuorum(t *testing.T) {
 			t.Fatalf("%s allowed local SQL", reason)
 		}
 	}
-	h.uncertain.Store(true)
 	beforeRead, err := h.node.ManagedState()
 	if err != nil {
 		t.Fatal(err)
@@ -79,10 +77,6 @@ func TestManagedSQLLocalReadsRemainReadyWithoutQuorum(t *testing.T) {
 	if err != nil || beforeRead != afterRead {
 		t.Fatalf("local snapshot reads changed runtime state: before=%+v after=%+v err=%v", beforeRead, afterRead, err)
 	}
-	if !h.uncertain.Load() {
-		t.Fatal("local reads cleared unknown outcome")
-	}
-	h.uncertain.Store(false)
 	fixture.mu.Lock()
 	original := append(json.RawMessage(nil), fixture.obj["status"]...)
 	var status map[string]any
@@ -112,56 +106,28 @@ func TestManagedSQLLocalReadsRemainReadyWithoutQuorum(t *testing.T) {
 			t.Error(err)
 		}
 	})
-	if _, err := db.ExecContext(ctx, "CREATE TABLE _rhiza_corrupt_internal(value)"); err != nil {
-		t.Fatal(err)
+	for _, corruption := range []struct{ name, damage, repair string }{
+		{"unknown internal table", "CREATE TABLE _rhiza_corrupt_internal(value)", "DROP TABLE _rhiza_corrupt_internal"},
+		{"missing internal index", "DROP INDEX _rhiza_idempotency_slot", "CREATE INDEX _rhiza_idempotency_slot ON _rhiza_idempotency(commit_slot)"},
+		{"changed internal table", "ALTER TABLE _rhiza_kv ADD COLUMN corrupt_internal", "ALTER TABLE _rhiza_kv DROP COLUMN corrupt_internal"},
+		{"changed local protocol", "UPDATE _rhiza_meta SET value='invalid' WHERE key='managed_application_protocol'", "UPDATE _rhiza_meta SET value='rhiza-managed-request-append-only/v1' WHERE key='managed_application_protocol'"},
+	} {
+		func() {
+			if _, err := db.ExecContext(ctx, corruption.damage); err != nil {
+				t.Fatal(err)
+			}
+			defer func() {
+				if _, err := db.ExecContext(ctx, corruption.repair); err != nil {
+					t.Error(err)
+				}
+			}()
+			rejectLocal(corruption.name)
+		}()
+		checkLocal()
 	}
-	rejectLocal("corrupted local internal schema")
-	if _, err := db.ExecContext(ctx, "DROP TABLE _rhiza_corrupt_internal"); err != nil {
-		t.Fatal(err)
-	}
-	checkLocal()
-	fixture.mu.Lock()
-	if err := json.Unmarshal(original, &status); err != nil {
-		fixture.mu.Unlock()
-		t.Fatal(err)
-	}
-	status["authority"].(map[string]any)["binding"].(map[string]any)["storageID"] = "successor-storage"
-	fixture.obj["status"], err = json.Marshal(status)
-	fixture.mu.Unlock()
-	if err != nil {
-		t.Fatal(err)
-	}
-	rejectLocal("stale storage binding")
-	fixture.mu.Lock()
-	fixture.obj["status"] = original
-	fixture.mu.Unlock()
-	checkLocal()
-	a, err = operator.LoadV1Alpha2Admission(ctx, configs[0].Store, configs[0].Ref)
-	if err != nil {
-		t.Fatal(err)
-	}
-	reserved, outcome, err := operator.ReserveV1Alpha2SQLWrite(ctx, configs[0].Store, a, a.Authority(), a.Evidence(), ExecuteRequest{RequestID: "pending-local-negative", SQL: "INSERT INTO local_read VALUES (2)"})
-	if err != nil || outcome != operator.V1Alpha2CASApplied {
-		t.Fatalf("real pending reservation: %v %v", outcome, err)
-	}
-	pending, ok := reserved.Pending()
-	if !ok {
-		t.Fatal("reservation missing")
-	}
-	h.gateMu.Lock()
-	h.active = &pending
-	h.gateMu.Unlock()
-	fixture.mu.Lock()
-	pendingStatus := append(json.RawMessage(nil), fixture.obj["status"]...)
-	fixture.mu.Unlock()
-	h.uncertain.Store(true)
-	checkLocal()
-	fixture.mu.Lock()
-	unchanged := bytes.Equal(pendingStatus, fixture.obj["status"])
-	fixture.mu.Unlock()
-	if !unchanged || !h.uncertain.Load() {
-		t.Fatal("local reads mutated pending/evidence/unknown state")
-	}
+	// 9/10 local reads use the immutable runtime plan and local lifetime/binding
+	// checks, not mutable legacy CR evidence or storageID observations. A CR
+	// storageID edit is therefore not a local-corruption oracle.
 	if _, err := h.node.API(); err == nil {
 		t.Fatal("raw managed API exposed")
 	}

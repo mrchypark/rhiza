@@ -20,13 +20,13 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - runner: macos-14
+          - runner: macos-15
             asset: aarch64-apple-darwin
             goos: darwin
             goarch: arm64
             cc: clang
             link_test: true
-          - runner: macos-14
+          - runner: macos-15
             asset: x86_64-apple-darwin
             goos: darwin
             goarch: amd64

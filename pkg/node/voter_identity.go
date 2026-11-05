@@ -17,6 +17,7 @@ import (
 	"strings"
 
 	objmetrics "github.com/mrchypark/rhiza/internal/objstore"
+	"github.com/mrchypark/rhiza/internal/sqlpolicy"
 	"github.com/mrchypark/rhiza/internal/types"
 	"github.com/mrchypark/rhiza/pkg/qlog"
 	"github.com/mrchypark/rhiza/pkg/recovery"
@@ -35,14 +36,86 @@ const voterIdentityVersion = 2
 // The registration is immutable. It detects lost/replaced WAL directories, not
 // cloned disks or rolled-back storage; those still require external fencing.
 type voterIdentity struct {
-	Version          int    `json:"version"`
-	Cluster          string `json:"cluster"`
-	Node             string `json:"node"`
-	Membership       string `json:"membership"`
-	Store            string `json:"store"`
-	Nonce            string `json:"nonce"`
-	Registered       bool   `json:"registered"`
-	LearnerPublicKey string `json:"learner_public_key,omitempty"`
+	Version             int    `json:"version"`
+	Cluster             string `json:"cluster"`
+	Node                string `json:"node"`
+	Membership          string `json:"membership"`
+	Store               string `json:"store"`
+	ApplicationProtocol string `json:"application_protocol,omitempty"`
+	BootstrapPlanDigest string `json:"bootstrap_plan_digest,omitempty"`
+	MemberConfigDigest  string `json:"member_config_digest,omitempty"`
+	Generation          *int64 `json:"generation,omitempty"`
+	Nonce               string `json:"nonce"`
+	Registered          bool   `json:"registered"`
+	LearnerPublicKey    string `json:"learner_public_key,omitempty"`
+}
+
+// managedVoterProfileBinding is copied from the already-verified startup
+// assignment. It is persisted only for the explicit append-only protocols;
+// legacy profiles retain the exact voter-identity bytes they used before.
+type managedVoterProfileBinding struct {
+	ApplicationProtocol string
+	BootstrapPlanDigest string
+	MemberConfigDigest  string
+	Generation          int64
+}
+
+type managedLearnerProfilePurpose uint8
+
+const (
+	managedLearnerProfileForRepairAdd managedLearnerProfilePurpose = iota + 1
+	managedLearnerProfileForFormerVoterLookup
+)
+
+// managedLearnerIntentProfileFor projects only the runtime WAL identity out of
+// a verified learner intent. Callers must already have validated the exact
+// registration nonce (ADD) or certified member/registration binding (lookup).
+func (n *Node) managedLearnerIntentProfileFor(config *types.ExecutionConfig, purpose managedLearnerProfilePurpose) (*managedVoterProfileBinding, error) {
+	switch purpose {
+	case managedLearnerProfileForRepairAdd, managedLearnerProfileForFormerVoterLookup:
+	default:
+		return nil, fmt.Errorf("invalid managed learner profile purpose")
+	}
+	if config == nil || config.Learner == nil || n == nil || n.managedStartup == nil || !isManagedAppendOnlyProtocol(n.managedApplicationProtocol()) {
+		return nil, fmt.Errorf("verified managed learner intent required")
+	}
+	profileConfig := *config
+	profileLearner := *config.Learner
+	profileLearner.WALIdentity = ""
+	profileConfig.Learner = &profileLearner
+	return n.managedVoterProfileFor(&profileConfig)
+}
+
+func (n *Node) managedVoterProfileFor(config *types.ExecutionConfig) (*managedVoterProfileBinding, error) {
+	if n == nil || n.managedStartup == nil || config == nil {
+		return nil, nil
+	}
+	i := n.managedStartup.Identity
+	switch i.ApplicationProtocol {
+	case sqlpolicy.ManagedRequestAppendOnlyApplicationProtocol, sqlpolicy.ManagedGraphRequestAppendOnlyApplicationProtocol:
+	default:
+		return nil, nil
+	}
+	if i.Member.Generation != 0 || i.BootstrapPlanDigest == "" {
+		return nil, fmt.Errorf("append-only profile requires the original generation bootstrap binding")
+	}
+	memberDigest, err := types.ManagedMemberConfigDigest(*config, i.ApplicationProtocol)
+	if err != nil {
+		return nil, fmt.Errorf("managed voter member profile digest: %w", err)
+	}
+	if config.NodeID == n.config.NodeID && memberDigest != i.Member.ConfigDigest {
+		return nil, fmt.Errorf("managed voter member profile differs from trusted assignment")
+	}
+	bootstrap, err := n.ManagedBootstrapPlanDigestForProtocol(i.PhysicalBinding, i.EvidenceFormat, i.ApplicationProtocol)
+	if err != nil || bootstrap != i.BootstrapPlanDigest {
+		return nil, errors.Join(fmt.Errorf("managed voter original bootstrap profile differs"), err)
+	}
+	return &managedVoterProfileBinding{
+		ApplicationProtocol: i.ApplicationProtocol,
+		BootstrapPlanDigest: i.BootstrapPlanDigest,
+		MemberConfigDigest:  memberDigest,
+		Generation:          i.Member.Generation,
+	}, nil
 }
 
 type localVoterState struct {
@@ -87,6 +160,30 @@ func voterIdentityFor(config *types.ExecutionConfig) voterIdentity {
 	return identity
 }
 
+func voterIdentityForProfile(config *types.ExecutionConfig, profile *managedVoterProfileBinding) voterIdentity {
+	identity := voterIdentityFor(config)
+	if profile != nil {
+		generation := profile.Generation
+		identity.ApplicationProtocol = profile.ApplicationProtocol
+		identity.BootstrapPlanDigest = profile.BootstrapPlanDigest
+		identity.MemberConfigDigest = profile.MemberConfigDigest
+		identity.Generation = &generation
+	}
+	return identity
+}
+
+func sameVoterIdentity(a, b voterIdentity) bool {
+	if a.Generation == nil || b.Generation == nil {
+		if a.Generation != nil || b.Generation != nil {
+			return false
+		}
+	} else if *a.Generation != *b.Generation {
+		return false
+	}
+	a.Generation, b.Generation = nil, nil
+	return a == b
+}
+
 // ensureVoterIdentity runs before any archive replay or peer listener. An
 // archive contains decided values, not the lost voter's outstanding promises.
 func ensureVoterIdentity(ctx context.Context, config *types.ExecutionConfig, bucket objstore.Bucket, wal *qlog.WAL, local localVoterState, enroll bool, beforeWrite ...func(context.Context, string) error) error {
@@ -94,7 +191,14 @@ func ensureVoterIdentity(ctx context.Context, config *types.ExecutionConfig, buc
 }
 
 func ensureVoterIdentityManaged(ctx context.Context, config *types.ExecutionConfig, bucket objstore.Bucket, wal *qlog.WAL, local localVoterState, enroll, preparedLearner bool, beforeWrite ...func(context.Context, string) error) error {
-	want := voterIdentityFor(config)
+	return ensureVoterIdentityWithProfile(ctx, config, bucket, wal, local, enroll, preparedLearner, nil, beforeWrite...)
+}
+
+func ensureVoterIdentityWithProfile(ctx context.Context, config *types.ExecutionConfig, bucket objstore.Bucket, wal *qlog.WAL, local localVoterState, enroll, preparedLearner bool, profile *managedVoterProfileBinding, beforeWrite ...func(context.Context, string) error) error {
+	want := voterIdentityForProfile(config, profile)
+	if profile != nil && (profile.ApplicationProtocol == "" || profile.BootstrapPlanDigest == "" || profile.MemberConfigDigest == "" || profile.Generation < 0) {
+		return fmt.Errorf("invalid managed voter profile binding")
+	}
 	bound, hasBinding := wal.Identity()
 	if local.identity != nil {
 		nonce, _ := hex.DecodeString(local.identity.Nonce)
@@ -107,7 +211,7 @@ func ensureVoterIdentityManaged(ctx context.Context, config *types.ExecutionConf
 	if local.identity != nil {
 		got := *local.identity
 		got.Nonce, got.Registered = "", false
-		if got != want {
+		if !sameVoterIdentity(got, want) {
 			return fmt.Errorf("%w: voter configuration changed", ErrVoterStateLost)
 		}
 	}

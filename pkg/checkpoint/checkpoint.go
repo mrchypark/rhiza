@@ -117,6 +117,7 @@ type RecoveryPin struct {
 }
 
 type Manager struct {
+	expectedPolicy           sqlpolicy.MaterializationPolicy
 	appendOnly               bool
 	bucket                   objstore.Bucket
 	prefix                   string
@@ -134,6 +135,13 @@ type Manager struct {
 
 // NewAppendOnlyManager opens an HA namespace without online deletion.
 func NewAppendOnlyManager(bucket objstore.Bucket, prefix, localDir string, configID ...uint) (*Manager, error) {
+	return NewAppendOnlyManagerForPolicy(bucket, prefix, localDir, sqlpolicy.LegacyMaterializationPolicy, configID...)
+}
+
+func NewAppendOnlyManagerForPolicy(bucket objstore.Bucket, prefix, localDir string, expected sqlpolicy.MaterializationPolicy, configID ...uint) (*Manager, error) {
+	if err := expected.Validate(); err != nil {
+		return nil, err
+	}
 	if bucket == nil {
 		return nil, fmt.Errorf("append-only checkpoint requires an object store")
 	}
@@ -141,13 +149,24 @@ func NewAppendOnlyManager(bucket objstore.Bucket, prefix, localDir string, confi
 	if !slices.Contains(options, objstore.IfNotExists) || !slices.Contains(options, objstore.IfMatch) {
 		return nil, fmt.Errorf("append-only checkpoint requires conditional object writes")
 	}
-	m := NewManager(bucket, prefix, localDir, configID...)
+	m := newManagerForPolicy(bucket, prefix, localDir, expected, configID...)
 	m.appendOnly = true
 	return m, nil
 }
 
 func NewManager(bucket objstore.Bucket, prefix, localDir string, configID ...uint) *Manager {
-	m := &Manager{bucket: bucket, prefix: prefix, localDir: localDir, verifiedRoots: make(map[[32]byte]verifiedRoot)}
+	return newManagerForPolicy(bucket, prefix, localDir, sqlpolicy.LegacyMaterializationPolicy, configID...)
+}
+
+func NewManagerForPolicy(bucket objstore.Bucket, prefix, localDir string, expected sqlpolicy.MaterializationPolicy, configID ...uint) (*Manager, error) {
+	if err := expected.Validate(); err != nil {
+		return nil, err
+	}
+	return newManagerForPolicy(bucket, prefix, localDir, expected, configID...), nil
+}
+
+func newManagerForPolicy(bucket objstore.Bucket, prefix, localDir string, expected sqlpolicy.MaterializationPolicy, configID ...uint) *Manager {
+	m := &Manager{bucket: bucket, prefix: prefix, localDir: localDir, expectedPolicy: expected, verifiedRoots: make(map[[32]byte]verifiedRoot)}
 	if len(configID) > 0 {
 		m.configID = configID[0]
 	}
@@ -156,6 +175,54 @@ func NewManager(bucket objstore.Bucket, prefix, localDir string, configID ...uin
 
 // Load performs two exact GETs: CURRENT and its immutable root.
 func (m *Manager) Load(ctx context.Context) error {
+	if m.expectedPolicy == sqlpolicy.ManagedRequestMaterializationPolicy {
+		if !m.appendOnly {
+			return fmt.Errorf("managed request checkpoint CURRENT requires its append-only profile")
+		}
+		locator, exists, err := m.LoadManagedAppendOnlyLocator(ctx, sqlpolicy.ManagedRequestMaterializationPolicy)
+		if err != nil {
+			return err
+		}
+		if !exists {
+			m.mu.Lock()
+			known := m.certified != nil
+			m.mu.Unlock()
+			if known {
+				return fmt.Errorf("managed request checkpoint locator disappeared")
+			}
+			return nil
+		}
+		root, err := m.OpenRoot(ctx, locator.Index, locator.RootHash)
+		if err != nil {
+			return err
+		}
+		if root.Generation != locator.Index {
+			return fmt.Errorf("managed request checkpoint generation differs from locator cut")
+		}
+		m.rememberCertified(*root)
+		return nil
+	}
+	if m.expectedPolicy == sqlpolicy.ManagedGraphRequestMaterializationPolicy {
+		locator, exists, err := m.LoadManagedGraphLocator(ctx)
+		if err != nil {
+			return err
+		}
+		if !exists {
+			m.mu.Lock()
+			known := m.certified != nil
+			m.mu.Unlock()
+			if known {
+				return fmt.Errorf("managed Graph checkpoint locator disappeared")
+			}
+			return nil
+		}
+		root, err := m.OpenRoot(ctx, locator.Index, locator.RootHash)
+		if err != nil {
+			return err
+		}
+		m.rememberCertified(*root)
+		return nil
+	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	// A new cluster has no certified checkpoint yet. Mark only this initial
@@ -528,9 +595,12 @@ func (m *Manager) CreateFiles(ctx context.Context, claim *PublisherClaim, source
 // createFilesWithScanObserver is the opt-in cost-test path. The callback reports
 // the block scan/hash phase only; it does not include block uploads.
 func (m *Manager) createFilesWithScanObserver(ctx context.Context, claim *PublisherClaim, sources []Source, index uint64, onScan func(role string, elapsed time.Duration)) (*Checkpoint, error) {
+	if err := m.validateSourceProfile(sources); err != nil {
+		return nil, err
+	}
 	for _, source := range sources {
 		if source.Role == RoleSQLite {
-			if err := sqlpolicy.CheckFile(ctx, source.Path); err != nil {
+			if err := sqlpolicy.CheckFileForPolicy(ctx, source.Path, m.expectedPolicy); err != nil {
 				return nil, err
 			}
 		}
@@ -547,9 +617,15 @@ func (m *Manager) createFilesWithScanObserver(ctx context.Context, claim *Publis
 	if err := validateSources(sources); err != nil {
 		return nil, err
 	}
+	return m.uploadCandidate(ctx, sources, index, claim.Generation, claim, onScan)
+}
+
+// uploadCandidate shares immutable block/root encoding, not publication
+// authority. Its callers must establish their profile-specific prerequisites.
+func (m *Manager) uploadCandidate(ctx context.Context, sources []Source, index, generation uint64, claim *PublisherClaim, onScan func(string, time.Duration)) (*Checkpoint, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	root := Checkpoint{SQLExecutionPolicy: sqlpolicy.Version, ConfigID: m.configID, Generation: claim.Generation, Index: index}
+	root := Checkpoint{SQLExecutionPolicy: int(m.expectedPolicy), ConfigID: m.configID, Generation: generation, Index: index}
 	conditional := false
 	for _, option := range m.bucket.SupportedObjectUploadOptions() {
 		conditional = conditional || option == objstore.IfNotExists
@@ -564,7 +640,7 @@ func (m *Manager) createFilesWithScanObserver(ctx context.Context, claim *Publis
 	}
 	blocks := 0
 	for _, source := range sources {
-		file, err := m.uploadFile(ctx, source, claim.Generation, conditional, knownBlocks, onScan)
+		file, err := m.uploadFile(ctx, source, generation, conditional, knownBlocks, onScan)
 		if err != nil {
 			return nil, err
 		}
@@ -591,6 +667,13 @@ func (m *Manager) createFilesWithScanObserver(ctx context.Context, claim *Publis
 	var uploadOptions []objstore.ObjectUploadOption
 	if conditional {
 		uploadOptions = append(uploadOptions, objstore.WithIfNotExists())
+	}
+	if m.expectedPolicy == sqlpolicy.ManagedGraphRequestMaterializationPolicy {
+		if err := m.uploadManagedGraphImmutable(ctx, rootKey, bytes.NewReader(data), int64(len(data)), root.RootHash); err != nil {
+			return nil, fmt.Errorf("publish managed Graph root: %w", err)
+		}
+		copy := root
+		return &copy, nil
 	}
 	if err := m.bucket.Upload(ctx, rootKey, bytes.NewReader(data), uploadOptions...); err != nil {
 		if !conditional || !m.bucket.IsConditionNotMetErr(err) {
@@ -835,6 +918,9 @@ func (m *Manager) uploadFile(ctx context.Context, source Source, generation uint
 		reader := io.NewSectionReader(input, upload.offset, upload.block.Size)
 		key := m.key(blockKey(upload.hash))
 		var err error
+		if m.expectedPolicy == sqlpolicy.ManagedGraphRequestMaterializationPolicy {
+			return m.uploadManagedGraphImmutable(ctx, key, reader, upload.block.Size, upload.hash)
+		}
 		if conditional {
 			err = m.bucket.Upload(ctx, key, reader, objstore.WithIfNotExists())
 			if m.bucket.IsConditionNotMetErr(err) {
@@ -936,6 +1022,22 @@ func validateSources(sources []Source) error {
 	return nil
 }
 
+func (m *Manager) validateSourceProfile(sources []Source) error {
+	if err := m.expectedPolicy.Validate(); err != nil {
+		return err
+	}
+	if err := validateSources(sources); err != nil {
+		return err
+	}
+	if m.expectedPolicy == sqlpolicy.ManagedGraphRequestMaterializationPolicy && (len(sources) != 2 || sources[0].Role != RoleSQLite || sources[1].Role != RoleGraphData) {
+		return fmt.Errorf("managed Graph checkpoint requires the exact SQLite/Graph pair")
+	}
+	if (m.expectedPolicy == sqlpolicy.ManagedSQLKVMaterializationPolicy || m.expectedPolicy == sqlpolicy.ManagedRequestMaterializationPolicy) && (len(sources) != 1 || sources[0].Role != RoleSQLite) {
+		return fmt.Errorf("mixed checkpoint requires exactly one SQLite file")
+	}
+	return nil
+}
+
 func (m *Manager) Latest() *Checkpoint {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -988,7 +1090,7 @@ func (m *Manager) DownloadAndVerifyRootFiles(ctx context.Context, root *Checkpoi
 	}
 	for _, file := range files {
 		if file.Role == RoleSQLite {
-			if err := sqlpolicy.CheckFile(ctx, file.Path); err != nil {
+			if err := sqlpolicy.CheckFileForPolicy(ctx, file.Path, m.expectedPolicy); err != nil {
 				return nil, err
 			}
 		}
@@ -1640,8 +1742,14 @@ func (m *Manager) readRoot(ctx context.Context, name string, expected [32]byte) 
 }
 
 func (m *Manager) validateRoot(root Checkpoint) error {
-	if root.SQLExecutionPolicy != sqlpolicy.Version {
+	if m.expectedPolicy.Validate() != nil || root.SQLExecutionPolicy != int(m.expectedPolicy) {
 		return sqlpolicy.ErrIncompatible
+	}
+	if m.expectedPolicy == sqlpolicy.ManagedGraphRequestMaterializationPolicy && (len(root.Files) != 2 || root.Files[0].Role != RoleSQLite || root.Files[1].Role != RoleGraphData) {
+		return fmt.Errorf("managed Graph checkpoint requires the exact SQLite/Graph pair")
+	}
+	if (m.expectedPolicy == sqlpolicy.ManagedSQLKVMaterializationPolicy || m.expectedPolicy == sqlpolicy.ManagedRequestMaterializationPolicy) && (len(root.Files) != 1 || root.Files[0].Role != RoleSQLite) {
+		return fmt.Errorf("mixed checkpoint requires exactly one SQLite file")
 	}
 	if root.ConfigID != m.configID || root.Generation == 0 || root.Index == 0 || root.Size <= 0 || root.Size > maxCheckpointSize || len(root.Files) < 1 || len(root.Files) > 2 {
 		return fmt.Errorf("invalid checkpoint root")

@@ -10,7 +10,12 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"strings"
 
+	"github.com/mrchypark/rhiza/internal/sqlpolicy"
+	"github.com/mrchypark/rhiza/internal/types"
+	"github.com/mrchypark/rhiza/pkg/checkpoint"
+	"github.com/mrchypark/rhiza/pkg/materializer"
 	"github.com/mrchypark/rhiza/pkg/quepaxa"
 	"github.com/thanos-io/objstore"
 )
@@ -28,11 +33,13 @@ type PreparedStartupIdentity struct {
 }
 
 type preparedStartupManifest struct {
-	Version    int                     `json:"version"`
-	Identity   PreparedStartupIdentity `json:"identity"`
-	Head       []byte                  `json:"head"`
-	SQLiteHash [32]byte                `json:"sqliteHash"`
-	SuffixHash [32]byte                `json:"suffixHash"`
+	Version      int                             `json:"version"`
+	Identity     PreparedStartupIdentity         `json:"identity"`
+	Head         []byte                          `json:"head"`
+	SQLiteHash   [32]byte                        `json:"sqliteHash"`
+	SuffixHash   [32]byte                        `json:"suffixHash"`
+	Files        []preparedGraphArtifact         `json:"files,omitempty"`
+	GraphLocator *checkpoint.ManagedGraphLocator `json:"graphLocator,omitempty"`
 }
 
 // VerifiedPreparedStartup is verified local data, never startup authority.
@@ -50,15 +57,40 @@ func validPreparedIdentity(i PreparedStartupIdentity) bool {
 	return i.ClusterUID != "" && i.Generation >= 0 && i.DeploymentUID != "" && i.PodUID != "" && i.NodeID != "" && i.SourceBinding != "" && i.ConfigDigest != ""
 }
 
+func validatePreparedProfile(identity PreparedStartupIdentity, policy sqlpolicy.MaterializationPolicy, window uint64, applicationProtocol string) error {
+	if err := validateReadOnlyProfile(policy, window, applicationProtocol); err != nil {
+		return err
+	}
+	if (policy == sqlpolicy.ManagedRequestMaterializationPolicy || policy == sqlpolicy.ManagedGraphRequestMaterializationPolicy) && identity.Generation != 0 {
+		return fmt.Errorf("final managed recovery requires generation 0")
+	}
+	return nil
+}
+
 // PublishPreparedStartup prepares a new directory, then syncs data and writes a
 // completion marker. The caller controls its parent and excludes replacement.
 // A failed attempt remains in place. An error after marker publication is an
 // uncertain outcome and must be resolved by loading and verifying the result.
 func PublishPreparedStartup(ctx context.Context, view *ReadOnlyView, targetDir string, identity PreparedStartupIdentity) error {
+	return PublishPreparedStartupForPolicy(ctx, view, targetDir, identity, sqlpolicy.LegacyMaterializationPolicy, types.DefaultIdempotencyWindowSlots)
+}
+
+// PublishPreparedStartupForPolicy publishes compatibility data, not authority.
+func PublishPreparedStartupForPolicy(ctx context.Context, view *ReadOnlyView, targetDir string, identity PreparedStartupIdentity, expected sqlpolicy.MaterializationPolicy, window uint64) error {
+	version, err := preparedVersion(expected, window)
+	if err != nil {
+		return err
+	}
+	if view == nil {
+		return fmt.Errorf("read-only view is not verified")
+	}
+	if err := validatePreparedProfile(identity, expected, window, view.applicationProtocol); err != nil {
+		return err
+	}
 	if !validPreparedIdentity(identity) {
 		return fmt.Errorf("invalid prepared startup identity")
 	}
-	result, err := PrepareReadOnlyRestore(ctx, view, targetDir)
+	result, err := PrepareReadOnlyRestoreForPolicy(ctx, view, targetDir, expected, window)
 	if err != nil {
 		return err
 	}
@@ -69,14 +101,37 @@ func PublishPreparedStartup(ctx context.Context, view *ReadOnlyView, targetDir s
 	if err := errors.Join(parent.Sync(), parent.Close()); err != nil {
 		return fmt.Errorf("sync preparation parent: %w", err)
 	}
-	m := preparedStartupManifest{Version: 1, Identity: identity, Head: view.CapturedHead()}
-	if m.SQLiteHash, err = preparedFileHash(result.SQLitePath, true); err != nil {
+	m := preparedStartupManifest{Version: version, Identity: identity, Head: view.CapturedHead()}
+	if expected == sqlpolicy.ManagedGraphRequestMaterializationPolicy && view.graphLocator == nil {
+		return fmt.Errorf("prepared Graph source lacks exact certified locator")
+	}
+	// Reuse the existing locator wire shape for policy 9. Its absence in v3
+	// preserves the original archive-only selection, including old handoffs.
+	if view.graphLocator != nil {
+		selected := *view.graphLocator
+		m.GraphLocator = &selected
+	}
+	if expected == sqlpolicy.ManagedGraphRequestMaterializationPolicy {
+		m.Files, err = preparedGraphArtifacts(ctx, targetDir, true)
+		if err != nil {
+			return err
+		}
+		m.SQLiteHash = m.Files[0].SHA256
+	} else if m.SQLiteHash, err = preparedFileHash(result.SQLitePath, true); err != nil {
 		return err
 	}
 	if m.SuffixHash, err = preparedFileHash(result.SuffixPath, true); err != nil {
 		return err
 	}
-	if _, err = preparedGraphTree(targetDir, true); err != nil {
+	if expected == sqlpolicy.ManagedGraphRequestMaterializationPolicy {
+		if err := validateGraphPreparedInventory(targetDir, false); err != nil {
+			return err
+		}
+	} else if expected == sqlpolicy.LegacyMaterializationPolicy {
+		if _, err = preparedGraphTree(targetDir, true); err != nil {
+			return err
+		}
+	} else if err := validateMixedPreparedInventory(targetDir, false); err != nil {
 		return err
 	}
 	data, err := json.Marshal(m)
@@ -124,6 +179,35 @@ func PublishPreparedStartup(ctx context.Context, view *ReadOnlyView, targetDir s
 // controlled against replacement; failed targets remain for inspection. This
 // does not authenticate the mutable manifest or grant permission to write.
 func LoadPreparedStartup(ctx context.Context, bucket objstore.Bucket, prefix string, configID uint, bootstrap quepaxa.Cluster, handoffDir, verifiedTargetDir string, expected PreparedStartupIdentity) (*VerifiedPreparedStartup, error) {
+	return LoadPreparedStartupForPolicy(ctx, bucket, prefix, configID, bootstrap, handoffDir, verifiedTargetDir, expected, sqlpolicy.LegacyMaterializationPolicy, types.DefaultIdempotencyWindowSlots)
+}
+
+func LoadPreparedStartupForPolicy(ctx context.Context, bucket objstore.Bucket, prefix string, configID uint, bootstrap quepaxa.Cluster, handoffDir, verifiedTargetDir string, expected PreparedStartupIdentity, policy sqlpolicy.MaterializationPolicy, window uint64) (*VerifiedPreparedStartup, error) {
+	return loadPreparedStartupForPolicy(ctx, bucket, prefix, configID, bootstrap, handoffDir, verifiedTargetDir, expected, policy, window, nil, "")
+}
+
+func LoadPreparedStartupForPolicyWithReconfiguration(ctx context.Context, bucket objstore.Bucket, prefix string, configID uint, bootstrap quepaxa.Cluster, handoffDir, verifiedTargetDir string, expected PreparedStartupIdentity, policy sqlpolicy.MaterializationPolicy, window uint64, reconfiguration bool) (*VerifiedPreparedStartup, error) {
+	return loadPreparedStartupForPolicy(ctx, bucket, prefix, configID, bootstrap, handoffDir, verifiedTargetDir, expected, policy, window, &reconfiguration, "")
+}
+
+// LoadPreparedStartupForApplicationProtocol verifies the handoff and captured
+// source head against a trusted final append-only protocol before independent
+// reconstruction. The protocol is never inferred from files or manifest data.
+func LoadPreparedStartupForApplicationProtocol(ctx context.Context, bucket objstore.Bucket, prefix string, configID uint, bootstrap quepaxa.Cluster, handoffDir, verifiedTargetDir string, expected PreparedStartupIdentity, policy sqlpolicy.MaterializationPolicy, window uint64, applicationProtocol string, reconfiguration bool) (*VerifiedPreparedStartup, error) {
+	if err := validatePreparedProfile(expected, policy, window, applicationProtocol); err != nil {
+		return nil, err
+	}
+	return loadPreparedStartupForPolicy(ctx, bucket, prefix, configID, bootstrap, handoffDir, verifiedTargetDir, expected, policy, window, &reconfiguration, applicationProtocol)
+}
+
+func loadPreparedStartupForPolicy(ctx context.Context, bucket objstore.Bucket, prefix string, configID uint, bootstrap quepaxa.Cluster, handoffDir, verifiedTargetDir string, expected PreparedStartupIdentity, policy sqlpolicy.MaterializationPolicy, window uint64, trustedReconfiguration *bool, applicationProtocol string) (*VerifiedPreparedStartup, error) {
+	if err := validatePreparedProfile(expected, policy, window, applicationProtocol); err != nil {
+		return nil, err
+	}
+	version, err := preparedVersion(policy, window)
+	if err != nil {
+		return nil, err
+	}
 	if !validPreparedIdentity(expected) {
 		return nil, fmt.Errorf("invalid expected identity")
 	}
@@ -148,14 +232,64 @@ func LoadPreparedStartup(ctx context.Context, bucket objstore.Bucket, prefix str
 	if err = d.Decode(new(any)); err != io.EOF {
 		return nil, fmt.Errorf("invalid preparation marker")
 	}
-	if m.Version != 1 || m.Identity != expected {
+	if m.Version != version || m.Identity != expected {
 		return nil, fmt.Errorf("preparation identity mismatch")
 	}
-	view, err := OpenReadOnlyViewAtHead(ctx, bucket, prefix, configID, bootstrap, m.Head)
+	if policy != sqlpolicy.ManagedGraphRequestMaterializationPolicy && len(m.Files) != 0 {
+		return nil, fmt.Errorf("unexpected prepared artifact inventory")
+	}
+	if policy == sqlpolicy.ManagedGraphRequestMaterializationPolicy && m.GraphLocator == nil {
+		return nil, fmt.Errorf("prepared Graph locator/profile mismatch")
+	}
+	// Only explicit request/Graph profiles use this field. Preserve strict
+	// legacy rejection even for null (which decodes to a nil pointer).
+	if policy != sqlpolicy.ManagedGraphRequestMaterializationPolicy && policy != sqlpolicy.ManagedRequestMaterializationPolicy {
+		var fields map[string]json.RawMessage
+		if err := json.Unmarshal(data, &fields); err != nil {
+			return nil, err
+		}
+		for field := range fields {
+			if strings.EqualFold(field, "graphLocator") {
+				return nil, fmt.Errorf("unexpected Graph locator in legacy preparation")
+			}
+		}
+	}
+	if policy == sqlpolicy.ManagedGraphRequestMaterializationPolicy {
+		if err := validateGraphPreparedInventory(handoffDir, true); err != nil {
+			return nil, err
+		}
+		actual, err := preparedGraphArtifacts(ctx, handoffDir, false)
+		if err != nil {
+			return nil, err
+		}
+		if !equalGraphArtifacts(actual, m.Files) {
+			return nil, fmt.Errorf("prepared Graph artifact inventory differs")
+		}
+	}
+	var handoffState materializer.ManagedApplicationState
+	var handoffTip uint64
+	if managedSQLKVPolicy(policy) {
+		if err := validateMixedPreparedInventory(handoffDir, true); err != nil {
+			return nil, err
+		}
+		handoffState, handoffTip, err = inspectManagedFileForPolicy(ctx, filepath.Join(handoffDir, "sqlite.db"), window, policy, applicationProtocol)
+		if err != nil {
+			return nil, fmt.Errorf("inspect mixed handoff: %w", err)
+		}
+	}
+	view, err := openReadOnlyViewAtHeadForPolicy(ctx, bucket, prefix, configID, bootstrap, m.Head, policy, window, m.GraphLocator, trustedReconfiguration, applicationProtocol)
 	if err != nil {
 		return nil, err
 	}
-	sqlHash, err := preparedFileHash(filepath.Join(handoffDir, "sqlite.db"), false)
+	if managedSQLKVPolicy(policy) && handoffTip != uint64(view.Tip()) {
+		return nil, fmt.Errorf("mixed handoff tip differs from verified history")
+	}
+	var sqlHash [32]byte
+	if policy == sqlpolicy.ManagedGraphRequestMaterializationPolicy {
+		sqlHash = m.Files[0].SHA256
+	} else {
+		sqlHash, err = preparedFileHash(filepath.Join(handoffDir, "sqlite.db"), false)
+	}
 	if err != nil || sqlHash != m.SQLiteHash {
 		return nil, fmt.Errorf("prepared SQLite integrity mismatch")
 	}
@@ -172,18 +306,39 @@ func LoadPreparedStartup(ctx context.Context, bucket objstore.Bucket, prefix str
 	if err != nil || !bytes.Equal(got, want) {
 		return nil, fmt.Errorf("prepared suffix differs from verified history")
 	}
-	verified, err := PrepareReadOnlyRestore(ctx, view, verifiedTargetDir)
+	verified, err := PrepareReadOnlyRestoreForPolicy(ctx, view, verifiedTargetDir, policy, window)
 	if err != nil {
 		return nil, fmt.Errorf("reconstruct prepared state in %s: %w", verifiedTargetDir, err)
 	}
-	if _, err = preparedFileHash(verified.SQLitePath, true); err != nil {
+	if policy == sqlpolicy.ManagedGraphRequestMaterializationPolicy {
+		if _, err := preparedGraphArtifacts(ctx, verifiedTargetDir, true); err != nil {
+			return nil, err
+		}
+	} else if _, err = preparedFileHash(verified.SQLitePath, true); err != nil {
 		return nil, err
 	}
 	if _, err = preparedFileHash(verified.SuffixPath, true); err != nil {
 		return nil, err
 	}
-	if _, err = preparedGraphTree(verifiedTargetDir, true); err != nil {
-		return nil, err
+	if policy == sqlpolicy.ManagedGraphRequestMaterializationPolicy {
+		if err := validateGraphPreparedInventory(verifiedTargetDir, false); err != nil {
+			return nil, err
+		}
+	} else if policy == sqlpolicy.LegacyMaterializationPolicy {
+		if _, err = preparedGraphTree(verifiedTargetDir, true); err != nil {
+			return nil, err
+		}
+	} else {
+		if err := validateMixedPreparedInventory(verifiedTargetDir, false); err != nil {
+			return nil, err
+		}
+		state, tip, err := inspectManagedFileForPolicy(ctx, verified.SQLitePath, window, policy, applicationProtocol)
+		if err != nil {
+			return nil, err
+		}
+		if tip != handoffTip || state != handoffState {
+			return nil, fmt.Errorf("mixed handoff evidence differs from independent reconstruction")
+		}
 	}
 	for _, dir := range []string{verifiedTargetDir, filepath.Dir(verifiedTargetDir)} {
 		f, err := os.Open(dir)
@@ -195,6 +350,104 @@ func LoadPreparedStartup(ctx context.Context, bucket objstore.Bucket, prefix str
 		}
 	}
 	return &VerifiedPreparedStartup{dir: verifiedTargetDir, view: view, identity: expected}, nil
+}
+
+func preparedVersion(policy sqlpolicy.MaterializationPolicy, window uint64) (int, error) {
+	if err := validateReadOnlyPolicy(policy, window); err != nil {
+		return 0, err
+	}
+	if policy == sqlpolicy.ManagedGraphRequestMaterializationPolicy {
+		return 4, nil
+	}
+	if policy == sqlpolicy.ManagedRequestMaterializationPolicy {
+		return 3, nil
+	}
+	if managedSQLKVPolicy(policy) {
+		return 2, nil
+	}
+	if window != types.DefaultIdempotencyWindowSlots {
+		return 0, fmt.Errorf("legacy handoff requires the default idempotency window")
+	}
+	return 1, nil
+}
+
+// The caller excludes source replacement. Lstat prevents following entries
+// outside its handoff/cache before any SQLite inspector opens them.
+func validateMixedPreparedInventory(root string, completed bool) error {
+	info, err := os.Lstat(root)
+	if err != nil {
+		return err
+	}
+	if !info.IsDir() || info.Mode()&os.ModeSymlink != 0 {
+		return fmt.Errorf("invalid mixed preparation directory")
+	}
+	if err := materializer.ValidateManagedRestoreState(filepath.Join(root, "sqlite.db")); err != nil {
+		return err
+	}
+	entries, err := os.ReadDir(root)
+	if err != nil {
+		return err
+	}
+	seen := make(map[string]bool, len(entries))
+	for _, entry := range entries {
+		name := entry.Name()
+		info, err := os.Lstat(filepath.Join(root, name))
+		if err != nil {
+			return err
+		}
+		if name == "checkpoint" {
+			if !info.IsDir() || info.Mode()&os.ModeSymlink != 0 {
+				return fmt.Errorf("invalid mixed checkpoint cache")
+			}
+			if err := validateMixedCheckpointCache(filepath.Join(root, name)); err != nil {
+				return err
+			}
+		} else {
+			switch name {
+			case "sqlite.db", "sqlite.db-wal", "sqlite.db-shm", "certified-suffix.json", "completed.json", "completion.pending":
+			default:
+				return fmt.Errorf("unsupported mixed preparation entry %q", name)
+			}
+			if !info.Mode().IsRegular() {
+				return fmt.Errorf("invalid mixed preparation file %q", name)
+			}
+		}
+		seen[name] = true
+	}
+	for _, name := range []string{"checkpoint", "sqlite.db", "certified-suffix.json"} {
+		if !seen[name] {
+			return fmt.Errorf("missing mixed preparation entry %q", name)
+		}
+	}
+	if completed && !seen["completed.json"] {
+		return fmt.Errorf("mixed completion marker missing")
+	}
+	return nil
+}
+
+func validateMixedCheckpointCache(dir string) error {
+	if err := materializer.ValidateManagedRestoreState(filepath.Join(dir, "sqlite.db")); err != nil {
+		return err
+	}
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return err
+	}
+	for _, entry := range entries {
+		switch entry.Name() {
+		case "sqlite.db", "sqlite.db-wal", "sqlite.db-shm":
+		default:
+			return fmt.Errorf("unsupported mixed checkpoint cache entry %q", entry.Name())
+		}
+		info, err := os.Lstat(filepath.Join(dir, entry.Name()))
+		if err != nil {
+			return err
+		}
+		if !info.Mode().IsRegular() {
+			return fmt.Errorf("invalid mixed checkpoint cache file")
+		}
+	}
+	return nil
 }
 
 func readPreparedMarker(name string) (data []byte, resultErr error) {

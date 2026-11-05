@@ -1,9 +1,9 @@
 name: Application image
 
 # Publishes a digest-pinned release application image from the repository
-# Dockerfile, which installs /usr/local/bin/rhiza and /usr/local/bin/rhiza-fencer.
-# This is the supervised workload for the voterCount GCS/Chaos harness; it is not
-# the e2e/chaos qualification host, which serves the older rhiza-entrypoint flow.
+# Dockerfile, which installs /usr/local/bin/rhiza, without a fencing supervisor.
+# It is not an image for the retired supervised voterCount GCS/Chaos launcher
+# or the older e2e/chaos rhiza-entrypoint host. Optional DR proof code is separate.
 # Only the immutable tag sha-<commit> is pushed, and an existing tag is never
 # retargeted. Dispatch this workflow against the exact release commit.
 on:

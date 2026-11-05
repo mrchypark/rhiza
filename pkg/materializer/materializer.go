@@ -25,6 +25,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/mrchypark/rhiza/internal/localtesthooks"
 	"github.com/mrchypark/rhiza/internal/types"
 	"github.com/mrchypark/rhiza/pkg/quepaxa"
 	"github.com/ncruces/go-sqlite3"
@@ -81,6 +82,9 @@ type Materializer struct {
 	dbPath                   string
 	readersN                 int
 	idempotencyWindow        uint64
+	managedProtocol          string
+	materializationPolicy    sqlpolicy.MaterializationPolicy
+	commitUnknown            bool
 	sqlReceiptRetention      sqlReceiptRetentionUsage
 	afterApplyCommitError    func() error
 	recentSQLReceipts        map[string]storedReceipt
@@ -135,12 +139,20 @@ type CheckpointFile struct {
 }
 
 type sqliteSnapshot struct {
-	conn  *sql.Conn
-	index uint64
+	conn    *sql.Conn
+	index   uint64
+	release func()
 }
 
 // Open opens or creates a materializer.
 func Open(dbPath string, readerCount int, idempotencyWindow ...uint64) (*Materializer, error) {
+	return openWithProtocol(dbPath, readerCount, "", idempotencyWindow...)
+}
+
+func openWithProtocol(dbPath string, readerCount int, protocol string, idempotencyWindow ...uint64) (*Materializer, error) {
+	if protocol != "" && protocol != types.ManagedApplicationProtocolSQLKV && !originalsProtocol(protocol) {
+		return nil, fmt.Errorf("unsupported managed application protocol")
+	}
 	// SQLite receives this path as a file: URL, where a relative path lands in the
 	// authority part and resolves against the filesystem root. Resolve it first so
 	// a relative data directory stays where the caller's working directory is.
@@ -149,6 +161,26 @@ func Open(dbPath string, readerCount int, idempotencyWindow ...uint64) (*Materia
 		return nil, fmt.Errorf("resolve database path: %w", err)
 	}
 	dbPath = absolute
+	if graphProtocol(protocol) {
+		if err := ValidateCleanRestoreState(dbPath); err != nil {
+			return nil, err
+		}
+	}
+	if protocol != "" && !graphProtocol(protocol) {
+		if err := validateManagedArtifacts(dbPath); err != nil {
+			return nil, err
+		}
+	}
+	if _, err := os.Stat(dbPath); err == nil {
+		if err := sqlpolicy.CheckFileForPolicy(context.Background(), dbPath, policyForProtocol(protocol)); err != nil {
+			return nil, err
+		}
+		if err := checkManagedPolicyFile(context.Background(), dbPath, protocol, idempotencyWindow...); err != nil {
+			return nil, err
+		}
+	} else if !os.IsNotExist(err) {
+		return nil, err
+	}
 	if _, err := os.Lstat(localRestoreJournalPath(dbPath)); err == nil {
 		return nil, fmt.Errorf("Local restore journal requires exact validated WAL-base recovery")
 	} else if !os.IsNotExist(err) {
@@ -157,7 +189,7 @@ func Open(dbPath string, readerCount int, idempotencyWindow ...uint64) (*Materia
 	if err := recoverRestore(dbPath); err != nil {
 		return nil, fmt.Errorf("recover interrupted restore: %w", err)
 	}
-	return openMaterializer(dbPath, readerCount, idempotencyWindow...)
+	return openMaterializerPolicy(dbPath, readerCount, protocol, idempotencyWindow...)
 }
 
 // ValidateCleanRestoreState is a read-only Local startup guard. Restore
@@ -182,6 +214,12 @@ func ValidateCleanRestoreState(dbPath string) error {
 // ConfigureLocalGraphNodePropertyIndexes declares node-local derived indexes.
 // The declaration is retained and reconciled after materializer replacement.
 func (m *Materializer) ConfigureLocalGraphNodePropertyIndexes(indexes []types.GraphNodePropertyIndex) error {
+	if m.managedProtocol != "" {
+		if len(indexes) != 0 {
+			return fmt.Errorf("mixed materialization does not support Graph indexes")
+		}
+		return nil
+	}
 	deduped, err := ValidateLocalGraphNodePropertyIndexes(indexes)
 	if err != nil {
 		return err
@@ -218,6 +256,10 @@ func ValidateLocalGraphNodePropertyIndexes(indexes []types.GraphNodePropertyInde
 }
 
 func openMaterializer(dbPath string, readerCount int, idempotencyWindow ...uint64) (*Materializer, error) {
+	return openMaterializerPolicy(dbPath, readerCount, "", idempotencyWindow...)
+}
+
+func openMaterializerPolicy(dbPath string, readerCount int, protocol string, idempotencyWindow ...uint64) (*Materializer, error) {
 	if readerCount < 1 {
 		return nil, fmt.Errorf("reader count must be positive")
 	}
@@ -236,14 +278,37 @@ func openMaterializer(dbPath string, readerCount int, idempotencyWindow ...uint6
 	}
 	fileURL := (&url.URL{Scheme: "file", Path: filepath.ToSlash(dbPath)}).String()
 	if existing {
-		if err := sqlpolicy.CheckFile(context.Background(), dbPath); err != nil {
+		if err := sqlpolicy.CheckFileForPolicy(context.Background(), dbPath, policyForProtocol(protocol)); err != nil {
 			return nil, err
+		}
+		if err := checkManagedPolicyFile(context.Background(), dbPath, protocol, window); err != nil {
+			return nil, err
+		}
+	}
+	if protocol != "" {
+		if graphProtocol(protocol) {
+			if existing {
+				if _, _, err := inspectApplicationFile(context.Background(), dbPath, window, protocol); err != nil {
+					return nil, fmt.Errorf("validate stored graph SQL projection: %w", err)
+				}
+			}
+		} else {
+			if err := validateManagedGraphAbsence(dbPath); err != nil {
+				return nil, err
+			}
+			if existing {
+				if _, _, err := inspectApplicationFile(context.Background(), dbPath, window, protocol); err != nil {
+					return nil, fmt.Errorf("validate stored mixed application: %w", err)
+				}
+			}
 		}
 	}
 	// Check an existing graph policy before opening SQLite with a writer or
 	// opening LatticeDB writable. Old graph state is incompatible, not migrated.
-	if err := ValidateLocalGraphStorage(filepath.Join(filepath.Dir(dbPath), "latticedb", "graph.ltdb"), true); err != nil {
-		return nil, fmt.Errorf("incompatible graph materialization: %w", err)
+	if protocol == "" {
+		if err := ValidateLocalGraphStorage(filepath.Join(filepath.Dir(dbPath), "latticedb", "graph.ltdb"), true); err != nil {
+			return nil, fmt.Errorf("incompatible graph materialization: %w", err)
+		}
 	}
 	// QLog is the durable source of truth; SQLite is replayable materialized
 	// state, so NORMAL avoids a redundant per-command durability barrier.
@@ -277,17 +342,19 @@ func openMaterializer(dbPath string, readerCount int, idempotencyWindow ...uint6
 	readers := []*sql.DB{reader}
 
 	m := &Materializer{
-		db:                db,
-		writer:            writer,
-		readers:           readers,
-		dbPath:            dbPath,
-		readersN:          readerCount,
-		idempotencyWindow: window,
-		recentSQLReceipts: make(map[string]storedReceipt),
-		subs:              make(map[uint64]notificationSubscription),
-		notifyQueue:       make(chan pendingNotification, notificationDispatchDepth),
-		notifyStop:        make(chan struct{}),
-		walCheckpointStop: make(chan struct{}),
+		db:                    db,
+		writer:                writer,
+		readers:               readers,
+		dbPath:                dbPath,
+		readersN:              readerCount,
+		idempotencyWindow:     window,
+		managedProtocol:       protocol,
+		materializationPolicy: policyForProtocol(protocol),
+		recentSQLReceipts:     make(map[string]storedReceipt),
+		subs:                  make(map[uint64]notificationSubscription),
+		notifyQueue:           make(chan pendingNotification, notificationDispatchDepth),
+		notifyStop:            make(chan struct{}),
+		walCheckpointStop:     make(chan struct{}),
 	}
 	m.notifyWG.Add(1)
 	go m.runNotifications()
@@ -309,12 +376,20 @@ func openMaterializer(dbPath string, readerCount int, idempotencyWindow ...uint6
 		m.Close()
 		return nil, fmt.Errorf("load SQL receipts: %w", err)
 	}
-	graph, err := openGraph(filepath.Join(filepath.Dir(dbPath), "latticedb"), m.tip, window)
-	if err != nil {
-		m.Close()
-		return nil, fmt.Errorf("open graph materializer: %w", err)
+	if protocol == "" || graphProtocol(protocol) {
+		graph, err := openGraphForPolicy(filepath.Join(filepath.Dir(dbPath), "latticedb"), m.tip, window, graphProtocol(protocol))
+		if err != nil {
+			m.Close()
+			return nil, fmt.Errorf("open graph materializer: %w", err)
+		}
+		m.graph = graph
+		if graphProtocol(protocol) {
+			if err := m.validateGraphHistoryLocked(context.Background(), false); err != nil {
+				m.Close()
+				return nil, err
+			}
+		}
 	}
-	m.graph = graph
 	m.walCheckpointWG.Add(1)
 	go m.runSQLiteCheckpoints()
 
@@ -392,7 +467,20 @@ func (m *Materializer) loadTip(existing bool) error {
 			return fmt.Errorf("existing database has no applied slot; rebuild it from the decision log")
 		}
 		zeroHash := hex.EncodeToString(make([]byte, sha256.Size))
-		if _, err := m.writer.Exec(`INSERT INTO _rhiza_meta(key, value) VALUES ('sql_execution_policy', ?), ('sql_idempotency_window', ?), ('sql_receipt_result_bytes', '0'), ('sql_receipt_count', '0'), ('applied_slot', '0'), ('state_slot', '0'), ('applied_hash', ?)`, sqlpolicy.Marker(), strconv.FormatUint(m.idempotencyWindow, 10), zeroHash); err != nil {
+		query := `INSERT INTO _rhiza_meta(key, value) VALUES ('sql_execution_policy', ?), ('sql_idempotency_window', ?), ('sql_receipt_result_bytes', '0'), ('sql_receipt_count', '0'), ('applied_slot', '0'), ('state_slot', '0'), ('applied_hash', ?)`
+		args := []any{strconv.Itoa(int(m.materializationPolicy)), strconv.FormatUint(m.idempotencyWindow, 10), zeroHash}
+		if m.managedProtocol != "" {
+			query += `, ('managed_application_protocol', ?), ('managed_application_policy', ?)`
+			args = append(args, m.managedProtocol, managedApplicationPolicy)
+		}
+		if originalsPolicy(m.materializationPolicy) {
+			query += `, ('request_original_bytes','0')`
+		}
+		if graphProtocol(m.managedProtocol) {
+			query += `, ('last_graph_slot','0'), ('graph_history_hash',?)`
+			args = append(args, zeroHash)
+		}
+		if _, err := m.writer.Exec(query, args...); err != nil {
 			return err
 		}
 		value = "0"
@@ -428,11 +516,14 @@ func (m *Materializer) loadTip(existing bool) error {
 
 // ValidateTip checks that materialized state agrees with the recovered log.
 func (m *Materializer) ValidateTip(slot uint64, value []byte) error {
-	if err := types.ValidateExecutionPolicy(value); err != nil {
+	if err := m.validateExecutionPolicy(value); err != nil {
 		return err
 	}
 	m.mu.RLock()
 	defer m.mu.RUnlock()
+	if err := m.sqlReceiptReadLocked(); err != nil {
+		return err
+	}
 	if m.tip != slot {
 		return fmt.Errorf("materialized tip %d does not match recovered tip %d", m.tip, slot)
 	}
@@ -495,6 +586,10 @@ func (m *Materializer) initSchema() error {
 	}
 	if incompatible != 0 {
 		return fmt.Errorf("incompatible idempotency schema; rebuild from the certified log")
+	}
+	if originalsPolicy(m.materializationPolicy) {
+		_, err = m.db.Exec(requestOriginalDDL)
+		return err
 	}
 	return nil
 }
@@ -659,6 +754,12 @@ func receiptQuery() string {
 
 // sqlReceiptReadLocked checks the uncertainty state while m.mu is held.
 func (m *Materializer) sqlReceiptReadLocked() error {
+	if graphProtocol(m.managedProtocol) {
+		return m.graphReadableLocked()
+	}
+	if m.commitUnknown {
+		return ErrGraphCommitUnknown
+	}
 	if m.graph == nil {
 		return nil
 	}
@@ -671,7 +772,10 @@ func (m *Materializer) sqlReceiptReadLocked() error {
 }
 
 func (m *Materializer) MutationReceipt(ctx context.Context, kind types.MutationKind, requestID string) (types.MutationReceipt, bool, error) {
-	if kind == types.MutationSQL {
+	if kind == types.MutationGraph && graphProtocol(m.managedProtocol) {
+		return m.GraphMutationReceipt(ctx, requestID)
+	}
+	if kind == types.MutationSQL || m.managedProtocol != "" && kind != types.MutationGraph {
 		m.mu.RLock()
 		defer m.mu.RUnlock()
 		if err := m.sqlReceiptReadLocked(); err != nil {
@@ -710,7 +814,7 @@ func (m *Materializer) MutationReceipt(ctx context.Context, kind types.MutationK
 }
 
 func (m *Materializer) requestMatches(ctx context.Context, kind types.MutationKind, requestID string, fingerprint [32]byte) (bool, bool, error) {
-	if kind == types.MutationSQL {
+	if kind == types.MutationSQL || m.managedProtocol != "" && kind != types.MutationGraph {
 		m.mu.RLock()
 		defer m.mu.RUnlock()
 		if err := m.sqlReceiptReadLocked(); err != nil {
@@ -1065,6 +1169,18 @@ func (m *Materializer) pruneReceipts(ctx context.Context, tx *sql.Tx, tip uint64
 	if err := m.sqlReceiptRetention.remove(uint64(resultBytes), uint64(receipts)); err != nil {
 		return err
 	}
+	if originalsPolicy(m.materializationPolicy) {
+		var expiredBytes int64
+		if err := tx.QueryRowContext(ctx, `SELECT COALESCE(SUM(length(execution)),0) FROM _rhiza_request_original WHERE commit_slot < ?`, floor).Scan(&expiredBytes); err != nil {
+			return err
+		}
+		if err := adjustOriginalBytes(ctx, tx, -expiredBytes); err != nil {
+			return err
+		}
+		if _, err := tx.ExecContext(ctx, `DELETE FROM _rhiza_request_original WHERE commit_slot < ?`, floor); err != nil {
+			return err
+		}
+	}
 	_, err := tx.ExecContext(ctx, `DELETE FROM _rhiza_idempotency WHERE commit_slot < ?`, floor)
 	return err
 }
@@ -1075,9 +1191,11 @@ type pendingNotification struct {
 }
 
 type pendingSQLReceipt struct {
-	requestID string
-	record    storedReceipt
-	persisted bool
+	requestID     string
+	record        storedReceipt
+	persisted     bool
+	executionItem []byte
+	batchIndex    uint32
 }
 
 // Apply applies one decided value.
@@ -1088,7 +1206,7 @@ func (m *Materializer) Apply(ctx context.Context, slot uint64, value []byte) err
 // ApplyBatch materializes a contiguous decision page with one SQLite commit.
 func (m *Materializer) ApplyBatch(ctx context.Context, decisions []quepaxa.DecidedValue) (applyErr error) {
 	for _, decision := range decisions {
-		if err := types.ValidateExecutionPolicy(decision.Value); err != nil {
+		if err := m.validateExecutionPolicy(decision.Value); err != nil {
 			return err
 		}
 	}
@@ -1099,6 +1217,12 @@ func (m *Materializer) ApplyBatch(ctx context.Context, decisions []quepaxa.Decid
 	defer m.mu.Unlock()
 	if m.writer == nil {
 		return sql.ErrConnDone
+	}
+	if err := m.fatalHealthLocked(); err != nil {
+		return err
+	}
+	if err := m.validateGraphHistoryLocked(ctx, false); err != nil {
+		return err
 	}
 	if m.graph != nil {
 		m.graph.mu.RLock()
@@ -1128,6 +1252,11 @@ func (m *Materializer) ApplyBatch(ctx context.Context, decisions []quepaxa.Decid
 			_ = conn.Raw(func(any) error { return sqldriver.ErrBadConn })
 		}
 	}()
+	if m.managedProtocol != "" {
+		if err := checkManagedPolicy(ctx, tx, m.managedProtocol, m.idempotencyWindow); err != nil {
+			return err
+		}
+	}
 	statements := make(map[string]*sql.Stmt)
 	defer func() {
 		for _, statement := range statements {
@@ -1183,6 +1312,7 @@ func (m *Materializer) ApplyBatch(ctx context.Context, decisions []quepaxa.Decid
 		commitErr = m.afterApplyCommitError()
 	}
 	if commitErr != nil {
+		m.commitUnknown = true
 		m.tip, m.stateTip, m.tipHash = oldTip, oldStateTip, oldHash
 		if m.graph != nil {
 			m.graph.mu.Lock()
@@ -1261,15 +1391,58 @@ func (m *Materializer) enqueueNotification(notification pendingNotification) {
 }
 
 func (m *Materializer) applyValueLocked(ctx context.Context, conn *sql.Conn, tx *sql.Tx, statements map[string]*sql.Stmt, slot uint64, value []byte, hash [32]byte, confirmedGraphThrough uint64, pending *[]pendingNotification) error {
-	if err := m.pruneReceipts(ctx, tx, slot); err != nil {
+	if m.managedProtocol != "" {
+		application, err := managedApplicationValue(value)
+		if graphProtocol(m.managedProtocol) {
+			_, isGraph, decodeErr := types.DecodeManagedGraphExecution(value)
+			if decodeErr != nil {
+				return decodeErr
+			}
+			if isGraph {
+				application = true
+				err = nil
+			}
+		}
+		if err != nil {
+			return err
+		}
+		if application {
+			// Earlier values in this same batch must be visible to pruning and its
+			// accounting before their retained window can expire.
+			if err := m.flushPendingSQLReceipts(ctx, tx, statements); err != nil {
+				return err
+			}
+			if err := m.pruneReceipts(ctx, tx, slot); err != nil {
+				return err
+			}
+		}
+	} else if err := m.pruneReceipts(ctx, tx, slot); err != nil {
 		return fmt.Errorf("prune idempotency receipts: %w", err)
 	}
 	graphCommands, graph, err := types.DecodeGraphBatch(value)
+	if graphProtocol(m.managedProtocol) {
+		var command types.GraphCommand
+		command, graph, err = types.DecodeManagedGraphExecution(value)
+		graphCommands = nil
+		if graph {
+			graphCommands = []types.GraphCommand{command}
+		}
+	}
 	if err != nil {
 		return fmt.Errorf("decode graph batch: %w", err)
 	}
-	if err := m.applyGraph(ctx, slot, value, graphCommands, graph, confirmedGraphThrough); err != nil {
-		return err
+	if m.managedProtocol == "" || graphProtocol(m.managedProtocol) {
+		if err := m.applyGraph(ctx, slot, value, graphCommands, graph, confirmedGraphThrough); err != nil {
+			return err
+		}
+		if graph && graphProtocol(m.managedProtocol) {
+			if localtesthooks.Enabled {
+				localtesthooks.Hit("materializer:graph:after-native-before-sqlite")
+			}
+			if err := foldSQLiteGraphHistory(ctx, tx, slot, hash); err != nil {
+				return err
+			}
+		}
 	}
 
 	notifyCommand, notify, err := types.DecodeNotifyCommand(value)
@@ -1277,10 +1450,16 @@ func (m *Materializer) applyValueLocked(ctx context.Context, conn *sql.Conn, tx 
 		return fmt.Errorf("decode notification: %w", err)
 	}
 	kvCommand, kv, err := types.DecodeKVCommand(value)
+	if m.managedProtocol != "" {
+		kvCommand, kv, err = types.DecodeManagedKVCommand(value)
+	}
 	if err != nil {
 		return fmt.Errorf("decode KV command: %w", err)
 	}
 	kvCommands, kvBatch, err := types.DecodeKVBatch(value)
+	if m.managedProtocol != "" {
+		kvCommands, kvBatch, err = types.DecodeManagedKVBatch(value)
+	}
 	if err != nil {
 		return fmt.Errorf("decode KV batch: %w", err)
 	}
@@ -1336,14 +1515,14 @@ func (m *Materializer) applyValueLocked(ctx context.Context, conn *sql.Conn, tx 
 		commands = nil
 		batched = true
 	} else if kv {
-		if err := m.applyKV(ctx, tx, slot, kvCommand); err != nil {
+		if err := m.applyKV(ctx, tx, slot, kvCommand, 0); err != nil {
 			return err
 		}
 		commands = nil
 		batched = true
 	} else if kvBatch {
-		for _, command := range kvCommands {
-			if err := m.applyKV(ctx, tx, slot, command); err != nil {
+		for index, command := range kvCommands {
+			if err := m.applyKV(ctx, tx, slot, command, uint32(index)); err != nil {
 				return err
 			}
 		}
@@ -1353,7 +1532,7 @@ func (m *Materializer) applyValueLocked(ctx context.Context, conn *sql.Conn, tx 
 		return sqlpolicy.ErrIncompatible
 	}
 	pendingStart := len(m.pendingSQLReceipts)
-	for _, command := range commands {
+	for commandIndex, command := range commands {
 		if err := ValidateSQLCommand(command); err != nil {
 			return fmt.Errorf("validate SQL request %q: %w", command.RequestID, err)
 		}
@@ -1448,7 +1627,15 @@ func (m *Materializer) applyValueLocked(ctx context.Context, conn *sql.Conn, tx 
 				receipt = types.MutationReceipt{Slot: slot, Status: types.MutationRejected, ErrorCode: types.MutationErrorCodeResultRetentionFull, RetryThroughSlot: slot + m.idempotencyWindow - 1}
 			}
 			m.sqlReceiptRetention.add(uint64(len(encodedResult)))
-			m.pendingSQLReceipts = append(m.pendingSQLReceipts, pendingSQLReceipt{requestID: command.RequestID, record: storedReceipt{fingerprint: fingerprint, receipt: receipt, sqlResult: storedResult}})
+			pendingReceipt := pendingSQLReceipt{requestID: command.RequestID, record: storedReceipt{fingerprint: fingerprint, receipt: receipt, sqlResult: storedResult}}
+			if originalsPolicy(m.materializationPolicy) {
+				pendingReceipt.executionItem, err = types.EncodeSQLBatchItem(command)
+				if err != nil {
+					return err
+				}
+				pendingReceipt.batchIndex = uint32(commandIndex)
+			}
+			m.pendingSQLReceipts = append(m.pendingSQLReceipts, pendingReceipt)
 			m.pendingSQLResultBytes += sqlResultWorkingBytes(storedResult)
 			if m.pendingSQLResultBytes >= MaxMutationResultBytes {
 				if err := m.flushPendingSQLReceipts(ctx, tx, statements); err != nil {
@@ -1529,7 +1716,7 @@ func (m *Materializer) NotificationDrops() uint64 {
 	return m.notifyDrops.Load()
 }
 
-func (m *Materializer) applyKV(ctx context.Context, tx *sql.Tx, slot uint64, command types.KVCommand) error {
+func (m *Materializer) applyKV(ctx context.Context, tx *sql.Tx, slot uint64, command types.KVCommand, batchIndex uint32) error {
 	if command.RequestID == "" || len(command.RequestID) > types.MaxRequestIDBytes || command.Key == "" || len(command.Key) > 1024 || len(command.Value) > 16<<20 {
 		return fmt.Errorf("invalid KV command")
 	}
@@ -1538,7 +1725,7 @@ func (m *Materializer) applyKV(ctx context.Context, tx *sql.Tx, slot uint64, com
 	default:
 		return fmt.Errorf("invalid KV operation %q", command.Operation)
 	}
-	fingerprint, err := types.KVFingerprint(command)
+	fingerprint, err := m.kvFingerprint(command)
 	if err != nil {
 		return err
 	}
@@ -1577,11 +1764,25 @@ func (m *Materializer) applyKV(ctx context.Context, tx *sql.Tx, slot uint64, com
 	if err != nil {
 		return err
 	}
-	return insertReceipt(ctx, tx, types.MutationKV, command.RequestID, fingerprint, receipt)
+	if err := insertReceipt(ctx, tx, types.MutationKV, command.RequestID, fingerprint, receipt); err != nil {
+		return err
+	}
+	if originalsPolicy(m.materializationPolicy) {
+		item, err := types.EncodeManagedKVBatchItem(command)
+		if err != nil {
+			return err
+		}
+		return insertRequestOriginal(ctx, tx, types.MutationKV, command.RequestID, slot, batchIndex, item)
+	}
+	return nil
 }
 
 // KVGet reads a non-expired value from the local materialized state.
 func (m *Materializer) KVGet(ctx context.Context, key string, now time.Time) ([]byte, bool, error) {
+	if m.managedProtocol != "" {
+		value, found, _, err := m.KVGetAt(ctx, key, now)
+		return value, found, err
+	}
 	reader, err := m.reader()
 	if err != nil {
 		return nil, false, err
@@ -1596,6 +1797,9 @@ func (m *Materializer) KVGet(ctx context.Context, key string, now time.Time) ([]
 
 // KVGetAt reads a value and the applied slot from one SQLite snapshot.
 func (m *Materializer) KVGetAt(ctx context.Context, key string, now time.Time) ([]byte, bool, uint64, error) {
+	if m.managedProtocol != "" {
+		return m.managedKVGetAt(ctx, key, now)
+	}
 	reader, err := m.reader()
 	if err != nil {
 		return nil, false, 0, err
@@ -1620,7 +1824,7 @@ func (m *Materializer) KVGetAt(ctx context.Context, key string, now time.Time) (
 }
 
 func (m *Materializer) KVRequestMatches(ctx context.Context, command types.KVCommand) (bool, error) {
-	fingerprint, err := types.KVFingerprint(command)
+	fingerprint, err := m.kvFingerprint(command)
 	if err != nil {
 		return false, err
 	}
@@ -2152,6 +2356,12 @@ func (m *Materializer) flushPendingSQLReceipts(ctx context.Context, tx *sql.Tx, 
 		return fmt.Errorf("SQL request appeared during apply")
 	}
 	for i := start; i < len(m.pendingSQLReceipts); i++ {
+		pending := &m.pendingSQLReceipts[i]
+		if originalsPolicy(m.materializationPolicy) {
+			if err := insertRequestOriginal(ctx, tx, types.MutationSQL, pending.requestID, pending.record.receipt.Slot, pending.batchIndex, pending.executionItem); err != nil {
+				return err
+			}
+		}
 		m.pendingSQLReceipts[i].record.sqlResult = types.SQLCommandResult{}
 		m.pendingSQLReceipts[i].persisted = true
 	}
@@ -2306,6 +2516,9 @@ func (m *Materializer) SQLRequestStatusFingerprint(ctx context.Context, requestI
 
 // Query executes a read query.
 func (m *Materializer) Query(ctx context.Context, query string, args ...interface{}) (*sql.Rows, error) {
+	if m.managedProtocol != "" {
+		return nil, fmt.Errorf("mixed reads require bounded QueryResult")
+	}
 	if err := validatePublicSQL(query); err != nil {
 		return nil, err
 	}
@@ -2327,6 +2540,10 @@ func queryContextCause(ctx context.Context, err error) error {
 
 // QueryResult executes a bounded read query and materializes its result.
 func (m *Materializer) QueryResult(ctx context.Context, query string, args []any) (types.SQLStatementResult, error) {
+	if m.managedProtocol != "" {
+		result, _, err := m.QueryResultAt(ctx, query, args)
+		return result, err
+	}
 	if strings.TrimSpace(query) == "" || len(query) > MaxSQLBytes {
 		return types.SQLStatementResult{}, fmt.Errorf("invalid SQL query")
 	}
@@ -2436,23 +2653,38 @@ func (m *Materializer) SnapshotTo(ctx context.Context, writer io.Writer) (uint64
 
 func (m *Materializer) beginSQLiteSnapshot(ctx context.Context) (*sqliteSnapshot, error) {
 	m.mu.RLock()
+	defer m.mu.RUnlock()
+	if err := m.sqlReceiptReadLocked(); err != nil {
+		return nil, err
+	}
 	db := m.db
-	m.mu.RUnlock()
 	return beginSQLiteSnapshot(ctx, db)
 }
 
 func (m *Materializer) beginSQLiteReadSnapshot(ctx context.Context) (*sqliteSnapshot, error) {
 	m.mu.RLock()
+	if err := m.sqlReceiptReadLocked(); err != nil {
+		m.mu.RUnlock()
+		return nil, err
+	}
 	var reader *sql.DB
 	if len(m.readers) != 0 {
 		reader = m.readers[0]
 	}
-	m.mu.RUnlock()
-	return beginSQLiteSnapshot(ctx, reader)
+	snapshot, err := beginSQLiteSnapshot(ctx, reader)
+	if err != nil || m.managedProtocol == "" {
+		m.mu.RUnlock()
+	} else {
+		snapshot.release = m.mu.RUnlock
+	}
+	return snapshot, err
 }
 
 // beginSQLiteSnapshotLocked is for callers that already hold m.mu.
 func (m *Materializer) beginSQLiteSnapshotLocked(ctx context.Context) (*sqliteSnapshot, error) {
+	if err := m.sqlReceiptReadLocked(); err != nil {
+		return nil, err
+	}
 	return beginSQLiteSnapshot(ctx, m.db)
 }
 
@@ -2498,6 +2730,10 @@ func (snapshot *sqliteSnapshot) Close() error {
 	if snapshot == nil || snapshot.conn == nil {
 		return nil
 	}
+	if snapshot.release != nil {
+		defer snapshot.release()
+		snapshot.release = nil
+	}
 	_, rollbackErr := snapshot.conn.ExecContext(context.Background(), "ROLLBACK")
 	closeErr := snapshot.conn.Close()
 	snapshot.conn = nil
@@ -2509,6 +2745,9 @@ func (snapshot *sqliteSnapshot) Close() error {
 
 // CheckpointFilesAt captures fixed-role database files without packaging them.
 func (m *Materializer) CheckpointFilesAt(ctx context.Context) ([]CheckpointFile, uint64, func(), error) {
+	if m.managedProtocol != "" && !graphProtocol(m.managedProtocol) {
+		return m.managedCheckpointFilesAt(ctx)
+	}
 	dir := filepath.Dir(m.dbPath)
 	sqlite, err := os.CreateTemp(dir, ".rhiza-checkpoint-sqlite-*")
 	if err != nil {
@@ -2588,6 +2827,9 @@ func (m *Materializer) RestoreFile(ctx context.Context, snapshotPath string) err
 
 // RestoreCheckpoint atomically installs the exact fixed-role checkpoint set.
 func (m *Materializer) RestoreCheckpoint(ctx context.Context, files []CheckpointFile) error {
+	if m.managedProtocol != "" && !graphProtocol(m.managedProtocol) {
+		return m.restoreManagedCheckpoint(ctx, files)
+	}
 	var parts snapshotParts
 	seen := make(map[CheckpointRole]bool, len(files))
 	for _, file := range files {
@@ -2607,7 +2849,10 @@ func (m *Materializer) RestoreCheckpoint(ctx context.Context, files []Checkpoint
 	if parts.sqlitePath == "" || !seen[CheckpointGraphData] {
 		return fmt.Errorf("checkpoint requires SQLite and Graph files")
 	}
-	if err := sqlpolicy.CheckSnapshotFile(ctx, parts.sqlitePath); err != nil {
+	if err := sqlpolicy.CheckSnapshotFileForPolicy(ctx, parts.sqlitePath, m.materializationPolicy); err != nil {
+		return err
+	}
+	if err := checkManagedPolicySnapshot(ctx, parts.sqlitePath, m.managedProtocol, m.idempotencyWindow); err != nil {
 		return err
 	}
 	root, err := os.MkdirTemp(filepath.Dir(m.dbPath), ".rhiza-graph-restore-*")
@@ -2758,6 +3003,9 @@ func recoverRestore(dbPath string) error {
 func (m *Materializer) restoreParts(ctx context.Context, parts snapshotParts) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	if err := m.sqlReceiptReadLocked(); err != nil {
+		return err
+	}
 	dir := filepath.Dir(m.dbPath)
 	if parts.cleanup != nil {
 		defer parts.cleanup()
@@ -2788,7 +3036,7 @@ func (m *Materializer) restoreParts(ctx context.Context, parts snapshotParts) er
 	if closeErr != nil {
 		return fmt.Errorf("close snapshot: %w", closeErr)
 	}
-	check, err := openSQLite((&url.URL{Scheme: "file", Path: filepath.ToSlash(tempPath)}).String()+"?mode=ro", false)
+	check, err := openSQLite((&url.URL{Scheme: "file", Path: filepath.ToSlash(tempPath)}).String()+"?mode=ro&immutable=1", false)
 	if err != nil {
 		return fmt.Errorf("open snapshot: %w", err)
 	}
@@ -2799,7 +3047,7 @@ func (m *Materializer) restoreParts(ctx context.Context, parts snapshotParts) er
 		return fmt.Errorf("invalid snapshot: quick_check=%q err=%v", status, err)
 	}
 	backupPath := m.dbPath + ".restore-backup"
-	if err := sqlpolicy.CheckFile(ctx, tempPath); err != nil {
+	if err := sqlpolicy.CheckSnapshotFileForPolicy(ctx, tempPath, m.materializationPolicy); err != nil {
 		return err
 	}
 	graphPath := filepath.Join(dir, "latticedb")
@@ -2888,11 +3136,11 @@ func (m *Materializer) restoreParts(ctx context.Context, parts snapshotParts) er
 	if err := writeRestoreState(m.dbPath, state); err != nil {
 		return rollback(err)
 	}
-	restored, err := openMaterializer(m.dbPath, m.readersN, m.idempotencyWindow)
-	if err == nil {
+	restored, err := openMaterializerPolicy(m.dbPath, m.readersN, m.managedProtocol, m.idempotencyWindow)
+	if err == nil && (m.managedProtocol == "" || graphProtocol(m.managedProtocol)) {
 		err = restored.validateRestoredSnapshot()
 	}
-	if err == nil {
+	if err == nil && m.managedProtocol == "" {
 		err = ensureGraphNodePropertyIndexes(restored.graph, m.graphNodePropertyIndexes)
 		restored.graphNodePropertyIndexes = slices.Clone(m.graphNodePropertyIndexes)
 	}
@@ -2924,13 +3172,19 @@ func (m *Materializer) restoreParts(ctx context.Context, parts snapshotParts) er
 }
 
 func (m *Materializer) reopen() error {
-	reopened, err := Open(m.dbPath, m.readersN, m.idempotencyWindow)
+	open := openWithProtocol
+	if m.managedProtocol != "" {
+		open = openMaterializerPolicy
+	}
+	reopened, err := open(m.dbPath, m.readersN, m.managedProtocol, m.idempotencyWindow)
 	if err != nil {
 		return err
 	}
-	if err := ensureGraphNodePropertyIndexes(reopened.graph, m.graphNodePropertyIndexes); err != nil {
-		_ = reopened.Close()
-		return err
+	if m.managedProtocol == "" {
+		if err := ensureGraphNodePropertyIndexes(reopened.graph, m.graphNodePropertyIndexes); err != nil {
+			_ = reopened.Close()
+			return err
+		}
 	}
 	reopened.graphNodePropertyIndexes = slices.Clone(m.graphNodePropertyIndexes)
 	m.adopt(reopened)
@@ -2978,7 +3232,11 @@ func (m *Materializer) Close() error {
 		delete(m.subs, id)
 	}
 	m.notifyMu.Unlock()
-	return m.closeConnections()
+	err := m.closeConnections()
+	if localtesthooks.Enabled {
+		localtesthooks.Hit("materializer:close:complete")
+	}
+	return err
 }
 
 func (m *Materializer) closeConnections() error {
@@ -3008,6 +3266,19 @@ func (m *Materializer) closeConnections() error {
 
 // Health check
 func (m *Materializer) Health(ctx context.Context) error {
+	if m.managedProtocol != "" {
+		ctx, cancel := context.WithTimeout(ctx, time.Second)
+		defer cancel()
+		m.mu.RLock()
+		defer m.mu.RUnlock()
+		if err := m.sqlReceiptReadLocked(); err != nil {
+			return err
+		}
+		if m.db == nil {
+			return sql.ErrConnDone
+		}
+		return m.db.PingContext(ctx)
+	}
 	if err := m.graphHealth(); err != nil {
 		return err
 	}

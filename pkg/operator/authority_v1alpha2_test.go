@@ -2,12 +2,17 @@ package operator
 
 import (
 	"context"
+	"crypto/sha256"
 	"encoding/json"
-	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"strings"
 	"testing"
+
+	"github.com/mrchypark/rhiza/internal/types"
+	"github.com/mrchypark/rhiza/pkg/network"
+	"github.com/mrchypark/rhiza/pkg/quepaxa"
 )
 
 var authorityTestRequest = V1Alpha2WriteRequest{Kind: "sql", ID: "request", Fingerprint: "fingerprint"}
@@ -35,186 +40,193 @@ func authorityTestSetup(t *testing.T) (*phase8Server, *V1Alpha2StatusStore, V1Al
 	return s, store, snap
 }
 
-func TestAuthorityV1Alpha2ReserveFinalizeAndRecoveryRead(t *testing.T) {
-	s, store, initial := authorityTestSetup(t)
-	ctx := context.Background()
-	reserved, observation, err := ReserveV1Alpha2Write(ctx, store, initial, initial.Authority(), authorityTestEvidence, authorityTestRequest)
-	if err != nil || observation != V1Alpha2CASApplied {
-		t.Fatalf("reserve: %s %v", observation, err)
-	}
-	if initial.EverApplicationReserved() || !reserved.EverApplicationReserved() {
-		t.Fatal("reservation history was not atomically recorded")
-	}
-	if req, ok := reserved.Pending(); !ok || req != authorityTestRequest {
-		t.Fatalf("pending: %+v %v", req, ok)
-	}
-	loaded, err := LoadV1Alpha2Admission(ctx, store, phase2Ref)
-	if err != nil {
-		t.Fatalf("pending recovery read: %v", err)
-	}
-	if req, ok := loaded.Pending(); !ok || req != authorityTestRequest {
-		t.Fatalf("recovery pending: %+v %v", req, ok)
-	}
-	if _, _, err := ReserveV1Alpha2Write(ctx, store, loaded, loaded.Authority(), authorityTestEvidence, authorityTestRequest); err == nil {
-		t.Fatal("new write accepted during pending")
-	}
-	foreign := authorityTestRequest
-	foreign.Fingerprint = "foreign"
-	if _, _, err := FinalizeV1Alpha2Write(ctx, store, loaded, loaded.Authority(), foreign, V1Alpha2WriteCommitted, json.RawMessage(`{"tip":8}`)); err == nil {
-		t.Fatal("foreign finalization accepted")
-	}
-	if _, _, err := FinalizeV1Alpha2Write(ctx, store, loaded, loaded.Authority(), authorityTestRequest, "not-found", authorityTestEvidence); err == nil {
-		t.Fatal("unknown outcome finalized")
-	}
-	if _, _, err := FinalizeV1Alpha2Write(ctx, store, loaded, loaded.Authority(), authorityTestRequest, V1Alpha2WriteNoEffect, json.RawMessage(`{"tip":8}`)); err == nil {
-		t.Fatal("no-effect changed evidence")
-	}
-	if s.puts != 1 {
-		t.Fatalf("invalid operations wrote status: %d", s.puts)
-	}
-	final, observation, err := FinalizeV1Alpha2Write(ctx, store, loaded, loaded.Authority(), authorityTestRequest, V1Alpha2WriteCommitted, json.RawMessage(`{"tip":8}`))
-	if err != nil || observation != V1Alpha2CASApplied {
-		t.Fatalf("finalize: %s %v", observation, err)
-	}
-	if _, ok := final.Pending(); ok || !sameJSON(final.Evidence(), json.RawMessage(`{"tip":8}`)) {
-		t.Fatalf("final state pending=%v evidence=%s", ok, final.Evidence())
-	}
-	if !strings.Contains(s.cluster, `"unrelated":{"keep":true}`) || !strings.Contains(s.cluster, `"recoveryQueue":{"version":1}`) {
-		t.Fatal("unrelated status changed")
-	}
-}
-
-func TestAuthorityV1Alpha2StaleSnapshotConflicts(t *testing.T) {
-	s, store, snap := authorityTestSetup(t)
-	s.cluster = strings.Replace(s.cluster, `"resourceVersion":"47"`, `"resourceVersion":"48"`, 1)
-	s.cluster = strings.Replace(s.cluster, `"generation":2`, `"generation":3`, 1)
-	_, _, err := ReserveV1Alpha2Write(context.Background(), store, snap, snap.Authority(), authorityTestEvidence, authorityTestRequest)
-	if !errors.Is(err, ErrV1Alpha2StatusConflict) {
-		t.Fatalf("stale CAS: %v", err)
-	}
-	live, err := LoadV1Alpha2Admission(context.Background(), store, phase2Ref)
-	if err != nil || live.Authority().Generation != 3 {
-		t.Fatalf("live authority: %+v %v", live.Authority(), err)
-	}
-	if _, pending := live.Pending(); pending {
-		t.Fatal("stale CAS reserved a write")
-	}
-}
-
-func TestAuthorityV1Alpha2ProvenNoEffect(t *testing.T) {
-	s, store, snap := authorityTestSetup(t)
-	ctx := context.Background()
-	reserved, _, err := ReserveV1Alpha2Write(ctx, store, snap, snap.Authority(), authorityTestEvidence, authorityTestRequest)
+// Historical fixtures describe already stored UNKNOWN state. They never call a
+// reservation/finalization API, perform CAS, or manufacture execution authority.
+func historicalPendingSnapshot(t *testing.T, old V1Alpha2AdmissionSnapshot, original any) V1Alpha2AdmissionSnapshot {
+	t.Helper()
+	raw, err := json.Marshal(old.status.object)
 	if err != nil {
 		t.Fatal(err)
 	}
-	final, observation, err := FinalizeV1Alpha2Write(ctx, store, reserved, snap.Authority(), authorityTestRequest, V1Alpha2WriteNoEffect, authorityTestEvidence)
-	if err != nil || observation != V1Alpha2CASApplied {
-		t.Fatalf("no-effect finalize: %s %v", observation, err)
-	}
-	if !final.EverApplicationReserved() {
-		t.Fatal("no-effect reset reservation history")
-	}
-	if _, pending := final.Pending(); pending || !sameJSON(final.Evidence(), authorityTestEvidence) || s.puts != 2 {
-		t.Fatalf("pending=%v evidence=%s puts=%d", pending, final.Evidence(), s.puts)
-	}
-}
-
-func TestAuthorityV1Alpha2IdenticalCompetingReservationDoesNotProveOwnership(t *testing.T) {
-	s, store, old := authorityTestSetup(t)
-	ctx := context.Background()
-	if _, _, err := ReserveV1Alpha2Write(ctx, store, old, old.Authority(), authorityTestEvidence, authorityTestRequest); err != nil {
+	var object map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &object); err != nil {
 		t.Fatal(err)
 	}
-	// Simulate another writer installing the identical status while this CAS
-	// returns an ambiguous transport failure, not a successful response.
-	current := s.cluster
-	store.Kube.Client.Transport = phase2Transport(func(r *http.Request) (*http.Response, error) {
-		if r.Method == http.MethodPut {
-			return nil, errors.New("lost response")
+	status, err := jsonObject(object["status"])
+	if err != nil {
+		t.Fatal(err)
+	}
+	auth, err := jsonObject(status["authority"])
+	if err != nil {
+		t.Fatal(err)
+	}
+	pending := v1alpha2PendingRequest{PriorEvidence: old.Evidence()}
+	switch value := original.(type) {
+	case V1Alpha2WriteRequest:
+		pending.V1Alpha2WriteRequest = value
+	case network.ExecuteRequest:
+		fingerprint, err := sqlRequestFingerprint(value)
+		if err != nil {
+			t.Fatal(err)
 		}
-		return phase2Response(http.StatusOK, current), nil
+		pending.V1Alpha2WriteRequest = V1Alpha2WriteRequest{Kind: "sql", ID: value.RequestID, Fingerprint: fmt.Sprintf("%x", fingerprint)}
+		pending.OriginalSQL, err = types.EncodeSQLBatchItem(types.SQLCommand{RequestID: value.RequestID, SQL: value.SQL, Args: value.Args, WantRows: value.WantRows, RequireOne: value.RequireOne, Statements: value.Statements})
+		if err != nil {
+			t.Fatal(err)
+		}
+	case types.KVCommand:
+		pending.OriginalKV, _, err = types.EncodeManagedKVOriginal(value)
+		if err != nil {
+			t.Fatal(err)
+		}
+		id, err := types.ManagedKVPendingWireID(value.RequestID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		fingerprint, err := types.ManagedKVFingerprint(value)
+		if err != nil {
+			t.Fatal(err)
+		}
+		pending.V1Alpha2WriteRequest = V1Alpha2WriteRequest{Kind: "kv", ID: id, Fingerprint: fmt.Sprintf("%x", fingerprint)}
+	default:
+		t.Fatalf("unsupported historical original %T", original)
+	}
+	protocol, err := mixedApplicationProtocol(object)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if protocol != "" {
+		view := old.Authority()
+		pending.Reservation = &v1alpha2ReservationContext{Namespace: view.Owner.Namespace, Name: view.Owner.Name, UID: view.Owner.UID, LogicalID: view.Owner.LogicalID, Generation: view.Generation, DeploymentUID: view.Binding.DeploymentUID, StorageID: view.Binding.StorageID}
+	}
+	auth["pendingWrite"] = json.RawMessage("true")
+	auth["everApplicationReserved"] = json.RawMessage("true")
+	auth["pendingRequest"], _ = json.Marshal(pending)
+	status["authority"], _ = json.Marshal(auth)
+	object["status"], _ = json.Marshal(status)
+	snapshot := old.status
+	snapshot.object = object
+	snapshot.authorityRaw = status["authority"]
+	snapshot.everApplicationReserved = true
+	result, err := parseV1Alpha2Admission(snapshot)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return result
+}
+
+func historicalPhase8Pending(t *testing.T, server *phase8Server, store *V1Alpha2StatusStore, old V1Alpha2AdmissionSnapshot, original any) V1Alpha2AdmissionSnapshot {
+	t.Helper()
+	snapshot := historicalPendingSnapshot(t, old, original)
+	raw, err := json.Marshal(snapshot.status.object)
+	if err != nil {
+		t.Fatal(err)
+	}
+	server.cluster = string(raw)
+	loaded, err := LoadV1Alpha2Admission(context.Background(), store, phase2Ref)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return loaded
+}
+
+func historicalRepairPending(t *testing.T, fixture *repairFixture, old V1Alpha2AdmissionSnapshot, original any) V1Alpha2AdmissionSnapshot {
+	t.Helper()
+	snapshot := historicalPendingSnapshot(t, old, original)
+	fixture.cluster = snapshot.status.object
+	loaded, err := LoadV1Alpha2Admission(context.Background(), fixture.store, phase2Ref)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return loaded
+}
+
+func TestAuthorityV1Alpha2HistoricalUnknownRemainsReadOnly(t *testing.T) {
+	server, store, initial := authorityTestSetup(t)
+	stored := historicalPhase8Pending(t, server, store, initial, authorityTestRequest)
+	before, puts := server.cluster, server.puts
+	for range 2 {
+		loaded, err := LoadV1Alpha2Admission(context.Background(), store, phase2Ref)
+		request, pending := loaded.Pending()
+		if err != nil || !pending || request != authorityTestRequest || !loaded.EverApplicationReserved() || !sameJSON(loaded.Evidence(), stored.Evidence()) {
+			t.Fatalf("historical UNKNOWN lost: request=%+v pending=%t error=%v", request, pending, err)
+		}
+	}
+	if server.cluster != before || server.puts != puts {
+		t.Fatal("read-only historical observation mutated or completed UNKNOWN")
+	}
+}
+
+// Seed historical Unused bytes directly; retired genesis/commit APIs must not
+// be used to construct a fixture that claims those execution paths still work.
+func historicalUnusedFixture(t *testing.T, server *phase8Server, store *V1Alpha2StatusStore, protocol string) V1Alpha2ApplicationInitSnapshot {
+	t.Helper()
+	bootstrap, _, err := testBootstrapPlan(phase2Ref)
+	if err != nil {
+		t.Fatal(err)
+	}
+	format := V1Alpha2ManagedSQLEvidenceFormat
+	if protocol != "" {
+		format = protocol
+	}
+	bootstrap.EvidenceFormat = format
+	members := make([]quepaxa.Member, len(bootstrap.Members))
+	for i, member := range bootstrap.Members {
+		members[i] = member.Member
+	}
+	digest, err := types.ManagedBootstrapPlanDigestForProtocol(string(bootstrap.ClusterID), members, bootstrap.PhysicalBinding, format, bootstrap.Durability, bootstrap.Reconfiguration, protocol)
+	if err != nil {
+		t.Fatal(err)
+	}
+	plan, err := NewV1Alpha2ApplicationInitPlan(phase2Ref, "logical", "deployment", "assignment", bootstrap.PhysicalBinding, digest, format)
+	if err != nil {
+		t.Fatal(err)
+	}
+	plan.ApplicationProtocol = protocol
+	var object map[string]json.RawMessage
+	if err := json.Unmarshal([]byte(phase9ClusterWithProtocol(protocol)), &object); err != nil {
+		t.Fatal(err)
+	}
+	status, _ := jsonObject(object["status"])
+	status["genesis"], _ = json.Marshal(v1alpha2Genesis{OwnerUID: phase2Ref.UID, LogicalID: "logical", DeploymentUID: plan.DeploymentUID, StorageID: plan.StorageID, IntentHash: plan.IntentHash})
+	status["bootstrapPlan"], _ = json.Marshal(bootstrap)
+	status["applicationInit"], _ = json.Marshal(V1Alpha2ApplicationInitAssignment{Plan: plan, State: "Unused"})
+	status["authority"], _ = json.Marshal(map[string]any{
+		"owner":      map[string]any{"namespace": phase2Ref.Namespace, "name": phase2Ref.Name, "uid": phase2Ref.UID, "logicalID": "logical"},
+		"generation": 0, "binding": map[string]any{"deploymentUID": plan.DeploymentUID, "storageID": plan.StorageID},
+		"pendingWrite": false, "everApplicationReserved": false,
 	})
-	observed, result, err := ReserveV1Alpha2Write(ctx, store, old, old.Authority(), authorityTestEvidence, authorityTestRequest)
-	if !errors.Is(err, ErrV1Alpha2StatusOutcomeUnknown) || result != V1Alpha2CASMatchingReadback {
-		t.Fatalf("stale ambiguous CAS: %s %v", result, err)
+	object["status"], _ = json.Marshal(status)
+	raw, _ := json.Marshal(object)
+	server.cluster = string(raw)
+	loaded, err := LoadV1Alpha2ApplicationInit(context.Background(), store, phase2Ref)
+	if err != nil {
+		t.Fatal(err)
 	}
-	if s.cluster != current {
-		t.Fatal("ambiguous attempt changed competing pending")
-	}
-	if req, pending := observed.Pending(); !pending || req != authorityTestRequest {
-		t.Fatalf("readback pending: %+v %v", req, pending)
-	}
-	if !observed.EverApplicationReserved() {
-		t.Fatal("matching readback lost reservation history")
-	}
+	return loaded
 }
 
-func TestAuthorityV1Alpha2ReserveRejectsMismatches(t *testing.T) {
-	for _, test := range []string{"owner", "generation", "binding", "evidence", "request", "transition"} {
-		t.Run(test, func(t *testing.T) {
-			s, store, snap := authorityTestSetup(t)
-			expected, evidence, request := snap.Authority(), json.RawMessage(`{"tip":7}`), authorityTestRequest
-			switch test {
-			case "owner":
-				expected.Owner.UID = "other"
-			case "generation":
-				expected.Generation++
-			case "binding":
-				expected.Binding.DeploymentUID = "other"
-			case "evidence":
-				evidence = json.RawMessage(`{"tip":8}`)
-			case "request":
-				request.Fingerprint = ""
-			case "transition":
-				s.cluster = strings.Replace(s.cluster, `"pendingWrite":false`, `"transition":{"id":"other"},"pendingWrite":false`, 1)
-				var err error
-				snap, err = LoadV1Alpha2Admission(context.Background(), store, phase2Ref)
-				if err != nil {
-					t.Fatal(err)
-				}
-			}
-			if _, _, err := ReserveV1Alpha2Write(context.Background(), store, snap, expected, evidence, request); err == nil {
-				t.Fatal("invalid reservation accepted")
-			}
-			if s.puts != 0 {
-				t.Fatalf("writes: %d", s.puts)
-			}
-		})
+func historicalConsumedFixture(t *testing.T, protocol string) (*phase8Server, *V1Alpha2StatusStore, V1Alpha2AdmissionSnapshot) {
+	t.Helper()
+	server, store, _ := phase8Setup(t, phase9ClusterWithProtocol(protocol), "")
+	initial := historicalUnusedFixture(t, server, store, protocol)
+	var object map[string]json.RawMessage
+	if err := json.Unmarshal([]byte(server.cluster), &object); err != nil {
+		t.Fatal(err)
 	}
-}
-
-func TestAuthorityV1Alpha2CASConflictAndUnknown(t *testing.T) {
-	for _, mode := range []string{"conflict", "lost applied", "lost not applied"} {
-		t.Run(mode, func(t *testing.T) {
-			s, store, snap := authorityTestSetup(t)
-			s.conflict = mode == "conflict"
-			s.timeout = mode != "conflict"
-			s.apply = mode == "lost applied"
-			observed, result, err := ReserveV1Alpha2Write(context.Background(), store, snap, snap.Authority(), authorityTestEvidence, authorityTestRequest)
-			if mode == "conflict" {
-				if !errors.Is(err, ErrV1Alpha2StatusConflict) {
-					t.Fatalf("conflict: %v", err)
-				}
-			} else {
-				if !errors.Is(err, ErrV1Alpha2StatusOutcomeUnknown) {
-					t.Fatalf("unknown outcome: %v", err)
-				}
-				if mode == "lost applied" {
-					if result != V1Alpha2CASMatchingReadback {
-						t.Fatalf("observation: %s", result)
-					}
-					if req, ok := observed.Pending(); !ok || req != authorityTestRequest {
-						t.Fatalf("pending readback: %+v %v", req, ok)
-					}
-				}
-				if mode == "lost not applied" && result != V1Alpha2CASUnknown {
-					t.Fatalf("observation: %s", result)
-				}
-			}
-			if s.puts != 1 {
-				t.Fatalf("CAS attempts: %d", s.puts)
-			}
-		})
+	status, _ := jsonObject(object["status"])
+	assignment := initial.Assignment()
+	assignment.State, assignment.InitialEvidenceDigest = "Consumed", fmt.Sprintf("%x", sha256.Sum256(authorityTestEvidence))
+	status["applicationInit"], _ = json.Marshal(assignment)
+	auth, _ := jsonObject(status["authority"])
+	auth["evidence"] = authorityTestEvidence
+	status["authority"], _ = json.Marshal(auth)
+	object["status"], _ = json.Marshal(status)
+	raw, _ := json.Marshal(object)
+	server.cluster = string(raw)
+	loaded, err := LoadV1Alpha2Admission(context.Background(), store, phase2Ref)
+	if err != nil {
+		t.Fatal(err)
 	}
+	return server, store, loaded
 }

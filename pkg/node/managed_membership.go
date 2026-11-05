@@ -4,7 +4,9 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"log"
 	"path"
 	"reflect"
 	"strings"
@@ -39,6 +41,124 @@ type ManagedRepairSource struct {
 	HeadHash       [32]byte
 	RemoveTerminal quepaxa.DecidedValue
 	Survivors      quepaxa.Cluster
+	PreparedConfig *quepaxa.Cluster
+	PreparedSlot   quepaxa.Slot
+	PreparedHash   [32]byte
+}
+
+// ManagedRepairPreparationChecker authorizes only the read-only source capture
+// that precedes an ADD-first repair. It is separate from the membership
+// mutator capability and cannot authorize a consensus change.
+type ManagedRepairPreparationChecker interface {
+	ValidateManagedRepairPreparation(context.Context, ManagedStartupIdentity, ManagedMembershipRequest, quepaxa.Cluster, quepaxa.Slot) error
+}
+
+// CaptureManagedPreparedRepairSource pins the current certified application
+// prefix before an ADD-first membership change. The returned archive head is
+// fixed evidence, not an authorization to mutate membership.
+func (n *Node) CaptureManagedPreparedRepairSource(ctx context.Context, r ManagedMembershipRequest) (ManagedRepairSource, error) {
+	if n == nil || r.Action != ManagedMembershipAdd || r.Addition != nil || r.HandoffHeadHash != "" || r.RepairOperationID == "" {
+		return ManagedRepairSource{}, network.ErrInvalidRequest
+	}
+	n.shutdownMu.Lock()
+	defer n.shutdownMu.Unlock()
+	if err := n.managedRepairReady(); err != nil {
+		return ManagedRepairSource{}, err
+	}
+	checker, ok := n.managedStartup.Checker.(ManagedRepairPreparationChecker)
+	if !ok {
+		return ManagedRepairSource{}, network.ErrNotReady
+	}
+	current := n.core.CurrentCluster()
+	current.Members = append([]quepaxa.Member(nil), current.Members...)
+	abortSlot, _, _ := n.core.LastReconfigurationAbort()
+	_, pending := n.core.PendingReconfiguration()
+	if n.archive == nil || current.ConfigID != r.ExpectedConfigID || abortSlot != r.ExpectedAbortSlot || pending {
+		return ManagedRepairSource{}, network.ErrRequestConflict
+	}
+	var oldMember quepaxa.Member
+	oldFound := false
+	for _, member := range current.Members {
+		if member.ID == r.OldNodeID {
+			oldMember, oldFound = member, true
+			break
+		}
+	}
+	if !oldFound || r.OldWALIdentity == "" {
+		return ManagedRepairSource{}, network.ErrRequestConflict
+	}
+	registered, err := n.managedVoterWALIdentityLocked(ctx, current.ConfigID, abortSlot, oldMember)
+	if err != nil {
+		return ManagedRepairSource{}, err
+	}
+	if registered != r.OldWALIdentity {
+		return ManagedRepairSource{}, network.ErrRequestConflict
+	}
+	readIndex, _, err := n.core.ReadIndexExcluding(ctx, r.OldNodeID)
+	if err != nil {
+		return ManagedRepairSource{}, fmt.Errorf("verify current ADD-first quorum: %w", err)
+	}
+	if err := n.core.WaitTip(ctx, readIndex); err != nil {
+		return ManagedRepairSource{}, fmt.Errorf("wait for current ADD-first quorum tip: %w", err)
+	}
+	if err := ctx.Err(); err != nil {
+		return ManagedRepairSource{}, err
+	}
+	currentAfterQuorum := n.core.CurrentCluster()
+	currentAfterQuorum.Members = append([]quepaxa.Member(nil), currentAfterQuorum.Members...)
+	abortAfterQuorum, _, _ := n.core.LastReconfigurationAbort()
+	_, pendingAfterQuorum := n.core.PendingReconfiguration()
+	if !reflect.DeepEqual(currentAfterQuorum, current) || abortAfterQuorum != abortSlot || pendingAfterQuorum {
+		return ManagedRepairSource{}, network.ErrRequestConflict
+	}
+	if err := checker.ValidateManagedRepairPreparation(ctx, n.managedStartup.Identity, r, current, abortSlot); err != nil {
+		return ManagedRepairSource{}, err
+	}
+	registered, err = n.managedVoterWALIdentityLocked(ctx, current.ConfigID, abortSlot, oldMember)
+	if err != nil {
+		return ManagedRepairSource{}, err
+	}
+	if registered != r.OldWALIdentity {
+		return ManagedRepairSource{}, network.ErrRequestConflict
+	}
+	tip := n.core.Tip()
+	if tip <= r.ExpectedAbortSlot {
+		return ManagedRepairSource{}, network.ErrRequestConflict
+	}
+	if err := n.archive.SyncThrough(ctx, n.core, tip); err != nil {
+		return ManagedRepairSource{}, fmt.Errorf("sync fixed ADD-first source: %w", err)
+	}
+	prefix := path.Join(n.config.ObjStorePrefix, string(n.config.ClusterID))
+	bootstrap := quepaxa.Cluster{ConfigID: 1, Members: n.config.Members}
+	var view *recovery.ReadOnlyView
+	if isManagedAppendOnlyProtocol(n.managedApplicationProtocol()) {
+		view, err = recovery.OpenReadOnlyViewForApplicationProtocol(ctx, n.bucket, prefix, 1, bootstrap, n.materializationPolicy(), n.receiptWindow(), n.managedApplicationProtocol(), n.config.EnableReconfiguration)
+	} else {
+		view, err = recovery.OpenReadOnlyViewForPolicyWithReconfiguration(ctx, n.bucket, prefix, 1, bootstrap, n.materializationPolicy(), n.receiptWindow(), n.config.EnableReconfiguration)
+	}
+	if err != nil {
+		return ManagedRepairSource{}, fmt.Errorf("verify fixed ADD-first source: %w", err)
+	}
+	if err := checker.ValidateManagedRepairPreparation(ctx, n.managedStartup.Identity, r, current, abortSlot); err != nil {
+		return ManagedRepairSource{}, err
+	}
+	corePrefix, prefixOK := n.core.PrefixHash(tip)
+	if view.Tip() != tip || !prefixOK || view.PrefixHash() != corePrefix {
+		return ManagedRepairSource{}, network.ErrRequestConflict
+	}
+	currentAfterArchive := n.core.CurrentCluster()
+	currentAfterArchive.Members = append([]quepaxa.Member(nil), currentAfterArchive.Members...)
+	abortAfterArchive, _, _ := n.core.LastReconfigurationAbort()
+	_, pendingAfterArchive := n.core.PendingReconfiguration()
+	registered, registrationErr := n.managedVoterWALIdentityLocked(ctx, current.ConfigID, abortSlot, oldMember)
+	if registrationErr != nil {
+		return ManagedRepairSource{}, registrationErr
+	}
+	if !reflect.DeepEqual(currentAfterArchive, current) || abortAfterArchive != abortSlot || pendingAfterArchive || n.core.Tip() < tip || registered != r.OldWALIdentity {
+		return ManagedRepairSource{}, network.ErrRequestConflict
+	}
+	preparedConfig := current
+	return ManagedRepairSource{Head: view.CapturedHead(), HeadHash: view.HeadHash(), Survivors: current, PreparedConfig: &preparedConfig, PreparedSlot: tip, PreparedHash: view.PrefixHash()}, nil
 }
 
 // CaptureManagedRepairSource requires the exact completed REMOVE journal and
@@ -50,6 +170,121 @@ func (n *Node) CaptureManagedRepairSource(ctx context.Context, r ManagedMembersh
 	var result ManagedRepairSource
 	err := n.runManagedMembership(ctx, r, &result)
 	return result, err
+}
+
+// VerifyManagedRepairAddition revalidates the durable ADD journal and its
+// completed terminal after a later REMOVE may have advanced the live roster.
+// The returned Current is the exact ADD target, not the newer live cluster.
+func (n *Node) VerifyManagedRepairAddition(ctx context.Context, request ManagedMembershipRequest) (ManagedRepairCompletion, error) {
+	if n == nil || request.Action != ManagedMembershipAdd || request.Addition == nil || request.Addition.WALIdentity == "" || request.HandoffHeadHash == "" {
+		return ManagedRepairCompletion{}, network.ErrInvalidRequest
+	}
+	n.shutdownMu.Lock()
+	defer n.shutdownMu.Unlock()
+	if err := n.managedRepairReady(); err != nil {
+		return ManagedRepairCompletion{}, err
+	}
+	if err := ctx.Err(); err != nil {
+		return ManagedRepairCompletion{}, err
+	}
+	change := request.change(string(n.config.ClusterID))
+	data, err := readVoterRegistration(ctx, n.bucket, n.membershipOperationKey(change))
+	if err != nil {
+		return ManagedRepairCompletion{}, fmt.Errorf("read managed ADD journal: %w", err)
+	}
+	var operation membershipOperation
+	if len(data) == 0 || json.Unmarshal(data, &operation) != nil || !reflect.DeepEqual(operation.Request, change) || operation.Request.Add == nil || *operation.Request.Add != *request.Addition {
+		return ManagedRepairCompletion{}, network.ErrRequestConflict
+	}
+	if operation.Target.ConfigID != request.ExpectedConfigID+1 {
+		return ManagedRepairCompletion{}, network.ErrRequestConflict
+	}
+	terminal, err := n.retainedMembershipTerminal(operation)
+	if err != nil {
+		return ManagedRepairCompletion{}, err
+	}
+	// The terminal decision is certified by the pre-transition configuration;
+	// the target configuration becomes active at the following slot.
+	if !reflect.DeepEqual(n.core.ClusterForSlot(terminal.Slot+1), operation.Target) {
+		return ManagedRepairCompletion{}, network.ErrRequestConflict
+	}
+	current := n.core.CurrentCluster()
+	if !reflect.DeepEqual(current, operation.Target) {
+		if current.ConfigID != operation.Target.ConfigID+1 || !repairTargetAfterRemoval(current, operation.Target, request.OldNodeID) {
+			return ManagedRepairCompletion{}, network.ErrRequestConflict
+		}
+	}
+	completed, err := n.core.CompleteDecision(ctx, terminal.Slot)
+	if err != nil {
+		return ManagedRepairCompletion{}, fmt.Errorf("managed ADD terminal completion: %w", err)
+	}
+	if completed.Slot != terminal.Slot || completed.Hash != terminal.Hash || !reflect.DeepEqual(completed.Value, terminal.Value) || !reflect.DeepEqual(completed.Certificate, terminal.Certificate) || !reflect.DeepEqual(n.core.ClusterForSlot(completed.Slot+1), operation.Target) {
+		return ManagedRepairCompletion{}, fmt.Errorf("managed ADD terminal or historical target changed")
+	}
+	operationTarget := operation.Target
+	operationTarget.Members = append([]quepaxa.Member(nil), operationTarget.Members...)
+	return ManagedRepairCompletion{Current: operationTarget, Terminal: completed}, nil
+}
+
+// VerifyManagedRepairRemoval revalidates the exact final REMOVE operation and
+// terminal after its status completion CAS, without reopening the closed gate.
+func (n *Node) VerifyManagedRepairRemoval(ctx context.Context, request ManagedMembershipRequest) (ManagedRepairSource, error) {
+	if n == nil || request.Action != ManagedMembershipRemove || request.Addition != nil || request.RepairOperationID == "" {
+		return ManagedRepairSource{}, network.ErrInvalidRequest
+	}
+	n.shutdownMu.Lock()
+	defer n.shutdownMu.Unlock()
+	if err := n.managedRepairReady(); err != nil {
+		return ManagedRepairSource{}, err
+	}
+	if err := ctx.Err(); err != nil {
+		return ManagedRepairSource{}, err
+	}
+	change := request.change(string(n.config.ClusterID))
+	data, err := readVoterRegistration(ctx, n.bucket, n.membershipOperationKey(change))
+	if err != nil {
+		return ManagedRepairSource{}, fmt.Errorf("read managed REMOVE journal: %w", err)
+	}
+	var operation membershipOperation
+	if len(data) == 0 || json.Unmarshal(data, &operation) != nil || !reflect.DeepEqual(operation.Request, change) || operation.Request.Remove != request.OldNodeID || operation.Request.Add != nil {
+		return ManagedRepairSource{}, network.ErrRequestConflict
+	}
+	if operation.Target.ConfigID != request.ExpectedConfigID+1 || !reflect.DeepEqual(n.core.CurrentCluster(), operation.Target) {
+		return ManagedRepairSource{}, network.ErrRequestConflict
+	}
+	terminal, err := n.retainedMembershipTerminal(operation)
+	if err != nil {
+		return ManagedRepairSource{}, err
+	}
+	// Match the target at its first effective slot, not the terminal decision
+	// which is still certified under the prior configuration.
+	if !reflect.DeepEqual(n.core.ClusterForSlot(terminal.Slot+1), operation.Target) {
+		return ManagedRepairSource{}, network.ErrRequestConflict
+	}
+	completed, err := n.core.CompleteDecision(ctx, terminal.Slot)
+	if err != nil {
+		return ManagedRepairSource{}, fmt.Errorf("managed REMOVE terminal completion: %w", err)
+	}
+	if completed.Slot != terminal.Slot || completed.Hash != terminal.Hash || !reflect.DeepEqual(completed.Value, terminal.Value) || !reflect.DeepEqual(completed.Certificate, terminal.Certificate) || !reflect.DeepEqual(n.core.CurrentCluster(), operation.Target) {
+		return ManagedRepairSource{}, fmt.Errorf("managed REMOVE terminal or target changed")
+	}
+	return ManagedRepairSource{RemoveTerminal: completed, Survivors: operation.Target}, nil
+}
+
+func repairTargetAfterRemoval(current, added quepaxa.Cluster, oldID quepaxa.NodeID) bool {
+	if current.ConfigID != added.ConfigID+1 {
+		return false
+	}
+	expected := quepaxa.Cluster{ConfigID: current.ConfigID}
+	foundOld := false
+	for _, member := range added.Members {
+		if member.ID == oldID {
+			foundOld = true
+			continue
+		}
+		expected.Members = append(expected.Members, member)
+	}
+	return foundOld && reflect.DeepEqual(current, expected)
 }
 
 // Called only within changeMembership's lock and Server proposal lifecycle.
@@ -93,11 +328,20 @@ func (n *Node) captureManagedRepairSource(ctx context.Context, r ManagedMembersh
 	}
 	prefix := path.Join(n.config.ObjStorePrefix, string(n.config.ClusterID))
 	bootstrap := quepaxa.Cluster{ConfigID: 1, Members: n.config.Members}
-	view, err := recovery.OpenReadOnlyView(ctx, n.bucket, prefix, 1, bootstrap)
+	var view *recovery.ReadOnlyView
+	if isManagedAppendOnlyProtocol(n.managedApplicationProtocol()) {
+		view, err = recovery.OpenReadOnlyViewForApplicationProtocol(ctx, n.bucket, prefix, 1, bootstrap, n.materializationPolicy(), n.receiptWindow(), n.managedApplicationProtocol(), n.config.EnableReconfiguration)
+	} else {
+		view, err = recovery.OpenReadOnlyViewForPolicyWithReconfiguration(ctx, n.bucket, prefix, 1, bootstrap, n.materializationPolicy(), n.receiptWindow(), n.config.EnableReconfiguration)
+	}
 	if err != nil {
 		return ManagedRepairSource{}, err
 	}
-	view, err = recovery.OpenReadOnlyViewAtHead(ctx, n.bucket, prefix, 1, bootstrap, view.CapturedHead())
+	if isManagedAppendOnlyProtocol(n.managedApplicationProtocol()) {
+		view, err = recovery.OpenReadOnlyViewAtHeadForApplicationProtocol(ctx, n.bucket, prefix, 1, bootstrap, view.CapturedHead(), n.materializationPolicy(), n.receiptWindow(), n.managedApplicationProtocol(), n.config.EnableReconfiguration)
+	} else {
+		view, err = recovery.OpenReadOnlyViewAtHeadForPolicyWithReconfiguration(ctx, n.bucket, prefix, 1, bootstrap, view.CapturedHead(), n.materializationPolicy(), n.receiptWindow(), n.config.EnableReconfiguration)
+	}
 	if err != nil {
 		return ManagedRepairSource{}, err
 	}
@@ -185,7 +429,30 @@ func (n *Node) runManagedMembership(ctx context.Context, r ManagedMembershipRequ
 	}
 	change := r.change(string(n.config.ClusterID))
 	ctx = context.WithValue(ctx, managedMembershipPermitKey{}, managedMembershipPermit{request: r, change: change, capture: capture})
-	return n.server.ChangeMembership(ctx, change)
+	err := n.server.ChangeMembership(ctx, change)
+	if err != nil && r.Action == ManagedMembershipAdd {
+		log.Printf("MANAGED_MEMBERSHIP_FAILURE action=add cause=%s", managedMembershipCauseClass(err))
+	}
+	return err
+}
+
+func managedMembershipCauseClass(err error) string {
+	switch {
+	case errors.Is(err, context.Canceled):
+		return "canceled"
+	case errors.Is(err, context.DeadlineExceeded):
+		return "deadline"
+	case errors.Is(err, network.ErrNotReady):
+		return "not_ready"
+	case errors.Is(err, network.ErrInvalidRequest):
+		return "invalid_request"
+	case errors.Is(err, network.ErrRequestConflict):
+		return "request_conflict"
+	case errors.Is(err, quepaxa.ErrQuorumUnavailable):
+		return "quorum_unavailable"
+	default:
+		return "other"
+	}
 }
 
 // A package-private capability routes this operation through Server's existing

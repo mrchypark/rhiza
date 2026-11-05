@@ -24,16 +24,30 @@ import (
 // may contain credentials: keep its JSON in a private file/Secret, never status
 // or logs. The selected main image must contain /usr/local/bin/rhiza-ha-init.
 type V1Alpha2RuntimeProfile struct {
-	InitImage         string
-	PeerPort          int
-	EvidenceFormat    string
-	Storage           types.ExecutionConfig
-	ProfileSecretName string
+	ApplicationProtocol string `json:",omitempty"`
+	InitImage           string
+	PeerPort            int
+	EvidenceFormat      string
+	Storage             types.ExecutionConfig
+	ProfileSecretName   string
 }
 
 // V1Alpha2ManagedSQLEvidenceFormat is the sole supported reference-host format.
 // The CLI parity test binds it to managedsql without creating an import cycle.
 const V1Alpha2ManagedSQLEvidenceFormat = "rhiza-managed-sql/v1"
+
+const V1Alpha2ManagedSQLKVEvidenceFormat = "rhiza-managed-sql-kv/v1"
+
+// ValidateV1Alpha2ApplicationProfile checks installed capability, not authority.
+func ValidateV1Alpha2ApplicationProfile(protocol, evidenceFormat string) error {
+	if _, _, err := types.ManagedApplicationPolicy(protocol); err != nil {
+		return err
+	}
+	if evidenceFormat != protocol {
+		return fmt.Errorf("managed application evidence profile mismatch")
+	}
+	return nil
+}
 
 func validV1Alpha2ProfileSecretName(name string) bool {
 	if len(name) == 0 || len(name) > 253 {
@@ -106,6 +120,9 @@ var ErrV1Alpha2BootstrapPending = errors.New("v1alpha2 bootstrap identities pend
 // ReconcileV1Alpha2ManagedInitialization freezes actual gated Pod identities in
 // genesis. A successful return describes the committed plan, never our draft.
 func ReconcileV1Alpha2ManagedInitialization(ctx context.Context, kube *Kubernetes, ref V1Alpha2ClusterRef, profile V1Alpha2RuntimeProfile) (V1Alpha2StatusSnapshot, error) {
+	if err := ValidateV1Alpha2ApplicationProfile(profile.ApplicationProtocol, profile.EvidenceFormat); err != nil {
+		return V1Alpha2StatusSnapshot{}, err
+	}
 	store := &V1Alpha2StatusStore{Kube: kube}
 	path, err := store.path(ref)
 	if err != nil {
@@ -119,6 +136,9 @@ func ReconcileV1Alpha2ManagedInitialization(ctx context.Context, kube *Kubernete
 	c, err := DecodeV1Alpha2Cluster(raw)
 	if err != nil {
 		return V1Alpha2StatusSnapshot{}, err
+	}
+	if c.Spec.ApplicationProtocol != profile.ApplicationProtocol {
+		return V1Alpha2StatusSnapshot{}, fmt.Errorf("installed application protocol differs from cluster")
 	}
 	var meta v1alpha2BootstrapMetadata
 	b, _ := json.Marshal(c.Metadata)
@@ -313,8 +333,11 @@ func managedCandidateSpecMatches(raw, expected json.RawMessage) bool {
 func BuildV1Alpha2RuntimePlan(ref V1Alpha2ClusterRef, logicalID, deploymentUID string, profile V1Alpha2RuntimeProfile, members []V1Alpha2BootstrapMember) (V1Alpha2ApplicationInitPlan, V1Alpha2BootstrapPlan, error) {
 	var assignment V1Alpha2ApplicationInitPlan
 	var plan V1Alpha2BootstrapPlan
-	if profile.Storage.AdminToken == "" || profile.EvidenceFormat != V1Alpha2ManagedSQLEvidenceFormat {
-		return assignment, plan, fmt.Errorf("managed SQL requires an admin token and the reference evidence format")
+	if err := ValidateV1Alpha2ApplicationProfile(profile.ApplicationProtocol, profile.EvidenceFormat); err != nil {
+		return assignment, plan, err
+	}
+	if profile.Storage.AdminToken == "" {
+		return assignment, plan, fmt.Errorf("managed application requires an admin token")
 	}
 	if profile.InitImage == "" || profile.PeerPort < 1 || profile.PeerPort > 65535 || profile.EvidenceFormat == "" || profile.Storage.ObjStoreBucket == "" {
 		return assignment, plan, fmt.Errorf("incomplete managed runtime profile")
@@ -366,7 +389,7 @@ func BuildV1Alpha2RuntimePlan(ref V1Alpha2ClusterRef, logicalID, deploymentUID s
 	for _, member := range members {
 		common = append(common, member.Member)
 	}
-	digest, err := types.ManagedBootstrapPlanDigest(string(cluster), common, binding, profile.EvidenceFormat, durability, config.EnableReconfiguration)
+	digest, err := types.ManagedBootstrapPlanDigestForProtocol(string(cluster), common, binding, profile.EvidenceFormat, durability, config.EnableReconfiguration, profile.ApplicationProtocol)
 	if err != nil {
 		return assignment, plan, err
 	}
@@ -374,6 +397,7 @@ func BuildV1Alpha2RuntimePlan(ref V1Alpha2ClusterRef, logicalID, deploymentUID s
 	if err != nil {
 		return assignment, plan, err
 	}
+	assignment.ApplicationProtocol = profile.ApplicationProtocol
 	plan = V1Alpha2BootstrapPlan{ClusterID: cluster, Members: members, PhysicalBinding: binding, EvidenceFormat: profile.EvidenceFormat, Durability: durability, Reconfiguration: config.EnableReconfiguration}
 	return assignment, plan, nil
 }
@@ -421,6 +445,11 @@ func ReconcileV1Alpha2Initialization(ctx context.Context, kube *Kubernetes, ref 
 	}
 	if len(providers) != 1 || providers[0] == nil {
 		return V1Alpha2StatusSnapshot{}, fmt.Errorf("initialization requires a runtime common plan provider")
+	}
+	// Historical CRs remain structurally readable but cannot start an execution
+	// profile. The provider is invoked only once below, with the real live UID.
+	if _, _, err := types.ManagedApplicationPolicy(c.Spec.ApplicationProtocol); err != nil {
+		return V1Alpha2StatusSnapshot{}, err
 	}
 	for _, key := range []string{"authority", "applicationInit", "recoveryQueue", "pendingWrite", "transition", "receipt", "decision"} {
 		if _, ok := status[key]; ok {

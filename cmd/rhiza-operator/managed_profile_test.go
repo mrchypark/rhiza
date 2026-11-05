@@ -9,6 +9,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/mrchypark/rhiza/internal/sqlpolicy"
 	"github.com/mrchypark/rhiza/internal/types"
 	"github.com/mrchypark/rhiza/pkg/managedsql"
 	"github.com/mrchypark/rhiza/pkg/operator"
@@ -21,7 +22,7 @@ func TestManagedSQLReferenceFormatParity(t *testing.T) {
 }
 
 func TestManagedRuntimeProfileFile(t *testing.T) {
-	profile := operator.V1Alpha2RuntimeProfile{InitImage: "reference:v1", PeerPort: 9090, EvidenceFormat: "rhiza-managed-sql/v1", ProfileSecretName: "rhiza-runtime", Storage: types.ExecutionConfig{AdminToken: "private-admin", ObjStoreProvider: "s3", ObjStoreBucket: "bucket", ObjStoreEndpoint: "s3.example.test", ObjStoreSecretKey: "private-sentinel"}}
+	profile := operator.V1Alpha2RuntimeProfile{ApplicationProtocol: sqlpolicy.ManagedRequestAppendOnlyApplicationProtocol, InitImage: "reference:v1", PeerPort: 9090, EvidenceFormat: sqlpolicy.ManagedRequestAppendOnlyApplicationProtocol, ProfileSecretName: "rhiza-runtime", Storage: types.ExecutionConfig{AdminToken: "private-admin", ObjStoreProvider: "s3", ObjStoreBucket: "bucket", ObjStoreEndpoint: "s3.example.test", ObjStoreSecretKey: "private-sentinel"}}
 	b, _ := json.Marshal(profile)
 	for _, tc := range []struct {
 		name, body string
@@ -30,6 +31,9 @@ func TestManagedRuntimeProfileFile(t *testing.T) {
 	}{
 		{"valid", string(b), 0600, true},
 		{"Secret group read", string(b), 0440, true},
+		{"Graph append-only", strings.ReplaceAll(string(b), sqlpolicy.ManagedRequestAppendOnlyApplicationProtocol, sqlpolicy.ManagedGraphRequestAppendOnlyApplicationProtocol), 0600, true},
+		{"retired mixed", strings.ReplaceAll(string(b), sqlpolicy.ManagedRequestAppendOnlyApplicationProtocol, types.ManagedApplicationProtocolSQLKV), 0600, false},
+		{"retired empty", strings.ReplaceAll(string(b), sqlpolicy.ManagedRequestAppendOnlyApplicationProtocol, ""), 0600, false},
 		{"public file", string(b), 0644, false},
 		{"unknown field", strings.Replace(string(b), `"InitImage":`, `"secret-sentinel":true,"InitImage":`, 1), 0600, false},
 		{"unknown storage field", strings.Replace(string(b), `"objstore_provider":`, `"secret-sentinel":true,"objstore_provider":`, 1), 0600, false},

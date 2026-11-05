@@ -20,9 +20,9 @@ import (
 	"time"
 
 	"github.com/mrchypark/rhiza"
+	"github.com/mrchypark/rhiza/internal/sqlpolicy"
 	"github.com/mrchypark/rhiza/internal/types"
 	"github.com/mrchypark/rhiza/pkg/managedbootstrap"
-	"github.com/mrchypark/rhiza/pkg/managedsql"
 	nodepkg "github.com/mrchypark/rhiza/pkg/node"
 	"github.com/mrchypark/rhiza/pkg/operator"
 	"github.com/mrchypark/rhiza/pkg/quepaxa"
@@ -38,6 +38,7 @@ func mustRepairJSON(t *testing.T, value any) []byte {
 }
 
 func TestAwaitCommittedPlanAndLiveGuards(t *testing.T) {
+	const protocol = sqlpolicy.ManagedRequestAppendOnlyApplicationProtocol
 	ref := operator.V1Alpha2ClusterRef{Name: "cluster", Namespace: "ns", UID: "uid"}
 	dir := t.TempDir()
 	identity := filepath.Join(dir, "identity")
@@ -48,7 +49,7 @@ func TestAwaitCommittedPlanAndLiveGuards(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	plan := operator.V1Alpha2BootstrapPlan{ClusterID: cluster, PhysicalBinding: strings.Repeat("a", 64), EvidenceFormat: managedsql.EvidenceFormat, Durability: types.ObjectStoreDurabilityBeforeAck}
+	plan := operator.V1Alpha2BootstrapPlan{ClusterID: cluster, PhysicalBinding: strings.Repeat("a", 64), EvidenceFormat: protocol, Durability: types.ObjectStoreDurabilityBeforeAck}
 	var members []quepaxa.Member
 	for i := 1; i <= 3; i++ {
 		pod := fmt.Sprintf("pod-%d", i)
@@ -69,7 +70,7 @@ func TestAwaitCommittedPlanAndLiveGuards(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	digest, err := types.ManagedBootstrapPlanDigest(string(cluster), members, plan.PhysicalBinding, plan.EvidenceFormat, plan.Durability, false)
+	digest, err := types.ManagedBootstrapPlanDigestForProtocol(string(cluster), members, plan.PhysicalBinding, plan.EvidenceFormat, plan.Durability, false, protocol)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -77,11 +78,18 @@ func TestAwaitCommittedPlanAndLiveGuards(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	assignment.ApplicationProtocol = protocol
 	depName, err := operator.V1Alpha2GenesisDeploymentName(ref.UID)
 	if err != nil {
 		t.Fatal(err)
 	}
 	clusterJSON := []byte(`{"apiVersion":"rhiza.mrchypark.dev/v1alpha2","kind":"RhizaCluster","metadata":{"name":"cluster","namespace":"ns","uid":"uid","resourceVersion":"1"},"spec":{"logicalID":"logical","genesisIntent":"Create","voterCount":3,"workload":{"podTemplate":{"spec":{"containers":[{"name":"app","image":"image"}]}}}},"status":{}}`)
+	var clusterObject map[string]any
+	if err := json.Unmarshal(clusterJSON, &clusterObject); err != nil {
+		t.Fatal(err)
+	}
+	clusterObject["spec"].(map[string]any)["applicationProtocol"] = protocol
+	clusterJSON = mustRepairJSON(t, clusterObject)
 	dep := fmt.Sprintf(`{"apiVersion":"apps/v1","kind":"Deployment","metadata":{"name":%q,"namespace":"ns","uid":"deployment","resourceVersion":"1","labels":{"rhiza.mrchypark.dev/cluster-uid":"uid","rhiza.mrchypark.dev/generation":"0"},"ownerReferences":[{"apiVersion":"rhiza.mrchypark.dev/v1alpha2","kind":"RhizaCluster","name":"cluster","uid":"uid","controller":true}]}}`, depName)
 	rs := fmt.Sprintf(`{"apiVersion":"apps/v1","kind":"ReplicaSet","metadata":{"name":"rs","namespace":"ns","uid":"rsuid","resourceVersion":"1","ownerReferences":[{"apiVersion":"apps/v1","kind":"Deployment","name":%q,"uid":"deployment","controller":true}]}}`, depName)
 	pod := `{"apiVersion":"v1","kind":"Pod","metadata":{"name":"pod-name","namespace":"ns","uid":"pod-1","resourceVersion":"1","ownerReferences":[{"apiVersion":"apps/v1","kind":"ReplicaSet","name":"rs","uid":"rsuid","controller":true}]},"status":{"podIP":"127.0.0.1"}}`
@@ -140,7 +148,7 @@ func TestAwaitCommittedPlanAndLiveGuards(t *testing.T) {
 	if err := json.Unmarshal(data, &got); err != nil || len(got.Members) != 3 || got.Members[0].PodUID != "pod-1" || bytes.Contains(data, []byte(token)) {
 		t.Fatal("invalid or secret-bearing handoff")
 	}
-	profile := operator.V1Alpha2RuntimeProfile{PeerPort: 1234, EvidenceFormat: managedsql.EvidenceFormat, Storage: types.ExecutionConfig{ObjStorePrefix: "root", AdminToken: "private-admin"}}
+	profile := operator.V1Alpha2RuntimeProfile{PeerPort: 1234, ApplicationProtocol: protocol, EvidenceFormat: protocol, Storage: types.ExecutionConfig{ObjStorePrefix: "root", AdminToken: "private-admin"}}
 	cfg, err := managedConfig(context.Background(), k, ref, "pod-name", "pod-1", identity, output, profile)
 	if err != nil || cfg.StorageRoot != "root" || cfg.Runtime.NodeID != node || cfg.Runtime.PeerToken != token || cfg.Runtime.PeerAddr != "127.0.0.1:1234" || len(cfg.Runtime.Members) != 3 || cfg.Runtime.ObjStorePrefix == "root" {
 		t.Fatalf("bad managed configuration: %v", err)
@@ -156,7 +164,7 @@ func TestAwaitCommittedPlanAndLiveGuards(t *testing.T) {
 	if _, err := managedConfig(context.Background(), k, ref, "pod-name", "pod-1", identity, output, profile); err == nil {
 		t.Fatal("mismatched evidence profile accepted")
 	}
-	profile.EvidenceFormat = managedsql.EvidenceFormat
+	profile.EvidenceFormat = protocol
 	var advanced map[string]any
 	if err := json.Unmarshal(clusterJSON, &advanced); err != nil {
 		t.Fatal(err)
@@ -206,6 +214,7 @@ func TestAwaitCommittedPlanAndLiveGuards(t *testing.T) {
 		}
 		intent := operator.V1Alpha2RepairPlan{OperationID: "repair-gate", ClusterUID: ref.UID, Generation: 0, DeploymentUID: assignment.DeploymentUID, StorageID: assignment.StorageID, ExpectedConfigID: 1, OldNodeID: members[0].ID, OldWALIdentity: "trusted-runtime-registered-wal", Replacement: operator.V1Alpha2RepairMember{PodName: "pod-name", PodUID: "replacement-uid", NodeID: replacementID, PublicKey: key, PeerURL: "quic://127.0.0.1:1234"}, BootstrapPlanDigest: assignment.BootstrapPlanDigest, FinalVoterIDs: []types.NodeID{members[1].ID, members[2].ID, replacementID}}
 		slices.Sort(intent.FinalVoterIDs)
+		intent.Sequence = operator.V1Alpha2RepairAddThenRemove
 		closed, _, err := operator.BeginV1Alpha2Repair(context.Background(), store, a, a.Authority(), intent)
 		if err != nil {
 			t.Fatal(err)
@@ -216,7 +225,9 @@ func TestAwaitCommittedPlanAndLiveGuards(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		capture := operator.V1Alpha2RepairHandoff{PlanDigest: intent.Digest(), SourceRoot: "root", SourcePrefix: namespace.FinalPrefix, PhysicalBinding: assignment.PhysicalBinding, Head: head, HeadHash: fmt.Sprintf("%x", sha256.Sum256(head)), RemoveTerminalSlot: 17, RemoveTerminalHash: strings.Repeat("b", 64), Survivors: quepaxa.Cluster{ConfigID: 2, Members: members[1:]}}
+		source := quepaxa.Cluster{ConfigID: 1, Members: append([]quepaxa.Member(nil), members...)}
+		source.Members[0].WALIdentity = intent.OldWALIdentity
+		capture := operator.V1Alpha2RepairHandoff{PlanDigest: intent.Digest(), SourceRoot: "root", SourcePrefix: namespace.FinalPrefix, PhysicalBinding: assignment.PhysicalBinding, Head: head, HeadHash: fmt.Sprintf("%x", sha256.Sum256(head)), PreparedConfig: &source, PreparedSlot: 17, PreparedHash: strings.Repeat("b", 64)}
 		if _, _, err := operator.CaptureV1Alpha2RepairHandoff(context.Background(), store, closed, closed.Authority(), capture); err != nil {
 			t.Fatal(err)
 		}

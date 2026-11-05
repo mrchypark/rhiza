@@ -125,6 +125,12 @@ const (
 // binaries built with the rhiza_local_testhooks tag.
 func Hit(string) {}
 
+// SetManagedRuntimeStateContext is a production no-op.
+func SetManagedRuntimeStateContext(func(context.Context)) func() { return func() {} }
+
+// HitManagedRuntimeStateContext is compiled out of production builds.
+func HitManagedRuntimeStateContext(context.Context) {}
+
 // SetBatchAdmission is a production no-op and preserves the tagged hook API.
 func SetBatchAdmission(func(BatchAdmissionEvent)) func() { return func() {} }
 

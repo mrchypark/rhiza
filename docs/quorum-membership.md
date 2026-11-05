@@ -53,11 +53,13 @@ not start a second transition.
 
 ## Lost voter example
 
-With voters A/B/C and C's WAL permanently lost, A/B can authorize removal of C.
-The resulting A/B configuration requires both surviving voters. A replacement
-uses a new voter ID and token, starts with `quepaxa.NewLearner`, and receives
-certified history without voting. A/B authorize its addition only after an
-admission callback verifies its durable prefix at the transition boundary.
+With voters A/B/C and C's WAL permanently lost, the normal managed repair path
+uses ADD-first replacement under the surviving quorum. A replacement uses a new
+voter ID and token, starts with `quepaxa.NewLearner`, and receives certified
+history without voting. The quorum authorizes its addition only after an
+admission callback verifies its durable prefix at the transition boundary;
+the failed identity is removed after certified admission. No separate fencer
+or external lease service is required for this consensus membership path.
 The target member must include that learner's `Core.WALIdentity()`. Reopening
 the same WAL preserves this identity; an empty replacement WAL receives a new
 identity and cannot reuse the previous incarnation's promotion.
@@ -65,6 +67,8 @@ identity and cannot reuse the previous incarnation's promotion.
 `network.Transport.VerifyLearner` checks the WAL identity and prefix through the candidate's
 token-pinned QUIC endpoint. Readiness, Pod identity, or a reported log index
 alone is not admission evidence. Removed voter IDs must not be reused.
+Same-identity rejoin requires the intact original WAL and current certified
+membership; replay into an empty WAL is not a rejoin certificate.
 
 The core APIs are `BeginReconfiguration`, `BeginReconfigurationAt`,
 `FinishReconfigurationAt`, `AbortReconfigurationAt`, `CurrentCluster`, and
@@ -93,9 +97,32 @@ A deterministic lagged-recorder regression covers full and hash-only proposals.
 
 Checkpoint seals now bind complete configuration history and retirement state;
 compaction, restart, and cold restore validate it. Archive publication,
-before-ack durability, GC authority, and immutable registration retain one archive
+before-ack durability and immutable registration retain one archive
 generation identity across membership transitions. A checkpoint proof is still
 bounded by the 128 KiB replicated-value limit and fails closed when too large.
+HA object data is append-only; online delete GC is not part of this contract.
+
+Quorum loss makes writes and linearizable reads unavailable; ready nodes may
+still serve local reads. Restore the original quorum or use a separately
+verified manual DR procedure. Membership cannot manufacture quorum, and the
+current operator does not automatically start a new generation. Pod deletion
+does not prove isolated-process termination or outstanding storage completion.
+The approved, not-yet-implemented DR design defaults automatic attempts to OFF.
+Explicit policy may begin preparation after sustained actual ReadIndex/quorum
+failures. Activation still needs all old runtimes/voters/sidecars terminated,
+recreation blocked, in-flight storage completed, every successful ACK covered
+by the verified source, live activation authority and a new ready quorum.
+Unknown evidence or partition remains Blocked for manual action; no new lease,
+epoch or live permissions are added. This is a design boundary, not a claim
+that the current operator implements or qualifies automatic DR.
+
+### Unsupported legacy Operator workflow
+
+The following alpha1 fields and fence-based workflow are retained as legacy
+reference only, not current alpha2 deployment instructions. The current API
+does not serve `RhizaRecovery.spec.membership`; enabling the old automatic
+recovery environment flag is rejected. Historical test results below do not
+qualify the current managed runtime or manual DR.
 
 The Operator requires an explicit external fence for a removed voter and only
 coordinates existing workloads. It does not kill the old process, revoke object

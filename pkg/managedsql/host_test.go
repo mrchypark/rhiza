@@ -14,6 +14,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strconv"
 	"strings"
 	"sync"
@@ -23,10 +24,13 @@ import (
 
 	objectstore "github.com/mrchypark/rhiza/internal/objstore"
 	"github.com/mrchypark/rhiza/internal/peertest"
+	"github.com/mrchypark/rhiza/internal/sqlpolicy"
 	"github.com/mrchypark/rhiza/internal/types"
+	"github.com/mrchypark/rhiza/pkg/materializer"
 	"github.com/mrchypark/rhiza/pkg/network"
 	"github.com/mrchypark/rhiza/pkg/node"
 	"github.com/mrchypark/rhiza/pkg/operator"
+	"github.com/mrchypark/rhiza/pkg/qlog"
 	"github.com/mrchypark/rhiza/pkg/quepaxa"
 	"github.com/mrchypark/rhiza/pkg/recovery"
 	"github.com/quic-go/quic-go"
@@ -47,9 +51,28 @@ type sqlWireControl struct {
 	putReady                chan string
 	putRelease              chan struct{}
 	putSuffix               string
-	failFirstPut            atomic.Bool
-	keysMu                  sync.Mutex
-	putKeys                 []string
+	putPrefix               string
+	putReadGateBytes        int
+	putReadErrors           chan error
+	putReadFailure          func(*http.Request, error)
+	// Evaluated before body reads/object-map lock. The owner must fail its
+	// test on predicate observation errors rather than silently passing them.
+	putGate func(context.Context, string) bool
+	// Optional arm is installed before runtime startup. Nil retains the
+	// existing unconditional gate; tests may atomically arm a later failure.
+	putEnabled     *atomic.Bool
+	failFirstPut   atomic.Bool
+	deleteRequests atomic.Int64
+	keysMu         sync.Mutex
+	putKeys        []string
+}
+
+// Opt in before Open; only an actual owned Host Close starts this lifecycle.
+type sqlWireCloseLifecycle struct{ closing atomic.Bool }
+
+func (l *sqlWireCloseLifecycle) expectedCanceledPUT(prefix string, r *http.Request, err error) bool {
+	return l.closing.Load() && r.Method == http.MethodPut && errors.Is(r.Context().Err(), context.Canceled) &&
+		errors.Is(err, io.ErrUnexpectedEOF) && strings.HasPrefix(r.URL.Path, prefix) && len(r.URL.Path) > len(prefix)
 }
 
 func sqlWireStore(t *testing.T) (*httptest.Server, *sqlWireControl) {
@@ -58,7 +81,30 @@ func sqlWireStore(t *testing.T) (*httptest.Server, *sqlWireControl) {
 	objects := map[string][]byte{}
 	control := &sqlWireControl{}
 	s := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.Method == http.MethodPut && control.putReady != nil && strings.HasSuffix(r.URL.Path, control.putSuffix) {
+		if r.Method == http.MethodDelete {
+			control.deleteRequests.Add(1)
+		}
+		var gatedBodyPrefix []byte
+		gatePut := r.Method == http.MethodPut && control.putReady != nil && (control.putEnabled == nil || control.putEnabled.Load()) && strings.Contains(r.URL.Path, control.putPrefix) && strings.HasSuffix(r.URL.Path, control.putSuffix) && (control.putGate == nil || control.putGate(r.Context(), r.URL.Path))
+		if gatePut && control.putReadGateBytes > 0 {
+			gatedBodyPrefix = make([]byte, control.putReadGateBytes)
+			n, err := io.ReadFull(r.Body, gatedBodyPrefix)
+			gatedBodyPrefix = gatedBodyPrefix[:n]
+			if err != nil {
+				if control.putReadErrors != nil {
+					select {
+					case control.putReadErrors <- fmt.Errorf("%s: read gate: %w", r.URL.Path, err):
+						w.WriteHeader(http.StatusBadRequest)
+						return
+					default:
+					}
+				}
+				t.Error(err)
+				w.WriteHeader(http.StatusInternalServerError)
+				return
+			}
+		}
+		if gatePut {
 			select {
 			case control.putReady <- r.URL.Path:
 			case <-control.putRelease:
@@ -68,7 +114,9 @@ func sqlWireStore(t *testing.T) (*httptest.Server, *sqlWireControl) {
 			select {
 			case <-control.putRelease:
 			case <-r.Context().Done():
-				return
+				if control.putReadGateBytes == 0 {
+					return
+				}
 			}
 		}
 		if r.Method == http.MethodPut && strings.HasSuffix(r.URL.Path, "voters/managed-sql-initialization.json") && control.receiptPutReady != nil {
@@ -149,9 +197,25 @@ func sqlWireStore(t *testing.T) (*httptest.Server, *sqlWireControl) {
 			}
 			body, err := io.ReadAll(r.Body)
 			if err != nil {
+				if control.putReadFailure != nil {
+					control.putReadFailure(r, err)
+					w.WriteHeader(http.StatusBadRequest)
+					return
+				}
+				if control.putReadErrors != nil {
+					select {
+					case control.putReadErrors <- fmt.Errorf("%s: %w", r.URL.Path, err):
+						w.WriteHeader(http.StatusBadRequest)
+						return
+					default:
+					}
+				}
 				t.Error(err)
-				w.WriteHeader(500)
+				w.WriteHeader(http.StatusInternalServerError)
 				return
+			}
+			if len(gatedBodyPrefix) != 0 {
+				body = append(gatedBodyPrefix, body...)
 			}
 			if strings.HasPrefix(r.Header.Get("X-Amz-Content-Sha256"), "STREAMING-") {
 				var decoded []byte
@@ -219,11 +283,55 @@ type sqlFixturePeer struct {
 	transport *quic.Transport
 	once      sync.Once
 	err       error
+	closed    atomic.Bool
 }
 
 func (p *sqlFixturePeer) close() error {
-	p.once.Do(func() { p.err = errors.Join(p.transport.Close(), p.conn.Close()) })
+	p.once.Do(func() { p.closed.Store(true); p.err = errors.Join(p.transport.Close(), p.conn.Close()) })
 	return p.err
+}
+
+func (f *sqlStatusFixture) observeRecoveryPeer(t *testing.T, phase string, h *Host, cfg Config) {
+	t.Helper()
+	f.mu.Lock()
+	p := f.peers[cfg.Runtime.NodeID]
+	f.mu.Unlock()
+	if p == nil {
+		t.Fatal("recovery peer has no owned UDP reservation")
+	}
+	bound := p.conn.LocalAddr().String()
+	endpoint := ""
+	keyMatches := false
+	for _, member := range cfg.Runtime.Members {
+		if member.ID == cfg.Runtime.NodeID {
+			endpoint = member.PeerURL
+			keyMatches = member.PublicKey == quepaxa.PublicKey(network.PeerPublicKey(cfg.Runtime.ClusterID, cfg.Runtime.NodeID, cfg.Runtime.PeerToken))
+		}
+	}
+	var socketErr error
+	if udp, ok := p.conn.(*net.UDPConn); ok {
+		raw, err := udp.SyscallConn()
+		socketErr = err
+		if err == nil {
+			socketErr = raw.Control(func(uintptr) {})
+		}
+	} else {
+		socketErr = errors.New("owned packet connection is not UDP")
+	}
+	h.mu.Lock()
+	closed := h.closed
+	var lifetimeErr error
+	if h.admissionLifetime == nil {
+		lifetimeErr = errors.New("Host lifetime unavailable")
+	} else {
+		lifetimeErr = h.admissionLifetime.Err()
+	}
+	h.mu.Unlock()
+	state, nodeErr := h.node.ManagedState()
+	t.Logf("recovery peer phase=%s node=%s endpoint=%s bound_udp=%s endpoint_matches=%t configured_addr_matches=%t socket_open=%t socket_error=%v transport_owns_socket=%t fixture_close_called=%t host_closed=%t host_lifetime_error=%v node_binding_error=%v node_R/C/A=%d/%d/%d key_matches=%t listener_state=unknown node_context=not_directly_observable", phase, cfg.Runtime.NodeID, endpoint, bound, endpoint == "quic://"+bound, cfg.Runtime.PeerAddr == bound, socketErr == nil, socketErr, p.transport.Conn == p.conn, p.closed.Load(), closed, lifetimeErr, nodeErr, state.RecorderTip, state.CertifiedTip, state.AppliedTip, keyMatches)
+	if endpoint != "quic://"+bound || cfg.Runtime.PeerAddr != bound || !keyMatches {
+		t.Fatal("recovery peer endpoint or pinned identity differs from its fixture reservation")
+	}
 }
 
 func (f *sqlStatusFixture) reservePeer(t *testing.T, id types.NodeID) string {
@@ -322,6 +430,18 @@ func (f *sqlStatusFixture) serve(w http.ResponseWriter, r *http.Request) {
 
 func sqlCluster(t *testing.T) ([]Config, *sqlStatusFixture) {
 	t.Helper()
+	return sqlClusterForProtocol(t, sqlpolicy.ManagedRequestAppendOnlyApplicationProtocol)
+}
+
+func sqlClusterForProtocol(t *testing.T, protocol string) ([]Config, *sqlStatusFixture) {
+	t.Helper()
+	format := EvidenceFormat
+	if protocol != "" {
+		format = protocol
+	}
+	if err := operator.ValidateV1Alpha2ApplicationProfile(protocol, format); err != nil {
+		t.Fatal(err)
+	}
 	s3, sourceControl := sqlWireStore(t)
 	configs := make([]Config, 3)
 	members := make([]quepaxa.Member, 3)
@@ -349,6 +469,14 @@ func sqlCluster(t *testing.T) ([]Config, *sqlStatusFixture) {
 		configs[i].Runtime.Members = members
 	}
 	_ = json.Unmarshal([]byte(`{"apiVersion":"rhiza.mrchypark.dev/v1alpha2","kind":"RhizaCluster","metadata":{"name":"cluster","namespace":"ns","uid":"uid","resourceVersion":"1"},"spec":{"logicalID":"logical","genesisIntent":"Create","voterCount":3,"workload":{"podTemplate":{"spec":{"containers":[{"name":"app","image":"image"}]}}}},"status":{}}`), &f.obj)
+	if protocol != "" {
+		var spec map[string]json.RawMessage
+		if err := json.Unmarshal(f.obj["spec"], &spec); err != nil {
+			t.Fatal(err)
+		}
+		spec["applicationProtocol"], _ = json.Marshal(protocol)
+		f.obj["spec"], _ = json.Marshal(spec)
+	}
 	kube := httptest.NewTLSServer(http.HandlerFunc(f.serve))
 	t.Cleanup(kube.Close)
 	tokenFile := filepath.Join(t.TempDir(), "token")
@@ -358,20 +486,23 @@ func sqlCluster(t *testing.T) ([]Config, *sqlStatusFixture) {
 	store := &operator.V1Alpha2StatusStore{Kube: &operator.Kubernetes{BaseURL: kube.URL, Namespace: "ns", TokenFile: tokenFile, Client: kube.Client()}}
 	ref := operator.V1Alpha2ClusterRef{Name: "cluster", Namespace: "ns", UID: "uid"}
 	n := node.New(&configs[0].Runtime)
-	source, _, err := n.PreparedStartupBindingDigests()
+	source, _, err := n.PreparedStartupBindingDigestsForProtocol(protocol)
 	if err != nil {
 		t.Fatal(err)
 	}
-	common, err := n.ManagedBootstrapPlanDigest(source, EvidenceFormat)
+	common, err := n.ManagedBootstrapPlanDigestForProtocol(source, format, protocol)
 	if err != nil {
 		t.Fatal(err)
 	}
-	plan, err := operator.NewV1Alpha2ApplicationInitPlan(ref, "logical", "deployment", "assignment", source, common, EvidenceFormat)
+	plan, err := operator.NewV1Alpha2ApplicationInitPlan(ref, "logical", "deployment", "assignment", source, common, format)
 	if err != nil {
 		t.Fatal(err)
 	}
+	// The checked public plan field and CR marker agree before the first
+	// authority write; no legacy assignment is converted after creation.
+	plan.ApplicationProtocol = protocol
 	name, _ := operator.V1Alpha2GenesisDeploymentName(ref.UID)
-	bootstrap := operator.V1Alpha2BootstrapPlan{ClusterID: clusterID, PhysicalBinding: source, EvidenceFormat: EvidenceFormat, Durability: types.ObjectStoreDurabilityBeforeAck}
+	bootstrap := operator.V1Alpha2BootstrapPlan{ClusterID: clusterID, PhysicalBinding: source, EvidenceFormat: format, Durability: types.ObjectStoreDurabilityBeforeAck}
 	for i, member := range members {
 		bootstrap.Members = append(bootstrap.Members, operator.V1Alpha2BootstrapMember{PodUID: fmt.Sprintf("pod-%d", i), Member: member})
 	}
@@ -385,6 +516,93 @@ func sqlCluster(t *testing.T) ([]Config, *sqlStatusFixture) {
 		configs[i].PodUID = fmt.Sprintf("pod-%d", i)
 	}
 	return configs, f
+}
+
+func TestManagedSQLPublicStartupRejectsRetiredPrototypeBeforeRuntimeEffects(t *testing.T) {
+	for _, tc := range []struct {
+		name       string
+		configured string
+		retired    string
+	}{
+		{"empty", sqlpolicy.ManagedRequestAppendOnlyApplicationProtocol, ""},
+		{"mixed", sqlpolicy.ManagedRequestAppendOnlyApplicationProtocol, types.ManagedApplicationProtocolSQLKV},
+		{"request", sqlpolicy.ManagedRequestAppendOnlyApplicationProtocol, sqlpolicy.ManagedRequestApplicationProtocol},
+		{"graph", sqlpolicy.ManagedGraphRequestAppendOnlyApplicationProtocol, sqlpolicy.ManagedGraphRequestApplicationProtocol},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			configs, fixture := sqlClusterForProtocol(t, tc.configured)
+			cfg := configs[0]
+			installedPlan := cfg.Plan
+			cfg.Plan.ApplicationProtocol = tc.retired
+			cfg.Plan.EvidenceFormat = tc.retired
+
+			// Existing local bytes model a previously installed prototype WAL and
+			// materializer. Public startup must reject the profile before opening,
+			// rewriting, or rebinding either file.
+			walPath := filepath.Join(cfg.Runtime.DataDir, "qlog")
+			dbPath := filepath.Join(cfg.Runtime.DataDir, "sqlite.db")
+			walBefore := []byte("retired-prototype-wal-bytes")
+			dbBefore := []byte("retired-prototype-materializer-bytes")
+			if err := os.WriteFile(walPath, walBefore, 0o600); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(dbPath, dbBefore, 0o600); err != nil {
+				t.Fatal(err)
+			}
+
+			host, err := fixture.open(context.Background(), cfg)
+			if err == nil || host != nil || !strings.Contains(err.Error(), "unsupported managed startup profile") {
+				if host != nil {
+					_ = host.Close()
+				}
+				t.Fatalf("retired profile was not explicitly rejected before startup: host=%v err=%v", host, err)
+			}
+			for path, want := range map[string][]byte{walPath: walBefore, dbPath: dbBefore} {
+				got, readErr := os.ReadFile(path)
+				if readErr != nil || !bytes.Equal(got, want) {
+					t.Fatalf("retired startup changed existing bytes at %s: got=%q err=%v", path, got, readErr)
+				}
+			}
+			entries, readErr := os.ReadDir(cfg.Runtime.DataDir)
+			if readErr != nil || len(entries) != 2 {
+				t.Fatalf("retired startup created runtime files: entries=%v err=%v", entries, readErr)
+			}
+			fixture.source.keysMu.Lock()
+			putCount := len(fixture.source.putKeys)
+			fixture.source.keysMu.Unlock()
+			if putCount != 0 {
+				t.Fatalf("retired startup uploaded %d objects before rejection", putCount)
+			}
+			state, loadErr := operator.LoadV1Alpha2ApplicationInit(context.Background(), cfg.Store, cfg.Ref)
+			if loadErr != nil || state.Assignment().State != "Unused" || state.Assignment().Plan != installedPlan {
+				t.Fatalf("retired startup changed initialization authority: state=%+v err=%v", state.Assignment(), loadErr)
+			}
+		})
+	}
+}
+
+func TestManagedSQLPublicStartupPreservesSupportedProfileEvidenceError(t *testing.T) {
+	for _, protocol := range []string{sqlpolicy.ManagedRequestAppendOnlyApplicationProtocol, sqlpolicy.ManagedGraphRequestAppendOnlyApplicationProtocol} {
+		name := protocol
+		if name == "" {
+			name = "legacy"
+		}
+		t.Run(name, func(t *testing.T) {
+			configs, fixture := sqlClusterForProtocol(t, protocol)
+			cfg := configs[0]
+			cfg.Plan.EvidenceFormat = "wrong-supported-profile-evidence"
+
+			host, err := fixture.open(context.Background(), cfg)
+			if host != nil {
+				_ = host.Close()
+				t.Fatal("invalid evidence unexpectedly opened a Host")
+			}
+			const want = "unsupported managed startup profile"
+			if err == nil || !strings.Contains(err.Error(), want) {
+				t.Fatalf("supported profile evidence mismatch changed error contract: got %v, want %q", err, want)
+			}
+		})
+	}
 }
 
 func TestManagedSQLFixtureRetainsPeerSocketUntilHostOpen(t *testing.T) {
@@ -507,9 +725,9 @@ func TestManagedSQLRealThreeNodeInitializationAndWrite(t *testing.T) {
 	if err != nil {
 		t.Fatalf("create: %+v %v", response, err)
 	}
-	_, err = hosts[0].Execute(context.Background(), ExecuteRequest{RequestID: "insert", SQL: "INSERT INTO app VALUES (?)", Args: []any{[]byte{0, 255}}})
-	if err != nil {
-		t.Fatal(err)
+	insert, err := hosts[0].Execute(context.Background(), ExecuteRequest{RequestID: "insert", SQL: "INSERT INTO app VALUES (?)", Args: []any{[]byte{0, 255}}})
+	if err != nil || insert.Status != types.MutationCommitted || insert.Slot == 0 {
+		t.Fatalf("insert lacks a committed ACK: %+v %v", insert, err)
 	}
 	a, err := operator.LoadV1Alpha2Admission(context.Background(), configs[0].Store, configs[0].Ref)
 	if err != nil {
@@ -518,8 +736,8 @@ func TestManagedSQLRealThreeNodeInitializationAndWrite(t *testing.T) {
 	if _, pending := a.Pending(); pending {
 		t.Fatal("completed SQL still pending")
 	}
-	if evidenceHash(a.Evidence()) == init.Assignment().InitialEvidenceDigest {
-		t.Fatal("write did not advance application evidence")
+	if evidenceHash(a.Evidence()) != init.Assignment().InitialEvidenceDigest {
+		t.Fatal("ordinary write rewrote immutable E0 CR evidence")
 	}
 	late, err := f.open(context.Background(), configs[2])
 	if late != nil {
@@ -541,22 +759,47 @@ func TestManagedSQLRealThreeNodeInitializationAndWrite(t *testing.T) {
 		if _, err := h.node.Handler(); err == nil {
 			t.Fatal("admitted raw handler exposed")
 		}
-		state, err := h.node.InspectManagedSQL(context.Background(), false)
-		if err != nil || !bytes.Equal(encodeEvidence(state), a.Evidence()) {
-			t.Fatalf("replica SQL evidence mismatch: %v", err)
+		waitSQLCertifiedApplication(t, context.Background(), h, insert.Slot)
+		// Public rows and applied slot share one SQLite snapshot; checkpoint
+		// progress need not globally stop around a private evidence Inspector.
+		rows, err := h.Query(context.Background(), QueryRequest{SQL: "SELECT hex(value) FROM app", Consistency: "linearizable"})
+		if err != nil || rows.AppliedSlot < insert.Slot || len(rows.Rows) != 1 || len(rows.Rows[0]) != 1 || rows.Rows[0][0] != "00FF" {
+			t.Fatalf("replica certified SQL snapshot mismatch: %+v %v", rows, err)
+		}
+		status, err := h.RequestStatus(context.Background(), network.RequestStatusRequest{Kind: "sql", RequestID: "insert"})
+		if err != nil || status.Receipt == nil || !reflect.DeepEqual(*status.Receipt, insert.MutationReceipt) {
+			t.Fatalf("replica changed exact INSERT ACK receipt: %+v %v", status, err)
 		}
 	}
 }
 
-func openSQLQuorum(t *testing.T) ([]Config, []*Host, *sqlStatusFixture) {
+func openSQLQuorum(t *testing.T, closeLifecycle ...*sqlWireCloseLifecycle) ([]Config, []*Host, *sqlStatusFixture) {
 	t.Helper()
 	configs, f := sqlCluster(t)
+	var lifecycle *sqlWireCloseLifecycle
+	if len(closeLifecycle) != 0 {
+		if len(closeLifecycle) != 1 || closeLifecycle[0] == nil {
+			t.Fatal("one explicit wire Close lifecycle is required")
+		}
+		lifecycle = closeLifecycle[0]
+		prefix := "/bucket/" + f.source.finalPrefix + "/"
+		f.source.putReadFailure = func(r *http.Request, err error) {
+			if !lifecycle.expectedCanceledPUT(prefix, r, err) {
+				t.Errorf("unexpected PUT read failure method=%s path=%s canceled=%t owned_close=%t: %v", r.Method, r.URL.Path, errors.Is(r.Context().Err(), context.Canceled), lifecycle.closing.Load(), err)
+			} else {
+				t.Logf("expected canceled PUT method=%s path=%s canceled=true owned_close=true", r.Method, r.URL.Path)
+			}
+		}
+	}
 	hosts := make([]*Host, 2)
 	for i := range hosts {
 		h, err := f.open(context.Background(), configs[i])
 		if h != nil {
 			hosts[i] = h
 			t.Cleanup(func() {
+				if lifecycle != nil {
+					lifecycle.closing.Store(true)
+				}
 				if err := h.Close(); err != nil {
 					t.Error(err)
 				}
@@ -572,134 +815,10 @@ func openSQLQuorum(t *testing.T) ([]Config, []*Host, *sqlStatusFixture) {
 	return configs, hosts, f
 }
 
-func TestManagedSQLPendingDurableOriginalResolvesWithoutNewExecution(t *testing.T) {
-	configs, hosts, f := openSQLQuorum(t)
-	h := hosts[0]
-	if _, err := h.Execute(context.Background(), ExecuteRequest{RequestID: "schema", SQL: "CREATE TABLE app(value BLOB)"}); err != nil {
-		t.Fatal(err)
-	}
-	f.mu.Lock()
-	f.failFinalize = true
-	f.mu.Unlock()
-	req := ExecuteRequest{RequestID: "durable-blob", SQL: "INSERT INTO app VALUES (?)", Args: []any{[]byte{0, 255}}}
-	if _, err := h.Execute(context.Background(), req); err == nil {
-		t.Fatal("unconfirmed finalization reported success")
-	}
-	a, err := operator.LoadV1Alpha2Admission(context.Background(), configs[0].Store, configs[0].Ref)
-	if err != nil {
-		t.Fatal(err)
-	}
-	original, ok, err := a.PendingSQL()
-	if err != nil || !ok || !bytes.Equal(original.Args[0].([]byte), []byte{0, 255}) {
-		t.Fatalf("durable original blob missing: %v", err)
-	}
-	before, err := h.node.ManagedState()
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := h.Ready(context.Background()); err != nil {
-		t.Fatalf("unknown finalization blocked certified local snapshot: %v", err)
-	}
-	if _, err := h.Execute(context.Background(), ExecuteRequest{RequestID: "blocked", SQL: "INSERT INTO app VALUES (1)"}); err == nil {
-		t.Fatal("new write bypassed pending uncertainty")
-	}
-	f.mu.Lock()
-	f.failFinalize = false
-	f.mu.Unlock()
-	if err := h.RecoverPending(context.Background()); err != nil {
-		t.Fatal(err)
-	}
-	after, err := h.node.ManagedState()
-	if err != nil || after.CertifiedTip != before.CertifiedTip {
-		t.Fatalf("resolution re-executed SQL: before=%+v after=%+v error=%v", before, after, err)
-	}
-	readySQL(t, h)
-	a, err = operator.LoadV1Alpha2Admission(context.Background(), configs[0].Store, configs[0].Ref)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if _, ok := a.Pending(); ok {
-		t.Fatal("resolved request remained pending")
-	}
-}
-
-func TestManagedSQLUnknownPendingIsNotNoEffectAndBlocksNewSQL(t *testing.T) {
-	configs, hosts, _ := openSQLQuorum(t)
-	h := hosts[0]
-	a, err := operator.LoadV1Alpha2Admission(context.Background(), configs[0].Store, configs[0].Ref)
-	if err != nil {
-		t.Fatal(err)
-	}
-	req := ExecuteRequest{RequestID: "reserved-not-executed", SQL: "CREATE TABLE must_not_exist(value)"}
-	if _, _, err := operator.ReserveV1Alpha2SQLWrite(context.Background(), configs[0].Store, a, a.Authority(), a.Evidence(), req); err != nil {
-		t.Fatal(err)
-	}
-	before, err := h.node.ManagedState()
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := h.RecoverPending(context.Background()); err == nil {
-		t.Fatal("unknown request became no-effect proof")
-	}
-	if err := h.Ready(context.Background()); err != nil {
-		t.Fatalf("unknown request blocked previous certified snapshot: %v", err)
-	}
-	if err := h.node.AdmitManaged(context.Background()); err == nil {
-		t.Fatal("unknown request admitted new SQL")
-	}
-	a, err = operator.LoadV1Alpha2Admission(context.Background(), configs[0].Store, configs[0].Ref)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if _, ok := a.Pending(); !ok {
-		t.Fatal("unknown request was cleared")
-	}
-	after, err := h.node.ManagedState()
-	if err != nil || after.CertifiedTip != before.CertifiedTip {
-		t.Fatal("unknown pending request was re-executed")
-	}
-}
-
-func TestManagedSQLLostFinalizeResponseRequiresFreshRecoveryAdmission(t *testing.T) {
-	configs, hosts, f := openSQLQuorum(t)
-	h := hosts[0]
-	f.mu.Lock()
-	f.dropFinalize = true
-	f.mu.Unlock()
-	if _, err := h.Execute(context.Background(), ExecuteRequest{RequestID: "lost-response", SQL: "CREATE TABLE app(value)"}); err == nil {
-		t.Fatal("lost response established writer ownership")
-	}
-	if err := h.Ready(context.Background()); err != nil {
-		t.Fatalf("unknown finalization blocked local snapshot: %v", err)
-	}
-	if err := h.node.AdmitManaged(context.Background()); err == nil {
-		t.Fatal("unknown finalization automatically reopened write admission")
-	}
-	a, err := operator.LoadV1Alpha2Admission(context.Background(), configs[0].Store, configs[0].Ref)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if _, ok := a.Pending(); ok {
-		t.Fatal("injected finalize did not apply")
-	}
-	before, err := h.node.ManagedState()
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := h.RecoverPending(context.Background()); err != nil {
-		t.Fatal(err)
-	}
-	readySQL(t, h)
-	after, err := h.node.ManagedState()
-	if err != nil || before.CertifiedTip != after.CertifiedTip {
-		t.Fatal("readback recovery re-executed SQL")
-	}
-}
-
 func TestManagedSQLDDLReversalDoesNotRearmMissingSource(t *testing.T) {
 	configs, hosts, f := openSQLQuorum(t)
 	h := hosts[0]
-	initial, err := h.node.InspectManagedSQL(context.Background(), false)
+	initial, err := h.node.InspectManagedKV(context.Background(), false)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -708,12 +827,28 @@ func TestManagedSQLDDLReversalDoesNotRearmMissingSource(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	reversed, err := h.node.InspectManagedSQL(context.Background(), false)
+	reversed, err := h.node.InspectManagedKV(context.Background(), false)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if reversed.Application.Digest != initial.Application.Digest || reversed.Application.FreshEmpty {
-		t.Fatal("regression requires E0 logical digest but nonfresh actual history")
+	// The user schema returns to empty, but append-only request originals and
+	// receipts remain part of the application digest; they must not revert to E0.
+	rows, err := h.Query(context.Background(), QueryRequest{SQL: "SELECT COUNT(*) FROM sqlite_schema WHERE name='reversible'", Consistency: "local"})
+	if err != nil || len(rows.Rows) != 1 || len(rows.Rows[0]) != 1 || rows.Rows[0][0] != int64(0) {
+		t.Fatalf("DDL reversal did not restore the empty user schema: %+v %v", rows, err)
+	}
+	if reversed.Application.Digest == initial.Application.Digest || reversed.Application.FreshEmpty || reversed.Runtime.AppliedTip <= initial.Runtime.AppliedTip {
+		t.Fatal("DDL reversal lost append-only request history or rearmed E0")
+	}
+	for _, id := range []string{"create-reversal", "drop-reversal"} {
+		status, err := h.RequestStatus(context.Background(), network.RequestStatusRequest{Kind: "sql", RequestID: id})
+		if err != nil || status.Receipt == nil || status.Receipt.Status != types.MutationCommitted {
+			t.Fatalf("DDL reversal receipt %s was not retained: %+v %v", id, status, err)
+		}
+	}
+	authorityBefore, err := operator.LoadV1Alpha2Admission(context.Background(), configs[0].Store, configs[0].Ref)
+	if err != nil {
+		t.Fatal(err)
 	}
 	if err := h.Close(); err != nil {
 		t.Fatal(err)
@@ -725,6 +860,8 @@ func TestManagedSQLDDLReversalDoesNotRearmMissingSource(t *testing.T) {
 	reopened, err := f.open(context.Background(), configs[0])
 	if reopened != nil {
 		t.Cleanup(func() {
+			f.source.hideArchive.Store(false)
+			f.source.hideApplicationStart.Store(false)
 			if err := reopened.Close(); err != nil {
 				t.Error(err)
 			}
@@ -733,16 +870,108 @@ func TestManagedSQLDDLReversalDoesNotRearmMissingSource(t *testing.T) {
 	if err != nil {
 		t.Fatalf("intact local WAL must retain non-serving recovery ownership: %v", err)
 	}
-	if reopened.identity.Fresh {
-		t.Fatal("consumed E0 logical digest rearmed missing-source fresh baseline")
+	// Fresh is only the pre-open remote-absence hint. The actual retained WAL
+	// and application history must independently refuse fresh-state/E0 proof.
+	retained, err := reopened.node.InspectManagedKV(context.Background(), false)
+	if err != nil || retained.Application != reversed.Application || retained.Runtime.WALIdentity != reversed.Runtime.WALIdentity || retained.Runtime.AppliedTip < reversed.Runtime.AppliedTip {
+		t.Fatalf("reopen lost retained append-only history: %+v %v", retained, err)
+	}
+	if _, err := reopened.node.InspectManagedKV(context.Background(), true); err == nil {
+		t.Fatal("retained application history authorized fresh-state/E0 proof")
+	}
+	readySQL(t, reopened) // The retained WAL and actual remaining quorum may admit.
+	for _, id := range []string{"create-reversal", "drop-reversal"} {
+		status, err := reopened.RequestStatus(context.Background(), network.RequestStatusRequest{Kind: "sql", RequestID: id})
+		if err != nil || status.Receipt == nil || status.Receipt.Status != types.MutationCommitted || status.Receipt.Slot > reversed.Runtime.AppliedTip {
+			t.Fatalf("reopened DDL receipt %s was not retained: %+v %v", id, status, err)
+		}
 	}
 	state, err := reopened.node.ManagedState()
 	if err != nil || !state.ExistingRegisteredWAL || state.CertifiedTip == 0 {
 		t.Fatalf("recovery did not use actual pre-existing WAL: %+v %v", state, err)
 	}
+	// The fault hides reads, not the actual CAS object. Restore visibility
+	// before normal shutdown flushes the shared archive; otherwise GET-404 plus
+	// an existing HEAD creates an artificial permanent If-None-Match conflict.
+	f.source.hideArchive.Store(false)
+	f.source.hideApplicationStart.Store(false)
+	if err := reopened.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := hosts[1].Close(); err != nil {
+		t.Fatal(err)
+	}
+	readWAL := func() []qlog.Entry {
+		t.Helper()
+		wal, err := qlog.OpenReadOnly(filepath.Join(configs[0].Runtime.DataDir, "qlog"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer func() {
+			if err := wal.Close(); err != nil {
+				t.Error(err)
+			}
+		}()
+		nonce, registered := wal.Identity()
+		if !registered || fmt.Sprintf("%x", nonce) != reversed.Runtime.WALIdentity {
+			t.Fatal("missing-source restart replaced the registered WAL identity")
+		}
+		entries, err := wal.Read()
+		if err != nil {
+			t.Fatal(err)
+		}
+		return entries
+	}
+	beforeWAL := readWAL()
+	// Without quorum, Open may itself fail while recovering the certified log,
+	// or return a non-serving owner. Neither result may reinitialize local data.
+	f.source.hideArchive.Store(true)
+	f.source.hideApplicationStart.Store(true)
+	openCtx, cancel := context.WithTimeout(context.Background(), 250*time.Millisecond)
+	blocked, openErr := f.open(openCtx, configs[0])
+	cancel()
+	if blocked != nil {
+		t.Cleanup(func() {
+			f.source.hideArchive.Store(false)
+			f.source.hideApplicationStart.Store(false)
+			if err := blocked.Close(); err != nil {
+				t.Error(err)
+			}
+		})
+	}
+	if openErr != nil && !errors.Is(openErr, context.DeadlineExceeded) && !errors.Is(openErr, context.Canceled) && !errors.Is(openErr, quepaxa.ErrQuorumUnavailable) {
+		t.Fatalf("unexpected no-quorum startup failure: %v", openErr)
+	}
+	if blocked != nil {
+		if openErr == nil {
+			readyCtx, cancel := context.WithTimeout(context.Background(), 250*time.Millisecond)
+			err := blocked.Ready(readyCtx)
+			cancel()
+			if err == nil {
+				t.Error("remote absence bypassed initial quorum admission")
+			}
+		}
+		f.source.hideArchive.Store(false)
+		f.source.hideApplicationStart.Store(false)
+		if err := blocked.Close(); err != nil {
+			t.Fatal(err)
+		}
+	} else if openErr == nil {
+		t.Fatal("no-quorum startup returned neither owner nor error")
+	}
+	f.source.hideArchive.Store(false)
+	f.source.hideApplicationStart.Store(false)
+	afterWAL := readWAL()
+	if len(afterWAL) < len(beforeWAL) || !reflect.DeepEqual(afterWAL[:len(beforeWAL)], beforeWAL) {
+		t.Fatal("no-quorum startup lost or replaced retained WAL history")
+	}
+	application, _, err := materializer.InspectManagedAppendOnlyRequestFile(context.Background(), filepath.Join(configs[0].Runtime.DataDir, "sqlite.db"), types.DefaultIdempotencyWindowSlots)
+	if err != nil || application != reversed.Application {
+		t.Fatalf("no-quorum startup changed retained application/receipt history: %+v %v", application, err)
+	}
 	live, err := operator.LoadV1Alpha2Admission(context.Background(), configs[0].Store, configs[0].Ref)
-	if err != nil || !live.EverApplicationReserved() {
-		t.Fatal("DDL reversal erased canonical reservation history")
+	if err != nil || live.EverApplicationReserved() || live.ResourceVersion() != authorityBefore.ResourceVersion() || !bytes.Equal(live.Evidence(), authorityBefore.Evidence()) {
+		t.Fatal("append-only DDL reversal changed CR initialization or reservation history", err)
 	}
 }
 
@@ -799,15 +1028,15 @@ func TestManagedSQLUnusedAssignmentRejectsPreexistingCertifiedSource(t *testing.
 func sqlSourceNode(t *testing.T, cfg Config) (*node.Node, node.ManagedStartupIdentity) {
 	t.Helper()
 	n := node.New(&cfg.Runtime)
-	source, member, err := n.PreparedStartupBindingDigests()
+	source, member, err := n.PreparedStartupBindingDigestsForProtocol(cfg.Plan.ApplicationProtocol)
 	if err != nil {
 		t.Fatal(err)
 	}
-	common, err := n.ManagedBootstrapPlanDigest(source, EvidenceFormat)
+	common, err := n.ManagedBootstrapPlanDigestForProtocol(source, cfg.Plan.EvidenceFormat, cfg.Plan.ApplicationProtocol)
 	if err != nil {
 		t.Fatal(err)
 	}
-	return n, node.ManagedStartupIdentity{Member: recovery.PreparedStartupIdentity{ClusterUID: cfg.Ref.UID, Generation: cfg.Plan.Generation, DeploymentUID: cfg.Plan.DeploymentUID, PodUID: cfg.PodUID, NodeID: string(cfg.Runtime.NodeID), SourceBinding: source, ConfigDigest: member}, AssignmentID: cfg.Plan.AssignmentID, IntentHash: cfg.Plan.IntentHash, StorageID: cfg.Plan.StorageID, PhysicalBinding: source, BootstrapPlanDigest: common, EvidenceFormat: EvidenceFormat}
+	return n, node.ManagedStartupIdentity{Member: recovery.PreparedStartupIdentity{ClusterUID: cfg.Ref.UID, Generation: cfg.Plan.Generation, DeploymentUID: cfg.Plan.DeploymentUID, PodUID: cfg.PodUID, NodeID: string(cfg.Runtime.NodeID), SourceBinding: source, ConfigDigest: member}, AssignmentID: cfg.Plan.AssignmentID, IntentHash: cfg.Plan.IntentHash, StorageID: cfg.Plan.StorageID, PhysicalBinding: source, BootstrapPlanDigest: common, EvidenceFormat: cfg.Plan.EvidenceFormat, ApplicationProtocol: cfg.Plan.ApplicationProtocol}
 }
 
 func TestManagedSQLSourceDefaultS3Provider(t *testing.T) {
@@ -864,103 +1093,6 @@ func TestManagedSQLSourceLostReceiptResponseRetry(t *testing.T) {
 	if err := n.VerifyManagedSQLFreshSource(context.Background(), i); err != nil {
 		t.Fatal(err)
 	}
-}
-
-func TestManagedSQLPendingReservationBeforeDelayedPutBlocksFreshJoin(t *testing.T) {
-	configs, hosts, f := openSQLQuorum(t)
-	control := f.source
-	control.putReady = make(chan string, 4)
-	control.putRelease = make(chan struct{})
-	control.putSuffix = "voters/managed-sql-application-start.json"
-	var release sync.Once
-	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
-	done := make(chan error, 1)
-	joined := false
-	t.Cleanup(func() {
-		release.Do(func() { close(control.putRelease) })
-		cancel()
-		if !joined {
-			select {
-			case <-done:
-			case <-time.After(5 * time.Second):
-				t.Error("delayed SQL execution did not finish after cancellation")
-			}
-		}
-	})
-	go func() {
-		_, err := hosts[0].Execute(ctx, ExecuteRequest{RequestID: "delayed-first", SQL: "CREATE TABLE delayed(value)"})
-		done <- err
-	}()
-	select {
-	case key := <-control.putReady:
-		if !strings.HasSuffix(key, control.putSuffix) {
-			t.Fatal("wrong delayed PUT boundary")
-		}
-	case <-ctx.Done():
-		t.Fatal(ctx.Err())
-	}
-	a, err := operator.LoadV1Alpha2Admission(ctx, configs[0].Store, configs[0].Ref)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if _, pending := a.Pending(); !pending || !a.EverApplicationReserved() {
-		t.Fatal("pending and canonical history were not committed before delayed PUT")
-	}
-	if available, err := hosts[0].node.ManagedArchiveAvailable(ctx); err != nil || available {
-		t.Fatal("test did not stop before first archive HEAD")
-	}
-	runtime := configs[0].Runtime
-	diagnostic, err := objectstore.NewBucketForNamespace(ctx, objectstore.Config{Provider: objectstore.ProviderS3, Endpoint: runtime.ObjStoreEndpoint, Bucket: runtime.ObjStoreBucket, Region: runtime.ObjStoreRegion, Insecure: runtime.ObjStoreInsecure, AccessKey: runtime.ObjStoreAccessKey, SecretKey: runtime.ObjStoreSecretKey}, control.finalPrefix)
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() {
-		if err := diagnostic.Close(); err != nil {
-			t.Error(err)
-		}
-	})
-	objects := 0
-	if err := diagnostic.Iter(ctx, control.finalPrefix+"/archive/", func(string) error { objects++; return nil }); err != nil || objects != 0 {
-		t.Fatalf("actual SDK archive LIST was not empty: count=%d error=%v", objects, err)
-	}
-	late, err := f.open(ctx, configs[2])
-	if late != nil {
-		t.Cleanup(func() {
-			if err := late.Close(); err != nil {
-				t.Error(err)
-			}
-		})
-	}
-	if err != nil {
-		t.Fatalf("pending blocked private peer recovery: %v", err)
-	}
-	if late.identity.Fresh {
-		t.Fatal("pending/everReserved plus missing HEAD admitted fresh baseline")
-	}
-	if late.Ready(ctx) == nil {
-		t.Fatal("pending first mutation opened late application admission")
-	}
-	release.Do(func() { close(control.putRelease) })
-	select {
-	case err := <-done:
-		joined = true
-		if err != nil {
-			t.Fatal(err)
-		}
-	case <-ctx.Done():
-		t.Fatal(ctx.Err())
-	}
-	a, err = operator.LoadV1Alpha2Admission(ctx, configs[0].Store, configs[0].Ref)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if _, pending := a.Pending(); pending || !a.EverApplicationReserved() {
-		t.Fatal("delayed effect did not finalize with monotonic history")
-	}
-	if available, err := hosts[0].node.ManagedArchiveAvailable(ctx); err != nil || !available {
-		t.Fatal("resumed SQL did not produce actual certified archive")
-	}
-	readySQL(t, late)
 }
 
 func TestManagedSQLConsumedMissingBirthIsNeverRecreated(t *testing.T) {

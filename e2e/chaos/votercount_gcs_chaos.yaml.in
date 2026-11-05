@@ -1,4 +1,8 @@
-# Rendered only after e2e/chaos/bootstrap-gcs-postrelease.sh has applied the
+# HISTORICAL / UNSUPPORTED alpha1 template, not current HA or automatic DR.
+# Its live launcher is retired. Inspection requires explicit unsupported legacy
+# host/operator images containing rhiza-fencer; normal images cannot run it.
+# Never substitute current normal/latest images or apply it as a DR procedure.
+# Previously rendered after e2e/chaos/bootstrap-gcs-postrelease.sh applied the
 # namespace, rhiza-gcs KSA, operator GSA binding, quota and the four admission
 # policies. This set adds the voterCount operator path: one HTTP bind (RHIZA_BIND_ADDR port must equal
 # spec.httpPort), a supervised bootstrap StatefulSet that exports no
@@ -80,7 +84,7 @@ spec:
               topologyKey: kubernetes.io/hostname
       containers:
         - name: rhiza
-          image: __HOST_IMAGE__
+          image: __UNSUPPORTED_LEGACY_HOST_IMAGE__
           imagePullPolicy: IfNotPresent
           command: [/usr/local/bin/rhiza-fencer]
           args: [supervise, --, /usr/local/bin/rhiza]
@@ -184,7 +188,7 @@ spec:
       securityContext: {runAsNonRoot: true, fsGroup: 65532, seccompProfile: {type: RuntimeDefault}}
       containers:
         - name: operator
-          image: __OPERATOR_IMAGE__
+          image: __UNSUPPORTED_LEGACY_OPERATOR_IMAGE__
           imagePullPolicy: IfNotPresent
           args: ["--namespace=$(POD_NAMESPACE)", "--poll-interval=2s"]
           env:
@@ -252,7 +256,7 @@ spec:
       securityContext: {runAsNonRoot: true, fsGroup: 65532, seccompProfile: {type: RuntimeDefault}}
       containers:
         - name: authority
-          image: __OPERATOR_IMAGE__
+          image: __UNSUPPORTED_LEGACY_OPERATOR_IMAGE__
           command: [/usr/local/bin/rhiza-fencer]
           args: [serve, --tls-cert=/tls/tls.crt, --tls-key=/tls/tls.key]
           env: [{name: POD_NAMESPACE, valueFrom: {fieldRef: {fieldPath: metadata.namespace}}}]
@@ -290,7 +294,7 @@ spec:
   securityContext: {runAsNonRoot: true, runAsUser: 65532, runAsGroup: 65532, fsGroup: 65532, seccompProfile: {type: RuntimeDefault}}
   containers:
     - name: inspector
-      image: __HOST_IMAGE__
+      image: __UNSUPPORTED_LEGACY_HOST_IMAGE__
       command: [sh, -c, "sleep 1500"]
       securityContext: {allowPrivilegeEscalation: false, readOnlyRootFilesystem: true, runAsNonRoot: true, capabilities: {drop: [ALL]}}
       resources:
@@ -318,7 +322,7 @@ spec:
   securityContext: {runAsNonRoot: true, runAsUser: 65532, runAsGroup: 65532, fsGroup: 65532, seccompProfile: {type: RuntimeDefault}}
   containers:
     - name: control
-      image: __HOST_IMAGE__
+      image: __UNSUPPORTED_LEGACY_HOST_IMAGE__
       command: [sh, -c, "sleep 1500"]
       securityContext: {allowPrivilegeEscalation: false, readOnlyRootFilesystem: true, runAsNonRoot: true, capabilities: {drop: [ALL]}}
       resources:

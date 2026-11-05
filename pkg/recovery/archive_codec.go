@@ -29,21 +29,36 @@ func archiveDecisionSize(decision quepaxa.DecidedValue) int {
 }
 
 func validateArchivePayload(value, certificate []byte) error {
-	if len(value) == 0 || len(value) > quepaxa.MaxReplicatedValueBytes || len(certificate) == 0 ||
+	return validateArchivePayloadWithValueValidator(value, certificate, nil)
+}
+
+func validateArchivePayloadWithValueValidator(value, certificate []byte, validateValue func([]byte) error) error {
+	limit := quepaxa.MaxReplicatedValueBytes
+	if validateValue != nil {
+		limit = 256 << 10
+	}
+	if len(value) == 0 || len(value) > limit || len(certificate) == 0 ||
 		len(value) > maxExtentPayload || len(certificate) > maxExtentPayload-len(value) {
 		return fmt.Errorf("invalid archive decision payload size")
+	}
+	if validateValue != nil {
+		return validateValue(value)
 	}
 	return nil
 }
 
 func encodeExtent(extent Extent) ([]byte, error) {
+	return encodeExtentWithValueValidator(extent, nil)
+}
+
+func encodeExtentWithValueValidator(extent Extent, validateValue func([]byte) error) ([]byte, error) {
 	if extent.Start == 0 || len(extent.Decisions) == 0 || uint64(extent.Start) > math.MaxUint64-uint64(len(extent.Decisions)-1) || extent.End != extent.Start+quepaxa.Slot(len(extent.Decisions))-1 {
 		return nil, fmt.Errorf("invalid archive extent range")
 	}
 	size := extentHeaderSize + archiveCRCSize
 	prefix := extent.StartPrefix
 	for i, decision := range extent.Decisions {
-		if decision.Slot != extent.Start+quepaxa.Slot(i) || validateArchivePayload(decision.Value, decision.Certificate) != nil || sha256.Sum256(decision.Value) != decision.Hash {
+		if decision.Slot != extent.Start+quepaxa.Slot(i) || validateArchivePayloadWithValueValidator(decision.Value, decision.Certificate, validateValue) != nil || sha256.Sum256(decision.Value) != decision.Hash {
 			return nil, fmt.Errorf("invalid archived decision size")
 		}
 		decisionSize := archiveDecisionSize(decision)
@@ -81,6 +96,10 @@ func encodeExtent(extent Extent) ([]byte, error) {
 }
 
 func decodeExtent(data []byte) (Extent, error) {
+	return decodeExtentWithValueValidator(data, nil)
+}
+
+func decodeExtentWithValueValidator(data []byte, validateValue func([]byte) error) (Extent, error) {
 	if len(data) < extentHeaderSize+archiveCRCSize || len(data) > maxExtentSize || string(data[:8]) != string(extentMagic[:]) || binary.BigEndian.Uint32(data[8:12]) != uint32(len(data)) || binary.BigEndian.Uint32(data[12:16]) != 0 || binary.BigEndian.Uint32(data[36:40]) != 0 {
 		return Extent{}, fmt.Errorf("invalid archive extent header")
 	}
@@ -107,9 +126,12 @@ func decodeExtent(data []byte) (Extent, error) {
 		valueLen := int(binary.BigEndian.Uint32(data[offset : offset+4]))
 		certificateLen := int(binary.BigEndian.Uint32(data[offset+4 : offset+8]))
 		offset += 8
-		if valueLen == 0 || valueLen > quepaxa.MaxReplicatedValueBytes || certificateLen == 0 ||
+		if valueLen == 0 || certificateLen == 0 ||
 			valueLen > maxExtentPayload || certificateLen > maxExtentPayload-valueLen || valueLen > end-offset || certificateLen > end-offset-valueLen {
 			return Extent{}, fmt.Errorf("invalid archive decision length")
+		}
+		if err := validateArchivePayloadWithValueValidator(data[offset:offset+valueLen], data[offset+valueLen:offset+valueLen+certificateLen], validateValue); err != nil {
+			return Extent{}, err
 		}
 		value := append([]byte(nil), data[offset:offset+valueLen]...)
 		offset += valueLen

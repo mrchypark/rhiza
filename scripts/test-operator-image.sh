@@ -60,7 +60,7 @@ jq -e --arg arch "$arch" --arg revision "$revision" --arg version "$version" '
   .[0].Config.Labels["org.opencontainers.image.version"] == $version
 ' "$work/image.json" >/dev/null
 files_id=$(create_owned --name "$files" "$image")
-for binary in rhiza-operator rhiza-fencer rhiza-ha-init; do
+for binary in rhiza-operator rhiza-ha-init; do
     docker cp "$files_id:/usr/local/bin/$binary" "$work/$binary"
     magic=$(od -An -tx1 -N6 "$work/$binary" | tr -d ' \n')
     [ "$magic" = 7f454c460201 ] || { echo "not a little-endian ELF64 binary: $binary" >&2; exit 1; }
@@ -76,17 +76,10 @@ test "$(id -u)" = 65532
 test -s /etc/ssl/certs/ca-certificates.crt
 rhiza-operator --help > /tmp/operator-help 2>&1
 grep -q 'namespace' /tmp/operator-help
-if rhiza-fencer serve --help > /tmp/fencer-help 2>&1; then
-    echo 'unexpected fencer help exit' >&2
-    exit 1
-else
-    test "$?" -eq 1
-fi
-grep -q 'flag: help requested' /tmp/fencer-help
 rhiza-ha-init prepare-identity --cr-uid image-smoke-cluster --generation 0 \
     --pod-uid image-smoke-pod --identity-file /tmp/identity --termination-message /tmp/termination
 test -s /tmp/identity
 test -s /tmp/termination
-printf 'nonroot runtime: operator/fencer CLI startup and ha-init identity preparation passed\n'
+printf 'nonroot runtime: operator CLI startup and ha-init identity preparation passed\n'
 SMOKE
-printf 'verified linux/%s: three ELF64 binaries; image metadata revision %s, version %s\n' "$arch" "$revision" "$version"
+printf 'verified linux/%s: two ELF64 binaries; image metadata revision %s, version %s\n' "$arch" "$revision" "$version"

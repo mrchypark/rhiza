@@ -29,8 +29,9 @@ type repairFixture struct {
 func repairTestSetup(t *testing.T) (*repairFixture, V1Alpha2AdmissionSnapshot) {
 	t.Helper()
 	ctx := context.Background()
-	server, kube := phase9Setup(t, phase8Cluster)
-	seed, err := ReconcileV1Alpha2ManagedInitialization(ctx, kube, phase2Ref, phase9RuntimeProfile())
+	profile := phase9RuntimeProfile()
+	server, kube := phase9Setup(t, phase9ClusterWithProtocol(profile.ApplicationProtocol), profile)
+	seed, err := ReconcileV1Alpha2ManagedInitialization(ctx, kube, phase2Ref, profile)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -104,7 +105,7 @@ func repairTestSetup(t *testing.T) (*repairFixture, V1Alpha2AdmissionSnapshot) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	f.plan = V1Alpha2RepairPlan{OperationID: "repair-1", ClusterUID: phase2Ref.UID, Generation: old.Authority().Generation, DeploymentUID: old.Authority().Binding.DeploymentUID, StorageID: old.Authority().Binding.StorageID, ExpectedConfigID: 1, ExpectedAbortSlot: 0, OldNodeID: bootstrap.Members[0].Member.ID, OldWALIdentity: "actual-registered-wal-identity-from-trusted-caller", Replacement: V1Alpha2RepairMember{PodName: "replacement", PodUID: "replacement-uid", NodeID: nodeID, PublicKey: key, PeerURL: "quic://10.0.0.1:9090"}, BootstrapPlanDigest: initial.Assignment().Plan.BootstrapPlanDigest}
+	f.plan = V1Alpha2RepairPlan{Sequence: V1Alpha2RepairAddThenRemove, OperationID: "repair-1", ClusterUID: phase2Ref.UID, Generation: old.Authority().Generation, DeploymentUID: old.Authority().Binding.DeploymentUID, StorageID: old.Authority().Binding.StorageID, ExpectedConfigID: 1, ExpectedAbortSlot: 0, OldNodeID: bootstrap.Members[0].Member.ID, OldWALIdentity: "actual-registered-wal-identity-from-trusted-caller", Replacement: V1Alpha2RepairMember{PodName: "replacement", PodUID: "replacement-uid", NodeID: nodeID, PublicKey: key, PeerURL: "quic://10.0.0.1:9090"}, BootstrapPlanDigest: initial.Assignment().Plan.BootstrapPlanDigest}
 	f.plan.FinalVoterIDs = []types.NodeID{bootstrap.Members[1].Member.ID, bootstrap.Members[2].Member.ID, nodeID}
 	slices.Sort(f.plan.FinalVoterIDs)
 	f.puts = 0
@@ -135,17 +136,14 @@ func TestRepairV1Alpha2GateAndABA(t *testing.T) {
 	if !sameJSON(closed.status.authorityRaw, old.status.authorityRaw) {
 		t.Fatal("closing changed application authority")
 	}
-	if _, _, err := ReserveV1Alpha2SQLWrite(ctx, f.store, closed, closed.Authority(), closed.Evidence(), network.ExecuteRequest{RequestID: "blocked", SQL: "CREATE TABLE t (v TEXT)"}); err == nil {
-		t.Fatal("closed gate reserved SQL")
-	}
-	if _, _, err := ReserveV1Alpha2Write(ctx, f.store, closed, closed.Authority(), closed.Evidence(), authorityTestRequest); err == nil {
-		t.Fatal("generic mutation bypassed repair gate")
-	}
+
 	for _, kind := range []string{"remove-only", "wrong op", "wrong digest", "wrong target"} {
-		c := repairCompletion(f.plan, "Terminal")
+		c := repairCompletion(f.plan, "Abort")
 		switch kind {
 		case "remove-only":
-			c.ConfigID--
+			c.Kind = "Terminal"
+			c.ConfigID = f.plan.ExpectedConfigID + 1
+			c.FinalVoterIDs = f.plan.FinalVoterIDs
 			c.FinalVoterIDs = c.FinalVoterIDs[:2]
 		case "wrong op":
 			c.OperationID = "other"
@@ -158,31 +156,25 @@ func TestRepairV1Alpha2GateAndABA(t *testing.T) {
 			t.Fatalf("accepted completion %s", kind)
 		}
 	}
-	opened, _, err := FinishV1Alpha2Repair(ctx, f.store, closed, closed.Authority(), repairCompletion(f.plan, "Terminal"))
+	opened, _, err := FinishV1Alpha2Repair(ctx, f.store, closed, closed.Authority(), repairCompletion(f.plan, "Abort"))
 	if err != nil || opened.SQLReservationsClosed() {
 		t.Fatalf("finish: %v", err)
 	}
 	if !sameJSON(opened.status.authorityRaw, old.status.authorityRaw) {
 		t.Fatal("finishing changed pending/evidence")
 	}
-	// The quorum decision is imagined between this old snapshot and the two
-	// repair CASes. Reusing its RV must conflict even though the gate is open.
-	if _, _, err := ReserveV1Alpha2SQLWrite(ctx, f.store, old, old.Authority(), old.Evidence(), network.ExecuteRequest{RequestID: "stale", SQL: "CREATE TABLE t (v TEXT)"}); !errors.Is(err, ErrV1Alpha2StatusConflict) {
-		t.Fatalf("ABA reservation: %v", err)
+	// Repair CAS must still detect an old snapshot after close/finish/open.
+	if _, _, err := BeginV1Alpha2Repair(ctx, f.store, old, old.Authority(), f.plan); !errors.Is(err, ErrV1Alpha2StatusConflict) {
+		t.Fatalf("stale repair CAS bypassed ABA: %v", err)
 	}
-	if _, _, err := ReserveV1Alpha2SQLWrite(ctx, f.store, opened, opened.Authority(), opened.Evidence(), network.ExecuteRequest{RequestID: "new", SQL: "CREATE TABLE t (v TEXT)"}); err != nil {
-		t.Fatalf("fresh pre-quorum snapshot reservation: %v", err)
-	}
+
 }
 
-func TestRepairV1Alpha2PendingFinalizationPreserved(t *testing.T) {
+func TestRepairV1Alpha2HistoricalPendingPreserved(t *testing.T) {
 	f, old := repairTestSetup(t)
 	ctx := context.Background()
 	req := network.ExecuteRequest{RequestID: "existing", SQL: "INSERT INTO t VALUES (?)", Args: []any{"value"}}
-	pending, _, err := ReserveV1Alpha2SQLWrite(ctx, f.store, old, old.Authority(), old.Evidence(), req)
-	if err != nil {
-		t.Fatal(err)
-	}
+	pending := historicalRepairPending(t, f, old, req)
 	closed, _, err := BeginV1Alpha2Repair(ctx, f.store, pending, pending.Authority(), f.plan)
 	if err != nil {
 		t.Fatal(err)
@@ -194,17 +186,12 @@ func TestRepairV1Alpha2PendingFinalizationPreserved(t *testing.T) {
 	if err != nil || !ok || got.SQL != req.SQL || got.RequestID != req.RequestID {
 		t.Fatalf("original SQL lost: %v", err)
 	}
-	request, _ := closed.Pending()
-	final, _, err := FinalizeV1Alpha2Write(ctx, f.store, closed, closed.Authority(), request, V1Alpha2WriteCommitted, json.RawMessage(`{"tip":8}`))
-	if err != nil {
-		t.Fatal(err)
+	want, _ := pending.Pending()
+	gotPending, stillPending := closed.Pending()
+	if !stillPending || gotPending != want || !closed.SQLReservationsClosed() || !closed.EverApplicationReserved() || !sameJSON(closed.Evidence(), pending.Evidence()) {
+		t.Fatal("repair cleared/completed historical UNKNOWN or changed its evidence")
 	}
-	if !final.SQLReservationsClosed() || !final.EverApplicationReserved() {
-		t.Fatal("finalization opened gate or erased history")
-	}
-	if _, ok := final.Pending(); ok {
-		t.Fatal("exact pending finalization did not clear pending")
-	}
+
 }
 
 func TestRepairV1Alpha2CompetingAndBoundedRecords(t *testing.T) {
@@ -335,7 +322,7 @@ func TestRepairV1Alpha2UnknownFinishAndTransitionRead(t *testing.T) {
 				t.Fatal(err)
 			}
 			f.apply, f.lose = applied, true
-			got, obs, err := FinishV1Alpha2Repair(context.Background(), f.store, closed, closed.Authority(), repairCompletion(f.plan, "Terminal"))
+			got, obs, err := FinishV1Alpha2Repair(context.Background(), f.store, closed, closed.Authority(), repairCompletion(f.plan, "Abort"))
 			if !errors.Is(err, ErrV1Alpha2StatusOutcomeUnknown) {
 				t.Fatalf("finish claimed ownership: %v", err)
 			}
@@ -401,4 +388,21 @@ func TestRepairV1Alpha2SchemaIsBoundedIntentNotHandoff(t *testing.T) {
 			t.Fatalf("missing CEL invariant %s", message)
 		}
 	}
+}
+
+// An already stored operation may retain its historical wire shape. This is
+// fixture setup, not a call to the new-operation admission API.
+func historicalClosedRepair(t *testing.T, f *repairFixture, old V1Alpha2AdmissionSnapshot) V1Alpha2AdmissionSnapshot {
+	t.Helper()
+	status, err := jsonObject(f.cluster["status"])
+	if err != nil {
+		t.Fatal(err)
+	}
+	status["repair"], _ = json.Marshal(V1Alpha2RepairRecord{Plan: f.plan, State: "Closed"})
+	f.cluster["status"], _ = json.Marshal(status)
+	loaded, err := LoadV1Alpha2Admission(context.Background(), f.store, old.status.ref)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return loaded
 }

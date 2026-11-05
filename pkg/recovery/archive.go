@@ -141,6 +141,8 @@ type extentObject struct {
 }
 
 type Manager struct {
+	validateValue func([]byte) error
+
 	appendOnly   bool
 	bucket       objstore.Bucket
 	prefix       string
@@ -170,6 +172,12 @@ type Manager struct {
 
 // NewAppendOnlyManager opens an HA namespace without online deletion.
 func NewAppendOnlyManager(bucket objstore.Bucket, prefix string, configID uint) (*Manager, error) {
+	return NewAppendOnlyManagerWithValueValidator(bucket, prefix, configID, nil)
+}
+
+// NewAppendOnlyManagerWithValueValidator binds the startup-selected execution
+// policy before any archive reads. Nil preserves the legacy value budget.
+func NewAppendOnlyManagerWithValueValidator(bucket objstore.Bucket, prefix string, configID uint, validateValue func([]byte) error) (*Manager, error) {
 	if bucket == nil {
 		return nil, fmt.Errorf("append-only archive requires an object store")
 	}
@@ -178,6 +186,7 @@ func NewAppendOnlyManager(bucket objstore.Bucket, prefix string, configID uint) 
 		return nil, fmt.Errorf("append-only archive requires conditional object writes")
 	}
 	m := NewManager(bucket, prefix, configID)
+	m.validateValue = validateValue
 	m.appendOnly = true
 	return m, nil
 }
@@ -490,7 +499,7 @@ func (m *Manager) TrimThrough(ctx context.Context, sealed quepaxa.SealedCheckpoi
 
 func (m *Manager) trimThrough(ctx context.Context, sealed quepaxa.SealedCheckpoint, decision quepaxa.DecidedValue) error {
 	through, prefix := sealed.Index, sealed.PrefixHash
-	if err := validateArchivePayload(decision.Value, decision.Certificate); err != nil {
+	if err := validateArchivePayloadWithValueValidator(decision.Value, decision.Certificate, m.validateValue); err != nil {
 		return fmt.Errorf("archive trim decision: %w", err)
 	}
 	encoded, err := quepaxa.EncodeCheckpointSeal(sealed.CheckpointSeal)
@@ -1157,7 +1166,7 @@ func (m *Manager) buildExtent(core source, from, through quepaxa.Slot, previous 
 		return Extent{}, nil, tip, fmt.Errorf("archive end prefix %d is unavailable", end)
 	}
 	extent := Extent{ConfigID: m.configID, Start: from, End: end, StartPrefix: startPrefix, EndPrefix: endPrefix, PreviousHash: previous, PreviousObject: previousObject, Decisions: decisions}
-	data, err := encodeExtent(extent)
+	data, err := encodeExtentWithValueValidator(extent, m.validateValue)
 	if err != nil {
 		return Extent{}, nil, tip, err
 	}
@@ -1383,7 +1392,7 @@ func (m *Manager) cleanupPublication(ctx context.Context, priorHead archiveHead,
 		for i := range compacted {
 			extent := &compacted[i]
 			extent.PreviousHash, extent.PreviousObject = previous, previousObject
-			data, err := encodeExtent(*extent)
+			data, err := encodeExtentWithValueValidator(*extent, m.validateValue)
 			if err != nil {
 				localtesthooks.HitArchiveGCPhase(ctx, "archive-gc:extent-upload:error")
 				return fmt.Errorf("encode compacted archive extent: %w", err)
@@ -1442,6 +1451,7 @@ func (m *Manager) cleanupPublication(ctx context.Context, priorHead archiveHead,
 			return err
 		}
 		verifier := NewManager(m.bucket, m.prefix, m.configID)
+		verifier.validateValue = m.validateValue
 		if err := archiveGCTrace(ctx, "readback", func() error { return verifier.Load(ctx) }); err != nil {
 			verifier.Close()
 			return fmt.Errorf("verify compacted archive: %w", err)
@@ -2405,7 +2415,7 @@ func (m *Manager) readExtent(ctx context.Context, expected [32]byte, object uint
 	if sha256.Sum256(data) != expected {
 		return Extent{}, fmt.Errorf("archive extent integrity mismatch")
 	}
-	extent, err := decodeExtent(data)
+	extent, err := decodeExtentWithValueValidator(data, m.validateValue)
 	if err != nil {
 		return Extent{}, err
 	}

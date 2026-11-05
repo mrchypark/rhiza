@@ -1,70 +1,159 @@
 package managedsql
 
 import (
-	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
+	"io"
+	"net"
 	"net/http"
-	"net/http/httptest"
-	"path"
-	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
+	"time"
 
-	objectstore "github.com/mrchypark/rhiza/internal/objstore"
-	"github.com/mrchypark/rhiza/internal/types"
 	"github.com/mrchypark/rhiza/pkg/node"
 	"github.com/mrchypark/rhiza/pkg/operator"
 	"github.com/mrchypark/rhiza/pkg/quepaxa"
-	"github.com/mrchypark/rhiza/pkg/recovery"
 )
 
-func TestManagedSQLHostRemoveRepairVoterTerminal(t *testing.T) {
+func TestManagedSQLPreparationRequiresLiveExactRepair(t *testing.T) {
 	ctx := context.Background()
-	configs, seed := sqlCluster(t)
-	// Build a separate, fresh CR fixture with reconfiguration enabled before
-	// any Host opens; never rewrite a committed live assignment.
-	f := &sqlStatusFixture{obj: make(map[string]json.RawMessage), source: seed.source}
-	for k, v := range seed.obj {
-		if k != "status" {
-			f.obj[k] = append(json.RawMessage(nil), v...)
-		}
+	configs, hosts, _ := openSQLQuorum(t, &sqlWireCloseLifecycle{})
+	h := hosts[0]
+	writer, plan := hostRepairWriter(t, configs, hosts)
+	plan.Sequence = operator.V1Alpha2RepairAddThenRemove
+	r := node.ManagedMembershipRequest{RepairOperationID: plan.OperationID, Action: node.ManagedMembershipAdd, ExpectedConfigID: uint(plan.ExpectedConfigID), OldNodeID: quepaxa.NodeID(plan.OldNodeID), OldWALIdentity: plan.OldWALIdentity}
+	current := quepaxa.Cluster{ConfigID: 1, Members: configs[0].Runtime.Members}
+	if err := h.ValidateManagedRepairPreparation(ctx, h.identity, r, current, 0); err == nil {
+		t.Fatal("missing repair accepted")
 	}
-	f.obj["status"] = json.RawMessage(`{}`)
-	api := httptest.NewTLSServer(http.HandlerFunc(f.serve))
-	t.Cleanup(api.Close)
-	k := *configs[0].Store.Kube
-	k.BaseURL, k.Client = api.URL, api.Client()
-	store := &operator.V1Alpha2StatusStore{Kube: &k}
+	a, err := operator.LoadV1Alpha2Admission(ctx, writer, configs[0].Ref)
+	if err != nil {
+		t.Fatal(err)
+	}
+	closed, _, err := operator.BeginV1Alpha2Repair(ctx, writer, a, a.Authority(), plan)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := h.ValidateManagedRepairPreparation(ctx, h.identity, r, current, 0); err != nil {
+		t.Fatalf("exact live ADD-first source preparation: %v", err)
+	}
+	wrong := r
+	wrong.OldWALIdentity = "wrong"
+	if err := h.ValidateManagedRepairPreparation(ctx, h.identity, wrong, current, 0); err == nil {
+		t.Fatal("wrong old WAL accepted")
+	}
+	if err := h.ValidateManagedRepairPreparation(ctx, h.identity, r, current, 1); err == nil {
+		t.Fatal("wrong abort revision accepted")
+	}
+	i := h.identity
+	i.Member.Generation++
+	if err := h.ValidateManagedRepairPreparation(ctx, i, r, current, 0); err == nil {
+		t.Fatal("wrong generation accepted")
+	}
+	completion := operator.V1Alpha2RepairCompletion{OperationID: plan.OperationID, PlanDigest: plan.Digest(), ExpectedConfigID: plan.ExpectedConfigID, ExpectedAbortSlot: plan.ExpectedAbortSlot, Kind: "Abort", ConfigID: 1, Slot: 1, Hash: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}
+	if _, _, err := operator.FinishV1Alpha2Repair(ctx, writer, closed, closed.Authority(), completion); err != nil {
+		t.Fatal(err)
+	}
+	if err := h.ValidateManagedRepairPreparation(ctx, h.identity, r, current, 0); err == nil {
+		t.Fatal("terminal repair reused for preparation")
+	}
+}
+
+func TestManagedSQLWireCloseLifecycleRejectsUnexpectedPUTFailure(t *testing.T) {
+	for _, tc := range []struct {
+		name, method, path string
+		err                error
+		closing, canceled  bool
+		want               bool
+	}{
+		{"owned-close", "PUT", "/bucket/owned/archive/head.bin", io.ErrUnexpectedEOF, true, true, true},
+		{"before-close", "PUT", "/bucket/owned/archive/head.bin", io.ErrUnexpectedEOF, false, true, false},
+		{"live-context", "PUT", "/bucket/owned/archive/head.bin", io.ErrUnexpectedEOF, true, false, false},
+		{"wrong-path", "PUT", "/bucket/other/archive/head.bin", io.ErrUnexpectedEOF, true, true, false},
+		{"prefix-only", "PUT", "/bucket/owned/", io.ErrUnexpectedEOF, true, true, false},
+		{"wrong-method", "GET", "/bucket/owned/archive/head.bin", io.ErrUnexpectedEOF, true, true, false},
+		{"other-io", "PUT", "/bucket/owned/archive/head.bin", io.ErrClosedPipe, true, true, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			if tc.canceled {
+				cancel()
+			}
+			r, err := http.NewRequestWithContext(ctx, tc.method, "http://fixture"+tc.path, nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			lifecycle := &sqlWireCloseLifecycle{}
+			lifecycle.closing.Store(tc.closing)
+			if got := lifecycle.expectedCanceledPUT("/bucket/owned/", r, tc.err); got != tc.want {
+				t.Fatalf("classification got=%t want=%t", got, tc.want)
+			}
+		})
+	}
+	server, control := sqlWireStore(t)
+	lifecycle := &sqlWireCloseLifecycle{}
+	observed := make(chan bool, 1)
+	control.putReadFailure = func(r *http.Request, err error) {
+		observed <- errors.Is(err, io.ErrUnexpectedEOF) && !lifecycle.expectedCanceledPUT("/bucket/owned/", r, err)
+	}
+	conn, err := net.DialTimeout("tcp", strings.TrimPrefix(server.URL, "http://"), 5*time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, writeErr := io.WriteString(conn, "PUT /bucket/owned/archive/head.bin HTTP/1.1\r\nHost: fixture\r\nContent-Length: 10\r\n\r\nx")
+	closeErr := conn.Close()
+	if writeErr != nil || closeErr != nil {
+		t.Fatal(writeErr, closeErr)
+	}
+	select {
+	case rejected := <-observed:
+		if !rejected {
+			t.Fatal("actual truncated PUT before owned Close was not rejected")
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("actual truncated PUT did not reach the observer")
+	}
+}
+
+func TestManagedSQLDirectMembershipRejectsRemoveFirstIntent(t *testing.T) {
+	configs, fixture := sqlCluster(t)
+	ctx := context.Background()
+	// Snapshot assertions require an actual reconfiguration-enabled runtime,
+	// including the matching committed bootstrap digest, not the SQL-only fixture.
 	for i := range configs {
 		configs[i].Runtime.EnableReconfiguration = true
-		configs[i].Store = store
 	}
-	n := node.New(&configs[0].Runtime)
-	source, _, err := n.PreparedStartupBindingDigests()
+	bootstrapNode := node.New(&configs[0].Runtime)
+	plan := configs[0].Plan
+	digest, err := bootstrapNode.ManagedBootstrapPlanDigestForProtocol(plan.PhysicalBinding, plan.EvidenceFormat, plan.ApplicationProtocol)
 	if err != nil {
 		t.Fatal(err)
 	}
-	digest, err := n.ManagedBootstrapPlanDigest(source, EvidenceFormat)
-	if err != nil {
+	plan.BootstrapPlanDigest = digest
+	var status map[string]json.RawMessage
+	if err := json.Unmarshal(fixture.obj["status"], &status); err != nil {
 		t.Fatal(err)
 	}
-	plan, err := operator.NewV1Alpha2ApplicationInitPlan(configs[0].Ref, "logical", "deployment", "assignment", source, digest, EvidenceFormat)
-	if err != nil {
+	var assignment operator.V1Alpha2ApplicationInitAssignment
+	var bootstrap operator.V1Alpha2BootstrapPlan
+	if err := json.Unmarshal(status["applicationInit"], &assignment); err != nil {
 		t.Fatal(err)
 	}
-	bootstrap := operator.V1Alpha2BootstrapPlan{ClusterID: configs[0].Runtime.ClusterID, PhysicalBinding: source, EvidenceFormat: EvidenceFormat, Durability: types.ObjectStoreDurabilityBeforeAck, Reconfiguration: true}
-	for i, m := range configs[0].Runtime.Members {
-		bootstrap.Members = append(bootstrap.Members, operator.V1Alpha2BootstrapMember{PodUID: configs[i].PodUID, Member: m})
-	}
-	name, _ := operator.V1Alpha2GenesisDeploymentName(configs[0].Ref.UID)
-	if _, err := operator.InitializeV1Alpha2AuthorityWithBootstrap(ctx, store, configs[0].Ref, name, plan, bootstrap); err != nil {
+	if err := json.Unmarshal(status["bootstrapPlan"], &bootstrap); err != nil {
 		t.Fatal(err)
 	}
-	hosts := make([]*Host, 3)
-	for _, i := range []int{1, 2} {
+	assignment.Plan = plan
+	bootstrap.Reconfiguration = true
+	status["applicationInit"], _ = json.Marshal(assignment)
+	status["bootstrapPlan"], _ = json.Marshal(bootstrap)
+	fixture.obj["status"], _ = json.Marshal(status)
+	hosts := make([]*Host, len(configs))
+	for i := range configs {
 		configs[i].Plan = plan
-		h, err := seed.open(ctx, configs[i])
+		h, err := fixture.open(ctx, configs[i])
 		if h != nil {
 			t.Cleanup(func() {
 				if err := h.Close(); err != nil {
@@ -77,316 +166,53 @@ func TestManagedSQLHostRemoveRepairVoterTerminal(t *testing.T) {
 		}
 		hosts[i] = h
 	}
-	configs[0].Plan = plan
-	writer, repair := hostRepairWriter(t, configs, hosts)
-	peerAddr := seed.reservePeer(t, repair.Replacement.NodeID)
-	repair.Replacement.PeerURL = "quic://" + peerAddr
-	originalTransport := writer.Kube.Client.Transport
-	writer.Kube.Client.Transport = repairGateTransport(func(req *http.Request) (*http.Response, error) {
-		response, err := originalTransport.RoundTrip(req)
-		if err != nil || !strings.Contains(req.URL.Path, "/pods/") {
-			return response, err
-		}
-		defer response.Body.Close()
-		var pod map[string]any
-		if err := json.NewDecoder(response.Body).Decode(&pod); err != nil {
-			return nil, err
-		}
-		pod["status"].(map[string]any)["podIP"] = "127.0.0.1"
-		return repairGateJSON(pod), nil
-	})
-	configs[0].Store = writer
-	hosts[0], err = seed.open(ctx, configs[0])
-	if hosts[0] != nil {
-		t.Cleanup(func() {
-			if err := hosts[0].Close(); err != nil {
-				t.Error(err)
-			}
-		})
-	}
-	if err != nil {
-		t.Fatal(err)
-	}
 	for _, h := range hosts {
 		readySQL(t, h)
 	}
-	a, err := operator.LoadV1Alpha2Admission(ctx, writer, configs[0].Ref)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if _, _, err := operator.BeginV1Alpha2Repair(ctx, writer, a, a.Authority(), repair); err != nil {
-		t.Fatal(err)
-	}
-	logControlState := func(stage string) {
-		for i, h := range hosts {
-			state, stateErr := h.node.ManagedState()
-			t.Logf("control %s member=%s certified=%d applied=%d recorder=%d inspect-error=%t", stage, configs[i].Runtime.NodeID, state.CertifiedTip, state.AppliedTip, state.RecorderTip, stateErr != nil)
-			if stage == "remove-failed" {
-				t.Logf("control readiness member=%s error=%v", configs[i].Runtime.NodeID, h.ValidateManagedAdmission(ctx, h.identity, state))
+	readyCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	defer cancel()
+	ticker := time.NewTicker(30 * time.Millisecond)
+	defer ticker.Stop()
+	for _, h := range hosts {
+		for !h.node.Ready() {
+			select {
+			case <-readyCtx.Done():
+				t.Fatal("fixture voter did not reach actual peer readiness")
+			case <-ticker.C:
 			}
 		}
 	}
-	logControlState("before-remove")
-	if err := hosts[0].RemoveRepairVoter(ctx, repair.OperationID); err != nil {
-		logControlState("remove-failed")
-		t.Fatal(err)
-	}
-	// The same Host entry must retry the actual terminal, not produce a second
-	// operation or reopen SQL after the REMOVE-only intermediate configuration.
-	before, err := hosts[0].node.ManagedState()
-	if err != nil {
-		t.Fatal(err)
-	}
-	cfg := configs[0].Runtime
-	bucket, err := objectstore.NewBucketWithoutProvisioning(ctx, objectstore.Config{Provider: objectstore.ProviderS3, Endpoint: cfg.ObjStoreEndpoint, Bucket: cfg.ObjStoreBucket, Region: cfg.ObjStoreRegion, Insecure: true, AccessKey: cfg.ObjStoreAccessKey, SecretKey: cfg.ObjStoreSecretKey})
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { _ = bucket.Close() })
-	archive := recovery.NewManager(bucket, path.Join(cfg.ObjStorePrefix, string(cfg.ClusterID)), 1)
-	t.Cleanup(archive.Close)
-	if err := archive.Load(ctx); err != nil {
-		t.Fatal(err)
-	}
-	values, _, err := archive.DecisionsFrom(ctx, quepaxa.Slot(before.CertifiedTip), 1)
-	if err != nil || len(values) != 1 {
-		t.Fatalf("actual terminal archive: %v", err)
-	}
-	terminal := values[0]
-	if control, err := quepaxa.DecodeReconfiguration(terminal.Value); err != nil || !control || len(terminal.Certificate) == 0 {
-		t.Fatalf("certified terminal: %v", err)
-	}
-	var record struct {
-		Terminal bool            `json:"terminal"`
-		Abort    bool            `json:"abort"`
-		Target   quepaxa.Cluster `json:"target"`
-	}
-	if err := json.Unmarshal(bytes.TrimPrefix(terminal.Value, []byte("QRCF\x00")), &record); err != nil || !record.Terminal || record.Abort || record.Target.ConfigID != 2 || len(record.Target.Members) != 2 {
-		t.Fatalf("REMOVE terminal: %+v %v", record, err)
-	}
-	for _, member := range record.Target.Members {
-		if member.ID != configs[0].Runtime.NodeID && member.ID != configs[2].Runtime.NodeID {
-			t.Fatal("terminal is not exact survivor-only intermediate membership")
-		}
-	}
-	if err := hosts[0].RemoveRepairVoter(ctx, repair.OperationID); err != nil {
-		t.Fatal(err)
-	}
-	after, err := hosts[0].node.ManagedState()
-	if err != nil || after.CertifiedTip != before.CertifiedTip {
-		t.Fatalf("terminal retry: %v", err)
-	}
-	live, err := operator.LoadV1Alpha2Admission(ctx, writer, configs[0].Ref)
-	if err != nil || !live.SQLReservationsClosed() {
-		t.Fatalf("REMOVE reopened repair: %v", err)
-	}
-	capture, err := hosts[0].CaptureRepairHandoff(ctx, repair.OperationID)
-	if err != nil {
-		t.Fatalf("real post-REMOVE capture: %v", err)
-	}
-	recordSize, _ := json.Marshal(capture)
-	t.Logf("actual post-REMOVE HEAD bytes=%d handoff JSON bytes=%d", len(capture.Head), len(recordSize))
-	if len(capture.Head) > operator.V1Alpha2RepairHeadLimit {
-		t.Fatal("actual HEAD exceeded bounded inline contract")
-	}
-	live, err = operator.LoadV1Alpha2Admission(ctx, writer, configs[0].Ref)
-	if err != nil {
-		t.Fatal(err)
-	}
-	repairRecord, ok := live.Repair()
-	if !ok || repairRecord.PreparedHandoff == nil || repairRecord.PreparedHandoff.HeadHash != capture.HeadHash {
-		t.Fatal("captured handoff not read back")
-	}
-	encodedRecord, _ := json.Marshal(repairRecord)
-	t.Logf("actual bounded repair record JSON bytes=%d", len(encodedRecord))
-	if len(encodedRecord) > operator.V1Alpha2RepairRecordLimit {
-		t.Fatal("actual post-REMOVE record exceeds budget")
-	}
-	captureAgain, err := hosts[0].CaptureRepairHandoff(ctx, repair.OperationID)
-	if err != nil || !bytes.Equal(captureAgain.Head, capture.Head) {
-		t.Fatalf("capture retry retargeted HEAD: %v", err)
-	}
-	if _, _, err := operator.CaptureV1Alpha2RepairHandoff(ctx, writer, live, live.Authority(), capture); err == nil {
-		t.Fatal("write-once capture overwritten")
-	}
-	learnerCfg := configs[0]
-	learnerCfg.Store = writer
-	learnerCfg.PodUID = repair.Replacement.PodUID
-	learnerCfg.Runtime = node.CloneManagedRuntimeConfig(learnerCfg.Runtime)
-	learnerCfg.Runtime.NodeID = repair.Replacement.NodeID
-	learnerCfg.Runtime.PeerAddr, learnerCfg.Runtime.PeerToken = peerAddr, "replacement-test-token"
-	learnerCfg.Runtime.Learner = &quepaxa.Member{ID: repair.Replacement.NodeID, PublicKey: repair.Replacement.PublicKey, PeerURL: repair.Replacement.PeerURL}
-	learnerCfg.Runtime.DataDir = filepath.Join(t.TempDir(), "verified")
-	learnerNode := node.New(&learnerCfg.Runtime)
-	physical, configDigest, err := learnerNode.PreparedStartupBindingDigests()
-	if err != nil {
-		t.Fatal(err)
-	}
-	identity := recovery.PreparedStartupIdentity{ClusterUID: learnerCfg.Ref.UID, Generation: learnerCfg.Plan.Generation, DeploymentUID: learnerCfg.Plan.DeploymentUID, PodUID: learnerCfg.PodUID, NodeID: string(learnerCfg.Runtime.NodeID), SourceBinding: physical, ConfigDigest: configDigest}
-	trustedBootstrap := quepaxa.Cluster{ConfigID: 1, Members: learnerCfg.Runtime.Members}
-	view, err := recovery.OpenReadOnlyViewAtHead(ctx, bucket, capture.SourcePrefix, 1, trustedBootstrap, capture.Head)
-	if err != nil {
-		t.Fatal(err)
-	}
-	handoffDir := filepath.Join(t.TempDir(), "handoff")
-	if err := recovery.PublishPreparedStartup(ctx, view, handoffDir, identity); err != nil {
-		t.Fatal(err)
-	}
-	prepared, err := recovery.LoadPreparedStartup(ctx, bucket, capture.SourcePrefix, 1, trustedBootstrap, handoffDir, learnerCfg.Runtime.DataDir, identity)
-	if err != nil {
-		t.Fatal(err)
-	}
-	learnerCfg.Prepared = prepared
-	originAdmission, err := operator.LoadV1Alpha2Admission(ctx, writer, learnerCfg.Ref)
-	if err != nil {
-		t.Fatal(err)
-	}
-	originRepair, ok := originAdmission.Repair()
-	if !ok {
-		t.Fatal("prepared learner lacks live repair")
-	}
-	originBinding, err := operator.ValidateV1Alpha2RepairPodBinding(ctx, writer, learnerCfg.Ref, originRepair.Plan)
-	if err != nil {
-		t.Fatal(err)
-	}
-	learnerCfg.RepairOrigin, err = json.Marshal(managedRepairOriginFile{Version: 1, Repair: originRepair, Binding: originBinding})
-	if err != nil {
-		t.Fatal(err)
-	}
-	learner, err := seed.open(ctx, learnerCfg)
-	if learner != nil {
-		t.Cleanup(func() {
-			if err := learner.Close(); err != nil {
-				t.Error(err)
-			}
-		})
-	}
-	if err != nil {
-		t.Fatalf("open actual prepared learner: %v", err)
-	}
-	learnerState, err := learner.node.ManagedState()
-	if err != nil || learnerState.WALIdentity == "" {
-		t.Fatalf("actual learner registration: %v", err)
-	}
-	if err := hosts[0].AddRepairVoter(ctx, repair.OperationID, "not-a-registered-nonce"); err == nil {
-		t.Fatal("fake learner nonce accepted")
-	}
-	if err := hosts[0].AddRepairVoter(ctx, repair.OperationID, learnerState.WALIdentity); err != nil {
-		t.Fatalf("private actual learner ADD: %v", err)
-	}
-	if err := hosts[0].AddRepairVoter(ctx, repair.OperationID, learnerState.WALIdentity); err != nil {
-		t.Fatalf("exact ADD terminal retry: %v", err)
-	}
-	readySQL(t, learner)
-	if _, err := learner.node.API(); err == nil {
-		t.Fatal("prepared learner exposed raw API")
-	}
-	if _, err := learner.node.Handler(); err == nil {
-		t.Fatal("prepared learner exposed raw Handler")
-	}
-	finalState, err := hosts[0].node.ManagedState()
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := archive.Load(ctx); err != nil {
-		t.Fatal(err)
-	}
-	values, _, err = archive.DecisionsFrom(ctx, quepaxa.Slot(finalState.CertifiedTip), 1)
-	if err != nil || len(values) != 1 {
-		t.Fatalf("actual ADD terminal archive: %v", err)
-	}
-	terminal = values[0]
-	if control, err := quepaxa.DecodeReconfiguration(terminal.Value); err != nil || !control || len(terminal.Certificate) == 0 {
-		t.Fatalf("ADD certificate: %v", err)
-	}
-	if err := json.Unmarshal(bytes.TrimPrefix(terminal.Value, []byte("QRCF\x00")), &record); err != nil || !record.Terminal || record.Abort || record.Target.ConfigID != 3 || len(record.Target.Members) != 3 {
-		t.Fatalf("ADD terminal: %+v %v", record, err)
-	}
-	foundLearner := false
-	for _, member := range record.Target.Members {
-		if member.ID == repair.OldNodeID {
-			t.Fatal("old voter resurrected")
-		}
-		if member.ID == repair.Replacement.NodeID {
-			foundLearner = member.WALIdentity == learnerState.WALIdentity && member.PublicKey == repair.Replacement.PublicKey && member.PeerURL == repair.Replacement.PeerURL
-		}
-	}
-	if !foundLearner {
-		t.Fatal("ADD terminal lacks actual registered learner identity")
-	}
-	retained, err := hosts[0].CaptureRepairHandoff(ctx, repair.OperationID)
-	if err != nil || !bytes.Equal(retained.Head, capture.Head) {
-		t.Fatalf("later HEAD retargeted capture: %v", err)
-	}
-	fixed, err := recovery.OpenReadOnlyViewAtHead(ctx, bucket, capture.SourcePrefix, 1, trustedBootstrap, capture.Head)
-	if err != nil || fixed.Tip() >= archive.Tip() {
-		t.Fatalf("fixed HEAD did not retain earlier cut: %v", err)
-	}
-	if err := learner.Close(); err != nil {
-		t.Fatal(err)
-	}
-	learnerCfg.Prepared = nil
-	restarted, err := seed.open(ctx, learnerCfg)
-	if restarted != nil {
-		t.Cleanup(func() {
-			if err := restarted.Close(); err != nil {
-				t.Error(err)
-			}
-		})
-	}
-	if err != nil {
-		t.Fatalf("same-Pod promoted adopted restart: %v", err)
-	}
-	readySQL(t, restarted)
-	restartedState, err := restarted.node.ManagedState()
-	if err != nil || restartedState.WALIdentity != learnerState.WALIdentity {
-		t.Fatalf("adopted restart replaced WAL: %v", err)
-	}
-	live, err = operator.LoadV1Alpha2Admission(ctx, writer, configs[0].Ref)
-	if err != nil || !live.SQLReservationsClosed() {
-		t.Fatalf("membership alone reopened SQL: %v", err)
-	}
-}
-
-func TestManagedSQLMembershipRequiresLiveExactRepair(t *testing.T) {
-	ctx := context.Background()
-	configs, hosts, _ := openSQLQuorum(t)
 	h := hosts[0]
-	writer, plan := hostRepairWriter(t, configs, hosts)
-	r := node.ManagedMembershipRequest{RepairOperationID: plan.OperationID, Action: node.ManagedMembershipRemove, ExpectedConfigID: uint(plan.ExpectedConfigID), OldNodeID: quepaxa.NodeID(plan.OldNodeID), OldWALIdentity: plan.OldWALIdentity}
-	current := quepaxa.Cluster{ConfigID: 1, Members: configs[0].Runtime.Members}
-	if err := h.ValidateManagedMembership(ctx, h.identity, r, current, 0); err == nil {
-		t.Fatal("missing repair accepted")
-	}
-	a, err := operator.LoadV1Alpha2Admission(ctx, writer, configs[0].Ref)
+	writer, repairPlan := hostRepairWriter(t, configs, hosts)
+	repairPlan.Sequence = ""
+	fixture.mu.Lock()
+	_ = json.Unmarshal(fixture.obj["status"], &status)
+	status["repair"], _ = json.Marshal(operator.V1Alpha2RepairRecord{Plan: repairPlan, State: "Closed"})
+	fixture.obj["status"], _ = json.Marshal(status)
+	fixture.mu.Unlock()
+	closed, err := operator.LoadV1Alpha2Admission(ctx, writer, configs[0].Ref)
 	if err != nil {
 		t.Fatal(err)
 	}
-	closed, _, err := operator.BeginV1Alpha2Repair(ctx, writer, a, a.Authority(), plan)
+	state, err := h.node.ManagedRepairSnapshot(ctx, "", quepaxa.PublicKey{})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := h.ValidateManagedMembership(ctx, h.identity, r, current, 0); err != nil {
-		t.Fatalf("exact live repair: %v", err)
+	for _, action := range []struct {
+		name string
+		run  func() error
+	}{
+		{"remove", func() error { return h.RemoveRepairVoter(ctx, repairPlan.OperationID) }},
+		{"capture", func() error { _, err := h.CaptureRepairHandoff(ctx, repairPlan.OperationID); return err }},
+		{"add", func() error { return h.AddRepairVoter(ctx, repairPlan.OperationID, "must-not-authorize") }},
+	} {
+		if err := action.run(); err == nil || !strings.Contains(err.Error(), "append-only replacement requires ADD-first") {
+			t.Fatalf("%s accepted a retired REMOVE-first intent: %v", action.name, err)
+		}
 	}
-	wrong := r
-	wrong.OldWALIdentity = "wrong"
-	if err := h.ValidateManagedMembership(ctx, h.identity, wrong, current, 0); err == nil {
-		t.Fatal("wrong old WAL accepted")
-	}
-	if err := h.ValidateManagedMembership(ctx, h.identity, r, current, 1); err == nil {
-		t.Fatal("wrong abort revision accepted")
-	}
-	i := h.identity
-	i.Member.Generation++
-	if err := h.ValidateManagedMembership(ctx, i, r, current, 0); err == nil {
-		t.Fatal("wrong generation accepted")
-	}
-	completion := operator.V1Alpha2RepairCompletion{OperationID: plan.OperationID, PlanDigest: plan.Digest(), ExpectedConfigID: plan.ExpectedConfigID, ExpectedAbortSlot: plan.ExpectedAbortSlot, Kind: "Abort", ConfigID: 1, Slot: 1, Hash: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}
-	if _, _, err := operator.FinishV1Alpha2Repair(ctx, writer, closed, closed.Authority(), completion); err != nil {
-		t.Fatal(err)
-	}
-	if err := h.ValidateManagedMembership(ctx, h.identity, r, current, 0); err == nil {
-		t.Fatal("terminal repair reused for membership")
+	after, err := operator.LoadV1Alpha2Admission(ctx, writer, configs[0].Ref)
+	afterState, stateErr := h.node.ManagedRepairSnapshot(ctx, "", quepaxa.PublicKey{})
+	if err != nil || stateErr != nil || after.ResourceVersion() != closed.ResourceVersion() || !reflect.DeepEqual(state.Current, afterState.Current) || state.AbortSlot != afterState.AbortSlot {
+		t.Fatalf("rejected direct membership changed CR/runtime: err=%v state_error=%v", err, stateErr)
 	}
 }

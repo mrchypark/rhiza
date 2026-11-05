@@ -50,7 +50,9 @@ for invalid in \
   [ "$code" -ne 0 ] || { echo 'unsafe host mapping accepted' >&2; exit 1; }
 done
 for driver in scripts/test-ha-managed-cluster-chaos.sh scripts/test-ha-managed-direct-host-chaos.sh; do
-  oracle=$(sed -n '/^chaos_record_oracle() {/,/^}/p' "$driver")
+  fault_source=$driver
+  case "$driver" in *direct-host*) fault_source=scripts/ha-managed-podchaos.sh ;; esac
+  oracle=$(sed -n '/^chaos_record_oracle() {/,/^}/p' "$fault_source")
   [ -n "$oracle" ]
   for target in test-ns/host-1 test-ns/host-1/sql; do
     for condition in AllInjected AllRecovered; do
@@ -72,14 +74,16 @@ for driver in scripts/test-ha-managed-cluster-chaos.sh scripts/test-ha-managed-d
       done
     done
   done
-  capture=$(sed -n '/^capture_chaos_failure() {/,/^}/p' "$driver")
-  waiter=$(sed -n '/^wait_chaos_injected() {/,/^}/p' "$driver")
+  capture=$(sed -n '/^capture_chaos_failure() {/,/^}/p' "$fault_source")
+  waiter=$(sed -n '/^wait_chaos_injected() {/,/^}/p' "$fault_source")
   [ -n "$capture" ] && [ -n "$waiter" ]
   jq -n '{apiVersion:"chaos-mesh.org/v1alpha1",kind:"PodChaos",metadata:{name:"pod-kill",namespace:"test-ns",uid:"fault-uid",labels:{"rhiza-ci-run":"test-run"}},status:{conditions:[{type:"AllInjected",status:"False"}]}}' > "$scratch/fault.json"
   jq -n '{items:[{reason:"Failed",message:("x" * 70000),involvedObject:{kind:"PodChaos",name:"pod-kill",uid:"fault-uid"}}]}' > "$scratch/fault-events.json"
   sh -c 'set -eu
-    private=$1 logs=$1; RHIZA_HOST_NAMESPACE=test-ns; release=test-run
+    private=$1 logs=$1; RHIZA_HOST_NAMESPACE=test-ns; namespace=test-ns; release=test-run
     host_guard() { return 0; }
+    chaos_scope_guard() { host_guard; }
+    chaos_k() { hn "$@"; }
     hn() {
       printf "%s\n" "$*" >> "$logs/capture-trace.txt"
       case "$1/$2" in wait/*) return 7 ;; get/podchaos/pod-kill) cat "$logs/fault.json" ;; get/events) cat "$logs/fault-events.json" ;; *) return 9 ;; esac
@@ -110,14 +114,17 @@ for driver in scripts/test-ha-managed-cluster-chaos.sh scripts/test-ha-managed-d
   ' fixture "$scratch" "$cleanup_helper" || cleanup_code=$?
   [ "$cleanup_code" -eq 7 ] && [ "$(cat "$scratch/driver-original.exit")" -eq 7 ] && [ "$(cat "$scratch/driver.exit")" -eq 7 ]
   [ ! -e "$scratch/cleanup-private" ]
-  if grep -Fq 'AllRecovered' "$driver"; then echo 'one-shot kill waits for unsupported pre-delete recovery condition' >&2; exit 1; fi
+  if grep -Fq 'AllRecovered' "$fault_source"; then echo 'one-shot kill waits for unsupported pre-delete recovery condition' >&2; exit 1; fi
   fault_function=chaos_fault
   case "$driver" in *direct-host*) fault_function=direct_chaos_fault ;; esac
-  runner=$(sed -n "/^$fault_function() {/,/^}/p" "$driver")
+  runner=$(sed -n "/^$fault_function() {/,/^}/p" "$fault_source")
+  request_builder=$(sed -n '/^managed_chaos_request() {/,/^}/p' "$fault_source")
   for kill in pod-kill container-kill; do
     sh -c 'set -eu
       logs=$1; namespace=test-ns RHIZA_HOST_NAMESPACE=test-ns release=test-run uid=cluster-uid
       event_deleted=0 pod_reads=0
+      chaos_scope_guard() { return 0; }
+      chaos_k() { hn "$@"; }
       : > "$logs/capture-trace.txt"
       hn() {
         printf "%s\n" "$*" >> "$logs/capture-trace.txt"
@@ -136,7 +143,7 @@ for driver in scripts/test-ha-managed-cluster-chaos.sh scripts/test-ha-managed-d
         esac
       }
       mapped_host_pod() { host_pod=host-1 host_uid=pod-uid; hn get pod host-1 -o json | jq "[.]" > "$logs/$fault-host-before.json"; }
-      eval "$2"; eval "$3"; eval "$4"
+      eval "$2"; eval "$3"; eval "$4"; eval "$7"
       "$5" "$6" "$6" host-1 pod-uid
       [ "$event_deleted" -eq 1 ]
       printf "%s\n" app-recovery-check >> "$logs/capture-trace.txt"
@@ -144,7 +151,7 @@ for driver in scripts/test-ha-managed-cluster-chaos.sh scripts/test-ha-managed-d
       absence=$(grep -n "^get podchaos/$6 --ignore-not-found " "$logs/capture-trace.txt" | cut -d: -f1)
       app=$(grep -n "^app-recovery-check$" "$logs/capture-trace.txt" | cut -d: -f1)
       [ "$deleted" -lt "$absence" ] && [ "$absence" -lt "$app" ]
-    ' fixture "$scratch" "$oracle" "$waiter" "$runner" "$fault_function" "$kill"
+    ' fixture "$scratch" "$oracle" "$waiter" "$runner" "$fault_function" "$kill" "$request_builder"
   done
 done
 [ "$(grep -c 'set-json "sync.fromHost.nodes.selector.labels=' scripts/test-ha-managed-cluster-chaos.sh)" -eq 2 ]

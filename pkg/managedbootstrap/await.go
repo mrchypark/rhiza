@@ -53,6 +53,9 @@ func CheckGate(ctx context.Context, kube *operator.Kubernetes, ref operator.V1Al
 
 func CheckGateMember(ctx context.Context, kube *operator.Kubernetes, ref operator.V1Alpha2ClusterRef, generation int64, podName, podUID, identityPath string, replacement *operator.V1Alpha2BootstrapMember) (operator.V1Alpha2BootstrapPlan, error) {
 	var empty operator.V1Alpha2BootstrapPlan
+	if generation != 0 {
+		return empty, errors.New("unsupported managed bootstrap generation")
+	}
 	cluster, err := types.ManagedClusterID(ref.UID, generation)
 	if err != nil {
 		return empty, err
@@ -83,6 +86,18 @@ func CheckGateMember(ctx context.Context, kube *operator.Kubernetes, ref operato
 	}
 	if init.Authority() != snap.Authority() || init.Assignment().Plan.Generation != generation || init.Authority().Generation != generation || plan.ClusterID != cluster {
 		return empty, errors.New("live bootstrap authority changed")
+	}
+	assignment := init.Assignment().Plan
+	if err := operator.ValidateV1Alpha2ApplicationProfile(assignment.ApplicationProtocol, assignment.EvidenceFormat); err != nil {
+		return empty, err
+	}
+	members := make([]types.NodeConfig, 0, len(plan.Members))
+	for _, member := range plan.Members {
+		members = append(members, member.Member)
+	}
+	digest, err := types.ManagedBootstrapPlanDigestForProtocol(string(cluster), members, plan.PhysicalBinding, plan.EvidenceFormat, plan.Durability, plan.Reconfiguration, assignment.ApplicationProtocol)
+	if err != nil || assignment.PhysicalBinding != plan.PhysicalBinding || assignment.EvidenceFormat != plan.EvidenceFormat || assignment.BootstrapPlanDigest != digest {
+		return empty, errors.New("live bootstrap application profile mismatch")
 	}
 	var entry *operator.V1Alpha2BootstrapMember
 	for i := range plan.Members {

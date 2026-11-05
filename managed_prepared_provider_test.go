@@ -1,9 +1,11 @@
 package rhiza_test
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"database/sql"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -15,6 +17,8 @@ import (
 	"os"
 	"path"
 	"path/filepath"
+	"reflect"
+	"slices"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -22,15 +26,80 @@ import (
 	"time"
 
 	"github.com/mrchypark/rhiza"
+	"github.com/mrchypark/rhiza/internal/sqlpolicy"
 	"github.com/mrchypark/rhiza/internal/types"
 	"github.com/mrchypark/rhiza/pkg/managedsql"
 	"github.com/mrchypark/rhiza/pkg/materializer"
+	"github.com/mrchypark/rhiza/pkg/network"
 	"github.com/mrchypark/rhiza/pkg/node"
 	"github.com/mrchypark/rhiza/pkg/operator"
 	"github.com/mrchypark/rhiza/pkg/quepaxa"
 	"github.com/mrchypark/rhiza/pkg/recovery"
 	_ "github.com/ncruces/go-sqlite3/driver"
+	"github.com/thanos-io/objstore"
 )
+
+// Freeze only a source-observed CURRENT hint, never archive HEAD or immutable
+// objects. Each view must still verify its exact seal/root against real SDK
+// reads. This preserves the test's checkpoint-base-plus-later-suffix scenario
+// even when another admitted publisher advances the live discovery hint.
+type managedProviderFixedCurrent struct {
+	*readonlyProviderBucket
+	key  string
+	data []byte
+	attr objstore.ObjectAttributes
+}
+
+func captureManagedProviderCurrent(ctx context.Context, bucket *readonlyProviderBucket, key string) (*managedProviderFixedCurrent, error) {
+	before, err := bucket.Attributes(ctx, key)
+	if err != nil {
+		return nil, err
+	}
+	if before.Version == nil {
+		return nil, fmt.Errorf("provider CURRENT lacks conditional version")
+	}
+	r, err := bucket.Get(ctx, key)
+	if err != nil {
+		return nil, err
+	}
+	// Match the existing checkpoint locator reader's bounded object size.
+	const limit = 64 << 10
+	data, readErr := io.ReadAll(io.LimitReader(r, limit+1))
+	if err := errors.Join(readErr, r.Close()); err != nil {
+		return nil, err
+	}
+	if len(data) == 0 || len(data) > limit {
+		return nil, fmt.Errorf("provider CURRENT has invalid size")
+	}
+	after, err := bucket.Attributes(ctx, key)
+	if err != nil {
+		return nil, err
+	}
+	if after.Version == nil || *before.Version != *after.Version {
+		return nil, fmt.Errorf("provider CURRENT changed during capture")
+	}
+	return &managedProviderFixedCurrent{readonlyProviderBucket: bucket, key: key, data: data, attr: after}, nil
+}
+
+func (b *managedProviderFixedCurrent) Get(ctx context.Context, key string) (io.ReadCloser, error) {
+	if key != b.key {
+		return b.readonlyProviderBucket.Get(ctx, key)
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	return io.NopCloser(bytes.NewReader(b.data)), nil
+}
+
+func (b *managedProviderFixedCurrent) Attributes(ctx context.Context, key string) (objstore.ObjectAttributes, error) {
+	if key != b.key {
+		return b.readonlyProviderBucket.Attributes(ctx, key)
+	}
+	if err := ctx.Err(); err != nil {
+		return objstore.ObjectAttributes{}, err
+	}
+	return b.attr, nil
+}
 
 // This test uses source voters and target materializers from the real Rhiza
 // runtime plus each provider's SDK adapter. Its status endpoint is only a
@@ -115,42 +184,24 @@ func TestEmbeddedObjectStorageManagedPreparedCheckpointAdoption(t *testing.T) {
 		t.Fatal(err)
 	}
 	learner.NodeID, learner.PeerToken, learner.PeerAddr = string(learnerID), "provider-learner-token", freeUDPAddr(t)
-	learner.Learner = &rhiza.Member{ID: learnerID, PublicKey: rhiza.PeerPublicKey(base.ClusterID, string(learnerID), learner.PeerToken)}
+	learner.Learner = &rhiza.Member{ID: learnerID, PublicKey: rhiza.PeerPublicKey(base.ClusterID, string(learnerID), learner.PeerToken), PeerURL: "quic://" + learner.PeerAddr}
 	learner.DataDir = filepath.Join(t.TempDir(), "managed-learner")
 	learnerObject = path.Join(path.Join(base.ObjStorePrefix, string(clusterID)), "voters", fmt.Sprintf("%x.json", sha256.Sum256([]byte(learner.NodeID))))
 	managedProviderSeedSource(t, ctx, learner, learnerPod, assignmentID, clusterUID)
-	sources := make([]*rhiza.DB, 0, sourceCount)
+	sources := managedProviderSourceNodes(t, ctx, base, members, memberPods, peerTokens, storageRoot, assignmentID)
 	t.Cleanup(func() {
 		for _, db := range sources {
 			if db != nil {
-				if err := db.Close(); err != nil {
+				if err := db.Shutdown(); err != nil {
 					t.Errorf("close provider source voter: %v", err)
 				}
 			}
 		}
 	})
-	for i := range members {
-		cfg := base
-		cfg.NodeID, cfg.PeerToken = string(members[i].ID), peerTokens[i]
-		cfg.DataDir = filepath.Join(t.TempDir(), "source")
-		cfg.PeerAddr = strings.TrimPrefix(members[i].PeerURL, "quic://")
-		cfg.CheckpointInterval = 24 * time.Hour
-		if i == 0 {
-			cfg.CheckpointInterval = time.Second
-		}
-		db, err := rhiza.Open(ctx, cfg)
-		if err != nil {
-			t.Fatalf("open source voter %d: %v", i, err)
-		}
-		sources = append(sources, db)
-	}
-	for _, db := range sources {
-		membershipWaitReady(t, ctx, db)
-	}
-	if _, err := sources[0].Execute(ctx, rhiza.ExecuteRequest{RequestID: "managed-provider-create", SQL: "CREATE TABLE managed_prepared_rows(id INTEGER PRIMARY KEY)"}); err != nil {
+	if _, err := sources[0].ExecuteManagedSQL(ctx, network.ExecuteRequest{RequestID: "managed-provider-create", SQL: "CREATE TABLE managed_prepared_rows(id INTEGER PRIMARY KEY)"}); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := sources[0].Execute(ctx, rhiza.ExecuteRequest{RequestID: "managed-provider-base-row", SQL: "INSERT INTO managed_prepared_rows VALUES (7)"}); err != nil {
+	if _, err := sources[0].ExecuteManagedSQL(ctx, network.ExecuteRequest{RequestID: "managed-provider-base-row", SQL: "INSERT INTO managed_prepared_rows VALUES (7)"}); err != nil {
 		t.Fatal(err)
 	}
 	bucket := embeddedBucket(t, base)
@@ -160,8 +211,12 @@ func TestEmbeddedObjectStorageManagedPreparedCheckpointAdoption(t *testing.T) {
 	checkpointCtx, stopCheckpoint := context.WithTimeout(ctx, 2*time.Minute)
 	defer stopCheckpoint()
 	var view *recovery.ReadOnlyView
+	var fixedCurrent *managedProviderFixedCurrent
 	for {
-		view, err = recovery.OpenReadOnlyView(checkpointCtx, readonly, finalPrefix, 1, bootstrap)
+		fixedCurrent, err = captureManagedProviderCurrent(checkpointCtx, readonly, path.Join(finalPrefix, "checkpoint/CURRENT"))
+		if err == nil {
+			view, err = recovery.OpenReadOnlyViewForApplicationProtocol(checkpointCtx, fixedCurrent, finalPrefix, 1, bootstrap, sqlpolicy.ManagedRequestMaterializationPolicy, types.DefaultIdempotencyWindowSlots, sqlpolicy.ManagedRequestAppendOnlyApplicationProtocol, true)
+		}
 		if err == nil {
 			seal, decision, ok := view.RecoveryBase()
 			if ok && seal.Index == view.Base() && decision.Slot > seal.Index {
@@ -177,43 +232,71 @@ func TestEmbeddedObjectStorageManagedPreparedCheckpointAdoption(t *testing.T) {
 		}
 	}
 	checkpointBase := view.Base()
-	if err := sources[0].Close(); err != nil {
+	checkpointSeal, checkpointDecision, _ := view.RecoveryBase()
+	sourceState, err := sources[0].ManagedState()
+	if err != nil || sourceState.WALIdentity == "" {
+		t.Fatalf("actual source registration: %v", err)
+	}
+	if err := sources[0].Shutdown(); err != nil {
 		t.Fatal(err)
 	}
 	sources[0] = nil
-	if _, err := sources[1].Execute(ctx, rhiza.ExecuteRequest{RequestID: "managed-provider-suffix", SQL: "INSERT INTO managed_prepared_rows VALUES (8)"}); err != nil {
-		t.Fatal(err)
+	suffix, err := sources[1].ExecuteManagedSQL(ctx, network.ExecuteRequest{RequestID: "managed-provider-suffix", SQL: "INSERT INTO managed_prepared_rows VALUES (8)"})
+	if err != nil || suffix.Status != types.MutationCommitted || suffix.Slot <= uint64(checkpointBase) {
+		t.Fatalf("suffix lacks a committed ACK strictly after captured checkpoint: %+v %v", suffix, err)
 	}
+	// SQL receipts do not set the KV/Graph Applied flag. Prove application
+	// through the public read's same-SQLite-snapshot applied slot and rows.
+	applied, err := sources[1].QueryManagedSQL(ctx, network.QueryRequest{SQL: "SELECT CAST(id AS TEXT) FROM managed_prepared_rows ORDER BY id", Consistency: "linearizable"})
+	if err != nil || applied.AppliedSlot < suffix.Slot || len(applied.Rows) != 2 || len(applied.Rows[0]) != 1 || len(applied.Rows[1]) != 1 || applied.Rows[0][0] != "7" || applied.Rows[1][0] != "8" {
+		t.Fatalf("public SQL snapshot does not cover the exact ACK suffix: %+v %v", applied, err)
+	}
+	status, err := sources[1].RequestStatusManaged(ctx, network.RequestStatusRequest{Kind: "sql", RequestID: "managed-provider-suffix"})
+	if err != nil || status.Receipt == nil || *status.Receipt != suffix.MutationReceipt {
+		t.Fatalf("public SQL status changed the suffix ACK receipt: %+v %v", status, err)
+	}
+	lastSuccessfulBase, lastSuccessfulTip := view.Base(), view.Tip()
 	for {
-		view, err = recovery.OpenReadOnlyView(checkpointCtx, readonly, finalPrefix, 1, bootstrap)
-		found := false
-		if err == nil && view.Base() == checkpointBase {
-			for _, decision := range view.Decisions() {
-				commands, ok, decodeErr := types.DecodeSQLBatch(decision.Value)
-				if decodeErr != nil {
-					t.Fatal(decodeErr)
-				}
-				if ok {
-					for _, command := range commands {
-						found = found || command.RequestID == "managed-provider-suffix"
-					}
-				}
-			}
+		view, err = recovery.OpenReadOnlyViewForApplicationProtocol(checkpointCtx, fixedCurrent, finalPrefix, 1, bootstrap, sqlpolicy.ManagedRequestMaterializationPolicy, types.DefaultIdempotencyWindowSlots, sqlpolicy.ManagedRequestAppendOnlyApplicationProtocol, true)
+		if err == nil {
+			lastSuccessfulBase, lastSuccessfulTip = view.Base(), view.Tip()
 		}
-		if found {
+		if err == nil && view.Base() == checkpointBase && uint64(view.Tip()) >= suffix.Slot {
 			break
 		}
 		timer := time.NewTimer(100 * time.Millisecond)
 		select {
 		case <-checkpointCtx.Done():
 			timer.Stop()
-			t.Fatalf("certified SQL suffix not observed: %v (last view: %v)", checkpointCtx.Err(), err)
+			t.Fatalf("certified SQL suffix not observed: %v (required base=%d suffix slot=%d; last successful base=%d tip=%d; last view: %v)", checkpointCtx.Err(), checkpointBase, suffix.Slot, lastSuccessfulBase, lastSuccessfulTip, err)
 		case <-timer.C:
 		}
 	}
+	seal, decision, hasBase := view.RecoveryBase()
+	if !hasBase || seal.Index != checkpointBase || seal.RootHash != checkpointSeal.RootHash || decision.Slot != checkpointDecision.Slot || decision.Hash != checkpointDecision.Hash || !bytes.Equal(decision.Certificate, checkpointDecision.Certificate) {
+		t.Fatal("suffix view replaced the exact captured checkpoint proof")
+	}
+	foundSuffix := false
+	for _, decision := range view.Decisions() {
+		if uint64(decision.Slot) != suffix.Slot {
+			continue
+		}
+		commands, sqlValue, decodeErr := types.DecodeSQLBatch(decision.Value)
+		if decodeErr != nil || !sqlValue || len(decision.Certificate) == 0 || sha256.Sum256(decision.Value) != decision.Hash {
+			t.Fatal("suffix ACK lacks its exact certified SQL value", decodeErr)
+		}
+		for _, command := range commands {
+			if command.RequestID == "managed-provider-suffix" && command.SQL == "INSERT INTO managed_prepared_rows VALUES (8)" {
+				foundSuffix = true
+			}
+		}
+	}
+	if !foundSuffix {
+		t.Fatal("captured checkpoint suffix lacks the original SQL at its ACK slot")
+	}
 	for i := range sources {
 		if sources[i] != nil {
-			if err := sources[i].Close(); err != nil {
+			if err := sources[i].Shutdown(); err != nil {
 				t.Fatal(err)
 			}
 			sources[i] = nil
@@ -222,9 +305,57 @@ func TestEmbeddedObjectStorageManagedPreparedCheckpointAdoption(t *testing.T) {
 	if readonly.writes != 0 {
 		t.Fatalf("provider recovery reader attempted %d source writes", readonly.writes)
 	}
+	// Shutdown may publish an already-certified CONTROL after the captured H.
+	// Retain H for adoption, and independently verify every permitted later cut.
+	settled, err := recovery.OpenReadOnlyViewForApplicationProtocol(ctx, fixedCurrent, finalPrefix, 1, bootstrap, sqlpolicy.ManagedRequestMaterializationPolicy, types.DefaultIdempotencyWindowSlots, sqlpolicy.ManagedRequestAppendOnlyApplicationProtocol, true)
+	if err != nil {
+		t.Fatal("verify source archive after all voters stopped", err)
+	}
+	settledSeal, settledDecision, ok := settled.RecoveryBase()
+	if !ok || !reflect.DeepEqual(settledSeal, seal) || !reflect.DeepEqual(settledDecision, decision) {
+		t.Fatal("source shutdown changed the captured checkpoint/membership proof")
+	}
+	allowedTips := map[uint64]bool{uint64(view.Tip()): true}
+	prefix, through := seal.PrefixHash, seal.Index
+	if through == view.Tip() && prefix != view.PrefixHash() {
+		t.Fatal("captured H base prefix mismatch")
+	}
+	for _, d := range settled.Decisions() {
+		if d.Slot <= seal.Index {
+			continue
+		}
+		if d.Slot != through+1 || len(d.Certificate) == 0 || sha256.Sum256(d.Value) != d.Hash {
+			t.Fatalf("invalid settled certified decision slot=%d previous=%d", d.Slot, through)
+		}
+		prefix = quepaxa.AdvancePrefixHash(prefix, d.Slot, d.Hash)
+		through = d.Slot
+		if through == view.Tip() && prefix != view.PrefixHash() {
+			t.Fatal("source shutdown changed captured H prefix/originals")
+		}
+		if through > view.Tip() {
+			kind, err := providerControlKind(d.Value)
+			if err != nil {
+				t.Fatalf("post-H source decision slot=%d is not permitted CONTROL: %v", d.Slot, err)
+			}
+			allowedTips[uint64(through)] = true
+			t.Logf("verified post-H source CONTROL slot=%d kind=%s captured_tip=%d", through, kind, view.Tip())
+		}
+	}
+	if through != settled.Tip() || through < view.Tip() || prefix != settled.PrefixHash() {
+		t.Fatal("settled source archive does not cover exact captured H and final prefix")
+	}
+	evidence, err := managedProviderInitialEvidence(t, ctx, view)
+	if err != nil {
+		t.Fatal("reconstruct exact captured application/receipt evidence", err)
+	}
+	var expectedEvidence struct{ Digest string }
+	if err := json.Unmarshal(evidence, &expectedEvidence); err != nil || expectedEvidence.Digest == "" {
+		t.Fatal("decode captured application evidence", err)
+	}
 
 	prepared, plan, runtime, store, ref := managedProviderPreparedIdentity(t, ctx, learner, members, memberPods, learnerPod, storageRoot, assignmentID, view)
-	managedConfig := managedsql.Config{StorageRoot: storageRoot, Runtime: runtime, Store: store, Ref: ref, Plan: plan, PodUID: learnerPod, Prepared: prepared}
+	origin := managedProviderRepairOrigin(t, ctx, store, ref, plan, runtime, learnerPod, storageRoot, sourceState.WALIdentity, view)
+	managedConfig := managedsql.Config{StorageRoot: storageRoot, Runtime: runtime, Store: store, Ref: ref, Plan: plan, PodUID: learnerPod, Prepared: prepared, RepairOrigin: origin}
 	first, err := managedsql.Open(ctx, managedConfig)
 	if first != nil {
 		t.Cleanup(func() {
@@ -239,7 +370,7 @@ func TestEmbeddedObjectStorageManagedPreparedCheckpointAdoption(t *testing.T) {
 	if err := first.Close(); err != nil {
 		t.Fatal(err)
 	}
-	providerAssertSQLRows(t, ctx, learner.DataDir, uint64(view.Tip()))
+	providerAssertSQLRows(t, ctx, learner.DataDir, allowedTips, expectedEvidence.Digest)
 	managedConfig.Prepared = nil
 	second, err := managedsql.Open(ctx, managedConfig)
 	if second != nil {
@@ -255,7 +386,7 @@ func TestEmbeddedObjectStorageManagedPreparedCheckpointAdoption(t *testing.T) {
 	if err := second.Close(); err != nil {
 		t.Fatal(err)
 	}
-	providerAssertSQLRows(t, ctx, learner.DataDir, uint64(view.Tip()))
+	providerAssertSQLRows(t, ctx, learner.DataDir, allowedTips, expectedEvidence.Digest)
 
 	mutatedPath := filepath.Join(learner.DataDir, "sqlite.db")
 	mutateDB, err := sql.Open("sqlite3", (&url.URL{Scheme: "file", Path: filepath.ToSlash(mutatedPath)}).String())
@@ -319,40 +450,173 @@ func TestEmbeddedObjectStorageManagedPreparedCheckpointAdoption(t *testing.T) {
 	if err := last.Close(); err != nil {
 		t.Fatal(err)
 	}
-	providerAssertSQLRows(t, ctx, learner.DataDir, uint64(view.Tip()))
+	providerAssertSQLRows(t, ctx, learner.DataDir, allowedTips, expectedEvidence.Digest)
 	t.Logf("provider=%s SDK exercised; authority used an HTTP fixture, not Kubernetes", provider)
+}
+
+func managedProviderSourceNodes(t *testing.T, ctx context.Context, base rhiza.Config, members []rhiza.Member, pods, tokens []string, root, assignmentID string) []*node.Node {
+	t.Helper()
+	ref := operator.V1Alpha2ClusterRef{Name: "fixture", Namespace: "ns", UID: "managed-provider-fixture"}
+	runtime := managedProviderRuntime(base)
+	n := node.New(&runtime)
+	physical, _, err := n.PreparedStartupBindingDigestsForProtocol(sqlpolicy.ManagedRequestAppendOnlyApplicationProtocol)
+	if err != nil {
+		t.Fatal(err)
+	}
+	digest, err := n.ManagedBootstrapPlanDigestForProtocol(physical, sqlpolicy.ManagedRequestAppendOnlyApplicationProtocol, sqlpolicy.ManagedRequestAppendOnlyApplicationProtocol)
+	if err != nil {
+		t.Fatal(err)
+	}
+	plan, err := operator.NewV1Alpha2ApplicationInitPlan(ref, "managed-provider-logical", "managed-provider-deployment", assignmentID, physical, digest, sqlpolicy.ManagedRequestAppendOnlyApplicationProtocol)
+	if err != nil {
+		t.Fatal(err)
+	}
+	plan.ApplicationProtocol = sqlpolicy.ManagedRequestAppendOnlyApplicationProtocol
+	bootstrap := operator.V1Alpha2BootstrapPlan{ClusterID: runtime.ClusterID, PhysicalBinding: physical, EvidenceFormat: plan.EvidenceFormat, Durability: types.ObjectStoreDurabilityBeforeAck, Reconfiguration: true}
+	for i, member := range members {
+		bootstrap.Members = append(bootstrap.Members, operator.V1Alpha2BootstrapMember{PodUID: pods[i], Member: member})
+	}
+	store, deployment := managedProviderStatusStore(t, ref, plan.ApplicationProtocol)
+	if _, err := operator.InitializeV1Alpha2AuthorityWithBootstrap(ctx, store, ref, deployment, plan, bootstrap); err != nil {
+		t.Fatal(err)
+	}
+	nodes := make([]*node.Node, len(members))
+	t.Cleanup(func() {
+		for _, n := range nodes {
+			if n != nil {
+				if err := n.Shutdown(); err != nil {
+					t.Error(err)
+				}
+			}
+		}
+	})
+	for i, member := range members {
+		cfg := managedProviderRuntime(base)
+		cfg.NodeID, cfg.PeerToken, cfg.PeerAddr, cfg.BindAddr = member.ID, tokens[i], strings.TrimPrefix(member.PeerURL, "quic://"), ""
+		cfg.DataDir = filepath.Join(t.TempDir(), "managed-source")
+		cfg.CheckpointInterval = 24 * time.Hour
+		if i == 0 {
+			cfg.CheckpointInterval = time.Second
+		}
+		nodes[i] = node.New(&cfg)
+		_, memberDigest, err := nodes[i].PreparedStartupBindingDigestsForProtocol(plan.ApplicationProtocol)
+		if err != nil {
+			t.Fatal(err)
+		}
+		identity := node.ManagedStartupIdentity{ApplicationProtocol: plan.ApplicationProtocol, EvidenceFormat: plan.EvidenceFormat, AssignmentID: plan.AssignmentID, IntentHash: plan.IntentHash, StorageID: plan.StorageID, PhysicalBinding: physical, BootstrapPlanDigest: digest, Fresh: true, Member: recovery.PreparedStartupIdentity{ClusterUID: ref.UID, DeploymentUID: plan.DeploymentUID, PodUID: pods[i], NodeID: string(member.ID), SourceBinding: physical, ConfigDigest: memberDigest}}
+		checker := &mixedProviderNodeChecker{n: nodes[i], store: store, ref: ref, plan: plan, identity: identity}
+		if _, err := nodes[i].PrepareManagedSQLSource(ctx, identity, true); err != nil {
+			t.Fatal(err)
+		}
+		if err := nodes[i].OpenManaged(ctx, node.ManagedStartupConfig{StorageRoot: root, PeerRecovery: true, Identity: identity, Checker: checker, BootstrapMember: true}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	initial, err := operator.LoadV1Alpha2ApplicationInit(ctx, store, ref)
+	if err != nil {
+		t.Fatal(err)
+	}
+	state, err := nodes[0].InspectManagedKV(ctx, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := operator.CommitV1Alpha2ApplicationInit(ctx, store, initial, plan, mixedProviderEvidence(state)); err != nil {
+		t.Fatal(err)
+	}
+	for _, n := range nodes {
+		for {
+			// Application admission does not set the catch-up/peer-ready flag
+			// consumed by the real Server. Wait for both before the first write.
+			if err := n.AdmitManaged(ctx); err == nil && n.Ready() {
+				break
+			}
+			timer := time.NewTimer(30 * time.Millisecond)
+			select {
+			case <-ctx.Done():
+				timer.Stop()
+				t.Fatal(ctx.Err())
+			case <-timer.C:
+			}
+		}
+	}
+	return nodes
 }
 
 func managedProviderSeedSource(t *testing.T, ctx context.Context, cfg rhiza.Config, podUID, assignmentID, clusterUID string) {
 	t.Helper()
 	runtime := managedProviderRuntime(cfg)
 	n := node.New(&runtime)
-	physical, member, err := n.PreparedStartupBindingDigests()
+	physical, member, err := n.PreparedStartupBindingDigestsForProtocol(sqlpolicy.ManagedRequestAppendOnlyApplicationProtocol)
 	if err != nil {
 		t.Fatal(err)
 	}
-	bootstrap, err := n.ManagedBootstrapPlanDigest(physical, managedsql.EvidenceFormat)
+	bootstrap, err := n.ManagedBootstrapPlanDigestForProtocol(physical, sqlpolicy.ManagedRequestAppendOnlyApplicationProtocol, sqlpolicy.ManagedRequestAppendOnlyApplicationProtocol)
 	if err != nil {
 		t.Fatal(err)
 	}
 	ref := operator.V1Alpha2ClusterRef{Name: "fixture", Namespace: "ns", UID: clusterUID}
-	plan, err := operator.NewV1Alpha2ApplicationInitPlan(ref, "managed-provider-logical", "managed-provider-deployment", assignmentID, physical, bootstrap, managedsql.EvidenceFormat)
+	plan, err := operator.NewV1Alpha2ApplicationInitPlan(ref, "managed-provider-logical", "managed-provider-deployment", assignmentID, physical, bootstrap, sqlpolicy.ManagedRequestAppendOnlyApplicationProtocol)
 	if err != nil {
 		t.Fatal(err)
 	}
 	memberIdentity := recovery.PreparedStartupIdentity{ClusterUID: clusterUID, Generation: 0, DeploymentUID: plan.DeploymentUID, PodUID: podUID, NodeID: string(runtime.NodeID), SourceBinding: physical, ConfigDigest: member}
-	identity := node.ManagedStartupIdentity{Member: memberIdentity, AssignmentID: assignmentID, IntentHash: plan.IntentHash, StorageID: plan.StorageID, PhysicalBinding: physical, BootstrapPlanDigest: bootstrap, EvidenceFormat: managedsql.EvidenceFormat, Fresh: true}
+	identity := node.ManagedStartupIdentity{ApplicationProtocol: sqlpolicy.ManagedRequestAppendOnlyApplicationProtocol, Member: memberIdentity, AssignmentID: assignmentID, IntentHash: plan.IntentHash, StorageID: plan.StorageID, PhysicalBinding: physical, BootstrapPlanDigest: bootstrap, EvidenceFormat: sqlpolicy.ManagedRequestAppendOnlyApplicationProtocol, Fresh: true}
 	if empty, err := n.PrepareManagedSQLSource(ctx, identity, true); err != nil || !empty {
 		t.Fatalf("seed exact managed SQL source identity: empty=%v err=%v", empty, err)
 	}
 }
 
-func providerAssertSQLRows(t *testing.T, ctx context.Context, dataDir string, expectedTip uint64) {
+func providerControlKind(value []byte) (string, error) {
+	barrier, e1 := types.DecodeReadBarrier(value)
+	_, seal, e2 := types.DecodeCheckpointSeal(value)
+	_, schedule, e3 := types.DecodeLeaderSchedule(value)
+	if err := errors.Join(e1, e2, e3); err != nil {
+		return "", err
+	}
+	switch {
+	case barrier:
+		return "read_barrier", nil
+	case seal:
+		return "checkpoint_seal", nil
+	case schedule:
+		return "leader_schedule", nil
+	default:
+		return "", fmt.Errorf("application, membership, or unknown value")
+	}
+}
+
+func TestManagedProviderControlSuffixClassification(t *testing.T) {
+	if kind, err := providerControlKind(types.EncodeReadBarrier([types.ReadBarrierNonceSize]byte{1})); err != nil || kind != "read_barrier" {
+		t.Fatal("actual CONTROL encoding rejected", kind, err)
+	}
+	schedule, err := types.EncodeLeaderSchedule([]types.NodeID{"source"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if kind, err := providerControlKind(schedule); err != nil || kind != "leader_schedule" {
+		t.Fatal("actual schedule encoding rejected", kind, err)
+	}
+	application, err := types.EncodeSQLBatch([]types.SQLCommand{{RequestID: "unexpected", SQL: "INSERT INTO managed_prepared_rows VALUES (9)"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	invalidSeal, err := quepaxa.EncodeCheckpointSeal(quepaxa.CheckpointSeal{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, value := range [][]byte{application, nil, []byte("unknown"), invalidSeal} {
+		if _, err := providerControlKind(value); err == nil {
+			t.Fatal("application or unknown suffix accepted as CONTROL")
+		}
+	}
+}
+
+func providerAssertSQLRows(t *testing.T, ctx context.Context, dataDir string, allowedTips map[uint64]bool, expectedDigest string) {
 	t.Helper()
 	dbPath := filepath.Join(dataDir, "sqlite.db")
-	state, tip, err := materializer.InspectSQLApplicationFile(ctx, dbPath)
-	if err != nil || tip != expectedTip || state.FreshEmpty {
-		t.Fatalf("restored SQLite evidence state=%+v tip=%d want=%d err=%v", state, tip, expectedTip, err)
+	state, tip, err := materializer.InspectManagedAppendOnlyRequestFile(ctx, dbPath, types.DefaultIdempotencyWindowSlots)
+	if err != nil || !allowedTips[tip] || state.FreshEmpty || fmt.Sprintf("%x", state.Digest) != expectedDigest {
+		t.Fatalf("restored SQLite evidence differs from captured application/receipts or certified CONTROL cuts: tip=%d allowed=%v err=%v", tip, allowedTips, err)
 	}
 	tmp, err := os.MkdirTemp(t.TempDir(), "actual-sql-read-")
 	if err != nil {
@@ -420,24 +684,25 @@ func managedProviderPreparedIdentity(t *testing.T, ctx context.Context, cfg rhiz
 	t.Helper()
 	runtime := managedProviderRuntime(cfg)
 	managedNode := node.New(&runtime)
-	physicalBinding, memberDigest, err := managedNode.PreparedStartupBindingDigests()
+	physicalBinding, memberDigest, err := managedNode.PreparedStartupBindingDigestsForProtocol(sqlpolicy.ManagedRequestAppendOnlyApplicationProtocol)
 	if err != nil {
 		t.Fatal(err)
 	}
-	commonDigest, err := managedNode.ManagedBootstrapPlanDigest(physicalBinding, managedsql.EvidenceFormat)
+	commonDigest, err := managedNode.ManagedBootstrapPlanDigestForProtocol(physicalBinding, sqlpolicy.ManagedRequestAppendOnlyApplicationProtocol, sqlpolicy.ManagedRequestAppendOnlyApplicationProtocol)
 	if err != nil {
 		t.Fatal(err)
 	}
 	ref := operator.V1Alpha2ClusterRef{Name: "fixture", Namespace: "ns", UID: "managed-provider-fixture"}
-	plan, err := operator.NewV1Alpha2ApplicationInitPlan(ref, "managed-provider-logical", "managed-provider-deployment", assignmentID, physicalBinding, commonDigest, managedsql.EvidenceFormat)
+	plan, err := operator.NewV1Alpha2ApplicationInitPlan(ref, "managed-provider-logical", "managed-provider-deployment", assignmentID, physicalBinding, commonDigest, sqlpolicy.ManagedRequestAppendOnlyApplicationProtocol)
 	if err != nil {
 		t.Fatal(err)
 	}
-	bootstrap := operator.V1Alpha2BootstrapPlan{ClusterID: runtime.ClusterID, PhysicalBinding: physicalBinding, EvidenceFormat: managedsql.EvidenceFormat, Durability: types.ObjectStoreDurabilityBeforeAck, Reconfiguration: runtime.EnableReconfiguration}
+	plan.ApplicationProtocol = sqlpolicy.ManagedRequestAppendOnlyApplicationProtocol
+	bootstrap := operator.V1Alpha2BootstrapPlan{ClusterID: runtime.ClusterID, PhysicalBinding: physicalBinding, EvidenceFormat: plan.EvidenceFormat, Durability: types.ObjectStoreDurabilityBeforeAck, Reconfiguration: runtime.EnableReconfiguration}
 	for i, member := range members {
 		bootstrap.Members = append(bootstrap.Members, operator.V1Alpha2BootstrapMember{PodUID: pods[i], Member: member})
 	}
-	store, deploymentName := managedProviderStatusStore(t, ref)
+	store, deploymentName := managedProviderStatusStore(t, ref, plan.ApplicationProtocol)
 	if _, err := operator.InitializeV1Alpha2AuthorityWithBootstrap(ctx, store, ref, deploymentName, plan, bootstrap); err != nil {
 		t.Fatal(err)
 	}
@@ -454,15 +719,101 @@ func managedProviderPreparedIdentity(t *testing.T, ctx context.Context, cfg rhiz
 	}
 	identity := recovery.PreparedStartupIdentity{ClusterUID: ref.UID, Generation: 0, DeploymentUID: plan.DeploymentUID, PodUID: learnerPod, NodeID: string(runtime.NodeID), SourceBinding: physicalBinding, ConfigDigest: memberDigest}
 	handoffDir := filepath.Join(t.TempDir(), "managed-provider-handoff")
-	if err := recovery.PublishPreparedStartup(ctx, view, handoffDir, identity); err != nil {
+	if err := recovery.PublishPreparedStartupForPolicy(ctx, view, handoffDir, identity, sqlpolicy.ManagedRequestMaterializationPolicy, types.DefaultIdempotencyWindowSlots); err != nil {
 		t.Fatal(err)
 	}
 	bucket := embeddedBucket(t, cfg)
-	prepared, err := recovery.LoadPreparedStartup(ctx, bucket, path.Join(cfg.ObjStorePrefix, string(runtime.ClusterID)), 1, quepaxa.Cluster{ConfigID: 1, Members: members}, handoffDir, runtime.DataDir, identity)
+	prepared, err := recovery.LoadPreparedStartupForApplicationProtocol(ctx, bucket, path.Join(cfg.ObjStorePrefix, string(runtime.ClusterID)), 1, quepaxa.Cluster{ConfigID: 1, Members: members}, handoffDir, runtime.DataDir, identity, sqlpolicy.ManagedRequestMaterializationPolicy, types.DefaultIdempotencyWindowSlots, plan.ApplicationProtocol, true)
 	if err != nil {
 		t.Fatal(err)
 	}
 	return prepared, plan, runtime, store, ref
+}
+
+type managedProviderRepairTransport struct {
+	base      http.RoundTripper
+	resources map[string]any
+}
+
+func (r *managedProviderRepairTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	if object, ok := r.resources[req.URL.Path]; ok && req.Method == http.MethodGet {
+		raw, err := json.Marshal(object)
+		if err != nil {
+			return nil, err
+		}
+		return &http.Response{StatusCode: http.StatusOK, Header: http.Header{"Content-Type": []string{"application/json"}}, Body: io.NopCloser(bytes.NewReader(raw)), Request: req}, nil
+	}
+	return r.base.RoundTrip(req)
+}
+
+// Only the bounded Kubernetes owner chain is simulated. H, its prefix hash,
+// checkpoint policy and the old registration nonce come from actual SDK data.
+func managedProviderRepairOrigin(t *testing.T, ctx context.Context, store *operator.V1Alpha2StatusStore, ref operator.V1Alpha2ClusterRef, assignment operator.V1Alpha2ApplicationInitPlan, runtime managedsql.RuntimeConfig, pod, root, oldWAL string, view *recovery.ReadOnlyView) []byte {
+	t.Helper()
+	old := runtime.Members[0].ID
+	ids := make([]types.NodeID, 0, len(runtime.Members))
+	for _, member := range runtime.Members {
+		if member.ID != old {
+			ids = append(ids, member.ID)
+		}
+	}
+	ids = append(ids, runtime.NodeID)
+	slices.Sort(ids)
+	plan := operator.V1Alpha2RepairPlan{OperationID: "provider-prepared-repair", Sequence: operator.V1Alpha2RepairAddThenRemove, ClusterUID: ref.UID, DeploymentUID: assignment.DeploymentUID, StorageID: assignment.StorageID, ExpectedConfigID: 1, OldNodeID: old, OldWALIdentity: oldWAL, Replacement: operator.V1Alpha2RepairMember{PodName: pod, PodUID: pod, NodeID: runtime.NodeID, PublicKey: runtime.Learner.PublicKey, PeerURL: runtime.Learner.PeerURL}, BootstrapPlanDigest: assignment.BootstrapPlanDigest, FinalVoterIDs: ids}
+	deployment, err := operator.V1Alpha2GenesisDeploymentName(ref.UID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	owner := func(kind, name, uid string) []any {
+		return []any{map[string]any{"apiVersion": "apps/v1", "kind": kind, "name": name, "uid": uid, "controller": true}}
+	}
+	report, err := json.Marshal(map[string]any{"version": 1, "publicKey": base64.StdEncoding.EncodeToString(runtime.Learner.PublicKey[:])})
+	if err != nil {
+		t.Fatal(err)
+	}
+	resources := map[string]any{
+		"/api/v1/namespaces/" + ref.Namespace + "/pods/" + pod: map[string]any{
+			"apiVersion": "v1", "kind": "Pod",
+			"metadata": map[string]any{"name": pod, "namespace": ref.Namespace, "uid": pod, "resourceVersion": "1", "ownerReferences": owner("ReplicaSet", "provider-rs", "provider-rs-uid")},
+			"status":   map[string]any{"podIP": "127.0.0.1", "containerStatuses": []any{map[string]any{"name": "sql", "restartCount": 0, "state": map[string]any{"waiting": map[string]any{}}}}, "initContainerStatuses": []any{map[string]any{"name": operator.V1Alpha2PrepareIdentityContainer, "state": map[string]any{"terminated": map[string]any{"exitCode": 0, "message": string(report)}}}}},
+		},
+		"/apis/apps/v1/namespaces/" + ref.Namespace + "/replicasets/provider-rs": map[string]any{"apiVersion": "apps/v1", "kind": "ReplicaSet", "metadata": map[string]any{"name": "provider-rs", "namespace": ref.Namespace, "uid": "provider-rs-uid", "resourceVersion": "1", "ownerReferences": owner("Deployment", deployment, assignment.DeploymentUID)}},
+	}
+	client := *store.Kube.Client
+	client.Transport = &managedProviderRepairTransport{base: client.Transport, resources: resources}
+	store.Kube.Client = &client
+	admission, err := operator.LoadV1Alpha2Admission(ctx, store, ref)
+	if err != nil {
+		t.Fatal(err)
+	}
+	closed, _, err := operator.BeginV1Alpha2Repair(ctx, store, admission, admission.Authority(), plan)
+	if err != nil {
+		t.Fatal(err)
+	}
+	head := view.CapturedHead()
+	source := quepaxa.Cluster{ConfigID: 1, Members: runtime.Members}
+	handoff := operator.V1Alpha2RepairHandoff{PlanDigest: plan.Digest(), SourceRoot: root, SourcePrefix: path.Join(runtime.ObjStorePrefix, string(runtime.ClusterID)), PhysicalBinding: assignment.PhysicalBinding, Head: head, HeadHash: fmt.Sprintf("%x", sha256.Sum256(head)), PreparedConfig: &source, PreparedSlot: uint64(view.Tip()), PreparedHash: fmt.Sprintf("%x", view.PrefixHash())}
+	captured, _, err := operator.CaptureV1Alpha2RepairHandoff(ctx, store, closed, closed.Authority(), handoff)
+	if err != nil {
+		t.Fatal(err)
+	}
+	repair, ok := captured.Repair()
+	if !ok {
+		t.Fatal("captured provider repair absent")
+	}
+	binding, err := operator.ValidateV1Alpha2RepairPodBinding(ctx, store, ref, plan)
+	if err != nil {
+		t.Fatal(err)
+	}
+	raw, err := json.Marshal(struct {
+		Version int                               `json:"version"`
+		Repair  operator.V1Alpha2RepairRecord     `json:"repair"`
+		Binding operator.V1Alpha2RepairPodBinding `json:"binding"`
+	}{1, repair, binding})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return raw
 }
 
 func managedProviderInitialEvidence(t *testing.T, ctx context.Context, view *recovery.ReadOnlyView) (json.RawMessage, error) {
@@ -483,7 +834,7 @@ func managedProviderInitialEvidence(t *testing.T, ctx context.Context, view *rec
 	for _, file := range checkpointFiles {
 		files = append(files, materializer.CheckpointFile{Role: materializer.CheckpointRole(file.Role), Path: file.Path})
 	}
-	expected, err := materializer.Open(filepath.Join(tmp, "expected.sqlite"), 4)
+	expected, err := materializer.OpenManagedSQLKVWithAppendOnlyOriginals(filepath.Join(tmp, "expected.sqlite"), 4)
 	if err != nil {
 		return nil, err
 	}
@@ -516,14 +867,14 @@ func managedProviderInitialEvidence(t *testing.T, ctx context.Context, view *rec
 	if expected.Tip() != uint64(view.Tip()) {
 		return nil, fmt.Errorf("expected provider materializer tip %d differs from view %d", expected.Tip(), view.Tip())
 	}
-	state, err := expected.InspectSQLApplicationState(ctx)
+	state, err := expected.InspectManagedApplicationState(ctx)
 	if err != nil {
 		return nil, err
 	}
 	return json.Marshal(struct {
 		Format string `json:"format"`
 		Digest string `json:"digest"`
-	}{Format: managedsql.EvidenceFormat, Digest: fmt.Sprintf("%x", state.Digest)})
+	}{Format: sqlpolicy.ManagedRequestAppendOnlyApplicationProtocol, Digest: fmt.Sprintf("%x", state.Digest)})
 }
 
 func managedProviderRuntime(cfg rhiza.Config) managedsql.RuntimeConfig {
@@ -583,8 +934,11 @@ func (s *managedProviderStatusFixture) ServeHTTP(w http.ResponseWriter, r *http.
 	_ = json.NewEncoder(w).Encode(s.cluster)
 }
 
-func managedProviderStatusStore(t *testing.T, ref operator.V1Alpha2ClusterRef) (*operator.V1Alpha2StatusStore, string) {
+func managedProviderStatusStore(t *testing.T, ref operator.V1Alpha2ClusterRef, protocol ...string) (*operator.V1Alpha2StatusStore, string) {
 	t.Helper()
+	if len(protocol) != 1 || protocol[0] != sqlpolicy.ManagedRequestAppendOnlyApplicationProtocol && protocol[0] != sqlpolicy.ManagedGraphRequestAppendOnlyApplicationProtocol {
+		t.Fatal("unsupported provider fixture application protocol")
+	}
 	deploymentName, err := operator.V1Alpha2GenesisDeploymentName(ref.UID)
 	if err != nil {
 		t.Fatal(err)
@@ -601,6 +955,7 @@ func managedProviderStatusStore(t *testing.T, ref operator.V1Alpha2ClusterRef) (
 			"metadata": map[string]any{"name": deploymentName, "namespace": ref.Namespace, "uid": "managed-provider-deployment", "resourceVersion": "1", "labels": map[string]string{"rhiza.mrchypark.dev/cluster-uid": ref.UID, "rhiza.mrchypark.dev/generation": "0"}, "ownerReferences": []any{map[string]any{"apiVersion": "rhiza.mrchypark.dev/v1alpha2", "kind": "RhizaCluster", "name": ref.Name, "uid": ref.UID, "controller": true}}},
 		},
 	}
+	fixture.cluster["spec"].(map[string]any)["applicationProtocol"] = protocol[0]
 	server := httptest.NewTLSServer(fixture)
 	t.Cleanup(server.Close)
 	tokenFile := filepath.Join(t.TempDir(), "managed-provider-token")

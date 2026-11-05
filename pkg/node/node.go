@@ -35,54 +35,70 @@ import (
 
 // Node is the main runtime container.
 type Node struct {
-	config                    *types.ExecutionConfig
-	core                      *quepaxa.Core
-	material                  *materializer.Materializer
-	server                    *network.Server
-	peerControl               *network.Server
-	peer                      *network.PeerServer
-	transport                 *network.Transport
-	catchUp                   *network.Transport
-	wal                       *qlog.WAL
-	lock                      *qlog.LockFile
-	bucket                    *objectstore.MeteredBucket
-	checkpoints               *checkpoint.Manager
-	archive                   *recovery.Manager
-	checkpointer              *checkpoint.AutoCheckpointer
-	localStore                *localCheckpointIdentity
-	localBackup               *recovery.LocalArchive
-	localOwner                *objectstore.LocalFilesystemOwner
-	localBackupReady          bool
-	localBackupNeedsSnapshot  bool
-	localGCContext            context.Context
-	localGCCancel             context.CancelFunc
-	localSnapshotMu           sync.Mutex
-	localBackupRestorePins    *localRestorePins
-	localRoot                 *localCheckpointDescriptor
-	localRestoreSuffixPending bool
-	recoveryPhases            nodeRecoveryPhases
-	ready                     atomic.Bool
-	membershipMu              sync.Mutex
-	opened                    atomic.Bool
-	cancel                    context.CancelFunc
-	wg                        sync.WaitGroup
-	recoveryMu                sync.Mutex
-	replayMu                  sync.Mutex
-	compactionMu              sync.Mutex
-	catchUpWake               chan struct{}
-	shutdownMu                sync.Mutex
-	terminalMu                sync.Mutex
-	terminalIdentity          network.TerminalDrainRequest
-	terminalRequested         atomic.Bool
-	terminalDone              chan struct{}
-	terminalResult            TerminalDrainResult
-	terminalErr               error
-	fenceSession              *fencing.Session
-	preparedStartup           *PreparedStartupConfig
-	managedStartup            *ManagedStartupConfig
-	managedAdmitted           atomic.Bool
-	managedInitiallyAdmitted  atomic.Bool
-	managedPeerVerified       atomic.Bool
+	config                       *types.ExecutionConfig
+	core                         *quepaxa.Core
+	material                     *materializer.Materializer
+	server                       *network.Server
+	peerControl                  *network.Server
+	peer                         *network.PeerServer
+	transport                    *network.Transport
+	catchUp                      *network.Transport
+	wal                          *qlog.WAL
+	lock                         *qlog.LockFile
+	bucket                       *objectstore.MeteredBucket
+	checkpoints                  *checkpoint.Manager
+	archive                      *recovery.Manager
+	checkpointer                 *checkpoint.AutoCheckpointer
+	localStore                   *localCheckpointIdentity
+	localBackup                  *recovery.LocalArchive
+	localOwner                   *objectstore.LocalFilesystemOwner
+	localBackupReady             bool
+	localBackupNeedsSnapshot     bool
+	localGCContext               context.Context
+	localGCCancel                context.CancelFunc
+	localSnapshotMu              sync.Mutex
+	localBackupRestorePins       *localRestorePins
+	localRoot                    *localCheckpointDescriptor
+	localRestoreSuffixPending    bool
+	recoveryPhases               nodeRecoveryPhases
+	ready                        atomic.Bool
+	membershipMu                 sync.Mutex
+	opened                       atomic.Bool
+	cancel                       context.CancelFunc
+	wg                           sync.WaitGroup
+	recoveryMu                   sync.Mutex
+	replayMu                     sync.Mutex
+	compactionMu                 sync.Mutex
+	catchUpWake                  chan struct{}
+	shutdownMu                   sync.Mutex
+	terminalMu                   sync.Mutex
+	terminalIdentity             network.TerminalDrainRequest
+	terminalRequested            atomic.Bool
+	terminalDone                 chan struct{}
+	terminalResult               TerminalDrainResult
+	terminalErr                  error
+	fenceSession                 *fencing.Session
+	preparedStartup              *PreparedStartupConfig
+	managedStartup               *ManagedStartupConfig
+	managedAdmitted              atomic.Bool
+	managedInitiallyAdmitted     atomic.Bool
+	managedGraphPublisherStarted atomic.Bool
+	managedGraphPublisherBinding atomic.Pointer[internalApplicationBinding]
+	managedGraphInitialRootDone  chan struct{}
+	managedGraphInitialRootOnce  sync.Once
+	managedGraphControlMu        sync.Mutex
+	managedGraphControl          *managedGraphControlOperation
+	managedPeerVerified          atomic.Bool
+	internalApplication          atomic.Pointer[internalApplicationBinding]
+}
+
+type managedGraphControlOperation struct {
+	value   []byte
+	hash    quepaxa.ValueHash
+	binding *internalApplicationBinding
+	done    chan struct{}
+	slot    quepaxa.Slot
+	err     error
 }
 
 // nodeRecoveryPhases records the selected certified checkpoint restore path.
@@ -102,7 +118,8 @@ type nodeRecoveryPhases struct {
 // New creates a new Node.
 func New(config *types.ExecutionConfig) *Node {
 	return &Node{
-		config: config,
+		managedGraphInitialRootDone: make(chan struct{}),
+		config:                      config,
 	}
 }
 
@@ -221,22 +238,45 @@ func (n *Node) openWithWALLock(ctx context.Context, enroll, cleanStart bool, loc
 	return n.openInternal(ctx, enroll, lock, cleanStart)
 }
 
+func refusePreparedUncertifiedRecorder(core *quepaxa.Core) error {
+	if core == nil {
+		return fmt.Errorf("managed prepared startup has no verified Core")
+	}
+	recordedTip, certifiedTip := core.RecorderTip(), core.Tip()
+	if recordedTip > certifiedTip {
+		return fmt.Errorf("managed prepared startup has uncertified recorded progress: recorded=%d certified=%d", recordedTip, certifiedTip)
+	}
+	return nil
+}
+
 func (n *Node) openInternal(ctx context.Context, enroll bool, prelocked *qlog.LockFile, cleanStart bool) (err error) {
+	openStage := "runtime_config"
+	defer func() {
+		logManagedNodeOpenFailure(n.managedStartup != nil && isManagedAppendOnlyProtocol(n.managedStartup.Identity.ApplicationProtocol), openStage, err)
+	}()
 	if n.terminalRequested.Load() {
 		return fmt.Errorf("terminally drained node cannot reopen")
 	}
 	var localRestoreAuthority *materializer.LocalRestoreAuthority
 	var localRestoreFiles []materializer.CheckpointFile
 	managedMaterializerWasAbsent := false
+	var managedGraphTarget materializer.ManagedGraphTargetState
+	var managedGraphSelectedSeal *quepaxa.SealedCheckpoint
+	var managedGraphSelectedCheckpoint *checkpoint.Checkpoint
+	var managedGraphReplayThrough quepaxa.Slot
+	var managedPreparedReplayThrough quepaxa.Slot
 	if n.config == nil || n.config.NodeID == "" {
 		return fmt.Errorf("node ID is required")
 	}
+	preparedLearner := n.managedStartup != nil && (n.managedStartup.Prepared != nil || n.managedStartup.verifiedAdoption != nil) && n.config.Learner != nil && isManagedAppendOnlyProtocol(n.managedStartup.Identity.ApplicationProtocol)
+	preparedResume := preparedLearner && n.managedStartup.verifiedAdoption != nil
 	if n.opened.Load() {
 		return fmt.Errorf("node is already open")
 	}
 	if err := validateLocalGCConfig(n.config); err != nil {
 		return err
 	}
+	openStage = "runtime_optional_supervisor"
 	if err := n.connectFenceSession(ctx); err != nil {
 		return err
 	}
@@ -245,7 +285,8 @@ func (n *Node) openInternal(ctx context.Context, enroll bool, prelocked *qlog.Lo
 		return fmt.Errorf("local mode requires standalone storage without listeners, membership, or enrollment")
 	}
 	if !n.config.Local {
-		if err := sqlpolicy.CheckExisting(ctx, n.config.DataDir+"/sqlite.db"); err != nil {
+		openStage = "runtime_policy"
+		if err := sqlpolicy.CheckExistingForPolicy(ctx, n.config.DataDir+"/sqlite.db", n.materializationPolicy()); err != nil {
 			return err
 		}
 	}
@@ -310,7 +351,7 @@ func (n *Node) openInternal(ctx context.Context, enroll bool, prelocked *qlog.Lo
 	n.recoveryPhases = nodeRecoveryPhases{}
 	defer func() {
 		if err != nil {
-			_ = n.Shutdown()
+			_ = n.abortOpen()
 		}
 	}()
 	ctx, n.cancel = context.WithCancel(ctx)
@@ -322,6 +363,7 @@ func (n *Node) openInternal(ctx context.Context, enroll bool, prelocked *qlog.Lo
 	}()
 
 	// 1. Acquire lock file
+	openStage = "runtime_wal_lock"
 	lock := prelocked
 	if lock == nil {
 		var acquireErr error
@@ -436,6 +478,7 @@ func (n *Node) openInternal(ctx context.Context, enroll bool, prelocked *qlog.Lo
 	if n.config.Local {
 		wal, err = qlog.OpenLocalDeferredCleanup(n.config.DataDir + "/qlog")
 	} else {
+		openStage = "runtime_wal_open"
 		wal, err = qlog.Open(n.config.DataDir + "/qlog")
 	}
 	if err != nil {
@@ -452,6 +495,7 @@ func (n *Node) openInternal(ctx context.Context, enroll bool, prelocked *qlog.Lo
 		}
 	}
 	if objectStoreConfigured && !n.config.Local {
+		openStage = "runtime_source_open"
 		provider := objectstore.Provider(n.config.ObjStoreProvider)
 		if provider == "" {
 			provider = objectstore.ProviderS3
@@ -485,6 +529,7 @@ func (n *Node) openInternal(ctx context.Context, enroll bool, prelocked *qlog.Lo
 			beforeWrite = append(beforeWrite, n.fenceSession.BindWAL)
 		}
 		if n.managedStartup != nil {
+			openStage = "runtime_registration"
 			if err := n.managedStartup.Checker.ValidateManagedStartup(ctx, n.managedStartup.Identity); err != nil {
 				return fmt.Errorf("managed registration authority: %w", err)
 			}
@@ -495,8 +540,18 @@ func (n *Node) openInternal(ctx context.Context, enroll bool, prelocked *qlog.Lo
 				}
 			}
 		}
-		if err := ensureVoterIdentity(ctx, n.config, bucket, n.wal, localVoter, enroll, beforeWrite...); err != nil {
-			return err
+		profile, profileErr := n.managedVoterProfileFor(n.config)
+		if profileErr != nil {
+			return profileErr
+		}
+		var identityErr error
+		if profile == nil {
+			identityErr = ensureVoterIdentity(ctx, n.config, bucket, n.wal, localVoter, enroll, beforeWrite...)
+		} else {
+			identityErr = ensureVoterIdentityWithProfile(ctx, n.config, bucket, n.wal, localVoter, enroll, false, profile, beforeWrite...)
+		}
+		if identityErr != nil {
+			return identityErr
 		}
 		if n.fenceSession != nil && n.fenceSession.Identity().WALIdentity == "" {
 			return fmt.Errorf("supervised fencing requires registered voter WAL identity")
@@ -509,15 +564,20 @@ func (n *Node) openInternal(ctx context.Context, enroll bool, prelocked *qlog.Lo
 			n.checkpoints = checkpoint.NewManager(bucket, clusterPrefix, n.config.DataDir, 1)
 			n.archive = recovery.NewManager(bucket, clusterPrefix, 1)
 		} else {
-			n.checkpoints, err = checkpoint.NewAppendOnlyManager(bucket, clusterPrefix, n.config.DataDir, 1)
+			n.checkpoints, err = checkpoint.NewAppendOnlyManagerForPolicy(bucket, clusterPrefix, n.config.DataDir, n.materializationPolicy(), 1)
 			if err != nil {
 				return err
 			}
-			n.archive, err = recovery.NewAppendOnlyManager(bucket, clusterPrefix, 1)
+			var validateValue func([]byte) error
+			if n.materializationPolicy() == sqlpolicy.ManagedGraphRequestMaterializationPolicy {
+				validateValue = types.ValidateManagedGraphExecutionPolicy
+			}
+			n.archive, err = recovery.NewAppendOnlyManagerWithValueValidator(bucket, clusterPrefix, 1, validateValue)
 			if err != nil {
 				return err
 			}
 		}
+		openStage = "runtime_checkpoint_load"
 		if loadErr := n.checkpoints.Load(ctx); loadErr != nil {
 			return fmt.Errorf("load checkpoint manifest: %w", loadErr)
 		}
@@ -525,6 +585,7 @@ func (n *Node) openInternal(ctx context.Context, enroll bool, prelocked *qlog.Lo
 		if len(n.config.Members) > 1 && !n.archive.CASSupported() {
 			return fmt.Errorf("multi-node shared archive requires conditional object writes")
 		}
+		openStage = "runtime_archive_load"
 		loadArchive := true
 		if n.managedStartup != nil && n.managedStartup.PeerRecovery {
 			loadArchive, err = bucket.Exists(ctx, path.Join(clusterPrefix, "archive/head.bin"))
@@ -567,15 +628,30 @@ func (n *Node) openInternal(ctx context.Context, enroll bool, prelocked *qlog.Lo
 		log.Println("non-clean start detected, recovering from WAL...")
 	}
 
+	openStage = "runtime_materializer"
 	var material *materializer.Materializer
-	if localRestoreAuthority == nil {
+	deferredManagedGraph := n.managedStartup != nil && n.materializationPolicy() == sqlpolicy.ManagedGraphRequestMaterializationPolicy
+	if deferredManagedGraph {
+		if localtesthooks.Enabled {
+			localtesthooks.Hit("node:managed-graph-startup:target_inspect")
+		}
+		managedMaterializerWasAbsent, err = managedMaterializerFilesAbsent(n.config.DataDir)
+		if err != nil {
+			return err
+		}
+		managedGraphTarget, err = materializer.InspectManagedGraphInstallTarget(ctx, filepath.Join(n.config.DataDir, "sqlite.db"), n.receiptWindow(), n.managedGraphInstallProtocol())
+		if err != nil {
+			return err
+		}
+	}
+	if localRestoreAuthority == nil && !deferredManagedGraph {
 		if n.managedStartup != nil {
 			managedMaterializerWasAbsent, err = managedMaterializerFilesAbsent(n.config.DataDir)
 			if err != nil {
 				return err
 			}
 		}
-		material, err = materializer.Open(filepath.Join(n.config.DataDir, "sqlite.db"), 4)
+		material, err = n.openMaterializer(filepath.Join(n.config.DataDir, "sqlite.db"), 4)
 		if err != nil {
 			if n.managedStartup != nil {
 				return fmt.Errorf("open managed materializer without replacing application evidence: %w", err)
@@ -589,7 +665,7 @@ func (n *Node) openInternal(ctx context.Context, enroll bool, prelocked *qlog.Lo
 			if rebuildErr := quarantineGraph(n.config.DataDir + "/latticedb"); rebuildErr != nil {
 				return fmt.Errorf("open materializer: %w; quarantine graph: %v", err, rebuildErr)
 			}
-			material, err = materializer.Open(filepath.Join(n.config.DataDir, "sqlite.db"), 4)
+			material, err = n.openMaterializer(filepath.Join(n.config.DataDir, "sqlite.db"), 4)
 			if err != nil {
 				return fmt.Errorf("rebuild materializer: %w", err)
 			}
@@ -604,17 +680,36 @@ func (n *Node) openInternal(ctx context.Context, enroll bool, prelocked *qlog.Lo
 	}
 
 	// 5. Create consensus core through the same public API available to external users.
+	openStage = "runtime_core_open"
 	cluster := n.loadClusterConfig()
 	var transport *network.Transport
 	var coreTransport quepaxa.Transport
+	managedPeerProfile, profileErr := n.managedAppendOnlyProfile()
+	if profileErr != nil {
+		return profileErr
+	}
 	if !n.config.Local {
-		transport = network.NewTransport(n.config.ClusterID, n.config.NodeID, cluster, n.config.PeerToken)
+		if managedPeerProfile != nil {
+			transport, err = network.NewTransportForManagedProfile(n.config.ClusterID, n.config.NodeID, cluster, n.config.PeerToken, *managedPeerProfile)
+		} else {
+			transport, err = network.NewTransportForPolicy(n.config.ClusterID, n.config.NodeID, cluster, n.config.PeerToken, n.materializationPolicy())
+		}
+		if err != nil {
+			return err
+		}
 		coreTransport = transport
 	}
 	n.transport = transport
 	if len(cluster.Members) > 1 {
 		n.catchUpWake = make(chan struct{}, 1)
-		n.catchUp = network.NewTransport(n.config.ClusterID, n.config.NodeID, cluster, n.config.PeerToken)
+		if managedPeerProfile != nil {
+			n.catchUp, err = network.NewTransportForManagedProfile(n.config.ClusterID, n.config.NodeID, cluster, n.config.PeerToken, *managedPeerProfile)
+		} else {
+			n.catchUp, err = network.NewTransportForPolicy(n.config.ClusterID, n.config.NodeID, cluster, n.config.PeerToken, n.materializationPolicy())
+		}
+		if err != nil {
+			return err
+		}
 	}
 	// An unpromoted learner holds no voting identity, so it authenticates its
 	// read-only sync with the cluster admin token until its promotion applies.
@@ -628,11 +723,33 @@ func (n *Node) openInternal(ctx context.Context, enroll bool, prelocked *qlog.Lo
 	if n.config.Learner != nil {
 		makeCore = quepaxa.NewLearner
 	}
-	core, err := makeCore(quepaxa.Config{
+	var validateValue func([]byte) error
+	if n.materializationPolicy() == sqlpolicy.ManagedGraphRequestMaterializationPolicy {
+		validateValue = types.ValidateManagedGraphExecutionPolicy
+		for _, peer := range []*network.Transport{transport, n.catchUp} {
+			if peer != nil {
+				if err := peer.ValidateManagedGraphWireBudget(); err != nil {
+					return fmt.Errorf("managed Graph wire budget: %w", err)
+				}
+			}
+		}
+	}
+	if deferredManagedGraph && localtesthooks.Enabled {
+		localtesthooks.Hit("node:managed-graph-startup:core_open")
+	}
+	coreConfig := quepaxa.Config{
 		NodeID: n.config.NodeID, Cluster: *cluster, WAL: wal, Transport: coreTransport, LocalMode: n.config.Local,
 		EnableReconfiguration:    n.config.EnableReconfiguration,
 		ReconfigurationAdmission: n.verifyMembershipAdmission,
-	})
+		ValidateValue:            validateValue,
+	}
+	if managedPeerProfile != nil {
+		coreConfig.ManagedAppendOnly, err = n.managedAppendOnlyCoreConfig()
+		if err != nil {
+			return err
+		}
+	}
+	core, err := makeCore(coreConfig)
 	if err != nil {
 		return fmt.Errorf("create QuePaxa core: %w", err)
 	}
@@ -681,7 +798,7 @@ func (n *Node) openInternal(ctx context.Context, enroll bool, prelocked *qlog.Lo
 			return fmt.Errorf("writable WAL recovery base differs from authorized Local restore")
 		}
 		material, err = materializer.OpenLocalFromBase(filepath.Join(n.config.DataDir, "sqlite.db"), 4, *localRestoreAuthority, localRestoreFiles, n.config.LocalGraphNodePropertyIndexes)
-	} else if material == nil {
+	} else if material == nil && !deferredManagedGraph {
 		return fmt.Errorf("materializer was not opened before Core initialization")
 	}
 	n.material = material
@@ -701,11 +818,25 @@ func (n *Node) openInternal(ctx context.Context, enroll bool, prelocked *qlog.Lo
 			return n.checkpoints.Verify(ctx, uint64(seal.Index), seal.RootHash, seal.StateHash)
 		})
 	}
+	if managedSQLKVPolicy(n.materializationPolicy()) {
+		if core.GenerationAnchorHash() != ([32]byte{}) {
+			return fmt.Errorf("mixed generation anchors are not supported")
+		}
+		if n.archive != nil {
+			if _, anchored := n.archive.GenerationAnchor(); anchored {
+				return fmt.Errorf("mixed generation anchors are not supported")
+			}
+		}
+	}
+	openStage = "runtime_archive_recover"
 	generationCheckpoint, err := n.installGenerationAnchor(startupRecovery)
 	if err != nil {
 		return fmt.Errorf("restore generation anchor: %w", startupRecovery.Check(err))
 	}
 	if n.archive != nil {
+		if deferredManagedGraph && localtesthooks.Enabled {
+			localtesthooks.Hit("node:managed-graph-startup:archive_recover")
+		}
 		archiveTip := n.archive.Tip()
 		archiveDecisions := n.archive.DecisionsFrom
 		archiveBase := n.archive.RecoveryBase
@@ -714,32 +845,120 @@ func (n *Node) openInternal(ctx context.Context, enroll bool, prelocked *qlog.Lo
 			archiveDecisions = snapshot.DecisionsFrom
 			archiveBase = snapshot.RecoveryBase
 		}
-		if seal, decision, ok := archiveBase(); ok && core.Tip() < seal.Index {
-			if err := core.RestoreCheckpointBase(startupRecovery.Context(), seal, decision); err != nil {
-				return fmt.Errorf("restore checkpoint recovery base: %w", startupRecovery.Check(err))
-			}
-		}
-		for core.Tip() < archiveTip {
-			values, _, archiveErr := archiveDecisions(startupRecovery.Context(), core.Tip()+1, 256)
-			if archiveErr != nil || len(values) == 0 {
-				if archiveErr == nil {
-					archiveErr = fmt.Errorf("shared archive omitted slot %d", core.Tip()+1)
+		if !preparedLearner {
+			if seal, decision, ok := archiveBase(); ok && core.Tip() < seal.Index {
+				if managedSQLKVPolicy(n.materializationPolicy()) {
+					dir, err := os.MkdirTemp(n.config.DataDir, ".rhiza-managed-base-*")
+					if err != nil {
+						return err
+					}
+					files, readErr := n.checkpoints.DownloadRootFiles(startupRecovery.Context(), uint64(seal.Index), seal.RootHash, dir)
+					if readErr == nil {
+						readErr = n.validateCheckpointFiles(startupRecovery.Context(), files, uint64(seal.Index))
+					}
+					cleanupErr := os.RemoveAll(dir)
+					if err := errors.Join(readErr, cleanupErr); err != nil {
+						return err
+					}
 				}
-				return startupRecovery.Check(archiveErr)
-			}
-			for _, decision := range values {
-				if err := types.ValidateExecutionPolicy(decision.Value); err != nil {
-					return err
+				if err := core.RestoreCheckpointBase(startupRecovery.Context(), seal, decision); err != nil {
+					return fmt.Errorf("restore checkpoint recovery base: %w", startupRecovery.Check(err))
 				}
 			}
-			if archiveErr := core.AcceptCertifiedValues(values); archiveErr != nil {
-				return fmt.Errorf("recover shared archive: %w", archiveErr)
+			for core.Tip() < archiveTip {
+				values, _, archiveErr := archiveDecisions(startupRecovery.Context(), core.Tip()+1, 256)
+				if archiveErr != nil || len(values) == 0 {
+					if archiveErr == nil {
+						archiveErr = fmt.Errorf("shared archive omitted slot %d", core.Tip()+1)
+					}
+					return startupRecovery.Check(archiveErr)
+				}
+				for _, decision := range values {
+					if err := n.validateExecutionPolicy(decision.Value); err != nil {
+						return err
+					}
+				}
+				if archiveErr := core.AcceptCertifiedValues(values); archiveErr != nil {
+					return fmt.Errorf("recover shared archive: %w", archiveErr)
+				}
 			}
 		}
 	}
+	openStage = "runtime_pair_reconstruct"
+	if deferredManagedGraph {
+		if localtesthooks.Enabled {
+			localtesthooks.Hit("node:managed-graph-startup:pair_select")
+		}
+		hasSeal := false
+		if managedPeerProfile != nil {
+			openStage = "" // This selector supplies its own fixed failure reason.
+			selectedRoot, selected, selectErr := n.selectManagedAppendOnlyRoot(ctx)
+			if selectErr != nil {
+				return selectErr
+			}
+			openStage = "runtime_pair_reconstruct"
+			hasSeal = selected != nil
+			if selected != nil {
+				selectedCopy := *selected
+				managedGraphSelectedSeal = &selectedCopy
+				managedGraphSelectedCheckpoint = selectedRoot
+			}
+		} else {
+			selected, found, selectErr := core.LatestCheckpointSeal()
+			if selectErr != nil {
+				return selectErr
+			}
+			hasSeal = found
+			if found {
+				selectedCopy := selected
+				managedGraphSelectedSeal = &selectedCopy
+				managedGraphSelectedCheckpoint, err = n.checkpoints.OpenRoot(ctx, uint64(selected.Index), selected.RootHash)
+				if err != nil || managedGraphSelectedCheckpoint == nil || managedGraphSelectedCheckpoint.Hash != selected.StateHash {
+					if err == nil {
+						err = fmt.Errorf("selected managed Graph checkpoint state hash mismatch")
+					}
+					return err
+				}
+			}
+		}
+		if hasSeal {
+			material, managedGraphReplayThrough, err = n.installManagedGraphStartup(ctx, core, managedGraphTarget, managedGraphSelectedSeal)
+		} else {
+			// Only an explicitly verified original bootstrap may create fresh
+			// application files. A registered restart, required root or observed
+			// locator can never be reinterpreted as empty genesis.
+			_, hasLocator, locatorErr := n.checkpoints.LoadManagedGraphLocator(ctx)
+			if locatorErr != nil {
+				return locatorErr
+			}
+			if !managedMaterializerWasAbsent || n.managedStartup.existingRegisteredWAL || !n.managedStartup.Identity.Fresh || !n.managedStartup.BootstrapMember || core.CompactionFloor() != 0 || hasLocator {
+				return fmt.Errorf("managed Graph recovery requires an authenticated producer root")
+			}
+			// Actual Core has authenticated the complete genesis prefix. No old
+			// native target exists and no installer authority is fabricated.
+			if _, historyErr := certifiedSuffixThrough(core, 1, core.Tip()); historyErr != nil {
+				return historyErr
+			}
+			material, err = n.openMaterializer(filepath.Join(n.config.DataDir, "sqlite.db"), 4)
+			managedGraphReplayThrough = core.Tip()
+		}
+		if err != nil {
+			return fmt.Errorf("open actual reconstructed managed Graph pair: %w", err)
+		}
+		n.material = material
+	}
 	// Record RPCs must be available while every replica is recovering. Public
 	// proposals and learned decisions remain gated by ready=false.
-	server := network.NewServer(core, material, n.config.ClusterID, true, transport, n.Ready)
+	openStage = "runtime_peer_open"
+	var server *network.Server
+	if managedPeerProfile != nil {
+		server, err = network.NewServerForManagedProfile(core, material, n.config.ClusterID, true, transport, *managedPeerProfile, n.Ready)
+	} else {
+		server, err = network.NewServerForPolicy(core, material, n.config.ClusterID, true, transport, n.materializationPolicy(), n.Ready)
+	}
+	if err != nil {
+		return err
+	}
 	server.SetTerminalDrain(func(ctx context.Context, expected network.TerminalDrainRequest) (any, error) {
 		return n.TerminalDrain(ctx, expected)
 	})
@@ -838,7 +1057,14 @@ func (n *Node) openInternal(ctx context.Context, enroll bool, prelocked *qlog.Lo
 	if n.managedStartup != nil {
 		// Peer ReadIndex and learned/control traffic must not depend on the
 		// application evidence CAS. This server is never returned by API/Handler.
-		peerServer = network.NewServer(core, material, n.config.ClusterID, false, transport, n.ready.Load)
+		if managedPeerProfile != nil {
+			peerServer, err = network.NewServerForManagedProfile(core, material, n.config.ClusterID, false, transport, *managedPeerProfile, n.ready.Load)
+		} else {
+			peerServer, err = network.NewServerForPolicy(core, material, n.config.ClusterID, false, transport, n.materializationPolicy(), n.ready.Load)
+		}
+		if err != nil {
+			return err
+		}
 		peerServer.SetLearnReady(n.managedLearnReady)
 		peerServer.SetCompactedHandler(n.wakeCatchUp)
 		if n.checkpoints != nil {
@@ -862,36 +1088,47 @@ func (n *Node) openInternal(ctx context.Context, enroll bool, prelocked *qlog.Lo
 	n.peer = peer
 
 	certifiedCheckpoint := generationCheckpoint
+	var managedSelectedSeal *quepaxa.SealedCheckpoint
 	restoreCheckpoint := certifiedCheckpoint
 	if n.checkpoints != nil {
-		seal, sealed, sealErr := core.LatestCheckpointSeal()
-		if sealErr != nil {
-			return sealErr
-		}
-		if current := n.checkpoints.Latest(); current != nil {
-			anchorCurrent := !sealed && generationCheckpoint != nil && current.Index == generationCheckpoint.Index && current.RootHash == generationCheckpoint.RootHash
-			if !anchorCurrent && (!sealed || current.Index > uint64(seal.Index) || current.Index == uint64(seal.Index) && current.RootHash != seal.RootHash) {
-				return fmt.Errorf("checkpoint CURRENT is not backed by certified recovery evidence")
-			}
-		}
-		if sealed {
-			certifiedCheckpoint, err = n.checkpoints.OpenRoot(startupRecovery.Context(), uint64(seal.Index), seal.RootHash)
-			if err != nil || certifiedCheckpoint.Hash != seal.StateHash {
-				if err == nil {
-					err = fmt.Errorf("certified checkpoint state hash mismatch")
-				}
+		if deferredManagedGraph {
+			certifiedCheckpoint = managedGraphSelectedCheckpoint
+		} else if managedPeerProfile != nil {
+			certifiedCheckpoint, managedSelectedSeal, err = n.selectManagedAppendOnlyRoot(startupRecovery.Context())
+			if err != nil {
 				return err
 			}
-			if n.managedStartup == nil {
-				certifiedCheckpoint, err = startupRecovery.PinRoot(startupRecovery.Context(), n.checkpoints, certifiedCheckpoint, startupRecovery.Owner())
-				if err != nil {
-					return fmt.Errorf("pin certified checkpoint recovery root: %w", startupRecovery.Check(err))
+			localtesthooks.Hit("node:startup:managed-checkpoint-selected")
+		} else {
+			seal, sealed, sealErr := core.LatestCheckpointSeal()
+			if sealErr != nil {
+				return sealErr
+			}
+			if current := n.checkpoints.Latest(); current != nil {
+				anchorCurrent := !sealed && generationCheckpoint != nil && current.Index == generationCheckpoint.Index && current.RootHash == generationCheckpoint.RootHash
+				if !anchorCurrent && (!sealed || current.Index > uint64(seal.Index) || current.Index == uint64(seal.Index) && current.RootHash != seal.RootHash) {
+					return fmt.Errorf("checkpoint CURRENT is not backed by certified recovery evidence")
 				}
 			}
-		} else if certifiedCheckpoint != nil {
-			certifiedCheckpoint, err = startupRecovery.PinRoot(startupRecovery.Context(), n.checkpoints, certifiedCheckpoint, startupRecovery.Owner())
-			if err != nil {
-				return fmt.Errorf("pin generation recovery root: %w", startupRecovery.Check(err))
+			if sealed {
+				certifiedCheckpoint, err = n.checkpoints.OpenRoot(startupRecovery.Context(), uint64(seal.Index), seal.RootHash)
+				if err != nil || certifiedCheckpoint.Hash != seal.StateHash {
+					if err == nil {
+						err = fmt.Errorf("certified checkpoint state hash mismatch")
+					}
+					return err
+				}
+				if n.managedStartup == nil {
+					certifiedCheckpoint, err = startupRecovery.PinRoot(startupRecovery.Context(), n.checkpoints, certifiedCheckpoint, startupRecovery.Owner())
+					if err != nil {
+						return fmt.Errorf("pin certified checkpoint recovery root: %w", startupRecovery.Check(err))
+					}
+				}
+			} else if certifiedCheckpoint != nil {
+				certifiedCheckpoint, err = startupRecovery.PinRoot(startupRecovery.Context(), n.checkpoints, certifiedCheckpoint, startupRecovery.Owner())
+				if err != nil {
+					return fmt.Errorf("pin generation recovery root: %w", startupRecovery.Check(err))
+				}
 			}
 		}
 	}
@@ -902,11 +1139,19 @@ func (n *Node) openInternal(ctx context.Context, enroll bool, prelocked *qlog.Lo
 	if n.managedStartup == nil {
 		restoreCheckpoint = certifiedCheckpoint
 	}
-	if n.managedStartup != nil && n.managedStartup.Prepared != nil {
+	if deferredManagedGraph {
+		// The exact selected root and its fixed certified cut were already
+		// consumed by the paired Graph reconstruction above.
+		restoreCheckpoint = nil
+	}
+	openStage = "runtime_post_checkpoint"
+	if n.managedStartup != nil && n.managedStartup.Prepared != nil && !preparedResume {
+		openStage = "runtime_post_prepared_view"
 		view := n.managedStartup.Prepared.View()
 		if view == nil {
 			return fmt.Errorf("managed prepared checkpoint view is unavailable")
 		}
+		openStage = "runtime_post_prepared_base"
 		seal, decision, hasBase := view.RecoveryBase()
 		if !hasBase {
 			if core.CompactionFloor() != 0 {
@@ -922,9 +1167,11 @@ func (n *Node) openInternal(ctx context.Context, enroll bool, prelocked *qlog.Lo
 			if !ok || floor != seal.Index || root != seal.RootHash || !prefixOK || prefix != seal.PrefixHash {
 				return fmt.Errorf("managed prepared WAL base differs from verified checkpoint")
 			}
+			openStage = "runtime_post_prepared_validate_base"
 			if err := core.ValidateCheckpointBase(startupRecovery.Context(), seal, decision); err != nil {
 				return fmt.Errorf("validate managed prepared checkpoint: %w", err)
 			}
+			openStage = "runtime_post_prepared_root"
 			preparedCheckpoint, openErr := n.checkpoints.OpenRoot(startupRecovery.Context(), uint64(seal.Index), seal.RootHash)
 			if openErr != nil || preparedCheckpoint.Hash != seal.StateHash {
 				if openErr == nil {
@@ -934,6 +1181,7 @@ func (n *Node) openInternal(ctx context.Context, enroll bool, prelocked *qlog.Lo
 			}
 			restoreCheckpoint = preparedCheckpoint
 		}
+		openStage = "runtime_post_prepared_prefix"
 		if core.Tip() != view.Tip() {
 			return fmt.Errorf("managed prepared WAL tip differs from verified source")
 		}
@@ -942,7 +1190,14 @@ func (n *Node) openInternal(ctx context.Context, enroll bool, prelocked *qlog.Lo
 			return fmt.Errorf("managed prepared WAL suffix differs from verified source")
 		}
 	}
+	if preparedResume {
+		// The existing H adoption, not a second prepared restore, is the
+		// checkpoint authority. Preserve the local materializer (which may be
+		// between H and the certified WAL tip) and never replace it from H.
+		restoreCheckpoint = nil
+	}
 	if n.config.Local && localRestoreAuthority == nil {
+		openStage = "runtime_post_local_resume"
 		if err := n.resumePreparedLocalCheckpoint(startupRecovery.Context()); err != nil {
 			return fmt.Errorf("resume prepared Local checkpoint: %w", startupRecovery.Check(err))
 		}
@@ -951,25 +1206,52 @@ func (n *Node) openInternal(ctx context.Context, enroll bool, prelocked *qlog.Lo
 	if n.config.Local {
 		recoveryTarget = core.Tip()
 	}
-	if recorderTip := core.RecorderTip(); recorderTip > recoveryTarget {
-		recoveryTarget = recorderTip
+	recordedTip := core.RecorderTip()
+	certifiedTip := core.Tip()
+	// An adoption receipt protects the existing materializer for its lifetime,
+	// but only the certified current membership determines the runtime role.
+	preparedReadOnly := preparedLearner && !core.IsVoter()
+	preparedReadOnlyResume := preparedResume && preparedReadOnly
+	if preparedReadOnly {
+		openStage = "runtime_post_recorder"
+		if err := refusePreparedUncertifiedRecorder(core); err != nil {
+			return err
+		}
 	}
-	if certifiedCheckpoint != nil && quepaxa.Slot(certifiedCheckpoint.Index) > recoveryTarget {
+	if preparedResume {
+		openStage = "runtime_post_adopted_tip"
+		managedPreparedReplayThrough = certifiedTip
+		if managedPreparedReplayThrough < n.managedStartup.verifiedAdoption.Tip {
+			return fmt.Errorf("managed adopted WAL is behind its durable H receipt")
+		}
+		recoveryTarget = managedPreparedReplayThrough
+	}
+	if !preparedReadOnlyResume && recordedTip > recoveryTarget {
+		recoveryTarget = recordedTip
+	}
+	if !preparedReadOnlyResume && certifiedCheckpoint != nil && quepaxa.Slot(certifiedCheckpoint.Index) > recoveryTarget {
 		recoveryTarget = quepaxa.Slot(certifiedCheckpoint.Index)
 	}
-	if recoveryTarget > core.Tip() {
+	if !preparedReadOnlyResume && recoveryTarget > core.Tip() {
+		openStage = "runtime_post_recover"
 		if err := core.RecoverThrough(startupRecovery.Context(), recoveryTarget); err != nil {
 			return fmt.Errorf("recover certified log through %d: %w", recoveryTarget, startupRecovery.Check(err))
 		}
 	}
+	if preparedResume && !preparedReadOnly {
+		// Recover only through the captured target above, then replay a fixed
+		// certified cut. Never restore the adopted materializer from H again.
+		managedPreparedReplayThrough = core.Tip()
+	}
 	if restoreCheckpoint != nil {
 		if restoreCheckpoint.Index > material.Tip() {
+			openStage = "runtime_post_restore"
 			if n.managedStartup != nil && (n.managedStartup.Prepared != nil || n.managedStartup.verifiedAdoption != nil) {
-				state, inspectErr := material.InspectSQLApplicationState(startupRecovery.Context())
+				_, freshEmpty, inspectErr := n.inspectApplicationState(startupRecovery.Context(), material)
 				if inspectErr != nil {
 					return fmt.Errorf("inspect existing managed SQLite before prepared restore: %w", inspectErr)
 				}
-				if !managedMaterializerWasAbsent || material.Tip() != 0 || !state.FreshEmpty {
+				if !managedMaterializerWasAbsent || material.Tip() != 0 || !freshEmpty {
 					return fmt.Errorf("refuse to replace non-empty managed SQLite with prepared checkpoint")
 				}
 			}
@@ -1009,21 +1291,45 @@ func (n *Node) openInternal(ctx context.Context, enroll bool, prelocked *qlog.Lo
 
 	// 6. Verify a materializer that survived beyond the local decision marker,
 	// then replay the remaining recovered decisions.
+	openStage = "runtime_post_material_tip"
 	if quepaxa.Slot(material.Tip()) > core.Tip() {
 		return fmt.Errorf("materialized slot %d is ahead of certified log tip %d", material.Tip(), core.Tip())
 	}
 	if material.Tip() > uint64(core.CompactionFloor()) {
+		openStage = "runtime_post_material_decision"
 		decision, ok := core.CertifiedValue(quepaxa.Slot(material.Tip()))
 		if !ok {
 			return fmt.Errorf("materialized slot %d has no recovered decision", material.Tip())
 		}
+		openStage = "runtime_post_material_validate_tip"
 		if err := material.ValidateTip(material.Tip(), decision.Value); err != nil {
 			return err
 		}
 	}
-	if err := n.replayLocalDecisions(startupRecovery.Context()); err != nil {
-		return fmt.Errorf("replay local decisions: %w", startupRecovery.Check(err))
+	if deferredManagedGraph {
+		if preparedResume && !preparedReadOnly {
+			managedGraphReplayThrough = managedPreparedReplayThrough
+		}
+		if managedGraphReplayThrough > 0 {
+			openStage = "runtime_post_replay_graph"
+			if err := n.replayLocalDecisionsThrough(startupRecovery.Context(), managedGraphReplayThrough); err != nil {
+				return fmt.Errorf("replay managed Graph startup prefix through %d: %w", managedGraphReplayThrough, startupRecovery.Check(err))
+			}
+		}
+	} else if preparedResume {
+		if managedPreparedReplayThrough > 0 {
+			openStage = "runtime_post_replay_adopted"
+			if err := n.replayLocalDecisionsThrough(startupRecovery.Context(), managedPreparedReplayThrough); err != nil {
+				return fmt.Errorf("replay managed adopted prefix through %d: %w", managedPreparedReplayThrough, startupRecovery.Check(err))
+			}
+		}
+	} else {
+		openStage = "runtime_post_replay_local"
+		if err := n.replayLocalDecisions(startupRecovery.Context()); err != nil {
+			return fmt.Errorf("replay local decisions: %w", startupRecovery.Check(err))
+		}
 	}
+	openStage = "runtime_post_recovery_evidence"
 	if err := startupRecovery.Check(nil); err != nil {
 		return fmt.Errorf("renew startup recovery evidence: %w", err)
 	}
@@ -1033,7 +1339,58 @@ func (n *Node) openInternal(ctx context.Context, enroll bool, prelocked *qlog.Lo
 		startupRecovery.Close()
 	}
 	if certifiedCheckpoint != nil {
-		if err := n.publishCertifiedCheckpoint(ctx, certifiedCheckpoint); err != nil {
+		openStage = "runtime_post_selected_seal"
+		if n.materializationPolicy() == sqlpolicy.ManagedGraphRequestMaterializationPolicy {
+			if deferredManagedGraph {
+				if managedGraphSelectedSeal == nil {
+					return fmt.Errorf("managed Graph startup lost its fixed selected checkpoint")
+				}
+				// Root selection and archive verification were completed before
+				// the captured cut. Do not refresh or promote CURRENT after that cut.
+				n.markManagedGraphInitialRootComplete()
+			} else if managedPeerProfile != nil {
+				seal := managedGraphSelectedSeal
+				if seal == nil {
+					latest, exists, err := core.LatestManagedCheckpointSeal()
+					if err != nil || !exists || uint64(latest.Index) != certifiedCheckpoint.Index || latest.RootHash != certifiedCheckpoint.RootHash {
+						return errors.Join(fmt.Errorf("managed append-only Graph startup certified root differs from exact QCKP"), err)
+					}
+					seal = &latest
+				}
+				if !preparedLearner {
+					openStage = "runtime_post_checkpoint_promote"
+					if err := n.promoteManagedAppendOnlySeal(ctx, *seal); err != nil {
+						return fmt.Errorf("promote managed append-only Graph checkpoint: %w", err)
+					}
+				}
+			} else {
+				seal := managedGraphSelectedSeal
+				if seal == nil {
+					latest, exists, err := core.LatestCheckpointSeal()
+					if err != nil || !exists || uint64(latest.Index) != certifiedCheckpoint.Index || latest.RootHash != certifiedCheckpoint.RootHash {
+						return errors.Join(fmt.Errorf("managed Graph startup certified root differs from exact seal"), err)
+					}
+					seal = &latest
+				}
+				openStage = "runtime_post_checkpoint_promote"
+				if err := n.promoteManagedGraphSeal(ctx, *seal); err != nil {
+					return fmt.Errorf("promote managed Graph certified checkpoint: %w", err)
+				}
+			}
+		} else if managedPeerProfile != nil {
+			// Keep the verified selection paired with its restored root: peer
+			// recovery may have learned a later authentic QCKP since selection.
+			seal := managedSelectedSeal
+			if seal == nil || uint64(seal.Index) != certifiedCheckpoint.Index || seal.RootHash != certifiedCheckpoint.RootHash {
+				return fmt.Errorf("managed request startup certified root differs from exact QCKP")
+			}
+			if !preparedLearner {
+				openStage = "runtime_post_checkpoint_promote"
+				if err := n.promoteManagedAppendOnlySeal(ctx, *seal); err != nil {
+					return fmt.Errorf("promote managed append-only checkpoint: %w", err)
+				}
+			}
+		} else if err := n.publishCertifiedCheckpoint(ctx, certifiedCheckpoint); err != nil {
 			return fmt.Errorf("publish certified checkpoint: %w", err)
 		}
 	}
@@ -1043,6 +1400,7 @@ func (n *Node) openInternal(ctx context.Context, enroll bool, prelocked *qlog.Lo
 		}
 	}
 	if n.config.Local && objectStoreConfigured {
+		openStage = "runtime_post_local_backup"
 		if err := n.initializeLocalBackup(ctx); err != nil {
 			return fmt.Errorf("initialize Local backup: %w", err)
 		}
@@ -1057,6 +1415,7 @@ func (n *Node) openInternal(ctx context.Context, enroll bool, prelocked *qlog.Lo
 		}()
 	}
 	if n.localBackupReady {
+		openStage = "runtime_post_local_backup"
 		if n.localBackupNeedsSnapshot {
 			if err := n.reclaimLocalCheckpoint(ctx); err != nil {
 				return fmt.Errorf("snapshot Local extension: %w", err)
@@ -1079,6 +1438,9 @@ func (n *Node) openInternal(ctx context.Context, enroll bool, prelocked *qlog.Lo
 		n.wg.Add(1)
 		go func() {
 			defer n.wg.Done()
+			if err := localtesthooks.HitBackgroundPublication(ctx, "archive"); err != nil {
+				return
+			}
 			ticker := time.NewTicker(interval)
 			defer ticker.Stop()
 			for {
@@ -1240,6 +1602,12 @@ func (n *Node) openInternal(ctx context.Context, enroll bool, prelocked *qlog.Lo
 }
 
 func (n *Node) preparePeerCheckpoint(ctx context.Context, sender quepaxa.NodeID, seal quepaxa.CheckpointSeal) error {
+	if n.managedStartup != nil && isManagedAppendOnlyProtocol(n.managedStartup.Identity.ApplicationProtocol) {
+		return fmt.Errorf("managed append-only checkpoint profile does not use prepared-fence RPCs")
+	}
+	if n.materializationPolicy() == sqlpolicy.ManagedGraphRequestMaterializationPolicy {
+		return n.prepareManagedGraphPeerCheckpoint(ctx, sender, seal)
+	}
 	if err := n.checkpoints.ValidatePublisherClaim(ctx, string(sender), uint64(seal.Index), seal.RootHash); err != nil {
 		return err
 	}
@@ -1258,6 +1626,28 @@ func (n *Node) preparePeerCheckpoint(ctx context.Context, sender quepaxa.NodeID,
 	}
 	log.Printf("checkpoint prepared: index=%d root=%x", seal.Index, seal.RootHash)
 	return nil
+}
+
+// Initial admission owns a real runtime borrow. Shutdown cancels that binding
+// and drains its borrowers before wg.Wait, so this Add cannot race a completed
+// Wait or outlive native resources. Starting here avoids losing the first tick
+// before a startup-only binding has acquired its actual admission.
+func (n *Node) startManagedGraphPublisherAfterAdmission(binding *internalApplicationBinding) {
+	if binding == nil || n.managedStartup == nil {
+		return
+	}
+	if isManagedAppendOnlyProtocol(n.managedStartup.Identity.ApplicationProtocol) {
+		if !n.managedGraphPublisherStarted.CompareAndSwap(false, true) {
+			return
+		}
+		n.managedGraphPublisherBinding.Store(binding)
+		n.startManagedAppendOnlyPublisher(binding.lifetime)
+		return
+	}
+	if n.materializationPolicy() == sqlpolicy.ManagedGraphRequestMaterializationPolicy && n.managedGraphPublisherStarted.CompareAndSwap(false, true) {
+		n.managedGraphPublisherBinding.Store(binding)
+		n.startManagedGraphCheckpointPublisher(binding.lifetime)
+	}
 }
 
 func advanceCheckpointReadBarriers(ctx context.Context, reserved uint64, material *materializer.Materializer, server *network.Server) error {
@@ -1634,7 +2024,7 @@ func (n *Node) catchUpArchive(ctx context.Context) error {
 			return err
 		}
 		for _, decision := range values {
-			if err := types.ValidateExecutionPolicy(decision.Value); err != nil {
+			if err := n.validateExecutionPolicy(decision.Value); err != nil {
 				return err
 			}
 		}
@@ -1757,6 +2147,9 @@ func (n *Node) restoreArchiveCatchUp(ctx context.Context) (resultErr error) {
 	if err != nil {
 		return checkRenewFailure(err)
 	}
+	if err := n.validateCheckpointFiles(workCtx, files, uint64(seal.Index)); err != nil {
+		return err
+	}
 	materialFiles := make([]materializer.CheckpointFile, 0, len(files))
 	for _, file := range files {
 		materialFiles = append(materialFiles, materializer.CheckpointFile{Role: materializer.CheckpointRole(file.Role), Path: file.Path})
@@ -1787,7 +2180,7 @@ func (n *Node) restoreArchiveCatchUp(ctx context.Context) (resultErr error) {
 			return err
 		}
 		for _, decision := range values {
-			if err := types.ValidateExecutionPolicy(decision.Value); err != nil {
+			if err := n.validateExecutionPolicy(decision.Value); err != nil {
 				return err
 			}
 		}
@@ -1807,7 +2200,7 @@ func (n *Node) restoreArchiveCatchUp(ctx context.Context) (resultErr error) {
 			return err
 		}
 		for _, decision := range values {
-			if err := types.ValidateExecutionPolicy(decision.Value); err != nil {
+			if err := n.validateExecutionPolicy(decision.Value); err != nil {
 				return err
 			}
 		}
@@ -1903,12 +2296,21 @@ func (n *Node) Ready() bool {
 	if n.managedStartup == nil {
 		return true
 	}
+	if n.internalApplicationProfile() {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		return n.CheckManagedLocalRead(ctx) == nil
+	}
 	if !n.managedAdmitted.Load() || !n.opened.Load() {
 		return false
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	return n.managedStartup.Checker.ValidateManagedAdmission(ctx, n.managedStartup.Identity, n.managedRuntimeState()) == nil
+	state, err := n.managedRuntimeStateWithContext(ctx)
+	if err != nil {
+		return false
+	}
+	return n.managedStartup.Checker.ValidateManagedAdmission(ctx, n.managedStartup.Identity, state) == nil
 }
 
 func quarantineSQLite(path string) error {
@@ -1934,9 +2336,24 @@ func (n *Node) replayLocalDecisions(ctx context.Context) error {
 	return err
 }
 
+// replayLocalDecisionsThrough applies one fixed continuous certified prefix.
+// It is used by admission recovery after observing a stable Core tip; callers
+// must not extend the bound if consensus advances while replay is in progress.
+func (n *Node) replayLocalDecisionsThrough(ctx context.Context, through quepaxa.Slot) error {
+	if through == 0 {
+		return fmt.Errorf("bounded local replay requires a positive certified prefix")
+	}
+	_, err := n.replayLocalDecisionsTo(ctx, through)
+	return err
+}
+
 // The diagnostic variant retains the exact failed local replay page under the
 // same replay owner; callers must not reconstruct it from a later live tip.
 func (n *Node) replayLocalDecisionsFrom(ctx context.Context) (quepaxa.Slot, error) {
+	return n.replayLocalDecisionsTo(ctx, 0)
+}
+
+func (n *Node) replayLocalDecisionsTo(ctx context.Context, through quepaxa.Slot) (quepaxa.Slot, error) {
 	// Archive catch-up and checkpoint verification can both request local
 	// replay. Keep the tip read, decision selection, apply, and restore-suffix
 	// state transition under one owner so neither path races or replays stale
@@ -1945,9 +2362,30 @@ func (n *Node) replayLocalDecisionsFrom(ctx context.Context) (quepaxa.Slot, erro
 	defer n.replayMu.Unlock()
 	for {
 		from := quepaxa.Slot(n.material.Tip() + 1)
-		decisions, tip, err := n.core.DecisionsFrom(from, 256)
+		if through != 0 && from > through {
+			localtesthooks.Hit("node:replay-local-decisions-through:applied")
+			return 0, nil
+		}
+		limit := 256
+		if through != 0 {
+			remaining := through - from + 1
+			if remaining < quepaxa.Slot(limit) {
+				limit = int(remaining)
+			}
+		}
+		decisions, tip, err := n.core.DecisionsFrom(from, limit)
 		if err != nil {
 			return from, err
+		}
+		if len(decisions) == 0 && through != 0 && from <= through {
+			return from, fmt.Errorf("certified local replay made no progress through slot %d", through)
+		}
+		// HA certified hints may be memory-only. Local cannot accept hints and
+		// its reclaim callback already owns the non-reentrant execution gate.
+		if !n.core.LocalMode() && len(decisions) != 0 {
+			if err := n.core.EnsureDurableThrough(ctx, decisions[len(decisions)-1].Slot); err != nil {
+				return from, err
+			}
 		}
 		if n.localRestoreSuffixPending && localRestoreSuffixCrashBoundary != nil {
 			for _, decision := range decisions {
@@ -1959,9 +2397,22 @@ func (n *Node) replayLocalDecisionsFrom(ctx context.Context) (quepaxa.Slot, erro
 		} else if err := n.material.ApplyBatch(ctx, decisions); err != nil {
 			return from, err
 		}
-		if quepaxa.Slot(n.material.Tip()) >= tip {
-			n.localRestoreSuffixPending = false
+		applied := quepaxa.Slot(n.material.Tip())
+		if through != 0 && applied >= through {
+			if applied >= tip {
+				n.localRestoreSuffixPending = false
+			}
+			localtesthooks.Hit("node:replay-local-decisions-through:applied")
 			return 0, nil
+		}
+		if applied >= tip {
+			n.localRestoreSuffixPending = false
+			if through == 0 {
+				return 0, nil
+			}
+			if applied < through {
+				return from, fmt.Errorf("certified local history ended before fixed replay prefix %d", through)
+			}
 		}
 	}
 }
@@ -1991,7 +2442,75 @@ func (n *Node) catchUpMembership(ctx context.Context, transport *network.Transpo
 	return last
 }
 
+// catchUpPreparedArchiveSuffix applies only the already-certified archive
+// suffix after the exact prepared view has been verified and persisted as the
+// adoption boundary. The prepared view remains the recovery authority; archive
+// state is only a source of independently validated DecidedValues.
+func (n *Node) catchUpPreparedArchiveSuffix(ctx context.Context, adoptedThrough quepaxa.Slot) error {
+	if n == nil || n.config == nil || n.config.Learner == nil || n.managedStartup == nil || n.managedStartup.Prepared == nil || n.core == nil || n.material == nil || n.archive == nil {
+		return fmt.Errorf("prepared learner archive catch-up is unavailable")
+	}
+	if n.core.Tip() != adoptedThrough || quepaxa.Slot(n.material.Tip()) != adoptedThrough {
+		return fmt.Errorf("prepared learner did not remain at its adopted cut")
+	}
+	target := n.archive.Tip()
+	if target < adoptedThrough {
+		target = adoptedThrough
+	}
+	for n.core.Tip() < target {
+		from := n.core.Tip() + 1
+		values, _, err := n.archive.DecisionsFrom(ctx, from, 256)
+		if err != nil {
+			return fmt.Errorf("read prepared learner certified suffix from %d: %w", from, err)
+		}
+		if len(values) == 0 || values[0].Slot != from {
+			return fmt.Errorf("prepared learner archive omitted certified slot %d", from)
+		}
+		limit := len(values)
+		for i, decision := range values {
+			if decision.Slot > target {
+				limit = i
+				break
+			}
+			if err := n.validateExecutionPolicy(decision.Value); err != nil {
+				return err
+			}
+		}
+		if limit == 0 {
+			return fmt.Errorf("prepared learner archive omitted certified slot %d", from)
+		}
+		if err := n.core.AcceptCertifiedValues(values[:limit]); err != nil {
+			return fmt.Errorf("accept prepared learner certified suffix: %w", err)
+		}
+		if localtesthooks.Enabled {
+			localtesthooks.Hit("node:managed-prepared:suffix-page-accepted")
+		}
+	}
+	if n.core.Tip() > adoptedThrough {
+		if err := n.core.EnsureDurableThrough(ctx, n.core.Tip()); err != nil {
+			return fmt.Errorf("sync prepared learner certified suffix: %w", err)
+		}
+		if err := n.replayLocalDecisions(ctx); err != nil {
+			return fmt.Errorf("replay prepared learner certified suffix: %w", err)
+		}
+	}
+	if n.core.Tip() != target || quepaxa.Slot(n.material.Tip()) != target {
+		return fmt.Errorf("prepared learner did not finish the fixed archived suffix")
+	}
+	return nil
+}
+
 func (n *Node) startCatchUp(ctx context.Context, transport *network.Transport, cluster *quepaxa.Cluster) {
+	if n.managedStartup != nil && (n.managedStartup.Prepared != nil || n.managedStartup.verifiedAdoption != nil) && n.config.Learner != nil && isManagedAppendOnlyProtocol(n.managedStartup.Identity.ApplicationProtocol) {
+		if n.managedStartup.promotionReady == nil {
+			return
+		}
+		select {
+		case <-n.managedStartup.promotionReady:
+		case <-ctx.Done():
+			return
+		}
+	}
 	n.observeCatchUp(n.catchUpMembership(ctx, transport, cluster))
 	var round uint64
 	for {
@@ -2204,7 +2723,11 @@ func (n *Node) observeCatchUp(err error) {
 		log.Printf("quorum catch-up failed: %v", err)
 		return
 	}
+	if localtesthooks.Enabled {
+		localtesthooks.Hit("node:catchup:before-ready:node=" + string(n.config.NodeID))
+	}
 	n.ready.Store(true)
+	localtesthooks.Hit("node:catchup:after-ready:node=" + string(n.config.NodeID))
 }
 
 func hasUsablePeerSuffix(applied quepaxa.Slot, successes, quorum int, best *network.DecisionsResponse) bool {
@@ -2291,7 +2814,7 @@ func (n *Node) catchUpQuorum(ctx context.Context, transport *network.Transport, 
 			expected++
 		}
 		for _, decision := range best.Decisions {
-			if err := types.ValidateExecutionPolicy(decision.Value); err != nil {
+			if err := n.validateExecutionPolicy(decision.Value); err != nil {
 				return err
 			}
 		}
@@ -2318,6 +2841,7 @@ func (n *Node) catchUpPeer(ctx context.Context, transport *network.Transport, so
 	}()
 	for {
 		stage, from, remoteTip, remoteTipKnown = "local-replay", quepaxa.Slot(n.material.Tip())+1, 0, false
+		localtesthooks.Hit("node:catchup-peer:phase=before-local-replay:node=" + string(n.config.NodeID))
 		if replayFrom, err := n.replayLocalDecisionsFrom(ctx); err != nil {
 			from = replayFrom
 			return err
@@ -2345,7 +2869,7 @@ func (n *Node) catchUpPeer(ctx context.Context, transport *network.Transport, so
 			return fmt.Errorf("operation sync source %s omitted slot %d", source, from)
 		}
 		for _, decision := range response.Decisions {
-			if err := types.ValidateExecutionPolicy(decision.Value); err != nil {
+			if err := n.validateExecutionPolicy(decision.Value); err != nil {
 				return err
 			}
 		}
@@ -2378,6 +2902,20 @@ func (n *Node) shutdown() error {
 }
 
 func (n *Node) shutdownEngine(closeBucket bool) error {
+	return n.shutdownEngineWithArchiveSync(closeBucket, true)
+}
+
+// abortOpen closes a failed append-only startup without publishing local
+// decisions that its read-only archive selection rejected.
+func (n *Node) abortOpen() error {
+	n.shutdownMu.Lock()
+	defer n.shutdownMu.Unlock()
+	syncArchive := n.managedStartup == nil || !isManagedAppendOnlyProtocol(n.managedApplicationProtocol())
+	return n.shutdownEngineWithArchiveSync(true, syncArchive)
+}
+
+func (n *Node) shutdownEngineWithArchiveSync(closeBucket, syncArchive bool) error {
+	internal := n.stopInternalApplication()
 	n.managedPeerVerified.Store(false)
 	n.managedAdmitted.Store(false)
 	n.opened.Store(false)
@@ -2394,6 +2932,9 @@ func (n *Node) shutdownEngine(closeBucket bool) error {
 	// Keep the server reachable until the peer handlers that reference it join.
 	if n.server != nil {
 		n.server.Close()
+	}
+	if internal != nil {
+		internal.active.Wait()
 	}
 	if n.peerControl != nil {
 		n.peerControl.Close()
@@ -2437,7 +2978,7 @@ func (n *Node) shutdownEngine(closeBucket bool) error {
 	// Creating a new checkpoint here would instead require new consensus and
 	// make simultaneous or last-voter shutdown depend on peers staying alive.
 	if n.archive != nil {
-		if n.core != nil && (!n.config.EnableReconfiguration || n.core.IsVoter()) {
+		if syncArchive && n.core != nil && (!n.config.EnableReconfiguration || n.core.IsVoter()) {
 			shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 			shutdownErr = errors.Join(shutdownErr, n.archive.SyncThrough(shutdownCtx, n.core, n.core.Tip()))
 			cancel()

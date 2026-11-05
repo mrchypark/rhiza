@@ -5,7 +5,6 @@ COPY go.mod go.sum ./
 RUN go mod download
 COPY . .
 RUN CGO_ENABLED=0 GOOS=linux go build -o rhiza-operator ./cmd/rhiza-operator
-RUN CGO_ENABLED=0 GOOS=linux go build -o rhiza-fencer ./cmd/rhiza-fencer
 RUN CGO_ENABLED=0 GOOS=linux go build -o rhiza-ha-init ./cmd/rhiza-ha-init
 
 # SDK build.rs accepts linux-gnu, not musl. Digest verified at the official
@@ -15,16 +14,19 @@ COPY --from=builder /usr/local/go /usr/local/go
 ENV PATH="/usr/local/go/bin:${PATH}"
 WORKDIR /app
 COPY . .
-RUN CGO_ENABLED=1 go test -c -o rhiza-managed-ffi-contract ./cmd/rhiza-ffi
+RUN CGO_ENABLED=1 go test -tags rhiza_local_testhooks -c -o rhiza-managed-ffi-contract ./cmd/rhiza-ffi
+RUN CGO_ENABLED=1 go test -c -o rhiza-managed-materializer-contract ./pkg/materializer
 # This links the actual adjacent Go C archive, not a prebuilt substitute.
 RUN cargo build --manifest-path sdk/rust/Cargo.toml --locked --release --example managed_ha_contract
 
 FROM mirror.gcr.io/library/ubuntu:24.04@sha256:534baea6a22c03a63003dbc8dbe78fe34bc0d7e595d9a9dc9834884ff530eb55
+# CI-only fixed GCS emulator route, inherited by init, Go FFI, Rust and runtime.
+ENV STORAGE_EMULATOR_HOST=http://floci:4588
 RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates libgcc-s1
 COPY --from=builder /app/rhiza-operator /usr/local/bin/rhiza-operator
-COPY --from=builder /app/rhiza-fencer /usr/local/bin/rhiza-fencer
 COPY --from=builder /app/rhiza-ha-init /usr/local/libexec/rhiza-ha-init
 COPY --from=rust-builder /app/rhiza-managed-ffi-contract /usr/local/libexec/rhiza-managed-ffi-contract
+COPY --from=rust-builder /app/rhiza-managed-materializer-contract /usr/local/libexec/rhiza-managed-materializer-contract
 COPY --from=rust-builder /app/sdk/rust/target/release/examples/managed_ha_contract /usr/local/libexec/rhiza-rust-managed-contract
 COPY --chmod=0755 scripts/managed-ffi-contract-entrypoint.sh /usr/local/bin/rhiza-ha-init
 USER 65532:65532

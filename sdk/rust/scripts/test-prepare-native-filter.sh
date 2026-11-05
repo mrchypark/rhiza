@@ -1,0 +1,228 @@
+#!/bin/sh
+set -eu
+
+script_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+prepare_script="$script_dir/prepare-native.sh"
+scratch=$(mktemp -d "${TMPDIR:-/tmp}/rhiza-native-filter.XXXXXX")
+cleanup() { rm -rf "$scratch"; }
+trap cleanup EXIT HUP INT TERM
+
+filter_block="$scratch/filter-block.sh"
+awk '
+    /^# BEGIN native-vendor compiler-unread input filter$/ { active=1; next }
+    /^# END native-vendor compiler-unread input filter$/ { active=0; exit }
+    active { print }
+' "$prepare_script" > "$filter_block"
+[ -s "$filter_block" ] || { echo 'FAIL unable to extract actual prepare-native filter' >&2; exit 1; }
+grep -Fq "! -path 'internal/foregroundcosttest/*'" "$prepare_script" || { echo 'FAIL test-only foreground cost package is staged into native snapshot' >&2; exit 1; }
+go_filter_block="$scratch/go-filter-block.sh"
+awk '
+    /^# BEGIN native-vendor unreachable Go source filter$/ { active=1; next }
+    /^# END native-vendor unreachable Go source filter$/ { active=0; exit }
+    active { print }
+' "$prepare_script" > "$go_filter_block"
+[ -s "$go_filter_block" ] || { echo 'FAIL unable to extract actual vendor Go source filter' >&2; exit 1; }
+
+run_go_source_filter() (
+    . "$go_filter_block"
+    filter_unreachable_vendor_go "$@"
+)
+run_vendor_root_check() (
+    . "$go_filter_block"
+    vendor_dir_from_go_list "$@"
+)
+
+# macOS TMPDIR can name /var while physical paths name /private/var.
+physical_workspace="$scratch/physical-workspace"
+alias_workspace="$scratch/alias-workspace"
+mkdir -p "$physical_workspace/vendor/example.com/kept" "$physical_workspace/vendor/example.com/unreachable" "$scratch/neighbor/vendor/example.com/kept"
+ln -s "$physical_workspace" "$alias_workspace"
+physical_vendor=$(CDPATH= cd -P -- "$physical_workspace/vendor" && pwd -P)
+alias_vendor="$alias_workspace/vendor"
+printf 'example.com/kept\t%s\n' "$alias_vendor/example.com/kept" > "$scratch/alias-metadata.tsv"
+reported_alias=$(run_vendor_root_check "$physical_vendor" "$scratch/alias-metadata.tsv")
+[ "$reported_alias" = "$alias_vendor" ] || { echo 'FAIL equivalent vendor alias lost metadata spelling' >&2; exit 1; }
+printf 'example.com/kept\t%s\n' "$physical_vendor/example.com/kept" > "$scratch/physical-metadata.tsv"
+[ "$(run_vendor_root_check "$alias_vendor" "$scratch/physical-metadata.tsv")" = "$physical_vendor" ] || { echo 'FAIL physical metadata with equivalent expected alias was refused' >&2; exit 1; }
+if run_vendor_root_check "$scratch/neighbor/vendor" "$scratch/alias-metadata.tsv" >/dev/null 2>&1; then
+    echo 'FAIL different physical vendor root was accepted' >&2
+    exit 1
+fi
+printf 'malformed metadata\n' > "$scratch/alias-malformed.tsv"
+if run_vendor_root_check "$physical_vendor" "$scratch/alias-malformed.tsv" >/dev/null 2>&1; then
+    echo 'FAIL malformed alias metadata was accepted' >&2
+    exit 1
+fi
+printf 'package kept\n' > "$alias_vendor/example.com/kept/kept.go"
+printf 'package unreachable\n' > "$alias_vendor/example.com/unreachable/unreachable.go"
+printf '%s\n' "$alias_vendor/example.com/kept" > "$scratch/alias-reachable"
+run_go_source_filter "$reported_alias" "$scratch/alias-reachable"
+[ -f "$alias_vendor/example.com/kept/kept.go" ] && [ ! -e "$alias_vendor/example.com/unreachable/unreachable.go" ] || { echo 'FAIL alias source filtering changed package selection' >&2; exit 1; }
+if [ "${1-}" = --vendor-root-only ]; then
+    echo 'PASS vendor root aliases, wrong-root refusal, and source filtering'
+    exit 0
+fi
+
+cache_dir=$(go env GOMODCACHE)
+run_filter() (
+    native_dir=$1
+    . "$filter_block"
+)
+
+add_candidate() {
+    target="$matching/vendor/$1"
+    source="$cache_dir/$2"
+    [ -f "$source" ] || { echo "FAIL missing read-only cached source $source" >&2; exit 1; }
+    mkdir -p "$(dirname "$target")"
+    cp "$source" "$target"
+}
+
+assert_candidate() {
+    target="$matching/vendor/$1"
+    source="$cache_dir/$2"
+    [ -f "$target" ] || { echo "FAIL pinned doc.go removed: $1" >&2; exit 1; }
+    [ "$(wc -c < "$target" | tr -d ' ')" -lt "$(wc -c < "$source" | tr -d ' ')" ] || { echo "FAIL pinned doc.go not reduced: $1" >&2; exit 1; }
+    grep -Fx "$3" "$target" >/dev/null || { echo "FAIL package clause not retained: $1" >&2; exit 1; }
+    if [ -n "$4" ]; then
+        grep -F "$4" "$target" >/dev/null || { echo "FAIL copyright/license preamble not retained: $1" >&2; exit 1; }
+    fi
+}
+
+source_doc="$cache_dir/cloud.google.com/go/storage@v1.56.0/doc.go"
+matching="$scratch/matching"
+match_doc="$matching/vendor/cloud.google.com/go/storage/doc.go"
+mkdir -p "$(dirname "$match_doc")" "$matching/vendor/docs" "$matching/vendor/embed" "$matching/vendor/golang.org/x/sys/unix"
+printf '%s\n' \
+    '# cloud.google.com/go/storage v1.56.0' \
+    '# github.com/Azure/azure-sdk-for-go/sdk/azcore v1.18.1' \
+    '# github.com/prometheus/client_golang v1.17.0' \
+    '# go.opentelemetry.io/otel/metric v1.45.0' \
+    '# github.com/aws/aws-sdk-go-v2 v1.30.4' \
+    '# github.com/go-kit/log v0.2.1' \
+    '# golang.org/x/net v0.60.0' \
+    '# go.opentelemetry.io/otel/trace v1.45.0' \
+    '# go.opentelemetry.io/otel/sdk/metric v1.45.0' > "$matching/vendor/modules.txt"
+add_candidate cloud.google.com/go/storage/doc.go cloud.google.com/go/storage@v1.56.0/doc.go
+add_candidate github.com/Azure/azure-sdk-for-go/sdk/azcore/doc.go github.com/\!azure/azure-sdk-for-go/sdk/azcore@v1.18.1/doc.go
+add_candidate github.com/prometheus/client_golang/prometheus/doc.go github.com/prometheus/client_golang@v1.17.0/prometheus/doc.go
+add_candidate go.opentelemetry.io/otel/metric/doc.go go.opentelemetry.io/otel/metric@v1.45.0/doc.go
+add_candidate github.com/aws/aws-sdk-go-v2/aws/doc.go github.com/aws/aws-sdk-go-v2@v1.30.4/aws/doc.go
+add_candidate github.com/go-kit/log/doc.go github.com/go-kit/log@v0.2.1/doc.go
+add_candidate golang.org/x/net/ipv4/doc.go golang.org/x/net@v0.60.0/ipv4/doc.go
+add_candidate golang.org/x/net/ipv6/doc.go golang.org/x/net@v0.60.0/ipv6/doc.go
+add_candidate go.opentelemetry.io/otel/trace/doc.go go.opentelemetry.io/otel/trace@v1.45.0/doc.go
+add_candidate github.com/aws/aws-sdk-go-v2/aws/retry/doc.go github.com/aws/aws-sdk-go-v2@v1.30.4/aws/retry/doc.go
+add_candidate go.opentelemetry.io/otel/sdk/metric/doc.go go.opentelemetry.io/otel/sdk/metric@v1.45.0/doc.go
+printf 'ordinary documentation\n' > "$matching/vendor/docs/README.md"
+printf 'legal documentation\n' > "$matching/vendor/docs/legal.md"
+printf 'license notice\n' > "$matching/vendor/docs/LICENSE.md"
+printf 'package embedfixture\n//go:embed asset.md\nvar asset string\n' > "$matching/vendor/embed/embed.go"
+printf 'embedded bytes\n' > "$matching/vendor/embed/asset.md"
+printf '#!/bin/sh\n' > "$matching/vendor/golang.org/x/sys/unix/mkerrors.sh"
+printf '#!/bin/sh\n' > "$matching/vendor/golang.org/x/sys/unix/mkerrors-neighbor.sh"
+run_filter "$matching"
+
+assert_candidate cloud.google.com/go/storage/doc.go cloud.google.com/go/storage@v1.56.0/doc.go 'package storage // import "cloud.google.com/go/storage"' 'Copyright 2016 Google LLC'
+assert_candidate github.com/Azure/azure-sdk-for-go/sdk/azcore/doc.go github.com/\!azure/azure-sdk-for-go/sdk/azcore@v1.18.1/doc.go 'package azcore' 'Copyright 2017 Microsoft Corporation'
+assert_candidate github.com/prometheus/client_golang/prometheus/doc.go github.com/prometheus/client_golang@v1.17.0/prometheus/doc.go 'package prometheus' 'Copyright 2014 The Prometheus Authors'
+assert_candidate go.opentelemetry.io/otel/metric/doc.go go.opentelemetry.io/otel/metric@v1.45.0/doc.go 'package metric' 'SPDX-License-Identifier: Apache-2.0'
+assert_candidate github.com/aws/aws-sdk-go-v2/aws/doc.go github.com/aws/aws-sdk-go-v2@v1.30.4/aws/doc.go 'package aws' ''
+grep -Fx '//go:generate go run -tags codegen generate.go' "$matching/vendor/github.com/aws/aws-sdk-go-v2/aws/doc.go" >/dev/null || { echo 'FAIL go:generate directive was not retained' >&2; exit 1; }
+grep -Fx '//go:generate go run -tags codegen logging_generate.go' "$matching/vendor/github.com/aws/aws-sdk-go-v2/aws/doc.go" >/dev/null || { echo 'FAIL second go:generate directive was not retained' >&2; exit 1; }
+grep -Fx '//go:generate gofmt -w -s .' "$matching/vendor/github.com/aws/aws-sdk-go-v2/aws/doc.go" >/dev/null || { echo 'FAIL gofmt generation directive was not retained' >&2; exit 1; }
+assert_candidate github.com/go-kit/log/doc.go github.com/go-kit/log@v0.2.1/doc.go 'package log' ''
+assert_candidate golang.org/x/net/ipv4/doc.go golang.org/x/net@v0.60.0/ipv4/doc.go 'package ipv4 // import "golang.org/x/net/ipv4"' 'Copyright 2012 The Go Authors.'
+assert_candidate golang.org/x/net/ipv6/doc.go golang.org/x/net@v0.60.0/ipv6/doc.go 'package ipv6 // import "golang.org/x/net/ipv6"' 'Copyright 2013 The Go Authors.'
+assert_candidate go.opentelemetry.io/otel/trace/doc.go go.opentelemetry.io/otel/trace@v1.45.0/doc.go 'package trace' 'SPDX-License-Identifier: Apache-2.0'
+assert_candidate github.com/aws/aws-sdk-go-v2/aws/retry/doc.go github.com/aws/aws-sdk-go-v2@v1.30.4/aws/retry/doc.go 'package retry' ''
+assert_candidate go.opentelemetry.io/otel/sdk/metric/doc.go go.opentelemetry.io/otel/sdk/metric@v1.45.0/doc.go 'package metric' 'SPDX-License-Identifier: Apache-2.0'
+if grep -F 'Package storage provides an easy way' "$match_doc" >/dev/null; then
+    echo 'FAIL package documentation body remains' >&2
+    exit 1
+fi
+[ ! -e "$matching/vendor/docs/README.md" ] || { echo 'FAIL ordinary Markdown was retained' >&2; exit 1; }
+[ -f "$matching/vendor/docs/legal.md" ] && [ -f "$matching/vendor/docs/LICENSE.md" ] || { echo 'FAIL legal Markdown was removed' >&2; exit 1; }
+[ -f "$matching/vendor/embed/asset.md" ] || { echo 'FAIL go:embed input was removed' >&2; exit 1; }
+[ ! -e "$matching/vendor/golang.org/x/sys/unix/mkerrors.sh" ] || { echo 'FAIL exact generator was retained' >&2; exit 1; }
+[ -f "$matching/vendor/golang.org/x/sys/unix/mkerrors-neighbor.sh" ] || { echo 'FAIL neighboring script was removed' >&2; exit 1; }
+
+go_vendor="$scratch/workspace/vendor/source/sdk/rust/native/vendor"
+go_keep="$go_vendor/github.com/example/kept"
+go_reachable="$scratch/reachable-go-packages"
+mkdir -p "$go_keep/child" "$go_vendor/github.com/example/unreachable"
+printf 'package kept\n' > "$go_keep/kept.go"
+printf 'package child\n//go:embed child.asset\nvar asset string\n' > "$go_keep/child/child.go"
+printf 'embedded bytes\n' > "$go_keep/child/child.asset"
+printf 'package unreachable\n' > "$go_vendor/github.com/example/unreachable/unreachable.go"
+printf 'license bytes\n' > "$go_vendor/github.com/example/unreachable/LICENSE"
+printf 'C source bytes\n' > "$go_vendor/github.com/example/unreachable/source.c"
+printf 'C header bytes\n' > "$go_vendor/github.com/example/unreachable/source.h"
+printf 'asset bytes\n' > "$go_vendor/github.com/example/unreachable/asset.bin"
+printf '%s\n' "$go_keep" > "$go_reachable"
+metadata="$scratch/go-list-metadata.tsv"
+printf 'github.com/example/kept\t%s\n' "$go_keep" > "$metadata"
+reported_vendor=$(run_vendor_root_check "$go_vendor" "$metadata")
+[ "$reported_vendor" = "$go_vendor" ] || { echo 'FAIL vendor derivation selected an ancestor named vendor' >&2; exit 1; }
+# Actual go list -deps also emits standard-library vendoring and main packages.
+# Neither is a module-vendor root, even when an ancestor is named vendor.
+printf 'vendor/golang.org/x/net/dns/dnsmessage\t%s\n' "$scratch/goroot/src/vendor/golang.org/x/net/dns/dnsmessage" >> "$metadata"
+printf 'fmt\t%s\n' "$scratch/goroot/src/fmt" >> "$metadata"
+printf 'github.com/mrchypark/rhiza/cmd/rhiza-ffi\t%s\n' "$scratch/workspace/vendor/source/sdk/rust/native/cmd/rhiza-ffi" >> "$metadata"
+reported_vendor=$(run_vendor_root_check "$go_vendor" "$metadata")
+[ "$reported_vendor" = "$go_vendor" ] || { echo 'FAIL mixed actual-format Go metadata selected a GOROOT or main-module ancestor' >&2; exit 1; }
+printf 'vendor/golang.org/x/net/dns/dnsmessage\t%s\n' "$scratch/goroot/src/vendor/golang.org/x/net/dns/dnsmessage" > "$scratch/stdlib-only.tsv"
+if run_vendor_root_check "$go_vendor" "$scratch/stdlib-only.tsv" >/dev/null 2>&1; then
+    echo 'FAIL standard-library vendor directory substituted for the native vendor root' >&2
+    exit 1
+fi
+if run_vendor_root_check 2>/dev/null; then
+    echo 'FAIL missing vendor-root inputs were accepted' >&2
+    exit 1
+fi
+if run_vendor_root_check "$scratch/workspace/vendor" "$metadata" >/dev/null 2>&1; then
+    echo 'FAIL ancestor vendor path was accepted as the generated vendor directory' >&2
+    exit 1
+fi
+printf 'malformed metadata\n' > "$scratch/malformed-metadata.tsv"
+if run_vendor_root_check "$go_vendor" "$scratch/malformed-metadata.tsv" >/dev/null 2>&1; then
+    echo 'FAIL malformed Go package metadata was accepted' >&2
+    exit 1
+fi
+run_go_source_filter "$go_vendor" "$go_reachable"
+[ -f "$go_keep/kept.go" ] && [ -f "$go_keep/child/child.go" ] || { echo 'FAIL reachable Go package or descendant was removed' >&2; exit 1; }
+[ -f "$go_keep/child/child.asset" ] || { echo 'FAIL embedded asset was removed' >&2; exit 1; }
+[ ! -e "$go_vendor/github.com/example/unreachable/unreachable.go" ] || { echo 'FAIL unreachable Go package source was retained' >&2; exit 1; }
+[ -f "$go_vendor/github.com/example/unreachable/LICENSE" ] && [ -f "$go_vendor/github.com/example/unreachable/source.c" ] && [ -f "$go_vendor/github.com/example/unreachable/source.h" ] && [ -f "$go_vendor/github.com/example/unreachable/asset.bin" ] || { echo 'FAIL non-Go, C, header, or license asset was removed' >&2; exit 1; }
+if run_go_source_filter "$go_vendor" "$scratch/empty-reachable" 2>/dev/null; then
+    echo 'FAIL empty reachable package metadata was accepted' >&2
+    exit 1
+fi
+if run_go_source_filter 2>/dev/null; then
+    echo 'FAIL missing Go source filter inputs were accepted' >&2
+    exit 1
+fi
+
+unknown="$scratch/unknown"
+unknown_doc="$unknown/vendor/cloud.google.com/go/storage/doc.go"
+mkdir -p "$(dirname "$unknown_doc")"
+cp "$source_doc" "$unknown_doc"
+cp "$matching/vendor/modules.txt" "$unknown/vendor/modules.txt"
+chmod u+w "$unknown_doc"
+printf '\n// unreviewed dependency contents\n' >> "$unknown_doc"
+cp "$unknown_doc" "$scratch/unknown-before.go"
+run_filter "$unknown"
+cmp -s "$unknown_doc" "$scratch/unknown-before.go" || { echo 'FAIL unknown hash was modified' >&2; exit 1; }
+
+upgraded="$scratch/upgraded"
+upgraded_doc="$upgraded/vendor/cloud.google.com/go/storage/doc.go"
+mkdir -p "$(dirname "$upgraded_doc")"
+cp "$source_doc" "$upgraded_doc"
+printf '%s\n' '# cloud.google.com/go/storage v1.56.1' > "$upgraded/vendor/modules.txt"
+cp "$upgraded_doc" "$scratch/upgraded-before.go"
+run_filter "$upgraded"
+cmp -s "$upgraded_doc" "$scratch/upgraded-before.go" || { echo 'FAIL dependency-version change was modified' >&2; exit 1; }
+
+rm -rf "$scratch"
+trap - EXIT HUP INT TERM
+[ ! -e "$scratch" ] || { echo 'FAIL fixture cleanup left temporary data' >&2; exit 1; }
+echo 'PASS prepare-native hash filter, unknown-hash retention, legal/embed preservation, and cleanup'

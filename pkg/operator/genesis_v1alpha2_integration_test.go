@@ -12,6 +12,10 @@ import (
 	"os/exec"
 	"strings"
 	"testing"
+
+	"github.com/mrchypark/rhiza/internal/sqlpolicy"
+	"github.com/mrchypark/rhiza/internal/types"
+	"github.com/mrchypark/rhiza/pkg/quepaxa"
 )
 
 func TestV1Alpha2GenesisAPIServerContract(t *testing.T) {
@@ -76,10 +80,20 @@ func TestV1Alpha2GenesisAPIServerContract(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	bootstrap.EvidenceFormat = sqlpolicy.ManagedRequestAppendOnlyApplicationProtocol
+	members := make([]quepaxa.Member, len(bootstrap.Members))
+	for i, member := range bootstrap.Members {
+		members[i] = member.Member
+	}
+	digest, err = types.ManagedBootstrapPlanDigestForProtocol(string(bootstrap.ClusterID), members, bootstrap.PhysicalBinding, bootstrap.EvidenceFormat, bootstrap.Durability, bootstrap.Reconfiguration, bootstrap.EvidenceFormat)
+	if err != nil {
+		t.Fatal(err)
+	}
 	plan, err := NewV1Alpha2ApplicationInitPlan(ref, "test", liveDeployment.Metadata.UID, "genesis-contract-assignment", bootstrap.PhysicalBinding, digest, bootstrap.EvidenceFormat)
 	if err != nil {
 		t.Fatal(err)
 	}
+	plan.ApplicationProtocol = sqlpolicy.ManagedRequestAppendOnlyApplicationProtocol
 	genesis := v1alpha2Genesis{OwnerUID: uid, LogicalID: "test", DeploymentUID: liveDeployment.Metadata.UID, StorageID: plan.StorageID, IntentHash: plan.IntentHash}
 	bad, err := json.Marshal(map[string]any{"status": map[string]any{"genesis": genesis, "authority": map[string]any{"owner": map[string]string{"namespace": ns, "name": ref.Name, "uid": uid, "logicalID": "test"}, "generation": 0, "binding": map[string]string{"deploymentUID": liveDeployment.Metadata.UID, "storageID": plan.StorageID}, "pendingWrite": false, "everApplicationReserved": false}}})
 	if err != nil {

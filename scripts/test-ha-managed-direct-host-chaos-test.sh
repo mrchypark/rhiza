@@ -2,13 +2,125 @@
 # Offline guardrails for direct-host mode. No kubectl/API calls.
 set -eu
 cd "$(CDPATH='' cd -- "$(dirname -- "$0")/.." && pwd)"
+if [ "${1-}" = --podchaos-self-test ]; then
+  scratch=$(mktemp -d "${TMPDIR:-/tmp}/rhiza-kind-chaos-oracles.XXXXXX")
+  trap 'rm -f "$scratch"/*.json "$scratch"/*.jsonl "$scratch"/*.txt "$scratch"/*.exit; rmdir "$scratch"' EXIT HUP INT TERM
+  namespace=test-ns release=test-run
+  . scripts/ha-managed-podchaos.sh
+  managed_chaos_request pod-kill sql-pod > "$scratch/request.json"
+  jq -e '.spec=={action:"pod-kill",mode:"one",duration:"10s",containerNames:["sql"],selector:{namespaces:["test-ns"],pods:{"test-ns":["sql-pod"]}}}' "$scratch/request.json" >/dev/null
+  managed_chaos_request container-kill sql-pod > "$scratch/request.json"
+  jq -e '.spec.action=="container-kill" and .spec.duration=="10s"' "$scratch/request.json" >/dev/null
+  if managed_chaos_request network-delay sql-pod >/dev/null 2>&1; then exit 1; fi
+  if managed_chaos_request pod-kill '' >/dev/null 2>&1; then exit 1; fi
+  jq -n '{status:{conditions:[{type:"AllInjected",status:"True"}],experiment:{containerRecords:[{id:"test-ns/sql-pod",phase:"Injected",injectedCount:1,recoveredCount:0}]}}}' > "$scratch/record.json"
+  chaos_record_oracle "$scratch/record.json" test-ns/sql-pod
+  for expression in '.status.conditions[0].status="False"' '.status.experiment.containerRecords[0].phase="NotInjected"' '.status.experiment.containerRecords[0].injectedCount=0' '.status.experiment.containerRecords[0].recoveredCount=1' '.status.experiment.containerRecords+=.status.experiment.containerRecords'; do
+    jq "$expression" "$scratch/record.json" > "$scratch/bad.json"
+    if chaos_record_oracle "$scratch/bad.json" test-ns/sql-pod; then exit 1; fi
+  done
+  if chaos_record_oracle "$scratch/record.json" wrong-target; then exit 1; fi
+  runtime_helper=$(sed -n '/^kind_runtime_oracle() {/,/^}/p' scripts/test-ha-managed-bootstrap.sh)
+  [ -n "$runtime_helper" ]; eval "$runtime_helper"
+  jq -n '{containers:[{id:"old",state:"CONTAINER_EXITED",labels:{"io.kubernetes.pod.uid":"old-uid","io.kubernetes.container.name":"sql"}}]}' > "$scratch/cri.json"
+  kind_runtime_oracle "$scratch/cri.json" old-uid old pod-kill
+  jq '.containers[0].state="CONTAINER_RUNNING"' "$scratch/cri.json" > "$scratch/bad.json"
+  if kind_runtime_oracle "$scratch/bad.json" old-uid old pod-kill; then exit 1; fi
+  eval "$(sed -n '/^  controllers=/p' scripts/test-ha-managed-bootstrap.sh)"
+  eval "$(sed -n '/^kind_chaos_profile_valid() {/,/^}/p' scripts/test-ha-managed-bootstrap.sh)"
+  jq -cn --arg ns "$namespace" --arg enabled "$(printf '%s' "$controllers" | jq -r 'join(",")')" '
+    {kind:"Deployment",metadata:{name:"chaos-controller-manager"},spec:{template:{spec:{containers:[{name:"chaos-mesh",env:[{name:"ENABLED_CONTROLLERS",value:$enabled},{name:"CLUSTER_SCOPED",value:"false"},{name:"TARGET_NAMESPACE",value:$ns},{name:"ENABLE_FILTER_NAMESPACE",value:"false"},{name:"ENABLED_WEBHOOKS",value:"podchaos"}]}]}}}},
+    {kind:"DaemonSet",metadata:{name:"chaos-daemon"},spec:{template:{spec:{hostPID:false,containers:[{securityContext:{privileged:false,allowPrivilegeEscalation:false,capabilities:{drop:["ALL"]}},command:["--runtime-socket-path","/host-run/containerd.sock"],volumeMounts:[{name:"socket-path",mountPath:"/host-run"}]}],volumes:[{name:"socket-path",hostPath:{path:"/run/containerd"}}]}}}}
+    , {kind:"RoleBinding",metadata:{name:"test-chaos-controller-manager-target-namespace",namespace:$ns},roleRef:{kind:"ClusterRole",name:"test-chaos-controller-manager-target-namespace"}}
+  ' > "$scratch/profile.jsonl"
+  kind_chaos_profile_valid "$scratch/profile.jsonl"
+  for expression in '(.spec.template.spec.containers[]?.env[]?|select(.name=="TARGET_NAMESPACE").value)=""' '(.spec.template.spec.containers[]?.env[]?|select(.name=="CLUSTER_SCOPED").value)="true"' '(.spec.template.spec.containers[]?.env[]?|select(.name=="ENABLE_FILTER_NAMESPACE").value)="true"' '(.spec.template.spec.containers[]?.env[]?|select(.name=="ENABLED_CONTROLLERS").value)+=",remotecluster"' '(select(.kind=="DaemonSet")|.spec.template.spec.hostPID)=true' '(select(.kind=="DaemonSet")|.spec.template.spec.containers[0].securityContext.privileged)=true' '(select(.kind=="DaemonSet")|.spec.template.spec.volumes)+=[{hostPath:{path:"/sys"}}]' '(select(.kind=="DaemonSet")|.spec.template.spec.containers[0].command[1])="/wrong/socket"'; do
+    jq -c "$expression" "$scratch/profile.jsonl" > "$scratch/bad-profile.jsonl"
+    if kind_chaos_profile_valid "$scratch/bad-profile.jsonl"; then exit 1; fi
+  done
+  if kind_runtime_oracle "$scratch/bad.json" old-uid old container-kill; then exit 1; fi
+  jq '.containers+=[{id:"new",state:"CONTAINER_RUNNING",labels:{"io.kubernetes.pod.uid":"old-uid","io.kubernetes.container.name":"sql"}}]' "$scratch/cri.json" > "$scratch/new.json"
+  kind_runtime_oracle "$scratch/new.json" old-uid old container-kill new
+  if kind_runtime_oracle "$scratch/new.json" old-uid old container-kill wrong-new-id; then exit 1; fi
+  jq '.containers+=[{id:"unexpected-running",state:"CONTAINER_RUNNING",labels:{"io.kubernetes.pod.uid":"old-uid","io.kubernetes.container.name":"sql"}}]' "$scratch/new.json" > "$scratch/bad.json"
+  if kind_runtime_oracle "$scratch/bad.json" old-uid old container-kill new; then exit 1; fi
+  if kind_runtime_oracle "$scratch/new.json" old-uid old pod-kill; then exit 1; fi
+  printf '%s\n' '{"containers":[]}' > "$scratch/absent.json"
+  kind_runtime_oracle "$scratch/absent.json" old-uid old pod-kill
+  printf '%s\n' '{}' > "$scratch/bad.json"
+  if kind_runtime_oracle "$scratch/bad.json" old-uid old pod-kill; then exit 1; fi
+  # Run the actual callback in an errexit child, not in a conditional function.
+  eval "$(sed -n '/^kind_node_guard() {/,/^}/p' scripts/test-ha-managed-bootstrap.sh)"
+  # shellcheck disable=SC2034 # Read by the actual source-extracted node guard.
+  cluster=owned-kind runtime_node=foreign-node node_queries=0
+  # shellcheck disable=SC2329 # Called by the actual source-extracted node guard.
+  docker() { node_queries=$((node_queries+1)); printf '%s\n' wrong-cluster; }
+  if kind_node_guard; then exit 1; fi
+  [ "$node_queries" = 0 ]
+  # shellcheck disable=SC2034 # Read by the actual source-extracted node guard.
+  runtime_node=owned-kind-control-plane
+  if kind_node_guard; then exit 1; fi
+  # shellcheck disable=SC2329 # Called by the actual source-extracted node guard.
+  docker() {
+    case "$3" in
+      *io.x-k8s.kind.cluster*) printf '%s\n' owned-kind ;;
+      *io.x-k8s.kind.role*) printf '%s\n' control-plane ;;
+      *) return 2 ;;
+    esac
+  }
+  kind_node_guard
+  for callback_mode in pass wait-fail delete-fail stale-fault; do
+    callback_exit=0
+    sh -c 'set -eu
+      . scripts/ha-managed-podchaos.sh
+      private=$1 logs=$1 namespace=test-ns release=test-run uid=cluster-uid mode=$2
+      chaos_scope_guard() { :; }
+      chaos_k() {
+        printf "%s\n" "$*" >> "$logs/calls.txt"
+        case "$1:$2" in
+          get:pod) printf "%s\n" '\''{"metadata":{"uid":"pod-uid","labels":{"rhiza.mrchypark.dev/cluster-uid":"cluster-uid"}},"status":{"containerStatuses":[{"name":"sql","ready":true,"containerID":"containerd://old"}]}}'\'' ;;
+          create:*) : ;;
+          wait:*) [ "$mode" != wait-fail ] || return 41 ;;
+          get:pods) printf "%s\n" '\''{"items":[]}'\'' ;;
+          get:podchaos/pod-kill)
+            if [ "${deleted-0}" = 1 ] && [ "$mode" != stale-fault ]; then return 0; fi
+            printf "%s\n" '\''{"metadata":{"namespace":"test-ns","uid":"fault-uid","labels":{"rhiza-ci-run":"test-run"}},"status":{"conditions":[{"type":"AllInjected","status":"True"}],"experiment":{"containerRecords":[{"id":"test-ns/sql-pod","phase":"Injected","injectedCount":1,"recoveredCount":0}]}}}'\'' ;;
+          get:events) printf "%s\n" '\''{"items":[]}'\'' ;;
+          delete:*) [ "$mode" != delete-fail ] || return 43; deleted=1 ;;
+          *) return 49 ;;
+        esac
+      }
+      direct_chaos_fault pod-kill pod-kill sql-pod pod-uid
+      printf "%s\n" callback-completed >> "$logs/calls.txt"
+    ' fixture "$scratch" "$callback_mode" > "$scratch/child-output.txt" 2>&1 || callback_exit=$?
+    case "$callback_mode" in
+      pass) [ "$callback_exit" = 0 ]; grep -Fx callback-completed "$scratch/calls.txt" >/dev/null ;;
+      wait-fail) [ "$callback_exit" = 41 ]; [ "$(cat "$scratch/pod-kill-AllInjected-wait.exit")" = 41 ]; [ -s "$scratch/pod-kill-AllInjected-failure.json" ] ;;
+      delete-fail) [ "$callback_exit" = 43 ] ;;
+      stale-fault) [ "$callback_exit" != 0 ] ;;
+    esac
+    if [ "$callback_mode" != pass ] && grep -Fx callback-completed "$scratch/calls.txt" >/dev/null; then exit 1; fi
+    rm -f "$scratch/calls.txt" "$scratch/pod-kill-AllInjected-wait.exit"
+  done
+  cleanup_helper=$(sed -n '/^cleanup() {/,/^}/p' scripts/test-ha-managed-bootstrap.sh)
+  mkdir "$scratch/cleanup-private"
+  cleanup_exit=0
+  sh -c 'set +e; logs=$1 private=$1/cleanup-private owned=0 built=0; eval "$2"; (exit 17); cleanup' fixture "$scratch" "$cleanup_helper" || cleanup_exit=$?
+  [ "$cleanup_exit" = 17 ] && [ "$(cat "$scratch/driver-original.exit")" = 17 ] && [ "$(cat "$scratch/driver.exit")" = 17 ]
+  [ ! -e "$scratch/cleanup-private" ]
+  printf '%s\n' 'PASS: actual PodChaos request/record/CRI callbacks and failure exit controls'
+  exit 0
+fi
+sh "$0" --podchaos-self-test
 direct=scripts/test-ha-managed-direct-host-chaos.sh
+shared=scripts/ha-managed-podchaos.sh
+bootstrap=scripts/test-ha-managed-bootstrap.sh
 fixture=scripts/ha-managed-bootstrap-fixture.sh
 candidate=.github/workflows/ha-managed-candidate-image.yml
 chaos=.github/workflows/ha-managed-cluster-chaos.yml
 operator_builder=pkg/operator/bootstrap_members_v1alpha2.go
 operator_initializer=pkg/operator/initializer_v1alpha2.go
-for source in "$direct" "$fixture" scripts/test-ha-managed-direct-host-chaos-test.sh; do sh -n "$source"; done
+for source in "$direct" "$shared" "$bootstrap" "$fixture" scripts/test-ha-managed-direct-host-chaos-test.sh; do sh -n "$source"; done
 scratch=$(mktemp -d "${TMPDIR:-/tmp}/rhiza-direct-chaos-oracles.XXXXXX")
 cleanup_test() {
   rm -f "$scratch/old-id" "$scratch/new-id" "$scratch/same-a" "$scratch/same-b" "$scratch/preflight-list.json" "$scratch/bucket-contract_test.go" "$scratch/bucket-overlay.json"
@@ -119,10 +231,11 @@ grep -Fq 'main["command"] = []string{"/usr/local/bin/rhiza-ha-init"}' "$operator
 grep -Fq 'podSpec, err := V1Alpha2ManagedSQLPodSpec' "$operator_initializer"
 grep -Fq 'name=="rhizaclusters" and .kind=="RhizaCluster"' "$direct"
 grep -Fq 'create podchaos.chaos-mesh.org' "$direct"
-grep -Fq 'AllInjected' "$direct"
-if grep -Fq 'AllRecovered' "$direct"; then echo 'one-shot kill waits for unsupported pre-delete recovery condition' >&2; exit 1; fi
-grep -Fq 'metadata.uid!=$old_uid' "$direct"
-grep -Fq 'containerID!=$old' "$direct"
+grep -Fq '. scripts/ha-managed-podchaos.sh' "$direct"
+grep -Fq 'AllInjected' "$shared"
+if grep -Fq 'AllRecovered' "$shared"; then echo 'one-shot kill waits for unsupported pre-delete recovery condition' >&2; exit 1; fi
+grep -Fq 'metadata.uid!=$old_uid' "$shared"
+grep -Fq 'containerID!=$old' "$shared"
 grep -Fq 'voter-identity.json' "$direct"
 grep -Fq 'rhiza-prepare-identity' "$direct"
 grep -Fq 'rhiza-await-bootstrap-plan' "$direct"

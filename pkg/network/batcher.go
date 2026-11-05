@@ -1,6 +1,7 @@
 package network
 
 import (
+	"bytes"
 	"context"
 	"sync"
 	"time"
@@ -51,9 +52,11 @@ type mutationBatcher[T any] struct {
 	propose    func(context.Context, []byte) (quepaxa.Slot, error)
 	apply      func(context.Context, quepaxa.Slot) error
 	encodeItem func(T) ([]byte, error)
-	assemble   func([][]byte) []byte
+	assemble   func([][]byte) ([]byte, error)
 	requestID  func(T) string
 	baseSize   int
+	valueLimit int
+	batchLimit int
 	input      chan *batchItem
 	jobs       chan batchJob
 	inflight   chan struct{}
@@ -67,12 +70,35 @@ type mutationBatcher[T any] struct {
 	inflightB  int
 }
 
+func (b *mutationBatcher[T]) encodedValueLimit() int {
+	if b.valueLimit == 0 {
+		return quepaxa.MaxReplicatedValueBytes
+	}
+	return b.valueLimit
+}
+
+func (b *mutationBatcher[T]) commandBatchLimit() int {
+	if b.batchLimit == 0 {
+		return maxMutationBatch
+	}
+	return b.batchLimit
+}
+
 func newMutationBatcher[T any](propose func(context.Context, []byte) (quepaxa.Slot, error), apply func(context.Context, quepaxa.Slot) error, encodeItem func(T) ([]byte, error), assemble func([][]byte) []byte, requestID func(T) string) *mutationBatcher[T] {
+	return newMutationBatcherWithAssembly(propose, apply, encodeItem, func(items [][]byte) ([]byte, error) { return assemble(items), nil }, len(assemble(nil)), requestID)
+}
+
+func newMutationBatcherWithAssembly[T any](propose func(context.Context, []byte) (quepaxa.Slot, error), apply func(context.Context, quepaxa.Slot) error, encodeItem func(T) ([]byte, error), assemble func([][]byte) ([]byte, error), envelopeBytes int, requestID func(T) string) *mutationBatcher[T] {
+	return newMutationBatcherWithLimits(propose, apply, encodeItem, assemble, envelopeBytes, requestID, quepaxa.MaxReplicatedValueBytes, maxMutationBatch)
+}
+
+func newMutationBatcherWithLimits[T any](propose func(context.Context, []byte) (quepaxa.Slot, error), apply func(context.Context, quepaxa.Slot) error, encodeItem func(T) ([]byte, error), assemble func([][]byte) ([]byte, error), envelopeBytes int, requestID func(T) string, valueLimit, batchLimit int) *mutationBatcher[T] {
 	ctx, cancel := context.WithCancel(context.Background())
 	b := &mutationBatcher[T]{
 		propose: propose, apply: apply, encodeItem: encodeItem, assemble: assemble, requestID: requestID,
-		baseSize: len(assemble(nil)),
-		input:    make(chan *batchItem, maxQueuedRequests), jobs: make(chan batchJob), inflight: make(chan struct{}, maxInflightBatches),
+		baseSize:   envelopeBytes,
+		valueLimit: valueLimit, batchLimit: batchLimit,
+		input: make(chan *batchItem, maxQueuedRequests), jobs: make(chan batchJob), inflight: make(chan struct{}, maxInflightBatches),
 		ctx: ctx, cancel: cancel,
 	}
 	b.wg.Add(1 + maxInflightBatches)
@@ -88,11 +114,30 @@ func newSQLBatcher(propose func(context.Context, []byte) (quepaxa.Slot, error), 
 }
 
 func newGraphBatcher(propose func(context.Context, []byte) (quepaxa.Slot, error), apply func(context.Context, quepaxa.Slot) error) *mutationBatcher[types.GraphCommand] {
+	if localtesthooks.Enabled {
+		localtesthooks.Hit("network:graph-batcher:ordinary-constructor")
+	}
 	return newMutationBatcher(propose, apply, types.EncodeGraphBatchItem, types.AssembleGraphBatch, func(command types.GraphCommand) string { return command.RequestID })
+}
+
+func newManagedGraphBatcher(propose func(context.Context, []byte) (quepaxa.Slot, error), apply func(context.Context, quepaxa.Slot) error) *mutationBatcher[types.GraphCommand] {
+	if localtesthooks.Enabled {
+		localtesthooks.Hit("network:graph-batcher:managed-constructor")
+	}
+	return newMutationBatcherWithLimits(propose, apply, PrepareManagedGraphExecution, func(items [][]byte) ([]byte, error) {
+		if len(items) != 1 {
+			return nil, ErrInvalidRequest
+		}
+		return bytes.Clone(items[0]), nil
+	}, 0, func(command types.GraphCommand) string { return command.RequestID }, types.MaxManagedGraphExecutionBytes, 1)
 }
 
 func newKVBatcher(propose func(context.Context, []byte) (quepaxa.Slot, error), apply func(context.Context, quepaxa.Slot) error) *mutationBatcher[types.KVCommand] {
 	return newMutationBatcher(propose, apply, types.EncodeKVBatchItem, types.AssembleKVBatch, func(command types.KVCommand) string { return command.RequestID })
+}
+
+func newManagedKVBatcher(propose func(context.Context, []byte) (quepaxa.Slot, error), apply func(context.Context, quepaxa.Slot) error) *mutationBatcher[types.KVCommand] {
+	return newMutationBatcherWithAssembly(propose, apply, types.EncodeManagedKVBatchItem, types.AssembleManagedKVBatch, 7, func(command types.KVCommand) string { return command.RequestID })
 }
 
 func (b *mutationBatcher[T]) submit(ctx context.Context, command T, leases ...*mutationLease) (quepaxa.Slot, error) {
@@ -104,7 +149,7 @@ func (b *mutationBatcher[T]) submit(ctx context.Context, command T, leases ...*m
 }
 
 func (b *mutationBatcher[T]) submitEncoded(ctx context.Context, command T, encoded []byte, leases ...*mutationLease) (quepaxa.Slot, error) {
-	if b.baseSize+len(encoded) > quepaxa.MaxReplicatedValueBytes {
+	if b.baseSize+len(encoded) > b.encodedValueLimit() {
 		return 0, ErrInvalidRequest
 	}
 	item := &batchItem{
@@ -197,7 +242,7 @@ func (b *mutationBatcher[T]) run() {
 		ewmaRate, lastArrival = observeArrivalRate(ewmaRate, lastArrival, now, len(first.encoded))
 
 	collect:
-		for len(items) < maxMutationBatch {
+		for len(items) < b.commandBatchLimit() {
 			if encodedSize >= targetBatchBytes {
 				break
 			}
@@ -206,7 +251,7 @@ func (b *mutationBatcher[T]) run() {
 				b.releaseQueue(next.reserved)
 				now = time.Now()
 				ewmaRate, lastArrival = observeArrivalRate(ewmaRate, lastArrival, now, len(next.encoded))
-				if encodedSize+1+len(next.encoded) > quepaxa.MaxReplicatedValueBytes {
+				if encodedSize+1+len(next.encoded) > b.encodedValueLimit() {
 					carry = next
 					break collect
 				}
@@ -228,7 +273,7 @@ func (b *mutationBatcher[T]) run() {
 				b.releaseQueue(next.reserved)
 				now = time.Now()
 				ewmaRate, lastArrival = observeArrivalRate(ewmaRate, lastArrival, now, len(next.encoded))
-				if encodedSize+1+len(next.encoded) > quepaxa.MaxReplicatedValueBytes {
+				if encodedSize+1+len(next.encoded) > b.encodedValueLimit() {
 					carry = next
 					break collect
 				}
@@ -322,7 +367,15 @@ func (b *mutationBatcher[T]) dispatch(items []*batchItem, encoded [][]byte) {
 	if len(active) == 0 {
 		return
 	}
-	value := b.assemble(activeEncoded)
+	value, err := b.assemble(activeEncoded)
+	if err != nil {
+		b.fail(active, err)
+		return
+	}
+	if len(value) == 0 || len(value) > b.encodedValueLimit() {
+		b.fail(active, ErrInvalidRequest)
+		return
+	}
 	b.inflight <- struct{}{}
 	b.budgetMu.Lock()
 	if len(value) > maxInflightEncodedByte-b.inflightB {

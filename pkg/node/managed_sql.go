@@ -12,9 +12,11 @@ import (
 	"time"
 
 	objectstore "github.com/mrchypark/rhiza/internal/objstore"
+	"github.com/mrchypark/rhiza/internal/sqlpolicy"
 	"github.com/mrchypark/rhiza/internal/types"
 	"github.com/mrchypark/rhiza/pkg/materializer"
 	"github.com/mrchypark/rhiza/pkg/network"
+	"github.com/mrchypark/rhiza/pkg/quepaxa"
 	"github.com/mrchypark/rhiza/pkg/recovery"
 	"github.com/thanos-io/objstore"
 )
@@ -50,6 +52,12 @@ func (n *Node) managedLearnReady() bool {
 		log.Printf("managed QUIC Learned refused stage=runtime opened=%t verified=%t", n.opened.Load(), n.managedPeerVerified.Load())
 		return false
 	}
+	if n.internalApplicationProfile() {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		_, err := n.checkInternalApplicationRuntime(ctx)
+		return err == nil
+	}
 	checker, ok := n.managedStartup.Checker.(ManagedPeerLearnChecker)
 	if !ok {
 		return n.Ready()
@@ -64,7 +72,33 @@ func (n *Node) managedLearnReady() bool {
 }
 
 func (n *Node) CheckManagedLocalRead(ctx context.Context) error {
-	if _, err := n.ManagedState(); err != nil {
+	if n.internalApplicationProfile() {
+		_, scoped, release, err := n.borrowInternalApplication(ctx)
+		if err != nil {
+			return err
+		}
+		defer release()
+		ctx = scoped
+	}
+	if n.internalApplicationProfile() {
+		if _, err := n.checkInternalApplicationRuntime(ctx); err != nil {
+			return err
+		}
+		if !n.managedInitiallyAdmitted.Load() || !n.core.IsVoter() {
+			return network.ErrNotReady
+		}
+		if err := n.material.ValidateManagedLocalSchema(ctx); err != nil {
+			return err
+		}
+		if n.materializationPolicy() == sqlpolicy.ManagedGraphRequestMaterializationPolicy {
+			if !n.managedGraphInitialRootComplete() {
+				return network.ErrNotReady
+			}
+			return n.material.ProjectionReadable(ctx)
+		}
+		return nil
+	}
+	if _, err := n.managedStateWithContext(ctx); err != nil {
 		return err
 	}
 	if !n.managedInitiallyAdmitted.Load() {
@@ -75,7 +109,10 @@ func (n *Node) CheckManagedLocalRead(ctx context.Context) error {
 	if !n.core.IsVoter() {
 		return network.ErrNotReady
 	}
-	state := n.managedRuntimeState()
+	state, err := n.managedRuntimeStateWithContext(ctx)
+	if err != nil {
+		return err
+	}
 	checker, ok := n.managedStartup.Checker.(ManagedSQLReadChecker)
 	if !ok {
 		return network.ErrNotReady
@@ -104,11 +141,18 @@ func (n *Node) managedSQLBucket(ctx context.Context) (*objectstore.MeteredBucket
 }
 
 func (n *Node) managedSQLScope(i ManagedStartupIdentity) ([]byte, string, error) {
-	source, _, err := n.preparedBindingDigests()
+	policy, _, err := types.ManagedApplicationPolicy(i.ApplicationProtocol)
+	if err != nil {
+		return nil, "", err
+	}
+	if managedSQLKVPolicy(policy) && (i.Member.Generation != 0 || i.EvidenceFormat != i.ApplicationProtocol) {
+		return nil, "", fmt.Errorf("unsupported managed application generation or evidence format")
+	}
+	source, _, err := n.preparedBindingDigestsForProtocol(i.ApplicationProtocol)
 	if err != nil || source != i.PhysicalBinding {
 		return nil, "", errors.Join(fmt.Errorf("initial SQL physical binding mismatch"), err)
 	}
-	common, err := n.ManagedBootstrapPlanDigest(source, i.EvidenceFormat)
+	common, err := n.ManagedBootstrapPlanDigestForProtocol(source, i.EvidenceFormat, i.ApplicationProtocol)
 	if err != nil || common != i.BootstrapPlanDigest {
 		return nil, "", errors.Join(fmt.Errorf("initial SQL bootstrap binding mismatch"), err)
 	}
@@ -223,7 +267,12 @@ func (n *Node) VerifyManagedSQLFreshSource(ctx context.Context, i ManagedStartup
 	if err != nil {
 		return err
 	}
-	view, err := recovery.OpenReadOnlyView(ctx, source, prefix, 1, *n.loadClusterConfig())
+	var view *recovery.ReadOnlyView
+	if isManagedAppendOnlyProtocol(n.managedApplicationProtocol()) {
+		view, err = recovery.OpenReadOnlyViewForApplicationProtocol(ctx, source, prefix, 1, *n.loadClusterConfig(), n.materializationPolicy(), n.receiptWindow(), n.managedApplicationProtocol(), n.config.EnableReconfiguration)
+	} else {
+		view, err = recovery.OpenReadOnlyViewForPolicyWithReconfiguration(ctx, source, prefix, 1, *n.loadClusterConfig(), n.materializationPolicy(), n.receiptWindow(), n.config.EnableReconfiguration)
+	}
 	if err != nil {
 		return err
 	}
@@ -265,39 +314,189 @@ func (n *Node) InspectManagedSQLRead(ctx context.Context) (ManagedSQLSnapshot, e
 }
 
 func (n *Node) inspectManagedSQL(ctx context.Context, fresh, localRead bool) (ManagedSQLSnapshot, error) {
-	if _, err := n.ManagedState(); err != nil {
-		return ManagedSQLSnapshot{}, err
+	if n.materializationPolicy() != sqlpolicy.LegacyMaterializationPolicy {
+		return ManagedSQLSnapshot{}, fmt.Errorf("mixed runtime requires mixed application evidence")
+	}
+	digest, empty, runtime, err := n.inspectManagedApplication(ctx, fresh, localRead)
+	return ManagedSQLSnapshot{Application: materializer.SQLApplicationState{Digest: digest, FreshEmpty: empty}, Runtime: runtime}, err
+}
+
+type ManagedKVSnapshot struct {
+	Application materializer.ManagedApplicationState
+	Runtime     ManagedRuntimeState
+}
+
+// InspectManagedKV is mixed evidence only, not public request status or ACK.
+func (n *Node) InspectManagedKV(ctx context.Context, fresh bool) (ManagedKVSnapshot, error) {
+	return n.inspectManagedKV(ctx, fresh, false)
+}
+
+func (n *Node) InspectManagedKVRead(ctx context.Context) (ManagedKVSnapshot, error) {
+	return n.inspectManagedKV(ctx, false, true)
+}
+
+func (n *Node) inspectManagedKV(ctx context.Context, fresh, localRead bool) (ManagedKVSnapshot, error) {
+	if !managedSQLKVPolicy(n.materializationPolicy()) {
+		return ManagedKVSnapshot{}, fmt.Errorf("mixed evidence requires the mixed application profile")
+	}
+	digest, empty, runtime, err := n.inspectManagedApplication(ctx, fresh, localRead)
+	return ManagedKVSnapshot{Application: materializer.ManagedApplicationState{Digest: digest, FreshEmpty: empty}, Runtime: runtime}, err
+}
+
+func (n *Node) inspectApplicationState(ctx context.Context, m *materializer.Materializer) ([32]byte, bool, error) {
+	if managedSQLKVPolicy(n.materializationPolicy()) {
+		if m.MaterializationPolicy() != n.materializationPolicy() {
+			return [32]byte{}, false, sqlpolicy.ErrIncompatible
+		}
+		state, err := m.InspectManagedApplicationState(ctx)
+		return state.Digest, state.FreshEmpty, err
+	}
+	state, err := m.InspectSQLApplicationState(ctx)
+	return state.Digest, state.FreshEmpty, err
+}
+
+// This reports only the inspector's observed progress, never application data.
+func managedEvidenceRuntimeDiagnostic(reason string, before, after ManagedRuntimeState, err error) string {
+	if err == nil {
+		return ""
+	}
+	switch reason {
+	case "unresolved_history":
+		return fmt.Sprintf("MANAGED_EVIDENCE_RUNTIME_FAILURE reason=%s recorded=%d certified=%d applied=%d", reason, before.RecorderTip, before.CertifiedTip, before.AppliedTip)
+	case "snapshot_changed":
+		return fmt.Sprintf("MANAGED_EVIDENCE_RUNTIME_FAILURE reason=%s before_recorded=%d before_certified=%d before_applied=%d after_recorded=%d after_certified=%d after_applied=%d", reason, before.RecorderTip, before.CertifiedTip, before.AppliedTip, after.RecorderTip, after.CertifiedTip, after.AppliedTip)
+	default:
+		return ""
+	}
+}
+func logManagedEvidenceRuntimeFailure(reason string, before, after ManagedRuntimeState, err error) error {
+	if line := managedEvidenceRuntimeDiagnostic(reason, before, after, err); line != "" {
+		log.Print(line)
+	}
+	return err
+}
+
+type managedInitialAdmissionCut struct {
+	state   ManagedRuntimeState
+	prefix  [32]byte
+	floor   quepaxa.Slot
+	root    [32]byte
+	hasRoot bool
+}
+
+func (n *Node) initialAdmissionCutCurrent(cut managedInitialAdmissionCut, state ManagedRuntimeState) bool {
+	floor, root, hasRoot := n.core.RecoveryRoot()
+	prefix, ok := n.core.PrefixHash(quepaxa.Slot(cut.state.CertifiedTip))
+	if cut.state.CertifiedTip == 0 {
+		ok = cut.floor == 0 && !cut.hasRoot && cut.prefix == ([32]byte{})
+		prefix = [32]byte{}
+	}
+	return state.WALIdentity == cut.state.WALIdentity && state.ExistingRegisteredWAL == cut.state.ExistingRegisteredWAL &&
+		state.CertifiedTip == cut.state.CertifiedTip && state.AppliedTip == cut.state.AppliedTip &&
+		state.RecorderTip >= cut.state.RecorderTip && floor == cut.floor && root == cut.root && hasRoot == cut.hasRoot && ok && prefix == cut.prefix
+}
+
+// ValidateManagedInitialAdmission checks the caller's already-resolved initial
+// cut. It admits no operation and never treats a later recorder ISR as certified.
+func (n *Node) ValidateManagedInitialAdmission(ctx context.Context, identity ManagedStartupIdentity, state ManagedRuntimeState) error {
+	binding, ctx, release, err := n.borrowInternalApplication(ctx)
+	if err != nil {
+		return err
+	}
+	defer release()
+	if !isManagedAppendOnlyProtocol(n.managedApplicationProtocol()) || binding.identity != identity || state.WALIdentity == "" || state.AppliedTip != state.CertifiedTip || state.RecorderTip > state.CertifiedTip {
+		return fmt.Errorf("initial admission lacks its resolved runtime cut")
+	}
+	cut := managedInitialAdmissionCut{state: state}
+	cut.floor, cut.root, cut.hasRoot = n.core.RecoveryRoot()
+	var ok bool
+	cut.prefix, ok = n.core.PrefixHash(quepaxa.Slot(state.CertifiedTip))
+	if state.CertifiedTip == 0 {
+		ok = cut.floor == 0 && !cut.hasRoot
+		cut.prefix = [32]byte{}
+	}
+	if !ok || uint64(cut.floor) > state.CertifiedTip {
+		return fmt.Errorf("initial admission certified prefix is unavailable")
+	}
+	_, _, runtime, err := n.inspectManagedApplicationAtCut(ctx, false, false, &cut)
+	if err != nil {
+		return err
+	}
+	if n.materializationPolicy() == sqlpolicy.ManagedGraphRequestMaterializationPolicy {
+		if _, err := n.material.ManagedGraphHistory(ctx); err != nil {
+			return errors.Join(fmt.Errorf("Graph lineage changed or is not fresh"), err)
+		}
+	}
+	current, err := n.checkInternalApplicationRuntime(ctx)
+	if err != nil {
+		return err
+	}
+	if runtime.WALIdentity != state.WALIdentity || !n.initialAdmissionCutCurrent(cut, current) || binding != n.internalApplication.Load() || binding.identity != identity || binding.lifetime == nil || binding.lifetime.Err() != nil || !n.core.IsVoter() {
+		return fmt.Errorf("initial admission runtime cut changed")
+	}
+	return ctx.Err()
+}
+
+func (n *Node) inspectManagedApplication(ctx context.Context, fresh, localRead bool) ([32]byte, bool, ManagedRuntimeState, error) {
+	return n.inspectManagedApplicationAtCut(ctx, fresh, localRead, nil)
+}
+
+func (n *Node) inspectManagedApplicationAtCut(ctx context.Context, fresh, localRead bool, initial *managedInitialAdmissionCut) (digest [32]byte, empty bool, runtime ManagedRuntimeState, resultErr error) {
+	if n.internalApplicationProfile() {
+		_, scoped, release, err := n.borrowInternalApplication(ctx)
+		if err != nil {
+			return [32]byte{}, false, ManagedRuntimeState{}, err
+		}
+		defer release()
+		ctx = scoped
+	}
+	// Keep one certified-prefix/adoption check for both evidence domains.
+	fail := func(err error) ([32]byte, bool, ManagedRuntimeState, error) {
+		return [32]byte{}, false, ManagedRuntimeState{}, err
+	}
+	if _, err := n.managedStateWithContext(ctx); err != nil {
+		return fail(err)
 	}
 	if !localRead {
 		if err := n.replayLocalDecisions(ctx); err != nil {
-			return ManagedSQLSnapshot{}, err
+			return fail(err)
 		}
 	}
 	n.replayMu.Lock()
 	defer n.replayMu.Unlock()
-	before := n.managedRuntimeState()
+	before, err := n.managedRuntimeStateWithContext(ctx)
+	if err != nil {
+		return fail(err)
+	}
 	floor := n.core.CompactionFloor()
+	if fresh && managedSQLKVPolicy(n.materializationPolicy()) && floor != 0 {
+		return fail(fmt.Errorf("compacted application history is not fresh-state proof"))
+	}
 	if floor > 0 {
 		adoption := n.managedStartup.verifiedAdoption
 		if adoption == nil || adoption.BaseSeal == nil || adoption.WALIdentity != before.WALIdentity {
-			return ManagedSQLSnapshot{}, fmt.Errorf("SQL host requires a verified prepared checkpoint adoption")
+			return fail(fmt.Errorf("managed host requires a verified prepared checkpoint adoption"))
 		}
 		base, root, ok := n.core.RecoveryRoot()
 		prefix, prefixOK := n.core.PrefixHash(adoption.BaseSeal.Index)
 		adoptedPrefix, adoptedOK := n.core.PrefixHash(adoption.Tip)
 		membership, membershipErr := n.core.MembershipHistory()
 		if !ok || base != adoption.BaseSeal.Index || root != adoption.BaseSeal.RootHash || !prefixOK || prefix != adoption.BaseSeal.PrefixHash || !adoptedOK || adoptedPrefix != adoption.PrefixHash || n.core.Tip() < adoption.Tip || membershipErr != nil || adoption.Membership == nil || !membershipHistoryHasPrefix(*adoption.Membership, membership) {
-			return ManagedSQLSnapshot{}, errors.Join(fmt.Errorf("SQL host checkpoint adoption no longer matches actual WAL"), membershipErr)
+			return fail(errors.Join(fmt.Errorf("managed host checkpoint adoption no longer matches actual WAL"), membershipErr))
 		}
 	}
-	if before.WALIdentity == "" || before.AppliedTip > before.CertifiedTip || !localRead && (before.RecorderTip > before.CertifiedTip || before.AppliedTip != before.CertifiedTip) {
-		return ManagedSQLSnapshot{}, fmt.Errorf("SQL host requires registered, resolved history")
+	resolved := before.WALIdentity != "" && before.AppliedTip <= before.CertifiedTip && (localRead || before.RecorderTip <= before.CertifiedTip && before.AppliedTip == before.CertifiedTip)
+	if initial != nil && !fresh && !localRead {
+		resolved = n.initialAdmissionCutCurrent(*initial, before)
+	}
+	if !resolved {
+		return fail(logManagedEvidenceRuntimeFailure("unresolved_history", before, ManagedRuntimeState{}, fmt.Errorf("managed host requires registered, resolved history")))
 	}
 	from := floor + 1
 	for uint64(from) <= before.AppliedTip {
 		values, _, err := n.core.DecisionsFrom(from, 256)
 		if err != nil || len(values) == 0 {
-			return ManagedSQLSnapshot{}, fmt.Errorf("SQL history unavailable: %w", err)
+			return fail(fmt.Errorf("managed history unavailable: %w", err))
 		}
 		for _, v := range values {
 			if uint64(v.Slot) > before.AppliedTip {
@@ -305,13 +504,25 @@ func (n *Node) inspectManagedSQL(ctx context.Context, fresh, localRead bool) (Ma
 			}
 			if uint64(v.Slot) == before.AppliedTip {
 				if err := n.material.ValidateTip(before.AppliedTip, v.Value); err != nil {
-					return ManagedSQLSnapshot{}, err
+					return fail(err)
 				}
 			}
 			if len(v.Value) != 0 {
+				if managedSQLKVPolicy(n.materializationPolicy()) {
+					if err := n.validateExecutionPolicy(v.Value); err != nil {
+						return fail(err)
+					}
+					if fresh {
+						if err := managedSQLControlOnly(v.Value); err != nil {
+							return fail(err)
+						}
+					}
+					from = v.Slot + 1
+					continue
+				}
 				_, sql, err := types.DecodeSQLBatch(v.Value)
 				if err != nil || sql && fresh {
-					return ManagedSQLSnapshot{}, fmt.Errorf("application history prevents fresh SQL initialization")
+					return fail(fmt.Errorf("application history prevents fresh SQL initialization"))
 				}
 				if !sql {
 					_, schedule, e1 := types.DecodeLeaderSchedule(v.Value)
@@ -319,28 +530,56 @@ func (n *Node) inspectManagedSQL(ctx context.Context, fresh, localRead bool) (Ma
 					_, seal, e3 := types.DecodeCheckpointSeal(v.Value)
 					reconfig, e4 := types.DecodeReconfiguration(v.Value)
 					if e1 != nil || e2 != nil || e3 != nil || e4 != nil || !(schedule || barrier || seal || reconfig) {
-						return ManagedSQLSnapshot{}, fmt.Errorf("non-SQL application history")
+						return fail(fmt.Errorf("non-SQL application history"))
 					}
 				}
 			}
 			from = v.Slot + 1
 		}
 	}
-	app, err := n.material.InspectSQLApplicationState(ctx)
+	digest, empty, err = n.inspectApplicationState(ctx, n.material)
 	if err != nil {
-		return ManagedSQLSnapshot{}, err
+		return fail(err)
 	}
-	if fresh && !app.FreshEmpty {
-		return ManagedSQLSnapshot{}, fmt.Errorf("application state is not fresh empty")
+	if fresh && !empty {
+		return fail(fmt.Errorf("application state is not fresh empty"))
 	}
-	if before != n.managedRuntimeState() {
-		return ManagedSQLSnapshot{}, fmt.Errorf("history changed during SQL inspection")
+	after, err := n.managedRuntimeStateWithContext(ctx)
+	if err != nil {
+		return fail(err)
 	}
-	return ManagedSQLSnapshot{Application: app, Runtime: before}, nil
+	unchanged := before == after
+	if initial != nil && !fresh && !localRead {
+		unchanged = n.initialAdmissionCutCurrent(*initial, before) && n.initialAdmissionCutCurrent(*initial, after)
+	}
+	if !unchanged {
+		return fail(logManagedEvidenceRuntimeFailure("snapshot_changed", before, after, fmt.Errorf("history changed during application inspection")))
+	}
+	return digest, empty, before, nil
 }
 
 func (n *Node) ExecuteManagedSQL(ctx context.Context, req network.ExecuteRequest) (network.ExecuteResponse, error) {
-	state, err := n.ManagedState()
+	if n.internalApplicationProfile() {
+		_, scoped, release, err := n.borrowInternalApplication(ctx)
+		if err != nil {
+			return network.ExecuteResponse{}, err
+		}
+		defer release()
+		ctx = scoped
+	}
+	if n.internalApplicationProfile() {
+		if err := network.ValidateExecuteRequest(req); err != nil {
+			return network.ExecuteResponse{}, err
+		}
+		if err := n.admitInternalApplication(ctx); err != nil {
+			return network.ExecuteResponse{}, err
+		}
+		if err := n.recordManagedApplicationStart(ctx); err != nil {
+			return network.ExecuteResponse{}, err
+		}
+		return n.server.Execute(ctx, req)
+	}
+	state, err := n.managedStateWithContext(ctx)
 	if err != nil {
 		return network.ExecuteResponse{}, err
 	}
@@ -354,22 +593,54 @@ func (n *Node) ExecuteManagedSQL(ctx context.Context, req network.ExecuteRequest
 	if err := checker.ValidateManagedSQLWrite(ctx, n.managedStartup.Identity, state, req); err != nil {
 		return network.ExecuteResponse{}, err
 	}
-	want, prefix, err := n.managedSQLScope(n.managedStartup.Identity)
-	if err != nil {
+	if err := n.recordManagedApplicationStart(ctx); err != nil {
 		return network.ExecuteResponse{}, err
-	}
-	claimed, err := readVoterRegistration(ctx, n.bucket, path.Join(prefix, "voters/managed-sql-initialization.json"))
-	if err != nil || !bytes.Equal(claimed, want) {
-		return network.ExecuteResponse{}, errors.Join(fmt.Errorf("exact initial SQL namespace provenance required before execution"), err)
-	}
-	if err := matchVoterRegistration(ctx, n.bucket, path.Join(prefix, "voters/managed-sql-application-start.json"), want, nil); err != nil {
-		return network.ExecuteResponse{}, fmt.Errorf("record irreversible SQL application start: %w", err)
 	}
 	return n.server.Execute(ctx, req)
 }
 
+func (n *Node) recordManagedApplicationStart(ctx context.Context) error {
+	want, prefix, err := n.managedSQLScope(n.managedStartup.Identity)
+	if err != nil {
+		return err
+	}
+	claimed, err := readVoterRegistration(ctx, n.bucket, path.Join(prefix, "voters/managed-sql-initialization.json"))
+	if err != nil || !bytes.Equal(claimed, want) {
+		return errors.Join(fmt.Errorf("exact initial SQL namespace provenance required before execution"), err)
+	}
+	if err := matchVoterRegistration(ctx, n.bucket, path.Join(prefix, "voters/managed-sql-application-start.json"), want, nil); err != nil {
+		return fmt.Errorf("record irreversible SQL application start: %w", err)
+	}
+	return nil
+}
+
 func (n *Node) ResolveManagedSQL(ctx context.Context, req network.ExecuteRequest) (network.ResolveExecuteResult, error) {
-	if _, err := n.ManagedState(); err != nil {
+	if n.internalApplicationProfile() {
+		_, scoped, release, err := n.borrowInternalApplication(ctx)
+		if err != nil {
+			return network.ResolveExecuteResult{}, err
+		}
+		defer release()
+		ctx = scoped
+	}
+	if n.internalApplicationProfile() {
+		if err := network.ValidateExecuteRequest(req); err != nil {
+			return network.ResolveExecuteResult{}, err
+		}
+		resolved, err := n.ResolveRequest(ctx, "sql", req.RequestID)
+		if err != nil {
+			return network.ResolveExecuteResult{State: network.ResolveExecuteUnknownOrExpired, Durability: network.ResolveExecuteDurabilityUnknown}, err
+		}
+		fingerprint, err := types.SQLFingerprint(types.SQLCommand{RequestID: req.RequestID, SQL: req.SQL, Args: req.Args, WantRows: req.WantRows, RequireOne: req.RequireOne, Statements: req.Statements})
+		if err != nil {
+			return network.ResolveExecuteResult{}, err
+		}
+		if fingerprint != resolved.Original.Fingerprint {
+			return network.ResolveExecuteResult{}, network.ErrRequestConflict
+		}
+		return network.ResolveExecuteResult{State: network.ResolveExecuteRetained, Receipt: &resolved.Receipt, Statements: resolved.Statements, Durability: network.ResolveExecuteDurabilityConfirmed}, nil
+	}
+	if _, err := n.managedStateWithContext(ctx); err != nil {
 		return network.ResolveExecuteResult{}, err
 	}
 	result, err := n.server.ResolveExecute(ctx, req)
@@ -390,7 +661,10 @@ func (n *Node) ResolveManagedSQL(ctx context.Context, req network.ExecuteRequest
 	if err := n.replayLocalDecisions(ctx); err != nil {
 		return result, err
 	}
-	state := n.managedRuntimeState()
+	state, err := n.managedRuntimeStateWithContext(ctx)
+	if err != nil {
+		return result, err
+	}
 	if state.CertifiedTip < uint64(target) || state.AppliedTip != state.CertifiedTip || state.RecorderTip > state.CertifiedTip {
 		return result, fmt.Errorf("managed SQL recovery has unresolved certified history")
 	}
@@ -401,18 +675,65 @@ func (n *Node) ResolveManagedSQL(ctx context.Context, req network.ExecuteRequest
 }
 
 func (n *Node) QueryManagedSQL(ctx context.Context, req network.QueryRequest) (network.QueryResponse, error) {
+	if n.internalApplicationProfile() {
+		ctx = context.WithValue(ctx, managedSQLQueryDiagnosticKey{}, true)
+		_, scoped, release, err := n.borrowInternalApplication(ctx)
+		if err != nil {
+			return network.QueryResponse{}, logManagedSQLQueryFailure(ctx, "node_borrow", err)
+		}
+		defer release()
+		ctx = scoped
+	}
 	if req.Consistency != "" && req.Consistency != "local" && req.Consistency != "linearizable" {
 		return network.QueryResponse{}, fmt.Errorf("%w: consistency must be local or linearizable", network.ErrInvalidRequest)
 	}
 	if err := n.CheckManagedLocalRead(ctx); err != nil {
-		return network.QueryResponse{}, err
+		return network.QueryResponse{}, logManagedSQLQueryFailure(ctx, "node_local_read", err)
 	}
 	if req.Consistency == "linearizable" {
-		if err := n.managedStartup.Checker.ValidateManagedAdmission(ctx, n.managedStartup.Identity, n.managedRuntimeState()); err != nil {
+		if n.internalApplicationProfile() {
+			if err := n.admitInternalApplication(ctx); err != nil {
+				return network.QueryResponse{}, logManagedSQLQueryFailure(ctx, "node_admission", err)
+			}
+			response, err := n.server.Query(ctx, req)
+			return response, logManagedSQLQueryFailure(ctx, "node_server", err)
+		}
+		state, err := n.managedRuntimeStateWithContext(ctx)
+		if err != nil {
+			return network.QueryResponse{}, err
+		}
+		if err := n.managedStartup.Checker.ValidateManagedAdmission(ctx, n.managedStartup.Identity, state); err != nil {
 			return network.QueryResponse{}, err
 		}
 	}
 	// The private server retains its lifecycle/read limits and enforces the
 	// quorum ReadIndex barrier only for explicit linearizable queries.
-	return n.server.Query(ctx, req)
+	response, err := n.server.Query(ctx, req)
+	return response, logManagedSQLQueryFailure(ctx, "node_server", err)
+}
+
+type managedSQLQueryDiagnosticKey struct{}
+
+func managedSQLQueryDiagnostic(ctx context.Context, stage string) string {
+	if enabled, _ := ctx.Value(managedSQLQueryDiagnosticKey{}).(bool); !enabled {
+		return ""
+	}
+	switch stage {
+	case "node_borrow", "node_local_read", "node_admission", "node_server",
+		"admission_runtime_pre", "admission_pre_control", "admission_owned_wait",
+		"admission_read_index", "admission_wait_tip", "admission_replay",
+		"admission_runtime_post", "admission_fixed_replay", "admission_unresolved_history":
+		return "MANAGED_SQL_QUERY_FAILURE stage=" + stage
+	default:
+		return ""
+	}
+}
+
+func logManagedSQLQueryFailure(ctx context.Context, stage string, err error) error {
+	if err != nil {
+		if line := managedSQLQueryDiagnostic(ctx, stage); line != "" {
+			log.Print(line)
+		}
+	}
+	return err
 }

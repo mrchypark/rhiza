@@ -5,7 +5,28 @@ import (
 	"fmt"
 	"strings"
 	"testing"
+
+	"github.com/mrchypark/rhiza/internal/sqlpolicy"
+	"github.com/mrchypark/rhiza/internal/types"
 )
+
+func TestV1Alpha2ClusterExplicitApplicationProtocols(t *testing.T) {
+	for _, protocol := range []string{"", types.ManagedApplicationProtocolSQLKV, sqlpolicy.ManagedRequestAppendOnlyApplicationProtocol, sqlpolicy.ManagedGraphRequestAppendOnlyApplicationProtocol, sqlpolicy.ManagedRequestApplicationProtocol, sqlpolicy.ManagedGraphRequestApplicationProtocol, "rhiza-managed-request/v2", "rhiza-managed-graph/v1", "unknown"} {
+		c := phase1Cluster()
+		create := "Create"
+		c.Spec.GenesisIntent, c.Spec.ApplicationProtocol = &create, protocol
+		valid := protocol == "" || protocol == types.ManagedApplicationProtocolSQLKV || protocol == sqlpolicy.ManagedRequestAppendOnlyApplicationProtocol || protocol == sqlpolicy.ManagedGraphRequestAppendOnlyApplicationProtocol
+		if err := ValidateV1Alpha2Cluster(c); (err == nil) != valid {
+			t.Fatalf("protocol=%q valid=%t error=%v", protocol, valid, err)
+		}
+		if protocol != "" && valid {
+			c.Spec.GenesisIntent = nil
+			if err := ValidateV1Alpha2Cluster(c); err == nil {
+				t.Fatalf("explicit protocol %q accepted without new genesis intent", protocol)
+			}
+		}
+	}
+}
 
 func phase1Int32(v int32) *int32 { return &v }
 func phase1Int64(v int64) *int64 { return &v }

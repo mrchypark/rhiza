@@ -9,11 +9,13 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"os"
 	"path/filepath"
 	"sort"
 	"strings"
 
+	"github.com/mrchypark/rhiza/internal/localtesthooks"
 	"github.com/mrchypark/rhiza/internal/sqlpolicy"
 	"github.com/mrchypark/rhiza/internal/types"
 )
@@ -57,21 +59,22 @@ type localRestoreOriginal struct {
 }
 
 type localRestoreJournal struct {
-	Version       int                    `json:"version"`
-	LocalVersion  int                    `json:"local_version"`
-	StoreUUID     string                 `json:"store_uuid"`
-	ConfigDigest  string                 `json:"config_digest"`
-	Index         uint64                 `json:"index"`
-	ConfigID      uint                   `json:"config_id"`
-	RootHash      string                 `json:"root_hash"`
-	PrefixHash    string                 `json:"prefix_hash"`
-	StateHash     string                 `json:"state_hash"`
-	AttemptID     string                 `json:"attempt_id"`
-	Phase         string                 `json:"phase"`
-	Files         []localRestoreFile     `json:"files"`
-	OriginalSQL   []localRestoreOriginal `json:"original_sql"`
-	OriginalGraph []localRestoreOriginal `json:"original_graph"`
-	HadGraph      bool                   `json:"had_graph"`
+	ManagedGraph  *managedGraphInstallJournal `json:"managed_graph,omitempty"`
+	Version       int                         `json:"version"`
+	LocalVersion  int                         `json:"local_version"`
+	StoreUUID     string                      `json:"store_uuid"`
+	ConfigDigest  string                      `json:"config_digest"`
+	Index         uint64                      `json:"index"`
+	ConfigID      uint                        `json:"config_id"`
+	RootHash      string                      `json:"root_hash"`
+	PrefixHash    string                      `json:"prefix_hash"`
+	StateHash     string                      `json:"state_hash"`
+	AttemptID     string                      `json:"attempt_id"`
+	Phase         string                      `json:"phase"`
+	Files         []localRestoreFile          `json:"files"`
+	OriginalSQL   []localRestoreOriginal      `json:"original_sql"`
+	OriginalGraph []localRestoreOriginal      `json:"original_graph"`
+	HadGraph      bool                        `json:"had_graph"`
 }
 
 // PrepareLocalRestore durably authorizes one exact-base restore attempt after
@@ -360,6 +363,9 @@ func readLocalRestoreJournal(path string) (localRestoreJournal, error) {
 	if err := decoder.Decode(&j); err != nil {
 		return localRestoreJournal{}, err
 	}
+	if j.ManagedGraph != nil {
+		return localRestoreJournal{}, fmt.Errorf("managed Graph install journal cannot authorize Local restore")
+	}
 	var trailing any
 	if err := decoder.Decode(&trailing); !errors.Is(err, io.EOF) {
 		return localRestoreJournal{}, fmt.Errorf("Local restore journal has trailing data")
@@ -415,6 +421,9 @@ func validRestoreInventory(j localRestoreJournal) bool {
 
 func writeLocalRestoreJournal(dbPath string, j localRestoreJournal) error {
 	data, err := json.Marshal(j)
+	if j.ManagedGraph != nil {
+		data, err = encodeManagedGraphInstallJournal(j)
+	}
 	if err != nil {
 		return err
 	}
@@ -454,6 +463,9 @@ func (w localRestoreFileWriter) Write(data []byte) (int, error) {
 }
 
 func hitLocalRestoreBoundary(name string) error {
+	if localtesthooks.Enabled {
+		localtesthooks.Hit("materializer:restore:" + name)
+	}
 	if localRestoreFailpoint != nil {
 		return localRestoreFailpoint(name)
 	}
@@ -697,6 +709,14 @@ func ensureLocalRestoreDir(path string) error {
 }
 
 func copyLocalRestoreFile(source, target string) error {
+	return copyLocalRestoreFileContext(context.Background(), source, target)
+}
+
+func copyLocalRestoreFileContext(ctx context.Context, source, target string) error {
+	return copyLocalRestoreFileContextLimit(ctx, source, target, math.MaxInt64)
+}
+
+func copyLocalRestoreFileContextLimit(ctx context.Context, source, target string, limit int64) error {
 	in, err := os.Open(source)
 	if err != nil {
 		return err
@@ -709,7 +729,7 @@ func copyLocalRestoreFile(source, target string) error {
 	if err != nil {
 		return err
 	}
-	_, err = io.Copy(localRestoreFileWriter{file: out}, in)
+	_, err = io.Copy(localRestoreFileWriter{file: out}, io.LimitReader(localRestoreContextReader{ctx: ctx, file: in}, limit))
 	if err == nil {
 		err = localRestoreSyncFile(out)
 	}
@@ -717,6 +737,18 @@ func copyLocalRestoreFile(source, target string) error {
 		err = closeErr
 	}
 	return err
+}
+
+type localRestoreContextReader struct {
+	ctx  context.Context
+	file *os.File
+}
+
+func (r localRestoreContextReader) Read(p []byte) (int, error) {
+	if err := r.ctx.Err(); err != nil {
+		return 0, err
+	}
+	return r.file.Read(p)
 }
 
 func backupLocalOriginals(dbPath, attempt string, j *localRestoreJournal) error {

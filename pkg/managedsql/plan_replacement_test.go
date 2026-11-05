@@ -10,6 +10,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/mrchypark/rhiza/internal/sqlpolicy"
 	"github.com/mrchypark/rhiza/internal/types"
 	"github.com/mrchypark/rhiza/pkg/node"
 	"github.com/mrchypark/rhiza/pkg/operator"
@@ -26,19 +27,20 @@ func TestPlanVoterReplacementActualBootstrapNonceAndClosedPrecedence(t *testing.
 		configs[i].Runtime.EnableReconfiguration = true
 	}
 	n := node.New(&configs[0].Runtime)
-	physical, _, err := n.PreparedStartupBindingDigests()
+	physical, _, err := n.PreparedStartupBindingDigestsForProtocol(configs[0].Plan.ApplicationProtocol)
 	if err != nil {
 		t.Fatal(err)
 	}
-	digest, err := n.ManagedBootstrapPlanDigest(physical, EvidenceFormat)
+	digest, err := n.ManagedBootstrapPlanDigestForProtocol(physical, configs[0].Plan.EvidenceFormat, configs[0].Plan.ApplicationProtocol)
 	if err != nil {
 		t.Fatal(err)
 	}
-	init, err := operator.NewV1Alpha2ApplicationInitPlan(configs[0].Ref, "logical", "deployment", "assignment", physical, digest, EvidenceFormat)
+	init, err := operator.NewV1Alpha2ApplicationInitPlan(configs[0].Ref, "logical", "deployment", "assignment", physical, digest, configs[0].Plan.EvidenceFormat)
 	if err != nil {
 		t.Fatal(err)
 	}
-	bootstrap := operator.V1Alpha2BootstrapPlan{ClusterID: configs[0].Runtime.ClusterID, PhysicalBinding: physical, EvidenceFormat: EvidenceFormat, Durability: types.ObjectStoreDurabilityBeforeAck, Reconfiguration: true}
+	init.ApplicationProtocol = configs[0].Plan.ApplicationProtocol
+	bootstrap := operator.V1Alpha2BootstrapPlan{ClusterID: configs[0].Runtime.ClusterID, PhysicalBinding: physical, EvidenceFormat: configs[0].Plan.EvidenceFormat, Durability: types.ObjectStoreDurabilityBeforeAck, Reconfiguration: true}
 	for i, member := range configs[0].Runtime.Members {
 		bootstrap.Members = append(bootstrap.Members, operator.V1Alpha2BootstrapMember{PodUID: configs[i].PodUID, Member: member})
 	}
@@ -86,6 +88,9 @@ func TestPlanVoterReplacementActualBootstrapNonceAndClosedPrecedence(t *testing.
 	if plan.OldWALIdentity != expected.OldWALIdentity || plan.OldNodeID != expected.OldNodeID || plan.ExpectedConfigID != 1 || plan.ExpectedAbortSlot != 0 || !reflect.DeepEqual(plan.FinalVoterIDs, expected.FinalVoterIDs) {
 		t.Fatal("plan did not bind actual current membership/registered WAL")
 	}
+	if plan.Sequence != operator.V1Alpha2RepairAddThenRemove {
+		t.Fatalf("append-only profile did not select ADD-first: %q", plan.Sequence)
+	}
 	again, err := h.PlanVoterReplacement(ctx, expected.Replacement, present)
 	if err != nil || !reflect.DeepEqual(plan, again) {
 		t.Fatalf("plan was not deterministic: %v", err)
@@ -127,5 +132,24 @@ func TestPlanVoterReplacementActualBootstrapNonceAndClosedPrecedence(t *testing.
 	retained, ok := live.Repair()
 	if !ok || retained.State != "Closed" || !reflect.DeepEqual(retained.Plan, *plan) {
 		t.Fatal("candidate loss cleared or replaced exact Closed plan")
+	}
+}
+
+func TestReplacementPlanSequenceMatchesSupportedProfiles(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		protocol string
+		want     operator.V1Alpha2RepairSequence
+	}{
+		{name: "legacy profile 7", want: ""},
+		{name: "SQL/KV profile 8", protocol: types.ManagedApplicationProtocolSQLKV, want: ""},
+		{name: "request profile 9", protocol: sqlpolicy.ManagedRequestAppendOnlyApplicationProtocol, want: operator.V1Alpha2RepairAddThenRemove},
+		{name: "graph profile 10", protocol: sqlpolicy.ManagedGraphRequestAppendOnlyApplicationProtocol, want: operator.V1Alpha2RepairAddThenRemove},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := replacementSequenceForProtocol(tc.protocol); got != tc.want {
+				t.Fatalf("replacement sequence for %q = %q, want %q", tc.protocol, got, tc.want)
+			}
+		})
 	}
 }

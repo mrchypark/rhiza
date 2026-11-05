@@ -35,7 +35,12 @@ if [[ ! $bench_count =~ ^[1-9][0-9]*$ || ! $bench_procs =~ ^[1-9][0-9]*$ ]]; the
 fi
 
 work_root=$(mktemp -d "${TMPDIR:-/tmp}/rhiza-ci-bench.XXXXXX")
+capture_pid=
 cleanup() {
+	if [[ -n $capture_pid ]]; then
+		kill "$capture_pid" 2>/dev/null || true
+		wait "$capture_pid" 2>/dev/null || true
+	fi
 	git -C "$repo_root" worktree remove --force "$work_root/base" >/dev/null 2>&1 || true
 	git -C "$repo_root" worktree remove --force "$work_root/candidate" >/dev/null 2>&1 || true
 	case "$work_root" in
@@ -95,14 +100,17 @@ fi
 
 : >"$output_dir/base.txt"
 : >"$output_dir/candidate.txt"
+mkdir -p "$output_dir/diagnostics"
 
 run_revision() {
 	local label=$1
 	local source=$2
 	local output="$output_dir/$label.txt"
-	local package benchmark sample_time
+	local package benchmark sample_time benchmark_index stderr_log capture_fifo status capture_status
 	local -a selected
+	local -a statuses
 	for package in "${packages[@]}"; do
+		benchmark_index=0
 		case "$package" in
 			qlog) selected=('^BenchmarkWAL(AppendSync|ScanScratch)$') ;;
 			quepaxa) selected=('^BenchmarkCorePropose(ThreePeersParallel|CertifiedThreePeersParallel)$' '^BenchmarkDecisionsFromBounded$' '^BenchmarkEnsureDurableThroughRetainedPrefix$' '^BenchmarkCoreReadIndexThreePeers$') ;;
@@ -114,6 +122,7 @@ run_revision() {
 		# Go treats benchmark patterns with no match as a successful run, so
 		# candidate-only benchmarks remain compatible with older baselines.
 		for benchmark in "${selected[@]}"; do
+			benchmark_index=$((benchmark_index + 1))
 			sample_time=$bench_time
 			# Snapshot setup is excluded from timing; bound iterations to avoid
 			# calibration multiplying expensive untimed database updates.
@@ -123,21 +132,41 @@ run_revision() {
 			if [[ $benchmark == '^BenchmarkGraphPruneSparseSlotsAndBatchSize$' ]]; then
 				sample_time=1x
 			fi
-		(
-			cd "$source"
-			GOMAXPROCS=$bench_procs "$work_root/bin/$label-$package.test" \
-				-test.run '^$' \
-				-test.bench "$benchmark" \
-				-test.benchtime "$sample_time" \
-				-test.count 1 \
-				-test.benchmem \
-				-test.cpu "$bench_procs" \
-				-test.timeout 20m
-		) 2>&1 | tee -a "$output" && continue
-		if [[ $label == candidate || $network_optimization != none ]]; then
-			return 1
-		fi
-		printf 'baseline %s benchmark failed; continuing with available comparisons\n' "$package" | tee -a "$output"
+			stderr_log="$output_dir/diagnostics/$label-$package-$sample-$benchmark_index.stderr.log"
+			capture_fifo="$work_root/benchmark-stderr"
+			mkfifo "$capture_fifo"
+			# Bound diagnostics without splitting Go's benchmark name/iteration line.
+			tail -c 65536 <"$capture_fifo" >"$stderr_log" &
+			capture_pid=$!
+			if (
+				cd "$source"
+				GOMAXPROCS=$bench_procs "$work_root/bin/$label-$package.test" \
+					-test.run '^$' \
+					-test.bench "$benchmark" \
+					-test.benchtime "$sample_time" \
+					-test.count 1 \
+					-test.benchmem \
+					-test.cpu "$bench_procs" \
+					-test.timeout 20m
+			) 2>"$capture_fifo" | tee -a "$output"; then
+				statuses=("${PIPESTATUS[@]}")
+			else
+				statuses=("${PIPESTATUS[@]}")
+			fi
+			if wait "$capture_pid"; then capture_status=0; else capture_status=$?; fi
+			capture_pid=
+			rm "$capture_fifo"
+			status=${statuses[0]}
+			# Preserve pipefail's rightmost nonzero exit, including a failed sink.
+			if ((statuses[1] != 0)); then status=${statuses[1]}; fi
+			if ((status == 0 && capture_status != 0)); then status=$capture_status; fi
+			printf 'binary_exit=%s\nstdout_exit=%s\nstderr_exit=%s\nexit=%s\n' "${statuses[0]}" "${statuses[1]}" "$capture_status" "$status" >"${stderr_log%.stderr.log}.exit"
+			if [[ -s $stderr_log ]]; then cat "$stderr_log" >&2; fi
+			if ((status == 0)); then continue; fi
+			if [[ $label == candidate || $network_optimization != none ]]; then
+				return "$status"
+			fi
+			printf 'baseline %s benchmark failed; continuing with available comparisons\n' "$package" | tee -a "$output"
 		done
 	done
 }

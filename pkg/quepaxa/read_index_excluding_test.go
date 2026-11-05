@@ -119,8 +119,8 @@ func TestReadIndexExcludingBridgeDependingOnExcludedCannotPass(t *testing.T) {
 	// Take n3 down and exclude n2: only n1(self) succeeds = 1 < 2.
 	transport.fail("n3")
 	_, _, err := cores["n1"].ReadIndexExcluding(ctx, "n2")
-	if err == nil {
-		t.Fatal("quorum passed when the excluded voter was the only bridge to quorum")
+	if err != ErrQuorumUnavailable {
+		t.Fatalf("excluded bridge returned %v, want unchanged ErrQuorumUnavailable identity", err)
 	}
 }
 

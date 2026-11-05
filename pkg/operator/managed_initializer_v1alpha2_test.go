@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"github.com/mrchypark/rhiza/internal/sqlpolicy"
 	"github.com/mrchypark/rhiza/internal/types"
 	"gopkg.in/yaml.v3"
 	"io"
@@ -18,12 +19,12 @@ import (
 )
 
 func TestManagedInitializationConnected(t *testing.T) {
-	history, store, name := phase8Setup(t, phase8Cluster, "")
+	history, store, name := phase8Setup(t, phase9CurrentManagedCluster(), "")
 	var deployment map[string]any
 	ready := false
 	podFault := ""
 	posts := 0
-	profile := V1Alpha2RuntimeProfile{ProfileSecretName: "rhiza-runtime", InitImage: "example/init:v1", PeerPort: 9090, EvidenceFormat: "rhiza-managed-sql/v1", Storage: types.ExecutionConfig{AdminToken: "admin-must-not-leak", ObjStoreBucket: "test", ObjStorePrefix: "managed", ObjStoreProvider: "s3", ObjStoreEndpoint: "s3.example.test", ObjStoreSecretKey: "credential-must-not-leak"}}
+	profile := V1Alpha2RuntimeProfile{ProfileSecretName: "rhiza-runtime", InitImage: "example/init:v1", PeerPort: 9090, EvidenceFormat: sqlpolicy.ManagedRequestAppendOnlyApplicationProtocol, ApplicationProtocol: sqlpolicy.ManagedRequestAppendOnlyApplicationProtocol, Storage: types.ExecutionConfig{AdminToken: "admin-must-not-leak", ObjStoreBucket: "test", ObjStorePrefix: "managed", ObjStoreProvider: "s3", ObjStoreEndpoint: "s3.example.test", ObjStoreSecretKey: "credential-must-not-leak"}}
 	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		respond := func(v any) { w.Header().Set("Content-Type", "application/json"); _ = json.NewEncoder(w).Encode(v) }
 		switch {
@@ -227,6 +228,7 @@ func testManagedCapturedKubeletObjectsReconcile(t *testing.T, nativeList bool, f
 	_ = json.Unmarshal(cluster["spec"], &spec)
 	profile := phase9RuntimeProfile()
 	profile.InitImage = spec.Workload.PodTemplate.Spec.Containers[0].Image
+	cluster = managedCapturedClusterForProfile(t, cluster, profile.ApplicationProtocol)
 	puts := 0
 	podGets := 0
 	store := phase2Store(t, func(r *http.Request) (*http.Response, error) {
@@ -323,6 +325,50 @@ func testManagedCapturedKubeletObjectsReconcile(t *testing.T, nativeList bool, f
 	}
 }
 
+// The captured kubelet snapshot predates applicationProtocol in the Rhiza
+// spec. Port its original user intent into the current wire contract while
+// retaining the captured Deployment, ReplicaSet, and Pod objects unchanged.
+func managedCapturedClusterForProfile(t *testing.T, raw map[string]json.RawMessage, protocol string) map[string]json.RawMessage {
+	t.Helper()
+	var cluster map[string]any
+	if err := json.Unmarshal(mustManagedJSON(raw), &cluster); err != nil {
+		t.Fatal("decode captured cluster", err)
+	}
+	spec, ok := cluster["spec"].(map[string]any)
+	if !ok {
+		t.Fatal("captured cluster spec missing")
+	}
+	spec["applicationProtocol"] = protocol
+	metadata, ok := cluster["metadata"].(map[string]any)
+	if !ok {
+		t.Fatal("captured cluster metadata missing")
+	}
+	annotations, ok := metadata["annotations"].(map[string]any)
+	if !ok {
+		t.Fatal("captured cluster annotations missing")
+	}
+	const lastAppliedKey = "kubectl.kubernetes.io/last-applied-configuration"
+	lastAppliedText, ok := annotations[lastAppliedKey].(string)
+	if !ok {
+		t.Fatal("captured last-applied configuration missing")
+	}
+	var lastApplied map[string]any
+	if err := json.Unmarshal([]byte(lastAppliedText), &lastApplied); err != nil {
+		t.Fatal("decode captured last-applied configuration", err)
+	}
+	lastSpec, ok := lastApplied["spec"].(map[string]any)
+	if !ok {
+		t.Fatal("captured last-applied spec missing")
+	}
+	lastSpec["applicationProtocol"] = protocol
+	annotations[lastAppliedKey] = string(mustManagedJSON(lastApplied))
+	var current map[string]json.RawMessage
+	if err := json.Unmarshal(mustManagedJSON(cluster), &current); err != nil {
+		t.Fatal("encode current captured cluster", err)
+	}
+	return current
+}
+
 // managedFixturePods supplies public status on exact API-owned Pods. It does
 // not simulate kubelet execution or prove the init binary ran.
 func managedFixturePods(ref V1Alpha2ClusterRef, rsName, rsUID string, spec json.RawMessage) []any {
@@ -357,7 +403,7 @@ func managedFixtureAdmitPodToken(spec map[string]any) {
 func TestManagedInitializationRequiresInstalledHostAccountBeforePost(t *testing.T) {
 	for _, name := range []string{"absent", "deleting", "wrong namespace", "wrong name", "missing UID"} {
 		t.Run(name, func(t *testing.T) {
-			s, kube := phase9Setup(t, phase8Cluster)
+			s, kube := phase9Setup(t, phase9CurrentManagedCluster())
 			s.serviceAccount = managedFixtureServiceAccount(phase2Ref)
 			meta := s.serviceAccount["metadata"].(map[string]any)
 			switch name {
@@ -530,7 +576,7 @@ func TestManagedInitializationRejectsProfileBeforePost(t *testing.T) {
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			posts := 0
-			profile := V1Alpha2RuntimeProfile{ProfileSecretName: "rhiza-runtime", InitImage: "example/init:v1", PeerPort: 9090, EvidenceFormat: "rhiza-managed-sql/v1", Storage: types.ExecutionConfig{AdminToken: "private-admin", ObjStoreProvider: "s3", ObjStoreBucket: "test", ObjStoreEndpoint: "s3.example.test", ObjStorePrefix: "managed"}}
+			profile := V1Alpha2RuntimeProfile{ProfileSecretName: "rhiza-runtime", InitImage: "example/init:v1", PeerPort: 9090, EvidenceFormat: sqlpolicy.ManagedRequestAppendOnlyApplicationProtocol, ApplicationProtocol: sqlpolicy.ManagedRequestAppendOnlyApplicationProtocol, Storage: types.ExecutionConfig{AdminToken: "private-admin", ObjStoreProvider: "s3", ObjStoreBucket: "test", ObjStoreEndpoint: "s3.example.test", ObjStorePrefix: "managed"}}
 			tc.mutate(&profile)
 			store := phase2Store(t, func(r *http.Request) (*http.Response, error) {
 				if r.Method == http.MethodPost {
@@ -542,7 +588,7 @@ func TestManagedInitializationRejectsProfileBeforePost(t *testing.T) {
 					secret, _ := json.Marshal(map[string]any{"metadata": map[string]any{"name": profile.ProfileSecretName, "namespace": "ns", "uid": "secretuid"}, "data": map[string][]byte{V1Alpha2ManagedRuntimeProfileKey: b}})
 					return phase2Response(200, string(secret)), nil
 				}
-				return phase2Response(200, phase8Cluster), nil
+				return phase2Response(200, phase9CurrentManagedCluster()), nil
 			})
 			_, err := ReconcileV1Alpha2ManagedInitialization(context.Background(), store.Kube, phase2Ref, profile)
 			if err == nil || posts != 0 {
@@ -560,7 +606,7 @@ func TestManagedRuntimeProfileSupportedStorage(t *testing.T) {
 	} {
 		t.Run(storage.ObjStoreProvider, func(t *testing.T) {
 			storage.AdminToken = "private-admin"
-			profile := V1Alpha2RuntimeProfile{ProfileSecretName: "rhiza-runtime", InitImage: "example/init:v1", PeerPort: 9090, EvidenceFormat: "rhiza-managed-sql/v1", Storage: storage}
+			profile := V1Alpha2RuntimeProfile{ProfileSecretName: "rhiza-runtime", InitImage: "example/init:v1", PeerPort: 9090, EvidenceFormat: sqlpolicy.ManagedRequestAppendOnlyApplicationProtocol, ApplicationProtocol: sqlpolicy.ManagedRequestAppendOnlyApplicationProtocol, Storage: storage}
 			_, plan, err := BuildV1Alpha2RuntimePlan(phase2Ref, "logical", "deployment", profile, nil)
 			if err != nil || plan.Durability != types.ObjectStoreDurabilityBeforeAck {
 				t.Fatalf("supported installed profile: %v durability=%s", err, plan.Durability)
@@ -572,8 +618,8 @@ func TestManagedRuntimeProfileSupportedStorage(t *testing.T) {
 func TestManagedInitializationRejectsSecretAndMainBeforePost(t *testing.T) {
 	for _, name := range []string{"Secret mismatch", "Secret unavailable", "two main containers"} {
 		t.Run(name, func(t *testing.T) {
-			profile := V1Alpha2RuntimeProfile{ProfileSecretName: "runtime", InitImage: "reference:v1", PeerPort: 9090, EvidenceFormat: "rhiza-managed-sql/v1", Storage: types.ExecutionConfig{AdminToken: "private-admin", ObjStoreProvider: "s3", ObjStoreBucket: "bucket", ObjStoreEndpoint: "s3.example.test"}}
-			cluster := phase8Cluster
+			profile := V1Alpha2RuntimeProfile{ProfileSecretName: "runtime", InitImage: "reference:v1", PeerPort: 9090, EvidenceFormat: sqlpolicy.ManagedRequestAppendOnlyApplicationProtocol, ApplicationProtocol: sqlpolicy.ManagedRequestAppendOnlyApplicationProtocol, Storage: types.ExecutionConfig{AdminToken: "private-admin", ObjStoreProvider: "s3", ObjStoreBucket: "bucket", ObjStoreEndpoint: "s3.example.test"}}
+			cluster := phase9CurrentManagedCluster()
 			if name == "two main containers" {
 				cluster = strings.Replace(cluster, `{"name":"app","image":"image"}`, `{"name":"app","image":"image"},{"name":"second","image":"image"}`, 1)
 			}

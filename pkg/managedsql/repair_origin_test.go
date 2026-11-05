@@ -53,11 +53,11 @@ func TestManagedRepairOriginUsesCurrentPodOwnerChainAfterSamePodRestart(t *testi
 	learner := quepaxa.Member{ID: nodeID, PublicKey: key, PeerURL: peerURL}
 	runtime.NodeID, runtime.PeerToken, runtime.PeerAddr, runtime.Learner = nodeID, peerToken, "10.0.0.9:9090", &learner
 	preparedNode := node.New(&runtime)
-	physical, configDigest, err := preparedNode.PreparedStartupBindingDigests()
+	physical, configDigest, err := preparedNode.PreparedStartupBindingDigestsForProtocol(cfg.Plan.ApplicationProtocol)
 	if err != nil {
 		t.Fatal(err)
 	}
-	identity := node.ManagedStartupIdentity{Member: recovery.PreparedStartupIdentity{ClusterUID: cfg.Ref.UID, Generation: cfg.Plan.Generation, DeploymentUID: cfg.Plan.DeploymentUID, PodUID: podUID, NodeID: string(nodeID), SourceBinding: physical, ConfigDigest: configDigest}, AssignmentID: cfg.Plan.AssignmentID, IntentHash: cfg.Plan.IntentHash, StorageID: cfg.Plan.StorageID, PhysicalBinding: physical, BootstrapPlanDigest: cfg.Plan.BootstrapPlanDigest, EvidenceFormat: EvidenceFormat}
+	identity := node.ManagedStartupIdentity{Member: recovery.PreparedStartupIdentity{ClusterUID: cfg.Ref.UID, Generation: cfg.Plan.Generation, DeploymentUID: cfg.Plan.DeploymentUID, PodUID: podUID, NodeID: string(nodeID), SourceBinding: physical, ConfigDigest: configDigest}, AssignmentID: cfg.Plan.AssignmentID, IntentHash: cfg.Plan.IntentHash, StorageID: cfg.Plan.StorageID, PhysicalBinding: physical, BootstrapPlanDigest: cfg.Plan.BootstrapPlanDigest, EvidenceFormat: cfg.Plan.EvidenceFormat, ApplicationProtocol: cfg.Plan.ApplicationProtocol}
 	plan := operator.V1Alpha2RepairPlan{OperationID: "origin-operation", ClusterUID: cfg.Ref.UID, Generation: cfg.Plan.Generation, DeploymentUID: cfg.Plan.DeploymentUID, StorageID: cfg.Plan.StorageID, ExpectedConfigID: 1, OldNodeID: cfg.Runtime.NodeID, OldWALIdentity: strings.Repeat("b", 64), Replacement: operator.V1Alpha2RepairMember{PodName: "replacement", PodUID: podUID, NodeID: nodeID, PublicKey: key, PeerURL: peerURL}, BootstrapPlanDigest: cfg.Plan.BootstrapPlanDigest}
 	plan.FinalVoterIDs = []types.NodeID{cfg.Runtime.Members[1].ID, cfg.Runtime.Members[2].ID, nodeID}
 	slices.Sort(plan.FinalVoterIDs)

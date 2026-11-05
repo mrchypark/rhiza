@@ -13,14 +13,39 @@ import (
 	"testing"
 	"time"
 
+	"github.com/mrchypark/rhiza/internal/sqlpolicy"
 	"github.com/mrchypark/rhiza/internal/types"
+	"github.com/mrchypark/rhiza/pkg/materializer"
+	"github.com/mrchypark/rhiza/pkg/network"
 	"github.com/mrchypark/rhiza/pkg/operator"
+	"github.com/mrchypark/rhiza/pkg/qlog"
+	"github.com/mrchypark/rhiza/pkg/quepaxa"
 )
+
+func managedFFIGraphContractCommand(run string) types.GraphCommand {
+	return types.GraphCommand{RequestID: string([]byte{0xff}) + run, Cypher: "CREATE (:ManagedFFIItem {run: $run, value: 'ffi-graph-live'})", Args: map[string]any{"run": run}}
+}
+
+func managedFFIGraphContractQuery(run string) network.GraphQueryRequest {
+	return network.GraphQueryRequest{Cypher: "MATCH (n:ManagedFFIItem {run: $run}) RETURN n.run,n.value", Args: map[string]any{"run": run}, Consistency: "linearizable"}
+}
 
 // This contract runs as the replacement Pod's main process, not beside a live
 // owner of its WAL. The existing identity/await init containers supply the real
 // files; surviving managed voters perform the actual certified membership work.
 func TestManagedFFIInClusterSQLLifecycle(t *testing.T) {
+	runManagedFFIInClusterLifecycle(t, false)
+}
+
+func TestManagedFFIInClusterMixedLifecycle(t *testing.T) {
+	runManagedFFIInClusterLifecycle(t, true)
+}
+
+func TestManagedFFIInClusterGraphLifecycle(t *testing.T) {
+	runManagedFFIInClusterLifecycle(t, false, true)
+}
+
+func runManagedFFIInClusterLifecycle(t *testing.T, mixed bool, graphMode ...bool) {
 	if os.Getenv("RHIZA_FFI_IN_CLUSTER_CONTRACT") != "1" {
 		t.Skip("requires the actual in-cluster managed replacement fixture; no local Host substitute")
 	}
@@ -41,11 +66,16 @@ func TestManagedFFIInClusterSQLLifecycle(t *testing.T) {
 		} `json:"data"`
 		Error *ffiError `json:"error"`
 	}
-	if err := json.Unmarshal(goOpenManaged([]byte(`{}`)), &opened); err != nil {
+	lastStartupStage, stopStartupObservation := observeManagedGraphStartup()
+	openResponse := goOpenManaged([]byte(`{}`))
+	stopStartupObservation()
+	startupStage := lastStartupStage()
+	if err := json.Unmarshal(openResponse, &opened); err != nil {
 		t.Fatal("invalid FFI open response")
 	}
 	if opened.Error != nil {
-		t.Fatalf("real managed FFI open failed, code=%s", opened.Error.Code)
+		fmt.Printf("GRAPH_STARTUP_DIAGNOSTIC last_stage=%s\n", startupStage)
+		t.Fatalf("real managed FFI open failed, code=%s message=%s", opened.Error.Code, opened.Error.Message)
 	}
 	handle := opened.Data.Handle
 	if handle == 0 {
@@ -139,6 +169,55 @@ func TestManagedFFIInClusterSQLLifecycle(t *testing.T) {
 	if json.Unmarshal(invoke("query", map[string]any{"sql": "SELECT id, value FROM managed_ffi_contract WHERE id = ?", "args": []any{requestID}, "consistency": "linearizable"}), &query) != nil || len(query.Rows) != 1 || len(query.Rows[0]) != 2 || query.Rows[0][0] != requestID || query.Rows[0][1] != "ffi-live" {
 		t.Fatal("real FFI SQL ACK readback mismatch")
 	}
+	if mixed {
+		original := types.KVCommand{RequestID: string([]byte{0xfd}) + requestID, Operation: "put", Key: string([]byte{0xfc}) + requestID, Value: []byte("ffi-live"), Expected: []byte{}, TTLMS: 0}
+		raw, _, err := types.EncodeManagedKVOriginal(original)
+		if err != nil {
+			t.Fatal("invalid mixed FFI original")
+		}
+		var receipt managedKVReceipt
+		if json.Unmarshal(invoke("kv_put", raw), &receipt) != nil || receipt.Slot == 0 || receipt.Status != types.MutationCommitted || !receipt.Applied {
+			t.Fatal("mixed FFI ACK unavailable")
+		}
+		var found managedKVRead
+		if json.Unmarshal(invoke("kv_get", map[string]any{"key_b64": []byte(original.Key), "consistency": "linearizable"}), &found) != nil || !found.Found || !bytes.Equal(found.Value, original.Value) || found.AppliedSlot < receipt.Slot {
+			t.Fatal("mixed FFI ACK readback mismatch")
+		}
+	}
+	graph := len(graphMode) == 1 && graphMode[0]
+	if graph {
+		original := managedFFIGraphContractCommand(requestID)
+		frame, err := types.EncodeManagedGraphExecution(original)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var receipt managedKVReceipt
+		if json.Unmarshal(invoke("graph_execute", map[string]any{"frame_b64": frame}), &receipt) != nil || receipt.Slot == 0 || receipt.Status != types.MutationCommitted || !receipt.Applied {
+			t.Fatal("actual Graph FFI ACK unavailable; no mutation retry")
+		}
+		var rows struct {
+			Rows [][]any `json:"rows"`
+		}
+		if json.Unmarshal(invoke("graph_query", managedFFIGraphContractQuery(requestID)), &rows) != nil || len(rows.Rows) != 1 || len(rows.Rows[0]) != 2 || rows.Rows[0][0] != requestID || rows.Rows[0][1] != "ffi-graph-live" {
+			t.Fatal("actual Graph FFI ACK readback mismatch")
+		}
+		selector := map[string]any{"kind": "graph", "request_id_b64": []byte(original.RequestID)}
+		var status struct {
+			State   string            `json:"state"`
+			Receipt *managedKVReceipt `json:"receipt"`
+		}
+		if json.Unmarshal(invoke("request_status", selector), &status) != nil || status.State != string(types.MutationCommitted) || status.Receipt == nil || *status.Receipt != receipt {
+			t.Fatal("actual Graph FFI status changed original receipt")
+		}
+		var recovered struct {
+			Kind      string            `json:"kind"`
+			RequestID []byte            `json:"request_id_b64"`
+			Graph     *managedKVReceipt `json:"graph"`
+		}
+		if json.Unmarshal(invoke("recover_pending_detailed", selector), &recovered) != nil || recovered.Kind != "graph" || !bytes.Equal(recovered.RequestID, []byte(original.RequestID)) || recovered.Graph == nil || *recovered.Graph != receipt {
+			t.Fatal("actual Graph FFI recovery changed raw ID or receipt")
+		}
+	}
 	var closeResult struct {
 		Error *ffiError `json:"error"`
 	}
@@ -159,7 +238,64 @@ func TestManagedFFIInClusterSQLLifecycle(t *testing.T) {
 	if err != nil || !bytes.Equal(registered, after) {
 		t.Fatal("FFI SQL/close replaced the actual voter registration")
 	}
-	t.Log("actual in-cluster Go FFI -> managed Host -> SQL ACK readback -> close passed; no Rust or physical-fencing claim")
+	if graph {
+		t.Log("actual in-cluster Go FFI -> Graph managed Host -> raw original ACK/readback/status/recovery -> close passed")
+	} else if mixed {
+		t.Log("actual in-cluster Go FFI -> mixed managed Host -> SQL KV ACK readback -> close passed")
+	} else {
+		t.Log("actual in-cluster Go FFI -> managed Host -> SQL ACK readback -> close passed; no Rust or physical-fencing claim")
+	}
+}
+
+// This exercises the same two command/query builders against actual certified
+// Core/WAL/native Graph state, not a substitute Pod or in-cluster Host.
+func TestManagedFFIGraphContractTwoRunsRetainOwnRows(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	wal, err := qlog.Open(filepath.Join(t.TempDir(), "qlog"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = wal.Close() })
+	core, err := quepaxa.New(quepaxa.Config{NodeID: "one", Cluster: quepaxa.Cluster{ConfigID: 1, Members: []quepaxa.Member{{ID: "one"}}}, WAL: wal, ValidateValue: types.ValidateManagedGraphExecutionPolicy})
+	if err != nil {
+		t.Fatal(err)
+	}
+	mat, err := materializer.OpenManagedSQLKVGraphWithOriginals(filepath.Join(t.TempDir(), "sqlite.db"), 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = mat.Close() })
+	server, err := network.NewServerForPolicy(core, mat, "graph-contract", true, nil, sqlpolicy.ManagedGraphRequestMaterializationPolicy)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(server.Close)
+	runs := []string{"ffi-contract-first", "ffi-contract-restart"}
+	receipts := make(map[string]types.MutationReceipt)
+	for _, run := range runs {
+		command := managedFFIGraphContractCommand(run)
+		response, err := server.GraphExecute(ctx, command)
+		if err != nil || response.Status != types.MutationCommitted || response.Slot == 0 || !response.Applied {
+			t.Fatalf("actual run receipt=%+v error=%v", response, err)
+		}
+		receipts[command.RequestID] = response.MutationReceipt
+	}
+	for _, run := range runs {
+		rows, err := server.GraphQuery(ctx, managedFFIGraphContractQuery(run))
+		if err != nil || len(rows.Rows) != 1 || len(rows.Rows[0]) != 2 || rows.Rows[0][0] != run || rows.Rows[0][1] != "ffi-graph-live" {
+			t.Fatalf("run-specific readback changed: rows=%+v error=%v", rows, err)
+		}
+		id := managedFFIGraphContractCommand(run).RequestID
+		receipt, found, err := mat.GraphMutationReceipt(ctx, id)
+		if err != nil || !found || receipt != receipts[id] {
+			t.Fatalf("original raw receipt changed: found=%t receipt=%+v error=%v", found, receipt, err)
+		}
+	}
+	all, err := server.GraphQuery(ctx, network.GraphQueryRequest{Cypher: "MATCH (n:ManagedFFIItem) RETURN n.run", Consistency: "linearizable"})
+	if err != nil || len(all.Rows) != 2 || receipts["\xff"+runs[0]].Slot == receipts["\xff"+runs[1]].Slot {
+		t.Fatalf("earlier run was removed or duplicated: rows=%+v error=%v", all, err)
+	}
 }
 
 func committedFFIReceipt(raw json.RawMessage) bool {
