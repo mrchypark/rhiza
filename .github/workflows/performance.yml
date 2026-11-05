@@ -32,9 +32,9 @@ on:
         default: ""
 
       network_optimization:
-        description: Focused network optimization (none runs the full suite)
+        description: Focused network diagnostic, not release qualification (none runs the full suite)
         type: choice
-        options: [none, transport, auth, catchup]
+        options: [none, transport, auth, catchup, sql]
         default: none
 
       issue185_cost_evidence:
@@ -124,6 +124,9 @@ jobs:
         run: |
           go install golang.org/x/perf/cmd/benchstat@v0.0.0-20260825160852-19be9d8e6c70
           printf '%s\n' "$GOBIN" >>"$GITHUB_PATH"
+
+      - name: Check benchmark runner contract without compilation
+        run: sh benchmarks/run-ci-benchmarks_test.sh
 
       - name: Run interleaved base and candidate benchmarks
         run: |

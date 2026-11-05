@@ -27,6 +27,7 @@ case "$network_optimization" in
 	transport) packages=(network); network_benchmark='^BenchmarkBoundTransportQUICReadTip$' ;;
 	auth) packages=(network); network_benchmark='^BenchmarkPeerAuthentication$' ;;
 	catchup) packages=(network); network_benchmark='^BenchmarkCatchUpSameSourceQUIC$' ;;
+	sql) packages=(network); network_benchmark='^Benchmark(ThreePeerSQLExecute|ThreePeerSQLExecuteReturning)$' ;;
 	*) printf 'unknown RHIZA_BENCH_NETWORK_OPTIMIZATION: %s\n' "$network_optimization" >&2; exit 2 ;;
 esac
 if [[ ! $bench_count =~ ^[1-9][0-9]*$ || ! $bench_procs =~ ^[1-9][0-9]*$ ]]; then
@@ -35,7 +36,12 @@ if [[ ! $bench_count =~ ^[1-9][0-9]*$ || ! $bench_procs =~ ^[1-9][0-9]*$ ]]; the
 fi
 
 work_root=$(mktemp -d "${TMPDIR:-/tmp}/rhiza-ci-bench.XXXXXX")
+capture_pid=
 cleanup() {
+	if [[ -n $capture_pid ]]; then
+		kill "$capture_pid" 2>/dev/null || true
+		wait "$capture_pid" 2>/dev/null || true
+	fi
 	git -C "$repo_root" worktree remove --force "$work_root/base" >/dev/null 2>&1 || true
 	git -C "$repo_root" worktree remove --force "$work_root/candidate" >/dev/null 2>&1 || true
 	case "$work_root" in
@@ -50,7 +56,7 @@ mkdir -p "$work_root/bin"
 
 # Both revisions must run identical benchmark code, including when the base
 # predates these benchmarks. The fixtures use the pre-optimization Core API.
-if [[ $network_optimization != none ]]; then
+if [[ $network_optimization != none && $network_optimization != sql ]]; then
 	for fixture in auth_benchmark_test.go transport_benchmark_test.go catchup_benchmark_test.go; do
 		git show "$head_sha:pkg/network/$fixture" >"$work_root/base/pkg/network/$fixture"
 	done
@@ -95,25 +101,35 @@ fi
 
 : >"$output_dir/base.txt"
 : >"$output_dir/candidate.txt"
+mkdir -p "$output_dir/diagnostics"
 
 run_revision() {
 	local label=$1
 	local source=$2
 	local output="$output_dir/$label.txt"
-	local package benchmark sample_time
+	local package benchmark sample_time benchmark_index stderr_log capture_fifo status capture_status
 	local -a selected
+	local -a statuses
 	for package in "${packages[@]}"; do
+		benchmark_index=0
 		case "$package" in
 			qlog) selected=('^BenchmarkWAL(AppendSync|ScanScratch)$') ;;
 			quepaxa) selected=('^BenchmarkCorePropose(ThreePeersParallel|CertifiedThreePeersParallel)$' '^BenchmarkDecisionsFromBounded$' '^BenchmarkEnsureDurableThroughRetainedPrefix$' '^BenchmarkCoreReadIndexThreePeers$') ;;
 			recovery) selected=('^BenchmarkArchiveMemoryPublication$' '^BenchmarkAuthenticatedMembershipCheckpointProof$' '^BenchmarkArchiveHeadEvidenceStages$') ;;
 			materializer) selected=('^Benchmark(SQLBatchApply|GraphApply|GraphQuery4096Nodes|LatticeAppMetadataUpdate4096Keys)$' '^BenchmarkGraphSnapshotFreezeByDatabaseSize$' '^BenchmarkSQLAuthorizerSchemaCount$' '^BenchmarkGraphPruneSparseSlotsAndBatchSize$') ;;
-			network) selected=("$network_benchmark") ;;
+			network)
+				if [[ $network_optimization == sql ]]; then
+					selected=('^BenchmarkThreePeerSQLExecute$/^c4$' '^BenchmarkThreePeerSQLExecuteReturning$/^rows1$')
+				else
+					selected=("$network_benchmark")
+				fi
+				;;
 			internal-types) selected=('^BenchmarkSQLBatchCodec$') ;;
 		esac
 		# Go treats benchmark patterns with no match as a successful run, so
 		# candidate-only benchmarks remain compatible with older baselines.
 		for benchmark in "${selected[@]}"; do
+			benchmark_index=$((benchmark_index + 1))
 			sample_time=$bench_time
 			# Snapshot setup is excluded from timing; bound iterations to avoid
 			# calibration multiplying expensive untimed database updates.
@@ -123,21 +139,42 @@ run_revision() {
 			if [[ $benchmark == '^BenchmarkGraphPruneSparseSlotsAndBatchSize$' ]]; then
 				sample_time=1x
 			fi
-		(
-			cd "$source"
-			GOMAXPROCS=$bench_procs "$work_root/bin/$label-$package.test" \
-				-test.run '^$' \
-				-test.bench "$benchmark" \
-				-test.benchtime "$sample_time" \
-				-test.count 1 \
-				-test.benchmem \
-				-test.cpu "$bench_procs" \
-				-test.timeout 20m
-		) 2>&1 | tee -a "$output" && continue
-		if [[ $label == candidate || $network_optimization != none ]]; then
-			return 1
-		fi
-		printf 'baseline %s benchmark failed; continuing with available comparisons\n' "$package" | tee -a "$output"
+			stderr_log="$output_dir/diagnostics/$label-$package-$sample-$benchmark_index.stderr.log"
+			capture_fifo="$work_root/benchmark-stderr"
+			mkfifo "$capture_fifo"
+			# Keep only the last 64 KiB, without mixing calibration logs into the
+			# benchmark name/iteration line or retaining an unbounded stderr file.
+			tail -c 65536 <"$capture_fifo" >"$stderr_log" &
+			capture_pid=$!
+			if (
+				cd "$source"
+				GOMAXPROCS=$bench_procs "$work_root/bin/$label-$package.test" \
+					-test.run '^$' \
+					-test.bench "$benchmark" \
+					-test.benchtime "$sample_time" \
+					-test.count 1 \
+					-test.benchmem \
+					-test.cpu "$bench_procs" \
+					-test.timeout 20m
+			) 2>"$capture_fifo" | tee -a "$output"; then
+				statuses=("${PIPESTATUS[@]}")
+			else
+				statuses=("${PIPESTATUS[@]}")
+			fi
+			if wait "$capture_pid"; then capture_status=0; else capture_status=$?; fi
+			capture_pid=
+			rm "$capture_fifo"
+			status=${statuses[0]}
+			# Match pipefail's rightmost nonzero status, including a failed sink.
+			if ((statuses[1] != 0)); then status=${statuses[1]}; fi
+			if ((status == 0 && capture_status != 0)); then status=$capture_status; fi
+			printf 'binary_exit=%s\nstdout_exit=%s\nstderr_exit=%s\nexit=%s\n' "${statuses[0]}" "${statuses[1]}" "$capture_status" "$status" >"${stderr_log%.stderr.log}.exit"
+			if [[ -s $stderr_log ]]; then cat "$stderr_log" >&2; fi
+			if ((status == 0)); then continue; fi
+			if [[ $label == candidate || $network_optimization != none ]]; then
+				return "$status"
+			fi
+			printf 'baseline %s benchmark failed; continuing with available comparisons\n' "$package" | tee -a "$output"
 		done
 	done
 }
@@ -153,46 +190,73 @@ for ((sample = 1; sample <= bench_count; sample++)); do
 	fi
 done
 
-profile_codec_revision() {
+profile_revision() {
 	local label=$1
 	local source=$2
+	local package=$3 profile_case=$4 benchmark=$5 measurement=$6
 	local profile_dir="$output_dir/profiles"
-	local binary="$work_root/bin/$label-internal-types.test"
-	local status
+	local prefix="$profile_dir/$label${profile_case:+-$profile_case}"
+	local binary="$work_root/bin/$label-$package.test"
+	local status capture_status
+	local capture_fifo="$work_root/profile-stderr"
 	mkdir -p "$profile_dir"
 	# Profiling is a separate diagnostic run, never another paired sample.
+	mkfifo "$capture_fifo"
+	tail -c 65536 <"$capture_fifo" >"$prefix.stderr.log" &
+	capture_pid=$!
 	if (
 		cd "$source"
 		GOMAXPROCS=$bench_procs "$binary" \
 			-test.run '^$' \
-			-test.bench '^BenchmarkSQLBatchCodec$/^blob_1k_encode$' \
+			-test.bench "$benchmark" \
 			-test.benchtime 3s \
 			-test.count 1 \
 			-test.benchmem \
 			-test.cpu "$bench_procs" \
-			-test.cpuprofile "$profile_dir/$label-cpu.pprof" \
-			-test.memprofile "$profile_dir/$label-heap.pprof" \
+			-test.cpuprofile "$prefix-cpu.pprof" \
+			-test.memprofile "$prefix-heap.pprof" \
 			-test.timeout 1m
-	) >"$profile_dir/$label.txt" 2>&1; then
-		printf '0\n' >"$profile_dir/$label.exit"
+	) >"$prefix.txt" 2>"$capture_fifo"; then
+		status=0
 	else
 		status=$?
-		printf '%s\n' "$status" >"$profile_dir/$label.exit"
-		cat "$profile_dir/$label.txt" >&2
+	fi
+	if wait "$capture_pid"; then capture_status=0; else capture_status=$?; fi
+	capture_pid=
+	rm "$capture_fifo"
+	if ((status == 0 && capture_status != 0)); then status=$capture_status; fi
+	# Go exits successfully when no benchmark matches, which is not evidence.
+	if ((status == 0)); then
+		if ! grep -Eq "^$measurement(-[1-9][0-9]*)?[[:space:]]+[1-9][0-9]*[[:space:]]+[0-9]+([.][0-9]+)?[[:space:]]+ns/op([[:space:]]|$)" "$prefix.txt" || [[ ! -s $prefix-cpu.pprof || ! -s $prefix-heap.pprof ]]; then
+			printf 'diagnostic profile lacks its exact measurement or nonempty profiles: %s\n' "$label${profile_case:+-$profile_case}" >&2
+			status=1
+		fi
+	fi
+	printf '%s\n' "$status" >"$prefix.exit"
+	if [[ -s $prefix.stderr.log ]]; then cat "$prefix.stderr.log" >&2; fi
+	if ((status != 0)); then return "$status"; fi
+	if go tool pprof -top "$binary" "$prefix-cpu.pprof" >"$prefix-cpu-top.txt" &&
+		go tool pprof -top -cum "$binary" "$prefix-cpu.pprof" >"$prefix-cpu-cum-top.txt" &&
+		go tool pprof -top -alloc_space "$binary" "$prefix-heap.pprof" >"$prefix-alloc-space-top.txt" &&
+		go tool pprof -top -alloc_objects "$binary" "$prefix-heap.pprof" >"$prefix-alloc-objects-top.txt" &&
+		test -s "$prefix-cpu-top.txt" && test -s "$prefix-cpu-cum-top.txt" &&
+		test -s "$prefix-alloc-space-top.txt" && test -s "$prefix-alloc-objects-top.txt"; then
+		return 0
+	else
+		status=$?
+		printf '%s\n' "$status" >"$prefix.exit"
 		return "$status"
 	fi
-	# Go exits successfully when no benchmark matches, which is not evidence.
-	grep -Eq '^BenchmarkSQLBatchCodec/blob_1k_encode(-[1-9][0-9]*)?[[:space:]]' "$profile_dir/$label.txt"
-	test -s "$profile_dir/$label-cpu.pprof"
-	test -s "$profile_dir/$label-heap.pprof"
-	go tool pprof -top "$binary" "$profile_dir/$label-cpu.pprof" >"$profile_dir/$label-cpu-top.txt"
-	go tool pprof -top -alloc_space "$binary" "$profile_dir/$label-heap.pprof" >"$profile_dir/$label-alloc-space-top.txt"
-	go tool pprof -top -alloc_objects "$binary" "$profile_dir/$label-heap.pprof" >"$profile_dir/$label-alloc-objects-top.txt"
 }
 
 if [[ $network_optimization == none ]]; then
-	profile_codec_revision base "$work_root/base"
-	profile_codec_revision candidate "$work_root/candidate"
+	profile_revision base "$work_root/base" internal-types '' '^BenchmarkSQLBatchCodec$/^blob_1k_encode$' 'BenchmarkSQLBatchCodec/blob_1k_encode'
+	profile_revision candidate "$work_root/candidate" internal-types '' '^BenchmarkSQLBatchCodec$/^blob_1k_encode$' 'BenchmarkSQLBatchCodec/blob_1k_encode'
+elif [[ $network_optimization == sql ]]; then
+	for label in base candidate; do
+		profile_revision "$label" "$work_root/$label" network sql-execute-c4 '^BenchmarkThreePeerSQLExecute$/^c4$' 'BenchmarkThreePeerSQLExecute/c4'
+		profile_revision "$label" "$work_root/$label" network sql-returning-rows1 '^BenchmarkThreePeerSQLExecuteReturning$/^rows1$' 'BenchmarkThreePeerSQLExecuteReturning/rows1'
+	done
 fi
 
 {
@@ -200,6 +264,7 @@ fi
 	printf 'candidate_sha=%s\n' "$head_sha"
 	printf 'network_optimization=%s\n' "$network_optimization"
 	printf 'samples=%s\n' "$bench_count"
+	printf 'profiles=diagnostic-only-not-paired\n'
 	printf 'benchtime=%s\n' "$bench_time"
 	printf 'graph_snapshot_benchtime=20x\n'
 	printf 'gomaxprocs=%s\n' "$bench_procs"
