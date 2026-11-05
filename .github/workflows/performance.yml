@@ -125,6 +125,9 @@ jobs:
           go install golang.org/x/perf/cmd/benchstat@v0.0.0-20260825160852-19be9d8e6c70
           printf '%s\n' "$GOBIN" >>"$GITHUB_PATH"
 
+      - name: Check benchmark parser without compilation
+        run: sh benchmarks/run-ci-benchmarks_test.sh
+
       - name: Run interleaved base and candidate benchmarks
         run: |
           benchmarks/run-ci-benchmarks.sh \
