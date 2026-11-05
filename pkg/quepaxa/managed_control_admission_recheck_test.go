@@ -22,8 +22,10 @@ type managedControlObserverContextKey struct{}
 type managedControlHeldTransport struct {
 	*clusterTransport
 	held        chan struct{}
+	localSynced chan struct{}
 	release     chan struct{}
 	heldOnce    sync.Once
+	localOnce   sync.Once
 	releaseOnce sync.Once
 }
 
@@ -114,7 +116,7 @@ func newManagedControlRaceCluster(t *testing.T, verifier ManagedCheckpointCandid
 		cluster.Members = append(cluster.Members, Member{ID: id, WALIdentity: hex.EncodeToString(registeredIdentity)})
 	}
 	base := &clusterTransport{cores: make(map[NodeID]*Core), down: make(map[NodeID]bool), dropDecision: make(map[NodeID]bool)}
-	transport := &managedControlHeldTransport{clusterTransport: base, held: make(chan struct{}), release: make(chan struct{})}
+	transport := &managedControlHeldTransport{clusterTransport: base, held: make(chan struct{}), localSynced: make(chan struct{}), release: make(chan struct{})}
 	cores := make(map[NodeID]*Core, len(ids))
 	for _, id := range ids {
 		registered := wals[id]
@@ -134,6 +136,22 @@ func newManagedControlRaceCluster(t *testing.T, verifier ManagedCheckpointCandid
 		})
 		if err != nil {
 			t.Fatal(err)
+		}
+		if id == "n1" {
+			// Install before any proposals. A remote recorder response does not
+			// establish the observer Core's own ISR. Capture before Sync so the
+			// notification covers an already appended local slot-9 receipt.
+			core.commits = newGroupCommit(func() error {
+				core.mu.RLock()
+				state, exists := core.recorders[9]
+				localISR := exists && state.Step >= 4 && state.FirstCurrent != nil && state.AggregateCurrent != nil
+				core.mu.RUnlock()
+				err := registered.wal.Sync()
+				if err == nil && localISR {
+					transport.localOnce.Do(func() { close(transport.localSynced) })
+				}
+				return err
+			})
 		}
 		cores[id] = core
 		base.cores[id] = core
@@ -159,17 +177,12 @@ func managedControlRacePrefix(t *testing.T, core *Core) {
 func startManagedControlProposal(t *testing.T, ctx context.Context, core *Core, transport *managedControlHeldTransport, value []byte) *managedControlProposal {
 	t.Helper()
 	proposal := &managedControlProposal{done: make(chan managedControlProposalResult, 1)}
+	deadline := time.NewTimer(5 * time.Second)
+	defer deadline.Stop()
 	go func() {
 		slot, _, err := core.Propose(ctx, value)
 		proposal.done <- managedControlProposalResult{slot: slot, err: err}
 	}()
-	select {
-	case <-transport.held:
-	case <-ctx.Done():
-		t.Fatalf("proposal did not reach actual held recorder response: %v", ctx.Err())
-	case <-time.After(5 * time.Second):
-		t.Fatal("proposal did not reach actual held recorder response")
-	}
 	t.Cleanup(func() {
 		transport.releaseHeld()
 		if !proposal.got.Load() {
@@ -181,6 +194,31 @@ func startManagedControlProposal(t *testing.T, ctx context.Context, core *Core, 
 			}
 		}
 	})
+	select {
+	case <-transport.held:
+	case <-ctx.Done():
+		t.Fatalf("proposal did not reach actual held recorder response: %v", ctx.Err())
+	case <-deadline.C:
+		t.Fatal("proposal did not reach actual held recorder response")
+	}
+	select {
+	case <-transport.localSynced:
+	case <-ctx.Done():
+		t.Fatalf("proposal did not reach the actual local recorder: %v", ctx.Err())
+	case <-deadline.C:
+		t.Fatal("proposal did not reach the actual local recorder")
+	}
+	core.mu.RLock()
+	state, exists := core.recorders[9]
+	_, certified := core.decided[9]
+	hash := ValueHash(sha256.Sum256(value))
+	valid := exists && state.Step >= 4 && state.FirstCurrent != nil && state.AggregateCurrent != nil &&
+		state.FirstCurrent.Hash == hash && state.AggregateCurrent.Hash == hash &&
+		string(core.values[hash]) == string(value) && core.tip == 8 && core.highestKnownSlotLocked() == 9 && !certified
+	core.mu.RUnlock()
+	if !valid {
+		t.Fatal("held proposal lacks the exact unresolved local slot-9 ISR")
+	}
 	return proposal
 }
 
@@ -323,5 +361,102 @@ func TestObserveManagedControlVerifierFailureStaysGenericAfterActualCertificatio
 	}
 	if _, ok := core.CertifiedValue(9); !ok {
 		t.Fatal("verifier-negative race lacks the actual slot-9 certificate")
+	}
+}
+
+func TestObserveManagedControlRemoteRecorderDoesNotEstablishLocalISR(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	var verified atomic.Bool
+	cores, transport := newManagedControlRaceCluster(t, func(ctx context.Context, _ ManagedCheckpointCandidate) error {
+		if ctx.Value(managedControlObserverContextKey{}) == true {
+			verified.Store(true)
+		}
+		return nil
+	})
+	core := cores["n1"]
+	localEntered, localRelease := make(chan struct{}), make(chan struct{})
+	if core.localMode {
+		t.Fatal("local recorder delay requires the nonLocal Record path")
+	}
+	var armed atomic.Bool
+	var enteredOnce, releaseOnce sync.Once
+	releaseLocal := func() { releaseOnce.Do(func() { close(localRelease) }) }
+	// Install before proposals. nonLocal record invokes this with only its
+	// slot lock, before c.mu.Lock; recordLocalOwned invokes it under c.mu and
+	// must never be used by this observer-while-blocked regression.
+	core.recordBeforeAppend = func() {
+		if armed.Load() {
+			enteredOnce.Do(func() { close(localEntered) })
+			<-localRelease
+		}
+	}
+	t.Cleanup(releaseLocal)
+	managedControlRacePrefix(t, core)
+	seal := managedAppendOnlyTestSeal()
+	seal.Index = 8
+	seal.GenerationAnchorHash = core.GenerationAnchorHash()
+	seal.PrefixHash, _ = core.PrefixHash(8)
+	seal.NextLeaderOrder, seal.FollowingLeaderOrder, _ = core.CheckpointLeaderOrders(8)
+	value, err := EncodeCheckpointSeal(seal)
+	if err != nil {
+		t.Fatal(err)
+	}
+	armed.Store(true)
+	done := make(chan managedControlProposalResult, 1)
+	go func() {
+		slot, _, err := core.Propose(ctx, value)
+		done <- managedControlProposalResult{slot: slot, err: err}
+	}()
+	var result managedControlProposalResult
+	joined := false
+	t.Cleanup(func() {
+		releaseLocal()
+		transport.releaseHeld()
+		cancel()
+		if !joined {
+			select {
+			case <-done:
+			case <-time.After(5 * time.Second):
+				t.Error("controlled local recorder proposal did not terminate")
+			}
+		}
+	})
+	for _, event := range []<-chan struct{}{transport.held, localEntered} {
+		select {
+		case <-event:
+		case <-ctx.Done():
+			t.Fatal("controlled recorder ordering was not established", ctx.Err())
+		}
+	}
+	core.mu.RLock()
+	_, localISR := core.recorders[9]
+	committed, recorded := core.tip, core.highestKnownSlotLocked()
+	core.mu.RUnlock()
+	observerCtx := context.WithValue(ctx, managedControlObserverContextKey{}, true)
+	_, err = core.ObserveManagedAppendOnlyControl(observerCtx)
+	if localISR || committed != 8 || recorded != 8 || !errors.Is(err, ErrManagedControlObservationUnavailable) || verified.Load() {
+		t.Fatalf("remote-only ordering localISR=%v C=%d R=%d verifier=%v err=%v", localISR, committed, recorded, verified.Load(), err)
+	}
+	releaseLocal()
+	select {
+	case <-transport.localSynced:
+	case <-ctx.Done():
+		t.Fatal("released local recorder did not sync", ctx.Err())
+	}
+	observation, err := core.ObserveManagedAppendOnlyControl(observerCtx)
+	if err != nil || !verified.Load() || observation.CommittedTip != 8 || observation.ObservedSlot != 9 {
+		t.Fatalf("local recorder observation=%+v verifier=%v err=%v", observation, verified.Load(), err)
+	}
+	transport.releaseHeld()
+	select {
+	case result = <-done:
+		joined = true
+	case <-ctx.Done():
+		t.Fatal("released original QCKP did not certify", ctx.Err())
+	}
+	certified, ok := core.CertifiedValue(9)
+	if result.err != nil || result.slot != 9 || !ok || certified.Hash != ValueHash(sha256.Sum256(value)) || string(certified.Value) != string(value) || len(certified.Certificate) == 0 {
+		t.Fatal("controlled original QCKP lost its exact certificate", result, ok)
 	}
 }
