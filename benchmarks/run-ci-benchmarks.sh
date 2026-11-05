@@ -199,6 +199,11 @@ profile_revision() {
 	local binary="$work_root/bin/$label-$package.test"
 	local status capture_status
 	local capture_fifo="$work_root/profile-stderr"
+	set --
+	if [[ $network_optimization == sql ]]; then
+		set -- -test.blockprofile "$prefix-block.pprof" -test.blockprofilerate 1 \
+			-test.mutexprofile "$prefix-mutex.pprof" -test.mutexprofilefraction 1
+	fi
 	mkdir -p "$profile_dir"
 	# Profiling is a separate diagnostic run, never another paired sample.
 	mkfifo "$capture_fifo"
@@ -215,6 +220,7 @@ profile_revision() {
 			-test.cpu "$bench_procs" \
 			-test.cpuprofile "$prefix-cpu.pprof" \
 			-test.memprofile "$prefix-heap.pprof" \
+			"$@" \
 			-test.timeout 1m
 	) >"$prefix.txt" 2>"$capture_fifo"; then
 		status=0
@@ -232,6 +238,10 @@ profile_revision() {
 			status=1
 		fi
 	fi
+	if ((status == 0)) && [[ $network_optimization == sql && (! -s $prefix-block.pprof || ! -s $prefix-mutex.pprof) ]]; then
+		printf 'diagnostic contention profile is empty: %s\n' "$label-$profile_case" >&2
+		status=1
+	fi
 	printf '%s\n' "$status" >"$prefix.exit"
 	if [[ -s $prefix.stderr.log ]]; then cat "$prefix.stderr.log" >&2; fi
 	if ((status != 0)); then return "$status"; fi
@@ -241,12 +251,24 @@ profile_revision() {
 		go tool pprof -top -alloc_objects "$binary" "$prefix-heap.pprof" >"$prefix-alloc-objects-top.txt" &&
 		test -s "$prefix-cpu-top.txt" && test -s "$prefix-cpu-cum-top.txt" &&
 		test -s "$prefix-alloc-space-top.txt" && test -s "$prefix-alloc-objects-top.txt"; then
-		return 0
+		status=0
 	else
 		status=$?
-		printf '%s\n' "$status" >"$prefix.exit"
-		return "$status"
 	fi
+	if ((status == 0)) && [[ $network_optimization == sql ]]; then
+		if go tool pprof -top "$binary" "$prefix-block.pprof" >"$prefix-block-top.txt" &&
+			go tool pprof -top -cum "$binary" "$prefix-block.pprof" >"$prefix-block-cum-top.txt" &&
+			go tool pprof -top "$binary" "$prefix-mutex.pprof" >"$prefix-mutex-top.txt" &&
+			go tool pprof -top -cum "$binary" "$prefix-mutex.pprof" >"$prefix-mutex-cum-top.txt" &&
+			test -s "$prefix-block-top.txt" && test -s "$prefix-block-cum-top.txt" &&
+			test -s "$prefix-mutex-top.txt" && test -s "$prefix-mutex-cum-top.txt"; then
+			status=0
+		else
+			status=$?
+		fi
+	fi
+	printf '%s\n' "$status" >"$prefix.exit"
+	return "$status"
 }
 
 if [[ $network_optimization == none ]]; then

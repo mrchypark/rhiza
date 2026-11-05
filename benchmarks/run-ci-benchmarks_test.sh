@@ -41,6 +41,9 @@ case "$1" in
     version) echo 'go version mock';;
     tool)
         if [ "${MOCK_PPROF_FAIL:-0}" -eq 1 ]; then echo 'pprof failure' >&2; exit 31; fi
+        case "${MOCK_CONTENTION_PPROF_FAIL:-}:$*" in
+            block:*-block.pprof|mutex:*-mutex.pprof) echo 'contention pprof failure' >&2; exit 37;;
+        esac
         echo 'mock profile report'
         ;;
     test)
@@ -54,12 +57,17 @@ label=${name%%-*}
 package=${name#*-}
 package=${package%.test}
 bench= cpu= heap= benchtime=
+block= mutex= block_rate= mutex_rate=
 while [ "$#" -gt 0 ]; do
     case "$1" in
         -test.bench) bench=$2; shift;;
         -test.benchtime) benchtime=$2; shift;;
         -test.cpuprofile) cpu=$2; shift;;
         -test.memprofile) heap=$2; shift;;
+        -test.blockprofile) block=$2; shift;;
+        -test.blockprofilerate) block_rate=$2; shift;;
+        -test.mutexprofile) mutex=$2; shift;;
+        -test.mutexprofilefraction) mutex_rate=$2; shift;;
         -test.list) echo BenchmarkMock; exit 0;;
     esac
     shift
@@ -74,8 +82,18 @@ if [ -n "$cpu" ]; then
         printf 'profile\n' > "$cpu"
         printf 'profile\n' > "$heap"
     fi
+    if [ "$package" = network ]; then
+        [ -n "$block" ] && [ -n "$mutex" ] && [ "$block_rate" = 1 ] && [ "$mutex_rate" = 1 ]
+        : > "$block"
+        : > "$mutex"
+        if [ "${MOCK_EMPTY_CONTENTION:-}" != block ]; then printf 'block profile\n' > "$block"; fi
+        if [ "${MOCK_EMPTY_CONTENTION:-}" != mutex ]; then printf 'mutex profile\n' > "$mutex"; fi
+    else
+        [ -z "$block$mutex$block_rate$mutex_rate" ]
+    fi
     if [ "${MOCK_PROFILE_NO_MATCH:-0}" -eq 1 ]; then echo 'PASS'; exit 0; fi
 else
+    [ -z "$block$mutex$block_rate$mutex_rate" ]
     printf '%s\t%s\t%s\n' "$label" "$package" "$bench" >> "$MOCK_RUN_LOG"
     suffix=$(printf '%s' "$bench" | tr -cs 'A-Za-z0-9' '_')
     measurement="BenchmarkMock_${package}_${suffix}-2"
@@ -157,7 +175,7 @@ for label in base candidate; do
     for profile in sql-execute-c4 sql-returning-rows1; do
         prefix="$scratch/sql-success/profiles/$label-$profile"
         [ "$(cat "$prefix.exit")" -eq 0 ]
-        for suffix in cpu.pprof heap.pprof cpu-top.txt cpu-cum-top.txt alloc-space-top.txt alloc-objects-top.txt; do [ -s "$prefix-$suffix" ]; done
+        for suffix in cpu.pprof heap.pprof block.pprof mutex.pprof cpu-top.txt cpu-cum-top.txt alloc-space-top.txt alloc-objects-top.txt block-top.txt block-cum-top.txt mutex-top.txt mutex-cum-top.txt; do [ -s "$prefix-$suffix" ]; done
         ! grep -Eq 'stderr-only|BenchmarkStderr' "$prefix.txt"
         grep -q 'stderr-only' "$prefix.stderr.log"
     done
@@ -178,4 +196,16 @@ unset MOCK_EMPTY_PROFILE
 MOCK_PPROF_FAIL=1; export MOCK_PPROF_FAIL
 run_case sql-pprof-failure 31
 [ "$(cat "$scratch/sql-pprof-failure/profiles/base-sql-execute-c4.exit")" -eq 31 ]
+unset MOCK_PPROF_FAIL
+for kind in block mutex; do
+    MOCK_EMPTY_CONTENTION=$kind; export MOCK_EMPTY_CONTENTION
+    run_case "sql-empty-$kind-profile" 1
+    [ "$(cat "$scratch/sql-empty-$kind-profile/profiles/base-sql-execute-c4.exit")" -eq 1 ]
+done
+unset MOCK_EMPTY_CONTENTION
+for kind in block mutex; do
+    MOCK_CONTENTION_PPROF_FAIL=$kind; export MOCK_CONTENTION_PPROF_FAIL
+    run_case "sql-$kind-pprof-failure" 37
+    [ "$(cat "$scratch/sql-$kind-pprof-failure/profiles/base-sql-execute-c4.exit")" -eq 37 ]
+done
 echo 'PASS interleaved stderr isolation, all ten paired samples/six packages, original failure and bounded diagnostics'
