@@ -9,6 +9,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log"
 	"path"
 	"reflect"
 	"slices"
@@ -68,59 +69,63 @@ type Host struct {
 // quorum. Evidence/CAS failures after runtime creation return the host as well:
 // callers must retain it for diagnosis/recovery or call Close.
 func Open(ctx context.Context, cfg Config) (*Host, error) {
+	openStage := "host_config"
 	cfg.Runtime = node.CloneManagedRuntimeConfig(cfg.Runtime)
 	cfg.RepairOrigin = bytes.Clone(cfg.RepairOrigin)
 	if cfg.Runtime.ObjStoreProvider == "" {
 		cfg.Runtime.ObjStoreProvider = "s3"
 	}
 	if err := operator.ValidateV1Alpha2ApplicationProfile(cfg.Plan.ApplicationProtocol, cfg.Plan.EvidenceFormat); err != nil {
-		return nil, fmt.Errorf("unsupported managed startup profile: %w", err)
+		return nil, logManagedHostOpenFailure(openStage, fmt.Errorf("unsupported managed startup profile: %w", err))
 	}
 	if cfg.Store == nil || cfg.PodUID == "" {
-		return nil, fmt.Errorf("exact SQL initialization plan, store, and Pod UID required")
+		return nil, logManagedHostOpenFailure(openStage, fmt.Errorf("exact SQL initialization plan, store, and Pod UID required"))
 	}
 	if cfg.Plan.ApplicationProtocol != "" && cfg.Plan.Generation != 0 {
-		return nil, fmt.Errorf("mixed managed generation is not supported")
+		return nil, logManagedHostOpenFailure(openStage, fmt.Errorf("mixed managed generation is not supported"))
 	}
 	if cfg.Runtime.ObjStoreDurability == "" {
 		cfg.Runtime.ObjStoreDurability = types.ObjectStoreDurabilityBeforeAck
 	}
 	if cfg.Runtime.ObjStoreDurability != types.ObjectStoreDurabilityBeforeAck {
-		return nil, fmt.Errorf("managed SQL requires configured before-ack durability")
+		return nil, logManagedHostOpenFailure(openStage, fmt.Errorf("managed SQL requires configured before-ack durability"))
 	}
+	openStage = "host_binding"
 	namespace, err := node.ManagedNamespaceFor(cfg.StorageRoot, cfg.Ref.UID, cfg.Plan.Generation, cfg.Plan.AssignmentID, string(cfg.Runtime.ClusterID))
 	if err != nil || cfg.Runtime.ObjStorePrefix != namespace.ConfigPrefix {
-		return nil, errors.Join(fmt.Errorf("installed runtime final namespace differs from exact assignment"), err)
+		return nil, logManagedHostOpenFailure(openStage, errors.Join(fmt.Errorf("installed runtime final namespace differs from exact assignment"), err))
 	}
 	cluster, err := types.ManagedClusterID(cfg.Ref.UID, cfg.Plan.Generation)
 	memberID, memberErr := types.ManagedNodeID(cfg.PodUID)
 	if err != nil || memberErr != nil || cfg.Runtime.ClusterID != cluster || cfg.Runtime.NodeID != memberID {
-		return nil, errors.Join(fmt.Errorf("runtime member identity differs from CR generation or actual Pod UID"), err, memberErr)
+		return nil, logManagedHostOpenFailure(openStage, errors.Join(fmt.Errorf("runtime member identity differs from CR generation or actual Pod UID"), err, memberErr))
 	}
 	h := &Host{cfg: cfg, node: node.New(&cfg.Runtime)}
 	h.admissionLifetime, h.stopAdmission = context.WithCancel(context.Background())
 	source, member, err := h.node.PreparedStartupBindingDigestsForProtocol(cfg.Plan.ApplicationProtocol)
 	if err != nil {
-		return nil, err
+		return nil, logManagedHostOpenFailure(openStage, err)
 	}
 	common, err := h.node.ManagedBootstrapPlanDigestForProtocol(source, cfg.Plan.EvidenceFormat, cfg.Plan.ApplicationProtocol)
 	if err != nil || cfg.Plan.PhysicalBinding != source || cfg.Plan.BootstrapPlanDigest != common || cfg.Plan.ClusterUID != cfg.Ref.UID {
-		return nil, errors.Join(fmt.Errorf("installed runtime differs from initialization plan"), err)
+		return nil, logManagedHostOpenFailure(openStage, errors.Join(fmt.Errorf("installed runtime differs from initialization plan"), err))
 	}
+	openStage = "host_plan"
 	initial, err := operator.LoadV1Alpha2ApplicationInit(ctx, cfg.Store, cfg.Ref)
 	if err != nil || initial.Assignment().Plan != cfg.Plan {
-		return nil, errors.Join(fmt.Errorf("live initialization assignment mismatch"), err)
+		return nil, logManagedHostOpenFailure(openStage, errors.Join(fmt.Errorf("live initialization assignment mismatch"), err))
 	}
 	status, err := cfg.Store.Load(ctx, cfg.Ref)
 	if err != nil {
-		return nil, err
+		return nil, logManagedHostOpenFailure(openStage, err)
 	}
+	openStage = "host_bootstrap"
 	bootstrap, err := status.BootstrapPlan()
 	if err != nil {
-		return nil, err
+		return nil, logManagedHostOpenFailure(openStage, err)
 	}
 	if bootstrap.ClusterID != cfg.Runtime.ClusterID || bootstrap.PhysicalBinding != source || bootstrap.EvidenceFormat != cfg.Plan.EvidenceFormat || bootstrap.Durability != cfg.Runtime.ObjStoreDurability || bootstrap.Reconfiguration != cfg.Runtime.EnableReconfiguration {
-		return nil, fmt.Errorf("installed runtime differs from full bootstrap plan")
+		return nil, logManagedHostOpenFailure(openStage, fmt.Errorf("installed runtime differs from full bootstrap plan"))
 	}
 	initialMember := false
 	for _, m := range bootstrap.Members {
@@ -129,53 +134,58 @@ func Open(ctx context.Context, cfg Config) (*Host, error) {
 		}
 	}
 	if cfg.Runtime.Learner == nil && !initialMember {
-		return nil, fmt.Errorf("exact initial Pod/member/key is not in bootstrap plan")
+		return nil, logManagedHostOpenFailure(openStage, fmt.Errorf("exact initial Pod/member/key is not in bootstrap plan"))
 	}
+	openStage = "host_prepared_identity"
 	if cfg.Prepared != nil && cfg.Runtime.Learner != nil {
 		admission, err := operator.LoadV1Alpha2Admission(ctx, cfg.Store, cfg.Ref)
 		if err != nil {
-			return nil, err
+			return nil, logManagedHostOpenFailure(openStage, err)
 		}
 		if repair, ok := admission.Repair(); ok && repairPlanMatchesConfiguredLearner(repair.Plan, cfg) {
 			if repair.State != "Closed" {
-				return nil, fmt.Errorf("prepared repair learner requires the exact current closed repair")
+				return nil, logManagedHostOpenFailure(openStage, fmt.Errorf("prepared repair learner requires the exact current closed repair"))
 			}
 			if len(cfg.RepairOrigin) == 0 {
-				return nil, fmt.Errorf("closed repair learner requires immutable repair origin")
+				return nil, logManagedHostOpenFailure(openStage, fmt.Errorf("closed repair learner requires immutable repair origin"))
 			}
 		}
 	}
 	if initial.Assignment().State == "Unused" && !initialMember {
-		return nil, fmt.Errorf("only an exact initial member may consume E0")
+		return nil, logManagedHostOpenFailure(openStage, fmt.Errorf("only an exact initial member may consume E0"))
 	}
+	openStage = "host_authority"
 	h.authority = initial.Authority()
 	ever := initial.EverApplicationReserved()
 	if h.authority.Generation != cfg.Plan.Generation || h.authority.Binding.DeploymentUID != cfg.Plan.DeploymentUID || h.authority.Binding.StorageID != cfg.Plan.StorageID {
-		return nil, fmt.Errorf("current authority differs from installed generation and storage binding")
+		return nil, logManagedHostOpenFailure(openStage, fmt.Errorf("current authority differs from installed generation and storage binding"))
 	}
 	h.identity = node.ManagedStartupIdentity{Member: recovery.PreparedStartupIdentity{ClusterUID: cfg.Ref.UID, Generation: cfg.Plan.Generation, DeploymentUID: cfg.Plan.DeploymentUID, PodUID: cfg.PodUID, NodeID: string(cfg.Runtime.NodeID), SourceBinding: source, ConfigDigest: member}, AssignmentID: cfg.Plan.AssignmentID, IntentHash: cfg.Plan.IntentHash, StorageID: cfg.Plan.StorageID, PhysicalBinding: source, BootstrapPlanDigest: common, EvidenceFormat: cfg.Plan.EvidenceFormat, ApplicationProtocol: cfg.Plan.ApplicationProtocol}
+	openStage = "host_prepared_identity"
 	if cfg.Prepared != nil {
 		if cfg.Prepared.Identity() != h.identity.Member {
-			return nil, fmt.Errorf("prepared handoff differs from exact configured execution identity")
+			return nil, logManagedHostOpenFailure(openStage, fmt.Errorf("prepared handoff differs from exact configured execution identity"))
 		}
 		h.identity.Fresh = false
 	}
+	openStage = "host_authority"
 	if err := h.ValidateManagedStartup(ctx, h.identity); err != nil {
-		return nil, err
+		return nil, logManagedHostOpenFailure(openStage, err)
 	}
+	openStage = "host_source"
 	birthAuthority, err := operator.LoadV1Alpha2ApplicationInit(ctx, cfg.Store, cfg.Ref)
 	if err != nil || birthAuthority.Assignment().Plan != cfg.Plan || birthAuthority.Authority() != h.authority {
-		return nil, errors.Join(fmt.Errorf("birth assignment changed"), err)
+		return nil, logManagedHostOpenFailure(openStage, errors.Join(fmt.Errorf("birth assignment changed"), err))
 	}
 	emptySource, err := h.node.PrepareManagedSQLSource(ctx, h.identity, birthAuthority.Assignment().State == "Unused" && !birthAuthority.EverApplicationReserved() && cfg.Prepared == nil)
 	if err != nil {
-		return nil, err
+		return nil, logManagedHostOpenFailure(openStage, err)
 	}
 	h.identity.Fresh = emptySource && !ever && cfg.Prepared == nil && initialMember
 	if h.identity.Fresh && initial.Assignment().State == "Consumed" {
 		a, err := h.live(ctx)
 		if err != nil {
-			return nil, err
+			return nil, logManagedHostOpenFailure(openStage, err)
 		}
 		reserved := a.EverApplicationReserved()
 		if _, pending := a.Pending(); reserved || pending {
@@ -184,41 +194,61 @@ func Open(ctx context.Context, cfg Config) (*Host, error) {
 	}
 	if initial.Assignment().State == "Unused" {
 		if ever {
-			return nil, fmt.Errorf("reserved application history prevents E0 consumption")
+			return nil, logManagedHostOpenFailure(openStage, fmt.Errorf("reserved application history prevents E0 consumption"))
 		}
 		if err := h.node.VerifyManagedSQLFreshSource(ctx, h.identity); err != nil {
-			return nil, err
+			return nil, logManagedHostOpenFailure(openStage, err)
 		}
 	}
+	openStage = "host_node_open"
 	if err := h.node.OpenManaged(ctx, node.ManagedStartupConfig{StorageRoot: cfg.StorageRoot, PeerRecovery: true, Identity: h.identity, Checker: h, Prepared: cfg.Prepared, RepairOrigin: cfg.RepairOrigin, BootstrapMember: cfg.Runtime.Learner == nil}); err != nil {
-		return nil, err
+		return nil, logManagedHostOpenFailure(openStage, err)
 	}
+	openStage = "host_initialization"
 	if initial.Assignment().State == "Unused" {
 		evidence, err := h.inspectEvidence(ctx, true, false)
 		if err != nil {
-			return h, err
+			return h, logManagedHostOpenFailure(openStage, err)
 		}
 		liveInit, err := operator.LoadV1Alpha2ApplicationInit(ctx, cfg.Store, cfg.Ref)
 		if err != nil {
-			return h, err
+			return h, logManagedHostOpenFailure(openStage, err)
 		}
 		if liveInit.EverApplicationReserved() {
-			return h, fmt.Errorf("reservation raced initial E0 inspection")
+			return h, logManagedHostOpenFailure(openStage, fmt.Errorf("reservation raced initial E0 inspection"))
 		}
 		if err := h.node.VerifyManagedSQLFreshSource(ctx, h.identity); err != nil {
-			return h, err
+			return h, logManagedHostOpenFailure(openStage, err)
 		}
 		_, _, err = operator.CommitV1Alpha2ApplicationInit(ctx, cfg.Store, initial, cfg.Plan, evidence)
 		if err != nil {
 			live, e := operator.LoadV1Alpha2ApplicationInit(ctx, cfg.Store, cfg.Ref)
 			if e != nil || live.Assignment().Plan != cfg.Plan || live.Assignment().State != "Consumed" || live.Assignment().InitialEvidenceDigest != evidenceHash(evidence) {
-				return h, errors.Join(err, e)
+				return h, logManagedHostOpenFailure(openStage, errors.Join(err, e))
 			}
 			// Matching consumption establishes initialization only. Admission is
 			// always loaded again and local state checked by Ready/Execute.
 		}
 	}
 	return h, nil
+}
+
+func managedHostOpenDiagnostic(stage string) string {
+	switch stage {
+	case "host_config", "host_binding", "host_plan", "host_bootstrap", "host_authority", "host_prepared_identity", "host_source", "host_node_open", "host_initialization":
+		return "MANAGED_HOST_OPEN_FAILURE stage=" + stage
+	default:
+		return ""
+	}
+}
+
+func logManagedHostOpenFailure(stage string, err error) error {
+	if err != nil {
+		if line := managedHostOpenDiagnostic(stage); line != "" {
+			log.Print(line)
+		}
+	}
+	return err
 }
 
 func repairPlanMatchesConfiguredLearner(plan operator.V1Alpha2RepairPlan, cfg Config) bool {
@@ -725,14 +755,32 @@ func (h *Host) Query(ctx context.Context, req QueryRequest) (QueryResponse, erro
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	if h.closed {
-		return QueryResponse{}, fmt.Errorf("SQL host closed")
+		return QueryResponse{}, h.logQueryFailure("host_closed", fmt.Errorf("SQL host closed"))
 	}
 	operationCtx, release := h.internalRequestContext(ctx)
 	defer release()
 	if err := h.ensureInitialRequestAdmission(operationCtx); err != nil {
-		return QueryResponse{}, err
+		return QueryResponse{}, h.logQueryFailure("host_initial_admission", err)
 	}
 	return h.node.QueryManagedSQL(operationCtx, req)
+}
+
+func managedHostQueryDiagnostic(stage string) string {
+	switch stage {
+	case "host_closed", "host_initial_admission":
+		return "MANAGED_SQL_QUERY_FAILURE stage=" + stage
+	default:
+		return ""
+	}
+}
+
+func (h *Host) logQueryFailure(stage string, err error) error {
+	if err != nil && h.internalRequests() {
+		if line := managedHostQueryDiagnostic(stage); line != "" {
+			log.Print(line)
+		}
+	}
+	return err
 }
 
 func (h *Host) Close() error {

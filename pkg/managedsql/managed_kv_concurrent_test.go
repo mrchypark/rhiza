@@ -3,9 +3,12 @@ package managedsql
 import (
 	"bytes"
 	"context"
+	"crypto/rand"
+	"crypto/sha256"
 	"encoding/hex"
 	"errors"
 	"net/http"
+	"path/filepath"
 	"reflect"
 	"testing"
 	"time"
@@ -15,7 +18,9 @@ import (
 	"github.com/mrchypark/rhiza/pkg/network"
 	"github.com/mrchypark/rhiza/pkg/node"
 	"github.com/mrchypark/rhiza/pkg/operator"
+	"github.com/mrchypark/rhiza/pkg/qlog"
 	"github.com/mrchypark/rhiza/pkg/quepaxa"
+	"github.com/mrchypark/rhiza/pkg/quepaxa/walfb"
 )
 
 func mixedHostQuorum(t *testing.T, wrappers ...func(int, http.RoundTripper) http.RoundTripper) ([]Config, []*Host, *sqlStatusFixture) {
@@ -203,7 +208,7 @@ func TestManagedKVHostMixedRoundTripAndDetailedRecovery(t *testing.T) {
 }
 
 func TestManagedKVHostLocalObservationSurvivesQuorumLoss(t *testing.T) {
-	_, hosts, _ := mixedHostQuorum(t)
+	configs, hosts, _ := mixedHostQuorum(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 	h := hosts[0]
@@ -238,22 +243,60 @@ func TestManagedKVHostLocalObservationSurvivesQuorumLoss(t *testing.T) {
 	if err == nil {
 		t.Fatal("linearizable read bypassed quorum")
 	}
-	beforeWrite, err := h.node.ManagedState()
+	cluster := quepaxa.Cluster{ConfigID: 1, Members: configs[0].Runtime.Members}
+	profile := network.ManagedPeerProfile{ApplicationProtocol: configs[0].Plan.ApplicationProtocol, BootstrapPlanDigest: configs[0].Plan.BootstrapPlanDigest, Generation: int64(configs[0].Plan.Generation)}
+	client, err := network.NewTransportForManagedProfile(configs[0].Runtime.ClusterID, configs[0].Runtime.NodeID, &cluster, configs[0].Runtime.PeerToken, profile)
 	if err != nil {
 		t.Fatal(err)
 	}
+	defer client.Close()
+	beforeSeed, err := h.node.ManagedState()
+	if err != nil {
+		t.Fatal(err)
+	}
+	certified := hostQuorumLossCertifiedPrefix(t, ctx, client, configs[0].Runtime.NodeID, beforeSeed.CertifiedTip)
+	// Real authenticated recorder traffic creates an uncertified control ISR.
+	// No certificate or private Core state is fabricated; the other voters are closed.
+	var nonce [types.ReadBarrierNonceSize]byte
+	if _, err := rand.Read(nonce[:]); err != nil {
+		t.Fatal(err)
+	}
+	seed := types.EncodeReadBarrier(nonce)
+	seedHash := sha256.Sum256(seed)
+	seedSlot := quepaxa.Slot(beforeSeed.RecorderTip + 1)
+	summary, err := client.SendRecord(ctx, configs[0].Runtime.NodeID, quepaxa.RecordRequest{Slot: seedSlot, Step: 4, ConfigID: 1, Proposal: quepaxa.Proposal{Priority: quepaxa.Priority{31: 1}, ProposerID: configs[0].Runtime.NodeID, Hash: seedHash, Value: seed}})
+	if err != nil || summary.FirstCurrent == nil || summary.FirstCurrent.Hash != seedHash {
+		t.Fatal("actual pending read-barrier ISR was not recorded", err)
+	}
+	beforeWrite, err := h.node.ManagedState()
+	if err != nil || beforeWrite.RecorderTip < uint64(seedSlot) || beforeWrite.RecorderTip <= beforeWrite.CertifiedTip || beforeWrite.CertifiedTip != beforeSeed.CertifiedTip || beforeWrite.AppliedTip != beforeSeed.AppliedTip {
+		t.Fatalf("fixture lacks an uncertified recorder gap: before=%+v pending=%+v err=%v", beforeSeed, beforeWrite, err)
+	}
 	write, stop := context.WithTimeout(ctx, 200*time.Millisecond)
-	_, err = h.KVMutate(write, "put", network.KVMutationRequest{RequestID: "must-not-reserve", Key: "new"})
+	refused, err := h.KVMutate(write, "put", network.KVMutationRequest{RequestID: "must-not-reserve", Key: "new"})
 	stop()
-	if !errors.Is(err, ErrKVNotSubmitted) && !errors.Is(err, context.DeadlineExceeded) {
-		t.Fatal("new write bypassed quorum admission", err)
+	// A live caller joining a failed earlier barrier gets typed availability,
+	// not the previous owner's deadline. Generic unresolved-history text alone
+	// is not an accepted classification.
+	notSubmitted := errors.Is(err, ErrKVNotSubmitted)
+	callerDeadline := errors.Is(err, context.DeadlineExceeded)
+	unavailable := errors.Is(err, network.ErrNotReady)
+	if !notSubmitted && !callerDeadline && !unavailable {
+		t.Fatalf("quorum refusal lacks a known typed availability classification: not_submitted=%t deadline=%t not_ready=%t err=%v", notSubmitted, callerDeadline, unavailable, err)
+	}
+	if !reflect.DeepEqual(refused, network.KVMutationResponse{}) {
+		t.Fatalf("quorum-refused write returned an ACK: %+v", refused)
 	}
 	// An admitted 9/10 runtime waits for fresh quorum inside the engine, so
 	// deadline expiry need not use the Host's initial-admission error wrapper.
-	// Prove no intent was certified or recorded instead of relying on that wrapper.
+	// A real own-nonce control ISR may be recorded, even in a reused vacant
+	// slot, but cannot certify/apply intent or replace runtime identity.
 	afterWrite, err := h.node.ManagedState()
-	if err != nil || afterWrite != beforeWrite {
+	if err != nil || afterWrite.WALIdentity != beforeWrite.WALIdentity || afterWrite.ExistingRegisteredWAL != beforeWrite.ExistingRegisteredWAL || afterWrite.CertifiedTip != beforeWrite.CertifiedTip || afterWrite.AppliedTip != beforeWrite.AppliedTip || afterWrite.RecorderTip < beforeWrite.RecorderTip {
 		t.Fatalf("quorum-refused write changed runtime: before=%+v after=%+v err=%v", beforeWrite, afterWrite, err)
+	}
+	if after := hostQuorumLossCertifiedPrefix(t, ctx, client, configs[0].Runtime.NodeID, afterWrite.CertifiedTip); !reflect.DeepEqual(certified, after) {
+		t.Fatal("quorum-refused write changed certified decision bytes")
 	}
 	missing, err := h.RequestStatus(ctx, network.RequestStatusRequest{Kind: "kv", RequestID: "must-not-reserve"})
 	if err != nil || missing.Receipt != nil {
@@ -262,5 +305,151 @@ func TestManagedKVHostLocalObservationSurvivesQuorumLoss(t *testing.T) {
 	value, err = h.KVGet(ctx, network.KVGetRequest{Key: "new", Consistency: "local"})
 	if err != nil || value.Found {
 		t.Fatalf("quorum-refused write changed the value: %+v %v", value, err)
+	}
+	retained, err := h.RequestStatus(ctx, network.RequestStatusRequest{Kind: "kv", RequestID: req.RequestID})
+	if err != nil || !reflect.DeepEqual(retained, status) {
+		t.Fatal("quorum-refused write changed prior acknowledged receipt", err)
+	}
+	value, err = h.KVGet(ctx, network.KVGetRequest{Key: req.Key, Consistency: "local"})
+	if err != nil || !value.Found || string(value.Value) != "acknowledged" {
+		t.Fatal("quorum-refused write changed prior acknowledged data", err)
+	}
+	if err := h.Close(); err != nil {
+		t.Fatal(err)
+	}
+	assertHostQuorumLossControlWAL(t, configs[0], beforeWrite, seedHash)
+}
+
+func hostQuorumLossCertifiedPrefix(t *testing.T, ctx context.Context, client *network.Transport, id quepaxa.NodeID, tip uint64) []quepaxa.DecidedValue {
+	t.Helper()
+	var values []quepaxa.DecidedValue
+	for from := quepaxa.Slot(1); uint64(from) <= tip; {
+		page, err := client.FetchDecisions(ctx, id, from, 128)
+		if err != nil || len(page.Decisions) == 0 {
+			t.Fatal("read actual certified prefix", err)
+		}
+		for _, d := range page.Decisions {
+			if uint64(d.Slot) > tip {
+				break
+			}
+			if d.Slot != from || len(d.Certificate) == 0 || sha256.Sum256(d.Value) != d.Hash {
+				t.Fatal("invalid certified prefix identity")
+			}
+			values = append(values, d)
+			from++
+		}
+	}
+	return values
+}
+
+func assertHostQuorumLossControlWAL(t *testing.T, cfg Config, before node.ManagedRuntimeState, seedHash [32]byte) {
+	t.Helper()
+	wal, err := qlog.OpenReadOnly(filepath.Join(cfg.Runtime.DataDir, "qlog"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() {
+		if err := wal.Close(); err != nil {
+			t.Error(err)
+		}
+	}()
+	nonce, registered := wal.Identity()
+	if !registered || hex.EncodeToString(nonce) != before.WALIdentity {
+		t.Fatal("registered WAL nonce changed")
+	}
+	entries, err := wal.Read()
+	if err != nil {
+		t.Fatal(err)
+	}
+	values := make(map[[32]byte][]byte)
+	seedRecorded := false
+	control := func(value []byte) bool {
+		barrier, err := types.DecodeReadBarrier(value)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if barrier {
+			return true
+		}
+		_, checkpoint, err := quepaxa.DecodeCheckpointSeal(value)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if checkpoint {
+			return true
+		}
+		_, schedule, err := quepaxa.DecodeLeaderSchedule(value)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return schedule
+	}
+	for _, entry := range entries {
+		if entry.Type == qlog.EntryProposal {
+			if sha256.Sum256(entry.Payload) != entry.Hash {
+				t.Fatal("WAL proposal identity mismatch")
+			}
+			values[entry.Hash] = entry.Payload
+			commands, kv, err := types.DecodeManagedKVBatch(entry.Payload)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if kv {
+				for _, command := range commands {
+					if command.RequestID == "must-not-reserve" {
+						t.Fatal("refused KV original reached WAL")
+					}
+				}
+			}
+			if seedRecorded && !control(entry.Payload) {
+				t.Fatal("post-injection proposal is not control-only")
+			}
+		}
+		if entry.Type == qlog.EntryDecide && entry.Slot > before.CertifiedTip {
+			t.Fatal("new certified decision without quorum")
+		}
+		if entry.Type != qlog.EntryReceipt || entry.Slot == 0 {
+			continue
+		}
+		if entry.Hash == seedHash {
+			seedRecorded = true
+			continue
+		}
+		if !seedRecorded {
+			continue
+		}
+		payload := bytes.TrimPrefix(entry.Payload, []byte("QISR2\x00"))
+		if len(payload) == len(entry.Payload) {
+			payload = bytes.TrimPrefix(entry.Payload, []byte("QISR\x00"))
+		}
+		if len(payload) == len(entry.Payload) || len(payload) < 8 || !walfb.RecorderStateBufferHasIdentifier(payload) {
+			t.Fatal("invalid actual recorder WAL message")
+		}
+		state := walfb.GetRootAsRecorderState(payload, 0).UnPack()
+		if state.Slot != entry.Slot || state.Step < 4 {
+			t.Fatal("recorder WAL slot/step mismatch")
+		}
+		for _, p := range []*walfb.ProposalT{state.FirstCurrent, state.AggregateCurrent, state.AggregatePrior} {
+			if p == nil {
+				continue
+			}
+			var hash [32]byte
+			if len(p.Hash) != len(hash) {
+				t.Fatal("invalid recorder hash")
+			}
+			copy(hash[:], p.Hash)
+			if !control(values[hash]) {
+				t.Fatal("post-injection ISR references application data")
+			}
+		}
+		if !control(values[entry.Hash]) {
+			t.Fatal("post-injection recorder input is not control-only")
+		}
+	}
+	// A refused call may join an existing failed owner without recording a new
+	// barrier. Node's direct tests verify own-nonce certificate proofs; this Host
+	// test verifies a real pending ISR and no application effects on refusal.
+	if !seedRecorded {
+		t.Fatal("missing actual injected pending barrier WAL record")
 	}
 }

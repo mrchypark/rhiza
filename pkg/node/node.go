@@ -250,6 +250,10 @@ func refusePreparedUncertifiedRecorder(core *quepaxa.Core) error {
 }
 
 func (n *Node) openInternal(ctx context.Context, enroll bool, prelocked *qlog.LockFile, cleanStart bool) (err error) {
+	openStage := "runtime_config"
+	defer func() {
+		logManagedNodeOpenFailure(n.managedStartup != nil && isManagedAppendOnlyProtocol(n.managedStartup.Identity.ApplicationProtocol), openStage, err)
+	}()
 	if n.terminalRequested.Load() {
 		return fmt.Errorf("terminally drained node cannot reopen")
 	}
@@ -272,6 +276,7 @@ func (n *Node) openInternal(ctx context.Context, enroll bool, prelocked *qlog.Lo
 	if err := validateLocalGCConfig(n.config); err != nil {
 		return err
 	}
+	openStage = "runtime_optional_supervisor"
 	if err := n.connectFenceSession(ctx); err != nil {
 		return err
 	}
@@ -280,6 +285,7 @@ func (n *Node) openInternal(ctx context.Context, enroll bool, prelocked *qlog.Lo
 		return fmt.Errorf("local mode requires standalone storage without listeners, membership, or enrollment")
 	}
 	if !n.config.Local {
+		openStage = "runtime_policy"
 		if err := sqlpolicy.CheckExistingForPolicy(ctx, n.config.DataDir+"/sqlite.db", n.materializationPolicy()); err != nil {
 			return err
 		}
@@ -357,6 +363,7 @@ func (n *Node) openInternal(ctx context.Context, enroll bool, prelocked *qlog.Lo
 	}()
 
 	// 1. Acquire lock file
+	openStage = "runtime_wal_lock"
 	lock := prelocked
 	if lock == nil {
 		var acquireErr error
@@ -471,6 +478,7 @@ func (n *Node) openInternal(ctx context.Context, enroll bool, prelocked *qlog.Lo
 	if n.config.Local {
 		wal, err = qlog.OpenLocalDeferredCleanup(n.config.DataDir + "/qlog")
 	} else {
+		openStage = "runtime_wal_open"
 		wal, err = qlog.Open(n.config.DataDir + "/qlog")
 	}
 	if err != nil {
@@ -487,6 +495,7 @@ func (n *Node) openInternal(ctx context.Context, enroll bool, prelocked *qlog.Lo
 		}
 	}
 	if objectStoreConfigured && !n.config.Local {
+		openStage = "runtime_source_open"
 		provider := objectstore.Provider(n.config.ObjStoreProvider)
 		if provider == "" {
 			provider = objectstore.ProviderS3
@@ -520,6 +529,7 @@ func (n *Node) openInternal(ctx context.Context, enroll bool, prelocked *qlog.Lo
 			beforeWrite = append(beforeWrite, n.fenceSession.BindWAL)
 		}
 		if n.managedStartup != nil {
+			openStage = "runtime_registration"
 			if err := n.managedStartup.Checker.ValidateManagedStartup(ctx, n.managedStartup.Identity); err != nil {
 				return fmt.Errorf("managed registration authority: %w", err)
 			}
@@ -567,6 +577,7 @@ func (n *Node) openInternal(ctx context.Context, enroll bool, prelocked *qlog.Lo
 				return err
 			}
 		}
+		openStage = "runtime_checkpoint_load"
 		if loadErr := n.checkpoints.Load(ctx); loadErr != nil {
 			return fmt.Errorf("load checkpoint manifest: %w", loadErr)
 		}
@@ -574,6 +585,7 @@ func (n *Node) openInternal(ctx context.Context, enroll bool, prelocked *qlog.Lo
 		if len(n.config.Members) > 1 && !n.archive.CASSupported() {
 			return fmt.Errorf("multi-node shared archive requires conditional object writes")
 		}
+		openStage = "runtime_archive_load"
 		loadArchive := true
 		if n.managedStartup != nil && n.managedStartup.PeerRecovery {
 			loadArchive, err = bucket.Exists(ctx, path.Join(clusterPrefix, "archive/head.bin"))
@@ -616,6 +628,7 @@ func (n *Node) openInternal(ctx context.Context, enroll bool, prelocked *qlog.Lo
 		log.Println("non-clean start detected, recovering from WAL...")
 	}
 
+	openStage = "runtime_materializer"
 	var material *materializer.Materializer
 	deferredManagedGraph := n.managedStartup != nil && n.materializationPolicy() == sqlpolicy.ManagedGraphRequestMaterializationPolicy
 	if deferredManagedGraph {
@@ -667,6 +680,7 @@ func (n *Node) openInternal(ctx context.Context, enroll bool, prelocked *qlog.Lo
 	}
 
 	// 5. Create consensus core through the same public API available to external users.
+	openStage = "runtime_core_open"
 	cluster := n.loadClusterConfig()
 	var transport *network.Transport
 	var coreTransport quepaxa.Transport
@@ -814,6 +828,7 @@ func (n *Node) openInternal(ctx context.Context, enroll bool, prelocked *qlog.Lo
 			}
 		}
 	}
+	openStage = "runtime_archive_recover"
 	generationCheckpoint, err := n.installGenerationAnchor(startupRecovery)
 	if err != nil {
 		return fmt.Errorf("restore generation anchor: %w", startupRecovery.Check(err))
@@ -869,16 +884,19 @@ func (n *Node) openInternal(ctx context.Context, enroll bool, prelocked *qlog.Lo
 			}
 		}
 	}
+	openStage = "runtime_pair_reconstruct"
 	if deferredManagedGraph {
 		if localtesthooks.Enabled {
 			localtesthooks.Hit("node:managed-graph-startup:pair_select")
 		}
 		hasSeal := false
 		if managedPeerProfile != nil {
+			openStage = "" // This selector supplies its own fixed failure reason.
 			selectedRoot, selected, selectErr := n.selectManagedAppendOnlyRoot(ctx)
 			if selectErr != nil {
 				return selectErr
 			}
+			openStage = "runtime_pair_reconstruct"
 			hasSeal = selected != nil
 			if selected != nil {
 				selectedCopy := *selected
@@ -931,6 +949,7 @@ func (n *Node) openInternal(ctx context.Context, enroll bool, prelocked *qlog.Lo
 	}
 	// Record RPCs must be available while every replica is recovering. Public
 	// proposals and learned decisions remain gated by ready=false.
+	openStage = "runtime_peer_open"
 	var server *network.Server
 	if managedPeerProfile != nil {
 		server, err = network.NewServerForManagedProfile(core, material, n.config.ClusterID, true, transport, *managedPeerProfile, n.Ready)
@@ -1123,6 +1142,7 @@ func (n *Node) openInternal(ctx context.Context, enroll bool, prelocked *qlog.Lo
 		// consumed by the paired Graph reconstruction above.
 		restoreCheckpoint = nil
 	}
+	openStage = "runtime_post_checkpoint"
 	if n.managedStartup != nil && n.managedStartup.Prepared != nil && !preparedResume {
 		view := n.managedStartup.Prepared.View()
 		if view == nil {

@@ -581,9 +581,10 @@ func (n *Node) ResolveManagedSQL(ctx context.Context, req network.ExecuteRequest
 
 func (n *Node) QueryManagedSQL(ctx context.Context, req network.QueryRequest) (network.QueryResponse, error) {
 	if n.internalApplicationProfile() {
+		ctx = context.WithValue(ctx, managedSQLQueryDiagnosticKey{}, true)
 		_, scoped, release, err := n.borrowInternalApplication(ctx)
 		if err != nil {
-			return network.QueryResponse{}, err
+			return network.QueryResponse{}, logManagedSQLQueryFailure(ctx, "node_borrow", err)
 		}
 		defer release()
 		ctx = scoped
@@ -592,14 +593,15 @@ func (n *Node) QueryManagedSQL(ctx context.Context, req network.QueryRequest) (n
 		return network.QueryResponse{}, fmt.Errorf("%w: consistency must be local or linearizable", network.ErrInvalidRequest)
 	}
 	if err := n.CheckManagedLocalRead(ctx); err != nil {
-		return network.QueryResponse{}, err
+		return network.QueryResponse{}, logManagedSQLQueryFailure(ctx, "node_local_read", err)
 	}
 	if req.Consistency == "linearizable" {
 		if n.internalApplicationProfile() {
 			if err := n.admitInternalApplication(ctx); err != nil {
-				return network.QueryResponse{}, err
+				return network.QueryResponse{}, logManagedSQLQueryFailure(ctx, "node_admission", err)
 			}
-			return n.server.Query(ctx, req)
+			response, err := n.server.Query(ctx, req)
+			return response, logManagedSQLQueryFailure(ctx, "node_server", err)
 		}
 		state, err := n.managedRuntimeStateWithContext(ctx)
 		if err != nil {
@@ -611,5 +613,32 @@ func (n *Node) QueryManagedSQL(ctx context.Context, req network.QueryRequest) (n
 	}
 	// The private server retains its lifecycle/read limits and enforces the
 	// quorum ReadIndex barrier only for explicit linearizable queries.
-	return n.server.Query(ctx, req)
+	response, err := n.server.Query(ctx, req)
+	return response, logManagedSQLQueryFailure(ctx, "node_server", err)
+}
+
+type managedSQLQueryDiagnosticKey struct{}
+
+func managedSQLQueryDiagnostic(ctx context.Context, stage string) string {
+	if enabled, _ := ctx.Value(managedSQLQueryDiagnosticKey{}).(bool); !enabled {
+		return ""
+	}
+	switch stage {
+	case "node_borrow", "node_local_read", "node_admission", "node_server",
+		"admission_runtime_pre", "admission_pre_control", "admission_owned_wait",
+		"admission_read_index", "admission_wait_tip", "admission_replay",
+		"admission_runtime_post", "admission_fixed_replay", "admission_unresolved_history":
+		return "MANAGED_SQL_QUERY_FAILURE stage=" + stage
+	default:
+		return ""
+	}
+}
+
+func logManagedSQLQueryFailure(ctx context.Context, stage string, err error) error {
+	if err != nil {
+		if line := managedSQLQueryDiagnostic(ctx, stage); line != "" {
+			log.Print(line)
+		}
+	}
+	return err
 }

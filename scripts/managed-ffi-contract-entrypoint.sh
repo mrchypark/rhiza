@@ -47,7 +47,9 @@ run_contract() {
     function knowncode(s) { return s ~ /^(internal|commit_unknown|kv_recovery_required|kv_not_submitted|sql_recovery_required|sql_not_submitted|timeout|canceled|invalid_request|not_ready|quorum_unavailable|request_conflict|durability_unavailable|overloaded|unclassified)$/ }
     function knownadmissioncause(s) { return s ~ /^(canceled|deadline|not_ready|invalid_request|request_conflict|quorum_unavailable|other)$/ }
     function knowncontrolreason(s) { return s ~ /^(runtime_role_or_profile|reference_validation|validated_prefix_advance|slot_not_next|isr_shape|voter_configuration|proposal_value|authority_changed|refs_uncovered|slot_changed|step_regressed|final_snapshot_mismatch)$/ }
-    function knowncheckpointreason(s) { return s ~ /^(selection_unavailable|local_seal_read|current_read|refreshed_local_seal_read|current_without_certified_qckp|current_ahead|current_rank_conflict|archive_load|archive_sealed|archive_tip_behind|archive_base_ahead|archive_base_invalid|archive_decision_unavailable|core_certificate_mismatch|archive_certificate_invalid|candidate_validation|root_open|root_state_policy_mismatch|current_certificate_hash_mismatch|prefix_refresh_unavailable|prefix_archive_load|prefix_unexpected_base|prefix_page_incomplete|prefix_decision_identity|prefix_decision_policy|prefix_certificate_accept)$/ }
+    function knowncheckpointreason(s) { return s ~ /^(selection_unavailable|local_seal_read|current_read|refreshed_local_seal_read|current_without_certified_qckp|current_ahead|current_rank_conflict|archive_load|archive_sealed|archive_tip_behind|archive_base_ahead|archive_base_invalid|archive_decision_unavailable|core_certificate_mismatch|archive_certificate_invalid|candidate_validation|root_open|root_state_policy_mismatch|current_certificate_hash_mismatch|prefix_refresh_unavailable|prefix_archive_load|prefix_unexpected_base|prefix_page_incomplete|prefix_decision_identity|prefix_decision_policy|prefix_certificate_accept|prefix_anchor_invalid|prefix_overlap_mismatch|prefix_anchor_changed)$/ }
+    function knownquerystage(s) { return s ~ /^(host_closed|host_initial_admission|node_borrow|node_local_read|node_admission|node_server|admission_runtime_pre|admission_pre_control|admission_owned_wait|admission_read_index|admission_wait_tip|admission_replay|admission_runtime_post|admission_fixed_replay|admission_unresolved_history|server_read_acquire|server_read_index|server_catchup|server_apply|server_materialize)$/ }
+    function knownopenstage(s) { return s ~ /^(host_config|host_binding|host_plan|host_bootstrap|host_authority|host_prepared_identity|host_source|host_node_open|host_initialization|prepared_config|prepared_authority|prepared_identity|prepared_lock|prepared_origin|prepared_adoption|prepared_wal|prepared_materializer|prepared_restore|prepared_runtime_open|adoption_identity|adoption_wal_history|adoption_sql_reconstruct|adoption_sql_digest|runtime_config|runtime_optional_supervisor|runtime_policy|runtime_wal_lock|runtime_wal_open|runtime_source_open|runtime_registration|runtime_checkpoint_load|runtime_archive_load|runtime_materializer|runtime_core_open|runtime_archive_recover|runtime_pair_reconstruct|runtime_peer_open|runtime_post_checkpoint|prepared_runtime_adoption)$/ }
     function uint(s) { return s ~ /^[0-9]+$/ && length(s)<=20 }
     function uint64(s) { return uint(s) && (length(s)<20 || "x" s<="x18446744073709551615") }
     function bit(s) { return s ~ /^(true|false)$/ }
@@ -56,6 +58,32 @@ run_contract() {
     {
       refusal=$0
       diagnostic=stripgotimestamp($0)
+      if (diagnostic ~ /^MANAGED_SQL_QUERY_HISTORY_REFUSED/) {
+        if (diagnostic ~ /^MANAGED_SQL_QUERY_HISTORY_REFUSED target=[0-9]+ recorded=[0-9]+ certified=[0-9]+ applied=[0-9]+$/) {
+          split(diagnostic, history_fields, " ")
+          valid_history=1
+          for (history_i=2;history_i<=5;history_i++) {
+            history_value=history_fields[history_i]; sub(/^[a-z_]+=/,"",history_value)
+            if (!uint64(history_value)) valid_history=0
+          }
+          if (valid_history) emit(diagnostic)
+        }
+        next
+      }
+      if (diagnostic ~ /^MANAGED_HOST_OPEN_FAILURE/) {
+        if (diagnostic ~ /^MANAGED_HOST_OPEN_FAILURE stage=[a-z_]+$/) {
+          open_stage=diagnostic; sub(/^MANAGED_HOST_OPEN_FAILURE stage=/,"",open_stage)
+          if (knownopenstage(open_stage)) emit(diagnostic)
+        }
+        next
+      }
+      if (diagnostic ~ /^MANAGED_SQL_QUERY_FAILURE/) {
+        if (diagnostic ~ /^MANAGED_SQL_QUERY_FAILURE stage=[a-z_]+$/) {
+          stage=diagnostic; sub(/^MANAGED_SQL_QUERY_FAILURE stage=/,"",stage)
+          if (knownquerystage(stage)) emit(diagnostic)
+        }
+        next
+      }
       if (diagnostic ~ /^MANAGED_CHECKPOINT_SELECT_FAILURE/) {
         if (diagnostic ~ /^MANAGED_CHECKPOINT_SELECT_FAILURE reason=[a-z_]+ prepared_readonly_learner=(true|false) local_voter=(true|false) local_config=[0-9]+$/) {
           split(diagnostic, select_fields, " ")
@@ -303,13 +331,42 @@ if [ "${1-}" = --diagnostic-self-test ]; then
   before=$(cksum "$diag_dir/first.log")
   if run_contract rust-restart sh -c 'echo "FAIL: managed-ha-contract prior_ack_marker_missing"; exit 1'; then exit 1; fi
   [ "$before" = "$(cksum "$diag_dir/first.log")" ]
-  for reason in selection_unavailable local_seal_read current_read refreshed_local_seal_read current_without_certified_qckp current_ahead current_rank_conflict archive_load archive_sealed archive_tip_behind archive_base_ahead archive_base_invalid archive_decision_unavailable core_certificate_mismatch archive_certificate_invalid candidate_validation root_open root_state_policy_mismatch current_certificate_hash_mismatch prefix_refresh_unavailable prefix_archive_load prefix_unexpected_base prefix_page_incomplete prefix_decision_identity prefix_decision_policy prefix_certificate_accept; do
+  for reason in selection_unavailable local_seal_read current_read refreshed_local_seal_read current_without_certified_qckp current_ahead current_rank_conflict archive_load archive_sealed archive_tip_behind archive_base_ahead archive_base_invalid archive_decision_unavailable core_certificate_mismatch archive_certificate_invalid candidate_validation root_open root_state_policy_mismatch current_certificate_hash_mismatch prefix_refresh_unavailable prefix_archive_load prefix_unexpected_base prefix_page_incomplete prefix_decision_identity prefix_decision_policy prefix_certificate_accept prefix_anchor_invalid prefix_overlap_mismatch prefix_anchor_changed; do
     run_contract rust-restart sh -c 'printf "2026/11/03 12:00:00 MANAGED_CHECKPOINT_SELECT_FAILURE reason=%s prepared_readonly_learner=false local_voter=true local_config=3\n" "$1"' sh "$reason"
     grep -Fx "MANAGED_CHECKPOINT_SELECT_FAILURE reason=$reason prepared_readonly_learner=false local_voter=true local_config=3" "$diag_dir/active.log" >/dev/null
     [ "$(grep -c '^MANAGED_CHECKPOINT_SELECT_FAILURE ' "$diag_dir/active.log")" = 1 ]
     [ "$before" = "$(cksum "$diag_dir/first.log")" ]
   done
   [ "$(cat "$diag_dir/go-initial.exit")" = 7 ]
+  for open_stage in host_config host_binding host_plan host_bootstrap host_authority host_prepared_identity host_source host_node_open host_initialization prepared_config prepared_authority prepared_identity prepared_lock prepared_origin prepared_adoption prepared_wal prepared_materializer prepared_restore prepared_runtime_open adoption_identity adoption_wal_history adoption_sql_reconstruct adoption_sql_digest runtime_config runtime_optional_supervisor runtime_policy runtime_wal_lock runtime_wal_open runtime_source_open runtime_registration runtime_checkpoint_load runtime_archive_load runtime_materializer runtime_core_open runtime_archive_recover runtime_pair_reconstruct runtime_peer_open runtime_post_checkpoint prepared_runtime_adoption; do
+    run_contract rust-restart sh -c 'printf "2026/11/03 12:00:00 MANAGED_HOST_OPEN_FAILURE stage=%s\n" "$1"' sh "$open_stage"
+    grep -Fx "MANAGED_HOST_OPEN_FAILURE stage=$open_stage" "$diag_dir/active.log" >/dev/null
+    [ "$before" = "$(cksum "$diag_dir/first.log")" ]
+  done
+  run_contract rust-restart sh -c 'printf "%s\n" \
+    "2026/11/03 12:00:00 MANAGED_SQL_QUERY_HISTORY_REFUSED target=0 recorded=18446744073709551615 certified=3 applied=2" \
+    "MANAGED_SQL_QUERY_HISTORY_REFUSED target=-1 recorded=4 certified=3 applied=2" \
+    "MANAGED_SQL_QUERY_HISTORY_REFUSED target=1 recorded=18446744073709551616 certified=3 applied=2" \
+    "MANAGED_SQL_QUERY_HISTORY_REFUSED target=1 recorded=4 certified=3.5 applied=2" \
+    "MANAGED_SQL_QUERY_HISTORY_REFUSED target=1 recorded=4 certified=3 applied=2 payload=DO-NOT-RETAIN"'
+  grep -Fx 'MANAGED_SQL_QUERY_HISTORY_REFUSED target=0 recorded=18446744073709551615 certified=3 applied=2' "$diag_dir/active.log" >/dev/null
+  [ "$(grep -c '^MANAGED_SQL_QUERY_HISTORY_REFUSED ' "$diag_dir/active.log")" = 1 ]
+  [ "$before" = "$(cksum "$diag_dir/first.log")" ]
+  run_contract rust-restart sh -c 'printf "%s\n" "MANAGED_HOST_OPEN_FAILURE stage=private_stage" "MANAGED_HOST_OPEN_FAILURE stage=adoption_identity payload=DO-NOT-RETAIN" "MANAGED_HOST_OPEN_FAILURE stage=https://private.invalid" "prefix MANAGED_HOST_OPEN_FAILURE stage=host_config"'
+  if grep -E "MANAGED_HOST_OPEN_FAILURE|DO-NOT-RETAIN|private.invalid|private_stage" "$diag_dir/active.log"; then exit 1; fi
+  [ "$before" = "$(cksum "$diag_dir/first.log")" ]
+  for query_stage in host_closed host_initial_admission node_borrow node_local_read node_admission node_server admission_runtime_pre admission_pre_control admission_owned_wait admission_read_index admission_wait_tip admission_replay admission_runtime_post admission_fixed_replay admission_unresolved_history server_read_acquire server_read_index server_catchup server_apply server_materialize; do
+    run_contract rust-restart sh -c 'printf "2026/11/03 12:00:00 MANAGED_SQL_QUERY_FAILURE stage=%s\n" "$1"' sh "$query_stage"
+    grep -Fx "MANAGED_SQL_QUERY_FAILURE stage=$query_stage" "$diag_dir/active.log" >/dev/null
+    [ "$before" = "$(cksum "$diag_dir/first.log")" ]
+  done
+  run_contract rust-restart sh -c 'printf "%s\n" \
+    "MANAGED_SQL_QUERY_FAILURE stage=private_stage" \
+    "MANAGED_SQL_QUERY_FAILURE stage=server_apply payload=DO-NOT-RETAIN" \
+    "MANAGED_SQL_QUERY_FAILURE stage=https://private.invalid" \
+    "prefix MANAGED_SQL_QUERY_FAILURE stage=server_apply"'
+  if grep -E 'MANAGED_SQL_QUERY_FAILURE|DO-NOT-RETAIN|private.invalid|private_stage' "$diag_dir/active.log"; then exit 1; fi
+  [ "$before" = "$(cksum "$diag_dir/first.log")" ]
   run_contract rust-restart sh -c 'printf "%s\n" \
     "2026/11/03 12:00:00 MANAGED_CHECKPOINT_SELECT_FAILURE reason=current_without_certified_qckp prepared_readonly_learner=false local_voter=true local_config=3" \
     "MANAGED_CHECKPOINT_SELECT_FAILURE reason=current_without_certified_qckp prepared_readonly_learner=true local_voter=false local_config=1" \

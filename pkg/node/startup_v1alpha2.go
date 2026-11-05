@@ -307,34 +307,36 @@ func (n *Node) admitInternalApplication(ctx context.Context) error {
 		if n != nil && n.materializationPolicy() == sqlpolicy.ManagedGraphRequestMaterializationPolicy {
 			logManagedGraphAdmissionStageFailure("admitted", "runtime_pre", err)
 		}
-		return err
+		return logManagedSQLQueryFailure(ctx, "admission_runtime_pre", err)
 	}
 	defer release()
 	if _, err := n.checkInternalApplicationRuntime(ctx); err != nil {
 		if n.materializationPolicy() == sqlpolicy.ManagedGraphRequestMaterializationPolicy {
 			logManagedGraphAdmissionStageFailure("admitted", "runtime_pre", err)
 		}
-		return err
+		return logManagedSQLQueryFailure(ctx, "admission_runtime_pre", err)
 	}
 	if !n.managedInitiallyAdmitted.Load() || !n.core.CanParticipateReadIndex() {
 		err := fmt.Errorf("internal application has no active voter admission")
 		if n.materializationPolicy() == sqlpolicy.ManagedGraphRequestMaterializationPolicy {
 			logManagedGraphAdmissionStageFailure("admitted", "runtime_pre", err)
 		}
-		return err
+		return logManagedSQLQueryFailure(ctx, "admission_runtime_pre", err)
 	}
+	var verifiedBarrier quepaxa.Slot
 	if isManagedAppendOnlyProtocol(n.managedApplicationProtocol()) {
-		if err := n.waitManagedAppendOnlyControl(ctx, binding); err != nil {
+		verifiedBarrier, err = n.waitManagedAppendOnlyControlProof(ctx, binding)
+		if err != nil {
 			if n.materializationPolicy() == sqlpolicy.ManagedGraphRequestMaterializationPolicy {
 				logManagedGraphAdmissionStageFailure("admitted", "pre_control", err)
 			}
-			return err
+			return logManagedSQLQueryFailure(ctx, "admission_pre_control", err)
 		}
 	}
 	if n.materializationPolicy() == sqlpolicy.ManagedGraphRequestMaterializationPolicy {
 		if err := n.ensureManagedGraphInitialRoot(ctx); err != nil {
 			logManagedGraphAdmissionStageFailure("admitted", "owned_wait", err)
-			return err
+			return logManagedSQLQueryFailure(ctx, "admission_owned_wait", err)
 		}
 	}
 	target, _, err := n.core.ReadIndex(ctx)
@@ -342,15 +344,21 @@ func (n *Node) admitInternalApplication(ctx context.Context) error {
 		if n.materializationPolicy() == sqlpolicy.ManagedGraphRequestMaterializationPolicy {
 			logManagedGraphAdmissionStageFailure("admitted", "read_index", err)
 		}
-		return err
+		return logManagedSQLQueryFailure(ctx, "admission_read_index", err)
 	}
 	if n.materializationPolicy() == sqlpolicy.ManagedGraphRequestMaterializationPolicy {
 		localtesthooks.Hit("node:managed-control:post-readindex-owner-selected")
-		if err := n.waitManagedAppendOnlyControl(ctx, binding); err != nil {
+		if verifiedBarrier == 0 {
+			verifiedBarrier, err = n.waitManagedAppendOnlyControlProof(ctx, binding)
+		}
+		if err != nil {
 			logManagedGraphAdmissionTargetFailure("admitted", "owned_wait", target, err)
-			return err
+			return logManagedSQLQueryFailure(ctx, "admission_owned_wait", err)
 		}
 	}
+	// A successful wait returns only the exact own-nonce barrier certificate.
+	// Later recorder activity is not a reason to move this completed boundary.
+	target = max(target, verifiedBarrier)
 	// ReadIndex may observe a peer's certified tip before its Learned delivery
 	// reaches this Core. Replay must not finish against an older local tip and
 	// then reject the very target it was meant to synchronize. Wait only for
@@ -359,83 +367,104 @@ func (n *Node) admitInternalApplication(ctx context.Context) error {
 		if n.materializationPolicy() == sqlpolicy.ManagedGraphRequestMaterializationPolicy {
 			logManagedGraphAdmissionTargetFailure("admitted", "wait_tip", target, err)
 		}
-		return err
+		return logManagedSQLQueryFailure(ctx, "admission_wait_tip", err)
 	}
 	if err := n.replayLocalDecisions(ctx); err != nil {
 		if n.materializationPolicy() == sqlpolicy.ManagedGraphRequestMaterializationPolicy {
 			logManagedGraphAdmissionTargetFailure("admitted", "replay", target, err)
 		}
-		return err
+		return logManagedSQLQueryFailure(ctx, "admission_replay", err)
 	}
 	state, err := n.checkInternalApplicationRuntime(ctx)
 	if err != nil {
 		if n.materializationPolicy() == sqlpolicy.ManagedGraphRequestMaterializationPolicy {
 			logManagedGraphAdmissionTargetFailure("admitted", "runtime_post", target, err)
 		}
-		return err
+		return logManagedSQLQueryFailure(ctx, "admission_runtime_post", err)
 	}
-	// Preserve the existing recovery path for a real recorder/certificate gap.
+	// Without an owned proof, preserve recovery for a recorder/certificate gap.
 	// Certified but unapplied decisions are handled separately below with a
 	// fixed local prefix, so recorder data never becomes admission authority.
-	if state.RecorderTip > state.CertifiedTip && isManagedAppendOnlyProtocol(n.managedApplicationProtocol()) {
-		if err := n.waitManagedAppendOnlyControl(ctx, binding); err != nil {
+	if verifiedBarrier == 0 && state.RecorderTip > state.CertifiedTip && isManagedAppendOnlyProtocol(n.managedApplicationProtocol()) {
+		verifiedBarrier, err = n.waitManagedAppendOnlyControlProof(ctx, binding)
+		if err != nil {
 			if n.materializationPolicy() == sqlpolicy.ManagedGraphRequestMaterializationPolicy {
 				logManagedGraphAdmissionStageFailureRound("admitted", "pre_control", 2, err)
 			}
-			return err
+			return logManagedSQLQueryFailure(ctx, "admission_pre_control", err)
 		}
 		target, _, err = n.core.ReadIndex(ctx)
 		if err != nil {
 			if n.materializationPolicy() == sqlpolicy.ManagedGraphRequestMaterializationPolicy {
 				logManagedGraphAdmissionStageFailureRound("admitted", "read_index", 2, err)
 			}
-			return err
+			return logManagedSQLQueryFailure(ctx, "admission_read_index", err)
 		}
+		target = max(target, verifiedBarrier)
 		if err := n.core.WaitTip(ctx, target); err != nil {
 			if n.materializationPolicy() == sqlpolicy.ManagedGraphRequestMaterializationPolicy {
 				logManagedGraphAdmissionTargetFailureRound("admitted", "wait_tip", 2, target, err)
 			}
-			return err
+			return logManagedSQLQueryFailure(ctx, "admission_wait_tip", err)
 		}
 		if err := n.replayLocalDecisions(ctx); err != nil {
 			if n.materializationPolicy() == sqlpolicy.ManagedGraphRequestMaterializationPolicy {
 				logManagedGraphAdmissionTargetFailureRound("admitted", "replay", 2, target, err)
 			}
-			return err
+			return logManagedSQLQueryFailure(ctx, "admission_replay", err)
+		}
+		if localtesthooks.Enabled {
+			localtesthooks.Hit("node:managed-admission:before-final-runtime-observation")
 		}
 		state, err = n.checkInternalApplicationRuntime(ctx)
 		if err != nil {
 			if n.materializationPolicy() == sqlpolicy.ManagedGraphRequestMaterializationPolicy {
 				logManagedGraphAdmissionTargetFailureRound("admitted", "runtime_post", 2, target, err)
 			}
-			return err
+			return logManagedSQLQueryFailure(ctx, "admission_runtime_post", err)
 		}
 	}
-	if isManagedAppendOnlyProtocol(n.managedApplicationProtocol()) &&
-		state.RecorderTip == state.CertifiedTip && state.AppliedTip < state.CertifiedTip && uint64(target) <= state.CertifiedTip {
-		// ReadIndex is a lower bound, not an upper bound, on a safe local replay.
-		// Capture one continuous certified tip and never chase a later one here.
+	if isManagedAppendOnlyProtocol(n.managedApplicationProtocol()) && uint64(target) <= state.CertifiedTip &&
+		(verifiedBarrier != 0 && state.AppliedTip < uint64(target) || verifiedBarrier == 0 && state.RecorderTip == state.CertifiedTip && state.AppliedTip < state.CertifiedTip) {
+		// An owned proof needs replay only through its covered ReadIndex cut.
+		// Otherwise retain the existing single captured certified-tip replay.
 		through := quepaxa.Slot(state.CertifiedTip)
+		if verifiedBarrier != 0 {
+			through = target
+		}
 		if err := n.replayLocalDecisionsThrough(ctx, through); err != nil {
 			if n.materializationPolicy() == sqlpolicy.ManagedGraphRequestMaterializationPolicy {
 				logManagedGraphAdmissionTargetFailure("admitted", "fixed_replay", target, err)
 			}
-			return err
+			return logManagedSQLQueryFailure(ctx, "admission_fixed_replay", err)
 		}
 		state, err = n.checkInternalApplicationRuntimeOnce(ctx)
 		if err != nil {
 			if n.materializationPolicy() == sqlpolicy.ManagedGraphRequestMaterializationPolicy {
 				logManagedGraphAdmissionTargetFailure("admitted", "runtime_post", target, err)
 			}
-			return err
+			return logManagedSQLQueryFailure(ctx, "admission_runtime_post", err)
 		}
 	}
-	if state.CertifiedTip < uint64(target) || state.AppliedTip != state.CertifiedTip || state.RecorderTip > state.CertifiedTip {
+	historyIncomplete := state.CertifiedTip < uint64(target) || state.AppliedTip != state.CertifiedTip || state.RecorderTip > state.CertifiedTip
+	if verifiedBarrier != 0 {
+		if err := ctx.Err(); err != nil {
+			return logManagedSQLQueryFailure(ctx, "admission_runtime_post", err)
+		}
+		if binding.lifetime.Err() != nil || n.internalApplication.Load() != binding || !n.core.CanParticipateReadIndex() {
+			return logManagedSQLQueryFailure(ctx, "admission_runtime_post", network.ErrNotReady)
+		}
+		historyIncomplete = state.CertifiedTip < uint64(target) || state.AppliedTip < uint64(target)
+	}
+	if historyIncomplete {
+		if line := managedSQLQueryHistoryDiagnostic(ctx, uint64(target), state.RecorderTip, state.CertifiedTip, state.AppliedTip); line != "" {
+			log.Print(line)
+		}
 		if n.materializationPolicy() == sqlpolicy.ManagedGraphRequestMaterializationPolicy {
 			log.Printf("MANAGED_GRAPH_ADMISSION_REFUSED target=%d recorded=%d certified=%d applied=%d", target, state.RecorderTip, state.CertifiedTip, state.AppliedTip)
 			logManagedGraphHistoryRefused("admitted", uint64(target), state)
 		}
-		return fmt.Errorf("internal application has unresolved certified history: target=%d recorded=%d certified=%d applied=%d", target, state.RecorderTip, state.CertifiedTip, state.AppliedTip)
+		return logManagedSQLQueryFailure(ctx, "admission_unresolved_history", fmt.Errorf("internal application has unresolved certified history: target=%d recorded=%d certified=%d applied=%d", target, state.RecorderTip, state.CertifiedTip, state.AppliedTip))
 	}
 	return nil
 }
@@ -513,10 +542,42 @@ func (n *Node) ManagedBootstrapPlanDigestForProtocol(physicalBinding, evidenceFo
 	return types.ManagedBootstrapPlanDigestForProtocol(string(n.config.ClusterID), n.config.Members, physicalBinding, evidenceFormat, n.config.ObjStoreDurability, n.config.EnableReconfiguration, protocol)
 }
 
+func managedSQLQueryHistoryDiagnostic(ctx context.Context, target, recorded, certified, applied uint64) string {
+	if managedSQLQueryDiagnostic(ctx, "admission_unresolved_history") == "" {
+		return ""
+	}
+	return fmt.Sprintf("MANAGED_SQL_QUERY_HISTORY_REFUSED target=%d recorded=%d certified=%d applied=%d", target, recorded, certified, applied)
+}
+
+func managedNodeOpenDiagnostic(stage string) string {
+	switch stage {
+	case "prepared_config", "prepared_authority", "prepared_identity", "prepared_lock", "prepared_origin", "prepared_adoption", "prepared_wal", "prepared_materializer", "prepared_restore", "prepared_runtime_open",
+		"adoption_identity", "adoption_wal_history", "adoption_sql_reconstruct", "adoption_sql_digest",
+		"runtime_config", "runtime_optional_supervisor", "runtime_policy", "runtime_wal_lock", "runtime_wal_open", "runtime_source_open", "runtime_registration", "runtime_checkpoint_load", "runtime_archive_load", "runtime_materializer", "runtime_core_open", "runtime_archive_recover",
+		"runtime_pair_reconstruct", "runtime_peer_open", "runtime_post_checkpoint", "prepared_runtime_adoption":
+		return "MANAGED_HOST_OPEN_FAILURE stage=" + stage
+	default:
+		return ""
+	}
+}
+
+func logManagedNodeOpenFailure(enabled bool, stage string, err error) error {
+	if enabled && err != nil {
+		if line := managedNodeOpenDiagnostic(stage); line != "" {
+			log.Print(line)
+		}
+	}
+	return err
+}
+
 // OpenManaged starts an owned WAL/core/materializer and private peers while
 // application admission stays closed. The caller must Shutdown even when the
 // later evidence CAS or admission fails.
 func (n *Node) OpenManaged(ctx context.Context, cfg ManagedStartupConfig) (resultErr error) {
+	openStage := "prepared_config"
+	defer func() {
+		logManagedNodeOpenFailure(isManagedAppendOnlyProtocol(cfg.Identity.ApplicationProtocol), openStage, resultErr)
+	}()
 	if n == nil || n.config == nil || n.config.Local || n.opened.Load() || n.preparedStartup != nil || n.managedStartup != nil || cfg.Checker == nil {
 		return fmt.Errorf("managed startup requires a new non-Local node and live checker")
 	}
@@ -570,6 +631,7 @@ func (n *Node) OpenManaged(ctx context.Context, cfg ManagedStartupConfig) (resul
 	if err := validateVoterMembership(n.config); err != nil {
 		return err
 	}
+	openStage = "prepared_authority"
 	if err := cfg.Checker.ValidateManagedStartup(ctx, i); err != nil {
 		return fmt.Errorf("managed startup authority: %w", err)
 	}
@@ -588,6 +650,7 @@ func (n *Node) OpenManaged(ctx context.Context, cfg ManagedStartupConfig) (resul
 		}
 		cfg.RepairOrigin = bytes.Clone(cfg.RepairOrigin)
 	}
+	openStage = "prepared_identity"
 	if cfg.Prepared != nil && (i.Fresh || cfg.Prepared.Identity() != i.Member) {
 		return fmt.Errorf("managed prepared identity mismatch")
 	}
@@ -605,16 +668,19 @@ func (n *Node) OpenManaged(ctx context.Context, cfg ManagedStartupConfig) (resul
 			resultErr = errors.Join(resultErr, startupLock.Release())
 		}
 	}()
+	openStage = "prepared_lock"
 	if cfg.Prepared != nil || !i.Fresh && !cfg.BootstrapMember {
 		cleanStart, startupLock, err = qlog.Acquire(filepath.Join(n.config.DataDir, "qlog"))
 		if err != nil {
 			return fmt.Errorf("acquire managed startup lock: %w", err)
 		}
 	}
+	openStage = "prepared_origin"
 	if cfg.Prepared != nil {
 		if err := validateManagedRepairOrigin(ctx, cfg.Checker, cfg.RepairOrigin); err != nil {
 			return err
 		}
+		openStage = "prepared_adoption"
 		adoptionPath := filepath.Join(n.config.DataDir, "prepared-adoption.json")
 		_, adoptionErr := os.Lstat(adoptionPath)
 		if adoptionErr == nil {
@@ -643,9 +709,11 @@ func (n *Node) OpenManaged(ctx context.Context, cfg ManagedStartupConfig) (resul
 		} else if errors.Is(adoptionErr, os.ErrNotExist) {
 			// Only an absent durable receipt permits the original exact-H install
 			// path. Any present but unreadable or malformed receipt fails closed.
+			openStage = "prepared_wal"
 			if err := n.verifyPreparedWALBeforeRestore(ctx, cfg.Prepared); err != nil {
 				return err
 			}
+			openStage = "prepared_materializer"
 			if managedSQLKVPolicy(policy) {
 				_, tip, err := inspectManagedFileForPolicy(ctx, filepath.Join(cfg.Prepared.Directory(), "sqlite.db"), window, policy, i.ApplicationProtocol)
 				if err != nil || tip != uint64(cfg.Prepared.View().Tip()) {
@@ -661,6 +729,7 @@ func (n *Node) OpenManaged(ctx context.Context, cfg ManagedStartupConfig) (resul
 					return err
 				}
 			}
+			openStage = "prepared_restore"
 			if err := n.recoverPreparedV1Alpha2WithLock(ctx, cfg.Prepared, startupLock); err != nil {
 				return err
 			}
@@ -668,9 +737,11 @@ func (n *Node) OpenManaged(ctx context.Context, cfg ManagedStartupConfig) (resul
 			return fmt.Errorf("inspect durable prepared adoption: %w", adoptionErr)
 		}
 	} else if !i.Fresh && !cfg.BootstrapMember {
+		openStage = "prepared_origin"
 		if err := validateManagedRepairOrigin(ctx, cfg.Checker, cfg.RepairOrigin); err != nil {
 			return err
 		}
+		openStage = "prepared_adoption"
 		if err := n.verifyPreparedAdoptionWithLock(ctx, i.Member); err != nil {
 			return err
 		}
@@ -685,9 +756,11 @@ func (n *Node) OpenManaged(ctx context.Context, cfg ManagedStartupConfig) (resul
 	}
 	// Revalidate authority and owner-chain identity after read-only WAL/SQL
 	// preflight (or restore), immediately before opening writable runtime files.
+	openStage = "prepared_origin"
 	if err := validateManagedRepairOrigin(ctx, cfg.Checker, cfg.RepairOrigin); err != nil {
 		return err
 	}
+	openStage = "prepared_runtime_open"
 	var openErr error
 	if startupLock == nil {
 		openErr = n.open(ctx, false)
@@ -702,6 +775,7 @@ func (n *Node) OpenManaged(ctx context.Context, cfg ManagedStartupConfig) (resul
 	if policy == sqlpolicy.ManagedGraphRequestMaterializationPolicy && localtesthooks.Enabled {
 		localtesthooks.Hit("node:managed-graph-startup:runtime_verify")
 	}
+	openStage = "prepared_runtime_adoption"
 	postOpenFailure := func(err error) error { return errors.Join(err, n.abortOpen()) }
 	if cfg.Prepared != nil && cfg.verifiedAdoption == nil {
 		adoption, err := n.verifyManagedPreparedRestore(ctx, cfg.Prepared)
@@ -1263,6 +1337,10 @@ func (n *Node) verifyPreparedAdoption(ctx context.Context, identity recovery.Pre
 }
 
 func (n *Node) verifyPreparedAdoptionWithLock(ctx context.Context, identity recovery.PreparedStartupIdentity) (resultErr error) {
+	openStage := "adoption_identity"
+	defer func() {
+		logManagedNodeOpenFailure(n.managedStartup != nil && isManagedAppendOnlyProtocol(n.managedStartup.Identity.ApplicationProtocol), openStage, resultErr)
+	}()
 	if err := ctx.Err(); err != nil {
 		return err
 	}
@@ -1298,6 +1376,7 @@ func (n *Node) verifyPreparedAdoptionWithLock(ctx context.Context, identity reco
 	if closeErr != nil {
 		return fmt.Errorf("close prepared WAL inspection: %w", closeErr)
 	}
+	openStage = "adoption_wal_history"
 	wal, err := qlog.OpenReadOnly(filepath.Join(dir, "qlog"))
 	if err != nil {
 		return fmt.Errorf("open managed WAL read-only: %w", err)
@@ -1325,6 +1404,7 @@ func (n *Node) verifyPreparedAdoptionWithLock(ctx context.Context, identity reco
 	if err := verifyAdoptedWALBase(core, adoption); err != nil {
 		return err
 	}
+	openStage = ""
 	if n.managedStartup != nil {
 		absent, err := managedMaterializerFilesAbsent(dir)
 		if err != nil {
@@ -1340,6 +1420,10 @@ func (n *Node) verifyPreparedAdoptionWithLock(ctx context.Context, identity reco
 }
 
 func (n *Node) verifyExistingManagedSQLBeforeOpen(ctx context.Context, core *quepaxa.Core, adoption preparedAdoption) (resultErr error) {
+	openStage := "adoption_sql_reconstruct"
+	defer func() {
+		logManagedNodeOpenFailure(n.managedStartup != nil && isManagedAppendOnlyProtocol(n.managedStartup.Identity.ApplicationProtocol), openStage, resultErr)
+	}()
 	dbPath := filepath.Join(n.config.DataDir, "sqlite.db")
 	if err := materializer.ValidateCleanRestoreState(dbPath); err != nil {
 		return fmt.Errorf("managed materializer has an interrupted restore; preserve it: %w", err)
@@ -1483,6 +1567,10 @@ func (n *Node) inspectApplicationFile(ctx context.Context, path string) ([32]byt
 }
 
 func (n *Node) compareManagedFileAtTip(ctx context.Context, actual [32]byte, appliedTip uint64, checkpointFiles []materializer.CheckpointFile, suffix []quepaxa.DecidedValue, expectedPath string) (resultErr error) {
+	openStage := "adoption_sql_reconstruct"
+	defer func() {
+		logManagedNodeOpenFailure(n.managedStartup != nil && isManagedAppendOnlyProtocol(n.managedStartup.Identity.ApplicationProtocol), openStage, resultErr)
+	}()
 	expected, err := n.openMaterializer(expectedPath, 4)
 	if err != nil {
 		return fmt.Errorf("open isolated managed SQL verifier: %w", err)
@@ -1505,6 +1593,7 @@ func (n *Node) compareManagedFileAtTip(ctx context.Context, actual [32]byte, app
 	if err != nil {
 		return fmt.Errorf("inspect reconstructed managed SQL: %w", err)
 	}
+	openStage = "adoption_sql_digest"
 	if actual != want {
 		return fmt.Errorf("actual SQLite contents differ from verified checkpoint and certified WAL prefix at tip %d", appliedTip)
 	}

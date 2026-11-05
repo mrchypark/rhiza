@@ -30,7 +30,7 @@ func (t *terminalLossTransport) SendDecision(ctx context.Context, d quepaxa.Deci
 	return t.membershipOperationTransport.SendDecision(ctx, d)
 }
 
-func terminalRetryFixture(t *testing.T, admission func(context.Context, quepaxa.Cluster, quepaxa.Slot, [32]byte) error) (*Node, *objectstore.MeteredBucket, *terminalLossTransport, map[quepaxa.NodeID]string) {
+func terminalRetryFixture(t *testing.T, admission func(context.Context, quepaxa.Cluster, quepaxa.Slot, [32]byte) error, configure ...func(*quepaxa.Config)) (*Node, *objectstore.MeteredBucket, *terminalLossTransport, map[quepaxa.NodeID]string) {
 	t.Helper()
 	ctx := context.Background()
 	bucket, err := objectstore.NewBucket(objectstore.Config{Provider: objectstore.ProviderFilesystem, FilesystemDir: t.TempDir()})
@@ -71,7 +71,11 @@ func terminalRetryFixture(t *testing.T, admission func(context.Context, quepaxa.
 	base := &membershipOperationTransport{cores: map[quepaxa.NodeID]*quepaxa.Core{}, disabled: map[quepaxa.NodeID]bool{}, ids: []quepaxa.NodeID{"a", "b", "c"}}
 	tr := &terminalLossTransport{membershipOperationTransport: base}
 	for _, m := range members {
-		core, e := quepaxa.New(quepaxa.Config{NodeID: m.ID, Cluster: quepaxa.Cluster{ConfigID: 1, Members: members}, WAL: wals[m.ID], Transport: tr, EnableReconfiguration: true, ReconfigurationAdmission: admission})
+		coreConfig := quepaxa.Config{NodeID: m.ID, Cluster: quepaxa.Cluster{ConfigID: 1, Members: members}, WAL: wals[m.ID], Transport: tr, EnableReconfiguration: true, ReconfigurationAdmission: admission}
+		for _, apply := range configure {
+			apply(&coreConfig)
+		}
+		core, e := quepaxa.New(coreConfig)
 		if e != nil {
 			t.Fatal(e)
 		}

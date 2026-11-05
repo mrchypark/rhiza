@@ -361,9 +361,67 @@ func (n *Node) selectManagedAppendOnlyRoot(ctx context.Context) (*checkpoint.Che
 	return root, &sealed, nil
 }
 
+type managedAppendOnlyRefreshAnchor struct {
+	floor, tip                   quepaxa.Slot
+	root, floorPrefix, tipPrefix [32]byte
+}
+
+func (n *Node) managedAppendOnlyRefreshAnchor() (managedAppendOnlyRefreshAnchor, error) {
+	floor := n.core.CompactionFloor()
+	f, root, exists := n.core.RecoveryRoot()
+	tip := n.core.Tip()
+	floorPrefix, floorOK := n.core.PrefixHash(floor)
+	tipPrefix, tipOK := n.core.PrefixHash(tip)
+	if !exists || f != floor || floor == 0 || floor > tip || root == ([32]byte{}) || !floorOK || !tipOK || floorPrefix == ([32]byte{}) || tipPrefix == ([32]byte{}) {
+		return managedAppendOnlyRefreshAnchor{}, fmt.Errorf("managed append-only restored prefix anchor is unavailable")
+	}
+	return managedAppendOnlyRefreshAnchor{floor: floor, tip: tip, root: root, floorPrefix: floorPrefix, tipPrefix: tipPrefix}, nil
+}
+
+func (n *Node) verifyManagedAppendOnlyRefreshOverlap(ctx context.Context, anchor managedAppendOnlyRefreshAnchor) error {
+	prefix := anchor.floorPrefix
+	for from := anchor.floor + 1; from <= anchor.tip; {
+		if err := ctx.Err(); err != nil {
+			return n.managedCheckpointSelectionFailure("prefix_page_incomplete", err)
+		}
+		limit := int(min(quepaxa.Slot(256), anchor.tip-from+1))
+		page, tip, err := n.archive.DecisionsFrom(ctx, from, limit)
+		if err != nil || tip < anchor.tip || len(page) != limit {
+			return n.managedCheckpointSelectionFailure("prefix_page_incomplete", fmt.Errorf("restored managed append-only archive overlap is incomplete: %w", err))
+		}
+		for i, decision := range page {
+			if decision.Slot != from+quepaxa.Slot(i) || sha256.Sum256(decision.Value) != decision.Hash || len(decision.Certificate) == 0 {
+				return n.managedCheckpointSelectionFailure("prefix_decision_identity", fmt.Errorf("restored managed append-only archive overlap identity is invalid"))
+			}
+			if err := n.validateExecutionPolicy(decision.Value); err != nil {
+				return n.managedCheckpointSelectionFailure("prefix_decision_policy", err)
+			}
+			prefix = quepaxa.AdvancePrefixHash(prefix, decision.Slot, decision.Hash)
+		}
+		from += quepaxa.Slot(len(page))
+	}
+	if prefix != anchor.tipPrefix {
+		return n.managedCheckpointSelectionFailure("prefix_overlap_mismatch", fmt.Errorf("restored managed append-only archive overlap differs from local certified prefix"))
+	}
+	current, err := n.managedAppendOnlyRefreshAnchor()
+	if err != nil || current != anchor {
+		return n.managedCheckpointSelectionFailure("prefix_anchor_changed", fmt.Errorf("restored managed append-only prefix anchor changed during verification"))
+	}
+	return nil
+}
+
 func (n *Node) refreshManagedAppendOnlyCertifiedPrefix(ctx context.Context) error {
-	if n == nil || n.core == nil || n.archive == nil || n.core.CompactionFloor() != 0 {
+	if n == nil || n.core == nil || n.archive == nil {
 		return n.managedCheckpointSelectionFailure("prefix_refresh_unavailable", fmt.Errorf("managed append-only startup prefix refresh is unavailable"))
+	}
+	var anchor managedAppendOnlyRefreshAnchor
+	anchored := n.core.CompactionFloor() != 0
+	if anchored {
+		var err error
+		anchor, err = n.managedAppendOnlyRefreshAnchor()
+		if err != nil {
+			return n.managedCheckpointSelectionFailure("prefix_anchor_invalid", err)
+		}
 	}
 	if err := n.archive.Load(ctx); err != nil {
 		return n.managedCheckpointSelectionFailure("prefix_archive_load", fmt.Errorf("refresh managed append-only archive HEAD: %w", err))
@@ -372,6 +430,16 @@ func (n *Node) refreshManagedAppendOnlyCertifiedPrefix(ctx context.Context) erro
 		return n.managedCheckpointSelectionFailure("prefix_unexpected_base", fmt.Errorf("managed append-only archive unexpectedly has a recovery base"))
 	}
 	tip := n.archive.Tip()
+	if anchored {
+		if tip < anchor.tip {
+			return n.managedCheckpointSelectionFailure("prefix_page_incomplete", fmt.Errorf("managed append-only archive is behind the restored certified tip"))
+		}
+		// Trust the actual restored floor, not archive history below it. Verify
+		// the complete overlap before any suffix can mutate the live Core.
+		if err := n.verifyManagedAppendOnlyRefreshOverlap(ctx, anchor); err != nil {
+			return err
+		}
+	}
 	for from := n.core.Tip() + 1; from <= tip; {
 		page, observedTip, err := n.archive.DecisionsFrom(ctx, from, 256)
 		if err != nil || observedTip < tip || len(page) == 0 {

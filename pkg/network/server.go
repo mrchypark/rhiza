@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"math"
 	"net/http"
 	"strings"
@@ -1659,9 +1660,12 @@ func (s *Server) handleQuery(w http.ResponseWriter, r *http.Request) {
 
 // Query reads SQL locally or after a linearizable consensus barrier.
 func (s *Server) Query(ctx context.Context, req QueryRequest) (QueryResponse, error) {
+	if s.expectedPolicy == sqlpolicy.ManagedRequestMaterializationPolicy || s.expectedPolicy == sqlpolicy.ManagedGraphRequestMaterializationPolicy {
+		ctx = context.WithValue(ctx, managedQueryDiagnosticKey{}, true)
+	}
 	release, err := s.acquireRead(ctx, false)
 	if err != nil {
-		return QueryResponse{}, err
+		return QueryResponse{}, logManagedQueryFailure(ctx, "server_read_acquire", err)
 	}
 	defer release()
 	return s.query(ctx, req)
@@ -1676,9 +1680,33 @@ func (s *Server) query(ctx context.Context, req QueryRequest) (QueryResponse, er
 	}
 	result, appliedSlot, err := s.material.QueryResultAt(ctx, req.SQL, req.Args)
 	if err != nil {
+		logManagedQueryFailure(ctx, "server_materialize", err)
 		return QueryResponse{}, fmt.Errorf("%w: %w", ErrInvalidRequest, err)
 	}
 	return QueryResponse{Columns: result.Columns, Rows: result.Rows, AppliedSlot: appliedSlot, ConsensusTip: uint64(s.core.Tip())}, nil
+}
+
+type managedQueryDiagnosticKey struct{}
+
+func managedQueryDiagnostic(ctx context.Context, stage string) string {
+	if enabled, _ := ctx.Value(managedQueryDiagnosticKey{}).(bool); !enabled {
+		return ""
+	}
+	switch stage {
+	case "server_read_acquire", "server_read_index", "server_catchup", "server_apply", "server_materialize":
+		return "MANAGED_SQL_QUERY_FAILURE stage=" + stage
+	default:
+		return ""
+	}
+}
+
+func logManagedQueryFailure(ctx context.Context, stage string, err error) error {
+	if err != nil {
+		if line := managedQueryDiagnostic(ctx, stage); line != "" {
+			log.Print(line)
+		}
+	}
+	return err
 }
 
 // ErrorResponse is the stable JSON error envelope returned by the HTTP adapter.
@@ -2055,14 +2083,14 @@ func (s *Server) readBarrier(ctx context.Context, consistency string) error {
 	case "linearizable":
 		index, source, err := s.core.ReadIndex(ctx)
 		if err != nil {
-			return err
+			return logManagedQueryFailure(ctx, "server_read_index", err)
 		}
 		if index > s.core.Tip() {
 			if s.transport == nil || source == s.core.NodeID() {
-				return fmt.Errorf("read-index source cannot supply slot %d", index)
+				return logManagedQueryFailure(ctx, "server_catchup", fmt.Errorf("read-index source cannot supply slot %d", index))
 			}
 			if err := s.catchUpFrom(ctx, source, index, true); err != nil {
-				return err
+				return logManagedQueryFailure(ctx, "server_catchup", err)
 			}
 		}
 		if s.localMode {
@@ -2087,7 +2115,7 @@ func (s *Server) readBarrier(ctx context.Context, consistency string) error {
 				return err
 			}
 		}
-		return s.applyDecisions(ctx, index)
+		return logManagedQueryFailure(ctx, "server_apply", s.applyDecisions(ctx, index))
 	default:
 		return errConsistency
 	}
