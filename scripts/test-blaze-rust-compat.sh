@@ -20,6 +20,49 @@ prebuilt_valid() {
 release_paths_valid() {
   awk -v prefix="$1/" 'index($0,prefix)!=1 || $0 ~ /(^|\/)\.\.(\/|$)/ {bad=1} END {exit bad}'
 }
+# cb18c54 has one daemon Native driver: four page-aligned 1 MiB fixed
+# buffers. Reserve one additional page as alignment/accounting headroom.
+# Print "keep" or a bounded soft limit in KiB; never change the hard limit.
+memlock_target() {
+  awk -v soft="$1" -v hard="$2" -v page="$3" 'BEGIN {
+    if (page !~ /^[0-9]+$/ || page < 1 ||
+        (soft != "unlimited" && soft !~ /^[0-9]+$/) ||
+        (hard != "unlimited" && hard !~ /^[0-9]+$/)) exit 2
+    required = int((4194304 + page + 1023) / 1024)
+    if (hard != "unlimited" && hard < required) exit 1
+    if (soft == "unlimited" || soft >= required) { print "keep"; exit }
+    target = 8192
+    if (hard != "unlimited" && hard < target) target = hard
+    if (target < required) exit 1
+    print target
+  }'
+}
+prepare_linux_memlock() {
+  memlock_soft=$(ulimit -S -l)
+  memlock_hard=$(ulimit -H -l)
+  memlock_page=$(getconf PAGESIZE)
+  {
+    printf 'soft_kib=%s\nhard_kib=%s\npage_bytes=%s\nfixed_buffer_bytes=4194304\ndaemon_native_drivers=1\n' "$memlock_soft" "$memlock_hard" "$memlock_page"
+    grep '^Max locked memory' /proc/self/limits
+  } > "$task_root/logs/linux-memlock.log"
+  if memlock_next=$(memlock_target "$memlock_soft" "$memlock_hard" "$memlock_page"); then :; else
+    memlock_plan_exit=$?
+    printf 'limit_plan_exit=%s\n' "$memlock_plan_exit" >> "$task_root/logs/linux-memlock.log"
+    if [ "$memlock_plan_exit" = 1 ]; then
+      echo 'environment constraint: existing memlock hard limit cannot cover 4 MiB fixed buffers plus one page; no Blaze SDK compilation attempted' >&2
+    else
+      echo 'environment constraint: invalid actual memlock/page-size probe; no Blaze SDK compilation attempted' >&2
+    fi
+    return 1
+  fi
+  if [ "$memlock_next" != keep ]; then
+    ulimit -S -l "$memlock_next" || { echo 'environment constraint: bounded soft memlock adjustment refused' >&2; return 1; }
+  fi
+  {
+    printf 'selected_soft_kib=%s\nafter_soft_kib=%s\nafter_hard_kib=%s\n' "$memlock_next" "$(ulimit -S -l)" "$(ulimit -H -l)"
+    grep '^Max locked memory' /proc/self/limits
+  } >> "$task_root/logs/linux-memlock.log"
+}
 preserve_daemon_logs() {
   daemon_home=$1
   log_dir=$2
@@ -74,6 +117,15 @@ if [ "${1-}" = --self-test ]; then
   grep -Fx 'known-daemon-startup-failure' "$test_root/logs/before-stop-v2-serve.log" >/dev/null
   record_invocation "$test_root/logs/invocation.log" blaze build --locked --example embedded
   grep -Fx 'client_argv[4]=embedded' "$test_root/logs/invocation.log" >/dev/null
+  [ "$(memlock_target 64 8192 4096)" = 8192 ]
+  [ "$(memlock_target 64 6144 4096)" = 6144 ]
+  [ "$(memlock_target 64 4160 65536)" = 4160 ]
+  [ "$(memlock_target 64 unlimited 4096)" = 8192 ]
+  [ "$(memlock_target 8192 8192 4096)" = keep ]
+  [ "$(memlock_target unlimited unlimited 4096)" = keep ]
+  if memlock_target 64 4096 4096; then exit 1; fi
+  if memlock_target 64 4159 65536; then exit 1; fi
+  if memlock_target 64 8192 invalid; then exit 1; fi
   echo 'Blaze script safeguards self-test passed (no Rust/Go build).'
   exit 0
 fi
@@ -98,10 +150,12 @@ release=v0.20261105.1
 nightly=nightly-2026-10-27
 case "$(uname -s):$(uname -m)" in
   Darwin:arm64)
+    [ -z "${RUNNER_ARCH-}" ] || [ "$RUNNER_ARCH" = ARM64 ] || { echo 'runner architecture mismatch' >&2; exit 2; }
     target=aarch64-apple-darwin
     archive_sha=2c6fb64b14668cb73c1a4531bd4f8b77665d2abe0e365d5ad76aaa77a3001f3e
     ;;
   Linux:x86_64)
+    [ -z "${RUNNER_ARCH-}" ] || [ "$RUNNER_ARCH" = X64 ] || { echo 'runner architecture mismatch' >&2; exit 2; }
     target=x86_64-unknown-linux-gnu
     archive_sha=aaf09e38f7cd9e873c84d4fa6afe8c26f713cb558e2e9dfc1a599af31b15ad8b
     ;;
@@ -190,6 +244,7 @@ native_before=$(sha256 "$native/librhiza_ffi.a")
 printf 'source=%s\nrelease=%s\ntoolchain=%s\ntarget=%s\nnative_archive=%s\nblaze_binary=%s\n' \
   "$(git -C "$repo" rev-parse HEAD)" "$release" "$nightly" "$target" \
   "$(sha256 "$native/librhiza_ffi.a")" "$binary_sha" > "$task_root/results.txt"
+printf 'runner_arch=%s\nactual_host=%s:%s\n' "${RUNNER_ARCH:-local}" "$(uname -s)" "$(uname -m)" >> "$task_root/results.txt"
 run_phase() {
   phase=$1
   shift
@@ -213,6 +268,7 @@ ln -s /usr/bin/false "$BLAZE_HOME/deny-go/go"
 PATH="$BLAZE_HOME/deny-go:$PATH"
 export PATH
 blaze_started=1
+if [ "$target" = x86_64-unknown-linux-gnu ]; then prepare_linux_memlock; fi
 run_phase blaze-build "$bin/blaze" build --locked --example embedded
 run_phase blaze-test "$bin/blaze" test --locked --lib
 run_phase blaze-status "$bin/blaze" status
