@@ -6,7 +6,10 @@ import (
 	"bytes"
 	"context"
 	"crypto/sha256"
+	"errors"
+	"fmt"
 	"reflect"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -17,6 +20,236 @@ import (
 	"github.com/mrchypark/rhiza/pkg/network"
 	"github.com/mrchypark/rhiza/pkg/quepaxa"
 )
+
+func TestInternalRequestActualPostApplyCancellationRecoversExactOriginal(t *testing.T) {
+	pauseCertifiedRecoveryBackground(t)
+	testInternalRequestActualPostApplyCancellationRecoversExactOriginal(t, nil)
+}
+
+func TestInternalRequestReopenedKVInitialAdmissionAcrossCertifiedReadBarrierDuringInspection(t *testing.T) {
+	pauseCertifiedRecoveryBackground(t)
+	testInternalRequestActualPostApplyCancellationRecoversExactOriginal(t, func(ctx context.Context, h *Host, cfg, readyPeer Config, original materializer.RequestOriginal) (context.Context, func(RecoveryResult, error)) {
+		cluster := quepaxa.Cluster{ConfigID: 1, Members: cfg.Runtime.Members}
+		client, err := network.NewTransportForManagedProfile(readyPeer.Runtime.ClusterID, readyPeer.Runtime.NodeID, &cluster, readyPeer.Runtime.PeerToken, network.ManagedPeerProfile{ApplicationProtocol: readyPeer.Plan.ApplicationProtocol, BootstrapPlanDigest: readyPeer.Plan.BootstrapPlanDigest, Generation: int64(readyPeer.Plan.Generation)})
+		if err != nil {
+			t.Fatal(err)
+		}
+		workerCtx, cancelWorker := context.WithCancel(ctx)
+		start, done, applied, stop := make(chan internalRecoveryEvidence, 1), make(chan struct{}), make(chan struct{}), make(chan struct{})
+		var stopOnce, appliedOnce sync.Once
+		var slot atomic.Uint64
+		var workerErr error
+		var oldCut, newCut internalRecoveryEvidence
+		var fresh, originalDecision quepaxa.DecidedValue
+		marker := &struct{}{}
+		var armed atomic.Bool
+		var samples atomic.Int32
+		var beforeSamples [2][3]uint64
+		var injected atomic.Bool
+		healthy := quepaxa.NodeID("")
+		for _, member := range cfg.Runtime.Members {
+			if member.ID != cfg.Runtime.NodeID && member.ID != readyPeer.Runtime.NodeID {
+				healthy = member.ID
+			}
+		}
+		if healthy == "" {
+			t.Fatal("three actual fixture voters required")
+		}
+		restoreEvent := localtesthooks.Set(func(event string) {
+			if event == "managed-host:initial-authority:before-evidence" {
+				samples.Store(0)
+				armed.Store(true)
+			}
+			current := slot.Load()
+			if current == 0 {
+				return
+			}
+			if event == fmt.Sprintf("network:learned:phase=apply-complete:node=%s:sender=%s:slot=%d", cfg.Runtime.NodeID, readyPeer.Runtime.NodeID, current) {
+				appliedOnce.Do(func() { close(applied) })
+			}
+			if strings.HasPrefix(event, fmt.Sprintf("network:learned:phase=apply-start:node=%s:", healthy)) && strings.HasSuffix(event, fmt.Sprintf(":slot=%d", current)) {
+				select {
+				case <-applied:
+				case <-stop:
+				case <-workerCtx.Done():
+				}
+			}
+		})
+		restoreState := localtesthooks.SetManagedRuntimeStateContext(func(observed context.Context) {
+			if observed.Value(managedGraphCallerMarkerKey{}) != marker || !armed.Load() || observed.Err() != nil {
+				return
+			}
+			// Inside the armed inspector: runtime binding sample, captured-before
+			// sample, then final sample after application inspection releases its
+			// materializer read lock. Do not inject into the initial/before sample.
+			index := samples.Add(1)
+			if index <= 2 {
+				state, err := h.node.ManagedState()
+				if err != nil {
+					t.Fatal("capture actual pre-inspection sample", err)
+				}
+				beforeSamples[index-1] = [3]uint64{state.RecorderTip, state.CertifiedTip, state.AppliedTip}
+				return
+			}
+			if index != 3 {
+				return
+			}
+			oldCut = captureInternalRecoveryEvidence(ctx, h, cfg)
+			if oldCut.err != nil || oldCut.recorded != oldCut.certified || oldCut.applied != oldCut.certified || oldCut.floor != 0 || oldCut.certified >= 127 {
+				t.Fatal("post-inspection cut is not the bounded resolved fixture", oldCut, oldCut.err)
+			}
+			if beforeSamples[0] != beforeSamples[1] || beforeSamples[1] != [3]uint64{oldCut.recorded, oldCut.certified, oldCut.applied} {
+				t.Fatal("inspection samples changed before controlled injection", beforeSamples, oldCut)
+			}
+			start <- oldCut
+			select {
+			case <-done:
+			case <-observed.Done():
+				t.Fatal("controlled certification did not finish", observed.Err())
+			}
+			if workerErr != nil {
+				t.Fatal("controlled certification failed", workerErr)
+			}
+			injected.Store(true)
+		})
+		t.Cleanup(func() {
+			stopOnce.Do(func() { close(stop) })
+			cancelWorker()
+			<-done
+			restoreState()
+			restoreEvent()
+			if err := client.Close(); err != nil {
+				t.Error(err)
+			}
+		})
+		go func() {
+			defer close(done)
+			workerErr = func() error {
+				select {
+				case oldCut = <-start:
+				case <-workerCtx.Done():
+					return workerCtx.Err()
+				}
+				before, err := client.FetchDecisions(workerCtx, cfg.Runtime.NodeID, 1, 128)
+				if err != nil || uint64(len(before.Decisions)) != oldCut.certified {
+					return fmt.Errorf("actual captured prefix unavailable: %w", err)
+				}
+				if original.Slot == 0 || original.Slot > uint64(len(before.Decisions)) {
+					return fmt.Errorf("original slot not covered")
+				}
+				for i, decision := range before.Decisions {
+					if uint64(decision.Slot) != uint64(i+1) || len(decision.Certificate) == 0 || sha256.Sum256(decision.Value) != decision.Hash {
+						return fmt.Errorf("captured certificate identity invalid")
+					}
+				}
+				originalDecision = before.Decisions[original.Slot-1]
+				commands, batch, err := types.DecodeManagedKVBatch(originalDecision.Value)
+				if err != nil {
+					return err
+				}
+				if !batch {
+					command, single, err := types.DecodeManagedKVCommand(originalDecision.Value)
+					if err != nil || !single || original.BatchIndex != 0 {
+						return fmt.Errorf("actual original frame invalid: %w", err)
+					}
+					commands = []types.KVCommand{command}
+				}
+				if int(original.BatchIndex) >= len(commands) {
+					return fmt.Errorf("actual original batch ordinal invalid")
+				}
+				command := commands[original.BatchIndex]
+				item, err := types.EncodeManagedKVBatchItem(command)
+				if err != nil || command.RequestID != original.RequestID || !bytes.Equal(item, original.ExecutionItem) {
+					return fmt.Errorf("actual certified original item differs: %w", err)
+				}
+				canonical, _, err := types.EncodeManagedKVOriginal(command)
+				if err != nil || !bytes.Equal(canonical, original.CanonicalOriginal) {
+					return fmt.Errorf("actual certified canonical original differs: %w", err)
+				}
+				fingerprint, err := types.ManagedKVFingerprint(command)
+				if err != nil || fingerprint != original.Fingerprint {
+					return fmt.Errorf("actual certified fingerprint differs: %w", err)
+				}
+				var nonce [types.ReadBarrierNonceSize]byte
+				nonce[0] = 93
+				value := types.EncodeReadBarrier(nonce)
+				hash := sha256.Sum256(value)
+				next := quepaxa.Slot(oldCut.certified + 1)
+				slot.Store(uint64(next))
+				proposal := quepaxa.Proposal{ProposerID: readyPeer.Runtime.NodeID, Hash: hash, Value: value}
+				var summaries []quepaxa.Summary
+				// Both rounds use actual authenticated Record RPCs and durable WAL
+				// receipts. Phase 6 certifies their actual phase-5 AggregatePrior;
+				// no recorder, certificate, Core snapshot or public ACK is fabricated.
+				for _, step := range []quepaxa.Step{5, 6} {
+					summaries = nil
+					for _, member := range cfg.Runtime.Members {
+						summary, err := client.SendRecord(workerCtx, member.ID, quepaxa.RecordRequest{Slot: next, Step: step, ConfigID: 1, Proposal: proposal})
+						if err != nil || summary.RecorderID != member.ID || summary.Step != step || summary.FirstCurrent == nil || summary.FirstCurrent.Hash != hash || (step == 6 && (summary.AggregatePrior == nil || summary.AggregatePrior.Hash != hash)) {
+							return fmt.Errorf("actual recorder proof invalid at step %d: %w", step, err)
+						}
+						summaries = append(summaries, summary)
+					}
+				}
+				if err := client.SendDecision(workerCtx, quepaxa.Decision{ConfigID: 1, Slot: next, Step: 6, Proposal: proposal, Summaries: summaries}); err != nil {
+					return err
+				}
+				select {
+				case <-applied:
+				case <-workerCtx.Done():
+					return workerCtx.Err()
+				}
+				after, err := client.FetchDecisions(workerCtx, cfg.Runtime.NodeID, 1, 128)
+				if err != nil || len(after.Decisions) != len(before.Decisions)+1 || !reflect.DeepEqual(before.Decisions, after.Decisions[:len(before.Decisions)]) {
+					return fmt.Errorf("actual certified prefix/original certificate changed: %w", err)
+				}
+				fresh = after.Decisions[len(before.Decisions)]
+				barrier, err := types.DecodeReadBarrier(fresh.Value)
+				if err != nil || !barrier || fresh.Slot != next || fresh.Hash != hash || !bytes.Equal(fresh.Value, value) || len(fresh.Certificate) == 0 {
+					return fmt.Errorf("actual new certificate is not the exact read barrier")
+				}
+				newCut = captureInternalRecoveryEvidence(ctx, h, cfg)
+				if newCut.err != nil || newCut.certified != uint64(next) || newCut.applied != uint64(next) || newCut.recorded != uint64(next) || newCut.stateTip != oldCut.stateTip || newCut.digest != oldCut.digest || newCut.floor != oldCut.floor || newCut.root != oldCut.root || newCut.wal != oldCut.wal {
+					return fmt.Errorf("pure read barrier changed application/receipts/authority or did not apply: %v", newCut.err)
+				}
+				return nil
+			}()
+		}()
+		verify := func(first RecoveryResult, firstErr error) {
+			restoreState()
+			restoreEvent()
+			if !injected.Load() {
+				t.Fatal("post-inspection certified advance was not injected")
+			}
+			if !errors.Is(firstErr, network.ErrCommitUnknown) || first.KV != nil || !strings.Contains(firstErr.Error(), "history changed during application inspection") {
+				t.Fatal("controlled inspection advance did not preserve UNKNOWN without ACK at the intended guard", first, firstErr)
+			}
+			t.Logf("forced read-barrier certificate slot=%d kind=read_barrier hash=%x certificate_bytes=%d before_R/C/A=%d/%d/%d after_R/C/A=%d/%d/%d state_tip_same=%t application_receipts_digest_same=%t root_floor_same=%t wal_same=%t", fresh.Slot, fresh.Hash, len(fresh.Certificate), oldCut.recorded, oldCut.certified, oldCut.applied, newCut.recorded, newCut.certified, newCut.applied, oldCut.stateTip == newCut.stateTip, oldCut.digest == newCut.digest, oldCut.floor == newCut.floor && oldCut.root == newCut.root, oldCut.wal == newCut.wal)
+			t.Logf("preserved original slot=%d value_hash=%x certificate_sha256=%x new_certificate_sha256=%x", originalDecision.Slot, originalDecision.Hash, sha256.Sum256(originalDecision.Certificate), sha256.Sum256(fresh.Certificate))
+			cancelWorker()
+			<-done
+			if err := client.Close(); err != nil {
+				t.Fatal("controlled peer cleanup", err)
+			}
+			stable := captureInternalRecoveryEvidence(ctx, h, cfg)
+			if stable.err != nil || stable != newCut {
+				t.Fatal("controlled completion did not retain its stable cut", stable, stable.err)
+			}
+			// A concurrent maintenance cut may refuse admission as UNKNOWN.
+			// Once that work has completed, make exactly one explicit recovery
+			// of the same original; never loop/replay the mutation itself.
+			if original.Kind != types.MutationKV {
+				t.Fatal("stable recovery fixture requires the actual KV original")
+			}
+			// MutationKind is an internal uint8 enum, not the public wire kind.
+			recovered, err := h.RecoverRequest(ctx, network.RequestStatusRequest{Kind: "kv", RequestID: original.RequestID})
+			if err != nil || recovered.KV == nil || !bytes.Equal(recovered.RequestID, []byte(original.RequestID)) || !reflect.DeepEqual(recovered.KV.MutationReceipt, original.Receipt) {
+				t.Fatal("one stable-cut recovery did not recover the exact original receipt", recovered, err)
+			}
+		}
+		return managedGraphCallerMarkedContext{Context: ctx, marker: marker}, verify
+	}, true)
+}
 
 func TestInternalRequestActualPostApplyCancellationRecoversExactOriginalWithControlISR(t *testing.T) {
 	runInternalRequestRecoveryWithControlISR(t, false)
@@ -35,7 +268,7 @@ func runInternalRequestRecoveryWithControlISR(t *testing.T, beforeFinalRuntime b
 	// Retain the actual SDK-held post-Apply cancellation, UNKNOWN metadata,
 	// canonical raw original/TTL, healthy neighbor, and exact receipt oracles.
 	pauseCertifiedRecoveryBackground(t)
-	testInternalRequestActualPostApplyCancellationRecoversExactOriginal(t, func(ctx context.Context, h *Host, cfg, readyPeer Config, original materializer.RequestOriginal) (context.Context, func()) {
+	testInternalRequestActualPostApplyCancellationRecoversExactOriginal(t, func(ctx context.Context, h *Host, cfg, readyPeer Config, original materializer.RequestOriginal) (context.Context, func(RecoveryResult, error)) {
 		before, err := h.node.InspectManagedKVRead(ctx)
 		if err != nil || before.Runtime.RecorderTip != before.Runtime.CertifiedTip || before.Runtime.AppliedTip != before.Runtime.CertifiedTip {
 			t.Fatal("capture resolved actual prefix before hook", before.Runtime, err)
@@ -211,7 +444,7 @@ func runInternalRequestRecoveryWithControlISR(t *testing.T, beforeFinalRuntime b
 			client.Close()
 		}
 		t.Cleanup(cleanup)
-		verify := func() {
+		verify := func(_ RecoveryResult, _ error) {
 			restore()
 			restoreContext()
 			restoreProposal()

@@ -1,10 +1,14 @@
 package managedsql
 
 import (
+	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"net/http"
+	"net/url"
 	"path/filepath"
 	"reflect"
 	"sync"
@@ -17,7 +21,9 @@ import (
 	"github.com/mrchypark/rhiza/pkg/materializer"
 	"github.com/mrchypark/rhiza/pkg/network"
 	"github.com/mrchypark/rhiza/pkg/operator"
+	"github.com/mrchypark/rhiza/pkg/qlog"
 	"github.com/mrchypark/rhiza/pkg/quepaxa"
+	sqlite3driver "github.com/ncruces/go-sqlite3/driver"
 )
 
 func TestAppendOnlyHostProfileClassification(t *testing.T) {
@@ -504,11 +510,7 @@ func TestInternalRequestFirstExecuteWithoutPrivateAdmissionOrReady(t *testing.T)
 
 // No manual error hint is installed here: the actual KVMutate call must return
 // CommitUnknown after Apply while the real SDK archive request is held.
-func TestInternalRequestActualPostApplyCancellationRecoversExactOriginal(t *testing.T) {
-	testInternalRequestActualPostApplyCancellationRecoversExactOriginal(t, nil)
-}
-
-func testInternalRequestActualPostApplyCancellationRecoversExactOriginal(t *testing.T, beforeReopenedRecovery func(context.Context, *Host, Config, Config, materializer.RequestOriginal) (context.Context, func()), expectReopenedUnknown ...bool) {
+func testInternalRequestActualPostApplyCancellationRecoversExactOriginal(t *testing.T, beforeReopenedRecovery func(context.Context, *Host, Config, Config, materializer.RequestOriginal) (context.Context, func(RecoveryResult, error)), expectReopenedUnknown ...bool) {
 	var outage, armed atomic.Bool
 	var attempts atomic.Int64
 	entered := make(chan string, 8)
@@ -640,22 +642,161 @@ func testInternalRequestActualPostApplyCancellationRecoversExactOriginal(t *test
 	if _, err := reopened.RecoverPendingDetailed(ctx); !errors.Is(err, network.ErrCommitUnknown) {
 		t.Fatal("new handle invented a no-arg target", err)
 	}
-	var verifyRecovery func()
+	var verifyRecovery func(RecoveryResult, error)
+	// Keep this diagnostic outside tagged callbacks, which may deliberately
+	// inject progress when the operation's marked context is sampled.
+	diagnosticBefore := internalRecoveryEvidence{}
+	if beforeReopenedRecovery == nil {
+		diagnosticBefore = captureInternalRecoveryEvidence(ctx, reopened, configs[0])
+	}
 	if beforeReopenedRecovery != nil {
 		ctx, verifyRecovery = beforeReopenedRecovery(ctx, reopened, configs[0], configs[1], beforeOriginal)
 	}
 	recovered, err = reopened.RecoverRequest(ctx, network.RequestStatusRequest{Kind: "kv", RequestID: id})
 	if verifyRecovery != nil {
-		verifyRecovery()
+		verifyRecovery(recovered, err)
 	}
 	if len(expectReopenedUnknown) == 1 && expectReopenedUnknown[0] {
 		if !errors.Is(err, network.ErrCommitUnknown) || recovered.KV != nil {
 			t.Fatalf("untrusted recorder tail did not preserve UNKNOWN without an ACK: %+v %v", recovered, err)
 		}
 	} else if err != nil || recovered.KV == nil || recovered.KV.Slot != receipt.Slot || !recovered.KV.Applied {
+		if beforeReopenedRecovery == nil {
+			logInternalRecoveryEvidence(t, ctx, reopened, configs[0], beforeOriginal, diagnosticBefore)
+		}
 		t.Fatalf("new handle exact original recovery: %+v %v", recovered, err)
 	}
 	if after := hostApplicationDecisionCount(t, ctx, configs[0], sqlpolicy.ManagedRequestMaterializationPolicy); after != before {
 		t.Fatal("reopen recovery submitted another application command")
+	}
+}
+
+type internalRecoveryEvidence struct {
+	recorded, certified, applied, stateTip, floor uint64
+	digest, root                                  [32]byte
+	wal                                           string
+	err                                           error
+}
+
+func captureInternalRecoveryEvidence(ctx context.Context, h *Host, cfg Config) (out internalRecoveryEvidence) {
+	runtime, err := h.node.ManagedState()
+	if err != nil {
+		out.err = err
+		return
+	}
+	out.recorded, out.certified, out.applied, out.wal = runtime.RecorderTip, runtime.CertifiedTip, runtime.AppliedTip, runtime.WALIdentity
+	app, _, err := materializer.InspectManagedAppendOnlyRequestFile(ctx, filepath.Join(cfg.Runtime.DataDir, "sqlite.db"), types.DefaultIdempotencyWindowSlots)
+	if err != nil {
+		out.err = err
+		return
+	}
+	out.digest = app.Digest
+	dsn := (&url.URL{Scheme: "file", Path: filepath.ToSlash(filepath.Join(cfg.Runtime.DataDir, "sqlite.db"))}).String() + "?mode=ro"
+	db, err := sqlite3driver.Open(dsn)
+	if err != nil {
+		out.err = err
+		return
+	}
+	err = db.QueryRowContext(ctx, `SELECT value FROM _rhiza_meta WHERE key='state_slot'`).Scan(&out.stateTip)
+	out.err = errors.Join(err, db.Close())
+	wal, err := qlog.OpenReadOnly(filepath.Join(cfg.Runtime.DataDir, "qlog"))
+	if err != nil {
+		out.err = errors.Join(out.err, err)
+		return
+	}
+	if nonce, ok := wal.Identity(); !ok || fmt.Sprintf("%x", nonce) != out.wal {
+		out.err = errors.Join(out.err, errors.New("diagnostic WAL identity mismatch"))
+	}
+	err = wal.Scan(func(entry qlog.Entry) error {
+		if entry.Type != qlog.EntryCheckpoint {
+			return nil
+		}
+		var base struct {
+			ClosedThrough uint64   `json:"closed_through"`
+			RecoveryRoot  [32]byte `json:"recovery_root"`
+		}
+		if err := json.Unmarshal(entry.Payload, &base); err != nil {
+			return err
+		}
+		if base.ClosedThrough != entry.Slot || base.RecoveryRoot != entry.Hash {
+			return errors.New("diagnostic WAL base identity mismatch")
+		}
+		out.floor, out.root = base.ClosedThrough, base.RecoveryRoot
+		return nil
+	})
+	out.err = errors.Join(out.err, err, wal.Close())
+	return
+}
+
+func logInternalRecoveryEvidence(t *testing.T, ctx context.Context, h *Host, cfg Config, original materializer.RequestOriginal, before internalRecoveryEvidence) {
+	t.Helper()
+	after := captureInternalRecoveryEvidence(ctx, h, cfg)
+	known := before.err == nil && after.err == nil
+	t.Logf("recovery evidence before_R/C/A=%d/%d/%d after_R/C/A=%d/%d/%d state_tip=%d/%d floor=%d/%d evidence_known=%t root_same=%t wal_same=%t application_receipts_digest_same=%t evidence_errors=%v/%v", before.recorded, before.certified, before.applied, after.recorded, after.certified, after.applied, before.stateTip, after.stateTip, before.floor, after.floor, known, known && before.root == after.root, known && before.wal == after.wal, known && before.digest == after.digest, before.err, after.err)
+	cluster := quepaxa.Cluster{ConfigID: 1, Members: cfg.Runtime.Members}
+	client, err := network.NewTransportForManagedProfile(cfg.Runtime.ClusterID, cfg.Runtime.NodeID, &cluster, cfg.Runtime.PeerToken, network.ManagedPeerProfile{ApplicationProtocol: cfg.Plan.ApplicationProtocol, BootstrapPlanDigest: cfg.Plan.BootstrapPlanDigest, Generation: int64(cfg.Plan.Generation)})
+	if err != nil {
+		t.Log("diagnostic peer unavailable", err)
+		return
+	}
+	defer func() {
+		if err := client.Close(); err != nil {
+			t.Log("diagnostic peer cleanup", err)
+		}
+	}()
+	// Fetch only actual certificates; ReadTip would introduce a fresh quorum
+	// barrier and could change the very evidence being diagnosed.
+	starts := []quepaxa.Slot{quepaxa.Slot(original.Slot), quepaxa.Slot(before.certified + 1)}
+	for i, from := range starts {
+		limit := 1
+		if i == 1 {
+			limit = 16
+		}
+		page, err := client.FetchDecisions(ctx, cfg.Runtime.NodeID, from, limit)
+		if err != nil {
+			t.Log("diagnostic certificate fetch", from, err)
+			continue
+		}
+		for _, decision := range page.Decisions {
+			kind := "other"
+			barrier, e1 := types.DecodeReadBarrier(decision.Value)
+			_, checkpoint, e2 := types.DecodeCheckpointSeal(decision.Value)
+			_, schedule, e3 := types.DecodeLeaderSchedule(decision.Value)
+			reconfiguration, e4 := types.DecodeReconfiguration(decision.Value)
+			switch {
+			case barrier:
+				kind = "read_barrier"
+			case checkpoint:
+				kind = "checkpoint"
+			case schedule:
+				kind = "leader_schedule"
+			case reconfiguration:
+				kind = "reconfiguration"
+			}
+			commands, kv, decodeErr := types.DecodeManagedKVBatch(decision.Value)
+			if decodeErr == nil && !kv {
+				var command types.KVCommand
+				command, kv, decodeErr = types.DecodeManagedKVCommand(decision.Value)
+				if kv {
+					commands = []types.KVCommand{command}
+				}
+			}
+			requestSame, itemSame := false, false
+			if kv {
+				kind = "kv"
+				for _, command := range commands {
+					if command.RequestID == original.RequestID {
+						requestSame = true
+						item, err := types.EncodeManagedKVBatchItem(command)
+						itemSame = err == nil && bytes.Equal(item, original.ExecutionItem)
+					}
+				}
+			}
+			_, sql, sqlErr := types.DecodeSQLBatch(decision.Value)
+			if sql {
+				kind = "sql"
+			}
+			t.Logf("recovery certified slot=%d kind=%s hash=%x hash_valid=%t certificate_bytes=%d request_same=%t execution_item_same=%t decoder_error=%v", decision.Slot, kind, decision.Hash, sha256.Sum256(decision.Value) == decision.Hash, len(decision.Certificate), requestSame, itemSame, errors.Join(e1, e2, e3, e4, decodeErr, sqlErr))
+		}
 	}
 }
