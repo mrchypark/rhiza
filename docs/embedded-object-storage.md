@@ -30,6 +30,34 @@ window. An empty policy defaults to before-ack for Local plus object storage.
 The same bounded storage-outage test exercises both the explicit policy and
 the empty default. Nonlocal policy defaults are outside this test contract.
 
+## Deployment-owned single-writer contract
+
+The Local deployment guarantees one writer for each archive identity, including
+startup restore and maintenance. Under this contract, Local recovery does not
+require a Rhiza operator, distributed ownership lease, or fencer. Conditional
+object writes and restore-pin leases still protect archive operations; they do
+not replace the deployment's single-writer guarantee.
+
+Stop and confirm termination of the old runtime before starting its replacement.
+Trusting a confirmed runtime kill is different from trusting a Pod deletion API
+response: Kubernetes `Recreate` waits for old Pods during normal rollout, but
+manual Pod deletion can create a replacement while the old Pod is terminating.
+Force deletion does not wait for runtime termination confirmation. See the
+[Recreate contract](https://kubernetes.io/docs/concepts/workloads/controllers/deployment/#recreate-deployment)
+and [forced deletion behavior](https://kubernetes.io/docs/concepts/workloads/pods/pod-lifecycle/#forced-pod-termination).
+Process termination also does not establish the outcome of already-issued
+object-store requests. Unknown storage outcomes and unresolved maintenance gates
+remain fail-closed; single-writer deployment is not permission for blanket unlock.
+
+`rhiza.Open` performs the actual restore before returning a ready database.
+The Kubernetes fixture's offline initContainer only downloads and verifies a
+separate staging copy; main independently restores through `Open`. Neither this
+ordering nor single-writer deployment changes durability: BeforeAck synchronizes
+the acknowledged mutation to the archive, while explicit Async retains a loss
+window. The provider-shared SIGKILL regression tests acknowledged recovery after
+confirmed runtime termination and total DataDir loss; execution results must be
+reported separately per provider.
+
 ## Filesystem-backed Local recovery
 
 Filesystem-backed Local archives automatically acquire a same-host process-lifetime
@@ -152,7 +180,7 @@ Missing or malformed HEAD must fail closed and preserve surviving evidence.
 
 The GC CAS gate does not expire. An ambiguous deletion must leave it held;
 elapsed time does not prove the outstanding deleter stopped. Until that evidence
-is resolved through safe operator recovery, later collectors, restore pins, and
+is resolved through explicit recovery, later collectors, restore pins, and
 publications must be refused. Read-only archive inspection remains allowed.
 Recovery requires proof that the old owner has terminated and all outstanding
 storage operations are resolved. Do not blindly delete the control key or force
@@ -199,8 +227,10 @@ including restore journals and materialized data, remains part of the evidence.
 
 | Test suffix | Evidence |
 | --- | --- |
-| `RepeatedTotalLoss` | Close and drain the DB, capture its actual free-gate namespace, copy only while stopped, delete the entire local root, recover original SQL and exact idempotent RETURNING result/slot, write, restart, and repeat total loss. This permits a shutdown flush and does not independently prove pre-Close publication. |
-| `CheckpointAndTailTotalLoss` | Force reclamation with a bounded WAL, observe an existing Go published local checkpoint with nonempty snapshot files, append a tail whose slot is beyond that checkpoint, close/drain before capturing remote bytes, delete the entire DataDir and recover snapshot state plus tail. Require a restored checkpoint, original/tail idempotent results, new writes, restart, and a second whole-root loss. This permits a shutdown flush. |
+| `SIGKILLTotalDataDirLoss` | Leave the child idle after a committed ACK, verify remote history covers its slot before killing it, and require actual SIGKILL and reap without Close. Delete the entire DataDir, restore the acknowledged row, RequestStatus receipt, and exact idempotent RETURNING result/slot, then write and restart. This does not test in-flight unacknowledged writes or Async RPO. |
+| `UnresolvedHeldControlPreserved` | Inject a valid held maintenance gate on remote providers, or a held gate with malformed binding on filesystem. Require refusal for the expected reason and unchanged remote evidence after total DataDir loss. This synthetic control-state test does not inject an actual uncertain storage operation; `GCUncertainDeleteGateHeld` covers that separately. |
+| `RepeatedTotalLoss` | Before Close, read the archive through a read-only bucket and require its tip to cover the acknowledged slot with zero remote mutations. Then close/drain, capture its actual free-gate namespace, copy only while stopped, delete the entire local root, recover original SQL and exact idempotent RETURNING result/slot, write, restart, and repeat total loss. The loss step is not a SIGKILL test. |
+| `CheckpointAndTailTotalLoss` | Force reclamation with a bounded WAL, observe a published local checkpoint with nonempty snapshot files, and append a tail beyond that checkpoint. Before Close, require the remote snapshot and contiguous decisions to cover the acknowledged tail. Then close/drain before capturing remote bytes, delete DataDir, and require restored checkpoint/tail, original/tail idempotent results, new writes, restart, and a second whole-root loss. The loss step is not a SIGKILL test. |
 | `Equal` | Reopen matching histories, retain SQL and original request results, and leave remote object bytes unchanged. |
 | `FirstAdoption` | Create SQL locally without a store, attach an empty archive, then delete the root and recover it. |
 | `LocalAheadCheckpointAndTail` | Force and observe a shared checkpoint, save that remote image, append a local suffix without another checkpoint, roll remote objects back while stopped, reconcile the extension with retained overlap, then prove whole-root recovery includes snapshot and suffix. |
@@ -305,9 +335,10 @@ The initContainer's test helper downloads the checkpoint into a separate staging
 emptyDir using existing read/download functions, not a public typed staging API.
 It does not create DataDir, local
 store identity or voter identity, call `rhiza.Open`, or perform remote mutations.
-The main process reads `/staging/verified.json` and compares LocalBinding, then
-calls `rhiza.Open` without a staging path. It independently downloads and
-restores remote state under the local lock, writes new data, and becomes Ready.
+The main process reads `/staging/verified.json`, then calls `rhiza.Open` without
+a staging path. It independently downloads and restores remote state under the
+local lock, compares the restored LocalBinding with init evidence, writes new
+data, and becomes Ready.
 It does not adopt the initContainer's downloaded files. There is no typed
 staging handoff in this baseline; these tests establish init download verification
 and an independent main restore. The separate HA protocol is outside these Local
