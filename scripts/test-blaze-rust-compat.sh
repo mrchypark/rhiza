@@ -20,6 +20,30 @@ prebuilt_valid() {
 release_paths_valid() {
   awk -v prefix="$1/" 'index($0,prefix)!=1 || $0 ~ /(^|\/)\.\.(\/|$)/ {bad=1} END {exit bad}'
 }
+preserve_daemon_logs() {
+  daemon_home=$1
+  log_dir=$2
+  capture=$3
+  for daemon_log in v2/serve.log daemon.log; do
+    if [ -f "$daemon_home/$daemon_log" ]; then
+      log_name=$(printf '%s' "$daemon_log" | tr / -)
+      tail -c 262144 "$daemon_home/$daemon_log" > "$log_dir/$capture-$log_name" || return 1
+    fi
+  done
+}
+record_invocation() {
+  invocation_log=$1
+  shift
+  {
+    printf 'cwd=%s\n' "$PWD"
+    argument=0
+    for value do
+      printf 'client_argv[%s]=%s\n' "$argument" "$value"
+      argument=$((argument + 1))
+    done
+    printf '%s\n' 'daemon_spawn_argv=not_observed; inspect captured v2-serve.log (no environment dump)'
+  } > "$invocation_log"
+}
 if [ "${1-}" = --self-test ]; then
   test_root=$(mktemp -d /tmp/rhiza-blaze-check.XXXXXX)
   trap 'rm -rf "$test_root"' EXIT HUP INT TERM
@@ -43,6 +67,13 @@ if [ "${1-}" = --self-test ]; then
   mkdir "$test_root/deny-go"
   ln -s /usr/bin/false "$test_root/deny-go/go"
   if PATH="$test_root/deny-go:$PATH" go version; then exit 1; fi
+  mkdir -p "$test_root/daemon/v2" "$test_root/logs"
+  printf '%s\n' 'known-daemon-startup-failure' > "$test_root/daemon/v2/serve.log"
+  preserve_daemon_logs "$test_root/daemon" "$test_root/logs" before-stop
+  rm -r "$test_root/daemon"
+  grep -Fx 'known-daemon-startup-failure' "$test_root/logs/before-stop-v2-serve.log" >/dev/null
+  record_invocation "$test_root/logs/invocation.log" blaze build --locked --example embedded
+  grep -Fx 'client_argv[4]=embedded' "$test_root/logs/invocation.log" >/dev/null
   echo 'Blaze script safeguards self-test passed (no Rust/Go build).'
   exit 0
 fi
@@ -98,14 +129,21 @@ cleanup() {
   result=$?
   trap - EXIT HUP INT TERM
   cleanup_exit=0
+  evidence_saved=1
+  if ! preserve_daemon_logs "$BLAZE_HOME" "$task_root/logs" before-stop; then
+    evidence_saved=0
+    echo 'daemon evidence capture failed; preserving owned home' >&2
+    [ "$result" -ne 0 ] || result=1
+  fi
   if [ "$blaze_started" = 1 ]; then
     if "$bin/blaze" stop > "$task_root/logs/cleanup.log" 2>&1; then :; else cleanup_exit=$?; fi
   fi
-  if [ -f "$BLAZE_HOME/daemon.log" ]; then tail -c 262144 "$BLAZE_HOME/daemon.log" > "$task_root/logs/daemon-tail.log"; fi
   printf 'cleanup_exit=%s\n' "$cleanup_exit" >> "$task_root/results.txt"
   if [ "$cleanup_exit" -ne 0 ]; then
     echo "owned Blaze cleanup failed; preserved $BLAZE_HOME" >&2
     [ "$result" -ne 0 ] || result=1
+  elif [ "$evidence_saved" = 0 ]; then
+    echo "preserved daemon evidence at $BLAZE_HOME" >&2
   elif short_home_valid "$BLAZE_HOME" && [ "$(cat "$BLAZE_HOME/.rhiza-blaze-owner")" = "$repo" ]; then
     rm -rf "$BLAZE_HOME"
     if [ -e "$BLAZE_HOME" ]; then [ "$result" -ne 0 ] || result=1; fi
@@ -155,8 +193,14 @@ printf 'source=%s\nrelease=%s\ntoolchain=%s\ntarget=%s\nnative_archive=%s\nblaze
 run_phase() {
   phase=$1
   shift
+  record_invocation "$task_root/logs/$phase-invocation.log" "$@"
   if "$@" > "$task_root/logs/$phase.log" 2>&1; then phase_exit=0; else phase_exit=$?; fi
   printf '%s_exit=%s\n' "$phase" "$phase_exit" >> "$task_root/results.txt"
+  if [ "$phase_exit" -ne 0 ]; then
+    if ! preserve_daemon_logs "$BLAZE_HOME" "$task_root/logs" "$phase-failed"; then
+      echo 'failed to preserve daemon log; cleanup will retain owned home if capture remains unavailable' >&2
+    fi
+  fi
   tail -n 80 "$task_root/logs/$phase.log"
   return "$phase_exit"
 }
