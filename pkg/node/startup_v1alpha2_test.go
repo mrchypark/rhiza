@@ -1171,6 +1171,56 @@ func TestManagedPreparedCheckpointSQLSuffixAdoptionAndRestart(t *testing.T) {
 	if err := advancedRestart.Shutdown(); err != nil {
 		t.Fatal(err)
 	}
+	// Capture only closed, policy-validated SQLite state. Keep the real adopted
+	// WAL/origin untouched, and restore each deep negative independently rather
+	// than repairing counters or inheriting an earlier accounting corruption.
+	sqlitePath := filepath.Join(dataDir, "sqlite.db")
+	captureSQLite := func(filename string, expectedTip uint64) map[string][]byte {
+		t.Helper()
+		_, tip, err := sourceNode.inspectApplicationFile(ctx, filename)
+		if err != nil || tip != expectedTip {
+			t.Fatalf("capture valid profile-9 SQLite at %d: tip=%d error=%v", expectedTip, tip, err)
+		}
+		snapshot := make(map[string][]byte)
+		for _, suffix := range []string{"", "-wal", "-shm"} {
+			data, err := os.ReadFile(filename + suffix)
+			if errors.Is(err, os.ErrNotExist) && suffix != "" {
+				continue
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			snapshot[suffix] = data
+		}
+		return snapshot
+	}
+	restoreSQLite := func(snapshot map[string][]byte, expectedTip uint64) {
+		t.Helper()
+		for _, suffix := range []string{"", "-wal", "-shm"} {
+			if err := os.Remove(sqlitePath + suffix); err != nil && !errors.Is(err, os.ErrNotExist) {
+				t.Fatal(err)
+			}
+			if data, exists := snapshot[suffix]; exists {
+				if err := os.WriteFile(sqlitePath+suffix, data, 0600); err != nil {
+					t.Fatal(err)
+				}
+			}
+		}
+		_, tip, err := sourceNode.inspectApplicationFile(ctx, sqlitePath)
+		if err != nil || tip != expectedTip {
+			t.Fatalf("restored profile-9 baseline at %d: tip=%d error=%v", expectedTip, tip, err)
+		}
+	}
+	advancedSQLite := captureSQLite(sqlitePath, uint64(advancedSlot))
+	basePath := filepath.Join(t.TempDir(), "certified-base.sqlite")
+	baseMaterial, err := sourceNode.openMaterializer(basePath, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := errors.Join(baseMaterial.RestoreCheckpoint(ctx, files), baseMaterial.Close()); err != nil {
+		t.Fatalf("restore actual certified checkpoint for independent base negative: %v", err)
+	}
+	baseSQLite := captureSQLite(basePath, uint64(view.Base()))
 
 	dbURL = (&url.URL{Scheme: "file", Path: filepath.ToSlash(filepath.Join(dataDir, "sqlite.db"))}).String()
 	db, err = sql.Open("sqlite3", dbURL)
@@ -1256,34 +1306,31 @@ func TestManagedPreparedCheckpointSQLSuffixAdoptionAndRestart(t *testing.T) {
 	if err := db.Close(); err != nil {
 		t.Fatal(err)
 	}
+	restoreSQLite(baseSQLite, uint64(view.Base()))
 	db, err = sql.Open("sqlite3", dbURL)
 	if err != nil {
 		t.Fatal(err)
 	}
-	baseHash := fmt.Sprintf("%x", sha256.Sum256(baseSQL))
-	if _, err := db.ExecContext(ctx, `UPDATE managed_items SET value='base-corrupt' WHERE id=1`); err != nil {
-		_ = db.Close()
-		t.Fatal(err)
-	}
-	for key, value := range map[string]string{"applied_slot": "1", "state_slot": "1", "applied_hash": baseHash} {
-		if _, err := db.ExecContext(ctx, `UPDATE _rhiza_meta SET value=? WHERE key=?`, value, key); err != nil {
-			_ = db.Close()
-			t.Fatal(err)
-		}
-	}
-	if _, err := db.ExecContext(ctx, `DELETE FROM _rhiza_idempotency WHERE commit_slot > 1`); err != nil {
+	// The certified base creates the table but contains no application rows.
+	// Inject content only: its genuine receipts/originals/accounting stay valid.
+	if _, err := db.ExecContext(ctx, `INSERT INTO managed_items(id,value) VALUES(1,'base-corrupt')`); err != nil {
 		_ = db.Close()
 		t.Fatal(err)
 	}
 	if err := db.Close(); err != nil {
 		t.Fatal(err)
 	}
+	beforeBaseCorrupt, _ := managedStartupDataDigest(t, dataDir)
+	writesBeforeBaseCorrupt := objectStore.writeCount()
 	baseCorrupt := New(config)
 	if err := baseCorrupt.OpenManaged(ctx, ManagedStartupConfig{StorageRoot: storageRoot, Identity: identity, Checker: checker, RepairOrigin: repairOrigin}); err == nil || !strings.Contains(err.Error(), "actual SQLite contents differ") {
 		t.Fatalf("checkpoint-tip SQLite corruption result: %v", err)
 	}
 	if baseCorrupt.opened.Load() || baseCorrupt.peer != nil || baseCorrupt.wal != nil || baseCorrupt.lock != nil {
 		t.Fatal("checkpoint-tip rejection retained runtime resources")
+	}
+	if after, _ := managedStartupDataDigest(t, dataDir); after != beforeBaseCorrupt || objectStore.writeCount() != writesBeforeBaseCorrupt {
+		t.Fatal("checkpoint-tip rejection changed local bytes or wrote object storage")
 	}
 	db, err = sql.Open("sqlite3", dbURL)
 	if err != nil {
@@ -1297,6 +1344,7 @@ func TestManagedPreparedCheckpointSQLSuffixAdoptionAndRestart(t *testing.T) {
 	if err := db.Close(); err != nil {
 		t.Fatal(err)
 	}
+	restoreSQLite(advancedSQLite, uint64(advancedSlot))
 	db, err = sql.Open("sqlite3", dbURL)
 	if err != nil {
 		t.Fatal(err)
@@ -1312,11 +1360,16 @@ func TestManagedPreparedCheckpointSQLSuffixAdoptionAndRestart(t *testing.T) {
 	if err := db.Close(); err != nil {
 		t.Fatal(err)
 	}
+	beforeMissingSuffix, _ := managedStartupDataDigest(t, dataDir)
+	writesBeforeMissingSuffix := objectStore.writeCount()
 	missingSuffix := New(config)
 	if err := missingSuffix.OpenManaged(ctx, ManagedStartupConfig{StorageRoot: storageRoot, Identity: identity, Checker: checker, RepairOrigin: repairOrigin}); err == nil || !strings.Contains(err.Error(), "ahead of certified WAL tip") {
 		t.Fatalf("missing certified SQL suffix result: %v", err)
 	}
 	if missingSuffix.opened.Load() || missingSuffix.peer != nil || missingSuffix.wal != nil || missingSuffix.lock != nil {
 		t.Fatal("missing-suffix rejection retained runtime resources")
+	}
+	if after, _ := managedStartupDataDigest(t, dataDir); after != beforeMissingSuffix || objectStore.writeCount() != writesBeforeMissingSuffix {
+		t.Fatal("missing-suffix rejection changed local bytes or wrote object storage")
 	}
 }

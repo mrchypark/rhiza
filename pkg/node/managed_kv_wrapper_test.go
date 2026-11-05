@@ -41,6 +41,15 @@ func (c *kvWrapperChecker) ValidateManagedSQLRead(context.Context, ManagedStartu
 	return errors.New("retired CR read authority invoked")
 }
 
+// Match Node.Open's non-Local before-ACK barrier; a retained receipt alone is
+// not durable confirmation and a test counter must not replace this work.
+func kvWrapperDurable(ctx context.Context, n *Node, slot quepaxa.Slot) error {
+	if err := n.core.EnsureDurable(slot); err != nil {
+		return err
+	}
+	return n.archive.SyncThrough(ctx, n.core, slot)
+}
+
 func newKVWrapperFixture(t *testing.T) (*Node, *kvWrapperChecker, *managedGraphAdmissionRaceFixture) {
 	t.Helper()
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
@@ -174,6 +183,9 @@ func newKVWrapperFixture(t *testing.T) (*Node, *kvWrapperChecker, *managedGraphA
 		t.Fatal(err)
 	}
 	n.server = server
+	server.SetDurabilityBarrier(func(ctx context.Context, slot quepaxa.Slot) error {
+		return kvWrapperDurable(ctx, n, slot)
+	})
 	t.Cleanup(server.Close)
 	// Isolate wrapper/application assertions from the real publisher's first
 	// checkpoint round; cancel it before releasing this maintenance lock.
@@ -263,7 +275,10 @@ func TestManagedKVWrappersExactAuthorityAndObservation(t *testing.T) {
 		}
 	}
 	var barriers atomic.Int64
-	n.server.SetDurabilityBarrier(func(context.Context, quepaxa.Slot) error { barriers.Add(1); return nil })
+	n.server.SetDurabilityBarrier(func(ctx context.Context, slot quepaxa.Slot) error {
+		barriers.Add(1)
+		return kvWrapperDurable(ctx, n, slot)
+	})
 	if _, err := n.RequestStatusManaged(ctx, network.RequestStatusRequest{Kind: "kv", RequestID: req.RequestID}); err != nil || barriers.Load() != 0 {
 		t.Fatal("status invoked durability", err)
 	}
@@ -284,23 +299,39 @@ func TestManagedKVWrappersExactAuthorityAndObservation(t *testing.T) {
 	if _, err := n.Handler(); !errors.Is(err, network.ErrNotReady) {
 		t.Fatal("raw Handler exposed", err)
 	}
-	identity := n.managedStartup.Identity
-	n.managedStartup.Identity.Member.PodUID = "different-runtime"
-	beforeMismatch := n.core.Tip()
-	if _, err := n.ExecuteManagedKV(ctx, "put", network.KVMutationRequest{RequestID: "wrong-binding", Key: req.Key}); err == nil || n.core.Tip() != beforeMismatch {
-		t.Fatal("changed captured identity admitted mutation", err)
-	}
-	n.managedStartup.Identity = identity
-
 	binding := n.internalApplication.Load()
+	if binding == nil || binding.lifetime.Err() != nil || ctx.Err() != nil {
+		t.Fatal("binding mismatch fixture requires a live runtime and caller")
+	}
+	// Startup identity is immutable and the publisher reads it before taking
+	// compactionMu. Publish a separate mismatched binding atomically instead.
+	wrongIdentity := binding.identity
+	wrongIdentity.Member.PodUID = "different-runtime"
+	wrongBinding := &internalApplicationBinding{
+		identity: wrongIdentity, policy: binding.policy, window: binding.window,
+		wal: binding.wal, walStore: binding.walStore, member: binding.member,
+		core: binding.core, material: binding.material, lifetime: binding.lifetime,
+	}
+	n.internalApplication.Store(wrongBinding)
+	defer n.internalApplication.Store(binding)
+	beforeMismatch := n.core.Tip()
+	beforeMismatchBarriers := barriers.Load()
+	if result, err := n.ExecuteManagedKV(ctx, "put", network.KVMutationRequest{RequestID: "wrong-binding", Key: req.Key}); err == nil || err.Error() != "internal application runtime binding changed" || result.Status == types.MutationCommitted {
+		t.Fatal("mismatched captured identity admitted mutation or failed at the wrong boundary", result, err)
+	}
+	if n.core.Tip() != beforeMismatch || barriers.Load() != beforeMismatchBarriers || binding.lifetime.Err() != nil || ctx.Err() != nil {
+		t.Fatal("binding mismatch proposed, reached durability, or relied on cancellation")
+	}
+	n.internalApplication.Store(binding)
+
 	n.internalApplication.Store(nil)
 	defer n.internalApplication.Store(binding)
 	before := n.core.Tip()
 	if _, err := n.ExecuteManagedKV(ctx, "put", network.KVMutationRequest{RequestID: "unbound", Key: req.Key}); err == nil {
 		t.Fatal("missing runtime binding admitted a mutation")
 	}
-	if _, err := n.ResolveManagedKV(ctx, "put", req); !errors.Is(err, network.ErrCommitUnknown) {
-		t.Fatal("missing binding fabricated a recovery ACK", err)
+	if result, err := n.ResolveManagedKV(ctx, "put", req); err == nil || err.Error() != "internal application binding unavailable" || result.Receipt != nil || result.Durability == network.ResolveKVDurabilityConfirmed {
+		t.Fatal("Node missing-binding boundary fabricated a recovery ACK or returned the wrong error", result, err)
 	}
 	if _, err := n.KVGetManaged(ctx, network.KVGetRequest{Key: req.Key}); err == nil {
 		t.Fatal("missing binding admitted a read")
@@ -331,11 +362,11 @@ func TestManagedKVWrappersControlledCertifiedApplyLag(t *testing.T) {
 		t.Fatal("fixture lost controlled certified-but-unapplied value")
 	}
 	result, err := n.ResolveManagedKV(ctx, "put", req)
-	if err != nil || result.Receipt == nil || result.Receipt.Slot != uint64(slot) || n.material.Tip() < uint64(slot) {
+	if err != nil || result.Receipt == nil || result.Receipt.Slot != uint64(slot) || result.Durability != network.ResolveKVDurabilityConfirmed || n.material.Tip() < uint64(slot) || n.archive.Tip() < slot {
 		t.Fatal("certified recovery lost original", result, err)
 	}
 	original, found, err := n.RetainedRequest(ctx, "kv", req.RequestID)
-	if err != nil || !found || original.Slot != uint64(slot) {
+	if err != nil || !found || original.Slot != uint64(slot) || original.Receipt != *result.Receipt {
 		t.Fatal("recovery resubmitted original at another slot", original, found, err)
 	}
 }
@@ -364,7 +395,9 @@ func TestManagedKVWrappersFalseCASAndUnknown(t *testing.T) {
 	if _, err := n.ResolveManagedKV(ctx, "cas", network.KVMutationRequest{RequestID: "missing", Key: req.Key}); !errors.Is(err, network.ErrCommitUnknown) {
 		t.Fatal("missing original fabricated recovery", err)
 	}
-	n.server.SetDurabilityBarrier(nil)
+	n.server.SetDurabilityBarrier(func(ctx context.Context, slot quepaxa.Slot) error {
+		return kvWrapperDurable(ctx, n, slot)
+	})
 	binding := n.internalApplication.Load()
 	binding.cancel()
 	before := n.core.Tip()
