@@ -561,6 +561,8 @@ func managedNodeOpenDiagnostic(stage string) string {
 		"runtime_config", "runtime_optional_supervisor", "runtime_policy", "runtime_wal_lock", "runtime_wal_open", "runtime_source_open", "runtime_registration", "runtime_checkpoint_load", "runtime_archive_load", "runtime_materializer", "runtime_core_open", "runtime_archive_recover",
 		"runtime_pair_reconstruct", "runtime_peer_open", "runtime_post_checkpoint", "prepared_runtime_adoption":
 		return "MANAGED_HOST_OPEN_FAILURE stage=" + stage
+	case "runtime_post_prepared_view", "runtime_post_prepared_base", "runtime_post_prepared_validate_base", "runtime_post_prepared_root", "runtime_post_prepared_prefix", "runtime_post_local_resume", "runtime_post_recorder", "runtime_post_adopted_tip", "runtime_post_recover", "runtime_post_restore", "runtime_post_material_tip", "runtime_post_material_decision", "runtime_post_material_validate_tip", "runtime_post_replay_graph", "runtime_post_replay_adopted", "runtime_post_replay_local", "runtime_post_recovery_evidence", "runtime_post_selected_seal", "runtime_post_checkpoint_promote", "runtime_post_local_backup":
+		return "MANAGED_HOST_OPEN_FAILURE stage=" + stage
 	default:
 		return ""
 	}

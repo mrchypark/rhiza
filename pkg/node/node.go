@@ -1144,10 +1144,12 @@ func (n *Node) openInternal(ctx context.Context, enroll bool, prelocked *qlog.Lo
 	}
 	openStage = "runtime_post_checkpoint"
 	if n.managedStartup != nil && n.managedStartup.Prepared != nil && !preparedResume {
+		openStage = "runtime_post_prepared_view"
 		view := n.managedStartup.Prepared.View()
 		if view == nil {
 			return fmt.Errorf("managed prepared checkpoint view is unavailable")
 		}
+		openStage = "runtime_post_prepared_base"
 		seal, decision, hasBase := view.RecoveryBase()
 		if !hasBase {
 			if core.CompactionFloor() != 0 {
@@ -1163,9 +1165,11 @@ func (n *Node) openInternal(ctx context.Context, enroll bool, prelocked *qlog.Lo
 			if !ok || floor != seal.Index || root != seal.RootHash || !prefixOK || prefix != seal.PrefixHash {
 				return fmt.Errorf("managed prepared WAL base differs from verified checkpoint")
 			}
+			openStage = "runtime_post_prepared_validate_base"
 			if err := core.ValidateCheckpointBase(startupRecovery.Context(), seal, decision); err != nil {
 				return fmt.Errorf("validate managed prepared checkpoint: %w", err)
 			}
+			openStage = "runtime_post_prepared_root"
 			preparedCheckpoint, openErr := n.checkpoints.OpenRoot(startupRecovery.Context(), uint64(seal.Index), seal.RootHash)
 			if openErr != nil || preparedCheckpoint.Hash != seal.StateHash {
 				if openErr == nil {
@@ -1175,6 +1179,7 @@ func (n *Node) openInternal(ctx context.Context, enroll bool, prelocked *qlog.Lo
 			}
 			restoreCheckpoint = preparedCheckpoint
 		}
+		openStage = "runtime_post_prepared_prefix"
 		if core.Tip() != view.Tip() {
 			return fmt.Errorf("managed prepared WAL tip differs from verified source")
 		}
@@ -1190,6 +1195,7 @@ func (n *Node) openInternal(ctx context.Context, enroll bool, prelocked *qlog.Lo
 		restoreCheckpoint = nil
 	}
 	if n.config.Local && localRestoreAuthority == nil {
+		openStage = "runtime_post_local_resume"
 		if err := n.resumePreparedLocalCheckpoint(startupRecovery.Context()); err != nil {
 			return fmt.Errorf("resume prepared Local checkpoint: %w", startupRecovery.Check(err))
 		}
@@ -1201,11 +1207,13 @@ func (n *Node) openInternal(ctx context.Context, enroll bool, prelocked *qlog.Lo
 	recordedTip := core.RecorderTip()
 	certifiedTip := core.Tip()
 	if preparedLearner {
+		openStage = "runtime_post_recorder"
 		if err := refusePreparedUncertifiedRecorder(core); err != nil {
 			return err
 		}
 	}
 	if preparedResume {
+		openStage = "runtime_post_adopted_tip"
 		managedPreparedReplayThrough = certifiedTip
 		if managedPreparedReplayThrough < n.managedStartup.verifiedAdoption.Tip {
 			return fmt.Errorf("managed adopted WAL is behind its durable H receipt")
@@ -1218,12 +1226,14 @@ func (n *Node) openInternal(ctx context.Context, enroll bool, prelocked *qlog.Lo
 		recoveryTarget = quepaxa.Slot(certifiedCheckpoint.Index)
 	}
 	if !preparedResume && recoveryTarget > core.Tip() {
+		openStage = "runtime_post_recover"
 		if err := core.RecoverThrough(startupRecovery.Context(), recoveryTarget); err != nil {
 			return fmt.Errorf("recover certified log through %d: %w", recoveryTarget, startupRecovery.Check(err))
 		}
 	}
 	if restoreCheckpoint != nil {
 		if restoreCheckpoint.Index > material.Tip() {
+			openStage = "runtime_post_restore"
 			if n.managedStartup != nil && (n.managedStartup.Prepared != nil || n.managedStartup.verifiedAdoption != nil) {
 				_, freshEmpty, inspectErr := n.inspectApplicationState(startupRecovery.Context(), material)
 				if inspectErr != nil {
@@ -1269,33 +1279,42 @@ func (n *Node) openInternal(ctx context.Context, enroll bool, prelocked *qlog.Lo
 
 	// 6. Verify a materializer that survived beyond the local decision marker,
 	// then replay the remaining recovered decisions.
+	openStage = "runtime_post_material_tip"
 	if quepaxa.Slot(material.Tip()) > core.Tip() {
 		return fmt.Errorf("materialized slot %d is ahead of certified log tip %d", material.Tip(), core.Tip())
 	}
 	if material.Tip() > uint64(core.CompactionFloor()) {
+		openStage = "runtime_post_material_decision"
 		decision, ok := core.CertifiedValue(quepaxa.Slot(material.Tip()))
 		if !ok {
 			return fmt.Errorf("materialized slot %d has no recovered decision", material.Tip())
 		}
+		openStage = "runtime_post_material_validate_tip"
 		if err := material.ValidateTip(material.Tip(), decision.Value); err != nil {
 			return err
 		}
 	}
 	if deferredManagedGraph {
 		if managedGraphReplayThrough > 0 {
+			openStage = "runtime_post_replay_graph"
 			if err := n.replayLocalDecisionsThrough(startupRecovery.Context(), managedGraphReplayThrough); err != nil {
 				return fmt.Errorf("replay managed Graph startup prefix through %d: %w", managedGraphReplayThrough, startupRecovery.Check(err))
 			}
 		}
 	} else if preparedResume {
 		if managedPreparedReplayThrough > 0 {
+			openStage = "runtime_post_replay_adopted"
 			if err := n.replayLocalDecisionsThrough(startupRecovery.Context(), managedPreparedReplayThrough); err != nil {
 				return fmt.Errorf("replay managed adopted prefix through %d: %w", managedPreparedReplayThrough, startupRecovery.Check(err))
 			}
 		}
-	} else if err := n.replayLocalDecisions(startupRecovery.Context()); err != nil {
-		return fmt.Errorf("replay local decisions: %w", startupRecovery.Check(err))
+	} else {
+		openStage = "runtime_post_replay_local"
+		if err := n.replayLocalDecisions(startupRecovery.Context()); err != nil {
+			return fmt.Errorf("replay local decisions: %w", startupRecovery.Check(err))
+		}
 	}
+	openStage = "runtime_post_recovery_evidence"
 	if err := startupRecovery.Check(nil); err != nil {
 		return fmt.Errorf("renew startup recovery evidence: %w", err)
 	}
@@ -1305,6 +1324,7 @@ func (n *Node) openInternal(ctx context.Context, enroll bool, prelocked *qlog.Lo
 		startupRecovery.Close()
 	}
 	if certifiedCheckpoint != nil {
+		openStage = "runtime_post_selected_seal"
 		if n.materializationPolicy() == sqlpolicy.ManagedGraphRequestMaterializationPolicy {
 			if deferredManagedGraph {
 				if managedGraphSelectedSeal == nil {
@@ -1323,6 +1343,7 @@ func (n *Node) openInternal(ctx context.Context, enroll bool, prelocked *qlog.Lo
 					seal = &latest
 				}
 				if !preparedLearner {
+					openStage = "runtime_post_checkpoint_promote"
 					if err := n.promoteManagedAppendOnlySeal(ctx, *seal); err != nil {
 						return fmt.Errorf("promote managed append-only Graph checkpoint: %w", err)
 					}
@@ -1336,6 +1357,7 @@ func (n *Node) openInternal(ctx context.Context, enroll bool, prelocked *qlog.Lo
 					}
 					seal = &latest
 				}
+				openStage = "runtime_post_checkpoint_promote"
 				if err := n.promoteManagedGraphSeal(ctx, *seal); err != nil {
 					return fmt.Errorf("promote managed Graph certified checkpoint: %w", err)
 				}
@@ -1346,6 +1368,7 @@ func (n *Node) openInternal(ctx context.Context, enroll bool, prelocked *qlog.Lo
 				return errors.Join(fmt.Errorf("managed request startup certified root differs from exact QCKP"), err)
 			}
 			if !preparedLearner {
+				openStage = "runtime_post_checkpoint_promote"
 				if err := n.promoteManagedAppendOnlySeal(ctx, seal); err != nil {
 					return fmt.Errorf("promote managed append-only checkpoint: %w", err)
 				}
@@ -1360,6 +1383,7 @@ func (n *Node) openInternal(ctx context.Context, enroll bool, prelocked *qlog.Lo
 		}
 	}
 	if n.config.Local && objectStoreConfigured {
+		openStage = "runtime_post_local_backup"
 		if err := n.initializeLocalBackup(ctx); err != nil {
 			return fmt.Errorf("initialize Local backup: %w", err)
 		}
@@ -1374,6 +1398,7 @@ func (n *Node) openInternal(ctx context.Context, enroll bool, prelocked *qlog.Lo
 		}()
 	}
 	if n.localBackupReady {
+		openStage = "runtime_post_local_backup"
 		if n.localBackupNeedsSnapshot {
 			if err := n.reclaimLocalCheckpoint(ctx); err != nil {
 				return fmt.Errorf("snapshot Local extension: %w", err)
@@ -2338,9 +2363,9 @@ func (n *Node) replayLocalDecisionsTo(ctx context.Context, through quepaxa.Slot)
 		if len(decisions) == 0 && through != 0 && from <= through {
 			return from, fmt.Errorf("certified local replay made no progress through slot %d", through)
 		}
-		// Certified hints may be memory-only. Persist this fixed page before
-		// durable application state can advance beyond its recoverable WAL.
-		if len(decisions) != 0 {
+		// HA certified hints may be memory-only. Local cannot accept hints and
+		// its reclaim callback already owns the non-reentrant execution gate.
+		if !n.core.LocalMode() && len(decisions) != 0 {
 			if err := n.core.EnsureDurableThrough(ctx, decisions[len(decisions)-1].Slot); err != nil {
 				return from, err
 			}

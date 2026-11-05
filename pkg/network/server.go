@@ -2490,9 +2490,9 @@ func (s *Server) applyDecisions(ctx context.Context, through quepaxa.Slot) error
 				break
 			}
 		}
-		// A certified catch-up hint is not necessarily logged yet. Application
-		// persistence must follow WAL persistence of this exact replay page.
-		if end > 0 {
+		// HA certified hints need WAL persistence before application. Local
+		// owns its durability pipeline and cannot accept external hints.
+		if !s.core.LocalMode() && end > 0 {
 			if err := s.core.EnsureDurableThrough(ctx, decisions[end-1].Slot); err != nil {
 				return err
 			}

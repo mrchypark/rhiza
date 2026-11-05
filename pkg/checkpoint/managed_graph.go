@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"slices"
 
 	objmetrics "github.com/mrchypark/rhiza/internal/objstore"
@@ -199,12 +200,31 @@ func (m *Manager) PromoteManagedGraphLocator(ctx context.Context, l ManagedGraph
 	return fmt.Errorf("managed Graph CURRENT CAS did not converge")
 }
 
+func managedCurrentReadFailureDiagnostic(stage string, err error) string {
+	if err == nil {
+		return ""
+	}
+	switch stage {
+	case "attributes_before", "get", "body", "close", "attributes_after", "version_changed", "decode", "policy":
+		return "MANAGED_CHECKPOINT_CURRENT_READ_FAILURE stage=" + stage
+	default:
+		return ""
+	}
+}
+
+func logManagedCurrentReadFailure(stage string, err error) error {
+	if line := managedCurrentReadFailureDiagnostic(stage, err); line != "" {
+		log.Print(line)
+	}
+	return err
+}
+
 // LoadManagedAppendOnlyLocator reads the new profile's CURRENT hint. The
 // expected policy is explicit so policy 9/10 objects cannot cross profiles.
 func (m *Manager) LoadManagedAppendOnlyLocator(ctx context.Context, policy sqlpolicy.MaterializationPolicy) (ManagedAppendOnlyLocator, bool, error) {
 	if !m.appendOnly || m.expectedPolicy != policy ||
 		policy != sqlpolicy.ManagedRequestMaterializationPolicy && policy != sqlpolicy.ManagedGraphRequestMaterializationPolicy {
-		return ManagedAppendOnlyLocator{}, false, sqlpolicy.ErrIncompatible
+		return ManagedAppendOnlyLocator{}, false, logManagedCurrentReadFailure("policy", sqlpolicy.ErrIncompatible)
 	}
 	key := m.key("checkpoint/CURRENT")
 	attr, err := m.bucket.Attributes(objmetrics.WithExpectedNotFound(ctx), key)
@@ -212,30 +232,38 @@ func (m *Manager) LoadManagedAppendOnlyLocator(ctx context.Context, policy sqlpo
 		if m.bucket.IsObjNotFoundErr(err) {
 			return ManagedAppendOnlyLocator{}, false, nil
 		}
-		return ManagedAppendOnlyLocator{}, false, err
+		return ManagedAppendOnlyLocator{}, false, logManagedCurrentReadFailure("attributes_before", err)
 	}
 	if attr.Version == nil {
-		return ManagedAppendOnlyLocator{}, false, fmt.Errorf("managed append-only CURRENT lacks conditional version")
+		return ManagedAppendOnlyLocator{}, false, logManagedCurrentReadFailure("attributes_before", fmt.Errorf("managed append-only CURRENT lacks conditional version"))
 	}
 	r, err := m.bucket.Get(ctx, key)
 	if err != nil {
-		return ManagedAppendOnlyLocator{}, false, err
+		return ManagedAppendOnlyLocator{}, false, logManagedCurrentReadFailure("get", err)
 	}
 	data, readErr := io.ReadAll(io.LimitReader(r, maxRootSize+1))
 	closeErr := r.Close()
 	if readErr != nil || closeErr != nil || len(data) > maxRootSize {
-		return ManagedAppendOnlyLocator{}, false, errors.Join(readErr, closeErr, fmt.Errorf("invalid managed append-only CURRENT"))
+		stage := "body"
+		if readErr == nil && len(data) <= maxRootSize {
+			stage = "close"
+		}
+		return ManagedAppendOnlyLocator{}, false, logManagedCurrentReadFailure(stage, errors.Join(readErr, closeErr, fmt.Errorf("invalid managed append-only CURRENT")))
 	}
 	after, err := m.bucket.Attributes(ctx, key)
 	if err != nil || after.Version == nil || *after.Version != *attr.Version {
-		return ManagedAppendOnlyLocator{}, false, errors.Join(err, fmt.Errorf("managed append-only CURRENT changed during read"))
+		stage := "version_changed"
+		if err != nil || after.Version == nil {
+			stage = "attributes_after"
+		}
+		return ManagedAppendOnlyLocator{}, false, logManagedCurrentReadFailure(stage, errors.Join(err, fmt.Errorf("managed append-only CURRENT changed during read")))
 	}
 	var locator ManagedAppendOnlyLocator
 	if err := decodePersistedJSON(data, &locator); err != nil {
-		return ManagedAppendOnlyLocator{}, false, err
+		return ManagedAppendOnlyLocator{}, false, logManagedCurrentReadFailure("decode", err)
 	}
 	if err := locator.validate(policy); err != nil {
-		return ManagedAppendOnlyLocator{}, false, err
+		return ManagedAppendOnlyLocator{}, false, logManagedCurrentReadFailure("policy", err)
 	}
 	return locator, true, nil
 }
