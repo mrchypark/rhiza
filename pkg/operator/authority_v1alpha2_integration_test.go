@@ -5,10 +5,8 @@ import (
 	"crypto/tls"
 	"crypto/x509"
 	"encoding/json"
-	"errors"
 	"net/http"
 	"os"
-	"strings"
 	"testing"
 
 	"github.com/mrchypark/rhiza/pkg/network"
@@ -142,11 +140,7 @@ func TestV1Alpha2AuthorityAPIServerContract(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			err = store.Kube.Put(ctx, endpoint+"/status", proposed, &response)
-			var api *APIError
-			if !errors.As(err, &api) || api.StatusCode != 422 || !strings.Contains(err.Error(), "historical unresolved CR pending is read-only; updates are unsupported") {
-				t.Fatalf("historical UNKNOWN update was not explicitly denied: %v", err)
-			}
+			assertV1Alpha2StatusRejectedByRule(t, ctx, store.Kube, endpoint+"/status", proposed, "historical unresolved CR pending is read-only; updates are unsupported")
 			live, err := LoadV1Alpha2Admission(ctx, store, ref)
 			if err != nil || live.ResourceVersion() != observed.ResourceVersion() || !sameJSON(live.status.object["status"], observed.status.object["status"]) {
 				t.Fatalf("rejected historical UNKNOWN update changed original status: %v", err)
@@ -190,12 +184,7 @@ func verifyMixedReservationCEL(ctx context.Context, t *testing.T, store *V1Alpha
 	if err != nil {
 		t.Fatal(err)
 	}
-	var response map[string]json.RawMessage
-	err = store.Kube.Put(ctx, endpoint+"/status?dryRun=All", fixture.status.object, &response)
-	var api *APIError
-	if !errors.As(err, &api) || api.StatusCode != 422 || !strings.Contains(err.Error(), "append-only profiles cannot create CR application pending writes") {
-		t.Fatalf("fully bound new CR pending was not explicitly rejected: %v", err)
-	}
+	assertV1Alpha2StatusRejectedByRule(t, ctx, store.Kube, endpoint+"/status?dryRun=All", fixture.status.object, "append-only profiles cannot create CR application pending writes")
 	loaded, err := LoadV1Alpha2Admission(ctx, store, old.status.ref)
 	if err != nil || loaded.ResourceVersion() != old.ResourceVersion() || !sameJSON(loaded.status.object["status"], old.status.object["status"]) {
 		t.Fatal("rejected new pending changed status", err)

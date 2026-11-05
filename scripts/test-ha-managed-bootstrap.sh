@@ -2,6 +2,59 @@
 # Actual owned Kind bootstrap/recovery with two scoped Chaos Mesh kill actions.
 set -eu
 cd "$(CDPATH='' cd -- "$(dirname -- "$0")/.." && pwd)"
+managed_first_pod_fault_self_test() (
+  scratch=$(mktemp -d)
+  trap 'rm -f "$scratch"/*.json "$scratch"/*.txt "$scratch"/*.exit; rmdir "$scratch"' EXIT HUP INT TERM
+  namespace=test-ns release=test-run
+  . scripts/ha-managed-podchaos.sh
+  chaos_scope_guard() { [ "$scope_ok" = 1 ]; }
+  chaos_k() {
+    [ "$*" = 'get podchaos/pod-kill --ignore-not-found -o json' ] || return 97
+    [ "$get_present" = 0 ] || printf '%s\n' '{"kind":"PodChaos"}'
+    return "$get_code"
+  }
+  for mutation in valid empty-other extra-empty missing-proof nonempty-absence get-error get-still-present wrong-scope old-uid-running wrong-uid; do
+    rm -f "$scratch"/first-*.json "$scratch"/pod-kill-unexpected.json "$scratch"/pod-kill-after-delete-recheck.txt "$scratch"/pod-kill-after-delete-recheck.exit
+    scope_ok=1 get_code=0 get_present=0 proof_uid=old-uid
+    managed_chaos_request pod-kill sql-pod > "$scratch/pod-kill-request.json"
+    jq -n '{metadata:{namespace:"test-ns",name:"sql-pod",uid:"old-uid"},status:{containerStatuses:[{name:"sql",containerID:"containerd://old-container"}]}}' > "$scratch/pod-kill-pod-before.json"
+    cp "$scratch/pod-kill-pod-before.json" "$scratch/pod-kill-runtime-before.json"
+    jq -n '{containers:[{id:"old-container",state:"CONTAINER_RUNNING",labels:{"io.kubernetes.pod.uid":"old-uid"}}]}' > "$scratch/pod-kill-cri-before.json"
+    printf '%s\n' '{"containers":[]}' > "$scratch/pod-kill-cri-after.json"
+    jq -n '{status:{conditions:[{type:"AllInjected",status:"True"}],experiment:{containerRecords:[{id:"test-ns/sql-pod",phase:"Injected",injectedCount:1,recoveredCount:0}]}}}' > "$scratch/pod-kill-injected.json"
+    cp "$scratch/pod-kill-injected.json" "$scratch/pod-kill-before-delete.json"
+    printf '%s\n' '{"items":[{"metadata":{"uid":"new-uid"}}]}' > "$scratch/pod-kill-pods-after.json"
+    : > "$scratch/pod-kill-after-delete.json"
+    case "$mutation" in
+      valid) ;;
+      empty-other) : > "$scratch/pod-kill-injected.json" ;;
+      extra-empty) : > "$scratch/pod-kill-unexpected.json" ;;
+      missing-proof) rm "$scratch/pod-kill-cri-after.json" ;;
+      nonempty-absence) printf '{}\n' > "$scratch/pod-kill-after-delete.json" ;;
+      get-error) get_code=41 ;;
+      get-still-present) get_present=1 ;;
+      wrong-scope) scope_ok=0 ;;
+      old-uid-running) cp "$scratch/pod-kill-cri-before.json" "$scratch/pod-kill-cri-after.json" ;;
+      wrong-uid) proof_uid=other-uid ;;
+    esac
+    if managed_preserve_first_pod_fault "$scratch" sql-pod "$proof_uid"; then
+      [ "$mutation" = valid ] || { echo "accepted invalid first fault proof: $mutation" >&2; return 1; }
+      [ -f "$scratch/first-pod-kill-after-delete.json" ] && [ ! -s "$scratch/first-pod-kill-after-delete.json" ] || return 1
+      [ "$(cat "$scratch/pod-kill-after-delete-recheck.exit")" = 0 ] || return 1
+      for suffix in request pod-before runtime-before cri-before cri-after injected pods-after before-delete; do
+        [ -s "$scratch/first-pod-kill-$suffix.json" ] || return 1
+      done
+    else
+      code=$?
+      [ "$mutation" != valid ] || return "$code"
+      [ ! -e "$scratch/first-pod-kill-request.json" ] || return 1
+      if [ "$mutation" = get-error ]; then
+        [ "$code" = 41 ] && [ "$(cat "$scratch/pod-kill-after-delete-recheck.exit")" = 41 ] || return 1
+      fi
+    fi
+  done
+)
+
 managed_completed_repair_oracle_self_test() {
   scratch=$(mktemp -d)
   trap 'rm -f "$scratch"/repair.json "$scratch"/mismatch.json; rmdir "$scratch"' EXIT HUP INT TERM
@@ -42,8 +95,14 @@ managed_completed_repair_oracle_self_test() {
 }
 if [ "${1-}" = --oracle-self-test ]; then
   . scripts/ha-managed-bootstrap-fixture.sh
+  managed_first_pod_fault_self_test
   managed_completed_repair_oracle_self_test
   (cd scripts/ha-managed-bucket-setup-src && go test -mod=readonly -timeout=45s -run 'Test(GatedOracle|CommittedPlanOracle)$' .)
+  exit 0
+fi
+if [ "${1-}" = --pod-fault-proof-self-test ]; then
+  . scripts/ha-managed-bootstrap-fixture.sh
+  managed_first_pod_fault_self_test
   exit 0
 fi
 [ "${GITHUB_ACTIONS-}" = true ] || { echo 'GitHub Actions only' >&2; exit 1; }

@@ -277,6 +277,8 @@ func TestEmbeddedObjectStorageManagedKVNode(t *testing.T) {
 				return "context-canceled"
 			case errors.Is(err, context.DeadlineExceeded):
 				return "context-deadline"
+			case errors.Is(err, network.ErrNotReady):
+				return "peer-readiness"
 			}
 			switch err.Error() {
 			case "provider exact identity changed", "provider live assignment or authority changed":
@@ -295,8 +297,11 @@ func TestEmbeddedObjectStorageManagedKVNode(t *testing.T) {
 		attempts := 0
 		for {
 			err := n.AdmitManaged(ctx)
-			if err == nil {
+			if err == nil && n.Ready() {
 				return
+			}
+			if err == nil {
+				err = network.ErrNotReady
 			}
 			attempts++
 			if first == nil {

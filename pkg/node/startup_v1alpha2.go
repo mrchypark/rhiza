@@ -824,14 +824,28 @@ func (n *Node) validateCheckpointFiles(ctx context.Context, files []checkpoint.F
 	if len(files) != 1 || files[0].Role != checkpoint.RoleSQLite {
 		return fmt.Errorf("mixed checkpoint requires exactly one SQLite file")
 	}
-	_, actual, err := inspectManagedFileForPolicy(ctx, files[0].Path, n.receiptWindow(), n.materializationPolicy(), n.managedApplicationProtocol())
+	// The publisher's completed snapshot is deliberately adjacent to the live
+	// database and retains its .rhiza-checkpoint-* name until publication ends.
+	// Validate it through production restore in an isolated stage, just like the
+	// Graph branch, without relaxing the live startup artifact guard.
+	stage, err := os.MkdirTemp("", "rhiza-managed-checkpoint-validation-*")
 	if err != nil {
 		return err
 	}
-	if actual != tip {
-		return fmt.Errorf("mixed checkpoint applied tip differs from certified base")
+	defer func() { resultErr = errors.Join(resultErr, os.RemoveAll(stage)) }()
+	mat, err := n.openMaterializer(filepath.Join(stage, "sqlite.db"), 1)
+	if err != nil {
+		return err
 	}
-	return nil
+	restore := []materializer.CheckpointFile{{Role: materializer.CheckpointSQLite, Path: files[0].Path}}
+	if err := mat.RestoreCheckpoint(ctx, restore); err != nil {
+		return errors.Join(err, mat.Close())
+	}
+	_, inspectErr := mat.InspectManagedApplicationState(ctx)
+	if mat.Tip() != tip {
+		inspectErr = errors.Join(inspectErr, fmt.Errorf("mixed checkpoint applied tip differs from certified base"))
+	}
+	return errors.Join(inspectErr, mat.Close())
 }
 
 func validateManagedRepairOrigin(ctx context.Context, checker ManagedStartupChecker, raw []byte) error {

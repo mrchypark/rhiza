@@ -1,5 +1,42 @@
 #!/bin/sh
 # Shared actual managed bootstrap/replacement checks. Drivers own API, image and cleanup.
+managed_preserve_first_pod_fault() (
+  proof_dir=$1 proof_pod=$2 proof_uid=$3
+  # Absence is represented by one intentionally empty JSON file, never by a
+  # missing file. Every other JSON proof still has to be present and nonempty.
+  for suffix in request pod-before runtime-before cri-before cri-after injected pods-after before-delete after-delete; do
+    [ -f "$proof_dir/pod-kill-$suffix.json" ] || return 1
+  done
+  for evidence in "$proof_dir"/pod-kill-*.json; do
+    [ -f "$evidence" ] || return 1
+    case "${evidence##*/}" in
+      pod-kill-after-delete.json) [ ! -s "$evidence" ] || return 1 ;;
+      *) [ -s "$evidence" ] && jq -e . "$evidence" >/dev/null || return 1 ;;
+    esac
+  done
+  jq -e --arg ns "$namespace" --arg pod "$proof_pod" --arg run "$release" '.metadata.namespace==$ns and .metadata.labels["rhiza-ci-run"]==$run and .spec.action=="pod-kill" and .spec.mode=="one" and .spec.selector.namespaces==[$ns] and .spec.selector.pods=={($ns):[$pod]}' "$proof_dir/pod-kill-request.json" >/dev/null || return 1
+  jq -e --arg ns "$namespace" --arg pod "$proof_pod" --arg uid "$proof_uid" '.metadata.namespace==$ns and .metadata.name==$pod and .metadata.uid==$uid' "$proof_dir/pod-kill-pod-before.json" >/dev/null || return 1
+  jq -e --arg uid "$proof_uid" 'all(.items[]; .metadata.uid!=$uid)' "$proof_dir/pod-kill-pods-after.json" >/dev/null || return 1
+  chaos_record_oracle "$proof_dir/pod-kill-injected.json" "$namespace/$proof_pod" || return 1
+  old_container=$(jq -er --arg uid "$proof_uid" 'select(.metadata.uid==$uid)|.status.containerStatuses[]|select(.name=="sql")|.containerID|select(length>0)|sub("^containerd://";"")' "$proof_dir/pod-kill-runtime-before.json") || return 1
+  jq -e --arg uid "$proof_uid" --arg id "$old_container" 'any(.containers[]; .id==$id and .state=="CONTAINER_RUNNING" and .labels["io.kubernetes.pod.uid"]==$uid)' "$proof_dir/pod-kill-cri-before.json" >/dev/null || return 1
+  jq -e --arg uid "$proof_uid" --arg id "$old_container" '(.containers|type)=="array" and all(.containers[]; (.id!=$id or .state=="CONTAINER_EXITED") and (.state!="CONTAINER_RUNNING" or .labels["io.kubernetes.pod.uid"]!=$uid))' "$proof_dir/pod-kill-cri-after.json" >/dev/null || return 1
+  # Keep the producer's empty success proof and independently record a scoped
+  # successful GET. An empty stdout from a failed GET is not absence evidence.
+  chaos_scope_guard || return 1
+  if chaos_k get podchaos/pod-kill --ignore-not-found -o json > "$proof_dir/pod-kill-after-delete-recheck.txt"; then
+    printf '0\n' > "$proof_dir/pod-kill-after-delete-recheck.exit"
+  else
+    code=$?
+    printf '%s\n' "$code" > "$proof_dir/pod-kill-after-delete-recheck.exit"
+    return "$code"
+  fi
+  [ ! -s "$proof_dir/pod-kill-after-delete-recheck.txt" ] || return 1
+  for evidence in "$proof_dir"/pod-kill-*.json; do
+    cp "$evidence" "$proof_dir/first-${evidence##*/}" || return 1
+  done
+)
+
 managed_completed_repair_oracle() {
   jq -e --arg old_uid "$2" --arg old_node "$3" --arg prior_operation "${4-}" '
     .status.repair as $r | .status.applicationInit.plan as $application | try (
@@ -470,10 +507,7 @@ if [ "$fixture_case" != legacy ]; then
 fi
 old_node=$(jq -er --arg uid "$old_uid" '.status.bootstrapPlan.members[]|select(.podUID==$uid)|.member.node_id' "$logs/committed.json")
 managed_pod_fault "$old_pod" "$old_uid"
-for evidence in "$logs"/pod-kill-*.json; do
-  [ -s "$evidence" ]
-  cp "$evidence" "$logs/first-${evidence##*/}"
-done
+managed_preserve_first_pod_fault "$logs" "$old_pod" "$old_uid"
 attempt=0
 until k -n "$namespace" get rhizacluster sql -o json > "$logs/replacement-status.json" &&
   managed_completed_repair_oracle "$logs/replacement-status.json" "$old_uid" "$old_node"; do

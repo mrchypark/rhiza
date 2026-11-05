@@ -373,7 +373,9 @@ func managedProviderSourceNodes(t *testing.T, ctx context.Context, base rhiza.Co
 	}
 	for _, n := range nodes {
 		for {
-			if err := n.AdmitManaged(ctx); err == nil {
+			// Application admission does not set the catch-up/peer-ready flag
+			// consumed by the real Server. Wait for both before the first write.
+			if err := n.AdmitManaged(ctx); err == nil && n.Ready() {
 				break
 			}
 			timer := time.NewTimer(30 * time.Millisecond)
