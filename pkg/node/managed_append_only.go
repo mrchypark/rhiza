@@ -253,20 +253,39 @@ func (n *Node) verifyManagedAppendOnlyArchiveHistory(ctx context.Context, seal q
 	return ctx.Err()
 }
 
+// managedCheckpointSelectionDiagnostic contains only fixed source reason codes and
+// non-identifying runtime state; errors and object-store data never enter it.
+func managedCheckpointSelectionDiagnostic(reason string, preparedReadonlyLearner, localVoter bool, localConfig uint) string {
+	return fmt.Sprintf("MANAGED_CHECKPOINT_SELECT_FAILURE reason=%s prepared_readonly_learner=%t local_voter=%t local_config=%d", reason, preparedReadonlyLearner, localVoter, localConfig)
+}
+
+func (n *Node) managedCheckpointSelectionFailure(reason string, err error) error {
+	var preparedReadonlyLearner, localVoter bool
+	var localConfig uint
+	if n != nil && n.core != nil {
+		localVoter = n.core.IsVoter()
+		localConfig = n.core.CurrentCluster().ConfigID
+		preparedReadonlyLearner = n.config != nil && n.config.Learner != nil && !localVoter && n.managedStartup != nil &&
+			(n.managedStartup.Prepared != nil || n.managedStartup.verifiedAdoption != nil)
+	}
+	log.Print(managedCheckpointSelectionDiagnostic(reason, preparedReadonlyLearner, localVoter, localConfig))
+	return err
+}
+
 func (n *Node) selectManagedAppendOnlyRoot(ctx context.Context) (*checkpoint.Checkpoint, *quepaxa.SealedCheckpoint, error) {
 	if n == nil || n.core == nil || n.checkpoints == nil || n.archive == nil || !isManagedAppendOnlyProtocol(n.managedStartup.Identity.ApplicationProtocol) {
-		return nil, nil, fmt.Errorf("managed append-only checkpoint selection unavailable")
+		return nil, nil, n.managedCheckpointSelectionFailure("selection_unavailable", fmt.Errorf("managed append-only checkpoint selection unavailable"))
 	}
 	sealed, ok, err := n.core.LatestManagedCheckpointSeal()
 	if err != nil {
-		return nil, nil, err
+		return nil, nil, n.managedCheckpointSelectionFailure("local_seal_read", err)
 	}
 	// Prepared/adopted learners select local H certificates before any CURRENT-driven import.
 	preparedReadonlyLearner := n.config.Learner != nil && !n.core.IsVoter() &&
 		(n.managedStartup.Prepared != nil || n.managedStartup.verifiedAdoption != nil)
 	locator, hasLocator, err := n.checkpoints.LoadManagedAppendOnlyLocator(ctx, n.materializationPolicy())
 	if err != nil {
-		return nil, nil, err
+		return nil, nil, n.managedCheckpointSelectionFailure("current_read", err)
 	}
 	if hasLocator && !preparedReadonlyLearner && (!ok || locator.Index > uint64(sealed.Index) || locator.Index == uint64(sealed.Index) && locator.SealDecisionSlot > uint64(sealed.DecisionSlot)) {
 		// Another admitted voter may have advanced the shared append-only
@@ -278,97 +297,96 @@ func (n *Node) selectManagedAppendOnlyRoot(ctx context.Context) (*checkpoint.Che
 		}
 		sealed, ok, err = n.core.LatestManagedCheckpointSeal()
 		if err != nil {
-			return nil, nil, err
+			return nil, nil, n.managedCheckpointSelectionFailure("refreshed_local_seal_read", err)
 		}
 	}
 	if !ok {
 		if hasLocator && !preparedReadonlyLearner {
-			log.Printf("MANAGED_CHECKPOINT_SELECT_FAILURE reason=current_without_certified_qckp prepared_readonly_learner=%t local_voter=%t local_config=%d", preparedReadonlyLearner, n.core.IsVoter(), n.core.CurrentCluster().ConfigID)
-			return nil, nil, fmt.Errorf("managed append-only CURRENT has no certified QCKP")
+			return nil, nil, n.managedCheckpointSelectionFailure("current_without_certified_qckp", fmt.Errorf("managed append-only CURRENT has no certified QCKP"))
 		}
 		return nil, nil, nil
 	}
 	if hasLocator {
 		if !preparedReadonlyLearner && (locator.Index > uint64(sealed.Index) || locator.Index == uint64(sealed.Index) && locator.SealDecisionSlot > uint64(sealed.DecisionSlot)) {
-			return nil, nil, fmt.Errorf("managed append-only CURRENT is ahead of actual local certified selection")
+			return nil, nil, n.managedCheckpointSelectionFailure("current_ahead", fmt.Errorf("managed append-only CURRENT is ahead of actual local certified selection"))
 		}
 		if locator.Index == uint64(sealed.Index) && locator.SealDecisionSlot == uint64(sealed.DecisionSlot) && (locator.RootHash != sealed.RootHash) {
-			return nil, nil, fmt.Errorf("managed append-only CURRENT conflicts at the selected certificate rank")
+			return nil, nil, n.managedCheckpointSelectionFailure("current_rank_conflict", fmt.Errorf("managed append-only CURRENT conflicts at the selected certificate rank"))
 		}
 	}
 	if err := n.archive.Load(ctx); err != nil {
-		return nil, nil, fmt.Errorf("refresh managed append-only archive snapshot: %w", err)
+		return nil, nil, n.managedCheckpointSelectionFailure("archive_load", fmt.Errorf("refresh managed append-only archive snapshot: %w", err))
 	}
 	if n.archive.Sealed() {
-		return nil, nil, fmt.Errorf("managed append-only archive is sealed")
+		return nil, nil, n.managedCheckpointSelectionFailure("archive_sealed", fmt.Errorf("managed append-only archive is sealed"))
 	}
 	if n.archive.Tip() < sealed.DecisionSlot {
-		return nil, nil, fmt.Errorf("selected managed append-only QCKP remains beyond durable archive tip")
+		return nil, nil, n.managedCheckpointSelectionFailure("archive_tip_behind", fmt.Errorf("selected managed append-only QCKP remains beyond durable archive tip"))
 	}
 	if baseSeal, baseDecision, hasBase := n.archive.RecoveryBase(); hasBase {
 		if baseSeal.Index > sealed.Index || baseSeal.Index == sealed.Index && baseDecision.Slot > sealed.DecisionSlot {
-			return nil, nil, fmt.Errorf("managed append-only archive base is ahead of the selected QCKP")
+			return nil, nil, n.managedCheckpointSelectionFailure("archive_base_ahead", fmt.Errorf("managed append-only archive base is ahead of the selected QCKP"))
 		}
 		if err := n.core.ValidateCheckpointBase(ctx, baseSeal, baseDecision); err != nil {
-			return nil, nil, fmt.Errorf("managed append-only archive base differs from local certified history: %w", err)
+			return nil, nil, n.managedCheckpointSelectionFailure("archive_base_invalid", fmt.Errorf("managed append-only archive base differs from local certified history: %w", err))
 		}
 	}
 	d, tip, err := n.archive.DecisionsFrom(ctx, sealed.DecisionSlot, 1)
 	if err != nil || tip < sealed.DecisionSlot || len(d) != 1 || d[0].Slot != sealed.DecisionSlot {
-		return nil, nil, errors.Join(fmt.Errorf("selected managed append-only QCKP is absent from durable archive"), err)
+		return nil, nil, n.managedCheckpointSelectionFailure("archive_decision_unavailable", errors.Join(fmt.Errorf("selected managed append-only QCKP is absent from durable archive"), err))
 	}
 	decision := d[0]
 	if value, found := n.core.CertifiedValue(sealed.DecisionSlot); !found || value.Hash != decision.Hash || !bytes.Equal(value.Value, decision.Value) || sha256.Sum256(decision.Value) != decision.Hash || len(decision.Certificate) == 0 {
-		return nil, nil, fmt.Errorf("selected managed append-only QCKP certificate differs from Core")
+		return nil, nil, n.managedCheckpointSelectionFailure("core_certificate_mismatch", fmt.Errorf("selected managed append-only QCKP certificate differs from Core"))
 	}
 	if err := n.core.ValidateCertifiedValue(ctx, decision); err != nil {
-		return nil, nil, fmt.Errorf("selected managed append-only archive certificate is invalid: %w", err)
+		return nil, nil, n.managedCheckpointSelectionFailure("archive_certificate_invalid", fmt.Errorf("selected managed append-only archive certificate is invalid: %w", err))
 	}
 	if err := n.core.ValidateManagedCheckpointRoot(ctx, quepaxa.ManagedCheckpointCandidate{
 		Value: decision.Value, Hash: decision.Hash, Seal: sealed.CheckpointSeal,
 		DecisionSlot: sealed.DecisionSlot, ConfigID: n.core.ConfigIDForSlot(sealed.DecisionSlot),
 	}); err != nil {
-		return nil, nil, err
+		return nil, nil, n.managedCheckpointSelectionFailure("candidate_validation", err)
 	}
 	root, err := n.checkpoints.OpenRoot(ctx, uint64(sealed.Index), sealed.RootHash)
 	if err != nil {
-		return nil, nil, err
+		return nil, nil, n.managedCheckpointSelectionFailure("root_open", err)
 	}
 	if root.Hash != sealed.StateHash || root.SQLExecutionPolicy != int(n.materializationPolicy()) {
-		return nil, nil, fmt.Errorf("selected managed append-only root differs from certified QCKP")
+		return nil, nil, n.managedCheckpointSelectionFailure("root_state_policy_mismatch", fmt.Errorf("selected managed append-only root differs from certified QCKP"))
 	}
 	if hasLocator && locator.Index == uint64(sealed.Index) && locator.SealDecisionSlot == uint64(sealed.DecisionSlot) && locator.SealDecisionHash != decision.Hash {
-		return nil, nil, fmt.Errorf("managed append-only CURRENT certificate hash differs")
+		return nil, nil, n.managedCheckpointSelectionFailure("current_certificate_hash_mismatch", fmt.Errorf("managed append-only CURRENT certificate hash differs"))
 	}
 	return root, &sealed, nil
 }
 
 func (n *Node) refreshManagedAppendOnlyCertifiedPrefix(ctx context.Context) error {
 	if n == nil || n.core == nil || n.archive == nil || n.core.CompactionFloor() != 0 {
-		return fmt.Errorf("managed append-only startup prefix refresh is unavailable")
+		return n.managedCheckpointSelectionFailure("prefix_refresh_unavailable", fmt.Errorf("managed append-only startup prefix refresh is unavailable"))
 	}
 	if err := n.archive.Load(ctx); err != nil {
-		return fmt.Errorf("refresh managed append-only archive HEAD: %w", err)
+		return n.managedCheckpointSelectionFailure("prefix_archive_load", fmt.Errorf("refresh managed append-only archive HEAD: %w", err))
 	}
 	if _, _, hasBase := n.archive.RecoveryBase(); hasBase {
-		return fmt.Errorf("managed append-only archive unexpectedly has a recovery base")
+		return n.managedCheckpointSelectionFailure("prefix_unexpected_base", fmt.Errorf("managed append-only archive unexpectedly has a recovery base"))
 	}
 	tip := n.archive.Tip()
 	for from := n.core.Tip() + 1; from <= tip; {
 		page, observedTip, err := n.archive.DecisionsFrom(ctx, from, 256)
 		if err != nil || observedTip < tip || len(page) == 0 {
-			return fmt.Errorf("refreshed managed append-only archive prefix is incomplete: %w", err)
+			return n.managedCheckpointSelectionFailure("prefix_page_incomplete", fmt.Errorf("refreshed managed append-only archive prefix is incomplete: %w", err))
 		}
 		for i, decision := range page {
 			if decision.Slot != from+quepaxa.Slot(i) || sha256.Sum256(decision.Value) != decision.Hash || len(decision.Certificate) == 0 {
-				return fmt.Errorf("refreshed managed append-only archive identity is invalid at slot %d", decision.Slot)
+				return n.managedCheckpointSelectionFailure("prefix_decision_identity", fmt.Errorf("refreshed managed append-only archive identity is invalid at slot %d", decision.Slot))
 			}
 			if err := n.validateExecutionPolicy(decision.Value); err != nil {
-				return fmt.Errorf("refreshed managed append-only decision policy is invalid at slot %d: %w", decision.Slot, err)
+				return n.managedCheckpointSelectionFailure("prefix_decision_policy", fmt.Errorf("refreshed managed append-only decision policy is invalid at slot %d: %w", decision.Slot, err))
 			}
 		}
 		if err := n.core.AcceptCertifiedValues(page); err != nil {
-			return fmt.Errorf("accept refreshed managed append-only certified prefix: %w", err)
+			return n.managedCheckpointSelectionFailure("prefix_certificate_accept", fmt.Errorf("accept refreshed managed append-only certified prefix: %w", err))
 		}
 		from += quepaxa.Slot(len(page))
 	}

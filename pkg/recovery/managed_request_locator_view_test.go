@@ -30,6 +30,14 @@ func TestManagedRequestReadOnlyLocatorAndFixedHandoff(t *testing.T) {
 	const window = types.DefaultIdempotencyWindowSlots
 	const prefix = "request-view"
 	bucket := objstore.NewInMemBucket()
+	// Keep provider conditional-operation capabilities visible, but deny every
+	// actual upload/delete through the reader (including conditional uploads).
+	readonly := &haReadOnlyRecordingBucket{Bucket: bucket}
+	t.Cleanup(func() {
+		if readonly.mutations != 0 {
+			t.Fatalf("read-only source attempted %d mutations", readonly.mutations)
+		}
+	})
 	bootstrap := quepaxa.Cluster{ConfigID: 1, Members: []quepaxa.Member{{ID: "request-view", PublicKey: testPublicKey("request-view")}}}
 	wal, err := qlog.Open(t.TempDir())
 	if err != nil {
@@ -135,7 +143,7 @@ func TestManagedRequestReadOnlyLocatorAndFixedHandoff(t *testing.T) {
 	open := func() *ReadOnlyView {
 		t.Helper()
 		before := requestViewBucketHashes(t, ctx, bucket)
-		v, err := OpenReadOnlyViewForApplicationProtocol(ctx, bucket, prefix, 1, bootstrap, policy, window, protocol, false)
+		v, err := OpenReadOnlyViewForApplicationProtocol(ctx, readonly, prefix, 1, bootstrap, policy, window, protocol, false)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -157,7 +165,7 @@ func TestManagedRequestReadOnlyLocatorAndFixedHandoff(t *testing.T) {
 	load := func(t *testing.T, dir string, want *ReadOnlyView, ids ...string) {
 		t.Helper()
 		before := requestViewBucketHashes(t, ctx, bucket)
-		p, err := LoadPreparedStartupForApplicationProtocol(ctx, bucket, prefix, 1, bootstrap, dir, filepath.Join(t.TempDir(), "verified"), identity, policy, window, protocol, false)
+		p, err := LoadPreparedStartupForApplicationProtocol(ctx, readonly, prefix, 1, bootstrap, dir, filepath.Join(t.TempDir(), "verified"), identity, policy, window, protocol, false)
 		if err != nil {
 			t.Fatal("fixed handoff changed after CURRENT advanced", err)
 		}
@@ -228,7 +236,7 @@ func TestManagedRequestReadOnlyLocatorAndFixedHandoff(t *testing.T) {
 	}
 	t.Run("captured-checkpointless-H-does-not-import-J", func(t *testing.T) {
 		before := requestViewBucketHashes(t, ctx, bucket)
-		v, err := OpenReadOnlyViewAtHeadForApplicationProtocol(ctx, bucket, prefix, 1, bootstrap, noCheckpoint.CapturedHead(), policy, window, protocol, false)
+		v, err := OpenReadOnlyViewAtHeadForApplicationProtocol(ctx, readonly, prefix, 1, bootstrap, noCheckpoint.CapturedHead(), policy, window, protocol, false)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -258,7 +266,7 @@ func TestManagedRequestReadOnlyLocatorAndFixedHandoff(t *testing.T) {
 				t.Fatal(err)
 			}
 			before := requestViewBucketHashes(t, ctx, bucket)
-			if _, err := OpenReadOnlyViewForApplicationProtocol(ctx, bucket, prefix, 1, bootstrap, policy, window, protocol, false); err == nil {
+			if _, err := OpenReadOnlyViewForApplicationProtocol(ctx, readonly, prefix, 1, bootstrap, policy, window, protocol, false); err == nil {
 				t.Fatal("untrusted CURRENT accepted without exact policy/seal/root authentication")
 			}
 			if after := requestViewBucketHashes(t, ctx, bucket); !reflect.DeepEqual(before, after) {

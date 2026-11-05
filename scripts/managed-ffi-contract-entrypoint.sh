@@ -47,6 +47,7 @@ run_contract() {
     function knowncode(s) { return s ~ /^(internal|commit_unknown|kv_recovery_required|kv_not_submitted|sql_recovery_required|sql_not_submitted|timeout|canceled|invalid_request|not_ready|quorum_unavailable|request_conflict|durability_unavailable|overloaded|unclassified)$/ }
     function knownadmissioncause(s) { return s ~ /^(canceled|deadline|not_ready|invalid_request|request_conflict|quorum_unavailable|other)$/ }
     function knowncontrolreason(s) { return s ~ /^(runtime_role_or_profile|reference_validation|validated_prefix_advance|slot_not_next|isr_shape|voter_configuration|proposal_value|authority_changed|refs_uncovered|slot_changed|step_regressed|final_snapshot_mismatch)$/ }
+    function knowncheckpointreason(s) { return s ~ /^(selection_unavailable|local_seal_read|current_read|refreshed_local_seal_read|current_without_certified_qckp|current_ahead|current_rank_conflict|archive_load|archive_sealed|archive_tip_behind|archive_base_ahead|archive_base_invalid|archive_decision_unavailable|core_certificate_mismatch|archive_certificate_invalid|candidate_validation|root_open|root_state_policy_mismatch|current_certificate_hash_mismatch|prefix_refresh_unavailable|prefix_archive_load|prefix_unexpected_base|prefix_page_incomplete|prefix_decision_identity|prefix_decision_policy|prefix_certificate_accept)$/ }
     function uint(s) { return s ~ /^[0-9]+$/ && length(s)<=20 }
     function uint64(s) { return uint(s) && (length(s)<20 || "x" s<="x18446744073709551615") }
     function bit(s) { return s ~ /^(true|false)$/ }
@@ -62,7 +63,7 @@ run_contract() {
           prepared=select_fields[3]; sub(/^prepared_readonly_learner=/,"",prepared)
           voter=select_fields[4]; sub(/^local_voter=/,"",voter)
           config=select_fields[5]; sub(/^local_config=/,"",config)
-          if (reason!="current_without_certified_qckp") reason="unclassified"
+          if (!knowncheckpointreason(reason)) reason="unclassified"
           if (uint64(config)) emit("MANAGED_CHECKPOINT_SELECT_FAILURE reason=" reason " prepared_readonly_learner=" prepared " local_voter=" voter " local_config=" config)
         }
         next
@@ -302,6 +303,12 @@ if [ "${1-}" = --diagnostic-self-test ]; then
   before=$(cksum "$diag_dir/first.log")
   if run_contract rust-restart sh -c 'echo "FAIL: managed-ha-contract prior_ack_marker_missing"; exit 1'; then exit 1; fi
   [ "$before" = "$(cksum "$diag_dir/first.log")" ]
+  for reason in selection_unavailable local_seal_read current_read refreshed_local_seal_read current_without_certified_qckp current_ahead current_rank_conflict archive_load archive_sealed archive_tip_behind archive_base_ahead archive_base_invalid archive_decision_unavailable core_certificate_mismatch archive_certificate_invalid candidate_validation root_open root_state_policy_mismatch current_certificate_hash_mismatch prefix_refresh_unavailable prefix_archive_load prefix_unexpected_base prefix_page_incomplete prefix_decision_identity prefix_decision_policy prefix_certificate_accept; do
+    run_contract rust-restart sh -c 'printf "2026/11/03 12:00:00 MANAGED_CHECKPOINT_SELECT_FAILURE reason=%s prepared_readonly_learner=false local_voter=true local_config=3\n" "$1"' sh "$reason"
+    grep -Fx "MANAGED_CHECKPOINT_SELECT_FAILURE reason=$reason prepared_readonly_learner=false local_voter=true local_config=3" "$diag_dir/active.log" >/dev/null
+    [ "$(grep -c '^MANAGED_CHECKPOINT_SELECT_FAILURE ' "$diag_dir/active.log")" = 1 ]
+    [ "$before" = "$(cksum "$diag_dir/first.log")" ]
+  done
   [ "$(cat "$diag_dir/go-initial.exit")" = 7 ]
   run_contract rust-restart sh -c 'printf "%s\n" \
     "2026/11/03 12:00:00 MANAGED_CHECKPOINT_SELECT_FAILURE reason=current_without_certified_qckp prepared_readonly_learner=false local_voter=true local_config=3" \

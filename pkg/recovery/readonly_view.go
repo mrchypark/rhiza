@@ -159,7 +159,12 @@ func openReadOnlyView(ctx context.Context, bucket objstore.Bucket, prefix string
 		return nil, err
 	}
 	v := &ReadOnlyView{headHash: sha256.Sum256(encoded), headBytes: encoded, base: head.Base, tip: head.Tip, expectedPolicy: expectedPolicy, idempotencyWindow: window, applicationProtocol: applicationProtocol}
-	cp, err := checkpoint.NewManagerForPolicy(bucket, prefix, "", expectedPolicy, configID)
+	var cp *checkpoint.Manager
+	if expectedPolicy == sqlpolicy.ManagedRequestMaterializationPolicy {
+		cp, err = checkpoint.NewAppendOnlyManagerForPolicy(bucket, prefix, "", expectedPolicy, configID)
+	} else {
+		cp, err = checkpoint.NewManagerForPolicy(bucket, prefix, "", expectedPolicy, configID)
+	}
 	if err != nil {
 		return nil, err
 	}
