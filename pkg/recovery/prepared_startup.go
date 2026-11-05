@@ -102,10 +102,12 @@ func PublishPreparedStartupForPolicy(ctx context.Context, view *ReadOnlyView, ta
 		return fmt.Errorf("sync preparation parent: %w", err)
 	}
 	m := preparedStartupManifest{Version: version, Identity: identity, Head: view.CapturedHead()}
-	if expected == sqlpolicy.ManagedGraphRequestMaterializationPolicy {
-		if view.graphLocator == nil {
-			return fmt.Errorf("prepared Graph source lacks exact certified locator")
-		}
+	if expected == sqlpolicy.ManagedGraphRequestMaterializationPolicy && view.graphLocator == nil {
+		return fmt.Errorf("prepared Graph source lacks exact certified locator")
+	}
+	// Reuse the existing locator wire shape for policy 9. Its absence in v3
+	// preserves the original archive-only selection, including old handoffs.
+	if view.graphLocator != nil {
 		selected := *view.graphLocator
 		m.GraphLocator = &selected
 	}
@@ -236,12 +238,12 @@ func loadPreparedStartupForPolicy(ctx context.Context, bucket objstore.Bucket, p
 	if policy != sqlpolicy.ManagedGraphRequestMaterializationPolicy && len(m.Files) != 0 {
 		return nil, fmt.Errorf("unexpected prepared artifact inventory")
 	}
-	if (policy == sqlpolicy.ManagedGraphRequestMaterializationPolicy) != (m.GraphLocator != nil) {
+	if policy == sqlpolicy.ManagedGraphRequestMaterializationPolicy && m.GraphLocator == nil {
 		return nil, fmt.Errorf("prepared Graph locator/profile mismatch")
 	}
-	// The field is new only in v4. Preserve the old strict rejection even if a
-	// legacy marker explicitly supplies null (which decodes to a nil pointer).
-	if policy != sqlpolicy.ManagedGraphRequestMaterializationPolicy {
+	// Only explicit request/Graph profiles use this field. Preserve strict
+	// legacy rejection even for null (which decodes to a nil pointer).
+	if policy != sqlpolicy.ManagedGraphRequestMaterializationPolicy && policy != sqlpolicy.ManagedRequestMaterializationPolicy {
 		var fields map[string]json.RawMessage
 		if err := json.Unmarshal(data, &fields); err != nil {
 			return nil, err

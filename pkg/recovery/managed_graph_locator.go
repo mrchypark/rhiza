@@ -17,8 +17,13 @@ import (
 // data, or grant startup authority. The verifier carries trusted membership and
 // a real checkpoint file validator, never a no-op callback.
 func VerifyManagedGraphLocator(ctx context.Context, snapshot *RecoverySnapshot, cp *checkpoint.Manager, verifier *quepaxa.Core, l checkpoint.ManagedGraphLocator) (quepaxa.CheckpointSeal, quepaxa.DecidedValue, error) {
+	return verifyManagedAppendOnlyLocator(ctx, snapshot, cp, verifier, checkpoint.ManagedAppendOnlyLocator(l), sqlpolicy.ManagedGraphRequestMaterializationPolicy)
+}
+
+// The expected policy is trusted configuration; CURRENT cannot select it.
+func verifyManagedAppendOnlyLocator(ctx context.Context, snapshot *RecoverySnapshot, cp *checkpoint.Manager, verifier *quepaxa.Core, l checkpoint.ManagedAppendOnlyLocator, expected sqlpolicy.MaterializationPolicy) (quepaxa.CheckpointSeal, quepaxa.DecidedValue, error) {
 	var zero quepaxa.CheckpointSeal
-	if l.Policy != int(sqlpolicy.ManagedGraphRequestMaterializationPolicy) || snapshot == nil || cp == nil || verifier == nil || l.Index == 0 || l.Index >= l.SealDecisionSlot || quepaxa.Slot(l.SealDecisionSlot) > snapshot.Tip() {
+	if (expected != sqlpolicy.ManagedRequestMaterializationPolicy && expected != sqlpolicy.ManagedGraphRequestMaterializationPolicy) || l.Policy != int(expected) || snapshot == nil || cp == nil || verifier == nil || l.Index == 0 || l.Index >= l.SealDecisionSlot || quepaxa.Slot(l.SealDecisionSlot) > snapshot.Tip() {
 		return zero, quepaxa.DecidedValue{}, fmt.Errorf("managed Graph locator lies outside captured history")
 	}
 	page, _, err := snapshot.DecisionsFrom(ctx, quepaxa.Slot(l.SealDecisionSlot), 1)

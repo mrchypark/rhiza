@@ -48,13 +48,13 @@ func OpenReadOnlyView(ctx context.Context, bucket objstore.Bucket, prefix string
 }
 
 func OpenReadOnlyViewForPolicy(ctx context.Context, bucket objstore.Bucket, prefix string, configID uint, bootstrap quepaxa.Cluster, expected sqlpolicy.MaterializationPolicy, window uint64) (*ReadOnlyView, error) {
-	return openReadOnlyView(ctx, bucket, prefix, configID, bootstrap, expected, window, nil, nil, "")
+	return openReadOnlyView(ctx, bucket, prefix, configID, bootstrap, expected, window, nil, nil, "", true)
 }
 
 // The membership mode is trusted startup configuration, never inferred from a
-// locator, seal, or checkpoint payload. Existing 7/8/9 entrypoints are unchanged.
+// locator, seal, or checkpoint payload. Protocol-free legacy APIs are unchanged.
 func OpenReadOnlyViewForPolicyWithReconfiguration(ctx context.Context, bucket objstore.Bucket, prefix string, configID uint, bootstrap quepaxa.Cluster, expected sqlpolicy.MaterializationPolicy, window uint64, reconfiguration bool) (*ReadOnlyView, error) {
-	return openReadOnlyView(ctx, bucket, prefix, configID, bootstrap, expected, window, nil, &reconfiguration, "")
+	return openReadOnlyView(ctx, bucket, prefix, configID, bootstrap, expected, window, nil, &reconfiguration, "", true)
 }
 
 // OpenReadOnlyViewForApplicationProtocol verifies final append-only profiles
@@ -64,7 +64,7 @@ func OpenReadOnlyViewForApplicationProtocol(ctx context.Context, bucket objstore
 	if err := validateReadOnlyProfile(expected, window, applicationProtocol); err != nil {
 		return nil, err
 	}
-	return openReadOnlyView(ctx, bucket, prefix, configID, bootstrap, expected, window, nil, &reconfiguration, applicationProtocol)
+	return openReadOnlyView(ctx, bucket, prefix, configID, bootstrap, expected, window, nil, &reconfiguration, applicationProtocol, true)
 }
 
 // OpenReadOnlyViewAtHead verifies the captured head and its immutable source
@@ -98,7 +98,10 @@ func openReadOnlyViewAtHeadForPolicy(ctx context.Context, bucket objstore.Bucket
 	if bucket == nil || len(capturedHead) == 0 || len(capturedHead) > maxArchiveHeadSize {
 		return nil, fmt.Errorf("invalid captured archive head")
 	}
-	return openReadOnlyView(ctx, &capturedHeadBucket{Bucket: bucket, name: path.Join(prefix, "archive/head.bin"), head: bytes.Clone(capturedHead)}, prefix, configID, bootstrap, expected, window, selected, trustedReconfiguration, applicationProtocol)
+	// A request-profile captured HEAD with no selected locator means the
+	// original archive-only selection, not permission to discover a later CURRENT.
+	discoverLocator := expected != sqlpolicy.ManagedRequestMaterializationPolicy
+	return openReadOnlyView(ctx, &capturedHeadBucket{Bucket: bucket, name: path.Join(prefix, "archive/head.bin"), head: bytes.Clone(capturedHead)}, prefix, configID, bootstrap, expected, window, selected, trustedReconfiguration, applicationProtocol, discoverLocator)
 }
 
 // Only the mutable HEAD is substituted. Every immutable object is fetched from
@@ -129,12 +132,13 @@ func (b *capturedHeadBucket) Get(ctx context.Context, name string) (io.ReadClose
 	return io.NopCloser(bytes.NewReader(b.head)), nil
 }
 
-func openReadOnlyView(ctx context.Context, bucket objstore.Bucket, prefix string, configID uint, bootstrap quepaxa.Cluster, expectedPolicy sqlpolicy.MaterializationPolicy, window uint64, selected *checkpoint.ManagedGraphLocator, trustedReconfiguration *bool, applicationProtocol string) (result *ReadOnlyView, resultErr error) {
+func openReadOnlyView(ctx context.Context, bucket objstore.Bucket, prefix string, configID uint, bootstrap quepaxa.Cluster, expectedPolicy sqlpolicy.MaterializationPolicy, window uint64, selected *checkpoint.ManagedGraphLocator, trustedReconfiguration *bool, applicationProtocol string, discoverLocator bool) (result *ReadOnlyView, resultErr error) {
 	if err := validateReadOnlyProfile(expectedPolicy, window, applicationProtocol); err != nil {
 		return nil, err
 	}
-	if expectedPolicy == sqlpolicy.ManagedGraphRequestMaterializationPolicy && trustedReconfiguration == nil {
-		return nil, fmt.Errorf("managed Graph reader requires explicit trusted membership mode")
+	appendOnlyPolicy := expectedPolicy == sqlpolicy.ManagedRequestMaterializationPolicy || expectedPolicy == sqlpolicy.ManagedGraphRequestMaterializationPolicy
+	if appendOnlyPolicy && trustedReconfiguration == nil {
+		return nil, fmt.Errorf("managed append-only reader requires explicit trusted membership mode")
 	}
 	if bucket == nil || len(bootstrap.Members) == 0 {
 		return nil, fmt.Errorf("read-only view requires a bucket and trusted bootstrap")
@@ -178,6 +182,20 @@ func openReadOnlyView(ctx context.Context, bucket objstore.Bucket, prefix string
 			}
 		}
 		v.graphLocator = &graphLocator
+	} else if expectedPolicy == sqlpolicy.ManagedRequestMaterializationPolicy {
+		if selected != nil {
+			locator := *selected
+			v.graphLocator = &locator
+		} else if discoverLocator {
+			locator, found, err := cp.LoadManagedAppendOnlyLocator(ctx, expectedPolicy)
+			if err != nil {
+				return nil, fmt.Errorf("load managed request checkpoint locator: %w", err)
+			}
+			if found {
+				selected := checkpoint.ManagedGraphLocator(locator)
+				v.graphLocator = &selected
+			}
+		}
 	}
 	if hasCheckpoint {
 		v.baseSeal, err = json.Marshal(seal)
@@ -258,7 +276,7 @@ func openReadOnlyView(ctx context.Context, bucket objstore.Bucket, prefix string
 		}
 	}()
 	enableReconfiguration := !hasCheckpoint || seal.Membership != nil
-	if graphPolicy {
+	if appendOnlyPolicy {
 		enableReconfiguration = *trustedReconfiguration
 	}
 	coreConfig := quepaxa.Config{NodeID: "rhiza-readonly-verifier", Cluster: bootstrap, WAL: wal, EnableReconfiguration: enableReconfiguration}
@@ -280,10 +298,10 @@ func openReadOnlyView(ctx context.Context, bucket objstore.Bucket, prefix string
 			return nil, err
 		}
 	}
-	if graphPolicy {
-		seal, decision, err = VerifyManagedGraphLocator(ctx, snapshot, cp, core, graphLocator)
+	if v.graphLocator != nil {
+		seal, decision, err = verifyManagedAppendOnlyLocator(ctx, snapshot, cp, core, checkpoint.ManagedAppendOnlyLocator(*v.graphLocator), expectedPolicy)
 		if err != nil {
-			return nil, fmt.Errorf("verify captured Graph checkpoint locator: %w", err)
+			return nil, fmt.Errorf("verify captured managed checkpoint locator: %w", err)
 		}
 		v.base = seal.Index
 		hasCheckpoint = true
@@ -304,6 +322,11 @@ func openReadOnlyView(ctx context.Context, bucket objstore.Bucket, prefix string
 		}
 		if err := cp.Verify(ctx, v.root.Index, v.root.RootHash, v.root.Hash); err != nil {
 			return nil, err
+		}
+		if managedSQLKVPolicy(expectedPolicy) {
+			if err := verifyMixedReadOnlyCheckpointForPolicy(ctx, cp, v.root, v.base, window, filepath.Join(dir, "selected-checkpoint"), expectedPolicy, applicationProtocol); err != nil {
+				return nil, err
+			}
 		}
 	}
 	if hasCheckpoint {
