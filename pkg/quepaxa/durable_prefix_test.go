@@ -246,6 +246,82 @@ func TestEnsureDurableThroughConcurrentRecoveryBase(t *testing.T) {
 	}
 }
 
+func TestEnsureDurableThroughWakesRegisteredDecisionBatch(t *testing.T) {
+	core, wal, values := durableFrontierCertifiedFixture(t)
+	if err := core.AcceptCertifiedHints(values); err != nil {
+		t.Fatal(err)
+	}
+	entered, release, synced := make(chan struct{}), make(chan struct{}), make(chan struct{})
+	var calls atomic.Int32
+	core.commits = newGroupCommit(func() error {
+		if calls.Add(1) == 1 {
+			close(entered)
+			<-release
+		}
+		err := wal.Sync()
+		if calls.Load() == 1 {
+			close(synced)
+		}
+		return err
+	})
+	// A decision must explicitly wake the registered batch, not depend on
+	// the recorder's timer or enough unrelated recorder waiters arriving.
+	core.commits.delay = time.Hour
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	done := make(chan error, 1)
+	go func() { done <- core.EnsureDurableThrough(ctx, 3) }()
+	joined, released := false, false
+	t.Cleanup(func() {
+		cancel()
+		if !released {
+			close(release)
+		}
+		select {
+		case core.commits.wake <- struct{}{}:
+		default:
+		}
+		if !joined {
+			<-done
+		}
+		core.commits.mu.Lock()
+		running := core.commits.running
+		core.commits.mu.Unlock()
+		if running {
+			<-synced
+		}
+	})
+	select {
+	case <-entered:
+	case err := <-done:
+		joined = true
+		t.Fatalf("decision did not wake its registered sync batch: %v", err)
+	case <-ctx.Done():
+		t.Fatal("decision waited for the recorder timer instead of waking its registered batch")
+	}
+	core.mu.RLock()
+	premature := core.durableThrough != 0 || core.durable[1] || core.durable[2] || core.durable[3]
+	core.mu.RUnlock()
+	if premature {
+		t.Fatal("decision became durable before the actual WAL Sync completed")
+	}
+	close(release)
+	released = true
+	err := <-done
+	joined = true
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := core.EnsureDurableThrough(ctx, 3); err != nil || calls.Load() != 1 {
+		t.Fatalf("covered prefix synced again: calls=%d err=%v", calls.Load(), err)
+	}
+	for _, expected := range values {
+		got, ok := core.CertifiedValue(expected.Slot)
+		if !ok || got.Hash != expected.Hash || string(got.Value) != string(expected.Value) || string(got.Certificate) != string(expected.Certificate) {
+			t.Fatal("decision sync changed the certified original", expected.Slot)
+		}
+	}
+}
+
 func durableFrontierCertifiedFixture(t *testing.T) (*Core, *qlog.WAL, []DecidedValue) {
 	t.Helper()
 	config := &Cluster{ConfigID: 1, Members: []Member{{ID: "a"}}}
