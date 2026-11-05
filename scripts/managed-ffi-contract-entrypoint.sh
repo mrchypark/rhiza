@@ -48,12 +48,25 @@ run_contract() {
     function knownadmissioncause(s) { return s ~ /^(canceled|deadline|not_ready|invalid_request|request_conflict|quorum_unavailable|other)$/ }
     function knowncontrolreason(s) { return s ~ /^(runtime_role_or_profile|reference_validation|validated_prefix_advance|slot_not_next|isr_shape|voter_configuration|proposal_value|authority_changed|refs_uncovered|slot_changed|step_regressed|final_snapshot_mismatch)$/ }
     function uint(s) { return s ~ /^[0-9]+$/ && length(s)<=20 }
+    function uint64(s) { return uint(s) && (length(s)<20 || "x" s<="x18446744073709551615") }
     function bit(s) { return s ~ /^(true|false)$/ }
     function stripgotimestamp(s) { sub(/^[0-9][0-9][0-9][0-9]\/[0-9][0-9]\/[0-9][0-9] [0-9][0-9]:[0-9][0-9]:[0-9][0-9] /,"",s); return s }
     /^GRAPH_STARTUP_DIAGNOSTIC last_stage=(target_inspect|core_open|archive_recover|pair_select|pair_reconstruct|pair_install|runtime_verify|open_complete|not_observed)$/ { emit($0); next }
     {
       refusal=$0
       diagnostic=stripgotimestamp($0)
+      if (diagnostic ~ /^MANAGED_CHECKPOINT_SELECT_FAILURE/) {
+        if (diagnostic ~ /^MANAGED_CHECKPOINT_SELECT_FAILURE reason=[a-z_]+ prepared_readonly_learner=(true|false) local_voter=(true|false) local_config=[0-9]+$/) {
+          split(diagnostic, select_fields, " ")
+          reason=select_fields[2]; sub(/^reason=/,"",reason)
+          prepared=select_fields[3]; sub(/^prepared_readonly_learner=/,"",prepared)
+          voter=select_fields[4]; sub(/^local_voter=/,"",voter)
+          config=select_fields[5]; sub(/^local_config=/,"",config)
+          if (reason!="current_without_certified_qckp") reason="unclassified"
+          if (uint64(config)) emit("MANAGED_CHECKPOINT_SELECT_FAILURE reason=" reason " prepared_readonly_learner=" prepared " local_voter=" voter " local_config=" config)
+        }
+        next
+      }
       if (diagnostic ~ /^MANAGED_CONTROL_OBSERVATION_REJECTED/) {
         if (diagnostic ~ /^MANAGED_CONTROL_OBSERVATION_REJECTED reason=[a-z_]+$/) {
           split(diagnostic, control_fields, " ")
@@ -282,13 +295,38 @@ if [ "${1-}" = --diagnostic-self-test ]; then
   trap 'rm -f "$diag_test_dir/first.log" "$diag_test_dir/active.log" "$diag_test_dir/go-initial.exit" "$diag_test_dir/rust-initial.exit" "$diag_test_dir/rust-restart.exit" "$diag_test_dir/graph-profile-restart.exit" "$diag_test_dir/graph-qualification-restart.exit"; rmdir "$diag_test_dir"' EXIT HUP INT TERM
   diag_dir=$diag_test_dir
   : > "$diag_dir/first.log"
-  if run_contract go-initial sh -c 'printf "%s\n" "private-profile-DO-NOT-RETAIN" "    managed_incluster_test.go:123: private-profile-DO-NOT-RETAIN"; exit 7'; then exit 1; else [ "$?" = 7 ]; fi
+  if run_contract go-initial sh -c 'printf "%s\n" "private-profile-DO-NOT-RETAIN" "    managed_incluster_test.go:123: private-profile-DO-NOT-RETAIN" "2026/11/03 12:00:00 MANAGED_CHECKPOINT_SELECT_FAILURE reason=current_without_certified_qckp prepared_readonly_learner=true local_voter=false local_config=1"; exit 7'; then exit 1; else [ "$?" = 7 ]; fi
   grep -Fx 'GO_CONTRACT_SOURCE managed_incluster_test.go:123:' "$diag_dir/first.log" >/dev/null
+  grep -Fx 'MANAGED_CHECKPOINT_SELECT_FAILURE reason=current_without_certified_qckp prepared_readonly_learner=true local_voter=false local_config=1' "$diag_dir/first.log" >/dev/null
   if grep -F 'DO-NOT-RETAIN' "$diag_dir/first.log"; then exit 1; fi
   before=$(cksum "$diag_dir/first.log")
   if run_contract rust-restart sh -c 'echo "FAIL: managed-ha-contract prior_ack_marker_missing"; exit 1'; then exit 1; fi
   [ "$before" = "$(cksum "$diag_dir/first.log")" ]
   [ "$(cat "$diag_dir/go-initial.exit")" = 7 ]
+  run_contract rust-restart sh -c 'printf "%s\n" \
+    "2026/11/03 12:00:00 MANAGED_CHECKPOINT_SELECT_FAILURE reason=current_without_certified_qckp prepared_readonly_learner=false local_voter=true local_config=3" \
+    "MANAGED_CHECKPOINT_SELECT_FAILURE reason=current_without_certified_qckp prepared_readonly_learner=true local_voter=false local_config=1" \
+    "MANAGED_CHECKPOINT_SELECT_FAILURE reason=private_reason prepared_readonly_learner=false local_voter=false local_config=2" \
+    "MANAGED_CHECKPOINT_SELECT_FAILURE reason=current_without_certified_qckp prepared_readonly_learner=false local_voter=false local_config=18446744073709551615" \
+    "MANAGED_CHECKPOINT_SELECT_FAILURE reason=current_without_certified_qckp prepared_readonly_learner=unknown local_voter=false local_config=3" \
+    "MANAGED_CHECKPOINT_SELECT_FAILURE reason=current_without_certified_qckp prepared_readonly_learner=false local_voter=1 local_config=3" \
+    "MANAGED_CHECKPOINT_SELECT_FAILURE reason=current_without_certified_qckp prepared_readonly_learner=false local_voter=true local_config=-1" \
+    "MANAGED_CHECKPOINT_SELECT_FAILURE reason=current_without_certified_qckp prepared_readonly_learner=false local_voter=true local_config=3.5" \
+    "MANAGED_CHECKPOINT_SELECT_FAILURE reason=current_without_certified_qckp prepared_readonly_learner=false local_voter=true local_config=18446744073709551616" \
+    "MANAGED_CHECKPOINT_SELECT_FAILURE reason=current_without_certified_qckp prepared_readonly_learner=false local_voter=true local_config=999999999999999999999" \
+    "MANAGED_CHECKPOINT_SELECT_FAILURE reason=current_without_certified_qckp prepared_readonly_learner=false local_voter=true local_config=3 extra=DO-NOT-RETAIN" \
+    "prefix 2026/11/03 12:00:00 MANAGED_CHECKPOINT_SELECT_FAILURE reason=current_without_certified_qckp prepared_readonly_learner=false local_voter=true local_config=3" \
+    "MANAGED_CHECKPOINT_SELECT_FAILURE reason=https://private.invalid prepared_readonly_learner=false local_voter=true local_config=3"'
+  for fixed in \
+    'MANAGED_CHECKPOINT_SELECT_FAILURE reason=current_without_certified_qckp prepared_readonly_learner=false local_voter=true local_config=3' \
+    'MANAGED_CHECKPOINT_SELECT_FAILURE reason=current_without_certified_qckp prepared_readonly_learner=true local_voter=false local_config=1' \
+    'MANAGED_CHECKPOINT_SELECT_FAILURE reason=unclassified prepared_readonly_learner=false local_voter=false local_config=2' \
+    'MANAGED_CHECKPOINT_SELECT_FAILURE reason=current_without_certified_qckp prepared_readonly_learner=false local_voter=false local_config=18446744073709551615'; do
+    grep -Fx "$fixed" "$diag_dir/active.log" >/dev/null
+  done
+  [ "$(grep -c '^MANAGED_CHECKPOINT_SELECT_FAILURE ' "$diag_dir/active.log")" = 4 ]
+  if grep -E 'DO-NOT-RETAIN|private_reason|private.invalid|local_config=-1|local_config=3.5|18446744073709551616|999999999999999999999|^prefix ' "$diag_dir/active.log"; then exit 1; fi
+  [ "$before" = "$(cksum "$diag_dir/first.log")" ]
   run_contract rust-restart sh -c 'printf "%s\n" \
     "2026/11/03 12:00:00 managed startup unavailable stage=host_open code=internal cause=required_root_unavailable" \
     "    managed_incluster_test.go:73: real managed FFI open failed, code=internal message=managed startup rejected" \

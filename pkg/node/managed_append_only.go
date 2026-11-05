@@ -282,7 +282,8 @@ func (n *Node) selectManagedAppendOnlyRoot(ctx context.Context) (*checkpoint.Che
 		}
 	}
 	if !ok {
-		if hasLocator {
+		if hasLocator && !preparedReadonlyLearner {
+			log.Printf("MANAGED_CHECKPOINT_SELECT_FAILURE reason=current_without_certified_qckp prepared_readonly_learner=%t local_voter=%t local_config=%d", preparedReadonlyLearner, n.core.IsVoter(), n.core.CurrentCluster().ConfigID)
 			return nil, nil, fmt.Errorf("managed append-only CURRENT has no certified QCKP")
 		}
 		return nil, nil, nil
