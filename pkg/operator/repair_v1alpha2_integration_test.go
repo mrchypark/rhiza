@@ -352,7 +352,7 @@ func TestRepairDiagnosticPreservesBodyReadError(t *testing.T) {
 }
 
 func TestRepairDiagnosticAllowlistedCause(t *testing.T) {
-	body := `{"reason":"Invalid","details":{"causes":[{"reason":"FieldValueInvalid","field":"status.repair.plan.replacement.publicKey","message":"private-value"},{"reason":"secret-type","field":"status.repair.secret-field","message":"private-value"}]}}`
+	body := `{"reason":"Invalid","details":{"causes":[{"reason":"FieldValueInvalid","field":"status.repair.plan.replacement.publicKey","message":"private-value"},{"reason":"secret-type","field":"status.repair.secret-field","message":"private-value"},{"reason":"FieldValueInvalid","field":"status.repair.preparedHandoff.preparedConfig.members[0].wal_identity","message":"private-value"},{"reason":"FieldValueInvalid","field":"status.repair","message":"Invalid value: PRIVATE_RESOURCE: ADD-first prepared source must bind the current roster and exact old WAL"}]}}`
 	var log string
 	d := repairDiagnosticTransport{base: repairDiagnosticRoundTrip(func(*http.Request) (*http.Response, error) {
 		return &http.Response{StatusCode: 422, Body: io.NopCloser(strings.NewReader(body))}, nil
@@ -372,7 +372,7 @@ func TestRepairDiagnosticAllowlistedCause(t *testing.T) {
 	if err := resp.Body.Close(); err != nil {
 		t.Fatal(err)
 	}
-	if string(got) != body || !strings.Contains(log, "status.repair.plan.replacement.publicKey:FieldValueInvalid") || !strings.Contains(log, "other:other") || strings.Contains(log, "private-value") || strings.Contains(log, "secret-field") || strings.Contains(log, "secret-type") {
+	if string(got) != body || !strings.Contains(log, "status.repair.plan.replacement.publicKey:FieldValueInvalid") || !strings.Contains(log, "status.repair.preparedHandoff.preparedConfig.members[0].wal_identity:FieldValueInvalid") || !strings.Contains(log, "ADD-first prepared source must bind the current roster and exact old WAL") || !strings.Contains(log, "other:other") || strings.Contains(log, "private-value") || strings.Contains(log, "PRIVATE_RESOURCE") || strings.Contains(log, "secret-field") || strings.Contains(log, "secret-type") {
 		t.Fatalf("unsafe or missing cause diagnostic: %q", log)
 	}
 }
@@ -587,6 +587,13 @@ func (d repairDiagnosticTransport) RoundTrip(req *http.Request) (*http.Response,
 				field = allowed
 			}
 		}
+		// Fixed fields of this two-member administrative source fixture only;
+		// arbitrary API field paths and resource values are never logged.
+		for _, allowed := range []string{"status.repair.preparedHandoff", "status.repair.preparedHandoff.preparedConfig", "status.repair.preparedHandoff.preparedSlot", "status.repair.preparedHandoff.preparedHash", "status.repair.preparedHandoff.preparedConfig.members[0].wal_identity", "status.repair.preparedHandoff.preparedConfig.members[1].wal_identity"} {
+			if cause.Field == allowed {
+				field = allowed
+			}
+		}
 		causeType := "other"
 		for _, allowed := range []string{"FieldValueInvalid", "FieldValueRequired", "FieldValueNotSupported", "FieldValueDuplicate", "FieldValueTooLong", "FieldValueTooMany", "UnexpectedServerResponse"} {
 			if cause.Type == allowed {
@@ -594,9 +601,9 @@ func (d repairDiagnosticTransport) RoundTrip(req *http.Request) (*http.Response,
 			}
 		}
 		causes = append(causes, field+":"+causeType)
-		for _, message := range []string{"repair record cannot be removed", "repair requires consumed managed bootstrap history", "closed repair must match authority and cannot overlap a transition", "repair intent is immutable per operation", "terminal repair is immutable per operation", "a new repair must start closed", "replacement repair requires a terminal predecessor and advanced position", "repair CAS cannot overwrite application authority", "closed repair forbids new application reservations", "repair state and completion must agree", "repair completion must bind the exact operation and position", "REMOVE alone is not final repair completion", "final target must include replacement and exclude old voter"} {
-			if strings.Contains(cause.Message, message) {
-				matches = append(matches, message)
+		for _, rule := range rules {
+			if rule.message != "" && (cause.Message == rule.message || strings.HasSuffix(cause.Message, ": "+rule.message)) {
+				matches = append(matches, rule.message)
 			}
 		}
 	}
@@ -768,7 +775,10 @@ func TestV1Alpha2RepairAPIServerContract(t *testing.T) {
 	}
 	kubectl("", "patch", "pod", podName, "--subresource=status", "--type=merge", "-p", string(status))
 	voters := []types.NodeID{nodeID, "survivor"}
-	plan := V1Alpha2RepairPlan{Sequence: V1Alpha2RepairAddThenRemove, OperationID: "repair-cel", ClusterUID: ref.UID, Generation: a.Authority().Generation, DeploymentUID: a.Authority().Binding.DeploymentUID, StorageID: a.Authority().Binding.StorageID, ExpectedConfigID: 1, OldNodeID: "old", OldWALIdentity: "registered-nonce", BootstrapPlanDigest: init.Assignment().Plan.BootstrapPlanDigest, FinalVoterIDs: voters, Replacement: V1Alpha2RepairMember{PodName: podName, PodUID: podUID, NodeID: nodeID, PublicKey: key, PeerURL: "quic://10.0.0.1:9090"}}
+	// Administrative identity evidence must use the same 32-byte hex nonce
+	// shape as actual WAL registrations. Capture first exposes it in the typed
+	// preparedConfig, whose CRD wal_identity schema rejects arbitrary labels.
+	plan := V1Alpha2RepairPlan{Sequence: V1Alpha2RepairAddThenRemove, OperationID: "repair-cel", ClusterUID: ref.UID, Generation: a.Authority().Generation, DeploymentUID: a.Authority().Binding.DeploymentUID, StorageID: a.Authority().Binding.StorageID, ExpectedConfigID: 1, OldNodeID: "old", OldWALIdentity: strings.Repeat("1", 64), BootstrapPlanDigest: init.Assignment().Plan.BootstrapPlanDigest, FinalVoterIDs: voters, Replacement: V1Alpha2RepairMember{PodName: podName, PodUID: podUID, NodeID: nodeID, PublicKey: key, PeerURL: "quic://10.0.0.1:9090"}}
 	patch := func(body any, want string) {
 		t.Helper()
 		b, e := json.Marshal(map[string]any{"status": body})
