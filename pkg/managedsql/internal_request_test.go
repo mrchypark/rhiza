@@ -508,7 +508,7 @@ func TestInternalRequestActualPostApplyCancellationRecoversExactOriginal(t *test
 	testInternalRequestActualPostApplyCancellationRecoversExactOriginal(t, nil)
 }
 
-func testInternalRequestActualPostApplyCancellationRecoversExactOriginal(t *testing.T, beforeReopenedRecovery func(context.Context, *Host, Config, Config, materializer.RequestOriginal) (context.Context, func())) {
+func testInternalRequestActualPostApplyCancellationRecoversExactOriginal(t *testing.T, beforeReopenedRecovery func(context.Context, *Host, Config, Config, materializer.RequestOriginal) (context.Context, func()), expectReopenedUnknown ...bool) {
 	var outage, armed atomic.Bool
 	var attempts atomic.Int64
 	entered := make(chan string, 8)
@@ -648,7 +648,11 @@ func testInternalRequestActualPostApplyCancellationRecoversExactOriginal(t *test
 	if verifyRecovery != nil {
 		verifyRecovery()
 	}
-	if err != nil || recovered.KV == nil || recovered.KV.Slot != receipt.Slot || !recovered.KV.Applied {
+	if len(expectReopenedUnknown) == 1 && expectReopenedUnknown[0] {
+		if !errors.Is(err, network.ErrCommitUnknown) || recovered.KV != nil {
+			t.Fatalf("untrusted recorder tail did not preserve UNKNOWN without an ACK: %+v %v", recovered, err)
+		}
+	} else if err != nil || recovered.KV == nil || recovered.KV.Slot != receipt.Slot || !recovered.KV.Applied {
 		t.Fatalf("new handle exact original recovery: %+v %v", recovered, err)
 	}
 	if after := hostApplicationDecisionCount(t, ctx, configs[0], sqlpolicy.ManagedRequestMaterializationPolicy); after != before {

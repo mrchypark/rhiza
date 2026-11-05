@@ -333,14 +333,14 @@ jobs:
           CGO_ENABLED: 1
         run: >-
           go test -tags rhiza_local_testhooks ./pkg/node ./pkg/network ./pkg/managedsql
-          -run '^(TestManagedGraphAppliedHintCertificateSurvivesWALReopen|TestManagedGraphAdoptionReopen.*|TestServerCertifiedHintReplayPersistsBeforeApply|TestManagedInitialAdmissionCutAllowsOnlyLaterRecorderProgress|TestInternalRequestActualPostApplyCancellationRecoversExactOriginalWithControlISR|TestManagedRequestStartupRetainsSelectedSealAcrossLaterCertifiedQCKP)$'
+          -run '^(TestManagedGraphAppliedHintCertificateSurvivesWALReopen|TestManagedGraphAdoptionReopen.*|TestServerCertifiedHintReplayPersistsBeforeApply|TestManagedInitialAdmissionCutAllowsOnlyLaterRecorderProgress|TestInternalRequestActualPostApplyCancellationRecoversExactOriginalWithControlISR|TestInternalRequestReopenedKVInitialAdmissionRetainsOwnedCutAcrossControlISR|TestInternalRequestReopenedKVInitialAdmissionRejectsApplicationISRAfterOwnedCut|TestManagedRequestStartupRetainsSelectedSealAcrossLaterCertifiedQCKP)$'
           -count=1 -timeout=60s
       - name: Managed checkpoint durability and retained reopen (race)
         env:
           CGO_ENABLED: 1
         run: >-
           go test -race -tags rhiza_local_testhooks ./pkg/node ./pkg/network ./pkg/managedsql
-          -run '^(TestManagedGraphAppliedHintCertificateSurvivesWALReopen|TestManagedGraphAdoptionReopen.*|TestServerCertifiedHintReplayPersistsBeforeApply|TestManagedInitialAdmissionCutAllowsOnlyLaterRecorderProgress|TestInternalRequestActualPostApplyCancellationRecoversExactOriginalWithControlISR|TestManagedRequestStartupRetainsSelectedSealAcrossLaterCertifiedQCKP)$'
+          -run '^(TestManagedGraphAppliedHintCertificateSurvivesWALReopen|TestManagedGraphAdoptionReopen.*|TestServerCertifiedHintReplayPersistsBeforeApply|TestManagedInitialAdmissionCutAllowsOnlyLaterRecorderProgress|TestInternalRequestActualPostApplyCancellationRecoversExactOriginalWithControlISR|TestInternalRequestReopenedKVInitialAdmissionRetainsOwnedCutAcrossControlISR|TestInternalRequestReopenedKVInitialAdmissionRejectsApplicationISRAfterOwnedCut|TestManagedRequestStartupRetainsSelectedSealAcrossLaterCertifiedQCKP)$'
           -count=1 -timeout=60s
       - name: Vet
         env:

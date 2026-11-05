@@ -3,10 +3,13 @@
 package managedsql
 
 import (
+	"bytes"
 	"context"
+	"crypto/sha256"
 	"errors"
 	"fmt"
 	"path/filepath"
+	"reflect"
 	"strconv"
 	"strings"
 	"sync"
@@ -26,6 +29,24 @@ import (
 )
 
 func managedGraphCertifiedCounts(t *testing.T, ctx context.Context, cfg Config, id string) (int, int) {
+	t.Helper()
+	total, original := 0, 0
+	for _, value := range managedGraphCertifiedSnapshot(t, ctx, cfg) {
+		command, graph, err := types.DecodeManagedGraphExecution(value.Value)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if graph {
+			total++
+			if command.RequestID == id {
+				original++
+			}
+		}
+	}
+	return total, original
+}
+
+func managedGraphCertifiedSnapshot(t *testing.T, ctx context.Context, cfg Config) []quepaxa.DecidedValue {
 	t.Helper()
 	cluster := quepaxa.Cluster{ConfigID: 1, Members: cfg.Runtime.Members}
 	identity := node.New(&cfg.Runtime)
@@ -47,7 +68,7 @@ func managedGraphCertifiedCounts(t *testing.T, ctx context.Context, cfg Config, 
 	if err != nil {
 		t.Fatal(err)
 	}
-	total, original := 0, 0
+	var values []quepaxa.DecidedValue
 	for from := quepaxa.Slot(1); from <= tip; {
 		page, err := peer.FetchDecisions(ctx, cfg.Runtime.NodeID, from, 128)
 		if err != nil || len(page.Decisions) == 0 {
@@ -57,20 +78,14 @@ func managedGraphCertifiedCounts(t *testing.T, ctx context.Context, cfg Config, 
 			if value.Slot > tip {
 				break
 			}
-			command, graph, err := types.DecodeManagedGraphExecution(value.Value)
-			if err != nil {
-				t.Fatal(err)
+			if value.Slot != from || len(value.Certificate) == 0 || sha256.Sum256(value.Value) != value.Hash {
+				t.Fatal("actual certified Graph snapshot lost slot/hash/certificate continuity")
 			}
-			if graph {
-				total++
-				if command.RequestID == id {
-					original++
-				}
-			}
+			values = append(values, value)
 			from = value.Slot + 1
 		}
 	}
-	return total, original
+	return values
 }
 
 func TestManagedGraphPublicRecoveryHealsPendingWithoutProposal(t *testing.T) {
@@ -242,7 +257,17 @@ func testManagedGraphPublicPending(t *testing.T, mode string) {
 	if _, err := hosts[1].RequestStatus(ctx, selector); !pendingObservation(err) {
 		t.Fatalf("public status did not reject actual pending projection: %v", err)
 	}
-	count, own := managedGraphCertifiedCounts(t, ctx, configs[0], original.RequestID)
+	originalBefore, found, err := hosts[0].node.RetainedRequest(ctx, "graph", original.RequestID)
+	if err != nil || !found || originalBefore.Slot != ack.Slot || originalBefore.Receipt != ack.MutationReceipt {
+		t.Fatal("actual source original/receipt unavailable before recovery", err)
+	}
+	// Count on the runtime that performs the operation. Its ACK does not
+	// promise synchronous delivery to a different replica's local ReadTip.
+	beforeValues := managedGraphCertifiedSnapshot(t, ctx, configs[1])
+	count, own := managedGraphCertifiedCounts(t, ctx, configs[1], original.RequestID)
+	if ack.Slot > uint64(len(beforeValues)) || !bytes.Equal(beforeValues[ack.Slot-1].Value, originalBefore.ExecutionItem) || beforeValues[ack.Slot-1].Hash != originalBefore.DecisionHash {
+		t.Fatal("target's certified original differs from exact source slot/bytes/hash")
+	}
 	if mode == "read" {
 		rows, err := hosts[1].GraphQuery(ctx, query)
 		if err != nil || len(rows.Rows) != 1 || rows.Rows[0][0] != "original" {
@@ -298,13 +323,25 @@ func testManagedGraphPublicPending(t *testing.T, mode string) {
 			t.Fatalf("actual public pending recovery failed: result=%+v error=%v", resolved, err)
 		}
 	}
-	afterCount, afterOwn := managedGraphCertifiedCounts(t, ctx, configs[0], original.RequestID)
+	afterCount, afterOwn := managedGraphCertifiedCounts(t, ctx, configs[1], original.RequestID)
 	wantCount := count
 	if mode == "write" {
 		wantCount++
 	}
 	if wantCount != afterCount || own != 1 || afterOwn != 1 {
-		t.Fatalf("recovery proposed Graph application: total %d->%d original %d->%d", count, afterCount, own, afterOwn)
+		t.Fatalf("recovery changed certified Graph originals on target: total %d->%d want=%d original %d->%d original_slot=%d", count, afterCount, wantCount, own, afterOwn, ack.Slot)
+	}
+	afterValues := managedGraphCertifiedSnapshot(t, ctx, configs[1])
+	if len(afterValues) < len(beforeValues) || !reflect.DeepEqual(beforeValues, afterValues[:len(beforeValues)]) {
+		t.Fatal("recovery changed the target's original certified prefix")
+	}
+	originalAfter, found, err := hosts[1].node.RetainedRequest(ctx, "graph", original.RequestID)
+	if err != nil || !found || !reflect.DeepEqual(originalBefore, originalAfter) {
+		t.Fatal("recovery changed original slot/fingerprint/bytes/result/receipt", err)
+	}
+	status, err := hosts[1].RequestStatus(ctx, selector)
+	if err != nil || status.Receipt == nil || *status.Receipt != ack.MutationReceipt {
+		t.Fatal("recovery changed the original ACK receipt", err)
 	}
 	rows, err := hosts[1].GraphQuery(ctx, network.GraphQueryRequest{Cypher: query.Cypher, Consistency: "local"})
 	if err != nil || len(rows.Rows) != 1 || rows.Rows[0][0] != "original" {

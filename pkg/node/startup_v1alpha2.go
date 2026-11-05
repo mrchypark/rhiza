@@ -1103,8 +1103,11 @@ func (n *Node) AdmitManaged(ctx context.Context) error {
 		return err
 	}
 	n.managedAdmitted.Store(false)
+	var ownedBarrier quepaxa.Slot
 	if binding != nil && isManagedAppendOnlyProtocol(n.managedApplicationProtocol()) {
-		if err := n.waitManagedAppendOnlyControl(ctx, binding); err != nil {
+		var err error
+		ownedBarrier, err = n.waitManagedAppendOnlyControlProof(ctx, binding)
+		if err != nil {
 			if n.materializationPolicy() == sqlpolicy.ManagedGraphRequestMaterializationPolicy {
 				logManagedGraphAdmissionStageFailure("initial", "pre_control", err)
 			}
@@ -1118,6 +1121,8 @@ func (n *Node) AdmitManaged(ctx context.Context) error {
 		}
 		return err
 	}
+	readIndexTarget := target
+	target = max(target, ownedBarrier)
 	if binding != nil && isManagedAppendOnlyProtocol(n.managedApplicationProtocol()) {
 		if err := n.core.WaitTip(ctx, target); err != nil {
 			if n.materializationPolicy() == sqlpolicy.ManagedGraphRequestMaterializationPolicy {
@@ -1147,6 +1152,29 @@ func (n *Node) AdmitManaged(ctx context.Context) error {
 		}
 		return err
 	}
+	refuseHistory := func(phase string, state ManagedRuntimeState) error {
+		log.Printf("MANAGED_INITIAL_ADMISSION_HISTORY_REFUSED phase=%s owned=%d read_index=%d target=%d recorded=%d certified=%d applied=%d", phase, ownedBarrier, readIndexTarget, target, state.RecorderTip, state.CertifiedTip, state.AppliedTip)
+		return fmt.Errorf("managed runtime has unapplied or unresolved history")
+	}
+	var ownedCut *managedInitialAdmissionCut
+	if ownedBarrier != 0 {
+		// Capture actual resolved progress before the final observation. This is
+		// evidence for one immutable cut, not a fabricated quiescent snapshot.
+		progress := n.core.RuntimeProgressSnapshot()
+		cut := managedInitialAdmissionCut{state: ManagedRuntimeState{WALIdentity: n.core.WALIdentity(), CertifiedTip: uint64(progress.CertifiedTip), AppliedTip: n.material.Tip(), RecorderTip: uint64(progress.RecorderTip), ExistingRegisteredWAL: n.managedStartup.existingRegisteredWAL}}
+		cut.floor, cut.root, cut.hasRoot = n.core.RecoveryRoot()
+		prefix, prefixOK := n.core.PrefixHash(progress.CertifiedTip)
+		cut.prefix = prefix
+		decision, certified := n.core.CertifiedValue(ownedBarrier)
+		certificateErr := n.core.ValidateCertifiedValue(ctx, decision)
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		if !certified || len(decision.Certificate) == 0 || certificateErr != nil || !prefixOK || cut.state.CertifiedTip < uint64(target) || cut.state.AppliedTip != cut.state.CertifiedTip || cut.state.RecorderTip > cut.state.CertifiedTip || progress != n.core.RuntimeProgressSnapshot() || !n.initialAdmissionCutCurrent(cut, cut.state) {
+			return refuseHistory("owned_cut", cut.state)
+		}
+		ownedCut = &cut
+	}
 	state, err := n.managedRuntimeStateWithContext(ctx)
 	if err != nil {
 		if n.materializationPolicy() == sqlpolicy.ManagedGraphRequestMaterializationPolicy {
@@ -1154,13 +1182,45 @@ func (n *Node) AdmitManaged(ctx context.Context) error {
 		}
 		return err
 	}
-	if state.CertifiedTip < uint64(target) || state.AppliedTip != state.CertifiedTip || state.RecorderTip > state.CertifiedTip {
+	historyIncomplete := state.CertifiedTip < uint64(target) || state.AppliedTip != state.CertifiedTip || state.RecorderTip > state.CertifiedTip
+	authorityState := state
+	if ownedCut != nil {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		binding.mu.Lock()
+		bindingCurrent := !binding.closing && n.internalApplication.Load() == binding
+		binding.mu.Unlock()
+		if !bindingCurrent || binding.lifetime.Err() != nil || !n.core.IsVoter() || !n.core.CanParticipateReadIndex() {
+			return network.ErrNotReady
+		}
+		if !n.initialAdmissionCutCurrent(*ownedCut, state) {
+			return refuseHistory("changed_cut", state)
+		}
+		if state.RecorderTip > state.CertifiedTip {
+			// Classification alone grants no authority: the owned certificate,
+			// fixed C/A/prefix/root and live binding above remain mandatory.
+			observation, err := n.core.ObserveManagedAppendOnlyControl(ctx)
+			if err != nil {
+				if ctx.Err() != nil {
+					return ctx.Err()
+				}
+				return refuseHistory("untrusted_recorder", state)
+			}
+			if !observation.BelongsTo(n.core) || uint64(observation.CommittedTip) != state.CertifiedTip || uint64(observation.ObservedSlot) != state.RecorderTip || observation.ApplicationProtocol != n.managedApplicationProtocol() || observation.Generation != binding.identity.Member.Generation || !n.initialAdmissionCutCurrent(*ownedCut, state) {
+				return refuseHistory("changed_control", state)
+			}
+		}
+		historyIncomplete = false
+		authorityState = ownedCut.state
+	}
+	if historyIncomplete {
 		if n.materializationPolicy() == sqlpolicy.ManagedGraphRequestMaterializationPolicy {
 			logManagedGraphHistoryRefused("initial", uint64(target), state)
 		}
-		return fmt.Errorf("managed runtime has unapplied or unresolved history")
+		return refuseHistory("final_state", state)
 	}
-	if err := n.managedStartup.Checker.ValidateManagedAdmission(ctx, n.managedStartup.Identity, state); err != nil {
+	if err := n.managedStartup.Checker.ValidateManagedAdmission(ctx, n.managedStartup.Identity, authorityState); err != nil {
 		if n.materializationPolicy() == sqlpolicy.ManagedGraphRequestMaterializationPolicy {
 			logManagedGraphAdmissionTargetFailure("initial", "authority", target, err)
 		}
