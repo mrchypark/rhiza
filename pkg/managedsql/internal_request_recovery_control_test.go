@@ -28,7 +28,7 @@ func TestInternalRequestActualPostApplyCancellationRecoversExactOriginal(t *test
 
 func TestInternalRequestReopenedKVInitialAdmissionAcrossCertifiedReadBarrierDuringInspection(t *testing.T) {
 	pauseCertifiedRecoveryBackground(t)
-	testInternalRequestActualPostApplyCancellationRecoversExactOriginal(t, func(ctx context.Context, h *Host, cfg, readyPeer Config, original materializer.RequestOriginal) (context.Context, func(RecoveryResult, error)) {
+	testInternalRequestActualPostApplyCancellationRecoversExactOriginal(t, func(ctx context.Context, h *Host, cfg, readyPeer Config, original materializer.RequestOriginal, _ uint64, _ func(string)) (context.Context, func(RecoveryResult, error)) {
 		cluster := quepaxa.Cluster{ConfigID: 1, Members: cfg.Runtime.Members}
 		client, err := network.NewTransportForManagedProfile(readyPeer.Runtime.ClusterID, readyPeer.Runtime.NodeID, &cluster, readyPeer.Runtime.PeerToken, network.ManagedPeerProfile{ApplicationProtocol: readyPeer.Plan.ApplicationProtocol, BootstrapPlanDigest: readyPeer.Plan.BootstrapPlanDigest, Generation: int64(readyPeer.Plan.Generation)})
 		if err != nil {
@@ -263,18 +263,103 @@ func TestInternalRequestReopenedKVInitialAdmissionRejectsApplicationISRAfterOwne
 	runInternalRequestRecoveryWithControlISR(t, true, true)
 }
 
+func internalRecoveryPrefixThrough(t *testing.T, ctx context.Context, cfg Config, through uint64, observe func(string)) ([]quepaxa.DecidedValue, [32]byte) {
+	t.Helper()
+	// The caller supplies an actual certified slot, not a latest-tip guess.
+	// These small fixtures fit in one Sync response; never retry or ReadIndex.
+	if through == 0 || through > 128 {
+		t.Fatal("known recovery prefix is outside the one-RPC fixture bound", through)
+	}
+	if observe != nil {
+		observe("before-prefix-rpc")
+	}
+	cluster := quepaxa.Cluster{ConfigID: 1, Members: cfg.Runtime.Members}
+	profile := network.ManagedPeerProfile{ApplicationProtocol: cfg.Plan.ApplicationProtocol, BootstrapPlanDigest: cfg.Plan.BootstrapPlanDigest, Generation: int64(cfg.Plan.Generation)}
+	client, err := network.NewTransportForManagedProfile(cfg.Runtime.ClusterID, cfg.Runtime.NodeID, &cluster, cfg.Runtime.PeerToken, profile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() {
+		if err := client.Close(); err != nil {
+			t.Error("owned prefix client cleanup", err)
+		}
+	}()
+	page, err := client.FetchDecisions(ctx, cfg.Runtime.NodeID, 1, int(through))
+	if observe != nil {
+		observe("after-prefix-rpc")
+	}
+	if err != nil {
+		t.Fatal("single authenticated known-cut prefix RPC", err)
+	}
+	if page.ClusterID != cfg.Runtime.ClusterID || page.ProposerID != cfg.Runtime.NodeID || page.ConfigID != 1 || uint64(page.Tip) < through || uint64(len(page.Decisions)) != through {
+		t.Fatal("actual response does not cover the exact known prefix", through, len(page.Decisions), page.Tip)
+	}
+	var prefix [32]byte
+	for i, decision := range page.Decisions {
+		if uint64(decision.Slot) != uint64(i+1) || len(decision.Certificate) == 0 || sha256.Sum256(decision.Value) != decision.Hash {
+			t.Fatal("invalid actual certified prefix identity")
+		}
+		prefix = quepaxa.AdvancePrefixHash(prefix, decision.Slot, decision.Hash)
+	}
+	return page.Decisions, prefix
+}
+
+func internalRecoveryApplications(t *testing.T, values []quepaxa.DecidedValue) []managedApplicationDecision {
+	t.Helper()
+	var applications []managedApplicationDecision
+	for _, decision := range values {
+		if len(decision.Value) == 0 {
+			continue
+		} // certified recovery no-op, not an application original
+		sqlCommands, sql, err := types.DecodeSQLBatch(decision.Value)
+		if err != nil {
+			t.Fatal(err)
+		}
+		kvCommands, kv, err := types.DecodeManagedKVBatch(decision.Value)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !kv {
+			command, single, err := types.DecodeManagedKVCommand(decision.Value)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if single {
+				kv = true
+				kvCommands = []types.KVCommand{command}
+			}
+		}
+		for _, command := range sqlCommands {
+			applications = append(applications, managedApplicationDecision{slot: decision.Slot, hash: fmt.Sprintf("%x", decision.Hash), kind: "sql", requestID: command.RequestID})
+		}
+		for _, command := range kvCommands {
+			applications = append(applications, managedApplicationDecision{slot: decision.Slot, hash: fmt.Sprintf("%x", decision.Hash), kind: "kv", requestID: command.RequestID})
+		}
+		if !sql && !kv {
+			barrier, e1 := types.DecodeReadBarrier(decision.Value)
+			_, seal, e2 := types.DecodeCheckpointSeal(decision.Value)
+			_, schedule, e3 := types.DecodeLeaderSchedule(decision.Value)
+			reconfiguration, e4 := types.DecodeReconfiguration(decision.Value)
+			if e1 != nil || e2 != nil || e3 != nil || e4 != nil || !(barrier || seal || schedule || reconfiguration) {
+				t.Fatal("certified recovery prefix contains an unclassified value")
+			}
+		}
+	}
+	return applications
+}
+
 func runInternalRequestRecoveryWithControlISR(t *testing.T, beforeFinalRuntime bool, applicationISR ...bool) {
 	lateApplication := len(applicationISR) == 1 && applicationISR[0]
 	// Retain the actual SDK-held post-Apply cancellation, UNKNOWN metadata,
 	// canonical raw original/TTL, healthy neighbor, and exact receipt oracles.
 	pauseCertifiedRecoveryBackground(t)
-	testInternalRequestActualPostApplyCancellationRecoversExactOriginal(t, func(ctx context.Context, h *Host, cfg, readyPeer Config, original materializer.RequestOriginal) (context.Context, func(RecoveryResult, error)) {
+	testInternalRequestActualPostApplyCancellationRecoversExactOriginal(t, func(ctx context.Context, h *Host, cfg, readyPeer Config, original materializer.RequestOriginal, knownY uint64, observeReadyPeer func(string)) (context.Context, func(RecoveryResult, error)) {
 		before, err := h.node.InspectManagedKVRead(ctx)
 		if err != nil || before.Runtime.RecorderTip != before.Runtime.CertifiedTip || before.Runtime.AppliedTip != before.Runtime.CertifiedTip {
 			t.Fatal("capture resolved actual prefix before hook", before.Runtime, err)
 		}
-		values, prefix := certifiedRecoveryPrefix(t, ctx, readyPeer)
-		beforeApplications := hostApplicationDecisionSnapshot(t, ctx, readyPeer)
+		values, prefix := internalRecoveryPrefixThrough(t, ctx, readyPeer, knownY, observeReadyPeer)
+		beforeApplications := internalRecoveryApplications(t, values)
 		if uint64(len(values)) != before.Runtime.CertifiedTip {
 			t.Fatal("ready peer does not cover the exact captured target prefix")
 		}
@@ -459,7 +544,7 @@ func runInternalRequestRecoveryWithControlISR(t *testing.T, beforeFinalRuntime b
 			}
 			// The operation under test has now initialized this Host; only now
 			// may its certified tip be observed through the peer protocol.
-			afterValues, _ := certifiedRecoveryPrefix(t, ctx, cfg)
+			afterValues, _ := internalRecoveryPrefixThrough(t, ctx, cfg, after.Runtime.CertifiedTip, nil)
 			if len(afterValues) < len(values) || !reflect.DeepEqual(values, afterValues[:len(values)]) {
 				t.Fatal("recovery forked certified original bytes/certificates")
 			}
@@ -479,7 +564,7 @@ func runInternalRequestRecoveryWithControlISR(t *testing.T, beforeFinalRuntime b
 					t.Fatal("recovery certified a non-control suffix")
 				}
 			}
-			afterApplications := hostApplicationDecisionSnapshot(t, ctx, cfg)
+			afterApplications := internalRecoveryApplications(t, afterValues)
 			if !reflect.DeepEqual(beforeApplications, afterApplications) {
 				t.Fatal("recovery submitted an additional application original")
 			}

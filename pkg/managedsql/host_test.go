@@ -283,11 +283,55 @@ type sqlFixturePeer struct {
 	transport *quic.Transport
 	once      sync.Once
 	err       error
+	closed    atomic.Bool
 }
 
 func (p *sqlFixturePeer) close() error {
-	p.once.Do(func() { p.err = errors.Join(p.transport.Close(), p.conn.Close()) })
+	p.once.Do(func() { p.closed.Store(true); p.err = errors.Join(p.transport.Close(), p.conn.Close()) })
 	return p.err
+}
+
+func (f *sqlStatusFixture) observeRecoveryPeer(t *testing.T, phase string, h *Host, cfg Config) {
+	t.Helper()
+	f.mu.Lock()
+	p := f.peers[cfg.Runtime.NodeID]
+	f.mu.Unlock()
+	if p == nil {
+		t.Fatal("recovery peer has no owned UDP reservation")
+	}
+	bound := p.conn.LocalAddr().String()
+	endpoint := ""
+	keyMatches := false
+	for _, member := range cfg.Runtime.Members {
+		if member.ID == cfg.Runtime.NodeID {
+			endpoint = member.PeerURL
+			keyMatches = member.PublicKey == quepaxa.PublicKey(network.PeerPublicKey(cfg.Runtime.ClusterID, cfg.Runtime.NodeID, cfg.Runtime.PeerToken))
+		}
+	}
+	var socketErr error
+	if udp, ok := p.conn.(*net.UDPConn); ok {
+		raw, err := udp.SyscallConn()
+		socketErr = err
+		if err == nil {
+			socketErr = raw.Control(func(uintptr) {})
+		}
+	} else {
+		socketErr = errors.New("owned packet connection is not UDP")
+	}
+	h.mu.Lock()
+	closed := h.closed
+	var lifetimeErr error
+	if h.admissionLifetime == nil {
+		lifetimeErr = errors.New("Host lifetime unavailable")
+	} else {
+		lifetimeErr = h.admissionLifetime.Err()
+	}
+	h.mu.Unlock()
+	state, nodeErr := h.node.ManagedState()
+	t.Logf("recovery peer phase=%s node=%s endpoint=%s bound_udp=%s endpoint_matches=%t configured_addr_matches=%t socket_open=%t socket_error=%v transport_owns_socket=%t fixture_close_called=%t host_closed=%t host_lifetime_error=%v node_binding_error=%v node_R/C/A=%d/%d/%d key_matches=%t listener_state=unknown node_context=not_directly_observable", phase, cfg.Runtime.NodeID, endpoint, bound, endpoint == "quic://"+bound, cfg.Runtime.PeerAddr == bound, socketErr == nil, socketErr, p.transport.Conn == p.conn, p.closed.Load(), closed, lifetimeErr, nodeErr, state.RecorderTip, state.CertifiedTip, state.AppliedTip, keyMatches)
+	if endpoint != "quic://"+bound || cfg.Runtime.PeerAddr != bound || !keyMatches {
+		t.Fatal("recovery peer endpoint or pinned identity differs from its fixture reservation")
+	}
 }
 
 func (f *sqlStatusFixture) reservePeer(t *testing.T, id types.NodeID) string {

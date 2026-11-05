@@ -510,7 +510,7 @@ func TestInternalRequestFirstExecuteWithoutPrivateAdmissionOrReady(t *testing.T)
 
 // No manual error hint is installed here: the actual KVMutate call must return
 // CommitUnknown after Apply while the real SDK archive request is held.
-func testInternalRequestActualPostApplyCancellationRecoversExactOriginal(t *testing.T, beforeReopenedRecovery func(context.Context, *Host, Config, Config, materializer.RequestOriginal) (context.Context, func(RecoveryResult, error)), expectReopenedUnknown ...bool) {
+func testInternalRequestActualPostApplyCancellationRecoversExactOriginal(t *testing.T, beforeReopenedRecovery func(context.Context, *Host, Config, Config, materializer.RequestOriginal, uint64, func(string)) (context.Context, func(RecoveryResult, error)), expectReopenedUnknown ...bool) {
 	var outage, armed atomic.Bool
 	var attempts atomic.Int64
 	entered := make(chan string, 8)
@@ -650,7 +650,9 @@ func testInternalRequestActualPostApplyCancellationRecoversExactOriginal(t *test
 		diagnosticBefore = captureInternalRecoveryEvidence(ctx, reopened, configs[0])
 	}
 	if beforeReopenedRecovery != nil {
-		ctx, verifyRecovery = beforeReopenedRecovery(ctx, reopened, configs[0], configs[1], beforeOriginal)
+		ctx, verifyRecovery = beforeReopenedRecovery(ctx, reopened, configs[0], configs[1], beforeOriginal, y.Slot, func(phase string) {
+			fixture.observeRecoveryPeer(t, phase, hosts[1], configs[1])
+		})
 	}
 	recovered, err = reopened.RecoverRequest(ctx, network.RequestStatusRequest{Kind: "kv", RequestID: id})
 	if verifyRecovery != nil {
