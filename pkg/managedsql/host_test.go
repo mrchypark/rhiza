@@ -67,6 +67,14 @@ type sqlWireControl struct {
 	putKeys        []string
 }
 
+// Opt in before Open; only an actual owned Host Close starts this lifecycle.
+type sqlWireCloseLifecycle struct{ closing atomic.Bool }
+
+func (l *sqlWireCloseLifecycle) expectedCanceledPUT(prefix string, r *http.Request, err error) bool {
+	return l.closing.Load() && r.Method == http.MethodPut && errors.Is(r.Context().Err(), context.Canceled) &&
+		errors.Is(err, io.ErrUnexpectedEOF) && strings.HasPrefix(r.URL.Path, prefix) && len(r.URL.Path) > len(prefix)
+}
+
 func sqlWireStore(t *testing.T) (*httptest.Server, *sqlWireControl) {
 	t.Helper()
 	var mu sync.Mutex
@@ -721,15 +729,33 @@ func TestManagedSQLRealThreeNodeInitializationAndWrite(t *testing.T) {
 	}
 }
 
-func openSQLQuorum(t *testing.T) ([]Config, []*Host, *sqlStatusFixture) {
+func openSQLQuorum(t *testing.T, closeLifecycle ...*sqlWireCloseLifecycle) ([]Config, []*Host, *sqlStatusFixture) {
 	t.Helper()
 	configs, f := sqlCluster(t)
+	var lifecycle *sqlWireCloseLifecycle
+	if len(closeLifecycle) != 0 {
+		if len(closeLifecycle) != 1 || closeLifecycle[0] == nil {
+			t.Fatal("one explicit wire Close lifecycle is required")
+		}
+		lifecycle = closeLifecycle[0]
+		prefix := "/bucket/" + f.source.finalPrefix + "/"
+		f.source.putReadFailure = func(r *http.Request, err error) {
+			if !lifecycle.expectedCanceledPUT(prefix, r, err) {
+				t.Errorf("unexpected PUT read failure method=%s path=%s canceled=%t owned_close=%t: %v", r.Method, r.URL.Path, errors.Is(r.Context().Err(), context.Canceled), lifecycle.closing.Load(), err)
+			} else {
+				t.Logf("expected canceled PUT method=%s path=%s canceled=true owned_close=true", r.Method, r.URL.Path)
+			}
+		}
+	}
 	hosts := make([]*Host, 2)
 	for i := range hosts {
 		h, err := f.open(context.Background(), configs[i])
 		if h != nil {
 			hosts[i] = h
 			t.Cleanup(func() {
+				if lifecycle != nil {
+					lifecycle.closing.Store(true)
+				}
 				if err := h.Close(); err != nil {
 					t.Error(err)
 				}

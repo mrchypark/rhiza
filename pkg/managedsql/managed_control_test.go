@@ -3,6 +3,10 @@ package managedsql
 import (
 	"context"
 	"encoding/json"
+	"errors"
+	"io"
+	"net"
+	"net/http"
 	"reflect"
 	"strings"
 	"testing"
@@ -15,7 +19,7 @@ import (
 
 func TestManagedSQLPreparationRequiresLiveExactRepair(t *testing.T) {
 	ctx := context.Background()
-	configs, hosts, _ := openSQLQuorum(t)
+	configs, hosts, _ := openSQLQuorum(t, &sqlWireCloseLifecycle{})
 	h := hosts[0]
 	writer, plan := hostRepairWriter(t, configs, hosts)
 	plan.Sequence = operator.V1Alpha2RepairAddThenRemove
@@ -54,6 +58,63 @@ func TestManagedSQLPreparationRequiresLiveExactRepair(t *testing.T) {
 	}
 	if err := h.ValidateManagedRepairPreparation(ctx, h.identity, r, current, 0); err == nil {
 		t.Fatal("terminal repair reused for preparation")
+	}
+}
+
+func TestManagedSQLWireCloseLifecycleRejectsUnexpectedPUTFailure(t *testing.T) {
+	for _, tc := range []struct {
+		name, method, path string
+		err                error
+		closing, canceled  bool
+		want               bool
+	}{
+		{"owned-close", "PUT", "/bucket/owned/archive/head.bin", io.ErrUnexpectedEOF, true, true, true},
+		{"before-close", "PUT", "/bucket/owned/archive/head.bin", io.ErrUnexpectedEOF, false, true, false},
+		{"live-context", "PUT", "/bucket/owned/archive/head.bin", io.ErrUnexpectedEOF, true, false, false},
+		{"wrong-path", "PUT", "/bucket/other/archive/head.bin", io.ErrUnexpectedEOF, true, true, false},
+		{"prefix-only", "PUT", "/bucket/owned/", io.ErrUnexpectedEOF, true, true, false},
+		{"wrong-method", "GET", "/bucket/owned/archive/head.bin", io.ErrUnexpectedEOF, true, true, false},
+		{"other-io", "PUT", "/bucket/owned/archive/head.bin", io.ErrClosedPipe, true, true, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			if tc.canceled {
+				cancel()
+			}
+			r, err := http.NewRequestWithContext(ctx, tc.method, "http://fixture"+tc.path, nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			lifecycle := &sqlWireCloseLifecycle{}
+			lifecycle.closing.Store(tc.closing)
+			if got := lifecycle.expectedCanceledPUT("/bucket/owned/", r, tc.err); got != tc.want {
+				t.Fatalf("classification got=%t want=%t", got, tc.want)
+			}
+		})
+	}
+	server, control := sqlWireStore(t)
+	lifecycle := &sqlWireCloseLifecycle{}
+	observed := make(chan bool, 1)
+	control.putReadFailure = func(r *http.Request, err error) {
+		observed <- errors.Is(err, io.ErrUnexpectedEOF) && !lifecycle.expectedCanceledPUT("/bucket/owned/", r, err)
+	}
+	conn, err := net.DialTimeout("tcp", strings.TrimPrefix(server.URL, "http://"), 5*time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, writeErr := io.WriteString(conn, "PUT /bucket/owned/archive/head.bin HTTP/1.1\r\nHost: fixture\r\nContent-Length: 10\r\n\r\nx")
+	closeErr := conn.Close()
+	if writeErr != nil || closeErr != nil {
+		t.Fatal(writeErr, closeErr)
+	}
+	select {
+	case rejected := <-observed:
+		if !rejected {
+			t.Fatal("actual truncated PUT before owned Close was not rejected")
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("actual truncated PUT did not reach the observer")
 	}
 }
 
