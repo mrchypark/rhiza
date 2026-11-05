@@ -5,6 +5,12 @@ on:
     branches: [main, feature/ha-node-prepared-restore]
   pull_request:
   workflow_dispatch:
+    inputs:
+      blaze_compat:
+        description: 'Run pinned Blaze compatibility experiment (Cargo CI stays authoritative)'
+        type: boolean
+        required: false
+        default: false
 
 permissions:
   contents: read
@@ -406,3 +412,49 @@ jobs:
           file: Dockerfile.operator
           push: false
           tags: rhiza-operator:ci
+
+  blaze-rust-compat:
+    if: github.event_name == 'workflow_dispatch' && inputs.blaze_compat
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Script safeguards without compiler execution
+        shell: sh
+        run: |
+          sh -n scripts/test-blaze-rust-compat.sh
+          sh scripts/test-blaze-rust-compat.sh --self-test
+      - uses: actions/setup-go@v6
+        with:
+          go-version: '1.27.3'
+          cache: false
+      - uses: dtolnay/rust-toolchain@1.98.0
+      - name: Build native C ABI from this exact source
+        shell: sh
+        run: |
+          set -eu
+          native="$RUNNER_TEMP/rhiza-blaze-native"
+          mkdir -p "$native"
+          CGO_ENABLED=1 GOWORK=off go build -buildmode=c-archive -o "$native/librhiza_ffi.a" ./cmd/rhiza-ffi
+          git rev-parse HEAD > "$native/source-commit"
+          sha256sum "$native/librhiza_ffi.a" | cut -d ' ' -f 1 > "$native/archive-sha256"
+      - name: Compare Cargo baseline with pinned Blaze
+        shell: sh
+        env:
+          BLAZE_COMPAT_ROOT: ${{ runner.temp }}/rhiza-blaze-compat
+          RHIZA_NATIVE_LIB_DIR: ${{ runner.temp }}/rhiza-blaze-native
+        run: sh scripts/test-blaze-rust-compat.sh verify
+      - name: Preserve compatibility evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: blaze-rust-compat-${{ github.run_id }}
+          path: |
+            ${{ runner.temp }}/rhiza-blaze-native/source-commit
+            ${{ runner.temp }}/rhiza-blaze-native/archive-sha256
+            ${{ runner.temp }}/rhiza-blaze-compat/results.txt
+            ${{ runner.temp }}/rhiza-blaze-compat/logs/*.log
+            ${{ runner.temp }}/rhiza-blaze-compat/logs/*.json
+          if-no-files-found: warn
