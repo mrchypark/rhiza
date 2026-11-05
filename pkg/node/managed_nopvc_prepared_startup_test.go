@@ -21,6 +21,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/mrchypark/rhiza/internal/localtesthooks"
 	localobj "github.com/mrchypark/rhiza/internal/objstore"
 	"github.com/mrchypark/rhiza/internal/sqlpolicy"
 	"github.com/mrchypark/rhiza/internal/types"
@@ -505,7 +506,7 @@ func runManagedNoPVCPreparedLearnerStartup(t *testing.T, appendSuffix, cancelAft
 			}
 		}
 	})
-	if appendSuffix {
+	if appendSuffix && localtesthooks.Enabled {
 		adopted := make(chan struct{})
 		resume := make(chan struct{})
 		var adoptedOnce, releaseOnce sync.Once
@@ -645,6 +646,10 @@ func runManagedNoPVCPreparedLearnerStartup(t *testing.T, appendSuffix, cancelAft
 		requests := append([]string(nil), objectStore.requests...)
 		objectStore.mu.RUnlock()
 		t.Fatalf("public prepared learner startup: %v; requests=%v", err, requests)
+	}
+	adoption, adoptionErr := loadPreparedAdoption(filepath.Join(dataDir, "prepared-adoption.json"))
+	if adoptionErr != nil || adoption.Tip != view.Tip() || adoption.PrefixHash != view.PrefixHash() {
+		t.Fatalf("completed startup did not retain exact H adoption: adoption=%+v err=%v", adoption, adoptionErr)
 	}
 	verifyOnlyFreshRegistration()
 	if nilPreparedRestart {

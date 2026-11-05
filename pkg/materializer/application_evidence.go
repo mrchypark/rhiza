@@ -166,6 +166,21 @@ func inspectSQLApplicationTransaction(ctx context.Context, tx *sql.Tx, stateTip 
 	return inspectApplicationTransaction(ctx, tx, stateTip, 0)
 }
 
+func managedInternalSchema(protocol string, mixedWindow uint64) map[string]string {
+	internal := map[string]string{
+		"_rhiza_meta":             `CREATE TABLE _rhiza_meta ( key TEXT PRIMARY KEY, value TEXT )`,
+		"_rhiza_kv":               `CREATE TABLE _rhiza_kv ( key TEXT PRIMARY KEY, value BLOB NOT NULL, expires_at_unix_ms INTEGER NOT NULL DEFAULT 0 )`,
+		"_rhiza_idempotency":      `CREATE TABLE _rhiza_idempotency ( kind INTEGER NOT NULL, request_id BLOB NOT NULL, fingerprint BLOB NOT NULL CHECK(length(fingerprint) = 32), commit_slot INTEGER NOT NULL, status TEXT NOT NULL, error_code TEXT NOT NULL, rows_affected INTEGER NOT NULL, last_insert_id INTEGER NOT NULL, applied INTEGER NOT NULL, sql_result BLOB NOT NULL DEFAULT X'', PRIMARY KEY(kind, request_id) ) WITHOUT ROWID`,
+		"_rhiza_migrations":       `CREATE TABLE _rhiza_migrations ( version INTEGER PRIMARY KEY CHECK(version > 0), name TEXT NOT NULL, checksum TEXT NOT NULL CHECK(length(checksum) = 64) ) STRICT`,
+		"_rhiza_kv_expiry":        `CREATE INDEX _rhiza_kv_expiry ON _rhiza_kv(expires_at_unix_ms) WHERE expires_at_unix_ms > 0`,
+		"_rhiza_idempotency_slot": `CREATE INDEX _rhiza_idempotency_slot ON _rhiza_idempotency(commit_slot)`,
+	}
+	if originalsProtocol(protocol) && mixedWindow != 0 {
+		internal["_rhiza_request_original"] = strings.Join(strings.Fields(strings.Replace(requestOriginalDDL, "IF NOT EXISTS ", "", 1)), " ")
+	}
+	return internal
+}
+
 func inspectApplicationTransaction(ctx context.Context, tx *sql.Tx, stateTip, mixedWindow uint64, protocols ...string) (state SQLApplicationState, resultErr error) {
 	defer tx.Rollback()
 	protocol := types.ManagedApplicationProtocolSQLKV
@@ -220,17 +235,7 @@ func inspectApplicationTransaction(ctx context.Context, tx *sql.Tx, stateTip, mi
 	if err != nil {
 		return SQLApplicationState{}, err
 	}
-	internal := map[string]string{
-		"_rhiza_meta":             `CREATE TABLE _rhiza_meta ( key TEXT PRIMARY KEY, value TEXT )`,
-		"_rhiza_kv":               `CREATE TABLE _rhiza_kv ( key TEXT PRIMARY KEY, value BLOB NOT NULL, expires_at_unix_ms INTEGER NOT NULL DEFAULT 0 )`,
-		"_rhiza_idempotency":      `CREATE TABLE _rhiza_idempotency ( kind INTEGER NOT NULL, request_id BLOB NOT NULL, fingerprint BLOB NOT NULL CHECK(length(fingerprint) = 32), commit_slot INTEGER NOT NULL, status TEXT NOT NULL, error_code TEXT NOT NULL, rows_affected INTEGER NOT NULL, last_insert_id INTEGER NOT NULL, applied INTEGER NOT NULL, sql_result BLOB NOT NULL DEFAULT X'', PRIMARY KEY(kind, request_id) ) WITHOUT ROWID`,
-		"_rhiza_migrations":       `CREATE TABLE _rhiza_migrations ( version INTEGER PRIMARY KEY CHECK(version > 0), name TEXT NOT NULL, checksum TEXT NOT NULL CHECK(length(checksum) = 64) ) STRICT`,
-		"_rhiza_kv_expiry":        `CREATE INDEX _rhiza_kv_expiry ON _rhiza_kv(expires_at_unix_ms) WHERE expires_at_unix_ms > 0`,
-		"_rhiza_idempotency_slot": `CREATE INDEX _rhiza_idempotency_slot ON _rhiza_idempotency(commit_slot)`,
-	}
-	if originalsProtocol(protocol) && mixedWindow != 0 {
-		internal["_rhiza_request_original"] = strings.Join(strings.Fields(strings.Replace(requestOriginalDDL, "IF NOT EXISTS ", "", 1)), " ")
-	}
+	internal := managedInternalSchema(protocol, mixedWindow)
 	objectCount := 0
 	for rows.Next() {
 		var o sqlEvidenceObject

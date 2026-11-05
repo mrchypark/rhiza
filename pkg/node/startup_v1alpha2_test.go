@@ -5,6 +5,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"database/sql"
+	"encoding/hex"
 	"encoding/json"
 	"encoding/xml"
 	"errors"
@@ -23,9 +24,9 @@ import (
 	"testing"
 	"time"
 
+	"github.com/mrchypark/rhiza/internal/sqlpolicy"
 	"github.com/mrchypark/rhiza/internal/types"
 	"github.com/mrchypark/rhiza/pkg/checkpoint"
-	"github.com/mrchypark/rhiza/pkg/materializer"
 	"github.com/mrchypark/rhiza/pkg/operator"
 	"github.com/mrchypark/rhiza/pkg/qlog"
 	"github.com/mrchypark/rhiza/pkg/quepaxa"
@@ -639,18 +640,41 @@ func (s *managedTestObjectStore) serve(w http.ResponseWriter, r *http.Request) {
 func TestManagedPreparedCheckpointSQLSuffixAdoptionAndRestart(t *testing.T) {
 	ctx := context.Background()
 	const clusterID = "managed-restore"
+	const protocol = sqlpolicy.ManagedRequestAppendOnlyApplicationProtocol
+	const policy = sqlpolicy.ManagedRequestMaterializationPolicy
 	members := []quepaxa.Member{peerMember(clusterID, "voter-a", "voter-a-token"), peerMember(clusterID, "voter-b", "voter-b-token")}
 	members[0].PeerURL = "quic://127.0.0.1:19001"
 	members[1].PeerURL = "quic://127.0.0.1:19002"
+	for i := range members {
+		members[i].WALIdentity = hex.EncodeToString(bytes.Repeat([]byte{byte(i + 1)}, 32))
+	}
 	cluster := quepaxa.Cluster{ConfigID: 1, Members: members}
 	transport := &membershipOperationTransport{cores: make(map[quepaxa.NodeID]*quepaxa.Core), ids: []quepaxa.NodeID{"voter-a", "voter-b"}, disabled: make(map[quepaxa.NodeID]bool)}
+	var sourceNode *Node
 	for _, member := range members {
 		wal, err := qlog.Open(filepath.Join(t.TempDir(), string(member.ID), "qlog"))
 		if err != nil {
 			t.Fatal(err)
 		}
 		t.Cleanup(func() { _ = wal.Close() })
-		core, err := quepaxa.New(quepaxa.Config{NodeID: member.ID, Cluster: cluster, WAL: wal, Transport: transport, EnableReconfiguration: true})
+		nonce, err := hex.DecodeString(member.WALIdentity)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := wal.BindIdentity(nonce); err != nil {
+			t.Fatal(err)
+		}
+		var walIdentity [32]byte
+		copy(walIdentity[:], nonce)
+		core, err := quepaxa.New(quepaxa.Config{NodeID: member.ID, Cluster: cluster, WAL: wal, Transport: transport, EnableReconfiguration: true,
+			ValidateValue: types.ValidateManagedKVExecutionPolicy,
+			ManagedAppendOnly: &quepaxa.ManagedAppendOnlyConfig{
+				Binding: quepaxa.ManagedAppendOnlyBinding{ApplicationProtocol: protocol, BootstrapPlanDigest: fmt.Sprintf("%064x", 55), MemberConfigDigest: fmt.Sprintf("%064x", len(transport.cores)+1), WALIdentity: walIdentity},
+				Verify: func(ctx context.Context, candidate quepaxa.ManagedCheckpointCandidate) error {
+					return sourceNode.verifyManagedAppendOnlyCandidate(ctx, candidate)
+				},
+			},
+		})
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -659,17 +683,29 @@ func TestManagedPreparedCheckpointSQLSuffixAdoptionAndRestart(t *testing.T) {
 	sourceCore := transport.cores["voter-a"]
 	memory := objstore.NewInMemBucket()
 	const storageRoot = "prepared-test-root"
-	namespace, err := ManagedNamespaceFor(storageRoot, "cluster-uid", 4, "assignment", clusterID)
+	namespace, err := ManagedNamespaceFor(storageRoot, "cluster-uid", 0, "assignment", clusterID)
 	if err != nil {
 		t.Fatal(err)
 	}
-	archive, err := recovery.NewAppendOnlyManager(memory, namespace.FinalPrefix, 1)
+	archive, err := recovery.NewAppendOnlyManagerWithValueValidator(memory, namespace.FinalPrefix, 1, types.ValidateManagedKVExecutionPolicy)
 	if err != nil {
 		t.Fatal(err)
 	}
 	t.Cleanup(archive.Close)
-	checkpoints := checkpoint.NewManager(memory, namespace.FinalPrefix, t.TempDir(), 1)
-	sourceMaterial, err := materializer.Open(filepath.Join(t.TempDir(), "sqlite.db"), 4)
+	if err := archive.Load(ctx); err != nil {
+		t.Fatal(err)
+	}
+	checkpoints, err := checkpoint.NewAppendOnlyManagerForPolicy(memory, namespace.FinalPrefix, t.TempDir(), policy, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := checkpoints.Load(ctx); err != nil {
+		t.Fatal(err)
+	}
+	sourceNode = New(&types.ExecutionConfig{NodeID: "voter-a", ClusterID: clusterID, Members: members, EnableReconfiguration: true})
+	sourceNode.managedStartup = &ManagedStartupConfig{expectedPolicy: policy, Identity: ManagedStartupIdentity{ApplicationProtocol: protocol}}
+	sourceNode.core, sourceNode.checkpoints, sourceNode.archive = sourceCore, checkpoints, archive
+	sourceMaterial, err := sourceNode.openMaterializer(filepath.Join(t.TempDir(), "sqlite.db"), 4)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -696,13 +732,9 @@ func TestManagedPreparedCheckpointSQLSuffixAdoptionAndRestart(t *testing.T) {
 	for _, file := range files {
 		sources = append(sources, checkpoint.Source{Role: string(file.Role), Path: file.Path})
 	}
-	claim, err := checkpoints.AcquirePublisherClaim(ctx, "prepared-base", 0, time.Minute)
+	root, err := checkpoints.CreateManagedAppendOnlyCandidate(ctx, sources, index)
 	if err != nil {
 		t.Fatal(err)
-	}
-	root, err := checkpoints.CreateFiles(ctx, claim, sources, index)
-	if releaseErr := checkpoints.ReleasePublisherClaim(ctx, claim); err != nil || releaseErr != nil {
-		t.Fatal(errors.Join(err, releaseErr))
 	}
 	root, err = checkpoints.OpenRoot(ctx, root.Index, root.RootHash)
 	if err != nil {
@@ -728,9 +760,6 @@ func TestManagedPreparedCheckpointSQLSuffixAdoptionAndRestart(t *testing.T) {
 			}
 			return checkpoints.Verify(ctx, uint64(candidate.Index), candidate.RootHash, candidate.StateHash)
 		})
-		if err := core.PrepareCheckpoint(ctx, seal); err != nil {
-			t.Fatal(err)
-		}
 	}
 	sealValue, err := quepaxa.EncodeCheckpointSeal(seal)
 	if err != nil {
@@ -748,6 +777,13 @@ func TestManagedPreparedCheckpointSQLSuffixAdoptionAndRestart(t *testing.T) {
 		t.Fatal(err)
 	}
 	if err := archive.SyncThrough(ctx, sourceCore, sealSlot); err != nil {
+		t.Fatal(err)
+	}
+	sealed, exists, err := sourceCore.LatestManagedCheckpointSeal()
+	if err != nil || !exists {
+		t.Fatalf("actual managed source seal missing: %v", err)
+	}
+	if err := sourceNode.promoteManagedAppendOnlySeal(ctx, sealed); err != nil {
 		t.Fatal(err)
 	}
 	if err := archive.TrimThrough(ctx, quepaxa.SealedCheckpoint{CheckpointSeal: seal, DecisionSlot: sealSlot}, sealDecision); err != nil {
@@ -778,14 +814,14 @@ func TestManagedPreparedCheckpointSQLSuffixAdoptionAndRestart(t *testing.T) {
 	if err := archive.SyncThrough(ctx, sourceCore, sourceCore.Tip()); err != nil {
 		t.Fatal(err)
 	}
-	view, err := recovery.OpenReadOnlyView(ctx, memory, namespace.FinalPrefix, 1, cluster)
+	view, err := recovery.OpenReadOnlyViewForApplicationProtocol(ctx, memory, namespace.FinalPrefix, 1, cluster, policy, types.DefaultIdempotencyWindowSlots, protocol, true)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if view.Base() != 1 || view.Tip() != 4 {
 		t.Fatalf("prepared view base=%d tip=%d, want base=1 tip=4", view.Base(), view.Tip())
 	}
-	preparedIdentity := recovery.PreparedStartupIdentity{ClusterUID: "cluster-uid", Generation: 4, DeploymentUID: "deployment", PodUID: "prepared-pod", NodeID: "learner", SourceBinding: "pending", ConfigDigest: "pending"}
+	preparedIdentity := recovery.PreparedStartupIdentity{ClusterUID: "cluster-uid", Generation: 0, DeploymentUID: "deployment", PodUID: "prepared-pod", NodeID: "learner", SourceBinding: "pending", ConfigDigest: "pending"}
 	learner := peerMember(clusterID, "learner", "learner-token")
 	dataDir := filepath.Join(t.TempDir(), "prepared-data")
 	objectStore := &managedTestObjectStore{objects: make(map[string][]byte)}
@@ -798,16 +834,16 @@ func TestManagedPreparedCheckpointSQLSuffixAdoptionAndRestart(t *testing.T) {
 	objectStore.put(strings.TrimSuffix(namespace.ConfigPrefix, "/")+"/"+clusterID+"/voters/membership.json", membershipRecord)
 	config := &types.ExecutionConfig{NodeID: "learner", ClusterID: clusterID, DataDir: dataDir, Members: members, Learner: &learner, PeerToken: "learner-token", AdminToken: "admin-token", PeerAddr: "127.0.0.1:0", EnableReconfiguration: true, ObjStoreProvider: "s3", ObjStoreEndpoint: strings.TrimPrefix(objectServer.URL, "http://"), ObjStoreInsecure: true, ObjStoreBucket: "prepared-target", ObjStoreAccessKey: "test", ObjStoreSecretKey: "test", ObjStorePrefix: namespace.ConfigPrefix, ObjStoreDurability: types.ObjectStoreDurabilityBeforeAck, ObjStoreSyncInterval: time.Hour}
 	node := New(config)
-	sourceBinding, configDigest, err := node.preparedBindingDigests()
+	sourceBinding, configDigest, err := node.PreparedStartupBindingDigestsForProtocol(protocol)
 	if err != nil {
 		t.Fatal(err)
 	}
 	preparedIdentity.SourceBinding, preparedIdentity.ConfigDigest = sourceBinding, configDigest
 	handoffDir := filepath.Join(t.TempDir(), "handoff")
-	if err := recovery.PublishPreparedStartup(ctx, view, handoffDir, preparedIdentity); err != nil {
+	if err := recovery.PublishPreparedStartupForPolicy(ctx, view, handoffDir, preparedIdentity, policy, types.DefaultIdempotencyWindowSlots); err != nil {
 		t.Fatal(err)
 	}
-	prepared, err := recovery.LoadPreparedStartup(ctx, memory, namespace.FinalPrefix, 1, cluster, handoffDir, dataDir, preparedIdentity)
+	prepared, err := recovery.LoadPreparedStartupForApplicationProtocol(ctx, memory, namespace.FinalPrefix, 1, cluster, handoffDir, dataDir, preparedIdentity, policy, types.DefaultIdempotencyWindowSlots, protocol, true)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -826,11 +862,11 @@ func TestManagedPreparedCheckpointSQLSuffixAdoptionAndRestart(t *testing.T) {
 	}, objstore.WithRecursiveIter()); err != nil {
 		t.Fatal(err)
 	}
-	bootstrapPlan, err := node.ManagedBootstrapPlanDigest(sourceBinding, "sql-v1")
+	bootstrapPlan, err := node.ManagedBootstrapPlanDigestForProtocol(sourceBinding, protocol, protocol)
 	if err != nil {
 		t.Fatal(err)
 	}
-	identity := ManagedStartupIdentity{Member: preparedIdentity, AssignmentID: "assignment", IntentHash: "intent", StorageID: "storage", PhysicalBinding: sourceBinding, BootstrapPlanDigest: bootstrapPlan, EvidenceFormat: "sql-v1"}
+	identity := ManagedStartupIdentity{ApplicationProtocol: protocol, Member: preparedIdentity, AssignmentID: "assignment", IntentHash: "intent", StorageID: "storage", PhysicalBinding: sourceBinding, BootstrapPlanDigest: bootstrapPlan, EvidenceFormat: protocol}
 	repairOrigin := []byte(`{"version":1,"repair":{"state":"Closed"}}`)
 	checker := &managedTestChecker{}
 	startup := ManagedStartupConfig{StorageRoot: storageRoot, Identity: identity, Checker: checker, Prepared: prepared, RepairOrigin: repairOrigin}
@@ -840,6 +876,13 @@ func TestManagedPreparedCheckpointSQLSuffixAdoptionAndRestart(t *testing.T) {
 		objectStore.mu.RUnlock()
 		t.Fatalf("open prepared managed node: %v; requests=%v", err, requests)
 	}
+	if node.core.IsVoter() || node.Ready() {
+		t.Fatal("verified read-only prepared source promoted the learner or opened application admission")
+	}
+	locator, locatorExists, err := node.checkpoints.LoadManagedAppendOnlyLocator(ctx, policy)
+	if err != nil || !locatorExists || locator.RootHash != root.RootHash || locator.Index != root.Index {
+		t.Fatalf("adoption changed the actual source locator: locator=%+v exists=%t err=%v", locator, locatorExists, err)
+	}
 	if node.managedStartup == nil || node.managedStartup.promotionReady == nil {
 		t.Fatal("prepared learner did not install its promotion gate")
 	}
@@ -848,7 +891,7 @@ func TestManagedPreparedCheckpointSQLSuffixAdoptionAndRestart(t *testing.T) {
 	default:
 		t.Fatal("promotion gate opened before verified adoption completed")
 	}
-	if _, err := node.InspectManagedSQL(ctx, false); err != nil {
+	if snapshot, err := node.InspectManagedKV(ctx, false); err != nil || snapshot.Application.FreshEmpty || snapshot.Runtime.AppliedTip != uint64(view.Tip()) {
 		t.Fatalf("inspect prepared SQL history: %v", err)
 	}
 	result, err := node.material.QueryResult(ctx, "SELECT value FROM managed_items WHERE id = 1", nil)
@@ -904,7 +947,7 @@ func TestManagedPreparedCheckpointSQLSuffixAdoptionAndRestart(t *testing.T) {
 	if err := preparedNeighbor.OpenManaged(ctx, ManagedStartupConfig{StorageRoot: storageRoot, Identity: identity, Checker: checker, RepairOrigin: repairOrigin}); err != nil {
 		t.Fatalf("valid prepared neighbor after rejected corruption: %v", err)
 	}
-	if _, err := preparedNeighbor.InspectManagedSQL(ctx, false); err != nil {
+	if snapshot, err := preparedNeighbor.InspectManagedKV(ctx, false); err != nil || snapshot.Application.FreshEmpty || snapshot.Runtime.AppliedTip != uint64(view.Tip()) {
 		t.Fatalf("inspect valid prepared neighbor SQL: %v", err)
 	}
 	if err := preparedNeighbor.Shutdown(); err != nil {
@@ -925,7 +968,7 @@ func TestManagedPreparedCheckpointSQLSuffixAdoptionAndRestart(t *testing.T) {
 	if got := managedSQLIdempotencyRows(t, filepath.Join(dataDir, "sqlite.db")); got != receiptsBeforeRestart {
 		t.Fatalf("retained SQL receipt rows changed across restart:\nbefore:\n%s\nafter:\n%s", receiptsBeforeRestart, got)
 	}
-	if _, err := restart.InspectManagedSQL(ctx, false); err != nil {
+	if snapshot, err := restart.InspectManagedKV(ctx, false); err != nil || snapshot.Application.FreshEmpty || snapshot.Runtime.AppliedTip != uint64(view.Tip()) {
 		t.Fatalf("inspect restarted SQL history: %v", err)
 	}
 	if err := restart.Shutdown(); err != nil {
@@ -1161,8 +1204,11 @@ func TestManagedPreparedCheckpointSQLSuffixAdoptionAndRestart(t *testing.T) {
 	corrupt := New(config)
 	beforeCorruptDigest, beforeCorruptFiles := managedStartupDataDigest(t, dataDir)
 	beforeCorruptWrites := objectStore.writeCount()
+	// Removing receipt rows without repairing profile-9 accounting must fail
+	// in the read-only existing-state inspection, before replay or mutation.
+	const corruptAccounting = "inspect existing managed SQL before startup: invalid mixed retention accounting"
 	existingCorrupt := New(config)
-	if err := existingCorrupt.OpenManaged(ctx, ManagedStartupConfig{StorageRoot: storageRoot, Identity: identity, Checker: checker, RepairOrigin: repairOrigin}); err == nil || !strings.Contains(err.Error(), "actual SQLite contents differ") {
+	if err := existingCorrupt.OpenManaged(ctx, ManagedStartupConfig{StorageRoot: storageRoot, Identity: identity, Checker: checker, RepairOrigin: repairOrigin}); err == nil || err.Error() != corruptAccounting {
 		t.Fatalf("existing managed-target corruption result: %v", err)
 	}
 	if existingCorrupt.opened.Load() || existingCorrupt.peer != nil || existingCorrupt.wal != nil || existingCorrupt.lock != nil {
@@ -1174,7 +1220,7 @@ func TestManagedPreparedCheckpointSQLSuffixAdoptionAndRestart(t *testing.T) {
 	if after := objectStore.writeCount(); after != beforeCorruptWrites {
 		t.Fatalf("prepared-target preflight wrote object storage: before=%d after=%d", beforeCorruptWrites, after)
 	}
-	if err := corrupt.OpenManaged(ctx, ManagedStartupConfig{StorageRoot: storageRoot, Identity: identity, Checker: checker, RepairOrigin: repairOrigin}); err == nil || !strings.Contains(err.Error(), "actual SQLite contents differ") {
+	if err := corrupt.OpenManaged(ctx, ManagedStartupConfig{StorageRoot: storageRoot, Identity: identity, Checker: checker, RepairOrigin: repairOrigin}); err == nil || err.Error() != corruptAccounting {
 		t.Fatalf("pre-replay SQLite corruption result: %v", err)
 	}
 	if afterDigest, afterFiles := managedStartupDataDigest(t, dataDir); afterDigest != beforeCorruptDigest {

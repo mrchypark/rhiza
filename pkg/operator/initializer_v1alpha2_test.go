@@ -470,6 +470,15 @@ func TestPhase9InitializerConcurrentCreateCAS(t *testing.T) {
 
 func TestPhase9InitializerListGuards(t *testing.T) {
 	currentCluster := phase9CurrentManagedCluster()
+	// An old object without creation intent is structurally readable only
+	// without an explicit application protocol; listing it must not initialize it.
+	missingIntent := strings.Replace(phase9ClusterWithProtocol(""), `"genesisIntent":"Create",`, "", 1)
+	if missingIntent == phase9ClusterWithProtocol("") {
+		t.Fatal("missing-intent fixture mutation did not apply")
+	}
+	if _, err := DecodeV1Alpha2Cluster([]byte(missingIntent)); err != nil {
+		t.Fatalf("historical missing-intent fixture is not readable: %v", err)
+	}
 	for _, test := range []struct {
 		name, body string
 		wantErr    bool
@@ -478,7 +487,8 @@ func TestPhase9InitializerListGuards(t *testing.T) {
 		{"missing items", `{"apiVersion":"rhiza.mrchypark.dev/v1alpha2","kind":"RhizaClusterList","metadata":{"resourceVersion":"1"}}`, true},
 		{"duplicate", `{"apiVersion":"rhiza.mrchypark.dev/v1alpha2","kind":"RhizaClusterList","metadata":{"resourceVersion":"1"},"items":[` + currentCluster + `,` + currentCluster + `]}`, true},
 		{"duplicate uid", `{"apiVersion":"rhiza.mrchypark.dev/v1alpha2","kind":"RhizaClusterList","metadata":{"resourceVersion":"1"},"items":[` + currentCluster + `,` + strings.Replace(currentCluster, `"name":"cluster"`, `"name":"other"`, 1) + `]}`, true},
-		{"missing intent", `{"apiVersion":"rhiza.mrchypark.dev/v1alpha2","kind":"RhizaClusterList","metadata":{"resourceVersion":"1"},"items":[` + strings.Replace(phase8Cluster, `"genesisIntent":"Create",`, "", 1) + `]}`, false},
+		{"missing intent", `{"apiVersion":"rhiza.mrchypark.dev/v1alpha2","kind":"RhizaClusterList","metadata":{"resourceVersion":"1"},"items":[` + missingIntent + `]}`, false},
+		{"current profile missing intent", `{"apiVersion":"rhiza.mrchypark.dev/v1alpha2","kind":"RhizaClusterList","metadata":{"resourceVersion":"1"},"items":[` + strings.Replace(currentCluster, `"genesisIntent":"Create",`, "", 1) + `]}`, true},
 		{"partial page", `{"apiVersion":"rhiza.mrchypark.dev/v1alpha2","kind":"RhizaClusterList","metadata":{"resourceVersion":"1","continue":"next"},"items":[` + currentCluster + `]}`, true},
 	} {
 		t.Run(test.name, func(t *testing.T) {

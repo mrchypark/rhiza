@@ -203,7 +203,9 @@ func managedHTTPQuorum(t *testing.T) (*managedsql.Host, managedsql.Config, *http
 	readyCtx, cancel := context.WithTimeout(ctx, 15*time.Second)
 	defer cancel()
 	for {
-		if err := hosts[0].RecoverPending(readyCtx); err == nil {
+		// Readiness admits the actual voter; selector-free recovery must remain
+		// UNKNOWN even when no request is outstanding.
+		if err := hosts[0].Ready(readyCtx); err == nil {
 			break
 		} else if readyCtx.Err() != nil {
 			t.Fatal(err)

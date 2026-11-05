@@ -19,7 +19,11 @@ func TestActualManagedPeerLearnRequiresLiveAuthority(t *testing.T) {
 	}
 	cfg := configs[0].Runtime
 	cluster := quepaxa.Cluster{ConfigID: 1, Members: cfg.Members}
-	transport := network.NewTransport(cfg.ClusterID, cfg.NodeID, &cluster, cfg.PeerToken)
+	profile := network.ManagedPeerProfile{ApplicationProtocol: configs[0].Plan.ApplicationProtocol, BootstrapPlanDigest: configs[0].Plan.BootstrapPlanDigest, Generation: configs[0].Plan.Generation}
+	transport, err := network.NewTransportForManagedProfile(cfg.ClusterID, cfg.NodeID, &cluster, cfg.PeerToken, profile)
+	if err != nil {
+		t.Fatal(err)
+	}
 	t.Cleanup(func() { _ = transport.Close() })
 	page, err := transport.FetchDecisions(ctx, cfg.Members[1].ID, 1, 1)
 	if err != nil || len(page.Decisions) != 1 {

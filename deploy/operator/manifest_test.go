@@ -10,6 +10,45 @@ import (
 	"gopkg.in/yaml.v3"
 )
 
+func TestClusterCRDHistoricalPendingRejectsUpdates(t *testing.T) {
+	data, err := os.ReadFile("cluster-crd.yaml")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var crd map[string]any
+	if err := yaml.Unmarshal(data, &crd); err != nil {
+		t.Fatal(err)
+	}
+	get := func(value any, key string) any {
+		object, _ := value.(map[string]any)
+		return object[key]
+	}
+	versions, _ := get(get(crd, "spec"), "versions").([]any)
+	for _, version := range versions {
+		if get(version, "name") != "v1alpha2" {
+			continue
+		}
+		schema := get(get(version, "schema"), "openAPIV3Schema")
+		authority := get(get(get(get(schema, "properties"), "status"), "properties"), "authority")
+		if get(authority, "x-kubernetes-preserve-unknown-fields") != true || get(get(get(authority, "properties"), "pendingWrite"), "type") != "boolean" {
+			t.Fatal("historical authority bytes must remain preserved and pendingWrite must be declared for CEL")
+		}
+		rules, _ := get(schema, "x-kubernetes-validations").([]any)
+		for _, rule := range rules {
+			if get(rule, "message") == "historical unresolved CR pending is read-only; updates are unsupported" {
+				expression, _ := get(rule, "rule").(string)
+				const expected = "!has(oldSelf.status) || !has(oldSelf.status.authority) || !has(oldSelf.status.authority.pendingWrite) || !oldSelf.status.authority.pendingWrite"
+				if expression != expected {
+					t.Fatalf("historical UNKNOWN must reject every update without opaque equality: %s", expression)
+				}
+				return
+			}
+		}
+		t.Fatal("historical UNKNOWN preservation rule missing")
+	}
+	t.Fatal("v1alpha2 schema missing")
+}
+
 func TestNoPVCBootstrapRetainsPeerCredentials(t *testing.T) {
 	data, err := os.ReadFile("no-pvc/statefulset-base.yaml")
 	if err != nil {

@@ -53,6 +53,34 @@ func TestV1Alpha2AuthorityAPIServerContract(t *testing.T) {
 		t.Fatal("wrong UID accepted")
 	}
 	stored := historicalPendingSnapshot(t, first, original)
+	// Use an opaque one-key payload so a same-size unknown-key substitution
+	// exercises actual admission rather than CEL's incomplete object equality.
+	seedStatus, err := jsonObject(stored.status.object["status"])
+	if err != nil {
+		t.Fatal(err)
+	}
+	seedAuthority, err := jsonObject(seedStatus["authority"])
+	if err != nil {
+		t.Fatal(err)
+	}
+	seedPending, err := jsonObject(seedAuthority["pendingRequest"])
+	if err != nil {
+		t.Fatal(err)
+	}
+	seedAuthority["evidence"] = json.RawMessage(`{"digest":"a"}`)
+	seedPending["priorEvidence"] = json.RawMessage(`{"digest":"a"}`)
+	seedAuthority["pendingRequest"], err = json.Marshal(seedPending)
+	if err != nil {
+		t.Fatal(err)
+	}
+	seedStatus["authority"], err = json.Marshal(seedAuthority)
+	if err != nil {
+		t.Fatal(err)
+	}
+	stored.status.object["status"], err = json.Marshal(seedStatus)
+	if err != nil {
+		t.Fatal(err)
+	}
 	endpoint, err := store.path(ref)
 	if err != nil {
 		t.Fatal(err)
@@ -69,6 +97,61 @@ func TestV1Alpha2AuthorityAPIServerContract(t *testing.T) {
 	request, _ := stored.Pending()
 	if got, pending := observed.Pending(); !pending || got != request {
 		t.Fatalf("pending request: %+v %t", got, pending)
+	}
+	if !sameJSON(observed.Evidence(), json.RawMessage(`{"digest":"a"}`)) {
+		t.Fatal("historical opaque evidence was pruned or changed during seed")
+	}
+	for _, mutation := range []struct {
+		name   string
+		change func(map[string]json.RawMessage, map[string]json.RawMessage)
+	}{
+		{"unknown-evidence-key-swap", func(_ map[string]json.RawMessage, auth map[string]json.RawMessage) {
+			auth["evidence"] = json.RawMessage(`{"other":"a"}`)
+		}},
+		{"clear-pending", func(_ map[string]json.RawMessage, auth map[string]json.RawMessage) {
+			auth["pendingWrite"] = json.RawMessage(`false`)
+			delete(auth, "pendingRequest")
+		}},
+		{"transition", func(_ map[string]json.RawMessage, auth map[string]json.RawMessage) {
+			auth["transition"] = json.RawMessage(`{"id":"must-not-activate"}`)
+		}},
+		{"unrelated-status", func(status map[string]json.RawMessage, _ map[string]json.RawMessage) {
+			status["diagnostic"] = json.RawMessage(`true`)
+		}},
+		{"identical-update", func(map[string]json.RawMessage, map[string]json.RawMessage) {}},
+	} {
+		t.Run(mutation.name, func(t *testing.T) {
+			status, err := jsonObject(observed.status.object["status"])
+			if err != nil {
+				t.Fatal(err)
+			}
+			auth, err := jsonObject(status["authority"])
+			if err != nil {
+				t.Fatal(err)
+			}
+			mutation.change(status, auth)
+			status["authority"], err = json.Marshal(auth)
+			if err != nil {
+				t.Fatal(err)
+			}
+			proposed := make(map[string]json.RawMessage, len(observed.status.object))
+			for key, value := range observed.status.object {
+				proposed[key] = value
+			}
+			proposed["status"], err = json.Marshal(status)
+			if err != nil {
+				t.Fatal(err)
+			}
+			err = store.Kube.Put(ctx, endpoint+"/status", proposed, &response)
+			var api *APIError
+			if !errors.As(err, &api) || api.StatusCode != 422 || !strings.Contains(err.Error(), "historical unresolved CR pending is read-only; updates are unsupported") {
+				t.Fatalf("historical UNKNOWN update was not explicitly denied: %v", err)
+			}
+			live, err := LoadV1Alpha2Admission(ctx, store, ref)
+			if err != nil || live.ResourceVersion() != observed.ResourceVersion() || !sameJSON(live.status.object["status"], observed.status.object["status"]) {
+				t.Fatalf("rejected historical UNKNOWN update changed original status: %v", err)
+			}
+		})
 	}
 	finished, err := LoadV1Alpha2Admission(ctx, store, ref)
 	if err != nil || finished.ResourceVersion() != observed.ResourceVersion() {

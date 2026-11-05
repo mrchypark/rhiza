@@ -48,7 +48,7 @@ func (c *mixedPreambleChecker) ValidateManagedStartup(context.Context, ManagedSt
 }
 
 func TestManagedKVNodePreambleBeforeEffects(t *testing.T) {
-	for _, fault := range []string{"unknown", "evidence", "generation", "binding", "digest", "authority"} {
+	for _, fault := range []string{"unknown", "retired-empty", "retired-mixed", "retired-request", "retired-graph", "evidence", "generation", "binding", "digest", "authority"} {
 		t.Run(fault, func(t *testing.T) {
 			dir := filepath.Join(t.TempDir(), "untouched")
 			cfg := &types.ExecutionConfig{NodeID: "member", ClusterID: "cluster", DataDir: dir, PeerToken: "peer", AdminToken: "admin", Members: []types.NodeConfig{peerMember("cluster", "member", "peer"), peerMember("cluster", "other", "other")}, ObjStoreProvider: "s3", ObjStoreBucket: "test", ObjStoreEndpoint: "127.0.0.1:1", ObjStoreInsecure: true, ObjStoreDurability: types.ObjectStoreDurabilityBeforeAck}
@@ -59,7 +59,7 @@ func TestManagedKVNodePreambleBeforeEffects(t *testing.T) {
 			}
 			cfg.ObjStorePrefix = ns.ConfigPrefix
 			n := New(cfg)
-			protocol := types.ManagedApplicationProtocolSQLKV
+			protocol := sqlpolicy.ManagedRequestAppendOnlyApplicationProtocol
 			source, config, err := n.PreparedStartupBindingDigestsForProtocol(protocol)
 			if err != nil {
 				t.Fatal(err)
@@ -75,6 +75,14 @@ func TestManagedKVNodePreambleBeforeEffects(t *testing.T) {
 			switch fault {
 			case "unknown":
 				i.ApplicationProtocol = "unknown"
+			case "retired-empty":
+				i.ApplicationProtocol = ""
+			case "retired-mixed":
+				i.ApplicationProtocol = types.ManagedApplicationProtocolSQLKV
+			case "retired-request":
+				i.ApplicationProtocol = sqlpolicy.ManagedRequestApplicationProtocol
+			case "retired-graph":
+				i.ApplicationProtocol = sqlpolicy.ManagedGraphRequestApplicationProtocol
 			case "evidence":
 				i.EvidenceFormat = "legacy"
 			case "generation":

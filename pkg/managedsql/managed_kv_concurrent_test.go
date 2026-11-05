@@ -238,10 +238,29 @@ func TestManagedKVHostLocalObservationSurvivesQuorumLoss(t *testing.T) {
 	if err == nil {
 		t.Fatal("linearizable read bypassed quorum")
 	}
+	beforeWrite, err := h.node.ManagedState()
+	if err != nil {
+		t.Fatal(err)
+	}
 	write, stop := context.WithTimeout(ctx, 200*time.Millisecond)
 	_, err = h.KVMutate(write, "put", network.KVMutationRequest{RequestID: "must-not-reserve", Key: "new"})
 	stop()
-	if !errors.Is(err, ErrKVNotSubmitted) {
+	if !errors.Is(err, ErrKVNotSubmitted) && !errors.Is(err, context.DeadlineExceeded) {
 		t.Fatal("new write bypassed quorum admission", err)
+	}
+	// An admitted 9/10 runtime waits for fresh quorum inside the engine, so
+	// deadline expiry need not use the Host's initial-admission error wrapper.
+	// Prove no intent was certified or recorded instead of relying on that wrapper.
+	afterWrite, err := h.node.ManagedState()
+	if err != nil || afterWrite != beforeWrite {
+		t.Fatalf("quorum-refused write changed runtime: before=%+v after=%+v err=%v", beforeWrite, afterWrite, err)
+	}
+	missing, err := h.RequestStatus(ctx, network.RequestStatusRequest{Kind: "kv", RequestID: "must-not-reserve"})
+	if err != nil || missing.Receipt != nil {
+		t.Fatalf("quorum-refused write produced a receipt: %+v %v", missing, err)
+	}
+	value, err = h.KVGet(ctx, network.KVGetRequest{Key: "new", Consistency: "local"})
+	if err != nil || value.Found {
+		t.Fatalf("quorum-refused write changed the value: %+v %v", value, err)
 	}
 }

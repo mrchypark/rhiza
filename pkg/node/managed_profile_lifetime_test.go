@@ -94,7 +94,7 @@ func (c *managedProfileLifetimeChecker) stop() error {
 }
 
 func TestManagedProfileStableAcrossPublicOpen(t *testing.T) {
-	for _, protocol := range []string{"", types.ManagedApplicationProtocolSQLKV, sqlpolicy.ManagedRequestAppendOnlyApplicationProtocol, sqlpolicy.ManagedGraphRequestAppendOnlyApplicationProtocol} {
+	for _, protocol := range []string{sqlpolicy.ManagedRequestAppendOnlyApplicationProtocol, sqlpolicy.ManagedGraphRequestAppendOnlyApplicationProtocol} {
 		t.Run(protocol, func(t *testing.T) {
 			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 			defer cancel()

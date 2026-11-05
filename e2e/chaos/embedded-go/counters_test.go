@@ -367,9 +367,17 @@ func TestQualificationApplicationProvenance(t *testing.T) {
 	}
 	for _, required := range []string{
 		`-test.run='^TestRustContractRunStartedMarker$'`,
-		`-test.run='^TestManagedFFIInClusterSQLLifecycle$'`,
-		"if [ \"$rust_initial\" = 0 ]; then\n    # A prior start with a lost ACK never authorizes another initial mutation.\n    run_contract rust-restart /usr/local/libexec/rhiza-rust-managed-contract\n",
-		"if [ \"$rust_initial\" = 1 ]; then\n    run_contract rust-initial /usr/local/libexec/rhiza-rust-managed-contract --initial-run\n",
+		`valid_fixture_profile "$fixture_profile" ||`,
+		`[ "$mixed_mode" = verify ] || { emit_first_contract; exit 125; }`,
+		`[ "$mixed_mode" = verify ] || { echo 'FAIL: replacement cannot run initial mixed writes' >&2; exit 1; }`,
+		`lifecycle=Mixed`,
+		`[ "$fixture_profile" != graph ] || lifecycle=Graph`,
+		`-test.run="^TestManagedFFIInCluster${lifecycle}Lifecycle$"`,
+		`run_contract "$rust_stage" /usr/local/libexec/rhiza-rust-managed-contract "--mixed-$mixed_mode"`,
+		`run_contract "graph-${rust_stage#rust-}" /usr/local/libexec/rhiza-rust-managed-contract "--graph-$mixed_mode"`,
+		`-test.run='^TestManagedGraphMaterializationMarker$'`,
+		`-test.run='^TestManagedFFIInClusterGraphQualification$'`,
+		`-test.run='^TestManagedInternalMaterializationMarker$'`,
 		`exec /usr/local/libexec/rhiza-ha-init "$@"`,
 	} {
 		if !bytes.Contains(entrypoint, []byte(required)) {

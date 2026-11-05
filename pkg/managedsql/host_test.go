@@ -14,6 +14,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strconv"
 	"strings"
 	"sync"
@@ -25,9 +26,11 @@ import (
 	"github.com/mrchypark/rhiza/internal/peertest"
 	"github.com/mrchypark/rhiza/internal/sqlpolicy"
 	"github.com/mrchypark/rhiza/internal/types"
+	"github.com/mrchypark/rhiza/pkg/materializer"
 	"github.com/mrchypark/rhiza/pkg/network"
 	"github.com/mrchypark/rhiza/pkg/node"
 	"github.com/mrchypark/rhiza/pkg/operator"
+	"github.com/mrchypark/rhiza/pkg/qlog"
 	"github.com/mrchypark/rhiza/pkg/quepaxa"
 	"github.com/mrchypark/rhiza/pkg/recovery"
 	"github.com/quic-go/quic-go"
@@ -743,8 +746,24 @@ func TestManagedSQLDDLReversalDoesNotRearmMissingSource(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if reversed.Application.Digest != initial.Application.Digest || reversed.Application.FreshEmpty {
-		t.Fatal("regression requires E0 logical digest but nonfresh actual history")
+	// The user schema returns to empty, but append-only request originals and
+	// receipts remain part of the application digest; they must not revert to E0.
+	rows, err := h.Query(context.Background(), QueryRequest{SQL: "SELECT COUNT(*) FROM sqlite_schema WHERE name='reversible'", Consistency: "local"})
+	if err != nil || len(rows.Rows) != 1 || len(rows.Rows[0]) != 1 || rows.Rows[0][0] != int64(0) {
+		t.Fatalf("DDL reversal did not restore the empty user schema: %+v %v", rows, err)
+	}
+	if reversed.Application.Digest == initial.Application.Digest || reversed.Application.FreshEmpty || reversed.Runtime.AppliedTip <= initial.Runtime.AppliedTip {
+		t.Fatal("DDL reversal lost append-only request history or rearmed E0")
+	}
+	for _, id := range []string{"create-reversal", "drop-reversal"} {
+		status, err := h.RequestStatus(context.Background(), network.RequestStatusRequest{Kind: "sql", RequestID: id})
+		if err != nil || status.Receipt == nil || status.Receipt.Status != types.MutationCommitted {
+			t.Fatalf("DDL reversal receipt %s was not retained: %+v %v", id, status, err)
+		}
+	}
+	authorityBefore, err := operator.LoadV1Alpha2Admission(context.Background(), configs[0].Store, configs[0].Ref)
+	if err != nil {
+		t.Fatal(err)
 	}
 	if err := h.Close(); err != nil {
 		t.Fatal(err)
@@ -756,6 +775,8 @@ func TestManagedSQLDDLReversalDoesNotRearmMissingSource(t *testing.T) {
 	reopened, err := f.open(context.Background(), configs[0])
 	if reopened != nil {
 		t.Cleanup(func() {
+			f.source.hideArchive.Store(false)
+			f.source.hideApplicationStart.Store(false)
 			if err := reopened.Close(); err != nil {
 				t.Error(err)
 			}
@@ -764,16 +785,108 @@ func TestManagedSQLDDLReversalDoesNotRearmMissingSource(t *testing.T) {
 	if err != nil {
 		t.Fatalf("intact local WAL must retain non-serving recovery ownership: %v", err)
 	}
-	if reopened.identity.Fresh {
-		t.Fatal("consumed E0 logical digest rearmed missing-source fresh baseline")
+	// Fresh is only the pre-open remote-absence hint. The actual retained WAL
+	// and application history must independently refuse fresh-state/E0 proof.
+	retained, err := reopened.node.InspectManagedKV(context.Background(), false)
+	if err != nil || retained.Application != reversed.Application || retained.Runtime.WALIdentity != reversed.Runtime.WALIdentity || retained.Runtime.AppliedTip < reversed.Runtime.AppliedTip {
+		t.Fatalf("reopen lost retained append-only history: %+v %v", retained, err)
+	}
+	if _, err := reopened.node.InspectManagedKV(context.Background(), true); err == nil {
+		t.Fatal("retained application history authorized fresh-state/E0 proof")
+	}
+	readySQL(t, reopened) // The retained WAL and actual remaining quorum may admit.
+	for _, id := range []string{"create-reversal", "drop-reversal"} {
+		status, err := reopened.RequestStatus(context.Background(), network.RequestStatusRequest{Kind: "sql", RequestID: id})
+		if err != nil || status.Receipt == nil || status.Receipt.Status != types.MutationCommitted || status.Receipt.Slot > reversed.Runtime.AppliedTip {
+			t.Fatalf("reopened DDL receipt %s was not retained: %+v %v", id, status, err)
+		}
 	}
 	state, err := reopened.node.ManagedState()
 	if err != nil || !state.ExistingRegisteredWAL || state.CertifiedTip == 0 {
 		t.Fatalf("recovery did not use actual pre-existing WAL: %+v %v", state, err)
 	}
+	// The fault hides reads, not the actual CAS object. Restore visibility
+	// before normal shutdown flushes the shared archive; otherwise GET-404 plus
+	// an existing HEAD creates an artificial permanent If-None-Match conflict.
+	f.source.hideArchive.Store(false)
+	f.source.hideApplicationStart.Store(false)
+	if err := reopened.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := hosts[1].Close(); err != nil {
+		t.Fatal(err)
+	}
+	readWAL := func() []qlog.Entry {
+		t.Helper()
+		wal, err := qlog.OpenReadOnly(filepath.Join(configs[0].Runtime.DataDir, "qlog"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer func() {
+			if err := wal.Close(); err != nil {
+				t.Error(err)
+			}
+		}()
+		nonce, registered := wal.Identity()
+		if !registered || fmt.Sprintf("%x", nonce) != reversed.Runtime.WALIdentity {
+			t.Fatal("missing-source restart replaced the registered WAL identity")
+		}
+		entries, err := wal.Read()
+		if err != nil {
+			t.Fatal(err)
+		}
+		return entries
+	}
+	beforeWAL := readWAL()
+	// Without quorum, Open may itself fail while recovering the certified log,
+	// or return a non-serving owner. Neither result may reinitialize local data.
+	f.source.hideArchive.Store(true)
+	f.source.hideApplicationStart.Store(true)
+	openCtx, cancel := context.WithTimeout(context.Background(), 250*time.Millisecond)
+	blocked, openErr := f.open(openCtx, configs[0])
+	cancel()
+	if blocked != nil {
+		t.Cleanup(func() {
+			f.source.hideArchive.Store(false)
+			f.source.hideApplicationStart.Store(false)
+			if err := blocked.Close(); err != nil {
+				t.Error(err)
+			}
+		})
+	}
+	if openErr != nil && !errors.Is(openErr, context.DeadlineExceeded) && !errors.Is(openErr, context.Canceled) && !errors.Is(openErr, quepaxa.ErrQuorumUnavailable) {
+		t.Fatalf("unexpected no-quorum startup failure: %v", openErr)
+	}
+	if blocked != nil {
+		if openErr == nil {
+			readyCtx, cancel := context.WithTimeout(context.Background(), 250*time.Millisecond)
+			err := blocked.Ready(readyCtx)
+			cancel()
+			if err == nil {
+				t.Error("remote absence bypassed initial quorum admission")
+			}
+		}
+		f.source.hideArchive.Store(false)
+		f.source.hideApplicationStart.Store(false)
+		if err := blocked.Close(); err != nil {
+			t.Fatal(err)
+		}
+	} else if openErr == nil {
+		t.Fatal("no-quorum startup returned neither owner nor error")
+	}
+	f.source.hideArchive.Store(false)
+	f.source.hideApplicationStart.Store(false)
+	afterWAL := readWAL()
+	if len(afterWAL) < len(beforeWAL) || !reflect.DeepEqual(afterWAL[:len(beforeWAL)], beforeWAL) {
+		t.Fatal("no-quorum startup lost or replaced retained WAL history")
+	}
+	application, _, err := materializer.InspectManagedAppendOnlyRequestFile(context.Background(), filepath.Join(configs[0].Runtime.DataDir, "sqlite.db"), types.DefaultIdempotencyWindowSlots)
+	if err != nil || application != reversed.Application {
+		t.Fatalf("no-quorum startup changed retained application/receipt history: %+v %v", application, err)
+	}
 	live, err := operator.LoadV1Alpha2Admission(context.Background(), configs[0].Store, configs[0].Ref)
-	if err != nil || live.EverApplicationReserved() {
-		t.Fatal("append-only DDL reversal changed CR reservation history")
+	if err != nil || live.EverApplicationReserved() || live.ResourceVersion() != authorityBefore.ResourceVersion() || !bytes.Equal(live.Evidence(), authorityBefore.Evidence()) {
+		t.Fatal("append-only DDL reversal changed CR initialization or reservation history", err)
 	}
 }
 

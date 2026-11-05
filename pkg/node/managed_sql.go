@@ -86,6 +86,9 @@ func (n *Node) CheckManagedLocalRead(ctx context.Context) error {
 		if !n.managedInitiallyAdmitted.Load() || !n.core.IsVoter() {
 			return network.ErrNotReady
 		}
+		if err := n.material.ValidateManagedLocalSchema(ctx); err != nil {
+			return err
+		}
 		if n.materializationPolicy() == sqlpolicy.ManagedGraphRequestMaterializationPolicy {
 			if !n.managedGraphInitialRootComplete() {
 				return network.ErrNotReady

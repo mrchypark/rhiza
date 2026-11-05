@@ -3,6 +3,7 @@ package node
 import (
 	"bytes"
 	"context"
+	"encoding/hex"
 	"errors"
 	"path"
 	"path/filepath"
@@ -10,282 +11,367 @@ import (
 	"testing"
 	"time"
 
-	objectstore "github.com/mrchypark/rhiza/internal/objstore"
+	localobj "github.com/mrchypark/rhiza/internal/objstore"
+	"github.com/mrchypark/rhiza/internal/sqlpolicy"
 	"github.com/mrchypark/rhiza/internal/types"
-	"github.com/mrchypark/rhiza/pkg/materializer"
+	"github.com/mrchypark/rhiza/pkg/checkpoint"
 	"github.com/mrchypark/rhiza/pkg/network"
 	"github.com/mrchypark/rhiza/pkg/qlog"
 	"github.com/mrchypark/rhiza/pkg/quepaxa"
 	"github.com/mrchypark/rhiza/pkg/recovery"
 )
 
+// These legacy reservation interfaces are tripwires, not execution authority.
+// Normal 9/10 mutations must use the captured engine binding and lifetime.
 type kvWrapperChecker struct {
-	identity      ManagedStartupIdentity
-	operation     string
-	request       network.KVMutationRequest
-	deny          atomic.Bool
-	writeCalls    atomic.Int64
-	recoveryCalls atomic.Int64
-	readCalls     atomic.Int64
+	managedTestChecker
+	calls atomic.Int64
 }
 
-func (c *kvWrapperChecker) ValidateManagedStartup(_ context.Context, i ManagedStartupIdentity) error {
-	if i != c.identity || c.deny.Load() {
-		return errors.New("synthetic exact authority refused")
-	}
-	return nil
+func (c *kvWrapperChecker) ValidateManagedKVWrite(context.Context, ManagedStartupIdentity, ManagedRuntimeState, string, network.KVMutationRequest) error {
+	c.calls.Add(1)
+	return errors.New("retired CR write reservation invoked")
 }
-func (c *kvWrapperChecker) ValidateManagedAdmission(ctx context.Context, i ManagedStartupIdentity, state ManagedRuntimeState) error {
-	if state.WALIdentity == "" || state.AppliedTip != state.CertifiedTip || state.RecorderTip > state.CertifiedTip {
-		return errors.New("synthetic runtime unresolved")
-	}
-	return c.ValidateManagedStartup(ctx, i)
+func (c *kvWrapperChecker) ValidateManagedKVRecovery(context.Context, ManagedStartupIdentity, string, network.KVMutationRequest) error {
+	c.calls.Add(1)
+	return errors.New("retired CR recovery reservation invoked")
 }
-func (c *kvWrapperChecker) ValidateManagedSQLRead(ctx context.Context, i ManagedStartupIdentity, state ManagedRuntimeState) error {
-	c.readCalls.Add(1)
-	return c.ValidateManagedStartup(ctx, i)
-}
-func (c *kvWrapperChecker) exact(ctx context.Context, i ManagedStartupIdentity, operation string, req network.KVMutationRequest) error {
-	if err := c.ValidateManagedStartup(ctx, i); err != nil {
-		return err
-	}
-	want := types.KVCommand{RequestID: c.request.RequestID, Operation: c.operation, Key: c.request.Key, Value: c.request.Value, Expected: c.request.Expected, ExpectedExists: c.request.ExpectedExists, TTLMS: c.request.TTLMS}
-	got := types.KVCommand{RequestID: req.RequestID, Operation: operation, Key: req.Key, Value: req.Value, Expected: req.Expected, ExpectedExists: req.ExpectedExists, TTLMS: req.TTLMS}
-	wf, we := types.ManagedKVFingerprint(want)
-	gf, ge := types.ManagedKVFingerprint(got)
-	if we != nil || ge != nil || want.RequestID != got.RequestID || wf != gf {
-		return errors.New("synthetic exact original refused")
-	}
-	return nil
-}
-func (c *kvWrapperChecker) ValidateManagedKVWrite(ctx context.Context, i ManagedStartupIdentity, _ ManagedRuntimeState, operation string, req network.KVMutationRequest) error {
-	c.writeCalls.Add(1)
-	return c.exact(ctx, i, operation, req)
-}
-func (c *kvWrapperChecker) ValidateManagedKVRecovery(ctx context.Context, i ManagedStartupIdentity, operation string, req network.KVMutationRequest) error {
-	c.recoveryCalls.Add(1)
-	return c.exact(ctx, i, operation, req)
+func (c *kvWrapperChecker) ValidateManagedSQLRead(context.Context, ManagedStartupIdentity, ManagedRuntimeState) error {
+	c.calls.Add(1)
+	return errors.New("retired CR read authority invoked")
 }
 
-// Actual local Core/WAL/SQLite/filesystem source proof. This is neither public
-// OpenManaged nor a remote registry/provider qualification.
-func newKVWrapperFixture(t *testing.T) (*Node, *kvWrapperChecker) {
+func newKVWrapperFixture(t *testing.T) (*Node, *kvWrapperChecker, *managedGraphAdmissionRaceFixture) {
 	t.Helper()
-	ctx := context.Background()
-	ns, err := ManagedNamespaceFor("root", "uid", 0, "assignment", "cluster")
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	const protocol = sqlpolicy.ManagedRequestAppendOnlyApplicationProtocol
+	const clusterID = "kv-wrapper"
+	ns, err := ManagedNamespaceFor("root", "uid", 0, "assignment", clusterID)
 	if err != nil {
 		t.Fatal(err)
 	}
-	cfg := &types.ExecutionConfig{ClusterID: "cluster", NodeID: "member", DataDir: t.TempDir(), ObjStoreProvider: "filesystem", ObjStoreDir: t.TempDir(), ObjStorePrefix: ns.ConfigPrefix}
-	n := New(cfg)
-	physical, member, err := n.PreparedStartupBindingDigestsForProtocol(types.ManagedApplicationProtocolSQLKV)
+	storeDir := t.TempDir()
+	bucket, err := localobj.NewBucketForNamespace(ctx, localobj.Config{Provider: localobj.ProviderFilesystem, FilesystemDir: storeDir}, ns.FinalPrefix)
 	if err != nil {
 		t.Fatal(err)
 	}
-	common, err := n.ManagedBootstrapPlanDigestForProtocol(physical, types.ManagedApplicationProtocolSQLKV, types.ManagedApplicationProtocolSQLKV)
+	t.Cleanup(func() {
+		if err := bucket.Close(); err != nil {
+			t.Error(err)
+		}
+	})
+	transport := &graphAdmissionRaceTransport{graphReviewTransport: make(graphReviewTransport), held: make(chan struct{}), release: make(chan struct{})}
+	transport.releaseHeld()
+	cluster := quepaxa.Cluster{ConfigID: 1}
+	for i, id := range []quepaxa.NodeID{"n1", "n2", "n3"} {
+		member := peerMember(clusterID, id, string(id)+"-token")
+		member.PeerURL = "quic://" + string(id) + ":9090"
+		member.WALIdentity = hex.EncodeToString(bytes.Repeat([]byte{byte(i + 1)}, 32))
+		cluster.Members = append(cluster.Members, member)
+	}
+	c := &kvWrapperChecker{}
+	var owned *Node
+	for _, member := range cluster.Members {
+		cfg := &types.ExecutionConfig{NodeID: member.ID, ClusterID: clusterID, Members: cluster.Members, DataDir: t.TempDir(), ObjStoreProvider: "filesystem", ObjStoreDir: storeDir, ObjStorePrefix: ns.ConfigPrefix, ObjStoreDurability: types.ObjectStoreDurabilityBeforeAck}
+		n := New(cfg)
+		physical, memberDigest, err := n.PreparedStartupBindingDigestsForProtocol(protocol)
+		if err != nil {
+			t.Fatal(err)
+		}
+		common, err := n.ManagedBootstrapPlanDigestForProtocol(physical, protocol, protocol)
+		if err != nil {
+			t.Fatal(err)
+		}
+		identity := ManagedStartupIdentity{ApplicationProtocol: protocol, EvidenceFormat: protocol, AssignmentID: "assignment", IntentHash: "intent", StorageID: "storage", PhysicalBinding: physical, BootstrapPlanDigest: common, Member: recovery.PreparedStartupIdentity{ClusterUID: "uid", DeploymentUID: "deployment", PodUID: string(member.ID), NodeID: string(member.ID), SourceBinding: physical, ConfigDigest: memberDigest}}
+		n.managedStartup = &ManagedStartupConfig{Identity: identity, Checker: c, expectedPolicy: sqlpolicy.ManagedRequestMaterializationPolicy}
+		// Match public startup ordering: claim exact birth intent before any
+		// voter registration consumes the shared namespace's empty boundary.
+		if fresh, err := n.PrepareManagedSQLSource(ctx, identity, true); err != nil || !fresh {
+			t.Fatalf("prepare exact source before voter registration: fresh=%t err=%v", fresh, err)
+		}
+		wal, err := qlog.Open(filepath.Join(cfg.DataDir, "qlog"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() {
+			if err := wal.Close(); err != nil {
+				t.Error(err)
+			}
+		})
+		nonce, err := hex.DecodeString(member.WALIdentity)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := wal.BindIdentity(nonce); err != nil {
+			t.Fatal(err)
+		}
+		profile, err := n.managedVoterProfileFor(cfg)
+		if err != nil {
+			t.Fatal(err)
+		}
+		pending := voterIdentityForProfile(cfg, profile)
+		pending.Nonce = member.WALIdentity
+		if err := writeVoterIdentity(cfg.DataDir, pending); err != nil {
+			t.Fatal(err)
+		}
+		local, err := loadVoterIdentity(cfg)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := ensureVoterIdentityWithProfile(ctx, cfg, bucket, wal, local, true, false, profile); err != nil {
+			t.Fatal(err)
+		}
+		registered, err := loadVoterIdentity(cfg)
+		if err != nil || registered.identity == nil || !registered.identity.Registered || registered.identity.Nonce != member.WALIdentity {
+			t.Fatalf("actual voter registration missing: %+v %v", registered.identity, err)
+		}
+		manager, err := checkpoint.NewAppendOnlyManagerForPolicy(bucket, ns.FinalPrefix, t.TempDir(), sqlpolicy.ManagedRequestMaterializationPolicy, 1)
+		if err != nil {
+			t.Fatal(err)
+		}
+		archive, err := recovery.NewAppendOnlyManagerWithValueValidator(bucket, ns.FinalPrefix, 1, types.ValidateManagedKVExecutionPolicy)
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(archive.Close)
+		if err := archive.Load(ctx); err != nil {
+			t.Fatal(err)
+		}
+		n.bucket, n.checkpoints, n.archive, n.wal = bucket, manager, archive, wal
+		var walIdentity [32]byte
+		copy(walIdentity[:], nonce)
+		core, err := quepaxa.New(quepaxa.Config{NodeID: member.ID, Cluster: cluster, WAL: wal, Transport: transport, ValidateValue: types.ValidateManagedKVExecutionPolicy, ManagedAppendOnly: &quepaxa.ManagedAppendOnlyConfig{Binding: quepaxa.ManagedAppendOnlyBinding{ApplicationProtocol: protocol, BootstrapPlanDigest: common, MemberConfigDigest: memberDigest, WALIdentity: walIdentity}, Verify: n.verifyManagedAppendOnlyCandidate}})
+		if err != nil {
+			t.Fatal(err)
+		}
+		n.core = core
+		transport.graphReviewTransport[member.ID] = core
+		if member.ID == "n1" {
+			owned = n
+		}
+	}
+	n := owned
+	if n == nil {
+		t.Fatal("owned runtime missing")
+	}
+	mat, err := n.openMaterializer(filepath.Join(n.config.DataDir, "sqlite.db"), 1)
 	if err != nil {
 		t.Fatal(err)
 	}
-	i := ManagedStartupIdentity{ApplicationProtocol: types.ManagedApplicationProtocolSQLKV, EvidenceFormat: types.ManagedApplicationProtocolSQLKV, Member: recovery.PreparedStartupIdentity{ClusterUID: "uid", DeploymentUID: "deployment", PodUID: "pod", NodeID: "member", SourceBinding: physical, ConfigDigest: member}, AssignmentID: "assignment", IntentHash: "intent", StorageID: "storage", PhysicalBinding: physical, BootstrapPlanDigest: common}
-	checker := &kvWrapperChecker{identity: i}
-	if _, err := n.PrepareManagedSQLSource(ctx, i, true); err != nil {
-		t.Fatal(err)
-	}
-	bucket, err := objectstore.NewBucketForNamespace(ctx, objectstore.Config{Provider: objectstore.ProviderFilesystem, FilesystemDir: cfg.ObjStoreDir}, ns.FinalPrefix)
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { _ = bucket.Close() })
-	wal, err := qlog.Open(filepath.Join(cfg.DataDir, "qlog"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { _ = wal.Close() })
-	if err := wal.BindIdentity([]byte("01234567890123456789012345678901")); err != nil {
-		t.Fatal(err)
-	}
-	core, err := quepaxa.New(quepaxa.Config{NodeID: "member", Cluster: quepaxa.Cluster{ConfigID: 1, Members: []quepaxa.Member{{ID: "member"}}}, WAL: wal})
-	if err != nil {
-		t.Fatal(err)
-	}
-	m, err := materializer.OpenManagedSQLKV(filepath.Join(cfg.DataDir, "sqlite.db"), 1)
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { _ = m.Close() })
-	n.managedStartup = &ManagedStartupConfig{Identity: i, Checker: checker, expectedPolicy: 8, idempotencyWindow: types.DefaultIdempotencyWindowSlots}
-	n.core, n.material, n.bucket, n.wal = core, m, bucket, wal
+	t.Cleanup(func() {
+		if err := mat.Close(); err != nil {
+			t.Error(err)
+		}
+	})
+	n.material = mat
 	n.opened.Store(true)
-	n.ready.Store(true)
-	n.server, err = network.NewServerForPolicy(core, m, "cluster", true, nil, 8, n.Ready)
+	if err := n.installInternalApplicationBinding(ctx); err != nil {
+		t.Fatal(err)
+	}
+	server, err := network.NewServerForManagedProfile(n.core, mat, clusterID, true, nil, network.ManagedPeerProfile{ApplicationProtocol: protocol, BootstrapPlanDigest: n.managedStartup.Identity.BootstrapPlanDigest})
 	if err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(n.server.Close)
+	n.server = server
+	t.Cleanup(server.Close)
+	// Isolate wrapper/application assertions from the real publisher's first
+	// checkpoint round; cancel it before releasing this maintenance lock.
+	n.compactionMu.Lock()
+	t.Cleanup(func() {
+		if binding := n.stopInternalApplication(); binding != nil {
+			binding.active.Wait()
+		}
+		n.compactionMu.Unlock()
+		n.wg.Wait()
+	})
 	if err := n.AdmitManaged(ctx); err != nil {
 		t.Fatal(err)
 	}
-	return n, checker
+	t.Cleanup(func() {
+		if got := c.calls.Load(); got != 0 {
+			t.Errorf("normal engine wrapper used %d retired CR reservation callbacks", got)
+		}
+	})
+	return n, c, &managedGraphAdmissionRaceFixture{node: n, transport: transport}
 }
 
 func TestManagedKVWrappersExactAuthorityAndObservation(t *testing.T) {
-	n, c := newKVWrapperFixture(t)
-	ctx := context.Background()
+	n, _, _ := newKVWrapperFixture(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
 	req := network.KVMutationRequest{RequestID: string([]byte{0xff}), Key: string([]byte{0xfe}), Value: []byte{}, TTLMS: 60000}
-	c.operation, c.request = "put", req
 	response, err := n.ExecuteManagedKV(ctx, "put", req)
 	if err != nil || response.Status != types.MutationCommitted {
 		t.Fatal(response, err)
 	}
-	tip := n.core.Tip()
-	first, ok := n.core.CertifiedValue(quepaxa.Slot(response.Slot))
-	if !ok {
-		t.Fatal("missing actual first execution")
+	wantStart, prefix, err := n.managedSQLScope(n.managedStartup.Identity)
+	if err != nil {
+		t.Fatal(err)
+	}
+	start, err := readVoterRegistration(ctx, n.bucket, path.Join(prefix, "voters/managed-sql-application-start.json"))
+	if err != nil || !bytes.Equal(start, wantStart) {
+		t.Fatal("actual application start was not conditionally recorded", err)
+	}
+	original, found, err := n.RetainedRequest(ctx, "kv", req.RequestID)
+	if err != nil || !found || original.Slot != response.Slot {
+		t.Fatal("actual retained original missing", found, err)
 	}
 	duplicate, err := n.ExecuteManagedKV(ctx, "put", req)
-	second, secondOK := n.core.CertifiedValue(quepaxa.Slot(response.Slot))
-	if err != nil || duplicate.Slot != response.Slot || n.core.Tip() != tip || !secondOK || !bytes.Equal(first.Value, second.Value) {
-		t.Fatal("duplicate reexecuted or refreshed TTL", duplicate, err)
+	retained, found, retainedErr := n.RetainedRequest(ctx, "kv", req.RequestID)
+	if err != nil || duplicate.Slot != response.Slot || !found || retainedErr != nil || retained.Fingerprint != original.Fingerprint || retained.Receipt != original.Receipt || !bytes.Equal(retained.ExecutionItem, original.ExecutionItem) {
+		t.Fatal("duplicate changed exact original/result", duplicate, err, retainedErr)
+	}
+	executions := 0
+	for slot := quepaxa.Slot(1); slot <= n.core.Tip(); slot++ {
+		decision, ok := n.core.CertifiedValue(slot)
+		if !ok {
+			continue
+		}
+		commands, kv, err := types.DecodeManagedKVBatch(decision.Value)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !kv {
+			command, single, err := types.DecodeManagedKVCommand(decision.Value)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if single {
+				commands, kv = []types.KVCommand{command}, true
+			}
+		}
+		if kv {
+			for _, command := range commands {
+				if command.RequestID == req.RequestID {
+					executions++
+				}
+			}
+		}
+	}
+	if executions != 1 {
+		t.Fatalf("original appeared in %d certified application values", executions)
+	}
+	changed := req
+	changed.Value = []byte("different original")
+	if _, err := n.ExecuteManagedKV(ctx, "put", changed); err == nil {
+		t.Fatal("changed original reused the request identity")
 	}
 	for _, kind := range []string{"graph", "notify", "unknown"} {
 		if _, err := n.RequestStatusManaged(ctx, network.RequestStatusRequest{Kind: kind, RequestID: req.RequestID}); !errors.Is(err, network.ErrInvalidRequest) {
 			t.Fatal(kind, err)
 		}
 	}
-	status, err := n.RequestStatusManaged(ctx, network.RequestStatusRequest{Kind: "kv", RequestID: req.RequestID})
-	if err != nil || status.Receipt == nil || status.Receipt.Slot != response.Slot {
-		t.Fatal(status, err)
-	}
-	value, err := n.KVGetManaged(ctx, network.KVGetRequest{Key: req.Key, Consistency: "local"})
-	if err != nil || !value.Found || len(value.Value) != 0 {
-		t.Fatal(value, err)
-	}
-	resolved, err := n.ResolveManagedKV(ctx, "put", req)
-	if err != nil || resolved.Receipt == nil || resolved.Receipt.Slot != response.Slot || n.core.Tip() != tip {
-		t.Fatal(resolved, err)
-	}
-	changed := req
-	changed.Expected = []byte("ignored but bound")
-	if _, err := n.ExecuteManagedKV(ctx, "put", changed); err == nil || n.core.Tip() != tip {
-		t.Fatal("changed original bypassed exact checker", err)
-	}
 	var barriers atomic.Int64
 	n.server.SetDurabilityBarrier(func(context.Context, quepaxa.Slot) error { barriers.Add(1); return nil })
 	if _, err := n.RequestStatusManaged(ctx, network.RequestStatusRequest{Kind: "kv", RequestID: req.RequestID}); err != nil || barriers.Load() != 0 {
 		t.Fatal("status invoked durability", err)
 	}
-	// Previously admitted local reads do not inherit closed write admission.
 	n.managedAdmitted.Store(false)
-	if _, err := n.KVGetManaged(ctx, network.KVGetRequest{Key: req.Key, Consistency: "local"}); err != nil {
-		t.Fatal("write gate blocked local read", err)
+	if value, err := n.KVGetManaged(ctx, network.KVGetRequest{Key: req.Key, Consistency: "local"}); err != nil || !value.Found || len(value.Value) != 0 {
+		t.Fatal("closed write admission blocked certified local read", value, err)
 	}
-	if _, err := n.RequestStatusManaged(ctx, network.RequestStatusRequest{Kind: "kv", RequestID: req.RequestID}); err != nil {
-		t.Fatal("write gate blocked status", err)
+	if status, err := n.RequestStatusManaged(ctx, network.RequestStatusRequest{Kind: "kv", RequestID: req.RequestID}); err != nil || status.Receipt == nil || status.Receipt.Slot != response.Slot {
+		t.Fatal("closed write admission blocked original status", status, err)
 	}
-	n.managedAdmitted.Store(true)
-	c.deny.Store(true)
-	if _, err := n.ResolveManagedKV(ctx, "put", req); err == nil || barriers.Load() != 0 {
-		t.Fatal("denied recovery reached barrier", err)
+	resolved, err := n.ResolveManagedKV(ctx, "put", req)
+	if err != nil || resolved.Receipt == nil || resolved.Receipt.Slot != response.Slot || resolved.Durability != network.ResolveKVDurabilityConfirmed || barriers.Load() != 1 {
+		t.Fatal("actual retained resolution", resolved, err)
 	}
-	if _, err := n.ExecuteManagedKV(ctx, "put", req); err == nil || n.core.Tip() != tip {
-		t.Fatal("denied write submitted", err)
-	}
-	if _, err := n.KVGetManaged(ctx, network.KVGetRequest{Key: req.Key}); err == nil {
-		t.Fatal("stale authority read")
-	}
-	if _, err := n.RequestStatusManaged(ctx, network.RequestStatusRequest{Kind: "kv", RequestID: req.RequestID}); err == nil {
-		t.Fatal("stale authority status")
-	}
-	c.deny.Store(false)
-	resolved, err = n.ResolveManagedKV(ctx, "put", req)
-	if err != nil || resolved.Durability != network.ResolveKVDurabilityConfirmed || barriers.Load() != 1 {
-		t.Fatal(resolved, err)
-	}
-	n.server.SetDurabilityBarrier(func(context.Context, quepaxa.Slot) error { c.deny.Store(true); return nil })
-	resolved, err = n.ResolveManagedKV(ctx, "put", req)
-	if !errors.Is(err, network.ErrCommitUnknown) || resolved.Receipt == nil || resolved.Durability != network.ResolveKVDurabilityUnknown {
-		t.Fatal("barrier authority change ACKed", resolved, err)
-	}
-	c.deny.Store(false)
 	if _, err := n.API(); !errors.Is(err, network.ErrNotReady) {
 		t.Fatal("raw API exposed", err)
 	}
 	if _, err := n.Handler(); !errors.Is(err, network.ErrNotReady) {
 		t.Fatal("raw Handler exposed", err)
 	}
-	if _, _, err := n.inspectApplicationFile(ctx, path.Join(n.config.DataDir, "sqlite.db")); err != nil {
-		t.Fatal(err)
+	identity := n.managedStartup.Identity
+	n.managedStartup.Identity.Member.PodUID = "different-runtime"
+	beforeMismatch := n.core.Tip()
+	if _, err := n.ExecuteManagedKV(ctx, "put", network.KVMutationRequest{RequestID: "wrong-binding", Key: req.Key}); err == nil || n.core.Tip() != beforeMismatch {
+		t.Fatal("changed captured identity admitted mutation", err)
 	}
-	if c.writeCalls.Load() == 0 || c.recoveryCalls.Load() == 0 || c.readCalls.Load() == 0 {
-		t.Fatal("exact permission paths untested")
+	n.managedStartup.Identity = identity
+
+	binding := n.internalApplication.Load()
+	n.internalApplication.Store(nil)
+	defer n.internalApplication.Store(binding)
+	before := n.core.Tip()
+	if _, err := n.ExecuteManagedKV(ctx, "put", network.KVMutationRequest{RequestID: "unbound", Key: req.Key}); err == nil {
+		t.Fatal("missing runtime binding admitted a mutation")
+	}
+	if _, err := n.ResolveManagedKV(ctx, "put", req); !errors.Is(err, network.ErrCommitUnknown) {
+		t.Fatal("missing binding fabricated a recovery ACK", err)
+	}
+	if _, err := n.KVGetManaged(ctx, network.KVGetRequest{Key: req.Key}); err == nil {
+		t.Fatal("missing binding admitted a read")
+	}
+	if _, err := n.RequestStatusManaged(ctx, network.RequestStatusRequest{Kind: "kv", RequestID: req.RequestID}); err == nil {
+		t.Fatal("missing binding admitted status")
+	}
+	if n.core.Tip() != before || barriers.Load() != 1 {
+		t.Fatal("binding rejection proposed or reached durability")
 	}
 }
 
 func TestManagedKVWrappersControlledCertifiedApplyLag(t *testing.T) {
+	n, _, fixture := newKVWrapperFixture(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	n, _, peers, _ := terminalRetryFixture(t, nil)
-	m, err := materializer.OpenManagedSQLKV(filepath.Join(t.TempDir(), "sqlite.db"), 1)
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { _ = m.Close() })
-	req := network.KVMutationRequest{RequestID: string([]byte{0xff}), Key: string([]byte{0xfe}), Value: []byte("original")}
-	c := &kvWrapperChecker{operation: "put", request: req}
-	n.material = m
-	n.managedStartup = &ManagedStartupConfig{Checker: c, expectedPolicy: 8, idempotencyWindow: types.DefaultIdempotencyWindowSlots}
-	n.opened.Store(true)
-	n.server, err = network.NewServerForPolicy(n.core, m, "cluster", false, nil, 8)
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(n.server.Close)
+	req := network.KVMutationRequest{RequestID: "certified-unapplied", Key: "key", Value: []byte("original")}
 	value, err := types.EncodeManagedKVCommand(types.KVCommand{RequestID: req.RequestID, Operation: "put", Key: req.Key, Value: req.Value})
 	if err != nil {
 		t.Fatal(err)
 	}
-	slot, _, err := peers.cores["b"].Propose(ctx, value)
+	beforeApplied := n.material.Tip()
+	slot, _, err := fixture.transport.graphReviewTransport["n2"].Propose(ctx, value)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if m.Tip() != 0 {
-		t.Fatal("fixture lost controlled unapplied state")
+	if n.material.Tip() != beforeApplied || uint64(slot) <= beforeApplied {
+		t.Fatal("fixture lost controlled certified-but-unapplied value")
 	}
-	before := peers.cores["b"].Tip()
 	result, err := n.ResolveManagedKV(ctx, "put", req)
-	if err != nil || result.Receipt == nil || result.Receipt.Slot != uint64(slot) || m.Tip() != uint64(slot) || peers.cores["b"].Tip() != before {
-		t.Fatal("certified recovery submitted or lost original", result, err)
+	if err != nil || result.Receipt == nil || result.Receipt.Slot != uint64(slot) || n.material.Tip() < uint64(slot) {
+		t.Fatal("certified recovery lost original", result, err)
+	}
+	original, found, err := n.RetainedRequest(ctx, "kv", req.RequestID)
+	if err != nil || !found || original.Slot != uint64(slot) {
+		t.Fatal("recovery resubmitted original at another slot", original, found, err)
 	}
 }
 
 func TestManagedKVWrappersFalseCASAndUnknown(t *testing.T) {
-	n, c := newKVWrapperFixture(t)
-	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	n, _, _ := newKVWrapperFixture(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	req := network.KVMutationRequest{RequestID: "false", Key: "absent", ExpectedExists: true, Expected: []byte{}, Value: nil}
-	c.operation, c.request = "cas", req
 	response, err := n.ExecuteManagedKV(ctx, "cas", req)
 	if err != nil || response.Applied || response.Status != types.MutationCommitted {
 		t.Fatal(response, err)
 	}
-	tip := n.core.Tip()
+	original, found, err := n.RetainedRequest(ctx, "kv", req.RequestID)
+	if err != nil || !found || original.Receipt.Applied {
+		t.Fatal(original, found, err)
+	}
 	n.server.SetDurabilityBarrier(func(context.Context, quepaxa.Slot) error { return context.DeadlineExceeded })
-	result, err := n.ResolveManagedKV(ctx, "cas", req)
-	var unknown *network.CommitUnknownError
-	if !errors.As(err, &unknown) || result.Receipt == nil || result.Receipt.Applied || unknown.Slot != quepaxa.Slot(response.Slot) || unknown.RequestID != req.RequestID {
-		t.Fatal(result, err)
+	if _, err := n.ResolveManagedKV(ctx, "cas", req); !errors.Is(err, network.ErrCommitUnknown) {
+		t.Fatal("unconfirmed false CAS fabricated ACK", err)
 	}
-	c.request.RequestID = "missing"
-	missing, err := n.ResolveManagedKV(ctx, "cas", c.request)
-	if err != nil || missing.State != network.ResolveKVUnknownOrExpired || missing.Receipt != nil || n.core.Tip() != tip {
-		t.Fatal(missing, err)
+	retained, found, err := n.RetainedRequest(ctx, "kv", req.RequestID)
+	if err != nil || !found || retained.Slot != original.Slot || retained.Receipt != original.Receipt || !bytes.Equal(retained.ExecutionItem, original.ExecutionItem) {
+		t.Fatal("UNKNOWN lost false-CAS original", retained, found, err)
 	}
-	c.operation, c.request = "put", network.KVMutationRequest{RequestID: "old-large-pending", Key: "k", Value: bytes.Repeat([]byte{1}, 100000)}
-	if _, err := types.ManagedKVExecutionSizeBound(types.KVCommand{RequestID: c.request.RequestID, Operation: "put", Key: "k", Value: c.request.Value}); err == nil {
-		t.Fatal("fixture must exceed new-reservation bound")
+	if _, err := n.ResolveManagedKV(ctx, "cas", network.KVMutationRequest{RequestID: "missing", Key: req.Key}); !errors.Is(err, network.ErrCommitUnknown) {
+		t.Fatal("missing original fabricated recovery", err)
 	}
-	missing, err = n.ResolveManagedKV(ctx, "put", c.request)
-	if err != nil || missing.State != network.ResolveKVUnknownOrExpired || n.core.Tip() != tip {
-		t.Fatal("retroactive reservation cap or resubmit", missing, err)
+	n.server.SetDurabilityBarrier(nil)
+	binding := n.internalApplication.Load()
+	binding.cancel()
+	before := n.core.Tip()
+	if _, err := n.ExecuteManagedKV(ctx, "put", network.KVMutationRequest{RequestID: "after-lifetime", Key: req.Key}); err == nil {
+		t.Fatal("expired binding lifetime admitted mutation")
+	}
+	if _, err := n.ResolveManagedKV(ctx, "cas", req); !errors.Is(err, network.ErrCommitUnknown) || n.core.Tip() != before {
+		t.Fatal("expired lifetime fabricated recovery or proposed", err)
 	}
 }

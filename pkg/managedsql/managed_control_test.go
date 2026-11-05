@@ -32,27 +32,27 @@ func TestManagedSQLPreparationRequiresLiveExactRepair(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := h.ValidateManagedMembership(ctx, h.identity, r, current, 0); err != nil {
+	if err := h.ValidateManagedRepairPreparation(ctx, h.identity, r, current, 0); err != nil {
 		t.Fatalf("exact live ADD-first source preparation: %v", err)
 	}
 	wrong := r
 	wrong.OldWALIdentity = "wrong"
-	if err := h.ValidateManagedMembership(ctx, h.identity, wrong, current, 0); err == nil {
+	if err := h.ValidateManagedRepairPreparation(ctx, h.identity, wrong, current, 0); err == nil {
 		t.Fatal("wrong old WAL accepted")
 	}
-	if err := h.ValidateManagedMembership(ctx, h.identity, r, current, 1); err == nil {
+	if err := h.ValidateManagedRepairPreparation(ctx, h.identity, r, current, 1); err == nil {
 		t.Fatal("wrong abort revision accepted")
 	}
 	i := h.identity
 	i.Member.Generation++
-	if err := h.ValidateManagedMembership(ctx, i, r, current, 0); err == nil {
+	if err := h.ValidateManagedRepairPreparation(ctx, i, r, current, 0); err == nil {
 		t.Fatal("wrong generation accepted")
 	}
 	completion := operator.V1Alpha2RepairCompletion{OperationID: plan.OperationID, PlanDigest: plan.Digest(), ExpectedConfigID: plan.ExpectedConfigID, ExpectedAbortSlot: plan.ExpectedAbortSlot, Kind: "Abort", ConfigID: 1, Slot: 1, Hash: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}
 	if _, _, err := operator.FinishV1Alpha2Repair(ctx, writer, closed, closed.Authority(), completion); err != nil {
 		t.Fatal(err)
 	}
-	if err := h.ValidateManagedMembership(ctx, h.identity, r, current, 0); err == nil {
+	if err := h.ValidateManagedRepairPreparation(ctx, h.identity, r, current, 0); err == nil {
 		t.Fatal("terminal repair reused for preparation")
 	}
 }

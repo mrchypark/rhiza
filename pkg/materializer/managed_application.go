@@ -351,6 +351,51 @@ func managedApplicationValue(value []byte) (bool, error) {
 	return false, fmt.Errorf("unknown mixed application value")
 }
 
+// ValidateManagedLocalSchema checks only fixed policy values and internal schema
+// shape. It never scans application rows, receipts, or retained originals.
+func (m *Materializer) ValidateManagedLocalSchema(ctx context.Context) error {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	if !originalsProtocol(m.managedProtocol) || len(m.readers) == 0 || m.readers[0] == nil {
+		return fmt.Errorf("managed request materialization is not open")
+	}
+	if err := m.sqlReceiptReadLocked(); err != nil {
+		return err
+	}
+	tx, err := m.readers[0].BeginTx(ctx, &sql.TxOptions{ReadOnly: true})
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	if err := checkManagedPolicy(ctx, tx, m.managedProtocol, m.idempotencyWindow); err != nil {
+		return err
+	}
+	internal := managedInternalSchema(m.managedProtocol, m.idempotencyWindow)
+	rows, err := tx.QueryContext(ctx, `SELECT name,COALESCE(sql,'') FROM sqlite_schema WHERE substr(lower(name),1,7)='_rhiza_'`)
+	if err != nil {
+		return err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var name, ddl string
+		if err := rows.Scan(&name, &ddl); err != nil {
+			return err
+		}
+		want, ok := internal[name]
+		if !ok || strings.Join(strings.Fields(ddl), " ") != want {
+			return fmt.Errorf("invalid internal schema %q", name)
+		}
+		delete(internal, name)
+	}
+	if err := rows.Err(); err != nil {
+		return err
+	}
+	if len(internal) != 0 {
+		return fmt.Errorf("missing internal schema")
+	}
+	return nil
+}
+
 func (m *Materializer) InspectManagedApplicationState(ctx context.Context) (ManagedApplicationState, error) {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
