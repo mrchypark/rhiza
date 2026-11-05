@@ -10,8 +10,8 @@ complete.
 | Profile | Policy | HA startup contract |
 |---|---:|---|
 | Local | Local | Existing Local contract; unchanged |
-| Legacy managed SQL | 7 | Existing contract; unchanged |
-| Managed SQL/KV | 8 | Existing contract; unchanged |
+| Legacy managed SQL | 7 | Retired for managed HA execution; historical read-only inspection only |
+| Managed SQL/KV | 8 | Retired for managed HA execution; historical read-only inspection only |
 | Retired request prototype `rhiza-managed-request/v1` | 9 | Reject for HA startup; preserve its WAL and bytes |
 | Retired Graph prototype `rhiza-managed-request-graph/v1` | 10 | Reject for HA startup; preserve its WAL and bytes |
 | Final managed request `rhiza-managed-request-append-only/v1` | 9 | Explicit append-only identity required |
@@ -29,8 +29,11 @@ No automatic old-WAL migration or relabeling is supported. Preserve original
 bytes, source anchors, and UNKNOWN outcomes. Do not fall back to another
 protocol because a file happens to carry policy 9 or 10. Low-level read-only
 inspection may be used to diagnose old data, but does not enable HA startup.
-Legacy-7, SQL/KV-8, and Local signatures, defaults, eligibility, and tests stay
-unchanged.
+Managed HA execution profiles 7/8, including their prior startup defaults, are
+retired. Historical records may remain readable for diagnosis, but do not
+authorize startup, application execution, or activation. New clusters must
+select an explicit 9/10 append-only profile. The separate Local contract
+remains unchanged.
 
 ## Go, Rust, and C ABI
 

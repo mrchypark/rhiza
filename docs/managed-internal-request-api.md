@@ -10,8 +10,8 @@ runtime enforcement or final CI qualification is complete.
 | Runtime | Durable policy | HA support |
 |---|---:|---|
 | Local | Local | Existing Local contract; unchanged |
-| Legacy managed SQL | 7 | Existing contract; unchanged |
-| Managed SQL/KV | 8 | Existing contract; unchanged |
+| Legacy managed SQL | 7 | Retired for managed HA execution; historical read-only inspection only |
+| Managed SQL/KV | 8 | Retired for managed HA execution; historical read-only inspection only |
 | Managed internal SQL/KV | 9 | Explicit `rhiza-managed-request-append-only/v1` only |
 | Managed Graph | 10 | See [managed Graph HA](managed-graph-ha.md); explicit append-only identity only |
 | Retired request-9 prototype | 9 | `rhiza-managed-request/v1` is not a supported HA startup profile |
@@ -27,8 +27,11 @@ checkpoint, submitting application intent, or uploading a new object.
 Selecting the final profile does not relabel, migrate, or reinterpret an old
 WAL. Retain original bytes, anchors, and uncertain outcomes; use read-only
 inspection for diagnosis. Do not silently fall back to a different profile.
-These rules do not change the released legacy-7, SQL/KV-8, or Local APIs,
-defaults, eligibility, or tests.
+Managed HA execution profiles 7/8, including their prior startup defaults, are
+retired. Historical records may remain readable for diagnosis, but do not
+authorize startup, application execution, or activation. Use an explicit 9/10
+append-only profile for a new cluster; no automatic old-WAL migration is
+provided. The separate Local contract remains unchanged.
 
 ## Request and recovery path
 
