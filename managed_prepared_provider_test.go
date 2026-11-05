@@ -35,7 +35,70 @@ import (
 	"github.com/mrchypark/rhiza/pkg/quepaxa"
 	"github.com/mrchypark/rhiza/pkg/recovery"
 	_ "github.com/ncruces/go-sqlite3/driver"
+	"github.com/thanos-io/objstore"
 )
+
+// Freeze only a source-observed CURRENT hint, never archive HEAD or immutable
+// objects. Each view must still verify its exact seal/root against real SDK
+// reads. This preserves the test's checkpoint-base-plus-later-suffix scenario
+// even when another admitted publisher advances the live discovery hint.
+type managedProviderFixedCurrent struct {
+	*readonlyProviderBucket
+	key  string
+	data []byte
+	attr objstore.ObjectAttributes
+}
+
+func captureManagedProviderCurrent(ctx context.Context, bucket *readonlyProviderBucket, key string) (*managedProviderFixedCurrent, error) {
+	before, err := bucket.Attributes(ctx, key)
+	if err != nil {
+		return nil, err
+	}
+	if before.Version == nil {
+		return nil, fmt.Errorf("provider CURRENT lacks conditional version")
+	}
+	r, err := bucket.Get(ctx, key)
+	if err != nil {
+		return nil, err
+	}
+	// Match the existing checkpoint locator reader's bounded object size.
+	const limit = 64 << 10
+	data, readErr := io.ReadAll(io.LimitReader(r, limit+1))
+	if err := errors.Join(readErr, r.Close()); err != nil {
+		return nil, err
+	}
+	if len(data) == 0 || len(data) > limit {
+		return nil, fmt.Errorf("provider CURRENT has invalid size")
+	}
+	after, err := bucket.Attributes(ctx, key)
+	if err != nil {
+		return nil, err
+	}
+	if after.Version == nil || *before.Version != *after.Version {
+		return nil, fmt.Errorf("provider CURRENT changed during capture")
+	}
+	return &managedProviderFixedCurrent{readonlyProviderBucket: bucket, key: key, data: data, attr: after}, nil
+}
+
+func (b *managedProviderFixedCurrent) Get(ctx context.Context, key string) (io.ReadCloser, error) {
+	if key != b.key {
+		return b.readonlyProviderBucket.Get(ctx, key)
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	return io.NopCloser(bytes.NewReader(b.data)), nil
+}
+
+func (b *managedProviderFixedCurrent) Attributes(ctx context.Context, key string) (objstore.ObjectAttributes, error) {
+	if key != b.key {
+		return b.readonlyProviderBucket.Attributes(ctx, key)
+	}
+	if err := ctx.Err(); err != nil {
+		return objstore.ObjectAttributes{}, err
+	}
+	return b.attr, nil
+}
 
 // This test uses source voters and target materializers from the real Rhiza
 // runtime plus each provider's SDK adapter. Its status endpoint is only a
@@ -147,8 +210,12 @@ func TestEmbeddedObjectStorageManagedPreparedCheckpointAdoption(t *testing.T) {
 	checkpointCtx, stopCheckpoint := context.WithTimeout(ctx, 2*time.Minute)
 	defer stopCheckpoint()
 	var view *recovery.ReadOnlyView
+	var fixedCurrent *managedProviderFixedCurrent
 	for {
-		view, err = recovery.OpenReadOnlyViewForApplicationProtocol(checkpointCtx, readonly, finalPrefix, 1, bootstrap, sqlpolicy.ManagedRequestMaterializationPolicy, types.DefaultIdempotencyWindowSlots, sqlpolicy.ManagedRequestAppendOnlyApplicationProtocol, true)
+		fixedCurrent, err = captureManagedProviderCurrent(checkpointCtx, readonly, path.Join(finalPrefix, "checkpoint/CURRENT"))
+		if err == nil {
+			view, err = recovery.OpenReadOnlyViewForApplicationProtocol(checkpointCtx, fixedCurrent, finalPrefix, 1, bootstrap, sqlpolicy.ManagedRequestMaterializationPolicy, types.DefaultIdempotencyWindowSlots, sqlpolicy.ManagedRequestAppendOnlyApplicationProtocol, true)
+		}
 		if err == nil {
 			seal, decision, ok := view.RecoveryBase()
 			if ok && seal.Index == view.Base() && decision.Slot > seal.Index {
@@ -164,6 +231,7 @@ func TestEmbeddedObjectStorageManagedPreparedCheckpointAdoption(t *testing.T) {
 		}
 	}
 	checkpointBase := view.Base()
+	checkpointSeal, checkpointDecision, _ := view.RecoveryBase()
 	sourceState, err := sources[0].ManagedState()
 	if err != nil || sourceState.WALIdentity == "" {
 		t.Fatalf("actual source registration: %v", err)
@@ -173,11 +241,15 @@ func TestEmbeddedObjectStorageManagedPreparedCheckpointAdoption(t *testing.T) {
 	}
 	sources[0] = nil
 	suffix, err := sources[1].ExecuteManagedSQL(ctx, network.ExecuteRequest{RequestID: "managed-provider-suffix", SQL: "INSERT INTO managed_prepared_rows VALUES (8)"})
-	if err != nil {
-		t.Fatal(err)
+	if err != nil || suffix.Status != types.MutationCommitted || !suffix.Applied || suffix.Slot <= uint64(checkpointBase) {
+		t.Fatalf("suffix lacks an applied ACK strictly after captured checkpoint: %+v %v", suffix, err)
 	}
+	lastSuccessfulBase, lastSuccessfulTip := view.Base(), view.Tip()
 	for {
-		view, err = recovery.OpenReadOnlyViewForApplicationProtocol(checkpointCtx, readonly, finalPrefix, 1, bootstrap, sqlpolicy.ManagedRequestMaterializationPolicy, types.DefaultIdempotencyWindowSlots, sqlpolicy.ManagedRequestAppendOnlyApplicationProtocol, true)
+		view, err = recovery.OpenReadOnlyViewForApplicationProtocol(checkpointCtx, fixedCurrent, finalPrefix, 1, bootstrap, sqlpolicy.ManagedRequestMaterializationPolicy, types.DefaultIdempotencyWindowSlots, sqlpolicy.ManagedRequestAppendOnlyApplicationProtocol, true)
+		if err == nil {
+			lastSuccessfulBase, lastSuccessfulTip = view.Base(), view.Tip()
+		}
 		if err == nil && view.Base() == checkpointBase && uint64(view.Tip()) >= suffix.Slot {
 			break
 		}
@@ -185,9 +257,31 @@ func TestEmbeddedObjectStorageManagedPreparedCheckpointAdoption(t *testing.T) {
 		select {
 		case <-checkpointCtx.Done():
 			timer.Stop()
-			t.Fatalf("certified SQL suffix not observed: %v (last view: %v)", checkpointCtx.Err(), err)
+			t.Fatalf("certified SQL suffix not observed: %v (required base=%d suffix slot=%d; last successful base=%d tip=%d; last view: %v)", checkpointCtx.Err(), checkpointBase, suffix.Slot, lastSuccessfulBase, lastSuccessfulTip, err)
 		case <-timer.C:
 		}
+	}
+	seal, decision, hasBase := view.RecoveryBase()
+	if !hasBase || seal.Index != checkpointBase || seal.RootHash != checkpointSeal.RootHash || decision.Slot != checkpointDecision.Slot || decision.Hash != checkpointDecision.Hash || !bytes.Equal(decision.Certificate, checkpointDecision.Certificate) {
+		t.Fatal("suffix view replaced the exact captured checkpoint proof")
+	}
+	foundSuffix := false
+	for _, decision := range view.Decisions() {
+		if uint64(decision.Slot) != suffix.Slot {
+			continue
+		}
+		commands, sqlValue, decodeErr := types.DecodeSQLBatch(decision.Value)
+		if decodeErr != nil || !sqlValue || len(decision.Certificate) == 0 || sha256.Sum256(decision.Value) != decision.Hash {
+			t.Fatal("suffix ACK lacks its exact certified SQL value", decodeErr)
+		}
+		for _, command := range commands {
+			if command.RequestID == "managed-provider-suffix" && command.SQL == "INSERT INTO managed_prepared_rows VALUES (8)" {
+				foundSuffix = true
+			}
+		}
+	}
+	if !foundSuffix {
+		t.Fatal("captured checkpoint suffix lacks the original SQL at its ACK slot")
 	}
 	for i := range sources {
 		if sources[i] != nil {

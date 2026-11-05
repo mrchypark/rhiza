@@ -46,6 +46,10 @@ var ErrPreparedWriteAdmissionUnavailable = errors.New("prepared startup write ad
 
 const managedRepairOriginMaxBytes = (128 << 10) + 4096
 
+// This is a bounded local metadata budget, not an unlimited membership-history
+// guarantee. Publication and reload must agree before any receipt is created.
+const managedPreparedAdoptionMaxBytes = quepaxa.MaxReplicatedValueBytes + 4096
+
 // ManagedStartupIdentity binds an explicit, live initialization assignment to
 // this exact execution member. A missing archive is never an assignment.
 type ManagedStartupIdentity struct {
@@ -2089,6 +2093,9 @@ func persistPreparedAdoption(dir string, identity recovery.PreparedStartupIdenti
 	if err != nil {
 		return err
 	}
+	if len(want) > managedPreparedAdoptionMaxBytes {
+		return fmt.Errorf("prepared adoption exceeds bounded metadata budget")
+	}
 	name := filepath.Join(dir, "prepared-adoption.json")
 	if existing, err := readPreparedAdoption(name); err == nil {
 		if !bytes.Equal(existing, want) {
@@ -2127,7 +2134,7 @@ func readPreparedAdoption(name string) (data []byte, resultErr error) {
 	if err != nil {
 		return nil, err
 	}
-	if !info.Mode().IsRegular() || info.Size() > 16384 {
+	if !info.Mode().IsRegular() || info.Size() > managedPreparedAdoptionMaxBytes {
 		return nil, fmt.Errorf("invalid adoption file")
 	}
 	f, err := os.Open(name)
@@ -2139,11 +2146,11 @@ func readPreparedAdoption(name string) (data []byte, resultErr error) {
 	if err != nil || !os.SameFile(info, opened) {
 		return nil, fmt.Errorf("adoption file changed")
 	}
-	data, err = io.ReadAll(io.LimitReader(f, 16385))
+	data, err = io.ReadAll(io.LimitReader(f, managedPreparedAdoptionMaxBytes+1))
 	if err != nil {
 		return nil, err
 	}
-	if len(data) > 16384 {
+	if len(data) > managedPreparedAdoptionMaxBytes {
 		return nil, fmt.Errorf("adoption file too large")
 	}
 	return data, nil

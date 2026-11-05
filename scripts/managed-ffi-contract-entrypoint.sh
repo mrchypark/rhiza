@@ -160,6 +160,19 @@ run_contract() {
         }
         next
       }
+      if (diagnostic ~ /^MANAGED_GRAPH_RESOLUTION_FAILURE/) {
+        if (diagnostic ~ /^MANAGED_GRAPH_RESOLUTION_FAILURE leaf=(original_certificate|durability_result|runtime_post|original_recheck) original_slot=[0-9]+ cut=[0-9]+ floor=[0-9]+ recorded=[0-9]+ certified=[0-9]+ applied=[0-9]+ certificate_present=(true|false) certificate_matches=(true|false) binding_current=(true|false) voter=(true|false) cut_covered=(true|false) cause=[a-z_]+$/) {
+          split(diagnostic, resolution_fields, " ")
+          resolution_valid=1
+          for (resolution_i=3;resolution_i<=8;resolution_i++) {
+            resolution_value=resolution_fields[resolution_i]; sub(/^[a-z_]+=/,"",resolution_value)
+            if (!uint64(resolution_value)) resolution_valid=0
+          }
+          resolution_cause=resolution_fields[14]; sub(/^cause=/,"",resolution_cause)
+          if (resolution_valid && (knownadmissioncause(resolution_cause) || resolution_cause=="durability_unavailable")) emit(diagnostic)
+        }
+        next
+      }
       if (diagnostic ~ /^MANAGED_REQUEST_RESOLUTION_FAILURE/) {
         if (diagnostic ~ /^MANAGED_REQUEST_RESOLUTION_FAILURE stage=(resolve_borrow|resolve_admit) cause=[a-z_]+$/) {
           split(diagnostic, request_fields, " ")
@@ -537,6 +550,19 @@ if [ "${1-}" = --diagnostic-self-test ]; then
   [ "$(grep -Fc 'MANAGED_HOST_REQUEST_RECOVERY_FAILURE stage=request_recovery_admission cause=not_ready' "$diag_dir/active.log")" = 1 ]
   [ "$(grep -Fc 'MANAGED_HOST_REQUEST_RECOVERY_FAILURE stage=request_recovery_admission cause=quorum_unavailable' "$diag_dir/active.log")" = 1 ]
   if grep -E 'DO-NOT-RETAIN|route=private|stage=private|private_cause|round=3|target=17x|slot_known=true slot=0|lookup=other|host_precheck|^prefix 12:00:00 MANAGED_HOST_REQUEST_RECOVERY_FAILURE' "$diag_dir/active.log"; then exit 1; fi
+  [ "$before" = "$(cksum "$diag_dir/first.log")" ]
+  resolution_tuple='original_slot=77 cut=77 floor=1 recorded=81 certified=80 applied=77 certificate_present=true certificate_matches=true binding_current=true voter=true cut_covered=true cause=durability_unavailable'
+  for resolution_leaf in original_certificate durability_result runtime_post original_recheck; do
+    run_contract rust-restart sh -c 'printf "MANAGED_GRAPH_RESOLUTION_FAILURE leaf=%s %s\n" "$1" "$2"' sh "$resolution_leaf" "$resolution_tuple"
+    grep -Fx "MANAGED_GRAPH_RESOLUTION_FAILURE leaf=$resolution_leaf $resolution_tuple" "$diag_dir/active.log" >/dev/null
+  done
+  run_contract rust-restart sh -c 'printf "%s\n" \
+    "MANAGED_GRAPH_RESOLUTION_FAILURE leaf=private original_slot=77 cut=77 floor=1 recorded=81 certified=80 applied=77 certificate_present=true certificate_matches=true binding_current=true voter=true cut_covered=true cause=other" \
+    "MANAGED_GRAPH_RESOLUTION_FAILURE leaf=runtime_post original_slot=18446744073709551616 cut=77 floor=1 recorded=81 certified=80 applied=77 certificate_present=true certificate_matches=true binding_current=true voter=true cut_covered=true cause=other" \
+    "MANAGED_GRAPH_RESOLUTION_FAILURE leaf=runtime_post original_slot=77 cut=77 floor=1 recorded=81 certified=80 applied=77 certificate_present=invalid certificate_matches=true binding_current=true voter=true cut_covered=true cause=other" \
+    "MANAGED_GRAPH_RESOLUTION_FAILURE leaf=runtime_post original_slot=77 cut=77 floor=1 recorded=81 certified=80 applied=77 certificate_present=true certificate_matches=true binding_current=true voter=true cut_covered=true cause=private" \
+    "MANAGED_GRAPH_RESOLUTION_FAILURE leaf=runtime_post original_slot=77 cut=77 floor=1 recorded=81 certified=80 applied=77 certificate_present=true certificate_matches=true binding_current=true voter=true cut_covered=true cause=other payload=DO-NOT-RETAIN"'
+  if grep -E 'MANAGED_GRAPH_RESOLUTION_FAILURE|DO-NOT-RETAIN' "$diag_dir/active.log"; then exit 1; fi
   [ "$before" = "$(cksum "$diag_dir/first.log")" ]
   if run_contract rust-initial sh -c 'i=0; while [ "$i" -lt 4000 ]; do echo "FAIL: managed-ha-contract prior_ack_marker_missing"; i=$((i+1)); done; exit 9' >/dev/null 2>&1; then exit 1; else [ "$?" = 9 ]; fi
   [ "$(wc -c < "$diag_dir/first.log")" -le 65536 ]

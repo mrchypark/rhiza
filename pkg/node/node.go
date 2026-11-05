@@ -1396,6 +1396,9 @@ func (n *Node) openInternal(ctx context.Context, enroll bool, prelocked *qlog.Lo
 		n.wg.Add(1)
 		go func() {
 			defer n.wg.Done()
+			if err := localtesthooks.HitBackgroundPublication(ctx, "archive"); err != nil {
+				return
+			}
 			ticker := time.NewTicker(interval)
 			defer ticker.Stop()
 			for {

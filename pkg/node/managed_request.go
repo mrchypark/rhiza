@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"log"
 
+	"github.com/mrchypark/rhiza/internal/localtesthooks"
 	"github.com/mrchypark/rhiza/internal/types"
 	"github.com/mrchypark/rhiza/pkg/materializer"
 	"github.com/mrchypark/rhiza/pkg/network"
@@ -19,6 +20,82 @@ type ManagedRequestResolution struct {
 	Original   materializer.RequestOriginal
 	Receipt    types.MutationReceipt
 	Statements []types.SQLStatementResult
+}
+
+// The cut is anchored in the actual admitted Core, not a later recorder tip.
+// A compacted original is covered by the already-verified local recovery root.
+type managedGraphResolutionCut struct {
+	through quepaxa.Slot
+	prefix  [32]byte
+	floor   quepaxa.Slot
+	root    [32]byte
+}
+
+func (n *Node) captureManagedGraphResolutionCut(ctx context.Context, original materializer.RequestOriginal) (managedGraphResolutionCut, error) {
+	var cut managedGraphResolutionCut
+	if original.Slot == 0 || original.Receipt.Slot != original.Slot {
+		return cut, fmt.Errorf("Graph original receipt position is invalid")
+	}
+	cut.floor, cut.root, _ = n.core.RecoveryRoot()
+	cut.through = quepaxa.Slot(original.Slot)
+	if cut.through <= cut.floor {
+		if cut.floor == 0 || cut.root == ([32]byte{}) {
+			return cut, fmt.Errorf("Graph original recovery root is unavailable")
+		}
+		cut.through = cut.floor
+	} else {
+		decision, found := n.core.CertifiedValue(cut.through)
+		if !found || decision.Hash != original.DecisionHash || !bytes.Equal(decision.Value, original.ExecutionItem) {
+			return cut, fmt.Errorf("Graph original differs from its exact certified slot")
+		}
+		if err := n.core.ValidateCertifiedValue(ctx, decision); err != nil {
+			return cut, err
+		}
+	}
+	var exists bool
+	cut.prefix, exists = n.core.PrefixHash(cut.through)
+	if !exists || cut.prefix == ([32]byte{}) {
+		return cut, fmt.Errorf("Graph original certified prefix is unavailable")
+	}
+	return cut, nil
+}
+
+func (n *Node) managedGraphResolutionCutCovered(cut managedGraphResolutionCut, state ManagedRuntimeState) bool {
+	if cut.through == 0 || cut.prefix == ([32]byte{}) {
+		return false
+	}
+	floor, root, _ := n.core.RecoveryRoot()
+	prefix, exists := n.core.PrefixHash(cut.through)
+	return floor == cut.floor && root == cut.root && exists && prefix == cut.prefix &&
+		state.CertifiedTip >= uint64(cut.through) && state.AppliedTip >= uint64(cut.through)
+}
+
+type managedGraphResolutionDiagnosticState struct {
+	originalSlot, cut, floor, recorded, certified, applied                    uint64
+	certificatePresent, certificateMatches, bindingCurrent, voter, cutCovered bool
+}
+
+func managedGraphResolutionFailureDiagnostic(leaf string, state managedGraphResolutionDiagnosticState, err error) string {
+	if err == nil {
+		return ""
+	}
+	switch leaf {
+	case "original_certificate", "durability_result", "runtime_post", "original_recheck":
+	default:
+		return ""
+	}
+	cause := managedMembershipCauseClass(err)
+	if cause == "other" && errors.Is(err, network.ErrDurabilityUnavailable) {
+		cause = "durability_unavailable"
+	}
+	return fmt.Sprintf("MANAGED_GRAPH_RESOLUTION_FAILURE leaf=%s original_slot=%d cut=%d floor=%d recorded=%d certified=%d applied=%d certificate_present=%t certificate_matches=%t binding_current=%t voter=%t cut_covered=%t cause=%s", leaf, state.originalSlot, state.cut, state.floor, state.recorded, state.certified, state.applied, state.certificatePresent, state.certificateMatches, state.bindingCurrent, state.voter, state.cutCovered, cause)
+}
+
+func logManagedGraphResolutionFailure(leaf string, state managedGraphResolutionDiagnosticState, err error) error {
+	if line := managedGraphResolutionFailureDiagnostic(leaf, state, err); line != "" {
+		log.Print(line)
+	}
+	return err
 }
 
 func retainedRequestKind(kind string) (types.MutationKind, error) {
@@ -87,7 +164,19 @@ func (n *Node) ResolveRequest(ctx context.Context, kind, rawID string) (ManagedR
 		return unknown(errors.Join(fmt.Errorf("request original is unknown or expired"), err))
 	}
 	result := ManagedRequestResolution{Original: original}
+	var graphCut managedGraphResolutionCut
+	graphLeaf := "original_certificate"
 	fail := func(cause error) (ManagedRequestResolution, error) {
+		if k == types.MutationGraph {
+			progress := n.core.RuntimeProgressSnapshot()
+			decision, present := n.core.CertifiedValue(quepaxa.Slot(original.Slot))
+			state := ManagedRuntimeState{CertifiedTip: uint64(progress.CertifiedTip), AppliedTip: n.material.Tip()}
+			cause = logManagedGraphResolutionFailure(graphLeaf, managedGraphResolutionDiagnosticState{
+				originalSlot: original.Slot, cut: uint64(graphCut.through), floor: uint64(n.core.CompactionFloor()), recorded: uint64(progress.RecorderTip), certified: state.CertifiedTip, applied: state.AppliedTip,
+				certificatePresent: present, certificateMatches: present && decision.Hash == original.DecisionHash && bytes.Equal(decision.Value, original.ExecutionItem) && len(decision.Certificate) != 0,
+				bindingCurrent: bound != nil && bound == n.internalApplication.Load() && bound.core == n.core && bound.lifetime != nil && bound.lifetime.Err() == nil, voter: n.core.IsVoter(), cutCovered: graphCut.through != 0 && n.managedGraphResolutionCutCovered(graphCut, state),
+			}, cause)
+		}
 		logManagedRequestOriginalFound(original, k, rawID)
 		return result, &network.CommitUnknownError{RequestID: rawID, Slot: quepaxa.Slot(original.Slot), RetryThroughSlot: original.Receipt.RetryThroughSlot, Cause: cause}
 	}
@@ -115,19 +204,42 @@ func (n *Node) ResolveRequest(ctx context.Context, kind, rawID string) (ManagedR
 		if original.Graph == nil || original.SQL != nil || original.KV != nil {
 			return fail(fmt.Errorf("stored Graph original is unavailable"))
 		}
+		graphCut, err = n.captureManagedGraphResolutionCut(ctx, original)
+		if err != nil {
+			return fail(err)
+		}
+		graphLeaf = "durability_result"
 		resolved, err := n.server.ResolveGraph(ctx, *original.Graph)
 		if err != nil || resolved.State != network.ResolveKVRetained || resolved.Durability != network.ResolveKVDurabilityConfirmed || resolved.Receipt == nil || *resolved.Receipt != original.Receipt {
 			return fail(errors.Join(fmt.Errorf("original Graph result is not durably confirmed"), err))
 		}
 		result.Receipt = *resolved.Receipt
 	}
+	localtesthooks.Hit("node:managed-request:resolved-before-runtime-recheck")
+	graphLeaf = "runtime_post"
 	state, err := n.checkInternalApplicationRuntime(ctx)
-	if err != nil || bound == nil || bound != n.internalApplication.Load() || !n.core.IsVoter() || original.Slot > state.CertifiedTip || state.AppliedTip != state.CertifiedTip || state.RecorderTip > state.CertifiedTip {
+	historyCovered := original.Slot <= state.CertifiedTip && state.AppliedTip == state.CertifiedTip && state.RecorderTip <= state.CertifiedTip
+	if k == types.MutationGraph {
+		// ResolveGraph has already confirmed the exact receipt's durability.
+		// Later ISR or certified suffix work cannot invalidate this fixed cut.
+		historyCovered = n.managedGraphResolutionCutCovered(graphCut, state)
+	}
+	if err != nil || bound == nil || bound != n.internalApplication.Load() || !n.core.IsVoter() || !historyCovered {
 		return fail(errors.Join(fmt.Errorf("request runtime changed during resolution"), err))
 	}
+	graphLeaf = "original_recheck"
 	after, found, err := n.material.RetainedRequestOriginal(ctx, k, rawID)
 	if err != nil || !found || after.Kind != original.Kind || after.RequestID != original.RequestID || after.Slot != original.Slot || after.BatchIndex != original.BatchIndex || after.Fingerprint != original.Fingerprint || after.Receipt != original.Receipt || after.DecisionHash != original.DecisionHash || !bytes.Equal(after.ExecutionItem, original.ExecutionItem) || !bytes.Equal(after.CanonicalOriginal, original.CanonicalOriginal) {
 		return fail(errors.Join(fmt.Errorf("exact retained original changed during resolution"), err))
+	}
+	if k == types.MutationGraph {
+		localtesthooks.Hit("node:managed-request:original-rechecked")
+		if err := ctx.Err(); err != nil {
+			return fail(err)
+		}
+		if bound.lifetime.Err() != nil || bound != n.internalApplication.Load() || !n.core.IsVoter() || !n.managedGraphResolutionCutCovered(graphCut, state) {
+			return fail(fmt.Errorf("Graph request runtime changed after original recheck"))
+		}
 	}
 	return result, nil
 }

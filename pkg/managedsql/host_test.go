@@ -54,6 +54,9 @@ type sqlWireControl struct {
 	putPrefix               string
 	putReadGateBytes        int
 	putReadErrors           chan error
+	// Evaluated before body reads/object-map lock. The owner must fail its
+	// test on predicate observation errors rather than silently passing them.
+	putGate func(context.Context, string) bool
 	// Optional arm is installed before runtime startup. Nil retains the
 	// existing unconditional gate; tests may atomically arm a later failure.
 	putEnabled     *atomic.Bool
@@ -73,7 +76,7 @@ func sqlWireStore(t *testing.T) (*httptest.Server, *sqlWireControl) {
 			control.deleteRequests.Add(1)
 		}
 		var gatedBodyPrefix []byte
-		gatePut := r.Method == http.MethodPut && control.putReady != nil && (control.putEnabled == nil || control.putEnabled.Load()) && strings.Contains(r.URL.Path, control.putPrefix) && strings.HasSuffix(r.URL.Path, control.putSuffix)
+		gatePut := r.Method == http.MethodPut && control.putReady != nil && (control.putEnabled == nil || control.putEnabled.Load()) && strings.Contains(r.URL.Path, control.putPrefix) && strings.HasSuffix(r.URL.Path, control.putSuffix) && (control.putGate == nil || control.putGate(r.Context(), r.URL.Path))
 		if gatePut && control.putReadGateBytes > 0 {
 			gatedBodyPrefix = make([]byte, control.putReadGateBytes)
 			n, err := io.ReadFull(r.Body, gatedBodyPrefix)
@@ -665,8 +668,8 @@ func TestManagedSQLRealThreeNodeInitializationAndWrite(t *testing.T) {
 		t.Fatalf("create: %+v %v", response, err)
 	}
 	insert, err := hosts[0].Execute(context.Background(), ExecuteRequest{RequestID: "insert", SQL: "INSERT INTO app VALUES (?)", Args: []any{[]byte{0, 255}}})
-	if err != nil {
-		t.Fatal(err)
+	if err != nil || insert.Status != types.MutationCommitted || insert.Slot == 0 {
+		t.Fatalf("insert lacks a committed ACK: %+v %v", insert, err)
 	}
 	a, err := operator.LoadV1Alpha2Admission(context.Background(), configs[0].Store, configs[0].Ref)
 	if err != nil {
@@ -699,9 +702,15 @@ func TestManagedSQLRealThreeNodeInitializationAndWrite(t *testing.T) {
 			t.Fatal("admitted raw handler exposed")
 		}
 		waitSQLCertifiedApplication(t, context.Background(), h, insert.Slot)
-		state, err := h.node.InspectManagedKV(context.Background(), false)
-		if err != nil || state.Runtime.AppliedTip < insert.Slot {
-			t.Fatalf("replica certified SQL application mismatch: %v", err)
+		// Public rows and applied slot share one SQLite snapshot; checkpoint
+		// progress need not globally stop around a private evidence Inspector.
+		rows, err := h.Query(context.Background(), QueryRequest{SQL: "SELECT hex(value) FROM app", Consistency: "linearizable"})
+		if err != nil || rows.AppliedSlot < insert.Slot || len(rows.Rows) != 1 || len(rows.Rows[0]) != 1 || rows.Rows[0][0] != "00FF" {
+			t.Fatalf("replica certified SQL snapshot mismatch: %+v %v", rows, err)
+		}
+		status, err := h.RequestStatus(context.Background(), network.RequestStatusRequest{Kind: "sql", RequestID: "insert"})
+		if err != nil || status.Receipt == nil || !reflect.DeepEqual(*status.Receipt, insert.MutationReceipt) {
+			t.Fatalf("replica changed exact INSERT ACK receipt: %+v %v", status, err)
 		}
 	}
 }

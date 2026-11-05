@@ -12,6 +12,7 @@ import (
 	"reflect"
 	"time"
 
+	"github.com/mrchypark/rhiza/internal/localtesthooks"
 	"github.com/mrchypark/rhiza/internal/sqlpolicy"
 	"github.com/mrchypark/rhiza/internal/types"
 	"github.com/mrchypark/rhiza/pkg/checkpoint"
@@ -528,6 +529,9 @@ func (n *Node) startManagedAppendOnlyPublisher(ctx context.Context) {
 	n.wg.Add(1)
 	go func() {
 		defer n.wg.Done()
+		if err := localtesthooks.HitBackgroundPublication(ctx, "checkpoint"); err != nil {
+			return
+		}
 		ticker := time.NewTicker(period)
 		defer ticker.Stop()
 		var last time.Time
