@@ -1208,7 +1208,11 @@ func (n *Node) openInternal(ctx context.Context, enroll bool, prelocked *qlog.Lo
 	}
 	recordedTip := core.RecorderTip()
 	certifiedTip := core.Tip()
-	if preparedLearner {
+	// An adoption receipt protects the existing materializer for its lifetime,
+	// but only the certified current membership determines the runtime role.
+	preparedReadOnly := preparedLearner && !core.IsVoter()
+	preparedReadOnlyResume := preparedResume && preparedReadOnly
+	if preparedReadOnly {
 		openStage = "runtime_post_recorder"
 		if err := refusePreparedUncertifiedRecorder(core); err != nil {
 			return err
@@ -1221,17 +1225,23 @@ func (n *Node) openInternal(ctx context.Context, enroll bool, prelocked *qlog.Lo
 			return fmt.Errorf("managed adopted WAL is behind its durable H receipt")
 		}
 		recoveryTarget = managedPreparedReplayThrough
-	} else if recordedTip > recoveryTarget {
+	}
+	if !preparedReadOnlyResume && recordedTip > recoveryTarget {
 		recoveryTarget = recordedTip
 	}
-	if !preparedResume && certifiedCheckpoint != nil && quepaxa.Slot(certifiedCheckpoint.Index) > recoveryTarget {
+	if !preparedReadOnlyResume && certifiedCheckpoint != nil && quepaxa.Slot(certifiedCheckpoint.Index) > recoveryTarget {
 		recoveryTarget = quepaxa.Slot(certifiedCheckpoint.Index)
 	}
-	if !preparedResume && recoveryTarget > core.Tip() {
+	if !preparedReadOnlyResume && recoveryTarget > core.Tip() {
 		openStage = "runtime_post_recover"
 		if err := core.RecoverThrough(startupRecovery.Context(), recoveryTarget); err != nil {
 			return fmt.Errorf("recover certified log through %d: %w", recoveryTarget, startupRecovery.Check(err))
 		}
+	}
+	if preparedResume && !preparedReadOnly {
+		// Recover only through the captured target above, then replay a fixed
+		// certified cut. Never restore the adopted materializer from H again.
+		managedPreparedReplayThrough = core.Tip()
 	}
 	if restoreCheckpoint != nil {
 		if restoreCheckpoint.Index > material.Tip() {
@@ -1297,6 +1307,9 @@ func (n *Node) openInternal(ctx context.Context, enroll bool, prelocked *qlog.Lo
 		}
 	}
 	if deferredManagedGraph {
+		if preparedResume && !preparedReadOnly {
+			managedGraphReplayThrough = managedPreparedReplayThrough
+		}
 		if managedGraphReplayThrough > 0 {
 			openStage = "runtime_post_replay_graph"
 			if err := n.replayLocalDecisionsThrough(startupRecovery.Context(), managedGraphReplayThrough); err != nil {

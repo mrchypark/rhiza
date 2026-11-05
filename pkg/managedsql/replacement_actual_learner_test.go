@@ -31,6 +31,10 @@ import (
 )
 
 func TestReplaceVoterCoordinatesActualPreparedLearner(t *testing.T) {
+	runReplaceVoterCoordinatesActualPreparedLearner(t, nil)
+}
+
+func runReplaceVoterCoordinatesActualPreparedLearner(t *testing.T, beforeRetainedRestart func(context.Context, *Host, Config, *Host) func(*Host)) {
 	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Second)
 	defer cancel()
 	const protocol = sqlpolicy.ManagedRequestAppendOnlyApplicationProtocol
@@ -490,6 +494,19 @@ func TestReplaceVoterCoordinatesActualPreparedLearner(t *testing.T) {
 	if err != nil || dSnapshot.LocalWALIdentity == "" {
 		t.Fatalf("read adopted D WAL identity: %+v err=%v", dSnapshot, err)
 	}
+	var verifyRetainedRestart func(*Host)
+	recoverOriginal := func() {
+		recovered, err := hosts[0].RecoverRequest(ctx, network.RequestStatusRequest{Kind: "sql", RequestID: "repair-pending"})
+		if err != nil || recovered.RequestID == nil || string(recovered.RequestID) != "repair-pending" || recovered.SQL == nil || recovered.SQL.Slot != original.Slot {
+			t.Fatalf("exact retained SQL original did not recover after repair: %+v err=%v", recovered, err)
+		}
+	}
+	if beforeRetainedRestart != nil {
+		// Finish the existing original before injecting the focused retained
+		// recorder tail; no unrelated foreground barrier may drain that tail.
+		recoverOriginal()
+		verifyRetainedRestart = beforeRetainedRestart(ctx, learner, learnerCfg, hosts[0])
+	}
 	if err := learner.Close(); err != nil {
 		t.Fatal(err)
 	}
@@ -498,9 +515,8 @@ func TestReplaceVoterCoordinatesActualPreparedLearner(t *testing.T) {
 	if _, err := seed.open(ctx, completedWithoutOrigin); err == nil || !strings.Contains(err.Error(), "prepared repair learner requires the exact current closed repair") {
 		t.Fatalf("completed D record accepted a fresh prepared adoption without its closed origin: %v", err)
 	}
-	recovered, err := hosts[0].RecoverRequest(ctx, network.RequestStatusRequest{Kind: "sql", RequestID: "repair-pending"})
-	if err != nil || recovered.RequestID == nil || string(recovered.RequestID) != "repair-pending" || recovered.SQL == nil || recovered.SQL.Slot != original.Slot {
-		t.Fatalf("exact retained SQL original did not recover after repair: %+v err=%v", recovered, err)
+	if beforeRetainedRestart == nil {
+		recoverOriginal()
 	}
 	historicalCfg := learnerCfg
 	historicalCfg.Prepared = nil
@@ -533,6 +549,9 @@ func TestReplaceVoterCoordinatesActualPreparedLearner(t *testing.T) {
 	}
 	if err := historical.Ready(ctx); err != nil {
 		t.Fatalf("same-Pod D restart did not recover before readiness: %v", err)
+	}
+	if verifyRetainedRestart != nil {
+		verifyRetainedRestart(historical)
 	}
 	if _, err := historical.Execute(ctx, ExecuteRequest{RequestID: "after-d-restart", SQL: "INSERT INTO app VALUES ('after-d-restart')"}); err != nil {
 		t.Fatalf("same-Pod D restart could not admit SQL while quorum was available: %v", err)
