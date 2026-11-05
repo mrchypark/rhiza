@@ -25,6 +25,7 @@ set -eu
 sdk=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
 repo=$(CDPATH= cd -- "$sdk/../.." && pwd)
 mkdir -p "$sdk/native/vendor/example.test" "$sdk/native/cmd" "$sdk/native/pkg"
+mkdir -p "$sdk/native/vendor/example.test/empty-after-filter"
 cp "$repo/go.mod" "$repo/go.sum" "$repo/rhiza.go" "$sdk/native/"
 cp -R "$repo/cmd/rhiza-ffi" "$sdk/native/cmd/"
 cp -R "$repo/pkg/data" "$sdk/native/pkg/"
@@ -45,9 +46,18 @@ case "$1" in
         mkdir -p "$stage/target/package/rhizadb-1.2.3"
         package="$stage/target/package/rhizadb-1.2.3"
         (cd "$stage" && tar -cf - --exclude=./target .) | tar -xf - -C "$package"
+        # Cargo packages file members, not empty source directories.
+        rmdir "$package/native/vendor/example.test/empty-after-filter"
         cp "$package/Cargo.toml" "$package/Cargo.toml.orig"
         printf '# Cargo normalization\n' >> "$package/Cargo.toml"
         if [ "${MOCK_CORRUPT:-0}" -eq 1 ]; then echo corrupt >> "$package/native/pkg/data/payload.bin"; fi
+        if [ "${MOCK_UNEXPECTED_FILE:-0}" -eq 1 ]; then echo unexpected > "$package/native/vendor/example.test/unexpected.bin"; fi
+        if [ "${MOCK_OMIT_NONEMPTY:-0}" -eq 1 ]; then rm -rf "$package/native/pkg/data"; fi
+        if [ "${MOCK_CHANGE_TYPE:-0}" -eq 1 ]; then
+            rm "$package/native/pkg/data/payload.bin"
+            ln -s missing "$package/native/pkg/data/payload.bin"
+        fi
+        if [ "${MOCK_CHANGE_MODE:-0}" -eq 1 ]; then chmod +x "$package/native/pkg/data/payload.bin"; fi
         (cd "$stage/target/package" && tar -czf rhizadb-1.2.3.crate rhizadb-1.2.3)
         ;;
     test)
@@ -116,8 +126,25 @@ grep -q '^commit=' "$test_root/success/verified/provenance.txt"
 [ "$(grep -c '^test ' "$MOCK_CARGO_LOG")" -eq 1 ]
 MOCK_CORRUPT=1; export MOCK_CORRUPT
 run_case corrupted-embedded-data 1
+grep -q '^phase=native_bytes_modes$' "$test_root/corrupted-embedded-data/diagnostics/failure.txt"
 if grep -q '^test ' "$MOCK_CARGO_LOG"; then echo 'FAIL corrupt crate reached tests'; exit 1; fi
 unset MOCK_CORRUPT
+MOCK_UNEXPECTED_FILE=1; export MOCK_UNEXPECTED_FILE
+run_case unexpected-native-file 1
+grep -q '^phase=native_inventory$' "$test_root/unexpected-native-file/diagnostics/failure.txt"
+unset MOCK_UNEXPECTED_FILE
+MOCK_OMIT_NONEMPTY=1; export MOCK_OMIT_NONEMPTY
+run_case omitted-nonempty-directory 1
+grep -q '^phase=native_inventory$' "$test_root/omitted-nonempty-directory/diagnostics/failure.txt"
+unset MOCK_OMIT_NONEMPTY
+MOCK_CHANGE_TYPE=1; export MOCK_CHANGE_TYPE
+run_case changed-native-type 1
+grep -q '^phase=member_types$' "$test_root/changed-native-type/diagnostics/failure.txt"
+unset MOCK_CHANGE_TYPE
+MOCK_CHANGE_MODE=1; export MOCK_CHANGE_MODE
+run_case changed-native-mode 1
+grep -q '^phase=native_bytes_modes$' "$test_root/changed-native-mode/diagnostics/failure.txt"
+unset MOCK_CHANGE_MODE
 MOCK_PACKAGE_FAIL=1; export MOCK_PACKAGE_FAIL
 run_case package-failure 17
 unset MOCK_PACKAGE_FAIL

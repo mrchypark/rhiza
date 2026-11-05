@@ -12,12 +12,17 @@ output=${2:?new artifact directory required}
 mkdir -p "$output/diagnostics"
 output=$(CDPATH='' cd -- "$output" && pwd)
 state=$(mktemp -d "${TMPDIR:-/tmp}/rhiza-ci-package.XXXXXX")
+phase=stage
 cleanup() {
     result=$?
     trap - EXIT HUP INT TERM
     set +e
     original_result=$result
     cleanup_failed=0
+    if [ "$original_result" -ne 0 ]; then
+        printf 'PACKAGE_ARTIFACT_FAILURE phase=%s exit=%s\n' "$phase" "$original_result" >&2
+        printf 'phase=%s\nexit=%s\n' "$phase" "$original_result" > "$output/diagnostics/failure.txt"
+    fi
     # Only paths recorded by our child stage invocation belong to this cleanup.
     if [ -f "$state/worktree" ]; then
         worktree=$(cat "$state/worktree")
@@ -75,6 +80,7 @@ trap 'exit 130' INT
 trap 'exit 143' TERM
 RHIZA_CRATE_STATE_DIR=$state sh "$script_dir/stage-crate.sh" "$commit" > "$state/result" 2> "$output/diagnostics/stage.log"
 stage=$(cat "$state/result")
+phase=stage_result
 [ "$stage" = "$(cat "$state/stage")" ]
 version=$(sed -n 's/^version = "\(.*\)"/\1/p' "$stage/Cargo.toml" | head -n 1)
 case "$version" in ''|*[!0-9.]*) echo 'FAIL invalid package version' >&2; exit 1;; esac
@@ -83,6 +89,7 @@ crate="$stage/target/package/rhizadb-$version.crate"
 set -- "$stage"/target/package/*.crate
 [ "$#" -eq 1 ] && [ "$1" = "$crate" ]
 mkdir "$state/extracted"
+phase=extract
 tar -xf "$crate" -C "$state/extracted"
 extracted="$state/extracted/rhizadb-$version"
 [ -d "$extracted/native/cmd/rhiza-ffi" ]
@@ -93,9 +100,27 @@ mkdir "$output/verified"
 verified="$output/verified"
 # Compare every packaged member with the staged original. Cargo normalizes its
 # manifest; Cargo.toml.orig is the exact Git source, not fabricated VCS metadata.
-find "$extracted" -type l -print > "$state/symlinks"
-[ ! -s "$state/symlinks" ] || { echo 'FAIL symlink in crate' >&2; exit 1; }
-diff -r "$stage/native" "$extracted/native"
+phase=member_types
+find "$extracted" ! -type f ! -type d -print > "$state/special-members"
+[ ! -s "$state/special-members" ] || { echo 'FAIL non-regular member in crate' >&2; exit 1; }
+find "$stage/native" ! -type f ! -type d -print > "$state/special-native"
+[ ! -s "$state/special-native" ] || { echo 'FAIL non-regular staged native member' >&2; exit 1; }
+# Cargo omits empty directories. Require the complete native file set instead:
+# this tolerates no missing nonempty subtree, extra file, byte or mode change.
+phase=native_inventory
+(cd "$stage" && find native -type f | LC_ALL=C sort) > "$state/staged-native"
+(cd "$extracted" && find native -type f | LC_ALL=C sort) > "$state/packaged-native"
+cmp "$state/staged-native" "$state/packaged-native"
+phase=native_bytes_modes
+while IFS= read -r member; do
+    cmp "$stage/$member" "$extracted/$member"
+    if [ -x "$stage/$member" ]; then
+        [ -x "$extracted/$member" ]
+    else
+        [ ! -x "$extracted/$member" ]
+    fi
+done < "$state/staged-native"
+phase=source_members
 (cd "$extracted" && find . -type f | LC_ALL=C sort) > "$state/members"
 while IFS= read -r member; do
     relative=${member#./}
@@ -121,9 +146,12 @@ done < "$state/members"
     printf '%s\t%s\n' "$mode" "$member"
 done) > "$verified/member-modes.tsv"
 # This path is outside Git and has no adjacent module; build.rs uses native/.
+phase=extracted_tests
 cargo test --manifest-path "$extracted/Cargo.toml" --locked --all-targets > "$output/diagnostics/extracted-tests.log" 2>&1
+phase=source_recheck
 (cd "$extracted" && shasum -a 256 -c "$verified/members.sha256") > "$output/diagnostics/source-recheck.log"
 cp "$crate" "$verified/"
+phase=provenance
 (cd "$verified" && shasum -a 256 "rhizadb-$version.crate") > "$verified/crate.sha256"
 {
     printf 'commit=%s\ntree=%s\nversion=%s\nbytes=%s\n' "$commit" "$(git -C "$repo_dir" rev-parse "$commit^{tree}")" "$version" "$(wc -c < "$crate" | tr -d ' ')"
