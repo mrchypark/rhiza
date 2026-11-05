@@ -2358,7 +2358,7 @@ func (c *Core) ensureDurableThroughOwned(ctx context.Context, through Slot) erro
 			return err
 		}
 	} else {
-		if err := c.commits.Sync(ctx); err != nil {
+		if err := c.commits.syncBatch(ctx, !c.localMode); err != nil {
 			return err
 		}
 	}
