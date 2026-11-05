@@ -105,6 +105,7 @@ type Core struct {
 	tipChanged          chan struct{}
 	decided             map[Slot]DecidedValue
 	durable             map[Slot]bool
+	durableThrough      Slot // contiguous verified durable prefix; protected by mu
 	logged              map[Slot]bool
 	byHash              map[ValueHash]Slot
 	values              map[ValueHash][]byte
@@ -2190,7 +2191,7 @@ func (c *Core) finishPendingCheckpointPrepare(ctx context.Context, seal Checkpoi
 
 func (c *Core) appendUndurablePrefix(ctx context.Context, through Slot) ([]SlotValue, error) {
 	c.mu.RLock()
-	floor := c.floor
+	floor := max(c.floor, c.durableThrough)
 	c.mu.RUnlock()
 	pending := make([]SlotValue, 0)
 	if floor >= through {
@@ -2345,17 +2346,21 @@ func (c *Core) ensureDurableThroughOwned(ctx context.Context, through Slot) erro
 	if err := ctx.Err(); err != nil {
 		return err
 	}
-	// ponytail: scans the retained prefix; add a durable watermark if long WALs
-	// make repeated catch-up checks costly.
+	c.mu.RLock()
+	floor, root := c.floor, c.floorRoot
+	c.mu.RUnlock()
 	pending, err := c.appendUndurablePrefix(ctx, through)
 	if err != nil {
 		return err
 	}
 	if len(pending) == 0 {
-		return ctx.Err()
-	}
-	if err := c.commits.Sync(ctx); err != nil {
-		return err
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+	} else {
+		if err := c.commits.Sync(ctx); err != nil {
+			return err
+		}
 	}
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -2364,6 +2369,20 @@ func (c *Core) ensureDurableThroughOwned(ctx context.Context, through Slot) erro
 			c.durable[value.Slot] = true
 			c.valueDurable[value.Hash] = true
 		}
+	}
+	// A base change owns its own frontier reset. Never extend an old scan's
+	// frontier across it, even when the old sync completed successfully.
+	if c.floor == floor && c.floorRoot == root {
+		for c.durableThrough < through {
+			next := c.durableThrough + 1
+			if _, ok := c.decided[next]; !ok || !c.logged[next] || !c.durable[next] {
+				break
+			}
+			c.durableThrough = next
+		}
+	}
+	if len(pending) == 0 {
+		return ctx.Err()
 	}
 	return nil
 }

@@ -46,6 +46,9 @@ func TestEnsureDurableThroughPromotesHintsWithOneSync(t *testing.T) {
 	if err := core.EnsureDurableThrough(context.Background(), 3); err == nil {
 		t.Fatal("failed sync was acknowledged")
 	}
+	if core.durableThrough != 0 {
+		t.Fatal("failed sync advanced the verified durable prefix", core.durableThrough)
+	}
 	for slot := Slot(1); slot <= 3; slot++ {
 		if core.durable[slot] {
 			t.Fatalf("failed sync marked slot %d durable", slot)
@@ -61,8 +64,14 @@ func TestEnsureDurableThroughPromotesHintsWithOneSync(t *testing.T) {
 	if got := syncs.Load(); got != 1 {
 		t.Fatalf("promotion and repeated check used %d syncs, want 1", got)
 	}
+	if core.durableThrough != 3 {
+		t.Fatal("successful contiguous sync did not establish the exact frontier", core.durableThrough)
+	}
 	if err := core.EnsureDurableThrough(context.Background(), 4); err == nil {
 		t.Fatal("missing prefix was acknowledged")
+	}
+	if core.durableThrough != 3 {
+		t.Fatal("missing decision advanced the verified durable prefix", core.durableThrough)
 	}
 	if err := wal.Close(); err != nil {
 		t.Fatal(err)
@@ -84,6 +93,93 @@ func TestEnsureDurableThroughPromotesHintsWithOneSync(t *testing.T) {
 		if !ok || got.Hash != value.Hash {
 			t.Fatalf("restarted slot %d differs", value.Slot)
 		}
+	}
+}
+
+func TestEnsureDurableThroughVerifiedPrefixSkipsOldRecordLock(t *testing.T) {
+	for _, through := range []Slot{1, 2} {
+		name := "same-prefix"
+		if through == 2 {
+			name = "new-slot"
+		}
+		t.Run(name, func(t *testing.T) {
+			config := &Cluster{ConfigID: 1, Members: []Member{{ID: "a"}}}
+			sourceWAL, err := qlog.Open(t.TempDir())
+			if err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(func() { _ = sourceWAL.Close() })
+			source := newCore("a", config, sourceWAL, nil)
+			for i := 1; i <= 2; i++ {
+				if _, _, err := source.Propose(context.Background(), []byte{byte(i)}); err != nil {
+					t.Fatal(err)
+				}
+			}
+			values, _, err := source.DecisionsFrom(1, 2)
+			if err != nil || len(values) != 2 {
+				t.Fatal("actual certified source prefix unavailable", err)
+			}
+			dir := t.TempDir()
+			wal, err := qlog.Open(dir)
+			if err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(func() { _ = wal.Close() })
+			core := newCore("a", config, wal, nil)
+			if err := core.AcceptCertifiedHints(values); err != nil {
+				t.Fatal(err)
+			}
+			var syncs atomic.Int32
+			core.commits = newGroupCommit(func() error { syncs.Add(1); return wal.Sync() })
+			if err := core.EnsureDurableThrough(context.Background(), 1); err != nil {
+				t.Fatal(err)
+			}
+			canceled, cancel := context.WithCancel(context.Background())
+			cancel()
+			if err := core.EnsureDurableThrough(canceled, 1); !errors.Is(err, context.Canceled) {
+				t.Fatal("verified prefix bypassed caller cancellation", err)
+			}
+			// This is a lock-dependency assertion, not a wall-clock benchmark:
+			// a verified old prefix must not depend on reacquiring its old lock.
+			oldLock := &core.recordLocks[1%uint64(len(core.recordLocks))]
+			oldLock.Lock()
+			ctx, stop := context.WithTimeout(context.Background(), 5*time.Second)
+			defer stop()
+			done := make(chan error, 1)
+			go func() { done <- core.EnsureDurableThrough(ctx, through) }()
+			blocked := false
+			select {
+			case err = <-done:
+			case <-ctx.Done():
+				blocked = true
+			}
+			oldLock.Unlock()
+			if blocked {
+				<-done // Releasing the owned old lock lets the canceled call drain.
+				t.Fatal("verified prefix was revisited while its old record lock was held")
+			}
+			if err != nil || syncs.Load() != int32(through) {
+				t.Fatalf("prefix through=%d syncs=%d: %v", through, syncs.Load(), err)
+			}
+			if err := wal.Close(); err != nil {
+				t.Fatal(err)
+			}
+			reopened, err := qlog.Open(dir)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer reopened.Close()
+			recovered := newCore("a", config, reopened, nil)
+			if err := recovered.recover(); err != nil || recovered.Tip() != through {
+				t.Fatalf("actual WAL reopen through=%d want=%d: %v", recovered.Tip(), through, err)
+			}
+			for _, expected := range values[:int(through)] {
+				got, ok := recovered.CertifiedValue(expected.Slot)
+				if !ok || got.Hash != expected.Hash || string(got.Value) != string(expected.Value) || string(got.Certificate) != string(expected.Certificate) {
+					t.Fatal("WAL reopen changed original certified bytes", expected.Slot)
+				}
+			}
+		})
 	}
 }
 
@@ -127,6 +223,9 @@ func TestEnsureDurableThroughConcurrentRecoveryBase(t *testing.T) {
 	if core.durable[1] {
 		t.Fatal("sync resurrected a compacted durability entry")
 	}
+	if core.durableThrough != seal.Index {
+		t.Fatal("old sync changed the recovery-base frontier", core.durableThrough, seal.Index)
+	}
 	if err := core.EnsureDurableThrough(ctx, seal.Index); err != nil {
 		t.Fatalf("covered prefix: %v", err)
 	}
@@ -144,5 +243,105 @@ func TestEnsureDurableThroughConcurrentRecoveryBase(t *testing.T) {
 	}
 	if recovered.Tip() != seal.Index || recovered.CompactionFloor() != seal.Index {
 		t.Fatal("checkpoint coverage lost across restart")
+	}
+}
+
+func durableFrontierCertifiedFixture(t *testing.T) (*Core, *qlog.WAL, []DecidedValue) {
+	t.Helper()
+	config := &Cluster{ConfigID: 1, Members: []Member{{ID: "a"}}}
+	sourceWAL, err := qlog.Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = sourceWAL.Close() })
+	source := newCore("a", config, sourceWAL, nil)
+	for i := 1; i <= 3; i++ {
+		if _, _, err := source.Propose(context.Background(), []byte{byte(i)}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	values, _, err := source.DecisionsFrom(1, 3)
+	if err != nil || len(values) != 3 {
+		t.Fatal("actual certified source prefix unavailable", err)
+	}
+	wal, err := qlog.Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = wal.Close() })
+	return newCore("a", config, wal, nil), wal, values
+}
+
+func TestEnsureDurableThroughFrontierDoesNotSkipMiddleGap(t *testing.T) {
+	core, _, values := durableFrontierCertifiedFixture(t)
+	// Slot 3 is genuinely synced before slot 2 is even learned. Its durable
+	// certificate must not stand in for the missing contiguous middle slot.
+	if err := core.AcceptCertifiedValues([]DecidedValue{values[0], values[2]}); err != nil {
+		t.Fatal(err)
+	}
+	if err := core.EnsureDurableThrough(context.Background(), 1); err != nil {
+		t.Fatal(err)
+	}
+	if err := core.EnsureDurableThrough(context.Background(), 3); err == nil {
+		t.Fatal("out-of-order durable decision bypassed missing slot 2")
+	}
+	if core.durableThrough != 1 || !core.durable[3] {
+		t.Fatal("frontier crossed a real middle gap", core.durableThrough, core.durable[3])
+	}
+	if err := core.AcceptCertifiedHints(values[1:2]); err != nil {
+		t.Fatal(err)
+	}
+	if err := core.EnsureDurableThrough(context.Background(), 3); err != nil {
+		t.Fatal(err)
+	}
+	if core.durableThrough != 3 || !core.durable[2] {
+		t.Fatal("synced gap did not establish contiguous frontier", core.durableThrough)
+	}
+}
+
+func TestEnsureDurableThroughCanceledInFlightSyncDoesNotAdvanceFrontier(t *testing.T) {
+	core, wal, values := durableFrontierCertifiedFixture(t)
+	if err := core.AcceptCertifiedHints(values); err != nil {
+		t.Fatal(err)
+	}
+	entered, release, finished := make(chan struct{}), make(chan struct{}), make(chan struct{})
+	core.commits = newGroupCommit(func() error {
+		close(entered)
+		<-release
+		err := wal.Sync()
+		close(finished)
+		return err
+	})
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- core.EnsureDurableThrough(ctx, 3) }()
+	released := false
+	// Register cleanup before any assertion: release the owned sync worker
+	// before the fixture's WAL cleanup, even if an assertion fails.
+	t.Cleanup(func() {
+		cancel()
+		if !released {
+			close(release)
+		}
+		<-finished
+	})
+	<-entered
+	cancel()
+	if err := <-done; !errors.Is(err, context.Canceled) {
+		t.Fatal("in-flight sync did not return caller cancellation", err)
+	}
+	if core.durableThrough != 0 {
+		t.Fatal("uncertain sync advanced the frontier", core.durableThrough)
+	}
+	for slot := Slot(1); slot <= 3; slot++ {
+		if !core.logged[slot] || core.durable[slot] {
+			t.Fatal("pending append was treated as synced", slot, core.logged[slot], core.durable[slot])
+		}
+	}
+	close(release)
+	released = true
+	<-finished
+	if core.durableThrough != 0 {
+		t.Fatal("late completion retroactively advanced canceled call's frontier", core.durableThrough)
 	}
 }

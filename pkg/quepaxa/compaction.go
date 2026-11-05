@@ -610,6 +610,7 @@ func (c *Core) RecoveryRoot() (Slot, [32]byte, bool) {
 func (c *Core) installBaseLocked(base consensusBase) {
 	before := c.tip
 	c.floor = base.ClosedThrough
+	c.durableThrough = base.ClosedThrough
 	c.floorRoot = base.RecoveryRoot
 	c.baseLeaderEpoch = base.LeaderEpoch
 	c.baseLeaderOrder = append([]NodeID(nil), base.NextLeaderOrder...)
