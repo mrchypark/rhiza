@@ -34,6 +34,10 @@ if [[ ! $bench_count =~ ^[1-9][0-9]*$ || ! $bench_procs =~ ^[1-9][0-9]*$ ]]; the
 	printf 'RHIZA_BENCH_COUNT and RHIZA_BENCH_PROCS must be positive integers\n' >&2
 	exit 2
 fi
+if [[ $network_optimization == sql ]]; then
+	if ! command -v strace >/dev/null 2>&1; then printf 'SQL diagnostic requires strace\n' >&2; exit 1; fi
+	strace --version >"$output_dir/strace-version.txt"
+fi
 
 work_root=$(mktemp -d "${TMPDIR:-/tmp}/rhiza-ci-bench.XXXXXX")
 capture_pid=
@@ -271,13 +275,69 @@ profile_revision() {
 	return "$status"
 }
 
+trace_sql_revision() {
+	local label=$1 source=$2 profile_case=$3 benchmark=$4 measurement=$5
+	local prefix="$output_dir/profiles/$label-$profile_case-sync"
+	local binary="$work_root/bin/$label-network.test" status capture_status
+	local metric=commands/slot
+	if [[ $profile_case == sql-returning-rows1 ]]; then metric=rows/op; fi
+	local fifo="$work_root/strace-stderr"
+	local -a command=(strace -f -qq -c -e trace=fsync,fdatasync -o "$prefix.summary.txt" --
+		"$binary" -test.run '^$' -test.bench "$benchmark" -test.benchtime 1000x
+		-test.count 1 -test.benchmem -test.cpu "$bench_procs" -test.timeout 1m)
+	printf '%q ' "${command[@]}" >"$prefix.command.txt"
+	printf '\n' >>"$prefix.command.txt"
+	printf 'scope=whole-child-process-including-setup-calibration-cleanup\nnormalization=raw-totals-not-per-operation\n' >"$prefix.metadata.txt"
+	printf 'source_sha=%s\n' "$([[ $label == base ]] && printf '%s' "$base_sha" || printf '%s' "$head_sha")" >>"$prefix.metadata.txt"
+	mkfifo "$fifo"
+	tail -c 65536 <"$fifo" >"$prefix.stderr.log" &
+	capture_pid=$!
+	if (cd "$source"; GOMAXPROCS=$bench_procs "${command[@]}") >"$prefix.txt" 2>"$fifo"; then status=0; else status=$?; fi
+	if wait "$capture_pid"; then capture_status=0; else capture_status=$?; fi
+	capture_pid=
+	rm "$fifo"
+	if ((status == 0 && capture_status != 0)); then status=$capture_status; fi
+	if ((status == 0)); then
+		if ! awk -v name="$measurement" -v unit="$metric" '
+			$1 ~ "^" name "(-[1-9][0-9]*)?$" {
+				n++; if($2!=1000 || $3!~/^[0-9]+([.][0-9]+)?$/ || $4!="ns/op") bad=1;
+				for(i=5;i<=NF;i++) {
+					if($i==unit && $(i-1)~/^[0-9]+([.][0-9]+)?$/) {metric++; value=$(i-1)}
+					if($i=="payload-bytes/op" && $(i-1)==0) payload++;
+				}
+			}
+			END {
+				if(n!=1 || metric!=1 || bad || value<=0 || (unit=="rows/op" && (value!=1 || payload!=1))) exit 1;
+				print "actual_n=1000"; print "metric_unit=" unit; print "metric_value=" value
+			}
+		' "$prefix.txt" >>"$prefix.metadata.txt" || [[ ! -s $prefix.summary.txt ]]; then status=1; fi
+	fi
+	if ((status == 0)); then
+		if ! awk '
+			BEGIN {print "syscall\tcalls\terrors\tkernel_seconds"}
+			$NF=="fsync" || $NF=="fdatasync" {
+				if((NF!=5 && NF!=6) || $2!~/^[0-9]+([.][0-9]+)?$/ || $4!~/^[0-9]+$/ || (NF==6 && $5!~/^[0-9]+$/)) exit 1;
+				print $NF "\t" $4 "\t" (NF==6?$5:0) "\t" $2; n++
+			}
+			END {if(!n) exit 1}
+		' "$prefix.summary.txt" >"$prefix.syscalls.tsv"; then status=1; fi
+	fi
+	printf '%s\n' "$status" >"$prefix.exit"
+	if [[ -s $prefix.stderr.log ]]; then cat "$prefix.stderr.log" >&2; fi
+	if ((status != 0)); then printf 'SQL sync trace failed or lacks exact evidence: %s (exit %s)\n' "$label-$profile_case" "$status" >&2; fi
+	return "$status"
+}
+
 if [[ $network_optimization == none ]]; then
 	profile_revision base "$work_root/base" internal-types '' '^BenchmarkSQLBatchCodec$/^blob_1k_encode$' 'BenchmarkSQLBatchCodec/blob_1k_encode'
 	profile_revision candidate "$work_root/candidate" internal-types '' '^BenchmarkSQLBatchCodec$/^blob_1k_encode$' 'BenchmarkSQLBatchCodec/blob_1k_encode'
 elif [[ $network_optimization == sql ]]; then
+	# No privileged tracing or fallback: inability to trace is a diagnostic gap.
 	for label in base candidate; do
 		profile_revision "$label" "$work_root/$label" network sql-execute-c4 '^BenchmarkThreePeerSQLExecute$/^c4$' 'BenchmarkThreePeerSQLExecute/c4'
 		profile_revision "$label" "$work_root/$label" network sql-returning-rows1 '^BenchmarkThreePeerSQLExecuteReturning$/^rows1$' 'BenchmarkThreePeerSQLExecuteReturning/rows1'
+		trace_sql_revision "$label" "$work_root/$label" sql-execute-c4 '^BenchmarkThreePeerSQLExecute$/^c4$' 'BenchmarkThreePeerSQLExecute/c4'
+		trace_sql_revision "$label" "$work_root/$label" sql-returning-rows1 '^BenchmarkThreePeerSQLExecuteReturning$/^rows1$' 'BenchmarkThreePeerSQLExecuteReturning/rows1'
 	done
 fi
 

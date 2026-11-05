@@ -9,8 +9,11 @@ MOCK_REPO="$scratch/repo"
 MOCK_RUN_LOG="$scratch/runs.tsv"
 MOCK_BUILD_LOG="$scratch/builds.tsv"
 MOCK_PROFILE_LOG="$scratch/profiles.tsv"
+MOCK_SYNC_LOG="$scratch/sync.tsv"
 REAL_TEE=$(command -v tee)
-export MOCK_REPO MOCK_RUN_LOG MOCK_BUILD_LOG MOCK_PROFILE_LOG REAL_TEE
+REAL_BASH=$(command -v bash)
+REAL_MKDIR=$(command -v mkdir)
+export MOCK_REPO MOCK_RUN_LOG MOCK_BUILD_LOG MOCK_PROFILE_LOG MOCK_SYNC_LOG REAL_TEE
 cat > "$scratch/bin/git" <<'SH'
 #!/bin/sh
 set -eu
@@ -94,7 +97,11 @@ if [ -n "$cpu" ]; then
     if [ "${MOCK_PROFILE_NO_MATCH:-0}" -eq 1 ]; then echo 'PASS'; exit 0; fi
 else
     [ -z "$block$mutex$block_rate$mutex_rate" ]
-    printf '%s\t%s\t%s\n' "$label" "$package" "$bench" >> "$MOCK_RUN_LOG"
+    if [ "$benchtime" = 1000x ]; then
+        printf '%s\t%s\t%s\n' "$label" "$package" "$bench" >> "$MOCK_SYNC_LOG"
+    else
+        printf '%s\t%s\t%s\n' "$label" "$package" "$bench" >> "$MOCK_RUN_LOG"
+    fi
     suffix=$(printf '%s' "$bench" | tr -cs 'A-Za-z0-9' '_')
     measurement="BenchmarkMock_${package}_${suffix}-2"
 fi
@@ -106,7 +113,19 @@ esac
 # Go prints the name before calibration; stderr must not split that line.
 printf '%s' "$measurement"
 printf 'stderr-only diagnostic\nBenchmarkStderrIsNotMeasurement\n' >&2
-printf '\t100\t1.0 ns/op\t8 B/op\t1 allocs/op\n'
+if [ "$benchtime" = 1000x ]; then
+    case "$bench" in
+        '^BenchmarkThreePeerSQLExecute$/^c4$') metric='2.5 commands/slot'; kind=c4;;
+        '^BenchmarkThreePeerSQLExecuteReturning$/^rows1$') metric='0 payload-bytes/op 1 rows/op'; kind=rows1;;
+        *) exit 92;;
+    esac
+    if [ "${MOCK_WRONG_SYNC_METRIC:-}" = "$kind" ]; then
+        case "$kind" in c4) metric='1 rows/op';; rows1) metric='2.5 commands/slot';; esac
+    fi
+    printf '\t%s\t1.0 ns/op\t%s\t8 B/op\t1 allocs/op\n' "${MOCK_SYNC_N:-1000}" "$metric"
+else
+    printf '\t100\t1.0 ns/op\t8 B/op\t1 allocs/op\n'
+fi
 if [ "${MOCK_FAIL_LABEL:-}" = "$label" ] && [ "$package" = qlog ]; then
     awk 'BEGIN {for(i=0;i<1500;i++) print "bounded stderr padding 01234567890123456789012345678901234567890123456789"}' >&2
     printf 'failure-tail-retained\n' >&2
@@ -118,6 +137,21 @@ BIN
     *) exit 97;;
 esac
 SH
+cat > "$scratch/bin/strace" <<'SH'
+#!/bin/sh
+set -eu
+if [ "${1-}" = --version ]; then echo 'strace mock'; exit 0; fi
+[ "$1" = -f ] && [ "$2" = -qq ] && [ "$3" = -c ] && [ "$4" = -e ] && [ "$5" = trace=fsync,fdatasync ] && [ "$6" = -o ] && [ "$8" = -- ]
+summary=$7
+shift 8
+case "$1" in */base-network.test|*/candidate-network.test) ;; *) exit 93;; esac
+if [ "${MOCK_STRACE_FAIL:-0}" -eq 1 ]; then echo 'ptrace denied' >&2; exit 41; fi
+"$@"
+: > "$summary"
+if [ "${MOCK_EMPTY_SYNC:-0}" -eq 0 ]; then
+    printf '90.00 0.123456 122 1013 fsync\n10.00 0.010000 3333 3 1 fdatasync\n' > "$summary"
+fi
+SH
 cat > "$scratch/bin/uname" <<'SH'
 #!/bin/sh
 echo 'mock Linux runner'
@@ -127,7 +161,7 @@ cat > "$scratch/bin/tee" <<'SH'
 if [ "${MOCK_TEE_FAIL:-0}" -eq 1 ]; then cat >/dev/null; exit 23; fi
 exec "$REAL_TEE" "$@"
 SH
-chmod +x "$scratch/bin/git" "$scratch/bin/go" "$scratch/bin/uname" "$scratch/bin/tee"
+chmod +x "$scratch/bin/git" "$scratch/bin/go" "$scratch/bin/uname" "$scratch/bin/tee" "$scratch/bin/strace"
 PATH="$scratch/bin:$PATH"
 TMPDIR="$scratch/tmp"
 export PATH TMPDIR
@@ -137,7 +171,8 @@ run_case() {
     : > "$MOCK_RUN_LOG"
     : > "$MOCK_BUILD_LOG"
     : > "$MOCK_PROFILE_LOG"
-    if bash "$script_dir/run-ci-benchmarks.sh" base candidate "$scratch/$label" > "$scratch/$label.log" 2>&1; then actual=0; else actual=$?; fi
+    : > "$MOCK_SYNC_LOG"
+    if PATH="${MOCK_RUN_PATH:-$PATH}" "$REAL_BASH" "$script_dir/run-ci-benchmarks.sh" base candidate "$scratch/$label" > "$scratch/$label.log" 2>&1; then actual=0; else actual=$?; fi
     [ "$actual" -eq "$expected" ] || { tail -12 "$scratch/$label.log"; echo "FAIL $label exit=$actual expected=$expected"; exit 1; }
     [ -z "$(find "$TMPDIR" -mindepth 1 -print)" ] || { echo 'FAIL retained owned worktree/capture'; exit 1; }
     printf 'PASS %s exit=%s owned_resources=0\n' "$label" "$actual"
@@ -167,6 +202,19 @@ grep -q '^stdout_exit=23$' "$scratch/stdout-failure/diagnostics/base-qlog-1-1.ex
 unset MOCK_TEE_FAIL
 RHIZA_BENCH_NETWORK_OPTIMIZATION=sql; export RHIZA_BENCH_NETWORK_OPTIMIZATION
 run_case sql-success 0
+[ "$(wc -l < "$MOCK_SYNC_LOG" | tr -d ' ')" -eq 4 ]
+for label in base candidate; do
+    for profile in sql-execute-c4 sql-returning-rows1; do
+        prefix="$scratch/sql-success/profiles/$label-$profile-sync"
+        grep -q '^actual_n=1000$' "$prefix.metadata.txt"
+        case "$profile" in
+            sql-execute-c4) grep -q '^metric_unit=commands/slot$' "$prefix.metadata.txt"; grep -q '^metric_value=2.5$' "$prefix.metadata.txt";;
+            sql-returning-rows1) grep -q '^metric_unit=rows/op$' "$prefix.metadata.txt"; grep -q '^metric_value=1$' "$prefix.metadata.txt";;
+        esac
+        grep -q '^fsync[[:space:]]1013[[:space:]]0[[:space:]]0.123456$' "$prefix.syscalls.tsv"
+        grep -q '^fdatasync[[:space:]]3[[:space:]]1[[:space:]]0.010000$' "$prefix.syscalls.tsv"
+    done
+done
 [ "$(wc -l < "$MOCK_BUILD_LOG" | tr -d ' ')" -eq 2 ]
 [ "$(wc -l < "$MOCK_PROFILE_LOG" | tr -d ' ')" -eq 4 ]
 awk -F '\t' '{block=int((NR-1)/2)%4; expected=(block==0 || block==3)?"base":"candidate"; if($1!=expected || $2!="network") exit 1} END {if(NR!=40) exit 1}' "$MOCK_RUN_LOG"
@@ -208,4 +256,29 @@ for kind in block mutex; do
     run_case "sql-$kind-pprof-failure" 37
     [ "$(cat "$scratch/sql-$kind-pprof-failure/profiles/base-sql-execute-c4.exit")" -eq 37 ]
 done
+unset MOCK_CONTENTION_PPROF_FAIL
+MOCK_STRACE_FAIL=1; export MOCK_STRACE_FAIL
+run_case sql-ptrace-denied 41
+grep -q 'ptrace denied' "$scratch/sql-ptrace-denied/profiles/base-sql-execute-c4-sync.stderr.log"
+[ "$(cat "$scratch/sql-ptrace-denied/profiles/base-sql-execute-c4-sync.exit")" -eq 41 ]
+unset MOCK_STRACE_FAIL
+MOCK_EMPTY_SYNC=1; export MOCK_EMPTY_SYNC
+run_case sql-empty-sync 1
+unset MOCK_EMPTY_SYNC
+MOCK_SYNC_N=999; export MOCK_SYNC_N
+run_case sql-wrong-sync-n 1
+unset MOCK_SYNC_N
+for kind in c4 rows1; do
+    MOCK_WRONG_SYNC_METRIC=$kind; export MOCK_WRONG_SYNC_METRIC
+    run_case "sql-wrong-metric-$kind" 1
+done
+unset MOCK_WRONG_SYNC_METRIC
+mkdir "$scratch/no-strace"
+ln -s "$scratch/bin/git" "$scratch/no-strace/git"
+ln -s "$REAL_MKDIR" "$scratch/no-strace/mkdir"
+MOCK_RUN_PATH="$scratch/no-strace"; export MOCK_RUN_PATH
+run_case sql-missing-strace 1
+[ ! -s "$MOCK_BUILD_LOG" ]
+grep -q 'requires strace' "$scratch/sql-missing-strace.log"
+unset MOCK_RUN_PATH
 echo 'PASS interleaved stderr isolation, all ten paired samples/six packages, original failure and bounded diagnostics'

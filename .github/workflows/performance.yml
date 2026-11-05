@@ -128,6 +128,15 @@ jobs:
       - name: Check benchmark runner contract without compilation
         run: sh benchmarks/run-ci-benchmarks_test.sh
 
+      - name: Ensure SQL sync diagnostic tracer
+        if: inputs.network_optimization == 'sql'
+        run: |
+          if ! command -v strace >/dev/null 2>&1; then
+            sudo apt-get update
+            sudo apt-get install --no-install-recommends -y strace
+          fi
+          strace --version
+
       - name: Run interleaved base and candidate benchmarks
         run: |
           benchmarks/run-ci-benchmarks.sh \
