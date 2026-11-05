@@ -5,6 +5,10 @@ package managedsql
 import (
 	"context"
 	"errors"
+	"io"
+	"net"
+	"net/http"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -20,6 +24,13 @@ func TestManagedGraphInitialRootCloseCancelsBackgroundWait(t *testing.T) {
 	for _, operation := range []string{"execute", "query"} {
 		t.Run(operation, func(t *testing.T) {
 			configs, fixture := sqlClusterForProtocol(t, sqlpolicy.ManagedGraphRequestAppendOnlyApplicationProtocol)
+			var closing atomic.Bool
+			ownedPrefix := "/bucket/" + fixture.source.finalPrefix + "/"
+			fixture.source.putReadFailure = func(r *http.Request, err error) {
+				if !initialRootExpectedCanceledPUT(ownedPrefix, r.URL.Path, err, errors.Is(r.Context().Err(), context.Canceled), closing.Load()) {
+					t.Errorf("unexpected PUT body failure path=%s: %v", r.URL.Path, err)
+				}
+			}
 			rootRelease := make(chan struct{})
 			var releaseOnce sync.Once
 			releaseRoot := func() { releaseOnce.Do(func() { close(rootRelease) }) }
@@ -68,6 +79,7 @@ func TestManagedGraphInitialRootCloseCancelsBackgroundWait(t *testing.T) {
 				t.Fatal("root gate not reached", ctx.Err())
 			}
 			closed := make(chan error, 1)
+			closing.Store(true)
 			go func() { closed <- hosts[0].Close() }()
 			select {
 			case err := <-closed:
@@ -91,6 +103,53 @@ func TestManagedGraphInitialRootCloseCancelsBackgroundWait(t *testing.T) {
 			// The wire gate is still closed here. Release only during cleanup,
 			// after proving that Node lifetime cancellation drained the operation.
 		})
+	}
+}
+
+func initialRootExpectedCanceledPUT(prefix, requestPath string, err error, canceled, closing bool) bool {
+	return closing && canceled && errors.Is(err, io.ErrUnexpectedEOF) && strings.HasPrefix(requestPath, prefix) && len(requestPath) > len(prefix)
+}
+
+func TestManagedGraphInitialRootPUTReadFailureScope(t *testing.T) {
+	for _, tc := range []struct {
+		name, path        string
+		err               error
+		canceled, closing bool
+		want              bool
+	}{
+		{"owned-close-canceled", "/bucket/owned/archive/head.bin", io.ErrUnexpectedEOF, true, true, true},
+		{"before-close", "/bucket/owned/archive/head.bin", io.ErrUnexpectedEOF, true, false, false},
+		{"live-request", "/bucket/owned/archive/head.bin", io.ErrUnexpectedEOF, false, true, false},
+		{"different-namespace", "/bucket/other/archive/head.bin", io.ErrUnexpectedEOF, true, true, false},
+		{"prefix-only", "/bucket/owned/", io.ErrUnexpectedEOF, true, true, false},
+		{"other-io-failure", "/bucket/owned/archive/head.bin", io.ErrClosedPipe, true, true, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := initialRootExpectedCanceledPUT("/bucket/owned/", tc.path, tc.err, tc.canceled, tc.closing); got != tc.want {
+				t.Fatalf("unexpected cancellation classification: got=%v want=%v", got, tc.want)
+			}
+		})
+	}
+	observed := make(chan bool, 1)
+	server, control := sqlWireStore(t)
+	control.putReadFailure = func(r *http.Request, err error) {
+		observed <- errors.Is(err, io.ErrUnexpectedEOF) && !initialRootExpectedCanceledPUT("/bucket/owned/", r.URL.Path, err, errors.Is(r.Context().Err(), context.Canceled), false)
+	}
+	conn, err := net.DialTimeout("tcp", strings.TrimPrefix(server.URL, "http://"), 5*time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, writeErr := io.WriteString(conn, "PUT /bucket/owned/archive/head.bin HTTP/1.1\r\nHost: fixture\r\nContent-Length: 10\r\n\r\nx")
+	if err := errors.Join(writeErr, conn.Close()); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case rejected := <-observed:
+		if !rejected {
+			t.Fatal("actual pre-Close truncated PUT was not rejected")
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("actual truncated PUT did not reach body-read observer")
 	}
 }
 
