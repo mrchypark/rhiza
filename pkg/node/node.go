@@ -1088,15 +1088,17 @@ func (n *Node) openInternal(ctx context.Context, enroll bool, prelocked *qlog.Lo
 	n.peer = peer
 
 	certifiedCheckpoint := generationCheckpoint
+	var managedSelectedSeal *quepaxa.SealedCheckpoint
 	restoreCheckpoint := certifiedCheckpoint
 	if n.checkpoints != nil {
 		if deferredManagedGraph {
 			certifiedCheckpoint = managedGraphSelectedCheckpoint
 		} else if managedPeerProfile != nil {
-			certifiedCheckpoint, _, err = n.selectManagedAppendOnlyRoot(startupRecovery.Context())
+			certifiedCheckpoint, managedSelectedSeal, err = n.selectManagedAppendOnlyRoot(startupRecovery.Context())
 			if err != nil {
 				return err
 			}
+			localtesthooks.Hit("node:startup:managed-checkpoint-selected")
 		} else {
 			seal, sealed, sealErr := core.LatestCheckpointSeal()
 			if sealErr != nil {
@@ -1363,13 +1365,15 @@ func (n *Node) openInternal(ctx context.Context, enroll bool, prelocked *qlog.Lo
 				}
 			}
 		} else if managedPeerProfile != nil {
-			seal, exists, err := core.LatestManagedCheckpointSeal()
-			if err != nil || !exists || uint64(seal.Index) != certifiedCheckpoint.Index || seal.RootHash != certifiedCheckpoint.RootHash {
-				return errors.Join(fmt.Errorf("managed request startup certified root differs from exact QCKP"), err)
+			// Keep the verified selection paired with its restored root: peer
+			// recovery may have learned a later authentic QCKP since selection.
+			seal := managedSelectedSeal
+			if seal == nil || uint64(seal.Index) != certifiedCheckpoint.Index || seal.RootHash != certifiedCheckpoint.RootHash {
+				return fmt.Errorf("managed request startup certified root differs from exact QCKP")
 			}
 			if !preparedLearner {
 				openStage = "runtime_post_checkpoint_promote"
-				if err := n.promoteManagedAppendOnlySeal(ctx, seal); err != nil {
+				if err := n.promoteManagedAppendOnlySeal(ctx, *seal); err != nil {
 					return fmt.Errorf("promote managed append-only checkpoint: %w", err)
 				}
 			}

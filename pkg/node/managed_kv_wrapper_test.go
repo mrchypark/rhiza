@@ -50,7 +50,7 @@ func kvWrapperDurable(ctx context.Context, n *Node, slot quepaxa.Slot) error {
 	return n.archive.SyncThrough(ctx, n.core, slot)
 }
 
-func newKVWrapperFixture(t *testing.T) (*Node, *kvWrapperChecker, *managedGraphAdmissionRaceFixture) {
+func newKVWrapperFixture(t *testing.T, sharedStore ...localobj.Config) (*Node, *kvWrapperChecker, *managedGraphAdmissionRaceFixture) {
 	t.Helper()
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
@@ -60,8 +60,16 @@ func newKVWrapperFixture(t *testing.T) (*Node, *kvWrapperChecker, *managedGraphA
 	if err != nil {
 		t.Fatal(err)
 	}
-	storeDir := t.TempDir()
-	bucket, err := localobj.NewBucketForNamespace(ctx, localobj.Config{Provider: localobj.ProviderFilesystem, FilesystemDir: storeDir}, ns.FinalPrefix)
+	storeConfig := localobj.Config{Provider: localobj.ProviderFilesystem, FilesystemDir: t.TempDir()}
+	if len(sharedStore) > 1 {
+		t.Fatal("fixture accepts at most one object-store configuration")
+	}
+	if len(sharedStore) == 1 {
+		storeConfig = sharedStore[0]
+	}
+	// Shared-store startup fixtures include a real, separately identified learner.
+	enableReconfiguration := len(sharedStore) == 1
+	bucket, err := localobj.NewBucketForNamespace(ctx, storeConfig, ns.FinalPrefix)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -82,7 +90,11 @@ func newKVWrapperFixture(t *testing.T) (*Node, *kvWrapperChecker, *managedGraphA
 	c := &kvWrapperChecker{}
 	var owned *Node
 	for _, member := range cluster.Members {
-		cfg := &types.ExecutionConfig{NodeID: member.ID, ClusterID: clusterID, Members: cluster.Members, DataDir: t.TempDir(), ObjStoreProvider: "filesystem", ObjStoreDir: storeDir, ObjStorePrefix: ns.ConfigPrefix, ObjStoreDurability: types.ObjectStoreDurabilityBeforeAck}
+		cfg := &types.ExecutionConfig{NodeID: member.ID, ClusterID: clusterID, Members: cluster.Members, DataDir: t.TempDir(), ObjStoreProvider: string(storeConfig.Provider), ObjStoreDir: storeConfig.FilesystemDir, ObjStoreEndpoint: storeConfig.Endpoint, ObjStoreBucket: storeConfig.Bucket, ObjStoreRegion: storeConfig.Region, ObjStoreInsecure: storeConfig.Insecure, ObjStoreAccessKey: storeConfig.AccessKey, ObjStoreSecretKey: storeConfig.SecretKey, ObjStorePrefix: ns.ConfigPrefix, ObjStoreDurability: types.ObjectStoreDurabilityBeforeAck}
+		cfg.EnableReconfiguration = enableReconfiguration
+		if enableReconfiguration {
+			cfg.AdminToken = "selected-admin"
+		}
 		n := New(cfg)
 		physical, memberDigest, err := n.PreparedStartupBindingDigestsForProtocol(protocol)
 		if err != nil {
@@ -150,7 +162,7 @@ func newKVWrapperFixture(t *testing.T) (*Node, *kvWrapperChecker, *managedGraphA
 		n.bucket, n.checkpoints, n.archive, n.wal = bucket, manager, archive, wal
 		var walIdentity [32]byte
 		copy(walIdentity[:], nonce)
-		core, err := quepaxa.New(quepaxa.Config{NodeID: member.ID, Cluster: cluster, WAL: wal, Transport: transport, ValidateValue: types.ValidateManagedKVExecutionPolicy, ManagedAppendOnly: &quepaxa.ManagedAppendOnlyConfig{Binding: quepaxa.ManagedAppendOnlyBinding{ApplicationProtocol: protocol, BootstrapPlanDigest: common, MemberConfigDigest: memberDigest, WALIdentity: walIdentity}, Verify: n.verifyManagedAppendOnlyCandidate}})
+		core, err := quepaxa.New(quepaxa.Config{NodeID: member.ID, Cluster: cluster, WAL: wal, Transport: transport, EnableReconfiguration: enableReconfiguration, ValidateValue: types.ValidateManagedKVExecutionPolicy, ManagedAppendOnly: &quepaxa.ManagedAppendOnlyConfig{Binding: quepaxa.ManagedAppendOnlyBinding{ApplicationProtocol: protocol, BootstrapPlanDigest: common, MemberConfigDigest: memberDigest, WALIdentity: walIdentity}, Verify: n.verifyManagedAppendOnlyCandidate}})
 		if err != nil {
 			t.Fatal(err)
 		}

@@ -377,13 +377,15 @@ func TestManagedApplicationControlPruningAndRestore(t *testing.T) {
 	}
 	m.mu.Lock()
 	err = m.closeConnections()
-	m.mu.Unlock()
 	if err != nil {
+		m.mu.Unlock()
 		t.Fatal(err)
 	}
 	if err := m.reopen(); err != nil {
+		m.mu.Unlock()
 		t.Fatal(err)
 	}
+	m.mu.Unlock()
 	managedKVApply(t, m, types.KVCommand{RequestID: "next", Operation: "delete", Key: "absent"})
 	if err := m.writer.QueryRow(`SELECT COUNT(*) FROM _rhiza_idempotency`).Scan(&retained); err != nil || retained != 1 {
 		t.Fatalf("application prune %d %v", retained, err)
