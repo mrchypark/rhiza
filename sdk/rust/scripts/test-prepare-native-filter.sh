@@ -7,7 +7,6 @@ scratch=$(mktemp -d "${TMPDIR:-/tmp}/rhiza-native-filter.XXXXXX")
 cleanup() { rm -rf "$scratch"; }
 trap cleanup EXIT HUP INT TERM
 
-cache_dir=$(go env GOMODCACHE)
 filter_block="$scratch/filter-block.sh"
 awk '
     /^# BEGIN native-vendor compiler-unread input filter$/ { active=1; next }
@@ -33,6 +32,38 @@ run_vendor_root_check() (
     vendor_dir_from_go_list "$@"
 )
 
+# macOS TMPDIR can name /var while physical paths name /private/var.
+physical_workspace="$scratch/physical-workspace"
+alias_workspace="$scratch/alias-workspace"
+mkdir -p "$physical_workspace/vendor/example.com/kept" "$physical_workspace/vendor/example.com/unreachable" "$scratch/neighbor/vendor/example.com/kept"
+ln -s "$physical_workspace" "$alias_workspace"
+physical_vendor=$(CDPATH= cd -P -- "$physical_workspace/vendor" && pwd -P)
+alias_vendor="$alias_workspace/vendor"
+printf 'example.com/kept\t%s\n' "$alias_vendor/example.com/kept" > "$scratch/alias-metadata.tsv"
+reported_alias=$(run_vendor_root_check "$physical_vendor" "$scratch/alias-metadata.tsv")
+[ "$reported_alias" = "$alias_vendor" ] || { echo 'FAIL equivalent vendor alias lost metadata spelling' >&2; exit 1; }
+printf 'example.com/kept\t%s\n' "$physical_vendor/example.com/kept" > "$scratch/physical-metadata.tsv"
+[ "$(run_vendor_root_check "$alias_vendor" "$scratch/physical-metadata.tsv")" = "$physical_vendor" ] || { echo 'FAIL physical metadata with equivalent expected alias was refused' >&2; exit 1; }
+if run_vendor_root_check "$scratch/neighbor/vendor" "$scratch/alias-metadata.tsv" >/dev/null 2>&1; then
+    echo 'FAIL different physical vendor root was accepted' >&2
+    exit 1
+fi
+printf 'malformed metadata\n' > "$scratch/alias-malformed.tsv"
+if run_vendor_root_check "$physical_vendor" "$scratch/alias-malformed.tsv" >/dev/null 2>&1; then
+    echo 'FAIL malformed alias metadata was accepted' >&2
+    exit 1
+fi
+printf 'package kept\n' > "$alias_vendor/example.com/kept/kept.go"
+printf 'package unreachable\n' > "$alias_vendor/example.com/unreachable/unreachable.go"
+printf '%s\n' "$alias_vendor/example.com/kept" > "$scratch/alias-reachable"
+run_go_source_filter "$reported_alias" "$scratch/alias-reachable"
+[ -f "$alias_vendor/example.com/kept/kept.go" ] && [ ! -e "$alias_vendor/example.com/unreachable/unreachable.go" ] || { echo 'FAIL alias source filtering changed package selection' >&2; exit 1; }
+if [ "${1-}" = --vendor-root-only ]; then
+    echo 'PASS vendor root aliases, wrong-root refusal, and source filtering'
+    exit 0
+fi
+
+cache_dir=$(go env GOMODCACHE)
 run_filter() (
     native_dir=$1
     . "$filter_block"

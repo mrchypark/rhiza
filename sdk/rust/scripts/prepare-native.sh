@@ -276,11 +276,13 @@ vendor_dir_from_go_list() {
         }
         END { if (NR == 0 || bad || root == "") exit 1; print root }
     ' "$package_list") || { echo 'FAIL unable to derive vendor root from go list metadata' >&2; return 1; }
-    [ "$actual_vendor_dir" = "$expected_vendor_dir_arg" ] || {
+    actual_vendor_physical=$(CDPATH= cd -P -- "$actual_vendor_dir" && pwd -P) || { echo 'FAIL go list vendor directory is missing' >&2; return 1; }
+    expected_vendor_physical=$(CDPATH= cd -P -- "$expected_vendor_dir_arg" && pwd -P) || { echo 'FAIL generated vendor directory is missing' >&2; return 1; }
+    [ "$actual_vendor_physical" = "$expected_vendor_physical" ] || {
         echo 'FAIL go list vendor root differs from the generated native/vendor directory' >&2
         return 1
     }
-    [ -d "$actual_vendor_dir" ] || { echo 'FAIL go list vendor directory is missing' >&2; return 1; }
+    # Keep go list's spelling for the later reachable-package prefix checks.
     printf '%s\n' "$actual_vendor_dir"
 }
 filter_unreachable_vendor_go() {

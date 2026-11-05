@@ -17,6 +17,7 @@ import (
 	"os"
 	"path"
 	"path/filepath"
+	"reflect"
 	"slices"
 	"strings"
 	"sync"
@@ -304,6 +305,53 @@ func TestEmbeddedObjectStorageManagedPreparedCheckpointAdoption(t *testing.T) {
 	if readonly.writes != 0 {
 		t.Fatalf("provider recovery reader attempted %d source writes", readonly.writes)
 	}
+	// Shutdown may publish an already-certified CONTROL after the captured H.
+	// Retain H for adoption, and independently verify every permitted later cut.
+	settled, err := recovery.OpenReadOnlyViewForApplicationProtocol(ctx, fixedCurrent, finalPrefix, 1, bootstrap, sqlpolicy.ManagedRequestMaterializationPolicy, types.DefaultIdempotencyWindowSlots, sqlpolicy.ManagedRequestAppendOnlyApplicationProtocol, true)
+	if err != nil {
+		t.Fatal("verify source archive after all voters stopped", err)
+	}
+	settledSeal, settledDecision, ok := settled.RecoveryBase()
+	if !ok || !reflect.DeepEqual(settledSeal, seal) || !reflect.DeepEqual(settledDecision, decision) {
+		t.Fatal("source shutdown changed the captured checkpoint/membership proof")
+	}
+	allowedTips := map[uint64]bool{uint64(view.Tip()): true}
+	prefix, through := seal.PrefixHash, seal.Index
+	if through == view.Tip() && prefix != view.PrefixHash() {
+		t.Fatal("captured H base prefix mismatch")
+	}
+	for _, d := range settled.Decisions() {
+		if d.Slot <= seal.Index {
+			continue
+		}
+		if d.Slot != through+1 || len(d.Certificate) == 0 || sha256.Sum256(d.Value) != d.Hash {
+			t.Fatalf("invalid settled certified decision slot=%d previous=%d", d.Slot, through)
+		}
+		prefix = quepaxa.AdvancePrefixHash(prefix, d.Slot, d.Hash)
+		through = d.Slot
+		if through == view.Tip() && prefix != view.PrefixHash() {
+			t.Fatal("source shutdown changed captured H prefix/originals")
+		}
+		if through > view.Tip() {
+			kind, err := providerControlKind(d.Value)
+			if err != nil {
+				t.Fatalf("post-H source decision slot=%d is not permitted CONTROL: %v", d.Slot, err)
+			}
+			allowedTips[uint64(through)] = true
+			t.Logf("verified post-H source CONTROL slot=%d kind=%s captured_tip=%d", through, kind, view.Tip())
+		}
+	}
+	if through != settled.Tip() || through < view.Tip() || prefix != settled.PrefixHash() {
+		t.Fatal("settled source archive does not cover exact captured H and final prefix")
+	}
+	evidence, err := managedProviderInitialEvidence(t, ctx, view)
+	if err != nil {
+		t.Fatal("reconstruct exact captured application/receipt evidence", err)
+	}
+	var expectedEvidence struct{ Digest string }
+	if err := json.Unmarshal(evidence, &expectedEvidence); err != nil || expectedEvidence.Digest == "" {
+		t.Fatal("decode captured application evidence", err)
+	}
 
 	prepared, plan, runtime, store, ref := managedProviderPreparedIdentity(t, ctx, learner, members, memberPods, learnerPod, storageRoot, assignmentID, view)
 	origin := managedProviderRepairOrigin(t, ctx, store, ref, plan, runtime, learnerPod, storageRoot, sourceState.WALIdentity, view)
@@ -322,7 +370,7 @@ func TestEmbeddedObjectStorageManagedPreparedCheckpointAdoption(t *testing.T) {
 	if err := first.Close(); err != nil {
 		t.Fatal(err)
 	}
-	providerAssertSQLRows(t, ctx, learner.DataDir, uint64(view.Tip()))
+	providerAssertSQLRows(t, ctx, learner.DataDir, allowedTips, expectedEvidence.Digest)
 	managedConfig.Prepared = nil
 	second, err := managedsql.Open(ctx, managedConfig)
 	if second != nil {
@@ -338,7 +386,7 @@ func TestEmbeddedObjectStorageManagedPreparedCheckpointAdoption(t *testing.T) {
 	if err := second.Close(); err != nil {
 		t.Fatal(err)
 	}
-	providerAssertSQLRows(t, ctx, learner.DataDir, uint64(view.Tip()))
+	providerAssertSQLRows(t, ctx, learner.DataDir, allowedTips, expectedEvidence.Digest)
 
 	mutatedPath := filepath.Join(learner.DataDir, "sqlite.db")
 	mutateDB, err := sql.Open("sqlite3", (&url.URL{Scheme: "file", Path: filepath.ToSlash(mutatedPath)}).String())
@@ -402,7 +450,7 @@ func TestEmbeddedObjectStorageManagedPreparedCheckpointAdoption(t *testing.T) {
 	if err := last.Close(); err != nil {
 		t.Fatal(err)
 	}
-	providerAssertSQLRows(t, ctx, learner.DataDir, uint64(view.Tip()))
+	providerAssertSQLRows(t, ctx, learner.DataDir, allowedTips, expectedEvidence.Digest)
 	t.Logf("provider=%s SDK exercised; authority used an HTTP fixture, not Kubernetes", provider)
 }
 
@@ -518,12 +566,57 @@ func managedProviderSeedSource(t *testing.T, ctx context.Context, cfg rhiza.Conf
 	}
 }
 
-func providerAssertSQLRows(t *testing.T, ctx context.Context, dataDir string, expectedTip uint64) {
+func providerControlKind(value []byte) (string, error) {
+	barrier, e1 := types.DecodeReadBarrier(value)
+	_, seal, e2 := types.DecodeCheckpointSeal(value)
+	_, schedule, e3 := types.DecodeLeaderSchedule(value)
+	if err := errors.Join(e1, e2, e3); err != nil {
+		return "", err
+	}
+	switch {
+	case barrier:
+		return "read_barrier", nil
+	case seal:
+		return "checkpoint_seal", nil
+	case schedule:
+		return "leader_schedule", nil
+	default:
+		return "", fmt.Errorf("application, membership, or unknown value")
+	}
+}
+
+func TestManagedProviderControlSuffixClassification(t *testing.T) {
+	if kind, err := providerControlKind(types.EncodeReadBarrier([types.ReadBarrierNonceSize]byte{1})); err != nil || kind != "read_barrier" {
+		t.Fatal("actual CONTROL encoding rejected", kind, err)
+	}
+	schedule, err := types.EncodeLeaderSchedule([]types.NodeID{"source"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if kind, err := providerControlKind(schedule); err != nil || kind != "leader_schedule" {
+		t.Fatal("actual schedule encoding rejected", kind, err)
+	}
+	application, err := types.EncodeSQLBatch([]types.SQLCommand{{RequestID: "unexpected", SQL: "INSERT INTO managed_prepared_rows VALUES (9)"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	invalidSeal, err := quepaxa.EncodeCheckpointSeal(quepaxa.CheckpointSeal{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, value := range [][]byte{application, nil, []byte("unknown"), invalidSeal} {
+		if _, err := providerControlKind(value); err == nil {
+			t.Fatal("application or unknown suffix accepted as CONTROL")
+		}
+	}
+}
+
+func providerAssertSQLRows(t *testing.T, ctx context.Context, dataDir string, allowedTips map[uint64]bool, expectedDigest string) {
 	t.Helper()
 	dbPath := filepath.Join(dataDir, "sqlite.db")
 	state, tip, err := materializer.InspectManagedAppendOnlyRequestFile(ctx, dbPath, types.DefaultIdempotencyWindowSlots)
-	if err != nil || tip != expectedTip || state.FreshEmpty {
-		t.Fatalf("restored SQLite evidence state=%+v tip=%d want=%d err=%v", state, tip, expectedTip, err)
+	if err != nil || !allowedTips[tip] || state.FreshEmpty || fmt.Sprintf("%x", state.Digest) != expectedDigest {
+		t.Fatalf("restored SQLite evidence differs from captured application/receipts or certified CONTROL cuts: tip=%d allowed=%v err=%v", tip, allowedTips, err)
 	}
 	tmp, err := os.MkdirTemp(t.TempDir(), "actual-sql-read-")
 	if err != nil {

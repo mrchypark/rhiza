@@ -5,6 +5,7 @@ package managedsql
 import (
 	"bytes"
 	"context"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"io"
@@ -34,7 +35,12 @@ func TestReplaceVoterCoordinatesActualPreparedLearner(t *testing.T) {
 	runReplaceVoterCoordinatesActualPreparedLearner(t, nil)
 }
 
-func runReplaceVoterCoordinatesActualPreparedLearner(t *testing.T, beforeRetainedRestart func(context.Context, *Host, Config, *Host) func(*Host)) {
+func TestReplaceVoterFreshInvocationCompletesActualAddThenRemove(t *testing.T) {
+	runReplaceVoterCoordinatesActualPreparedLearner(t, nil, true)
+}
+
+func runReplaceVoterCoordinatesActualPreparedLearner(t *testing.T, beforeRetainedRestart func(context.Context, *Host, Config, *Host) func(*Host), freshInvocation ...bool) {
+	freshCall := len(freshInvocation) == 1 && freshInvocation[0]
 	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Second)
 	defer cancel()
 	const protocol = sqlpolicy.ManagedRequestAppendOnlyApplicationProtocol
@@ -121,10 +127,25 @@ func runReplaceVoterCoordinatesActualPreparedLearner(t *testing.T, beforeRetaine
 	plan.Replacement.PeerURL = "quic://" + peerAddr
 	originalTransport := writer.Kube.Client.Transport
 	var rejectAddRecord atomic.Bool
-	rejectAddRecord.Store(true)
+	rejectAddRecord.Store(!freshCall)
 	var rejectFinish atomic.Bool
-	rejectFinish.Store(true)
+	rejectFinish.Store(!freshCall)
+	freshAddProofEntered := make(chan struct{}, 1)
+	freshRemoveReady := make(chan struct{})
+	type coordinatorStartupKey struct{}
+	var listenerGateArmed atomic.Bool
+	listenerVerified := make(chan struct{})
+	var releaseListenerOnce sync.Once
+	releaseListener := func() { releaseListenerOnce.Do(func() { close(listenerVerified) }) }
+	t.Cleanup(releaseListener)
 	writer.Kube.Client.Transport = repairGateTransport(func(request *http.Request) (*http.Response, error) {
+		if request.Method == http.MethodGet && request.Context().Value(coordinatorStartupKey{}) == true && listenerGateArmed.Load() {
+			select {
+			case <-listenerVerified:
+			case <-request.Context().Done():
+				return nil, request.Context().Err()
+			}
+		}
 		if request.Method == http.MethodPut && request.Body != nil {
 			body, err := io.ReadAll(request.Body)
 			if err != nil {
@@ -137,6 +158,17 @@ func runReplaceVoterCoordinatesActualPreparedLearner(t *testing.T, beforeRetaine
 				}
 			}
 			if json.Unmarshal(body, &update) == nil {
+				if freshCall && update.Status.Repair.State == "Closed" && update.Status.Repair.AddCompletion != nil {
+					select {
+					case freshAddProofEntered <- struct{}{}:
+					default:
+					}
+					select {
+					case <-freshRemoveReady:
+					case <-ctx.Done():
+						return nil, ctx.Err()
+					}
+				}
 				if update.Status.Repair.State == "Closed" && update.Status.Repair.AddCompletion != nil && rejectAddRecord.CompareAndSwap(true, false) {
 					return nil, errors.New("injected ADD proof CAS failure after committed terminal")
 				}
@@ -274,7 +306,8 @@ func runReplaceVoterCoordinatesActualPreparedLearner(t *testing.T, beforeRetaine
 	}
 
 	coordination := make(chan error, 1)
-	go func() { coordination <- hosts[0].ReplaceVoter(ctx, plan) }()
+	coordinatorCtx := context.WithValue(ctx, coordinatorStartupKey{}, true)
+	go func() { coordination <- hosts[0].ReplaceVoter(coordinatorCtx, plan) }()
 	var handoff operator.V1Alpha2RepairHandoff
 	deadline := time.NewTimer(10 * time.Second)
 	defer deadline.Stop()
@@ -294,6 +327,7 @@ func runReplaceVoterCoordinatesActualPreparedLearner(t *testing.T, beforeRetaine
 		case <-time.After(20 * time.Millisecond):
 		}
 	}
+	listenerGateArmed.Store(true)
 	originAdmission, err := operator.LoadV1Alpha2Admission(ctx, writer, configs[0].Ref)
 	if err != nil {
 		t.Fatal(err)
@@ -369,6 +403,9 @@ func runReplaceVoterCoordinatesActualPreparedLearner(t *testing.T, beforeRetaine
 		t.Fatalf("prepared handoff mismatch failed at an unexpected boundary: %v", err)
 	}
 	readyBlocked, readyObserved, releaseReady, readyHooked := holdReplacementBeforeReady(t, ctx, learnerCfg.Runtime.NodeID)
+	if freshCall {
+		releaseReady()
+	}
 	learner, err := seed.open(ctx, learnerCfg)
 	if learner != nil {
 		t.Cleanup(func() {
@@ -383,103 +420,161 @@ func runReplaceVoterCoordinatesActualPreparedLearner(t *testing.T, beforeRetaine
 	if err != nil {
 		t.Fatalf("open actual prepared learner: %v", err)
 	}
-	select {
-	case err := <-coordination:
-		if err == nil || rejectAddRecord.Load() {
-			t.Fatalf("expected injected ADD proof CAS failure after the real terminal: %v", err)
-		}
-	case <-ctx.Done():
-		t.Fatalf("replacement coordinator timed out: %v", ctx.Err())
+	// Registration is published before the QUIC listener is opened. Keep only
+	// the coordinator's pre-ADD authority GET behind this startup handshake;
+	// main-thread origin/adoption GETs remain live and require no ADD to finish.
+	registration, err := hosts[0].node.ManagedRepairSnapshot(ctx, plan.Replacement.NodeID, plan.Replacement.PublicKey)
+	if err != nil || registration.LearnerWALIdentity == "" || uint64(registration.Current.ConfigID) != plan.ExpectedConfigID {
+		t.Fatal("learner listener handshake lost exact pre-ADD registration", err)
 	}
-	closedAfterADD, err := operator.LoadV1Alpha2Admission(ctx, writer, configs[0].Ref)
+	learnerMember := *learnerCfg.Runtime.Learner
+	learnerMember.WALIdentity = registration.LearnerWALIdentity
+	prefixBytes, err := hex.DecodeString(handoff.PreparedHash)
+	if err != nil || len(prefixBytes) != len(quepaxa.ValueHash{}) {
+		t.Fatal("invalid actual prepared prefix encoding", err)
+	}
+	var preparedPrefix quepaxa.ValueHash
+	copy(preparedPrefix[:], prefixBytes)
+	listenerPeer, err := network.NewTransportForManagedProfile(configs[0].Runtime.ClusterID, configs[0].Runtime.NodeID, &registration.Current, configs[0].Runtime.PeerToken, network.ManagedPeerProfile{ApplicationProtocol: protocol, BootstrapPlanDigest: configs[0].Plan.BootstrapPlanDigest, Generation: configs[0].Plan.Generation})
 	if err != nil {
-		t.Fatal(err)
+		t.Fatal("create bound learner listener observer", err)
 	}
-	closedRecord, ok := closedAfterADD.Repair()
-	committed, snapshotErr := hosts[0].node.ManagedRepairSnapshot(ctx, "", quepaxa.PublicKey{})
-	if !ok || closedRecord.State != "Closed" || closedRecord.AddCompletion != nil || snapshotErr != nil || uint64(committed.Current.ConfigID) != plan.ExpectedConfigID+1 {
-		t.Fatalf("injected ADD proof CAS failure did not preserve the real unjournaled ADD terminal: state=%s config=%d err=%v", closedRecord.State, committed.Current.ConfigID, snapshotErr)
+	defer listenerPeer.Close()
+	if err := listenerPeer.VerifyLearner(ctx, learnerMember, quepaxa.Slot(handoff.PreparedSlot), preparedPrefix); err != nil {
+		t.Fatalf("learner listener handshake peer=%s endpoint=%s listener_open=true prefix_rpc_ok=false: %v", learnerMember.ID, learnerMember.PeerURL, err)
 	}
-	if readyHooked {
+	releaseListener()
+	if freshCall {
 		select {
-		case <-readyBlocked:
+		case <-freshAddProofEntered:
 		case <-ctx.Done():
-			t.Fatal("fresh D did not reach actual pre-ready hook", ctx.Err())
+			t.Fatal("fresh ADD proof CAS was not reached", ctx.Err())
 		}
-		if learner.node.Ready() {
-			t.Fatal("held fresh D became ready")
-		}
-		if err := hosts[0].ReplaceVoter(ctx, plan); !errors.Is(err, quepaxa.ErrQuorumUnavailable) {
-			t.Fatalf("excluded-old fresh quorum must fail while D is held not ready: %v", err)
-		}
-		stillClosed, err := operator.LoadV1Alpha2Admission(ctx, writer, configs[0].Ref)
-		if err != nil {
-			t.Fatal(err)
-		}
-		stillRecord, exists := stillClosed.Repair()
-		stillConfig, configErr := hosts[0].node.ManagedRepairSnapshot(ctx, "", quepaxa.PublicKey{})
-		if !exists || stillRecord.State != "Closed" || !reflect.DeepEqual(stillRecord.Plan, plan) || !reflect.DeepEqual(stillRecord.PreparedHandoff, closedRecord.PreparedHandoff) || stillRecord.AddCompletion == nil || stillRecord.AddCompletion.PlanDigest != plan.Digest() || stillRecord.AddCompletion.ConfigID != plan.ExpectedConfigID+1 || configErr != nil || uint64(stillConfig.Current.ConfigID) != plan.ExpectedConfigID+1 || !rejectFinish.Load() {
-			t.Fatalf("not-ready resume changed Closed/ADD proof/config2 or attempted REMOVE: record=%+v config=%d err=%v", stillRecord, stillConfig.Current.ConfigID, configErr)
-		}
-	}
-	releaseReady()
-	if readyHooked {
 		select {
 		case <-readyObserved:
 		case <-ctx.Done():
-			t.Fatal("fresh D did not publish actual raw-ready observation after release", ctx.Err())
+			t.Fatal("fresh D did not publish actual raw-ready observation", ctx.Err())
 		}
-	}
-	// Public Node.Ready also requires application admission, which remains
-	// closed by this unfinished repair. The peer server instead uses the raw
-	// catch-up readiness callback. Probe that actual authenticated ReadIndex
-	// endpoint at the committed ADD configuration; ReplaceVoter below still
-	// performs its own excluded-old quorum check before REMOVE.
-	readinessPeer, err := network.NewTransportForManagedProfile(configs[0].Runtime.ClusterID, configs[0].Runtime.NodeID, &committed.Current, configs[0].Runtime.PeerToken, network.ManagedPeerProfile{ApplicationProtocol: protocol, BootstrapPlanDigest: configs[0].Plan.BootstrapPlanDigest, Generation: configs[0].Plan.Generation})
-	if err != nil {
-		t.Fatal("create bound D readiness observer", err)
-	}
-	defer readinessPeer.Close()
-	var readinessErr error
-	for {
-		var tip quepaxa.Slot
-		tip, readinessErr = readinessPeer.ReadTip(ctx, plan.Replacement.NodeID)
-		if readinessErr == nil {
-			if uint64(tip) < handoff.PreparedSlot {
-				t.Fatalf("ready D ReadIndex regressed below its verified H: tip=%d H=%d", tip, handoff.PreparedSlot)
+		committed, err := hosts[0].node.ManagedRepairSnapshot(ctx, "", quepaxa.PublicKey{})
+		if err != nil || uint64(committed.Current.ConfigID) != plan.ExpectedConfigID+1 {
+			t.Fatal("fresh ADD did not establish exact C+1 before readiness proof", err)
+		}
+		readinessPeer, err := network.NewTransportForManagedProfile(configs[0].Runtime.ClusterID, configs[0].Runtime.NodeID, &committed.Current, configs[0].Runtime.PeerToken, network.ManagedPeerProfile{ApplicationProtocol: protocol, BootstrapPlanDigest: configs[0].Plan.BootstrapPlanDigest, Generation: configs[0].Plan.Generation})
+		if err != nil {
+			t.Fatal("create fresh D readiness observer", err)
+		}
+		defer readinessPeer.Close()
+		if tip, err := readinessPeer.ReadTip(ctx, plan.Replacement.NodeID); err != nil || uint64(tip) < handoff.PreparedSlot {
+			t.Fatal("fresh D actual config-2 ReadIndex readiness was not established", err)
+		}
+		close(freshRemoveReady)
+		select {
+		case err := <-coordination:
+			if err != nil {
+				t.Fatalf("fresh single ReplaceVoter invocation did not complete actual ADD then REMOVE: %v", err)
 			}
-			break
+		case <-ctx.Done():
+			t.Fatal("fresh replacement coordinator did not finish", ctx.Err())
+		}
+	} else {
+		select {
+		case err := <-coordination:
+			if err == nil || rejectAddRecord.Load() {
+				t.Fatalf("expected injected ADD proof CAS failure after the real terminal: %v", err)
+			}
+		case <-ctx.Done():
+			t.Fatalf("replacement coordinator timed out: %v", ctx.Err())
+		}
+		closedAfterADD, err := operator.LoadV1Alpha2Admission(ctx, writer, configs[0].Ref)
+		if err != nil {
+			t.Fatal(err)
+		}
+		closedRecord, ok := closedAfterADD.Repair()
+		committed, snapshotErr := hosts[0].node.ManagedRepairSnapshot(ctx, "", quepaxa.PublicKey{})
+		if !ok || closedRecord.State != "Closed" || closedRecord.AddCompletion != nil || snapshotErr != nil || uint64(committed.Current.ConfigID) != plan.ExpectedConfigID+1 {
+			t.Fatalf("injected ADD proof CAS failure did not preserve the real unjournaled ADD terminal: state=%s config=%d err=%v", closedRecord.State, committed.Current.ConfigID, snapshotErr)
 		}
 		if readyHooked {
-			t.Fatalf("D raw-ready was observed but actual config-2 ReadIndex failed: %v", readinessErr)
+			select {
+			case <-readyBlocked:
+			case <-ctx.Done():
+				t.Fatal("fresh D did not reach actual pre-ready hook", ctx.Err())
+			}
+			if learner.node.Ready() {
+				t.Fatal("held fresh D became ready")
+			}
+			if err := hosts[0].ReplaceVoter(ctx, plan); !errors.Is(err, quepaxa.ErrQuorumUnavailable) {
+				t.Fatalf("excluded-old fresh quorum must fail while D is held not ready: %v", err)
+			}
+			stillClosed, err := operator.LoadV1Alpha2Admission(ctx, writer, configs[0].Ref)
+			if err != nil {
+				t.Fatal(err)
+			}
+			stillRecord, exists := stillClosed.Repair()
+			stillConfig, configErr := hosts[0].node.ManagedRepairSnapshot(ctx, "", quepaxa.PublicKey{})
+			if !exists || stillRecord.State != "Closed" || !reflect.DeepEqual(stillRecord.Plan, plan) || !reflect.DeepEqual(stillRecord.PreparedHandoff, closedRecord.PreparedHandoff) || stillRecord.AddCompletion == nil || stillRecord.AddCompletion.PlanDigest != plan.Digest() || stillRecord.AddCompletion.ConfigID != plan.ExpectedConfigID+1 || configErr != nil || uint64(stillConfig.Current.ConfigID) != plan.ExpectedConfigID+1 || !rejectFinish.Load() {
+				t.Fatalf("not-ready resume changed Closed/ADD proof/config2 or attempted REMOVE: record=%+v config=%d err=%v", stillRecord, stillConfig.Current.ConfigID, configErr)
+			}
 		}
-		select {
-		case <-ctx.Done():
-			t.Fatalf("fresh D never reached actual ReadIndex readiness: context=%v peer_error=%v", ctx.Err(), readinessErr)
-		case <-tick.C:
+		releaseReady()
+		if readyHooked {
+			select {
+			case <-readyObserved:
+			case <-ctx.Done():
+				t.Fatal("fresh D did not publish actual raw-ready observation after release", ctx.Err())
+			}
 		}
-	}
-	if err := hosts[0].ReplaceVoter(ctx, plan); err == nil || rejectFinish.Load() {
-		t.Fatalf("expected injected final completion failure after resume from actual ADD terminal: %v", err)
-	}
-	closedAfterADD, err = operator.LoadV1Alpha2Admission(ctx, writer, configs[0].Ref)
-	if err != nil {
-		t.Fatal(err)
-	}
-	closedRecord, ok = closedAfterADD.Repair()
-	committed, snapshotErr = hosts[0].node.ManagedRepairSnapshot(ctx, "", quepaxa.PublicKey{})
-	if !ok || closedRecord.State != "Closed" || closedRecord.AddCompletion == nil || closedRecord.AddCompletion.ConfigID != plan.ExpectedConfigID+1 || snapshotErr != nil || uint64(committed.Current.ConfigID) != plan.ExpectedConfigID+2 {
-		t.Fatalf("injection did not preserve Closed after actual ADD: state=%s config=%d err=%v", closedRecord.State, committed.Current.ConfigID, snapshotErr)
-	}
-	if err := hosts[0].ReplaceVoter(ctx, plan); err != nil {
-		t.Fatalf("resume exact committed ADD without repeating REMOVE: %v", err)
+		// Public Node.Ready also requires application admission, which remains
+		// closed by this unfinished repair. The peer server instead uses the raw
+		// catch-up readiness callback. Probe that actual authenticated ReadIndex
+		// endpoint at the committed ADD configuration; ReplaceVoter below still
+		// performs its own excluded-old quorum check before REMOVE.
+		readinessPeer, err := network.NewTransportForManagedProfile(configs[0].Runtime.ClusterID, configs[0].Runtime.NodeID, &committed.Current, configs[0].Runtime.PeerToken, network.ManagedPeerProfile{ApplicationProtocol: protocol, BootstrapPlanDigest: configs[0].Plan.BootstrapPlanDigest, Generation: configs[0].Plan.Generation})
+		if err != nil {
+			t.Fatal("create bound D readiness observer", err)
+		}
+		defer readinessPeer.Close()
+		var readinessErr error
+		for {
+			var tip quepaxa.Slot
+			tip, readinessErr = readinessPeer.ReadTip(ctx, plan.Replacement.NodeID)
+			if readinessErr == nil {
+				if uint64(tip) < handoff.PreparedSlot {
+					t.Fatalf("ready D ReadIndex regressed below its verified H: tip=%d H=%d", tip, handoff.PreparedSlot)
+				}
+				break
+			}
+			if readyHooked {
+				t.Fatalf("D raw-ready was observed but actual config-2 ReadIndex failed: %v", readinessErr)
+			}
+			select {
+			case <-ctx.Done():
+				t.Fatalf("fresh D never reached actual ReadIndex readiness: context=%v peer_error=%v", ctx.Err(), readinessErr)
+			case <-tick.C:
+			}
+		}
+		if err := hosts[0].ReplaceVoter(ctx, plan); err == nil || rejectFinish.Load() {
+			t.Fatalf("expected injected final completion failure after resume from actual ADD terminal: %v", err)
+		}
+		closedAfterADD, err = operator.LoadV1Alpha2Admission(ctx, writer, configs[0].Ref)
+		if err != nil {
+			t.Fatal(err)
+		}
+		closedRecord, ok = closedAfterADD.Repair()
+		committed, snapshotErr = hosts[0].node.ManagedRepairSnapshot(ctx, "", quepaxa.PublicKey{})
+		if !ok || closedRecord.State != "Closed" || closedRecord.AddCompletion == nil || closedRecord.AddCompletion.ConfigID != plan.ExpectedConfigID+1 || snapshotErr != nil || uint64(committed.Current.ConfigID) != plan.ExpectedConfigID+2 {
+			t.Fatalf("injection did not preserve Closed after actual ADD: state=%s config=%d err=%v", closedRecord.State, committed.Current.ConfigID, snapshotErr)
+		}
+		if err := hosts[0].ReplaceVoter(ctx, plan); err != nil {
+			t.Fatalf("resume exact committed ADD without repeating REMOVE: %v", err)
+		}
 	}
 	after, err := operator.LoadV1Alpha2Admission(ctx, writer, configs[0].Ref)
 	if err != nil {
 		t.Fatal(err)
 	}
 	record, ok := after.Repair()
-	if !ok || record.State != "Completed" || record.Completion == nil {
+	if !ok || record.State != "Completed" || !reflect.DeepEqual(record.Plan, plan) || record.AddCompletion == nil || record.AddCompletion.ConfigID != plan.ExpectedConfigID+1 || record.Completion == nil || record.Completion.ConfigID != plan.ExpectedConfigID+2 || record.Completion.Slot <= record.AddCompletion.Slot {
 		t.Fatalf("actual repair not completed: %+v", record)
 	}
 	afterOriginal, found, err := hosts[0].node.RetainedRequest(ctx, "sql", "repair-pending")

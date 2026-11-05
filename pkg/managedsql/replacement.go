@@ -193,6 +193,13 @@ func (h *Host) replaceVoterAddFirst(ctx context.Context, a operator.V1Alpha2Admi
 	} else if !reflect.DeepEqual(*r.AddCompletion, addCompletion) {
 		return fmt.Errorf("retained ADD terminal differs from actual Core proof")
 	}
+	registration, err = h.node.ManagedRepairSnapshot(ctx, plan.Replacement.NodeID, plan.Replacement.PublicKey)
+	if err != nil {
+		return repairResumeFailure(repairResumeVerification, err)
+	}
+	if registration.LearnerWALIdentity != addRequest.Addition.WALIdentity {
+		return fmt.Errorf("replacement registration changed after verified ADD terminal")
+	}
 	if registration.Current.ConfigID == handoff.PreparedConfig.ConfigID+1 {
 		if err := h.RemoveRepairVoter(ctx, plan.OperationID); err != nil {
 			return repairResumeFailure(repairResumeMembership, fmt.Errorf("remove old voter after recorded ADD: %w", err))
