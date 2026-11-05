@@ -223,23 +223,6 @@ func (s *Server) ProposeCheckpointBarrier(ctx context.Context, value []byte) (qu
 	return retryCheckpointBarrier(ctx, value, s.ProposeControl)
 }
 
-// ProposeObservedCheckpointBarrier is the managed append-only admission
-// barrier path. It carries the Core's validated observation through proposal
-// admission and slot reservation.
-func (s *Server) ProposeObservedCheckpointBarrier(ctx context.Context, value []byte, observation quepaxa.ManagedAppendOnlyControlObservation) (quepaxa.Slot, error) {
-	if barrier, err := types.DecodeReadBarrier(value); err != nil || !barrier {
-		return 0, fmt.Errorf("read barrier control value is required")
-	}
-	if !observation.BelongsTo(s.core) || observation.ObservedSlot == 0 || observation.ObservedSlot != observation.CommittedTip+1 {
-		return 0, fmt.Errorf("managed control observation is unavailable")
-	}
-	copy := observation
-	copy.Proposals = append([]quepaxa.ManagedAppendOnlyControlProposal(nil), observation.Proposals...)
-	return retryCheckpointBarrier(ctx, value, func(ctx context.Context, value []byte) (quepaxa.Slot, error) {
-		return s.proposeWithAdmission(ctx, value, nil, 0, 0, nil, nil, &copy)
-	})
-}
-
 func retryCheckpointBarrier(ctx context.Context, value []byte, propose func(context.Context, []byte) (quepaxa.Slot, error)) (quepaxa.Slot, error) {
 	const maxAttempts = 50
 	const retryDelay = 20 * time.Millisecond
@@ -303,7 +286,6 @@ type proposalCall struct {
 	err         error
 	deadline    time.Time
 	hasDeadline bool
-	observation *quepaxa.ManagedAppendOnlyControlObservation
 	leases      []*mutationLease
 }
 
@@ -663,7 +645,7 @@ func (s *Server) propose(ctx context.Context, value []byte) (quepaxa.Slot, error
 }
 
 func (s *Server) proposeWithLease(ctx context.Context, value []byte, lease *mutationLease) (quepaxa.Slot, error) {
-	return s.proposeWithAdmission(ctx, value, lease, 0, 0, nil, nil, nil)
+	return s.proposeWithAdmission(ctx, value, lease, 0, 0, nil, nil)
 }
 
 // These finite bounds are an uncalibrated internal-batch candidate. Direct
@@ -680,11 +662,11 @@ func (s *Server) proposeInternalBatch(ctx context.Context, value []byte) (quepax
 // proposeBatch permits same-package tests to use shorter finite bounds.
 func (s *Server) proposeBatch(ctx context.Context, value []byte, admissionBudget, executionReserve time.Duration) (quepaxa.Slot, error) {
 	if !localtesthooks.Enabled {
-		return s.proposeWithAdmission(ctx, value, nil, admissionBudget, executionReserve, nil, nil, nil)
+		return s.proposeWithAdmission(ctx, value, nil, admissionBudget, executionReserve, nil, nil)
 	}
 	trace := localtesthooks.NewBatchAdmissionTrace()
 	result := &batchAdmissionResult{}
-	slot, err := s.proposeWithAdmission(ctx, value, nil, admissionBudget, executionReserve, &trace, result, nil)
+	slot, err := s.proposeWithAdmission(ctx, value, nil, admissionBudget, executionReserve, &trace, result)
 	reason := result.reason
 	if reason == "" {
 		switch {
@@ -720,7 +702,7 @@ func (s *Server) signalAdmissionLocked(invalidate bool) {
 	s.admissionChanged = make(chan struct{})
 }
 
-func (s *Server) proposeWithAdmission(ctx context.Context, value []byte, lease *mutationLease, admissionBudget, executionReserve time.Duration, trace *localtesthooks.BatchAdmissionTrace, result *batchAdmissionResult, observation *quepaxa.ManagedAppendOnlyControlObservation) (quepaxa.Slot, error) {
+func (s *Server) proposeWithAdmission(ctx context.Context, value []byte, lease *mutationLease, admissionBudget, executionReserve time.Duration, trace *localtesthooks.BatchAdmissionTrace, result *batchAdmissionResult) (quepaxa.Slot, error) {
 	if err := ctx.Err(); err != nil {
 		return 0, err
 	}
@@ -751,10 +733,6 @@ func (s *Server) proposeWithAdmission(ctx context.Context, value []byte, lease *
 			return 0, ErrNotReady
 		}
 		if call := s.inflight[hash]; call != nil {
-			if call.observation != observation {
-				s.proposeMu.Unlock()
-				return 0, ErrRequestConflict
-			}
 			if !s.retainProposalLease(call, lease) {
 				s.proposeMu.Unlock()
 				return 0, ErrInvalidRequest
@@ -849,7 +827,7 @@ func (s *Server) proposeWithAdmission(ctx context.Context, value []byte, lease *
 			s.proposeMu.Unlock()
 			return 0, proposalAdmissionOverload{}
 		}
-		call := &proposalCall{done: make(chan struct{}), observation: observation}
+		call := &proposalCall{done: make(chan struct{})}
 		if !s.retainProposalLease(call, lease) {
 			<-s.operationCap
 			<-s.localCap
@@ -942,7 +920,7 @@ func (s *Server) runProposal(hash [32]byte, call *proposalCall, value []byte) {
 	ctx, cancel := s.proposalWorkContext(call)
 	defer cancel()
 	var coreStarted, prewriteDenied bool
-	call.slot, call.err, coreStarted, prewriteDenied = s.runProposalAttempt(ctx, value, call.observation)
+	call.slot, call.err, coreStarted, prewriteDenied = s.runProposalAttempt(ctx, value)
 	if s.localMode && prewriteDenied {
 		s.releaseProposalAttempt()
 		s.proposeMu.Lock()
@@ -954,7 +932,7 @@ func (s *Server) runProposal(hash [32]byte, call *proposalCall, value []byte) {
 				if err := s.beginLocalRetry(ctx); err != nil {
 					call.err = err
 				} else {
-					call.slot, call.err, coreStarted, prewriteDenied = s.runProposalAttempt(ctx, value, call.observation)
+					call.slot, call.err, coreStarted, prewriteDenied = s.runProposalAttempt(ctx, value)
 					if coreStarted && call.err != nil && !prewriteDenied {
 						s.FailLocalLifecycle(call.err)
 					}
@@ -997,7 +975,7 @@ func (s *Server) proposalWorkContext(call *proposalCall) (context.Context, conte
 	return context.WithDeadline(s.proposalCtx, deadline)
 }
 
-func (s *Server) runProposalAttempt(ctx context.Context, value []byte, observation *quepaxa.ManagedAppendOnlyControlObservation) (quepaxa.Slot, error, bool, bool) {
+func (s *Server) runProposalAttempt(ctx context.Context, value []byte) (quepaxa.Slot, error, bool, bool) {
 	if s.localMode {
 		if err := s.validateExecutionPolicy(value); err != nil {
 			return 0, fmt.Errorf("%w: %v", ErrInvalidRequest, err), false, false
@@ -1006,7 +984,7 @@ func (s *Server) runProposalAttempt(ctx context.Context, value []byte, observati
 			return 0, fmt.Errorf("%w: %v", ErrInvalidRequest, err), false, false
 		}
 	}
-	slot, err := s.proposeOnceObserved(ctx, value, observation)
+	slot, err := s.proposeOnce(ctx, value)
 	if err != nil {
 		return slot, err, true, s.localMode && quepaxa.IsLocalAdmissionDenial(err)
 	}
@@ -1116,29 +1094,17 @@ func (s *Server) finishLocalLifecycle(err error) {
 	s.proposalWG.Done()
 }
 func (s *Server) proposeOnce(ctx context.Context, value []byte) (quepaxa.Slot, error) {
-	return s.proposeOnceObserved(ctx, value, nil)
-}
-
-func (s *Server) proposeOnceObserved(ctx context.Context, value []byte, observation *quepaxa.ManagedAppendOnlyControlObservation) (quepaxa.Slot, error) {
 	if err := s.validateExecutionPolicy(value); err != nil {
 		return 0, err
 	}
-	if observation == nil {
-		if slot, ok := s.core.DecidedSlot(value); ok {
-			if _, err := s.core.CompleteDecision(ctx, slot); err == nil {
-				return slot, nil
-			} else if !errors.Is(err, quepaxa.ErrCompacted) {
-				return slot, err
-			}
+	if slot, ok := s.core.DecidedSlot(value); ok {
+		if _, err := s.core.CompleteDecision(ctx, slot); err == nil {
+			return slot, nil
+		} else if !errors.Is(err, quepaxa.ErrCompacted) {
+			return slot, err
 		}
 	}
-	var slot quepaxa.Slot
-	var err error
-	if observation == nil {
-		slot, _, err = s.core.Propose(ctx, value)
-	} else {
-		slot, _, err = s.core.ProposeManagedObservedControl(ctx, value, *observation)
-	}
+	slot, _, err := s.core.Propose(ctx, value)
 	return slot, err
 }
 

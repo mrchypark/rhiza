@@ -433,8 +433,18 @@ docker run --rm --name rhiza -p 8080:8080 \
   rhiza:dev
 ```
 
-The [no-PVC recovery operator](deploy/operator/README.md) supports explicit,
-fenced full-generation recovery in both durability modes.
+The [managed HA operator](deploy/operator/README.md) uses a surviving QuePaxa
+quorum for certified replacement with a fresh voter identity. Normal HA does
+not require a separate fencer or external lease service. Without quorum,
+writes and linearizable reads fail; local reads remain available on ready
+nodes. Restore the original quorum or use a separately verified DR procedure.
+The approved DR design defaults automatic attempts to OFF. When explicitly
+enabled, sustained actual ReadIndex/quorum failure may trigger preparation,
+not activation. Activation requires proof that all old runtimes, voters and
+sidecars ended, recreation is blocked, in-flight storage work completed, all
+successful ACKs are covered by the source, and a new ready quorum is verified.
+Unknown or partitioned state stays Blocked for manual action. This automatic
+attempt policy is not yet implemented or qualified by the current operator.
 
 Kubernetes examples live under [`deploy/k8s`](deploy/k8s), including three-peer
 SQL and Graph qualification manifests and both read-replica modes.

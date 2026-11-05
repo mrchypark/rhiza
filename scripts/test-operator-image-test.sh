@@ -51,7 +51,7 @@ case "$1:$2" in
         ;;
     cp:*)
         case "$2" in
-            */rhiza-fencer) [ "$MOCK_CASE" != missing ] || exit 1 ;;
+            */rhiza-ha-init) [ "$MOCK_CASE" != missing ] || exit 1 ;;
         esac
         machine='\076'
         [ "$MOCK_ARCH" != arm64 ] || machine='\267'
@@ -103,7 +103,9 @@ for arch in amd64 arm64; do
         if [ "$scenario" = success ]; then
             [ "$status" -eq 0 ] || { cat "$run/output"; exit 1; }
             grep -q 'rhiza-operator --help' "$run/runtime.sh"
-            grep -q 'rhiza-fencer serve --help' "$run/runtime.sh"
+            if grep -q 'rhiza-fencer' "$run/runtime.sh" "$run/calls"; then
+                echo 'normal operator smoke still requires a fencer' >&2; exit 1
+            fi
             grep -q 'rhiza-ha-init prepare-identity' "$run/runtime.sh"
             grep -q -- '--network none --read-only' "$run/calls"
         else

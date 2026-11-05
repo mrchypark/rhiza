@@ -93,13 +93,12 @@ type Node struct {
 }
 
 type managedGraphControlOperation struct {
-	value       []byte
-	hash        quepaxa.ValueHash
-	binding     *internalApplicationBinding
-	observation *quepaxa.ManagedAppendOnlyControlObservation
-	done        chan struct{}
-	slot        quepaxa.Slot
-	err         error
+	value   []byte
+	hash    quepaxa.ValueHash
+	binding *internalApplicationBinding
+	done    chan struct{}
+	slot    quepaxa.Slot
+	err     error
 }
 
 // nodeRecoveryPhases records the selected certified checkpoint restore path.
@@ -265,7 +264,7 @@ func (n *Node) openInternal(ctx context.Context, enroll bool, prelocked *qlog.Lo
 	if n.config == nil || n.config.NodeID == "" {
 		return fmt.Errorf("node ID is required")
 	}
-	preparedLearner := n.managedStartup != nil && n.managedStartup.Prepared != nil && n.config.Learner != nil && isManagedAppendOnlyProtocol(n.managedStartup.Identity.ApplicationProtocol)
+	preparedLearner := n.managedStartup != nil && (n.managedStartup.Prepared != nil || n.managedStartup.verifiedAdoption != nil) && n.config.Learner != nil && isManagedAppendOnlyProtocol(n.managedStartup.Identity.ApplicationProtocol)
 	preparedResume := preparedLearner && n.managedStartup.verifiedAdoption != nil
 	if n.opened.Load() {
 		return fmt.Errorf("node is already open")
@@ -2430,7 +2429,7 @@ func (n *Node) catchUpPreparedArchiveSuffix(ctx context.Context, adoptedThrough 
 }
 
 func (n *Node) startCatchUp(ctx context.Context, transport *network.Transport, cluster *quepaxa.Cluster) {
-	if n.managedStartup != nil && n.managedStartup.Prepared != nil && n.config.Learner != nil && isManagedAppendOnlyProtocol(n.managedStartup.Identity.ApplicationProtocol) {
+	if n.managedStartup != nil && (n.managedStartup.Prepared != nil || n.managedStartup.verifiedAdoption != nil) && n.config.Learner != nil && isManagedAppendOnlyProtocol(n.managedStartup.Identity.ApplicationProtocol) {
 		if n.managedStartup.promotionReady == nil {
 			return
 		}
@@ -2652,7 +2651,11 @@ func (n *Node) observeCatchUp(err error) {
 		log.Printf("quorum catch-up failed: %v", err)
 		return
 	}
+	if localtesthooks.Enabled {
+		localtesthooks.Hit("node:catchup:before-ready:node=" + string(n.config.NodeID))
+	}
 	n.ready.Store(true)
+	localtesthooks.Hit("node:catchup:after-ready:node=" + string(n.config.NodeID))
 }
 
 func hasUsablePeerSuffix(applied quepaxa.Slot, successes, quorum int, best *network.DecisionsResponse) bool {

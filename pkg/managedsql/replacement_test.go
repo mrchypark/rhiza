@@ -12,12 +12,15 @@ import (
 	"reflect"
 	"slices"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/mrchypark/rhiza/internal/objstore"
+	"github.com/mrchypark/rhiza/internal/sqlpolicy"
 	"github.com/mrchypark/rhiza/internal/types"
+	"github.com/mrchypark/rhiza/pkg/materializer"
 	"github.com/mrchypark/rhiza/pkg/network"
 	"github.com/mrchypark/rhiza/pkg/node"
 	"github.com/mrchypark/rhiza/pkg/operator"
@@ -28,7 +31,25 @@ import (
 func TestReplaceVoterCoordinatesActualPreparedLearner(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Second)
 	defer cancel()
-	configs, seed := sqlCluster(t)
+	const protocol = sqlpolicy.ManagedRequestAppendOnlyApplicationProtocol
+	configs, seed := sqlClusterForProtocol(t, protocol)
+	// Hold the real archive HEAD request after application execution so this
+	// profile's engine-side original becomes UNKNOWN without inventing a normal
+	// Kubernetes PendingWrite (request protocols do not use that reservation).
+	archiveEntered := make(chan string, 8)
+	archiveRelease := make(chan struct{})
+	var archiveArmed atomic.Bool
+	var archiveReleased atomic.Bool
+	seed.source.putReady = archiveEntered
+	seed.source.putRelease = archiveRelease
+	seed.source.putSuffix = "archive/head.bin"
+	seed.source.putEnabled = &archiveArmed
+	releaseArchive := func() {
+		archiveArmed.Store(false)
+		if archiveReleased.CompareAndSwap(false, true) {
+			close(archiveRelease)
+		}
+	}
 
 	fresh := &sqlStatusFixture{obj: make(map[string]json.RawMessage)}
 	for key, value := range seed.obj {
@@ -47,19 +68,20 @@ func TestReplaceVoterCoordinatesActualPreparedLearner(t *testing.T) {
 		configs[i].Store = store
 	}
 	bootstrapNode := node.New(&configs[0].Runtime)
-	source, _, err := bootstrapNode.PreparedStartupBindingDigests()
+	source, _, err := bootstrapNode.PreparedStartupBindingDigestsForProtocol(protocol)
 	if err != nil {
 		t.Fatal(err)
 	}
-	digest, err := bootstrapNode.ManagedBootstrapPlanDigest(source, EvidenceFormat)
+	digest, err := bootstrapNode.ManagedBootstrapPlanDigestForProtocol(source, protocol, protocol)
 	if err != nil {
 		t.Fatal(err)
 	}
-	initPlan, err := operator.NewV1Alpha2ApplicationInitPlan(configs[0].Ref, "logical", "deployment", "assignment", source, digest, EvidenceFormat)
+	initPlan, err := operator.NewV1Alpha2ApplicationInitPlan(configs[0].Ref, "logical", "deployment", "assignment", source, digest, protocol)
 	if err != nil {
 		t.Fatal(err)
 	}
-	bootstrap := operator.V1Alpha2BootstrapPlan{ClusterID: configs[0].Runtime.ClusterID, PhysicalBinding: source, EvidenceFormat: EvidenceFormat, Durability: types.ObjectStoreDurabilityBeforeAck, Reconfiguration: true}
+	initPlan.ApplicationProtocol = protocol
+	bootstrap := operator.V1Alpha2BootstrapPlan{ClusterID: configs[0].Runtime.ClusterID, PhysicalBinding: source, EvidenceFormat: protocol, Durability: types.ObjectStoreDurabilityBeforeAck, Reconfiguration: true}
 	for i, member := range configs[0].Runtime.Members {
 		bootstrap.Members = append(bootstrap.Members, operator.V1Alpha2BootstrapMember{PodUID: configs[i].PodUID, Member: member})
 	}
@@ -85,9 +107,12 @@ func TestReplaceVoterCoordinatesActualPreparedLearner(t *testing.T) {
 	}
 	configs[0].Plan = initPlan
 	writer, plan := hostRepairWriter(t, configs, hosts)
+	plan.Sequence = replacementSequenceForProtocol(protocol)
 	peerAddr := seed.reservePeer(t, plan.Replacement.NodeID)
 	plan.Replacement.PeerURL = "quic://" + peerAddr
 	originalTransport := writer.Kube.Client.Transport
+	var rejectAddRecord atomic.Bool
+	rejectAddRecord.Store(true)
 	var rejectFinish atomic.Bool
 	rejectFinish.Store(true)
 	writer.Kube.Client.Transport = repairGateTransport(func(request *http.Request) (*http.Response, error) {
@@ -98,10 +123,17 @@ func TestReplaceVoterCoordinatesActualPreparedLearner(t *testing.T) {
 			}
 			request.Body = io.NopCloser(bytes.NewReader(body))
 			var update struct {
-				Status struct{ Repair operator.V1Alpha2RepairRecord }
+				Status struct {
+					Repair operator.V1Alpha2RepairRecord
+				}
 			}
-			if json.Unmarshal(body, &update) == nil && update.Status.Repair.State == "Completed" && rejectFinish.CompareAndSwap(true, false) {
-				return nil, errors.New("injected Finish failure after committed ADD")
+			if json.Unmarshal(body, &update) == nil {
+				if update.Status.Repair.State == "Closed" && update.Status.Repair.AddCompletion != nil && rejectAddRecord.CompareAndSwap(true, false) {
+					return nil, errors.New("injected ADD proof CAS failure after committed terminal")
+				}
+				if update.Status.Repair.State == "Completed" && rejectFinish.CompareAndSwap(true, false) {
+					return nil, errors.New("injected Finish failure after committed ADD and REMOVE")
+				}
 			}
 		}
 		response, err := originalTransport.RoundTrip(request)
@@ -133,28 +165,71 @@ func TestReplaceVoterCoordinatesActualPreparedLearner(t *testing.T) {
 		readySQL(t, h)
 	}
 
-	// Keep an unresolved original SQL reservation across the control-only repair.
+	// Preserve an actual request-profile original across the control-only repair.
 	if _, err := hosts[0].Execute(ctx, ExecuteRequest{RequestID: "repair-schema", SQL: "CREATE TABLE app(value TEXT)"}); err != nil {
 		t.Fatal(err)
 	}
-	fresh.mu.Lock()
-	fresh.failFinalize = true
-	fresh.mu.Unlock()
-	if _, err := hosts[0].Execute(ctx, ExecuteRequest{RequestID: "repair-pending", SQL: "INSERT INTO app VALUES ('retained')"}); err == nil {
-		t.Fatal("fixture did not retain an uncertain SQL request")
+	requestCtx, cancelRequest := context.WithCancel(ctx)
+	var requestWG sync.WaitGroup
+	t.Cleanup(func() {
+		releaseArchive()
+		cancelRequest()
+		requestWG.Wait()
+	})
+	type execution struct {
+		response ExecuteResponse
+		err      error
 	}
-	fresh.mu.Lock()
-	fresh.failFinalize = false
-	fresh.mu.Unlock()
-	before, err := operator.LoadV1Alpha2Admission(ctx, writer, configs[0].Ref)
-	if err != nil {
-		t.Fatal(err)
+	executed := make(chan execution, 1)
+	archiveArmed.Store(true)
+	requestWG.Add(1)
+	go func() {
+		defer requestWG.Done()
+		response, err := hosts[0].Execute(requestCtx, ExecuteRequest{RequestID: "repair-pending", SQL: "INSERT INTO app VALUES ('retained')"})
+		executed <- execution{response: response, err: err}
+	}()
+	select {
+	case <-archiveEntered:
+	case result := <-executed:
+		t.Fatalf("request completed before real archive gate: %+v %v", result.response, result.err)
+	case <-ctx.Done():
+		t.Fatal("real archive gate was not reached", ctx.Err())
 	}
-	pending, hasPending := before.Pending()
-	pendingSQL, hasSQL, err := before.PendingSQL()
-	if err != nil || !hasPending || !hasSQL {
-		t.Fatalf("fixture pending request: %v", err)
+	var original materializer.RequestOriginal
+	tick := time.NewTicker(10 * time.Millisecond)
+	defer tick.Stop()
+	for {
+		status, statusErr := hosts[0].node.RequestStatusManaged(ctx, network.RequestStatusRequest{Kind: "sql", RequestID: "repair-pending"})
+		if statusErr == nil && status.Receipt != nil && status.State == string(types.MutationCommitted) {
+			var found bool
+			original, found, statusErr = hosts[0].node.RetainedRequest(ctx, "sql", "repair-pending")
+			if statusErr == nil && found && original.SQL != nil && original.Receipt == *status.Receipt {
+				break
+			}
+		}
+		select {
+		case result := <-executed:
+			t.Fatalf("request completed before actual committed original: %+v %v", result.response, result.err)
+		case <-ctx.Done():
+			t.Fatalf("actual committed original not observed: %v", ctx.Err())
+		case <-tick.C:
+		}
 	}
+	if original.SQL.RequestID != "repair-pending" || original.SQL.SQL != "INSERT INTO app VALUES ('retained')" {
+		t.Fatalf("unexpected retained SQL original: %+v", original)
+	}
+	cancelRequest()
+	var unknownResult execution
+	select {
+	case unknownResult = <-executed:
+	case <-ctx.Done():
+		t.Fatal("canceled SQL caller did not drain", ctx.Err())
+	}
+	var unknown *network.CommitUnknownError
+	if !errors.As(unknownResult.err, &unknown) || !errors.Is(unknownResult.err, context.Canceled) || !errors.Is(unknownResult.err, network.ErrCommitUnknown) || unknown.RequestID != "repair-pending" || errors.Is(unknownResult.err, ErrSQLNotSubmitted) {
+		t.Fatalf("real post-commit SQL cancellation did not preserve UNKNOWN: response=%+v err=%v", unknownResult.response, unknownResult.err)
+	}
+	releaseArchive()
 	beforeRestart, err := hosts[0].node.ManagedState()
 	if err != nil {
 		t.Fatal(err)
@@ -174,12 +249,16 @@ func TestReplaceVoterCoordinatesActualPreparedLearner(t *testing.T) {
 		t.Fatalf("cold survivor with original pending SQL: %v", err)
 	}
 	hosts[0] = cold
+	if err := cold.Ready(ctx); err != nil {
+		t.Fatalf("cold request-profile survivor did not pass initial admission: %v", err)
+	}
 	afterRestart, err := cold.node.ManagedState()
 	if err != nil || afterRestart.WALIdentity != beforeRestart.WALIdentity {
 		t.Fatalf("cold restart changed voter WAL identity: %v", err)
 	}
-	if err := cold.Ready(ctx); err == nil {
-		t.Fatal("cold pending survivor admitted new SQL before recovery")
+	afterRestartOriginal, found, err := cold.node.RetainedRequest(ctx, "sql", "repair-pending")
+	if err != nil || !found || afterRestartOriginal.Slot != original.Slot || afterRestartOriginal.Fingerprint != original.Fingerprint || afterRestartOriginal.Receipt != original.Receipt || !bytes.Equal(afterRestartOriginal.ExecutionItem, original.ExecutionItem) {
+		t.Fatalf("cold restart changed or lost the exact uncertain SQL original: found=%t err=%v", found, err)
 	}
 
 	coordination := make(chan error, 1)
@@ -230,7 +309,7 @@ func TestReplaceVoterCoordinatesActualPreparedLearner(t *testing.T) {
 	learnerCfg.Runtime.DataDir = filepath.Join(t.TempDir(), "verified")
 	learnerCfg.RepairOrigin = repairOrigin
 	learnerNode := node.New(&learnerCfg.Runtime)
-	physical, configDigest, err := learnerNode.PreparedStartupBindingDigests()
+	physical, configDigest, err := learnerNode.PreparedStartupBindingDigestsForProtocol(protocol)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -245,21 +324,25 @@ func TestReplaceVoterCoordinatesActualPreparedLearner(t *testing.T) {
 		}
 	})
 	trustedBootstrap := quepaxa.Cluster{ConfigID: 1, Members: learnerCfg.Runtime.Members}
-	view, err := recovery.OpenReadOnlyViewAtHead(ctx, bucket, handoff.SourcePrefix, 1, trustedBootstrap, handoff.Head)
+	policy, window, err := types.ManagedApplicationPolicy(protocol)
+	if err != nil {
+		t.Fatal(err)
+	}
+	view, err := recovery.OpenReadOnlyViewAtHeadForApplicationProtocol(ctx, bucket, handoff.SourcePrefix, 1, trustedBootstrap, handoff.Head, policy, window, protocol, true)
 	if err != nil {
 		t.Fatal(err)
 	}
 	handoffDir := filepath.Join(t.TempDir(), "handoff")
-	if err := recovery.PublishPreparedStartup(ctx, view, handoffDir, identity); err != nil {
+	if err := recovery.PublishPreparedStartupForPolicy(ctx, view, handoffDir, identity, policy, window); err != nil {
 		t.Fatal(err)
 	}
-	learnerCfg.Prepared, err = recovery.LoadPreparedStartup(ctx, bucket, handoff.SourcePrefix, 1, trustedBootstrap, handoffDir, learnerCfg.Runtime.DataDir, identity)
+	learnerCfg.Prepared, err = recovery.LoadPreparedStartupForApplicationProtocol(ctx, bucket, handoff.SourcePrefix, 1, trustedBootstrap, handoffDir, learnerCfg.Runtime.DataDir, identity, policy, window, protocol, true)
 	if err != nil {
 		t.Fatal(err)
 	}
 	badHandoffOrigin := originRepair
 	badHandoff := *originRepair.PreparedHandoff
-	badHandoff.RemoveTerminalSlot++
+	badHandoff.PreparedHash = strings.Repeat("0", 64)
 	badHandoffOrigin.PreparedHandoff = &badHandoff
 	badHandoffBytes, err := json.Marshal(managedRepairOriginFile{Version: 1, Repair: badHandoffOrigin, Binding: originBinding})
 	if err != nil {
@@ -269,10 +352,11 @@ func TestReplaceVoterCoordinatesActualPreparedLearner(t *testing.T) {
 	badHandoffCfg.RepairOrigin = badHandoffBytes
 	if badLearner, err := seed.open(ctx, badHandoffCfg); err == nil {
 		_ = badLearner.Close()
-		t.Fatal("prepared adoption accepted an origin whose REMOVE terminal differed from the full live handoff")
-	} else if !strings.Contains(err.Error(), "prepared learner no longer matches the closed repair intent") {
+		t.Fatal("prepared adoption accepted an origin whose prepared prefix differed from the live source")
+	} else if !strings.Contains(err.Error(), "ADD-first prepared source differs from immutable repair origin") {
 		t.Fatalf("prepared handoff mismatch failed at an unexpected boundary: %v", err)
 	}
+	readyBlocked, readyObserved, releaseReady, readyHooked := holdReplacementBeforeReady(t, ctx, learnerCfg.Runtime.NodeID)
 	learner, err := seed.open(ctx, learnerCfg)
 	if learner != nil {
 		t.Cleanup(func() {
@@ -281,13 +365,16 @@ func TestReplaceVoterCoordinatesActualPreparedLearner(t *testing.T) {
 			}
 		})
 	}
+	// Register after the learner Close cleanup so a failed assertion cannot
+	// leave its catch-up worker blocked while Close waits to join it.
+	t.Cleanup(releaseReady)
 	if err != nil {
 		t.Fatalf("open actual prepared learner: %v", err)
 	}
 	select {
 	case err := <-coordination:
-		if err == nil || rejectFinish.Load() {
-			t.Fatalf("expected injected post-ADD Finish failure: %v", err)
+		if err == nil || rejectAddRecord.Load() {
+			t.Fatalf("expected injected ADD proof CAS failure after the real terminal: %v", err)
 		}
 	case <-ctx.Done():
 		t.Fatalf("replacement coordinator timed out: %v", ctx.Err())
@@ -298,7 +385,78 @@ func TestReplaceVoterCoordinatesActualPreparedLearner(t *testing.T) {
 	}
 	closedRecord, ok := closedAfterADD.Repair()
 	committed, snapshotErr := hosts[0].node.ManagedRepairSnapshot(ctx, "", quepaxa.PublicKey{})
-	if !ok || closedRecord.State != "Closed" || snapshotErr != nil || uint64(committed.Current.ConfigID) != plan.ExpectedConfigID+2 {
+	if !ok || closedRecord.State != "Closed" || closedRecord.AddCompletion != nil || snapshotErr != nil || uint64(committed.Current.ConfigID) != plan.ExpectedConfigID+1 {
+		t.Fatalf("injected ADD proof CAS failure did not preserve the real unjournaled ADD terminal: state=%s config=%d err=%v", closedRecord.State, committed.Current.ConfigID, snapshotErr)
+	}
+	if readyHooked {
+		select {
+		case <-readyBlocked:
+		case <-ctx.Done():
+			t.Fatal("fresh D did not reach actual pre-ready hook", ctx.Err())
+		}
+		if learner.node.Ready() {
+			t.Fatal("held fresh D became ready")
+		}
+		if err := hosts[0].ReplaceVoter(ctx, plan); !errors.Is(err, quepaxa.ErrQuorumUnavailable) {
+			t.Fatalf("excluded-old fresh quorum must fail while D is held not ready: %v", err)
+		}
+		stillClosed, err := operator.LoadV1Alpha2Admission(ctx, writer, configs[0].Ref)
+		if err != nil {
+			t.Fatal(err)
+		}
+		stillRecord, exists := stillClosed.Repair()
+		stillConfig, configErr := hosts[0].node.ManagedRepairSnapshot(ctx, "", quepaxa.PublicKey{})
+		if !exists || stillRecord.State != "Closed" || !reflect.DeepEqual(stillRecord.Plan, plan) || !reflect.DeepEqual(stillRecord.PreparedHandoff, closedRecord.PreparedHandoff) || stillRecord.AddCompletion == nil || stillRecord.AddCompletion.PlanDigest != plan.Digest() || stillRecord.AddCompletion.ConfigID != plan.ExpectedConfigID+1 || configErr != nil || uint64(stillConfig.Current.ConfigID) != plan.ExpectedConfigID+1 || !rejectFinish.Load() {
+			t.Fatalf("not-ready resume changed Closed/ADD proof/config2 or attempted REMOVE: record=%+v config=%d err=%v", stillRecord, stillConfig.Current.ConfigID, configErr)
+		}
+	}
+	releaseReady()
+	if readyHooked {
+		select {
+		case <-readyObserved:
+		case <-ctx.Done():
+			t.Fatal("fresh D did not publish actual raw-ready observation after release", ctx.Err())
+		}
+	}
+	// Public Node.Ready also requires application admission, which remains
+	// closed by this unfinished repair. The peer server instead uses the raw
+	// catch-up readiness callback. Probe that actual authenticated ReadIndex
+	// endpoint at the committed ADD configuration; ReplaceVoter below still
+	// performs its own excluded-old quorum check before REMOVE.
+	readinessPeer, err := network.NewTransportForManagedProfile(configs[0].Runtime.ClusterID, configs[0].Runtime.NodeID, &committed.Current, configs[0].Runtime.PeerToken, network.ManagedPeerProfile{ApplicationProtocol: protocol, BootstrapPlanDigest: configs[0].Plan.BootstrapPlanDigest, Generation: configs[0].Plan.Generation})
+	if err != nil {
+		t.Fatal("create bound D readiness observer", err)
+	}
+	defer readinessPeer.Close()
+	var readinessErr error
+	for {
+		var tip quepaxa.Slot
+		tip, readinessErr = readinessPeer.ReadTip(ctx, plan.Replacement.NodeID)
+		if readinessErr == nil {
+			if uint64(tip) < handoff.PreparedSlot {
+				t.Fatalf("ready D ReadIndex regressed below its verified H: tip=%d H=%d", tip, handoff.PreparedSlot)
+			}
+			break
+		}
+		if readyHooked {
+			t.Fatalf("D raw-ready was observed but actual config-2 ReadIndex failed: %v", readinessErr)
+		}
+		select {
+		case <-ctx.Done():
+			t.Fatalf("fresh D never reached actual ReadIndex readiness: context=%v peer_error=%v", ctx.Err(), readinessErr)
+		case <-tick.C:
+		}
+	}
+	if err := hosts[0].ReplaceVoter(ctx, plan); err == nil || rejectFinish.Load() {
+		t.Fatalf("expected injected final completion failure after resume from actual ADD terminal: %v", err)
+	}
+	closedAfterADD, err = operator.LoadV1Alpha2Admission(ctx, writer, configs[0].Ref)
+	if err != nil {
+		t.Fatal(err)
+	}
+	closedRecord, ok = closedAfterADD.Repair()
+	committed, snapshotErr = hosts[0].node.ManagedRepairSnapshot(ctx, "", quepaxa.PublicKey{})
+	if !ok || closedRecord.State != "Closed" || closedRecord.AddCompletion == nil || closedRecord.AddCompletion.ConfigID != plan.ExpectedConfigID+1 || snapshotErr != nil || uint64(committed.Current.ConfigID) != plan.ExpectedConfigID+2 {
 		t.Fatalf("injection did not preserve Closed after actual ADD: state=%s config=%d err=%v", closedRecord.State, committed.Current.ConfigID, snapshotErr)
 	}
 	if err := hosts[0].ReplaceVoter(ctx, plan); err != nil {
@@ -312,10 +470,9 @@ func TestReplaceVoterCoordinatesActualPreparedLearner(t *testing.T) {
 	if !ok || record.State != "Completed" || record.Completion == nil {
 		t.Fatalf("actual repair not completed: %+v", record)
 	}
-	afterPending, hasPending := after.Pending()
-	afterSQL, hasSQL, err := after.PendingSQL()
-	if err != nil || !hasPending || !hasSQL || afterPending != pending || !reflect.DeepEqual(afterSQL, pendingSQL) {
-		t.Fatalf("replacement changed uncertain SQL: request=%+v sql=%+v err=%v", afterPending, afterSQL, err)
+	afterOriginal, found, err := hosts[0].node.RetainedRequest(ctx, "sql", "repair-pending")
+	if err != nil || !found || afterOriginal.Slot != original.Slot || afterOriginal.Fingerprint != original.Fingerprint || afterOriginal.Receipt != original.Receipt || !bytes.Equal(afterOriginal.ExecutionItem, original.ExecutionItem) {
+		t.Fatalf("replacement changed uncertain SQL original: found=%t err=%v", found, err)
 	}
 	snapshot, err := hosts[0].node.ManagedRepairSnapshot(ctx, "", quepaxa.PublicKey{})
 	if err != nil || uint64(snapshot.Current.ConfigID) != plan.ExpectedConfigID+2 {
@@ -333,18 +490,24 @@ func TestReplaceVoterCoordinatesActualPreparedLearner(t *testing.T) {
 	if _, err := seed.open(ctx, completedWithoutOrigin); err == nil || !strings.Contains(err.Error(), "prepared repair learner requires the exact current closed repair") {
 		t.Fatalf("completed D record accepted a fresh prepared adoption without its closed origin: %v", err)
 	}
-	if err := hosts[0].RecoverPending(ctx); err != nil {
-		t.Fatalf("resolve retained original request before restart write check: %v", err)
-	}
-	postRecovery, err := operator.LoadV1Alpha2Admission(ctx, writer, configs[0].Ref)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if _, pending := postRecovery.Pending(); pending {
-		t.Fatal("original pending request remained after exact recovery")
+	recovered, err := hosts[0].RecoverRequest(ctx, network.RequestStatusRequest{Kind: "sql", RequestID: "repair-pending"})
+	if err != nil || recovered.RequestID == nil || string(recovered.RequestID) != "repair-pending" || recovered.SQL == nil || recovered.SQL.Slot != original.Slot {
+		t.Fatalf("exact retained SQL original did not recover after repair: %+v err=%v", recovered, err)
 	}
 	historicalCfg := learnerCfg
 	historicalCfg.Prepared = nil
+	noAdoptionCfg := historicalCfg
+	noAdoptionCfg.Runtime = node.CloneManagedRuntimeConfig(learnerCfg.Runtime)
+	noAdoptionCfg.Runtime.DataDir = filepath.Join(t.TempDir(), "missing-adoption")
+	noAdoption, noAdoptionErr := seed.open(ctx, noAdoptionCfg)
+	if noAdoption != nil {
+		if closeErr := noAdoption.Close(); closeErr != nil {
+			t.Error(closeErr)
+		}
+	}
+	if noAdoptionErr == nil || !strings.Contains(noAdoptionErr.Error(), "prepared adoption is missing or invalid") {
+		t.Fatalf("ADD-first restart without persisted H adoption was not rejected by Node preflight: %v", noAdoptionErr)
+	}
 	historical, err := seed.open(ctx, historicalCfg)
 	if historical != nil {
 		t.Cleanup(func() {
@@ -453,11 +616,19 @@ func TestReplaceVoterCoordinatesActualPreparedLearner(t *testing.T) {
 	if err != nil || secondDRestart.LocalWALIdentity != dSnapshot.LocalWALIdentity {
 		t.Fatalf("same-Pod D restart under E changed its durable WAL nonce: before=%q after=%q err=%v", dSnapshot.LocalWALIdentity, secondDRestart.LocalWALIdentity, err)
 	}
-	if err := historicalE.Ready(ctx); err != nil {
-		t.Fatalf("same-Pod D restart under E did not recover before readiness: %v", err)
+	if err := historicalE.Ready(ctx); err == nil || !strings.Contains(err.Error(), "initial admission has pending control or closed repair") {
+		t.Fatalf("same-Pod D restart under closed E repair was not held NotReady: %v", err)
 	}
-	if _, err := historicalE.Execute(ctx, ExecuteRequest{RequestID: "must-not-reserve-under-e", SQL: "INSERT INTO app VALUES ('blocked')"}); err == nil || !strings.Contains(err.Error(), "reservations closed") {
-		t.Fatalf("E closed gate did not reject fresh SQL: %v", err)
+	if historicalE.node.Ready() {
+		t.Fatal("same-Pod D restart became locally ready under the closed E repair")
+	}
+	if _, err := historicalE.Execute(ctx, ExecuteRequest{RequestID: "must-not-reserve-under-e", SQL: "INSERT INTO app VALUES ('blocked')"}); err == nil {
+		t.Fatal("same-Pod D restart submitted a fresh SQL request under the closed E repair")
+	} else {
+		var notSubmitted *SQLNotSubmittedError
+		if !errors.As(err, &notSubmitted) || notSubmitted.Stage != SQLStageAdmission || notSubmitted.RecoveryRequired || !strings.Contains(err.Error(), "closed repair") {
+			t.Fatalf("closed E repair did not refuse fresh SQL at initial admission: %v", err)
+		}
 	}
 	eAfter, err := operator.LoadV1Alpha2Admission(ctx, writer, configs[0].Ref)
 	if err != nil {
@@ -471,5 +642,50 @@ func TestReplaceVoterCoordinatesActualPreparedLearner(t *testing.T) {
 	}
 	if currentRepair, ok := eAfter.Repair(); !ok || currentRepair.State != "Closed" || !reflect.DeepEqual(currentRepair.Plan, ePlan) {
 		t.Fatalf("D restart changed live E repair: %+v", currentRepair)
+	}
+}
+
+func TestReplaceVoterAddFirstRejectsNonAppendOnlyBeforeRuntimeAccess(t *testing.T) {
+	for _, protocol := range []string{
+		"", // legacy protocol 7
+		types.ManagedApplicationProtocolSQLKV,
+		sqlpolicy.ManagedRequestApplicationProtocol,
+		sqlpolicy.ManagedGraphRequestApplicationProtocol,
+	} {
+		t.Run(protocol, func(t *testing.T) {
+			h := &Host{cfg: Config{Plan: operator.V1Alpha2ApplicationInitPlan{ApplicationProtocol: protocol}}}
+			plan := operator.V1Alpha2RepairPlan{Sequence: operator.V1Alpha2RepairAddThenRemove}
+			if err := h.ReplaceVoter(context.Background(), plan); err == nil || !strings.Contains(err.Error(), "managed append-only application protocol") {
+				t.Fatalf("ADD-first must fail before runtime/status access for protocol %q: %v", protocol, err)
+			}
+		})
+	}
+	for _, protocol := range []string{
+		sqlpolicy.ManagedRequestAppendOnlyApplicationProtocol,
+		sqlpolicy.ManagedGraphRequestAppendOnlyApplicationProtocol,
+	} {
+		if err := validateRepairSequenceProfile(operator.V1Alpha2RepairAddThenRemove, protocol); err != nil {
+			t.Fatalf("supported protocol %q rejected: %v", protocol, err)
+		}
+	}
+}
+
+func TestReplaceVoterAppendOnlyRejectsRemoveFirstBeforeRuntimeAccess(t *testing.T) {
+	for _, protocol := range []string{sqlpolicy.ManagedRequestAppendOnlyApplicationProtocol, sqlpolicy.ManagedGraphRequestAppendOnlyApplicationProtocol} {
+		for _, sequence := range []operator.V1Alpha2RepairSequence{"", operator.V1Alpha2RepairRemoveThenAdd} {
+			t.Run(protocol+"/"+string(sequence), func(t *testing.T) {
+				h := &Host{cfg: Config{Plan: operator.V1Alpha2ApplicationInitPlan{ApplicationProtocol: protocol}}}
+				if err := h.ReplaceVoter(context.Background(), operator.V1Alpha2RepairPlan{Sequence: sequence}); err == nil || !strings.Contains(err.Error(), "append-only replacement requires ADD-first") {
+					t.Fatalf("REMOVE-first must fail before runtime/status access: %v", err)
+				}
+			})
+		}
+	}
+	for _, protocol := range []string{"", types.ManagedApplicationProtocolSQLKV} {
+		for _, sequence := range []operator.V1Alpha2RepairSequence{"", operator.V1Alpha2RepairRemoveThenAdd} {
+			if err := validateRepairSequenceProfile(sequence, protocol); err == nil {
+				t.Fatalf("retired legacy replacement %q/%q accepted", protocol, sequence)
+			}
+		}
 	}
 }

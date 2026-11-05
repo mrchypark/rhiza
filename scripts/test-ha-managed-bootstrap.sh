@@ -2,7 +2,47 @@
 # Actual owned Kind bootstrap/recovery with two scoped Chaos Mesh kill actions.
 set -eu
 cd "$(CDPATH='' cd -- "$(dirname -- "$0")/.." && pwd)"
+managed_completed_repair_oracle_self_test() {
+  scratch=$(mktemp -d)
+  trap 'rm -f "$scratch"/repair.json "$scratch"/mismatch.json; rmdir "$scratch"' EXIT HUP INT TERM
+  jq -n '{status:{applicationInit:{plan:{applicationProtocol:"rhiza-managed-request-append-only/v1",evidenceFormat:"rhiza-managed-request-append-only/v1"}},repair:{state:"Completed",plan:{sequence:"addThenRemove",operationID:"op-2",expectedConfigID:3,expectedAbortSlot:7,oldNodeID:"old-2",replacement:{podUID:"pod-2",nodeID:"node-2"},finalVoterIDs:["node-2","voter-a","voter-b"]},preparedHandoff:{planDigest:("cd"*32),preparedConfig:{config_id:3,members:[{node_id:"old-2"},{node_id:"voter-a"},{node_id:"voter-b"}]},preparedSlot:8,preparedHash:("ef"*32)},addCompletion:{kind:"Terminal",operationID:"op-2",expectedConfigID:3,expectedAbortSlot:7,configID:4,slot:12,hash:("01"*32),planDigest:("cd"*32),finalVoterIDs:["node-2","old-2","voter-a","voter-b"]},completion:{kind:"Terminal",operationID:"op-2",expectedConfigID:3,expectedAbortSlot:7,configID:5,slot:17,hash:("ab"*32),planDigest:("cd"*32),finalVoterIDs:["node-2","voter-a","voter-b"]}}}}' > "$scratch/repair.json"
+  managed_completed_repair_oracle "$scratch/repair.json" old-2 old-2 op-1
+  jq '.status.applicationInit.plan.applicationProtocol="rhiza-managed-request-graph-append-only/v1" | .status.applicationInit.plan.evidenceFormat="rhiza-managed-request-graph-append-only/v1"' "$scratch/repair.json" > "$scratch/mismatch.json"
+  managed_completed_repair_oracle "$scratch/mismatch.json" old-2 old-2 op-1
+  if managed_completed_repair_oracle "$scratch/repair.json" old-2 old-1 op-1; then return 1; fi
+  if managed_completed_repair_oracle "$scratch/repair.json" old-2 old-2 op-2; then return 1; fi
+  jq '.status.repair.completion.finalVoterIDs=["old-2","voter-a","voter-b"]' "$scratch/repair.json" > "$scratch/mismatch.json"
+  if managed_completed_repair_oracle "$scratch/mismatch.json" old-2 old-2 op-1; then return 1; fi
+  for mutation in duplicate missing-proof wrong-config stale-slot retired-profile remove-first missing-add malformed-add malformed-add-object wrong-add-operation wrong-add-digest wrong-add-config add-before-source remove-before-add wrong-add-roster wrong-prepared-config missing-prepared; do
+    case "$mutation" in
+      duplicate) filter='.status.repair.plan.finalVoterIDs=["node-2","node-2","voter-a"] | .status.repair.completion.finalVoterIDs=.status.repair.plan.finalVoterIDs' ;;
+      missing-proof) filter='del(.status.repair.completion.hash)' ;;
+      wrong-config) filter='.status.repair.completion.configID=4' ;;
+      stale-slot) filter='.status.repair.completion.slot=7' ;;
+      retired-profile) filter='.status.applicationInit.plan.applicationProtocol="rhiza-managed-sql-kv/v1" | .status.applicationInit.plan.evidenceFormat="rhiza-managed-sql-kv/v1"' ;;
+      remove-first) filter='.status.repair.plan.sequence="removeThenAdd"' ;;
+      missing-add) filter='del(.status.repair.addCompletion)' ;;
+      malformed-add) filter='.status.repair.addCompletion.hash=null' ;;
+      malformed-add-object) filter='.status.repair.addCompletion="invalid"' ;;
+      wrong-add-operation) filter='.status.repair.addCompletion.operationID="other"' ;;
+      wrong-add-digest) filter='.status.repair.addCompletion.planDigest=("00"*32)' ;;
+      wrong-add-config) filter='.status.repair.addCompletion.configID=5' ;;
+      add-before-source) filter='.status.repair.addCompletion.slot=8' ;;
+      remove-before-add) filter='.status.repair.completion.slot=12' ;;
+      wrong-add-roster) filter='.status.repair.addCompletion.finalVoterIDs=["node-2","old-2","old-2","voter-a"]' ;;
+      wrong-prepared-config) filter='.status.repair.preparedHandoff.preparedConfig.config_id=4' ;;
+      missing-prepared) filter='del(.status.repair.preparedHandoff)' ;;
+    esac
+    jq "$filter" "$scratch/repair.json" > "$scratch/mismatch.json"
+    if managed_completed_repair_oracle "$scratch/mismatch.json" old-2 old-2 op-1; then return 1; fi
+  done
+  rm -f "$scratch/repair.json" "$scratch/mismatch.json"
+  rmdir "$scratch"
+  trap - EXIT HUP INT TERM
+}
 if [ "${1-}" = --oracle-self-test ]; then
+  . scripts/ha-managed-bootstrap-fixture.sh
+  managed_completed_repair_oracle_self_test
   (cd scripts/ha-managed-bucket-setup-src && go test -mod=readonly -timeout=45s -run 'Test(GatedOracle|CommittedPlanOracle)$' .)
   exit 0
 fi

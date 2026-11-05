@@ -20,6 +20,9 @@ import (
 
 func ManagedConfig(ctx context.Context, kube *operator.Kubernetes, ref operator.V1Alpha2ClusterRef, podName, podUID, identityPath, handoffPath string, profile operator.V1Alpha2RuntimeProfile) (managedsql.Config, error) {
 	var result managedsql.Config
+	if err := operator.ValidateV1Alpha2ApplicationProfile(profile.ApplicationProtocol, profile.EvidenceFormat); err != nil {
+		return result, err
+	}
 	plan, err := CheckGate(ctx, kube, ref, 0, podName, podUID, identityPath)
 	if err != nil {
 		return result, err
@@ -44,6 +47,9 @@ func ManagedConfig(ctx context.Context, kube *operator.Kubernetes, ref operator.
 
 func ManagedRuntimeConfig(ctx context.Context, kube *operator.Kubernetes, ref operator.V1Alpha2ClusterRef, podUID, identityPath string, profile operator.V1Alpha2RuntimeProfile, plan operator.V1Alpha2BootstrapPlan) (managedsql.Config, error) {
 	var result managedsql.Config
+	if err := operator.ValidateV1Alpha2ApplicationProfile(profile.ApplicationProtocol, profile.EvidenceFormat); err != nil {
+		return result, err
+	}
 	store := &operator.V1Alpha2StatusStore{Kube: kube}
 	init, err := operator.LoadV1Alpha2ApplicationInit(ctx, store, ref)
 	if err != nil {

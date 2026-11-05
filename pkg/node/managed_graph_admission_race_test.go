@@ -119,7 +119,7 @@ func TestManagedGraphAdmissionJoinsStableActualPendingControl(t *testing.T) {
 	wantControl := managedGraphRaceControlValue()
 	gate := make(chan error, 1)
 	go func() { gate <- fixture.node.admitInternalApplication(ctx) }()
-	awaitManagedGraphAdmissionObservation(t, fixture, gate, 9)
+	awaitManagedGraphAdmissionOwner(t, fixture, gate, 9)
 
 	fixture.transport.releaseHeld()
 	if err := awaitProposal(t, proposal); err != nil {
@@ -145,7 +145,7 @@ func TestManagedGraphAdmissionPendingControlCompletesSeparateBarrier(t *testing.
 	wantControl := managedGraphRaceControlValue()
 	gate := make(chan error, 1)
 	go func() { gate <- fixture.node.admitInternalApplication(ctx) }()
-	awaitManagedGraphAdmissionObservation(t, fixture, gate, 9)
+	awaitManagedGraphAdmissionOwner(t, fixture, gate, 9)
 	fixture.transport.releaseHeld()
 	if err := awaitProposal(t, proposal); err != nil {
 		t.Fatalf("actual control did not certify after cleanup release: %v", err)
@@ -543,7 +543,7 @@ func TestManagedGraphAdmissionRejectsEarlyUnknownOwnerReturn(t *testing.T) {
 	}
 	gate := make(chan error, 1)
 	go func() { gate <- fixture.node.admitInternalApplication(ctx) }()
-	awaitManagedGraphAdmissionObservation(t, fixture, gate, 9)
+	awaitManagedGraphAdmissionOwner(t, fixture, gate, 9)
 	fixture.transport.releaseHeld()
 	select {
 	case err := <-gate:
@@ -725,7 +725,7 @@ func managedGraphRaceControlValue() []byte {
 	return types.EncodeReadBarrier(nonce)
 }
 
-func awaitManagedGraphAdmissionObservation(t *testing.T, fixture *managedGraphAdmissionRaceFixture, result <-chan error, observedSlot uint64) {
+func awaitManagedGraphAdmissionOwner(t *testing.T, fixture *managedGraphAdmissionRaceFixture, result <-chan error, observedSlot uint64) {
 	t.Helper()
 	deadline := time.Now().Add(3 * time.Second)
 	for time.Now().Before(deadline) {
@@ -736,7 +736,7 @@ func awaitManagedGraphAdmissionObservation(t *testing.T, fixture *managedGraphAd
 		}
 		fixture.node.managedGraphControlMu.Lock()
 		operation := fixture.node.managedGraphControl
-		observed := operation != nil && operation.observation != nil && operation.observation.ObservedSlot == quepaxa.Slot(observedSlot) && operation.observation.BelongsTo(fixture.node.core)
+		observed := operation != nil && operation.binding == fixture.node.internalApplication.Load() && managedGraphControlOwnBarrierMatches(operation, operation.hash) && fixture.node.core.RecorderTip() >= quepaxa.Slot(observedSlot)
 		fixture.node.managedGraphControlMu.Unlock()
 		if observed {
 			return

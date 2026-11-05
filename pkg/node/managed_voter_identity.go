@@ -21,6 +21,12 @@ func (n *Node) ManagedVoterWALIdentity(ctx context.Context, configID uint, abort
 	}
 	n.shutdownMu.Lock()
 	defer n.shutdownMu.Unlock()
+	return n.managedVoterWALIdentityLocked(ctx, configID, abortSlot, member)
+}
+
+// managedVoterWALIdentityLocked verifies the complete immutable registration
+// while the caller owns shutdownMu. It does not acquire that lock itself.
+func (n *Node) managedVoterWALIdentityLocked(ctx context.Context, configID uint, abortSlot quepaxa.Slot, member quepaxa.Member) (string, error) {
 	if err := n.managedRepairReady(); err != nil {
 		return "", err
 	}

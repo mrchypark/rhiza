@@ -1,5 +1,7 @@
-# Illustrative only: the v1alpha2 operator engine is not implemented.
-# When supported, submit with strict server-side field validation.
+# Illustrative v1alpha2 input; a private installed runtime profile is required.
+# This does not enable legacy automatic whole-generation disaster recovery.
+# Approved automatic-attempt DR remains unimplemented/unqualified; default OFF.
+# Submit with strict server-side field validation; it is not DR authority.
 apiVersion: rhiza.mrchypark.dev/v1alpha2
 kind: RhizaCluster
 metadata:
@@ -7,6 +9,7 @@ metadata:
   namespace: rhiza
 spec:
   logicalID: rhiza-production
+  applicationProtocol: rhiza-managed-request-append-only/v1
   voterCount: 3
   automaticRecovery: "OFF"
   provisionalRetentionSeconds: 172800

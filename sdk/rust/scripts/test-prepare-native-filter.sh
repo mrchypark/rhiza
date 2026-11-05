@@ -129,9 +129,21 @@ printf 'C header bytes\n' > "$go_vendor/github.com/example/unreachable/source.h"
 printf 'asset bytes\n' > "$go_vendor/github.com/example/unreachable/asset.bin"
 printf '%s\n' "$go_keep" > "$go_reachable"
 metadata="$scratch/go-list-metadata.tsv"
-printf 'example/kept\t%s\n' "$go_keep" > "$metadata"
+printf 'github.com/example/kept\t%s\n' "$go_keep" > "$metadata"
 reported_vendor=$(run_vendor_root_check "$go_vendor" "$metadata")
 [ "$reported_vendor" = "$go_vendor" ] || { echo 'FAIL vendor derivation selected an ancestor named vendor' >&2; exit 1; }
+# Actual go list -deps also emits standard-library vendoring and main packages.
+# Neither is a module-vendor root, even when an ancestor is named vendor.
+printf 'vendor/golang.org/x/net/dns/dnsmessage\t%s\n' "$scratch/goroot/src/vendor/golang.org/x/net/dns/dnsmessage" >> "$metadata"
+printf 'fmt\t%s\n' "$scratch/goroot/src/fmt" >> "$metadata"
+printf 'github.com/mrchypark/rhiza/cmd/rhiza-ffi\t%s\n' "$scratch/workspace/vendor/source/sdk/rust/native/cmd/rhiza-ffi" >> "$metadata"
+reported_vendor=$(run_vendor_root_check "$go_vendor" "$metadata")
+[ "$reported_vendor" = "$go_vendor" ] || { echo 'FAIL mixed actual-format Go metadata selected a GOROOT or main-module ancestor' >&2; exit 1; }
+printf 'vendor/golang.org/x/net/dns/dnsmessage\t%s\n' "$scratch/goroot/src/vendor/golang.org/x/net/dns/dnsmessage" > "$scratch/stdlib-only.tsv"
+if run_vendor_root_check "$go_vendor" "$scratch/stdlib-only.tsv" >/dev/null 2>&1; then
+    echo 'FAIL standard-library vendor directory substituted for the native vendor root' >&2
+    exit 1
+fi
 if run_vendor_root_check 2>/dev/null; then
     echo 'FAIL missing vendor-root inputs were accepted' >&2
     exit 1

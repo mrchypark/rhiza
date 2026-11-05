@@ -6,8 +6,6 @@ import (
 	"bytes"
 	"context"
 	"crypto/sha256"
-	"log"
-	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -104,7 +102,7 @@ func TestManagedGraphAdmissionAcceptsSuccessfulOwnedBarrierBelowLaterCertifiedTi
 		value: bytes.Clone(ownedDecision.Value), hash: sha256.Sum256(ownedDecision.Value),
 		done: shortDone, slot: 9,
 	}
-	if err := fixture.node.waitManagedAppendOnlyBarrier(ctx, 10, shortRemoteOperation, shortDone, false); err == nil {
+	if err := fixture.node.waitManagedAppendOnlyBarrier(ctx, 10, shortRemoteOperation, shortDone); err == nil {
 		t.Fatal("a valid slot-9 certificate satisfied the actual slot-10 remote minimum")
 	}
 
@@ -167,12 +165,26 @@ func TestManagedGraphPostReadIndexJoinsExactObservedBarrierOwner(t *testing.T) {
 		}
 	})
 	t.Cleanup(restoreProposal)
+	firstWaiting := make(chan struct{})
+	var firstWaitOnce sync.Once
+	restoreFirstWait := localtesthooks.Set(func(event string) {
+		if event == "node:managed-control:waiter-entered" {
+			firstWaitOnce.Do(func() { close(firstWaiting) })
+		}
+	})
+	t.Cleanup(restoreFirstWait)
 	go func() { observedAdmission <- fixture.node.waitManagedAppendOnlyControl(ctx, binding) }()
-	awaitManagedGraphAdmissionObservation(t, fixture, observedAdmission, 9)
+	awaitManagedGraphAdmissionOwner(t, fixture, observedAdmission, 9)
+	select {
+	case <-firstWaiting:
+	case <-ctx.Done():
+		t.Fatal("first owner waiter did not enter", ctx.Err())
+	}
+	restoreFirstWait()
 	fixture.node.managedGraphControlMu.Lock()
 	operation := fixture.node.managedGraphControl
 	fixture.node.managedGraphControlMu.Unlock()
-	if operation == nil || operation.observation == nil || operation.observation.ObservedSlot != 9 {
+	if operation == nil || operation.binding != binding {
 		t.Fatalf("Node did not retain the sealed R=9 observation: %+v", operation)
 	}
 
@@ -183,7 +195,7 @@ func TestManagedGraphPostReadIndexJoinsExactObservedBarrierOwner(t *testing.T) {
 	selected, resume := make(chan struct{}), make(chan struct{})
 	var selectedOnce sync.Once
 	restoreHook := localtesthooks.Set(func(event string) {
-		if event == "node:managed-control:post-readindex-owner-selected" {
+		if event == "node:managed-control:waiter-entered" {
 			selectedOnce.Do(func() { close(selected) })
 			<-resume
 		}
@@ -197,7 +209,7 @@ func TestManagedGraphPostReadIndexJoinsExactObservedBarrierOwner(t *testing.T) {
 		}
 	})
 	joined := make(chan error, 1)
-	go func() { joined <- fixture.node.waitManagedGraphOwnedControl(ctx, binding, readIndex) }()
+	go func() { joined <- fixture.node.waitManagedAppendOnlyControl(ctx, binding) }()
 	select {
 	case <-selected:
 	case err := <-joined:
@@ -215,7 +227,7 @@ func TestManagedGraphPostReadIndexJoinsExactObservedBarrierOwner(t *testing.T) {
 		if err != nil {
 			progress := fixture.node.core.RuntimeProgressSnapshot()
 			isBarrier, decodeErr := types.DecodeReadBarrier(operation.value)
-			t.Fatalf("observation worker rejected the exact certified R=9 barrier: wait_err=%v worker_err=%v slot=%d observation_belongs=%t observation_C=%d observation_R=%d observation_proposals=%d operation_value_is_barrier=%t operation_value_decode_err=%v operation_hash_matches_value=%t progress_C=%d progress_R=%d", err, operation.err, operation.slot, operation.observation.BelongsTo(fixture.node.core), operation.observation.CommittedTip, operation.observation.ObservedSlot, len(operation.observation.Proposals), isBarrier, decodeErr, operation.hash == quepaxa.ValueHash(sha256.Sum256(operation.value)), progress.CertifiedTip, progress.RecorderTip)
+			t.Fatalf("owner rejected certified R=9: wait_err=%v worker_err=%v slot=%d barrier=%t decode_err=%v hash_matches=%t C=%d R=%d", err, operation.err, operation.slot, isBarrier, decodeErr, operation.hash == quepaxa.ValueHash(sha256.Sum256(operation.value)), progress.CertifiedTip, progress.RecorderTip)
 		}
 	case <-ctx.Done():
 		t.Fatal("observation worker did not complete after R=9 certification", ctx.Err())
@@ -245,7 +257,7 @@ func TestManagedGraphPostReadIndexJoinsExactObservedBarrierOwner(t *testing.T) {
 	}
 }
 
-func TestManagedGraphPostReadIndexRejectsFreshOrdinaryGapInsteadOfJoiningOldOwner(t *testing.T) {
+func TestManagedGraphPostReadIndexAdoptsOriginalOrdinaryAtOriginalSlot(t *testing.T) {
 	fixture := newManagedGraphAdmissionRaceFixture(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
@@ -277,11 +289,11 @@ func TestManagedGraphPostReadIndexRejectsFreshOrdinaryGapInsteadOfJoiningOldOwne
 	t.Cleanup(restoreProposal)
 	ownerResult := make(chan error, 1)
 	go func() { ownerResult <- fixture.node.waitManagedAppendOnlyControl(ctx, binding) }()
-	awaitManagedGraphAdmissionObservation(t, fixture, ownerResult, 9)
+	awaitManagedGraphAdmissionOwner(t, fixture, ownerResult, 9)
 	fixture.node.managedGraphControlMu.Lock()
 	operation := fixture.node.managedGraphControl
 	fixture.node.managedGraphControlMu.Unlock()
-	if operation == nil || operation.observation == nil || operation.observation.ObservedSlot != 9 {
+	if operation == nil || operation.binding != binding {
 		t.Fatalf("Node did not retain the exact original R=9 observation: %+v", operation)
 	}
 	select {
@@ -296,10 +308,11 @@ func TestManagedGraphPostReadIndexRejectsFreshOrdinaryGapInsteadOfJoiningOldOwne
 	if err := awaitProposal(t, foreignOwner); err != nil {
 		t.Fatalf("actual foreign R=9 barrier did not certify: %v", err)
 	}
-	ordinary, err := types.EncodeManagedGraphExecution(types.GraphCommand{
+	command := types.GraphCommand{
 		RequestID: "post-readindex-fresh-ordinary-gap",
 		Cypher:    "CREATE (:PostReadIndexFreshOrdinary {original:true})",
-	})
+	}
+	ordinary, err := types.EncodeManagedGraphExecution(command)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -321,36 +334,75 @@ func TestManagedGraphPostReadIndexRejectsFreshOrdinaryGapInsteadOfJoiningOldOwne
 		t.Fatal("ordinary R=10 original bytes were not retained")
 	}
 	joined := make(chan error, 1)
-	go func() { joined <- fixture.node.waitManagedGraphOwnedControl(ctx, binding, readIndex) }()
+	go func() { joined <- fixture.node.waitManagedAppendOnlyControl(ctx, binding) }()
 	select {
 	case err := <-joined:
-		if err == nil {
-			t.Fatal("caller reused the old R=9 owner for fresh ordinary R=10")
-		}
-	case <-time.After(250 * time.Millisecond):
-		t.Fatal("caller waited on the old owner instead of rejecting the fresh R=10 gap")
-	case <-ctx.Done():
-		t.Fatal("caller did not reject the fresh R=10 gap", ctx.Err())
+		t.Fatalf("caller did not wait for actual owner and X10 certificate: %v", err)
+	case <-time.After(100 * time.Millisecond):
 	}
 	releaseProposal()
 	select {
 	case err := <-ownerResult:
-		if err == nil {
-			t.Fatal("private R=9 observation accepted the later uncertified ordinary X10")
+		if err != nil {
+			t.Fatalf("ordinary consensus did not finish X10 and its own barrier: %v", err)
 		}
 	case <-ctx.Done():
-		t.Fatal("private owner did not stop after unobserved X10 refusal", ctx.Err())
+		t.Fatal("ordinary consensus did not complete original X10", ctx.Err())
 	}
-	if _, certified := fixture.node.core.CertifiedValue(10); certified {
-		t.Fatal("unobserved ordinary R=10 was certified by the private barrier")
+	select {
+	case err := <-joined:
+		if err != nil {
+			t.Fatalf("joined owner did not finish original X10: %v", err)
+		}
+	case <-ctx.Done():
+		t.Fatal("joined owner did not complete", ctx.Err())
+	}
+	decision, certified := fixture.node.core.CertifiedValue(10)
+	if !certified || decision.Hash != ordinaryHash || !bytes.Equal(decision.Value, ordinary) || len(decision.Certificate) == 0 {
+		t.Fatalf("X10 did not retain its original bytes and certificate: certified=%t decision=%+v", certified, decision)
+	}
+	barrier, certified := fixture.node.core.CertifiedValue(operation.slot)
+	if !certified || operation.slot <= 10 || !managedGraphControlCertificateMatches(fixture.node.core, operation, barrier) {
+		t.Fatalf("owner lacks its separate exact barrier certificate: slot=%d certified=%t", operation.slot, certified)
 	}
 	progress = fixture.node.core.RuntimeProgressSnapshot()
-	if progress.CertifiedTip != 9 || progress.RecorderTip != 10 || !progress.RecorderHashPresent || progress.RecorderHashIsCertified || progress.RecorderHash != ordinaryHash {
-		t.Fatalf("fresh ordinary gap changed after both callers refused it: %+v", progress)
+	if progress.CertifiedTip < operation.slot || fixture.node.material.Tip() < uint64(operation.slot) {
+		t.Fatalf("owner returned before contiguous apply: progress=%+v applied=%d", progress, fixture.node.material.Tip())
+	}
+	fingerprint, err := types.ManagedGraphIntentFingerprint(command)
+	if err != nil {
+		t.Fatal(err)
+	}
+	receipt, found, matches, err := fixture.node.material.GraphRequestStatusFingerprint(ctx, command.RequestID, fingerprint)
+	if err != nil || !found || !matches || !receipt.Applied || receipt.Slot != 10 {
+		t.Fatalf("original X10 receipt differs: receipt=%+v found=%t matches=%t err=%v", receipt, found, matches, err)
+	}
+	query, err := fixture.node.material.GraphQuery(ctx, "MATCH (n:PostReadIndexFreshOrdinary) RETURN n.original", nil)
+	if err != nil || len(query.Rows) != 1 || len(query.Rows[0]) != 1 || query.Rows[0][0] != true {
+		t.Fatalf("original X10 was not applied exactly once: rows=%v err=%v", query.Rows, err)
+	}
+	decisions, _, err := fixture.node.core.DecisionsFrom(9, int(progress.CertifiedTip-9)+1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	applications := 0
+	for _, decided := range decisions {
+		if bytes.Equal(decided.Value, ordinary) {
+			applications++
+			if decided.Slot != 10 {
+				t.Fatalf("original application was resubmitted at slot %d", decided.Slot)
+			}
+		}
+	}
+	if applications != 1 {
+		t.Fatalf("original application appeared at %d slots, want exactly one", applications)
+	}
+	if receipt, found, _, err := fixture.node.material.GraphRequestStatusFingerprint(ctx, "post-readindex-never-submitted", fingerprint); err != nil || found {
+		t.Fatalf("consensus recovery fabricated another request receipt: receipt=%+v found=%t err=%v", receipt, found, err)
 	}
 }
 
-func TestManagedGraphAdmissionReobservesAfterCompletedRemoteControlBeforeNewGap(t *testing.T) {
+func TestManagedGraphAdmissionStartsFreshOwnerAfterCompletedRemoteControl(t *testing.T) {
 	fixture := newManagedGraphAdmissionRaceFixture(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 	defer cancel()
@@ -364,16 +416,6 @@ func TestManagedGraphAdmissionReobservesAfterCompletedRemoteControlBeforeNewGap(
 	recordRemotePendingControl(t, fixture, ctx, 11, nextValue)
 	awaitManagedGraphActualRecorderGap(t, fixture, 11, nextValue)
 
-	var observationChecks atomic.Int32
-	observedFresh := make(chan struct{})
-	var observedOnce sync.Once
-	restoreObserver := localtesthooks.Set(func(event string) {
-		if event == "core:managed-control:before-snapshot-recheck" {
-			observationChecks.Add(1)
-			observedOnce.Do(func() { close(observedFresh) })
-		}
-	})
-	t.Cleanup(restoreObserver)
 	secondOperationReady := make(chan struct{})
 	var secondOperationMu sync.Mutex
 	var secondOperation *managedGraphControlOperation
@@ -385,7 +427,7 @@ func TestManagedGraphAdmissionReobservesAfterCompletedRemoteControlBeforeNewGap(
 		fixture.node.managedGraphControlMu.Lock()
 		candidate := fixture.node.managedGraphControl
 		fixture.node.managedGraphControlMu.Unlock()
-		if candidate == nil || candidate.observation == nil || candidate.observation.ObservedSlot != 11 {
+		if candidate == nil || candidate.binding != fixture.node.internalApplication.Load() {
 			return
 		}
 		secondOperationMu.Lock()
@@ -398,14 +440,6 @@ func TestManagedGraphAdmissionReobservesAfterCompletedRemoteControlBeforeNewGap(
 	t.Cleanup(restoreProposal)
 	secondAdmission := make(chan error, 1)
 	go func() { secondAdmission <- fixture.node.admitInternalApplication(ctx) }()
-	select {
-	case <-observedFresh:
-	case <-ctx.Done():
-		t.Fatal("second admission did not execute Core's fresh R=11 observation", ctx.Err())
-	}
-	if observationChecks.Load() == 0 {
-		t.Fatal("second admission retained R=11 without executing Core's actual managed-control observation")
-	}
 	select {
 	case <-secondOperationReady:
 	case <-ctx.Done():
@@ -427,7 +461,7 @@ func TestManagedGraphAdmissionReobservesAfterCompletedRemoteControlBeforeNewGap(
 		t.Fatal("second observation did not close the actual R=11 certificate")
 	}
 	isBarrier, decodeErr := types.DecodeReadBarrier(decision11.Value)
-	if decodeErr != nil || !isBarrier || operation.slot < operation.observation.ObservedSlot || operation.observation.ObservedSlot != 11 {
+	if decodeErr != nil || !isBarrier || operation.slot < 11 {
 		t.Fatalf("second observation's exact-slot/later barrier contract differs: decode_err=%v is_barrier=%t operation=%+v", decodeErr, isBarrier, operation)
 	}
 	decision, ok := fixture.node.core.CertifiedValue(operation.slot)
@@ -442,27 +476,37 @@ func TestManagedGraphAdmissionReobservesAfterCompletedRemoteControlBeforeNewGap(
 	}
 }
 
-func TestManagedGraphAdmissionRejectsOrdinaryGapAfterCompletedRemoteControl(t *testing.T) {
+func TestManagedGraphAdmissionRecoversOrdinaryGapAfterCompletedRemoteControl(t *testing.T) {
 	fixture := newManagedGraphAdmissionRaceFixture(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 	defer cancel()
 	firstOperation := completeRemoteObservedBarrierForStalePointerTest(t, fixture, ctx)
 
-	ordinaryValue, err := types.EncodeManagedGraphExecution(types.GraphCommand{RequestID: "stale-operation-ordinary-gap", Cypher: "CREATE (:NeverAdmitted {id:'ordinary'})"})
+	command := types.GraphCommand{RequestID: "stale-operation-ordinary-gap", Cypher: "CREATE (:RecoveredPending {id:'ordinary'})"}
+	ordinaryValue, err := types.EncodeManagedGraphExecution(command)
 	if err != nil {
 		t.Fatal(err)
 	}
-	recordRemotePendingControl(t, fixture, ctx, 11, ordinaryValue)
+	originalHash := quepaxa.ValueHash(sha256.Sum256(ordinaryValue))
+	// A local minority record need not win. Persist the original Step-5
+	// proposal on a real quorum before the next normal proposal starts.
+	for _, id := range []quepaxa.NodeID{"n1", "n2", "n3"} {
+		summary, err := fixture.transport.SendRecord(ctx, id, quepaxa.RecordRequest{Slot: 11, Step: 5, ConfigID: 1, Proposal: quepaxa.Proposal{ProposerID: "n2", Hash: originalHash, Value: bytes.Clone(ordinaryValue)}})
+		if err != nil || summary.Step != 5 || summary.FirstCurrent == nil || summary.FirstCurrent.Hash != originalHash {
+			t.Fatalf("persist original R11 on real recorder %s: summary=%+v err=%v", id, summary, err)
+		}
+	}
+	if _, certified := fixture.node.core.CertifiedValue(11); certified {
+		t.Fatal("fixture manufactured a certificate before normal consensus")
+	}
 	awaitManagedGraphActualRecorderGap(t, fixture, 11, ordinaryValue)
 
-	var observationLogs bytes.Buffer
-	previousLogOutput := log.Writer()
-	log.SetOutput(&observationLogs)
-	t.Cleanup(func() { log.SetOutput(previousLogOutput) })
 	var barrierProposals atomic.Int32
+	var ownBarrier []byte
 	restoreProposal := localtesthooks.SetProposalEntry(func(value []byte) {
 		if barrier, err := types.DecodeReadBarrier(value); err == nil && barrier {
 			barrierProposals.Add(1)
+			ownBarrier = bytes.Clone(value)
 		}
 	})
 	t.Cleanup(restoreProposal)
@@ -470,25 +514,55 @@ func TestManagedGraphAdmissionRejectsOrdinaryGapAfterCompletedRemoteControl(t *t
 	go func() { result <- fixture.node.admitInternalApplication(ctx) }()
 	select {
 	case err := <-result:
-		if err == nil {
-			t.Fatal("ordinary R=11 recorder value was accepted")
+		if err != nil {
+			t.Fatalf("ordinary R=11 consensus recovery failed: %v", err)
 		}
 	case <-ctx.Done():
-		t.Fatal("ordinary R=11 observation did not fail closed", ctx.Err())
+		t.Fatal("ordinary R=11 recovery did not complete", ctx.Err())
 	}
-	if !strings.Contains(observationLogs.String(), "MANAGED_CONTROL_OBSERVATION_REJECTED reason=reference_validation") {
-		t.Fatalf("ordinary-gap rejection lacks Core's fixed reference-validation observation diagnostic: %q", observationLogs.String())
-	}
-	if barrierProposals.Load() != 0 {
-		t.Fatalf("ordinary-gap rejection proposed %d Node-owned barriers", barrierProposals.Load())
+	decision, found := fixture.node.core.CertifiedValue(11)
+	if !found || !bytes.Equal(decision.Value, ordinaryValue) || len(decision.Certificate) == 0 {
+		t.Fatalf("ordinary R=11 original certificate differs: found=%t decision=%+v", found, decision)
 	}
 	progress := fixture.node.core.RuntimeProgressSnapshot()
-	if progress.CertifiedTip != 10 || progress.RecorderTip != 11 || !progress.RecorderHashPresent || progress.RecorderHashIsCertified || fixture.node.material.Tip() != 10 {
-		t.Fatalf("ordinary-gap rejection changed or applied the pending value: progress=%+v applied=%d", progress, fixture.node.material.Tip())
+	if barrierProposals.Load() != 1 || progress.CertifiedTip <= 11 || fixture.node.material.Tip() < uint64(progress.CertifiedTip) {
+		t.Fatalf("fresh owner lacks its own barrier and replay: proposals=%d progress=%+v applied=%d", barrierProposals.Load(), progress, fixture.node.material.Tip())
 	}
-	retained, found := fixture.node.core.Value(progress.RecorderHash)
-	if !found || !bytes.Equal(retained, ordinaryValue) {
-		t.Fatal("ordinary-gap rejection did not preserve the exact original pending bytes")
+	ownedSlot, found := fixture.node.core.DecidedSlot(ownBarrier)
+	owned, certified := fixture.node.core.CertifiedValue(ownedSlot)
+	if !found || !certified || ownedSlot <= 11 || !bytes.Equal(owned.Value, ownBarrier) || len(owned.Certificate) == 0 {
+		t.Fatalf("new owner lacks its own exact certificate: slot=%d found=%t certified=%t", ownedSlot, found, certified)
+	}
+	fingerprint, err := types.ManagedGraphIntentFingerprint(command)
+	if err != nil {
+		t.Fatal(err)
+	}
+	receipt, found, matches, err := fixture.node.material.GraphRequestStatusFingerprint(ctx, command.RequestID, fingerprint)
+	if err != nil || !found || !matches || !receipt.Applied || receipt.Slot != 11 {
+		t.Fatalf("original receipt differs: receipt=%+v found=%t matches=%t err=%v", receipt, found, matches, err)
+	}
+	rows, err := fixture.node.material.GraphQuery(ctx, "MATCH (n:RecoveredPending) RETURN n.id", nil)
+	if err != nil || len(rows.Rows) != 1 || len(rows.Rows[0]) != 1 || rows.Rows[0][0] != "ordinary" {
+		t.Fatalf("original R11 was not applied once: rows=%v err=%v", rows.Rows, err)
+	}
+	decisions, _, err := fixture.node.core.DecisionsFrom(11, int(progress.CertifiedTip-11)+1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	originals := 0
+	for _, retained := range decisions {
+		if bytes.Equal(retained.Value, ordinaryValue) {
+			originals++
+			if retained.Slot != 11 {
+				t.Fatalf("original R11 was resubmitted at %d", retained.Slot)
+			}
+		}
+	}
+	if originals != 1 {
+		t.Fatalf("original R11 appeared at %d slots", originals)
+	}
+	if _, found, _, err := fixture.node.material.GraphRequestStatusFingerprint(ctx, "never-submitted-after-completion", fingerprint); err != nil || found {
+		t.Fatalf("normal recovery fabricated another request receipt: found=%t err=%v", found, err)
 	}
 	if firstOperation.slot != 10 {
 		t.Fatalf("initial completed-operation schedule was not actual R=9/S=10: %+v", firstOperation)
@@ -524,11 +598,11 @@ func completeRemoteObservedBarrierForStalePointerTest(t *testing.T, fixture *man
 	fixture.awaitPendingControl(t)
 	firstAdmission := make(chan error, 1)
 	go func() { firstAdmission <- fixture.node.admitInternalApplication(ctx) }()
-	awaitManagedGraphAdmissionObservation(t, fixture, firstAdmission, 9)
+	awaitManagedGraphAdmissionOwner(t, fixture, firstAdmission, 9)
 	fixture.node.managedGraphControlMu.Lock()
 	firstOperation := fixture.node.managedGraphControl
 	fixture.node.managedGraphControlMu.Unlock()
-	if firstOperation == nil || firstOperation.observation == nil || firstOperation.observation.ObservedSlot != 9 {
+	if firstOperation == nil || firstOperation.binding != fixture.node.internalApplication.Load() {
 		t.Fatalf("first admission did not retain its actual R=9 observation: %+v", firstOperation)
 	}
 	fixture.transport.releaseHeld()
@@ -555,7 +629,7 @@ func completeRemoteObservedBarrierForStalePointerTest(t *testing.T, fixture *man
 	case <-ctx.Done():
 		t.Fatal("first admission did not finish after the slot-10 durability release", ctx.Err())
 	}
-	if firstOperation.slot != 10 || firstOperation.err != nil || firstOperation.observation == nil || firstOperation.observation.ObservedSlot != 9 {
+	if firstOperation.slot != 10 || firstOperation.err != nil {
 		t.Fatalf("first success did not complete its actual R=9/S=10 observation: %+v", firstOperation)
 	}
 	select {

@@ -3,17 +3,88 @@ package node
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"errors"
+	"fmt"
+	"path"
 	"path/filepath"
 	"strings"
 	"testing"
 
+	objectstore "github.com/mrchypark/rhiza/internal/objstore"
 	"github.com/mrchypark/rhiza/internal/types"
 	"github.com/mrchypark/rhiza/pkg/network"
 	"github.com/mrchypark/rhiza/pkg/qlog"
 	"github.com/mrchypark/rhiza/pkg/quepaxa"
 	"github.com/mrchypark/rhiza/pkg/recovery"
 )
+
+type preparedRepairCaptureChecker struct{}
+
+func (preparedRepairCaptureChecker) ValidateManagedStartup(context.Context, ManagedStartupIdentity) error {
+	return nil
+}
+
+func (preparedRepairCaptureChecker) ValidateManagedAdmission(context.Context, ManagedStartupIdentity, ManagedRuntimeState) error {
+	return nil
+}
+
+func (preparedRepairCaptureChecker) ValidateManagedMembership(context.Context, ManagedStartupIdentity, ManagedMembershipRequest, quepaxa.Cluster, quepaxa.Slot) error {
+	return nil
+}
+
+func (preparedRepairCaptureChecker) ValidateManagedRepairPreparation(context.Context, ManagedStartupIdentity, ManagedMembershipRequest, quepaxa.Cluster, quepaxa.Slot) error {
+	return nil
+}
+
+func TestCapturePreparedRepairRequiresExactRegisteredOldVoterAndFreshQuorum(t *testing.T) {
+	for _, test := range []struct {
+		name   string
+		mutate func(*Node, *objectstore.MeteredBucket, ManagedMembershipRequest, map[quepaxa.NodeID]string, *membershipOperationTransport) ManagedMembershipRequest
+	}{
+		{
+			name: "wrong nonce",
+			mutate: func(_ *Node, _ *objectstore.MeteredBucket, request ManagedMembershipRequest, _ map[quepaxa.NodeID]string, _ *membershipOperationTransport) ManagedMembershipRequest {
+				request.OldWALIdentity = "wrong-registered-nonce"
+				return request
+			},
+		},
+		{
+			name: "missing registration",
+			mutate: func(n *Node, bucket *objectstore.MeteredBucket, request ManagedMembershipRequest, _ map[quepaxa.NodeID]string, _ *membershipOperationTransport) ManagedMembershipRequest {
+				key := path.Join(n.config.ObjStorePrefix, string(n.config.ClusterID), "voters", fmt.Sprintf("%x.json", sha256.Sum256([]byte(request.OldNodeID))))
+				if err := bucket.Delete(context.Background(), key); err != nil {
+					t.Fatal(err)
+				}
+				return request
+			},
+		},
+		{
+			name: "quorum unavailable excluding old voter",
+			mutate: func(_ *Node, _ *objectstore.MeteredBucket, request ManagedMembershipRequest, _ map[quepaxa.NodeID]string, transport *membershipOperationTransport) ManagedMembershipRequest {
+				transport.disable("b")
+				return request
+			},
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			ctx := context.Background()
+			n, identities, bucket, transport := newMembershipOperationNode(t)
+			source, _, err := n.preparedBindingDigests()
+			if err != nil {
+				t.Fatal(err)
+			}
+			n.config.EnableReconfiguration = true
+			n.managedStartup = &ManagedStartupConfig{Checker: preparedRepairCaptureChecker{}, Identity: ManagedStartupIdentity{PhysicalBinding: source}}
+			n.opened.Store(true)
+			request := ManagedMembershipRequest{RepairOperationID: "capture", Action: ManagedMembershipAdd, ExpectedConfigID: 1, OldNodeID: "c", OldWALIdentity: identities["c"]}
+			request = test.mutate(n, bucket, request, identities, transport)
+			if _, err := n.CaptureManagedPreparedRepairSource(ctx, request); err == nil {
+				t.Fatal("captured prepared source without exact registered identity and excluded-voter quorum")
+			}
+		})
+	}
+}
 
 type membershipAuthorityChecker struct {
 	calls        int

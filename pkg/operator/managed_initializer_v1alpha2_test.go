@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"github.com/mrchypark/rhiza/internal/sqlpolicy"
 	"github.com/mrchypark/rhiza/internal/types"
 	"gopkg.in/yaml.v3"
 	"io"
@@ -18,12 +19,12 @@ import (
 )
 
 func TestManagedInitializationConnected(t *testing.T) {
-	history, store, name := phase8Setup(t, phase8Cluster, "")
+	history, store, name := phase8Setup(t, phase9CurrentManagedCluster(), "")
 	var deployment map[string]any
 	ready := false
 	podFault := ""
 	posts := 0
-	profile := V1Alpha2RuntimeProfile{ProfileSecretName: "rhiza-runtime", InitImage: "example/init:v1", PeerPort: 9090, EvidenceFormat: "rhiza-managed-sql/v1", Storage: types.ExecutionConfig{AdminToken: "admin-must-not-leak", ObjStoreBucket: "test", ObjStorePrefix: "managed", ObjStoreProvider: "s3", ObjStoreEndpoint: "s3.example.test", ObjStoreSecretKey: "credential-must-not-leak"}}
+	profile := V1Alpha2RuntimeProfile{ProfileSecretName: "rhiza-runtime", InitImage: "example/init:v1", PeerPort: 9090, EvidenceFormat: sqlpolicy.ManagedRequestAppendOnlyApplicationProtocol, ApplicationProtocol: sqlpolicy.ManagedRequestAppendOnlyApplicationProtocol, Storage: types.ExecutionConfig{AdminToken: "admin-must-not-leak", ObjStoreBucket: "test", ObjStorePrefix: "managed", ObjStoreProvider: "s3", ObjStoreEndpoint: "s3.example.test", ObjStoreSecretKey: "credential-must-not-leak"}}
 	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		respond := func(v any) { w.Header().Set("Content-Type", "application/json"); _ = json.NewEncoder(w).Encode(v) }
 		switch {
@@ -575,7 +576,7 @@ func TestManagedInitializationRejectsProfileBeforePost(t *testing.T) {
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			posts := 0
-			profile := V1Alpha2RuntimeProfile{ProfileSecretName: "rhiza-runtime", InitImage: "example/init:v1", PeerPort: 9090, EvidenceFormat: "rhiza-managed-sql/v1", Storage: types.ExecutionConfig{AdminToken: "private-admin", ObjStoreProvider: "s3", ObjStoreBucket: "test", ObjStoreEndpoint: "s3.example.test", ObjStorePrefix: "managed"}}
+			profile := V1Alpha2RuntimeProfile{ProfileSecretName: "rhiza-runtime", InitImage: "example/init:v1", PeerPort: 9090, EvidenceFormat: sqlpolicy.ManagedRequestAppendOnlyApplicationProtocol, ApplicationProtocol: sqlpolicy.ManagedRequestAppendOnlyApplicationProtocol, Storage: types.ExecutionConfig{AdminToken: "private-admin", ObjStoreProvider: "s3", ObjStoreBucket: "test", ObjStoreEndpoint: "s3.example.test", ObjStorePrefix: "managed"}}
 			tc.mutate(&profile)
 			store := phase2Store(t, func(r *http.Request) (*http.Response, error) {
 				if r.Method == http.MethodPost {
@@ -587,7 +588,7 @@ func TestManagedInitializationRejectsProfileBeforePost(t *testing.T) {
 					secret, _ := json.Marshal(map[string]any{"metadata": map[string]any{"name": profile.ProfileSecretName, "namespace": "ns", "uid": "secretuid"}, "data": map[string][]byte{V1Alpha2ManagedRuntimeProfileKey: b}})
 					return phase2Response(200, string(secret)), nil
 				}
-				return phase2Response(200, phase8Cluster), nil
+				return phase2Response(200, phase9CurrentManagedCluster()), nil
 			})
 			_, err := ReconcileV1Alpha2ManagedInitialization(context.Background(), store.Kube, phase2Ref, profile)
 			if err == nil || posts != 0 {
@@ -605,7 +606,7 @@ func TestManagedRuntimeProfileSupportedStorage(t *testing.T) {
 	} {
 		t.Run(storage.ObjStoreProvider, func(t *testing.T) {
 			storage.AdminToken = "private-admin"
-			profile := V1Alpha2RuntimeProfile{ProfileSecretName: "rhiza-runtime", InitImage: "example/init:v1", PeerPort: 9090, EvidenceFormat: "rhiza-managed-sql/v1", Storage: storage}
+			profile := V1Alpha2RuntimeProfile{ProfileSecretName: "rhiza-runtime", InitImage: "example/init:v1", PeerPort: 9090, EvidenceFormat: sqlpolicy.ManagedRequestAppendOnlyApplicationProtocol, ApplicationProtocol: sqlpolicy.ManagedRequestAppendOnlyApplicationProtocol, Storage: storage}
 			_, plan, err := BuildV1Alpha2RuntimePlan(phase2Ref, "logical", "deployment", profile, nil)
 			if err != nil || plan.Durability != types.ObjectStoreDurabilityBeforeAck {
 				t.Fatalf("supported installed profile: %v durability=%s", err, plan.Durability)
@@ -617,8 +618,8 @@ func TestManagedRuntimeProfileSupportedStorage(t *testing.T) {
 func TestManagedInitializationRejectsSecretAndMainBeforePost(t *testing.T) {
 	for _, name := range []string{"Secret mismatch", "Secret unavailable", "two main containers"} {
 		t.Run(name, func(t *testing.T) {
-			profile := V1Alpha2RuntimeProfile{ProfileSecretName: "runtime", InitImage: "reference:v1", PeerPort: 9090, EvidenceFormat: "rhiza-managed-sql/v1", Storage: types.ExecutionConfig{AdminToken: "private-admin", ObjStoreProvider: "s3", ObjStoreBucket: "bucket", ObjStoreEndpoint: "s3.example.test"}}
-			cluster := phase8Cluster
+			profile := V1Alpha2RuntimeProfile{ProfileSecretName: "runtime", InitImage: "reference:v1", PeerPort: 9090, EvidenceFormat: sqlpolicy.ManagedRequestAppendOnlyApplicationProtocol, ApplicationProtocol: sqlpolicy.ManagedRequestAppendOnlyApplicationProtocol, Storage: types.ExecutionConfig{AdminToken: "private-admin", ObjStoreProvider: "s3", ObjStoreBucket: "bucket", ObjStoreEndpoint: "s3.example.test"}}
+			cluster := phase9CurrentManagedCluster()
 			if name == "two main containers" {
 				cluster = strings.Replace(cluster, `{"name":"app","image":"image"}`, `{"name":"app","image":"image"},{"name":"second","image":"image"}`, 1)
 			}

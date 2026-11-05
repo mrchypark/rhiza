@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net"
 	"net/http"
 	"os"
@@ -19,12 +20,10 @@ import (
 	"github.com/mrchypark/rhiza/internal/peertest"
 	"github.com/mrchypark/rhiza/internal/sqlpolicy"
 	"github.com/mrchypark/rhiza/internal/types"
-	"github.com/mrchypark/rhiza/pkg/checkpoint"
 	"github.com/mrchypark/rhiza/pkg/materializer"
 	"github.com/mrchypark/rhiza/pkg/network"
 	"github.com/mrchypark/rhiza/pkg/node"
 	"github.com/mrchypark/rhiza/pkg/operator"
-	"github.com/mrchypark/rhiza/pkg/qlog"
 	"github.com/mrchypark/rhiza/pkg/quepaxa"
 	"github.com/mrchypark/rhiza/pkg/recovery"
 	"github.com/quic-go/quic-go"
@@ -35,130 +34,34 @@ import (
 // the existing publisher claim, authenticated peer preparation, certified
 // proposal, durable archive and CURRENT promotion paths. TrimThrough publishes
 // a certified recovery base; it does not delete immutable objects or enable GC.
-func mixedProviderCheckpoint(t *testing.T, ctx context.Context, cfg types.ExecutionConfig, cluster quepaxa.Cluster, bucket objstore.Bucket, prefix string) {
-	t.Helper()
-	_, lock, err := qlog.Acquire(filepath.Join(cfg.DataDir, "qlog"))
-	if err != nil {
-		t.Fatal(err)
+
+// Pin only the actual captured discovery hint. Immutable roots and archive
+// certificates are still fetched and independently verified by production code.
+type mixedProviderPinnedCurrent struct {
+	objstore.Bucket
+	name       string
+	data       []byte
+	attributes objstore.ObjectAttributes
+}
+
+func (b *mixedProviderPinnedCurrent) Get(ctx context.Context, name string) (io.ReadCloser, error) {
+	if name != b.name {
+		return b.Bucket.Get(ctx, name)
 	}
-	defer lock.Release()
-	wal, err := qlog.Open(filepath.Join(cfg.DataDir, "qlog"))
-	if err != nil {
-		t.Fatal(err)
+	if err := ctx.Err(); err != nil {
+		return nil, err
 	}
-	defer wal.Close()
-	transport, err := network.NewTransportForPolicy(cfg.ClusterID, cfg.NodeID, &cluster, cfg.PeerToken, sqlpolicy.ManagedSQLKVMaterializationPolicy)
-	if err != nil {
-		t.Fatal(err)
+	return io.NopCloser(bytes.NewReader(b.data)), nil
+}
+
+func (b *mixedProviderPinnedCurrent) Attributes(ctx context.Context, name string) (objstore.ObjectAttributes, error) {
+	if name != b.name {
+		return b.Bucket.Attributes(ctx, name)
 	}
-	defer transport.Close()
-	core, err := quepaxa.New(quepaxa.Config{NodeID: cfg.NodeID, Cluster: cluster, WAL: wal, Transport: transport, EnableReconfiguration: true})
-	if err != nil {
-		t.Fatal(err)
+	if err := ctx.Err(); err != nil {
+		return objstore.ObjectAttributes{}, err
 	}
-	transport.BindCore(core)
-	manager, err := checkpoint.NewAppendOnlyManagerForPolicy(bucket, prefix, cfg.DataDir, sqlpolicy.ManagedSQLKVMaterializationPolicy, 1)
-	if err != nil {
-		t.Fatal(err)
-	}
-	core.SetCheckpointValidator(func(ctx context.Context, seal quepaxa.CheckpointSeal) error {
-		return manager.Verify(ctx, uint64(seal.Index), seal.RootHash, seal.StateHash)
-	})
-	material, err := materializer.OpenManagedSQLKV(filepath.Join(cfg.DataDir, "sqlite.db"), 1)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer material.Close()
-	files, index, cleanup, err := material.CheckpointFilesAt(ctx)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer cleanup()
-	claim, err := manager.AcquirePublisherClaim(ctx, string(cfg.NodeID), 0, time.Minute)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer func() {
-		if err := manager.ReleasePublisherClaim(ctx, claim); err != nil {
-			t.Error(err)
-		}
-	}()
-	if index < claim.ReservedIndex {
-		t.Fatal("snapshot is behind publisher reservation")
-	}
-	sources := make([]checkpoint.Source, len(files))
-	for i, file := range files {
-		sources[i] = checkpoint.Source{Role: string(file.Role), Path: file.Path}
-	}
-	root, err := manager.CreateFiles(ctx, claim, sources, index)
-	if err != nil {
-		t.Fatal(err)
-	}
-	claim, err = manager.BindPublisherClaim(ctx, claim, index, root.RootHash, time.Minute)
-	if err != nil {
-		t.Fatal(err)
-	}
-	prefixHash, ok := core.PrefixHash(quepaxa.Slot(index))
-	if !ok {
-		t.Fatal("snapshot prefix is not certified")
-	}
-	order, following, err := core.CheckpointLeaderOrders(quepaxa.Slot(index))
-	if err != nil {
-		t.Fatal(err)
-	}
-	history, err := core.CheckpointMembership(quepaxa.Slot(index))
-	if err != nil {
-		t.Fatal(err)
-	}
-	seal := quepaxa.CheckpointSeal{ConfigID: core.ConfigID(), Index: quepaxa.Slot(index), RootHash: root.RootHash, StateHash: root.Hash, PrefixHash: prefixHash, NextLeaderOrder: order, FollowingLeaderOrder: following, Membership: &history, GenerationAnchorHash: core.GenerationAnchorHash()}
-	if err := manager.ValidatePublisherClaim(ctx, string(cfg.NodeID), index, root.RootHash); err != nil {
-		t.Fatal(err)
-	}
-	if err := core.PrepareCheckpoint(ctx, seal); err != nil {
-		t.Fatal(err)
-	}
-	if err := transport.PrepareCheckpoint(ctx, seal); err != nil {
-		t.Fatal(err)
-	}
-	value, err := quepaxa.EncodeCheckpointSeal(seal)
-	if err != nil {
-		t.Fatal(err)
-	}
-	decisionSlot, _, err := core.Propose(ctx, value)
-	if err != nil {
-		t.Fatal(err)
-	}
-	for slot := quepaxa.Slot(material.Tip()) + 1; slot <= decisionSlot; slot++ {
-		decision, ok := core.CertifiedValue(slot)
-		if !ok {
-			t.Fatal("checkpoint proposal lacks certified history", slot)
-		}
-		if err := material.Apply(ctx, uint64(slot), decision.Value); err != nil {
-			t.Fatal(err)
-		}
-	}
-	archive, err := recovery.NewAppendOnlyManager(bucket, prefix, 1)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer archive.Close()
-	if err := archive.SyncThrough(ctx, core, decisionSlot); err != nil {
-		t.Fatal(err)
-	}
-	if err := manager.PromoteCertifiedCurrent(ctx, root); err != nil {
-		t.Fatal(err)
-	}
-	sealed, ok, err := core.LatestCheckpointSeal()
-	if err != nil || !ok {
-		t.Fatal("missing certified checkpoint seal", err)
-	}
-	decision, ok := core.CertifiedValue(sealed.DecisionSlot)
-	if !ok {
-		t.Fatal("missing checkpoint certificate")
-	}
-	if err := archive.TrimThrough(ctx, sealed, decision); err != nil {
-		t.Fatal(err)
-	}
+	return b.attributes, nil
 }
 
 func mixedProviderPeer(t *testing.T, ctx context.Context, cluster types.ClusterID, id types.NodeID) (context.Context, string) {
@@ -193,19 +96,18 @@ type mixedProviderNodeChecker struct {
 	ref      operator.V1Alpha2ClusterRef
 	plan     operator.V1Alpha2ApplicationInitPlan
 	identity node.ManagedStartupIdentity
-	active   atomic.Pointer[operator.V1Alpha2WriteRequest]
 }
 
 func mixedProviderEvidence(state node.ManagedKVSnapshot) json.RawMessage {
 	raw, _ := json.Marshal(map[string]string{
-		"Format": types.ManagedApplicationProtocolSQLKV,
+		"Format": sqlpolicy.ManagedRequestAppendOnlyApplicationProtocol,
 		"Digest": fmt.Sprintf("%x", state.Application.Digest),
 	})
 	return raw
 }
 
 func (c *mixedProviderNodeChecker) ValidateManagedStartup(ctx context.Context, identity node.ManagedStartupIdentity) error {
-	if identity != c.identity || identity.ApplicationProtocol != types.ManagedApplicationProtocolSQLKV || identity.Member.Generation != 0 {
+	if identity != c.identity || identity.ApplicationProtocol != sqlpolicy.ManagedRequestAppendOnlyApplicationProtocol || identity.Member.Generation != 0 {
 		return errors.New("provider exact identity changed")
 	}
 	initial, err := operator.LoadV1Alpha2ApplicationInit(ctx, c.store, c.ref)
@@ -229,21 +131,11 @@ func (c *mixedProviderNodeChecker) ValidateManagedAdmission(ctx context.Context,
 	if err != nil {
 		return err
 	}
-	if pending, exists := a.Pending(); exists {
-		active := c.active.Load()
-		if active == nil || *active != pending {
-			return errors.New("provider another active reservation")
-		}
-		return nil
-	}
-	state, err := c.n.InspectManagedKV(ctx, false)
-	if err != nil {
-		return err
-	}
-	if !bytes.Equal(a.Evidence(), mixedProviderEvidence(state)) {
-		return errors.New("provider canonical evidence mismatch")
+	if _, pending := a.Pending(); pending || a.SQLReservationsClosed() || len(bytes.TrimSpace(a.Transition())) != 0 && !bytes.Equal(bytes.TrimSpace(a.Transition()), []byte("null")) {
+		return errors.New("provider unresolved control state")
 	}
 	return nil
+
 }
 func (c *mixedProviderNodeChecker) ValidateManagedPeerLearn(ctx context.Context, i node.ManagedStartupIdentity) error {
 	return c.ValidateManagedStartup(ctx, i)
@@ -259,29 +151,10 @@ func (c *mixedProviderNodeChecker) exactKV(ctx context.Context, i node.ManagedSt
 	if err := c.ValidateManagedStartup(ctx, i); err != nil {
 		return err
 	}
-	a, err := operator.LoadV1Alpha2Admission(ctx, c.store, c.ref)
-	if err != nil {
-		return err
-	}
-	want, found, err := a.PendingKV()
-	if err != nil || !found {
-		return errors.Join(errors.New("provider exact pending KV missing"), err)
-	}
-	got := types.KVCommand{RequestID: req.RequestID, Operation: operation, Key: req.Key, Value: req.Value, Expected: req.Expected, ExpectedExists: req.ExpectedExists, TTLMS: req.TTLMS}
-	wire, _, err := types.EncodeManagedKVOriginal(got)
-	if err != nil {
-		return err
-	}
-	original, _, err := types.EncodeManagedKVOriginal(want)
-	if err != nil || !bytes.Equal(wire, original) {
-		return errors.New("provider pending original differs")
-	}
-	return nil
+	_, _, err := types.EncodeManagedKVOriginal(types.KVCommand{RequestID: req.RequestID, Operation: operation, Key: req.Key, Value: req.Value, Expected: req.Expected, ExpectedExists: req.ExpectedExists, TTLMS: req.TTLMS})
+	return err
 }
 func (c *mixedProviderNodeChecker) ValidateManagedKVWrite(ctx context.Context, i node.ManagedStartupIdentity, runtime node.ManagedRuntimeState, operation string, req network.KVMutationRequest) error {
-	if c.active.Load() == nil {
-		return errors.New("provider no directly applied reservation")
-	}
 	if err := c.ValidateManagedAdmission(ctx, i, runtime); err != nil {
 		return err
 	}
@@ -294,20 +167,8 @@ func (c *mixedProviderNodeChecker) ValidateManagedSQLWrite(ctx context.Context, 
 	if err := c.ValidateManagedAdmission(ctx, i, runtime); err != nil {
 		return err
 	}
-	a, err := operator.LoadV1Alpha2Admission(ctx, c.store, c.ref)
-	if err != nil {
-		return err
-	}
-	want, found, err := a.PendingSQL()
-	if err != nil || !found || c.active.Load() == nil {
-		return errors.New("provider exact pending SQL missing")
-	}
-	wf, we := types.SQLFingerprint(types.SQLCommand{RequestID: want.RequestID, SQL: want.SQL, Args: want.Args})
-	gf, ge := types.SQLFingerprint(types.SQLCommand{RequestID: req.RequestID, SQL: req.SQL, Args: req.Args})
-	if we != nil || ge != nil || want.RequestID != req.RequestID || wf != gf {
-		return errors.New("provider pending SQL differs")
-	}
-	return nil
+	return network.ValidateExecuteRequest(req)
+
 }
 
 func TestEmbeddedObjectStorageManagedKVNode(t *testing.T) {
@@ -330,7 +191,7 @@ func TestEmbeddedObjectStorageManagedKVNode(t *testing.T) {
 	}
 	base.ClusterID = string(cluster)
 	const root = "mixed-node-provider-root"
-	profile := operator.V1Alpha2RuntimeProfile{ApplicationProtocol: types.ManagedApplicationProtocolSQLKV, EvidenceFormat: operator.V1Alpha2ManagedSQLKVEvidenceFormat, InitImage: "fixture:v1", PeerPort: 9090, ProfileSecretName: "runtime", Storage: managedProviderRuntime(base)}
+	profile := operator.V1Alpha2RuntimeProfile{ApplicationProtocol: sqlpolicy.ManagedRequestAppendOnlyApplicationProtocol, EvidenceFormat: sqlpolicy.ManagedRequestAppendOnlyApplicationProtocol, InitImage: "fixture:v1", PeerPort: 9090, ProfileSecretName: "runtime", Storage: managedProviderRuntime(base)}
 	profile.Storage.ObjStorePrefix = root
 	entries := make([]operator.V1Alpha2BootstrapMember, 3)
 	contexts := make([]context.Context, 3)
@@ -350,7 +211,7 @@ func TestEmbeddedObjectStorageManagedKVNode(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	store, deployment := managedProviderStatusStore(t, ref, types.ManagedApplicationProtocolSQLKV)
+	store, deployment := managedProviderStatusStore(t, ref, sqlpolicy.ManagedRequestAppendOnlyApplicationProtocol)
 	if _, err := operator.InitializeV1Alpha2AuthorityWithBootstrap(ctx, store, ref, deployment, plan, bootstrap); err != nil {
 		t.Fatal(err)
 	}
@@ -380,6 +241,9 @@ func TestEmbeddedObjectStorageManagedKVNode(t *testing.T) {
 		runtimes[i].NodeID, runtimes[i].PeerToken = entries[i].Member.ID, tokens[i]
 		runtimes[i].PeerAddr, runtimes[i].BindAddr = strings.TrimPrefix(entries[i].Member.PeerURL, "quic://"), ""
 		runtimes[i].DataDir = filepath.Join(t.TempDir(), "source")
+		if i == 0 {
+			runtimes[i].CheckpointInterval = 100 * time.Millisecond
+		}
 		nodes[i] = node.New(&runtimes[i])
 		physical, member, err := nodes[i].PreparedStartupBindingDigestsForProtocol(plan.ApplicationProtocol)
 		if err != nil {
@@ -460,38 +324,10 @@ func TestEmbeddedObjectStorageManagedKVNode(t *testing.T) {
 	for _, n := range nodes {
 		waitAdmission(n)
 	}
-	finalize := func(c *mixedProviderNodeChecker, reserved operator.V1Alpha2AdmissionSnapshot) {
-		t.Helper()
-		state, err := c.n.InspectManagedKV(ctx, false)
-		if err != nil {
-			t.Fatal(err)
-		}
-		request, ok := reserved.Pending()
-		if !ok {
-			t.Fatal("lost actual reservation")
-		}
-		if _, observation, err := operator.FinalizeV1Alpha2Write(ctx, store, reserved, reserved.Authority(), request, operator.V1Alpha2WriteCommitted, mixedProviderEvidence(state)); err != nil || observation != operator.V1Alpha2CASApplied {
-			t.Fatal("finalize direct CAS", observation, err)
-		}
-		c.active.Store(nil)
-	}
 	mutate := func(index int, operation string, req network.KVMutationRequest) network.KVMutationResponse {
 		t.Helper()
 		c := checkers[index]
 		waitAdmission(c.n)
-		old, err := operator.LoadV1Alpha2Admission(ctx, store, ref)
-		if err != nil {
-			t.Fatal(err)
-		}
-		reserved, observation, err := operator.ReserveV1Alpha2KVWrite(ctx, store, old, old.Authority(), old.Evidence(), types.KVCommand{RequestID: req.RequestID, Operation: operation, Key: req.Key, Value: req.Value, Expected: req.Expected, ExpectedExists: req.ExpectedExists, TTLMS: req.TTLMS})
-		if err != nil || observation != operator.V1Alpha2CASApplied {
-			t.Fatal("reserve direct CAS", observation, err)
-		}
-		pending, ok := reserved.Pending()
-		if !ok {
-			t.Fatal("missing directly reserved KV")
-		}
-		c.active.Store(&pending)
 		result, err := c.n.ExecuteManagedKV(ctx, operation, req)
 		if err != nil {
 			t.Fatal("real reserved KV", err)
@@ -500,28 +336,13 @@ func TestEmbeddedObjectStorageManagedKVNode(t *testing.T) {
 		if err != nil || resolved.Receipt == nil || resolved.Durability != network.ResolveKVDurabilityConfirmed || resolved.Receipt.Slot != result.Slot {
 			t.Fatal("real original durability", resolved, err)
 		}
-		finalize(c, reserved)
 		return result
 	}
-	// SQL and KV share one real original/pending lane in the authority fixture.
+	// SQL and KV retain their originals in certified application history, not CR reservations.
 	sqlRequest := network.ExecuteRequest{RequestID: "mixed-sql", SQL: "CREATE TABLE mixed_node_rows(v INTEGER)"}
-	a, err := operator.LoadV1Alpha2Admission(ctx, store, ref)
-	if err != nil {
-		t.Fatal(err)
-	}
-	reserved, observation, err := operator.ReserveV1Alpha2SQLWrite(ctx, store, a, a.Authority(), a.Evidence(), sqlRequest)
-	if err != nil || observation != operator.V1Alpha2CASApplied {
-		t.Fatal(err, observation)
-	}
-	pendingSQL, ok := reserved.Pending()
-	if !ok {
-		t.Fatal("missing directly reserved SQL")
-	}
-	checkers[0].active.Store(&pendingSQL)
 	if _, err := nodes[0].ExecuteManagedSQL(ctx, sqlRequest); err != nil {
 		t.Fatal(err)
 	}
-	finalize(checkers[0], reserved)
 	id, key := string([]byte{0xff}), string([]byte{0xfe})
 	ack := mutate(0, "put", network.KVMutationRequest{RequestID: id, Key: key, Value: []byte("ack-kept")})
 	falseACK := mutate(0, "cas", network.KVMutationRequest{RequestID: "false-cas", Key: "absent", ExpectedExists: true, Expected: []byte{}, Value: nil})
@@ -560,26 +381,49 @@ func TestEmbeddedObjectStorageManagedKVNode(t *testing.T) {
 	readonly := &readonlyProviderBucket{Bucket: bucket}
 	trusted := quepaxa.Cluster{ConfigID: 1, Members: base.Members}
 	prefix := path.Join(base.ObjStorePrefix, string(cluster))
+	var view *recovery.ReadOnlyView
+	for {
+		view, err = recovery.OpenReadOnlyViewForApplicationProtocol(ctx, readonly, prefix, 1, trusted, sqlpolicy.ManagedRequestMaterializationPolicy, types.DefaultIdempotencyWindowSlots, plan.ApplicationProtocol, true)
+		if err == nil && uint64(view.Base()) >= falseACK.Slot {
+			break
+		}
+		timer := time.NewTimer(20 * time.Millisecond)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			t.Fatal("real append-only publisher did not certify prior ACK checkpoint", err)
+		case <-timer.C:
+		}
+	}
 	if err := nodes[0].Shutdown(); err != nil {
 		t.Fatal(err)
 	}
 	nodes[0] = nil
-	// Managed Nodes intentionally do not start automatic checkpoint/GC work.
-	// Reuse this stopped member's registered WAL identity for a one-shot,
-	// authenticated checkpoint proposal while the other real voters serve it.
-	mixedProviderCheckpoint(t, ctx, runtimes[0], trusted, bucket, prefix)
-	view, err := recovery.OpenReadOnlyViewForPolicy(ctx, readonly, prefix, 1, trusted, 8, types.DefaultIdempotencyWindowSlots)
-	if err != nil || view.Base() == 0 {
-		t.Fatal("certified mixed checkpoint base", err)
-	}
-	baseTip := view.Base()
-	suffixACK := mutate(1, "put", network.KVMutationRequest{RequestID: "suffix", Key: "suffix-key", Value: []byte("after-checkpoint")})
-	canonical, err := operator.LoadV1Alpha2Admission(ctx, store, ref)
+	// Capture a real discovery hint after stopping the producing member. Other
+	// voters may publish newer CURRENT hints; this fixture verifies the exact
+	// earlier physical base plus a subsequently certified application suffix.
+	currentName := path.Join(prefix, "checkpoint/CURRENT")
+	currentReader, err := readonly.Get(ctx, currentName)
 	if err != nil {
 		t.Fatal(err)
 	}
+	currentBytes, readErr := io.ReadAll(currentReader)
+	if err := errors.Join(readErr, currentReader.Close()); err != nil {
+		t.Fatal(err)
+	}
+	currentAttributes, err := readonly.Attributes(ctx, currentName)
+	if err != nil {
+		t.Fatal(err)
+	}
+	restoreSource := &mixedProviderPinnedCurrent{Bucket: readonly, name: currentName, data: currentBytes, attributes: currentAttributes}
+	view, err = recovery.OpenReadOnlyViewForApplicationProtocol(ctx, restoreSource, prefix, 1, trusted, sqlpolicy.ManagedRequestMaterializationPolicy, types.DefaultIdempotencyWindowSlots, plan.ApplicationProtocol, true)
+	if err != nil || view.Base() == 0 {
+		t.Fatal("certified append-only checkpoint base", err)
+	}
+	baseTip := view.Base()
+	suffixACK := mutate(1, "put", network.KVMutationRequest{RequestID: "suffix", Key: "suffix-key", Value: []byte("after-checkpoint")})
 	for {
-		view, err = recovery.OpenReadOnlyViewForPolicy(ctx, readonly, prefix, 1, trusted, 8, types.DefaultIdempotencyWindowSlots)
+		view, err = recovery.OpenReadOnlyViewForApplicationProtocol(ctx, restoreSource, prefix, 1, trusted, sqlpolicy.ManagedRequestMaterializationPolicy, types.DefaultIdempotencyWindowSlots, plan.ApplicationProtocol, true)
 		if err == nil && view.Base() == baseTip && uint64(view.Tip()) >= suffixACK.Slot {
 			break
 		}
@@ -619,10 +463,10 @@ func TestEmbeddedObjectStorageManagedKVNode(t *testing.T) {
 	}
 	i := node.ManagedStartupIdentity{ApplicationProtocol: plan.ApplicationProtocol, EvidenceFormat: plan.EvidenceFormat, AssignmentID: plan.AssignmentID, IntentHash: plan.IntentHash, StorageID: plan.StorageID, PhysicalBinding: physical, BootstrapPlanDigest: plan.BootstrapPlanDigest, Member: recovery.PreparedStartupIdentity{ClusterUID: ref.UID, DeploymentUID: plan.DeploymentUID, PodUID: pod, NodeID: string(replacement.NodeID), SourceBinding: physical, ConfigDigest: member}}
 	handoff := filepath.Join(t.TempDir(), "handoff")
-	if err := recovery.PublishPreparedStartupForPolicy(ctx, view, handoff, i.Member, 8, types.DefaultIdempotencyWindowSlots); err != nil {
+	if err := recovery.PublishPreparedStartupForPolicy(ctx, view, handoff, i.Member, sqlpolicy.ManagedRequestMaterializationPolicy, types.DefaultIdempotencyWindowSlots); err != nil {
 		t.Fatal(err)
 	}
-	prepared, err := recovery.LoadPreparedStartupForPolicy(ctx, readonly, prefix, 1, trusted, handoff, replacement.DataDir, i.Member, 8, types.DefaultIdempotencyWindowSlots)
+	prepared, err := recovery.LoadPreparedStartupForApplicationProtocol(ctx, restoreSource, prefix, 1, trusted, handoff, replacement.DataDir, i.Member, sqlpolicy.ManagedRequestMaterializationPolicy, types.DefaultIdempotencyWindowSlots, plan.ApplicationProtocol, true)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -632,7 +476,7 @@ func TestEmbeddedObjectStorageManagedKVNode(t *testing.T) {
 		t.Fatal("prepared public OpenManaged", err)
 	}
 	state, err = n.InspectManagedKV(ctx, false)
-	if err != nil || state.Runtime.AppliedTip != uint64(view.Tip()) || !bytes.Equal(mixedProviderEvidence(state), canonical.Evidence()) {
+	if err != nil || state.Runtime.AppliedTip != uint64(view.Tip()) {
 		_ = n.Shutdown()
 		t.Fatal("prepared mixed evidence", err)
 	}
@@ -641,7 +485,7 @@ func TestEmbeddedObjectStorageManagedKVNode(t *testing.T) {
 	}
 	// Directly read the data/receipts restored by the public Node path after it
 	// has closed. This does not make the unpromoted learner application-ready.
-	restored, err := materializer.OpenManagedSQLKV(filepath.Join(replacement.DataDir, "sqlite.db"), 1)
+	restored, err := materializer.OpenManagedSQLKVWithAppendOnlyOriginals(filepath.Join(replacement.DataDir, "sqlite.db"), 1)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -697,15 +541,11 @@ func (c *mixedGenesisWriteCounter) RoundTrip(r *http.Request) (*http.Response, e
 // This is the real status initializer with a bounded TLS authority fixture.
 // It does not contact a provider or establish Kubernetes qualification.
 func TestManagedKVNodeProviderGenesisBinding(t *testing.T) {
-	for _, protocol := range []string{"", types.ManagedApplicationProtocolSQLKV} {
+	for _, protocol := range []string{sqlpolicy.ManagedRequestAppendOnlyApplicationProtocol, sqlpolicy.ManagedGraphRequestAppendOnlyApplicationProtocol} {
 		t.Run(protocol, func(t *testing.T) {
 			ref := operator.V1Alpha2ClusterRef{Name: "fixture", Namespace: "ns", UID: "managed-provider-fixture"}
-			format := operator.V1Alpha2ManagedSQLEvidenceFormat
-			var options []string
-			if protocol != "" {
-				format = operator.V1Alpha2ManagedSQLKVEvidenceFormat
-				options = []string{protocol}
-			}
+			format := protocol
+			options := []string{protocol}
 			profile := operator.V1Alpha2RuntimeProfile{ApplicationProtocol: protocol, EvidenceFormat: format, InitImage: "fixture:v1", PeerPort: 9090, ProfileSecretName: "runtime", Storage: types.ExecutionConfig{AdminToken: "fixture-admin", ObjStoreProvider: "s3", ObjStoreBucket: "test", ObjStoreEndpoint: "127.0.0.1:1", ObjStoreInsecure: true, EnableReconfiguration: true}}
 			members := make([]operator.V1Alpha2BootstrapMember, 3)
 			cluster, err := types.ManagedClusterID(ref.UID, 0)
@@ -740,7 +580,7 @@ func TestManagedKVNodeProviderGenesisBinding(t *testing.T) {
 					}
 					if fault == "protocol" {
 						if protocol == "" {
-							request.ApplicationProtocol = types.ManagedApplicationProtocolSQLKV
+							request.ApplicationProtocol = sqlpolicy.ManagedRequestAppendOnlyApplicationProtocol
 						} else {
 							request.ApplicationProtocol = ""
 						}
@@ -759,7 +599,7 @@ func TestManagedKVNodeProviderGenesisBinding(t *testing.T) {
 					if err != nil || loaded.Assignment().Plan != assignment {
 						t.Fatal("initialized plan changed", err)
 					}
-					if protocol == types.ManagedApplicationProtocolSQLKV {
+					if protocol == sqlpolicy.ManagedRequestAppendOnlyApplicationProtocol {
 						t.Run("evidence-status-roundtrip", func(t *testing.T) {
 							// Serialization-layer probe only: no Node or provider is opened.
 							input := mixedProviderEvidence(node.ManagedKVSnapshot{Application: materializer.ManagedApplicationState{Digest: [32]byte{1}}})

@@ -14,18 +14,21 @@ process permission to forget an existing voter's recorded proposals.
 | Voter falls behind | Fetch certified peer/archive history; restore a pinned checkpoint when needed. |
 | One voter unavailable | The remaining voters still hold a strict majority, so quorum operations continue. |
 | Unavailable voters leave fewer than a strict majority (two of three, three of five) | Restore the original nodes/disks/network. Quorum operations remain unavailable; local reads on running nodes remain possible. |
-| Voter WAL permanently lost | Never reuse its registered identity with an empty WAL. With a surviving quorum, fence the lost voter and replace it through a fresh learner; otherwise use explicitly fenced whole-generation recovery. |
-| Membership change or learner promotion | Supported through opt-in authenticated reconfiguration with a surviving quorum, fencing, and durable learner admission. Editing the bootstrap member list is not reconfiguration. |
+| Voter WAL permanently lost | Never reuse its registered identity with an empty WAL. With a surviving quorum, use certified ADD-first replacement with a fresh voter ID and WAL; otherwise restore the original quorum or stop for manual DR. |
+| Membership change or learner promotion | Use authenticated QuePaxa reconfiguration with a surviving quorum and durable learner admission. Editing the bootstrap member list is not reconfiguration. |
 
 `Ready()` describes completed local startup/catch-up, not current quorum
 availability. Do not turn quorum loss into a liveness policy that restarts all
 voters or replaces their volumes. Recovery-time Record RPCs remain necessary
 for voters with intact state to resolve unfinished slots during a full restart.
 
-Online replacement has two Operator paths: manual `RhizaRecovery.spec.membership`
-uses an externally provisioned learner and trusted fence attestation; opt-in
-`RhizaCluster` automatic recovery requests fencing and provisions the learner
-after matching proof. See the [membership workflow](membership-completion-plan.md).
+Normal managed HA adds a fresh learner, verifies its certified prefix and WAL
+identity, commits its admission, then removes the failed identity through the
+surviving quorum. A lost or removed voter ID is never reused. Same-identity
+rejoin requires its intact original WAL and the current certified membership;
+an empty WAL cannot acquire voting authority by replaying an archive.
+This path does not require a separate fencer or external lease service.
+It does not prove that an isolated process ended or that external work drained.
 Passive fixed read replicas remain outside membership reconfiguration.
 
 ## Voter registration and upgrades
@@ -70,10 +73,10 @@ stopped permanently; it is not a multi-voter replacement protocol.
 ## Checkpoints and remote durability
 
 A checkpoint's certified seal must be durably published to the archive before
-`CURRENT` advertises that checkpoint. Initial recovery pins its selected
-shared CAS archive history and checkpoint files against concurrent trimming/GC until
-replay and installation finish. A lost recovery lease fails recovery instead
-of silently continuing with an unprotected source.
+`CURRENT` advertises that checkpoint. HA object data is append-only; online
+delete GC is not part of the HA contract. Certified checkpoint and archive
+validation still protect recovery. Local-mode restore pins and GC have their
+own contract and are not removed by this boundary.
 
 Graceful close drains and joins local work and syncs/closes the WAL. For
 archive-publishing voting nodes, it also publishes the final local certified
@@ -92,39 +95,42 @@ acknowledged changes newer than the last published prefix after permanent
 loss of the authoritative voter disks; the publication interval is not a
 guaranteed maximum loss window.
 
-## No-PVC recovery operator
+## Managed No-PVC HA and manual disaster recovery
 
-The namespace-scoped [recovery operator](../deploy/operator/README.md) supports
-both `async` and `before-ack` for an existing `emptyDir` StatefulSet of at least
-three voters. The voter count comes from `RhizaCluster.spec.voterCount` and must
-equal the StatefulSet replica count; the operator rejects a mismatch. Existing
-exported membership is adopted as-is, while a workload with no exported
-membership receives one immutable, Operator-generated bootstrap Secret. Quorum and
-completion need only the strict majority of that membership. Lost WALs that
-leave less than a majority use the same full-generation disaster-recovery path.
-Preserved WALs should first regain their original quorum; missing pods and
-failed probes alone never authorize a generation change.
+The namespace-scoped [managed operator](../deploy/operator/README.md) uses
+v1alpha2 Deployment Pods and init-container identity handoff. The public managed
+Host requires before-ack durability. Healthy-quorum replacement uses the
+certified ADD-first path above, not a separate fencing Deployment.
 
-A manual recovery request requires an out-of-band fence attestation tied to the
-source cluster, StatefulSet UID, and recovery operation. All old voters,
-clients, read replicas, and archive/GC writers must be fenced. The operator
-reserves one successor, atomically seals the source archive HEAD against late
-publication, verifies and copies its certified checkpoint and suffix into a
-new namespace, and restarts the StatefulSet with a new ClusterID and peer
-credentials. The ordinal names remain unchanged. This is a service-interrupting
-whole-generation recovery, not online voter replacement or membership changes.
+If quorum is lost, writes and linearizable reads fail; ready nodes can still
+serve local reads. First restore the original nodes, disks or network. Missing
+Pods, failed probes and object-store checkpoints cannot manufacture quorum or
+authorize a generation change.
 
-The opt-in automatic loop can choose online voter replacement when quorum
-survives or whole-generation recovery when it is lost. Its Kubernetes backend
-submits an immutable `RhizaFence` and waits for proof of termination of the
-requested identity scope, recreation prevention, and storage quiescence. A Pod
-delete response is not proof. The supplied executor is qualified only in CI on
-single-node kind with a dedicated S3 test gateway; production requires a trusted,
-environment-specific runtime/storage executor. Missing proof blocks recovery.
+Whole-generation DR is separately authorized, not an automatic fallback
+implemented by the current operator. The approved design defaults automatic
+attempts to OFF. Explicit policy may trigger preparation after sustained
+actual ReadIndex/quorum failures, but failure detection is not activation
+authority. This automatic-attempt policy is not yet implemented or qualified.
+
+Activation requires verified
+termination or isolation of the complete old identity scope, recreation
+prevention, termination of every old runtime/voter/sidecar, in-flight
+storage-work completion, certified source coverage of every successful ACK,
+live activation authority and a verified new ready quorum before service resumes.
+Unknown evidence or partition leaves recovery Blocked for manual action.
+No new lease, epoch or live permissions are introduced. Pending writes,
+UNKNOWN outcomes and live anchor/Transition checks remain protected.
+A Pod delete response, elapsed timeout or stored receipt
+alone is insufficient. Preserve all evidence and pending application state;
+missing evidence blocks DR. Legacy alpha1 `spec.membership`, `spec.fence` and
+StatefulSet recovery examples are unsupported by the current alpha2 API and
+must not be applied as an operational procedure.
 
 The source generation's immutable membership record binds its durability mode.
-An `async` source requires explicit `allowDataLoss`, even when the target uses
-`before-ack`. Changing an environment variable cannot retroactively protect
+Manual DR from an `async` source requires explicit data-loss authorization,
+even when the target uses `before-ack`. This is not an alpha2 `allowDataLoss`
+field or permission to enable legacy recovery. Changing an environment variable cannot retroactively protect
 past acknowledgements. Unknown legacy durability records fail closed and must
 not be rewritten or removed to bypass validation. Archive age is evidence age,
 not a bound on the number or age of missing acknowledged writes.

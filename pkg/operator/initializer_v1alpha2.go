@@ -43,13 +43,7 @@ func ValidateV1Alpha2ApplicationProfile(protocol, evidenceFormat string) error {
 	if _, _, err := types.ManagedApplicationPolicy(protocol); err != nil {
 		return err
 	}
-	expected := V1Alpha2ManagedSQLEvidenceFormat
-	if protocol != "" {
-		// ManagedApplicationPolicy above accepts only explicit installed
-		// capabilities. Each nonlegacy profile carries its own evidence marker.
-		expected = protocol
-	}
-	if evidenceFormat != expected {
+	if evidenceFormat != protocol {
 		return fmt.Errorf("managed application evidence profile mismatch")
 	}
 	return nil
@@ -126,6 +120,9 @@ var ErrV1Alpha2BootstrapPending = errors.New("v1alpha2 bootstrap identities pend
 // ReconcileV1Alpha2ManagedInitialization freezes actual gated Pod identities in
 // genesis. A successful return describes the committed plan, never our draft.
 func ReconcileV1Alpha2ManagedInitialization(ctx context.Context, kube *Kubernetes, ref V1Alpha2ClusterRef, profile V1Alpha2RuntimeProfile) (V1Alpha2StatusSnapshot, error) {
+	if err := ValidateV1Alpha2ApplicationProfile(profile.ApplicationProtocol, profile.EvidenceFormat); err != nil {
+		return V1Alpha2StatusSnapshot{}, err
+	}
 	store := &V1Alpha2StatusStore{Kube: kube}
 	path, err := store.path(ref)
 	if err != nil {
@@ -336,11 +333,11 @@ func managedCandidateSpecMatches(raw, expected json.RawMessage) bool {
 func BuildV1Alpha2RuntimePlan(ref V1Alpha2ClusterRef, logicalID, deploymentUID string, profile V1Alpha2RuntimeProfile, members []V1Alpha2BootstrapMember) (V1Alpha2ApplicationInitPlan, V1Alpha2BootstrapPlan, error) {
 	var assignment V1Alpha2ApplicationInitPlan
 	var plan V1Alpha2BootstrapPlan
-	if profile.Storage.AdminToken == "" {
-		return assignment, plan, fmt.Errorf("managed application requires an admin token")
-	}
 	if err := ValidateV1Alpha2ApplicationProfile(profile.ApplicationProtocol, profile.EvidenceFormat); err != nil {
 		return assignment, plan, err
+	}
+	if profile.Storage.AdminToken == "" {
+		return assignment, plan, fmt.Errorf("managed application requires an admin token")
 	}
 	if profile.InitImage == "" || profile.PeerPort < 1 || profile.PeerPort > 65535 || profile.EvidenceFormat == "" || profile.Storage.ObjStoreBucket == "" {
 		return assignment, plan, fmt.Errorf("incomplete managed runtime profile")
@@ -448,6 +445,11 @@ func ReconcileV1Alpha2Initialization(ctx context.Context, kube *Kubernetes, ref 
 	}
 	if len(providers) != 1 || providers[0] == nil {
 		return V1Alpha2StatusSnapshot{}, fmt.Errorf("initialization requires a runtime common plan provider")
+	}
+	// Historical CRs remain structurally readable but cannot start an execution
+	// profile. The provider is invoked only once below, with the real live UID.
+	if _, _, err := types.ManagedApplicationPolicy(c.Spec.ApplicationProtocol); err != nil {
+		return V1Alpha2StatusSnapshot{}, err
 	}
 	for _, key := range []string{"authority", "applicationInit", "recoveryQueue", "pendingWrite", "transition", "receipt", "decision"} {
 		if _, ok := status[key]; ok {

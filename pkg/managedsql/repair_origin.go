@@ -47,14 +47,43 @@ func (h *Host) ValidateManagedRepairOrigin(ctx context.Context, raw []byte) erro
 	if plan.Replacement.PublicKey != quepaxa.PublicKey(network.PeerPublicKey(h.cfg.Runtime.ClusterID, h.cfg.Runtime.NodeID, h.cfg.Runtime.PeerToken)) {
 		return fmt.Errorf("repair origin public key differs from configured peer identity")
 	}
-	if handoff.PlanDigest != plan.Digest() || handoff.PhysicalBinding != h.identity.PhysicalBinding || handoff.SourceRoot != h.cfg.StorageRoot || handoff.HeadHash != fmt.Sprintf("%x", sha256.Sum256(handoff.Head)) || len(handoff.Head) == 0 || handoff.RemoveTerminalSlot <= plan.ExpectedAbortSlot || handoff.Survivors.ConfigID != uint(plan.ExpectedConfigID+1) {
+	if handoff.PlanDigest != plan.Digest() || handoff.PhysicalBinding != h.identity.PhysicalBinding || handoff.SourceRoot != h.cfg.StorageRoot || handoff.HeadHash != fmt.Sprintf("%x", sha256.Sum256(handoff.Head)) || len(handoff.Head) == 0 {
 		return fmt.Errorf("repair origin handoff digest or physical binding mismatch")
 	}
-	if terminalHash, err := hex.DecodeString(handoff.RemoveTerminalHash); err != nil || len(terminalHash) != sha256.Size {
-		return fmt.Errorf("invalid repair origin REMOVE terminal hash")
-	}
-	if h.cfg.Prepared != nil && !bytes.Equal(handoff.Head, h.cfg.Prepared.View().CapturedHead()) {
-		return fmt.Errorf("prepared source HEAD differs from immutable repair origin")
+	switch plan.Sequence {
+	case "", operator.V1Alpha2RepairRemoveThenAdd:
+		if handoff.RemoveTerminalSlot <= plan.ExpectedAbortSlot || handoff.Survivors.ConfigID != uint(plan.ExpectedConfigID+1) || handoff.PreparedConfig != nil || handoff.PreparedSlot != 0 || handoff.PreparedHash != "" {
+			return fmt.Errorf("repair origin handoff digest or physical binding mismatch")
+		}
+		if terminalHash, err := hex.DecodeString(handoff.RemoveTerminalHash); err != nil || len(terminalHash) != sha256.Size {
+			return fmt.Errorf("invalid repair origin REMOVE terminal hash")
+		}
+		if h.cfg.Prepared != nil && !bytes.Equal(handoff.Head, h.cfg.Prepared.View().CapturedHead()) {
+			return fmt.Errorf("prepared source HEAD differs from immutable repair origin")
+		}
+	case operator.V1Alpha2RepairAddThenRemove:
+		if handoff.PreparedConfig == nil || uint64(handoff.PreparedConfig.ConfigID) != plan.ExpectedConfigID || handoff.PreparedSlot <= plan.ExpectedAbortSlot || handoff.RemoveTerminalSlot != 0 || handoff.RemoveTerminalHash != "" || handoff.Survivors.ConfigID != 0 || len(handoff.Survivors.Members) != 0 {
+			return fmt.Errorf("invalid ADD-first prepared source in repair origin")
+		}
+		preparedHash, err := hex.DecodeString(handoff.PreparedHash)
+		if err != nil || len(preparedHash) != sha256.Size || fmt.Sprintf("%x", preparedHash) != handoff.PreparedHash {
+			return fmt.Errorf("invalid ADD-first prepared prefix hash in repair origin")
+		}
+		if h.cfg.Prepared != nil {
+			view := h.cfg.Prepared.View()
+			if view == nil {
+				return fmt.Errorf("ADD-first prepared source differs from immutable repair origin")
+			}
+			prefixHash := view.PrefixHash()
+			if uint64(view.Tip()) != handoff.PreparedSlot || !bytes.Equal(prefixHash[:], preparedHash) || !bytes.Equal(handoff.Head, view.CapturedHead()) {
+				return fmt.Errorf("ADD-first prepared source differs from immutable repair origin")
+			}
+		}
+		// With no Prepared view this is a retained same-Pod restart. Node's
+		// preflight separately requires a valid persisted adoption whose exact
+		// origin digest matches these immutable H bytes before opening runtime state.
+	default:
+		return fmt.Errorf("unsupported repair origin sequence")
 	}
 	namespace, err := node.ManagedNamespaceFor(h.cfg.StorageRoot, h.cfg.Ref.UID, h.cfg.Plan.Generation, h.cfg.Plan.AssignmentID, string(h.cfg.Runtime.ClusterID))
 	if err != nil || handoff.SourcePrefix != namespace.FinalPrefix {

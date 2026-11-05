@@ -26,6 +26,10 @@ spec:
               message: mixed pending must retain its exact authority reservation
             - rule: '!has(self.spec.applicationProtocol) || !has(oldSelf.status) || !has(oldSelf.status.authority) || !has(oldSelf.status.authority.pendingWrite) || !oldSelf.status.authority.pendingWrite || !has(self.status) || !has(self.status.authority) || !has(self.status.authority.pendingWrite) || !self.status.authority.pendingWrite || (has(self.status.authority.pendingRequest) && has(oldSelf.status.authority.pendingRequest) && self.status.authority.pendingRequest == oldSelf.status.authority.pendingRequest)'
               message: a mixed pending request cannot be replaced in place
+            - rule: '!has(self.spec.applicationProtocol) || !(self.spec.applicationProtocol in ["rhiza-managed-request-append-only/v1", "rhiza-managed-request-graph-append-only/v1"]) || !has(self.status) || !has(self.status.authority) || !has(self.status.authority.pendingWrite) || !self.status.authority.pendingWrite || (has(oldSelf.status) && has(oldSelf.status.authority) && has(oldSelf.status.authority.pendingWrite) && oldSelf.status.authority.pendingWrite)'
+              message: append-only profiles cannot create CR application pending writes
+            - rule: '!has(self.spec.applicationProtocol) || !(self.spec.applicationProtocol in ["rhiza-managed-request-append-only/v1", "rhiza-managed-request-graph-append-only/v1"]) || !has(oldSelf.status) || !has(oldSelf.status.authority) || !has(oldSelf.status.authority.pendingWrite) || !oldSelf.status.authority.pendingWrite || (has(self.status) && has(self.status.authority) && has(self.status.authority.pendingWrite) && self.status.authority.pendingWrite && has(self.status.authority.pendingRequest) && has(oldSelf.status.authority.pendingRequest) && self.status.authority.pendingRequest == oldSelf.status.authority.pendingRequest && has(self.status.authority.evidence) && has(oldSelf.status.authority.evidence) && self.status.authority.evidence == oldSelf.status.authority.evidence)'
+              message: historical append-only CR pending and evidence must remain unchanged
             - rule: '!has(self.spec.applicationProtocol) || !has(self.status) || !has(self.status.authority) || has(self.status.applicationInit)'
               message: mixed authority requires initialization marker
             - rule: '!has(self.status) || !has(self.status.applicationInit) || (has(self.spec.applicationProtocol) == has(self.status.applicationInit.plan.applicationProtocol) && (!has(self.spec.applicationProtocol) || self.spec.applicationProtocol == self.status.applicationInit.plan.applicationProtocol))'
@@ -56,7 +60,7 @@ spec:
                 - rule: self.voterCount == oldSelf.voterCount
                   message: voterCount updates are unsupported
               properties:
-                applicationProtocol: {type: string, maxLength: 64, enum: [rhiza-managed-sql-kv/v1, rhiza-managed-request-append-only/v1, rhiza-managed-request-graph-append-only/v1]}
+                applicationProtocol: {type: string, maxLength: 64, enum: [rhiza-managed-request-append-only/v1, rhiza-managed-request-graph-append-only/v1]}
                 genesisIntent: {type: string, maxLength: 6, enum: [Create]}
                 statefulSet: {type: string}
                 container: {type: string}
@@ -161,8 +165,12 @@ spec:
                   message: repair intent is immutable per operation
                 - rule: '!has(oldSelf.repair) || !has(self.repair) || oldSelf.repair.state == "Closed" || self.repair.plan.operationID != oldSelf.repair.plan.operationID || self.repair == oldSelf.repair'
                   message: terminal repair is immutable per operation
+                - rule: '!has(oldSelf.repair) || !has(oldSelf.repair.addCompletion) || (has(self.repair) && (self.repair.plan.operationID != oldSelf.repair.plan.operationID || (has(self.repair.addCompletion) && self.repair.addCompletion == oldSelf.repair.addCompletion)))'
+                  message: ADD terminal proof is immutable once recorded
                 - rule: '!has(self.repair) || (has(oldSelf.repair) && self.repair.plan.operationID == oldSelf.repair.plan.operationID) || self.repair.state == "Closed"'
                   message: a new repair must start closed
+                - rule: '!has(self.repair) || (has(oldSelf.repair) && self.repair.plan.operationID == oldSelf.repair.plan.operationID) || (has(self.repair.plan.sequence) && self.repair.plan.sequence == "addThenRemove")'
+                  message: a new repair operation requires ADD-first sequence
                 - rule: '!has(oldSelf.repair) || !has(self.repair) || self.repair.plan.operationID == oldSelf.repair.plan.operationID || (oldSelf.repair.state != "Closed" && self.repair.state == "Closed" && (self.repair.plan.generation > oldSelf.repair.plan.generation || (self.repair.plan.generation == oldSelf.repair.plan.generation && self.repair.plan.expectedConfigID >= oldSelf.repair.completion.configID && (self.repair.plan.expectedConfigID > oldSelf.repair.plan.expectedConfigID || (self.repair.plan.expectedConfigID == oldSelf.repair.plan.expectedConfigID && self.repair.plan.expectedAbortSlot > oldSelf.repair.plan.expectedAbortSlot)) && (oldSelf.repair.state != "Aborted" || self.repair.plan.expectedConfigID != oldSelf.repair.completion.configID || self.repair.plan.expectedAbortSlot >= oldSelf.repair.completion.slot))))'
                   message: replacement repair requires a terminal predecessor and advanced position
                 - rule: '!has(self.repair) || (has(oldSelf.repair) && self.repair == oldSelf.repair) || (has(oldSelf.authority) && self.authority == oldSelf.authority)'
@@ -252,21 +260,47 @@ spec:
                   x-kubernetes-validations:
                     - rule: 'self.plan.operationID != oldSelf.plan.operationID || !has(oldSelf.preparedHandoff) || (has(self.preparedHandoff) && self.preparedHandoff == oldSelf.preparedHandoff)'
                       message: captured handoff is immutable within an operation
-                    - rule: '!has(self.preparedHandoff) || (self.preparedHandoff.survivors.config_id == self.plan.expectedConfigID + 1 && self.preparedHandoff.removeTerminalSlot > self.plan.expectedAbortSlot)'
+                    - rule: '!has(self.preparedHandoff) || (has(self.plan.sequence) && self.plan.sequence == "addThenRemove") || (has(self.preparedHandoff.survivors) && self.preparedHandoff.survivors.config_id == self.plan.expectedConfigID + 1 && self.preparedHandoff.removeTerminalSlot > self.plan.expectedAbortSlot)'
                       message: handoff must bind the post-REMOVE configuration and terminal position
-                    - rule: '!has(self.preparedHandoff) || (self.preparedHandoff.survivors.members.size() + 1 == self.plan.finalVoterIDs.size() && self.preparedHandoff.survivors.members.all(m, m.node_id != self.plan.oldNodeID && m.node_id != self.plan.replacement.nodeID && m.node_id in self.plan.finalVoterIDs && self.preparedHandoff.survivors.members.filter(other, other.node_id == m.node_id).size() == 1))'
+                    - rule: '!has(self.preparedHandoff) || (has(self.plan.sequence) && self.plan.sequence == "addThenRemove") || (has(self.preparedHandoff.survivors) && self.preparedHandoff.survivors.members.size() + 1 == self.plan.finalVoterIDs.size() && self.preparedHandoff.survivors.members.all(m, m.node_id != self.plan.oldNodeID && m.node_id != self.plan.replacement.nodeID && m.node_id in self.plan.finalVoterIDs && self.preparedHandoff.survivors.members.filter(other, other.node_id == m.node_id).size() == 1))'
                       message: handoff survivor set must exactly precede the intended ADD
+                    - rule: '!has(self.preparedHandoff) || !has(self.plan.sequence) || self.plan.sequence != "addThenRemove" || (has(self.preparedHandoff.preparedConfig) && self.preparedHandoff.preparedConfig.config_id == self.plan.expectedConfigID && has(self.preparedHandoff.preparedSlot) && self.preparedHandoff.preparedSlot > self.plan.expectedAbortSlot && has(self.preparedHandoff.preparedHash) && !has(self.preparedHandoff.removeTerminalSlot) && !has(self.preparedHandoff.removeTerminalHash) && !has(self.preparedHandoff.survivors) && self.preparedHandoff.preparedConfig.members.exists(m, m.node_id == self.plan.oldNodeID && (!has(m.wal_identity) || m.wal_identity == self.plan.oldWALIdentity)) && !self.preparedHandoff.preparedConfig.members.exists(m, m.node_id == self.plan.replacement.nodeID) && self.preparedHandoff.preparedConfig.members.filter(m, m.node_id != self.plan.oldNodeID).size() + 1 == self.plan.finalVoterIDs.size() && self.preparedHandoff.preparedConfig.members.all(m, m.node_id == self.plan.oldNodeID || m.node_id in self.plan.finalVoterIDs) && self.plan.finalVoterIDs.all(id, id == self.plan.replacement.nodeID || self.preparedHandoff.preparedConfig.members.exists(m, m.node_id == id && id != self.plan.oldNodeID)))'
+                      message: ADD-first prepared source must bind the current roster and exact old WAL
+                    - rule: '!has(self.preparedHandoff) || (has(self.plan.sequence) && self.plan.sequence == "addThenRemove") || (!has(self.preparedHandoff.preparedConfig) && !has(self.preparedHandoff.preparedSlot) && !has(self.preparedHandoff.preparedHash))'
+                      message: prepared source fields require ADD-first sequence
+                    - rule: '!has(self.addCompletion) || (has(self.plan.sequence) && self.plan.sequence == "addThenRemove" && ((self.state == "Closed" && !has(self.completion)) || (self.state == "Completed" && has(self.completion))) && has(self.preparedHandoff) && self.addCompletion.operationID == self.plan.operationID && self.addCompletion.expectedConfigID == self.plan.expectedConfigID && self.addCompletion.expectedAbortSlot == self.plan.expectedAbortSlot && self.addCompletion.kind == "Terminal" && self.addCompletion.configID == self.plan.expectedConfigID + 1 && self.addCompletion.slot > self.preparedHandoff.preparedSlot && has(self.addCompletion.finalVoterIDs) && self.addCompletion.finalVoterIDs.size() == self.preparedHandoff.preparedConfig.members.size() + 1 && self.preparedHandoff.preparedConfig.members.all(m, m.node_id in self.addCompletion.finalVoterIDs) && self.addCompletion.finalVoterIDs.all(id, id == self.plan.replacement.nodeID || self.preparedHandoff.preparedConfig.members.exists(m, m.node_id == id)))'
+                      message: ADD terminal proof must bind the exact intermediate configuration
                     - rule: '(self.state == "Closed" && !has(self.completion)) || (self.state != "Closed" && has(self.completion))'
                       message: repair state and completion must agree
                     - rule: '!has(self.completion) || (self.completion.operationID == self.plan.operationID && self.completion.expectedConfigID == self.plan.expectedConfigID && self.completion.expectedAbortSlot == self.plan.expectedAbortSlot && self.completion.slot > self.plan.expectedAbortSlot)'
                       message: repair completion must bind the exact operation and position
-                    - rule: '!has(self.completion) || (self.state == "Completed" && self.completion.kind == "Terminal" && self.completion.configID == self.plan.expectedConfigID + 2 && has(self.completion.finalVoterIDs) && self.completion.finalVoterIDs == self.plan.finalVoterIDs) || (self.state == "Aborted" && self.completion.kind == "Abort" && self.completion.configID >= self.plan.expectedConfigID && !has(self.completion.finalVoterIDs))'
+                    - rule: '!has(self.completion) || (self.state == "Completed" && self.completion.kind == "Terminal" && self.completion.configID == self.plan.expectedConfigID + 2 && has(self.completion.finalVoterIDs) && self.completion.finalVoterIDs == self.plan.finalVoterIDs && (!has(self.plan.sequence) || self.plan.sequence != "addThenRemove" || has(self.addCompletion))) || (self.state == "Aborted" && self.completion.kind == "Abort" && self.completion.configID >= self.plan.expectedConfigID && !has(self.completion.finalVoterIDs) && (!has(self.plan.sequence) || self.plan.sequence != "addThenRemove" || !has(self.addCompletion)))'
                       message: REMOVE alone is not final repair completion
+                    - rule: '!has(self.completion) || !has(self.plan.sequence) || self.plan.sequence != "addThenRemove" || self.completion.kind != "Terminal" || (has(self.addCompletion) && self.completion.slot > self.addCompletion.slot)'
+                      message: final REMOVE terminal must follow ADD terminal
                   properties:
                     state: {type: string, enum: [Closed, Completed, Aborted]}
+                    addCompletion:
+                      type: object
+                      required: [operationID, planDigest, expectedConfigID, expectedAbortSlot, kind, configID, slot, hash, finalVoterIDs]
+                      properties:
+                        operationID: {type: string, minLength: 1, maxLength: 256}
+                        planDigest: {type: string, pattern: '^[0-9a-f]{64}$', minLength: 64, maxLength: 64}
+                        expectedConfigID: {type: integer, format: int64, minimum: 1}
+                        expectedAbortSlot: {type: integer, format: int64, minimum: 0}
+                        kind: {type: string, enum: [Terminal]}
+                        configID: {type: integer, format: int64, minimum: 1}
+                        slot: {type: integer, format: int64, minimum: 1}
+                        hash: {type: string, pattern: '^[0-9a-f]{64}$', minLength: 64, maxLength: 64}
+                        finalVoterIDs:
+                          type: array
+                          minItems: 2
+                          maxItems: 64
+                          x-kubernetes-list-type: set
+                          items: {type: string, minLength: 1, maxLength: 256}
                     preparedHandoff:
                       type: object
-                      required: [planDigest, sourceRoot, sourcePrefix, physicalBinding, head, headHash, removeTerminalSlot, removeTerminalHash, survivors]
+                      required: [planDigest, sourceRoot, sourcePrefix, physicalBinding, head, headHash]
                       x-kubernetes-validations:
                         - rule: 'self.head.size() < 87384 || self.head.endsWith("==")'
                           message: captured HEAD exceeds the decoded 64 KiB limit
@@ -302,6 +336,29 @@ spec:
                                   log_url: {type: string, maxLength: 2048}
                                   public_key: {type: string, minLength: 44, maxLength: 44}
                                   wal_identity: {type: string, pattern: '^[0-9a-f]{64}$', minLength: 64, maxLength: 64}
+                        preparedConfig:
+                          type: object
+                          required: [config_id, members]
+                          properties:
+                            config_id: {type: integer, format: int64, minimum: 1}
+                            members:
+                              type: array
+                              minItems: 2
+                              maxItems: 63
+                              x-kubernetes-list-type: map
+                              x-kubernetes-list-map-keys: [node_id]
+                              items:
+                                type: object
+                                required: [node_id, url, log_url, public_key]
+                                properties:
+                                  node_id: {type: string, minLength: 1, maxLength: 256}
+                                  url: {type: string, maxLength: 2048}
+                                  peer_url: {type: string, maxLength: 2048}
+                                  log_url: {type: string, maxLength: 2048}
+                                  public_key: {type: string, minLength: 44, maxLength: 44}
+                                  wal_identity: {type: string, pattern: '^[0-9a-f]{64}$', minLength: 64, maxLength: 64}
+                        preparedSlot: {type: integer, format: int64, minimum: 1}
+                        preparedHash: {type: string, pattern: '^[0-9a-f]{64}$', minLength: 64, maxLength: 64}
                     plan:
                       type: object
                       required: [operationID, clusterUID, generation, deploymentUID, storageID, expectedConfigID, expectedAbortSlot, oldNodeID, oldWALIdentity, replacement, bootstrapPlanDigest, finalVoterIDs]
@@ -310,6 +367,7 @@ spec:
                           message: final target must include replacement and exclude old voter
                       properties:
                         operationID: {type: string, minLength: 1, maxLength: 256}
+                        sequence: {type: string, enum: [removeThenAdd, addThenRemove]}
                         clusterUID: {type: string, minLength: 1, maxLength: 256}
                         generation: {type: integer, format: int64, minimum: 0}
                         deploymentUID: {type: string, minLength: 1, maxLength: 256}
@@ -407,7 +465,7 @@ spec:
                       type: object
                       required: [assignmentID, clusterUID, intentHash, generation, deploymentUID, storageID, physicalBinding, bootstrapPlanDigest, evidenceFormat]
                       properties:
-                        applicationProtocol: {type: string, maxLength: 64, enum: [rhiza-managed-sql-kv/v1, rhiza-managed-request-append-only/v1, rhiza-managed-request-graph-append-only/v1]}
+                        applicationProtocol: {type: string, maxLength: 64, enum: [rhiza-managed-request-append-only/v1, rhiza-managed-request-graph-append-only/v1]}
                         assignmentID: {type: string, minLength: 1, maxLength: 256}
                         clusterUID: {type: string, minLength: 1, maxLength: 256}
                         intentHash: {type: string, minLength: 64, maxLength: 64, pattern: '^[0-9a-f]{64}$'}

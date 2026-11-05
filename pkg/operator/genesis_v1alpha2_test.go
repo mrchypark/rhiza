@@ -11,6 +11,7 @@ import (
 	"sync"
 	"testing"
 
+	"github.com/mrchypark/rhiza/internal/sqlpolicy"
 	"github.com/mrchypark/rhiza/internal/types"
 	"github.com/mrchypark/rhiza/pkg/quepaxa"
 )
@@ -20,7 +21,7 @@ func testBootstrapPlan(ref V1Alpha2ClusterRef) (V1Alpha2BootstrapPlan, string, e
 	if err != nil {
 		return V1Alpha2BootstrapPlan{}, "", err
 	}
-	plan := V1Alpha2BootstrapPlan{ClusterID: cluster, PhysicalBinding: strings.Repeat("a", 64), EvidenceFormat: "sql/v1", Durability: types.ObjectStoreDurabilityBeforeAck}
+	plan := V1Alpha2BootstrapPlan{ClusterID: cluster, PhysicalBinding: strings.Repeat("a", 64), EvidenceFormat: sqlpolicy.ManagedRequestAppendOnlyApplicationProtocol, Durability: types.ObjectStoreDurabilityBeforeAck}
 	var members []quepaxa.Member
 	for i := 1; i <= 3; i++ {
 		pod := fmt.Sprintf("pod-%d", i)
@@ -34,7 +35,7 @@ func testBootstrapPlan(ref V1Alpha2ClusterRef) (V1Alpha2BootstrapPlan, string, e
 		plan.Members = append(plan.Members, V1Alpha2BootstrapMember{PodUID: pod, Member: m})
 		members = append(members, m)
 	}
-	digest, err := types.ManagedBootstrapPlanDigest(string(cluster), members, plan.PhysicalBinding, plan.EvidenceFormat, plan.Durability, false)
+	digest, err := types.ManagedBootstrapPlanDigestForProtocol(string(cluster), members, plan.PhysicalBinding, plan.EvidenceFormat, plan.Durability, false, sqlpolicy.ManagedRequestAppendOnlyApplicationProtocol)
 	return plan, digest, err
 }
 
@@ -43,7 +44,7 @@ func TestPhase8BootstrapPlanValidation(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	assignment := V1Alpha2ApplicationInitPlan{PhysicalBinding: plan.PhysicalBinding, EvidenceFormat: plan.EvidenceFormat, BootstrapPlanDigest: digest}
+	assignment := V1Alpha2ApplicationInitPlan{ApplicationProtocol: sqlpolicy.ManagedRequestAppendOnlyApplicationProtocol, PhysicalBinding: plan.PhysicalBinding, EvidenceFormat: plan.EvidenceFormat, BootstrapPlanDigest: digest}
 	if err := validateV1Alpha2BootstrapPlan(phase2Ref, assignment, plan, 3); err != nil {
 		t.Fatal(err)
 	}
@@ -53,7 +54,7 @@ func TestPhase8BootstrapPlanValidation(t *testing.T) {
 	}
 }
 
-const phase8Cluster = `{"apiVersion":"rhiza.mrchypark.dev/v1alpha2","kind":"RhizaCluster","metadata":{"name":"cluster","namespace":"ns","uid":"uid","resourceVersion":"47","labels":{"keep":"yes"}},"spec":{"logicalID":"logical","genesisIntent":"Create","voterCount":3,"workload":{"podTemplate":{"spec":{"containers":[{"name":"app","image":"image"}]}}}},"status":{"unrelated":{"keep":true}}}`
+const phase8Cluster = `{"apiVersion":"rhiza.mrchypark.dev/v1alpha2","kind":"RhizaCluster","metadata":{"name":"cluster","namespace":"ns","uid":"uid","resourceVersion":"47","labels":{"keep":"yes"}},"spec":{"logicalID":"logical","genesisIntent":"Create","applicationProtocol":"rhiza-managed-request-append-only/v1","voterCount":3,"workload":{"podTemplate":{"spec":{"containers":[{"name":"app","image":"image"}]}}}},"status":{"unrelated":{"keep":true}}}`
 
 func phase8Deployment(name string) string {
 	return fmt.Sprintf(`{"apiVersion":"apps/v1","kind":"Deployment","metadata":{"name":%q,"namespace":"ns","uid":"deployment","resourceVersion":"91","labels":{"rhiza.mrchypark.dev/cluster-uid":"uid","rhiza.mrchypark.dev/generation":"0"},"ownerReferences":[{"apiVersion":"rhiza.mrchypark.dev/v1alpha2","kind":"RhizaCluster","name":"cluster","uid":"uid","controller":true}]}}`, name)
@@ -134,6 +135,7 @@ func phase8Initialize(ctx context.Context, store *V1Alpha2StatusStore, ref V1Alp
 	if err != nil {
 		return V1Alpha2StatusSnapshot{}, err
 	}
+	plan.ApplicationProtocol = sqlpolicy.ManagedRequestAppendOnlyApplicationProtocol
 	return InitializeV1Alpha2AuthorityWithBootstrap(ctx, store, ref, name, plan, bootstrap)
 }
 
@@ -298,7 +300,7 @@ func TestPhase8GenesisIntentUpdateImmutable(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	old, err := DecodeV1Alpha2Cluster([]byte(strings.Replace(phase8Cluster, `"genesisIntent":"Create",`, "", 1)))
+	old, err := DecodeV1Alpha2Cluster([]byte(strings.Replace(phase9ClusterWithProtocol(""), `"genesisIntent":"Create",`, "", 1)))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -356,5 +358,40 @@ func TestPhase8GenesisConcurrentControllers(t *testing.T) {
 	}
 	if _, err := store.Load(context.Background(), phase2Ref); err != nil {
 		t.Fatalf("no complete authority: %v", err)
+	}
+}
+
+func TestGenesisRetiredProfilesRejectBeforeKubernetes(t *testing.T) {
+	for _, protocol := range []string{"", types.ManagedApplicationProtocolSQLKV} {
+		t.Run(protocol, func(t *testing.T) {
+			server, store, _ := phase8Setup(t, phase9ClusterWithProtocol(protocol), "")
+			old := historicalUnusedFixture(t, server, store, protocol)
+			plan := old.Assignment().Plan
+			bootstrap, err := old.status.BootstrapPlan()
+			if err != nil {
+				t.Fatal(err)
+			}
+			for _, action := range []struct {
+				name string
+				run  func() error
+			}{
+				{"plan", func() error {
+					_, err := InitializeV1Alpha2AuthorityWithPlan(context.Background(), nil, phase2Ref, "", plan)
+					return err
+				}},
+				{"bootstrap", func() error {
+					_, err := InitializeV1Alpha2AuthorityWithBootstrap(context.Background(), nil, phase2Ref, "", plan, bootstrap)
+					return err
+				}},
+				{"expected-bootstrap", func() error {
+					_, err := InitializeV1Alpha2AuthorityWithExpectedBootstrap(context.Background(), nil, phase2Ref, "", V1Alpha2ClusterSpec{}, "deployment", "1", plan, bootstrap)
+					return err
+				}},
+			} {
+				if err := action.run(); err == nil || !strings.Contains(err.Error(), "profiles 7/8 are retired") {
+					t.Fatalf("%s did not refuse retired profile before Kubernetes access: %v", action.name, err)
+				}
+			}
+		})
 	}
 }

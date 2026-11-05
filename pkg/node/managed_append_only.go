@@ -261,11 +261,14 @@ func (n *Node) selectManagedAppendOnlyRoot(ctx context.Context) (*checkpoint.Che
 	if err != nil {
 		return nil, nil, err
 	}
+	// Prepared/adopted learners select local H certificates before any CURRENT-driven import.
+	preparedReadonlyLearner := n.config.Learner != nil && !n.core.IsVoter() &&
+		(n.managedStartup.Prepared != nil || n.managedStartup.verifiedAdoption != nil)
 	locator, hasLocator, err := n.checkpoints.LoadManagedAppendOnlyLocator(ctx, n.materializationPolicy())
 	if err != nil {
 		return nil, nil, err
 	}
-	if hasLocator && (!ok || locator.Index > uint64(sealed.Index) || locator.Index == uint64(sealed.Index) && locator.SealDecisionSlot > uint64(sealed.DecisionSlot)) {
+	if hasLocator && !preparedReadonlyLearner && (!ok || locator.Index > uint64(sealed.Index) || locator.Index == uint64(sealed.Index) && locator.SealDecisionSlot > uint64(sealed.DecisionSlot)) {
 		// Another admitted voter may have advanced the shared append-only
 		// archive after this startup's first archive snapshot. Refresh and
 		// validate that certified prefix before treating CURRENT as a candidate
@@ -285,7 +288,7 @@ func (n *Node) selectManagedAppendOnlyRoot(ctx context.Context) (*checkpoint.Che
 		return nil, nil, nil
 	}
 	if hasLocator {
-		if locator.Index > uint64(sealed.Index) || locator.Index == uint64(sealed.Index) && locator.SealDecisionSlot > uint64(sealed.DecisionSlot) {
+		if !preparedReadonlyLearner && (locator.Index > uint64(sealed.Index) || locator.Index == uint64(sealed.Index) && locator.SealDecisionSlot > uint64(sealed.DecisionSlot)) {
 			return nil, nil, fmt.Errorf("managed append-only CURRENT is ahead of actual local certified selection")
 		}
 		if locator.Index == uint64(sealed.Index) && locator.SealDecisionSlot == uint64(sealed.DecisionSlot) && (locator.RootHash != sealed.RootHash) {

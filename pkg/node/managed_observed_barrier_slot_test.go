@@ -17,7 +17,7 @@ import (
 	"github.com/mrchypark/rhiza/pkg/quepaxa"
 )
 
-func TestManagedObservedBarrierDoesNotAdoptUnobservedNextSlot(t *testing.T) {
+func TestManagedBarrierAdoptsUnobservedOriginalAtOriginalSlot(t *testing.T) {
 	fixture := newManagedGraphAdmissionRaceFixture(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
@@ -125,18 +125,19 @@ func TestManagedObservedBarrierDoesNotAdoptUnobservedNextSlot(t *testing.T) {
 	releaseBarrier()
 	select {
 	case err := <-admission:
-		if err == nil {
-			t.Fatal("admission accepted a barrier that adopted unobserved X10")
+		if err != nil {
+			t.Fatalf("ordinary consensus failed to finish original X10: %v", err)
 		}
 	case <-ctx.Done():
-		t.Fatal("admission did not return after the observed-slot proposal resumed")
+		t.Fatal("admission did not complete original-slot recovery")
 	}
-	if decision, ok := fixture.node.core.CertifiedValue(10); ok {
-		t.Fatalf("observed R9 barrier drove an unobserved slot-10 decision: hash=%x value=%x", decision.Hash, decision.Value)
+	decision, ok := fixture.node.core.CertifiedValue(10)
+	if !ok || decision.Hash != ordinaryProposal.Hash || !bytes.Equal(decision.Value, ordinary) || len(decision.Certificate) == 0 {
+		t.Fatalf("original X10 certificate differs: ok=%t decision=%+v", ok, decision)
 	}
 	progress := fixture.node.core.RuntimeProgressSnapshot()
-	if progress.CertifiedTip != 9 || progress.RecorderTip != 10 || !progress.RecorderHashPresent || progress.RecorderHash != ordinaryProposal.Hash {
-		t.Fatalf("slot-10 ordinary recorder value was changed or driven: %+v", progress)
+	if progress.CertifiedTip <= 10 || fixture.node.material.Tip() < uint64(progress.CertifiedTip) {
+		t.Fatalf("admission lacks later barrier and contiguous replay: progress=%+v A=%d", progress, fixture.node.material.Tip())
 	}
 }
 
@@ -194,7 +195,7 @@ func TestManagedObservedBarrierLearnsCertifiedLaterOrdinary(t *testing.T) {
 	fixture.node.managedGraphControlMu.Lock()
 	operation := fixture.node.managedGraphControl
 	fixture.node.managedGraphControlMu.Unlock()
-	if operation == nil || operation.observation == nil || operation.observation.ObservedSlot != 9 {
+	if operation == nil || operation.binding != fixture.node.internalApplication.Load() {
 		t.Fatalf("admission did not retain the exact R9 observation before the certified suffix: %+v", operation)
 	}
 
@@ -244,7 +245,7 @@ func TestManagedObservedBarrierLearnsCertifiedLaterOrdinary(t *testing.T) {
 	if ordinaryProposalEntries.Load() != entriesBeforeBarrierRelease {
 		t.Fatalf("observed barrier resubmitted certified X10: proposal entries before=%d after=%d", entriesBeforeBarrierRelease, ordinaryProposalEntries.Load())
 	}
-	if operation == nil || operation.observation == nil || operation.observation.ObservedSlot != 9 || operation.slot != 11 || operation.err != nil {
+	if operation == nil || operation.binding != fixture.node.internalApplication.Load() || operation.slot != 11 || operation.err != nil {
 		t.Fatalf("admission did not retain its exact R9 observation and later S11 barrier: %+v", operation)
 	}
 	barrier, ok := fixture.node.core.CertifiedValue(11)

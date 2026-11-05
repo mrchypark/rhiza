@@ -8,6 +8,7 @@ import (
 	"reflect"
 	"slices"
 
+	"github.com/mrchypark/rhiza/internal/sqlpolicy"
 	"github.com/mrchypark/rhiza/internal/types"
 	"github.com/mrchypark/rhiza/pkg/operator"
 	"github.com/mrchypark/rhiza/pkg/quepaxa"
@@ -17,6 +18,9 @@ import (
 // retarget it, including when its candidate disappeared. Missing Pods authorize
 // consensus replacement only, not a physical-death or storage-I/O claim.
 func (h *Host) PlanVoterReplacement(ctx context.Context, replacement operator.V1Alpha2RepairPodRequest, presentIDs []quepaxa.NodeID) (*operator.V1Alpha2RepairPlan, error) {
+	if _, _, err := types.ManagedApplicationPolicy(h.cfg.Plan.ApplicationProtocol); err != nil {
+		return nil, err
+	}
 	a, err := h.live(ctx)
 	if err != nil {
 		return nil, err
@@ -58,7 +62,7 @@ func (h *Host) PlanVoterReplacement(ctx context.Context, replacement operator.V1
 	if err != nil {
 		return nil, err
 	}
-	p := operator.V1Alpha2RepairPlan{ClusterUID: h.cfg.Ref.UID, Generation: h.cfg.Plan.Generation, DeploymentUID: h.cfg.Plan.DeploymentUID, StorageID: h.cfg.Plan.StorageID, ExpectedConfigID: uint64(snapshot.Current.ConfigID), ExpectedAbortSlot: uint64(snapshot.AbortSlot), OldNodeID: old.ID, OldWALIdentity: nonce, Replacement: replacement, BootstrapPlanDigest: h.cfg.Plan.BootstrapPlanDigest}
+	p := operator.V1Alpha2RepairPlan{Sequence: replacementSequenceForProtocol(h.cfg.Plan.ApplicationProtocol), ClusterUID: h.cfg.Ref.UID, Generation: h.cfg.Plan.Generation, DeploymentUID: h.cfg.Plan.DeploymentUID, StorageID: h.cfg.Plan.StorageID, ExpectedConfigID: uint64(snapshot.Current.ConfigID), ExpectedAbortSlot: uint64(snapshot.AbortSlot), OldNodeID: old.ID, OldWALIdentity: nonce, Replacement: replacement, BootstrapPlanDigest: h.cfg.Plan.BootstrapPlanDigest}
 	for _, member := range snapshot.Current.Members {
 		if member.ID != old.ID {
 			p.FinalVoterIDs = append(p.FinalVoterIDs, types.NodeID(member.ID))
@@ -89,4 +93,12 @@ func (h *Host) PlanVoterReplacement(ctx context.Context, replacement operator.V1
 		return nil, fmt.Errorf("membership changed during replacement planning")
 	}
 	return &p, nil
+}
+
+func replacementSequenceForProtocol(protocol string) operator.V1Alpha2RepairSequence {
+	if sqlpolicy.IsManagedAppendOnlyApplicationProtocol(protocol) {
+		return operator.V1Alpha2RepairAddThenRemove
+	}
+	// Empty preserves the historical REMOVE-first sequence for profiles 7/8.
+	return ""
 }

@@ -195,20 +195,15 @@ func TestFenceCRDKeepsGenerationTargetBound(t *testing.T) {
 	}
 }
 
-// The controller deletes the learner-credential Secrets it created
-// (retireLearnerCredential) and the Pods it created. A Role that omits either
-// verb makes learner retirement fail with HTTP 403 at runtime, so the release
-// Role must cover every write the operator actually issues.
+// The normal v1alpha2 Role excludes legacy fencing and StatefulSet control.
 func TestOperatorRoleCoversControllerWrites(t *testing.T) {
 	required := map[string][]string{
 		"pods":                   {"get", "list", "create", "delete"},
 		"secrets":                {"get", "create", "delete"},
 		"configmaps":             {"get"},
 		"services":               {"get", "create"},
-		"statefulsets":           {"get", "update"},
 		"rhizaclusters":          {"get", "list"},
 		"rhizaclusters/status":   {"get", "update"},
-		"rhizafences":            {"get", "create"},
 		"rhizarecoveries":        {"get", "list", "create", "update"},
 		"rhizarecoveries/status": {"get", "update"},
 	}
@@ -248,6 +243,11 @@ func TestOperatorRoleCoversControllerWrites(t *testing.T) {
 			if !grants[resource][verb] {
 				t.Errorf("operator Role must grant %q on %q", verb, resource)
 			}
+		}
+	}
+	for _, resource := range []string{"rhizafences", "statefulsets"} {
+		if len(grants[resource]) != 0 {
+			t.Errorf("normal operator Role must not grant legacy %q access", resource)
 		}
 	}
 }

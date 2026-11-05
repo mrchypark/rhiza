@@ -71,7 +71,7 @@ func TestPhase9InitializerLegacyPlanRemainsInert(t *testing.T) {
 	}
 	var dep struct{ Spec struct{ Replicas int } }
 	if json.Unmarshal([]byte(s.deployment), &dep) != nil || dep.Spec.Replicas != 0 || s.posts != 1 || s.puts != 0 {
-		t.Fatalf("legacy path was not inert: posts=%d puts=%d", s.posts, s.puts)
+		t.Fatalf("legacy provider plan did not leave only its already-created inert candidate: posts=%d puts=%d", s.posts, s.puts)
 	}
 }
 
@@ -629,5 +629,42 @@ func TestPhase9InitializerManagedLoopCommitsAndCancels(t *testing.T) {
 	}
 	if s.posts != 1 || s.puts != 1 || !strings.Contains(s.cluster, `"bootstrapPlan"`) {
 		t.Fatalf("managed loop did not commit once: posts=%d puts=%d", s.posts, s.puts)
+	}
+}
+
+func TestPhase9InitializerRetiredSpecRejectsBeforeEffects(t *testing.T) {
+	for _, protocol := range []string{"", types.ManagedApplicationProtocolSQLKV} {
+		t.Run(protocol, func(t *testing.T) {
+			server, kube := phase9Setup(t, phase9ClusterWithProtocol(protocol))
+			calls := 0
+			provider := func(context.Context, V1Alpha2ClusterRef, string, string) (V1Alpha2ApplicationInitPlan, error) {
+				calls++
+				return V1Alpha2ApplicationInitPlan{}, errors.New("retired spec invoked provider")
+			}
+			_, err := ReconcileV1Alpha2Initialization(context.Background(), kube, phase2Ref, provider)
+			if err == nil || !strings.Contains(err.Error(), "profiles 7/8 are retired") || calls != 0 || server.posts != 0 || server.puts != 0 {
+				t.Fatalf("retired spec reached execution setup: calls=%d posts=%d puts=%d error=%v", calls, server.posts, server.puts, err)
+			}
+		})
+	}
+}
+
+func TestPhase9InitializerProviderRunsOnceWithActualUID(t *testing.T) {
+	server, kube := phase9Setup(t, phase9CurrentManagedCluster())
+	calls := 0
+	provider := func(ctx context.Context, ref V1Alpha2ClusterRef, logicalID, deploymentUID string) (V1Alpha2ApplicationInitPlan, error) {
+		calls++
+		if deploymentUID != "deployment" {
+			t.Fatalf("provider received synthetic or wrong UID %q", deploymentUID)
+		}
+		// This deliberately retired provider plan is unknowable until that
+		// actual callback. It may leave the inert candidate but not authority.
+		return phase9Plan(ctx, ref, logicalID, deploymentUID)
+	}
+	if _, err := ReconcileV1Alpha2Initialization(context.Background(), kube, phase2Ref, provider); err == nil {
+		t.Fatal("retired returned plan created authority")
+	}
+	if calls != 1 || server.posts != 1 || server.puts != 0 {
+		t.Fatalf("provider identity/call count or mutation boundary changed: calls=%d posts=%d puts=%d", calls, server.posts, server.puts)
 	}
 }

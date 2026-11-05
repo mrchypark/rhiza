@@ -18,10 +18,7 @@ func TestRepairV1Alpha2ActualWireIntegerTokens(t *testing.T) {
 	for _, large := range []bool{false, true} {
 		t.Run(strconv.FormatBool(large), func(t *testing.T) {
 			f, old := repairTestSetup(t)
-			pending, observation, err := ReserveV1Alpha2SQLWrite(context.Background(), f.store, old, old.Authority(), old.Evidence(), network.ExecuteRequest{RequestID: "repair-pending", SQL: "CREATE TABLE repair_pending(value INTEGER)"})
-			if err != nil || observation != V1Alpha2CASApplied {
-				t.Fatalf("reserve before wire Begin: %s %v", observation, err)
-			}
+			pending := historicalRepairPending(t, f, old, network.ExecuteRequest{RequestID: "repair-pending", SQL: "CREATE TABLE repair_pending(value INTEGER)"})
 			old = pending
 			if large {
 				f.plan.ExpectedConfigID = 9007199254740993
@@ -87,7 +84,7 @@ func TestRepairV1Alpha2ActualWireIntegerTokens(t *testing.T) {
 				copy.URL = &u
 				return server.Client().Transport.RoundTrip(copy)
 			})
-			_, observation, err = BeginV1Alpha2Repair(context.Background(), f.store, old, old.Authority(), f.plan)
+			_, observation, err := BeginV1Alpha2Repair(context.Background(), f.store, old, old.Authority(), f.plan)
 			if err != nil || observation != V1Alpha2CASApplied || !received {
 				t.Fatalf("actual wire Begin: %s %v received=%t", observation, err, received)
 			}

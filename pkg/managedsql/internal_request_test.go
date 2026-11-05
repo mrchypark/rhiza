@@ -225,7 +225,7 @@ func TestInternalRequestHintsDoNotSelectLatestOrPoisonRuntime(t *testing.T) {
 	y := network.RequestStatusRequest{Kind: "kv", RequestID: "\xff"}
 	h.rememberRequestOutcome(testHintOriginal(x.Kind, x.RequestID), &network.CommitUnknownError{RequestID: x.RequestID, Cause: context.DeadlineExceeded}, types.MutationReceipt{})
 	h.rememberRequestOutcome(testHintOriginal(y.Kind, y.RequestID), nil, types.MutationReceipt{Slot: 1})
-	if _, ok := h.recoveryTargets[x]; !ok || len(h.recoveryTargets) != 1 || h.uncertain.Load() {
+	if _, ok := h.recoveryTargets[x]; !ok || len(h.recoveryTargets) != 1 {
 		t.Fatal("independent successful Y must not erase X or poison runtime")
 	}
 	h.rememberRequestOutcome(testHintOriginal(y.Kind, y.RequestID), &network.CommitUnknownError{RequestID: y.RequestID, Cause: context.Canceled}, types.MutationReceipt{})

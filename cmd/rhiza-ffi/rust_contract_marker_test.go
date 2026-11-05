@@ -75,10 +75,6 @@ func rustContractRunMode(path string) (bool, error) {
 
 func rustFixtureProfile(protocol string) (string, error) {
 	switch protocol {
-	case "":
-		return "sql", nil
-	case types.ManagedApplicationProtocolSQLKV:
-		return "mixed", nil
 	case sqlpolicy.ManagedRequestAppendOnlyApplicationProtocol:
 		return "internal", nil
 	case sqlpolicy.ManagedGraphRequestAppendOnlyApplicationProtocol:
@@ -89,13 +85,13 @@ func rustFixtureProfile(protocol string) (string, error) {
 }
 
 func TestRustFixtureProfileSelection(t *testing.T) {
-	for _, tc := range []struct{ protocol, want string }{{"", "sql"}, {types.ManagedApplicationProtocolSQLKV, "mixed"}, {sqlpolicy.ManagedRequestAppendOnlyApplicationProtocol, "internal"}, {sqlpolicy.ManagedGraphRequestAppendOnlyApplicationProtocol, "graph"}} {
+	for _, tc := range []struct{ protocol, want string }{{sqlpolicy.ManagedRequestAppendOnlyApplicationProtocol, "internal"}, {sqlpolicy.ManagedGraphRequestAppendOnlyApplicationProtocol, "graph"}} {
 		got, err := rustFixtureProfile(tc.protocol)
 		if err != nil || got != tc.want {
 			t.Fatalf("profile selection %q: %q %v", tc.protocol, got, err)
 		}
 	}
-	for _, unknown := range []string{sqlpolicy.ManagedRequestApplicationProtocol, sqlpolicy.ManagedGraphRequestApplicationProtocol, "rhiza-managed-request/v2", "rhiza-managed-request-graph/v2", "rhiza-managed-request-graph", "graph", "10"} {
+	for _, unknown := range []string{"", types.ManagedApplicationProtocolSQLKV, sqlpolicy.ManagedRequestApplicationProtocol, sqlpolicy.ManagedGraphRequestApplicationProtocol, "rhiza-managed-request/v2", "rhiza-managed-request-graph/v2", "rhiza-managed-request-graph", "graph", "10"} {
 		if _, err := rustFixtureProfile(unknown); err == nil {
 			t.Fatal("unknown profile fell back")
 		}
@@ -144,49 +140,30 @@ func TestRustContractRunStartedMarker(t *testing.T) {
 	if err != nil {
 		t.Fatal("invalid Rust fixture profile")
 	}
-	if fixtureProfile == "mixed" || fixtureProfile == "internal" || fixtureProfile == "graph" {
-		var plan operator.V1Alpha2BootstrapPlan
-		if err := managedbootstrap.ReadGateFile(operator.V1Alpha2BootstrapHandoffPath, &plan, 65536, false); err != nil {
-			t.Fatal("contract bootstrap unavailable")
-		}
-		_, repairErr := os.Lstat(managedbootstrap.RepairHandoffPath)
-		if repairErr != nil && !errors.Is(repairErr, os.ErrNotExist) {
-			t.Fatal("repair presence unknown")
-		}
-		producer, role, err := mixedRustRole(plan, os.Getenv("POD_UID"), repairErr == nil)
-		if err != nil {
-			t.Fatal("invalid original producer binding")
-		}
-		if role == "initial" {
-			initial, err := rustContractRunMode("/var/lib/rhiza/rust-mixed-contract-started")
-			if err != nil {
-				t.Fatal("mixed run marker failed")
-			}
-			if !initial {
-				role = "verify"
-			}
-		}
-		fmt.Println("RHIZA_RUST_FIXTURE_PROFILE=" + fixtureProfile)
-		fmt.Println("RHIZA_RUST_CONTRACT_MODE=" + role)
-		fmt.Println("RHIZA_RUST_CONTRACT_PRODUCER_UID=" + producer)
-		return
+	var plan operator.V1Alpha2BootstrapPlan
+	if err := managedbootstrap.ReadGateFile(operator.V1Alpha2BootstrapHandoffPath, &plan, 65536, false); err != nil {
+		t.Fatal("contract bootstrap unavailable")
 	}
-	fmt.Println("RHIZA_RUST_FIXTURE_PROFILE=sql")
-	if _, err := os.Lstat(managedbootstrap.RepairHandoffPath); errors.Is(err, os.ErrNotExist) {
-		fmt.Println("RHIZA_RUST_CONTRACT_MODE=skip")
-		return
-	} else if err != nil {
+	_, repairErr := os.Lstat(managedbootstrap.RepairHandoffPath)
+	if repairErr != nil && !errors.Is(repairErr, os.ErrNotExist) {
 		t.Fatal("repair presence unknown")
 	}
-	initial, err := rustContractRunMode("/var/lib/rhiza/rust-contract-started")
+	producer, role, err := mixedRustRole(plan, os.Getenv("POD_UID"), repairErr == nil)
 	if err != nil {
-		t.Fatal("Rust run-start marker publication/validation failed")
+		t.Fatal("invalid original producer binding")
 	}
-	if initial {
-		fmt.Println("RHIZA_RUST_CONTRACT_MODE=initial")
-	} else {
-		fmt.Println("RHIZA_RUST_CONTRACT_MODE=restart")
+	if role == "initial" {
+		initial, err := rustContractRunMode("/var/lib/rhiza/rust-mixed-contract-started")
+		if err != nil {
+			t.Fatal("mixed run marker failed")
+		}
+		if !initial {
+			role = "verify"
+		}
 	}
+	fmt.Println("RHIZA_RUST_FIXTURE_PROFILE=" + fixtureProfile)
+	fmt.Println("RHIZA_RUST_CONTRACT_MODE=" + role)
+	fmt.Println("RHIZA_RUST_CONTRACT_PRODUCER_UID=" + producer)
 }
 
 func mixedRustRole(plan operator.V1Alpha2BootstrapPlan, uid string, repair bool) (string, string, error) {

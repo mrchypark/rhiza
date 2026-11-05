@@ -21,6 +21,7 @@ import (
 	"time"
 
 	"github.com/mrchypark/rhiza/internal/peertest"
+	"github.com/mrchypark/rhiza/internal/sqlpolicy"
 	"github.com/mrchypark/rhiza/internal/types"
 	"github.com/mrchypark/rhiza/pkg/managedsql"
 	"github.com/mrchypark/rhiza/pkg/network"
@@ -158,19 +159,24 @@ func managedHTTPQuorum(t *testing.T) (*managedsql.Host, managedsql.Config, *http
 	store := &operator.V1Alpha2StatusStore{Kube: &operator.Kubernetes{BaseURL: kubeServer.URL, Namespace: "ns", TokenFile: tokenFile, Client: kubeServer.Client()}}
 	ref := operator.V1Alpha2ClusterRef{Name: "cluster", Namespace: "ns", UID: "uid"}
 	n := node.New(&configs[0].Runtime)
-	source, _, err := n.PreparedStartupBindingDigests()
+	source, _, err := n.PreparedStartupBindingDigestsForProtocol(sqlpolicy.ManagedRequestAppendOnlyApplicationProtocol)
 	if err != nil {
 		t.Fatal(err)
 	}
-	digest, err := n.ManagedBootstrapPlanDigest(source, managedsql.EvidenceFormat)
+	digest, err := n.ManagedBootstrapPlanDigestForProtocol(source, sqlpolicy.ManagedRequestAppendOnlyApplicationProtocol, sqlpolicy.ManagedRequestAppendOnlyApplicationProtocol)
 	if err != nil {
 		t.Fatal(err)
 	}
-	plan, err := operator.NewV1Alpha2ApplicationInitPlan(ref, "logical", "deployment", "assignment", source, digest, managedsql.EvidenceFormat)
+	plan, err := operator.NewV1Alpha2ApplicationInitPlan(ref, "logical", "deployment", "assignment", source, digest, sqlpolicy.ManagedRequestAppendOnlyApplicationProtocol)
 	if err != nil {
 		t.Fatal(err)
 	}
-	bootstrap := operator.V1Alpha2BootstrapPlan{ClusterID: cluster, PhysicalBinding: source, EvidenceFormat: managedsql.EvidenceFormat, Durability: types.ObjectStoreDurabilityBeforeAck}
+	plan.ApplicationProtocol = sqlpolicy.ManagedRequestAppendOnlyApplicationProtocol
+	var spec map[string]json.RawMessage
+	_ = json.Unmarshal(obj["spec"], &spec)
+	spec["applicationProtocol"], _ = json.Marshal(plan.ApplicationProtocol)
+	obj["spec"], _ = json.Marshal(spec)
+	bootstrap := operator.V1Alpha2BootstrapPlan{ClusterID: cluster, PhysicalBinding: source, EvidenceFormat: sqlpolicy.ManagedRequestAppendOnlyApplicationProtocol, Durability: types.ObjectStoreDurabilityBeforeAck}
 	for i, member := range members {
 		bootstrap.Members = append(bootstrap.Members, operator.V1Alpha2BootstrapMember{PodUID: fmt.Sprintf("pod-%d", i), Member: member})
 	}
@@ -324,101 +330,39 @@ func managedHTTPPost(t *testing.T, server *httptest.Server, route string, body a
 	return response.StatusCode, data
 }
 
-func TestManagedHandlerCanceledCommittedWriteRequiresExplicitRecovery(t *testing.T) {
-	_, cfg, server, blockFinalize, finalizeStarted := managedHTTPQuorum(t)
-	// Bootstrap may still lower client readiness after a quorum probe. Retry
-	// setup only while canonical state proves no application reservation exists.
-	setupCtx, setupCancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer setupCancel()
-	for {
-		code, body := managedHTTPPost(t, server, "/execute", managedsql.ExecuteRequest{RequestID: "schema", SQL: "CREATE TABLE pending_http(value)"})
-		if code == http.StatusOK {
-			break
-		}
-		a, err := operator.LoadV1Alpha2Admission(setupCtx, cfg.Store, cfg.Ref)
-		if err != nil || a.EverApplicationReserved() || setupCtx.Err() != nil {
-			t.Fatalf("schema %d: %s; canonical setup reservation: %v", code, body, err)
-		}
-		if _, pending := a.Pending(); pending {
-			t.Fatal("uncertain setup mutation must not be retried")
-		}
-		time.Sleep(30 * time.Millisecond)
-	}
-	blockFinalize.Store(true)
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-	request, err := http.NewRequestWithContext(ctx, http.MethodPost, server.URL+"/execute", strings.NewReader(`{"request_id":"canceled","sql":"INSERT INTO pending_http VALUES (1)"}`))
+func TestManagedHandlerCommittedWriteAndRecoveryDoNotReserveCR(t *testing.T) {
+	_, cfg, server, _, _ := managedHTTPQuorum(t)
+	before, err := operator.LoadV1Alpha2Admission(context.Background(), cfg.Store, cfg.Ref)
 	if err != nil {
 		t.Fatal(err)
 	}
-	request.Header.Set("Authorization", "Bearer private-admin")
-	done := make(chan error, 1)
-	go func() {
-		response, err := server.Client().Do(request)
-		if response != nil {
-			_ = response.Body.Close()
-		}
-		done <- err
-	}()
-	select {
-	case <-finalizeStarted:
-	case <-time.After(10 * time.Second):
-		t.Fatal("committed request did not reach finalization")
+	if code, body := managedHTTPPost(t, server, "/execute", managedsql.ExecuteRequest{RequestID: "schema", SQL: "CREATE TABLE pending_http(value)"}); code != http.StatusOK {
+		t.Fatalf("schema: %d %s", code, body)
 	}
-	cancel()
-	if err := <-done; err == nil {
-		t.Fatal("canceled caller received success")
-	}
-	blockFinalize.Store(false)
-	if code, _ := managedHTTPPost(t, server, "/execute", managedsql.ExecuteRequest{RequestID: "blocked", SQL: "INSERT INTO pending_http VALUES (2)"}); code != http.StatusServiceUnavailable {
-		t.Fatalf("pending admitted new write: %d", code)
-	}
-	a, err := operator.LoadV1Alpha2Admission(context.Background(), cfg.Store, cfg.Ref)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if original, ok, err := a.PendingSQL(); err != nil || !ok || original.RequestID != "canceled" {
-		t.Fatalf("exact canceled request not preserved: %+v %v", original, err)
-	}
-	if code, body := managedHTTPPost(t, server, "/recover-pending", struct{}{}); code != http.StatusNoContent || len(body) != 0 {
-		t.Fatalf("explicit recovery %d: %s", code, body)
+	if code, body := managedHTTPPost(t, server, "/execute", managedsql.ExecuteRequest{RequestID: "write", SQL: "INSERT INTO pending_http VALUES (1)"}); code != http.StatusOK {
+		t.Fatalf("write: %d %s", code, body)
 	}
 	if code, body := managedHTTPPost(t, server, "/query", managedsql.QueryRequest{SQL: "SELECT COUNT(*) FROM pending_http", Consistency: "local"}); code != http.StatusOK || !bytes.Contains(body, []byte(`"rows":[[1]]`)) {
-		t.Fatalf("committed request repeated or lost: %d %s", code, body)
+		t.Fatalf("exactly-once result: %d %s", code, body)
 	}
-	if code, body := managedHTTPPost(t, server, "/execute", managedsql.ExecuteRequest{RequestID: "next", SQL: "INSERT INTO pending_http VALUES (2)"}); code != http.StatusOK {
-		t.Fatalf("new write remained blocked: %d %s", code, body)
-	}
-	if code, body := managedHTTPPost(t, server, "/query", managedsql.QueryRequest{SQL: "SELECT COUNT(*) FROM pending_http", Consistency: "local"}); code != http.StatusOK || !bytes.Contains(body, []byte(`"rows":[[2]]`)) {
-		t.Fatalf("post-recovery write was not exactly once: %d %s", code, body)
+	after, err := operator.LoadV1Alpha2Admission(context.Background(), cfg.Store, cfg.Ref)
+	if err != nil || before.ResourceVersion() != after.ResourceVersion() || !bytes.Equal(before.Evidence(), after.Evidence()) {
+		t.Fatal("ordinary HTTP write mutated CR authority", err)
 	}
 }
 
-func TestManagedHandlerUnknownPendingRemainsFailClosed(t *testing.T) {
+func TestManagedHandlerUnselectedRecoveryRemainsUnknown(t *testing.T) {
 	_, cfg, server, _, _ := managedHTTPQuorum(t)
-	a, err := operator.LoadV1Alpha2Admission(context.Background(), cfg.Store, cfg.Ref)
+	before, err := operator.LoadV1Alpha2Admission(context.Background(), cfg.Store, cfg.Ref)
 	if err != nil {
-		t.Fatal(err)
-	}
-	req := managedsql.ExecuteRequest{RequestID: "unknown", SQL: "CREATE TABLE must_not_execute(value)"}
-	if _, _, err := operator.ReserveV1Alpha2SQLWrite(context.Background(), cfg.Store, a, a.Authority(), a.Evidence(), req); err != nil {
 		t.Fatal(err)
 	}
 	if code, _ := managedHTTPPost(t, server, "/recover-pending", struct{}{}); code != http.StatusServiceUnavailable {
-		t.Fatalf("unknown outcome cleared: %d", code)
+		t.Fatalf("missing exact selector was treated as completed: %d", code)
 	}
-	if code, _ := managedHTTPPost(t, server, "/execute", managedsql.ExecuteRequest{RequestID: "new", SQL: "CREATE TABLE blocked(value)"}); code != http.StatusServiceUnavailable {
-		t.Fatalf("unknown outcome admitted new write: %d", code)
-	}
-	a, err = operator.LoadV1Alpha2Admission(context.Background(), cfg.Store, cfg.Ref)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if original, ok, err := a.PendingSQL(); err != nil || !ok || original.RequestID != req.RequestID {
-		t.Fatalf("unknown original changed: %+v %v", original, err)
-	}
-	if code, body := managedHTTPPost(t, server, "/query", managedsql.QueryRequest{SQL: "SELECT COUNT(*) FROM sqlite_master WHERE name='must_not_execute'", Consistency: "local"}); code != http.StatusOK || !bytes.Contains(body, []byte(`"rows":[[0]]`)) {
-		t.Fatalf("unknown request was executed or local snapshot lost: %d %s", code, body)
+	after, err := operator.LoadV1Alpha2Admission(context.Background(), cfg.Store, cfg.Ref)
+	if err != nil || before.ResourceVersion() != after.ResourceVersion() || !bytes.Equal(before.Evidence(), after.Evidence()) {
+		t.Fatal("unselected UNKNOWN recovery mutated CR", err)
 	}
 }
 

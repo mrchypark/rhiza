@@ -111,6 +111,11 @@ func validateV1Alpha2BootstrapPlan(ref V1Alpha2ClusterRef, assignment V1Alpha2Ap
 }
 
 func initializeV1Alpha2AuthorityWithPlan(ctx context.Context, s *V1Alpha2StatusStore, ref V1Alpha2ClusterRef, deploymentName string, expected *V1Alpha2ClusterSpec, expectedUID, expectedRV string, plan *V1Alpha2ApplicationInitPlan, bootstraps ...*V1Alpha2BootstrapPlan) (V1Alpha2StatusSnapshot, error) {
+	if plan != nil {
+		if err := ValidateV1Alpha2ApplicationProfile(plan.ApplicationProtocol, plan.EvidenceFormat); err != nil {
+			return V1Alpha2StatusSnapshot{}, err
+		}
+	}
 	p, err := s.path(ref)
 	if err != nil {
 		return V1Alpha2StatusSnapshot{}, err

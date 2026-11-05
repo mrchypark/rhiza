@@ -366,7 +366,7 @@ func (f *sqlStatusFixture) serve(w http.ResponseWriter, r *http.Request) {
 
 func sqlCluster(t *testing.T) ([]Config, *sqlStatusFixture) {
 	t.Helper()
-	return sqlClusterForProtocol(t, "")
+	return sqlClusterForProtocol(t, sqlpolicy.ManagedRequestAppendOnlyApplicationProtocol)
 }
 
 func sqlClusterForProtocol(t *testing.T, protocol string) ([]Config, *sqlStatusFixture) {
@@ -460,6 +460,8 @@ func TestManagedSQLPublicStartupRejectsRetiredPrototypeBeforeRuntimeEffects(t *t
 		configured string
 		retired    string
 	}{
+		{"empty", sqlpolicy.ManagedRequestAppendOnlyApplicationProtocol, ""},
+		{"mixed", sqlpolicy.ManagedRequestAppendOnlyApplicationProtocol, types.ManagedApplicationProtocolSQLKV},
 		{"request", sqlpolicy.ManagedRequestAppendOnlyApplicationProtocol, sqlpolicy.ManagedRequestApplicationProtocol},
 		{"graph", sqlpolicy.ManagedGraphRequestAppendOnlyApplicationProtocol, sqlpolicy.ManagedGraphRequestApplicationProtocol},
 	} {
@@ -516,7 +518,7 @@ func TestManagedSQLPublicStartupRejectsRetiredPrototypeBeforeRuntimeEffects(t *t
 }
 
 func TestManagedSQLPublicStartupPreservesSupportedProfileEvidenceError(t *testing.T) {
-	for _, protocol := range []string{"", types.ManagedApplicationProtocolSQLKV} {
+	for _, protocol := range []string{sqlpolicy.ManagedRequestAppendOnlyApplicationProtocol, sqlpolicy.ManagedGraphRequestAppendOnlyApplicationProtocol} {
 		name := protocol
 		if name == "" {
 			name = "legacy"
@@ -531,8 +533,8 @@ func TestManagedSQLPublicStartupPreservesSupportedProfileEvidenceError(t *testin
 				_ = host.Close()
 				t.Fatal("invalid evidence unexpectedly opened a Host")
 			}
-			const want = "exact SQL initialization plan, store, and Pod UID required"
-			if err == nil || err.Error() != want {
+			const want = "unsupported managed startup profile"
+			if err == nil || !strings.Contains(err.Error(), want) {
 				t.Fatalf("supported profile evidence mismatch changed error contract: got %v, want %q", err, want)
 			}
 		})
@@ -659,7 +661,7 @@ func TestManagedSQLRealThreeNodeInitializationAndWrite(t *testing.T) {
 	if err != nil {
 		t.Fatalf("create: %+v %v", response, err)
 	}
-	_, err = hosts[0].Execute(context.Background(), ExecuteRequest{RequestID: "insert", SQL: "INSERT INTO app VALUES (?)", Args: []any{[]byte{0, 255}}})
+	insert, err := hosts[0].Execute(context.Background(), ExecuteRequest{RequestID: "insert", SQL: "INSERT INTO app VALUES (?)", Args: []any{[]byte{0, 255}}})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -670,8 +672,8 @@ func TestManagedSQLRealThreeNodeInitializationAndWrite(t *testing.T) {
 	if _, pending := a.Pending(); pending {
 		t.Fatal("completed SQL still pending")
 	}
-	if evidenceHash(a.Evidence()) == init.Assignment().InitialEvidenceDigest {
-		t.Fatal("write did not advance application evidence")
+	if evidenceHash(a.Evidence()) != init.Assignment().InitialEvidenceDigest {
+		t.Fatal("ordinary write rewrote immutable E0 CR evidence")
 	}
 	late, err := f.open(context.Background(), configs[2])
 	if late != nil {
@@ -693,9 +695,10 @@ func TestManagedSQLRealThreeNodeInitializationAndWrite(t *testing.T) {
 		if _, err := h.node.Handler(); err == nil {
 			t.Fatal("admitted raw handler exposed")
 		}
-		state, err := h.node.InspectManagedSQL(context.Background(), false)
-		if err != nil || !bytes.Equal(encodeEvidence(state), a.Evidence()) {
-			t.Fatalf("replica SQL evidence mismatch: %v", err)
+		waitSQLCertifiedApplication(t, context.Background(), h, insert.Slot)
+		state, err := h.node.InspectManagedKV(context.Background(), false)
+		if err != nil || state.Runtime.AppliedTip < insert.Slot {
+			t.Fatalf("replica certified SQL application mismatch: %v", err)
 		}
 	}
 }
@@ -724,134 +727,10 @@ func openSQLQuorum(t *testing.T) ([]Config, []*Host, *sqlStatusFixture) {
 	return configs, hosts, f
 }
 
-func TestManagedSQLPendingDurableOriginalResolvesWithoutNewExecution(t *testing.T) {
-	configs, hosts, f := openSQLQuorum(t)
-	h := hosts[0]
-	if _, err := h.Execute(context.Background(), ExecuteRequest{RequestID: "schema", SQL: "CREATE TABLE app(value BLOB)"}); err != nil {
-		t.Fatal(err)
-	}
-	f.mu.Lock()
-	f.failFinalize = true
-	f.mu.Unlock()
-	req := ExecuteRequest{RequestID: "durable-blob", SQL: "INSERT INTO app VALUES (?)", Args: []any{[]byte{0, 255}}}
-	if _, err := h.Execute(context.Background(), req); err == nil {
-		t.Fatal("unconfirmed finalization reported success")
-	}
-	a, err := operator.LoadV1Alpha2Admission(context.Background(), configs[0].Store, configs[0].Ref)
-	if err != nil {
-		t.Fatal(err)
-	}
-	original, ok, err := a.PendingSQL()
-	if err != nil || !ok || !bytes.Equal(original.Args[0].([]byte), []byte{0, 255}) {
-		t.Fatalf("durable original blob missing: %v", err)
-	}
-	before, err := h.node.ManagedState()
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := h.Ready(context.Background()); err != nil {
-		t.Fatalf("unknown finalization blocked certified local snapshot: %v", err)
-	}
-	if _, err := h.Execute(context.Background(), ExecuteRequest{RequestID: "blocked", SQL: "INSERT INTO app VALUES (1)"}); err == nil {
-		t.Fatal("new write bypassed pending uncertainty")
-	}
-	f.mu.Lock()
-	f.failFinalize = false
-	f.mu.Unlock()
-	if err := h.RecoverPending(context.Background()); err != nil {
-		t.Fatal(err)
-	}
-	after, err := h.node.ManagedState()
-	if err != nil || after.CertifiedTip != before.CertifiedTip {
-		t.Fatalf("resolution re-executed SQL: before=%+v after=%+v error=%v", before, after, err)
-	}
-	readySQL(t, h)
-	a, err = operator.LoadV1Alpha2Admission(context.Background(), configs[0].Store, configs[0].Ref)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if _, ok := a.Pending(); ok {
-		t.Fatal("resolved request remained pending")
-	}
-}
-
-func TestManagedSQLUnknownPendingIsNotNoEffectAndBlocksNewSQL(t *testing.T) {
-	configs, hosts, _ := openSQLQuorum(t)
-	h := hosts[0]
-	a, err := operator.LoadV1Alpha2Admission(context.Background(), configs[0].Store, configs[0].Ref)
-	if err != nil {
-		t.Fatal(err)
-	}
-	req := ExecuteRequest{RequestID: "reserved-not-executed", SQL: "CREATE TABLE must_not_exist(value)"}
-	if _, _, err := operator.ReserveV1Alpha2SQLWrite(context.Background(), configs[0].Store, a, a.Authority(), a.Evidence(), req); err != nil {
-		t.Fatal(err)
-	}
-	before, err := h.node.ManagedState()
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := h.RecoverPending(context.Background()); err == nil {
-		t.Fatal("unknown request became no-effect proof")
-	}
-	if err := h.Ready(context.Background()); err != nil {
-		t.Fatalf("unknown request blocked previous certified snapshot: %v", err)
-	}
-	if err := h.node.AdmitManaged(context.Background()); err == nil {
-		t.Fatal("unknown request admitted new SQL")
-	}
-	a, err = operator.LoadV1Alpha2Admission(context.Background(), configs[0].Store, configs[0].Ref)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if _, ok := a.Pending(); !ok {
-		t.Fatal("unknown request was cleared")
-	}
-	after, err := h.node.ManagedState()
-	if err != nil || after.CertifiedTip != before.CertifiedTip {
-		t.Fatal("unknown pending request was re-executed")
-	}
-}
-
-func TestManagedSQLLostFinalizeResponseRequiresFreshRecoveryAdmission(t *testing.T) {
-	configs, hosts, f := openSQLQuorum(t)
-	h := hosts[0]
-	f.mu.Lock()
-	f.dropFinalize = true
-	f.mu.Unlock()
-	if _, err := h.Execute(context.Background(), ExecuteRequest{RequestID: "lost-response", SQL: "CREATE TABLE app(value)"}); err == nil {
-		t.Fatal("lost response established writer ownership")
-	}
-	if err := h.Ready(context.Background()); err != nil {
-		t.Fatalf("unknown finalization blocked local snapshot: %v", err)
-	}
-	if err := h.node.AdmitManaged(context.Background()); err == nil {
-		t.Fatal("unknown finalization automatically reopened write admission")
-	}
-	a, err := operator.LoadV1Alpha2Admission(context.Background(), configs[0].Store, configs[0].Ref)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if _, ok := a.Pending(); ok {
-		t.Fatal("injected finalize did not apply")
-	}
-	before, err := h.node.ManagedState()
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := h.RecoverPending(context.Background()); err != nil {
-		t.Fatal(err)
-	}
-	readySQL(t, h)
-	after, err := h.node.ManagedState()
-	if err != nil || before.CertifiedTip != after.CertifiedTip {
-		t.Fatal("readback recovery re-executed SQL")
-	}
-}
-
 func TestManagedSQLDDLReversalDoesNotRearmMissingSource(t *testing.T) {
 	configs, hosts, f := openSQLQuorum(t)
 	h := hosts[0]
-	initial, err := h.node.InspectManagedSQL(context.Background(), false)
+	initial, err := h.node.InspectManagedKV(context.Background(), false)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -860,7 +739,7 @@ func TestManagedSQLDDLReversalDoesNotRearmMissingSource(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	reversed, err := h.node.InspectManagedSQL(context.Background(), false)
+	reversed, err := h.node.InspectManagedKV(context.Background(), false)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -893,8 +772,8 @@ func TestManagedSQLDDLReversalDoesNotRearmMissingSource(t *testing.T) {
 		t.Fatalf("recovery did not use actual pre-existing WAL: %+v %v", state, err)
 	}
 	live, err := operator.LoadV1Alpha2Admission(context.Background(), configs[0].Store, configs[0].Ref)
-	if err != nil || !live.EverApplicationReserved() {
-		t.Fatal("DDL reversal erased canonical reservation history")
+	if err != nil || live.EverApplicationReserved() {
+		t.Fatal("append-only DDL reversal changed CR reservation history")
 	}
 }
 
@@ -951,15 +830,15 @@ func TestManagedSQLUnusedAssignmentRejectsPreexistingCertifiedSource(t *testing.
 func sqlSourceNode(t *testing.T, cfg Config) (*node.Node, node.ManagedStartupIdentity) {
 	t.Helper()
 	n := node.New(&cfg.Runtime)
-	source, member, err := n.PreparedStartupBindingDigests()
+	source, member, err := n.PreparedStartupBindingDigestsForProtocol(cfg.Plan.ApplicationProtocol)
 	if err != nil {
 		t.Fatal(err)
 	}
-	common, err := n.ManagedBootstrapPlanDigest(source, EvidenceFormat)
+	common, err := n.ManagedBootstrapPlanDigestForProtocol(source, cfg.Plan.EvidenceFormat, cfg.Plan.ApplicationProtocol)
 	if err != nil {
 		t.Fatal(err)
 	}
-	return n, node.ManagedStartupIdentity{Member: recovery.PreparedStartupIdentity{ClusterUID: cfg.Ref.UID, Generation: cfg.Plan.Generation, DeploymentUID: cfg.Plan.DeploymentUID, PodUID: cfg.PodUID, NodeID: string(cfg.Runtime.NodeID), SourceBinding: source, ConfigDigest: member}, AssignmentID: cfg.Plan.AssignmentID, IntentHash: cfg.Plan.IntentHash, StorageID: cfg.Plan.StorageID, PhysicalBinding: source, BootstrapPlanDigest: common, EvidenceFormat: EvidenceFormat}
+	return n, node.ManagedStartupIdentity{Member: recovery.PreparedStartupIdentity{ClusterUID: cfg.Ref.UID, Generation: cfg.Plan.Generation, DeploymentUID: cfg.Plan.DeploymentUID, PodUID: cfg.PodUID, NodeID: string(cfg.Runtime.NodeID), SourceBinding: source, ConfigDigest: member}, AssignmentID: cfg.Plan.AssignmentID, IntentHash: cfg.Plan.IntentHash, StorageID: cfg.Plan.StorageID, PhysicalBinding: source, BootstrapPlanDigest: common, EvidenceFormat: cfg.Plan.EvidenceFormat, ApplicationProtocol: cfg.Plan.ApplicationProtocol}
 }
 
 func TestManagedSQLSourceDefaultS3Provider(t *testing.T) {
@@ -1016,103 +895,6 @@ func TestManagedSQLSourceLostReceiptResponseRetry(t *testing.T) {
 	if err := n.VerifyManagedSQLFreshSource(context.Background(), i); err != nil {
 		t.Fatal(err)
 	}
-}
-
-func TestManagedSQLPendingReservationBeforeDelayedPutBlocksFreshJoin(t *testing.T) {
-	configs, hosts, f := openSQLQuorum(t)
-	control := f.source
-	control.putReady = make(chan string, 4)
-	control.putRelease = make(chan struct{})
-	control.putSuffix = "voters/managed-sql-application-start.json"
-	var release sync.Once
-	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
-	done := make(chan error, 1)
-	joined := false
-	t.Cleanup(func() {
-		release.Do(func() { close(control.putRelease) })
-		cancel()
-		if !joined {
-			select {
-			case <-done:
-			case <-time.After(5 * time.Second):
-				t.Error("delayed SQL execution did not finish after cancellation")
-			}
-		}
-	})
-	go func() {
-		_, err := hosts[0].Execute(ctx, ExecuteRequest{RequestID: "delayed-first", SQL: "CREATE TABLE delayed(value)"})
-		done <- err
-	}()
-	select {
-	case key := <-control.putReady:
-		if !strings.HasSuffix(key, control.putSuffix) {
-			t.Fatal("wrong delayed PUT boundary")
-		}
-	case <-ctx.Done():
-		t.Fatal(ctx.Err())
-	}
-	a, err := operator.LoadV1Alpha2Admission(ctx, configs[0].Store, configs[0].Ref)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if _, pending := a.Pending(); !pending || !a.EverApplicationReserved() {
-		t.Fatal("pending and canonical history were not committed before delayed PUT")
-	}
-	if available, err := hosts[0].node.ManagedArchiveAvailable(ctx); err != nil || available {
-		t.Fatal("test did not stop before first archive HEAD")
-	}
-	runtime := configs[0].Runtime
-	diagnostic, err := objectstore.NewBucketForNamespace(ctx, objectstore.Config{Provider: objectstore.ProviderS3, Endpoint: runtime.ObjStoreEndpoint, Bucket: runtime.ObjStoreBucket, Region: runtime.ObjStoreRegion, Insecure: runtime.ObjStoreInsecure, AccessKey: runtime.ObjStoreAccessKey, SecretKey: runtime.ObjStoreSecretKey}, control.finalPrefix)
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() {
-		if err := diagnostic.Close(); err != nil {
-			t.Error(err)
-		}
-	})
-	objects := 0
-	if err := diagnostic.Iter(ctx, control.finalPrefix+"/archive/", func(string) error { objects++; return nil }); err != nil || objects != 0 {
-		t.Fatalf("actual SDK archive LIST was not empty: count=%d error=%v", objects, err)
-	}
-	late, err := f.open(ctx, configs[2])
-	if late != nil {
-		t.Cleanup(func() {
-			if err := late.Close(); err != nil {
-				t.Error(err)
-			}
-		})
-	}
-	if err != nil {
-		t.Fatalf("pending blocked private peer recovery: %v", err)
-	}
-	if late.identity.Fresh {
-		t.Fatal("pending/everReserved plus missing HEAD admitted fresh baseline")
-	}
-	if late.Ready(ctx) == nil {
-		t.Fatal("pending first mutation opened late application admission")
-	}
-	release.Do(func() { close(control.putRelease) })
-	select {
-	case err := <-done:
-		joined = true
-		if err != nil {
-			t.Fatal(err)
-		}
-	case <-ctx.Done():
-		t.Fatal(ctx.Err())
-	}
-	a, err = operator.LoadV1Alpha2Admission(ctx, configs[0].Store, configs[0].Ref)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if _, pending := a.Pending(); pending || !a.EverApplicationReserved() {
-		t.Fatal("delayed effect did not finalize with monotonic history")
-	}
-	if available, err := hosts[0].node.ManagedArchiveAvailable(ctx); err != nil || !available {
-		t.Fatal("resumed SQL did not produce actual certified archive")
-	}
-	readySQL(t, late)
 }
 
 func TestManagedSQLConsumedMissingBirthIsNeverRecreated(t *testing.T) {

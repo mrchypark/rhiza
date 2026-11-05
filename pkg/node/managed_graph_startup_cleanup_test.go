@@ -36,20 +36,24 @@ import (
 )
 
 type preparedLearnerFixture struct {
-	ctx        context.Context
-	node       *Node
-	sourceCore *quepaxa.Core
-	protocol   string
-	dataDir    string
-	cut        quepaxa.Slot
-	sealA      quepaxa.SealedCheckpoint
-	sealB      quepaxa.SealedCheckpoint
-	rootA      [32]byte
-	rootB      [32]byte
-	viewTip    quepaxa.Slot
+	ctx         context.Context
+	node        *Node
+	sourceCore  *quepaxa.Core
+	protocol    string
+	dataDir     string
+	cut         quepaxa.Slot
+	sealA       quepaxa.SealedCheckpoint
+	sealB       quepaxa.SealedCheckpoint
+	rootA       [32]byte
+	rootB       [32]byte
+	currentRoot [32]byte
+	currentSeal quepaxa.SealedCheckpoint
+	viewTip     quepaxa.Slot
+	suffixJ     quepaxa.Slot
 }
 
-func newPreparedLearnerFixture(t *testing.T) *preparedLearnerFixture {
+func newPreparedLearnerFixture(t *testing.T, advanceCurrentAfterH ...bool) *preparedLearnerFixture {
+	advanceCurrent := len(advanceCurrentAfterH) != 0 && advanceCurrentAfterH[0]
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	t.Cleanup(cancel)
 	protocol := sqlpolicy.ManagedGraphRequestAppendOnlyApplicationProtocol
@@ -280,6 +284,64 @@ func newPreparedLearnerFixture(t *testing.T) *preparedLearnerFixture {
 	if err != nil {
 		t.Fatal(err)
 	}
+	currentRoot := rootA.RootHash
+	currentSeal := sealedA
+	var suffixJ quepaxa.Slot
+	if advanceCurrent {
+		// H is already published and frozen in prepared above. Advance CURRENT
+		// afterward using the same real quorum, then certify a real Graph suffix.
+		fileDB, err := sql.Open("sqlite3", files[0].Path)
+		if err != nil {
+			t.Fatal("open prepared Graph source for later CURRENT root", err)
+		}
+		_, editErr := fileDB.ExecContext(ctx, "PRAGMA user_version=2")
+		closeErr := fileDB.Close()
+		if editErr != nil || closeErr != nil {
+			t.Fatal("make later CURRENT root distinct", editErr, closeErr)
+		}
+		rootC, err := checkpoints.CreateManagedAppendOnlyCandidate(ctx, sources, cut)
+		if err != nil || rootC.RootHash == rootB.RootHash {
+			t.Fatalf("later same-cut CURRENT C root is not distinct from H's B: root=%+v err=%v", rootC, err)
+		}
+		sealC := sealA
+		sealC.RootHash, sealC.StateHash = rootC.RootHash, rootC.Hash
+		valueC, err := quepaxa.EncodeCheckpointSeal(sealC)
+		if err != nil {
+			t.Fatal("encode later certified CURRENT C", err)
+		}
+		if _, _, err := cores[0].Propose(ctx, valueC); err != nil {
+			t.Fatal("certify later CURRENT C with source quorum", err)
+		}
+		if err := archive.SyncThrough(ctx, cores[0], cores[0].Tip()); err != nil {
+			t.Fatal("archive later CURRENT C certificate", err)
+		}
+		currentSeal, ok, err = cores[0].LatestManagedCheckpointSeal()
+		if err != nil || !ok || currentSeal.RootHash != rootC.RootHash {
+			t.Fatalf("source quorum did not retain exact later CURRENT C: seal=%+v err=%v", currentSeal, err)
+		}
+		if err := source.promoteManagedAppendOnlySeal(ctx, currentSeal); err != nil {
+			t.Fatal("publish actual later CURRENT C", err)
+		}
+		currentRoot = rootC.RootHash
+		command, err := types.EncodeManagedGraphExecution(types.GraphCommand{RequestID: "prepared-learner-later-j", Cypher: "CREATE (:ManagedGraphResume {id:'suffix-j'})"})
+		if err != nil {
+			t.Fatal("encode actual Graph J suffix", err)
+		}
+		suffixJ, _, err = cores[0].Propose(ctx, command)
+		if err != nil || suffixJ <= view.Tip() {
+			t.Fatalf("source quorum did not certify actual J after H and C: H=%d J=%d err=%v", view.Tip(), suffixJ, err)
+		}
+		decision, certified := cores[0].CertifiedValue(suffixJ)
+		if !certified || decision.Slot != suffixJ || !bytes.Equal(decision.Value, command) || decision.Hash != quepaxa.ValueHash(sha256.Sum256(command)) {
+			t.Fatalf("source quorum lacks exact actual Graph J certificate: decision=%+v certified=%t", decision, certified)
+		}
+		if err := source.replayLocalDecisions(ctx); err != nil {
+			t.Fatal("apply actual source suffix through J", err)
+		}
+		if err := archive.SyncThrough(ctx, cores[0], suffixJ); err != nil {
+			t.Fatal("archive actual Graph J suffix", err)
+		}
+	}
 	membership, err := json.Marshal(recovery.NewMembershipRecord(clusterID, cluster.Members, string(config.ObjStoreDurability)))
 	if err != nil {
 		t.Fatal(err)
@@ -307,6 +369,36 @@ func newPreparedLearnerFixture(t *testing.T) *preparedLearnerFixture {
 		AssignmentID: assignment, IntentHash: "intent", StorageID: storageRoot,
 		PhysicalBinding: physical, BootstrapPlanDigest: bootstrap,
 	}
+	var hObserved bool
+	var beforeOpenWrites int
+	var beforeOpenRequests int
+	registrationKey := path.Join(namespace.FinalPrefix, "voters", fmt.Sprintf("%x.json", sha256.Sum256([]byte(config.NodeID))))
+	if advanceCurrent {
+		beforeOpenWrites = objectStore.writeCount()
+		objectStore.mu.RLock()
+		beforeOpenRequests = len(objectStore.requests)
+		_, alreadyRegistered := objectStore.objects[registrationKey]
+		objectStore.mu.RUnlock()
+		if alreadyRegistered {
+			t.Fatal("fresh learner registration unexpectedly exists before Open")
+		}
+		restoreHook := setManagedPreparedStartupTestHook(func(event string) {
+			if event != "node:managed-prepared:adopted-before-suffix-catchup" {
+				return
+			}
+			adoption, adoptionErr := loadPreparedAdoption(filepath.Join(dataDir, "prepared-adoption.json"))
+			if adoptionErr != nil || adoption.Tip != view.Tip() || adoption.PrefixHash != view.PrefixHash() {
+				t.Errorf("H adoption hook observed a different durable receipt: adoption=%+v err=%v H=%d", adoption, adoptionErr, view.Tip())
+				return
+			}
+			if node.core == nil || node.core.Tip() != view.Tip() || node.material == nil || quepaxa.Slot(node.material.Tip()) != view.Tip() {
+				t.Errorf("learner did not install exact H before importing J: core=%v material=%v H=%d", node.core, node.material, view.Tip())
+				return
+			}
+			hObserved = true
+		})
+		defer restoreHook()
+	}
 	if err := node.OpenManaged(ctx, ManagedStartupConfig{StorageRoot: storageRoot, Identity: startupIdentity, Checker: &managedTestChecker{}, Prepared: prepared}); err != nil {
 		objectStore.mu.RLock()
 		requests := append([]string(nil), objectStore.requests...)
@@ -318,7 +410,44 @@ func newPreparedLearnerFixture(t *testing.T) *preparedLearnerFixture {
 			t.Error(err)
 		}
 	})
-	return &preparedLearnerFixture{ctx: ctx, node: node, sourceCore: cores[0], protocol: protocol, dataDir: dataDir, cut: quepaxa.Slot(cut), sealA: sealedA, sealB: sealedB, rootA: rootA.RootHash, rootB: rootB.RootHash, viewTip: view.Tip()}
+	if advanceCurrent {
+		if !hObserved {
+			t.Fatal("public prepared startup did not pass the exact-H adoption boundary before suffix catch-up")
+		}
+		objectStore.mu.RLock()
+		requests := append([]string(nil), objectStore.requests[beforeOpenRequests:]...)
+		registration := append([]byte(nil), objectStore.objects[registrationKey]...)
+		objectStore.mu.RUnlock()
+		var mutations []string
+		for _, request := range requests {
+			if !strings.HasPrefix(request, "GET ") && !strings.HasPrefix(request, "HEAD ") {
+				mutations = append(mutations, request)
+			}
+		}
+		wantPut := "PUT /" + config.ObjStoreBucket + "/" + registrationKey
+		if writes := objectStore.writeCount() - beforeOpenWrites; writes != 1 || len(mutations) != 1 || mutations[0] != wantPut {
+			t.Fatalf("fresh learner may only register its exact voter identity, never mutate backup objects: writes=%d mutations=%v requests=%v", writes, mutations, requests)
+		}
+		var got voterIdentity
+		if err := json.Unmarshal(registration, &got); err != nil {
+			t.Fatal("decode fresh learner registration", err)
+		}
+		nonce, err := hex.DecodeString(got.Nonce)
+		if err != nil || len(nonce) != 32 || got.Nonce != node.core.WALIdentity() {
+			t.Fatalf("fresh learner registration lacks its exact bound WAL nonce: nonce=%q err=%v", got.Nonce, err)
+		}
+		profile, err := node.managedVoterProfileFor(config)
+		if err != nil || profile == nil {
+			t.Fatalf("fresh learner profile unavailable: %v", err)
+		}
+		want := voterIdentityForProfile(config, profile)
+		want.Nonce, want.Registered = got.Nonce, true
+		local, err := loadVoterIdentity(config)
+		if !sameVoterIdentity(got, want) || err != nil || local.identity == nil || !sameVoterIdentity(got, *local.identity) {
+			t.Fatalf("fresh learner remote registration differs from expected identity or local WAL registration: got=%+v want=%+v local=%+v err=%v", got, want, local.identity, err)
+		}
+	}
+	return &preparedLearnerFixture{ctx: ctx, node: node, sourceCore: cores[0], protocol: protocol, dataDir: dataDir, cut: quepaxa.Slot(cut), sealA: sealedA, sealB: sealedB, rootA: rootA.RootHash, rootB: rootB.RootHash, currentRoot: currentRoot, currentSeal: currentSeal, viewTip: view.Tip(), suffixJ: suffixJ}
 }
 
 func TestManagedGraphStartupInstallPreparedLearnerFreshOpenCancellationClosesHandle(t *testing.T) {

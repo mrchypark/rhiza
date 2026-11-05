@@ -35,7 +35,9 @@ func validManagedUID(uid string) bool {
 	return len(uid) > 0 && len(uid) <= 256 && utf8.ValidString(uid) && strings.TrimSpace(uid) == uid && !strings.ContainsRune(uid, '\x00')
 }
 
-// ManagedBootstrapPlanDigest matches the managed Node's common bootstrap
+// ManagedBootstrapPlanDigest preserves historical binding bytes for inspection.
+// It does not select or authorize a managed runtime.
+// It matches the managed Node's common bootstrap
 // digest; member-specific WAL identities do not belong to the common plan.
 func ManagedBootstrapPlanDigest(clusterID string, members []quepaxa.Member, physicalBinding, evidenceFormat string, durability ObjectStoreDurability, reconfiguration bool) (string, error) {
 	return ManagedBootstrapPlanDigestForProtocol(clusterID, members, physicalBinding, evidenceFormat, durability, reconfiguration, "")
@@ -45,10 +47,8 @@ func ManagedBootstrapPlanDigest(clusterID string, members []quepaxa.Member, phys
 // Managed startup has no configurable retention window.
 func ManagedApplicationPolicy(protocol string) (sqlpolicy.MaterializationPolicy, uint64, error) {
 	switch protocol {
-	case "":
-		return sqlpolicy.LegacyMaterializationPolicy, DefaultIdempotencyWindowSlots, nil
-	case ManagedApplicationProtocolSQLKV:
-		return sqlpolicy.ManagedSQLKVMaterializationPolicy, DefaultIdempotencyWindowSlots, nil
+	case "", ManagedApplicationProtocolSQLKV:
+		return 0, 0, fmt.Errorf("managed application profiles 7/8 are retired; select an explicit append-only profile for a new cluster")
 	case sqlpolicy.ManagedRequestAppendOnlyApplicationProtocol:
 		return sqlpolicy.ManagedRequestMaterializationPolicy, DefaultIdempotencyWindowSlots, nil
 	case sqlpolicy.ManagedGraphRequestAppendOnlyApplicationProtocol:
@@ -58,13 +58,24 @@ func ManagedApplicationPolicy(protocol string) (sqlpolicy.MaterializationPolicy,
 	}
 }
 
+// Historical digests remain readable after their execution profiles are retired.
+// Startup must call ManagedApplicationPolicy independently.
+func managedBindingWindow(protocol string) (uint64, error) {
+	switch protocol {
+	case "":
+		return 0, nil
+	case ManagedApplicationProtocolSQLKV:
+		return DefaultIdempotencyWindowSlots, nil
+	default:
+		_, window, err := ManagedApplicationPolicy(protocol)
+		return window, err
+	}
+}
+
 func ManagedBootstrapPlanDigestForProtocol(clusterID string, members []quepaxa.Member, physicalBinding, evidenceFormat string, durability ObjectStoreDurability, reconfiguration bool, protocol string) (string, error) {
-	_, window, err := ManagedApplicationPolicy(protocol)
+	window, err := managedBindingWindow(protocol)
 	if err != nil {
 		return "", err
-	}
-	if protocol == "" {
-		window = 0 // Preserve the original serialized digest byte for byte.
 	}
 	if clusterID == "" || physicalBinding == "" || evidenceFormat == "" {
 		return "", fmt.Errorf("invalid managed bootstrap binding")
@@ -102,12 +113,9 @@ func ManagedBootstrapPlanDigestForProtocol(clusterID string, members []quepaxa.M
 
 // ManagedMemberConfigDigest is shared by pure bootstrap binding checks.
 func ManagedMemberConfigDigest(config ExecutionConfig, protocol string) (string, error) {
-	_, window, err := ManagedApplicationPolicy(protocol)
+	window, err := managedBindingWindow(protocol)
 	if err != nil {
 		return "", err
-	}
-	if protocol == "" {
-		window = 0
 	}
 	data, err := json.Marshal(struct {
 		Cluster             string

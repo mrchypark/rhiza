@@ -2,31 +2,38 @@ package managedsql
 
 import (
 	"context"
+	"errors"
 	"testing"
 
 	"github.com/mrchypark/rhiza/internal/sqlpolicy"
-	"github.com/mrchypark/rhiza/internal/types"
-	"github.com/mrchypark/rhiza/pkg/node"
 	"github.com/mrchypark/rhiza/pkg/operator"
 )
 
-func TestManagedGraphHostOperationContextSharesNodeObservationBudget(t *testing.T) {
-	h := &Host{
-		cfg:  Config{Plan: operator.V1Alpha2ApplicationInitPlan{ApplicationProtocol: sqlpolicy.ManagedGraphRequestAppendOnlyApplicationProtocol}},
-		node: node.New(&types.ExecutionConfig{}), admissionLifetime: context.Background(),
-	}
-	operationCtx, release := h.internalRequestContext(context.Background())
+func TestManagedGraphHostOperationContextRetainsCallerAndHostLifetime(t *testing.T) {
+	lifetime, closeHost := context.WithCancel(context.Background())
+	defer closeHost()
+	h := &Host{cfg: Config{Plan: operator.V1Alpha2ApplicationInitPlan{ApplicationProtocol: sqlpolicy.ManagedGraphRequestAppendOnlyApplicationProtocol}}, admissionLifetime: lifetime}
+	type markerKey struct{}
+	marker := &struct{}{}
+	caller, cancel := context.WithCancel(context.WithValue(context.Background(), markerKey{}, marker))
+	defer cancel()
+	operation, release := h.internalRequestContext(caller)
 	defer release()
-	if shared := node.WithManagedControlObservationBudget(operationCtx); shared != operationCtx {
-		t.Fatal("Host did not install the context-private operation budget before Node admission")
+	nested, releaseNested := h.internalRequestContext(operation)
+	defer releaseNested()
+	if nested.Value(markerKey{}) != marker {
+		t.Fatal("nested Host scope lost caller context")
 	}
-	initialCtx, releaseInitial := h.internalRequestContext(operationCtx)
-	defer releaseInitial()
-	if shared := node.WithManagedControlObservationBudget(initialCtx); shared != initialCtx {
-		t.Fatal("nested Host initial-admission context replaced the operation budget")
+	cancel()
+	<-nested.Done()
+	if !errors.Is(nested.Err(), context.Canceled) {
+		t.Fatalf("caller cancellation was lost: %v", nested.Err())
 	}
-	executionCtx := node.WithManagedControlObservationBudget(initialCtx)
-	if executionCtx != initialCtx {
-		t.Fatal("Node execution context replaced the budget shared with initial admission")
+	hostScope, releaseHost := h.internalRequestContext(context.Background())
+	defer releaseHost()
+	closeHost()
+	<-hostScope.Done()
+	if !errors.Is(hostScope.Err(), context.Canceled) {
+		t.Fatalf("Host lifetime cancellation was lost: %v", hostScope.Err())
 	}
 }

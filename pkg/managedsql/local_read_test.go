@@ -1,7 +1,6 @@
 package managedsql
 
 import (
-	"bytes"
 	"context"
 	"database/sql"
 	"encoding/json"
@@ -69,7 +68,6 @@ func TestManagedSQLLocalReadsRemainReadyWithoutQuorum(t *testing.T) {
 			t.Fatalf("%s allowed local SQL", reason)
 		}
 	}
-	h.uncertain.Store(true)
 	beforeRead, err := h.node.ManagedState()
 	if err != nil {
 		t.Fatal(err)
@@ -79,10 +77,6 @@ func TestManagedSQLLocalReadsRemainReadyWithoutQuorum(t *testing.T) {
 	if err != nil || beforeRead != afterRead {
 		t.Fatalf("local snapshot reads changed runtime state: before=%+v after=%+v err=%v", beforeRead, afterRead, err)
 	}
-	if !h.uncertain.Load() {
-		t.Fatal("local reads cleared unknown outcome")
-	}
-	h.uncertain.Store(false)
 	fixture.mu.Lock()
 	original := append(json.RawMessage(nil), fixture.obj["status"]...)
 	var status map[string]any
@@ -136,32 +130,6 @@ func TestManagedSQLLocalReadsRemainReadyWithoutQuorum(t *testing.T) {
 	fixture.obj["status"] = original
 	fixture.mu.Unlock()
 	checkLocal()
-	a, err = operator.LoadV1Alpha2Admission(ctx, configs[0].Store, configs[0].Ref)
-	if err != nil {
-		t.Fatal(err)
-	}
-	reserved, outcome, err := operator.ReserveV1Alpha2SQLWrite(ctx, configs[0].Store, a, a.Authority(), a.Evidence(), ExecuteRequest{RequestID: "pending-local-negative", SQL: "INSERT INTO local_read VALUES (2)"})
-	if err != nil || outcome != operator.V1Alpha2CASApplied {
-		t.Fatalf("real pending reservation: %v %v", outcome, err)
-	}
-	pending, ok := reserved.Pending()
-	if !ok {
-		t.Fatal("reservation missing")
-	}
-	h.gateMu.Lock()
-	h.active = &pending
-	h.gateMu.Unlock()
-	fixture.mu.Lock()
-	pendingStatus := append(json.RawMessage(nil), fixture.obj["status"]...)
-	fixture.mu.Unlock()
-	h.uncertain.Store(true)
-	checkLocal()
-	fixture.mu.Lock()
-	unchanged := bytes.Equal(pendingStatus, fixture.obj["status"])
-	fixture.mu.Unlock()
-	if !unchanged || !h.uncertain.Load() {
-		t.Fatal("local reads mutated pending/evidence/unknown state")
-	}
 	if _, err := h.node.API(); err == nil {
 		t.Fatal("raw managed API exposed")
 	}

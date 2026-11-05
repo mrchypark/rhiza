@@ -12,14 +12,6 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - fixture: legacy
-            provider: s3
-          - fixture: mixed
-            provider: s3
-          - fixture: mixed
-            provider: gcs
-          - fixture: mixed
-            provider: azure
           - fixture: internal
             provider: s3
           - fixture: internal

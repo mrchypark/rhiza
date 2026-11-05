@@ -5,16 +5,17 @@ import (
 	"crypto/sha256"
 	"encoding/json"
 	"fmt"
-	objectstore "github.com/mrchypark/rhiza/internal/objstore"
 	"math"
 	"net"
 	"net/url"
 	"path"
+	"reflect"
 	"slices"
 	"strconv"
 	"strings"
 	"unicode/utf8"
 
+	objectstore "github.com/mrchypark/rhiza/internal/objstore"
 	"github.com/mrchypark/rhiza/internal/types"
 	"github.com/mrchypark/rhiza/pkg/quepaxa"
 )
@@ -27,24 +28,35 @@ type V1Alpha2RepairMember struct {
 	PeerURL   string            `json:"peerURL"`
 }
 
+// V1Alpha2RepairSequence selects the order of the two certified membership
+// terminals. The empty value preserves the historical REMOVE-then-ADD flow.
+type V1Alpha2RepairSequence string
+
+const (
+	V1Alpha2RepairRemoveThenAdd V1Alpha2RepairSequence = "removeThenAdd"
+	V1Alpha2RepairAddThenRemove V1Alpha2RepairSequence = "addThenRemove"
+)
+
 // V1Alpha2RepairPlan is one bounded two-membership-operation intent, not a
-// membership certificate or prepared handoff. A source HEAD is not required:
-// REMOVE may be the operation that first publishes that control history.
-// OldWALIdentity must be the registered old voter nonce verified by the caller;
-// it is not an external fence. Replacement WAL identity is deliberately absent.
+// membership certificate or prepared handoff. Legacy REMOVE-first plans do
+// not require a source HEAD because REMOVE may first publish that history;
+// ADD-first plans bind their prepared source in V1Alpha2RepairHandoff.
+// OldWALIdentity is the caller-verified registered nonce, not an external
+// fence. Replacement WAL identity is deliberately absent until registration.
 type V1Alpha2RepairPlan struct {
-	OperationID         string               `json:"operationID"`
-	ClusterUID          string               `json:"clusterUID"`
-	Generation          int64                `json:"generation"`
-	DeploymentUID       string               `json:"deploymentUID"`
-	StorageID           string               `json:"storageID"`
-	ExpectedConfigID    uint64               `json:"expectedConfigID"`
-	ExpectedAbortSlot   uint64               `json:"expectedAbortSlot"`
-	OldNodeID           types.NodeID         `json:"oldNodeID"`
-	OldWALIdentity      string               `json:"oldWALIdentity"`
-	Replacement         V1Alpha2RepairMember `json:"replacement"`
-	BootstrapPlanDigest string               `json:"bootstrapPlanDigest"`
-	FinalVoterIDs       []types.NodeID       `json:"finalVoterIDs"`
+	OperationID         string                 `json:"operationID"`
+	Sequence            V1Alpha2RepairSequence `json:"sequence,omitempty"`
+	ClusterUID          string                 `json:"clusterUID"`
+	Generation          int64                  `json:"generation"`
+	DeploymentUID       string                 `json:"deploymentUID"`
+	StorageID           string                 `json:"storageID"`
+	ExpectedConfigID    uint64                 `json:"expectedConfigID"`
+	ExpectedAbortSlot   uint64                 `json:"expectedAbortSlot"`
+	OldNodeID           types.NodeID           `json:"oldNodeID"`
+	OldWALIdentity      string                 `json:"oldWALIdentity"`
+	Replacement         V1Alpha2RepairMember   `json:"replacement"`
+	BootstrapPlanDigest string                 `json:"bootstrapPlanDigest"`
+	FinalVoterIDs       []types.NodeID         `json:"finalVoterIDs"`
 }
 
 func (p V1Alpha2RepairPlan) Digest() string {
@@ -71,6 +83,7 @@ type V1Alpha2RepairRecord struct {
 	Plan            V1Alpha2RepairPlan        `json:"plan"`
 	State           string                    `json:"state"`
 	Completion      *V1Alpha2RepairCompletion `json:"completion,omitempty"`
+	AddCompletion   *V1Alpha2RepairCompletion `json:"addCompletion,omitempty"`
 	PreparedHandoff *V1Alpha2RepairHandoff    `json:"preparedHandoff,omitempty"`
 }
 
@@ -80,15 +93,25 @@ const V1Alpha2RepairRecordLimit = 128 << 10
 // Status capture is provenance only; the private runtime verifies source and
 // REMOVE certificate before publishing the handoff.
 type V1Alpha2RepairHandoff struct {
-	PlanDigest         string          `json:"planDigest"`
-	SourceRoot         string          `json:"sourceRoot"`
-	SourcePrefix       string          `json:"sourcePrefix"`
-	PhysicalBinding    string          `json:"physicalBinding"`
-	Head               []byte          `json:"head"`
-	HeadHash           string          `json:"headHash"`
-	RemoveTerminalSlot uint64          `json:"removeTerminalSlot"`
-	RemoveTerminalHash string          `json:"removeTerminalHash"`
-	Survivors          quepaxa.Cluster `json:"survivors"`
+	PlanDigest         string           `json:"planDigest"`
+	SourceRoot         string           `json:"sourceRoot"`
+	SourcePrefix       string           `json:"sourcePrefix"`
+	PhysicalBinding    string           `json:"physicalBinding"`
+	Head               []byte           `json:"head"`
+	HeadHash           string           `json:"headHash"`
+	RemoveTerminalSlot uint64           `json:"removeTerminalSlot,omitempty"`
+	RemoveTerminalHash string           `json:"removeTerminalHash,omitempty"`
+	Survivors          quepaxa.Cluster  `json:"survivors,omitzero"`
+	PreparedConfig     *quepaxa.Cluster `json:"preparedConfig,omitempty"`
+	PreparedSlot       uint64           `json:"preparedSlot,omitempty"`
+	PreparedHash       string           `json:"preparedHash,omitempty"`
+}
+
+func repairSequence(p V1Alpha2RepairPlan) V1Alpha2RepairSequence {
+	if p.Sequence == "" {
+		return V1Alpha2RepairRemoveThenAdd
+	}
+	return p.Sequence
 }
 
 func validateRepairHandoff(s V1Alpha2StatusSnapshot, p V1Alpha2RepairPlan, h V1Alpha2RepairHandoff) error {
@@ -99,8 +122,17 @@ func validateRepairHandoff(s V1Alpha2StatusSnapshot, p V1Alpha2RepairPlan, h V1A
 	}
 	cluster, err := types.ManagedClusterID(p.ClusterUID, p.Generation)
 	_, prefix, namespaceErr := objectstore.ManagedNamespacePrefixes(h.SourceRoot, p.ClusterUID, p.Generation, assignment.Plan.AssignmentID, string(cluster))
-	if err != nil || namespaceErr != nil || h.SourcePrefix != prefix || path.Clean(h.SourcePrefix) != h.SourcePrefix || h.PhysicalBinding != assignment.Plan.PhysicalBinding || h.PlanDigest != p.Digest() || len(h.Head) == 0 || len(h.Head) > V1Alpha2RepairHeadLimit || h.HeadHash != fmt.Sprintf("%x", sha256.Sum256(h.Head)) || h.RemoveTerminalSlot <= p.ExpectedAbortSlot || h.RemoveTerminalSlot > math.MaxInt64 || !validInitDigest(h.RemoveTerminalHash) || uint64(h.Survivors.ConfigID) != p.ExpectedConfigID+1 {
+	if err != nil || namespaceErr != nil || h.SourcePrefix != prefix || path.Clean(h.SourcePrefix) != h.SourcePrefix || h.PhysicalBinding != assignment.Plan.PhysicalBinding || h.PlanDigest != p.Digest() || len(h.Head) == 0 || len(h.Head) > V1Alpha2RepairHeadLimit || h.HeadHash != fmt.Sprintf("%x", sha256.Sum256(h.Head)) {
 		return fmt.Errorf("invalid repair handoff binding or budget")
+	}
+	if repairSequence(p) == V1Alpha2RepairAddThenRemove {
+		if h.PreparedConfig == nil || uint64(h.PreparedConfig.ConfigID) != p.ExpectedConfigID || h.PreparedSlot <= p.ExpectedAbortSlot || h.PreparedSlot > math.MaxInt64 || !validInitDigest(h.PreparedHash) || h.RemoveTerminalSlot != 0 || h.RemoveTerminalHash != "" || h.Survivors.ConfigID != 0 || len(h.Survivors.Members) != 0 {
+			return fmt.Errorf("invalid ADD-first prepared source")
+		}
+		return validateAddFirstPreparedConfig(p, *h.PreparedConfig)
+	}
+	if h.PreparedConfig != nil || h.PreparedSlot != 0 || h.PreparedHash != "" || h.RemoveTerminalSlot <= p.ExpectedAbortSlot || h.RemoveTerminalSlot > math.MaxInt64 || !validInitDigest(h.RemoveTerminalHash) || uint64(h.Survivors.ConfigID) != p.ExpectedConfigID+1 {
+		return fmt.Errorf("invalid REMOVE-first handoff")
 	}
 	ids := make([]types.NodeID, 0, len(h.Survivors.Members)+1)
 	seen := map[types.NodeID]bool{}
@@ -119,7 +151,45 @@ func validateRepairHandoff(s V1Alpha2StatusSnapshot, p V1Alpha2RepairPlan, h V1A
 	return nil
 }
 
+func validateAddFirstPreparedConfig(p V1Alpha2RepairPlan, source quepaxa.Cluster) error {
+	if len(source.Members) < 2 || len(source.Members) >= 64 {
+		return fmt.Errorf("ADD-first source roster exceeds bounded intermediate target")
+	}
+	ids := make([]types.NodeID, 0, len(source.Members))
+	seen := make(map[types.NodeID]bool, len(source.Members))
+	oldFound := false
+	for _, member := range source.Members {
+		id := types.NodeID(member.ID)
+		if id == "" || seen[id] || id == p.Replacement.NodeID || !validRepairText(string(id), 256) || member.PublicKey == (quepaxa.PublicKey{}) {
+			return fmt.Errorf("invalid ADD-first source membership")
+		}
+		seen[id] = true
+		if id == p.OldNodeID {
+			if member.WALIdentity != "" && member.WALIdentity != p.OldWALIdentity {
+				return fmt.Errorf("ADD-first source old WAL identity changed")
+			}
+			oldFound = true
+		}
+		ids = append(ids, id)
+	}
+	if !oldFound {
+		return fmt.Errorf("ADD-first source does not contain the old voter")
+	}
+	ids = append(ids, p.Replacement.NodeID)
+	// The intermediate ADD roster is the source roster plus N. Removing the
+	// exact old identity from it must yield the already-bound final target.
+	ids = slices.DeleteFunc(ids, func(id types.NodeID) bool { return id == p.OldNodeID })
+	slices.Sort(ids)
+	if !slices.Equal(ids, p.FinalVoterIDs) {
+		return fmt.Errorf("ADD-first source and final target do not match")
+	}
+	return nil
+}
+
 func CaptureV1Alpha2RepairHandoff(ctx context.Context, store *V1Alpha2StatusStore, old V1Alpha2AdmissionSnapshot, expected V1Alpha2AuthorityView, h V1Alpha2RepairHandoff) (V1Alpha2AdmissionSnapshot, V1Alpha2CASObservation, error) {
+	if err := validateV1Alpha2RepairExecutionProfile(old); err != nil {
+		return V1Alpha2AdmissionSnapshot{}, "", err
+	}
 	r, ok := old.Repair()
 	if !ok || old.status.store != store || old.Authority() != expected || !old.SQLReservationsClosed() || r.PreparedHandoff != nil || !repairMatchesAuthority(r.Plan, expected) || hasV1Alpha2Transition(old.transition) {
 		return V1Alpha2AdmissionSnapshot{}, "", fmt.Errorf("repair handoff requires exact uncaptured closed intent")
@@ -131,6 +201,31 @@ func CaptureV1Alpha2RepairHandoff(ctx context.Context, store *V1Alpha2StatusStor
 		return V1Alpha2AdmissionSnapshot{}, "", err
 	}
 	r.PreparedHandoff = &h
+	encoded, err := json.Marshal(r)
+	if err != nil || len(encoded) > V1Alpha2RepairRecordLimit {
+		return V1Alpha2AdmissionSnapshot{}, "", fmt.Errorf("repair record exceeds bounded budget")
+	}
+	return updateV1Alpha2AdmissionStatus(ctx, store, old, func(status, auth map[string]json.RawMessage) { status["repair"] = encoded })
+}
+
+// RecordV1Alpha2RepairAddition durably records the exact ADD terminal before
+// the same repair operation may proceed to REMOVE. The runtime caller must
+// verify the actual consensus terminal and target before invoking this method.
+func RecordV1Alpha2RepairAddition(ctx context.Context, store *V1Alpha2StatusStore, old V1Alpha2AdmissionSnapshot, expected V1Alpha2AuthorityView, completion V1Alpha2RepairCompletion) (V1Alpha2AdmissionSnapshot, V1Alpha2CASObservation, error) {
+	if err := validateV1Alpha2RepairExecutionProfile(old); err != nil {
+		return V1Alpha2AdmissionSnapshot{}, "", err
+	}
+	r, ok := old.Repair()
+	if old.status.store != store || old.Authority() != expected || !ok || !old.SQLReservationsClosed() || !repairMatchesAuthority(r.Plan, expected) || hasV1Alpha2Transition(old.transition) || repairSequence(r.Plan) != V1Alpha2RepairAddThenRemove || r.PreparedHandoff == nil || !validateV1Alpha2RepairAddition(r.Plan, *r.PreparedHandoff, completion) || r.Completion != nil {
+		return V1Alpha2AdmissionSnapshot{}, "", fmt.Errorf("repair ADD completion preconditions do not match")
+	}
+	if r.AddCompletion != nil {
+		if reflect.DeepEqual(*r.AddCompletion, completion) {
+			return V1Alpha2AdmissionSnapshot{}, "", fmt.Errorf("repair ADD terminal is already recorded; resume from the retained proof")
+		}
+		return V1Alpha2AdmissionSnapshot{}, "", fmt.Errorf("repair ADD terminal changed")
+	}
+	r.AddCompletion = &completion
 	encoded, err := json.Marshal(r)
 	if err != nil || len(encoded) > V1Alpha2RepairRecordLimit {
 		return V1Alpha2AdmissionSnapshot{}, "", fmt.Errorf("repair record exceeds bounded budget")
@@ -175,6 +270,9 @@ func validRepairText(s string, max int) bool {
 }
 
 func validateV1Alpha2RepairPlan(s V1Alpha2StatusSnapshot, p V1Alpha2RepairPlan) error {
+	if p.Sequence != "" && p.Sequence != V1Alpha2RepairRemoveThenAdd && p.Sequence != V1Alpha2RepairAddThenRemove {
+		return fmt.Errorf("unsupported repair sequence")
+	}
 	id, err := types.ManagedNodeID(p.Replacement.PodUID)
 	u, urlErr := url.Parse(p.Replacement.PeerURL)
 	if err != nil || urlErr != nil || u.Scheme != "quic" || u.User != nil || u.Path != "" || u.RawQuery != "" || u.ForceQuery || u.Fragment != "" || net.ParseIP(u.Hostname()) == nil || net.ParseIP(u.Hostname()).IsUnspecified() {
@@ -219,6 +317,26 @@ func validateV1Alpha2RepairCompletion(p V1Alpha2RepairPlan, c V1Alpha2RepairComp
 	return c.Kind == "Terminal" && c.ConfigID == p.ExpectedConfigID+2 && slices.Equal(c.FinalVoterIDs, p.FinalVoterIDs) || c.Kind == "Abort" && c.ConfigID >= p.ExpectedConfigID && len(c.FinalVoterIDs) == 0
 }
 
+func validateV1Alpha2RepairAddition(p V1Alpha2RepairPlan, h V1Alpha2RepairHandoff, c V1Alpha2RepairCompletion) bool {
+	if repairSequence(p) != V1Alpha2RepairAddThenRemove || h.PreparedConfig == nil || c.OperationID != p.OperationID || c.PlanDigest != p.Digest() || c.ExpectedConfigID != p.ExpectedConfigID || c.ExpectedAbortSlot != p.ExpectedAbortSlot || c.Kind != "Terminal" || c.ConfigID != p.ExpectedConfigID+1 || c.ConfigID > math.MaxInt64 || c.Slot <= h.PreparedSlot || c.Slot > math.MaxInt64 || !validInitDigest(c.Hash) {
+		return false
+	}
+	ids := make([]types.NodeID, 0, len(h.PreparedConfig.Members)+1)
+	for _, member := range h.PreparedConfig.Members {
+		ids = append(ids, types.NodeID(member.ID))
+	}
+	ids = append(ids, p.Replacement.NodeID)
+	if len(ids) > 64 {
+		return false
+	}
+	slices.Sort(ids)
+	return c.FinalVoterIDs != nil && slices.Equal(c.FinalVoterIDs, ids)
+}
+
+func validV1Alpha2RepairTerminalOrder(p V1Alpha2RepairPlan, completion V1Alpha2RepairCompletion, addition *V1Alpha2RepairCompletion) bool {
+	return repairSequence(p) != V1Alpha2RepairAddThenRemove || completion.Kind != "Terminal" || addition != nil && completion.Slot > addition.Slot
+}
+
 func parseV1Alpha2Repair(s V1Alpha2StatusSnapshot) (*V1Alpha2RepairRecord, error) {
 	status, _ := jsonObject(s.object["status"])
 	raw, ok := status["repair"]
@@ -234,6 +352,9 @@ func parseV1Alpha2Repair(s V1Alpha2StatusSnapshot) (*V1Alpha2RepairRecord, error
 			return nil, err
 		}
 	}
+	if r.AddCompletion != nil && (repairSequence(r.Plan) != V1Alpha2RepairAddThenRemove || r.PreparedHandoff == nil || !validateV1Alpha2RepairAddition(r.Plan, *r.PreparedHandoff, *r.AddCompletion)) {
+		return nil, fmt.Errorf("invalid repair ADD terminal")
+	}
 	if r.Plan.Generation > s.authority.Generation {
 		return nil, fmt.Errorf("repair belongs to a future authority")
 	}
@@ -242,8 +363,11 @@ func parseV1Alpha2Repair(s V1Alpha2StatusSnapshot) (*V1Alpha2RepairRecord, error
 		if r.Completion != nil || !repairMatchesAuthority(r.Plan, s.authority) || hasV1Alpha2Transition(auth["transition"]) {
 			return nil, fmt.Errorf("repair overlaps changed authority or transition")
 		}
-	} else if (r.State != "Completed" && r.State != "Aborted") || r.Completion == nil || !validateV1Alpha2RepairCompletion(r.Plan, *r.Completion) || (r.State == "Completed") != (r.Completion.Kind == "Terminal") {
+	} else if (r.State != "Completed" && r.State != "Aborted") || r.Completion == nil || !validateV1Alpha2RepairCompletion(r.Plan, *r.Completion) || (r.State == "Completed") != (r.Completion.Kind == "Terminal") || (repairSequence(r.Plan) == V1Alpha2RepairAddThenRemove && r.Completion.Kind == "Terminal" && r.AddCompletion == nil) || (repairSequence(r.Plan) == V1Alpha2RepairAddThenRemove && r.Completion.Kind == "Abort" && r.AddCompletion != nil) {
 		return nil, fmt.Errorf("invalid repair terminal")
+	}
+	if r.Completion != nil && !validV1Alpha2RepairTerminalOrder(r.Plan, *r.Completion, r.AddCompletion) {
+		return nil, fmt.Errorf("final REMOVE terminal must follow ADD terminal")
 	}
 	return &r, nil
 }
@@ -253,6 +377,12 @@ func parseV1Alpha2Repair(s V1Alpha2StatusSnapshot) (*V1Alpha2RepairRecord, error
 // The trusted caller must verify current consensus configuration and the old
 // registered WAL identity; these cannot be proved by Kubernetes status.
 func BeginV1Alpha2Repair(ctx context.Context, store *V1Alpha2StatusStore, old V1Alpha2AdmissionSnapshot, expected V1Alpha2AuthorityView, plan V1Alpha2RepairPlan) (V1Alpha2AdmissionSnapshot, V1Alpha2CASObservation, error) {
+	if err := validateV1Alpha2RepairExecutionProfile(old); err != nil {
+		return V1Alpha2AdmissionSnapshot{}, "", err
+	}
+	if plan.Sequence != V1Alpha2RepairAddThenRemove {
+		return V1Alpha2AdmissionSnapshot{}, "", fmt.Errorf("new append-only repair requires ADD-first sequence")
+	}
 	if old.status.store != store || old.Authority() != expected || !repairMatchesAuthority(plan, expected) || hasV1Alpha2Transition(old.transition) || old.SQLReservationsClosed() {
 		return V1Alpha2AdmissionSnapshot{}, "", fmt.Errorf("repair close preconditions do not match")
 	}
@@ -281,9 +411,15 @@ func BeginV1Alpha2Repair(ctx context.Context, store *V1Alpha2StatusStore, old V1
 // The caller must verify the actual final configuration and exact retained
 // consensus terminal/abort, including completing required terminal ACKs.
 func FinishV1Alpha2Repair(ctx context.Context, store *V1Alpha2StatusStore, old V1Alpha2AdmissionSnapshot, expected V1Alpha2AuthorityView, completion V1Alpha2RepairCompletion) (V1Alpha2AdmissionSnapshot, V1Alpha2CASObservation, error) {
+	if err := validateV1Alpha2RepairExecutionProfile(old); err != nil {
+		return V1Alpha2AdmissionSnapshot{}, "", err
+	}
 	r, ok := old.Repair()
-	if old.status.store != store || old.Authority() != expected || !ok || !old.SQLReservationsClosed() || !repairMatchesAuthority(r.Plan, expected) || hasV1Alpha2Transition(old.transition) || !validateV1Alpha2RepairCompletion(r.Plan, completion) {
+	if old.status.store != store || old.Authority() != expected || !ok || !old.SQLReservationsClosed() || !repairMatchesAuthority(r.Plan, expected) || hasV1Alpha2Transition(old.transition) || !validateV1Alpha2RepairCompletion(r.Plan, completion) || repairSequence(r.Plan) == V1Alpha2RepairAddThenRemove && (completion.Kind == "Terminal" && r.AddCompletion == nil || completion.Kind == "Abort" && r.AddCompletion != nil) {
 		return V1Alpha2AdmissionSnapshot{}, "", fmt.Errorf("repair completion preconditions do not match")
+	}
+	if !validV1Alpha2RepairTerminalOrder(r.Plan, completion, r.AddCompletion) {
+		return V1Alpha2AdmissionSnapshot{}, "", fmt.Errorf("final REMOVE terminal must follow ADD terminal")
 	}
 	r.State = "Completed"
 	if completion.Kind == "Abort" {
@@ -330,4 +466,20 @@ func validateV1Alpha2RepairPod(ctx context.Context, store *V1Alpha2StatusStore, 
 		return err
 	}
 	return nil
+}
+
+// Historical control may be inspected but never used to execute membership.
+func validateV1Alpha2RepairExecutionProfile(old V1Alpha2AdmissionSnapshot) error {
+	protocol, err := mixedApplicationProtocol(old.status.object)
+	if err != nil {
+		return err
+	}
+	if err := ValidateV1Alpha2ApplicationProfile(protocol, protocol); err != nil {
+		return err
+	}
+	assignment, err := parseV1Alpha2ApplicationInit(old.status)
+	if err != nil {
+		return err
+	}
+	return ValidateV1Alpha2ApplicationProfile(assignment.Plan.ApplicationProtocol, assignment.Plan.EvidenceFormat)
 }

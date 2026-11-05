@@ -17,43 +17,20 @@ import (
 	"github.com/mrchypark/rhiza/internal/types"
 	"github.com/mrchypark/rhiza/pkg/network"
 	"github.com/mrchypark/rhiza/pkg/operator"
-	"github.com/mrchypark/rhiza/pkg/quepaxa"
 )
 
 // Count actual certified SQL commands through authenticated QUIC. Counting the
 // original receipt alone would not detect a deduplicated second proposal.
 func retainedLagApplicationCounts(t *testing.T, ctx context.Context, cfg Config, original string) (int, int) {
 	t.Helper()
-	cluster := quepaxa.Cluster{ConfigID: 1, Members: cfg.Runtime.Members}
-	transport := network.NewTransport(cfg.Runtime.ClusterID, cfg.Runtime.NodeID, &cluster, cfg.Runtime.PeerToken)
-	defer transport.Close()
-	tip, err := transport.ReadTip(ctx, cfg.Runtime.NodeID)
-	if err != nil {
-		t.Fatal(err)
-	}
 	total, originalCount := 0, 0
-	for from := quepaxa.Slot(1); from <= tip; {
-		page, err := transport.FetchDecisions(ctx, cfg.Runtime.NodeID, from, 128)
-		if err != nil || len(page.Decisions) == 0 {
-			t.Fatal("actual command count page", err)
+	for _, decision := range hostApplicationDecisionSnapshot(t, ctx, cfg) {
+		if decision.kind != "sql" {
+			continue
 		}
-		for _, decision := range page.Decisions {
-			if decision.Slot > tip {
-				break
-			}
-			commands, sql, err := types.DecodeSQLBatch(decision.Value)
-			if err != nil {
-				t.Fatal(err)
-			}
-			if sql {
-				for _, command := range commands {
-					total++
-					if command.RequestID == original {
-						originalCount++
-					}
-				}
-			}
-			from = decision.Slot + 1
+		total++
+		if decision.requestID == original {
+			originalCount++
 		}
 	}
 	return total, originalCount
@@ -135,10 +112,6 @@ func TestManagedSQLRetainedOriginalAppliesCertifiedSuffixBeforeFinalize(t *testi
 	if _, pending := authority.Pending(); pending {
 		t.Fatal("later original not actually finalized")
 	}
-	reserved, observed, err := operator.ReserveV1Alpha2SQLWrite(ctx, configs[0].Store, authority, authority.Authority(), authority.Evidence(), original)
-	if err != nil || observed != operator.V1Alpha2CASApplied {
-		t.Fatal("actual exact duplicate-original CAS reservation", observed, err)
-	}
 	retained, err := hosts[1].node.ResolveManagedSQL(ctx, original)
 	if err != nil || retained.State != network.ResolveExecuteRetained || retained.Durability != network.ResolveExecuteDurabilityConfirmed || retained.Receipt == nil || retained.Receipt.Slot != ack.Slot {
 		t.Fatal("real retained/barrier setup", retained, err)
@@ -148,22 +121,14 @@ func TestManagedSQLRetainedOriginalAppliesCertifiedSuffixBeforeFinalize(t *testi
 		t.Fatal("retained resolver unexpectedly drained controlled suffix", afterRetained, err)
 	}
 	beforeTotal, beforeOriginal := retainedLagApplicationCounts(t, ctx, configs[0], original.RequestID)
-	result, recoverErr := hosts[1].RecoverPendingDetailed(ctx)
+	result, recoverErr := hosts[1].RecoverRequest(ctx, network.RequestStatusRequest{Kind: "sql", RequestID: original.RequestID})
 	afterTotal, afterOriginal := retainedLagApplicationCounts(t, ctx, configs[0], original.RequestID)
 	if beforeTotal != afterTotal || beforeOriginal != 1 || afterOriginal != 1 {
 		t.Fatalf("application resubmitted: total %d->%d original %d->%d", beforeTotal, afterTotal, beforeOriginal, afterOriginal)
 	}
 	t.Logf("actual retained slot=%d certified=%d applied=%d recorder=%d barrier=%s SQL application commands %d->%d original commands %d->%d", ack.Slot, lag.CertifiedTip, lag.AppliedTip, lag.RecorderTip, retained.Durability, beforeTotal, afterTotal, beforeOriginal, afterOriginal)
 	if recoverErr != nil {
-		stillPending, err := operator.LoadV1Alpha2Admission(ctx, configs[0].Store, configs[0].Ref)
-		if err != nil || stillPending.ResourceVersion() != reserved.ResourceVersion() {
-			t.Fatal("failed recovery changed reservation", err)
-		}
-		stored, ok, err := stillPending.PendingSQL()
-		if err != nil || !ok || stored.RequestID != original.RequestID || stored.SQL != original.SQL {
-			t.Fatal("failed recovery changed exact original", err)
-		}
-		t.Fatalf("retained original must finalize after existing certified replay: %v", recoverErr)
+		t.Fatalf("retained original recovery after certified replay: %v", recoverErr)
 	}
 	if result.Kind != "sql" || string(result.RequestID) != original.RequestID || result.SQL == nil {
 		t.Fatal("original tagged result lost", result)
@@ -176,6 +141,9 @@ func TestManagedSQLRetainedOriginalAppliesCertifiedSuffixBeforeFinalize(t *testi
 	after, err := operator.LoadV1Alpha2Admission(ctx, configs[0].Store, configs[0].Ref)
 	if err != nil {
 		t.Fatal(err)
+	}
+	if after.ResourceVersion() != authority.ResourceVersion() || !bytes.Equal(after.Evidence(), authority.Evidence()) {
+		t.Fatal("retained recovery mutated CR authority")
 	}
 	if _, pending := after.Pending(); pending {
 		t.Fatal("confirmed original remains pending")

@@ -70,8 +70,10 @@ func validInitDigest(s string) bool {
 	return err == nil && len(b) == sha256.Size && hex.EncodeToString(b) == s
 }
 func validateV1Alpha2ApplicationInitPlan(p V1Alpha2ApplicationInitPlan, ref V1Alpha2ClusterRef, g v1alpha2Genesis) error {
-	if _, _, err := types.ManagedApplicationPolicy(p.ApplicationProtocol); err != nil {
-		return fmt.Errorf("unsupported initialization protocol")
+	if p.ApplicationProtocol != "" && p.ApplicationProtocol != types.ManagedApplicationProtocolSQLKV {
+		if _, _, err := types.ManagedApplicationPolicy(p.ApplicationProtocol); err != nil {
+			return fmt.Errorf("unsupported initialization protocol")
+		}
 	}
 	if !validInitString(p.AssignmentID) || p.ClusterUID != ref.UID || p.IntentHash != g.IntentHash || p.Generation != 0 || p.DeploymentUID != g.DeploymentUID || p.StorageID != g.StorageID || !validInitDigest(p.PhysicalBinding) || !validInitDigest(p.BootstrapPlanDigest) || !validInitString(p.EvidenceFormat) {
 		return fmt.Errorf("invalid application initialization plan")
@@ -125,6 +127,9 @@ func LoadV1Alpha2ApplicationInit(ctx context.Context, store *V1Alpha2StatusStore
 // CommitV1Alpha2ApplicationInit atomically consumes an unused assignment and
 // stores host-verified initial evidence. Matching readback is not ownership.
 func CommitV1Alpha2ApplicationInit(ctx context.Context, store *V1Alpha2StatusStore, old V1Alpha2ApplicationInitSnapshot, expected V1Alpha2ApplicationInitPlan, evidence json.RawMessage) (V1Alpha2ApplicationInitSnapshot, V1Alpha2CASObservation, error) {
+	if err := ValidateV1Alpha2ApplicationProfile(expected.ApplicationProtocol, expected.EvidenceFormat); err != nil {
+		return V1Alpha2ApplicationInitSnapshot{}, "", err
+	}
 	if store == nil || old.status.store != store || old.status.object == nil || old.assignment.State != "Unused" || old.assignment.Plan != expected || len(evidence) == 0 || len(evidence) > 64<<10 || bytes.Equal(bytes.TrimSpace(evidence), []byte("null")) || !json.Valid(evidence) {
 		return V1Alpha2ApplicationInitSnapshot{}, "", fmt.Errorf("invalid initialization preconditions")
 	}

@@ -1,8 +1,12 @@
 package managedbootstrap
 
 import (
+	"context"
+	"strings"
+
 	"testing"
 
+	"github.com/mrchypark/rhiza/internal/sqlpolicy"
 	"github.com/mrchypark/rhiza/internal/types"
 	"github.com/mrchypark/rhiza/pkg/node"
 	"github.com/mrchypark/rhiza/pkg/operator"
@@ -10,12 +14,9 @@ import (
 
 func TestManagedProfileBindingPureRoundTrip(t *testing.T) {
 	ref := operator.V1Alpha2ClusterRef{Name: "sql", Namespace: "ns", UID: "uid"}
-	for _, protocol := range []string{"", types.ManagedApplicationProtocolSQLKV} {
+	for _, protocol := range []string{sqlpolicy.ManagedRequestAppendOnlyApplicationProtocol, sqlpolicy.ManagedGraphRequestAppendOnlyApplicationProtocol} {
 		t.Run(protocol, func(t *testing.T) {
-			format := operator.V1Alpha2ManagedSQLEvidenceFormat
-			if protocol != "" {
-				format = operator.V1Alpha2ManagedSQLKVEvidenceFormat
-			}
+			format := protocol
 			profile := operator.V1Alpha2RuntimeProfile{ApplicationProtocol: protocol, EvidenceFormat: format, InitImage: "example/init:v1", PeerPort: 9090, ProfileSecretName: "runtime", Storage: types.ExecutionConfig{AdminToken: "private", ObjStoreProvider: "s3", ObjStoreBucket: "test", ObjStorePrefix: "managed", ObjStoreEndpoint: "s3.example.test"}}
 			assignment, plan, err := operator.BuildV1Alpha2RuntimePlan(ref, "logical", "deployment", profile, nil)
 			if err != nil {
@@ -74,5 +75,20 @@ func TestManagedProfileBindingPureRoundTrip(t *testing.T) {
 				})
 			}
 		})
+	}
+}
+
+func TestManagedConfigRetiredProfilesRefusedBeforeEffects(t *testing.T) {
+	for _, protocol := range []string{"", types.ManagedApplicationProtocolSQLKV} {
+		profile := operator.V1Alpha2RuntimeProfile{ApplicationProtocol: protocol, EvidenceFormat: protocol}
+		if _, err := ManagedConfig(context.Background(), nil, operator.V1Alpha2ClusterRef{}, "", "", "missing-identity", "missing-bootstrap", profile); err == nil || !strings.Contains(err.Error(), "profiles 7/8 are retired") {
+			t.Fatalf("retired ManagedConfig did not reject before file/Kubernetes access: %v", err)
+		}
+		if _, err := ManagedRuntimeConfig(context.Background(), nil, operator.V1Alpha2ClusterRef{}, "", "missing-identity", profile, operator.V1Alpha2BootstrapPlan{}); err == nil || !strings.Contains(err.Error(), "profiles 7/8 are retired") {
+			t.Fatalf("retired runtime config did not reject before file/Kubernetes access: %v", err)
+		}
+		if _, _, err := ManagedRepairConfig(context.Background(), nil, operator.V1Alpha2ClusterRef{}, "", "", "missing-identity", "missing-bootstrap", "missing-repair", profile); err == nil || !strings.Contains(err.Error(), "profiles 7/8 are retired") {
+			t.Fatalf("retired repair config did not reject before file/Kubernetes access: %v", err)
+		}
 	}
 }

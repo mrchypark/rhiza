@@ -5,7 +5,6 @@ COPY go.mod go.sum ./
 RUN go mod download
 COPY . .
 RUN CGO_ENABLED=0 GOOS=linux go build -o rhiza-operator ./cmd/rhiza-operator
-RUN CGO_ENABLED=0 GOOS=linux go build -o rhiza-fencer ./cmd/rhiza-fencer
 RUN CGO_ENABLED=0 GOOS=linux go build -o rhiza-ha-init ./cmd/rhiza-ha-init
 
 # SDK build.rs accepts linux-gnu, not musl. Digest verified at the official
@@ -25,7 +24,6 @@ FROM mirror.gcr.io/library/ubuntu:24.04@sha256:534baea6a22c03a63003dbc8dbe78fe34
 ENV STORAGE_EMULATOR_HOST=http://floci:4588
 RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates libgcc-s1
 COPY --from=builder /app/rhiza-operator /usr/local/bin/rhiza-operator
-COPY --from=builder /app/rhiza-fencer /usr/local/bin/rhiza-fencer
 COPY --from=builder /app/rhiza-ha-init /usr/local/libexec/rhiza-ha-init
 COPY --from=rust-builder /app/rhiza-managed-ffi-contract /usr/local/libexec/rhiza-managed-ffi-contract
 COPY --from=rust-builder /app/rhiza-managed-materializer-contract /usr/local/libexec/rhiza-managed-materializer-contract

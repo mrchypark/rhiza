@@ -264,16 +264,13 @@ vendor_dir_from_go_list() {
     package_list=$2
     actual_vendor_dir=$(awk -F '\t' '
         NF != 2 || $1 == "" || $2 == "" { bad=1 }
-        index($2, "/vendor/") {
-            path=$2
-            search=1
-            while (search <= length(path)) {
-                relative=index(substr(path, search), "/vendor/")
-                if (relative == 0) break
-                at=search+relative-1
-                found=substr(path, 1, at+6)
-                search=at+8
-            }
+        {
+            # GOROOT packages use vendor/... import paths, not module paths.
+            # Match the complete import suffix before identifying its root.
+            suffix="/" $1
+            if (length($2) <= length(suffix) || substr($2, length($2)-length(suffix)+1) != suffix) next
+            found=substr($2, 1, length($2)-length(suffix))
+            if (substr(found, length(found)-6) != "/vendor") next
             if (root != "" && root != found) bad=1
             root=found
         }

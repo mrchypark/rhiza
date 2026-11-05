@@ -32,10 +32,18 @@ import (
 )
 
 func TestManagedNoPVCPreparedLearnerPreservesCurrentAndCertifiedRoot(t *testing.T) {
-	runManagedNoPVCPreparedLearnerStartup(t, false, false, false)
+	runManagedNoPVCPreparedLearnerStartup(t, false, false, false, false, false)
 }
 
-func runManagedNoPVCPreparedLearnerStartup(t *testing.T, appendSuffix, cancelAfterAcceptedSuffix, partialReplayAfterCancel bool) {
+func TestManagedNoPVCPreparedLearnerNilPreparedRestartRemainsReadOnly(t *testing.T) {
+	runManagedNoPVCPreparedLearnerStartup(t, false, false, false, true, false)
+}
+
+func TestManagedNoPVCPreparedLearnerAdoptsHBeforeLaterCurrentAndJ(t *testing.T) {
+	runManagedNoPVCPreparedLearnerStartup(t, true, false, false, false, true)
+}
+
+func runManagedNoPVCPreparedLearnerStartup(t *testing.T, appendSuffix, cancelAfterAcceptedSuffix, partialReplayAfterCancel, nilPreparedRestart, advanceCurrentAfterH bool) {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 	protocol := sqlpolicy.ManagedRequestAppendOnlyApplicationProtocol
@@ -216,6 +224,10 @@ func runManagedNoPVCPreparedLearnerStartup(t *testing.T, appendSuffix, cancelAft
 	if err := archive.SyncThrough(ctx, cores[0], cores[0].Tip()); err != nil {
 		t.Fatal(err)
 	}
+	sealedB, ok, err := cores[0].LatestManagedCheckpointSeal()
+	if err != nil || !ok || sealedB.Index != sealB.Index || sealedB.RootHash != sealB.RootHash || sealedB.StateHash != sealB.StateHash {
+		t.Fatalf("certified B missing as exact managed checkpoint: seal=%+v exists=%t err=%v expected=%+v", sealedB, ok, err, sealB)
+	}
 	locator, exists, err := checkpoints.LoadManagedAppendOnlyLocator(ctx, policy)
 	if err != nil || !exists || locator.RootHash != rootA.RootHash {
 		t.Fatalf("fixture CURRENT must remain at physical A before learner startup: %+v exists=%t err=%v", locator, exists, err)
@@ -262,6 +274,8 @@ func runManagedNoPVCPreparedLearnerStartup(t *testing.T, appendSuffix, cancelAft
 	var suffixCommand []byte
 	var suffixDecision quepaxa.DecidedValue
 	var suffixFirstDecision quepaxa.DecidedValue
+	currentRoot := rootA.RootHash
+	currentSeal := sealedB
 	if appendSuffix {
 		if err := source.replayLocalDecisions(ctx); err != nil {
 			t.Fatal("apply captured H prefix to source materializer", err)
@@ -312,6 +326,43 @@ func runManagedNoPVCPreparedLearnerStartup(t *testing.T, appendSuffix, cancelAft
 		if err := archive.SyncThrough(ctx, cores[0], suffixSlot); err != nil {
 			t.Fatal("archive certified suffix through J", err)
 		}
+	}
+	if advanceCurrentAfterH {
+		// Prepared H was published above. Advance CURRENT only after that frozen
+		// source view, using another real quorum-certified same-cut QCKP.
+		fileDB, err := sql.Open("sqlite3", files[0].Path)
+		if err != nil {
+			t.Fatal("open prepared KV source for later CURRENT root", err)
+		}
+		_, editErr := fileDB.ExecContext(ctx, "PRAGMA user_version=2")
+		closeErr := fileDB.Close()
+		if editErr != nil || closeErr != nil {
+			t.Fatal("make later CURRENT root distinct", editErr, closeErr)
+		}
+		rootC, err := checkpoints.CreateManagedAppendOnlyCandidate(ctx, sources, cut)
+		if err != nil || rootC.RootHash == rootB.RootHash {
+			t.Fatalf("later same-cut CURRENT C root is not distinct from H's B: root=%+v err=%v", rootC, err)
+		}
+		sealC := sealA
+		sealC.RootHash, sealC.StateHash = rootC.RootHash, rootC.Hash
+		valueC, err := quepaxa.EncodeCheckpointSeal(sealC)
+		if err != nil {
+			t.Fatal("encode later certified CURRENT C", err)
+		}
+		if _, _, err := cores[0].Propose(ctx, valueC); err != nil {
+			t.Fatal("certify later CURRENT C with source quorum", err)
+		}
+		if err := archive.SyncThrough(ctx, cores[0], cores[0].Tip()); err != nil {
+			t.Fatal("archive later CURRENT C certificate", err)
+		}
+		currentSeal, ok, err = cores[0].LatestManagedCheckpointSeal()
+		if err != nil || !ok || currentSeal.RootHash != rootC.RootHash {
+			t.Fatalf("source quorum did not retain exact later CURRENT C: seal=%+v err=%v", currentSeal, err)
+		}
+		if err := source.promoteManagedAppendOnlySeal(ctx, currentSeal); err != nil {
+			t.Fatal("publish actual later CURRENT C", err)
+		}
+		currentRoot = rootC.RootHash
 	}
 	membership, err := json.Marshal(recovery.NewMembershipRecord(clusterID, cluster.Members, string(config.ObjStoreDurability)))
 	if err != nil {
@@ -386,25 +437,52 @@ func runManagedNoPVCPreparedLearnerStartup(t *testing.T, appendSuffix, cancelAft
 		}
 		var writes []string
 		for _, request := range objectStore.requests[start:] {
-			if strings.HasPrefix(request, "PUT ") || strings.HasPrefix(request, "DELETE ") {
+			if !strings.HasPrefix(request, "GET ") && !strings.HasPrefix(request, "HEAD ") {
 				writes = append(writes, request)
 			}
 		}
 		return writes
 	}
-	backupWriteRequestsSince := func(start int) []string {
-		var backupWrites []string
-		for _, request := range writeRequestsSince(start) {
-			if strings.Contains(request, "/archive/") || strings.Contains(request, "/checkpoint/") {
-				backupWrites = append(backupWrites, request)
-			}
-		}
-		return backupWrites
-	}
 	backupBeforeOpen := backupSnapshot()
 	objectStore.mu.RLock()
 	requestsBeforeOpen := len(objectStore.requests)
 	objectStore.mu.RUnlock()
+	registrationKey := path.Join(namespace.FinalPrefix, "voters", fmt.Sprintf("%x.json", sha256.Sum256([]byte(config.NodeID))))
+	objectStore.mu.RLock()
+	_, alreadyRegistered := objectStore.objects[registrationKey]
+	objectStore.mu.RUnlock()
+	if alreadyRegistered {
+		t.Fatal("fresh learner registration unexpectedly exists before Open")
+	}
+	verifyOnlyFreshRegistration := func() {
+		t.Helper()
+		mutations := writeRequestsSince(requestsBeforeOpen)
+		wantPut := "PUT /" + config.ObjStoreBucket + "/" + registrationKey
+		if len(mutations) != 1 || mutations[0] != wantPut {
+			t.Fatalf("fresh learner may only register its exact voter identity: mutations=%v", mutations)
+		}
+		objectStore.mu.RLock()
+		registration := append([]byte(nil), objectStore.objects[registrationKey]...)
+		objectStore.mu.RUnlock()
+		var got voterIdentity
+		if err := json.Unmarshal(registration, &got); err != nil {
+			t.Fatal("decode fresh learner registration", err)
+		}
+		nonce, err := hex.DecodeString(got.Nonce)
+		if err != nil || len(nonce) != 32 || node.core == nil || got.Nonce != node.core.WALIdentity() {
+			t.Fatalf("fresh learner registration lacks exact WAL nonce: nonce=%q err=%v", got.Nonce, err)
+		}
+		profile, err := node.managedVoterProfileFor(config)
+		if err != nil || profile == nil {
+			t.Fatalf("fresh learner profile unavailable: %v", err)
+		}
+		want := voterIdentityForProfile(config, profile)
+		want.Nonce, want.Registered = got.Nonce, true
+		local, err := loadVoterIdentity(config)
+		if !sameVoterIdentity(got, want) || err != nil || local.identity == nil || !sameVoterIdentity(got, *local.identity) {
+			t.Fatalf("fresh registration differs from exact profile/local identity: got=%+v want=%+v local=%+v err=%v", got, want, local.identity, err)
+		}
+	}
 	startupIdentity := ManagedStartupIdentity{
 		ApplicationProtocol: protocol, EvidenceFormat: protocol, Member: identity,
 		AssignmentID: assignment, IntentHash: "intent", StorageID: storageRoot,
@@ -414,12 +492,16 @@ func runManagedNoPVCPreparedLearnerStartup(t *testing.T, appendSuffix, cancelAft
 		if err := node.Shutdown(); err != nil {
 			t.Error(err)
 		}
+		mutations := writeRequestsSince(requestsBeforeOpen)
+		wantPut := "PUT /" + config.ObjStoreBucket + "/" + registrationKey
+		if len(mutations) != 1 || mutations[0] != wantPut {
+			t.Errorf("catch-up or shutdown mutated storage beyond exact initial registration: %v", mutations)
+		}
 		if appendSuffix {
 			after := backupSnapshot()
 			diff := backupDiff(backupBeforeOpen, after)
-			backupWrites := backupWriteRequestsSince(requestsBeforeOpen)
-			if len(diff) != 0 || len(backupWrites) != 0 {
-				t.Errorf("unpromoted learner changed archive/checkpoint storage during catch-up or shutdown: objects=%v backup_writes=%v all_writes=%v", diff, backupWrites, writeRequestsSince(requestsBeforeOpen))
+			if len(diff) != 0 {
+				t.Errorf("unpromoted learner changed archive/checkpoint storage during catch-up or shutdown: objects=%v all_mutations=%v", diff, writeRequestsSince(requestsBeforeOpen))
 			}
 		}
 	})
@@ -485,13 +567,13 @@ func runManagedNoPVCPreparedLearnerStartup(t *testing.T, appendSuffix, cancelAft
 			t.Fatalf("learner did not persist/install exact H before J catch-up: adoption=%+v err=%v core=%d material=%v H=%d", adoption, adoptionErr, coreTip, node.material, view.Tip())
 		}
 		diff := backupDiff(backupBeforeOpen, backupSnapshot())
-		backupWrites := backupWriteRequestsSince(requestsBeforeOpen)
-		if len(diff) != 0 || len(backupWrites) != 0 {
-			t.Fatalf("prepared learner changed archive/checkpoint storage before J catch-up: objects=%v backup_writes=%v all_writes=%v", diff, backupWrites, writeRequestsSince(requestsBeforeOpen))
+		if len(diff) != 0 {
+			t.Fatalf("prepared learner changed archive/checkpoint storage before J catch-up: objects=%v all_mutations=%v", diff, writeRequestsSince(requestsBeforeOpen))
 		}
+		verifyOnlyFreshRegistration()
 		current, exists, currentErr := node.checkpoints.LoadManagedAppendOnlyLocator(ctx, policy)
-		if currentErr != nil || !exists || current.RootHash != rootA.RootHash {
-			t.Fatalf("unpromoted learner changed CURRENT before J catch-up: current=%+v exists=%t err=%v", current, exists, currentErr)
+		if currentErr != nil || !exists || current.RootHash != currentRoot {
+			t.Fatalf("prepared learner changed the source CURRENT while adopting H: current=%+v exists=%t err=%v", current, exists, currentErr)
 		}
 		release()
 		if cancelAfterAcceptedSuffix {
@@ -564,6 +646,25 @@ func runManagedNoPVCPreparedLearnerStartup(t *testing.T, appendSuffix, cancelAft
 		objectStore.mu.RUnlock()
 		t.Fatalf("public prepared learner startup: %v; requests=%v", err, requests)
 	}
+	verifyOnlyFreshRegistration()
+	if nilPreparedRestart {
+		objectStore.mu.RLock()
+		requestsBeforeRestart := len(objectStore.requests)
+		objectStore.mu.RUnlock()
+		if err := node.Shutdown(); err != nil {
+			t.Fatalf("close prepared learner after durable H adoption: %v", err)
+		}
+		node = New(config)
+		if err := node.OpenManaged(ctx, ManagedStartupConfig{StorageRoot: storageRoot, Identity: startupIdentity, Checker: &managedTestChecker{}}); err != nil {
+			t.Fatalf("same-identity public restart with verified persisted H and Prepared=nil: %v", err)
+		}
+		if diff := backupDiff(backupBeforeOpen, backupSnapshot()); len(diff) != 0 {
+			t.Fatalf("Prepared=nil readonly learner restart changed archive/checkpoint objects: %v", diff)
+		}
+		if writes := writeRequestsSince(requestsBeforeRestart); len(writes) != 0 {
+			t.Fatalf("Prepared=nil readonly learner restart mutated object storage: %v", writes)
+		}
+	}
 	if node.core == nil || node.core.IsVoter() || node.Ready() {
 		t.Fatalf("prepared learner voted or served before membership promotion: core=%t voter=%t ready=%t", node.core != nil, node.core != nil && node.core.IsVoter(), node.Ready())
 	}
@@ -572,14 +673,14 @@ func runManagedNoPVCPreparedLearnerStartup(t *testing.T, appendSuffix, cancelAft
 		t.Fatalf("startup changed physical A recovery floor: floor=%d root=%x ok=%t", floor, floorRoot, ok)
 	}
 	selected, exists, err := node.checkpoints.LoadManagedAppendOnlyLocator(ctx, policy)
-	if err != nil || !exists || selected.RootHash != rootA.RootHash || selected.Index != uint64(cut) {
-		t.Fatalf("unpromoted prepared learner changed physical CURRENT A: current=%+v exists=%t err=%v A=%x B=%x", selected, exists, err, rootA.RootHash, rootB.RootHash)
+	if err != nil || !exists || selected.RootHash != currentRoot || selected.Index != uint64(cut) {
+		t.Fatalf("unpromoted prepared learner changed physical CURRENT: current=%+v exists=%t err=%v expected=%x A=%x B=%x", selected, exists, err, currentRoot, rootA.RootHash, rootB.RootHash)
 	}
 	latest, latestExists, latestErr := node.core.LatestManagedCheckpointSeal()
-	if latestErr != nil || !latestExists || latest.Index != sealB.Index || latest.RootHash != rootB.RootHash || latest.StateHash != rootB.Hash {
-		t.Fatalf("prepared learner lost certified local B representative: latest=%+v exists=%t err=%v B=%+v", latest, latestExists, latestErr, sealB)
+	if latestErr != nil || !latestExists || latest.Index != currentSeal.Index || latest.RootHash != currentSeal.RootHash || latest.StateHash != currentSeal.StateHash {
+		t.Fatalf("prepared learner lost certified local selected QCKP representative: latest=%+v exists=%t err=%v expected=%+v", latest, latestExists, latestErr, currentSeal)
 	}
-	bDecision, bCertified := node.core.CertifiedValue(latest.DecisionSlot)
+	bDecision, bCertified := node.core.CertifiedValue(sealedB.DecisionSlot)
 	if !bCertified || !bytes.Equal(bDecision.Value, valueB) || bDecision.Hash != quepaxa.ValueHash(sha256.Sum256(valueB)) {
 		t.Fatalf("prepared learner lost exact B certificate: decision=%+v certified=%t", bDecision, bCertified)
 	}
@@ -588,8 +689,17 @@ func runManagedNoPVCPreparedLearnerStartup(t *testing.T, appendSuffix, cancelAft
 		t.Fatalf("prepared learner lost B root object: root=%+v err=%v", openedB, err)
 	}
 	if appendSuffix {
-		if node.core.Tip() != suffixSlot || node.material == nil || quepaxa.Slot(node.material.Tip()) != suffixSlot {
-			t.Fatalf("prepared learner did not catch up exact J suffix: core=%d material=%v J=%d", node.core.Tip(), node.material, suffixSlot)
+		wantCoreTip := suffixSlot
+		if advanceCurrentAfterH {
+			wantCoreTip = currentSeal.DecisionSlot
+		}
+		// The later certified QCKP is also applied, without changing physical floor A.
+		if node.core.Tip() != wantCoreTip || node.material == nil || quepaxa.Slot(node.material.Tip()) != wantCoreTip {
+			var appliedTip uint64
+			if node.material != nil {
+				appliedTip = node.material.Tip()
+			}
+			t.Fatalf("prepared learner did not adopt H, preserve later certified QCKP, and replay exact J suffix: core=%d material_present=%t material_tip=%d J=%d expectedCore=%d current_QCKP_slot=%d", node.core.Tip(), node.material != nil, appliedTip, suffixSlot, wantCoreTip, currentSeal.DecisionSlot)
 		}
 		appliedDecision, certified := node.core.CertifiedValue(suffixSlot)
 		if !certified || appliedDecision.Slot != suffixDecision.Slot || appliedDecision.Hash != suffixDecision.Hash || !bytes.Equal(appliedDecision.Value, suffixDecision.Value) || !bytes.Equal(appliedDecision.Certificate, suffixDecision.Certificate) {

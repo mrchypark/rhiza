@@ -94,11 +94,22 @@ func mixedApplicationProtocol(obj map[string]json.RawMessage) (string, error) {
 		if json.Unmarshal(raw, &protocol) != nil || protocol == "" {
 			return "", fmt.Errorf("unsupported application protocol")
 		}
-		if _, _, err := types.ManagedApplicationPolicy(protocol); err != nil {
-			return "", fmt.Errorf("unsupported application protocol")
+		if protocol != types.ManagedApplicationProtocolSQLKV {
+			if _, _, err := types.ManagedApplicationPolicy(protocol); err != nil {
+				return "", fmt.Errorf("unsupported application protocol")
+			}
 		}
 	}
 	return protocol, nil
+}
+
+// Retired markers are recognized only for inspecting retained control evidence.
+// They never pass ValidateV1Alpha2ApplicationProfile or managed startup.
+func validateObservedApplicationProfile(protocol, evidence string) error {
+	if protocol == "" && evidence == V1Alpha2ManagedSQLEvidenceFormat || protocol == types.ManagedApplicationProtocolSQLKV && evidence == protocol {
+		return nil
+	}
+	return ValidateV1Alpha2ApplicationProfile(protocol, evidence)
 }
 
 func managedControlProfile(obj map[string]json.RawMessage) (string, string, error) {
@@ -117,7 +128,7 @@ func managedControlProfile(obj map[string]json.RawMessage) (string, string, erro
 	if decodeV1Alpha2(status["applicationInit"], &assignment) != nil || assignment.Plan.ApplicationProtocol != protocol {
 		return "", "", fmt.Errorf("application protocol markers disagree")
 	}
-	if err := ValidateV1Alpha2ApplicationProfile(protocol, assignment.Plan.EvidenceFormat); err != nil {
+	if err := validateObservedApplicationProfile(protocol, assignment.Plan.EvidenceFormat); err != nil {
 		return "", "", err
 	}
 	return protocol, assignment.Plan.EvidenceFormat, nil

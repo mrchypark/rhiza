@@ -89,7 +89,7 @@ func TestManagedGraphAdmissionPostReadIndexJoinsValidatedRemoteOwner(t *testing.
 	// value while the original slot-9 certificate is still pending.
 	callerB := make(chan error, 1)
 	go func() { callerB <- fixture.node.admitInternalApplication(ctx) }()
-	awaitManagedGraphAdmissionObservation(t, fixture, callerB, 9)
+	awaitManagedGraphAdmissionOwner(t, fixture, callerB, 9)
 	var ownerBarrier []byte
 	select {
 	case ownerBarrier = <-ownerProposalEntered:
@@ -101,8 +101,7 @@ func TestManagedGraphAdmissionPostReadIndexJoinsValidatedRemoteOwner(t *testing.
 	}
 	fixture.node.managedGraphControlMu.Lock()
 	registered := fixture.node.managedGraphControl
-	registeredMatches := registered != nil && registered.observation != nil &&
-		registered.observation.ObservedSlot == 9 && registered.observation.BelongsTo(fixture.node.core) &&
+	registeredMatches := registered != nil && registered.binding == fixture.node.internalApplication.Load() &&
 		bytes.Equal(registered.value, ownerBarrier)
 	fixture.node.managedGraphControlMu.Unlock()
 	if !registeredMatches {
@@ -163,7 +162,7 @@ func TestManagedGraphAdmissionPostReadIndexJoinsValidatedRemoteOwner(t *testing.
 	}
 }
 
-func TestManagedGraphAdmissionPostReadIndexDoesNotReuseOwnerForFreshGap(t *testing.T) {
+func TestManagedGraphAdmissionPostReadIndexCancellationPreservesFreshGap(t *testing.T) {
 	fixture := newManagedGraphAdmissionRaceFixture(t)
 	t.Cleanup(fixture.transport.releaseHeld)
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
@@ -205,7 +204,7 @@ func TestManagedGraphAdmissionPostReadIndexDoesNotReuseOwnerForFreshGap(t *testi
 	fixture.awaitPendingControl(t)
 	callerB := make(chan error, 1)
 	go func() { callerB <- fixture.node.admitInternalApplication(ctx) }()
-	awaitManagedGraphAdmissionObservation(t, fixture, callerB, 9)
+	awaitManagedGraphAdmissionOwner(t, fixture, callerB, 9)
 	var ownerBarrier []byte
 	select {
 	case ownerBarrier = <-ownerProposalEntered:
@@ -246,11 +245,8 @@ func TestManagedGraphAdmissionPostReadIndexDoesNotReuseOwnerForFreshGap(t *testi
 	readTipReleaseOnce.Do(func() { close(readTipRelease) })
 	select {
 	case err := <-callerA:
-		if err == nil || errors.Is(err, context.DeadlineExceeded) {
-			t.Fatalf("caller A reused the old R=9 observation for fresh ordinary R=10: %v", err)
-		}
-	case <-time.After(3 * time.Second):
-		t.Fatal("caller A waited on the old owner instead of refusing the fresh R=10 gap")
+		t.Fatalf("caller A did not wait for the actual owner and fresh gap: %v", err)
+	case <-time.After(100 * time.Millisecond):
 	}
 	if _, ok := fixture.node.core.CertifiedValue(10); ok {
 		t.Fatal("the fresh ordinary slot 10 was certified while B's private proposal remained held")
@@ -261,6 +257,14 @@ func TestManagedGraphAdmissionPostReadIndexDoesNotReuseOwnerForFreshGap(t *testi
 	}
 
 	cancel()
+	select {
+	case err := <-callerA:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("caller A cancellation was lost: %v", err)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("caller A did not cancel its owner wait")
+	}
 	ownerReleaseOnce.Do(func() { close(ownerProposalRelease) })
 	select {
 	case err := <-callerB:

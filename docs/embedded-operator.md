@@ -1,5 +1,44 @@
 # 임베딩 애플리케이션에서 Rhiza Operator 사용하기
 
+## 현재 managed HA 계약
+
+현재 Operator는 v1alpha2 Deployment Pod와 init-container identity handoff를
+사용한다. 설치한 private runtime profile이 필요하며, 정상 HA 이미지는
+`rhiza-operator`와 `rhiza-ha-init`을 제공한다. 별도 fencer Deployment나 외부
+lease 서비스는 정상 quorum 복구의 필수 구성 요소가 아니다.
+
+quorum이 살아 있으면 인증된 QuePaxa 경로로 새 ID와 새 WAL을 가진 learner를
+먼저 추가하고, certified prefix와 admission을 검증한 뒤 실패한 ID를 제거한다.
+분실한 WAL의 voter ID를 재사용하지 않는다. 동일 ID의 재가입에는 원래 WAL과
+현재 certified membership 검증이 필요하다. HA object data는 append-only이며
+online delete GC를 사용하지 않는다.
+
+quorum을 잃으면 쓰기와 linearizable 읽기는 실패한다. 준비된 노드의 local 읽기는
+계속 가능하다. 우선 원래 노드·디스크·네트워크를 복원한다. 새 세대의 수동 DR은
+이전 프로세스의 재등장 방지, 전체 identity scope의 종료·격리, 미완료 storage
+작업과 certified 자료 및 live authority를 별도로 검증해야 한다. Pod 삭제나
+timeout만으로 이를 증명할 수 없고, 현재 Operator는 자동 세대 전환을 제공하지 않는다.
+현재 설치 계약은 [배포 안내](../deploy/operator/README.md)와
+[복구 경계](recovery.md)를 따른다.
+
+승인된 DR 설계에서 자동 시도는 기본 OFF다. 명시적으로 허용한 정책에서 실제
+ReadIndex/quorum 실패가 지속되면 준비를 시도할 수 있지만, 실패 감지는 활성화
+권한이 아니다. 모든 이전 runtime·voter·sidecar의 종료와 재생성 차단, 진행 중인
+storage 작업의 완료, 모든 성공 ACK를 포함하는 소스와 새 ready quorum을 검증해야
+활성화할 수 있다. 증거가 불명확하거나 partition 상태이면 Blocked로 남겨 수동
+조치를 요구한다. 별도의 상시 fencer나 새 lease·epoch·live permission을 추가하는
+정책이 아니며 pending state·UNKNOWN·live anchor/Transition 검증은 유지한다.
+이 자동 시도 정책은 아직 현재 Operator에 구현되거나 qualification된 기능이 아니다.
+
+## 지원하지 않는 legacy 운영 예제
+
+아래 내용은 기존 StatefulSet/alpha1 통합의 참고 자료이며 현재 설치 절차가 아니다.
+아래 YAML·명령·환경 변수를 현재 alpha2 배포에 적용하지 않는다.
+`spec.membership`, `spec.fence`, `spec.anchorID`는 현재 API로 변환되지 않는다.
+`RHIZA_AUTOMATIC_RECOVERY=true`는 현재 Operator가 거부하며, fencer/anchor 설정을
+추가해도 legacy recovery engine이 활성화되지 않는다. 아래의 과거 동작 설명은
+현재 기능이나 검증 완료를 주장하지 않는다. DR 안전 조건은 여전히 지켜야 한다.
+
 Rhiza를 라이브러리로 사용하는 **Go·Rust 애플리케이션의 프로세스 자체**를
 Operator가 복구할 수 있다. 별도의 Rhiza 서버 프로세스나 데이터베이스 sidecar는
 필요하지 않다. Operator는 Kubernetes에 별도 Deployment로 실행한다.

@@ -83,7 +83,6 @@ kubeconfig="$RUNNER_TEMP/ha-contract-$nonce.kubeconfig"
 tokenfile="$RUNNER_TEMP/ha-contract-$nonce.token"
 cafile="$RUNNER_TEMP/ha-contract-$nonce.ca"
 owned=0
-old_source=''
 
 cleanup() {
   result=$?
@@ -104,10 +103,6 @@ cleanup() {
     fi
   fi
   # The kubeconfig contains credentials and must not be uploaded.
-  if [ -n "$old_source" ]; then
-    case "$old_source" in "$RUNNER_TEMP"/ha-old-source.*) rm -rf "$old_source";; *) echo 'refusing unowned old-source cleanup' >&2; result=1;; esac
-    if [ -e "$old_source" ]; then echo 'old source cleanup incomplete' >&2; result=1; fi
-  fi
   rm -f "$kubeconfig" "$tokenfile" "$cafile"
   if [ -e "$kubeconfig" ] || [ -e "$tokenfile" ] || [ -e "$cafile" ]; then
     echo "credential cleanup incomplete for contract $nonce" >&2
@@ -168,8 +163,18 @@ recovery_json() {
 cluster_json cluster 3 '' > "$logs/cluster.json"
 ok cluster-create create --validate=strict -f "$logs/cluster.json"
 reject genesis-retrofit 'genesisIntent' patch rhizacluster cluster -n "$namespace" --type=merge -p '{"spec":{"genesisIntent":"Create"}}'
-cluster_json genesis-admission 3 ',"genesisIntent":"Create"' > "$logs/genesis-admission.json"
+cluster_json genesis-admission 3 ',"genesisIntent":"Create","applicationProtocol":"rhiza-managed-request-append-only/v1"' > "$logs/genesis-admission.json"
 ok genesis-create create --validate=strict -f "$logs/genesis-admission.json"
+for retired in empty mixed request graph; do
+  case "$retired" in
+    empty) protocol='' ;;
+    mixed) protocol=rhiza-managed-sql-kv/v1 ;;
+    request) protocol=rhiza-managed-request/v1 ;;
+    graph) protocol=rhiza-managed-request-graph/v1 ;;
+  esac
+  cluster_json "retired-profile-$retired" 3 ",\"genesisIntent\":\"Create\",\"applicationProtocol\":\"$protocol\"" > "$logs/retired-profile-$retired.json"
+  reject "retired-profile-$retired" 'applicationProtocol' create --validate=strict --dry-run=server -f "$logs/retired-profile-$retired.json"
+done
 reject genesis-remove 'genesisIntent' patch rhizacluster genesis-admission -n "$namespace" --type=merge -p '{"spec":{"genesisIntent":null}}'
 reject genesis-change 'genesisIntent' patch rhizacluster genesis-admission -n "$namespace" --type=merge -p '{"spec":{"genesisIntent":"other"}}'
 ok genesis-mutable-spec patch rhizacluster genesis-admission -n "$namespace" --type=merge -p '{"spec":{"automaticRecovery":"A"}}'
@@ -243,7 +248,7 @@ done
 authority_uid=$(k get rhizacluster authority-contract -n "$namespace" -o jsonpath='{.metadata.uid}')
 : "${authority_uid:?}"
 ok authority-contract-seed patch rhizacluster authority-contract -n "$namespace" --subresource=status --type=merge -p "{\"status\":{\"authority\":{\"owner\":{\"namespace\":\"$namespace\",\"name\":\"authority-contract\",\"uid\":\"$authority_uid\",\"logicalID\":\"test\"},\"generation\":2,\"binding\":{\"deploymentUID\":\"deployment\",\"storageID\":\"storage\"},\"pendingWrite\":false,\"everApplicationReserved\":false,\"evidence\":{\"host\":\"before\"},\"receipt\":{\"opaque\":\"keep\"}},\"other\":{\"opaque\":\"keep\"}}}"
-cluster_json genesis-contract 3 ',"genesisIntent":"Create"' > "$logs/genesis-contract.json"
+cluster_json genesis-contract 3 ',"genesisIntent":"Create","applicationProtocol":"rhiza-managed-request-append-only/v1"' > "$logs/genesis-contract.json"
 ok genesis-contract-create create --validate=strict -f "$logs/genesis-contract.json"
 for name in status-contract queue-contract finalizer-contract lifecycle-cancel lifecycle-prepare cancel-complete cancel-retained cancel-waiting; do
   uid=$(k get rhizacluster "$name" -n "$namespace" -o jsonpath='{.metadata.uid}')
@@ -357,51 +362,7 @@ export RHIZA_CONTRACT_LOG_DIR="$logs"
 export RHIZA_CONTRACT_COMPLETE_UID="$complete_uid" RHIZA_CONTRACT_RETAINED_UID="$retained_uid" RHIZA_CONTRACT_WAITING_UID="$waiting_uid"
 export RHIZA_CONTRACT_GENESIS_UID="$genesis_uid" RHIZA_CONTRACT_KUBECONFIG="$kubeconfig" RHIZA_CONTRACT_CONTEXT="$context"
 export RHIZA_CONTRACT_AUTHORITY_UID="$authority_uid"
-go test ./pkg/operator -run '^TestV1Alpha2(Status|Authority|Lifecycle|Cancellation|Genesis|Initializer|Repair|MixedBudget)APIServerContract$|^TestRepairIntegerBoundAPIServerContract$' -count=1 -timeout=60s
-# Compile the actual released decoder implementation, not a simulated old parser.
-# No registry publication or cluster workload is required for these API readers.
-old_source=$(mktemp -d "$RUNNER_TEMP/ha-old-source.XXXXXXXX")
-git archive 04a6006e9c29cf9a652397f209896e79984ce344 | tar -xf - -C "$old_source"
-cat > "$old_source/pkg/operator/mixed_old_binary_contract_test.go" <<'EOF'
-package operator
-
-import (
-  "context"
-  "encoding/json"
-  "net/http"
-  "os"
-  "path/filepath"
-  "strings"
-  "testing"
-)
-
-func TestMixedOldBinaryRejectsProtocol(t *testing.T) {
-  for _, count := range []string{"3", "64"} {
-    raw, err := os.ReadFile(filepath.Join(os.Getenv("RHIZA_CONTRACT_LOG_DIR"), "mixed-old-binary-"+count+".json"))
-    if err != nil { t.Fatal(err) }
-    if _, err := DecodeV1Alpha2Cluster(raw); err == nil || !strings.Contains(err.Error(), "unknown field") || !strings.Contains(err.Error(), "applicationProtocol") { t.Fatalf("old controller did not specifically reject spec marker: %v",err) }
-    var object map[string]json.RawMessage
-    if err := json.Unmarshal(raw, &object); err != nil { t.Fatal(err) }
-    meta, err := jsonObject(object["metadata"])
-    if err != nil { t.Fatal(err) }
-    var ref V1Alpha2ClusterRef
-    _ = json.Unmarshal(meta["name"], &ref.Name)
-    _ = json.Unmarshal(meta["namespace"], &ref.Namespace)
-    _ = json.Unmarshal(meta["uid"], &ref.UID)
-    // Remove only the spec marker: the old Host init reader must independently
-    // reject the required marker in its strict initialization-plan decoder.
-    spec, err := jsonObject(object["spec"])
-    if err != nil { t.Fatal(err) }
-    delete(spec, "applicationProtocol")
-    object["spec"], _ = json.Marshal(spec)
-    oldHostObject, _ := json.Marshal(object)
-    store := phase2Store(t, func(*http.Request) (*http.Response, error) { return phase2Response(http.StatusOK, string(oldHostObject)), nil })
-    store.Kube.Namespace = ref.Namespace
-    if _, err := LoadV1Alpha2ApplicationInit(context.Background(), store, ref); err == nil || !strings.Contains(err.Error(), "invalid application initialization assignment") { t.Fatalf("old Host init reader did not reject strict plan: %v",err) }
-  }
-}
-EOF
-(cd "$old_source" && go test ./pkg/operator -run '^TestMixedOldBinaryRejectsProtocol$' -count=1 -timeout=60s) > "$logs/old-binary-contract.txt" 2>&1 || { cat "$logs/old-binary-contract.txt" >&2; exit 1; }
+go test ./pkg/operator -run '^TestV1Alpha2(Status|Authority|Lifecycle|Cancellation|Genesis|Initializer|Repair)APIServerContract$|^TestRepairIntegerBoundAPIServerContract$|^TestAuthorityV1Alpha2HistoricalUnknownRemainsReadOnly$|^TestApplicationInitHistoricalUnusedCannotActivateRetiredProfile$|^TestGenesisRetiredProfilesRejectBeforeKubernetes$' -count=1 -timeout=60s
 reject genesis-receipt-remove 'genesis receipt cannot be removed or changed and requires authority' patch rhizacluster genesis-contract -n "$namespace" --subresource=status --type=merge -p '{"status":{"genesis":null}}'
 reject genesis-receipt-change 'genesis receipt cannot be removed or changed and requires authority' patch rhizacluster genesis-contract -n "$namespace" --subresource=status --type=merge -p '{"status":{"genesis":{"logicalID":"different"}}}'
 reject genesis-status-wipe 'genesis receipt cannot be removed or changed and requires authority' patch rhizacluster genesis-contract -n "$namespace" --subresource=status --type=merge -p '{"status":null}'

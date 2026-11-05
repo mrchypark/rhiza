@@ -34,8 +34,8 @@ def render(path, **values):
 RUN = dict(NAMESPACE=NS, RUN_ID="abc12345", CLUSTER_ID="abc12345-cluster",
            GCS_BUCKET="bucket", GCS_PREFIX="rhiza/abc12345/",
            POD_GSA="data@example.iam.gserviceaccount.com",
-           OPERATOR_IMAGE="ghcr.io/mrchypark/rhiza-operator@sha256:aa",
-           HOST_IMAGE="ghcr.io/mrchypark/rhiza-application@sha256:bb")
+           UNSUPPORTED_LEGACY_OPERATOR_IMAGE="example.invalid/unsupported-legacy-operator@sha256:aa",
+           UNSUPPORTED_LEGACY_HOST_IMAGE="example.invalid/unsupported-legacy-host@sha256:bb")
 
 
 class RunManifestTest(unittest.TestCase):
@@ -90,7 +90,7 @@ class RunManifestTest(unittest.TestCase):
             self.assertNotIn("volumes", pod["spec"])
             self.assertEqual(pod["spec"]["restartPolicy"], "Never")
             self.assertEqual(pod["spec"]["containers"][0]["name"], container)
-            self.assertEqual(pod["spec"]["containers"][0]["image"], RUN["HOST_IMAGE"])
+            self.assertEqual(pod["spec"]["containers"][0]["image"], RUN["UNSUPPORTED_LEGACY_HOST_IMAGE"])
             self.assertEqual(pod["spec"]["containers"][0]["command"], ["sh", "-c", "sleep 1500"])
 
         def derived(pod, container):
@@ -527,44 +527,7 @@ class InspectorIsolationTest(unittest.TestCase):
                     harness.parse_https_443(bad)
 
 
-class LauncherDigestTest(unittest.TestCase):
-    """The launcher must reject anything that is not name@sha256:<64 hex>."""
-
-    BASE = dict(RHIZA_RUN_ID="abc12345", RHIZA_NAMESPACE="ns", RHIZA_KUBE_CONTEXT="ctx",
-                RHIZA_GCS_BUCKET="b", RHIZA_GCS_PREFIX="p/", RHIZA_CLUSTER_ID="cid",
-                RHIZA_GCP_PROJECT_ID="project", RHIZA_DATA_GSA_ID="data-gsa",
-                RHIZA_OPERATOR_IMAGE="ghcr.io/mrchypark/rhiza-operator@sha256:" + "f" * 64)
-
-    def run_launcher(self, app_image):
-        env = dict(os.environ, **self.BASE)
-        env["RHIZA_APP_IMAGE"] = app_image
-        return subprocess.run(["sh", str(HERE / "run-votercount-gcs-chaos.sh")],
-                              env=env, capture_output=True, text=True, timeout=60)
-
-    def test_malformed_digests_are_rejected(self):
-        for bad in ("repo@sha256:", "repo@sha256:not-a-digest", "repo@sha256:zz",
-                    "repo:v0.19.5", "repo@sha256:" + "a" * 63):
-            with self.subTest(bad=bad):
-                result = self.run_launcher(bad)
-                self.assertEqual(result.returncode, 2, result.stderr[-200:])
-
-    def test_non_hex_digest_is_rejected(self):
-        result = self.run_launcher("repo@sha256:" + "g" * 64)
-        self.assertEqual(result.returncode, 2, result.stderr[-200:])
-
-    def test_launcher_has_strict_shell_syntax(self):
-        result = subprocess.run(["sh", "-n", str(HERE / "run-votercount-gcs-chaos.sh")],
-                                capture_output=True, text=True, timeout=30)
-        self.assertEqual(result.returncode, 0, result.stderr)
-
-    def test_runtime_phase_requires_the_privileged_install_credential(self):
-        output = tempfile.mkdtemp()
-        env = dict(os.environ, **self.BASE, RHIZA_OUT=output,
-                   RHIZA_APP_IMAGE="repo@sha256:" + "a" * 64)
-        result = subprocess.run(["sh", str(HERE / "run-votercount-gcs-chaos.sh"), "run"],
-                                env=env, capture_output=True, text=True, timeout=30)
-        self.assertEqual(result.returncode, 2)
-        self.assertIn("missing privileged-install credential", result.stderr)
+# Launcher execution contracts moved to normal_artifact_contract_test.go.
 
 
 if __name__ == "__main__":

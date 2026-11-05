@@ -51,7 +51,7 @@ func TestV1Alpha2InitializerAPIServerContract(t *testing.T) {
 			t.Errorf("cleanup owned host ServiceAccount: %v %s", err, out)
 		}
 	})
-	cluster := fmt.Sprintf(`{"apiVersion":"rhiza.mrchypark.dev/v1alpha2","kind":"RhizaCluster","metadata":{"name":"initializer-contract","namespace":%q},"spec":{"logicalID":"initializer","genesisIntent":"Create","voterCount":3,"workload":{"podTemplate":{"spec":{"containers":[{"name":"app","image":"example.invalid/app"}]}}}}}`, ns)
+	cluster := fmt.Sprintf(`{"apiVersion":"rhiza.mrchypark.dev/v1alpha2","kind":"RhizaCluster","metadata":{"name":"initializer-contract","namespace":%q},"spec":{"logicalID":"initializer","genesisIntent":"Create","applicationProtocol":"rhiza-managed-request-append-only/v1","voterCount":3,"workload":{"podTemplate":{"spec":{"containers":[{"name":"app","image":"example.invalid/app"}]}}}}}`, ns)
 	var created struct {
 		Metadata struct {
 			UID string `json:"uid"`

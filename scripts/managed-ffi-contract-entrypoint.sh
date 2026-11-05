@@ -3,6 +3,9 @@
 set -eu
 umask 077
 diag_dir=/var/lib/rhiza/contract-diagnostics
+valid_fixture_profile() {
+  case "$1" in internal|graph) return 0 ;; *) return 1 ;; esac
+}
 emit_first_contract() {
   if [ -f "$diag_dir/first.log" ]; then
     printf '%s\n' 'FIRST_CONTRACT_DIAGNOSTIC_BEGIN' >&2
@@ -271,6 +274,10 @@ run_contract() {
   if [ "$code" != 0 ]; then emit_first_contract; return "$code"; fi
 }
 if [ "${1-}" = --diagnostic-self-test ]; then
+  for profile in internal graph; do valid_fixture_profile "$profile"; done
+  for profile in "" sql mixed legacy 7 8 rhiza-managed-sql-kv/v1 rhiza-managed-request/v1 rhiza-managed-request-graph/v1; do
+    if valid_fixture_profile "$profile"; then echo 'FAIL: retired fixture profile accepted' >&2; exit 1; fi
+  done
   diag_test_dir=$(mktemp -d)
   trap 'rm -f "$diag_test_dir/first.log" "$diag_test_dir/active.log" "$diag_test_dir/go-initial.exit" "$diag_test_dir/rust-initial.exit" "$diag_test_dir/rust-restart.exit" "$diag_test_dir/graph-profile-restart.exit" "$diag_test_dir/graph-qualification-restart.exit"; rmdir "$diag_test_dir"' EXIT HUP INT TERM
   diag_dir=$diag_test_dir
@@ -445,70 +452,45 @@ if [ "${1-}" = serve-managed-sql ]; then
   marker_output=$(RHIZA_RUST_CONTRACT_MARKER=1 /usr/local/libexec/rhiza-managed-ffi-contract \
     -test.run='^TestRustContractRunStartedMarker$' -test.count=1 -test.v -test.timeout=10s)
   fixture_profile=$(printf '%s\n' "$marker_output" | sed -n 's/^RHIZA_RUST_FIXTURE_PROFILE=//p')
-  case "$fixture_profile" in sql|mixed|internal|graph) ;; *) echo 'FAIL: explicit fixture profile unavailable' >&2; exit 1 ;; esac
-  if [ "$fixture_profile" = mixed ] || [ "$fixture_profile" = internal ] || [ "$fixture_profile" = graph ]; then
-    mixed_mode=$(printf '%s\n' "$marker_output" | sed -n 's/^RHIZA_RUST_CONTRACT_MODE=//p')
-    producer_uid=$(printf '%s\n' "$marker_output" | sed -n 's/^RHIZA_RUST_CONTRACT_PRODUCER_UID=//p')
-    printf '%s\n' "$producer_uid" | grep -Eq '^[0-9a-fA-F-]{16,64}$' || { echo 'FAIL: invalid mixed producer UID' >&2; exit 1; }
-    export RHIZA_RUST_PRODUCER_UID="$producer_uid"
-    case "$mixed_mode" in
-      skip) ;;
-      initial|verify)
-        if [ -d "$diag_dir" ]; then
-          [ "$mixed_mode" = verify ] || { emit_first_contract; exit 125; }
-          go_stage=go-restart rust_stage=rust-restart
-        else
-          mkdir -m 700 "$diag_dir"
-          (set -C; : > "$diag_dir/first.log")
-          sync
-          go_stage=go-initial rust_stage=rust-initial
-        fi
-        if [ -e /var/lib/rhiza/repair.json ]; then
-          [ "$mixed_mode" = verify ] || { echo 'FAIL: replacement cannot run initial mixed writes' >&2; exit 1; }
-          lifecycle=Mixed
-          [ "$fixture_profile" != graph ] || lifecycle=Graph
-          RHIZA_FFI_IN_CLUSTER_CONTRACT=1 run_contract "$go_stage" /usr/local/libexec/rhiza-managed-ffi-contract \
-            -test.run="^TestManagedFFIInCluster${lifecycle}Lifecycle$" -test.count=1 -test.v -test.timeout=120s
-        fi
-        run_contract "$rust_stage" /usr/local/libexec/rhiza-rust-managed-contract "--mixed-$mixed_mode"
-        if [ "$fixture_profile" = graph ]; then
-          run_contract "graph-${rust_stage#rust-}" /usr/local/libexec/rhiza-rust-managed-contract "--graph-$mixed_mode"
-          run_contract "graph-profile-${rust_stage#rust-}" /usr/local/libexec/rhiza-managed-materializer-contract \
-            -test.run='^TestManagedGraphMaterializationMarker$' -test.count=1 -test.v -test.timeout=10s
-          RHIZA_FFI_GRAPH_QUALIFICATION=1 run_contract "graph-qualification-${rust_stage#rust-}" /usr/local/libexec/rhiza-managed-ffi-contract \
-            -test.run='^TestManagedFFIInClusterGraphQualification$' -test.count=1 -test.v -test.timeout=120s
-        fi
-        if [ "$fixture_profile" = internal ]; then
-          RHIZA_INTERNAL_MATERIALIZATION_MARKER=1 run_contract "internal-profile-${rust_stage#rust-}" /usr/local/libexec/rhiza-managed-ffi-contract \
-            -test.run='^TestManagedInternalMaterializationMarker$' -test.count=1 -test.v -test.timeout=10s
-        fi
-        ;;
-      *) echo 'FAIL: mixed contract phase unavailable' >&2; exit 1 ;;
-    esac
-  elif [ -e /var/lib/rhiza/repair.json ]; then
-  case "$marker_output" in
-    *RHIZA_RUST_CONTRACT_MODE=initial*) rust_initial=1 ;;
-    *RHIZA_RUST_CONTRACT_MODE=restart*) rust_initial=0 ;;
-    *) echo 'FAIL: Rust run-start marker result missing' >&2; exit 1 ;;
+  valid_fixture_profile "$fixture_profile" || { echo 'FAIL: explicit append-only fixture profile unavailable' >&2; exit 1; }
+  mixed_mode=$(printf '%s\n' "$marker_output" | sed -n 's/^RHIZA_RUST_CONTRACT_MODE=//p')
+  producer_uid=$(printf '%s\n' "$marker_output" | sed -n 's/^RHIZA_RUST_CONTRACT_PRODUCER_UID=//p')
+  printf '%s\n' "$producer_uid" | grep -Eq '^[0-9a-fA-F-]{16,64}$' || { echo 'FAIL: invalid mixed producer UID' >&2; exit 1; }
+  export RHIZA_RUST_PRODUCER_UID="$producer_uid"
+  case "$mixed_mode" in
+    skip) ;;
+    initial|verify)
+      if [ -d "$diag_dir" ]; then
+        [ "$mixed_mode" = verify ] || { emit_first_contract; exit 125; }
+        go_stage=go-restart rust_stage=rust-restart
+      else
+        mkdir -m 700 "$diag_dir"
+        (set -C; : > "$diag_dir/first.log")
+        sync
+        go_stage=go-initial rust_stage=rust-initial
+      fi
+      if [ -e /var/lib/rhiza/repair.json ]; then
+        [ "$mixed_mode" = verify ] || { echo 'FAIL: replacement cannot run initial mixed writes' >&2; exit 1; }
+        lifecycle=Mixed
+        [ "$fixture_profile" != graph ] || lifecycle=Graph
+        RHIZA_FFI_IN_CLUSTER_CONTRACT=1 run_contract "$go_stage" /usr/local/libexec/rhiza-managed-ffi-contract \
+          -test.run="^TestManagedFFIInCluster${lifecycle}Lifecycle$" -test.count=1 -test.v -test.timeout=120s
+      fi
+      run_contract "$rust_stage" /usr/local/libexec/rhiza-rust-managed-contract "--mixed-$mixed_mode"
+      if [ "$fixture_profile" = graph ]; then
+        run_contract "graph-${rust_stage#rust-}" /usr/local/libexec/rhiza-rust-managed-contract "--graph-$mixed_mode"
+        run_contract "graph-profile-${rust_stage#rust-}" /usr/local/libexec/rhiza-managed-materializer-contract \
+          -test.run='^TestManagedGraphMaterializationMarker$' -test.count=1 -test.v -test.timeout=10s
+        RHIZA_FFI_GRAPH_QUALIFICATION=1 run_contract "graph-qualification-${rust_stage#rust-}" /usr/local/libexec/rhiza-managed-ffi-contract \
+          -test.run='^TestManagedFFIInClusterGraphQualification$' -test.count=1 -test.v -test.timeout=120s
+      fi
+      if [ "$fixture_profile" = internal ]; then
+        RHIZA_INTERNAL_MATERIALIZATION_MARKER=1 run_contract "internal-profile-${rust_stage#rust-}" /usr/local/libexec/rhiza-managed-ffi-contract \
+          -test.run='^TestManagedInternalMaterializationMarker$' -test.count=1 -test.v -test.timeout=10s
+      fi
+      ;;
+    *) echo 'FAIL: mixed contract phase unavailable' >&2; exit 1 ;;
   esac
-  if [ "$rust_initial" = 1 ]; then
-    mkdir -m 700 "$diag_dir"
-    (set -C; : > "$diag_dir/first.log")
-    sync
-  elif [ ! -d "$diag_dir" ]; then
-    # Older runs may lack diagnostics; this is not initial-run permission.
-    mkdir -m 700 "$diag_dir"
-  fi
-  if [ "$rust_initial" = 0 ]; then
-    # A prior start with a lost ACK never authorizes another initial mutation.
-    run_contract rust-restart /usr/local/libexec/rhiza-rust-managed-contract
-  fi
-  RHIZA_FFI_IN_CLUSTER_CONTRACT=1 run_contract "go-$([ "$rust_initial" = 1 ] && printf initial || printf restart)" /usr/local/libexec/rhiza-managed-ffi-contract \
-    -test.run='^TestManagedFFIInClusterSQLLifecycle$' -test.count=1 -test.v -test.timeout=120s
-  if [ "$rust_initial" = 1 ]; then
-    run_contract rust-initial /usr/local/libexec/rhiza-rust-managed-contract --initial-run
-  fi
-  fi
 fi
 # The contract closes its real FFI Host before normal same-Pod adopted startup.
 exec /usr/local/libexec/rhiza-ha-init "$@"

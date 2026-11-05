@@ -5,8 +5,6 @@ package managedsql
 import (
 	"context"
 	"fmt"
-	"io"
-	"net/http"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -18,22 +16,12 @@ import (
 
 type certifiedRecoveryControlKey struct{}
 
-// Status reads from the real peer-learning path fail while explicit recovery
-// still uses the real live authority API. No SQL or consensus result is mocked.
+// Hold actual Learned delivery before certificate acceptance and the actual
+// periodic certificate pull. No Kubernetes dependency, SQL, or result is mocked.
 func heldCertifiedRecoveryHosts(t *testing.T) ([]Config, []*Host, *sqlStatusFixture, *atomic.Bool, <-chan struct{}, <-chan struct{}, func()) {
 	t.Helper()
 	held := &atomic.Bool{}
-	configs, hosts, fixture := concurrentSQLHosts(t, func(i int, base http.RoundTripper) http.RoundTripper {
-		if i != 1 {
-			return base
-		}
-		return repairGateTransport(func(r *http.Request) (*http.Response, error) {
-			if held.Load() && r.Method == http.MethodGet && r.Context().Value(certifiedRecoveryControlKey{}) != true {
-				return &http.Response{StatusCode: http.StatusServiceUnavailable, Header: http.Header{"Content-Type": {"application/json"}}, Body: io.NopCloser(strings.NewReader(`{"error":"held peer authority read"}`)), Request: r}, nil
-			}
-			return base.RoundTrip(r)
-		})
-	})
+	configs, hosts, fixture := concurrentSQLHosts(t, nil)
 	pushSeen, pullSeen, releasePull := make(chan struct{}), make(chan struct{}), make(chan struct{})
 	var pushOnce, pullOnce, releaseOnce sync.Once
 	target := configs[1].Runtime.NodeID
@@ -41,10 +29,11 @@ func heldCertifiedRecoveryHosts(t *testing.T) ([]Config, []*Host, *sqlStatusFixt
 		if !held.Load() {
 			return
 		}
-		if strings.HasPrefix(event, fmt.Sprintf("network:learned:phase=handler-result:node=%s:", target)) && strings.Contains(event, ":slot=1:") && !strings.HasSuffix(event, `error=""`) {
+		if strings.HasPrefix(event, fmt.Sprintf("network:learned:phase=received:node=%s:", target)) {
 			pushOnce.Do(func() { close(pushSeen) })
+			<-releasePull
 		}
-		if strings.HasPrefix(event, fmt.Sprintf("node:catchup-peer:phase=before-accept:node=%s:", target)) && strings.Contains(event, ":from=1:") {
+		if strings.HasPrefix(event, fmt.Sprintf("node:catchup-peer:phase=before-accept:node=%s:", target)) {
 			pullOnce.Do(func() { close(pullSeen) })
 			<-releasePull
 		}

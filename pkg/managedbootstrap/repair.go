@@ -72,7 +72,7 @@ func CheckRepairGate(ctx context.Context, kube *operator.Kubernetes, ref operato
 		return empty, output, err
 	}
 	next, exists := live.Repair()
-	if !exists || live.Authority() != a.Authority() || !reflect.DeepEqual(next.Plan, r.Plan) || !reflect.DeepEqual(next.PreparedHandoff, r.PreparedHandoff) || next.State != r.State || (len(bytes.TrimSpace(live.Transition())) != 0 && !bytes.Equal(bytes.TrimSpace(live.Transition()), []byte("null"))) {
+	if !exists || live.Authority() != a.Authority() || !reflect.DeepEqual(next.Plan, r.Plan) || !reflect.DeepEqual(next.PreparedHandoff, r.PreparedHandoff) || next.State != r.State || next.Completion != nil || (next.AddCompletion != nil && next.Plan.Sequence != operator.V1Alpha2RepairAddThenRemove) || (len(bytes.TrimSpace(live.Transition())) != 0 && !bytes.Equal(bytes.TrimSpace(live.Transition()), []byte("null"))) {
 		return empty, output, errors.New("repair changed during gate verification")
 	}
 	binding, err := operator.ValidateV1Alpha2RepairPodBinding(ctx, store, ref, p)
@@ -248,6 +248,9 @@ func ReadGateFile(path string, dst any, limit int64, private bool) error {
 func ManagedRepairConfig(ctx context.Context, kube *operator.Kubernetes, ref operator.V1Alpha2ClusterRef, podName, podUID, identity, bootstrapPath, repairPath string, profile operator.V1Alpha2RuntimeProfile) (managedsql.Config, func() error, error) {
 	var empty managedsql.Config
 	noop := func() error { return nil }
+	if err := operator.ValidateV1Alpha2ApplicationProfile(profile.ApplicationProtocol, profile.EvidenceFormat); err != nil {
+		return empty, noop, err
+	}
 	if filepath.Clean(repairPath) == filepath.Clean(bootstrapPath) || filepath.Clean(repairPath) == filepath.Clean(identity) {
 		return empty, noop, errors.New("distinct repair handoff required")
 	}
@@ -266,9 +269,6 @@ func ManagedRepairConfig(ctx context.Context, kube *operator.Kubernetes, ref ope
 	cfg, err := ManagedRuntimeConfig(ctx, kube, ref, podUID, identity, profile, plan)
 	if err != nil {
 		return empty, noop, err
-	}
-	if (cfg.Plan.ApplicationProtocol == sqlpolicy.ManagedRequestApplicationProtocol || cfg.Plan.ApplicationProtocol == sqlpolicy.ManagedGraphRequestApplicationProtocol) && (cfg.Plan.Generation != 0 || cfg.Plan.EvidenceFormat != cfg.Plan.ApplicationProtocol) {
-		return empty, noop, errors.New("unsupported managed request repair profile or generation")
 	}
 	cfg.RepairOrigin, err = os.ReadFile(repairPath)
 	if err != nil {
@@ -311,7 +311,7 @@ func ManagedRepairConfig(ctx context.Context, kube *operator.Kubernetes, ref ope
 	}
 	// Only the current closed handoff can create a first adopted learner.
 	_, current, err := CheckRepairGate(ctx, kube, ref, 0, podName, podUID, identity, false)
-	if err != nil || !reflect.DeepEqual(current, saved) {
+	if err != nil || !repairGateCompatible(saved, current) {
 		return empty, noop, errors.New("historical repair requires existing adoption and WAL")
 	}
 	c := cfg.Runtime
@@ -370,6 +370,16 @@ func ManagedRepairConfig(ctx context.Context, kube *operator.Kubernetes, ref ope
 	return cfg, closeBucket, nil
 }
 
+func repairGateCompatible(saved, live RepairGateFile) bool {
+	if saved.Version != live.Version || saved.Repair.State != "Closed" || live.Repair.State != "Closed" || saved.Repair.Completion != nil || live.Repair.Completion != nil || !reflect.DeepEqual(saved.Repair.Plan, live.Repair.Plan) || !reflect.DeepEqual(saved.Repair.PreparedHandoff, live.Repair.PreparedHandoff) || saved.Binding != live.Binding {
+		return false
+	}
+	if saved.Repair.AddCompletion != nil {
+		return reflect.DeepEqual(saved.Repair.AddCompletion, live.Repair.AddCompletion)
+	}
+	return live.Repair.AddCompletion == nil || live.Repair.Plan.Sequence == operator.V1Alpha2RepairAddThenRemove
+}
+
 // Reuse the actual consensus replay and checkpoint verifier to bind the fixed
 // source to its REMOVE terminal/target, rather than parsing control wire data.
 func VerifyRepairControl(ctx context.Context, bucket thanosobjstore.Bucket, bootstrap quepaxa.Cluster, view *recovery.ReadOnlyView, capture operator.V1Alpha2RepairHandoff) (resultErr error) {
@@ -417,6 +427,13 @@ func VerifyRepairControl(ctx context.Context, bucket thanosobjstore.Bucket, boot
 		if uint64(transition.Terminal.Slot) == capture.RemoveTerminalSlot && fmt.Sprintf("%x", transition.Terminal.Hash) == capture.RemoveTerminalHash {
 			found = true
 		}
+	}
+	if capture.PreparedConfig != nil {
+		prefixHash := view.PrefixHash()
+		if !reflect.DeepEqual(core.CurrentCluster(), *capture.PreparedConfig) || uint64(view.Tip()) != capture.PreparedSlot || fmt.Sprintf("%x", prefixHash) != capture.PreparedHash || fmt.Sprintf("%x", view.HeadHash()) != capture.HeadHash {
+			return errors.New("fixed source does not prove captured ADD-first configuration and prefix")
+		}
+		return nil
 	}
 	if !found || !reflect.DeepEqual(core.CurrentCluster(), capture.Survivors) || fmt.Sprintf("%x", view.HeadHash()) != capture.HeadHash {
 		return errors.New("fixed source does not prove captured REMOVE target")

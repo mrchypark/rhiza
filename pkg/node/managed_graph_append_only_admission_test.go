@@ -51,7 +51,7 @@ func TestManagedGraphAppendOnlyAdmissionJoinsActivePublisherBarrier(t *testing.T
 	fixture.node.managedGraphControlMu.Lock()
 	owned := fixture.node.managedGraphControl
 	fixture.node.managedGraphControlMu.Unlock()
-	if owned == nil || owned.observation != nil || owned.binding != fixture.node.internalApplication.Load() {
+	if owned == nil || owned.binding != fixture.node.internalApplication.Load() {
 		t.Fatal("publisher operation did not retain its exact local binding")
 	}
 	admission := make(chan error, 1)
@@ -100,7 +100,7 @@ func TestManagedGraphAppendOnlyAdmissionCancellationAfterOwnedBarrierStarts(t *t
 	fixture.node.managedGraphControlMu.Lock()
 	owned := fixture.node.managedGraphControl
 	fixture.node.managedGraphControlMu.Unlock()
-	if owned == nil || owned.observation == nil || progress.RecorderTip != 10 || progress.RecorderHash != owned.hash {
+	if owned == nil || progress.RecorderTip != 10 || progress.RecorderHash != owned.hash {
 		t.Fatalf("owned barrier was not the actual pending value before cancel: progress=%+v operation=%+v", progress, owned)
 	}
 	cancelOwner()
@@ -119,18 +119,6 @@ func TestManagedGraphAppendOnlyAdmissionCancellationAfterOwnedBarrierStarts(t *t
 		}
 	case <-ctx.Done():
 		t.Fatal("owned barrier worker outlived its caller cancellation")
-	}
-	if err := fixture.node.admitInternalApplication(ctx); err == nil || !strings.Contains(err.Error(), "target=10 recorded=10 certified=8") {
-		t.Fatalf("fresh caller retried or accepted the still-unresolved canceled control: %v", err)
-	}
-	fixture.node.managedGraphControlMu.Lock()
-	if fixture.node.managedGraphControl != nil {
-		fixture.node.managedGraphControlMu.Unlock()
-		t.Fatal("settled failed operation was not reaped for the fresh caller")
-	}
-	fixture.node.managedGraphControlMu.Unlock()
-	if fixture.node.core.RecorderTip() != 10 {
-		t.Fatalf("fresh unresolved-state caller created another intent: recorder=%d", fixture.node.core.RecorderTip())
 	}
 	fixture.transport.releaseAll()
 	if err := awaitProposal(t, remoteOwner); err != nil {
@@ -174,7 +162,7 @@ func TestManagedGraphAppendOnlyAdmissionCancellationAfterOwnedBarrierStarts(t *t
 	}
 }
 
-func TestManagedGraphAppendOnlyAdmissionStillRefusesPendingApplication(t *testing.T) {
+func TestManagedGraphAppendOnlyAdmissionCompletesPendingApplication(t *testing.T) {
 	fixture := newManagedGraphAppendOnlyAdmissionFixture(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
@@ -198,23 +186,31 @@ func TestManagedGraphAppendOnlyAdmissionStillRefusesPendingApplication(t *testin
 	if progress.RecorderTip != 9 || progress.CertifiedTip != 8 || progress.RecorderHash != quepaxa.ValueHash(sha256.Sum256(value)) {
 		t.Fatalf("pending application value was not the actual recorded unknown: %+v", progress)
 	}
-	err = fixture.node.admitInternalApplication(ctx)
-	if err == nil || !strings.Contains(err.Error(), "target=9 recorded=9 certified=8 applied=8") {
-		t.Fatalf("pending application was not refused under strict admission: %v", err)
-	}
-	fixture.node.managedGraphControlMu.Lock()
-	operation := fixture.node.managedGraphControl
-	fixture.node.managedGraphControlMu.Unlock()
-	if operation != nil {
-		t.Fatal("admission created a barrier owner over application UNKNOWN")
+	admission := make(chan error, 1)
+	go func() { admission <- fixture.node.admitInternalApplication(ctx) }()
+	select {
+	case err := <-admission:
+		t.Fatalf("pending original was acknowledged before quorum release: %v", err)
+	case <-time.After(100 * time.Millisecond):
 	}
 	fixture.transport.releaseAll()
 	if err := awaitProposal(t, proposal); err != nil {
 		t.Fatalf("actual application proposal did not complete after release: %v", err)
 	}
 	decision, ok := fixture.node.core.CertifiedValue(9)
-	if !ok || !bytes.Equal(decision.Value, value) || fixture.node.core.RecorderTip() != 9 {
+	if !ok || !bytes.Equal(decision.Value, value) || len(decision.Certificate) == 0 {
 		t.Fatalf("admission changed or resubmitted the existing application: decision=%+v ok=%t recorder=%d", decision, ok, fixture.node.core.RecorderTip())
+	}
+	select {
+	case err := <-admission:
+		if err != nil {
+			t.Fatalf("admission did not finish original-slot application: %v", err)
+		}
+	case <-ctx.Done():
+		t.Fatal("admission did not complete after actual recorder release")
+	}
+	if fixture.node.core.Tip() <= 9 || fixture.node.material.Tip() < uint64(fixture.node.core.Tip()) {
+		t.Fatal("admission lacks own barrier certificate and contiguous replay")
 	}
 }
 

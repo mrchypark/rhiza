@@ -32,7 +32,7 @@ func TestManagedBootstrapProfileLegacyBytesAndMixedBinding(t *testing.T) {
 	for _, tc := range []struct {
 		protocol string
 		policy   sqlpolicy.MaterializationPolicy
-	}{{"", sqlpolicy.LegacyMaterializationPolicy}, {ManagedApplicationProtocolSQLKV, sqlpolicy.ManagedSQLKVMaterializationPolicy}, {sqlpolicy.ManagedRequestAppendOnlyApplicationProtocol, sqlpolicy.ManagedRequestMaterializationPolicy}, {sqlpolicy.ManagedGraphRequestAppendOnlyApplicationProtocol, sqlpolicy.ManagedGraphRequestMaterializationPolicy}} {
+	}{{sqlpolicy.ManagedRequestAppendOnlyApplicationProtocol, sqlpolicy.ManagedRequestMaterializationPolicy}, {sqlpolicy.ManagedGraphRequestAppendOnlyApplicationProtocol, sqlpolicy.ManagedGraphRequestMaterializationPolicy}} {
 		policy, window, err := ManagedApplicationPolicy(tc.protocol)
 		if err != nil || policy != tc.policy || window != 65536 {
 			t.Fatalf("profile: %v %d %v", policy, window, err)
@@ -55,6 +55,11 @@ func TestManagedBootstrapProfileLegacyBytesAndMixedBinding(t *testing.T) {
 		}
 		if _, err := ManagedBootstrapPlanDigestForProtocol("cluster", nil, "source", retired, "", false, retired); err == nil {
 			t.Fatalf("retired protocol %q was accepted for plan binding", retired)
+		}
+	}
+	for _, retired := range []string{"", ManagedApplicationProtocolSQLKV} {
+		if _, _, err := ManagedApplicationPolicy(retired); err == nil {
+			t.Fatalf("retired managed startup profile %q remains selectable", retired)
 		}
 	}
 	if _, _, err := ManagedApplicationPolicy("unknown"); err == nil {

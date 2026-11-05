@@ -11,10 +11,11 @@ import (
 )
 
 func phase9ClusterWithProtocol(protocol string) string {
+	const marker = `,"applicationProtocol":"rhiza-managed-request-append-only/v1"`
 	if protocol == "" {
-		return phase8Cluster
+		return strings.Replace(phase8Cluster, marker, "", 1)
 	}
-	return strings.Replace(phase8Cluster, "\"genesisIntent\":\"Create\"", "\"genesisIntent\":\"Create\",\"applicationProtocol\":\""+protocol+"\"", 1)
+	return strings.Replace(phase8Cluster, marker, `,"applicationProtocol":"`+protocol+`"`, 1)
 }
 
 func TestManagedProfileCRDEnumRetiresExperimentalProtocols(t *testing.T) {
@@ -22,26 +23,26 @@ func TestManagedProfileCRDEnumRetiresExperimentalProtocols(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	const enum = "enum: [rhiza-managed-sql-kv/v1, rhiza-managed-request-append-only/v1, rhiza-managed-request-graph-append-only/v1]"
+	const enum = "enum: [rhiza-managed-request-append-only/v1, rhiza-managed-request-graph-append-only/v1]"
 	if strings.Count(string(raw), enum) != 2 {
-		t.Fatal("cluster and assigned-plan protocol enums must retain SQLKV and only final append-only profiles")
+		t.Fatal("cluster and assigned-plan protocol enums must advertise only final append-only execution profiles")
 	}
-	for _, retired := range []string{"rhiza-managed-request/v1", "rhiza-managed-request-graph/v1"} {
+	for _, retired := range []string{types.ManagedApplicationProtocolSQLKV, "rhiza-managed-request/v1", "rhiza-managed-request-graph/v1"} {
 		if strings.Contains(string(raw), retired) {
 			t.Fatalf("CRD still advertises retired experimental protocol %q", retired)
 		}
 	}
 }
 
-func phase9MixedRuntimeProfile() V1Alpha2RuntimeProfile {
+func phase9GraphRuntimeProfile() V1Alpha2RuntimeProfile {
 	profile := phase9RuntimeProfile()
-	profile.ApplicationProtocol = types.ManagedApplicationProtocolSQLKV
-	profile.EvidenceFormat = V1Alpha2ManagedSQLKVEvidenceFormat
+	profile.ApplicationProtocol = sqlpolicy.ManagedGraphRequestAppendOnlyApplicationProtocol
+	profile.EvidenceFormat = sqlpolicy.ManagedGraphRequestAppendOnlyApplicationProtocol
 	return profile
 }
 
 func TestManagedBootstrapKnownProfilesCreateOnce(t *testing.T) {
-	for _, profile := range []V1Alpha2RuntimeProfile{phase9RuntimeProfile(), phase9MixedRuntimeProfile()} {
+	for _, profile := range []V1Alpha2RuntimeProfile{phase9RuntimeProfile(), phase9GraphRuntimeProfile()} {
 		t.Run(profile.EvidenceFormat, func(t *testing.T) {
 			s, kube := phase9Setup(t, phase9ClusterWithProtocol(profile.ApplicationProtocol), profile)
 			first, err := ReconcileV1Alpha2ManagedInitialization(t.Context(), kube, phase2Ref, profile)
@@ -82,13 +83,13 @@ func TestManagedBootstrapProfileInstalledMismatchBeforeWrites(t *testing.T) {
 			p.ApplicationProtocol, p.EvidenceFormat = sqlpolicy.ManagedGraphRequestApplicationProtocol, sqlpolicy.ManagedGraphRequestApplicationProtocol
 		}},
 		{"unknown protocol", "unknown/v1", func(p *V1Alpha2RuntimeProfile) { p.ApplicationProtocol = "unknown/v1" }},
-		{"wrong evidence", types.ManagedApplicationProtocolSQLKV, func(p *V1Alpha2RuntimeProfile) { p.EvidenceFormat = V1Alpha2ManagedSQLEvidenceFormat }},
-		{"missing image", types.ManagedApplicationProtocolSQLKV, func(p *V1Alpha2RuntimeProfile) { p.InitImage = "" }},
-		{"local storage", types.ManagedApplicationProtocolSQLKV, func(p *V1Alpha2RuntimeProfile) { p.Storage.ObjStoreDir = "local" }},
-		{"invalid Secret", types.ManagedApplicationProtocolSQLKV, func(p *V1Alpha2RuntimeProfile) { p.ProfileSecretName = "invalid/name" }},
+		{"wrong evidence", sqlpolicy.ManagedGraphRequestAppendOnlyApplicationProtocol, func(p *V1Alpha2RuntimeProfile) { p.EvidenceFormat = V1Alpha2ManagedSQLEvidenceFormat }},
+		{"missing image", sqlpolicy.ManagedGraphRequestAppendOnlyApplicationProtocol, func(p *V1Alpha2RuntimeProfile) { p.InitImage = "" }},
+		{"local storage", sqlpolicy.ManagedGraphRequestAppendOnlyApplicationProtocol, func(p *V1Alpha2RuntimeProfile) { p.Storage.ObjStoreDir = "local" }},
+		{"invalid Secret", sqlpolicy.ManagedGraphRequestAppendOnlyApplicationProtocol, func(p *V1Alpha2RuntimeProfile) { p.ProfileSecretName = "invalid/name" }},
 	} {
 		t.Run(test.name, func(t *testing.T) {
-			profile := phase9MixedRuntimeProfile()
+			profile := phase9GraphRuntimeProfile()
 			test.edit(&profile)
 			s, kube := phase9Setup(t, phase9ClusterWithProtocol(test.live), profile)
 			if _, err := ReconcileV1Alpha2ManagedInitialization(t.Context(), kube, phase2Ref, profile); err == nil || s.posts != 0 || s.puts != 0 {
@@ -96,7 +97,7 @@ func TestManagedBootstrapProfileInstalledMismatchBeforeWrites(t *testing.T) {
 			}
 		})
 	}
-	profile := phase9MixedRuntimeProfile()
+	profile := phase9GraphRuntimeProfile()
 	s, kube := phase9Setup(t, phase9ClusterWithProtocol(profile.ApplicationProtocol), profile)
 	s.runtimeProfile.InitImage = "different:v1"
 	if _, err := ReconcileV1Alpha2ManagedInitialization(t.Context(), kube, phase2Ref, profile); err == nil || s.posts != 0 || s.puts != 0 {

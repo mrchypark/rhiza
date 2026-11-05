@@ -11,6 +11,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"net/url"
 	"sort"
 	"strconv"
@@ -1119,6 +1120,11 @@ func (t *Transport) ReadTip(ctx context.Context, to quepaxa.NodeID) (quepaxa.Slo
 	}
 	response, err := t.callQuorum(ctx, to, t.request(peerfb.OperationReadIndex))
 	if err != nil {
+		var diagnostic interface{ RPCDiagnostic() PeerRPCDiagnostic }
+		if ctx.Err() == nil && errors.As(err, &diagnostic) {
+			d := diagnostic.RPCDiagnostic()
+			log.Printf("read-index RPC failed node_hash=%x peer_hash=%x requested_config=%d error_type=%T quorum_unavailable=%t canceled=%t deadline=%t rpc_phase=%s elapsed_us=%d total_known=%t total_us=%d connection_known=%t connection_us=%d request_known=%t request_us=%d gate_wait_known=%t gate_wait_us=%d mutex_wait_known=%t mutex_wait_us=%d dial_measured=%t dial_us=%d dial_deadline_known=%t dial_remaining_us=%d", sha256.Sum256([]byte(t.localID)), sha256.Sum256([]byte(to)), t.configID, err, errors.Is(err, quepaxa.ErrQuorumUnavailable), errors.Is(err, context.Canceled), errors.Is(err, context.DeadlineExceeded), d.Phase, d.Elapsed.Microseconds(), d.TotalKnown, d.TotalElapsed.Microseconds(), d.ConnectionKnown, d.ConnectionElapsed.Microseconds(), d.RequestKnown, d.RequestElapsed.Microseconds(), d.GateWaitKnown, d.GateWait.Microseconds(), d.MutexWaitKnown, d.MutexWait.Microseconds(), d.DialMeasured, d.DialElapsed.Microseconds(), d.DialDeadlineKnown, d.DialRemaining.Microseconds())
+		}
 		return 0, err
 	}
 	if response.ClusterId != string(t.clusterID) || response.ProposerId != string(to) || response.ConfigId != uint64(t.configID) {

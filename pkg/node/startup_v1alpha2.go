@@ -96,9 +96,6 @@ func (n *Node) borrowInternalApplication(ctx context.Context) (*internalApplicat
 	if !n.internalApplicationProfile() {
 		return nil, ctx, nil, fmt.Errorf("internal application profile required")
 	}
-	if isManagedAppendOnlyProtocol(n.managedApplicationProtocol()) {
-		ctx = WithManagedControlObservationBudget(ctx)
-	}
 	b := n.internalApplication.Load()
 	if b == nil {
 		return nil, ctx, nil, fmt.Errorf("internal application binding unavailable")
@@ -333,12 +330,6 @@ func (n *Node) admitInternalApplication(ctx context.Context) error {
 			}
 			return err
 		}
-		if err := n.refuseSpentManagedControlObservationBudget(ctx); err != nil {
-			if n.materializationPolicy() == sqlpolicy.ManagedGraphRequestMaterializationPolicy {
-				logManagedGraphAdmissionStageFailure("admitted", "pre_control", err)
-			}
-			return err
-		}
 	}
 	if n.materializationPolicy() == sqlpolicy.ManagedGraphRequestMaterializationPolicy {
 		if err := n.ensureManagedGraphInitialRoot(ctx); err != nil {
@@ -354,7 +345,8 @@ func (n *Node) admitInternalApplication(ctx context.Context) error {
 		return err
 	}
 	if n.materializationPolicy() == sqlpolicy.ManagedGraphRequestMaterializationPolicy {
-		if err := n.waitManagedGraphOwnedControl(ctx, binding, target); err != nil {
+		localtesthooks.Hit("node:managed-control:post-readindex-owner-selected")
+		if err := n.waitManagedAppendOnlyControl(ctx, binding); err != nil {
 			logManagedGraphAdmissionTargetFailure("admitted", "owned_wait", target, err)
 			return err
 		}
@@ -732,7 +724,7 @@ func (n *Node) OpenManaged(ctx context.Context, cfg ManagedStartupConfig) (resul
 		if err := n.verifyManagedAdoptionAfterOpen(ctx, *cfg.verifiedAdoption); err != nil {
 			return postOpenFailure(err)
 		}
-		if cfg.Prepared != nil && n.config.Learner != nil && isManagedAppendOnlyProtocol(i.ApplicationProtocol) {
+		if n.config.Learner != nil && isManagedAppendOnlyProtocol(i.ApplicationProtocol) {
 			if err := n.replayAdoptedCertifiedSuffix(ctx, *cfg.verifiedAdoption); err != nil {
 				return postOpenFailure(err)
 			}
@@ -1018,12 +1010,6 @@ func (n *Node) AdmitManaged(ctx context.Context) error {
 	n.managedAdmitted.Store(false)
 	if binding != nil && isManagedAppendOnlyProtocol(n.managedApplicationProtocol()) {
 		if err := n.waitManagedAppendOnlyControl(ctx, binding); err != nil {
-			if n.materializationPolicy() == sqlpolicy.ManagedGraphRequestMaterializationPolicy {
-				logManagedGraphAdmissionStageFailure("initial", "pre_control", err)
-			}
-			return err
-		}
-		if err := n.refuseSpentManagedControlObservationBudget(ctx); err != nil {
 			if n.materializationPolicy() == sqlpolicy.ManagedGraphRequestMaterializationPolicy {
 				logManagedGraphAdmissionStageFailure("initial", "pre_control", err)
 			}

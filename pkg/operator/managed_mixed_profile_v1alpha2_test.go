@@ -3,17 +3,13 @@ package operator
 import (
 	"bytes"
 	"context"
-	"crypto/sha256"
 	"encoding/json"
-	"errors"
 	"fmt"
-	"net/http"
 	"os"
 	"reflect"
 	"strings"
 	"testing"
 
-	objectstore "github.com/mrchypark/rhiza/internal/objstore"
 	"github.com/mrchypark/rhiza/internal/sqlpolicy"
 	"github.com/mrchypark/rhiza/internal/types"
 	"github.com/mrchypark/rhiza/pkg/network"
@@ -22,9 +18,9 @@ import (
 )
 
 func TestManagedApplicationExplicitProfileLoaders(t *testing.T) {
-	for _, protocol := range []string{types.ManagedApplicationProtocolSQLKV, sqlpolicy.ManagedRequestAppendOnlyApplicationProtocol} {
+	for _, protocol := range []string{sqlpolicy.ManagedRequestAppendOnlyApplicationProtocol, sqlpolicy.ManagedGraphRequestAppendOnlyApplicationProtocol} {
 		t.Run(protocol, func(t *testing.T) {
-			cluster := strings.Replace(phase8Cluster, `"genesisIntent":"Create"`, `"genesisIntent":"Create","applicationProtocol":"`+protocol+`"`, 1)
+			cluster := phase9ClusterWithProtocol(protocol)
 			server, store, name := phase8Setup(t, cluster, "")
 			bootstrap := initTestBootstrap(t)
 			bootstrap.EvidenceFormat = protocol
@@ -133,27 +129,7 @@ func TestManagedMixedProfileCELReservationSelectors(t *testing.T) {
 
 func mixedAuthoritySetup(t *testing.T) (*phase8Server, *V1Alpha2StatusStore, V1Alpha2AdmissionSnapshot) {
 	t.Helper()
-	cluster := strings.Replace(phase8Cluster, `"genesisIntent":"Create"`, `"genesisIntent":"Create","applicationProtocol":"rhiza-managed-sql-kv/v1"`, 1)
-	server, store, name := phase8Setup(t, cluster, "")
-	plan, bootstrap := mixedTestBootstrapBinding(t, "deployment", "assignment", initTestBootstrap(t))
-	ctx := context.Background()
-	if _, err := InitializeV1Alpha2AuthorityWithBootstrap(ctx, store, phase2Ref, name, plan, bootstrap); err != nil {
-		t.Fatal(err)
-	}
-	server.cluster = strings.Replace(server.cluster, `"resourceVersion":"48"`, `"resourceVersion":"47"`, 1)
-	initial, err := LoadV1Alpha2ApplicationInit(ctx, store, phase2Ref)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if _, result, err := CommitV1Alpha2ApplicationInit(ctx, store, initial, plan, authorityTestEvidence); err != nil || result != V1Alpha2CASApplied {
-		t.Fatalf("consume %s %v", result, err)
-	}
-	server.cluster = strings.Replace(server.cluster, `"resourceVersion":"48"`, `"resourceVersion":"47"`, 1)
-	snapshot, err := LoadV1Alpha2Admission(ctx, store, phase2Ref)
-	if err != nil {
-		t.Fatal(err)
-	}
-	return server, store, snapshot
+	return historicalConsumedFixture(t, types.ManagedApplicationProtocolSQLKV)
 }
 
 // The explicit protocol, evidence format and bootstrap digest are one binding.
@@ -179,7 +155,7 @@ func mixedTestBootstrapBinding(t *testing.T, deploymentUID, assignmentID string,
 }
 
 func TestManagedMixedProfileRejectsLegacyBootstrapDigestBeforeWrite(t *testing.T) {
-	cluster := strings.Replace(phase8Cluster, `"genesisIntent":"Create"`, `"genesisIntent":"Create","applicationProtocol":"rhiza-managed-sql-kv/v1"`, 1)
+	cluster := phase9ClusterWithProtocol(types.ManagedApplicationProtocolSQLKV)
 	server, store, name := phase8Setup(t, cluster, "")
 	plan, bootstrap := mixedTestBootstrapBinding(t, "deployment", "assignment", initTestBootstrap(t))
 	members := make([]quepaxa.Member, len(bootstrap.Members))
@@ -191,228 +167,17 @@ func TestManagedMixedProfileRejectsLegacyBootstrapDigestBeforeWrite(t *testing.T
 		t.Fatalf("mixed and legacy bootstrap domains did not differ: %v", err)
 	}
 	plan.BootstrapPlanDigest = legacyDigest
-	if _, err := InitializeV1Alpha2AuthorityWithBootstrap(context.Background(), store, phase2Ref, name, plan, bootstrap); err == nil || !strings.Contains(err.Error(), "bootstrap digest mismatch") || server.puts != 0 {
+	if _, err := InitializeV1Alpha2AuthorityWithBootstrap(context.Background(), store, phase2Ref, name, plan, bootstrap); err == nil || !strings.Contains(err.Error(), "profiles 7/8 are retired") || server.puts != 0 {
 		t.Fatalf("legacy digest reached mixed genesis write: err=%v puts=%d", err, server.puts)
-	}
-}
-
-func TestManagedMixedProfileKVReservation(t *testing.T) {
-	for _, operation := range []string{"put", "delete", "cas"} {
-		t.Run(operation, func(t *testing.T) {
-			server, store, old := mixedAuthoritySetup(t)
-			ctx := context.Background()
-			before := server.puts
-			if _, _, err := ReserveV1Alpha2Write(ctx, store, old, old.Authority(), old.Evidence(), authorityTestRequest); err == nil || server.puts != before {
-				t.Fatal("original-less mixed reservation reached API")
-			}
-			command := types.KVCommand{RequestID: string([]byte{0xff, 0, 'i'}), Operation: operation, Key: string([]byte{0xfe, 'k'}), Value: []byte{}, Expected: []byte{0, 0xff}, ExpectedExists: true, TTLMS: 13}
-			reserved, result, err := ReserveV1Alpha2KVWrite(ctx, store, old, old.Authority(), old.Evidence(), command)
-			if err != nil || result != V1Alpha2CASApplied {
-				t.Fatalf("reserve %s %v", result, err)
-			}
-			got, present, err := reserved.PendingKV()
-			if err != nil || !present || !reflect.DeepEqual(got, command) {
-				t.Fatalf("intent changed %#v %v", got, err)
-			}
-			got.Expected[0] = 9
-			again, _, _ := reserved.PendingKV()
-			if again.Expected[0] != 0 {
-				t.Fatal("pending accessor aliases state")
-			}
-			request, _ := reserved.Pending()
-			wantID, _ := types.ManagedKVPendingWireID(command.RequestID)
-			if request.ID != wantID || request.Kind != "kv" {
-				t.Fatal("pending logical ID not transported losslessly")
-			}
-			// The fake API uses one successor RV; reset it between separate writes.
-			server.cluster = strings.Replace(server.cluster, `"resourceVersion":"48"`, `"resourceVersion":"47"`, 1)
-			loaded, err := LoadV1Alpha2Admission(ctx, store, phase2Ref)
-			if err != nil {
-				t.Fatal(err)
-			}
-			final, result, err := FinalizeV1Alpha2Write(ctx, store, loaded, loaded.Authority(), request, V1Alpha2WriteCommitted, json.RawMessage(`{"tip":8}`))
-			if err != nil || result != V1Alpha2CASApplied {
-				t.Fatalf("finalize %s %v", result, err)
-			}
-			if _, present := final.Pending(); present {
-				t.Fatal("finalize retained pending")
-			}
-		})
-	}
-}
-
-func TestManagedMixedProfileSQLAndLegacy(t *testing.T) {
-	_, store, old := mixedAuthoritySetup(t)
-	if _, result, err := ReserveV1Alpha2SQLWrite(context.Background(), store, old, old.Authority(), old.Evidence(), network.ExecuteRequest{RequestID: "sql", SQL: "CREATE TABLE t(v)"}); err != nil || result != V1Alpha2CASApplied {
-		t.Fatalf("mixed SQL %s %v", result, err)
-	}
-	_, store, old = authorityTestSetup(t)
-	if _, _, err := ReserveV1Alpha2KVWrite(context.Background(), store, old, old.Authority(), old.Evidence(), types.KVCommand{RequestID: "i", Operation: "put", Key: "k"}); err == nil {
-		t.Fatal("legacy accepted KV")
-	}
-	if _, result, err := ReserveV1Alpha2Write(context.Background(), store, old, old.Authority(), old.Evidence(), authorityTestRequest); err != nil || result != V1Alpha2CASApplied {
-		t.Fatalf("legacy changed %s %v", result, err)
-	}
-}
-
-func TestManagedAppendOnlySQLReservationBindsCurrentProfileAndEvidence(t *testing.T) {
-	profiles := []V1Alpha2RuntimeProfile{phase9RuntimeProfile()}
-	graph := phase9RuntimeProfile()
-	graph.ApplicationProtocol = sqlpolicy.ManagedGraphRequestAppendOnlyApplicationProtocol
-	graph.EvidenceFormat = graph.ApplicationProtocol
-	profiles = append(profiles, graph)
-	for _, profile := range profiles {
-		t.Run(profile.ApplicationProtocol, func(t *testing.T) {
-			server, kube := phase9Setup(t, phase9ClusterWithProtocol(profile.ApplicationProtocol), profile)
-			if _, err := ReconcileV1Alpha2ManagedInitialization(context.Background(), kube, phase2Ref, profile); err != nil {
-				t.Fatal(err)
-			}
-			// This fixture API models an original RV 47 with each successful
-			// status write advancing to 48; reset before the separate evidence CAS.
-			server.cluster = strings.Replace(server.cluster, `"resourceVersion":"48"`, `"resourceVersion":"47"`, 1)
-			store := &V1Alpha2StatusStore{Kube: kube}
-			initial, err := LoadV1Alpha2ApplicationInit(context.Background(), store, phase2Ref)
-			if err != nil {
-				t.Fatal(err)
-			}
-			if _, _, err := CommitV1Alpha2ApplicationInit(context.Background(), store, initial, initial.Assignment().Plan, json.RawMessage(`{"schema":"append-only-fixture"}`)); err != nil {
-				t.Fatal(err)
-			}
-			server.cluster = strings.Replace(server.cluster, `"resourceVersion":"48"`, `"resourceVersion":"47"`, 1)
-			old, err := LoadV1Alpha2Admission(context.Background(), store, phase2Ref)
-			if err != nil {
-				t.Fatal(err)
-			}
-			beforeReservation := server.puts
-			if _, _, err := ReserveV1Alpha2KVWrite(context.Background(), store, old, old.Authority(), old.Evidence(), types.KVCommand{RequestID: "kv-still-policy8", Operation: "put", Key: "key"}); err == nil || server.puts != beforeReservation {
-				t.Fatalf("profile %q expanded KV reservation beyond policy 8: err=%v puts=%d", profile.ApplicationProtocol, err, server.puts)
-			}
-			reserved, result, err := ReserveV1Alpha2SQLWrite(context.Background(), store, old, old.Authority(), old.Evidence(), network.ExecuteRequest{RequestID: "repair-profile-bound", SQL: "CREATE TABLE repair_profile_bound(v INTEGER)"})
-			if err != nil || result != V1Alpha2CASApplied {
-				t.Fatalf("explicit append-only repair reservation %s: %v", result, err)
-			}
-			request, pending := reserved.Pending()
-			if !pending || request.Kind != "sql" {
-				t.Fatalf("reservation did not retain SQL identity: %+v pending=%t", request, pending)
-			}
-			got := reserved.pending.Reservation
-			if got == nil || *got != *reservationContext(old.Authority()) {
-				t.Fatalf("reservation context differs from same-snapshot owner/binding: got=%+v", got)
-			}
-			encodedPending, err := json.Marshal(reserved.pending)
-			if err != nil {
-				t.Fatal(err)
-			}
-			pendingFields, err := jsonObject(encodedPending)
-			if err != nil {
-				t.Fatal(err)
-			}
-			wantReservation, _ := json.Marshal(reservationContext(old.Authority()))
-			if !sameJSON(pendingFields["reservation"], wantReservation) || !sameJSON(pendingFields["priorEvidence"], old.Evidence()) {
-				t.Fatalf("serialized control reservation changed existing context/evidence fields: %s", encodedPending)
-			}
-			pendingSQL, ok, err := reserved.PendingSQL()
-			if err != nil || !ok || pendingSQL.RequestID != "repair-profile-bound" || pendingSQL.SQL != "CREATE TABLE repair_profile_bound(v INTEGER)" {
-				t.Fatalf("retained repair SQL changed: request=%+v present=%t error=%v", pendingSQL, ok, err)
-			}
-			beforeNegativeWrites := server.puts
-
-			for name, mutate := range map[string]func(map[string]json.RawMessage, map[string]json.RawMessage){
-				"wrong reservation owner": func(_, auth map[string]json.RawMessage) {
-					var req v1alpha2PendingRequest
-					_ = json.Unmarshal(auth["pendingRequest"], &req)
-					req.Reservation.UID = "foreign-uid"
-					auth["pendingRequest"], _ = json.Marshal(req)
-				},
-				"wrong reservation generation": func(_, auth map[string]json.RawMessage) {
-					var req v1alpha2PendingRequest
-					_ = json.Unmarshal(auth["pendingRequest"], &req)
-					req.Reservation.Generation++
-					auth["pendingRequest"], _ = json.Marshal(req)
-				},
-				"wrong assigned evidence": func(status, _ map[string]json.RawMessage) {
-					var assignment V1Alpha2ApplicationInitAssignment
-					_ = json.Unmarshal(status["applicationInit"], &assignment)
-					assignment.Plan.EvidenceFormat = V1Alpha2ManagedSQLKVEvidenceFormat
-					status["applicationInit"], _ = json.Marshal(assignment)
-				},
-			} {
-				t.Run(name, func(t *testing.T) {
-					object := make(map[string]json.RawMessage, len(reserved.status.object))
-					for key, raw := range reserved.status.object {
-						object[key] = bytes.Clone(raw)
-					}
-					status, err := jsonObject(object["status"])
-					if err != nil {
-						t.Fatal(err)
-					}
-					auth, err := jsonObject(status["authority"])
-					if err != nil {
-						t.Fatal(err)
-					}
-					mutate(status, auth)
-					status["authority"], _ = json.Marshal(auth)
-					object["status"], _ = json.Marshal(status)
-					if err := validateManagedMixedProfile(object); err == nil {
-						t.Fatal("mismatched profile/evidence reservation accepted")
-					}
-				})
-			}
-			for _, protocol := range []string{sqlpolicy.ManagedRequestApplicationProtocol, sqlpolicy.ManagedGraphRequestApplicationProtocol, "unknown/v1", ""} {
-				object := make(map[string]json.RawMessage, len(reserved.status.object))
-				for key, raw := range reserved.status.object {
-					object[key] = bytes.Clone(raw)
-				}
-				spec, err := jsonObject(object["spec"])
-				if err != nil {
-					t.Fatal(err)
-				}
-				spec["applicationProtocol"], _ = json.Marshal(protocol)
-				object["spec"], _ = json.Marshal(spec)
-				if err := validateManagedMixedProfile(object); err == nil {
-					t.Fatalf("unsupported/retired protocol %q accepted", protocol)
-				}
-				bad := old
-				bad.status.object = object
-				if _, _, err := ReserveV1Alpha2SQLWrite(context.Background(), store, bad, bad.Authority(), bad.Evidence(), network.ExecuteRequest{RequestID: "bad-profile", SQL: "CREATE TABLE must_not_reserve(v INTEGER)"}); err == nil {
-					t.Fatalf("reservation accepted unsupported/retired protocol %q", protocol)
-				}
-			}
-			badEvidence := old
-			badEvidence.status.object = make(map[string]json.RawMessage, len(old.status.object))
-			for key, raw := range old.status.object {
-				badEvidence.status.object[key] = bytes.Clone(raw)
-			}
-			badStatus, err := jsonObject(badEvidence.status.object["status"])
-			if err != nil {
-				t.Fatal(err)
-			}
-			var badAssignment V1Alpha2ApplicationInitAssignment
-			if err := json.Unmarshal(badStatus["applicationInit"], &badAssignment); err != nil {
-				t.Fatal(err)
-			}
-			badAssignment.Plan.EvidenceFormat = V1Alpha2ManagedSQLKVEvidenceFormat
-			badStatus["applicationInit"], _ = json.Marshal(badAssignment)
-			badEvidence.status.object["status"], _ = json.Marshal(badStatus)
-			if _, _, err := ReserveV1Alpha2SQLWrite(context.Background(), store, badEvidence, badEvidence.Authority(), badEvidence.Evidence(), network.ExecuteRequest{RequestID: "bad-evidence", SQL: "CREATE TABLE must_not_reserve(v INTEGER)"}); err == nil {
-				t.Fatal("reservation accepted a wrong assigned evidence marker")
-			}
-			if server.puts != beforeNegativeWrites {
-				t.Fatalf("validation-only negative cases wrote status: before=%d after=%d", beforeNegativeWrites, server.puts)
-			}
-		})
 	}
 }
 
 func TestManagedMixedProfilePendingRawFingerprint(t *testing.T) {
 	var previous []string
 	for _, key := range []string{string([]byte{0xff}), string([]byte{0xfe}), "\ufffd"} {
-		_, store, old := mixedAuthoritySetup(t)
+		server, store, old := mixedAuthoritySetup(t)
 		command := types.KVCommand{RequestID: string([]byte{'i', 0xff}), Operation: "delete", Key: key}
-		reserved, obs, err := ReserveV1Alpha2KVWrite(context.Background(), store, old, old.Authority(), old.Evidence(), command)
-		if err != nil || obs != V1Alpha2CASApplied {
-			t.Fatalf("reserve %s %v", obs, err)
-		}
+		reserved := historicalPhase8Pending(t, server, store, old, command)
 		request, _ := reserved.Pending()
 		want, _ := types.ManagedKVFingerprint(command)
 		legacy, _ := types.KVFingerprint(command)
@@ -439,15 +204,8 @@ func TestManagedMixedProfilePendingRawFingerprint(t *testing.T) {
 func TestManagedMixedProfilePendingRawKeySwapRejected(t *testing.T) {
 	server, store, old := mixedAuthoritySetup(t)
 	command := types.KVCommand{RequestID: "same", Operation: "put", Key: string([]byte{0xff})}
-	reserved, _, err := ReserveV1Alpha2KVWrite(context.Background(), store, old, old.Authority(), old.Evidence(), command)
-	if err != nil {
-		t.Fatal(err)
-	}
+	reserved := historicalPhase8Pending(t, server, store, old, command)
 	request, _ := reserved.Pending()
-	loaded, err := LoadV1Alpha2Admission(context.Background(), store, phase2Ref)
-	if err != nil {
-		t.Fatal(err)
-	}
 	for _, key := range []string{string([]byte{0xfe}), "\ufffd"} {
 		changed := command
 		changed.Key = key
@@ -458,20 +216,13 @@ func TestManagedMixedProfilePendingRawKeySwapRejected(t *testing.T) {
 		if _, err := decodePendingKV(raw, request); err == nil {
 			t.Fatal("same ID legacy-colliding raw key swap accepted")
 		}
-		before := server.puts
-		if _, _, err := ReserveV1Alpha2KVWrite(context.Background(), store, loaded, loaded.Authority(), loaded.Evidence(), changed); err == nil || server.puts != before {
-			t.Fatal("pending conflict reached status API")
-		}
 	}
 }
 
 func TestManagedMixedProfilePendingIntentAndExactOriginal(t *testing.T) {
 	server, store, old := mixedAuthoritySetup(t)
 	command := types.KVCommand{RequestID: "same", Operation: "delete", Key: "key"}
-	reserved, obs, err := ReserveV1Alpha2KVWrite(context.Background(), store, old, old.Authority(), old.Evidence(), command)
-	if err != nil || obs != V1Alpha2CASApplied {
-		t.Fatal(obs, err)
-	}
+	reserved := historicalPhase8Pending(t, server, store, old, command)
 	request, _ := reserved.Pending()
 	for _, change := range []func(*types.KVCommand){
 		func(c *types.KVCommand) { c.Value = []byte{1} },
@@ -523,9 +274,7 @@ func TestManagedMixedProfilePendingIntentAndExactOriginal(t *testing.T) {
 func TestManagedMixedProfilePendingRejectsLegacyDomain(t *testing.T) {
 	server, store, old := mixedAuthoritySetup(t)
 	command := types.KVCommand{RequestID: "domain", Operation: "put", Key: "key"}
-	if _, _, err := ReserveV1Alpha2KVWrite(context.Background(), store, old, old.Authority(), old.Evidence(), command); err != nil {
-		t.Fatal(err)
-	}
+	historicalPhase8Pending(t, server, store, old, command)
 	var object map[string]json.RawMessage
 	if err := json.Unmarshal([]byte(server.cluster), &object); err != nil {
 		t.Fatal(err)
@@ -546,22 +295,10 @@ func TestManagedMixedProfilePendingRejectsLegacyDomain(t *testing.T) {
 	}
 }
 
-func TestManagedMixedProfileAmbiguousReservation(t *testing.T) {
-	server, store, old := mixedAuthoritySetup(t)
-	server.timeout = true
-	_, result, err := ReserveV1Alpha2KVWrite(context.Background(), store, old, old.Authority(), old.Evidence(), types.KVCommand{RequestID: "i", Operation: "put", Key: "k"})
-	if !errors.Is(err, ErrV1Alpha2StatusOutcomeUnknown) || result != V1Alpha2CASMatchingReadback {
-		t.Fatalf("matching readback authorized submission: %s %v", result, err)
-	}
-}
-
 func TestManagedMixedProfileRejectsInflationAndMutation(t *testing.T) {
 	server, store, old := mixedAuthoritySetup(t)
 	command := types.KVCommand{RequestID: "i", Operation: "cas", Key: "k", Value: []byte{1}}
-	reserved, _, err := ReserveV1Alpha2KVWrite(context.Background(), store, old, old.Authority(), old.Evidence(), command)
-	if err != nil {
-		t.Fatal(err)
-	}
+	reserved := historicalPhase8Pending(t, server, store, old, command)
 	for _, change := range []func(map[string]json.RawMessage, map[string]json.RawMessage){
 		func(_ map[string]json.RawMessage, auth map[string]json.RawMessage) {
 			var r v1alpha2PendingRequest
@@ -592,27 +329,6 @@ func TestManagedMixedProfileRejectsInflationAndMutation(t *testing.T) {
 		if _, _, err := updateV1Alpha2AdmissionStatus(context.Background(), store, reserved, change); err == nil || server.puts != before {
 			t.Fatal("invalid mixed object reached status API")
 		}
-	}
-	// A response with inflated metadata is not an Applied proof even if status matches.
-	server, store, old = mixedAuthoritySetup(t)
-	base := store.Kube.Client.Transport
-	store.Kube.Client.Transport = phase2Transport(func(r *http.Request) (*http.Response, error) {
-		response, err := base.RoundTrip(r)
-		if err == nil && r.Method == http.MethodPut {
-			_ = response.Body.Close()
-			var obj map[string]json.RawMessage
-			_ = json.Unmarshal([]byte(server.cluster), &obj)
-			meta, _ := jsonObject(obj["metadata"])
-			meta["annotations"], _ = json.Marshal(map[string]string{"large": strings.Repeat("x", 128<<10)})
-			obj["metadata"], _ = json.Marshal(meta)
-			raw, _ := json.Marshal(obj)
-			return phase2Response(http.StatusOK, string(raw)), nil
-		}
-		return response, err
-	})
-	_, result, err := ReserveV1Alpha2KVWrite(context.Background(), store, old, old.Authority(), old.Evidence(), command)
-	if err == nil || result == V1Alpha2CASApplied {
-		t.Fatal("inflated response established ownership")
 	}
 }
 
@@ -705,39 +421,22 @@ func mixedTestMetadataBytes(t *testing.T, object string, size int) string {
 }
 
 func TestManagedMixedProfileMetadataGrowth(t *testing.T) {
-	server, store, _ := mixedAuthoritySetup(t)
-	server.cluster = mixedTestMetadataBytes(t, server.cluster, 48<<10)
-	old, err := LoadV1Alpha2Admission(context.Background(), store, phase2Ref)
-	if err != nil {
-		t.Fatal(err)
-	}
-	base := store.Kube.Client.Transport
-	store.Kube.Client.Transport = phase2Transport(func(r *http.Request) (*http.Response, error) {
-		response, err := base.RoundTrip(r)
-		if err == nil && r.Method == http.MethodPut && response.StatusCode == http.StatusOK {
-			_ = response.Body.Close()
-			server.cluster = mixedTestMetadataBytes(t, server.cluster, 70<<10)
-			return phase2Response(http.StatusOK, server.cluster), nil
-		}
-		return response, err
-	})
-	reserved, result, err := ReserveV1Alpha2KVWrite(context.Background(), store, old, old.Authority(), old.Evidence(), types.KVCommand{RequestID: "growth", Operation: "put", Key: "k"})
-	if err != nil || result != V1Alpha2CASApplied {
-		t.Fatalf("permitted metadata growth rejected: %s %v", result, err)
-	}
-	for i := 0; i < 2; i++ {
-		if _, err := LoadV1Alpha2Admission(context.Background(), store, phase2Ref); err != nil {
-			t.Fatalf("repeated Load consumed fresh reserve: %v", err)
+	server, store, old := mixedAuthoritySetup(t)
+	stored := historicalPhase8Pending(t, server, store, old, types.KVCommand{RequestID: "growth", Operation: "put", Key: "k"})
+	want, _ := stored.Pending()
+	puts := server.puts
+	for _, size := range []int{48 << 10, 70 << 10} {
+		server.cluster = mixedTestMetadataBytes(t, server.cluster, size)
+		for range 2 {
+			loaded, err := LoadV1Alpha2Admission(context.Background(), store, phase2Ref)
+			got, pending := loaded.Pending()
+			if err != nil || !pending || got != want || !sameJSON(loaded.Evidence(), stored.Evidence()) {
+				t.Fatalf("metadata growth changed UNKNOWN: size=%d pending=%t error=%v", size, pending, err)
+			}
 		}
 	}
-	server.cluster = strings.Replace(server.cluster, `"resourceVersion":"48"`, `"resourceVersion":"47"`, 1)
-	loaded, err := LoadV1Alpha2Admission(context.Background(), store, phase2Ref)
-	if err != nil {
-		t.Fatal(err)
-	}
-	request, _ := reserved.Pending()
-	if _, result, err := FinalizeV1Alpha2Write(context.Background(), store, loaded, loaded.Authority(), request, V1Alpha2WriteCommitted, loaded.Evidence()); err != nil || result != V1Alpha2CASApplied {
-		t.Fatalf("finalize after growth: %s %v", result, err)
+	if server.puts != puts {
+		t.Fatal("observation wrote status")
 	}
 }
 
@@ -745,12 +444,9 @@ func TestManagedMixedProfilePendingContextImmutable(t *testing.T) {
 	for _, field := range []string{"generation", "binding", "owner"} {
 		t.Run(field, func(t *testing.T) {
 			server, store, old := mixedAuthoritySetup(t)
-			reserved, _, err := ReserveV1Alpha2KVWrite(context.Background(), store, old, old.Authority(), old.Evidence(), types.KVCommand{RequestID: "context", Operation: "put", Key: "k"})
-			if err != nil {
-				t.Fatal(err)
-			}
+			reserved := historicalPhase8Pending(t, server, store, old, types.KVCommand{RequestID: "context", Operation: "put", Key: "k"})
 			before := server.puts
-			_, _, err = updateV1Alpha2AdmissionStatus(context.Background(), store, reserved, func(_ map[string]json.RawMessage, auth map[string]json.RawMessage) {
+			_, _, err := updateV1Alpha2AdmissionStatus(context.Background(), store, reserved, func(_ map[string]json.RawMessage, auth map[string]json.RawMessage) {
 				switch field {
 				case "generation":
 					auth["generation"] = json.RawMessage("1")
@@ -792,67 +488,47 @@ func TestManagedMixedProfileMetadataCeiling(t *testing.T) {
 	}
 }
 
-func TestManagedMixedProfileRepairPreservesReservation(t *testing.T) {
-	f, _ := repairTestSetup(t)
-	spec, _ := jsonObject(f.cluster["spec"])
-	spec["applicationProtocol"], _ = json.Marshal(types.ManagedApplicationProtocolSQLKV)
-	f.cluster["spec"], _ = json.Marshal(spec)
-	status, _ := jsonObject(f.cluster["status"])
-	var assignment V1Alpha2ApplicationInitAssignment
-	_ = json.Unmarshal(status["applicationInit"], &assignment)
-	var sourceBootstrap V1Alpha2BootstrapPlan
-	if err := json.Unmarshal(status["bootstrapPlan"], &sourceBootstrap); err != nil {
-		t.Fatal(err)
-	}
-	var mixedBootstrap V1Alpha2BootstrapPlan
-	assignment.Plan, mixedBootstrap = mixedTestBootstrapBinding(t, assignment.Plan.DeploymentUID, assignment.Plan.AssignmentID, sourceBootstrap)
-	status["bootstrapPlan"], _ = json.Marshal(mixedBootstrap)
-	f.plan.BootstrapPlanDigest = assignment.Plan.BootstrapPlanDigest
-	status["applicationInit"], _ = json.Marshal(assignment)
-	f.cluster["status"], _ = json.Marshal(status)
-	raw, _ := json.Marshal(f.cluster)
-	grown := mixedTestMetadataBytes(t, string(raw), 70<<10)
-	_ = json.Unmarshal([]byte(grown), &f.cluster)
-	ctx := context.Background()
-	old, err := LoadV1Alpha2Admission(ctx, f.store, phase2Ref)
-	if err != nil {
-		t.Fatal(err)
-	}
-	pending, obs, err := ReserveV1Alpha2KVWrite(ctx, f.store, old, old.Authority(), old.Evidence(), types.KVCommand{RequestID: "repair-context", Operation: "cas", Key: "k"})
-	if err != nil || obs != V1Alpha2CASApplied {
-		t.Fatalf("reserve after metadata growth %s %v", obs, err)
-	}
-	closed, obs, err := BeginV1Alpha2Repair(ctx, f.store, pending, pending.Authority(), f.plan)
-	if err != nil || obs != V1Alpha2CASApplied {
-		t.Fatalf("legitimate close %s %v", obs, err)
-	}
-	bootstrap, err := closed.status.BootstrapPlan()
-	if err != nil {
-		t.Fatal(err)
-	}
-	_, prefix, err := objectstore.ManagedNamespacePrefixes("", f.plan.ClusterUID, f.plan.Generation, assignment.Plan.AssignmentID, string(bootstrap.ClusterID))
-	if err != nil {
-		t.Fatal(err)
-	}
-	head := bytes.Repeat([]byte("h"), V1Alpha2RepairHeadLimit)
-	handoff := V1Alpha2RepairHandoff{PlanDigest: f.plan.Digest(), SourcePrefix: prefix, PhysicalBinding: assignment.Plan.PhysicalBinding, Head: head, HeadHash: fmt.Sprintf("%x", sha256.Sum256(head)), RemoveTerminalSlot: 17, RemoveTerminalHash: strings.Repeat("a", 64), Survivors: quepaxa.Cluster{ConfigID: 2}}
-	for _, m := range bootstrap.Members {
-		if m.Member.ID != f.plan.OldNodeID {
-			handoff.Survivors.Members = append(handoff.Survivors.Members, m.Member)
-		}
-	}
-	captured, obs, err := CaptureV1Alpha2RepairHandoff(ctx, f.store, closed, closed.Authority(), handoff)
-	if err != nil || obs != V1Alpha2CASApplied {
-		t.Fatalf("legitimate handoff %s %v", obs, err)
-	}
-	completion := repairCompletion(f.plan, "Terminal")
-	finished, obs, err := FinishV1Alpha2Repair(ctx, f.store, captured, captured.Authority(), completion)
-	if err != nil || obs != V1Alpha2CASApplied {
-		t.Fatalf("legitimate completion %s %v", obs, err)
-	}
-	request, _ := pending.Pending()
-	if _, obs, err := FinalizeV1Alpha2Write(ctx, f.store, finished, finished.Authority(), request, V1Alpha2WriteCommitted, finished.Evidence()); err != nil || obs != V1Alpha2CASApplied {
-		t.Fatalf("finalize after legitimate repair %s %v", obs, err)
+func TestManagedMixedProfileRepairRefusesHistoricalReservation(t *testing.T) {
+	for _, protocol := range []string{"", types.ManagedApplicationProtocolSQLKV} {
+		t.Run(protocol, func(t *testing.T) {
+			server, store, old := historicalConsumedFixture(t, protocol)
+			pending := historicalPhase8Pending(t, server, store, old, network.ExecuteRequest{RequestID: "historical-unknown", SQL: "SELECT 1"})
+			before, puts := server.cluster, server.puts
+			want, _ := pending.Pending()
+			for _, action := range []struct {
+				name string
+				run  func() error
+			}{
+				{"begin", func() error {
+					_, _, err := BeginV1Alpha2Repair(context.Background(), store, pending, pending.Authority(), V1Alpha2RepairPlan{})
+					return err
+				}},
+				{"finish", func() error {
+					_, _, err := FinishV1Alpha2Repair(context.Background(), store, pending, pending.Authority(), V1Alpha2RepairCompletion{})
+					return err
+				}},
+				{"capture", func() error {
+					_, _, err := CaptureV1Alpha2RepairHandoff(context.Background(), store, pending, pending.Authority(), V1Alpha2RepairHandoff{})
+					return err
+				}},
+				{"record-add", func() error {
+					_, _, err := RecordV1Alpha2RepairAddition(context.Background(), store, pending, pending.Authority(), V1Alpha2RepairCompletion{})
+					return err
+				}},
+			} {
+				if err := action.run(); err == nil || !strings.Contains(err.Error(), "profiles 7/8 are retired") {
+					t.Fatalf("%s did not reject historical execution profile first: %v", action.name, err)
+				}
+				if server.puts != puts || server.cluster != before {
+					t.Fatalf("%s mutated historical UNKNOWN", action.name)
+				}
+			}
+			loaded, err := LoadV1Alpha2Admission(context.Background(), store, phase2Ref)
+			got, remains := loaded.Pending()
+			if err != nil || !remains || got != want || !sameJSON(loaded.Evidence(), pending.Evidence()) {
+				t.Fatalf("historical UNKNOWN was resolved or replaced: %v", err)
+			}
+		})
 	}
 }
 

@@ -20,8 +20,8 @@ func TestManagedGraphAdmissionDiagnosticRecoversRemoteControlAtExactSlot(t *test
 		t.Fatal("fixture has no installed application binding")
 	}
 	result := make(chan error, 1)
-	go func() { result <- fixture.node.waitManagedGraphOwnedControl(ctx, binding, 9) }()
-	awaitManagedGraphAdmissionObservation(t, fixture, result, 9)
+	go func() { result <- fixture.node.waitManagedAppendOnlyControl(ctx, binding) }()
+	awaitManagedGraphAdmissionOwner(t, fixture, result, 9)
 	fixture.transport.releaseHeld()
 	select {
 	case err := <-result:

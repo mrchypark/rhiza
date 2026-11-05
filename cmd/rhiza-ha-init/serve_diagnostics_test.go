@@ -12,7 +12,6 @@ import (
 
 	"github.com/mrchypark/rhiza/pkg/managedsql"
 	"github.com/mrchypark/rhiza/pkg/network"
-	"github.com/mrchypark/rhiza/pkg/operator"
 	"github.com/mrchypark/rhiza/pkg/quepaxa"
 )
 
@@ -64,23 +63,13 @@ func TestManagedOperationDiagnosticSanitizedAndResponseUnchanged(t *testing.T) {
 }
 
 func TestManagedHandlerOperationDiagnosticsPreserveLocalReads(t *testing.T) {
-	_, cfg, server, _, _ := managedHTTPQuorum(t)
+	_, _, server, _, _ := managedHTTPQuorum(t)
 	output := captureManagedDiagnostic(t)
-	ctx := context.Background()
-	a, err := operator.LoadV1Alpha2Admission(ctx, cfg.Store, cfg.Ref)
-	if err != nil {
-		t.Fatal(err)
-	}
-	req := managedsql.ExecuteRequest{RequestID: "private-original-id", SQL: "CREATE TABLE PRIVATE_SQL_MUST_NOT_APPEAR(value)"}
-	if _, _, err := operator.ReserveV1Alpha2SQLWrite(ctx, cfg.Store, a, a.Authority(), a.Evidence(), req); err != nil {
-		t.Fatal(err)
-	}
 	for _, tc := range []struct {
 		route, want string
 		body        any
 	}{
 		{"/recover-pending", "operation=recover-pending code=commit_unknown", struct{}{}},
-		{"/execute", "operation=execute code=sql_recovery_required stage=pending", managedsql.ExecuteRequest{RequestID: "private-new-id", SQL: "CREATE TABLE PRIVATE_SQL_OTHER(value)"}},
 		{"/query", "operation=query code=invalid_request", managedsql.QueryRequest{SQL: "SELECT 'PRIVATE_SQL'", Consistency: "invalid"}},
 	} {
 		output.Reset()

@@ -5,5 +5,5 @@ package node
 import "testing"
 
 func TestManagedNoPVCPreparedLearnerAdoptsHBeforeArchivedJCatchUp(t *testing.T) {
-	runManagedNoPVCPreparedLearnerStartup(t, true, false, false)
+	runManagedNoPVCPreparedLearnerStartup(t, true, false, false, false, false)
 }

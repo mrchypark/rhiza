@@ -8,67 +8,10 @@ import (
 
 	"github.com/mrchypark/rhiza/internal/types"
 	"github.com/mrchypark/rhiza/pkg/network"
-	"github.com/mrchypark/rhiza/pkg/node"
 )
 
 // This is a pure predicate decision table, not evidence that a live certified
 // gap was forced. Integration evidence comes from the prepared-learner test.
-func TestManagedKVHostResolvedHistoryGuard(t *testing.T) {
-	for _, test := range []struct {
-		name      string
-		kind      string
-		receipt   types.MutationReceipt
-		certified uint64
-		applied   uint64
-		recorder  uint64
-		wantError bool
-	}{
-		{"slot-zero", "sql", types.MutationReceipt{Status: types.MutationCommitted}, 3, 3, 3, true},
-		{"outside-certified", "sql", types.MutationReceipt{Slot: 4, Status: types.MutationCommitted}, 3, 3, 3, true},
-		{"nonterminal", "sql", types.MutationReceipt{Slot: 2}, 3, 3, 3, true},
-		{"kv-rejected", "kv", types.MutationReceipt{Slot: 2, Status: types.MutationRejected}, 3, 3, 3, true},
-		{"applied-gap", "sql", types.MutationReceipt{Slot: 2, Status: types.MutationCommitted}, 36, 33, 36, true},
-		{"recorder-gap", "sql", types.MutationReceipt{Slot: 2, Status: types.MutationCommitted}, 3, 3, 4, true},
-		{"sql-rejected", "sql", types.MutationReceipt{Slot: 2, Status: types.MutationRejected}, 3, 3, 3, false},
-		{"kv-cas-false", "kv", types.MutationReceipt{Slot: 2, Status: types.MutationCommitted, Applied: false}, 3, 3, 3, false},
-		{"sql-committed", "sql", types.MutationReceipt{Slot: 2, Status: types.MutationCommitted}, 3, 3, 3, false},
-	} {
-		t.Run(test.name, func(t *testing.T) {
-			result := RecoveryResult{Kind: test.kind}
-			if test.kind == "sql" {
-				result.SQL = &ExecuteResponse{MutationReceipt: test.receipt}
-			} else {
-				result.KV = &network.KVMutationResponse{MutationReceipt: test.receipt}
-			}
-			state := node.ManagedRuntimeState{CertifiedTip: test.certified, AppliedTip: test.applied, RecorderTip: test.recorder}
-			if err := validateResolvedHistory(applicationOriginal{kind: test.kind}, result, state); (err != nil) != test.wantError {
-				t.Fatalf("guard error=%v, want error=%v", err, test.wantError)
-			}
-		})
-	}
-}
-
-func TestManagedKVHostPendingAbsentReasonIsNarrow(t *testing.T) {
-	for _, test := range []struct {
-		name string
-		err  error
-		want bool
-	}{
-		{"exact", errPendingAbsent, true},
-		{"wrapped-unknown", &network.CommitUnknownError{Cause: errors.Join(errPendingAbsent)}, true},
-		{"barrier", errors.Join(errPendingAbsent, context.DeadlineExceeded), false},
-		{"poison", errors.Join(errPendingAbsent, errors.New("materializer poisoned")), false},
-		{"mismatch", errors.New("pending original differs"), false},
-		{"empty", nil, false},
-		{"unknown-without-reason", &network.CommitUnknownError{}, false},
-	} {
-		t.Run(test.name, func(t *testing.T) {
-			if got := onlyPendingAbsent(test.err); got != test.want {
-				t.Fatalf("onlyPendingAbsent(%v)=%v, want %v", test.err, got, test.want)
-			}
-		})
-	}
-}
 
 func TestManagedKVHostOutcomeContextOwnsOriginal(t *testing.T) {
 	for _, kind := range []string{"sql", "kv"} {
@@ -118,11 +61,11 @@ func TestManagedKVHostFingerprintIsNotOriginalEquality(t *testing.T) {
 	b := a
 	b.Value = []byte{}
 	b.Expected = []byte{}
-	left, err := (applicationOriginal{kind: "kv", kv: a}).identity()
+	left, err := originalFingerprint(applicationOriginal{kind: "kv", kv: a})
 	if err != nil {
 		t.Fatal(err)
 	}
-	right, err := (applicationOriginal{kind: "kv", kv: b}).identity()
+	right, err := originalFingerprint(applicationOriginal{kind: "kv", kv: b})
 	if err != nil || left != right {
 		t.Fatalf("fixture no longer covers equivalent fingerprint: %v", err)
 	}

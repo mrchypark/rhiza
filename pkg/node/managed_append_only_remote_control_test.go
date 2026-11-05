@@ -81,7 +81,7 @@ func TestManagedGraphAppendOnlyAdmissionAdoptsSameSlotApplication(t *testing.T) 
 		fixture.node.managedGraphControlMu.Lock()
 		candidate := fixture.node.managedGraphControl
 		fixture.node.managedGraphControlMu.Unlock()
-		if candidate != nil && candidate.observation != nil && candidate.observation.ObservedSlot == 9 {
+		if candidate != nil && candidate.binding == fixture.node.internalApplication.Load() {
 			admissionOwner = candidate
 			break
 		}
@@ -159,7 +159,7 @@ func TestManagedGraphAppendOnlyAdmissionAdoptsSameSlotApplication(t *testing.T) 
 	}
 
 	progress := fixture.node.core.RuntimeProgressSnapshot()
-	if progress.RecorderTip != progress.CertifiedTip || progress.CertifiedTip < admissionOwner.observation.ObservedSlot || fixture.node.material.Tip() < uint64(progress.CertifiedTip) {
+	if progress.RecorderTip != progress.CertifiedTip || progress.CertifiedTip < 9 || fixture.node.material.Tip() < uint64(progress.CertifiedTip) {
 		t.Fatalf("admission returned before certified prefix replay: progress=%+v materialized=%d", progress, fixture.node.material.Tip())
 	}
 	barrierDecision, ok := fixture.node.core.CertifiedValue(admissionOwner.slot)
@@ -369,7 +369,7 @@ func TestManagedGraphAppendOnlyAdmissionWaitsForRemoteQCKPAndReadBarrier(t *test
 	go func() { admission <- fixture.node.admitInternalApplication(ctx) }()
 	var owned *managedGraphControlOperation
 	observationWaitStart := time.Now()
-	for owned == nil || owned.observation == nil {
+	for owned == nil {
 		select {
 		case err := <-admission:
 			t.Fatalf("admission returned before the held R=10 owner completed: %v", err)
@@ -380,7 +380,7 @@ func TestManagedGraphAppendOnlyAdmissionWaitsForRemoteQCKPAndReadBarrier(t *test
 		fixture.node.managedGraphControlMu.Lock()
 		owned = fixture.node.managedGraphControl
 		fixture.node.managedGraphControlMu.Unlock()
-		if owned == nil || owned.observation == nil {
+		if owned == nil {
 			progress := core.RuntimeProgressSnapshot()
 			if progress.RecorderTip != 10 || progress.CertifiedTip != 9 || !progress.RecorderHashPresent || progress.RecorderHash != candidate.Hash {
 				t.Fatalf("R=10 observation window drifted before the owned operation was created: progress=%+v operation=%+v", progress, owned)
@@ -395,17 +395,21 @@ func TestManagedGraphAppendOnlyAdmissionWaitsForRemoteQCKPAndReadBarrier(t *test
 		}
 	}
 	t.Logf("phase=node_admission_qckp_observation_ready elapsed_ms=%d", time.Since(observationWaitStart).Milliseconds())
-	if owned == nil || owned.observation == nil || owned.observation.ObservedSlot != 10 || !owned.observation.BelongsTo(core) || owned.slot != 0 {
+	if owned == nil || owned.binding != fixture.node.internalApplication.Load() || owned.slot != 0 {
 		t.Fatalf("admission did not retain the exact R=10 observation: %+v", owned)
 	}
+	observation, err := core.ObserveManagedAppendOnlyControl(ctx)
+	if err != nil {
+		t.Fatalf("read-only QCKP diagnostic: %v", err)
+	}
 	sealObserved := false
-	for _, proposal := range owned.observation.Proposals {
+	for _, proposal := range observation.Proposals {
 		if proposal.Hash == candidate.Hash && proposal.Kind == quepaxa.ManagedAppendOnlyCheckpointSeal {
 			sealObserved = true
 		}
 	}
 	if !sealObserved {
-		t.Fatalf("actual QCKP R=10 did not pass the cold-control object verifier: %+v", owned.observation.Proposals)
+		t.Fatalf("actual QCKP R=10 did not pass the cold-control object verifier: %+v", observation.Proposals)
 	}
 	if decision, decided := core.CertifiedValue(10); decided {
 		t.Fatalf("R=10 QCKP unexpectedly certified while its exact remote owner response is held: %+v", decision)

@@ -7,7 +7,6 @@ import (
 	"context"
 	"crypto/sha256"
 	"errors"
-	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -172,7 +171,7 @@ func TestManagedGraphAdmissionOwnerFailureBeforeRecordDoesNotPoisonFutureRequest
 	}
 }
 
-func TestManagedGraphAdmissionRejectsWrongHashDuringOwnedOperation(t *testing.T) {
+func TestManagedGraphAdmissionWaitsForDisplacedOwnerAndHonorsCancellation(t *testing.T) {
 	fixture := newManagedGraphAdmissionRaceFixture(t)
 	server, err := network.NewServerForPolicy(fixture.node.core, fixture.node.material, "managed-graph-race", true, nil, sqlpolicy.ManagedGraphRequestMaterializationPolicy)
 	if err != nil {
@@ -230,13 +229,34 @@ func TestManagedGraphAdmissionRejectsWrongHashDuringOwnedOperation(t *testing.T)
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	admissionErr := fixture.node.admitInternalApplication(ctx)
-	if admissionErr == nil || !strings.Contains(admissionErr.Error(), "target=9 recorded=9 certified=8 applied=8") {
-		progress := fixture.node.core.RuntimeProgressSnapshot()
-		t.Fatalf("active operation accepted a different pending recorder hash or reported an unexpected gate: err=%v progress=%+v", admissionErr, progress)
+	waitEntered := make(chan struct{})
+	var waitOnce sync.Once
+	restoreWait := localtesthooks.Set(func(event string) {
+		if event == "node:managed-control:waiter-entered" {
+			waitOnce.Do(func() { close(waitEntered) })
+		}
+	})
+	t.Cleanup(restoreWait)
+	admission := make(chan error, 1)
+	go func() { admission <- fixture.node.admitInternalApplication(ctx) }()
+	select {
+	case <-waitEntered:
+	case err := <-admission:
+		t.Fatalf("admission returned before waiting for displaced owner: %v", err)
+	case <-ctx.Done():
+		t.Fatal("displaced-owner waiter did not enter", ctx.Err())
 	}
 	if fixture.node.core.Tip() != 8 {
-		t.Fatalf("wrong-hash refusal submitted foreground work: C=%d", fixture.node.core.Tip())
+		t.Fatalf("waiter certified work before owner/competitor release: C=%d", fixture.node.core.Tip())
+	}
+	cancel()
+	select {
+	case err := <-admission:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("displaced-owner waiter lost cancellation: %v", err)
+		}
+	case <-ownerCtx.Done():
+		t.Fatal("waiter did not stop after caller cancellation")
 	}
 	fixture.transport.releaseHeld()
 	if err := awaitProposal(t, competitor); err != nil {
@@ -246,10 +266,15 @@ func TestManagedGraphAdmissionRejectsWrongHashDuringOwnedOperation(t *testing.T)
 	if err := awaitProposal(t, owner); err != nil {
 		t.Fatalf("owner did not complete after its candidate was displaced: %v", err)
 	}
+	ownedSlot, ownedFound := fixture.node.core.DecidedSlot(owned)
+	ownedDecision, ownedCertified := fixture.node.core.CertifiedValue(ownedSlot)
+	if !ownedFound || !ownedCertified || ownedSlot != 10 || !bytes.Equal(ownedDecision.Value, owned) || len(ownedDecision.Certificate) == 0 {
+		t.Fatalf("displaced owner lacks its own exact certificate: slot=%d found=%t certified=%t", ownedSlot, ownedFound, ownedCertified)
+	}
 	if fixture.node.core.Tip() != 10 || fixture.node.material.Tip() != 10 {
 		t.Fatalf("displaced owner schedule did not complete at the later slot: certified=%d applied=%d", fixture.node.core.Tip(), fixture.node.material.Tip())
 	}
-	if err := fixture.node.admitInternalApplication(ctx); err != nil {
+	if err := fixture.node.admitInternalApplication(competitorCtx); err != nil {
 		t.Fatalf("future request remained poisoned after displaced owner reached valid state: %v", err)
 	}
 }

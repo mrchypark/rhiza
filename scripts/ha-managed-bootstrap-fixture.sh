@@ -1,5 +1,58 @@
 #!/bin/sh
 # Shared actual managed bootstrap/replacement checks. Drivers own API, image and cleanup.
+managed_completed_repair_oracle() {
+  jq -e --arg old_uid "$2" --arg old_node "$3" --arg prior_operation "${4-}" '
+    .status.repair as $r | .status.applicationInit.plan as $application | try (
+    ($application.applicationProtocol=="rhiza-managed-request-append-only/v1" or $application.applicationProtocol=="rhiza-managed-request-graph-append-only/v1") and
+    $application.evidenceFormat==$application.applicationProtocol and
+    $r.state=="Completed" and $r.plan.oldNodeID==$old_node and
+    $r.plan.sequence=="addThenRemove" and
+    $r.plan.expectedConfigID>0 and
+    $r.plan.replacement.podUID!=$old_uid and
+    ($prior_operation=="" or $r.plan.operationID!=$prior_operation) and
+    $r.completion.kind=="Terminal" and
+    $r.completion.operationID==$r.plan.operationID and
+    $r.completion.expectedConfigID==$r.plan.expectedConfigID and
+    $r.completion.expectedAbortSlot==$r.plan.expectedAbortSlot and
+    $r.completion.configID==($r.plan.expectedConfigID+2) and
+    $r.completion.slot>$r.plan.expectedAbortSlot and
+    ($r.completion.hash|if type=="string" then test("^[0-9a-f]{64}$") else false end) and
+    ($r.completion.planDigest|if type=="string" then test("^[0-9a-f]{64}$") else false end) and
+    $r.preparedHandoff.planDigest==$r.completion.planDigest and
+    $r.addCompletion.planDigest==$r.completion.planDigest and
+    $r.preparedHandoff.preparedConfig.config_id==$r.plan.expectedConfigID and
+    ($r.preparedHandoff.preparedConfig.members|length)==3 and
+    ([$r.preparedHandoff.preparedConfig.members[].node_id]|unique|length)==3 and
+    ([$r.preparedHandoff.preparedConfig.members[].node_id]|index($old_node))!=null and
+    ([$r.preparedHandoff.preparedConfig.members[].node_id]|index($r.plan.replacement.nodeID))==null and
+    $r.preparedHandoff.preparedSlot>$r.plan.expectedAbortSlot and
+    ($r.preparedHandoff.preparedHash|if type=="string" then test("^[0-9a-f]{64}$") else false end) and
+    ($r.preparedHandoff.removeTerminalSlot // 0)==0 and
+    ($r.preparedHandoff.removeTerminalHash // "")=="" and
+    ($r.preparedHandoff.survivors.config_id // 0)==0 and
+    ($r.preparedHandoff.survivors.members // []|length)==0 and
+    $r.addCompletion.kind=="Terminal" and
+    $r.addCompletion.operationID==$r.plan.operationID and
+    $r.addCompletion.expectedConfigID==$r.plan.expectedConfigID and
+    $r.addCompletion.expectedAbortSlot==$r.plan.expectedAbortSlot and
+    $r.addCompletion.configID==($r.plan.expectedConfigID+1) and
+    $r.addCompletion.slot>$r.preparedHandoff.preparedSlot and
+    $r.completion.slot>$r.addCompletion.slot and
+    ($r.addCompletion.hash|if type=="string" then test("^[0-9a-f]{64}$") else false end) and
+    ($r.addCompletion.finalVoterIDs|length)==4 and
+    ($r.addCompletion.finalVoterIDs|unique|length)==4 and
+    ($r.addCompletion.finalVoterIDs|sort)==(([$r.preparedHandoff.preparedConfig.members[].node_id]+[$r.plan.replacement.nodeID])|sort) and
+    ($r.plan.finalVoterIDs|sort)==($r.addCompletion.finalVoterIDs|map(select(.!=$old_node))|sort) and
+    all([$r.plan.expectedConfigID,$r.plan.expectedAbortSlot,$r.preparedHandoff.preparedSlot,$r.addCompletion.configID,$r.addCompletion.slot,$r.completion.configID,$r.completion.slot][]; type=="number" and floor==. and .>=0) and
+    $r.completion.finalVoterIDs==$r.plan.finalVoterIDs and
+    ($r.plan.finalVoterIDs|length)==3 and
+    ($r.plan.finalVoterIDs|unique|length)==3 and
+    all($r.plan.finalVoterIDs[]; type=="string" and length>0) and
+    ($r.plan.finalVoterIDs|index($old_node))==null and
+    ($r.plan.finalVoterIDs|index($r.plan.replacement.nodeID))!=null
+    ) catch false
+  ' "$1" >/dev/null
+}
 capture_client_job() {
   client_capture_name=$1 client_capture_uid=$2
   client_capture_gap=0
@@ -205,7 +258,7 @@ managed_fixture_profile_family() {
   case "$1" in
     internal|internal-append-only) printf '%s\n' internal ;;
     graph|graph-append-only) printf '%s\n' graph ;;
-    *) printf '%s\n' other ;;
+    *) return 1 ;;
   esac
 }
 
@@ -217,11 +270,37 @@ managed_fixture_profile_protocol() {
   esac
 }
 
+managed_replacement_ffi_contract() (
+  [ "${RHIZA_MANAGED_TEST_DOCKERFILE-}" = Dockerfile.managed-ffi-contract ] || return 0
+  ffi_pod=$1 ffi_uid=$2 ffi_phase=$3
+  ffi_log="$logs/go-ffi-contract-$ffi_phase.log"
+  k -n "$namespace" logs "$ffi_pod" -c sql > "$ffi_log"
+  if [ "$fixture_family" = internal ]; then
+    [ "$(grep -Fxc 'RHIZA_ACTUAL_MATERIALIZATION_PROFILE=9' "$ffi_log")" = 1 ]
+  fi
+  if [ "$fixture_case" != legacy ]; then
+    if [ "$fixture_family" = graph ]; then
+      [ "$(grep -Fxc 'RHIZA_ACTUAL_MATERIALIZATION_PROFILE=10' "$ffi_log")" = 1 ]
+      managed_graph_tuple_oracle "$ffi_log" verify "$ffi_uid" "$logs/rust-graph-$ffi_phase-tuple.json"
+      managed_graph_cabi_oracle "$ffi_log" "$ffi_uid" "$logs/graph-cabi-$ffi_phase.json"
+      cmp "$logs/rust-graph-prefault-tuple.json" "$logs/rust-graph-$ffi_phase-tuple.json"
+    else
+      grep -F 'actual in-cluster Go FFI -> mixed managed Host -> SQL KV ACK readback -> close passed' "$ffi_log" >/dev/null
+    fi
+    managed_mixed_tuple_oracle "$ffi_log" verify "$ffi_uid" "$logs/rust-mixed-$ffi_phase-tuple.json"
+    cmp "$logs/rust-mixed-prefault-tuple.json" "$logs/rust-mixed-$ffi_phase-tuple.json"
+    run_client "mixed-$ffi_phase" query '{"sql":"SELECT tuple FROM rust_mixed_contract WHERE id=1","consistency":"linearizable"}'
+    jq -S '.rows[0][0]|fromjson' "$logs/mixed-$ffi_phase.json" > "$logs/rust-mixed-$ffi_phase-row.json"
+    cmp "$logs/rust-mixed-prefault-tuple.json" "$logs/rust-mixed-$ffi_phase-row.json"
+  else
+    grep -F 'actual in-cluster Go FFI -> managed Host -> SQL ACK readback -> close passed' "$ffi_log" >/dev/null
+    grep -Fx 'PASS: managed Rust FFI SQL contract' "$ffi_log" >/dev/null
+  fi
+)
+
 managed_fixture() {
-fixture_case=${RHIZA_MANAGED_FIXTURE_CASE:-legacy}
+fixture_case=${RHIZA_MANAGED_FIXTURE_CASE:-internal}
 case "$fixture_case" in
-  legacy) fixture_protocol='' fixture_evidence=rhiza-managed-sql/v1 ;;
-  mixed) fixture_protocol=rhiza-managed-sql-kv/v1 fixture_evidence=rhiza-managed-sql-kv/v1 ;;
   internal|internal-append-only|graph|graph-append-only)
     fixture_protocol=$(managed_fixture_profile_protocol "$fixture_case") || return 1
     fixture_evidence=$fixture_protocol
@@ -237,9 +316,6 @@ case "$fixture_provider" in
   azure) floci_image=floci/floci-az:0.15.0; floci_port=4577 ;;
   *) echo 'unsupported explicit emulator provider' >&2; return 1 ;;
 esac
-if [ "$fixture_case" = legacy ] && [ "$fixture_provider" != s3 ]; then
-  echo 'legacy runtime qualification is S3-only' >&2; return 1
-fi
 printf 'case=%s\nprovider=%s\nemulator=%s\nport=%s\nprotocol=%s\n' "$fixture_case" "$fixture_provider" "$floci_image" "$floci_port" "$fixture_protocol" > "$logs/fixture-provider.txt"
 if [ -n "${RHIZA_MANAGED_FIXTURE_NODE-}" ]; then
   printf '%s\n' "$RHIZA_MANAGED_FIXTURE_NODE" | grep -Eq '^[a-z0-9][a-z0-9.-]{0,252}$' || {
@@ -392,10 +468,15 @@ if [ "$fixture_case" != legacy ]; then
   k -n "$namespace" get pod "$old_pod" -o json > "$logs/rust-mixed-producer-before.json"
   jq -e --arg uid "$producer_uid" '.metadata.uid==$uid and any(.status.containerStatuses[]; .name=="sql" and .ready==true and .restartCount==0)' "$logs/rust-mixed-producer-before.json" >/dev/null
 fi
+old_node=$(jq -er --arg uid "$old_uid" '.status.bootstrapPlan.members[]|select(.podUID==$uid)|.member.node_id' "$logs/committed.json")
 managed_pod_fault "$old_pod" "$old_uid"
+for evidence in "$logs"/pod-kill-*.json; do
+  [ -s "$evidence" ]
+  cp "$evidence" "$logs/first-${evidence##*/}"
+done
 attempt=0
 until k -n "$namespace" get rhizacluster sql -o json > "$logs/replacement-status.json" &&
-  jq -e --arg old "$old_uid" '.status.repair.state=="Completed" and .status.repair.plan.replacement.podUID!=$old' "$logs/replacement-status.json" >/dev/null; do
+  managed_completed_repair_oracle "$logs/replacement-status.json" "$old_uid" "$old_node"; do
   attempt=$((attempt+1)); [ "$attempt" -lt 180 ] || exit 1; sleep 1
 done
 k -n "$namespace" wait --for=condition=Ready pod -l "$selector" --timeout=180s
@@ -405,35 +486,46 @@ run_client query-after-replacement query '{"sql":"SELECT id, value FROM bootstra
 jq -e '.rows==[[1,"real-kubelet"]]' "$logs/query-after-replacement.json" >/dev/null
 jq -S '.status|{bootstrapPlan,genesis,plan:.applicationInit.plan}' "$logs/replacement-status.json" > "$logs/immutable-replacement.json"
 cmp "$logs/immutable-before.json" "$logs/immutable-replacement.json"
-replacement_uid=$(jq -r '.status.repair.plan.replacement.podUID' "$logs/replacement-status.json")
-replacement_pod=$(jq -r --arg uid "$replacement_uid" '.items[]|select(.metadata.uid==$uid)|.metadata.name' "$logs/replacement-pods.json")
-[ -n "$replacement_pod" ]
-restart_before=$(jq -r --arg uid "$replacement_uid" '.items[]|select(.metadata.uid==$uid)|.status.containerStatuses[]|select(.name=="sql")|.restartCount' "$logs/replacement-pods.json")
+replacement_uid=$(jq -er '.status.repair.plan.replacement.podUID' "$logs/replacement-status.json")
+replacement_pod=$(jq -er --arg uid "$replacement_uid" '.items[]|select(.metadata.uid==$uid)|.metadata.name' "$logs/replacement-pods.json")
+jq -e --slurpfile initial "$logs/committed.json" '.status.repair.plan as $p | ([$initial[0].status.bootstrapPlan.members[].member.node_id]|index($p.replacement.nodeID))==null and ($p.finalVoterIDs|sort)==(([$initial[0].status.bootstrapPlan.members[].member.node_id]|map(select(.!=$p.oldNodeID)))+[$p.replacement.nodeID]|sort)' "$logs/replacement-status.json" >/dev/null
+jq -e --arg uid "$replacement_uid" '[.items[]|select(.metadata.uid==$uid)]|length==1 and any(.[0].status.containerStatuses[]; .name=="sql" and .ready==true and .restartCount==0)' "$logs/replacement-pods.json" >/dev/null
+managed_replacement_ffi_contract "$replacement_pod" "$replacement_uid" first-replacement
+
+# Replacing a second fresh Pod proves sequential voter repair, not only a
+# process restart of the first replacement.
+first_replacement_uid=$replacement_uid
+first_replacement_pod=$replacement_pod
+first_replacement_node=$(jq -er '.status.repair.plan.replacement.nodeID' "$logs/replacement-status.json")
+first_operation=$(jq -er '.status.repair.plan.operationID' "$logs/replacement-status.json")
+managed_pod_fault "$first_replacement_pod" "$first_replacement_uid"
+attempt=0
+until k -n "$namespace" get rhizacluster sql -o json > "$logs/replacement-second-status.json" &&
+  managed_completed_repair_oracle "$logs/replacement-second-status.json" "$first_replacement_uid" "$first_replacement_node" "$first_operation"; do
+  attempt=$((attempt+1)); [ "$attempt" -lt 180 ] || exit 1; sleep 1
+done
+k -n "$namespace" wait --for=condition=Ready pod -l "$selector" --timeout=180s
+k -n "$namespace" get pods -l "$selector" -o json > "$logs/replacement-second-pods.json"
+jq -e --arg old "$first_replacement_uid" '.items|length==3 and all(.[]; .metadata.uid!=$old and ([.status.initContainerStatuses[]?|select(.state.terminated.exitCode==0)]|length)==2 and all(.spec.volumes[]?; has("persistentVolumeClaim")|not))' "$logs/replacement-second-pods.json" >/dev/null
+second_replacement_uid=$(jq -er '.status.repair.plan.replacement.podUID' "$logs/replacement-second-status.json")
+[ "$second_replacement_uid" != "$old_uid" ]
+jq -e --arg original_old "$old_node" --slurpfile previous "$logs/replacement-status.json" '.status.repair.plan as $p | ($p.finalVoterIDs|index($original_old))==null and ($p.finalVoterIDs|sort)==(($previous[0].status.repair.plan.finalVoterIDs|map(select(.!=$p.oldNodeID)))+[$p.replacement.nodeID]|sort)' "$logs/replacement-second-status.json" >/dev/null
+second_replacement_pod=$(jq -er --arg uid "$second_replacement_uid" '.items[]|select(.metadata.uid==$uid)|.metadata.name' "$logs/replacement-second-pods.json")
+jq -e --arg uid "$second_replacement_uid" '[.items[]|select(.metadata.uid==$uid)]|length==1 and any(.[0].status.containerStatuses[]; .name=="sql" and .ready==true and .restartCount==0)' "$logs/replacement-second-pods.json" >/dev/null
+managed_replacement_ffi_contract "$second_replacement_pod" "$second_replacement_uid" second-replacement
+run_client query-after-second-replacement query '{"sql":"SELECT id, value FROM bootstrap_ci"}'
+jq -e '.rows==[[1,"real-kubelet"]]' "$logs/query-after-second-replacement.json" >/dev/null
+jq -S '.status|{bootstrapPlan,genesis,plan:.applicationInit.plan}' "$logs/replacement-second-status.json" > "$logs/immutable-second-replacement.json"
+cmp "$logs/immutable-before.json" "$logs/immutable-second-replacement.json"
+jq -S '.status.repair' "$logs/replacement-second-status.json" > "$logs/repair-proof-before-restart.json"
+
+# Keep the main-container restart as a separate, same-Pod recovery assertion.
+replacement_uid=$second_replacement_uid
+replacement_pod=$second_replacement_pod
+restart_before=$(jq -r --arg uid "$replacement_uid" '.items[]|select(.metadata.uid==$uid)|.status.containerStatuses[]|select(.name=="sql")|.restartCount' "$logs/replacement-second-pods.json")
 if [ "${RHIZA_MANAGED_TEST_DOCKERFILE-}" = Dockerfile.managed-ffi-contract ]; then
   # A failed test must not become a pass through kubelet retries/new request IDs.
   [ "$restart_before" = 0 ] || { echo 'FFI contract initial main restarted; retain first failure' >&2; return 1; }
-  k -n "$namespace" logs "$replacement_pod" -c sql > "$logs/go-ffi-contract-first.log"
-  if [ "$fixture_family" = internal ]; then
-    [ "$(grep -Fxc 'RHIZA_ACTUAL_MATERIALIZATION_PROFILE=9' "$logs/go-ffi-contract-first.log")" = 1 ]
-  fi
-  if [ "$fixture_case" != legacy ]; then
-    if [ "$fixture_family" = graph ]; then
-      [ "$(grep -Fxc 'RHIZA_ACTUAL_MATERIALIZATION_PROFILE=10' "$logs/go-ffi-contract-first.log")" = 1 ]
-      managed_graph_tuple_oracle "$logs/go-ffi-contract-first.log" verify "$replacement_uid" "$logs/rust-graph-replacement-tuple.json"
-      managed_graph_cabi_oracle "$logs/go-ffi-contract-first.log" "$replacement_uid" "$logs/graph-cabi-replacement.json"
-      cmp "$logs/rust-graph-prefault-tuple.json" "$logs/rust-graph-replacement-tuple.json"
-    else
-      grep -F 'actual in-cluster Go FFI -> mixed managed Host -> SQL KV ACK readback -> close passed' "$logs/go-ffi-contract-first.log" >/dev/null
-    fi
-    managed_mixed_tuple_oracle "$logs/go-ffi-contract-first.log" verify "$replacement_uid" "$logs/rust-mixed-replacement-tuple.json"
-    cmp "$logs/rust-mixed-prefault-tuple.json" "$logs/rust-mixed-replacement-tuple.json"
-    run_client mixed-replacement query '{"sql":"SELECT tuple FROM rust_mixed_contract WHERE id=1","consistency":"linearizable"}'
-    jq -S '.rows[0][0]|fromjson' "$logs/mixed-replacement.json" > "$logs/rust-mixed-replacement-row.json"
-    cmp "$logs/rust-mixed-prefault-tuple.json" "$logs/rust-mixed-replacement-row.json"
-  else
-    grep -F 'actual in-cluster Go FFI -> managed Host -> SQL ACK readback -> close passed' "$logs/go-ffi-contract-first.log" >/dev/null
-    grep -Fx 'PASS: managed Rust FFI SQL contract' "$logs/go-ffi-contract-first.log" >/dev/null
-  fi
 fi
 k -n "$namespace" exec "$replacement_pod" -c sql -- sha256sum /var/lib/rhiza/repair.json /var/lib/rhiza/data/prepared-adoption.json /var/lib/rhiza/data/qlog/voter-identity.json > "$logs/restart-identity-before.txt"
 # The application handles TERM; kubelet restarts main without replacing the
@@ -473,7 +565,11 @@ k -n "$namespace" exec "$replacement_pod" -c sql -- sha256sum /var/lib/rhiza/rep
 managed_same_pod_identity_oracle "$logs/restart-identity-before.txt" "$logs/restart-identity-after.txt"
 run_client query-after-restart query '{"sql":"SELECT id, value FROM bootstrap_ci"}'
 jq -e '.rows==[[1,"real-kubelet"]]' "$logs/query-after-restart.json" >/dev/null
-printf '%s\n' 'PASS: actual kubelet bootstrap, Deployment Pod replacement, same-Pod main restart preserving origin/adoption/voter identity, NoPVC and ACK readback' > "$logs/result.txt"
+k -n "$namespace" get rhizacluster sql -o json > "$logs/restart-final-status.json"
+managed_completed_repair_oracle "$logs/restart-final-status.json" "$first_replacement_uid" "$first_replacement_node" "$first_operation"
+jq -S '.status.repair' "$logs/restart-final-status.json" > "$logs/repair-proof-after-restart.json"
+cmp "$logs/repair-proof-before-restart.json" "$logs/repair-proof-after-restart.json"
+printf '%s\n' 'PASS: actual kubelet bootstrap, two sequential Deployment Pod replacements, separate same-Pod main restart preserving origin/adoption/voter identity, NoPVC and ACK readback' > "$logs/result.txt"
 if [ "${managed_chaos_verified-0}" = 1 ]; then
   printf '%s\n' 'PASS: scoped Chaos Mesh pod-kill and container-kill injection, runtime effects and one-shot deletion verified' >> "$logs/result.txt"
 else
