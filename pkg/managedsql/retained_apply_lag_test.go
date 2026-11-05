@@ -39,7 +39,9 @@ func retainedLagApplicationCounts(t *testing.T, ctx context.Context, cfg Config,
 func TestManagedSQLRetainedOriginalAppliesCertifiedSuffixBeforeFinalize(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 25*time.Second)
 	defer cancel()
+	backgroundPaused := pauseCertifiedRecoveryBackground(t)
 	configs, hosts, _ := concurrentSQLHosts(t, nil)
+	backgroundPaused(ctx, len(hosts))
 	if _, err := hosts[0].Execute(ctx, ExecuteRequest{RequestID: "retained-lag-schema", SQL: "CREATE TABLE retained_lag(id INTEGER PRIMARY KEY, value TEXT)"}); err != nil {
 		t.Fatal(err)
 	}
@@ -61,17 +63,31 @@ func TestManagedSQLRetainedOriginalAppliesCertifiedSuffixBeforeFinalize(t *testi
 	pushSeen, backgroundSeen, release := make(chan struct{}), make(chan struct{}), make(chan struct{})
 	var pushOnce, backgroundOnce, releaseOnce sync.Once
 	target := configs[1].Runtime.NodeID
+	healthyPeer := configs[2].Runtime.NodeID
 	restore := localtesthooks.Set(func(event string) {
 		if !held.Load() {
 			return
 		}
 		if strings.HasPrefix(event, fmt.Sprintf("network:learned:phase=apply-start:node=%s:", target)) {
 			pushOnce.Do(func() { close(pushSeen) })
-			<-release
+			select {
+			case <-release:
+			case <-ctx.Done():
+			}
+		}
+		if strings.HasPrefix(event, fmt.Sprintf("network:learned:phase=apply-start:node=%s:", healthyPeer)) {
+			select {
+			case <-pushSeen:
+			case <-release:
+			case <-ctx.Done():
+			}
 		}
 		if event == "node:catchup-peer:phase=before-local-replay:node="+string(target) {
 			backgroundOnce.Do(func() { close(backgroundSeen) })
-			<-release
+			select {
+			case <-release:
+			case <-ctx.Done():
+			}
 		}
 	})
 	// Registered after Host cleanups so callbacks are unblocked before any
@@ -112,13 +128,15 @@ func TestManagedSQLRetainedOriginalAppliesCertifiedSuffixBeforeFinalize(t *testi
 	if _, pending := authority.Pending(); pending {
 		t.Fatal("later original not actually finalized")
 	}
-	retained, err := hosts[1].node.ResolveManagedSQL(ctx, original)
-	if err != nil || retained.State != network.ResolveExecuteRetained || retained.Durability != network.ResolveExecuteDurabilityConfirmed || retained.Receipt == nil || retained.Receipt.Slot != ack.Slot {
-		t.Fatal("real retained/barrier setup", retained, err)
+	// Local observation does not own recovery. ResolveManagedSQL now performs
+	// admission/replay and must not be used to assert a no-replay snapshot.
+	observed, err := hosts[1].node.RequestStatusManaged(ctx, network.RequestStatusRequest{Kind: "sql", RequestID: original.RequestID})
+	if err != nil || observed.Receipt == nil || *observed.Receipt != ack.MutationReceipt {
+		t.Fatal("real retained receipt observation", observed, err)
 	}
 	afterRetained, err := hosts[1].node.ManagedState()
 	if err != nil || afterRetained.AppliedTip != lag.AppliedTip || afterRetained.CertifiedTip <= afterRetained.AppliedTip {
-		t.Fatal("retained resolver unexpectedly drained controlled suffix", afterRetained, err)
+		t.Fatal("local observation unexpectedly drained controlled suffix", afterRetained, err)
 	}
 	beforeTotal, beforeOriginal := retainedLagApplicationCounts(t, ctx, configs[0], original.RequestID)
 	result, recoverErr := hosts[1].RecoverRequest(ctx, network.RequestStatusRequest{Kind: "sql", RequestID: original.RequestID})
@@ -126,7 +144,6 @@ func TestManagedSQLRetainedOriginalAppliesCertifiedSuffixBeforeFinalize(t *testi
 	if beforeTotal != afterTotal || beforeOriginal != 1 || afterOriginal != 1 {
 		t.Fatalf("application resubmitted: total %d->%d original %d->%d", beforeTotal, afterTotal, beforeOriginal, afterOriginal)
 	}
-	t.Logf("actual retained slot=%d certified=%d applied=%d recorder=%d barrier=%s SQL application commands %d->%d original commands %d->%d", ack.Slot, lag.CertifiedTip, lag.AppliedTip, lag.RecorderTip, retained.Durability, beforeTotal, afterTotal, beforeOriginal, afterOriginal)
 	if recoverErr != nil {
 		t.Fatalf("retained original recovery after certified replay: %v", recoverErr)
 	}
@@ -138,6 +155,14 @@ func TestManagedSQLRetainedOriginalAppliesCertifiedSuffixBeforeFinalize(t *testi
 	if !bytes.Equal(want, got) {
 		t.Fatalf("original result changed: want=%s got=%s", want, got)
 	}
+	retained, err := hosts[1].node.ResolveManagedSQL(ctx, original)
+	if err != nil || retained.State != network.ResolveExecuteRetained || retained.Durability != network.ResolveExecuteDurabilityConfirmed || retained.Receipt == nil || *retained.Receipt != ack.MutationReceipt {
+		t.Fatal("post-recovery retained/barrier result", retained, err)
+	}
+	if total, originals := retainedLagApplicationCounts(t, ctx, configs[0], original.RequestID); total != afterTotal || originals != 1 {
+		t.Fatal("post-recovery retained resolver resubmitted the original")
+	}
+	t.Logf("actual retained slot=%d certified=%d applied=%d recorder=%d barrier=%s SQL application commands %d->%d original commands %d->%d", ack.Slot, lag.CertifiedTip, lag.AppliedTip, lag.RecorderTip, retained.Durability, beforeTotal, afterTotal, beforeOriginal, afterOriginal)
 	after, err := operator.LoadV1Alpha2Admission(ctx, configs[0].Store, configs[0].Ref)
 	if err != nil {
 		t.Fatal(err)

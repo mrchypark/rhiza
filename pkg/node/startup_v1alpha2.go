@@ -557,6 +557,7 @@ func managedNodeOpenDiagnostic(stage string) string {
 	switch stage {
 	case "prepared_config", "prepared_authority", "prepared_identity", "prepared_lock", "prepared_origin", "prepared_adoption", "prepared_wal", "prepared_materializer", "prepared_restore", "prepared_runtime_open",
 		"adoption_identity", "adoption_wal_history", "adoption_sql_reconstruct", "adoption_sql_digest",
+		"adoption_sql_restore_state", "adoption_sql_actual_inspect", "adoption_sql_applied_below_floor", "adoption_sql_applied_above_tip", "adoption_sql_base_binding", "adoption_sql_base_missing", "adoption_sql_adopted_prefix", "adoption_sql_bucket_open", "adoption_sql_temp_create", "adoption_sql_cache_create", "adoption_sql_reader_open", "adoption_sql_root_open", "adoption_sql_root_state_hash", "adoption_sql_checkpoint_dir_create", "adoption_sql_checkpoint_download", "adoption_sql_certified_suffix", "adoption_sql_expected_open", "adoption_sql_checkpoint_restore", "adoption_sql_suffix_apply", "adoption_sql_tip_mismatch", "adoption_sql_expected_inspect", "adoption_sql_bucket_close", "adoption_sql_temp_remove", "adoption_sql_expected_close",
 		"runtime_config", "runtime_optional_supervisor", "runtime_policy", "runtime_wal_lock", "runtime_wal_open", "runtime_source_open", "runtime_registration", "runtime_checkpoint_load", "runtime_archive_load", "runtime_materializer", "runtime_core_open", "runtime_archive_recover",
 		"runtime_pair_reconstruct", "runtime_peer_open", "runtime_post_checkpoint", "prepared_runtime_adoption":
 		return "MANAGED_HOST_OPEN_FAILURE stage=" + stage
@@ -1429,20 +1430,25 @@ func (n *Node) verifyExistingManagedSQLBeforeOpen(ctx context.Context, core *que
 		logManagedNodeOpenFailure(n.managedStartup != nil && isManagedAppendOnlyProtocol(n.managedStartup.Identity.ApplicationProtocol), openStage, resultErr)
 	}()
 	dbPath := filepath.Join(n.config.DataDir, "sqlite.db")
+	openStage = "adoption_sql_restore_state"
 	if err := materializer.ValidateCleanRestoreState(dbPath); err != nil {
 		return fmt.Errorf("managed materializer has an interrupted restore; preserve it: %w", err)
 	}
+	openStage = "adoption_sql_actual_inspect"
 	actual, appliedTip, err := n.inspectApplicationFile(ctx, dbPath)
 	if err != nil {
 		return fmt.Errorf("inspect existing managed SQL before startup: %w", err)
 	}
 	floor := core.CompactionFloor()
+	openStage = "adoption_sql_applied_below_floor"
 	if quepaxa.Slot(appliedTip) < floor {
 		return fmt.Errorf("managed SQLite tip %d is below verified checkpoint base %d; preserve existing data", appliedTip, floor)
 	}
+	openStage = "adoption_sql_applied_above_tip"
 	if appliedTip > uint64(core.Tip()) {
 		return fmt.Errorf("managed SQLite tip %d is ahead of certified WAL tip %d; preserve existing data", appliedTip, core.Tip())
 	}
+	openStage = "adoption_sql_base_binding"
 	if adoption.BaseSeal != nil {
 		base, root, ok := core.RecoveryRoot()
 		prefix, prefixOK := core.PrefixHash(adoption.BaseSeal.Index)
@@ -1450,8 +1456,10 @@ func (n *Node) verifyExistingManagedSQLBeforeOpen(ctx context.Context, core *que
 			return fmt.Errorf("managed SQLite verification base differs from adopted WAL")
 		}
 	} else if floor != 0 {
+		openStage = "adoption_sql_base_missing"
 		return fmt.Errorf("managed SQLite verification has no checkpoint for WAL floor %d", floor)
 	}
+	openStage = "adoption_sql_adopted_prefix"
 	if quepaxa.Slot(appliedTip) > adoption.Tip {
 		adoptedPrefix, ok := core.PrefixHash(adoption.Tip)
 		if core.Tip() < adoption.Tip || !ok || adoptedPrefix != adoption.PrefixHash {
@@ -1459,52 +1467,64 @@ func (n *Node) verifyExistingManagedSQLBeforeOpen(ctx context.Context, core *que
 		}
 	}
 
+	openStage = "adoption_sql_bucket_open"
 	bucket, err := n.newManagedStartupBucket(ctx)
 	if err != nil {
 		return err
 	}
-	defer func() { resultErr = errors.Join(resultErr, bucket.Close()) }()
+	defer func() {
+		resultErr = errors.Join(resultErr, logManagedNodeOpenFailure(n.managedStartup != nil && isManagedAppendOnlyProtocol(n.managedStartup.Identity.ApplicationProtocol), "adoption_sql_bucket_close", bucket.Close()))
+	}()
+	openStage = "adoption_sql_temp_create"
 	tmp, err := os.MkdirTemp(n.config.DataDir, ".rhiza-managed-sql-state-verify-*")
 	if err != nil {
 		return err
 	}
 	defer func() {
 		if err := os.RemoveAll(tmp); err != nil {
-			resultErr = errors.Join(resultErr, fmt.Errorf("remove managed SQL verification directory: %w", err))
+			resultErr = errors.Join(resultErr, logManagedNodeOpenFailure(n.managedStartup != nil && isManagedAppendOnlyProtocol(n.managedStartup.Identity.ApplicationProtocol), "adoption_sql_temp_remove", fmt.Errorf("remove managed SQL verification directory: %w", err)))
 		}
 	}()
 	var checkpointFiles []materializer.CheckpointFile
 	if adoption.BaseSeal != nil {
 		clusterPrefix := path.Join(n.config.ObjStorePrefix, string(n.config.ClusterID))
 		cacheDir := filepath.Join(tmp, "checkpoint-cache")
+		openStage = "adoption_sql_cache_create"
 		if err := os.Mkdir(cacheDir, 0o700); err != nil {
 			return err
 		}
+		openStage = "adoption_sql_reader_open"
 		manager, err := checkpoint.NewManagerForPolicy(bucket, clusterPrefix, cacheDir, n.materializationPolicy(), 1)
 		if err != nil {
 			return err
 		}
+		openStage = "adoption_sql_root_open"
 		root, err := manager.OpenRoot(ctx, uint64(adoption.BaseSeal.Index), adoption.BaseSeal.RootHash)
 		if err != nil || root.Hash != adoption.BaseSeal.StateHash {
 			if err == nil {
+				openStage = "adoption_sql_root_state_hash"
 				err = fmt.Errorf("checkpoint state hash differs from adopted seal")
 			}
 			return fmt.Errorf("verify adopted SQL checkpoint: %w", err)
 		}
 		checkpointDir := filepath.Join(tmp, "checkpoint")
+		openStage = "adoption_sql_checkpoint_dir_create"
 		if err := os.Mkdir(checkpointDir, 0o700); err != nil {
 			return err
 		}
+		openStage = "adoption_sql_checkpoint_download"
 		files, err := manager.DownloadRootFiles(ctx, uint64(adoption.BaseSeal.Index), adoption.BaseSeal.RootHash, checkpointDir)
 		if err != nil {
 			return fmt.Errorf("download adopted SQL checkpoint: %w", err)
 		}
 		checkpointFiles = checkpointMaterializerFiles(files)
 	}
+	openStage = "adoption_sql_certified_suffix"
 	suffix, err := certifiedSuffixThrough(core, floor+1, quepaxa.Slot(appliedTip))
 	if err != nil {
 		return fmt.Errorf("verify certified SQL prefix at applied tip %d: %w", appliedTip, err)
 	}
+	openStage = "adoption_sql_reconstruct"
 	return n.compareManagedFileAtTip(ctx, actual, appliedTip, checkpointFiles, suffix, filepath.Join(tmp, "expected.db"))
 }
 
@@ -1575,24 +1595,31 @@ func (n *Node) compareManagedFileAtTip(ctx context.Context, actual [32]byte, app
 	defer func() {
 		logManagedNodeOpenFailure(n.managedStartup != nil && isManagedAppendOnlyProtocol(n.managedStartup.Identity.ApplicationProtocol), openStage, resultErr)
 	}()
+	openStage = "adoption_sql_expected_open"
 	expected, err := n.openMaterializer(expectedPath, 4)
 	if err != nil {
 		return fmt.Errorf("open isolated managed SQL verifier: %w", err)
 	}
-	defer func() { resultErr = errors.Join(resultErr, expected.Close()) }()
+	defer func() {
+		resultErr = errors.Join(resultErr, logManagedNodeOpenFailure(n.managedStartup != nil && isManagedAppendOnlyProtocol(n.managedStartup.Identity.ApplicationProtocol), "adoption_sql_expected_close", expected.Close()))
+	}()
 	if len(checkpointFiles) != 0 {
+		openStage = "adoption_sql_checkpoint_restore"
 		if err := expected.RestoreCheckpoint(ctx, checkpointFiles); err != nil {
 			return fmt.Errorf("restore verified SQL checkpoint: %w", err)
 		}
 	}
 	if len(suffix) != 0 {
+		openStage = "adoption_sql_suffix_apply"
 		if err := expected.ApplyBatch(ctx, suffix); err != nil {
 			return fmt.Errorf("apply certified SQL prefix: %w", err)
 		}
 	}
+	openStage = "adoption_sql_tip_mismatch"
 	if expected.Tip() != appliedTip {
 		return fmt.Errorf("reconstructed SQL tip %d differs from actual applied tip %d", expected.Tip(), appliedTip)
 	}
+	openStage = "adoption_sql_expected_inspect"
 	want, _, err := n.inspectApplicationState(ctx, expected)
 	if err != nil {
 		return fmt.Errorf("inspect reconstructed managed SQL: %w", err)

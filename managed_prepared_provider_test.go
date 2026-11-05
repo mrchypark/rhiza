@@ -241,8 +241,18 @@ func TestEmbeddedObjectStorageManagedPreparedCheckpointAdoption(t *testing.T) {
 	}
 	sources[0] = nil
 	suffix, err := sources[1].ExecuteManagedSQL(ctx, network.ExecuteRequest{RequestID: "managed-provider-suffix", SQL: "INSERT INTO managed_prepared_rows VALUES (8)"})
-	if err != nil || suffix.Status != types.MutationCommitted || !suffix.Applied || suffix.Slot <= uint64(checkpointBase) {
-		t.Fatalf("suffix lacks an applied ACK strictly after captured checkpoint: %+v %v", suffix, err)
+	if err != nil || suffix.Status != types.MutationCommitted || suffix.Slot <= uint64(checkpointBase) {
+		t.Fatalf("suffix lacks a committed ACK strictly after captured checkpoint: %+v %v", suffix, err)
+	}
+	// SQL receipts do not set the KV/Graph Applied flag. Prove application
+	// through the public read's same-SQLite-snapshot applied slot and rows.
+	applied, err := sources[1].QueryManagedSQL(ctx, network.QueryRequest{SQL: "SELECT CAST(id AS TEXT) FROM managed_prepared_rows ORDER BY id", Consistency: "linearizable"})
+	if err != nil || applied.AppliedSlot < suffix.Slot || len(applied.Rows) != 2 || len(applied.Rows[0]) != 1 || len(applied.Rows[1]) != 1 || applied.Rows[0][0] != "7" || applied.Rows[1][0] != "8" {
+		t.Fatalf("public SQL snapshot does not cover the exact ACK suffix: %+v %v", applied, err)
+	}
+	status, err := sources[1].RequestStatusManaged(ctx, network.RequestStatusRequest{Kind: "sql", RequestID: "managed-provider-suffix"})
+	if err != nil || status.Receipt == nil || *status.Receipt != suffix.MutationReceipt {
+		t.Fatalf("public SQL status changed the suffix ACK receipt: %+v %v", status, err)
 	}
 	lastSuccessfulBase, lastSuccessfulTip := view.Base(), view.Tip()
 	for {
