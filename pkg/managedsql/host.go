@@ -15,6 +15,7 @@ import (
 	"slices"
 	"sync"
 
+	"github.com/mrchypark/rhiza/internal/localtesthooks"
 	"github.com/mrchypark/rhiza/internal/types"
 	"github.com/mrchypark/rhiza/pkg/network"
 	"github.com/mrchypark/rhiza/pkg/node"
@@ -357,7 +358,7 @@ func (h *Host) logInitialAuthorityFailure(leaf string, err error) error {
 	return err
 }
 
-func (h *Host) ValidateManagedAdmission(ctx context.Context, i node.ManagedStartupIdentity, _ node.ManagedRuntimeState) error {
+func (h *Host) ValidateManagedAdmission(ctx context.Context, i node.ManagedStartupIdentity, state node.ManagedRuntimeState) error {
 	if i != h.identity {
 		return h.logInitialAuthorityFailure("identity", fmt.Errorf("execution identity changed"))
 	}
@@ -368,7 +369,12 @@ func (h *Host) ValidateManagedAdmission(ctx context.Context, i node.ManagedStart
 	if _, pending := a.Pending(); pending || a.SQLReservationsClosed() {
 		return h.logInitialAuthorityFailure("pending_closed", fmt.Errorf("initial admission has pending control or closed repair"))
 	}
-	_, err = h.inspectEvidence(ctx, false, false)
+	localtesthooks.Hit("managed-host:initial-authority:before-evidence")
+	if h.internalRequests() {
+		err = h.node.ValidateManagedInitialAdmission(ctx, i, state)
+	} else {
+		_, err = h.inspectEvidence(ctx, false, false)
+	}
 	return h.logInitialAuthorityFailure("evidence", err)
 }
 

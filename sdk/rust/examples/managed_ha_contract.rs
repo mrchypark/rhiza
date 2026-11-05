@@ -280,6 +280,26 @@ fn graph_state(db: &ManagedDb) -> Result<serde_json::Value, String> {
     )
 }
 
+fn wait_managed_ready<E>(
+    deadline: Instant,
+    mut ready: impl FnMut(Duration) -> Result<bool, E>,
+) -> Result<bool, E> {
+    loop {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Ok(false);
+        }
+        if ready(remaining)? {
+            return Ok(true);
+        }
+        thread::sleep(
+            deadline
+                .saturating_duration_since(Instant::now())
+                .min(Duration::from_millis(250)),
+        );
+    }
+}
+
 fn run_graph(initial: bool) -> Result<(), String> {
     let uid = env::var("POD_UID").map_err(|_| "pod_identity_missing")?;
     let producer = env::var("RHIZA_RUST_PRODUCER_UID").map_err(|_| "producer_identity_missing")?;
@@ -287,8 +307,8 @@ fn run_graph(initial: bool) -> Result<(), String> {
         return Err("graph_producer_identity_mismatch".into());
     }
     let mut db = ManagedDb::open_from_env().map_err(|e| format!("graph_open {}", e))?;
-    if !db
-        .ready_with_timeout(Duration::from_secs(90))
+    let deadline = Instant::now() + Duration::from_secs(90);
+    if !wait_managed_ready(deadline, |remaining| db.ready_with_timeout(remaining))
         .map_err(|e| format!("graph_ready {}", e))?
     {
         return Err("graph_not_ready".into());
@@ -1006,6 +1026,40 @@ fn execute_committed_or_resolve(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn graph_readiness_waits_for_false_then_true() {
+        let mut calls = 0;
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let ready = wait_managed_ready(deadline, |remaining| {
+            assert!(!remaining.is_zero());
+            calls += 1;
+            Ok::<bool, &str>(calls == 2)
+        });
+        assert_eq!(ready, Ok(true));
+        assert_eq!(calls, 2);
+    }
+
+    #[test]
+    fn graph_readiness_error_is_immediate() {
+        let mut calls = 0;
+        let ready = wait_managed_ready(Instant::now() + Duration::from_secs(2), |_| {
+            calls += 1;
+            Err::<bool, _>("original-error")
+        });
+        assert_eq!(ready, Err("original-error"));
+        assert_eq!(calls, 1);
+    }
+
+    #[test]
+    fn graph_readiness_exhausted_budget_does_not_call() {
+        for deadline in [Instant::now(), Instant::now() - Duration::from_secs(1)] {
+            let ready = wait_managed_ready(deadline, |_| -> Result<bool, &str> {
+                panic!("readiness called after deadline")
+            });
+            assert_eq!(ready, Ok(false));
+        }
+    }
 
     #[test]
     fn graph_step_diagnostic_is_fixed_and_context_is_explicit() {

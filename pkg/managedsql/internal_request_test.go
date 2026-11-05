@@ -505,6 +505,10 @@ func TestInternalRequestFirstExecuteWithoutPrivateAdmissionOrReady(t *testing.T)
 // No manual error hint is installed here: the actual KVMutate call must return
 // CommitUnknown after Apply while the real SDK archive request is held.
 func TestInternalRequestActualPostApplyCancellationRecoversExactOriginal(t *testing.T) {
+	testInternalRequestActualPostApplyCancellationRecoversExactOriginal(t, nil)
+}
+
+func testInternalRequestActualPostApplyCancellationRecoversExactOriginal(t *testing.T, beforeReopenedRecovery func(context.Context, *Host, Config, Config, materializer.RequestOriginal) (context.Context, func())) {
 	var outage, armed atomic.Bool
 	var attempts atomic.Int64
 	entered := make(chan string, 8)
@@ -616,6 +620,9 @@ func TestInternalRequestActualPostApplyCancellationRecoversExactOriginal(t *test
 	if after := hostApplicationDecisionCount(t, ctx, configs[0], sqlpolicy.ManagedRequestMaterializationPolicy); after != before {
 		t.Fatal("exact recovery submitted another application command")
 	}
+	if beforeReopenedRecovery != nil {
+		waitSQLCertifiedApplication(t, ctx, hosts[1], y.Slot)
+	}
 	if err := hosts[0].Close(); err != nil {
 		t.Fatal(err)
 	}
@@ -633,7 +640,14 @@ func TestInternalRequestActualPostApplyCancellationRecoversExactOriginal(t *test
 	if _, err := reopened.RecoverPendingDetailed(ctx); !errors.Is(err, network.ErrCommitUnknown) {
 		t.Fatal("new handle invented a no-arg target", err)
 	}
+	var verifyRecovery func()
+	if beforeReopenedRecovery != nil {
+		ctx, verifyRecovery = beforeReopenedRecovery(ctx, reopened, configs[0], configs[1], beforeOriginal)
+	}
 	recovered, err = reopened.RecoverRequest(ctx, network.RequestStatusRequest{Kind: "kv", RequestID: id})
+	if verifyRecovery != nil {
+		verifyRecovery()
+	}
 	if err != nil || recovered.KV == nil || recovered.KV.Slot != receipt.Slot || !recovered.KV.Applied {
 		t.Fatalf("new handle exact original recovery: %+v %v", recovered, err)
 	}

@@ -17,6 +17,8 @@ import (
 type managedCurrentReadBucket struct {
 	objstore.Bucket
 	attrs                                 int
+	gets, uploads, deletes                int
+	versions                              []objstore.ObjectAttributes
 	beforeGet                             func() error
 	attrFailure                           int
 	getFailure, bodyFailure, closeFailure error
@@ -24,13 +26,19 @@ type managedCurrentReadBucket struct {
 
 func (b *managedCurrentReadBucket) Attributes(ctx context.Context, name string) (objstore.ObjectAttributes, error) {
 	b.attrs++
+	if err := ctx.Err(); err != nil {
+		return objstore.ObjectAttributes{}, err
+	}
 	if b.attrs == b.attrFailure {
 		return objstore.ObjectAttributes{}, errManagedCurrentRead
 	}
-	return b.Bucket.Attributes(ctx, name)
+	attr, err := b.Bucket.Attributes(ctx, name)
+	b.versions = append(b.versions, attr)
+	return attr, err
 }
 
 func (b *managedCurrentReadBucket) Get(ctx context.Context, name string) (io.ReadCloser, error) {
+	b.gets++
 	if b.beforeGet != nil {
 		if err := b.beforeGet(); err != nil {
 			return nil, err
@@ -44,6 +52,15 @@ func (b *managedCurrentReadBucket) Get(ctx context.Context, name string) (io.Rea
 		return nil, err
 	}
 	return &managedCurrentReadCloser{ReadCloser: r, readErr: b.bodyFailure, closeErr: b.closeFailure}, nil
+}
+
+func (b *managedCurrentReadBucket) Upload(ctx context.Context, name string, r io.Reader, opts ...objstore.ObjectUploadOption) error {
+	b.uploads++
+	return b.Bucket.Upload(ctx, name, r, opts...)
+}
+func (b *managedCurrentReadBucket) Delete(ctx context.Context, name string) error {
+	b.deletes++
+	return b.Bucket.Delete(ctx, name)
 }
 
 type managedCurrentReadCloser struct {
@@ -108,10 +125,10 @@ func TestManagedCurrentReadConcurrentConditionalPublisher(t *testing.T) {
 	ctx := context.Background()
 	m, b, prior := managedCurrentReadFixture(t)
 	next := prior
-	next.SealDecisionSlot++
 	next.SealDecisionHash = sha256.Sum256([]byte("next-seal"))
 	published := false
 	b.beforeGet = func() error {
+		next.SealDecisionSlot++
 		attr, err := b.Bucket.Attributes(ctx, m.key("checkpoint/CURRENT"))
 		if err != nil {
 			return err
@@ -165,6 +182,87 @@ func TestManagedCurrentReadPreservesIOAndValidationRefusals(t *testing.T) {
 			if err == nil || exists || got != (ManagedAppendOnlyLocator{}) || wantIO && !errors.Is(err, errManagedCurrentRead) {
 				t.Fatalf("read failure accepted or identity lost: mode=%s exists=%t err=%v", mode, exists, err)
 			}
+			if b.gets > 1 || b.attrs > 2 || b.uploads != 0 || b.deletes != 0 {
+				t.Fatal("terminal read failure retried or mutated storage")
+			}
 		})
+	}
+}
+
+func TestManagedCurrentReadCapturesOnceChangedPublisher(t *testing.T) {
+	ctx := context.Background()
+	m, b, prior := managedCurrentReadFixture(t)
+	next := prior
+	next.SealDecisionSlot++
+	next.SealDecisionHash = sha256.Sum256([]byte("once-published"))
+	publishes := 0
+	b.beforeGet = func() error {
+		if b.gets != 1 {
+			return nil
+		}
+		attr, err := b.Bucket.Attributes(ctx, m.key("checkpoint/CURRENT"))
+		if err != nil {
+			return err
+		}
+		data, err := json.Marshal(next)
+		if err != nil {
+			return err
+		}
+		if err := b.Bucket.Upload(ctx, m.key("checkpoint/CURRENT"), bytes.NewReader(data), objstore.WithIfMatch(attr.Version)); err != nil {
+			return err
+		}
+		publishes++
+		return nil
+	}
+	got, exists, err := m.LoadManagedAppendOnlyLocator(ctx, sqlpolicy.ManagedGraphRequestMaterializationPolicy)
+	if err != nil || !exists || got != next {
+		t.Fatalf("one concurrent publication prevented a fresh consistent capture: exists=%t err=%v", exists, err)
+	}
+	if publishes != 1 || b.gets != 2 || b.attrs != 4 || b.uploads != 0 || b.deletes != 0 {
+		t.Fatal("capture exceeded its exact read-only budget")
+	}
+	if len(b.versions) != 4 || b.versions[2].Version == nil || b.versions[3].Version == nil || *b.versions[2].Version != *b.versions[3].Version || *b.versions[0].Version == *b.versions[3].Version {
+		t.Fatal("accepted body lacks its matching version interval")
+	}
+	data, err := json.Marshal(got)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := b.Bucket.Upload(ctx, m.key("checkpoint/CURRENT"), bytes.NewReader(data), objstore.WithIfMatch(b.versions[0].Version)); !b.Bucket.IsConditionNotMetErr(err) {
+		t.Fatal("stale capture version authorized CAS", err)
+	}
+	if err := b.Bucket.Upload(ctx, m.key("checkpoint/CURRENT"), bytes.NewReader(data), objstore.WithIfMatch(b.versions[3].Version)); err != nil {
+		t.Fatal("matching accepted capture version could not authorize CAS", err)
+	}
+}
+
+func TestManagedCurrentReadContinuousChangeStopsAtTwoCaptures(t *testing.T) {
+	ctx := context.Background()
+	m, b, next := managedCurrentReadFixture(t)
+	b.beforeGet = func() error {
+		next.SealDecisionSlot++
+		attr, err := b.Bucket.Attributes(ctx, m.key("checkpoint/CURRENT"))
+		if err != nil {
+			return err
+		}
+		data, err := json.Marshal(next)
+		if err != nil {
+			return err
+		}
+		return b.Bucket.Upload(ctx, m.key("checkpoint/CURRENT"), bytes.NewReader(data), objstore.WithIfMatch(attr.Version))
+	}
+	got, exists, err := m.LoadManagedAppendOnlyLocator(ctx, sqlpolicy.ManagedGraphRequestMaterializationPolicy)
+	if err == nil || exists || got != (ManagedAppendOnlyLocator{}) || !strings.Contains(err.Error(), "CURRENT changed during read") || b.gets != 2 || b.attrs != 4 || b.uploads != 0 || b.deletes != 0 {
+		t.Fatalf("continuous publication was accepted or exceeded two captures: gets=%d attrs=%d err=%v", b.gets, b.attrs, err)
+	}
+}
+
+func TestManagedCurrentReadCanceledContextDoesNotCapture(t *testing.T) {
+	m, b, _ := managedCurrentReadFixture(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	got, exists, err := m.LoadManagedAppendOnlyLocator(ctx, sqlpolicy.ManagedGraphRequestMaterializationPolicy)
+	if !errors.Is(err, context.Canceled) || exists || got != (ManagedAppendOnlyLocator{}) || b.gets != 0 || b.attrs > 1 || b.uploads != 0 || b.deletes != 0 {
+		t.Fatal("canceled read retried, mutated, or returned locator", err)
 	}
 }

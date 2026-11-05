@@ -222,6 +222,28 @@ func logManagedCurrentReadFailure(stage string, err error) error {
 // LoadManagedAppendOnlyLocator reads the new profile's CURRENT hint. The
 // expected policy is explicit so policy 9/10 objects cannot cross profiles.
 func (m *Manager) LoadManagedAppendOnlyLocator(ctx context.Context, policy sqlpolicy.MaterializationPolicy) (ManagedAppendOnlyLocator, bool, error) {
+	for attempt := 0; ; attempt++ {
+		if err := ctx.Err(); err != nil {
+			return ManagedAppendOnlyLocator{}, false, logManagedCurrentReadFailure("attributes_before", err)
+		}
+		locator, exists, err := m.loadManagedAppendOnlyLocatorOnce(ctx, policy)
+		if err != errManagedCurrentVersionChanged {
+			return locator, exists, err
+		}
+		if contextErr := ctx.Err(); contextErr != nil {
+			return ManagedAppendOnlyLocator{}, false, logManagedCurrentReadFailure("version_changed", contextErr)
+		}
+		// A concurrent publisher can invalidate a capture, not its validation.
+		// Re-capture once in the same budget; never mix either attempt's bytes.
+		if attempt == 1 {
+			return ManagedAppendOnlyLocator{}, false, logManagedCurrentReadFailure("version_changed", err)
+		}
+	}
+}
+
+var errManagedCurrentVersionChanged = errors.New("managed append-only CURRENT changed during read")
+
+func (m *Manager) loadManagedAppendOnlyLocatorOnce(ctx context.Context, policy sqlpolicy.MaterializationPolicy) (ManagedAppendOnlyLocator, bool, error) {
 	if !m.appendOnly || m.expectedPolicy != policy ||
 		policy != sqlpolicy.ManagedRequestMaterializationPolicy && policy != sqlpolicy.ManagedGraphRequestMaterializationPolicy {
 		return ManagedAppendOnlyLocator{}, false, logManagedCurrentReadFailure("policy", sqlpolicy.ErrIncompatible)
@@ -251,12 +273,11 @@ func (m *Manager) LoadManagedAppendOnlyLocator(ctx context.Context, policy sqlpo
 		return ManagedAppendOnlyLocator{}, false, logManagedCurrentReadFailure(stage, errors.Join(readErr, closeErr, fmt.Errorf("invalid managed append-only CURRENT")))
 	}
 	after, err := m.bucket.Attributes(ctx, key)
-	if err != nil || after.Version == nil || *after.Version != *attr.Version {
-		stage := "version_changed"
-		if err != nil || after.Version == nil {
-			stage = "attributes_after"
-		}
-		return ManagedAppendOnlyLocator{}, false, logManagedCurrentReadFailure(stage, errors.Join(err, fmt.Errorf("managed append-only CURRENT changed during read")))
+	if err != nil || after.Version == nil {
+		return ManagedAppendOnlyLocator{}, false, logManagedCurrentReadFailure("attributes_after", errors.Join(err, fmt.Errorf("managed append-only CURRENT changed during read")))
+	}
+	if *after.Version != *attr.Version {
+		return ManagedAppendOnlyLocator{}, false, errManagedCurrentVersionChanged
 	}
 	var locator ManagedAppendOnlyLocator
 	if err := decodePersistedJSON(data, &locator); err != nil {

@@ -16,6 +16,7 @@ import (
 	"github.com/mrchypark/rhiza/internal/types"
 	"github.com/mrchypark/rhiza/pkg/materializer"
 	"github.com/mrchypark/rhiza/pkg/network"
+	"github.com/mrchypark/rhiza/pkg/quepaxa"
 	"github.com/mrchypark/rhiza/pkg/recovery"
 	"github.com/thanos-io/objstore"
 )
@@ -375,7 +376,72 @@ func logManagedEvidenceRuntimeFailure(reason string, before, after ManagedRuntim
 	return err
 }
 
-func (n *Node) inspectManagedApplication(ctx context.Context, fresh, localRead bool) (digest [32]byte, empty bool, runtime ManagedRuntimeState, resultErr error) {
+type managedInitialAdmissionCut struct {
+	state   ManagedRuntimeState
+	prefix  [32]byte
+	floor   quepaxa.Slot
+	root    [32]byte
+	hasRoot bool
+}
+
+func (n *Node) initialAdmissionCutCurrent(cut managedInitialAdmissionCut, state ManagedRuntimeState) bool {
+	floor, root, hasRoot := n.core.RecoveryRoot()
+	prefix, ok := n.core.PrefixHash(quepaxa.Slot(cut.state.CertifiedTip))
+	if cut.state.CertifiedTip == 0 {
+		ok = cut.floor == 0 && !cut.hasRoot && cut.prefix == ([32]byte{})
+		prefix = [32]byte{}
+	}
+	return state.WALIdentity == cut.state.WALIdentity && state.ExistingRegisteredWAL == cut.state.ExistingRegisteredWAL &&
+		state.CertifiedTip == cut.state.CertifiedTip && state.AppliedTip == cut.state.AppliedTip &&
+		state.RecorderTip >= cut.state.RecorderTip && floor == cut.floor && root == cut.root && hasRoot == cut.hasRoot && ok && prefix == cut.prefix
+}
+
+// ValidateManagedInitialAdmission checks the caller's already-resolved initial
+// cut. It admits no operation and never treats a later recorder ISR as certified.
+func (n *Node) ValidateManagedInitialAdmission(ctx context.Context, identity ManagedStartupIdentity, state ManagedRuntimeState) error {
+	binding, ctx, release, err := n.borrowInternalApplication(ctx)
+	if err != nil {
+		return err
+	}
+	defer release()
+	if !isManagedAppendOnlyProtocol(n.managedApplicationProtocol()) || binding.identity != identity || state.WALIdentity == "" || state.AppliedTip != state.CertifiedTip || state.RecorderTip > state.CertifiedTip {
+		return fmt.Errorf("initial admission lacks its resolved runtime cut")
+	}
+	cut := managedInitialAdmissionCut{state: state}
+	cut.floor, cut.root, cut.hasRoot = n.core.RecoveryRoot()
+	var ok bool
+	cut.prefix, ok = n.core.PrefixHash(quepaxa.Slot(state.CertifiedTip))
+	if state.CertifiedTip == 0 {
+		ok = cut.floor == 0 && !cut.hasRoot
+		cut.prefix = [32]byte{}
+	}
+	if !ok || uint64(cut.floor) > state.CertifiedTip {
+		return fmt.Errorf("initial admission certified prefix is unavailable")
+	}
+	_, _, runtime, err := n.inspectManagedApplicationAtCut(ctx, false, false, &cut)
+	if err != nil {
+		return err
+	}
+	if n.materializationPolicy() == sqlpolicy.ManagedGraphRequestMaterializationPolicy {
+		if _, err := n.material.ManagedGraphHistory(ctx); err != nil {
+			return errors.Join(fmt.Errorf("Graph lineage changed or is not fresh"), err)
+		}
+	}
+	current, err := n.checkInternalApplicationRuntime(ctx)
+	if err != nil {
+		return err
+	}
+	if runtime.WALIdentity != state.WALIdentity || !n.initialAdmissionCutCurrent(cut, current) || binding != n.internalApplication.Load() || binding.identity != identity || binding.lifetime == nil || binding.lifetime.Err() != nil || !n.core.IsVoter() {
+		return fmt.Errorf("initial admission runtime cut changed")
+	}
+	return ctx.Err()
+}
+
+func (n *Node) inspectManagedApplication(ctx context.Context, fresh, localRead bool) ([32]byte, bool, ManagedRuntimeState, error) {
+	return n.inspectManagedApplicationAtCut(ctx, fresh, localRead, nil)
+}
+
+func (n *Node) inspectManagedApplicationAtCut(ctx context.Context, fresh, localRead bool, initial *managedInitialAdmissionCut) (digest [32]byte, empty bool, runtime ManagedRuntimeState, resultErr error) {
 	if n.internalApplicationProfile() {
 		_, scoped, release, err := n.borrowInternalApplication(ctx)
 		if err != nil {
@@ -419,7 +485,11 @@ func (n *Node) inspectManagedApplication(ctx context.Context, fresh, localRead b
 			return fail(errors.Join(fmt.Errorf("managed host checkpoint adoption no longer matches actual WAL"), membershipErr))
 		}
 	}
-	if before.WALIdentity == "" || before.AppliedTip > before.CertifiedTip || !localRead && (before.RecorderTip > before.CertifiedTip || before.AppliedTip != before.CertifiedTip) {
+	resolved := before.WALIdentity != "" && before.AppliedTip <= before.CertifiedTip && (localRead || before.RecorderTip <= before.CertifiedTip && before.AppliedTip == before.CertifiedTip)
+	if initial != nil && !fresh && !localRead {
+		resolved = n.initialAdmissionCutCurrent(*initial, before)
+	}
+	if !resolved {
 		return fail(logManagedEvidenceRuntimeFailure("unresolved_history", before, ManagedRuntimeState{}, fmt.Errorf("managed host requires registered, resolved history")))
 	}
 	from := floor + 1
@@ -478,7 +548,11 @@ func (n *Node) inspectManagedApplication(ctx context.Context, fresh, localRead b
 	if err != nil {
 		return fail(err)
 	}
-	if before != after {
+	unchanged := before == after
+	if initial != nil && !fresh && !localRead {
+		unchanged = n.initialAdmissionCutCurrent(*initial, before) && n.initialAdmissionCutCurrent(*initial, after)
+	}
+	if !unchanged {
 		return fail(logManagedEvidenceRuntimeFailure("snapshot_changed", before, after, fmt.Errorf("history changed during application inspection")))
 	}
 	return digest, empty, before, nil
