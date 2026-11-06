@@ -20,6 +20,18 @@ wait_benchmark_child() {
 	return "$status"
 }
 
+wait_fault_child() {
+	local status=0
+	wait "$failed_pid" || status=$?
+	fault_exit_status=$status
+	failed_pid= # never signal an explicitly waited handle during failure cleanup
+	if [[ $status != 137 ]]; then
+		printf 'fault child exit not qualified: observed=%s expected=137\n' "$status" >&2
+		[[ $status != 0 ]] || return 1
+		return "$status"
+	fi
+}
+
 verify_benchmark_rows() {
 	# INTEGER PRIMARY KEY uniqueness plus N total and N in [0,N) proves the set.
 	jq -e --argjson requests "$1" '.rows == [[$requests, $requests]]' >/dev/null
@@ -222,6 +234,7 @@ fi
 	-n "$requests" -c "$concurrency" -commit-unknown-retries 3 -verify-insert-receipt "${control_args[@]+${control_args[@]}}" >"$result_file" &
 bench_pid=$!
 overlap='null'
+fault_exit_status=null
 if [[ $failed_node != none ]]; then
 	sleep "$fault_after"
 	# Bounded control startup only; never wait/retry for an in-flight request.
@@ -243,13 +256,22 @@ if [[ $failed_node != none ]]; then
 	jq -e '.attempted == true and .signal_succeeded == true' <<<"$overlap" >/dev/null
 	printf 'overlap=%s\n' "$overlap" >> "$run_dir/fault-metadata.txt"
 	printf 'after=%s\n' "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" >> "$run_dir/fault-metadata.txt"
-	wait "$failed_pid" 2>/dev/null || true
+	wait_status=0
+	wait_fault_child || wait_status=$?
+	printf 'fault_exit_status=%s\n' "$fault_exit_status" >> "$run_dir/fault-metadata.txt"
 	rm -- "$run_dir/node-$failed_index.pid"
+	if [[ $wait_status != 0 ]]; then
+		jq -nc --argjson status "$fault_exit_status" --argjson overlap "$overlap" \
+			'{qualification:"not_qualified",reason:"fault_child_exit_status",fault_exit_status:$status,fault_overlap:$overlap}' | tee "$output_file"
+		exit "$wait_status"
+	fi
 fi
 wait_benchmark_child
 result=$(<"$result_file")
 # Preserve the client result even when the subsequent correctness gate fails.
 tee "$output_file" <<<"$result" >/dev/null
+result_with_exit=$(jq --argjson status "$fault_exit_status" '. + {fault_exit_status:$status}' <<<"$result")
+tee "$output_file" <<<"$result_with_exit" >/dev/null
 if [[ $failed_node != none ]]; then
 	overlap=$(jq -c '.fault_window' <<<"$result")
 	if ! jq -e '.attempted == true and .signal_succeeded == true and .overlap == true and .witnesses > 0' <<<"$overlap" >/dev/null; then
@@ -272,7 +294,7 @@ for log in "$run_dir"/node-*.log; do
 	log_failures=$(grep -Ei 'error|failed|timeout' "$log" | grep -Eivc 'failed to sufficiently increase receive buffer size' || true)
 	runtime_failure_lines=$((runtime_failure_lines + log_failures))
 done
-jq -nc --argjson result "$result" --argjson count "$count" --argjson overlap "$overlap" --arg client_revision "$client_revision" --arg client_sha256 "$client_sha256" --argjson concurrency "$concurrency" --argjson runtime_failure_lines "$runtime_failure_lines" --argjson max_fault_latency_ms "$max_fault_latency_ms" --argjson object_delta "$object_delta" --argjson object_metric_nodes "$object_metric_nodes" --arg failed_node "$failed_node" --arg target_node "$target_node" --arg durability "$durability" --arg fault_after "$fault_after" \
-	'{transport:"HTTP client + three QUIC voters",client_revision:$client_revision,client_sha256:$client_sha256,receipt_oracle:"sql-insert-id-v1",fault_overlap:$overlap,fault_instrumentation:(if $failed_node == "none" then "disabled" else "pidfd-single-coordinator-monotonic-interval-v2" end),durability_mode:$durability,ack_contract:(if $durability == "before-ack" then "quorum WAL sync and object-store durability before acknowledgement" else "quorum WAL sync; object-store publication async" end),failure_mode:(if $failed_node == "none" then "healthy" else "peer-sigkill-during-load" end),failed_node:$failed_node,target_node:$target_node,fault_after:(if $failed_node == "none" then null else $fault_after end),max_fault_latency_ms:(if $failed_node == "none" then null else $max_fault_latency_ms end),concurrency:$concurrency,object_metric_nodes:$object_metric_nodes,object_measurement:"after schema through final linearizable verification",object_store_delta:$object_delta,runtime_failure_lines:$runtime_failure_lines,result:$result,verification:$count}' \
+jq -nc --argjson result "$result" --argjson count "$count" --argjson overlap "$overlap" --argjson fault_exit_status "$fault_exit_status" --arg client_revision "$client_revision" --arg client_sha256 "$client_sha256" --argjson concurrency "$concurrency" --argjson runtime_failure_lines "$runtime_failure_lines" --argjson max_fault_latency_ms "$max_fault_latency_ms" --argjson object_delta "$object_delta" --argjson object_metric_nodes "$object_metric_nodes" --arg failed_node "$failed_node" --arg target_node "$target_node" --arg durability "$durability" --arg fault_after "$fault_after" \
+	'{transport:"HTTP client + three QUIC voters",client_revision:$client_revision,client_sha256:$client_sha256,receipt_oracle:"sql-insert-id-v1",fault_overlap:$overlap,fault_exit_status:$fault_exit_status,fault_instrumentation:(if $failed_node == "none" then "disabled" else "pidfd-single-coordinator-monotonic-interval-v2" end),durability_mode:$durability,ack_contract:(if $durability == "before-ack" then "quorum WAL sync and object-store durability before acknowledgement" else "quorum WAL sync; object-store publication async" end),failure_mode:(if $failed_node == "none" then "healthy" else "peer-sigkill-during-load" end),failed_node:$failed_node,target_node:$target_node,fault_after:(if $failed_node == "none" then null else $fault_after end),max_fault_latency_ms:(if $failed_node == "none" then null else $max_fault_latency_ms end),concurrency:$concurrency,object_metric_nodes:$object_metric_nodes,object_measurement:"after schema through final linearizable verification",object_store_delta:$object_delta,runtime_failure_lines:$runtime_failure_lines,result:$result,verification:$count}' \
 	| tee "$output_file"
 jq -e '.runtime_failure_lines == 0 and (.failed_node == "none" or .result.max_ms <= .max_fault_latency_ms)' "$output_file" >/dev/null

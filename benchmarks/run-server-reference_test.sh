@@ -29,6 +29,22 @@ status=0
 wait_benchmark_child || status=$?
 [[ $status == 19 && -z $bench_pid ]]
 
+# Exercise the actual shared wait helper, including a real non-child wait
+# error. Bash deliberately cannot distinguish explicit exit 137 from SIGKILL.
+for raw in 0 137 139; do
+	(exit "$raw") & failed_pid=$!
+	status=0
+	wait_fault_child 2>"$scratch/wait-$raw.err" || status=$?
+	[[ $fault_exit_status == "$raw" && -z $failed_pid ]]
+	if [[ $raw == 137 ]]; then [[ $status == 0 ]];
+	elif [[ $raw == 0 ]]; then [[ $status == 1 ]];
+	else [[ $status == "$raw" ]]; fi
+done
+failed_pid=$$
+status=0
+wait_fault_child 2>"$scratch/wait-error.err" || status=$?
+[[ $status == 127 && $fault_exit_status == 127 && -z $failed_pid ]]
+
 # A controlled fault command failure occurs while the exact owned client is
 # alive. EXIT cleanup must kill/wait that child and preserve the original 47.
 status=0
@@ -144,23 +160,40 @@ case ${1:-} in
 *) exec /bin/cat "$@" ;;
 esac
 MOCK
+cat > "$scratch/wait-env" <<'MOCK'
+# Simulate the three alternate visible statuses only after reaping the exact
+# mock target. The helper-only tests above exercise genuine wait statuses.
+wait() {
+ if [[ ${MOCK_MODE:-} == wait-* && ${1:-} == "$(cat "$MOCK_HOME/fault.pid")" ]]; then
+  builtin wait "$1" || true
+  case $MOCK_MODE in wait-normal) return 0 ;; wait-crash) return 139 ;; wait-error) return 127 ;; esac
+ fi
+ builtin wait "$@"
+}
+MOCK
 chmod +x "$scratch/bin/"* "$scratch/node" "$scratch/bench"
-for mode in normal shifted before-first after-last no-witness signal-failure; do
+for mode in normal shifted before-first after-last no-witness signal-failure wait-normal wait-crash wait-error; do
  mkdir "$scratch/$mode"
  # Each run's stand-ins and process evidence remain in its own scratch scope.
  cp "$scratch/node" "$scratch/bench" "$scratch/$mode/"
  fault=n0
  [[ $mode != shifted ]] || fault=none
  status=0
- MOCK_HOME="$scratch/$mode" MOCK_MODE="$mode" PATH="$scratch/bin:$PATH" TMPDIR="$scratch/$mode" \
+ BASH_ENV="$scratch/wait-env" MOCK_HOME="$scratch/$mode" MOCK_MODE="$mode" PATH="$scratch/bin:$PATH" TMPDIR="$scratch/$mode" \
  RHIZA_SERVER_BENCH_REQUESTS=4 RHIZA_SERVER_BENCH_CONCURRENCY=2 RHIZA_SERVER_BENCH_FAULT_AFTER=0 RHIZA_SERVER_BENCH_FAILED_NODE="$fault" \
  bash "$here/run-server-reference.sh" "$scratch/base-server" "$scratch/$mode/result.json" >"$scratch/$mode/stdout" 2>"$scratch/$mode/stderr" || status=$?
  if [[ $mode == normal ]]; then
   [[ $status == 0 ]]
-  jq -e '.fault_overlap.overlap == true and .receipt_oracle == "sql-insert-id-v1" and (.client_sha256 | length == 64)' "$scratch/$mode/result.json" >/dev/null
+  jq -e '.fault_overlap.overlap == true and .fault_exit_status == 137 and .receipt_oracle == "sql-insert-id-v1" and (.client_sha256 | length == 64)' "$scratch/$mode/result.json" >/dev/null
+  grep -qx 'fault_exit_status=137' "$scratch/$mode/result-fault-metadata.txt"
  else
   [[ $status != 0 ]]
-  if [[ $mode == signal-failure ]]; then [[ $status == 47 ]];
+  if [[ $mode == wait-* ]]; then
+   case $mode in wait-normal) raw=0; want=1 ;; wait-crash) raw=139; want=139 ;; wait-error) raw=127; want=127 ;; esac
+   [[ $status == "$want" ]]
+   grep -qx "fault_exit_status=$raw" "$scratch/$mode/result-fault-metadata.txt"
+   jq -e --argjson raw "$raw" '.qualification == "not_qualified" and .fault_exit_status == $raw' "$scratch/$mode/result.json" >/dev/null
+  elif [[ $mode == signal-failure ]]; then [[ $status == 47 ]];
   elif [[ $mode != shifted ]]; then grep -Eq 'fault (coordinator failed|interval not qualified)' "$scratch/$mode/stderr"; fi
  fi
  grep -q -- '-verify-insert-receipt' "$scratch/$mode/bench.args"
@@ -171,4 +204,4 @@ for mode in normal shifted before-first after-last no-witness signal-failure; do
   if kill -0 "$pid" 2>/dev/null; then printf 'mock owned process survived: %s\n' "$pid" >&2; exit 1; fi
  done < <(cat "$scratch/$mode/nodes" "$scratch/$mode/bench.pid")
 done
-printf 'server oracle helpers + six complete mocked runner cases PASS\n'
+printf 'server oracle helpers + nine complete mocked runner cases PASS\n'

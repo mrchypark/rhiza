@@ -77,6 +77,12 @@ The nonce-protected loopback `/fault` endpoint accepts no body or target PID,
 makes one `PidfdSendSignal(SIGKILL)` attempt, and records the syscall bracket in
 the same monotonic clock as request sent/finished timestamps. No numeric-PID
 signal fallback is permitted. Unsupported kernels/platforms fail closed.
+The parent must also observe Bash child wait status **137**; other statuses,
+including normal exit 0, fail qualification with the raw status preserved in
+permanent fault metadata and the final JSON (`fault_exit_status`). This is a
+Bash-status check, not an exact kernel wait-cause attestation: explicit `exit
+137` and termination by SIGKILL can both produce 137. The waited PID handle and
+its pidfile are cleared before any failure cleanup can signal it again.
 
 Only current logical requests and one concurrency-bounded fault snapshot are
 retained. After requests complete, qualification requires a witness with
