@@ -2,6 +2,22 @@
 # Actual owned Kind bootstrap/recovery with two scoped Chaos Mesh kill actions.
 set -eu
 cd "$(CDPATH='' cd -- "$(dirname -- "$0")/.." && pwd)"
+managed_install_mode_valid() {
+  case "$1" in
+    false) return 0 ;;
+    true) [ "$2" = internal ] || { echo 'published install mode requires internal fixture' >&2; return 1; } ;;
+    *) echo 'invalid published install mode' >&2; return 1 ;;
+  esac
+}
+if [ "${1-}" = --install-mode-self-test ]; then
+  managed_install_mode_valid true internal || exit 1
+  managed_install_mode_valid false graph || exit 1
+  for invalid_case in graph graph-append-only internal-append-only legacy ''; do
+    if managed_install_mode_valid true "$invalid_case" 2>/dev/null; then exit 1; fi
+  done
+  if managed_install_mode_valid invalid internal 2>/dev/null; then exit 1; fi
+  exit 0
+fi
 cleanup_managed_private() {
   rm -f "$private/runtime.json" "$private/kubeconfig" "$private/curl.conf" "$private/request.body" "$private/admin.token" "$private/runtime-before.json" "$private/runtime-after.json" "$private/chaos-chart.yaml" "$private/chaos-render.jsonl" "$private/chaos-failure.json" "$private/gcs-emulator.json" "$private/managed-install.jsonl" || return 1
   rmdir "$private"
@@ -129,12 +145,12 @@ if [ "${1-}" = --pod-fault-proof-self-test ]; then
   managed_first_pod_fault_self_test
   exit 0
 fi
+published_install_only=${RHIZA_MANAGED_PUBLISHED_INSTALL_ONLY-false}
+managed_install_mode_valid "$published_install_only" "${RHIZA_MANAGED_FIXTURE_CASE-internal}"
 [ "${GITHUB_ACTIONS-}" = true ] || { echo 'GitHub Actions only' >&2; exit 1; }
 : "${RUNNER_TEMP:?}" "${GITHUB_SHA:?}" "${GITHUB_RUN_ID:?}" "${GITHUB_RUN_ATTEMPT:?}"
 fixture_provider=${RHIZA_MANAGED_FIXTURE_PROVIDER-s3}
 case "$fixture_provider" in s3|gcs|azure) ;; *) echo 'unsupported explicit emulator provider' >&2; exit 1 ;; esac
-published_install_only=${RHIZA_MANAGED_PUBLISHED_INSTALL_ONLY-false}
-case "$published_install_only" in true|false) ;; *) echo 'invalid published install mode' >&2; exit 1 ;; esac
 logs="$RUNNER_TEMP/ha-managed-bootstrap"
 if [ "$published_install_only" = true ]; then logs="$RUNNER_TEMP/ha-managed-published-install"; fi
 mkdir -p "$logs"
