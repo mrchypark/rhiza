@@ -50,3 +50,9 @@ Bootstrap setup now requires committed receipts with valid slot/retention
 metadata for its initial SQL mutations, and checks the INSERT effect explicitly.
 Exact-row and zero-restart checks remain unchanged; failures identify the
 phase, check and diagnostic artifact without logging request payloads.
+
+The prepared-checkpoint membership fixture waits for each active voter to learn
+the fixed certified cut and compares its exact prefix, config and membership
+before preparing. Its delayed-voter regression verifies the original mismatch
+refusal and subsequent preparation after real certified delivery. Production
+seal validation is unchanged; historical mismatch details are not reconstructed.
