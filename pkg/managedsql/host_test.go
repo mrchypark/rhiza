@@ -75,6 +75,20 @@ func (l *sqlWireCloseLifecycle) expectedCanceledPUT(prefix string, r *http.Reque
 		errors.Is(err, io.ErrUnexpectedEOF) && strings.HasPrefix(r.URL.Path, prefix) && len(r.URL.Path) > len(prefix)
 }
 
+func (l *sqlWireCloseLifecycle) observePUTFailures(t *testing.T, fixture *sqlStatusFixture) {
+	t.Helper()
+	fixture.closeLifecycle = l
+	control := fixture.source
+	prefix := "/bucket/" + control.finalPrefix + "/"
+	control.putReadFailure = func(r *http.Request, err error) {
+		if !l.expectedCanceledPUT(prefix, r, err) {
+			t.Errorf("unexpected PUT read failure method=%s path=%s canceled=%t owned_close=%t: %v", r.Method, r.URL.Path, errors.Is(r.Context().Err(), context.Canceled), l.closing.Load(), err)
+		} else {
+			t.Logf("expected canceled PUT method=%s path=%s canceled=true owned_close=true", r.Method, r.URL.Path)
+		}
+	}
+}
+
 func sqlWireStore(t *testing.T) (*httptest.Server, *sqlWireControl) {
 	t.Helper()
 	var mu sync.Mutex
@@ -269,13 +283,14 @@ func sqlWireStore(t *testing.T) (*httptest.Server, *sqlWireControl) {
 }
 
 type sqlStatusFixture struct {
-	mu           sync.Mutex
-	obj          map[string]json.RawMessage
-	failFinalize bool
-	dropFinalize bool
-	source       *sqlWireControl
-	peers        map[types.NodeID]*sqlFixturePeer
-	cluster      types.ClusterID
+	mu             sync.Mutex
+	obj            map[string]json.RawMessage
+	failFinalize   bool
+	dropFinalize   bool
+	source         *sqlWireControl
+	peers          map[types.NodeID]*sqlFixturePeer
+	cluster        types.ClusterID
+	closeLifecycle *sqlWireCloseLifecycle
 }
 
 type sqlFixturePeer struct {
@@ -370,6 +385,9 @@ func (f *sqlStatusFixture) open(ctx context.Context, cfg Config) (*Host, error) 
 	ctx = peertest.WithTransport(ctx, string(f.cluster), string(cfg.Runtime.NodeID), p.conn.LocalAddr().String(), p.transport)
 	host, err := Open(ctx, cfg)
 	if err != nil && host != nil {
+		if f.closeLifecycle != nil {
+			f.closeLifecycle.closing.Store(true)
+		}
 		err = errors.Join(err, host.Close())
 	}
 	return host, err
@@ -782,14 +800,7 @@ func openSQLQuorum(t *testing.T, closeLifecycle ...*sqlWireCloseLifecycle) ([]Co
 			t.Fatal("one explicit wire Close lifecycle is required")
 		}
 		lifecycle = closeLifecycle[0]
-		prefix := "/bucket/" + f.source.finalPrefix + "/"
-		f.source.putReadFailure = func(r *http.Request, err error) {
-			if !lifecycle.expectedCanceledPUT(prefix, r, err) {
-				t.Errorf("unexpected PUT read failure method=%s path=%s canceled=%t owned_close=%t: %v", r.Method, r.URL.Path, errors.Is(r.Context().Err(), context.Canceled), lifecycle.closing.Load(), err)
-			} else {
-				t.Logf("expected canceled PUT method=%s path=%s canceled=true owned_close=true", r.Method, r.URL.Path)
-			}
-		}
+		lifecycle.observePUTFailures(t, f)
 	}
 	hosts := make([]*Host, 2)
 	for i := range hosts {
