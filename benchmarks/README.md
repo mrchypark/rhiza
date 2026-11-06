@@ -56,6 +56,12 @@ The Rhiza server qualification injects `SIGKILL` into each named voter while
 the 100,000-write workload is running. QuePaxa has no stable leader role, so
 results are reported by peer identity (`n0`, `n1`, `n2`) with throughput, p99,
 maximum request latency, retries, and a linearizable final row-count check.
+The final query requires both N total rows and N rows in `[0,N)`; with the
+INTEGER PRIMARY KEY this proves the exact requested identity set. The client
+also validates the committed SQL INSERT receipt, affected-row count, inserted
+ID, and receipt retention bound. It does not assume SQL exposes an `Applied`
+flag or echoes the request ID, and this workload-specific oracle is not a
+general SQL response validator.
 Zero final request errors across all three runs is the availability gate. Node
 logs are always uploaded, and each result counts lines containing `error`,
 `failed`, or `timeout` so internal failure noise is visible beside client
@@ -63,6 +69,25 @@ correctness. The known quic-go host UDP receive-buffer warning is excluded from
 that application-failure count. A run fails when the count is nonzero, or when
 a fault-injection request exceeds the configurable 1,500 ms maximum latency
 gate (`RHIZA_SERVER_BENCH_MAX_FAULT_LATENCY_MS`).
+
+Fault lanes additionally require a sent, unfinished logical request to span two
+nonce-protected loopback probes bracketing the actual SIGKILL. Process liveness
+alone does not qualify, and a missing witness fails as not qualified rather than
+being retried or manufactured by holding runtime requests. Same-ID retries are
+one logical request. This client-observed overlap does not prove that the failed
+voter was processing the witness. Healthy lanes disable this control/trace path.
+Both server revisions use the same candidate client and record its revision,
+binary SHA, receipt oracle, and instrumentation mode. Receipt decoding and
+fault-only trace/control overhead are included; do not compare these results
+as though they used the old uninstrumented client. A final query alone does not
+prove before-ACK object-store durability.
+
+`bash benchmarks/run-server-reference_test.sh` checks the real runner wiring
+with explicit stand-ins, including early fault failure and owned-child cleanup.
+These mocks are not an actual server or fault qualification. Go client tests
+separately exercise receipt rejection and actual local HTTP trace lifecycle.
+The runner terminates and reaps its exact owned benchmark child on early exit,
+while preserving the original failure status.
 
 Hiqlite remains an external Raft reference, not a direct algorithm comparison.
 Its leader/follower cases gracefully stop one peer and wait for a replacement
@@ -73,8 +98,15 @@ reusing the result.
 
 The workflow is advisory: candidate benchmark failures fail the job, while a
 measured regression is reported without an arbitrary threshold. A failing
-baseline benchmark is retained as evidence and does not prevent the fixed
-candidate from running. Use `workflow_dispatch` to compare the selected commit
+baseline invocation is retained as raw evidence, including its original exit,
+but none of its measurements enter the statistical comparison. The required
+candidate names and subcases are tracked in `ci-benchmark-matrix.txt`; every
+required case must have the configured sample count. Missing, extra, or malformed
+candidate measurements fail qualification. Older baseline-only or incomplete
+cases are reported in `unavailable.txt` and excluded from comparison input;
+complete common cases remain eligible. Retaining an unavailable baseline does
+not certify a complete paired result. Use `workflow_dispatch` to compare the
+selected commit
 against another base ref. The same collector can be smoke-tested locally with
 short samples:
 
@@ -82,6 +114,12 @@ short samples:
 RHIZA_BENCH_COUNT=1 RHIZA_BENCH_TIME=100ms \
   benchmarks/run-ci-benchmarks.sh HEAD HEAD /tmp/rhiza-performance
 ```
+
+The collector's bounded mock regressions run with
+`sh benchmarks/run-ci-benchmarks_test.sh`. They check output/exit handling,
+matrix completeness and baseline isolation, not actual Go benchmark execution
+or the performance of any workload. The opt-in Issue #185 job separately rejects
+an exit-zero `go test -run` invocation without a passing test record.
 
 Issue-184 measurements run in that same paired job with identical benchmark
 fixtures added to both revisions. They report latency and Go allocation metrics
