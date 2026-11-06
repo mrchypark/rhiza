@@ -1,17 +1,54 @@
 # Rhiza recovery operator: v1alpha2 managed HA
 
-The v1alpha2 managed runtime uses Deployment Pods, two init containers and no PVC.
-The managed initialization route is selected with a private runtime profile;
-CI verifies actual bootstrap, Pod replacement, main restart and ACK readback.
-Normal images contain `rhiza-operator` and `rhiza-ha-init`; a separate fencer
-Deployment or external lease service is not required. With a healthy quorum,
-managed repair uses certified ADD-first admission of a fresh voter ID/WAL,
-followed by removal of the failed identity. Lost WALs never reuse voter IDs;
+## Responsibilities and deployment shape
+
+The v1alpha2 managed route uses Deployment Pods, two init containers and an
+`emptyDir`, not a PVC. It is an explicit reference-host integration, not a
+turnkey adapter for an arbitrary application image or a library-only upgrade.
+The image must provide `rhiza-ha-init`; the current managed Pod builder starts
+its `serve-managed-sql` reference host as the main process.
+
+| Component | Current responsibility |
+| --- | --- |
+| `rhiza-operator` | Poll namespace-scoped clusters, validate the installed private runtime profile and matching Secret, create/read back the generation-zero Deployment, and commit genesis/bootstrap authority and the plan from actual gated Pod identities. |
+| Kubernetes Deployment/kubelet | Maintain the configured Pod count and restart containers. A replacement Pod has a new identity; Kubernetes restart alone does not grant it voting authority. |
+| Reference managed host | Run the background replacement loop, discover replacement candidates, and coordinate certified ADD-first repair under a healthy quorum. |
+| Rhiza engine | Validate WAL identity, membership and certified history, catch up the learner, and certify/apply decisions. |
+
+See the [operator entry point](../../cmd/rhiza-operator/main.go),
+[initialization reconciler](../../pkg/operator/initializer_v1alpha2.go),
+[Pod/init contract](../../pkg/operator/bootstrap_members_v1alpha2.go),
+[reference-host replacement loop](../../cmd/rhiza-ha-init/serve.go), and
+[Host replacement coordinator](../../pkg/managedsql/replacement.go).
+Without the installed managed profile, the default initializer only creates
+an inert candidate; it is not the managed database startup path.
+
+`rhiza-prepare-identity` binds the actual Pod UID to its identity handoff.
+`rhiza-await-bootstrap-plan` waits for the committed bootstrap/repair preparation
+before the main runtime opens. They share the data `emptyDir` with the main
+container. Main-container restart retains that directory; Pod replacement loses
+it and must follow authenticated bootstrap/adoption and catch-up.
+
+The [cluster schema](cluster-crd.yaml) requires `voterCount` from 3 through 64
+and makes it immutable. This is a fixed target, not autoscaling. The initializer
+does not enforce `Recreate` or create/manage peer and client Services; rollout
+policy, network reachability, service exposure and application integration need
+explicit deployment configuration. `Recreate` is not a termination or fencing
+proof for forced deletion or partitions.
+
+Normal images contain `rhiza-operator` and `rhiza-ha-init`. A separate fencer
+Deployment or external lease service is not required for normal quorum repair.
+The reference-host loop adds a fresh voter ID/WAL, verifies certified admission,
+then removes the failed identity. Lost WALs never reuse voter IDs;
 same-identity rejoin requires the original WAL and current certified membership.
 HA object data is append-only, with no online delete GC.
 Normal managed HA supports only the explicit policy-9 request and policy-10
 Graph append-only profiles. Retired policy-7/8 profiles are not success lanes
 or implicit defaults; their data must not be relabeled or silently migrated.
+After startup and initial live admission, ordinary requests use the engine;
+they do not reserve/finalize a Kubernetes CR for every application request.
+Preserve pending state and UNKNOWN outcomes; use the exact-original recovery
+contract in the [managed API guide](../../docs/managed-internal-request-api.md).
 
 Without quorum, writes and linearizable reads fail while local reads remain
 available on ready nodes. Restore the original quorum or stop for separately
@@ -20,6 +57,12 @@ recovery. A Pod deletion or timeout is not proof of process termination,
 recreation prevention or completion of outstanding storage work.
 
 ## Approved automatic-attempt policy, not implemented or qualified
+
+The `automaticRecovery: OFF` schema default and the existence of recovery
+request/status APIs do not mean that a whole-generation DR executor exists.
+The current operator does not execute that workflow, even when a request object
+or another schema policy value is accepted. The policy below is a design
+boundary, not an installation switch.
 
 Automatic DR attempts default to OFF. Explicit policy may allow preparation
 after sustained actual ReadIndex/quorum failures, not just Pod readiness or a
@@ -52,8 +95,8 @@ otherwise be pruned before admission. Actual API-server admission validation
 is required in CI; schema inspection alone is not that validation.
 
 The pod template supports only `spec.containers` with a name and image. Its
-restore integration still requires validation; an accepted template is not
-proof of safety. Automatic recovery defaults to OFF,
+accepted shape is not proof that an arbitrary image implements the reference
+host or a safe restore integration. Automatic recovery defaults to OFF,
 provisional retention defaults to 48 hours, and deletion defaults to Orphan.
 Neither deletion policy authorizes deletion of application storage evidence.
 

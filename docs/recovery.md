@@ -24,7 +24,12 @@ for voters with intact state to resolve unfinished slots during a full restart.
 
 Normal managed HA adds a fresh learner, verifies its certified prefix and WAL
 identity, commits its admission, then removes the failed identity through the
-surviving quorum. A lost or removed voter ID is never reused. Same-identity
+surviving quorum. In the reference deployment this sequence is coordinated by
+the managed host's [background replacement loop](../cmd/rhiza-ha-init/serve.go)
+and [Host coordinator](../pkg/managedsql/replacement.go), not by a general
+whole-generation recovery loop in `rhiza-operator`. Kubernetes maintains the
+Pod replicas; the engine establishes voting authority. A lost or removed voter
+ID is never reused. Same-identity
 rejoin requires its intact original WAL and the current certified membership;
 an empty WAL cannot acquire voting authority by replaying an archive.
 This path does not require a separate fencer or external lease service.
@@ -101,6 +106,16 @@ The namespace-scoped [managed operator](../deploy/operator/README.md) uses
 v1alpha2 Deployment Pods and init-container identity handoff. The public managed
 Host requires before-ack durability. Healthy-quorum replacement uses the
 certified ADD-first path above, not a separate fencing Deployment.
+The operator validates the installed profile and reconciles initialization,
+genesis and bootstrap plans. The reference host runs the repair loop; upgrading
+the library alone does not add that loop to an arbitrary embedding application.
+The two init containers prepare identity and wait for the committed plan; the
+main engine performs verified startup/adoption and catch-up. NoPVC uses an
+`emptyDir`, so a container restart and a new Pod are different recovery events.
+`voterCount` is fixed at creation (3–64), not an autoscaling API. Recreate rollout
+enforcement and peer/client Service management are not supplied by this
+initializer. See the [Pod builder](../pkg/operator/bootstrap_members_v1alpha2.go)
+and [initializer](../pkg/operator/initializer_v1alpha2.go) for those boundaries.
 
 If quorum is lost, writes and linearizable reads fail; ready nodes can still
 serve local reads. First restore the original nodes, disks or network. Missing
@@ -112,6 +127,9 @@ implemented by the current operator. The approved design defaults automatic
 attempts to OFF. Explicit policy may trigger preparation after sustained
 actual ReadIndex/quorum failures, but failure detection is not activation
 authority. This automatic-attempt policy is not yet implemented or qualified.
+An `automaticRecovery: OFF` schema default or an accepted recovery request/status
+API is not a DR executor. Do not interpret another accepted policy value as
+execution support or a safe way to activate a new generation.
 
 Activation requires verified
 termination or isolation of the complete old identity scope, recreation
