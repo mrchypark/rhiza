@@ -19,7 +19,7 @@ import (
 
 func TestManagedSQLPreparationRequiresLiveExactRepair(t *testing.T) {
 	ctx := context.Background()
-	configs, hosts, _ := openSQLQuorum(t, &sqlWireCloseLifecycle{})
+	configs, hosts, _ := openSQLQuorum(t)
 	h := hosts[0]
 	writer, plan := hostRepairWriter(t, configs, hosts)
 	plan.Sequence = operator.V1Alpha2RepairAddThenRemove
@@ -119,38 +119,16 @@ func TestManagedSQLWireCloseLifecycleRejectsUnexpectedPUTFailure(t *testing.T) {
 }
 
 func TestManagedSQLWireCloseLifecycleActualCanceledPUTAfterOwnedClose(t *testing.T) {
-	configs, fixture := sqlCluster(t)
-	lifecycle := &sqlWireCloseLifecycle{}
-	lifecycle.observePUTFailures(t, fixture)
+	configs, hosts, fixture := openSQLQuorum(t)
+	lifecycle := fixture.closeLifecycle
+	if lifecycle == nil || fixture.source.putReadFailure == nil || !fixture.closeObserverAtOpen.Load() || lifecycle.closing.Load() {
+		t.Fatal("default quorum did not install a strict observer before opening its Hosts")
+	}
 	path := "/bucket/" + fixture.source.finalPrefix + "/archive/close-observer-test.bin"
-	observed := make(chan bool, 1)
-	observer := fixture.source.putReadFailure
-	// Install before Open, and retain the real observer's error/log behavior.
-	fixture.source.putReadFailure = func(r *http.Request, err error) {
-		observer(r, err)
-		if r.URL.Path == path {
-			select {
-			case observed <- lifecycle.expectedCanceledPUT("/bucket/"+fixture.source.finalPrefix+"/", r, err):
-			default:
-				t.Error("duplicate canceled PUT observation")
-			}
+	for _, host := range hosts {
+		if err := fixture.closeHost(host); err != nil {
+			t.Fatal(err)
 		}
-	}
-	host, err := fixture.open(context.Background(), configs[0])
-	if host != nil {
-		t.Cleanup(func() {
-			lifecycle.closing.Store(true)
-			if err := host.Close(); err != nil {
-				t.Error(err)
-			}
-		})
-	}
-	if err != nil {
-		t.Fatal(err)
-	}
-	lifecycle.closing.Store(true)
-	if err := host.Close(); err != nil {
-		t.Fatal(err)
 	}
 	// A real TCP disconnect produces the HTTP request cancellation and truncated
 	// body. This validates classification after actual owned Close, not the
@@ -164,13 +142,17 @@ func TestManagedSQLWireCloseLifecycleActualCanceledPUTAfterOwnedClose(t *testing
 	if writeErr != nil || closeErr != nil {
 		t.Fatal(writeErr, closeErr)
 	}
-	select {
-	case accepted := <-observed:
-		if !accepted {
-			t.Fatal("real canceled PUT after owned Close did not satisfy the strict observer")
+	deadline := time.NewTimer(5 * time.Second)
+	defer deadline.Stop()
+	for {
+		select {
+		case acceptedPath := <-lifecycle.acceptedPUT:
+			if acceptedPath == path {
+				return
+			}
+		case <-deadline.C:
+			t.Fatal("real canceled PUT did not reach the installed observer")
 		}
-	case <-time.After(5 * time.Second):
-		t.Fatal("real canceled PUT did not reach the installed observer")
 	}
 }
 
@@ -214,8 +196,7 @@ func TestManagedSQLDirectMembershipRejectsRemoveFirstIntent(t *testing.T) {
 		h, err := fixture.open(ctx, configs[i])
 		if h != nil {
 			t.Cleanup(func() {
-				lifecycle.closing.Store(true)
-				if err := h.Close(); err != nil {
+				if err := fixture.closeHost(h); err != nil {
 					t.Error(err)
 				}
 			})
