@@ -1,9 +1,10 @@
 # Quorum-controlled membership (experimental)
 
-This work implements experimental quorum-controlled membership across QuePaxa,
-`rhiza.Open`, Go/Rust management, and the Kubernetes Operator. It is not automatic
-recovery or infrastructure fencing, and it is not enabled for production use.
-CI qualification remains outstanding; local functional results are recorded below.
+v0.23.1 includes quorum-controlled membership across QuePaxa and Go/Rust
+management. The experimental API label remains: release availability does not
+make this automatic disaster recovery or infrastructure fencing. The current
+managed profiles are explicit append-only 9/10, generation 0, with `before_ack`
+durability. Historical local results below are not current release qualification.
 
 ## Protocol boundary
 
@@ -52,6 +53,12 @@ freeze in the drain keeps its original bytes and prefix contribution, but does
 not start a second transition.
 
 ## Lost voter example
+
+Kubernetes replaces Pods under the managed Deployment. The operator initializes
+that Deployment and its bootstrap plan; the reference managed host's background
+loop discovers candidates and invokes healthy-quorum replacement. The engine
+enforces the membership transition and learner proof. This is distinct from
+operator-driven generation recovery after quorum loss.
 
 With voters A/B/C and C's WAL permanently lost, the normal managed repair path
 uses ADD-first replacement under the surviving quorum. A replacement uses a new
@@ -232,9 +239,10 @@ join a completed earlier barrier. Failure/retry, one-sync hint promotion,
 cancellation, and a real recovery-base installation racing with sync are tested.
 Cancellation does not undo prior appends or stop an already running shared fsync.
 
-The deliberate limit is an O(retained prefix length) durability scan. A durable
-watermark is deferred until repeated scans of long WALs justify it. Different
-sources can still fetch overlapping pages; the limit remains two, and the normal
+At that historical revision, durability scanned the retained prefix. v0.23.1
+tracks a contiguous verified durable frontier only after successful sync and
+resets it on recovery-base installation; pending appends alone do not advance
+it. Different sources can still fetch overlapping pages; the limit remains two, and the normal
 pipeline remains sixteen. These changes do not complete any deployment gate above.
 
 Measurement for steps 2–4 used the Performance CI on `ubuntu-24.04`, Go 1.27.0,

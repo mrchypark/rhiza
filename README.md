@@ -105,12 +105,33 @@ it uses the embedded Go API without a public HTTP server. From this checkout:
 cargo run --manifest-path sdk/rust/Cargo.toml --example embedded
 ```
 
-Use `rhizadb = "0.23.1"` in your Cargo dependencies.
+Use `rhizadb = "0.23.2"` in your Cargo dependencies.
 Native builds support macOS and Linux GNU and require Rust, Go 1.27.3+, and a C
 compiler. The Rust bridge requires cgo; Go-only applications remain cgo-free.
 Calls are synchronous. By default the embedded engine starts its private peer
 endpoint; use `Config::local()` to disable peer networking. SQL, KV, Graph, stream, and request-status access are documented in
 the SDK README.
+
+## Operator and managed HA
+
+Start with the [managed operator guide](deploy/operator/README.md) and
+[recovery boundaries](docs/recovery.md); a [Korean introduction](docs/embedded-operator.md)
+is also available. The v1alpha2 route is an explicit no-PVC reference-host
+integration, not a turnkey conversion of arbitrary applications that update
+the library. The operator validates profiles and reconciles initialization,
+genesis Deployment and bootstrap plans. Kubernetes maintains Pod replicas and
+container restarts; the reference managed host runs healthy-quorum ADD-first
+replacement, and the engine validates identity and certified catch-up.
+
+Managed HA uses two init containers and shared `emptyDir`, explicit append-only
+profiles 9/10, before-ack durability, and a creation-time fixed voter count of
+3–64. Ordinary requests do not reserve a Kubernetes CR per mutation. HA object
+data is append-only with no online delete GC. Recreate rollout enforcement and
+peer/client Service management are not supplied by the initializer.
+Whole-generation DR is not implemented by the operator: recovery API/schema fields
+are not an executor. Preserve pending/UNKNOWN evidence and restore the original
+quorum when quorum is lost. Local single-writer backup/restore is a separate
+[deployment contract](docs/local-init-container-recovery.md).
 
 ## Consistency and failure model
 
@@ -433,8 +454,9 @@ docker run --rm --name rhiza -p 8080:8080 \
   rhiza:dev
 ```
 
-The [managed HA operator](deploy/operator/README.md) uses a surviving QuePaxa
-quorum for certified replacement with a fresh voter identity. Normal HA does
+In the [managed HA integration](deploy/operator/README.md), the reference host's
+background loop uses a surviving QuePaxa quorum for certified replacement with
+a fresh voter identity; the operator reconciles initialization. Normal HA does
 not require a separate fencer or external lease service. Without quorum,
 writes and linearizable reads fail; local reads remain available on ready
 nodes. Restore the original quorum or use a separately verified DR procedure.
@@ -490,4 +512,4 @@ comparison boundaries are in
 
 [MIT](LICENSE)
 
-For applications embedding Rhiza, see the [Go/Rust Operator integration guide](docs/embedded-operator.md).
+For applications embedding Rhiza, see the [Korean operator and HA introduction](docs/embedded-operator.md).

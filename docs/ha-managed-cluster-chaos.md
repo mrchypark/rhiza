@@ -1,8 +1,35 @@
-# Released managed HA: isolated Kubernetes Chaos Mesh qualification
+# Managed HA Chaos Mesh: qualification scopes
 
-The manual `HA managed Kubernetes Chaos Mesh` workflow tests the published release and
-its immutable operator image. It does not rebuild an application image or use a
-different harness revision. Run it only after the release image has published.
+## Automated main qualification
+
+[Main run 42176644960](https://github.com/mrchypark/rhiza/actions/runs/42176644960)
+qualified commit `2262531f266f2638eb21baea6f65de45465ffe90` in six lanes:
+internal request/SQL+KV and Graph, each with S3, GCS and Azure adapters. The
+`HA managed kubelet bootstrap` workflow runs the shared fixture on isolated Kind
+clusters with pinned Floci-family emulators and actual provider SDKs. This is
+not live-cloud parity. Local development uses VersityGW; neither path introduces
+a MinIO installation procedure.
+
+The fixture checks two sequential fresh-Pod replacements, followed by a
+same-Pod container restart, certified identity/membership transitions and typed
+SQL/KV/Graph C ABI ACK readback. The second replacement targets the first new
+Pod identity. These are healthy-quorum repair and restart qualification, not
+whole-quorum generation DR or infrastructure fencing. Current ownership and
+deployment roles are in the [operator guide](../deploy/operator/README.md).
+
+A Pod deletion response or API absence does not prove process termination,
+recreation prevention or completion of outstanding storage work. Independent
+DR still requires those conditions, a source covering successful ACKs and live
+activation authority. Automatic generation DR is not implemented or qualified.
+
+## Separate opt-in manual live-cluster qualification
+
+The manual `HA managed Kubernetes Chaos Mesh` workflow is a separate driver for
+the published release and its immutable operator image. The automated six-lane
+run above is not evidence that this manual workflow ran. Run the manual driver
+only after the release image has published; it does not rebuild an application
+image or substitute a different harness revision. Its scope below uses a
+disposable namespace and local S3 emulator, not live GCS or Azure storage.
 
 The administrator creates a fresh `rhiza-ha-chaos-*` namespace and short-lived
 namespace-only Kubernetes service account. Upload its kubeconfig as temporary
