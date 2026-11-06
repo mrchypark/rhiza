@@ -441,23 +441,25 @@ fi
 printf 'header = "Authorization: Bearer %s"\n' "$admin" > "$private/curl.conf"
 unset admin
 k -n "$namespace" create secret generic runtime --from-file="runtime.json=$private/runtime.json"
-k -n "$namespace" create serviceaccount operator
-k -n "$namespace" create serviceaccount rhiza-managed-host
-k -n "$namespace" create role runtime-read --verb=get --resource=rhizaclusters,pods,replicasets,deployments
-k -n "$namespace" create rolebinding runtime-read --role=runtime-read --serviceaccount="$namespace:rhiza-managed-host"
-# Pod LIST is namespace-scoped discovery, not field/label-scoped RBAC.
-k -n "$namespace" create role runtime-pod-discovery --verb=list --resource=pods
-k -n "$namespace" create rolebinding runtime-pod-discovery --role=runtime-pod-discovery --serviceaccount="$namespace:rhiza-managed-host"
-k -n "$namespace" create role runtime-status --verb=get,update --resource=rhizaclusters/status --resource-name=sql
-k -n "$namespace" create rolebinding runtime-status --role=runtime-status --serviceaccount="$namespace:rhiza-managed-host"
-k -n "$namespace" create role managed-host-account-read --verb=get --resource=serviceaccounts --resource-name=rhiza-managed-host
-k -n "$namespace" create rolebinding managed-host-account-read --role=managed-host-account-read --serviceaccount="$namespace:operator"
-k -n "$namespace" create role bootstrap --verb=get,list --resource=rhizaclusters,pods,replicasets,deployments,secrets
-k -n "$namespace" create role create-deployment --verb=create --resource=deployments
-k -n "$namespace" create rolebinding bootstrap --role=bootstrap --serviceaccount="$namespace:operator"
-k -n "$namespace" create rolebinding create-deployment --role=create-deployment --serviceaccount="$namespace:operator"
-# Withhold status-update RBAC until actual kubelet termination and gate observations.
-jq -n --arg image "$image" --arg namespace "$namespace" '{apiVersion:"apps/v1",kind:"Deployment",metadata:{name:"operator"},spec:{replicas:1,selector:{matchLabels:{app:"operator"}},template:{metadata:{labels:{app:"operator"}},spec:{serviceAccountName:"operator",securityContext:{runAsUser:65532,runAsGroup:65532,fsGroup:65532,runAsNonRoot:true},containers:[{name:"operator",image:$image,args:[("--namespace="+$namespace),"--poll-interval=1s","--managed-runtime-profile=/etc/rhiza/managed/runtime.json"],volumeMounts:[{name:"runtime",mountPath:"/etc/rhiza/managed",readOnly:true}]}],volumes:[{name:"runtime",secret:{secretName:"runtime",defaultMode:288}}]}}}}' | k -n "$namespace" apply -f -
+# Consume the public managed overlay, not a test-owned operator Deployment.
+# CRDs and the isolated namespace were already installed by the driver.
+kubectl kustomize deploy/operator-managed > "$logs/managed-install.yaml"
+yq -o=json -I=0 '.' "$logs/managed-install.yaml" > "$private/managed-install.jsonl"
+jq -s --arg namespace "$namespace" --arg image "$image" '
+  map(select(.kind!="CustomResourceDefinition" and .kind!="Namespace") |
+    .metadata.namespace=$namespace |
+    if .kind=="RoleBinding" then .subjects |= map(if .kind=="ServiceAccount" then .namespace=$namespace else . end) else . end |
+    if .kind=="Deployment" and .metadata.name=="rhiza-operator" then
+      .spec.template.spec.containers |= map(if .name=="operator" then .image=$image else . end)
+    else . end) | {apiVersion:"v1",kind:"List",items:.}' "$private/managed-install.jsonl" > "$logs/managed-install.json"
+jq -e '[.items[]|select(.kind=="Deployment")]|length==1 and .[0].metadata.name=="rhiza-operator"' "$logs/managed-install.json" >/dev/null
+jq -e '[.items[]|select(.kind=="Role" and .metadata.name=="rhiza-operator")|.rules[]|select((.resources|index("rhizaclusters/status"))!=null and (.verbs|index("update"))!=null)]|length==1' "$logs/managed-install.json" >/dev/null
+# Withhold ONLY operator status-update until actual kubelet gate observations.
+jq '(.items[]|select(.kind=="Role" and .metadata.name=="rhiza-operator")|.rules[]|select(.resources|index("rhizaclusters/status"))|.verbs) -= ["update"]' "$logs/managed-install.json" > "$logs/managed-install-gated.json"
+jq -e 'all(.items[]|select(.kind=="Role" and .metadata.name=="rhiza-operator")|.rules[]|select(.resources|index("rhizaclusters/status")); (.verbs|index("update"))==null)' "$logs/managed-install-gated.json" >/dev/null
+k -n "$namespace" apply --validate=strict -f "$logs/managed-install-gated.json"
+k -n "$namespace" get deployments -o json > "$logs/before-cr-deployments.json"
+jq -e 'all(.items[]; .metadata.name!="" and .metadata.name!="sql" and (.metadata.labels["rhiza.mrchypark.dev/cluster-uid"] // "")=="")' "$logs/before-cr-deployments.json" >/dev/null
 jq -n --arg image "$image" --arg protocol "$fixture_protocol" '{apiVersion:"rhiza.mrchypark.dev/v1alpha2",kind:"RhizaCluster",metadata:{name:"sql"},spec:{logicalID:"managed-ci",genesisIntent:"Create",voterCount:3,workload:{podTemplate:{spec:{containers:[{name:"sql",image:$image}]}}}}} | if $protocol=="" then . else .spec.applicationProtocol=$protocol end' | k -n "$namespace" apply -f -
 uid=$(k -n "$namespace" get rhizacluster sql -o jsonpath='{.metadata.uid}')
 selector="rhiza.mrchypark.dev/cluster-uid=$uid"
@@ -465,8 +467,7 @@ attempt=0
 until k -n "$namespace" get pods -l "$selector" -o json > "$logs/gated-pods.json" && sh scripts/ha-managed-bucket-setup oracle-gated "$logs/gated-pods.json"; do
   attempt=$((attempt+1)); [ "$attempt" -lt 120 ] || exit 1; sleep 1
 done
-k -n "$namespace" create role status --verb=update --resource=rhizaclusters/status
-k -n "$namespace" create rolebinding status --role=status --serviceaccount="$namespace:operator"
+jq '.items[]|select(.kind=="Role" and .metadata.name=="rhiza-operator")' "$logs/managed-install.json" | k -n "$namespace" apply --validate=strict -f -
 k -n "$namespace" get serviceaccounts,roles,rolebindings -o jsonpath='{range .items[*]}{.kind}{" "}{.metadata.name}{"\n"}{end}' > "$logs/public-rbac-names.txt"
 k -n "$namespace" wait --for=condition=Ready pod -l "$selector" --timeout=180s
 k -n "$namespace" get rhizacluster sql -o json > "$logs/committed.json"

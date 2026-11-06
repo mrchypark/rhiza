@@ -36,6 +36,31 @@ ServiceAccount/RBAC, 공유 object store와 peer 네트워크가 준비되어야
 profile을 설치하지 않은 기본 initializer의 inert candidate는 실행 가능한 managed DB가 아니다.
 사용자 애플리케이션이 이 참조 host와 같은 통합을 구현했다고 자동으로 가정하지 않는다.
 
+### CR로 새 배포를 시작하는 순서
+
+CR에서 managed Deployment를 만드는 경로는 이미 구현되어 있다. 다만 기본
+initializer만 설치하는 것과 managed profile을 설치하는 것은 다르다.
+
+1. namespace, 공유 object-store namespace, 명시적 profile 9/10, peer 네트워크와
+   private admin 인증을 배포 소유자가 결정하고 준비한다. CI emulator 자격 증명을
+   실제 배포 설정으로 복사하지 않는다.
+2. `before-ack`, reconfiguration, peer port와 실제 실행 파일을 포함한 `InitImage`를
+   지정한 private runtime profile을 준비한다. Secret `runtime`의 key는
+   `runtime.json`이며 설치된 profile과 Secret 내용이 정확히 같아야 한다.
+3. 공개 [managed overlay](../deploy/operator-managed/)를 namespace와 검토한 image로
+   렌더링·검토한 뒤 strict validation으로 적용한다. profile Secret과 storage는
+   overlay가 대신 만들지 않는다. 상세 절차는 [설치 안내](../deploy/operator/README.md#installing-the-managed-reference-host)를 따른다.
+4. 일치하는 protocol과 참조 host image, `genesisIntent: Create`를 지정한
+   [RhizaCluster](../deploy/operator/automatic-example.yaml)를 생성한다. status나
+   DB Deployment를 미리 심지 않는다.
+5. operator가 만든 Deployment의 owner UID, init 완료, 확정 bootstrap plan과
+   해당 CR label의 실제 Pod Ready를 확인한 뒤 사용한다. CR 생성 성공만으로
+   데이터베이스가 준비되었다고 판단하지 않는다.
+
+이 절차는 임의 애플리케이션을 자동 변환하거나 Service·autoscaling·전체 quorum DR를
+제공하는 절차가 아니다. overlay의 namespace/RBAC와 private profile은 명시적으로
+검토해야 하는 배포 입력이다.
+
 같은 Pod의 컨테이너 재시작은 `emptyDir`를 유지하지만, Pod 교체는 디렉터리를 잃는다.
 quorum이 살아 있으면 새 ID와 새 WAL의 learner를 먼저 추가하고 인증된 prefix와 admission을
 검증한 뒤 이전 voter를 제거한다. 유실한 WAL의 ID를 빈 WAL에 재사용하지 않는다.

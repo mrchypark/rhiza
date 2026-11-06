@@ -229,7 +229,7 @@ capture_floci() {
 }
 capture_bootstrap_logs() {
   for component in operator managed; do
-    if [ "$component" = operator ]; then log_selector=app=operator
+    if [ "$component" = operator ]; then log_selector=app.kubernetes.io/name=rhiza-operator
     elif [ -n "${uid-}" ]; then log_selector="rhiza.mrchypark.dev/cluster-uid=$uid"
     else continue
     fi

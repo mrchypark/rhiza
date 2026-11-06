@@ -23,6 +23,41 @@ See the [operator entry point](../../cmd/rhiza-operator/main.go),
 Without the installed managed profile, the default initializer only creates
 an inert candidate; it is not the managed database startup path.
 
+## Installing the managed reference host
+
+CR-driven managed deployment is implemented, but installing the inert base
+alone is not the managed installation procedure. Use the public sibling
+[managed overlay](../operator-managed/) after preparing its prerequisites:
+
+1. Choose the namespace, a reachable shared object-store namespace, the explicit
+   append-only application profile (9 or 10), peer networking and private admin
+   authentication. Provision storage and supply credentials through your own
+   authorized mechanism; do not copy CI emulator credentials into a deployment.
+2. Prepare a private runtime profile with the chosen protocol/evidence identity,
+   `before-ack` durability, reconfiguration enabled, peer port and `InitImage`.
+   The image must contain `rhiza-operator` and `rhiza-ha-init`; use a reviewed
+   immutable image reference. The workload image must implement the reference
+   host contract, not merely expose an application executable.
+3. Install the profile as Secret `runtime`, key `runtime.json`, in that namespace.
+   It is mounted at `/etc/rhiza/managed/runtime.json` and selected with
+   `--managed-runtime-profile`. The installed file and the profile Secret read
+   by the reconciler must agree exactly, including `ProfileSecretName`.
+4. Render and review `kubectl kustomize deploy/operator-managed` with your
+   namespace and operator image overrides, then apply that reviewed output with
+   strict server-side validation. This installs the operator/host ServiceAccounts
+   and RBAC; it does not supply your private runtime profile or storage.
+5. Create a status-free `RhizaCluster` from the
+   [managed example](automatic-example.yaml), with `genesisIntent: Create`,
+   matching application protocol and reference-host image. Do not pre-create
+   its managed Deployment or write genesis/bootstrap authority into status.
+6. Observe the operator-created Deployment and its owner UID, completed identity
+   init containers, committed bootstrap plan and the exact cluster-labelled
+   Pods becoming Ready. A successful CR create alone is not a ready database.
+
+The existing six-lane Kind qualification covers this managed bootstrap and
+healthy-quorum repair path with isolated provider emulators. It does not grant
+live-cloud parity, install credentials for consumers, or implement automatic DR.
+
 `rhiza-prepare-identity` binds the actual Pod UID to its identity handoff.
 `rhiza-await-bootstrap-plan` waits for the committed bootstrap/repair preparation
 before the main runtime opens. They share the data `emptyDir` with the main
