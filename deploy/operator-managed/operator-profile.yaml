@@ -1,0 +1,27 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: rhiza-operator
+  namespace: rhiza
+spec:
+  template:
+    spec:
+      containers:
+        - name: operator
+          args:
+            - --namespace=$(POD_NAMESPACE)
+            - --managed-runtime-profile=/etc/rhiza/managed/runtime.json
+          envFrom: null
+          volumeMounts:
+            - name: managed-runtime
+              mountPath: /etc/rhiza/managed
+              readOnly: true
+      volumes:
+        - name: managed-runtime
+          secret:
+            secretName: runtime
+            optional: false
+            defaultMode: 0440
+            items:
+              - key: runtime.json
+                path: runtime.json

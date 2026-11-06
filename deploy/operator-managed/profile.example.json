@@ -1,0 +1,18 @@
+{
+  "ApplicationProtocol": "rhiza-managed-request-append-only/v1",
+  "InitImage": "ghcr.io/mrchypark/rhiza-operator:v0.23.2",
+  "PeerPort": 9000,
+  "EvidenceFormat": "rhiza-managed-request-append-only/v1",
+  "ProfileSecretName": "runtime",
+  "Storage": {
+    "admin_token": "REPLACE_WITH_PRIVATE_RANDOM_ADMIN_TOKEN",
+    "objstore_provider": "s3",
+    "objstore_endpoint": "https://REPLACE_WITH_YOUR_S3_ENDPOINT",
+    "objstore_bucket": "REPLACE_WITH_YOUR_EXISTING_BUCKET",
+    "objstore_prefix": "rhiza-managed",
+    "objstore_region": "REPLACE_WITH_YOUR_REGION",
+    "objstore_access_key": "REPLACE_WITH_YOUR_ACCESS_KEY",
+    "objstore_secret_key": "REPLACE_WITH_YOUR_SECRET_KEY",
+    "objstore_durability": "before-ack"
+  }
+}
