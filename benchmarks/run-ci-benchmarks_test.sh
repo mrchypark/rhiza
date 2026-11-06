@@ -77,6 +77,10 @@ if [ -n "$cpu" ]; then
 else
     printf '%s\t%s\t%s\n' "$label" "$package" "$bench" >> "$MOCK_RUN_LOG"
 fi
+# testing/benchmark.go emits configuration before benchmark rows.
+import_path="github.com/mrchypark/rhiza/pkg/$package"
+[ "$package" != internal-types ] || import_path=github.com/mrchypark/rhiza/internal/types
+printf 'goos: linux\ngoarch: amd64\npkg: %s\ncpu: Mock CPU\n' "$import_path"
 # Go prints the name before calibration; stderr must not split that line.
 emit_measurement() {
     printf '%s' "$1"
@@ -156,6 +160,21 @@ for label in base candidate; do
     grep -q '^codec profile diagnostic$' "$scratch/success/profiles/$label.txt"
     awk -F '\t' -v label="$label" '$1==label {count[$2]++} END {if(count["qlog"]!=10 || count["quepaxa"]!=40 || count["recovery"]!=30 || count["materializer"]!=40 || count["network"]!=10 || count["internal-types"]!=10) exit 1}' "$MOCK_RUN_LOG"
 done
+for label in base candidate; do
+    awk '
+        /^goos:/ {goos=$0}
+        /^goarch:/ {goarch=$0}
+        /^pkg:/ {pkg=$0}
+        /^cpu:/ {cpu=$0}
+        /^Benchmark/ {
+            if (goos!="goos: linux" || goarch!="goarch: amd64" || cpu!="cpu: Mock CPU" || pkg!~/^pkg: github.com\/mrchypark\/rhiza\//) exit 1
+            print goos "|" goarch "|" pkg "|" cpu "|" $1
+        }
+    ' "$scratch/success/$label.txt" | sort >"$scratch/$label-context.txt"
+done
+cmp "$scratch/base-context.txt" "$scratch/candidate-context.txt"
+grep -q 'pkg: github.com/mrchypark/rhiza/pkg/network|cpu: Mock CPU|BenchmarkThreePeerSQLExecuteReturning/rows100-2$' "$scratch/base-context.txt"
+printf 'PASS header-aware common comparison context\n'
 MOCK_FAIL_LABEL=candidate; export MOCK_FAIL_LABEL
 run_case candidate-failure 17
 grep -q 'failure-tail-retained' "$scratch/candidate-failure/diagnostics/candidate-qlog-1-1.stderr.log"
@@ -167,6 +186,8 @@ run_case baseline-failure 0
 ! grep -q '^BenchmarkWAL' "$scratch/baseline-failure/base.txt"
 grep -q '^BenchmarkCorePropose' "$scratch/baseline-failure/base.txt"
 grep -q '^BenchmarkWAL' "$scratch/baseline-failure/diagnostics/base-qlog-1-1.stdout.log"
+grep -q '^pkg: github.com/mrchypark/rhiza/pkg/qlog$' "$scratch/baseline-failure/diagnostics/base-qlog-1-1.stdout.log"
+grep -q '^pkg: github.com/mrchypark/rhiza/pkg/quepaxa$' "$scratch/baseline-failure/base.txt"
 grep -q '^binary_exit=17$' "$scratch/baseline-failure/diagnostics/base-qlog-1-1.exit"
 grep -q 'failure-tail-retained' "$scratch/baseline-failure/diagnostics/base-qlog-1-1.stderr.log"
 unset MOCK_FAIL_LABEL
@@ -184,6 +205,8 @@ grep -q '^base baseline-only: BenchmarkThreePeerSQLExecuteReturning/rows10$' "$s
 ! grep -q 'Returning/rows10-' "$scratch/baseline-extra-name/base.txt"
 grep -q 'Returning/rows100-' "$scratch/baseline-extra-name/base.txt"
 grep -q 'Returning/rows10-' "$scratch/baseline-extra-name/diagnostics/base-network-1-1.stdout.log"
+grep -q '^pkg: github.com/mrchypark/rhiza/pkg/network$' "$scratch/baseline-extra-name/base.txt"
+grep -q '^pkg: github.com/mrchypark/rhiza/pkg/network$' "$scratch/baseline-extra-name/diagnostics/base-network-1-1.stdout.log"
 MOCK_EXTRA=candidate; export MOCK_EXTRA
 run_case candidate-extra-name 1
 unset MOCK_EXTRA

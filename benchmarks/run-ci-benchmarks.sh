@@ -220,6 +220,8 @@ for label in candidate base; do
 		awk -v expected="$bench_count" -v names="$output_dir/expected-names.txt" '
 			BEGIN { while ((getline name < names) > 0) required[name]=1; close(names) }
 			FNR == NR { if ($1 ~ /^Benchmark/) { name=$1; sub(/-[0-9]+$/, "", name); count[name]++ }; next }
+			# Preserve Go configuration headers: benchstat groups rows by pkg, etc.
+			!/^Benchmark/ { print; next }
 			{ name=$1; sub(/-[0-9]+$/, "", name); if (name in required && count[name] == expected) print }
 		' "$output_dir/base.txt" "$output_dir/base.txt" >"$work_root/base-valid.txt"
 		mv "$work_root/base-valid.txt" "$output_dir/base.txt"
