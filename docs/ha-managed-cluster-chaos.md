@@ -61,8 +61,13 @@ guessed. `pod-kill` must result in a new virtual Pod UID and Completed certified
 repair. There is no fallback virtual Pod deletion to manufacture that outcome.
 Then `container-kill` must increase restartCount in the same replacement Pod and
 preserve repair origin, adoption and voter identity hashes. Both experiments
-require actual AllInjected/AllRecovered evidence. ACK readback, fresh writes,
-two completed initContainers and NoPVC are required.
+require `AllInjected=True` and exactly one matching injected container record,
+followed by the observed runtime turnover. These kill actions are one-shot:
+the driver records and deletes each fault object and verifies its absence
+before checking application recovery. It does not require or claim a controller
+`AllRecovered=True` condition. Controller condition names are not a substitute
+for application recovery: ACK readback, fresh writes, two completed
+initContainers and NoPVC remain required.
 
 Fault removal, Helm uninstall, host Pod/fault absence and private credential /
 port-forward cleanup are checked even on failure. Raw first-failure evidence is

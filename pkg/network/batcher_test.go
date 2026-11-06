@@ -3,8 +3,12 @@ package network
 import (
 	"context"
 	"errors"
+	"os"
+	"os/exec"
 	"runtime"
 	"strconv"
+	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -93,13 +97,13 @@ func TestSQLBatcherReportsCommitUnknownAfterProposalStarts(t *testing.T) {
 
 func TestSQLBatcherCancellationAfterDispatchReportsCommitUnknown(t *testing.T) {
 	started := make(chan struct{})
-	release := make(chan struct{})
+	release, unblock := newBatcherTestGate()
 	b := newSQLBatcher(func(context.Context, []byte) (quepaxa.Slot, error) {
 		close(started)
 		<-release
 		return 1, nil
 	}, func(context.Context, quepaxa.Slot) error { return nil })
-	defer b.Close()
+	defer func() { unblock(); b.Close() }()
 
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan error, 1)
@@ -114,7 +118,45 @@ func TestSQLBatcherCancellationAfterDispatchReportsCommitUnknown(t *testing.T) {
 	if !errors.As(err, &unknown) || unknown.Slot != 0 || unknown.RequestID != "canceled" || !errors.Is(err, context.Canceled) {
 		t.Fatalf("commit unknown detail=%#v err=%v", unknown, err)
 	}
-	close(release)
+	unblock()
+}
+
+// A fatal assertion must release a context-ignoring proposer before Close joins it.
+func newBatcherTestGate() (chan struct{}, func()) {
+	gate := make(chan struct{})
+	var once sync.Once
+	return gate, func() { once.Do(func() { close(gate) }) }
+}
+
+func TestSQLBatcherFatalAssertionReleasesGateBeforeClose(t *testing.T) {
+	const marker = "RHIZA_BATCHER_FATAL_CLEANUP_CHILD"
+	if os.Getenv(marker) == "1" {
+		started := make(chan struct{})
+		gate, unblock := newBatcherTestGate()
+		b := newSQLBatcher(func(context.Context, []byte) (quepaxa.Slot, error) {
+			close(started)
+			<-gate
+			return 1, nil
+		}, nil)
+		defer func() { unblock(); b.Close() }()
+		go func() {
+			_, _ = b.submit(context.Background(), types.SQLCommand{RequestID: "fatal-cleanup", SQL: "SELECT 1"})
+		}()
+		<-started
+		t.Fatal("intentional gated assertion failure")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, os.Args[0], "-test.run=^TestSQLBatcherFatalAssertionReleasesGateBeforeClose$")
+	cmd.Env = append(os.Environ(), marker+"=1")
+	output, err := cmd.CombinedOutput()
+	if ctx.Err() != nil {
+		t.Fatalf("fatal assertion hung during cleanup: %v", ctx.Err())
+	}
+	var exit *exec.ExitError
+	if !errors.As(err, &exit) || exit.ExitCode() != 1 || !strings.Contains(string(output), "intentional gated assertion failure") {
+		t.Fatalf("child did not preserve its assertion failure: error=%v output=%s", err, output)
+	}
 }
 
 func TestSQLBatcherRejectsOversizedItemAtAdmission(t *testing.T) {

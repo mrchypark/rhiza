@@ -62,6 +62,7 @@ func TestObserveManagedControlAllowsSameValidatedValueISRStepAdvance(t *testing.
 		memberCore.transport = gate
 	}
 	managedControlRacePrefix(t, core)
+	requireManagedControlSharedPrefix(t, ctx, core, proposer)
 	if core.Tip() != 8 || proposer.Tip() != 8 {
 		t.Fatalf("observer/proposer do not share certified prefix 8: observer=%d proposer=%d", core.Tip(), proposer.Tip())
 	}

@@ -435,24 +435,58 @@ func assertRaceResults(t *testing.T, results []error) {
 	}
 }
 
+type requestIDRaceOutcome struct {
+	choice  string
+	receipt types.MutationReceipt
+	err     error
+}
+
+func requestIDRaceWinner(t *testing.T, results chan requestIDRaceOutcome) requestIDRaceOutcome {
+	t.Helper()
+	a, b := <-results, <-results
+	assertRaceResults(t, []error{a.err, b.err})
+	if a.err != nil {
+		a = b
+	}
+	if a.err != nil || a.receipt.Slot == 0 || a.receipt.Status != types.MutationCommitted {
+		t.Fatalf("winning mutation lacks a successful committed receipt: %+v", a)
+	}
+	return a
+}
+
+func assertRequestIDRaceReceipt(t *testing.T, server *Server, kind string, expected types.MutationReceipt) {
+	t.Helper()
+	status, err := server.RequestStatus(context.Background(), RequestStatusRequest{Kind: kind, RequestID: "shared"})
+	if err != nil || status.Receipt == nil || *status.Receipt != expected {
+		t.Fatalf("retained %s receipt=%+v want=%+v error=%v", kind, status.Receipt, expected, err)
+	}
+}
+
 func TestCrossIngressRequestIDConflictDoesNotBlockSQLKVOrNotify(t *testing.T) {
 	t.Run("sql", func(t *testing.T) {
 		cluster := newRequestIDRaceCluster(t)
 		start := make(chan struct{})
-		results := make(chan error, 2)
+		results := make(chan requestIDRaceOutcome, 2)
 		go func() {
 			<-start
-			_, err := cluster.servers["n1"].Execute(context.Background(), ExecuteRequest{RequestID: "shared", SQL: "CREATE TABLE request_id_race_a (id INTEGER)"})
-			results <- err
+			response, err := cluster.servers["n1"].Execute(context.Background(), ExecuteRequest{RequestID: "shared", SQL: "CREATE TABLE request_id_race_a (id INTEGER)"})
+			results <- requestIDRaceOutcome{"request_id_race_a", response.MutationReceipt, err}
 		}()
 		go func() {
 			<-start
-			_, err := cluster.servers["n2"].Execute(context.Background(), ExecuteRequest{RequestID: "shared", SQL: "CREATE TABLE request_id_race_b (id INTEGER)"})
-			results <- err
+			response, err := cluster.servers["n2"].Execute(context.Background(), ExecuteRequest{RequestID: "shared", SQL: "CREATE TABLE request_id_race_b (id INTEGER)"})
+			results <- requestIDRaceOutcome{"request_id_race_b", response.MutationReceipt, err}
 		}()
 		close(start)
-		assertRaceResults(t, []error{<-results, <-results})
+		winner := requestIDRaceWinner(t, results)
 		cluster.applyAll(t)
+		for id, server := range cluster.servers {
+			assertRequestIDRaceReceipt(t, server, "sql", winner.receipt)
+			rows, err := server.Query(context.Background(), QueryRequest{SQL: "SELECT name FROM sqlite_master WHERE type='table' AND name IN ('request_id_race_a','request_id_race_b') ORDER BY name"})
+			if err != nil || !reflect.DeepEqual(rows.Rows, [][]any{{winner.choice}}) {
+				t.Fatalf("replica %s winner/loser tables=%v want only %s error=%v", id, rows.Rows, winner.choice, err)
+			}
+		}
 		if _, err := cluster.servers["n3"].Execute(context.Background(), ExecuteRequest{RequestID: "after", SQL: "CREATE TABLE request_id_race_after (id INTEGER)"}); err != nil {
 			t.Fatalf("follow-up mutation: %v", err)
 		}
@@ -462,20 +496,32 @@ func TestCrossIngressRequestIDConflictDoesNotBlockSQLKVOrNotify(t *testing.T) {
 	t.Run("kv", func(t *testing.T) {
 		cluster := newRequestIDRaceCluster(t)
 		start := make(chan struct{})
-		results := make(chan error, 2)
+		results := make(chan requestIDRaceOutcome, 2)
 		go func() {
 			<-start
-			_, err := cluster.servers["n1"].KVPut(context.Background(), KVMutationRequest{RequestID: "shared", Key: "race", Value: []byte("a")})
-			results <- err
+			response, err := cluster.servers["n1"].KVPut(context.Background(), KVMutationRequest{RequestID: "shared", Key: "race-a", Value: []byte("a")})
+			results <- requestIDRaceOutcome{"a", response.MutationReceipt, err}
 		}()
 		go func() {
 			<-start
-			_, err := cluster.servers["n2"].KVPut(context.Background(), KVMutationRequest{RequestID: "shared", Key: "race", Value: []byte("b")})
-			results <- err
+			response, err := cluster.servers["n2"].KVPut(context.Background(), KVMutationRequest{RequestID: "shared", Key: "race-b", Value: []byte("b")})
+			results <- requestIDRaceOutcome{"b", response.MutationReceipt, err}
 		}()
 		close(start)
-		assertRaceResults(t, []error{<-results, <-results})
+		winner := requestIDRaceWinner(t, results)
 		cluster.applyAll(t)
+		for id, server := range cluster.servers {
+			assertRequestIDRaceReceipt(t, server, "kv", winner.receipt)
+			if !winner.receipt.Applied {
+				t.Fatalf("winning KV mutation was not applied: %+v", winner.receipt)
+			}
+			for _, choice := range []string{"a", "b"} {
+				value, err := server.KVGet(context.Background(), KVGetRequest{Key: "race-" + choice})
+				if err != nil || value.Found != (choice == winner.choice) || value.Found && string(value.Value) != winner.choice {
+					t.Fatalf("replica %s choice %s value=%+v winner=%s error=%v", id, choice, value, winner.choice, err)
+				}
+			}
+		}
 		if _, err := cluster.servers["n3"].KVPut(context.Background(), KVMutationRequest{RequestID: "after", Key: "after", Value: []byte("ok")}); err != nil {
 			t.Fatalf("follow-up mutation: %v", err)
 		}

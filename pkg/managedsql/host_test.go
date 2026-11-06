@@ -67,12 +67,33 @@ type sqlWireControl struct {
 	putKeys        []string
 }
 
-// Opt in before Open; only an actual owned Host Close starts this lifecycle.
-type sqlWireCloseLifecycle struct{ closing atomic.Bool }
+// Install before Open; only an actual owned Host Close starts this lifecycle.
+type sqlWireCloseLifecycle struct {
+	closing     atomic.Bool
+	acceptedPUT chan string
+}
 
 func (l *sqlWireCloseLifecycle) expectedCanceledPUT(prefix string, r *http.Request, err error) bool {
 	return l.closing.Load() && r.Method == http.MethodPut && errors.Is(r.Context().Err(), context.Canceled) &&
 		errors.Is(err, io.ErrUnexpectedEOF) && strings.HasPrefix(r.URL.Path, prefix) && len(r.URL.Path) > len(prefix)
+}
+
+func (l *sqlWireCloseLifecycle) observePUTFailures(t *testing.T, fixture *sqlStatusFixture) {
+	t.Helper()
+	fixture.closeLifecycle = l
+	control := fixture.source
+	prefix := "/bucket/" + control.finalPrefix + "/"
+	control.putReadFailure = func(r *http.Request, err error) {
+		if !l.expectedCanceledPUT(prefix, r, err) {
+			t.Errorf("unexpected PUT read failure method=%s path=%s canceled=%t owned_close=%t: %v", r.Method, r.URL.Path, errors.Is(r.Context().Err(), context.Canceled), l.closing.Load(), err)
+		} else {
+			t.Logf("expected canceled PUT method=%s path=%s canceled=true owned_close=true", r.Method, r.URL.Path)
+			select {
+			case l.acceptedPUT <- r.URL.Path:
+			default:
+			}
+		}
+	}
 }
 
 func sqlWireStore(t *testing.T) (*httptest.Server, *sqlWireControl) {
@@ -269,13 +290,15 @@ func sqlWireStore(t *testing.T) (*httptest.Server, *sqlWireControl) {
 }
 
 type sqlStatusFixture struct {
-	mu           sync.Mutex
-	obj          map[string]json.RawMessage
-	failFinalize bool
-	dropFinalize bool
-	source       *sqlWireControl
-	peers        map[types.NodeID]*sqlFixturePeer
-	cluster      types.ClusterID
+	mu                  sync.Mutex
+	obj                 map[string]json.RawMessage
+	failFinalize        bool
+	dropFinalize        bool
+	source              *sqlWireControl
+	peers               map[types.NodeID]*sqlFixturePeer
+	cluster             types.ClusterID
+	closeLifecycle      *sqlWireCloseLifecycle
+	closeObserverAtOpen atomic.Bool
 }
 
 type sqlFixturePeer struct {
@@ -368,11 +391,19 @@ func (f *sqlStatusFixture) open(ctx context.Context, cfg Config) (*Host, error) 
 		return nil, fmt.Errorf("fixture peer is not reserved")
 	}
 	ctx = peertest.WithTransport(ctx, string(f.cluster), string(cfg.Runtime.NodeID), p.conn.LocalAddr().String(), p.transport)
+	f.closeObserverAtOpen.Store(f.closeLifecycle != nil && f.source.putReadFailure != nil)
 	host, err := Open(ctx, cfg)
 	if err != nil && host != nil {
-		err = errors.Join(err, host.Close())
+		err = errors.Join(err, f.closeHost(host))
 	}
 	return host, err
+}
+
+func (f *sqlStatusFixture) closeHost(host *Host) error {
+	if f.closeLifecycle != nil {
+		f.closeLifecycle.closing.Store(true)
+	}
+	return host.Close()
 }
 
 func (f *sqlStatusFixture) serve(w http.ResponseWriter, r *http.Request) {
@@ -553,7 +584,7 @@ func TestManagedSQLPublicStartupRejectsRetiredPrototypeBeforeRuntimeEffects(t *t
 			host, err := fixture.open(context.Background(), cfg)
 			if err == nil || host != nil || !strings.Contains(err.Error(), "unsupported managed startup profile") {
 				if host != nil {
-					_ = host.Close()
+					_ = fixture.closeHost(host)
 				}
 				t.Fatalf("retired profile was not explicitly rejected before startup: host=%v err=%v", host, err)
 			}
@@ -594,7 +625,7 @@ func TestManagedSQLPublicStartupPreservesSupportedProfileEvidenceError(t *testin
 
 			host, err := fixture.open(context.Background(), cfg)
 			if host != nil {
-				_ = host.Close()
+				_ = fixture.closeHost(host)
 				t.Fatal("invalid evidence unexpectedly opened a Host")
 			}
 			const want = "unsupported managed startup profile"
@@ -617,7 +648,7 @@ func TestManagedSQLFixtureRetainsPeerSocketUntilHostOpen(t *testing.T) {
 	t.Cleanup(cancel)
 	host, err := f.open(ctx, configs[0])
 	if host != nil {
-		t.Cleanup(func() { _ = host.Close() })
+		t.Cleanup(func() { _ = f.closeHost(host) })
 	}
 	if err != nil {
 		t.Fatalf("fixture endpoint must remain owned through actual Host Open (competitor_bind=%v): %v", bindErr, err)
@@ -625,7 +656,7 @@ func TestManagedSQLFixtureRetainsPeerSocketUntilHostOpen(t *testing.T) {
 	if bindErr == nil {
 		t.Fatal("competing socket acquired the fixture's advertised endpoint")
 	}
-	if err := host.Close(); err != nil {
+	if err := f.closeHost(host); err != nil {
 		t.Fatal(err)
 	}
 	cancel()
@@ -637,12 +668,12 @@ func TestManagedSQLFixtureRetainsPeerSocketUntilHostOpen(t *testing.T) {
 	// Restart uses a fresh parent, not the cancelled previous execution context.
 	restarted, err := f.open(context.Background(), configs[0])
 	if restarted != nil {
-		t.Cleanup(func() { _ = restarted.Close() })
+		t.Cleanup(func() { _ = f.closeHost(restarted) })
 	}
 	if err != nil {
 		t.Fatalf("same transport restart: %v", err)
 	}
-	if err := restarted.Close(); err != nil {
+	if err := f.closeHost(restarted); err != nil {
 		t.Fatal(err)
 	}
 	if err := f.peers[configs[0].Runtime.NodeID].close(); err != nil {
@@ -683,7 +714,7 @@ func TestManagedSQLRealThreeNodeInitializationAndWrite(t *testing.T) {
 		if h != nil {
 			hosts[i] = h
 			t.Cleanup(func() {
-				if err := h.Close(); err != nil {
+				if err := f.closeHost(h); err != nil {
 					t.Error(err)
 				}
 			})
@@ -743,7 +774,7 @@ func TestManagedSQLRealThreeNodeInitializationAndWrite(t *testing.T) {
 	if late != nil {
 		hosts[2] = late
 		t.Cleanup(func() {
-			if err := late.Close(); err != nil {
+			if err := f.closeHost(late); err != nil {
 				t.Error(err)
 			}
 		})
@@ -776,31 +807,21 @@ func TestManagedSQLRealThreeNodeInitializationAndWrite(t *testing.T) {
 func openSQLQuorum(t *testing.T, closeLifecycle ...*sqlWireCloseLifecycle) ([]Config, []*Host, *sqlStatusFixture) {
 	t.Helper()
 	configs, f := sqlCluster(t)
-	var lifecycle *sqlWireCloseLifecycle
+	lifecycle := &sqlWireCloseLifecycle{acceptedPUT: make(chan string, 16)}
 	if len(closeLifecycle) != 0 {
 		if len(closeLifecycle) != 1 || closeLifecycle[0] == nil {
 			t.Fatal("one explicit wire Close lifecycle is required")
 		}
 		lifecycle = closeLifecycle[0]
-		prefix := "/bucket/" + f.source.finalPrefix + "/"
-		f.source.putReadFailure = func(r *http.Request, err error) {
-			if !lifecycle.expectedCanceledPUT(prefix, r, err) {
-				t.Errorf("unexpected PUT read failure method=%s path=%s canceled=%t owned_close=%t: %v", r.Method, r.URL.Path, errors.Is(r.Context().Err(), context.Canceled), lifecycle.closing.Load(), err)
-			} else {
-				t.Logf("expected canceled PUT method=%s path=%s canceled=true owned_close=true", r.Method, r.URL.Path)
-			}
-		}
 	}
+	lifecycle.observePUTFailures(t, f)
 	hosts := make([]*Host, 2)
 	for i := range hosts {
 		h, err := f.open(context.Background(), configs[i])
 		if h != nil {
 			hosts[i] = h
 			t.Cleanup(func() {
-				if lifecycle != nil {
-					lifecycle.closing.Store(true)
-				}
-				if err := h.Close(); err != nil {
+				if err := f.closeHost(h); err != nil {
 					t.Error(err)
 				}
 			})
@@ -850,7 +871,7 @@ func TestManagedSQLDDLReversalDoesNotRearmMissingSource(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := h.Close(); err != nil {
+	if err := f.closeHost(h); err != nil {
 		t.Fatal(err)
 	}
 	f.source.hideArchive.Store(true)
@@ -862,7 +883,7 @@ func TestManagedSQLDDLReversalDoesNotRearmMissingSource(t *testing.T) {
 		t.Cleanup(func() {
 			f.source.hideArchive.Store(false)
 			f.source.hideApplicationStart.Store(false)
-			if err := reopened.Close(); err != nil {
+			if err := f.closeHost(reopened); err != nil {
 				t.Error(err)
 			}
 		})
@@ -895,10 +916,10 @@ func TestManagedSQLDDLReversalDoesNotRearmMissingSource(t *testing.T) {
 	// an existing HEAD creates an artificial permanent If-None-Match conflict.
 	f.source.hideArchive.Store(false)
 	f.source.hideApplicationStart.Store(false)
-	if err := reopened.Close(); err != nil {
+	if err := f.closeHost(reopened); err != nil {
 		t.Fatal(err)
 	}
-	if err := hosts[1].Close(); err != nil {
+	if err := f.closeHost(hosts[1]); err != nil {
 		t.Fatal(err)
 	}
 	readWAL := func() []qlog.Entry {
@@ -934,7 +955,7 @@ func TestManagedSQLDDLReversalDoesNotRearmMissingSource(t *testing.T) {
 		t.Cleanup(func() {
 			f.source.hideArchive.Store(false)
 			f.source.hideApplicationStart.Store(false)
-			if err := blocked.Close(); err != nil {
+			if err := f.closeHost(blocked); err != nil {
 				t.Error(err)
 			}
 		})
@@ -953,7 +974,7 @@ func TestManagedSQLDDLReversalDoesNotRearmMissingSource(t *testing.T) {
 		}
 		f.source.hideArchive.Store(false)
 		f.source.hideApplicationStart.Store(false)
-		if err := blocked.Close(); err != nil {
+		if err := f.closeHost(blocked); err != nil {
 			t.Fatal(err)
 		}
 	} else if openErr == nil {
@@ -983,7 +1004,7 @@ func TestManagedSQLUnusedAssignmentRejectsPreexistingCertifiedSource(t *testing.
 				t.Fatal(err)
 			}
 			for _, h := range hosts {
-				if err := h.Close(); err != nil {
+				if err := f.closeHost(h); err != nil {
 					t.Fatal(err)
 				}
 			}
@@ -1006,7 +1027,7 @@ func TestManagedSQLUnusedAssignmentRejectsPreexistingCertifiedSource(t *testing.
 			h, err := f.open(context.Background(), configs[2])
 			if h != nil {
 				t.Cleanup(func() {
-					if err := h.Close(); err != nil {
+					if err := f.closeHost(h); err != nil {
 						t.Error(err)
 					}
 				})
@@ -1057,7 +1078,7 @@ func TestManagedSQLSourceDefaultS3Provider(t *testing.T) {
 	h, err := f.open(context.Background(), cfg)
 	if h != nil {
 		t.Cleanup(func() {
-			if err := h.Close(); err != nil {
+			if err := f.closeHost(h); err != nil {
 				t.Error(err)
 			}
 		})
@@ -1097,7 +1118,7 @@ func TestManagedSQLSourceLostReceiptResponseRetry(t *testing.T) {
 
 func TestManagedSQLConsumedMissingBirthIsNeverRecreated(t *testing.T) {
 	configs, hosts, f := openSQLQuorum(t)
-	if err := hosts[0].Close(); err != nil {
+	if err := f.closeHost(hosts[0]); err != nil {
 		t.Fatal(err)
 	}
 	// A missing consumed receipt is an error, even before the first SQL/HEAD.
@@ -1117,7 +1138,7 @@ func TestManagedSQLConsumedMissingBirthIsNeverRecreated(t *testing.T) {
 	defer f.source.hideBirth.Store(false)
 	h, err := f.open(context.Background(), configs[0])
 	if h != nil {
-		t.Cleanup(func() { _ = h.Close() })
+		t.Cleanup(func() { _ = f.closeHost(h) })
 	}
 	if err == nil {
 		t.Fatal("Consumed missing birth was recreated")
@@ -1252,7 +1273,7 @@ func TestManagedSQLConcurrentLegitimateInitialMembers(t *testing.T) {
 			}
 		}
 		for _, h := range owned {
-			if err := h.Close(); err != nil {
+			if err := f.closeHost(h); err != nil {
 				t.Error(err)
 			}
 		}
