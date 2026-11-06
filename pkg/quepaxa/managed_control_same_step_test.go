@@ -159,7 +159,7 @@ func requireManagedControlSharedPrefix(t *testing.T, ctx context.Context, source
 	}
 }
 
-func TestManagedControlQuorumPrefixRequiresProposerDelivery(t *testing.T) {
+func TestObserveManagedControlQuorumPrefixRequiresProposerDelivery(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
 	cores, transport := newManagedControlRaceCluster(t, nil)
