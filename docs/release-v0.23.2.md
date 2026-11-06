@@ -36,3 +36,12 @@ actual certificate recorder set, and retains the original recovery assertions.
 The Record boundary uses the existing build-tagged test-hook mechanism and is
 inactive in default builds. This is not a change to the QuePaxa quorum policy
 or evidence that the historical run's exact RPC cancellation order is known.
+
+The Rust managed qualification client also consumes SQL `commit_unknown` through
+one exact-original recovery call. It verifies the returned SQL request ID and
+committed receipt, slot, retention bound and expected result without executing
+the mutation again. Missing, expired, conflicting or still-unknown outcomes
+remain failures. Initial UNKNOWN and recovery observations are recorded
+separately; the zero-container-restart qualification remains unchanged. This
+corrects the client's handling of a valid API outcome, not a claim that the
+historical UNKNOWN's internal cause was reconstructed or eliminated.
