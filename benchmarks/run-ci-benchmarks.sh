@@ -8,6 +8,7 @@ if [[ $# -ne 3 ]]; then
 fi
 
 repo_root=$(git rev-parse --show-toplevel)
+matrix=$(cd -- "$(dirname -- "$0")" && pwd)/ci-benchmark-matrix.txt
 base_sha=$(git rev-parse --verify "$1^{commit}")
 head_sha=$(git rev-parse --verify "$2^{commit}")
 output_dir=$3
@@ -101,6 +102,15 @@ fi
 : >"$output_dir/base.txt"
 : >"$output_dir/candidate.txt"
 mkdir -p "$output_dir/diagnostics"
+awk -v mode="$network_optimization" -v procs="$bench_procs" '$1 == mode {
+	name=$3
+	if (name ~ /^Benchmark(Certified)?ThreePeerSQLExecute\/c[0-9]+$/) {
+		parallel=name; sub(/.*\/c/, "", parallel)
+		sub(/\/c[0-9]+$/, "/c" (parallel / 2 * procs), name)
+	}
+	print name
+}' "$matrix" >"$output_dir/expected-names.txt"
+test -s "$output_dir/expected-names.txt"
 
 run_revision() {
 	local label=$1
@@ -148,7 +158,7 @@ run_revision() {
 					-test.benchmem \
 					-test.cpu "$bench_procs" \
 					-test.timeout 20m
-			) 2>"$capture_fifo" | tee -a "$output"; then
+			) 2>"$capture_fifo" | tee "${stderr_log%.stderr.log}.stdout.log"; then
 				statuses=("${PIPESTATUS[@]}")
 			else
 				statuses=("${PIPESTATUS[@]}")
@@ -162,11 +172,14 @@ run_revision() {
 			if ((status == 0 && capture_status != 0)); then status=$capture_status; fi
 			printf 'binary_exit=%s\nstdout_exit=%s\nstderr_exit=%s\nexit=%s\n' "${statuses[0]}" "${statuses[1]}" "$capture_status" "$status" >"${stderr_log%.stderr.log}.exit"
 			if [[ -s $stderr_log ]]; then cat "$stderr_log" >&2; fi
-			if ((status == 0)); then continue; fi
+			if ((status == 0)); then
+				cat "${stderr_log%.stderr.log}.stdout.log" >>"$output"
+				continue
+			fi
 			if [[ $label == candidate || $network_optimization != none ]]; then
 				return "$status"
 			fi
-			printf 'baseline %s benchmark failed; continuing with available comparisons\n' "$package" | tee -a "$output"
+			printf 'baseline %s benchmark failed; raw retained, unavailable for comparison\n' "$package" | tee -a "$output_dir/unavailable.txt"
 		done
 	done
 }
@@ -179,6 +192,37 @@ for ((sample = 1; sample <= bench_count; sample++)); do
 	else
 		run_revision candidate "$work_root/candidate"
 		run_revision base "$work_root/base"
+	fi
+done
+
+for label in candidate base; do
+	awk -v expected="$bench_count" -v label="$label" -v unavailable="$output_dir/unavailable.txt" '
+		NR == FNR { required[$1]=1; next }
+		/^Benchmark/ {
+			name=$1; sub(/-[0-9]+$/, "", name)
+			if ($2 !~ /^[1-9][0-9]*$/ || $3 !~ /^[0-9]+([.][0-9]+)?([eE][+-]?[0-9]+)?$/ || $4 != "ns/op") { bad=1; next }
+			count[name]++
+			if (!(name in required)) {
+				if (label == "candidate") { print "unexpected benchmark: " name > "/dev/stderr"; bad=1 }
+				else if (!reported[name]++) print "base baseline-only: " name >> unavailable
+			}
+		}
+		END {
+			for (name in required) if (count[name] != expected) {
+				message=label " unavailable: " name " samples=" (count[name]+0) "/" expected
+				if (label == "candidate") { print message > "/dev/stderr"; bad=1 }
+				else print message >> unavailable
+			}
+			exit bad
+		}' "$output_dir/expected-names.txt" "$output_dir/$label.txt"
+	# A partial baseline case is unavailable, not an apparently complete pair.
+	if [[ $label == base ]]; then
+		awk -v expected="$bench_count" -v names="$output_dir/expected-names.txt" '
+			BEGIN { while ((getline name < names) > 0) required[name]=1; close(names) }
+			FNR == NR { if ($1 ~ /^Benchmark/) { name=$1; sub(/-[0-9]+$/, "", name); count[name]++ }; next }
+			{ name=$1; sub(/-[0-9]+$/, "", name); if (name in required && count[name] == expected) print }
+		' "$output_dir/base.txt" "$output_dir/base.txt" >"$work_root/base-valid.txt"
+		mv "$work_root/base-valid.txt" "$output_dir/base.txt"
 	fi
 done
 

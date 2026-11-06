@@ -388,6 +388,11 @@ jobs:
             if [[ $status -ne 0 ]]; then
               return "$status"
             fi
+            # Exit zero also means a stale -run selector matched no tests.
+            if ! grep -Eq '^--- PASS: Test[^[:space:]]* ' "$evidence_dir/logs/$label.log"; then
+              printf '%s: no passing test executed\n' "$label" >&2
+              return 1
+            fi
             if [[ $cleanup_status -ne 0 ]]; then
               return "$cleanup_status"
             fi
