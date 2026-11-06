@@ -460,7 +460,9 @@ jq -e 'all(.items[]|select(.kind=="Role" and .metadata.name=="rhiza-operator")|.
 k -n "$namespace" apply --validate=strict -f "$logs/managed-install-gated.json"
 k -n "$namespace" get deployments -o json > "$logs/before-cr-deployments.json"
 jq -e 'all(.items[]; .metadata.name!="" and .metadata.name!="sql" and (.metadata.labels["rhiza.mrchypark.dev/cluster-uid"] // "")=="")' "$logs/before-cr-deployments.json" >/dev/null
-jq -n --arg image "$image" --arg protocol "$fixture_protocol" '{apiVersion:"rhiza.mrchypark.dev/v1alpha2",kind:"RhizaCluster",metadata:{name:"sql"},spec:{logicalID:"managed-ci",genesisIntent:"Create",voterCount:3,workload:{podTemplate:{spec:{containers:[{name:"sql",image:$image}]}}}}} | if $protocol=="" then . else .spec.applicationProtocol=$protocol end' | k -n "$namespace" apply -f -
+jq -n --arg image "$image" --arg protocol "$fixture_protocol" '{apiVersion:"rhiza.mrchypark.dev/v1alpha2",kind:"RhizaCluster",metadata:{name:"sql"},spec:{logicalID:"managed-ci",genesisIntent:"Create",voterCount:3,workload:{podTemplate:{spec:{containers:[{name:"sql",image:$image}]}}}}} | if $protocol=="" then . else .spec.applicationProtocol=$protocol end' > "$logs/requested-cluster.json"
+jq -e 'has("status")|not' "$logs/requested-cluster.json" >/dev/null
+k -n "$namespace" apply --validate=strict -f "$logs/requested-cluster.json"
 uid=$(k -n "$namespace" get rhizacluster sql -o jsonpath='{.metadata.uid}')
 selector="rhiza.mrchypark.dev/cluster-uid=$uid"
 attempt=0
@@ -514,6 +516,14 @@ run_client insert-sql execute '{"request_id":"bootstrap-insert","sql":"INSERT IN
 managed_initial_ack_oracle "$logs/insert-sql.json" insert_ack
 run_client query query '{"sql":"SELECT id, value FROM bootstrap_ci"}'
 managed_bootstrap_check initial query_rows "$logs/query.json" '.rows==[[1,"real-kubelet"]]'
+if [ "${published_install_only-false}" = true ]; then
+  k -n "$namespace" get deployments -l "$selector" -o json > "$logs/installed-deployments.json"
+  jq -e --arg uid "$uid" '.items|length==1 and any(.[0].metadata.ownerReferences[]; .kind=="RhizaCluster" and .uid==$uid and .controller==true)' "$logs/installed-deployments.json" >/dev/null
+  jq -e --arg image "$image" '.items|length==3 and all(.[]; any(.status.conditions[]; .type=="Ready" and .status=="True") and (.status.containerStatuses|length)==1 and all(.status.containerStatuses[]; .restartCount==0) and ([.status.initContainerStatuses[]|select(.state.terminated.exitCode==0)]|length)==2 and all(.spec.volumes[]; has("persistentVolumeClaim")|not) and all(.spec.containers[],.spec.initContainers[]; .image==$image))' "$logs/ready-pods.json" >/dev/null
+  printf 'image=%s\n' "$image" > "$logs/published-image.txt"
+  printf '%s\n' 'PASS: published-image managed install: status-free CR -> owned Deployment -> three Ready NoPVC Pods -> committed SQL ACK and exact readback' 'SCOPE: installation only; Rust/CABI, Pod replacement, C3/C5 and Chaos are not executed or qualified by this mode' > "$logs/published-install-result.txt"
+  return 0
+fi
 if [ "$fixture_case" != legacy ]; then
   producer_uid=$(jq -er '.status.bootstrapPlan.members|sort_by(.member.node_id)|.[0].podUID' "$logs/committed.json")
   producer_pod=$(jq -er --arg uid "$producer_uid" '.items[]|select(.metadata.uid==$uid)|.metadata.name' "$logs/ready-pods.json")

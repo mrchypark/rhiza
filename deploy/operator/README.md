@@ -58,6 +58,16 @@ The existing six-lane Kind qualification covers this managed bootstrap and
 healthy-quorum repair path with isolated provider emulators. It does not grant
 live-cloud parity, install credentials for consumers, or implement automatic DR.
 
+The same CI driver has a separate installation-only scope selected by
+`RHIZA_MANAGED_PUBLISHED_INSTALL_ONLY=true`. It uses the pinned published image
+`ghcr.io/mrchypark/rhiza-operator@sha256:2f7752353aa8796a074cf8cf3d91102f206d30cc0628cfd5fff4fcd37e555f40`
+for the operator, init containers and host, without building a CI application
+image. It stops after a status-free CR produces an owned Deployment, three
+Ready NoPVC Pods and committed SQL ACK/exact readback. Its distinct
+`ha-managed-published-install/published-install-result.txt` artifact is not
+evidence for Rust/C ABI, Pod replacement, C3/C5 or Chaos. Without this explicit
+flag, the original six-lane qualification continues unchanged.
+
 `rhiza-prepare-identity` binds the actual Pod UID to its identity handoff.
 `rhiza-await-bootstrap-plan` waits for the committed bootstrap/repair preparation
 before the main runtime opens. They share the data `emptyDir` with the main

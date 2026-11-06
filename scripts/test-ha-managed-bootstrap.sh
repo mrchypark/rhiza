@@ -2,6 +2,30 @@
 # Actual owned Kind bootstrap/recovery with two scoped Chaos Mesh kill actions.
 set -eu
 cd "$(CDPATH='' cd -- "$(dirname -- "$0")/.." && pwd)"
+cleanup_managed_private() {
+  rm -f "$private/runtime.json" "$private/kubeconfig" "$private/curl.conf" "$private/request.body" "$private/admin.token" "$private/runtime-before.json" "$private/runtime-after.json" "$private/chaos-chart.yaml" "$private/chaos-render.jsonl" "$private/chaos-failure.json" "$private/gcs-emulator.json" "$private/managed-install.jsonl" || return 1
+  rmdir "$private"
+}
+managed_private_cleanup_self_test() (
+  scratch=$(mktemp -d)
+  private=$scratch/private
+  trap 'rm -f "$private/managed-install.jsonl" "$private/unlisted" "$scratch/error"; rmdir "$private" 2>/dev/null || :; rmdir "$scratch"' EXIT HUP INT TERM
+  mkdir "$private"
+  # Seed the actual generated fixture filename, not a parallel mock spelling.
+  generated=$(sed -n 's/.*> "\$private\/\(managed-install.jsonl\)".*/\1/p' scripts/ha-managed-bootstrap-fixture.sh)
+  [ "$generated" = managed-install.jsonl ] || exit 1
+  : > "$private/$generated"
+  cleanup_managed_private || exit 1
+  [ ! -e "$private" ] || exit 1
+  mkdir "$private"
+  : > "$private/unlisted"
+  if cleanup_managed_private 2> "$scratch/error"; then exit 1; fi
+  [ -f "$private/unlisted" ] || exit 1
+)
+if [ "${1-}" = --private-cleanup-self-test ]; then
+  managed_private_cleanup_self_test
+  exit 0
+fi
 managed_first_pod_fault_self_test() (
   scratch=$(mktemp -d)
   trap 'rm -f "$scratch"/*.json "$scratch"/*.txt "$scratch"/*.exit; rmdir "$scratch"' EXIT HUP INT TERM
@@ -109,13 +133,19 @@ fi
 : "${RUNNER_TEMP:?}" "${GITHUB_SHA:?}" "${GITHUB_RUN_ID:?}" "${GITHUB_RUN_ATTEMPT:?}"
 fixture_provider=${RHIZA_MANAGED_FIXTURE_PROVIDER-s3}
 case "$fixture_provider" in s3|gcs|azure) ;; *) echo 'unsupported explicit emulator provider' >&2; exit 1 ;; esac
+published_install_only=${RHIZA_MANAGED_PUBLISHED_INSTALL_ONLY-false}
+case "$published_install_only" in true|false) ;; *) echo 'invalid published install mode' >&2; exit 1 ;; esac
 logs="$RUNNER_TEMP/ha-managed-bootstrap"
+if [ "$published_install_only" = true ]; then logs="$RUNNER_TEMP/ha-managed-published-install"; fi
 mkdir -p "$logs"
 private=$(mktemp -d "$RUNNER_TEMP/ha-managed-private.XXXXXX")
 nonce=$(od -An -N6 -tx1 /dev/urandom | tr -d ' \n')
 cluster="ha-managed-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-$nonce"
 namespace=managed-bootstrap
 image="rhiza-managed:$GITHUB_SHA-$nonce"
+if [ "$published_install_only" = true ]; then
+  image=ghcr.io/mrchypark/rhiza-operator@sha256:2f7752353aa8796a074cf8cf3d91102f206d30cc0628cfd5fff4fcd37e555f40
+fi
 kubeconfig="$private/kubeconfig"
 owned=0
 built=0
@@ -251,10 +281,12 @@ cleanup() {
       capture_chaos_failure "$fault_name" cleanup || :
       chaos_k delete "podchaos/$fault_name" --wait=true --timeout=45s > "$logs/fault-cleanup.txt" 2>&1 || result=1
     fi
+    if [ "$published_install_only" = false ]; then
     for chaos_component in controller-manager chaos-daemon; do
       k -n "$control" logs -l "app.kubernetes.io/component=$chaos_component" --all-containers --tail=200 --limit-bytes=65536 > "$logs/$chaos_component-current.log" 2>&1 || :
       k -n "$control" logs -l "app.kubernetes.io/component=$chaos_component" --all-containers --previous --tail=200 --limit-bytes=65536 > "$logs/$chaos_component-previous.log" 2>&1 || :
     done
+    fi
     capture_floci
     capture_bootstrap_logs
     k -n "$namespace" get pods,deployments,replicasets,rhizaclusters,jobs,services,endpoints -o json > "$logs/final-state.json" 2>&1 || :
@@ -272,8 +304,7 @@ cleanup() {
     docker image rm "$image" > "$logs/image-cleanup.txt" 2>&1 || result=1
     if docker image inspect "$image" >/dev/null 2>&1; then result=1; fi
   fi
-  rm -f "$private/runtime.json" "$private/kubeconfig" "$private/curl.conf" "$private/request.body" "$private/admin.token" "$private/runtime-before.json" "$private/runtime-after.json" "$private/chaos-chart.yaml" "$private/chaos-render.jsonl" "$private/chaos-failure.json" "$private/gcs-emulator.json"
-  rmdir "$private" || result=1
+  cleanup_managed_private || result=1
   printf '%s\n' "$result" > "$logs/driver.exit"
   exit "$result"
 }
@@ -283,12 +314,14 @@ kind get clusters > "$logs/clusters-before.txt"
 if grep -Fx "$cluster" "$logs/clusters-before.txt" >/dev/null; then exit 1; fi
 owned=1
 kind create cluster --name "$cluster" --kubeconfig "$kubeconfig" --wait 120s > "$logs/create.txt" 2>&1
-built=1
-docker build -f "${RHIZA_MANAGED_TEST_DOCKERFILE:-Dockerfile.operator}" -t "$image" . > "$logs/build.txt" 2>&1
-kind load docker-image --name "$cluster" "$image" > "$logs/load.txt" 2>&1
+if [ "$published_install_only" = false ]; then
+  built=1
+  docker build -f "${RHIZA_MANAGED_TEST_DOCKERFILE:-Dockerfile.operator}" -t "$image" . > "$logs/build.txt" 2>&1
+  kind load docker-image --name "$cluster" "$image" > "$logs/load.txt" 2>&1
+fi
 k create namespace "$namespace"
 chaos_namespace_uid=$(k get namespace "$namespace" -o jsonpath='{.metadata.uid}')
-install_kind_chaos
+if [ "$published_install_only" = false ]; then install_kind_chaos; fi
 k apply -f deploy/operator/cluster-crd.yaml -f deploy/operator/crd.yaml
 k wait --for=condition=Established --timeout=90s crd/rhizaclusters.rhiza.mrchypark.dev crd/rhizarecoveries.rhiza.mrchypark.dev
 managed_bucket_setup() {
