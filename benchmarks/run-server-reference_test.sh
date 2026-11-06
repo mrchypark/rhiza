@@ -41,12 +41,13 @@ wait_benchmark_child || status=$?
 status=0
 (
 	source "$here/run-server-reference.sh"
-	trap 'status=$?; trap - EXIT; stop_benchmark_child; printf "cleared=%s\n" "$bench_pid" > "$scratch/cleanup"; exit "$status"' EXIT
+	trap 'status=$?; trap - EXIT; stop_benchmark_child; builtin kill -KILL "$failed_pid" 2>/dev/null || true; wait "$failed_pid" 2>/dev/null || true; printf "cleared=%s\n" "$bench_pid" > "$scratch/cleanup"; exit "$status"' EXIT
 	sleep 60 & bench_pid=$!
 	printf '%s\n' "$bench_pid" > "$scratch/client.pid"
-	failed_pid=12345
+	sleep 60 & failed_pid=$!
+	fault_attempted=0
 	fault_overlap_probe() { return 0; }
-	kill() { if [[ $1 == -KILL && $2 == 12345 ]]; then return 47; fi; builtin kill "$@"; }
+	kill() { if [[ $1 == -KILL && $2 == "$failed_pid" && $fault_attempted == 0 ]]; then fault_attempted=1; return 47; fi; builtin kill "$@"; }
 	inject_benchmark_fault
 ) >"$scratch/fault.out" 2>"$scratch/fault.err" || status=$?
 [[ $status == 47 ]]
@@ -58,17 +59,42 @@ if kill -0 "$owned_pid" 2>/dev/null; then printf 'owned child survived cleanup\n
 # failure, never a retry that could manufacture an overlap witness.
 failed_pid=12345
 (
+	jobs() { printf '%s\n' "$failed_pid"; }
 	fault_overlap_probe() { [[ $1 != begin ]] || return 23; }
 	kill() { printf 'unexpected kill\n' >&2; return 99; }
 	status=0; inject_benchmark_fault || status=$?
 	[[ $status == 23 ]]
 )
 (
+	jobs() { printf '%s\n' "$failed_pid"; }
 	fault_overlap_probe() { [[ $1 != end ]] || return 24; }
 	kill() { return 0; }
 	status=0; inject_benchmark_fault || status=$?
 	[[ $status == 24 ]]
 )
+
+# An unrelated PID and an already waited child must fail before begin/kill.
+# The mocked kill protects the negative target even if the guard regresses;
+# the real owned benchmark child still has to be cleaned with original exit 1.
+for ownership in unowned stale; do
+	status=0
+	(
+		source "$here/run-server-reference.sh"
+		failed_pid=$$
+		if [[ $ownership == stale ]]; then (exit 0) & failed_pid=$!; wait "$failed_pid"; fi
+		sleep 60 & bench_pid=$!
+		printf '%s\n' "$bench_pid" > "$scratch/$ownership-client.pid"
+		trap 'status=$?; trap - EXIT; stop_benchmark_child; printf "cleared=%s\n" "$bench_pid" > "$scratch/$ownership-cleanup"; exit "$status"' EXIT
+		fault_overlap_probe() { printf 'unexpected probe\n' >> "$scratch/$ownership-calls"; return 0; }
+		kill() { if [[ $2 == "$failed_pid" ]]; then printf 'unexpected target kill\n' >> "$scratch/$ownership-calls"; return 99; fi; builtin kill "$@"; }
+		inject_benchmark_fault
+	) >"$scratch/$ownership.out" 2>"$scratch/$ownership.err" || status=$?
+	[[ $status == 1 && ! -e $scratch/$ownership-calls ]]
+	grep -q 'not a current owned running child' "$scratch/$ownership.err"
+	grep -qx 'cleared=' "$scratch/$ownership-cleanup"
+	owned_pid=$(<"$scratch/$ownership-client.pid")
+	if kill -0 "$owned_pid" 2>/dev/null; then printf 'negative-case client survived cleanup\n' >&2; exit 1; fi
+done
 # Exercise the complete runner wiring with only tiny shell stand-ins. The fake
 # go command copies these fixtures; it never invokes a compiler.
 mkdir -p "$scratch/bin" "$scratch/base-server"

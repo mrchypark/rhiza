@@ -34,6 +34,10 @@ fault_overlap_probe() {
 }
 
 inject_benchmark_fault() {
+	if ! jobs -pr | grep -qx "$failed_pid"; then
+		printf 'fault target is not a current owned running child; refusing injection\n' >&2
+		return 1
+	fi
 	fault_overlap_probe begin >/dev/null || return $?
 	kill -KILL "$failed_pid" || return $?
 	fault_overlap_probe end
