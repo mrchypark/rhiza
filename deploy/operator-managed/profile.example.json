@@ -5,6 +5,7 @@
   "EvidenceFormat": "rhiza-managed-request-append-only/v1",
   "ProfileSecretName": "runtime",
   "Storage": {
+    "enable_reconfiguration": true,
     "admin_token": "REPLACE_WITH_PRIVATE_RANDOM_ADMIN_TOKEN",
     "objstore_provider": "s3",
     "objstore_endpoint": "https://REPLACE_WITH_YOUR_S3_ENDPOINT",

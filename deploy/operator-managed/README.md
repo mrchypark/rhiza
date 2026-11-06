@@ -13,6 +13,7 @@ RhizaCluster, provisions storage, or enables whole-generation disaster recovery.
 2. Create namespace `rhiza` if absent, then install the required Secret:
 
    ```sh
+   kubectl apply -f deploy/operator-managed/namespace.yaml
    kubectl create secret generic runtime -n rhiza \
      --from-file=runtime.json=/absolute/path/to/private/runtime.json
    ```
