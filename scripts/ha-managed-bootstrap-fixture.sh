@@ -1,5 +1,46 @@
 #!/bin/sh
 # Shared actual managed bootstrap/replacement checks. Drivers own API, image and cleanup.
+managed_bootstrap_check() {
+  if jq -e "$4" "$3" >/dev/null 2>&1; then return 0; fi
+  printf 'MANAGED_BOOTSTRAP_ORACLE_FAILURE phase=%s check=%s artifact=%s\n' "$1" "$2" "${3##*/}" >&2
+  return 1
+}
+
+managed_initial_ack_oracle() {
+  managed_bootstrap_check initial "$2" "$1" '
+    def slot: type=="number" and .>0 and .==floor;
+    .status=="committed" and (.slot|slot) and
+    (.retry_through_slot|slot) and .retry_through_slot>=.slot' || return 1
+  if [ "$2" = insert_ack ]; then
+    managed_bootstrap_check initial insert_rows "$1" '.rows_affected==1' || return 1
+  fi
+}
+
+managed_initial_oracle_self_test() (
+  set -eu
+  oracle_dir=$(mktemp -d)
+  trap 'rm -f "$oracle_dir/ack.json" "$oracle_dir/query.json" "$oracle_dir/pods.json" "$oracle_dir/error"; rmdir "$oracle_dir"' EXIT HUP INT TERM
+  printf '%s\n' '{"status":"committed","slot":7,"retry_through_slot":99,"rows_affected":1}' > "$oracle_dir/ack.json"
+  managed_initial_ack_oracle "$oracle_dir/ack.json" insert_ack || exit 1
+  printf '%s\n' '{"status":"committed","slot":7,"retry_through_slot":99,"applied":false}' > "$oracle_dir/ack.json"
+  managed_initial_ack_oracle "$oracle_dir/ack.json" create_ack || exit 1
+  for value in '{"status":"rejected","slot":7,"retry_through_slot":99}' '{"status":"committed","slot":0,"retry_through_slot":99}' '{"status":"committed","slot":7}' '{"status":"committed","slot":7,"retry_through_slot":6}' '{"status":"committed","slot":7,"retry_through_slot":"99"}' '{"status":"committed","slot":7.5,"retry_through_slot":99}' '{}' 'not-json' '{"status":"committed","slot":7,"retry_through_slot":99,"rows_affected":0}'; do
+    printf '%s\n' "$value" > "$oracle_dir/ack.json"
+    if managed_initial_ack_oracle "$oracle_dir/ack.json" insert_ack 2> "$oracle_dir/error"; then exit 1; fi
+    grep -Eq '^MANAGED_BOOTSTRAP_ORACLE_FAILURE phase=initial check=(insert_ack|insert_rows) artifact=ack.json$' "$oracle_dir/error" || exit 1
+  done
+  printf '%s\n' '{"rows":[[1,"real-kubelet"]]}' > "$oracle_dir/query.json"
+  managed_bootstrap_check initial query_rows "$oracle_dir/query.json" '.rows==[[1,"real-kubelet"]]' || exit 1
+  printf '%s\n' '{"rows":[[2,"wrong"]]}' > "$oracle_dir/query.json"
+  if managed_bootstrap_check initial query_rows "$oracle_dir/query.json" '.rows==[[1,"real-kubelet"]]' 2> "$oracle_dir/error"; then exit 1; fi
+  grep -Fx 'MANAGED_BOOTSTRAP_ORACLE_FAILURE phase=initial check=query_rows artifact=query.json' "$oracle_dir/error" || exit 1
+  printf '%s\n' '{"items":[{"status":{"containerStatuses":[{"restartCount":0}]}}]}' > "$oracle_dir/pods.json"
+  managed_bootstrap_check initial restart_zero "$oracle_dir/pods.json" 'all(.items[]; all(.status.containerStatuses[]; .restartCount==0))' || exit 1
+  printf '%s\n' '{"items":[{"status":{"containerStatuses":[{"restartCount":1}]}}]}' > "$oracle_dir/pods.json"
+  if managed_bootstrap_check initial restart_zero "$oracle_dir/pods.json" 'all(.items[]; all(.status.containerStatuses[]; .restartCount==0))' 2> "$oracle_dir/error"; then exit 1; fi
+  grep -Fx 'MANAGED_BOOTSTRAP_ORACLE_FAILURE phase=initial check=restart_zero artifact=pods.json' "$oracle_dir/error" || exit 1
+)
+
 managed_preserve_first_pod_fault() (
   proof_dir=$1 proof_pod=$2 proof_uid=$3
   # Absence is represented by one intentionally empty JSON file, never by a
@@ -192,6 +233,7 @@ managed_mixed_tuple_oracle() {
 }
 
 managed_mixed_tuple_self_test() (
+  managed_initial_oracle_self_test || exit 1
   set -eu
   tuple_test_dir=$(mktemp -d "${TMPDIR:-/tmp}/rhiza-mixed-oracle.XXXXXX")
   # shellcheck disable=SC2329 # Invoked by the owned subshell EXIT/signal trap.
@@ -466,13 +508,15 @@ run_client() {
 }
 
 run_client create-sql execute '{"request_id":"bootstrap-create","sql":"CREATE TABLE bootstrap_ci (id INTEGER PRIMARY KEY, value TEXT)"}'
+managed_initial_ack_oracle "$logs/create-sql.json" create_ack
 run_client insert-sql execute '{"request_id":"bootstrap-insert","sql":"INSERT INTO bootstrap_ci VALUES (1, '\''real-kubelet'\'')"}'
+managed_initial_ack_oracle "$logs/insert-sql.json" insert_ack
 run_client query query '{"sql":"SELECT id, value FROM bootstrap_ci"}'
-jq -e '.rows==[[1,"real-kubelet"]]' "$logs/query.json" >/dev/null
+managed_bootstrap_check initial query_rows "$logs/query.json" '.rows==[[1,"real-kubelet"]]'
 if [ "$fixture_case" != legacy ]; then
   producer_uid=$(jq -er '.status.bootstrapPlan.members|sort_by(.member.node_id)|.[0].podUID' "$logs/committed.json")
   producer_pod=$(jq -er --arg uid "$producer_uid" '.items[]|select(.metadata.uid==$uid)|.metadata.name' "$logs/ready-pods.json")
-  jq -e 'all(.items[]; all(.status.containerStatuses[]; .restartCount==0))' "$logs/ready-pods.json" >/dev/null
+  managed_bootstrap_check initial restart_zero "$logs/ready-pods.json" 'all(.items[]; all(.status.containerStatuses[]; .restartCount==0))'
   k -n "$namespace" logs "$producer_pod" -c sql > "$logs/rust-mixed-prefault.log"
   if [ "$fixture_family" = internal ]; then
     [ "$(grep -Fxc 'RHIZA_ACTUAL_MATERIALIZATION_PROFILE=9' "$logs/rust-mixed-prefault.log")" = 1 ]
@@ -517,13 +561,13 @@ k -n "$namespace" wait --for=condition=Ready pod -l "$selector" --timeout=180s
 k -n "$namespace" get pods -l "$selector" -o json > "$logs/replacement-pods.json"
 jq -e --arg old "$old_uid" '.items|length==3 and all(.[]; .metadata.uid!=$old and ([.status.initContainerStatuses[]?|select(.state.terminated.exitCode==0)]|length)==2 and all(.spec.volumes[]?; has("persistentVolumeClaim")|not))' "$logs/replacement-pods.json" >/dev/null
 run_client query-after-replacement query '{"sql":"SELECT id, value FROM bootstrap_ci"}'
-jq -e '.rows==[[1,"real-kubelet"]]' "$logs/query-after-replacement.json" >/dev/null
+managed_bootstrap_check first_replacement query_rows "$logs/query-after-replacement.json" '.rows==[[1,"real-kubelet"]]'
 jq -S '.status|{bootstrapPlan,genesis,plan:.applicationInit.plan}' "$logs/replacement-status.json" > "$logs/immutable-replacement.json"
 cmp "$logs/immutable-before.json" "$logs/immutable-replacement.json"
 replacement_uid=$(jq -er '.status.repair.plan.replacement.podUID' "$logs/replacement-status.json")
 replacement_pod=$(jq -er --arg uid "$replacement_uid" '.items[]|select(.metadata.uid==$uid)|.metadata.name' "$logs/replacement-pods.json")
 jq -e --slurpfile initial "$logs/committed.json" '.status.repair.plan as $p | ([$initial[0].status.bootstrapPlan.members[].member.node_id]|index($p.replacement.nodeID))==null and ($p.finalVoterIDs|sort)==(([$initial[0].status.bootstrapPlan.members[].member.node_id]|map(select(.!=$p.oldNodeID)))+[$p.replacement.nodeID]|sort)' "$logs/replacement-status.json" >/dev/null
-jq -e --arg uid "$replacement_uid" '[.items[]|select(.metadata.uid==$uid)]|length==1 and any(.[0].status.containerStatuses[]; .name=="sql" and .ready==true and .restartCount==0)' "$logs/replacement-pods.json" >/dev/null
+jq -e --arg uid "$replacement_uid" '[.items[]|select(.metadata.uid==$uid)]|length==1 and any(.[0].status.containerStatuses[]; .name=="sql" and .ready==true and .restartCount==0)' "$logs/replacement-pods.json" >/dev/null || { printf '%s\n' 'MANAGED_BOOTSTRAP_ORACLE_FAILURE phase=first_replacement check=restart_zero artifact=replacement-pods.json' >&2; return 1; }
 managed_replacement_ffi_contract "$replacement_pod" "$replacement_uid" first-replacement
 
 # Replacing a second fresh Pod proves sequential voter repair, not only a
@@ -545,10 +589,10 @@ second_replacement_uid=$(jq -er '.status.repair.plan.replacement.podUID' "$logs/
 [ "$second_replacement_uid" != "$old_uid" ]
 jq -e --arg original_old "$old_node" --slurpfile previous "$logs/replacement-status.json" '.status.repair.plan as $p | ($p.finalVoterIDs|index($original_old))==null and ($p.finalVoterIDs|sort)==(($previous[0].status.repair.plan.finalVoterIDs|map(select(.!=$p.oldNodeID)))+[$p.replacement.nodeID]|sort)' "$logs/replacement-second-status.json" >/dev/null
 second_replacement_pod=$(jq -er --arg uid "$second_replacement_uid" '.items[]|select(.metadata.uid==$uid)|.metadata.name' "$logs/replacement-second-pods.json")
-jq -e --arg uid "$second_replacement_uid" '[.items[]|select(.metadata.uid==$uid)]|length==1 and any(.[0].status.containerStatuses[]; .name=="sql" and .ready==true and .restartCount==0)' "$logs/replacement-second-pods.json" >/dev/null
+jq -e --arg uid "$second_replacement_uid" '[.items[]|select(.metadata.uid==$uid)]|length==1 and any(.[0].status.containerStatuses[]; .name=="sql" and .ready==true and .restartCount==0)' "$logs/replacement-second-pods.json" >/dev/null || { printf '%s\n' 'MANAGED_BOOTSTRAP_ORACLE_FAILURE phase=second_replacement check=restart_zero artifact=replacement-second-pods.json' >&2; return 1; }
 managed_replacement_ffi_contract "$second_replacement_pod" "$second_replacement_uid" second-replacement
 run_client query-after-second-replacement query '{"sql":"SELECT id, value FROM bootstrap_ci"}'
-jq -e '.rows==[[1,"real-kubelet"]]' "$logs/query-after-second-replacement.json" >/dev/null
+managed_bootstrap_check second_replacement query_rows "$logs/query-after-second-replacement.json" '.rows==[[1,"real-kubelet"]]'
 jq -S '.status|{bootstrapPlan,genesis,plan:.applicationInit.plan}' "$logs/replacement-second-status.json" > "$logs/immutable-second-replacement.json"
 cmp "$logs/immutable-before.json" "$logs/immutable-second-replacement.json"
 jq -S '.status.repair' "$logs/replacement-second-status.json" > "$logs/repair-proof-before-restart.json"
@@ -598,7 +642,7 @@ fi
 k -n "$namespace" exec "$replacement_pod" -c sql -- sha256sum /var/lib/rhiza/repair.json /var/lib/rhiza/data/prepared-adoption.json /var/lib/rhiza/data/qlog/voter-identity.json > "$logs/restart-identity-after.txt"
 managed_same_pod_identity_oracle "$logs/restart-identity-before.txt" "$logs/restart-identity-after.txt"
 run_client query-after-restart query '{"sql":"SELECT id, value FROM bootstrap_ci"}'
-jq -e '.rows==[[1,"real-kubelet"]]' "$logs/query-after-restart.json" >/dev/null
+managed_bootstrap_check same_pod_restart query_rows "$logs/query-after-restart.json" '.rows==[[1,"real-kubelet"]]'
 k -n "$namespace" get rhizacluster sql -o json > "$logs/restart-final-status.json"
 managed_completed_repair_oracle "$logs/restart-final-status.json" "$first_replacement_uid" "$first_replacement_node" "$first_operation"
 jq -S '.status.repair' "$logs/restart-final-status.json" > "$logs/repair-proof-after-restart.json"

@@ -36,3 +36,23 @@ actual certificate recorder set, and retains the original recovery assertions.
 The Record boundary uses the existing build-tagged test-hook mechanism and is
 inactive in default builds. This is not a change to the QuePaxa quorum policy
 or evidence that the historical run's exact RPC cancellation order is known.
+
+The Rust managed qualification client also consumes SQL `commit_unknown` through
+one exact-original recovery call. It verifies the returned SQL request ID and
+committed receipt, slot, retention bound and expected result without executing
+the mutation again. Missing, expired, conflicting or still-unknown outcomes
+remain failures. Initial UNKNOWN and recovery observations are recorded
+separately; the zero-container-restart qualification remains unchanged. This
+corrects the client's handling of a valid API outcome, not a claim that the
+historical UNKNOWN's internal cause was reconstructed or eliminated.
+
+Bootstrap setup now requires committed receipts with valid slot/retention
+metadata for its initial SQL mutations, and checks the INSERT effect explicitly.
+Exact-row and zero-restart checks remain unchanged; failures identify the
+phase, check and diagnostic artifact without logging request payloads.
+
+The prepared-checkpoint membership fixture waits for each active voter to learn
+the fixed certified cut and compares its exact prefix, config and membership
+before preparing. Its delayed-voter regression verifies the original mismatch
+refusal and subsequent preparation after real certified delivery. Production
+seal validation is unchanged; historical mismatch details are not reconstructed.
