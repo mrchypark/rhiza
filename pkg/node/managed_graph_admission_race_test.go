@@ -557,8 +557,9 @@ func TestManagedGraphAdmissionRejectsEarlyUnknownOwnerReturn(t *testing.T) {
 }
 
 type managedGraphAdmissionRaceFixture struct {
-	node      *Node
-	transport *graphAdmissionRaceTransport
+	node        *Node
+	transport   *graphAdmissionRaceTransport
+	materialDir string
 }
 
 func newManagedGraphAdmissionRaceFixture(t *testing.T) *managedGraphAdmissionRaceFixture {
@@ -650,7 +651,8 @@ func newManagedGraphAdmissionRaceFixture(t *testing.T) *managedGraphAdmissionRac
 	if n == nil {
 		t.Fatal("managed Graph test node missing")
 	}
-	mat, err := n.openMaterializer(filepath.Join(t.TempDir(), "sqlite.db"), 1)
+	materialDir := t.TempDir()
+	mat, err := n.openMaterializer(filepath.Join(materialDir, "sqlite.db"), 1)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -690,8 +692,18 @@ func newManagedGraphAdmissionRaceFixture(t *testing.T) *managedGraphAdmissionRac
 	n.managedInitiallyAdmitted.Store(true)
 	n.managedGraphInitialRootDone = make(chan struct{})
 	close(n.managedGraphInitialRootDone)
+	// Admission may start a Node-owned publisher even though this fixture does
+	// not call Node.Open. Stop its independent binding lifetime and join it
+	// before the earlier server/materializer/WAL/TempDir cleanups run (LIFO).
+	t.Cleanup(func() {
+		transport.releaseHeld()
+		if binding := n.stopInternalApplication(); binding != nil {
+			binding.active.Wait()
+		}
+		n.wg.Wait()
+	})
 
-	return &managedGraphAdmissionRaceFixture{node: n, transport: transport}
+	return &managedGraphAdmissionRaceFixture{node: n, transport: transport, materialDir: materialDir}
 }
 
 func (f *managedGraphAdmissionRaceFixture) startHeldControl(ctx context.Context) <-chan error {
