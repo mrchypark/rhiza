@@ -103,9 +103,12 @@ if [ "${1-}" = --podchaos-self-test ]; then
     rm -f "$scratch/calls.txt" "$scratch/pod-kill-AllInjected-wait.exit"
   done
   cleanup_helper=$(sed -n '/^cleanup() {/,/^}/p' scripts/test-ha-managed-bootstrap.sh)
+  private_cleanup_helper=$(sed -n '/^cleanup_managed_private() {/,/^}/p' scripts/test-ha-managed-bootstrap.sh)
+  [ -n "$private_cleanup_helper" ]
   mkdir "$scratch/cleanup-private"
+  : > "$scratch/cleanup-private/managed-install.jsonl"
   cleanup_exit=0
-  sh -c 'set +e; logs=$1 private=$1/cleanup-private owned=0 built=0; eval "$2"; (exit 17); cleanup' fixture "$scratch" "$cleanup_helper" || cleanup_exit=$?
+  sh -c 'set +e; logs=$1 private=$1/cleanup-private owned=0 built=0; eval "$3"; eval "$2"; (exit 17); cleanup' fixture "$scratch" "$cleanup_helper" "$private_cleanup_helper" || cleanup_exit=$?
   [ "$cleanup_exit" = 17 ] && [ "$(cat "$scratch/driver-original.exit")" = 17 ] && [ "$(cat "$scratch/driver.exit")" = 17 ]
   [ ! -e "$scratch/cleanup-private" ]
   printf '%s\n' 'PASS: actual PodChaos request/record/CRI callbacks and failure exit controls'
