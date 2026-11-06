@@ -33,6 +33,7 @@ jobs:
           sh -n scripts/test-ha-managed-bootstrap.sh
           sh -n scripts/ha-managed-bootstrap-fixture.sh
           sh scripts/test-ha-managed-bootstrap.sh --private-cleanup-self-test
+          sh scripts/test-ha-managed-bootstrap.sh --install-mode-self-test
       - name: Install the published reference host through a CR
         env:
           RHIZA_MANAGED_FIXTURE_CASE: internal
