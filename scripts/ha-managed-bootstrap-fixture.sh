@@ -21,24 +21,24 @@ managed_initial_oracle_self_test() (
   oracle_dir=$(mktemp -d)
   trap 'rm -f "$oracle_dir/ack.json" "$oracle_dir/query.json" "$oracle_dir/pods.json" "$oracle_dir/error"; rmdir "$oracle_dir"' EXIT HUP INT TERM
   printf '%s\n' '{"status":"committed","slot":7,"retry_through_slot":99,"rows_affected":1}' > "$oracle_dir/ack.json"
-  managed_initial_ack_oracle "$oracle_dir/ack.json" insert_ack
+  managed_initial_ack_oracle "$oracle_dir/ack.json" insert_ack || exit 1
   printf '%s\n' '{"status":"committed","slot":7,"retry_through_slot":99,"applied":false}' > "$oracle_dir/ack.json"
-  managed_initial_ack_oracle "$oracle_dir/ack.json" create_ack
+  managed_initial_ack_oracle "$oracle_dir/ack.json" create_ack || exit 1
   for value in '{"status":"rejected","slot":7,"retry_through_slot":99}' '{"status":"committed","slot":0,"retry_through_slot":99}' '{"status":"committed","slot":7}' '{"status":"committed","slot":7,"retry_through_slot":6}' '{"status":"committed","slot":7,"retry_through_slot":"99"}' '{"status":"committed","slot":7.5,"retry_through_slot":99}' '{}' 'not-json' '{"status":"committed","slot":7,"retry_through_slot":99,"rows_affected":0}'; do
     printf '%s\n' "$value" > "$oracle_dir/ack.json"
     if managed_initial_ack_oracle "$oracle_dir/ack.json" insert_ack 2> "$oracle_dir/error"; then exit 1; fi
-    grep -Eq '^MANAGED_BOOTSTRAP_ORACLE_FAILURE phase=initial check=(insert_ack|insert_rows) artifact=ack.json$' "$oracle_dir/error"
+    grep -Eq '^MANAGED_BOOTSTRAP_ORACLE_FAILURE phase=initial check=(insert_ack|insert_rows) artifact=ack.json$' "$oracle_dir/error" || exit 1
   done
   printf '%s\n' '{"rows":[[1,"real-kubelet"]]}' > "$oracle_dir/query.json"
-  managed_bootstrap_check initial query_rows "$oracle_dir/query.json" '.rows==[[1,"real-kubelet"]]'
+  managed_bootstrap_check initial query_rows "$oracle_dir/query.json" '.rows==[[1,"real-kubelet"]]' || exit 1
   printf '%s\n' '{"rows":[[2,"wrong"]]}' > "$oracle_dir/query.json"
   if managed_bootstrap_check initial query_rows "$oracle_dir/query.json" '.rows==[[1,"real-kubelet"]]' 2> "$oracle_dir/error"; then exit 1; fi
-  grep -Fx 'MANAGED_BOOTSTRAP_ORACLE_FAILURE phase=initial check=query_rows artifact=query.json' "$oracle_dir/error"
+  grep -Fx 'MANAGED_BOOTSTRAP_ORACLE_FAILURE phase=initial check=query_rows artifact=query.json' "$oracle_dir/error" || exit 1
   printf '%s\n' '{"items":[{"status":{"containerStatuses":[{"restartCount":0}]}}]}' > "$oracle_dir/pods.json"
-  managed_bootstrap_check initial restart_zero "$oracle_dir/pods.json" 'all(.items[]; all(.status.containerStatuses[]; .restartCount==0))'
+  managed_bootstrap_check initial restart_zero "$oracle_dir/pods.json" 'all(.items[]; all(.status.containerStatuses[]; .restartCount==0))' || exit 1
   printf '%s\n' '{"items":[{"status":{"containerStatuses":[{"restartCount":1}]}}]}' > "$oracle_dir/pods.json"
   if managed_bootstrap_check initial restart_zero "$oracle_dir/pods.json" 'all(.items[]; all(.status.containerStatuses[]; .restartCount==0))' 2> "$oracle_dir/error"; then exit 1; fi
-  grep -Fx 'MANAGED_BOOTSTRAP_ORACLE_FAILURE phase=initial check=restart_zero artifact=pods.json' "$oracle_dir/error"
+  grep -Fx 'MANAGED_BOOTSTRAP_ORACLE_FAILURE phase=initial check=restart_zero artifact=pods.json' "$oracle_dir/error" || exit 1
 )
 
 managed_preserve_first_pod_fault() (
