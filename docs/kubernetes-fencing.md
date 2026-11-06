@@ -1,261 +1,52 @@
-# Cooperative Kubernetes fencing
+# Kubernetes fencing: retired operational guide
 
-The default automatic-recovery backend is Kubernetes. `KubernetesFencer`
-delivers immutable `RhizaFence` requests; **`rhiza-fencer serve` must also be
-installed** to execute them. The `http` backend remains available explicitly
-for external fencing adapters. This default needs no cloud-specific adapter,
-host CRI socket, privileged DaemonSet, admission webhook, or node mutation.
+The alpha1 `RhizaFence`, StatefulSet, `rhiza-fencer serve` and
+`rhiza-fencer supervise` installation described here is retired, not the
+normal managed HA installation. Do not apply those manifests or enable legacy
+automatic-recovery flags as an alpha2 procedure. There is no implicit migration
+or relabeling of legacy authority, pending operations or storage.
 
-## Supported deployment boundary
+The [v0.23.1 original](https://github.com/mrchypark/rhiza/blob/2262531f266f2638eb21baea6f65de45465ffe90/docs/kubernetes-fencing.md)
+is preserved at its immutable release commit for historical protocol and test
+provenance. Its deployment commands and qualification claims are not current
+operating instructions.
 
-Enroll a **new generation before its first writer starts**. Every application
-process must start through `rhiza-fencer supervise`, including every restart.
-An already-running generation with unregistered or orphan writers cannot be
-retroactively qualified by changing its Pod annotation. Do not treat absence
-from the Kubernetes API as evidence that an old writer never existed.
+## Current managed HA
 
-The supported workload is a dedicated Linux container with the supervisor as
-PID 1, a private PID namespace, one application container, dropped capabilities,
-no privilege escalation, no host mounts, no init/ephemeral containers, and no
-additional credential-bearing writers outside the enrolled workload. Node IDs
-are stable Pod names. The application and its image are trusted; this is not
-an isolation boundary against a compromised application sharing the supervisor's
-service-account token. Administrators who replace images, edit protected
-ledgers, inject processes, or bypass the wrapper can invalidate the contract.
+See the [current operator guide](../deploy/operator/README.md) for genesis,
+healthy-quorum Host repair and certified engine membership responsibilities.
+Normal HA does not require a separate always-on fencer or external lease.
+Healthy repair and whole-generation disaster recovery are different operations.
 
-Exec probes and lifecycle process hooks are unsupported because they could
-start work after the namespace was inspected. The container must retain normal
-kernel procfs at `/proc`; the supervisor verifies its filesystem and PID-1
-view before collecting termination evidence.
+Automatic generation DR is not implemented or qualified. Existing
+`RhizaRecovery` queue/status components do not establish an executable recovery
+controller. The [approved automatic-attempt policy](../deploy/operator/README.md#approved-automatic-attempt-policy-not-implemented-or-qualified)
+defaults OFF; it is not a claim that an enabled runtime can execute it.
 
-Keep the root filesystem read-only, but provide a writable `emptyDir` at `/tmp`
-as the supervised patch does. LatticeDB checkpoint restore creates temporary
-read-only graph materializations there; without this mount a recovered engine
-cannot open its snapshot. This directory is scratch space, not persistent data
-or fencing evidence.
+## Safety boundary retained for independent recovery
 
-The authority verifies the projected token's audience and Pod UID using
-TokenReview, the current Pod's owner UID and source configuration, and the
-single-container wrapper contract. Automatic learners additionally bind the
-root cluster UID, source StatefulSet UID, operation, and immutable credential
-Secret UID; they do not become unrelated, unregistered processes. Learners are
-provisioned before their recovery child exists, so a missing child UID at that
-stage is not fabricated or treated as an authority credential.
+Any separately authorized recovery must establish:
 
-## Evidence and failure behavior
+- Complete old runtime identity and incarnation scope, including voters,
+  learners, sidecars, embedded processes and storage-maintenance writers.
+- Actual independent termination and prevention of recreation, including old
+  container restarts, rescheduling and restored machines. Pod DELETE success,
+  API absence, timeout or an unreachable process is not this proof.
+- Resolution or safe containment of outstanding storage work, including already
+  submitted writes and deletes. A quiet object listing is not a clean drain.
+- A verified source covering successful ACKs, with authentic checkpoint and
+  contiguous certified suffix evidence. Unknown source coverage remains unknown.
+- Fresh live activation authority bound to the exact operation, source,
+  storage, binding and generation. Historical receipts or an expired authority
+  observation do not authorize new activation or future writes.
+- A new ready quorum before service resumes. Unknown evidence or a partition
+  stays Blocked for manual action, not a fabricated proof or bootstrap.
 
-The authority CAS-registers a fresh run before the supervisor spawns its child.
-The same ConfigMap CAS closes a voter slot or the entire source generation.
-The child passes the local startup gate before `Node.Open` and binds its WAL
-once before any writer starts. A concurrent fence either includes that run or
-rejects its startup/bind. Every old incarnation remains in the ledger.
+Preserve unresolved registrations, pending application state, UNKNOWN outcomes
+and anchor/Transition evidence. Never delete a ledger, clear pending state or
+reset object storage to manufacture recovery. Optional manual DR evidence and
+raw externally fenced membership interfaces remain separate; retiring this
+launcher does not remove their safety guards.
 
-If closure wins before WAL bind is authorized, the authority can record a
-separate **never-bound exit** only after the supervisor waits for the child and
-reaps its namespace. The closed CAS history proves this run never obtained
-writer authorization. This is not a fabricated clean drain or invented WAL.
-If a bind committed but its response was lost, its persisted WAL makes this
-exception ineligible; normal drain or independent fencing evidence is required.
-
-For a stop request, the engine closes admission, joins foreground, peer and
-maintenance writers, and drains its lifetime storage-mutation tracker. Unknown
-provider outcomes remain unknown even if an SDK retry later succeeds. A clean
-engine receipt is persisted first. The supervisor then kills and waits for the
-child and kills/reaps remaining processes in its private PID namespace before
-recording separate process-exit evidence. Only matching durable evidence,
-closed recreation admission, and the complete registered inventory permit a
-`processesTerminated/recreationBlocked/storageQuiesced` proof.
-
-This is a useful **reachable, cooperative** fencing path, not power fencing.
-A hard crash, unreachable supervisor, unresolved old registration, unknown
-storage mutation, missing historical registration, or unsupported Pod stays
-pending. A container restart within the same Pod UID may reserve a fresh run
-while admission is open, but must bind its exact historical WAL before writers
-start. A different Pod UID cannot bypass an unresolved prior voter. Restarting
-does not prove an old run safe: every old record remains, and a later fence stays
-pending without its evidence. Such fencing incidents need independent stronger
-evidence from the optional external attestor described below or a carefully
-verified manual recovery; never delete the ledger or restart the object store to
-manufacture a pass.
-
-Voter fencing permanently closes that stable slot in the source generation but
-does not stop surviving voters. A later generation fence preserves immutable
-prior stop receipts and may reuse completed proof. A prior pending stop still
-has to finish; escalation does not replace its evidence with a fresh tracker.
-
-After a verified whole-generation fence, the operator scales the StatefulSet
-to zero and cleans up supervised standalone learners from the exact fenced
-incarnation inventory using UID-preconditioned Pod deletion. The operator's
-namespaced Pod role therefore includes `delete`; it does not force-delete nodes
-or treat a deletion response as fencing proof. All source inventory must still
-disappear before the new generation can start.
-
-### Independent evidence for an unreachable incarnation
-
-A hard-killed or deleted voter leaves no exit receipt, so the cooperative ledger
-can never complete on its own. `rhiza-fencer serve` accepts one **optional**
-external attestation service for exactly that case. Without it, the fence stays
-pending exactly as before.
-
-The trust boundary is explicit. The operator keeps only its namespaced
-Kubernetes credentials and asks a separately operated service, over HTTPS with a
-pinned CA and an audience-bound projected token, to prove that the exact dead
-incarnation is terminally gone. No node, CRI, or cloud credential is added to
-the operator, and the service must not hold write access to `RhizaFence`
-status. Configure it with `RHIZA_FENCE_ATTESTOR_URL`,
-`RHIZA_FENCE_ATTESTOR_TOKEN_FILE`, and `RHIZA_FENCE_ATTESTOR_CA_FILE`. All
-three values are required together, the CA bundle replaces the system root pool
-rather than adding to it, and a partial configuration fails startup instead of
-silently disabling independent evidence or leaving the attestor unpinned.
-
-The authority keeps closing the durable ledger first and keeps writing the status
-itself. It consults the attestor only after that closure is persisted and only
-while the cooperative proof is still incomplete. Before it issues a proof, the
-returned evidence must bind all of:
-
-- the exact request hash and the canonical hash of the closed ledger;
-- the closing operation ID and that same request hash in the barrier evidence;
-- the exact current supervised Pod UID inventory, which is re-read after the
-  attestation and must be unchanged;
-- one terminal runtime per fenced Pod incarnation, restating the Pod UID, node
-  name, node UID, compute instance, container ID, image ID, run IDs, and WAL
-  identities the operator captured before the fault;
-- the exact object-store location of the workload, including the endpoint and
-  account identity that make a provider, bucket, and prefix unambiguous;
-- two observations of `archive/head.bin` and `checkpoint/CURRENT` whose
-  generation, metageneration, and inventory digest are identical, taken at the
-  start and end of a quiet window of at least 30 seconds, whose later
-  observation is no more than two minutes ahead of the authority's own clock.
-
-An incarnation stays pending when its immutable identity was never captured. The
-authority never resolves a dead request by Pod name, never re-derives identity
-after the fault, and never accepts a weaker signal: Pod absence from the
-Kubernetes API, a successful DELETE, an unreachable runtime, an unfinished quiet
-window, and a Pod inventory that changed during attestation all leave the fence
-pending. The storage observation is explicitly labelled independent evidence of
-writer absence and object stability. It is not a clean engine drain, and it never
-authorizes cooperative cleanup that requires one.
-
-The evidence is additive. It is recorded on the existing `RhizaFence` status
-beside the unchanged cooperative proof fields, and the operator still validates
-the persisted proof before it dispatches any recovery. The recommended provider
-behind the service is a GCP VM/power provider for a dedicated
-one-voter-per-node pool that stops the exact instance and detaches its disks.
-That provider, its least-privilege credentials, its deployment, and its
-disposable-cluster qualification are a separate deliverable; nothing in this
-repository contacts a cloud API.
-
-### Pod deletion scope
-
-`--delete-namespaces` (environment default `RHIZA_OPERATOR_DELETE_NAMESPACES`)
-limits post-fence Pod deletion independently of the watched `--namespace`:
-
-- Unset or empty: only the operator's actual namespace from its mounted service
-  account namespace file. If `POD_NAMESPACE` is supplied, it must match that file.
-  Missing or inconsistent self-namespace evidence stops startup; the watched
-  namespace is never substituted as deletion authority.
-- `team-a,team-b`: an explicit namespace allowlist. Whitespace is trimmed and
-  duplicates are harmless. Empty items and invalid namespace names are errors.
-- `*`: explicit all-namespace deletion eligibility; it must be the only value.
-
-This is an upper bound, not a multi-namespace watcher or an RBAC grant. The
-operator still watches one namespace, fencing remains bound to exact workloads,
-and Kubernetes RBAC must independently permit the request. The default manifest
-keeps a namespaced Role; neither CSV nor `*` creates broader Roles/Bindings.
-Only named Pod deletion with an exact UID precondition is available; collection,
-node, namespace, and arbitrary resource deletion are not supported. To operate
-on a watched namespace different from the operator's own namespace, explicitly
-allow that namespace and grant only the corresponding namespace RoleBinding.
-
-## Installation
-
-Use the same versioned/digest-pinned images for server, supervisor, and authority.
-Both repository Dockerfiles include `/usr/local/bin/rhiza-fencer`. Embedded
-applications must include that binary in their own image and use the Go startup
-integration; unwrapped or unsupported hosts cannot produce this proof.
-
-1. Install the operator CRDs, including `deploy/operator/fence-crd.yaml`.
-2. Provide a TLS Secret `rhiza-fencer-tls` (`tls.crt`, `tls.key`) whose certificate
-   is valid for `rhiza-fencer` and its namespace-qualified Service name. Provide
-   its issuing CA as `rhiza-fencer-ca`, key `ca.crt`. Use your normal certificate
-   management; no private key belongs in Git.
-3. Review and apply `deploy/operator/fencing/authority.yaml`. Its namespace Role
-   can update fencing ledgers/status and read workload configuration. The
-   additional ClusterRole can create TokenReviews only; it cannot modify nodes
-   or Pods. Use namespace-specific ClusterRoleBinding names for multiple installs.
-4. Apply the supervised StatefulSet patch to a **fresh** no-PVC generation. The
-   file `deploy/operator/fencing/supervised-statefulset.patch.yaml` contains a
-   strategic-merge patch and a separate application ServiceAccount document;
-   split these documents in your manifest renderer. The application account has
-   no Kubernetes RoleBinding. The token is audience-bound and rotates every ten
-   minutes; the client rereads the token file for each request.
-5. Set `RHIZA_AUTOMATIC_RECOVERY=true` on the operator. Leave
-   `RHIZA_FENCER_BACKEND` empty (default) or use `kubernetes`. For compatibility,
-   an empty backend with existing HTTP URL/token/CA configuration still selects
-   HTTP and rejects incomplete configuration. An explicit backend selection
-   wins. New external HTTPS adapter installations should set `http` explicitly.
-
-The supervisor injects `RHIZA_FENCE_SOCKET` and `RHIZA_FENCE_TICKET` into its child.
-Neither is a substitute for Kubernetes authentication. Missing half of this
-configuration fails startup. The application still needs its normal cluster,
-member credentials, object-store configuration, and
-`RHIZA_ENABLE_RECONFIGURATION=true` opt-in where online replacement is desired.
-
-Do not remove fencing ConfigMaps or closed operations while their source
-generation could still have authority. Ledgers deliberately fail closed at a
-bounded size instead of evicting unresolved history. Ordinary graceful shutdown
-without the exact terminal request is not a fencing receipt.
-
-### Planned restarts and upgrades
-
-A successful application `Close` or exit code zero without an operation-bound
-terminal drain leaves unresolved fencing history; it is not retroactively a
-clean receipt. Same-Pod container restarts can continue the intact WAL while
-admission is open, but a different Pod UID cannot replace an unresolved voter.
-This does not support arbitrary rolling image updates. Keep `OnDelete` and use
-the explicit terminal-fencing/new-generation procedure for planned replacement.
-Old unknown history still needs independent evidence for a later fence, even
-if a newer run exits cleanly. Cloud adapters are optional stronger alternatives,
-not evidence silently supplied by this cooperative default.
-
-## Verification scope
-
-### Learner cleanup evidence
-
-The automatic control journal retains each learner's source generation, creation
-operation, immutable credential UID, Pod UID and authenticated WAL identity until
-the operator can prove that the incarnation can no longer return. Generation
-requests freeze that retained inventory before fencing. A Pod created before the
-journal CAS completes is strictly rediscovered and journaled in a separate
-reconcile before escalation; conflicting ownership blocks recovery.
-
-Cleanup follows a validated full-generation proof, never a Pod deletion as proof.
-An empty WAL is not a wildcard: only an exact cooperative ledger snapshot whose
-hash matches the proof, whose generation closure is complete, and whose every
-run for that Pod is a verified never-bound exit permits this case. External HTTPS
-proofs retain their existing bound-incarnation contract; they do not implicitly
-authorize never-bound cleanup. Operator RBAC already includes ConfigMap `get`.
-History is discarded as soon as the operator verifies the exact terminal proof,
-the Pod UID is gone, and the incarnation's credential is deleted or superseded.
-The controller retries every retained incarnation on later reconciles, including
-entries from generations that are no longer active, so a temporary proof failure
-does not permanently consume the journal. An incarnation missing any part of that
-proof stays in the journal and remains fenced; a Pod deletion alone is never
-proof. A completed external fence request with its exact proof is also retained as
-a retirement receipt, so compaction does not require a cooperative ledger from
-non-cooperative backends. Every retained run for the same Pod UID must be proven;
-one clean run cannot hide an unknown run. Pruning does not mutate an already issued fence request. Pruned identities
-are not retained as tombstones: a learner that reappears without a matching
-journal entry is rejected by the existing unlisted-learner cleanup guard and
-blocks recovery. Preexisting journals that discarded a retired learner's identity
-cannot reconstruct that authority from Pod absence; they remain blocked and
-require independently verified recovery. Learner history is capped at 64 entries,
-and a record that cannot be compacted below the cap blocks with a precise remedy instead of
-exceeding the control-record read limit.
-
-Package tests cover identity, receipt ordering, CAS races, immutable evidence,
-restart uncertainty, and voter-to-generation escalation. Linux Kubernetes
-qualification must exercise the real supervisor/authority and physical storage
-drain without the test-only MinIO-restart fencer. Legacy Kind-fencer test success
-is not evidence for this backend. No GCS, Chaos Mesh, cloud cost, release, or
-unreachable-node power-fencing qualification is implied by package tests.
+See [recovery boundaries](recovery.md#managed-no-pvc-ha-and-manual-disaster-recovery)
+and [anchor protocol limits](recovery-anchor.md).
