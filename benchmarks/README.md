@@ -70,12 +70,27 @@ that application-failure count. A run fails when the count is nonzero, or when
 a fault-injection request exceeds the configurable 1,500 ms maximum latency
 gate (`RHIZA_SERVER_BENCH_MAX_FAULT_LATENCY_MS`).
 
-Fault lanes additionally require a sent, unfinished logical request to span two
-nonce-protected loopback probes bracketing the actual SIGKILL. Process liveness
-alone does not qualify, and a missing witness fails as not qualified rather than
-being retried or manufactured by holding runtime requests. Same-ID retries are
-one logical request. This client-observed overlap does not prove that the failed
+Fault lanes are Linux-only and require a kernel pidfd. Before requests start,
+the parent verifies its running child and captures its `/proc` start-time ticks;
+the client checks the same birth/parent identity and pins it with `PidfdOpen`.
+The nonce-protected loopback `/fault` endpoint accepts no body or target PID,
+makes one `PidfdSendSignal(SIGKILL)` attempt, and records the syscall bracket in
+the same monotonic clock as request sent/finished timestamps. No numeric-PID
+signal fallback is permitted. Unsupported kernels/platforms fail closed.
+
+Only current logical requests and one concurrency-bounded fault snapshot are
+retained. After requests complete, qualification requires a witness with
+`sent <= signal_before` and `finished >= signal_after`. Completion is timestamped
+immediately after the client operation, before any tracking lock; the completion
+lock is never held across the signal. A request that finishes after the signal
+but before endpoint validation can qualify, while one already finished before
+the signal cannot. There are no artificial runtime response holds, repeat fault
+calls, or retries to manufacture a witness. Same-ID retries remain one logical
+operation. Missing overlap fails as **not qualified**, distinct from the request
+availability gate. This client-observed interval does not prove that the failed
 voter was processing the witness. Healthy lanes disable this control/trace path.
+Earlier n1 signal/request ordering remains unknown; deterministic counterexamples
+to the old two-probe oracle do not establish the cause of that historical run.
 Both server revisions use the same candidate client and record its revision,
 binary SHA, receipt oracle, and instrumentation mode. Receipt decoding and
 fault-only trace/control overhead are included; do not compare these results
@@ -85,7 +100,8 @@ prove before-ACK object-store durability.
 `bash benchmarks/run-server-reference_test.sh` checks the real runner wiring
 with explicit stand-ins, including early fault failure and owned-child cleanup.
 These mocks are not an actual server or fault qualification. Go client tests
-separately exercise receipt rejection and actual local HTTP trace lifecycle.
+separately exercise receipt rejection, actual local HTTP trace lifecycle and,
+on Linux, disposable-child pidfd signaling and birth-identity refusal.
 The runner terminates and reaps its exact owned benchmark child on early exit,
 while preserving the original failure status.
 

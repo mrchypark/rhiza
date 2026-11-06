@@ -25,22 +25,19 @@ verify_benchmark_rows() {
 	jq -e --argjson requests "$1" '.rows == [[$requests, $requests]]' >/dev/null
 }
 
-fault_overlap_probe() {
-	local route=$1
-	if ! curl -fsS --max-time 2 -X POST "$control_url/$route"; then
-		printf 'fault overlap not qualified: %s probe failed (no proven sent request spanning fault)\n' "$route" >&2
-		return 1
-	fi
-}
-
 inject_benchmark_fault() {
 	if ! jobs -pr | grep -qx "$failed_pid"; then
 		printf 'fault target is not a current owned running child; refusing injection\n' >&2
 		return 1
 	fi
-	fault_overlap_probe begin >/dev/null || return $?
-	kill -KILL "$failed_pid" || return $?
-	fault_overlap_probe end
+	# The client already pinned the birth identity with a pidfd before requests.
+	# A single call records/signals/checks in its monotonic clock domain.
+	local status=0
+	curl -fsS --max-time 2 -X POST "$control_url/fault" || status=$?
+	if [[ $status != 0 ]]; then
+		printf 'fault coordinator failed; interruption not qualified\n' >&2
+		return "$status"
+	fi
 }
 
 # Unit mocks source only the same small helpers used by the actual runner.
@@ -211,7 +208,14 @@ object_before=$(object_stats)
 result_file="$run_dir/result.json"
 control_args=()
 if [[ $failed_node != none ]]; then
-	control_args=(-fault-control-file "$run_dir/fault-control.url")
+	failed_index=${failed_node#n}
+	failed_pid=$(<"$run_dir/node-$failed_index.pid")
+	if ! jobs -pr | grep -qx "$failed_pid"; then printf 'fault target is not a current owned running child; refusing binding\n' >&2; exit 1; fi
+	# Linux fault lanes only; bind exact start-time ticks as well as the PID.
+	process_stat=$(cat "/proc/$failed_pid/stat")
+	read -ra process_fields <<< "${process_stat##*) }"
+	[[ ${process_fields[19]:-} =~ ^[0-9]+$ ]] || { printf 'fault target start identity unavailable\n' >&2; exit 1; }
+	control_args=(-fault-control-file "$run_dir/fault-control.url" -fault-pid "$failed_pid" -fault-start-time "${process_fields[19]}")
 fi
 "$run_dir/rhiza-bench" -url "$target" -path /sql/execute \
 	-body '{"request_id":"bench-{{id}}","sql":"INSERT INTO benchmark_writes(id) VALUES ({{id}})"}' \
@@ -232,13 +236,11 @@ if [[ $failed_node != none ]]; then
 	fi
 	control_url=$(<"$run_dir/fault-control.url")
 	[[ $control_url =~ ^http://127\.0\.0\.1:[0-9]+/[a-f0-9]{32}$ ]] || { printf 'invalid owned fault control address\n' >&2; exit 1; }
-	failed_index=${failed_node#n}
-	failed_pid=$(<"$run_dir/node-$failed_index.pid")
 	printf 'target=%s\npid=%s\nsignal=SIGKILL\nbefore=%s\n' "$failed_node" "$failed_pid" "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" > "$run_dir/fault-metadata.txt"
 	# Run in this shell, not command substitution: PID ownership/jobs stay local.
 	inject_benchmark_fault > "$run_dir/fault-overlap.json"
 	overlap=$(<"$run_dir/fault-overlap.json")
-	jq -e '.overlap == true and .witnesses > 0' <<<"$overlap" >/dev/null
+	jq -e '.attempted == true and .signal_succeeded == true' <<<"$overlap" >/dev/null
 	printf 'overlap=%s\n' "$overlap" >> "$run_dir/fault-metadata.txt"
 	printf 'after=%s\n' "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" >> "$run_dir/fault-metadata.txt"
 	wait "$failed_pid" 2>/dev/null || true
@@ -248,6 +250,13 @@ wait_benchmark_child
 result=$(<"$result_file")
 # Preserve the client result even when the subsequent correctness gate fails.
 tee "$output_file" <<<"$result" >/dev/null
+if [[ $failed_node != none ]]; then
+	overlap=$(jq -c '.fault_window' <<<"$result")
+	if ! jq -e '.attempted == true and .signal_succeeded == true and .overlap == true and .witnesses > 0' <<<"$overlap" >/dev/null; then
+		printf 'fault interval not qualified: %s\n' "$(jq -r '.reason // "missing_window"' <<<"$overlap")" >&2
+		exit 1
+	fi
+fi
 count=$(curl -fsS -H 'Content-Type: application/json' \
 	-d "{\"sql\":\"SELECT COUNT(*), COUNT(CASE WHEN id >= 0 AND id < $requests THEN 1 END) FROM benchmark_writes\",\"consistency\":\"linearizable\"}" \
 	"$target/sql/query")
@@ -264,6 +273,6 @@ for log in "$run_dir"/node-*.log; do
 	runtime_failure_lines=$((runtime_failure_lines + log_failures))
 done
 jq -nc --argjson result "$result" --argjson count "$count" --argjson overlap "$overlap" --arg client_revision "$client_revision" --arg client_sha256 "$client_sha256" --argjson concurrency "$concurrency" --argjson runtime_failure_lines "$runtime_failure_lines" --argjson max_fault_latency_ms "$max_fault_latency_ms" --argjson object_delta "$object_delta" --argjson object_metric_nodes "$object_metric_nodes" --arg failed_node "$failed_node" --arg target_node "$target_node" --arg durability "$durability" --arg fault_after "$fault_after" \
-	'{transport:"HTTP client + three QUIC voters",client_revision:$client_revision,client_sha256:$client_sha256,receipt_oracle:"sql-insert-id-v1",fault_overlap:$overlap,fault_instrumentation:(if $failed_node == "none" then "disabled" else "sent-logical-request-spans-two-loopback-probes-v1" end),durability_mode:$durability,ack_contract:(if $durability == "before-ack" then "quorum WAL sync and object-store durability before acknowledgement" else "quorum WAL sync; object-store publication async" end),failure_mode:(if $failed_node == "none" then "healthy" else "peer-sigkill-during-load" end),failed_node:$failed_node,target_node:$target_node,fault_after:(if $failed_node == "none" then null else $fault_after end),max_fault_latency_ms:(if $failed_node == "none" then null else $max_fault_latency_ms end),concurrency:$concurrency,object_metric_nodes:$object_metric_nodes,object_measurement:"after schema through final linearizable verification",object_store_delta:$object_delta,runtime_failure_lines:$runtime_failure_lines,result:$result,verification:$count}' \
+	'{transport:"HTTP client + three QUIC voters",client_revision:$client_revision,client_sha256:$client_sha256,receipt_oracle:"sql-insert-id-v1",fault_overlap:$overlap,fault_instrumentation:(if $failed_node == "none" then "disabled" else "pidfd-single-coordinator-monotonic-interval-v2" end),durability_mode:$durability,ack_contract:(if $durability == "before-ack" then "quorum WAL sync and object-store durability before acknowledgement" else "quorum WAL sync; object-store publication async" end),failure_mode:(if $failed_node == "none" then "healthy" else "peer-sigkill-during-load" end),failed_node:$failed_node,target_node:$target_node,fault_after:(if $failed_node == "none" then null else $fault_after end),max_fault_latency_ms:(if $failed_node == "none" then null else $max_fault_latency_ms end),concurrency:$concurrency,object_metric_nodes:$object_metric_nodes,object_measurement:"after schema through final linearizable verification",object_store_delta:$object_delta,runtime_failure_lines:$runtime_failure_lines,result:$result,verification:$count}' \
 	| tee "$output_file"
 jq -e '.runtime_failure_lines == 0 and (.failed_node == "none" or .result.max_ms <= .max_fault_latency_ms)' "$output_file" >/dev/null
