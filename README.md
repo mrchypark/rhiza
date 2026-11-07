@@ -115,6 +115,7 @@ the SDK README.
 ## Operator and managed HA
 
 Start with the [managed operator guide](deploy/operator/README.md) and
+[first-install overlay instructions](deploy/operator-managed/README.md). See the
 [recovery boundaries](docs/recovery.md); a [Korean introduction](docs/embedded-operator.md)
 is also available. The v1alpha2 route is an explicit no-PVC reference-host
 integration, not a turnkey conversion of arbitrary applications that update
@@ -149,12 +150,15 @@ window of 65,536 consensus slots and each receipt carries `retry_through_slot`.
 Within the window, retrying the same request with the same payload returns its
 retained result without re-executing; reusing the ID with different intent
 returns `ErrRequestConflict`.
-`ErrCommitUnknown` means the caller must inspect the request status and, while
-`tip <= retry_through_slot`, retry with the same request ID and payload.
+For the raw Go API, `ErrCommitUnknown` means the caller must inspect request
+status and, while `tip <= retry_through_slot`, retry with the same ID and payload.
 After expiry, or when the request was never submitted, `RequestStatus`
 returns `unknown_or_expired` and the two cases are indistinguishable. Never
 reuse an expired ID for a different intent: the same ID may execute again as a
-new mutation. Use a new `request_id` once the window has passed.
+new mutation. Use a new `request_id` only for a genuinely new operation, not to
+resolve an expired UNKNOWN. Managed callers must use
+[exact-original recovery](docs/managed-internal-request-api.md), not resubmit
+an uncertain operation.
 Use the `RequestKind*`, `RequestState*`, and `MutationCommitted`/
 `MutationRejected` constants instead of comparing wire strings directly.
 
@@ -361,6 +365,7 @@ replica, err := rhiza.OpenReadReplica(ctx, rhiza.ReplicaConfig{
     DataDir:          "./read-1",
     Members:          []rhiza.ReplicaMember{{ID: "n1"}},
     ObjStoreProvider: rhiza.ObjectStoreProviderS3,
+    ObjStoreEndpoint: "s3.amazonaws.com",
     ObjStoreBucket:   "rhiza",
 })
 ```
@@ -401,14 +406,16 @@ Operator.
 Single-voter deployments may use local filesystem storage. Multi-voter
 clusters require shared S3-compatible, GCS, or Azure Blob storage. Read
 replicas must reach the same published namespace; their filesystem provider is
-useful only when that directory is shared or mounted. Object-store durability
-modes are:
+useful only when that directory is shared or mounted. For raw deployments,
+object-store durability modes are:
 
 - `async`: acknowledge after quorum certification and publish in the
   background.
 - `before-ack`: wait for durable object-store publication before acknowledging.
 
-S3 supports custom endpoints and insecure HTTP for local-compatible stores.
+Managed HA accepts only `before-ack`; explicit `async` is rejected.
+S3 endpoints use `host[:port]` without a URL scheme. TLS is used unless
+the insecure option is explicitly enabled for a local-compatible store.
 GCS uses service-account JSON. Azure supports its standard credentials and
 custom endpoint, but GCS endpoint overrides and insecure GCS/Azure transports
 are rejected rather than ignored.
@@ -468,8 +475,12 @@ successful ACKs are covered by the source, and a new ready quorum is verified.
 Unknown or partitioned state stays Blocked for manual action. This automatic
 attempt policy is not yet implemented or qualified by the current operator.
 
-Kubernetes examples live under [`deploy/k8s`](deploy/k8s), including three-peer
-SQL and Graph qualification manifests and both read-replica modes.
+Raw server and replica examples live under [`deploy/k8s`](deploy/k8s), including
+three-peer SQL and Graph qualification manifests. They are not the managed
+CR installation. The [managed bootstrap CI](.github/workflows/ha-managed-bootstrap.yml)
+qualifies that path separately. The [legacy recovery chaos](e2e/chaos/README.md)
+and [fencing qualification](e2e/fencing/README.md) records are not current
+installation or recovery procedures.
 
 ## Peer security
 

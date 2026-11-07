@@ -1,8 +1,16 @@
 # Operator recovery chaos test
 
-The `operator-chaos` CI job builds both binaries from the candidate revision and
-runs them with MinIO in an ephemeral kind Kubernetes cluster. It applies the
-repository CRD and namespace-scoped RBAC and drives the running Operator through
+> **Historical qualification record.** The operator-chaos/MinIO recovery
+> procedure below is retired, not an active CI job or supported recovery
+> procedure. Current CI retains
+> [legacy rejection tests](../../.github/workflows/ci.yml); the
+> [managed bootstrap workflow](../../.github/workflows/ha-managed-bootstrap.yml)
+> qualifies genesis and healthy-quorum repair, not whole-generation DR.
+> For installation, use the [current managed guide](../../deploy/operator/README.md).
+
+The former `operator-chaos` CI job built both binaries from the candidate revision
+and ran them with MinIO in an ephemeral kind Kubernetes cluster. It applied the
+repository CRD and namespace-scoped RBAC and drove the running Operator through
 `RhizaRecovery` resources.
 
 The GCS post-release qualification installs admission policies only for its

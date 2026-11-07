@@ -20,8 +20,12 @@ See the [operator entry point](../../cmd/rhiza-operator/main.go),
 [Pod/init contract](../../pkg/operator/bootstrap_members_v1alpha2.go),
 [reference-host replacement loop](../../cmd/rhiza-ha-init/serve.go), and
 [Host replacement coordinator](../../pkg/managedsql/replacement.go).
-Without the installed managed profile, the default initializer only creates
-an inert candidate; it is not the managed database startup path.
+Without the installed managed profile, the operator CLI polls but refuses new
+genesis before creating a Deployment because it supplies no common-plan
+provider. The library initializer can create a zero-replica candidate when
+given an explicit provider; that is not the managed database startup path.
+The base manifest still references `rhiza-config` and `rhiza-object-store`;
+the managed overlay replaces those dependencies with the profile Secret.
 
 ## Installing the managed reference host
 
@@ -47,13 +51,16 @@ alone is not the managed installation procedure. Use the public sibling
    namespace and operator image overrides, then apply that reviewed output with
    strict server-side validation. This installs the operator/host ServiceAccounts
    and RBAC; it does not supply your private runtime profile or storage.
+   Keep the Namespace, RoleBindings, Secret and CR in the same namespace.
 5. Create a status-free `RhizaCluster` from the
    [managed example](automatic-example.yaml), with `genesisIntent: Create`,
    matching application protocol and reference-host image. Do not pre-create
    its managed Deployment or write genesis/bootstrap authority into status.
 6. Observe the operator-created Deployment and its owner UID, completed identity
    init containers, committed bootstrap plan and the exact cluster-labelled
-   Pods becoming Ready. A successful CR create alone is not a ready database.
+   Pods becoming Ready. A successful CR create or operator rollout alone is
+   not a ready database. Use the overlay guide's first-install checks and an
+   authenticated linearizable query to verify current quorum.
 
 The existing six-lane Kind qualification covers this managed bootstrap and
 healthy-quorum repair path with isolated provider emulators. It does not grant
@@ -81,6 +88,13 @@ does not enforce `Recreate` or create/manage peer and client Services; rollout
 policy, network reachability, service exposure and application integration need
 explicit deployment configuration. `Recreate` is not a termination or fencing
 proof for forced deletion or partitions.
+
+The shipped [RBAC](rbac.yaml) grants more than this reconciliation path uses:
+the operator Role includes Pod and Secret creation/deletion, Service creation,
+and recovery-object permissions. The Host Role can read cluster resources
+and update their status across the namespace by default. These grants do not
+imply that a Service or DR controller runs. Use a trusted namespace and scope
+the Host's cluster and status rules to known CR names where practical.
 
 Normal images contain `rhiza-operator` and `rhiza-ha-init`. A separate fencer
 Deployment or external lease service is not required for normal quorum repair.
@@ -140,9 +154,10 @@ Submit resources with strict server-side field validation (for example,
 otherwise be pruned before admission. Actual API-server admission validation
 is required in CI; schema inspection alone is not that validation.
 
-The pod template supports only `spec.containers` with a name and image. Its
-accepted shape is not proof that an arbitrary image implements the reference
-host or a safe restore integration. Automatic recovery defaults to OFF,
+The pod template supports only `spec.containers` with a name and image. The
+schema permits 1–64 entries, but the managed reference-host builder requires
+exactly one. Schema acceptance is not proof that an arbitrary image implements
+the reference host or a safe restore integration. Automatic recovery defaults to OFF,
 provisional retention defaults to 48 hours, and deletion defaults to Orphan.
 Neither deletion policy authorizes deletion of application storage evidence.
 
@@ -172,8 +187,10 @@ The queue selects from a complete current request list by creationTimestamp,
 using UID to break equal timestamps deterministically. An existing claim is
 never overtaken or released by these components. A protected request finalizer
 and fresh request/authority observations are required; unknown, deleted or
-changed records block. Finalizer installation, safe claim release and the
-trusted retention protocol are not implemented here. Two-resource observations
+changed records block. A [finalizer-install primitive](../../pkg/operator/finalizer_v1alpha2.go)
+exists for an exact UID and resourceVersion, but no running recovery controller
+invokes it. Safe claim release and trusted retention are not implemented in
+this path. Two-resource observations
 are not atomic, and a claim is bookkeeping, not permission to perform recovery.
 `Controller.Run` remains unavailable. CI seeds authority only as a test fixture;
 that seed is not a production genesis or recovery procedure.
