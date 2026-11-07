@@ -87,7 +87,7 @@ proof of no effect. Recovery itself adds zero application proposals and does
 not refresh retention or clear poison. A duplicate submission may be assigned
 a later slot than the canonical first receipt.
 
-The public managed Host requires `before_ack` object-store durability. An
+The public managed Host requires `before-ack` object-store durability. An
 asynchronous success ACK beyond the remote archive head is outside this
 contract; a certified-only or uncertain result must not be reported as a
 durable ACK.

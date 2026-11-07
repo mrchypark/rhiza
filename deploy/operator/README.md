@@ -35,9 +35,10 @@ alone is not the managed installation procedure. Use the public sibling
    authorized mechanism; do not copy CI emulator credentials into a deployment.
 2. Prepare a private runtime profile with the chosen protocol/evidence identity,
    `before-ack` durability, reconfiguration enabled, peer port and `InitImage`.
-   The image must contain `rhiza-operator` and `rhiza-ha-init`; use a reviewed
-   immutable image reference. The workload image must implement the reference
-   host contract, not merely expose an application executable.
+   Use reviewed immutable image references. `InitImage` must contain
+   `/usr/local/bin/rhiza-ha-init`; the operator Deployment image must provide
+   `rhiza-operator`. The workload image must implement the reference host
+   contract, not merely expose an application executable.
 3. Install the profile as Secret `runtime`, key `runtime.json`, in that namespace.
    It is mounted at `/etc/rhiza/managed/runtime.json` and selected with
    `--managed-runtime-profile`. The installed file and the profile Secret read
