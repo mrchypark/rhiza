@@ -73,6 +73,11 @@ jobs:
           printf '%s\n' "$RELEASE_IMAGE" | grep -Eq '^ghcr\.io/mrchypark/rhiza-operator@sha256:[0-9a-f]{64}$'
           gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" --json isDraft,publishedAt | jq -e '.isDraft==false and .publishedAt!=null'
           test "$(git describe --tags --exact-match)" = "$RELEASE_TAG"
+          if ! grep -Fxq 'managed_manual_proof=vcluster' scripts/test-ha-managed-cluster-chaos.sh ||
+             ! grep -Fq 'vcluster|direct-host) managed_verify_first_manual_pod_fault' scripts/ha-managed-bootstrap-fixture.sh; then
+            echo 'release tag does not contain the reference-host manual evidence path; refusing cluster execution' >&2
+            exit 1
+          fi
           docker pull "$RELEASE_IMAGE"
           test "$(docker image inspect "$RELEASE_IMAGE" --format '{{ index .Config.Labels "org.opencontainers.image.revision" }}')" = "$(git rev-parse HEAD)"
           mkdir -p "$RUNNER_TEMP/ha-managed-cluster-chaos"
@@ -163,8 +168,21 @@ jobs:
       - uses: azure/setup-helm@v4
         with:
           version: v3.19.0
+      - name: Prepare pinned YAML renderer
+        shell: sh
+        run: |
+          set -eu
+          mkdir "$RUNNER_TEMP/ha-managed-chaos-tools"
+          curl --fail --silent --show-error --location --max-time 60 https://github.com/mikefarah/yq/releases/download/v4.45.1/yq_linux_amd64 -o "$RUNNER_TEMP/ha-managed-chaos-tools/yq"
+          printf '%s  %s\n' 654d2943ca1d3be2024089eb4f270f4070f491a0610481d128509b2834870049 "$RUNNER_TEMP/ha-managed-chaos-tools/yq" | sha256sum --check
+          chmod 0755 "$RUNNER_TEMP/ha-managed-chaos-tools/yq"
+          printf '%s\n' "$RUNNER_TEMP/ha-managed-chaos-tools" >> "$GITHUB_PATH"
       - name: Offline identity guard regressions
-        run: sh scripts/test-ha-managed-cluster-chaos-test.sh
+        run: |
+          sh scripts/test-ha-managed-cluster-chaos-test.sh
+          if [ -f scripts/test-ha-managed-direct-host-chaos-test.sh ] && grep -Fq -- --overlay-self-test scripts/test-ha-managed-direct-host-chaos-test.sh; then
+            sh scripts/test-ha-managed-direct-host-chaos-test.sh --overlay-self-test
+          fi
       - name: Actual namespace-isolated Kubernetes Chaos Mesh qualification
         env:
           HOST_CONFIG: ${{ secrets.RHIZA_CLUSTER_CHAOS_KUBECONFIG }}
@@ -196,3 +214,12 @@ jobs:
         with:
           name: ha-managed-cluster-chaos-${{ github.run_id }}
           path: ${{ runner.temp }}/ha-managed-cluster-chaos
+      - name: Remove owned YAML renderer
+        if: always()
+        shell: sh
+        run: |
+          set -eu
+          if [ -d "$RUNNER_TEMP/ha-managed-chaos-tools" ]; then
+            rm -f "$RUNNER_TEMP/ha-managed-chaos-tools/yq"
+            rmdir "$RUNNER_TEMP/ha-managed-chaos-tools"
+          fi

@@ -104,6 +104,7 @@ for driver in scripts/test-ha-managed-cluster-chaos.sh scripts/test-ha-managed-d
   ' fixture "$scratch" "$capture" "$waiter"
   cleanup_helper=$(sed -n '/^cleanup() {/,/^}/p' "$driver")
   mkdir "$scratch/cleanup-private"
+  : > "$scratch/cleanup-private/managed-install.jsonl"
   cleanup_code=0
   sh -c 'set +e
     private=$1/cleanup-private logs=$1 RUNNER_TEMP=$1
