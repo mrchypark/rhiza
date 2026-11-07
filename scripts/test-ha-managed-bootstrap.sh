@@ -137,7 +137,7 @@ if [ "${1-}" = --oracle-self-test ]; then
   . scripts/ha-managed-bootstrap-fixture.sh
   managed_first_pod_fault_self_test
   managed_completed_repair_oracle_self_test
-  (cd scripts/ha-managed-bucket-setup-src && go test -mod=readonly -timeout=45s -run 'Test(GatedOracle|CommittedPlanOracle)$' .)
+  (cd scripts/ha-managed-bucket-setup-src && go test -mod=readonly -timeout=45s ./...)
   exit 0
 fi
 if [ "${1-}" = --pod-fault-proof-self-test ]; then
