@@ -105,12 +105,16 @@ Deployment `Recreate` strategy, and `voterCount` updates are unsupported.
 Applications outside the reference host must integrate the corresponding
 startup and repair contracts; the operator is not a generic application adapter.
 
-With no PVC, startup reconstructs the verified SQLite/native Graph pair from
-the selected immutable checkpoint and replays the contiguous certified suffix
-through the registered local WAL's captured certified ACK tip. Checkpoint
+An authenticated first bootstrap may create fresh SQLite/native Graph state
+without a checkpoint. It must be an original bootstrap member with no existing
+registered WAL or application state, no compaction floor or producer locator,
+and a verified genesis prefix. For recovery, startup reconstructs the verified
+SQLite/native Graph pair from the selected immutable checkpoint and replays the
+contiguous certified suffix through the captured certified ACK tip of the
+registered local WAL. Checkpoint
 selection requires the exact QCKP, actual archive certificate/history, full
 object hashes, and pair validation; a CURRENT locator is a hint, not authority.
-Missing roots, identity/prefix drift, incomplete installation, poison, or
+Missing required roots, identity/prefix drift, incomplete installation, poison, or
 ambiguous evidence fail closed rather than creating a new baseline.
 
 Object data is append-only. Online delete GC is not part of this profile. Pod

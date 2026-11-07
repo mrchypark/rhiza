@@ -3,7 +3,7 @@
 v0.23.1 includes quorum-controlled membership across QuePaxa and Go/Rust
 management. The experimental API label remains: release availability does not
 make this automatic disaster recovery or infrastructure fencing. The current
-managed profiles are explicit append-only 9/10, generation 0, with `before_ack`
+managed profiles are explicit append-only 9/10, generation 0, with `before-ack`
 durability. Historical local results below are not current release qualification.
 
 ## Protocol boundary
@@ -80,9 +80,10 @@ membership; replay into an empty WAL is not a rejoin certificate.
 The core APIs are `BeginReconfiguration`, `BeginReconfigurationAt`,
 `FinishReconfigurationAt`, `AbortReconfigurationAt`, `CurrentCluster`, and
 `ClusterForSlot`. Enable it through `quepaxa.Config.EnableReconfiguration`.
-Go exposes `ChangeMembership`, `MembershipStatus`, and `AbortMembership`;
-the Rust methods are `change_membership`, `membership_status`, and
-`abort_membership`. HTTP management requires the admin bearer token. Bind a network transport to its core
+Go exposes `ChangeMembership`, `MembershipStatus`, and `AbortMembership`.
+The Rust methods `change_membership`, `membership_status`, and
+`abort_membership` are on `rhizadb::Db`, not `rhizadb::ManagedDb`.
+HTTP management requires the admin bearer token. Bind a network transport to its core
 with `BindCore` before starting traffic. A plain `NewObserver` remains a
 nonvoting verifier; it must never acquire voting authority by replaying a
 membership record.
