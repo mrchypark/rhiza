@@ -150,13 +150,15 @@ window of 65,536 consensus slots and each receipt carries `retry_through_slot`.
 Within the window, retrying the same request with the same payload returns its
 retained result without re-executing; reusing the ID with different intent
 returns `ErrRequestConflict`.
-For the raw Go API, `ErrCommitUnknown` means the caller must inspect request
-status and, while `tip <= retry_through_slot`, retry with the same ID and payload.
-After expiry, or when the request was never submitted, `RequestStatus`
-returns `unknown_or_expired` and the two cases are indistinguishable. Never
-reuse an expired ID for a different intent: the same ID may execute again as a
-new mutation. Use a new `request_id` only for a genuinely new operation, not to
-resolve an expired UNKNOWN. Managed callers must use
+After `ErrCommitUnknown` from the raw Go `Execute` API, call `ResolveExecute`
+with the exact original request to look up its outcome without resubmitting.
+A separately observed `tip <= retry_through_slot` does not authorize a retry:
+the receipt can expire before a later `Execute` checks it. Do not resubmit if
+you cannot establish that the receipt will still be retained at that check.
+`RequestStatus` reports `unknown_or_expired` both after expiry and when no
+request was submitted; this is not proof that the mutation had no effect.
+Use a new `request_id` only for a genuinely new operation, not to resolve
+an expired UNKNOWN. Managed callers must use
 [exact-original recovery](docs/managed-internal-request-api.md), not resubmit
 an uncertain operation.
 Use the `RequestKind*`, `RequestState*`, and `MutationCommitted`/
