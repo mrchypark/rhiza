@@ -26,6 +26,9 @@ live authority. This rehearsal neither enables Async nor tests that ACK path.
    [protocol mapping](../internal/types/managed_bootstrap.go) fixes the matching
    policy and retry window (65,536 slots for both). Do not infer these settings
    from the archive, `CURRENT`, or restored files.
+   Policy 10 requires a published producer checkpoint locator and its
+   verifiable checkpoint pair. A checkpointless Graph archive is not
+   supported by this rehearsal.
 2. Open the source provider bucket with **read-only credentials** scoped to the
    source objects, including the archive, locator, and referenced checkpoint
    objects. Use a bounded caller context and close the bucket in the caller.
@@ -112,7 +115,8 @@ exact published hashes and tip, compares retained originals with the producer,
 and excludes a later locally certified, WAL-durable but unpublished operation
 without mutating the source. The [Graph fixture](../pkg/recovery/managed_nopvc_protocol_restore_test.go)
 checks that the restored tip and hashes match the published cut, published
-Graph nodes and retained originals with their receipts are intact, and a later
-WAL-only Graph node and its original are absent. The source bucket is unchanged.
+Graph nodes and retained originals with their receipts are intact. A later
+Graph write is certified, WAL-durable, and applied locally but unpublished;
+its node and original are absent from the restore. The source bucket is unchanged.
 Neither fixture qualifies old-writer fencing, live authority, or write
 activation after quorum loss.

@@ -33,9 +33,12 @@ genesis operator, healthy-quorum Host repair, certified engine membership의
    네트워크 단절을 물리적 종료의 증거로 대체하지 않는다.
 3. 이미 제출된 저장소 작업까지 완료되거나 안전하게 격리됐음을 확인한다.
    오래된 삭제 작업이 복구 자료를 손상시킬 가능성도 포함한다.
-4. 성공한 ACK를 포괄하는 source와 checkpoint/연속 certified suffix를 검증한다.
-   async archive lag나 알 수 없는 손실량을 0으로 기록하지 않는다. 부족한
-   source를 낮은 tip, 빈 초기화나 새 bootstrap으로 대체하지 않는다.
+4. 이 자동 시도 설계의 BeforeAck 경로에서는 성공한 ACK를 모두 포함하는
+   source와 checkpoint 및 연속 certified suffix를 검증한다. 별도로 승인된
+   [managed Async 제안](managed-async-recovery.md)은 검증된 게시 cut 이후의
+   미게시 tail 손실만 허용한다. 이 제안도 활성화 기능을 구현한 것은 아니다.
+   archive 지연이나 알 수 없는 손실량을 0으로 기록하지 않고, 부족한 source를
+   임의로 낮춘 tip, 빈 초기화 또는 새 bootstrap으로 대체하지 않는다.
 5. 정확한 source·storage·binding·generation·operation에 대한 live authority와
    Transition을 검증하고, 새 ready quorum을 확인한 뒤 서비스를 재개한다.
 

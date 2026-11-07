@@ -95,10 +95,11 @@ checkpoint. Archive publication or local close failures remain close errors.
 `before-ack` adds remote publication after quorum certification. Given intact,
 non-rollback remote storage and a valid consensus history, it preserves the
 certified prefix containing successful acknowledgments. It neither replaces
-quorum nor recovers a lost voter's outstanding recorder state. `async` can lose
-acknowledged changes newer than the last published prefix after permanent
-loss of the authoritative voter disks; the publication interval is not a
-guaranteed maximum loss window.
+quorum nor recovers a lost voter's outstanding recorder state. In runtime
+paths that support `async`, permanent loss of the authoritative voter disks
+can lose acknowledged changes newer than the last published prefix. The
+publication interval is not a guaranteed maximum loss window. The managed
+initializer and Host do not accept `async`.
 
 ## Managed No-PVC HA and manual disaster recovery
 
@@ -131,11 +132,11 @@ An `automaticRecovery: OFF` schema default or an accepted recovery request/statu
 API is not a DR executor. Do not interpret another accepted policy value as
 execution support or a safe way to activate a new generation.
 
-Activation requires verified
-termination or isolation of the complete old identity scope, recreation
-prevention, termination of every old runtime/voter/sidecar, in-flight
-storage-work completion, certified source coverage of every successful ACK,
-live activation authority and a verified new ready quorum before service resumes.
+The DR design requires independent evidence of termination for the complete
+old writer, voter, learner and sidecar scope, prevention of recreation, and
+safe resolution of in-flight storage work. A verified source, live activation
+authority and a verified new ready quorum are required before service resumes.
+For `before-ack`, the certified source must cover every successful ACK.
 Unknown evidence or partition leaves recovery Blocked for manual action.
 No new lease, epoch or live permissions are introduced. Pending writes,
 UNKNOWN outcomes and live anchor/Transition checks remain protected.
@@ -146,11 +147,15 @@ StatefulSet recovery examples are unsupported by the current alpha2 API and
 must not be applied as an operational procedure.
 
 The source generation's immutable membership record binds its durability mode.
-Manual DR from an `async` source requires explicit data-loss authorization,
-even when the target uses `before-ack`. This is not an alpha2 `allowDataLoss`
-field or permission to enable legacy recovery. Changing an environment variable cannot retroactively protect
-past acknowledgements. Unknown legacy durability records fail closed and must
-not be rewritten or removed to bypass validation. Archive age is evidence age,
+The historical recovery design requires explicit data-loss authorization for an
+`async` source even when the target uses `before-ack`. The separately approved
+managed Async proposal permits only unpublished-tail loss beyond the verified
+published cut. Neither is an implemented managed DR procedure or an alpha2
+`allowDataLoss` field. The current [published-archive rehearsal](managed-async-recovery.md)
+prepares isolated local data without activating a writer.
+Changing an environment variable cannot retroactively protect past
+acknowledgements. Unknown legacy durability records fail closed and must not
+be rewritten or removed to bypass validation. Archive age is evidence age,
 not a bound on the number or age of missing acknowledged writes.
 
 `before-ack` protects successful write acknowledgements under the remote-store
