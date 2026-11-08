@@ -129,6 +129,90 @@ benchmark_host_pressure() {
 		{cpu_some_us:delta(0),io_some_us:delta(1),cpu_steal_ticks:delta(2)}'
 }
 
+sample_benchmark_disks() {
+	local proc=$1
+	shift
+	[[ -r $proc/diskstats ]] || { printf '{}\n'; return 0; }
+	awk -v ids="$*" '
+		BEGIN { n=split(ids, list, " "); for (i=1; i<=n; i++) wanted[list[i]]=1 }
+		{
+			device=$1 ":" $2
+			if (device in wanted) print device, $8, $11, $14, ($19==""?"-":$19), ($20==""?"-":$20)
+		}
+	' "$proc/diskstats" | jq -Rsc '
+		def number: if test("^[0-9]+$") then tonumber else null end;
+		split("\n") | map(select(length>0) | split(" ")) | map({
+			key:.[0], value: (.[1:] | map(number))
+		}) | from_entries'
+}
+
+benchmark_disk_deltas() {
+	local before=$1 after=$2
+	shift 2
+	printf '%s\n' "$@" | jq -Rsc --argjson b "$before" --argjson a "$after" '
+		def delta($id; $i):
+			$b[$id][$i] as $old | $a[$id][$i] as $new |
+			if $old == null or $new == null or $new < $old then null else $new-$old end;
+		split("\n") | map(select(length>0)) as $layout |
+		{voter_devices: $layout, devices: [$layout | unique[] as $id |
+			{device:$id,write_ios:delta($id;0),write_ms:delta($id;1),
+			 weighted_io_ms:delta($id;2),flush_ios:delta($id;3),flush_ms:delta($id;4)}]}'
+}
+
+sample_benchmark_sched() {
+	local proc=$1 pid=$2 enabled=null f dir tid stat runtime wait slices identity
+	local -a fields
+	if { read -r enabled; } 2>/dev/null < "$proc/sys/kernel/sched_schedstats"; then
+		case $enabled in 1) enabled=true ;; 0) enabled=false ;; *) enabled=null ;; esac
+	else
+		enabled=null
+	fi
+	{
+		for f in "$proc/$pid/task/"*/schedstat; do
+			dir=${f%/schedstat}
+			tid=${dir##*/}
+			[[ $tid =~ ^[0-9]+$ ]] || continue
+			{ read -r stat; } 2>/dev/null < "$dir/stat" || continue
+			[[ $stat == "$tid ("* && $stat == *") "* ]] || continue
+			identity=$stat
+			read -ra fields <<< "${stat##*) }"
+			[[ ${fields[19]:-} =~ ^[0-9]+$ ]] || continue
+			{ read -r runtime wait slices; } 2>/dev/null < "$f" || continue
+			[[ $runtime =~ ^[0-9]+$ && $wait =~ ^[0-9]+$ && $slices =~ ^[0-9]+$ ]] || continue
+			{ read -r stat; } 2>/dev/null < "$dir/stat" || continue
+			[[ ${identity%% (*} == "${stat%% (*}" && $stat == *") "* ]] || continue
+			identity=${fields[19]}
+			read -ra fields <<< "${stat##*) }"
+			[[ ${fields[19]:-} == "$identity" ]] || continue
+			printf '%s:%s %s %s %s\n' "$tid" "$identity" "$runtime" "$wait" "$slices"
+		done
+	} | jq -Rsc --argjson enabled "$enabled" '
+		{enabled:$enabled, threads:(split("\n") | map(select(length>0) | split(" ")
+		  | {key:.[0], value:(.[1:] | map(tonumber))}) | from_entries)}'
+}
+
+benchmark_sched_deltas() {
+	local before=$1 after=$2 voters=$3
+	jq -nc --argjson b "$before" --argjson a "$after" --argjson voters "$voters" '
+		[range($voters | length) as $i |
+		 $b[$i] as $old | $a[$i] as $new |
+		 ($old.threads | keys) as $old_keys | ($new.threads | keys) as $new_keys |
+		 [$old_keys[] as $id | select($new.threads[$id] != null) | $id] as $ids |
+		 [$ids[] as $id | [range(3) as $j | $new.threads[$id][$j] - $old.threads[$id][$j]]] as $matched |
+		 (if $old.enabled == true and $new.enabled == true then true
+		  elif $old.enabled == false and $new.enabled == false then false else null end) as $enabled |
+		 # The sysctl gates optional schedstats, not CONFIG_SCHED_INFO. A
+		 # live nonzero proc counter is evidence even when the sysctl is 0.
+		 (if ($matched | length) == 0 or any($matched[][]; . < 0) or
+		    (any($ids[] as $id | $new.threads[$id][]; . > 0) | not) then "unavailable"
+		  elif ($matched|length) != ($old_keys|length) or ($matched|length) != ($new_keys|length)
+		    then "partial_thread_coverage" else "matched_threads" end) as $status |
+		 {node:$voters[$i].node,pid:$voters[$i].pid,schedstats_enabled:$enabled,status:$status,
+		  threads_before:($old_keys|length),threads_after:($new_keys|length),threads_matched:($matched|length),
+		  runtime_ns:(if $status == "matched_threads" or $status == "partial_thread_coverage" then [$matched[][0]]|add else null end),
+		  runqueue_wait_ns:(if $status == "matched_threads" or $status == "partial_thread_coverage" then [$matched[][1]]|add else null end)}]'
+}
+
 inject_benchmark_fault() {
 	if ! jobs -pr | grep -qx "$failed_pid"; then
 		printf 'fault target is not a current owned running child; refusing injection\n' >&2
@@ -223,6 +307,11 @@ if [[ ! $max_fault_latency_ms =~ ^[1-9][0-9]*([.][0-9]+)?$ ]]; then
 	exit 2
 fi
 voter_roots=${RHIZA_SERVER_BENCH_VOTER_ROOTS:-}
+kernel_probe=${RHIZA_SERVER_BENCH_KERNEL_COUNTERS:-0}
+if [[ $kernel_probe != 0 && ( $kernel_probe != 1 || -z $voter_roots || $failed_node != none || $(uname -s) != Linux ) ]]; then
+	printf 'RHIZA_SERVER_BENCH_KERNEL_COUNTERS=1 requires Linux, voter roots and a healthy lane\n' >&2
+	exit 2
+fi
 if [[ -n $voter_roots ]]; then
 	if [[ ! $voter_roots =~ ^/[^:]+:/[^:]+:/[^:]+$ || $voter_roots =~ [[:cntrl:]] ]]; then
 		printf 'RHIZA_SERVER_BENCH_VOTER_ROOTS must contain three colon-separated absolute directories\n' >&2
@@ -530,6 +619,14 @@ resource_before=null
 resource_summary=null
 resource_status=not_collected_non_linux
 host_pressure=null
+kernel_counters=null
+sample_benchmark_schedulers() {
+	local i pid
+	for i in 0 1 2; do
+		pid=$(<"$run_dir/node-$i.pid")
+		sample_benchmark_sched /proc "$pid"
+	done | jq -sc .
+}
 sample_benchmark_voters() {
 	local i pid
 	for i in 0 1 2; do
@@ -558,6 +655,16 @@ elif [[ $(uname -s) == Linux ]]; then
 	resource_before=$(sample_benchmark_voters)
 	resource_status=measured
 	host_before=$(sample_benchmark_host /proc)
+fi
+if [[ $kernel_probe == 1 ]]; then
+	voter_devices=()
+	for root in "${voter_roots_array[@]}"; do
+		device=$(findmnt -nr -o MAJ:MIN --target "$root")
+		[[ $device =~ ^[0-9]+:[0-9]+$ ]] || { printf 'cannot resolve voter block device\n' >&2; exit 1; }
+		voter_devices+=("$device")
+	done
+	sched_before=$(sample_benchmark_schedulers)
+	disk_before=$(sample_benchmark_disks /proc "${voter_devices[@]}")
 fi
 if [[ $stage_probe == 1 ]]; then
 	printf 'ASYNC_WINDOW_BEGIN_NS=%s\n' "$(date +%s%N)" >&2
@@ -602,6 +709,10 @@ wait_benchmark_child
 if [[ $stage_probe == 1 ]]; then
 	printf 'ASYNC_WINDOW_END_NS=%s\n' "$(date +%s%N)" >&2
 fi
+if [[ $kernel_probe == 1 ]]; then
+	disk_after=$(sample_benchmark_disks /proc "${voter_devices[@]}")
+	sched_after=$(sample_benchmark_schedulers)
+fi
 if [[ $resource_status == measured ]]; then
 	host_after=$(sample_benchmark_host /proc)
 fi
@@ -612,6 +723,14 @@ if [[ $resource_status == measured ]]; then
 	resource_after=$(sample_benchmark_voters)
 	resource_summary=$(benchmark_resources "$resource_before" "$resource_after" "$resource_hz")
 	host_pressure=$(benchmark_host_pressure "$host_before" "$host_after")
+fi
+if [[ $kernel_probe == 1 ]]; then
+	disk_summary=$(benchmark_disk_deltas "$disk_before" "$disk_after" "${voter_devices[@]}")
+	sched_summary=$(benchmark_sched_deltas "$sched_before" "$sched_after" "$resource_before")
+	kernel_counters=$(jq -c --argjson sched "$sched_summary" '. + {voter_sched:$sched}' <<<"$disk_summary")
+	if jq -e 'any(.voter_sched[]; .runqueue_wait_ns == null)' <<<"$kernel_counters" >/dev/null; then
+		printf 'kernel scheduling counters disabled or unavailable for at least one voter\n' >&2
+	fi
 fi
 result_with_exit=$(jq --argjson status "$fault_exit_status" '. + {fault_exit_status:$status}' <<<"$result")
 tee "$output_file" <<<"$result_with_exit" >/dev/null
@@ -701,10 +820,10 @@ done
 jq -nc --argjson result "$result" --argjson count "$count" --argjson overlap "$overlap" --argjson fault_exit_status "$fault_exit_status" --arg client_revision "$client_revision" --arg client_sha256 "$client_sha256" --argjson concurrency "$concurrency" --argjson runtime_failure_lines "$runtime_failure_lines" --argjson max_fault_latency_ms "$max_fault_latency_ms" --argjson object_delta "$object_delta" --argjson object_metric_nodes "$object_metric_nodes" --arg failed_node "$failed_node" --arg target_node "$target_node" --arg durability "$durability" --arg fault_after "$fault_after" \
 	'{transport:"HTTP client + three QUIC voters",client_revision:$client_revision,client_sha256:$client_sha256,receipt_oracle:"sql-insert-id-v1",fault_overlap:$overlap,fault_exit_status:$fault_exit_status,fault_instrumentation:(if $failed_node == "none" then "disabled" else "pidfd-single-coordinator-monotonic-interval-v2" end),durability_mode:$durability,ack_contract:(if $durability == "before-ack" then "quorum WAL sync and object-store durability before acknowledgement" else "quorum WAL sync; object-store publication async" end),failure_mode:(if $failed_node == "none" then "healthy" else "peer-sigkill-during-load" end),failed_node:$failed_node,target_node:$target_node,fault_after:(if $failed_node == "none" then null else $fault_after end),max_fault_latency_ms:(if $failed_node == "none" then null else $max_fault_latency_ms end),concurrency:$concurrency,object_metric_nodes:$object_metric_nodes,object_measurement:"after schema through final linearizable verification",object_store_delta:$object_delta,runtime_failure_lines:$runtime_failure_lines,result:$result,verification:$count}' \
 	| jq -c --arg status "$resource_status" --argjson resources "$resource_summary" \
-		--argjson host_pressure "$host_pressure" \
+		--argjson host_pressure "$host_pressure" --argjson kernel_counters "$kernel_counters" \
 		--arg workload "$workload" --arg oracle "$receipt_oracle" --argjson writes "$write_object_delta" --argjson publication "$publication" \
 		--arg provider "$provider" --argjson gcs_classes "$gcs_classes" \
-		'. + {workload:$workload,receipt_oracle:$oracle,voter_resource_status:$status,voter_resources:$resources,host_pressure:$host_pressure,
+		'. + {workload:$workload,receipt_oracle:$oracle,voter_resource_status:$status,voter_resources:$resources,host_pressure:$host_pressure,kernel_counters:$kernel_counters,
 			write_object_store_delta:$writes,async_publication:$publication,object_store_provider:$provider,gcs_request_classes:$gcs_classes}
 		 | if $workload != "sql" then .object_measurement = "after setup through final verification" else . end' \
 	| tee "$output_file"
