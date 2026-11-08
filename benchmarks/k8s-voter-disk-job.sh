@@ -2,13 +2,43 @@
 set -euo pipefail
 umask 077
 
+failure_tail() {
+	local log=$1
+	[[ -s $log ]] || return 0
+	printf 'BENCH_FAILURE_LOG %s (last 20 lines, sensitive lines omitted)\n' "${log##*/}"
+	# These logs come only from the disposable fixture; never print auth material or URL queries.
+	LC_ALL=C awk '
+		/-----BEGIN .*PRIVATE KEY-----/ { pem=1 }
+		{ lower=tolower($0) }
+		pem || lower ~ /authorization|bearer|credential|password|private[_ -]?key|cookie|signature|secret|token["=: ]|[?][^[:space:]]+|https?:\/\/[^\/[:space:]]+@|eyj[a-z0-9_-]+\.[a-z0-9_-]+\./ {
+			print "[sensitive line omitted]"
+			if ($0 ~ /-----END .*PRIVATE KEY-----/) pem=0
+			next
+		}
+		{ gsub(/[[:cntrl:]]/, " "); print substr($0, 1, 800) }
+	' "$log" | tail -n 20
+}
+
+report_failure() {
+	local status=$1 voter
+	(( status != 0 )) || return 0
+	printf 'BENCH_FAILURE status=%s evidence=%s\n' "$status" "${evidence:-unavailable}"
+	if [[ -n ${evidence:-} ]]; then failure_tail "$evidence/apt.log"; fi
+	if [[ -n ${sample:-} ]]; then
+		failure_tail "$sample.log"
+		for voter in 0 1 2; do failure_tail "$sample-node-$voter.log"; done
+		failure_tail "$RHIZA_SERVER_BENCH_GCS_LOG"
+	fi
+}
+
+trap 'status=$?; report_failure "$status" >&2 || true; exit "$status"' EXIT
+
 sha=${RHIZA_EXPERIMENT_SHA:?RHIZA_EXPERIMENT_SHA must be the exact public commit}
 [[ $sha =~ ^[0-9a-f]{40}$ ]]
 trial=$(mktemp -d /work/rhiza-voter-disk.XXXXXX)
 evidence=$trial/evidence
 export HOME=$trial/home GOCACHE=$trial/go-cache GOMODCACHE=$trial/go-mod
 mkdir "$evidence" "$HOME" "$trial/bin"
-trap 'status=$?; if (( status != 0 )); then printf "BENCH_FAILED status=%s evidence=%s\n" "$status" "$evidence" >&2; fi' EXIT
 
 if ! command -v jq >/dev/null; then
 	# Download signed Debian packages without elevating privileges or installing globally.
