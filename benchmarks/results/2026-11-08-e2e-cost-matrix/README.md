@@ -305,3 +305,44 @@ queue wait, flush scheduling and actual WAL sync duration on both revisions.
 The Graph engine follow-up is tracked as
 [LatticeDB Go #253](https://github.com/mrchypark/latticedb-go/issues/253).
 It is not part of these measured revisions.
+
+## LatticeDB Go v0.12.1
+
+[LatticeDB Go #255](https://github.com/mrchypark/latticedb-go/pull/255) is
+included in tag `v0.12.1` (`a3155939`). Successful commits reuse the exact
+committed metadata view; errors and reopen still reload it from storage.
+Rhiza compared `addbce0a` (v0.11.3) with `0567370d` (v0.12.1); only the root
+Go module version and sums changed. Both [Versity S3](https://github.com/mrchypark/rhiza/actions/runs/42481741130)
+and [Floci GCS](https://github.com/mrchypark/rhiza/actions/runs/42481740766)
+passed all 36 samples (three per cell per revision, 1,000 writes at concurrency
+16, zero errors). Raw artifacts: [S3](https://github.com/mrchypark/rhiza/actions/runs/42481741130/artifacts/13618280249),
+[GCS](https://github.com/mrchypark/rhiza/actions/runs/42481740766/artifacts/13617738548).
+
+| Provider | Workload | Mode | Writes/s | p99 (ms) | Voter CPU (s) | Largest voter HWM (MiB) |
+| --- | --- | --- | ---: | ---: | ---: | ---: |
+| S3 | SQL | Async | 1745.80 → 1683.20 | 13.64 → 13.80 | 0.86 → 0.92 | 63.79 → 64.53 |
+| S3 | SQL | BeforeAck | 608.89 → 602.10 | 31.91 → 33.90 | 1.48 → 1.51 | 65.21 → 66.16 |
+| S3 | KV | Async | 1282.72 → 1192.02 | 18.94 → 21.34 | 1.50 → 1.79 | 59.21 → 60.93 |
+| S3 | KV | BeforeAck | 568.78 → 562.73 | 37.91 → 37.42 | 2.03 → 2.06 | 60.26 → 60.85 |
+| S3 | Graph | Async | 268.09 → 390.95 | 86.55 → 58.30 | 6.54 → 2.67 | 60.82 → 60.24 |
+| S3 | Graph | BeforeAck | 207.45 → 278.64 | 105.72 → 67.33 | 7.06 → 3.26 | 61.65 → 60.79 |
+| GCS | SQL | Async | 1681.29 → 1673.59 | 13.84 → 14.24 | 1.02 → 1.06 | 96.79 → 96.92 |
+| GCS | SQL | BeforeAck | 503.07 → 511.44 | 48.81 → 50.89 | 2.54 → 2.50 | 105.97 → 106.75 |
+| GCS | KV | Async | 1009.49 → 1022.53 | 25.36 → 25.86 | 2.63 → 2.33 | 98.31 → 98.33 |
+| GCS | KV | BeforeAck | 380.52 → 398.51 | 56.77 → 56.70 | 4.10 → 3.85 | 103.99 → 104.47 |
+| GCS | Graph | Async | 265.45 → 446.32 | 94.05 → 63.16 | 7.78 → 3.29 | 96.95 → 97.93 |
+| GCS | Graph | BeforeAck | 178.10 → 284.76 | 127.80 → 72.43 | 9.52 → 4.70 | 114.34 → 106.59 |
+
+Per-cell medians use the same CPU and memory scopes as above. Every sample
+retained 1,071 BeforeAck attempts, zero timed Async attempts and 17 forced
+Async publication attempts. The GCS Class A/B splits were unchanged:
+252/819 (SQL BeforeAck), 254/817 (Graph or KV BeforeAck), and 6/11 (forced
+publication). Graph improved on both backends; SQL/KV did not improve across
+the board. These runs do not resolve the earlier GCS SQL Async tail anomaly.
+
+The separate candidate-only Graph Apply profile recorded 1.31 ms/op,
+174,901 B/op and 858 allocs/op. In a previous v0.11.3 run on another runner,
+the same benchmark recorded 6.11 ms/op, 2,729,575 B/op and 49,047 allocs/op.
+The old `LoadGraph` frame used 58.39% cumulative CPU; its replacement
+`LoadGraphWithAppMetadata` used 0.82% in the new profile. These profile runs
+were not paired on one runner; the E2E table is the controlled comparison.
