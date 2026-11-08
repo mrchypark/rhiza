@@ -611,7 +611,8 @@ jobs:
               cd "$RUNNER_TEMP/rhiza-e2e-$revision"
               overlay="$RUNNER_TEMP/sql-returning-receipt-$revision.json"
               jq -n --arg target "$PWD/$fixture" --arg fixture "$candidate" '{Replace:{($target):$fixture}}' >"$overlay"
-              go test -overlay="$overlay" ./pkg/materializer -run '^$' -bench '^BenchmarkSQLReturningReceipt$' -benchtime=400ms -count=3 -benchmem
+              # 200 × 600KB stays below the 256MiB retained-result limit.
+              go test -overlay="$overlay" ./pkg/materializer -run '^$' -bench '^BenchmarkSQLReturningReceipt$' -benchtime=200x -count=3 -benchmem
             ) | tee "$evidence/sql-returning-receipt-$revision.txt"
             grep -Eq '^BenchmarkSQLReturningReceipt([/[:alnum:]_-]*)[[:space:]]' "$evidence/sql-returning-receipt-$revision.txt"
           done

@@ -1540,7 +1540,7 @@ func BenchmarkSQLBatchApply(b *testing.B) {
 func BenchmarkSQLReturningReceipt(b *testing.B) {
 	for _, size := range []int{4096, 600000} {
 		b.Run(strconv.Itoa(size), func(b *testing.B) {
-			m, err := Open(filepath.Join(b.TempDir(), "returning.db"), 1, 4)
+			m, err := Open(filepath.Join(b.TempDir(), "returning.db"), 1, 1024)
 			if err != nil {
 				b.Fatal(err)
 			}
