@@ -191,3 +191,68 @@ it expected 14 Attributes and 6 GETs, and observed 12 and 5. HEAD remained
 at 4 Attributes and 1 GET, with zero block GETs. Commit `e8c6e881` checks
 both the lower total and those unchanged safety-path counters. See the
 [corrected functional CI run 42462502583](https://github.com/mrchypark/rhiza/actions/runs/42462502583).
+
+## WAL buffer reuse and publication lease version checks
+
+Baseline: `a845a33f5fd8bfcfbd82475459330e95161776de`. Candidate and harness:
+`fa870b132e6b93957892b1907b21d1d7e84a7082`. The
+[S3 run](https://github.com/mrchypark/rhiza/actions/runs/42473460816) and
+[GCS run](https://github.com/mrchypark/rhiza/actions/runs/42473462715) each passed
+36 samples: 1,000 writes at concurrency 16, with exact receipt and state checks.
+The candidate combines bounded per-WAL encoding scratch and lease confirmation
+by the acquired version; a changed version still uses the full stable read.
+
+| Provider | Workload | Mode | Writes/s | p99 (ms) | Voter CPU (s) | Largest voter HWM (MiB) |
+| --- | --- | --- | ---: | ---: | ---: | ---: |
+| S3 | SQL | Async | 1708.74 → 1703.15 | 14.23 → 12.82 | 1.07 → 1.03 | 63.90 → 63.65 |
+| S3 | SQL | BeforeAck | 525.19 → 591.93 | 35.09 → 32.13 | 1.88 → 1.72 | 65.48 → 65.34 |
+| S3 | KV | Async | 1029.65 → 1018.70 | 25.27 → 24.66 | 2.57 → 2.71 | 61.07 → 61.28 |
+| S3 | KV | BeforeAck | 444.10 → 499.50 | 43.12 → 41.21 | 3.10 → 2.94 | 60.94 → 60.34 |
+| S3 | GRAPH | Async | 275.93 → 273.98 | 93.67 → 86.74 | 7.61 → 7.39 | 61.05 → 60.23 |
+| S3 | GRAPH | BeforeAck | 203.88 → 217.06 | 105.33 → 103.90 | 8.33 → 8.67 | 62.11 → 61.80 |
+| GCS | SQL | Async | 1588.27 → 1676.13 | 52.38 → 64.88 | 0.70 → 0.68 | 96.80 → 95.70 |
+| GCS | SQL | BeforeAck | 431.09 → 361.58 | 135.48 → 234.54 | 1.96 → 1.80 | 106.48 → 105.66 |
+| GCS | KV | Async | 1063.92 → 1224.74 | 120.91 → 68.21 | 1.31 → 1.26 | 96.73 → 96.57 |
+| GCS | KV | BeforeAck | 388.71 → 355.75 | 122.14 → 192.37 | 2.68 → 2.83 | 103.75 → 103.81 |
+| GCS | GRAPH | Async | 220.79 → 262.22 | 310.41 → 216.50 | 5.20 → 5.03 | 96.41 → 97.95 |
+| GCS | GRAPH | BeforeAck | 145.51 → 170.60 | 347.40 → 334.22 | 6.76 → 6.81 | 110.04 → 107.10 |
+
+Values are medians of three samples per revision. CPU and HWM use the scopes
+defined above. S3 BeforeAck throughput improved in all three cells, but GCS
+SQL and KV BeforeAck throughput decreased in all three paired samples per
+workload. Async and process resource results were mixed. These are not
+evidence of a universal throughput, CPU, or RSS improvement.
+
+BeforeAck write HTTP attempts fell **1,323 → 1,071** (−19.0%) per 1,000 writes
+in every paired sample. Forced Async publication fell **21 → 17** (−19.0%);
+Async timed writes still made no object requests. GCS observed and transport
+counts matched in every classified phase. Class A was unchanged (SQL 252,
+Graph/KV 254, forced publication 6). Class B was SQL **1,071 → 819**,
+Graph/KV **1,069 → 817**, and forced publication **15 → 11**. These are
+emulator operations, not cloud billing.
+
+The separate WAL append-and-sync benchmark with 256-byte payloads changed from
+320 B/op and 1 alloc/op to 0 B/op and 0 allocs/op in all three runs. The
+reusable buffer holds at most 64 KiB per WAL; lower allocation traffic does not
+imply lower process RSS.
+
+The candidate-only Graph Apply profile still attributes 68.1% cumulative CPU
+to LatticeDB `commitPages` and 58.9% to its nested `PageGraph.LoadGraph`.
+The LatticeDB engine, durability settings, and transaction boundaries were
+not changed.
+
+The independent [GCS repeat](https://github.com/mrchypark/rhiza/actions/runs/42474088475)
+used the same baseline, candidate, and harness and passed 36/36. It reproduced
+the HTTP and class counts exactly, including transport/server agreement.
+The first run's SQL/KV BeforeAck throughput drops did not reproduce: repeat
+medians improved 447.82 → 483.23 and 380.10 → 407.22 writes/s, respectively.
+Their p99 medians fell 49.53 → 44.29 and 60.49 → 55.84 ms. GCS SQL Async p99
+increased in both runs (52.38 → 64.88 and 13.43 → 14.50 ms). These paired
+samples establish request-count savings, but not a repeatable latency or
+resource gain across all cells; the Async latency cause remains unresolved.
+
+Local full recovery and QLog tests and focused race tests passed. The initial
+combined local command passed QLog but reached its 55-second timeout in
+QuePaxa. Focused QuePaxa recording, recovery, and quorum tests passed; the
+[full functional CI](https://github.com/mrchypark/rhiza/actions/runs/42473464663)
+ran against the exact candidate.
