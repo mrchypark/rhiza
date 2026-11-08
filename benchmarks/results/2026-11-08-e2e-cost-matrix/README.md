@@ -288,3 +288,20 @@ than a comparable increase in median latency or measured voter CPU time.
 All timed writes used zero GCS requests. Forced publication still used 21
 requests without the lease change and 17 with it. The result does not justify
 changing the Async ACK or WAL sync contract to improve p99.
+
+The [instrumented repeat](https://github.com/mrchypark/rhiza/actions/runs/42475756318)
+passed all 32 samples using the same comparison trees. Median p99 was
+10.90 ms baseline, 11.37 ms WAL-only, 11.29 ms lease-only, and 11.48 ms
+combined. The combined within-block median changes were +5.03% p99 and
+−1.76% throughput. The earlier 280–519 ms tail did not recur. The six highest
+p99 samples had approximately 8.3–9.6% host I/O pressure versus 5.6–6.5% for
+the eight lowest, dividing PSI stall time by the reported client duration
+(an approximation; the host window also covers launch and wait). This
+supports investigating I/O wait, but it does not isolate Rhiza WAL `fsync`
+or explain the larger earlier stalls. CPU steal was zero in all samples;
+that does not exclude contention. The next discriminating measurement is
+queue wait, flush scheduling and actual WAL sync duration on both revisions.
+
+The Graph engine follow-up is tracked as
+[LatticeDB Go #253](https://github.com/mrchypark/latticedb-go/issues/253).
+It is not part of these measured revisions.
