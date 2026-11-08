@@ -163,6 +163,7 @@ target_node=${RHIZA_SERVER_BENCH_TARGET_NODE:-n1}
 durability=${RHIZA_SERVER_BENCH_DURABILITY:-async}
 workload=${RHIZA_SERVER_BENCH_WORKLOAD:-sql}
 publish_async=${RHIZA_SERVER_BENCH_ASYNC_PUBLISH:-0}
+stage_probe=${RHIZA_ASYNC_STAGE_PROBE:-0}
 provider=${RHIZA_SERVER_BENCH_PROVIDER:-s3}
 fault_after=${RHIZA_SERVER_BENCH_FAULT_AFTER:-1}
 max_fault_latency_ms=${RHIZA_SERVER_BENCH_MAX_FAULT_LATENCY_MS:-1500}
@@ -351,6 +352,7 @@ for i in 0 1 2; do
 		RHIZA_DATA_DIR="$run_dir/node-$i" RHIZA_CLUSTER_MEMBERS="$members" "${peer_token_env[@]+${peer_token_env[@]}}" \
 		"${admin_env[@]+${admin_env[@]}}" \
 		"${object_env[@]}" RHIZA_OBJSTORE_PREFIX=server-bench \
+		RHIZA_ASYNC_STAGE_PROBE="$stage_probe" \
 		RHIZA_OBJSTORE_DURABILITY="$durability" RHIZA_OBJSTORE_SYNC_INTERVAL=1h RHIZA_CHECKPOINT_INTERVAL=0 \
 		"$run_dir/rhiza" >"$run_dir/node-$i.log" 2>&1 &
 	printf '%s' "$!" >"$run_dir/node-$i.pid"
@@ -363,6 +365,10 @@ for i in 0 1 2; do
 	done
 	if ! curl -fsS "http://127.0.0.1:$port/ready" >/dev/null; then
 		sed -n '1,200p' "$run_dir/node-$i.log" >&2
+		exit 1
+	fi
+	if [[ $stage_probe == 1 ]] && ! grep -Fxq 'ASYNC_STAGE_PROBE_READY=1' "$run_dir/node-$i.log"; then
+		printf 'missing Async stage probe startup marker for voter n%s\n' "$i" >&2
 		exit 1
 	fi
 done
@@ -497,7 +503,7 @@ elif [[ $(uname -s) == Linux ]]; then
 	resource_status=measured
 	host_before=$(sample_benchmark_host /proc)
 fi
-if [[ ${RHIZA_ASYNC_STAGE_PROBE:-0} == 1 ]]; then
+if [[ $stage_probe == 1 ]]; then
 	printf 'ASYNC_WINDOW_BEGIN_NS=%s\n' "$(date +%s%N)" >&2
 fi
 "$run_dir/rhiza-bench" -url "$target" -path "$request_path" -body "$request_body" \
@@ -537,7 +543,7 @@ if [[ $failed_node != none ]]; then
 	fi
 fi
 wait_benchmark_child
-if [[ ${RHIZA_ASYNC_STAGE_PROBE:-0} == 1 ]]; then
+if [[ $stage_probe == 1 ]]; then
 	printf 'ASYNC_WINDOW_END_NS=%s\n' "$(date +%s%N)" >&2
 fi
 if [[ $resource_status == measured ]]; then

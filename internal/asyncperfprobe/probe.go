@@ -9,6 +9,12 @@ import (
 
 var enabled = os.Getenv("RHIZA_ASYNC_STAGE_PROBE") == "1"
 
+func init() {
+	if enabled {
+		_, _ = os.Stderr.WriteString("ASYNC_STAGE_PROBE_READY=1\n")
+	}
+}
+
 // Stamp returns zero when the probe is disabled.
 func Stamp() time.Time {
 	if enabled {

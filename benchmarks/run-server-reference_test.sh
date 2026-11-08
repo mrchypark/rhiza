@@ -163,8 +163,17 @@ if [[ $RHIZA_OBJSTORE_PROVIDER == gcs ]]; then
   "$GOOGLE_APPLICATION_CREDENTIALS" >/dev/null
  MOCK_HOME=${TMPDIR%/*}
  printf '%s\n' "$RHIZA_NODE_ID" >> "$MOCK_HOME/gcs-local-adc"
+ printf '%s:%s\n' "$RHIZA_NODE_ID" "$RHIZA_ASYNC_STAGE_PROBE" >> "$MOCK_HOME/gcs-stage-probe"
+ if [[ $RHIZA_ASYNC_STAGE_PROBE == 1 ]]; then
+  if [[ ${MOCK_HOME##*/} == gcs-probe-missing && $RHIZA_NODE_ID == n2 ]]; then
+   printf 'not-a-marker ASYNC_STAGE_PROBE_READY=1\n' >&2
+  else
+   printf 'ASYNC_STAGE_PROBE_READY=1\n' >&2
+  fi
+ fi
 fi
 printf '%s\n' "$$" >> "$MOCK_HOME/nodes"
+touch "$MOCK_HOME/ready-${RHIZA_BIND_ADDR##*:}"
 exec sleep 60
 MOCK
 cat > "$scratch/bench" <<'MOCK'
@@ -210,6 +219,12 @@ cat > "$scratch/bin/curl" <<'MOCK'
 set -eu
 for url in "$@"; do :; done
 case $url in
+*/ready)
+ if [[ $MOCK_MODE == gcs-* ]]; then
+  port=${url%/ready}
+  port=${port##*:}
+  [[ -f $MOCK_HOME/ready-$port ]]
+ fi ;;
 http://127.0.0.1:24588/storage/v1/b\?project=rhiza-local-test)
  [[ $* == *"--noproxy *"* ]]
  while [[ $# -gt 1 ]]; do
@@ -294,7 +309,7 @@ wait() {
 }
 MOCK
 chmod +x "$scratch/bin/"* "$scratch/node" "$scratch/bench"
-for mode in normal shifted before-first after-last no-witness signal-failure wait-normal wait-crash wait-error healthy healthy-nonlinux resource-replaced resource-missing graph graph-wrong-ids kv kv-wrong-value async-stale-cut gcs-before-ack gcs-async gcs-missing gcs-unknown gcs-malformed; do
+for mode in normal shifted before-first after-last no-witness signal-failure wait-normal wait-crash wait-error healthy healthy-nonlinux resource-replaced resource-missing graph graph-wrong-ids kv kv-wrong-value async-stale-cut gcs-before-ack gcs-async gcs-probe-missing gcs-missing gcs-unknown gcs-malformed; do
  mkdir "$scratch/$mode"
  # Each run's stand-ins and process evidence remain in its own scratch scope.
  cp "$scratch/node" "$scratch/bench" "$scratch/$mode/"
@@ -302,6 +317,7 @@ for mode in normal shifted before-first after-last no-witness signal-failure wai
  workload=sql
  durability=async
  publish=0
+ probe=0
  provider=s3
  case $mode in
   shifted|healthy*|resource-*) fault=none ;;
@@ -309,13 +325,14 @@ for mode in normal shifted before-first after-last no-witness signal-failure wai
   kv*) fault=none; workload=kv; publish=1 ;;
   async-stale-cut) fault=none; publish=1 ;;
   gcs-*) fault=none; provider=gcs
-   if [[ $mode == gcs-async ]]; then publish=1; else durability=before-ack; fi ;;
+   if [[ $mode == gcs-async || $mode == gcs-probe-missing ]]; then publish=1; probe=1; else durability=before-ack; fi ;;
  esac
  status=0
  BASH_ENV="$scratch/wait-env" MOCK_HOME="$scratch/$mode" MOCK_MODE="$mode" PATH="$scratch/bin:$PATH" TMPDIR="$scratch/$mode" \
  RHIZA_SERVER_BENCH_REQUESTS=4 RHIZA_SERVER_BENCH_CONCURRENCY=2 RHIZA_SERVER_BENCH_FAULT_AFTER=0 RHIZA_SERVER_BENCH_FAILED_NODE="$fault" \
  RHIZA_SERVER_BENCH_WORKLOAD="$workload" RHIZA_SERVER_BENCH_DURABILITY="$durability" RHIZA_SERVER_BENCH_ASYNC_PUBLISH="$publish" \
- RHIZA_SERVER_BENCH_PROVIDER="$provider" RHIZA_OBJSTORE_SERVICE_ACCOUNT=ambient-must-not-inherit HTTP_PROXY=http://ambient-must-not-inherit \
+ RHIZA_SERVER_BENCH_PROVIDER="$provider" RHIZA_ASYNC_STAGE_PROBE="$probe" \
+ RHIZA_OBJSTORE_SERVICE_ACCOUNT=ambient-must-not-inherit HTTP_PROXY=http://ambient-must-not-inherit \
  bash "$here/run-server-reference.sh" "$scratch/base-server" "$scratch/$mode/result.json" >"$scratch/$mode/stdout" 2>"$scratch/$mode/stderr" || status=$?
  if [[ $mode == normal ]]; then
   [[ $status == 0 ]]
@@ -374,6 +391,10 @@ for mode in normal shifted before-first after-last no-witness signal-failure wai
     and .gcs_request_classes.publication.access_record_shapes.query == 1' \
     "$scratch/$mode/result.json" >/dev/null
   fi
+ elif [[ $mode == gcs-probe-missing ]]; then
+  [[ $status != 0 && ! -e $scratch/$mode/bench.pid && ! -e $scratch/$mode/result.json ]]
+  grep -Fxq 'missing Async stage probe startup marker for voter n2' "$scratch/$mode/stderr"
+  ! grep -q '^ASYNC_WINDOW_BEGIN_NS=' "$scratch/$mode/stderr"
  elif [[ $mode == gcs-missing || $mode == gcs-unknown || $mode == gcs-malformed ]]; then
   [[ $status != 0 ]]
   grep -q 'lacks classifiable completed-request evidence' "$scratch/$mode/stderr"
@@ -394,21 +415,26 @@ for mode in normal shifted before-first after-last no-witness signal-failure wai
  if [[ $provider == gcs ]]; then
   [[ -f $scratch/$mode/gcs-removed ]]
   [[ $(sort "$scratch/$mode/gcs-local-adc") == $'n0\nn1\nn2' ]]
-  if grep -Eq 'synthetic-private-(query|fragment)' "$scratch/$mode/stderr" "$scratch/$mode"/result*.json; then
+  [[ $(sort "$scratch/$mode/gcs-stage-probe") == "$(printf 'n0:%s\nn1:%s\nn2:%s' "$probe" "$probe" "$probe")" ]]
+  diagnostics=("$scratch/$mode/stderr")
+  if [[ $mode != gcs-probe-missing ]]; then diagnostics+=("$scratch/$mode"/result*.json); fi
+  if grep -Eq 'synthetic-private-(query|fragment)' "${diagnostics[@]}"; then
    printf 'GCS diagnostics exposed a discarded URI suffix\n' >&2
    exit 1
   fi
  fi
- case $workload in
-  sql) grep -q -- '-verify-insert-receipt' "$scratch/$mode/bench.args" ;;
-  graph) grep -q -- '-path /graph/execute.*-verify-applied-receipt' "$scratch/$mode/bench.args" ;;
-  kv) grep -q -- '-path /kv/get.*-verify-kv-value' "$scratch/$mode/kv-verification.args" ;;
- esac
+ if [[ $mode != gcs-probe-missing ]]; then
+  case $workload in
+   sql) grep -q -- '-verify-insert-receipt' "$scratch/$mode/bench.args" ;;
+   graph) grep -q -- '-path /graph/execute.*-verify-applied-receipt' "$scratch/$mode/bench.args" ;;
+   kv) grep -q -- '-path /kv/get.*-verify-kv-value' "$scratch/$mode/kv-verification.args" ;;
+  esac
+ fi
  if [[ $fault != none ]]; then grep -q -- '-fault-start-time 123' "$scratch/$mode/bench.args"; fi
  grep -Fq "$scratch/base-server|build -o" "$scratch/$mode/builds"
  grep -Fq "$(cd "$here/.." && pwd)|build -o" "$scratch/$mode/builds"
  while IFS= read -r pid; do
   if kill -0 "$pid" 2>/dev/null; then printf 'mock owned process survived: %s\n' "$pid" >&2; exit 1; fi
- done < <(cat "$scratch/$mode/nodes" "$scratch/$mode/bench.pid")
+ done < <(cat "$scratch/$mode/nodes"; if [[ -f $scratch/$mode/bench.pid ]]; then cat "$scratch/$mode/bench.pid"; fi)
 done
-printf 'server oracle helpers + 23 complete mocked runner cases PASS\n'
+printf 'server oracle helpers + 24 complete mocked runner cases PASS\n'
