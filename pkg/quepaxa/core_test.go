@@ -590,6 +590,46 @@ func TestValueIsNotAvailableUntilRetrySyncSucceeds(t *testing.T) {
 	}
 }
 
+func TestStoreValueDoesNotRetainCallerBuffer(t *testing.T) {
+	dir := t.TempDir()
+	wal, err := qlog.Open(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() {
+		if wal != nil {
+			wal.Close()
+		}
+	}()
+	core := newCore("n1", &Cluster{Members: []Member{{ID: "n1"}}}, wal, nil)
+	const want = "caller-owned proposal"
+	value := []byte(want)
+	hash := sha256.Sum256(value)
+	if err := core.StoreValue(hash, value); err != nil {
+		t.Fatal(err)
+	}
+	clear(value)
+	if got, ok := core.Value(hash); !ok || string(got) != want {
+		t.Fatalf("stored value = %q, available = %t; want %q", got, ok, want)
+	}
+	err = wal.Close()
+	wal = nil
+	if err != nil {
+		t.Fatal(err)
+	}
+	wal, err = qlog.Open(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	entries, err := wal.Read()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 1 || entries[0].Type != qlog.EntryProposal || entries[0].Hash != hash || string(entries[0].Payload) != want {
+		t.Fatalf("reopened WAL has unexpected proposal entries: %+v", entries)
+	}
+}
+
 func TestCertifiedCompactionRestartsFromBaseAndSuffix(t *testing.T) {
 	dir := t.TempDir()
 	wal, err := qlog.Open(dir)

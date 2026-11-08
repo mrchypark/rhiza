@@ -37,6 +37,46 @@ verify_benchmark_rows() {
 	jq -e --argjson requests "$1" '.rows == [[$requests, $requests]]' >/dev/null
 }
 
+sample_benchmark_process() {
+	local node=$1 pid=$2 stat rss hwm start
+	local -a fields
+	stat=$(cat "/proc/$pid/stat") || return 1
+	[[ $stat == "$pid ("* && $stat == *") "* ]] || return 1
+	# Strip the command name, which can contain spaces and closing parentheses.
+	read -ra fields <<< "${stat##*) }"
+	[[ ${fields[0]:-} != Z && ${fields[0]:-} != X &&
+		${fields[11]:-} =~ ^[0-9]+$ && ${fields[12]:-} =~ ^[0-9]+$ &&
+		${fields[19]:-} =~ ^[1-9][0-9]*$ ]] || return 1
+	start=${fields[19]}
+	read -r rss hwm < <(cat "/proc/$pid/status" | awk '
+		$1 == "VmRSS:" && $3 == "kB" { rss=$2 }
+		$1 == "VmHWM:" && $3 == "kB" { hwm=$2 }
+		END { print rss, hwm }
+	') || return 1
+	[[ $rss =~ ^[0-9]+$ && $hwm =~ ^[0-9]+$ ]] || return 1
+	jq -nc --arg node "$node" --argjson pid "$pid" --argjson start "$start" \
+		--argjson user "${fields[11]}" --argjson system "${fields[12]}" --argjson rss "$rss" --argjson hwm "$hwm" \
+		'{node:$node,pid:$pid,process_start_ticks:$start,user_ticks:$user,system_ticks:$system,rss_kib:$rss,lifetime_hwm_kib:$hwm}'
+}
+
+benchmark_resources() {
+	local before=$1 after=$2 ticks_per_second=$3
+	jq -ne --argjson before "$before" --argjson after "$after" --argjson hz "$ticks_per_second" '
+		if ($before|length) != 3 or ($after|length) != 3 then error("expected three voter resource samples") else
+			{clock_ticks_per_second:$hz,scope:"per voter, before and after measured write client; excludes final verification",
+			memory_peak_scope:"individual process lifetime, not simultaneous cluster peak",
+			nodes:[range(3) as $i | $before[$i] as $b | $after[$i] as $a |
+				if [$b.node,$b.pid,$b.process_start_ticks] != [$a.node,$a.pid,$a.process_start_ticks]
+				or $a.user_ticks < $b.user_ticks or $a.system_ticks < $b.system_ticks
+				then error("voter identity changed or CPU counters regressed: " + $b.node)
+				else {node:$b.node,pid:$b.pid,process_start_ticks:$b.process_start_ticks,
+					cpu_user_ticks:($a.user_ticks-$b.user_ticks),cpu_system_ticks:($a.system_ticks-$b.system_ticks),
+					rss_kib_before:$b.rss_kib,rss_kib_after:$a.rss_kib,
+					lifetime_hwm_kib_before:$b.lifetime_hwm_kib,lifetime_hwm_kib_after:$a.lifetime_hwm_kib}
+				end]}
+		end'
+}
+
 inject_benchmark_fault() {
 	if ! jobs -pr | grep -qx "$failed_pid"; then
 		printf 'fault target is not a current owned running child; refusing injection\n' >&2
@@ -217,9 +257,23 @@ object_stats() {
 	done | jq -sc 'reduce .[] as $item ({}; reduce ($item.stats | to_entries[]) as $entry (. ; .[$entry.key] = ((.[$entry.key] // 0) + $entry.value)))'
 }
 object_before=$(object_stats)
+resource_before=null
+resource_summary=null
+resource_status=not_collected_non_linux
+sample_benchmark_voters() {
+	local i pid
+	for i in 0 1 2; do
+		pid=$(<"$run_dir/node-$i.pid")
+		sample_benchmark_process "n$i" "$pid" || {
+			printf 'cannot sample Linux voter resources: n%s (pid %s)\n' "$i" "$pid" >&2
+			return 1
+		}
+	done | jq -sc .
+}
 result_file="$run_dir/result.json"
 control_args=()
 if [[ $failed_node != none ]]; then
+	resource_status=not_collected_fault_lane
 	failed_index=${failed_node#n}
 	failed_pid=$(<"$run_dir/node-$failed_index.pid")
 	if ! jobs -pr | grep -qx "$failed_pid"; then printf 'fault target is not a current owned running child; refusing binding\n' >&2; exit 1; fi
@@ -228,6 +282,11 @@ if [[ $failed_node != none ]]; then
 	read -ra process_fields <<< "${process_stat##*) }"
 	[[ ${process_fields[19]:-} =~ ^[0-9]+$ ]] || { printf 'fault target start identity unavailable\n' >&2; exit 1; }
 	control_args=(-fault-control-file "$run_dir/fault-control.url" -fault-pid "$failed_pid" -fault-start-time "${process_fields[19]}")
+elif [[ $(uname -s) == Linux ]]; then
+	resource_hz=$(getconf CLK_TCK)
+	[[ $resource_hz =~ ^[1-9][0-9]*$ ]]
+	resource_before=$(sample_benchmark_voters)
+	resource_status=measured
 fi
 "$run_dir/rhiza-bench" -url "$target" -path /sql/execute \
 	-body '{"request_id":"bench-{{id}}","sql":"INSERT INTO benchmark_writes(id) VALUES ({{id}})"}' \
@@ -270,6 +329,10 @@ wait_benchmark_child
 result=$(<"$result_file")
 # Preserve the client result even when the subsequent correctness gate fails.
 tee "$output_file" <<<"$result" >/dev/null
+if [[ $resource_status == measured ]]; then
+	resource_after=$(sample_benchmark_voters)
+	resource_summary=$(benchmark_resources "$resource_before" "$resource_after" "$resource_hz")
+fi
 result_with_exit=$(jq --argjson status "$fault_exit_status" '. + {fault_exit_status:$status}' <<<"$result")
 tee "$output_file" <<<"$result_with_exit" >/dev/null
 if [[ $failed_node != none ]]; then
@@ -296,5 +359,6 @@ for log in "$run_dir"/node-*.log; do
 done
 jq -nc --argjson result "$result" --argjson count "$count" --argjson overlap "$overlap" --argjson fault_exit_status "$fault_exit_status" --arg client_revision "$client_revision" --arg client_sha256 "$client_sha256" --argjson concurrency "$concurrency" --argjson runtime_failure_lines "$runtime_failure_lines" --argjson max_fault_latency_ms "$max_fault_latency_ms" --argjson object_delta "$object_delta" --argjson object_metric_nodes "$object_metric_nodes" --arg failed_node "$failed_node" --arg target_node "$target_node" --arg durability "$durability" --arg fault_after "$fault_after" \
 	'{transport:"HTTP client + three QUIC voters",client_revision:$client_revision,client_sha256:$client_sha256,receipt_oracle:"sql-insert-id-v1",fault_overlap:$overlap,fault_exit_status:$fault_exit_status,fault_instrumentation:(if $failed_node == "none" then "disabled" else "pidfd-single-coordinator-monotonic-interval-v2" end),durability_mode:$durability,ack_contract:(if $durability == "before-ack" then "quorum WAL sync and object-store durability before acknowledgement" else "quorum WAL sync; object-store publication async" end),failure_mode:(if $failed_node == "none" then "healthy" else "peer-sigkill-during-load" end),failed_node:$failed_node,target_node:$target_node,fault_after:(if $failed_node == "none" then null else $fault_after end),max_fault_latency_ms:(if $failed_node == "none" then null else $max_fault_latency_ms end),concurrency:$concurrency,object_metric_nodes:$object_metric_nodes,object_measurement:"after schema through final linearizable verification",object_store_delta:$object_delta,runtime_failure_lines:$runtime_failure_lines,result:$result,verification:$count}' \
+	| jq -c --arg status "$resource_status" --argjson resources "$resource_summary" '. + {voter_resource_status:$status,voter_resources:$resources}' \
 	| tee "$output_file"
 jq -e '.runtime_failure_lines == 0 and (.failed_node == "none" or .result.max_ms <= .max_fault_latency_ms)' "$output_file" >/dev/null

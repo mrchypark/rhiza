@@ -137,6 +137,7 @@ if [[ -n $control ]]; then
  fi
 fi
 printf '{"requests":4,"successes":4,"errors":0,"max_ms":1,"receipt_oracle":"sql-insert-id-v1","fault_window":%s}\n' "$window"
+touch "$MOCK_HOME/client-done"
 MOCK
 cat > "$scratch/bin/curl" <<'MOCK'
 #!/usr/bin/env bash
@@ -156,9 +157,29 @@ MOCK
 cat > "$scratch/bin/cat" <<'MOCK'
 #!/usr/bin/env bash
 case ${1:-} in
-/proc/*/stat) printf '1 (mock node) S 1 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 123\n' ;;
+/proc/*/stat)
+ pid=${1#/proc/}
+ pid=${pid%/stat}
+ user=12 system=3 start=123
+ if [[ -f $MOCK_HOME/client-done ]]; then
+  user=19 system=5
+  [[ $MOCK_MODE != resource-replaced ]] || start=124
+ fi
+ printf '%s (mock ) node) S 1 0 0 0 0 0 0 0 0 0 %s %s 0 0 0 0 0 0 %s\n' "$pid" "$user" "$system" "$start" ;;
+/proc/*/status)
+ if [[ $MOCK_MODE == resource-missing && -f $MOCK_HOME/client-done ]]; then exit 1; fi
+ if [[ -f $MOCK_HOME/client-done ]]; then rss=800 hwm=1200; else rss=500 hwm=700; fi
+ printf 'VmRSS:\t%s kB\nVmHWM:\t%s kB\n' "$rss" "$hwm" ;;
 *) exec /bin/cat "$@" ;;
 esac
+MOCK
+cat > "$scratch/bin/uname" <<'MOCK'
+#!/usr/bin/env bash
+if [[ $MOCK_MODE == healthy-nonlinux ]]; then printf 'Darwin\n'; else printf 'Linux\n'; fi
+MOCK
+cat > "$scratch/bin/getconf" <<'MOCK'
+#!/usr/bin/env bash
+[[ $1 == CLK_TCK ]] && printf '100\n'
 MOCK
 cat > "$scratch/wait-env" <<'MOCK'
 # Simulate the three alternate visible statuses only after reaping the exact
@@ -172,12 +193,12 @@ wait() {
 }
 MOCK
 chmod +x "$scratch/bin/"* "$scratch/node" "$scratch/bench"
-for mode in normal shifted before-first after-last no-witness signal-failure wait-normal wait-crash wait-error; do
+for mode in normal shifted before-first after-last no-witness signal-failure wait-normal wait-crash wait-error healthy healthy-nonlinux resource-replaced resource-missing; do
  mkdir "$scratch/$mode"
  # Each run's stand-ins and process evidence remain in its own scratch scope.
  cp "$scratch/node" "$scratch/bench" "$scratch/$mode/"
  fault=n0
- [[ $mode != shifted ]] || fault=none
+ case $mode in shifted|healthy*|resource-*) fault=none ;; esac
  status=0
  BASH_ENV="$scratch/wait-env" MOCK_HOME="$scratch/$mode" MOCK_MODE="$mode" PATH="$scratch/bin:$PATH" TMPDIR="$scratch/$mode" \
  RHIZA_SERVER_BENCH_REQUESTS=4 RHIZA_SERVER_BENCH_CONCURRENCY=2 RHIZA_SERVER_BENCH_FAULT_AFTER=0 RHIZA_SERVER_BENCH_FAILED_NODE="$fault" \
@@ -185,7 +206,26 @@ for mode in normal shifted before-first after-last no-witness signal-failure wai
  if [[ $mode == normal ]]; then
   [[ $status == 0 ]]
   jq -e '.fault_overlap.overlap == true and .fault_exit_status == 137 and .receipt_oracle == "sql-insert-id-v1" and (.client_sha256 | length == 64)' "$scratch/$mode/result.json" >/dev/null
+  jq -e '.voter_resource_status == "not_collected_fault_lane" and .voter_resources == null' "$scratch/$mode/result.json" >/dev/null
   grep -qx 'fault_exit_status=137' "$scratch/$mode/result-fault-metadata.txt"
+ elif [[ $mode == healthy ]]; then
+  [[ $status == 0 ]]
+  jq -e '.voter_resource_status == "measured" and .voter_resources.clock_ticks_per_second == 100
+    and ([.voter_resources.nodes[].node] == ["n0", "n1", "n2"])
+    and all(.voter_resources.nodes[]; .process_start_ticks == 123 and .cpu_user_ticks == 7 and .cpu_system_ticks == 2
+      and .rss_kib_before == 500 and .rss_kib_after == 800
+      and .lifetime_hwm_kib_before == 700 and .lifetime_hwm_kib_after == 1200)' "$scratch/$mode/result.json" >/dev/null
+ elif [[ $mode == healthy-nonlinux ]]; then
+  [[ $status == 0 ]]
+  jq -e '.voter_resource_status == "not_collected_non_linux" and .voter_resources == null' "$scratch/$mode/result.json" >/dev/null
+ elif [[ $mode == resource-* ]]; then
+  [[ $status != 0 ]]
+  if [[ $mode == resource-replaced ]]; then
+   grep -q 'voter identity changed' "$scratch/$mode/stderr"
+  else
+   grep -q 'cannot sample Linux voter resources' "$scratch/$mode/stderr"
+  fi
+  jq -e '.successes == 4 and (has("voter_resources") | not)' "$scratch/$mode/result.json" >/dev/null
  else
   [[ $status != 0 ]]
   if [[ $mode == wait-* ]]; then
@@ -197,11 +237,11 @@ for mode in normal shifted before-first after-last no-witness signal-failure wai
   elif [[ $mode != shifted ]]; then grep -Eq 'fault (coordinator failed|interval not qualified)' "$scratch/$mode/stderr"; fi
  fi
  grep -q -- '-verify-insert-receipt' "$scratch/$mode/bench.args"
- if [[ $mode != shifted ]]; then grep -q -- '-fault-start-time 123' "$scratch/$mode/bench.args"; fi
+ if [[ $fault != none ]]; then grep -q -- '-fault-start-time 123' "$scratch/$mode/bench.args"; fi
  grep -Fq "$scratch/base-server|build -o" "$scratch/$mode/builds"
  grep -Fq "$(cd "$here/.." && pwd)|build -o" "$scratch/$mode/builds"
  while IFS= read -r pid; do
   if kill -0 "$pid" 2>/dev/null; then printf 'mock owned process survived: %s\n' "$pid" >&2; exit 1; fi
  done < <(cat "$scratch/$mode/nodes" "$scratch/$mode/bench.pid")
 done
-printf 'server oracle helpers + nine complete mocked runner cases PASS\n'
+printf 'server oracle helpers + 13 complete mocked runner cases PASS\n'

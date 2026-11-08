@@ -486,7 +486,7 @@ func (c *Core) stageValueLocked(hash ValueHash, value []byte) error {
 		if c.compactionValues != nil {
 			key := [32]byte(hash)
 			if _, retained := c.compactionValues[key]; !retained {
-				if err := c.wal.Append(qlog.Entry{Hash: hash, Type: qlog.EntryProposal, Payload: append([]byte(nil), value...)}); err != nil {
+				if err := c.wal.Append(qlog.Entry{Hash: hash, Type: qlog.EntryProposal, Payload: value}); err != nil {
 					return err
 				}
 				c.compactionValues[key] = struct{}{}
@@ -494,7 +494,7 @@ func (c *Core) stageValueLocked(hash ValueHash, value []byte) error {
 		}
 		return nil
 	}
-	if err := c.wal.Append(qlog.Entry{Hash: hash, Type: qlog.EntryProposal, Payload: append([]byte(nil), value...)}); err != nil {
+	if err := c.wal.Append(qlog.Entry{Hash: hash, Type: qlog.EntryProposal, Payload: value}); err != nil {
 		return err
 	}
 	c.values[hash] = append([]byte(nil), value...)
