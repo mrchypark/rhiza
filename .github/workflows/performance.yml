@@ -53,6 +53,11 @@ on:
         options: [s3, gcs]
         default: s3
 
+      e2e_sql_async_isolation:
+        description: Compare baseline, WAL-only, lease-only, and combined in GCS SQL Async
+        type: boolean
+        default: false
+
 permissions:
   contents: read
 
@@ -322,6 +327,7 @@ jobs:
           REFRESH_HIQLITE: ${{ inputs.refresh_hiqlite_reference }}
           ISSUE185_COST: ${{ inputs.issue185_cost_evidence }}
           NETWORK_OPTIMIZATION: ${{ inputs.network_optimization }}
+          SQL_ASYNC_ISOLATION: ${{ inputs.e2e_sql_async_isolation }}
         run: |
           if [[ $REFRESH_HIQLITE == true || $ISSUE185_COST == true || ${NETWORK_OPTIMIZATION:-none} != none ]]; then
             echo '::error::The E2E cost matrix cannot be combined with another special Performance mode.'
@@ -346,10 +352,28 @@ jobs:
           }
           checkout_revision "$BASE_SHA" base
           checkout_revision "$CANDIDATE_SHA" candidate
+          if [[ $SQL_ASYNC_ISOLATION == true ]]; then
+            [[ $RHIZA_SERVER_BENCH_PROVIDER == gcs ]]
+            expected=$(printf '%s\n' pkg/qlog/entry.go pkg/qlog/wal.go pkg/recovery/archive.go)
+            actual=$(git diff --name-only "$BASE_SHA" "$CANDIDATE_SHA" -- 'pkg/**/*.go' ':!**/*_test.go')
+            [[ $actual == "$expected" ]]
+            for role in wal lease; do
+              checkout_revision "$BASE_SHA" "$role"
+            done
+            git diff --binary "$BASE_SHA" "$CANDIDATE_SHA" -- pkg/qlog/entry.go pkg/qlog/wal.go |
+              git -C "$RUNNER_TEMP/rhiza-e2e-wal" apply --index
+            git diff --binary "$BASE_SHA" "$CANDIDATE_SHA" -- pkg/recovery/archive.go |
+              git -C "$RUNNER_TEMP/rhiza-e2e-lease" apply --index
+          fi
           {
             printf 'base_sha=%s\ncandidate_sha=%s\nharness_sha=%s\n' "$BASE_SHA" "$CANDIDATE_SHA" "$(git rev-parse HEAD)"
             printf 'object_store_provider=%s\n' "$RHIZA_SERVER_BENCH_PROVIDER"
             printf 'requests=%s\nconcurrency=%s\nsamples_per_cell=3\n' "$RHIZA_SERVER_BENCH_REQUESTS" "$RHIZA_SERVER_BENCH_CONCURRENCY"
+            if [[ $SQL_ASYNC_ISOLATION == true ]]; then
+              for role in base wal lease candidate; do
+                printf '%s_tree=%s\n' "$role" "$(git -C "$RUNNER_TEMP/rhiza-e2e-$role" write-tree)"
+              done
+            fi
             printf 'runner_image=%s-%s\n' "$ImageOS" "$ImageVersion"
             go version
             uname -srmo
@@ -360,6 +384,7 @@ jobs:
           sh benchmarks/gcs-request-classes_test.sh
 
       - name: Run interleaved server cost matrix
+        if: ${{ !inputs.e2e_sql_async_isolation }}
         run: |
           evidence="$RUNNER_TEMP/rhiza-e2e-cost"
           harness_sha=$(git rev-parse HEAD)
@@ -416,6 +441,22 @@ jobs:
             done
           done
           printf '## E2E cost matrix (%s)\n\nAll 36 samples passed: SQL, Graph, and KV × Async and BeforeAck × two revisions × three runs. Raw result and process logs are attached.\n' "$RHIZA_SERVER_BENCH_PROVIDER" >>"$GITHUB_STEP_SUMMARY"
+
+      - name: Run GCS SQL Async isolation
+        if: ${{ inputs.e2e_sql_async_isolation }}
+        run: |
+          evidence="$RUNNER_TEMP/rhiza-e2e-cost"
+          revisions=(base wal candidate lease)
+          for sample in 0 1 2 3 4 5 6 7; do
+            for position in 0 1 2 3; do
+              role=${revisions[$(((sample + position) % 4))]}
+              result="$evidence/sql-async-$role-$sample.json"
+              RHIZA_SERVER_BENCH_WORKLOAD=sql RHIZA_SERVER_BENCH_DURABILITY=async RHIZA_SERVER_BENCH_ASYNC_PUBLISH=1 \
+                benchmarks/run-server-reference.sh "$RUNNER_TEMP/rhiza-e2e-$role" "$result"
+              jq -e '.result.successes == 1000 and .result.errors == 0 and
+                .write_object_store_delta.http_requests == 0 and .voter_resource_status == "measured"' "$result"
+            done
+          done
 
       - name: Compare WAL append allocations separately from E2E measurements
         if: ${{ inputs.e2e_cost_provider != 'gcs' }}
