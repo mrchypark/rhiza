@@ -214,9 +214,29 @@ func TestManagedKVHostLocalObservationSurvivesQuorumLoss(t *testing.T) {
 	h := hosts[0]
 	req := network.KVMutationRequest{RequestID: "ack", Key: "key", Value: []byte("acknowledged")}
 	ack, err := h.KVMutate(ctx, "put", req)
-	if err != nil {
-		t.Fatal(err)
+	if err != nil || ack.Status != types.MutationCommitted || ack.Slot == 0 {
+		t.Fatal("initial KV ACK", ack, err)
 	}
+	readAcknowledged := func(phase string) network.RequestStatusResponse {
+		t.Helper()
+		status, err := h.RequestStatus(ctx, network.RequestStatusRequest{Kind: "kv", RequestID: req.RequestID})
+		if err != nil || status.State != string(ack.Status) || status.Receipt == nil || *status.Receipt != ack.MutationReceipt {
+			t.Fatalf("%s: acknowledged state or receipt differs from ACK: state=%q receipt=%+v ACK=%+v err=%v", phase, status.State, status.Receipt, ack.MutationReceipt, err)
+		}
+		return status
+	}
+	// A real independent commit advances the observation tip, not the
+	// request's retained outcome. Exercise that distinction before quorum loss.
+	initial := readAcknowledged("before independent commit")
+	progress, err := h.KVMutate(ctx, "put", network.KVMutationRequest{RequestID: "advance-status-tip", Key: "independent", Value: []byte("committed")})
+	if err != nil || progress.Status != types.MutationCommitted || progress.Slot <= initial.Tip {
+		t.Fatal("independent KV commit did not advance history", progress, err)
+	}
+	advanced := readAcknowledged("after independent commit")
+	if advanced.Tip < progress.Slot {
+		t.Fatalf("status tip did not include the independent applied commit: %d -> %d, commit slot=%d", initial.Tip, advanced.Tip, progress.Slot)
+	}
+	t.Logf("independent commit advanced status tip %d -> %d with identical ACK receipt at slot %d", initial.Tip, advanced.Tip, ack.Slot)
 	for _, other := range hosts[1:] {
 		waitSQLCertifiedApplication(t, ctx, other, ack.Slot)
 		if err := other.Close(); err != nil {
@@ -233,9 +253,9 @@ func TestManagedKVHostLocalObservationSurvivesQuorumLoss(t *testing.T) {
 	if err != nil || !value.Found || string(value.Value) != "acknowledged" {
 		t.Fatal("local acknowledged read failed", value, err)
 	}
-	status, err := h.RequestStatus(ctx, network.RequestStatusRequest{Kind: "kv", RequestID: req.RequestID})
-	if err != nil || status.Receipt == nil || status.Receipt.Slot != ack.Slot {
-		t.Fatal("local observational status failed", status, err)
+	status := readAcknowledged("after quorum loss")
+	if status.Tip < advanced.Tip {
+		t.Fatalf("local status tip regressed after quorum loss: %d -> %d", advanced.Tip, status.Tip)
 	}
 	linear, stop := context.WithTimeout(ctx, 200*time.Millisecond)
 	_, err = h.KVGet(linear, network.KVGetRequest{Key: req.Key, Consistency: "linearizable"})
@@ -306,9 +326,9 @@ func TestManagedKVHostLocalObservationSurvivesQuorumLoss(t *testing.T) {
 	if err != nil || value.Found {
 		t.Fatalf("quorum-refused write changed the value: %+v %v", value, err)
 	}
-	retained, err := h.RequestStatus(ctx, network.RequestStatusRequest{Kind: "kv", RequestID: req.RequestID})
-	if err != nil || !reflect.DeepEqual(retained, status) {
-		t.Fatal("quorum-refused write changed prior acknowledged receipt", err)
+	retained := readAcknowledged("after quorum-refused write")
+	if retained.Tip < status.Tip {
+		t.Fatalf("local status tip regressed after quorum-refused write: %d -> %d", status.Tip, retained.Tip)
 	}
 	value, err = h.KVGet(ctx, network.KVGetRequest{Key: req.Key, Consistency: "local"})
 	if err != nil || !value.Found || string(value.Value) != "acknowledged" {
