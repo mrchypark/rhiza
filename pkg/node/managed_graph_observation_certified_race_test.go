@@ -5,6 +5,7 @@ package node
 import (
 	"context"
 	"errors"
+	"os"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -73,6 +74,89 @@ func TestManagedGraphInitialAdmissionWaitsForOwnCertifiedBarrier(t *testing.T) {
 		t.Fatalf("initial voter admission lacks own certified replay: admitted=%t C=%d A=%d", fixture.node.managedInitiallyAdmitted.Load(), fixture.node.core.Tip(), fixture.node.material.Tip())
 	}
 	assertManagedGraphRaceBarrierSuffix(t, fixture, managedGraphRaceControlValue())
+}
+
+func TestManagedGraphAdmissionFixtureJoinsPublisherBeforeTempDirCleanup(t *testing.T) {
+	entered := make(chan struct{})
+	canceled := make(chan error, 1)
+	var fixture *managedGraphAdmissionRaceFixture
+	var binding *internalApplicationBinding
+	restore := func() {}
+	// On the old broken fixture, the worker remains parked after t.Run returns.
+	// Parent-owned cancellation/join prevents this negative from leaking or
+	// hanging; restore the global hook only after that exact worker has joined.
+	defer func() {
+		if fixture != nil {
+			fixture.transport.releaseHeld()
+			if binding != nil {
+				binding.cancel()
+			}
+			if current := fixture.node.stopInternalApplication(); current != nil {
+				current.active.Wait()
+			}
+			fixture.node.wg.Wait()
+		}
+		restore()
+	}()
+	if !t.Run("actual-initial-admission", func(t *testing.T) {
+		fixture = newManagedGraphAdmissionRaceFixture(t)
+		binding = fixture.node.internalApplication.Load()
+		if binding == nil {
+			t.Fatal("fixture binding missing")
+		}
+		ownedLifetime, materialDir := binding.lifetime, fixture.materialDir
+		restore = localtesthooks.SetBackgroundPublication(func(ctx context.Context, phase string) {
+			if phase != "checkpoint" || ctx != ownedLifetime {
+				return
+			}
+			close(entered)
+			<-ctx.Done()
+			// Capture directory existence at cancellation, not after cleanup.
+			_, err := os.Stat(materialDir)
+			canceled <- err
+		})
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		requireManagedGraphStrictAdmissionFixture(fixture)
+		fixture.node.managedInitiallyAdmitted.Store(false)
+		fixture.node.managedAdmitted.Store(false)
+		foreign := fixture.startHeldControl(ctx)
+		fixture.awaitPendingControl(t)
+		result := make(chan error, 1)
+		go func() { result <- fixture.node.EnsureInitialManagedAdmission(ctx) }()
+		awaitManagedGraphAdmissionOwner(t, fixture, result, 9)
+		fixture.transport.releaseHeld()
+		if err := awaitProposal(t, foreign); err != nil {
+			t.Fatal(err)
+		}
+		select {
+		case err := <-result:
+			if err != nil {
+				t.Fatalf("actual initial admission: %v", err)
+			}
+		case <-ctx.Done():
+			t.Fatal("actual initial admission did not finish", ctx.Err())
+		}
+		assertManagedGraphRaceBarrierSuffix(t, fixture, managedGraphRaceControlValue())
+		select {
+		case <-entered:
+		case <-ctx.Done():
+			t.Fatal("owned checkpoint publisher did not enter", ctx.Err())
+		}
+	}) {
+		return
+	}
+	select {
+	case err := <-canceled:
+		if err != nil {
+			t.Errorf("publisher cancellation occurred after material TempDir removal: %v", err)
+		}
+	default:
+		t.Error("fixture cleanup returned without canceling and joining its checkpoint publisher")
+	}
+	if _, err := os.Stat(fixture.materialDir); !os.IsNotExist(err) {
+		t.Errorf("subtest material TempDir cleanup did not complete: %v", err)
+	}
 }
 
 func TestManagedGraphAdmissionRejectsBindingDriftBeforePendingRecovery(t *testing.T) {

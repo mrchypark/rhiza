@@ -59,7 +59,13 @@ func pauseCertifiedRecoveryBackground(t *testing.T) func(context.Context, int) {
 
 // Hold actual Learned delivery before certificate acceptance and the actual
 // periodic certificate pull. No Kubernetes dependency, SQL, or result is mocked.
-func heldCertifiedRecoveryHosts(t *testing.T, ctx context.Context) ([]Config, []*Host, *sqlStatusFixture, *atomic.Bool, <-chan struct{}, <-chan struct{}, func()) {
+type certifiedRecoveryRecordGate struct {
+	slot    atomic.Uint64
+	seen    chan struct{}
+	release func()
+}
+
+func heldCertifiedRecoveryHosts(t *testing.T, ctx context.Context, originalHash [32]byte) ([]Config, []*Host, *sqlStatusFixture, *atomic.Bool, <-chan struct{}, <-chan struct{}, func(), *certifiedRecoveryRecordGate) {
 	t.Helper()
 	held := &atomic.Bool{}
 	backgroundPaused := pauseCertifiedRecoveryBackground(t)
@@ -67,10 +73,46 @@ func heldCertifiedRecoveryHosts(t *testing.T, ctx context.Context) ([]Config, []
 	backgroundPaused(ctx, len(hosts))
 	pushSeen, pullSeen, releasePull := make(chan struct{}), make(chan struct{}), make(chan struct{})
 	var pushOnce, pullOnce, releaseOnce sync.Once
+	recordRelease := make(chan struct{})
+	var recordSeenOnce, recordReleaseOnce sync.Once
+	recordGate := &certifiedRecoveryRecordGate{seen: make(chan struct{})}
+	recordGate.release = func() { recordReleaseOnce.Do(func() { close(recordRelease) }) }
 	target := configs[1].Runtime.NodeID
 	healthyPeer := configs[2].Runtime.NodeID
 	restore := localtesthooks.Set(func(event string) {
 		if !held.Load() {
+			return
+		}
+		for _, nodeID := range []quepaxa.NodeID{target, healthyPeer} {
+			prefix := fmt.Sprintf("network:record:phase=before:node=%s:sender=%s:slot=", nodeID, configs[0].Runtime.NodeID)
+			if !strings.HasPrefix(event, prefix) {
+				continue
+			}
+			var slot uint64
+			var hash string
+			if _, err := fmt.Sscanf(strings.TrimPrefix(event, prefix), "%d:hash=%s", &slot, &hash); err != nil || hash != fmt.Sprintf("%x", originalHash) {
+				return
+			}
+			recordGate.slot.CompareAndSwap(0, slot)
+			if slot == 0 || slot != recordGate.slot.Load() {
+				t.Error("original Record changed slot while gated")
+				return
+			}
+			if nodeID == healthyPeer {
+				recordSeenOnce.Do(func() { close(recordGate.seen) })
+				select {
+				case <-recordRelease:
+				case <-ctx.Done():
+				}
+			} else {
+				// Make the third recorder's exclusion observed before the
+				// required target can complete the recorder quorum.
+				select {
+				case <-recordGate.seen:
+				case <-recordRelease:
+				case <-ctx.Done():
+				}
+			}
 			return
 		}
 		if strings.HasPrefix(event, fmt.Sprintf("network:learned:phase=received:node=%s:", target)) {
@@ -99,12 +141,13 @@ func heldCertifiedRecoveryHosts(t *testing.T, ctx context.Context) ([]Config, []
 		}
 	})
 	release := func() {
+		recordGate.release()
 		held.Store(false)
 		releaseOnce.Do(func() { close(releasePull) })
 	}
 	// Release the periodic worker before the Host cleanup waits for shutdown.
 	t.Cleanup(func() { release(); restore() })
-	return configs, hosts, fixture, held, pushSeen, pullSeen, release
+	return configs, hosts, fixture, held, pushSeen, pullSeen, release, recordGate
 }
 
 func TestManagedSQLCertifiedRecoveryGapHoldsPushAndPeriodicPull(t *testing.T) {
@@ -115,13 +158,27 @@ func TestManagedSQLCertifiedRecoveryGapHoldsPushAndPeriodicPull(t *testing.T) {
 func testCertifiedRecoveryOriginalSlot(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 25*time.Second)
 	defer cancel()
-	configs, hosts, _, held, pushSeen, pullSeen, release := heldCertifiedRecoveryHosts(t, ctx)
-	held.Store(true)
 	req := ExecuteRequest{RequestID: "certified-gap-original", SQL: "CREATE TABLE certified_gap_original(id INTEGER PRIMARY KEY)"}
+	value, err := types.EncodeSQLBatch([]types.SQLCommand{{RequestID: req.RequestID, SQL: req.SQL}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	originalHash := sha256.Sum256(value)
+	configs, hosts, _, held, pushSeen, pullSeen, release, recordGate := heldCertifiedRecoveryHosts(t, ctx, originalHash)
+	held.Store(true)
 	ack, err := hosts[0].Execute(ctx, req)
 	if err != nil || ack.Status != types.MutationCommitted || ack.Slot == 0 {
 		t.Fatal("original durable ACK", ack, err)
 	}
+	select {
+	case <-recordGate.seen:
+	default:
+		t.Fatal("third recorder was not actually gated before ACK")
+	}
+	if recordGate.slot.Load() != ack.Slot {
+		t.Fatal("gated original Record differs from ACK slot")
+	}
+	recordGate.release() // do not constrain subsequent normal recovery
 	for _, observation := range []struct {
 		name string
 		done <-chan struct{}
@@ -141,6 +198,25 @@ func testCertifiedRecoveryOriginalSlot(t *testing.T) {
 		t.Fatal(err)
 	}
 	values, prefix := certifiedRecoveryPrefix(t, ctx, configs[0])
+	if ack.Slot > uint64(len(values)) || values[ack.Slot-1].Hash != originalHash {
+		t.Fatal("ACK certificate does not cover the gated original bytes")
+	}
+	var certificate struct {
+		Summaries []struct {
+			RecorderID quepaxa.NodeID `json:"recorder_id"`
+		} `json:"summaries"`
+	}
+	if err := json.Unmarshal(values[ack.Slot-1].Certificate, &certificate); err != nil {
+		t.Fatal(err)
+	}
+	recorders := make(map[quepaxa.NodeID]bool)
+	for _, summary := range certificate.Summaries {
+		recorders[summary.RecorderID] = true
+	}
+	if len(recorders) != 2 || !recorders[configs[0].Runtime.NodeID] || !recorders[configs[1].Runtime.NodeID] || recorders[configs[2].Runtime.NodeID] {
+		t.Fatal("actual certificate did not require origin and target recorders", recorders)
+	}
+	t.Logf("actual original slot=%d recorder/certified/applied=%d/%d/%d third_record_gated=true target_in_certificate=true", ack.Slot, state.RecorderTip, state.CertifiedTip, state.AppliedTip)
 	beforeApplications := hostApplicationDecisionSnapshot(t, ctx, configs[0])
 	originalCount := 0
 	for _, application := range beforeApplications {

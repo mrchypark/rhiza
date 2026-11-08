@@ -481,6 +481,10 @@ type ManagedStartupChecker interface {
 	ValidateManagedAdmission(context.Context, ManagedStartupIdentity, ManagedRuntimeState) error
 }
 
+type managedGraphBootstrapChecker interface {
+	ValidateManagedGraphBootstrapControl(context.Context, ManagedStartupIdentity) error
+}
+
 // managedRepairOriginChecker validates an immutable repair handoff against the
 // current managed identity and Kubernetes owner chain. It is optional for
 // ordinary prepared startups; repair adoption requires it.

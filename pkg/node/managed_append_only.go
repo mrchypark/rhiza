@@ -274,6 +274,16 @@ func (n *Node) managedCheckpointSelectionFailure(reason string, err error) error
 }
 
 func (n *Node) selectManagedAppendOnlyRoot(ctx context.Context) (*checkpoint.Checkpoint, *quepaxa.SealedCheckpoint, error) {
+	return n.selectManagedAppendOnlyRootWithGenesisCheck(ctx, false)
+}
+
+// selectManagedGraphStartupRoot checks for a first published root before
+// allowing the caller to evaluate its local genesis guards.
+func (n *Node) selectManagedGraphStartupRoot(ctx context.Context) (*checkpoint.Checkpoint, *quepaxa.SealedCheckpoint, error) {
+	return n.selectManagedAppendOnlyRootWithGenesisCheck(ctx, true)
+}
+
+func (n *Node) selectManagedAppendOnlyRootWithGenesisCheck(ctx context.Context, confirmGraphGenesis bool) (*checkpoint.Checkpoint, *quepaxa.SealedCheckpoint, error) {
 	if n == nil || n.core == nil || n.checkpoints == nil || n.archive == nil || !isManagedAppendOnlyProtocol(n.managedStartup.Identity.ApplicationProtocol) {
 		return nil, nil, n.managedCheckpointSelectionFailure("selection_unavailable", fmt.Errorf("managed append-only checkpoint selection unavailable"))
 	}
@@ -287,6 +297,15 @@ func (n *Node) selectManagedAppendOnlyRoot(ctx context.Context) (*checkpoint.Che
 	locator, hasLocator, err := n.checkpoints.LoadManagedAppendOnlyLocator(ctx, n.materializationPolicy())
 	if err != nil {
 		return nil, nil, n.managedCheckpointSelectionFailure("current_read", err)
+	}
+	if confirmGraphGenesis && !ok && !hasLocator {
+		// A first CURRENT can be published between selection and the genesis
+		// check. Validate this exact observation like any other locator, rather
+		// than refusing a legitimate publication or treating it as authority.
+		locator, hasLocator, err = n.checkpoints.LoadManagedAppendOnlyLocator(ctx, n.materializationPolicy())
+		if err != nil {
+			return nil, nil, n.managedCheckpointSelectionFailure("current_read", err)
+		}
 	}
 	if hasLocator && !preparedReadonlyLearner && (!ok || locator.Index > uint64(sealed.Index) || locator.Index == uint64(sealed.Index) && locator.SealDecisionSlot > uint64(sealed.DecisionSlot)) {
 		// Another admitted voter may have advanced the shared append-only
@@ -302,8 +321,12 @@ func (n *Node) selectManagedAppendOnlyRoot(ctx context.Context) (*checkpoint.Che
 		}
 	}
 	if !ok {
-		if hasLocator && !preparedReadonlyLearner {
-			return nil, nil, n.managedCheckpointSelectionFailure("current_without_certified_qckp", fmt.Errorf("managed append-only CURRENT has no certified QCKP"))
+		if hasLocator && (!preparedReadonlyLearner || confirmGraphGenesis) {
+			err := fmt.Errorf("managed append-only CURRENT has no certified QCKP")
+			if confirmGraphGenesis {
+				err = fmt.Errorf("managed Graph recovery requires an authenticated producer root: %w", err)
+			}
+			return nil, nil, n.managedCheckpointSelectionFailure("current_without_certified_qckp", err)
 		}
 		return nil, nil, nil
 	}

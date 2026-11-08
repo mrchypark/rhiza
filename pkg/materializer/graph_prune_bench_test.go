@@ -39,6 +39,19 @@ func BenchmarkGraphPruneSparseSlotsAndBatchSize(b *testing.B) {
 				if err := seed(); err != nil {
 					b.Fatal(err)
 				}
+				// The first slot outside the prune range must survive, including
+				// sparse-slot and multi-item cases. Seed it once outside timing.
+				if err := m.graph.db.Update(func(tx *latticedb.Tx) error {
+					for item := range batchSize {
+						id := fmt.Sprintf("slot-%d-request-%d", through+1, item)
+						if err := putRequest(tx, id, graphRequest{Receipt: types.MutationReceipt{Slot: through + 1, Status: types.MutationCommitted, Applied: true}}); err != nil {
+							return err
+						}
+					}
+					return nil
+				}); err != nil {
+					b.Fatal(err)
+				}
 				b.ReportAllocs()
 				b.ResetTimer()
 				for range b.N {
@@ -49,6 +62,33 @@ func BenchmarkGraphPruneSparseSlotsAndBatchSize(b *testing.B) {
 					b.StartTimer()
 					if err := m.graph.db.Update(func(tx *latticedb.Tx) error {
 						return pruneGraphRequestsForApply(tx, 3*window, 2*window, window)
+					}); err != nil {
+						b.Fatal(err)
+					}
+					b.StopTimer()
+					if err := m.graph.db.View(func(tx *latticedb.Tx) error {
+						for slot := start; slot <= through+1; slot++ {
+							boundary := slot == through+1
+							if _, found, err := tx.GetAppMetadata(graphSlotKey(slot)); err != nil {
+								return err
+							} else if found != boundary {
+								return fmt.Errorf("slot index %d present=%t want=%t", slot, found, boundary)
+							}
+							if !boundary && int(slot-start)%gap != 0 {
+								continue
+							}
+							for item := range batchSize {
+								id := fmt.Sprintf("slot-%d-request-%d", slot, item)
+								request, found, err := requestInTx(tx, id)
+								if err != nil {
+									return err
+								}
+								if found != boundary || boundary && (request.Receipt.Slot != slot || request.Receipt.Status != types.MutationCommitted || !request.Receipt.Applied) {
+									return fmt.Errorf("request %s present=%t receipt=%+v boundary=%t", id, found, request.Receipt, boundary)
+								}
+							}
+						}
+						return nil
 					}); err != nil {
 						b.Fatal(err)
 					}

@@ -1,158 +1,75 @@
-# Recovery Anchor
+# Recovery Anchor: protocol boundary, not automatic DR
 
-The Kubernetes Operator orchestrates recovery (fencing, StatefulSet control,
-fork, seal). The recovery-anchor service provides two capabilities: anchor
-CAS and verification via `recoveryanchor.Coordinator`. The embedded
-application does NOT write its own recovery orchestrator.
+The anchor provides CAS and verification through `recoveryanchor.Coordinator`.
+It does not terminate old runtimes, restore data or orchestrate a new generation.
+The current operator does not implement automatic generation DR; a
+`RhizaRecovery` queue/status record is not permission or a completed executor.
+
+Normal managed HA does not require this as an always-on external lease/fencer.
+For genesis, Host healthy-quorum repair and engine membership roles, use the
+[current operator guide](../deploy/operator/README.md). Its
+[automatic-attempt policy](../deploy/operator/README.md#approved-automatic-attempt-policy-not-implemented-or-qualified)
+is explicitly unimplemented and unqualified.
+
+The [v0.23.1 original](https://github.com/mrchypark/rhiza/blob/2262531f266f2638eb21baea6f65de45465ffe90/docs/recovery-anchor.md)
+preserves the former alpha1/StatefulSet service configuration and
+application-specific migration notes at an immutable commit. Those examples
+are not current alpha2 deployment or migration instructions.
 
 ## Activate protocol
 
-Two-phase CAS via `Coordinator.Activate`:
+Two-phase CAS through `Coordinator.Activate` reserves `Record.Transition`
+with the frozen source binding, generation and evidence, then calls the
+Verifier for a matching target binding and proof. Commit advances the generation,
+clears Transition and records a receipt. Recovery reserves Transition, not an
+application PendingWrite; a pending application operation must not be cleared
+to manufacture recovery.
 
-1. **Transition reserve** — freezes current source binding, generation, and
-evidence into `Record.Transition`. CAS writes with outer `PendingWrite=false`.
-2. **Commit** — calls Verifier which returns `(targetBinding, proofBytes)`.
-Proof must match frozen evidence. Commits with `Binding=targetBinding`,
-`Generation=baseGeneration+1`, clears `Transition`, records `Receipt`.
+The Coordinator validates the returned binding and compares proof bytes with
+the frozen evidence before CAS. The caller and verifier establish fencing and
+validate the recovery data; the Coordinator does not independently observe
+process termination, archive coverage or quorum readiness. This primitive is
+not wired into managed v1alpha2 generation activation.
 
-`Receipt` contains `RequestHash`, `Target` binding, and `Generation`.
-Idempotent: already committed returns existing `Receipt`.
+`RequestHash` covers the entire request, including `FenceHash`. The latter
+describes independent fencing evidence and is not the request hash.
+Independent proof must establish the complete old-runtime termination scope,
+recreation prevention and outstanding storage-work safety. A Pod deletion,
+timeout or successful infrastructure API response alone is insufficient.
+The BeforeAck recovery design requires a verified source covering successful
+ACKs. The separate [managed Async proposal](managed-async-recovery.md) permits
+only unpublished-tail loss beyond the verified cut and does not implement
+activation. Resuming service also needs fresh live authority and a new ready
+quorum. Unknown evidence stays Blocked.
 
-## Verify protocol
+## Verification is not restoration
 
-`Coordinator.Verify(ctx, req, receipt)` live-checks:
+`Coordinator.Verify(ctx, req, receipt)` checks the live record, committed
+request and matching receipt/binding/generation. A stored receipt alone cannot
+authorize activation, future writes or a cached authority decision.
+Verify does not restore checkpoints or establish full database rollback
+protection. Same-generation startup must compare application state with the
+current external evidence.
 
-- Record `Version==1`, `EvidenceFormat` matches
-- `committed()` helper confirms request is committed
-- `receipt == *record.LastTransition` (full struct comparison)
+`CheckBinding` rejects pending writes and active Transition; it is non-atomic
+and must be used within the application's write protocol.
+`UpdateApplication` CAS-updates application evidence/pending state while
+preserving recovery fields, with no active Transition.
 
-Does NOT restore checkpoints or compare current evidence. Normal writes
-advance evidence via `UpdateApplication`; Verify is receipt/binding/generation
-check only.
+## Evidence and preservation
 
-Same-generation startup MUST compare current DB state against current
-external anchor evidence.
+Application evidence has an application-specific schema. A static epoch/token
+proof is not a proof of the complete database or every ACK.
+Object-store `GenerationAnchor` and the external Record have distinct roles:
+the former is an immutable recovery artifact; the latter supplies live
+binding/evidence/transition authority. A missing external anchor is an error,
+never a bootstrap signal reconstructed from restored data.
 
-## App helpers
-
-`CheckBinding(record, expected, expectedGeneration)` — validates record
-against expected binding/generation. Rejects `PendingWrite` and active
-`Transition`. Non-atomic; use within application writeprotocol.
-
-`UpdateApplication(ctx, backend, id, version, binding, generation, evidence,
-pendingWrite)` — updates app fields (evidence, pending flag) while
-preserving recovery fields. Uses string resource version for CAS.
-Record must have no active `Transition`.
-
-## Evidence model
-
-Stored evidence is the application schema proof — canonical
-`json.Marshal(struct{Epoch int64; Token string}{...})` from the materializer
-callback. Static epoch proof, NOT full DB rollback protection.
-
-## Object store GenerationAnchor vs external Record
-
-Object store `GenerationAnchor` (recovery/anchor.json) is the immutable
-recovery artifact used by `VerifyGenerationAnchor` and
-`MaterializeGeneration`. External `Record` (ConfigMap via Backend)
-supplements it with binding, evidence, and transition state.
-Missing external anchor never initializes from recovered data.
-
-## Ternal migration
-
-Existing Ternal guard/backend must adapt to the common Record format.
-Migration preserves these fields from the source tree:
-
-- `Format` — validate the legacy format and retain it in a versioned, application-specific migration envelope; Record.EvidenceFormat identifies the adapter's new evidence schema.
-- `ClusterID` — mapped to `Binding.ClusterID`
-- `StorageID` — preserve the stored identity only after verifying it equals the trusted storage recipe (`TrustAnchorStorageID`); mismatch blocks migration.
-- `Epoch` (int64) — stored in `Record.Evidence` via canonical JSON
-- `Token` (string) — stored in `Record.Evidence` via canonical JSON
-- `PendingEpoch` — preserved in application-specific evidence fields
-- `PendingID` — preserved in application-specific evidence fields
-- `Bootstrap` — preserved in application-specific evidence fields
-
-The adapter writes the common Record to ConfigMap while retaining all
-original source fields. Normal write protocol continues through the adapter;
-no promise of automatic compatibility with the old flat ConfigMap format.
-No reset epoch or bootstrap during migration.
-
-Binding recipe: `sha256(JSON([provider, endpoint, bucket, prefix, cluster]))`.
-App-specific; not universal.
-
-## Configuration
-
-### Environment variables
-
-| Variable | Description |
-|----------|-------------|
-| `RHIZA_NAMESPACE` | Kubernetes namespace (default: `default`) |
-| `ANCHOR_TOKEN_FILE` | Path to bearer token file (required, empty denies all) |
-| `ANCHOR_TLS_CERT` | TLS certificate file path (required) |
-| `ANCHOR_TLS_KEY` | TLS key file path (required) |
-| `RHIZA_OBJSTORE_PROVIDER` | `s3`, `gcs`, `azure`, or `filesystem` |
-| `RHIZA_OBJSTORE_ENDPOINT` | Object store endpoint |
-| `RHIZA_OBJSTORE_BUCKET` | Object store bucket |
-| `RHIZA_OBJSTORE_PREFIX` | Object store prefix |
-
-### AWS credentials (for S3 / MinIO)
-
-`objstore.LoadConfig` uses the AWS SDK credential chain. For MinIO or
-non-IAM environments, set:
-
-- `AWS_ACCESS_KEY_ID`
-- `AWS_SECRET_ACCESS_KEY`
-- `AWS_REGION`
-
-Do not use `RHIZA_*` keys for object store credentials.
-
-### Operator environment
-
-The Kubernetes Operator Deployment requires additional environment variables
-to connect to the recovery-anchor service. See [embedded-operator.md](embedded-operator.md#6-recovery-anchor-연동) for the full configuration.
-
-| Variable | Description |
-|----------|-------------|
-| `RHIZA_RECOVERY_ANCHOR_URL` | HTTPS URL of the recovery-anchor service (e.g. `https://anchor.svc:9191`) |
-| `RHIZA_RECOVERY_ANCHOR_TOKEN_FILE` | Path to the bearer token file for the anchor service |
-| `RHIZA_RECOVERY_ANCHOR_CA_FILE` | Path to the TLS CA certificate file for the anchor service |
-
-Workload Pods must also set:
-
-| Variable | Description |
-|----------|-------------|
-| `RHIZA_RECOVERY_ANCHOR_ID` | Anchor ConfigMap identifier (e.g. `myapp-production`) |
-| `RHIZA_NAMESPACE` | Kubernetes namespace of the anchor ConfigMap |
-
-The CRD fields `spec.anchorID` on `RhizaCluster` and `RhizaRecovery` link a
-recovery operation to a specific anchor.
-
-
-### ServiceAccount and RBAC
-
-The anchor service requires a scoped ServiceAccount with permission to
-get and update (not create/delete) a preexisting ConfigMap named
-`rhiza-anchor-<id>`. Do not alter global RBAC. Example Role:
-
-```yaml
-apiVersion: rbac.authorization.k8s.io/v1
-kind: Role
-metadata:
-  name: anchor-configmap-access
-  namespace: YOUR_NAMESPACE
-rules:
-  - apiGroups: [""]
-    resources: ["configmaps"]
-    resourceNames: ["rhiza-anchor-YOUR_ID"]
-    verbs: ["get", "update"]
-```
-
-## TLS
-
-Required. `ANCHOR_TLS_CERT` and `ANCHOR_TLS_KEY` must be set.
-Empty or missing values are errors.
-
-## Token auth
-
-`ANCHOR_TOKEN_FILE` reads the bearer token from a file. **Empty token
-denies ALL requests** — it does NOT disable auth.
+Preserve legacy UNKNOWN/pending originals and all binding/generation/Transition
+evidence. There is no implicit compatibility or automatic migration from a
+legacy ConfigMap schema. Validate any separately authorized migration against
+the original format and trusted storage identity; do not reset epochs,
+bootstrap missing authority or discard unrecognized fields.
+An authenticated, scoped verifier is required; missing credentials must fail
+closed, not disable authentication. Historical TLS/auth examples do not
+establish that a current deployment or end-to-end DR path has been qualified.

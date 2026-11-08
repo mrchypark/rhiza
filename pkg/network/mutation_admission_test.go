@@ -102,13 +102,14 @@ func TestRequestStripeWaitHonorsCancellationAndShutdown(t *testing.T) {
 }
 
 func TestMutationLeaseLivesUntilQueuedProposalFinishesAfterCancel(t *testing.T) {
-	started, finish, released := make(chan struct{}), make(chan struct{}), make(chan struct{})
+	started, released := make(chan struct{}), make(chan struct{})
+	finish, unblock := newBatcherTestGate()
 	b := newSQLBatcher(func(context.Context, []byte) (quepaxa.Slot, error) {
 		close(started)
 		<-finish
 		return 1, nil
 	}, nil)
-	defer b.Close()
+	defer func() { unblock(); b.Close() }()
 	lease := &mutationLease{release: func() { close(released) }}
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan error, 1)
@@ -130,7 +131,7 @@ func TestMutationLeaseLivesUntilQueuedProposalFinishesAfterCancel(t *testing.T) 
 		t.Fatal("lease released while proposal was still running")
 	default:
 	}
-	close(finish)
+	unblock()
 	select {
 	case <-released:
 	case <-time.After(5 * time.Second):

@@ -655,14 +655,64 @@ fn mixed_sql(
     db: &ManagedDb,
     request: &ManagedExecuteRequest,
 ) -> Result<ExecuteReturningResult, String> {
-    // The unchanged SQL facade returns Error without mutation context. Reject
-    // any lost SQL ACK instead of inventing its slot or accepting row presence
-    // as ACK proof. KV's detailed error path below retains exact slot context.
-    let receipt = db.execute(request).map_err(|error| error.code)?;
+    mixed_sql_once(
+        request,
+        || db.execute(request).map_err(|e| e.code),
+        || {
+            db.recover_request(MutationKind::Sql, request.request_id.as_bytes())
+                .map_err(|e| e.error().code.clone())
+        },
+    )
+}
+
+fn mixed_sql_once(
+    request: &ManagedExecuteRequest,
+    execute: impl FnOnce() -> Result<ExecuteReturningResult, String>,
+    recover: impl FnOnce() -> Result<ManagedRecoveryResult, String>,
+) -> Result<ExecuteReturningResult, String> {
+    let receipt = match execute() {
+        Ok(receipt) => receipt,
+        Err(code) if code == "commit_unknown" => {
+            eprintln!("RUST_SQL_ORIGINAL_OUTCOME=commit_unknown");
+            let recovered = recover();
+            eprintln!(
+                "RUST_SQL_RECOVERY_OUTCOME={}",
+                if recovered.is_ok() {
+                    "returned"
+                } else {
+                    "failed"
+                }
+            );
+            match recovered? {
+                ManagedRecoveryResult::Sql { request_id, result }
+                    if request_id == request.request_id.as_bytes() =>
+                {
+                    result
+                }
+                _ => return Err("mixed_sql_recovery_original_mismatch".into()),
+            }
+        }
+        Err(code) => return Err(code),
+    };
     receipt
         .require_committed()
         .map_err(|_| "mixed_sql_ack_missing")?;
-    mixed_sql_ack_slot(receipt.receipt.slot)?;
+    let slot = mixed_sql_ack_slot(receipt.receipt.slot)?;
+    if receipt
+        .receipt
+        .retry_through_slot
+        .is_none_or(|tip| tip < slot)
+    {
+        return Err("mixed_sql_retention_missing".into());
+    }
+    // These four fixture requests are CREATEs and single-row INSERTs only.
+    if matches!(
+        request.request_id.as_str(),
+        "graph-ci-row" | "rust-mixed-row"
+    ) && receipt.receipt.rows_affected != Some(1)
+    {
+        return Err("mixed_sql_row_result_mismatch".into());
+    }
     Ok(receipt)
 }
 
@@ -1071,6 +1121,85 @@ mod tests {
         let diagnostic = graph_step_error(private, 1, private, None);
         assert_eq!(diagnostic, "graph_step stage=unclassified ordinal=1 code=unclassified context_known=false slot=0 retry=0");
         assert!(!diagnostic.contains(private));
+    }
+
+    #[test]
+    fn mixed_sql_committed_does_not_recover() {
+        let request = ManagedExecuteRequest::sql("graph-ci-row", "unused");
+        let result = mixed_sql_once(
+            &request,
+            || {
+                Ok(serde_json::from_value(json!({
+                    "slot":27,"status":"committed","retry_through_slot":65562,"rows_affected":1
+                }))
+                .unwrap())
+            },
+            || panic!("must not recover committed Execute"),
+        )
+        .unwrap();
+        assert_eq!(result.receipt.slot, Some(27));
+    }
+
+    #[test]
+    fn mixed_sql_unknown_recovers_exact_original_once() {
+        let request = ManagedExecuteRequest::sql("graph-ci-row", "unused");
+        let calls = std::cell::Cell::new(0);
+        let result = mixed_sql_once(&request, || Err("commit_unknown".into()), || {
+            calls.set(calls.get() + 1);
+            Ok(ManagedRecoveryResult::Sql {
+                request_id: b"graph-ci-row".to_vec(),
+                result: serde_json::from_value(json!({"slot":27,"status":"committed","retry_through_slot":65562,"rows_affected":1})).unwrap(),
+            })
+        }).unwrap();
+        assert_eq!(calls.get(), 1);
+        assert_eq!(result.receipt.slot, Some(27));
+    }
+
+    #[test]
+    fn mixed_sql_recovery_fails_closed() {
+        let request = ManagedExecuteRequest::sql("graph-ci-row", "unused");
+        for value in [
+            json!({"slot":0,"status":"committed","retry_through_slot":65562,"rows_affected":1}),
+            json!({"slot":27,"status":"rejected","retry_through_slot":65562,"rows_affected":1}),
+            json!({"slot":27,"status":"committed","rows_affected":1}),
+            json!({"slot":27,"status":"committed","retry_through_slot":26,"rows_affected":1}),
+            json!({"slot":27,"status":"committed","retry_through_slot":65562,"rows_affected":0}),
+        ] {
+            assert!(mixed_sql_once(
+                &request,
+                || Err("commit_unknown".into()),
+                || {
+                    Ok(ManagedRecoveryResult::Sql {
+                        request_id: b"graph-ci-row".to_vec(),
+                        result: serde_json::from_value(value).unwrap(),
+                    })
+                }
+            )
+            .is_err());
+        }
+        assert!(mixed_sql_once(
+            &request,
+            || Err("commit_unknown".into()),
+            || Ok(ManagedRecoveryResult::None)
+        )
+        .is_err());
+        for code in ["commit_unknown", "request_conflict", "expired", "poisoned"] {
+            assert!(mixed_sql_once(
+                &request,
+                || Err("commit_unknown".into()),
+                || Err(code.into())
+            )
+            .is_err());
+        }
+        assert!(mixed_sql_once(
+            &request,
+            || Err("invalid_request".into()),
+            || panic!("must not recover non-UNKNOWN")
+        )
+        .is_err());
+        assert!(mixed_sql_once(&request, || Err("commit_unknown".into()), || {
+            Ok(ManagedRecoveryResult::Sql { request_id: b"other".to_vec(), result: serde_json::from_value(json!({"slot":27,"status":"committed","retry_through_slot":65562,"rows_affected":1})).unwrap() })
+        }).is_err());
     }
 
     #[test]

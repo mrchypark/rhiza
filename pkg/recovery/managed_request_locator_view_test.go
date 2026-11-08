@@ -76,7 +76,7 @@ func TestManagedRequestReadOnlyLocatorAndFixedHandoff(t *testing.T) {
 	core.SetCheckpointValidator(func(ctx context.Context, s quepaxa.CheckpointSeal) error {
 		return cp.Verify(ctx, uint64(s.Index), s.RootHash, s.StateHash)
 	})
-	propose := func(value []byte) quepaxa.DecidedValue {
+	proposeLocal := func(value []byte) quepaxa.DecidedValue {
 		t.Helper()
 		slot, _, err := core.Propose(ctx, value)
 		if err != nil {
@@ -89,7 +89,12 @@ func TestManagedRequestReadOnlyLocatorAndFixedHandoff(t *testing.T) {
 		if err := producer.ApplyBatch(ctx, []quepaxa.DecidedValue{d}); err != nil {
 			t.Fatal(err)
 		}
-		if err := archive.SyncThrough(ctx, core, slot); err != nil {
+		return d
+	}
+	propose := func(value []byte) quepaxa.DecidedValue {
+		t.Helper()
+		d := proposeLocal(value)
+		if err := archive.SyncThrough(ctx, core, d.Slot); err != nil {
 			t.Fatal(err)
 		}
 		return d
@@ -245,6 +250,72 @@ func TestManagedRequestReadOnlyLocatorAndFixedHandoff(t *testing.T) {
 		}
 		if after := requestViewBucketHashes(t, ctx, bucket); !reflect.DeepEqual(before, after) {
 			t.Fatal("captured HEAD reader mutated source objects")
+		}
+	})
+	t.Run("pinned-restore-excludes-unpublished-certified-tail", func(t *testing.T) {
+		published := open()
+		if published.Tip() != core.Tip() {
+			t.Fatalf("published cut tip=%d, want producer certified tip=%d", published.Tip(), core.Tip())
+		}
+		before := requestViewBucketHashes(t, ctx, bucket)
+		const tail = "unpublished-tail"
+		value, err := types.EncodeManagedKVCommand(types.KVCommand{RequestID: tail, Operation: "put", Key: tail, Value: []byte(tail)})
+		if err != nil {
+			t.Fatal(err)
+		}
+		decision := proposeLocal(value)
+		if err := core.EnsureDurableThrough(ctx, decision.Slot); err != nil {
+			t.Fatal(err)
+		}
+		if decision.Slot <= published.Tip() || core.Tip() != decision.Slot || producer.Tip() != uint64(decision.Slot) {
+			t.Fatal("fixture did not certify and apply a later local write")
+		}
+		if got, found, err := producer.KVGet(ctx, tail, time.Now()); err != nil || !found || string(got) != tail {
+			t.Fatalf("producer tail missing: found=%t err=%v", found, err)
+		}
+		if after := requestViewBucketHashes(t, ctx, bucket); !reflect.DeepEqual(before, after) {
+			t.Fatal("local tail unexpectedly changed published objects")
+		}
+		fixed, err := OpenReadOnlyViewAtHeadForApplicationProtocol(ctx, readonly, prefix, 1, bootstrap, published.CapturedHead(), policy, window, protocol, false)
+		if err != nil {
+			t.Fatal(err)
+		}
+		restored, err := PrepareReadOnlyRestoreForPolicy(ctx, fixed, filepath.Join(t.TempDir(), "restore"), policy, window)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if restored.Tip != published.Tip() || restored.HeadHash != published.HeadHash() || restored.PrefixHash != published.PrefixHash() {
+			t.Fatal("restore did not preserve the exact latest published cut")
+		}
+		// Inspect only the isolated materializer; do not open a voter/runtime.
+		m, err := materializer.OpenManagedSQLKVWithAppendOnlyOriginals(restored.SQLitePath, 1, window)
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() {
+			if err := m.Close(); err != nil {
+				t.Error(err)
+			}
+		})
+		for _, key := range []string{"suffix", "after-H", tail} {
+			want := key != tail
+			got, found, err := m.KVGet(ctx, key, time.Now())
+			if err != nil || found != want || (want && string(got) != key) {
+				t.Fatalf("restored key %q: found=%t want=%t err=%v", key, found, want, err)
+			}
+			original, found, err := m.RetainedRequestOriginal(ctx, types.MutationKV, key)
+			if err != nil || found != want {
+				t.Fatalf("restored original %q: found=%t want=%t err=%v", key, found, want, err)
+			}
+			if want {
+				local, found, err := producer.RetainedRequestOriginal(ctx, types.MutationKV, key)
+				if err != nil || !found || !reflect.DeepEqual(original, local) {
+					t.Fatalf("restored original/receipt %q differs from producer: found=%t err=%v", key, found, err)
+				}
+			}
+		}
+		if after := requestViewBucketHashes(t, ctx, bucket); !reflect.DeepEqual(before, after) {
+			t.Fatal("read-only restore changed published objects")
 		}
 	})
 	for _, tc := range []struct {

@@ -892,7 +892,7 @@ func (n *Node) openInternal(ctx context.Context, enroll bool, prelocked *qlog.Lo
 		hasSeal := false
 		if managedPeerProfile != nil {
 			openStage = "" // This selector supplies its own fixed failure reason.
-			selectedRoot, selected, selectErr := n.selectManagedAppendOnlyRoot(ctx)
+			selectedRoot, selected, selectErr := n.selectManagedGraphStartupRoot(ctx)
 			if selectErr != nil {
 				return selectErr
 			}
@@ -924,23 +924,41 @@ func (n *Node) openInternal(ctx context.Context, enroll bool, prelocked *qlog.Lo
 		if hasSeal {
 			material, managedGraphReplayThrough, err = n.installManagedGraphStartup(ctx, core, managedGraphTarget, managedGraphSelectedSeal)
 		} else {
-			// Only an explicitly verified original bootstrap may create fresh
-			// application files. A registered restart, required root or observed
-			// locator can never be reinterpreted as empty genesis.
-			_, hasLocator, locatorErr := n.checkpoints.LoadManagedGraphLocator(ctx)
-			if locatorErr != nil {
-				return locatorErr
+			// The append-only selector already authenticated any observed CURRENT.
+			// Legacy Graph still needs its separate locator guard.
+			if managedPeerProfile == nil {
+				_, hasLocator, locatorErr := n.checkpoints.LoadManagedGraphLocator(ctx)
+				if locatorErr != nil {
+					return locatorErr
+				}
+				if hasLocator {
+					return fmt.Errorf("managed Graph recovery requires an authenticated producer root")
+				}
 			}
-			if !managedMaterializerWasAbsent || n.managedStartup.existingRegisteredWAL || !n.managedStartup.Identity.Fresh || !n.managedStartup.BootstrapMember || core.CompactionFloor() != 0 || hasLocator {
+			if !managedMaterializerWasAbsent || n.managedStartup.existingRegisteredWAL || !n.managedStartup.BootstrapMember || core.CompactionFloor() != 0 {
 				return fmt.Errorf("managed Graph recovery requires an authenticated producer root")
+			}
+			tip := core.Tip()
+			if n.managedApplicationProtocol() == sqlpolicy.ManagedGraphRequestAppendOnlyApplicationProtocol &&
+				(!n.managedStartup.Identity.Fresh || tip != 0) {
+				if !managedGraphTarget.Absent || managedGraphTarget.InstallAttempt != nil {
+					return fmt.Errorf("managed Graph recovery requires an authenticated producer root")
+				}
+				if proofErr := n.verifyManagedGraphBootstrapControl(startupRecovery.Context(), tip); proofErr != nil {
+					return fmt.Errorf("managed Graph recovery requires an authenticated producer root: %w", proofErr)
+				}
+			} else {
+				if !n.managedStartup.Identity.Fresh {
+					return fmt.Errorf("managed Graph recovery requires an authenticated producer root")
+				}
+				if _, historyErr := certifiedSuffixThrough(core, 1, tip); historyErr != nil {
+					return historyErr
+				}
 			}
 			// Actual Core has authenticated the complete genesis prefix. No old
 			// native target exists and no installer authority is fabricated.
-			if _, historyErr := certifiedSuffixThrough(core, 1, core.Tip()); historyErr != nil {
-				return historyErr
-			}
 			material, err = n.openMaterializer(filepath.Join(n.config.DataDir, "sqlite.db"), 4)
-			managedGraphReplayThrough = core.Tip()
+			managedGraphReplayThrough = tip
 		}
 		if err != nil {
 			return fmt.Errorf("open actual reconstructed managed Graph pair: %w", err)

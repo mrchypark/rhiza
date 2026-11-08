@@ -3,6 +3,7 @@
 package quepaxa
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"sync/atomic"
@@ -27,6 +28,7 @@ func TestObserveManagedControlAllowsCoveredSameStepAggregateAdvance(t *testing.T
 		core.transport = gate
 	}
 	managedControlRacePrefix(t, observer)
+	requireManagedControlSharedPrefix(t, ctx, observer, proposer)
 	if observer.Tip() != 8 || proposer.Tip() != 8 {
 		t.Fatalf("observer/proposer do not share certified prefix 8: observer=%d proposer=%d", observer.Tip(), proposer.Tip())
 	}
@@ -135,4 +137,52 @@ func TestObserveManagedControlAllowsCoveredSameStepAggregateAdvance(t *testing.T
 	case <-ctx.Done():
 		t.Fatalf("pending control did not finish after releasing recorders: %v", ctx.Err())
 	}
+}
+
+func requireManagedControlSharedPrefix(t *testing.T, ctx context.Context, source, target *Core) {
+	t.Helper()
+	// Proposal completion covers a quorum, not every remote learner delivery.
+	if err := target.WaitTip(ctx, 8); err != nil {
+		t.Fatalf("wait for actual proposer prefix 8: %v", err)
+	}
+	sourceHash, sourceOK := source.PrefixHash(8)
+	targetHash, targetOK := target.PrefixHash(8)
+	if !sourceOK || !targetOK || sourceHash != targetHash {
+		t.Fatal("observer/proposer certified prefix 8 differs")
+	}
+	for slot := Slot(1); slot <= 8; slot++ {
+		want, wantOK := source.CertifiedValue(slot)
+		got, gotOK := target.CertifiedValue(slot)
+		if !wantOK || !gotOK || len(want.Certificate) == 0 || !bytes.Equal(want.Certificate, got.Certificate) || !bytes.Equal(want.Value, got.Value) {
+			t.Fatalf("observer/proposer certified value differs at slot %d", slot)
+		}
+	}
+}
+
+func TestObserveManagedControlQuorumPrefixRequiresProposerDelivery(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	cores, transport := newManagedControlRaceCluster(t, nil)
+	transport.mu.Lock()
+	transport.dropDecision["n2"] = true
+	transport.mu.Unlock()
+	observer, proposer := cores["n1"], cores["n2"]
+	managedControlRacePrefix(t, observer)
+	if err := cores["n3"].WaitTip(ctx, 8); err != nil {
+		t.Fatalf("actual n1/n3 completion quorum: %v", err)
+	}
+	if proposer.Tip() >= 8 {
+		t.Fatal("undelivered proposer unexpectedly has certified prefix 8")
+	}
+	if _, ok := proposer.PrefixHash(8); ok {
+		t.Fatal("undelivered proposer unexpectedly has prefix hash 8")
+	}
+	values, tip, err := observer.DecisionsFrom(1, 8)
+	if err != nil || tip != 8 || len(values) != 8 {
+		t.Fatalf("actual quorum-certified prefix: values=%d tip=%d err=%v", len(values), tip, err)
+	}
+	if err := proposer.AcceptCertifiedValues(values); err != nil {
+		t.Fatalf("deliver actual certified prefix: %v", err)
+	}
+	requireManagedControlSharedPrefix(t, ctx, observer, proposer)
 }

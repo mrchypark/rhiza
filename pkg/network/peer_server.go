@@ -410,6 +410,9 @@ func (s *PeerServer) handle(ctx context.Context, certificateKey ed25519.PublicKe
 				return nil, err
 			}
 		}
+		if localtesthooks.Enabled {
+			localtesthooks.Hit(fmt.Sprintf("network:record:phase=before:node=%s:sender=%s:slot=%d:hash=%x", s.server.core.NodeID(), request.SenderId, record.Slot, record.Proposal.Hash))
+		}
 		summary, err := s.server.core.Record(ctx, record)
 		if err != nil {
 			return nil, err
