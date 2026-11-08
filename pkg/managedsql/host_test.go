@@ -120,7 +120,7 @@ func sqlWireStore(t *testing.T) (*httptest.Server, *sqlWireControl) {
 					default:
 					}
 				}
-				t.Error(err)
+				t.Errorf("read PUT gate body path=%s canceled=%t: %v", r.URL.Path, errors.Is(r.Context().Err(), context.Canceled), err)
 				w.WriteHeader(http.StatusInternalServerError)
 				return
 			}
@@ -231,7 +231,7 @@ func sqlWireStore(t *testing.T) (*httptest.Server, *sqlWireControl) {
 					default:
 					}
 				}
-				t.Error(err)
+				t.Errorf("read PUT body path=%s canceled=%t: %v", r.URL.Path, errors.Is(r.Context().Err(), context.Canceled), err)
 				w.WriteHeader(http.StatusInternalServerError)
 				return
 			}
