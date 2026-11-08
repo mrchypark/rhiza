@@ -108,6 +108,10 @@ run_contract() {
         }
         next
       }
+      if (diagnostic ~ /^MANAGED_GRAPH_EXECUTE_FAILURE/) {
+        if (diagnostic ~ /^MANAGED_GRAPH_EXECUTE_FAILURE stage=(host_initial_admission|node_binding|node_protocol|node_admission|node_application_start|network_readiness|network_context|network_prepare|network_decode|network_fingerprint|network_charge|network_admission|network_request_lock|network_receipt_lookup|network_receipt_durability|network_submit) cause=(canceled|deadline|not_ready|invalid_request|request_conflict|overloaded|durability_unavailable|commit_unknown|quorum_unavailable|other)$/) emit(diagnostic)
+        next
+      }
       if (diagnostic ~ /^MANAGED_CHECKPOINT_SELECT_FAILURE/) {
         if (diagnostic ~ /^MANAGED_CHECKPOINT_SELECT_FAILURE reason=[a-z_]+ prepared_readonly_learner=(true|false) local_voter=(true|false) local_config=[0-9]+$/) {
           split(diagnostic, select_fields, " ")
@@ -420,6 +424,30 @@ if [ "${1-}" = --diagnostic-self-test ]; then
     "MANAGED_SQL_QUERY_FAILURE stage=https://private.invalid" \
     "prefix MANAGED_SQL_QUERY_FAILURE stage=server_apply"'
   if grep -E 'MANAGED_SQL_QUERY_FAILURE|DO-NOT-RETAIN|private.invalid|private_stage' "$diag_dir/active.log"; then exit 1; fi
+  [ "$before" = "$(cksum "$diag_dir/first.log")" ]
+  graph_execute_stages='host_initial_admission node_binding node_protocol node_admission node_application_start network_readiness network_context network_prepare network_decode network_fingerprint network_charge network_admission network_request_lock network_receipt_lookup network_receipt_durability network_submit'
+  graph_execute_causes='canceled deadline not_ready invalid_request request_conflict overloaded durability_unavailable commit_unknown quorum_unavailable other'
+  run_contract rust-restart sh -c '
+    for stage in $1; do
+      printf "2026/11/03 12:00:00 MANAGED_GRAPH_EXECUTE_FAILURE stage=%s cause=not_ready\n" "$stage"
+    done
+    for cause in $2; do
+      printf "MANAGED_GRAPH_EXECUTE_FAILURE stage=network_submit cause=%s\n" "$cause"
+    done
+    printf "%s\n" \
+      "MANAGED_GRAPH_EXECUTE_FAILURE stage=private_stage cause=not_ready" \
+      "MANAGED_GRAPH_EXECUTE_FAILURE stage=network_readiness cause=private_cause" \
+      "MANAGED_GRAPH_EXECUTE_FAILURE stage=network_readiness cause=not_ready payload=DO-NOT-RETAIN" \
+      "prefix MANAGED_GRAPH_EXECUTE_FAILURE stage=network_readiness cause=not_ready"
+  ' sh "$graph_execute_stages" "$graph_execute_causes"
+  for graph_stage in $graph_execute_stages; do
+    grep -Fx "MANAGED_GRAPH_EXECUTE_FAILURE stage=$graph_stage cause=not_ready" "$diag_dir/active.log" >/dev/null
+  done
+  for graph_cause in $graph_execute_causes; do
+    grep -Fx "MANAGED_GRAPH_EXECUTE_FAILURE stage=network_submit cause=$graph_cause" "$diag_dir/active.log" >/dev/null
+  done
+  [ "$(grep -c '^MANAGED_GRAPH_EXECUTE_FAILURE ' "$diag_dir/active.log")" = 26 ]
+  if grep -E 'private_stage|private_cause|DO-NOT-RETAIN|^prefix ' "$diag_dir/active.log"; then exit 1; fi
   [ "$before" = "$(cksum "$diag_dir/first.log")" ]
   run_contract rust-restart sh -c 'printf "%s\n" \
     "2026/11/03 12:00:00 MANAGED_CHECKPOINT_SELECT_FAILURE reason=current_without_certified_qckp prepared_readonly_learner=false local_voter=true local_config=3" \
