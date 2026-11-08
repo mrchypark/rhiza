@@ -261,14 +261,30 @@ trap 'exit_status=$?; trap - EXIT; cleanup || { [[ $exit_status != 0 ]] || exit_
 trap 'exit 130' INT
 trap 'exit 143' TERM
 
-(cd "$source_dir" && CGO_ENABLED=0 go build -o "$run_dir/rhiza" ./cmd/rhiza)
-# Both server revisions use the exact same candidate client/oracle, not each
-# revision's potentially different receipt parser or fault instrumentation.
-(cd "$client_source_dir" && CGO_ENABLED=0 go build -o "$run_dir/rhiza-bench" ./cmd/rhiza-bench)
-if command -v sha256sum >/dev/null; then
-	client_sha256=$(sha256sum "$run_dir/rhiza-bench" | awk '{print $1}')
-else
-	client_sha256=$(shasum -a 256 "$run_dir/rhiza-bench" | awk '{print $1}')
+binary_dir=${RHIZA_SERVER_BENCH_BINARY_DIR:-$run_dir}
+expected_sha256=${RHIZA_SERVER_BENCH_EXPECTED_SHA256:-}
+if [[ $binary_dir == "$run_dir" ]]; then
+	(cd "$source_dir" && CGO_ENABLED=0 go build -o "$binary_dir/rhiza" ./cmd/rhiza)
+	# Both server revisions use the same candidate client/oracle.
+	(cd "$client_source_dir" && CGO_ENABLED=0 go build -o "$binary_dir/rhiza-bench" ./cmd/rhiza-bench)
+elif [[ $binary_dir != /* || -z $expected_sha256 || ! -x $binary_dir/rhiza || ! -x $binary_dir/rhiza-bench ]]; then
+	printf 'prebuilt benchmark requires an absolute binary directory, two executables, and expected hashes\n' >&2
+	exit 2
+fi
+benchmark_sha256() {
+	if command -v sha256sum >/dev/null; then
+		sha256sum "$1" | awk '{print $1}'
+	else
+		shasum -a 256 "$1" | awk '{print $1}'
+	fi
+}
+client_sha256=$(benchmark_sha256 "$binary_dir/rhiza-bench")
+if [[ -n $expected_sha256 ]]; then
+	server_sha256=$(benchmark_sha256 "$binary_dir/rhiza")
+	if [[ "$server_sha256:$client_sha256" != "$expected_sha256" ]]; then
+		printf 'benchmark server/client binary hash mismatch\n' >&2
+		exit 2
+	fi
 fi
 
 node_environment=(env)
@@ -354,7 +370,7 @@ for i in 0 1 2; do
 		"${object_env[@]}" RHIZA_OBJSTORE_PREFIX=server-bench \
 		RHIZA_ASYNC_STAGE_PROBE="$stage_probe" \
 		RHIZA_OBJSTORE_DURABILITY="$durability" RHIZA_OBJSTORE_SYNC_INTERVAL=1h RHIZA_CHECKPOINT_INTERVAL=0 \
-		"$run_dir/rhiza" >"$run_dir/node-$i.log" 2>&1 &
+		"$binary_dir/rhiza" >"$run_dir/node-$i.log" 2>&1 &
 	printf '%s' "$!" >"$run_dir/node-$i.pid"
 done
 for i in 0 1 2; do
@@ -506,7 +522,7 @@ fi
 if [[ $stage_probe == 1 ]]; then
 	printf 'ASYNC_WINDOW_BEGIN_NS=%s\n' "$(date +%s%N)" >&2
 fi
-"$run_dir/rhiza-bench" -url "$target" -path "$request_path" -body "$request_body" \
+"$binary_dir/rhiza-bench" -url "$target" -path "$request_path" -body "$request_body" \
 	-n "$requests" -c "$concurrency" -commit-unknown-retries 3 "$oracle_flag" "${control_args[@]+${control_args[@]}}" >"$result_file" &
 bench_pid=$!
 overlap='null'
@@ -596,7 +612,7 @@ case "$workload" in
 		# the immutable benchmark keys are then read without N read barriers.
 		curl -fsS -H 'Content-Type: application/json' \
 			-d '{"key":"bench-0","consistency":"linearizable"}' "$target/kv/get" >/dev/null
-		count=$("$run_dir/rhiza-bench" -url "$target" -path /kv/get \
+		count=$("$binary_dir/rhiza-bench" -url "$target" -path /kv/get \
 			-body '{"key":"bench-{{id}}","consistency":"local"}' -n "$requests" -c "$concurrency" -verify-kv-value)
 		jq -e --argjson requests "$requests" \
 			'.errors == 0 and .successes == $requests and .receipt_oracle == "kv-benchmark-value-v1"' <<<"$count" >/dev/null ;;

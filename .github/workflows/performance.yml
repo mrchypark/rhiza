@@ -68,16 +68,21 @@ on:
         type: boolean
         default: false
 
+      e2e_async_prebuild_ab:
+        description: Compare per-sample builds with prebuilt binaries for same-SHA GCS SQL Async
+        type: boolean
+        default: false
+
 permissions:
   contents: read
 
 concurrency:
-  group: performance-${{ github.event.pull_request.number || github.ref }}${{ inputs.e2e_cost_matrix && format('-e2e-cost-matrix-{0}', inputs.e2e_cost_provider || 's3') || '' }}${{ inputs.e2e_async_stage_probe && '-stage-probe' || '' }}${{ inputs.e2e_async_disk_isolation && '-disk-isolation' || '' }}
+  group: performance-${{ github.event.pull_request.number || github.ref }}${{ inputs.e2e_cost_matrix && format('-e2e-cost-matrix-{0}', inputs.e2e_cost_provider || 's3') || '' }}${{ inputs.e2e_async_stage_probe && '-stage-probe' || '' }}${{ inputs.e2e_async_disk_isolation && '-disk-isolation' || '' }}${{ inputs.e2e_async_prebuild_ab && '-prebuild-ab' || '' }}
   cancel-in-progress: true
 
 jobs:
   paired-go-benchmarks:
-    if: ${{ !inputs.refresh_hiqlite_reference && !inputs.issue185_cost_evidence && !inputs.e2e_cost_matrix && !inputs.e2e_async_disk_isolation }}
+    if: ${{ !inputs.refresh_hiqlite_reference && !inputs.issue185_cost_evidence && !inputs.e2e_cost_matrix && !inputs.e2e_async_disk_isolation && !inputs.e2e_async_prebuild_ab }}
     runs-on: ubuntu-24.04
     timeout-minutes: 60
     env:
@@ -305,7 +310,7 @@ jobs:
           retention-days: 30
 
   e2e-cost-matrix:
-    if: ${{ inputs.e2e_cost_matrix || inputs.e2e_async_disk_isolation }}
+    if: ${{ inputs.e2e_cost_matrix || inputs.e2e_async_disk_isolation || inputs.e2e_async_prebuild_ab }}
     runs-on: ubuntu-24.04
     timeout-minutes: 60
     defaults:
@@ -317,6 +322,8 @@ jobs:
       RHIZA_SERVER_BENCH_CONCURRENCY: 16
       RHIZA_SERVER_BENCH_PROVIDER: ${{ inputs.e2e_cost_provider || 's3' }}
       ASYNC_DISK_ISOLATION: ${{ inputs.e2e_async_disk_isolation && '1' || '0' }}
+      ASYNC_PREBUILD_AB: ${{ inputs.e2e_async_prebuild_ab && '1' || '0' }}
+      ASYNC_PREBUILD_PAIRS: 8
     steps:
       - name: Initialize matrix evidence
         run: mkdir -p "$RUNNER_TEMP/rhiza-e2e-cost"
@@ -356,6 +363,12 @@ jobs:
             echo '::error::Disk isolation requires the GCS cost matrix, stage probe, and identical full base/candidate SHAs; do not combine it with SQL isolation.'
             exit 1
           fi
+          if [[ $ASYNC_PREBUILD_AB == 1 ]] &&
+            [[ $COST_MATRIX != true || $ASYNC_STAGE_PROBE != true || $SQL_ASYNC_ISOLATION == true ||
+              $ASYNC_DISK_ISOLATION == 1 || $RHIZA_SERVER_BENCH_PROVIDER != gcs || $BASE_SHA != "$CANDIDATE_SHA" ]]; then
+            echo '::error::Prebuild A/B requires the GCS cost matrix, stage probe, and identical full base/candidate SHAs; do not combine it with isolation modes.'
+            exit 1
+          fi
           checkout_revision() {
             local sha=$1 role=$2
             if [[ ! $sha =~ ^[0-9a-f]{40}$ ]]; then
@@ -393,6 +406,8 @@ jobs:
               for role in base wal lease candidate; do
                 printf '%s_tree=%s\n' "$role" "$(git -C "$RUNNER_TEMP/rhiza-e2e-$role" write-tree)"
               done
+            elif [[ $ASYNC_PREBUILD_AB == 1 ]]; then
+              printf 'samples_per_cell=%s\n' "$ASYNC_PREBUILD_PAIRS"
             else
               printf 'samples_per_cell=3\n'
             fi
@@ -415,6 +430,9 @@ jobs:
           workloads=(sql graph kv)
           durabilities=(async before-ack)
           disk_root=
+          prebuilt_dir=
+          expected_sha256=
+          samples=3
           if [[ $ASYNC_DISK_ISOLATION == 1 ]]; then
             {
               printf 'default /tmp: '
@@ -436,8 +454,23 @@ jobs:
             workloads=(sql kv)
             durabilities=(async)
           fi
+          if [[ $ASYNC_PREBUILD_AB == 1 ]]; then
+            prebuilt_dir=$(mktemp -d "$RUNNER_TEMP/rhiza-prebuild-ab.XXXXXX")
+            trap 'rm -f -- "$prebuilt_dir/rhiza" "$prebuilt_dir/rhiza-bench"; rmdir -- "$prebuilt_dir"' EXIT
+            # Use the exact same source directory for both server builds; Go can embed its absolute path.
+            (cd "$RUNNER_TEMP/rhiza-e2e-base" && go build -o "$prebuilt_dir/rhiza" ./cmd/rhiza)
+            go build -o "$prebuilt_dir/rhiza-bench" ./cmd/rhiza-bench
+            server_sha256=$(sha256sum "$prebuilt_dir/rhiza" | awk '{print $1}')
+            client_sha256=$(sha256sum "$prebuilt_dir/rhiza-bench" | awk '{print $1}')
+            expected_sha256="$server_sha256:$client_sha256"
+            printf 'base=build-per-sample\ncandidate=prebuilt\nserver_sha256=%s\nclient_sha256=%s\n' \
+              "$server_sha256" "$client_sha256" >"$evidence/prebuild-ab.txt"
+            workloads=(sql)
+            durabilities=(async)
+            samples=$ASYNC_PREBUILD_PAIRS
+          fi
           printf 'sample\tworkload\tdurability\trevision\texit\n' >"$evidence/exits.tsv"
-          for sample in 1 2 3; do
+          for ((sample = 1; sample <= samples; sample++)); do
             revisions=(base candidate)
             if (( sample % 2 == 0 )); then
               revisions=(candidate base)
@@ -450,15 +483,22 @@ jobs:
                   result="$evidence/$workload-$durability-$revision-$sample"
                   status=0
                   sample_tmpdir=${TMPDIR:-/tmp}
+                  sample_source="$RUNNER_TEMP/rhiza-e2e-$revision"
+                  sample_binary_dir=
+                  if [[ -n $prebuilt_dir ]]; then
+                    sample_source="$RUNNER_TEMP/rhiza-e2e-base"
+                    if [[ $revision == candidate ]]; then sample_binary_dir=$prebuilt_dir; fi
+                  fi
                   if [[ -n $disk_root ]]; then
                     sample_tmpdir=/tmp
                     if [[ $revision == candidate ]]; then sample_tmpdir=$disk_root; fi
                   fi
                   TMPDIR="$sample_tmpdir" RHIZA_ASYNC_STAGE_PROBE="$((publish * ASYNC_STAGE_PROBE))" \
+                    RHIZA_SERVER_BENCH_BINARY_DIR="$sample_binary_dir" RHIZA_SERVER_BENCH_EXPECTED_SHA256="$expected_sha256" \
                     RHIZA_SERVER_BENCH_WORKLOAD="$workload" \
                     RHIZA_SERVER_BENCH_DURABILITY="$durability" \
                     RHIZA_SERVER_BENCH_ASYNC_PUBLISH="$publish" \
-                    benchmarks/run-server-reference.sh "$RUNNER_TEMP/rhiza-e2e-$revision" "$result.json" \
+                    benchmarks/run-server-reference.sh "$sample_source" "$result.json" \
                     >"$result.log" 2>&1 || status=$?
                   printf '%s\t%s\t%s\t%s\t%s\n' "$sample" "$workload" "$durability" "$revision" "$status" | tee -a "$evidence/exits.tsv"
                   if (( status != 0 )); then
@@ -468,6 +508,7 @@ jobs:
                   if ! jq -e --argjson requests "$RHIZA_SERVER_BENCH_REQUESTS" \
                     --argjson concurrency "$RHIZA_SERVER_BENCH_CONCURRENCY" \
                       --argjson disk_isolation "$ASYNC_DISK_ISOLATION" \
+                      --argjson prebuild_ab "$ASYNC_PREBUILD_AB" \
                     --arg provider "$RHIZA_SERVER_BENCH_PROVIDER" \
                     --arg harness "$harness_sha" --arg workload "$workload" --arg durability "$durability" '
                       .client_revision == $harness and .workload == $workload and .durability_mode == $durability and
@@ -476,7 +517,7 @@ jobs:
                       .voter_resource_status == "measured" and (.voter_resources.nodes | length) == 3 and
                       (.object_store_delta.http_requests | type) == "number" and
                       (.write_object_store_delta.http_requests | type) == "number" and
-                      ($disk_isolation == 0 or .write_object_store_delta.http_requests == 0) and
+                      (($disk_isolation == 0 and $prebuild_ab == 0) or .write_object_store_delta.http_requests == 0) and
                       (if $provider == "gcs" then
                         (.gcs_request_classes.write | type) == "object" and
                         (if $durability == "async" then (.gcs_request_classes.publication | type) == "object"
@@ -496,7 +537,10 @@ jobs:
               done
             done
           done
-          if [[ -n $disk_root ]]; then
+          if [[ -n $prebuilt_dir ]]; then
+            printf '## GCS SQL Async prebuild A/B\n\nAll %s samples (%s alternating pairs) passed. Both arms verified identical server and client binaries; only per-sample building changed. Raw results and stage logs are attached.\n' \
+              "$((samples * 2))" "$samples" >>"$GITHUB_STEP_SUMMARY"
+          elif [[ -n $disk_root ]]; then
             printf '## GCS Async disk isolation\n\nAll 12 samples passed: SQL and KV × two mounts × three runs. Both mounts used the same commit with WAL sync and stage probes enabled. Mount evidence, raw results, and process logs are attached.\n' >>"$GITHUB_STEP_SUMMARY"
           else
             printf '## E2E cost matrix (%s)\n\nAll 36 samples passed: SQL, Graph, and KV × Async and BeforeAck × two revisions × three runs. Raw result and process logs are attached.\n' "$RHIZA_SERVER_BENCH_PROVIDER" >>"$GITHUB_STEP_SUMMARY"
