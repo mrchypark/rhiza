@@ -35,6 +35,11 @@ trap 'status=$?; report_failure "$status" >&2 || true; exit "$status"' EXIT
 
 sha=${RHIZA_EXPERIMENT_SHA:?RHIZA_EXPERIMENT_SHA must be the exact public commit}
 [[ $sha =~ ^[0-9a-f]{40}$ ]]
+comparison=${RHIZA_EXPERIMENT_LAYOUT-placement}
+case $comparison in
+	placement|storage-tier) ;;
+	*) printf 'RHIZA_EXPERIMENT_LAYOUT must be placement or storage-tier\n' >&2; exit 2 ;;
+esac
 trial=$(mktemp -d /work/rhiza-voter-disk.XXXXXX)
 evidence=$trial/evidence
 export HOME=$trial/home GOCACHE=$trial/go-cache GOMODCACHE=$trial/go-mod
@@ -86,10 +91,15 @@ export RHIZA_SERVER_BENCH_REQUESTS=1000 RHIZA_SERVER_BENCH_CONCURRENCY=16
 for ((pair = 0; pair < 6; pair++)); do
 	a=${roots[$((pair % 3))]} b=${roots[$(((pair + 1) % 3))]} c=${roots[$(((pair + 2) % 3))]}
 	arms=(shared split)
-	if (( pair % 2 == 1 )); then arms=(split shared); fi
+	if [[ $comparison == storage-tier ]]; then arms=(standard premium); fi
+	if (( pair % 2 == 1 )); then arms=("${arms[1]}" "${arms[0]}"); fi
 	for arm in "${arms[@]}"; do
-		layout="$a:$a:$a"
-		if [[ $arm == split ]]; then layout="$a:$b:$c"; fi
+		case $arm in
+			shared) layout="$a:$a:$a" ;;
+			split) layout="$a:$b:$c" ;;
+			standard) disk=${roots[$((pair % 2))]}; layout="$disk:$disk:$disk" ;;
+			premium) layout="${roots[2]}:${roots[2]}:${roots[2]}" ;;
+		esac
 		sample="$evidence/pair-$pair-$arm"
 		printf 'BENCH_LAYOUT pair=%s arm=%s roots=%s\n' "$pair" "$arm" "$layout" | tee -a "$evidence/layouts.txt"
 		status=0
