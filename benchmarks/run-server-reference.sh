@@ -165,6 +165,7 @@ workload=${RHIZA_SERVER_BENCH_WORKLOAD:-sql}
 publish_async=${RHIZA_SERVER_BENCH_ASYNC_PUBLISH:-0}
 stage_probe=${RHIZA_ASYNC_STAGE_PROBE:-0}
 provider=${RHIZA_SERVER_BENCH_PROVIDER:-s3}
+gcs_log=${RHIZA_SERVER_BENCH_GCS_LOG:-}
 fault_after=${RHIZA_SERVER_BENCH_FAULT_AFTER:-1}
 max_fault_latency_ms=${RHIZA_SERVER_BENCH_MAX_FAULT_LATENCY_MS:-1500}
 base_http_port=${RHIZA_SERVER_BENCH_HTTP_PORT:-18100}
@@ -192,6 +193,10 @@ if [[ $workload != sql && $workload != graph && $workload != kv ]]; then
 fi
 if [[ $provider != s3 && $provider != gcs ]] || [[ $provider == gcs && $failed_node != none ]]; then
 	printf 'RHIZA_SERVER_BENCH_PROVIDER must be s3 or gcs; gcs requires a healthy lane\n' >&2
+	exit 2
+fi
+if [[ -n $gcs_log ]] && [[ $provider != gcs || $gcs_log != /* || ! -f $gcs_log || ! -r $gcs_log || -L $gcs_log ]]; then
+	printf 'RHIZA_SERVER_BENCH_GCS_LOG requires GCS and an absolute readable regular file\n' >&2
 	exit 2
 fi
 if [[ $publish_async != 0 && $publish_async != 1 ]] ||
@@ -313,17 +318,22 @@ if [[ $provider == gcs ]]; then
 	# Same native JSON API as the embedded provider test. The Kind helper's
 	# generated account uses an in-cluster token URI, so bind this ADC locally.
 	gcs_image=floci/floci-gcp:0.11.0@sha256:eae9683d806ceb643bcb36aee97cdb8cad13c3e2959cd053bf40e481994fde12
-	# The image's periodic health GET would enter measured access-log windows.
-	# The explicit readiness and bucket probes below still gate startup.
-	gcs_container_id=$(docker run --rm -d --no-healthcheck --name "$container" -p 127.0.0.1::4588 \
-		-e QUARKUS_HTTP_ACCESS_LOG_ENABLED=true \
-		-e 'QUARKUS_HTTP_ACCESS_LOG_PATTERN=RHIZA_GCS_ACCESS %m %R %s' "$gcs_image")
-	[[ $gcs_container_id =~ ^[a-f0-9]{64}$ ]]
-	gcs_address=$(docker port "$gcs_container_id" 4588/tcp)
-	[[ $gcs_address =~ ^127\.0\.0\.1:[1-9][0-9]{0,4}$ ]]
-	gcs_endpoint="http://$gcs_address"
+	if [[ -n $gcs_log ]]; then
+		gcs_endpoint=http://127.0.0.1:4588
+		# The disposable sidecar can outlive individual benchmark samples.
+		gcs_bucket="rhiza-server-bench-$(openssl rand -hex 12)"
+	else
+		# The periodic health GET would enter measured access-log windows.
+		gcs_container_id=$(docker run --rm -d --no-healthcheck --name "$container" -p 127.0.0.1::4588 \
+			-e QUARKUS_HTTP_ACCESS_LOG_ENABLED=true \
+			-e 'QUARKUS_HTTP_ACCESS_LOG_PATTERN=RHIZA_GCS_ACCESS %m %R %s' "$gcs_image")
+		[[ $gcs_container_id =~ ^[a-f0-9]{64}$ ]]
+		gcs_address=$(docker port "$gcs_container_id" 4588/tcp)
+		[[ $gcs_address =~ ^127\.0\.0\.1:[1-9][0-9]{0,4}$ ]]
+		gcs_endpoint="http://$gcs_address"
+		gcs_bucket="rhiza-server-bench-$$-${RANDOM}"
+	fi
 	gcs_project=rhiza-local-test
-	gcs_bucket="rhiza-server-bench-$$-${RANDOM}"
 	for _ in {1..100}; do
 		curl -q -fsS --noproxy '*' --max-time 1 "$gcs_endpoint/storage/v1/b?project=$gcs_project" >/dev/null 2>&1 && break
 		sleep 0.1
@@ -455,7 +465,11 @@ object_stats() {
 gcs_snapshot() {
 	# Quarkus %R is the path; %U includes the query. Redact defensively before
 	# writing snapshots and keep only shape metadata for malformed records.
-	docker logs "$gcs_container_id" 2>&1 | awk '
+	if [[ -n $gcs_log ]]; then
+		cat -- "$gcs_log"
+	else
+		docker logs "$gcs_container_id" 2>&1
+	fi | awk '
 		match($0, /(^|[[:space:]])RHIZA_GCS_ACCESS([[:space:]]|$)/) {
 			record = substr($0, RSTART)
 			sub(/^[[:space:]]+/, "", record)

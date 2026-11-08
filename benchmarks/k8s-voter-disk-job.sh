@@ -1,0 +1,99 @@
+#!/usr/bin/env bash
+set -euo pipefail
+umask 077
+
+sha=${RHIZA_EXPERIMENT_SHA:?RHIZA_EXPERIMENT_SHA must be the exact public commit}
+[[ $sha =~ ^[0-9a-f]{40}$ ]]
+trial=$(mktemp -d /work/rhiza-voter-disk.XXXXXX)
+evidence=$trial/evidence
+export HOME=$trial/home GOCACHE=$trial/go-cache GOMODCACHE=$trial/go-mod
+mkdir "$evidence" "$HOME" "$trial/bin"
+trap 'status=$?; if (( status != 0 )); then printf "BENCH_FAILED status=%s evidence=%s\n" "$status" "$evidence" >&2; fi' EXIT
+
+if ! command -v jq >/dev/null; then
+	# Download signed Debian packages without elevating privileges or installing globally.
+	mkdir -p "$trial/apt/lists/partial" "$trial/apt/cache/archives/partial" "$trial/packages"
+	apt_opts=(-o "Dir::State::lists=$trial/apt/lists" -o "Dir::Cache=$trial/apt/cache" -o APT::Sandbox::User= -o Debug::NoLocking=1)
+	apt-get "${apt_opts[@]}" -qq update >"$evidence/apt.log" 2>&1
+	(
+		cd "$trial/packages"
+		apt-get "${apt_opts[@]}" -qq download jq libjq1 libonig5
+		for package in ./*.deb; do dpkg-deb -x "$package" "$trial/jq"; done
+	) >>"$evidence/apt.log" 2>&1
+	export PATH="$trial/jq/usr/bin:$PATH"
+	export LD_LIBRARY_PATH="$trial/jq/usr/lib/x86_64-linux-gnu"
+fi
+jq --version
+
+roots=(/mnt/disk-a /mnt/disk-b /mnt/disk-c)
+declare -A devices=()
+for root in "${roots[@]}"; do
+	read -r target fs device < <(findmnt -nr -o TARGET,FSTYPE,MAJ:MIN -M "$root")
+	if [[ $target != "$root" || ! -w $root || ! $fs =~ ^(ext4|xfs)$ || ! $device =~ ^[0-9]+:[0-9]+$ || ${devices[$device]+present} ]]; then
+		printf 'Expected a distinct writable ext4/xfs mount: %s\n' "$root" >&2
+		exit 1
+	fi
+	devices[$device]=1
+	printf 'BENCH_MOUNT %s %s %s\n' "$root" "$fs" "$device"
+done | tee "$evidence/mounts.txt"
+
+git init -q "$trial/source"
+git -C "$trial/source" fetch --quiet --depth=1 --no-tags https://github.com/mrchypark/rhiza.git "$sha"
+git -C "$trial/source" checkout --quiet --detach FETCH_HEAD
+cd "$trial/source"
+[[ $(git rev-parse HEAD) == "$sha" ]]
+CGO_ENABLED=0 go build -o "$trial/bin/rhiza" ./cmd/rhiza
+CGO_ENABLED=0 go build -o "$trial/bin/rhiza-bench" ./cmd/rhiza-bench
+server_sha=$(sha256sum "$trial/bin/rhiza" | awk '{print $1}')
+client_sha=$(sha256sum "$trial/bin/rhiza-bench" | awk '{print $1}')
+printf 'BENCH_ID sha=%s server=%s client=%s\n' "$sha" "$server_sha" "$client_sha" | tee "$evidence/identity.txt"
+
+export RHIZA_SERVER_BENCH_GCS_LOG=/work/floci-access.log
+export RHIZA_SERVER_BENCH_BINARY_DIR="$trial/bin" RHIZA_SERVER_BENCH_EXPECTED_SHA256="$server_sha:$client_sha"
+export RHIZA_SERVER_BENCH_PROVIDER=gcs RHIZA_SERVER_BENCH_DURABILITY=async RHIZA_SERVER_BENCH_ASYNC_PUBLISH=1
+export RHIZA_SERVER_BENCH_WORKLOAD=sql RHIZA_ASYNC_STAGE_PROBE=1
+export RHIZA_SERVER_BENCH_REQUESTS=1000 RHIZA_SERVER_BENCH_CONCURRENCY=16
+for ((pair = 0; pair < 6; pair++)); do
+	a=${roots[$((pair % 3))]} b=${roots[$(((pair + 1) % 3))]} c=${roots[$(((pair + 2) % 3))]}
+	arms=(shared split)
+	if (( pair % 2 == 1 )); then arms=(split shared); fi
+	for arm in "${arms[@]}"; do
+		layout="$a:$a:$a"
+		if [[ $arm == split ]]; then layout="$a:$b:$c"; fi
+		sample="$evidence/pair-$pair-$arm"
+		printf 'BENCH_LAYOUT pair=%s arm=%s roots=%s\n' "$pair" "$arm" "$layout" | tee -a "$evidence/layouts.txt"
+		status=0
+		RHIZA_SERVER_BENCH_VOTER_ROOTS="$layout" bash benchmarks/run-server-reference.sh "$PWD" "$sample.json" >"$sample.log" 2>&1 || status=$?
+		printf 'BENCH_EXIT pair=%s arm=%s status=%s evidence=%s\n' "$pair" "$arm" "$status" "$evidence"
+		(( status == 0 )) || exit "$status"
+		if ! jq -e --arg sha "$sha" --arg client "$client_sha" '
+			.client_revision == $sha and .client_sha256 == $client and
+			.workload == "sql" and .object_store_provider == "gcs" and .durability_mode == "async" and
+			.ack_contract == "quorum WAL sync; object-store publication async" and
+			.failure_mode == "healthy" and .concurrency == 16 and .runtime_failure_lines == 0 and
+			.receipt_oracle == "sql-insert-id-v1" and
+			.result.requests == 1000 and .result.successes == 1000 and .result.errors == 0 and
+			.voter_resource_status == "measured" and (.voter_resources.nodes | length) == 3 and
+			.write_object_store_delta.http_requests == 0 and
+			.gcs_request_classes.write.observed_storage_responses == 0 and
+			.gcs_request_classes.write.transport_minus_observed == 0 and
+			.gcs_request_classes.publication.transport_minus_observed == 0 and
+			.async_publication.forced == true and .async_publication.object_store_delta.http_requests > 0 and
+			.async_publication.before.archive_tip < .async_publication.before.certified_tip and
+			.async_publication.after.archive_tip >= .async_publication.before.certified_tip
+		' "$sample.json" >/dev/null; then
+			printf 'BENCH_GATE_FAILED pair=%s arm=%s evidence=%s\n' "$pair" "$arm" "$evidence" >&2
+			exit 1
+		fi
+		printf 'BENCH_RESULT pair=%s arm=%s %s\n' "$pair" "$arm" "$(jq -c . "$sample.json")"
+		awk -v prefix="BENCH_WINDOW pair=$pair arm=$arm " '/^ASYNC_WINDOW_(BEGIN|END)_NS=/ { print prefix $0; count++ } END { exit count != 2 }' "$sample.log"
+		for voter in 0 1 2; do
+			awk -v prefix="BENCH_STAGE pair=$pair arm=$arm voter=$voter " '
+				/ASYNC_STAGE_PROBE_READY=1/ { ready=1; print prefix "ready=1" }
+				/ASYNC_STAGE stage=/ { sub(/^.*ASYNC_STAGE stage=/, "stage="); print prefix $0 }
+				END { exit !ready }
+			' "$sample-node-$voter.log"
+		done
+	done
+done
+printf 'BENCH_COMPLETE pairs=6 samples=12 evidence=%s\n' "$evidence"

@@ -1,0 +1,73 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: rhiza-voter-disk
+spec:
+  backoffLimit: 0
+  activeDeadlineSeconds: 1200
+  template:
+    spec:
+      restartPolicy: Never
+      automountServiceAccountToken: false
+      nodeSelector:
+        kubernetes.io/arch: amd64
+        kubernetes.io/os: linux
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+        runAsGroup: 65532
+        fsGroup: 65532
+        seccompProfile:
+          type: RuntimeDefault
+      initContainers:
+        - name: gcs
+          restartPolicy: Always
+          image: floci/floci-gcp:0.11.0@sha256:eae9683d806ceb643bcb36aee97cdb8cad13c3e2959cd053bf40e481994fde12
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: [ALL]
+          env:
+            - name: QUARKUS_HTTP_ACCESS_LOG_ENABLED
+              value: "true"
+            - name: QUARKUS_HTTP_ACCESS_LOG_PATTERN
+              value: "RHIZA_GCS_ACCESS %m %R %s"
+          command: [/bin/sh, -c]
+          args:
+            - |
+              exec /usr/local/bin/docker-entrypoint.sh /app/application -Dquarkus.http.host=127.0.0.1 >>/work/floci-access.log 2>&1
+          volumeMounts:
+            - {name: work, mountPath: /work}
+      containers:
+        - name: benchmark
+          image: golang:1.27.3-bookworm@sha256:025eefc1e8dbe63201734a72aaa0a55d7a077f2d8410432f8ae2f3e939f32871
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: [ALL]
+          env:
+            - name: RHIZA_EXPERIMENT_SHA
+              value: REPLACE_WITH_40_HEX_COMMIT
+          command: [/bin/sh, -ec]
+          args:
+            - |
+              case "$RHIZA_EXPERIMENT_SHA" in *[!0-9a-f]*|'') exit 2;; esac
+              test "${#RHIZA_EXPERIMENT_SHA}" -eq 40
+              curl --fail --silent --show-error --location --max-time 30 \
+                "https://raw.githubusercontent.com/mrchypark/rhiza/$RHIZA_EXPERIMENT_SHA/benchmarks/k8s-voter-disk-job.sh" \
+                -o /work/k8s-voter-disk-job.sh
+              exec /bin/bash /work/k8s-voter-disk-job.sh
+          volumeMounts:
+            - {name: work, mountPath: /work}
+            - {name: disk-a, mountPath: /mnt/disk-a}
+            - {name: disk-b, mountPath: /mnt/disk-b}
+            - {name: disk-c, mountPath: /mnt/disk-c}
+      volumes:
+        - name: work
+          emptyDir: {}
+        - name: disk-a
+          persistentVolumeClaim: {claimName: disk-a}
+        - name: disk-b
+          persistentVolumeClaim: {claimName: disk-b}
+        - name: disk-c
+          persistentVolumeClaim: {claimName: disk-c}
