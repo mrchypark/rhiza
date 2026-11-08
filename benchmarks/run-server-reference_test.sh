@@ -114,7 +114,7 @@ set -eu
 id=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
 case $1 in
  run)
-  [[ $* == *'127.0.0.1::4588'* && $* == *'RHIZA_GCS_ACCESS %m %U %s'* && $* == *'floci/floci-gcp:0.11.0@sha256:'* ]]
+  [[ $* == *'127.0.0.1::4588'* && $* == *'RHIZA_GCS_ACCESS %m %R %s'* && $* == *'floci/floci-gcp:0.11.0@sha256:'* ]]
   printf '%s\n' "$id" ;;
  port)
   [[ $2 == "$id" && $3 == 4588/tcp ]]
@@ -125,11 +125,14 @@ case $1 in
   printf 'not an access record\n'
   printf 'quarkus-prefix RHIZA_GCS_ACCESS POST /storage/v1/b 200\n'
   if [[ -f $MOCK_HOME/client-done && $MOCK_MODE != gcs-missing ]]; then
-   printf 'quarkus-prefix RHIZA_GCS_ACCESS GET /storage/v1/b/%s/o/bench-head 404\n' "$bucket"
+   suffix=
+   [[ $MOCK_MODE != gcs-async ]] || suffix='?projection=synthetic-private-query#synthetic-private-fragment'
+   printf 'quarkus-prefix RHIZA_GCS_ACCESS GET /storage/v1/b/%s/o/bench-head%s 404\n' "$bucket" "$suffix"
    if [[ $MOCK_MODE == gcs-unknown ]]; then printf 'RHIZA_GCS_ACCESS GET /other 200\n'; fi
+   if [[ $MOCK_MODE == gcs-malformed ]]; then printf 'quarkus-prefix RHIZA_GCS_ACCESS GET /storage/v1/b?synthetic-private-query missing_status\n'; fi
   fi
   if [[ -f $MOCK_HOME/archived ]]; then
-   printf 'RHIZA_GCS_ACCESS POST /upload/storage/v1/b/%s/o 200\n' "$bucket"
+   printf 'quarkus-prefix RHIZA_GCS_ACCESS POST /upload/storage/v1/b/%s/o?upload_id=synthetic-private-query 200\n' "$bucket"
   fi ;;
  rm)
   [[ $2 == -f && $3 == "$id" ]]
@@ -278,7 +281,7 @@ wait() {
 }
 MOCK
 chmod +x "$scratch/bin/"* "$scratch/node" "$scratch/bench"
-for mode in normal shifted before-first after-last no-witness signal-failure wait-normal wait-crash wait-error healthy healthy-nonlinux resource-replaced resource-missing graph graph-wrong-ids kv kv-wrong-value async-stale-cut gcs-before-ack gcs-async gcs-missing gcs-unknown; do
+for mode in normal shifted before-first after-last no-witness signal-failure wait-normal wait-crash wait-error healthy healthy-nonlinux resource-replaced resource-missing graph graph-wrong-ids kv kv-wrong-value async-stale-cut gcs-before-ack gcs-async gcs-missing gcs-unknown gcs-malformed; do
  mkdir "$scratch/$mode"
  # Each run's stand-ins and process evidence remain in its own scratch scope.
  cp "$scratch/node" "$scratch/bench" "$scratch/$mode/"
@@ -350,15 +353,20 @@ for mode in normal shifted before-first after-last no-witness signal-failure wai
     and .gcs_request_classes.write.transport_minus_observed == 5
     and .gcs_request_classes.verification.http_attempts == 0' "$scratch/$mode/result.json" >/dev/null
   if [[ $mode == gcs-before-ack ]]; then
-   jq -e '.gcs_request_classes.publication == null' "$scratch/$mode/result.json" >/dev/null
+   jq -e '.gcs_request_classes.publication == null and .gcs_request_classes.write.access_record_shapes.path_only == 1' "$scratch/$mode/result.json" >/dev/null
   else
-   jq -e '.gcs_request_classes.publication.class_a_attempts == 1 and .gcs_request_classes.publication.transport_attempts == 27' \
+   jq -e '.gcs_request_classes.publication.class_a_attempts == 1 and .gcs_request_classes.publication.transport_attempts == 27
+    and .gcs_request_classes.write.access_record_shapes.query_and_fragment == 1
+    and .gcs_request_classes.publication.access_record_shapes.query == 1' \
     "$scratch/$mode/result.json" >/dev/null
   fi
- elif [[ $mode == gcs-missing || $mode == gcs-unknown ]]; then
+ elif [[ $mode == gcs-missing || $mode == gcs-unknown || $mode == gcs-malformed ]]; then
   [[ $status != 0 ]]
   grep -q 'lacks classifiable completed-request evidence' "$scratch/$mode/stderr"
   [[ -f $scratch/$mode/result-gcs-write-classes.json ]]
+  if [[ $mode == gcs-malformed ]]; then
+   jq -e '.malformed_access_lines == 1 and .access_record_shapes.malformed == 1' "$scratch/$mode/result-gcs-write-classes.json" >/dev/null
+  fi
  else
   [[ $status != 0 ]]
   if [[ $mode == wait-* ]]; then
@@ -372,6 +380,10 @@ for mode in normal shifted before-first after-last no-witness signal-failure wai
  if [[ $provider == gcs ]]; then
   [[ -f $scratch/$mode/gcs-removed ]]
   [[ $(sort "$scratch/$mode/gcs-local-adc") == $'n0\nn1\nn2' ]]
+  if grep -Eq 'synthetic-private-(query|fragment)' "$scratch/$mode/stderr" "$scratch/$mode"/result*.json; then
+   printf 'GCS diagnostics exposed a discarded URI suffix\n' >&2
+   exit 1
+  fi
  fi
  case $workload in
   sql) grep -q -- '-verify-insert-receipt' "$scratch/$mode/bench.args" ;;
@@ -385,4 +397,4 @@ for mode in normal shifted before-first after-last no-witness signal-failure wai
   if kill -0 "$pid" 2>/dev/null; then printf 'mock owned process survived: %s\n' "$pid" >&2; exit 1; fi
  done < <(cat "$scratch/$mode/nodes" "$scratch/$mode/bench.pid")
 done
-printf 'server oracle helpers + 22 complete mocked runner cases PASS\n'
+printf 'server oracle helpers + 23 complete mocked runner cases PASS\n'

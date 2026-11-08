@@ -165,12 +165,15 @@ SHAs for the two server revisions:
 
 ```bash
 gh workflow run performance.yml --ref "$HARNESS_REF" \
-  -f e2e_cost_matrix=true -f base_ref="$BASE_SHA" -f candidate_ref="$CANDIDATE_SHA"
+  -f e2e_cost_matrix=true -f e2e_cost_provider=s3 \
+  -f base_ref="$BASE_SHA" -f candidate_ref="$CANDIDATE_SHA"
 ```
 
 This runs instead of the ordinary Performance suite. On one `ubuntu-24.04`
 runner, the same client tests SQL, Graph, and KV against three healthy QUIC voters
-and a disposable VersityGW S3 backend. For each workload and durability mode,
+and a disposable VersityGW S3 backend. Select `e2e_cost_provider=gcs` for the same
+matrix against a pinned Floci GCS instance on loopback with synthetic credentials.
+For each workload and durability mode,
 base and candidate run serially in alternating order across three repeats
 (36 samples total). Each sample requires 1,000 successful writes at concurrency
 16 and a workload-specific final state check. This measures normal HA writes,
@@ -189,11 +192,12 @@ not Local mode, managed Kubernetes recovery, or fault tolerance.
   measures a forced archive call and requires the archive to advance through
   the pre-call certified/applied cut. This is not an independent restore test
   or a measurement of scheduled background publication overhead.
-- Object-store HTTP counters are client transport attempts, not server-side
-  operation counts or billed operations. The Versity results do not measure
-  GCS Class A/B; those require native operation attribution, including the
-  distinction between resumable upload requests and the single Class A
-  operation they can represent. See [GCS operation pricing](https://cloud.google.com/storage/pricing#operations-pricing).
+- Object-store HTTP counters are client transport attempts. GCS results also
+  classify Floci server access records into Class A and B attempts, separate
+  resumable transfers/probes, and retain SDK and server count differences.
+  Attempts include failures, and multiple HTTP requests can represent one
+  billable operation. Versity does not measure GCS classes. See
+  [GCS operation pricing](https://cloud.google.com/storage/pricing#operations-pricing).
 
 The `e2e-cost-matrix-<run-id>` artifact records both SHAs, the harness SHA,
 runner metadata, raw result JSON, process logs, and exit statuses. The matrix

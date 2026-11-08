@@ -57,7 +57,7 @@ permissions:
   contents: read
 
 concurrency:
-  group: performance-${{ github.event.pull_request.number || github.ref }}${{ inputs.e2e_cost_matrix && '-e2e-cost-matrix' || '' }}
+  group: performance-${{ github.event.pull_request.number || github.ref }}${{ inputs.e2e_cost_matrix && format('-e2e-cost-matrix-{0}', inputs.e2e_cost_provider || 's3') || '' }}
   cancel-in-progress: true
 
 jobs:
@@ -416,6 +416,19 @@ jobs:
             done
           done
           printf '## E2E cost matrix (%s)\n\nAll 36 samples passed: SQL, Graph, and KV × Async and BeforeAck × two revisions × three runs. Raw result and process logs are attached.\n' "$RHIZA_SERVER_BENCH_PROVIDER" >>"$GITHUB_STEP_SUMMARY"
+
+      - name: Profile Graph apply separately from E2E measurements
+        if: ${{ inputs.e2e_cost_provider != 'gcs' }}
+        working-directory: ${{ runner.temp }}/rhiza-e2e-candidate
+        run: |
+          evidence="$RUNNER_TEMP/rhiza-e2e-cost"
+          binary="$RUNNER_TEMP/graph-apply.test"
+          go test ./pkg/materializer -run '^$' -bench '^BenchmarkGraphApply$' -benchtime=3s -benchmem \
+            -o "$binary" -cpuprofile "$RUNNER_TEMP/graph-apply.cpu" -memprofile "$RUNNER_TEMP/graph-apply.mem" \
+            | tee "$evidence/graph-apply-benchmark.txt"
+          grep -Eq '^BenchmarkGraphApply-[0-9]+[[:space:]]' "$evidence/graph-apply-benchmark.txt"
+          go tool pprof -top -cum "$binary" "$RUNNER_TEMP/graph-apply.cpu" >"$evidence/graph-apply-cpu-top.txt"
+          go tool pprof -top -alloc_space "$binary" "$RUNNER_TEMP/graph-apply.mem" >"$evidence/graph-apply-alloc-top.txt"
 
       - name: Upload server cost evidence
         if: always()

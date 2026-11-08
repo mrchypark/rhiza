@@ -253,7 +253,7 @@ if [[ $provider == gcs ]]; then
 	gcs_image=floci/floci-gcp:0.11.0@sha256:eae9683d806ceb643bcb36aee97cdb8cad13c3e2959cd053bf40e481994fde12
 	gcs_container_id=$(docker run --rm -d --name "$container" -p 127.0.0.1::4588 \
 		-e QUARKUS_HTTP_ACCESS_LOG_ENABLED=true \
-		-e 'QUARKUS_HTTP_ACCESS_LOG_PATTERN=RHIZA_GCS_ACCESS %m %U %s' "$gcs_image")
+		-e 'QUARKUS_HTTP_ACCESS_LOG_PATTERN=RHIZA_GCS_ACCESS %m %R %s' "$gcs_image")
 	[[ $gcs_container_id =~ ^[a-f0-9]{64}$ ]]
 	gcs_address=$(docker port "$gcs_container_id" 4588/tcp)
 	[[ $gcs_address =~ ^127\.0\.0\.1:[1-9][0-9]{0,4}$ ]]
@@ -379,18 +379,28 @@ object_stats() {
 }
 
 gcs_snapshot() {
-	# Keep only the configured method/path/status fields, never arbitrary
-	# emulator output. The parser must reject malformed marker records.
+	# Quarkus %R is the path; %U includes the query. Redact defensively before
+	# writing snapshots and keep only shape metadata for malformed records.
 	docker logs "$gcs_container_id" 2>&1 | awk '
 		match($0, /(^|[[:space:]])RHIZA_GCS_ACCESS([[:space:]]|$)/) {
 			record = substr($0, RSTART)
 			sub(/^[[:space:]]+/, "", record)
-			print record
+			sub(/[[:space:]]+$/, "", record)
+			if (split(record, f, /[[:space:]]+/) != 4 || f[2] !~ /^[A-Z]+$/ ||
+			    f[3] !~ /^\// || f[4] !~ /^[1-5][0-9][0-9]$/) {
+				print "malformed\tRHIZA_GCS_ACCESS"
+				next
+			}
+			query = index(f[3], "?") > 0
+			fragment = index(f[3], "#") > 0
+			shape = query ? (fragment ? "query_and_fragment" : "query") : (fragment ? "fragment" : "path_only")
+			sub(/[?#].*$/, "", f[3])
+			printf "%s\t%s %s %s %s\n", shape, f[1], f[2], f[3], f[4]
 		}' >"$1"
 }
 
 gcs_phase() {
-	local before=$1 after=$2 phase=$3 transport=$4 lines records classified summary
+	local before=$1 after=$2 phase=$3 transport=$4 lines records classified shapes summary
 	lines=$(wc -l <"$before")
 	lines=$((lines + 0))
 	if ! head -n "$lines" "$after" | cmp -s "$before" -; then
@@ -399,11 +409,17 @@ gcs_phase() {
 	fi
 	records="$run_dir/gcs-$phase.log"
 	tail -n "+$((lines + 1))" "$after" >"$records"
-	classified=$(awk -v bucket="$gcs_bucket" -f "$client_source_dir/benchmarks/gcs-request-classes.awk" "$records") || return 1
+	classified=$(cut -f 2 "$records" | awk -v bucket="$gcs_bucket" -f "$client_source_dir/benchmarks/gcs-request-classes.awk") || return 1
+	shapes=$(awk -F '\t' '
+		{ counts[$1]++ }
+		END {
+			printf "{\"path_only\":%d,\"query\":%d,\"fragment\":%d,\"query_and_fragment\":%d,\"malformed\":%d}",
+				counts["path_only"], counts["query"], counts["fragment"], counts["query_and_fragment"], counts["malformed"]
+		}' "$records") || return 1
 	summary="$run_dir/gcs-$phase-classes.json"
-	jq -c --argjson transport "$transport" '
+	jq -c --argjson transport "$transport" --argjson shapes "$shapes" '
 		(.http_attempts - .auth_attempts) as $observed
-		| . + {transport_attempts:$transport.http_requests,transport_counts:$transport,
+		| . + {transport_attempts:$transport.http_requests,transport_counts:$transport,access_record_shapes:$shapes,
 		       observed_storage_responses:$observed,
 		       transport_minus_observed:(if ($transport.http_requests | type) == "number"
 		                                  then $transport.http_requests - $observed else null end)}' \

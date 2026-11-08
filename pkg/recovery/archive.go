@@ -1922,6 +1922,10 @@ func (m *Manager) withArchiveLock(ctx context.Context, key, owner string, gcTrac
 	var releaseErr error
 	if gcTrace {
 		releaseErr = archiveGCTrace(ctx, "lock-release", release)
+	} else if err == nil && len(renewErr) == 0 && lock.version != nil && lock.version.Value != "" {
+		// Renewal has stopped. Use the last confirmed version without masking a
+		// failed or ambiguous conditional release with another attempt.
+		releaseErr = m.expireArchiveLock(releaseCtx, key, *lock)
 	} else {
 		releaseErr = release()
 	}
@@ -2013,8 +2017,12 @@ func (m *Manager) releaseArchiveLock(ctx context.Context, key string, lock *arch
 		m.traceArchiveBusy(ctx, "unknown", key, "release_mismatch_or_conflict", "site", true)
 		return ErrArchiveBusy
 	}
-	current.LeaseUntilMS = time.Now().UnixMilli()
-	if err := m.writeArchiveLock(ctx, key, *current, objstore.WithIfMatch(current.version)); err != nil {
+	return m.expireArchiveLock(ctx, key, *current)
+}
+
+func (m *Manager) expireArchiveLock(ctx context.Context, key string, lock archiveGCLock) error {
+	lock.LeaseUntilMS = time.Now().UnixMilli()
+	if err := m.writeArchiveLock(ctx, key, lock, objstore.WithIfMatch(lock.version)); err != nil {
 		if m.bucket.IsConditionNotMetErr(err) {
 			m.traceArchiveBusy(ctx, "unknown", key, "release_mismatch_or_conflict", "site", true)
 			return ErrArchiveBusy
