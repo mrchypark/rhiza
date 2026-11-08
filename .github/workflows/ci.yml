@@ -289,6 +289,7 @@ jobs:
           go test -tags rhiza_local_testhooks ./pkg/managedsql -run '^(TestManagedGraphLongPollCloseCancelsBorrow|TestManagedGraphActualUnknownRetainsNativeOriginal|TestManagedGraphInitialRootBlocksApplicationAndHonorsCancellation|TestManagedGraphInitialRootCloseCancelsBackgroundWait|TestManagedGraphInitialRootPUTReadFailureScope)$' -count=1 -timeout=60s
           go test -tags rhiza_local_testhooks ./pkg/managedsql -run '^(TestManagedGraphPendingLearnedSlotMatchesExactTarget|TestManagedGraphPublic(RecoveryHealsPendingWithoutProposal|LinearizableReadHealsPendingWithoutProposal|NewWriteHealsPendingWithoutResubmission|RestartHealsCertifiedNativePending))$' -count=1 -timeout=60s
           go test -tags rhiza_local_testhooks ./pkg/managedsql -run '^TestManagedGraphPublic(PublisherCreatesCertifiedPairAndSuffix|RestartInstallsCertifiedPairAndSuffix)$' -count=1 -timeout=60s
+          go test -tags rhiza_local_testhooks ./pkg/managedsql -run '^TestManagedGraphOriginalOpensAfterControlHeadBeforeFirstQCKP$' -count=1 -timeout=60s
           go test -tags rhiza_local_testhooks ./pkg/managedsql -run '^TestManagedGraphPublicNodeRecoversRetainedInstallAndLaterSuffix$' -count=1 -timeout=60s -v
           go test -tags rhiza_local_testhooks ./pkg/node -run '^TestManagedGraphStartupInstallPreparedLearner' -count=1 -timeout=60s -v
           go test -tags rhiza_local_testhooks ./pkg/node -run '^TestManagedAppendOnly(OpenFailureDoesNotPublishDuringAbortCleanup|NormalShutdownArchivesExistingCertifiedSuffix)$' -count=1 -timeout=60s -v
@@ -307,6 +308,7 @@ jobs:
           go test -race -tags rhiza_local_testhooks ./pkg/managedsql -run '^(TestManagedGraphLongPollCloseCancelsBorrow|TestManagedGraphActualUnknownRetainsNativeOriginal|TestManagedGraphInitialRootBlocksApplicationAndHonorsCancellation|TestManagedGraphInitialRootCloseCancelsBackgroundWait|TestManagedGraphInitialRootPUTReadFailureScope)$' -count=1 -timeout=60s
           go test -race -tags rhiza_local_testhooks ./pkg/managedsql -run '^(TestManagedGraphPendingLearnedSlotMatchesExactTarget|TestManagedGraphPublic(RecoveryHealsPendingWithoutProposal|LinearizableReadHealsPendingWithoutProposal|NewWriteHealsPendingWithoutResubmission|RestartHealsCertifiedNativePending))$' -count=1 -timeout=60s
           go test -race -tags rhiza_local_testhooks ./pkg/managedsql -run '^TestManagedGraphPublic(PublisherCreatesCertifiedPairAndSuffix|RestartInstallsCertifiedPairAndSuffix)$' -count=1 -timeout=60s
+          go test -race -tags rhiza_local_testhooks ./pkg/managedsql -run '^TestManagedGraphOriginalOpensAfterControlHeadBeforeFirstQCKP$' -count=1 -timeout=60s
           go test -race -tags rhiza_local_testhooks ./pkg/managedsql -run '^TestManagedGraphPublicNodeRecoversRetainedInstallAndLaterSuffix$' -count=1 -timeout=60s -v
           go test -race -tags rhiza_local_testhooks ./pkg/node -run '^TestManagedGraphStartupInstallPreparedLearner' -count=1 -timeout=60s -v
           go test -race -tags rhiza_local_testhooks ./pkg/node -run '^TestManagedAppendOnly(OpenFailureDoesNotPublishDuringAbortCleanup|NormalShutdownArchivesExistingCertifiedSuffix)$' -count=1 -timeout=60s -v
