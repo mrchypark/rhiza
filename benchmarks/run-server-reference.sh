@@ -160,7 +160,7 @@ benchmark_disk_deltas() {
 }
 
 sample_benchmark_sched() {
-	local proc=$1 pid=$2 enabled=null f dir tid stat runtime wait slices identity
+	local proc=$1 pid=$2 enabled=null dir tid stat runtime wait slices identity
 	local -a fields
 	if { read -r enabled; } 2>/dev/null < "$proc/sys/kernel/sched_schedstats"; then
 		case $enabled in 1) enabled=true ;; 0) enabled=false ;; *) enabled=null ;; esac
@@ -168,26 +168,27 @@ sample_benchmark_sched() {
 		enabled=null
 	fi
 	{
-		for f in "$proc/$pid/task/"*/schedstat; do
-			dir=${f%/schedstat}
+		for dir in "$proc/$pid/task/"*; do
 			tid=${dir##*/}
 			[[ $tid =~ ^[0-9]+$ ]] || continue
+			printf '%s\n' "$tid"
 			{ read -r stat; } 2>/dev/null < "$dir/stat" || continue
 			[[ $stat == "$tid ("* && $stat == *") "* ]] || continue
-			identity=$stat
 			read -ra fields <<< "${stat##*) }"
 			[[ ${fields[19]:-} =~ ^[0-9]+$ ]] || continue
-			{ read -r runtime wait slices; } 2>/dev/null < "$f" || continue
+			{ read -r runtime wait slices; } 2>/dev/null < "$dir/schedstat" || continue
 			[[ $runtime =~ ^[0-9]+$ && $wait =~ ^[0-9]+$ && $slices =~ ^[0-9]+$ ]] || continue
 			{ read -r stat; } 2>/dev/null < "$dir/stat" || continue
-			[[ ${identity%% (*} == "${stat%% (*}" && $stat == *") "* ]] || continue
+			[[ $stat == "$tid ("* && $stat == *") "* ]] || continue
 			identity=${fields[19]}
 			read -ra fields <<< "${stat##*) }"
 			[[ ${fields[19]:-} == "$identity" ]] || continue
 			printf '%s:%s %s %s %s\n' "$tid" "$identity" "$runtime" "$wait" "$slices"
 		done
 	} | jq -Rsc --argjson enabled "$enabled" '
-		{enabled:$enabled, threads:(split("\n") | map(select(length>0) | split(" ")
+		split("\n") | map(select(length>0)) as $lines |
+		{enabled:$enabled, visible:([$lines[] | select(contains(" ")|not)]|length),
+		 threads:($lines | map(select(contains(" ")) | split(" ")
 		  | {key:.[0], value:(.[1:] | map(tonumber))}) | from_entries)}'
 }
 
@@ -205,10 +206,10 @@ benchmark_sched_deltas() {
 		 # live nonzero proc counter is evidence even when the sysctl is 0.
 		 (if ($matched | length) == 0 or any($matched[][]; . < 0) or
 		    (any($ids[] as $id | $new.threads[$id][]; . > 0) | not) then "unavailable"
-		  elif ($matched|length) != ($old_keys|length) or ($matched|length) != ($new_keys|length)
+		  elif ($matched|length) != $old.visible or ($matched|length) != $new.visible
 		    then "partial_thread_coverage" else "matched_threads" end) as $status |
 		 {node:$voters[$i].node,pid:$voters[$i].pid,schedstats_enabled:$enabled,status:$status,
-		  threads_before:($old_keys|length),threads_after:($new_keys|length),threads_matched:($matched|length),
+		  threads_before:$old.visible,threads_after:$new.visible,threads_matched:($matched|length),
 		  runtime_ns:(if $status == "matched_threads" or $status == "partial_thread_coverage" then [$matched[][0]]|add else null end),
 		  runqueue_wait_ns:(if $status == "matched_threads" or $status == "partial_thread_coverage" then [$matched[][1]]|add else null end)}]'
 }

@@ -26,6 +26,40 @@ benchmark_host_pressure "$host_before" "$(sample_benchmark_host "$scratch/absent
 benchmark_host_pressure "$host_before" '[119,null,2]' |
 	jq -e '. == {cpu_some_us:null,io_some_us:null,cpu_steal_ticks:0}' >/dev/null
 
+# The kernel prefixes 17 I/O fields with major, minor and name. In particular,
+# distinguish discards from flushes, and old-format missing flushes from zero.
+printf '%s\n' '8 16 sdb 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17' \
+	'8 32 sdc 11 12 13 14 15 16 17 18 19 20 21' > "$scratch/proc/diskstats"
+disk_before=$(sample_benchmark_disks "$scratch/proc" 8:16 8:32 8:64)
+printf '%s\n' '8 16 sdb 1 2 3 4 9 6 7 18 9 10 31 12 13 140 150 16 20' \
+	'8 32 sdc 11 12 13 14 14 16 17 18 19 20 22' > "$scratch/proc/diskstats"
+disk_after=$(sample_benchmark_disks "$scratch/proc" 8:16 8:32 8:64)
+benchmark_disk_deltas "$disk_before" "$disk_after" 8:16 8:16 8:32 8:64 |
+	jq -e '.voter_devices == ["8:16","8:16","8:32","8:64"] and .devices == [
+		{device:"8:16",write_ios:4,write_ms:10,weighted_io_ms:20,flush_ios:0,flush_ms:3},
+		{device:"8:32",write_ios:null,write_ms:0,weighted_io_ms:1,flush_ios:null,flush_ms:null},
+		{device:"8:64",write_ios:null,write_ms:null,weighted_io_ms:null,flush_ios:null,flush_ms:null}]' >/dev/null
+[[ $(sample_benchmark_disks "$scratch/absent" 8:16) == '{}' ]]
+
+mkdir -p "$scratch/proc/sys/kernel" "$scratch/proc/100/task/"{100,101}
+printf '0\n' > "$scratch/proc/sys/kernel/sched_schedstats"
+for tid in 100 101; do
+	printf '%s (thread ) name) S 1 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 123\n' "$tid" > "$scratch/proc/100/task/$tid/stat"
+	printf '1000 100 2\n' > "$scratch/proc/100/task/$tid/schedstat"
+done
+sched_before=$(sample_benchmark_sched "$scratch/proc" 100)
+printf '1200 140 3\n' > "$scratch/proc/100/task/100/schedstat"
+printf '101 (thread ) name) S 1 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 124\n' > "$scratch/proc/100/task/101/stat"
+sched_after=$(sample_benchmark_sched "$scratch/proc" 100)
+benchmark_sched_deltas "[$sched_before]" "[$sched_after]" '[{"node":"n0","pid":100}]' |
+	jq -e '.[0] == {node:"n0",pid:100,schedstats_enabled:false,status:"partial_thread_coverage",
+		threads_before:2,threads_after:2,threads_matched:1,runtime_ns:200,runqueue_wait_ns:40}' >/dev/null
+sched_empty='[{"enabled":null,"visible":1,"threads":{"100:123":[0,0,0]}}]'
+benchmark_sched_deltas "$sched_empty" "$sched_empty" '[{"node":"n0","pid":100}]' |
+	jq -e '.[0] | .status=="unavailable" and .runqueue_wait_ns==null' >/dev/null
+benchmark_sched_deltas "[$sched_before]" "[$sched_before]" '[{"node":"n0","pid":100}]' |
+	jq -e '.[0] | .status=="matched_threads" and .runqueue_wait_ns==0' >/dev/null
+
 # Unique INTEGER PRIMARY KEY rows: [0,4) is valid; shifted [1,5) has only 3
 # in-range rows despite total cardinality 4. Extra negative/out-of-range rows fail.
 verify_benchmark_rows 4 <<< '{"rows":[[4,4]]}'
@@ -322,6 +356,14 @@ cat > "$scratch/bin/getconf" <<'MOCK'
 #!/usr/bin/env bash
 [[ $1 == CLK_TCK ]] && printf '100\n'
 MOCK
+cat > "$scratch/bin/findmnt" <<'MOCK'
+#!/usr/bin/env bash
+root=${*: -1}
+case $root in
+ */drive-[012]) printf '999:%s\n' "${root##*-}" ;;
+ *) exit 1 ;;
+esac
+MOCK
 cat > "$scratch/wait-env" <<'MOCK'
 # Simulate the three alternate visible statuses only after reaping the exact
 # mock target. The helper-only tests above exercise genuine wait statuses.
@@ -347,6 +389,7 @@ for mode in normal shifted before-first after-last no-witness signal-failure wai
  prebuilt_dir=
  expected_sha256=
  voter_roots=
+ kernel_probe=0
  gcs_log=
  case $mode in
   shifted|healthy*|resource-*) fault=none ;;
@@ -368,6 +411,7 @@ for mode in normal shifted before-first after-last no-witness signal-failure wai
   expected_sha256=$(openssl dgst -sha256 "$prebuilt_dir/rhiza" "$prebuilt_dir/rhiza-bench" | awk '{print $NF}' | paste -sd ':' -)
  fi
  if [[ $mode == gcs-voter-roots ]]; then
+  kernel_probe=1
   for i in 0 1 2; do
    mkdir "$scratch/$mode/drive-$i"
    touch "$scratch/$mode/drive-$i/keep"
@@ -380,7 +424,7 @@ for mode in normal shifted before-first after-last no-witness signal-failure wai
  RHIZA_SERVER_BENCH_WORKLOAD="$workload" RHIZA_SERVER_BENCH_DURABILITY="$durability" RHIZA_SERVER_BENCH_ASYNC_PUBLISH="$publish" \
  RHIZA_SERVER_BENCH_PROVIDER="$provider" RHIZA_ASYNC_STAGE_PROBE="$probe" \
  RHIZA_SERVER_BENCH_BINARY_DIR="$prebuilt_dir" RHIZA_SERVER_BENCH_EXPECTED_SHA256="$expected_sha256" \
- RHIZA_SERVER_BENCH_VOTER_ROOTS="$voter_roots" RHIZA_SERVER_BENCH_GCS_LOG="$gcs_log" \
+ RHIZA_SERVER_BENCH_VOTER_ROOTS="$voter_roots" RHIZA_SERVER_BENCH_KERNEL_COUNTERS="$kernel_probe" RHIZA_SERVER_BENCH_GCS_LOG="$gcs_log" \
  RHIZA_OBJSTORE_SERVICE_ACCOUNT=ambient-must-not-inherit HTTP_PROXY=http://ambient-must-not-inherit \
  bash "$here/run-server-reference.sh" "$scratch/base-server" "$scratch/$mode/result.json" >"$scratch/$mode/stdout" 2>"$scratch/$mode/stderr" || status=$?
  if [[ $mode == normal ]]; then
@@ -494,6 +538,9 @@ for mode in normal shifted before-first after-last no-witness signal-failure wai
   grep -Fq "$(cd "$here/.." && pwd)|build -o" "$scratch/$mode/builds"
  fi
  if [[ $mode == gcs-voter-roots ]]; then
+  jq -e '.kernel_counters.voter_devices == ["999:0","999:1","999:2"]
+    and all(.kernel_counters.devices[]; .write_ios == null and .flush_ms == null)
+    and (.kernel_counters.voter_sched | map(.node)) == ["n0","n1","n2"]' "$scratch/$mode/result.json" >/dev/null
   [[ $(wc -l < "$scratch/$mode/voter-dirs") -eq 3 ]]
   while IFS= read -r voter_dir; do
    [[ ! -e $voter_dir && -f ${voter_dir%/*}/keep ]]
