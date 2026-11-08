@@ -1537,9 +1537,13 @@ func BenchmarkSQLBatchApply(b *testing.B) {
 	}
 }
 
+// Use -benchtime=200x to measure both payload sizes within the receipt budget.
 func BenchmarkSQLReturningReceipt(b *testing.B) {
 	for _, size := range []int{4096, 600000} {
 		b.Run(strconv.Itoa(size), func(b *testing.B) {
+			if size == 600000 && b.N > 200 {
+				b.Skip("use -benchtime=200x to stay within the retained-result budget")
+			}
 			m, err := Open(filepath.Join(b.TempDir(), "returning.db"), 1, 1024)
 			if err != nil {
 				b.Fatal(err)
@@ -1557,7 +1561,9 @@ func BenchmarkSQLReturningReceipt(b *testing.B) {
 			}
 			command := types.SQLCommand{SQL: "UPDATE returning_payload SET count=count+1 RETURNING payload", WantRows: true}
 			b.ReportAllocs()
-			for slot := uint64(2); b.Loop(); slot++ {
+			b.ResetTimer()
+			for iteration := range b.N {
+				slot := uint64(iteration) + 2
 				command.RequestID = "return-" + strconv.FormatUint(slot, 10)
 				value, err := types.EncodeSQLBatch([]types.SQLCommand{command})
 				if err != nil {
@@ -1567,6 +1573,7 @@ func BenchmarkSQLReturningReceipt(b *testing.B) {
 					b.Fatal(err)
 				}
 			}
+			b.StopTimer()
 			fingerprint, err := types.SQLFingerprint(command)
 			if err != nil {
 				b.Fatal(err)
