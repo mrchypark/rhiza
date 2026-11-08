@@ -64,9 +64,10 @@ on:
         default: false
 
       e2e_async_disk_isolation:
-        description: Compare GCS Async on /tmp and a separate /mnt block mount using the same commit and stage probe
-        type: boolean
-        default: false
+        description: Diagnose GCS SQL Async disk pressure or isolate voter placement on a dedicated runner
+        type: choice
+        options: [none, pressure-control, voter-placement]
+        default: none
 
       e2e_async_prebuild_ab:
         description: Compare per-sample builds with prebuilt binaries for same-SHA GCS SQL Async
@@ -77,12 +78,12 @@ permissions:
   contents: read
 
 concurrency:
-  group: performance-${{ github.event.pull_request.number || github.ref }}${{ inputs.e2e_cost_matrix && format('-e2e-cost-matrix-{0}', inputs.e2e_cost_provider || 's3') || '' }}${{ inputs.e2e_async_stage_probe && '-stage-probe' || '' }}${{ inputs.e2e_async_disk_isolation && '-disk-isolation' || '' }}${{ inputs.e2e_async_prebuild_ab && '-prebuild-ab' || '' }}
+  group: performance-${{ github.event.pull_request.number || github.ref }}${{ inputs.e2e_cost_matrix && format('-e2e-cost-matrix-{0}', inputs.e2e_cost_provider || 's3') || '' }}${{ inputs.e2e_async_stage_probe && '-stage-probe' || '' }}${{ inputs.e2e_async_disk_isolation && inputs.e2e_async_disk_isolation != 'none' && format('-{0}', inputs.e2e_async_disk_isolation) || '' }}${{ inputs.e2e_async_prebuild_ab && '-prebuild-ab' || '' }}
   cancel-in-progress: true
 
 jobs:
   paired-go-benchmarks:
-    if: ${{ !inputs.refresh_hiqlite_reference && !inputs.issue185_cost_evidence && !inputs.e2e_cost_matrix && !inputs.e2e_async_disk_isolation && !inputs.e2e_async_prebuild_ab }}
+    if: ${{ !inputs.refresh_hiqlite_reference && !inputs.issue185_cost_evidence && !inputs.e2e_cost_matrix && (!inputs.e2e_async_disk_isolation || inputs.e2e_async_disk_isolation == 'none') && !inputs.e2e_async_prebuild_ab }}
     runs-on: ubuntu-24.04
     timeout-minutes: 60
     env:
@@ -310,8 +311,8 @@ jobs:
           retention-days: 30
 
   e2e-cost-matrix:
-    if: ${{ inputs.e2e_cost_matrix || inputs.e2e_async_disk_isolation || inputs.e2e_async_prebuild_ab }}
-    runs-on: ubuntu-24.04
+    if: ${{ inputs.e2e_cost_matrix || (inputs.e2e_async_disk_isolation && inputs.e2e_async_disk_isolation != 'none') || inputs.e2e_async_prebuild_ab }}
+    runs-on: ${{ fromJSON(github.event_name == 'workflow_dispatch' && inputs.e2e_cost_matrix && inputs.e2e_async_disk_isolation == 'voter-placement' && '["self-hosted","linux","rhiza-voter-io"]' || '["ubuntu-24.04"]') }}
     timeout-minutes: 60
     defaults:
       run:
@@ -321,7 +322,7 @@ jobs:
       RHIZA_SERVER_BENCH_REQUESTS: 1000
       RHIZA_SERVER_BENCH_CONCURRENCY: 16
       RHIZA_SERVER_BENCH_PROVIDER: ${{ inputs.e2e_cost_provider || 's3' }}
-      ASYNC_DISK_ISOLATION: ${{ inputs.e2e_async_disk_isolation && '1' || '0' }}
+      ASYNC_DISK_MODE: ${{ inputs.e2e_async_disk_isolation || 'none' }}
       ASYNC_PREBUILD_AB: ${{ inputs.e2e_async_prebuild_ab && '1' || '0' }}
       ASYNC_PREBUILD_PAIRS: 8
     steps:
@@ -357,15 +358,16 @@ jobs:
             s3|gcs) ;;
             *) echo '::error::The E2E cost matrix provider must be s3 or gcs.'; exit 1 ;;
           esac
-          if [[ $ASYNC_DISK_ISOLATION == 1 ]] &&
+          if [[ $ASYNC_DISK_MODE != none ]] &&
             [[ $COST_MATRIX != true || $ASYNC_STAGE_PROBE != true || $SQL_ASYNC_ISOLATION == true ||
-              $RHIZA_SERVER_BENCH_PROVIDER != gcs || $BASE_SHA != "$CANDIDATE_SHA" ]]; then
-            echo '::error::Disk isolation requires the GCS cost matrix, stage probe, and identical full base/candidate SHAs; do not combine it with SQL isolation.'
+              $ASYNC_PREBUILD_AB == 1 || $RHIZA_SERVER_BENCH_PROVIDER != gcs || $BASE_SHA != "$CANDIDATE_SHA" ||
+              $GITHUB_EVENT_NAME != workflow_dispatch ]]; then
+            echo '::error::Disk diagnostics require manual GCS matrix dispatch, the stage probe, and identical full base/candidate SHAs without another isolation mode.'
             exit 1
           fi
           if [[ $ASYNC_PREBUILD_AB == 1 ]] &&
             [[ $COST_MATRIX != true || $ASYNC_STAGE_PROBE != true || $SQL_ASYNC_ISOLATION == true ||
-              $ASYNC_DISK_ISOLATION == 1 || $RHIZA_SERVER_BENCH_PROVIDER != gcs || $BASE_SHA != "$CANDIDATE_SHA" ]]; then
+              $ASYNC_DISK_MODE != none || $RHIZA_SERVER_BENCH_PROVIDER != gcs || $BASE_SHA != "$CANDIDATE_SHA" ]]; then
             echo '::error::Prebuild A/B requires the GCS cost matrix, stage probe, and identical full base/candidate SHAs; do not combine it with isolation modes.'
             exit 1
           fi
@@ -406,12 +408,16 @@ jobs:
               for role in base wal lease candidate; do
                 printf '%s_tree=%s\n' "$role" "$(git -C "$RUNNER_TEMP/rhiza-e2e-$role" write-tree)"
               done
+            elif [[ $ASYNC_DISK_MODE == voter-placement ]]; then
+              printf 'samples_per_cell=12\n'
+            elif [[ $ASYNC_DISK_MODE == pressure-control ]]; then
+              printf 'samples_per_cell=8\n'
             elif [[ $ASYNC_PREBUILD_AB == 1 ]]; then
               printf 'samples_per_cell=%s\n' "$ASYNC_PREBUILD_PAIRS"
             else
               printf 'samples_per_cell=3\n'
             fi
-            printf 'runner_image=%s-%s\n' "$ImageOS" "$ImageVersion"
+            printf 'runner_image=%s-%s\n' "${ImageOS:-self-hosted}" "${ImageVersion:-unknown}"
             go version
             uname -srmo
             lscpu
@@ -429,45 +435,84 @@ jobs:
           harness_sha=$(git rev-parse HEAD)
           workloads=(sql graph kv)
           durabilities=(async before-ack)
-          disk_root=
+          voter_roots=()
+          pressure_pid=
           prebuilt_dir=
           expected_sha256=
           samples=3
-          if [[ $ASYNC_DISK_ISOLATION == 1 ]]; then
-            {
-              printf 'default /tmp: '
-              findmnt -nr -o TARGET,SOURCE,FSTYPE,MAJ:MIN -T /tmp || true
-              printf 'candidate /mnt: '
-              findmnt -nr -o TARGET,SOURCE,FSTYPE,MAJ:MIN -M /mnt || true
-            } | tee "$evidence/disk-mounts.txt"
-            if ! read -r base_device base_fs base_id < <(findmnt -nr -o SOURCE,FSTYPE,MAJ:MIN -T /tmp) ||
-              ! read -r candidate_device candidate_fs candidate_id < <(findmnt -nr -o SOURCE,FSTYPE,MAJ:MIN -M /mnt) ||
-              [[ ! -b $base_device || ! -b $candidate_device || $base_id == "$candidate_id" ||
-                ! $base_fs =~ ^(ext4|xfs)$ || ! $candidate_fs =~ ^(ext4|xfs)$ ]]; then
-              echo '::error::Disk isolation unavailable: /mnt must be a distinct ext4/xfs block mount from /tmp.'
-              exit 1
+          stop_pressure() {
+            [[ -n $pressure_pid ]] || return 0
+            local pid=$pressure_pid signalled=0 status=0
+            pressure_pid=
+            if jobs -pr | grep -Fxq "$pid"; then
+              kill -TERM "$pid" || signalled=1
+            else
+              signalled=1
             fi
-            disk_root=$(sudo mktemp -d /mnt/rhiza-disk-ab.XXXXXX)
-            trap 'if ! sudo rmdir -- "$disk_root"; then echo "::error::Could not remove disk isolation directory: $disk_root"; exit 1; fi' EXIT
-            sudo chown "$(id -u):$(id -g)" "$disk_root"
-            printf 'base_TMPDIR=/tmp\ncandidate_TMPDIR=%s\n' "$disk_root" >>"$evidence/disk-mounts.txt"
-            workloads=(sql kv)
+            wait "$pid" || status=$?
+            (( signalled == 0 && status == 0 ))
+          }
+          cleanup() {
+            local status=$?
+            trap - EXIT
+            stop_pressure || status=1
+            if [[ -n $prebuilt_dir ]]; then
+              rm -f -- "$prebuilt_dir/rhiza" "$prebuilt_dir/rhiza-bench" || status=1
+              rmdir -- "$prebuilt_dir" || status=1
+            fi
+            exit "$status"
+          }
+          trap cleanup EXIT
+          trap 'exit 130' INT
+          trap 'exit 143' TERM
+          if [[ $ASYNC_DISK_MODE == voter-placement ]]; then
+            declare -A disks=()
+            for mountpoint in /mnt/rhiza-voter-{a,b,c}; do
+              findmnt -nr -o TARGET,SOURCE,FSTYPE,MAJ:MIN -M "$mountpoint" | tee -a "$evidence/disk-mounts.txt"
+              read -r device fs < <(findmnt -nr -o SOURCE,FSTYPE -M "$mountpoint")
+              [[ $(realpath -- "$mountpoint") == "$mountpoint" && -w $mountpoint && -b $device && $fs =~ ^(ext4|xfs)$ ]]
+              read -r type disk parent < <(lsblk -dnro TYPE,KNAME,PKNAME "$device")
+              if [[ $type == part ]]; then
+                [[ $parent =~ ^[[:alnum:]]+$ && -b /dev/$parent ]]
+                read -r type disk parent < <(lsblk -dnro TYPE,KNAME,PKNAME "/dev/$parent")
+              fi
+              # Reject stacked/virtual in-kernel devices and partitions of one disk.
+              [[ $type == disk && -z $parent && $disk =~ ^(sd[a-z]+|nvme[0-9]+n[0-9]+|vd[a-z]+|xvd[a-z]+)$ ]]
+              disk_id=$(<"/sys/class/block/$disk/dev")
+              [[ $disk_id =~ ^[0-9]+:[0-9]+$ && ! ${disks[$disk_id]+present} ]]
+              disks[$disk_id]=1
+              voter_roots+=("$mountpoint")
+              printf 'whole_disk=%s %s\n' "$disk" "$disk_id" >>"$evidence/disk-mounts.txt"
+            done
+            workloads=(sql)
             durabilities=(async)
+            samples=12
+          elif [[ $ASYNC_DISK_MODE == pressure-control ]]; then
+            findmnt -nr -o TARGET,SOURCE,FSTYPE,MAJ:MIN -T /tmp | tee "$evidence/disk-mounts.txt"
+            findmnt -nr -o TARGET,SOURCE,FSTYPE,MAJ:MIN -M /dev/shm | tee -a "$evidence/disk-mounts.txt"
+            read -r device fs < <(findmnt -nr -o SOURCE,FSTYPE -T /tmp)
+            [[ -b $device && $fs =~ ^(ext4|xfs)$ && $(findmnt -nr -o FSTYPE -M /dev/shm) == tmpfs ]]
+            workloads=(sql)
+            durabilities=(async)
+            samples=8
           fi
-          if [[ $ASYNC_PREBUILD_AB == 1 ]]; then
+          if [[ $ASYNC_PREBUILD_AB == 1 || $ASYNC_DISK_MODE != none ]]; then
             prebuilt_dir=$(mktemp -d "$RUNNER_TEMP/rhiza-prebuild-ab.XXXXXX")
-            trap 'rm -f -- "$prebuilt_dir/rhiza" "$prebuilt_dir/rhiza-bench"; rmdir -- "$prebuilt_dir"' EXIT
             # Use the exact same source directory for both server builds; Go can embed its absolute path.
             (cd "$RUNNER_TEMP/rhiza-e2e-base" && go build -o "$prebuilt_dir/rhiza" ./cmd/rhiza)
             go build -o "$prebuilt_dir/rhiza-bench" ./cmd/rhiza-bench
             server_sha256=$(sha256sum "$prebuilt_dir/rhiza" | awk '{print $1}')
             client_sha256=$(sha256sum "$prebuilt_dir/rhiza-bench" | awk '{print $1}')
             expected_sha256="$server_sha256:$client_sha256"
-            printf 'base=build-per-sample\ncandidate=prebuilt\nserver_sha256=%s\nclient_sha256=%s\n' \
-              "$server_sha256" "$client_sha256" >"$evidence/prebuild-ab.txt"
-            workloads=(sql)
-            durabilities=(async)
-            samples=$ASYNC_PREBUILD_PAIRS
+            if [[ $ASYNC_PREBUILD_AB == 1 ]]; then
+              printf 'base=build-per-sample\ncandidate=prebuilt\nserver_sha256=%s\nclient_sha256=%s\n' \
+                "$server_sha256" "$client_sha256" >"$evidence/prebuild-ab.txt"
+              workloads=(sql)
+              durabilities=(async)
+              samples=$ASYNC_PREBUILD_PAIRS
+            else
+              printf 'mode=%s\nserver_sha256=%s\nclient_sha256=%s\n' "$ASYNC_DISK_MODE" "$server_sha256" "$client_sha256" >"$evidence/disk-mode.txt"
+            fi
           fi
           printf 'sample\tworkload\tdurability\trevision\texit\n' >"$evidence/exits.tsv"
           for ((sample = 1; sample <= samples; sample++)); do
@@ -485,29 +530,62 @@ jobs:
                   sample_tmpdir=${TMPDIR:-/tmp}
                   sample_source="$RUNNER_TEMP/rhiza-e2e-$revision"
                   sample_binary_dir=
+                  sample_voter_roots=
                   if [[ -n $prebuilt_dir ]]; then
                     sample_source="$RUNNER_TEMP/rhiza-e2e-base"
-                    if [[ $revision == candidate ]]; then sample_binary_dir=$prebuilt_dir; fi
+                    if [[ $revision == candidate || $ASYNC_DISK_MODE != none ]]; then sample_binary_dir=$prebuilt_dir; fi
                   fi
-                  if [[ -n $disk_root ]]; then
+                  if [[ $ASYNC_DISK_MODE == voter-placement ]]; then
+                    a=${voter_roots[$(((sample - 1) % 3))]}
+                    b=${voter_roots[$((sample % 3))]}
+                    c=${voter_roots[$(((sample + 1) % 3))]}
+                    sample_voter_roots="$a:$a:$a"
+                    if [[ $revision == candidate ]]; then sample_voter_roots="$a:$b:$c"; fi
+                    printf '%s %s\n' "$revision-$sample" "$sample_voter_roots" >>"$evidence/voter-placement.txt"
+                  elif [[ $ASYNC_DISK_MODE == pressure-control ]]; then
                     sample_tmpdir=/tmp
-                    if [[ $revision == candidate ]]; then sample_tmpdir=$disk_root; fi
+                    pressure_root=/tmp
+                    if [[ $revision == candidate ]]; then pressure_root=/dev/shm; fi
+                    bash benchmarks/async-disk-pressure.sh "$pressure_root" >"$result-pressure.log" 2>"$result-pressure.stderr" &
+                    pressure_pid=$!
                   fi
                   TMPDIR="$sample_tmpdir" RHIZA_ASYNC_STAGE_PROBE="$((publish * ASYNC_STAGE_PROBE))" \
                     RHIZA_SERVER_BENCH_BINARY_DIR="$sample_binary_dir" RHIZA_SERVER_BENCH_EXPECTED_SHA256="$expected_sha256" \
+                    RHIZA_SERVER_BENCH_VOTER_ROOTS="$sample_voter_roots" \
                     RHIZA_SERVER_BENCH_WORKLOAD="$workload" \
                     RHIZA_SERVER_BENCH_DURABILITY="$durability" \
                     RHIZA_SERVER_BENCH_ASYNC_PUBLISH="$publish" \
                     benchmarks/run-server-reference.sh "$sample_source" "$result.json" \
                     >"$result.log" 2>&1 || status=$?
+                  if ! stop_pressure; then
+                    echo '::error::Pressure writer did not stop and clean up successfully.'
+                    status=1
+                  fi
                   printf '%s\t%s\t%s\t%s\t%s\n' "$sample" "$workload" "$durability" "$revision" "$status" | tee -a "$evidence/exits.tsv"
                   if (( status != 0 )); then
                     tail -n 100 "$result.log"
                     exit "$status"
                   fi
+                  if [[ $ASYNC_DISK_MODE == pressure-control ]]; then
+                    # Require a completed writer operation fully inside the timed window.
+                    begin=$(sed -n 's/^ASYNC_WINDOW_BEGIN_NS=//p' "$result.log")
+                    end=$(sed -n 's/^ASYNC_WINDOW_END_NS=//p' "$result.log")
+                    [[ $begin =~ ^[0-9]{19}$ && $end =~ ^[0-9]{19}$ && $begin < $end ]]
+                    if ! awk -v begin="$begin" -v end="$end" '
+                      $1 == "DISK_PRESSURE_WRITE" && $2 ~ /^begin_ns=[0-9]+$/ && $3 ~ /^end_ns=[0-9]+$/ {
+                        a = substr($2, 10); b = substr($3, 8)
+                        if (length(a) == length(begin) && length(b) == length(end) &&
+                            "x"a >= "x"begin && "x"b <= "x"end && "x"a < "x"b) count++
+                      }
+                      END { print count + 0; exit !count }
+                    ' "$result-pressure.log" >"$result-pressure-in-window.txt"; then
+                      echo '::error::No completed pressure operation in the timed write window.'
+                      exit 1
+                    fi
+                  fi
                   if ! jq -e --argjson requests "$RHIZA_SERVER_BENCH_REQUESTS" \
                     --argjson concurrency "$RHIZA_SERVER_BENCH_CONCURRENCY" \
-                      --argjson disk_isolation "$ASYNC_DISK_ISOLATION" \
+                      --arg disk_mode "$ASYNC_DISK_MODE" \
                       --argjson prebuild_ab "$ASYNC_PREBUILD_AB" \
                     --arg provider "$RHIZA_SERVER_BENCH_PROVIDER" \
                     --arg harness "$harness_sha" --arg workload "$workload" --arg durability "$durability" '
@@ -517,7 +595,7 @@ jobs:
                       .voter_resource_status == "measured" and (.voter_resources.nodes | length) == 3 and
                       (.object_store_delta.http_requests | type) == "number" and
                       (.write_object_store_delta.http_requests | type) == "number" and
-                      (($disk_isolation == 0 and $prebuild_ab == 0) or .write_object_store_delta.http_requests == 0) and
+                      (($disk_mode == "none" and $prebuild_ab == 0) or .write_object_store_delta.http_requests == 0) and
                       (if $provider == "gcs" then
                         (.gcs_request_classes.write | type) == "object" and
                         (if $durability == "async" then (.gcs_request_classes.publication | type) == "object"
@@ -537,11 +615,12 @@ jobs:
               done
             done
           done
-          if [[ -n $prebuilt_dir ]]; then
+          if [[ $ASYNC_PREBUILD_AB == 1 ]]; then
             printf '## GCS SQL Async prebuild A/B\n\nAll %s samples (%s alternating pairs) passed. Both arms verified identical server and client binaries; only per-sample building changed. Raw results and stage logs are attached.\n' \
               "$((samples * 2))" "$samples" >>"$GITHUB_STEP_SUMMARY"
-          elif [[ -n $disk_root ]]; then
-            printf '## GCS Async disk isolation\n\nAll 12 samples passed: SQL and KV × two mounts × three runs. Both mounts used the same commit with WAL sync and stage probes enabled. Mount evidence, raw results, and process logs are attached.\n' >>"$GITHUB_STEP_SUMMARY"
+          elif [[ $ASYNC_DISK_MODE != none ]]; then
+            printf '## GCS SQL Async %s\n\nAll %s samples (%s alternating pairs) passed with identical binaries and unchanged WAL sync. Raw stage and device evidence is attached.\n' \
+              "$ASYNC_DISK_MODE" "$((samples * 2))" "$samples" >>"$GITHUB_STEP_SUMMARY"
           else
             printf '## E2E cost matrix (%s)\n\nAll 36 samples passed: SQL, Graph, and KV × Async and BeforeAck × two revisions × three runs. Raw result and process logs are attached.\n' "$RHIZA_SERVER_BENCH_PROVIDER" >>"$GITHUB_STEP_SUMMARY"
           fi

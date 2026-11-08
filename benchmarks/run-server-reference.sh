@@ -217,13 +217,28 @@ if [[ ! $max_fault_latency_ms =~ ^[1-9][0-9]*([.][0-9]+)?$ ]]; then
 	printf 'RHIZA_SERVER_BENCH_MAX_FAULT_LATENCY_MS must be a positive number\n' >&2
 	exit 2
 fi
+voter_roots=${RHIZA_SERVER_BENCH_VOTER_ROOTS:-}
+if [[ -n $voter_roots ]]; then
+	if [[ ! $voter_roots =~ ^/[^:]+:/[^:]+:/[^:]+$ || $voter_roots =~ [[:cntrl:]] ]]; then
+		printf 'RHIZA_SERVER_BENCH_VOTER_ROOTS must contain three colon-separated absolute directories\n' >&2
+		exit 2
+	fi
+	IFS=: read -r -a voter_roots_array <<< "$voter_roots"
+	for root in "${voter_roots_array[@]}"; do
+		if [[ ! -d $root || ! -w $root || $(cd -P -- "$root" && pwd -P) != "$root" ]]; then
+			printf 'voter root is not a canonical writable directory: %s\n' "$root" >&2
+			exit 2
+		fi
+	done
+fi
 
 run_dir=$(mktemp -d "${TMPDIR:-/tmp}/rhiza-server-bench.XXXXXX")
 container="rhiza-bench-$provider-$$"
 gcs_container_id=
 bench_pid=
+owned_voter_dirs=()
 cleanup() {
-	local cleanup_failed=0
+	local cleanup_failed=0 voter_dir
 	set +e
 	stop_benchmark_child
 	output_stem=$(basename "$output_file" .json)
@@ -243,6 +258,12 @@ cleanup() {
 		pid=$(<"$pid_file")
 		if jobs -pr | grep -qx "$pid"; then kill "$pid" 2>/dev/null || true; fi
 		wait "$pid" 2>/dev/null || true
+	done
+	for voter_dir in "${owned_voter_dirs[@]+${owned_voter_dirs[@]}}"; do
+		if ! rm -rf -- "$voter_dir" || [[ -e $voter_dir || -L $voter_dir ]]; then
+			printf 'could not verify removal of owned voter directory: %s\n' "$voter_dir" >&2
+			cleanup_failed=1
+		fi
 	done
 	if [[ $provider == s3 ]]; then
 		docker rm -f "$container" >/dev/null 2>&1 || true
@@ -361,11 +382,16 @@ if [[ $publish_async == 1 ]]; then
 	admin_env=(RHIZA_ADMIN_TOKEN="$admin_token")
 fi
 for i in 0 1 2; do
+	voter_data_dir="$run_dir/node-$i"
+	if [[ -n $voter_roots ]]; then
+		voter_data_dir=$(mktemp -d "${voter_roots_array[i]}/rhiza-server-voter-n$i.XXXXXX")
+		owned_voter_dirs+=("$voter_data_dir")
+	fi
 	peer_token_env=()
 	[[ $legacy_membership -eq 1 ]] || peer_token_env=(RHIZA_PEER_TOKEN="n$i-token")
 	"${node_environment[@]}" RHIZA_CLUSTER_ID=server-bench RHIZA_NODE_ID="n$i" \
 		RHIZA_BIND_ADDR="127.0.0.1:$((base_http_port + i))" RHIZA_PEER_ADDR="127.0.0.1:$((base_peer_port + i))" \
-		RHIZA_DATA_DIR="$run_dir/node-$i" RHIZA_CLUSTER_MEMBERS="$members" "${peer_token_env[@]+${peer_token_env[@]}}" \
+		RHIZA_DATA_DIR="$voter_data_dir" RHIZA_CLUSTER_MEMBERS="$members" "${peer_token_env[@]+${peer_token_env[@]}}" \
 		"${admin_env[@]+${admin_env[@]}}" \
 		"${object_env[@]}" RHIZA_OBJSTORE_PREFIX=server-bench \
 		RHIZA_ASYNC_STAGE_PROBE="$stage_probe" \

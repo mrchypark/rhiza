@@ -139,7 +139,7 @@ case $1 in
   printf 'quarkus-prefix RHIZA_GCS_ACCESS POST /storage/v1/b 200\n'
   if [[ -f $MOCK_HOME/client-done && $MOCK_MODE != gcs-missing ]]; then
    suffix=
-   [[ $MOCK_MODE != gcs-async && $MOCK_MODE != gcs-prebuilt ]] || suffix='?projection=synthetic-private-query#synthetic-private-fragment'
+   [[ $MOCK_MODE != gcs-async && $MOCK_MODE != gcs-prebuilt && $MOCK_MODE != gcs-voter-roots ]] || suffix='?projection=synthetic-private-query#synthetic-private-fragment'
    printf 'quarkus-prefix RHIZA_GCS_ACCESS GET /storage/v1/b/%s/o/bench-head%s 404\n' "$bucket" "$suffix"
    if [[ $MOCK_MODE == gcs-unknown ]]; then printf 'RHIZA_GCS_ACCESS GET /other 200\n'; fi
    if [[ $MOCK_MODE == gcs-malformed ]]; then printf 'quarkus-prefix RHIZA_GCS_ACCESS GET /storage/v1/b?synthetic-private-query missing_status\n'; fi
@@ -164,6 +164,11 @@ if [[ $RHIZA_OBJSTORE_PROVIDER == gcs ]]; then
  MOCK_HOME=${TMPDIR%/*}
  printf '%s\n' "$RHIZA_NODE_ID" >> "$MOCK_HOME/gcs-local-adc"
  printf '%s:%s\n' "$RHIZA_NODE_ID" "$RHIZA_ASYNC_STAGE_PROBE" >> "$MOCK_HOME/gcs-stage-probe"
+ if [[ ${MOCK_HOME##*/} == gcs-voter-roots ]]; then
+  [[ $RHIZA_DATA_DIR == "$MOCK_HOME/drive-${RHIZA_NODE_ID#n}/rhiza-server-voter-$RHIZA_NODE_ID."* && -d $RHIZA_DATA_DIR ]]
+  touch "$RHIZA_DATA_DIR/owned-data"
+  printf '%s\n' "$RHIZA_DATA_DIR" >> "$MOCK_HOME/voter-dirs"
+ fi
  if [[ $RHIZA_ASYNC_STAGE_PROBE == 1 ]]; then
   if [[ ${MOCK_HOME##*/} == gcs-probe-missing && $RHIZA_NODE_ID == n2 ]]; then
    printf 'not-a-marker ASYNC_STAGE_PROBE_READY=1\n' >&2
@@ -309,7 +314,7 @@ wait() {
 }
 MOCK
 chmod +x "$scratch/bin/"* "$scratch/node" "$scratch/bench"
-for mode in normal shifted before-first after-last no-witness signal-failure wait-normal wait-crash wait-error healthy healthy-nonlinux resource-replaced resource-missing graph graph-wrong-ids kv kv-wrong-value async-stale-cut gcs-before-ack gcs-async gcs-prebuilt gcs-probe-missing gcs-missing gcs-unknown gcs-malformed; do
+for mode in normal shifted before-first after-last no-witness signal-failure wait-normal wait-crash wait-error healthy healthy-nonlinux resource-replaced resource-missing graph graph-wrong-ids kv kv-wrong-value async-stale-cut gcs-before-ack gcs-async gcs-prebuilt gcs-voter-roots gcs-probe-missing gcs-missing gcs-unknown gcs-malformed; do
  mkdir "$scratch/$mode"
  # Each run's stand-ins and process evidence remain in its own scratch scope.
  cp "$scratch/node" "$scratch/bench" "$scratch/$mode/"
@@ -321,13 +326,14 @@ for mode in normal shifted before-first after-last no-witness signal-failure wai
  provider=s3
  prebuilt_dir=
  expected_sha256=
+ voter_roots=
  case $mode in
   shifted|healthy*|resource-*) fault=none ;;
   graph*) fault=none; workload=graph; durability=before-ack ;;
   kv*) fault=none; workload=kv; publish=1 ;;
   async-stale-cut) fault=none; publish=1 ;;
   gcs-*) fault=none; provider=gcs
-   if [[ $mode == gcs-async || $mode == gcs-prebuilt || $mode == gcs-probe-missing ]]; then publish=1; probe=1; else durability=before-ack; fi ;;
+   if [[ $mode == gcs-async || $mode == gcs-prebuilt || $mode == gcs-voter-roots || $mode == gcs-probe-missing ]]; then publish=1; probe=1; else durability=before-ack; fi ;;
  esac
  if [[ $mode == gcs-prebuilt ]]; then
   prebuilt_dir="$scratch/prebuilt"
@@ -336,12 +342,20 @@ for mode in normal shifted before-first after-last no-witness signal-failure wai
   cp "$scratch/bench" "$prebuilt_dir/rhiza-bench"
   expected_sha256=$(openssl dgst -sha256 "$prebuilt_dir/rhiza" "$prebuilt_dir/rhiza-bench" | awk '{print $NF}' | paste -sd ':' -)
  fi
+ if [[ $mode == gcs-voter-roots ]]; then
+  for i in 0 1 2; do
+   mkdir "$scratch/$mode/drive-$i"
+   touch "$scratch/$mode/drive-$i/keep"
+  done
+  voter_roots="$scratch/$mode/drive-0:$scratch/$mode/drive-1:$scratch/$mode/drive-2"
+ fi
  status=0
  BASH_ENV="$scratch/wait-env" MOCK_HOME="$scratch/$mode" MOCK_MODE="$mode" PATH="$scratch/bin:$PATH" TMPDIR="$scratch/$mode" \
  RHIZA_SERVER_BENCH_REQUESTS=4 RHIZA_SERVER_BENCH_CONCURRENCY=2 RHIZA_SERVER_BENCH_FAULT_AFTER=0 RHIZA_SERVER_BENCH_FAILED_NODE="$fault" \
  RHIZA_SERVER_BENCH_WORKLOAD="$workload" RHIZA_SERVER_BENCH_DURABILITY="$durability" RHIZA_SERVER_BENCH_ASYNC_PUBLISH="$publish" \
  RHIZA_SERVER_BENCH_PROVIDER="$provider" RHIZA_ASYNC_STAGE_PROBE="$probe" \
  RHIZA_SERVER_BENCH_BINARY_DIR="$prebuilt_dir" RHIZA_SERVER_BENCH_EXPECTED_SHA256="$expected_sha256" \
+ RHIZA_SERVER_BENCH_VOTER_ROOTS="$voter_roots" \
  RHIZA_OBJSTORE_SERVICE_ACCOUNT=ambient-must-not-inherit HTTP_PROXY=http://ambient-must-not-inherit \
  bash "$here/run-server-reference.sh" "$scratch/base-server" "$scratch/$mode/result.json" >"$scratch/$mode/stdout" 2>"$scratch/$mode/stderr" || status=$?
  if [[ $mode == normal ]]; then
@@ -387,7 +401,7 @@ for mode in normal shifted before-first after-last no-witness signal-failure wai
   else
    [[ ! -f $scratch/$mode/archived ]]
   fi
- elif [[ $mode == gcs-before-ack || $mode == gcs-async || $mode == gcs-prebuilt ]]; then
+ elif [[ $mode == gcs-before-ack || $mode == gcs-async || $mode == gcs-prebuilt || $mode == gcs-voter-roots ]]; then
   [[ $status == 0 ]]
   jq -e '.object_store_provider == "gcs" and .gcs_request_classes.write.class_b_attempts == 1
     and .gcs_request_classes.write.transport_attempts == 6
@@ -447,6 +461,12 @@ for mode in normal shifted before-first after-last no-witness signal-failure wai
   grep -Fq "$scratch/base-server|build -o" "$scratch/$mode/builds"
   grep -Fq "$(cd "$here/.." && pwd)|build -o" "$scratch/$mode/builds"
  fi
+ if [[ $mode == gcs-voter-roots ]]; then
+  [[ $(wc -l < "$scratch/$mode/voter-dirs") -eq 3 ]]
+  while IFS= read -r voter_dir; do
+   [[ ! -e $voter_dir && -f ${voter_dir%/*}/keep ]]
+  done < "$scratch/$mode/voter-dirs"
+ fi
  while IFS= read -r pid; do
   if kill -0 "$pid" 2>/dev/null; then printf 'mock owned process survived: %s\n' "$pid" >&2; exit 1; fi
  done < <(cat "$scratch/$mode/nodes"; if [[ -f $scratch/$mode/bench.pid ]]; then cat "$scratch/$mode/bench.pid"; fi)
@@ -457,4 +477,10 @@ RHIZA_SERVER_BENCH_BINARY_DIR="$scratch/prebuilt" RHIZA_SERVER_BENCH_EXPECTED_SH
  >"$scratch/mismatch.out" 2>"$scratch/mismatch.err" || status=$?
 [[ $status == 2 && ! -e $scratch/mismatch.json ]]
 grep -Fxq 'benchmark server/client binary hash mismatch' "$scratch/mismatch.err"
-printf 'server oracle helpers + 25 complete mocked runner cases PASS\n'
+status=0
+RHIZA_SERVER_BENCH_VOTER_ROOTS="$scratch::$scratch" TMPDIR="$scratch" \
+ bash "$here/run-server-reference.sh" "$scratch/base-server" "$scratch/invalid-roots.json" \
+ >"$scratch/invalid-roots.out" 2>"$scratch/invalid-roots.err" || status=$?
+[[ $status == 2 && ! -e $scratch/invalid-roots.json ]]
+grep -Fxq 'RHIZA_SERVER_BENCH_VOTER_ROOTS must contain three colon-separated absolute directories' "$scratch/invalid-roots.err"
+printf 'server oracle helpers + 26 complete mocked runner cases PASS\n'
