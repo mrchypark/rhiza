@@ -35,7 +35,7 @@ sh -c '
         [ "$4" = pods ] && [ "$5" = -l ] && [ "$7" = -o ] && [ "$8" = json ] && [ "$#" -eq 8 ] || { echo "unexpected Pod query" >&2; return 2; }
         printf "get %s\n" "$6" >> "$calls"
         case "$6" in
-          app=operator)
+          app.kubernetes.io/name=rhiza-operator)
             printf "%s\n" '\''{"items":[{"metadata":{"name":"operator-pod"},"spec":{"containers":[{"name":"operator","env":[{"name":"PROFILE","value":"NO_PRIVATE_PROFILE_LOG"}]},{"name":"sidecar-secret"}]}}]}'\''
             ;;
           rhiza.mrchypark.dev/cluster-uid=cluster-uid)
@@ -68,7 +68,7 @@ sh -c '
 [ "$(wc -l < "$scratch/calls.txt" | tr -d ' ')" -eq 10 ]
 [ "$(grep -c '^get ' "$scratch/calls.txt")" -eq 2 ]
 [ "$(grep -c '^logs ' "$scratch/calls.txt")" -eq 8 ]
-grep -Fx 'get app=operator' "$scratch/calls.txt" >/dev/null
+grep -Fx 'get app.kubernetes.io/name=rhiza-operator' "$scratch/calls.txt" >/dev/null
 grep -Fx 'get rhiza.mrchypark.dev/cluster-uid=cluster-uid' "$scratch/calls.txt" >/dev/null
 grep -F 'CAPTURED operator-pod operator current' "$scratch/logs/operator-operator-pod-operator-current.log" >/dev/null
 grep -F 'CAPTURED sql-pod rhiza-prepare-identity previous' "$scratch/logs/managed-sql-pod-rhiza-prepare-identity-previous.log" >/dev/null
