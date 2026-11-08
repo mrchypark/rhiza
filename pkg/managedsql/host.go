@@ -16,6 +16,7 @@ import (
 	"sync"
 
 	"github.com/mrchypark/rhiza/internal/localtesthooks"
+	"github.com/mrchypark/rhiza/internal/sqlpolicy"
 	"github.com/mrchypark/rhiza/internal/types"
 	"github.com/mrchypark/rhiza/pkg/network"
 	"github.com/mrchypark/rhiza/pkg/node"
@@ -183,6 +184,18 @@ func Open(ctx context.Context, cfg Config) (*Host, error) {
 		return nil, logManagedHostOpenFailure(openStage, err)
 	}
 	h.identity.Fresh = emptySource && !ever && cfg.Prepared == nil && initialMember
+	if localtesthooks.Enabled && h.identity.Fresh && cfg.Plan.ApplicationProtocol == sqlpolicy.ManagedGraphRequestAppendOnlyApplicationProtocol {
+		localtesthooks.Hit("managed-host:graph-bootstrap:source-checked")
+	}
+	graphBootstrap := cfg.Plan.ApplicationProtocol == sqlpolicy.ManagedGraphRequestAppendOnlyApplicationProtocol
+	if graphBootstrap && initial.Assignment().State == "Unused" {
+		localtesthooks.Hit("managed-host:graph-bootstrap:before-unused-source-check")
+		initial, err = h.loadStartupInitialization(ctx)
+		if err != nil {
+			return nil, logManagedHostOpenFailure(openStage, err)
+		}
+		ever = initial.EverApplicationReserved()
+	}
 	if h.identity.Fresh && initial.Assignment().State == "Consumed" {
 		a, err := h.live(ctx)
 		if err != nil {
@@ -207,6 +220,21 @@ func Open(ctx context.Context, cfg Config) (*Host, error) {
 	}
 	openStage = "host_initialization"
 	if initial.Assignment().State == "Unused" {
+		if graphBootstrap {
+			localtesthooks.Hit("managed-host:graph-bootstrap:before-unused-evidence")
+			initial, err = h.loadStartupInitialization(ctx)
+			if err != nil {
+				return h, logManagedHostOpenFailure(openStage, err)
+			}
+			if initial.Assignment().State == "Consumed" {
+				// Do not inspect a now-live runtime as empty or attempt another
+				// E0. Admission remains an independent live check.
+				if _, err := h.live(ctx); err != nil {
+					return h, logManagedHostOpenFailure(openStage, err)
+				}
+				return h, nil
+			}
+		}
 		evidence, err := h.inspectEvidence(ctx, true, false)
 		if err != nil {
 			return h, logManagedHostOpenFailure(openStage, err)
@@ -232,6 +260,17 @@ func Open(ctx context.Context, cfg Config) (*Host, error) {
 		}
 	}
 	return h, nil
+}
+
+func (h *Host) loadStartupInitialization(ctx context.Context) (operator.V1Alpha2ApplicationInitSnapshot, error) {
+	init, err := operator.LoadV1Alpha2ApplicationInit(ctx, h.cfg.Store, h.cfg.Ref)
+	if err != nil {
+		return init, err
+	}
+	if init.Assignment().Plan != h.cfg.Plan || init.Authority() != h.authority {
+		return init, fmt.Errorf("live initialization binding changed")
+	}
+	return init, nil
 }
 
 func managedHostOpenDiagnostic(stage string) string {
@@ -285,6 +324,27 @@ func (h *Host) live(ctx context.Context) (operator.V1Alpha2AdmissionSnapshot, er
 	return a, nil
 }
 
+// ValidateManagedGraphBootstrapControl verifies live authority for an exact
+// original opening a certified control prefix before the first producer root.
+func (h *Host) ValidateManagedGraphBootstrapControl(ctx context.Context, i node.ManagedStartupIdentity) error {
+	// Open already checked this exact Pod UID, node ID and public key
+	// against the original plan before installing h.identity.
+	if i != h.identity || i.Member.Generation != 0 || h.cfg.Runtime.Learner != nil || h.cfg.Prepared != nil {
+		return fmt.Errorf("managed Graph control bootstrap requires the original startup identity")
+	}
+	a, err := h.live(ctx)
+	if err != nil {
+		return err
+	}
+	if _, pending := a.Pending(); pending || a.EverApplicationReserved() || a.SQLReservationsClosed() {
+		return fmt.Errorf("managed Graph control bootstrap requires no application reservation or closed admission")
+	}
+	if _, repair := a.Repair(); repair {
+		return fmt.Errorf("managed Graph control bootstrap requires no repair history")
+	}
+	return ctx.Err()
+}
+
 func (h *Host) ValidateManagedStartup(ctx context.Context, i node.ManagedStartupIdentity) error {
 	if i != h.identity {
 		return fmt.Errorf("execution identity changed")
@@ -312,6 +372,13 @@ func (h *Host) ValidateManagedStartup(ctx context.Context, i node.ManagedStartup
 			// Keep the owner and private peers alive; live application admission
 			// below requires actual history rather than this stale startup hint.
 			return nil
+		}
+		if i.ApplicationProtocol == sqlpolicy.ManagedGraphRequestAppendOnlyApplicationProtocol {
+			// Once E0 is consumed, another original may publish a READ
+			// between source inspection and registration. Startup authenticates
+			// a producer root or checks the actual rootless Core prefix; the
+			// public archive restore view intentionally requires a locator.
+			return ctx.Err()
 		}
 		return h.node.VerifyManagedSQLFreshSource(ctx, i)
 	}

@@ -25,13 +25,22 @@ clears Transition and records a receipt. Recovery reserves Transition, not an
 application PendingWrite; a pending application operation must not be cleared
 to manufacture recovery.
 
+The Coordinator validates the returned binding and compares proof bytes with
+the frozen evidence before CAS. The caller and verifier establish fencing and
+validate the recovery data; the Coordinator does not independently observe
+process termination, archive coverage or quorum readiness. This primitive is
+not wired into managed v1alpha2 generation activation.
+
 `RequestHash` covers the entire request, including `FenceHash`. The latter
 describes independent fencing evidence and is not the request hash.
 Independent proof must establish the complete old-runtime termination scope,
 recreation prevention and outstanding storage-work safety. A Pod deletion,
 timeout or successful infrastructure API response alone is insufficient.
-The verified recovery source must cover successful ACKs; activation also needs
-fresh live authority and a new ready quorum. Unknown evidence stays Blocked.
+The BeforeAck recovery design requires a verified source covering successful
+ACKs. The separate [managed Async proposal](managed-async-recovery.md) permits
+only unpublished-tail loss beyond the verified cut and does not implement
+activation. Resuming service also needs fresh live authority and a new ready
+quorum. Unknown evidence stays Blocked.
 
 ## Verification is not restoration
 

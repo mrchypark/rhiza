@@ -441,32 +441,51 @@ fi
 printf 'header = "Authorization: Bearer %s"\n' "$admin" > "$private/curl.conf"
 unset admin
 k -n "$namespace" create secret generic runtime --from-file="runtime.json=$private/runtime.json"
-k -n "$namespace" create serviceaccount operator
-k -n "$namespace" create serviceaccount rhiza-managed-host
-k -n "$namespace" create role runtime-read --verb=get --resource=rhizaclusters,pods,replicasets,deployments
-k -n "$namespace" create rolebinding runtime-read --role=runtime-read --serviceaccount="$namespace:rhiza-managed-host"
-# Pod LIST is namespace-scoped discovery, not field/label-scoped RBAC.
-k -n "$namespace" create role runtime-pod-discovery --verb=list --resource=pods
-k -n "$namespace" create rolebinding runtime-pod-discovery --role=runtime-pod-discovery --serviceaccount="$namespace:rhiza-managed-host"
-k -n "$namespace" create role runtime-status --verb=get,update --resource=rhizaclusters/status --resource-name=sql
-k -n "$namespace" create rolebinding runtime-status --role=runtime-status --serviceaccount="$namespace:rhiza-managed-host"
-k -n "$namespace" create role managed-host-account-read --verb=get --resource=serviceaccounts --resource-name=rhiza-managed-host
-k -n "$namespace" create rolebinding managed-host-account-read --role=managed-host-account-read --serviceaccount="$namespace:operator"
-k -n "$namespace" create role bootstrap --verb=get,list --resource=rhizaclusters,pods,replicasets,deployments,secrets
-k -n "$namespace" create role create-deployment --verb=create --resource=deployments
-k -n "$namespace" create rolebinding bootstrap --role=bootstrap --serviceaccount="$namespace:operator"
-k -n "$namespace" create rolebinding create-deployment --role=create-deployment --serviceaccount="$namespace:operator"
-# Withhold status-update RBAC until actual kubelet termination and gate observations.
-jq -n --arg image "$image" --arg namespace "$namespace" '{apiVersion:"apps/v1",kind:"Deployment",metadata:{name:"operator"},spec:{replicas:1,selector:{matchLabels:{app:"operator"}},template:{metadata:{labels:{app:"operator"}},spec:{serviceAccountName:"operator",securityContext:{runAsUser:65532,runAsGroup:65532,fsGroup:65532,runAsNonRoot:true},containers:[{name:"operator",image:$image,args:[("--namespace="+$namespace),"--poll-interval=1s","--managed-runtime-profile=/etc/rhiza/managed/runtime.json"],volumeMounts:[{name:"runtime",mountPath:"/etc/rhiza/managed",readOnly:true}]}],volumes:[{name:"runtime",secret:{secretName:"runtime",defaultMode:288}}]}}}}' | k -n "$namespace" apply -f -
-jq -n --arg image "$image" --arg protocol "$fixture_protocol" '{apiVersion:"rhiza.mrchypark.dev/v1alpha2",kind:"RhizaCluster",metadata:{name:"sql"},spec:{logicalID:"managed-ci",genesisIntent:"Create",voterCount:3,workload:{podTemplate:{spec:{containers:[{name:"sql",image:$image}]}}}}} | if $protocol=="" then . else .spec.applicationProtocol=$protocol end' | k -n "$namespace" apply -f -
-uid=$(k -n "$namespace" get rhizacluster sql -o jsonpath='{.metadata.uid}')
+# Consume the public managed overlay, not a test-owned operator Deployment.
+# CRDs and the isolated namespace were already installed by the driver.
+kubectl kustomize deploy/operator-managed > "$logs/managed-install.yaml"
+yq -o=json -I=0 '.' "$logs/managed-install.yaml" > "$private/managed-install.jsonl"
+jq -s --arg namespace "$namespace" --arg image "$image" '
+  map(select(.kind!="CustomResourceDefinition" and .kind!="Namespace") |
+    .metadata.namespace=$namespace |
+    if .kind=="RoleBinding" then .subjects |= map(if .kind=="ServiceAccount" then .namespace=$namespace else . end) else . end |
+    if .kind=="Deployment" and .metadata.name=="rhiza-operator" then
+      .spec.template.spec.containers |= map(if .name=="operator" then .image=$image else . end)
+    else . end) | {apiVersion:"v1",kind:"List",items:.}' "$private/managed-install.jsonl" > "$logs/managed-install.json"
+if [ "${managed_manual_proof-}" = direct-host ]; then
+  project_direct_overlay "$logs/managed-install.json" > "$private/managed-install-direct.json"
+  cp "$private/managed-install-direct.json" "$logs/managed-install.json"
+fi
+jq -e '[.items[]|select(.kind=="Deployment")]|length==1 and .[0].metadata.name=="rhiza-operator"' "$logs/managed-install.json" >/dev/null
+jq -e '[.items[]|select(.kind=="Role" and .metadata.name=="rhiza-operator")|.rules[]|select((.resources|index("rhizaclusters/status"))!=null and (.verbs|index("update"))!=null)]|length==1' "$logs/managed-install.json" >/dev/null
+# Withhold ONLY operator status-update until actual kubelet gate observations.
+jq '(.items[]|select(.kind=="Role" and .metadata.name=="rhiza-operator")|.rules[]|select(.resources|index("rhizaclusters/status"))|.verbs) -= ["update"]' "$logs/managed-install.json" > "$logs/managed-install-gated.json"
+jq -e 'all(.items[]|select(.kind=="Role" and .metadata.name=="rhiza-operator")|.rules[]|select(.resources|index("rhizaclusters/status")); (.verbs|index("update"))==null)' "$logs/managed-install-gated.json" >/dev/null
+if [ "${managed_manual_proof-}" = direct-host ]; then
+  create_direct_overlay "$logs/managed-install-gated.json"
+else
+  k -n "$namespace" apply --validate=strict -f "$logs/managed-install-gated.json"
+fi
+k -n "$namespace" get deployments -o json > "$logs/before-cr-deployments.json"
+jq -e 'all(.items[]; .metadata.name!="" and .metadata.name!="sql" and (.metadata.labels["rhiza.mrchypark.dev/cluster-uid"] // "")=="")' "$logs/before-cr-deployments.json" >/dev/null
+jq -n --arg image "$image" --arg protocol "$fixture_protocol" '{apiVersion:"rhiza.mrchypark.dev/v1alpha2",kind:"RhizaCluster",metadata:{name:"sql"},spec:{logicalID:"managed-ci",genesisIntent:"Create",voterCount:3,workload:{podTemplate:{spec:{containers:[{name:"sql",image:$image}]}}}}} | if $protocol=="" then . else .spec.applicationProtocol=$protocol end' > "$logs/requested-cluster.json"
+jq -e 'has("status")|not' "$logs/requested-cluster.json" >/dev/null
+if [ "${managed_manual_proof-}" = direct-host ]; then
+  create_direct_cluster "$logs/requested-cluster.json"
+else
+  k -n "$namespace" apply --validate=strict -f "$logs/requested-cluster.json"
+  uid=$(k -n "$namespace" get rhizacluster sql -o jsonpath='{.metadata.uid}')
+fi
 selector="rhiza.mrchypark.dev/cluster-uid=$uid"
 attempt=0
 until k -n "$namespace" get pods -l "$selector" -o json > "$logs/gated-pods.json" && sh scripts/ha-managed-bucket-setup oracle-gated "$logs/gated-pods.json"; do
   attempt=$((attempt+1)); [ "$attempt" -lt 120 ] || exit 1; sleep 1
 done
-k -n "$namespace" create role status --verb=update --resource=rhizaclusters/status
-k -n "$namespace" create rolebinding status --role=status --serviceaccount="$namespace:operator"
+if [ "${managed_manual_proof-}" = direct-host ]; then
+  restore_direct_overlay_status "$logs/managed-install.json"
+else
+  jq '.items[]|select(.kind=="Role" and .metadata.name=="rhiza-operator")' "$logs/managed-install.json" | k -n "$namespace" apply --validate=strict -f -
+fi
 k -n "$namespace" get serviceaccounts,roles,rolebindings -o jsonpath='{range .items[*]}{.kind}{" "}{.metadata.name}{"\n"}{end}' > "$logs/public-rbac-names.txt"
 k -n "$namespace" wait --for=condition=Ready pod -l "$selector" --timeout=180s
 k -n "$namespace" get rhizacluster sql -o json > "$logs/committed.json"
@@ -513,10 +532,20 @@ run_client insert-sql execute '{"request_id":"bootstrap-insert","sql":"INSERT IN
 managed_initial_ack_oracle "$logs/insert-sql.json" insert_ack
 run_client query query '{"sql":"SELECT id, value FROM bootstrap_ci"}'
 managed_bootstrap_check initial query_rows "$logs/query.json" '.rows==[[1,"real-kubelet"]]'
+if [ "${published_install_only-false}" = true ]; then
+  k -n "$namespace" get deployments -l "$selector" -o json > "$logs/installed-deployments.json"
+  jq -e --arg uid "$uid" '.items|length==1 and any(.[0].metadata.ownerReferences[]; .kind=="RhizaCluster" and .uid==$uid and .controller==true)' "$logs/installed-deployments.json" >/dev/null
+  jq -e --arg image "$image" '.items|length==3 and all(.[]; any(.status.conditions[]; .type=="Ready" and .status=="True") and (.status.containerStatuses|length)==1 and all(.status.containerStatuses[]; .restartCount==0) and ([.status.initContainerStatuses[]|select(.state.terminated.exitCode==0)]|length)==2 and all(.spec.volumes[]; has("persistentVolumeClaim")|not) and all(.spec.containers[],.spec.initContainers[]; .image==$image))' "$logs/ready-pods.json" >/dev/null
+  printf 'image=%s\n' "$image" > "$logs/published-image.txt"
+  printf '%s\n' 'PASS: published-image managed install: status-free CR -> owned Deployment -> three Ready NoPVC Pods -> committed SQL ACK and exact readback' 'SCOPE: installation only; Rust/CABI, Pod replacement, C3/C5 and Chaos are not executed or qualified by this mode' > "$logs/published-install-result.txt"
+  return 0
+fi
 if [ "$fixture_case" != legacy ]; then
+  managed_bootstrap_check initial restart_zero "$logs/ready-pods.json" 'all(.items[]; all(.status.containerStatuses[]; .restartCount==0))'
+fi
+if [ "$fixture_case" != legacy ] && [ "${managed_manual_proof-}" != vcluster ]; then
   producer_uid=$(jq -er '.status.bootstrapPlan.members|sort_by(.member.node_id)|.[0].podUID' "$logs/committed.json")
   producer_pod=$(jq -er --arg uid "$producer_uid" '.items[]|select(.metadata.uid==$uid)|.metadata.name' "$logs/ready-pods.json")
-  managed_bootstrap_check initial restart_zero "$logs/ready-pods.json" 'all(.items[]; all(.status.containerStatuses[]; .restartCount==0))'
   k -n "$namespace" logs "$producer_pod" -c sql > "$logs/rust-mixed-prefault.log"
   if [ "$fixture_family" = internal ]; then
     [ "$(grep -Fxc 'RHIZA_ACTUAL_MATERIALIZATION_PROFILE=9' "$logs/rust-mixed-prefault.log")" = 1 ]
@@ -544,14 +573,18 @@ cmp "$logs/immutable-before.json" "$logs/immutable-after.json"
 # process or outstanding object-store request has physically terminated.
 old_pod=$(jq -r '.items|sort_by(.metadata.name)|.[0].metadata.name' "$logs/ready-pods.json")
 old_uid=$(jq -r --arg name "$old_pod" '.items[]|select(.metadata.name==$name)|.metadata.uid' "$logs/ready-pods.json")
-if [ "$fixture_case" != legacy ]; then
+if [ "$fixture_case" != legacy ] && [ "${managed_manual_proof-}" != vcluster ]; then
   old_pod=$producer_pod old_uid=$producer_uid
   k -n "$namespace" get pod "$old_pod" -o json > "$logs/rust-mixed-producer-before.json"
   jq -e --arg uid "$producer_uid" '.metadata.uid==$uid and any(.status.containerStatuses[]; .name=="sql" and .ready==true and .restartCount==0)' "$logs/rust-mixed-producer-before.json" >/dev/null
 fi
 old_node=$(jq -er --arg uid "$old_uid" '.status.bootstrapPlan.members[]|select(.podUID==$uid)|.member.node_id' "$logs/committed.json")
 managed_pod_fault "$old_pod" "$old_uid"
-managed_preserve_first_pod_fault "$logs" "$old_pod" "$old_uid"
+case ${managed_manual_proof-} in
+  '') managed_preserve_first_pod_fault "$logs" "$old_pod" "$old_uid" ;;
+  vcluster|direct-host) managed_verify_first_manual_pod_fault "$old_pod" "$old_uid" ;;
+  *) return 1 ;;
+esac
 attempt=0
 until k -n "$namespace" get rhizacluster sql -o json > "$logs/replacement-status.json" &&
   managed_completed_repair_oracle "$logs/replacement-status.json" "$old_uid" "$old_node"; do

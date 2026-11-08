@@ -186,7 +186,7 @@ db.execute(&request)?.require_committed()?;
 `ManagedDb` deliberately has no generic operation escape hatch, local mode,
 or legacy operator listener or membership methods. It exposes typed SQL, KV,
 and Graph methods. The released managed HA profiles are explicit append-only 9/10,
-generation 0, with `before_ack` durability; see the
+generation 0, with `before-ack` durability; see the
 [managed request contract](../../docs/managed-internal-request-api.md) and
 [managed Graph HA boundary](../../docs/managed-graph-ha.md).
 `ready()` checks managed admission; `recover_pending()` resolves the retained
@@ -194,9 +194,11 @@ original pending request, while `recover_request` selects an exact kind and ID.
 If the per-handle hint is missing or ambiguous, use `recover_request` with the
 known original kind and request ID; the engine must still retain that original.
 Writes are never automatically retried with a new request ID. An
-`Error` such as `commit_unknown` does not establish rollback; preserve the
-original request ID and use `recover_pending()` before deciding what to submit
-next. Calls use the native bridge's 30-second default timeout.
+`Error` such as `commit_unknown` does not establish rollback. Preserve the
+original kind, raw request ID, intent, and any known slot. Use
+`recover_request(kind, request_id)` to resolve that exact retained original;
+do not resubmit the mutation as recovery. Calls use the native bridge's
+30-second default timeout.
 
 ## Prebuilt native archives
 

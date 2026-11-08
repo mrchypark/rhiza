@@ -24,12 +24,25 @@ activation authority. Automatic generation DR is not implemented or qualified.
 
 ## Separate opt-in manual live-cluster qualification
 
-The manual `HA managed Kubernetes Chaos Mesh` workflow is a separate driver for
-the published release and its immutable operator image. The automated six-lane
-run above is not evidence that this manual workflow ran. Run the manual driver
-only after the release image has published; it does not rebuild an application
-image or substitute a different harness revision. Its scope below uses a
-disposable namespace and local S3 emulator, not live GCS or Azure storage.
+The manual `HA managed Kubernetes Chaos Mesh` workflow is separate from the
+six-lane run above. It does not rebuild the application image. All modes use a
+disposable namespace and an in-namespace S3 emulator, not live GCS or Azure:
+
+- `release` uses the published tag's harness and the immutable release operator
+  image with matching source revision. The tag must contain the reference-host
+  manual evidence path; older tags such as v0.23.2 are refused before cluster
+  execution rather than paired with a different harness revision.
+- `candidate` uses the exact protected-main source and matching candidate
+  operator image. Both this mode and `release` use the virtual-cluster driver
+  described below.
+- `candidate-direct-host` uses the exact protected-main source and matching
+  `managed-ffi-contract` candidate image in a pre-created host namespace. It
+  requires the preinstalled v1alpha2 RhizaCluster API and does not install CRDs
+  or use vcluster. It is not qualification of the published operator image.
+
+The vcluster modes check reference-host SQL, not Rust/C ABI. The direct-host
+mode retains its Rust/C ABI checks. Manual modes use scoped Chaos records and
+Pod API observations, not the Kind workflow's host CRI proof.
 
 The administrator creates a fresh `rhiza-ha-chaos-*` namespace and short-lived
 namespace-only Kubernetes service account. Upload its kubeconfig as temporary
@@ -51,6 +64,21 @@ after the run. No cluster-scoped Namespace GET grant is needed.
 No permission to create Namespace, Node, CRD, ClusterRole,
 IAM, storage buckets or other namespaces is permitted. Auth expiry must cover
 the workflow's 20-minute ceiling and cleanup, but not exceed one hour.
+Direct-host requires exclusive use of the dedicated namespace for the run. It
+preflights fixture names, creates its overlay without adopting existing objects,
+and uses the returned UIDs as deletion preconditions for the overlay and CR.
+Unconfirmed overlay or CR creations are left for the administrator. Cleanup of
+the other exact, preflighted fixture names depends on exclusive namespace use.
+
+For direct-host only, the runner needs `get`, `list`, `watch`, `create`, and
+`delete` on `rhizaclusters` in the `rhiza.mrchypark.dev` API group in that
+namespace. The fixture uses `watch` when waiting for the `sql` CR to disappear.
+The runner also needs `get` and `update` on `rhizaclusters/status` to delegate
+those verbs to the operator and managed Host Roles. No `update` or `patch` on the
+main `rhizaclusters` resource is needed. The direct-host projection removes
+unused Recovery API rules; the runner must already be allowed to delegate the
+remaining namespace rules. Do not grant `escalate` or `bind` to bypass an RBAC
+refusal.
 
 The parent verifies the namespace UID; the driver verifies the original
 ServiceAccount UID and namespace emptiness, then installs the OSS
@@ -75,7 +103,8 @@ bound Pod count, CPU and memory for containers without explicit requests.
 The administrator must set and monitor a bounded runtime and cost budget; the maximum is not a spending target.
 
 The existing managed bootstrap fixture is shared with Kind qualification. Its
-runtime, init and main containers all use the exact released digest. Storage is
+operator, init and main containers all use the digest verified for the selected
+mode. Storage is
 the disposable in-namespace pinned Floci S3 adapter, not MinIO or live GCS.
 Actual SDK creation uses the existing Go helper through a loopback port-forward;
 it has no ambient cloud credential fallback.
@@ -83,11 +112,15 @@ it has no ambient cloud credential fallback.
 For each fault the driver matches the virtual Pod's exact name, namespace and UID
 against the vcluster host annotations, requiring exactly one ready host Pod.
 Chaos Mesh targets only that host namespace/name and virtual-UID annotation.
+Direct-host checks the exact Pod UID before submitting a namespace/name-scoped
+fault; this check is not atomic with Chaos selection or proof of physical
+termination.
 It records host UID/containerID and virtual Pod observations; names are not
-guessed. `pod-kill` must result in a new virtual Pod UID and Completed certified
-repair. There is no fallback virtual Pod deletion to manufacture that outcome.
-Then `container-kill` must increase restartCount in the same replacement Pod and
-preserve repair origin, adoption and voter identity hashes. Both experiments
+guessed. Two sequential `pod-kill` actions must each result in a new Pod UID
+and Completed certified repair; the second targets the first replacement.
+There is no fallback virtual Pod deletion to manufacture that outcome.
+Then `container-kill` must increase restartCount in the second replacement Pod
+without changing its UID, repair origin, adoption or voter identity hashes. All three actions
 require `AllInjected=True` and exactly one matching injected container record,
 followed by the observed runtime turnover. These kill actions are one-shot:
 the driver records and deletes each fault object and verifies its absence

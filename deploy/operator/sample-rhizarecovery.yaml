@@ -1,6 +1,5 @@
-# Illustrative only. Read the live binding and exact fresh cluster UID before
-# creating a request; generation 0 and this UID are placeholders, not authority.
-# When supported, submit with strict server-side field validation.
+# Schema example only. Submitting it does not run restore or activate a generation.
+# Generation 0 and this UID are placeholders, not live binding or authority.
 apiVersion: rhiza.mrchypark.dev/v1alpha2
 kind: RhizaRecovery
 metadata:

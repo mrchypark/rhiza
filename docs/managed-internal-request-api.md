@@ -84,6 +84,6 @@ Qualification must distinguish Go normal/race checks, actual provider-SDK
 checks, native Rust/C ABI execution, and scoped Pod/Chaos Mesh experiments.
 None establishes production-cloud parity or recovery from every partition.
 The normal profiles require generation 0, append-only object data, and
-`before_ack` object-store durability. No online HA delete GC or automatic
+`before-ack` object-store durability. No online HA delete GC or automatic
 old-profile migration is implied. See [managed HA](managed-graph-ha.md) for
 NoPVC restoration and deployment boundaries.

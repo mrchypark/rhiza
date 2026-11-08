@@ -1,0 +1,66 @@
+name: Published operator CR installation
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [feature/operator-cr-deployment]
+
+permissions:
+  contents: read
+
+jobs:
+  install:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+      - name: Install pinned Kind
+        run: go install sigs.k8s.io/kind@v0.32.0
+      - name: Prepare pinned YAML renderer
+        shell: sh
+        run: |
+          set -eu
+          mkdir -p "$RUNNER_TEMP/operator-install-tools"
+          curl --fail --silent --show-error --location --max-time 60 https://github.com/mikefarah/yq/releases/download/v4.45.1/yq_linux_amd64 -o "$RUNNER_TEMP/operator-install-tools/yq"
+          printf '%s  %s\n' 654d2943ca1d3be2024089eb4f270f4070f491a0610481d128509b2834870049 "$RUNNER_TEMP/operator-install-tools/yq" | sha256sum --check
+          chmod 0755 "$RUNNER_TEMP/operator-install-tools/yq"
+          printf '%s\n' "$RUNNER_TEMP/operator-install-tools" >> "$GITHUB_PATH"
+      - name: Check installation harness cleanup without a cluster
+        run: |
+          sh -n scripts/test-ha-managed-bootstrap.sh
+          sh -n scripts/ha-managed-bootstrap-fixture.sh
+          sh scripts/test-ha-managed-bootstrap.sh --private-cleanup-self-test
+          sh scripts/test-ha-managed-bootstrap.sh --install-mode-self-test
+      - name: Install the published reference host through a CR
+        env:
+          RHIZA_MANAGED_FIXTURE_CASE: internal
+          RHIZA_MANAGED_FIXTURE_PROVIDER: s3
+          RHIZA_MANAGED_BUCKET_SETUP: ./scripts/ha-managed-bucket-setup
+          RHIZA_MANAGED_PUBLISHED_INSTALL_ONLY: "true"
+          EXPECTED_PUBLISHED_IMAGE: ghcr.io/mrchypark/rhiza-operator@sha256:2f7752353aa8796a074cf8cf3d91102f206d30cc0628cfd5fff4fcd37e555f40
+        shell: sh
+        run: |
+          set -eu
+          sh scripts/test-ha-managed-bootstrap.sh
+          grep -Fx "image=$EXPECTED_PUBLISHED_IMAGE" "$RUNNER_TEMP/ha-managed-published-install/published-image.txt"
+          grep -Fx 'PASS: published-image managed install: status-free CR -> owned Deployment -> three Ready NoPVC Pods -> committed SQL ACK and exact readback' "$RUNNER_TEMP/ha-managed-published-install/published-install-result.txt"
+      - name: Preserve non-secret installation evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: operator-managed-install-${{ github.run_id }}
+          path: ${{ runner.temp }}/ha-managed-published-install
+          if-no-files-found: warn
+      - name: Remove owned YAML renderer
+        if: always()
+        shell: sh
+        run: |
+          set -eu
+          if [ -d "$RUNNER_TEMP/operator-install-tools" ]; then
+            rm -f "$RUNNER_TEMP/operator-install-tools/yq"
+            rmdir "$RUNNER_TEMP/operator-install-tools"
+            test ! -e "$RUNNER_TEMP/operator-install-tools"
+          fi

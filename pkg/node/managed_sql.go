@@ -301,6 +301,45 @@ func managedSQLControlOnly(value []byte) error {
 	return nil
 }
 
+// verifyManagedGraphBootstrapControl checks the exact imported, untrimmed
+// prefix. A published READ is not application-start history, and this check
+// grants no permission to serve application operations without a QCKP.
+func (n *Node) verifyManagedGraphBootstrapControl(ctx context.Context, tip quepaxa.Slot) error {
+	i := n.managedStartup.Identity
+	checker, ok := n.managedStartup.Checker.(managedGraphBootstrapChecker)
+	if !ok || i.ApplicationProtocol != sqlpolicy.ManagedGraphRequestAppendOnlyApplicationProtocol ||
+		i.Member.Generation != 0 || n.config.Learner != nil || n.managedStartup.Prepared != nil || !n.core.IsVoter() ||
+		n.archive == nil || n.archive.Sealed() || tip == 0 || n.archive.Tip() != tip {
+		return fmt.Errorf("managed Graph control bootstrap requires an original and its complete published prefix")
+	}
+	want, prefix, err := n.managedSQLScope(i)
+	if err != nil {
+		return err
+	}
+	birth, err := readVoterRegistration(ctx, n.bucket, path.Join(prefix, "voters/managed-sql-initialization.json"))
+	if err != nil || !bytes.Equal(birth, want) {
+		return errors.Join(fmt.Errorf("managed Graph control bootstrap provenance changed"), err)
+	}
+	started, err := readVoterRegistration(ctx, n.bucket, path.Join(prefix, "voters/managed-sql-application-start.json"))
+	if err != nil {
+		return err
+	}
+	if started != nil {
+		return fmt.Errorf("managed Graph control bootstrap cannot cross application start")
+	}
+	for slot := quepaxa.Slot(1); slot <= tip; slot++ {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		decision, found := n.core.CertifiedValue(slot)
+		barrier, err := types.DecodeReadBarrier(decision.Value)
+		if !found || len(decision.Certificate) == 0 || err != nil || !barrier {
+			return fmt.Errorf("managed Graph control bootstrap requires a certified READ prefix")
+		}
+	}
+	return checker.ValidateManagedGraphBootstrapControl(ctx, i)
+}
+
 // InspectManagedSQL rejects histories outside this bounded SQL-only host. An
 // unresolved recorder is never empty-state proof, even when SQLite is empty.
 func (n *Node) InspectManagedSQL(ctx context.Context, fresh bool) (ManagedSQLSnapshot, error) {
