@@ -9,6 +9,57 @@ import (
 	"testing"
 )
 
+func TestWALAppendScratchPreservesRecords(t *testing.T) {
+	dir := t.TempDir()
+	wal, err := Open(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		if wal != nil {
+			_ = wal.Close()
+		}
+	})
+	entries := []Entry{
+		{Slot: 1, Type: EntryReceipt, Payload: []byte("first")},
+		{Slot: 2, Type: EntryProposal, Payload: bytes.Repeat([]byte{0x42}, 64<<10)},
+		{Slot: 3, Type: EntryDecide, Payload: []byte("third")},
+	}
+	if err := wal.Append(entries[0]); err != nil {
+		t.Fatal(err)
+	}
+	scratch := &wal.appendScratch[:1][0]
+	for _, entry := range entries[1:] {
+		if err := wal.Append(entry); err != nil {
+			t.Fatal(err)
+		}
+		if &wal.appendScratch[:1][0] != scratch {
+			t.Fatal("large or same-size append replaced the small-record buffer")
+		}
+	}
+	if err := wal.Close(); err != nil {
+		t.Fatal(err)
+	}
+	wal = nil
+	reopened, err := Open(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer reopened.Close()
+	got, err := reopened.Read()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != len(entries) {
+		t.Fatalf("read %d records, want %d", len(got), len(entries))
+	}
+	for i, want := range entries {
+		if !bytes.Equal(got[i].Encode(), want.Encode()) {
+			t.Fatalf("record %d did not survive append and reopen", i)
+		}
+	}
+}
+
 func TestWALCapacityFailsClosedAndScanStreams(t *testing.T) {
 	wal, err := Open(t.TempDir())
 	if err != nil {

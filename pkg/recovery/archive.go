@@ -1078,7 +1078,7 @@ func (m *Manager) confirmPublicationLease(ctx context.Context) error {
 		m.traceArchiveBusy(ctx, "unknown", m.publicationLockKey(), "missing_lease_context", "site", true)
 		return ErrArchiveBusy
 	}
-	current, err := m.readArchiveLock(ctx, m.publicationLockKey())
+	current, err := m.readArchiveLockVersion(ctx, m.publicationLockKey(), &lease)
 	if err != nil {
 		return err
 	}
@@ -2087,9 +2087,21 @@ func (m *Manager) readGCLock(ctx context.Context) (*archiveGCLock, error) {
 }
 
 func (m *Manager) readArchiveLock(ctx context.Context, key string) (*archiveGCLock, error) {
-	attributes, data, _, err := m.readStableObject(ctx, key, nil, false, maxHeadSize)
+	return m.readArchiveLockVersion(ctx, key, nil)
+}
+
+func (m *Manager) readArchiveLockVersion(ctx context.Context, key string, known *archiveGCLock) (*archiveGCLock, error) {
+	var version *objstore.ObjectVersion
+	if known != nil {
+		version = known.version
+	}
+	attributes, data, unchanged, err := m.readStableObject(ctx, key, version, false, maxHeadSize)
 	if err != nil {
 		return nil, err
+	}
+	if unchanged {
+		// The version binds the fields decoded when the lease was acquired.
+		return known, nil
 	}
 	var lock archiveGCLock
 	if err := json.Unmarshal(data, &lock); err != nil {

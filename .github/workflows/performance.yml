@@ -417,6 +417,18 @@ jobs:
           done
           printf '## E2E cost matrix (%s)\n\nAll 36 samples passed: SQL, Graph, and KV × Async and BeforeAck × two revisions × three runs. Raw result and process logs are attached.\n' "$RHIZA_SERVER_BENCH_PROVIDER" >>"$GITHUB_STEP_SUMMARY"
 
+      - name: Compare WAL append allocations separately from E2E measurements
+        if: ${{ inputs.e2e_cost_provider != 'gcs' }}
+        run: |
+          evidence="$RUNNER_TEMP/rhiza-e2e-cost"
+          for revision in base candidate; do
+            (
+              cd "$RUNNER_TEMP/rhiza-e2e-$revision"
+              go test ./pkg/qlog -run '^$' -bench '^BenchmarkWALAppendSync$' -benchtime=300ms -count=3 -benchmem
+            ) | tee "$evidence/wal-append-$revision.txt"
+            grep -Eq '^BenchmarkWALAppendSync-[0-9]+[[:space:]]' "$evidence/wal-append-$revision.txt"
+          done
+
       - name: Profile Graph apply separately from E2E measurements
         if: ${{ inputs.e2e_cost_provider != 'gcs' }}
         working-directory: ${{ runner.temp }}/rhiza-e2e-candidate

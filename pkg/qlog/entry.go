@@ -43,10 +43,12 @@ type Entry struct {
 
 // Encode serializes an entry to bytes with CRC32 checksum.
 func (e Entry) Encode() []byte {
-	payloadLen := len(e.Payload)
 	// Layout: Slot(8) + Hash(32) + Type(1) + PayloadLen(4) + RecordCRC(4) + HeaderCRC(4) + Payload
-	buf := make([]byte, 0, entryHeaderSize+payloadLen)
+	return e.encode(make([]byte, 0, entryHeaderSize+len(e.Payload)))
+}
 
+// encode writes one record into an empty buffer owned by the caller.
+func (e Entry) encode(buf []byte) []byte {
 	// Slot
 	buf = binary.LittleEndian.AppendUint64(buf, e.Slot)
 
@@ -57,7 +59,7 @@ func (e Entry) Encode() []byte {
 	buf = append(buf, byte(e.Type))
 
 	// Payload length
-	buf = binary.LittleEndian.AppendUint32(buf, uint32(payloadLen)|entryLengthMarker)
+	buf = binary.LittleEndian.AppendUint32(buf, uint32(len(e.Payload))|entryLengthMarker)
 
 	// The marker rejects bytes written by any other WAL layout.
 	buf = binary.LittleEndian.AppendUint32(buf, 0)

@@ -37,6 +37,7 @@ type WAL struct {
 	maxBytes       int64
 	totalBytes     int64
 	identity       []byte
+	appendScratch  []byte
 	dirty          bool
 	fatal          error
 	readOnly       bool
@@ -49,6 +50,9 @@ type WAL struct {
 }
 
 var ErrCapacity = errors.New("WAL capacity reached")
+
+// Keep large payloads out of the per-WAL scratch buffer.
+const maxAppendScratch = 64 << 10
 
 // localWALCrashBoundary is a package-private subprocess-test seam. Production
 // leaves it nil; callbacks must not be used for WAL behavior or error policy.
@@ -676,13 +680,13 @@ func (w *WAL) Append(entry Entry) error {
 		return w.fatal
 	}
 
-	data := entry.Encode()
-	if w.maxBytes > 0 && int64(len(data)) > w.maxBytes-w.bytesLocked() {
-		return fmt.Errorf("%w: used=%d append=%d max=%d", ErrCapacity, w.bytesLocked(), len(data), w.maxBytes)
+	size := entryHeaderSize + len(entry.Payload)
+	if w.maxBytes > 0 && int64(size) > w.maxBytes-w.bytesLocked() {
+		return fmt.Errorf("%w: used=%d append=%d max=%d", ErrCapacity, w.bytesLocked(), size, w.maxBytes)
 	}
 
 	// Roll over if needed
-	if w.current != nil && w.current.offset+int64(len(data)) > w.maxSize {
+	if w.current != nil && w.current.offset+int64(size) > w.maxSize {
 		if err := w.createSegment(w.current.index + 1); err != nil {
 			return err
 		}
@@ -697,6 +701,15 @@ func (w *WAL) Append(entry Entry) error {
 	w.current.mu.Lock()
 	defer w.current.mu.Unlock()
 
+	var data []byte
+	if size <= maxAppendScratch {
+		if cap(w.appendScratch) < size {
+			w.appendScratch = make([]byte, 0, min(maxAppendScratch, max(size, 2*cap(w.appendScratch))))
+		}
+		data = entry.encode(w.appendScratch[:0])
+	} else {
+		data = entry.Encode()
+	}
 	n, err := w.writeAt(w.current.file, data, w.current.offset)
 	if err != nil || n != len(data) {
 		if err == nil {
@@ -785,7 +798,7 @@ func (w *WAL) EstimateCompactedBytes(base Entry, retainedValues map[[32]byte][]b
 	w.mu.RUnlock()
 	var size uint64
 	err := visitCompactedEntries(base, retainedValues, prefix, func(entry Entry) error {
-		encoded := uint64(len(entry.Encode()))
+		encoded := entryHeaderSize + uint64(len(entry.Payload))
 		if size > ^uint64(0)-encoded {
 			return fmt.Errorf("compacted WAL size overflow")
 		}

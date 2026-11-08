@@ -81,10 +81,9 @@ func TestPublicationReleaseUsesConfirmedVersion(t *testing.T) {
 			if mode == "normal" && err != nil || mode != "normal" && !errors.Is(err, ErrArchiveBusy) {
 				t.Fatalf("release error in %s = %v", mode, err)
 			}
-			// One missing Attributes, then acquire and final confirmation
-			// each use two Attributes and one GET. Release uses one PUT only.
-			if calls != 1 || bucket.heads.Load() != 5 || bucket.gets.Load() != 2 || bucket.puts.Load() != 2 {
-				t.Fatalf("work/Attributes/GET/PUT = %d/%d/%d/%d; want 1/5/2/2", calls, bucket.heads.Load(), bucket.gets.Load(), bucket.puts.Load())
+			// Missing, acquisition readback, then one version check. Release is a PUT only.
+			if calls != 1 || bucket.heads.Load() != 4 || bucket.gets.Load() != 1 || bucket.puts.Load() != 2 {
+				t.Fatalf("work/Attributes/GET/PUT = %d/%d/%d/%d; want 1/4/1/2", calls, bucket.heads.Load(), bucket.gets.Load(), bucket.puts.Load())
 			}
 			reader := NewManager(base, "cluster", 1)
 			defer reader.Close()
@@ -101,5 +100,33 @@ func TestPublicationReleaseUsesConfirmedVersion(t *testing.T) {
 				t.Fatalf("publisher lock was not expired as expected: %+v", stored)
 			}
 		})
+	}
+}
+
+func TestPublicationConfirmationRechecksChangedLease(t *testing.T) {
+	manager := NewManager(objstore.NewInMemBucket(), "cluster", 1)
+	defer manager.Close()
+	key := manager.publicationLockKey()
+	ctx := t.Context()
+	lease, err := manager.acquireArchiveLock(ctx, key, "publisher", time.Minute)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx = context.WithValue(ctx, publicationLeaseContextKey{}, *lease)
+	renewed, err := manager.renewArchiveLock(ctx, key, lease, 2*time.Minute)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := manager.confirmPublicationLease(ctx); err != nil {
+		t.Fatalf("renewed lease: %v", err)
+	}
+	successor := *renewed
+	successor.OwnerID = "successor"
+	successor.Generation++
+	if err := manager.writeArchiveLock(ctx, key, successor, objstore.WithIfMatch(renewed.version)); err != nil {
+		t.Fatal(err)
+	}
+	if err := manager.confirmPublicationLease(ctx); !errors.Is(err, ErrArchiveBusy) {
+		t.Fatalf("superseded lease returned %v, want ErrArchiveBusy", err)
 	}
 }
