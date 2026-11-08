@@ -368,11 +368,14 @@ jobs:
           {
             printf 'base_sha=%s\ncandidate_sha=%s\nharness_sha=%s\n' "$BASE_SHA" "$CANDIDATE_SHA" "$(git rev-parse HEAD)"
             printf 'object_store_provider=%s\n' "$RHIZA_SERVER_BENCH_PROVIDER"
-            printf 'requests=%s\nconcurrency=%s\nsamples_per_cell=3\n' "$RHIZA_SERVER_BENCH_REQUESTS" "$RHIZA_SERVER_BENCH_CONCURRENCY"
+            printf 'requests=%s\nconcurrency=%s\n' "$RHIZA_SERVER_BENCH_REQUESTS" "$RHIZA_SERVER_BENCH_CONCURRENCY"
             if [[ $SQL_ASYNC_ISOLATION == true ]]; then
+              printf 'samples_per_cell=8\n'
               for role in base wal lease candidate; do
                 printf '%s_tree=%s\n' "$role" "$(git -C "$RUNNER_TEMP/rhiza-e2e-$role" write-tree)"
               done
+            else
+              printf 'samples_per_cell=3\n'
             fi
             printf 'runner_image=%s-%s\n' "$ImageOS" "$ImageVersion"
             go version

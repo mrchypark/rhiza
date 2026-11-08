@@ -105,6 +105,30 @@ benchmark_resources() {
 		end'
 }
 
+sample_benchmark_host() {
+	local proc=$1 kind line cpu=null io=null steal=null
+	local -a stat
+	for kind in cpu io; do
+		if { read -r line; } 2>/dev/null < "$proc/pressure/$kind" &&
+			[[ $line =~ ^some[[:space:]].*[[:space:]]total=(0|[1-9][0-9]*)$ ]]; then
+			printf -v "$kind" '%s' "${BASH_REMATCH[1]}"
+		fi
+	done
+	if { read -ra stat; } 2>/dev/null < "$proc/stat" &&
+		[[ ${stat[0]:-} == cpu && ${stat[8]:-} =~ ^(0|[1-9][0-9]*)$ ]]; then
+		steal=${stat[8]}
+	fi
+	printf '[%s,%s,%s]\n' "$cpu" "$io" "$steal"
+}
+
+benchmark_host_pressure() {
+	jq -nc --argjson before "$1" --argjson after "$2" '
+		def delta($i):
+			if $before[$i] == null or $after[$i] == null or $after[$i] < $before[$i]
+			then null else $after[$i] - $before[$i] end;
+		{cpu_some_us:delta(0),io_some_us:delta(1),cpu_steal_ticks:delta(2)}'
+}
+
 inject_benchmark_fault() {
 	if ! jobs -pr | grep -qx "$failed_pid"; then
 		printf 'fault target is not a current owned running child; refusing injection\n' >&2
@@ -443,6 +467,7 @@ fi
 resource_before=null
 resource_summary=null
 resource_status=not_collected_non_linux
+host_pressure=null
 sample_benchmark_voters() {
 	local i pid
 	for i in 0 1 2; do
@@ -470,6 +495,7 @@ elif [[ $(uname -s) == Linux ]]; then
 	[[ $resource_hz =~ ^[1-9][0-9]*$ ]]
 	resource_before=$(sample_benchmark_voters)
 	resource_status=measured
+	host_before=$(sample_benchmark_host /proc)
 fi
 "$run_dir/rhiza-bench" -url "$target" -path "$request_path" -body "$request_body" \
 	-n "$requests" -c "$concurrency" -commit-unknown-retries 3 "$oracle_flag" "${control_args[@]+${control_args[@]}}" >"$result_file" &
@@ -508,12 +534,16 @@ if [[ $failed_node != none ]]; then
 	fi
 fi
 wait_benchmark_child
+if [[ $resource_status == measured ]]; then
+	host_after=$(sample_benchmark_host /proc)
+fi
 result=$(<"$result_file")
 # Preserve the client result even when the subsequent correctness gate fails.
 tee "$output_file" <<<"$result" >/dev/null
 if [[ $resource_status == measured ]]; then
 	resource_after=$(sample_benchmark_voters)
 	resource_summary=$(benchmark_resources "$resource_before" "$resource_after" "$resource_hz")
+	host_pressure=$(benchmark_host_pressure "$host_before" "$host_after")
 fi
 result_with_exit=$(jq --argjson status "$fault_exit_status" '. + {fault_exit_status:$status}' <<<"$result")
 tee "$output_file" <<<"$result_with_exit" >/dev/null
@@ -603,9 +633,10 @@ done
 jq -nc --argjson result "$result" --argjson count "$count" --argjson overlap "$overlap" --argjson fault_exit_status "$fault_exit_status" --arg client_revision "$client_revision" --arg client_sha256 "$client_sha256" --argjson concurrency "$concurrency" --argjson runtime_failure_lines "$runtime_failure_lines" --argjson max_fault_latency_ms "$max_fault_latency_ms" --argjson object_delta "$object_delta" --argjson object_metric_nodes "$object_metric_nodes" --arg failed_node "$failed_node" --arg target_node "$target_node" --arg durability "$durability" --arg fault_after "$fault_after" \
 	'{transport:"HTTP client + three QUIC voters",client_revision:$client_revision,client_sha256:$client_sha256,receipt_oracle:"sql-insert-id-v1",fault_overlap:$overlap,fault_exit_status:$fault_exit_status,fault_instrumentation:(if $failed_node == "none" then "disabled" else "pidfd-single-coordinator-monotonic-interval-v2" end),durability_mode:$durability,ack_contract:(if $durability == "before-ack" then "quorum WAL sync and object-store durability before acknowledgement" else "quorum WAL sync; object-store publication async" end),failure_mode:(if $failed_node == "none" then "healthy" else "peer-sigkill-during-load" end),failed_node:$failed_node,target_node:$target_node,fault_after:(if $failed_node == "none" then null else $fault_after end),max_fault_latency_ms:(if $failed_node == "none" then null else $max_fault_latency_ms end),concurrency:$concurrency,object_metric_nodes:$object_metric_nodes,object_measurement:"after schema through final linearizable verification",object_store_delta:$object_delta,runtime_failure_lines:$runtime_failure_lines,result:$result,verification:$count}' \
 	| jq -c --arg status "$resource_status" --argjson resources "$resource_summary" \
+		--argjson host_pressure "$host_pressure" \
 		--arg workload "$workload" --arg oracle "$receipt_oracle" --argjson writes "$write_object_delta" --argjson publication "$publication" \
 		--arg provider "$provider" --argjson gcs_classes "$gcs_classes" \
-		'. + {workload:$workload,receipt_oracle:$oracle,voter_resource_status:$status,voter_resources:$resources,
+		'. + {workload:$workload,receipt_oracle:$oracle,voter_resource_status:$status,voter_resources:$resources,host_pressure:$host_pressure,
 			write_object_store_delta:$writes,async_publication:$publication,object_store_provider:$provider,gcs_request_classes:$gcs_classes}
 		 | if $workload != "sql" then .object_measurement = "after setup through final verification" else . end' \
 	| tee "$output_file"

@@ -255,4 +255,36 @@ Local full recovery and QLog tests and focused race tests passed. The initial
 combined local command passed QLog but reached its 55-second timeout in
 QuePaxa. Focused QuePaxa recording, recovery, and quorum tests passed; the
 [full functional CI](https://github.com/mrchypark/rhiza/actions/runs/42473464663)
-ran against the exact candidate.
+passed all seven jobs against the exact candidate.
+
+## GCS SQL Async: separate WAL and lease changes
+
+[Run 42474927651](https://github.com/mrchypark/rhiza/actions/runs/42474927651)
+tested the same base and candidate plus WAL-only and lease-only trees. It ran
+eight blocks of four samples in rotating order on one runner. All 32 samples
+passed the exact receipt and row checks for 1,000 writes with zero errors.
+The [raw artifact](https://github.com/mrchypark/rhiza/actions/runs/42474927651/artifacts/13615127499)
+contains exact trees, metrics, and logs. Its `samples_per_cell=3` is stale
+metadata inherited from the full matrix; the isolation loop ran eight samples
+per variant.
+
+| Variant | Writes/s | p99 (ms) | Voter CPU (s) | Largest voter HWM (MiB) |
+| --- | ---: | ---: | ---: | ---: |
+| Baseline | 1,432 | 85.93 | 0.735 | 96.71 |
+| WAL only | 1,461 | 115.16 | 0.705 | 90.44 |
+| Lease only | 1,370 | 84.53 | 0.730 | 97.41 |
+| Both | 1,602 | 57.37 | 0.710 | 96.55 |
+
+These are medians of the eight run-level observations per variant. Comparing
+both changes against baseline *within each block*, the median paired change
+was +5.82% p99 and +10.67% throughput. The paired result differs from the
+unpaired column medians. Two blocks had p99 above 131 ms for every variant.
+That shows variation shared by revisions, but does not identify runner CPU
+contention, I/O stalls, or any particular Rhiza path as the cause.
+The five slowest samples had p99 between 280 and 519 ms, but p50 remained
+8.0–8.6 ms and total voter CPU 0.73–0.75 s. This was a tail event rather
+than a comparable increase in median latency or measured voter CPU time.
+
+All timed writes used zero GCS requests. Forced publication still used 21
+requests without the lease change and 17 with it. The result does not justify
+changing the Async ACK or WAL sync contract to improve p99.

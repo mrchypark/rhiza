@@ -13,6 +13,19 @@ cleanup_test() {
 }
 trap 'test_status=$?; trap - EXIT; cleanup_test; exit "$test_status"' EXIT
 
+mkdir -p "$scratch/proc/pressure"
+printf 'some avg10=0.00 avg60=0.00 avg300=0.00 total=120\nfull avg10=0.00 avg60=0.00 avg300=0.00 total=2\n' > "$scratch/proc/pressure/cpu"
+printf 'some avg10=0.00 avg60=0.00 avg300=0.00 total=90\n' > "$scratch/proc/pressure/io"
+printf 'cpu  9 8 7 6 5 4 3 2 1 0\ncpu0 0 0 0 0 0 0 0 99\n' > "$scratch/proc/stat"
+host_before=$(sample_benchmark_host "$scratch/proc")
+[[ $host_before == '[120,90,2]' ]]
+benchmark_host_pressure "$host_before" '[127,90,5]' |
+	jq -e '. == {cpu_some_us:7,io_some_us:0,cpu_steal_ticks:3}' >/dev/null
+benchmark_host_pressure "$host_before" "$(sample_benchmark_host "$scratch/absent")" |
+	jq -e '. == {cpu_some_us:null,io_some_us:null,cpu_steal_ticks:null}' >/dev/null
+benchmark_host_pressure "$host_before" '[119,null,2]' |
+	jq -e '. == {cpu_some_us:null,io_some_us:null,cpu_steal_ticks:0}' >/dev/null
+
 # Unique INTEGER PRIMARY KEY rows: [0,4) is valid; shifted [1,5) has only 3
 # in-range rows despite total cardinality 4. Extra negative/out-of-range rows fail.
 verify_benchmark_rows 4 <<< '{"rows":[[4,4]]}'
@@ -308,18 +321,19 @@ for mode in normal shifted before-first after-last no-witness signal-failure wai
   [[ $status == 0 ]]
   jq -e '.fault_overlap.overlap == true and .fault_exit_status == 137 and .receipt_oracle == "sql-insert-id-v1" and (.client_sha256 | length == 64)' "$scratch/$mode/result.json" >/dev/null
   jq -e '.object_store_provider == "s3" and .gcs_request_classes == null' "$scratch/$mode/result.json" >/dev/null
-  jq -e '.voter_resource_status == "not_collected_fault_lane" and .voter_resources == null' "$scratch/$mode/result.json" >/dev/null
+  jq -e '.voter_resource_status == "not_collected_fault_lane" and .voter_resources == null and .host_pressure == null' "$scratch/$mode/result.json" >/dev/null
   grep -qx 'fault_exit_status=137' "$scratch/$mode/result-fault-metadata.txt"
  elif [[ $mode == healthy ]]; then
   [[ $status == 0 ]]
   jq -e '.voter_resource_status == "measured" and .voter_resources.clock_ticks_per_second == 100
     and ([.voter_resources.nodes[].node] == ["n0", "n1", "n2"])
+    and (.host_pressure | keys == ["cpu_some_us", "cpu_steal_ticks", "io_some_us"])
     and all(.voter_resources.nodes[]; .process_start_ticks == 123 and .cpu_user_ticks == 7 and .cpu_system_ticks == 2
       and .rss_kib_before == 500 and .rss_kib_after == 800
       and .lifetime_hwm_kib_before == 700 and .lifetime_hwm_kib_after == 1200)' "$scratch/$mode/result.json" >/dev/null
  elif [[ $mode == healthy-nonlinux ]]; then
   [[ $status == 0 ]]
-  jq -e '.voter_resource_status == "not_collected_non_linux" and .voter_resources == null' "$scratch/$mode/result.json" >/dev/null
+  jq -e '.voter_resource_status == "not_collected_non_linux" and .voter_resources == null and .host_pressure == null' "$scratch/$mode/result.json" >/dev/null
  elif [[ $mode == resource-* ]]; then
   [[ $status != 0 ]]
   if [[ $mode == resource-replaced ]]; then
