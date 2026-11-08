@@ -19,16 +19,31 @@ func TestManagedGraphAdmissionRetainedSealValidationAllowsNonvotingLearner(t *te
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 	fixture, selected := newManagedGraphRetainedSealFixture(t, ctx)
-	replaceReadCoreWithLearner(t, fixture)
-	if fixture.node.core.IsVoter() || fixture.node.core.CanParticipateReadIndex() || fixture.node.Ready() {
-		t.Fatalf("fixture promoted the retained learner: voter=%t read_index=%t ready=%t", fixture.node.core.IsVoter(), fixture.node.core.CanParticipateReadIndex(), fixture.node.Ready())
+
+	// The producer's recorder fan-out may still be validating the seal after
+	// quorum returns. Copy the certified prefix without mutating its Node.
+	producer := fixture.node
+	config := CloneManagedRuntimeConfig(*producer.config)
+	startup := *producer.managedStartup
+	learner := New(&config)
+	learner.managedStartup = &startup
+	learner.core, learner.wal, learner.material = producer.core, producer.wal, producer.material
+	learner.checkpoints, learner.archive = producer.checkpoints, producer.archive
+	learner.opened.Store(true)
+	if err := learner.installInternalApplicationBinding(ctx); err != nil {
+		t.Fatal(err)
 	}
-	if err := fixture.node.validateManagedGraphSealForCut(ctx, fixture.node.core, selected); err != nil {
+	t.Cleanup(learner.internalApplication.Load().cancel)
+	replaceReadCoreWithLearner(t, &managedGraphAppendOnlyAdmissionFixture{node: learner, transport: fixture.transport})
+	if learner.core.IsVoter() || learner.core.CanParticipateReadIndex() || learner.Ready() {
+		t.Fatalf("fixture promoted the retained learner: voter=%t read_index=%t ready=%t", learner.core.IsVoter(), learner.core.CanParticipateReadIndex(), learner.Ready())
+	}
+	if err := learner.validateManagedGraphSealForCut(ctx, learner.core, selected); err != nil {
 		t.Fatalf("nonvoting learner rejected the exact certified read-only producer: %v", err)
 	}
 	wrongProducer := selected
 	wrongProducer.DecisionSlot++
-	if err := fixture.node.validateManagedGraphSealForCut(ctx, fixture.node.core, wrongProducer); err == nil {
+	if err := learner.validateManagedGraphSealForCut(ctx, learner.core, wrongProducer); err == nil {
 		t.Fatalf("wrong producer slot %d was accepted", wrongProducer.DecisionSlot)
 	}
 }
