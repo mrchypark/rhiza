@@ -97,7 +97,7 @@ for ((pair = 0; pair < 6; pair++)); do
 		case $arm in
 			shared) layout="$a:$a:$a" ;;
 			split) layout="$a:$b:$c" ;;
-			standard) disk=${roots[$((pair % 2))]}; layout="$disk:$disk:$disk" ;;
+			standard) disk=${roots[$(((pair / 2 + pair % 2) % 2))]}; layout="$disk:$disk:$disk" ;;
 			premium) layout="${roots[2]}:${roots[2]}:${roots[2]}" ;;
 		esac
 		sample="$evidence/pair-$pair-$arm"
