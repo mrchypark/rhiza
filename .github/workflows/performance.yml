@@ -63,16 +63,21 @@ on:
         type: boolean
         default: false
 
+      e2e_async_disk_isolation:
+        description: Compare GCS Async on /tmp and a separate /mnt block mount using the same commit and stage probe
+        type: boolean
+        default: false
+
 permissions:
   contents: read
 
 concurrency:
-  group: performance-${{ github.event.pull_request.number || github.ref }}${{ inputs.e2e_cost_matrix && format('-e2e-cost-matrix-{0}', inputs.e2e_cost_provider || 's3') || '' }}${{ inputs.e2e_async_stage_probe && '-stage-probe' || '' }}
+  group: performance-${{ github.event.pull_request.number || github.ref }}${{ inputs.e2e_cost_matrix && format('-e2e-cost-matrix-{0}', inputs.e2e_cost_provider || 's3') || '' }}${{ inputs.e2e_async_stage_probe && '-stage-probe' || '' }}${{ inputs.e2e_async_disk_isolation && '-disk-isolation' || '' }}
   cancel-in-progress: true
 
 jobs:
   paired-go-benchmarks:
-    if: ${{ !inputs.refresh_hiqlite_reference && !inputs.issue185_cost_evidence && !inputs.e2e_cost_matrix }}
+    if: ${{ !inputs.refresh_hiqlite_reference && !inputs.issue185_cost_evidence && !inputs.e2e_cost_matrix && !inputs.e2e_async_disk_isolation }}
     runs-on: ubuntu-24.04
     timeout-minutes: 60
     env:
@@ -300,7 +305,7 @@ jobs:
           retention-days: 30
 
   e2e-cost-matrix:
-    if: ${{ inputs.e2e_cost_matrix }}
+    if: ${{ inputs.e2e_cost_matrix || inputs.e2e_async_disk_isolation }}
     runs-on: ubuntu-24.04
     timeout-minutes: 60
     defaults:
@@ -311,6 +316,7 @@ jobs:
       RHIZA_SERVER_BENCH_REQUESTS: 1000
       RHIZA_SERVER_BENCH_CONCURRENCY: 16
       RHIZA_SERVER_BENCH_PROVIDER: ${{ inputs.e2e_cost_provider || 's3' }}
+      ASYNC_DISK_ISOLATION: ${{ inputs.e2e_async_disk_isolation && '1' || '0' }}
     steps:
       - name: Initialize matrix evidence
         run: mkdir -p "$RUNNER_TEMP/rhiza-e2e-cost"
@@ -333,6 +339,8 @@ jobs:
           ISSUE185_COST: ${{ inputs.issue185_cost_evidence }}
           NETWORK_OPTIMIZATION: ${{ inputs.network_optimization }}
           SQL_ASYNC_ISOLATION: ${{ inputs.e2e_sql_async_isolation }}
+          COST_MATRIX: ${{ inputs.e2e_cost_matrix }}
+          ASYNC_STAGE_PROBE: ${{ inputs.e2e_async_stage_probe }}
         run: |
           if [[ $REFRESH_HIQLITE == true || $ISSUE185_COST == true || ${NETWORK_OPTIMIZATION:-none} != none ]]; then
             echo '::error::The E2E cost matrix cannot be combined with another special Performance mode.'
@@ -342,6 +350,12 @@ jobs:
             s3|gcs) ;;
             *) echo '::error::The E2E cost matrix provider must be s3 or gcs.'; exit 1 ;;
           esac
+          if [[ $ASYNC_DISK_ISOLATION == 1 ]] &&
+            [[ $COST_MATRIX != true || $ASYNC_STAGE_PROBE != true || $SQL_ASYNC_ISOLATION == true ||
+              $RHIZA_SERVER_BENCH_PROVIDER != gcs || $BASE_SHA != "$CANDIDATE_SHA" ]]; then
+            echo '::error::Disk isolation requires the GCS cost matrix, stage probe, and identical full base/candidate SHAs; do not combine it with SQL isolation.'
+            exit 1
+          fi
           checkout_revision() {
             local sha=$1 role=$2
             if [[ ! $sha =~ ^[0-9a-f]{40}$ ]]; then
@@ -398,21 +412,50 @@ jobs:
         run: |
           evidence="$RUNNER_TEMP/rhiza-e2e-cost"
           harness_sha=$(git rev-parse HEAD)
+          workloads=(sql graph kv)
+          durabilities=(async before-ack)
+          disk_root=
+          if [[ $ASYNC_DISK_ISOLATION == 1 ]]; then
+            {
+              printf 'default /tmp: '
+              findmnt -nr -o TARGET,SOURCE,FSTYPE,MAJ:MIN -T /tmp || true
+              printf 'candidate /mnt: '
+              findmnt -nr -o TARGET,SOURCE,FSTYPE,MAJ:MIN -M /mnt || true
+            } | tee "$evidence/disk-mounts.txt"
+            if ! read -r base_device base_fs base_id < <(findmnt -nr -o SOURCE,FSTYPE,MAJ:MIN -T /tmp) ||
+              ! read -r candidate_device candidate_fs candidate_id < <(findmnt -nr -o SOURCE,FSTYPE,MAJ:MIN -M /mnt) ||
+              [[ ! -b $base_device || ! -b $candidate_device || $base_id == "$candidate_id" ||
+                ! $base_fs =~ ^(ext4|xfs)$ || ! $candidate_fs =~ ^(ext4|xfs)$ ]]; then
+              echo '::error::Disk isolation unavailable: /mnt must be a distinct ext4/xfs block mount from /tmp.'
+              exit 1
+            fi
+            disk_root=$(sudo mktemp -d /mnt/rhiza-disk-ab.XXXXXX)
+            trap 'if ! sudo rmdir -- "$disk_root"; then echo "::error::Could not remove disk isolation directory: $disk_root"; exit 1; fi' EXIT
+            sudo chown "$(id -u):$(id -g)" "$disk_root"
+            printf 'base_TMPDIR=/tmp\ncandidate_TMPDIR=%s\n' "$disk_root" >>"$evidence/disk-mounts.txt"
+            workloads=(sql kv)
+            durabilities=(async)
+          fi
           printf 'sample\tworkload\tdurability\trevision\texit\n' >"$evidence/exits.tsv"
           for sample in 1 2 3; do
             revisions=(base candidate)
             if (( sample % 2 == 0 )); then
               revisions=(candidate base)
             fi
-            for workload in sql graph kv; do
-              for durability in async before-ack; do
+            for workload in "${workloads[@]}"; do
+              for durability in "${durabilities[@]}"; do
                 publish=0
                 if [[ $durability == async ]]; then publish=1; fi
                 for revision in "${revisions[@]}"; do
                   result="$evidence/$workload-$durability-$revision-$sample"
                   status=0
-                  RHIZA_ASYNC_STAGE_PROBE="$((publish * ASYNC_STAGE_PROBE))" \
-                  RHIZA_SERVER_BENCH_WORKLOAD="$workload" \
+                  sample_tmpdir=${TMPDIR:-/tmp}
+                  if [[ -n $disk_root ]]; then
+                    sample_tmpdir=/tmp
+                    if [[ $revision == candidate ]]; then sample_tmpdir=$disk_root; fi
+                  fi
+                  TMPDIR="$sample_tmpdir" RHIZA_ASYNC_STAGE_PROBE="$((publish * ASYNC_STAGE_PROBE))" \
+                    RHIZA_SERVER_BENCH_WORKLOAD="$workload" \
                     RHIZA_SERVER_BENCH_DURABILITY="$durability" \
                     RHIZA_SERVER_BENCH_ASYNC_PUBLISH="$publish" \
                     benchmarks/run-server-reference.sh "$RUNNER_TEMP/rhiza-e2e-$revision" "$result.json" \
@@ -424,6 +467,7 @@ jobs:
                   fi
                   if ! jq -e --argjson requests "$RHIZA_SERVER_BENCH_REQUESTS" \
                     --argjson concurrency "$RHIZA_SERVER_BENCH_CONCURRENCY" \
+                      --argjson disk_isolation "$ASYNC_DISK_ISOLATION" \
                     --arg provider "$RHIZA_SERVER_BENCH_PROVIDER" \
                     --arg harness "$harness_sha" --arg workload "$workload" --arg durability "$durability" '
                       .client_revision == $harness and .workload == $workload and .durability_mode == $durability and
@@ -432,6 +476,7 @@ jobs:
                       .voter_resource_status == "measured" and (.voter_resources.nodes | length) == 3 and
                       (.object_store_delta.http_requests | type) == "number" and
                       (.write_object_store_delta.http_requests | type) == "number" and
+                      ($disk_isolation == 0 or .write_object_store_delta.http_requests == 0) and
                       (if $provider == "gcs" then
                         (.gcs_request_classes.write | type) == "object" and
                         (if $durability == "async" then (.gcs_request_classes.publication | type) == "object"
@@ -451,7 +496,11 @@ jobs:
               done
             done
           done
-          printf '## E2E cost matrix (%s)\n\nAll 36 samples passed: SQL, Graph, and KV × Async and BeforeAck × two revisions × three runs. Raw result and process logs are attached.\n' "$RHIZA_SERVER_BENCH_PROVIDER" >>"$GITHUB_STEP_SUMMARY"
+          if [[ -n $disk_root ]]; then
+            printf '## GCS Async disk isolation\n\nAll 12 samples passed: SQL and KV × two mounts × three runs. Both mounts used the same commit with WAL sync and stage probes enabled. Mount evidence, raw results, and process logs are attached.\n' >>"$GITHUB_STEP_SUMMARY"
+          else
+            printf '## E2E cost matrix (%s)\n\nAll 36 samples passed: SQL, Graph, and KV × Async and BeforeAck × two revisions × three runs. Raw result and process logs are attached.\n' "$RHIZA_SERVER_BENCH_PROVIDER" >>"$GITHUB_STEP_SUMMARY"
+          fi
 
       - name: Run GCS SQL Async isolation
         if: ${{ inputs.e2e_sql_async_isolation }}
