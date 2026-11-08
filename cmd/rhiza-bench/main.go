@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/rand"
+	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -53,6 +54,8 @@ func main() {
 	timeout := flag.Duration("timeout", 30*time.Second, "request timeout")
 	commitUnknownRetries := flag.Int("commit-unknown-retries", 0, "maximum same-request retries after commit_unknown")
 	verifyInsert := flag.Bool("verify-insert-receipt", false, "verify benchmark INSERT committed receipt and exact id")
+	verifyApplied := flag.Bool("verify-applied-receipt", false, "require a committed, applied Graph or KV put receipt")
+	verifyKVValue := flag.Bool("verify-kv-value", false, "require the benchmark KV get value")
 	faultControlFile := flag.String("fault-control-file", "", "optional owned file for loopback fault overlap control URL")
 	faultPID := flag.Int("fault-pid", 0, "fixed owned fault target PID, bound before requests (Linux pidfd required)")
 	faultStart := flag.String("fault-start-time", "", "Linux target start-time ticks captured by the owning parent")
@@ -60,6 +63,22 @@ func main() {
 	if *requests < 1 || *concurrency < 1 || *concurrency > *requests || *commitUnknownRetries < 0 {
 		fmt.Fprintln(os.Stderr, "invalid request count, concurrency, or commit-unknown retry count")
 		os.Exit(2)
+	}
+	encodeValue := strings.Contains(*body, "{{base64id}}")
+	var validateResponse func(string, []byte) error
+	var receiptOracle string
+	switch {
+	case *verifyInsert && (*verifyApplied || *verifyKVValue), *verifyApplied && *verifyKVValue,
+		*verifyApplied && *requestPath != "/graph/execute" && *requestPath != "/kv/put",
+		*verifyKVValue && *requestPath != "/kv/get":
+		fmt.Fprintln(os.Stderr, "incompatible response oracle and request path")
+		os.Exit(2)
+	case *verifyInsert:
+		validateResponse, receiptOracle = validateInsertReceipt, "sql-insert-id-v1"
+	case *verifyApplied:
+		validateResponse, receiptOracle = validateAppliedReceipt, "applied-mutation-v1"
+	case *verifyKVValue:
+		validateResponse, receiptOracle = validateKVValue, "kv-benchmark-value-v1"
 	}
 
 	client := &http.Client{Timeout: *timeout, Transport: &http.Transport{
@@ -126,7 +145,11 @@ func main() {
 		go func() {
 			defer workers.Done()
 			for id := range jobs {
-				payload := strings.ReplaceAll(*body, "{{id}}", strconv.Itoa(id))
+				idText := strconv.Itoa(id)
+				payload := strings.ReplaceAll(*body, "{{id}}", idText)
+				if encodeValue {
+					payload = strings.ReplaceAll(payload, "{{base64id}}", base64.StdEncoding.EncodeToString([]byte(idText)))
+				}
 				method := http.MethodGet
 				if payload != "" {
 					method = http.MethodPost
@@ -137,7 +160,7 @@ func main() {
 				if progress != nil {
 					requestCtx, finish = progress.traceRequest(ctx, id)
 				}
-				status, sample, retryCount, requestErr := doRequest(requestCtx, client, method, *baseURL+*requestPath, payload, *commitUnknownRetries, *verifyInsert)
+				status, sample, retryCount, requestErr := doRequest(requestCtx, client, method, *baseURL+*requestPath, payload, *commitUnknownRetries, validateResponse)
 				if finish != nil {
 					finish(time.Now()) // capture completion BEFORE the tracking lock
 				}
@@ -154,7 +177,7 @@ func main() {
 				}
 				if requestErr != nil || status < 200 || status >= 300 {
 					failures.Add(1)
-					if errors.Is(requestErr, errInvalidInsertReceipt) {
+					if errors.Is(requestErr, errInvalidBenchmarkResponse) {
 						receiptFailures.Add(1)
 					} else if requestErr != nil {
 						transportFailures.Add(1)
@@ -226,16 +249,14 @@ func main() {
 		window := progress.window()
 		output.FaultWindow = &window
 	}
-	if *verifyInsert {
-		output.ReceiptOracle = "sql-insert-id-v1"
-	}
+	output.ReceiptOracle = receiptOracle
 	if err := json.NewEncoder(os.Stdout).Encode(output); err != nil {
 		fmt.Fprintln(os.Stderr, err)
 		os.Exit(1)
 	}
 }
 
-func doRequest(ctx context.Context, client *http.Client, method, url, payload string, maxRetries int, verifyInsert bool) (int, []byte, int, error) {
+func doRequest(ctx context.Context, client *http.Client, method, url, payload string, maxRetries int, validateResponse func(string, []byte) error) (int, []byte, int, error) {
 	for retries := 0; ; retries++ {
 		request, err := http.NewRequestWithContext(ctx, method, url, bytes.NewBufferString(payload))
 		if err != nil {
@@ -250,10 +271,10 @@ func doRequest(ctx context.Context, client *http.Client, method, url, payload st
 		}
 		var body []byte
 		if response.StatusCode >= 200 && response.StatusCode < 300 {
-			if verifyInsert {
+			if validateResponse != nil {
 				body, err = io.ReadAll(io.LimitReader(response.Body, 4097))
 				if err == nil {
-					err = validateInsertReceipt(payload, body)
+					err = validateResponse(payload, body)
 				}
 			} else {
 				_, err = io.Copy(io.Discard, response.Body)
@@ -270,7 +291,7 @@ func doRequest(ctx context.Context, client *http.Client, method, url, payload st
 
 // SQL receipts do not set Applied or echo request_id. This oracle is specific
 // to the runner's one-row INTEGER PRIMARY KEY INSERT, not arbitrary SQL.
-var errInvalidInsertReceipt = errors.New("invalid benchmark INSERT receipt")
+var errInvalidBenchmarkResponse = errors.New("invalid benchmark response")
 
 func validateInsertReceipt(payload string, body []byte) error {
 	var request struct {
@@ -278,11 +299,11 @@ func validateInsertReceipt(payload string, body []byte) error {
 		SQL       string `json:"sql"`
 	}
 	if json.Unmarshal([]byte(payload), &request) != nil || !strings.HasPrefix(request.RequestID, "bench-") {
-		return errInvalidInsertReceipt
+		return errInvalidBenchmarkResponse
 	}
 	id, err := strconv.Atoi(strings.TrimPrefix(request.RequestID, "bench-"))
 	if err != nil || id < 0 || request.SQL != fmt.Sprintf("INSERT INTO benchmark_writes(id) VALUES (%d)", id) {
-		return errInvalidInsertReceipt
+		return errInvalidBenchmarkResponse
 	}
 	var receipt struct {
 		Slot             uint64 `json:"slot"`
@@ -293,7 +314,45 @@ func validateInsertReceipt(payload string, body []byte) error {
 		RetryThroughSlot uint64 `json:"retry_through_slot"`
 	}
 	if len(body) > 4096 || json.Unmarshal(body, &receipt) != nil || receipt.Slot == 0 || receipt.Status != "committed" || receipt.ErrorCode != "" || receipt.RowsAffected != 1 || receipt.LastInsertID != int64(id) || receipt.RetryThroughSlot < receipt.Slot {
-		return errInvalidInsertReceipt
+		return errInvalidBenchmarkResponse
+	}
+	return nil
+}
+
+func validateAppliedReceipt(_ string, body []byte) error {
+	var receipt struct {
+		Slot             uint64 `json:"slot"`
+		Status           string `json:"status"`
+		ErrorCode        string `json:"error_code"`
+		Applied          bool   `json:"applied"`
+		RetryThroughSlot uint64 `json:"retry_through_slot"`
+	}
+	if len(body) > 4096 || json.Unmarshal(body, &receipt) != nil || receipt.Slot == 0 ||
+		receipt.Status != "committed" || !receipt.Applied || receipt.ErrorCode != "" || receipt.RetryThroughSlot < receipt.Slot {
+		return errInvalidBenchmarkResponse
+	}
+	return nil
+}
+
+func validateKVValue(payload string, body []byte) error {
+	var request struct {
+		Key string `json:"key"`
+	}
+	if json.Unmarshal([]byte(payload), &request) != nil {
+		return errInvalidBenchmarkResponse
+	}
+	id, ok := strings.CutPrefix(request.Key, "bench-")
+	if !ok || id == "" {
+		return errInvalidBenchmarkResponse
+	}
+	var read struct {
+		Found       bool   `json:"found"`
+		Value       string `json:"value"`
+		AppliedSlot uint64 `json:"applied_slot"`
+	}
+	if len(body) > 4096 || json.Unmarshal(body, &read) != nil || !read.Found ||
+		read.Value != base64.StdEncoding.EncodeToString([]byte(id)) || read.AppliedSlot == 0 {
+		return errInvalidBenchmarkResponse
 	}
 	return nil
 }

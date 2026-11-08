@@ -42,16 +42,21 @@ on:
         type: boolean
         default: false
 
+      e2e_cost_matrix:
+        description: Compare the SQL, Graph, and KV server cost matrix (base_ref and candidate_ref must be full commit SHAs)
+        type: boolean
+        default: false
+
 permissions:
   contents: read
 
 concurrency:
-  group: performance-${{ github.event.pull_request.number || github.ref }}
+  group: performance-${{ github.event.pull_request.number || github.ref }}${{ inputs.e2e_cost_matrix && '-e2e-cost-matrix' || '' }}
   cancel-in-progress: true
 
 jobs:
   paired-go-benchmarks:
-    if: ${{ !inputs.refresh_hiqlite_reference && !inputs.issue185_cost_evidence }}
+    if: ${{ !inputs.refresh_hiqlite_reference && !inputs.issue185_cost_evidence && !inputs.e2e_cost_matrix }}
     runs-on: ubuntu-24.04
     timeout-minutes: 60
     env:
@@ -278,8 +283,131 @@ jobs:
           if-no-files-found: error
           retention-days: 30
 
+  e2e-cost-matrix:
+    if: ${{ inputs.e2e_cost_matrix }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    defaults:
+      run:
+        shell: bash
+    env:
+      CGO_ENABLED: 0
+      RHIZA_SERVER_BENCH_REQUESTS: 1000
+      RHIZA_SERVER_BENCH_CONCURRENCY: 16
+    steps:
+      - name: Initialize matrix evidence
+        run: mkdir -p "$RUNNER_TEMP/rhiza-e2e-cost"
+
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Prepare exact comparison revisions
+        env:
+          BASE_SHA: ${{ inputs.base_ref }}
+          CANDIDATE_SHA: ${{ inputs.candidate_ref }}
+          REFRESH_HIQLITE: ${{ inputs.refresh_hiqlite_reference }}
+          ISSUE185_COST: ${{ inputs.issue185_cost_evidence }}
+          NETWORK_OPTIMIZATION: ${{ inputs.network_optimization }}
+        run: |
+          if [[ $REFRESH_HIQLITE == true || $ISSUE185_COST == true || ${NETWORK_OPTIMIZATION:-none} != none ]]; then
+            echo '::error::The E2E cost matrix cannot be combined with another special Performance mode.'
+            exit 1
+          fi
+          checkout_revision() {
+            local sha=$1 role=$2
+            if [[ ! $sha =~ ^[0-9a-f]{40}$ ]]; then
+              printf '::error::%s revision must be a full lowercase commit SHA.\n' "$role"
+              return 1
+            fi
+            if ! git cat-file -e "$sha^{commit}"; then
+              git fetch --no-tags origin "$sha"
+            fi
+            [[ $(git rev-parse --verify "$sha^{commit}") == "$sha" ]]
+            git worktree add --detach "$RUNNER_TEMP/rhiza-e2e-$role" "$sha"
+            [[ $(git -C "$RUNNER_TEMP/rhiza-e2e-$role" rev-parse HEAD) == "$sha" ]]
+          }
+          checkout_revision "$BASE_SHA" base
+          checkout_revision "$CANDIDATE_SHA" candidate
+          {
+            printf 'base_sha=%s\ncandidate_sha=%s\nharness_sha=%s\n' "$BASE_SHA" "$CANDIDATE_SHA" "$(git rev-parse HEAD)"
+            printf 'requests=%s\nconcurrency=%s\nsamples_per_cell=3\n' "$RHIZA_SERVER_BENCH_REQUESTS" "$RHIZA_SERVER_BENCH_CONCURRENCY"
+            printf 'runner_image=%s-%s\n' "$ImageOS" "$ImageVersion"
+            go version
+            uname -srmo
+            lscpu
+            free -b
+          } >"$RUNNER_TEMP/rhiza-e2e-cost/environment.txt"
+          bash benchmarks/run-server-reference_test.sh
+
+      - name: Run interleaved server cost matrix
+        run: |
+          evidence="$RUNNER_TEMP/rhiza-e2e-cost"
+          harness_sha=$(git rev-parse HEAD)
+          printf 'sample\tworkload\tdurability\trevision\texit\n' >"$evidence/exits.tsv"
+          for sample in 1 2 3; do
+            revisions=(base candidate)
+            if (( sample % 2 == 0 )); then
+              revisions=(candidate base)
+            fi
+            for workload in sql graph kv; do
+              for durability in async before-ack; do
+                publish=0
+                if [[ $durability == async ]]; then publish=1; fi
+                for revision in "${revisions[@]}"; do
+                  result="$evidence/$workload-$durability-$revision-$sample"
+                  status=0
+                  RHIZA_SERVER_BENCH_WORKLOAD="$workload" \
+                    RHIZA_SERVER_BENCH_DURABILITY="$durability" \
+                    RHIZA_SERVER_BENCH_ASYNC_PUBLISH="$publish" \
+                    benchmarks/run-server-reference.sh "$RUNNER_TEMP/rhiza-e2e-$revision" "$result.json" \
+                    >"$result.log" 2>&1 || status=$?
+                  printf '%s\t%s\t%s\t%s\t%s\n' "$sample" "$workload" "$durability" "$revision" "$status" | tee -a "$evidence/exits.tsv"
+                  if (( status != 0 )); then
+                    tail -n 100 "$result.log"
+                    exit "$status"
+                  fi
+                  if ! jq -e --argjson requests "$RHIZA_SERVER_BENCH_REQUESTS" \
+                    --argjson concurrency "$RHIZA_SERVER_BENCH_CONCURRENCY" \
+                    --arg harness "$harness_sha" --arg workload "$workload" --arg durability "$durability" '
+                      .client_revision == $harness and .workload == $workload and .durability_mode == $durability and
+                      .failure_mode == "healthy" and .concurrency == $concurrency and .runtime_failure_lines == 0 and
+                      .voter_resource_status == "measured" and (.voter_resources.nodes | length) == 3 and
+                      (.object_store_delta.http_requests | type) == "number" and
+                      (.write_object_store_delta.http_requests | type) == "number" and
+                      (if $durability == "async" then
+                        .async_publication.forced == true and .async_publication.object_store_delta.http_requests > 0 and
+                        .async_publication.before.archive_tip < .async_publication.before.certified_tip and
+                        .async_publication.after.archive_tip >= .async_publication.before.certified_tip
+                      else .async_publication == null end) and
+                      .result.requests == $requests and .result.successes == $requests and .result.errors == 0
+                    ' "$result.json" >/dev/null; then
+                    printf '::error::Missing or inconsistent evidence: %s\n' "${result##*/}.json"
+                    exit 1
+                  fi
+                done
+              done
+            done
+          done
+          printf '## E2E cost matrix\n\nAll 36 samples passed: SQL, Graph, and KV × Async and BeforeAck × two revisions × three runs. Raw result and process logs are attached.\n' >>"$GITHUB_STEP_SUMMARY"
+
+      - name: Upload server cost evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: e2e-cost-matrix-${{ github.run_id }}
+          path: ${{ runner.temp }}/rhiza-e2e-cost
+          if-no-files-found: warn
+          retention-days: 30
+
   issue185-cost-evidence:
-    if: ${{ inputs.issue185_cost_evidence }}
+    if: ${{ inputs.issue185_cost_evidence && !inputs.e2e_cost_matrix }}
     runs-on: macos-15
     timeout-minutes: 80
     steps:
@@ -465,7 +593,7 @@ jobs:
           retention-days: 30
 
   refresh-hiqlite-reference:
-    if: ${{ inputs.refresh_hiqlite_reference }}
+    if: ${{ inputs.refresh_hiqlite_reference && !inputs.e2e_cost_matrix }}
     runs-on: ubuntu-24.04
     timeout-minutes: 60
     env:

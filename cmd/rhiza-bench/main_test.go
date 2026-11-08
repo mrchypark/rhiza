@@ -43,7 +43,7 @@ func TestDoRequestRetriesCommitUnknownWithSamePayload(t *testing.T) {
 	}))
 	defer server.Close()
 
-	status, _, retries, err := doRequest(t.Context(), server.Client(), http.MethodPost, server.URL, payload, 3, true)
+	status, _, retries, err := doRequest(t.Context(), server.Client(), http.MethodPost, server.URL, payload, 3, validateInsertReceipt)
 	if err != nil || status != http.StatusOK || retries != 3 || attempts != 4 {
 		t.Fatalf("status=%d retries=%d attempts=%d err=%v", status, retries, attempts, err)
 	}
@@ -58,7 +58,7 @@ func TestDoRequestStopsWhenRetriesAreExhausted(t *testing.T) {
 	}))
 	defer server.Close()
 
-	status, _, retries, err := doRequest(t.Context(), server.Client(), http.MethodPost, server.URL, `{}`, 2, true)
+	status, _, retries, err := doRequest(t.Context(), server.Client(), http.MethodPost, server.URL, `{}`, 2, validateInsertReceipt)
 	if err != nil || status != http.StatusServiceUnavailable || retries != 2 || attempts != 3 {
 		t.Fatalf("status=%d retries=%d attempts=%d err=%v", status, retries, attempts, err)
 	}
@@ -84,8 +84,8 @@ func TestDoRequestChecksSQLInsertReceipt(t *testing.T) {
 			calls := 0
 			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) { calls++; _, _ = io.WriteString(w, tc.body) }))
 			defer server.Close()
-			status, _, retries, err := doRequest(t.Context(), server.Client(), http.MethodPost, server.URL, payload, 3, true)
-			if status != 200 || calls != 1 || retries != 0 || (err == nil) != tc.valid || (!tc.valid && !errors.Is(err, errInvalidInsertReceipt)) {
+			status, _, retries, err := doRequest(t.Context(), server.Client(), http.MethodPost, server.URL, payload, 3, validateInsertReceipt)
+			if status != 200 || calls != 1 || retries != 0 || (err == nil) != tc.valid || (!tc.valid && !errors.Is(err, errInvalidBenchmarkResponse)) {
 				t.Fatalf("status=%d calls=%d retries=%d err=%v", status, calls, retries, err)
 			}
 		})
@@ -93,6 +93,27 @@ func TestDoRequestChecksSQLInsertReceipt(t *testing.T) {
 	// The public SQL encoder omits zero last_insert_id; id 0 is still valid.
 	if err := validateInsertReceipt(`{"request_id":"bench-0","sql":"INSERT INTO benchmark_writes(id) VALUES (0)"}`, []byte(`{"slot":1,"status":"committed","rows_affected":1,"retry_through_slot":65536}`)); err != nil {
 		t.Fatal(err)
+	}
+}
+
+func TestWorkloadResponseOracles(t *testing.T) {
+	for _, tc := range []struct {
+		validate func(string, []byte) error
+		body     string
+		valid    bool
+	}{
+		{validateAppliedReceipt, `{"slot":4,"status":"committed","applied":true,"retry_through_slot":9}`, true},
+		{validateAppliedReceipt, `{"slot":4,"status":"committed","applied":false,"retry_through_slot":9}`, false},
+		{validateAppliedReceipt, `{"slot":4,"status":"rejected","applied":true,"retry_through_slot":9}`, false},
+		{validateAppliedReceipt, `{"slot":4,"status":"committed","applied":true,"retry_through_slot":3}`, false},
+		{validateKVValue, `{"found":true,"value":"Nw==","applied_slot":5}`, true},
+		{validateKVValue, `{"found":true,"value":"OA==","applied_slot":5}`, false},
+		{validateKVValue, `{"found":false,"value":"Nw==","applied_slot":5}`, false},
+		{validateKVValue, `{"found":true,"value":"Nw=="}`, false},
+	} {
+		if err := tc.validate(`{"key":"bench-7"}`, []byte(tc.body)); (err == nil) != tc.valid {
+			t.Errorf("body=%s valid=%v error=%v", tc.body, tc.valid, err)
+		}
 	}
 }
 
@@ -249,7 +270,7 @@ func TestFaultProgressActualHTTPTraceLifecycle(t *testing.T) {
 	var requestErr error
 	go func() {
 		defer close(done)
-		status, _, retries, requestErr = doRequest(ctx, server.Client(), http.MethodPost, server.URL, payload, 1, true)
+		status, _, retries, requestErr = doRequest(ctx, server.Client(), http.MethodPost, server.URL, payload, 1, validateInsertReceipt)
 		finish(time.Now())
 	}()
 	t.Cleanup(func() {
@@ -300,7 +321,7 @@ func TestFaultFastHTTPCompletionCannotQualify(t *testing.T) {
 	calls := 0
 	p := &faultProgress{epoch: time.Now(), active: make(map[int]*requestInterval), signal: func() (time.Time, time.Time, error) { calls++; return time.Now(), time.Now(), nil }}
 	ctx, finish := p.traceRequest(deadline, 0)
-	status, _, _, err := doRequest(ctx, server.Client(), http.MethodPost, server.URL, `{"request_id":"bench-0","sql":"INSERT INTO benchmark_writes(id) VALUES (0)"}`, 0, true)
+	status, _, _, err := doRequest(ctx, server.Client(), http.MethodPost, server.URL, `{"request_id":"bench-0","sql":"INSERT INTO benchmark_writes(id) VALUES (0)"}`, 0, validateInsertReceipt)
 	finish(time.Now())
 	if status != 200 || err != nil {
 		t.Fatal(status, err)

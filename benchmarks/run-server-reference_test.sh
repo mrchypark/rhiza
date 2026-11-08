@@ -19,6 +19,10 @@ verify_benchmark_rows 4 <<< '{"rows":[[4,4]]}'
 for rows in '[[4,3]]' '[[5,4]]' '[[3,3]]' '[[4]]' '[["4",4]]'; do
 	if verify_benchmark_rows 4 <<< "{\"rows\":$rows}"; then printf 'invalid exact set accepted: %s\n' "$rows" >&2; exit 1; fi
 done
+verify_graph_rows 4 <<< '{"rows":[[3],[0],[1],[2]]}'
+for rows in '[[0],[1],[1],[3]]' '[[0],[1],[2],[4]]' '[["0"],[1],[2],[3]]' '[[0],[1],[2],[3],[4]]'; do
+	if verify_graph_rows 4 <<< "{\"rows\":$rows}"; then printf 'invalid Graph identity set accepted: %s\n' "$rows" >&2; exit 1; fi
+done
 
 # Normal wait preserves the child's exit and clears the handle before cleanup.
 (exit 0) & bench_pid=$!
@@ -119,8 +123,19 @@ printf '%s\n' "$$" > "$MOCK_HOME/bench.pid"
 printf '%s\n' "$*" > "$MOCK_HOME/bench.args"
 control=
 pid=
+oracle=sql-insert-id-v1
+successes=4
+errors=0
 while [[ $# -gt 0 ]]; do
- case $1 in -fault-control-file) control=$2; shift ;; -fault-pid) pid=$2; shift ;; esac
+ case $1 in
+  -fault-control-file) control=$2; shift ;;
+  -fault-pid) pid=$2; shift ;;
+  -verify-applied-receipt) oracle=applied-mutation-v1 ;;
+  -verify-kv-value)
+   oracle=kv-benchmark-value-v1
+   cp "$MOCK_HOME/bench.args" "$MOCK_HOME/kv-verification.args"
+   if [[ $MOCK_MODE == kv-wrong-value ]]; then successes=3; errors=1; fi ;;
+ esac
  shift
 done
 if [[ -n $control ]]; then
@@ -136,7 +151,7 @@ if [[ -n $control ]]; then
   window='{"attempted":true,"signal_succeeded":true,"overlap":true,"witnesses":1,"reason":"qualified"}'
  fi
 fi
-printf '{"requests":4,"successes":4,"errors":0,"max_ms":1,"receipt_oracle":"sql-insert-id-v1","fault_window":%s}\n' "$window"
+printf '{"requests":4,"successes":%d,"errors":%d,"max_ms":1,"receipt_oracle":"%s","fault_window":%s}\n' "$successes" "$errors" "$oracle" "$window"
 touch "$MOCK_HOME/client-done"
 MOCK
 cat > "$scratch/bin/curl" <<'MOCK'
@@ -144,7 +159,11 @@ cat > "$scratch/bin/curl" <<'MOCK'
 set -eu
 for url in "$@"; do :; done
 case $url in
-*/metrics/object-store) printf '{"puts":0}\n' ;;
+*/metrics/object-store)
+ if [[ -f $MOCK_HOME/archived ]]; then puts=11
+ elif [[ -f $MOCK_HOME/client-done ]]; then puts=2
+ else puts=0; fi
+ printf '{"puts":%d}\n' "$puts" ;;
 */fault)
  case $MOCK_MODE in before-first) exit 22 ;; signal-failure) exit 47 ;; esac
  kill -KILL "$(cat "$MOCK_HOME/fault.pid")"
@@ -152,6 +171,22 @@ case $url in
  printf '{"attempted":true,"signal_succeeded":true}\n' ;;
 */sql/query)
  if [[ $MOCK_MODE == shifted ]]; then printf '{"rows":[[4,3]]}\n'; else printf '{"rows":[[4,4]]}\n'; fi ;;
+*/graph/query)
+ if [[ $MOCK_MODE == graph-wrong-ids ]]; then printf '{"rows":[[0],[1],[1],[3]]}\n'; else printf '{"rows":[[3],[0],[2],[1]],"applied_slot":8}\n'; fi ;;
+*/recovery/status)
+ if [[ -f $MOCK_HOME/archived && $MOCK_MODE != async-stale-cut ]]; then archive_tip=8; else archive_tip=1; fi
+ printf '{"node_id":"n1","cluster_id":"server-bench","durability":"async","ready":true,"quorum":true,"certified_tip":8,"applied_tip":8,"archive_tip":%d}\n' "$archive_tip" ;;
+*/recovery/archive)
+ [[ -f $MOCK_HOME/client-done ]]
+ while [[ $# -gt 1 ]]; do
+  case $1 in
+   -H) [[ $2 == 'Authorization: Bearer benchmark-only-rhiza-server-bench.'* ]]; shift ;;
+   -o) printf '{"status":"archived"}\n' > "$2"; shift ;;
+  esac
+  shift
+ done
+ touch "$MOCK_HOME/archived"
+ printf '0.123456' ;;
 esac
 MOCK
 cat > "$scratch/bin/cat" <<'MOCK'
@@ -166,12 +201,17 @@ case ${1:-} in
   [[ $MOCK_MODE != resource-replaced ]] || start=124
  fi
  printf '%s (mock ) node) S 1 0 0 0 0 0 0 0 0 0 %s %s 0 0 0 0 0 0 %s\n' "$pid" "$user" "$system" "$start" ;;
-/proc/*/status)
- if [[ $MOCK_MODE == resource-missing && -f $MOCK_HOME/client-done ]]; then exit 1; fi
- if [[ -f $MOCK_HOME/client-done ]]; then rss=800 hwm=1200; else rss=500 hwm=700; fi
- printf 'VmRSS:\t%s kB\nVmHWM:\t%s kB\n' "$rss" "$hwm" ;;
 *) exec /bin/cat "$@" ;;
 esac
+MOCK
+cat > "$scratch/bin/awk" <<'MOCK'
+#!/usr/bin/env bash
+if [[ ${2:-} == /proc/*/status ]]; then
+ if [[ $MOCK_MODE == resource-missing && -f $MOCK_HOME/client-done ]]; then exit 1; fi
+ if [[ -f $MOCK_HOME/client-done ]]; then printf '800 1200\n'; else printf '500 700\n'; fi
+else
+ exec /usr/bin/awk "$@"
+fi
 MOCK
 cat > "$scratch/bin/uname" <<'MOCK'
 #!/usr/bin/env bash
@@ -193,15 +233,24 @@ wait() {
 }
 MOCK
 chmod +x "$scratch/bin/"* "$scratch/node" "$scratch/bench"
-for mode in normal shifted before-first after-last no-witness signal-failure wait-normal wait-crash wait-error healthy healthy-nonlinux resource-replaced resource-missing; do
+for mode in normal shifted before-first after-last no-witness signal-failure wait-normal wait-crash wait-error healthy healthy-nonlinux resource-replaced resource-missing graph graph-wrong-ids kv kv-wrong-value async-stale-cut; do
  mkdir "$scratch/$mode"
  # Each run's stand-ins and process evidence remain in its own scratch scope.
  cp "$scratch/node" "$scratch/bench" "$scratch/$mode/"
  fault=n0
- case $mode in shifted|healthy*|resource-*) fault=none ;; esac
+ workload=sql
+ durability=async
+ publish=0
+ case $mode in
+  shifted|healthy*|resource-*) fault=none ;;
+  graph*) fault=none; workload=graph; durability=before-ack ;;
+  kv*) fault=none; workload=kv; publish=1 ;;
+  async-stale-cut) fault=none; publish=1 ;;
+ esac
  status=0
  BASH_ENV="$scratch/wait-env" MOCK_HOME="$scratch/$mode" MOCK_MODE="$mode" PATH="$scratch/bin:$PATH" TMPDIR="$scratch/$mode" \
  RHIZA_SERVER_BENCH_REQUESTS=4 RHIZA_SERVER_BENCH_CONCURRENCY=2 RHIZA_SERVER_BENCH_FAULT_AFTER=0 RHIZA_SERVER_BENCH_FAILED_NODE="$fault" \
+ RHIZA_SERVER_BENCH_WORKLOAD="$workload" RHIZA_SERVER_BENCH_DURABILITY="$durability" RHIZA_SERVER_BENCH_ASYNC_PUBLISH="$publish" \
  bash "$here/run-server-reference.sh" "$scratch/base-server" "$scratch/$mode/result.json" >"$scratch/$mode/stdout" 2>"$scratch/$mode/stderr" || status=$?
  if [[ $mode == normal ]]; then
   [[ $status == 0 ]]
@@ -226,6 +275,24 @@ for mode in normal shifted before-first after-last no-witness signal-failure wai
    grep -q 'cannot sample Linux voter resources' "$scratch/$mode/stderr"
   fi
   jq -e '.successes == 4 and (has("voter_resources") | not)' "$scratch/$mode/result.json" >/dev/null
+ elif [[ $mode == graph ]]; then
+  [[ $status == 0 ]]
+  jq -e '.workload == "graph" and .receipt_oracle == "applied-mutation-v1" and .verification.exact_identity_rows == 4
+    and .write_object_store_delta.puts == 6 and .async_publication == null' "$scratch/$mode/result.json" >/dev/null
+ elif [[ $mode == kv ]]; then
+  [[ $status == 0 ]]
+  jq -e '.workload == "kv" and .receipt_oracle == "applied-mutation-v1" and .verification.receipt_oracle == "kv-benchmark-value-v1"
+    and .write_object_store_delta.puts == 6 and .object_store_delta.puts == 6
+    and .async_publication.elapsed_seconds == 0.123456 and .async_publication.object_store_delta.puts == 27
+    and .async_publication.before.archive_tip == 1 and .async_publication.after.archive_tip == 8' "$scratch/$mode/result.json" >/dev/null
+ elif [[ $mode == graph-wrong-ids || $mode == kv-wrong-value || $mode == async-stale-cut ]]; then
+  [[ $status != 0 ]]
+  jq -e '.successes == 4 and (has("async_publication") | not)' "$scratch/$mode/result.json" >/dev/null
+  if [[ $mode == async-stale-cut ]]; then
+   grep -q 'did not cover the certified applied cut' "$scratch/$mode/stderr"
+  else
+   [[ ! -f $scratch/$mode/archived ]]
+  fi
  else
   [[ $status != 0 ]]
   if [[ $mode == wait-* ]]; then
@@ -236,7 +303,11 @@ for mode in normal shifted before-first after-last no-witness signal-failure wai
   elif [[ $mode == signal-failure ]]; then [[ $status == 47 ]];
   elif [[ $mode != shifted ]]; then grep -Eq 'fault (coordinator failed|interval not qualified)' "$scratch/$mode/stderr"; fi
  fi
- grep -q -- '-verify-insert-receipt' "$scratch/$mode/bench.args"
+ case $workload in
+  sql) grep -q -- '-verify-insert-receipt' "$scratch/$mode/bench.args" ;;
+  graph) grep -q -- '-path /graph/execute.*-verify-applied-receipt' "$scratch/$mode/bench.args" ;;
+  kv) grep -q -- '-path /kv/get.*-verify-kv-value' "$scratch/$mode/kv-verification.args" ;;
+ esac
  if [[ $fault != none ]]; then grep -q -- '-fault-start-time 123' "$scratch/$mode/bench.args"; fi
  grep -Fq "$scratch/base-server|build -o" "$scratch/$mode/builds"
  grep -Fq "$(cd "$here/.." && pwd)|build -o" "$scratch/$mode/builds"
@@ -244,4 +315,4 @@ for mode in normal shifted before-first after-last no-witness signal-failure wai
   if kill -0 "$pid" 2>/dev/null; then printf 'mock owned process survived: %s\n' "$pid" >&2; exit 1; fi
  done < <(cat "$scratch/$mode/nodes" "$scratch/$mode/bench.pid")
 done
-printf 'server oracle helpers + 13 complete mocked runner cases PASS\n'
+printf 'server oracle helpers + 18 complete mocked runner cases PASS\n'

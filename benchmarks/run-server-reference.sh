@@ -37,6 +37,29 @@ verify_benchmark_rows() {
 	jq -e --argjson requests "$1" '.rows == [[$requests, $requests]]' >/dev/null
 }
 
+verify_graph_rows() {
+	jq -e --argjson requests "$1" '(.rows | sort) == [range($requests) | [.]]' >/dev/null
+}
+
+verify_publication_cut() {
+	local node=$1 before=$2 after=$3
+	jq -ne --arg node "$node" --argjson before "$before" --argjson after "$after" '
+		def observed: .node_id == $node and .cluster_id == "server-bench" and .durability == "async"
+			and .ready == true and .quorum == true
+			and ([.archive_tip,.applied_tip,.certified_tip] | all(type == "number" and . >= 0 and floor == .));
+		($before|observed) and ($after|observed)
+		and $before.archive_tip < $before.certified_tip
+		and $before.applied_tip >= $before.certified_tip
+		and $after.certified_tip >= $before.certified_tip
+		and $after.applied_tip >= $before.certified_tip
+		and $after.archive_tip >= $before.certified_tip'
+}
+
+object_stats_delta() {
+	jq -nc --argjson before "$1" --argjson after "$2" 'reduce ((($before|keys_unsorted) + ($after|keys_unsorted)) | unique[]) as $key
+			({}; .[$key] = (($after[$key] // 0) - ($before[$key] // 0)))'
+}
+
 sample_benchmark_process() {
 	local node=$1 pid=$2 stat rss hwm start
 	local -a fields
@@ -48,12 +71,17 @@ sample_benchmark_process() {
 		${fields[11]:-} =~ ^[0-9]+$ && ${fields[12]:-} =~ ^[0-9]+$ &&
 		${fields[19]:-} =~ ^[1-9][0-9]*$ ]] || return 1
 	start=${fields[19]}
-	read -r rss hwm < <(cat "/proc/$pid/status" | awk '
+	read -r rss hwm < <(awk '
 		$1 == "VmRSS:" && $3 == "kB" { rss=$2 }
 		$1 == "VmHWM:" && $3 == "kB" { hwm=$2 }
 		END { print rss, hwm }
-	') || return 1
+	' "/proc/$pid/status") || return 1
 	[[ $rss =~ ^[0-9]+$ && $hwm =~ ^[0-9]+$ ]] || return 1
+	stat=$(cat "/proc/$pid/stat") || return 1
+	[[ $stat == "$pid ("* && $stat == *") "* ]] || return 1
+	read -ra fields <<< "${stat##*) }"
+	[[ ${fields[19]:-} == "$start" && ${fields[0]:-} != Z && ${fields[0]:-} != X &&
+		${fields[11]:-} =~ ^[0-9]+$ && ${fields[12]:-} =~ ^[0-9]+$ ]] || return 1
 	jq -nc --arg node "$node" --argjson pid "$pid" --argjson start "$start" \
 		--argjson user "${fields[11]}" --argjson system "${fields[12]}" --argjson rss "$rss" --argjson hwm "$hwm" \
 		'{node:$node,pid:$pid,process_start_ticks:$start,user_ticks:$user,system_ticks:$system,rss_kib:$rss,lifetime_hwm_kib:$hwm}'
@@ -109,6 +137,8 @@ concurrency=${RHIZA_SERVER_BENCH_CONCURRENCY:-16}
 failed_node=${RHIZA_SERVER_BENCH_FAILED_NODE:-none}
 target_node=${RHIZA_SERVER_BENCH_TARGET_NODE:-n1}
 durability=${RHIZA_SERVER_BENCH_DURABILITY:-async}
+workload=${RHIZA_SERVER_BENCH_WORKLOAD:-sql}
+publish_async=${RHIZA_SERVER_BENCH_ASYNC_PUBLISH:-0}
 fault_after=${RHIZA_SERVER_BENCH_FAULT_AFTER:-1}
 max_fault_latency_ms=${RHIZA_SERVER_BENCH_MAX_FAULT_LATENCY_MS:-1500}
 base_http_port=${RHIZA_SERVER_BENCH_HTTP_PORT:-18100}
@@ -128,6 +158,21 @@ if [[ $target_node != n0 && $target_node != n1 && $target_node != n2 ]]; then
 fi
 if [[ $durability != async && $durability != before-ack ]]; then
 	printf 'RHIZA_SERVER_BENCH_DURABILITY must be async or before-ack\n' >&2
+	exit 2
+fi
+if [[ $workload != sql && $workload != graph && $workload != kv ]]; then
+	printf 'RHIZA_SERVER_BENCH_WORKLOAD must be sql, graph, or kv\n' >&2
+	exit 2
+fi
+if [[ $publish_async != 0 && $publish_async != 1 ]] ||
+	[[ $publish_async == 1 && ( $durability != async || $failed_node != none ) ]] ||
+	[[ $workload != sql && $failed_node != none ]]; then
+	printf 'non-SQL workloads and forced Async publication require a healthy lane; publication requires Async\n' >&2
+	exit 2
+fi
+# Exact-set Graph verification reads all rows under the materializer's 10,000-row cap.
+if [[ $workload == graph && $requests -gt 10000 ]]; then
+	printf 'Graph benchmark supports at most 10000 requests\n' >&2
 	exit 2
 fi
 if [[ $failed_node == "$target_node" ]]; then
@@ -212,12 +257,18 @@ else
 	members=$(printf '[{"node_id":"n0","url":"http://127.0.0.1:%d","peer_url":"quic://127.0.0.1:%d","token":"n0-token"},{"node_id":"n1","url":"http://127.0.0.1:%d","peer_url":"quic://127.0.0.1:%d","token":"n1-token"},{"node_id":"n2","url":"http://127.0.0.1:%d","peer_url":"quic://127.0.0.1:%d","token":"n2-token"}]' \
 		"$base_http_port" "$base_peer_port" "$((base_http_port + 1))" "$((base_peer_port + 1))" "$((base_http_port + 2))" "$((base_peer_port + 2))")
 fi
+admin_env=()
+if [[ $publish_async == 1 ]]; then
+	admin_token="benchmark-only-${run_dir##*/}"
+	admin_env=(RHIZA_ADMIN_TOKEN="$admin_token")
+fi
 for i in 0 1 2; do
 	peer_token_env=()
 	[[ $legacy_membership -eq 1 ]] || peer_token_env=(RHIZA_PEER_TOKEN="n$i-token")
 	env RHIZA_CLUSTER_ID=server-bench RHIZA_NODE_ID="n$i" \
 		RHIZA_BIND_ADDR="127.0.0.1:$((base_http_port + i))" RHIZA_PEER_ADDR="127.0.0.1:$((base_peer_port + i))" \
 		RHIZA_DATA_DIR="$run_dir/node-$i" RHIZA_CLUSTER_MEMBERS="$members" "${peer_token_env[@]+${peer_token_env[@]}}" \
+		"${admin_env[@]+${admin_env[@]}}" \
 		RHIZA_OBJSTORE_PROVIDER=s3 RHIZA_OBJSTORE_ENDPOINT="127.0.0.1:$s3_port" RHIZA_OBJSTORE_BUCKET=rhiza \
 		RHIZA_OBJSTORE_PREFIX=server-bench RHIZA_OBJSTORE_REGION=us-east-1 RHIZA_OBJSTORE_INSECURE=true \
 		RHIZA_OBJSTORE_ACCESS_KEY=rhiza-e2e RHIZA_OBJSTORE_SECRET_KEY=rhiza-e2e-secret \
@@ -239,9 +290,26 @@ done
 
 target_index=${target_node#n}
 target="http://127.0.0.1:$((base_http_port + target_index))"
-curl -fsS -H 'Content-Type: application/json' \
-	-d '{"request_id":"schema","sql":"CREATE TABLE benchmark_writes (id INTEGER PRIMARY KEY)"}' \
-	"$target/sql/execute" >/dev/null
+case "$workload" in
+	sql)
+		curl -fsS -H 'Content-Type: application/json' \
+			-d '{"request_id":"schema","sql":"CREATE TABLE benchmark_writes (id INTEGER PRIMARY KEY)"}' \
+			"$target/sql/execute" >/dev/null
+		request_path=/sql/execute
+		request_body='{"request_id":"bench-{{id}}","sql":"INSERT INTO benchmark_writes(id) VALUES ({{id}})"}'
+		oracle_flag=-verify-insert-receipt
+		receipt_oracle=sql-insert-id-v1 ;;
+	graph)
+		request_path=/graph/execute
+		request_body='{"request_id":"bench-{{id}}","cypher":"CREATE (:BenchmarkNode {id: $id})","args":{"id":{{id}}}}'
+		oracle_flag=-verify-applied-receipt
+		receipt_oracle=applied-mutation-v1 ;;
+	kv)
+		request_path=/kv/put
+		request_body='{"request_id":"bench-{{id}}","key":"bench-{{id}}","value":"{{base64id}}"}'
+		oracle_flag=-verify-applied-receipt
+		receipt_oracle=applied-mutation-v1 ;;
+esac
 metric_nodes=(n0 n1 n2)
 case "$failed_node" in
 	n0) metric_nodes=(n1 n2) ;;
@@ -288,9 +356,8 @@ elif [[ $(uname -s) == Linux ]]; then
 	resource_before=$(sample_benchmark_voters)
 	resource_status=measured
 fi
-"$run_dir/rhiza-bench" -url "$target" -path /sql/execute \
-	-body '{"request_id":"bench-{{id}}","sql":"INSERT INTO benchmark_writes(id) VALUES ({{id}})"}' \
-	-n "$requests" -c "$concurrency" -commit-unknown-retries 3 -verify-insert-receipt "${control_args[@]+${control_args[@]}}" >"$result_file" &
+"$run_dir/rhiza-bench" -url "$target" -path "$request_path" -body "$request_body" \
+	-n "$requests" -c "$concurrency" -commit-unknown-retries 3 "$oracle_flag" "${control_args[@]+${control_args[@]}}" >"$result_file" &
 bench_pid=$!
 overlap='null'
 fault_exit_status=null
@@ -342,16 +409,53 @@ if [[ $failed_node != none ]]; then
 		exit 1
 	fi
 fi
-count=$(curl -fsS -H 'Content-Type: application/json' \
-	-d "{\"sql\":\"SELECT COUNT(*), COUNT(CASE WHEN id >= 0 AND id < $requests THEN 1 END) FROM benchmark_writes\",\"consistency\":\"linearizable\"}" \
-	"$target/sql/query")
+write_object_delta=null
+publication=null
+if [[ $failed_node == none && ( -n ${RHIZA_SERVER_BENCH_WORKLOAD:-} || $publish_async == 1 ) ]]; then
+	write_object_delta=$(object_stats_delta "$object_before" "$(object_stats)")
+fi
+jq -e --argjson requests "$requests" --arg oracle "$receipt_oracle" \
+	'.errors == 0 and .successes == $requests and .receipt_oracle == $oracle' <<<"$result" >/dev/null
+case "$workload" in
+	sql)
+		count=$(curl -fsS -H 'Content-Type: application/json' \
+			-d "{\"sql\":\"SELECT COUNT(*), COUNT(CASE WHEN id >= 0 AND id < $requests THEN 1 END) FROM benchmark_writes\",\"consistency\":\"linearizable\"}" \
+			"$target/sql/query")
+		verify_benchmark_rows "$requests" <<<"$count" ;;
+	graph)
+		rows=$(curl -fsS -H 'Content-Type: application/json' \
+			-d '{"cypher":"MATCH (n:BenchmarkNode) RETURN n.id","consistency":"linearizable"}' "$target/graph/query")
+		verify_graph_rows "$requests" <<<"$rows"
+		count=$(jq -c '{exact_identity_rows:(.rows | length),applied_slot}' <<<"$rows") ;;
+	kv)
+		# One linearizable read establishes the read point on the same voter;
+		# the immutable benchmark keys are then read without N read barriers.
+		curl -fsS -H 'Content-Type: application/json' \
+			-d '{"key":"bench-0","consistency":"linearizable"}' "$target/kv/get" >/dev/null
+		count=$("$run_dir/rhiza-bench" -url "$target" -path /kv/get \
+			-body '{"key":"bench-{{id}}","consistency":"local"}' -n "$requests" -c "$concurrency" -verify-kv-value)
+		jq -e --argjson requests "$requests" \
+			'.errors == 0 and .successes == $requests and .receipt_oracle == "kv-benchmark-value-v1"' <<<"$count" >/dev/null ;;
+esac
 object_after=$(object_stats)
-object_delta=$(jq -nc --argjson before "$object_before" --argjson after "$object_after" \
-	'reduce ((($before|keys_unsorted) + ($after|keys_unsorted)) | unique[]) as $key
-		({}; .[$key] = (($after[$key] // 0) - ($before[$key] // 0)))')
+object_delta=$(object_stats_delta "$object_before" "$object_after")
 object_metric_nodes=$(printf '%s\n' "${metric_nodes[@]}" | jq -R . | jq -sc .)
-jq -e --argjson requests "$requests" '.errors == 0 and .successes == $requests and .receipt_oracle == "sql-insert-id-v1"' <<<"$result" >/dev/null
-verify_benchmark_rows "$requests" <<<"$count"
+if [[ $publish_async == 1 ]]; then
+	cut_before=$(curl -fsS --max-time 5 "$target/recovery/status")
+	publish_object_before=$(object_stats)
+	publish_seconds=$(curl -fsS --max-time 35 -X POST -H "Authorization: Bearer $admin_token" \
+		-o "$run_dir/publication.json" -w '%{time_total}' "$target/recovery/archive")
+	publish_object_after=$(object_stats)
+	cut_after=$(curl -fsS --max-time 5 "$target/recovery/status")
+	if ! jq -e '.status == "archived"' "$run_dir/publication.json" >/dev/null ||
+		! verify_publication_cut "$target_node" "$cut_before" "$cut_after" >/dev/null; then
+		printf 'Async publication did not cover the certified applied cut: before=%s after=%s\n' "$cut_before" "$cut_after" >&2
+		exit 1
+	fi
+	publication=$(jq -nc --argjson seconds "$publish_seconds" --argjson before "$cut_before" --argjson after "$cut_after" \
+		--argjson delta "$(object_stats_delta "$publish_object_before" "$publish_object_after")" \
+		'{forced:true,elapsed_seconds:$seconds,object_store_delta:$delta,before:$before,after:$after}')
+fi
 runtime_failure_lines=0
 for log in "$run_dir"/node-*.log; do
 	log_failures=$(grep -Ei 'error|failed|timeout' "$log" | grep -Eivc 'failed to sufficiently increase receive buffer size' || true)
@@ -359,6 +463,10 @@ for log in "$run_dir"/node-*.log; do
 done
 jq -nc --argjson result "$result" --argjson count "$count" --argjson overlap "$overlap" --argjson fault_exit_status "$fault_exit_status" --arg client_revision "$client_revision" --arg client_sha256 "$client_sha256" --argjson concurrency "$concurrency" --argjson runtime_failure_lines "$runtime_failure_lines" --argjson max_fault_latency_ms "$max_fault_latency_ms" --argjson object_delta "$object_delta" --argjson object_metric_nodes "$object_metric_nodes" --arg failed_node "$failed_node" --arg target_node "$target_node" --arg durability "$durability" --arg fault_after "$fault_after" \
 	'{transport:"HTTP client + three QUIC voters",client_revision:$client_revision,client_sha256:$client_sha256,receipt_oracle:"sql-insert-id-v1",fault_overlap:$overlap,fault_exit_status:$fault_exit_status,fault_instrumentation:(if $failed_node == "none" then "disabled" else "pidfd-single-coordinator-monotonic-interval-v2" end),durability_mode:$durability,ack_contract:(if $durability == "before-ack" then "quorum WAL sync and object-store durability before acknowledgement" else "quorum WAL sync; object-store publication async" end),failure_mode:(if $failed_node == "none" then "healthy" else "peer-sigkill-during-load" end),failed_node:$failed_node,target_node:$target_node,fault_after:(if $failed_node == "none" then null else $fault_after end),max_fault_latency_ms:(if $failed_node == "none" then null else $max_fault_latency_ms end),concurrency:$concurrency,object_metric_nodes:$object_metric_nodes,object_measurement:"after schema through final linearizable verification",object_store_delta:$object_delta,runtime_failure_lines:$runtime_failure_lines,result:$result,verification:$count}' \
-	| jq -c --arg status "$resource_status" --argjson resources "$resource_summary" '. + {voter_resource_status:$status,voter_resources:$resources}' \
+	| jq -c --arg status "$resource_status" --argjson resources "$resource_summary" \
+		--arg workload "$workload" --arg oracle "$receipt_oracle" --argjson writes "$write_object_delta" --argjson publication "$publication" \
+		'. + {workload:$workload,receipt_oracle:$oracle,voter_resource_status:$status,voter_resources:$resources,
+			write_object_store_delta:$writes,async_publication:$publication}
+		 | if $workload != "sql" then .object_measurement = "after setup through final verification" else . end' \
 	| tee "$output_file"
 jq -e '.runtime_failure_lines == 0 and (.failed_node == "none" or .result.max_ms <= .max_fault_latency_ms)' "$output_file" >/dev/null

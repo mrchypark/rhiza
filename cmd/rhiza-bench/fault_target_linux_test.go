@@ -111,7 +111,7 @@ func TestFaultActualHTTPAndPidfdSignal(t *testing.T) {
 	var requestErr error
 	go func() {
 		defer close(done)
-		_, _, _, requestErr = doRequest(requestCtx, server.Client(), http.MethodPost, server.URL, `{"request_id":"bench-0","sql":"INSERT INTO benchmark_writes(id) VALUES (0)"}`, 0, true)
+		_, _, _, requestErr = doRequest(requestCtx, server.Client(), http.MethodPost, server.URL, `{"request_id":"bench-0","sql":"INSERT INTO benchmark_writes(id) VALUES (0)"}`, 0, validateInsertReceipt)
 		finish(time.Now())
 	}()
 	t.Cleanup(func() { cancel(); once.Do(func() { close(release) }); <-done })
