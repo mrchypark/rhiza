@@ -28,6 +28,21 @@ func TestActualManagedPeerLearnRequiresRuntimeBinding(t *testing.T) {
 			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 			defer cancel()
 			configs, fixture := sqlClusterForProtocol(t, protocol)
+			var checkpointRootPUT <-chan string
+			if protocol == sqlpolicy.ManagedRequestAppendOnlyApplicationProtocol {
+				// Hold every SQL candidate before it can certify a checkpoint seal.
+				// BeforeAck archives and the Graph first-root publisher stay live.
+				entered, release := make(chan string), make(chan struct{})
+				rootPrefix := "/bucket/" + fixture.source.finalPrefix + "/checkpoint/roots/"
+				fixture.source.putReady, fixture.source.putRelease = entered, release
+				fixture.source.putPrefix, fixture.source.putSuffix = rootPrefix, ".json"
+				fixture.source.putGate = func(_ context.Context, path string) bool {
+					return strings.HasPrefix(path, rootPrefix)
+				}
+				checkpointRootPUT = entered
+				// Hosts close and cancel the blocked requests before this cleanup.
+				t.Cleanup(func() { close(release) })
+			}
 			var crGets atomic.Int64
 			client := *configs[0].Store.Kube.Client
 			base := client.Transport
@@ -120,6 +135,16 @@ func TestActualManagedPeerLearnRequiresRuntimeBinding(t *testing.T) {
 				}
 				return applied
 			}
+			if checkpointRootPUT != nil {
+				select {
+				case <-checkpointRootPUT:
+				case <-ctx.Done():
+					t.Fatal("SQL checkpoint root PUT never reached the gate", ctx.Err())
+				}
+			}
+			if applied := readApplied(); applied < uint64(decision.Slot) {
+				t.Fatalf("first Learned did not apply slot %d on B: applied=%d", decision.Slot, applied)
+			}
 			fixture.mu.Lock()
 			saved := append(json.RawMessage(nil), fixture.obj["status"]...)
 			fixture.mu.Unlock()
@@ -149,8 +174,15 @@ func TestActualManagedPeerLearnRequiresRuntimeBinding(t *testing.T) {
 				if err := transport.SendDecision(ctx, decision); err != nil {
 					t.Fatalf("CR drift rejected certified idempotent Learned: %v", err)
 				}
-				if !reflect.DeepEqual(before, readWAL()) || applied != readApplied() || crGets.Load() != gets {
-					t.Fatal("duplicate Learned appended WAL, applied again, or queried the CR")
+				after, appliedAfter, getsAfter := readWAL(), readApplied(), crGets.Load()
+				if !reflect.DeepEqual(before, after) {
+					t.Errorf("duplicate Learned changed WAL (authority missing=%t): entries %d -> %d", missing, len(before), len(after))
+				}
+				if applied != appliedAfter {
+					t.Errorf("duplicate Learned changed applied slot (authority missing=%t): %d -> %d", missing, applied, appliedAfter)
+				}
+				if gets != getsAfter {
+					t.Errorf("duplicate Learned changed CR GET count (authority missing=%t): %d -> %d", missing, gets, getsAfter)
 				}
 			}
 			fixture.mu.Lock()
