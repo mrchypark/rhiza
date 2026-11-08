@@ -11,7 +11,9 @@ import (
 	"path/filepath"
 	"sort"
 	"sync"
+	"time"
 
+	"github.com/mrchypark/rhiza/internal/asyncperfprobe"
 	"github.com/mrchypark/rhiza/internal/localtesthooks"
 )
 
@@ -730,8 +732,16 @@ func (w *WAL) Append(entry Entry) error {
 // Sync flushes the current segment. Older segments are immutable and synced
 // before rollover.
 func (w *WAL) Sync() error {
+	queued := asyncperfprobe.Stamp()
+	var start, end time.Time
 	w.mu.Lock()
-	defer w.mu.Unlock()
+	defer func() {
+		w.mu.Unlock()
+		if !start.IsZero() {
+			asyncperfprobe.Slow("wal_wait", queued, start)
+			asyncperfprobe.Slow("wal_fsync", start, end)
+		}
+	}()
 	if w.readOnly {
 		return nil
 	}
@@ -744,7 +754,10 @@ func (w *WAL) Sync() error {
 	}
 	w.current.mu.Lock()
 	defer w.current.mu.Unlock()
-	if err := w.current.file.Sync(); err != nil {
+	start = asyncperfprobe.Stamp()
+	err := w.current.file.Sync()
+	end = asyncperfprobe.Stamp()
+	if err != nil {
 		return err
 	}
 	w.dirty = false

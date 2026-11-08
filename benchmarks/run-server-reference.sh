@@ -497,6 +497,9 @@ elif [[ $(uname -s) == Linux ]]; then
 	resource_status=measured
 	host_before=$(sample_benchmark_host /proc)
 fi
+if [[ ${RHIZA_ASYNC_STAGE_PROBE:-0} == 1 ]]; then
+	printf 'ASYNC_WINDOW_BEGIN_NS=%s\n' "$(date +%s%N)" >&2
+fi
 "$run_dir/rhiza-bench" -url "$target" -path "$request_path" -body "$request_body" \
 	-n "$requests" -c "$concurrency" -commit-unknown-retries 3 "$oracle_flag" "${control_args[@]+${control_args[@]}}" >"$result_file" &
 bench_pid=$!
@@ -534,6 +537,9 @@ if [[ $failed_node != none ]]; then
 	fi
 fi
 wait_benchmark_child
+if [[ ${RHIZA_ASYNC_STAGE_PROBE:-0} == 1 ]]; then
+	printf 'ASYNC_WINDOW_END_NS=%s\n' "$(date +%s%N)" >&2
+fi
 if [[ $resource_status == measured ]]; then
 	host_after=$(sample_benchmark_host /proc)
 fi

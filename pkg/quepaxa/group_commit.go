@@ -4,6 +4,8 @@ import (
 	"context"
 	"sync"
 	"time"
+
+	"github.com/mrchypark/rhiza/internal/asyncperfprobe"
 )
 
 const (
@@ -12,13 +14,14 @@ const (
 )
 
 type groupCommit struct {
-	sync    func() error
-	mu      sync.Mutex
-	pending *commitBatch
-	running bool
-	wake    chan struct{}
-	delay   time.Duration
-	max     int
+	sync         func() error
+	mu           sync.Mutex
+	pending      *commitBatch
+	pendingSince time.Time
+	running      bool
+	wake         chan struct{}
+	delay        time.Duration
+	max          int
 }
 
 type commitBatch struct {
@@ -41,6 +44,7 @@ func (g *groupCommit) syncBatch(ctx context.Context, immediate bool) error {
 	g.mu.Lock()
 	if g.pending == nil {
 		g.pending = &commitBatch{done: make(chan struct{})}
+		g.pendingSince = asyncperfprobe.Stamp()
 	}
 	batch := g.pending
 	batch.waiters++
@@ -73,10 +77,17 @@ func (g *groupCommit) flush() {
 		}
 		g.mu.Lock()
 		batch := g.pending
+		queued := g.pendingSince
 		g.pending = nil
 		g.mu.Unlock()
+		start := asyncperfprobe.Stamp()
 		batch.err = g.sync()
+		end := asyncperfprobe.Stamp()
 		close(batch.done)
+		if !start.IsZero() {
+			asyncperfprobe.Slow("group_queue", queued, start)
+			asyncperfprobe.Slow("group_flush", start, end)
+		}
 		g.mu.Lock()
 		if g.pending == nil {
 			g.running = false

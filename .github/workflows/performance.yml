@@ -58,11 +58,16 @@ on:
         type: boolean
         default: false
 
+      e2e_async_stage_probe:
+        description: Record slow WAL and group-commit stages in Async matrix samples
+        type: boolean
+        default: false
+
 permissions:
   contents: read
 
 concurrency:
-  group: performance-${{ github.event.pull_request.number || github.ref }}${{ inputs.e2e_cost_matrix && format('-e2e-cost-matrix-{0}', inputs.e2e_cost_provider || 's3') || '' }}
+  group: performance-${{ github.event.pull_request.number || github.ref }}${{ inputs.e2e_cost_matrix && format('-e2e-cost-matrix-{0}', inputs.e2e_cost_provider || 's3') || '' }}${{ inputs.e2e_async_stage_probe && '-stage-probe' || '' }}
   cancel-in-progress: true
 
 jobs:
@@ -388,6 +393,8 @@ jobs:
 
       - name: Run interleaved server cost matrix
         if: ${{ !inputs.e2e_sql_async_isolation }}
+        env:
+          ASYNC_STAGE_PROBE: ${{ inputs.e2e_async_stage_probe && '1' || '0' }}
         run: |
           evidence="$RUNNER_TEMP/rhiza-e2e-cost"
           harness_sha=$(git rev-parse HEAD)
@@ -404,6 +411,7 @@ jobs:
                 for revision in "${revisions[@]}"; do
                   result="$evidence/$workload-$durability-$revision-$sample"
                   status=0
+                  RHIZA_ASYNC_STAGE_PROBE="$((publish * ASYNC_STAGE_PROBE))" \
                   RHIZA_SERVER_BENCH_WORKLOAD="$workload" \
                     RHIZA_SERVER_BENCH_DURABILITY="$durability" \
                     RHIZA_SERVER_BENCH_ASYNC_PUBLISH="$publish" \
@@ -485,6 +493,18 @@ jobs:
           grep -Eq '^BenchmarkGraphApply-[0-9]+[[:space:]]' "$evidence/graph-apply-benchmark.txt"
           go tool pprof -top -cum "$binary" "$RUNNER_TEMP/graph-apply.cpu" >"$evidence/graph-apply-cpu-top.txt"
           go tool pprof -top -alloc_space "$binary" "$RUNNER_TEMP/graph-apply.mem" >"$evidence/graph-apply-alloc-top.txt"
+
+      - name: Compare SQL batch apply separately from E2E measurements
+        if: ${{ inputs.e2e_cost_provider != 'gcs' && !inputs.e2e_async_stage_probe }}
+        run: |
+          evidence="$RUNNER_TEMP/rhiza-e2e-cost"
+          for revision in base candidate; do
+            (
+              cd "$RUNNER_TEMP/rhiza-e2e-$revision"
+              go test ./pkg/materializer -run '^$' -bench '^BenchmarkSQLBatchApply$' -benchtime=300ms -count=3 -benchmem
+            ) | tee "$evidence/sql-batch-apply-$revision.txt"
+            grep -Eq '^BenchmarkSQLBatchApply/[0-9]+-[0-9]+[[:space:]]' "$evidence/sql-batch-apply-$revision.txt"
+          done
 
       - name: Upload server cost evidence
         if: always()
