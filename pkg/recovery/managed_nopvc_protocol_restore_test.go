@@ -3,6 +3,7 @@ package recovery
 import (
 	"context"
 	"path/filepath"
+	"reflect"
 	"testing"
 	"time"
 
@@ -170,6 +171,81 @@ func TestManagedNoPVCGraphProtocolOpenPublishLoadReconstructs(t *testing.T) {
 			t.Fatalf("reconstructed retained original %q missing: found=%t err=%v", id, found, err)
 		}
 	}
+
+	t.Run("published-only-excludes-unpublished-graph-tail", func(t *testing.T) {
+		const policy = sqlpolicy.ManagedGraphRequestMaterializationPolicy
+		const tail = "graph-unpublished"
+		readonly := &haReadOnlyRecordingBucket{Bucket: bucket}
+		before := requestViewBucketHashes(t, ctx, bucket)
+		published, err := OpenReadOnlyViewForApplicationProtocol(ctx, readonly, "graph-nopvc", 1, bootstrap, policy, window, protocol, false)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if published.Tip() != suffixSlot || published.Tip() != core.Tip() || published.Tip() != archive.Tip() {
+			t.Fatalf("published tip=%d, want suffix=%d, core=%d, archive=%d", published.Tip(), suffixSlot, core.Tip(), archive.Tip())
+		}
+		value, err := types.EncodeManagedGraphExecution(types.GraphCommand{RequestID: tail, Cypher: "CREATE (:NoPVCGraph {id:'unpublished'})"})
+		if err != nil {
+			t.Fatal(err)
+		}
+		slot, _, err := core.Propose(ctx, value)
+		if err != nil {
+			t.Fatal(err)
+		}
+		d, ok := core.CertifiedValue(slot)
+		if !ok || len(d.Certificate) == 0 || slot <= published.Tip() {
+			t.Fatalf("missing later certified tail at slot %d", slot)
+		}
+		if err := core.EnsureDurableThrough(ctx, slot); err != nil {
+			t.Fatal(err)
+		}
+		if err := producer.ApplyBatch(ctx, []quepaxa.DecidedValue{d}); err != nil {
+			t.Fatal(err)
+		}
+		const query = "MATCH (n:NoPVCGraph) RETURN n.id ORDER BY n.id"
+		if rows, err := producer.GraphQuery(ctx, query, nil); err != nil || !reflect.DeepEqual(rows.Rows, [][]any{{"base"}, {"suffix"}, {"unpublished"}}) {
+			t.Fatalf("producer nodes=%v err=%v", rows.Rows, err)
+		}
+		if _, found, err := producer.RetainedRequestOriginal(ctx, types.MutationGraph, tail); err != nil || !found {
+			t.Fatalf("producer tail original missing: found=%t err=%v", found, err)
+		}
+		restore, err := PrepareReadOnlyRestoreForPolicy(ctx, published, filepath.Join(t.TempDir(), "published-only"), policy, window)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if restore.Tip != published.Tip() || restore.HeadHash != published.HeadHash() || restore.PrefixHash != published.PrefixHash() {
+			t.Fatal("restore changed the pinned published cut")
+		}
+		// Inspect only the isolated materializer, without opening a voter.
+		m, err := materializer.OpenManagedSQLKVGraphWithAppendOnlyOriginals(restore.SQLitePath, 1, window)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer func() {
+			if err := m.Close(); err != nil {
+				t.Error(err)
+			}
+		}()
+		if rows, err := m.GraphQuery(ctx, query, nil); err != nil || !reflect.DeepEqual(rows.Rows, [][]any{{"base"}, {"suffix"}}) {
+			t.Fatalf("restored nodes=%v err=%v", rows.Rows, err)
+		}
+		for _, id := range []string{"graph-base", "graph-suffix"} {
+			want, found, err := producer.RetainedRequestOriginal(ctx, types.MutationGraph, id)
+			if err != nil || !found {
+				t.Fatalf("producer original %q missing: found=%t err=%v", id, found, err)
+			}
+			got, found, err := m.RetainedRequestOriginal(ctx, types.MutationGraph, id)
+			if err != nil || !found || !reflect.DeepEqual(got, want) {
+				t.Fatalf("restored original/receipt %q differs: found=%t err=%v", id, found, err)
+			}
+		}
+		if _, found, err := m.RetainedRequestOriginal(ctx, types.MutationGraph, tail); err != nil || found {
+			t.Fatalf("unpublished tail original: found=%t err=%v", found, err)
+		}
+		if readonly.mutations != 0 || !reflect.DeepEqual(before, requestViewBucketHashes(t, ctx, bucket)) {
+			t.Fatal("source objects changed or read-only path attempted a mutation")
+		}
+	})
 }
 
 func TestManagedNoPVCRecoveryProtocolBoundariesAndLegacyFunctionTypes(t *testing.T) {

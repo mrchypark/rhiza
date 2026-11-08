@@ -20,7 +20,7 @@ func TestManagedSQLLocalReadsRemainReadyWithoutQuorum(t *testing.T) {
 	if _, err := h.Execute(ctx, ExecuteRequest{RequestID: "local-read-create", SQL: "CREATE TABLE local_read(value)"}); err != nil {
 		t.Fatal(err)
 	}
-	if err := hosts[1].Close(); err != nil {
+	if err := fixture.closeHost(hosts[1]); err != nil {
 		t.Fatal(err)
 	}
 	checkLocal := func() {

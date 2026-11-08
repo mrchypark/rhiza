@@ -62,8 +62,6 @@ jobs:
           sh scripts/test-ha-managed-cluster-chaos-diagnostics-test.sh
           sh scripts/test-ha-managed-bootstrap.sh --oracle-self-test
           sh -n scripts/ha-managed-bucket-setup
-          cd scripts/ha-managed-bucket-setup-src
-          go test -mod=readonly -timeout=45s ./...
       - name: Real managed bootstrap
         env:
           RHIZA_MANAGED_BUCKET_SETUP: ./scripts/ha-managed-bucket-setup

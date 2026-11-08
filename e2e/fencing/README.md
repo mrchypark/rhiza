@@ -1,5 +1,11 @@
 # Generic cooperative fencing runtime qualification
 
+> **Historical qualification record.** The fixture and evidence contract below
+> do not describe the current managed installation. Current production
+> Dockerfiles no longer ship `rhiza-fencer`; the disposable
+> `Dockerfile.fencing-test` remains a separate fixture. See the
+> [managed operator guide](../../deploy/operator/README.md) for current scope.
+
 Only `cooperative-fencing-results/public` is uploaded. The driver's
 `safe-artifacts` command projects explicit image/identity/proof/readback fields,
 resource identity summaries, and a cleanup boolean. Raw CRI/containerd/Kind logs,
@@ -10,11 +16,12 @@ and allowlisted descriptor links, not raw image configuration or annotations.
 Package tests inject credential canaries to guard this boundary. This packet
 format change does not weaken the runtime fencing or readback checks.
 
-GitHub Actions builds the server, operator and supervisor from the same source
-and includes them in the disposable `Dockerfile.fencing-test` image, tagged
-`rhiza-fencing-host:local` and `rhiza-fencing-operator:local`. The repository's
-production Dockerfiles also include `rhiza-fencer`; this fixture image is never
-published and does not substitute for their image-build checks. Then run:
+The historical workflow built the server, operator and supervisor from the
+same source in the disposable `Dockerfile.fencing-test` image, tagged
+`rhiza-fencing-host:local` and `rhiza-fencing-operator:local`. Production
+Dockerfiles at the time also included `rhiza-fencer`. The fixture image was
+not published and did not substitute for production image-build checks. The
+recorded invocation was:
 
 ```sh
 CGO_ENABLED=0 go build -o "$RUNNER_TEMP/rhiza-fencing-e2e" ./e2e/fencing

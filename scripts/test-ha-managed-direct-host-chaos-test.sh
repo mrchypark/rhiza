@@ -2,6 +2,35 @@
 # Offline guardrails for direct-host mode. No kubectl/API calls.
 set -eu
 cd "$(CDPATH='' cd -- "$(dirname -- "$0")/.." && pwd)"
+if [ "${1-}" = --overlay-self-test ]; then
+  scratch=$(mktemp -d)
+  trap 'rm -f "$scratch"/overlay.json "$scratch"/direct-overlay-created.tsv "$scratch"/overlay-delete.json; rmdir "$scratch"' EXIT HUP INT TERM
+  private=$scratch logs=$scratch namespace=test-ns
+  direct=scripts/test-ha-managed-direct-host-chaos.sh
+  for helper in project_direct_overlay direct_overlay_path delete_direct_overlay; do
+    definition=$(sed -n "/^$helper() {/,/^}/p" "$direct")
+    [ -n "$definition" ]
+    eval "$definition"
+  done
+  jq -n '{items:(["Role","RoleBinding","ServiceAccount"] | map(. as $k | ["rhiza-operator","rhiza-managed-host"][] | {kind:$k,metadata:{name:.},rules:[{resources:["pods"],verbs:["get"]}]+(if $k=="Role" and .=="rhiza-operator" then [{resources:["rhizarecoveries"],verbs:["create"]},{resources:["rhizarecoveries/status"],verbs:["update"]}] else [] end)}) + [{kind:"Deployment",metadata:{name:"rhiza-operator"}}])}' > "$scratch/overlay.json"
+  project_direct_overlay "$scratch/overlay.json" | jq -e '[.items[]|select(.kind=="Role")|.rules[]]==[{resources:["pods"],verbs:["get"]},{resources:["pods"],verbs:["get"]}]' >/dev/null
+  calls=0
+  hn() {
+    calls=$((calls+1))
+    [ "$*" = "delete --raw /apis/rbac.authorization.k8s.io/v1/namespaces/test-ns/roles/rhiza-operator -f $scratch/overlay-delete.json" ] || return 1
+    jq -e '.preconditions.uid=="created-uid"' "$scratch/overlay-delete.json" >/dev/null
+  }
+  delete_direct_overlay
+  [ "$calls" = 0 ]
+  printf 'Role\trhiza-operator\tcreated-uid\n' > "$scratch/direct-overlay-created.tsv"
+  delete_direct_overlay
+  [ "$calls" = 1 ]
+  printf 'Role\tunowned\tother-uid\n' > "$scratch/direct-overlay-created.tsv"
+  if delete_direct_overlay; then exit 1; fi
+  [ "$calls" = 1 ]
+  printf '%s\n' 'PASS: exact overlay projection and UID-conditioned owned deletion'
+  exit 0
+fi
 if [ "${1-}" = --podchaos-self-test ]; then
   scratch=$(mktemp -d "${TMPDIR:-/tmp}/rhiza-kind-chaos-oracles.XXXXXX")
   trap 'rm -f "$scratch"/*.json "$scratch"/*.jsonl "$scratch"/*.txt "$scratch"/*.exit; rmdir "$scratch"' EXIT HUP INT TERM
@@ -103,15 +132,19 @@ if [ "${1-}" = --podchaos-self-test ]; then
     rm -f "$scratch/calls.txt" "$scratch/pod-kill-AllInjected-wait.exit"
   done
   cleanup_helper=$(sed -n '/^cleanup() {/,/^}/p' scripts/test-ha-managed-bootstrap.sh)
+  private_cleanup_helper=$(sed -n '/^cleanup_managed_private() {/,/^}/p' scripts/test-ha-managed-bootstrap.sh)
+  [ -n "$private_cleanup_helper" ]
   mkdir "$scratch/cleanup-private"
+  : > "$scratch/cleanup-private/managed-install.jsonl"
   cleanup_exit=0
-  sh -c 'set +e; logs=$1 private=$1/cleanup-private owned=0 built=0; eval "$2"; (exit 17); cleanup' fixture "$scratch" "$cleanup_helper" || cleanup_exit=$?
+  sh -c 'set +e; logs=$1 private=$1/cleanup-private owned=0 built=0; eval "$3"; eval "$2"; (exit 17); cleanup' fixture "$scratch" "$cleanup_helper" "$private_cleanup_helper" || cleanup_exit=$?
   [ "$cleanup_exit" = 17 ] && [ "$(cat "$scratch/driver-original.exit")" = 17 ] && [ "$(cat "$scratch/driver.exit")" = 17 ]
   [ ! -e "$scratch/cleanup-private" ]
   printf '%s\n' 'PASS: actual PodChaos request/record/CRI callbacks and failure exit controls'
   exit 0
 fi
 sh "$0" --podchaos-self-test
+sh "$0" --overlay-self-test
 direct=scripts/test-ha-managed-direct-host-chaos.sh
 shared=scripts/ha-managed-podchaos.sh
 bootstrap=scripts/test-ha-managed-bootstrap.sh

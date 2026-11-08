@@ -3,6 +3,9 @@
 set -eu
 cd "$(CDPATH='' cd -- "$(dirname -- "$0")/.." && pwd)"
 [ "${GITHUB_ACTIONS-}" = true ] || { echo 'GitHub Actions only' >&2; exit 1; }
+[ "${RHIZA_MANAGED_FIXTURE_CASE:-internal}" = internal ] || { echo 'vcluster qualifies only the internal profile' >&2; exit 1; }
+[ -z "${RHIZA_MANAGED_TEST_DOCKERFILE-}" ] || { echo 'vcluster requires the reference host image' >&2; exit 1; }
+command -v yq >/dev/null || { echo 'vcluster requires the pinned YAML renderer' >&2; exit 1; }
 : "${RUNNER_TEMP:?}" "${GITHUB_RUN_ID:?}" "${GITHUB_RUN_ATTEMPT:?}" "${GITHUB_SHA:?}"
 : "${RHIZA_HOST_KUBECONFIG:?}" "${RHIZA_HOST_CONTEXT:?}" "${RHIZA_HOST_NAMESPACE:?}" "${RHIZA_HOST_NAMESPACE_UID:?}" "${RHIZA_HOST_SERVICEACCOUNT_UID:?}" "${RHIZA_RELEASE_IMAGE:?}"
 : "${RHIZA_HOST_NODE:?existing Ready node hostname label, verified by administrator}"
@@ -277,6 +280,7 @@ cleanup() {
   done
   # Only this private run directory: credentials are never uploaded as artifacts.
   rm -f "$private/virtual.config" "$private/runtime.json" "$private/admin.token" "$private/curl.conf" "$private/request.body" "$private/chart.tgz" "$private/values.yaml" "$private/rendered.yaml" "$private/forward.log" "$private/bucket-forward.log" "$private/dns-probe.json" "$private/dns-probe-status.raw.json" "$private/floci-endpoints.raw.json" "$private/floci-endpoints.stderr" "$private/coredns-current.raw.log" "$private/coredns-previous.raw.log" "$private/virtual-dns-pods.raw.json" "$private/virtual-dns-services.raw.json" "$private/virtual-dns-endpoints.raw.json" "$private/virtual-dns-endpointslices.raw.json" "$private/virtual-dns-pods.stderr" "$private/virtual-dns-services.stderr" "$private/virtual-dns-endpoints.stderr" "$private/virtual-dns-endpointslices.stderr" "$RUNNER_TEMP/ha-managed-cluster-bucket-setup"
+  rm -f "$private/managed-install.jsonl" || result=1
   rmdir "$private" || result=1
   [ "$original_result" -eq 0 ] || result=$original_result
   printf '%s\n' "$result" > "$logs/driver.exit"
@@ -391,7 +395,7 @@ capture_managed_logs() {
 
   # Extract only Pod/container names from API responses; never save Pod specs,
   # environment values, Secret references or projected profile data.
-  capture_selector_logs operator 'app=operator'
+  capture_selector_logs operator 'app.kubernetes.io/name=rhiza-operator'
   if [ -n "${uid-}" ]; then
     capture_selector_logs managed "rhiza.mrchypark.dev/cluster-uid=$uid"
   fi
@@ -472,8 +476,18 @@ chaos_fault() {
   fault=
 }
 managed_pod_fault() {
-  k -n "$namespace" exec "$1" -c sql -- sha256sum /var/lib/rhiza/data/qlog/voter-identity.json > "$logs/old-voter-identity.txt"
+  k -n "$namespace" exec "$1" -c sql -- sha256sum /var/lib/rhiza/data/qlog/voter-identity.json > "$logs/prior-voter-identity.txt"
+  if [ -f "$logs/old-voter-identity.txt" ]; then
+    managed_replacement_identity_oracle "$logs/old-voter-identity.txt" "$logs/prior-voter-identity.txt"
+  fi
+  cp "$logs/prior-voter-identity.txt" "$logs/old-voter-identity.txt"
   chaos_fault pod-kill pod-kill "$1" "$2"
+  if [ ! -f "$logs/first-pod-kill-request.json" ]; then
+    for suffix in virtual-before host-before request injected host-after before-delete after-delete; do
+      cp "$logs/pod-kill-$suffix.json" "$logs/first-pod-kill-$suffix.json"
+    done
+    cp "$logs/old-voter-identity.txt" "$logs/first-old-voter-identity.txt"
+  fi
 }
 managed_container_fault() {
   k -n "$namespace" exec "$1" -c sql -- sha256sum /var/lib/rhiza/data/qlog/voter-identity.json > "$logs/replacement-voter-identity.txt"
@@ -482,12 +496,19 @@ managed_container_fault() {
   fi
   chaos_fault container-kill container-kill "$1" "$2"
 }
+managed_verify_first_manual_pod_fault() {
+  [ -f "$logs/first-pod-kill-after-delete.json" ] && [ ! -s "$logs/first-pod-kill-after-delete.json" ] &&
+    jq -e --arg pod "$1" --arg uid "$2" '.metadata.name==$pod and .metadata.uid==$uid' "$logs/first-pod-kill-virtual-before.json" >/dev/null &&
+    jq -e '.items|length==0' "$logs/first-pod-kill-host-after.json" >/dev/null || return 1
+  printf '%s\n' 'First Pod kill: exact virtual/host mapping, scoped injection and host Pod API absence; no host CRI proof.' > "$logs/manual-first-pod-fault.txt"
+}
 . scripts/ha-managed-bootstrap-fixture.sh
 capture_virtual_dns before-sql-fixture || :
+managed_manual_proof=vcluster
 managed_fixture
 # No synthetic virtual delete fallback: common oracle requires new virtual UID
 # and a Completed certified replacement after the host Chaos Mesh pod-kill.
 run_client insert-after-chaos execute '{"request_id":"chaos-final-insert","sql":"INSERT INTO bootstrap_ci VALUES (2, '\''after-chaos'\'')"}'
 run_client query-after-chaos query '{"sql":"SELECT id, value FROM bootstrap_ci ORDER BY id"}'
 jq -e '.rows==[[1,"real-kubelet"],[2,"after-chaos"]]' "$logs/query-after-chaos.json" >/dev/null
-printf '%s\n' 'PASS: released-image managed HA in isolated Kubernetes vcluster; actual host Chaos Mesh pod-kill/container-kill, certified replacement, same-Pod identity retention, NoPVC, ACK readback and new write' 'SCOPE: pinned in-namespace Floci S3; not live GCS, network partition, physical fencing, whole-quorum disaster recovery or performance qualification' > "$logs/result.txt"
+printf '%s\n' 'PASS: reference-host image in isolated Kubernetes vcluster; two scoped Pod kills, certified replacements, same-Pod container restart, NoPVC, SQL ACK readback and new write' 'SCOPE: pinned in-namespace Floci S3 and Pod API/Chaos evidence; not Rust/C ABI, host CRI, live cloud, network partition, physical fencing, whole-quorum disaster recovery or performance qualification' > "$logs/result.txt"

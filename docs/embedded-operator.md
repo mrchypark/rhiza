@@ -1,373 +1,117 @@
-# 임베딩 애플리케이션에서 Rhiza Operator 사용하기
+# 임베딩 애플리케이션과 Rhiza Operator
 
-## 현재 managed HA 계약
+이 문서는 현재 v1alpha2 managed HA의 역할과 운영 경계를 설명한다.
+배포 계약은 [Operator 안내](../deploy/operator/README.md)를, 장애별 대응은
+[복구 경계](recovery.md)를 먼저 확인한다. 라이브러리 버전만 올리면 임의의
+애플리케이션이 자동으로 managed HA에 연결되는 구조는 아니다.
 
-현재 Operator는 v1alpha2 Deployment Pod와 init-container identity handoff를
-사용한다. 설치한 private runtime profile이 필요하며, 정상 HA 이미지는
-`rhiza-operator`와 `rhiza-ha-init`을 제공한다. 별도 fencer Deployment나 외부
-lease 서비스는 정상 quorum 복구의 필수 구성 요소가 아니다.
+## 각 구성 요소가 맡는 일
 
-quorum이 살아 있으면 인증된 QuePaxa 경로로 새 ID와 새 WAL을 가진 learner를
-먼저 추가하고, certified prefix와 admission을 검증한 뒤 실패한 ID를 제거한다.
-분실한 WAL의 voter ID를 재사용하지 않는다. 동일 ID의 재가입에는 원래 WAL과
-현재 certified membership 검증이 필요하다. HA object data는 append-only이며
-online delete GC를 사용하지 않는다.
+| 구성 요소 | 현재 역할 |
+| --- | --- |
+| `rhiza-operator` | namespace의 초기화를 reconcile하고 설치된 private runtime profile과 Secret을 검증한다. generation 0 Deployment를 만들고 실제 Pod identity를 바탕으로 genesis와 bootstrap plan을 확정한다. |
+| Kubernetes Deployment와 kubelet | 설정된 replica 수를 유지하고 컨테이너를 재시작한다. 새 Pod의 생성만으로 투표 권한이 생기지는 않는다. |
+| 참조 managed host | background replacement loop에서 교체 후보를 관측하고, 살아 있는 quorum을 통해 ADD-first repair를 조정한다. |
+| Rhiza 엔진 | WAL identity, 현재 membership, 인증된 로그를 검증하고 learner catch-up과 결정의 인증·적용을 수행한다. |
+
+실제 경로는 [operator 진입점](../cmd/rhiza-operator/main.go),
+[초기화 reconciler](../pkg/operator/initializer_v1alpha2.go),
+[참조 host loop](../cmd/rhiza-ha-init/serve.go),
+[교체 coordinator](../pkg/managedsql/replacement.go)에서 확인할 수 있다.
+일반 요청마다 Kubernetes CR을 예약하고 완료하는 구조는 아니다.
+초기화·profile·membership·repair authority와 정상 요청의 엔진 실행 경로는 구분한다.
+
+## NoPVC Pod의 시작과 교체
+
+managed Pod는 [고정 Pod/init 계약](../pkg/operator/bootstrap_members_v1alpha2.go)을 따른다.
+두 init container와 main runtime은 같은 `emptyDir`를 사용한다.
+
+1. `rhiza-prepare-identity`가 실제 Pod UID에 결합된 identity handoff를 준비한다.
+2. `rhiza-await-bootstrap-plan`이 확정된 bootstrap plan 또는 repair 준비를 기다린다.
+3. main runtime이 profile·identity·인증된 자료를 검증하고 startup/adoption과 catch-up을 수행한다.
+
+현재 참조 profile은 main container에서 `rhiza-ha-init serve-managed-sql`을 실행한다.
+이미지에는 필요한 실행 파일이 있어야 하고 private runtime profile, 일치하는 Secret,
+ServiceAccount/RBAC, 공유 object store와 peer 네트워크가 준비되어야 한다.
+profile을 설치하지 않은 기본 initializer의 inert candidate는 실행 가능한 managed DB가 아니다.
+사용자 애플리케이션이 이 참조 host와 같은 통합을 구현했다고 자동으로 가정하지 않는다.
+
+### CR로 새 배포를 시작하는 순서
+
+CR에서 managed Deployment를 만드는 경로는 이미 구현되어 있다. 다만 기본
+initializer만 설치하는 것과 managed profile을 설치하는 것은 다르다.
+
+1. namespace, 공유 object-store namespace, 명시적 profile 9/10, peer 네트워크와
+   private admin 인증을 배포 소유자가 결정하고 준비한다. CI emulator 자격 증명을
+   실제 배포 설정으로 복사하지 않는다.
+2. `before-ack`, reconfiguration, peer port와 실제 실행 파일을 포함한 `InitImage`를
+   지정한 private runtime profile을 준비한다. Secret `runtime`의 key는
+   `runtime.json`이며 설치된 profile과 Secret 내용이 정확히 같아야 한다.
+3. 공개 [managed overlay](../deploy/operator-managed/)를 namespace와 검토한 image로
+   렌더링·검토한 뒤 strict validation으로 적용한다. profile Secret과 storage는
+   overlay가 대신 만들지 않는다. 상세 절차는 [설치 안내](../deploy/operator/README.md#installing-the-managed-reference-host)를 따른다.
+4. 일치하는 protocol과 참조 host image, `genesisIntent: Create`를 지정한
+   [RhizaCluster](../deploy/operator/automatic-example.yaml)를 생성한다. status나
+   DB Deployment를 미리 심지 않는다.
+5. operator가 만든 Deployment의 owner UID, init 완료, 확정 bootstrap plan과
+   해당 CR label의 실제 Pod Ready를 확인한 뒤 사용한다. CR 생성 성공만으로
+   데이터베이스가 준비되었다고 판단하지 않는다.
+
+이 절차는 임의 애플리케이션을 자동 변환하거나 Service·autoscaling·전체 quorum DR를
+제공하는 절차가 아니다. overlay의 namespace/RBAC와 private profile은 명시적으로
+검토해야 하는 배포 입력이다.
+
+같은 Pod의 컨테이너 재시작은 `emptyDir`를 유지하지만, Pod 교체는 디렉터리를 잃는다.
+quorum이 살아 있으면 새 ID와 새 WAL의 learner를 먼저 추가하고 인증된 prefix와 admission을
+검증한 뒤 이전 voter를 제거한다. 유실한 WAL의 ID를 빈 WAL에 재사용하지 않는다.
+같은 identity로 재가입하려면 원래 WAL과 현재 인증된 membership이 필요하다.
+
+## 설정과 지원 경계
+
+- `RhizaCluster.spec.voterCount`는 생성 시 3–64로 정하며 이후 변경할 수 없다. autoscaling 설정이 아니다.
+- 정상 managed HA는 명시적 append-only profile 9(SQL/KV) 또는 10(Graph)을 사용한다. 7/8 실행이나 자동 old-WAL migration은 지원하지 않는다.
+- public managed Host는 BeforeAck durability를 요구한다. HA object data는 append-only이며 online delete GC를 제공하지 않는다.
+- initializer는 Recreate 전략을 강제하거나 peer/client Service를 자동 관리하지 않는다. rollout, 접근 경로와 Service 구성은 배포에서 별도로 결정한다.
+- 별도 상시 fencer Deployment나 외부 lease 서비스는 정상 quorum 교체의 필수 구성 요소가 아니다. Recreate나 Pod 삭제 응답은 partition 중 이전 프로세스의 종료 증거가 아니다.
+
+설정의 범위와 불변 조건은 [cluster schema](../deploy/operator/cluster-crd.yaml)와
+[Operator 안내](../deploy/operator/README.md)를 따른다. 요청 API와 UNKNOWN 처리 방법은
+[managed request API](managed-internal-request-api.md), Graph의 추가 경계는
+[managed Graph HA](managed-graph-ha.md)를 참고한다.
+
+## quorum 상실과 DR
 
 quorum을 잃으면 쓰기와 linearizable 읽기는 실패한다. 준비된 노드의 local 읽기는
-계속 가능하다. 우선 원래 노드·디스크·네트워크를 복원한다. 새 세대의 수동 DR은
-이전 프로세스의 재등장 방지, 전체 identity scope의 종료·격리, 미완료 storage
-작업과 certified 자료 및 live authority를 별도로 검증해야 한다. Pod 삭제나
-timeout만으로 이를 증명할 수 없고, 현재 Operator는 자동 세대 전환을 제공하지 않는다.
-현재 설치 계약은 [배포 안내](../deploy/operator/README.md)와
-[복구 경계](recovery.md)를 따른다.
+계속 가능하지만, local Ready를 현재 quorum의 증거로 사용하면 안 된다.
+우선 원래 노드·디스크·네트워크를 복원하며 pending state와 UNKNOWN의 원본을 보존한다.
+UNKNOWN을 해결하려고 새 ID나 변경한 payload로 mutation을 다시 제출하지 않는다.
 
-승인된 DR 설계에서 자동 시도는 기본 OFF다. 명시적으로 허용한 정책에서 실제
-ReadIndex/quorum 실패가 지속되면 준비를 시도할 수 있지만, 실패 감지는 활성화
-권한이 아니다. 모든 이전 runtime·voter·sidecar의 종료와 재생성 차단, 진행 중인
-storage 작업의 완료, 모든 성공 ACK를 포함하는 소스와 새 ready quorum을 검증해야
-활성화할 수 있다. 증거가 불명확하거나 partition 상태이면 Blocked로 남겨 수동
-조치를 요구한다. 별도의 상시 fencer나 새 lease·epoch·live permission을 추가하는
-정책이 아니며 pending state·UNKNOWN·live anchor/Transition 검증은 유지한다.
-이 자동 시도 정책은 아직 현재 Operator에 구현되거나 qualification된 기능이 아니다.
+현재 operator에는 whole-generation DR executor가 없다. recovery 요청·status API나
+`automaticRecovery: OFF`라는 schema 기본값이 있다는 사실은 실행 지원을 뜻하지 않는다.
+다른 정책값을 받아들이더라도 자동 세대 전환을 수행한다는 뜻은 아니다.
 
-## 지원하지 않는 legacy 운영 예제
+별도로 승인된 DR 설계에서 자동 시도는 기본 OFF다. 실제 quorum 실패를 감지해도
+활성화 권한이 생기지는 않는다. 이전 runtime·voter·sidecar 전체의 종료 또는 격리,
+재생성 방지, 진행 중인 storage 작업의 완료, 모든 성공 ACK를 포함한 검증 소스,
+live authority와 새 ready quorum이 필요하다. 증거가 불명확하면 Blocked로 남긴다.
+이 설계를 현재 구현된 자동 복구 기능으로 설명하지 않는다.
 
-아래 내용은 기존 StatefulSet/alpha1 통합의 참고 자료이며 현재 설치 절차가 아니다.
-아래 YAML·명령·환경 변수를 현재 alpha2 배포에 적용하지 않는다.
-`spec.membership`, `spec.fence`, `spec.anchorID`는 현재 API로 변환되지 않는다.
-`RHIZA_AUTOMATIC_RECOVERY=true`는 현재 Operator가 거부하며, fencer/anchor 설정을
-추가해도 legacy recovery engine이 활성화되지 않는다. 아래의 과거 동작 설명은
-현재 기능이나 검증 완료를 주장하지 않는다. DR 안전 조건은 여전히 지켜야 한다.
+## Local과 검증 자료
 
-Rhiza를 라이브러리로 사용하는 **Go·Rust 애플리케이션의 프로세스 자체**를
-Operator가 복구할 수 있다. 별도의 Rhiza 서버 프로세스나 데이터베이스 sidecar는
-필요하지 않다. Operator는 Kubernetes에 별도 Deployment로 실행한다.
+Local은 peer quorum이 없는 별도 single-writer 모드다.
+[Local init-container recovery](local-init-container-recovery.md)의 배포 책임과
+미해결 maintenance token의 fail-closed 조건을 managed HA 절차와 혼동하지 않는다.
+[Chaos qualification](ha-managed-cluster-chaos.md)은 격리된 실험의 범위와 증거를 설명하며,
+production cloud parity·network partition·전체 quorum DR의 보편적 보증이 아니다.
 
-외부 앵커 검증 서비스를 구축하는 방법은 [Recovery Anchor](recovery-anchor.md)를 참고한다.
+## 과거 예제
 
-이 기능은 기존 **3개 이상의 voter로 구성한 StatefulSet + emptyDir(no-PVC) +
-공유 오브젝트 저장소**를 대상으로 한다. voter 수는 `RhizaCluster.spec.voterCount`에
-3 이상 64 이하의 정수로 선언한다. StatefulSet은 같은 수의 replica를 선언하고,
-Pod 이름은 `<statefulSet>-<ordinal>` 규칙을 따라야 한다. StatefulSet이
-`RHIZA_CLUSTER_MEMBERS`를 내보내면 Operator는 그 목록을 재생성하지 않고 채택하며,
-내보내지 않으면 `spec.bootstrap: true`를 명시한 경우에만 voter 수만큼 node ID,
-Pod 이름, headless service DNS URL, peer token, admin token, 공개키를 생성해 불변
-Secret에 보관한다. 이때 object storage에 해당 cluster ID의 membership commitment가
-이미 있으면 Operator는 bootstrap을 거부한다. `spec.clusterDomain`은 생성 URL의 DNS
-suffix이며 기본값은 `cluster.local`이다. 내보낸 목록의 수나
-node ID가 선언한 값과 어긋나면 Operator는 복구를 시작하지 않고 두 값을 함께 알려
-주는 오류를 남긴다. 최소 voter 수는 3이며 홀수 제약이 없으므로 짝수도 지원한다.
-`httpPort`와 `peerPort`는 선택 항목이고 기본값은 각각 8080과 9090이다. 세대가
-살아 있는 동안 voter 수는 제자리에서 바꿀 수 없고, 새 세대를 만들거나 재구성으로
-voter를 하나씩 교체해야 한다.
-소스 세대의 복구 자료를 검증하고 새 세대로 복사한 다음,
-애플리케이션 Pod 전체를 재시작한다. Pod 이름·peer 주소는 유지하지만
-ClusterID와 peer/admin 토큰은 바뀐다. 애플리케이션의 다른 emptyDir 상태도
-사라지므로, 필요한 업무 상태는 Rhiza 또는 별도 영속 저장소에 두어야 한다.
+기존 alpha1/StatefulSet·fencer·anchor YAML과 긴 통합 예제는
+[v0.23.1 원본 문서](https://github.com/mrchypark/rhiza/blob/v0.23.1/docs/embedded-operator.md#지원하지-않는-legacy-운영-예제)에서 추적할 수 있다.
+해당 예제는 현재 설치 절차가 아니다. alpha1 변환 경로는 없으며 `spec.membership`,
+`spec.fence`, `spec.anchorID`와 `RHIZA_AUTOMATIC_RECOVERY=true`를 현행 운영에 적용하지 않는다.
 
-## 1. 임베딩 프로세스 연결
+### 6. Recovery Anchor 연동
 
-### Go
-
-```go
-config, err := rhiza.ConfigFromEnv()
-if err != nil { return err }
-db, err := rhiza.Open(ctx, config)
-if err != nil { return err }
-defer db.Close()
-
-server := &http.Server{
-    Addr: config.BindAddr, // 예: 0.0.0.0:9091
-    Handler: db.OperatorHandler(),
-    ReadHeaderTimeout: 5 * time.Second,
-}
-// 애플리케이션 종료 시 server.Shutdown도 호출한다.
-return server.ListenAndServe()
-```
-
-[실행 가능한 Go 예제](../examples/operator-embedded/main.go)를 참고한다.
-업무 처리는 같은 `db`의 인프로세스 API를 사용한다. 기존 애플리케이션 HTTP
-서버가 있다면 별도 포트에 위 핸들러를 제공하거나, 아래 정확한 경로만 라우터에
-연결한다. 접두 경로를 추가하지 않는다.
-
-`OperatorHandler()`는 다음 여섯 경로만 제공한다. SQL·KV·Graph 등 일반 DB API와
-`/ready`는 노출하지 않는다. 기존 `db.Handler()`를 사용하는 서버도 계속 호환된다.
-
-| 경로 | 동작 |
-| --- | --- |
-| `GET /recovery/status` | 현재 세대·durability·복구 위치와 실제 quorum 확인. 로컬 Ready와 quorum은 다르다. |
-| `GET /recovery/probe` | `Authorization: Bearer <RHIZA_ADMIN_TOKEN>`와 query nonce를 보내고, 응답 HMAC으로 새 recovery 상태를 검증. |
-| `POST /recovery/archive` | `Authorization: Bearer <RHIZA_ADMIN_TOKEN>` 인증 후 로컬 확정 suffix를 저장소에 발행. 빈 토큰은 비활성화. |
-| `GET /membership/status` | `Authorization: Bearer <RHIZA_ADMIN_TOKEN>` 인증 후 현재 membership 상태를 반환. |
-| `POST /membership/change` | `Authorization: Bearer <RHIZA_ADMIN_TOKEN>` 인증 후 membership 변경을 요청. |
-| `POST /membership/abort` | `Authorization: Bearer <RHIZA_ADMIN_TOKEN>` 인증 후 진행 중인 membership 추가를 중단. |
-
-### Rust
-
-```rust
-let mut db = rhizadb::Db::open_from_env()?;
-let address = db.start_operator("0.0.0.0:9091")?;
-// db로 업무 처리를 수행한다. address는 실제 바인딩된 주소다.
-// 종료 시 close 또는 Drop이 복구 HTTP listener도 닫는다.
-db.close()?;
-```
-
-Rust SDK는 같은 Go 엔진과 환경 설정 파서를 사용한다. 프로세스를 실행하기
-**전에** 환경 변수를 주입한다. 실행 중 Rust 환경 변수 변경으로 엔진 설정을
-바꾸지 않는다. SDK 호출은 동기식이므로 async 런타임에서는 blocking 실행
-영역에서 열기·닫기 등을 수행한다. 자세한 API는 [Rust SDK](../sdk/rust/README.md)를
-참고한다.
-
-이 API가 포함된 Rhiza 소스/SDK 버전을 사용해야 한다. 아직 이 API가 없는
-이전 배포 버전에서 호출할 수 없으며, 개발 시에는 SDK의 로컬 path 의존성을
-사용한다. Operator와 임베딩 엔진은 같은 소스 버전으로 빌드하는 것을 권장한다.
-
-## 2. 환경 변수는 실행 시점의 원본으로 사용
-
-Operator는 컨테이너의 `RHIZA_*` 환경 설정을 읽고 다음 항목을 새 세대로
-교체한다. 애플리케이션은 매 시작마다 `ConfigFromEnv()` / `open_from_env()`를
-호출하고 아래 값을 하드코딩하거나 다른 설정 파일로 덮어쓰지 않아야 한다.
-
-| 환경 변수 | 의미 |
-| --- | --- |
-| `RHIZA_CLUSTER_ID` | 세대별 클러스터 ID |
-| `RHIZA_CLUSTER_MEMBERS` | member 목록의 JSON. 항목 수가 voter 수이며 StatefulSet replica 수와 `RhizaCluster.spec.voterCount`에 맞춘다. 각 항목은 `node_id`, `url`, `peer_url`, base64 Ed25519 `public_key`를 포함한다. StatefulSet이 이 값을 내보내면 Operator가 채택하고, 내보내지 않으면 Operator가 생성해 불변 Secret으로 주입한다 |
-| `RHIZA_PEER_TOKENS` | 노드별 비공개 peer 토큰의 JSON map. StatefulSet은 Pod 템플릿 하나로 replica별 Secret을 마운트할 수 없어 각 Pod가 자기 `RHIZA_NODE_ID` 항목을 선택한다. `RHIZA_PEER_TOKEN`(단일 값)과 동시에 설정할 수 없다 |
-| `RHIZA_ADMIN_TOKEN` | 복구 archive 발행 인증 토큰 |
-| `RHIZA_OBJSTORE_DURABILITY` | `async` 또는 `before-ack` |
-| `RHIZA_NODE_ID` | `metadata.name` downward API. 예: `myapp-0` |
-| `RHIZA_DATA_DIR` | emptyDir에 위치한 절대 경로. 예: `/data` |
-| `RHIZA_PEER_ADDR` | QUIC listener. 예: `0.0.0.0:9090` |
-| `RHIZA_BIND_ADDR` | 예제의 복구 HTTP listener. 예: `0.0.0.0:9091` |
-| `RHIZA_OBJSTORE_*` | Operator와 동일한 저장소·bucket·prefix. provider를 명시한다. |
-
-ConfigMap/Secret 참조를 사용할 수 있다. `RHIZA_NODE_ID=metadata.name` 이외의
-동적 fieldRef와 `$(...)` 환경 확장은 지원하지 않는다. 자체 Go 설정은 로더
-호출 후 추가할 수 있지만, 세대·멤버·저장소·durability·데이터 경로 계약은 유지한다.
-설정 오류나 `ErrVoterStateLost`가 나면 시작을 실패시켜야 한다. 빈 새 DB로
-fallback하거나 peer 상태를 지우고 기존 세대로 재가입하면 안 된다.
-
-## 3. StatefulSet 연결
-
-아래는 기존 애플리케이션 StatefulSet에 반영할 핵심 설정이다. `application`
-컨테이너의 image·command·업무 포트는 그대로 사용할 수 있다.
-
-```yaml
-spec:
-  # voter 수와 같게 맞춘다(최소 3, 짝수 허용).
-  replicas: 3
-  podManagementPolicy: Parallel
-  updateStrategy:
-    type: OnDelete
-  template:
-    spec:
-      containers:
-        - name: application
-          image: YOUR_REGISTRY/myapp:YOUR_VERSION
-          ports:
-            - name: recovery
-              containerPort: 9091
-              protocol: TCP
-            - name: peer
-              containerPort: 9090
-              protocol: UDP
-          envFrom:
-            - configMapRef:
-                name: rhiza-config
-            - secretRef:
-                name: rhiza-object-store
-          env:
-            - name: RHIZA_NODE_ID
-              valueFrom:
-                fieldRef:
-                  fieldPath: metadata.name
-            - name: RHIZA_DATA_DIR
-              value: /data
-            - name: RHIZA_BIND_ADDR
-              value: 0.0.0.0:9091
-            - name: RHIZA_PEER_ADDR
-              value: 0.0.0.0:9090
-            - name: RHIZA_CLUSTER_MEMBERS
-              valueFrom:
-                secretKeyRef:
-                  name: rhiza-peer-credentials
-                  key: members
-            - name: RHIZA_ADMIN_TOKEN
-              valueFrom:
-                secretKeyRef:
-                  name: rhiza-peer-credentials
-                  key: admin
-          volumeMounts:
-            - name: data
-              mountPath: /data
-      volumes:
-        - name: data
-          emptyDir: {}
-```
-
-`volumeClaimTemplates`와 데이터 경로의 PVC/subPath/중첩 mount는 제거한다.
-기존 데이터를 가진 배포의 PVC를 단순히 제거해 전환하지 않는다. 위 계약은
-이미 no-PVC로 준비된 배포의 복구용이다.
-
-headless Service에는 `publishNotReadyAddresses: true`와 peer UDP 포트를 설정한다.
-멤버 ID는 `myapp-0`부터 `myapp-N-1`까지 차례로 붙이며, 여기서 N은 voter 수다.
-peer URL은 예를 들어 `quic://myapp-0.myapp-peers.NAMESPACE.svc.cluster.local:9090`
-형태다.
-초기 `rhiza-peer-credentials`는 admin 토큰과 노드별 peer 토큰 map을 담은 Secret으로
-별도 생성한다. 공개 멤버십에는 각 노드의 `public_key`만 실리므로 복제되는
-membership, checkpoint, archive에는 비공개 토큰이 남지 않는다. 실제 자격 증명을
-Git에 기록하지 않는다.
-
-Operator는 소유 StatefulSet UID에 속한 Pod IP로 직접 접근한다.
-`recovery`라는 컨테이너 포트가 있으면 사용하고, 없으면 기존 `http` 포트,
-그것도 없으면 8080을 사용한다. 복구 포트는 인터넷/Ingress로 공개하지 말고
-NetworkPolicy로 Operator에서의 접근을 허용한다. HTTP이므로 신뢰할 수 있는
-클러스터 네트워크에서 사용한다. 애플리케이션의 로그인 middleware로 관리
-경로를 가로막지 않는다. readiness/liveness는 별도의 애플리케이션 경로를
-사용하고, quorum 상실만으로 모든 Pod를 재시작하는 probe를 만들지 않는다.
-
-## 4. Operator 배포와 관찰
-
-[배포 파일](../deploy/operator/README.md)의 CRD·RBAC·Deployment를 사용한다.
-애플리케이션 namespace로 모든 namespaced 리소스와 RoleBinding의 ServiceAccount
-namespace를 맞춘다. Operator의 `rhiza-config`, `rhiza-object-store` 참조도
-애플리케이션과 동일한 저장소를 가리키도록 설정한다.
-
-GitHub Release 발행 시 Operator 이미지를
-`ghcr.io/mrchypark/rhiza-operator:v0.14.1`처럼 릴리즈 태그로 게시한다.
-정식 릴리즈는 `latest`도 갱신하며 prerelease는 버전 태그만 게시한다.
-현재 지원 플랫폼은 `linux/amd64`다. CLI 실행 파일은 별도로 배포하지 않는다.
-이미지 게시와 Kubernetes 설치는 별개이며, 운영 클러스터에는 직접 적용한다.
-
-자체 레지스트리를 사용하면 Rhiza 저장소 루트에서 직접 빌드할 수 있다.
-
-```sh
-docker build -f Dockerfile.operator -t YOUR_REGISTRY/rhiza-operator:YOUR_VERSION .
-docker push YOUR_REGISTRY/rhiza-operator:YOUR_VERSION
-```
-
-Deployment의 image를 GHCR의 버전 태그(또는 자체 이미지)로 교체한다.
-샘플 `rhiza-operator:latest`는 로컬 이미지 이름이다. GHCR 패키지가 private이면
-읽기 권한을 가진 `imagePullSecrets`를 설정한다. CRD를 먼저 설치하고 해당
-namespace에 RBAC와 Operator Deployment를 적용한다.
-
-```yaml
-apiVersion: rhiza.mrchypark.dev/v1alpha1
-kind: RhizaRecovery
-metadata:
-  name: myapp-observe
-  namespace: YOUR_NAMESPACE
-spec:
-  statefulSet: myapp
-  container: application
-  sourceClusterID: YOUR_CURRENT_CLUSTER_ID
-  durability: async
-  recoveryID: ""
-  allowDataLoss: false
-```
-
-`container`는 Rhiza를 연 애플리케이션 컨테이너의 정확한 이름이다. 빈
-`recoveryID`는 관찰만 한다. `kubectl get rhizarecoveries -n YOUR_NAMESPACE -o yaml`로
-peer의 Ready/Quorum과 상태 메시지를 확인한다.
-
-자동 복구는 [Operator 배포 안내](../deploy/operator/README.md#automatic-recovery-with-kubernetes-fencing)의
-`RHIZA_AUTOMATIC_RECOVERY=true`, `RHIZA_FENCER_BACKEND=kubernetes`로 켜며 모든 voter의
-opt-in이 필요하다. 각 voter 프로세스에 `RHIZA_ENABLE_RECONFIGURATION=true`를 명시적으로 설정한다.
-`RhizaCluster.spec.voterCount`에 voter 수를 정수로 선언한다. Operator는
-`<statefulSet>-<ordinal>` 규칙으로 node ID와 Pod 이름을 유도하고, headless
-service와 namespace로 DNS URL을 만든다. StatefulSet이 이미
-`RHIZA_CLUSTER_MEMBERS`를 내보내면 Operator는 그 목록을 채택하고, 내보내지 않으면
-불변 Secret에 bootstrap identity를 한 번만 생성한다. Operator는 learner의 종료
-증거, Pod UID 소멸, credential 삭제 또는 대체를 모두 확인한 뒤에만 이력을 버리고,
-확인되지 않은 항목은 계속 fencing한다. 전체 세대 fencing은 voter와 남아 있는
-learner 이력을 합쳐 64개 대상까지만 예약할 수 있다.
-executor는 외부의 신뢰된 주체이고, learner는 애플리케이션 image와
-command를 복제하며, 새 `RHIZA_*` 환경은 재시작 때 읽힌다.
-
-## 5. quorum을 잃을 만큼 Pod를 유실한 뒤 복구
-
-1. 기존 노드·네트워크를 복원할 수 있으면 먼저 복원한다. quorum이 없다는
-   사실만으로 새 세대를 시작하지 않는다.
-2. 복구하려면 고유한 `recoveryID`를 정한다. 모든 이전 voter·클라이언트·replica와
-   저장소 writer가 다시 활동하지 못하도록 **외부 fencing**을 완료한다.
-   Pod 삭제나 Kubernetes Ready=false만으로 fencing을 증명할 수 없다.
-3. 현재 StatefulSet UID를 확인하고 복구 CR의 `spec.fence`에 동일한 recoveryID,
-   sourceClusterID, UID, `confirmed: true`, 구체적 evidence를 기록한다.
-   이 spec 수정 권한은 신뢰할 수 있는 운영자/자동화에만 부여한다.
-4. 소스가 `async`이면 `allowDataLoss: true`가 필요하다. 저장소에 아직 발행되지
-   않은 성공 응답 쓰기가 유실될 수 있다. 소스가 `before-ack`이면 검증된
-   certified archive가 필요하며, archive가 없다고 데이터 유실 동의로 우회할 수 없다.
-   `spec.durability`는 **복구 후 대상 세대**의 모드이며 소스의 보장을 바꾸지 않는다.
-5. Operator는 가능한 소스 suffix 수집, 유일한 successor 예약, archive seal,
-   대상 복사·검증을 거쳐 voter 수만큼의 Pod를 새 세대로 재시작한다. 새 세대의
-   voter 수는 소스와 같으며, 복구로 voter 수를 바꿀 수 없다. 중단되면 같은 CR로
-   재개한다. 예약 후 CR을 삭제하거나 source/recoveryID를 바꾸지 않는다.
-6. `Complete`와 구성된 voter 수의 과반(`n/2+1`)에 해당하는 일치하는 target
-   quorum을 확인하고 애플리케이션의 업무 읽기/쓰기를 검증한다. 다음 복구에는
-   완료된 대상 ClusterID를 소스로 별도 CR을 생성한다.
-
-before-ack는 성공 응답한 쓰기의 내구성 계약이다. 장애 직전 읽기로 관찰한
-모든 미응답 쓰기까지 보존한다는 뜻은 아니다. 애플리케이션의 업무 토큰·외부
-작업·캐시는 Operator가 갱신하지 않으므로 전체 프로세스 재시작에 맞게 처리한다.
-
-복구 상태가 `AwaitingFence`면 fencing 증명이, `Blocked`면 정책/배포/자료 검증
-문제가 남아 있다. 상태 메시지를 해결한 뒤 같은 요청을 재개한다. source archive를
-수정하거나 seal을 제거해 강제로 진행하지 않는다. 상세 계약은
-[복구 설계](recovery.md)와 [Operator 운영 설명](../deploy/operator/README.md)에 있다.
-
-## 6. Recovery Anchor 연동
-
-Operator가 복구를 오케스트레이션할 때, 외부 recovery-anchor 서비스가 anchor
-CAS와 검증을 담당한다. 서비스는 `recoveryanchor.Coordinator`를 사용하여
-ConfigMap에 anchor를 기록하고 검증한다.
-
-### Operator 환경 변수
-
-Operator Deployment에 다음 환경 변수를 추가한다:
-
-| 변수 | 설명 |
-|------|------|
-| `RHIZA_RECOVERY_ANCHOR_URL` | recovery-anchor 서비스 URL. 예: `https://anchor.svc:9191` |
-| `RHIZA_RECOVERY_ANCHOR_TOKEN_FILE` | Bearer token 파일 경로 |
-| `RHIZA_RECOVERY_ANCHOR_CA_FILE` | TLS CA 인증서 파일 경로 |
-
-### Workload 환경 변수
-
-임베디드 애플리케이션 Pod에 다음 환경 변수를 추가한다:
-
-| 변수 | 설명 |
-|------|------|
-| `RHIZA_RECOVERY_ANCHOR_ID` | Anchor ConfigMap 식별자 (예: `myapp-production`) |
-| `RHIZA_NAMESPACE` | Anchor ConfigMap이 위치한 Kubernetes namespace |
-
-### Host write guard responsibility
-
-환경 변수만으로 애플리케이션의 쓰기를 보호하지 않는다. 임베디드 호스트는
-`CheckBinding`, `UpdateApplication` 헬퍼를 사용하여 write reservation,
-CAS+binding, evidence startup check를 구현해야 한다. 환경 변수는 서비스 연결
- opt-in 표시일 뿐이고, 해당 코드가 없으면 쓰기 경로가 보호되지 않는다.
-
-### CRD spec.anchorID
-
-`RhizaCluster` 및 `RhizaRecovery` CRD에 `spec.anchorID` 필드를 추가하여
-어떤 anchor와 연결할지 지정한다:
-
-기존 CR의 `spec`에 다음 필드를 추가한다:
-
-```yaml
-spec:
-  anchorID: myapp-production
-```
-
-`anchorID`가 지정되면 Operator는 recovery-anchor 서비스에 HTTPS로 요청하고, 서비스가
-ConfigMap `rhiza-anchor-<anchorID>`를 읽어서 anchor를 활성화하고 검증한다.
-
-### 서비스 활성화
-
-1. Recovery Anchor 서비스를 Kubernetes에 배포한다 (TLS 필수).
-2. ServiceAccount에 ConfigMap get/update 권한을 부여한다.
-3. Operator Deployment에 `RHIZA_RECOVERY_ANCHOR_URL`, `RHIZA_RECOVERY_ANCHOR_TOKEN_FILE`,
-   `RHIZA_RECOVERY_ANCHOR_CA_FILE` 환경 변수를 설정한다.
-4. Workload Pod에 `RHIZA_RECOVERY_ANCHOR_ID`, `RHIZA_NAMESPACE`를 설정한다.
-5. CRD에 `spec.anchorID`를 지정한다.
-6. `kubectl apply`로 적용하면 Operator가 구성된 서비스에 연결하여 anchor 연동을 시작한다. 애플리케이션의 write guard는 별도 구현된 클래스에 의존한다.
+기존 링크를 위한 역사 안내다. [v0.23.1의 anchor 연동 예제](https://github.com/mrchypark/rhiza/blob/v0.23.1/docs/embedded-operator.md#6-recovery-anchor-연동)는
+지원하지 않는 과거 통합에 속하며, 현재 v1alpha2의 DR executor 설치 절차가 아니다.

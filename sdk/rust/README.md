@@ -15,7 +15,7 @@ toolchains above.
 
 ```toml
 [dependencies]
-rhizadb = "0.23.0"
+rhizadb = "0.23.3"
 serde_json = "1"
 ```
 
@@ -74,7 +74,7 @@ For Local object-storage backup, the Rust facade passes documented Go config
 fields through `set_option`; it does not provide typed object-store builders.
 The engine streams backup history and can restore an empty `DataDir` during
 open. Use the same storage identity and ensure only one process owns the archive
-at a time. See the [Local backup and recovery contract](https://github.com/mrchypark/rhiza/blob/v0.23.0/docs/embedded-object-storage.md),
+at a time. See the [Local backup and recovery contract](https://github.com/mrchypark/rhiza/blob/v0.23.3/docs/embedded-object-storage.md),
 including durability, archive compatibility, and filesystem ownership limits.
 
 `execute` and other mutations return `MutationReceipt`; always call
@@ -184,12 +184,21 @@ db.execute(&request)?.require_committed()?;
 ```
 
 `ManagedDb` deliberately has no generic operation escape hatch, local mode,
-legacy operator listener, or KV/graph/membership methods. `ready()` checks
-managed admission; `recover_pending()` resolves the retained original SQL
-request. Writes are never automatically retried with a new request ID. An
-`Error` such as `commit_unknown` does not establish rollback; preserve the
-original request ID and use `recover_pending()` before deciding what to submit
-next. Calls use the native bridge's 30-second default timeout.
+or legacy operator listener or membership methods. It exposes typed SQL, KV,
+and Graph methods. The released managed HA profiles are explicit append-only 9/10,
+generation 0, with `before-ack` durability; see the
+[managed request contract](../../docs/managed-internal-request-api.md) and
+[managed Graph HA boundary](../../docs/managed-graph-ha.md).
+`ready()` checks managed admission; `recover_pending()` resolves the retained
+original pending request, while `recover_request` selects an exact kind and ID.
+If the per-handle hint is missing or ambiguous, use `recover_request` with the
+known original kind and request ID; the engine must still retain that original.
+Writes are never automatically retried with a new request ID. An
+`Error` such as `commit_unknown` does not establish rollback. Preserve the
+original kind, raw request ID, intent, and any known slot. Use
+`recover_request(kind, request_id)` to resolve that exact retained original;
+do not resubmit the mutation as recovery. Calls use the native bridge's
+30-second default timeout.
 
 ## Prebuilt native archives
 
@@ -209,15 +218,15 @@ target, verifies it against the published checksum, and writes it as
 `$RHIZA_NATIVE_LIB_DIR` or `./.rhiza-native`:
 
 ```sh
-curl -fsSLO https://raw.githubusercontent.com/mrchypark/rhiza/v0.23.0/sdk/rust/scripts/fetch-native.sh
-sh fetch-native.sh 0.23.0
+curl -fsSLO https://raw.githubusercontent.com/mrchypark/rhiza/v0.23.3/sdk/rust/scripts/fetch-native.sh
+sh fetch-native.sh 0.23.3
 export RHIZA_NATIVE_LIB_DIR="$(pwd)/.rhiza-native"
 ```
 
 For containers, pass the host target and destination explicitly:
 
 ```sh
-sh fetch-native.sh 0.23.0 x86_64-unknown-linux-gnu /opt/rhiza-native
+sh fetch-native.sh 0.23.3 x86_64-unknown-linux-gnu /opt/rhiza-native
 ```
 
 The same files can be fetched by hand: download

@@ -1,8 +1,16 @@
 # Operator recovery chaos test
 
-The `operator-chaos` CI job builds both binaries from the candidate revision and
-runs them with MinIO in an ephemeral kind Kubernetes cluster. It applies the
-repository CRD and namespace-scoped RBAC and drives the running Operator through
+> **Historical qualification record.** The operator-chaos/MinIO recovery
+> procedure below is retired, not an active CI job or supported recovery
+> procedure. Current CI retains
+> [legacy rejection tests](../../.github/workflows/ci.yml); the
+> [managed bootstrap workflow](../../.github/workflows/ha-managed-bootstrap.yml)
+> qualifies genesis and healthy-quorum repair, not whole-generation DR.
+> For installation, use the [current managed guide](../../deploy/operator/README.md).
+
+The former `operator-chaos` CI job built both binaries from the candidate revision
+and ran them with MinIO in an ephemeral kind Kubernetes cluster. It applied the
+repository CRD and namespace-scoped RBAC and drove the running Operator through
 `RhizaRecovery` resources.
 
 The GCS post-release qualification installs admission policies only for its
@@ -52,18 +60,21 @@ establish complete recovery. This is a single Kubernetes-node test of real
 process, storage-loss and network faults, not physical-host or multi-node network
 partition qualification. It makes no performance claim.
 
-To rerun against an isolated kind cluster named `rhiza-operator-chaos`, load the
-test images `rhiza-chaos:local` and `rhiza-operator-chaos:local`, then run:
+**Historical command; do not run as a current workflow.** The former job used
+an isolated kind cluster named `rhiza-operator-chaos` with the test images
+`rhiza-chaos:local` and `rhiza-operator-chaos:local`:
 
 ```sh
 python3 -u e2e/chaos/operator_recovery.py
 ```
 
-The CI workflow contains the exact image and cluster setup commands. The harness
-creates namespace `rhiza-chaos`; delete the disposable cluster after collecting
-results. Do not run it against a shared cluster.
+The former CI workflow contained the image and cluster setup commands. The harness
+created namespace `rhiza-chaos` in the disposable cluster.
 
 ## GCS post-release qualification
+
+**Historical procedure only.** This section records the former GCS qualification
+contract; it is not a current deployment or recovery workflow.
 
 The GCS/Chaos harness has no cloud defaults. Keep project, cluster, bucket,
 service-account, node, context, local path, and object-prefix values outside the
@@ -101,27 +112,29 @@ tokens, and command-based auth fields are never written to receipts or logs;
 receipts contain only the selected endpoint, CA hash, cluster/location, node-pool
 metadata, or a generic failed stage and native exit code.
 
-With those variables exported, including fresh `RHIZA_OUTPUT` and the planned
-exact SHA inputs, review the offline render first:
+**Historical commands; do not run as a current workflow.** The former
+procedure reviewed the offline render with fresh `RHIZA_OUTPUT` and exact SHA
+inputs:
 
 ```sh
 sh e2e/chaos/bootstrap-gcs-postrelease.sh render-local > /tmp/rhiza-auth-review.yaml
 sh e2e/chaos/run-gcs-postrelease.sh render
 ```
 
-After reviewing scope, receipts, digests, expiry, and cost cap, direct execution
-uses `apply-local`, `mint-local`, and `run-local`; federation uses `apply` and
-`run`. These are one-shot operations: do not reuse an output or receipt
-directory, adopt colliding resources, or rerun after an unknown outcome.
+The historical direct execution used `apply-local`, `mint-local`, and
+`run-local` after reviewing scope, receipts, digests, expiry, and cost cap;
+federation used `apply` and `run`. The one-shot procedure prohibited reusing
+an output or receipt directory, adopting colliding resources, or rerunning
+after an unknown outcome.
 
 ## voterCount operator path (GCS + Chaos Mesh)
 
-`run-votercount-gcs-chaos.sh` is the launcher for the v0.19.5 voterCount operator
-path. It is a second, run-owned path that shares the bootstrap above: run
-`bootstrap-gcs-postrelease.sh apply-local` first so the namespace, the `rhiza-gcs`
-and `rhiza-operator` workload-identity bindings, the quota and the admission
-policies exist. Then use the launcher's two phases with one fresh `RHIZA_OUT`
-directory:
+**Retired launcher; do not execute this sequence.**
+`run-votercount-gcs-chaos.sh` now exits before any external action. The former
+v0.19.5 voterCount path used `bootstrap-gcs-postrelease.sh apply-local` to
+create the namespace, workload-identity bindings for `rhiza-gcs` and
+`rhiza-operator`, quota, and admission policies. The historical launcher's
+two phases shared one fresh `RHIZA_OUT` directory:
 
 - `install` with the administrator kubeconfig. It applies the repository CRDs,
   generates a one-day self-signed `rhiza-fencer-tls` Secret and matching
@@ -183,18 +196,20 @@ ports `base..base+3` and their Raft ports `base+100..base+103` are free on
 `127.0.0.1` before minting credentials. It rejects an occupied listener rather
 than using a healthy response from an unrelated local process.
 
-Always preserve evidence before cleanup. Run `rollback-local` for direct mode or
-`rollback` for federation mode with the exact original variables and receipt
-directory. Rollback verifies ownership and exact absence; a partial or ambiguous
-cleanup is a failure requiring manual investigation, not permission to delete a
-broader bucket, prefix, namespace, or account.
+The historical cleanup preserved evidence before using `rollback-local` for
+direct mode or `rollback` for federation mode with the exact original variables
+and receipt directory. Rollback verified ownership and exact absence; a partial
+or ambiguous cleanup required manual investigation, not deletion of a broader
+bucket, prefix, namespace, or account.
 
 ## Unattended Kubernetes backend qualification
 
-`automatic-operator-chaos` runs `automatic_recovery.py` in a separate disposable
-kind cluster. It creates one automatic `RhizaCluster` policy, then injects faults.
-It never submits a `RhizaRecovery`, changes a recovery spec, provisions a learner,
-or manually approves fencing. The Operator creates those actions from its journal.
+**Historical qualification only; not an active CI job.** The former
+`automatic-operator-chaos` job ran `automatic_recovery.py` in a separate
+disposable kind cluster. It created one automatic `RhizaCluster` policy, then
+injected faults. It did not submit a `RhizaRecovery`, change a recovery spec,
+provision a learner, or manually approve fencing. The former Operator drove
+those actions from its journal.
 
 The Kubernetes backend submits immutable `RhizaFence` requests. A test-only kind
 executor establishes admission, runtime and isolated storage barriers before

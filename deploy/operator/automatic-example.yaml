@@ -1,4 +1,4 @@
-# Illustrative v1alpha2 input; a private installed runtime profile is required.
+# Managed reference-host genesis; install the managed overlay and private profile first.
 # This does not enable legacy automatic whole-generation disaster recovery.
 # Approved automatic-attempt DR remains unimplemented/unqualified; default OFF.
 # Submit with strict server-side field validation; it is not DR authority.
@@ -9,6 +9,7 @@ metadata:
   namespace: rhiza
 spec:
   logicalID: rhiza-production
+  genesisIntent: Create
   applicationProtocol: rhiza-managed-request-append-only/v1
   voterCount: 3
   automaticRecovery: "OFF"
@@ -19,4 +20,4 @@ spec:
       spec:
         containers:
           - name: app
-            image: example.invalid/rhiza-app:review-only
+            image: ghcr.io/mrchypark/rhiza-operator:v0.23.2

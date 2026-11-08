@@ -5,6 +5,8 @@ import (
 	"crypto/sha256"
 	"errors"
 	"path/filepath"
+	"slices"
+	"strings"
 	"testing"
 	"time"
 
@@ -104,6 +106,15 @@ func TestPreparedCheckpointMarkersReopenAcrossCertifiedMembershipChanges(t *test
 		seal := CheckpointSeal{ConfigID: core.ConfigID(), Index: index, RootHash: sha256.Sum256([]byte("prepared-root:" + label)), StateHash: sha256.Sum256([]byte("prepared-state:" + label)), PrefixHash: prefix, NextLeaderOrder: next, FollowingLeaderOrder: following, Membership: &membership}
 		for _, id := range active {
 			voter := cores[id]
+			if err := voter.WaitTip(ctx, index); err != nil {
+				t.Fatalf("wait for %s cut on voter %s: %v", label, id, err)
+			}
+			gotPrefix, prefixOK := voter.PrefixHash(index)
+			gotMembership, membershipErr := voter.CheckpointMembership(index)
+			gotNext, gotFollowing, orderErr := voter.CheckpointLeaderOrders(index)
+			if !prefixOK || gotPrefix != seal.PrefixHash || voter.ClusterForSlot(index+1).ConfigID != seal.ConfigID || membershipErr != nil || !sameMembershipRecord(gotMembership, membership) || orderErr != nil || !slices.Equal(gotNext, next) || !slices.Equal(gotFollowing, following) {
+				t.Fatalf("voter %s differs from fixed %s checkpoint cut after local delivery", id, label)
+			}
 			voter.SetCheckpointValidator(func(context.Context, CheckpointSeal) error { return nil })
 			if err := voter.PrepareCheckpoint(ctx, seal); err != nil {
 				t.Fatalf("prepare %s marker on voter %s: %v", label, id, err)
@@ -123,8 +134,50 @@ func TestPreparedCheckpointMarkersReopenAcrossCertifiedMembershipChanges(t *test
 	}
 	prepare := func(label string, active []NodeID) CheckpointSeal {
 		t.Helper()
+		// Force the first quorum ACK to exclude b's decision delivery. This
+		// establishes the precondition gap without sleeps or a synthetic tip.
+		if label == "before-add" {
+			transport.mu.Lock()
+			transport.dropDecision["b"] = true
+			transport.mu.Unlock()
+		}
 		if _, _, err := cores["a"].Propose(ctx, []byte("checkpoint-input:"+label)); err != nil {
 			t.Fatalf("certify checkpoint input %s: %v", label, err)
+		}
+		if label == "before-add" {
+			source := cores["a"]
+			index := source.Tip()
+			prefix, ok := source.PrefixHash(index)
+			if !ok || cores["b"].Tip() >= index {
+				t.Fatal("delayed voter did not retain the actual certified-delivery gap")
+			}
+			membership, err := source.CheckpointMembership(index)
+			if err != nil {
+				t.Fatal(err)
+			}
+			next, following, err := source.CheckpointLeaderOrders(index)
+			if err != nil {
+				t.Fatal(err)
+			}
+			seal := CheckpointSeal{ConfigID: source.ConfigID(), Index: index, RootHash: sha256.Sum256([]byte("prepared-root:" + label)), StateHash: sha256.Sum256([]byte("prepared-state:" + label)), PrefixHash: prefix, NextLeaderOrder: next, FollowingLeaderOrder: following, Membership: &membership}
+			cores["b"].SetCheckpointValidator(func(context.Context, CheckpointSeal) error { return nil })
+			if err := cores["b"].PrepareCheckpoint(ctx, seal); err == nil || !strings.Contains(err.Error(), "checkpoint seal does not match local certified prefix") {
+				t.Fatalf("raw prepare before local delivery must refuse: %v", err)
+			}
+			value, ok := source.CertifiedValue(index)
+			if !ok {
+				t.Fatal("delayed decision lacks actual certificate")
+			}
+			decision, err := source.certifiedDecision(value)
+			if err != nil {
+				t.Fatal(err)
+			}
+			transport.mu.Lock()
+			transport.dropDecision["b"] = false
+			transport.mu.Unlock()
+			if err := cores["b"].AcceptDecision(decision); err != nil {
+				t.Fatalf("release actual certified decision to delayed voter: %v", err)
+			}
 		}
 		return prepareAtCurrentCut(label, active)
 	}

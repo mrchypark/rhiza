@@ -1,9 +1,8 @@
 # Managed internal request API
 
-Status: this documents the final explicit append-only profile contract. It is
-an unreleased candidate, not a release-support or production-readiness claim.
-The support rows state the intended boundary; this page is not evidence that
-runtime enforcement or final CI qualification is complete.
+Status: this documents the explicit append-only profiles released in v0.23.1.
+Release availability is not a guarantee for arbitrary deployments, cloud
+partitions, or whole-cluster disaster recovery; the boundaries below still apply.
 
 ## Supported profile boundary
 
@@ -35,8 +34,12 @@ provided. The separate Local contract remains unchanged.
 
 ## Request and recovery path
 
-The operator owns policy, bootstrap, repair, and membership authority at
-lifecycle boundaries. After managed startup and initial live admission,
+The operator initializes the managed Deployment and bootstrap plan. Kubernetes
+maintains its Pods; the reference managed host discovers replacement candidates
+and coordinates healthy-quorum repair through the Host membership APIs. The
+engine verifies the certified membership, WAL identity, and replay prefix.
+These are separate lifecycle responsibilities, not automatic whole-cluster DR.
+After managed startup and initial live admission,
 ordinary SQL/KV calls use the engine-owned Node/materializer path. They do not
 create one Kubernetes CR reservation/finalization sequence per request or a
 second application intent log. This is a control-path boundary, not a latency
@@ -76,7 +79,11 @@ Validation, admission, and intent-conflict failures remain distinct from
 
 ## Qualification
 
-Focused Go normal/race evidence exists for candidate engine-owned recovery and
-the exact-original receipt path. Final Actions and provider-SDK, native Rust/C
-ABI runtime, Pod lifecycle, and Chaos Mesh qualification remain pending. This
-document does not assert a release version or complete HA qualification.
+The release includes engine-owned recovery and the exact-original receipt path.
+Qualification must distinguish Go normal/race checks, actual provider-SDK
+checks, native Rust/C ABI execution, and scoped Pod/Chaos Mesh experiments.
+None establishes production-cloud parity or recovery from every partition.
+The normal profiles require generation 0, append-only object data, and
+`before-ack` object-store durability. No online HA delete GC or automatic
+old-profile migration is implied. See [managed HA](managed-graph-ha.md) for
+NoPVC restoration and deployment boundaries.

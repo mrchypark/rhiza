@@ -1,4 +1,9 @@
-# `pkg/operator` current contracts appendix
+# `pkg/operator` historical contracts appendix (2026-10-30)
+
+This is a snapshot of the legacy operator implementation at the commit cited
+below, not a current installation or recovery procedure. The current
+`Controller.Run` rejects legacy recovery. For the current v1alpha2 managed
+reference-host installation, see the [operator guide](../deploy/operator/README.md#installing-the-managed-reference-host).
 
 Scope and source root are as stated in
 [`operator-go-reverse-spec-2026-10-30.md`](operator-go-reverse-spec-2026-10-30.md).

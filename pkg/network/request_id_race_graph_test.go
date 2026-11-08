@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"path/filepath"
+	"reflect"
 	"sync"
 	"testing"
 	"time"
@@ -130,32 +131,23 @@ func TestCrossIngressGraphRequestIDConflictDoesNotBlockApply(t *testing.T) {
 	}
 
 	start := make(chan struct{})
-	results := make(chan error, 2)
+	results := make(chan requestIDRaceOutcome, 2)
 	for id, command := range map[quepaxa.NodeID]types.GraphCommand{
 		"n1": {RequestID: "shared", Cypher: `CREATE (:Race {name: 'a'})`},
 		"n2": {RequestID: "shared", Cypher: `CREATE (:Race {name: 'b'})`},
 	} {
 		go func(id quepaxa.NodeID, command types.GraphCommand) {
 			<-start
-			_, err := servers[id].GraphExecute(context.Background(), command)
-			results <- err
+			response, err := servers[id].GraphExecute(context.Background(), command)
+			results <- requestIDRaceOutcome{string(id), response.MutationReceipt, err}
 		}(id, command)
 	}
 	close(start)
-	successes, conflicts := 0, 0
-	for range 2 {
-		switch err := <-results; {
-		case err == nil:
-			successes++
-		case errors.Is(err, ErrRequestConflict):
-			conflicts++
-		default:
-			t.Fatalf("race result=%v", err)
-		}
+	winner := requestIDRaceWinner(t, results)
+	if !winner.receipt.Applied {
+		t.Fatalf("winning Graph mutation was not applied: %+v", winner.receipt)
 	}
-	if successes != 1 || conflicts != 1 {
-		t.Fatalf("successes=%d conflicts=%d", successes, conflicts)
-	}
+	winnerName := map[string]string{"n1": "a", "n2": "b"}[winner.choice]
 
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
@@ -171,6 +163,11 @@ func TestCrossIngressGraphRequestIDConflictDoesNotBlockApply(t *testing.T) {
 		}
 		if got := quepaxa.Slot(materials[id].Tip()); got != tip {
 			t.Fatalf("materializer %s tip=%d want %d", id, got, tip)
+		}
+		assertRequestIDRaceReceipt(t, server, "graph", winner.receipt)
+		rows, err := server.GraphQuery(ctx, GraphQueryRequest{Cypher: "MATCH (n:Race) RETURN n.name"})
+		if err != nil || !reflect.DeepEqual(rows.Rows, [][]any{{winnerName}}) {
+			t.Fatalf("replica %s graph rows=%v want only %s error=%v", id, rows.Rows, winnerName, err)
 		}
 	}
 	if _, err := servers["n3"].GraphExecute(context.Background(), types.GraphCommand{RequestID: "after", Cypher: `CREATE (:Race {name: 'after'})`}); err != nil {

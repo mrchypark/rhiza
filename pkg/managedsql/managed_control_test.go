@@ -19,7 +19,7 @@ import (
 
 func TestManagedSQLPreparationRequiresLiveExactRepair(t *testing.T) {
 	ctx := context.Background()
-	configs, hosts, _ := openSQLQuorum(t, &sqlWireCloseLifecycle{})
+	configs, hosts, _ := openSQLQuorum(t)
 	h := hosts[0]
 	writer, plan := hostRepairWriter(t, configs, hosts)
 	plan.Sequence = operator.V1Alpha2RepairAddThenRemove
@@ -118,8 +118,48 @@ func TestManagedSQLWireCloseLifecycleRejectsUnexpectedPUTFailure(t *testing.T) {
 	}
 }
 
+func TestManagedSQLWireCloseLifecycleActualCanceledPUTAfterOwnedClose(t *testing.T) {
+	configs, hosts, fixture := openSQLQuorum(t)
+	lifecycle := fixture.closeLifecycle
+	if lifecycle == nil || fixture.source.putReadFailure == nil || !fixture.closeObserverAtOpen.Load() || lifecycle.closing.Load() {
+		t.Fatal("default quorum did not install a strict observer before opening its Hosts")
+	}
+	path := "/bucket/" + fixture.source.finalPrefix + "/archive/close-observer-test.bin"
+	for _, host := range hosts {
+		if err := fixture.closeHost(host); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// A real TCP disconnect produces the HTTP request cancellation and truncated
+	// body. This validates classification after actual owned Close, not the
+	// historical publisher's unobserved timing or the source of its EOF.
+	conn, err := net.DialTimeout("tcp", strings.TrimPrefix(configs[0].Runtime.ObjStoreEndpoint, "http://"), 5*time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, writeErr := io.WriteString(conn, "PUT "+path+" HTTP/1.1\r\nHost: fixture\r\nContent-Length: 10\r\n\r\nx")
+	closeErr := conn.Close()
+	if writeErr != nil || closeErr != nil {
+		t.Fatal(writeErr, closeErr)
+	}
+	deadline := time.NewTimer(5 * time.Second)
+	defer deadline.Stop()
+	for {
+		select {
+		case acceptedPath := <-lifecycle.acceptedPUT:
+			if acceptedPath == path {
+				return
+			}
+		case <-deadline.C:
+			t.Fatal("real canceled PUT did not reach the installed observer")
+		}
+	}
+}
+
 func TestManagedSQLDirectMembershipRejectsRemoveFirstIntent(t *testing.T) {
 	configs, fixture := sqlCluster(t)
+	lifecycle := &sqlWireCloseLifecycle{}
+	lifecycle.observePUTFailures(t, fixture)
 	ctx := context.Background()
 	// Snapshot assertions require an actual reconfiguration-enabled runtime,
 	// including the matching committed bootstrap digest, not the SQL-only fixture.
@@ -156,7 +196,7 @@ func TestManagedSQLDirectMembershipRejectsRemoveFirstIntent(t *testing.T) {
 		h, err := fixture.open(ctx, configs[i])
 		if h != nil {
 			t.Cleanup(func() {
-				if err := h.Close(); err != nil {
+				if err := fixture.closeHost(h); err != nil {
 					t.Error(err)
 				}
 			})

@@ -1,9 +1,8 @@
 # Managed SQL/KV/Graph HA
 
-Status: unreleased final explicit append-only profile candidate. Local focused
-tests are not final CI, provider, or production qualification. The support
-table states the intended boundary, not proof that runtime enforcement is
-complete.
+Status: the explicit append-only profiles below are released in v0.23.1.
+This is a bounded runtime contract, not a promise of turnkey integration for
+arbitrary application images or recovery from every infrastructure failure.
 
 ## Profile support
 
@@ -63,7 +62,7 @@ document adds no alternative limit or larger-payload promise.
 ## Normal requests and control path
 
 ```text
-operator startup / policy / bootstrap / repair authority
+operator initialization / verified profile / bootstrap plan
                       │
                       ▼
      exact profile + generation + WAL binding + initial admission
@@ -78,7 +77,7 @@ separate control path: membership, repair, certified checkpoint/archive,
 After initial admission, normal reads, writes, status, and exact recovery use
 the engine runtime; they do not create a per-request Kubernetes CR
 reservation/finalization or a second application-intent log. This does not
-bypass operator authority at startup, repair, policy, or membership boundaries,
+bypass live lifecycle authority at startup, repair, policy, or membership boundaries,
 and is not a request-latency or Kube-request-count claim.
 
 An uncertain mutation may have committed. Keep its original kind, raw ID,
@@ -88,32 +87,47 @@ proof of no effect. Recovery itself adds zero application proposals and does
 not refresh retention or clear poison. A duplicate submission may be assigned
 a later slot than the canonical first receipt.
 
-The public managed Host requires `before_ack` object-store durability. An
+The public managed Host requires `before-ack` object-store durability. An
 asynchronous success ACK beyond the remote archive head is outside this
 contract; a certified-only or uncertain result must not be reported as a
 durable ACK.
 
 ## NoPVC and recovery boundary
 
-With no PVC, startup reconstructs the verified SQLite/native Graph pair from
-the selected immutable checkpoint and replays the contiguous certified suffix
-through the registered local WAL's captured certified ACK tip. Checkpoint
+The operator renders the reference managed host, identity/bootstrap init
+containers, and an `emptyDir` data volume. Kubernetes maintains Deployment
+replicas and restarts containers. The reference host's replacement loop
+discovers candidates and coordinates ADD-first healthy-quorum repair; the
+engine checks certified membership and restores/replays verified history.
+This does not require a separate fencer for normal quorum membership changes.
+The current initializer does not create peer/client Services or set a
+Deployment `Recreate` strategy, and `voterCount` updates are unsupported.
+Applications outside the reference host must integrate the corresponding
+startup and repair contracts; the operator is not a generic application adapter.
+
+An authenticated first bootstrap may create fresh SQLite/native Graph state
+without a checkpoint. It must be an original bootstrap member with no existing
+registered WAL or application state, no compaction floor or producer locator,
+and a verified genesis prefix. For recovery, startup reconstructs the verified
+SQLite/native Graph pair from the selected immutable checkpoint and replays the
+contiguous certified suffix through the captured certified ACK tip of the
+registered local WAL. Checkpoint
 selection requires the exact QCKP, actual archive certificate/history, full
 object hashes, and pair validation; a CURRENT locator is a hint, not authority.
-Missing roots, identity/prefix drift, incomplete installation, poison, or
+Missing required roots, identity/prefix drift, incomplete installation, poison, or
 ambiguous evidence fail closed rather than creating a new baseline.
 
 Object data is append-only. Online delete GC is not part of this profile. Pod
 API deletion is not proof that an isolated old process ended or that outstanding
-object-store work completed. This candidate does not qualify whole-cluster
+object-store work completed. This release does not qualify whole-cluster
 disaster recovery or fencing every arbitrary network partition; those remain
 explicit gaps.
 
 ## Qualification status
 
-Focused Go normal/race checks cover candidate APIs, actual Core/WAL effects,
-original receipts, public pair publication/restart, and control admission.
-They do not replace final-head Actions or the three object-store provider-SDK checks,
-native Rust/C ABI execution, Pod replacement, or scoped Chaos Mesh
-qualification. Emulator or unit success is not production-cloud parity. No
-release-version support or full HA pass is claimed.
+Go normal/race checks, actual provider-SDK checks, native Rust/C ABI execution,
+and scoped Pod/Chaos Mesh qualification establish different evidence. A pass
+in one scope is not a substitute for another; emulator success is not
+production-cloud parity. Automatic generation DR remains unimplemented, with
+automatic-attempt policy defaulting to OFF. Recovery-intent schemas and status
+components do not constitute a completed manual or automatic DR executor.
