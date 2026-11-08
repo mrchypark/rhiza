@@ -2180,16 +2180,7 @@ func executeSQLCommand(ctx context.Context, conn *sql.Conn, tx *sql.Tx, prepared
 			if _, err := reset.ExecContext(ctx); err != nil {
 				return types.SQLStatementResult{}, err
 			}
-			// The driver's LastInsertId reads native connection state even for an
-			// UPDATE. Reset it for each user statement so receipts cannot inherit
-			// an earlier insert (or differ after reconnecting the writer).
-			if err := conn.Raw(func(driverConn any) error {
-				driverConn.(sqlite3driver.Conn).Raw().SetLastInsertRowID(0)
-				return nil
-			}); err != nil {
-				return types.SQLStatementResult{}, err
-			}
-			finishRowID, err = watchRowID(ctx, conn, tx)
+			finishRowID, err = beginStatementRowID(ctx, conn, tx)
 			if err != nil {
 				return out, err
 			}

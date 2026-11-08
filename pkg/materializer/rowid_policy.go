@@ -12,13 +12,17 @@ import (
 
 var errSQLRowIDExhausted = errors.New("maximum SQLite rowid is reserved by execution policy")
 
-// watchRowID watches effective native writes, including transient trigger writes.
+// beginStatementRowID resets insert identity and watches effective native writes,
+// including transient trigger writes.
 // Classification is needed only for maximum-rowid events: WITHOUT ROWID hook
 // arguments are undefined and must never be interpreted as actual rowids.
-func watchRowID(ctx context.Context, conn *sql.Conn, tx *sql.Tx) (func() error, error) {
+func beginStatementRowID(ctx context.Context, conn *sql.Conn, tx *sql.Tx) (func() error, error) {
 	var targets map[string]bool
 	if err := conn.Raw(func(raw any) error {
-		raw.(driver.Conn).Raw().PreUpdateHook(func(p sqlite3.PreUpdateData) {
+		native := raw.(driver.Conn).Raw()
+		// The driver's LastInsertId reads connection state even for UPDATE.
+		native.SetLastInsertRowID(0)
+		native.PreUpdateHook(func(p sqlite3.PreUpdateData) {
 			if (p.Op == sqlite3.AUTH_INSERT || p.Op == sqlite3.AUTH_UPDATE) && p.NewRowID == math.MaxInt64 {
 				if targets == nil {
 					targets = make(map[string]bool)
