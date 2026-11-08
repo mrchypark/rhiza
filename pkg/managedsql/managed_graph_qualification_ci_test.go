@@ -6,6 +6,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"io"
 	"net/http"
 	"sync"
 	"sync/atomic"
@@ -19,9 +20,46 @@ import (
 	"github.com/mrchypark/rhiza/pkg/operator"
 )
 
+func expectedQualificationPUTCancellation(lifecycle *sqlWireCloseLifecycle, ownedPrefix, headPath string, r *http.Request, err error, gated, callerCanceled bool) bool {
+	return lifecycle.expectedCanceledPUT(ownedPrefix, r, err) ||
+		gated && callerCanceled && r.Method == http.MethodPut && r.URL.Path == headPath &&
+			errors.Is(r.Context().Err(), context.Canceled) && errors.Is(err, io.ErrUnexpectedEOF)
+}
+
 // Actual three-Host/Core/WAL/native/S3-SDK regression. The HTTP server is the
 // existing synthetic wire fixture, not Floci/provider parity or a Rust test.
 func TestManagedGraphActualUnknownRetainsNativeOriginal(t *testing.T) {
+	t.Run("put-read-error-scope", func(t *testing.T) {
+		const prefix = "/bucket/owned/"
+		const head = prefix + "archive/head.bin"
+		for _, tc := range []struct {
+			name, path                    string
+			err                           error
+			gated, caller, canceled, want bool
+		}{
+			{"canceled-gated-head", head, io.ErrUnexpectedEOF, true, true, true, true},
+			{"never-gated", head, io.ErrUnexpectedEOF, false, true, true, false},
+			{"before-caller-cancel", head, io.ErrUnexpectedEOF, true, false, true, false},
+			{"live-wire", head, io.ErrUnexpectedEOF, true, true, false, false},
+			{"wrong-path", "/bucket/other/archive/head.bin", io.ErrUnexpectedEOF, true, true, true, false},
+			{"wrong-error", head, io.ErrClosedPipe, true, true, true, false},
+		} {
+			t.Run(tc.name, func(t *testing.T) {
+				ctx, cancel := context.WithCancel(context.Background())
+				defer cancel()
+				if tc.canceled {
+					cancel()
+				}
+				r, err := http.NewRequestWithContext(ctx, http.MethodPut, "http://fixture"+tc.path, nil)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if got := expectedQualificationPUTCancellation(&sqlWireCloseLifecycle{}, prefix, head, r, tc.err, tc.gated, tc.caller); got != tc.want {
+					t.Fatalf("classify canceled PUT: got %t, want %t", got, tc.want)
+				}
+			})
+		}
+	})
 	ctx, cancel := context.WithTimeout(context.Background(), 25*time.Second)
 	defer cancel()
 	configs, fixture := sqlClusterForProtocol(t, sqlpolicy.ManagedGraphRequestAppendOnlyApplicationProtocol)
@@ -31,6 +69,32 @@ func TestManagedGraphActualUnknownRetainsNativeOriginal(t *testing.T) {
 	var releaseOnce sync.Once
 	fixture.source.putReady, fixture.source.putRelease = entered, release
 	fixture.source.putSuffix, fixture.source.putEnabled = "archive/head.bin", &armed
+	ownedPrefix := "/bucket/" + fixture.source.finalPrefix + "/"
+	headPath := ownedPrefix + "archive/head.bin"
+	var gatedRequests sync.Map
+	fixture.source.putGate = func(ctx context.Context, path string) bool {
+		if path != headPath {
+			return false
+		}
+		gatedRequests.Store(ctx, struct{}{})
+		return true
+	}
+	var callerCanceled atomic.Bool
+	var lifecycle sqlWireCloseLifecycle
+	fixture.source.putReadFailure = func(r *http.Request, err error) {
+		_, gated := gatedRequests.LoadAndDelete(r.Context())
+		if expectedQualificationPUTCancellation(&lifecycle, ownedPrefix, headPath, r, err, gated, callerCanceled.Load()) {
+			t.Logf("expected canceled PUT path=%s gated=%t owned_close=%t", r.URL.Path, gated, lifecycle.closing.Load())
+			return
+		}
+		t.Errorf("unexpected PUT read failure method=%s path=%s context=%v gated=%t caller_canceled=%t owned_close=%t: %v",
+			r.Method, r.URL.Path, r.Context().Err(), gated, callerCanceled.Load(), lifecycle.closing.Load(), err)
+	}
+	closeOwnedHost := func(h *Host) error {
+		lifecycle.closing.Store(true)
+		defer lifecycle.closing.Store(false)
+		return h.Close()
+	}
 	hosts := make([]*Host, len(configs))
 	for i, cfg := range configs {
 		// Observe the real product publisher within this bounded fixture; the
@@ -51,7 +115,7 @@ func TestManagedGraphActualUnknownRetainsNativeOriginal(t *testing.T) {
 		configs[i] = cfg
 		h, err := fixture.open(ctx, cfg)
 		if h != nil {
-			t.Cleanup(func() { _ = h.Close() })
+			t.Cleanup(func() { _ = closeOwnedHost(h) })
 		}
 		if err != nil {
 			t.Fatal(err)
@@ -133,6 +197,7 @@ func TestManagedGraphActualUnknownRetainsNativeOriginal(t *testing.T) {
 		case <-tick.C:
 		}
 	}
+	callerCanceled.Store(true)
 	cancelX()
 	var result outcome
 	select {
@@ -201,12 +266,12 @@ func TestManagedGraphActualUnknownRetainsNativeOriginal(t *testing.T) {
 	// empty-disk/Pod replacement claim. Startup control may use Kubernetes;
 	// normal observations after actual fresh admission must not use it.
 	outage.Store(false)
-	if err := hosts[0].Close(); err != nil {
+	if err := closeOwnedHost(hosts[0]); err != nil {
 		t.Fatal(err)
 	}
 	reopened, err := fixture.open(ctx, configs[0])
 	if reopened != nil {
-		t.Cleanup(func() { _ = reopened.Close() })
+		t.Cleanup(func() { _ = closeOwnedHost(reopened) })
 	}
 	if err != nil {
 		t.Fatal("fresh Host same-DataDir reopen failed", err)

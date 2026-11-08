@@ -46,88 +46,112 @@ func TestManagedGraphCloseCancelsActiveBackgroundAdmissionResampling(t *testing.
 		t.Fatalf("Graph Host not ready after its actual initial-root write: %v", err)
 	}
 
-	var armed atomic.Bool
-	var closing atomic.Bool
-	var injecting atomic.Bool
-	var observedHooks atomic.Int64
-	var progressCount atomic.Int64
-	var progressPaused atomic.Bool
-	progressed := make(chan struct{}, 1)
+	type targetRequestKey struct{}
+	targetCtx := context.WithValue(context.Background(), targetRequestKey{}, true)
+	progressCtx, cancelProgress := context.WithTimeout(context.Background(), 20*time.Second)
+	t.Cleanup(cancelProgress)
+	var observing atomic.Bool
+	var skippedInitialGate, captured, failed bool
+	progressCount := 0
+	var lastSlot uint64
+	progressed := make(chan error, 1)
 	resumeProgress := make(chan struct{})
 	var resumeProgressOnce sync.Once
 	releaseProgress := func() { resumeProgressOnce.Do(func() { close(resumeProgress) }) }
-	var hookErr atomic.Value
-	restore := localtesthooks.Set(func(event string) {
-		if event != "node:managed-runtime-state:after-certified-tip" || !armed.Load() || closing.Load() || !injecting.CompareAndSwap(false, true) {
-			return
-		}
-		if observedHooks.Add(1) == 1 {
-			injecting.Store(false)
-			return // GraphExecute's Host-level initial gate precedes the Node operation.
-		}
-		id := progressCount.Load() + 1
-		_, err := hosts[1].GraphExecute(context.Background(), types.GraphCommand{RequestID: fmt.Sprintf("close-progress-%d", id), Cypher: "CREATE (:CloseProgress {id: $id})", Args: map[string]any{"id": id}})
-		injecting.Store(false)
-		if err != nil {
-			hookErr.Store(err)
-			return
-		}
-		count := progressCount.Add(1)
-		if count >= 3 && progressPaused.CompareAndSwap(false, true) {
-			select {
-			case progressed <- struct{}{}:
-			default:
-			}
-			<-resumeProgress
-		}
-	})
-	t.Cleanup(restore)
-	t.Cleanup(releaseProgress)
-
-	var captureArmed atomic.Bool
-	var captured atomic.Bool
 	entered := make(chan context.Context, 1)
 	canceled := make(chan struct{})
 	releaseOperation := make(chan struct{})
 	var releaseOperationOnce sync.Once
 	releaseBorrower := func() { releaseOperationOnce.Do(func() { close(releaseOperation) }) }
+
+	advanceTarget := func(id int) (uint64, error) {
+		receipt, err := hosts[1].GraphExecute(progressCtx, types.GraphCommand{
+			RequestID: fmt.Sprintf("close-progress-%d", id),
+			Cypher:    "CREATE (:CloseProgress {id: $id})",
+			Args:      map[string]any{"id": id},
+		})
+		if err != nil || receipt.Slot <= lastSlot || receipt.Status != types.MutationCommitted {
+			return 0, fmt.Errorf("peer write did not commit a new slot: slot=%d status=%s err=%v", receipt.Slot, receipt.Status, err)
+		}
+		// The peer can ACK before Learned reaches the target's Core.
+		tick := time.NewTicker(10 * time.Millisecond)
+		defer tick.Stop()
+		for {
+			state, err := hosts[0].node.ManagedState()
+			if err == nil && state.CertifiedTip >= receipt.Slot {
+				return receipt.Slot, nil
+			}
+			if err != nil && !errors.Is(err, network.ErrNotReady) {
+				return 0, err
+			}
+			select {
+			case <-progressCtx.Done():
+				return 0, fmt.Errorf("target did not certify slot %d (last observed tip %d): %w", receipt.Slot, state.CertifiedTip, progressCtx.Err())
+			case <-tick.C:
+			}
+		}
+	}
 	restoreContext := localtesthooks.SetManagedRuntimeStateContext(func(operationCtx context.Context) {
-		if !captureArmed.Load() || !captured.CompareAndSwap(false, true) {
+		if operationCtx.Value(targetRequestKey{}) != true || !observing.CompareAndSwap(false, true) {
 			return
 		}
+		defer observing.Store(false)
+		if captured || failed {
+			return
+		}
+		if !skippedInitialGate {
+			skippedInitialGate = true
+			return // GraphExecute's Host-level initial gate precedes the Node operation.
+		}
+		if progressCount < 3 {
+			slot, err := advanceTarget(progressCount + 1)
+			if err != nil {
+				failed = true
+				progressed <- err
+				return
+			}
+			lastSlot = slot
+			progressCount++
+			if progressCount == 3 {
+				progressed <- nil
+				<-resumeProgress
+			}
+			return
+		}
+		captured = true
 		entered <- operationCtx
 		<-operationCtx.Done()
 		close(canceled)
 		<-releaseOperation
 	})
 	t.Cleanup(restoreContext)
+	t.Cleanup(releaseProgress)
 	t.Cleanup(releaseBorrower)
 
-	armed.Store(true)
 	type executeResult struct {
 		response network.GraphExecuteResponse
 		err      error
 	}
 	executed := make(chan executeResult, 1)
 	go func() {
-		response, err := hosts[0].GraphExecute(context.Background(), types.GraphCommand{RequestID: "close-active-admission", Cypher: "CREATE (:CloseLifetime {id: 1})"})
+		response, err := hosts[0].GraphExecute(targetCtx, types.GraphCommand{RequestID: "close-active-admission", Cypher: "CREATE (:CloseLifetime {id: 1})"})
 		executed <- executeResult{response: response, err: err}
 	}()
 
 	select {
-	case <-progressed:
-	case <-time.After(20 * time.Second):
-		if err, ok := hookErr.Load().(error); ok {
+	case err := <-progressed:
+		if err != nil {
 			t.Fatalf("actual read-barrier progress failed: %v", err)
 		}
+	case result := <-executed:
+		t.Fatalf("Graph admission returned before observing repeated Core progress: slot=%d err=%v", result.response.MutationReceipt.Slot, result.err)
+	case <-progressCtx.Done():
 		t.Fatal("Graph admission did not repeatedly reobserve actual Core progress")
 	}
-	if progressCount.Load() < 3 {
-		t.Fatalf("insufficient actual certified progress before close: %d", progressCount.Load())
+	if progressCount != 3 {
+		t.Fatalf("insufficient actual certified progress before close: %d", progressCount)
 	}
 
-	closing.Store(true)
-	captureArmed.Store(true)
 	releaseProgress()
 	var operationCtx context.Context
 	select {
@@ -168,5 +192,4 @@ func TestManagedGraphCloseCancelsActiveBackgroundAdmissionResampling(t *testing.
 	case <-time.After(10 * time.Second):
 		t.Fatal("Host.Close remained blocked behind active Graph admission")
 	}
-	armed.Store(false)
 }
