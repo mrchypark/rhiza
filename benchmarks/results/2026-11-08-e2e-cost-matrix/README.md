@@ -488,3 +488,47 @@ in the hosted runs; the Graph engine version and metadata path are unchanged.
 [Functional CI](https://github.com/mrchypark/rhiza/actions/runs/42492457051)
 passed all seven jobs at the production-code revision `8b50cb1c`; only
 the benchmark fixture and workflow changed in `6d1c25b9`.
+
+## SQL Async: voter data placement and disk pressure
+
+At `0274f38c8c9ce41fef33d86fd64f0a620eadeb63`, a Kubernetes Job compared
+three voters sharing one block volume with the same three voters using one
+volume each. Both arms used the same host and the same pool of three
+independent block volumes, rotating the shared volume and voter assignments
+and alternating arm order. This moved each voter's entire data directory, not
+just its WAL. All 12 samples across six pairs verified 1,000 SQL writes each.
+Timed writes used zero object-store HTTP attempts and forced publication used
+17 in every sample, against the Floci GCS emulator.
+
+| Per-arm median | Shared | Split |
+| --- | ---: | ---: |
+| p99 (ms) | 422.54 | 326.86 |
+| Successful writes/s | 444.24 | 371.39 |
+| Voter CPU sum (s) | 2.045 | 2.140 |
+| Largest individual voter lifetime RSS HWM (MiB) | 97.81 | 96.25 |
+
+The median of paired changes was **−6.20% p99** and **−5.13% throughput**;
+split lowered p99 in 3/6 pairs and increased throughput in 3/6. Shared/split
+p99 pairs in execution-pair order (ms): `48.71/451.52`, `489.14/575.67`,
+`438.16/645.47`, `731.92/202.21`, `29.99/20.97`, `406.93/114.42`. There is
+no consistent placement win. In all six pairs, the higher-p99 arm had a
+larger fraction of its write window with overlapping slow fsyncs on at least
+two voters. The probe used a 2 ms threshold; individual sync wall times
+reached 332.95 ms shared and 373.31 ms split. These are wall durations, not
+device service latencies. The host and potentially shared upstream storage
+were not isolated, so the association does not establish the cause of the spikes.
+
+Earlier, [hosted pressure-control run 42494789160](https://github.com/mrchypark/rhiza/actions/runs/42494789160)
+passed 16/16 samples on the same code revision in both arms. The median p99
+was 24.13 ms with the pressure writer on the voter filesystem and 23.66 ms
+with the writer on tmpfs. This control did not reproduce the large spikes.
+
+The placement benchmark container exited 0 and the Pod reached `Succeeded`;
+Floci exited 143 during sidecar shutdown. The terminal snapshot did not
+capture a Job `Complete` condition. The test namespace, volumes, and backing
+disks were removed. Neither experiment changes durability or verifies live GCS.
+
+Before changing the WAL path, distinguish device I/O time from voter scheduling
+delay by collecting per-device block I/O and per-voter scheduler wait over the
+same write window. Reuse the exact-binary paired setup and keep the quorum sync
+and receipt gates unchanged.
