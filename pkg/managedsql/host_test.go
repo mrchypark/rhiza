@@ -708,6 +708,10 @@ func readySQL(t *testing.T, h *Host) {
 
 func TestManagedSQLRealThreeNodeInitializationAndWrite(t *testing.T) {
 	configs, f := sqlCluster(t)
+	// This fixture starts background publishers and owns their Host shutdown.
+	// Keep reporting incomplete PUTs unless the strict Close observer proves
+	// that this fixture is closing and the owned request was canceled.
+	(&sqlWireCloseLifecycle{}).observePUTFailures(t, f)
 	hosts := make([]*Host, 3)
 	for i, cfg := range configs[:2] {
 		h, err := f.open(context.Background(), cfg)
