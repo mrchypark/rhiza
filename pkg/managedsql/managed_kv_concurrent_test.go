@@ -23,9 +23,12 @@ import (
 	"github.com/mrchypark/rhiza/pkg/quepaxa/walfb"
 )
 
-func mixedHostQuorum(t *testing.T, wrappers ...func(int, http.RoundTripper) http.RoundTripper) ([]Config, []*Host, *sqlStatusFixture) {
+func mixedHostQuorum(t *testing.T, closeLifecycle *sqlWireCloseLifecycle, wrappers ...func(int, http.RoundTripper) http.RoundTripper) ([]Config, []*Host, *sqlStatusFixture) {
 	t.Helper()
 	configs, fixture := sqlClusterForProtocol(t, sqlpolicy.ManagedRequestAppendOnlyApplicationProtocol)
+	if closeLifecycle != nil {
+		closeLifecycle.observePUTFailures(t, fixture)
+	}
 	hosts := make([]*Host, 3)
 	for i := range hosts {
 		kube := *configs[i].Store.Kube
@@ -38,7 +41,7 @@ func mixedHostQuorum(t *testing.T, wrappers ...func(int, http.RoundTripper) http
 		h, err := fixture.open(context.Background(), configs[i])
 		if h != nil {
 			t.Cleanup(func() {
-				if err := h.Close(); err != nil {
+				if err := fixture.closeHost(h); err != nil {
 					t.Error(err)
 				}
 			})
@@ -141,7 +144,7 @@ func hostApplicationDecisionSnapshot(t *testing.T, ctx context.Context, cfg Conf
 }
 
 func TestManagedKVHostMixedRoundTripAndDetailedRecovery(t *testing.T) {
-	configs, hosts, _ := mixedHostQuorum(t)
+	configs, hosts, _ := mixedHostQuorum(t, nil)
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 	defer cancel()
 	h := hosts[0]
@@ -208,7 +211,7 @@ func TestManagedKVHostMixedRoundTripAndDetailedRecovery(t *testing.T) {
 }
 
 func TestManagedKVHostLocalObservationSurvivesQuorumLoss(t *testing.T) {
-	configs, hosts, _ := mixedHostQuorum(t)
+	configs, hosts, fixture := mixedHostQuorum(t, &sqlWireCloseLifecycle{})
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 	h := hosts[0]
@@ -239,7 +242,7 @@ func TestManagedKVHostLocalObservationSurvivesQuorumLoss(t *testing.T) {
 	t.Logf("independent commit advanced status tip %d -> %d with identical ACK receipt at slot %d", initial.Tip, advanced.Tip, ack.Slot)
 	for _, other := range hosts[1:] {
 		waitSQLCertifiedApplication(t, ctx, other, ack.Slot)
-		if err := other.Close(); err != nil {
+		if err := fixture.closeHost(other); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -334,7 +337,7 @@ func TestManagedKVHostLocalObservationSurvivesQuorumLoss(t *testing.T) {
 	if err != nil || !value.Found || string(value.Value) != "acknowledged" {
 		t.Fatal("quorum-refused write changed prior acknowledged data", err)
 	}
-	if err := h.Close(); err != nil {
+	if err := fixture.closeHost(h); err != nil {
 		t.Fatal(err)
 	}
 	assertHostQuorumLossControlWAL(t, configs[0], beforeWrite, seedHash)
