@@ -346,3 +346,86 @@ the same benchmark recorded 6.11 ms/op, 2,729,575 B/op and 49,047 allocs/op.
 The old `LoadGraph` frame used 58.39% cumulative CPU; its replacement
 `LoadGraphWithAppMetadata` used 0.82% in the new profile. These profile runs
 were not paired on one runner; the E2E table is the controlled comparison.
+
+## SQL and KV Async follow-up
+
+[Same-revision Versity A/A](https://github.com/mrchypark/rhiza/actions/runs/42484194658)
+used identical server code for both labels. All three KV Async candidate
+labels nevertheless had worse p99 (28.35→30.80, 28.02→32.43 and
+25.03→26.08 ms). This is a control for ordinary variation, not evidence
+that the LatticeDB change caused or could never cause a KV regression.
+
+[GCS stage diagnostics](https://github.com/mrchypark/rhiza/actions/runs/42484768841)
+passed 36/36, with probe startup markers for all 54 voters in the 18 Async
+samples. In one SQL sample, client p99 was 280.47 ms, the longest in-window
+WAL `file.Sync` was 280.17 ms and group flush was 280.23 ms. Another had
+140.63 ms p99 and a 139.57 ms WAL sync. Timed GCS requests were zero.
+In the 280 ms sample, two voters' sync intervals overlapped by 274.23 ms;
+all three voters used the same runner disk. This can stall a quorum, not
+just one slow voter. The measured `file.Sync` wall time can also include
+time the process spent descheduled during the call.
+These wall timings localize the stall to the sync call in those samples;
+they do not prove why the underlying I/O stalled or attribute every
+outlier request to a particular voter. The earlier [cancelled probe](https://github.com/mrchypark/rhiza/actions/runs/42484194715)
+did not forward the flag through `env -i` and is not diagnostic evidence.
+The runner now requires an exact startup marker on all three ready voters.
+The [separate block mount A/B](https://github.com/mrchypark/rhiza/actions/runs/42485565210)
+stopped before measuring: `/tmp` resolved to `/dev/sda1` and no distinct
+`/mnt` block mount was present. This leaves the disk-placement mitigation
+unqualified. No same-disk fallback, tmpfs, or weaker sync was used.
+
+[Versity](https://github.com/mrchypark/rhiza/actions/runs/42484340256) and
+[GCS](https://github.com/mrchypark/rhiza/actions/runs/42484340029) each passed
+36/36 comparing `36a867ee` with `73b18aec` (probe disabled). All samples
+preserved 1,071 BeforeAck requests, zero timed Async requests and 17
+forced Async publication requests; GCS Class A/B splits were unchanged.
+The same-run KV batch benchmark at 16 commands fell from 1.82 to 1.23 ms
+and 2,099 to 1,677 allocations per batch. Single-command allocation rose
+from 195 to 197, so `a2872f82` removes method-value indirection from that
+path. SQL skipped redundant maintenance tokenization, reducing the
+single-command microbenchmark from 248 to 237 allocations with essentially
+unchanged median time. E2E latency and throughput were mixed; in particular
+the uninstrumented GCS SQL Async comparison still included 112 and 414 ms
+candidate tails. The optimizations do not remove the durable sync barrier.
+
+[CI at the dependency update](https://github.com/mrchypark/rhiza/actions/runs/42481741693)
+failed waiting for repeated certified progress in the Graph Close fixture.
+The corrected fixture passed that step in
+[CI 42484226962](https://github.com/mrchypark/rhiza/actions/runs/42484226962).
+[CI 42484340027](https://github.com/mrchypark/rhiza/actions/runs/42484340027)
+failed separately on a truncated PUT body in the Graph UNKNOWN fixture.
+The test now reports the wire path and cancellation state and accepts
+only a proven, scoped cancellation. The original failed runs remain linked.
+
+The [final Versity retest](https://github.com/mrchypark/rhiza/actions/runs/42485117382)
+and [final GCS retest](https://github.com/mrchypark/rhiza/actions/runs/42485117409)
+compared `36a867ee` with `a2872f82` and passed 36/36 each. The medians below
+retain the earlier CPU and memory scopes.
+
+| Provider | Workload | Mode | Writes/s | p99 (ms) | Voter CPU (s) | Largest voter HWM (MiB) |
+| --- | --- | --- | ---: | ---: | ---: | ---: |
+| S3 | SQL | Async | 1647.24 → 1657.84 | 14.17 → 13.91 | 1.08 → 1.06 | 64.11 → 63.70 |
+| S3 | SQL | BeforeAck | 558.72 → 561.81 | 34.18 → 32.71 | 1.85 → 1.84 | 66.34 → 65.94 |
+| S3 | KV | Async | 1002.24 → 1183.62 | 29.60 → 24.68 | 2.41 → 1.96 | 62.76 → 61.21 |
+| S3 | KV | BeforeAck | 487.46 → 516.58 | 42.28 → 39.62 | 2.88 → 2.65 | 61.13 → 61.20 |
+| S3 | GRAPH | Async | 458.14 → 452.40 | 60.50 → 61.12 | 3.24 → 3.27 | 59.54 → 60.47 |
+| S3 | GRAPH | BeforeAck | 323.53 → 323.63 | 60.42 → 61.97 | 3.85 → 3.86 | 60.87 → 61.05 |
+| GCS | SQL | Async | 1742.58 → 1493.24 | 29.06 → 93.00 | 0.66 → 0.65 | 97.09 → 96.54 |
+| GCS | SQL | BeforeAck | 577.49 → 516.37 | 88.67 → 84.50 | 1.72 → 1.95 | 106.25 → 115.84 |
+| GCS | KV | Async | 1343.89 → 1515.56 | 45.19 → 64.27 | 1.24 → 1.17 | 100.02 → 97.42 |
+| GCS | KV | BeforeAck | 483.58 → 421.80 | 95.99 → 154.35 | 2.62 → 2.43 | 110.18 → 104.17 |
+| GCS | GRAPH | Async | 548.64 → 564.84 | 131.61 → 57.12 | 2.08 → 2.14 | 97.02 → 100.37 |
+| GCS | GRAPH | BeforeAck | 324.69 → 359.91 | 118.67 → 82.48 | 3.37 → 3.33 | 106.36 → 105.90 |
+
+In every sample, BeforeAck remained at 1,071 attempts, timed Async stayed
+at zero, and forced Async publication remained at 17. GCS retained Class
+A/B counts of 252/819 (SQL BeforeAck), 254/817 (Graph/KV BeforeAck), and
+6/11 (forced publication). The Graph Apply profile still used the optimized
+metadata path (1.17 ms/op, 180,206 B/op, 862 allocs/op, not a paired microbenchmark).
+
+The same-run KV microbenchmark regained 195 allocs for one command and
+reduced 16-command median time from 2.88 to 1.94 ms, allocations from
+2,099 to 1,640. SQL single-command allocation remained 248→237, and 128
+commands used about 100 KiB less per batch; the elapsed improvement was small.
+Versity KV Async improved in this run, while GCS SQL Async p99 did not.
+These are emulator and hosted-runner measurements, not live cloud latency.
