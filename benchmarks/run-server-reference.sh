@@ -139,6 +139,7 @@ target_node=${RHIZA_SERVER_BENCH_TARGET_NODE:-n1}
 durability=${RHIZA_SERVER_BENCH_DURABILITY:-async}
 workload=${RHIZA_SERVER_BENCH_WORKLOAD:-sql}
 publish_async=${RHIZA_SERVER_BENCH_ASYNC_PUBLISH:-0}
+provider=${RHIZA_SERVER_BENCH_PROVIDER:-s3}
 fault_after=${RHIZA_SERVER_BENCH_FAULT_AFTER:-1}
 max_fault_latency_ms=${RHIZA_SERVER_BENCH_MAX_FAULT_LATENCY_MS:-1500}
 base_http_port=${RHIZA_SERVER_BENCH_HTTP_PORT:-18100}
@@ -162,6 +163,10 @@ if [[ $durability != async && $durability != before-ack ]]; then
 fi
 if [[ $workload != sql && $workload != graph && $workload != kv ]]; then
 	printf 'RHIZA_SERVER_BENCH_WORKLOAD must be sql, graph, or kv\n' >&2
+	exit 2
+fi
+if [[ $provider != s3 && $provider != gcs ]] || [[ $provider == gcs && $failed_node != none ]]; then
+	printf 'RHIZA_SERVER_BENCH_PROVIDER must be s3 or gcs; gcs requires a healthy lane\n' >&2
 	exit 2
 fi
 if [[ $publish_async != 0 && $publish_async != 1 ]] ||
@@ -189,13 +194,19 @@ if [[ ! $max_fault_latency_ms =~ ^[1-9][0-9]*([.][0-9]+)?$ ]]; then
 fi
 
 run_dir=$(mktemp -d "${TMPDIR:-/tmp}/rhiza-server-bench.XXXXXX")
-container="rhiza-bench-s3-$$"
+container="rhiza-bench-$provider-$$"
+gcs_container_id=
 bench_pid=
 cleanup() {
+	local cleanup_failed=0
 	set +e
 	stop_benchmark_child
 	output_stem=$(basename "$output_file" .json)
 	for log in "$run_dir"/node-*.log; do
+		[[ -f $log ]] || continue
+		cp "$log" "$(dirname "$output_file")/$output_stem-$(basename "$log")"
+	done
+	for log in "$run_dir"/gcs-*-classes.json; do
 		[[ -f $log ]] || continue
 		cp "$log" "$(dirname "$output_file")/$output_stem-$(basename "$log")"
 	done
@@ -208,12 +219,20 @@ cleanup() {
 		if jobs -pr | grep -qx "$pid"; then kill "$pid" 2>/dev/null || true; fi
 		wait "$pid" 2>/dev/null || true
 	done
-	docker rm -f "$container" >/dev/null 2>&1 || true
+	if [[ $provider == s3 ]]; then
+		docker rm -f "$container" >/dev/null 2>&1 || true
+	elif [[ $gcs_container_id =~ ^[a-f0-9]{64}$ ]]; then
+		if ! docker rm -f "$gcs_container_id" >/dev/null; then
+			printf 'could not verify removal of owned GCS emulator %s\n' "$gcs_container_id" >&2
+			cleanup_failed=1
+		fi
+	fi
 	case "$run_dir" in
 		"${TMPDIR:-/tmp}"/rhiza-server-bench.*) rm -rf -- "$run_dir" ;;
 	esac
+	return "$cleanup_failed"
 }
-trap 'exit_status=$?; trap - EXIT; cleanup; exit "$exit_status"' EXIT
+trap 'exit_status=$?; trap - EXIT; cleanup || { [[ $exit_status != 0 ]] || exit_status=1; }; exit "$exit_status"' EXIT
 trap 'exit 130' INT
 trap 'exit 143' TERM
 
@@ -227,8 +246,40 @@ else
 	client_sha256=$(shasum -a 256 "$run_dir/rhiza-bench" | awk '{print $1}')
 fi
 
-mkdir -p "$run_dir/s3-data"
-docker run --rm -d --name "$container" -p "$s3_port:9000" --user "$(id -u):$(id -g)" \
+node_environment=(env)
+if [[ $provider == gcs ]]; then
+	# Same native JSON API as the embedded provider test. The Kind helper's
+	# generated account uses an in-cluster token URI, so bind this ADC locally.
+	gcs_image=floci/floci-gcp:0.11.0@sha256:eae9683d806ceb643bcb36aee97cdb8cad13c3e2959cd053bf40e481994fde12
+	gcs_container_id=$(docker run --rm -d --name "$container" -p 127.0.0.1::4588 \
+		-e QUARKUS_HTTP_ACCESS_LOG_ENABLED=true \
+		-e 'QUARKUS_HTTP_ACCESS_LOG_PATTERN=RHIZA_GCS_ACCESS %m %U %s' "$gcs_image")
+	[[ $gcs_container_id =~ ^[a-f0-9]{64}$ ]]
+	gcs_address=$(docker port "$gcs_container_id" 4588/tcp)
+	[[ $gcs_address =~ ^127\.0\.0\.1:[1-9][0-9]{0,4}$ ]]
+	gcs_endpoint="http://$gcs_address"
+	gcs_project=rhiza-local-test
+	gcs_bucket="rhiza-server-bench-$$-${RANDOM}"
+	for _ in {1..100}; do
+		curl -q -fsS --noproxy '*' --max-time 1 "$gcs_endpoint/storage/v1/b?project=$gcs_project" >/dev/null 2>&1 && break
+		sleep 0.1
+	done
+	curl -q -fsS --noproxy '*' --max-time 5 -H 'Content-Type: application/json' \
+		-d "{\"name\":\"$gcs_bucket\"}" "$gcs_endpoint/storage/v1/b?project=$gcs_project" \
+		| jq -e --arg bucket "$gcs_bucket" '.name == $bucket' >/dev/null
+	(
+		umask 077
+		openssl genpkey -algorithm RSA -pkeyopt rsa_keygen_bits:2048 -out "$run_dir/gcs-key.pem" 2>/dev/null
+		jq -nc --rawfile key "$run_dir/gcs-key.pem" --arg project "$gcs_project" --arg token "$gcs_endpoint/token" \
+			'{type:"service_account",project_id:$project,private_key_id:$project,private_key:$key,
+			  client_email:("rhiza@" + $project + ".iam.gserviceaccount.com"),token_uri:$token}' >"$run_dir/gcs-adc.json"
+	)
+	node_environment=(env -i PATH="$PATH" HOME="$run_dir" TMPDIR="$run_dir" GCE_METADATA_HOST=127.0.0.1:1)
+	object_env=(RHIZA_OBJSTORE_PROVIDER=gcs RHIZA_OBJSTORE_BUCKET="$gcs_bucket" STORAGE_EMULATOR_HOST="$gcs_endpoint"
+		GOOGLE_APPLICATION_CREDENTIALS="$run_dir/gcs-adc.json")
+else
+	mkdir -p "$run_dir/s3-data"
+	docker run --rm -d --name "$container" -p "$s3_port:9000" --user "$(id -u):$(id -g)" \
 	-v "$run_dir/s3-data:/data" \
 	-e ROOT_ACCESS_KEY=rhiza-e2e -e ROOT_SECRET_KEY=rhiza-e2e-secret \
 	ghcr.io/versity/versitygw@sha256:30292fc2eeacc67a36993b01f7a7a5e3361a19cced0e80c1d71cfa2a4b0a2499 \
@@ -238,11 +289,15 @@ for _ in {1..100}; do
 	sleep 0.1
 done
 curl -fsS "http://127.0.0.1:$s3_port/_/health" >/dev/null
-docker run --rm --add-host host.docker.internal:host-gateway \
+	docker run --rm --add-host host.docker.internal:host-gateway \
 	-e AWS_ACCESS_KEY_ID=rhiza-e2e -e AWS_SECRET_ACCESS_KEY=rhiza-e2e-secret \
 	-e AWS_DEFAULT_REGION=us-east-1 \
 	amazon/aws-cli@sha256:83f8ffe939569070c5b66d22231862ab78718766d9d8e4c44ca84dd0be5569a5 \
 	--endpoint-url "http://host.docker.internal:$s3_port" s3 mb s3://rhiza >/dev/null
+	object_env=(RHIZA_OBJSTORE_PROVIDER=s3 RHIZA_OBJSTORE_ENDPOINT="127.0.0.1:$s3_port" RHIZA_OBJSTORE_BUCKET=rhiza
+		RHIZA_OBJSTORE_REGION=us-east-1 RHIZA_OBJSTORE_INSECURE=true RHIZA_OBJSTORE_ACCESS_KEY=rhiza-e2e
+		RHIZA_OBJSTORE_SECRET_KEY=rhiza-e2e-secret)
+fi
 
 # The membership record shape follows the revision under test: v2 publishes
 # only the public key each node's private peer token derives for cluster
@@ -265,13 +320,11 @@ fi
 for i in 0 1 2; do
 	peer_token_env=()
 	[[ $legacy_membership -eq 1 ]] || peer_token_env=(RHIZA_PEER_TOKEN="n$i-token")
-	env RHIZA_CLUSTER_ID=server-bench RHIZA_NODE_ID="n$i" \
+	"${node_environment[@]}" RHIZA_CLUSTER_ID=server-bench RHIZA_NODE_ID="n$i" \
 		RHIZA_BIND_ADDR="127.0.0.1:$((base_http_port + i))" RHIZA_PEER_ADDR="127.0.0.1:$((base_peer_port + i))" \
 		RHIZA_DATA_DIR="$run_dir/node-$i" RHIZA_CLUSTER_MEMBERS="$members" "${peer_token_env[@]+${peer_token_env[@]}}" \
 		"${admin_env[@]+${admin_env[@]}}" \
-		RHIZA_OBJSTORE_PROVIDER=s3 RHIZA_OBJSTORE_ENDPOINT="127.0.0.1:$s3_port" RHIZA_OBJSTORE_BUCKET=rhiza \
-		RHIZA_OBJSTORE_PREFIX=server-bench RHIZA_OBJSTORE_REGION=us-east-1 RHIZA_OBJSTORE_INSECURE=true \
-		RHIZA_OBJSTORE_ACCESS_KEY=rhiza-e2e RHIZA_OBJSTORE_SECRET_KEY=rhiza-e2e-secret \
+		"${object_env[@]}" RHIZA_OBJSTORE_PREFIX=server-bench \
 		RHIZA_OBJSTORE_DURABILITY="$durability" RHIZA_OBJSTORE_SYNC_INTERVAL=1h RHIZA_CHECKPOINT_INTERVAL=0 \
 		"$run_dir/rhiza" >"$run_dir/node-$i.log" 2>&1 &
 	printf '%s' "$!" >"$run_dir/node-$i.pid"
@@ -324,7 +377,51 @@ object_stats() {
 			| jq -c --arg node "$node" '{node:$node,stats:.}'
 	done | jq -sc 'reduce .[] as $item ({}; reduce ($item.stats | to_entries[]) as $entry (. ; .[$entry.key] = ((.[$entry.key] // 0) + $entry.value)))'
 }
+
+gcs_snapshot() {
+	# Keep only the configured method/path/status fields, never arbitrary
+	# emulator output. The parser must reject malformed marker records.
+	docker logs "$gcs_container_id" 2>&1 | awk '
+		match($0, /(^|[[:space:]])RHIZA_GCS_ACCESS([[:space:]]|$)/) {
+			record = substr($0, RSTART)
+			sub(/^[[:space:]]+/, "", record)
+			print record
+		}' >"$1"
+}
+
+gcs_phase() {
+	local before=$1 after=$2 phase=$3 transport=$4 lines records classified summary
+	lines=$(wc -l <"$before")
+	lines=$((lines + 0))
+	if ! head -n "$lines" "$after" | cmp -s "$before" -; then
+		printf 'GCS access log no longer extends the %s baseline\n' "$phase" >&2
+		return 1
+	fi
+	records="$run_dir/gcs-$phase.log"
+	tail -n "+$((lines + 1))" "$after" >"$records"
+	classified=$(awk -v bucket="$gcs_bucket" -f "$client_source_dir/benchmarks/gcs-request-classes.awk" "$records") || return 1
+	summary="$run_dir/gcs-$phase-classes.json"
+	jq -c --argjson transport "$transport" '
+		(.http_attempts - .auth_attempts) as $observed
+		| . + {transport_attempts:$transport.http_requests,transport_counts:$transport,
+		       observed_storage_responses:$observed,
+		       transport_minus_observed:(if ($transport.http_requests | type) == "number"
+		                                  then $transport.http_requests - $observed else null end)}' \
+		<<<"$classified" >"$summary" || return 1
+	if ! jq -e '(.transport_attempts | type) == "number" and .transport_attempts >= 0
+		and .unknown_attempts == 0 and .malformed_access_lines == 0
+		and (.transport_attempts == 0 or .observed_storage_responses > 0)' "$summary" >/dev/null; then
+		printf 'GCS %s phase lacks classifiable completed-request evidence\n' "$phase" >&2
+		return 1
+	fi
+	cat "$summary"
+}
+
 object_before=$(object_stats)
+if [[ $provider == gcs ]]; then
+	gcs_snapshot "$run_dir/gcs-setup.log"
+	[[ -s $run_dir/gcs-setup.log ]] || { printf 'missing native GCS access records after setup\n' >&2; exit 1; }
+fi
 resource_before=null
 resource_summary=null
 resource_status=not_collected_non_linux
@@ -411,8 +508,15 @@ if [[ $failed_node != none ]]; then
 fi
 write_object_delta=null
 publication=null
-if [[ $failed_node == none && ( -n ${RHIZA_SERVER_BENCH_WORKLOAD:-} || $publish_async == 1 ) ]]; then
-	write_object_delta=$(object_stats_delta "$object_before" "$(object_stats)")
+gcs_classes=null
+gcs_publication=null
+if [[ $failed_node == none && ( -n ${RHIZA_SERVER_BENCH_WORKLOAD:-} || $publish_async == 1 || $provider == gcs ) ]]; then
+	write_object_after=$(object_stats)
+	write_object_delta=$(object_stats_delta "$object_before" "$write_object_after")
+fi
+if [[ $provider == gcs ]]; then
+	gcs_snapshot "$run_dir/gcs-write.snapshot"
+	gcs_write=$(gcs_phase "$run_dir/gcs-setup.log" "$run_dir/gcs-write.snapshot" write "$write_object_delta")
 fi
 jq -e --argjson requests "$requests" --arg oracle "$receipt_oracle" \
 	'.errors == 0 and .successes == $requests and .receipt_oracle == $oracle' <<<"$result" >/dev/null
@@ -440,12 +544,23 @@ esac
 object_after=$(object_stats)
 object_delta=$(object_stats_delta "$object_before" "$object_after")
 object_metric_nodes=$(printf '%s\n' "${metric_nodes[@]}" | jq -R . | jq -sc .)
+if [[ $provider == gcs ]]; then
+	gcs_snapshot "$run_dir/gcs-verification.snapshot"
+	gcs_verification=$(gcs_phase "$run_dir/gcs-write.snapshot" "$run_dir/gcs-verification.snapshot" verification \
+		"$(object_stats_delta "$write_object_after" "$object_after")")
+fi
 if [[ $publish_async == 1 ]]; then
 	cut_before=$(curl -fsS --max-time 5 "$target/recovery/status")
 	publish_object_before=$(object_stats)
+	if [[ $provider == gcs ]]; then gcs_snapshot "$run_dir/gcs-prepublication.snapshot"; fi
 	publish_seconds=$(curl -fsS --max-time 35 -X POST -H "Authorization: Bearer $admin_token" \
 		-o "$run_dir/publication.json" -w '%{time_total}' "$target/recovery/archive")
 	publish_object_after=$(object_stats)
+	publish_delta=$(object_stats_delta "$publish_object_before" "$publish_object_after")
+	if [[ $provider == gcs ]]; then
+		gcs_snapshot "$run_dir/gcs-publication.snapshot"
+		gcs_publication=$(gcs_phase "$run_dir/gcs-prepublication.snapshot" "$run_dir/gcs-publication.snapshot" publication "$publish_delta")
+	fi
 	cut_after=$(curl -fsS --max-time 5 "$target/recovery/status")
 	if ! jq -e '.status == "archived"' "$run_dir/publication.json" >/dev/null ||
 		! verify_publication_cut "$target_node" "$cut_before" "$cut_after" >/dev/null; then
@@ -453,8 +568,14 @@ if [[ $publish_async == 1 ]]; then
 		exit 1
 	fi
 	publication=$(jq -nc --argjson seconds "$publish_seconds" --argjson before "$cut_before" --argjson after "$cut_after" \
-		--argjson delta "$(object_stats_delta "$publish_object_before" "$publish_object_after")" \
+		--argjson delta "$publish_delta" \
 		'{forced:true,elapsed_seconds:$seconds,object_store_delta:$delta,before:$before,after:$after}')
+fi
+if [[ $provider == gcs ]]; then
+	gcs_classes=$(jq -nc --arg image "$gcs_image" --argjson write "$gcs_write" \
+		--argjson verification "$gcs_verification" --argjson publication "$gcs_publication" \
+		'{scope:"completed requests observed in the native GCS emulator; not a billing statement",
+			emulator_image:$image,write:$write,verification:$verification,publication:$publication}')
 fi
 runtime_failure_lines=0
 for log in "$run_dir"/node-*.log; do
@@ -465,8 +586,9 @@ jq -nc --argjson result "$result" --argjson count "$count" --argjson overlap "$o
 	'{transport:"HTTP client + three QUIC voters",client_revision:$client_revision,client_sha256:$client_sha256,receipt_oracle:"sql-insert-id-v1",fault_overlap:$overlap,fault_exit_status:$fault_exit_status,fault_instrumentation:(if $failed_node == "none" then "disabled" else "pidfd-single-coordinator-monotonic-interval-v2" end),durability_mode:$durability,ack_contract:(if $durability == "before-ack" then "quorum WAL sync and object-store durability before acknowledgement" else "quorum WAL sync; object-store publication async" end),failure_mode:(if $failed_node == "none" then "healthy" else "peer-sigkill-during-load" end),failed_node:$failed_node,target_node:$target_node,fault_after:(if $failed_node == "none" then null else $fault_after end),max_fault_latency_ms:(if $failed_node == "none" then null else $max_fault_latency_ms end),concurrency:$concurrency,object_metric_nodes:$object_metric_nodes,object_measurement:"after schema through final linearizable verification",object_store_delta:$object_delta,runtime_failure_lines:$runtime_failure_lines,result:$result,verification:$count}' \
 	| jq -c --arg status "$resource_status" --argjson resources "$resource_summary" \
 		--arg workload "$workload" --arg oracle "$receipt_oracle" --argjson writes "$write_object_delta" --argjson publication "$publication" \
+		--arg provider "$provider" --argjson gcs_classes "$gcs_classes" \
 		'. + {workload:$workload,receipt_oracle:$oracle,voter_resource_status:$status,voter_resources:$resources,
-			write_object_store_delta:$writes,async_publication:$publication}
+			write_object_store_delta:$writes,async_publication:$publication,object_store_provider:$provider,gcs_request_classes:$gcs_classes}
 		 | if $workload != "sql" then .object_measurement = "after setup through final verification" else . end' \
 	| tee "$output_file"
 jq -e '.runtime_failure_lines == 0 and (.failed_node == "none" or .result.max_ms <= .max_fault_latency_ms)' "$output_file" >/dev/null

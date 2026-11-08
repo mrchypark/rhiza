@@ -158,6 +158,48 @@ Hosted-runner absolute throughput remains diagnostic. Use paired deltas for PR
 decisions and retain the Dory matrix for Kubernetes, fault, and object-store
 qualification.
 
+## Opt-in E2E write-cost matrix
+
+Dispatch `Performance` from a branch with the matrix harness, using full commit
+SHAs for the two server revisions:
+
+```bash
+gh workflow run performance.yml --ref "$HARNESS_REF" \
+  -f e2e_cost_matrix=true -f base_ref="$BASE_SHA" -f candidate_ref="$CANDIDATE_SHA"
+```
+
+This runs instead of the ordinary Performance suite. On one `ubuntu-24.04`
+runner, the same client tests SQL, Graph, and KV against three healthy QUIC voters
+and a disposable VersityGW S3 backend. For each workload and durability mode,
+base and candidate run serially in alternating order across three repeats
+(36 samples total). Each sample requires 1,000 successful writes at concurrency
+16 and a workload-specific final state check. This measures normal HA writes,
+not Local mode, managed Kubernetes recovery, or fault tolerance.
+
+- `result` reports write throughput and latency, including p99. `voter_resources`
+  records per-voter user/system CPU tick deltas and RSS samples bracketing the
+  timed write client. The CPU window excludes setup, final verification, and
+  forced publication; no client or gateway resources are sampled. `VmHWM` is
+  each voter's lifetime peak up to the sample and can include startup; summing
+  those peaks does not produce a simultaneous cluster peak.
+- `write_object_store_delta` covers setup complete through the writes;
+  `object_store_delta` also includes final verification. BeforeAck waits for
+  object-store durability before returning success. Async acknowledges quorum
+  WAL durability first. After Async verification, `async_publication` separately
+  measures a forced archive call and requires the archive to advance through
+  the pre-call certified/applied cut. This is not an independent restore test
+  or a measurement of scheduled background publication overhead.
+- Object-store HTTP counters are client transport attempts, not server-side
+  operation counts or billed operations. The Versity results do not measure
+  GCS Class A/B; those require native operation attribution, including the
+  distinction between resumable upload requests and the single Class A
+  operation they can represent. See [GCS operation pricing](https://cloud.google.com/storage/pricing#operations-pricing).
+
+The `e2e-cost-matrix-<run-id>` artifact records both SHAs, the harness SHA,
+runner metadata, raw result JSON, process logs, and exit statuses. The matrix
+stops on the first failure and uploads available evidence; a partial matrix is
+not a passing comparison.
+
 ## Issue #185 local S3 cost evidence
 
 Use the `Performance` workflow's `workflow_dispatch` input

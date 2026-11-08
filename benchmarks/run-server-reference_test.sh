@@ -109,10 +109,45 @@ case "$*" in *rev-parse*) printf '%040d\n' 1 ;; *grep*) exit 0 ;; *) exit 92 ;; 
 MOCK
 cat > "$scratch/bin/docker" <<'MOCK'
 #!/usr/bin/env bash
-exit 0
+set -eu
+[[ $MOCK_MODE == gcs-* ]] || exit 0
+id=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+case $1 in
+ run)
+  [[ $* == *'127.0.0.1::4588'* && $* == *'RHIZA_GCS_ACCESS %m %U %s'* && $* == *'floci/floci-gcp:0.11.0@sha256:'* ]]
+  printf '%s\n' "$id" ;;
+ port)
+  [[ $2 == "$id" && $3 == 4588/tcp ]]
+  printf '127.0.0.1:24588\n' ;;
+ logs)
+  [[ $2 == "$id" ]]
+  bucket=$(<"$MOCK_HOME/gcs-bucket")
+  printf 'not an access record\n'
+  printf 'quarkus-prefix RHIZA_GCS_ACCESS POST /storage/v1/b 200\n'
+  if [[ -f $MOCK_HOME/client-done && $MOCK_MODE != gcs-missing ]]; then
+   printf 'quarkus-prefix RHIZA_GCS_ACCESS GET /storage/v1/b/%s/o/bench-head 404\n' "$bucket"
+   if [[ $MOCK_MODE == gcs-unknown ]]; then printf 'RHIZA_GCS_ACCESS GET /other 200\n'; fi
+  fi
+  if [[ -f $MOCK_HOME/archived ]]; then
+   printf 'RHIZA_GCS_ACCESS POST /upload/storage/v1/b/%s/o 200\n' "$bucket"
+  fi ;;
+ rm)
+  [[ $2 == -f && $3 == "$id" ]]
+  touch "$MOCK_HOME/gcs-removed" ;;
+ *) exit 93 ;;
+esac
 MOCK
 cat > "$scratch/node" <<'MOCK'
 #!/usr/bin/env bash
+set -eu
+if [[ $RHIZA_OBJSTORE_PROVIDER == gcs ]]; then
+ [[ $STORAGE_EMULATOR_HOST == http://127.0.0.1:24588 && $GOOGLE_APPLICATION_CREDENTIALS == "$TMPDIR/gcs-adc.json" &&
+    ! ${RHIZA_OBJSTORE_SERVICE_ACCOUNT+x} && ! ${HTTP_PROXY+x} ]]
+ jq -e '.type == "service_account" and .token_uri == "http://127.0.0.1:24588/token" and (.private_key | length > 0)' \
+  "$GOOGLE_APPLICATION_CREDENTIALS" >/dev/null
+ MOCK_HOME=${TMPDIR%/*}
+ printf '%s\n' "$RHIZA_NODE_ID" >> "$MOCK_HOME/gcs-local-adc"
+fi
 printf '%s\n' "$$" >> "$MOCK_HOME/nodes"
 exec sleep 60
 MOCK
@@ -159,11 +194,21 @@ cat > "$scratch/bin/curl" <<'MOCK'
 set -eu
 for url in "$@"; do :; done
 case $url in
+http://127.0.0.1:24588/storage/v1/b\?project=rhiza-local-test)
+ [[ $* == *"--noproxy *"* ]]
+ while [[ $# -gt 1 ]]; do
+  if [[ $1 == -d ]]; then
+   jq -er '.name | select(test("^rhiza-server-bench-[0-9]+-[0-9]+$"))' <<<"$2" >"$MOCK_HOME/gcs-bucket"
+   printf '%s\n' "$2"
+   break
+  fi
+  shift
+ done ;;
 */metrics/object-store)
  if [[ -f $MOCK_HOME/archived ]]; then puts=11
  elif [[ -f $MOCK_HOME/client-done ]]; then puts=2
  else puts=0; fi
- printf '{"puts":%d}\n' "$puts" ;;
+ printf '{"puts":%d,"http_requests":%d}\n' "$puts" "$puts" ;;
 */fault)
  case $MOCK_MODE in before-first) exit 22 ;; signal-failure) exit 47 ;; esac
  kill -KILL "$(cat "$MOCK_HOME/fault.pid")"
@@ -233,7 +278,7 @@ wait() {
 }
 MOCK
 chmod +x "$scratch/bin/"* "$scratch/node" "$scratch/bench"
-for mode in normal shifted before-first after-last no-witness signal-failure wait-normal wait-crash wait-error healthy healthy-nonlinux resource-replaced resource-missing graph graph-wrong-ids kv kv-wrong-value async-stale-cut; do
+for mode in normal shifted before-first after-last no-witness signal-failure wait-normal wait-crash wait-error healthy healthy-nonlinux resource-replaced resource-missing graph graph-wrong-ids kv kv-wrong-value async-stale-cut gcs-before-ack gcs-async gcs-missing gcs-unknown; do
  mkdir "$scratch/$mode"
  # Each run's stand-ins and process evidence remain in its own scratch scope.
  cp "$scratch/node" "$scratch/bench" "$scratch/$mode/"
@@ -241,20 +286,25 @@ for mode in normal shifted before-first after-last no-witness signal-failure wai
  workload=sql
  durability=async
  publish=0
+ provider=s3
  case $mode in
   shifted|healthy*|resource-*) fault=none ;;
   graph*) fault=none; workload=graph; durability=before-ack ;;
   kv*) fault=none; workload=kv; publish=1 ;;
   async-stale-cut) fault=none; publish=1 ;;
+  gcs-*) fault=none; provider=gcs
+   if [[ $mode == gcs-async ]]; then publish=1; else durability=before-ack; fi ;;
  esac
  status=0
  BASH_ENV="$scratch/wait-env" MOCK_HOME="$scratch/$mode" MOCK_MODE="$mode" PATH="$scratch/bin:$PATH" TMPDIR="$scratch/$mode" \
  RHIZA_SERVER_BENCH_REQUESTS=4 RHIZA_SERVER_BENCH_CONCURRENCY=2 RHIZA_SERVER_BENCH_FAULT_AFTER=0 RHIZA_SERVER_BENCH_FAILED_NODE="$fault" \
  RHIZA_SERVER_BENCH_WORKLOAD="$workload" RHIZA_SERVER_BENCH_DURABILITY="$durability" RHIZA_SERVER_BENCH_ASYNC_PUBLISH="$publish" \
+ RHIZA_SERVER_BENCH_PROVIDER="$provider" RHIZA_OBJSTORE_SERVICE_ACCOUNT=ambient-must-not-inherit HTTP_PROXY=http://ambient-must-not-inherit \
  bash "$here/run-server-reference.sh" "$scratch/base-server" "$scratch/$mode/result.json" >"$scratch/$mode/stdout" 2>"$scratch/$mode/stderr" || status=$?
  if [[ $mode == normal ]]; then
   [[ $status == 0 ]]
   jq -e '.fault_overlap.overlap == true and .fault_exit_status == 137 and .receipt_oracle == "sql-insert-id-v1" and (.client_sha256 | length == 64)' "$scratch/$mode/result.json" >/dev/null
+  jq -e '.object_store_provider == "s3" and .gcs_request_classes == null' "$scratch/$mode/result.json" >/dev/null
   jq -e '.voter_resource_status == "not_collected_fault_lane" and .voter_resources == null' "$scratch/$mode/result.json" >/dev/null
   grep -qx 'fault_exit_status=137' "$scratch/$mode/result-fault-metadata.txt"
  elif [[ $mode == healthy ]]; then
@@ -293,6 +343,22 @@ for mode in normal shifted before-first after-last no-witness signal-failure wai
   else
    [[ ! -f $scratch/$mode/archived ]]
   fi
+ elif [[ $mode == gcs-before-ack || $mode == gcs-async ]]; then
+  [[ $status == 0 ]]
+  jq -e '.object_store_provider == "gcs" and .gcs_request_classes.write.class_b_attempts == 1
+    and .gcs_request_classes.write.transport_attempts == 6
+    and .gcs_request_classes.write.transport_minus_observed == 5
+    and .gcs_request_classes.verification.http_attempts == 0' "$scratch/$mode/result.json" >/dev/null
+  if [[ $mode == gcs-before-ack ]]; then
+   jq -e '.gcs_request_classes.publication == null' "$scratch/$mode/result.json" >/dev/null
+  else
+   jq -e '.gcs_request_classes.publication.class_a_attempts == 1 and .gcs_request_classes.publication.transport_attempts == 27' \
+    "$scratch/$mode/result.json" >/dev/null
+  fi
+ elif [[ $mode == gcs-missing || $mode == gcs-unknown ]]; then
+  [[ $status != 0 ]]
+  grep -q 'lacks classifiable completed-request evidence' "$scratch/$mode/stderr"
+  [[ -f $scratch/$mode/result-gcs-write-classes.json ]]
  else
   [[ $status != 0 ]]
   if [[ $mode == wait-* ]]; then
@@ -302,6 +368,10 @@ for mode in normal shifted before-first after-last no-witness signal-failure wai
    jq -e --argjson raw "$raw" '.qualification == "not_qualified" and .fault_exit_status == $raw' "$scratch/$mode/result.json" >/dev/null
   elif [[ $mode == signal-failure ]]; then [[ $status == 47 ]];
   elif [[ $mode != shifted ]]; then grep -Eq 'fault (coordinator failed|interval not qualified)' "$scratch/$mode/stderr"; fi
+ fi
+ if [[ $provider == gcs ]]; then
+  [[ -f $scratch/$mode/gcs-removed ]]
+  [[ $(sort "$scratch/$mode/gcs-local-adc") == $'n0\nn1\nn2' ]]
  fi
  case $workload in
   sql) grep -q -- '-verify-insert-receipt' "$scratch/$mode/bench.args" ;;
@@ -315,4 +385,4 @@ for mode in normal shifted before-first after-last no-witness signal-failure wai
   if kill -0 "$pid" 2>/dev/null; then printf 'mock owned process survived: %s\n' "$pid" >&2; exit 1; fi
  done < <(cat "$scratch/$mode/nodes" "$scratch/$mode/bench.pid")
 done
-printf 'server oracle helpers + 18 complete mocked runner cases PASS\n'
+printf 'server oracle helpers + 22 complete mocked runner cases PASS\n'

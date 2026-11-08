@@ -47,6 +47,12 @@ on:
         type: boolean
         default: false
 
+      e2e_cost_provider:
+        description: Backend for the E2E cost matrix (Versity S3 or local Floci GCS)
+        type: choice
+        options: [s3, gcs]
+        default: s3
+
 permissions:
   contents: read
 
@@ -294,6 +300,7 @@ jobs:
       CGO_ENABLED: 0
       RHIZA_SERVER_BENCH_REQUESTS: 1000
       RHIZA_SERVER_BENCH_CONCURRENCY: 16
+      RHIZA_SERVER_BENCH_PROVIDER: ${{ inputs.e2e_cost_provider || 's3' }}
     steps:
       - name: Initialize matrix evidence
         run: mkdir -p "$RUNNER_TEMP/rhiza-e2e-cost"
@@ -320,6 +327,10 @@ jobs:
             echo '::error::The E2E cost matrix cannot be combined with another special Performance mode.'
             exit 1
           fi
+          case "$RHIZA_SERVER_BENCH_PROVIDER" in
+            s3|gcs) ;;
+            *) echo '::error::The E2E cost matrix provider must be s3 or gcs.'; exit 1 ;;
+          esac
           checkout_revision() {
             local sha=$1 role=$2
             if [[ ! $sha =~ ^[0-9a-f]{40}$ ]]; then
@@ -337,6 +348,7 @@ jobs:
           checkout_revision "$CANDIDATE_SHA" candidate
           {
             printf 'base_sha=%s\ncandidate_sha=%s\nharness_sha=%s\n' "$BASE_SHA" "$CANDIDATE_SHA" "$(git rev-parse HEAD)"
+            printf 'object_store_provider=%s\n' "$RHIZA_SERVER_BENCH_PROVIDER"
             printf 'requests=%s\nconcurrency=%s\nsamples_per_cell=3\n' "$RHIZA_SERVER_BENCH_REQUESTS" "$RHIZA_SERVER_BENCH_CONCURRENCY"
             printf 'runner_image=%s-%s\n' "$ImageOS" "$ImageVersion"
             go version
@@ -345,6 +357,7 @@ jobs:
             free -b
           } >"$RUNNER_TEMP/rhiza-e2e-cost/environment.txt"
           bash benchmarks/run-server-reference_test.sh
+          sh benchmarks/gcs-request-classes_test.sh
 
       - name: Run interleaved server cost matrix
         run: |
@@ -375,12 +388,19 @@ jobs:
                   fi
                   if ! jq -e --argjson requests "$RHIZA_SERVER_BENCH_REQUESTS" \
                     --argjson concurrency "$RHIZA_SERVER_BENCH_CONCURRENCY" \
+                    --arg provider "$RHIZA_SERVER_BENCH_PROVIDER" \
                     --arg harness "$harness_sha" --arg workload "$workload" --arg durability "$durability" '
                       .client_revision == $harness and .workload == $workload and .durability_mode == $durability and
+                      .object_store_provider == $provider and
                       .failure_mode == "healthy" and .concurrency == $concurrency and .runtime_failure_lines == 0 and
                       .voter_resource_status == "measured" and (.voter_resources.nodes | length) == 3 and
                       (.object_store_delta.http_requests | type) == "number" and
                       (.write_object_store_delta.http_requests | type) == "number" and
+                      (if $provider == "gcs" then
+                        (.gcs_request_classes.write | type) == "object" and
+                        (if $durability == "async" then (.gcs_request_classes.publication | type) == "object"
+                        else .gcs_request_classes.publication == null end)
+                      else .gcs_request_classes == null end) and
                       (if $durability == "async" then
                         .async_publication.forced == true and .async_publication.object_store_delta.http_requests > 0 and
                         .async_publication.before.archive_tip < .async_publication.before.certified_tip and
@@ -395,7 +415,7 @@ jobs:
               done
             done
           done
-          printf '## E2E cost matrix\n\nAll 36 samples passed: SQL, Graph, and KV × Async and BeforeAck × two revisions × three runs. Raw result and process logs are attached.\n' >>"$GITHUB_STEP_SUMMARY"
+          printf '## E2E cost matrix (%s)\n\nAll 36 samples passed: SQL, Graph, and KV × Async and BeforeAck × two revisions × three runs. Raw result and process logs are attached.\n' "$RHIZA_SERVER_BENCH_PROVIDER" >>"$GITHUB_STEP_SUMMARY"
 
       - name: Upload server cost evidence
         if: always()
