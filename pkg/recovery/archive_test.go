@@ -2190,8 +2190,11 @@ func TestArchivePublishRevalidatesItsTail(t *testing.T) {
 	if err := manager.SyncThrough(ctx, core, core.Tip()); err != nil {
 		t.Fatal(err)
 	}
-	if heads, gets := bucket.heads.Load(), bucket.gets.Load(); heads != 14 || gets != 6 {
-		t.Fatalf("publish physical attributes=%d gets=%d, want 14/6 (archive head attributes=%d gets=%d, block gets=%d)", heads, gets, bucket.archiveHeads.Load(), bucket.archiveHeadGets.Load(), bucket.blockGets.Load())
+	// Release uses the confirmed lock version; HEAD revalidation is unchanged.
+	heads, gets := bucket.heads.Load(), bucket.gets.Load()
+	headAttributes, headGets, blockGets := bucket.archiveHeads.Load(), bucket.archiveHeadGets.Load(), bucket.blockGets.Load()
+	if heads != 12 || gets != 5 || headAttributes != 4 || headGets != 1 || blockGets != 0 {
+		t.Fatalf("publish physical attributes=%d gets=%d, want 12/5 (archive head attributes=%d gets=%d, block gets=%d; want 4/1/0)", heads, gets, headAttributes, headGets, blockGets)
 	}
 }
 
