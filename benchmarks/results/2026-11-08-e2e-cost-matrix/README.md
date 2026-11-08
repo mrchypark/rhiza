@@ -396,6 +396,9 @@ The corrected fixture passed that step in
 failed separately on a truncated PUT body in the Graph UNKNOWN fixture.
 The test now reports the wire path and cancellation state and accepts
 only a proven, scoped cancellation. The original failed runs remain linked.
+The [final functional CI](https://github.com/mrchypark/rhiza/actions/runs/42485467166)
+passed all seven jobs at `d324be61`, including both repaired race steps,
+the full Go race suite, vulnerability scan, and all three Floci providers.
 
 The [final Versity retest](https://github.com/mrchypark/rhiza/actions/runs/42485117382)
 and [final GCS retest](https://github.com/mrchypark/rhiza/actions/runs/42485117409)
