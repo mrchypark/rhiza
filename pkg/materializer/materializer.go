@@ -1515,14 +1515,27 @@ func (m *Materializer) applyValueLocked(ctx context.Context, conn *sql.Conn, tx 
 		commands = nil
 		batched = true
 	} else if kv {
-		if err := m.applyKV(ctx, tx, slot, kvCommand, 0); err != nil {
+		if err := m.applyKV(ctx, tx, tx.ExecContext, slot, kvCommand, 0); err != nil {
 			return err
 		}
 		commands = nil
 		batched = true
 	} else if kvBatch {
+		exec := tx.ExecContext
+		if len(kvCommands) > 1 {
+			// Statements prepared as internal KV must never be reused as user SQL.
+			kvStatements := make(map[string]*sql.Stmt)
+			defer func() {
+				for _, statement := range kvStatements {
+					statement.Close()
+				}
+			}()
+			exec = func(ctx context.Context, query string, args ...any) (sql.Result, error) {
+				return execPrepared(ctx, tx, kvStatements, query, args...)
+			}
+		}
 		for index, command := range kvCommands {
-			if err := m.applyKV(ctx, tx, slot, command, uint32(index)); err != nil {
+			if err := m.applyKV(ctx, tx, exec, slot, command, uint32(index)); err != nil {
 				return err
 			}
 		}
@@ -1716,7 +1729,7 @@ func (m *Materializer) NotificationDrops() uint64 {
 	return m.notifyDrops.Load()
 }
 
-func (m *Materializer) applyKV(ctx context.Context, tx *sql.Tx, slot uint64, command types.KVCommand, batchIndex uint32) error {
+func (m *Materializer) applyKV(ctx context.Context, tx *sql.Tx, exec func(context.Context, string, ...any) (sql.Result, error), slot uint64, command types.KVCommand, batchIndex uint32) error {
 	if command.RequestID == "" || len(command.RequestID) > types.MaxRequestIDBytes || command.Key == "" || len(command.Key) > 1024 || len(command.Value) > 16<<20 {
 		return fmt.Errorf("invalid KV command")
 	}
@@ -1734,16 +1747,17 @@ func (m *Materializer) applyKV(ctx context.Context, tx *sql.Tx, slot uint64, com
 	} else if found {
 		return nil
 	}
-	if _, err := tx.ExecContext(ctx, `DELETE FROM _rhiza_kv WHERE rowid IN (SELECT rowid FROM _rhiza_kv WHERE expires_at_unix_ms > 0 AND expires_at_unix_ms <= ? LIMIT 256)`, command.ObservedAtUnixMS); err != nil {
+	if _, err := exec(ctx, `DELETE FROM _rhiza_kv WHERE rowid IN (SELECT rowid FROM _rhiza_kv WHERE expires_at_unix_ms > 0 AND expires_at_unix_ms <= ? LIMIT 256)`, command.ObservedAtUnixMS); err != nil {
 		return fmt.Errorf("prune expired KV entries: %w", err)
 	}
 	receipt := types.MutationReceipt{Slot: slot, Status: types.MutationCommitted, Applied: true}
+	const upsert = `INSERT INTO _rhiza_kv(key, value, expires_at_unix_ms) VALUES (?, ?, ?) ON CONFLICT(key) DO UPDATE SET value=excluded.value, expires_at_unix_ms=excluded.expires_at_unix_ms`
 	switch command.Operation {
 	case "put":
-		_, err = tx.ExecContext(ctx, `INSERT INTO _rhiza_kv(key, value, expires_at_unix_ms) VALUES (?, ?, ?) ON CONFLICT(key) DO UPDATE SET value=excluded.value, expires_at_unix_ms=excluded.expires_at_unix_ms`, command.Key, command.Value, command.ExpiresAtUnixMS)
+		_, err = exec(ctx, upsert, command.Key, command.Value, command.ExpiresAtUnixMS)
 	case "delete":
 		var affected sql.Result
-		affected, err = tx.ExecContext(ctx, `DELETE FROM _rhiza_kv WHERE key = ?`, command.Key)
+		affected, err = exec(ctx, `DELETE FROM _rhiza_kv WHERE key = ?`, command.Key)
 		if err == nil {
 			rows, _ := affected.RowsAffected()
 			receipt.Applied = rows > 0
@@ -1758,7 +1772,7 @@ func (m *Materializer) applyKV(ctx context.Context, tx *sql.Tx, slot uint64, com
 		}
 		receipt.Applied = exists == command.ExpectedExists && (!exists || bytes.Equal(current, command.Expected))
 		if receipt.Applied {
-			_, err = tx.ExecContext(ctx, `INSERT INTO _rhiza_kv(key, value, expires_at_unix_ms) VALUES (?, ?, ?) ON CONFLICT(key) DO UPDATE SET value=excluded.value, expires_at_unix_ms=excluded.expires_at_unix_ms`, command.Key, command.Value, command.ExpiresAtUnixMS)
+			_, err = exec(ctx, upsert, command.Key, command.Value, command.ExpiresAtUnixMS)
 		}
 	}
 	if err != nil {

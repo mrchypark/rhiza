@@ -506,6 +506,23 @@ jobs:
             grep -Eq '^BenchmarkSQLBatchApply/[0-9]+-[0-9]+[[:space:]]' "$evidence/sql-batch-apply-$revision.txt"
           done
 
+      - name: Compare KV batch apply with the same test fixture
+        if: ${{ inputs.e2e_cost_provider != 'gcs' && !inputs.e2e_async_stage_probe }}
+        run: |
+          evidence="$RUNNER_TEMP/rhiza-e2e-cost"
+          fixture=pkg/materializer/kv_expiry_test.go
+          candidate="$RUNNER_TEMP/rhiza-e2e-candidate/$fixture"
+          if ! grep -q '^func BenchmarkKVBatchApply(' "$candidate"; then exit 0; fi
+          for revision in base candidate; do
+            (
+              cd "$RUNNER_TEMP/rhiza-e2e-$revision"
+              overlay="$RUNNER_TEMP/kv-batch-apply-$revision.json"
+              jq -n --arg target "$PWD/$fixture" --arg fixture "$candidate" '{Replace:{($target):$fixture}}' >"$overlay"
+              go test -overlay="$overlay" ./pkg/materializer -run '^$' -bench '^BenchmarkKVBatchApply$' -benchtime=300ms -count=3 -benchmem
+            ) | tee "$evidence/kv-batch-apply-$revision.txt"
+            grep -Eq '^BenchmarkKVBatchApply/[0-9]+-[0-9]+[[:space:]]' "$evidence/kv-batch-apply-$revision.txt"
+          done
+
       - name: Upload server cost evidence
         if: always()
         uses: actions/upload-artifact@v4
