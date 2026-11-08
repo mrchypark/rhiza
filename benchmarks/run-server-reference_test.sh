@@ -114,7 +114,7 @@ set -eu
 id=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
 case $1 in
  run)
-  [[ $* == *'127.0.0.1::4588'* && $* == *'RHIZA_GCS_ACCESS %m %R %s'* && $* == *'floci/floci-gcp:0.11.0@sha256:'* ]]
+  [[ $* == *'--no-healthcheck'* && $* == *'127.0.0.1::4588'* && $* == *'RHIZA_GCS_ACCESS %m %R %s'* && $* == *'floci/floci-gcp:0.11.0@sha256:'* ]]
   printf '%s\n' "$id" ;;
  port)
   [[ $2 == "$id" && $3 == 4588/tcp ]]

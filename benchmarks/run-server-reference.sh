@@ -251,7 +251,9 @@ if [[ $provider == gcs ]]; then
 	# Same native JSON API as the embedded provider test. The Kind helper's
 	# generated account uses an in-cluster token URI, so bind this ADC locally.
 	gcs_image=floci/floci-gcp:0.11.0@sha256:eae9683d806ceb643bcb36aee97cdb8cad13c3e2959cd053bf40e481994fde12
-	gcs_container_id=$(docker run --rm -d --name "$container" -p 127.0.0.1::4588 \
+	# The image's periodic health GET would enter measured access-log windows.
+	# The explicit readiness and bucket probes below still gate startup.
+	gcs_container_id=$(docker run --rm -d --no-healthcheck --name "$container" -p 127.0.0.1::4588 \
 		-e QUARKUS_HTTP_ACCESS_LOG_ENABLED=true \
 		-e 'QUARKUS_HTTP_ACCESS_LOG_PATTERN=RHIZA_GCS_ACCESS %m %R %s' "$gcs_image")
 	[[ $gcs_container_id =~ ^[a-f0-9]{64}$ ]]
