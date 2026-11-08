@@ -417,10 +417,12 @@ retain the earlier CPU and memory scopes.
 | GCS | GRAPH | Async | 548.64 → 564.84 | 131.61 → 57.12 | 2.08 → 2.14 | 97.02 → 100.37 |
 | GCS | GRAPH | BeforeAck | 324.69 → 359.91 | 118.67 → 82.48 | 3.37 → 3.33 | 106.36 → 105.90 |
 
-In every sample, BeforeAck remained at 1,071 attempts, timed Async stayed
-at zero, and forced Async publication remained at 17. GCS retained Class
-A/B counts of 252/819 (SQL BeforeAck), 254/817 (Graph/KV BeforeAck), and
-6/11 (forced publication). The Graph Apply profile still used the optimized
+BeforeAck medians remained at 1,071 attempts for every workload, timed Async
+stayed at zero, and forced Async publication remained at 17 in every sample.
+One GCS KV BeforeAck candidate sample made 1,088 attempts (258 Class A and
+830 Class B). All other GCS samples retained Class A/B counts of 252/819
+(SQL BeforeAck), 254/817 (Graph/KV BeforeAck), and 6/11 (forced publication).
+The Graph Apply profile still used the optimized
 metadata path (1.17 ms/op, 180,206 B/op, 862 allocs/op, not a paired microbenchmark).
 
 The same-run KV microbenchmark regained 195 allocs for one command and
