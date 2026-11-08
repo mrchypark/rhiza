@@ -68,10 +68,17 @@ Direct-host requires exclusive use of the dedicated namespace for the run. It
 preflights fixture names, creates its overlay without adopting existing objects,
 and uses the returned UIDs as deletion preconditions for the overlay and CR.
 Unconfirmed overlay or CR creations are left for the administrator. Cleanup of
-the other exact, preflighted fixture names depends on exclusive namespace use. The
-direct-host projection removes unused Recovery API rules; the existing runner
-must already be allowed to delegate the remaining namespace rules. Do not grant
-`escalate` or `bind` to bypass an RBAC refusal.
+the other exact, preflighted fixture names depends on exclusive namespace use.
+
+For direct-host only, the runner needs `get`, `list`, `watch`, `create`, and
+`delete` on `rhizaclusters` in the `rhiza.mrchypark.dev` API group in that
+namespace. The fixture uses `watch` when waiting for the `sql` CR to disappear.
+The runner also needs `get` and `update` on `rhizaclusters/status` to delegate
+those verbs to the operator and managed Host Roles. No `update` or `patch` on the
+main `rhizaclusters` resource is needed. The direct-host projection removes
+unused Recovery API rules; the runner must already be allowed to delegate the
+remaining namespace rules. Do not grant `escalate` or `bind` to bypass an RBAC
+refusal.
 
 The parent verifies the namespace UID; the driver verifies the original
 ServiceAccount UID and namespace emptiness, then installs the OSS
