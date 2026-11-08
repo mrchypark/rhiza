@@ -209,7 +209,7 @@ reserved `_rhiza_` namespace is inaccessible through public SQL APIs.
 
 ### Graph and Cypher
 
-Rhiza uses `latticedb-go v0.10.0` and exposes its deliberately small,
+Rhiza uses `latticedb-go v0.12.2` and exposes its deliberately small,
 case-sensitive Cypher subset. This is not full openCypher. Structural keywords
 and built-in function names are case-sensitive.
 
@@ -266,8 +266,8 @@ indexes are node-local derived state: they are not replicated, and Rhiza
 reconciles them when the node opens or installs a checkpoint.
 
 The dependency owns the complete language contract. See the version-pinned
-[`Supported Cypher Subset`](https://github.com/mrchypark/latticedb-go/blob/v0.10.0/docs/engine_conformance.md#supported-cypher-subset)
-and [canonical EBNF grammar](https://github.com/mrchypark/latticedb-go/blob/v0.10.0/internal/engine/testdata/query_grammar.ebnf).
+[`Supported Cypher Subset`](https://github.com/mrchypark/latticedb-go/blob/v0.12.2/docs/engine_conformance.md#supported-cypher-subset)
+and [canonical EBNF grammar](https://github.com/mrchypark/latticedb-go/blob/v0.12.2/internal/engine/testdata/query_grammar.ebnf).
 
 ### Graph streams
 
