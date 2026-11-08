@@ -434,3 +434,57 @@ reduced 16-command median time from 2.88 to 1.94 ms, allocations from
 commands used about 100 KiB less per batch; the elapsed improvement was small.
 Versity KV Async improved in this run, while GCS SQL Async p99 did not.
 These are emulator and hosted-runner measurements, not live cloud latency.
+
+## SQLite rowid guard and GCS setup control
+
+`b901c6c8` combines resetting last-insert ROWID and installing the pre-update
+guard into one native connection callback. [Versity](https://github.com/mrchypark/rhiza/actions/runs/42491833393)
+and [GCS](https://github.com/mrchypark/rhiza/actions/runs/42491833382) passed
+36/36 each against `a44b3191`. The SQL one-command microbenchmark was
+0.290 → 0.288 ms, still 237 allocations; the 128-command median was
+6.56 → 6.59 ms. This reduces one callback per statement, but the measurement
+does not establish a latency improvement.
+[Functional CI](https://github.com/mrchypark/rhiza/actions/runs/42491851471)
+passed all seven jobs at `b901c6c8`.
+
+[GCS prebuild A/B](https://github.com/mrchypark/rhiza/actions/runs/42492194681)
+compared eight alternating SQL Async pairs at `cd1d9d25`. Both arms used
+byte-identical binaries from the same source checkout, fresh voters and
+emulator state, the same sync barrier, and the same receipt/publication
+checks. All 16 samples passed, with zero timed GCS requests and 17 forced
+publication requests each. Median p99 was 13.15 ms with per-sample builds
+and 13.71 ms with prebuilt binaries; median throughput was 1,725 → 1,719
+writes/s. No p99 exceeded 16.24 ms. The earlier tail did not recur, so this
+does not identify repeated builds as its cause or show a mitigation.
+
+## Reuse encoded SQL RETURNING receipts
+
+`8b50cb1c` reuses the RSQL bytes already used for retention accounting,
+instead of holding decoded rows and encoding them again during flush. The
+format and policy limits are unchanged. Tests cover a slot-gap rollback,
+releasing pending buffers, and replaying the same slot and result.
+
+[GCS E2E](https://github.com/mrchypark/rhiza/actions/runs/42492457219)
+passed 36/36. The first [Versity workflow](https://github.com/mrchypark/rhiza/actions/runs/42492457099)
+also completed its 36 E2E samples, but the new isolated receipt benchmark
+failed setup: a four-slot window is below the supported minimum of 1,024.
+`6d1c25b9` fixes the fixture, not the runtime, and uses 200 fixed operations
+per run to stay below the 256 MiB retained-result limit.
+
+The [corrected Versity workflow](https://github.com/mrchypark/rhiza/actions/runs/42493215236)
+passed 36/36 E2E samples and both receipt workloads. The same fixture was
+overlaid on both revisions, with three runs per cell on one runner.
+
+| Result payload | Median ms/op | Allocated B/op | Allocations/op |
+| --- | ---: | ---: | ---: |
+| 4 KiB | 0.282 → 0.296 | 30,104 → 24,970 | 255 → 232 |
+| 600 KB | 3.706 → 3.643 | 2,437,451 → 1,830,982 | 258 → 235 |
+
+The 600 KB workload allocates 24.9% fewer bytes. The small, mixed elapsed
+changes are not a general latency improvement. The 72 final S3/GCS E2E
+samples all used 1,071 BeforeAck attempts, zero timed Async attempts, and
+17 forced Async publication attempts. Graph throughput and p99 were mixed
+in the hosted runs; the Graph engine version and metadata path are unchanged.
+[Functional CI](https://github.com/mrchypark/rhiza/actions/runs/42492457051)
+passed all seven jobs at the production-code revision `8b50cb1c`; only
+the benchmark fixture and workflow changed in `6d1c25b9`.
