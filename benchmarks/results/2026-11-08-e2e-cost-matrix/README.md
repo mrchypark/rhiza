@@ -528,7 +528,54 @@ Floci exited 143 during sidecar shutdown. The terminal snapshot did not
 capture a Job `Complete` condition. The test namespace, volumes, and backing
 disks were removed. Neither experiment changes durability or verifies live GCS.
 
-Before changing the WAL path, distinguish device I/O time from voter scheduling
-delay by collecting per-device block I/O and per-voter scheduler wait over the
-same write window. Reuse the exact-binary paired setup and keep the quorum sync
-and receipt gates unchanged.
+### Block-device and scheduler diagnostic
+
+A follow-up at `ee735418ba3f9c9cbcde9845e50fe2dba66a01de` repeated six
+shared/split pairs with Linux block-device and voter-thread scheduler counters.
+All 12 samples exited 0, verified 1,000 SQL writes each, and reached the
+certified archive cut. The higher-p99 arm had a higher maximum per-device
+`write_ms / write_ios` in all six pairs. In the slowest pair, p99 was
+**988.49 ms shared / 943.91 ms split** and this block-write average was
+**3.45 / 2.54 ms**. The kernel-reported mean flush time per operation stayed
+between 0.060 and 0.072 ms across measured devices and samples.
+
+In that slowest pair, the longest in-window WAL fsync call took **406.87 ms
+shared / 298.27 ms split** in process wall time. The kernel flush average is
+not a tail measure or the same interval as a WAL syscall. A syscall can
+include filesystem work, waiting for writeback, and scheduling delays; these
+samples cannot allocate that time among them. Summed voter run-queue wait
+rose with p99 in raw totals, but after dividing by timed client duration,
+its Pearson correlation with p99 across the 12 samples was only **0.04**.
+The scheduler sample uses threads visible at both endpoints and has partial
+coverage in some voters. The WAL probe logs only calls above its 2 ms
+threshold; device counters are window aggregates, not request-level traces.
+This diagnostic establishes an association, not a cause or a storage-tier
+recommendation. It did not change the WAL or the durability policy.
+
+### Storage-tier comparison
+
+At `7df2e84cd2a0a9c0e01d4bf9e7273071cf48d577`, one isolated Pod alternated
+standard/premium and premium/standard order across six pairs. Both arms put
+all three voters on one mount at a time. The two 10 GiB standard (`pd-balanced`)
+volumes rotated A/B/B/A/A/B against one 10 GiB premium (`pd-ssd`) volume. All
+12 samples verified 1,000 SQL Async writes each, with zero object-store HTTP
+attempts during writes and 17 in the forced-publication phase.
+
+Median p99 was **33.33 ms standard / 61.69 ms premium**. Premium had higher
+p99 in 5/6 pairs (median paired change **+55.38%**) and lower median throughput
+(**898.50 / 770.85 writes/s**; median paired change **−12.72%**). The worst
+observed p99 was **554.05 / 142.08 ms**, so premium lowered the maximum in
+this sample without improving latency consistently.
+
+In zero-based pair 2, premium p99 reached 142.08 ms although the longest
+in-window WAL fsync call was only 6.0 ms (standard: 24.26 ms p99 and 4.8 ms
+fsync). The longest group flush in that premium sample was 86.95 ms, but the
+probe does not bind those events to the same client request. In pair 5,
+standard p99 reached 554.05 ms, with a 336.6 ms maximum
+fsync and 2.44 ms mean device write time per operation. Long WAL syncs may
+contribute to some spikes, but do not account for every observed spike.
+
+The evidence supports neither switching storage tiers nor changing the WAL
+path. A next diagnostic, if separately authorized, should correlate request
+and commit timing with fsync and filesystem or block events and track scheduling
+of the same voter threads, while retaining quorum sync and receipt checks.
