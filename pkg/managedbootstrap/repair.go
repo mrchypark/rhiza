@@ -48,14 +48,22 @@ func CheckRepairGate(ctx context.Context, kube *operator.Kubernetes, ref operato
 	if !ok || r.PreparedHandoff == nil {
 		return empty, output, ErrLearnerAdmissionPending
 	}
-	if r.State != "Closed" && !(allowCompleted && r.State == "Completed") {
-		return empty, output, errors.New("repair startup is not authorized")
-	}
 	if !bytes.Equal(bytes.TrimSpace(a.Transition()), []byte("null")) && len(bytes.TrimSpace(a.Transition())) != 0 {
 		return empty, output, errors.New("repair overlaps authority transition")
 	}
 	p := r.Plan
-	if p.ClusterUID != ref.UID || p.Generation != generation || p.Generation != a.Authority().Generation || p.DeploymentUID != a.Authority().Binding.DeploymentUID || p.StorageID != a.Authority().Binding.StorageID || p.Replacement.PodName != podName || p.Replacement.PodUID != podUID {
+	if p.ClusterUID != ref.UID || p.Generation != generation || p.Generation != a.Authority().Generation || p.DeploymentUID != a.Authority().Binding.DeploymentUID || p.StorageID != a.Authority().Binding.StorageID {
+		return empty, output, errors.New("repair execution binding changed")
+	}
+	if r.State == "Completed" && p.Replacement.PodUID != podUID {
+		// The previous repair stays in status until the controller records
+		// this new Pod's plan. Its terminal never authorizes the new Pod.
+		return empty, output, ErrLearnerAdmissionPending
+	}
+	if r.State != "Closed" && !(allowCompleted && r.State == "Completed") {
+		return empty, output, errors.New("repair startup is not authorized")
+	}
+	if p.Replacement.PodName != podName || p.Replacement.PodUID != podUID {
 		return empty, output, errors.New("repair execution binding changed")
 	}
 	member := operator.V1Alpha2BootstrapMember{PodUID: podUID, Member: quepaxa.Member{ID: p.Replacement.NodeID, PublicKey: p.Replacement.PublicKey, PeerURL: p.Replacement.PeerURL}}
