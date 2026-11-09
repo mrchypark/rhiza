@@ -209,13 +209,15 @@ reserved `_rhiza_` namespace is inaccessible through public SQL APIs.
 
 ### Graph and Cypher
 
-Rhiza uses `latticedb-go v0.12.2` and exposes its deliberately small,
+Rhiza uses `latticedb-go v0.13.0` and exposes its deliberately small,
 case-sensitive Cypher subset. This is not full openCypher. Structural keywords
 and built-in function names are case-sensitive.
 
 Supported query building blocks follow the pinned engine grammar and include:
 
 - `MATCH` with incoming, outgoing, or undirected fixed- and variable-length paths.
+- Read-only `OPTIONAL MATCH`, correlated `EXISTS` / `NOT EXISTS` subqueries,
+  and `UNION` / `UNION ALL`.
 - `WHERE` with comparisons, `IN`, `STARTS WITH`, `ENDS WITH`, `CONTAINS`,
   `IS NULL`, `IS NOT NULL`, `AND`, `OR`, and `NOT`.
 - `RETURN`, `WITH`, `DISTINCT`, scalar/arithmetic expressions, built-in functions,
@@ -227,7 +229,7 @@ Supported query building blocks follow the pinned engine grammar and include:
 - `UNWIND` with supported query parts.
 - Full-text `@@` predicates, subject to the engine's ranking restrictions.
 
-`OPTIONAL MATCH`, `UNION`, `CALL`, comments, multiple statements, and user-defined
+`CALL`, comments, multiple statements, and user-defined
 functions are not supported. Only the engine's known built-ins are callable; the
 pinned engine currently has no clock, random, or external-I/O built-ins. This is
 a version-pinned supported-language contract, not a determinism guarantee for
@@ -239,6 +241,8 @@ accept JSON-compatible null, boolean, string, number, list, and map values.
 The dependency grammar also includes vector-distance `<=>`, but Rhiza does not
 currently configure LatticeDB vector mode or expose typed vector parameters, so
 vector search is not part of Rhiza's supported Graph surface.
+Rhiza does not expose the engine's structured EXPLAIN, SearchGraph, or
+graph-constraint APIs.
 
 Use `GraphQuery` or `POST /graph/query` for read-only `MATCH ... RETURN` and
 `UNWIND ... RETURN` queries. Use `GraphExecute` or `POST /graph/execute` for
@@ -266,8 +270,8 @@ indexes are node-local derived state: they are not replicated, and Rhiza
 reconciles them when the node opens or installs a checkpoint.
 
 The dependency owns the complete language contract. See the version-pinned
-[`Supported Cypher Subset`](https://github.com/mrchypark/latticedb-go/blob/v0.12.2/docs/engine_conformance.md#supported-cypher-subset)
-and [canonical EBNF grammar](https://github.com/mrchypark/latticedb-go/blob/v0.12.2/internal/engine/testdata/query_grammar.ebnf).
+[`Supported Cypher Subset`](https://github.com/mrchypark/latticedb-go/blob/v0.13.0/docs/engine_conformance.md#supported-cypher-subset)
+and [canonical EBNF grammar](https://github.com/mrchypark/latticedb-go/blob/v0.13.0/internal/engine/testdata/query_grammar.ebnf).
 
 ### Graph streams
 
