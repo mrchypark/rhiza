@@ -288,17 +288,42 @@ func TestObserveManagedControlAcceptsDurablyPromotedLearner(t *testing.T) {
 	}
 	var hookHit atomic.Bool
 	var proposalResult managedControlProposalResult
+	var deliveryErr error
 	restore := localtesthooks.Set(func(event string) {
 		if event != "core:managed-control:before-snapshot-recheck" || !hookHit.CompareAndSwap(false, true) {
 			return
 		}
+		// A proposer quorum need not include n4. Hold its delivery until the
+		// proposer returns, then install that exact certificate on the observer.
+		transport.mu.Lock()
+		transport.dropDecision["n4"] = true
+		transport.mu.Unlock()
+		defer func() {
+			transport.mu.Lock()
+			delete(transport.dropDecision, "n4")
+			transport.mu.Unlock()
+		}()
 		transport.releaseHeld()
 		proposalResult = proposal.wait(ctx)
+		if proposalResult.err != nil || proposalResult.slot != pendingSlot {
+			return
+		}
+		value, ok := cores["n1"].CertifiedValue(pendingSlot)
+		if !ok || value.Hash != expectedHash || learner.Tip() != committedSlot {
+			deliveryErr = fmt.Errorf("expected exact source certificate and unchanged n4 tip %d, got certified=%t hash=%x tip=%d", committedSlot, ok, value.Hash, learner.Tip())
+			return
+		}
+		decision, err := cores["n1"].certifiedDecision(value)
+		if err != nil {
+			deliveryErr = err
+			return
+		}
+		deliveryErr = learner.AcceptDecision(decision)
 	})
 	_, observationErr := learner.ObserveManagedAppendOnlyControl(ctx)
 	restore()
-	if !hookHit.Load() || proposalResult.err != nil || proposalResult.slot != pendingSlot {
-		t.Fatalf("certification during promoted-learner validation: hook=%t proposal=%+v", hookHit.Load(), proposalResult)
+	if !hookHit.Load() || proposalResult.err != nil || proposalResult.slot != pendingSlot || deliveryErr != nil {
+		t.Fatalf("certification during promoted-learner validation: hook=%t proposal=%+v learner delivery=%v", hookHit.Load(), proposalResult, deliveryErr)
 	}
 	if !IsManagedControlPrefixAdvance(observationErr) || !errors.Is(observationErr, ErrManagedControlObservationUnavailable) {
 		t.Fatalf("promoted learner observation error=%v, want typed certified-prefix advance", observationErr)
@@ -376,17 +401,21 @@ func TestObserveManagedControlRejectsPromotedLearnerOrdinaryNextSlotGap(t *testi
 	pendingSlot, proposal, _, _ := startPromotedLearnerPendingControl(t, ctx, fixture, nonce)
 	var hookHit atomic.Bool
 	var proposalResult managedControlProposalResult
+	var learnerWaitErr error
 	restore := localtesthooks.Set(func(event string) {
 		if event != "core:managed-control:before-snapshot-recheck" || !hookHit.CompareAndSwap(false, true) {
 			return
 		}
 		fixture.transport.releaseHeld()
 		proposalResult = proposal.wait(ctx)
+		if proposalResult.err == nil && proposalResult.slot == pendingSlot {
+			learnerWaitErr = fixture.learner.WaitTip(ctx, pendingSlot)
+		}
 	})
 	_, observationErr := fixture.learner.ObserveManagedAppendOnlyControl(ctx)
 	restore()
-	if !hookHit.Load() || proposalResult.err != nil || proposalResult.slot != pendingSlot || !IsManagedControlPrefixAdvance(observationErr) {
-		t.Fatalf("actual promoted prefix advance hook=%t proposal=%+v observationErr=%v", hookHit.Load(), proposalResult, observationErr)
+	if !hookHit.Load() || proposalResult.err != nil || proposalResult.slot != pendingSlot || learnerWaitErr != nil || !IsManagedControlPrefixAdvance(observationErr) {
+		t.Fatalf("actual promoted prefix advance hook=%t proposal=%+v learner wait=%v observationErr=%v", hookHit.Load(), proposalResult, learnerWaitErr, observationErr)
 	}
 	ordinary := newProposal(highestPriority, "n4", []byte("ordinary R+1 application value"))
 	ordinarySlot := pendingSlot + 1

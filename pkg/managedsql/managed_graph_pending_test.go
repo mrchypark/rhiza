@@ -96,6 +96,10 @@ func TestManagedGraphPublicLinearizableReadHealsPendingWithoutProposal(t *testin
 	testManagedGraphPublicPending(t, "read")
 }
 
+func TestManagedGraphPublicLinearizableSQLReadHealsPendingWithoutProposal(t *testing.T) {
+	testManagedGraphPublicPending(t, "sql-read")
+}
+
 func TestManagedGraphPublicNewWriteHealsPendingWithoutResubmission(t *testing.T) {
 	testManagedGraphPublicPending(t, "write")
 }
@@ -276,6 +280,14 @@ func testManagedGraphPublicPending(t *testing.T, mode string) {
 		status, err := hosts[1].RequestStatus(ctx, selector)
 		if err != nil || status.Receipt == nil || *status.Receipt != ack.MutationReceipt {
 			t.Fatalf("linearizable read changed original receipt: status=%+v error=%v", status, err)
+		}
+	} else if mode == "sql-read" {
+		if _, err := hosts[1].Query(ctx, QueryRequest{SQL: "SELECT 1", Consistency: "local"}); !pendingObservation(err) {
+			t.Fatalf("public local SQL did not reject actual pending Graph projection: %v", err)
+		}
+		rows, err := hosts[1].Query(ctx, QueryRequest{SQL: "SELECT 1", Consistency: "linearizable"})
+		if err != nil || len(rows.Rows) != 1 || len(rows.Rows[0]) != 1 || rows.Rows[0][0] != int64(1) || rows.AppliedSlot < ack.Slot {
+			t.Fatalf("public linearizable SQL did not replay certified Graph projection: rows=%+v error=%v", rows, err)
 		}
 	} else if mode == "write" {
 		next := types.GraphCommand{RequestID: "\xfe-after-pending", Cypher: "CREATE (:AfterPendingGraph {value: 'new'})"}

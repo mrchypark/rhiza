@@ -6,7 +6,9 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"io"
 	"net/http"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -19,9 +21,50 @@ import (
 	"github.com/mrchypark/rhiza/pkg/operator"
 )
 
+func expectedQualificationPUTCancellation(ownedPrefix, closingAccessKey string, r *http.Request, err error) bool {
+	// The SDK uses a fixture-only access key per Host. A caller can abandon
+	// the batch without canceling its archive PUT; only that Host's Close can.
+	return closingAccessKey != "" && r.Method == http.MethodPut && strings.HasPrefix(r.URL.Path, ownedPrefix) &&
+		len(r.URL.Path) > len(ownedPrefix) &&
+		strings.HasPrefix(r.Header.Get("Authorization"), "AWS4-HMAC-SHA256 Credential="+closingAccessKey+"/") &&
+		errors.Is(r.Context().Err(), context.Canceled) && errors.Is(err, io.ErrUnexpectedEOF)
+}
+
 // Actual three-Host/Core/WAL/native/S3-SDK regression. The HTTP server is the
 // existing synthetic wire fixture, not Floci/provider parity or a Rust test.
 func TestManagedGraphActualUnknownRetainsNativeOriginal(t *testing.T) {
+	t.Run("put-read-error-scope", func(t *testing.T) {
+		const prefix = "/bucket/owned/"
+		const head = prefix + "archive/head.bin"
+		for _, tc := range []struct {
+			name, path, accessKey, closingAccessKey string
+			err                                     error
+			canceled, want                          bool
+		}{
+			{"owned-close", head, "host-1", "host-1", io.ErrUnexpectedEOF, true, true},
+			{"different-host-same-path", head, "host-2", "host-1", io.ErrUnexpectedEOF, true, false},
+			{"caller-cancel-without-close", head, "host-1", "", io.ErrUnexpectedEOF, true, false},
+			{"live-wire", head, "host-1", "host-1", io.ErrUnexpectedEOF, false, false},
+			{"wrong-path", "/bucket/other/archive/head.bin", "host-1", "host-1", io.ErrUnexpectedEOF, true, false},
+			{"wrong-error", head, "host-1", "host-1", io.ErrClosedPipe, true, false},
+		} {
+			t.Run(tc.name, func(t *testing.T) {
+				ctx, cancel := context.WithCancel(context.Background())
+				defer cancel()
+				if tc.canceled {
+					cancel()
+				}
+				r, err := http.NewRequestWithContext(ctx, http.MethodPut, "http://fixture"+tc.path, nil)
+				if err != nil {
+					t.Fatal(err)
+				}
+				r.Header.Set("Authorization", "AWS4-HMAC-SHA256 Credential="+tc.accessKey+"/fixture")
+				if got := expectedQualificationPUTCancellation(prefix, tc.closingAccessKey, r, tc.err); got != tc.want {
+					t.Fatalf("classify canceled PUT: got %t, want %t", got, tc.want)
+				}
+			})
+		}
+	})
 	ctx, cancel := context.WithTimeout(context.Background(), 25*time.Second)
 	defer cancel()
 	configs, fixture := sqlClusterForProtocol(t, sqlpolicy.ManagedGraphRequestAppendOnlyApplicationProtocol)
@@ -31,11 +74,31 @@ func TestManagedGraphActualUnknownRetainsNativeOriginal(t *testing.T) {
 	var releaseOnce sync.Once
 	fixture.source.putReady, fixture.source.putRelease = entered, release
 	fixture.source.putSuffix, fixture.source.putEnabled = "archive/head.bin", &armed
+	ownedPrefix := "/bucket/" + fixture.source.finalPrefix + "/"
+	headPath := ownedPrefix + "archive/head.bin"
+	fixture.source.putGate = func(_ context.Context, path string) bool {
+		return path == headPath
+	}
+	var closingAccessKey atomic.Value
+	closingAccessKey.Store("")
+	fixture.source.putReadFailure = func(r *http.Request, err error) {
+		if expectedQualificationPUTCancellation(ownedPrefix, closingAccessKey.Load().(string), r, err) {
+			t.Logf("expected canceled PUT path=%s owned_close=true", r.URL.Path)
+			return
+		}
+		t.Errorf("unexpected PUT read failure method=%s path=%s context=%v: %v", r.Method, r.URL.Path, r.Context().Err(), err)
+	}
+	closeOwnedHost := func(h *Host) error {
+		closingAccessKey.Store(h.cfg.Runtime.ObjStoreAccessKey)
+		defer closingAccessKey.Store("")
+		return h.Close()
+	}
 	hosts := make([]*Host, len(configs))
 	for i, cfg := range configs {
 		// Observe the real product publisher within this bounded fixture; the
 		// default production interval is not a 25-second test precondition.
 		cfg.Runtime.CheckpointInterval = 200 * time.Millisecond
+		cfg.Runtime.ObjStoreAccessKey = "fixture-" + string(cfg.Runtime.NodeID)
 		kube := *cfg.Store.Kube
 		client := *kube.Client
 		base := client.Transport
@@ -51,7 +114,7 @@ func TestManagedGraphActualUnknownRetainsNativeOriginal(t *testing.T) {
 		configs[i] = cfg
 		h, err := fixture.open(ctx, cfg)
 		if h != nil {
-			t.Cleanup(func() { _ = h.Close() })
+			t.Cleanup(func() { _ = closeOwnedHost(h) })
 		}
 		if err != nil {
 			t.Fatal(err)
@@ -201,12 +264,12 @@ func TestManagedGraphActualUnknownRetainsNativeOriginal(t *testing.T) {
 	// empty-disk/Pod replacement claim. Startup control may use Kubernetes;
 	// normal observations after actual fresh admission must not use it.
 	outage.Store(false)
-	if err := hosts[0].Close(); err != nil {
+	if err := closeOwnedHost(hosts[0]); err != nil {
 		t.Fatal(err)
 	}
 	reopened, err := fixture.open(ctx, configs[0])
 	if reopened != nil {
-		t.Cleanup(func() { _ = reopened.Close() })
+		t.Cleanup(func() { _ = closeOwnedHost(reopened) })
 	}
 	if err != nil {
 		t.Fatal("fresh Host same-DataDir reopen failed", err)

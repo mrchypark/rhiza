@@ -250,6 +250,31 @@ func TestAwaitCommittedPlanAndLiveGuards(t *testing.T) {
 		if saved.Binding.PodUID != "replacement-uid" || saved.Binding.ReplicaSetUID == "" || saved.Binding.PodIP != "127.0.0.1" {
 			t.Fatal("origin omitted live owner-chain binding")
 		}
+		t.Run("second replacement waits behind prior completed repair", func(t *testing.T) {
+			prior := bytes.Clone(clusterJSON)
+			defer func() { clusterJSON = prior }()
+			prepared, err := operator.LoadV1Alpha2Admission(context.Background(), store, ref)
+			if err != nil {
+				t.Fatal(err)
+			}
+			added := operator.V1Alpha2RepairCompletion{OperationID: intent.OperationID, PlanDigest: intent.Digest(), ExpectedConfigID: intent.ExpectedConfigID, Kind: "Terminal", ConfigID: 2, Slot: 18, Hash: strings.Repeat("c", 64), FinalVoterIDs: append(slices.Clone(intent.FinalVoterIDs), intent.OldNodeID)}
+			slices.Sort(added.FinalVoterIDs)
+			withAdd, _, err := operator.RecordV1Alpha2RepairAddition(context.Background(), store, prepared, prepared.Authority(), added)
+			if err != nil {
+				t.Fatal(err)
+			}
+			terminal := added
+			terminal.ConfigID, terminal.Slot, terminal.FinalVoterIDs = 3, 19, intent.FinalVoterIDs
+			if _, _, err := operator.FinishV1Alpha2Repair(context.Background(), store, withAdd, withAdd.Authority(), terminal); err != nil {
+				t.Fatal(err)
+			}
+			if _, _, err := checkRepairGate(context.Background(), k, ref, 0, "next-pod", "next-uid", replacementIdentity, false); !errors.Is(err, errLearnerAdmissionPending) {
+				t.Fatalf("new Pod did not remain pending behind prior terminal: %v", err)
+			}
+			if _, _, err := checkRepairGate(context.Background(), k, ref, 0, "pod-name", "replacement-uid", replacementIdentity, false); err == nil || errors.Is(err, errLearnerAdmissionPending) {
+				t.Fatalf("same Pod must not turn a terminal into first-start permission: %v", err)
+			}
+		})
 		// This HTTP gate fixture establishes no consensus proof. A later valid
 		// status shape must not retarget D's local origin to the E replacement.
 		beforeRollover := bytes.Clone(clusterJSON)

@@ -726,13 +726,23 @@ func (n *Node) QueryManagedSQL(ctx context.Context, req network.QueryRequest) (n
 	if req.Consistency != "" && req.Consistency != "local" && req.Consistency != "linearizable" {
 		return network.QueryResponse{}, fmt.Errorf("%w: consistency must be local or linearizable", network.ErrInvalidRequest)
 	}
-	if err := n.CheckManagedLocalRead(ctx); err != nil {
-		return network.QueryResponse{}, logManagedSQLQueryFailure(ctx, "node_local_read", err)
+	graphReplay := req.Consistency == "linearizable" && n.internalApplicationProfile() && n.materializationPolicy() == sqlpolicy.ManagedGraphRequestMaterializationPolicy
+	if !graphReplay {
+		if err := n.CheckManagedLocalRead(ctx); err != nil {
+			return network.QueryResponse{}, logManagedSQLQueryFailure(ctx, "node_local_read", err)
+		}
 	}
 	if req.Consistency == "linearizable" {
 		if n.internalApplicationProfile() {
 			if err := n.admitInternalApplication(ctx); err != nil {
 				return network.QueryResponse{}, logManagedSQLQueryFailure(ctx, "node_admission", err)
+			}
+			if graphReplay {
+				// Certified replay can finish a paired projection that is not
+				// yet readable. Check the complete projection before serving.
+				if err := n.CheckManagedLocalRead(ctx); err != nil {
+					return network.QueryResponse{}, logManagedSQLQueryFailure(ctx, "node_local_read", err)
+				}
 			}
 			response, err := n.server.Query(ctx, req)
 			return response, logManagedSQLQueryFailure(ctx, "node_server", err)
