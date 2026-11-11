@@ -317,7 +317,7 @@ func TestQualificationApplicationProvenance(t *testing.T) {
 	for _, required := range []string{
 		`cd "$(CDPATH='' cd -- "$(dirname -- "$0")/.." && pwd)"`,
 		`image="rhiza-managed:$GITHUB_SHA-$nonce"`,
-		`docker build -f "${RHIZA_MANAGED_TEST_DOCKERFILE:-Dockerfile.operator}" -t "$image" .`,
+		`docker build --network host -f "${RHIZA_MANAGED_TEST_DOCKERFILE:-Dockerfile.operator}" -t "$image" .`,
 		`kind load docker-image --name "$cluster" "$image"`,
 		`--arg image "$image" --rawfile admin`,
 		`InitImage:$image`,
