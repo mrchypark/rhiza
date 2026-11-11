@@ -332,7 +332,7 @@ owned=1
 kind create cluster --name "$cluster" --kubeconfig "$kubeconfig" --wait 120s > "$logs/create.txt" 2>&1
 if [ "$published_install_only" = false ]; then
   built=1
-  docker build -f "${RHIZA_MANAGED_TEST_DOCKERFILE:-Dockerfile.operator}" -t "$image" . > "$logs/build.txt" 2>&1
+  docker build --network host -f "${RHIZA_MANAGED_TEST_DOCKERFILE:-Dockerfile.operator}" -t "$image" . > "$logs/build.txt" 2>&1
   kind load docker-image --name "$cluster" "$image" > "$logs/load.txt" 2>&1
 fi
 k create namespace "$namespace"
