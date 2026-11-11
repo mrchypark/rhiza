@@ -543,6 +543,10 @@ fi
 if [ "$fixture_case" != legacy ]; then
   managed_bootstrap_check initial restart_zero "$logs/ready-pods.json" 'all(.items[]; all(.status.containerStatuses[]; .restartCount==0))'
 fi
+if [ -n "${functional_scenario-}" ]; then
+  managed_functional_qualification "$functional_scenario"
+  return $?
+fi
 if [ "$fixture_case" != legacy ] && [ "${managed_manual_proof-}" != vcluster ]; then
   producer_uid=$(jq -er '.status.bootstrapPlan.members|sort_by(.member.node_id)|.[0].podUID' "$logs/committed.json")
   producer_pod=$(jq -er --arg uid "$producer_uid" '.items[]|select(.metadata.uid==$uid)|.metadata.name' "$logs/ready-pods.json")

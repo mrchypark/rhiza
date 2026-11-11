@@ -146,6 +146,11 @@ if [ "${1-}" = --pod-fault-proof-self-test ]; then
   exit 0
 fi
 published_install_only=${RHIZA_MANAGED_PUBLISHED_INSTALL_ONLY-false}
+functional_scenario=${RHIZA_MANAGED_FUNCTIONAL_SCENARIO-}
+case "$functional_scenario" in
+  ''|scale-up|quorum) ;;
+  *) echo 'invalid RHIZA_MANAGED_FUNCTIONAL_SCENARIO' >&2; exit 1 ;;
+esac
 managed_install_mode_valid "$published_install_only" "${RHIZA_MANAGED_FIXTURE_CASE-internal}"
 [ "${GITHUB_ACTIONS-}" = true ] || { echo 'GitHub Actions only' >&2; exit 1; }
 : "${RUNNER_TEMP:?}" "${GITHUB_SHA:?}" "${GITHUB_RUN_ID:?}" "${GITHUB_RUN_ATTEMPT:?}"
@@ -303,6 +308,9 @@ cleanup() {
       k -n "$control" logs -l "app.kubernetes.io/component=$chaos_component" --all-containers --previous --tail=200 --limit-bytes=65536 > "$logs/$chaos_component-previous.log" 2>&1 || :
     done
     fi
+    if [ -n "$functional_scenario" ] && command -v managed_functional_capture >/dev/null 2>&1; then
+      managed_functional_capture || :
+    fi
     capture_floci
     capture_bootstrap_logs
     k -n "$namespace" get pods,deployments,replicasets,rhizaclusters,jobs,services,endpoints -o json > "$logs/final-state.json" 2>&1 || :
@@ -358,4 +366,7 @@ managed_container_fault() {
   managed_chaos_verified=1
 }
 . scripts/ha-managed-bootstrap-fixture.sh
+if [ -n "$functional_scenario" ]; then
+  . scripts/ha-managed-scale-qualification.sh
+fi
 managed_fixture
