@@ -750,26 +750,20 @@ func (h *Host) validateAddOnlyEnrollment(r operator.V1Alpha2RepairRecord, reques
 	}
 	ids = append(ids, p.Replacement.NodeID)
 	slices.Sort(ids)
-	if !oldFound || replacementFound || !slices.Equal(ids, p.FinalVoterIDs) || len(current.Members) > len(handoff.PreparedConfig.Members) {
+	if !oldFound || replacementFound || !slices.Equal(ids, p.FinalVoterIDs) || (current.ConfigID == request.ExpectedConfigID && len(current.Members) > len(handoff.PreparedConfig.Members)) {
 		return fmt.Errorf("managed enrollment source or final roster changed")
 	}
 	if current.ConfigID == request.ExpectedConfigID {
 		if abortSlot != request.ExpectedAbortSlot || !reflect.DeepEqual(current, *handoff.PreparedConfig) {
 			return fmt.Errorf("managed enrollment source configuration/revision changed")
 		}
-	} else if current.ConfigID != request.ExpectedConfigID+1 || len(current.Members) != len(p.FinalVoterIDs) || !slices.Equal(sortedCurrentIDs(current), p.FinalVoterIDs) {
-		return fmt.Errorf("managed enrollment target configuration changed")
+	} else {
+		expected := quepaxa.Cluster{ConfigID: request.ExpectedConfigID + 1, Members: append(append([]quepaxa.Member(nil), handoff.PreparedConfig.Members...), *request.Addition)}
+		if !sameRepairClusterMembers(current, expected) {
+			return fmt.Errorf("managed enrollment target configuration changed")
+		}
 	}
 	return nil
-}
-
-func sortedCurrentIDs(current quepaxa.Cluster) []types.NodeID {
-	ids := make([]types.NodeID, 0, len(current.Members))
-	for _, member := range current.Members {
-		ids = append(ids, types.NodeID(member.ID))
-	}
-	slices.Sort(ids)
-	return ids
 }
 
 func (h *Host) ValidateManagedRepairPreparation(ctx context.Context, i node.ManagedStartupIdentity, request node.ManagedMembershipRequest, current quepaxa.Cluster, abortSlot quepaxa.Slot) error {

@@ -61,6 +61,38 @@ func TestManagedSQLPreparationRequiresLiveExactRepair(t *testing.T) {
 	}
 }
 
+func TestManagedAddOnlyTerminalRequiresExactMemberIdentity(t *testing.T) {
+	old := quepaxa.Member{ID: "a", URL: "https://a", PeerURL: "quic://a:1", PublicKey: quepaxa.PublicKey{1}, WALIdentity: "wal-a"}
+	retained := quepaxa.Member{ID: "b", URL: "https://b", PeerURL: "quic://b:1", PublicKey: quepaxa.PublicKey{2}, WALIdentity: "wal-b"}
+	addition := quepaxa.Member{ID: "c", PeerURL: "quic://c:1", PublicKey: quepaxa.PublicKey{3}, WALIdentity: strings.Repeat("3", 64)}
+	prepared := quepaxa.Cluster{ConfigID: 1, Members: []quepaxa.Member{old, retained}}
+	plan := operator.V1Alpha2RepairPlan{Sequence: operator.V1Alpha2RepairAdd, ExpectedConfigID: 1, OldNodeID: old.ID, OldWALIdentity: old.WALIdentity, Replacement: operator.V1Alpha2RepairMember{NodeID: addition.ID, PublicKey: addition.PublicKey, PeerURL: addition.PeerURL}, FinalVoterIDs: []quepaxa.NodeID{old.ID, retained.ID, addition.ID}}
+	record := operator.V1Alpha2RepairRecord{Plan: plan, PreparedHandoff: &operator.V1Alpha2RepairHandoff{HeadHash: "handoff", PreparedConfig: &prepared, PreparedSlot: 1, PreparedHash: strings.Repeat("a", 64)}}
+	request := node.ManagedMembershipRequest{Action: node.ManagedMembershipAdd, AddOnly: true, HandoffHeadHash: "handoff", ExpectedConfigID: 1, OldNodeID: old.ID, OldWALIdentity: old.WALIdentity, Addition: &addition}
+	exact := quepaxa.Cluster{ConfigID: 2, Members: []quepaxa.Member{old, retained, addition}}
+	h := &Host{}
+	if err := h.validateAddOnlyEnrollment(record, request, exact, 0); err != nil {
+		t.Fatalf("exact terminal identity: %v", err)
+	}
+	for _, tc := range []struct {
+		name string
+		edit func(*quepaxa.Member)
+	}{
+		{"public key", func(member *quepaxa.Member) { member.PublicKey[0] ^= 0xff }},
+		{"peer URL", func(member *quepaxa.Member) { member.PeerURL = "quic://changed:1" }},
+		{"WAL identity", func(member *quepaxa.Member) { member.WALIdentity = "different-wal" }},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			changed := exact
+			changed.Members = append([]quepaxa.Member(nil), exact.Members...)
+			tc.edit(&changed.Members[2])
+			if err := h.validateAddOnlyEnrollment(record, request, changed, 0); err == nil {
+				t.Fatal("terminal identity change accepted")
+			}
+		})
+	}
+}
+
 func TestManagedSQLWireCloseLifecycleRejectsUnexpectedPUTFailure(t *testing.T) {
 	for _, tc := range []struct {
 		name, method, path string

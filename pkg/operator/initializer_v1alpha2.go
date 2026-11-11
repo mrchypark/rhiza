@@ -300,10 +300,9 @@ func reconcileV1Alpha2ManagedScale(ctx context.Context, kube *Kubernetes, ref V1
 				current = len(r.Completion.FinalVoterIDs)
 			}
 		case V1Alpha2RepairAddThenRemove:
-			current = len(r.Plan.FinalVoterIDs) + 1
-			if r.State == "Completed" && r.Completion != nil && r.Completion.Kind == "Terminal" {
-				current = len(r.Completion.FinalVoterIDs)
-			}
+			// FinalVoterIDs is the stable replacement target. The ADD-first
+			// intermediate roster is temporary and must not block reconciliation.
+			current = len(r.Plan.FinalVoterIDs)
 		}
 	}
 	target := int(spec.VoterCount)

@@ -9,6 +9,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -367,6 +368,71 @@ func TestManagedScaleGrowsReplicaTargetWithoutShrinking(t *testing.T) {
 	}
 	if got := replicas(); got != 5 {
 		t.Fatalf("manual lower target or kubectl-scale drift changed replicas to %d", got)
+	}
+}
+
+func TestManagedScaleIgnoresTemporaryAddFirstMembership(t *testing.T) {
+	s, kube := phase9Setup(t, phase9CurrentManagedCluster())
+	ctx := context.Background()
+	first, err := ReconcileV1Alpha2ManagedInitialization(ctx, kube, phase2Ref, phase9RuntimeProfile())
+	if err != nil {
+		t.Fatal(err)
+	}
+	init, err := LoadV1Alpha2ApplicationInit(ctx, &V1Alpha2StatusStore{Kube: kube}, phase2Ref)
+	if err != nil {
+		t.Fatal(err)
+	}
+	bootstrap, err := first.BootstrapPlan()
+	if err != nil || len(bootstrap.Members) != 3 {
+		t.Fatalf("bootstrap members: %+v err=%v", bootstrap.Members, err)
+	}
+	auth := first.Authority()
+	replacement, err := types.ManagedNodeID("replacement-pod-uid")
+	if err != nil {
+		t.Fatal(err)
+	}
+	old := bootstrap.Members[0].Member.ID
+	plan := V1Alpha2RepairPlan{
+		Sequence: V1Alpha2RepairAddThenRemove, OperationID: "replace-temporary", ClusterUID: auth.Owner.UID,
+		Generation: auth.Generation, DeploymentUID: auth.Binding.DeploymentUID, StorageID: auth.Binding.StorageID,
+		ExpectedConfigID: 1, OldNodeID: old, OldWALIdentity: strings.Repeat("1", 64),
+		Replacement:         V1Alpha2RepairMember{PodName: "replacement", PodUID: "replacement-pod-uid", NodeID: replacement, PublicKey: bootstrap.Members[1].Member.PublicKey, PeerURL: "quic://10.0.0.4:9090"},
+		BootstrapPlanDigest: init.Assignment().Plan.BootstrapPlanDigest,
+	}
+	for _, member := range bootstrap.Members {
+		if member.Member.ID != old {
+			plan.FinalVoterIDs = append(plan.FinalVoterIDs, member.Member.ID)
+		}
+	}
+	plan.FinalVoterIDs = append(plan.FinalVoterIDs, replacement)
+	slices.Sort(plan.FinalVoterIDs)
+
+	cluster := jsonDecode(t, s.cluster)
+	status := asObject(cluster["status"])
+	assignment := asObject(status["applicationInit"])
+	assignment["state"] = "Consumed"
+	assignment["initialEvidenceDigest"] = strings.Repeat("a", 64)
+	asObject(status["authority"])["evidence"] = map[string]any{"schema": "empty"}
+	status["repair"] = mustManagedJSON(V1Alpha2RepairRecord{Plan: plan, State: "Closed"})
+	s.cluster = string(mustManagedJSON(cluster))
+
+	s.mu9.Lock()
+	deployment := jsonDecode(t, s.deployment)
+	asObject(deployment["spec"])["replicas"] = 4
+	s.deployment = string(mustManagedJSON(deployment))
+	s.mu9.Unlock()
+	before := s.cluster
+	if _, err := ReconcileV1Alpha2ManagedInitialization(ctx, kube, phase2Ref, phase9RuntimeProfile()); err != nil {
+		t.Fatalf("temporary add-first membership blocked reconciliation: %v", err)
+	}
+	if s.cluster != before {
+		t.Fatal("stable target reconciliation changed cluster status")
+	}
+	s.mu9.Lock()
+	got := int(number(asObject(asObject(jsonDecode(t, s.deployment))["spec"])["replicas"]))
+	s.mu9.Unlock()
+	if got != 4 {
+		t.Fatalf("temporary 4-voter membership or target 3 changed replicas to %d", got)
 	}
 }
 
