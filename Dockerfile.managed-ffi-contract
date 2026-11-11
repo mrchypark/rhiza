@@ -22,7 +22,9 @@ RUN cargo build --manifest-path sdk/rust/Cargo.toml --locked --release --example
 FROM mirror.gcr.io/library/ubuntu:24.04@sha256:534baea6a22c03a63003dbc8dbe78fe34bc0d7e595d9a9dc9834884ff530eb55
 # CI-only fixed GCS emulator route, inherited by init, Go FFI, Rust and runtime.
 ENV STORAGE_EMULATOR_HOST=http://floci:4588
-RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates libgcc-s1
+# libgcc-s1 is already in this pinned base; copy the builder's CA bundle so the
+# final stage needs no package-repository DNS.
+COPY --from=builder /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/ca-certificates.crt
 COPY --from=builder /app/rhiza-operator /usr/local/bin/rhiza-operator
 COPY --from=builder /app/rhiza-ha-init /usr/local/libexec/rhiza-ha-init
 COPY --from=rust-builder /app/rhiza-managed-ffi-contract /usr/local/libexec/rhiza-managed-ffi-contract

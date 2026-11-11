@@ -257,6 +257,8 @@ grep -Fq 'export RHIZA_MANAGED_FIXTURE_NODE=$RHIZA_HOST_NODE' "$direct"
 grep -Fq 'nodeSelector:$nodeSelector' "$fixture"
 [ "$(grep -Fc 'nodeSelector:$nodeSelector' "$fixture")" -eq 2 ]
 grep -Fq 'containers:[{name:"sql",image:$image}]' "$fixture"
+grep -Fq 'COPY --from=builder /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/ca-certificates.crt' Dockerfile.managed-ffi-contract
+if grep -Eq '^RUN .*apt-get' Dockerfile.managed-ffi-contract; then echo 'managed contract image requires package-repository DNS' >&2; exit 1; fi
 grep -Fq 'ENTRYPOINT ["rhiza-operator"]' Dockerfile.managed-ffi-contract
 grep -Fq 'COPY --chmod=0755 scripts/managed-ffi-contract-entrypoint.sh /usr/local/bin/rhiza-ha-init' Dockerfile.managed-ffi-contract
 grep -Fq 'exec /usr/local/libexec/rhiza-ha-init "$@"' scripts/managed-ffi-contract-entrypoint.sh
