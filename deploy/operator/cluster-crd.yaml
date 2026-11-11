@@ -363,8 +363,8 @@ spec:
                       type: object
                       required: [operationID, clusterUID, generation, deploymentUID, storageID, expectedConfigID, expectedAbortSlot, oldNodeID, oldWALIdentity, replacement, bootstrapPlanDigest, finalVoterIDs]
                       x-kubernetes-validations:
-                        - rule: 'self.replacement.nodeID in self.finalVoterIDs && !(self.oldNodeID in self.finalVoterIDs)'
-                          message: final target must include replacement and exclude old voter
+                        - rule: 'self.replacement.nodeID in self.finalVoterIDs && (self.oldNodeID in self.finalVoterIDs) == (has(self.sequence) && self.sequence == "add")'
+                          message: final target must include replacement and exclude old voter except for add-only enrollment
                       properties:
                         operationID: {type: string, minLength: 1, maxLength: 256}
                         sequence: {type: string, enum: [removeThenAdd, addThenRemove, add]}

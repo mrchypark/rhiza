@@ -241,6 +241,7 @@ func TestOperatorRoleCoversControllerWrites(t *testing.T) {
 		"secrets":                {"get", "create", "delete"},
 		"configmaps":             {"get"},
 		"services":               {"get", "create"},
+		"deployments":            {"get", "create", "update"},
 		"rhizaclusters":          {"get", "list"},
 		"rhizaclusters/status":   {"get", "update"},
 		"rhizarecoveries":        {"get", "list", "create", "update"},

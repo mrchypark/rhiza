@@ -263,6 +263,18 @@ func TestRepairV1Alpha2HandoffSchema(t *testing.T) {
 	}
 	planSchema := repair["properties"].(map[string]any)["plan"].(map[string]any)
 	planProperties := planSchema["properties"].(map[string]any)
+	var finalTargetRule string
+	for _, validation := range planSchema["x-kubernetes-validations"].([]any) {
+		entry := validation.(map[string]any)
+		if strings.Contains(entry["message"].(string), "final target") {
+			finalTargetRule = entry["rule"].(string)
+			break
+		}
+	}
+	const wantFinalTargetRule = `self.replacement.nodeID in self.finalVoterIDs && (self.oldNodeID in self.finalVoterIDs) == (has(self.sequence) && self.sequence == "add")`
+	if finalTargetRule != wantFinalTargetRule {
+		t.Fatalf("add-only final target must retain its old-voter witness: %q", finalTargetRule)
+	}
 	sequence := planProperties["sequence"].(map[string]any)
 	if !slices.Equal(sequence["enum"].([]any), []any{"removeThenAdd", "addThenRemove", "add"}) || slices.ContainsFunc(planSchema["required"].([]any), func(value any) bool {
 		field, ok := value.(string)
@@ -297,6 +309,14 @@ func TestRepairV1Alpha2HandoffSchema(t *testing.T) {
 	for _, message := range []string{"handoff capture requires an existing closed repair operation", "handoff physical binding must match immutable initialization", "captured handoff is immutable within an operation", "ADD terminal proof is immutable once recorded", "handoff must bind the post-REMOVE configuration and terminal position", "handoff survivor set must exactly precede the intended ADD", "ADD-first prepared source must bind the current roster and exact old WAL", "ADD terminal proof must bind the exact intermediate configuration", "REMOVE alone is not final repair completion", "m.node_id == self.plan.oldNodeID && (!has(m.wal_identity) || m.wal_identity == self.plan.oldWALIdentity)"} {
 		if !strings.Contains(joined, message) {
 			t.Fatalf("missing handoff invariant %s", message)
+		}
+	}
+	for _, fragment := range []string{
+		`(self.plan.sequence == "addThenRemove" && self.preparedHandoff.preparedConfig.members.filter(m, m.node_id != self.plan.oldNodeID).size() + 1 == self.plan.finalVoterIDs.size()`,
+		`self.preparedHandoff.preparedConfig.members.all(m, m.node_id == self.plan.oldNodeID || m.node_id in self.plan.finalVoterIDs)`,
+	} {
+		if !strings.Contains(joined, fragment) {
+			t.Fatalf("ADD-first replacement prepared source must retain its old voter: %s", fragment)
 		}
 	}
 	var addProofImmutableRule string
