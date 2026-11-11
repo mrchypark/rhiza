@@ -11,6 +11,7 @@ import (
 	"path/filepath"
 	"sort"
 	"sync"
+	"sync/atomic"
 
 	"github.com/mrchypark/rhiza/internal/localtesthooks"
 )
@@ -46,6 +47,7 @@ type WAL struct {
 	remove         func(string) error
 	writeAt        func(*os.File, []byte, int64) (int, error)
 	syncFile       func(*os.File) error
+	syncCount      atomic.Uint64
 }
 
 var ErrCapacity = errors.New("WAL capacity reached")
@@ -727,9 +729,13 @@ func (w *WAL) Sync() error {
 	if err := w.current.file.Sync(); err != nil {
 		return err
 	}
+	w.syncCount.Add(1)
 	w.dirty = false
 	return nil
 }
+
+// SyncCount reports successful file-sync operations for measurement and tests.
+func (w *WAL) SyncCount() uint64 { return w.syncCount.Load() }
 
 // Read reads all entries from all segments.
 func (w *WAL) Read() ([]Entry, error) {

@@ -1869,14 +1869,14 @@ func (s *Server) KVMutate(ctx context.Context, operation string, req KVMutationR
 		return KVMutationResponse{}, err
 	}
 	defer unlock()
-	if matches, err := s.material.KVRequestMatches(ctx, intent); err != nil {
+	receipt, found, matches, err := s.material.KVRequestStatus(ctx, intent)
+	if err != nil {
 		return KVMutationResponse{}, err
-	} else if !matches {
+	}
+	if !matches {
 		return KVMutationResponse{}, ErrRequestConflict
 	}
-	if receipt, found, err := s.material.MutationReceipt(ctx, types.MutationKV, req.RequestID); err != nil {
-		return KVMutationResponse{}, err
-	} else if found {
+	if found {
 		if err := s.waitReceiptDurable(ctx, receipt, req.RequestID); err != nil {
 			return KVMutationResponse{}, err
 		}
@@ -1895,12 +1895,12 @@ func (s *Server) KVMutate(ctx context.Context, operation string, req KVMutationR
 	if err != nil {
 		return KVMutationResponse{}, err
 	}
-	if matches, err := s.material.KVRequestMatches(ctx, intent); err != nil || !matches {
-		return KVMutationResponse{}, ErrRequestConflict
-	}
-	receipt, found, err := s.material.MutationReceipt(ctx, types.MutationKV, req.RequestID)
+	receipt, found, matches, err = s.material.KVRequestStatus(ctx, intent)
 	if err != nil {
 		return KVMutationResponse{}, err
+	}
+	if !matches {
+		return KVMutationResponse{}, ErrRequestConflict
 	}
 	if !found {
 		return KVMutationResponse{}, fmt.Errorf("KV mutation receipt is unavailable")

@@ -424,6 +424,42 @@ func TestMaterializerConflictingRequestIDIsNoOp(t *testing.T) {
 	})
 }
 
+func TestKVRequestStatusCombinesReceiptAndMatch(t *testing.T) {
+	ctx := context.Background()
+	m, err := Open(filepath.Join(t.TempDir(), "sqlite.db"), 1, 1024)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer m.Close()
+
+	first := types.KVCommand{RequestID: "status", Operation: "put", Key: "key", Value: []byte("value"), ObservedAtUnixMS: 1}
+	if receipt, found, matches, err := m.KVRequestStatus(ctx, first); err != nil || found || !matches || receipt != (types.MutationReceipt{}) {
+		t.Fatalf("missing status receipt=%+v found=%v matches=%v err=%v", receipt, found, matches, err)
+	}
+	value, err := types.EncodeKVCommand(first)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := m.Apply(ctx, 1, value); err != nil {
+		t.Fatal(err)
+	}
+	receipt, found, matches, err := m.KVRequestStatus(ctx, first)
+	if err != nil || !found || !matches || receipt.Slot != 1 {
+		t.Fatalf("exact status receipt=%+v found=%v matches=%v err=%v", receipt, found, matches, err)
+	}
+	conflict := first
+	conflict.Value = []byte("other")
+	if got, found, matches, err := m.KVRequestStatus(ctx, conflict); err != nil || !found || matches || got != receipt {
+		t.Fatalf("conflict status receipt=%+v found=%v matches=%v err=%v", got, found, matches, err)
+	}
+	m.mu.Lock()
+	m.tip = receipt.RetryThroughSlot + 1
+	m.mu.Unlock()
+	if got, found, matches, err := m.KVRequestStatus(ctx, first); err != nil || found || !matches || got != (types.MutationReceipt{}) {
+		t.Fatalf("expired status receipt=%+v found=%v matches=%v err=%v", got, found, matches, err)
+	}
+}
+
 func TestFailedSQLCommandRecordsResultAndAdvancesTip(t *testing.T) {
 	ctx := context.Background()
 	m, err := Open(t.TempDir()+"/failure.db", 1)

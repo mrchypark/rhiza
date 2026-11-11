@@ -14,6 +14,7 @@ import (
 
 	"github.com/mrchypark/rhiza/internal/types"
 	"github.com/mrchypark/rhiza/pkg/materializer"
+	"github.com/mrchypark/rhiza/pkg/qlog"
 	"github.com/mrchypark/rhiza/pkg/quepaxa"
 )
 
@@ -26,6 +27,8 @@ type requestIDRaceTransport struct {
 	disabled         map[quepaxa.NodeID]bool
 	failNextDecision bool
 	benchmarkQuorum  bool
+	recordCalls      atomic.Uint64
+	decisionCalls    atomic.Uint64
 
 	gateMu sync.Mutex
 	hashes map[quepaxa.ValueHash]struct{}
@@ -33,6 +36,7 @@ type requestIDRaceTransport struct {
 }
 
 func (t *requestIDRaceTransport) SendRecord(ctx context.Context, to quepaxa.NodeID, request quepaxa.RecordRequest) (quepaxa.Summary, error) {
+	t.recordCalls.Add(1)
 	if t.gate != nil && request.Slot == 1 && request.Step == 4 {
 		t.gateMu.Lock()
 		t.hashes[request.Proposal.Hash] = struct{}{}
@@ -91,6 +95,7 @@ func (t *requestIDRaceTransport) SendDecision(_ context.Context, decision quepax
 			}
 		}
 		for _, core := range cores {
+			t.decisionCalls.Add(1)
 			var err error
 			if decisionHasRecorder(decision, core.NodeID()) {
 				err = core.AcceptDecisionHint(decision)
@@ -108,6 +113,7 @@ func (t *requestIDRaceTransport) SendDecision(_ context.Context, decision quepax
 	}
 	results := make(chan error, len(cores))
 	for _, core := range cores {
+		t.decisionCalls.Add(1)
 		go func() { results <- core.AcceptDecision(decision) }()
 	}
 	successes := 0
@@ -196,6 +202,7 @@ type requestIDRaceCluster struct {
 	servers   map[quepaxa.NodeID]*Server
 	cores     map[quepaxa.NodeID]*quepaxa.Core
 	material  map[quepaxa.NodeID]*materializer.Materializer
+	wals      map[quepaxa.NodeID]*qlog.WAL
 	transport *requestIDRaceTransport
 }
 
@@ -210,9 +217,16 @@ func newInMemoryThreePeerCluster(t testing.TB, gated bool) requestIDRaceCluster 
 	if gated {
 		transport.gate = make(chan struct{})
 	}
-	cluster := requestIDRaceCluster{servers: make(map[quepaxa.NodeID]*Server), cores: make(map[quepaxa.NodeID]*quepaxa.Core), material: make(map[quepaxa.NodeID]*materializer.Materializer), transport: transport}
+	cluster := requestIDRaceCluster{servers: make(map[quepaxa.NodeID]*Server), cores: make(map[quepaxa.NodeID]*quepaxa.Core), material: make(map[quepaxa.NodeID]*materializer.Materializer), wals: make(map[quepaxa.NodeID]*qlog.WAL), transport: transport}
 	for _, member := range members {
-		core := mustCore(t, member.ID, members, nil, transport)
+		wal, err := qlog.Open(t.TempDir() + "/qlog")
+		if err != nil {
+			t.Fatal(err)
+		}
+		core, err := quepaxa.New(quepaxa.Config{NodeID: member.ID, Cluster: quepaxa.Cluster{Members: members}, WAL: wal, Transport: transport})
+		if err != nil {
+			t.Fatal(err)
+		}
 		material, err := materializer.Open(t.TempDir()+"/state.sqlite", 1)
 		if err != nil {
 			t.Fatal(err)
@@ -220,11 +234,12 @@ func newInMemoryThreePeerCluster(t testing.TB, gated bool) requestIDRaceCluster 
 		server := NewServer(core, material, "cluster", true, nil)
 		cluster.cores[member.ID] = core
 		cluster.material[member.ID] = material
+		cluster.wals[member.ID] = wal
 		cluster.servers[member.ID] = server
 		transport.mu.Lock()
 		transport.cores[member.ID] = core
 		transport.mu.Unlock()
-		t.Cleanup(func() { server.Close(); material.Close() })
+		t.Cleanup(func() { server.Close(); material.Close(); _ = wal.Close() })
 	}
 	return cluster
 }
