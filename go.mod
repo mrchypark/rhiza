@@ -1,6 +1,6 @@
 module github.com/mrchypark/rhiza
 
-go 1.27.3
+go 1.27.4
 
 // v0.9.0 was cached by module proxies from the wrong commit.
 retract v0.9.0
