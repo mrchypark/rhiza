@@ -835,21 +835,27 @@ func (m *Materializer) requestMatches(ctx context.Context, kind types.MutationKi
 		}
 		return record.fingerprint == fingerprint, true, nil
 	}
+	_, found, matches, err := m.requestStatus(ctx, kind, requestID, fingerprint)
+	return matches, found, err
+}
+
+// requestStatus returns the retained receipt and fingerprint match from one lookup.
+func (m *Materializer) requestStatus(ctx context.Context, kind types.MutationKind, requestID string, fingerprint [32]byte) (types.MutationReceipt, bool, bool, error) {
 	reader, err := m.reader()
 	if err != nil {
-		return false, false, err
+		return types.MutationReceipt{}, false, false, err
 	}
 	record, err := scanReceipt(reader.QueryRowContext(ctx, receiptQuery(), kind, requestID), m.idempotencyWindow)
 	if err == sql.ErrNoRows {
-		return true, false, nil
+		return types.MutationReceipt{}, false, true, nil
 	}
 	if err != nil {
-		return false, false, err
+		return types.MutationReceipt{}, false, false, err
 	}
 	if m.Tip() > record.receipt.RetryThroughSlot {
-		return true, false, nil
+		return types.MutationReceipt{}, false, true, nil
 	}
-	return record.fingerprint == fingerprint, true, nil
+	return record.receipt, true, record.fingerprint == fingerprint, nil
 }
 
 func (m *Materializer) receiptInTx(ctx context.Context, tx *sql.Tx, kind types.MutationKind, requestID string) (storedReceipt, bool, error) {
@@ -1830,6 +1836,15 @@ func (m *Materializer) KVRequestMatches(ctx context.Context, command types.KVCom
 	}
 	matches, _, err := m.requestMatches(ctx, types.MutationKV, command.RequestID, fingerprint)
 	return matches, err
+}
+
+// KVRequestStatus returns the retained receipt and fingerprint match in one lookup.
+func (m *Materializer) KVRequestStatus(ctx context.Context, command types.KVCommand) (types.MutationReceipt, bool, bool, error) {
+	fingerprint, err := types.KVFingerprint(command)
+	if err != nil {
+		return types.MutationReceipt{}, false, false, err
+	}
+	return m.requestStatus(ctx, types.MutationKV, command.RequestID, fingerprint)
 }
 
 // NotifyRequestMatches checks whether a request ID is unused or has identical content.

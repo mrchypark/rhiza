@@ -1304,19 +1304,25 @@ func (m *Materializer) GraphMutationReceipt(_ context.Context, requestID string)
 	return request.Receipt, found, err
 }
 
-func (m *Materializer) GraphRequestMatches(_ context.Context, command types.GraphCommand) (bool, error) {
-	m.mu.RLock()
-	defer m.mu.RUnlock()
+func (m *Materializer) GraphRequestMatches(ctx context.Context, command types.GraphCommand) (bool, error) {
+	_, _, matches, err := m.GraphRequestStatus(ctx, command)
+	return matches, err
+}
+
+// GraphRequestStatus returns the retained receipt and fingerprint match in one lookup.
+func (m *Materializer) GraphRequestStatus(_ context.Context, command types.GraphCommand) (types.MutationReceipt, bool, bool, error) {
 	fingerprint, err := types.GraphFingerprint(command)
 	if graphProtocol(m.managedProtocol) {
 		fingerprint, err = types.ManagedGraphIntentFingerprint(command)
 	}
 	if err != nil {
-		return false, err
+		return types.MutationReceipt{}, false, false, err
 	}
+	m.mu.RLock()
+	defer m.mu.RUnlock()
 	g := m.graph
 	if err := m.graphReadableLocked(); err != nil {
-		return false, err
+		return types.MutationReceipt{}, false, false, err
 	}
 	g.mu.RLock()
 	defer g.mu.RUnlock()
@@ -1324,10 +1330,13 @@ func (m *Materializer) GraphRequestMatches(_ context.Context, command types.Grap
 	if found && m.tip > request.Receipt.RetryThroughSlot {
 		found = false
 	}
-	if err != nil || !found {
-		return !found, err
+	if err != nil {
+		return types.MutationReceipt{}, false, false, err
 	}
-	return request.Fingerprint == fingerprint, nil
+	if !found {
+		return types.MutationReceipt{}, false, true, nil
+	}
+	return request.Receipt, true, request.Fingerprint == fingerprint, nil
 }
 
 func (m *Materializer) graphRequestExists(requestID string) (bool, error) {

@@ -2057,6 +2057,46 @@ func TestGraphSlotsKeepFirstFingerprintForDuplicateRequestID(t *testing.T) {
 	}
 }
 
+func TestGraphRequestStatusCombinesReceiptAndMatch(t *testing.T) {
+	ctx := context.Background()
+	m, err := Open(t.TempDir()+"/sqlite.db", 1, 1024)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer m.Close()
+
+	first := types.GraphCommand{RequestID: "status", Cypher: `CREATE (:Item {id: '1'})`}
+	if receipt, found, matches, err := m.GraphRequestStatus(ctx, first); err != nil || found || !matches || receipt != (types.MutationReceipt{}) {
+		t.Fatalf("missing status receipt=%+v found=%v matches=%v err=%v", receipt, found, matches, err)
+	}
+	value, err := types.EncodeGraphCommand(first)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := m.Apply(ctx, 1, value); err != nil {
+		t.Fatal(err)
+	}
+	receipt, found, matches, err := m.GraphRequestStatus(ctx, first)
+	if err != nil || !found || !matches || receipt.Slot != 1 {
+		t.Fatalf("exact status receipt=%+v found=%v matches=%v err=%v", receipt, found, matches, err)
+	}
+	conflict := first
+	conflict.Cypher = `CREATE (:Item {id: '2'})`
+	if got, found, matches, err := m.GraphRequestStatus(ctx, conflict); err != nil || !found || matches || got != receipt {
+		t.Fatalf("conflict status receipt=%+v found=%v matches=%v err=%v", got, found, matches, err)
+	}
+	var nonce [types.ReadBarrierNonceSize]byte
+	for slot := uint64(2); slot <= receipt.RetryThroughSlot+1; slot++ {
+		nonce[0] = byte(slot)
+		if err := m.Apply(ctx, slot, types.EncodeReadBarrier(nonce)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if got, found, matches, err := m.GraphRequestStatus(ctx, first); err != nil || found || !matches || got != (types.MutationReceipt{}) {
+		t.Fatalf("expired status receipt=%+v found=%v matches=%v err=%v", got, found, matches, err)
+	}
+}
+
 func TestGraphIdempotencyReceiptExpiresAtWindowBoundary(t *testing.T) {
 	ctx := context.Background()
 	m, err := Open(filepath.Join(t.TempDir(), "sqlite.db"), 1, 1024)
