@@ -52,6 +52,9 @@ type V1Alpha2AdmissionSnapshot struct {
 }
 
 func (s V1Alpha2AdmissionSnapshot) Authority() V1Alpha2AuthorityView { return s.status.Authority() }
+func (s V1Alpha2AdmissionSnapshot) TargetVoterCount() (int, error) {
+	return s.status.TargetVoterCount()
+}
 func (s V1Alpha2AdmissionSnapshot) EverApplicationReserved() bool {
 	return s.status.EverApplicationReserved()
 }

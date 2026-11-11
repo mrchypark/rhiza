@@ -210,6 +210,19 @@ func TestPhase1ClusterUpdateRejectsOldProvenance(t *testing.T) {
 	}
 }
 
+func TestV1Alpha2VoterCountUpdateIsMonotonic(t *testing.T) {
+	old, increase, decrease := phase1Cluster(), phase1Cluster(), phase1Cluster()
+	old.Spec.VoterCount = 5
+	decrease.Spec.VoterCount = 4
+	if err := ValidateV1Alpha2ClusterUpdate(old, decrease); err == nil {
+		t.Fatal("accepted voterCount shrink")
+	}
+	increase.Spec.VoterCount = 6
+	if err := ValidateV1Alpha2ClusterUpdate(old, increase); err != nil {
+		t.Fatalf("rejected voterCount growth: %v", err)
+	}
+}
+
 func TestPhase1StrictDecode(t *testing.T) {
 	valid := `{"apiVersion":"rhiza.mrchypark.dev/v1alpha2","kind":"RhizaRecovery","metadata":{"name":"r","namespace":"ns","uid":"r-uid"},"spec":{"target":{"name":"cluster","uid":"cluster-uid"},"expectedGeneration":1}}`
 	if _, err := DecodeV1Alpha2Recovery([]byte(valid)); err != nil {

@@ -358,6 +358,14 @@ func peerCertificateKey(conn *quic.Conn) ed25519.PublicKey {
 // the cluster admin token for the read-only sync path.
 func (s *PeerServer) handle(ctx context.Context, certificateKey ed25519.PublicKey, request *peerfb.RequestT) (*peerfb.ResponseT, error) {
 	config, err := s.configurationFor(request)
+	mismatch := err != nil || request.ClusterId != string(s.server.cluster) || request.ConfigId != uint64(config.ConfigID)
+	if mismatch && request.ClusterId == string(s.server.cluster) && certificateKey != nil {
+		current := s.server.core.CurrentCluster()
+		member, known := peerMember(current, quepaxa.NodeID(request.SenderId))
+		if known && subtle.ConstantTimeCompare(certificateKey, member.PublicKey[:]) == 1 && s.server.core.RecoverFrozenMembership(ctx) {
+			config, err = s.configurationFor(request)
+		}
+	}
 	if err != nil || request.ClusterId != string(s.server.cluster) || request.ConfigId != uint64(config.ConfigID) {
 		if request.Operation == peerfb.OperationReadIndex {
 			log.Printf("read-index peer refused reason=identity node_hash=%x sender_hash=%x requested_config=%d current_config=%d", sha256.Sum256([]byte(s.server.core.NodeID())), sha256.Sum256([]byte(request.SenderId)), request.ConfigId, s.server.core.ConfigID())

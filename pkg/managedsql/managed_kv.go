@@ -131,12 +131,10 @@ func (h *Host) validateKVOriginal(ctx context.Context, i node.ManagedStartupIden
 }
 
 func (h *Host) KVMutate(ctx context.Context, operation string, req network.KVMutationRequest) (network.KVMutationResponse, error) {
-	h.mu.Lock()
-	defer h.mu.Unlock()
 	notSubmitted := func(stage SQLSubmissionStage, recovery bool, cause error) (network.KVMutationResponse, error) {
 		return network.KVMutationResponse{}, &KVNotSubmittedError{Stage: stage, RecoveryRequired: recovery, Cause: cause}
 	}
-	if h.closed || !h.mixed() {
+	if !h.mixed() {
 		return notSubmitted(SQLStageAuthority, false, fmt.Errorf("mixed managed Host required"))
 	}
 	_, original, err := types.EncodeManagedKVOriginal(types.KVCommand{RequestID: req.RequestID, Operation: operation, Key: req.Key, Value: req.Value, Expected: req.Expected, ExpectedExists: req.ExpectedExists, TTLMS: req.TTLMS})
@@ -149,6 +147,14 @@ func (h *Host) KVMutate(ctx context.Context, operation string, req network.KVMut
 	}
 	operationCtx, release := h.internalRequestContext(ctx)
 	defer release()
+	if err := h.waitForMembershipTransition(operationCtx); err != nil {
+		return notSubmitted(SQLStageAdmission, false, err)
+	}
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if h.closed {
+		return notSubmitted(SQLStageAuthority, false, fmt.Errorf("mixed managed Host required"))
+	}
 	if err := h.ensureInitialRequestAdmission(operationCtx); err != nil {
 		return notSubmitted(SQLStageAdmission, false, err)
 	}
@@ -160,17 +166,20 @@ func (h *Host) KVMutate(ctx context.Context, operation string, req network.KVMut
 }
 
 func (h *Host) KVGet(ctx context.Context, req network.KVGetRequest) (network.KVGetResponse, error) {
-	h.mu.Lock()
-	defer h.mu.Unlock()
-	if h.closed || !h.mixed() {
+	if !h.mixed() {
 		return network.KVGetResponse{}, fmt.Errorf("mixed managed Host required")
 	}
-	operationCtx, release := h.internalRequestContext(ctx)
-	defer release()
-	if err := h.ensureInitialRequestAdmission(operationCtx); err != nil {
+	operationCtx, n, release, err := h.localReadNode(ctx)
+	if err != nil {
 		return network.KVGetResponse{}, err
 	}
-	return h.node.KVGetManaged(operationCtx, req)
+	defer release()
+	if req.Consistency == "linearizable" {
+		if err := n.WaitForManagedMembershipTransition(operationCtx); err != nil {
+			return network.KVGetResponse{}, err
+		}
+	}
+	return n.KVGetManaged(operationCtx, req)
 }
 
 // RequestStatus observes local retained history, not a durability ACK or write

@@ -68,7 +68,9 @@ quorum이 살아 있으면 새 ID와 새 WAL의 learner를 먼저 추가하고 �
 
 ## 설정과 지원 경계
 
-- `RhizaCluster.spec.voterCount`는 생성 시 3–64로 정하며 이후 변경할 수 없다. autoscaling 설정이 아니다.
+- `RhizaCluster.spec.voterCount`는 3–64이며 생성 뒤에는 늘릴 수만 있다. 감소는 거부한다.
+  initializer는 Deployment replica 목표만 바꾸고, 새 Pod는 host가 실제 WAL과 admission을
+  검증한 add-only QuePaxa 전환을 기록하기 전까지 identity gate에서 대기한다. autoscaling 설정이 아니다.
 - 정상 managed HA는 명시적 append-only profile 9(SQL/KV) 또는 10(Graph)을 사용한다. 7/8 실행이나 자동 old-WAL migration은 지원하지 않는다.
 - public managed Host는 BeforeAck durability를 요구한다. HA object data는 append-only이며 online delete GC를 제공하지 않는다.
 - initializer는 Recreate 전략을 강제하거나 peer/client Service를 자동 관리하지 않는다. rollout, 접근 경로와 Service 구성은 배포에서 별도로 결정한다.

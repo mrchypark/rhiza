@@ -82,8 +82,11 @@ before the main runtime opens. They share the data `emptyDir` with the main
 container. Main-container restart retains that directory; Pod replacement loses
 it and must follow authenticated bootstrap/adoption and catch-up.
 
-The [cluster schema](cluster-crd.yaml) requires `voterCount` from 3 through 64
-and makes it immutable. This is a fixed target, not autoscaling. The initializer
+The [cluster schema](cluster-crd.yaml) requires `voterCount` from 3 through 64.
+It may increase, but is never decreased automatically. The initializer changes
+the Deployment replica target; each new Pod remains behind the identity gate
+until a host records an add-only QuePaxa transition with its live WAL/admission
+proof. This is bounded enrollment, not autoscaling. The initializer
 does not enforce `Recreate` or create/manage peer and client Services; rollout
 policy, network reachability, service exposure and application integration need
 explicit deployment configuration. `Recreate` is not a termination or fencing

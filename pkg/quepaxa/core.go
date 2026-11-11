@@ -37,6 +37,7 @@ var (
 )
 
 const leaderEpochSize Slot = 16
+const frozenRecoveryTimeout = 500 * time.Millisecond
 
 type leaderTiming struct {
 	average time.Duration
@@ -56,6 +57,10 @@ type Transport interface {
 	ReadTip(ctx context.Context, to NodeID) (Slot, error)
 	StageValue(ctx context.Context, to NodeID, hash ValueHash, value []byte) error
 	FetchValue(ctx context.Context, from NodeID, hash ValueHash) ([]byte, error)
+}
+
+type frozenTargetDecisionFetcher interface {
+	FetchFrozenTargetDecisions(context.Context, NodeID, Slot, int, Cluster) ([]DecidedValue, Slot, error)
 }
 
 // Core runs one QuePaxa proposer and recorder per replica.
@@ -85,6 +90,8 @@ type Core struct {
 	generationAnchorHash    [32]byte
 	reconfiguration         *reconfigurationState
 	reconfigurationMu       sync.Mutex
+	frozenRecoveryMu        sync.Mutex
+	frozenRecoveryAt        time.Time
 	priority                func() (Priority, error)
 	recordBeforeAppend      func()
 
@@ -266,6 +273,132 @@ func (c *Core) PendingReconfiguration() (Cluster, bool) {
 	return cloneCluster(c.reconfiguration.target), true
 }
 
+// RecoverFrozenMembership fetches one certified page when a retained voter has
+// missed its terminal transition. It trusts only the certified frozen target's
+// retained routes and requires its exact terminal before activation.
+func (c *Core) RecoverFrozenMembership(ctx context.Context) bool {
+	if !c.reconfigEnabled || c.observer || c.transport == nil {
+		return false
+	}
+	fetcher, ok := c.transport.(frozenTargetDecisionFetcher)
+	if !ok {
+		return false
+	}
+	c.mu.RLock()
+	state := c.reconfiguration
+	tip := c.tip
+	var target Cluster
+	if state != nil {
+		_, retained := state.target.MemberSet()[c.nodeID]
+		if !retained {
+			c.mu.RUnlock()
+			return false
+		}
+		target = cloneCluster(state.target)
+	}
+	c.mu.RUnlock()
+	if state == nil {
+		return false
+	}
+
+	c.frozenRecoveryMu.Lock()
+	now := c.now()
+	if !c.frozenRecoveryAt.IsZero() && now.Sub(c.frozenRecoveryAt) < frozenRecoveryTimeout {
+		c.frozenRecoveryMu.Unlock()
+		return false
+	}
+	c.frozenRecoveryAt = now
+	c.frozenRecoveryMu.Unlock()
+
+	recoveryCtx, cancel := context.WithTimeout(ctx, frozenRecoveryTimeout)
+	defer cancel()
+	from := tip + 1
+	type pageResult struct {
+		values []DecidedValue
+		err    error
+	}
+	results := make(chan pageResult, len(target.Members))
+	pending := 0
+	for _, member := range target.Members {
+		if member.ID == c.nodeID {
+			continue
+		}
+		pending++
+		go func(source NodeID) {
+			values, _, err := fetcher.FetchFrozenTargetDecisions(recoveryCtx, source, from, 128, target)
+			results <- pageResult{values: values, err: err}
+		}(member.ID)
+	}
+	for range pending {
+		var page pageResult
+		select {
+		case <-recoveryCtx.Done():
+			return false
+		case page = <-results:
+		}
+		if page.err != nil || len(page.values) == 0 || page.values[0].Slot != from {
+			continue
+		}
+		contiguous := true
+		for index, value := range page.values {
+			if value.Slot != from+Slot(index) {
+				contiguous = false
+				break
+			}
+		}
+		if !contiguous {
+			continue
+		}
+		hasTerminal, valid := c.validateFrozenPage(page.values, state)
+		if !valid {
+			continue
+		}
+		if err := c.AcceptCertifiedValues(page.values); err != nil {
+			continue
+		}
+		if !hasTerminal {
+			// A frame-bounded page may stop before the terminal. Retaining this
+			// certified prefix lets the next bounded attempt start closer to it.
+			return false
+		}
+		c.mu.RLock()
+		recovered := c.reconfiguration == nil
+		c.mu.RUnlock()
+		return recovered
+	}
+	return false
+}
+
+// validateFrozenPage validates every certificate and binds any terminal to the
+// exact freeze that is installed locally. AcceptCertifiedValues then repeats
+// all sequential transition, prefix, and target checks while applying the page.
+func (c *Core) validateFrozenPage(values []DecidedValue, state *reconfigurationState) (hasTerminal, valid bool) {
+	for _, value := range values {
+		decision, err := c.certifiedDecision(value)
+		if err != nil {
+			return false, false
+		}
+		control, ok, err := decodeReconfiguration(value.Value)
+		if err != nil {
+			return false, false
+		}
+		if !ok || !control.Terminal {
+			continue
+		}
+		if decision.Slot != state.terminal ||
+			control.Freeze != state.freeze ||
+			control.TerminalSlot != state.terminal ||
+			!sameCluster(control.Target, state.target) {
+			return false, false
+		}
+		if err := c.validateDecisionForRecovery(decision, false); err != nil {
+			return false, false
+		}
+		hasTerminal = true
+	}
+	return hasTerminal, true
+}
+
 // LastReconfigurationAbort returns the certified abort terminal revision and
 // its original target. The result is absent after a successful transition.
 func (c *Core) LastReconfigurationAbort() (Slot, Cluster, bool) {
@@ -369,20 +502,32 @@ func (c *Core) proposeOwned(ctx context.Context, value []byte, complete, executi
 			return 0, nil, err
 		}
 	}
-	select {
-	case c.pipeline <- struct{}{}:
-		defer func() { <-c.pipeline }()
-	case <-ctx.Done():
-		return 0, nil, ctx.Err()
-	}
 	if c.reconfigEnabled {
-		c.mu.RLock()
-		frozen := c.reconfiguration != nil
-		c.mu.RUnlock()
-		if frozen {
-			return 0, nil, fmt.Errorf("reconfiguration drain is in progress")
+		for {
+			select {
+			case c.pipeline <- struct{}{}:
+			case <-ctx.Done():
+				return 0, nil, ctx.Err()
+			}
+			c.mu.RLock()
+			frozen := c.reconfiguration != nil
+			c.mu.RUnlock()
+			if !frozen {
+				break
+			}
+			<-c.pipeline
+			if !c.RecoverFrozenMembership(ctx) {
+				return 0, nil, fmt.Errorf("reconfiguration drain is in progress")
+			}
+		}
+	} else {
+		select {
+		case c.pipeline <- struct{}{}:
+		case <-ctx.Done():
+			return 0, nil, ctx.Err()
 		}
 	}
+	defer func() { <-c.pipeline }()
 
 	offeredHash := sha256.Sum256(value)
 	for {
@@ -620,6 +765,9 @@ func (c *Core) ReadIndexExcluding(ctx context.Context, excluded NodeID) (Slot, N
 	return c.readIndexExcluding(ctx, excluded)
 }
 func (c *Core) readIndexExcluding(ctx context.Context, excluded NodeID) (Slot, NodeID, error) {
+	if c.reconfigEnabled {
+		c.RecoverFrozenMembership(ctx)
+	}
 	if c.observer || !c.CanParticipateReadIndex() {
 		c.mu.RLock()
 		frozen := c.reconfiguration != nil

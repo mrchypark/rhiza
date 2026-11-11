@@ -61,7 +61,7 @@ func (h *Host) ValidateManagedRepairOrigin(ctx context.Context, raw []byte) erro
 		if h.cfg.Prepared != nil && !bytes.Equal(handoff.Head, h.cfg.Prepared.View().CapturedHead()) {
 			return fmt.Errorf("prepared source HEAD differs from immutable repair origin")
 		}
-	case operator.V1Alpha2RepairAddThenRemove:
+	case operator.V1Alpha2RepairAddThenRemove, operator.V1Alpha2RepairAdd:
 		if handoff.PreparedConfig == nil || uint64(handoff.PreparedConfig.ConfigID) != plan.ExpectedConfigID || handoff.PreparedSlot <= plan.ExpectedAbortSlot || handoff.RemoveTerminalSlot != 0 || handoff.RemoveTerminalHash != "" || handoff.Survivors.ConfigID != 0 || len(handoff.Survivors.Members) != 0 {
 			return fmt.Errorf("invalid ADD-first prepared source in repair origin")
 		}

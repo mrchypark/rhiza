@@ -83,9 +83,9 @@ func TestRepairV1Alpha2AddFirstPersistsPreparedSourceAndADDPhase(t *testing.T) {
 
 	handoff := addFirstHandoff(t, f, closed)
 	for name, mutate := range map[string]func(*V1Alpha2RepairHandoff){
-		"wrong plan digest": func(h *V1Alpha2RepairHandoff) { h.PlanDigest = strings.Repeat("d", 64) },
+		"wrong plan digest":    func(h *V1Alpha2RepairHandoff) { h.PlanDigest = strings.Repeat("d", 64) },
 		"wrong source binding": func(h *V1Alpha2RepairHandoff) { h.PhysicalBinding = strings.Repeat("e", 64) },
-		"stale source config": func(h *V1Alpha2RepairHandoff) { h.PreparedConfig.ConfigID-- },
+		"stale source config":  func(h *V1Alpha2RepairHandoff) { h.PreparedConfig.ConfigID-- },
 		"old voter absent": func(h *V1Alpha2RepairHandoff) {
 			h.PreparedConfig.Members = slices.DeleteFunc(h.PreparedConfig.Members, func(m quepaxa.Member) bool { return types.NodeID(m.ID) == f.plan.OldNodeID })
 		},
@@ -124,10 +124,10 @@ func TestRepairV1Alpha2AddFirstPersistsPreparedSourceAndADDPhase(t *testing.T) {
 	}
 	add := addFirstCompletion(f.plan, handoff)
 	for name, mutate := range map[string]func(*V1Alpha2RepairCompletion){
-		"wrong config": func(c *V1Alpha2RepairCompletion) { c.ConfigID++ },
-		"wrong target": func(c *V1Alpha2RepairCompletion) { c.FinalVoterIDs = slices.Clone(c.FinalVoterIDs[:2]) },
-		"wrong operation": func(c *V1Alpha2RepairCompletion) { c.OperationID = "other-operation" },
-		"wrong slot": func(c *V1Alpha2RepairCompletion) { c.Slot = handoff.PreparedSlot },
+		"wrong config":      func(c *V1Alpha2RepairCompletion) { c.ConfigID++ },
+		"wrong target":      func(c *V1Alpha2RepairCompletion) { c.FinalVoterIDs = slices.Clone(c.FinalVoterIDs[:2]) },
+		"wrong operation":   func(c *V1Alpha2RepairCompletion) { c.OperationID = "other-operation" },
+		"wrong slot":        func(c *V1Alpha2RepairCompletion) { c.Slot = handoff.PreparedSlot },
 		"wrong plan digest": func(c *V1Alpha2RepairCompletion) { c.PlanDigest = strings.Repeat("0", 64) },
 	} {
 		t.Run("add-proof-"+name, func(t *testing.T) {
@@ -208,6 +208,50 @@ func TestRepairV1Alpha2AddFirstPersistsPreparedSourceAndADDPhase(t *testing.T) {
 	}
 }
 
+func TestAddOnlyEnrollmentRequiresExactOldToNewTerminal(t *testing.T) {
+	ctx := context.Background()
+	f, old := repairTestSetup(t)
+	bootstrap, err := old.status.BootstrapPlan()
+	if err != nil {
+		t.Fatal(err)
+	}
+	f.plan.Sequence = V1Alpha2RepairAdd
+	f.plan.FinalVoterIDs = nil
+	for _, member := range bootstrap.Members {
+		f.plan.FinalVoterIDs = append(f.plan.FinalVoterIDs, types.NodeID(member.Member.ID))
+	}
+	f.plan.FinalVoterIDs = append(f.plan.FinalVoterIDs, f.plan.Replacement.NodeID)
+	slices.Sort(f.plan.FinalVoterIDs)
+	closed, observation, err := BeginV1Alpha2Repair(ctx, f.store, old, old.Authority(), f.plan)
+	if err != nil || observation != V1Alpha2CASApplied {
+		t.Fatalf("begin enrollment: observation=%s error=%v", observation, err)
+	}
+	handoff := addFirstHandoff(t, f, closed)
+	captured, observation, err := CaptureV1Alpha2RepairHandoff(ctx, f.store, closed, closed.Authority(), handoff)
+	if err != nil || observation != V1Alpha2CASApplied {
+		t.Fatalf("capture enrollment source: observation=%s error=%v", observation, err)
+	}
+	completion := addFirstCompletion(f.plan, handoff)
+	bad := completion
+	bad.FinalVoterIDs = slices.Clone(completion.FinalVoterIDs[:len(completion.FinalVoterIDs)-1])
+	if _, _, err := FinishV1Alpha2Repair(ctx, f.store, captured, captured.Authority(), bad); err == nil {
+		t.Fatal("accepted enrollment without the new-configuration roster")
+	}
+	bad = completion
+	bad.ConfigID = f.plan.ExpectedConfigID
+	if _, _, err := FinishV1Alpha2Repair(ctx, f.store, captured, captured.Authority(), bad); err == nil {
+		t.Fatal("accepted enrollment at the old configuration")
+	}
+	finished, observation, err := FinishV1Alpha2Repair(ctx, f.store, captured, captured.Authority(), completion)
+	if err != nil || observation != V1Alpha2CASApplied {
+		t.Fatalf("finish enrollment: observation=%s error=%v", observation, err)
+	}
+	record, ok := finished.Repair()
+	if !ok || record.State != "Completed" || record.AddCompletion != nil || record.Completion == nil || record.Completion.ConfigID != f.plan.ExpectedConfigID+1 || !slices.Equal(record.Completion.FinalVoterIDs, f.plan.FinalVoterIDs) {
+		t.Fatalf("enrollment terminal=%+v", record)
+	}
+}
+
 func TestRepairV1Alpha2CompletedAddFirstRejectsNextRemoveFirstOperation(t *testing.T) {
 	ctx := context.Background()
 	f, old := repairTestSetup(t)
@@ -273,12 +317,18 @@ func TestRepairV1Alpha2CompletedAddFirstRejectsNextRemoveFirstOperation(t *testi
 		t.Fatalf("new REMOVE-first operation was admitted after terminal ADD-first: %v puts=%d", err, f.puts-beforePuts)
 	}
 	retained, err := LoadV1Alpha2Admission(ctx, f.store, phase2Ref)
-	if err != nil { t.Fatal(err) }
+	if err != nil {
+		t.Fatal(err)
+	}
 	record, ok := retained.Repair()
-	if !ok || !reflect.DeepEqual(record, prior) { t.Fatal("rejected successor changed prior terminal/ADD proof") }
+	if !ok || !reflect.DeepEqual(record, prior) {
+		t.Fatal("rejected successor changed prior terminal/ADD proof")
+	}
 	next.Sequence = V1Alpha2RepairAddThenRemove
 	nextClosed, _, err := BeginV1Alpha2Repair(ctx, f.store, completed, completed.Authority(), next)
-	if err != nil { t.Fatalf("new ADD-first successor rejected: %v", err) }
+	if err != nil {
+		t.Fatalf("new ADD-first successor rejected: %v", err)
+	}
 	nextRecord, ok := nextClosed.Repair()
 	if !ok || nextRecord.State != "Closed" || nextRecord.Plan.Sequence != V1Alpha2RepairAddThenRemove || nextRecord.AddCompletion != nil || nextRecord.Plan.OperationID != next.OperationID {
 		t.Fatal("new ADD-first successor inherited prior proof or wrong sequence")
@@ -289,7 +339,9 @@ func TestRepairV1Alpha2CompletedAddFirstRejectsNextRemoveFirstOperation(t *testi
 func TestRepairV1Alpha2HistoricalEmptySequenceRemainsReadableButNewBeginRefuses(t *testing.T) {
 	f, old := repairTestSetup(t)
 	f.plan.Sequence = ""
-	if repairSequence(f.plan) != V1Alpha2RepairRemoveThenAdd { t.Fatal("historical empty sequence changed interpretation") }
+	if repairSequence(f.plan) != V1Alpha2RepairRemoveThenAdd {
+		t.Fatal("historical empty sequence changed interpretation")
+	}
 	for _, sequence := range []V1Alpha2RepairSequence{"", V1Alpha2RepairRemoveThenAdd} {
 		f.plan.Sequence = sequence
 		if _, _, err := BeginV1Alpha2Repair(context.Background(), f.store, old, old.Authority(), f.plan); err == nil || !strings.Contains(err.Error(), "requires ADD-first") || f.puts != 0 {

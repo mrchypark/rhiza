@@ -77,6 +77,13 @@ alone is not admission evidence. Removed voter IDs must not be reused.
 Same-identity rejoin requires the intact original WAL and current certified
 membership; replay into an empty WAL is not a rejoin certificate.
 
+A managed `voterCount` increase is enrollment-only: each extra Pod waits at the
+identity gate, a current voter captures a certified source and proves the old
+configuration quorum, and QuePaxa must verify the learner's WAL/prefix admission
+before recording the old-to-new terminal. The next candidate waits for that
+terminal. Deployment readiness and `kubectl scale` are not admission evidence.
+Lowering the target is rejected; no voter or Pod is removed automatically.
+
 The core APIs are `BeginReconfiguration`, `BeginReconfigurationAt`,
 `FinishReconfigurationAt`, `AbortReconfigurationAt`, `CurrentCluster`, and
 `ClusterForSlot`. Enable it through `quepaxa.Config.EnableReconfiguration`.

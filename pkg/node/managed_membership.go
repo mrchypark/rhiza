@@ -28,6 +28,9 @@ const (
 type ManagedMembershipRequest struct {
 	RepairOperationID string
 	Action            ManagedMembershipAction
+	// AddOnly enrolls one voter without removing OldNodeID. OldNodeID is then
+	// a deterministic current-voter witness for the old configuration quorum.
+	AddOnly           bool
 	ExpectedConfigID  uint
 	ExpectedAbortSlot quepaxa.Slot
 	OldNodeID         quepaxa.NodeID
@@ -74,7 +77,7 @@ func (n *Node) CaptureManagedPreparedRepairSource(ctx context.Context, r Managed
 	abortSlot, _, _ := n.core.LastReconfigurationAbort()
 	_, pending := n.core.PendingReconfiguration()
 	if n.archive == nil || current.ConfigID != r.ExpectedConfigID || abortSlot != r.ExpectedAbortSlot || pending {
-		return ManagedRepairSource{}, network.ErrRequestConflict
+		return ManagedRepairSource{}, fmt.Errorf("prepared repair source config/revision changed: %w", network.ErrRequestConflict)
 	}
 	var oldMember quepaxa.Member
 	oldFound := false
@@ -85,18 +88,23 @@ func (n *Node) CaptureManagedPreparedRepairSource(ctx context.Context, r Managed
 		}
 	}
 	if !oldFound || r.OldWALIdentity == "" {
-		return ManagedRepairSource{}, network.ErrRequestConflict
+		return ManagedRepairSource{}, fmt.Errorf("prepared repair source voter missing: %w", network.ErrRequestConflict)
 	}
 	registered, err := n.managedVoterWALIdentityLocked(ctx, current.ConfigID, abortSlot, oldMember)
 	if err != nil {
 		return ManagedRepairSource{}, err
 	}
 	if registered != r.OldWALIdentity {
-		return ManagedRepairSource{}, network.ErrRequestConflict
+		return ManagedRepairSource{}, fmt.Errorf("prepared repair source WAL changed: %w", network.ErrRequestConflict)
 	}
-	readIndex, _, err := n.core.ReadIndexExcluding(ctx, r.OldNodeID)
+	var readIndex quepaxa.Slot
+	if r.AddOnly {
+		readIndex, _, err = n.core.ReadIndex(ctx)
+	} else {
+		readIndex, _, err = n.core.ReadIndexExcluding(ctx, r.OldNodeID)
+	}
 	if err != nil {
-		return ManagedRepairSource{}, fmt.Errorf("verify current ADD-first quorum: %w", err)
+		return ManagedRepairSource{}, fmt.Errorf("verify current membership quorum: %w", err)
 	}
 	if err := n.core.WaitTip(ctx, readIndex); err != nil {
 		return ManagedRepairSource{}, fmt.Errorf("wait for current ADD-first quorum tip: %w", err)
@@ -109,7 +117,7 @@ func (n *Node) CaptureManagedPreparedRepairSource(ctx context.Context, r Managed
 	abortAfterQuorum, _, _ := n.core.LastReconfigurationAbort()
 	_, pendingAfterQuorum := n.core.PendingReconfiguration()
 	if !reflect.DeepEqual(currentAfterQuorum, current) || abortAfterQuorum != abortSlot || pendingAfterQuorum {
-		return ManagedRepairSource{}, network.ErrRequestConflict
+		return ManagedRepairSource{}, fmt.Errorf("prepared repair source changed after quorum read: %w", network.ErrRequestConflict)
 	}
 	if err := checker.ValidateManagedRepairPreparation(ctx, n.managedStartup.Identity, r, current, abortSlot); err != nil {
 		return ManagedRepairSource{}, err
@@ -119,11 +127,11 @@ func (n *Node) CaptureManagedPreparedRepairSource(ctx context.Context, r Managed
 		return ManagedRepairSource{}, err
 	}
 	if registered != r.OldWALIdentity {
-		return ManagedRepairSource{}, network.ErrRequestConflict
+		return ManagedRepairSource{}, fmt.Errorf("prepared repair source WAL changed after quorum read: %w", network.ErrRequestConflict)
 	}
 	tip := n.core.Tip()
 	if tip <= r.ExpectedAbortSlot {
-		return ManagedRepairSource{}, network.ErrRequestConflict
+		return ManagedRepairSource{}, fmt.Errorf("prepared repair source tip precedes enrollment revision: %w", network.ErrRequestConflict)
 	}
 	if err := n.archive.SyncThrough(ctx, n.core, tip); err != nil {
 		return ManagedRepairSource{}, fmt.Errorf("sync fixed ADD-first source: %w", err)
@@ -144,7 +152,7 @@ func (n *Node) CaptureManagedPreparedRepairSource(ctx context.Context, r Managed
 	}
 	corePrefix, prefixOK := n.core.PrefixHash(tip)
 	if view.Tip() != tip || !prefixOK || view.PrefixHash() != corePrefix {
-		return ManagedRepairSource{}, network.ErrRequestConflict
+		return ManagedRepairSource{}, fmt.Errorf("prepared repair source prefix differs from live source: %w", network.ErrRequestConflict)
 	}
 	currentAfterArchive := n.core.CurrentCluster()
 	currentAfterArchive.Members = append([]quepaxa.Member(nil), currentAfterArchive.Members...)
@@ -155,7 +163,7 @@ func (n *Node) CaptureManagedPreparedRepairSource(ctx context.Context, r Managed
 		return ManagedRepairSource{}, registrationErr
 	}
 	if !reflect.DeepEqual(currentAfterArchive, current) || abortAfterArchive != abortSlot || pendingAfterArchive || n.core.Tip() < tip || registered != r.OldWALIdentity {
-		return ManagedRepairSource{}, network.ErrRequestConflict
+		return ManagedRepairSource{}, fmt.Errorf("prepared repair source changed after archive sync: %w", network.ErrRequestConflict)
 	}
 	preparedConfig := current
 	return ManagedRepairSource{Head: view.CapturedHead(), HeadHash: view.HeadHash(), Survivors: current, PreparedConfig: &preparedConfig, PreparedSlot: tip, PreparedHash: view.PrefixHash()}, nil
@@ -411,6 +419,9 @@ func (n *Node) runManagedMembership(ctx context.Context, r ManagedMembershipRequ
 	if r.Action != ManagedMembershipRemove && r.Action != ManagedMembershipAdd {
 		return network.ErrInvalidRequest
 	}
+	if r.AddOnly && r.Action != ManagedMembershipAdd {
+		return network.ErrInvalidRequest
+	}
 	if r.Addition != nil {
 		member := *r.Addition
 		r.Addition = &member
@@ -484,7 +495,7 @@ func (n *Node) validateManagedMembership(ctx context.Context, change network.Mem
 	if err := checker.ValidateManagedMembership(ctx, i, permit.request, n.core.CurrentCluster(), revision); err != nil {
 		return err
 	}
-	if permit.request.OldNodeID == n.config.NodeID {
+	if permit.request.OldNodeID == n.config.NodeID && !permit.request.AddOnly {
 		return network.ErrInvalidRequest
 	}
 	if permit.request.Action == ManagedMembershipAdd {

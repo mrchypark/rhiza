@@ -4,7 +4,9 @@ import (
 	"context"
 	"errors"
 	"path/filepath"
+	"strings"
 	"testing"
+	"time"
 
 	"github.com/mrchypark/rhiza/pkg/qlog"
 )
@@ -133,6 +135,169 @@ func TestReconfigurationFreezeRequiresCapableQuorum(t *testing.T) {
 	cores["c"].reconfigEnabled = false
 	if _, err := cores["a"].BeginReconfiguration(context.Background(), Cluster{ConfigID: 2, Members: []Member{{ID: "a"}, {ID: "b"}}}); err == nil {
 		t.Fatal("upgraded minority froze a mixed-version quorum")
+	}
+}
+
+func TestRecoverRetainedFrozenVoterFromCertifiedSync(t *testing.T) {
+	for _, recovering := range []bool{true, false} {
+		t.Run(map[bool]string{true: "recover", false: "preserve-failure"}[recovering], func(t *testing.T) {
+			cores, transport := reconfigCluster(t)
+			initial := Cluster{ConfigID: 1, Members: []Member{{ID: "a"}, {ID: "b"}, {ID: "c"}}}
+			wal, err := qlog.Open(filepath.Join(t.TempDir(), "d"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(func() { _ = wal.Close() })
+			learner, err := NewLearner(Config{NodeID: "d", Cluster: initial, WAL: wal, Transport: transport, EnableReconfiguration: true})
+			if err != nil {
+				t.Fatal(err)
+			}
+			for _, core := range append([]*Core{cores["a"], cores["b"], cores["c"]}, learner) {
+				core.reconfigAdmission = func(context.Context, Cluster, Slot, [32]byte) error { return nil }
+			}
+			transport.cores["d"] = learner
+			target := Cluster{ConfigID: 2, Members: []Member{{ID: "a"}, {ID: "b"}, {ID: "c"}, {ID: "d", WALIdentity: learner.WALIdentity()}}}
+			if _, err := cores["a"].BeginReconfiguration(context.Background(), target); err != nil {
+				t.Fatal(err)
+			}
+			transport.dropDecision["b"] = true
+			if err := cores["a"].FinishReconfiguration(context.Background()); err != nil {
+				t.Fatal(err)
+			}
+			if _, pending := cores["b"].PendingReconfiguration(); !pending {
+				t.Fatal("retained voter unexpectedly observed terminal")
+			}
+			if !recovering {
+				transport.down["a"] = true
+				transport.down["c"] = true
+				transport.down["d"] = true
+			}
+			if _, _, err := cores["b"].Propose(context.Background(), []byte("after-terminal")); err != nil {
+				if recovering || !strings.Contains(err.Error(), "reconfiguration drain") {
+					t.Fatalf("proposal error=%v", err)
+				}
+			} else if !recovering {
+				t.Fatal("proposal passed without certified recovery")
+			}
+			_, pending := cores["b"].PendingReconfiguration()
+			if pending == recovering {
+				t.Fatalf("recovered=%t pending=%t", recovering, pending)
+			}
+		})
+	}
+}
+
+func TestRecoverTwoVoterTransitionFromOnlyNewVoter(t *testing.T) {
+	for _, operation := range []string{"read-index", "proposal"} {
+		t.Run(operation, func(t *testing.T) {
+			initial := Cluster{ConfigID: 1, Members: []Member{{ID: "a"}, {ID: "b"}}}
+			transport := &clusterTransport{cores: map[NodeID]*Core{}, down: map[NodeID]bool{}, dropDecision: map[NodeID]bool{}}
+			for _, member := range initial.Members {
+				wal, err := qlog.Open(filepath.Join(t.TempDir(), string(member.ID)))
+				if err != nil {
+					t.Fatal(err)
+				}
+				t.Cleanup(func() { _ = wal.Close() })
+				core := newCore(member.ID, &initial, wal, transport)
+				core.reconfigEnabled = true
+				transport.cores[member.ID] = core
+			}
+			wal, err := qlog.Open(filepath.Join(t.TempDir(), "d"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(func() { _ = wal.Close() })
+			newVoter, err := NewLearner(Config{NodeID: "d", Cluster: initial, WAL: wal, Transport: transport, EnableReconfiguration: true})
+			if err != nil {
+				t.Fatal(err)
+			}
+			for _, core := range []*Core{transport.cores["a"], transport.cores["b"], newVoter} {
+				core.reconfigAdmission = func(context.Context, Cluster, Slot, [32]byte) error { return nil }
+			}
+			transport.cores["d"] = newVoter
+			target := Cluster{ConfigID: 2, Members: []Member{{ID: "a"}, {ID: "b"}, {ID: "d", WALIdentity: newVoter.WALIdentity()}}}
+			if _, err := transport.cores["a"].BeginReconfiguration(context.Background(), target); err != nil {
+				t.Fatal(err)
+			}
+			transport.dropDecision["b"] = true
+			if err := transport.cores["a"].FinishReconfiguration(context.Background()); err != nil {
+				t.Fatal(err)
+			}
+			if _, pending := transport.cores["b"].PendingReconfiguration(); !pending {
+				t.Fatal("retained voter unexpectedly observed terminal")
+			}
+			if _, pending := newVoter.PendingReconfiguration(); pending {
+				t.Fatal("new voter did not retain the terminal")
+			}
+			transport.dropDecision["b"] = false
+			transport.down["a"] = true
+
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+			core := transport.cores["b"]
+			switch operation {
+			case "read-index":
+				if _, _, err := core.ReadIndex(ctx); err != nil {
+					t.Fatalf("read-index from only new-voter route: %v", err)
+				}
+			case "proposal":
+				if _, _, err := core.Propose(ctx, []byte("after-two-to-three")); err != nil {
+					t.Fatalf("proposal from only new-voter route: %v", err)
+				}
+			}
+			if _, pending := core.PendingReconfiguration(); pending {
+				t.Fatal("frozen membership did not recover")
+			}
+		})
+	}
+}
+
+func TestFrozenRecoveryPageRequiresExactCertifiedTerminal(t *testing.T) {
+	cores, transport := reconfigCluster(t)
+	initial := Cluster{ConfigID: 1, Members: []Member{{ID: "a"}, {ID: "b"}, {ID: "c"}}}
+	wal, err := qlog.Open(filepath.Join(t.TempDir(), "d"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = wal.Close() })
+	newVoter, err := NewLearner(Config{NodeID: "d", Cluster: initial, WAL: wal, Transport: transport, EnableReconfiguration: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, core := range append([]*Core{cores["a"], cores["b"], cores["c"]}, newVoter) {
+		core.reconfigAdmission = func(context.Context, Cluster, Slot, [32]byte) error { return nil }
+	}
+	transport.cores["d"] = newVoter
+	target := Cluster{ConfigID: 2, Members: []Member{{ID: "a"}, {ID: "b"}, {ID: "c"}, {ID: "d", WALIdentity: newVoter.WALIdentity()}}}
+	freeze, err := cores["a"].BeginReconfiguration(context.Background(), target)
+	if err != nil {
+		t.Fatal(err)
+	}
+	freezeValue, ok := cores["a"].CertifiedValue(freeze)
+	if !ok {
+		t.Fatal("freeze decision unavailable")
+	}
+	transport.dropDecision["b"] = true
+	if err := cores["a"].FinishReconfiguration(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	core := cores["b"]
+	hasTerminal, valid := core.validateFrozenPage([]DecidedValue{freezeValue}, core.reconfiguration)
+	if hasTerminal || !valid {
+		t.Fatalf("nonterminal page terminal=%t valid=%t", hasTerminal, valid)
+	}
+	terminal, ok := cores["a"].CertifiedValue(cores["a"].Tip())
+	if !ok {
+		t.Fatal("terminal decision unavailable")
+	}
+	hasTerminal, valid = core.validateFrozenPage([]DecidedValue{terminal}, core.reconfiguration)
+	if !hasTerminal || !valid {
+		t.Fatalf("terminal page terminal=%t valid=%t", hasTerminal, valid)
+	}
+	terminal.Certificate = []byte("{}")
+	hasTerminal, valid = core.validateFrozenPage([]DecidedValue{terminal}, core.reconfiguration)
+	if hasTerminal || valid {
+		t.Fatalf("invalid certificate terminal=%t valid=%t", hasTerminal, valid)
 	}
 }
 

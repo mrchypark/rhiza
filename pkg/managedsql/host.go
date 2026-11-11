@@ -52,12 +52,15 @@ type sqlEvidence struct {
 }
 
 type Host struct {
-	mu        sync.Mutex
-	node      *node.Node
-	cfg       Config
-	identity  node.ManagedStartupIdentity
-	authority operator.V1Alpha2AuthorityView
-	closed    bool
+	mu sync.Mutex
+	// Initial admission is the only quorum-dependent setup step. Serialize it
+	// independently so local reads and readiness never queue behind mutations.
+	admissionMu sync.Mutex
+	node        *node.Node
+	cfg         Config
+	identity    node.ManagedStartupIdentity
+	authority   operator.V1Alpha2AuthorityView
+	closed      bool
 	// Immutable after Open publishes the Host. Close cancels admission waits
 	// before acquiring mu, then retains the existing serialized Node drain.
 	admissionLifetime context.Context
@@ -484,17 +487,12 @@ func (h *Host) ValidateManagedSQLRecovery(ctx context.Context, i node.ManagedSta
 }
 
 func (h *Host) Ready(ctx context.Context) error {
-	h.mu.Lock()
-	defer h.mu.Unlock()
-	if h.closed {
-		return fmt.Errorf("SQL host closed")
-	}
-	operationCtx, release := h.internalRequestContext(ctx)
-	defer release()
-	if err := h.ensureInitialRequestAdmission(operationCtx); err != nil {
+	operationCtx, n, release, err := h.localReadNode(ctx)
+	if err != nil {
 		return err
 	}
-	return h.node.CheckManagedLocalRead(operationCtx)
+	defer release()
+	return n.CheckManagedLocalRead(operationCtx)
 }
 
 // RemoveRepairVoter excludes the old voter from consensus only. It does not
@@ -510,6 +508,9 @@ func (h *Host) RemoveRepairVoter(ctx context.Context, repairID string) error {
 	r, err := h.closedRepair(ctx, repairID)
 	if err != nil {
 		return err
+	}
+	if r.Plan.Sequence == operator.V1Alpha2RepairAdd {
+		return fmt.Errorf("add-only enrollment has no voter to remove")
 	}
 	expectedConfig := r.Plan.ExpectedConfigID
 	if r.Plan.Sequence == operator.V1Alpha2RepairAddThenRemove {
@@ -541,8 +542,10 @@ func (h *Host) RemoveRepairVoter(ctx context.Context, repairID string) error {
 	return h.node.ChangeManagedMembership(ctx, request)
 }
 
-// CaptureRepairHandoff pins the verified post-REMOVE source in the same closed
-// repair. A later live HEAD is never substituted for an already captured one.
+// CaptureRepairHandoff pins the verified source in the same closed operation.
+// ADD-first replacement captures after REMOVE; add-only enrollment captures
+// the current roster before its sole ADD. A later live HEAD is never
+// substituted for an already captured one.
 func (h *Host) CaptureRepairHandoff(ctx context.Context, repairID string) (operator.V1Alpha2RepairHandoff, error) {
 	a, err := h.live(ctx)
 	if err != nil {
@@ -556,8 +559,8 @@ func (h *Host) CaptureRepairHandoff(ctx context.Context, repairID string) (opera
 		return *r.PreparedHandoff, nil
 	}
 	var source node.ManagedRepairSource
-	if r.Plan.Sequence == operator.V1Alpha2RepairAddThenRemove {
-		request := node.ManagedMembershipRequest{RepairOperationID: repairID, Action: node.ManagedMembershipAdd, ExpectedConfigID: uint(r.Plan.ExpectedConfigID), ExpectedAbortSlot: quepaxa.Slot(r.Plan.ExpectedAbortSlot), OldNodeID: r.Plan.OldNodeID, OldWALIdentity: r.Plan.OldWALIdentity}
+	if r.Plan.Sequence == operator.V1Alpha2RepairAddThenRemove || r.Plan.Sequence == operator.V1Alpha2RepairAdd {
+		request := node.ManagedMembershipRequest{RepairOperationID: repairID, Action: node.ManagedMembershipAdd, AddOnly: r.Plan.Sequence == operator.V1Alpha2RepairAdd, ExpectedConfigID: uint(r.Plan.ExpectedConfigID), ExpectedAbortSlot: quepaxa.Slot(r.Plan.ExpectedAbortSlot), OldNodeID: r.Plan.OldNodeID, OldWALIdentity: r.Plan.OldWALIdentity}
 		source, err = h.node.CaptureManagedPreparedRepairSource(ctx, request)
 	} else {
 		request := node.ManagedMembershipRequest{RepairOperationID: repairID, Action: node.ManagedMembershipRemove, ExpectedConfigID: uint(r.Plan.ExpectedConfigID), ExpectedAbortSlot: quepaxa.Slot(r.Plan.ExpectedAbortSlot), OldNodeID: r.Plan.OldNodeID, OldWALIdentity: r.Plan.OldWALIdentity}
@@ -571,7 +574,7 @@ func (h *Host) CaptureRepairHandoff(ctx context.Context, repairID string) (opera
 		return operator.V1Alpha2RepairHandoff{}, err
 	}
 	capture := operator.V1Alpha2RepairHandoff{PlanDigest: r.Plan.Digest(), SourceRoot: h.cfg.StorageRoot, SourcePrefix: namespace.FinalPrefix, PhysicalBinding: h.identity.PhysicalBinding, Head: source.Head, HeadHash: fmt.Sprintf("%x", source.HeadHash)}
-	if r.Plan.Sequence == operator.V1Alpha2RepairAddThenRemove {
+	if r.Plan.Sequence == operator.V1Alpha2RepairAddThenRemove || r.Plan.Sequence == operator.V1Alpha2RepairAdd {
 		if source.PreparedConfig == nil || source.PreparedSlot == 0 || source.PreparedHash == ([32]byte{}) {
 			return operator.V1Alpha2RepairHandoff{}, fmt.Errorf("verified ADD-first prepared source required")
 		}
@@ -594,7 +597,8 @@ func (h *Host) CaptureRepairHandoff(ctx context.Context, repairID string) (opera
 }
 
 // AddRepairVoter accepts only the real learner's already registered nonce. The
-// Node independently checks that registration and its QUIC durable-prefix proof.
+// Node independently checks that registration and its QUIC durable-prefix proof
+// for both replacement and add-only enrollment.
 func (h *Host) AddRepairVoter(ctx context.Context, repairID, registeredWALIdentity string) error {
 	h.mu.Lock()
 	closed := h.closed
@@ -612,14 +616,14 @@ func (h *Host) AddRepairVoter(ctx context.Context, repairID, registeredWALIdenti
 	member := quepaxa.Member{ID: r.Plan.Replacement.NodeID, PublicKey: r.Plan.Replacement.PublicKey, PeerURL: r.Plan.Replacement.PeerURL, WALIdentity: registeredWALIdentity}
 	expectedConfig := r.PreparedHandoff.Survivors.ConfigID
 	expectedAbort := quepaxa.Slot(0)
-	if r.Plan.Sequence == operator.V1Alpha2RepairAddThenRemove {
+	if r.Plan.Sequence == operator.V1Alpha2RepairAddThenRemove || r.Plan.Sequence == operator.V1Alpha2RepairAdd {
 		if r.PreparedHandoff.PreparedConfig == nil || uint64(r.PreparedHandoff.PreparedConfig.ConfigID) != r.Plan.ExpectedConfigID {
 			return fmt.Errorf("exact ADD-first prepared configuration required")
 		}
 		expectedConfig = uint(r.PreparedHandoff.PreparedConfig.ConfigID)
 		expectedAbort = quepaxa.Slot(r.Plan.ExpectedAbortSlot)
 	}
-	return h.node.ChangeManagedMembership(ctx, node.ManagedMembershipRequest{RepairOperationID: repairID, Action: node.ManagedMembershipAdd, ExpectedConfigID: expectedConfig, ExpectedAbortSlot: expectedAbort, OldNodeID: r.Plan.OldNodeID, OldWALIdentity: r.Plan.OldWALIdentity, Addition: &member, HandoffHeadHash: r.PreparedHandoff.HeadHash})
+	return h.node.ChangeManagedMembership(ctx, node.ManagedMembershipRequest{RepairOperationID: repairID, Action: node.ManagedMembershipAdd, AddOnly: r.Plan.Sequence == operator.V1Alpha2RepairAdd, ExpectedConfigID: expectedConfig, ExpectedAbortSlot: expectedAbort, OldNodeID: r.Plan.OldNodeID, OldWALIdentity: r.Plan.OldWALIdentity, Addition: &member, HandoffHeadHash: r.PreparedHandoff.HeadHash})
 }
 
 func (h *Host) closedRepair(ctx context.Context, repairID string) (operator.V1Alpha2RepairRecord, error) {
@@ -657,6 +661,9 @@ func (h *Host) ValidateManagedMembership(ctx context.Context, i node.ManagedStar
 	p := r.Plan
 	if request.OldNodeID != p.OldNodeID || request.OldWALIdentity != p.OldWALIdentity || i.Member.Generation != p.Generation || i.Member.DeploymentUID != p.DeploymentUID || i.StorageID != p.StorageID {
 		return fmt.Errorf("managed membership repair binding changed")
+	}
+	if p.Sequence == operator.V1Alpha2RepairAdd && request.Action == node.ManagedMembershipAdd {
+		return h.validateAddOnlyEnrollment(r, request, current, abortSlot)
 	}
 	if p.Sequence == operator.V1Alpha2RepairAddThenRemove && request.Action == node.ManagedMembershipAdd {
 		return h.validateAddFirstRepairAdd(r, request, current, abortSlot)
@@ -722,6 +729,49 @@ func (h *Host) ValidateManagedMembership(ctx context.Context, i node.ManagedStar
 	return nil
 }
 
+func (h *Host) validateAddOnlyEnrollment(r operator.V1Alpha2RepairRecord, request node.ManagedMembershipRequest, current quepaxa.Cluster, abortSlot quepaxa.Slot) error {
+	p, handoff := r.Plan, r.PreparedHandoff
+	if !request.AddOnly || handoff == nil || handoff.PreparedConfig == nil || request.HandoffHeadHash != handoff.HeadHash || request.Addition == nil || request.Addition.ID != p.Replacement.NodeID || request.Addition.PublicKey != p.Replacement.PublicKey || request.Addition.PeerURL != p.Replacement.PeerURL || request.Addition.WALIdentity == "" || request.Addition.URL != "" || request.Addition.LogURL != "" || uint64(request.ExpectedConfigID) != p.ExpectedConfigID || uint64(request.ExpectedAbortSlot) != p.ExpectedAbortSlot {
+		return fmt.Errorf("managed enrollment handoff or learner binding changed")
+	}
+	if uint64(handoff.PreparedConfig.ConfigID) != p.ExpectedConfigID || handoff.PreparedSlot <= p.ExpectedAbortSlot || handoff.PreparedHash == "" {
+		return fmt.Errorf("managed enrollment prepared source changed")
+	}
+	ids := make([]types.NodeID, 0, len(handoff.PreparedConfig.Members)+1)
+	oldFound, replacementFound := false, false
+	for _, member := range handoff.PreparedConfig.Members {
+		if member.ID == p.OldNodeID {
+			oldFound = member.WALIdentity == "" || member.WALIdentity == p.OldWALIdentity
+		}
+		if member.ID == p.Replacement.NodeID {
+			replacementFound = true
+		}
+		ids = append(ids, types.NodeID(member.ID))
+	}
+	ids = append(ids, p.Replacement.NodeID)
+	slices.Sort(ids)
+	if !oldFound || replacementFound || !slices.Equal(ids, p.FinalVoterIDs) || len(current.Members) > len(handoff.PreparedConfig.Members) {
+		return fmt.Errorf("managed enrollment source or final roster changed")
+	}
+	if current.ConfigID == request.ExpectedConfigID {
+		if abortSlot != request.ExpectedAbortSlot || !reflect.DeepEqual(current, *handoff.PreparedConfig) {
+			return fmt.Errorf("managed enrollment source configuration/revision changed")
+		}
+	} else if current.ConfigID != request.ExpectedConfigID+1 || len(current.Members) != len(p.FinalVoterIDs) || !slices.Equal(sortedCurrentIDs(current), p.FinalVoterIDs) {
+		return fmt.Errorf("managed enrollment target configuration changed")
+	}
+	return nil
+}
+
+func sortedCurrentIDs(current quepaxa.Cluster) []types.NodeID {
+	ids := make([]types.NodeID, 0, len(current.Members))
+	for _, member := range current.Members {
+		ids = append(ids, types.NodeID(member.ID))
+	}
+	slices.Sort(ids)
+	return ids
+}
+
 func (h *Host) ValidateManagedRepairPreparation(ctx context.Context, i node.ManagedStartupIdentity, request node.ManagedMembershipRequest, current quepaxa.Cluster, abortSlot quepaxa.Slot) error {
 	if i != h.identity || request.Action != node.ManagedMembershipAdd || request.Addition != nil || request.HandoffHeadHash != "" {
 		return fmt.Errorf("managed ADD-first preparation identity changed")
@@ -734,7 +784,7 @@ func (h *Host) ValidateManagedRepairPreparation(ctx context.Context, i node.Mana
 	if err := validateRepairSequenceProfile(p.Sequence, h.cfg.Plan.ApplicationProtocol); err != nil {
 		return err
 	}
-	if p.Sequence != operator.V1Alpha2RepairAddThenRemove || r.PreparedHandoff != nil || r.AddCompletion != nil || r.Completion != nil || request.OldNodeID != p.OldNodeID || request.OldWALIdentity != p.OldWALIdentity || uint64(request.ExpectedConfigID) != p.ExpectedConfigID || uint64(request.ExpectedAbortSlot) != p.ExpectedAbortSlot || uint64(current.ConfigID) != p.ExpectedConfigID || uint64(abortSlot) != p.ExpectedAbortSlot || i.Member.Generation != p.Generation || i.Member.DeploymentUID != p.DeploymentUID || i.StorageID != p.StorageID {
+	if (p.Sequence != operator.V1Alpha2RepairAddThenRemove && p.Sequence != operator.V1Alpha2RepairAdd) || request.AddOnly != (p.Sequence == operator.V1Alpha2RepairAdd) || r.PreparedHandoff != nil || r.AddCompletion != nil || r.Completion != nil || request.OldNodeID != p.OldNodeID || request.OldWALIdentity != p.OldWALIdentity || uint64(request.ExpectedConfigID) != p.ExpectedConfigID || uint64(request.ExpectedAbortSlot) != p.ExpectedAbortSlot || uint64(current.ConfigID) != p.ExpectedConfigID || uint64(abortSlot) != p.ExpectedAbortSlot || i.Member.Generation != p.Generation || i.Member.DeploymentUID != p.DeploymentUID || i.StorageID != p.StorageID {
 		return fmt.Errorf("exact open ADD-first source intent required")
 	}
 	oldFound := false
@@ -745,7 +795,9 @@ func (h *Host) ValidateManagedRepairPreparation(ctx context.Context, i node.Mana
 			if member.WALIdentity != "" && member.WALIdentity != p.OldWALIdentity {
 				return fmt.Errorf("old voter WAL identity changed before ADD-first capture")
 			}
-			continue
+			if p.Sequence != operator.V1Alpha2RepairAdd {
+				continue
+			}
 		}
 		if member.ID == p.Replacement.NodeID {
 			return fmt.Errorf("replacement already appears in ADD-first source configuration")
@@ -817,16 +869,19 @@ func sameRepairClusterMembers(actual, expected quepaxa.Cluster) bool {
 }
 
 func (h *Host) Execute(ctx context.Context, req ExecuteRequest) (ExecuteResponse, error) {
-	h.mu.Lock()
-	defer h.mu.Unlock()
-	if h.closed {
-		return ExecuteResponse{}, &SQLNotSubmittedError{Stage: SQLStageAuthority, Cause: fmt.Errorf("SQL host closed")}
-	}
 	if err := network.ValidateExecuteRequest(req); err != nil {
 		return ExecuteResponse{}, &SQLNotSubmittedError{Stage: SQLStageValidation, Cause: err}
 	}
 	operationCtx, release := h.internalRequestContext(ctx)
 	defer release()
+	if err := h.waitForMembershipTransition(operationCtx); err != nil {
+		return ExecuteResponse{}, &SQLNotSubmittedError{Stage: SQLStageAdmission, Cause: err}
+	}
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if h.closed {
+		return ExecuteResponse{}, &SQLNotSubmittedError{Stage: SQLStageAuthority, Cause: fmt.Errorf("SQL host closed")}
+	}
 	if err := h.ensureInitialRequestAdmission(operationCtx); err != nil {
 		return ExecuteResponse{}, &SQLNotSubmittedError{Stage: SQLStageAdmission, Cause: err}
 	}
@@ -845,17 +900,17 @@ func (h *Host) RecoverPending(ctx context.Context) error {
 }
 
 func (h *Host) Query(ctx context.Context, req QueryRequest) (QueryResponse, error) {
-	h.mu.Lock()
-	defer h.mu.Unlock()
-	if h.closed {
-		return QueryResponse{}, h.logQueryFailure("host_closed", fmt.Errorf("SQL host closed"))
-	}
-	operationCtx, release := h.internalRequestContext(ctx)
-	defer release()
-	if err := h.ensureInitialRequestAdmission(operationCtx); err != nil {
+	operationCtx, n, release, err := h.localReadNode(ctx)
+	if err != nil {
 		return QueryResponse{}, h.logQueryFailure("host_initial_admission", err)
 	}
-	return h.node.QueryManagedSQL(operationCtx, req)
+	defer release()
+	if req.Consistency == "linearizable" {
+		if err := n.WaitForManagedMembershipTransition(operationCtx); err != nil {
+			return QueryResponse{}, err
+		}
+	}
+	return n.QueryManagedSQL(operationCtx, req)
 }
 
 func managedHostQueryDiagnostic(stage string) string {

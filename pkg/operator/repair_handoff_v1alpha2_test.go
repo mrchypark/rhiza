@@ -264,7 +264,7 @@ func TestRepairV1Alpha2HandoffSchema(t *testing.T) {
 	planSchema := repair["properties"].(map[string]any)["plan"].(map[string]any)
 	planProperties := planSchema["properties"].(map[string]any)
 	sequence := planProperties["sequence"].(map[string]any)
-	if !slices.Equal(sequence["enum"].([]any), []any{"removeThenAdd", "addThenRemove"}) || slices.ContainsFunc(planSchema["required"].([]any), func(value any) bool {
+	if !slices.Equal(sequence["enum"].([]any), []any{"removeThenAdd", "addThenRemove", "add"}) || slices.ContainsFunc(planSchema["required"].([]any), func(value any) bool {
 		field, ok := value.(string)
 		return ok && field == "sequence"
 	}) {

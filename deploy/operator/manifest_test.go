@@ -118,7 +118,7 @@ func TestHAContractSchemas(t *testing.T) {
 			for _, raw := range rules {
 				foundRules[raw.(map[string]any)["rule"].(string)] = true
 			}
-			for _, rule := range []string{"self.voterCount == oldSelf.voterCount"} {
+			for _, rule := range []string{"self.voterCount >= oldSelf.voterCount"} {
 				if !foundRules[rule] {
 					t.Fatalf("missing cluster transition rule %q", rule)
 				}

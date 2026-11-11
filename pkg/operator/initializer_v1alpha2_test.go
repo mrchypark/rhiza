@@ -195,6 +195,25 @@ func (s *phase9Server) roundTrip(r *http.Request) (*http.Response, error) {
 			}
 			return phase2Response(201, s.deployment), nil
 		}
+		if r.Method == http.MethodPut {
+			body, err := io.ReadAll(r.Body)
+			if err != nil {
+				s.t.Fatal(err)
+			}
+			var obj map[string]any
+			if json.Unmarshal(body, &obj) != nil || s.deployment == "" {
+				return phase2Response(400, "invalid update"), nil
+			}
+			var current map[string]any
+			_ = json.Unmarshal([]byte(s.deployment), &current)
+			if asObject(obj["metadata"])["resourceVersion"] != asObject(current["metadata"])["resourceVersion"] {
+				return phase2Response(409, "conflict"), nil
+			}
+			meta := asObject(obj["metadata"])
+			meta["resourceVersion"] = "92"
+			s.deployment = string(mustManagedJSON(obj))
+			return phase2Response(200, s.deployment), nil
+		}
 		if r.Method != http.MethodGet {
 			s.t.Fatalf("unexpected deployment request: %s", r.Method)
 		}
@@ -285,6 +304,79 @@ func TestPhase9InitializerCreatesOnceAndPreservesStatus(t *testing.T) {
 	if !strings.Contains(s.cluster, `"unrelated":{"keep":true}`) {
 		t.Fatal("unrelated status lost")
 	}
+}
+
+func TestManagedScaleGrowsReplicaTargetWithoutShrinking(t *testing.T) {
+	s, kube := phase9Setup(t, phase9CurrentManagedCluster())
+	if _, err := ReconcileV1Alpha2ManagedInitialization(context.Background(), kube, phase2Ref, phase9RuntimeProfile()); err != nil {
+		t.Fatal(err)
+	}
+	consume := jsonDecode(t, s.cluster)
+	consumeStatus := asObject(consume["status"])
+	asObject(consumeStatus["applicationInit"])["state"] = "Consumed"
+	asObject(consumeStatus["applicationInit"])["initialEvidenceDigest"] = strings.Repeat("a", 64)
+	asObject(consumeStatus["authority"])["evidence"] = map[string]any{"schema": "empty"}
+	s.cluster = string(mustManagedJSON(consume))
+
+	setTarget := func(count int) {
+		s.mu9.Lock()
+		defer s.mu9.Unlock()
+		obj := jsonDecode(s.t, s.cluster)
+		asObject(obj["spec"])["voterCount"] = count
+		s.cluster = string(mustManagedJSON(obj))
+	}
+	replicas := func() int {
+		s.mu9.Lock()
+		defer s.mu9.Unlock()
+		return int(number(asObject(asObject(jsonDecode(s.t, s.deployment))["spec"])["replicas"]))
+	}
+	// A direct Kubernetes scale changes Pod count only. It must not create a
+	// membership intent or make the initializer treat the extra replica as a voter.
+	s.mu9.Lock()
+	deployment := jsonDecode(s.t, s.deployment)
+	asObject(deployment["spec"])["replicas"] = 4
+	s.deployment = string(mustManagedJSON(deployment))
+	s.mu9.Unlock()
+	before := s.cluster
+	if _, err := ReconcileV1Alpha2ManagedInitialization(context.Background(), kube, phase2Ref, phase9RuntimeProfile()); err != nil {
+		t.Fatal(err)
+	}
+	if got := replicas(); got != 4 {
+		t.Fatalf("bare kubectl scale changed replicas to %d", got)
+	}
+	if s.cluster != before || asObject(asObject(jsonDecode(t, s.cluster)["status"])["repair"]) != nil {
+		t.Fatal("bare kubectl scale fabricated membership or changed status")
+	}
+	setTarget(4)
+	if _, err := ReconcileV1Alpha2ManagedInitialization(context.Background(), kube, phase2Ref, phase9RuntimeProfile()); err != nil {
+		t.Fatal(err)
+	}
+	if got := replicas(); got != 4 {
+		t.Fatalf("3->4 replicas=%d", got)
+	}
+	setTarget(5)
+	if _, err := ReconcileV1Alpha2ManagedInitialization(context.Background(), kube, phase2Ref, phase9RuntimeProfile()); err != nil {
+		t.Fatal(err)
+	}
+	if got := replicas(); got != 5 {
+		t.Fatalf("4->5 replicas=%d", got)
+	}
+	setTarget(3)
+	if _, err := ReconcileV1Alpha2ManagedInitialization(context.Background(), kube, phase2Ref, phase9RuntimeProfile()); err != nil {
+		t.Fatalf("lower target must be inert: %v", err)
+	}
+	if got := replicas(); got != 5 {
+		t.Fatalf("manual lower target or kubectl-scale drift changed replicas to %d", got)
+	}
+}
+
+func jsonDecode(t *testing.T, raw string) map[string]any {
+	t.Helper()
+	var value map[string]any
+	if json.Unmarshal([]byte(raw), &value) != nil {
+		t.Fatal("invalid fixture JSON")
+	}
+	return value
 }
 
 func TestPhase9InitializerRejectsMissingIntent(t *testing.T) {
