@@ -326,7 +326,7 @@ cleanup() {
 }
 trap cleanup EXIT
 trap 'exit 1' HUP INT TERM
-kind get clusters > "$logs/clusters-before.txt"
+kind get clusters > "$logs/clusters-before.txt" 2>&1 || true
 if grep -Fx "$cluster" "$logs/clusters-before.txt" >/dev/null; then exit 1; fi
 owned=1
 kind create cluster --name "$cluster" --kubeconfig "$kubeconfig" --wait 120s > "$logs/create.txt" 2>&1
