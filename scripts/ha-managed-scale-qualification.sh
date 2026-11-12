@@ -243,13 +243,31 @@ managed_functional_stop_load() {
 }
 
 managed_functional_start_survivor_load() {
-  k -n "$namespace" exec "$functional_client_pod" -c client -- sh -c 'rm -f /work/stop; nohup sh /load/load.sh write > /work/one-write.tsv 2>&1 & nohup sh /load/load.sh linear > /work/one-read.tsv 2>&1 &'
+  # shellcheck disable=SC2016 # The remote shell owns $! and wait targets.
+  k -n "$namespace" exec "$functional_client_pod" -c client -- sh -c '
+    rm -f /work/stop /work/one-done
+    sh /load/load.sh write > /work/one-write.tsv 2>&1 & w=$!
+    sh /load/load.sh linear > /work/one-read.tsv 2>&1 & r=$!
+    wait $w
+    wait $r
+    touch /work/one-done
+  ' > "$logs/functional-survivor-client.log" 2>&1 &
+  functional_survivor_pid=$!
   sleep 2
 }
 
 managed_functional_stop_survivor_load() {
   k -n "$namespace" exec "$functional_client_pod" -c client -- touch /work/stop >/dev/null 2>&1 || :
-  sleep 12
+  mfssl_deadline=$(( $(date +%s) + 30 ))
+  while :; do
+    k -n "$namespace" exec "$functional_client_pod" -c client -- test -f /work/one-done >/dev/null 2>&1 && break
+    [ "$(date +%s)" -lt "$mfssl_deadline" ] || { echo 'one-survivor load did not stop' >&2; return 1; }
+    sleep 1
+  done
+  if [ -n "${functional_survivor_pid-}" ]; then
+    wait "$functional_survivor_pid" 2>/dev/null || :
+    functional_survivor_pid=
+  fi
   k -n "$namespace" exec "$functional_client_pod" -c client -- cat /work/one-write.tsv > "$logs/functional-one-writes.tsv" 2>/dev/null || :
   k -n "$namespace" exec "$functional_client_pod" -c client -- cat /work/one-read.tsv > "$logs/functional-one-reads.tsv" 2>/dev/null || :
   k -n "$namespace" exec "$functional_client_pod" -c client -- touch /work/probe-done >/dev/null 2>&1 || :
@@ -294,6 +312,10 @@ managed_functional_capture() {
   if [ -n "${functional_client_pod-}" ]; then
     k -n "$namespace" get job,pod -l rhiza-ci-owner=harness -o json > "$logs/functional-client-state.json" 2>/dev/null || :
     k -n "$namespace" exec "$functional_client_pod" -c client -- touch /work/stop >/dev/null 2>&1 || :
+    if [ -n "${functional_survivor_pid-}" ]; then
+      wait "$functional_survivor_pid" 2>/dev/null || :
+      functional_survivor_pid=
+    fi
     k -n "$namespace" logs job/functional-load --all-containers=true > "$logs/functional-load.log" 2> "$logs/functional-load-errors.txt" || :
     awk -F '\t' '$3=="write"' "$logs/functional-load.log" > "$logs/functional-writes.tsv" 2>/dev/null || :
     awk -F '\t' '$3=="linearizable-read"' "$logs/functional-load.log" > "$logs/functional-reads.tsv" 2>/dev/null || :
@@ -477,6 +499,35 @@ managed_functional_self_test() (
   }
   managed_functional_stage up-3
   [ "$(cat "$scratch/stage-forwarded")" = up-3 ]
+  functional_survivor_pid=
+  survivor_stopped=0
+  sleep() { :; }
+  k() {
+    case "$*" in
+      *"exec load-pod -c client -- sh -c"*) printf '%s\n' "$*" > "$scratch/survivor-command" ;;
+      *"exec load-pod -c client -- touch /work/stop"*) survivor_stopped=1 ;;
+      *"exec load-pod -c client -- test -f /work/one-done"*) [ "$survivor_stopped" = 1 ] ;;
+      *"exec load-pod -c client -- cat /work/one-write.tsv"*) printf '1\tone-survivor\twrite\t1\t503\t0\tunavailable\n' ;;
+      *"exec load-pod -c client -- cat /work/one-read.tsv"*) printf '2\tone-survivor\tlinearizable-read\t2\t503\t0\tunavailable\n' ;;
+      *"exec load-pod -c client -- touch /work/probe-done"*) ;;
+      *"wait --for=condition=complete job/functional-load"*) ;;
+      *) return 97 ;;
+    esac
+  }
+  managed_functional_start_survivor_load
+  wait "$functional_survivor_pid"
+  grep -F '/load/load.sh write' "$scratch/survivor-command" >/dev/null
+  grep -F '/load/load.sh linear' "$scratch/survivor-command" >/dev/null
+  # shellcheck disable=SC2016 # Verify the remote shell retains its variables.
+  grep -F 'wait $w' "$scratch/survivor-command" >/dev/null
+  # shellcheck disable=SC2016 # Verify the remote shell retains its variables.
+  grep -F 'wait $r' "$scratch/survivor-command" >/dev/null
+  if grep -F 'nohup' "$scratch/survivor-command" >/dev/null; then return 1; fi
+  : > "$scratch/functional-writes.tsv"
+  : > "$scratch/functional-reads.tsv"
+  managed_functional_stop_survivor_load
+  [ "$(awk -F '\t' '$2=="one-survivor" && $3=="write"{n++} END{print n+0}' "$scratch/functional-one-writes.tsv")" -gt 0 ]
+  [ "$(awk -F '\t' '$2=="one-survivor" && $3=="linearizable-read"{n++} END{print n+0}' "$scratch/functional-one-reads.tsv")" -gt 0 ]
   printf '%s\n' 'PASS: managed functional scale oracles'
 )
 
