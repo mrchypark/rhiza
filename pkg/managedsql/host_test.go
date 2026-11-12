@@ -55,6 +55,7 @@ type sqlWireControl struct {
 	putReadGateBytes        int
 	putReadErrors           chan error
 	putReadFailure          func(*http.Request, error)
+	ownedClose              atomic.Int64
 	// Evaluated before body reads/object-map lock. The owner must fail its
 	// test on predicate observation errors rather than silently passing them.
 	putGate func(context.Context, string) bool
@@ -93,6 +94,49 @@ func (l *sqlWireCloseLifecycle) observePUTFailures(t *testing.T, fixture *sqlSta
 			default:
 			}
 		}
+	}
+}
+
+func expectedOwnedClosePUTReadFailure(control *sqlWireControl, r *http.Request, err error) bool {
+	prefix := "/bucket/" + control.finalPrefix + "/"
+	return control.ownedClose.Load() > 0 && r.Method == http.MethodPut && errors.Is(r.Context().Err(), context.Canceled) && errors.Is(err, io.ErrUnexpectedEOF) && strings.HasPrefix(r.URL.Path, prefix) && len(r.URL.Path) > len(prefix)
+}
+
+func TestOwnedClosePUTReadFailureClassification(t *testing.T) {
+	control := &sqlWireControl{finalPrefix: "owned"}
+	request := func(method, path string, canceled bool) *http.Request {
+		r := httptest.NewRequest(method, "http://fixture"+path, strings.NewReader("partial"))
+		if canceled {
+			ctx, cancel := context.WithCancel(r.Context())
+			cancel()
+			r = r.WithContext(ctx)
+		}
+		return r
+	}
+	path := "/bucket/owned/checkpoint/CURRENT"
+	control.ownedClose.Store(1)
+	if !expectedOwnedClosePUTReadFailure(control, request(http.MethodPut, path, true), io.ErrUnexpectedEOF) {
+		t.Fatal("owned close cancellation was not recognized")
+	}
+	for _, test := range []struct {
+		name    string
+		request *http.Request
+		err     error
+	}{
+		{"outside owned namespace", request(http.MethodPut, "/bucket/other/checkpoint/CURRENT", true), io.ErrUnexpectedEOF},
+		{"non-canceled truncation", request(http.MethodPut, path, false), io.ErrUnexpectedEOF},
+		{"other read error", request(http.MethodPut, path, true), io.EOF},
+		{"wrong method", request(http.MethodGet, path, true), io.ErrUnexpectedEOF},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			if expectedOwnedClosePUTReadFailure(control, test.request, test.err) {
+				t.Fatal("unexpected PUT read failure was masked")
+			}
+		})
+	}
+	control.ownedClose.Store(0)
+	if expectedOwnedClosePUTReadFailure(control, request(http.MethodPut, path, true), io.ErrUnexpectedEOF) {
+		t.Fatal("canceled truncation without an owned close was masked")
 	}
 }
 
@@ -221,6 +265,12 @@ func sqlWireStore(t *testing.T) (*httptest.Server, *sqlWireControl) {
 				if control.putReadFailure != nil {
 					control.putReadFailure(r, err)
 					w.WriteHeader(http.StatusBadRequest)
+					return
+				}
+				if expectedOwnedClosePUTReadFailure(control, r, err) {
+					// The body was never copied into objects; only a complete
+					// ReadAll may commit it.
+					w.WriteHeader(http.StatusRequestTimeout)
 					return
 				}
 				if control.putReadErrors != nil {
@@ -400,6 +450,8 @@ func (f *sqlStatusFixture) open(ctx context.Context, cfg Config) (*Host, error) 
 }
 
 func (f *sqlStatusFixture) closeHost(host *Host) error {
+	f.source.ownedClose.Add(1)
+	defer f.source.ownedClose.Add(-1)
 	if f.closeLifecycle != nil {
 		f.closeLifecycle.closing.Store(true)
 	}
