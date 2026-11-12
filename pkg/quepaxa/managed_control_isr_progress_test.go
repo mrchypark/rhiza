@@ -166,7 +166,8 @@ func TestObserveManagedControlRejectsNewOrdinaryReferenceDuringISRAdvance(t *tes
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
 	cores, base := newManagedControlRaceCluster(t, nil)
-	core := cores["n2"]
+	core := cores["n1"] // observe a remote recorder so gate completion establishes its local ISR
+	proposer := cores["n2"]
 	gate := &managedControlStepGate{
 		clusterTransport: base.clusterTransport,
 		step4Held:        make(chan struct{}, 2), step4Release: make(chan struct{}),
@@ -176,6 +177,7 @@ func TestObserveManagedControlRejectsNewOrdinaryReferenceDuringISRAdvance(t *tes
 		memberCore.transport = gate
 	}
 	managedControlRacePrefix(t, core)
+	requireManagedControlSharedPrefix(t, ctx, core, proposer)
 	proposalCtx, cancelProposal := context.WithCancel(ctx)
 	t.Cleanup(func() {
 		cancelProposal()
@@ -192,13 +194,18 @@ func TestObserveManagedControlRejectsNewOrdinaryReferenceDuringISRAdvance(t *tes
 	})
 	control := EncodeReadBarrier([ReadBarrierNonceSize]byte{17, 18, 19})
 	proposalDone := make(chan error, 1)
-	go func() { _, _, err := core.Propose(proposalCtx, control); proposalDone <- err }()
+	go func() { _, _, err := proposer.Propose(proposalCtx, control); proposalDone <- err }()
 	for i := 0; i < 2; i++ {
 		select {
 		case <-gate.step4Held:
 		case <-ctx.Done():
 			t.Fatalf("actual Step-4 responses were not held: %v", ctx.Err())
 		}
+	}
+	select {
+	case <-base.localSynced:
+	case <-ctx.Done():
+		t.Fatalf("observer local Step-4 ISR was not durable: %v", ctx.Err())
 	}
 	var injected atomic.Bool
 	var observationErr error
