@@ -156,7 +156,7 @@ func ValidateV1Alpha2ClusterUpdate(old, next V1Alpha2Cluster) error {
 	if err := validateV1Alpha2MetadataUpdate(old.Metadata, next.Metadata); err != nil {
 		return err
 	}
-	if !reflect.DeepEqual(old.Spec.GenesisIntent, next.Spec.GenesisIntent) || old.Spec.LogicalID != next.Spec.LogicalID || next.Spec.VoterCount < old.Spec.VoterCount || !reflect.DeepEqual(old.Spec.Workload, next.Spec.Workload) {
+	if !reflect.DeepEqual(old.Spec.GenesisIntent, next.Spec.GenesisIntent) || old.Spec.LogicalID != next.Spec.LogicalID || next.Spec.VoterCount < old.Spec.VoterCount-1 || !reflect.DeepEqual(old.Spec.Workload, next.Spec.Workload) {
 		return fmt.Errorf("unsupported cluster identity or workload update")
 	}
 	return nil

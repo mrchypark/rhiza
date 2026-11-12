@@ -659,6 +659,9 @@ func (h *Host) ValidateManagedMembership(ctx context.Context, i node.ManagedStar
 		return err
 	}
 	p := r.Plan
+	if p.Sequence == operator.V1Alpha2RepairLeave {
+		return h.validateManagedLeave(r, request, current, abortSlot)
+	}
 	if request.OldNodeID != p.OldNodeID || request.OldWALIdentity != p.OldWALIdentity || i.Member.Generation != p.Generation || i.Member.DeploymentUID != p.DeploymentUID || i.StorageID != p.StorageID {
 		return fmt.Errorf("managed membership repair binding changed")
 	}

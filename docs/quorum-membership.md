@@ -68,12 +68,18 @@ authenticated ADD-first transition under a surviving quorum. Readiness, replica
 count, Pod deletion and elapsed time do not prove that an old incarnation is
 stopped or that its storage work is complete.
 
-For an embedded database, this document exposes only an explicit, confirmed
-removal through `DB.ChangeMembership`; callers must establish the exact old
-incarnation and its exclusion. It is not inferred from a missing Pod. Lowering
-`voterCount` is rejected, and no managed leave workflow is documented as
-available. The operator remains part of the genesis/bootstrap and separately
-authorized DR boundary; this does not claim that automatic DR exists.
+Managed leave is explicit and staged: with the operator still off after genesis,
+lower the desired `voterCount` by one (minimum 3), then scale the Deployment down
+one. Verify the actual removed Pod's ID; never predict the Deployment victim.
+From a surviving Host/service, call the
+authenticated private `POST /leave-voter` with `{"node_id":"<actual-id>"}`, then
+wait for the certified exact target configuration and a live write/readback.
+
+Pod disappearance does not invoke leave, and managed leave uses no fence. A
+removed voter may not re-enroll. It does not claim storage completion or DR. If
+the response is pending or unknown, retry the same node ID only while the current
+repair record exists; there is no indefinite historical replay claim. Existing
+direct embedded `DB.ChangeMembership` behavior is unchanged.
 
 ## Lost voter example
 
@@ -105,7 +111,8 @@ identity gate, a current voter captures a certified source and proves the old
 configuration quorum, and QuePaxa must verify the learner's WAL/prefix admission
 before recording the old-to-new terminal. The next candidate waits for that
 terminal. Deployment readiness and `kubectl scale` are not admission evidence.
-Lowering the target is rejected; no voter or Pod is removed automatically.
+A managed `voterCount` decrease is removed only through the explicit staged leave
+contract above, one voter at a time; no voter or Pod is removed automatically.
 
 The core APIs are `BeginReconfiguration`, `BeginReconfigurationAt`,
 `FinishReconfigurationAt`, `AbortReconfigurationAt`, `CurrentCluster`, and

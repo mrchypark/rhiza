@@ -78,6 +78,9 @@ func (h *Host) ReplaceVoter(ctx context.Context, plan operator.V1Alpha2RepairPla
 	if plan.Sequence == operator.V1Alpha2RepairAdd {
 		return h.enrollVoter(ctx, a, plan)
 	}
+	if plan.Sequence == operator.V1Alpha2RepairLeave {
+		return fmt.Errorf("managed leave must use the explicit leave coordinator")
+	}
 	return h.replaceVoterAddFirst(ctx, a, plan)
 }
 
@@ -85,7 +88,7 @@ func validateRepairSequenceProfile(sequence operator.V1Alpha2RepairSequence, app
 	if !sqlpolicy.IsManagedAppendOnlyApplicationProtocol(applicationProtocol) {
 		return fmt.Errorf("managed append-only application protocol required; profiles 7/8 are retired")
 	}
-	if sequence != operator.V1Alpha2RepairAddThenRemove && sequence != operator.V1Alpha2RepairAdd {
+	if sequence != operator.V1Alpha2RepairAddThenRemove && sequence != operator.V1Alpha2RepairAdd && sequence != operator.V1Alpha2RepairLeave {
 		return fmt.Errorf("append-only replacement requires ADD-first")
 	}
 	return nil

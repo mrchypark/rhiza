@@ -10,8 +10,8 @@
 | 구성 요소 | 현재 역할 |
 | --- | --- |
 | `rhiza-operator` | namespace의 초기화를 reconcile하고 설치된 private runtime profile과 Secret을 검증한다. generation 0 Deployment를 만들고 실제 Pod identity를 바탕으로 genesis와 bootstrap plan을 확정한다. 초기 bootstrap이 확정된 뒤에는 인증된 join과 replacement에 실행 중인 operator가 필요하지 않다. operator는 별도로 승인된 DR 경계를 위해 유지되지만 automatic DR executor는 없다. |
-| Kubernetes Deployment와 kubelet | 설정된 replica 수를 유지하고 컨테이너를 재시작한다. deployment tooling이 원하는 `voterCount`를 설정하고 Deployment를 직접 scale up한다. Pod 손실은 인증된 leave가 아니며, 새 Pod의 생성만으로 투표 권한이 생기지도 않는다. |
-| 참조 managed host | background replacement loop에서 gate를 통과한 교체 후보를 관측하고, 살아 있는 quorum을 통해 learner 하나씩 ADD-first repair로 승인한다. |
+| Kubernetes Deployment와 kubelet | 설정된 replica 수를 유지하고 컨테이너를 재시작한다. deployment tooling이 원하는 `voterCount`를 설정하고 Deployment를 직접 scale한다. Pod 손실은 인증된 leave가 아니며, 새 Pod의 생성만으로 투표 권한이 생기지도 않는다. |
+| 참조 managed host | background replacement loop에서 gate를 통과한 교체 후보를 관측하고, learner 하나씩 ADD-first repair로 승인한다. 살아 있는 Host는 인증된 private leave 요청도 처리한다. |
 | Rhiza 엔진 | WAL identity, 현재 membership, 인증된 로그를 검증하고 learner catch-up과 결정의 인증·적용을 수행한다. |
 
 실제 경로는 [operator 진입점](../cmd/rhiza-operator/main.go),
@@ -70,10 +70,14 @@ quorum이 살아 있으면 참조 host가 gate를 통과한 새 ID와 새 WAL의
 ## 설정과 지원 경계
 
 - `RhizaCluster.spec.voterCount`는 3–64 범위의 desired target이며 autoscaling 설정이 아니다.
-  deployment tooling이 이 값을 설정하고 Deployment를 명시적으로 scale up한다. bootstrap 뒤에는
-  이 정상 경로에 실행 중인 operator가 필요하지 않다. 감소와 scale down은 거부하며, Pod 손실은
-  인증된 leave가 아니고 managed leave 절차도 현재 제공하지 않는다. 새 Pod는 host가 하나씩 실제
-  WAL과 admission을 검증한 add-only QuePaxa 전환을 기록하기 전까지 identity gate에서 대기한다.
+  deployment tooling이 이 값을 설정하고 Deployment를 명시적으로 scale한다. bootstrap 뒤에는
+  정상 join, replacement와 leave에 실행 중인 operator가 필요하지 않다. managed leave는 한 번에
+  한 voter만 수행한다. target을 하나 줄인 뒤(최소 3) replica 하나를 scale down하고, 실제로 사라진
+  voter ID를 확인하여 살아 있는 Host의 인증된 private `POST /leave-voter`에 전달한다. 이후 certified
+  exact target과 live write/readback을 확인한다. Pod 손실 자체는 leave가 아니다. 제거된 ID는
+  재가입할 수 없으며 이 경로는 fence, storage 완료 또는 DR을 주장하지 않는다. pending 결과는
+  현재 repair record가 유지되는 동안 같은 ID로만 재시도한다. 새 Pod는 host가 하나씩 실제 WAL과
+  admission을 검증한 add-only QuePaxa 전환을 기록하기 전까지 identity gate에서 대기한다.
 - 정상 managed HA는 명시적 append-only profile 9(SQL/KV) 또는 10(Graph)을 사용한다. 7/8 실행이나 자동 old-WAL migration은 지원하지 않는다.
 - public managed Host는 BeforeAck durability를 요구한다. HA object data는 append-only이며 online delete GC를 제공하지 않는다.
 - initializer는 Recreate 전략을 강제하거나 peer/client Service를 자동 관리하지 않는다. rollout, 접근 경로와 Service 구성은 배포에서 별도로 결정한다.

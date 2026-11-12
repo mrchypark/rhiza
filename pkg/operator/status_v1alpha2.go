@@ -195,7 +195,7 @@ func (s *V1Alpha2StatusStore) snapshot(ref V1Alpha2ClusterRef, obj map[string]js
 		}
 		var bootstrap V1Alpha2BootstrapPlan
 		var target int
-		if decodeV1Alpha2(status["bootstrapPlan"], &bootstrap) != nil || json.Unmarshal(spec["voterCount"], &target) != nil || target < len(bootstrap.Members) || validateV1Alpha2BootstrapPlan(ref, assignment.Plan, bootstrap, len(bootstrap.Members)) != nil {
+		if decodeV1Alpha2(status["bootstrapPlan"], &bootstrap) != nil || json.Unmarshal(spec["voterCount"], &target) != nil || target < 3 || target > 64 || validateV1Alpha2BootstrapPlan(ref, assignment.Plan, bootstrap, len(bootstrap.Members)) != nil {
 			return V1Alpha2StatusSnapshot{}, fmt.Errorf("invalid public bootstrap plan")
 		}
 		evidence, present := auth["evidence"]

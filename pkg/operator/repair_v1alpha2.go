@@ -38,6 +38,9 @@ const (
 	// Add keeps every current voter and enrolls exactly one additional voter.
 	// It is used only for a monotonic managed Pod scale-up.
 	V1Alpha2RepairAdd V1Alpha2RepairSequence = "add"
+	// Leave removes exactly one named voter after the desired voter count was
+	// explicitly reduced. Replacement names that same logical voter.
+	V1Alpha2RepairLeave V1Alpha2RepairSequence = "leave"
 )
 
 // V1Alpha2RepairPlan is one bounded membership intent, not a certificate or a
@@ -47,7 +50,8 @@ const (
 // OldWALIdentity is the caller-verified registered nonce, not an external
 // fence. For Add, OldNodeID is a current-voter quorum witness and remains in
 // FinalVoterIDs. Replacement WAL identity is deliberately absent until
-// registration.
+// registration. For Leave, Replacement names the retired logical voter and is
+// not part of FinalVoterIDs; PodName/PodUID are not live-workload authority.
 type V1Alpha2RepairPlan struct {
 	OperationID         string                 `json:"operationID"`
 	Sequence            V1Alpha2RepairSequence `json:"sequence,omitempty"`
@@ -148,7 +152,9 @@ func validateRepairHandoff(s V1Alpha2StatusSnapshot, p V1Alpha2RepairPlan, h V1A
 		seen[m.ID] = true
 		ids = append(ids, m.ID)
 	}
-	ids = append(ids, p.Replacement.NodeID)
+	if repairSequence(p) != V1Alpha2RepairLeave {
+		ids = append(ids, p.Replacement.NodeID)
+	}
 	slices.Sort(ids)
 	if !slices.Equal(ids, p.FinalVoterIDs) {
 		return fmt.Errorf("repair survivors differ from final target")
@@ -204,8 +210,10 @@ func CaptureV1Alpha2RepairHandoff(ctx context.Context, store *V1Alpha2StatusStor
 	if err := validateRepairHandoff(old.status, r.Plan, h); err != nil {
 		return V1Alpha2AdmissionSnapshot{}, "", err
 	}
-	if err := validateV1Alpha2RepairPod(ctx, store, old.status.ref, r.Plan); err != nil {
-		return V1Alpha2AdmissionSnapshot{}, "", err
+	if r.Plan.Sequence != V1Alpha2RepairLeave {
+		if err := validateV1Alpha2RepairPod(ctx, store, old.status.ref, r.Plan); err != nil {
+			return V1Alpha2AdmissionSnapshot{}, "", err
+		}
 	}
 	r.PreparedHandoff = &h
 	encoded, err := json.Marshal(r)
@@ -276,24 +284,55 @@ func validRepairText(s string, max int) bool {
 	return true
 }
 
-func validateV1Alpha2RepairPlan(s V1Alpha2StatusSnapshot, p V1Alpha2RepairPlan) error {
-	if p.Sequence != "" && p.Sequence != V1Alpha2RepairRemoveThenAdd && p.Sequence != V1Alpha2RepairAddThenRemove && p.Sequence != V1Alpha2RepairAdd {
+func validateV1Alpha2RepairPlan(s V1Alpha2StatusSnapshot, p V1Alpha2RepairPlan, requireReducedTarget bool) error {
+	if p.Sequence != "" && p.Sequence != V1Alpha2RepairRemoveThenAdd && p.Sequence != V1Alpha2RepairAddThenRemove && p.Sequence != V1Alpha2RepairAdd && p.Sequence != V1Alpha2RepairLeave {
 		return fmt.Errorf("unsupported repair sequence")
 	}
-	id, err := types.ManagedNodeID(p.Replacement.PodUID)
-	u, urlErr := url.Parse(p.Replacement.PeerURL)
-	if err != nil || urlErr != nil || u.Scheme != "quic" || u.User != nil || u.Path != "" || u.RawQuery != "" || u.ForceQuery || u.Fragment != "" || net.ParseIP(u.Hostname()) == nil || net.ParseIP(u.Hostname()).IsUnspecified() {
-		return fmt.Errorf("invalid repair member endpoint")
-	}
-	port, err := strconv.Atoi(u.Port())
-	if err != nil || port < 1 || port > 65535 || !validRepairText(p.Replacement.PodName, 253) || !v1alpha2Name.MatchString(p.Replacement.PodName) || p.Replacement.NodeID != id || p.Replacement.PublicKey == (quepaxa.PublicKey{}) || !validRepairText(string(p.OldNodeID), 256) || !validRepairText(p.OldWALIdentity, 256) || p.OldNodeID == id {
-		return fmt.Errorf("invalid repair member identity")
+	if repairSequence(p) == V1Alpha2RepairLeave {
+		u, urlErr := url.Parse(p.Replacement.PeerURL)
+		if p.Replacement.NodeID != p.OldNodeID || p.Replacement.PodName != string(p.OldNodeID) || p.Replacement.PodUID != string(p.OldNodeID) || p.Replacement.PublicKey == (quepaxa.PublicKey{}) || urlErr != nil || u.Scheme != "quic" || u.User != nil || u.Path != "" || u.RawQuery != "" || u.ForceQuery || u.Fragment != "" || net.ParseIP(u.Hostname()) == nil || net.ParseIP(u.Hostname()).IsUnspecified() {
+			return fmt.Errorf("invalid leave member identity")
+		}
+		if port, err := strconv.Atoi(u.Port()); err != nil || port < 1 || port > 65535 {
+			return fmt.Errorf("invalid leave member endpoint")
+		}
+	} else {
+		id, err := types.ManagedNodeID(p.Replacement.PodUID)
+		u, urlErr := url.Parse(p.Replacement.PeerURL)
+		if err != nil || urlErr != nil || u.Scheme != "quic" || u.User != nil || u.Path != "" || u.RawQuery != "" || u.ForceQuery || u.Fragment != "" || net.ParseIP(u.Hostname()) == nil || net.ParseIP(u.Hostname()).IsUnspecified() {
+			return fmt.Errorf("invalid repair member endpoint")
+		}
+		port, err := strconv.Atoi(u.Port())
+		if err != nil || port < 1 || port > 65535 || !validRepairText(p.Replacement.PodName, 253) || !v1alpha2Name.MatchString(p.Replacement.PodName) || p.Replacement.NodeID != id || p.Replacement.PublicKey == (quepaxa.PublicKey{}) || p.OldNodeID == id {
+			return fmt.Errorf("invalid repair member identity")
+		}
 	}
 	if !validRepairText(p.OperationID, 256) || p.ClusterUID != s.ref.UID || p.Generation < 0 || !validRepairText(p.DeploymentUID, 256) || !validRepairText(p.StorageID, 256) || p.ExpectedConfigID == 0 || p.ExpectedConfigID > math.MaxInt64-2 || p.ExpectedAbortSlot > math.MaxInt64 {
 		return fmt.Errorf("invalid repair operation binding")
 	}
-	if !validInitDigest(p.BootstrapPlanDigest) || len(p.FinalVoterIDs) < 2 || len(p.FinalVoterIDs) > 64 || !slices.Contains(p.FinalVoterIDs, id) || (repairSequence(p) == V1Alpha2RepairAdd) != slices.Contains(p.FinalVoterIDs, p.OldNodeID) {
+	if !validRepairText(string(p.OldNodeID), 256) || !validRepairText(p.OldWALIdentity, 256) || !validInitDigest(p.BootstrapPlanDigest) || len(p.FinalVoterIDs) < 2 || len(p.FinalVoterIDs) > 64 {
 		return fmt.Errorf("invalid repair final target")
+	}
+	switch repairSequence(p) {
+	case V1Alpha2RepairAdd:
+		if !slices.Contains(p.FinalVoterIDs, p.Replacement.NodeID) || !slices.Contains(p.FinalVoterIDs, p.OldNodeID) {
+			return fmt.Errorf("invalid repair final target")
+		}
+	case V1Alpha2RepairLeave:
+		if slices.Contains(p.FinalVoterIDs, p.OldNodeID) || len(p.FinalVoterIDs) < 3 {
+			return fmt.Errorf("invalid leave final target")
+		}
+		if requireReducedTarget {
+			var spec map[string]json.RawMessage
+			var target int
+			if json.Unmarshal(s.object["spec"], &spec) != nil || json.Unmarshal(spec["voterCount"], &target) != nil || target != len(p.FinalVoterIDs) {
+				return fmt.Errorf("leave final target differs from desired voter count")
+			}
+		}
+	default:
+		if !slices.Contains(p.FinalVoterIDs, p.Replacement.NodeID) || slices.Contains(p.FinalVoterIDs, p.OldNodeID) {
+			return fmt.Errorf("invalid repair final target")
+		}
 	}
 	for i, node := range p.FinalVoterIDs {
 		if !validRepairText(string(node), 256) || i > 0 && p.FinalVoterIDs[i-1] >= node {
@@ -320,6 +359,9 @@ func validateV1Alpha2RepairCompletion(p V1Alpha2RepairPlan, c V1Alpha2RepairComp
 		return false
 	}
 	if repairSequence(p) == V1Alpha2RepairAdd {
+		return c.Kind == "Terminal" && c.ConfigID == p.ExpectedConfigID+1 && slices.Equal(c.FinalVoterIDs, p.FinalVoterIDs) || c.Kind == "Abort" && c.ConfigID >= p.ExpectedConfigID && len(c.FinalVoterIDs) == 0
+	}
+	if repairSequence(p) == V1Alpha2RepairLeave {
 		return c.Kind == "Terminal" && c.ConfigID == p.ExpectedConfigID+1 && slices.Equal(c.FinalVoterIDs, p.FinalVoterIDs) || c.Kind == "Abort" && c.ConfigID >= p.ExpectedConfigID && len(c.FinalVoterIDs) == 0
 	}
 	// ConfigID alone cannot demonstrate target completion. In particular the
@@ -354,7 +396,7 @@ func parseV1Alpha2Repair(s V1Alpha2StatusSnapshot) (*V1Alpha2RepairRecord, error
 		return nil, nil
 	}
 	var r V1Alpha2RepairRecord
-	if len(raw) > V1Alpha2RepairRecordLimit || decodeV1Alpha2(raw, &r) != nil || validateV1Alpha2RepairPlan(s, r.Plan) != nil {
+	if len(raw) > V1Alpha2RepairRecordLimit || decodeV1Alpha2(raw, &r) != nil || validateV1Alpha2RepairPlan(s, r.Plan, false) != nil {
 		return nil, fmt.Errorf("invalid repair record")
 	}
 	if r.PreparedHandoff != nil {
@@ -390,13 +432,13 @@ func BeginV1Alpha2Repair(ctx context.Context, store *V1Alpha2StatusStore, old V1
 	if err := validateV1Alpha2RepairExecutionProfile(old); err != nil {
 		return V1Alpha2AdmissionSnapshot{}, "", err
 	}
-	if plan.Sequence != V1Alpha2RepairAddThenRemove && plan.Sequence != V1Alpha2RepairAdd {
+	if plan.Sequence != V1Alpha2RepairAddThenRemove && plan.Sequence != V1Alpha2RepairAdd && plan.Sequence != V1Alpha2RepairLeave {
 		return V1Alpha2AdmissionSnapshot{}, "", fmt.Errorf("new append-only repair requires ADD-first or add sequence")
 	}
 	if old.status.store != store || old.Authority() != expected || !repairMatchesAuthority(plan, expected) || hasV1Alpha2Transition(old.transition) || old.SQLReservationsClosed() {
 		return V1Alpha2AdmissionSnapshot{}, "", fmt.Errorf("repair close preconditions do not match")
 	}
-	if err := validateV1Alpha2RepairPlan(old.status, plan); err != nil {
+	if err := validateV1Alpha2RepairPlan(old.status, plan, true); err != nil {
 		return V1Alpha2AdmissionSnapshot{}, "", err
 	}
 	if previous, ok := old.Repair(); ok {
@@ -408,8 +450,10 @@ func BeginV1Alpha2Repair(ctx context.Context, store *V1Alpha2StatusStore, old V1
 			return V1Alpha2AdmissionSnapshot{}, "", fmt.Errorf("repair operation regressed behind terminal")
 		}
 	}
-	if err := validateV1Alpha2RepairPod(ctx, store, old.status.ref, plan); err != nil {
-		return V1Alpha2AdmissionSnapshot{}, "", err
+	if plan.Sequence != V1Alpha2RepairLeave {
+		if err := validateV1Alpha2RepairPod(ctx, store, old.status.ref, plan); err != nil {
+			return V1Alpha2AdmissionSnapshot{}, "", err
+		}
 	}
 	return updateV1Alpha2AdmissionStatus(ctx, store, old, func(status, auth map[string]json.RawMessage) {
 		status["repair"], _ = json.Marshal(V1Alpha2RepairRecord{Plan: plan, State: "Closed"})

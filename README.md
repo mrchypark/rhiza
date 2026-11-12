@@ -130,9 +130,11 @@ catch-up. A missing Pod is not a certified leave.
 Managed HA uses two init containers and shared `emptyDir`, explicit append-only
 profiles 9/10, before-ack durability, and a desired voter count of 3–64. Raising
 the count requires an explicit Deployment scale-up; it is not autoscaling or a
-membership decision by itself. Lowering the target or scaling down is rejected,
-and no managed leave workflow is currently available. Ordinary requests do not
-reserve a Kubernetes CR per mutation. HA object
+membership decision by itself. Managed leave is staged one voter at a time: lower
+the target by one (minimum 3), scale down one Deployment replica, identify the
+actual removed voter, call the authenticated private `POST /leave-voter`, and wait
+for the certified target plus a live write/readback. Pod loss alone never removes
+membership. Ordinary requests do not reserve a Kubernetes CR per mutation. HA object
 data is append-only with no online delete GC. Recreate rollout enforcement and
 peer/client Service management are not supplied by the initializer.
 Whole-generation DR is not implemented by the operator: recovery API/schema fields

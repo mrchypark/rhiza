@@ -27,6 +27,15 @@ func (h *Host) PlanVoterReplacement(ctx context.Context, replacement operator.V1
 	if err != nil {
 		return nil, err
 	}
+	if replacement.NodeID != "" {
+		retired, err := h.node.ManagedVoterRetired(replacement.NodeID)
+		if err != nil {
+			return nil, err
+		}
+		if retired {
+			return nil, fmt.Errorf("retired voter identity cannot be enrolled or replaced")
+		}
+	}
 	if r, ok := a.Repair(); ok && r.State == "Closed" {
 		if _, err := operator.ValidateV1Alpha2RepairPodBinding(ctx, h.cfg.Store, h.cfg.Ref, r.Plan); err != nil {
 			return nil, fmt.Errorf("closed repair candidate unavailable; retargeting forbidden: %w", err)

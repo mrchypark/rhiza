@@ -329,6 +329,15 @@ func (c *Core) ValidateReconfigurationTarget(target Cluster) error {
 	return validateReconfigurationTarget(current, target, retired)
 }
 
+// IsRetired reports an identity already retired by a certified configuration
+// transition. It is an admission check, not proof that a process has stopped.
+func (c *Core) IsRetired(id NodeID) bool {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	_, retired := c.retiredIDs[id]
+	return retired
+}
+
 func (c *Core) validateReconfigurationSlotsLocked(freeze, terminal Slot) error {
 	if freeze == 0 || freeze > ^Slot(0)-17 || terminal != freeze+16 || c.isLeaderScheduleSlotLocked(freeze) || c.isLeaderScheduleSlotLocked(terminal) {
 		return fmt.Errorf("incompatible reconfiguration schedule boundary: freeze=%d terminal=%d", freeze, terminal)

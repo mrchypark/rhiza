@@ -465,7 +465,15 @@ func sqlCluster(t *testing.T) ([]Config, *sqlStatusFixture) {
 }
 
 func sqlClusterForProtocol(t *testing.T, protocol string) ([]Config, *sqlStatusFixture) {
+	return sqlClusterForProtocolVoters(t, protocol, 3)
+}
+
+func sqlClusterForProtocolVoters(t *testing.T, protocol string, voterCount int, reconfiguration ...bool) ([]Config, *sqlStatusFixture) {
 	t.Helper()
+	if len(reconfiguration) > 1 {
+		t.Fatal("one reconfiguration selection required")
+	}
+	enableReconfiguration := len(reconfiguration) == 1 && reconfiguration[0]
 	format := EvidenceFormat
 	if protocol != "" {
 		format = protocol
@@ -474,8 +482,8 @@ func sqlClusterForProtocol(t *testing.T, protocol string) ([]Config, *sqlStatusF
 		t.Fatal(err)
 	}
 	s3, sourceControl := sqlWireStore(t)
-	configs := make([]Config, 3)
-	members := make([]quepaxa.Member, 3)
+	configs := make([]Config, voterCount)
+	members := make([]quepaxa.Member, voterCount)
 	clusterID, err := types.ManagedClusterID("uid", 0)
 	if err != nil {
 		t.Fatal(err)
@@ -494,20 +502,21 @@ func sqlClusterForProtocol(t *testing.T, protocol string) ([]Config, *sqlStatusF
 		addr := f.reservePeer(t, id)
 		token := fmt.Sprintf("peer-%d", i)
 		members[i] = quepaxa.Member{ID: id, PeerURL: "quic://" + addr, PublicKey: quepaxa.PublicKey(network.PeerPublicKey(clusterID, id, token))}
-		configs[i].Runtime = RuntimeConfig{NodeID: id, ClusterID: clusterID, ObjStorePrefix: namespace.ConfigPrefix, DataDir: t.TempDir(), PeerAddr: addr, PeerToken: token, AdminToken: "admin", ObjStoreProvider: "s3", ObjStoreEndpoint: strings.TrimPrefix(s3.URL, "http://"), ObjStoreInsecure: true, ObjStoreBucket: "bucket", ObjStoreRegion: "us-east-1", ObjStoreAccessKey: "test", ObjStoreSecretKey: "test", ObjStoreDurability: types.ObjectStoreDurabilityBeforeAck}
+		configs[i].Runtime = RuntimeConfig{NodeID: id, ClusterID: clusterID, ObjStorePrefix: namespace.ConfigPrefix, DataDir: t.TempDir(), PeerAddr: addr, PeerToken: token, AdminToken: "admin", ObjStoreProvider: "s3", ObjStoreEndpoint: strings.TrimPrefix(s3.URL, "http://"), ObjStoreInsecure: true, ObjStoreBucket: "bucket", ObjStoreRegion: "us-east-1", ObjStoreAccessKey: "test", ObjStoreSecretKey: "test", ObjStoreDurability: types.ObjectStoreDurabilityBeforeAck, EnableReconfiguration: enableReconfiguration}
 	}
 	for i := range configs {
 		configs[i].Runtime.Members = members
 	}
 	_ = json.Unmarshal([]byte(`{"apiVersion":"rhiza.mrchypark.dev/v1alpha2","kind":"RhizaCluster","metadata":{"name":"cluster","namespace":"ns","uid":"uid","resourceVersion":"1"},"spec":{"logicalID":"logical","genesisIntent":"Create","voterCount":3,"workload":{"podTemplate":{"spec":{"containers":[{"name":"app","image":"image"}]}}}},"status":{}}`), &f.obj)
-	if protocol != "" {
-		var spec map[string]json.RawMessage
-		if err := json.Unmarshal(f.obj["spec"], &spec); err != nil {
-			t.Fatal(err)
-		}
-		spec["applicationProtocol"], _ = json.Marshal(protocol)
-		f.obj["spec"], _ = json.Marshal(spec)
+	var spec map[string]json.RawMessage
+	if err := json.Unmarshal(f.obj["spec"], &spec); err != nil {
+		t.Fatal(err)
 	}
+	spec["voterCount"], _ = json.Marshal(voterCount)
+	if protocol != "" {
+		spec["applicationProtocol"], _ = json.Marshal(protocol)
+	}
+	f.obj["spec"], _ = json.Marshal(spec)
 	kube := httptest.NewTLSServer(http.HandlerFunc(f.serve))
 	t.Cleanup(kube.Close)
 	tokenFile := filepath.Join(t.TempDir(), "token")
@@ -533,7 +542,7 @@ func sqlClusterForProtocol(t *testing.T, protocol string) ([]Config, *sqlStatusF
 	// authority write; no legacy assignment is converted after creation.
 	plan.ApplicationProtocol = protocol
 	name, _ := operator.V1Alpha2GenesisDeploymentName(ref.UID)
-	bootstrap := operator.V1Alpha2BootstrapPlan{ClusterID: clusterID, PhysicalBinding: source, EvidenceFormat: format, Durability: types.ObjectStoreDurabilityBeforeAck}
+	bootstrap := operator.V1Alpha2BootstrapPlan{ClusterID: clusterID, PhysicalBinding: source, EvidenceFormat: format, Durability: types.ObjectStoreDurabilityBeforeAck, Reconfiguration: enableReconfiguration}
 	for i, member := range members {
 		bootstrap.Members = append(bootstrap.Members, operator.V1Alpha2BootstrapMember{PodUID: fmt.Sprintf("pod-%d", i), Member: member})
 	}

@@ -9,6 +9,7 @@ managed_functional_node_id() {
 
 managed_functional_roster_oracle() {
   mfr_cr=$1 mfr_pods=$2 mfr_dep=$3 mfr_eps=$4 mfr_target=$5 mfr_out=$6
+  mfr_sequence=${7-}
   [ "$(jq -r '.spec.voterCount' "$mfr_cr")" = "$mfr_target" ] || return 1
   [ "$(jq -r '.items|length' "$mfr_dep")" = 1 ] || return 1
   [ "$(jq -r '.items[0].spec.replicas' "$mfr_dep")" = "$mfr_target" ] || return 1
@@ -17,10 +18,14 @@ managed_functional_roster_oracle() {
   mfr_ready_ids=
   for mfr_uid in $mfr_ready_uids; do mfr_ready_ids="$mfr_ready_ids\n$(managed_functional_node_id "$mfr_uid")"; done
   mfr_ready_ids=$(printf '%b\n' "$mfr_ready_ids" | sed '/^$/d' | sort)
-  if [ "$mfr_target" = 3 ]; then
+  if [ -z "$mfr_sequence" ] && [ "$mfr_target" = 3 ]; then
+    mfr_sequence=bootstrap
+  fi
+  [ -n "$mfr_sequence" ] || mfr_sequence=add
+  if [ "$mfr_sequence" = bootstrap ]; then
     mfr_roster=$(jq -c '.status.bootstrapPlan.members|map(.member.ID)|sort' "$mfr_cr")
   else
-    jq -e --argjson target "$mfr_target" '.status.repair.state=="Completed" and .status.repair.plan.sequence=="add" and .status.repair.completion.kind=="Terminal" and (.status.repair.completion.finalVoterIDs|length)==$target and ((.status.repair.completion.finalVoterIDs|unique|length)==$target)' "$mfr_cr" >/dev/null || return 1
+    jq -e --argjson target "$mfr_target" --arg sequence "$mfr_sequence" '.status.repair.state=="Completed" and .status.repair.plan.sequence==$sequence and .status.repair.completion.kind=="Terminal" and (.status.repair.completion.finalVoterIDs|length)==$target and ((.status.repair.completion.finalVoterIDs|unique|length)==$target)' "$mfr_cr" >/dev/null || return 1
     mfr_roster=$(jq -c '.status.repair.completion.finalVoterIDs|sort' "$mfr_cr")
   fi
   [ "$mfr_roster" = "$(printf '%s\n' "$mfr_ready_ids" | jq -R . | jq -sc 'map(select(.!=""))|sort')" ] || return 1
@@ -31,32 +36,32 @@ managed_functional_roster_oracle() {
 }
 
 managed_functional_observe_roster() {
-  mfo_target=$1 mfo_tag=$2
+  mfo_target=$1 mfo_tag=$2 mfo_sequence=${3-}
   k -n "$namespace" get rhizacluster sql -o json > "$logs/functional-$mfo_tag-cr.json"
   k -n "$namespace" get deployment -l "$selector" -o json > "$logs/functional-$mfo_tag-deployment.json"
   k -n "$namespace" get pods -l "$selector" -o json > "$logs/functional-$mfo_tag-pods.json"
   k -n "$namespace" get endpoints bootstrap-client -o json > "$logs/functional-$mfo_tag-endpoints.json"
-  managed_functional_roster_oracle "$logs/functional-$mfo_tag-cr.json" "$logs/functional-$mfo_tag-pods.json" "$logs/functional-$mfo_tag-deployment.json" "$logs/functional-$mfo_tag-endpoints.json" "$mfo_target" "$logs/functional-$mfo_tag-roster.json"
+  managed_functional_roster_oracle "$logs/functional-$mfo_tag-cr.json" "$logs/functional-$mfo_tag-pods.json" "$logs/functional-$mfo_tag-deployment.json" "$logs/functional-$mfo_tag-endpoints.json" "$mfo_target" "$logs/functional-$mfo_tag-roster.json" "$mfo_sequence"
 }
 
 managed_functional_enrollment_ready() {
-  mfer_target=$1 mfer_tag=$2
-  jq -e --argjson target "$mfer_target" '.spec.voterCount==$target and .status.repair.state=="Completed" and .status.repair.plan.sequence=="add" and .status.repair.completion.kind=="Terminal" and (.status.repair.completion.finalVoterIDs|length)==$target' "$logs/functional-$mfer_tag-poll.json" >/dev/null 2>&1 \
+  mfer_target=$1 mfer_tag=$2 mfer_sequence=${3:-add}
+  jq -e --argjson target "$mfer_target" --arg sequence "$mfer_sequence" '.spec.voterCount==$target and .status.repair.state=="Completed" and .status.repair.plan.sequence==$sequence and .status.repair.completion.kind=="Terminal" and (.status.repair.completion.finalVoterIDs|length)==$target' "$logs/functional-$mfer_tag-poll.json" >/dev/null 2>&1 \
     && jq -e --argjson target "$mfer_target" '(.items|length)==1 and .items[0].spec.replicas==$target' "$logs/functional-$mfer_tag-deployment-poll.json" >/dev/null 2>&1 \
     && jq -e --argjson target "$mfer_target" '[.items[]|select(any(.status.conditions[]?; .type=="Ready" and .status=="True"))]|length==$target' "$logs/functional-$mfer_tag-pods-poll.json" >/dev/null 2>&1 \
     && jq -e --argjson target "$mfer_target" '[.subsets[]?.addresses[]?]|length==$target' "$logs/functional-$mfer_tag-endpoints-poll.json" >/dev/null 2>&1
 }
 
 managed_functional_wait_enrollment() {
-  mfw_target=$1 mfw_tag=$2
+  mfw_target=$1 mfw_tag=$2 mfw_sequence=${3:-add}
   mfw_deadline=$(( $(date +%s) + 300 ))
   while :; do
     k -n "$namespace" get rhizacluster sql -o json > "$logs/functional-$mfw_tag-poll.json" 2>/dev/null || :
     k -n "$namespace" get deployment -l "$selector" -o json > "$logs/functional-$mfw_tag-deployment-poll.json" 2>/dev/null || :
     k -n "$namespace" get pods -l "$selector" -o json > "$logs/functional-$mfw_tag-pods-poll.json" 2>/dev/null || :
     k -n "$namespace" get endpoints bootstrap-client -o json > "$logs/functional-$mfw_tag-endpoints-poll.json" 2>/dev/null || :
-    if managed_functional_enrollment_ready "$mfw_target" "$mfw_tag"; then
-      managed_functional_observe_roster "$mfw_target" "$mfw_tag"
+    if managed_functional_enrollment_ready "$mfw_target" "$mfw_tag" "$mfw_sequence"; then
+      managed_functional_observe_roster "$mfw_target" "$mfw_tag" "$mfw_sequence"
       return 0
     fi
     [ "$(date +%s)" -lt "$mfw_deadline" ] || return 1
@@ -65,8 +70,16 @@ managed_functional_wait_enrollment() {
 }
 
 managed_functional_operator_stopped() {
-  jq -e '.spec.replicas==0 and .status.observedGeneration==.metadata.generation and (.status.replicas//0)==0 and (.status.updatedReplicas//0)==0 and (.status.availableReplicas//0)==0' "$logs/functional-operator-deployment.json" >/dev/null 2>&1 \
-    && jq -e '(.items|length)==0' "$logs/functional-operator-pods.json" >/dev/null 2>&1
+  mfops_tag=${1-}
+  if [ -n "$mfops_tag" ]; then
+    mfops_deployment="$logs/functional-operator-$mfops_tag-deployment.json"
+    mfops_pods="$logs/functional-operator-$mfops_tag-pods.json"
+  else
+    mfops_deployment="$logs/functional-operator-deployment.json"
+    mfops_pods="$logs/functional-operator-pods.json"
+  fi
+  jq -e '.spec.replicas==0 and .status.observedGeneration==.metadata.generation and (.status.replicas//0)==0 and (.status.updatedReplicas//0)==0 and (.status.availableReplicas//0)==0' "$mfops_deployment" >/dev/null 2>&1 \
+    && jq -e '(.items|length)==0' "$mfops_pods" >/dev/null 2>&1
 }
 
 managed_functional_stop_operator() {
@@ -158,9 +171,12 @@ while [ ! -f /work/stop ]; do
   fi
   op=$mode
   [ "$mode" != linear ] || op=linearizable-read
-  code=$(printf '%s' "$body" | curl --silent --show-error --output "/work/$mode.body" --write-out '%{http_code}' --max-time 8 --noproxy '*' --config /auth/config --header 'Content-Type: application/json' --data-binary @- "http://bootstrap-client.managed-bootstrap.svc.cluster.local:8080/$route")
+  body_file="/work/$stage-$mode.body"
+  error_file="/work/$stage-$mode.curl.stderr"
+  : > "$body_file"
+  code=$(printf '%s' "$body" | curl --silent --show-error --output "$body_file" --write-out '%{http_code}' --max-time 8 --noproxy '*' --config /auth/config --header 'Content-Type: application/json' --data-binary @- "http://bootstrap-client.managed-bootstrap.svc.cluster.local:8080/$route" 2>> "$error_file")
   rc=$?
-  response=$(tr '\n' ' ' < "/work/$mode.body" 2>/dev/null | head -c 2048 || :)
+  response=$(tr '\n' ' ' < "$body_file" 2>/dev/null | head -c 2048 || :)
   printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$(date +%s)" "$stage" "$op" "$n" "${code:-000}" "$rc" "$response"
   sleep 0.15
 done
@@ -283,14 +299,15 @@ managed_functional_stop_load() {
   k -n "$namespace" logs job/functional-load --all-containers=true > "$logs/functional-load.log" 2> "$logs/functional-load-errors.txt" || :
   awk -F '\t' '$3=="write"' "$logs/functional-load.log" > "$logs/functional-writes.tsv"
   awk -F '\t' '$3=="linearizable-read"' "$logs/functional-load.log" > "$logs/functional-reads.tsv"
+  for mfsl_stage in initial down-2 up-3; do managed_functional_capture_work_raw "$mfsl_stage"; done
 }
 
 managed_functional_start_survivor_load() {
   # shellcheck disable=SC2016 # The remote shell owns $! and wait targets.
   k -n "$namespace" exec "$functional_client_pod" -c client -- sh -c '
     rm -f /work/stop /work/one-done
-    sh /load/load.sh write > /work/one-write.tsv 2>&1 & w=$!
-    sh /load/load.sh linear > /work/one-read.tsv 2>&1 & r=$!
+    sh /load/load.sh write > /work/one-write.tsv 2> /work/one-write.script.stderr & w=$!
+    sh /load/load.sh linear > /work/one-read.tsv 2> /work/one-read.script.stderr & r=$!
     wait $w
     wait $r
     touch /work/one-done
@@ -313,6 +330,24 @@ managed_functional_capture_one_stream() {
   fi
 }
 
+managed_functional_capture_file() {
+  mfcf_dest=$1 mfcf_remote=$2
+  mfcf_candidate="$mfcf_dest.capture"
+  if k -n "$namespace" exec "$functional_client_pod" -c client -- cat "$mfcf_remote" > "$mfcf_candidate" 2>/dev/null; then
+    mv "$mfcf_candidate" "$mfcf_dest"
+  else
+    rm -f "$mfcf_candidate"
+  fi
+}
+
+managed_functional_capture_work_raw() {
+  mfcwr_tag=$1
+  for mfcwr_mode in write linear; do
+    managed_functional_capture_file "$logs/functional-load-$mfcwr_tag-$mfcwr_mode.body" "/work/$mfcwr_tag-$mfcwr_mode.body"
+    managed_functional_capture_file "$logs/functional-load-$mfcwr_tag-$mfcwr_mode.curl.stderr" "/work/$mfcwr_tag-$mfcwr_mode.curl.stderr"
+  done
+}
+
 managed_functional_stop_survivor_load() {
   k -n "$namespace" exec "$functional_client_pod" -c client -- touch /work/stop >/dev/null 2>&1 || :
   mfssl_deadline=$(( $(date +%s) + 30 ))
@@ -327,6 +362,9 @@ managed_functional_stop_survivor_load() {
   fi
   managed_functional_capture_one_stream writes /work/one-write.tsv
   managed_functional_capture_one_stream reads /work/one-read.tsv
+  managed_functional_capture_work_raw one-survivor
+  managed_functional_capture_file "$logs/functional-load-one-survivor-write.script.stderr" /work/one-write.script.stderr
+  managed_functional_capture_file "$logs/functional-load-one-survivor-read.script.stderr" /work/one-read.script.stderr
   k -n "$namespace" exec "$functional_client_pod" -c client -- touch /work/probe-done >/dev/null 2>&1 || :
   k -n "$namespace" wait --for=condition=complete job/functional-load --timeout=90s > "$logs/functional-load-complete.txt" 2>&1 || :
   cat "$logs/functional-writes.tsv" "$logs/functional-one-writes.tsv" > "$logs/functional-all-writes.tsv"
@@ -381,6 +419,156 @@ managed_functional_service_readback() {
   printf 'ack_rows=%s\ncurl_rc=%s\nstatus=PASS\n' "$(wc -l < "$logs/functional-acked-write-numbers.txt" | tr -d ' ')" "$mfsr_rc" > "$logs/functional-ack-readback.txt"
 }
 
+managed_functional_record_leave_before() {
+  mflb_roster=${1:-"$logs/functional-scale5-roster.json"}
+  mflb_pods=${2:-"$logs/functional-scale5-pods.json"}
+  jq -e '.target==5 and .readyMatchesCertified==true and .endpointCount==5 and (.certifiedRoster|length)==5 and ((.certifiedRoster|unique|length)==5) and (.readyIDs|length)==5 and ((.readyIDs|unique|length)==5) and .certifiedRoster==.readyIDs' "$mflb_roster" >/dev/null || return 1
+  jq -e '(.items|length)==5' "$mflb_pods" >/dev/null || return 1
+  mflb_uids=$(jq -r '.items[] | select(.metadata.deletionTimestamp==null) | select(any(.status.conditions[]?; .type=="Ready" and .status=="True")) | .metadata.uid' "$mflb_pods" | sort)
+  [ "$(printf '%s\n' "$mflb_uids" | sed '/^$/d' | wc -l | tr -d ' ')" = 5 ] || return 1
+  [ "$(printf '%s\n' "$mflb_uids" | sort -u | sed '/^$/d' | wc -l | tr -d ' ')" = 5 ] || return 1
+  mflb_live_ids=
+  for mflb_uid in $mflb_uids; do mflb_live_ids="$mflb_live_ids\n$(managed_functional_node_id "$mflb_uid")"; done
+  mflb_live_ids=$(printf '%b\n' "$mflb_live_ids" | sed '/^$/d' | sort)
+  mflb_live_ids_json=$(printf '%s\n' "$mflb_live_ids" | jq -R . | jq -sc 'map(select(.!=""))|sort')
+  mflb_uids_json=$(printf '%s\n' "$mflb_uids" | jq -R . | jq -sc 'map(select(.!=""))|sort')
+  jq -e --argjson live "$mflb_live_ids_json" '.readyIDs==$live' "$mflb_roster" >/dev/null || return 1
+  jq -n --argjson target 5 \
+    --argjson certified "$(jq -c '.certifiedRoster' "$mflb_roster")" \
+    --argjson live "$mflb_live_ids_json" \
+    --argjson uids "$mflb_uids_json" \
+    '{target:$target,certifiedIDs:$certified,liveIDs:$live,podUIDs:$uids,certifiedMatchesLive:($certified==$live)}' > "$logs/functional-leave-before.json"
+}
+
+managed_functional_leave_scale_ready() {
+  mflsr_before=$1 mflsr_cr=$2 mflsr_dep=$3 mflsr_pods=$4 mflsr_eps=$5 mflsr_target=$6 mflsr_out=$7
+  [ "$(jq -r '.spec.voterCount' "$mflsr_cr")" = "$mflsr_target" ] || return 1
+  jq -e --argjson target "$mflsr_target" '(.items|length)==1 and .items[0].spec.replicas==$target' "$mflsr_dep" >/dev/null || return 1
+  jq -e --argjson target "$mflsr_target" '(.items|length)==$target and all(.items[]; .metadata.deletionTimestamp==null and any(.status.conditions[]?; .type=="Ready" and .status=="True"))' "$mflsr_pods" >/dev/null || return 1
+  jq -e '[.subsets[]?.notReadyAddresses[]?]|length==0' "$mflsr_eps" >/dev/null || return 1
+  mflsr_old_uids=$(jq -r '.podUIDs[]' "$mflsr_before" | sort)
+  mflsr_current_uids=$(jq -r '.items[].metadata.uid' "$mflsr_pods" | sort)
+  [ "$(printf '%s\n' "$mflsr_current_uids" | sed '/^$/d' | wc -l | tr -d ' ')" = "$mflsr_target" ] || return 1
+  [ "$(printf '%s\n' "$mflsr_current_uids" | sort -u | sed '/^$/d' | wc -l | tr -d ' ')" = "$mflsr_target" ] || return 1
+  for mflsr_uid in $mflsr_current_uids; do
+    printf '%s\n' "$mflsr_old_uids" | grep -Fx "$mflsr_uid" >/dev/null || return 1
+  done
+  mflsr_removed_uids=
+  for mflsr_uid in $mflsr_old_uids; do
+    if ! printf '%s\n' "$mflsr_current_uids" | grep -Fx "$mflsr_uid" >/dev/null; then
+      mflsr_removed_uids="$mflsr_removed_uids $mflsr_uid"
+    fi
+  done
+  [ "$(printf '%s\n' "$mflsr_removed_uids" | wc -w | tr -d ' ')" = 1 ] || return 1
+  mflsr_removed_uid=$(printf '%s\n' "$mflsr_removed_uids" | awk '{print $1}')
+  jq -e --arg uid "$mflsr_removed_uid" 'all(.items[]; .metadata.uid!=$uid)' "$mflsr_pods" >/dev/null || return 1
+  mflsr_endpoint_uids=$(jq -r '[.subsets[]?.addresses[]?.targetRef.uid]|sort|.[]' "$mflsr_eps")
+  [ "$(printf '%s\n' "$mflsr_endpoint_uids" | sed '/^$/d' | wc -l | tr -d ' ')" = "$mflsr_target" ] || return 1
+  [ "$(printf '%s\n' "$mflsr_endpoint_uids" | sort)" = "$(printf '%s\n' "$mflsr_current_uids" | sort)" ] || return 1
+  mflsr_removed_node=$(managed_functional_node_id "$mflsr_removed_uid")
+  mflsr_ready_ids=
+  for mflsr_uid in $mflsr_current_uids; do mflsr_ready_ids="$mflsr_ready_ids\n$(managed_functional_node_id "$mflsr_uid")"; done
+  mflsr_ready_ids_json=$(printf '%b\n' "$mflsr_ready_ids" | sed '/^$/d' | sort | jq -R . | jq -sc 'map(select(.!=""))|sort')
+  mflsr_current_uids_json=$(printf '%s\n' "$mflsr_current_uids" | jq -R . | jq -sc 'map(select(.!=""))|sort')
+  jq -n --argjson target "$mflsr_target" --arg removedUID "$mflsr_removed_uid" --arg removedNodeID "$mflsr_removed_node" \
+    --argjson remainingPodUIDs "$mflsr_current_uids_json" --argjson readyIDs "$mflsr_ready_ids_json" \
+    '{target:$target,removedPodUID:$removedUID,removedNodeID:$removedNodeID,previousPodUIDAbsent:true,remainingPodUIDs:$remainingPodUIDs,readyIDs:$readyIDs,endpointCount:$target}' > "$mflsr_out"
+}
+
+managed_functional_wait_leave_scale_down() {
+  mflw_before=$1 mflw_target=$2 mflw_tag=$3
+  mflw_deadline=$(( $(date +%s) + 180 ))
+  while :; do
+    k -n "$namespace" get rhizacluster sql -o json > "$logs/functional-$mflw_tag-cr-poll.json" 2>/dev/null || :
+    k -n "$namespace" get deployment -l "$selector" -o json > "$logs/functional-$mflw_tag-deployment-poll.json" 2>/dev/null || :
+    k -n "$namespace" get pods -l "$selector" -o json > "$logs/functional-$mflw_tag-pods-poll.json" 2>/dev/null || :
+    k -n "$namespace" get endpoints bootstrap-client -o json > "$logs/functional-$mflw_tag-endpoints-poll.json" 2>/dev/null || :
+    if managed_functional_leave_scale_ready "$mflw_before" "$logs/functional-$mflw_tag-cr-poll.json" "$logs/functional-$mflw_tag-deployment-poll.json" "$logs/functional-$mflw_tag-pods-poll.json" "$logs/functional-$mflw_tag-endpoints-poll.json" "$mflw_target" "$logs/functional-$mflw_tag.json"; then
+      cp "$logs/functional-$mflw_tag-cr-poll.json" "$logs/functional-$mflw_tag-cr.json"
+      cp "$logs/functional-$mflw_tag-deployment-poll.json" "$logs/functional-$mflw_tag-deployment.json"
+      cp "$logs/functional-$mflw_tag-pods-poll.json" "$logs/functional-$mflw_tag-pods.json"
+      cp "$logs/functional-$mflw_tag-endpoints-poll.json" "$logs/functional-$mflw_tag-endpoints.json"
+      return 0
+    fi
+    [ "$(date +%s)" -lt "$mflw_deadline" ] || { echo '5->4 scale-down did not leave exactly four certified live voters' >&2; return 1; }
+    sleep 1
+  done
+}
+
+managed_functional_leave_http_ok() {
+  [ "$1" = 204 ] && [ "$2" = 0 ] && [ "$3" = 0 ]
+}
+
+managed_functional_leave_voter() {
+  mflv_node=$1
+  jq -cn --arg node "$mflv_node" '{node_id:$node}' > "$logs/functional-leave-voter-request.json"
+  k -n "$namespace" create secret generic functional-leave-voter-request \
+    --from-file="config=$private/curl.conf" \
+    --from-file="body=$logs/functional-leave-voter-request.json" > "$logs/functional-leave-voter-secret.txt" || return 1
+  jq -n --arg route "http://bootstrap-client.$namespace.svc.cluster.local:8080/leave-voter" '
+    {
+      apiVersion:"batch/v1",kind:"Job",metadata:{name:"functional-leave-voter",labels:{"rhiza-ci-owner":"harness"}},
+      spec:{backoffLimit:0,activeDeadlineSeconds:90,template:{metadata:{labels:{"rhiza-ci-owner":"harness"}},spec:{restartPolicy:"Never",automountServiceAccountToken:false,securityContext:{runAsUser:65532,runAsGroup:65532,fsGroup:65532,runAsNonRoot:true},containers:[{name:"client",image:"curlimages/curl:8.12.1@sha256:94e9e444bcba979c2ea12e27ae39bee4cd10bc7041a472c4727a558e213744e6",command:["curl"],args:["--silent","--show-error","--fail-with-body","--write-out","\nRHIZA_HTTP_CODE=%{http_code}\n","--max-time","60","--noproxy","*","--config","/request/config","--header","Content-Type: application/json","--data-binary","@/request/body",$route],securityContext:{allowPrivilegeEscalation:false,readOnlyRootFilesystem:true,capabilities:{drop:["ALL"]}},volumeMounts:[{name:"request",mountPath:"/request",readOnly:true}]}],volumes:[{name:"request",secret:{secretName:"functional-leave-voter-request",defaultMode:288}}]}}}}
+  ' | k -n "$namespace" create -f - -o json > "$logs/functional-leave-voter-job.json" || return 1
+  set +e
+  k -n "$namespace" wait --for=condition=complete job/functional-leave-voter --timeout=90s > "$logs/functional-leave-voter-wait.txt" 2>&1
+  mflv_wait_rc=$?
+  set -e
+  k -n "$namespace" get job functional-leave-voter -o json > "$logs/functional-leave-voter-job-state.json" 2>/dev/null || :
+  k -n "$namespace" get pods -l job-name=functional-leave-voter -o json > "$logs/functional-leave-voter-pods.json" 2>/dev/null || :
+  k -n "$namespace" logs job/functional-leave-voter --all-containers=true > "$logs/functional-leave-voter.raw" 2> "$logs/functional-leave-voter.stderr" || :
+  mflv_code=$(sed -n 's/^RHIZA_HTTP_CODE=\([0-9][0-9][0-9]\)$/\1/p' "$logs/functional-leave-voter.raw")
+  [ -n "$mflv_code" ] || mflv_code=000
+  mflv_pod_rc=$(jq -r '[.items[].status.containerStatuses[]?|select(.name=="client")|.state.terminated.exitCode]|if length==1 then .[0] else -1 end' "$logs/functional-leave-voter-pods.json" 2>/dev/null || printf '%s' -1)
+  sed '/^RHIZA_HTTP_CODE=[0-9][0-9][0-9]$/d' "$logs/functional-leave-voter.raw" > "$logs/functional-leave-voter.json"
+  printf '%s\t%s\t%s\t%s\n' "$mflv_code" "$mflv_pod_rc" "$mflv_wait_rc" leave-voter > "$logs/functional-leave-voter.meta.tsv"
+  managed_functional_leave_http_ok "$mflv_code" "$mflv_pod_rc" "$mflv_wait_rc"
+}
+
+managed_functional_leave_completion_oracle() {
+  mflc_cr=$1 mflc_target=$2 mflc_removed=$3 mflc_expected=$4 mflc_out=$5
+  jq -e --argjson target "$mflc_target" --arg removed "$mflc_removed" --slurpfile expected "$mflc_expected" '
+    ($expected|length)==1 and ($expected[0]|type)=="array" and .spec.voterCount==$target and
+    .status.repair.state=="Completed" and .status.repair.plan.sequence=="leave" and
+    .status.repair.plan.oldNodeID==$removed and
+    .status.repair.completion.kind=="Terminal" and
+    .status.repair.completion.operationID==.status.repair.plan.operationID and
+    (.status.repair.plan.finalVoterIDs|sort)==($expected[0]|sort) and
+    (.status.repair.completion.finalVoterIDs|sort)==($expected[0]|sort) and
+    (.status.repair.completion.finalVoterIDs|length)==$target and
+    ((.status.repair.completion.finalVoterIDs|unique|length)==$target) and
+    (.status.repair.completion.finalVoterIDs|index($removed))==null
+  ' "$mflc_cr" >/dev/null || return 1
+  jq -n --argjson target "$mflc_target" --arg removed "$mflc_removed" --slurpfile expected "$mflc_expected" '{target:$target,removedNodeID:$removed,finalVoterIDs:($expected[0]|sort),sequence:"leave",state:"Completed"}' > "$mflc_out"
+}
+
+managed_functional_leave_scale_down() {
+  managed_functional_observe_roster 5 leave-before add || { echo 'live five-voter roster was not certified exactly before leave' >&2; return 1; }
+  managed_functional_record_leave_before "$logs/functional-leave-before-roster.json" "$logs/functional-leave-before-pods.json" || { echo 'live five-voter roster was not recorded exactly' >&2; return 1; }
+  k -n "$namespace" get deployment rhiza-operator -o json > "$logs/functional-operator-leave-before-deployment.json"
+  k -n "$namespace" get pods -l app.kubernetes.io/name=rhiza-operator -o json > "$logs/functional-operator-leave-before-pods.json"
+  managed_functional_operator_stopped leave-before || { echo 'operator was not stopped before 5->4 leave scale-down' >&2; return 1; }
+  k -n "$namespace" patch rhizacluster sql --type merge -p '{"spec":{"voterCount":4}}' > "$logs/functional-leave-target-4.txt" || return 1
+  k -n "$namespace" scale "deployment/$mfsu_deployment" --replicas=4 > "$logs/functional-leave-scale-deployment-4.txt" || return 1
+  managed_functional_wait_leave_scale_down "$logs/functional-leave-before.json" 4 leave-scale-down || return 1
+  k -n "$namespace" get deployment rhiza-operator -o json > "$logs/functional-operator-leave-after-scale-deployment.json"
+  k -n "$namespace" get pods -l app.kubernetes.io/name=rhiza-operator -o json > "$logs/functional-operator-leave-after-scale-pods.json"
+  managed_functional_operator_stopped leave-after-scale || { echo 'operator was not stopped after 5->4 scale-down' >&2; return 1; }
+  functional_leave_removed_node_id=$(jq -er '.removedNodeID' "$logs/functional-leave-scale-down.json")
+  jq -c --arg removed "$functional_leave_removed_node_id" '.certifiedIDs|map(select(.!=$removed))|sort' "$logs/functional-leave-before.json" > "$logs/functional-leave-expected-final.json"
+  jq -e --slurpfile expected "$logs/functional-leave-expected-final.json" '.readyIDs==$expected[0]' "$logs/functional-leave-scale-down.json" >/dev/null || { echo 'remaining live voters do not match certified five-voter roster minus the removed Pod' >&2; return 1; }
+}
+
+managed_functional_verify_leave() {
+  managed_functional_wait_enrollment 4 leave4 leave || { echo '5->4 explicit leave did not complete a certified four-voter roster' >&2; return 1; }
+  managed_functional_leave_completion_oracle "$logs/functional-leave4-cr.json" 4 "$functional_leave_removed_node_id" "$logs/functional-leave-expected-final.json" "$logs/functional-leave4-certified.json" || { echo 'leave repair is not Completed with the exact certified final roster' >&2; return 1; }
+  jq -e --slurpfile expected "$logs/functional-leave-expected-final.json" '.certifiedRoster==$expected[0] and .readyIDs==$expected[0] and .endpointCount==4' "$logs/functional-leave4-roster.json" >/dev/null || { echo 'completed leave roster differs from certified/live/endpoint voters' >&2; return 1; }
+  k -n "$namespace" get deployment rhiza-operator -o json > "$logs/functional-operator-leave4-after-deployment.json"
+  k -n "$namespace" get pods -l app.kubernetes.io/name=rhiza-operator -o json > "$logs/functional-operator-leave4-after-pods.json"
+  managed_functional_operator_stopped leave4-after || { echo 'operator was started during explicit leave' >&2; return 1; }
+  managed_functional_commit functional-scale-write-after-leave leave-functional-4 "INSERT INTO bootstrap_ci VALUES (6,'functional-after-leave-4')" functional-after-leave-4 || { echo 'write/readback failed after explicit leave' >&2; return 1; }
+}
+
 managed_functional_capture() {
   if [ -n "${functional_client_pod-}" ]; then
     k -n "$namespace" get job,pod -l rhiza-ci-owner=harness -o json > "$logs/functional-client-state.json" 2>/dev/null || :
@@ -394,6 +582,9 @@ managed_functional_capture() {
     awk -F '\t' '$3=="linearizable-read"' "$logs/functional-load.log" > "$logs/functional-reads.tsv" 2>/dev/null || :
     managed_functional_capture_one_stream writes /work/one-write.tsv
     managed_functional_capture_one_stream reads /work/one-read.tsv
+    for mfc_stage in initial down-2 up-3 one-survivor; do managed_functional_capture_work_raw "$mfc_stage"; done
+    managed_functional_capture_file "$logs/functional-load-one-survivor-write.script.stderr" /work/one-write.script.stderr
+    managed_functional_capture_file "$logs/functional-load-one-survivor-read.script.stderr" /work/one-read.script.stderr
     cat "$logs/functional-writes.tsv" "$logs/functional-one-writes.tsv" > "$logs/functional-all-writes.tsv" 2>/dev/null || :
     cat "$logs/functional-reads.tsv" "$logs/functional-one-reads.tsv" > "$logs/functional-all-reads.tsv" 2>/dev/null || :
     k -n "$namespace" exec "$functional_client_pod" -c client -- touch /work/probe-done >/dev/null 2>&1 || :
@@ -413,7 +604,10 @@ managed_functional_scale_up() {
   k -n "$namespace" scale "deployment/$mfsu_deployment" --replicas=5 > "$logs/functional-scale-deployment-5.txt"
   managed_functional_wait_enrollment 5 scale5 || { echo '4->5 enrollment did not certify a five-voter roster' >&2; return 1; }
   managed_functional_commit functional-scale-write-5 scale-functional-5 "INSERT INTO bootstrap_ci VALUES (5,'functional-5')" functional-5
-  printf '%s\n' 'PASS: 3->4->5 certified managed enrollment, Deployment/Ready/endpoint rosters, ACK and SQL readback' > "$logs/functional-result.txt"
+  managed_functional_leave_scale_down || return 1
+  managed_functional_leave_voter "$functional_leave_removed_node_id" || { echo 'authenticated leave-voter POST did not return 204' >&2; return 1; }
+  managed_functional_verify_leave || return 1
+  printf '%s\n' 'PASS: 3->4->5 certified managed enrollment and explicit 5->4 leave; operator stayed zero; exact certified final roster plus write/readback' > "$logs/functional-result.txt"
 }
 
 managed_functional_quorum() {
@@ -543,6 +737,7 @@ managed_functional_self_test() (
   grep -F '"$op" "$n"' "$scratch/load.sh" >/dev/null
   mkdir "$scratch/work"
   printf 'initial' > "$scratch/work/stage"
+  printf 'stale-body-from-previous-attempt' > "$scratch/work/up-3-write.body"
   sed "s#/work#$scratch/work#g" "$scratch/load.sh" > "$scratch/load-test.sh"
   cat > "$scratch/curl" <<'EOF'
 #!/bin/sh
@@ -559,14 +754,95 @@ case "$count" in
   2) printf 'up-3' > "$LOAD_WORK/stage" ;;
   3) : > "$LOAD_WORK/stop" ;;
 esac
-[ -z "$out" ] || printf '%s' '{"slot":1,"status":"committed","rows_affected":1,"last_insert_id":100001,"retry_through_slot":1}' > "$out"
-printf '200'
+[ "$count" = 2 ] && printf '%s\n' 'curl: simulated timeout in stderr only' >&2
+[ "$count" = 3 ] || [ -z "$out" ] || printf '%s' '{"slot":1,"status":"committed","rows_affected":1,"last_insert_id":100001,"retry_through_slot":1}' > "$out"
+[ "$count" = 3 ] && printf '000' || printf '200'
 EOF
   chmod 0755 "$scratch/curl"
   PATH="$scratch:$PATH" LOAD_WORK="$scratch/work" sh "$scratch/load-test.sh" write > "$scratch/stage-per-request.tsv"
   [ "$(awk -F '\t' '{printf "%s%s",sep,$2; sep=","}' "$scratch/stage-per-request.tsv")" = initial,down-2,up-3 ]
+  awk -F '\t' 'NF!=7{exit 1}' "$scratch/stage-per-request.tsv"
+  if grep -F 'curl:' "$scratch/stage-per-request.tsv" >/dev/null; then return 1; fi
+  grep -Fx 'curl: simulated timeout in stderr only' "$scratch/work/down-2-write.curl.stderr" >/dev/null
+  [ ! -s "$scratch/work/up-3-write.body" ]
   printf 'not-a-row\n' > "$scratch/writes.tsv"
   if managed_functional_load_oracle "$scratch/writes.tsv" "$scratch/reads.tsv" "$scratch/bad.json" 2>/dev/null; then return 1; fi
+  logs=$scratch
+  leave_uids='leave-u1
+leave-u2
+leave-u3
+leave-u4
+leave-u5'
+  leave_uids_json=$(printf '%s\n' "$leave_uids" | jq -R . | jq -sc 'map(select(.!=""))|sort')
+  leave_ids=
+  for leave_uid in $leave_uids; do leave_ids="$leave_ids\n$(managed_functional_node_id "$leave_uid")"; done
+  leave_ids_json=$(printf '%b\n' "$leave_ids" | sed '/^$/d' | sort | jq -R . | jq -sc 'map(select(.!=""))|sort')
+  jq -n --argjson ids "$leave_ids_json" '{target:5,certifiedRoster:$ids,readyIDs:$ids,readyMatchesCertified:true,endpointCount:5}' > "$scratch/functional-scale5-roster.json"
+  jq -n --argjson uids "$leave_uids_json" '{items:[$uids[]|{metadata:{uid:.},status:{conditions:[{type:"Ready",status:"True"}]}}]}' > "$scratch/functional-scale5-pods.json"
+  managed_functional_record_leave_before
+  jq -e --argjson uids "$leave_uids_json" --argjson ids "$leave_ids_json" '.target==5 and .podUIDs==$uids and .certifiedIDs==$ids and .liveIDs==$ids and .certifiedMatchesLive==true' "$scratch/functional-leave-before.json" >/dev/null
+  jq -n '{spec:{voterCount:4}}' > "$scratch/leave-cr.json"
+  jq -n '{items:[{spec:{replicas:4}}]}' > "$scratch/leave-deploy.json"
+  leave_current_json=$(printf '%s\n' leave-u1 leave-u2 leave-u3 leave-u4 | jq -R . | jq -sc 'map(select(.!=""))|sort')
+  jq -n --argjson uids "$leave_current_json" '{items:[$uids[]|{metadata:{uid:.},status:{conditions:[{type:"Ready",status:"True"}]}}]}' > "$scratch/leave-pods.json"
+  jq -n --argjson uids "$leave_current_json" '{subsets:[{addresses:[$uids[]|{targetRef:{uid:.}}]}]}' > "$scratch/leave-endpoints.json"
+  managed_functional_leave_scale_ready "$scratch/functional-leave-before.json" "$scratch/leave-cr.json" "$scratch/leave-deploy.json" "$scratch/leave-pods.json" "$scratch/leave-endpoints.json" 4 "$scratch/leave-scale-down.json"
+  jq -e --arg node "$(managed_functional_node_id leave-u5)" '.target==4 and .removedPodUID=="leave-u5" and .removedNodeID==$node and .previousPodUIDAbsent==true and .endpointCount==4' "$scratch/leave-scale-down.json" >/dev/null
+  jq -c --arg removed "$(managed_functional_node_id leave-u5)" '.certifiedIDs|map(select(.!=$removed))|sort' "$scratch/functional-leave-before.json" > "$scratch/leave-expected-final.json"
+  jq -e --slurpfile expected "$scratch/leave-expected-final.json" '.readyIDs==$expected[0]' "$scratch/leave-scale-down.json" >/dev/null
+  jq '.spec.voterCount=5' "$scratch/leave-cr.json" > "$scratch/leave-bad-cr.json"
+  if managed_functional_leave_scale_ready "$scratch/functional-leave-before.json" "$scratch/leave-bad-cr.json" "$scratch/leave-deploy.json" "$scratch/leave-pods.json" "$scratch/leave-endpoints.json" 4 "$scratch/leave-bad.json"; then return 1; fi
+  jq -n --argjson uids '["leave-u1","leave-u2","leave-u3","leave-u6"]' '{items:[$uids[]|{metadata:{uid:.},status:{conditions:[{type:"Ready",status:"True"}]}}]}' > "$scratch/leave-replacement.json"
+  if managed_functional_leave_scale_ready "$scratch/functional-leave-before.json" "$scratch/leave-cr.json" "$scratch/leave-deploy.json" "$scratch/leave-replacement.json" "$scratch/leave-endpoints.json" 4 "$scratch/leave-bad.json"; then return 1; fi
+  jq '.items[0].status.conditions[0].status="False"' "$scratch/leave-pods.json" > "$scratch/leave-not-ready.json"
+  if managed_functional_leave_scale_ready "$scratch/functional-leave-before.json" "$scratch/leave-cr.json" "$scratch/leave-deploy.json" "$scratch/leave-not-ready.json" "$scratch/leave-endpoints.json" 4 "$scratch/leave-bad.json"; then return 1; fi
+  jq '.subsets[0].addresses += [{targetRef:{uid:"leave-u5"}}]' "$scratch/leave-endpoints.json" > "$scratch/leave-bad-endpoints.json"
+  if managed_functional_leave_scale_ready "$scratch/functional-leave-before.json" "$scratch/leave-cr.json" "$scratch/leave-deploy.json" "$scratch/leave-pods.json" "$scratch/leave-bad-endpoints.json" 4 "$scratch/leave-bad.json"; then return 1; fi
+  jq -n --argjson finalRoster "$(cat "$scratch/leave-expected-final.json")" --arg removed "$(managed_functional_node_id leave-u5)" '{spec:{voterCount:4},status:{repair:{state:"Completed",plan:{sequence:"leave",operationID:"leave-op",oldNodeID:$removed,finalVoterIDs:$finalRoster},completion:{kind:"Terminal",operationID:"leave-op",finalVoterIDs:$finalRoster}}}}' > "$scratch/leave-complete.json"
+  managed_functional_leave_completion_oracle "$scratch/leave-complete.json" 4 "$(managed_functional_node_id leave-u5)" "$scratch/leave-expected-final.json" "$scratch/leave-certified.json"
+  jq -e --arg removed "$(managed_functional_node_id leave-u5)" --slurpfile expected "$scratch/leave-expected-final.json" '.removedNodeID==$removed' "$scratch/leave-certified.json" >/dev/null
+  for leave_mutation in add closed wrong-operation removed-in-final extra-final missing-final; do
+    case "$leave_mutation" in
+      add) filter='.status.repair.plan.sequence="add"' ;;
+      closed) filter='.status.repair.state="Closed"' ;;
+      wrong-operation) filter='.status.repair.completion.operationID="other-op"' ;;
+      removed-in-final) filter='.status.repair.completion.finalVoterIDs += [.status.repair.plan.oldNodeID]' ;;
+      extra-final) filter='.status.repair.completion.finalVoterIDs += ["extra"]' ;;
+      missing-final) filter='.status.repair.completion.finalVoterIDs |= .[1:]' ;;
+    esac
+    jq "$filter" "$scratch/leave-complete.json" > "$scratch/leave-bad-complete.json"
+    if managed_functional_leave_completion_oracle "$scratch/leave-bad-complete.json" 4 "$(managed_functional_node_id leave-u5)" "$scratch/leave-expected-final.json" "$scratch/leave-bad.json"; then return 1; fi
+  done
+  managed_functional_leave_http_ok 204 0 0
+  for leave_http in '200 0 0' '204 1 0' '204 0 1' '503 0 0'; do
+    leave_http_code=${leave_http%% *}
+    leave_http_rest=${leave_http#* }
+    leave_http_pod=${leave_http_rest%% *}
+    leave_http_wait=${leave_http_rest#* }
+    if managed_functional_leave_http_ok "$leave_http_code" "$leave_http_pod" "$leave_http_wait"; then return 1; fi
+  done
+  managed_functional_roster_oracle "$scratch/leave-complete.json" "$scratch/leave-pods.json" "$scratch/leave-deploy.json" "$scratch/leave-endpoints.json" 4 "$scratch/leave-roster.json" leave
+  if managed_functional_roster_oracle "$scratch/leave-complete.json" "$scratch/leave-pods.json" "$scratch/leave-deploy.json" "$scratch/leave-endpoints.json" 4 "$scratch/leave-roster-bad.json" add; then return 1; fi
+  private=$scratch namespace=managed-bootstrap
+  : > "$scratch/curl.conf"
+  k() {
+    case "$*" in
+      *"create secret generic functional-leave-voter-request"*) ;;
+      *"create -f - -o json"*) cat > "$scratch/leave-job-created.json"; printf '%s\n' '{"metadata":{"uid":"leave-job"}}' ;;
+      *"wait --for=condition=complete job/functional-leave-voter"*) ;;
+      *"get job functional-leave-voter -o json"*) printf '%s\n' '{"status":{"conditions":[{"type":"Complete","status":"True"}]}}' ;;
+      *"get pods -l job-name=functional-leave-voter -o json"*) printf '%s\n' '{"items":[{"status":{"containerStatuses":[{"name":"client","state":{"terminated":{"exitCode":0}}}]}}]}' ;;
+      *"logs job/functional-leave-voter"*) printf '\nRHIZA_HTTP_CODE=%s\n' "$leave_http_fixture" ;;
+      *) return 97 ;;
+    esac
+  }
+  leave_http_fixture=204
+  managed_functional_leave_voter leave-node
+  jq -e '.node_id=="leave-node"' "$scratch/functional-leave-voter-request.json" >/dev/null
+  jq -e '.spec.backoffLimit==0 and .spec.template.spec.restartPolicy=="Never" and .spec.template.spec.containers[0].args[-1]=="http://bootstrap-client.managed-bootstrap.svc.cluster.local:8080/leave-voter" and (.spec.template.spec.containers[0].args|index("--config"))!=null and (.spec.template.spec.containers[0].volumeMounts[0].mountPath=="/request")' "$scratch/leave-job-created.json" >/dev/null
+  [ "$(cut -f1-3 "$scratch/functional-leave-voter.meta.tsv" | tr '\t' ',')" = 204,0,0 ]
+  leave_http_fixture=200
+  if managed_functional_leave_voter leave-node 2>/dev/null; then return 1; fi
   namespace=managed-bootstrap selector=test-selector logs=$scratch
   mfsu_order="$scratch/scale-up-order.txt"
   k() {
@@ -582,8 +858,11 @@ EOF
   managed_functional_commit() { printf 'commit-%s\n' "$2" >> "$mfsu_order"; }
   managed_functional_stop_operator() { printf '%s\n' stop >> "$mfsu_order"; }
   managed_functional_wait_enrollment() { printf 'wait-%s\n' "$1" >> "$mfsu_order"; }
+  managed_functional_leave_scale_down() { printf '%s\n' leave-scale-down >> "$mfsu_order"; functional_leave_removed_node_id=leave-removed; }
+  managed_functional_leave_voter() { printf 'leave-post-%s\n' "$1" >> "$mfsu_order"; }
+  managed_functional_verify_leave() { printf '%s\n' leave-verify >> "$mfsu_order"; }
   managed_functional_scale_up
-  printf '%s\n' commit-scale-functional-3 stop patch-4 scale-4 wait-4 commit-scale-functional-4 patch-5 scale-5 wait-5 commit-scale-functional-5 > "$scratch/scale-up-expected.txt"
+  printf '%s\n' commit-scale-functional-3 stop patch-4 scale-4 wait-4 commit-scale-functional-4 patch-5 scale-5 wait-5 commit-scale-functional-5 leave-scale-down leave-post-leave-removed leave-verify > "$scratch/scale-up-expected.txt"
   cmp "$scratch/scale-up-expected.txt" "$mfsu_order"
   functional_client_pod=load-pod private=$scratch
   k() {
@@ -651,6 +930,13 @@ EOF
   k() { printf 'new-write\n'; }
   managed_functional_capture_one_stream writes /work/one-write.tsv
   grep -Fx 'new-write' "$scratch/functional-one-writes.tsv" >/dev/null
+  printf '%s\n' 'preserved-raw' > "$scratch/raw-capture"
+  k() { printf 'partial-raw\n'; return 1; }
+  managed_functional_capture_file "$scratch/raw-capture" /work/raw.body
+  grep -Fx 'preserved-raw' "$scratch/raw-capture" >/dev/null
+  k() { printf '%s\n' 'new-raw'; }
+  managed_functional_capture_file "$scratch/raw-capture" /work/raw.body
+  grep -Fx 'new-raw' "$scratch/raw-capture" >/dev/null
   k() {
     case "$*" in
       *"get pods -l test-selector -o json"*) printf '%s\n' '{"items":[{"metadata":{"name":"voter-a"}},{"metadata":{"name":"voter-b"}}]}' ;;

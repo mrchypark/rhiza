@@ -271,12 +271,12 @@ func TestRepairV1Alpha2HandoffSchema(t *testing.T) {
 			break
 		}
 	}
-	const wantFinalTargetRule = `self.replacement.nodeID in self.finalVoterIDs && (self.oldNodeID in self.finalVoterIDs) == (has(self.sequence) && self.sequence == "add")`
+	const wantFinalTargetRule = `(has(self.sequence) && self.sequence == "leave") ? (self.replacement.nodeID == self.oldNodeID && !(self.oldNodeID in self.finalVoterIDs)) : (self.replacement.nodeID in self.finalVoterIDs && (self.oldNodeID in self.finalVoterIDs) == (has(self.sequence) && self.sequence == "add"))`
 	if finalTargetRule != wantFinalTargetRule {
 		t.Fatalf("add-only final target must retain its old-voter witness: %q", finalTargetRule)
 	}
 	sequence := planProperties["sequence"].(map[string]any)
-	if !slices.Equal(sequence["enum"].([]any), []any{"removeThenAdd", "addThenRemove", "add"}) || slices.ContainsFunc(planSchema["required"].([]any), func(value any) bool {
+	if !slices.Equal(sequence["enum"].([]any), []any{"removeThenAdd", "addThenRemove", "add", "leave"}) || slices.ContainsFunc(planSchema["required"].([]any), func(value any) bool {
 		field, ok := value.(string)
 		return ok && field == "sequence"
 	}) {
