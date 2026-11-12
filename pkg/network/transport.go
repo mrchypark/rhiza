@@ -39,6 +39,17 @@ func managedKVExecutionPolicy(policy sqlpolicy.MaterializationPolicy) bool {
 
 const peerRPCTimeout = 5 * time.Second
 const checkpointPrepareTimeout = 5 * time.Minute
+const peerIdleTimeout = 30 * time.Second
+
+// Keep-alive stays disabled so superseded configuration transports release their connections.
+func newPeerQUICConfig(maxIdleTimeout time.Duration) *quic.Config {
+	return &quic.Config{
+		HandshakeIdleTimeout:  5 * time.Second,
+		MaxIdleTimeout:        maxIdleTimeout,
+		MaxIncomingStreams:    256,
+		MaxIncomingUniStreams: -1,
+	}
+}
 
 var errPeerRejected = errors.New("peer rejected request")
 var errTransportClosed = errors.New("peer transport is closed")
@@ -275,7 +286,7 @@ func newTransportWithProfile(clusterID types.ClusterID, localID quepaxa.NodeID, 
 			MinVersion: tls.VersionTLS13, NextProtos: []string{alpn},
 			ClientSessionCache: tls.NewLRUClientSessionCache(len(config.Members)),
 		},
-		quic: &quic.Config{HandshakeIdleTimeout: 5 * time.Second, MaxIdleTimeout: 30 * time.Second, KeepAlivePeriod: 10 * time.Second, MaxIncomingStreams: 256}, dynamic: make(map[uint]*Transport),
+		quic: newPeerQUICConfig(peerIdleTimeout), dynamic: make(map[uint]*Transport),
 	}, nil
 }
 
