@@ -108,6 +108,7 @@ managed_functional_load_oracle() {
   mfl_down2_503=$(awk -F '\t' '$2=="down-2" && $5==503{n++} END{print n+0}' "$mfl_write" "$mfl_read")
   mfl_one_writes=$(awk -F '\t' '$2=="one-survivor" && $3=="write"{n++} END{print n+0}' "$mfl_write")
   mfl_one_reads=$(awk -F '\t' '$2=="one-survivor" && $3=="linearizable-read"{n++} END{print n+0}' "$mfl_read")
+  mfl_one_linear_200=$(awk -F '\t' '$2=="one-survivor" && $3=="linearizable-read" && $5==200{n++} END{print n+0}' "$mfl_read")
   mfl_one_acked=$(awk -F '\t' '$2=="one-survivor" && $3=="write" && index($7,"\"status\":\"committed\"")>0{n++} END{print n+0}' "$mfl_write")
   mfl_write_200_noncommit=$(awk -F '\t' '$5==200 && $3=="write" && index($7,"\"status\":\"committed\"")==0{n++} END{print n+0}' "$mfl_write")
   mfl_write_timeout=$(awk -F '\t' '$5=="000" && $6==28{n++} END{print n+0}' "$mfl_write")
@@ -117,17 +118,18 @@ managed_functional_load_oracle() {
   [ "$mfl_up3_writes" -gt 0 ] && [ "$mfl_up3_reads" -gt 0 ] || return 1
   [ "$mfl_up3_503" = 0 ] || return 1
   [ "$mfl_one_writes" -gt 0 ] && [ "$mfl_one_reads" -gt 0 ] || return 1
+  [ "$mfl_one_linear_200" = 0 ] || return 1
   [ "$mfl_one_acked" = 0 ] || return 1
   [ "$mfl_write_200_noncommit" = 0 ] || return 1
   awk -F '\t' '{n[$5]++} END{for(code in n) print code"\t"n[code]}' "$mfl_write" "$mfl_read" | sort -n > "$logs/functional-http-codes.tsv"
   jq -n \
     --argjson up3w "$mfl_up3_writes" --argjson up3r "$mfl_up3_reads" \
-    --argjson onew "$mfl_one_writes" --argjson oner "$mfl_one_reads" --argjson down2503 "$mfl_down2_503" \
+    --argjson onew "$mfl_one_writes" --argjson oner "$mfl_one_reads" --argjson onelinear200 "$mfl_one_linear_200" --argjson down2503 "$mfl_down2_503" \
     --argjson w503 "$(wc -l < "$logs/functional-write-503.tsv" | tr -d ' ')" \
     --argjson r503 "$(wc -l < "$logs/functional-read-503.tsv" | tr -d ' ')" \
     --argjson wtimeout "$mfl_write_timeout" --argjson rtimeout "$mfl_read_timeout" \
     --argjson wother "$mfl_write_other" --argjson rother "$mfl_read_other" --argjson wnoncommit "$mfl_write_200_noncommit" \
-    '{stages:{down2:{http503:$down2503},up3:{writes:$up3w,reads:$up3r,http503:0},oneSurvivor:{writes:$onew,reads:$oner,committedWrites:0}},failures:{http503:{writes:$w503,reads:$r503,total:($w503+$r503)},deadline:{writes:$wtimeout,reads:$rtimeout,total:($wtimeout+$rtimeout)},other:{writes:$wother,reads:$rother,total:($wother+$rother)},http200WriteWithoutCommit:$wnoncommit},all503RowsRetained:true}' > "$mfl_out"
+    '{stages:{down2:{http503:$down2503},up3:{writes:$up3w,reads:$up3r,http503:0},oneSurvivor:{writes:$onew,reads:$oner,committedWrites:0,linearizableHTTP200:$onelinear200}},failures:{http503:{writes:$w503,reads:$r503,total:($w503+$r503)},deadline:{writes:$wtimeout,reads:$rtimeout,total:($wtimeout+$rtimeout)},other:{writes:$wother,reads:$rother,total:($wother+$rother)},http200WriteWithoutCommit:$wnoncommit},all503RowsRetained:true}' > "$mfl_out"
 }
 
 managed_functional_write_load_script() {
@@ -136,13 +138,19 @@ managed_functional_write_load_script() {
 set -u
 mode=$1
 n=0
+stage=initial
 while [ ! -f /work/stop ]; do
   n=$((n+1))
-  stage=$(cat /work/stage 2>/dev/null || printf initial)
+  next_stage=$(cat /work/stage 2>/dev/null || :)
+  [ -z "$next_stage" ] || stage=$next_stage
   if [ "$mode" = write ]; then
-    row=$((100000+n))
+    case "$stage" in
+      one-survivor) row_base=900000 ;;
+      *) row_base=100000 ;;
+    esac
+    row=$((row_base+n))
     value="functional-$n-$$"
-    body="{\"request_id\":\"functional-write-$n-$$\",\"sql\":\"INSERT INTO bootstrap_ci VALUES ($row,'$value')\"}"
+    body="{\"request_id\":\"functional-$stage-write-$n-$$\",\"sql\":\"INSERT INTO bootstrap_ci VALUES ($row,'$value')\"}"
     route=execute
   else
     body='{"sql":"SELECT id FROM bootstrap_ci ORDER BY id","consistency":"linearizable"}'
@@ -229,6 +237,41 @@ managed_functional_wait_up3_samples() {
   done
 }
 
+managed_functional_wait_single_survivor() {
+  mfwss_uid=
+  mfwss_ip=
+  mfwss_samples=0
+  mfwss_deadline=$(( $(date +%s) + 120 ))
+  while :; do
+    k -n "$namespace" get pods -l "$selector" -o json > "$logs/functional-one-pods.json" 2>/dev/null || :
+    mfwss_ready=$(jq '[.items[]|select(any(.status.conditions[]?; .type=="Ready" and .status=="True"))]|length' "$logs/functional-one-pods.json" 2>/dev/null || printf 0)
+    mfwss_total=$(jq '.items|length' "$logs/functional-one-pods.json" 2>/dev/null || printf 0)
+    if [ "$mfwss_ready" = 1 ] && [ "$mfwss_total" = 1 ]; then
+      mfwss_next_uid=$(jq -r '.items[0].metadata.uid // ""' "$logs/functional-one-pods.json")
+      mfwss_next_ip=$(jq -r '.items[0].status.podIP // ""' "$logs/functional-one-pods.json")
+      mfwss_live=$(jq -r '.items[0].metadata.deletionTimestamp==null' "$logs/functional-one-pods.json")
+      if [ "$mfwss_live" = true ] && [ -n "$mfwss_next_uid" ] && [ -n "$mfwss_next_ip" ] && [ "$mfwss_next_uid" = "$mfwss_uid" ] && [ "$mfwss_next_ip" = "$mfwss_ip" ]; then
+        mfwss_samples=$((mfwss_samples+1))
+      else
+        mfwss_uid=$mfwss_next_uid
+        mfwss_ip=$mfwss_next_ip
+        mfwss_samples=1
+      fi
+    else
+      mfwss_uid=
+      mfwss_ip=
+      mfwss_samples=0
+    fi
+    if [ "$mfwss_samples" -ge 5 ]; then
+      functional_survivor_ip=$mfwss_ip
+      jq -n --arg uid "$mfwss_uid" --arg ip "$mfwss_ip" --argjson samples "$mfwss_samples" '{uid:$uid,ip:$ip,totalPods:1,readyPods:1,consecutiveReadyObservations:$samples}' > "$logs/functional-one-convergence.json"
+      return 0
+    fi
+    [ "$(date +%s)" -lt "$mfwss_deadline" ] || { echo 'single-voter readiness did not converge' >&2; return 1; }
+    sleep 1
+  done
+}
+
 managed_functional_stop_load() {
   k -n "$namespace" exec "$functional_client_pod" -c client -- touch /work/stop >/dev/null 2>&1 || :
   mfst_deadline=$(( $(date +%s) + 30 ))
@@ -256,6 +299,20 @@ managed_functional_start_survivor_load() {
   sleep 2
 }
 
+managed_functional_start_survivor_phase() {
+  managed_functional_wait_single_survivor || return 1
+  managed_functional_stage one-survivor
+  managed_functional_start_survivor_load
+}
+
+managed_functional_capture_one_stream() {
+  mfcos_name=$1 mfcos_remote=$2
+  mfcos_candidate="$logs/functional-one-$mfcos_name.capture.tsv"
+  if k -n "$namespace" exec "$functional_client_pod" -c client -- cat "$mfcos_remote" > "$mfcos_candidate" 2>/dev/null && [ -s "$mfcos_candidate" ]; then
+    mv "$mfcos_candidate" "$logs/functional-one-$mfcos_name.tsv"
+  fi
+}
+
 managed_functional_stop_survivor_load() {
   k -n "$namespace" exec "$functional_client_pod" -c client -- touch /work/stop >/dev/null 2>&1 || :
   mfssl_deadline=$(( $(date +%s) + 30 ))
@@ -268,12 +325,28 @@ managed_functional_stop_survivor_load() {
     wait "$functional_survivor_pid" 2>/dev/null || :
     functional_survivor_pid=
   fi
-  k -n "$namespace" exec "$functional_client_pod" -c client -- cat /work/one-write.tsv > "$logs/functional-one-writes.tsv" 2>/dev/null || :
-  k -n "$namespace" exec "$functional_client_pod" -c client -- cat /work/one-read.tsv > "$logs/functional-one-reads.tsv" 2>/dev/null || :
+  managed_functional_capture_one_stream writes /work/one-write.tsv
+  managed_functional_capture_one_stream reads /work/one-read.tsv
   k -n "$namespace" exec "$functional_client_pod" -c client -- touch /work/probe-done >/dev/null 2>&1 || :
   k -n "$namespace" wait --for=condition=complete job/functional-load --timeout=90s > "$logs/functional-load-complete.txt" 2>&1 || :
   cat "$logs/functional-writes.tsv" "$logs/functional-one-writes.tsv" > "$logs/functional-all-writes.tsv"
   cat "$logs/functional-reads.tsv" "$logs/functional-one-reads.tsv" > "$logs/functional-all-reads.tsv"
+}
+
+managed_functional_capture_voter_logs() {
+  mfcvl_phase=$1
+  mfcvl_result=0
+  mfcvl_pods="$logs/functional-voter-$mfcvl_phase-pods.json"
+  if ! k -n "$namespace" get pods -l "$selector" -o json > "$mfcvl_pods" 2> "$logs/functional-voter-$mfcvl_phase-pods-errors.txt"; then
+    return 1
+  fi
+  for mfcvl_pod in $(jq -r '.items[].metadata.name' "$mfcvl_pods"); do
+    if ! k -n "$namespace" logs "$mfcvl_pod" -c sql > "$logs/functional-voter-$mfcvl_phase-$mfcvl_pod-current.log" 2> "$logs/functional-voter-$mfcvl_phase-$mfcvl_pod-current-errors.txt"; then
+      mfcvl_result=1
+    fi
+    k -n "$namespace" logs "$mfcvl_pod" -c sql --previous > "$logs/functional-voter-$mfcvl_phase-$mfcvl_pod-previous.log" 2> "$logs/functional-voter-$mfcvl_phase-$mfcvl_pod-previous-errors.txt" || :
+  done
+  return "$mfcvl_result"
 }
 
 managed_functional_probe() {
@@ -319,8 +392,8 @@ managed_functional_capture() {
     k -n "$namespace" logs job/functional-load --all-containers=true > "$logs/functional-load.log" 2> "$logs/functional-load-errors.txt" || :
     awk -F '\t' '$3=="write"' "$logs/functional-load.log" > "$logs/functional-writes.tsv" 2>/dev/null || :
     awk -F '\t' '$3=="linearizable-read"' "$logs/functional-load.log" > "$logs/functional-reads.tsv" 2>/dev/null || :
-    k -n "$namespace" exec "$functional_client_pod" -c client -- sh -c 'test ! -f /work/one-write.tsv || cat /work/one-write.tsv' > "$logs/functional-one-writes.tsv" 2>/dev/null || :
-    k -n "$namespace" exec "$functional_client_pod" -c client -- sh -c 'test ! -f /work/one-read.tsv || cat /work/one-read.tsv' > "$logs/functional-one-reads.tsv" 2>/dev/null || :
+    managed_functional_capture_one_stream writes /work/one-write.tsv
+    managed_functional_capture_one_stream reads /work/one-read.tsv
     cat "$logs/functional-writes.tsv" "$logs/functional-one-writes.tsv" > "$logs/functional-all-writes.tsv" 2>/dev/null || :
     cat "$logs/functional-reads.tsv" "$logs/functional-one-reads.tsv" > "$logs/functional-all-reads.tsv" 2>/dev/null || :
     k -n "$namespace" exec "$functional_client_pod" -c client -- touch /work/probe-done >/dev/null 2>&1 || :
@@ -376,8 +449,7 @@ managed_functional_quorum() {
   if ! managed_functional_wait_up3_samples; then mfq_result=1; fi
   if ! managed_functional_stop_load; then mfq_result=1; fi
   if ! managed_functional_service_readback; then mfq_result=1; fi
-  managed_functional_stage one-survivor
-  if ! managed_functional_start_survivor_load; then mfq_result=1; fi
+  if ! managed_functional_capture_voter_logs up-3-before-scale-down; then mfq_result=1; fi
   # Remove a gated replacement before reducing to one, so the survivor is a
   # previously Ready data-bearing voter rather than an unstarted candidate.
   k -n "$namespace" scale "deployment/$mfq_deployment" --replicas=2 > "$logs/functional-scale-down-before-one.txt"
@@ -391,16 +463,7 @@ managed_functional_quorum() {
     sleep 1
   done
   k -n "$namespace" scale "deployment/$mfq_deployment" --replicas=1 > "$logs/functional-scale-one.txt"
-  mfq_deadline=$(( $(date +%s) + 120 ))
-  while :; do
-    k -n "$namespace" get pods -l "$selector" -o json > "$logs/functional-one-pods.json"
-    mfq_ready=$(jq '[.items[]|select(any(.status.conditions[]?;.type=="Ready" and .status=="True"))]|length' "$logs/functional-one-pods.json")
-    mfq_total=$(jq '.items|length' "$logs/functional-one-pods.json")
-    [ "$mfq_ready" = 1 ] && [ "$mfq_total" = 1 ] && break
-    [ "$(date +%s)" -lt "$mfq_deadline" ] || { echo 'scale to one did not leave one Ready voter' >&2; return 1; }
-    sleep 1
-  done
-  functional_survivor_ip=$(jq -r '.items[0].status.podIP' "$logs/functional-one-pods.json")
+  managed_functional_start_survivor_phase || { echo 'single-survivor load phase did not start' >&2; return 1; }
   managed_functional_probe local-read query '{"sql":"SELECT id,value FROM bootstrap_ci WHERE id=1","consistency":"local"}' 15
   managed_functional_probe failed-write execute '{"request_id":"functional-no-quorum-write","sql":"INSERT INTO bootstrap_ci VALUES (999999,'\''must-not-ack'\'')"}' 8
   managed_functional_probe failed-linear query '{"sql":"SELECT id FROM bootstrap_ci ORDER BY id","consistency":"linearizable"}' 8
@@ -438,7 +501,7 @@ managed_functional_self_test() (
   set -eu
   test "$(managed_functional_node_id test-uid)" = rhiza-n-a48858a1777167efb162008f1b8cdf11efbcd0aea8145193ba000e7c6d1c7381
   scratch=$(mktemp -d)
-  trap 'rm -f "$scratch"/*; rmdir "$scratch"' EXIT HUP INT TERM
+  trap 'find "$scratch" -depth -delete' EXIT HUP INT TERM
   jq -n '{spec:{voterCount:1},status:{repair:{state:"Completed",plan:{sequence:"add"},completion:{kind:"Terminal",finalVoterIDs:["rhiza-n-a48858a1777167efb162008f1b8cdf11efbcd0aea8145193ba000e7c6d1c7381"]}}}}' > "$scratch/cr.json"
   jq -n '{items:[{metadata:{uid:"test-uid"},status:{conditions:[{type:"Ready",status:"True"}]}}]}' > "$scratch/pods.json"
   jq -n '{items:[{spec:{replicas:1}}]}' > "$scratch/deploy.json"
@@ -465,13 +528,43 @@ managed_functional_self_test() (
   printf '1\tup-3\tlinearizable-read\t1\t200\t0\t{"rows":[[1]]}\n2\tone-survivor\tlinearizable-read\t2\t000\t28\t\n' > "$scratch/reads.tsv"
   logs=$scratch managed_functional_load_oracle "$scratch/writes.tsv" "$scratch/reads.tsv" "$scratch/summary.json"
   jq -e '.stages.up3.http503==0 and .failures.http503.total==1 and .failures.deadline.total==1' "$scratch/summary.json" >/dev/null
+  cat "$scratch/reads.tsv" > "$scratch/bad-reads.tsv"
+  printf '3\tone-survivor\tlinearizable-read\t3\t200\t0\t{"rows":[[1]]}\n' >> "$scratch/bad-reads.tsv"
+  if logs=$scratch managed_functional_load_oracle "$scratch/writes.tsv" "$scratch/bad-reads.tsv" "$scratch/bad-summary.json" 2>/dev/null; then return 1; fi
   managed_functional_write_load_script "$scratch/load.sh"
   sh -n "$scratch/load.sh"
   managed_functional_load_job test-image > "$scratch/load-job.json"
   jq -e --arg image test-image '.apiVersion=="batch/v1" and .kind=="Job" and .metadata.name=="functional-load" and .spec.template.spec.containers[0].image==$image and (.spec.template.spec.containers[0].volumeMounts|length)==3 and (.spec.template.spec.volumes|length)==3' "$scratch/load-job.json" >/dev/null
   grep -F 'op=linearizable-read' "$scratch/load.sh" >/dev/null
   # shellcheck disable=SC2016 # Verify the generated script retains its variables.
+  grep -F 'functional-$stage-write-$n-$$' "$scratch/load.sh" >/dev/null
+  grep -F 'one-survivor) row_base=900000' "$scratch/load.sh" >/dev/null
+  # shellcheck disable=SC2016 # Verify the generated script retains its variables.
   grep -F '"$op" "$n"' "$scratch/load.sh" >/dev/null
+  mkdir "$scratch/work"
+  printf 'initial' > "$scratch/work/stage"
+  sed "s#/work#$scratch/work#g" "$scratch/load.sh" > "$scratch/load-test.sh"
+  cat > "$scratch/curl" <<'EOF'
+#!/bin/sh
+out=
+while [ "$#" -gt 0 ]; do
+  case "$1" in --output) out=$2; shift ;; esac
+  shift
+done
+count=$(cat "$LOAD_WORK/count" 2>/dev/null || printf 0)
+count=$((count + 1))
+printf '%s' "$count" > "$LOAD_WORK/count"
+case "$count" in
+  1) printf 'down-2' > "$LOAD_WORK/stage" ;;
+  2) printf 'up-3' > "$LOAD_WORK/stage" ;;
+  3) : > "$LOAD_WORK/stop" ;;
+esac
+[ -z "$out" ] || printf '%s' '{"slot":1,"status":"committed","rows_affected":1,"last_insert_id":100001,"retry_through_slot":1}' > "$out"
+printf '200'
+EOF
+  chmod 0755 "$scratch/curl"
+  PATH="$scratch:$PATH" LOAD_WORK="$scratch/work" sh "$scratch/load-test.sh" write > "$scratch/stage-per-request.tsv"
+  [ "$(awk -F '\t' '{printf "%s%s",sep,$2; sep=","}' "$scratch/stage-per-request.tsv")" = initial,down-2,up-3 ]
   printf 'not-a-row\n' > "$scratch/writes.tsv"
   if managed_functional_load_oracle "$scratch/writes.tsv" "$scratch/reads.tsv" "$scratch/bad.json" 2>/dev/null; then return 1; fi
   namespace=managed-bootstrap selector=test-selector logs=$scratch
@@ -502,6 +595,19 @@ managed_functional_self_test() (
   functional_survivor_pid=
   survivor_stopped=0
   sleep() { :; }
+  convergence_polls=0
+  k() {
+    convergence_polls=$((convergence_polls+1))
+    if [ "$convergence_polls" = 4 ]; then
+      printf '%s\n' '{"items":[]}'
+    else
+      printf '%s\n' '{"items":[{"metadata":{"uid":"survivor-a"},"status":{"podIP":"10.0.0.8","conditions":[{"type":"Ready","status":"True"}]}}]}'
+    fi
+  }
+  managed_functional_wait_single_survivor
+  [ "$convergence_polls" = 9 ]
+  [ "$functional_survivor_ip" = 10.0.0.8 ]
+  jq -e '.uid=="survivor-a" and .ip=="10.0.0.8" and .totalPods==1 and .readyPods==1 and .consecutiveReadyObservations==5' "$scratch/functional-one-convergence.json" >/dev/null
   k() {
     case "$*" in
       *"exec load-pod -c client -- sh -c"*) printf '%s\n' "$*" > "$scratch/survivor-command" ;;
@@ -528,6 +634,35 @@ managed_functional_self_test() (
   managed_functional_stop_survivor_load
   [ "$(awk -F '\t' '$2=="one-survivor" && $3=="write"{n++} END{print n+0}' "$scratch/functional-one-writes.tsv")" -gt 0 ]
   [ "$(awk -F '\t' '$2=="one-survivor" && $3=="linearizable-read"{n++} END{print n+0}' "$scratch/functional-one-reads.tsv")" -gt 0 ]
+  phase_order="$scratch/survivor-phase-order.txt"
+  managed_functional_wait_single_survivor() { printf '%s\n' converge >> "$phase_order"; }
+  managed_functional_stage() { printf 'stage-%s\n' "$1" >> "$phase_order"; }
+  managed_functional_start_survivor_load() { printf '%s\n' start >> "$phase_order"; }
+  managed_functional_start_survivor_phase
+  printf '%s\n' converge stage-one-survivor start > "$scratch/survivor-phase-expected.txt"
+  cmp "$scratch/survivor-phase-expected.txt" "$phase_order"
+  printf 'preserved-write\n' > "$scratch/functional-one-writes.tsv"
+  k() { printf 'partial-read\n'; return 1; }
+  managed_functional_capture_one_stream writes /work/one-write.tsv
+  grep -Fx 'preserved-write' "$scratch/functional-one-writes.tsv" >/dev/null
+  k() { :; }
+  managed_functional_capture_one_stream writes /work/one-write.tsv
+  grep -Fx 'preserved-write' "$scratch/functional-one-writes.tsv" >/dev/null
+  k() { printf 'new-write\n'; }
+  managed_functional_capture_one_stream writes /work/one-write.tsv
+  grep -Fx 'new-write' "$scratch/functional-one-writes.tsv" >/dev/null
+  k() {
+    case "$*" in
+      *"get pods -l test-selector -o json"*) printf '%s\n' '{"items":[{"metadata":{"name":"voter-a"}},{"metadata":{"name":"voter-b"}}]}' ;;
+      *"logs voter-a -c sql --previous"*|*"logs voter-b -c sql --previous"*) return 1 ;;
+      *"logs voter-a -c sql"*) printf 'unavailable-a\n' ;;
+      *"logs voter-b -c sql"*) printf 'unavailable-b\n' ;;
+      *) return 97 ;;
+    esac
+  }
+  managed_functional_capture_voter_logs phase
+  grep -Fx 'unavailable-a' "$scratch/functional-voter-phase-voter-a-current.log" >/dev/null
+  grep -Fx 'unavailable-b' "$scratch/functional-voter-phase-voter-b-current.log" >/dev/null
   printf '%s\n' 'PASS: managed functional scale oracles'
 )
 
