@@ -14,6 +14,7 @@ import (
 	"path/filepath"
 	"reflect"
 
+	"github.com/mrchypark/rhiza/internal/atomicdir"
 	objectstore "github.com/mrchypark/rhiza/internal/objstore"
 	"github.com/mrchypark/rhiza/internal/sqlpolicy"
 	"github.com/mrchypark/rhiza/internal/types"
@@ -251,6 +252,163 @@ func ReadGateFile(path string, dst any, limit int64, private bool) error {
 	return nil
 }
 
+func repairPreparationFailed(err error) error {
+	return fmt.Errorf("repair preparation failed: %w", err)
+}
+
+func repairPreparedVerificationFailed(err error) error {
+	return fmt.Errorf("repair prepared data verification failed: %w", err)
+}
+
+func inspectRepairPreparedDirectory(path string) (exists, complete bool, err error) {
+	if err := safeRepairDirectoryParent(path); err != nil {
+		return false, false, err
+	}
+	info, err := os.Lstat(path)
+	if errors.Is(err, os.ErrNotExist) {
+		return false, false, nil
+	}
+	if err != nil {
+		return false, false, err
+	}
+	if !info.IsDir() || info.Mode()&os.ModeSymlink != 0 {
+		return false, false, errors.New("unsafe repair prepared directory")
+	}
+	marker, err := os.Lstat(filepath.Join(path, "completed.json"))
+	if errors.Is(err, os.ErrNotExist) {
+		return true, false, nil
+	}
+	if err != nil {
+		return false, false, err
+	}
+	if !marker.Mode().IsRegular() {
+		return false, false, errors.New("unsafe repair prepared completion marker")
+	}
+	return true, true, nil
+}
+
+func safeRepairDirectoryParent(path string) error {
+	info, err := os.Lstat(filepath.Dir(path))
+	if err != nil || !info.IsDir() || info.Mode()&os.ModeSymlink != 0 {
+		return errors.New("unsafe repair directory parent")
+	}
+	return nil
+}
+
+func reserveRepairSiblingPath(parent, prefix string) (string, error) {
+	if prefix == "" || filepath.Base(prefix) != prefix {
+		return "", errors.New("invalid repair sibling prefix")
+	}
+	if err := safeRepairDirectoryParent(filepath.Join(parent, prefix)); err != nil {
+		return "", err
+	}
+	f, err := os.CreateTemp(parent, prefix)
+	if err != nil {
+		return "", err
+	}
+	name := f.Name()
+	if err := errors.Join(f.Close(), os.Remove(name)); err != nil {
+		return "", err
+	}
+	return name, nil
+}
+
+func quarantineRepairDirectory(path, prefix string) (string, error) {
+	info, err := os.Lstat(path)
+	if err != nil || !info.IsDir() || info.Mode()&os.ModeSymlink != 0 {
+		return "", errors.New("unsafe repair quarantine source")
+	}
+	parent := filepath.Dir(path)
+	target, err := reserveRepairSiblingPath(parent, prefix)
+	if err != nil {
+		return "", err
+	}
+	if err := atomicdir.RenameNoReplace(path, target); err != nil {
+		return "", fmt.Errorf("quarantine repair directory: %w", err)
+	}
+	return target, nil
+}
+
+func ensureRepairPreparedDirectory(path string, validate, publish func() error) error {
+	exists, complete, err := inspectRepairPreparedDirectory(path)
+	if err != nil {
+		return err
+	}
+	if complete {
+		if err := validate(); err == nil {
+			return nil
+		}
+		complete = false
+	}
+	if exists && !complete {
+		if _, err := quarantineRepairDirectory(path, "."+filepath.Base(path)+"-quarantine-"); err != nil {
+			return err
+		}
+	}
+	if !complete {
+		if err := publish(); err != nil {
+			return err
+		}
+		exists, complete, err = inspectRepairPreparedDirectory(path)
+		if err != nil {
+			return err
+		}
+		if !exists || !complete {
+			return errors.New("repair prepared directory publication is incomplete")
+		}
+		if err := validate(); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func ensureUnadoptedRepairDataDirAbsent(dataDir string) error {
+	if err := safeRepairDirectoryParent(dataDir); err != nil {
+		return err
+	}
+	info, err := os.Lstat(dataDir)
+	if errors.Is(err, os.ErrNotExist) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	if !info.IsDir() || info.Mode()&os.ModeSymlink != 0 {
+		return errors.New("unsafe repair data directory")
+	}
+	adoption, err := os.Lstat(filepath.Join(dataDir, "prepared-adoption.json"))
+	if err == nil {
+		if adoption.Mode().IsRegular() {
+			return errors.New("repair adoption appeared during preparation")
+		}
+		return errors.New("unsafe repair adoption record")
+	}
+	if !errors.Is(err, os.ErrNotExist) {
+		return err
+	}
+	_, err = quarantineRepairDirectory(dataDir, "."+filepath.Base(dataDir)+"-quarantine-")
+	return err
+}
+
+func validateRepairPromotionPaths(stagingDir, finalDir string) error {
+	stagingDir = filepath.Clean(stagingDir)
+	finalDir = filepath.Clean(finalDir)
+	if stagingDir == finalDir || filepath.Dir(stagingDir) != filepath.Dir(finalDir) || filepath.Base(stagingDir) == "." || filepath.Base(finalDir) == "." {
+		return errors.New("ambiguous repair staging and final directories")
+	}
+	if err := safeRepairDirectoryParent(finalDir); err != nil {
+		return err
+	}
+	if _, err := os.Lstat(stagingDir); !errors.Is(err, os.ErrNotExist) {
+		return errors.New("repair staging directory is not absent")
+	}
+	if _, err := os.Lstat(finalDir); !errors.Is(err, os.ErrNotExist) {
+		return errors.New("repair final directory is not absent")
+	}
+	return nil
+}
+
 // The returned cleanup owns only the SDK handle. Failed/partial local evidence
 // is preserved; an existing adopted DataDir is never reconstructed over itself.
 func ManagedRepairConfig(ctx context.Context, kube *operator.Kubernetes, ref operator.V1Alpha2ClusterRef, podName, podUID, identity, bootstrapPath, repairPath string, profile operator.V1Alpha2RuntimeProfile) (managedsql.Config, func() error, error) {
@@ -307,6 +465,16 @@ func ManagedRepairConfig(ctx context.Context, kube *operator.Kubernetes, ref ope
 	if err != nil || capture.SourceRoot != cfg.StorageRoot || capture.SourcePrefix != namespace.FinalPrefix || capture.PhysicalBinding != physical || cfg.Plan.PhysicalBinding != physical {
 		return empty, noop, errors.New("repair physical profile mismatch")
 	}
+	dataInfo, err := os.Lstat(cfg.Runtime.DataDir)
+	if err == nil && (!dataInfo.IsDir() || dataInfo.Mode()&os.ModeSymlink != 0) {
+		return empty, noop, errors.New("unsafe repair data directory")
+	}
+	if err != nil && !errors.Is(err, os.ErrNotExist) {
+		return empty, noop, errors.New("adoption inspection failed")
+	}
+	if err := safeRepairDirectoryParent(cfg.Runtime.DataDir); err != nil {
+		return empty, noop, errors.New("adoption inspection failed")
+	}
 	adoption, err := os.Lstat(filepath.Join(cfg.Runtime.DataDir, "prepared-adoption.json"))
 	if err == nil {
 		if !adoption.Mode().IsRegular() {
@@ -358,21 +526,26 @@ func ManagedRepairConfig(ctx context.Context, kube *operator.Kubernetes, ref ope
 	}
 	expected := recovery.PreparedStartupIdentity{ClusterUID: ref.UID, Generation: cfg.Plan.Generation, DeploymentUID: cfg.Plan.DeploymentUID, PodUID: podUID, NodeID: string(cfg.Runtime.NodeID), SourceBinding: physical, ConfigDigest: member}
 	preparedDir := filepath.Join(filepath.Dir(cfg.Runtime.DataDir), "repair-prepared-"+capture.PlanDigest)
-	if _, err := os.Lstat(preparedDir); errors.Is(err, os.ErrNotExist) {
-		if err := recovery.PublishPreparedStartupForPolicy(ctx, view, preparedDir, expected, policy, window); err != nil {
-			return fail(errors.New("repair preparation failed"))
-		}
-	} else if err != nil {
-		return fail(err)
+	if err := ensureRepairPreparedDirectory(preparedDir, func() error {
+		return recovery.ValidatePreparedStartupDirectoryForPolicy(ctx, preparedDir, expected, policy, window, protocol)
+	}, func() error {
+		return recovery.PublishPreparedStartupForPolicy(ctx, view, preparedDir, expected, policy, window)
+	}); err != nil {
+		return fail(repairPreparationFailed(err))
 	}
-	var prepared *recovery.VerifiedPreparedStartup
-	if sqlpolicy.IsManagedAppendOnlyApplicationProtocol(protocol) {
-		prepared, err = recovery.LoadPreparedStartupForApplicationProtocol(ctx, readonly, capture.SourcePrefix, 1, trusted, preparedDir, cfg.Runtime.DataDir, expected, policy, window, protocol, c.EnableReconfiguration)
-	} else {
-		prepared, err = recovery.LoadPreparedStartupForPolicyWithReconfiguration(ctx, readonly, capture.SourcePrefix, 1, trusted, preparedDir, cfg.Runtime.DataDir, expected, policy, window, c.EnableReconfiguration)
+	if err := ensureUnadoptedRepairDataDirAbsent(cfg.Runtime.DataDir); err != nil {
+		return fail(repairPreparedVerificationFailed(err))
 	}
+	stagingDir, err := reserveRepairSiblingPath(filepath.Dir(cfg.Runtime.DataDir), ".repair-data-staging-"+capture.PlanDigest+"-")
 	if err != nil {
-		return fail(errors.New("repair prepared data verification failed"))
+		return fail(repairPreparedVerificationFailed(err))
+	}
+	if err := validateRepairPromotionPaths(stagingDir, cfg.Runtime.DataDir); err != nil {
+		return fail(repairPreparedVerificationFailed(err))
+	}
+	prepared, err := recovery.LoadPreparedStartupForPolicyIntoStagingAndPromote(ctx, readonly, capture.SourcePrefix, 1, trusted, preparedDir, stagingDir, cfg.Runtime.DataDir, expected, policy, window, protocol, c.EnableReconfiguration)
+	if err != nil {
+		return fail(repairPreparedVerificationFailed(err))
 	}
 	cfg.Prepared = prepared
 	return cfg, closeBucket, nil

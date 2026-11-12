@@ -12,6 +12,7 @@ import (
 	"path/filepath"
 	"strings"
 
+	"github.com/mrchypark/rhiza/internal/atomicdir"
 	"github.com/mrchypark/rhiza/internal/sqlpolicy"
 	"github.com/mrchypark/rhiza/internal/types"
 	"github.com/mrchypark/rhiza/pkg/checkpoint"
@@ -200,110 +201,164 @@ func LoadPreparedStartupForApplicationProtocol(ctx context.Context, bucket objst
 	return loadPreparedStartupForPolicy(ctx, bucket, prefix, configID, bootstrap, handoffDir, verifiedTargetDir, expected, policy, window, &reconfiguration, applicationProtocol)
 }
 
-func loadPreparedStartupForPolicy(ctx context.Context, bucket objstore.Bucket, prefix string, configID uint, bootstrap quepaxa.Cluster, handoffDir, verifiedTargetDir string, expected PreparedStartupIdentity, policy sqlpolicy.MaterializationPolicy, window uint64, trustedReconfiguration *bool, applicationProtocol string) (*VerifiedPreparedStartup, error) {
-	if err := validatePreparedProfile(expected, policy, window, applicationProtocol); err != nil {
+// LoadPreparedStartupForPolicyIntoStagingAndPromote verifies and reconstructs
+// into an absent sibling staging directory, then atomically promotes it to the
+// absent final directory. The returned verified object names the final path.
+// A failed reconstruction leaves staging for diagnosis; this function never
+// removes partial evidence or replaces an existing final directory.
+func LoadPreparedStartupForPolicyIntoStagingAndPromote(ctx context.Context, bucket objstore.Bucket, prefix string, configID uint, bootstrap quepaxa.Cluster, handoffDir, stagingDir, finalDir string, expected PreparedStartupIdentity, policy sqlpolicy.MaterializationPolicy, window uint64, applicationProtocol string, reconfiguration bool) (*VerifiedPreparedStartup, error) {
+	prepared, err := loadPreparedStartupForPolicy(ctx, bucket, prefix, configID, bootstrap, handoffDir, stagingDir, expected, policy, window, &reconfiguration, applicationProtocol)
+	if err != nil {
 		return nil, err
+	}
+	if err := promotePreparedStartupDirectory(stagingDir, finalDir); err != nil {
+		return nil, err
+	}
+	prepared.dir = filepath.Clean(finalDir)
+	return prepared, nil
+}
+
+func promotePreparedStartupDirectory(stagingDir, finalDir string) error {
+	if !filepath.IsAbs(stagingDir) || !filepath.IsAbs(finalDir) || filepath.Clean(stagingDir) != stagingDir || filepath.Clean(finalDir) != finalDir || stagingDir == finalDir || filepath.Dir(stagingDir) != filepath.Dir(finalDir) || filepath.Base(stagingDir) == "." || filepath.Base(finalDir) == "." {
+		return fmt.Errorf("invalid prepared startup promotion paths")
+	}
+	if err := atomicdir.RenameNoReplace(stagingDir, finalDir); err != nil {
+		return fmt.Errorf("promote prepared startup: %w", err)
+	}
+	return nil
+}
+
+type preparedStartupParse struct {
+	manifest     preparedStartupManifest
+	handoffState materializer.ManagedApplicationState
+	handoffTip   uint64
+	suffix       []byte
+}
+
+// ValidatePreparedStartupDirectoryForPolicy validates only bounded local
+// prepared evidence. It never opens source history or grants startup authority.
+func ValidatePreparedStartupDirectoryForPolicy(ctx context.Context, handoffDir string, expected PreparedStartupIdentity, policy sqlpolicy.MaterializationPolicy, window uint64, applicationProtocol string) error {
+	_, err := parsePreparedStartupDirectory(ctx, handoffDir, expected, policy, window, applicationProtocol)
+	return err
+}
+
+func parsePreparedStartupDirectory(ctx context.Context, handoffDir string, expected PreparedStartupIdentity, policy sqlpolicy.MaterializationPolicy, window uint64, applicationProtocol string) (preparedStartupParse, error) {
+	var result preparedStartupParse
+	if err := validatePreparedProfile(expected, policy, window, applicationProtocol); err != nil {
+		return result, err
 	}
 	version, err := preparedVersion(policy, window)
 	if err != nil {
-		return nil, err
+		return result, err
 	}
 	if !validPreparedIdentity(expected) {
-		return nil, fmt.Errorf("invalid expected identity")
+		return result, fmt.Errorf("invalid expected identity")
 	}
 	info, err := os.Lstat(handoffDir)
 	if err != nil || !info.IsDir() || info.Mode()&os.ModeSymlink != 0 {
-		return nil, fmt.Errorf("invalid preparation directory")
+		return result, fmt.Errorf("invalid preparation directory")
 	}
-	marker := filepath.Join(handoffDir, "completed.json")
-	data, err := readPreparedMarker(marker)
+	data, err := readPreparedMarker(filepath.Join(handoffDir, "completed.json"))
 	if err != nil {
-		return nil, err
+		return result, err
 	}
 	if len(data) > maxArchiveHeadSize*2 {
-		return nil, fmt.Errorf("preparation marker too large")
+		return result, fmt.Errorf("preparation marker too large")
 	}
 	var m preparedStartupManifest
 	d := json.NewDecoder(bytes.NewReader(data))
 	d.DisallowUnknownFields()
 	if err = d.Decode(&m); err != nil {
-		return nil, err
+		return result, err
 	}
 	if err = d.Decode(new(any)); err != io.EOF {
-		return nil, fmt.Errorf("invalid preparation marker")
+		return result, fmt.Errorf("invalid preparation marker")
 	}
 	if m.Version != version || m.Identity != expected {
-		return nil, fmt.Errorf("preparation identity mismatch")
+		return result, fmt.Errorf("preparation identity mismatch")
 	}
 	if policy != sqlpolicy.ManagedGraphRequestMaterializationPolicy && len(m.Files) != 0 {
-		return nil, fmt.Errorf("unexpected prepared artifact inventory")
+		return result, fmt.Errorf("unexpected prepared artifact inventory")
 	}
-	if policy == sqlpolicy.ManagedGraphRequestMaterializationPolicy && m.GraphLocator == nil {
-		return nil, fmt.Errorf("prepared Graph locator/profile mismatch")
+	if policy == sqlpolicy.ManagedGraphRequestMaterializationPolicy && (m.GraphLocator == nil || len(m.Files) == 0) {
+		return result, fmt.Errorf("prepared Graph locator/profile mismatch")
 	}
-	// Only explicit request/Graph profiles use this field. Preserve strict
-	// legacy rejection even for null (which decodes to a nil pointer).
 	if policy != sqlpolicy.ManagedGraphRequestMaterializationPolicy && policy != sqlpolicy.ManagedRequestMaterializationPolicy {
 		var fields map[string]json.RawMessage
 		if err := json.Unmarshal(data, &fields); err != nil {
-			return nil, err
+			return result, err
 		}
 		for field := range fields {
 			if strings.EqualFold(field, "graphLocator") {
-				return nil, fmt.Errorf("unexpected Graph locator in legacy preparation")
+				return result, fmt.Errorf("unexpected Graph locator in legacy preparation")
 			}
 		}
 	}
+	if len(m.Head) == 0 {
+		return result, fmt.Errorf("preparation head missing")
+	}
 	if policy == sqlpolicy.ManagedGraphRequestMaterializationPolicy {
 		if err := validateGraphPreparedInventory(handoffDir, true); err != nil {
-			return nil, err
+			return result, err
 		}
 		actual, err := preparedGraphArtifacts(ctx, handoffDir, false)
 		if err != nil {
-			return nil, err
+			return result, err
 		}
 		if !equalGraphArtifacts(actual, m.Files) {
-			return nil, fmt.Errorf("prepared Graph artifact inventory differs")
+			return result, fmt.Errorf("prepared Graph artifact inventory differs")
 		}
 	}
-	var handoffState materializer.ManagedApplicationState
-	var handoffTip uint64
 	if managedSQLKVPolicy(policy) {
 		if err := validateMixedPreparedInventory(handoffDir, true); err != nil {
-			return nil, err
+			return result, err
 		}
-		handoffState, handoffTip, err = inspectManagedFileForPolicy(ctx, filepath.Join(handoffDir, "sqlite.db"), window, policy, applicationProtocol)
+		result.handoffState, result.handoffTip, err = inspectManagedFileForPolicy(ctx, filepath.Join(handoffDir, "sqlite.db"), window, policy, applicationProtocol)
 		if err != nil {
-			return nil, fmt.Errorf("inspect mixed handoff: %w", err)
+			return result, fmt.Errorf("inspect mixed handoff: %w", err)
 		}
 	}
+	var sqlHash [32]byte
+	var hashErr error
+	if policy == sqlpolicy.ManagedGraphRequestMaterializationPolicy {
+		sqlHash = m.Files[0].SHA256
+	} else {
+		sqlHash, hashErr = preparedFileHash(filepath.Join(handoffDir, "sqlite.db"), false)
+	}
+	if hashErr != nil || sqlHash != m.SQLiteHash {
+		return result, fmt.Errorf("prepared SQLite integrity mismatch")
+	}
+	suffix := filepath.Join(handoffDir, "certified-suffix.json")
+	suffixHash, hashErr := preparedFileHash(suffix, false)
+	if hashErr != nil || suffixHash != m.SuffixHash {
+		return result, fmt.Errorf("prepared suffix integrity mismatch")
+	}
+	result.suffix, err = os.ReadFile(suffix)
+	if err != nil {
+		return result, err
+	}
+	result.manifest = m
+	return result, nil
+}
+
+func loadPreparedStartupForPolicy(ctx context.Context, bucket objstore.Bucket, prefix string, configID uint, bootstrap quepaxa.Cluster, handoffDir, verifiedTargetDir string, expected PreparedStartupIdentity, policy sqlpolicy.MaterializationPolicy, window uint64, trustedReconfiguration *bool, applicationProtocol string) (*VerifiedPreparedStartup, error) {
+	parsed, err := parsePreparedStartupDirectory(ctx, handoffDir, expected, policy, window, applicationProtocol)
+	if err != nil {
+		return nil, err
+	}
+	m := parsed.manifest
 	view, err := openReadOnlyViewAtHeadForPolicy(ctx, bucket, prefix, configID, bootstrap, m.Head, policy, window, m.GraphLocator, trustedReconfiguration, applicationProtocol)
 	if err != nil {
 		return nil, err
 	}
-	if managedSQLKVPolicy(policy) && handoffTip != uint64(view.Tip()) {
+	if managedSQLKVPolicy(policy) && parsed.handoffTip != uint64(view.Tip()) {
 		return nil, fmt.Errorf("mixed handoff tip differs from verified history")
-	}
-	var sqlHash [32]byte
-	if policy == sqlpolicy.ManagedGraphRequestMaterializationPolicy {
-		sqlHash = m.Files[0].SHA256
-	} else {
-		sqlHash, err = preparedFileHash(filepath.Join(handoffDir, "sqlite.db"), false)
-	}
-	if err != nil || sqlHash != m.SQLiteHash {
-		return nil, fmt.Errorf("prepared SQLite integrity mismatch")
-	}
-	suffix := filepath.Join(handoffDir, "certified-suffix.json")
-	suffixHash, err := preparedFileHash(suffix, false)
-	if err != nil || suffixHash != m.SuffixHash {
-		return nil, fmt.Errorf("prepared suffix integrity mismatch")
 	}
 	want, err := json.Marshal(view.Decisions())
 	if err != nil {
 		return nil, err
 	}
-	got, err := os.ReadFile(suffix)
-	if err != nil || !bytes.Equal(got, want) {
+	if !bytes.Equal(parsed.suffix, want) {
 		return nil, fmt.Errorf("prepared suffix differs from verified history")
 	}
 	verified, err := PrepareReadOnlyRestoreForPolicy(ctx, view, verifiedTargetDir, policy, window)
@@ -336,7 +391,7 @@ func loadPreparedStartupForPolicy(ctx context.Context, bucket objstore.Bucket, p
 		if err != nil {
 			return nil, err
 		}
-		if tip != handoffTip || state != handoffState {
+		if tip != parsed.handoffTip || state != parsed.handoffState {
 			return nil, fmt.Errorf("mixed handoff evidence differs from independent reconstruction")
 		}
 	}
