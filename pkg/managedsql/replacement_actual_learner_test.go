@@ -444,6 +444,35 @@ func runReplaceVoterCoordinatesActualPreparedLearner(t *testing.T, beforeRetaine
 		t.Fatalf("learner listener handshake peer=%s endpoint=%s listener_open=true prefix_rpc_ok=false: %v", learnerMember.ID, learnerMember.PeerURL, err)
 	}
 	releaseListener()
+	waitConfig2ReadIndex := func(committed quepaxa.Cluster) {
+		t.Helper()
+		readinessPeer, err := network.NewTransportForManagedProfile(configs[0].Runtime.ClusterID, configs[0].Runtime.NodeID, &committed, configs[0].Runtime.PeerToken, network.ManagedPeerProfile{ApplicationProtocol: protocol, BootstrapPlanDigest: configs[0].Plan.BootstrapPlanDigest, Generation: int64(configs[0].Plan.Generation)})
+		if err != nil {
+			t.Fatal("create bound config-2 readiness observer", err)
+		}
+		defer readinessPeer.Close()
+		for _, id := range []quepaxa.NodeID{plan.Replacement.NodeID, configs[2].Runtime.NodeID} {
+			var readinessErr error
+			for {
+				var tip quepaxa.Slot
+				tip, readinessErr = readinessPeer.ReadTip(ctx, id)
+				if readinessErr == nil {
+					if uint64(tip) < handoff.PreparedSlot {
+						t.Fatalf("config-2 voter ReadIndex regressed below the verified H: peer=%s tip=%d H=%d", id, tip, handoff.PreparedSlot)
+					}
+					break
+				}
+				if readyHooked && id == plan.Replacement.NodeID {
+					t.Fatalf("replacement raw-ready was observed but actual config-2 ReadIndex failed: %v", readinessErr)
+				}
+				select {
+				case <-ctx.Done():
+					t.Fatalf("config-2 voter never reached actual ReadIndex readiness: peer=%s context=%v peer_error=%v", id, ctx.Err(), readinessErr)
+				case <-tick.C:
+				}
+			}
+		}
+	}
 	if freshCall {
 		select {
 		case <-freshAddProofEntered:
@@ -459,14 +488,7 @@ func runReplaceVoterCoordinatesActualPreparedLearner(t *testing.T, beforeRetaine
 		if err != nil || uint64(committed.Current.ConfigID) != plan.ExpectedConfigID+1 {
 			t.Fatal("fresh ADD did not establish exact C+1 before readiness proof", err)
 		}
-		readinessPeer, err := network.NewTransportForManagedProfile(configs[0].Runtime.ClusterID, configs[0].Runtime.NodeID, &committed.Current, configs[0].Runtime.PeerToken, network.ManagedPeerProfile{ApplicationProtocol: protocol, BootstrapPlanDigest: configs[0].Plan.BootstrapPlanDigest, Generation: configs[0].Plan.Generation})
-		if err != nil {
-			t.Fatal("create fresh D readiness observer", err)
-		}
-		defer readinessPeer.Close()
-		if tip, err := readinessPeer.ReadTip(ctx, plan.Replacement.NodeID); err != nil || uint64(tip) < handoff.PreparedSlot {
-			t.Fatal("fresh D actual config-2 ReadIndex readiness was not established", err)
-		}
+		waitConfig2ReadIndex(committed.Current)
 		close(freshRemoveReady)
 		select {
 		case err := <-coordination:
@@ -529,30 +551,7 @@ func runReplaceVoterCoordinatesActualPreparedLearner(t *testing.T, beforeRetaine
 		// catch-up readiness callback. Probe that actual authenticated ReadIndex
 		// endpoint at the committed ADD configuration; ReplaceVoter below still
 		// performs its own excluded-old quorum check before REMOVE.
-		readinessPeer, err := network.NewTransportForManagedProfile(configs[0].Runtime.ClusterID, configs[0].Runtime.NodeID, &committed.Current, configs[0].Runtime.PeerToken, network.ManagedPeerProfile{ApplicationProtocol: protocol, BootstrapPlanDigest: configs[0].Plan.BootstrapPlanDigest, Generation: configs[0].Plan.Generation})
-		if err != nil {
-			t.Fatal("create bound D readiness observer", err)
-		}
-		defer readinessPeer.Close()
-		var readinessErr error
-		for {
-			var tip quepaxa.Slot
-			tip, readinessErr = readinessPeer.ReadTip(ctx, plan.Replacement.NodeID)
-			if readinessErr == nil {
-				if uint64(tip) < handoff.PreparedSlot {
-					t.Fatalf("ready D ReadIndex regressed below its verified H: tip=%d H=%d", tip, handoff.PreparedSlot)
-				}
-				break
-			}
-			if readyHooked {
-				t.Fatalf("D raw-ready was observed but actual config-2 ReadIndex failed: %v", readinessErr)
-			}
-			select {
-			case <-ctx.Done():
-				t.Fatalf("fresh D never reached actual ReadIndex readiness: context=%v peer_error=%v", ctx.Err(), readinessErr)
-			case <-tick.C:
-			}
-		}
+		waitConfig2ReadIndex(committed.Current)
 		if err := hosts[0].ReplaceVoter(ctx, plan); err == nil || rejectFinish.Load() {
 			t.Fatalf("expected injected final completion failure after resume from actual ADD terminal: %v", err)
 		}

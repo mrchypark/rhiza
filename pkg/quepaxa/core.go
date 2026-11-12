@@ -753,7 +753,7 @@ func (c *Core) hydrateProposal(ctx context.Context, proposal *Proposal, sources 
 // only after a learner quorum has accepted their decision, so the two quorums
 // intersect and a completed write cannot be missed.
 func (c *Core) ReadIndex(ctx context.Context) (Slot, NodeID, error) {
-	return c.readIndexExcluding(ctx, "")
+	return c.readIndexFollowingMembership(ctx, "")
 }
 
 // ReadIndexExcluding verifies the current quorum without counting or contacting
@@ -762,78 +762,107 @@ func (c *Core) ReadIndexExcluding(ctx context.Context, excluded NodeID) (Slot, N
 	if excluded == c.nodeID {
 		return 0, "", ErrQuorumUnavailable
 	}
-	return c.readIndexExcluding(ctx, excluded)
-}
-func (c *Core) readIndexExcluding(ctx context.Context, excluded NodeID) (Slot, NodeID, error) {
 	if c.reconfigEnabled {
 		c.RecoverFrozenMembership(ctx)
 	}
-	if c.observer || !c.CanParticipateReadIndex() {
-		c.mu.RLock()
-		frozen := c.reconfiguration != nil
-		c.mu.RUnlock()
-		log.Printf("read-index refused node_hash=%x excluded_hash=%x current_config=%d voter=%t observer=%t frozen=%t", sha256.Sum256([]byte(c.nodeID)), sha256.Sum256([]byte(excluded)), c.ConfigID(), c.IsVoter(), c.observer, frozen)
+	configID, members, changed, frozen, voter := c.readIndexState()
+	if frozen || !voter {
 		return 0, "", ErrQuorumUnavailable
 	}
-	cluster := *c.config
-	if c.reconfigEnabled {
-		cluster = c.CurrentCluster()
-	}
-	if len(cluster.Members) == 1 {
+	if len(members) == 1 {
 		return c.Tip(), c.nodeID, nil
 	}
 	transport := c.transport
 	if transport == nil {
 		return 0, "", fmt.Errorf("%w: read-index transport is unavailable", ErrQuorumUnavailable)
 	}
-	type result struct {
-		tip Slot
-		id  NodeID
-		err error
-	}
+	slot, id, _, err := c.readIndexRound(ctx, transport, configID, members, excluded, changed, false)
+	return slot, id, err
+}
+
+// readIndexState binds a monotonic configuration ID to the signal that may
+// invalidate it. Configuration members are immutable once installed.
+func (c *Core) readIndexState() (uint, []Member, <-chan struct{}, bool, bool) {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	cluster := c.clusterForSlotLocked(c.tip + 1)
+	return cluster.ConfigID, cluster.Members, c.tipChanged, c.reconfiguration != nil, !c.observer && c.voterForClusterLocked(cluster)
+}
+
+type readIndexResult struct {
+	tip Slot
+	id  NodeID
+	err error
+}
+
+// readIndexRound collects one complete quorum round from one immutable roster.
+// A transition return discards every response from this round; it never mixes
+// evidence across configurations or counts quorum while membership is frozen.
+func (c *Core) readIndexRound(ctx context.Context, transport Transport, configID uint, members []Member, excluded NodeID, changed <-chan struct{}, followMembership bool) (Slot, NodeID, bool, error) {
 	readCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
-	results := make(chan result, len(cluster.Members))
-	observed := make([]result, 0, len(cluster.Members))
-	for _, member := range cluster.Members {
+	results := make(chan readIndexResult, len(members))
+	observed := make([]readIndexResult, 0, len(members))
+	for _, member := range members {
 		if member.ID == excluded {
-			results <- result{id: member.ID, err: ErrQuorumUnavailable}
+			results <- readIndexResult{id: member.ID, err: ErrQuorumUnavailable}
 			continue
 		}
 		if member.ID == c.nodeID {
-			results <- result{tip: c.Tip(), id: c.nodeID}
+			results <- readIndexResult{tip: c.Tip(), id: c.nodeID}
 			continue
 		}
 		go func(id NodeID) {
 			tip, err := transport.ReadTip(readCtx, id)
-			results <- result{tip: tip, id: id, err: err}
+			results <- readIndexResult{tip: tip, id: id, err: err}
 		}(member.ID)
 	}
-	var best result
+	cluster := Cluster{ConfigID: configID, Members: members}
+	var best readIndexResult
 	successes := 0
 	logFailure := func(reason string) {
-		log.Printf("read-index failed reason=%s node_hash=%x excluded_hash=%x requested_config=%d current_config=%d required=%d actual=%d completed=%d participants=%d context_done=%t", reason, sha256.Sum256([]byte(c.nodeID)), sha256.Sum256([]byte(excluded)), cluster.ConfigID, c.ConfigID(), cluster.QuorumSize(), successes, len(observed), len(cluster.Members), ctx.Err() != nil)
+		log.Printf("read-index failed reason=%s node_hash=%x excluded_hash=%x requested_config=%d current_config=%d required=%d actual=%d completed=%d participants=%d context_done=%t", reason, sha256.Sum256([]byte(c.nodeID)), sha256.Sum256([]byte(excluded)), configID, c.ConfigID(), cluster.QuorumSize(), successes, len(observed), len(members), ctx.Err() != nil)
 		for _, item := range observed {
 			phase := "none"
 			var diagnostic interface{ RPCPhase() string }
 			if errors.As(item.err, &diagnostic) {
 				phase = diagnostic.RPCPhase()
 			}
-			log.Printf("read-index participant node_hash=%x peer_hash=%x requested_config=%d excluded=%t success=%t tip=%d error_type=%T quorum_unavailable=%t canceled=%t deadline=%t rpc_phase=%s", sha256.Sum256([]byte(c.nodeID)), sha256.Sum256([]byte(item.id)), cluster.ConfigID, item.id == excluded, item.err == nil, item.tip, item.err, errors.Is(item.err, ErrQuorumUnavailable), errors.Is(item.err, context.Canceled), errors.Is(item.err, context.DeadlineExceeded), phase)
+			log.Printf("read-index participant node_hash=%x peer_hash=%x requested_config=%d excluded=%t success=%t tip=%d error_type=%T quorum_unavailable=%t canceled=%t deadline=%t rpc_phase=%s", sha256.Sum256([]byte(c.nodeID)), sha256.Sum256([]byte(item.id)), configID, item.id == excluded, item.err == nil, item.tip, item.err, errors.Is(item.err, ErrQuorumUnavailable), errors.Is(item.err, context.Canceled), errors.Is(item.err, context.DeadlineExceeded), phase)
 		}
-		for _, member := range cluster.Members {
-			if !slices.ContainsFunc(observed, func(item result) bool { return item.id == member.ID }) {
-				log.Printf("read-index participant node_hash=%x peer_hash=%x requested_config=%d pending=true excluded=%t", sha256.Sum256([]byte(c.nodeID)), sha256.Sum256([]byte(member.ID)), cluster.ConfigID, member.ID == excluded)
+		for _, member := range members {
+			if !slices.ContainsFunc(observed, func(item readIndexResult) bool { return item.id == member.ID }) {
+				log.Printf("read-index participant node_hash=%x peer_hash=%x requested_config=%d pending=true excluded=%t", sha256.Sum256([]byte(c.nodeID)), sha256.Sum256([]byte(member.ID)), configID, member.ID == excluded)
 			}
 		}
 	}
-	for completed := 0; completed < len(cluster.Members); completed++ {
+	for responses := 0; responses < len(members); {
 		select {
 		case <-ctx.Done():
 			logFailure("context")
-			return 0, "", ctx.Err()
+			return 0, "", false, ctx.Err()
+		case <-changed:
+			current, _, nextChanged, frozen, voter := c.readIndexState()
+			if followMembership && (frozen || current > configID) {
+				return 0, "", true, nil
+			}
+			if frozen || current != configID || !voter {
+				logFailure("membership-not-installed")
+				return 0, "", false, ErrQuorumUnavailable
+			}
+			changed = nextChanged
 		case item := <-results:
+			responses++
 			observed = append(observed, item)
+			current, _, nextChanged, frozen, voter := c.readIndexState()
+			if followMembership && (frozen || current > configID) {
+				return 0, "", true, nil
+			}
+			if frozen || current != configID || !voter {
+				logFailure("membership-not-installed")
+				return 0, "", false, ErrQuorumUnavailable
+			}
+			changed = nextChanged
 			if item.err != nil {
 				continue
 			}
@@ -842,12 +871,52 @@ func (c *Core) readIndexExcluding(ctx context.Context, excluded NodeID) (Slot, N
 				best = item
 			}
 			if successes == cluster.QuorumSize() {
-				return best.tip, best.id, nil
+				return best.tip, best.id, false, nil
 			}
 		}
 	}
 	logFailure("results-exhausted")
-	return 0, "", ErrQuorumUnavailable
+	return 0, "", false, ErrQuorumUnavailable
+}
+
+func (c *Core) readIndexFollowingMembership(ctx context.Context, excluded NodeID) (Slot, NodeID, error) {
+	for {
+		if excluded == c.nodeID {
+			return 0, "", ErrQuorumUnavailable
+		}
+		if c.reconfigEnabled {
+			c.RecoverFrozenMembership(ctx)
+		}
+		configID, members, changed, frozen, voter := c.readIndexState()
+		if frozen {
+			if _, bounded := ctx.Deadline(); !bounded {
+				log.Printf("read-index refused node_hash=%x excluded_hash=%x current_config=%d voter=%t observer=%t frozen=true bounded=false", sha256.Sum256([]byte(c.nodeID)), sha256.Sum256([]byte(excluded)), configID, voter, c.observer)
+				return 0, "", ErrQuorumUnavailable
+			}
+			select {
+			case <-ctx.Done():
+				return 0, "", ctx.Err()
+			case <-changed:
+				continue
+			}
+		}
+		if !voter {
+			log.Printf("read-index refused node_hash=%x excluded_hash=%x current_config=%d voter=false observer=%t frozen=false", sha256.Sum256([]byte(c.nodeID)), sha256.Sum256([]byte(excluded)), configID, c.observer)
+			return 0, "", ErrQuorumUnavailable
+		}
+		if len(members) == 1 {
+			return c.Tip(), c.nodeID, nil
+		}
+		transport := c.transport
+		if transport == nil {
+			return 0, "", fmt.Errorf("%w: read-index transport is unavailable", ErrQuorumUnavailable)
+		}
+		slot, id, transition, err := c.readIndexRound(ctx, transport, configID, members, excluded, changed, true)
+		if transition {
+			continue
+		}
+		return slot, id, err
+	}
 }
 
 func proposalResult(decision Decision) (Slot, []Receipt, error) {

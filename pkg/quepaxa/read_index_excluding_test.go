@@ -2,7 +2,9 @@ package quepaxa
 
 import (
 	"context"
+	"errors"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -164,5 +166,275 @@ func TestReadIndexExcludingLocalNodeFails(t *testing.T) {
 	core := newCore("n1", &Cluster{Members: []Member{{ID: "n1"}, {ID: "n2"}}}, wal, nil)
 	if _, _, err := core.ReadIndexExcluding(context.Background(), "n1"); err != ErrQuorumUnavailable {
 		t.Fatalf("local exclusion returned %v, want ErrQuorumUnavailable", err)
+	}
+}
+
+type membershipAdvanceReadTransport struct {
+	mu          sync.Mutex
+	readTips    map[NodeID]int
+	n2Entered   chan struct{}
+	n2Once      sync.Once
+	oldBlocked  chan struct{}
+	oldCanceled chan struct{}
+	blocked     atomic.Int32
+}
+
+func (t *membershipAdvanceReadTransport) ReadTip(ctx context.Context, to NodeID) (Slot, error) {
+	t.mu.Lock()
+	t.readTips[to]++
+	call := t.readTips[to]
+	t.mu.Unlock()
+	switch to {
+	case "n2":
+		t.n2Once.Do(func() { close(t.n2Entered) })
+		return Slot(call), nil
+	case "n3", "n4":
+		if t.blocked.Add(1) == 1 {
+			close(t.oldBlocked)
+		}
+		<-ctx.Done()
+		if t.blocked.Add(-1) == 0 {
+			close(t.oldCanceled)
+		}
+		return 0, ctx.Err()
+	default:
+		return 0, errors.New("unexpected read-index peer")
+	}
+}
+
+func (t *membershipAdvanceReadTransport) SendRecord(context.Context, NodeID, RecordRequest) (Summary, error) {
+	return Summary{}, errors.New("unexpected record")
+}
+
+func (t *membershipAdvanceReadTransport) SendDecision(context.Context, Decision) error {
+	return errors.New("unexpected decision")
+}
+
+func (t *membershipAdvanceReadTransport) StageValue(context.Context, NodeID, ValueHash, []byte) error {
+	return errors.New("unexpected stage")
+}
+
+func (t *membershipAdvanceReadTransport) FetchValue(context.Context, NodeID, ValueHash) ([]byte, error) {
+	return nil, errors.New("unexpected fetch")
+}
+
+// A certified configuration advance invalidates every response from the old
+// roster. The read must cancel that round and issue a fresh round against the
+// installed roster instead of waiting for unavailable old members or mixing
+// quorum evidence across snapshots.
+func TestReadIndexRestartsAfterCertifiedMembershipAdvance(t *testing.T) {
+	oldMembers := []Member{{ID: "n1"}, {ID: "n2"}, {ID: "n3"}, {ID: "n4"}}
+	newMembers := []Member{{ID: "n1"}, {ID: "n2"}}
+	coreTransport := &membershipAdvanceReadTransport{
+		readTips:    make(map[NodeID]int),
+		n2Entered:   make(chan struct{}),
+		oldBlocked:  make(chan struct{}),
+		oldCanceled: make(chan struct{}),
+	}
+	wal, err := qlog.Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer wal.Close()
+	core := newCore("n1", &Cluster{ConfigID: 1, Members: oldMembers}, wal, coreTransport)
+	core.mu.Lock()
+	core.configHistory = append(core.configHistory, configEpoch{start: 2, cluster: cloneCluster(Cluster{ConfigID: 2, Members: newMembers})})
+	core.mu.Unlock()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	go func() {
+		<-coreTransport.n2Entered
+		<-coreTransport.oldBlocked
+		core.mu.Lock()
+		core.tip = 1
+		core.durable[1] = true
+		close(core.tipChanged)
+		core.tipChanged = make(chan struct{})
+		core.mu.Unlock()
+	}()
+
+	slot, id, err := core.ReadIndex(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if slot != 2 || id != "n2" {
+		t.Fatalf("read returned slot=%d id=%s, want the fresh config-2 response from n2", slot, id)
+	}
+	coreTransport.mu.Lock()
+	n2Calls := coreTransport.readTips["n2"]
+	coreTransport.mu.Unlock()
+	if n2Calls != 2 {
+		t.Fatalf("n2 ReadTip calls=%d, want one discarded old-roster call and one fresh call", n2Calls)
+	}
+	select {
+	case <-coreTransport.oldCanceled:
+	case <-ctx.Done():
+		t.Fatal("old-roster ReadTip calls were not canceled")
+	}
+}
+
+func TestReadIndexExcludingDoesNotFollowMembershipAdvance(t *testing.T) {
+	oldMembers := []Member{{ID: "n1"}, {ID: "n2"}, {ID: "n3"}, {ID: "n4"}}
+	newMembers := []Member{{ID: "n1"}, {ID: "n2"}}
+	coreTransport := &membershipAdvanceReadTransport{
+		readTips:    make(map[NodeID]int),
+		n2Entered:   make(chan struct{}),
+		oldBlocked:  make(chan struct{}),
+		oldCanceled: make(chan struct{}),
+	}
+	wal, err := qlog.Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer wal.Close()
+	core := newCore("n1", &Cluster{ConfigID: 1, Members: oldMembers}, wal, coreTransport)
+	core.mu.Lock()
+	core.configHistory = append(core.configHistory, configEpoch{start: 2, cluster: cloneCluster(Cluster{ConfigID: 2, Members: newMembers})})
+	core.mu.Unlock()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	go func() {
+		<-coreTransport.n2Entered
+		<-coreTransport.oldBlocked
+		core.mu.Lock()
+		core.tip = 1
+		core.durable[1] = true
+		close(core.tipChanged)
+		core.tipChanged = make(chan struct{})
+		core.mu.Unlock()
+	}()
+
+	if _, _, err := core.ReadIndexExcluding(ctx, "n4"); err != ErrQuorumUnavailable {
+		t.Fatalf("exact-roster exclusion followed a membership advance: %v", err)
+	}
+}
+
+func TestReadIndexWaitsThroughFreezeWithoutCountingQuorum(t *testing.T) {
+	oldMembers := []Member{{ID: "n1"}, {ID: "n2"}, {ID: "n3"}, {ID: "n4"}}
+	newMembers := []Member{{ID: "n1"}, {ID: "n2"}}
+	coreTransport := &membershipAdvanceReadTransport{
+		readTips:    make(map[NodeID]int),
+		n2Entered:   make(chan struct{}),
+		oldBlocked:  make(chan struct{}),
+		oldCanceled: make(chan struct{}),
+	}
+	wal, err := qlog.Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer wal.Close()
+	core := newCore("n1", &Cluster{ConfigID: 1, Members: oldMembers}, wal, coreTransport)
+	core.reconfigEnabled = true
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	go func() {
+		<-coreTransport.n2Entered
+		<-coreTransport.oldBlocked
+		core.mu.Lock()
+		core.reconfiguration = &reconfigurationState{target: Cluster{ConfigID: 2, Members: newMembers}}
+		close(core.tipChanged)
+		core.tipChanged = make(chan struct{})
+		core.mu.Unlock()
+		<-coreTransport.oldCanceled
+		core.mu.Lock()
+		core.reconfiguration = nil
+		core.configHistory = append(core.configHistory, configEpoch{start: 2, cluster: Cluster{ConfigID: 2, Members: newMembers}})
+		core.tip = 1
+		core.durable[1] = true
+		close(core.tipChanged)
+		core.tipChanged = make(chan struct{})
+		core.mu.Unlock()
+	}()
+
+	if slot, id, err := core.ReadIndex(ctx); err != nil || slot != 2 || id != "n2" {
+		t.Fatalf("read through freeze: slot=%d id=%s err=%v", slot, id, err)
+	}
+}
+
+func TestReadIndexFrozenBackgroundFailsClosed(t *testing.T) {
+	members := []Member{{ID: "n1"}, {ID: "n2"}, {ID: "n3"}}
+	wal, err := qlog.Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer wal.Close()
+	core := newCore("n1", &Cluster{ConfigID: 1, Members: members}, wal, nil)
+	core.reconfigEnabled = true
+	core.mu.Lock()
+	core.reconfiguration = &reconfigurationState{target: Cluster{ConfigID: 2, Members: members[:2]}}
+	core.mu.Unlock()
+	if _, _, err := core.ReadIndex(context.Background()); err != ErrQuorumUnavailable {
+		t.Fatalf("unbounded frozen read returned %v, want ErrQuorumUnavailable", err)
+	}
+}
+
+type tipNotificationReadTransport struct {
+	n2Entered chan struct{}
+	n2Release chan struct{}
+	once      sync.Once
+}
+
+func (t *tipNotificationReadTransport) ReadTip(ctx context.Context, to NodeID) (Slot, error) {
+	switch to {
+	case "n2":
+		t.once.Do(func() { close(t.n2Entered) })
+		select {
+		case <-t.n2Release:
+			return 1, nil
+		case <-ctx.Done():
+			return 0, ctx.Err()
+		}
+	case "n3":
+		<-ctx.Done()
+		return 0, ctx.Err()
+	default:
+		return 0, errors.New("unexpected read-index peer")
+	}
+}
+
+func (t *tipNotificationReadTransport) SendRecord(context.Context, NodeID, RecordRequest) (Summary, error) {
+	return Summary{}, errors.New("unexpected record")
+}
+
+func (t *tipNotificationReadTransport) SendDecision(context.Context, Decision) error {
+	return errors.New("unexpected decision")
+}
+
+func (t *tipNotificationReadTransport) StageValue(context.Context, NodeID, ValueHash, []byte) error {
+	return errors.New("unexpected stage")
+}
+
+func (t *tipNotificationReadTransport) FetchValue(context.Context, NodeID, ValueHash) ([]byte, error) {
+	return nil, errors.New("unexpected fetch")
+}
+
+func TestReadIndexIgnoresTipWakeupsUntilResponse(t *testing.T) {
+	coreTransport := &tipNotificationReadTransport{n2Entered: make(chan struct{}), n2Release: make(chan struct{})}
+	wal, err := qlog.Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer wal.Close()
+	core := newCore("n1", &Cluster{ConfigID: 1, Members: []Member{{ID: "n1"}, {ID: "n2"}, {ID: "n3"}}}, wal, coreTransport)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	go func() {
+		<-coreTransport.n2Entered
+		for range 8 {
+			core.mu.Lock()
+			close(core.tipChanged)
+			core.tipChanged = make(chan struct{})
+			core.mu.Unlock()
+			time.Sleep(2 * time.Millisecond)
+		}
+		close(coreTransport.n2Release)
+	}()
+
+	if slot, id, err := core.ReadIndex(ctx); err != nil || slot != 1 || id != "n2" {
+		t.Fatalf("read after ordinary tip wakeups: slot=%d id=%s err=%v", slot, id, err)
 	}
 }
