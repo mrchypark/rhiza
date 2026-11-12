@@ -8,6 +8,27 @@ managed_functional_node_id() {
   printf 'rhiza-managed-node-v1\000%s' "$1" | sha256sum | awk '{print "rhiza-n-"$1}'
 }
 
+managed_functional_bootstrap_roster() {
+  mfbr_file=$1 mfbr_watch=${2-false}
+  jq -sc --argjson watch "$mfbr_watch" '
+    def normalize: if has("object") then .object else . end;
+    (if $watch then
+       (first(.[] | normalize |
+          select((.status|type)=="object" and
+            (((.status|has("appliedVoterCount")) and (.status.appliedVoterCount != null)) or
+             (.spec.replicas? == 3 and
+              ((.status|has("replicaStep"))|not) and
+              ((.status|has("replicaCheck"))|not))))) // error("bootstrap event not found"))
+     else
+       (.[0] | normalize)
+     end)
+    | .status.bootstrapPlan.members
+    | map(.member.node_id)
+    | sort
+    | if all(.[]; type=="string" and length>0) then . else error("bootstrap roster lacks member.node_id") end
+  ' "$mfbr_file"
+}
+
 managed_functional_roster_oracle() {
   mfr_cr=$1 mfr_pods=$2 mfr_dep=$3 mfr_eps=$4 mfr_target=$5 mfr_out=$6
   mfr_sequence=${7-}
@@ -24,7 +45,7 @@ managed_functional_roster_oracle() {
   fi
   [ -n "$mfr_sequence" ] || mfr_sequence=add
   if [ "$mfr_sequence" = bootstrap ]; then
-    mfr_roster=$(jq -c '.status.bootstrapPlan.members|map(.member.ID)|sort' "$mfr_cr")
+    mfr_roster=$(managed_functional_bootstrap_roster "$mfr_cr") || return 1
   else
     jq -e --argjson target "$mfr_target" --arg sequence "$mfr_sequence" '.status.repair.state=="Completed" and .status.repair.plan.sequence==$sequence and .status.repair.completion.kind=="Terminal" and (.status.repair.completion.finalVoterIDs|length)==$target and ((.status.repair.completion.finalVoterIDs|unique|length)==$target)' "$mfr_cr" >/dev/null || return 1
     mfr_roster=$(jq -c '.status.repair.completion.finalVoterIDs|sort' "$mfr_cr")
@@ -630,7 +651,7 @@ managed_functional_external_roster_oracle() {
      end)
   ' "$mfero_cr" >/dev/null || return 1
   if [ "$mfero_sequence" = bootstrap ]; then
-    mfero_certified=$(jq -c '.status.bootstrapPlan.members|map(.member.ID)|sort' "$mfero_cr")
+    mfero_certified=$(managed_functional_bootstrap_roster "$mfero_cr") || return 1
   else
     mfero_certified=$(jq -c '.status.repair.completion.finalVoterIDs|sort' "$mfero_cr")
   fi
@@ -650,7 +671,11 @@ managed_functional_external_roster_oracle() {
   mfero_endpoint_uids=$(jq -r '[.subsets[]?.addresses[]?.targetRef.uid]|sort|.[]' "$mfero_eps")
   [ "$(printf '%s\n' "$mfero_endpoint_uids" | sed '/^$/d' | wc -l | tr -d ' ')" = "$mfero_target" ] || return 1
   [ "$mfero_endpoint_uids" = "$mfero_ready_uids" ] || return 1
-  mfero_endpoint_json=$(printf '%s\n' "$mfero_endpoint_uids" | sed '/^$/d' | jq -R . | jq -sc 'sort')
+  mfero_endpoint_uids_json=$(printf '%s\n' "$mfero_endpoint_uids" | sed '/^$/d' | jq -R . | jq -sc 'sort')
+  mfero_endpoint_ids=
+  for mfero_uid in $mfero_endpoint_uids; do mfero_endpoint_ids="$mfero_endpoint_ids\n$(managed_functional_node_id "$mfero_uid")"; done
+  mfero_endpoint_json=$(printf '%b\n' "$mfero_endpoint_ids" | sed '/^$/d' | sort | jq -R . | jq -sc 'map(select(.!=""))|sort')
+  [ "$mfero_endpoint_json" = "$mfero_ready_json" ] || return 1
   mfero_deployment_replicas=$(jq -er '.items[0].spec.replicas' "$mfero_dep")
   mfero_applied=$(jq -er '.status.appliedVoterCount // .spec.voterCount' "$mfero_cr")
   mfero_operation_id=$(jq -r '.status.repair.plan.operationID // .status.repair.completion.operationID // ""' "$mfero_cr")
@@ -658,10 +683,10 @@ managed_functional_external_roster_oracle() {
   mfero_completion_config=$(jq -r '.status.repair.completion.configID // ""' "$mfero_cr")
   jq -n --argjson target "$mfero_target" --arg sequence "$mfero_sequence" \
     --argjson certified "$mfero_certified" --argjson ready "$mfero_ready_json" \
-    --argjson endpoints "$mfero_endpoint_json" --argjson applied "$mfero_applied" \
+    --argjson endpoints "$mfero_endpoint_json" --argjson endpointPodUIDs "$mfero_endpoint_uids_json" --argjson applied "$mfero_applied" \
     --argjson replicas "$mfero_deployment_replicas" --arg operationID "$mfero_operation_id" \
     --arg planConfigID "$mfero_plan_config" --arg completionConfigID "$mfero_completion_config" \
-    '{target:$target,sequence:$sequence,appliedVoterCount:$applied,deploymentReplicas:$replicas,finalVoterIDs:$certified,certifiedRoster:$certified,readyIDs:$ready,endpointIDs:$endpoints,readyMatchesCertified:($certified==$ready),endpointsMatchReady:($endpoints==$ready),operationID:$operationID,planExpectedConfigID:$planConfigID,completionConfigID:$completionConfigID,endpointCount:$target}' > "$mfero_out"
+    '{target:$target,sequence:$sequence,appliedVoterCount:$applied,deploymentReplicas:$replicas,finalVoterIDs:$certified,certifiedRoster:$certified,readyIDs:$ready,endpointIDs:$endpoints,endpointPodUIDs:$endpointPodUIDs,readyMatchesCertified:($certified==$ready),endpointsMatchReady:($endpoints==$ready),operationID:$operationID,planExpectedConfigID:$planConfigID,completionConfigID:$completionConfigID,endpointCount:$target}' > "$mfero_out"
 }
 
 managed_functional_external_observe() {
@@ -723,7 +748,8 @@ managed_functional_stop_replica_watch() {
 
 managed_functional_replica_progress_oracle() {
   mfrp_watch=$1 mfrp_out=$2 mfrp_expected=$3
-  jq -s --arg expected "$mfrp_expected" '
+  mfrp_bootstrap=$(managed_functional_bootstrap_roster "$mfrp_watch" true) || return 1
+  jq -s --arg expected "$mfrp_expected" --argjson bootstrap "$mfrp_bootstrap" '
     def event: if has("object") then .object else . end;
     ($expected | split(" ") | map(select(length>0) | tonumber)) as $want |
     (map(event |
@@ -767,7 +793,7 @@ managed_functional_replica_progress_oracle() {
             state:($rep.state // "bootstrap"),planSequence:($rep.plan.sequence // "bootstrap"),
             operationID:($rep.plan.operationID // ""),planExpectedConfigID:($rep.plan.expectedConfigID // null),
             completionConfigID:($rep.completion.configID // null),completionKind:($rep.completion.kind // "bootstrap"),
-            finalVoterIDs:($rep.completion.finalVoterIDs // (($r.events[$i].status.bootstrapPlan.members // [])|map(.member.ID)|sort))}]
+            finalVoterIDs:($rep.completion.finalVoterIDs // $bootstrap)}]
         }
       else error("replica progress did not match the exact certified ramp")
       end
@@ -1289,10 +1315,13 @@ leave-u5'
   functional_scenario=
   external3_uids_json=$(printf '%s\n' leave-u1 leave-u2 leave-u3 | jq -R . | jq -sc 'map(select(.!=""))|sort')
   external3_ids_json=$(printf '%s\n' "$leave_ids_json" | jq -c '.[0:3]')
-  jq -n --argjson roster "$external3_ids_json" '{spec:{replicas:3},status:{appliedVoterCount:3,bootstrapPlan:{members:[$roster[]|{member:{ID:.}}]}}}' > "$scratch/external3-cr.json"
   jq -n --argjson uids "$external3_uids_json" '{items:[$uids[]|{metadata:{uid:.},status:{conditions:[{type:"Ready",status:"True"}]}}]}' > "$scratch/external3-pods.json"
   jq -n --argjson uids "$external3_uids_json" '{subsets:[{addresses:[$uids[]|{targetRef:{uid:.}}]}]}' > "$scratch/external3-endpoints.json"
   jq -n '{items:[{spec:{replicas:3}}]}' > "$scratch/external3-deploy.json"
+  jq -n --argjson roster "$external3_ids_json" '{spec:{replicas:3},status:{appliedVoterCount:3,bootstrapPlan:{members:[$roster[]|{member:{ID:.}}]}}}' > "$scratch/external3-old-id.json"
+  if managed_functional_external_roster_oracle "$scratch/external3-old-id.json" "$scratch/external3-pods.json" \
+    "$scratch/external3-deploy.json" "$scratch/external3-endpoints.json" 3 "$scratch/external3-old-roster.json" bootstrap 2> "$scratch/external3-old-id.err"; then return 1; fi
+  jq -n --argjson roster "$external3_ids_json" '{spec:{replicas:3},status:{appliedVoterCount:3,bootstrapPlan:{members:[$roster[]|{member:{node_id:.}}]}}}' > "$scratch/external3-cr.json"
   managed_functional_external_roster_oracle "$scratch/external3-cr.json" "$scratch/external3-pods.json" \
     "$scratch/external3-deploy.json" "$scratch/external3-endpoints.json" 3 "$scratch/external3-roster.json" bootstrap
   jq -n --argjson roster "$leave_ids_json" '{spec:{replicas:5},status:{appliedVoterCount:5,repair:{state:"Completed",plan:{sequence:"add",operationID:"external-add",expectedConfigID:9,finalVoterIDs:$roster},completion:{kind:"Terminal",operationID:"external-add",configID:10,finalVoterIDs:$roster}}}}' > "$scratch/external5-cr.json"
@@ -1301,7 +1330,7 @@ leave-u5'
   jq -n '{items:[{spec:{replicas:5}}]}' > "$scratch/external5-deploy.json"
   managed_functional_external_roster_oracle "$scratch/external5-cr.json" "$scratch/external5-pods.json" \
     "$scratch/external5-deploy.json" "$scratch/external5-endpoints.json" 5 "$scratch/external5-roster.json" add
-  jq -e '.target==5 and .readyMatchesCertified==true and .endpointCount==5' "$scratch/external5-roster.json" >/dev/null
+  jq -e '.target==5 and .readyMatchesCertified==true and .endpointsMatchReady==true and .endpointIDs==.readyIDs and .endpointIDs==.finalVoterIDs and (.endpointPodUIDs|length)==5 and .endpointPodUIDs!=.endpointIDs and .endpointCount==5' "$scratch/external5-roster.json" >/dev/null
   for external_mutation in spec applied closed sequence duplicate; do
     case "$external_mutation" in
       spec) filter='.spec.replicas=4' ;;
@@ -1320,6 +1349,10 @@ leave-u5'
   jq '.subsets[0].addresses += [{targetRef:{uid:"extra"}}]' "$scratch/external5-endpoints.json" > "$scratch/external5-bad-endpoints.json"
   if managed_functional_external_roster_oracle "$scratch/external5-cr.json" "$scratch/external5-pods.json" \
     "$scratch/external5-deploy.json" "$scratch/external5-bad-endpoints.json" 5 "$scratch/external5-bad-roster.json" add; then return 1; fi
+  jq --arg uid "$(managed_functional_node_id leave-u1)" '.subsets[0].addresses[0].targetRef.uid=$uid' \
+    "$scratch/external5-endpoints.json" > "$scratch/external5-node-id-confusion.json"
+  if managed_functional_external_roster_oracle "$scratch/external5-cr.json" "$scratch/external5-pods.json" \
+    "$scratch/external5-deploy.json" "$scratch/external5-node-id-confusion.json" 5 "$scratch/external5-confusion-roster.json" add; then return 1; fi
   managed_functional_external_sequence_artifacts "$managed_functional_external_high_sequence" \
     "$scratch/external-high-sequence.txt" "$scratch/external-high-sequence.json"
   [ "$(cat "$scratch/external-high-sequence.txt")" = "$managed_functional_external_high_sequence" ]
@@ -1334,10 +1367,10 @@ leave-u5'
       ($sequence|split(" ")|map(tonumber)) as $s |
       [range(0;($s|length)) as $i |
         ($s[$i]) as $n |
+        [range(0;$n) as $j | "fixture-\($n)-\($j)"] as $ids |
         if $i==0 then
-          ({spec:{replicas:$n},status:{appliedVoterCount:$n}})
+          ({spec:{replicas:$n},status:{appliedVoterCount:$n,bootstrapPlan:{members:[$ids[]|{member:{node_id:.}}]}}})
         else
-          [range(0;$n) as $j | "fixture-\($n)-\($j)"] as $ids |
           ($s[$i] > $s[$i-1]) as $up |
           ({spec:{replicas:$n},status:{appliedVoterCount:$n,repair:{state:"Completed",
             plan:{sequence:(if $up then "add" else "leave" end),operationID:("fixture-op-"+($i|tostring)),
@@ -1350,7 +1383,10 @@ leave-u5'
   managed_self_test_replica_watch "$managed_functional_external_high_sequence" "$scratch/replica-watch.jsonl"
   managed_functional_replica_progress_oracle "$scratch/replica-watch.jsonl" "$scratch/replica-progress.json" \
     "$managed_functional_external_high_sequence"
-  jq -e '.sequence==[3,4,5,4,3,4,5,6,7,6,5,4,3,4,5,6,7,8,9,10,9,8,7,6,5,4,3] and (.steps|length)==26 and .maxMove==1 and .minimum==3 and (.events|length)==27' "$scratch/replica-progress.json" >/dev/null
+  jq -e '.sequence==[3,4,5,4,3,4,5,6,7,6,5,4,3,4,5,6,7,8,9,10,9,8,7,6,5,4,3] and (.steps|length)==26 and .maxMove==1 and .minimum==3 and (.events|length)==27 and .events[0].finalVoterIDs==["fixture-3-0","fixture-3-1","fixture-3-2"]' "$scratch/replica-progress.json" >/dev/null
+  jq -c 'if .status.bootstrapPlan then .status.bootstrapPlan.members |= map({member:{ID:.member.node_id}}) else . end' \
+    "$scratch/replica-watch.jsonl" > "$scratch/replica-watch-old-bootstrap-id.jsonl"
+  if managed_functional_replica_progress_oracle "$scratch/replica-watch-old-bootstrap-id.jsonl" "$scratch/replica-progress-bad.json" "$managed_functional_external_high_sequence" 2> "$scratch/progress-old-bootstrap-id.err"; then return 1; fi
   managed_self_test_replica_watch '3 4 5 4 3' "$scratch/replica-watch-quick.jsonl"
   managed_functional_replica_progress_oracle "$scratch/replica-watch-quick.jsonl" "$scratch/replica-progress-quick.json" '3 4 5 4 3'
   if managed_functional_replica_progress_oracle "$scratch/replica-watch.jsonl" "$scratch/replica-progress-bad.json" '3 4 5 4 3' 2> "$scratch/progress-wrong.err"; then return 1; fi
@@ -1362,7 +1398,7 @@ leave-u5'
   if managed_functional_replica_progress_oracle "$scratch/replica-watch-config-gap.jsonl" "$scratch/replica-progress-bad.json" "$managed_functional_external_high_sequence" 2> "$scratch/progress-config-gap.err"; then return 1; fi
   jq -s -c '.[0:5] + [(.[5] | .status.repair.state="Closed")] + .[6:] | .[]' "$scratch/replica-watch.jsonl" > "$scratch/replica-watch-stale.jsonl"
   if managed_functional_replica_progress_oracle "$scratch/replica-watch-stale.jsonl" "$scratch/replica-progress-bad.json" "$managed_functional_external_high_sequence" 2> "$scratch/progress-stale.err"; then return 1; fi
-  jq -c '.events[1:][] | {step:.index,from:.from,target:.to,sequence:.planSequence,operationID:.operationID,planExpectedConfigID:.planExpectedConfigID,completionConfigID:.completionConfigID,finalVoterIDs:.finalVoterIDs,certifiedRoster:.finalVoterIDs,readyIDs:.finalVoterIDs,endpointIDs:.finalVoterIDs,deploymentReplicas:.to}' \
+  jq -c '.events[1:][] | {step:.index,from:.from,target:.to,sequence:.planSequence,operationID:.operationID,planExpectedConfigID:.planExpectedConfigID,completionConfigID:.completionConfigID,finalVoterIDs:.finalVoterIDs,certifiedRoster:.finalVoterIDs,readyIDs:.finalVoterIDs,endpointIDs:.finalVoterIDs,endpointPodUIDs:[.finalVoterIDs[] as $id | "pod-uid-"+$id],deploymentReplicas:.to}' \
     "$scratch/replica-progress.json" > "$scratch/external-high-checkpoints.jsonl"
   managed_functional_external_high_evidence_oracle "$scratch/external-high-checkpoints.jsonl" \
     "$scratch/replica-progress.json" "$scratch/external-high-ramp.json"
@@ -1371,6 +1407,8 @@ leave-u5'
   if managed_functional_external_high_evidence_oracle "$scratch/external-high-checkpoints-missing-7.jsonl" "$scratch/replica-progress.json" "$scratch/external-high-ramp-bad.json" 2> "$scratch/external-high-missing-7.err"; then return 1; fi
   jq -c 'if .target==10 then .finalVoterIDs[0]="stale-target-10" else . end' "$scratch/external-high-checkpoints.jsonl" > "$scratch/external-high-checkpoints-bad-10.jsonl"
   if managed_functional_external_high_evidence_oracle "$scratch/external-high-checkpoints-bad-10.jsonl" "$scratch/replica-progress.json" "$scratch/external-high-ramp-bad.json" 2> "$scratch/external-high-target-10.err"; then return 1; fi
+  jq -c 'if .step==1 then .endpointIDs=.endpointPodUIDs else . end' "$scratch/external-high-checkpoints.jsonl" > "$scratch/external-high-checkpoints-pod-uid-confusion.jsonl"
+  if managed_functional_external_high_evidence_oracle "$scratch/external-high-checkpoints-pod-uid-confusion.jsonl" "$scratch/replica-progress.json" "$scratch/external-high-ramp-bad.json" 2> "$scratch/external-high-pod-uid-confusion.err"; then return 1; fi
   jq -n '{metadata:{uid:"operator-deploy",generation:2},spec:{replicas:1},status:{observedGeneration:2,availableReplicas:1}}' > "$scratch/functional-operator-external-baseline-deployment.json"
   jq -n '{items:[{metadata:{uid:"operator-pod"},status:{conditions:[{type:"Ready",status:"True"}],containerStatuses:[{name:"operator",containerID:"containerd://operator-1",restartCount:0}]}}]}' > "$scratch/functional-operator-external-baseline-pods.json"
   operator_containers=$(managed_functional_operator_container_identity "$scratch/functional-operator-external-baseline-pods.json")
