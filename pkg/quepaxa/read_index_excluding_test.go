@@ -176,6 +176,7 @@ type membershipAdvanceReadTransport struct {
 	n2Once      sync.Once
 	oldBlocked  chan struct{}
 	oldCanceled chan struct{}
+	cancelOnce  sync.Once
 	blocked     atomic.Int32
 }
 
@@ -194,7 +195,7 @@ func (t *membershipAdvanceReadTransport) ReadTip(ctx context.Context, to NodeID)
 		}
 		<-ctx.Done()
 		if t.blocked.Add(-1) == 0 {
-			close(t.oldCanceled)
+			t.cancelOnce.Do(func() { close(t.oldCanceled) })
 		}
 		return 0, ctx.Err()
 	default:
@@ -328,7 +329,7 @@ func TestReadIndexWaitsThroughFreezeWithoutCountingQuorum(t *testing.T) {
 	core := newCore("n1", &Cluster{ConfigID: 1, Members: oldMembers}, wal, coreTransport)
 	core.reconfigEnabled = true
 
-	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	go func() {
 		<-coreTransport.n2Entered
@@ -368,6 +369,11 @@ func TestReadIndexFrozenBackgroundFailsClosed(t *testing.T) {
 	core.mu.Unlock()
 	if _, _, err := core.ReadIndex(context.Background()); err != ErrQuorumUnavailable {
 		t.Fatalf("unbounded frozen read returned %v, want ErrQuorumUnavailable", err)
+	}
+	canceled, cancel := context.WithCancel(context.Background())
+	cancel()
+	if _, _, err := core.ReadIndex(canceled); !errors.Is(err, context.Canceled) {
+		t.Fatalf("canceled frozen read returned %v, want context.Canceled", err)
 	}
 }
 

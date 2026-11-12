@@ -38,6 +38,7 @@ var (
 
 const leaderEpochSize Slot = 16
 const frozenRecoveryTimeout = 500 * time.Millisecond
+const readIndexFrozenWait = 10 * time.Second
 
 type leaderTiming struct {
 	average time.Duration
@@ -880,6 +881,13 @@ func (c *Core) readIndexRound(ctx context.Context, transport Transport, configID
 }
 
 func (c *Core) readIndexFollowingMembership(ctx context.Context, excluded NodeID) (Slot, NodeID, error) {
+	var frozenWait context.Context
+	var cancelFrozenWait context.CancelFunc
+	defer func() {
+		if cancelFrozenWait != nil {
+			cancelFrozenWait()
+		}
+	}()
 	for {
 		if excluded == c.nodeID {
 			return 0, "", ErrQuorumUnavailable
@@ -889,16 +897,29 @@ func (c *Core) readIndexFollowingMembership(ctx context.Context, excluded NodeID
 		}
 		configID, members, changed, frozen, voter := c.readIndexState()
 		if frozen {
-			if _, bounded := ctx.Deadline(); !bounded {
-				log.Printf("read-index refused node_hash=%x excluded_hash=%x current_config=%d voter=%t observer=%t frozen=true bounded=false", sha256.Sum256([]byte(c.nodeID)), sha256.Sum256([]byte(excluded)), configID, voter, c.observer)
-				return 0, "", ErrQuorumUnavailable
+			if frozenWait == nil {
+				if ctx.Done() == nil {
+					log.Printf("read-index refused node_hash=%x excluded_hash=%x current_config=%d voter=%t observer=%t frozen=true cancellable=false", sha256.Sum256([]byte(c.nodeID)), sha256.Sum256([]byte(excluded)), configID, voter, c.observer)
+					return 0, "", ErrQuorumUnavailable
+				}
+				frozenWait = ctx
+				if _, bounded := ctx.Deadline(); !bounded {
+					frozenWait, cancelFrozenWait = context.WithTimeout(ctx, readIndexFrozenWait)
+				}
 			}
 			select {
-			case <-ctx.Done():
-				return 0, "", ctx.Err()
+			case <-frozenWait.Done():
+				if err := ctx.Err(); err != nil {
+					return 0, "", err
+				}
+				return 0, "", ErrQuorumUnavailable
 			case <-changed:
 				continue
 			}
+		}
+		if cancelFrozenWait != nil {
+			cancelFrozenWait()
+			frozenWait, cancelFrozenWait = nil, nil
 		}
 		if !voter {
 			log.Printf("read-index refused node_hash=%x excluded_hash=%x current_config=%d voter=false observer=%t frozen=false", sha256.Sum256([]byte(c.nodeID)), sha256.Sum256([]byte(excluded)), configID, c.observer)
