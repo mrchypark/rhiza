@@ -38,7 +38,7 @@ var (
 
 const leaderEpochSize Slot = 16
 const frozenRecoveryTimeout = 500 * time.Millisecond
-const readIndexFrozenWait = 10 * time.Second
+const readIndexMembershipWait = 10 * time.Second
 
 type leaderTiming struct {
 	average time.Duration
@@ -790,6 +790,37 @@ func (c *Core) readIndexState() (uint, []Member, <-chan struct{}, bool, bool) {
 	return cluster.ConfigID, cluster.Members, c.tipChanged, c.reconfiguration != nil, !c.observer && c.voterForClusterLocked(cluster)
 }
 
+// retainedTerminalPending identifies the narrow state where the current
+// certified roster contains this exact voter incarnation, but its activation
+// terminal has not yet acquired the local durability marker. It never matches
+// removed, replaced, learner, observer, or frozen membership.
+func (c *Core) retainedTerminalPendingLocked(cluster Cluster) (Slot, bool) {
+	if c.observer || c.reconfiguration != nil {
+		return 0, false
+	}
+	exactMember := false
+	for _, member := range cluster.Members {
+		if member.ID != c.nodeID {
+			continue
+		}
+		if member.WALIdentity == "" {
+			exactMember = !c.learner
+		} else {
+			exactMember = member.WALIdentity == c.walIdentity
+		}
+		break
+	}
+	if !exactMember {
+		return 0, false
+	}
+	for _, epoch := range c.configHistory {
+		if epoch.start > 1 && sameCluster(epoch.cluster, cluster) && !c.epochTerminalDurableLocked(epoch) {
+			return epoch.start - 1, true
+		}
+	}
+	return 0, false
+}
+
 type readIndexResult struct {
 	tip Slot
 	id  NodeID
@@ -882,12 +913,7 @@ func (c *Core) readIndexRound(ctx context.Context, transport Transport, configID
 
 func (c *Core) readIndexFollowingMembership(ctx context.Context, excluded NodeID) (Slot, NodeID, error) {
 	var frozenWait context.Context
-	var cancelFrozenWait context.CancelFunc
-	defer func() {
-		if cancelFrozenWait != nil {
-			cancelFrozenWait()
-		}
-	}()
+	var durabilityAttempted uint
 	for {
 		if excluded == c.nodeID {
 			return 0, "", ErrQuorumUnavailable
@@ -904,7 +930,9 @@ func (c *Core) readIndexFollowingMembership(ctx context.Context, excluded NodeID
 				}
 				frozenWait = ctx
 				if _, bounded := ctx.Deadline(); !bounded {
-					frozenWait, cancelFrozenWait = context.WithTimeout(ctx, readIndexFrozenWait)
+					boundedWait, cancel := context.WithTimeout(ctx, readIndexMembershipWait)
+					defer cancel()
+					frozenWait = boundedWait
 				}
 			}
 			select {
@@ -917,11 +945,41 @@ func (c *Core) readIndexFollowingMembership(ctx context.Context, excluded NodeID
 				continue
 			}
 		}
-		if cancelFrozenWait != nil {
-			cancelFrozenWait()
-			frozenWait, cancelFrozenWait = nil, nil
-		}
 		if !voter {
+			c.mu.RLock()
+			current := c.clusterForSlotLocked(c.tip + 1)
+			currentConfigID := current.ConfigID
+			currentFrozen := c.reconfiguration != nil
+			currentVoter := !c.observer && c.voterForClusterLocked(current)
+			pendingTerminal, activationPending := c.retainedTerminalPendingLocked(current)
+			c.mu.RUnlock()
+			if currentConfigID != configID || currentFrozen || currentVoter {
+				continue
+			}
+			if activationPending && durabilityAttempted != configID {
+				durabilityAttempted = configID
+				if ctx.Done() == nil {
+					return 0, "", ErrQuorumUnavailable
+				}
+				activationCtx := ctx
+				cancel := func() {}
+				if _, bounded := ctx.Deadline(); !bounded {
+					activationCtx, cancel = context.WithTimeout(ctx, readIndexMembershipWait)
+				}
+				err := c.EnsureDurableThrough(activationCtx, pendingTerminal)
+				activationErr := activationCtx.Err()
+				cancel()
+				if cErr := ctx.Err(); cErr != nil {
+					return 0, "", cErr
+				}
+				if err != nil {
+					if errors.Is(activationErr, context.DeadlineExceeded) {
+						return 0, "", ErrQuorumUnavailable
+					}
+					return 0, "", err
+				}
+				continue
+			}
 			log.Printf("read-index refused node_hash=%x excluded_hash=%x current_config=%d voter=false observer=%t frozen=false", sha256.Sum256([]byte(c.nodeID)), sha256.Sum256([]byte(excluded)), configID, c.observer)
 			return 0, "", ErrQuorumUnavailable
 		}

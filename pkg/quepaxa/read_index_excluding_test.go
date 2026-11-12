@@ -3,6 +3,7 @@ package quepaxa
 import (
 	"context"
 	"errors"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -375,6 +376,138 @@ func TestReadIndexFrozenBackgroundFailsClosed(t *testing.T) {
 	if _, _, err := core.ReadIndex(canceled); !errors.Is(err, context.Canceled) {
 		t.Fatalf("canceled frozen read returned %v, want context.Canceled", err)
 	}
+}
+
+type terminalDurabilityFixture struct {
+	cores     map[NodeID]*Core
+	transport *clusterTransport
+	terminal  Slot
+}
+
+func newTerminalDurabilityFixture(t *testing.T) *terminalDurabilityFixture {
+	t.Helper()
+	cores, transport := reconfigCluster(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	freeze, err := cores["a"].BeginReconfiguration(ctx, Cluster{ConfigID: 2, Members: []Member{{ID: "a"}, {ID: "b"}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := cores["a"].FinishReconfiguration(ctx); err != nil {
+		t.Fatal(err)
+	}
+	return &terminalDurabilityFixture{cores: cores, transport: transport, terminal: freeze + 16}
+}
+
+func dropTerminalDurability(core *Core, terminal Slot) {
+	core.mu.Lock()
+	core.durable[terminal] = false
+	core.durableThrough = min(core.durableThrough, terminal-1)
+	core.mu.Unlock()
+}
+
+func TestReadIndexPersistsExactRetainedTerminalBeforeQuorum(t *testing.T) {
+	fixture := newTerminalDurabilityFixture(t)
+	core := fixture.cores["a"]
+	dropTerminalDurability(core, fixture.terminal)
+	if core.IsVoter() {
+		t.Fatal("fixture unexpectedly had durable retained-voter activation")
+	}
+	tracking := newTrackingTransport(fixture.transport)
+	core.transport = tracking
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	slot, id, err := core.ReadIndex(ctx)
+	if err != nil || slot < fixture.terminal || id == "" {
+		t.Fatalf("read across terminal durability: slot=%d id=%s err=%v", slot, id, err)
+	}
+	core.mu.RLock()
+	durable := core.durable[fixture.terminal]
+	core.mu.RUnlock()
+	if !durable || !core.IsVoter() {
+		t.Fatalf("terminal durability was not established: durable=%t voter=%t", durable, core.IsVoter())
+	}
+	if got := tracking.readTipCount("b"); got != 1 {
+		t.Fatalf("read returned without exact quorum evidence: b calls=%d", got)
+	}
+}
+
+func TestReadIndexCanceledBeforeTerminalDurabilityDoesNotParticipate(t *testing.T) {
+	fixture := newTerminalDurabilityFixture(t)
+	core := fixture.cores["a"]
+	dropTerminalDurability(core, fixture.terminal)
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if _, _, err := core.ReadIndex(ctx); !errors.Is(err, context.Canceled) {
+		t.Fatalf("canceled durability read returned %v", err)
+	}
+	core.mu.RLock()
+	durable := core.durable[fixture.terminal]
+	core.mu.RUnlock()
+	if durable || core.IsVoter() {
+		t.Fatalf("canceled read granted activation: durable=%t voter=%t", durable, core.IsVoter())
+	}
+}
+
+func TestReadIndexTerminalDurabilityDoesNotBypassQuorumOrIdentity(t *testing.T) {
+	t.Run("sync failure", func(t *testing.T) {
+		fixture := newTerminalDurabilityFixture(t)
+		core := fixture.cores["a"]
+		dropTerminalDurability(core, fixture.terminal)
+		core.commits = newGroupCommit(func() error { return errors.New("injected sync failure") })
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+		if _, _, err := core.ReadIndex(ctx); err == nil || !strings.Contains(err.Error(), "injected sync failure") {
+			t.Fatalf("durability sync failure=%v", err)
+		}
+		if core.IsVoter() {
+			t.Fatal("failed durability sync activated voter admission")
+		}
+	})
+	t.Run("quorum loss", func(t *testing.T) {
+		fixture := newTerminalDurabilityFixture(t)
+		core := fixture.cores["a"]
+		dropTerminalDurability(core, fixture.terminal)
+		fixture.transport.fail("b")
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+		if _, _, err := core.ReadIndex(ctx); !errors.Is(err, ErrQuorumUnavailable) {
+			t.Fatalf("terminal durability bypassed quorum: %v", err)
+		}
+	})
+	t.Run("wrong WAL", func(t *testing.T) {
+		fixture := newTerminalDurabilityFixture(t)
+		core := fixture.cores["a"]
+		dropTerminalDurability(core, fixture.terminal)
+		core.mu.Lock()
+		for i := range core.configHistory {
+			if !sameCluster(core.configHistory[i].cluster, core.clusterForSlotLocked(core.tip+1)) {
+				continue
+			}
+			for j := range core.configHistory[i].cluster.Members {
+				if core.configHistory[i].cluster.Members[j].ID == core.nodeID {
+					core.configHistory[i].cluster.Members[j].WALIdentity = strings.Repeat("1", 64)
+				}
+			}
+		}
+		core.walIdentity = strings.Repeat("2", 64)
+		core.mu.Unlock()
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+		if _, _, err := core.ReadIndex(ctx); !errors.Is(err, ErrQuorumUnavailable) {
+			t.Fatalf("wrong WAL activated: %v", err)
+		}
+	})
+	t.Run("removed voter", func(t *testing.T) {
+		fixture := newTerminalDurabilityFixture(t)
+		core := fixture.cores["c"]
+		dropTerminalDurability(core, fixture.terminal)
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+		if _, _, err := core.ReadIndex(ctx); !errors.Is(err, ErrQuorumUnavailable) {
+			t.Fatalf("removed voter activated: %v", err)
+		}
+	})
 }
 
 type tipNotificationReadTransport struct {

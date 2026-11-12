@@ -22,7 +22,15 @@ func (n *Node) waitForManagedVoterAdmission(ctx context.Context) error {
 		return err
 	}
 	if !n.core.CanParticipateReadIndex() {
-		return fmt.Errorf("internal application has no active voter admission")
+		// A certified terminal can be installed before its local fsync marker.
+		// ReadIndex performs that exact bounded activation before proving quorum;
+		// discard its view here so the ordinary admission still owns the barrier.
+		if _, _, err := n.core.ReadIndex(ctx); err != nil {
+			return err
+		}
+		if !n.core.CanParticipateReadIndex() {
+			return fmt.Errorf("internal application has no active voter admission")
+		}
 	}
 	return nil
 }
