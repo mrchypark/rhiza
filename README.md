@@ -119,14 +119,20 @@ Start with the [managed operator guide](deploy/operator/README.md) and
 [recovery boundaries](docs/recovery.md); a [Korean introduction](docs/embedded-operator.md)
 is also available. The v1alpha2 route is an explicit no-PVC reference-host
 integration, not a turnkey conversion of arbitrary applications that update
-the library. The operator validates profiles and reconciles initialization,
-genesis Deployment and bootstrap plans. Kubernetes maintains Pod replicas and
-container restarts; the reference managed host runs healthy-quorum ADD-first
-replacement, and the engine validates identity and certified catch-up.
+the library. The operator validates profiles and commits initial genesis and
+bootstrap authority. After that commit, no running operator is required for a
+certified join or replacement. Deployment tooling sets the desired `voterCount`
+and explicitly scales the Deployment up. Kubernetes maintains Pod replicas and
+container restarts; the reference Rhiza Host discovers gated candidates and
+admits one learner at a time, and the engine validates identity and certified
+catch-up. A missing Pod is not a certified leave.
 
 Managed HA uses two init containers and shared `emptyDir`, explicit append-only
-profiles 9/10, before-ack durability, and a creation-time fixed voter count of
-3–64. Ordinary requests do not reserve a Kubernetes CR per mutation. HA object
+profiles 9/10, before-ack durability, and a desired voter count of 3–64. Raising
+the count requires an explicit Deployment scale-up; it is not autoscaling or a
+membership decision by itself. Lowering the target or scaling down is rejected,
+and no managed leave workflow is currently available. Ordinary requests do not
+reserve a Kubernetes CR per mutation. HA object
 data is append-only with no online delete GC. Recreate rollout enforcement and
 peer/client Service management are not supplied by the initializer.
 Whole-generation DR is not implemented by the operator: recovery API/schema fields

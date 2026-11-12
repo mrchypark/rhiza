@@ -19,7 +19,7 @@ if [ "${1-}" = --install-mode-self-test ]; then
   exit 0
 fi
 cleanup_managed_private() {
-  rm -f "$private/runtime.json" "$private/kubeconfig" "$private/curl.conf" "$private/request.body" "$private/admin.token" "$private/runtime-before.json" "$private/runtime-after.json" "$private/chaos-chart.yaml" "$private/chaos-render.jsonl" "$private/chaos-failure.json" "$private/gcs-emulator.json" "$private/managed-install.jsonl" || return 1
+  rm -f "$private/runtime.json" "$private/kubeconfig" "$private/curl.conf" "$private/request.body" "$private/admin.token" "$private/runtime-before.json" "$private/runtime-after.json" "$private/chaos-chart.yaml" "$private/chaos-render.jsonl" "$private/chaos-failure.json" "$private/gcs-emulator.json" "$private/managed-install.jsonl" "$private/functional-load.sh" "$private/functional-load-job.json" "$private/functional-stage" "$private/functional-probe.body" "$private/functional-readback.body" || return 1
   rmdir "$private"
 }
 managed_private_cleanup_self_test() (
@@ -31,6 +31,12 @@ managed_private_cleanup_self_test() (
   generated=$(sed -n 's/.*> "\$private\/\(managed-install.jsonl\)".*/\1/p' scripts/ha-managed-bootstrap-fixture.sh)
   [ "$generated" = managed-install.jsonl ] || exit 1
   : > "$private/$generated"
+  . scripts/ha-managed-scale-qualification.sh
+  managed_functional_write_load_script "$private/functional-load.sh"
+  managed_functional_load_job test-image > "$private/functional-load-job.json"
+  for functional_private in functional-stage functional-probe.body functional-readback.body; do
+    : > "$private/$functional_private"
+  done
   cleanup_managed_private || exit 1
   [ ! -e "$private" ] || exit 1
   mkdir "$private"

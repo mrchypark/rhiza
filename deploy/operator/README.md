@@ -10,9 +10,9 @@ its `serve-managed-sql` reference host as the main process.
 
 | Component | Current responsibility |
 | --- | --- |
-| `rhiza-operator` | Poll namespace-scoped clusters, validate the installed private runtime profile and matching Secret, create/read back the generation-zero Deployment, and commit genesis/bootstrap authority and the plan from actual gated Pod identities. |
-| Kubernetes Deployment/kubelet | Maintain the configured Pod count and restart containers. A replacement Pod has a new identity; Kubernetes restart alone does not grant it voting authority. |
-| Reference managed host | Run the background replacement loop, discover replacement candidates, and coordinate certified ADD-first repair under a healthy quorum. |
+| `rhiza-operator` | Validate the installed private runtime profile and matching Secret, create/read back the generation-zero Deployment, and commit genesis/bootstrap authority from actual gated Pod identities. It is retained for separately authorized DR work but is not required after bootstrap for certified join or replacement, and it has no automatic DR executor. |
+| Kubernetes Deployment/kubelet | Maintain the configured Pod count and restart containers. Deployment tooling sets the desired `voterCount` and explicitly scales the Deployment up. A replacement Pod has a new identity; Pod loss is not a certified leave, and restart alone does not grant voting authority. |
+| Reference managed host | Run the background replacement loop, discover gated candidates, and admit one learner at a time through certified ADD-first repair under a healthy quorum. |
 | Rhiza engine | Validate WAL identity, membership and certified history, catch up the learner, and certify/apply decisions. |
 
 See the [operator entry point](../../cmd/rhiza-operator/main.go),
@@ -83,14 +83,15 @@ container. Main-container restart retains that directory; Pod replacement loses
 it and must follow authenticated bootstrap/adoption and catch-up.
 
 The [cluster schema](cluster-crd.yaml) requires `voterCount` from 3 through 64.
-It may increase, but is never decreased automatically. The initializer changes
-the Deployment replica target; each new Pod remains behind the identity gate
-until a host records an add-only QuePaxa transition with its live WAL/admission
-proof. This is bounded enrollment, not autoscaling. The initializer
-does not enforce `Recreate` or create/manage peer and client Services; rollout
-policy, network reachability, service exposure and application integration need
-explicit deployment configuration. `Recreate` is not a termination or fencing
-proof for forced deletion or partitions.
+It may increase but is never decreased automatically. The deployment owner sets
+that desired target and explicitly scales the Deployment up; the operator is not
+required after bootstrap for this normal path. Each new Pod remains behind the
+identity gate until the Rhiza Host admits one learner and records its add-only
+QuePaxa transition with live WAL/admission proof. This is bounded enrollment,
+not autoscaling. The initializer does not enforce `Recreate` or create/manage
+peer and client Services; rollout policy, network reachability, service exposure
+and application integration need explicit deployment configuration. `Recreate`
+is not a termination or fencing proof for forced deletion or partitions.
 
 The shipped [RBAC](rbac.yaml) grants more than this reconciliation path uses:
 the operator Role includes Pod and Secret creation/deletion, Service creation,

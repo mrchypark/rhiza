@@ -79,7 +79,9 @@ One operator process uses one installed profile (protocol, provider, bucket,
 base prefix and admin token) for the namespace's managed CRs. Existing code
 derives per-CR/generation storage namespaces; this is not independent per-CR
 credentials or tenant isolation. Use separate installations/namespaces for
-different profiles. Healthy-quorum replacement remains the Host/engine's job;
-no generation DR executor, fencer or lease is added here.
+different profiles. After genesis/bootstrap, no running operator is required for
+healthy-quorum join or replacement, which remains the Host/engine's job. The
+operator is retained for separately authorized DR work, but no generation DR
+executor, fencer or lease is added here.
 
 See the [operator contract](../operator/README.md) for ownership and recovery limits.

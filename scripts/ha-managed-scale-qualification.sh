@@ -69,6 +69,22 @@ managed_functional_operator_stopped() {
     && jq -e '(.items|length)==0' "$logs/functional-operator-pods.json" >/dev/null 2>&1
 }
 
+managed_functional_stop_operator() {
+  mfso_operator_pod=$(k -n "$namespace" get pods -l app.kubernetes.io/name=rhiza-operator -o json | jq -er 'if (.items|length)==1 then .items[0].metadata.name else error("expected one operator Pod") end')
+  mfso_operator_uid=$(k -n "$namespace" get pod "$mfso_operator_pod" -o json | jq -er '.metadata.uid')
+  kind_runtime_before "$mfso_operator_pod" "$mfso_operator_uid" functional-operator operator
+  k -n "$namespace" scale deployment/rhiza-operator --replicas=0 > "$logs/functional-operator-scale-zero.txt"
+  mfso_deadline=$(( $(date +%s) + 90 ))
+  while :; do
+    k -n "$namespace" get deployment rhiza-operator -o json > "$logs/functional-operator-deployment.json" 2>/dev/null || :
+    k -n "$namespace" get pods -l app.kubernetes.io/name=rhiza-operator -o json > "$logs/functional-operator-pods.json" 2>/dev/null || :
+    managed_functional_operator_stopped && break
+    [ "$(date +%s)" -lt "$mfso_deadline" ] || { echo 'operator did not stop before managed scale test' >&2; return 1; }
+    sleep 1
+  done
+  kind_runtime_after delete "$mfso_operator_uid" || { echo 'operator container did not stop before managed scale test' >&2; return 1; }
+}
+
 managed_functional_commit() {
   mfc_job=$1 mfc_id=$2 mfc_sql=$3 mfc_expected=$4
   mfc_body=$(jq -cn --arg id "$mfc_id" --arg sql "$mfc_sql" '{request_id:$id,sql:$sql}')
@@ -143,12 +159,54 @@ done
 EOF
 }
 
+managed_functional_load_job() {
+  jq -n --arg image "$1" '
+    {
+      apiVersion: "batch/v1",
+      kind: "Job",
+      metadata: {
+        name: "functional-load",
+        labels: {"rhiza-ci-owner": "harness"}
+      },
+      spec: {
+        backoffLimit: 0,
+        activeDeadlineSeconds: 720,
+        template: {
+          metadata: {labels: {"rhiza-ci-owner": "harness"}},
+          spec: {
+            restartPolicy: "Never",
+            automountServiceAccountToken: false,
+            securityContext: {runAsUser: 65532, runAsGroup: 65532, fsGroup: 65532, runAsNonRoot: true},
+            containers: [{
+              name: "client",
+              image: $image,
+              command: ["sh", "-c", "sh /load/load.sh write & w=$!; sh /load/load.sh linear & r=$!; wait $w; wait $r; touch /work/load-done; while [ ! -f /work/probe-done ]; do sleep 1; done"],
+              securityContext: {allowPrivilegeEscalation: false, readOnlyRootFilesystem: true, capabilities: {drop: ["ALL"]}},
+              volumeMounts: [
+                {name: "auth", mountPath: "/auth", readOnly: true},
+                {name: "load", mountPath: "/load", readOnly: true},
+                {name: "work", mountPath: "/work"}
+              ]
+            }],
+            volumes: [
+              {name: "auth", secret: {secretName: "functional-client-auth", defaultMode: 288}},
+              {name: "load", configMap: {name: "functional-load", defaultMode: 365}},
+              {name: "work", emptyDir: {}}
+            ]
+          }
+        }
+      }
+    }
+  '
+}
+
 managed_functional_start_load() {
   mfs_script="$private/functional-load.sh"
   managed_functional_write_load_script "$mfs_script"
   k -n "$namespace" create secret generic functional-client-auth --from-file="config=$private/curl.conf"
   k -n "$namespace" create configmap functional-load --from-file="load.sh=$mfs_script"
-  jq -n --arg image 'curlimages/curl:8.12.1@sha256:94e9e444bcba979c2ea12e27ae39bee4cd10bc7041a472c4727a558e213744e6' '{apiVersion:"batch/v1",kind:"Job",metadata:{name:"functional-load",labels:{"rhiza-ci-owner":"harness"}},spec:{backoffLimit:0,activeDeadlineSeconds:720,template:{metadata:{labels:{"rhiza-ci-owner":"harness"}},spec:{restartPolicy:"Never",automountServiceAccountToken:false,securityContext:{runAsUser:65532,runAsGroup:65532,fsGroup:65532,runAsNonRoot:true},containers:[{name:"client",image:$image,command:["sh","-c","sh /load/load.sh write & w=$!; sh /load/load.sh linear & r=$!; wait $w; wait $r; touch /work/load-done; while [ ! -f /work/probe-done ]; do sleep 1; done"],securityContext:{allowPrivilegeEscalation:false,readOnlyRootFilesystem:true,capabilities:{drop:["ALL"]}},volumeMounts:[{name:"auth",mountPath:"/auth",readOnly:true},{name:"load",mountPath:"/load",readOnly:true},{name:"work",mountPath:"/work"}]}],volumes:[{name:"auth",secret:{secretName:"functional-client-auth",defaultMode:288}},{name:"load",configMap:{name:"functional-load",defaultMode:365}},{name:"work",emptyDir:{}}]}}}' | k -n "$namespace" create -f - > "$logs/functional-load-create.txt"
+  managed_functional_load_job 'curlimages/curl:8.12.1@sha256:94e9e444bcba979c2ea12e27ae39bee4cd10bc7041a472c4727a558e213744e6' > "$private/functional-load-job.json"
+  k -n "$namespace" create -f "$private/functional-load-job.json" > "$logs/functional-load-create.txt"
   k -n "$namespace" wait --for=condition=Ready pod -l job-name=functional-load --timeout=120s > "$logs/functional-load-ready.txt"
   functional_client_pod=$(k -n "$namespace" get pod -l job-name=functional-load -o jsonpath='{.items[0].metadata.name}')
   test -n "$functional_client_pod"
@@ -248,11 +306,16 @@ managed_functional_capture() {
 }
 
 managed_functional_scale_up() {
+  mfsu_deployment=$(k -n "$namespace" get deployment -l "$selector" -o jsonpath='{.items[0].metadata.name}')
+  test -n "$mfsu_deployment"
   managed_functional_commit functional-scale-write-3 scale-functional-3 "INSERT INTO bootstrap_ci VALUES (3,'functional-3')" functional-3
+  managed_functional_stop_operator || return 1
   k -n "$namespace" patch rhizacluster sql --type merge -p '{"spec":{"voterCount":4}}' > "$logs/functional-scale-to-4.txt"
+  k -n "$namespace" scale "deployment/$mfsu_deployment" --replicas=4 > "$logs/functional-scale-deployment-4.txt"
   managed_functional_wait_enrollment 4 scale4 || { echo '3->4 enrollment did not certify a four-voter roster' >&2; return 1; }
   managed_functional_commit functional-scale-write-4 scale-functional-4 "INSERT INTO bootstrap_ci VALUES (4,'functional-4')" functional-4
   k -n "$namespace" patch rhizacluster sql --type merge -p '{"spec":{"voterCount":5}}' > "$logs/functional-scale-to-5.txt"
+  k -n "$namespace" scale "deployment/$mfsu_deployment" --replicas=5 > "$logs/functional-scale-deployment-5.txt"
   managed_functional_wait_enrollment 5 scale5 || { echo '4->5 enrollment did not certify a five-voter roster' >&2; return 1; }
   managed_functional_commit functional-scale-write-5 scale-functional-5 "INSERT INTO bootstrap_ci VALUES (5,'functional-5')" functional-5
   printf '%s\n' 'PASS: 3->4->5 certified managed enrollment, Deployment/Ready/endpoint rosters, ACK and SQL readback' > "$logs/functional-result.txt"
@@ -263,19 +326,7 @@ managed_functional_quorum() {
   mfq_result=0
   mfq_deployment=$(k -n "$namespace" get deployment -l "$selector" -o jsonpath='{.items[0].metadata.name}')
   test -n "$mfq_deployment"
-  mfq_operator_pod=$(k -n "$namespace" get pods -l app.kubernetes.io/name=rhiza-operator -o json | jq -er 'if (.items|length)==1 then .items[0].metadata.name else error("expected one operator Pod") end')
-  mfq_operator_uid=$(k -n "$namespace" get pod "$mfq_operator_pod" -o json | jq -er '.metadata.uid')
-  kind_runtime_before "$mfq_operator_pod" "$mfq_operator_uid" functional-operator operator
-  k -n "$namespace" scale deployment/rhiza-operator --replicas=0 > "$logs/functional-operator-scale-zero.txt"
-  mfq_deadline=$(( $(date +%s) + 90 ))
-  while :; do
-    k -n "$namespace" get deployment rhiza-operator -o json > "$logs/functional-operator-deployment.json" 2>/dev/null || :
-    k -n "$namespace" get pods -l app.kubernetes.io/name=rhiza-operator -o json > "$logs/functional-operator-pods.json" 2>/dev/null || :
-    managed_functional_operator_stopped && break
-    [ "$(date +%s)" -lt "$mfq_deadline" ] || { echo 'operator did not stop before quorum scale test' >&2; return 1; }
-    sleep 1
-  done
-  kind_runtime_after delete "$mfq_operator_uid" || { echo 'operator container did not stop before quorum scale test' >&2; return 1; }
+  managed_functional_stop_operator || return 1
   managed_functional_start_load
   managed_functional_stage down-2
   k -n "$namespace" scale "deployment/$mfq_deployment" --replicas=2 > "$logs/functional-scale-down-2.txt"
@@ -394,11 +445,31 @@ managed_functional_self_test() (
   jq -e '.stages.up3.http503==0 and .failures.http503.total==1 and .failures.deadline.total==1' "$scratch/summary.json" >/dev/null
   managed_functional_write_load_script "$scratch/load.sh"
   sh -n "$scratch/load.sh"
+  managed_functional_load_job test-image > "$scratch/load-job.json"
+  jq -e --arg image test-image '.apiVersion=="batch/v1" and .kind=="Job" and .metadata.name=="functional-load" and .spec.template.spec.containers[0].image==$image and (.spec.template.spec.containers[0].volumeMounts|length)==3 and (.spec.template.spec.volumes|length)==3' "$scratch/load-job.json" >/dev/null
   grep -F 'op=linearizable-read' "$scratch/load.sh" >/dev/null
   # shellcheck disable=SC2016 # Verify the generated script retains its variables.
   grep -F '"$op" "$n"' "$scratch/load.sh" >/dev/null
   printf 'not-a-row\n' > "$scratch/writes.tsv"
   if managed_functional_load_oracle "$scratch/writes.tsv" "$scratch/reads.tsv" "$scratch/bad.json" 2>/dev/null; then return 1; fi
+  namespace=managed-bootstrap selector=test-selector logs=$scratch
+  mfsu_order="$scratch/scale-up-order.txt"
+  k() {
+    case "$*" in
+      *"get deployment -l $selector -o jsonpath="*) printf '%s\n' workload-deployment ;;
+      *'patch rhizacluster sql'*'voterCount":4'*) printf '%s\n' patch-4 >> "$mfsu_order" ;;
+      *'patch rhizacluster sql'*'voterCount":5'*) printf '%s\n' patch-5 >> "$mfsu_order" ;;
+      *"scale deployment/workload-deployment --replicas=4"*) printf '%s\n' scale-4 >> "$mfsu_order" ;;
+      *"scale deployment/workload-deployment --replicas=5"*) printf '%s\n' scale-5 >> "$mfsu_order" ;;
+      *) return 97 ;;
+    esac
+  }
+  managed_functional_commit() { printf 'commit-%s\n' "$2" >> "$mfsu_order"; }
+  managed_functional_stop_operator() { printf '%s\n' stop >> "$mfsu_order"; }
+  managed_functional_wait_enrollment() { printf 'wait-%s\n' "$1" >> "$mfsu_order"; }
+  managed_functional_scale_up
+  printf '%s\n' commit-scale-functional-3 stop patch-4 scale-4 wait-4 commit-scale-functional-4 patch-5 scale-5 wait-5 commit-scale-functional-5 > "$scratch/scale-up-expected.txt"
+  cmp "$scratch/scale-up-expected.txt" "$mfsu_order"
   printf '%s\n' 'PASS: managed functional scale oracles'
 )
 

@@ -161,11 +161,7 @@ func ReconcileV1Alpha2ManagedInitialization(ctx context.Context, kube *Kubernete
 		return s, e
 	}
 	if _, ok := status["genesis"]; ok {
-		s, err := committed()
-		if err != nil {
-			return s, err
-		}
-		return reconcileV1Alpha2ManagedScale(ctx, kube, ref, c.Spec, profile, s)
+		return committed()
 	}
 	if c.Spec.GenesisIntent == nil || *c.Spec.GenesisIntent != "Create" {
 		return V1Alpha2StatusSnapshot{}, fmt.Errorf("cluster lacks creation intent")
@@ -269,92 +265,6 @@ func ReconcileV1Alpha2ManagedInitialization(ctx context.Context, kube *Kubernete
 		return V1Alpha2StatusSnapshot{}, err
 	}
 	return committed()
-}
-
-// reconcileV1Alpha2ManagedScale changes only the Deployment replica target.
-// New Pods stay behind the identity gate until a host records a certified
-// add-only enrollment. A lower target is never inferred as permission to shrink.
-func reconcileV1Alpha2ManagedScale(ctx context.Context, kube *Kubernetes, ref V1Alpha2ClusterRef, spec V1Alpha2ClusterSpec, profile V1Alpha2RuntimeProfile, status V1Alpha2StatusSnapshot) (V1Alpha2StatusSnapshot, error) {
-	init, err := LoadV1Alpha2ApplicationInit(ctx, &V1Alpha2StatusStore{Kube: kube}, ref)
-	if err != nil {
-		return status, err
-	}
-	if init.Assignment().State != "Consumed" {
-		return status, nil
-	}
-	if status.Authority().Generation != 0 {
-		return status, nil
-	}
-	bootstrap, err := status.BootstrapPlan()
-	if err != nil {
-		return status, err
-	}
-	current := len(bootstrap.Members)
-	if r, err := parseV1Alpha2Repair(status); err != nil {
-		return status, err
-	} else if r != nil {
-		switch r.Plan.Sequence {
-		case V1Alpha2RepairAdd:
-			current = len(r.Plan.FinalVoterIDs) - 1
-			if r.State == "Completed" && r.Completion != nil && r.Completion.Kind == "Terminal" {
-				current = len(r.Completion.FinalVoterIDs)
-			}
-		case V1Alpha2RepairAddThenRemove:
-			// FinalVoterIDs is the stable replacement target. The ADD-first
-			// intermediate roster is temporary and must not block reconciliation.
-			current = len(r.Plan.FinalVoterIDs)
-		}
-	}
-	target := int(spec.VoterCount)
-	if target < current {
-		return status, fmt.Errorf("voterCount %d is below the installed %d-voter membership; automatic shrink is unsupported", target, current)
-	}
-	name, err := V1Alpha2GenesisDeploymentName(ref.UID)
-	if err != nil {
-		return status, err
-	}
-	base := "/apis/apps/v1/namespaces/" + ref.Namespace + "/deployments/" + name
-	var live map[string]any
-	if err := kube.Get(ctx, base, &live); err != nil {
-		return status, err
-	}
-	meta, specObj := asObject(live["metadata"]), asObject(live["spec"])
-	if str(live["apiVersion"]) != "apps/v1" || str(live["kind"]) != "Deployment" || str(meta["name"]) != name || str(meta["namespace"]) != ref.Namespace || str(meta["uid"]) != status.Authority().Binding.DeploymentUID || meta["deletionTimestamp"] != nil || !bootstrapOwner(v1alpha2BootstrapMetadata{Name: str(meta["name"]), Namespace: str(meta["namespace"]), UID: str(meta["uid"]), ResourceVersion: str(meta["resourceVersion"]), OwnerReferences: ownerReferences(meta)}, V1Alpha2APIVersion, "RhizaCluster", ref.Name, ref.UID) {
-		return status, fmt.Errorf("managed Deployment identity changed")
-	}
-	replicas := int(number(specObj["replicas"]))
-	if replicas < current {
-		return status, fmt.Errorf("Deployment has %d replicas below the installed %d-voter membership", replicas, current)
-	}
-	podSpec, err := V1Alpha2ManagedSQLPodSpec(ref, profile, spec.Workload.PodTemplate.Spec.Containers)
-	if err != nil {
-		return status, err
-	}
-	labels := map[string]string{"rhiza.mrchypark.dev/cluster-uid": ref.UID, "rhiza.mrchypark.dev/generation": "0"}
-	expected := map[string]any{"replicas": replicas, "selector": map[string]any{"matchLabels": labels}, "template": map[string]any{"metadata": map[string]any{"labels": labels}, "spec": podSpec}}
-	if !managedCandidateSpecMatches(jsonBytes(specObj), jsonBytes(expected)) {
-		return status, fmt.Errorf("managed Deployment template changed")
-	}
-	if target == replicas {
-		return status, nil
-	}
-	// Scaling above the requested target is retained; reducing it would destroy
-	// capacity without a membership operation. Only an increase is reconciled.
-	if target < replicas {
-		return status, nil
-	}
-	specObj["replicas"] = target
-	if err := kube.Put(ctx, base, live, new(map[string]any)); err != nil {
-		return status, err
-	}
-	var readback map[string]any
-	if err := kube.Get(ctx, base, &readback); err != nil {
-		return status, err
-	}
-	if int(number(asObject(readback["spec"])["replicas"])) != target {
-		return status, fmt.Errorf("Deployment replica target readback mismatch")
-	}
-	return status, nil
 }
 
 func ownerReferences(meta map[string]any) []v1alpha2BootstrapOwner {

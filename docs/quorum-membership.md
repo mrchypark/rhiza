@@ -52,13 +52,36 @@ Sparse freezes are buffered until they enter the contiguous prefix. A later
 freeze in the drain keeps its original bytes and prefix contribution, but does
 not start a second transition.
 
+## Normal managed membership boundary
+
+Genesis and bootstrap are the operator-owned setup path. After that authority is
+committed, no running operator is required for certified membership joins or
+replacement. Deployment tooling sets the desired `voterCount` and explicitly
+scales the Deployment up; changing the target is neither autoscaling nor
+membership evidence. The reference Rhiza Host observes gated candidates and
+admits one learner at a time, waiting for the certified terminal before planning
+the next candidate.
+
+Pod loss is not a certified leave. A missing Pod can make a current voter a
+replacement candidate, but consensus membership changes only through the
+authenticated ADD-first transition under a surviving quorum. Readiness, replica
+count, Pod deletion and elapsed time do not prove that an old incarnation is
+stopped or that its storage work is complete.
+
+For an embedded database, this document exposes only an explicit, confirmed
+removal through `DB.ChangeMembership`; callers must establish the exact old
+incarnation and its exclusion. It is not inferred from a missing Pod. Lowering
+`voterCount` is rejected, and no managed leave workflow is documented as
+available. The operator remains part of the genesis/bootstrap and separately
+authorized DR boundary; this does not claim that automatic DR exists.
+
 ## Lost voter example
 
-Kubernetes replaces Pods under the managed Deployment. The operator initializes
-that Deployment and its bootstrap plan; the reference managed host's background
-loop discovers candidates and invokes healthy-quorum replacement. The engine
-enforces the membership transition and learner proof. This is distinct from
-operator-driven generation recovery after quorum loss.
+Kubernetes replaces Pods under the managed Deployment. The operator creates the
+initial Deployment and commits its bootstrap plan; afterward the reference Host's
+background loop discovers candidates and invokes healthy-quorum replacement.
+The engine enforces the membership transition and learner proof. This is distinct
+from separately authorized generation recovery after quorum loss.
 
 With voters A/B/C and C's WAL permanently lost, the normal managed repair path
 uses ADD-first replacement under the surviving quorum. A replacement uses a new

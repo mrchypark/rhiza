@@ -307,7 +307,7 @@ func TestPhase9InitializerCreatesOnceAndPreservesStatus(t *testing.T) {
 	}
 }
 
-func TestManagedScaleGrowsReplicaTargetWithoutShrinking(t *testing.T) {
+func TestManagedInitializerDoesNotDriveHealthyMembership(t *testing.T) {
 	s, kube := phase9Setup(t, phase9CurrentManagedCluster())
 	if _, err := ReconcileV1Alpha2ManagedInitialization(context.Background(), kube, phase2Ref, phase9RuntimeProfile()); err != nil {
 		t.Fatal(err)
@@ -331,8 +331,8 @@ func TestManagedScaleGrowsReplicaTargetWithoutShrinking(t *testing.T) {
 		defer s.mu9.Unlock()
 		return int(number(asObject(asObject(jsonDecode(s.t, s.deployment))["spec"])["replicas"]))
 	}
-	// A direct Kubernetes scale changes Pod count only. It must not create a
-	// membership intent or make the initializer treat the extra replica as a voter.
+	// Healthy membership belongs to Rhiza. The initializer persists intent and
+	// observes status, but it never changes the running voter capacity.
 	s.mu9.Lock()
 	deployment := jsonDecode(s.t, s.deployment)
 	asObject(deployment["spec"])["replicas"] = 4
@@ -348,30 +348,25 @@ func TestManagedScaleGrowsReplicaTargetWithoutShrinking(t *testing.T) {
 	if s.cluster != before || asObject(asObject(jsonDecode(t, s.cluster)["status"])["repair"]) != nil {
 		t.Fatal("bare kubectl scale fabricated membership or changed status")
 	}
-	setTarget(4)
-	if _, err := ReconcileV1Alpha2ManagedInitialization(context.Background(), kube, phase2Ref, phase9RuntimeProfile()); err != nil {
-		t.Fatal(err)
-	}
-	if got := replicas(); got != 4 {
-		t.Fatalf("3->4 replicas=%d", got)
-	}
 	setTarget(5)
+	targetCluster := s.cluster
 	if _, err := ReconcileV1Alpha2ManagedInitialization(context.Background(), kube, phase2Ref, phase9RuntimeProfile()); err != nil {
 		t.Fatal(err)
 	}
-	if got := replicas(); got != 5 {
-		t.Fatalf("4->5 replicas=%d", got)
+	if got := replicas(); got != 4 || s.cluster != targetCluster {
+		t.Fatalf("target increase changed replicas or status: replicas=%d", got)
 	}
 	setTarget(3)
+	targetCluster = s.cluster
 	if _, err := ReconcileV1Alpha2ManagedInitialization(context.Background(), kube, phase2Ref, phase9RuntimeProfile()); err != nil {
 		t.Fatalf("lower target must be inert: %v", err)
 	}
-	if got := replicas(); got != 5 {
-		t.Fatalf("manual lower target or kubectl-scale drift changed replicas to %d", got)
+	if got := replicas(); got != 4 || s.cluster != targetCluster {
+		t.Fatalf("manual lower target changed replicas or status: replicas=%d", got)
 	}
 }
 
-func TestManagedScaleIgnoresTemporaryAddFirstMembership(t *testing.T) {
+func TestManagedInitializerDoesNotDriveTemporaryMembership(t *testing.T) {
 	s, kube := phase9Setup(t, phase9CurrentManagedCluster())
 	ctx := context.Background()
 	first, err := ReconcileV1Alpha2ManagedInitialization(ctx, kube, phase2Ref, phase9RuntimeProfile())
