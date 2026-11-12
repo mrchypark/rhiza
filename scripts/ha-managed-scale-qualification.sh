@@ -214,7 +214,7 @@ managed_functional_start_load() {
 
 managed_functional_stage() {
   printf '%s' "$1" > "$private/functional-stage"
-  k -n "$namespace" exec "$functional_client_pod" -c client -- sh -c 'cat > /work/stage' < "$private/functional-stage"
+  k -n "$namespace" exec -i "$functional_client_pod" -c client -- sh -c 'cat > /work/stage' < "$private/functional-stage"
 }
 
 managed_functional_wait_up3_samples() {
@@ -470,6 +470,13 @@ managed_functional_self_test() (
   managed_functional_scale_up
   printf '%s\n' commit-scale-functional-3 stop patch-4 scale-4 wait-4 commit-scale-functional-4 patch-5 scale-5 wait-5 commit-scale-functional-5 > "$scratch/scale-up-expected.txt"
   cmp "$scratch/scale-up-expected.txt" "$mfsu_order"
+  functional_client_pod=load-pod private=$scratch
+  k() {
+    [ "$1 $2 $3 $4 $5" = "-n managed-bootstrap exec -i load-pod" ] || return 97
+    cat > "$scratch/stage-forwarded"
+  }
+  managed_functional_stage up-3
+  [ "$(cat "$scratch/stage-forwarded")" = up-3 ]
   printf '%s\n' 'PASS: managed functional scale oracles'
 )
 
