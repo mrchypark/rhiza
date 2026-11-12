@@ -303,7 +303,9 @@ func TestQualificationApplicationProvenance(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !bytes.Contains(script, []byte(". scripts/ha-managed-bootstrap-fixture.sh\nmanaged_fixture")) {
+	fixtureSource := []byte(". scripts/ha-managed-bootstrap-fixture.sh\n")
+	fixtureLoaded := bytes.LastIndex(script, fixtureSource)
+	if fixtureLoaded < 0 || !bytes.Contains(script[fixtureLoaded+len(fixtureSource):], []byte("\nmanaged_fixture\n")) {
 		t.Fatal("managed qualification must execute the shared fixture")
 	}
 	fixture, err := os.ReadFile("../../../scripts/ha-managed-bootstrap-fixture.sh")

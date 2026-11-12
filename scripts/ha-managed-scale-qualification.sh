@@ -39,6 +39,14 @@ managed_functional_observe_roster() {
   managed_functional_roster_oracle "$logs/functional-$mfo_tag-cr.json" "$logs/functional-$mfo_tag-pods.json" "$logs/functional-$mfo_tag-deployment.json" "$logs/functional-$mfo_tag-endpoints.json" "$mfo_target" "$logs/functional-$mfo_tag-roster.json"
 }
 
+managed_functional_enrollment_ready() {
+  mfer_target=$1 mfer_tag=$2
+  jq -e --argjson target "$mfer_target" '.spec.voterCount==$target and .status.repair.state=="Completed" and .status.repair.plan.sequence=="add" and .status.repair.completion.kind=="Terminal" and (.status.repair.completion.finalVoterIDs|length)==$target' "$logs/functional-$mfer_tag-poll.json" >/dev/null 2>&1 \
+    && jq -e --argjson target "$mfer_target" '(.items|length)==1 and .items[0].spec.replicas==$target' "$logs/functional-$mfer_tag-deployment-poll.json" >/dev/null 2>&1 \
+    && jq -e --argjson target "$mfer_target" '[.items[]|select(any(.status.conditions[]?; .type=="Ready" and .status=="True"))]|length==$target' "$logs/functional-$mfer_tag-pods-poll.json" >/dev/null 2>&1 \
+    && jq -e --argjson target "$mfer_target" '[.subsets[]?.addresses[]?]|length==$target' "$logs/functional-$mfer_tag-endpoints-poll.json" >/dev/null 2>&1
+}
+
 managed_functional_wait_enrollment() {
   mfw_target=$1 mfw_tag=$2
   mfw_deadline=$(( $(date +%s) + 300 ))
@@ -47,16 +55,18 @@ managed_functional_wait_enrollment() {
     k -n "$namespace" get deployment -l "$selector" -o json > "$logs/functional-$mfw_tag-deployment-poll.json" 2>/dev/null || :
     k -n "$namespace" get pods -l "$selector" -o json > "$logs/functional-$mfw_tag-pods-poll.json" 2>/dev/null || :
     k -n "$namespace" get endpoints bootstrap-client -o json > "$logs/functional-$mfw_tag-endpoints-poll.json" 2>/dev/null || :
-    if jq -e --argjson target "$mfw_target" '.spec.voterCount==$target and .status.repair.state=="Completed" and .status.repair.plan.sequence=="add" and .status.repair.completion.kind=="Terminal" and (.status.repair.completion.finalVoterIDs|length)==$target' "$logs/functional-$mfw_tag-poll.json" >/dev/null 2>&1 \
-      && jq -e --argjson target "$mfw_target" '.items|length==1 and .items[0].spec.replicas==$target' "$logs/functional-$mfw_tag-deployment-poll.json" >/dev/null 2>&1 \
-      && jq -e --argjson target "$mfw_target" '[.items[]|select(any(.status.conditions[]?; .type=="Ready" and .status=="True"))]|length==$target' "$logs/functional-$mfw_tag-pods-poll.json" >/dev/null 2>&1 \
-      && jq -e --argjson target "$mfw_target" '[.subsets[]?.addresses[]?]|length==$target' "$logs/functional-$mfw_tag-endpoints-poll.json" >/dev/null 2>&1; then
+    if managed_functional_enrollment_ready "$mfw_target" "$mfw_tag"; then
       managed_functional_observe_roster "$mfw_target" "$mfw_tag"
       return 0
     fi
     [ "$(date +%s)" -lt "$mfw_deadline" ] || return 1
     sleep 2
   done
+}
+
+managed_functional_operator_stopped() {
+  jq -e '.spec.replicas==0 and .status.observedGeneration==.metadata.generation and (.status.replicas//0)==0 and (.status.updatedReplicas//0)==0 and (.status.availableReplicas//0)==0' "$logs/functional-operator-deployment.json" >/dev/null 2>&1 \
+    && jq -e '(.items|length)==0' "$logs/functional-operator-pods.json" >/dev/null 2>&1
 }
 
 managed_functional_commit() {
@@ -253,14 +263,19 @@ managed_functional_quorum() {
   mfq_result=0
   mfq_deployment=$(k -n "$namespace" get deployment -l "$selector" -o jsonpath='{.items[0].metadata.name}')
   test -n "$mfq_deployment"
+  mfq_operator_pod=$(k -n "$namespace" get pods -l app.kubernetes.io/name=rhiza-operator -o json | jq -er 'if (.items|length)==1 then .items[0].metadata.name else error("expected one operator Pod") end')
+  mfq_operator_uid=$(k -n "$namespace" get pod "$mfq_operator_pod" -o json | jq -er '.metadata.uid')
+  kind_runtime_before "$mfq_operator_pod" "$mfq_operator_uid" functional-operator operator
   k -n "$namespace" scale deployment/rhiza-operator --replicas=0 > "$logs/functional-operator-scale-zero.txt"
   mfq_deadline=$(( $(date +%s) + 90 ))
   while :; do
-    mfq_operator_pods=$(k -n "$namespace" get pods -l app.kubernetes.io/name=rhiza-operator -o jsonpath='{.items|length}' 2>/dev/null || printf 0)
-    [ "$mfq_operator_pods" = 0 ] && break
+    k -n "$namespace" get deployment rhiza-operator -o json > "$logs/functional-operator-deployment.json" 2>/dev/null || :
+    k -n "$namespace" get pods -l app.kubernetes.io/name=rhiza-operator -o json > "$logs/functional-operator-pods.json" 2>/dev/null || :
+    managed_functional_operator_stopped && break
     [ "$(date +%s)" -lt "$mfq_deadline" ] || { echo 'operator did not stop before quorum scale test' >&2; return 1; }
     sleep 1
   done
+  kind_runtime_after delete "$mfq_operator_uid" || { echo 'operator container did not stop before quorum scale test' >&2; return 1; }
   managed_functional_start_load
   managed_functional_stage down-2
   k -n "$namespace" scale "deployment/$mfq_deployment" --replicas=2 > "$logs/functional-scale-down-2.txt"
@@ -356,6 +371,23 @@ managed_functional_self_test() (
   jq -n '{items:[{spec:{replicas:1}}]}' > "$scratch/deploy.json"
   jq -n '{subsets:[{addresses:[{targetRef:{uid:"test-uid"}}]}]}' > "$scratch/endpoints.json"
   managed_functional_roster_oracle "$scratch/cr.json" "$scratch/pods.json" "$scratch/deploy.json" "$scratch/endpoints.json" 1 "$scratch/roster.json"
+  cp "$scratch/cr.json" "$scratch/functional-enroll-poll.json"
+  cp "$scratch/deploy.json" "$scratch/functional-enroll-deployment-poll.json"
+  cp "$scratch/pods.json" "$scratch/functional-enroll-pods-poll.json"
+  cp "$scratch/endpoints.json" "$scratch/functional-enroll-endpoints-poll.json"
+  logs=$scratch managed_functional_enrollment_ready 1 enroll
+  jq '.items += .items' "$scratch/deploy.json" > "$scratch/functional-enroll-deployment-poll.json"
+  if logs=$scratch managed_functional_enrollment_ready 1 enroll; then return 1; fi
+  cp "$scratch/deploy.json" "$scratch/functional-enroll-deployment-poll.json"
+  jq -n '{metadata:{generation:2},spec:{replicas:0},status:{observedGeneration:2,replicas:0,updatedReplicas:0,availableReplicas:0}}' > "$scratch/functional-operator-deployment.json"
+  jq -n '{items:[]}' > "$scratch/functional-operator-pods.json"
+  logs=$scratch managed_functional_operator_stopped
+  jq '.status.observedGeneration=1' "$scratch/functional-operator-deployment.json" > "$scratch/operator-stale.json"
+  mv "$scratch/operator-stale.json" "$scratch/functional-operator-deployment.json"
+  if logs=$scratch managed_functional_operator_stopped; then return 1; fi
+  jq -n '{metadata:{generation:2},spec:{replicas:0},status:{observedGeneration:2,replicas:0,updatedReplicas:0,availableReplicas:0}}' > "$scratch/functional-operator-deployment.json"
+  jq -n '{items:[{}]}' > "$scratch/functional-operator-pods.json"
+  if logs=$scratch managed_functional_operator_stopped; then return 1; fi
   printf '1\tup-3\twrite\t1\t200\t0\t{"status":"committed"}\n2\tone-survivor\twrite\t2\t503\t0\toperation unavailable\n' > "$scratch/writes.tsv"
   printf '1\tup-3\tlinearizable-read\t1\t200\t0\t{"rows":[[1]]}\n2\tone-survivor\tlinearizable-read\t2\t000\t28\t\n' > "$scratch/reads.tsv"
   logs=$scratch managed_functional_load_oracle "$scratch/writes.tsv" "$scratch/reads.tsv" "$scratch/summary.json"

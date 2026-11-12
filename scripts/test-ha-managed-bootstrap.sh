@@ -202,10 +202,10 @@ kind_runtime_before() {
   k -n "$namespace" get pod "$1" -o json > "$logs/$3-runtime-before.json"
   jq -e --arg uid "$2" '.metadata.uid==$uid and .metadata.deletionTimestamp==null' "$logs/$3-runtime-before.json" >/dev/null
   runtime_node=$(jq -er '.spec.nodeName' "$logs/$3-runtime-before.json")
-  runtime_old=$(jq -er '.status.containerStatuses[]|select(.name=="sql")|.containerID|select(test("^containerd://[a-f0-9]{64}$"))|sub("^containerd://";"")' "$logs/$3-runtime-before.json")
+  runtime_old=$(jq -er --arg container "${4-sql}" '.status.containerStatuses[]|select(.name==$container)|.containerID|select(test("^containerd://[a-f0-9]{64}$"))|sub("^containerd://";"")' "$logs/$3-runtime-before.json")
   kind_node_guard
   docker exec "$runtime_node" crictl --runtime-endpoint unix:///run/containerd/containerd.sock ps -a -o json > "$private/runtime-before.json"
-  jq -e --arg id "$runtime_old" --arg uid "$2" 'any(.containers[]; .id==$id and .state=="CONTAINER_RUNNING" and .labels["io.kubernetes.pod.uid"]==$uid and .labels["io.kubernetes.container.name"]=="sql")' "$private/runtime-before.json" >/dev/null
+  jq -e --arg id "$runtime_old" --arg uid "$2" --arg container "${4-sql}" 'any(.containers[]; .id==$id and .state=="CONTAINER_RUNNING" and .labels["io.kubernetes.pod.uid"]==$uid and .labels["io.kubernetes.container.name"]==$container)' "$private/runtime-before.json" >/dev/null
   jq --arg uid "$2" '{containers:[.containers[]|select(.labels["io.kubernetes.pod.uid"]==$uid)|{id,state,labels:{"io.kubernetes.pod.uid":.labels["io.kubernetes.pod.uid"],"io.kubernetes.container.name":.labels["io.kubernetes.container.name"]}}]}' "$private/runtime-before.json" > "$logs/$3-cri-before.json"
 }
 kind_runtime_after() {
