@@ -46,9 +46,10 @@ var ErrPreparedWriteAdmissionUnavailable = errors.New("prepared startup write ad
 
 const managedRepairOriginMaxBytes = (128 << 10) + 4096
 
-// This is a bounded local metadata budget, not an unlimited membership-history
-// guarantee. Publication and reload must agree before any receipt is created.
-const managedPreparedAdoptionMaxBytes = quepaxa.MaxReplicatedValueBytes + 4096
+// Prepared adoption is local recovery metadata, not a replicated value. Its
+// certified membership history grows with reconfiguration, so keep a separate
+// bounded budget while retaining strict publication/reload agreement.
+const managedPreparedAdoptionMaxBytes = 1 << 20
 
 // ManagedStartupIdentity binds an explicit, live initialization assignment to
 // this exact execution member. A missing archive is never an assignment.
