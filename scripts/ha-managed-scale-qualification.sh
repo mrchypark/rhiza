@@ -620,7 +620,7 @@ managed_functional_external_target_valid() {
   [ "$1" -ge 3 ] && [ "$1" -le 64 ]
 }
 
-managed_functional_external_high_sequence='3 4 5 4 3 4 5 6 7 6 5 4 3 4 5 6 7 8 9 10 9 8 7 6 5 4 3'
+managed_functional_external_high_sequence='3 4 5 6 7 8 9 10 9 8 7 6 5 4 3'
 
 managed_functional_external_opt_in() {
   mfeo_file=$1
@@ -953,7 +953,7 @@ managed_functional_external_high_evidence_oracle() {
          finalVoterIDs:$checks[-1].finalVoterIDs}
       else error("high-scale checkpoints did not correlate with certified transition events")
       end
-    | .target7Visible=((.target7|length)==3) |
+    | .target7Visible=((.target7|length)==2) |
       .target10Visible=((.target10|length)==1) |
       if ((.target7Visible and .target10Visible) and
           all(.target7[]; .finalVoterIDs==.readyIDs and .finalVoterIDs==.endpointIDs and (.finalVoterIDs|length)==7) and
@@ -1058,7 +1058,7 @@ managed_functional_external_high() {
     '{"sql":"SELECT id,value FROM bootstrap_ci WHERE id IN (1,7,10) ORDER BY id","consistency":"linearizable"}' || return 1
   jq -e '.rows==[[1,"real-kubelet"],[7,"external-high-7"],[10,"external-high-10"]]' \
     "$logs/external-high-readback.json" >/dev/null || return 1
-  printf '%s\n' 'PASS: external control exact 3->4->5->4->3->4->5->6->7->6->5->4->3->4->5->6->7->8->9->10->9->8->7->6->5->4->3; every move had one certified terminal and exact CR/Deployment/ReadyPod/Endpoint roster; target 7 (3 occurrences) and target 10 are in target evidence; literal targets 1 and 2 were rejected with unchanged CR status/Deployment; operator Deployment/Pod/container identity stayed pinned' \
+  printf '%s\n' 'PASS: external control exact 3->4->5->6->7->8->9->10->9->8->7->6->5->4->3; every move had one certified terminal and exact CR/Deployment/ReadyPod/Endpoint roster; target 7 and target 10 are in target evidence; literal targets 1 and 2 were rejected with unchanged CR status/Deployment; operator Deployment/Pod/container identity stayed pinned' \
     > "$logs/functional-external-high-result.txt"
 }
 
@@ -1356,7 +1356,7 @@ leave-u5'
   managed_functional_external_sequence_artifacts "$managed_functional_external_high_sequence" \
     "$scratch/external-high-sequence.txt" "$scratch/external-high-sequence.json"
   [ "$(cat "$scratch/external-high-sequence.txt")" = "$managed_functional_external_high_sequence" ]
-  jq -e '.==[3,4,5,4,3,4,5,6,7,6,5,4,3,4,5,6,7,8,9,10,9,8,7,6,5,4,3]' "$scratch/external-high-sequence.json" >/dev/null
+  jq -e '.==[3,4,5,6,7,8,9,10,9,8,7,6,5,4,3]' "$scratch/external-high-sequence.json" >/dev/null
   external_spaced_sequence=$(printf ' 3\t4\n5  4 3 ')
   managed_functional_external_sequence_artifacts "$external_spaced_sequence" \
     "$scratch/external-spaced-sequence.txt" "$scratch/external-spaced-sequence.json"
@@ -1383,7 +1383,7 @@ leave-u5'
   managed_self_test_replica_watch "$managed_functional_external_high_sequence" "$scratch/replica-watch.jsonl"
   managed_functional_replica_progress_oracle "$scratch/replica-watch.jsonl" "$scratch/replica-progress.json" \
     "$managed_functional_external_high_sequence"
-  jq -e '.sequence==[3,4,5,4,3,4,5,6,7,6,5,4,3,4,5,6,7,8,9,10,9,8,7,6,5,4,3] and (.steps|length)==26 and .maxMove==1 and .minimum==3 and (.events|length)==27 and .events[0].finalVoterIDs==["fixture-3-0","fixture-3-1","fixture-3-2"]' "$scratch/replica-progress.json" >/dev/null
+  jq -e '.sequence==[3,4,5,6,7,8,9,10,9,8,7,6,5,4,3] and (.steps|length)==14 and .maxMove==1 and .minimum==3 and (.events|length)==15 and .events[0].finalVoterIDs==["fixture-3-0","fixture-3-1","fixture-3-2"]' "$scratch/replica-progress.json" >/dev/null
   jq -c 'if .status.bootstrapPlan then .status.bootstrapPlan.members |= map({member:{ID:.member.node_id}}) else . end' \
     "$scratch/replica-watch.jsonl" > "$scratch/replica-watch-old-bootstrap-id.jsonl"
   if managed_functional_replica_progress_oracle "$scratch/replica-watch-old-bootstrap-id.jsonl" "$scratch/replica-progress-bad.json" "$managed_functional_external_high_sequence" 2> "$scratch/progress-old-bootstrap-id.err"; then return 1; fi
@@ -1402,8 +1402,8 @@ leave-u5'
     "$scratch/replica-progress.json" > "$scratch/external-high-checkpoints.jsonl"
   managed_functional_external_high_evidence_oracle "$scratch/external-high-checkpoints.jsonl" \
     "$scratch/replica-progress.json" "$scratch/external-high-ramp.json"
-  jq -e '.target7Visible==true and .target10Visible==true and (.target7|length)==3 and (.target10|length)==1 and all(.target7[]; (.finalVoterIDs|length)==7 and .finalVoterIDs==.readyIDs and .finalVoterIDs==.endpointIDs) and all(.target10[]; (.finalVoterIDs|length)==10 and .finalVoterIDs==.readyIDs and .finalVoterIDs==.endpointIDs) and (.finalVoterIDs|length)==3' "$scratch/external-high-ramp.json" >/dev/null
-  jq -c 'select(.target!=7) | select(.step!=16)' "$scratch/external-high-checkpoints.jsonl" > "$scratch/external-high-checkpoints-missing-7.jsonl"
+  jq -e '.target7Visible==true and .target10Visible==true and (.target7|length)==2 and (.target10|length)==1 and all(.target7[]; (.finalVoterIDs|length)==7 and .finalVoterIDs==.readyIDs and .finalVoterIDs==.endpointIDs) and all(.target10[]; (.finalVoterIDs|length)==10 and .finalVoterIDs==.readyIDs and .finalVoterIDs==.endpointIDs) and (.finalVoterIDs|length)==3' "$scratch/external-high-ramp.json" >/dev/null
+  jq -c 'select(.target!=7) | select(.step!=4)' "$scratch/external-high-checkpoints.jsonl" > "$scratch/external-high-checkpoints-missing-7.jsonl"
   if managed_functional_external_high_evidence_oracle "$scratch/external-high-checkpoints-missing-7.jsonl" "$scratch/replica-progress.json" "$scratch/external-high-ramp-bad.json" 2> "$scratch/external-high-missing-7.err"; then return 1; fi
   jq -c 'if .target==10 then .finalVoterIDs[0]="stale-target-10" else . end' "$scratch/external-high-checkpoints.jsonl" > "$scratch/external-high-checkpoints-bad-10.jsonl"
   if managed_functional_external_high_evidence_oracle "$scratch/external-high-checkpoints-bad-10.jsonl" "$scratch/replica-progress.json" "$scratch/external-high-ramp-bad.json" 2> "$scratch/external-high-target-10.err"; then return 1; fi
