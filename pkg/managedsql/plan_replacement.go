@@ -4,12 +4,14 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"reflect"
 	"slices"
 
 	"github.com/mrchypark/rhiza/internal/sqlpolicy"
 	"github.com/mrchypark/rhiza/internal/types"
+	"github.com/mrchypark/rhiza/pkg/node"
 	"github.com/mrchypark/rhiza/pkg/operator"
 	"github.com/mrchypark/rhiza/pkg/quepaxa"
 )
@@ -25,6 +27,15 @@ func (h *Host) PlanVoterReplacement(ctx context.Context, replacement operator.V1
 	if err != nil {
 		return nil, err
 	}
+	if replacement.NodeID != "" {
+		retired, err := h.node.ManagedVoterRetired(replacement.NodeID)
+		if err != nil {
+			return nil, err
+		}
+		if retired {
+			return nil, fmt.Errorf("retired voter identity cannot be enrolled or replaced")
+		}
+	}
 	if r, ok := a.Repair(); ok && r.State == "Closed" {
 		if _, err := operator.ValidateV1Alpha2RepairPodBinding(ctx, h.cfg.Store, h.cfg.Ref, r.Plan); err != nil {
 			return nil, fmt.Errorf("closed repair candidate unavailable; retargeting forbidden: %w", err)
@@ -34,6 +45,13 @@ func (h *Host) PlanVoterReplacement(ctx context.Context, replacement operator.V1
 	snapshot, err := h.node.ManagedRepairSnapshot(ctx, "", quepaxa.PublicKey{})
 	if err != nil {
 		return nil, err
+	}
+	target, err := a.TargetVoterCount()
+	if err != nil {
+		return nil, err
+	}
+	if replacement.NodeID != "" && !memberPresent(snapshot.Current, replacement.NodeID) && target > len(snapshot.Current.Members) {
+		return h.planVoterEnrollment(ctx, a, snapshot, target, replacement)
 	}
 	seen := map[quepaxa.NodeID]bool{}
 	for _, id := range presentIDs {
@@ -91,6 +109,59 @@ func (h *Host) PlanVoterReplacement(ctx context.Context, replacement operator.V1
 	}
 	if !reflect.DeepEqual(current.Current, snapshot.Current) || current.AbortSlot != snapshot.AbortSlot {
 		return nil, fmt.Errorf("membership changed during replacement planning")
+	}
+	return &p, nil
+}
+
+func memberPresent(cluster quepaxa.Cluster, id quepaxa.NodeID) bool {
+	for _, member := range cluster.Members {
+		if member.ID == id {
+			return true
+		}
+	}
+	return false
+}
+
+func (h *Host) planVoterEnrollment(ctx context.Context, a operator.V1Alpha2AdmissionSnapshot, snapshot node.ManagedRepairSnapshot, target int, replacement operator.V1Alpha2RepairPodRequest) (*operator.V1Alpha2RepairPlan, error) {
+	if target <= len(snapshot.Current.Members) || len(snapshot.Current.Members) < 3 || len(snapshot.Current.Members) >= 64 || target > 64 {
+		return nil, fmt.Errorf("enrollment requires a higher bounded target voter count")
+	}
+	witness := snapshot.Current.Members[0]
+	nonce, err := h.node.ManagedVoterWALIdentity(ctx, snapshot.Current.ConfigID, snapshot.AbortSlot, witness)
+	if err != nil || nonce == "" {
+		return nil, errors.Join(fmt.Errorf("enrollment witness WAL identity unavailable"), err)
+	}
+	p := operator.V1Alpha2RepairPlan{Sequence: operator.V1Alpha2RepairAdd, ClusterUID: h.cfg.Ref.UID, Generation: h.cfg.Plan.Generation, DeploymentUID: h.cfg.Plan.DeploymentUID, StorageID: h.cfg.Plan.StorageID, ExpectedConfigID: uint64(snapshot.Current.ConfigID), ExpectedAbortSlot: uint64(snapshot.AbortSlot), OldNodeID: types.NodeID(witness.ID), OldWALIdentity: nonce, Replacement: replacement, BootstrapPlanDigest: h.cfg.Plan.BootstrapPlanDigest}
+	for _, member := range snapshot.Current.Members {
+		p.FinalVoterIDs = append(p.FinalVoterIDs, types.NodeID(member.ID))
+	}
+	p.FinalVoterIDs = append(p.FinalVoterIDs, replacement.NodeID)
+	slices.Sort(p.FinalVoterIDs)
+	encoded, err := json.Marshal(p)
+	if err != nil {
+		return nil, err
+	}
+	p.OperationID = fmt.Sprintf("enroll-%x", sha256.Sum256(encoded))
+	if _, err := operator.ValidateV1Alpha2RepairPodBinding(ctx, h.cfg.Store, h.cfg.Ref, p); err != nil {
+		return nil, err
+	}
+	latest, err := h.live(ctx)
+	if err != nil {
+		return nil, err
+	}
+	if latest.SQLReservationsClosed() {
+		return nil, fmt.Errorf("another repair closed during enrollment planning")
+	}
+	latestTarget, err := latest.TargetVoterCount()
+	if err != nil || latestTarget != target {
+		return nil, errors.Join(fmt.Errorf("target voter count changed during enrollment planning"), err)
+	}
+	current, err := h.node.ManagedRepairSnapshot(ctx, "", quepaxa.PublicKey{})
+	if err != nil {
+		return nil, err
+	}
+	if !reflect.DeepEqual(current.Current, snapshot.Current) || current.AbortSlot != snapshot.AbortSlot {
+		return nil, fmt.Errorf("membership changed during enrollment planning")
 	}
 	return &p, nil
 }

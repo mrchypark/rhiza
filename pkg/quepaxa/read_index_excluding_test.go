@@ -2,7 +2,10 @@ package quepaxa
 
 import (
 	"context"
+	"errors"
+	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -164,5 +167,505 @@ func TestReadIndexExcludingLocalNodeFails(t *testing.T) {
 	core := newCore("n1", &Cluster{Members: []Member{{ID: "n1"}, {ID: "n2"}}}, wal, nil)
 	if _, _, err := core.ReadIndexExcluding(context.Background(), "n1"); err != ErrQuorumUnavailable {
 		t.Fatalf("local exclusion returned %v, want ErrQuorumUnavailable", err)
+	}
+}
+
+type membershipAdvanceReadTransport struct {
+	mu          sync.Mutex
+	readTips    map[NodeID]int
+	n2Entered   chan struct{}
+	n2Once      sync.Once
+	oldBlocked  chan struct{}
+	oldCanceled chan struct{}
+	cancelOnce  sync.Once
+	blocked     atomic.Int32
+}
+
+type configurationLagTestError struct{}
+
+func (configurationLagTestError) Error() string          { return "configuration lag" }
+func (configurationLagTestError) ConfigurationLag() bool { return true }
+
+type lagReadOnceTransport struct {
+	*clusterTransport
+	mu            sync.Mutex
+	lagPeer       NodeID
+	lagLeft       int
+	readTips      int
+	sendDecisions int
+}
+
+func (t *lagReadOnceTransport) ReadTip(ctx context.Context, to NodeID) (Slot, error) {
+	t.mu.Lock()
+	t.readTips++
+	lag := to == t.lagPeer && t.lagLeft > 0
+	if lag {
+		t.lagLeft--
+	}
+	t.mu.Unlock()
+	if lag {
+		return 0, configurationLagTestError{}
+	}
+	return t.clusterTransport.ReadTip(ctx, to)
+}
+
+func (t *lagReadOnceTransport) SendDecision(ctx context.Context, decision Decision) error {
+	t.mu.Lock()
+	t.sendDecisions++
+	t.mu.Unlock()
+	return t.clusterTransport.SendDecision(ctx, decision)
+}
+
+func (t *membershipAdvanceReadTransport) ReadTip(ctx context.Context, to NodeID) (Slot, error) {
+	t.mu.Lock()
+	t.readTips[to]++
+	call := t.readTips[to]
+	t.mu.Unlock()
+	switch to {
+	case "n2":
+		t.n2Once.Do(func() { close(t.n2Entered) })
+		return Slot(call), nil
+	case "n3", "n4":
+		if t.blocked.Add(1) == 1 {
+			close(t.oldBlocked)
+		}
+		<-ctx.Done()
+		if t.blocked.Add(-1) == 0 {
+			t.cancelOnce.Do(func() { close(t.oldCanceled) })
+		}
+		return 0, ctx.Err()
+	default:
+		return 0, errors.New("unexpected read-index peer")
+	}
+}
+
+func (t *membershipAdvanceReadTransport) SendRecord(context.Context, NodeID, RecordRequest) (Summary, error) {
+	return Summary{}, errors.New("unexpected record")
+}
+
+func (t *membershipAdvanceReadTransport) SendDecision(context.Context, Decision) error {
+	return errors.New("unexpected decision")
+}
+
+func (t *membershipAdvanceReadTransport) StageValue(context.Context, NodeID, ValueHash, []byte) error {
+	return errors.New("unexpected stage")
+}
+
+func (t *membershipAdvanceReadTransport) FetchValue(context.Context, NodeID, ValueHash) ([]byte, error) {
+	return nil, errors.New("unexpected fetch")
+}
+
+// A certified configuration advance invalidates every response from the old
+// roster. The read must cancel that round and issue a fresh round against the
+// installed roster instead of waiting for unavailable old members or mixing
+// quorum evidence across snapshots.
+func TestReadIndexRestartsAfterCertifiedMembershipAdvance(t *testing.T) {
+	oldMembers := []Member{{ID: "n1"}, {ID: "n2"}, {ID: "n3"}, {ID: "n4"}}
+	newMembers := []Member{{ID: "n1"}, {ID: "n2"}}
+	coreTransport := &membershipAdvanceReadTransport{
+		readTips:    make(map[NodeID]int),
+		n2Entered:   make(chan struct{}),
+		oldBlocked:  make(chan struct{}),
+		oldCanceled: make(chan struct{}),
+	}
+	wal, err := qlog.Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer wal.Close()
+	core := newCore("n1", &Cluster{ConfigID: 1, Members: oldMembers}, wal, coreTransport)
+	core.mu.Lock()
+	core.configHistory = append(core.configHistory, configEpoch{start: 2, cluster: cloneCluster(Cluster{ConfigID: 2, Members: newMembers})})
+	core.mu.Unlock()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	go func() {
+		<-coreTransport.n2Entered
+		<-coreTransport.oldBlocked
+		core.mu.Lock()
+		core.tip = 1
+		core.durable[1] = true
+		close(core.tipChanged)
+		core.tipChanged = make(chan struct{})
+		core.mu.Unlock()
+	}()
+
+	slot, id, err := core.ReadIndex(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if slot != 2 || id != "n2" {
+		t.Fatalf("read returned slot=%d id=%s, want the fresh config-2 response from n2", slot, id)
+	}
+	coreTransport.mu.Lock()
+	n2Calls := coreTransport.readTips["n2"]
+	coreTransport.mu.Unlock()
+	if n2Calls != 2 {
+		t.Fatalf("n2 ReadTip calls=%d, want one discarded old-roster call and one fresh call", n2Calls)
+	}
+	select {
+	case <-coreTransport.oldCanceled:
+	case <-ctx.Done():
+		t.Fatal("old-roster ReadTip calls were not canceled")
+	}
+}
+
+func TestReadIndexExcludingDoesNotFollowMembershipAdvance(t *testing.T) {
+	oldMembers := []Member{{ID: "n1"}, {ID: "n2"}, {ID: "n3"}, {ID: "n4"}}
+	newMembers := []Member{{ID: "n1"}, {ID: "n2"}}
+	coreTransport := &membershipAdvanceReadTransport{
+		readTips:    make(map[NodeID]int),
+		n2Entered:   make(chan struct{}),
+		oldBlocked:  make(chan struct{}),
+		oldCanceled: make(chan struct{}),
+	}
+	wal, err := qlog.Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer wal.Close()
+	core := newCore("n1", &Cluster{ConfigID: 1, Members: oldMembers}, wal, coreTransport)
+	core.mu.Lock()
+	core.configHistory = append(core.configHistory, configEpoch{start: 2, cluster: cloneCluster(Cluster{ConfigID: 2, Members: newMembers})})
+	core.mu.Unlock()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	go func() {
+		<-coreTransport.n2Entered
+		<-coreTransport.oldBlocked
+		core.mu.Lock()
+		core.tip = 1
+		core.durable[1] = true
+		close(core.tipChanged)
+		core.tipChanged = make(chan struct{})
+		core.mu.Unlock()
+	}()
+
+	if _, _, err := core.ReadIndexExcluding(ctx, "n4"); err != ErrQuorumUnavailable {
+		t.Fatalf("exact-roster exclusion followed a membership advance: %v", err)
+	}
+}
+
+func TestReadIndexWaitsThroughFreezeWithoutCountingQuorum(t *testing.T) {
+	oldMembers := []Member{{ID: "n1"}, {ID: "n2"}, {ID: "n3"}, {ID: "n4"}}
+	newMembers := []Member{{ID: "n1"}, {ID: "n2"}}
+	coreTransport := &membershipAdvanceReadTransport{
+		readTips:    make(map[NodeID]int),
+		n2Entered:   make(chan struct{}),
+		oldBlocked:  make(chan struct{}),
+		oldCanceled: make(chan struct{}),
+	}
+	wal, err := qlog.Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer wal.Close()
+	core := newCore("n1", &Cluster{ConfigID: 1, Members: oldMembers}, wal, coreTransport)
+	core.reconfigEnabled = true
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go func() {
+		<-coreTransport.n2Entered
+		<-coreTransport.oldBlocked
+		core.mu.Lock()
+		core.reconfiguration = &reconfigurationState{target: Cluster{ConfigID: 2, Members: newMembers}}
+		close(core.tipChanged)
+		core.tipChanged = make(chan struct{})
+		core.mu.Unlock()
+		<-coreTransport.oldCanceled
+		core.mu.Lock()
+		core.reconfiguration = nil
+		core.configHistory = append(core.configHistory, configEpoch{start: 2, cluster: Cluster{ConfigID: 2, Members: newMembers}})
+		core.tip = 1
+		core.durable[1] = true
+		close(core.tipChanged)
+		core.tipChanged = make(chan struct{})
+		core.mu.Unlock()
+	}()
+
+	if slot, id, err := core.ReadIndex(ctx); err != nil || slot != 2 || id != "n2" {
+		t.Fatalf("read through freeze: slot=%d id=%s err=%v", slot, id, err)
+	}
+}
+
+func TestReadIndexFrozenBackgroundFailsClosed(t *testing.T) {
+	members := []Member{{ID: "n1"}, {ID: "n2"}, {ID: "n3"}}
+	wal, err := qlog.Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer wal.Close()
+	core := newCore("n1", &Cluster{ConfigID: 1, Members: members}, wal, nil)
+	core.reconfigEnabled = true
+	core.mu.Lock()
+	core.reconfiguration = &reconfigurationState{target: Cluster{ConfigID: 2, Members: members[:2]}}
+	core.mu.Unlock()
+	if _, _, err := core.ReadIndex(context.Background()); err != ErrQuorumUnavailable {
+		t.Fatalf("unbounded frozen read returned %v, want ErrQuorumUnavailable", err)
+	}
+	canceled, cancel := context.WithCancel(context.Background())
+	cancel()
+	if _, _, err := core.ReadIndex(canceled); !errors.Is(err, context.Canceled) {
+		t.Fatalf("canceled frozen read returned %v, want context.Canceled", err)
+	}
+}
+
+type terminalDurabilityFixture struct {
+	cores     map[NodeID]*Core
+	transport *clusterTransport
+	terminal  Slot
+}
+
+func newTerminalDurabilityFixture(t *testing.T) *terminalDurabilityFixture {
+	t.Helper()
+	cores, transport := reconfigCluster(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	freeze, err := cores["a"].BeginReconfiguration(ctx, Cluster{ConfigID: 2, Members: []Member{{ID: "a"}, {ID: "b"}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := cores["a"].FinishReconfiguration(ctx); err != nil {
+		t.Fatal(err)
+	}
+	return &terminalDurabilityFixture{cores: cores, transport: transport, terminal: freeze + 16}
+}
+
+func dropTerminalDurability(core *Core, terminal Slot) {
+	core.mu.Lock()
+	core.durable[terminal] = false
+	core.durableThrough = min(core.durableThrough, terminal-1)
+	core.mu.Unlock()
+}
+
+func TestReadIndexPersistsExactRetainedTerminalBeforeQuorum(t *testing.T) {
+	fixture := newTerminalDurabilityFixture(t)
+	core := fixture.cores["a"]
+	dropTerminalDurability(core, fixture.terminal)
+	if core.IsVoter() {
+		t.Fatal("fixture unexpectedly had durable retained-voter activation")
+	}
+	tracking := newTrackingTransport(fixture.transport)
+	core.transport = tracking
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	slot, id, err := core.ReadIndex(ctx)
+	if err != nil || slot < fixture.terminal || id == "" {
+		t.Fatalf("read across terminal durability: slot=%d id=%s err=%v", slot, id, err)
+	}
+	core.mu.RLock()
+	durable := core.durable[fixture.terminal]
+	core.mu.RUnlock()
+	if !durable || !core.IsVoter() {
+		t.Fatalf("terminal durability was not established: durable=%t voter=%t", durable, core.IsVoter())
+	}
+	if got := tracking.readTipCount("b"); got != 1 {
+		t.Fatalf("read returned without exact quorum evidence: b calls=%d", got)
+	}
+}
+
+func TestReadIndexCanceledBeforeTerminalDurabilityDoesNotParticipate(t *testing.T) {
+	fixture := newTerminalDurabilityFixture(t)
+	core := fixture.cores["a"]
+	dropTerminalDurability(core, fixture.terminal)
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if _, _, err := core.ReadIndex(ctx); !errors.Is(err, context.Canceled) {
+		t.Fatalf("canceled durability read returned %v", err)
+	}
+	core.mu.RLock()
+	durable := core.durable[fixture.terminal]
+	core.mu.RUnlock()
+	if durable || core.IsVoter() {
+		t.Fatalf("canceled read granted activation: durable=%t voter=%t", durable, core.IsVoter())
+	}
+}
+
+func TestReadIndexTerminalDurabilityDoesNotBypassQuorumOrIdentity(t *testing.T) {
+	t.Run("sync failure", func(t *testing.T) {
+		fixture := newTerminalDurabilityFixture(t)
+		core := fixture.cores["a"]
+		dropTerminalDurability(core, fixture.terminal)
+		core.commits = newGroupCommit(func() error { return errors.New("injected sync failure") })
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+		if _, _, err := core.ReadIndex(ctx); err == nil || !strings.Contains(err.Error(), "injected sync failure") {
+			t.Fatalf("durability sync failure=%v", err)
+		}
+		if core.IsVoter() {
+			t.Fatal("failed durability sync activated voter admission")
+		}
+	})
+	t.Run("quorum loss", func(t *testing.T) {
+		fixture := newTerminalDurabilityFixture(t)
+		core := fixture.cores["a"]
+		dropTerminalDurability(core, fixture.terminal)
+		fixture.transport.fail("b")
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+		if _, _, err := core.ReadIndex(ctx); !errors.Is(err, ErrQuorumUnavailable) {
+			t.Fatalf("terminal durability bypassed quorum: %v", err)
+		}
+	})
+	t.Run("wrong WAL", func(t *testing.T) {
+		fixture := newTerminalDurabilityFixture(t)
+		core := fixture.cores["a"]
+		dropTerminalDurability(core, fixture.terminal)
+		core.mu.Lock()
+		for i := range core.configHistory {
+			if !sameCluster(core.configHistory[i].cluster, core.clusterForSlotLocked(core.tip+1)) {
+				continue
+			}
+			for j := range core.configHistory[i].cluster.Members {
+				if core.configHistory[i].cluster.Members[j].ID == core.nodeID {
+					core.configHistory[i].cluster.Members[j].WALIdentity = strings.Repeat("1", 64)
+				}
+			}
+		}
+		core.walIdentity = strings.Repeat("2", 64)
+		core.mu.Unlock()
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+		if _, _, err := core.ReadIndex(ctx); !errors.Is(err, ErrQuorumUnavailable) {
+			t.Fatalf("wrong WAL activated: %v", err)
+		}
+	})
+	t.Run("removed voter", func(t *testing.T) {
+		fixture := newTerminalDurabilityFixture(t)
+		core := fixture.cores["c"]
+		dropTerminalDurability(core, fixture.terminal)
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+		if _, _, err := core.ReadIndex(ctx); !errors.Is(err, ErrQuorumUnavailable) {
+			t.Fatalf("removed voter activated: %v", err)
+		}
+	})
+}
+
+func TestReadIndexExcludingDoesNotTreatConfigurationLagAsSuccess(t *testing.T) {
+	members := []Member{{ID: "n1"}, {ID: "n2"}}
+	wal, err := qlog.Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer wal.Close()
+	transport := &lagReadOnceTransport{clusterTransport: &clusterTransport{}, lagPeer: "n2", lagLeft: 1}
+	core := newCore("n1", &Cluster{ConfigID: 1, Members: members}, wal, transport)
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	if _, _, err := core.ReadIndexExcluding(ctx, ""); !errors.Is(err, ErrQuorumUnavailable) {
+		t.Fatalf("excluded read accepted configuration lag as quorum: %v", err)
+	}
+}
+
+func TestReadIndexDoesNotAbortHealthyQuorumForConfigurationLag(t *testing.T) {
+	cores, transport := reconfigCluster(t)
+	genesis := cores["a"].Tip()
+	for _, core := range cores {
+		if tip := core.Tip(); tip != genesis {
+			t.Fatalf("fixture tip mismatch: %s=%d genesis=%d", core.NodeID(), tip, genesis)
+		}
+	}
+	wrapper := &lagReadOnceTransport{clusterTransport: transport, lagPeer: "c", lagLeft: 1}
+	cores["a"].transport = wrapper
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	if slot, id, err := cores["a"].ReadIndex(ctx); err != nil || slot != genesis || id == "" {
+		t.Fatalf("healthy quorum with one lagging peer: slot=%d id=%s err=%v", slot, id, err)
+	}
+	wrapper.mu.Lock()
+	decisions := wrapper.sendDecisions
+	wrapper.mu.Unlock()
+	if decisions != 0 {
+		t.Fatalf("healthy quorum triggered unnecessary terminal redelivery: %d", decisions)
+	}
+}
+
+func TestReadIndexRedeliversCertifiedTerminalOnceThenRequiresFreshQuorum(t *testing.T) {
+	fixture := newTerminalDurabilityFixture(t)
+	wrapper := &lagReadOnceTransport{clusterTransport: fixture.transport, lagPeer: "b", lagLeft: 1}
+	fixture.cores["a"].transport = wrapper
+	readCtx, readCancel := context.WithCancel(context.Background())
+	defer readCancel()
+	slot, id, err := fixture.cores["a"].ReadIndex(readCtx)
+	if err != nil || slot < fixture.terminal || id == "" {
+		t.Fatalf("terminal redelivery read: slot=%d id=%s err=%v", slot, id, err)
+	}
+	wrapper.mu.Lock()
+	decisions, readTips := wrapper.sendDecisions, wrapper.readTips
+	wrapper.mu.Unlock()
+	if decisions != 1 || readTips < 2 {
+		t.Fatalf("redelivery/fresh-quorum evidence decisions=%d readTips=%d", decisions, readTips)
+	}
+}
+
+type tipNotificationReadTransport struct {
+	n2Entered chan struct{}
+	n2Release chan struct{}
+	once      sync.Once
+}
+
+func (t *tipNotificationReadTransport) ReadTip(ctx context.Context, to NodeID) (Slot, error) {
+	switch to {
+	case "n2":
+		t.once.Do(func() { close(t.n2Entered) })
+		select {
+		case <-t.n2Release:
+			return 1, nil
+		case <-ctx.Done():
+			return 0, ctx.Err()
+		}
+	case "n3":
+		<-ctx.Done()
+		return 0, ctx.Err()
+	default:
+		return 0, errors.New("unexpected read-index peer")
+	}
+}
+
+func (t *tipNotificationReadTransport) SendRecord(context.Context, NodeID, RecordRequest) (Summary, error) {
+	return Summary{}, errors.New("unexpected record")
+}
+
+func (t *tipNotificationReadTransport) SendDecision(context.Context, Decision) error {
+	return errors.New("unexpected decision")
+}
+
+func (t *tipNotificationReadTransport) StageValue(context.Context, NodeID, ValueHash, []byte) error {
+	return errors.New("unexpected stage")
+}
+
+func (t *tipNotificationReadTransport) FetchValue(context.Context, NodeID, ValueHash) ([]byte, error) {
+	return nil, errors.New("unexpected fetch")
+}
+
+func TestReadIndexIgnoresTipWakeupsUntilResponse(t *testing.T) {
+	coreTransport := &tipNotificationReadTransport{n2Entered: make(chan struct{}), n2Release: make(chan struct{})}
+	wal, err := qlog.Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer wal.Close()
+	core := newCore("n1", &Cluster{ConfigID: 1, Members: []Member{{ID: "n1"}, {ID: "n2"}, {ID: "n3"}}}, wal, coreTransport)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	go func() {
+		<-coreTransport.n2Entered
+		for range 8 {
+			core.mu.Lock()
+			close(core.tipChanged)
+			core.tipChanged = make(chan struct{})
+			core.mu.Unlock()
+			time.Sleep(2 * time.Millisecond)
+		}
+		close(coreTransport.n2Release)
+	}()
+
+	if slot, id, err := core.ReadIndex(ctx); err != nil || slot != 1 || id != "n2" {
+		t.Fatalf("read after ordinary tip wakeups: slot=%d id=%s err=%v", slot, id, err)
 	}
 }

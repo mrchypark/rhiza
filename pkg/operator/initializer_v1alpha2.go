@@ -267,6 +267,16 @@ func ReconcileV1Alpha2ManagedInitialization(ctx context.Context, kube *Kubernete
 	return committed()
 }
 
+func ownerReferences(meta map[string]any) []v1alpha2BootstrapOwner {
+	var result []v1alpha2BootstrapOwner
+	for _, raw := range list(meta["ownerReferences"]) {
+		o := asObject(raw)
+		controller, _ := o["controller"].(bool)
+		result = append(result, v1alpha2BootstrapOwner{APIVersion: str(o["apiVersion"]), Kind: str(o["kind"]), Name: str(o["name"]), UID: str(o["uid"]), Controller: &controller})
+	}
+	return result
+}
+
 // Admit only deterministic API defaults; unexpected injected fields fail closed.
 func managedCandidateSpecMatches(raw, expected json.RawMessage) bool {
 	var spec map[string]json.RawMessage

@@ -45,6 +45,20 @@ func (s V1Alpha2StatusSnapshot) Authority() V1Alpha2AuthorityView { return s.aut
 func (s V1Alpha2StatusSnapshot) EverApplicationReserved() bool    { return s.everApplicationReserved }
 func (s V1Alpha2StatusSnapshot) Queue() json.RawMessage           { return bytes.Clone(s.queue) }
 
+// TargetVoterCount is the desired monotonic managed voter count. It is not a
+// membership observation and cannot authorize an enrollment by itself.
+func (s V1Alpha2StatusSnapshot) TargetVoterCount() (int, error) {
+	spec, err := jsonObject(s.object["spec"])
+	if err != nil {
+		return 0, err
+	}
+	var count int
+	if json.Unmarshal(spec["voterCount"], &count) != nil || count < 3 || count > 64 {
+		return 0, fmt.Errorf("invalid target voter count")
+	}
+	return count, nil
+}
+
 // BootstrapPlan returns a detached copy of the validated immutable public plan.
 func (s V1Alpha2StatusSnapshot) BootstrapPlan() (V1Alpha2BootstrapPlan, error) {
 	status, err := jsonObject(s.object["status"])
@@ -180,8 +194,8 @@ func (s *V1Alpha2StatusStore) snapshot(ref V1Alpha2ClusterRef, obj map[string]js
 			return V1Alpha2StatusSnapshot{}, err
 		}
 		var bootstrap V1Alpha2BootstrapPlan
-		var count int
-		if decodeV1Alpha2(status["bootstrapPlan"], &bootstrap) != nil || json.Unmarshal(spec["voterCount"], &count) != nil || validateV1Alpha2BootstrapPlan(ref, assignment.Plan, bootstrap, count) != nil {
+		var target int
+		if decodeV1Alpha2(status["bootstrapPlan"], &bootstrap) != nil || json.Unmarshal(spec["voterCount"], &target) != nil || target < 3 || target > 64 || validateV1Alpha2BootstrapPlan(ref, assignment.Plan, bootstrap, len(bootstrap.Members)) != nil {
 			return V1Alpha2StatusSnapshot{}, fmt.Errorf("invalid public bootstrap plan")
 		}
 		evidence, present := auth["evidence"]

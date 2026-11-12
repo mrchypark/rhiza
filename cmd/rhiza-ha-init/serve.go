@@ -164,7 +164,7 @@ func checkReady(ctx context.Context, client *http.Client, endpoint, token string
 
 func managedOperationUnavailable(w http.ResponseWriter, operation string, err error) {
 	switch operation {
-	case "execute", "query", "recover-pending":
+	case "execute", "query", "recover-pending", "leave-voter":
 	default:
 		operation = "unknown"
 	}
@@ -281,6 +281,17 @@ func managedHandler(host *managedsql.Host, token string) (http.Handler, error) {
 		}
 		w.Header().Set("Content-Type", "application/json")
 		_ = json.NewEncoder(w).Encode(result)
+	})
+	mux.HandleFunc("/leave-voter", func(w http.ResponseWriter, r *http.Request) {
+		var req managedsql.LeaveVoterRequest
+		if !decode(w, r, &req) {
+			return
+		}
+		if err := host.LeaveVoter(r.Context(), req); err != nil {
+			managedOperationUnavailable(w, "leave-voter", err)
+			return
+		}
+		w.WriteHeader(http.StatusNoContent)
 	})
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		got := r.Header.Get("Authorization")

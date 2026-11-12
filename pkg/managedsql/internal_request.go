@@ -9,15 +9,16 @@ import (
 	"github.com/mrchypark/rhiza/internal/sqlpolicy"
 	"github.com/mrchypark/rhiza/internal/types"
 	"github.com/mrchypark/rhiza/pkg/network"
+	"github.com/mrchypark/rhiza/pkg/node"
 )
 
 func (h *Host) internalRequests() bool {
 	return sqlpolicy.IsManagedRequestApplicationProtocol(h.cfg.Plan.ApplicationProtocol) || sqlpolicy.IsManagedGraphRequestApplicationProtocol(h.cfg.Plan.ApplicationProtocol)
 }
 
-// internalRequestContext scopes the complete lock-held operation to both its
-// caller and this Host's close lifetime. The initial-admission scope alone is
-// insufficient: Node may re-observe certified progress later in the request.
+// internalRequestContext scopes the complete operation to both its caller and
+// this Host's close lifetime. The initial-admission scope alone is insufficient:
+// Node may re-observe certified progress later in the request.
 func (h *Host) internalRequestContext(ctx context.Context) (context.Context, func()) {
 	if !h.internalRequests() {
 		return ctx, func() {}
@@ -40,6 +41,8 @@ func (h *Host) internalRequestContext(ctx context.Context) (context.Context, fun
 // Once admitted, Node returns without repeating quorum or Kubernetes checks;
 // each operation then uses its own actual runtime/read/write gate.
 func (h *Host) ensureInitialRequestAdmission(ctx context.Context) error {
+	h.admissionMu.Lock()
+	defer h.admissionMu.Unlock()
 	if h.internalRequests() {
 		if h.admissionLifetime == nil {
 			return h.node.EnsureInitialManagedAdmission(ctx)
@@ -53,6 +56,20 @@ func (h *Host) ensureInitialRequestAdmission(ctx context.Context) error {
 		return errors.Join(err, scope.Err(), h.admissionLifetime.Err())
 	}
 	return nil
+}
+
+// A local read only needs the immutable Node pointer and lifecycle context.
+// Holding h.mu here makes readiness and local reads wait behind quorum work.
+func (h *Host) localReadNode(ctx context.Context) (context.Context, *node.Node, func(), error) {
+	if h.node == nil || h.admissionLifetime != nil && h.admissionLifetime.Err() != nil {
+		return ctx, nil, nil, fmt.Errorf("SQL host closed")
+	}
+	operationCtx, release := h.internalRequestContext(ctx)
+	if err := h.ensureInitialRequestAdmission(operationCtx); err != nil {
+		release()
+		return ctx, nil, nil, err
+	}
+	return operationCtx, h.node, release, nil
 }
 
 type requestRecoveryHint struct {

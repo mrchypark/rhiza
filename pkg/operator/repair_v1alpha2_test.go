@@ -383,7 +383,7 @@ func TestRepairV1Alpha2SchemaIsBoundedIntentNotHandoff(t *testing.T) {
 		t.Fatal("unexpected ledger or prepared handoff")
 	}
 	rules := string(b)
-	for _, message := range []string{"repair record cannot be removed", "repair intent is immutable per operation", "terminal repair is immutable per operation", "replacement repair requires a terminal predecessor and advanced position", "closed repair forbids new application reservations", "REMOVE alone is not final repair completion", "closed repair must match authority and cannot overlap a transition"} {
+	for _, message := range []string{"voterCount may decrease by at most one per update", "repair record cannot be removed", "repair intent is immutable per operation", "terminal repair is immutable per operation", "replacement repair requires a terminal predecessor and advanced position", "closed repair forbids new application reservations", "REMOVE alone is not final repair completion", "closed repair must match authority and cannot overlap a transition"} {
 		if !strings.Contains(rules, message) {
 			t.Fatalf("missing CEL invariant %s", message)
 		}

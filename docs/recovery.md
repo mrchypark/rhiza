@@ -108,12 +108,24 @@ v1alpha2 Deployment Pods and init-container identity handoff. The public managed
 Host requires before-ack durability. Healthy-quorum replacement uses the
 certified ADD-first path above, not a separate fencing Deployment.
 The operator validates the installed profile and reconciles initialization,
-genesis and bootstrap plans. The reference host runs the repair loop; upgrading
+genesis and bootstrap plans. Once that bootstrap authority is committed, a
+running operator is not required for certified join or replacement. The
+reference Host discovers gated candidates and admits one learner at a time.
+Deployment tooling sets the desired `voterCount` and explicitly scales the
+Deployment up; a missing Pod is not a certified leave. Upgrading
 the library alone does not add that loop to an arbitrary embedding application.
 The two init containers prepare identity and wait for the committed plan; the
 main engine performs verified startup/adoption and catch-up. NoPVC uses an
 `emptyDir`, so a container restart and a new Pod are different recovery events.
-`voterCount` is fixed at creation (3–64), not an autoscaling API. Recreate rollout
+`voterCount` is a desired target from 3 through 64, not an autoscaling API.
+Increasing it requires an explicit Deployment scale-up. A one-voter decrease is a
+staged leave: lower the target one (minimum 3), scale down one replica, identify
+the actual removed Pod's voter ID, issue authenticated private
+`POST /leave-voter` from a surviving Host/service, and wait for the certified
+exact target and live write/readback. Pod disappearance or replica count alone is
+not leave. Removed IDs cannot re-enroll; this path uses no fence and makes no
+storage-completion or DR claim. If pending, retry only the same ID for the
+current repair record; historical replay is not promised. Recreate rollout
 enforcement and peer/client Service management are not supplied by this
 initializer. See the [Pod builder](../pkg/operator/bootstrap_members_v1alpha2.go)
 and [initializer](../pkg/operator/initializer_v1alpha2.go) for those boundaries.

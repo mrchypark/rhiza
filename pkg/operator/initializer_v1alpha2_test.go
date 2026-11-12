@@ -9,6 +9,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -195,6 +196,25 @@ func (s *phase9Server) roundTrip(r *http.Request) (*http.Response, error) {
 			}
 			return phase2Response(201, s.deployment), nil
 		}
+		if r.Method == http.MethodPut {
+			body, err := io.ReadAll(r.Body)
+			if err != nil {
+				s.t.Fatal(err)
+			}
+			var obj map[string]any
+			if json.Unmarshal(body, &obj) != nil || s.deployment == "" {
+				return phase2Response(400, "invalid update"), nil
+			}
+			var current map[string]any
+			_ = json.Unmarshal([]byte(s.deployment), &current)
+			if asObject(obj["metadata"])["resourceVersion"] != asObject(current["metadata"])["resourceVersion"] {
+				return phase2Response(409, "conflict"), nil
+			}
+			meta := asObject(obj["metadata"])
+			meta["resourceVersion"] = "92"
+			s.deployment = string(mustManagedJSON(obj))
+			return phase2Response(200, s.deployment), nil
+		}
 		if r.Method != http.MethodGet {
 			s.t.Fatalf("unexpected deployment request: %s", r.Method)
 		}
@@ -285,6 +305,139 @@ func TestPhase9InitializerCreatesOnceAndPreservesStatus(t *testing.T) {
 	if !strings.Contains(s.cluster, `"unrelated":{"keep":true}`) {
 		t.Fatal("unrelated status lost")
 	}
+}
+
+func TestManagedInitializerDoesNotDriveHealthyMembership(t *testing.T) {
+	s, kube := phase9Setup(t, phase9CurrentManagedCluster())
+	if _, err := ReconcileV1Alpha2ManagedInitialization(context.Background(), kube, phase2Ref, phase9RuntimeProfile()); err != nil {
+		t.Fatal(err)
+	}
+	consume := jsonDecode(t, s.cluster)
+	consumeStatus := asObject(consume["status"])
+	asObject(consumeStatus["applicationInit"])["state"] = "Consumed"
+	asObject(consumeStatus["applicationInit"])["initialEvidenceDigest"] = strings.Repeat("a", 64)
+	asObject(consumeStatus["authority"])["evidence"] = map[string]any{"schema": "empty"}
+	s.cluster = string(mustManagedJSON(consume))
+
+	setTarget := func(count int) {
+		s.mu9.Lock()
+		defer s.mu9.Unlock()
+		obj := jsonDecode(s.t, s.cluster)
+		asObject(obj["spec"])["voterCount"] = count
+		s.cluster = string(mustManagedJSON(obj))
+	}
+	replicas := func() int {
+		s.mu9.Lock()
+		defer s.mu9.Unlock()
+		return int(number(asObject(asObject(jsonDecode(s.t, s.deployment))["spec"])["replicas"]))
+	}
+	// Healthy membership belongs to Rhiza. The initializer persists intent and
+	// observes status, but it never changes the running voter capacity.
+	s.mu9.Lock()
+	deployment := jsonDecode(s.t, s.deployment)
+	asObject(deployment["spec"])["replicas"] = 4
+	s.deployment = string(mustManagedJSON(deployment))
+	s.mu9.Unlock()
+	before := s.cluster
+	if _, err := ReconcileV1Alpha2ManagedInitialization(context.Background(), kube, phase2Ref, phase9RuntimeProfile()); err != nil {
+		t.Fatal(err)
+	}
+	if got := replicas(); got != 4 {
+		t.Fatalf("bare kubectl scale changed replicas to %d", got)
+	}
+	if s.cluster != before || asObject(asObject(jsonDecode(t, s.cluster)["status"])["repair"]) != nil {
+		t.Fatal("bare kubectl scale fabricated membership or changed status")
+	}
+	setTarget(5)
+	targetCluster := s.cluster
+	if _, err := ReconcileV1Alpha2ManagedInitialization(context.Background(), kube, phase2Ref, phase9RuntimeProfile()); err != nil {
+		t.Fatal(err)
+	}
+	if got := replicas(); got != 4 || s.cluster != targetCluster {
+		t.Fatalf("target increase changed replicas or status: replicas=%d", got)
+	}
+	setTarget(3)
+	targetCluster = s.cluster
+	if _, err := ReconcileV1Alpha2ManagedInitialization(context.Background(), kube, phase2Ref, phase9RuntimeProfile()); err != nil {
+		t.Fatalf("lower target must be inert: %v", err)
+	}
+	if got := replicas(); got != 4 || s.cluster != targetCluster {
+		t.Fatalf("manual lower target changed replicas or status: replicas=%d", got)
+	}
+}
+
+func TestManagedInitializerDoesNotDriveTemporaryMembership(t *testing.T) {
+	s, kube := phase9Setup(t, phase9CurrentManagedCluster())
+	ctx := context.Background()
+	first, err := ReconcileV1Alpha2ManagedInitialization(ctx, kube, phase2Ref, phase9RuntimeProfile())
+	if err != nil {
+		t.Fatal(err)
+	}
+	init, err := LoadV1Alpha2ApplicationInit(ctx, &V1Alpha2StatusStore{Kube: kube}, phase2Ref)
+	if err != nil {
+		t.Fatal(err)
+	}
+	bootstrap, err := first.BootstrapPlan()
+	if err != nil || len(bootstrap.Members) != 3 {
+		t.Fatalf("bootstrap members: %+v err=%v", bootstrap.Members, err)
+	}
+	auth := first.Authority()
+	replacement, err := types.ManagedNodeID("replacement-pod-uid")
+	if err != nil {
+		t.Fatal(err)
+	}
+	old := bootstrap.Members[0].Member.ID
+	plan := V1Alpha2RepairPlan{
+		Sequence: V1Alpha2RepairAddThenRemove, OperationID: "replace-temporary", ClusterUID: auth.Owner.UID,
+		Generation: auth.Generation, DeploymentUID: auth.Binding.DeploymentUID, StorageID: auth.Binding.StorageID,
+		ExpectedConfigID: 1, OldNodeID: old, OldWALIdentity: strings.Repeat("1", 64),
+		Replacement:         V1Alpha2RepairMember{PodName: "replacement", PodUID: "replacement-pod-uid", NodeID: replacement, PublicKey: bootstrap.Members[1].Member.PublicKey, PeerURL: "quic://10.0.0.4:9090"},
+		BootstrapPlanDigest: init.Assignment().Plan.BootstrapPlanDigest,
+	}
+	for _, member := range bootstrap.Members {
+		if member.Member.ID != old {
+			plan.FinalVoterIDs = append(plan.FinalVoterIDs, member.Member.ID)
+		}
+	}
+	plan.FinalVoterIDs = append(plan.FinalVoterIDs, replacement)
+	slices.Sort(plan.FinalVoterIDs)
+
+	cluster := jsonDecode(t, s.cluster)
+	status := asObject(cluster["status"])
+	assignment := asObject(status["applicationInit"])
+	assignment["state"] = "Consumed"
+	assignment["initialEvidenceDigest"] = strings.Repeat("a", 64)
+	asObject(status["authority"])["evidence"] = map[string]any{"schema": "empty"}
+	status["repair"] = mustManagedJSON(V1Alpha2RepairRecord{Plan: plan, State: "Closed"})
+	s.cluster = string(mustManagedJSON(cluster))
+
+	s.mu9.Lock()
+	deployment := jsonDecode(t, s.deployment)
+	asObject(deployment["spec"])["replicas"] = 4
+	s.deployment = string(mustManagedJSON(deployment))
+	s.mu9.Unlock()
+	before := s.cluster
+	if _, err := ReconcileV1Alpha2ManagedInitialization(ctx, kube, phase2Ref, phase9RuntimeProfile()); err != nil {
+		t.Fatalf("temporary add-first membership blocked reconciliation: %v", err)
+	}
+	if s.cluster != before {
+		t.Fatal("stable target reconciliation changed cluster status")
+	}
+	s.mu9.Lock()
+	got := int(number(asObject(asObject(jsonDecode(t, s.deployment))["spec"])["replicas"]))
+	s.mu9.Unlock()
+	if got != 4 {
+		t.Fatalf("temporary 4-voter membership or target 3 changed replicas to %d", got)
+	}
+}
+
+func jsonDecode(t *testing.T, raw string) map[string]any {
+	t.Helper()
+	var value map[string]any
+	if json.Unmarshal([]byte(raw), &value) != nil {
+		t.Fatal("invalid fixture JSON")
+	}
+	return value
 }
 
 func TestPhase9InitializerRejectsMissingIntent(t *testing.T) {

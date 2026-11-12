@@ -423,6 +423,19 @@ func (transport *clusterTransport) ReadTip(_ context.Context, to NodeID) (Slot, 
 	return core.Tip(), nil
 }
 
+func (transport *clusterTransport) FetchFrozenTargetDecisions(_ context.Context, from NodeID, slot Slot, limit int, target Cluster) ([]DecidedValue, Slot, error) {
+	if _, ok := target.MemberSet()[from]; !ok {
+		return nil, 0, errors.New("source outside frozen target")
+	}
+	transport.mu.RLock()
+	core, down := transport.cores[from], transport.down[from]
+	transport.mu.RUnlock()
+	if down || core == nil {
+		return nil, 0, errors.New("down")
+	}
+	return core.DecisionsFrom(slot, limit)
+}
+
 func (transport *clusterTransport) StageValue(_ context.Context, to NodeID, hash ValueHash, value []byte) error {
 	transport.mu.Lock()
 	down := transport.down[to]

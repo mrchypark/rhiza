@@ -303,7 +303,9 @@ func TestQualificationApplicationProvenance(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !bytes.Contains(script, []byte(". scripts/ha-managed-bootstrap-fixture.sh\nmanaged_fixture")) {
+	fixtureSource := []byte(". scripts/ha-managed-bootstrap-fixture.sh\n")
+	fixtureLoaded := bytes.LastIndex(script, fixtureSource)
+	if fixtureLoaded < 0 || !bytes.Contains(script[fixtureLoaded+len(fixtureSource):], []byte("\nmanaged_fixture\n")) {
 		t.Fatal("managed qualification must execute the shared fixture")
 	}
 	fixture, err := os.ReadFile("../../../scripts/ha-managed-bootstrap-fixture.sh")
@@ -331,7 +333,7 @@ func TestQualificationApplicationProvenance(t *testing.T) {
 		t.Fatal(err)
 	}
 	for _, required := range []string{
-		`FROM mirror.gcr.io/library/golang:1.27.3-alpine@sha256:b8c9b82affbbb82a020bbcf998dad2ba9516944ac7e883524642a481a9505e9c AS builder`,
+		`FROM mirror.gcr.io/library/golang:1.27.4-alpine@sha256:0a5f7fe796599ff487605987432e7619ae45beeb2fba4c2ce0b907879932aebf AS builder`,
 		`FROM mirror.gcr.io/library/rust:1.98.0-bookworm@sha256:82150a52ec202c1b14d7817e14516c392bb7f5cfebd88f1ed531cb37ebd39922 AS rust-builder`,
 		`FROM mirror.gcr.io/library/ubuntu:24.04@sha256:534baea6a22c03a63003dbc8dbe78fe34bc0d7e595d9a9dc9834884ff530eb55`,
 		`RUN CGO_ENABLED=0 GOOS=linux go build -o rhiza-operator ./cmd/rhiza-operator`,

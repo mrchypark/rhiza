@@ -37,6 +37,8 @@ var (
 )
 
 const leaderEpochSize Slot = 16
+const frozenRecoveryTimeout = 500 * time.Millisecond
+const readIndexMembershipWait = 10 * time.Second
 
 type leaderTiming struct {
 	average time.Duration
@@ -56,6 +58,10 @@ type Transport interface {
 	ReadTip(ctx context.Context, to NodeID) (Slot, error)
 	StageValue(ctx context.Context, to NodeID, hash ValueHash, value []byte) error
 	FetchValue(ctx context.Context, from NodeID, hash ValueHash) ([]byte, error)
+}
+
+type frozenTargetDecisionFetcher interface {
+	FetchFrozenTargetDecisions(context.Context, NodeID, Slot, int, Cluster) ([]DecidedValue, Slot, error)
 }
 
 // Core runs one QuePaxa proposer and recorder per replica.
@@ -85,6 +91,8 @@ type Core struct {
 	generationAnchorHash    [32]byte
 	reconfiguration         *reconfigurationState
 	reconfigurationMu       sync.Mutex
+	frozenRecoveryMu        sync.Mutex
+	frozenRecoveryAt        time.Time
 	priority                func() (Priority, error)
 	recordBeforeAppend      func()
 
@@ -266,6 +274,132 @@ func (c *Core) PendingReconfiguration() (Cluster, bool) {
 	return cloneCluster(c.reconfiguration.target), true
 }
 
+// RecoverFrozenMembership fetches one certified page when a retained voter has
+// missed its terminal transition. It trusts only the certified frozen target's
+// retained routes and requires its exact terminal before activation.
+func (c *Core) RecoverFrozenMembership(ctx context.Context) bool {
+	if !c.reconfigEnabled || c.observer || c.transport == nil {
+		return false
+	}
+	fetcher, ok := c.transport.(frozenTargetDecisionFetcher)
+	if !ok {
+		return false
+	}
+	c.mu.RLock()
+	state := c.reconfiguration
+	tip := c.tip
+	var target Cluster
+	if state != nil {
+		_, retained := state.target.MemberSet()[c.nodeID]
+		if !retained {
+			c.mu.RUnlock()
+			return false
+		}
+		target = cloneCluster(state.target)
+	}
+	c.mu.RUnlock()
+	if state == nil {
+		return false
+	}
+
+	c.frozenRecoveryMu.Lock()
+	now := c.now()
+	if !c.frozenRecoveryAt.IsZero() && now.Sub(c.frozenRecoveryAt) < frozenRecoveryTimeout {
+		c.frozenRecoveryMu.Unlock()
+		return false
+	}
+	c.frozenRecoveryAt = now
+	c.frozenRecoveryMu.Unlock()
+
+	recoveryCtx, cancel := context.WithTimeout(ctx, frozenRecoveryTimeout)
+	defer cancel()
+	from := tip + 1
+	type pageResult struct {
+		values []DecidedValue
+		err    error
+	}
+	results := make(chan pageResult, len(target.Members))
+	pending := 0
+	for _, member := range target.Members {
+		if member.ID == c.nodeID {
+			continue
+		}
+		pending++
+		go func(source NodeID) {
+			values, _, err := fetcher.FetchFrozenTargetDecisions(recoveryCtx, source, from, 128, target)
+			results <- pageResult{values: values, err: err}
+		}(member.ID)
+	}
+	for range pending {
+		var page pageResult
+		select {
+		case <-recoveryCtx.Done():
+			return false
+		case page = <-results:
+		}
+		if page.err != nil || len(page.values) == 0 || page.values[0].Slot != from {
+			continue
+		}
+		contiguous := true
+		for index, value := range page.values {
+			if value.Slot != from+Slot(index) {
+				contiguous = false
+				break
+			}
+		}
+		if !contiguous {
+			continue
+		}
+		hasTerminal, valid := c.validateFrozenPage(page.values, state)
+		if !valid {
+			continue
+		}
+		if err := c.AcceptCertifiedValues(page.values); err != nil {
+			continue
+		}
+		if !hasTerminal {
+			// A frame-bounded page may stop before the terminal. Retaining this
+			// certified prefix lets the next bounded attempt start closer to it.
+			return false
+		}
+		c.mu.RLock()
+		recovered := c.reconfiguration == nil
+		c.mu.RUnlock()
+		return recovered
+	}
+	return false
+}
+
+// validateFrozenPage validates every certificate and binds any terminal to the
+// exact freeze that is installed locally. AcceptCertifiedValues then repeats
+// all sequential transition, prefix, and target checks while applying the page.
+func (c *Core) validateFrozenPage(values []DecidedValue, state *reconfigurationState) (hasTerminal, valid bool) {
+	for _, value := range values {
+		decision, err := c.certifiedDecision(value)
+		if err != nil {
+			return false, false
+		}
+		control, ok, err := decodeReconfiguration(value.Value)
+		if err != nil {
+			return false, false
+		}
+		if !ok || !control.Terminal {
+			continue
+		}
+		if decision.Slot != state.terminal ||
+			control.Freeze != state.freeze ||
+			control.TerminalSlot != state.terminal ||
+			!sameCluster(control.Target, state.target) {
+			return false, false
+		}
+		if err := c.validateDecisionForRecovery(decision, false); err != nil {
+			return false, false
+		}
+		hasTerminal = true
+	}
+	return hasTerminal, true
+}
+
 // LastReconfigurationAbort returns the certified abort terminal revision and
 // its original target. The result is absent after a successful transition.
 func (c *Core) LastReconfigurationAbort() (Slot, Cluster, bool) {
@@ -369,20 +503,32 @@ func (c *Core) proposeOwned(ctx context.Context, value []byte, complete, executi
 			return 0, nil, err
 		}
 	}
-	select {
-	case c.pipeline <- struct{}{}:
-		defer func() { <-c.pipeline }()
-	case <-ctx.Done():
-		return 0, nil, ctx.Err()
-	}
 	if c.reconfigEnabled {
-		c.mu.RLock()
-		frozen := c.reconfiguration != nil
-		c.mu.RUnlock()
-		if frozen {
-			return 0, nil, fmt.Errorf("reconfiguration drain is in progress")
+		for {
+			select {
+			case c.pipeline <- struct{}{}:
+			case <-ctx.Done():
+				return 0, nil, ctx.Err()
+			}
+			c.mu.RLock()
+			frozen := c.reconfiguration != nil
+			c.mu.RUnlock()
+			if !frozen {
+				break
+			}
+			<-c.pipeline
+			if !c.RecoverFrozenMembership(ctx) {
+				return 0, nil, fmt.Errorf("reconfiguration drain is in progress")
+			}
+		}
+	} else {
+		select {
+		case c.pipeline <- struct{}{}:
+		case <-ctx.Done():
+			return 0, nil, ctx.Err()
 		}
 	}
+	defer func() { <-c.pipeline }()
 
 	offeredHash := sha256.Sum256(value)
 	for {
@@ -608,7 +754,7 @@ func (c *Core) hydrateProposal(ctx context.Context, proposal *Proposal, sources 
 // only after a learner quorum has accepted their decision, so the two quorums
 // intersect and a completed write cannot be missed.
 func (c *Core) ReadIndex(ctx context.Context) (Slot, NodeID, error) {
-	return c.readIndexExcluding(ctx, "")
+	return c.readIndexFollowingMembership(ctx, "")
 }
 
 // ReadIndexExcluding verifies the current quorum without counting or contacting
@@ -617,75 +763,162 @@ func (c *Core) ReadIndexExcluding(ctx context.Context, excluded NodeID) (Slot, N
 	if excluded == c.nodeID {
 		return 0, "", ErrQuorumUnavailable
 	}
-	return c.readIndexExcluding(ctx, excluded)
-}
-func (c *Core) readIndexExcluding(ctx context.Context, excluded NodeID) (Slot, NodeID, error) {
-	if c.observer || !c.CanParticipateReadIndex() {
-		c.mu.RLock()
-		frozen := c.reconfiguration != nil
-		c.mu.RUnlock()
-		log.Printf("read-index refused node_hash=%x excluded_hash=%x current_config=%d voter=%t observer=%t frozen=%t", sha256.Sum256([]byte(c.nodeID)), sha256.Sum256([]byte(excluded)), c.ConfigID(), c.IsVoter(), c.observer, frozen)
+	if c.reconfigEnabled {
+		c.RecoverFrozenMembership(ctx)
+	}
+	configID, members, changed, frozen, voter := c.readIndexState()
+	if frozen || !voter {
 		return 0, "", ErrQuorumUnavailable
 	}
-	cluster := *c.config
-	if c.reconfigEnabled {
-		cluster = c.CurrentCluster()
-	}
-	if len(cluster.Members) == 1 {
+	if len(members) == 1 {
 		return c.Tip(), c.nodeID, nil
 	}
 	transport := c.transport
 	if transport == nil {
 		return 0, "", fmt.Errorf("%w: read-index transport is unavailable", ErrQuorumUnavailable)
 	}
-	type result struct {
-		tip Slot
-		id  NodeID
-		err error
+	slot, id, _, _, err := c.readIndexRound(ctx, transport, configID, members, excluded, changed, false)
+	return slot, id, err
+}
+
+// readIndexState binds a monotonic configuration ID to the signal that may
+// invalidate it. Configuration members are immutable once installed.
+func (c *Core) readIndexState() (uint, []Member, <-chan struct{}, bool, bool) {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	cluster := c.clusterForSlotLocked(c.tip + 1)
+	return cluster.ConfigID, cluster.Members, c.tipChanged, c.reconfiguration != nil, !c.observer && c.voterForClusterLocked(cluster)
+}
+
+// retainedTerminalPending identifies the narrow state where the current
+// certified roster contains this exact voter incarnation, but its activation
+// terminal has not yet acquired the local durability marker. It never matches
+// removed, replaced, learner, observer, or frozen membership.
+func (c *Core) retainedTerminalPendingLocked(cluster Cluster) (Slot, bool) {
+	if c.observer || c.reconfiguration != nil {
+		return 0, false
 	}
+	exactMember := false
+	for _, member := range cluster.Members {
+		if member.ID != c.nodeID {
+			continue
+		}
+		if member.WALIdentity == "" {
+			exactMember = !c.learner
+		} else {
+			exactMember = member.WALIdentity == c.walIdentity
+		}
+		break
+	}
+	if !exactMember {
+		return 0, false
+	}
+	for _, epoch := range c.configHistory {
+		if epoch.start > 1 && sameCluster(epoch.cluster, cluster) && !c.epochTerminalDurableLocked(epoch) {
+			return epoch.start - 1, true
+		}
+	}
+	return 0, false
+}
+
+type configurationLag interface{ ConfigurationLag() bool }
+
+// currentTransitionTerminalLocked returns the exact terminal that activated
+// the current configuration. It is used only after an authenticated current
+// roster peer reports that narrower configuration as unknown.
+func (c *Core) currentTransitionTerminalLocked() (Slot, uint, bool) {
+	cluster := c.clusterForSlotLocked(c.tip + 1)
+	for index := len(c.configHistory) - 1; index >= 0; index-- {
+		epoch := c.configHistory[index]
+		if epoch.start > 1 && sameCluster(epoch.cluster, cluster) {
+			return epoch.start - 1, cluster.ConfigID, true
+		}
+	}
+	return 0, cluster.ConfigID, false
+}
+
+type readIndexResult struct {
+	tip Slot
+	id  NodeID
+	err error
+}
+
+// readIndexRound collects one complete quorum round from one immutable roster.
+// A transition return discards every response from this round; it never mixes
+// evidence across configurations or counts quorum while membership is frozen.
+func (c *Core) readIndexRound(ctx context.Context, transport Transport, configID uint, members []Member, excluded NodeID, changed <-chan struct{}, followMembership bool) (Slot, NodeID, bool, bool, error) {
 	readCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
-	results := make(chan result, len(cluster.Members))
-	observed := make([]result, 0, len(cluster.Members))
-	for _, member := range cluster.Members {
+	results := make(chan readIndexResult, len(members))
+	observed := make([]readIndexResult, 0, len(members))
+	for _, member := range members {
 		if member.ID == excluded {
-			results <- result{id: member.ID, err: ErrQuorumUnavailable}
+			results <- readIndexResult{id: member.ID, err: ErrQuorumUnavailable}
 			continue
 		}
 		if member.ID == c.nodeID {
-			results <- result{tip: c.Tip(), id: c.nodeID}
+			results <- readIndexResult{tip: c.Tip(), id: c.nodeID}
 			continue
 		}
 		go func(id NodeID) {
 			tip, err := transport.ReadTip(readCtx, id)
-			results <- result{tip: tip, id: id, err: err}
+			results <- readIndexResult{tip: tip, id: id, err: err}
 		}(member.ID)
 	}
-	var best result
+	cluster := Cluster{ConfigID: configID, Members: members}
+	var best readIndexResult
 	successes := 0
+	lagSeen := false
 	logFailure := func(reason string) {
-		log.Printf("read-index failed reason=%s node_hash=%x excluded_hash=%x requested_config=%d current_config=%d required=%d actual=%d completed=%d participants=%d context_done=%t", reason, sha256.Sum256([]byte(c.nodeID)), sha256.Sum256([]byte(excluded)), cluster.ConfigID, c.ConfigID(), cluster.QuorumSize(), successes, len(observed), len(cluster.Members), ctx.Err() != nil)
+		log.Printf("read-index failed reason=%s node_hash=%x excluded_hash=%x requested_config=%d current_config=%d required=%d actual=%d completed=%d participants=%d context_done=%t", reason, sha256.Sum256([]byte(c.nodeID)), sha256.Sum256([]byte(excluded)), configID, c.ConfigID(), cluster.QuorumSize(), successes, len(observed), len(members), ctx.Err() != nil)
 		for _, item := range observed {
 			phase := "none"
 			var diagnostic interface{ RPCPhase() string }
 			if errors.As(item.err, &diagnostic) {
 				phase = diagnostic.RPCPhase()
 			}
-			log.Printf("read-index participant node_hash=%x peer_hash=%x requested_config=%d excluded=%t success=%t tip=%d error_type=%T quorum_unavailable=%t canceled=%t deadline=%t rpc_phase=%s", sha256.Sum256([]byte(c.nodeID)), sha256.Sum256([]byte(item.id)), cluster.ConfigID, item.id == excluded, item.err == nil, item.tip, item.err, errors.Is(item.err, ErrQuorumUnavailable), errors.Is(item.err, context.Canceled), errors.Is(item.err, context.DeadlineExceeded), phase)
+			log.Printf("read-index participant node_hash=%x peer_hash=%x requested_config=%d excluded=%t success=%t tip=%d error_type=%T quorum_unavailable=%t canceled=%t deadline=%t rpc_phase=%s", sha256.Sum256([]byte(c.nodeID)), sha256.Sum256([]byte(item.id)), configID, item.id == excluded, item.err == nil, item.tip, item.err, errors.Is(item.err, ErrQuorumUnavailable), errors.Is(item.err, context.Canceled), errors.Is(item.err, context.DeadlineExceeded), phase)
 		}
-		for _, member := range cluster.Members {
-			if !slices.ContainsFunc(observed, func(item result) bool { return item.id == member.ID }) {
-				log.Printf("read-index participant node_hash=%x peer_hash=%x requested_config=%d pending=true excluded=%t", sha256.Sum256([]byte(c.nodeID)), sha256.Sum256([]byte(member.ID)), cluster.ConfigID, member.ID == excluded)
+		for _, member := range members {
+			if !slices.ContainsFunc(observed, func(item readIndexResult) bool { return item.id == member.ID }) {
+				log.Printf("read-index participant node_hash=%x peer_hash=%x requested_config=%d pending=true excluded=%t", sha256.Sum256([]byte(c.nodeID)), sha256.Sum256([]byte(member.ID)), configID, member.ID == excluded)
 			}
 		}
 	}
-	for completed := 0; completed < len(cluster.Members); completed++ {
+	for responses := 0; responses < len(members); {
 		select {
 		case <-ctx.Done():
 			logFailure("context")
-			return 0, "", ctx.Err()
+			return 0, "", false, false, ctx.Err()
+		case <-changed:
+			current, _, nextChanged, frozen, voter := c.readIndexState()
+			if followMembership && (frozen || current > configID) {
+				return 0, "", true, false, nil
+			}
+			if frozen || current != configID || !voter {
+				logFailure("membership-not-installed")
+				return 0, "", false, false, ErrQuorumUnavailable
+			}
+			changed = nextChanged
 		case item := <-results:
+			responses++
 			observed = append(observed, item)
+			current, _, nextChanged, frozen, voter := c.readIndexState()
+			if followMembership && (frozen || current > configID) {
+				return 0, "", true, false, nil
+			}
+			if frozen || current != configID || !voter {
+				logFailure("membership-not-installed")
+				return 0, "", false, false, ErrQuorumUnavailable
+			}
+			changed = nextChanged
+			if followMembership {
+				var lag configurationLag
+				if errors.As(item.err, &lag) && lag.ConfigurationLag() {
+					lagSeen = true
+					continue
+				}
+			}
 			if item.err != nil {
 				continue
 			}
@@ -694,12 +927,137 @@ func (c *Core) readIndexExcluding(ctx context.Context, excluded NodeID) (Slot, N
 				best = item
 			}
 			if successes == cluster.QuorumSize() {
-				return best.tip, best.id, nil
+				return best.tip, best.id, false, false, nil
 			}
 		}
 	}
 	logFailure("results-exhausted")
-	return 0, "", ErrQuorumUnavailable
+	if followMembership && lagSeen {
+		return 0, "", true, true, nil
+	}
+	return 0, "", false, false, ErrQuorumUnavailable
+}
+
+func (c *Core) readIndexFollowingMembership(ctx context.Context, excluded NodeID) (Slot, NodeID, error) {
+	var frozenWait context.Context
+	var durabilityAttempted uint
+	var redeliveryAttempted uint
+	for {
+		if excluded == c.nodeID {
+			return 0, "", ErrQuorumUnavailable
+		}
+		if c.reconfigEnabled {
+			c.RecoverFrozenMembership(ctx)
+		}
+		configID, members, changed, frozen, voter := c.readIndexState()
+		if frozen {
+			if frozenWait == nil {
+				if ctx.Done() == nil {
+					log.Printf("read-index refused node_hash=%x excluded_hash=%x current_config=%d voter=%t observer=%t frozen=true cancellable=false", sha256.Sum256([]byte(c.nodeID)), sha256.Sum256([]byte(excluded)), configID, voter, c.observer)
+					return 0, "", ErrQuorumUnavailable
+				}
+				frozenWait = ctx
+				if _, bounded := ctx.Deadline(); !bounded {
+					boundedWait, cancel := context.WithTimeout(ctx, readIndexMembershipWait)
+					defer cancel()
+					frozenWait = boundedWait
+				}
+			}
+			select {
+			case <-frozenWait.Done():
+				if err := ctx.Err(); err != nil {
+					return 0, "", err
+				}
+				return 0, "", ErrQuorumUnavailable
+			case <-changed:
+				continue
+			}
+		}
+		if !voter {
+			c.mu.RLock()
+			current := c.clusterForSlotLocked(c.tip + 1)
+			currentConfigID := current.ConfigID
+			currentFrozen := c.reconfiguration != nil
+			currentVoter := !c.observer && c.voterForClusterLocked(current)
+			pendingTerminal, activationPending := c.retainedTerminalPendingLocked(current)
+			c.mu.RUnlock()
+			if currentConfigID != configID || currentFrozen || currentVoter {
+				continue
+			}
+			if activationPending && durabilityAttempted != configID {
+				durabilityAttempted = configID
+				if ctx.Done() == nil {
+					return 0, "", ErrQuorumUnavailable
+				}
+				activationCtx := ctx
+				cancel := func() {}
+				if _, bounded := ctx.Deadline(); !bounded {
+					activationCtx, cancel = context.WithTimeout(ctx, readIndexMembershipWait)
+				}
+				err := c.EnsureDurableThrough(activationCtx, pendingTerminal)
+				activationErr := activationCtx.Err()
+				cancel()
+				if cErr := ctx.Err(); cErr != nil {
+					return 0, "", cErr
+				}
+				if err != nil {
+					if errors.Is(activationErr, context.DeadlineExceeded) {
+						return 0, "", ErrQuorumUnavailable
+					}
+					return 0, "", err
+				}
+				continue
+			}
+			log.Printf("read-index refused node_hash=%x excluded_hash=%x current_config=%d voter=false observer=%t frozen=false", sha256.Sum256([]byte(c.nodeID)), sha256.Sum256([]byte(excluded)), configID, c.observer)
+			return 0, "", ErrQuorumUnavailable
+		}
+		if len(members) == 1 {
+			return c.Tip(), c.nodeID, nil
+		}
+		transport := c.transport
+		if transport == nil {
+			return 0, "", fmt.Errorf("%w: read-index transport is unavailable", ErrQuorumUnavailable)
+		}
+		slot, id, transition, lag, err := c.readIndexRound(ctx, transport, configID, members, excluded, changed, true)
+		if lag {
+			if redeliveryAttempted == configID {
+				return 0, "", ErrQuorumUnavailable
+			}
+			redeliveryAttempted = configID
+			c.mu.RLock()
+			terminal, currentConfigID, hasTerminal := c.currentTransitionTerminalLocked()
+			currentFrozen := c.reconfiguration != nil
+			c.mu.RUnlock()
+			if !hasTerminal || currentConfigID != configID || currentFrozen {
+				continue
+			}
+			if ctx.Done() == nil {
+				return 0, "", ErrQuorumUnavailable
+			}
+			redeliveryCtx := ctx
+			cancel := func() {}
+			if _, bounded := ctx.Deadline(); !bounded {
+				redeliveryCtx, cancel = context.WithTimeout(ctx, readIndexMembershipWait)
+			}
+			_, err := c.CompleteDecision(redeliveryCtx, terminal)
+			redeliveryErr := redeliveryCtx.Err()
+			cancel()
+			if cErr := ctx.Err(); cErr != nil {
+				return 0, "", cErr
+			}
+			if err != nil {
+				if errors.Is(redeliveryErr, context.DeadlineExceeded) {
+					return 0, "", ErrQuorumUnavailable
+				}
+				return 0, "", err
+			}
+			continue
+		}
+		if transition {
+			continue
+		}
+		return slot, id, err
+	}
 }
 
 func proposalResult(decision Decision) (Slot, []Receipt, error) {

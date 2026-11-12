@@ -320,8 +320,14 @@ func (n *Node) admitInternalApplication(ctx context.Context) error {
 		}
 		return logManagedSQLQueryFailure(ctx, "admission_runtime_pre", err)
 	}
-	if !n.managedInitiallyAdmitted.Load() || !n.core.CanParticipateReadIndex() {
+	if !n.managedInitiallyAdmitted.Load() {
 		err := fmt.Errorf("internal application has no active voter admission")
+		if n.materializationPolicy() == sqlpolicy.ManagedGraphRequestMaterializationPolicy {
+			logManagedGraphAdmissionStageFailure("admitted", "runtime_pre", err)
+		}
+		return logManagedSQLQueryFailure(ctx, "admission_runtime_pre", err)
+	}
+	if err := n.waitForManagedVoterAdmission(ctx); err != nil {
 		if n.materializationPolicy() == sqlpolicy.ManagedGraphRequestMaterializationPolicy {
 			logManagedGraphAdmissionStageFailure("admitted", "runtime_pre", err)
 		}

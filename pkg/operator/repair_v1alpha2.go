@@ -28,21 +28,30 @@ type V1Alpha2RepairMember struct {
 	PeerURL   string            `json:"peerURL"`
 }
 
-// V1Alpha2RepairSequence selects the order of the two certified membership
-// terminals. The empty value preserves the historical REMOVE-then-ADD flow.
+// V1Alpha2RepairSequence selects the certified membership operation. The empty
+// value preserves the historical REMOVE-then-ADD flow.
 type V1Alpha2RepairSequence string
 
 const (
 	V1Alpha2RepairRemoveThenAdd V1Alpha2RepairSequence = "removeThenAdd"
 	V1Alpha2RepairAddThenRemove V1Alpha2RepairSequence = "addThenRemove"
+	// Add keeps every current voter and enrolls exactly one additional voter.
+	// It is used only for a monotonic managed Pod scale-up.
+	V1Alpha2RepairAdd V1Alpha2RepairSequence = "add"
+	// Leave removes exactly one named voter after the desired voter count was
+	// explicitly reduced. Replacement names that same logical voter.
+	V1Alpha2RepairLeave V1Alpha2RepairSequence = "leave"
 )
 
-// V1Alpha2RepairPlan is one bounded two-membership-operation intent, not a
-// membership certificate or prepared handoff. Legacy REMOVE-first plans do
-// not require a source HEAD because REMOVE may first publish that history;
-// ADD-first plans bind their prepared source in V1Alpha2RepairHandoff.
+// V1Alpha2RepairPlan is one bounded membership intent, not a certificate or a
+// prepared handoff. Legacy REMOVE-first plans do not require a source HEAD;
+// ADD-first replacement and add-only enrollment bind a prepared source in
+// V1Alpha2RepairHandoff.
 // OldWALIdentity is the caller-verified registered nonce, not an external
-// fence. Replacement WAL identity is deliberately absent until registration.
+// fence. For Add, OldNodeID is a current-voter quorum witness and remains in
+// FinalVoterIDs. Replacement WAL identity is deliberately absent until
+// registration. For Leave, Replacement names the retired logical voter and is
+// not part of FinalVoterIDs; PodName/PodUID are not live-workload authority.
 type V1Alpha2RepairPlan struct {
 	OperationID         string                 `json:"operationID"`
 	Sequence            V1Alpha2RepairSequence `json:"sequence,omitempty"`
@@ -125,7 +134,7 @@ func validateRepairHandoff(s V1Alpha2StatusSnapshot, p V1Alpha2RepairPlan, h V1A
 	if err != nil || namespaceErr != nil || h.SourcePrefix != prefix || path.Clean(h.SourcePrefix) != h.SourcePrefix || h.PhysicalBinding != assignment.Plan.PhysicalBinding || h.PlanDigest != p.Digest() || len(h.Head) == 0 || len(h.Head) > V1Alpha2RepairHeadLimit || h.HeadHash != fmt.Sprintf("%x", sha256.Sum256(h.Head)) {
 		return fmt.Errorf("invalid repair handoff binding or budget")
 	}
-	if repairSequence(p) == V1Alpha2RepairAddThenRemove {
+	if repairSequence(p) == V1Alpha2RepairAddThenRemove || repairSequence(p) == V1Alpha2RepairAdd {
 		if h.PreparedConfig == nil || uint64(h.PreparedConfig.ConfigID) != p.ExpectedConfigID || h.PreparedSlot <= p.ExpectedAbortSlot || h.PreparedSlot > math.MaxInt64 || !validInitDigest(h.PreparedHash) || h.RemoveTerminalSlot != 0 || h.RemoveTerminalHash != "" || h.Survivors.ConfigID != 0 || len(h.Survivors.Members) != 0 {
 			return fmt.Errorf("invalid ADD-first prepared source")
 		}
@@ -143,7 +152,9 @@ func validateRepairHandoff(s V1Alpha2StatusSnapshot, p V1Alpha2RepairPlan, h V1A
 		seen[m.ID] = true
 		ids = append(ids, m.ID)
 	}
-	ids = append(ids, p.Replacement.NodeID)
+	if repairSequence(p) != V1Alpha2RepairLeave {
+		ids = append(ids, p.Replacement.NodeID)
+	}
 	slices.Sort(ids)
 	if !slices.Equal(ids, p.FinalVoterIDs) {
 		return fmt.Errorf("repair survivors differ from final target")
@@ -176,9 +187,11 @@ func validateAddFirstPreparedConfig(p V1Alpha2RepairPlan, source quepaxa.Cluster
 		return fmt.Errorf("ADD-first source does not contain the old voter")
 	}
 	ids = append(ids, p.Replacement.NodeID)
-	// The intermediate ADD roster is the source roster plus N. Removing the
-	// exact old identity from it must yield the already-bound final target.
-	ids = slices.DeleteFunc(ids, func(id types.NodeID) bool { return id == p.OldNodeID })
+	// Replacement removes the bound old identity from its final target. Add-only
+	// enrollment keeps every current voter and only appends N.
+	if repairSequence(p) != V1Alpha2RepairAdd {
+		ids = slices.DeleteFunc(ids, func(id types.NodeID) bool { return id == p.OldNodeID })
+	}
 	slices.Sort(ids)
 	if !slices.Equal(ids, p.FinalVoterIDs) {
 		return fmt.Errorf("ADD-first source and final target do not match")
@@ -197,8 +210,10 @@ func CaptureV1Alpha2RepairHandoff(ctx context.Context, store *V1Alpha2StatusStor
 	if err := validateRepairHandoff(old.status, r.Plan, h); err != nil {
 		return V1Alpha2AdmissionSnapshot{}, "", err
 	}
-	if err := validateV1Alpha2RepairPod(ctx, store, old.status.ref, r.Plan); err != nil {
-		return V1Alpha2AdmissionSnapshot{}, "", err
+	if r.Plan.Sequence != V1Alpha2RepairLeave {
+		if err := validateV1Alpha2RepairPod(ctx, store, old.status.ref, r.Plan); err != nil {
+			return V1Alpha2AdmissionSnapshot{}, "", err
+		}
 	}
 	r.PreparedHandoff = &h
 	encoded, err := json.Marshal(r)
@@ -269,24 +284,55 @@ func validRepairText(s string, max int) bool {
 	return true
 }
 
-func validateV1Alpha2RepairPlan(s V1Alpha2StatusSnapshot, p V1Alpha2RepairPlan) error {
-	if p.Sequence != "" && p.Sequence != V1Alpha2RepairRemoveThenAdd && p.Sequence != V1Alpha2RepairAddThenRemove {
+func validateV1Alpha2RepairPlan(s V1Alpha2StatusSnapshot, p V1Alpha2RepairPlan, requireReducedTarget bool) error {
+	if p.Sequence != "" && p.Sequence != V1Alpha2RepairRemoveThenAdd && p.Sequence != V1Alpha2RepairAddThenRemove && p.Sequence != V1Alpha2RepairAdd && p.Sequence != V1Alpha2RepairLeave {
 		return fmt.Errorf("unsupported repair sequence")
 	}
-	id, err := types.ManagedNodeID(p.Replacement.PodUID)
-	u, urlErr := url.Parse(p.Replacement.PeerURL)
-	if err != nil || urlErr != nil || u.Scheme != "quic" || u.User != nil || u.Path != "" || u.RawQuery != "" || u.ForceQuery || u.Fragment != "" || net.ParseIP(u.Hostname()) == nil || net.ParseIP(u.Hostname()).IsUnspecified() {
-		return fmt.Errorf("invalid repair member endpoint")
-	}
-	port, err := strconv.Atoi(u.Port())
-	if err != nil || port < 1 || port > 65535 || !validRepairText(p.Replacement.PodName, 253) || !v1alpha2Name.MatchString(p.Replacement.PodName) || p.Replacement.NodeID != id || p.Replacement.PublicKey == (quepaxa.PublicKey{}) || !validRepairText(string(p.OldNodeID), 256) || !validRepairText(p.OldWALIdentity, 256) || p.OldNodeID == id {
-		return fmt.Errorf("invalid repair member identity")
+	if repairSequence(p) == V1Alpha2RepairLeave {
+		u, urlErr := url.Parse(p.Replacement.PeerURL)
+		if p.Replacement.NodeID != p.OldNodeID || p.Replacement.PodName != string(p.OldNodeID) || p.Replacement.PodUID != string(p.OldNodeID) || p.Replacement.PublicKey == (quepaxa.PublicKey{}) || urlErr != nil || u.Scheme != "quic" || u.User != nil || u.Path != "" || u.RawQuery != "" || u.ForceQuery || u.Fragment != "" || net.ParseIP(u.Hostname()) == nil || net.ParseIP(u.Hostname()).IsUnspecified() {
+			return fmt.Errorf("invalid leave member identity")
+		}
+		if port, err := strconv.Atoi(u.Port()); err != nil || port < 1 || port > 65535 {
+			return fmt.Errorf("invalid leave member endpoint")
+		}
+	} else {
+		id, err := types.ManagedNodeID(p.Replacement.PodUID)
+		u, urlErr := url.Parse(p.Replacement.PeerURL)
+		if err != nil || urlErr != nil || u.Scheme != "quic" || u.User != nil || u.Path != "" || u.RawQuery != "" || u.ForceQuery || u.Fragment != "" || net.ParseIP(u.Hostname()) == nil || net.ParseIP(u.Hostname()).IsUnspecified() {
+			return fmt.Errorf("invalid repair member endpoint")
+		}
+		port, err := strconv.Atoi(u.Port())
+		if err != nil || port < 1 || port > 65535 || !validRepairText(p.Replacement.PodName, 253) || !v1alpha2Name.MatchString(p.Replacement.PodName) || p.Replacement.NodeID != id || p.Replacement.PublicKey == (quepaxa.PublicKey{}) || p.OldNodeID == id {
+			return fmt.Errorf("invalid repair member identity")
+		}
 	}
 	if !validRepairText(p.OperationID, 256) || p.ClusterUID != s.ref.UID || p.Generation < 0 || !validRepairText(p.DeploymentUID, 256) || !validRepairText(p.StorageID, 256) || p.ExpectedConfigID == 0 || p.ExpectedConfigID > math.MaxInt64-2 || p.ExpectedAbortSlot > math.MaxInt64 {
 		return fmt.Errorf("invalid repair operation binding")
 	}
-	if !validInitDigest(p.BootstrapPlanDigest) || len(p.FinalVoterIDs) < 2 || len(p.FinalVoterIDs) > 64 || !slices.Contains(p.FinalVoterIDs, id) || slices.Contains(p.FinalVoterIDs, p.OldNodeID) {
+	if !validRepairText(string(p.OldNodeID), 256) || !validRepairText(p.OldWALIdentity, 256) || !validInitDigest(p.BootstrapPlanDigest) || len(p.FinalVoterIDs) < 2 || len(p.FinalVoterIDs) > 64 {
 		return fmt.Errorf("invalid repair final target")
+	}
+	switch repairSequence(p) {
+	case V1Alpha2RepairAdd:
+		if !slices.Contains(p.FinalVoterIDs, p.Replacement.NodeID) || !slices.Contains(p.FinalVoterIDs, p.OldNodeID) {
+			return fmt.Errorf("invalid repair final target")
+		}
+	case V1Alpha2RepairLeave:
+		if slices.Contains(p.FinalVoterIDs, p.OldNodeID) || len(p.FinalVoterIDs) < 3 {
+			return fmt.Errorf("invalid leave final target")
+		}
+		if requireReducedTarget {
+			var spec map[string]json.RawMessage
+			var target int
+			if json.Unmarshal(s.object["spec"], &spec) != nil || json.Unmarshal(spec["voterCount"], &target) != nil || target != len(p.FinalVoterIDs) {
+				return fmt.Errorf("leave final target differs from desired voter count")
+			}
+		}
+	default:
+		if !slices.Contains(p.FinalVoterIDs, p.Replacement.NodeID) || slices.Contains(p.FinalVoterIDs, p.OldNodeID) {
+			return fmt.Errorf("invalid repair final target")
+		}
 	}
 	for i, node := range p.FinalVoterIDs {
 		if !validRepairText(string(node), 256) || i > 0 && p.FinalVoterIDs[i-1] >= node {
@@ -311,6 +357,12 @@ func repairMatchesAuthority(p V1Alpha2RepairPlan, a V1Alpha2AuthorityView) bool 
 func validateV1Alpha2RepairCompletion(p V1Alpha2RepairPlan, c V1Alpha2RepairCompletion) bool {
 	if c.OperationID != p.OperationID || c.PlanDigest != p.Digest() || c.ExpectedConfigID != p.ExpectedConfigID || c.ExpectedAbortSlot != p.ExpectedAbortSlot || c.ConfigID == 0 || c.ConfigID > math.MaxInt64 || c.Slot <= p.ExpectedAbortSlot || c.Slot > math.MaxInt64 || !validInitDigest(c.Hash) {
 		return false
+	}
+	if repairSequence(p) == V1Alpha2RepairAdd {
+		return c.Kind == "Terminal" && c.ConfigID == p.ExpectedConfigID+1 && slices.Equal(c.FinalVoterIDs, p.FinalVoterIDs) || c.Kind == "Abort" && c.ConfigID >= p.ExpectedConfigID && len(c.FinalVoterIDs) == 0
+	}
+	if repairSequence(p) == V1Alpha2RepairLeave {
+		return c.Kind == "Terminal" && c.ConfigID == p.ExpectedConfigID+1 && slices.Equal(c.FinalVoterIDs, p.FinalVoterIDs) || c.Kind == "Abort" && c.ConfigID >= p.ExpectedConfigID && len(c.FinalVoterIDs) == 0
 	}
 	// ConfigID alone cannot demonstrate target completion. In particular the
 	// REMOVE-only intermediate target cannot reopen this logical repair.
@@ -344,7 +396,7 @@ func parseV1Alpha2Repair(s V1Alpha2StatusSnapshot) (*V1Alpha2RepairRecord, error
 		return nil, nil
 	}
 	var r V1Alpha2RepairRecord
-	if len(raw) > V1Alpha2RepairRecordLimit || decodeV1Alpha2(raw, &r) != nil || validateV1Alpha2RepairPlan(s, r.Plan) != nil {
+	if len(raw) > V1Alpha2RepairRecordLimit || decodeV1Alpha2(raw, &r) != nil || validateV1Alpha2RepairPlan(s, r.Plan, false) != nil {
 		return nil, fmt.Errorf("invalid repair record")
 	}
 	if r.PreparedHandoff != nil {
@@ -363,7 +415,7 @@ func parseV1Alpha2Repair(s V1Alpha2StatusSnapshot) (*V1Alpha2RepairRecord, error
 		if r.Completion != nil || !repairMatchesAuthority(r.Plan, s.authority) || hasV1Alpha2Transition(auth["transition"]) {
 			return nil, fmt.Errorf("repair overlaps changed authority or transition")
 		}
-	} else if (r.State != "Completed" && r.State != "Aborted") || r.Completion == nil || !validateV1Alpha2RepairCompletion(r.Plan, *r.Completion) || (r.State == "Completed") != (r.Completion.Kind == "Terminal") || (repairSequence(r.Plan) == V1Alpha2RepairAddThenRemove && r.Completion.Kind == "Terminal" && r.AddCompletion == nil) || (repairSequence(r.Plan) == V1Alpha2RepairAddThenRemove && r.Completion.Kind == "Abort" && r.AddCompletion != nil) {
+	} else if (r.State != "Completed" && r.State != "Aborted") || r.Completion == nil || !validateV1Alpha2RepairCompletion(r.Plan, *r.Completion) || (r.State == "Completed") != (r.Completion.Kind == "Terminal") || (repairSequence(r.Plan) == V1Alpha2RepairAddThenRemove && r.Completion.Kind == "Terminal" && r.AddCompletion == nil) || (repairSequence(r.Plan) == V1Alpha2RepairAddThenRemove && r.Completion.Kind == "Abort" && r.AddCompletion != nil) || (repairSequence(r.Plan) == V1Alpha2RepairAdd && (r.PreparedHandoff == nil || r.AddCompletion != nil)) {
 		return nil, fmt.Errorf("invalid repair terminal")
 	}
 	if r.Completion != nil && !validV1Alpha2RepairTerminalOrder(r.Plan, *r.Completion, r.AddCompletion) {
@@ -380,13 +432,13 @@ func BeginV1Alpha2Repair(ctx context.Context, store *V1Alpha2StatusStore, old V1
 	if err := validateV1Alpha2RepairExecutionProfile(old); err != nil {
 		return V1Alpha2AdmissionSnapshot{}, "", err
 	}
-	if plan.Sequence != V1Alpha2RepairAddThenRemove {
-		return V1Alpha2AdmissionSnapshot{}, "", fmt.Errorf("new append-only repair requires ADD-first sequence")
+	if plan.Sequence != V1Alpha2RepairAddThenRemove && plan.Sequence != V1Alpha2RepairAdd && plan.Sequence != V1Alpha2RepairLeave {
+		return V1Alpha2AdmissionSnapshot{}, "", fmt.Errorf("new append-only repair requires ADD-first or add sequence")
 	}
 	if old.status.store != store || old.Authority() != expected || !repairMatchesAuthority(plan, expected) || hasV1Alpha2Transition(old.transition) || old.SQLReservationsClosed() {
 		return V1Alpha2AdmissionSnapshot{}, "", fmt.Errorf("repair close preconditions do not match")
 	}
-	if err := validateV1Alpha2RepairPlan(old.status, plan); err != nil {
+	if err := validateV1Alpha2RepairPlan(old.status, plan, true); err != nil {
 		return V1Alpha2AdmissionSnapshot{}, "", err
 	}
 	if previous, ok := old.Repair(); ok {
@@ -398,8 +450,10 @@ func BeginV1Alpha2Repair(ctx context.Context, store *V1Alpha2StatusStore, old V1
 			return V1Alpha2AdmissionSnapshot{}, "", fmt.Errorf("repair operation regressed behind terminal")
 		}
 	}
-	if err := validateV1Alpha2RepairPod(ctx, store, old.status.ref, plan); err != nil {
-		return V1Alpha2AdmissionSnapshot{}, "", err
+	if plan.Sequence != V1Alpha2RepairLeave {
+		if err := validateV1Alpha2RepairPod(ctx, store, old.status.ref, plan); err != nil {
+			return V1Alpha2AdmissionSnapshot{}, "", err
+		}
 	}
 	return updateV1Alpha2AdmissionStatus(ctx, store, old, func(status, auth map[string]json.RawMessage) {
 		status["repair"], _ = json.Marshal(V1Alpha2RepairRecord{Plan: plan, State: "Closed"})
@@ -415,11 +469,11 @@ func FinishV1Alpha2Repair(ctx context.Context, store *V1Alpha2StatusStore, old V
 		return V1Alpha2AdmissionSnapshot{}, "", err
 	}
 	r, ok := old.Repair()
-	if old.status.store != store || old.Authority() != expected || !ok || !old.SQLReservationsClosed() || !repairMatchesAuthority(r.Plan, expected) || hasV1Alpha2Transition(old.transition) || !validateV1Alpha2RepairCompletion(r.Plan, completion) || repairSequence(r.Plan) == V1Alpha2RepairAddThenRemove && (completion.Kind == "Terminal" && r.AddCompletion == nil || completion.Kind == "Abort" && r.AddCompletion != nil) {
+	if old.status.store != store || old.Authority() != expected || !ok || !old.SQLReservationsClosed() || !repairMatchesAuthority(r.Plan, expected) || hasV1Alpha2Transition(old.transition) || !validateV1Alpha2RepairCompletion(r.Plan, completion) || repairSequence(r.Plan) == V1Alpha2RepairAddThenRemove && (completion.Kind == "Terminal" && r.AddCompletion == nil || completion.Kind == "Abort" && r.AddCompletion != nil) || repairSequence(r.Plan) == V1Alpha2RepairAdd && (r.PreparedHandoff == nil || r.AddCompletion != nil) {
 		return V1Alpha2AdmissionSnapshot{}, "", fmt.Errorf("repair completion preconditions do not match")
 	}
 	if !validV1Alpha2RepairTerminalOrder(r.Plan, completion, r.AddCompletion) {
-		return V1Alpha2AdmissionSnapshot{}, "", fmt.Errorf("final REMOVE terminal must follow ADD terminal")
+		return V1Alpha2AdmissionSnapshot{}, "", fmt.Errorf("verified terminal does not satisfy the repair sequence")
 	}
 	r.State = "Completed"
 	if completion.Kind == "Abort" {

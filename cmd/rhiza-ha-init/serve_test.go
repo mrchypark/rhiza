@@ -474,6 +474,8 @@ func TestManagedHandlerAuthenticationAndClosedRoutes(t *testing.T) {
 		{"/readyz", "", http.StatusUnauthorized}, {"/execute", "Bearer wrong", http.StatusUnauthorized},
 		{"/kv", "Bearer secret", http.StatusNotFound}, {"/graph", "Bearer secret", http.StatusNotFound},
 		{"/execute", "Bearer secret", http.StatusMethodNotAllowed},
+		{"/leave-voter", "", http.StatusUnauthorized}, {"/leave-voter", "Bearer wrong", http.StatusUnauthorized},
+		{"/leave-voter", "Bearer secret", http.StatusMethodNotAllowed},
 		{"/recover-pending", "", http.StatusUnauthorized},
 		{"/recover-pending", "Bearer wrong", http.StatusUnauthorized},
 		{"/recover-pending", "Bearer secret", http.StatusMethodNotAllowed},
@@ -493,6 +495,15 @@ func TestManagedHandlerAuthenticationAndClosedRoutes(t *testing.T) {
 		h.ServeHTTP(w, req)
 		if w.Code != http.StatusBadRequest {
 			t.Fatalf("invalid body status %d", w.Code)
+		}
+	}
+	for _, body := range []string{`{"node_id":"voter","unknown":true}`, `{} {}`, strings.Repeat(" ", (1<<20)+1)} {
+		req := httptest.NewRequest(http.MethodPost, "/leave-voter", strings.NewReader(body))
+		req.Header.Set("Authorization", "Bearer secret")
+		w := httptest.NewRecorder()
+		h.ServeHTTP(w, req)
+		if w.Code != http.StatusBadRequest {
+			t.Fatalf("invalid leave body status %d", w.Code)
 		}
 	}
 	for _, body := range []string{`{"request_id":"foreign"}`, `{"sql":"INSERT INTO app VALUES (1)"}`, `{} {}`, strings.Repeat(" ", (1<<20)+1)} {

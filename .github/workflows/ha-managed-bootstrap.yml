@@ -61,6 +61,8 @@ jobs:
           sh scripts/test-ha-managed-direct-host-chaos-test.sh
           sh scripts/test-ha-managed-cluster-chaos-diagnostics-test.sh
           sh scripts/test-ha-managed-bootstrap.sh --oracle-self-test
+          sh -n scripts/ha-managed-scale-qualification.sh
+          sh scripts/ha-managed-scale-qualification.sh --self-test
           sh -n scripts/ha-managed-bucket-setup
       - name: Real managed bootstrap
         env:
@@ -74,6 +76,61 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: ha-managed-bootstrap-${{ matrix.fixture }}-${{ matrix.provider }}-${{ github.run_id }}
+          path: ${{ runner.temp }}/ha-managed-bootstrap
+      - name: Remove owned YAML renderer
+        if: always()
+        shell: sh
+        run: |
+          set -eu
+          if [ -d "$RUNNER_TEMP/ha-managed-tools" ]; then
+            rm -f "$RUNNER_TEMP/ha-managed-tools/yq"
+            rmdir "$RUNNER_TEMP/ha-managed-tools"
+            test ! -e "$RUNNER_TEMP/ha-managed-tools"
+          fi
+
+  functional-qualification:
+    strategy:
+      fail-fast: false
+      matrix:
+        scenario: [scale-up, quorum]
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+      - name: Install kind
+        run: go install sigs.k8s.io/kind@v0.32.0
+      - uses: azure/setup-helm@v4
+        with:
+          version: v3.17.3
+      - name: Prepare pinned YAML renderer
+        shell: sh
+        run: |
+          set -eu
+          mkdir -p "$RUNNER_TEMP/ha-managed-tools"
+          curl --fail --silent --show-error --location --max-time 60 https://github.com/mikefarah/yq/releases/download/v4.45.1/yq_linux_amd64 -o "$RUNNER_TEMP/ha-managed-tools/yq"
+          printf '%s  %s\n' 654d2943ca1d3be2024089eb4f270f4070f491a0610481d128509b2834870049 "$RUNNER_TEMP/ha-managed-tools/yq" | sha256sum --check
+          chmod 0755 "$RUNNER_TEMP/ha-managed-tools/yq"
+          printf '%s\n' "$RUNNER_TEMP/ha-managed-tools" >> "$GITHUB_PATH"
+      - name: Functional harness self-test
+        run: |
+          sh -n scripts/ha-managed-scale-qualification.sh
+          sh scripts/ha-managed-scale-qualification.sh --self-test
+      - name: Real managed functional qualification
+        env:
+          RHIZA_MANAGED_BUCKET_SETUP: ./scripts/ha-managed-bucket-setup
+          RHIZA_MANAGED_TEST_DOCKERFILE: Dockerfile.operator
+          RHIZA_MANAGED_FIXTURE_CASE: internal
+          RHIZA_MANAGED_FIXTURE_PROVIDER: s3
+          RHIZA_MANAGED_FUNCTIONAL_SCENARIO: ${{ matrix.scenario }}
+        run: sh scripts/test-ha-managed-bootstrap.sh
+      - name: Preserve non-secret diagnostics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ha-managed-${{ matrix.scenario }}-${{ github.run_id }}
           path: ${{ runner.temp }}/ha-managed-bootstrap
       - name: Remove owned YAML renderer
         if: always()

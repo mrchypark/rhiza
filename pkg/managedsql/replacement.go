@@ -75,6 +75,12 @@ func (h *Host) ReplaceVoter(ctx context.Context, plan operator.V1Alpha2RepairPla
 	if err != nil {
 		return err
 	}
+	if plan.Sequence == operator.V1Alpha2RepairAdd {
+		return h.enrollVoter(ctx, a, plan)
+	}
+	if plan.Sequence == operator.V1Alpha2RepairLeave {
+		return fmt.Errorf("managed leave must use the explicit leave coordinator")
+	}
 	return h.replaceVoterAddFirst(ctx, a, plan)
 }
 
@@ -82,7 +88,7 @@ func validateRepairSequenceProfile(sequence operator.V1Alpha2RepairSequence, app
 	if !sqlpolicy.IsManagedAppendOnlyApplicationProtocol(applicationProtocol) {
 		return fmt.Errorf("managed append-only application protocol required; profiles 7/8 are retired")
 	}
-	if sequence != operator.V1Alpha2RepairAddThenRemove {
+	if sequence != operator.V1Alpha2RepairAddThenRemove && sequence != operator.V1Alpha2RepairAdd && sequence != operator.V1Alpha2RepairLeave {
 		return fmt.Errorf("append-only replacement requires ADD-first")
 	}
 	return nil
@@ -242,6 +248,143 @@ func (h *Host) replaceVoterAddFirst(ctx context.Context, a operator.V1Alpha2Admi
 	return nil
 }
 
+// enrollVoter adds exactly one learner and keeps every current voter. The
+// admitted learner proof is verified by QuePaxa before AddRepairVoter can
+// commit the new configuration; status completion requires the retained
+// terminal and target configuration as well.
+func (h *Host) enrollVoter(ctx context.Context, a operator.V1Alpha2AdmissionSnapshot, plan operator.V1Alpha2RepairPlan) error {
+	existing, exists := a.Repair()
+	if exists && !reflect.DeepEqual(existing.Plan, plan) && existing.State == "Closed" {
+		return fmt.Errorf("another exact membership operation is already closed")
+	}
+	if exists && reflect.DeepEqual(existing.Plan, plan) && existing.State == "Completed" {
+		return h.verifyCompletedEnrollment(ctx, existing)
+	}
+	if exists && reflect.DeepEqual(existing.Plan, plan) && existing.State != "Closed" {
+		return fmt.Errorf("add-only enrollment is not resumable")
+	}
+	if !a.SQLReservationsClosed() {
+		if err := h.validateRepairStartState(ctx, plan); err != nil {
+			return err
+		}
+		closed, observation, err := operator.BeginV1Alpha2Repair(ctx, h.cfg.Store, a, a.Authority(), plan)
+		if err != nil {
+			return err
+		}
+		if observation != operator.V1Alpha2CASApplied || !closed.SQLReservationsClosed() {
+			return fmt.Errorf("enrollment close CAS outcome %s; refusing to claim ownership", observation)
+		}
+		a = closed
+	}
+	r, ok := a.Repair()
+	if !ok || r.State != "Closed" || !reflect.DeepEqual(r.Plan, plan) {
+		return fmt.Errorf("exact closed add-only enrollment required")
+	}
+	if r.PreparedHandoff == nil {
+		if _, err := h.CaptureRepairHandoff(ctx, plan.OperationID); err != nil {
+			return repairResumeFailure(repairResumeVerification, fmt.Errorf("capture fixed enrollment source: %w", err))
+		}
+		latest, err := h.live(ctx)
+		if err != nil {
+			return err
+		}
+		a = latest
+		r, ok = a.Repair()
+		if !ok || r.State != "Closed" || !reflect.DeepEqual(r.Plan, plan) || r.PreparedHandoff == nil {
+			return fmt.Errorf("enrollment source was not retained in the exact operation")
+		}
+	}
+	handoff := *r.PreparedHandoff
+	if handoff.PreparedConfig == nil || uint64(handoff.PreparedConfig.ConfigID) != plan.ExpectedConfigID {
+		return fmt.Errorf("exact enrollment prepared source required")
+	}
+	registration, err := h.node.ManagedRepairSnapshot(ctx, plan.Replacement.NodeID, plan.Replacement.PublicKey)
+	if err != nil {
+		return err
+	}
+	if registration.LearnerWALIdentity == "" {
+		registration.LearnerWALIdentity, err = h.waitRegisteredRepairLearner(ctx, plan.Replacement.NodeID, plan.Replacement.PublicKey)
+		if err != nil {
+			return repairResumeFailure(repairResumeRegistration, err)
+		}
+	}
+	request, err := managedRepairAddRequest(r, &handoff, registration.LearnerWALIdentity)
+	if err != nil {
+		return err
+	}
+	if r.Completion == nil {
+		switch registration.Current.ConfigID {
+		case handoff.PreparedConfig.ConfigID:
+			if err := h.AddRepairVoter(ctx, plan.OperationID, registration.LearnerWALIdentity); err != nil {
+				return repairResumeFailure(repairResumeMembership, fmt.Errorf("add enrolled learner: %w", err))
+			}
+		case handoff.PreparedConfig.ConfigID + 1:
+		default:
+			return fmt.Errorf("add-only enrollment advanced to an unexpected configuration")
+		}
+		proof, err := h.node.VerifyManagedRepairCompletion(ctx, request)
+		if err != nil {
+			return repairResumeFailure(repairResumeVerification, err)
+		}
+		completion, err := managedRepairAdditionCompletion(plan, handoff, proof)
+		if err != nil {
+			return repairResumeFailure(repairResumeVerification, err)
+		}
+		latest, err := h.live(ctx)
+		if err != nil {
+			return repairResumeFailure(repairResumeCompletion, err)
+		}
+		latestRepair, ok := latest.Repair()
+		if !ok || latestRepair.State != "Closed" || latestRepair.Completion != nil || !reflect.DeepEqual(latestRepair.Plan, plan) || !reflect.DeepEqual(latestRepair.PreparedHandoff, &handoff) {
+			return fmt.Errorf("enrollment intent changed before completion CAS")
+		}
+		finished, observation, err := operator.FinishV1Alpha2Repair(ctx, h.cfg.Store, latest, latest.Authority(), completion)
+		if err != nil {
+			return repairResumeFailure(repairResumeCompletion, err)
+		}
+		if observation != operator.V1Alpha2CASApplied {
+			return fmt.Errorf("enrollment completion CAS outcome %s; refusing to report completion", observation)
+		}
+		r, ok = finished.Repair()
+		if !ok || r.State != "Completed" || r.Completion == nil || !reflect.DeepEqual(*r.Completion, completion) {
+			return fmt.Errorf("enrollment completion readback mismatch")
+		}
+		return nil
+	}
+	proof, err := h.node.VerifyManagedRepairCompletion(ctx, request)
+	if err != nil {
+		return repairResumeFailure(repairResumeVerification, err)
+	}
+	completion, err := managedRepairAdditionCompletion(plan, handoff, proof)
+	if err != nil || !reflect.DeepEqual(completion, *r.Completion) {
+		return errors.Join(fmt.Errorf("enrollment completion differs from actual retained terminal"), err)
+	}
+	return nil
+}
+
+func (h *Host) verifyCompletedEnrollment(ctx context.Context, r operator.V1Alpha2RepairRecord) error {
+	if r.Plan.Sequence != operator.V1Alpha2RepairAdd || r.PreparedHandoff == nil || r.Completion == nil || r.Completion.Kind != "Terminal" {
+		return fmt.Errorf("completed enrollment lacks its prepared source or terminal")
+	}
+	snapshot, err := h.node.ManagedRepairSnapshot(ctx, r.Plan.Replacement.NodeID, r.Plan.Replacement.PublicKey)
+	if err != nil || snapshot.LearnerWALIdentity == "" {
+		return errors.Join(fmt.Errorf("completed enrollment registration unavailable"), err)
+	}
+	request, err := managedRepairAddRequest(r, r.PreparedHandoff, snapshot.LearnerWALIdentity)
+	if err != nil {
+		return err
+	}
+	proof, err := h.node.VerifyManagedRepairCompletion(ctx, request)
+	if err != nil {
+		return err
+	}
+	completion, err := managedRepairAdditionCompletion(r.Plan, *r.PreparedHandoff, proof)
+	if err != nil || !reflect.DeepEqual(completion, *r.Completion) {
+		return errors.Join(fmt.Errorf("completed enrollment differs from actual retained terminal"), err)
+	}
+	return nil
+}
+
 func (h *Host) verifyCompletedAddFirstRepair(ctx context.Context, r operator.V1Alpha2RepairRecord) error {
 	if r.Plan.Sequence != operator.V1Alpha2RepairAddThenRemove || r.PreparedHandoff == nil || r.AddCompletion == nil || r.Completion == nil || r.Completion.Kind != "Terminal" {
 		return fmt.Errorf("completed ADD-first repair lacks exact ADD/REMOVE proofs")
@@ -303,7 +446,9 @@ func (h *Host) validateRepairStartState(ctx context.Context, plan operator.V1Alp
 		if member.ID == plan.OldNodeID {
 			oldFound = true
 			oldMember = member
-			continue
+			if plan.Sequence != operator.V1Alpha2RepairAdd {
+				continue
+			}
 		}
 		ids = append(ids, types.NodeID(member.ID))
 	}
@@ -348,14 +493,14 @@ func managedRepairAddRequest(record operator.V1Alpha2RepairRecord, handoff *oper
 	member := quepaxa.Member{ID: record.Plan.Replacement.NodeID, PublicKey: record.Plan.Replacement.PublicKey, PeerURL: record.Plan.Replacement.PeerURL, WALIdentity: identity}
 	expectedConfig := handoff.Survivors.ConfigID
 	expectedAbort := quepaxa.Slot(0)
-	if record.Plan.Sequence == operator.V1Alpha2RepairAddThenRemove {
+	if record.Plan.Sequence == operator.V1Alpha2RepairAddThenRemove || record.Plan.Sequence == operator.V1Alpha2RepairAdd {
 		if handoff.PreparedConfig == nil || uint64(handoff.PreparedConfig.ConfigID) != record.Plan.ExpectedConfigID {
 			return node.ManagedMembershipRequest{}, fmt.Errorf("exact ADD-first prepared source required")
 		}
 		expectedConfig = handoff.PreparedConfig.ConfigID
 		expectedAbort = quepaxa.Slot(record.Plan.ExpectedAbortSlot)
 	}
-	return node.ManagedMembershipRequest{RepairOperationID: record.Plan.OperationID, Action: node.ManagedMembershipAdd, ExpectedConfigID: expectedConfig, ExpectedAbortSlot: expectedAbort, OldNodeID: record.Plan.OldNodeID, OldWALIdentity: record.Plan.OldWALIdentity, Addition: &member, HandoffHeadHash: handoff.HeadHash}, nil
+	return node.ManagedMembershipRequest{RepairOperationID: record.Plan.OperationID, Action: node.ManagedMembershipAdd, AddOnly: record.Plan.Sequence == operator.V1Alpha2RepairAdd, ExpectedConfigID: expectedConfig, ExpectedAbortSlot: expectedAbort, OldNodeID: record.Plan.OldNodeID, OldWALIdentity: record.Plan.OldWALIdentity, Addition: &member, HandoffHeadHash: handoff.HeadHash}, nil
 }
 
 func managedRepairAdditionCompletion(plan operator.V1Alpha2RepairPlan, handoff operator.V1Alpha2RepairHandoff, proof node.ManagedRepairCompletion) (operator.V1Alpha2RepairCompletion, error) {

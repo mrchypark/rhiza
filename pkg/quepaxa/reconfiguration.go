@@ -7,6 +7,11 @@ import (
 	"fmt"
 )
 
+// One membership round spans sixteen slots. Bound transient ordinary-value
+// interruptions to that existing geometry so a busy publisher cannot hold the
+// local proposal pipeline indefinitely.
+const maxReconfigurationStartConflicts = 16
+
 // BeginReconfiguration commits a freeze under the current voter quorum. The
 // next fifteen slots are drained under that same configuration; FinishReconfiguration
 // then commits the terminal control record and activates target at T+1.
@@ -30,7 +35,11 @@ func (c *Core) beginReconfiguration(ctx context.Context, target Cluster, expecte
 		return 0, err
 	}
 	defer c.releasePipeline()
+	ordinaryConflicts := 0
 	for {
+		if err := ctx.Err(); err != nil {
+			return 0, err
+		}
 		c.mu.RLock()
 		if c.reconfiguration != nil {
 			c.mu.RUnlock()
@@ -99,10 +108,36 @@ func (c *Core) beginReconfiguration(ctx context.Context, target Cluster, expecte
 			return 0, err
 		}
 		if decision.Proposal.Hash != reconfigurationHash(value) {
-			return 0, fmt.Errorf("freeze slot was decided by another value")
+			// A concurrent application value or checkpoint seal may win the
+			// proposed freeze slot. It is already certified and installed above;
+			// discard this attempted control and construct a fresh freeze at the
+			// next slot after re-reading the exact configuration, abort revision,
+			// target, prefix, and schedule. Never recast a competing membership
+			// or leader control.
+			if !ordinaryCompetingValue(decision.Proposal.Value) {
+				return 0, fmt.Errorf("freeze slot was decided by another control value")
+			}
+			ordinaryConflicts++
+			if ordinaryConflicts >= maxReconfigurationStartConflicts {
+				return 0, fmt.Errorf("reconfiguration start exceeded %d certified competing slots", maxReconfigurationStartConflicts)
+			}
+			if err := ctx.Err(); err != nil {
+				return 0, err
+			}
+			continue
 		}
 		return freeze, nil
 	}
+}
+
+func ordinaryCompetingValue(value []byte) bool {
+	if _, control, err := decodeReconfiguration(value); err != nil || control {
+		return false
+	}
+	if _, schedule, err := DecodeLeaderSchedule(value); err != nil || schedule {
+		return false
+	}
+	return true
 }
 
 // abortRevisionLocked returns zero only when no abort revision exists. A
@@ -327,6 +362,15 @@ func (c *Core) ValidateReconfigurationTarget(target Cluster) error {
 		retired[id] = struct{}{}
 	}
 	return validateReconfigurationTarget(current, target, retired)
+}
+
+// IsRetired reports an identity already retired by a certified configuration
+// transition. It is an admission check, not proof that a process has stopped.
+func (c *Core) IsRetired(id NodeID) bool {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	_, retired := c.retiredIDs[id]
+	return retired
 }
 
 func (c *Core) validateReconfigurationSlotsLocked(freeze, terminal Slot) error {

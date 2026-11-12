@@ -396,6 +396,42 @@ func TestBoundTransportSyncRoutesThroughCurrentConfiguration(t *testing.T) {
 	}
 }
 
+func TestFrozenTargetSyncRoutesToNewVoter(t *testing.T) {
+	retained := testMember("cluster", "b", "b-token")
+	newVoter := testMember("cluster", "d", "d-token")
+	target := quepaxa.Cluster{ConfigID: 2, Members: []quepaxa.Member{retained, newVoter}}
+	wal, err := qlog.Open(t.TempDir() + "/qlog")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer wal.Close()
+	core, err := quepaxa.New(quepaxa.Config{NodeID: "d", Cluster: target, WAL: wal, Transport: unavailableTransport{}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	server := NewServer(core, nil, "cluster", true, nil)
+	defer server.Close()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	peer, err := StartPeerServer(ctx, "127.0.0.1:0", server, target.Members, "d-token", "admin")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer peer.Close()
+	target.Members[1].PeerURL = "quic://" + peer.Addr()
+
+	old := quepaxa.Cluster{ConfigID: 1, Members: []quepaxa.Member{retained}}
+	transport := NewTransport("cluster", "b", &old, "b-token")
+	defer transport.Close()
+	page, _, err := transport.FetchFrozenTargetDecisions(ctx, "d", 1, 1, target)
+	if err != nil || len(page) != 0 {
+		t.Fatalf("new-voter target route page=%d error=%v", len(page), err)
+	}
+	if _, _, err := transport.FetchFrozenTargetDecisions(ctx, "a", 1, 1, target); err == nil || !strings.Contains(err.Error(), "not a retained member") {
+		t.Fatalf("accepted source outside frozen target: %v", err)
+	}
+}
+
 func TestBoundTransportCloseDoesNotCreateNewPools(t *testing.T) {
 	config := quepaxa.Cluster{ConfigID: 1, Members: []quepaxa.Member{testMember("cluster", "n1", "token")}}
 	transport := NewTransport("cluster", "n1", &config, "token")

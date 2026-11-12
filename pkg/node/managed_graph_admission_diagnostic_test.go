@@ -14,9 +14,7 @@ func TestManagedGraphAdmissionDiagnosticRecoversRemoteControlAtExactSlot(t *test
 	defer cancel()
 
 	_ = fixture.startHeldControl(ctx)
-	if fixture.node.core.Tip() != 8 || fixture.node.core.RecorderTip() != 9 {
-		t.Fatalf("fixture did not hold the exact next slot: certified=%d recorded=%d", fixture.node.core.Tip(), fixture.node.core.RecorderTip())
-	}
+	fixture.awaitPendingControl(t)
 	binding := fixture.node.internalApplication.Load()
 	if binding == nil {
 		t.Fatal("fixture has no installed application binding")

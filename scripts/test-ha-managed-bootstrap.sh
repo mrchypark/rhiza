@@ -19,7 +19,7 @@ if [ "${1-}" = --install-mode-self-test ]; then
   exit 0
 fi
 cleanup_managed_private() {
-  rm -f "$private/runtime.json" "$private/kubeconfig" "$private/curl.conf" "$private/request.body" "$private/admin.token" "$private/runtime-before.json" "$private/runtime-after.json" "$private/chaos-chart.yaml" "$private/chaos-render.jsonl" "$private/chaos-failure.json" "$private/gcs-emulator.json" "$private/managed-install.jsonl" || return 1
+  rm -f "$private/runtime.json" "$private/kubeconfig" "$private/curl.conf" "$private/request.body" "$private/admin.token" "$private/runtime-before.json" "$private/runtime-after.json" "$private/chaos-chart.yaml" "$private/chaos-render.jsonl" "$private/chaos-failure.json" "$private/gcs-emulator.json" "$private/managed-install.jsonl" "$private/functional-load.sh" "$private/functional-load-job.json" "$private/functional-stage" "$private/functional-probe.body" "$private/functional-readback.body" || return 1
   rmdir "$private"
 }
 managed_private_cleanup_self_test() (
@@ -31,6 +31,12 @@ managed_private_cleanup_self_test() (
   generated=$(sed -n 's/.*> "\$private\/\(managed-install.jsonl\)".*/\1/p' scripts/ha-managed-bootstrap-fixture.sh)
   [ "$generated" = managed-install.jsonl ] || exit 1
   : > "$private/$generated"
+  . scripts/ha-managed-scale-qualification.sh
+  managed_functional_write_load_script "$private/functional-load.sh"
+  managed_functional_load_job test-image > "$private/functional-load-job.json"
+  for functional_private in functional-stage functional-probe.body functional-readback.body; do
+    : > "$private/$functional_private"
+  done
   cleanup_managed_private || exit 1
   [ ! -e "$private" ] || exit 1
   mkdir "$private"
@@ -146,6 +152,11 @@ if [ "${1-}" = --pod-fault-proof-self-test ]; then
   exit 0
 fi
 published_install_only=${RHIZA_MANAGED_PUBLISHED_INSTALL_ONLY-false}
+functional_scenario=${RHIZA_MANAGED_FUNCTIONAL_SCENARIO-}
+case "$functional_scenario" in
+  ''|scale-up|quorum) ;;
+  *) echo 'invalid RHIZA_MANAGED_FUNCTIONAL_SCENARIO' >&2; exit 1 ;;
+esac
 managed_install_mode_valid "$published_install_only" "${RHIZA_MANAGED_FIXTURE_CASE-internal}"
 [ "${GITHUB_ACTIONS-}" = true ] || { echo 'GitHub Actions only' >&2; exit 1; }
 : "${RUNNER_TEMP:?}" "${GITHUB_SHA:?}" "${GITHUB_RUN_ID:?}" "${GITHUB_RUN_ATTEMPT:?}"
@@ -197,10 +208,10 @@ kind_runtime_before() {
   k -n "$namespace" get pod "$1" -o json > "$logs/$3-runtime-before.json"
   jq -e --arg uid "$2" '.metadata.uid==$uid and .metadata.deletionTimestamp==null' "$logs/$3-runtime-before.json" >/dev/null
   runtime_node=$(jq -er '.spec.nodeName' "$logs/$3-runtime-before.json")
-  runtime_old=$(jq -er '.status.containerStatuses[]|select(.name=="sql")|.containerID|select(test("^containerd://[a-f0-9]{64}$"))|sub("^containerd://";"")' "$logs/$3-runtime-before.json")
+  runtime_old=$(jq -er --arg container "${4-sql}" '.status.containerStatuses[]|select(.name==$container)|.containerID|select(test("^containerd://[a-f0-9]{64}$"))|sub("^containerd://";"")' "$logs/$3-runtime-before.json")
   kind_node_guard
   docker exec "$runtime_node" crictl --runtime-endpoint unix:///run/containerd/containerd.sock ps -a -o json > "$private/runtime-before.json"
-  jq -e --arg id "$runtime_old" --arg uid "$2" 'any(.containers[]; .id==$id and .state=="CONTAINER_RUNNING" and .labels["io.kubernetes.pod.uid"]==$uid and .labels["io.kubernetes.container.name"]=="sql")' "$private/runtime-before.json" >/dev/null
+  jq -e --arg id "$runtime_old" --arg uid "$2" --arg container "${4-sql}" 'any(.containers[]; .id==$id and .state=="CONTAINER_RUNNING" and .labels["io.kubernetes.pod.uid"]==$uid and .labels["io.kubernetes.container.name"]==$container)' "$private/runtime-before.json" >/dev/null
   jq --arg uid "$2" '{containers:[.containers[]|select(.labels["io.kubernetes.pod.uid"]==$uid)|{id,state,labels:{"io.kubernetes.pod.uid":.labels["io.kubernetes.pod.uid"],"io.kubernetes.container.name":.labels["io.kubernetes.container.name"]}}]}' "$private/runtime-before.json" > "$logs/$3-cri-before.json"
 }
 kind_runtime_after() {
@@ -303,6 +314,9 @@ cleanup() {
       k -n "$control" logs -l "app.kubernetes.io/component=$chaos_component" --all-containers --previous --tail=200 --limit-bytes=65536 > "$logs/$chaos_component-previous.log" 2>&1 || :
     done
     fi
+    if [ -n "$functional_scenario" ] && command -v managed_functional_capture >/dev/null 2>&1; then
+      managed_functional_capture || :
+    fi
     capture_floci
     capture_bootstrap_logs
     k -n "$namespace" get pods,deployments,replicasets,rhizaclusters,jobs,services,endpoints -o json > "$logs/final-state.json" 2>&1 || :
@@ -358,4 +372,7 @@ managed_container_fault() {
   managed_chaos_verified=1
 }
 . scripts/ha-managed-bootstrap-fixture.sh
+if [ -n "$functional_scenario" ]; then
+  . scripts/ha-managed-scale-qualification.sh
+fi
 managed_fixture

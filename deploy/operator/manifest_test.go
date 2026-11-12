@@ -118,7 +118,7 @@ func TestHAContractSchemas(t *testing.T) {
 			for _, raw := range rules {
 				foundRules[raw.(map[string]any)["rule"].(string)] = true
 			}
-			for _, rule := range []string{"self.voterCount == oldSelf.voterCount"} {
+			for _, rule := range []string{"self.voterCount >= oldSelf.voterCount - 1"} {
 				if !foundRules[rule] {
 					t.Fatalf("missing cluster transition rule %q", rule)
 				}
@@ -241,6 +241,7 @@ func TestOperatorRoleCoversControllerWrites(t *testing.T) {
 		"secrets":                {"get", "create", "delete"},
 		"configmaps":             {"get"},
 		"services":               {"get", "create"},
+		"deployments":            {"get", "create", "update"},
 		"rhizaclusters":          {"get", "list"},
 		"rhizaclusters/status":   {"get", "update"},
 		"rhizarecoveries":        {"get", "list", "create", "update"},

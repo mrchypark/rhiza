@@ -101,7 +101,13 @@ discovers candidates and coordinates ADD-first healthy-quorum repair; the
 engine checks certified membership and restores/replays verified history.
 This does not require a separate fencer for normal quorum membership changes.
 The current initializer does not create peer/client Services or set a
-Deployment `Recreate` strategy, and `voterCount` updates are unsupported.
+Deployment `Recreate` strategy. Managed scale-up and staged leave are explicit:
+leave lowers `voterCount` by one (minimum 3), scales down one replica, verifies
+the actual removed Pod ID, calls authenticated private `POST /leave-voter` from a
+surviving Host, and waits for the certified exact target plus live write/readback.
+Pod disappearance is not leave; removed IDs cannot re-enroll, and leave makes no
+storage-completion or DR claim. Existing direct embedded membership APIs are
+unchanged.
 Applications outside the reference host must integrate the corresponding
 startup and repair contracts; the operator is not a generic application adapter.
 

@@ -43,6 +43,11 @@ const checkpointPrepareTimeout = 5 * time.Minute
 var errPeerRejected = errors.New("peer rejected request")
 var errTransportClosed = errors.New("peer transport is closed")
 
+type peerConfigurationLagError struct{}
+
+func (peerConfigurationLagError) Error() string          { return "peer configuration lags certified request" }
+func (peerConfigurationLagError) ConfigurationLag() bool { return true }
+
 type peerConnection struct {
 	mu     sync.Mutex
 	gate   chan struct{}
@@ -563,6 +568,11 @@ func (t *Transport) callContext(ctx context.Context, to quepaxa.NodeID, request 
 			return nil, quepaxa.ErrCompacted
 		case peerErrorRetryable:
 			return nil, err
+		case peerErrorConfigurationLag:
+			if request.Operation == peerfb.OperationReadIndex {
+				return nil, peerConfigurationLagError{}
+			}
+			return nil, fmt.Errorf("%w: %v", errPeerRejected, err)
 		}
 	}
 	if err != nil {
@@ -742,6 +752,27 @@ func (t *Transport) FetchDecisions(ctx context.Context, source quepaxa.NodeID, f
 		return DecisionsResponse{}, fmt.Errorf("catch-up source identity mismatch")
 	}
 	return result, nil
+}
+
+// FetchFrozenTargetDecisions routes a certified Sync request through the exact
+// frozen target. The server still authenticates the stale retained sender and
+// the local Core validates every returned decision and terminal certificate.
+func (t *Transport) FetchFrozenTargetDecisions(ctx context.Context, source quepaxa.NodeID, from quepaxa.Slot, limit int, target quepaxa.Cluster) ([]quepaxa.DecidedValue, quepaxa.Slot, error) {
+	if _, ok := target.MemberSet()[source]; !ok {
+		return nil, 0, fmt.Errorf("frozen target source is not a retained member")
+	}
+	peer, err := t.transportFor(target)
+	if err != nil {
+		return nil, 0, err
+	}
+	result, err := peer.FetchDecisions(ctx, source, from, limit)
+	if err != nil {
+		return nil, 0, err
+	}
+	if result.ClusterID != t.clusterID || result.ProposerID != source || result.ConfigID != target.ConfigID {
+		return nil, 0, fmt.Errorf("frozen target recovery source identity mismatch")
+	}
+	return result.Decisions, result.Tip, nil
 }
 
 func (t *Transport) SendRecord(ctx context.Context, to quepaxa.NodeID, request quepaxa.RecordRequest) (quepaxa.Summary, error) {

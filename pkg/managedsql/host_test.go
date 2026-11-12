@@ -55,6 +55,7 @@ type sqlWireControl struct {
 	putReadGateBytes        int
 	putReadErrors           chan error
 	putReadFailure          func(*http.Request, error)
+	ownedClose              atomic.Int64
 	// Evaluated before body reads/object-map lock. The owner must fail its
 	// test on predicate observation errors rather than silently passing them.
 	putGate func(context.Context, string) bool
@@ -93,6 +94,49 @@ func (l *sqlWireCloseLifecycle) observePUTFailures(t *testing.T, fixture *sqlSta
 			default:
 			}
 		}
+	}
+}
+
+func expectedOwnedClosePUTReadFailure(control *sqlWireControl, r *http.Request, err error) bool {
+	prefix := "/bucket/" + control.finalPrefix + "/"
+	return control.ownedClose.Load() > 0 && r.Method == http.MethodPut && errors.Is(r.Context().Err(), context.Canceled) && errors.Is(err, io.ErrUnexpectedEOF) && strings.HasPrefix(r.URL.Path, prefix) && len(r.URL.Path) > len(prefix)
+}
+
+func TestOwnedClosePUTReadFailureClassification(t *testing.T) {
+	control := &sqlWireControl{finalPrefix: "owned"}
+	request := func(method, path string, canceled bool) *http.Request {
+		r := httptest.NewRequest(method, "http://fixture"+path, strings.NewReader("partial"))
+		if canceled {
+			ctx, cancel := context.WithCancel(r.Context())
+			cancel()
+			r = r.WithContext(ctx)
+		}
+		return r
+	}
+	path := "/bucket/owned/checkpoint/CURRENT"
+	control.ownedClose.Store(1)
+	if !expectedOwnedClosePUTReadFailure(control, request(http.MethodPut, path, true), io.ErrUnexpectedEOF) {
+		t.Fatal("owned close cancellation was not recognized")
+	}
+	for _, test := range []struct {
+		name    string
+		request *http.Request
+		err     error
+	}{
+		{"outside owned namespace", request(http.MethodPut, "/bucket/other/checkpoint/CURRENT", true), io.ErrUnexpectedEOF},
+		{"non-canceled truncation", request(http.MethodPut, path, false), io.ErrUnexpectedEOF},
+		{"other read error", request(http.MethodPut, path, true), io.EOF},
+		{"wrong method", request(http.MethodGet, path, true), io.ErrUnexpectedEOF},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			if expectedOwnedClosePUTReadFailure(control, test.request, test.err) {
+				t.Fatal("unexpected PUT read failure was masked")
+			}
+		})
+	}
+	control.ownedClose.Store(0)
+	if expectedOwnedClosePUTReadFailure(control, request(http.MethodPut, path, true), io.ErrUnexpectedEOF) {
+		t.Fatal("canceled truncation without an owned close was masked")
 	}
 }
 
@@ -221,6 +265,12 @@ func sqlWireStore(t *testing.T) (*httptest.Server, *sqlWireControl) {
 				if control.putReadFailure != nil {
 					control.putReadFailure(r, err)
 					w.WriteHeader(http.StatusBadRequest)
+					return
+				}
+				if expectedOwnedClosePUTReadFailure(control, r, err) {
+					// The body was never copied into objects; only a complete
+					// ReadAll may commit it.
+					w.WriteHeader(http.StatusRequestTimeout)
 					return
 				}
 				if control.putReadErrors != nil {
@@ -400,6 +450,8 @@ func (f *sqlStatusFixture) open(ctx context.Context, cfg Config) (*Host, error) 
 }
 
 func (f *sqlStatusFixture) closeHost(host *Host) error {
+	f.source.ownedClose.Add(1)
+	defer f.source.ownedClose.Add(-1)
 	if f.closeLifecycle != nil {
 		f.closeLifecycle.closing.Store(true)
 	}
@@ -465,7 +517,15 @@ func sqlCluster(t *testing.T) ([]Config, *sqlStatusFixture) {
 }
 
 func sqlClusterForProtocol(t *testing.T, protocol string) ([]Config, *sqlStatusFixture) {
+	return sqlClusterForProtocolVoters(t, protocol, 3)
+}
+
+func sqlClusterForProtocolVoters(t *testing.T, protocol string, voterCount int, reconfiguration ...bool) ([]Config, *sqlStatusFixture) {
 	t.Helper()
+	if len(reconfiguration) > 1 {
+		t.Fatal("one reconfiguration selection required")
+	}
+	enableReconfiguration := len(reconfiguration) == 1 && reconfiguration[0]
 	format := EvidenceFormat
 	if protocol != "" {
 		format = protocol
@@ -474,8 +534,8 @@ func sqlClusterForProtocol(t *testing.T, protocol string) ([]Config, *sqlStatusF
 		t.Fatal(err)
 	}
 	s3, sourceControl := sqlWireStore(t)
-	configs := make([]Config, 3)
-	members := make([]quepaxa.Member, 3)
+	configs := make([]Config, voterCount)
+	members := make([]quepaxa.Member, voterCount)
 	clusterID, err := types.ManagedClusterID("uid", 0)
 	if err != nil {
 		t.Fatal(err)
@@ -494,20 +554,21 @@ func sqlClusterForProtocol(t *testing.T, protocol string) ([]Config, *sqlStatusF
 		addr := f.reservePeer(t, id)
 		token := fmt.Sprintf("peer-%d", i)
 		members[i] = quepaxa.Member{ID: id, PeerURL: "quic://" + addr, PublicKey: quepaxa.PublicKey(network.PeerPublicKey(clusterID, id, token))}
-		configs[i].Runtime = RuntimeConfig{NodeID: id, ClusterID: clusterID, ObjStorePrefix: namespace.ConfigPrefix, DataDir: t.TempDir(), PeerAddr: addr, PeerToken: token, AdminToken: "admin", ObjStoreProvider: "s3", ObjStoreEndpoint: strings.TrimPrefix(s3.URL, "http://"), ObjStoreInsecure: true, ObjStoreBucket: "bucket", ObjStoreRegion: "us-east-1", ObjStoreAccessKey: "test", ObjStoreSecretKey: "test", ObjStoreDurability: types.ObjectStoreDurabilityBeforeAck}
+		configs[i].Runtime = RuntimeConfig{NodeID: id, ClusterID: clusterID, ObjStorePrefix: namespace.ConfigPrefix, DataDir: t.TempDir(), PeerAddr: addr, PeerToken: token, AdminToken: "admin", ObjStoreProvider: "s3", ObjStoreEndpoint: strings.TrimPrefix(s3.URL, "http://"), ObjStoreInsecure: true, ObjStoreBucket: "bucket", ObjStoreRegion: "us-east-1", ObjStoreAccessKey: "test", ObjStoreSecretKey: "test", ObjStoreDurability: types.ObjectStoreDurabilityBeforeAck, EnableReconfiguration: enableReconfiguration}
 	}
 	for i := range configs {
 		configs[i].Runtime.Members = members
 	}
 	_ = json.Unmarshal([]byte(`{"apiVersion":"rhiza.mrchypark.dev/v1alpha2","kind":"RhizaCluster","metadata":{"name":"cluster","namespace":"ns","uid":"uid","resourceVersion":"1"},"spec":{"logicalID":"logical","genesisIntent":"Create","voterCount":3,"workload":{"podTemplate":{"spec":{"containers":[{"name":"app","image":"image"}]}}}},"status":{}}`), &f.obj)
-	if protocol != "" {
-		var spec map[string]json.RawMessage
-		if err := json.Unmarshal(f.obj["spec"], &spec); err != nil {
-			t.Fatal(err)
-		}
-		spec["applicationProtocol"], _ = json.Marshal(protocol)
-		f.obj["spec"], _ = json.Marshal(spec)
+	var spec map[string]json.RawMessage
+	if err := json.Unmarshal(f.obj["spec"], &spec); err != nil {
+		t.Fatal(err)
 	}
+	spec["voterCount"], _ = json.Marshal(voterCount)
+	if protocol != "" {
+		spec["applicationProtocol"], _ = json.Marshal(protocol)
+	}
+	f.obj["spec"], _ = json.Marshal(spec)
 	kube := httptest.NewTLSServer(http.HandlerFunc(f.serve))
 	t.Cleanup(kube.Close)
 	tokenFile := filepath.Join(t.TempDir(), "token")
@@ -533,7 +594,7 @@ func sqlClusterForProtocol(t *testing.T, protocol string) ([]Config, *sqlStatusF
 	// authority write; no legacy assignment is converted after creation.
 	plan.ApplicationProtocol = protocol
 	name, _ := operator.V1Alpha2GenesisDeploymentName(ref.UID)
-	bootstrap := operator.V1Alpha2BootstrapPlan{ClusterID: clusterID, PhysicalBinding: source, EvidenceFormat: format, Durability: types.ObjectStoreDurabilityBeforeAck}
+	bootstrap := operator.V1Alpha2BootstrapPlan{ClusterID: clusterID, PhysicalBinding: source, EvidenceFormat: format, Durability: types.ObjectStoreDurabilityBeforeAck, Reconfiguration: enableReconfiguration}
 	for i, member := range members {
 		bootstrap.Members = append(bootstrap.Members, operator.V1Alpha2BootstrapMember{PodUID: fmt.Sprintf("pod-%d", i), Member: member})
 	}
