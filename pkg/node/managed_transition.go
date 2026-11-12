@@ -11,6 +11,22 @@ import (
 
 const managedMembershipTransitionWait = 10 * time.Second
 
+// waitForManagedVoterAdmission keeps control-barrier and application
+// admission behind the certified terminal. A stable non-voter fails without
+// allocating a wait; only an actual retained transition uses the bounded poll.
+func (n *Node) waitForManagedVoterAdmission(ctx context.Context) error {
+	if n.core.CanParticipateReadIndex() {
+		return nil
+	}
+	if err := n.WaitForManagedMembershipTransition(ctx); err != nil {
+		return err
+	}
+	if !n.core.CanParticipateReadIndex() {
+		return fmt.Errorf("internal application has no active voter admission")
+	}
+	return nil
+}
+
 // WaitForManagedMembershipTransition keeps a retained voter's client request
 // outside runtime and mutation admission until the Core has installed the
 // already-certified terminal. It never proposes, replays application values,

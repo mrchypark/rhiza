@@ -327,22 +327,11 @@ func (n *Node) admitInternalApplication(ctx context.Context) error {
 		}
 		return logManagedSQLQueryFailure(ctx, "admission_runtime_pre", err)
 	}
-	if !n.core.CanParticipateReadIndex() {
-		if _, pending := n.core.PendingReconfiguration(); pending {
-			if err := n.WaitForManagedMembershipTransition(ctx); err != nil {
-				if n.materializationPolicy() == sqlpolicy.ManagedGraphRequestMaterializationPolicy {
-					logManagedGraphAdmissionStageFailure("admitted", "runtime_pre", err)
-				}
-				return logManagedSQLQueryFailure(ctx, "admission_runtime_pre", err)
-			}
+	if err := n.waitForManagedVoterAdmission(ctx); err != nil {
+		if n.materializationPolicy() == sqlpolicy.ManagedGraphRequestMaterializationPolicy {
+			logManagedGraphAdmissionStageFailure("admitted", "runtime_pre", err)
 		}
-		if !n.core.CanParticipateReadIndex() {
-			err := fmt.Errorf("internal application has no active voter admission")
-			if n.materializationPolicy() == sqlpolicy.ManagedGraphRequestMaterializationPolicy {
-				logManagedGraphAdmissionStageFailure("admitted", "runtime_pre", err)
-			}
-			return logManagedSQLQueryFailure(ctx, "admission_runtime_pre", err)
-		}
+		return logManagedSQLQueryFailure(ctx, "admission_runtime_pre", err)
 	}
 	var verifiedBarrier quepaxa.Slot
 	if isManagedAppendOnlyProtocol(n.managedApplicationProtocol()) {

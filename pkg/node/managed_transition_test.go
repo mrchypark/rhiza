@@ -19,9 +19,13 @@ type managedTransitionTransport struct {
 	dropTerminalFrom quepaxa.Slot
 	dropTerminalTo   quepaxa.NodeID
 	fetches          int
+	records          int
 }
 
 func (t *managedTransitionTransport) SendRecord(ctx context.Context, to quepaxa.NodeID, request quepaxa.RecordRequest) (quepaxa.Summary, error) {
+	t.mu.Lock()
+	t.records++
+	t.mu.Unlock()
 	return t.core(to).Record(ctx, request)
 }
 
@@ -111,7 +115,10 @@ func TestManagedTransitionWaitInstallsCertifiedTerminalBeforeAdmission(t *testin
 		t.Fatal("retained voter unexpectedly installed the terminal")
 	}
 
-	if err := (&Node{core: a}).WaitForManagedMembershipTransition(ctx); err != nil {
+	transport.mu.RLock()
+	recordsBefore := transport.records
+	transport.mu.RUnlock()
+	if err := (&Node{core: a}).waitForManagedVoterAdmission(context.Background()); err != nil {
 		pending, _ := a.PendingReconfiguration()
 		page, _, fetchErr := transport.FetchFrozenTargetDecisions(ctx, b.NodeID(), a.Tip()+1, 128, pending)
 		acceptErr := a.AcceptCertifiedValues(page)
@@ -122,8 +129,12 @@ func TestManagedTransitionWaitInstallsCertifiedTerminalBeforeAdmission(t *testin
 	}
 	transport.mu.RLock()
 	fetches := transport.fetches
+	recordsAfter := transport.records
 	transport.mu.RUnlock()
 	if fetches == 0 {
 		t.Fatal("retained voter did not fetch the certified terminal")
+	}
+	if recordsAfter != recordsBefore {
+		t.Fatalf("admission pre-gate submitted %d records before ReadIndex", recordsAfter-recordsBefore)
 	}
 }
