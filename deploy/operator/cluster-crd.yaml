@@ -171,8 +171,6 @@ spec:
                   message: a new repair must start closed
                 - rule: '!has(self.repair) || (has(oldSelf.repair) && self.repair.plan.operationID == oldSelf.repair.plan.operationID) || (has(self.repair.plan.sequence) && (self.repair.plan.sequence == "addThenRemove" || self.repair.plan.sequence == "add" || self.repair.plan.sequence == "leave"))'
                   message: a new repair operation requires ADD-first replacement, add-only enrollment, or explicit leave
-                - rule: '!has(self.repair) || self.repair.state != "Closed" || self.repair.plan.sequence != "leave" || self.spec.voterCount == self.repair.plan.finalVoterIDs.size()'
-                  message: closed leave must match the reduced desired voter count
                 - rule: '!has(oldSelf.repair) || !has(self.repair) || self.repair.plan.operationID == oldSelf.repair.plan.operationID || (oldSelf.repair.state != "Closed" && self.repair.state == "Closed" && (self.repair.plan.generation > oldSelf.repair.plan.generation || (self.repair.plan.generation == oldSelf.repair.plan.generation && self.repair.plan.expectedConfigID >= oldSelf.repair.completion.configID && (self.repair.plan.expectedConfigID > oldSelf.repair.plan.expectedConfigID || (self.repair.plan.expectedConfigID == oldSelf.repair.plan.expectedConfigID && self.repair.plan.expectedAbortSlot > oldSelf.repair.plan.expectedAbortSlot)) && (oldSelf.repair.state != "Aborted" || self.repair.plan.expectedConfigID != oldSelf.repair.completion.configID || self.repair.plan.expectedAbortSlot >= oldSelf.repair.completion.slot))))'
                   message: replacement repair requires a terminal predecessor and advanced position
                 - rule: '!has(self.repair) || (has(oldSelf.repair) && self.repair == oldSelf.repair) || (has(oldSelf.authority) && self.authority == oldSelf.authority)'
@@ -276,6 +274,8 @@ spec:
                       message: repair state and completion must agree
                     - rule: '!has(self.completion) || (self.completion.operationID == self.plan.operationID && self.completion.expectedConfigID == self.plan.expectedConfigID && self.completion.expectedAbortSlot == self.plan.expectedAbortSlot && self.completion.slot > self.plan.expectedAbortSlot)'
                       message: repair completion must bind the exact operation and position
+                    - rule: '!has(self.completion) || self.completion.kind != "Terminal" || !has(self.plan.sequence) || self.plan.sequence != "leave" || (has(self.preparedHandoff) && has(self.preparedHandoff.removeTerminalSlot) && has(self.preparedHandoff.removeTerminalHash) && has(self.preparedHandoff.survivors) && self.completion.planDigest == self.preparedHandoff.planDigest && self.completion.configID == self.preparedHandoff.survivors.config_id && self.completion.slot == self.preparedHandoff.removeTerminalSlot && self.completion.hash == self.preparedHandoff.removeTerminalHash)'
+                      message: completed leave must bind the exact REMOVE terminal
                     - rule: '!has(self.completion) || (self.state == "Completed" && self.completion.kind == "Terminal" && has(self.completion.finalVoterIDs) && self.completion.finalVoterIDs == self.plan.finalVoterIDs && ((has(self.plan.sequence) && (self.plan.sequence == "add" || self.plan.sequence == "leave") && has(self.preparedHandoff) && self.completion.configID == self.plan.expectedConfigID + 1 && !has(self.addCompletion)) || self.completion.configID == self.plan.expectedConfigID + 2 && (!has(self.plan.sequence) || self.plan.sequence != "addThenRemove" || has(self.addCompletion)))) || (self.state == "Aborted" && self.completion.kind == "Abort" && self.completion.configID >= self.plan.expectedConfigID && !has(self.completion.finalVoterIDs) && (!has(self.plan.sequence) || self.plan.sequence != "addThenRemove" || !has(self.addCompletion)))'
                       message: REMOVE alone is not final repair completion
                     - rule: '!has(self.completion) || !has(self.plan.sequence) || self.plan.sequence != "addThenRemove" || self.completion.kind != "Terminal" || (has(self.addCompletion) && self.completion.slot > self.addCompletion.slot)'
@@ -367,6 +367,8 @@ spec:
                       x-kubernetes-validations:
                         - rule: '(has(self.sequence) && self.sequence == "leave") ? (self.replacement.nodeID == self.oldNodeID && !(self.oldNodeID in self.finalVoterIDs)) : (self.replacement.nodeID in self.finalVoterIDs && (self.oldNodeID in self.finalVoterIDs) == (has(self.sequence) && self.sequence == "add"))'
                           message: final target must bind leave to the retired voter or include replacement except for add-only enrollment
+                        - rule: '!has(self.sequence) || self.sequence != "leave" || self.finalVoterIDs.size() >= 3'
+                          message: leave final roster must retain at least three voters
                       properties:
                         operationID: {type: string, minLength: 1, maxLength: 256}
                         sequence: {type: string, enum: [removeThenAdd, addThenRemove, add, leave]}

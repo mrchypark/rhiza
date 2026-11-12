@@ -365,4 +365,58 @@ func TestRepairV1Alpha2HandoffSchema(t *testing.T) {
 			t.Fatalf("existing leaf guard lost: %s", guard)
 		}
 	}
+	for _, validation := range status["x-kubernetes-validations"].([]any) {
+		rule := validation.(map[string]any)["rule"].(string)
+		if strings.Contains(rule, "self.spec") {
+			t.Fatalf("status-scoped rule cannot reference the parent spec: %s", rule)
+		}
+	}
+	var leaveMinimum, leaveTerminal, leaveCompletion, leaveSurvivors string
+	for _, validation := range planSchema["x-kubernetes-validations"].([]any) {
+		entry := validation.(map[string]any)
+		if entry["message"] == "leave final roster must retain at least three voters" {
+			leaveMinimum = entry["rule"].(string)
+		}
+	}
+	for _, validation := range repair["x-kubernetes-validations"].([]any) {
+		entry := validation.(map[string]any)
+		switch entry["message"] {
+		case "completed leave must bind the exact REMOVE terminal":
+			leaveTerminal = entry["rule"].(string)
+		case "REMOVE alone is not final repair completion":
+			leaveCompletion = entry["rule"].(string)
+		case "handoff survivor set must exactly precede the intended ADD":
+			leaveSurvivors = entry["rule"].(string)
+		}
+	}
+	if !strings.Contains(leaveMinimum, `self.finalVoterIDs.size() >= 3`) {
+		t.Fatalf("leave plan lost its three-voter floor: %q", leaveMinimum)
+	}
+	for _, fragment := range []string{
+		`self.completion.planDigest == self.preparedHandoff.planDigest`,
+		`self.completion.configID == self.preparedHandoff.survivors.config_id`,
+		`self.completion.slot == self.preparedHandoff.removeTerminalSlot`,
+		`self.completion.hash == self.preparedHandoff.removeTerminalHash`,
+	} {
+		if !strings.Contains(leaveTerminal, fragment) {
+			t.Fatalf("leave terminal proof lost exact REMOVE binding %s: %q", fragment, leaveTerminal)
+		}
+	}
+	for _, fragment := range []string{
+		`self.completion.configID == self.plan.expectedConfigID + 1`,
+		`self.completion.finalVoterIDs == self.plan.finalVoterIDs`,
+	} {
+		if !strings.Contains(leaveCompletion, fragment) {
+			t.Fatalf("leave completion lost exact target binding %s: %q", fragment, leaveCompletion)
+		}
+	}
+	for _, fragment := range []string{
+		`self.plan.sequence == "leave" && self.preparedHandoff.survivors.members.size() == self.plan.finalVoterIDs.size()`,
+		`m.node_id in self.plan.finalVoterIDs`,
+		`self.preparedHandoff.survivors.members.filter(other, other.node_id == m.node_id).size() == 1`,
+	} {
+		if !strings.Contains(leaveSurvivors, fragment) {
+			t.Fatalf("leave survivor handoff lost exact roster binding %s: %q", fragment, leaveSurvivors)
+		}
+	}
 }
