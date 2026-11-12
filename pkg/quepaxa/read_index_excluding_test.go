@@ -179,6 +179,7 @@ type membershipAdvanceReadTransport struct {
 	oldCanceled chan struct{}
 	cancelOnce  sync.Once
 	blocked     atomic.Int32
+	oldPeers    int32
 }
 
 type configurationLagTestError struct{}
@@ -226,7 +227,7 @@ func (t *membershipAdvanceReadTransport) ReadTip(ctx context.Context, to NodeID)
 		t.n2Once.Do(func() { close(t.n2Entered) })
 		return Slot(call), nil
 	case "n3", "n4":
-		if t.blocked.Add(1) == 1 {
+		if t.blocked.Add(1) == t.oldPeers {
 			close(t.oldBlocked)
 		}
 		<-ctx.Done()
@@ -267,6 +268,7 @@ func TestReadIndexRestartsAfterCertifiedMembershipAdvance(t *testing.T) {
 		n2Entered:   make(chan struct{}),
 		oldBlocked:  make(chan struct{}),
 		oldCanceled: make(chan struct{}),
+		oldPeers:    2,
 	}
 	wal, err := qlog.Open(t.TempDir())
 	if err != nil {
@@ -299,10 +301,13 @@ func TestReadIndexRestartsAfterCertifiedMembershipAdvance(t *testing.T) {
 		t.Fatalf("read returned slot=%d id=%s, want the fresh config-2 response from n2", slot, id)
 	}
 	coreTransport.mu.Lock()
-	n2Calls := coreTransport.readTips["n2"]
+	n2Calls, n3Calls, n4Calls := coreTransport.readTips["n2"], coreTransport.readTips["n3"], coreTransport.readTips["n4"]
 	coreTransport.mu.Unlock()
 	if n2Calls != 2 {
 		t.Fatalf("n2 ReadTip calls=%d, want one discarded old-roster call and one fresh call", n2Calls)
+	}
+	if n3Calls != 1 || n4Calls != 1 {
+		t.Fatalf("old-roster ReadTip calls n3=%d n4=%d, want one each", n3Calls, n4Calls)
 	}
 	select {
 	case <-coreTransport.oldCanceled:
@@ -319,6 +324,7 @@ func TestReadIndexExcludingDoesNotFollowMembershipAdvance(t *testing.T) {
 		n2Entered:   make(chan struct{}),
 		oldBlocked:  make(chan struct{}),
 		oldCanceled: make(chan struct{}),
+		oldPeers:    1,
 	}
 	wal, err := qlog.Open(t.TempDir())
 	if err != nil {
@@ -356,6 +362,7 @@ func TestReadIndexWaitsThroughFreezeWithoutCountingQuorum(t *testing.T) {
 		n2Entered:   make(chan struct{}),
 		oldBlocked:  make(chan struct{}),
 		oldCanceled: make(chan struct{}),
+		oldPeers:    2,
 	}
 	wal, err := qlog.Open(t.TempDir())
 	if err != nil {
