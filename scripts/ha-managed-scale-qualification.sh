@@ -936,13 +936,19 @@ managed_functional_external_high_evidence_oracle() {
   ' "$mfehe_checkpoints" > "$mfehe_out"
 }
 
+managed_functional_external_sequence_artifacts() {
+  mfesa_sequence=$1 mfesa_text=$2 mfesa_json=$3
+  printf '%s\n' "$mfesa_sequence" > "$mfesa_text" || return 1
+  printf '%s\n' "$mfesa_sequence" \
+    | jq -R -s '[splits("\\s+") | select(length>0) | tonumber]' > "$mfesa_json"
+}
+
 managed_functional_external_high() {
   mfesh_checkpoints="$logs/functional-external-high-checkpoints.jsonl"
   mfesh_progress="$logs/functional-external-high-progress.json"
   mfesh_ramp="$logs/functional-external-high-ramp.json"
-  printf '%s\n' "$managed_functional_external_high_sequence" > "$logs/functional-external-high-sequence.txt" || return 1
-  printf '%s\n' "$managed_functional_external_high_sequence" \
-    | jq -R -s 'split("\n")|map(select(length>0)|tonumber)' > "$logs/functional-external-high-sequence.json" || return 1
+  managed_functional_external_sequence_artifacts "$managed_functional_external_high_sequence" \
+    "$logs/functional-external-high-sequence.txt" "$logs/functional-external-high-sequence.json" || return 1
   : > "$mfesh_checkpoints"
   managed_functional_external_observe 3 external-high-baseline bootstrap || return 1
   k -n "$namespace" get deployment rhiza-operator -o json > "$logs/functional-operator-external-high-baseline-deployment.json" || return 1
@@ -1314,6 +1320,14 @@ leave-u5'
   jq '.subsets[0].addresses += [{targetRef:{uid:"extra"}}]' "$scratch/external5-endpoints.json" > "$scratch/external5-bad-endpoints.json"
   if managed_functional_external_roster_oracle "$scratch/external5-cr.json" "$scratch/external5-pods.json" \
     "$scratch/external5-deploy.json" "$scratch/external5-bad-endpoints.json" 5 "$scratch/external5-bad-roster.json" add; then return 1; fi
+  managed_functional_external_sequence_artifacts "$managed_functional_external_high_sequence" \
+    "$scratch/external-high-sequence.txt" "$scratch/external-high-sequence.json"
+  [ "$(cat "$scratch/external-high-sequence.txt")" = "$managed_functional_external_high_sequence" ]
+  jq -e '.==[3,4,5,4,3,4,5,6,7,6,5,4,3,4,5,6,7,8,9,10,9,8,7,6,5,4,3]' "$scratch/external-high-sequence.json" >/dev/null
+  external_spaced_sequence=$(printf ' 3\t4\n5  4 3 ')
+  managed_functional_external_sequence_artifacts "$external_spaced_sequence" \
+    "$scratch/external-spaced-sequence.txt" "$scratch/external-spaced-sequence.json"
+  jq -e '.==[3,4,5,4,3]' "$scratch/external-spaced-sequence.json" >/dev/null
   managed_self_test_replica_watch() {
     mfs_trw_sequence=$1 mfs_trw_out=$2
     jq -cn --arg sequence "$mfs_trw_sequence" '
