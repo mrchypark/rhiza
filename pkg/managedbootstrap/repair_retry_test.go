@@ -64,6 +64,10 @@ func validateLegacyPrepared(dir string, identity recovery.PreparedStartupIdentit
 	return recovery.ValidatePreparedStartupDirectoryForPolicy(context.Background(), dir, identity, sqlpolicy.LegacyMaterializationPolicy, types.DefaultIdempotencyWindowSlots, "")
 }
 
+func repairTestRestoredMarker(identity recovery.PreparedStartupIdentity) repairRestoredMarker {
+	return repairRestoredMarker{Version: 1, Identity: identity, PlanDigest: strings.Repeat("a", 64), CompletionHash: sha256.Sum256([]byte("completion")), HeadHash: sha256.Sum256([]byte("head"))}
+}
+
 func TestRepairIncompletePreparedDirectoryQuarantinedAndRepublished(t *testing.T) {
 	root := repairCanonicalTempDir(t)
 	prepared := filepath.Join(root, "repair-prepared-digest")
@@ -240,6 +244,126 @@ func TestRepairInvalidMarkerQuarantinedAndRepublished(t *testing.T) {
 	}
 	if err := validate(); err != nil {
 		t.Fatalf("republished marker invalid: %v", err)
+	}
+}
+
+func TestRepairReadinessMarkerRoundTripPreservesLocalEvidence(t *testing.T) {
+	root := repairCanonicalTempDir(t)
+	dataDir := filepath.Join(root, "data")
+	if err := os.MkdirAll(filepath.Join(dataDir, "qlog"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	identityFile := filepath.Join(dataDir, "qlog", "voter-identity.json")
+	if err := os.WriteFile(identityFile, []byte("registered-local-identity"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	pending := filepath.Join(dataDir, "prepared-adoption.pending")
+	if err := os.WriteFile(pending, []byte("pending"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	identity := repairTestIdentity()
+	marker := repairTestRestoredMarker(identity)
+	if err := writeRepairRestoredMarker(dataDir, marker); err != nil {
+		t.Fatal(err)
+	}
+	got, present, err := inspectRepairRestoredState(dataDir, marker.PlanDigest, identity)
+	if err != nil || !present || got.Identity != identity || got.CompletionHash != marker.CompletionHash || got.HeadHash != marker.HeadHash {
+		t.Fatalf("marker=%+v present=%t err=%v", got, present, err)
+	}
+	if data, err := os.ReadFile(identityFile); err != nil || string(data) != "registered-local-identity" {
+		t.Fatalf("local identity evidence=%q err=%v", data, err)
+	}
+	if _, err := os.Lstat(pending); err != nil {
+		t.Fatalf("adoption pending evidence removed: %v", err)
+	}
+}
+
+func TestRepairReadinessMarkerFailsClosed(t *testing.T) {
+	identity := repairTestIdentity()
+	t.Run("malformed", func(t *testing.T) {
+		dataDir := filepath.Join(repairCanonicalTempDir(t), "data")
+		if err := os.Mkdir(dataDir, 0o700); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(dataDir, repairRestoredMarkerName), []byte("{"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		if _, present, err := readRepairRestoredMarker(dataDir, strings.Repeat("a", 64), identity); err == nil || !present {
+			t.Fatalf("malformed marker present=%t err=%v", present, err)
+		}
+	})
+	t.Run("identity mismatch", func(t *testing.T) {
+		dataDir := filepath.Join(repairCanonicalTempDir(t), "data")
+		wrong := identity
+		wrong.PodUID = "other-pod"
+		if err := writeRepairRestoredMarker(dataDir, repairTestRestoredMarker(wrong)); err == nil {
+			t.Fatal("marker unexpectedly wrote into absent DataDir")
+		}
+		if err := os.Mkdir(dataDir, 0o700); err != nil {
+			t.Fatal(err)
+		}
+		if err := writeRepairRestoredMarker(dataDir, repairTestRestoredMarker(wrong)); err != nil {
+			t.Fatal(err)
+		}
+		if _, present, err := readRepairRestoredMarker(dataDir, strings.Repeat("a", 64), identity); err == nil || !present {
+			t.Fatalf("identity mismatch present=%t err=%v", present, err)
+		}
+	})
+	t.Run("marker symlink", func(t *testing.T) {
+		root := repairCanonicalTempDir(t)
+		dataDir := filepath.Join(root, "data")
+		if err := os.Mkdir(dataDir, 0o700); err != nil {
+			t.Fatal(err)
+		}
+		target := filepath.Join(root, "marker-target")
+		if err := os.WriteFile(target, []byte("{}"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Symlink(target, filepath.Join(dataDir, repairRestoredMarkerName)); err != nil {
+			t.Fatal(err)
+		}
+		if _, present, err := readRepairRestoredMarker(dataDir, strings.Repeat("a", 64), identity); err == nil || !present {
+			t.Fatalf("marker symlink present=%t err=%v", present, err)
+		}
+	})
+}
+
+func TestRepairDurableLocalEvidenceWithoutMarkerFailsClosed(t *testing.T) {
+	identity := repairTestIdentity()
+	for _, name := range []string{"qlog identity", "adoption pending"} {
+		t.Run(name, func(t *testing.T) {
+			root := repairCanonicalTempDir(t)
+			dataDir := filepath.Join(root, "data")
+			if err := os.MkdirAll(filepath.Join(dataDir, "qlog"), 0o700); err != nil {
+				t.Fatal(err)
+			}
+			evidence := filepath.Join(dataDir, "qlog", "voter-identity.json")
+			if name == "adoption pending" {
+				evidence = filepath.Join(dataDir, "prepared-adoption.pending")
+			}
+			if err := os.WriteFile(evidence, []byte("durable"), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			if _, present, err := inspectRepairRestoredState(dataDir, strings.Repeat("a", 64), identity); err == nil || present || !strings.Contains(err.Error(), "preserve DataDir") {
+				t.Fatalf("durable evidence present=%t err=%v", present, err)
+			}
+			if got, err := os.ReadFile(evidence); err != nil || string(got) != "durable" {
+				t.Fatalf("durable evidence moved=%q err=%v", got, err)
+			}
+		})
+	}
+}
+
+func TestRepairNoQlogPartialDataDirEligibleForRetry(t *testing.T) {
+	dataDir := filepath.Join(repairCanonicalTempDir(t), "data")
+	if err := os.Mkdir(dataDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dataDir, "sqlite.db"), []byte("partial"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, present, err := inspectRepairRestoredState(dataDir, strings.Repeat("a", 64), repairTestIdentity()); err != nil || present {
+		t.Fatalf("partial DataDir present=%t err=%v", present, err)
 	}
 }
 

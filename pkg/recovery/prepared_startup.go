@@ -341,6 +341,90 @@ func parsePreparedStartupDirectory(ctx context.Context, handoffDir string, expec
 	return result, nil
 }
 
+// VerifyRestoredPreparedStartupForPolicy verifies an already materialized
+// DataDir against a prepared handoff and its already verified source view. It
+// never reconstructs or replaces DataDir; qlog and adoption-pending files are
+// unrelated local state and remain untouched.
+func VerifyRestoredPreparedStartupForPolicy(ctx context.Context, dataDir, handoffDir string, view *ReadOnlyView, expected PreparedStartupIdentity, policy sqlpolicy.MaterializationPolicy, window uint64, applicationProtocol string) (*VerifiedPreparedStartup, error) {
+	if view == nil || !view.verified || view.expectedPolicy != policy || view.idempotencyWindow != window || view.applicationProtocol != applicationProtocol {
+		return nil, fmt.Errorf("restored prepared source view profile mismatch")
+	}
+	parsed, err := parsePreparedStartupDirectory(ctx, handoffDir, expected, policy, window, applicationProtocol)
+	if err != nil {
+		return nil, err
+	}
+	if !bytes.Equal(parsed.manifest.Head, view.CapturedHead()) {
+		return nil, fmt.Errorf("restored prepared source head mismatch")
+	}
+	wantSuffix, err := json.Marshal(view.Decisions())
+	if err != nil {
+		return nil, err
+	}
+	if !bytes.Equal(parsed.suffix, wantSuffix) {
+		return nil, fmt.Errorf("prepared suffix differs from verified history")
+	}
+	info, err := os.Lstat(dataDir)
+	if err != nil || !info.IsDir() || info.Mode()&os.ModeSymlink != 0 {
+		return nil, fmt.Errorf("invalid restored data directory")
+	}
+	for _, name := range []string{"qlog", "checkpoint"} {
+		path := filepath.Join(dataDir, name)
+		info, err := os.Lstat(path)
+		if errors.Is(err, os.ErrNotExist) {
+			continue
+		}
+		if err != nil || !info.IsDir() || info.Mode()&os.ModeSymlink != 0 {
+			return nil, fmt.Errorf("unsafe restored local directory %q", name)
+		}
+	}
+	for _, name := range []string{"prepared-adoption.json", "prepared-adoption.pending"} {
+		path := filepath.Join(dataDir, name)
+		info, err := os.Lstat(path)
+		if errors.Is(err, os.ErrNotExist) {
+			continue
+		}
+		if err != nil || !info.Mode().IsRegular() || info.Mode()&os.ModeSymlink != 0 {
+			return nil, fmt.Errorf("unsafe restored adoption file %q", name)
+		}
+	}
+	sqlitePath := filepath.Join(dataDir, "sqlite.db")
+	suffixPath := filepath.Join(dataDir, "certified-suffix.json")
+	for _, path := range []string{sqlitePath, suffixPath} {
+		info, err := os.Lstat(path)
+		if err != nil || !info.Mode().IsRegular() || info.Mode()&os.ModeSymlink != 0 {
+			return nil, fmt.Errorf("invalid restored prepared file")
+		}
+	}
+	restoredSuffix, err := os.ReadFile(suffixPath)
+	if err != nil || !bytes.Equal(restoredSuffix, wantSuffix) {
+		return nil, fmt.Errorf("restored suffix differs from verified history")
+	}
+	if policy == sqlpolicy.ManagedGraphRequestMaterializationPolicy {
+		if _, err := preparedGraphArtifacts(ctx, dataDir, false); err != nil {
+			return nil, fmt.Errorf("invalid restored Graph preparation: %w", err)
+		}
+	}
+	if policy == sqlpolicy.LegacyMaterializationPolicy {
+		materialized, err := materializer.Open(sqlitePath, 1, window)
+		if err != nil {
+			return nil, fmt.Errorf("open restored prepared state: %w", err)
+		}
+		if materialized.Tip() != uint64(view.Tip()) {
+			_ = materialized.Close()
+			return nil, fmt.Errorf("restored prepared tip differs from verified history")
+		}
+		if err := materialized.Close(); err != nil {
+			return nil, fmt.Errorf("close restored prepared state: %w", err)
+		}
+	} else {
+		state, tip, err := inspectManagedFileForPolicy(ctx, sqlitePath, window, policy, applicationProtocol)
+		if err != nil || tip != uint64(view.Tip()) || state != parsed.handoffState {
+			return nil, fmt.Errorf("restored prepared state or tip differs from verified history")
+		}
+	}
+	return &VerifiedPreparedStartup{dir: dataDir, view: view, identity: expected}, nil
+}
+
 func loadPreparedStartupForPolicy(ctx context.Context, bucket objstore.Bucket, prefix string, configID uint, bootstrap quepaxa.Cluster, handoffDir, verifiedTargetDir string, expected PreparedStartupIdentity, policy sqlpolicy.MaterializationPolicy, window uint64, trustedReconfiguration *bool, applicationProtocol string) (*VerifiedPreparedStartup, error) {
 	parsed, err := parsePreparedStartupDirectory(ctx, handoffDir, expected, policy, window, applicationProtocol)
 	if err != nil {
