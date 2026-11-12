@@ -177,6 +177,7 @@ func TestObserveManagedControlRejectsNewOrdinaryReferenceDuringISRAdvance(t *tes
 		memberCore.transport = gate
 	}
 	managedControlRacePrefix(t, core)
+	requireManagedControlSharedPrefix(t, ctx, core, proposer)
 	proposalCtx, cancelProposal := context.WithCancel(ctx)
 	t.Cleanup(func() {
 		cancelProposal()
