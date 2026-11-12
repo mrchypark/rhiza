@@ -777,7 +777,7 @@ func (c *Core) ReadIndexExcluding(ctx context.Context, excluded NodeID) (Slot, N
 	if transport == nil {
 		return 0, "", fmt.Errorf("%w: read-index transport is unavailable", ErrQuorumUnavailable)
 	}
-	slot, id, _, err := c.readIndexRound(ctx, transport, configID, members, excluded, changed, false)
+	slot, id, _, _, err := c.readIndexRound(ctx, transport, configID, members, excluded, changed, false)
 	return slot, id, err
 }
 
@@ -821,6 +821,22 @@ func (c *Core) retainedTerminalPendingLocked(cluster Cluster) (Slot, bool) {
 	return 0, false
 }
 
+type configurationLag interface{ ConfigurationLag() bool }
+
+// currentTransitionTerminalLocked returns the exact terminal that activated
+// the current configuration. It is used only after an authenticated current
+// roster peer reports that narrower configuration as unknown.
+func (c *Core) currentTransitionTerminalLocked() (Slot, uint, bool) {
+	cluster := c.clusterForSlotLocked(c.tip + 1)
+	for index := len(c.configHistory) - 1; index >= 0; index-- {
+		epoch := c.configHistory[index]
+		if epoch.start > 1 && sameCluster(epoch.cluster, cluster) {
+			return epoch.start - 1, cluster.ConfigID, true
+		}
+	}
+	return 0, cluster.ConfigID, false
+}
+
 type readIndexResult struct {
 	tip Slot
 	id  NodeID
@@ -830,7 +846,7 @@ type readIndexResult struct {
 // readIndexRound collects one complete quorum round from one immutable roster.
 // A transition return discards every response from this round; it never mixes
 // evidence across configurations or counts quorum while membership is frozen.
-func (c *Core) readIndexRound(ctx context.Context, transport Transport, configID uint, members []Member, excluded NodeID, changed <-chan struct{}, followMembership bool) (Slot, NodeID, bool, error) {
+func (c *Core) readIndexRound(ctx context.Context, transport Transport, configID uint, members []Member, excluded NodeID, changed <-chan struct{}, followMembership bool) (Slot, NodeID, bool, bool, error) {
 	readCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
 	results := make(chan readIndexResult, len(members))
@@ -852,6 +868,7 @@ func (c *Core) readIndexRound(ctx context.Context, transport Transport, configID
 	cluster := Cluster{ConfigID: configID, Members: members}
 	var best readIndexResult
 	successes := 0
+	lagSeen := false
 	logFailure := func(reason string) {
 		log.Printf("read-index failed reason=%s node_hash=%x excluded_hash=%x requested_config=%d current_config=%d required=%d actual=%d completed=%d participants=%d context_done=%t", reason, sha256.Sum256([]byte(c.nodeID)), sha256.Sum256([]byte(excluded)), configID, c.ConfigID(), cluster.QuorumSize(), successes, len(observed), len(members), ctx.Err() != nil)
 		for _, item := range observed {
@@ -872,15 +889,15 @@ func (c *Core) readIndexRound(ctx context.Context, transport Transport, configID
 		select {
 		case <-ctx.Done():
 			logFailure("context")
-			return 0, "", false, ctx.Err()
+			return 0, "", false, false, ctx.Err()
 		case <-changed:
 			current, _, nextChanged, frozen, voter := c.readIndexState()
 			if followMembership && (frozen || current > configID) {
-				return 0, "", true, nil
+				return 0, "", true, false, nil
 			}
 			if frozen || current != configID || !voter {
 				logFailure("membership-not-installed")
-				return 0, "", false, ErrQuorumUnavailable
+				return 0, "", false, false, ErrQuorumUnavailable
 			}
 			changed = nextChanged
 		case item := <-results:
@@ -888,13 +905,20 @@ func (c *Core) readIndexRound(ctx context.Context, transport Transport, configID
 			observed = append(observed, item)
 			current, _, nextChanged, frozen, voter := c.readIndexState()
 			if followMembership && (frozen || current > configID) {
-				return 0, "", true, nil
+				return 0, "", true, false, nil
 			}
 			if frozen || current != configID || !voter {
 				logFailure("membership-not-installed")
-				return 0, "", false, ErrQuorumUnavailable
+				return 0, "", false, false, ErrQuorumUnavailable
 			}
 			changed = nextChanged
+			if followMembership {
+				var lag configurationLag
+				if errors.As(item.err, &lag) && lag.ConfigurationLag() {
+					lagSeen = true
+					continue
+				}
+			}
 			if item.err != nil {
 				continue
 			}
@@ -903,17 +927,21 @@ func (c *Core) readIndexRound(ctx context.Context, transport Transport, configID
 				best = item
 			}
 			if successes == cluster.QuorumSize() {
-				return best.tip, best.id, false, nil
+				return best.tip, best.id, false, false, nil
 			}
 		}
 	}
 	logFailure("results-exhausted")
-	return 0, "", false, ErrQuorumUnavailable
+	if followMembership && lagSeen {
+		return 0, "", true, true, nil
+	}
+	return 0, "", false, false, ErrQuorumUnavailable
 }
 
 func (c *Core) readIndexFollowingMembership(ctx context.Context, excluded NodeID) (Slot, NodeID, error) {
 	var frozenWait context.Context
 	var durabilityAttempted uint
+	var redeliveryAttempted uint
 	for {
 		if excluded == c.nodeID {
 			return 0, "", ErrQuorumUnavailable
@@ -990,7 +1018,41 @@ func (c *Core) readIndexFollowingMembership(ctx context.Context, excluded NodeID
 		if transport == nil {
 			return 0, "", fmt.Errorf("%w: read-index transport is unavailable", ErrQuorumUnavailable)
 		}
-		slot, id, transition, err := c.readIndexRound(ctx, transport, configID, members, excluded, changed, true)
+		slot, id, transition, lag, err := c.readIndexRound(ctx, transport, configID, members, excluded, changed, true)
+		if lag {
+			if redeliveryAttempted == configID {
+				return 0, "", ErrQuorumUnavailable
+			}
+			redeliveryAttempted = configID
+			c.mu.RLock()
+			terminal, currentConfigID, hasTerminal := c.currentTransitionTerminalLocked()
+			currentFrozen := c.reconfiguration != nil
+			c.mu.RUnlock()
+			if !hasTerminal || currentConfigID != configID || currentFrozen {
+				continue
+			}
+			if ctx.Done() == nil {
+				return 0, "", ErrQuorumUnavailable
+			}
+			redeliveryCtx := ctx
+			cancel := func() {}
+			if _, bounded := ctx.Deadline(); !bounded {
+				redeliveryCtx, cancel = context.WithTimeout(ctx, readIndexMembershipWait)
+			}
+			_, err := c.CompleteDecision(redeliveryCtx, terminal)
+			redeliveryErr := redeliveryCtx.Err()
+			cancel()
+			if cErr := ctx.Err(); cErr != nil {
+				return 0, "", cErr
+			}
+			if err != nil {
+				if errors.Is(redeliveryErr, context.DeadlineExceeded) {
+					return 0, "", ErrQuorumUnavailable
+				}
+				return 0, "", err
+			}
+			continue
+		}
 		if transition {
 			continue
 		}

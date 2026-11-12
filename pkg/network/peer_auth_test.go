@@ -32,6 +32,8 @@ func TestPeerAuthenticationMatrix(t *testing.T) {
 		{name: "admin-impersonation", sender: "b", adminToken: "admin", cluster: "cluster", op: peerfb.OperationRecord, want: "authentication failed"},
 		{name: "wrong-cluster", sender: "b", certificateKey: "b-token", cluster: "other", op: peerfb.OperationSync, want: "identity mismatch"},
 		{name: "wrong-config", sender: "b", certificateKey: "b-token", cluster: "cluster", config: 99, op: peerfb.OperationSync, want: "identity mismatch"},
+		{name: "lagging-read", sender: "b", certificateKey: "b-token", cluster: "cluster", config: 99, op: peerfb.OperationReadIndex, want: "configuration lag"},
+		{name: "unauthenticated-lagging-read", sender: "b", certificateKey: "wrong", cluster: "cluster", config: 99, op: peerfb.OperationReadIndex, want: "identity mismatch"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			var certificateKey ed25519.PublicKey

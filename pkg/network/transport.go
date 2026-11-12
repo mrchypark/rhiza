@@ -43,6 +43,11 @@ const checkpointPrepareTimeout = 5 * time.Minute
 var errPeerRejected = errors.New("peer rejected request")
 var errTransportClosed = errors.New("peer transport is closed")
 
+type peerConfigurationLagError struct{}
+
+func (peerConfigurationLagError) Error() string          { return "peer configuration lags certified request" }
+func (peerConfigurationLagError) ConfigurationLag() bool { return true }
+
 type peerConnection struct {
 	mu     sync.Mutex
 	gate   chan struct{}
@@ -563,6 +568,11 @@ func (t *Transport) callContext(ctx context.Context, to quepaxa.NodeID, request 
 			return nil, quepaxa.ErrCompacted
 		case peerErrorRetryable:
 			return nil, err
+		case peerErrorConfigurationLag:
+			if request.Operation == peerfb.OperationReadIndex {
+				return nil, peerConfigurationLagError{}
+			}
+			return nil, fmt.Errorf("%w: %v", errPeerRejected, err)
 		}
 	}
 	if err != nil {

@@ -181,6 +181,41 @@ type membershipAdvanceReadTransport struct {
 	blocked     atomic.Int32
 }
 
+type configurationLagTestError struct{}
+
+func (configurationLagTestError) Error() string          { return "configuration lag" }
+func (configurationLagTestError) ConfigurationLag() bool { return true }
+
+type lagReadOnceTransport struct {
+	*clusterTransport
+	mu            sync.Mutex
+	lagPeer       NodeID
+	lagLeft       int
+	readTips      int
+	sendDecisions int
+}
+
+func (t *lagReadOnceTransport) ReadTip(ctx context.Context, to NodeID) (Slot, error) {
+	t.mu.Lock()
+	t.readTips++
+	lag := to == t.lagPeer && t.lagLeft > 0
+	if lag {
+		t.lagLeft--
+	}
+	t.mu.Unlock()
+	if lag {
+		return 0, configurationLagTestError{}
+	}
+	return t.clusterTransport.ReadTip(ctx, to)
+}
+
+func (t *lagReadOnceTransport) SendDecision(ctx context.Context, decision Decision) error {
+	t.mu.Lock()
+	t.sendDecisions++
+	t.mu.Unlock()
+	return t.clusterTransport.SendDecision(ctx, decision)
+}
+
 func (t *membershipAdvanceReadTransport) ReadTip(ctx context.Context, to NodeID) (Slot, error) {
 	t.mu.Lock()
 	t.readTips[to]++
@@ -508,6 +543,63 @@ func TestReadIndexTerminalDurabilityDoesNotBypassQuorumOrIdentity(t *testing.T) 
 			t.Fatalf("removed voter activated: %v", err)
 		}
 	})
+}
+
+func TestReadIndexExcludingDoesNotTreatConfigurationLagAsSuccess(t *testing.T) {
+	members := []Member{{ID: "n1"}, {ID: "n2"}}
+	wal, err := qlog.Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer wal.Close()
+	transport := &lagReadOnceTransport{clusterTransport: &clusterTransport{}, lagPeer: "n2", lagLeft: 1}
+	core := newCore("n1", &Cluster{ConfigID: 1, Members: members}, wal, transport)
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	if _, _, err := core.ReadIndexExcluding(ctx, ""); !errors.Is(err, ErrQuorumUnavailable) {
+		t.Fatalf("excluded read accepted configuration lag as quorum: %v", err)
+	}
+}
+
+func TestReadIndexDoesNotAbortHealthyQuorumForConfigurationLag(t *testing.T) {
+	cores, transport := reconfigCluster(t)
+	genesis := cores["a"].Tip()
+	for _, core := range cores {
+		if tip := core.Tip(); tip != genesis {
+			t.Fatalf("fixture tip mismatch: %s=%d genesis=%d", core.NodeID(), tip, genesis)
+		}
+	}
+	wrapper := &lagReadOnceTransport{clusterTransport: transport, lagPeer: "c", lagLeft: 1}
+	cores["a"].transport = wrapper
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	if slot, id, err := cores["a"].ReadIndex(ctx); err != nil || slot != genesis || id == "" {
+		t.Fatalf("healthy quorum with one lagging peer: slot=%d id=%s err=%v", slot, id, err)
+	}
+	wrapper.mu.Lock()
+	decisions := wrapper.sendDecisions
+	wrapper.mu.Unlock()
+	if decisions != 0 {
+		t.Fatalf("healthy quorum triggered unnecessary terminal redelivery: %d", decisions)
+	}
+}
+
+func TestReadIndexRedeliversCertifiedTerminalOnceThenRequiresFreshQuorum(t *testing.T) {
+	fixture := newTerminalDurabilityFixture(t)
+	wrapper := &lagReadOnceTransport{clusterTransport: fixture.transport, lagPeer: "b", lagLeft: 1}
+	fixture.cores["a"].transport = wrapper
+	readCtx, readCancel := context.WithCancel(context.Background())
+	defer readCancel()
+	slot, id, err := fixture.cores["a"].ReadIndex(readCtx)
+	if err != nil || slot < fixture.terminal || id == "" {
+		t.Fatalf("terminal redelivery read: slot=%d id=%s err=%v", slot, id, err)
+	}
+	wrapper.mu.Lock()
+	decisions, readTips := wrapper.sendDecisions, wrapper.readTips
+	wrapper.mu.Unlock()
+	if decisions != 1 || readTips < 2 {
+		t.Fatalf("redelivery/fresh-quorum evidence decisions=%d readTips=%d", decisions, readTips)
+	}
 }
 
 type tipNotificationReadTransport struct {

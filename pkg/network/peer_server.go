@@ -28,12 +28,15 @@ import (
 )
 
 const (
-	maxPeerConnections = 64
-	maxPeerStreams     = 1024
-	peerErrorQuorum    = 1
-	peerErrorCompacted = 2
-	peerErrorRetryable = 3
+	maxPeerConnections        = 64
+	maxPeerStreams            = 1024
+	peerErrorQuorum           = 1
+	peerErrorCompacted        = 2
+	peerErrorRetryable        = 3
+	peerErrorConfigurationLag = 4
 )
+
+var errPeerConfigurationLag = errors.New("peer configuration lags certified request")
 
 // PeerServer owns the private QUIC listener. Public HTTP remains a separate adapter.
 type PeerServer struct {
@@ -310,6 +313,8 @@ func (s *PeerServer) serveStream(conn *quic.Conn, stream *quic.Stream) {
 			response.ErrorCode = peerErrorCompacted
 		case errors.Is(err, ErrNotReady), errors.Is(err, ErrOverloaded):
 			response.ErrorCode = peerErrorRetryable
+		case errors.Is(err, errPeerConfigurationLag):
+			response.ErrorCode = peerErrorConfigurationLag
 		}
 	}
 	writeErr := writePeerFrame(stream, encodePeerResponse(response))
@@ -359,16 +364,23 @@ func peerCertificateKey(conn *quic.Conn) ed25519.PublicKey {
 func (s *PeerServer) handle(ctx context.Context, certificateKey ed25519.PublicKey, request *peerfb.RequestT) (*peerfb.ResponseT, error) {
 	config, err := s.configurationFor(request)
 	mismatch := err != nil || request.ClusterId != string(s.server.cluster) || request.ConfigId != uint64(config.ConfigID)
+	authenticatedCurrent := false
+	currentConfig := uint(0)
 	if mismatch && request.ClusterId == string(s.server.cluster) && certificateKey != nil {
 		current := s.server.core.CurrentCluster()
+		currentConfig = current.ConfigID
 		member, known := peerMember(current, quepaxa.NodeID(request.SenderId))
-		if known && subtle.ConstantTimeCompare(certificateKey, member.PublicKey[:]) == 1 && s.server.core.RecoverFrozenMembership(ctx) {
+		authenticatedCurrent = known && subtle.ConstantTimeCompare(certificateKey, member.PublicKey[:]) == 1
+		if authenticatedCurrent && s.server.core.RecoverFrozenMembership(ctx) {
 			config, err = s.configurationFor(request)
 		}
 	}
 	if err != nil || request.ClusterId != string(s.server.cluster) || request.ConfigId != uint64(config.ConfigID) {
 		if request.Operation == peerfb.OperationReadIndex {
 			log.Printf("read-index peer refused reason=identity node_hash=%x sender_hash=%x requested_config=%d current_config=%d", sha256.Sum256([]byte(s.server.core.NodeID())), sha256.Sum256([]byte(request.SenderId)), request.ConfigId, s.server.core.ConfigID())
+		}
+		if request.Operation == peerfb.OperationReadIndex && authenticatedCurrent && request.ConfigId > uint64(currentConfig) {
+			return nil, errPeerConfigurationLag
 		}
 		return nil, fmt.Errorf("cluster identity mismatch")
 	}
