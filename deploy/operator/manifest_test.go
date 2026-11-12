@@ -89,6 +89,92 @@ func TestClusterCRDAcceptsVoterCountRange(t *testing.T) {
 	}
 }
 
+func TestClusterCRDReplicaScaleContract(t *testing.T) {
+	data, err := os.ReadFile("cluster-crd.yaml")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var crd map[string]any
+	if err := yaml.Unmarshal(data, &crd); err != nil {
+		t.Fatal(err)
+	}
+	version := crd["spec"].(map[string]any)["versions"].([]any)[0].(map[string]any)
+	scale := version["subresources"].(map[string]any)["scale"].(map[string]any)
+	if scale["specReplicasPath"] != ".spec.replicas" || scale["statusReplicasPath"] != ".status.replicas" || scale["labelSelectorPath"] != ".status.selector" {
+		t.Fatalf("scale paths: %v", scale)
+	}
+	schema := version["schema"].(map[string]any)["openAPIV3Schema"].(map[string]any)
+	spec := schema["properties"].(map[string]any)["spec"].(map[string]any)
+	for _, required := range spec["required"].([]any) {
+		if required == "replicas" {
+			t.Fatal("replicas must remain optional by presence")
+		}
+	}
+	props := spec["properties"].(map[string]any)
+	replicas := props["replicas"].(map[string]any)
+	if replicas["minimum"] != 3 || replicas["maximum"] != 64 {
+		t.Fatalf("replicas bounds: %v", replicas)
+	}
+	status := schema["properties"].(map[string]any)["status"].(map[string]any)
+	statusProps := status["properties"].(map[string]any)
+	step := statusProps["replicaStep"].(map[string]any)
+	required := map[string]bool{}
+	for _, field := range step["required"].([]any) {
+		required[field.(string)] = true
+	}
+	for _, field := range []string{"generation", "deploymentUID", "deploymentResourceVersion", "configID", "from", "to", "expiresAt"} {
+		if !required[field] {
+			t.Fatalf("replicaStep missing required %s", field)
+		}
+	}
+	stepProps := step["properties"].(map[string]any)
+	if stepProps["from"].(map[string]any)["minimum"] != 3 || stepProps["to"].(map[string]any)["maximum"] != 64 {
+		t.Fatal("replica step count bounds changed")
+	}
+	configID := stepProps["configID"].(map[string]any)
+	if _, numericBound := configID["maximum"]; numericBound {
+		t.Fatal("configID uses an imprecise numeric maximum")
+	}
+	configRules := configID["x-kubernetes-validations"].([]any)
+	if len(configRules) != 1 || configRules[0].(map[string]any)["rule"] != "self <= 9223372036854775805" {
+		t.Fatalf("configID exact bound: %v", configRules)
+	}
+	if _, ok := stepProps["checkID"].(map[string]any); !ok {
+		t.Fatal("replica step lacks a one-use check binding")
+	}
+	check := statusProps["replicaCheck"].(map[string]any)
+	checkRequired := map[string]bool{}
+	for _, field := range check["required"].([]any) {
+		checkRequired[field.(string)] = true
+	}
+	for _, field := range []string{"id", "deploymentResourceVersion", "expiresAt"} {
+		if !checkRequired[field] {
+			t.Fatalf("replicaCheck missing required %s", field)
+		}
+	}
+	selector := statusProps["selector"].(map[string]any)
+	if selector["maxLength"] != 307 || selector["pattern"] == nil {
+		t.Fatalf("selector is not bounded: %v", selector)
+	}
+	foundProofCheck := false
+	for _, raw := range status["x-kubernetes-validations"].([]any) {
+		message := raw.(map[string]any)["message"].(string)
+		switch message {
+		case "external replica control requires status replicas and selector":
+			t.Fatal("status scale observations must not block initial status")
+		case "replica step must advance one voter toward the proposal":
+			t.Fatal("active step direction must not track a reversible proposal")
+		case "selector must identify the exact active generation":
+			t.Fatal("selector equality exceeds the status CEL budget")
+		case "replica step proof requires the current one-use check":
+			foundProofCheck = true
+		}
+	}
+	if !foundProofCheck {
+		t.Fatal("missing one-use proof CEL")
+	}
+}
+
 func TestHAContractSchemas(t *testing.T) {
 	for _, name := range []string{"cluster-crd.yaml", "crd.yaml"} {
 		data, err := os.ReadFile(name)

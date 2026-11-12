@@ -128,6 +128,7 @@ func TestPhase1ClusterValidation(t *testing.T) {
 	}{
 		{"valid", func(*V1Alpha2Cluster) {}, false}, {"version", func(c *V1Alpha2Cluster) { c.APIVersion = "v1alpha1" }, true}, {"kind", func(c *V1Alpha2Cluster) { c.Kind = "RhizaRecovery" }, true},
 		{"two voters", func(c *V1Alpha2Cluster) { c.Spec.VoterCount = 2 }, true}, {"64 voters", func(c *V1Alpha2Cluster) { c.Spec.VoterCount = 64 }, false}, {"65 voters", func(c *V1Alpha2Cluster) { c.Spec.VoterCount = 65 }, true},
+		{"external replicas", func(c *V1Alpha2Cluster) { c.Spec.Replicas = phase1Int32(4) }, false}, {"two replicas", func(c *V1Alpha2Cluster) { c.Spec.Replicas = phase1Int32(2) }, true}, {"64 replicas", func(c *V1Alpha2Cluster) { c.Spec.Replicas = phase1Int32(64) }, false}, {"65 replicas", func(c *V1Alpha2Cluster) { c.Spec.Replicas = phase1Int32(65) }, true},
 		{"64 containers", containers(64), false}, {"65 containers", containers(65), true},
 		{"2048 character image", func(c *V1Alpha2Cluster) {
 			c.Spec.Workload.PodTemplate.Spec.Containers[0].Image = strings.Repeat("a", 2048)
@@ -224,6 +225,28 @@ func TestV1Alpha2VoterCountUpdateAllowsBoundedReduction(t *testing.T) {
 	invalid.Spec.VoterCount = 3
 	if err := ValidateV1Alpha2ClusterUpdate(old, invalid); err == nil {
 		t.Fatal("accepted voterCount decrease greater than one")
+	}
+}
+
+func TestV1Alpha2ReplicasOptInPresenceIsImmutable(t *testing.T) {
+	external, same, changed, manual := phase1Cluster(), phase1Cluster(), phase1Cluster(), phase1Cluster()
+	external.Spec.Replicas = phase1Int32(3)
+	same.Spec.Replicas = phase1Int32(3)
+	changed.Spec.Replicas = phase1Int32(4)
+	if err := ValidateV1Alpha2ClusterUpdate(external, same); err != nil {
+		t.Fatalf("stable opt-in: %v", err)
+	}
+	if err := ValidateV1Alpha2ClusterUpdate(external, changed); err != nil {
+		t.Fatalf("scale proposal update: %v", err)
+	}
+	if err := ValidateV1Alpha2ClusterUpdate(external, manual); err == nil {
+		t.Fatal("accepted opt-in removal")
+	}
+	if err := ValidateV1Alpha2ClusterUpdate(manual, external); err == nil {
+		t.Fatal("accepted late opt-in")
+	}
+	if err := ValidateV1Alpha2ClusterUpdate(manual, phase1Cluster()); err != nil {
+		t.Fatalf("changed manual path: %v", err)
 	}
 }
 

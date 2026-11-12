@@ -37,6 +37,9 @@ type V1Alpha2StatusSnapshot struct {
 	object                  map[string]json.RawMessage
 	store                   *V1Alpha2StatusStore
 	repair                  *V1Alpha2RepairRecord
+	replicaStep             *V1Alpha2ReplicaStep
+	replicaCheck            *V1Alpha2ReplicaCheck
+	appliedVoterCount       *int32
 }
 
 func (s V1Alpha2StatusSnapshot) Ref() V1Alpha2ClusterRef          { return s.ref }
@@ -48,15 +51,7 @@ func (s V1Alpha2StatusSnapshot) Queue() json.RawMessage           { return bytes
 // TargetVoterCount is the desired monotonic managed voter count. It is not a
 // membership observation and cannot authorize an enrollment by itself.
 func (s V1Alpha2StatusSnapshot) TargetVoterCount() (int, error) {
-	spec, err := jsonObject(s.object["spec"])
-	if err != nil {
-		return 0, err
-	}
-	var count int
-	if json.Unmarshal(spec["voterCount"], &count) != nil || count < 3 || count > 64 {
-		return 0, fmt.Errorf("invalid target voter count")
-	}
-	return count, nil
+	return effectiveVoterTarget(s)
 }
 
 // BootstrapPlan returns a detached copy of the validated immutable public plan.
@@ -204,6 +199,14 @@ func (s *V1Alpha2StatusStore) snapshot(ref V1Alpha2ClusterRef, obj map[string]js
 		}
 	}
 	snap.repair, err = parseV1Alpha2Repair(snap)
+	if err != nil {
+		return V1Alpha2StatusSnapshot{}, err
+	}
+	snap.replicaStep, snap.appliedVoterCount, err = parseV1Alpha2ReplicaStep(snap)
+	if err != nil {
+		return V1Alpha2StatusSnapshot{}, err
+	}
+	snap.replicaCheck, err = parseV1Alpha2ReplicaCheck(snap)
 	if err != nil {
 		return V1Alpha2StatusSnapshot{}, err
 	}

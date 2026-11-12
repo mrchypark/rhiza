@@ -96,6 +96,10 @@ func runManagedReplacementLoop(ctx context.Context, host *managedsql.Host, cfg m
 }
 
 func reconcileManagedReplacement(ctx context.Context, host *managedsql.Host, cfg managedsql.Config) (string, error) {
+	stage, err := host.ReconcileExternalReplicas(ctx)
+	if err != nil || stage != "disabled" && stage != "idle" && stage != "ordinary-repair" {
+		return stage, err
+	}
 	a, err := operator.LoadV1Alpha2Admission(ctx, cfg.Store, cfg.Ref)
 	if err != nil {
 		return "authority", err

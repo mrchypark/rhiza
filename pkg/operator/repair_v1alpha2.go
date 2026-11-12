@@ -323,9 +323,8 @@ func validateV1Alpha2RepairPlan(s V1Alpha2StatusSnapshot, p V1Alpha2RepairPlan, 
 			return fmt.Errorf("invalid leave final target")
 		}
 		if requireReducedTarget {
-			var spec map[string]json.RawMessage
-			var target int
-			if json.Unmarshal(s.object["spec"], &spec) != nil || json.Unmarshal(spec["voterCount"], &target) != nil || target != len(p.FinalVoterIDs) {
+			target, err := s.TargetVoterCount()
+			if err != nil || target != len(p.FinalVoterIDs) {
 				return fmt.Errorf("leave final target differs from desired voter count")
 			}
 		}
@@ -439,6 +438,9 @@ func BeginV1Alpha2Repair(ctx context.Context, store *V1Alpha2StatusStore, old V1
 		return V1Alpha2AdmissionSnapshot{}, "", fmt.Errorf("repair close preconditions do not match")
 	}
 	if err := validateV1Alpha2RepairPlan(old.status, plan, true); err != nil {
+		return V1Alpha2AdmissionSnapshot{}, "", err
+	}
+	if err := validateV1Alpha2ReplicaRepairStep(old, plan); err != nil {
 		return V1Alpha2AdmissionSnapshot{}, "", err
 	}
 	if previous, ok := old.Repair(); ok {

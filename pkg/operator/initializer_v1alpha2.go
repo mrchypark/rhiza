@@ -163,6 +163,9 @@ func ReconcileV1Alpha2ManagedInitialization(ctx context.Context, kube *Kubernete
 	if _, ok := status["genesis"]; ok {
 		return committed()
 	}
+	if err := validateV1Alpha2ReplicaGenesis(c); err != nil {
+		return V1Alpha2StatusSnapshot{}, err
+	}
 	if c.Spec.GenesisIntent == nil || *c.Spec.GenesisIntent != "Create" {
 		return V1Alpha2StatusSnapshot{}, fmt.Errorf("cluster lacks creation intent")
 	}
@@ -453,6 +456,9 @@ func ReconcileV1Alpha2Initialization(ctx context.Context, kube *Kubernetes, ref 
 	if _, ok := status["genesis"]; ok {
 		return store.snapshot(ref, obj)
 	}
+	if err := validateV1Alpha2ReplicaGenesis(c); err != nil {
+		return V1Alpha2StatusSnapshot{}, err
+	}
 	if len(providers) != 1 || providers[0] == nil {
 		return V1Alpha2StatusSnapshot{}, fmt.Errorf("initialization requires a runtime common plan provider")
 	}
@@ -609,8 +615,10 @@ func RunV1Alpha2ManagedInitialization(ctx context.Context, kube *Kubernetes, int
 	}
 	return runV1Alpha2Initialization(ctx, kube, interval, func() error {
 		return initializeV1Alpha2ListWith(ctx, kube, func(ref V1Alpha2ClusterRef) error {
-			_, err := ReconcileV1Alpha2ManagedInitialization(ctx, kube, ref, profile)
-			return err
+			if _, err := ReconcileV1Alpha2ManagedInitialization(ctx, kube, ref, profile); err != nil {
+				return err
+			}
+			return ReconcileV1Alpha2ReplicaScale(ctx, &V1Alpha2StatusStore{Kube: kube}, ref)
 		})
 	})
 }

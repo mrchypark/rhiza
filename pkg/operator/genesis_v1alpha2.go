@@ -171,6 +171,9 @@ func initializeV1Alpha2AuthorityWithPlan(ctx context.Context, s *V1Alpha2StatusS
 	if _, ok := status["genesis"]; ok {
 		return s.snapshot(ref, obj)
 	}
+	if err := validateV1Alpha2ReplicaGenesis(cluster); err != nil {
+		return V1Alpha2StatusSnapshot{}, err
+	}
 	if plan == nil || len(bootstraps) != 1 || bootstraps[0] == nil {
 		return V1Alpha2StatusSnapshot{}, fmt.Errorf("genesis requires an explicit application initialization plan")
 	}

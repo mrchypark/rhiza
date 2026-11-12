@@ -96,6 +96,30 @@ while the current repair record exists. This is bounded membership management,
 not autoscaling. The initializer does not enforce `Recreate` or create/manage
 peer and client Services; those remain explicit deployment configuration.
 
+### External replica proposals
+
+External replica control is opt-in by setting `spec.replicas`; at creation the
+Deployment starts at `spec.voterCount`, because neither value may be below 3 or
+above 64. In this mode, HPA or KEDA must target the `RhizaCluster`, not its
+Deployment. For example:
+
+```sh
+kubectl scale rhizacluster/sql --replicas=4 -n rhiza
+```
+
+The operator remains the sole writer of the Deployment's replicas. Do not set
+Deployment replicas directly through GitOps or `kubectl scale deployment` in
+external mode; the CR is the proposal path. A Host must record a durable,
+unexpired, one-replica approval tied to the active CR UID/generation and
+Deployment UID/revision. The operator waits closed on a missing, stale, expired
+or mismatched approval, then applies the exact approval using the Deployment
+`/scale` resourceVersion. Downscale additionally requires a one-use Host proof
+of the operator's current nonce after the Host rechecks quorum; old proofs are
+invalidated when a new nonce is issued. A changed HPA proposal does not rewrite
+or strand a pinned step. If the operator is stopped, its actuator pauses, but
+healthy membership normally remains Rhiza-managed. This path performs no
+automatic DR or physical fencing.
+
 The shipped [RBAC](rbac.yaml) grants more than this reconciliation path uses:
 the operator Role includes Pod and Secret creation/deletion, Service creation,
 and recovery-object permissions. The Host Role can read cluster resources

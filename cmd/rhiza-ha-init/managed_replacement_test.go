@@ -46,6 +46,9 @@ func TestManagedReplacementLoopReconcilesClosedRepairWithoutSQLReadiness(t *test
 	if !callsSelector(loop.Body, "reconcileManagedReplacement") {
 		t.Fatal("background loop no longer invokes managed replacement reconciliation")
 	}
+	if !callsSelector(reconcile.Body, "ReconcileExternalReplicas") {
+		t.Fatal("managed reconciliation no longer evaluates external replica control first")
+	}
 	if callsSelector(loop.Body, "Ready") || callsSelector(reconcile.Body, "Ready") {
 		t.Fatal("SQL readiness must not gate control-plane reconciliation of a closed repair")
 	}
