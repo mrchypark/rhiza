@@ -130,7 +130,7 @@ spec:
       spec:
         containers:
           - name: app
-            image: ghcr.io/mrchypark/rhiza-operator:v0.23.2
+            image: ghcr.io/mrchypark/rhiza-operator:v0.25.0
 ```
 
 In external mode, HPA, KEDA, or an operator uses the `RhizaCluster` scale

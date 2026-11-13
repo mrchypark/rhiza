@@ -40,7 +40,7 @@ resources (including RoleBinding subjects), Secret and CR together. For an
 image override, review the operator image, profile `InitImage` and CR workload
 image separately; changing one does not replace the others.
 
-The example CR selects policy 9 and the public v0.23.2 reference-host image.
+The example CR selects policy 9 and the public v0.25.0 reference-host image.
 The managed reconciler requires exactly one workload container, although the
 CRD admits a list of up to 64. Its image must provide `rhiza-ha-init`; arbitrary
 app command/env/ports are not supported.
