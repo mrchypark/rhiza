@@ -1078,7 +1078,7 @@ func (m *Manager) confirmPublicationLease(ctx context.Context) error {
 		m.traceArchiveBusy(ctx, "unknown", m.publicationLockKey(), "missing_lease_context", "site", true)
 		return ErrArchiveBusy
 	}
-	current, err := m.readArchiveLock(ctx, m.publicationLockKey())
+	current, err := m.readArchiveLockVersion(ctx, m.publicationLockKey(), &lease)
 	if err != nil {
 		return err
 	}
@@ -1922,6 +1922,10 @@ func (m *Manager) withArchiveLock(ctx context.Context, key, owner string, gcTrac
 	var releaseErr error
 	if gcTrace {
 		releaseErr = archiveGCTrace(ctx, "lock-release", release)
+	} else if err == nil && len(renewErr) == 0 && lock.version != nil && lock.version.Value != "" {
+		// Renewal has stopped. Use the last confirmed version without masking a
+		// failed or ambiguous conditional release with another attempt.
+		releaseErr = m.expireArchiveLock(releaseCtx, key, *lock)
 	} else {
 		releaseErr = release()
 	}
@@ -2013,8 +2017,12 @@ func (m *Manager) releaseArchiveLock(ctx context.Context, key string, lock *arch
 		m.traceArchiveBusy(ctx, "unknown", key, "release_mismatch_or_conflict", "site", true)
 		return ErrArchiveBusy
 	}
-	current.LeaseUntilMS = time.Now().UnixMilli()
-	if err := m.writeArchiveLock(ctx, key, *current, objstore.WithIfMatch(current.version)); err != nil {
+	return m.expireArchiveLock(ctx, key, *current)
+}
+
+func (m *Manager) expireArchiveLock(ctx context.Context, key string, lock archiveGCLock) error {
+	lock.LeaseUntilMS = time.Now().UnixMilli()
+	if err := m.writeArchiveLock(ctx, key, lock, objstore.WithIfMatch(lock.version)); err != nil {
 		if m.bucket.IsConditionNotMetErr(err) {
 			m.traceArchiveBusy(ctx, "unknown", key, "release_mismatch_or_conflict", "site", true)
 			return ErrArchiveBusy
@@ -2079,9 +2087,21 @@ func (m *Manager) readGCLock(ctx context.Context) (*archiveGCLock, error) {
 }
 
 func (m *Manager) readArchiveLock(ctx context.Context, key string) (*archiveGCLock, error) {
-	attributes, data, _, err := m.readStableObject(ctx, key, nil, false, maxHeadSize)
+	return m.readArchiveLockVersion(ctx, key, nil)
+}
+
+func (m *Manager) readArchiveLockVersion(ctx context.Context, key string, known *archiveGCLock) (*archiveGCLock, error) {
+	var version *objstore.ObjectVersion
+	if known != nil {
+		version = known.version
+	}
+	attributes, data, unchanged, err := m.readStableObject(ctx, key, version, false, maxHeadSize)
 	if err != nil {
 		return nil, err
+	}
+	if unchanged {
+		// The version binds the fields decoded when the lease was acquired.
+		return known, nil
 	}
 	var lock archiveGCLock
 	if err := json.Unmarshal(data, &lock); err != nil {
