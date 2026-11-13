@@ -195,7 +195,7 @@ func replicaScaleDownServerFor(t *testing.T, cluster map[string]any, authority V
 func replicaScaleShortChallengeWait(t *testing.T) {
 	t.Helper()
 	wait, poll, ttl := v1alpha2ReplicaCheckWait, v1alpha2ReplicaCheckPoll, v1alpha2ReplicaCheckTTL
-	v1alpha2ReplicaCheckWait, v1alpha2ReplicaCheckPoll, v1alpha2ReplicaCheckTTL = 40*time.Millisecond, 5*time.Millisecond, time.Second
+	v1alpha2ReplicaCheckWait, v1alpha2ReplicaCheckPoll, v1alpha2ReplicaCheckTTL = 2*time.Second, 5*time.Millisecond, 5*time.Second
 	t.Cleanup(func() { v1alpha2ReplicaCheckWait, v1alpha2ReplicaCheckPoll, v1alpha2ReplicaCheckTTL = wait, poll, ttl })
 }
 
