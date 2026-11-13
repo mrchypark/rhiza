@@ -84,8 +84,11 @@ func (n *Node) CheckManagedLocalRead(ctx context.Context) error {
 		if _, err := n.checkInternalApplicationRuntime(ctx); err != nil {
 			return err
 		}
-		if !n.managedInitiallyAdmitted.Load() || !n.core.IsVoter() {
+		if !n.managedInitiallyAdmitted.Load() {
 			return network.ErrNotReady
+		}
+		if err := n.waitForManagedLocalReadVoter(ctx); err != nil {
+			return err
 		}
 		if err := n.material.ValidateManagedLocalSchema(ctx); err != nil {
 			return err

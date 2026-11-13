@@ -11,6 +11,20 @@ import (
 
 const managedMembershipTransitionWait = 10 * time.Second
 
+// A retained voter can observe the certified target before its terminal is locally durable.
+func (n *Node) waitForManagedLocalReadVoter(ctx context.Context) error {
+	if n.core.IsVoter() {
+		return nil
+	}
+	if err := n.waitForManagedVoterAdmission(ctx); err != nil {
+		return err
+	}
+	if !n.core.IsVoter() {
+		return network.ErrNotReady
+	}
+	return nil
+}
+
 // waitForManagedVoterAdmission keeps control-barrier and application
 // admission behind the certified terminal. A stable non-voter fails without
 // allocating a wait; only an actual retained transition uses the bounded poll.
