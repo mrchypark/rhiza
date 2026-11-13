@@ -116,14 +116,14 @@ func (s *Server) GraphExecute(ctx context.Context, command types.GraphCommand) (
 		return GraphExecuteResponse{}, err
 	}
 	defer unlock()
-	if matches, err := s.material.GraphRequestMatches(ctx, command); err != nil {
+	receipt, found, matches, err := s.material.GraphRequestStatus(ctx, command)
+	if err != nil {
 		return GraphExecuteResponse{}, err
-	} else if !matches {
+	}
+	if !matches {
 		return GraphExecuteResponse{}, ErrRequestConflict
 	}
-	if receipt, found, err := s.material.GraphMutationReceipt(ctx, command.RequestID); err != nil {
-		return GraphExecuteResponse{}, err
-	} else if found {
+	if found {
 		if err := s.waitReceiptDurable(ctx, receipt, command.RequestID); err != nil {
 			return GraphExecuteResponse{}, err
 		}
@@ -133,16 +133,14 @@ func (s *Server) GraphExecute(ctx context.Context, command types.GraphCommand) (
 	if err != nil {
 		return GraphExecuteResponse{}, commitUnknown(submitSlot, command.RequestID, err)
 	}
-	receipt, found, err := s.material.GraphMutationReceipt(ctx, command.RequestID)
+	receipt, found, matches, err = s.material.GraphRequestStatus(ctx, command)
 	if err != nil {
 		return GraphExecuteResponse{}, commitUnknown(submitSlot, command.RequestID, err)
 	}
 	if !found {
 		return GraphExecuteResponse{}, commitUnknown(submitSlot, command.RequestID, fmt.Errorf("graph mutation receipt is unavailable"))
 	}
-	if matches, err := s.material.GraphRequestMatches(ctx, command); err != nil {
-		return GraphExecuteResponse{}, commitUnknown(submitSlot, command.RequestID, err)
-	} else if !matches {
+	if !matches {
 		return GraphExecuteResponse{}, ErrRequestConflict
 	}
 	return GraphExecuteResponse{MutationReceipt: receipt}, nil
