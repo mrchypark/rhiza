@@ -61,7 +61,7 @@ func TestPreparedAdoptionCertifiedMembershipRoundTripBound(t *testing.T) {
 	var lastMembership quepaxa.MembershipRecord
 	var lastWritten []byte
 	identity := recovery.PreparedStartupIdentity{ClusterUID: "cluster", Generation: 0, DeploymentUID: "deployment", PodUID: "pod", NodeID: "a", SourceBinding: strings.Repeat("1", 64), ConfigDigest: strings.Repeat("2", 64)}
-	for cycle := 1; cycle <= 2; cycle++ {
+	for cycle := 1; cycle <= 8; cycle++ {
 		member := registerMembershipLearner(t, bucket, quepaxa.NodeID(fmt.Sprintf("rhiza-n-%064d", cycle)))
 		wal, err := qlog.Open(t.TempDir())
 		if err != nil {

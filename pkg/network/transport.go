@@ -39,6 +39,19 @@ func managedKVExecutionPolicy(policy sqlpolicy.MaterializationPolicy) bool {
 
 const peerRPCTimeout = 5 * time.Second
 const checkpointPrepareTimeout = 5 * time.Minute
+const peerIdleTimeout = 30 * time.Second
+
+// Keep-alive protects active streams during long peer computations. Superseded
+// configuration transports are retired explicitly instead of accumulating.
+func newPeerQUICConfig(maxIdleTimeout time.Duration) *quic.Config {
+	return &quic.Config{
+		HandshakeIdleTimeout:  5 * time.Second,
+		MaxIdleTimeout:        maxIdleTimeout,
+		KeepAlivePeriod:       10 * time.Second,
+		MaxIncomingStreams:    256,
+		MaxIncomingUniStreams: -1,
+	}
+}
 
 var errPeerRejected = errors.New("peer rejected request")
 var errTransportClosed = errors.New("peer transport is closed")
@@ -81,12 +94,14 @@ type Transport struct {
 	quic       *quic.Config
 	peers      map[quepaxa.NodeID]*peerConnection
 
-	resolverMu sync.RWMutex
-	resolver   clusterResolver
-	bound      atomic.Bool
-	dynamicMu  sync.Mutex
-	dynamic    map[uint]*Transport
-	closed     bool
+	resolverMu   sync.RWMutex
+	resolver     clusterResolver
+	bound        atomic.Bool
+	dynamicMu    sync.Mutex
+	dynamic      map[uint]*Transport
+	dynamicCount atomic.Int32
+	closed       bool
+	retired      atomic.Bool
 }
 
 // ManagedPeerProfile binds a new append-only peer protocol to the common
@@ -275,7 +290,7 @@ func newTransportWithProfile(clusterID types.ClusterID, localID quepaxa.NodeID, 
 			MinVersion: tls.VersionTLS13, NextProtos: []string{alpn},
 			ClientSessionCache: tls.NewLRUClientSessionCache(len(config.Members)),
 		},
-		quic: &quic.Config{HandshakeIdleTimeout: 5 * time.Second, MaxIdleTimeout: 30 * time.Second, KeepAlivePeriod: 10 * time.Second, MaxIncomingStreams: 256}, dynamic: make(map[uint]*Transport),
+		quic: newPeerQUICConfig(peerIdleTimeout), dynamic: make(map[uint]*Transport),
 	}, nil
 }
 
@@ -333,7 +348,7 @@ func (t *Transport) transportFor(config quepaxa.Cluster) (*Transport, error) {
 func (t *Transport) transportForID(id uint, snapshot func() quepaxa.Cluster) (*Transport, error) {
 	t.dynamicMu.Lock()
 	defer t.dynamicMu.Unlock()
-	if t.closed {
+	if t.closed || t.retired.Load() {
 		return nil, errTransportClosed
 	}
 	if peer := t.dynamic[id]; peer != nil {
@@ -344,9 +359,18 @@ func (t *Transport) transportForID(id uint, snapshot func() quepaxa.Cluster) (*T
 	if peer := t.dynamic[config.ConfigID]; peer != nil {
 		return peer, nil
 	}
-	// Each immutable configuration owns its pools and TLS session cache. A
-	// changed voter token therefore cannot reuse a previous configuration's
-	// connection or 0-RTT ticket.
+	peer, err := t.newConfigurationTransport(config)
+	if err != nil {
+		return nil, err
+	}
+	t.dynamic[config.ConfigID] = peer
+	t.dynamicCount.Add(1)
+	return peer, nil
+}
+
+// Each configuration owns its pools and TLS session cache. A changed voter
+// token therefore cannot reuse a previous configuration's connection or 0-RTT ticket.
+func (t *Transport) newConfigurationTransport(config quepaxa.Cluster) (*Transport, error) {
 	peer, err := newTransportWithProfile(t.clusterID, t.localID, &config, t.peerToken, nil, t.expectedPolicy, t.managedProfile)
 	if err != nil {
 		return nil, err
@@ -357,22 +381,76 @@ func (t *Transport) transportForID(id uint, snapshot func() quepaxa.Cluster) (*T
 			return nil, err
 		}
 	}
-	t.dynamic[config.ConfigID] = peer
 	return peer, nil
 }
 
+// transportForSlot is the cached-only compatibility form used by tests. Callers
+// that may address configurations older than current-1 must use a lease.
 func (t *Transport) transportForSlot(slot quepaxa.Slot) (*Transport, error) {
-	if core := t.resolverSnapshot(); core != nil {
-		return t.transportForID(core.ConfigIDForSlot(slot), func() quepaxa.Cluster { return core.ClusterForSlot(slot) })
+	peer, closePeer, err := t.transportForSlotLease(slot)
+	if closePeer != nil {
+		_ = peer.Close()
+		return nil, fmt.Errorf("historical configuration transport requires an explicit lease")
 	}
-	return t, nil
+	return peer, err
+}
+
+func (t *Transport) transportForSlotLease(slot quepaxa.Slot) (*Transport, func(), error) {
+	if core := t.resolverSnapshot(); core != nil {
+		configID := core.ConfigIDForSlot(slot)
+		currentID := core.ConfigID()
+		if currentID > 1 && configID < currentID-1 {
+			if t.closeRequested() {
+				return nil, nil, errTransportClosed
+			}
+			peer, err := t.newConfigurationTransport(core.ClusterForSlot(slot))
+			if err != nil {
+				return nil, nil, err
+			}
+			return peer, func() { _ = peer.Close() }, nil
+		}
+		peer, err := t.transportForID(configID, func() quepaxa.Cluster { return core.ClusterForSlot(slot) })
+		if err == nil && currentID > 1 && t.dynamicCount.Load() > 1 {
+			t.retireDynamicBefore(currentID - 1)
+		}
+		return peer, nil, err
+	}
+	if t.closeRequested() {
+		return nil, nil, errTransportClosed
+	}
+	return t, nil, nil
 }
 
 func (t *Transport) transportForCurrent() (*Transport, error) {
 	if core := t.resolverSnapshot(); core != nil {
-		return t.transportForID(core.ConfigID(), core.CurrentCluster)
+		peer, err := t.transportForID(core.ConfigID(), core.CurrentCluster)
+		if err == nil && peer.configID > 1 && t.dynamicCount.Load() > 1 {
+			t.retireDynamicBefore(peer.configID - 1)
+		}
+		return peer, err
+	}
+	if t.closeRequested() {
+		return nil, errTransportClosed
 	}
 	return t, nil
+}
+
+func (t *Transport) closeRequested() bool {
+	t.dynamicMu.Lock()
+	defer t.dynamicMu.Unlock()
+	return t.closed || t.retired.Load()
+}
+
+func (t *Transport) retireDynamicBefore(configID uint) {
+	t.dynamicMu.Lock()
+	for id, peer := range t.dynamic {
+		if id < configID {
+			delete(t.dynamic, id)
+			t.dynamicCount.Add(-1)
+			peer.retire()
+		}
+	}
+	t.dynamicMu.Unlock()
 }
 
 func (t *Transport) request(operation peerfb.Operation) *peerfb.RequestT {
@@ -453,6 +531,10 @@ func (t *Transport) connectionDiagnostic(ctx context.Context, to quepaxa.NodeID)
 	peer.mu.Lock()
 	diagnostic.MutexWait = time.Since(mutexStarted)
 	diagnostic.MutexWaitKnown = true
+	if t.retired.Load() {
+		peer.mu.Unlock()
+		return nil, diagnostic, errTransportClosed
+	}
 	defer peer.mu.Unlock()
 	if peer.conn == nil || peer.conn.Context().Err() != nil {
 		phase = "peer-identity"
@@ -632,9 +714,12 @@ func (t *Transport) PrepareCheckpoint(ctx context.Context, seal quepaxa.Checkpoi
 	if err := ctx.Err(); err != nil {
 		return err
 	}
-	peer, err := t.transportForSlot(seal.Index)
+	peer, closePeer, err := t.transportForSlotLease(seal.Index)
 	if err != nil {
 		return err
+	}
+	if closePeer != nil {
+		defer closePeer()
 	}
 	if peer != t {
 		return peer.PrepareCheckpoint(ctx, seal)
@@ -713,9 +798,43 @@ func (t *Transport) release(to quepaxa.NodeID, conn *quic.Conn) {
 		delete(peer.active, conn)
 	}
 	stale := peer.conn != conn
+	retired := t.retired.Load()
+	if remaining == 0 && retired && peer.conn == conn {
+		peer.conn = nil
+	}
 	peer.mu.Unlock()
-	if remaining == 0 && stale {
+	if remaining == 0 && (stale || retired) {
 		_ = conn.CloseWithError(0, "reconnect")
+	}
+}
+
+func (t *Transport) retire() {
+	if !t.retired.CompareAndSwap(false, true) {
+		return
+	}
+	t.dynamicMu.Lock()
+	children := make([]*Transport, 0, len(t.dynamic))
+	for _, peer := range t.dynamic {
+		children = append(children, peer)
+	}
+	clear(t.dynamic)
+	t.dynamicCount.Store(0)
+	t.dynamicMu.Unlock()
+	for _, peer := range children {
+		peer.retire()
+	}
+
+	var idle []*quic.Conn
+	for _, peer := range t.peers {
+		peer.mu.Lock()
+		if len(peer.active) == 0 && peer.conn != nil {
+			idle = append(idle, peer.conn)
+			peer.conn = nil
+		}
+		peer.mu.Unlock()
+	}
+	for _, conn := range idle {
+		_ = conn.CloseWithError(0, "configuration retired")
 	}
 }
 
@@ -776,9 +895,12 @@ func (t *Transport) FetchFrozenTargetDecisions(ctx context.Context, source quepa
 }
 
 func (t *Transport) SendRecord(ctx context.Context, to quepaxa.NodeID, request quepaxa.RecordRequest) (quepaxa.Summary, error) {
-	peer, err := t.transportForSlot(request.Slot)
+	peer, closePeer, err := t.transportForSlotLease(request.Slot)
 	if err != nil {
 		return quepaxa.Summary{}, err
+	}
+	if closePeer != nil {
+		defer closePeer()
 	}
 	if peer != t {
 		return peer.SendRecord(ctx, to, request)
@@ -811,16 +933,22 @@ func (t *Transport) SendDecision(ctx context.Context, decision quepaxa.Decision)
 		if control, err := quepaxa.DecodeReconfiguration(decision.Proposal.Value); err != nil {
 			return err
 		} else if control {
-			peer, err := t.transportForSlot(decision.Slot)
+			peer, closePeer, err := t.transportForSlotLease(decision.Slot)
 			if err != nil {
 				return err
+			}
+			if closePeer != nil {
+				defer closePeer()
 			}
 			return peer.sendFreezeDecision(ctx, decision)
 		}
 	}
-	peer, err := t.transportForSlot(decision.Slot)
+	peer, closePeer, err := t.transportForSlotLease(decision.Slot)
 	if err != nil {
 		return err
+	}
+	if closePeer != nil {
+		defer closePeer()
 	}
 	if peer != t {
 		return peer.SendDecision(ctx, decision)
@@ -1273,6 +1401,7 @@ func (t *Transport) Close() error {
 		peers = append(peers, peer)
 	}
 	clear(t.dynamic)
+	t.dynamicCount.Store(0)
 	t.dynamicMu.Unlock()
 	for _, peer := range peers {
 		_ = peer.Close()

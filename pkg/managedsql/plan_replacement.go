@@ -27,6 +27,9 @@ func (h *Host) PlanVoterReplacement(ctx context.Context, replacement operator.V1
 	if err != nil {
 		return nil, err
 	}
+	if err := rejectReplicaDownStep(a); err != nil {
+		return nil, err
+	}
 	if replacement.NodeID != "" {
 		retired, err := h.node.ManagedVoterRetired(replacement.NodeID)
 		if err != nil {

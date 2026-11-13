@@ -1,6 +1,6 @@
 {
   "ApplicationProtocol": "rhiza-managed-request-append-only/v1",
-  "InitImage": "ghcr.io/mrchypark/rhiza-operator:v0.23.2",
+  "InitImage": "ghcr.io/mrchypark/rhiza-operator:v0.25.0",
   "PeerPort": 9000,
   "EvidenceFormat": "rhiza-managed-request-append-only/v1",
   "ProfileSecretName": "runtime",

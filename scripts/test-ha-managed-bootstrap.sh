@@ -154,7 +154,7 @@ fi
 published_install_only=${RHIZA_MANAGED_PUBLISHED_INSTALL_ONLY-false}
 functional_scenario=${RHIZA_MANAGED_FUNCTIONAL_SCENARIO-}
 case "$functional_scenario" in
-  ''|scale-up|quorum) ;;
+  ''|scale-up|quorum|external-scale|external-high) ;;
   *) echo 'invalid RHIZA_MANAGED_FUNCTIONAL_SCENARIO' >&2; exit 1 ;;
 esac
 managed_install_mode_valid "$published_install_only" "${RHIZA_MANAGED_FIXTURE_CASE-internal}"
@@ -179,7 +179,21 @@ built=0
 fault_name=
 release="rhiza-kind-chaos-$nonce"
 control=managed-chaos-control
-k() { kubectl --kubeconfig "$kubeconfig" --context "kind-$cluster" --request-timeout=30s "$@"; }
+k() {
+  case " $* " in
+    *" get rhizacluster sql --watch -o json "*)
+      kubectl --kubeconfig "$kubeconfig" --context "kind-$cluster" --request-timeout=0 "$@"
+      return
+      ;;
+    *" apply --validate=strict -f $logs/requested-cluster.json "*)
+      case "$functional_scenario" in external-scale|external-high)
+        managed_functional_external_opt_in "$logs/requested-cluster.json"
+        ;;
+      esac
+      ;;
+  esac
+  kubectl --kubeconfig "$kubeconfig" --context "kind-$cluster" --request-timeout=30s "$@"
+}
 chaos_k() { k -n "$namespace" "$@"; }
 chaos_scope_guard() {
   [ "$(k get namespace "$namespace" -o jsonpath='{.metadata.uid}')" = "$chaos_namespace_uid" ]

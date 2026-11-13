@@ -31,6 +31,7 @@ type V1Alpha2ClusterSpec struct {
 	GenesisIntent               *string          `json:"genesisIntent,omitempty"`
 	LogicalID                   string           `json:"logicalID"`
 	VoterCount                  int32            `json:"voterCount"`
+	Replicas                    *int32           `json:"replicas,omitempty"`
 	Workload                    V1Alpha2Workload `json:"workload"`
 	AutomaticRecovery           string           `json:"automaticRecovery,omitempty"`
 	ProvisionalRetentionSeconds *int64           `json:"provisionalRetentionSeconds,omitempty"`
@@ -100,6 +101,9 @@ func ValidateV1Alpha2Cluster(c V1Alpha2Cluster) error {
 	if c.Spec.VoterCount < 3 || c.Spec.VoterCount > 64 {
 		return fmt.Errorf("voterCount must be between 3 and 64")
 	}
+	if c.Spec.Replicas != nil && (*c.Spec.Replicas < 3 || *c.Spec.Replicas > 64) {
+		return fmt.Errorf("replicas must be between 3 and 64")
+	}
 	if c.Spec.AutomaticRecovery != "" && c.Spec.AutomaticRecovery != "OFF" && c.Spec.AutomaticRecovery != "A" && c.Spec.AutomaticRecovery != "B" {
 		return fmt.Errorf("invalid automaticRecovery")
 	}
@@ -156,7 +160,7 @@ func ValidateV1Alpha2ClusterUpdate(old, next V1Alpha2Cluster) error {
 	if err := validateV1Alpha2MetadataUpdate(old.Metadata, next.Metadata); err != nil {
 		return err
 	}
-	if !reflect.DeepEqual(old.Spec.GenesisIntent, next.Spec.GenesisIntent) || old.Spec.LogicalID != next.Spec.LogicalID || next.Spec.VoterCount < old.Spec.VoterCount-1 || !reflect.DeepEqual(old.Spec.Workload, next.Spec.Workload) {
+	if !reflect.DeepEqual(old.Spec.GenesisIntent, next.Spec.GenesisIntent) || old.Spec.LogicalID != next.Spec.LogicalID || next.Spec.VoterCount < old.Spec.VoterCount-1 || !reflect.DeepEqual(old.Spec.Workload, next.Spec.Workload) || (old.Spec.Replicas != nil) != (next.Spec.Replicas != nil) {
 		return fmt.Errorf("unsupported cluster identity or workload update")
 	}
 	return nil

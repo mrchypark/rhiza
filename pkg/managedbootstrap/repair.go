@@ -14,6 +14,7 @@ import (
 	"path/filepath"
 	"reflect"
 
+	"github.com/mrchypark/rhiza/internal/atomicdir"
 	objectstore "github.com/mrchypark/rhiza/internal/objstore"
 	"github.com/mrchypark/rhiza/internal/sqlpolicy"
 	"github.com/mrchypark/rhiza/internal/types"
@@ -29,6 +30,18 @@ import (
 
 const RepairHandoffPath = "/var/lib/rhiza/repair.json"
 const RepairFileLimit = operator.V1Alpha2RepairRecordLimit
+
+const repairRestoredMarkerName = "repair-restored.json"
+const repairRestoredMarkerLimit = 16 << 10
+const repairPreparedMarkerHashLimit = 1 << 30
+
+type repairRestoredMarker struct {
+	Version        int                              `json:"version"`
+	Identity       recovery.PreparedStartupIdentity `json:"identity"`
+	PlanDigest     string                           `json:"planDigest"`
+	CompletionHash [32]byte                         `json:"completionHash"`
+	HeadHash       [32]byte                         `json:"headHash"`
+}
 
 type RepairGateFile struct {
 	Version int                               `json:"version"`
@@ -251,6 +264,320 @@ func ReadGateFile(path string, dst any, limit int64, private bool) error {
 	return nil
 }
 
+func repairPreparationFailed(err error) error {
+	return fmt.Errorf("repair preparation failed: %w", err)
+}
+
+func repairPreparedVerificationFailed(err error) error {
+	return fmt.Errorf("repair prepared data verification failed: %w", err)
+}
+
+func readRepairRestoredMarker(dataDir, planDigest string, expected recovery.PreparedStartupIdentity) (repairRestoredMarker, bool, error) {
+	var marker repairRestoredMarker
+	info, err := os.Lstat(dataDir)
+	if errors.Is(err, os.ErrNotExist) {
+		return marker, false, nil
+	}
+	if err != nil || !info.IsDir() || info.Mode()&os.ModeSymlink != 0 {
+		return marker, false, errors.New("unsafe repair data directory")
+	}
+	name := filepath.Join(dataDir, repairRestoredMarkerName)
+	info, err = os.Lstat(name)
+	if errors.Is(err, os.ErrNotExist) {
+		return marker, false, nil
+	}
+	if err != nil || !info.Mode().IsRegular() || info.Mode()&os.ModeSymlink != 0 || info.Mode().Perm()&0o077 != 0 || info.Size() > repairRestoredMarkerLimit {
+		return marker, true, errors.New("invalid repair readiness marker")
+	}
+	f, err := os.Open(name)
+	if err != nil {
+		return marker, true, errors.New("repair readiness marker unavailable")
+	}
+	opened, err := f.Stat()
+	if err != nil || !os.SameFile(info, opened) {
+		_ = f.Close()
+		return marker, true, errors.New("repair readiness marker changed")
+	}
+	data, readErr := io.ReadAll(io.LimitReader(f, repairRestoredMarkerLimit+1))
+	closeErr := f.Close()
+	if readErr != nil || closeErr != nil || len(data) > repairRestoredMarkerLimit {
+		return marker, true, errors.New("invalid repair readiness marker")
+	}
+	decoder := json.NewDecoder(bytes.NewReader(data))
+	decoder.DisallowUnknownFields()
+	if decoder.Decode(&marker) != nil || decoder.Decode(new(any)) != io.EOF {
+		return marker, true, errors.New("invalid repair readiness marker encoding")
+	}
+	if marker.Version != 1 || marker.CompletionHash == [32]byte{} || marker.HeadHash == [32]byte{} {
+		return marker, true, errors.New("invalid repair readiness marker")
+	}
+	if marker.Identity != expected {
+		return marker, true, errors.New("repair readiness marker identity mismatch")
+	}
+	if marker.PlanDigest == "" || marker.PlanDigest != planDigest {
+		return marker, true, errors.New("repair readiness marker plan mismatch")
+	}
+	return marker, true, nil
+}
+
+func writeRepairRestoredMarker(dataDir string, marker repairRestoredMarker) error {
+	info, err := os.Lstat(dataDir)
+	if err != nil || !info.IsDir() || info.Mode()&os.ModeSymlink != 0 {
+		return errors.New("unsafe repair data directory")
+	}
+	data, err := json.Marshal(marker)
+	if err != nil || len(data) > repairRestoredMarkerLimit {
+		return errors.New("invalid repair readiness marker")
+	}
+	f, err := os.CreateTemp(dataDir, ".repair-restored-*")
+	if err != nil {
+		return err
+	}
+	tmp := f.Name()
+	defer os.Remove(tmp)
+	if err := f.Chmod(0o600); err != nil {
+		_ = f.Close()
+		return err
+	}
+	if _, err := f.Write(data); err != nil {
+		_ = f.Close()
+		return err
+	}
+	if err := errors.Join(f.Sync(), f.Close()); err != nil {
+		return err
+	}
+	name := filepath.Join(dataDir, repairRestoredMarkerName)
+	if err := os.Link(tmp, name); err != nil {
+		return fmt.Errorf("publish repair readiness marker: %w", err)
+	}
+	published, err := os.Lstat(name)
+	if err != nil || !published.Mode().IsRegular() || published.Mode().Perm() != 0o600 {
+		return errors.New("invalid published repair readiness marker")
+	}
+	dir, err := os.Open(dataDir)
+	if err != nil {
+		return err
+	}
+	return errors.Join(dir.Sync(), dir.Close())
+}
+
+func hashRepairPreparedCompletion(preparedDir string) ([32]byte, error) {
+	var sum [32]byte
+	name := filepath.Join(preparedDir, "completed.json")
+	info, err := os.Lstat(name)
+	if err != nil || !info.Mode().IsRegular() || info.Mode()&os.ModeSymlink != 0 || info.Size() > repairPreparedMarkerHashLimit {
+		return sum, errors.New("invalid repair prepared completion marker")
+	}
+	f, err := os.Open(name)
+	if err != nil {
+		return sum, err
+	}
+	opened, err := f.Stat()
+	if err != nil || !os.SameFile(info, opened) {
+		_ = f.Close()
+		return sum, errors.New("repair prepared completion marker changed")
+	}
+	h := sha256.New()
+	n, err := io.Copy(h, io.LimitReader(f, repairPreparedMarkerHashLimit+1))
+	closeErr := f.Close()
+	if err != nil || closeErr != nil || n > repairPreparedMarkerHashLimit {
+		return sum, errors.Join(err, closeErr, errors.New("invalid repair prepared completion marker"))
+	}
+	copy(sum[:], h.Sum(nil))
+	return sum, nil
+}
+
+func repairDataDirDurableEvidence(dataDir string) (bool, error) {
+	pending := filepath.Join(dataDir, "prepared-adoption.pending")
+	if _, err := os.Lstat(pending); err == nil {
+		return true, nil
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return false, err
+	}
+	qlog := filepath.Join(dataDir, "qlog")
+	info, err := os.Lstat(qlog)
+	if errors.Is(err, os.ErrNotExist) {
+		return false, nil
+	}
+	if err != nil || !info.IsDir() || info.Mode()&os.ModeSymlink != 0 {
+		return false, errors.New("unsafe durable qlog evidence")
+	}
+	entries, err := os.ReadDir(qlog)
+	if err != nil {
+		return false, err
+	}
+	for _, entry := range entries {
+		if entry.Name() != "lock.qlog" {
+			return true, nil
+		}
+	}
+	return false, nil
+}
+
+func inspectRepairRestoredState(dataDir, planDigest string, expected recovery.PreparedStartupIdentity) (repairRestoredMarker, bool, error) {
+	marker, present, err := readRepairRestoredMarker(dataDir, planDigest, expected)
+	if err != nil || present {
+		return marker, present, err
+	}
+	durable, err := repairDataDirDurableEvidence(dataDir)
+	if err != nil {
+		return marker, false, fmt.Errorf("repair durable local evidence inspection failed: %w", err)
+	}
+	if durable {
+		return marker, false, errors.New("repair readiness marker absent while durable local qlog/identity evidence exists; preserve DataDir")
+	}
+	return marker, false, nil
+}
+
+func inspectRepairPreparedDirectory(path string) (exists, complete bool, err error) {
+	if err := safeRepairDirectoryParent(path); err != nil {
+		return false, false, err
+	}
+	info, err := os.Lstat(path)
+	if errors.Is(err, os.ErrNotExist) {
+		return false, false, nil
+	}
+	if err != nil {
+		return false, false, err
+	}
+	if !info.IsDir() || info.Mode()&os.ModeSymlink != 0 {
+		return false, false, errors.New("unsafe repair prepared directory")
+	}
+	marker, err := os.Lstat(filepath.Join(path, "completed.json"))
+	if errors.Is(err, os.ErrNotExist) {
+		return true, false, nil
+	}
+	if err != nil {
+		return false, false, err
+	}
+	if !marker.Mode().IsRegular() {
+		return false, false, errors.New("unsafe repair prepared completion marker")
+	}
+	return true, true, nil
+}
+
+func safeRepairDirectoryParent(path string) error {
+	info, err := os.Lstat(filepath.Dir(path))
+	if err != nil || !info.IsDir() || info.Mode()&os.ModeSymlink != 0 {
+		return errors.New("unsafe repair directory parent")
+	}
+	return nil
+}
+
+func reserveRepairSiblingPath(parent, prefix string) (string, error) {
+	if prefix == "" || filepath.Base(prefix) != prefix {
+		return "", errors.New("invalid repair sibling prefix")
+	}
+	if err := safeRepairDirectoryParent(filepath.Join(parent, prefix)); err != nil {
+		return "", err
+	}
+	f, err := os.CreateTemp(parent, prefix)
+	if err != nil {
+		return "", err
+	}
+	name := f.Name()
+	if err := errors.Join(f.Close(), os.Remove(name)); err != nil {
+		return "", err
+	}
+	return name, nil
+}
+
+func quarantineRepairDirectory(path, prefix string) (string, error) {
+	info, err := os.Lstat(path)
+	if err != nil || !info.IsDir() || info.Mode()&os.ModeSymlink != 0 {
+		return "", errors.New("unsafe repair quarantine source")
+	}
+	parent := filepath.Dir(path)
+	target, err := reserveRepairSiblingPath(parent, prefix)
+	if err != nil {
+		return "", err
+	}
+	if err := atomicdir.RenameNoReplace(path, target); err != nil {
+		return "", fmt.Errorf("quarantine repair directory: %w", err)
+	}
+	return target, nil
+}
+
+func ensureRepairPreparedDirectory(path string, validate, publish func() error) error {
+	exists, complete, err := inspectRepairPreparedDirectory(path)
+	if err != nil {
+		return err
+	}
+	if complete {
+		if err := validate(); err == nil {
+			return nil
+		}
+		complete = false
+	}
+	if exists && !complete {
+		if _, err := quarantineRepairDirectory(path, "."+filepath.Base(path)+"-quarantine-"); err != nil {
+			return err
+		}
+	}
+	if !complete {
+		if err := publish(); err != nil {
+			return err
+		}
+		exists, complete, err = inspectRepairPreparedDirectory(path)
+		if err != nil {
+			return err
+		}
+		if !exists || !complete {
+			return errors.New("repair prepared directory publication is incomplete")
+		}
+		if err := validate(); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func ensureUnadoptedRepairDataDirAbsent(dataDir string) error {
+	if err := safeRepairDirectoryParent(dataDir); err != nil {
+		return err
+	}
+	info, err := os.Lstat(dataDir)
+	if errors.Is(err, os.ErrNotExist) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	if !info.IsDir() || info.Mode()&os.ModeSymlink != 0 {
+		return errors.New("unsafe repair data directory")
+	}
+	adoption, err := os.Lstat(filepath.Join(dataDir, "prepared-adoption.json"))
+	if err == nil {
+		if adoption.Mode().IsRegular() {
+			return errors.New("repair adoption appeared during preparation")
+		}
+		return errors.New("unsafe repair adoption record")
+	}
+	if !errors.Is(err, os.ErrNotExist) {
+		return err
+	}
+	_, err = quarantineRepairDirectory(dataDir, "."+filepath.Base(dataDir)+"-quarantine-")
+	return err
+}
+
+func validateRepairPromotionPaths(stagingDir, finalDir string) error {
+	stagingDir = filepath.Clean(stagingDir)
+	finalDir = filepath.Clean(finalDir)
+	if stagingDir == finalDir || filepath.Dir(stagingDir) != filepath.Dir(finalDir) || filepath.Base(stagingDir) == "." || filepath.Base(finalDir) == "." {
+		return errors.New("ambiguous repair staging and final directories")
+	}
+	if err := safeRepairDirectoryParent(finalDir); err != nil {
+		return err
+	}
+	if _, err := os.Lstat(stagingDir); !errors.Is(err, os.ErrNotExist) {
+		return errors.New("repair staging directory is not absent")
+	}
+	if _, err := os.Lstat(finalDir); !errors.Is(err, os.ErrNotExist) {
+		return errors.New("repair final directory is not absent")
+	}
+	return nil
+}
+
 // The returned cleanup owns only the SDK handle. Failed/partial local evidence
 // is preserved; an existing adopted DataDir is never reconstructed over itself.
 func ManagedRepairConfig(ctx context.Context, kube *operator.Kubernetes, ref operator.V1Alpha2ClusterRef, podName, podUID, identity, bootstrapPath, repairPath string, profile operator.V1Alpha2RuntimeProfile) (managedsql.Config, func() error, error) {
@@ -307,6 +634,18 @@ func ManagedRepairConfig(ctx context.Context, kube *operator.Kubernetes, ref ope
 	if err != nil || capture.SourceRoot != cfg.StorageRoot || capture.SourcePrefix != namespace.FinalPrefix || capture.PhysicalBinding != physical || cfg.Plan.PhysicalBinding != physical {
 		return empty, noop, errors.New("repair physical profile mismatch")
 	}
+	dataInfo, err := os.Lstat(cfg.Runtime.DataDir)
+	if err == nil {
+		if !dataInfo.IsDir() || dataInfo.Mode()&os.ModeSymlink != 0 {
+			return empty, noop, errors.New("unsafe repair data directory")
+		}
+		if err := safeRepairDirectoryParent(cfg.Runtime.DataDir); err != nil {
+			return empty, noop, errors.New("adoption inspection failed")
+		}
+	}
+	if err != nil && !errors.Is(err, os.ErrNotExist) {
+		return empty, noop, errors.New("adoption inspection failed")
+	}
 	adoption, err := os.Lstat(filepath.Join(cfg.Runtime.DataDir, "prepared-adoption.json"))
 	if err == nil {
 		if !adoption.Mode().IsRegular() {
@@ -357,22 +696,50 @@ func ManagedRepairConfig(ctx context.Context, kube *operator.Kubernetes, ref ope
 		return fail(err)
 	}
 	expected := recovery.PreparedStartupIdentity{ClusterUID: ref.UID, Generation: cfg.Plan.Generation, DeploymentUID: cfg.Plan.DeploymentUID, PodUID: podUID, NodeID: string(cfg.Runtime.NodeID), SourceBinding: physical, ConfigDigest: member}
-	preparedDir := filepath.Join(filepath.Dir(cfg.Runtime.DataDir), "repair-prepared-"+capture.PlanDigest)
-	if _, err := os.Lstat(preparedDir); errors.Is(err, os.ErrNotExist) {
-		if err := recovery.PublishPreparedStartupForPolicy(ctx, view, preparedDir, expected, policy, window); err != nil {
-			return fail(errors.New("repair preparation failed"))
-		}
-	} else if err != nil {
-		return fail(err)
-	}
-	var prepared *recovery.VerifiedPreparedStartup
-	if sqlpolicy.IsManagedAppendOnlyApplicationProtocol(protocol) {
-		prepared, err = recovery.LoadPreparedStartupForApplicationProtocol(ctx, readonly, capture.SourcePrefix, 1, trusted, preparedDir, cfg.Runtime.DataDir, expected, policy, window, protocol, c.EnableReconfiguration)
-	} else {
-		prepared, err = recovery.LoadPreparedStartupForPolicyWithReconfiguration(ctx, readonly, capture.SourcePrefix, 1, trusted, preparedDir, cfg.Runtime.DataDir, expected, policy, window, c.EnableReconfiguration)
-	}
+	restoredMarker, markerPresent, err := inspectRepairRestoredState(cfg.Runtime.DataDir, capture.PlanDigest, expected)
 	if err != nil {
-		return fail(errors.New("repair prepared data verification failed"))
+		return fail(fmt.Errorf("repair readiness marker validation failed: %w", err))
+	}
+	preparedDir := filepath.Join(filepath.Dir(cfg.Runtime.DataDir), "repair-prepared-"+capture.PlanDigest)
+	if err := ensureRepairPreparedDirectory(preparedDir, func() error {
+		return recovery.ValidatePreparedStartupDirectoryForPolicy(ctx, preparedDir, expected, policy, window, protocol)
+	}, func() error {
+		return recovery.PublishPreparedStartupForPolicy(ctx, view, preparedDir, expected, policy, window)
+	}); err != nil {
+		return fail(repairPreparationFailed(err))
+	}
+	completionHash, err := hashRepairPreparedCompletion(preparedDir)
+	if err != nil {
+		return fail(repairPreparedVerificationFailed(err))
+	}
+	if markerPresent {
+		if restoredMarker.CompletionHash != completionHash || restoredMarker.HeadHash != view.HeadHash() {
+			return fail(errors.New("repair readiness marker differs from verified preparation"))
+		}
+		prepared, err := recovery.VerifyRestoredPreparedStartupForPolicy(ctx, cfg.Runtime.DataDir, preparedDir, view, expected, policy, window, protocol)
+		if err != nil {
+			return fail(repairPreparedVerificationFailed(err))
+		}
+		cfg.Prepared = prepared
+		return cfg, closeBucket, nil
+	}
+	if err := ensureUnadoptedRepairDataDirAbsent(cfg.Runtime.DataDir); err != nil {
+		return fail(repairPreparedVerificationFailed(err))
+	}
+	stagingDir, err := reserveRepairSiblingPath(filepath.Dir(cfg.Runtime.DataDir), ".repair-data-staging-"+capture.PlanDigest+"-")
+	if err != nil {
+		return fail(repairPreparedVerificationFailed(err))
+	}
+	if err := validateRepairPromotionPaths(stagingDir, cfg.Runtime.DataDir); err != nil {
+		return fail(repairPreparedVerificationFailed(err))
+	}
+	prepared, err := recovery.LoadPreparedStartupForPolicyIntoStagingAndPromote(ctx, readonly, capture.SourcePrefix, 1, trusted, preparedDir, stagingDir, cfg.Runtime.DataDir, expected, policy, window, protocol, c.EnableReconfiguration)
+	if err != nil {
+		return fail(repairPreparedVerificationFailed(err))
+	}
+	marker := repairRestoredMarker{Version: 1, Identity: expected, PlanDigest: capture.PlanDigest, CompletionHash: completionHash, HeadHash: view.HeadHash()}
+	if err := writeRepairRestoredMarker(cfg.Runtime.DataDir, marker); err != nil {
+		return fail(repairPreparedVerificationFailed(fmt.Errorf("write repair readiness marker: %w", err)))
 	}
 	cfg.Prepared = prepared
 	return cfg, closeBucket, nil

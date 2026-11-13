@@ -53,6 +53,9 @@ type sqlEvidence struct {
 
 type Host struct {
 	mu sync.Mutex
+	// replicaMu serializes both public membership entry points and the Host's
+	// external scale coordinator. Status CAS remains the durable authority.
+	replicaMu sync.Mutex
 	// Initial admission is the only quorum-dependent setup step. Serialize it
 	// independently so local reads and readiness never queue behind mutations.
 	admissionMu sync.Mutex

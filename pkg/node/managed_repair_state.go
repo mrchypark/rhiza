@@ -17,6 +17,8 @@ import (
 // has not appeared yet; malformed or mismatched registration is an error.
 type ManagedRepairSnapshot struct {
 	Current            quepaxa.Cluster
+	Pending            quepaxa.Cluster
+	PendingOK          bool
 	AbortSlot          quepaxa.Slot
 	LocalWALIdentity   string
 	LearnerWALIdentity string
@@ -38,8 +40,12 @@ func (n *Node) ManagedRepairSnapshot(ctx context.Context, learnerID quepaxa.Node
 	}
 	current := n.core.CurrentCluster()
 	current.Members = append([]quepaxa.Member(nil), current.Members...)
+	pending, pendingOK := n.core.PendingReconfiguration()
+	if pendingOK {
+		pending.Members = append([]quepaxa.Member(nil), pending.Members...)
+	}
 	abort, _, _ := n.core.LastReconfigurationAbort()
-	result := ManagedRepairSnapshot{Current: current, AbortSlot: abort, LocalWALIdentity: n.core.WALIdentity()}
+	result := ManagedRepairSnapshot{Current: current, Pending: pending, PendingOK: pendingOK, AbortSlot: abort, LocalWALIdentity: n.core.WALIdentity()}
 	if learnerID == "" {
 		return result, nil
 	}

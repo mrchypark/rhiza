@@ -2,9 +2,31 @@
 # shellcheck disable=SC2154
 # Functional scale qualification invoked by test-ha-managed-bootstrap.sh after
 # the existing three-voter bootstrap and SQL/XKV readback have passed.
+functional_replica_watch_pid=
 
 managed_functional_node_id() {
   printf 'rhiza-managed-node-v1\000%s' "$1" | sha256sum | awk '{print "rhiza-n-"$1}'
+}
+
+managed_functional_bootstrap_roster() {
+  mfbr_file=$1 mfbr_watch=${2-false}
+  jq -sc --argjson watch "$mfbr_watch" '
+    def normalize: if has("object") then .object else . end;
+    (if $watch then
+       (first(.[] | normalize |
+          select((.status|type)=="object" and
+            (((.status|has("appliedVoterCount")) and (.status.appliedVoterCount != null)) or
+             (.spec.replicas? == 3 and
+              ((.status|has("replicaStep"))|not) and
+              ((.status|has("replicaCheck"))|not))))) // error("bootstrap event not found"))
+     else
+       (.[0] | normalize)
+     end)
+    | .status.bootstrapPlan.members
+    | map(.member.node_id)
+    | sort
+    | if all(.[]; type=="string" and length>0) then . else error("bootstrap roster lacks member.node_id") end
+  ' "$mfbr_file"
 }
 
 managed_functional_roster_oracle() {
@@ -23,7 +45,7 @@ managed_functional_roster_oracle() {
   fi
   [ -n "$mfr_sequence" ] || mfr_sequence=add
   if [ "$mfr_sequence" = bootstrap ]; then
-    mfr_roster=$(jq -c '.status.bootstrapPlan.members|map(.member.ID)|sort' "$mfr_cr")
+    mfr_roster=$(managed_functional_bootstrap_roster "$mfr_cr") || return 1
   else
     jq -e --argjson target "$mfr_target" --arg sequence "$mfr_sequence" '.status.repair.state=="Completed" and .status.repair.plan.sequence==$sequence and .status.repair.completion.kind=="Terminal" and (.status.repair.completion.finalVoterIDs|length)==$target and ((.status.repair.completion.finalVoterIDs|unique|length)==$target)' "$mfr_cr" >/dev/null || return 1
     mfr_roster=$(jq -c '.status.repair.completion.finalVoterIDs|sort' "$mfr_cr")
@@ -570,6 +592,9 @@ managed_functional_verify_leave() {
 }
 
 managed_functional_capture() {
+  if [ -n "$functional_replica_watch_pid" ]; then
+    managed_functional_stop_replica_watch
+  fi
   if [ -n "${functional_client_pod-}" ]; then
     k -n "$namespace" get job,pod -l rhiza-ci-owner=harness -o json > "$logs/functional-client-state.json" 2>/dev/null || :
     k -n "$namespace" exec "$functional_client_pod" -c client -- touch /work/stop >/dev/null 2>&1 || :
@@ -589,6 +614,452 @@ managed_functional_capture() {
     cat "$logs/functional-reads.tsv" "$logs/functional-one-reads.tsv" > "$logs/functional-all-reads.tsv" 2>/dev/null || :
     k -n "$namespace" exec "$functional_client_pod" -c client -- touch /work/probe-done >/dev/null 2>&1 || :
   fi
+}
+managed_functional_external_target_valid() {
+  case "$1" in ''|*[!0-9]*) return 1 ;; esac
+  [ "$1" -ge 3 ] && [ "$1" -le 64 ]
+}
+
+managed_functional_external_high_sequence='3 4 5 6 7 8 9 10 9 8 7 6 5 4 3'
+
+managed_functional_external_opt_in() {
+  mfeo_file=$1
+  case "$functional_scenario" in external-scale|external-high) ;; *) return 0 ;; esac
+  jq -e '.spec | type=="object" and ((has("replicas")|not) or .replicas==3)' "$mfeo_file" >/dev/null || return 1
+  jq '.spec.replicas=3' "$mfeo_file" > "$mfeo_file.external-scale.tmp" || return 1
+  mv "$mfeo_file.external-scale.tmp" "$mfeo_file"
+}
+
+managed_functional_external_roster_oracle() {
+  mfero_cr=$1 mfero_pods=$2 mfero_dep=$3 mfero_eps=$4 mfero_target=$5 mfero_out=$6 mfero_sequence=$7
+  managed_functional_external_target_valid "$mfero_target" || return 1
+  jq -e --argjson target "$mfero_target" --arg sequence "$mfero_sequence" '
+    .spec.replicas==$target and
+    (if $sequence=="bootstrap" then
+       (.status.appliedVoterCount // .spec.voterCount)==$target and
+       (.status.repair|not) and (.status.bootstrapPlan.members|length)==$target
+     else
+       .status.appliedVoterCount==$target and
+       .status.repair.state=="Completed" and
+       .status.repair.plan.sequence==$sequence and
+       .status.repair.completion.kind=="Terminal" and
+       .status.repair.completion.configID==(.status.repair.plan.expectedConfigID+1) and
+       .status.repair.completion.operationID==.status.repair.plan.operationID and
+       .status.repair.plan.finalVoterIDs==.status.repair.completion.finalVoterIDs and
+       (.status.repair.completion.finalVoterIDs|length)==$target and
+       (.status.repair.completion.finalVoterIDs|unique|length)==$target
+     end)
+  ' "$mfero_cr" >/dev/null || return 1
+  if [ "$mfero_sequence" = bootstrap ]; then
+    mfero_certified=$(managed_functional_bootstrap_roster "$mfero_cr") || return 1
+  else
+    mfero_certified=$(jq -c '.status.repair.completion.finalVoterIDs|sort' "$mfero_cr")
+  fi
+  jq -e --argjson target "$mfero_target" '(.items|length)==1 and .items[0].spec.replicas==$target' "$mfero_dep" >/dev/null || return 1
+  jq -e --argjson target "$mfero_target" '
+    (.items|length)==$target and
+    all(.items[]; .metadata.deletionTimestamp==null and any(.status.conditions[]?; .type=="Ready" and .status=="True"))
+  ' "$mfero_pods" >/dev/null || return 1
+  mfero_ready_uids=$(jq -r '.items[].metadata.uid' "$mfero_pods" | sort)
+  [ "$(printf '%s\n' "$mfero_ready_uids" | sed '/^$/d' | wc -l | tr -d ' ')" = "$mfero_target" ] || return 1
+  [ "$(printf '%s\n' "$mfero_ready_uids" | sed '/^$/d' | sort -u | wc -l | tr -d ' ')" = "$mfero_target" ] || return 1
+  mfero_ready_ids=
+  for mfero_uid in $mfero_ready_uids; do mfero_ready_ids="$mfero_ready_ids\n$(managed_functional_node_id "$mfero_uid")"; done
+  mfero_ready_json=$(printf '%b\n' "$mfero_ready_ids" | sed '/^$/d' | sort | jq -R . | jq -sc 'map(select(.!=""))|sort')
+  [ "$mfero_certified" = "$mfero_ready_json" ] || return 1
+  jq -e '[.subsets[]?.notReadyAddresses[]?]|length==0' "$mfero_eps" >/dev/null || return 1
+  mfero_endpoint_uids=$(jq -r '[.subsets[]?.addresses[]?.targetRef.uid]|sort|.[]' "$mfero_eps")
+  [ "$(printf '%s\n' "$mfero_endpoint_uids" | sed '/^$/d' | wc -l | tr -d ' ')" = "$mfero_target" ] || return 1
+  [ "$mfero_endpoint_uids" = "$mfero_ready_uids" ] || return 1
+  mfero_endpoint_uids_json=$(printf '%s\n' "$mfero_endpoint_uids" | sed '/^$/d' | jq -R . | jq -sc 'sort')
+  mfero_endpoint_ids=
+  for mfero_uid in $mfero_endpoint_uids; do mfero_endpoint_ids="$mfero_endpoint_ids\n$(managed_functional_node_id "$mfero_uid")"; done
+  mfero_endpoint_json=$(printf '%b\n' "$mfero_endpoint_ids" | sed '/^$/d' | sort | jq -R . | jq -sc 'map(select(.!=""))|sort')
+  [ "$mfero_endpoint_json" = "$mfero_ready_json" ] || return 1
+  mfero_deployment_replicas=$(jq -er '.items[0].spec.replicas' "$mfero_dep")
+  mfero_applied=$(jq -er '.status.appliedVoterCount // .spec.voterCount' "$mfero_cr")
+  mfero_operation_id=$(jq -r '.status.repair.plan.operationID // .status.repair.completion.operationID // ""' "$mfero_cr")
+  mfero_plan_config=$(jq -r '.status.repair.plan.expectedConfigID // ""' "$mfero_cr")
+  mfero_completion_config=$(jq -r '.status.repair.completion.configID // ""' "$mfero_cr")
+  jq -n --argjson target "$mfero_target" --arg sequence "$mfero_sequence" \
+    --argjson certified "$mfero_certified" --argjson ready "$mfero_ready_json" \
+    --argjson endpoints "$mfero_endpoint_json" --argjson endpointPodUIDs "$mfero_endpoint_uids_json" --argjson applied "$mfero_applied" \
+    --argjson replicas "$mfero_deployment_replicas" --arg operationID "$mfero_operation_id" \
+    --arg planConfigID "$mfero_plan_config" --arg completionConfigID "$mfero_completion_config" \
+    '{target:$target,sequence:$sequence,appliedVoterCount:$applied,deploymentReplicas:$replicas,finalVoterIDs:$certified,certifiedRoster:$certified,readyIDs:$ready,endpointIDs:$endpoints,endpointPodUIDs:$endpointPodUIDs,readyMatchesCertified:($certified==$ready),endpointsMatchReady:($endpoints==$ready),operationID:$operationID,planExpectedConfigID:$planConfigID,completionConfigID:$completionConfigID,endpointCount:$target}' > "$mfero_out"
+}
+
+managed_functional_external_observe() {
+  mfeoo_target=$1 mfeoo_tag=$2 mfeoo_sequence=$3
+  k -n "$namespace" get rhizacluster sql -o json > "$logs/functional-$mfeoo_tag-cr.json"
+  k -n "$namespace" get deployment -l "$selector" -o json > "$logs/functional-$mfeoo_tag-deployment.json"
+  k -n "$namespace" get pods -l "$selector" -o json > "$logs/functional-$mfeoo_tag-pods.json"
+  k -n "$namespace" get endpoints bootstrap-client -o json > "$logs/functional-$mfeoo_tag-endpoints.json"
+  managed_functional_external_roster_oracle "$logs/functional-$mfeoo_tag-cr.json" "$logs/functional-$mfeoo_tag-pods.json" \
+    "$logs/functional-$mfeoo_tag-deployment.json" "$logs/functional-$mfeoo_tag-endpoints.json" \
+    "$mfeoo_target" "$logs/functional-$mfeoo_tag-roster.json" "$mfeoo_sequence"
+}
+
+managed_functional_operator_running() {
+  mfor_tag=$1
+  mfor_expected_pod=
+  mfor_expected_deployment=
+  mfor_expected_containers=
+  [ "$#" -lt 2 ] || mfor_expected_pod=$2
+  [ "$#" -lt 3 ] || mfor_expected_deployment=$3
+  [ "$#" -lt 4 ] || mfor_expected_containers=$4
+  mfor_deployment="$logs/functional-operator-$mfor_tag-deployment.json"
+  mfor_pods="$logs/functional-operator-$mfor_tag-pods.json"
+  jq -e '.spec.replicas==1 and .status.observedGeneration==.metadata.generation and (.status.availableReplicas//0)==1' "$mfor_deployment" >/dev/null || return 1
+  jq -e '(.items|length)==1 and .items[0].metadata.deletionTimestamp==null and any(.items[0].status.conditions[]?; .type=="Ready" and .status=="True")' "$mfor_pods" >/dev/null || return 1
+  jq -e '(.items[0].status.containerStatuses|length)>0 and all(.items[0].status.containerStatuses[]; (.name|type)=="string" and (.name|length)>0 and (.containerID|type)=="string" and (.containerID|length)>0 and (.restartCount|type)=="number")' "$mfor_pods" >/dev/null || return 1
+  mfor_pod_uid=$(jq -er '.items[0].metadata.uid' "$mfor_pods")
+  mfor_deployment_uid=$(jq -er '.metadata.uid' "$mfor_deployment")
+  [ -z "$mfor_expected_pod" ] || [ "$mfor_pod_uid" = "$mfor_expected_pod" ] || return 1
+  [ -z "$mfor_expected_deployment" ] || [ "$mfor_deployment_uid" = "$mfor_expected_deployment" ] || return 1
+  if [ -n "$mfor_expected_containers" ]; then
+    mfor_containers=$(managed_functional_operator_container_identity "$mfor_pods") || return 1
+    [ "$mfor_containers" = "$mfor_expected_containers" ] || return 1
+  fi
+}
+
+managed_functional_operator_container_identity() {
+  jq -cer '[.items[0].status.containerStatuses[] | {name:.name,containerID:.containerID,restartCount:.restartCount}] | sort_by(.name)' "$1"
+}
+
+managed_functional_start_replica_watch() {
+  functional_replica_watch_log="$logs/functional-external-replicas-watch.jsonl"
+  : > "$functional_replica_watch_log"
+  k -n "$namespace" get rhizacluster sql --watch -o json > "$functional_replica_watch_log" 2> "$logs/functional-external-replicas-watch.stderr" &
+  functional_replica_watch_pid=$!
+  mfsrw_deadline=$(( $(date +%s) + 30 ))
+  while ! jq -s -e 'any(.[]; (.status.appliedVoterCount // .spec.voterCount)==3)' "$functional_replica_watch_log" >/dev/null 2>&1; do
+    [ "$(date +%s)" -lt "$mfsrw_deadline" ] || return 1
+    sleep 1
+  done
+}
+
+managed_functional_stop_replica_watch() {
+  [ -n "$functional_replica_watch_pid" ] || return 0
+  kill "$functional_replica_watch_pid" 2>/dev/null || :
+  wait "$functional_replica_watch_pid" 2>/dev/null || :
+  functional_replica_watch_pid=
+}
+
+managed_functional_replica_progress_oracle() {
+  mfrp_watch=$1 mfrp_out=$2 mfrp_expected=$3
+  mfrp_bootstrap=$(managed_functional_bootstrap_roster "$mfrp_watch" true) || return 1
+  jq -s --arg expected "$mfrp_expected" --argjson bootstrap "$mfrp_bootstrap" '
+    def event: if has("object") then .object else . end;
+    ($expected | split(" ") | map(select(length>0) | tonumber)) as $want |
+    (map(event |
+      select((.status|type)=="object" and
+        (((.status|has("appliedVoterCount")) and (.status.appliedVoterCount != null)) or
+         (.spec.replicas? == 3 and
+          ((.status|has("replicaStep"))|not) and
+          ((.status|has("replicaCheck"))|not)))))
+     | reduce .[] as $e ({sequence:[],events:[]};
+         ($e.status.appliedVoterCount // $e.spec.voterCount) as $n |
+         if (.sequence|length)==0 or .sequence[-1] != $n
+         then .sequence += [$n] | .events += [$e]
+         else . end)) as $r |
+    (($r.sequence|length)==($want|length)) and
+    ($r.sequence == $want) and
+    ([range(0; $r.sequence|length) as $i |
+      if $i == 0 then true
+      else ($r.sequence[$i]) as $to |
+        ($r.sequence[$i-1]) as $from |
+        ($r.events[$i].status.repair) as $rep |
+        ($rep.state=="Completed") and
+        ($rep.completion.kind=="Terminal") and
+        (($rep.plan.expectedConfigID|type)=="number") and
+        (($rep.completion.configID|type)=="number") and
+        $rep.completion.configID == ($rep.plan.expectedConfigID + 1) and
+        ($i==1 or $rep.plan.expectedConfigID == $r.events[$i-1].status.repair.completion.configID) and
+        (($rep.plan.operationID|type)=="string" and ($rep.plan.operationID|length)>0) and
+        $rep.plan.operationID == $rep.completion.operationID and
+        ($i==1 or $rep.plan.operationID != $r.events[$i-1].status.repair.plan.operationID) and
+        $rep.plan.finalVoterIDs == $rep.completion.finalVoterIDs and
+        ($rep.completion.finalVoterIDs|length)==$to and
+        ($rep.completion.finalVoterIDs|unique|length)==$to and
+        (($to>$from and $rep.plan.sequence=="add") or
+         ($to<$from and $rep.plan.sequence=="leave"))
+      end] | all)
+    | if . then
+        {baseline:$r.sequence[0],sequence:$r.sequence,steps:$r.sequence[1:],exact:true,maxMove:1,minimum:3,
+         events:[range(0;($r.events|length)) as $i |
+           ($r.events[$i].status.repair) as $rep |
+           {index:$i,from:(if $i==0 then null else $r.sequence[$i-1] end),to:$r.sequence[$i],
+            state:($rep.state // "bootstrap"),planSequence:($rep.plan.sequence // "bootstrap"),
+            operationID:($rep.plan.operationID // ""),planExpectedConfigID:($rep.plan.expectedConfigID // null),
+            completionConfigID:($rep.completion.configID // null),completionKind:($rep.completion.kind // "bootstrap"),
+            finalVoterIDs:($rep.completion.finalVoterIDs // $bootstrap)}]
+        }
+      else error("replica progress did not match the exact certified ramp")
+      end
+  ' "$mfrp_watch" > "$mfrp_out"
+}
+
+managed_functional_wait_external_scale() {
+  mfwes_target=$1 mfwes_tag=$2 mfwes_sequence=$3 mfwes_pod_uid=$4 mfwes_deployment_uid=$5
+  mfwes_containers=${6-}
+  mfwes_deadline=$(( $(date +%s) + 300 ))
+  while :; do
+    k -n "$namespace" get rhizacluster sql -o json > "$logs/functional-$mfwes_tag-cr-poll.json" 2>/dev/null || :
+    k -n "$namespace" get deployment -l "$selector" -o json > "$logs/functional-$mfwes_tag-deployment-poll.json" 2>/dev/null || :
+    k -n "$namespace" get pods -l "$selector" -o json > "$logs/functional-$mfwes_tag-pods-poll.json" 2>/dev/null || :
+    k -n "$namespace" get endpoints bootstrap-client -o json > "$logs/functional-$mfwes_tag-endpoints-poll.json" 2>/dev/null || :
+    k -n "$namespace" get deployment rhiza-operator -o json > "$logs/functional-operator-$mfwes_tag-deployment.json" 2>/dev/null || :
+    k -n "$namespace" get pods -l app.kubernetes.io/name=rhiza-operator -o json > "$logs/functional-operator-$mfwes_tag-pods.json" 2>/dev/null || :
+    if managed_functional_external_roster_oracle "$logs/functional-$mfwes_tag-cr-poll.json" "$logs/functional-$mfwes_tag-pods-poll.json" \
+      "$logs/functional-$mfwes_tag-deployment-poll.json" "$logs/functional-$mfwes_tag-endpoints-poll.json" \
+      "$mfwes_target" "$logs/functional-$mfwes_tag-roster.json" "$mfwes_sequence" &&
+      managed_functional_operator_running "$mfwes_tag" "$mfwes_pod_uid" "$mfwes_deployment_uid" "$mfwes_containers"; then
+      cp "$logs/functional-$mfwes_tag-cr-poll.json" "$logs/functional-$mfwes_tag-cr.json"
+      cp "$logs/functional-$mfwes_tag-deployment-poll.json" "$logs/functional-$mfwes_tag-deployment.json"
+      cp "$logs/functional-$mfwes_tag-pods-poll.json" "$logs/functional-$mfwes_tag-pods.json"
+      cp "$logs/functional-$mfwes_tag-endpoints-poll.json" "$logs/functional-$mfwes_tag-endpoints.json"
+      return 0
+    fi
+    [ "$(date +%s)" -lt "$mfwes_deadline" ] || { echo "external replicas did not converge to $mfwes_target" >&2; return 1; }
+    sleep 2
+  done
+}
+
+managed_functional_external_rejection_oracle() {
+  mfro_before_cr=$1 mfro_after_cr=$2 mfro_before_dep=$3 mfro_after_dep=$4
+  mfro_target=$5 mfro_stdout=$6 mfro_stderr=$7 mfro_marker=$8
+  case "$mfro_target" in 1|2) ;; *) return 1 ;; esac
+  test -f "$mfro_stdout" && test -f "$mfro_stderr" && test -f "$mfro_marker" || return 1
+  grep -E 'greater than or equal to 3|minimum.*3|Invalid value.*replicas' "$mfro_stderr" "$mfro_stdout" >/dev/null || return 1
+  jq -e --argjson target "$mfro_target" '
+    .target==$target and .command==("kubectl scale rhizacluster/sql --replicas="+($target|tostring)) and
+    .result=="rejected" and .schemaValidation==true and .exitCode!=0
+  ' "$mfro_marker" >/dev/null || return 1
+  mfro_cr_before=$(jq -S -c '{specReplicas:.spec.replicas,status:.status}' "$mfro_before_cr") || return 1
+  mfro_cr_after=$(jq -S -c '{specReplicas:.spec.replicas,status:.status}' "$mfro_after_cr") || return 1
+  mfro_dep_before=$(jq -S -c '{uid:.metadata.uid,resourceVersion:.metadata.resourceVersion,generation:.metadata.generation,spec:{replicas:.items[0].spec.replicas},status:.items[0].status}' "$mfro_before_dep") || return 1
+  mfro_dep_after=$(jq -S -c '{uid:.metadata.uid,resourceVersion:.metadata.resourceVersion,generation:.metadata.generation,spec:{replicas:.items[0].spec.replicas},status:.items[0].status}' "$mfro_after_dep") || return 1
+  [ "$mfro_cr_before" = "$mfro_cr_after" ] || return 1
+  [ "$mfro_dep_before" = "$mfro_dep_after" ] || return 1
+  jq -e '.spec.replicas==3' "$mfro_before_cr" "$mfro_after_cr" >/dev/null || return 1
+  jq -e '(.items|length)==1 and .items[0].spec.replicas==3' "$mfro_before_dep" "$mfro_after_dep" >/dev/null || return 1
+}
+
+managed_functional_external_reject() {
+  mfer_target=$1 mfer_tag=$2
+  mfer_cr_before="$logs/functional-$mfer_tag-before-cr.json"
+  mfer_dep_before="$logs/functional-$mfer_tag-before-deployment.json"
+  mfer_cr_after="$logs/functional-$mfer_tag-after-cr.json"
+  mfer_dep_after="$logs/functional-$mfer_tag-after-deployment.json"
+  mfer_stdout="$logs/functional-$mfer_tag.stdout"
+  mfer_stderr="$logs/functional-$mfer_tag.stderr"
+  mfer_marker="$logs/functional-$mfer_tag.result.json"
+  k -n "$namespace" get rhizacluster sql -o json > "$mfer_cr_before" || return 1
+  k -n "$namespace" get deployment -l "$selector" -o json > "$mfer_dep_before" || return 1
+  mfer_rc=0
+  if k -n "$namespace" scale rhizacluster/sql --replicas="$mfer_target" > "$mfer_stdout" 2> "$mfer_stderr"; then
+    mfer_rc=0
+  else
+    mfer_rc=$?
+  fi
+  jq -n --argjson target "$mfer_target" --argjson exitCode "$mfer_rc" \
+    '{target:$target,command:("kubectl scale rhizacluster/sql --replicas="+($target|tostring)),exitCode:$exitCode,result:(if $exitCode==0 then "accepted" else "rejected" end),schemaValidation:($exitCode!=0)}' \
+    > "$mfer_marker" || return 1
+  k -n "$namespace" get rhizacluster sql -o json > "$mfer_cr_after" || return 1
+  k -n "$namespace" get deployment -l "$selector" -o json > "$mfer_dep_after" || return 1
+  managed_functional_external_rejection_oracle "$mfer_cr_before" "$mfer_cr_after" \
+    "$mfer_dep_before" "$mfer_dep_after" "$mfer_target" "$mfer_stdout" "$mfer_stderr" "$mfer_marker" || return 1
+  jq -n --argjson target "$mfer_target" \
+    --arg stdout "$mfer_stdout" --arg stderr "$mfer_stderr" --arg result "$mfer_marker" \
+    --argjson stepBefore "$(jq '(.status|has("replicaStep"))' "$mfer_cr_before")" \
+    --argjson stepAfter "$(jq '(.status|has("replicaStep"))' "$mfer_cr_after")" \
+    --argjson checkBefore "$(jq '(.status|has("replicaCheck"))' "$mfer_cr_before")" \
+    --argjson checkAfter "$(jq '(.status|has("replicaCheck"))' "$mfer_cr_after")" \
+    '{target:$target,rawStdout:$stdout,rawStderr:$stderr,resultMarker:$result,specReplicas:3,deploymentReplicas:3,observedStateUnchanged:true,replicaStepBefore:$stepBefore,replicaStepAfter:$stepAfter,replicaCheckBefore:$checkBefore,replicaCheckAfter:$checkAfter}' \
+    > "$logs/functional-$mfer_tag-state.json"
+}
+
+managed_functional_external_scale() {
+  managed_functional_external_observe 3 external-baseline bootstrap
+  k -n "$namespace" get deployment rhiza-operator -o json > "$logs/functional-operator-external-baseline-deployment.json"
+  k -n "$namespace" get pods -l app.kubernetes.io/name=rhiza-operator -o json > "$logs/functional-operator-external-baseline-pods.json"
+  managed_functional_operator_running external-baseline || return 1
+  mfes_operator_pod_uid=$(jq -er '.items[0].metadata.uid' "$logs/functional-operator-external-baseline-pods.json")
+  mfes_operator_deployment_uid=$(jq -er '.metadata.uid' "$logs/functional-operator-external-baseline-deployment.json")
+  mfes_operator_containers=$(managed_functional_operator_container_identity "$logs/functional-operator-external-baseline-pods.json") || return 1
+  managed_functional_commit external-scale-write-7 external-scale-7 \
+    "INSERT INTO bootstrap_ci VALUES (7,'external-scale-7')" external-scale-7 || return 1
+  managed_functional_start_replica_watch || { managed_functional_stop_replica_watch; return 1; }
+  if ! k -n "$namespace" scale rhizacluster/sql --replicas=5 > "$logs/functional-external-scale-5.txt"; then
+    managed_functional_stop_replica_watch
+    return 1
+  fi
+  if ! managed_functional_wait_external_scale 5 external-5 add "$mfes_operator_pod_uid" "$mfes_operator_deployment_uid" "$mfes_operator_containers"; then
+    managed_functional_stop_replica_watch
+    return 1
+  fi
+  managed_functional_commit external-scale-write-8 external-scale-8 \
+    "INSERT INTO bootstrap_ci VALUES (8,'external-scale-8')" external-scale-8 || { managed_functional_stop_replica_watch; return 1; }
+  if ! k -n "$namespace" scale rhizacluster/sql --replicas=3 > "$logs/functional-external-scale-3.txt"; then
+    managed_functional_stop_replica_watch
+    return 1
+  fi
+  if ! managed_functional_wait_external_scale 3 external-3 leave "$mfes_operator_pod_uid" "$mfes_operator_deployment_uid" "$mfes_operator_containers"; then
+    managed_functional_stop_replica_watch
+    return 1
+  fi
+  managed_functional_external_reject 1 external-reject-1 || { managed_functional_stop_replica_watch; return 1; }
+  managed_functional_external_reject 2 external-reject-2 || { managed_functional_stop_replica_watch; return 1; }
+  managed_functional_external_observe 3 external-after-reject leave || { managed_functional_stop_replica_watch; return 1; }
+  run_client external-scale-readback query \
+    '{"sql":"SELECT id,value FROM bootstrap_ci WHERE id IN (1,7,8) ORDER BY id","consistency":"linearizable"}' || { managed_functional_stop_replica_watch; return 1; }
+  jq -e '.rows==[[1,"real-kubelet"],[7,"external-scale-7"],[8,"external-scale-8"]]' \
+    "$logs/external-scale-readback.json" >/dev/null || { managed_functional_stop_replica_watch; return 1; }
+  mfes_watch_deadline=$(( $(date +%s) + 30 ))
+  while ! jq -s -e 'last.status.appliedVoterCount==3' "$functional_replica_watch_log" >/dev/null 2>&1; do
+    [ "$(date +%s)" -lt "$mfes_watch_deadline" ] || { managed_functional_stop_replica_watch; return 1; }
+    sleep 1
+  done
+  managed_functional_stop_replica_watch
+  managed_functional_replica_progress_oracle "$logs/functional-external-replicas-watch.jsonl" \
+    "$logs/functional-external-replicas-progress.json" '3 4 5 4 3' || return 1
+  printf '%s\n' 'PASS: external replicas 3->4->5->4->3 certified one step at a time; literal targets 1 and 2 rejected with unchanged CR status/Deployment; operator Pod/container identity stayed pinned; committed rows 7 and 8 read back' \
+    > "$logs/functional-external-scale-result.txt"
+}
+
+managed_functional_external_high_evidence_oracle() {
+  mfehe_checkpoints=$1 mfehe_progress=$2 mfehe_out=$3
+  jq -s --slurpfile progress "$mfehe_progress" '
+    . as $checks | ($progress[0]) as $prog | ($prog.events[1:]) as $events |
+    (($checks|length)==($events|length)) and
+    ([range(0;($checks|length)) as $i |
+      ($checks[$i].step)==($i+1) and
+      ($checks[$i].from)==($events[$i].from) and
+      ($checks[$i].target)==($events[$i].to) and
+      ($checks[$i].operationID)==($events[$i].operationID) and
+      (($checks[$i].planExpectedConfigID|tostring)==($events[$i].planExpectedConfigID|tostring)) and
+      (($checks[$i].completionConfigID|tostring)==($events[$i].completionConfigID|tostring)) and
+      ($checks[$i].finalVoterIDs)==($events[$i].finalVoterIDs) and
+      ($checks[$i].finalVoterIDs)==($checks[$i].readyIDs) and
+      ($checks[$i].finalVoterIDs)==($checks[$i].endpointIDs) and
+      ($checks[$i].finalVoterIDs|length)==($checks[$i].target) and
+      ($checks[$i].deploymentReplicas)==($checks[$i].target) and
+      (($checks[$i].target>$checks[$i].from and $checks[$i].sequence=="add") or
+       ($checks[$i].target<$checks[$i].from and $checks[$i].sequence=="leave"))] | all)
+    | if . then
+        {exactSequence:$prog.sequence,steps:$prog.steps,transitionEvents:$events,checkpoints:$checks,
+         target7:[$checks[]|select(.target==7)],target10:[$checks[]|select(.target==10)],
+         finalVoterIDs:$checks[-1].finalVoterIDs}
+      else error("high-scale checkpoints did not correlate with certified transition events")
+      end
+    | .target7Visible=((.target7|length)==2) |
+      .target10Visible=((.target10|length)==1) |
+      if ((.target7Visible and .target10Visible) and
+          all(.target7[]; .finalVoterIDs==.readyIDs and .finalVoterIDs==.endpointIDs and (.finalVoterIDs|length)==7) and
+          all(.target10[]; .finalVoterIDs==.readyIDs and .finalVoterIDs==.endpointIDs and (.finalVoterIDs|length)==10))
+      then . else error("target 7 or 10 evidence is incomplete") end
+  ' "$mfehe_checkpoints" > "$mfehe_out"
+}
+
+managed_functional_external_sequence_artifacts() {
+  mfesa_sequence=$1 mfesa_text=$2 mfesa_json=$3
+  printf '%s\n' "$mfesa_sequence" > "$mfesa_text" || return 1
+  printf '%s\n' "$mfesa_sequence" \
+    | jq -R -s '[splits("\\s+") | select(length>0) | tonumber]' > "$mfesa_json"
+}
+
+managed_functional_external_high() {
+  mfesh_checkpoints="$logs/functional-external-high-checkpoints.jsonl"
+  mfesh_progress="$logs/functional-external-high-progress.json"
+  mfesh_ramp="$logs/functional-external-high-ramp.json"
+  managed_functional_external_sequence_artifacts "$managed_functional_external_high_sequence" \
+    "$logs/functional-external-high-sequence.txt" "$logs/functional-external-high-sequence.json" || return 1
+  : > "$mfesh_checkpoints"
+  managed_functional_external_observe 3 external-high-baseline bootstrap || return 1
+  k -n "$namespace" get deployment rhiza-operator -o json > "$logs/functional-operator-external-high-baseline-deployment.json" || return 1
+  k -n "$namespace" get pods -l app.kubernetes.io/name=rhiza-operator -o json > "$logs/functional-operator-external-high-baseline-pods.json" || return 1
+  managed_functional_operator_running external-high-baseline || return 1
+  mfesh_operator_pod_uid=$(jq -er '.items[0].metadata.uid' "$logs/functional-operator-external-high-baseline-pods.json")
+  mfesh_operator_deployment_uid=$(jq -er '.metadata.uid' "$logs/functional-operator-external-high-baseline-deployment.json")
+  mfesh_operator_containers=$(managed_functional_operator_container_identity "$logs/functional-operator-external-high-baseline-pods.json") || return 1
+  managed_functional_start_replica_watch || { managed_functional_stop_replica_watch; return 1; }
+  mfesh_previous=3
+  mfesh_step=0
+  mfesh_committed_7=0
+  mfesh_committed_10=0
+  for mfesh_target in $managed_functional_external_high_sequence; do
+    if [ "$mfesh_step" = 0 ]; then
+      mfesh_step=1
+      continue
+    fi
+    mfesh_tag=$(printf 'external-high-%02d-%s' "$mfesh_step" "$mfesh_target")
+    if [ "$mfesh_target" -gt "$mfesh_previous" ]; then mfesh_sequence=add; else mfesh_sequence=leave; fi
+    if ! k -n "$namespace" scale rhizacluster/sql --replicas="$mfesh_target" \
+      > "$logs/functional-$mfesh_tag-scale.stdout" 2> "$logs/functional-$mfesh_tag-scale.stderr"; then
+      managed_functional_stop_replica_watch
+      return 1
+    fi
+    if ! managed_functional_wait_external_scale "$mfesh_target" "$mfesh_tag" "$mfesh_sequence" \
+      "$mfesh_operator_pod_uid" "$mfesh_operator_deployment_uid" "$mfesh_operator_containers"; then
+      managed_functional_stop_replica_watch
+      return 1
+    fi
+    jq --argjson step "$mfesh_step" --argjson from "$mfesh_previous" --arg tag "$mfesh_tag" \
+      '. + {step:$step,from:$from,tag:$tag}' "$logs/functional-$mfesh_tag-roster.json" >> "$mfesh_checkpoints" || {
+        managed_functional_stop_replica_watch
+        return 1
+      }
+    if [ "$mfesh_target" = 7 ] && [ "$mfesh_committed_7" = 0 ]; then
+      managed_functional_commit external-high-write-7 external-high-7 \
+        "INSERT INTO bootstrap_ci VALUES (7,'external-high-7')" external-high-7 || {
+          managed_functional_stop_replica_watch
+          return 1
+        }
+      mfesh_committed_7=1
+    fi
+    if [ "$mfesh_target" = 10 ]; then
+      managed_functional_commit external-high-write-10 external-high-10 \
+        "INSERT INTO bootstrap_ci VALUES (10,'external-high-10')" external-high-10 || {
+          managed_functional_stop_replica_watch
+          return 1
+        }
+      mfesh_committed_10=1
+    fi
+    mfesh_previous=$mfesh_target
+    mfesh_step=$((mfesh_step + 1))
+  done
+  mfesh_watch_deadline=$(( $(date +%s) + 30 ))
+  while ! jq -s -e 'last.status.appliedVoterCount==3' "$functional_replica_watch_log" >/dev/null 2>&1; do
+    [ "$(date +%s)" -lt "$mfesh_watch_deadline" ] || { managed_functional_stop_replica_watch; return 1; }
+    sleep 1
+  done
+  managed_functional_stop_replica_watch
+  managed_functional_replica_progress_oracle "$functional_replica_watch_log" "$mfesh_progress" \
+    "$managed_functional_external_high_sequence" || return 1
+  managed_functional_external_high_evidence_oracle "$mfesh_checkpoints" "$mfesh_progress" "$mfesh_ramp" || return 1
+  jq '{target:7,occurrences:.target7,targetVisible:.target7Visible,finalVoterIDs:[.target7[].finalVoterIDs]}' "$mfesh_ramp" \
+    > "$logs/functional-external-high-target-7.json" || return 1
+  jq '{target:10,occurrences:.target10,targetVisible:.target10Visible,finalVoterIDs:[.target10[].finalVoterIDs]}' "$mfesh_ramp" \
+    > "$logs/functional-external-high-target-10.json" || return 1
+  managed_functional_external_observe 3 external-high-final leave || return 1
+  jq -n --slurpfile ramp "$mfesh_ramp" --slurpfile live "$logs/functional-external-high-final-roster.json" '
+    {target:3,rampFinalVoterIDs:$ramp[0].finalVoterIDs,liveFinalVoterIDs:$live[0].finalVoterIDs,
+     liveReadyIDs:$live[0].readyIDs,liveEndpointIDs:$live[0].endpointIDs,deploymentReplicas:$live[0].deploymentReplicas,
+     matchesRamp:($ramp[0].finalVoterIDs==$live[0].finalVoterIDs),matchesReady:($live[0].finalVoterIDs==$live[0].readyIDs),matchesEndpoints:($live[0].finalVoterIDs==$live[0].endpointIDs)}
+  ' > "$logs/functional-external-high-final-evidence.json" || return 1
+  jq -e '.target==3 and .matchesRamp==true and .matchesReady==true and .matchesEndpoints==true and .deploymentReplicas==3 and (.liveFinalVoterIDs|length)==3' \
+    "$logs/functional-external-high-final-evidence.json" >/dev/null || return 1
+  managed_functional_external_reject 1 external-high-reject-1 || return 1
+  managed_functional_external_reject 2 external-high-reject-2 || return 1
+  managed_functional_external_observe 3 external-high-after-reject leave || return 1
+  [ "$mfesh_committed_7" = 1 ] && [ "$mfesh_committed_10" = 1 ] || return 1
+  run_client external-high-readback query \
+    '{"sql":"SELECT id,value FROM bootstrap_ci WHERE id IN (1,7,10) ORDER BY id","consistency":"linearizable"}' || return 1
+  jq -e '.rows==[[1,"real-kubelet"],[7,"external-high-7"],[10,"external-high-10"]]' \
+    "$logs/external-high-readback.json" >/dev/null || return 1
+  printf '%s\n' 'PASS: external control exact 3->4->5->6->7->8->9->10->9->8->7->6->5->4->3; every move had one certified terminal and exact CR/Deployment/ReadyPod/Endpoint roster; target 7 and target 10 are in target evidence; literal targets 1 and 2 were rejected with unchanged CR status/Deployment; operator Deployment/Pod/container identity stayed pinned' \
+    > "$logs/functional-external-high-result.txt"
 }
 
 managed_functional_scale_up() {
@@ -676,7 +1147,7 @@ managed_functional_quorum() {
     mfq_result=1
   fi
   [ "$mfq_result" = 0 ] || return 1
-  printf '%s\n' 'PASS: 3->2->3 replacement, concurrent HTTP code inventory, ACK/local checks, and one-survivor fail-closed behavior' > "$logs/functional-result.txt"
+  printf '%s\n' 'PASS: forced physical Deployment 3->2->3 replacement followed by 3->2->1; concurrent HTTP code inventory and ACK/local checks retained; one survivor served only explicit local reads while writes and linearizable reads failed closed; this is a forced disaster test, not an ordinary 1->3 auto-repair claim' > "$logs/functional-result.txt"
 }
 
 managed_functional_qualification() {
@@ -687,6 +1158,8 @@ managed_functional_qualification() {
   case "$1" in
     scale-up) managed_functional_scale_up ;;
     quorum) managed_functional_quorum ;;
+    external-scale) managed_functional_external_scale ;;
+    external-high) managed_functional_external_high ;;
     *) return 2 ;;
   esac
 }
@@ -823,6 +1296,155 @@ leave-u5'
   done
   managed_functional_roster_oracle "$scratch/leave-complete.json" "$scratch/leave-pods.json" "$scratch/leave-deploy.json" "$scratch/leave-endpoints.json" 4 "$scratch/leave-roster.json" leave
   if managed_functional_roster_oracle "$scratch/leave-complete.json" "$scratch/leave-pods.json" "$scratch/leave-deploy.json" "$scratch/leave-endpoints.json" 4 "$scratch/leave-roster-bad.json" add; then return 1; fi
+  managed_functional_external_target_valid 3
+  managed_functional_external_target_valid 5
+  if managed_functional_external_target_valid 2; then return 1; fi
+  if managed_functional_external_target_valid 65; then return 1; fi
+  for external_scenario in external-scale external-high; do
+    jq -n '{spec:{voterCount:3}}' > "$scratch/requested-cluster.json"
+    functional_scenario=$external_scenario
+    managed_functional_external_opt_in "$scratch/requested-cluster.json"
+    jq -e '.spec.replicas==3' "$scratch/requested-cluster.json" >/dev/null
+  done
+  jq -n '{spec:{voterCount:3,replicas:4}}' > "$scratch/requested-cluster.json"
+  if managed_functional_external_opt_in "$scratch/requested-cluster.json"; then return 1; fi
+  functional_scenario=scale-up
+  jq -n '{spec:{voterCount:3}}' > "$scratch/requested-cluster.json"
+  managed_functional_external_opt_in "$scratch/requested-cluster.json"
+  jq -e '.spec.replicas==null' "$scratch/requested-cluster.json" >/dev/null
+  functional_scenario=
+  external3_uids_json=$(printf '%s\n' leave-u1 leave-u2 leave-u3 | jq -R . | jq -sc 'map(select(.!=""))|sort')
+  external3_ids_json=$(printf '%s\n' "$leave_ids_json" | jq -c '.[0:3]')
+  jq -n --argjson uids "$external3_uids_json" '{items:[$uids[]|{metadata:{uid:.},status:{conditions:[{type:"Ready",status:"True"}]}}]}' > "$scratch/external3-pods.json"
+  jq -n --argjson uids "$external3_uids_json" '{subsets:[{addresses:[$uids[]|{targetRef:{uid:.}}]}]}' > "$scratch/external3-endpoints.json"
+  jq -n '{items:[{spec:{replicas:3}}]}' > "$scratch/external3-deploy.json"
+  jq -n --argjson roster "$external3_ids_json" '{spec:{replicas:3},status:{appliedVoterCount:3,bootstrapPlan:{members:[$roster[]|{member:{ID:.}}]}}}' > "$scratch/external3-old-id.json"
+  if managed_functional_external_roster_oracle "$scratch/external3-old-id.json" "$scratch/external3-pods.json" \
+    "$scratch/external3-deploy.json" "$scratch/external3-endpoints.json" 3 "$scratch/external3-old-roster.json" bootstrap 2> "$scratch/external3-old-id.err"; then return 1; fi
+  jq -n --argjson roster "$external3_ids_json" '{spec:{replicas:3},status:{appliedVoterCount:3,bootstrapPlan:{members:[$roster[]|{member:{node_id:.}}]}}}' > "$scratch/external3-cr.json"
+  managed_functional_external_roster_oracle "$scratch/external3-cr.json" "$scratch/external3-pods.json" \
+    "$scratch/external3-deploy.json" "$scratch/external3-endpoints.json" 3 "$scratch/external3-roster.json" bootstrap
+  jq -n --argjson roster "$leave_ids_json" '{spec:{replicas:5},status:{appliedVoterCount:5,repair:{state:"Completed",plan:{sequence:"add",operationID:"external-add",expectedConfigID:9,finalVoterIDs:$roster},completion:{kind:"Terminal",operationID:"external-add",configID:10,finalVoterIDs:$roster}}}}' > "$scratch/external5-cr.json"
+  jq -n --argjson uids "$leave_uids_json" '{items:[$uids[]|{metadata:{uid:.},status:{conditions:[{type:"Ready",status:"True"}]}}]}' > "$scratch/external5-pods.json"
+  jq -n --argjson uids "$leave_uids_json" '{subsets:[{addresses:[$uids[]|{targetRef:{uid:.}}]}]}' > "$scratch/external5-endpoints.json"
+  jq -n '{items:[{spec:{replicas:5}}]}' > "$scratch/external5-deploy.json"
+  managed_functional_external_roster_oracle "$scratch/external5-cr.json" "$scratch/external5-pods.json" \
+    "$scratch/external5-deploy.json" "$scratch/external5-endpoints.json" 5 "$scratch/external5-roster.json" add
+  jq -e '.target==5 and .readyMatchesCertified==true and .endpointsMatchReady==true and .endpointIDs==.readyIDs and .endpointIDs==.finalVoterIDs and (.endpointPodUIDs|length)==5 and .endpointPodUIDs!=.endpointIDs and .endpointCount==5' "$scratch/external5-roster.json" >/dev/null
+  for external_mutation in spec applied closed sequence duplicate; do
+    case "$external_mutation" in
+      spec) filter='.spec.replicas=4' ;;
+      applied) filter='.status.appliedVoterCount=4' ;;
+      closed) filter='.status.repair.state="Closed"' ;;
+      sequence) filter='.status.repair.plan.sequence="leave"' ;;
+      duplicate) filter='.status.repair.plan.finalVoterIDs[1]=.status.repair.plan.finalVoterIDs[0] | .status.repair.completion.finalVoterIDs=.status.repair.plan.finalVoterIDs' ;;
+    esac
+    jq "$filter" "$scratch/external5-cr.json" > "$scratch/external5-bad.json"
+    if managed_functional_external_roster_oracle "$scratch/external5-bad.json" "$scratch/external5-pods.json" \
+      "$scratch/external5-deploy.json" "$scratch/external5-endpoints.json" 5 "$scratch/external5-bad-roster.json" add; then return 1; fi
+  done
+  jq '.items[0].status.conditions[0].status="False"' "$scratch/external5-pods.json" > "$scratch/external5-bad-pods.json"
+  if managed_functional_external_roster_oracle "$scratch/external5-cr.json" "$scratch/external5-bad-pods.json" \
+    "$scratch/external5-deploy.json" "$scratch/external5-endpoints.json" 5 "$scratch/external5-bad-roster.json" add; then return 1; fi
+  jq '.subsets[0].addresses += [{targetRef:{uid:"extra"}}]' "$scratch/external5-endpoints.json" > "$scratch/external5-bad-endpoints.json"
+  if managed_functional_external_roster_oracle "$scratch/external5-cr.json" "$scratch/external5-pods.json" \
+    "$scratch/external5-deploy.json" "$scratch/external5-bad-endpoints.json" 5 "$scratch/external5-bad-roster.json" add; then return 1; fi
+  jq --arg uid "$(managed_functional_node_id leave-u1)" '.subsets[0].addresses[0].targetRef.uid=$uid' \
+    "$scratch/external5-endpoints.json" > "$scratch/external5-node-id-confusion.json"
+  if managed_functional_external_roster_oracle "$scratch/external5-cr.json" "$scratch/external5-pods.json" \
+    "$scratch/external5-deploy.json" "$scratch/external5-node-id-confusion.json" 5 "$scratch/external5-confusion-roster.json" add; then return 1; fi
+  managed_functional_external_sequence_artifacts "$managed_functional_external_high_sequence" \
+    "$scratch/external-high-sequence.txt" "$scratch/external-high-sequence.json"
+  [ "$(cat "$scratch/external-high-sequence.txt")" = "$managed_functional_external_high_sequence" ]
+  jq -e '.==[3,4,5,6,7,8,9,10,9,8,7,6,5,4,3]' "$scratch/external-high-sequence.json" >/dev/null
+  external_spaced_sequence=$(printf ' 3\t4\n5  4 3 ')
+  managed_functional_external_sequence_artifacts "$external_spaced_sequence" \
+    "$scratch/external-spaced-sequence.txt" "$scratch/external-spaced-sequence.json"
+  jq -e '.==[3,4,5,4,3]' "$scratch/external-spaced-sequence.json" >/dev/null
+  managed_self_test_replica_watch() {
+    mfs_trw_sequence=$1 mfs_trw_out=$2
+    jq -cn --arg sequence "$mfs_trw_sequence" '
+      ($sequence|split(" ")|map(tonumber)) as $s |
+      [range(0;($s|length)) as $i |
+        ($s[$i]) as $n |
+        [range(0;$n) as $j | "fixture-\($n)-\($j)"] as $ids |
+        if $i==0 then
+          ({spec:{replicas:$n},status:{appliedVoterCount:$n,bootstrapPlan:{members:[$ids[]|{member:{node_id:.}}]}}})
+        else
+          ($s[$i] > $s[$i-1]) as $up |
+          ({spec:{replicas:$n},status:{appliedVoterCount:$n,repair:{state:"Completed",
+            plan:{sequence:(if $up then "add" else "leave" end),operationID:("fixture-op-"+($i|tostring)),
+              expectedConfigID:$i,finalVoterIDs:$ids},
+            completion:{kind:"Terminal",configID:($i+1),operationID:("fixture-op-"+($i|tostring)),
+              finalVoterIDs:$ids}}}})
+        end] | .[]
+    ' | jq -c . > "$mfs_trw_out"
+  }
+  managed_self_test_replica_watch "$managed_functional_external_high_sequence" "$scratch/replica-watch.jsonl"
+  managed_functional_replica_progress_oracle "$scratch/replica-watch.jsonl" "$scratch/replica-progress.json" \
+    "$managed_functional_external_high_sequence"
+  jq -e '.sequence==[3,4,5,6,7,8,9,10,9,8,7,6,5,4,3] and (.steps|length)==14 and .maxMove==1 and .minimum==3 and (.events|length)==15 and .events[0].finalVoterIDs==["fixture-3-0","fixture-3-1","fixture-3-2"]' "$scratch/replica-progress.json" >/dev/null
+  jq -c 'if .status.bootstrapPlan then .status.bootstrapPlan.members |= map({member:{ID:.member.node_id}}) else . end' \
+    "$scratch/replica-watch.jsonl" > "$scratch/replica-watch-old-bootstrap-id.jsonl"
+  if managed_functional_replica_progress_oracle "$scratch/replica-watch-old-bootstrap-id.jsonl" "$scratch/replica-progress-bad.json" "$managed_functional_external_high_sequence" 2> "$scratch/progress-old-bootstrap-id.err"; then return 1; fi
+  managed_self_test_replica_watch '3 4 5 4 3' "$scratch/replica-watch-quick.jsonl"
+  managed_functional_replica_progress_oracle "$scratch/replica-watch-quick.jsonl" "$scratch/replica-progress-quick.json" '3 4 5 4 3'
+  if managed_functional_replica_progress_oracle "$scratch/replica-watch.jsonl" "$scratch/replica-progress-bad.json" '3 4 5 4 3' 2> "$scratch/progress-wrong.err"; then return 1; fi
+  jq -s -c '.[0:5] + .[6:] | .[]' "$scratch/replica-watch.jsonl" > "$scratch/replica-watch-skipped.jsonl"
+  if managed_functional_replica_progress_oracle "$scratch/replica-watch-skipped.jsonl" "$scratch/replica-progress-bad.json" "$managed_functional_external_high_sequence" 2> "$scratch/progress-skipped.err"; then return 1; fi
+  jq -s -c '.[0:4] + [.[2]] + .[4:] | .[]' "$scratch/replica-watch.jsonl" > "$scratch/replica-watch-duplicate.jsonl"
+  if managed_functional_replica_progress_oracle "$scratch/replica-watch-duplicate.jsonl" "$scratch/replica-progress-bad.json" "$managed_functional_external_high_sequence" 2> "$scratch/progress-duplicate.err"; then return 1; fi
+  jq -s -c '.[0:5] + [(.[5] | .status.repair.plan.expectedConfigID += 10 | .status.repair.completion.configID = (.status.repair.plan.expectedConfigID + 1))] + .[6:] | .[]' "$scratch/replica-watch.jsonl" > "$scratch/replica-watch-config-gap.jsonl"
+  if managed_functional_replica_progress_oracle "$scratch/replica-watch-config-gap.jsonl" "$scratch/replica-progress-bad.json" "$managed_functional_external_high_sequence" 2> "$scratch/progress-config-gap.err"; then return 1; fi
+  jq -s -c '.[0:5] + [(.[5] | .status.repair.state="Closed")] + .[6:] | .[]' "$scratch/replica-watch.jsonl" > "$scratch/replica-watch-stale.jsonl"
+  if managed_functional_replica_progress_oracle "$scratch/replica-watch-stale.jsonl" "$scratch/replica-progress-bad.json" "$managed_functional_external_high_sequence" 2> "$scratch/progress-stale.err"; then return 1; fi
+  jq -c '.events[1:][] | {step:.index,from:.from,target:.to,sequence:.planSequence,operationID:.operationID,planExpectedConfigID:.planExpectedConfigID,completionConfigID:.completionConfigID,finalVoterIDs:.finalVoterIDs,certifiedRoster:.finalVoterIDs,readyIDs:.finalVoterIDs,endpointIDs:.finalVoterIDs,endpointPodUIDs:[.finalVoterIDs[] as $id | "pod-uid-"+$id],deploymentReplicas:.to}' \
+    "$scratch/replica-progress.json" > "$scratch/external-high-checkpoints.jsonl"
+  managed_functional_external_high_evidence_oracle "$scratch/external-high-checkpoints.jsonl" \
+    "$scratch/replica-progress.json" "$scratch/external-high-ramp.json"
+  jq -e '.target7Visible==true and .target10Visible==true and (.target7|length)==2 and (.target10|length)==1 and all(.target7[]; (.finalVoterIDs|length)==7 and .finalVoterIDs==.readyIDs and .finalVoterIDs==.endpointIDs) and all(.target10[]; (.finalVoterIDs|length)==10 and .finalVoterIDs==.readyIDs and .finalVoterIDs==.endpointIDs) and (.finalVoterIDs|length)==3' "$scratch/external-high-ramp.json" >/dev/null
+  jq -c 'select(.target!=7) | select(.step!=4)' "$scratch/external-high-checkpoints.jsonl" > "$scratch/external-high-checkpoints-missing-7.jsonl"
+  if managed_functional_external_high_evidence_oracle "$scratch/external-high-checkpoints-missing-7.jsonl" "$scratch/replica-progress.json" "$scratch/external-high-ramp-bad.json" 2> "$scratch/external-high-missing-7.err"; then return 1; fi
+  jq -c 'if .target==10 then .finalVoterIDs[0]="stale-target-10" else . end' "$scratch/external-high-checkpoints.jsonl" > "$scratch/external-high-checkpoints-bad-10.jsonl"
+  if managed_functional_external_high_evidence_oracle "$scratch/external-high-checkpoints-bad-10.jsonl" "$scratch/replica-progress.json" "$scratch/external-high-ramp-bad.json" 2> "$scratch/external-high-target-10.err"; then return 1; fi
+  jq -c 'if .step==1 then .endpointIDs=.endpointPodUIDs else . end' "$scratch/external-high-checkpoints.jsonl" > "$scratch/external-high-checkpoints-pod-uid-confusion.jsonl"
+  if managed_functional_external_high_evidence_oracle "$scratch/external-high-checkpoints-pod-uid-confusion.jsonl" "$scratch/replica-progress.json" "$scratch/external-high-ramp-bad.json" 2> "$scratch/external-high-pod-uid-confusion.err"; then return 1; fi
+  jq -n '{metadata:{uid:"operator-deploy",generation:2},spec:{replicas:1},status:{observedGeneration:2,availableReplicas:1}}' > "$scratch/functional-operator-external-baseline-deployment.json"
+  jq -n '{items:[{metadata:{uid:"operator-pod"},status:{conditions:[{type:"Ready",status:"True"}],containerStatuses:[{name:"operator",containerID:"containerd://operator-1",restartCount:0}]}}]}' > "$scratch/functional-operator-external-baseline-pods.json"
+  operator_containers=$(managed_functional_operator_container_identity "$scratch/functional-operator-external-baseline-pods.json")
+  logs=$scratch managed_functional_operator_running external-baseline operator-pod operator-deploy "$operator_containers"
+  if logs=$scratch managed_functional_operator_running external-baseline wrong-pod operator-deploy; then return 1; fi
+  if logs=$scratch managed_functional_operator_running external-baseline operator-pod wrong-deploy "$operator_containers"; then return 1; fi
+  jq '.items[0].status.containerStatuses[0].restartCount=1' "$scratch/functional-operator-external-baseline-pods.json" > "$scratch/functional-operator-external-restarted-pods.json"
+  cp "$scratch/functional-operator-external-baseline-pods.json" "$scratch/functional-operator-external-baseline-pods.json.original"
+  cp "$scratch/functional-operator-external-restarted-pods.json" "$scratch/functional-operator-external-baseline-pods.json"
+  if logs=$scratch managed_functional_operator_running external-baseline operator-pod operator-deploy "$operator_containers"; then return 1; fi
+  cp "$scratch/functional-operator-external-baseline-pods.json.original" "$scratch/functional-operator-external-baseline-pods.json"
+  jq '.items[0].status.containerStatuses[0].containerID="containerd://operator-2"' "$scratch/functional-operator-external-baseline-pods.json" > "$scratch/functional-operator-external-replaced-pods.json"
+  cp "$scratch/functional-operator-external-replaced-pods.json" "$scratch/functional-operator-external-baseline-pods.json"
+  if logs=$scratch managed_functional_operator_running external-baseline operator-pod operator-deploy "$operator_containers"; then return 1; fi
+  cp "$scratch/functional-operator-external-baseline-pods.json.original" "$scratch/functional-operator-external-baseline-pods.json"
+  rejection_cr="$scratch/rejection-cr.json"
+  rejection_dep="$scratch/rejection-deployment.json"
+  jq -n '{metadata:{uid:"cluster"},spec:{replicas:3},status:{appliedVoterCount:3,replicaStep:{generation:1,deploymentUID:"deploy",deploymentResourceVersion:"7",configID:9,from:4,to:3,expiresAt:"2030-01-01T00:00:00Z",checkID:"check"},replicaCheck:{id:"check",deploymentResourceVersion:"7",expiresAt:"2030-01-01T00:00:00Z"},repair:{state:"Closed",plan:{sequence:"leave",expectedConfigID:9,finalVoterIDs:["a","b","c"]}},conditions:[{type:"Ready",status:"True"}]}}' > "$rejection_cr"
+  jq -n '{metadata:{uid:"deploy",resourceVersion:"7",generation:1},items:[{spec:{replicas:3},status:{observedGeneration:1,availableReplicas:3}}]}' > "$rejection_dep"
+  : > "$scratch/rejection.stdout"
+  printf '%s\n' 'The RhizaCluster "sql" is invalid: spec.replicas: Invalid value: 1: must be greater than or equal to 3' > "$scratch/rejection.stderr"
+  for rejection_target in 1 2; do
+    jq -n --argjson target "$rejection_target" '{target:$target,command:("kubectl scale rhizacluster/sql --replicas="+($target|tostring)),exitCode:1,result:"rejected",schemaValidation:true}' > "$scratch/rejection-$rejection_target.result.json"
+    managed_functional_external_rejection_oracle "$rejection_cr" "$rejection_cr" "$rejection_dep" "$rejection_dep" \
+      "$rejection_target" "$scratch/rejection.stdout" "$scratch/rejection.stderr" "$scratch/rejection-$rejection_target.result.json"
+  done
+  jq '.spec.replicas=2' "$rejection_cr" > "$scratch/rejection-cr-spec-changed.json"
+  if managed_functional_external_rejection_oracle "$rejection_cr" "$scratch/rejection-cr-spec-changed.json" "$rejection_dep" "$rejection_dep" 1 "$scratch/rejection.stdout" "$scratch/rejection.stderr" "$scratch/rejection-1.result.json"; then return 1; fi
+  jq 'del(.status.replicaStep)' "$rejection_cr" > "$scratch/rejection-cr-step-lost.json"
+  if managed_functional_external_rejection_oracle "$rejection_cr" "$scratch/rejection-cr-step-lost.json" "$rejection_dep" "$rejection_dep" 1 "$scratch/rejection.stdout" "$scratch/rejection.stderr" "$scratch/rejection-1.result.json"; then return 1; fi
+  jq '.items[0].spec.replicas=2' "$rejection_dep" > "$scratch/rejection-deployment-changed.json"
+  if managed_functional_external_rejection_oracle "$rejection_cr" "$rejection_cr" "$rejection_dep" "$scratch/rejection-deployment-changed.json" 1 "$scratch/rejection.stdout" "$scratch/rejection.stderr" "$scratch/rejection-1.result.json"; then return 1; fi
+  jq '.exitCode=0 | .result="accepted" | .schemaValidation=false' "$scratch/rejection-1.result.json" > "$scratch/rejection-accepted.result.json"
+  if managed_functional_external_rejection_oracle "$rejection_cr" "$rejection_cr" "$rejection_dep" "$rejection_dep" 1 "$scratch/rejection.stdout" "$scratch/rejection.stderr" "$scratch/rejection-accepted.result.json"; then return 1; fi
+  printf '%s\n' 'some other failure' > "$scratch/rejection-bad.stderr"
+  if managed_functional_external_rejection_oracle "$rejection_cr" "$rejection_cr" "$rejection_dep" "$rejection_dep" 1 "$scratch/rejection.stdout" "$scratch/rejection-bad.stderr" "$scratch/rejection-1.result.json"; then return 1; fi
   private=$scratch namespace=managed-bootstrap
   : > "$scratch/curl.conf"
   k() {

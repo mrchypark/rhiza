@@ -59,6 +59,12 @@ func repairResumeFailure(stage repairResumeStage, err error) error {
 // the caller. It never proves physical death, executes pending SQL, or creates
 // a replacement identity; the Pod identity is validated by the status API.
 func (h *Host) ReplaceVoter(ctx context.Context, plan operator.V1Alpha2RepairPlan) error {
+	h.replicaMu.Lock()
+	defer h.replicaMu.Unlock()
+	return h.replaceVoterLocked(ctx, plan)
+}
+
+func (h *Host) replaceVoterLocked(ctx context.Context, plan operator.V1Alpha2RepairPlan) error {
 	h.mu.Lock()
 	closed := h.closed
 	h.mu.Unlock()
@@ -73,6 +79,9 @@ func (h *Host) ReplaceVoter(ctx context.Context, plan operator.V1Alpha2RepairPla
 	}
 	a, err := h.live(ctx)
 	if err != nil {
+		return err
+	}
+	if err := validateReplicaRepairEntry(a, plan.Sequence); err != nil {
 		return err
 	}
 	if plan.Sequence == operator.V1Alpha2RepairAdd {

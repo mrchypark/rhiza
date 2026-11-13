@@ -21,6 +21,12 @@ type LeaveVoterRequest struct {
 // LeaveVoter removes exactly one named voter after spec.voterCount was
 // explicitly reduced by one. The closed repair record is the replay journal.
 func (h *Host) LeaveVoter(ctx context.Context, request LeaveVoterRequest) error {
+	h.replicaMu.Lock()
+	defer h.replicaMu.Unlock()
+	return h.leaveVoterLocked(ctx, request, nil)
+}
+
+func (h *Host) leaveVoterLocked(ctx context.Context, request LeaveVoterRequest, proof *replicaLeaveProof) error {
 	if request.NodeID == "" {
 		return fmt.Errorf("%w: voter ID required", network.ErrInvalidRequest)
 	}
@@ -34,17 +40,39 @@ func (h *Host) LeaveVoter(ctx context.Context, request LeaveVoterRequest) error 
 	if err != nil {
 		return err
 	}
+	_, external, err := a.ReplicaProposal()
+	if err != nil {
+		return err
+	}
+	if external && proof == nil {
+		return fmt.Errorf("%w: external replica leave requires fresh Host certification", network.ErrInvalidRequest)
+	}
+	if proof != nil {
+		if err := validateReplicaLeaveProof(a, request, *proof); err != nil {
+			return err
+		}
+	}
 	if r, ok := a.Repair(); ok && r.Plan.Sequence == operator.V1Alpha2RepairLeave && r.Plan.OldNodeID == types.NodeID(request.NodeID) && r.State == "Completed" {
 		return h.resumeLeave(ctx, r)
 	}
 	if _, pending := a.Pending(); pending {
 		return fmt.Errorf("pending application write blocks managed leave")
 	}
-	target, err := a.TargetVoterCount()
-	if err != nil {
-		return err
+	target := 0
+	if proof != nil {
+		target = int(proof.Step.To)
+	} else {
+		target, err = a.TargetVoterCount()
+		if err != nil {
+			return err
+		}
 	}
 	if r, ok := a.Repair(); ok && r.Plan.Sequence == operator.V1Alpha2RepairLeave && r.Plan.OldNodeID == types.NodeID(request.NodeID) {
+		if proof != nil {
+			if err := h.verifyReplicaLeaveBeforeRemove(ctx, r, *proof); err != nil {
+				return err
+			}
+		}
 		return h.resumeLeave(ctx, r)
 	}
 	if a.SQLReservationsClosed() {
@@ -53,6 +81,11 @@ func (h *Host) LeaveVoter(ctx context.Context, request LeaveVoterRequest) error 
 	r, err := h.beginLeave(ctx, a, request, target)
 	if err != nil {
 		return err
+	}
+	if proof != nil {
+		if err := h.verifyReplicaLeaveBeforeRemove(ctx, r, *proof); err != nil {
+			return err
+		}
 	}
 	return h.resumeLeave(ctx, r)
 }
@@ -123,8 +156,22 @@ func (h *Host) resumeLeave(ctx context.Context, r operator.V1Alpha2RepairRecord)
 	if r.State != "Closed" || !a.SQLReservationsClosed() {
 		return fmt.Errorf("exact closed managed leave record required")
 	}
-	if err := h.RemoveRepairVoter(ctx, r.Plan.OperationID); err != nil {
+	request := node.ManagedMembershipRequest{RepairOperationID: r.Plan.OperationID, Action: node.ManagedMembershipRemove, ExpectedConfigID: uint(r.Plan.ExpectedConfigID), ExpectedAbortSlot: quepaxa.Slot(r.Plan.ExpectedAbortSlot), OldNodeID: quepaxa.NodeID(r.Plan.OldNodeID), OldWALIdentity: r.Plan.OldWALIdentity}
+	snapshot, err := h.node.ManagedRepairSnapshot(ctx, "", quepaxa.PublicKey{})
+	if err != nil {
 		return err
+	}
+	switch snapshot.Current.ConfigID {
+	case uint(r.Plan.ExpectedConfigID):
+		if err := h.RemoveRepairVoter(ctx, r.Plan.OperationID); err != nil {
+			return err
+		}
+	case uint(r.Plan.ExpectedConfigID + 1):
+		if _, err := h.node.VerifyManagedRepairRemoval(ctx, request); err != nil {
+			return fmt.Errorf("read-only applied REMOVE terminal: %w", err)
+		}
+	default:
+		return fmt.Errorf("managed leave configuration is neither its source nor target")
 	}
 	if r.PreparedHandoff == nil {
 		if _, err := h.CaptureRepairHandoff(ctx, r.Plan.OperationID); err != nil {
@@ -139,7 +186,6 @@ func (h *Host) resumeLeave(ctx context.Context, r operator.V1Alpha2RepairRecord)
 			return fmt.Errorf("leave handoff was not retained")
 		}
 	}
-	request := node.ManagedMembershipRequest{RepairOperationID: r.Plan.OperationID, Action: node.ManagedMembershipRemove, ExpectedConfigID: uint(r.Plan.ExpectedConfigID), ExpectedAbortSlot: quepaxa.Slot(r.Plan.ExpectedAbortSlot), OldNodeID: quepaxa.NodeID(r.Plan.OldNodeID), OldWALIdentity: r.Plan.OldWALIdentity}
 	proof, err := h.node.VerifyManagedRepairRemoval(ctx, request)
 	if err != nil {
 		return err

@@ -54,6 +54,7 @@ type PeerServer struct {
 	promotionReady <-chan struct{}
 	// Installed only by package tests; nil leaves ordinary serving unchanged.
 	diagnostic atomic.Pointer[func(string, error)]
+	capLogged  atomic.Bool
 }
 
 func StartPeerServer(ctx context.Context, addr string, server *Server, members []quepaxa.Member, peerToken, adminToken string) (*PeerServer, error) {
@@ -146,10 +147,7 @@ func startPeerServer(ctx context.Context, server *Server, members []quepaxa.Memb
 		// peer token. Requesting (not requiring) it keeps the admin-token
 		// read-only sync path working for clients without a peer identity.
 		ClientAuth: tls.RequestClientCert,
-	}, &quic.Config{
-		HandshakeIdleTimeout: 5 * time.Second, MaxIdleTimeout: 30 * time.Second, KeepAlivePeriod: 10 * time.Second,
-		MaxIncomingStreams: 256, MaxIncomingUniStreams: -1,
-	})
+	}, newPeerQUICConfig(peerIdleTimeout))
 	if err != nil {
 		return nil, err
 	}
@@ -227,12 +225,16 @@ func (s *PeerServer) serve(ctx context.Context) {
 		}
 		select {
 		case s.connections <- struct{}{}:
+			s.capLogged.Store(false)
 			s.wg.Add(1)
 			go func() {
 				defer func() { <-s.connections; s.wg.Done() }()
 				s.serveConnection(ctx, conn)
 			}()
 		default:
+			if s.capLogged.CompareAndSwap(false, true) {
+				log.Printf("peer connection rejected reason=connection_limit limit=%d", maxPeerConnections)
+			}
 			_ = conn.CloseWithError(1, "peer connection limit reached")
 		}
 	}

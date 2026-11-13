@@ -15,6 +15,10 @@ spec:
       storage: true
       subresources:
         status: {}
+        scale:
+          specReplicasPath: .spec.replicas
+          statusReplicasPath: .status.replicas
+          labelSelectorPath: .status.selector
       schema:
         openAPIV3Schema:
           type: object
@@ -44,6 +48,10 @@ spec:
               message: new genesis requires an unused initialization assignment
             - rule: '!has(oldSelf.status) || !has(oldSelf.status.authority) || !has(oldSelf.status.authority.everApplicationReserved) || !oldSelf.status.authority.everApplicationReserved || (has(self.status) && has(self.status.authority) && has(self.status.authority.everApplicationReserved) && self.status.authority.everApplicationReserved)'
               message: application reservation history cannot be removed or reset
+            - rule: '!has(self.status) || !has(self.status.replicaStep) || has(self.spec.replicas)'
+              message: non-opted clusters cannot gain a replica step
+            - rule: '!has(self.spec.replicas) || (has(self.status) && has(self.status.genesis)) || self.spec.replicas == self.spec.voterCount'
+              message: initial replicas must equal voterCount
           properties:
             spec:
               type: object
@@ -59,6 +67,8 @@ spec:
                   message: legacy cluster fields are unsupported
                 - rule: self.voterCount >= oldSelf.voterCount - 1
                   message: voterCount may decrease by at most one per update
+                - rule: has(self.replicas) == has(oldSelf.replicas)
+                  message: replicas opt-in presence is immutable
               properties:
                 applicationProtocol: {type: string, maxLength: 64, enum: [rhiza-managed-request-append-only/v1, rhiza-managed-request-graph-append-only/v1]}
                 genesisIntent: {type: string, maxLength: 6, enum: [Create]}
@@ -82,6 +92,7 @@ spec:
                     - rule: self == oldSelf
                       message: logicalID is immutable
                 voterCount: {type: integer, minimum: 3, maximum: 64}
+                replicas: {type: integer, format: int32, minimum: 3, maximum: 64}
                 workload:
                   type: object
                   required: [podTemplate]
@@ -151,6 +162,26 @@ spec:
               type: object
               x-kubernetes-preserve-unknown-fields: true
               x-kubernetes-validations:
+                - rule: '!has(self.replicaStep) || (has(self.authority.owner) && has(self.authority.owner.uid) && has(self.authority.binding) && has(self.authority.binding.deploymentUID) && has(self.authority.generation) && self.replicaStep.generation == self.authority.generation && self.replicaStep.deploymentUID == self.authority.binding.deploymentUID)'
+                  message: replica step must bind the current authority
+                - rule: '!has(self.replicaStep) || ((!has(self.authority.transition) || self.authority.transition == null) && (!has(self.authority.pendingWrite) || !self.authority.pendingWrite))'
+                  message: replica step cannot overlap a transition or pending write
+                - rule: '!has(self.replicaStep) || !has(self.repair) || self.repair.state != "Closed" || (has(self.repair.plan) && self.repair.plan.expectedConfigID == self.replicaStep.configID && self.repair.plan.finalVoterIDs.size() == self.replicaStep.to && ((self.replicaStep.to < self.replicaStep.from && self.repair.plan.sequence == "leave") || (self.replicaStep.to > self.replicaStep.from && self.repair.plan.sequence == "add")))'
+                  message: closed repair must exactly implement the replica step
+                - rule: '!has(oldSelf.replicaStep) || !has(self.replicaStep) || (self.replicaStep.from == oldSelf.replicaStep.from && self.replicaStep.to == oldSelf.replicaStep.to && self.replicaStep.generation == oldSelf.replicaStep.generation && self.replicaStep.deploymentUID == oldSelf.replicaStep.deploymentUID && self.replicaStep.configID == oldSelf.replicaStep.configID)'
+                  message: replica step pair and binding are immutable
+                - rule: '!has(self.replicaCheck) || (has(self.replicaStep) && self.replicaStep.to < self.replicaStep.from)'
+                  message: replica check requires an active down step
+                - rule: '!has(self.replicaStep) || !has(self.replicaStep.checkID) || (has(self.replicaCheck) && self.replicaStep.checkID == self.replicaCheck.id && self.replicaStep.deploymentResourceVersion == self.replicaCheck.deploymentResourceVersion)'
+                  message: replica step proof requires the current one-use check
+                - rule: '!has(oldSelf.replicaStep) || has(self.replicaStep) || (has(self.appliedVoterCount) && self.appliedVoterCount == oldSelf.replicaStep.to && !has(self.replicaCheck) && has(self.repair) && self.repair.state == "Completed" && has(self.repair.plan) && has(self.repair.completion) && self.repair.completion.kind == "Terminal" && self.repair.plan.expectedConfigID == oldSelf.replicaStep.configID && self.repair.completion.configID == oldSelf.replicaStep.configID + 1 && self.repair.plan.finalVoterIDs.size() == oldSelf.replicaStep.to && ((oldSelf.replicaStep.to < oldSelf.replicaStep.from && self.repair.plan.sequence == "leave") || (oldSelf.replicaStep.to > oldSelf.replicaStep.from && self.repair.plan.sequence == "add")))'
+                  message: clearing a replica step requires its exact certified terminal
+                - rule: '!has(self.appliedVoterCount) || has(oldSelf.appliedVoterCount) || (has(oldSelf.replicaStep) && !has(self.replicaStep) && self.appliedVoterCount == oldSelf.replicaStep.to)'
+                  message: appliedVoterCount can only be initialized by clearing a replica step
+                - rule: '!has(oldSelf.appliedVoterCount) || has(self.appliedVoterCount)'
+                  message: appliedVoterCount cannot be removed
+                - rule: '!has(oldSelf.appliedVoterCount) || !has(self.appliedVoterCount) || self.appliedVoterCount == oldSelf.appliedVoterCount || (has(oldSelf.replicaStep) && !has(self.replicaStep) && self.appliedVoterCount == oldSelf.replicaStep.to)'
+                  message: appliedVoterCount changes only on replica step clear
                 - rule: '!has(oldSelf.repair) || has(self.repair)'
                   message: repair record cannot be removed
                 - rule: '!has(self.repair) || (has(self.authority) && has(self.applicationInit) && self.applicationInit.state == "Consumed" && self.repair.plan.bootstrapPlanDigest == self.applicationInit.plan.bootstrapPlanDigest)'
@@ -198,6 +229,37 @@ spec:
                 - rule: '!has(self.applicationInit) || (self.applicationInit.plan.clusterUID == self.genesis.ownerUID && self.applicationInit.plan.intentHash == self.genesis.intentHash && self.applicationInit.plan.deploymentUID == self.genesis.deploymentUID && self.applicationInit.plan.storageID == self.genesis.storageID)'
                   message: initialization assignment must match genesis
               properties:
+                replicas: {type: integer, format: int32, minimum: 0, maximum: 64}
+                selector:
+                  type: string
+                  maxLength: 307
+                  pattern: '^rhiza\.mrchypark\.dev/cluster-uid=[^,]{1,256},rhiza\.mrchypark\.dev/generation=([0-9]{1,19})$'
+                appliedVoterCount: {type: integer, format: int32, minimum: 3, maximum: 64}
+                replicaStep:
+                  type: object
+                  required: [generation, deploymentUID, deploymentResourceVersion, configID, from, to, expiresAt]
+                  properties:
+                    generation: {type: integer, format: int64, minimum: 0}
+                    deploymentUID: {type: string, minLength: 1, maxLength: 256}
+                    deploymentResourceVersion: {type: string, minLength: 1, maxLength: 256}
+                    configID:
+                      type: integer
+                      format: int64
+                      minimum: 1
+                      x-kubernetes-validations:
+                        - rule: 'self <= 9223372036854775805'
+                          message: configID must remain within the exact int64 bound
+                    from: {type: integer, format: int32, minimum: 3, maximum: 64}
+                    to: {type: integer, format: int32, minimum: 3, maximum: 64}
+                    checkID: {type: string, maxLength: 256}
+                    expiresAt: {type: string, format: date-time}
+                replicaCheck:
+                  type: object
+                  required: [id, deploymentResourceVersion, expiresAt]
+                  properties:
+                    id: {type: string, minLength: 1, maxLength: 256}
+                    deploymentResourceVersion: {type: string, minLength: 1, maxLength: 256}
+                    expiresAt: {type: string, format: date-time}
                 authority:
                   type: object
                   x-kubernetes-preserve-unknown-fields: true
