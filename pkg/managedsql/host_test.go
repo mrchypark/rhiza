@@ -61,11 +61,12 @@ type sqlWireControl struct {
 	putGate func(context.Context, string) bool
 	// Optional arm is installed before runtime startup. Nil retains the
 	// existing unconditional gate; tests may atomically arm a later failure.
-	putEnabled     *atomic.Bool
-	failFirstPut   atomic.Bool
-	deleteRequests atomic.Int64
-	keysMu         sync.Mutex
-	putKeys        []string
+	putEnabled       *atomic.Bool
+	failFirstPut     atomic.Bool
+	deferCheckpoints atomic.Bool
+	deleteRequests   atomic.Int64
+	keysMu           sync.Mutex
+	putKeys          []string
 }
 
 // Install before Open; only an actual owned Host Close starts this lifecycle.
@@ -253,6 +254,11 @@ func sqlWireStore(t *testing.T) (*httptest.Server, *sqlWireControl) {
 			if control.failFirstPut.Swap(false) {
 				w.WriteHeader(500)
 				_, _ = io.WriteString(w, "<Error><Code>InternalError</Code></Error>")
+				return
+			}
+			if control.deferCheckpoints.Load() && strings.Contains(key, "/checkpoint/") {
+				w.WriteHeader(http.StatusServiceUnavailable)
+				_, _ = io.WriteString(w, "<Error><Code>SlowDown</Code></Error>")
 				return
 			}
 			if r.Header.Get("If-None-Match") == "*" && exists || r.Header.Get("If-Match") != "" && (!exists || r.Header.Get("If-Match") != etag) {
@@ -870,8 +876,15 @@ func TestManagedSQLRealThreeNodeInitializationAndWrite(t *testing.T) {
 }
 
 func openSQLQuorum(t *testing.T, closeLifecycle ...*sqlWireCloseLifecycle) ([]Config, []*Host, *sqlStatusFixture) {
+	return openSQLQuorumWithSetup(t, nil, closeLifecycle...)
+}
+
+func openSQLQuorumWithSetup(t *testing.T, setup func(*sqlStatusFixture), closeLifecycle ...*sqlWireCloseLifecycle) ([]Config, []*Host, *sqlStatusFixture) {
 	t.Helper()
 	configs, f := sqlCluster(t)
+	if setup != nil {
+		setup(f)
+	}
 	lifecycle := &sqlWireCloseLifecycle{acceptedPUT: make(chan string, 16)}
 	if len(closeLifecycle) != 0 {
 		if len(closeLifecycle) != 1 || closeLifecycle[0] == nil {
@@ -902,7 +915,10 @@ func openSQLQuorum(t *testing.T, closeLifecycle ...*sqlWireCloseLifecycle) ([]Co
 }
 
 func TestManagedSQLDDLReversalDoesNotRearmMissingSource(t *testing.T) {
-	configs, hosts, f := openSQLQuorum(t)
+	configs, hosts, f := openSQLQuorumWithSetup(t, func(f *sqlStatusFixture) {
+		f.source.deferCheckpoints.Store(true)
+	})
+	defer f.source.deferCheckpoints.Store(false)
 	h := hosts[0]
 	initial, err := h.node.InspectManagedKV(context.Background(), false)
 	if err != nil {
