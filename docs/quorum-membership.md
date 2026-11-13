@@ -55,10 +55,12 @@ not start a second transition.
 ## Normal managed membership boundary
 
 Genesis and bootstrap are the operator-owned setup path. After that authority is
-committed, no running operator is required for certified membership joins or
-replacement. In manual mode (`spec.replicas` omitted), deployment tooling sets
-`voterCount` and explicitly scales the Deployment. In external mode, HPA, KEDA,
-or an operator changes only the `RhizaCluster` scale subresource; see the
+committed, consensus certification itself does not require a running operator.
+Manual mode can keep it off. External replica control requires the operator loop
+to remain running because it is the sole generated-Deployment `/scale` writer.
+In manual mode (`spec.replicas` omitted), deployment tooling sets `voterCount`
+and explicitly scales the Deployment. In external mode, HPA, KEDA, or an
+operator changes only the `RhizaCluster` scale subresource; see the
 [operator replica-control guide](../deploy/operator/README.md#replica-control).
 Neither path makes replica count alone membership evidence. The reference Rhiza
 Host observes gated candidates and admits one learner at a time, waiting for the
@@ -70,12 +72,14 @@ authenticated ADD-first transition under a surviving quorum. Readiness, replica
 count, Pod deletion and elapsed time do not prove that an old incarnation is
 stopped or that its storage work is complete.
 
-Managed leave is explicit and staged: with the operator still off after genesis,
-lower the desired `voterCount` by one (minimum 3), then scale the Deployment down
-one. Verify the actual removed Pod's ID; never predict the Deployment victim.
-From a surviving Host/service, call the
+Manual-mode managed leave is explicit and staged: with the operator off after
+genesis, lower the desired `voterCount` by one (minimum 3), then scale the
+Deployment down one. Verify the actual removed Pod's ID; never predict the
+Deployment victim. From a surviving Host/service, call the
 authenticated private `POST /leave-voter` with `{"node_id":"<actual-id>"}`, then
 wait for the certified exact target configuration and a live write/readback.
+In external mode, never scale the generated Deployment: change only
+`RhizaCluster.spec.replicas` and let the operator apply the Host-approved step.
 
 Pod disappearance does not invoke leave, and managed leave uses no fence. A
 removed voter may not re-enroll. It does not claim storage completion or DR. If

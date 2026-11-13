@@ -10,7 +10,7 @@ its `serve-managed-sql` reference host as the main process.
 
 | Component | Current responsibility |
 | --- | --- |
-| `rhiza-operator` | Validate the installed private runtime profile and matching Secret, create/read back the generation-zero Deployment, and commit genesis/bootstrap authority from actual gated Pod identities. It is retained for separately authorized DR work but is not required after bootstrap for certified join or replacement, and it has no automatic DR executor. |
+| `rhiza-operator` | Validate the installed private runtime profile and matching Secret, create/read back the generation-zero Deployment, and commit genesis/bootstrap authority from actual gated Pod identities. Consensus certification does not require it after bootstrap, but external replica control does: the operator loop must remain running as the sole generated-Deployment `/scale` writer. Manual mode may run with it off. It is retained for separately authorized DR work and has no automatic DR executor. |
 | Kubernetes Deployment/kubelet | Maintain the configured Pod count and restart containers. Manual mode changes `voterCount` and the Deployment together; external mode changes the `RhizaCluster` scale target and the operator writes Deployment `/scale`. A replacement Pod has a new identity; Pod loss is not a certified leave, and restart alone does not grant voting authority. |
 | Reference managed host | Run the background replacement loop, discover gated candidates, admit one learner at a time through certified ADD-first repair, and serve authenticated private leave from a surviving Host. |
 | Rhiza engine | Validate WAL identity, membership and certified history, catch up the learner, and certify/apply decisions. |
@@ -85,9 +85,9 @@ it and must follow authenticated bootstrap/adoption and catch-up.
 The [cluster schema](cluster-crd.yaml) requires a voter count from 3 through 64.
 In manual mode the deployment owner changes `voterCount` and scales the Deployment
 together; in external mode it changes only the scale target and the operator
-writes Deployment `/scale`. See [Replica control](#replica-control). The operator
-is not required after bootstrap for normal join, replacement or leave. Each new
-Pod remains behind the identity gate until the Rhiza Host admits one learner.
+writes Deployment `/scale`. See [Replica control](#replica-control). Consensus does
+not require a running operator after bootstrap, but external replica control does.
+Each new Pod remains behind the identity gate until the Rhiza Host admits one learner.
 Managed leave is one voter at a time and waits for the certified exact target and
 live write/readback. Pod loss does not trigger leave. Removed IDs cannot
 re-enroll; leave uses no fence and claims neither storage completion nor DR.
@@ -103,7 +103,8 @@ Choose the replica-control mode when the cluster is created. The presence of
 
 Manual mode omits `spec.replicas`. `spec.voterCount` is the target, and the
 deployment owner changes it and the Deployment together. This mode does not
-consume the CR's scale subresource and is not autoscaling.
+consume the CR's scale subresource and is not autoscaling. The operator may run
+with it off after bootstrap.
 
 External mode sets `spec.replicas` equal to `voterCount` at creation. Both are
 bounded to 3-64. After genesis, change only `replicas`; `voterCount` records the
@@ -114,20 +115,27 @@ apiVersion: rhiza.mrchypark.dev/v1alpha2
 kind: RhizaCluster
 metadata:
   name: sql
+  namespace: rhiza
 spec:
+  logicalID: application-db
+  genesisIntent: Create
+  applicationProtocol: rhiza-managed-request-append-only/v1
   voterCount: 3
   replicas: 3
-  logicalID: application-db
+  automaticRecovery: "OFF"
+  provisionalRetentionSeconds: 172800
+  deletionPolicy: Orphan
   workload:
     podTemplate:
       spec:
         containers:
-          - name: sql
-            image: example/database:1
+          - name: app
+            image: ghcr.io/mrchypark/rhiza-operator:v0.23.2
 ```
 
 In external mode, HPA, KEDA, or an operator uses the `RhizaCluster` scale
-subresource. Never target the generated Deployment.
+subresource. Keep the operator loop running so it can write approved steps to
+Deployment `/scale`. Never target the generated Deployment.
 
 ```yaml
 scaleTargetRef:
@@ -159,8 +167,10 @@ step.
 
 Targets below 3 are rejected. A physically forced one-Pod state is a disaster
 state, not an autoscaled cluster: local reads may continue, while writes and
-linearizable reads fail closed until an explicit recovery supplies three
-voters. This path performs no automatic DR or physical fencing.
+linearizable reads fail closed until the original WAL-backed voters and network
+are restored or a separately authorized generation recovery establishes
+certified state and a new quorum. Recreating or rescaling empty Pods is
+insufficient. This path performs no automatic DR or physical fencing.
 
 QuePaxa uses `floor(voterCount/2)+1` responses for a decision. Thus 4 and 5
 voters both require 3 responses; 7 requires 4 and 10 requires 6. The leader fast

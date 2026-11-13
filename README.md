@@ -129,9 +129,10 @@ Deployment. The count is bounded to 3-64. See the
 [operator replica-control guide](deploy/operator/README.md#replica-control).
 
 Managed HA uses two init containers and shared `emptyDir`, explicit append-only
-profiles 9/10, before-ack durability, and a voter count of 3–64. A replica-count
-change is a proposal; the operator applies it one step at a time and the Rhiza
-Host certifies membership through QuePaxa. Pod loss alone never removes
+profiles 9/10, before-ack durability, and a voter count of 3–64. In external mode,
+keep the operator loop running: it applies CR replica targets one step at a time
+while the Rhiza Host certifies membership through QuePaxa. Manual mode changes
+`voterCount` and the Deployment together. Pod loss alone never removes
 membership. Ordinary requests do not reserve a Kubernetes CR per mutation. HA
 object data is append-only with no online delete GC. Recreate rollout enforcement
 and peer/client Service management are not supplied by the initializer.
