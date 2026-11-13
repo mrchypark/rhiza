@@ -635,13 +635,15 @@ func ManagedRepairConfig(ctx context.Context, kube *operator.Kubernetes, ref ope
 		return empty, noop, errors.New("repair physical profile mismatch")
 	}
 	dataInfo, err := os.Lstat(cfg.Runtime.DataDir)
-	if err == nil && (!dataInfo.IsDir() || dataInfo.Mode()&os.ModeSymlink != 0) {
-		return empty, noop, errors.New("unsafe repair data directory")
+	if err == nil {
+		if !dataInfo.IsDir() || dataInfo.Mode()&os.ModeSymlink != 0 {
+			return empty, noop, errors.New("unsafe repair data directory")
+		}
+		if err := safeRepairDirectoryParent(cfg.Runtime.DataDir); err != nil {
+			return empty, noop, errors.New("adoption inspection failed")
+		}
 	}
 	if err != nil && !errors.Is(err, os.ErrNotExist) {
-		return empty, noop, errors.New("adoption inspection failed")
-	}
-	if err := safeRepairDirectoryParent(cfg.Runtime.DataDir); err != nil {
 		return empty, noop, errors.New("adoption inspection failed")
 	}
 	adoption, err := os.Lstat(filepath.Join(cfg.Runtime.DataDir, "prepared-adoption.json"))
