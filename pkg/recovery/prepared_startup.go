@@ -308,6 +308,10 @@ func parsePreparedStartupDirectory(ctx context.Context, handoffDir string, expec
 		if !equalGraphArtifacts(actual, m.Files) {
 			return result, fmt.Errorf("prepared Graph artifact inventory differs")
 		}
+		result.handoffState, result.handoffTip, err = inspectManagedFileForPolicy(ctx, filepath.Join(handoffDir, "sqlite.db"), window, policy, applicationProtocol)
+		if err != nil {
+			return result, fmt.Errorf("inspect Graph handoff: %w", err)
+		}
 	}
 	if managedSQLKVPolicy(policy) {
 		if err := validateMixedPreparedInventory(handoffDir, true); err != nil {
