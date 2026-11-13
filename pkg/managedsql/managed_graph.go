@@ -41,22 +41,36 @@ func (h *Host) GraphExecute(ctx context.Context, request types.GraphCommand) (ne
 	}
 	operationCtx, release := h.internalRequestContext(ctx)
 	defer release()
-	if err := h.waitForMembershipTransition(operationCtx); err != nil {
-		return network.GraphExecuteResponse{}, managedGraphExecuteFailure("host_transition", err)
+	for attempt := 0; ; attempt++ {
+		if err := h.waitForMembershipTransition(operationCtx); err != nil {
+			return network.GraphExecuteResponse{}, managedGraphExecuteFailure("host_transition", err)
+		}
+		result, err, admissionFail := h.graphExecuteAttempt(operationCtx, owned)
+		if shouldRetryMembershipTransition(err, attempt) {
+			continue
+		}
+		err = exhaustedMembershipTransitionError(err)
+		if admissionFail && err != nil {
+			return network.GraphExecuteResponse{}, managedGraphExecuteFailure("host_initial_admission", err)
+		}
+		return result, err
 	}
+}
+
+func (h *Host) graphExecuteAttempt(ctx context.Context, owned types.GraphCommand) (network.GraphExecuteResponse, error, bool) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	if h.closed || h.node == nil {
-		return network.GraphExecuteResponse{}, network.ErrNotReady
+		return network.GraphExecuteResponse{}, network.ErrNotReady, false
 	}
-	if err := h.ensureInitialRequestAdmission(operationCtx); err != nil {
-		return network.GraphExecuteResponse{}, managedGraphExecuteFailure("host_initial_admission", err)
+	if err := h.ensureInitialRequestAdmission(ctx); err != nil {
+		return network.GraphExecuteResponse{}, err, true
 	}
-	result, err := h.node.ExecuteManagedGraph(operationCtx, owned)
+	result, err := h.node.ExecuteManagedGraph(ctx, owned)
 	p := applicationOriginal{kind: "graph", graph: owned}
 	err = internalRequestOutcome(p, result.MutationReceipt, err)
 	h.rememberRequestOutcome(p, err, result.MutationReceipt)
-	return result, err
+	return result, err, false
 }
 
 func managedGraphExecuteFailure(stage string, err error) error {
@@ -75,47 +89,54 @@ func (h *Host) TrimGraphStream(ctx context.Context, request network.GraphStreamT
 	return h.GraphExecute(ctx, types.GraphCommand{RequestID: request.RequestID, StreamTrim: &types.GraphStreamTrimMutation{Stream: request.Stream, ThroughSequence: request.ThroughSequence}})
 }
 
-func (h *Host) GraphQuery(ctx context.Context, request network.GraphQueryRequest) (types.GraphCommandResult, error) {
-	ctx, n, release, err := h.graphReadNode(ctx, request.Consistency)
-	if err != nil {
-		return types.GraphCommandResult{}, err
+func callGraphRead[T any](h *Host, ctx context.Context, consistency string, fn func(context.Context, *node.Node) (T, error)) (T, error) {
+	var zero T
+	for attempt := 0; ; attempt++ {
+		opCtx, n, release, err := h.graphReadNode(ctx, consistency)
+		if err != nil {
+			if consistency == "linearizable" && shouldRetryMembershipTransition(err, attempt) {
+				if waitErr := h.waitForLinearizableTransition(ctx); waitErr != nil {
+					return zero, waitErr
+				}
+				continue
+			}
+			return zero, err
+		}
+		resp, err := fn(opCtx, n)
+		release()
+		if consistency == "linearizable" && shouldRetryMembershipTransition(err, attempt) {
+			continue
+		}
+		return resp, exhaustedMembershipTransitionError(err)
 	}
-	defer release()
-	return n.GraphQueryManaged(ctx, request)
+}
+
+func (h *Host) GraphQuery(ctx context.Context, request network.GraphQueryRequest) (types.GraphCommandResult, error) {
+	return callGraphRead(h, ctx, request.Consistency, func(opCtx context.Context, n *node.Node) (types.GraphCommandResult, error) {
+		return n.GraphQueryManaged(opCtx, request)
+	})
 }
 
 func (h *Host) GraphReachable(ctx context.Context, request types.GraphReachableRequest) (types.GraphReachableResult, error) {
-	ctx, n, release, err := h.graphReadNode(ctx, request.Consistency)
-	if err != nil {
-		return types.GraphReachableResult{}, err
-	}
-	defer release()
-	return n.GraphReachableManaged(ctx, request)
+	return callGraphRead(h, ctx, request.Consistency, func(opCtx context.Context, n *node.Node) (types.GraphReachableResult, error) {
+		return n.GraphReachableManaged(opCtx, request)
+	})
 }
 
 func (h *Host) GraphChanges(ctx context.Context, request network.GraphStreamReadRequest) (network.GraphStreamReadResponse, error) {
-	ctx, n, release, err := h.graphReadNode(ctx, request.Consistency)
-	if err != nil {
-		return network.GraphStreamReadResponse{}, err
-	}
-	defer release()
-	return n.GraphChangesManaged(ctx, request)
+	return callGraphRead(h, ctx, request.Consistency, func(opCtx context.Context, n *node.Node) (network.GraphStreamReadResponse, error) {
+		return n.GraphChangesManaged(opCtx, request)
+	})
 }
 
 func (h *Host) GraphStreamRead(ctx context.Context, request network.GraphStreamReadRequest) (network.GraphStreamReadResponse, error) {
-	ctx, n, release, err := h.graphReadNode(ctx, request.Consistency)
-	if err != nil {
-		return network.GraphStreamReadResponse{}, err
-	}
-	defer release()
-	return n.GraphStreamReadManaged(ctx, request)
+	return callGraphRead(h, ctx, request.Consistency, func(opCtx context.Context, n *node.Node) (network.GraphStreamReadResponse, error) {
+		return n.GraphStreamReadManaged(opCtx, request)
+	})
 }
 
 func (h *Host) GraphStreamOffset(ctx context.Context, request network.GraphStreamOffsetRequest) (network.GraphStreamOffsetResponse, error) {
-	ctx, n, release, err := h.graphReadNode(ctx, request.Consistency)
-	if err != nil {
-		return network.GraphStreamOffsetResponse{}, err
-	}
-	defer release()
-	return n.GraphStreamOffsetManaged(ctx, request)
+	return callGraphRead(h, ctx, request.Consistency, func(opCtx context.Context, n *node.Node) (network.GraphStreamOffsetResponse, error) {
+		return n.GraphStreamOffsetManaged(opCtx, request)
+	})
 }

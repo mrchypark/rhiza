@@ -2,6 +2,7 @@ package node
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"time"
 
@@ -10,6 +11,15 @@ import (
 )
 
 const managedMembershipTransitionWait = 10 * time.Second
+
+func isRetainedClusterMember(cluster quepaxa.Cluster, id quepaxa.NodeID) bool {
+	for _, member := range cluster.Members {
+		if string(member.ID) == string(id) {
+			return true
+		}
+	}
+	return false
+}
 
 // A retained voter can observe the certified target before its terminal is locally durable.
 func (n *Node) waitForManagedLocalReadVoter(ctx context.Context) error {
@@ -43,7 +53,14 @@ func (n *Node) waitForManagedVoterAdmission(ctx context.Context) error {
 			return err
 		}
 		if !n.core.CanParticipateReadIndex() {
-			return fmt.Errorf("internal application has no active voter admission")
+			admissionErr := fmt.Errorf("internal application has no active voter admission")
+			if pending, ok := n.core.PendingReconfiguration(); ok {
+				if isRetainedClusterMember(pending, n.core.NodeID()) {
+					return errors.Join(network.ErrNotReady, quepaxa.ErrReconfigurationDrain, admissionErr)
+				}
+				return network.ErrNotReady
+			}
+			return admissionErr
 		}
 	}
 	return nil
@@ -61,14 +78,7 @@ func (n *Node) WaitForManagedMembershipTransition(ctx context.Context) error {
 	if !ok {
 		return nil
 	}
-	retained := false
-	for _, member := range pending.Members {
-		if string(member.ID) == string(n.core.NodeID()) {
-			retained = true
-			break
-		}
-	}
-	if !retained {
+	if !isRetainedClusterMember(pending, n.core.NodeID()) {
 		return network.ErrNotReady
 	}
 

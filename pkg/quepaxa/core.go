@@ -18,6 +18,7 @@ import (
 
 var ErrQuorumUnavailable = errors.New("QuePaxa quorum unavailable")
 var ErrCompacted = errors.New("QuePaxa history compacted")
+var ErrReconfigurationDrain = errors.New("reconfiguration drain is in progress")
 
 // localCheckpointCrashBoundary is a package-private subprocess-test seam.
 // Production leaves it nil and it does not participate in error handling.
@@ -518,7 +519,7 @@ func (c *Core) proposeOwned(ctx context.Context, value []byte, complete, executi
 			}
 			<-c.pipeline
 			if !c.RecoverFrozenMembership(ctx) {
-				return 0, nil, fmt.Errorf("reconfiguration drain is in progress")
+				return 0, nil, ErrReconfigurationDrain
 			}
 		}
 	} else {

@@ -2331,6 +2331,12 @@ func (n *Node) Ready() bool {
 	return n.managedStartup.Checker.ValidateManagedAdmission(ctx, n.managedStartup.Identity, state) == nil
 }
 
+// StartupCaughtUp reports whether Node's initial catch-up has marked the
+// local runtime ready for foreground writes.
+func (n *Node) StartupCaughtUp() bool {
+	return n != nil && n.ready.Load()
+}
+
 func quarantineSQLite(path string) error {
 	if _, err := os.Stat(path); os.IsNotExist(err) {
 		return nil

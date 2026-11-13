@@ -455,6 +455,8 @@ func managedMembershipCauseClass(err error) string {
 		return "deadline"
 	case errors.Is(err, network.ErrNotReady):
 		return "not_ready"
+	case errors.Is(err, quepaxa.ErrReconfigurationDrain):
+		return "reconfiguration_drain"
 	case errors.Is(err, network.ErrInvalidRequest):
 		return "invalid_request"
 	case errors.Is(err, network.ErrRequestConflict):

@@ -298,3 +298,33 @@ func TestManagedLocalReadVoterWaitsForRetainedTerminalDurability(t *testing.T) {
 		t.Fatalf("local-read voter gate proposed %d records", recordsAfter-recordsBefore)
 	}
 }
+
+func TestManagedVoterAdmissionClassifiesPendingReconfiguration(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	members := []quepaxa.Member{{ID: "a"}, {ID: "b"}, {ID: "c"}}
+	transport := &managedTransitionTransport{cores: map[quepaxa.NodeID]*quepaxa.Core{}}
+	for _, member := range members {
+		wal, err := qlog.Open(filepath.Join(t.TempDir(), "wal"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { _ = wal.Close() })
+		core, err := quepaxa.New(quepaxa.Config{
+			NodeID: member.ID, Cluster: quepaxa.Cluster{ConfigID: 1, Members: members}, WAL: wal, Transport: transport, EnableReconfiguration: true,
+			ReconfigurationAdmission: func(context.Context, quepaxa.Cluster, quepaxa.Slot, [32]byte) error { return nil },
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		transport.cores[member.ID] = core
+	}
+	a, c := transport.cores["a"], transport.cores["c"]
+	target := quepaxa.Cluster{ConfigID: 2, Members: members[:2]}
+	if _, err := a.BeginReconfiguration(ctx, target); err != nil {
+		t.Fatal(err)
+	}
+	if err := (&Node{core: c}).WaitForManagedMembershipTransition(ctx); !errors.Is(err, network.ErrNotReady) {
+		t.Fatalf("non-retained member err=%v, want ErrNotReady", err)
+	}
+}

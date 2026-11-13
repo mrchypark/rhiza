@@ -105,6 +105,9 @@ func TestManagedLocalGraphReadBypassesWriteSerialization(t *testing.T) {
 		hosts[i] = h
 	}
 	h := hosts[0]
+	for _, host := range hosts {
+		awaitPublicInternalReady(t, ctx, host)
+	}
 	if _, err := h.GraphExecute(ctx, types.GraphCommand{RequestID: "local-graph-row", Cypher: "CREATE (:LocalRead {value: 'graph'})"}); err != nil {
 		t.Fatal(err)
 	}
