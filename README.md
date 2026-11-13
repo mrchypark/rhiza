@@ -105,7 +105,7 @@ it uses the embedded Go API without a public HTTP server. From this checkout:
 cargo run --manifest-path sdk/rust/Cargo.toml --example embedded
 ```
 
-Use `rhizadb = "0.24.0"` in your Cargo dependencies.
+Use `rhizadb = "0.25.0"` in your Cargo dependencies.
 Native builds support macOS and Linux GNU and require Rust, Go 1.27.3+, and a C
 compiler. The Rust bridge requires cgo; Go-only applications remain cgo-free.
 Calls are synchronous. By default the embedded engine starts its private peer
@@ -120,23 +120,21 @@ Start with the [managed operator guide](deploy/operator/README.md) and
 is also available. The v1alpha2 route is an explicit no-PVC reference-host
 integration, not a turnkey conversion of arbitrary applications that update
 the library. The operator validates profiles and commits initial genesis and
-bootstrap authority. After that commit, no running operator is required for a
-certified join or replacement. Deployment tooling sets the desired `voterCount`
-and explicitly scales the Deployment up. Kubernetes maintains Pod replicas and
-container restarts; the reference Rhiza Host discovers gated candidates and
-admits one learner at a time, and the engine validates identity and certified
-catch-up. A missing Pod is not a certified leave.
+bootstrap authority. It supports two explicit replica-control modes. Manual mode
+omits `spec.replicas`; deployment tooling changes `spec.voterCount` and the
+Deployment together. External mode sets `spec.replicas == spec.voterCount` at
+creation and then uses the `RhizaCluster` scale subresource, with the operator as
+the sole Deployment `/scale` writer. HPA and KEDA must target the CR, never the
+Deployment. The count is bounded to 3-64. See the
+[operator replica-control guide](deploy/operator/README.md#replica-control).
 
 Managed HA uses two init containers and shared `emptyDir`, explicit append-only
-profiles 9/10, before-ack durability, and a desired voter count of 3–64. Raising
-the count requires an explicit Deployment scale-up; it is not autoscaling or a
-membership decision by itself. Managed leave is staged one voter at a time: lower
-the target by one (minimum 3), scale down one Deployment replica, identify the
-actual removed voter, call the authenticated private `POST /leave-voter`, and wait
-for the certified target plus a live write/readback. Pod loss alone never removes
-membership. Ordinary requests do not reserve a Kubernetes CR per mutation. HA object
-data is append-only with no online delete GC. Recreate rollout enforcement and
-peer/client Service management are not supplied by the initializer.
+profiles 9/10, before-ack durability, and a voter count of 3–64. A replica-count
+change is a proposal; the operator applies it one step at a time and the Rhiza
+Host certifies membership through QuePaxa. Pod loss alone never removes
+membership. Ordinary requests do not reserve a Kubernetes CR per mutation. HA
+object data is append-only with no online delete GC. Recreate rollout enforcement
+and peer/client Service management are not supplied by the initializer.
 Whole-generation DR is not implemented by the operator: recovery API/schema fields
 are not an executor. Preserve pending/UNKNOWN evidence and restore the original
 quorum when quorum is lost. Local single-writer backup/restore is a separate

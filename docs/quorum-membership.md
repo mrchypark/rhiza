@@ -56,11 +56,13 @@ not start a second transition.
 
 Genesis and bootstrap are the operator-owned setup path. After that authority is
 committed, no running operator is required for certified membership joins or
-replacement. Deployment tooling sets the desired `voterCount` and explicitly
-scales the Deployment up; changing the target is neither autoscaling nor
-membership evidence. The reference Rhiza Host observes gated candidates and
-admits one learner at a time, waiting for the certified terminal before planning
-the next candidate.
+replacement. In manual mode (`spec.replicas` omitted), deployment tooling sets
+`voterCount` and explicitly scales the Deployment. In external mode, HPA, KEDA,
+or an operator changes only the `RhizaCluster` scale subresource; see the
+[operator replica-control guide](../deploy/operator/README.md#replica-control).
+Neither path makes replica count alone membership evidence. The reference Rhiza
+Host observes gated candidates and admits one learner at a time, waiting for the
+certified terminal before planning the next candidate.
 
 Pod loss is not a certified leave. A missing Pod can make a current voter a
 replacement candidate, but consensus membership changes only through the
@@ -106,12 +108,12 @@ alone is not admission evidence. Removed voter IDs must not be reused.
 Same-identity rejoin requires the intact original WAL and current certified
 membership; replay into an empty WAL is not a rejoin certificate.
 
-A managed `voterCount` increase is enrollment-only: each extra Pod waits at the
+A managed voter increase is enrollment-only: each extra Pod waits at the
 identity gate, a current voter captures a certified source and proves the old
 configuration quorum, and QuePaxa must verify the learner's WAL/prefix admission
 before recording the old-to-new terminal. The next candidate waits for that
 terminal. Deployment readiness and `kubectl scale` are not admission evidence.
-A managed `voterCount` decrease is removed only through the explicit staged leave
+A managed voter decrease is removed only through the explicit staged leave
 contract above, one voter at a time; no voter or Pod is removed automatically.
 
 The core APIs are `BeginReconfiguration`, `BeginReconfigurationAt`,
