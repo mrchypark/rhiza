@@ -293,9 +293,7 @@ func runReplaceVoterCoordinatesActualPreparedLearner(t *testing.T, beforeRetaine
 	hosts[0] = cold
 	// Reopen need not start another worker of each kind. The installed hook
 	// blocks any newly started publisher before its first publication.
-	if err := cold.Ready(ctx); err != nil {
-		t.Fatalf("cold request-profile survivor did not pass initial admission: %v", err)
-	}
+	awaitPublicInternalReady(t, ctx, cold)
 	afterRestart, err := cold.node.ManagedState()
 	if err != nil || afterRestart.WALIdentity != beforeRestart.WALIdentity {
 		t.Fatalf("cold restart changed voter WAL identity: %v", err)
@@ -641,9 +639,7 @@ func runReplaceVoterCoordinatesActualPreparedLearner(t *testing.T, beforeRetaine
 	if err != nil || firstDRestart.LocalWALIdentity != dSnapshot.LocalWALIdentity {
 		t.Fatalf("same-Pod D restart changed its durable WAL nonce: before=%q after=%q err=%v", dSnapshot.LocalWALIdentity, firstDRestart.LocalWALIdentity, err)
 	}
-	if err := historical.Ready(ctx); err != nil {
-		t.Fatalf("same-Pod D restart did not recover before readiness: %v", err)
-	}
+	awaitPublicInternalReady(t, ctx, historical)
 	if verifyRetainedRestart != nil {
 		verifyRetainedRestart(historical)
 	}

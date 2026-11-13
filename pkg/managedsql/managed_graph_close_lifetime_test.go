@@ -42,9 +42,7 @@ func TestManagedGraphCloseCancelsActiveBackgroundAdmissionResampling(t *testing.
 	if err != nil || warmup.Slot == 0 || warmup.Status != types.MutationCommitted {
 		t.Fatalf("actual first Graph write did not publish the initial root: slot=%d status=%s err=%v", warmup.Slot, warmup.Status, err)
 	}
-	if err := hosts[0].Ready(openCtx); err != nil {
-		t.Fatalf("Graph Host not ready after its actual initial-root write: %v", err)
-	}
+	awaitPublicInternalReady(t, openCtx, hosts[0])
 
 	type targetRequestKey struct{}
 	targetCtx := context.WithValue(context.Background(), targetRequestKey{}, true)

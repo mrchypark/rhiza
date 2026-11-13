@@ -425,7 +425,11 @@ func (n *Node) waitManagedAppendOnlyBarrierProof(ctx context.Context, target que
 	}
 	if op.err != nil {
 		logManagedControlWaitFailure("waiter_error", op.err)
-		return 0, errors.Join(network.ErrNotReady, n.refuseManagedGraphAdmissionAtReason("observed_control_barrier_failed_or_short", target, n.core.RuntimeProgressSnapshot()))
+		refused := n.refuseManagedGraphAdmissionAtReason("observed_control_barrier_failed_or_short", target, n.core.RuntimeProgressSnapshot())
+		if errors.Is(op.err, quepaxa.ErrReconfigurationDrain) {
+			return 0, errors.Join(network.ErrNotReady, quepaxa.ErrReconfigurationDrain, refused)
+		}
+		return 0, errors.Join(network.ErrNotReady, refused)
 	}
 	if op.binding == nil || op.binding != n.internalApplication.Load() || op.binding.core != n.core || op.binding.lifetime.Err() != nil {
 		return 0, network.ErrNotReady

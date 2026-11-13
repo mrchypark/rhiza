@@ -494,6 +494,7 @@ func TestInternalRequestFirstExecuteWithoutPrivateAdmissionOrReady(t *testing.T)
 	if attempts.Load() <= before {
 		t.Fatal("first Execute skipped live initial admission")
 	}
+	awaitPublicInternalReady(t, ctx, hosts[0])
 	attempts.Store(0)
 	outage.Store(true)
 	t.Cleanup(func() { outage.Store(false) })

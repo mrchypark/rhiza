@@ -495,7 +495,13 @@ func (h *Host) Ready(ctx context.Context) error {
 		return err
 	}
 	defer release()
-	return n.CheckManagedLocalRead(operationCtx)
+	if err := n.CheckManagedLocalRead(operationCtx); err != nil {
+		return err
+	}
+	if !n.StartupCaughtUp() {
+		return network.ErrNotReady
+	}
+	return nil
 }
 
 // RemoveRepairVoter excludes the old voter from consensus only. It does not
@@ -874,22 +880,36 @@ func (h *Host) Execute(ctx context.Context, req ExecuteRequest) (ExecuteResponse
 	}
 	operationCtx, release := h.internalRequestContext(ctx)
 	defer release()
-	if err := h.waitForMembershipTransition(operationCtx); err != nil {
-		return ExecuteResponse{}, &SQLNotSubmittedError{Stage: SQLStageAdmission, Cause: err}
+	for attempt := 0; ; attempt++ {
+		if err := h.waitForMembershipTransition(operationCtx); err != nil {
+			return ExecuteResponse{}, &SQLNotSubmittedError{Stage: SQLStageAdmission, Cause: err}
+		}
+		response, err, submitted := h.executeAttempt(operationCtx, req)
+		if shouldRetryMembershipTransition(err, attempt) {
+			continue
+		}
+		err = exhaustedMembershipTransitionError(err)
+		if !submitted && err != nil {
+			return ExecuteResponse{}, &SQLNotSubmittedError{Stage: SQLStageAdmission, Cause: err}
+		}
+		return response, err
 	}
+}
+
+func (h *Host) executeAttempt(ctx context.Context, req ExecuteRequest) (ExecuteResponse, error, bool) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	if h.closed {
-		return ExecuteResponse{}, &SQLNotSubmittedError{Stage: SQLStageAuthority, Cause: fmt.Errorf("SQL host closed")}
+		return ExecuteResponse{}, &SQLNotSubmittedError{Stage: SQLStageAuthority, Cause: fmt.Errorf("SQL host closed")}, true
 	}
-	if err := h.ensureInitialRequestAdmission(operationCtx); err != nil {
-		return ExecuteResponse{}, &SQLNotSubmittedError{Stage: SQLStageAdmission, Cause: err}
+	if err := h.ensureInitialRequestAdmission(ctx); err != nil {
+		return ExecuteResponse{}, err, false
 	}
-	response, err := h.node.ExecuteManagedSQL(operationCtx, req)
+	response, err := h.node.ExecuteManagedSQL(ctx, req)
 	p := applicationOriginal{kind: "sql", sql: req}
 	err = internalRequestOutcome(p, response.MutationReceipt, err)
 	h.rememberRequestOutcome(p, err, response.MutationReceipt)
-	return response, err
+	return response, err, true
 }
 
 // RecoverPending never re-executes an unknown request or treats absence as no
@@ -900,17 +920,30 @@ func (h *Host) RecoverPending(ctx context.Context) error {
 }
 
 func (h *Host) Query(ctx context.Context, req QueryRequest) (QueryResponse, error) {
-	operationCtx, n, release, err := h.localReadNode(ctx)
-	if err != nil {
-		return QueryResponse{}, h.logQueryFailure("host_initial_admission", err)
-	}
-	defer release()
-	if req.Consistency == "linearizable" {
-		if err := n.WaitForManagedMembershipTransition(operationCtx); err != nil {
-			return QueryResponse{}, err
+	for attempt := 0; ; attempt++ {
+		operationCtx, n, release, err := h.localReadNode(ctx)
+		if err != nil {
+			if req.Consistency == "linearizable" && shouldRetryMembershipTransition(err, attempt) {
+				if waitErr := h.waitForLinearizableTransition(ctx); waitErr != nil {
+					return QueryResponse{}, h.logQueryFailure("host_initial_admission", waitErr)
+				}
+				continue
+			}
+			return QueryResponse{}, h.logQueryFailure("host_initial_admission", err)
 		}
+		var resp QueryResponse
+		if req.Consistency == "linearizable" {
+			err = n.WaitForManagedMembershipTransition(operationCtx)
+		}
+		if err == nil {
+			resp, err = n.QueryManagedSQL(operationCtx, req)
+		}
+		release()
+		if req.Consistency == "linearizable" && shouldRetryMembershipTransition(err, attempt) {
+			continue
+		}
+		return resp, exhaustedMembershipTransitionError(err)
 	}
-	return n.QueryManagedSQL(operationCtx, req)
 }
 
 func managedHostQueryDiagnostic(stage string) string {

@@ -45,7 +45,7 @@ run_contract() {
   ) 2>&1 | awk '
     function emit(s) { if (used+length(s)+1<=65536) { print s; used+=length(s)+1 } }
     function knowncode(s) { return s ~ /^(internal|commit_unknown|kv_recovery_required|kv_not_submitted|sql_recovery_required|sql_not_submitted|timeout|canceled|invalid_request|not_ready|quorum_unavailable|request_conflict|durability_unavailable|overloaded|unclassified)$/ }
-    function knownadmissioncause(s) { return s ~ /^(canceled|deadline|not_ready|invalid_request|request_conflict|quorum_unavailable|other)$/ }
+    function knownadmissioncause(s) { return s ~ /^(canceled|deadline|not_ready|reconfiguration_drain|invalid_request|request_conflict|quorum_unavailable|other)$/ }
     function knowncontrolreason(s) { return s ~ /^(runtime_role_or_profile|reference_validation|validated_prefix_advance|slot_not_next|isr_shape|voter_configuration|proposal_value|authority_changed|refs_uncovered|slot_changed|step_regressed|final_snapshot_mismatch)$/ }
     function knowncheckpointreason(s) { return s ~ /^(selection_unavailable|local_seal_read|current_read|refreshed_local_seal_read|current_without_certified_qckp|current_ahead|current_rank_conflict|archive_load|archive_sealed|archive_tip_behind|archive_base_ahead|archive_base_invalid|archive_decision_unavailable|core_certificate_mismatch|archive_certificate_invalid|candidate_validation|root_open|root_state_policy_mismatch|current_certificate_hash_mismatch|prefix_refresh_unavailable|prefix_archive_load|prefix_unexpected_base|prefix_page_incomplete|prefix_decision_identity|prefix_decision_policy|prefix_certificate_accept|prefix_anchor_invalid|prefix_overlap_mismatch|prefix_anchor_changed)$/ }
     function knownquerystage(s) { return s ~ /^(host_closed|host_initial_admission|node_borrow|node_local_read|node_admission|node_server|admission_runtime_pre|admission_pre_control|admission_owned_wait|admission_read_index|admission_wait_tip|admission_replay|admission_runtime_post|admission_fixed_replay|admission_unresolved_history|server_read_acquire|server_read_index|server_catchup|server_apply|server_materialize)$/ }
@@ -109,7 +109,7 @@ run_contract() {
         next
       }
       if (diagnostic ~ /^MANAGED_GRAPH_EXECUTE_FAILURE/) {
-        if (diagnostic ~ /^MANAGED_GRAPH_EXECUTE_FAILURE stage=(host_initial_admission|node_binding|node_protocol|node_admission|node_application_start|network_readiness|network_context|network_prepare|network_decode|network_fingerprint|network_charge|network_admission|network_request_lock|network_receipt_lookup|network_receipt_durability|network_submit) cause=(canceled|deadline|not_ready|invalid_request|request_conflict|overloaded|durability_unavailable|commit_unknown|quorum_unavailable|other)$/) emit(diagnostic)
+        if (diagnostic ~ /^MANAGED_GRAPH_EXECUTE_FAILURE stage=(host_initial_admission|node_binding|node_protocol|node_admission|node_application_start|network_readiness|network_context|network_prepare|network_decode|network_fingerprint|network_charge|network_admission|network_request_lock|network_receipt_lookup|network_receipt_durability|network_submit) cause=(canceled|deadline|not_ready|reconfiguration_drain|invalid_request|request_conflict|overloaded|durability_unavailable|commit_unknown|quorum_unavailable|other)$/) emit(diagnostic)
         next
       }
       if (diagnostic ~ /^MANAGED_CHECKPOINT_SELECT_FAILURE/) {
@@ -143,7 +143,7 @@ run_contract() {
         next
       }
       if (diagnostic ~ /^MANAGED_CONTROL_WAIT_FAILURE/) {
-        if (diagnostic ~ /^MANAGED_CONTROL_WAIT_FAILURE leaf=(binding|budget|context|observe|prefix_recheck_error|prefix_recheck_false|worker_propose|worker_wait_tip|worker_certificate|worker_replay|waiter_error|waiter_slot) cause=(canceled|deadline|not_ready|invalid_request|request_conflict|quorum_unavailable|other)$/)
+        if (diagnostic ~ /^MANAGED_CONTROL_WAIT_FAILURE leaf=(binding|budget|context|observe|prefix_recheck_error|prefix_recheck_false|worker_propose|worker_wait_tip|worker_certificate|worker_replay|waiter_error|waiter_slot) cause=(canceled|deadline|not_ready|reconfiguration_drain|invalid_request|request_conflict|quorum_unavailable|other)$/)
           emit(diagnostic)
         next
       }
@@ -558,6 +558,7 @@ if [ "${1-}" = --diagnostic-self-test ]; then
   run_contract rust-restart sh -c 'printf "%s\n" \
     "MANAGED_CONTROL_WAIT_FAILURE leaf=observe cause=quorum_unavailable" \
     "2026/11/03 12:00:00 MANAGED_CONTROL_WAIT_FAILURE leaf=waiter_slot cause=deadline" \
+    "2026/11/03 12:00:00 MANAGED_CONTROL_WAIT_FAILURE leaf=worker_propose cause=reconfiguration_drain" \
     "MANAGED_CONTROL_WAIT_FAILURE leaf=private_leaf cause=not_ready" \
     "MANAGED_CONTROL_WAIT_FAILURE leaf=observe cause=private_cause" \
     "MANAGED_CONTROL_WAIT_FAILURE leaf=observe cause=not_ready extra=DO-NOT-RETAIN" \
@@ -565,11 +566,13 @@ if [ "${1-}" = --diagnostic-self-test ]; then
     "MANAGED_CONTROL_WAIT_FAILURE leaf=observe cause=not_ready secret-DO-NOT-RETAIN"'
   grep -Fx 'MANAGED_CONTROL_WAIT_FAILURE leaf=observe cause=quorum_unavailable' "$diag_dir/active.log" >/dev/null
   grep -Fx 'MANAGED_CONTROL_WAIT_FAILURE leaf=waiter_slot cause=deadline' "$diag_dir/active.log" >/dev/null
+  grep -Fx 'MANAGED_CONTROL_WAIT_FAILURE leaf=worker_propose cause=reconfiguration_drain' "$diag_dir/active.log" >/dev/null
   if grep -E 'private_leaf|private_cause|extra=DO-NOT-RETAIN|forged 2026|secret-DO-NOT-RETAIN' "$diag_dir/active.log"; then exit 1; fi
   run_contract rust-restart sh -c 'printf "%s\n" \
     "MANAGED_GRAPH_ADMISSION_FAILURE route=initial stage=pre_control read_target_known=false cause=quorum_unavailable" \
     "2026/11/03 12:00:00 MANAGED_GRAPH_ADMISSION_FAILURE route=initial stage=read_index read_target_known=false cause=deadline" \
     "MANAGED_GRAPH_ADMISSION_FAILURE route=admitted stage=wait_tip read_target_known=true target=29 cause=deadline" \
+    "MANAGED_GRAPH_ADMISSION_FAILURE route=admitted stage=pre_control read_target_known=false cause=reconfiguration_drain" \
     "MANAGED_GRAPH_ADMISSION_FAILURE route=admitted stage=read_index round=2 read_target_known=false cause=quorum_unavailable" \
     "MANAGED_GRAPH_ADMISSION_FAILURE route=admitted stage=replay round=2 read_target_known=true target=31 cause=not_ready" \
     "MANAGED_GRAPH_ADMISSION_REFUSED stage=history_compare route=initial read_target_known=true target=17 recorded=15 certified=14 applied=13 c_below_target=true applied_differs_certified=true recorded_above_certified=true" \
@@ -607,6 +610,7 @@ if [ "${1-}" = --diagnostic-self-test ]; then
     'MANAGED_GRAPH_ADMISSION_FAILURE route=initial stage=pre_control read_target_known=false cause=quorum_unavailable' \
     'MANAGED_GRAPH_ADMISSION_FAILURE route=initial stage=read_index read_target_known=false cause=deadline' \
     'MANAGED_GRAPH_ADMISSION_FAILURE route=admitted stage=wait_tip read_target_known=true target=29 cause=deadline' \
+    'MANAGED_GRAPH_ADMISSION_FAILURE route=admitted stage=pre_control read_target_known=false cause=reconfiguration_drain' \
     'MANAGED_GRAPH_ADMISSION_FAILURE route=admitted stage=read_index round=2 read_target_known=false cause=quorum_unavailable' \
     'MANAGED_GRAPH_ADMISSION_FAILURE route=admitted stage=replay round=2 read_target_known=true target=31 cause=not_ready' \
     'MANAGED_GRAPH_ADMISSION_REFUSED stage=history_compare route=initial read_target_known=true target=17 recorded=15 certified=14 applied=13 c_below_target=true applied_differs_certified=true recorded_above_certified=true' \
