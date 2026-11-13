@@ -9,6 +9,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log"
 	"net/http"
 	"os"
 	"sync/atomic"
@@ -24,6 +25,109 @@ import (
 type graphQualificationRoundTrip func(*http.Request) (*http.Response, error)
 
 func (f graphQualificationRoundTrip) RoundTrip(r *http.Request) (*http.Response, error) { return f(r) }
+
+func qualificationSQL(call func([]byte) []byte, requestID, sql string) (types.MutationReceipt, error) {
+	invoke := func(operation string, request any) (json.RawMessage, *ffiError, error) {
+		wire, err := json.Marshal(map[string]any{"operation": operation, "request": request})
+		if err != nil {
+			return nil, nil, err
+		}
+		var response struct {
+			Data  json.RawMessage `json:"data"`
+			Error *ffiError       `json:"error"`
+		}
+		if err := json.Unmarshal(call(wire), &response); err != nil {
+			return nil, nil, fmt.Errorf("%s response: %w", operation, err)
+		}
+		return response.Data, response.Error, nil
+	}
+	data, failure, err := invoke("execute", map[string]any{"request_id": requestID, "sql": sql})
+	if err != nil {
+		return types.MutationReceipt{}, err
+	}
+	var receipt types.MutationReceipt
+	if failure != nil {
+		if failure.Code != "commit_unknown" {
+			return receipt, fmt.Errorf("execute: %s: %s", failure.Code, failure.Message)
+		}
+		log.Printf("QUALIFICATION_SQL_UNKNOWN code=%s message=%s", failure.Code, failure.Message)
+		if c := failure.MutationContext; c != nil && (c.Kind != "sql" || !bytes.Equal(c.RequestID, []byte(requestID))) {
+			return receipt, fmt.Errorf("execute: commit_unknown with mismatched request context")
+		}
+		data, recoveryFailure, err := invoke("recover_pending_detailed", map[string]any{"kind": "sql", "request_id_b64": []byte(requestID)})
+		if err != nil {
+			return receipt, fmt.Errorf("execute: commit_unknown; recovery: %w", err)
+		}
+		if recoveryFailure != nil {
+			return receipt, fmt.Errorf("execute: commit_unknown; recovery: %s: %s", recoveryFailure.Code, recoveryFailure.Message)
+		}
+		var recovered struct {
+			Kind      string                 `json:"kind"`
+			RequestID []byte                 `json:"request_id_b64"`
+			SQL       *types.MutationReceipt `json:"sql"`
+		}
+		if err := json.Unmarshal(data, &recovered); err != nil || recovered.Kind != "sql" || !bytes.Equal(recovered.RequestID, []byte(requestID)) || recovered.SQL == nil {
+			return receipt, fmt.Errorf("execute: commit_unknown; recovery returned invalid identity or receipt")
+		}
+		receipt = *recovered.SQL
+		if failure.MutationContext != nil && failure.MutationContext.Slot != 0 && failure.MutationContext.Slot != receipt.Slot {
+			return receipt, fmt.Errorf("execute: commit_unknown; recovery slot differs")
+		}
+	} else if err := json.Unmarshal(data, &receipt); err != nil {
+		return receipt, fmt.Errorf("execute receipt: %w", err)
+	}
+	if receipt.Slot == 0 || receipt.Status != types.MutationCommitted || receipt.ErrorCode != "" {
+		return receipt, fmt.Errorf("SQL receipt is not committed: %+v", receipt)
+	}
+	return receipt, nil
+}
+
+func TestQualificationSQLUnknownRecovery(t *testing.T) {
+	const unknown = `{"error":{"code":"commit_unknown","message":"uncertain","mutation_context":{"kind":"sql","request_id_b64":"aWQ=","slot":90}}}`
+	for _, tc := range []struct {
+		name, first, recovery string
+		wantCalls             int
+		wantError             bool
+	}{
+		{"committed", `{"data":{"slot":90,"status":"committed"}}`, "", 1, false},
+		{"recovered", unknown, `{"data":{"kind":"sql","request_id_b64":"aWQ=","sql":{"slot":90,"status":"committed"}}}`, 2, false},
+		{"wrong identity", unknown, `{"data":{"kind":"sql","request_id_b64":"b3RoZXI=","sql":{"slot":90,"status":"committed"}}}`, 2, true},
+		{"wrong slot", unknown, `{"data":{"kind":"sql","request_id_b64":"aWQ=","sql":{"slot":91,"status":"committed"}}}`, 2, true},
+		{"unresolved", unknown, `{"error":{"code":"commit_unknown","message":"still unknown"}}`, 2, true},
+		{"not committed", unknown, `{"data":{"kind":"sql","request_id_b64":"aWQ=","sql":{"slot":90,"status":"pending"}}}`, 2, true},
+		{"other error", `{"error":{"code":"internal","message":"broken"}}`, "", 1, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			calls := 0
+			receipt, err := qualificationSQL(func(wire []byte) []byte {
+				calls++
+				var request struct {
+					Operation string         `json:"operation"`
+					Request   map[string]any `json:"request"`
+				}
+				if err := json.Unmarshal(wire, &request); err != nil {
+					t.Fatal(err)
+				}
+				if calls == 1 {
+					if request.Operation != "execute" || request.Request["request_id"] != "id" {
+						t.Fatalf("unexpected execute: %s", wire)
+					}
+					return []byte(tc.first)
+				}
+				if request.Operation != "recover_pending_detailed" || request.Request["kind"] != "sql" || request.Request["request_id_b64"] != "aWQ=" {
+					t.Fatalf("unexpected recovery: %s", wire)
+				}
+				return []byte(tc.recovery)
+			}, "id", "CREATE TABLE t(n INT)")
+			if calls != tc.wantCalls || (err != nil) != tc.wantError {
+				t.Fatalf("calls=%d receipt=%+v error=%v", calls, receipt, err)
+			}
+			if err == nil && receipt.Slot != 90 {
+				t.Fatalf("wrong receipt: %+v", receipt)
+			}
+		})
+	}
+}
 
 // Runs in the real Pod after Rust has closed its Handle. These counters belong
 // to this Go C-ABI Host, NOT the earlier separate Rust process.
@@ -83,8 +187,11 @@ func TestManagedFFIInClusterGraphQualification(t *testing.T) {
 			Data  json.RawMessage `json:"data"`
 			Error *ffiError       `json:"error"`
 		}
-		if json.Unmarshal(goCall(handle, wire, 30000), &response) != nil || response.Error != nil {
-			t.Fatalf("actual qualification call failed operation=%s", operation)
+		if err := json.Unmarshal(goCall(handle, wire, 30000), &response); err != nil {
+			t.Fatalf("actual qualification call failed operation=%s: %v", operation, err)
+		}
+		if response.Error != nil {
+			t.Fatalf("actual qualification call failed operation=%s code=%s message=%s", operation, response.Error.Code, response.Error.Message)
 		}
 		return response.Data
 	}
@@ -187,9 +294,9 @@ func TestManagedFFIInClusterGraphQualification(t *testing.T) {
 	if kvPositive <= 0 {
 		t.Fatal("observer missed actual KV positive entry")
 	}
-	var sqlReceipt types.MutationReceipt
-	if json.Unmarshal(invoke("execute", map[string]any{"request_id": command.RequestID + "-sql", "sql": "CREATE TABLE IF NOT EXISTS qualification_observer(n INTEGER)"}), &sqlReceipt) != nil || sqlReceipt.Slot == 0 || sqlReceipt.Status != types.MutationCommitted {
-		t.Fatal("actual SQL positive ACK missing")
+	_, err = qualificationSQL(func(wire []byte) []byte { return goCall(handle, wire, 30000) }, command.RequestID+"-sql", "CREATE TABLE IF NOT EXISTS qualification_observer(n INTEGER)")
+	if err != nil {
+		t.Fatalf("actual SQL positive ACK missing: %v", err)
 	}
 	sqlPositive := proposals.Load() - positive - kvPositive
 	if sqlPositive <= 0 {
