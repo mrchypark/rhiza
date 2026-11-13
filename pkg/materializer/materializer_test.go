@@ -1537,6 +1537,58 @@ func BenchmarkSQLBatchApply(b *testing.B) {
 	}
 }
 
+// Use -benchtime=200x to measure both payload sizes within the receipt budget.
+func BenchmarkSQLReturningReceipt(b *testing.B) {
+	for _, size := range []int{4096, 600000} {
+		b.Run(strconv.Itoa(size), func(b *testing.B) {
+			if size == 600000 && b.N > 200 {
+				b.Skip("use -benchtime=200x to stay within the retained-result budget")
+			}
+			m, err := Open(filepath.Join(b.TempDir(), "returning.db"), 1, 1024)
+			if err != nil {
+				b.Fatal(err)
+			}
+			defer m.Close()
+			setup, err := types.EncodeSQLBatch([]types.SQLCommand{{RequestID: "setup", Statements: []types.SQLStatement{
+				{SQL: "CREATE TABLE returning_payload (count INTEGER NOT NULL, payload BLOB NOT NULL)"},
+				{SQL: "INSERT INTO returning_payload VALUES (0, zeroblob(?))", Args: []any{size}},
+			}}})
+			if err != nil {
+				b.Fatal(err)
+			}
+			if err := m.Apply(b.Context(), 1, setup); err != nil {
+				b.Fatal(err)
+			}
+			command := types.SQLCommand{SQL: "UPDATE returning_payload SET count=count+1 RETURNING payload", WantRows: true}
+			b.ReportAllocs()
+			b.ResetTimer()
+			for iteration := range b.N {
+				slot := uint64(iteration) + 2
+				command.RequestID = "return-" + strconv.FormatUint(slot, 10)
+				value, err := types.EncodeSQLBatch([]types.SQLCommand{command})
+				if err != nil {
+					b.Fatal(err)
+				}
+				if err := m.Apply(b.Context(), slot, value); err != nil {
+					b.Fatal(err)
+				}
+			}
+			b.StopTimer()
+			fingerprint, err := types.SQLFingerprint(command)
+			if err != nil {
+				b.Fatal(err)
+			}
+			_, result, found, matches, err := m.SQLRequestResultFingerprint(b.Context(), command.RequestID, fingerprint, true)
+			if err != nil || !found || !matches || len(result.Statements) != 1 || len(result.Statements[0].Rows) != 1 || len(result.Statements[0].Rows[0]) != 1 {
+				b.Fatalf("receipt missing after benchmark: found=%v matches=%v err=%v", found, matches, err)
+			}
+			if payload, ok := result.Statements[0].Rows[0][0].([]byte); !ok || len(payload) != size {
+				b.Fatalf("returned payload length=%d, blob=%v", len(payload), ok)
+			}
+		})
+	}
+}
+
 func TestMaterializerPublishesCommittedNotificationOnce(t *testing.T) {
 	m, err := Open(t.TempDir()+"/notify.db", 1)
 	if err != nil {
