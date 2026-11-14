@@ -5,6 +5,7 @@ import (
 	"context"
 	"errors"
 	"io"
+	"os"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -21,8 +22,15 @@ func TestInternalRequestIndependentPUTCancelOverlapsClose(t *testing.T) {
 	ready := make(chan string, 1)
 	release := make(chan struct{})
 	readErrors := make(chan error, 1)
+	t.Cleanup(func() {
+		select {
+		case err := <-readErrors:
+			t.Errorf("unconsumed PUT read failure: %v", err)
+		default:
+		}
+	})
 	var releaseOnce sync.Once
-	t.Cleanup(func() { releaseOnce.Do(func() { close(release) }) })
+	defer releaseOnce.Do(func() { close(release) })
 	configs, hosts, fixture := openInternalRequestHosts(t, &outage, &attempts, func(c *sqlWireControl) {
 		c.putEnabled, c.putReady, c.putRelease = &enabled, ready, release
 		c.putReadErrors = readErrors
@@ -46,8 +54,17 @@ func TestInternalRequestIndependentPUTCancelOverlapsClose(t *testing.T) {
 	uploadCtx, cancelUpload := context.WithCancel(ctx)
 	defer cancelUpload()
 	result := make(chan error, 1)
+	uploadDone := make(chan struct{})
 	enabled.Store(true)
-	go func() { result <- bucket.Upload(uploadCtx, key, reader) }()
+	go func() { defer close(uploadDone); result <- bucket.Upload(uploadCtx, key, reader) }()
+	defer func() {
+		releaseOnce.Do(func() { close(release) })
+		select {
+		case <-uploadDone:
+		case <-ctx.Done():
+			t.Errorf("failure-path upload did not finish: %v", ctx.Err())
+		}
+	}()
 	select {
 	case path := <-ready:
 		if path != "/bucket/"+key || reader.remaining.Load() == 0 {
@@ -57,6 +74,9 @@ func TestInternalRequestIndependentPUTCancelOverlapsClose(t *testing.T) {
 		t.Fatalf("upload ended early: %v", err)
 	case <-ctx.Done():
 		t.Fatal("PUT did not reach gate", ctx.Err())
+	}
+	if os.Getenv("RHIZA_TEST_GATE_FAILURE") == "overlap" {
+		t.Fatal("intentional failure after overlap partial-body gate")
 	}
 	// Keep Close in progress while the server observes the separately canceled
 	// request. Close cancels admission before acquiring this mutex.

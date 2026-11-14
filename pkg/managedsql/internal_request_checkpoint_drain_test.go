@@ -5,6 +5,7 @@ import (
 	"crypto/sha256"
 	"fmt"
 	"io"
+	"os"
 	"path"
 	"strings"
 	"sync"
@@ -85,7 +86,7 @@ func TestInternalRequestCheckpointAttemptSettlesBeforeClose(t *testing.T) {
 	started0 := make(chan struct{}, 1)
 	gate := newInternalPublisherGate()
 	var releaseOnce sync.Once
-	t.Cleanup(func() { releaseOnce.Do(func() { close(release) }) })
+	defer releaseOnce.Do(func() { close(release) })
 	configs, hosts, fixture := openInternalRequestHostsObserved(t, &outage, &attempts, gate.start, func(i int, ctx context.Context) {
 		gate.before(i, ctx)
 		if i == 0 {
@@ -103,6 +104,17 @@ func TestInternalRequestCheckpointAttemptSettlesBeforeClose(t *testing.T) {
 	})
 	ctx, cancel := context.WithTimeout(context.Background(), 25*time.Second)
 	defer cancel()
+	quiesced := false
+	defer func() {
+		releaseOnce.Do(func() { close(release) })
+		if !quiesced {
+			cleanupCtx, cleanupCancel := context.WithTimeout(context.Background(), 15*time.Second)
+			defer cleanupCancel()
+			if err := gate.quiesce(cleanupCtx); err != nil {
+				t.Errorf("failure-path checkpoint settlement: %v", err)
+			}
+		}
+	}()
 	enabled.Store(true)
 	writeDone := make(chan error, 1)
 	go func() {
@@ -129,6 +141,9 @@ func TestInternalRequestCheckpointAttemptSettlesBeforeClose(t *testing.T) {
 	case <-ctx.Done():
 		t.Fatal("no checkpoint block PUT", ctx.Err())
 	}
+	if os.Getenv("RHIZA_TEST_GATE_FAILURE") == "checkpoint" {
+		t.Fatal("intentional failure after checkpoint partial-body gate")
+	}
 	select {
 	case owner := <-readyOwner:
 		if owner != 0 {
@@ -147,6 +162,7 @@ func TestInternalRequestCheckpointAttemptSettlesBeforeClose(t *testing.T) {
 	}
 	enabled.Store(false)
 	releaseOnce.Do(func() { close(release) })
+	quiesced = true
 	if err := gate.quiesce(ctx); err != nil {
 		t.Fatal(err)
 	}
