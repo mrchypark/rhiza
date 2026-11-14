@@ -2,7 +2,6 @@ name: Performance
 
 on:
   pull_request:
-    types: [opened, synchronize, reopened, labeled]
     paths:
       - "**/*.go"
       - go.mod
@@ -47,12 +46,12 @@ permissions:
   contents: read
 
 concurrency:
-  group: performance-${{ github.event.action == 'labeled' && 'cost' || 'regular' }}-${{ github.event.pull_request.number || github.ref }}
+  group: performance-${{ github.event.pull_request.number || github.ref }}
   cancel-in-progress: true
 
 jobs:
   archive-head-allocation-profile:
-    if: ${{ github.event.action != 'labeled' && !inputs.refresh_hiqlite_reference && !inputs.issue185_cost_evidence && (inputs.network_optimization == '' || inputs.network_optimization == 'none') }}
+    if: ${{ !inputs.refresh_hiqlite_reference && !inputs.issue185_cost_evidence && (inputs.network_optimization == '' || inputs.network_optimization == 'none') }}
     runs-on: ubuntu-24.04
     timeout-minutes: 15
     env:
@@ -94,7 +93,7 @@ jobs:
           retention-days: 30
 
   paired-go-benchmarks:
-    if: ${{ github.event.action != 'labeled' && !inputs.refresh_hiqlite_reference && !inputs.issue185_cost_evidence }}
+    if: ${{ !inputs.refresh_hiqlite_reference && !inputs.issue185_cost_evidence }}
     runs-on: ubuntu-24.04
     timeout-minutes: 60
     env:
@@ -321,8 +320,29 @@ jobs:
           if-no-files-found: error
           retention-days: 30
 
+  cost-evidence-scope:
+    if: ${{ github.event_name == 'pull_request' }}
+    runs-on: ubuntu-24.04
+    outputs:
+      required: ${{ steps.scope.outputs.required }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - id: scope
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          if git diff --name-only "$BASE_SHA" "$HEAD_SHA" | grep -Eq '^(pkg/recovery/archive\.go|internal/objstore/transport_observer_enabled\.go|internal/objstore/transport_observer_test\.go|pkg/node/foreground_cost_lifecycle_test\.go)$'; then
+            echo 'required=true' >> "$GITHUB_OUTPUT"
+          else
+            echo 'required=false' >> "$GITHUB_OUTPUT"
+          fi
+
   issue185-cost-evidence:
-    if: ${{ inputs.issue185_cost_evidence || (github.event.action == 'labeled' && github.event.label.name == 'cost-evidence') }}
+    needs: cost-evidence-scope
+    if: ${{ always() && (inputs.issue185_cost_evidence || (needs.cost-evidence-scope.result == 'success' && needs.cost-evidence-scope.outputs.required == 'true')) }}
     runs-on: macos-15
     timeout-minutes: 80
     steps:
