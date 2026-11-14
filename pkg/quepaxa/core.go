@@ -264,6 +264,53 @@ func (c *Core) CanParticipateReadIndex() bool {
 	return c.reconfiguration == nil
 }
 
+// ReadIndexParticipationReason reports a non-sensitive diagnostic snapshot.
+func (c *Core) ReadIndexParticipationReason() string {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	if c.observer {
+		return "observer"
+	}
+	if c.reconfiguration != nil {
+		return "frozen"
+	}
+	cluster := c.clusterForSlotLocked(c.tip + 1)
+	if c.voterForClusterLocked(cluster) {
+		return "ready"
+	}
+	if _, pending := c.retainedTerminalPendingLocked(cluster); pending {
+		return "terminal_not_durable"
+	}
+	for _, member := range cluster.Members {
+		if member.ID == c.nodeID {
+			return "wal_identity_mismatch"
+		}
+	}
+	return "not_in_configuration"
+}
+
+// PrepareReadIndexParticipation persists an exact retained membership terminal
+// before a peer read. It never promotes an unrelated or frozen member.
+func (c *Core) PrepareReadIndexParticipation(ctx context.Context) error {
+	if c.CanParticipateReadIndex() {
+		return nil
+	}
+	c.mu.RLock()
+	cluster := c.clusterForSlotLocked(c.tip + 1)
+	terminal, pending := c.retainedTerminalPendingLocked(cluster)
+	c.mu.RUnlock()
+	if !pending {
+		return ErrQuorumUnavailable
+	}
+	if err := c.EnsureDurableThrough(ctx, terminal); err != nil {
+		return err
+	}
+	if !c.CanParticipateReadIndex() {
+		return ErrQuorumUnavailable
+	}
+	return nil
+}
+
 // PendingReconfiguration returns the frozen target while its old-configuration
 // drain is active. The returned cluster is safe for management retries to edit.
 func (c *Core) PendingReconfiguration() (Cluster, bool) {

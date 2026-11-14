@@ -545,9 +545,9 @@ func (s *PeerServer) handle(ctx context.Context, certificateKey ed25519.PublicKe
 		response.Decisions = wireDecisions[:fit]
 		return response, nil
 	case peerfb.OperationReadIndex:
-		if !s.server.core.CanParticipateReadIndex() {
+		if err := s.server.core.PrepareReadIndexParticipation(ctx); err != nil {
 			_, frozen := s.server.core.PendingReconfiguration()
-			log.Printf("read-index peer refused reason=participation node_hash=%x sender_hash=%x requested_config=%d current_config=%d voter=%t frozen=%t", sha256.Sum256([]byte(s.server.core.NodeID())), sha256.Sum256([]byte(request.SenderId)), request.ConfigId, s.server.core.ConfigID(), s.server.core.IsVoter(), frozen)
+			log.Printf("read-index peer refused reason=participation detail=%s node_hash=%x sender_hash=%x requested_config=%d current_config=%d voter=%t frozen=%t", s.server.core.ReadIndexParticipationReason(), sha256.Sum256([]byte(s.server.core.NodeID())), sha256.Sum256([]byte(request.SenderId)), request.ConfigId, s.server.core.ConfigID(), s.server.core.IsVoter(), frozen)
 			return nil, quepaxa.ErrQuorumUnavailable
 		}
 		if !s.server.Ready() {

@@ -474,6 +474,77 @@ func TestReadIndexPersistsExactRetainedTerminalBeforeQuorum(t *testing.T) {
 	}
 }
 
+func TestPeerReadParticipationPersistsExactTerminal(t *testing.T) {
+	fixture := newTerminalDurabilityFixture(t)
+	core := fixture.cores["a"]
+	dropTerminalDurability(core, fixture.terminal)
+	if core.CanParticipateReadIndex() {
+		t.Fatal("terminal unexpectedly durable")
+	}
+	if got := core.ReadIndexParticipationReason(); got != "terminal_not_durable" {
+		t.Fatalf("reason=%s", got)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := core.PrepareReadIndexParticipation(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if !core.CanParticipateReadIndex() {
+		t.Fatal("retained voter did not activate after durable terminal")
+	}
+}
+
+func TestPeerReadParticipationRejectsCanceledTerminal(t *testing.T) {
+	fixture := newTerminalDurabilityFixture(t)
+	core := fixture.cores["a"]
+	dropTerminalDurability(core, fixture.terminal)
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if err := core.PrepareReadIndexParticipation(ctx); !errors.Is(err, context.Canceled) {
+		t.Fatalf("got %v", err)
+	}
+	if core.CanParticipateReadIndex() {
+		t.Fatal("canceled persistence activated voter")
+	}
+}
+
+func TestPeerReadParticipationRejectsNonMember(t *testing.T) {
+	fixture := newTerminalDurabilityFixture(t)
+	core := fixture.cores["c"]
+	if got := core.ReadIndexParticipationReason(); got != "not_in_configuration" {
+		t.Fatalf("reason=%s", got)
+	}
+	if err := core.PrepareReadIndexParticipation(context.Background()); !errors.Is(err, ErrQuorumUnavailable) {
+		t.Fatalf("removed voter was allowed to participate: %v", err)
+	}
+}
+
+func TestPeerReadParticipationRechecksFrozenAfterSync(t *testing.T) {
+	fixture := newTerminalDurabilityFixture(t)
+	core := fixture.cores["a"]
+	dropTerminalDurability(core, fixture.terminal)
+	started, release := make(chan struct{}), make(chan struct{})
+	core.commits = newGroupCommit(func() error { close(started); <-release; return nil })
+	done := make(chan error, 1)
+	go func() { done <- core.PrepareReadIndexParticipation(context.Background()) }()
+	select {
+	case <-started:
+	case <-time.After(5 * time.Second):
+		close(release)
+		t.Fatal("sync did not start")
+	}
+	core.mu.Lock()
+	core.reconfiguration = &reconfigurationState{}
+	core.mu.Unlock()
+	close(release)
+	if err := <-done; !errors.Is(err, ErrQuorumUnavailable) {
+		t.Fatalf("frozen read accepted: %v", err)
+	}
+	core.mu.Lock()
+	core.reconfiguration = nil
+	core.mu.Unlock()
+}
+
 func TestReadIndexCanceledBeforeTerminalDurabilityDoesNotParticipate(t *testing.T) {
 	fixture := newTerminalDurabilityFixture(t)
 	core := fixture.cores["a"]
