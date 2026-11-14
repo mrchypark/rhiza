@@ -1,6 +1,7 @@
 package rhiza_test
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	_ "embed"
@@ -18,6 +19,7 @@ import (
 	"path"
 	"path/filepath"
 	"reflect"
+	"runtime/pprof"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -33,6 +35,86 @@ import (
 	"github.com/mrchypark/rhiza/pkg/quepaxa"
 	"github.com/mrchypark/rhiza/pkg/recovery"
 )
+
+// preparedProviderTrace counts only emulator requests made while the suffix
+// write is in progress. It deliberately records no URL, key, or credentials.
+type preparedProviderTrace struct {
+	base                                         http.RoundTripper
+	active                                       atomic.Bool
+	started, finished, failed, inFlight          atomic.Int64
+	reads, mutations, clientErrors, serverErrors atomic.Int64
+}
+
+func (p *preparedProviderTrace) RoundTrip(req *http.Request) (*http.Response, error) {
+	if !p.active.Load() {
+		return p.base.RoundTrip(req)
+	}
+	p.started.Add(1)
+	p.inFlight.Add(1)
+	defer p.inFlight.Add(-1)
+	if req.Method == http.MethodGet || req.Method == http.MethodHead {
+		p.reads.Add(1)
+	} else {
+		p.mutations.Add(1)
+	}
+	resp, err := p.base.RoundTrip(req)
+	p.finished.Add(1)
+	if err != nil {
+		p.failed.Add(1)
+	} else if resp.StatusCode >= 500 {
+		p.serverErrors.Add(1)
+	} else if resp.StatusCode >= 400 {
+		p.clientErrors.Add(1)
+	}
+	return resp, err
+}
+
+func (p *preparedProviderTrace) snapshot() string {
+	return fmt.Sprintf("started=%d finished=%d in_flight=%d transport_errors=%d reads=%d mutations=%d http_4xx=%d http_5xx=%d", p.started.Load(), p.finished.Load(), p.inFlight.Load(), p.failed.Load(), p.reads.Load(), p.mutations.Load(), p.clientErrors.Load(), p.serverErrors.Load())
+}
+
+func preparedProviderGoroutines(t *testing.T, label string, trace *preparedProviderTrace) {
+	t.Helper()
+	var stack bytes.Buffer
+	if err := pprof.Lookup("goroutine").WriteTo(&stack, 2); err != nil {
+		t.Logf("suffix diagnostic %s: goroutine profile error=%v", label, err)
+		return
+	}
+	t.Logf("suffix diagnostic %s: %s\n%s", label, trace.snapshot(), stack.String())
+}
+
+type preparedRoundTripFunc func(*http.Request) (*http.Response, error)
+
+func (f preparedRoundTripFunc) RoundTrip(r *http.Request) (*http.Response, error) { return f(r) }
+
+func TestPreparedProviderTrace(t *testing.T) {
+	trace := &preparedProviderTrace{base: preparedRoundTripFunc(func(r *http.Request) (*http.Response, error) {
+		if r.Method == http.MethodDelete {
+			return nil, errors.New("injected transport error")
+		}
+		return &http.Response{StatusCode: http.StatusServiceUnavailable, Header: make(http.Header)}, nil
+	})}
+	req := httptest.NewRequest(http.MethodGet, "http://example.invalid/secret", nil)
+	if _, err := trace.RoundTrip(req); err != nil {
+		t.Fatal(err)
+	}
+	if trace.started.Load() != 0 {
+		t.Fatal("inactive trace recorded request")
+	}
+	trace.active.Store(true)
+	if _, err := trace.RoundTrip(req); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := trace.RoundTrip(httptest.NewRequest(http.MethodDelete, "http://example.invalid/secret", nil)); err == nil {
+		t.Fatal("injected error missing")
+	}
+	if trace.started.Load() != 2 || trace.finished.Load() != 2 || trace.inFlight.Load() != 0 || trace.reads.Load() != 1 || trace.mutations.Load() != 1 || trace.failed.Load() != 1 || trace.serverErrors.Load() != 1 {
+		t.Fatalf("unexpected counters: %s", trace.snapshot())
+	}
+	if strings.Contains(trace.snapshot(), "secret") {
+		t.Fatal("trace exposed object path")
+	}
+}
 
 //go:embed pkg/node/startup_v1alpha2.go
 var preparedNodeSource string
@@ -206,6 +288,8 @@ func TestEmbeddedObjectStorageNodePreparedRestore(t *testing.T) {
 	var learnerObject string
 	var bucketName, accountName string
 	proxy := httputil.NewSingleHostReverseProxy(upstream)
+	trace := &preparedProviderTrace{base: http.DefaultTransport}
+	proxy.Transport = trace
 	proxyServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if inspect.Load() && r.Method != http.MethodGet && r.Method != http.MethodHead {
 			if preparedEmulatorAuthRequest(r, provider) {
@@ -333,8 +417,28 @@ func TestEmbeddedObjectStorageNodePreparedRestore(t *testing.T) {
 		t.Fatal("stable checkpoint base missing")
 	}
 	checkpointBase := view.Base()
-	if _, err := voters[1].Execute(ctx, rhiza.ExecuteRequest{RequestID: "provider-prepared-suffix", SQL: "INSERT INTO prepared_source VALUES (8)"}); err != nil {
-		t.Fatal(err)
+	trace.active.Store(true)
+	suffixStart := time.Now()
+	t.Logf("suffix diagnostic start provider=%s checkpoint_base=%d remaining_voters=2", provider, checkpointBase)
+	suffixResult := make(chan error, 1)
+	go func() {
+		_, err := voters[1].Execute(ctx, rhiza.ExecuteRequest{RequestID: "provider-prepared-suffix", SQL: "INSERT INTO prepared_source VALUES (8)"})
+		suffixResult <- err
+	}()
+	watchdog := time.NewTimer(5 * time.Second)
+	var suffixErr error
+	select {
+	case suffixErr = <-suffixResult:
+		watchdog.Stop()
+	case <-watchdog.C:
+		preparedProviderGoroutines(t, "in_progress_after_5s", trace)
+		suffixErr = <-suffixResult
+	}
+	trace.active.Store(false)
+	t.Logf("suffix diagnostic finish provider=%s elapsed=%s err=%v %s", provider, time.Since(suffixStart), suffixErr, trace.snapshot())
+	if suffixErr != nil {
+		preparedProviderGoroutines(t, "failure", trace)
+		t.Fatal(suffixErr)
 	}
 	for {
 		view, lastErr = recovery.OpenReadOnlyView(checkpointCtx, readonly, prefix, 1, bootstrap)
