@@ -64,14 +64,14 @@ func testManagedGraphPublicPublisherWithProtocol(t *testing.T, restart bool, pro
 		t.Cleanup(func() { holdNewRoots.Store(false); releaseRoots.Do(func() { close(rootRelease) }) })
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 25*time.Second)
-	defer cancel()
+	t.Cleanup(cancel)
 	hosts := make([]*Host, len(configs))
 	for i := range configs {
 		// Existing product controls, shortened only to observe the real worker.
 		configs[i].Runtime.CheckpointInterval = 200 * time.Millisecond
 		h, err := fixture.open(ctx, configs[i])
 		if h != nil {
-			t.Cleanup(func() { _ = h.Close() })
+			t.Cleanup(func() { _ = fixture.closeHost(h) })
 		}
 		if err != nil {
 			t.Fatal(err)
@@ -143,7 +143,7 @@ func testManagedGraphPublicPublisherWithProtocol(t *testing.T, restart bool, pro
 		}
 	}
 	// Close/drain one real publisher and keep the other two voters available.
-	if err := hosts[0].Close(); err != nil {
+	if err := fixture.closeHost(hosts[0]); err != nil {
 		t.Fatal(err)
 	}
 	if rows, err := hosts[1].GraphQuery(ctx, network.GraphQueryRequest{Cypher: "MATCH (n:PublishedGraph) RETURN n.id", Consistency: "linearizable"}); err != nil || len(rows.Rows) != 2 {
@@ -230,7 +230,7 @@ func testManagedGraphPublicPublisherWithProtocol(t *testing.T, restart bool, pro
 		}
 		reopened, err := fixture.open(ctx, configs[0])
 		if reopened != nil {
-			t.Cleanup(func() { _ = reopened.Close() })
+			t.Cleanup(func() { _ = fixture.closeHost(reopened) })
 		}
 		if err != nil {
 			t.Fatal("actual public paired reconstruction startup", err)
