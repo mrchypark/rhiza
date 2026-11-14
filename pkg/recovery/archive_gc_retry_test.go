@@ -77,80 +77,105 @@ type sameManagerHeadRefreshBucket struct {
 	heads       atomic.Int32
 }
 
-type latePublicationBucket struct {
-	objstore.Bucket
-	headStarted       chan struct{}
-	release           chan struct{}
-	heads             atomic.Int32
-	locks             atomic.Int32
-	failLater         bool
-	unknownLater      bool
-	beforeSecond      func(context.Context) error
-	failRelease       bool
-	failFirstReadback bool
-	readbackFailed    atomic.Bool
-	inSecond          atomic.Bool
-	failRenew         bool
-	renewFailures     atomic.Int32
-}
-
-func (b *latePublicationBucket) Attributes(ctx context.Context, name string) (objstore.ObjectAttributes, error) {
-	if strings.HasSuffix(name, "/archive/head.bin") && b.readbackFailed.Load() {
-		return objstore.ObjectAttributes{}, errors.New("injected readback failure")
-	}
-	return b.Bucket.Attributes(ctx, name)
-}
-
-func (b *latePublicationBucket) Upload(ctx context.Context, name string, r io.Reader, options ...objstore.ObjectUploadOption) error {
-	if strings.HasSuffix(name, "/archive/PUBLISH_LOCK") {
-		if b.failRenew && b.inSecond.Load() {
-			b.renewFailures.Add(1)
-			return errors.New("injected renewal failure")
-		}
-		if b.locks.Add(1) == 2 && b.failRelease {
-			return errors.New("injected release failure")
-		}
-	}
-	if strings.HasSuffix(name, "/archive/head.bin") {
-		count := b.heads.Add(1)
-		if count == 2 && b.beforeSecond != nil {
-			if err := b.beforeSecond(ctx); err != nil {
-				return err
-			}
-		}
-		if count > 1 && b.failLater {
-			return errors.New("injected later HEAD failure")
-		}
-		if count == 2 && b.unknownLater {
-			if err := b.Bucket.Upload(ctx, name, r, options...); err != nil {
-				return err
-			}
-			return errors.New("injected lost HEAD response")
-		}
-		if count == 1 {
-			close(b.headStarted)
-			select {
-			case <-b.release:
-			case <-ctx.Done():
-				return ctx.Err()
-			}
-			if b.failFirstReadback {
-				if err := b.Bucket.Upload(ctx, name, r, options...); err != nil {
-					return err
-				}
-				b.readbackFailed.Store(true)
-				return errors.New("injected lost first HEAD response")
-			}
-		}
-	}
-	return b.Bucket.Upload(ctx, name, r, options...)
-}
-
 type archiveHeadAttributesBucket struct {
 	objstore.Bucket
 	headErr      error
 	headVersions []*objstore.ObjectVersion
 	headAttrs    int
+}
+
+type unknownReleaseBucket struct {
+	objstore.Bucket
+	lockWrites atomic.Int32
+	released   chan struct{}
+	proceed    chan struct{}
+}
+
+type joinedBatchContext struct {
+	context.Context
+	joined chan struct{}
+	once   sync.Once
+}
+
+func (c *joinedBatchContext) Done() <-chan struct{} {
+	c.once.Do(func() { close(c.joined) })
+	return c.Context.Done()
+}
+
+func (b *unknownReleaseBucket) Upload(ctx context.Context, name string, r io.Reader, options ...objstore.ObjectUploadOption) error {
+	if strings.HasSuffix(name, "/archive/PUBLISH_LOCK") && b.lockWrites.Add(1) == 2 {
+		if err := b.Bucket.Upload(ctx, name, r, options...); err != nil {
+			return err
+		}
+		close(b.released)
+		select {
+		case <-b.proceed:
+			return errors.New("injected lost release response")
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	}
+	return b.Bucket.Upload(ctx, name, r, options...)
+}
+
+func testArchiveFailedReleaseRevalidatesTip(t *testing.T) {
+	baseCtx, base, core, seed := newSealableArchive(t)
+	defer seed.Close()
+	ctx, cancel := context.WithTimeout(baseCtx, 15*time.Second)
+	defer cancel()
+	bucket := &unknownReleaseBucket{Bucket: base, released: make(chan struct{}), proceed: make(chan struct{})}
+	manager := NewManager(bucket, "cluster", 1)
+	defer manager.Close()
+	if err := manager.Load(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := core.Propose(ctx, []byte("release-unknown")); err != nil {
+		t.Fatal(err)
+	}
+	target := core.Tip()
+	first := make(chan error, 1)
+	go func() { first <- manager.SyncThrough(ctx, core, target) }()
+	select {
+	case <-bucket.released:
+	case <-ctx.Done():
+		t.Fatal(ctx.Err())
+	}
+	if got := manager.Tip(); got < target {
+		t.Fatalf("tip=%d target=%d", got, target)
+	}
+	late := make(chan error, 1)
+	lateCtx := &joinedBatchContext{Context: ctx, joined: make(chan struct{})}
+	go func() { late <- manager.SyncThrough(lateCtx, core, target) }()
+	select {
+	case <-lateCtx.joined:
+	case <-ctx.Done():
+		t.Fatalf("late waiter did not join batch: %v", ctx.Err())
+	}
+	select {
+	case err := <-late:
+		t.Fatalf("late waiter returned before release: %v", err)
+	default:
+	}
+	close(bucket.proceed)
+	if err := <-first; err == nil {
+		t.Fatal("lost release response reported success")
+	}
+	if err := <-late; err == nil {
+		t.Fatal("late waiter ignored failed release")
+	}
+	if err := manager.SyncThrough(ctx, core, target); err != nil {
+		t.Fatalf("revalidation: %v", err)
+	}
+	if got := bucket.lockWrites.Load(); got < 4 {
+		t.Fatalf("lock writes=%d, want re-acquisition and release", got)
+	}
+	manager.Close()
+	if err := manager.SyncThrough(ctx, core, target); err != nil {
+		t.Fatalf("verified tip after close: %v", err)
+	}
+	if err := manager.SyncThrough(ctx, core, target+1); !errors.Is(err, ErrArchiveClosed) {
+		t.Fatalf("new work after close = %v, want ErrArchiveClosed", err)
+	}
 }
 
 type cancelPublicationReadBucket struct {
@@ -635,294 +660,6 @@ func testArchiveLateSharedBatchTargetUsesOnePublicationAdmission(t *testing.T) {
 	}
 	if got := probe.headCount.Load(); got != 1 {
 		t.Fatalf("actual HEAD uploads for late shared-batch target=%d, want exactly one", got)
-	}
-}
-
-func testArchiveBatchDrainsTargetJoinedDuringHeadUpload(t *testing.T) {
-	testArchiveBatchDrain(t, false, false, false, false, false, false, false, false)
-}
-
-func testArchiveBatchDrainFailurePreservesEarlierSuccess(t *testing.T) {
-	testArchiveBatchDrain(t, true, false, false, false, false, false, false, false)
-}
-
-func testArchiveBatchDrainUnknownResponse(t *testing.T) {
-	testArchiveBatchDrain(t, false, true, false, false, false, false, false, false)
-}
-
-func testArchiveBatchDrainExpiredLease(t *testing.T) {
-	testArchiveBatchDrain(t, false, false, true, false, false, false, false, false)
-}
-
-func testArchiveBatchDrainReleaseFailure(t *testing.T) {
-	testArchiveBatchDrain(t, false, false, false, true, false, false, false, false)
-}
-
-func testArchiveBatchDrainFirstUnknownReadbackFailure(t *testing.T) {
-	testArchiveBatchDrain(t, false, false, false, false, true, false, false, false)
-}
-
-func testArchiveBatchDrainClose(t *testing.T) {
-	testArchiveBatchDrain(t, false, false, false, false, false, true, false, false)
-}
-
-func testArchiveBatchDrainBlocksConcurrentGCAdmission(t *testing.T) {
-	testArchiveBatchDrain(t, false, false, false, false, false, false, true, false)
-}
-
-func testArchiveBatchDrainRenewFailure(t *testing.T) {
-	testArchiveBatchDrain(t, false, false, false, false, false, false, false, true)
-}
-
-func testArchiveBatchLateCoveredWaiterMustWaitForLease(t *testing.T) {
-	baseCtx, base, core, seed := newSealableArchive(t)
-	defer seed.Close()
-	ctx, cancel := context.WithTimeout(baseCtx, 15*time.Second)
-	defer cancel()
-	probe := &latePublicationBucket{Bucket: base, headStarted: make(chan struct{}), release: make(chan struct{})}
-	manager := NewManager(probe, "cluster", 1)
-	defer manager.Close()
-	secondStarted, releaseSecond := make(chan struct{}), make(chan struct{})
-	var firstOnce, secondOnce sync.Once
-	defer firstOnce.Do(func() { close(probe.release) })
-	defer secondOnce.Do(func() { close(releaseSecond) })
-	probe.beforeSecond = func(ctx context.Context) error {
-		close(secondStarted)
-		select {
-		case <-releaseSecond:
-		case <-ctx.Done():
-			return ctx.Err()
-		}
-		lock, err := manager.readArchiveLock(ctx, manager.publicationLockKey())
-		if err != nil {
-			return err
-		}
-		lock.LeaseUntilMS = time.Now().Add(-time.Second).UnixMilli()
-		return manager.writeArchiveLock(ctx, manager.publicationLockKey(), *lock, objstore.WithIfMatch(lock.version))
-	}
-	if err := manager.Load(ctx); err != nil {
-		t.Fatal(err)
-	}
-	if _, _, err := core.Propose(ctx, []byte("first")); err != nil {
-		t.Fatal(err)
-	}
-	first := core.Tip()
-	firstDone := make(chan error, 1)
-	go func() { firstDone <- manager.SyncThrough(ctx, core, first) }()
-	select {
-	case <-probe.headStarted:
-	case <-ctx.Done():
-		t.Fatal(ctx.Err())
-	}
-	if _, _, err := core.Propose(ctx, []byte("late")); err != nil {
-		t.Fatal(err)
-	}
-	late := core.Tip()
-	lateDone := make(chan error, 1)
-	go func() { lateDone <- manager.SyncThrough(ctx, core, late) }()
-	for {
-		manager.batchMu.Lock()
-		joined := manager.batch != nil && manager.batch.target >= late
-		manager.batchMu.Unlock()
-		if joined {
-			break
-		}
-		if err := ctx.Err(); err != nil {
-			t.Fatal(err)
-		}
-		runtime.Gosched()
-	}
-	firstOnce.Do(func() { close(probe.release) })
-	select {
-	case <-secondStarted:
-	case <-ctx.Done():
-		t.Fatal(ctx.Err())
-	}
-	if manager.Tip() < first {
-		t.Fatal("first publication not yet installed")
-	}
-	coveredDone := make(chan error, 1)
-	go func() { coveredDone <- manager.SyncThrough(ctx, core, first) }()
-	select {
-	case err := <-coveredDone:
-		t.Fatalf("covered waiter returned before lease finalization: %v", err)
-	case <-time.After(50 * time.Millisecond):
-	}
-	secondOnce.Do(func() { close(releaseSecond) })
-	for _, ch := range []<-chan error{firstDone, lateDone, coveredDone} {
-		if err := <-ch; err == nil {
-			t.Fatal("waiter succeeded after lease expiry")
-		}
-	}
-}
-
-func testArchiveBatchDrain(t *testing.T, failLater, unknownLater, expire, failRelease, failFirstReadback, closeDuringSecond, gcProbe, failRenew bool) {
-	baseCtx, base, core, seed := newSealableArchive(t)
-	defer seed.Close()
-	ctx, cancel := context.WithTimeout(baseCtx, 15*time.Second)
-	defer cancel()
-	probe := &latePublicationBucket{Bucket: base, headStarted: make(chan struct{}), release: make(chan struct{}), failLater: failLater, unknownLater: unknownLater, failRelease: failRelease, failFirstReadback: failFirstReadback}
-	var releaseOnce sync.Once
-	manager := NewManager(probe, "cluster", 1)
-	if failRenew {
-		probe.failRenew = true
-		manager.renewInterval = 10 * time.Millisecond
-	}
-	if gcProbe {
-		gc := NewManager(base, "cluster", 1)
-		defer gc.Close()
-		probe.beforeSecond = func(ctx context.Context) error {
-			err := gc.withArchiveLock(ctx, gc.publicationLockKey(), "gc-probe", false, func(context.Context) error { return nil })
-			if !errors.Is(err, ErrArchiveBusy) {
-				return fmt.Errorf("GC admission: got %v, want busy", err)
-			}
-			return nil
-		}
-	}
-	secondStarted := make(chan struct{})
-	if closeDuringSecond || failRenew {
-		probe.beforeSecond = func(ctx context.Context) error {
-			probe.inSecond.Store(true)
-			close(secondStarted)
-			<-ctx.Done()
-			return ctx.Err()
-		}
-	}
-	if expire {
-		probe.beforeSecond = func(ctx context.Context) error {
-			lock, err := manager.readArchiveLock(ctx, manager.publicationLockKey())
-			if err != nil {
-				return err
-			}
-			lock.LeaseUntilMS = time.Now().Add(-time.Second).UnixMilli()
-			return manager.writeArchiveLock(ctx, manager.publicationLockKey(), *lock, objstore.WithIfMatch(lock.version))
-		}
-	}
-	defer manager.Close()
-	defer releaseOnce.Do(func() { close(probe.release) })
-	if err := manager.Load(ctx); err != nil {
-		t.Fatal(err)
-	}
-	if _, _, err := core.Propose(ctx, []byte("first")); err != nil {
-		t.Fatal(err)
-	}
-	first := core.Tip()
-	firstDone := make(chan error, 1)
-	go func() { firstDone <- manager.SyncThrough(ctx, core, first) }()
-	select {
-	case <-probe.headStarted:
-	case <-ctx.Done():
-		t.Fatal(ctx.Err())
-	}
-	if _, _, err := core.Propose(ctx, []byte("late")); err != nil {
-		t.Fatal(err)
-	}
-	last := core.Tip()
-	canceledCtx, cancelWaiter := context.WithCancel(ctx)
-	canceledDone := make(chan error, 1)
-	go func() { canceledDone <- manager.SyncThrough(canceledCtx, core, last) }()
-	lateDone := make(chan error, 1)
-	go func() { lateDone <- manager.SyncThrough(ctx, core, last) }()
-	for {
-		manager.batchMu.Lock()
-		joined := manager.batch != nil && manager.batch.target >= last
-		manager.batchMu.Unlock()
-		if joined {
-			break
-		}
-		if err := ctx.Err(); err != nil {
-			t.Fatal(err)
-		}
-		runtime.Gosched()
-	}
-	cancelWaiter()
-	if err := <-canceledDone; !errors.Is(err, context.Canceled) {
-		t.Fatalf("canceled waiter: %v", err)
-	}
-	releaseOnce.Do(func() { close(probe.release) })
-	if closeDuringSecond || failRenew {
-		select {
-		case <-secondStarted:
-		case <-ctx.Done():
-			t.Fatal(ctx.Err())
-		}
-		if closeDuringSecond {
-			manager.Close()
-		}
-	}
-	if err := <-firstDone; (err != nil) != (expire || failRelease || failFirstReadback || closeDuringSecond || failRenew) {
-		t.Fatalf("first waiter: %v", err)
-	}
-	if err := <-lateDone; (err != nil) != (failLater || expire || failRelease || failFirstReadback || closeDuringSecond || failRenew) {
-		t.Fatalf("late waiter: %v; failLater=%v", err, failLater)
-	}
-	if expire || failRelease {
-		beforeLocks := probe.locks.Load()
-		beforeHeads := probe.heads.Load()
-		if failRelease {
-			waitCtx, waitCancel := context.WithTimeout(ctx, 150*time.Millisecond)
-			err := manager.SyncThrough(waitCtx, core, last)
-			waitCancel()
-			if !errors.Is(err, context.DeadlineExceeded) {
-				t.Fatalf("live lease retry: got %v, want deadline exceeded", err)
-			}
-			manager.batchMu.Lock()
-			batch := manager.batch
-			manager.batchMu.Unlock()
-			if batch == nil {
-				t.Fatal("revalidation batch exited before lease expired")
-			}
-			lock, err := seed.readArchiveLock(ctx, seed.publicationLockKey())
-			if err != nil {
-				t.Fatal(err)
-			}
-			lock.LeaseUntilMS = time.Now().Add(-time.Second).UnixMilli()
-			if err := seed.writeArchiveLock(ctx, seed.publicationLockKey(), *lock, objstore.WithIfMatch(lock.version)); err != nil {
-				t.Fatal(err)
-			}
-			select {
-			case <-batch.done:
-			case <-ctx.Done():
-				t.Fatal(ctx.Err())
-			}
-			if batch.err != nil {
-				t.Fatalf("revalidation after expiry: %v", batch.err)
-			}
-		}
-		if err := manager.SyncThrough(ctx, core, last); err != nil {
-			t.Fatalf("revalidate after failed lease finalization: %v", err)
-		}
-		if got := probe.locks.Load() - beforeLocks; got != 2 {
-			t.Fatalf("revalidation lock writes=%d, want one acquisition and release", got)
-		}
-		if got := probe.heads.Load(); got != beforeHeads {
-			t.Fatalf("revalidation republished HEAD: before=%d after=%d", beforeHeads, got)
-		}
-	}
-	if got := probe.heads.Load(); !failLater && !failFirstReadback && got != 2 {
-		t.Fatalf("HEAD writes=%d, want 2", got)
-	}
-	if got := probe.locks.Load(); !expire && !failRenew && !failRelease && got != 2 {
-		t.Fatalf("lock writes=%d, want one acquire and release", got)
-	}
-	if failRenew && probe.renewFailures.Load() == 0 {
-		t.Fatal("renewal failure was not injected")
-	}
-	reader := NewManager(base, "cluster", 1)
-	defer reader.Close()
-	if err := reader.Load(ctx); err != nil {
-		t.Fatal(err)
-	}
-	want := last
-	if failLater || failFirstReadback || closeDuringSecond || failRenew {
-		want = first
-	}
-	values, tip, err := reader.DecisionsFrom(ctx, 1, int(want))
-	if err != nil || tip != want || len(values) != int(want) {
-		t.Fatalf("readback tip=%d want=%d values=%d err=%v", tip, want, len(values), err)
-	}
-	if !failLater && !failFirstReadback && !closeDuringSecond && !failRenew && !bytes.Equal(values[len(values)-1].Value, []byte("late")) {
-		t.Fatal("late value missing")
 	}
 }
 
@@ -2300,16 +2037,7 @@ func TestArchiveCleanupReusesUnchangedPrefixAfterRealHeadConflict(t *testing.T) 
 	t.Run("archive_busy_observer_copy_keeps_release_deadline", testArchiveBusyTraceObserverCopyKeepsReleaseDeadline)
 	t.Run("independent_publisher_waits_for_gc_publication_lease", testArchiveIndependentPublisherWaitsForGCPublicationLease)
 	t.Run("late_shared_batch_target_uses_one_publication_admission", testArchiveLateSharedBatchTargetUsesOnePublicationAdmission)
-	t.Run("batch_drains_target_joined_during_head_upload", testArchiveBatchDrainsTargetJoinedDuringHeadUpload)
-	t.Run("batch_drain_failure_preserves_earlier_success", testArchiveBatchDrainFailurePreservesEarlierSuccess)
-	t.Run("batch_drain_unknown_response", testArchiveBatchDrainUnknownResponse)
-	t.Run("batch_drain_expired_lease", testArchiveBatchDrainExpiredLease)
-	t.Run("batch_drain_release_failure", testArchiveBatchDrainReleaseFailure)
-	t.Run("batch_drain_first_unknown_readback_failure", testArchiveBatchDrainFirstUnknownReadbackFailure)
-	t.Run("batch_drain_close", testArchiveBatchDrainClose)
-	t.Run("batch_drain_blocks_concurrent_gc_admission", testArchiveBatchDrainBlocksConcurrentGCAdmission)
-	t.Run("batch_drain_renew_failure", testArchiveBatchDrainRenewFailure)
-	t.Run("batch_late_covered_waiter_must_wait_for_lease", testArchiveBatchLateCoveredWaiterMustWaitForLease)
+	t.Run("failed_release_revalidates_tip", testArchiveFailedReleaseRevalidatesTip)
 	t.Run("direct_sync_keeps_fixed_target_and_noop_fast_path", testArchiveDirectSyncKeepsFixedTargetAndNoopFastPath)
 	t.Run("publisher_during_gc_delete_scan_keeps_chain", testArchivePublisherDuringGCDeleteScanKeepsReachableChain)
 	t.Run("no_compaction_keeps_concurrent_published_extent", testArchiveNoCompactionKeepsConcurrentPublishedExtent)

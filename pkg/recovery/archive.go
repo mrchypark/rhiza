@@ -133,8 +133,6 @@ type syncBatch struct {
 	target            quepaxa.Slot
 	done              chan struct{}
 	err               error
-	covered           quepaxa.Slot
-	lateErr           error
 	requireValidation bool
 }
 
@@ -146,33 +144,32 @@ type extentObject struct {
 type Manager struct {
 	validateValue func([]byte) error
 
-	appendOnly    bool
-	bucket        objstore.Bucket
-	prefix        string
-	configID      uint
-	mu            sync.Mutex
-	transitionMu  sync.Mutex
-	extents       []Extent
-	cache         map[extentObject]Extent
-	cacheLRU      []extentObject
-	cacheMu       sync.Mutex
-	head          archiveHead
-	tip           quepaxa.Slot
-	headCAS       *objstore.ObjectVersion
-	cas           bool
-	batchMu       sync.Mutex
-	batch         *syncBatch
-	ctx           context.Context
-	cancel        context.CancelFunc
-	batchWG       sync.WaitGroup
-	groupDelay    time.Duration
-	renewInterval time.Duration
-	closed        bool
-	unverified    bool
-	gcMu          sync.Mutex
-	readMu        sync.Mutex
-	readCond      *sync.Cond
-	readers       int
+	appendOnly   bool
+	bucket       objstore.Bucket
+	prefix       string
+	configID     uint
+	mu           sync.Mutex
+	transitionMu sync.Mutex
+	extents      []Extent
+	cache        map[extentObject]Extent
+	cacheLRU     []extentObject
+	cacheMu      sync.Mutex
+	head         archiveHead
+	tip          quepaxa.Slot
+	headCAS      *objstore.ObjectVersion
+	cas          bool
+	batchMu      sync.Mutex
+	batch        *syncBatch
+	ctx          context.Context
+	cancel       context.CancelFunc
+	batchWG      sync.WaitGroup
+	groupDelay   time.Duration
+	closed       bool
+	unverified   bool
+	gcMu         sync.Mutex
+	readMu       sync.Mutex
+	readCond     *sync.Cond
+	readers      int
 }
 
 // NewAppendOnlyManager opens an HA namespace without online deletion.
@@ -202,7 +199,7 @@ func NewAppendOnlyManagerWithValueValidator(bucket objstore.Bucket, prefix strin
 func NewManager(bucket objstore.Bucket, prefix string, configID uint) *Manager {
 	options := bucket.SupportedObjectUploadOptions()
 	ctx, cancel := context.WithCancel(context.Background())
-	m := &Manager{bucket: bucket, prefix: prefix, configID: configID, cas: slices.Contains(options, objstore.IfMatch) && slices.Contains(options, objstore.IfNotExists), cache: make(map[extentObject]Extent), ctx: ctx, cancel: cancel, groupDelay: archiveGroupDelay, renewInterval: archivePinLease / 3}
+	m := &Manager{bucket: bucket, prefix: prefix, configID: configID, cas: slices.Contains(options, objstore.IfMatch) && slices.Contains(options, objstore.IfNotExists), cache: make(map[extentObject]Extent), ctx: ctx, cancel: cancel, groupDelay: archiveGroupDelay}
 	m.readCond = sync.NewCond(&m.readMu)
 	return m
 }
@@ -878,9 +875,6 @@ func (m *Manager) SyncThrough(ctx context.Context, core source, through quepaxa.
 			return ctx.Err()
 		case <-batch.done:
 			if batch.err != nil {
-				if batch.covered >= through {
-					return nil
-				}
 				return batch.err
 			}
 			return m.SyncThrough(ctx, core, through)
@@ -903,9 +897,6 @@ func (m *Manager) SyncThrough(ctx context.Context, core source, through quepaxa.
 	case <-ctx.Done():
 		return ctx.Err()
 	case <-batch.done:
-		if batch.err != nil && batch.covered >= through {
-			return nil
-		}
 		return batch.err
 	}
 }
@@ -926,11 +917,6 @@ func (m *Manager) flushBatch(batch *syncBatch, core source) {
 		}
 		ctx, cancel := context.WithTimeout(m.ctx, archiveSyncTimeout)
 		batch.err = m.syncNowBatch(ctx, core, target, batch)
-		if batch.err == nil && batch.lateErr != nil {
-			batch.err = batch.lateErr
-		} else if batch.err != nil {
-			batch.covered = 0
-		}
 		cancel()
 	}
 	m.batchMu.Lock()
@@ -1005,20 +991,7 @@ func (m *Manager) syncNowBatch(ctx context.Context, core source, through quepaxa
 				through = tip
 			}
 		}
-		if err := m.syncNowLocked(ctx, core, through); err != nil || batch == nil {
-			return err
-		}
-		// Drain one target that joined during publication while admission is held.
-		m.batchMu.Lock()
-		lateTarget := batch.target
-		m.batchMu.Unlock()
-		if lateTarget > through {
-			if err := m.syncNowLocked(ctx, core, lateTarget); err != nil {
-				// Only report the earlier success after lease confirmation and release.
-				batch.covered, batch.lateErr = through, err
-			}
-		}
-		return nil
+		return m.syncNowLocked(ctx, core, through)
 	})
 }
 
@@ -1916,7 +1889,7 @@ func (m *Manager) withArchiveLock(ctx context.Context, key, owner string, gcTrac
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
-		ticker := time.NewTicker(m.renewInterval)
+		ticker := time.NewTicker(archivePinLease / 3)
 		defer ticker.Stop()
 		for {
 			select {
