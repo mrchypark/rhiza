@@ -84,6 +84,100 @@ type archiveHeadAttributesBucket struct {
 	headAttrs    int
 }
 
+type unknownReleaseBucket struct {
+	objstore.Bucket
+	lockWrites atomic.Int32
+	released   chan struct{}
+	proceed    chan struct{}
+}
+
+type joinedBatchContext struct {
+	context.Context
+	joined chan struct{}
+	once   sync.Once
+}
+
+func (c *joinedBatchContext) Done() <-chan struct{} {
+	c.once.Do(func() { close(c.joined) })
+	return c.Context.Done()
+}
+
+func (b *unknownReleaseBucket) Upload(ctx context.Context, name string, r io.Reader, options ...objstore.ObjectUploadOption) error {
+	if strings.HasSuffix(name, "/archive/PUBLISH_LOCK") && b.lockWrites.Add(1) == 2 {
+		if err := b.Bucket.Upload(ctx, name, r, options...); err != nil {
+			return err
+		}
+		close(b.released)
+		select {
+		case <-b.proceed:
+			return errors.New("injected lost release response")
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	}
+	return b.Bucket.Upload(ctx, name, r, options...)
+}
+
+func testArchiveFailedReleaseRevalidatesTip(t *testing.T) {
+	baseCtx, base, core, seed := newSealableArchive(t)
+	defer seed.Close()
+	ctx, cancel := context.WithTimeout(baseCtx, 15*time.Second)
+	defer cancel()
+	bucket := &unknownReleaseBucket{Bucket: base, released: make(chan struct{}), proceed: make(chan struct{})}
+	manager := NewManager(bucket, "cluster", 1)
+	defer manager.Close()
+	if err := manager.Load(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := core.Propose(ctx, []byte("release-unknown")); err != nil {
+		t.Fatal(err)
+	}
+	target := core.Tip()
+	first := make(chan error, 1)
+	go func() { first <- manager.SyncThrough(ctx, core, target) }()
+	select {
+	case <-bucket.released:
+	case <-ctx.Done():
+		t.Fatal(ctx.Err())
+	}
+	if got := manager.Tip(); got < target {
+		t.Fatalf("tip=%d target=%d", got, target)
+	}
+	late := make(chan error, 1)
+	lateCtx := &joinedBatchContext{Context: ctx, joined: make(chan struct{})}
+	go func() { late <- manager.SyncThrough(lateCtx, core, target) }()
+	select {
+	case <-lateCtx.joined:
+	case <-ctx.Done():
+		t.Fatalf("late waiter did not join batch: %v", ctx.Err())
+	}
+	select {
+	case err := <-late:
+		t.Fatalf("late waiter returned before release: %v", err)
+	default:
+	}
+	close(bucket.proceed)
+	if err := <-first; err == nil {
+		t.Fatal("lost release response reported success")
+	}
+	if err := <-late; err == nil {
+		t.Fatal("late waiter ignored failed release")
+	}
+	if err := manager.SyncThrough(ctx, core, target); err != nil {
+		t.Fatalf("revalidation: %v", err)
+	}
+	if got := bucket.lockWrites.Load(); got < 4 {
+		t.Fatalf("lock writes=%d, want re-acquisition and release", got)
+	}
+	manager.Close()
+	if err := manager.SyncThrough(ctx, core, target); err != nil {
+		t.Fatalf("verified tip after close: %v", err)
+	}
+	if err := manager.SyncThrough(ctx, core, target+1); !errors.Is(err, ErrArchiveClosed) {
+		t.Fatalf("new work after close = %v, want ErrArchiveClosed", err)
+	}
+}
+
 type cancelPublicationReadBucket struct {
 	objstore.Bucket
 	cancel context.CancelFunc
@@ -1943,6 +2037,7 @@ func TestArchiveCleanupReusesUnchangedPrefixAfterRealHeadConflict(t *testing.T) 
 	t.Run("archive_busy_observer_copy_keeps_release_deadline", testArchiveBusyTraceObserverCopyKeepsReleaseDeadline)
 	t.Run("independent_publisher_waits_for_gc_publication_lease", testArchiveIndependentPublisherWaitsForGCPublicationLease)
 	t.Run("late_shared_batch_target_uses_one_publication_admission", testArchiveLateSharedBatchTargetUsesOnePublicationAdmission)
+	t.Run("failed_release_revalidates_tip", testArchiveFailedReleaseRevalidatesTip)
 	t.Run("direct_sync_keeps_fixed_target_and_noop_fast_path", testArchiveDirectSyncKeepsFixedTargetAndNoopFastPath)
 	t.Run("publisher_during_gc_delete_scan_keeps_chain", testArchivePublisherDuringGCDeleteScanKeepsReachableChain)
 	t.Run("no_compaction_keeps_concurrent_published_extent", testArchiveNoCompactionKeepsConcurrentPublishedExtent)

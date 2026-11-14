@@ -414,31 +414,31 @@ func (h *Host) resumeExternalReplicaRepair(ctx context.Context, record operator.
 	case operator.V1Alpha2RepairLeave:
 		snapshot, err := h.node.ManagedRepairSnapshot(ctx, "", quepaxa.PublicKey{})
 		if err != nil {
-			return "resume-leave", err
+			return replicaLeaveErrorStage("snapshot", err), err
 		}
 		if snapshot.Current.ConfigID == uint(step.ConfigID+1) {
 			if err := h.resumeLeave(ctx, record); err != nil {
-				return "resume-leave-terminal", err
+				return replicaLeaveErrorStage("terminal", err), err
 			}
 			return h.finishReplicaStepAfterRepair(ctx, step)
 		}
 		if snapshot.Current.ConfigID != uint(step.ConfigID) {
-			return "resume-leave", fmt.Errorf("closed leave membership is neither its source nor target")
+			return "resume-leave-config-mismatch", fmt.Errorf("closed leave membership is neither its source nor target")
 		}
 		observation, err := h.observeReplicaDeployment(ctx)
 		if err != nil {
-			return "resume-leave", err
+			return replicaLeaveErrorStage("deployment", err), err
 		}
 		if observation.DesiredReplicas != step.To || observation.ObservedReplicas != step.To || observation.UpdatedReplicas != step.To {
 			return "waiting-deployment", nil
 		}
 		pods, err := h.observePods(ctx)
 		if err != nil {
-			return "resume-leave", err
+			return replicaLeaveErrorStage("pods", err), err
 		}
 		missing, survivors, err := replicaDownRemoval(snapshot.Current, pods)
 		if err != nil || missing.ID != record.Plan.OldNodeID {
-			return "resume-leave", errors.Join(fmt.Errorf("closed leave victim is not the single actual removed voter"), err)
+			return "resume-leave-victim-mismatch", errors.Join(fmt.Errorf("closed leave victim is not the single actual removed voter"), err)
 		}
 		proof := replicaLeaveProof{Step: step, Cluster: snapshot.Current, Missing: missing.ID, Repair: &record}
 		for _, pod := range survivors {
@@ -446,7 +446,7 @@ func (h *Host) resumeExternalReplicaRepair(ctx context.Context, record operator.
 		}
 		slices.Sort(proof.Survivors)
 		if err := h.proveReplicaRosterExcept(ctx, snapshot, missing.ID, &record.Plan); err != nil {
-			return "resume-leave-health", err
+			return replicaLeaveErrorStage("health", err), err
 		}
 		latest, err := h.live(ctx)
 		if err != nil {
@@ -457,12 +457,17 @@ func (h *Host) resumeExternalReplicaRepair(ctx context.Context, record operator.
 			return "frozen", fmt.Errorf("closed leave changed before survivor-certified mutation")
 		}
 		if err := h.leaveVoterLocked(ctx, LeaveVoterRequest{NodeID: missing.ID}, &proof); err != nil {
-			return "resume-leave", err
+			return replicaLeaveErrorStage("membership", err), err
 		}
 		return h.finishReplicaStepAfterRepair(ctx, step)
 	default:
 		return "ordinary-repair", nil
 	}
+}
+
+// Report a bounded cause class without exposing peer or storage error text.
+func replicaLeaveErrorStage(stage string, err error) string {
+	return "resume-leave-" + stage + "-" + managedRepairCauseClass(err)
 }
 
 func (h *Host) verifyReplicaLeaveBeforeRemove(ctx context.Context, record operator.V1Alpha2RepairRecord, proof replicaLeaveProof) error {

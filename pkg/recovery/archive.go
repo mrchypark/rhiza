@@ -130,9 +130,10 @@ type source interface {
 }
 
 type syncBatch struct {
-	target quepaxa.Slot
-	done   chan struct{}
-	err    error
+	target            quepaxa.Slot
+	done              chan struct{}
+	err               error
+	requireValidation bool
 }
 
 type extentObject struct {
@@ -164,6 +165,7 @@ type Manager struct {
 	batchWG      sync.WaitGroup
 	groupDelay   time.Duration
 	closed       bool
+	unverified   bool
 	gcMu         sync.Mutex
 	readMu       sync.Mutex
 	readCond     *sync.Cond
@@ -408,7 +410,7 @@ func (m *Manager) readStableObject(ctx context.Context, name string, known *objs
 		if sameObjectVersion(known, before.Version) {
 			return before, nil, true, nil
 		}
-		data, err := m.readObject(ctx, name, limit)
+		data, err := m.readObjectWithSizeHint(ctx, name, limit, before.Size)
 		if err != nil {
 			return objstore.ObjectAttributes{}, nil, false, err
 		}
@@ -859,14 +861,10 @@ func (s *RecoverySnapshot) Close(ctx context.Context) error {
 // SyncThrough publishes all decisions through the requested slot. Concurrent
 // callers share a bounded delay and one immutable block/head publication.
 func (m *Manager) SyncThrough(ctx context.Context, core source, through quepaxa.Slot) error {
-	if through == 0 || m.Tip() >= through {
+	if through == 0 {
 		return nil
 	}
 	m.batchMu.Lock()
-	if m.closed {
-		m.batchMu.Unlock()
-		return ErrArchiveClosed
-	}
 	if batch := m.batch; batch != nil {
 		if through > batch.target {
 			batch.target = through
@@ -882,7 +880,15 @@ func (m *Manager) SyncThrough(ctx context.Context, core source, through quepaxa.
 			return m.SyncThrough(ctx, core, through)
 		}
 	}
-	batch := &syncBatch{target: through, done: make(chan struct{})}
+	if !m.unverified && m.Tip() >= through {
+		m.batchMu.Unlock()
+		return nil
+	}
+	if m.closed {
+		m.batchMu.Unlock()
+		return ErrArchiveClosed
+	}
+	batch := &syncBatch{target: through, done: make(chan struct{}), requireValidation: m.unverified}
 	m.batch = batch
 	m.batchWG.Add(1)
 	m.batchMu.Unlock()
@@ -914,6 +920,7 @@ func (m *Manager) flushBatch(batch *syncBatch, core source) {
 		cancel()
 	}
 	m.batchMu.Lock()
+	m.unverified = batch.err != nil
 	if m.batch == batch {
 		m.batch = nil
 	}
@@ -926,18 +933,19 @@ func (m *Manager) syncNow(ctx context.Context, core source, through quepaxa.Slot
 }
 
 func (m *Manager) syncNowBatch(ctx context.Context, core source, through quepaxa.Slot, batch *syncBatch) error {
-	if m.Tip() >= through {
+	forceValidation := batch != nil && batch.requireValidation
+	if !forceValidation && m.Tip() >= through {
 		return nil
 	}
 	m.mu.Lock()
 	exhausted := m.head.Generation == ^uint64(0)
 	m.mu.Unlock()
-	if exhausted {
+	if exhausted && !forceValidation {
 		return fmt.Errorf("archive generation exhausted")
 	}
 	// Another manager may already have durably published this batch's effective
 	// target. Only a validated, non-sealed remote HEAD can skip admission.
-	if err := m.Load(ctx); err == nil {
+	if err := m.Load(ctx); err == nil && !forceValidation {
 		m.mu.Lock()
 		tip, sealed := m.tip, m.head.Sealed
 		m.mu.Unlock()
@@ -949,6 +957,9 @@ func (m *Manager) syncNowBatch(ctx context.Context, core source, through quepaxa
 		}
 	}
 	return m.withPublicationLockRecheck(ctx, "archive-sync", func(ctx context.Context) (bool, error) {
+		if forceValidation {
+			return false, nil
+		}
 		if err := m.Load(ctx); err != nil {
 			if ctxErr := ctx.Err(); ctxErr != nil {
 				return false, ctxErr
@@ -2441,12 +2452,24 @@ func extentPrefixes(extent Extent) [][32]byte {
 }
 
 func (m *Manager) readObject(ctx context.Context, name string, limit int64) ([]byte, error) {
+	return m.readObjectWithSizeHint(ctx, name, limit, 0)
+}
+
+func (m *Manager) readObjectWithSizeHint(ctx context.Context, name string, limit, sizeHint int64) ([]byte, error) {
 	r, err := m.bucket.Get(ctx, name)
 	if err != nil {
 		return nil, err
 	}
 	defer r.Close()
-	data, err := io.ReadAll(io.LimitReader(r, limit+1))
+	var data []byte
+	if sizeHint > 0 && sizeHint <= limit && sizeHint <= 1<<20 {
+		var buf bytes.Buffer
+		buf.Grow(int(sizeHint) + 512)
+		_, err = buf.ReadFrom(io.LimitReader(r, limit+1))
+		data = buf.Bytes()
+	} else {
+		data, err = io.ReadAll(io.LimitReader(r, limit+1))
+	}
 	if err != nil {
 		return nil, err
 	}

@@ -5,6 +5,7 @@ package objstore
 import (
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"net"
 	"net/http"
@@ -27,6 +28,7 @@ type S3TransportEvent struct {
 	StatusCode            int           `json:"status_code,omitempty"`
 	Outcome               string        `json:"outcome"`
 	ErrorClass            string        `json:"error_class,omitempty"`
+	ErrorType             string        `json:"error_type,omitempty"`
 	ResourceClass         string        `json:"resource_class,omitempty"`
 	ConditionalPresence   string        `json:"conditional_presence,omitempty"`
 	DeclaredContentLength int64         `json:"declared_content_length,omitempty"`
@@ -50,13 +52,15 @@ type S3TransportAggregate struct {
 // S3TransportRequestCount aggregates all actual RoundTrip calls without
 // retaining per-request success history.
 type S3TransportRequestCount struct {
-	Owner  string `json:"owner"`
-	Phase  string `json:"phase"`
-	Method string `json:"method"`
-	Count  uint64 `json:"count"`
+	Owner               string `json:"owner"`
+	Phase               string `json:"phase"`
+	Method              string `json:"method"`
+	ResourceClass       string `json:"resource_class"`
+	ConditionalPresence string `json:"conditional_presence"`
+	Count               uint64 `json:"count"`
 }
 
-type transportRequestKey struct{ owner, phase, method string }
+type transportRequestKey struct{ owner, phase, method, resource, condition string }
 
 // ExtentUploadAttributionAggregate joins physical failures and the final
 // result of one archive extent Upload without retaining its object identity.
@@ -234,7 +238,7 @@ func (o *S3TransportObserver) SetPhase(phase string) {
 func (o *S3TransportObserver) Snapshot() (total uint64, requests []S3TransportRequestCount, aggregates []S3TransportAggregate, first *S3TransportEvent) {
 	o.mu.Lock()
 	for key, count := range o.requests {
-		requests = append(requests, S3TransportRequestCount{Owner: key.owner, Phase: key.phase, Method: key.method, Count: count})
+		requests = append(requests, S3TransportRequestCount{Owner: key.owner, Phase: key.phase, Method: key.method, ResourceClass: key.resource, ConditionalPresence: key.condition, Count: count})
 	}
 	for key, count := range o.groups {
 		key.Count = count
@@ -272,7 +276,13 @@ func (o *S3TransportObserver) Snapshot() (total uint64, requests []S3TransportRe
 		if a.Owner != b.Owner {
 			return a.Owner < b.Owner
 		}
-		return a.Method < b.Method
+		if a.Method != b.Method {
+			return a.Method < b.Method
+		}
+		if a.ResourceClass != b.ResourceClass {
+			return a.ResourceClass < b.ResourceClass
+		}
+		return a.ConditionalPresence < b.ConditionalPresence
 	})
 	return o.total.Load(), requests, aggregates, first
 }
@@ -335,9 +345,11 @@ func (t *observedRoundTripper) RoundTrip(request *http.Request) (*http.Response,
 	t.observer.mu.Lock()
 	phase := t.observer.phase
 	method := safeHTTPMethod(request.Method)
-	t.observer.requests[transportRequestKey{owner: t.owner, phase: phase, method: method}]++
+	resource := classifyResourceClass(request.URL.Path)
+	condition := classifyConditionalPresence(request)
+	t.observer.requests[transportRequestKey{owner: t.owner, phase: phase, method: method, resource: resource, condition: condition}]++
 	t.observer.mu.Unlock()
-	base := S3TransportEvent{Sequence: sequence, Owner: t.owner, Phase: phase, Method: method, ResourceClass: classifyResourceClass(request.URL.Path), ConditionalPresence: classifyConditionalPresence(request), DeclaredContentLength: request.ContentLength}
+	base := S3TransportEvent{Sequence: sequence, Owner: t.owner, Phase: phase, Method: method, ResourceClass: resource, ConditionalPresence: condition, DeclaredContentLength: request.ContentLength}
 	var probe *ExtentUploadAttribution
 	if method == http.MethodPut && base.ResourceClass == "archive_block" && base.ConditionalPresence == "if_none_match" {
 		probe, _ = request.Context().Value(extentAttributionKey{}).(*ExtentUploadAttribution)
@@ -350,6 +362,7 @@ func (t *observedRoundTripper) RoundTrip(request *http.Request) (*http.Response,
 		}
 		base.Outcome = "round_trip_error"
 		base.ErrorClass = classifyTransportError(err)
+		base.ErrorType = safeErrorType(err)
 		probe.observe(t.observer, t.owner, phase, base.ErrorClass, false)
 		t.observer.record(base)
 		return response, err
@@ -375,10 +388,27 @@ func (t *observedRoundTripper) RoundTrip(request *http.Request) (*http.Response,
 			event.Elapsed = time.Since(started)
 			event.Outcome = outcome
 			event.ErrorClass = classifyTransportError(err)
+			event.ErrorType = safeErrorType(err)
 			t.observer.record(event)
 		}}
 	}
 	return response, nil
+}
+
+// safeErrorType records only a concrete type, never provider error text.
+func safeErrorType(err error) string {
+	for i := 0; i < 8; i++ {
+		next := errors.Unwrap(err)
+		if next == nil {
+			break
+		}
+		err = next
+	}
+	name := fmt.Sprintf("%T", err)
+	if len(name) > 128 {
+		return name[:128]
+	}
+	return name
 }
 
 func expectedHTTPControlOutcome(request *http.Request, status int) bool {
@@ -453,6 +483,12 @@ func classifyResourceClass(path string) string {
 	n := len(segs)
 	if n >= 2 && segs[n-2] == "archive" && segs[n-1] == "head.bin" {
 		return "archive_head"
+	}
+	if n >= 2 && segs[n-2] == "archive" && segs[n-1] == "PUBLISH_LOCK" {
+		return "archive_publish_lock"
+	}
+	if n >= 2 && segs[n-2] == "archive" && segs[n-1] == "GC_LOCK" {
+		return "archive_gc_lock"
 	}
 	if n >= 2 && segs[n-2] == "checkpoint" && segs[n-1] == "CURRENT" {
 		return "checkpoint_current"

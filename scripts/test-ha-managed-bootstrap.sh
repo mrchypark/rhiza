@@ -2,6 +2,25 @@
 # Actual owned Kind bootstrap/recovery with two scoped Chaos Mesh kill actions.
 set -eu
 cd "$(CDPATH='' cd -- "$(dirname -- "$0")/.." && pwd)"
+managed_kind_container_fault() {
+  kind_runtime_before "$1" "$2" container-kill || return $?
+  direct_chaos_fault container-kill container-kill "$1" "$2" || return $?
+  kind_runtime_after container-kill "$2" || return $?
+  managed_chaos_verified=1
+}
+if [ "${1-}" = --container-fault-self-test ]; then
+  for failed_step in before inject after none; do
+    managed_chaos_verified=0
+    kind_runtime_before() { [ "$failed_step" != before ] || return 41; }
+    direct_chaos_fault() { [ "$failed_step" != inject ] || return 42; }
+    kind_runtime_after() { [ "$failed_step" != after ] || return 43; }
+    if managed_kind_container_fault pod uid; then actual=0; else actual=$?; fi
+    case "$failed_step" in before) expected=41 ;; inject) expected=42 ;; after) expected=43 ;; none) expected=0 ;; esac
+    [ "$actual" = "$expected" ] || exit 1
+    if [ "$failed_step" = none ]; then [ "$managed_chaos_verified" = 1 ] || exit 1; else [ "$managed_chaos_verified" = 0 ] || exit 1; fi
+  done
+  exit 0
+fi
 managed_install_mode_valid() {
   case "$1" in
     false) return 0 ;;
@@ -19,7 +38,7 @@ if [ "${1-}" = --install-mode-self-test ]; then
   exit 0
 fi
 cleanup_managed_private() {
-  rm -f "$private/runtime.json" "$private/kubeconfig" "$private/curl.conf" "$private/request.body" "$private/admin.token" "$private/runtime-before.json" "$private/runtime-after.json" "$private/chaos-chart.yaml" "$private/chaos-render.jsonl" "$private/chaos-failure.json" "$private/gcs-emulator.json" "$private/managed-install.jsonl" "$private/functional-load.sh" "$private/functional-load-job.json" "$private/functional-stage" "$private/functional-probe.body" "$private/functional-readback.body" || return 1
+  rm -f "$private/runtime.json" "$private/kubeconfig" "$private/curl.conf" "$private/request.body" "$private/admin.token" "$private/runtime-before.json" "$private/runtime-after.json" "$private/chaos-chart.yaml" "$private/chaos-render.jsonl" "$private/chaos-failure.json" "$private/gcs-emulator.json" "$private/managed-install.jsonl" "$private/functional-load.sh" "$private/functional-load-job.json" "$private/functional-stage" "$private/functional-probe.body" "$private/functional-readback.body" "$private/restart-capture.raw" "$private/restart-capture-pod.json" || return 1
   rmdir "$private"
 }
 managed_private_cleanup_self_test() (
@@ -34,7 +53,7 @@ managed_private_cleanup_self_test() (
   . scripts/ha-managed-scale-qualification.sh
   managed_functional_write_load_script "$private/functional-load.sh"
   managed_functional_load_job test-image > "$private/functional-load-job.json"
-  for functional_private in functional-stage functional-probe.body functional-readback.body; do
+  for functional_private in functional-stage functional-probe.body functional-readback.body restart-capture.raw restart-capture-pod.json; do
     : > "$private/$functional_private"
   done
   cleanup_managed_private || exit 1
@@ -141,6 +160,7 @@ managed_completed_repair_oracle_self_test() {
 }
 if [ "${1-}" = --oracle-self-test ]; then
   . scripts/ha-managed-bootstrap-fixture.sh
+  managed_initial_oracle_self_test
   managed_first_pod_fault_self_test
   managed_completed_repair_oracle_self_test
   (cd scripts/ha-managed-bucket-setup-src && go test -mod=readonly -timeout=45s ./...)
@@ -154,7 +174,7 @@ fi
 published_install_only=${RHIZA_MANAGED_PUBLISHED_INSTALL_ONLY-false}
 functional_scenario=${RHIZA_MANAGED_FUNCTIONAL_SCENARIO-}
 case "$functional_scenario" in
-  ''|scale-up|quorum|external-scale|external-high) ;;
+  ''|scale-up|quorum|external-scale|external-high|autoscale) ;;
   *) echo 'invalid RHIZA_MANAGED_FUNCTIONAL_SCENARIO' >&2; exit 1 ;;
 esac
 managed_install_mode_valid "$published_install_only" "${RHIZA_MANAGED_FIXTURE_CASE-internal}"
@@ -170,6 +190,8 @@ nonce=$(od -An -N6 -tx1 /dev/urandom | tr -d ' \n')
 cluster="ha-managed-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-$nonce"
 namespace=managed-bootstrap
 image="rhiza-managed:$GITHUB_SHA-$nonce"
+embedded_image="rhiza-embedded-example:$GITHUB_SHA-$nonce"
+embedded_built=0
 if [ "$published_install_only" = true ]; then
   image=ghcr.io/mrchypark/rhiza-operator@sha256:2f7752353aa8796a074cf8cf3d91102f206d30cc0628cfd5fff4fcd37e555f40
 fi
@@ -186,7 +208,7 @@ k() {
       return
       ;;
     *" apply --validate=strict -f $logs/requested-cluster.json "*)
-      case "$functional_scenario" in external-scale|external-high)
+      case "$functional_scenario" in external-scale|external-high|autoscale)
         managed_functional_external_opt_in "$logs/requested-cluster.json"
         ;;
       esac
@@ -219,24 +241,24 @@ kind_node_guard() {
   [ "$(docker inspect --format '{{index .Config.Labels "io.x-k8s.kind.role"}}' "$runtime_node")" = control-plane ]
 }
 kind_runtime_before() {
-  k -n "$namespace" get pod "$1" -o json > "$logs/$3-runtime-before.json"
-  jq -e --arg uid "$2" '.metadata.uid==$uid and .metadata.deletionTimestamp==null' "$logs/$3-runtime-before.json" >/dev/null
-  runtime_node=$(jq -er '.spec.nodeName' "$logs/$3-runtime-before.json")
-  runtime_old=$(jq -er --arg container "${4-sql}" '.status.containerStatuses[]|select(.name==$container)|.containerID|select(test("^containerd://[a-f0-9]{64}$"))|sub("^containerd://";"")' "$logs/$3-runtime-before.json")
-  kind_node_guard
-  docker exec "$runtime_node" crictl --runtime-endpoint unix:///run/containerd/containerd.sock ps -a -o json > "$private/runtime-before.json"
-  jq -e --arg id "$runtime_old" --arg uid "$2" --arg container "${4-sql}" 'any(.containers[]; .id==$id and .state=="CONTAINER_RUNNING" and .labels["io.kubernetes.pod.uid"]==$uid and .labels["io.kubernetes.container.name"]==$container)' "$private/runtime-before.json" >/dev/null
+  k -n "$namespace" get pod "$1" -o json > "$logs/$3-runtime-before.json" || return $?
+  jq -e --arg uid "$2" '.metadata.uid==$uid and .metadata.deletionTimestamp==null' "$logs/$3-runtime-before.json" >/dev/null || return $?
+  runtime_node=$(jq -er '.spec.nodeName' "$logs/$3-runtime-before.json") || return $?
+  runtime_old=$(jq -er --arg container "${4-sql}" '.status.containerStatuses[]|select(.name==$container)|.containerID|select(test("^containerd://[a-f0-9]{64}$"))|sub("^containerd://";"")' "$logs/$3-runtime-before.json") || return $?
+  kind_node_guard || return $?
+  docker exec "$runtime_node" crictl --runtime-endpoint unix:///run/containerd/containerd.sock ps -a -o json > "$private/runtime-before.json" || return $?
+  jq -e --arg id "$runtime_old" --arg uid "$2" --arg container "${4-sql}" 'any(.containers[]; .id==$id and .state=="CONTAINER_RUNNING" and .labels["io.kubernetes.pod.uid"]==$uid and .labels["io.kubernetes.container.name"]==$container)' "$private/runtime-before.json" >/dev/null || return $?
   jq --arg uid "$2" '{containers:[.containers[]|select(.labels["io.kubernetes.pod.uid"]==$uid)|{id,state,labels:{"io.kubernetes.pod.uid":.labels["io.kubernetes.pod.uid"],"io.kubernetes.container.name":.labels["io.kubernetes.container.name"]}}]}' "$private/runtime-before.json" > "$logs/$3-cri-before.json"
 }
 kind_runtime_after() {
   runtime_tries=0
   runtime_new=
   if [ "$1" = container-kill ]; then
-    runtime_new=$(jq -er '.status.containerStatuses[]|select(.name=="sql")|.containerID|select(test("^containerd://[a-f0-9]{64}$"))|sub("^containerd://";"")' "$logs/container-kill-pod-after.json")
+    runtime_new=$(jq -er '.status.containerStatuses[]|select(.name=="sql")|.containerID|select(test("^containerd://[a-f0-9]{64}$"))|sub("^containerd://";"")' "$logs/container-kill-pod-after.json") || return $?
   fi
   while :; do
-    kind_node_guard
-    docker exec "$runtime_node" crictl --runtime-endpoint unix:///run/containerd/containerd.sock ps -a -o json > "$private/runtime-after.json"
+    kind_node_guard || return $?
+    docker exec "$runtime_node" crictl --runtime-endpoint unix:///run/containerd/containerd.sock ps -a -o json > "$private/runtime-after.json" || return $?
     if kind_runtime_oracle "$private/runtime-after.json" "$2" "$runtime_old" "$1" "$runtime_new"; then break; fi
     runtime_tries=$((runtime_tries+1)); [ "$runtime_tries" -lt 60 ] || return 1; sleep 1
   done
@@ -313,11 +335,55 @@ capture_bootstrap_logs() {
     done
   done
 }
+# Keep only diagnostic category counts, never raw API requests or object data.
+control_plane_log_summary() {
+  awk '{
+    category=""
+    if ($0 ~ /etcdserver: request timed out|context deadline exceeded/) category="timeout"
+    else if ($0 ~ /leader changed|lost leader|elected leader/) category="leader_change"
+    else if ($0 ~ /took too long|slow request|slow fdatasync/) category="slow_operation"
+    if (category != "") print category
+  }' | sort | uniq -c
+}
+capture_control_plane_failure() {
+  node="$cluster-control-plane"
+  # Do not inspect another cluster if the name was reused or ownership is uncertain.
+  [ "$(timeout 10s docker inspect --format '{{index .Config.Labels "io.x-k8s.kind.cluster"}}' "$node" 2>/dev/null)" = "$cluster" ] || return 0
+  timeout 10s docker stats --no-stream --format '{{.CPUPerc}} {{.MemUsage}} {{.BlockIO}}' "$node" > "$logs/control-plane-container-stats.txt" 2>&1 || :
+  timeout 10s docker exec "$node" sh -c 'uptime; df -h /var/lib/etcd; free -m' > "$logs/control-plane-resources.txt" 2>&1 || :
+  for component in etcd kube-apiserver; do
+    status="$logs/control-plane-$component-status.txt"
+    : > "$logs/control-plane-$component-summary.txt"
+    if ids=$(timeout 10s docker exec "$node" crictl ps -a --name "$component" -q 2>/dev/null); then
+      ids=$(printf '%s\n' "$ids" | head -n 3)
+      printf '%s\n' 'container_list=ok' > "$status"
+    else
+      code=$?
+      printf 'container_list=failed exit=%s\n' "$code" > "$status"
+      continue
+    fi
+    if [ -z "$ids" ]; then printf '%s\n' 'containers=none' >> "$status"; fi
+    for id in $ids; do
+      if raw=$(timeout 10s docker exec "$node" crictl logs --tail=500 "$id" 2>/dev/null); then
+        printf '%s\n' 'container_logs=ok' >> "$status"
+        printf '%s\n' "$raw" | control_plane_log_summary >> "$logs/control-plane-$component-summary.txt"
+      else
+        code=$?
+        printf 'container_logs=failed exit=%s\n' "$code" >> "$status"
+      fi
+      unset raw
+    done
+  done
+}
 cleanup() {
   result=$?
   trap - EXIT HUP INT TERM
   printf '%s\n' "$result" > "$logs/driver-original.exit"
+  if [ "$result" -ne 0 ] && [ "${restart_capture_active-0}" = 1 ] && command -v managed_capture_restart_once >/dev/null 2>&1; then
+    managed_capture_restart_once || :
+  fi
   if [ "$owned" = 1 ]; then
+    if [ "$result" -ne 0 ]; then capture_control_plane_failure || :; fi
     if [ -n "$fault_name" ]; then
       capture_chaos_failure "$fault_name" cleanup || :
       chaos_k delete "podchaos/$fault_name" --wait=true --timeout=45s > "$logs/fault-cleanup.txt" 2>&1 || result=1
@@ -348,6 +414,10 @@ cleanup() {
     docker image rm "$image" > "$logs/image-cleanup.txt" 2>&1 || result=1
     if docker image inspect "$image" >/dev/null 2>&1; then result=1; fi
   fi
+  if [ "$embedded_built" = 1 ]; then
+    docker image rm "$embedded_image" > "$logs/embedded-image-cleanup.txt" 2>&1 || result=1
+    if docker image inspect "$embedded_image" >/dev/null 2>&1; then result=1; fi
+  fi
   cleanup_managed_private || result=1
   printf '%s\n' "$result" > "$logs/driver.exit"
   exit "$result"
@@ -362,6 +432,11 @@ if [ "$published_install_only" = false ]; then
   built=1
   docker build -f "${RHIZA_MANAGED_TEST_DOCKERFILE:-Dockerfile.operator}" -t "$image" . > "$logs/build.txt" 2>&1
   kind load docker-image --name "$cluster" "$image" > "$logs/load.txt" 2>&1
+  if [ "$functional_scenario" = autoscale ]; then
+    docker build -f scripts/ha-embedded-autoscale.Dockerfile -t "$embedded_image" . > "$logs/embedded-build.txt" 2>&1
+    embedded_built=1
+    kind load docker-image --name "$cluster" "$embedded_image" > "$logs/embedded-load.txt" 2>&1
+  fi
 fi
 k create namespace "$namespace"
 chaos_namespace_uid=$(k get namespace "$namespace" -o jsonpath='{.metadata.uid}')
@@ -380,13 +455,15 @@ managed_pod_fault() {
   kind_runtime_after pod-kill "$2"
 }
 managed_container_fault() {
-  kind_runtime_before "$1" "$2" container-kill
-  direct_chaos_fault container-kill container-kill "$1" "$2"
-  kind_runtime_after container-kill "$2"
-  managed_chaos_verified=1
+  managed_kind_container_fault "$1" "$2"
 }
 . scripts/ha-managed-bootstrap-fixture.sh
 if [ -n "$functional_scenario" ]; then
   . scripts/ha-managed-scale-qualification.sh
+  if [ "$functional_scenario" = autoscale ]; then
+    . scripts/ha-embedded-autoscale-qualification.sh
+    RHIZA_AUTOSCALE_DISPOSABLE_NAMESPACE=$namespace
+    managed_autoscale_install
+  fi
 fi
 managed_fixture

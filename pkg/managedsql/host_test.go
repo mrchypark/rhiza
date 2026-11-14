@@ -55,6 +55,7 @@ type sqlWireControl struct {
 	putReadGateBytes        int
 	putReadErrors           chan error
 	putReadFailure          func(*http.Request, error)
+	putReadDiagnostic       func(*http.Request)
 	ownedClose              atomic.Int64
 	// Evaluated before body reads/object-map lock. The owner must fail its
 	// test on predicate observation errors rather than silently passing them.
@@ -268,6 +269,9 @@ func sqlWireStore(t *testing.T) (*httptest.Server, *sqlWireControl) {
 			}
 			body, err := io.ReadAll(r.Body)
 			if err != nil {
+				if control.putReadDiagnostic != nil {
+					control.putReadDiagnostic(r)
+				}
 				if control.putReadFailure != nil {
 					control.putReadFailure(r, err)
 					w.WriteHeader(http.StatusBadRequest)

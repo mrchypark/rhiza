@@ -3,6 +3,9 @@ package network
 import (
 	"context"
 	"errors"
+	"io"
+	"net/http"
+	"net/http/httptest"
 	"testing"
 	"time"
 
@@ -10,7 +13,89 @@ import (
 	"github.com/mrchypark/rhiza/pkg/materializer"
 	"github.com/mrchypark/rhiza/pkg/network/peerfb"
 	"github.com/mrchypark/rhiza/pkg/quepaxa"
+	"github.com/quic-go/quic-go"
 )
+
+func TestCheckpointQuorumCancelsSlowPeerBlockRead(t *testing.T) {
+	members := []quepaxa.Member{testMember("cluster", "n1", "secret1"), testMember("cluster", "n2", "secret2"), testMember("cluster", "n3", "secret3")}
+	reading := make(chan struct{})
+	readResult := make(chan error, 1)
+	block := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Length", "2")
+		_, _ = w.Write([]byte("a"))
+		w.(http.Flusher).Flush()
+		<-r.Context().Done()
+	}))
+	defer block.Close()
+	servers := make([]*PeerServer, 0, 2)
+	for i := 1; i < 3; i++ {
+		core := mustCore(t, members[i].ID, members, nil, nil)
+		material, err := materializer.Open(t.TempDir()+"/state.sqlite", 1)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer material.Close()
+		server := NewServer(core, material, "cluster", true, nil)
+		defer server.Close()
+		if i == 1 {
+			server.SetCheckpointPrepare(func(ctx context.Context, _ quepaxa.NodeID, _ quepaxa.CheckpointSeal) error {
+				select {
+				case <-reading:
+					return nil
+				case <-ctx.Done():
+					return ctx.Err()
+				}
+			})
+		} else {
+			server.SetCheckpointPrepare(func(ctx context.Context, _ quepaxa.NodeID, _ quepaxa.CheckpointSeal) error {
+				req, err := http.NewRequestWithContext(ctx, http.MethodGet, block.URL, nil)
+				if err != nil {
+					readResult <- err
+					return err
+				}
+				resp, err := http.DefaultClient.Do(req)
+				if err != nil {
+					readResult <- err
+					return err
+				}
+				defer resp.Body.Close()
+				close(reading)
+				_, err = io.ReadAll(resp.Body)
+				readResult <- err
+				return err
+			})
+		}
+		peer, err := StartPeerServer(context.Background(), "127.0.0.1:0", server, members, "secret"+string(rune('1'+i)), "admin")
+		if err != nil {
+			t.Fatal(err)
+		}
+		servers = append(servers, peer)
+		members[i].PeerURL = "quic://" + peer.Addr()
+	}
+	defer func() {
+		for _, peer := range servers {
+			peer.Close()
+		}
+	}()
+	transport := NewTransport("cluster", "n1", &quepaxa.Cluster{Members: members}, "secret1")
+	defer transport.Close()
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	seal := quepaxa.CheckpointSeal{Index: 1, RootHash: [32]byte{1}, StateHash: [32]byte{2}, PrefixHash: [32]byte{3}, NextLeaderOrder: []quepaxa.NodeID{"n1", "n2", "n3"}}
+	if err := transport.PrepareCheckpoint(ctx, seal); err != nil {
+		t.Fatalf("quorum prepare: %v", err)
+	}
+	select {
+	case err := <-readResult:
+		var streamErr *quic.StreamError
+		if !errors.As(err, &streamErr) {
+			t.Fatalf("slow peer read error = %v, want QUIC stream cancellation", err)
+		}
+		t.Logf("slow peer read canceled after quorum: %T", err)
+	case <-ctx.Done():
+		t.Fatal("slow peer block read did not terminate")
+	}
+}
 
 func TestNotifyCancellationReportsUnknownWithRequestID(t *testing.T) {
 	core := mustCore(t, "n1", []quepaxa.Member{{ID: "n1"}}, nil, nil)

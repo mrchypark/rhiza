@@ -92,9 +92,9 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        scenario: [scale-up, quorum, external-high]
+        scenario: [scale-up, quorum, external-high, autoscale]
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: ${{ matrix.scenario == 'autoscale' && 90 || 30 }}
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-go@v6
@@ -117,6 +117,7 @@ jobs:
       - name: Functional harness self-test
         run: |
           sh -n scripts/ha-managed-scale-qualification.sh
+          sh -n scripts/ha-embedded-autoscale-qualification.sh
           sh -n scripts/test-ha-managed-bootstrap.sh
           sh scripts/ha-managed-scale-qualification.sh --self-test
       - name: Real managed functional qualification

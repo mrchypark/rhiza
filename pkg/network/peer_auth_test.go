@@ -55,3 +55,22 @@ func TestPeerAuthenticationMatrix(t *testing.T) {
 		}
 	}
 }
+
+func TestAuthenticatedPeerReadIndexParticipation(t *testing.T) {
+	members := []quepaxa.Member{testMember("cluster", "a", "a-token"), testMember("cluster", "b", "b-token")}
+	core := mustCore(t, "a", members, nil, nil)
+	server := NewServer(core, nil, "cluster", true, nil, func() bool { return true })
+	defer server.Close()
+	peer := &PeerServer{server: server, adminToken: "admin"}
+	req := &peerfb.RequestT{Operation: peerfb.OperationReadIndex, ClusterId: "cluster", ConfigId: uint64(core.ConfigID()), SenderId: "b"}
+	if _, err := peer.handle(context.Background(), PeerPublicKey("cluster", "b", "wrong"), req); err == nil {
+		t.Fatal("wrong identity accepted")
+	}
+	if _, err := peer.handle(context.Background(), PeerPublicKey("cluster", "b", "b-token"), req); err != nil {
+		t.Fatalf("voter read-index rejected: %v", err)
+	}
+	req.ConfigId++
+	if _, err := peer.handle(context.Background(), PeerPublicKey("cluster", "b", "b-token"), req); err == nil {
+		t.Fatal("different configuration accepted")
+	}
+}

@@ -178,7 +178,7 @@ func ReconcileV1Alpha2ManagedInitialization(ctx context.Context, kube *Kubernete
 	if _, _, err = BuildV1Alpha2RuntimePlan(ref, c.Spec.LogicalID, "validation", profile, nil); err != nil {
 		return V1Alpha2StatusSnapshot{}, err
 	}
-	podSpec, err := V1Alpha2ManagedSQLPodSpec(ref, profile, c.Spec.Workload.PodTemplate.Spec.Containers)
+	podSpec, err := V1Alpha2ManagedSQLPodSpec(ref, profile, c.Spec.Workload.PodTemplate.Spec.Containers, c.Spec.Workload.Embedded)
 	if err != nil {
 		return V1Alpha2StatusSnapshot{}, err
 	}
@@ -308,6 +308,14 @@ func managedCandidateSpecMatches(raw, expected json.RawMessage) bool {
 	if json.Unmarshal(template["spec"], &pod) != nil {
 		return false
 	}
+	var expectedSpec, expectedTemplate, expectedPod map[string]json.RawMessage
+	if json.Unmarshal(expected, &expectedSpec) != nil || json.Unmarshal(expectedSpec["template"], &expectedTemplate) != nil || json.Unmarshal(expectedTemplate["spec"], &expectedPod) != nil {
+		return false
+	}
+	var expectedContainers []map[string]json.RawMessage
+	if json.Unmarshal(expectedPod["containers"], &expectedContainers) != nil {
+		return false
+	}
 	strip(pod, map[string]string{"restartPolicy": `"Always"`, "dnsPolicy": `"ClusterFirst"`, "schedulerName": `"default-scheduler"`, "terminationGracePeriodSeconds": "30"})
 	strip(pod, map[string]string{"serviceAccount": `"rhiza-managed-host"`})
 	for _, key := range []string{"containers", "initContainers"} {
@@ -315,7 +323,15 @@ func managedCandidateSpecMatches(raw, expected json.RawMessage) bool {
 		if json.Unmarshal(pod[key], &containers) != nil {
 			return false
 		}
-		for _, c := range containers {
+		for i, c := range containers {
+			if key == "containers" {
+				if i >= len(expectedContainers) || !managedResourceRequestsEqual(c["resources"], expectedContainers[i]["resources"]) {
+					return false
+				}
+				if expectedContainers[i]["resources"] != nil {
+					c["resources"] = expectedContainers[i]["resources"]
+				}
+			}
 			defaults := map[string]string{"resources": "{}"}
 			if key == "containers" {
 				defaults["terminationMessagePath"] = `"/dev/termination-log"`

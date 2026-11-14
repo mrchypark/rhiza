@@ -132,7 +132,12 @@ trap 'exit_status=$?; trap - EXIT; cleanup; exit "$exit_status"' EXIT
 trap 'exit 130' INT
 trap 'exit 143' TERM
 
-(cd "$source_dir" && CGO_ENABLED=0 go build -o "$run_dir/rhiza" ./cmd/rhiza)
+# Diagnostic builds are separate from the uninstrumented comparison baseline.
+if [[ ${RHIZA_SERVER_BENCH_LATENCY_DIAGNOSTICS:-0} == 1 ]]; then
+	(cd "$source_dir" && CGO_ENABLED=0 go build -tags rhiza_latency_diag -o "$run_dir/rhiza" ./cmd/rhiza)
+else
+	(cd "$source_dir" && CGO_ENABLED=0 go build -o "$run_dir/rhiza" ./cmd/rhiza)
+fi
 # Both server revisions use the exact same candidate client/oracle, not each
 # revision's potentially different receipt parser or fault instrumentation.
 (cd "$client_source_dir" && CGO_ENABLED=0 go build -o "$run_dir/rhiza-bench" ./cmd/rhiza-bench)
@@ -291,7 +296,7 @@ jq -e --argjson requests "$requests" '.errors == 0 and .successes == $requests a
 verify_benchmark_rows "$requests" <<<"$count"
 runtime_failure_lines=0
 for log in "$run_dir"/node-*.log; do
-	log_failures=$(grep -Ei 'error|failed|timeout' "$log" | grep -Eivc 'failed to sufficiently increase receive buffer size' || true)
+	log_failures=$(grep -v '^rhiza_latency ' "$log" | grep -Ei 'error|failed|timeout' | grep -Eivc 'failed to sufficiently increase receive buffer size' || true)
 	runtime_failure_lines=$((runtime_failure_lines + log_failures))
 done
 jq -nc --argjson result "$result" --argjson count "$count" --argjson overlap "$overlap" --argjson fault_exit_status "$fault_exit_status" --arg client_revision "$client_revision" --arg client_sha256 "$client_sha256" --argjson concurrency "$concurrency" --argjson runtime_failure_lines "$runtime_failure_lines" --argjson max_fault_latency_ms "$max_fault_latency_ms" --argjson object_delta "$object_delta" --argjson object_metric_nodes "$object_metric_nodes" --arg failed_node "$failed_node" --arg target_node "$target_node" --arg durability "$durability" --arg fault_after "$fault_after" \

@@ -45,17 +45,17 @@ managed_chaos_request() {
 direct_chaos_fault() {
   action=$1 fault_name=$2 pod=$3 pod_uid=$4
   [ "$action" = "$fault_name" ] || return 2
-  chaos_scope_guard
-  chaos_k get pod "$pod" -o json > "$logs/$fault_name-pod-before.json"
-  jq -e --arg pod_uid "$pod_uid" --arg cluster_uid "$uid" '.metadata.uid==$pod_uid and .metadata.deletionTimestamp==null and .metadata.labels["rhiza.mrchypark.dev/cluster-uid"]==$cluster_uid and any(.status.containerStatuses[]?; .name=="sql" and .ready)' "$logs/$fault_name-pod-before.json" >/dev/null
-  old_container=$(jq -er '.status.containerStatuses[]|select(.name=="sql")|.containerID|select(length>0)' "$logs/$fault_name-pod-before.json")
+  chaos_scope_guard || return $?
+  chaos_k get pod "$pod" -o json > "$logs/$fault_name-pod-before.json" || return $?
+  jq -e --arg pod_uid "$pod_uid" --arg cluster_uid "$uid" '.metadata.uid==$pod_uid and .metadata.deletionTimestamp==null and .metadata.labels["rhiza.mrchypark.dev/cluster-uid"]==$cluster_uid and any(.status.containerStatuses[]?; .name=="sql" and .ready)' "$logs/$fault_name-pod-before.json" >/dev/null || return $?
+  old_container=$(jq -er '.status.containerStatuses[]|select(.name=="sql")|.containerID|select(length>0)' "$logs/$fault_name-pod-before.json") || return $?
   expected_record="$namespace/$pod"
   [ "$action" != container-kill ] || expected_record="$expected_record/sql"
-  managed_chaos_request "$action" "$pod" > "$logs/$fault_name-request.json"
-  chaos_k create -f "$logs/$fault_name-request.json"
-  wait_chaos_injected "$fault_name"
-  chaos_k get "podchaos/$fault_name" -o json > "$logs/$fault_name-injected.json"
-  chaos_record_oracle "$logs/$fault_name-injected.json" "$expected_record"
+  managed_chaos_request "$action" "$pod" > "$logs/$fault_name-request.json" || return $?
+  chaos_k create -f "$logs/$fault_name-request.json" || return $?
+  wait_chaos_injected "$fault_name" || return $?
+  chaos_k get "podchaos/$fault_name" -o json > "$logs/$fault_name-injected.json" || return $?
+  chaos_record_oracle "$logs/$fault_name-injected.json" "$expected_record" || return $?
   if [ "$action" = container-kill ]; then
     tries=0
     until chaos_k get pod "$pod" -o json > "$logs/$fault_name-pod-after.json" &&
@@ -63,12 +63,12 @@ direct_chaos_fault() {
       tries=$((tries+1)); [ "$tries" -lt 60 ] || return 1; sleep 1
     done
   else
-    chaos_k get pods -o json > "$logs/$fault_name-pods-after.json"
-    jq -e --arg old_uid "$pod_uid" 'all(.items[]; .metadata.uid!=$old_uid)' "$logs/$fault_name-pods-after.json" >/dev/null
+    chaos_k get pods -o json > "$logs/$fault_name-pods-after.json" || return $?
+    jq -e --arg old_uid "$pod_uid" 'all(.items[]; .metadata.uid!=$old_uid)' "$logs/$fault_name-pods-after.json" >/dev/null || return $?
   fi
-  chaos_k get "podchaos/$fault_name" -o json > "$logs/$fault_name-before-delete.json"
-  chaos_k delete "podchaos/$fault_name" --wait=true --timeout=45s
-  chaos_k get "podchaos/$fault_name" --ignore-not-found -o json > "$logs/$fault_name-after-delete.json"
-  [ ! -s "$logs/$fault_name-after-delete.json" ]
+  chaos_k get "podchaos/$fault_name" -o json > "$logs/$fault_name-before-delete.json" || return $?
+  chaos_k delete "podchaos/$fault_name" --wait=true --timeout=45s || return $?
+  chaos_k get "podchaos/$fault_name" --ignore-not-found -o json > "$logs/$fault_name-after-delete.json" || return $?
+  [ ! -s "$logs/$fault_name-after-delete.json" ] || return 1
   fault_name=
 }

@@ -24,6 +24,32 @@ func TestIsCommitUnknown(t *testing.T) {
 	}
 }
 
+func TestSlowestRequestFaultCorrelation(t *testing.T) {
+	epoch := time.Now()
+	before, after := epoch.Add(10*time.Millisecond), epoch.Add(11*time.Millisecond)
+	samples := []faultSample{
+		{start: epoch.Add(time.Millisecond), end: epoch.Add(3 * time.Millisecond), measuredEnd: epoch.Add(3 * time.Millisecond)},
+		{start: epoch.Add(9 * time.Millisecond), sent: epoch.Add(9 * time.Millisecond), end: epoch.Add(20 * time.Millisecond), measuredEnd: epoch.Add(21 * time.Millisecond), retries: 2, slot: 42},
+		{start: epoch.Add(30 * time.Millisecond), end: epoch.Add(31 * time.Millisecond), measuredEnd: epoch.Add(31 * time.Millisecond)},
+	}
+	w := faultWindow{}
+	w.summarizeSlowest(epoch, before, after, true, samples)
+	if w.EpochUnixNS != epoch.UnixNano() || w.SlowestStartNS != int64(9*time.Millisecond) || w.SlowestSentNS == nil || *w.SlowestSentNS != int64(9*time.Millisecond) || w.SlowestEndNS != int64(20*time.Millisecond) || w.SlowestMeasuredEndNS != int64(21*time.Millisecond) || !w.SlowestOverlapsSignal || w.SlowestRetries != 2 || w.SlowestSlot != 42 || w.PostSignalMaxMS != 1 || w.PostSignalRequests != 1 {
+		t.Fatalf("unexpected slowest request: %+v", w)
+	}
+	samples = append(samples, faultSample{start: epoch.Add(30 * time.Millisecond), end: epoch.Add(50 * time.Millisecond), measuredEnd: epoch.Add(50 * time.Millisecond)})
+	w = faultWindow{}
+	w.summarizeSlowest(epoch, before, after, true, samples)
+	if w.SlowestOverlapsSignal || w.SlowestSentNS != nil || w.PostSignalMaxMS != 20 || w.PostSignalRequests != 2 {
+		t.Fatalf("unexpected post-fault request: %+v", w)
+	}
+	w = faultWindow{}
+	w.summarizeSlowest(epoch, before, after, true, []faultSample{{start: epoch.Add(time.Millisecond), sent: epoch.Add(2 * time.Millisecond), end: epoch.Add(9 * time.Millisecond), measuredEnd: epoch.Add(20 * time.Millisecond)}})
+	if w.SlowestOverlapsSignal || w.SlowestEndNS != int64(9*time.Millisecond) || w.SlowestMeasuredEndNS != int64(20*time.Millisecond) {
+		t.Fatalf("observer lock delay falsely counted as network overlap: %+v", w)
+	}
+}
+
 func TestDoRequestRetriesCommitUnknownWithSamePayload(t *testing.T) {
 	const payload = `{"request_id":"bench-7","sql":"INSERT INTO benchmark_writes(id) VALUES (7)"}`
 	attempts := 0

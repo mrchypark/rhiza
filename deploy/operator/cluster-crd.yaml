@@ -96,7 +96,15 @@ spec:
                 workload:
                   type: object
                   required: [podTemplate]
+                  x-kubernetes-validations:
+                    - rule: 'has(self.embedded) == has(oldSelf.embedded) && (!has(self.embedded) || self.embedded == oldSelf.embedded)'
+                      message: embedded mode is immutable
+                    - rule: '!has(self.embedded) || !self.embedded || (size(self.podTemplate.spec.containers) == 1 && has(self.podTemplate.spec.containers[0].command) && size(self.podTemplate.spec.containers[0].command) > 0)'
+                      message: embedded mode requires one container and an explicit command
+                    - rule: 'has(self.embedded) && self.embedded || self.podTemplate.spec.containers.all(c, !has(c.command) && !has(c.args))'
+                      message: command and args require embedded mode
                   properties:
+                    embedded: {type: boolean}
                     podTemplate:
                       type: object
                       required: [spec]
@@ -124,6 +132,8 @@ spec:
                                   message: container names must be unique
                                 - rule: 'self.map(c, [c.name, c.image]) == oldSelf.map(c, [c.name, c.image])'
                                   message: workload updates are unsupported
+                                - rule: 'self == oldSelf'
+                                  message: container settings are immutable
                               items:
                                 type: object
                                 required: [name, image]
@@ -140,6 +150,16 @@ spec:
                                       - rule: '!self.startsWith("rhiza-")'
                                         message: rhiza- container names are reserved
                                   image: {type: string, minLength: 1, maxLength: 2048, pattern: '[^\x{0009}-\x{000D}\x{0020}\x{0085}\x{00A0}\x{1680}\x{2000}-\x{200A}\x{2028}\x{2029}\x{202F}\x{205F}\x{3000}]'}
+                                  command: {type: array, minItems: 1, maxItems: 64, items: {type: string, minLength: 1, maxLength: 4096}}
+                                  args: {type: array, maxItems: 64, items: {type: string, maxLength: 4096}}
+                                  resources:
+                                    type: object
+                                    properties:
+                                      requests:
+                                        type: object
+                                        properties:
+                                          cpu: {type: string, minLength: 1, maxLength: 64}
+                                          memory: {type: string, minLength: 1, maxLength: 64}
                                   env: {type: array, items: {type: object, x-kubernetes-preserve-unknown-fields: true}}
                                   envFrom: {type: array, items: {type: object, x-kubernetes-preserve-unknown-fields: true}}
                                   volumeMounts: {type: array, items: {type: object, x-kubernetes-preserve-unknown-fields: true}}

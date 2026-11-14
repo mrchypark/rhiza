@@ -186,7 +186,7 @@ const managedCapturedKubeletObjects = "[{\"apiVersion\":\"v1\",\"kind\":\"Pod\",
 func TestManagedCapturedKubeletObjectsReconcile(t *testing.T) {
 	t.Run("kubectl enriched items", func(t *testing.T) { testManagedCapturedKubeletObjectsReconcile(t, false, "") })
 	t.Run("native list item type omitted", func(t *testing.T) { testManagedCapturedKubeletObjectsReconcile(t, true, "") })
-	for _, fault := range []string{"UID changed", "RV changed", "wrong live type", "partial list type", "live main started"} {
+	for _, fault := range []string{"UID changed", "RV changed", "wrong live type", "partial list type", "live main started", "main resources changed"} {
 		t.Run(fault, func(t *testing.T) { testManagedCapturedKubeletObjectsReconcile(t, true, fault) })
 	}
 }
@@ -229,6 +229,14 @@ func testManagedCapturedKubeletObjectsReconcile(t *testing.T, nativeList bool, f
 	profile := phase9RuntimeProfile()
 	profile.InitImage = spec.Workload.PodTemplate.Spec.Containers[0].Image
 	cluster = managedCapturedClusterForProfile(t, cluster, profile.ApplicationProtocol)
+	if fault == "main resources changed" {
+		var podSpec map[string]any
+		if err := json.Unmarshal(pods[0]["spec"], &podSpec); err != nil {
+			t.Fatal(err)
+		}
+		podSpec["containers"].([]any)[0].(map[string]any)["resources"] = map[string]any{"requests": map[string]string{"cpu": "250m"}}
+		pods[0]["spec"] = mustManagedJSON(podSpec)
+	}
 	puts := 0
 	podGets := 0
 	store := phase2Store(t, func(r *http.Request) (*http.Response, error) {

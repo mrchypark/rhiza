@@ -20,6 +20,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/mrchypark/rhiza/internal/latencydiag"
 	"github.com/mrchypark/rhiza/internal/localtesthooks"
 	"github.com/mrchypark/rhiza/internal/sqlpolicy"
 	"github.com/mrchypark/rhiza/internal/types"
@@ -617,6 +618,9 @@ func (t *Transport) callQuorum(ctx context.Context, to quepaxa.NodeID, request *
 func (t *Transport) callContext(ctx context.Context, to quepaxa.NodeID, request *peerfb.RequestT) (response *peerfb.ResponseT, err error) {
 	started := time.Now()
 	conn, observation, err := t.connectionDiagnostic(ctx, to)
+	if latencydiag.Enabled && request.Record != nil {
+		latencydiag.ObservePeer("peer_connection", request.Record.Slot, string(to), err, started)
+	}
 	defer func() {
 		if err == nil {
 			return
@@ -637,6 +641,13 @@ func (t *Transport) callContext(ctx context.Context, to quepaxa.NodeID, request 
 	}
 	requestStarted := time.Now()
 	response, err = t.callConnection(ctx, conn, request)
+	if latencydiag.Enabled && request.Record != nil {
+		phaseErr := err
+		if response != nil && response.ErrorCode != 0 {
+			phaseErr = errPeerRejected
+		}
+		latencydiag.ObservePeer("peer_rpc", request.Record.Slot, string(to), phaseErr, requestStarted)
+	}
 	observation.RequestElapsed, observation.RequestKnown = time.Since(requestStarted), true
 	if err != nil && response == nil && ctx.Err() == nil {
 		t.invalidate(to, conn)
@@ -895,6 +906,10 @@ func (t *Transport) FetchFrozenTargetDecisions(ctx context.Context, source quepa
 }
 
 func (t *Transport) SendRecord(ctx context.Context, to quepaxa.NodeID, request quepaxa.RecordRequest) (quepaxa.Summary, error) {
+	if latencydiag.Enabled {
+		diagnosticStart := latencydiag.Start()
+		defer latencydiag.Observe("peer_record", uint64(request.Slot), diagnosticStart)
+	}
 	peer, closePeer, err := t.transportForSlotLease(request.Slot)
 	if err != nil {
 		return quepaxa.Summary{}, err

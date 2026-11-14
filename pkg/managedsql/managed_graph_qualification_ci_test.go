@@ -297,7 +297,7 @@ func TestManagedGraphActualUnknownRetainsNativeOriginal(t *testing.T) {
 	// A real new mutation is the positive control for the same installed
 	// observer. A disconnected/no-op observer must not certify a zero window.
 	if _, err := reopened.GraphExecute(ctx, types.GraphCommand{RequestID: "observer-positive", Cypher: "CREATE (:ObserverCI {n:1})"}); err != nil {
-		t.Fatal("proposal observer positive control failed", err)
+		t.Fatalf("proposal observer positive control failed: %v; caught_up=%t local_read=%v", err, reopened.node.StartupCaughtUp(), reopened.node.CheckManagedLocalRead(ctx))
 	}
 	if recoveryAttempts.Load() == 0 {
 		t.Fatal("proposal observer never saw an actual new Graph proposal")

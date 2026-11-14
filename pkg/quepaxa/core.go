@@ -12,6 +12,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/mrchypark/rhiza/internal/latencydiag"
 	"github.com/mrchypark/rhiza/internal/localtesthooks"
 	"github.com/mrchypark/rhiza/pkg/qlog"
 )
@@ -262,6 +263,53 @@ func (c *Core) CanParticipateReadIndex() bool {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
 	return c.reconfiguration == nil
+}
+
+// ReadIndexParticipationReason reports a non-sensitive diagnostic snapshot.
+func (c *Core) ReadIndexParticipationReason() string {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	if c.observer {
+		return "observer"
+	}
+	if c.reconfiguration != nil {
+		return "frozen"
+	}
+	cluster := c.clusterForSlotLocked(c.tip + 1)
+	if c.voterForClusterLocked(cluster) {
+		return "ready"
+	}
+	if _, pending := c.retainedTerminalPendingLocked(cluster); pending {
+		return "terminal_not_durable"
+	}
+	for _, member := range cluster.Members {
+		if member.ID == c.nodeID {
+			return "wal_identity_mismatch"
+		}
+	}
+	return "not_in_configuration"
+}
+
+// PrepareReadIndexParticipation persists an exact retained membership terminal
+// before a peer read. It never promotes an unrelated or frozen member.
+func (c *Core) PrepareReadIndexParticipation(ctx context.Context) error {
+	if c.CanParticipateReadIndex() {
+		return nil
+	}
+	c.mu.RLock()
+	cluster := c.clusterForSlotLocked(c.tip + 1)
+	terminal, pending := c.retainedTerminalPendingLocked(cluster)
+	c.mu.RUnlock()
+	if !pending {
+		return ErrQuorumUnavailable
+	}
+	if err := c.EnsureDurableThrough(ctx, terminal); err != nil {
+		return err
+	}
+	if !c.CanParticipateReadIndex() {
+		return ErrQuorumUnavailable
+	}
+	return nil
 }
 
 // PendingReconfiguration returns the frozen target while its old-configuration
@@ -1393,6 +1441,10 @@ func (c *Core) releaseSlot(slot Slot) {
 }
 
 func (c *Core) runSlot(ctx context.Context, slot Slot, value []byte, allowLeaderFastPath bool) (Decision, error) {
+	if latencydiag.Enabled {
+		diagnosticStart := latencydiag.Start()
+		defer latencydiag.Observe("consensus_slot", uint64(slot), diagnosticStart)
+	}
 	leaderOrder, err := c.LeaderOrder(slot)
 	if err != nil {
 		return Decision{}, err
@@ -1571,6 +1623,10 @@ func maxPrior(summaries []Summary) *Proposal {
 }
 
 func (c *Core) recordQuorum(ctx context.Context, requests map[NodeID]RecordRequest) ([]Summary, error) {
+	if latencydiag.Enabled {
+		diagnosticStart := latencydiag.Start()
+		defer latencydiag.Observe("record_quorum", uint64(nextRequestSlot(requests)), diagnosticStart)
+	}
 	if c.localMode {
 		if len(requests) != 1 {
 			return nil, ErrQuorumUnavailable
@@ -1659,6 +1715,9 @@ func (c *Core) Record(ctx context.Context, request RecordRequest) (Summary, erro
 // localExecutionOwner; the slot lock then makes validation, staging, and the
 // receipt append one indivisible Local mutation.
 func (c *Core) recordLocalOwned(ctx context.Context, request RecordRequest) (Summary, error) {
+	if latencydiag.Enabled {
+		ctx = latencydiag.WithSlot(ctx, uint64(request.Slot))
+	}
 	if !c.localMode || c.observer || c.reconfigEnabled {
 		return Summary{}, ErrQuorumUnavailable
 	}
@@ -1783,6 +1842,9 @@ func (c *Core) recordLocalOwned(ctx context.Context, request RecordRequest) (Sum
 }
 
 func (c *Core) record(ctx context.Context, request RecordRequest) (Summary, error) {
+	if latencydiag.Enabled {
+		ctx = latencydiag.WithSlot(ctx, uint64(request.Slot))
+	}
 	if c.observer {
 		return Summary{}, ErrQuorumUnavailable
 	}
