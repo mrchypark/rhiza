@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"net"
 	"os"
+	"path"
 	"reflect"
 	"sort"
 	"strings"
@@ -405,6 +406,14 @@ func TestNodeForegroundAPICostS3(t *testing.T) {
 	logNodeStoreDelta(t, "warmup", ids, warmStoreStart, warmStoreEnd)
 	warmEndRequests, warmEndErr := nodeVersityRequestCount(gateway)
 	logVersityRequestDelta(t, "warmup", warmStartRequests, warmStartErr, warmEndRequests, warmEndErr)
+	var publicationBefore nodeForegroundPublicationBoundary
+	if os.Getenv("RHIZA_AB_PUBLICATION_EVIDENCE") == "1" {
+		if scenario != "baseline" {
+			t.Fatal("publication boundary evidence requires baseline scenario")
+		}
+		transportObserver.SetPhase("publication_boundary_before")
+		publicationBefore = nodeForegroundReadPublicationBoundary(t, ctx, nodes, prefix, clusterID, 0)
+	}
 	metrics := &nodeForegroundCostMetrics{}
 	measureStoreStart := snapshotNodeStoreStats(nodes)
 	measureStartRequests, measureStartErr := nodeVersityRequestCount(gateway)
@@ -539,7 +548,84 @@ func TestNodeForegroundAPICostS3(t *testing.T) {
 	logNodeStoreDelta(t, "measurement", ids, measureStoreStart, measureStoreEnd)
 	measureEndRequests, measureEndErr := nodeVersityRequestCount(gateway)
 	logVersityRequestDelta(t, "measurement", measureStartRequests, measureStartErr, measureEndRequests, measureEndErr)
+	if os.Getenv("RHIZA_AB_PUBLICATION_EVIDENCE") == "1" {
+		transportObserver.SetPhase("publication_boundary_after")
+		after := nodeForegroundReadPublicationBoundary(t, ctx, nodes, prefix, clusterID, publicationBefore.archiveTip+1)
+		if after.archiveTip < publicationBefore.archiveTip {
+			t.Fatal("archive tip regressed between publication boundary snapshots")
+		}
+		t.Logf("node_foreground_publication_boundary alignment=before_window_to_after_drain_not_exact_cutoff before_started=%s before_finished=%s after_started=%s after_finished=%s before_archive_tip=%d after_archive_tip=%d before_decided_tip_min=%d before_decided_tip_max=%d after_decided_tip_min=%d after_decided_tip_max=%d published_records=%d published_value_bytes=%d sampled_lag_slots_min=%d sampled_lag_slots_max=%d acked_write_backlog=unknown", publicationBefore.started.Format(time.RFC3339Nano), publicationBefore.finished.Format(time.RFC3339Nano), after.started.Format(time.RFC3339Nano), after.finished.Format(time.RFC3339Nano), publicationBefore.archiveTip, after.archiveTip, publicationBefore.coreMin, publicationBefore.coreMax, after.coreMin, after.coreMax, after.records, after.valueBytes, after.lagLower, after.lagUpper)
+	}
 	t.Logf("versity_fixture_version=%q versity_binary_sha256=%s endpoint_scope=local-loopback; phase server request counts come from the gateway access log", gateway.Version, gateway.BinarySHA256)
+}
+
+type nodeForegroundPublicationBoundary struct {
+	started, finished                       time.Time
+	archiveTip, coreMin, coreMax            quepaxa.Slot
+	records, valueBytes, lagLower, lagUpper uint64
+}
+
+// This is a separate read-only archive manager; it never publishes or changes a node's archive state.
+func nodeForegroundReadPublicationBoundary(t *testing.T, ctx context.Context, nodes []*Node, prefix, clusterID string, from quepaxa.Slot) nodeForegroundPublicationBoundary {
+	t.Helper()
+	s := nodeForegroundPublicationBoundary{started: time.Now().UTC()}
+	m := recovery.NewManager(nodes[0].bucket, path.Join(prefix, clusterID), 1)
+	defer m.Close()
+	if err := m.Load(ctx); err != nil {
+		t.Fatalf("publication boundary archive verification: %v", err)
+	}
+	s.archiveTip = m.Tip()
+	for i, n := range nodes {
+		tip := n.core.Tip()
+		if i == 0 || tip < s.coreMin {
+			s.coreMin = tip
+		}
+		if tip > s.coreMax {
+			s.coreMax = tip
+		}
+	}
+	s.lagLower = nodeForegroundSampledLag(s.coreMin, s.archiveTip)
+	s.lagUpper = nodeForegroundSampledLag(s.coreMax, s.archiveTip)
+	for from > 0 && from <= s.archiveTip {
+		rows, _, err := m.DecisionsFrom(ctx, from, 256)
+		if err != nil {
+			t.Fatalf("publication boundary decisions at %d: %v", from, err)
+		}
+		if len(rows) == 0 {
+			t.Fatalf("publication boundary missing decisions at %d", from)
+		}
+		for _, row := range rows {
+			if row.Slot > s.archiveTip {
+				break
+			}
+			if row.Slot != from {
+				t.Fatalf("publication boundary noncontiguous decisions: got %d want %d", row.Slot, from)
+			}
+			s.records++
+			s.valueBytes += uint64(len(row.Value))
+			from++
+		}
+	}
+	s.finished = time.Now().UTC()
+	return s
+}
+
+func nodeForegroundSampledLag(coreTip, archiveTip quepaxa.Slot) uint64 {
+	if coreTip <= archiveTip {
+		return 0
+	}
+	return uint64(coreTip - archiveTip)
+}
+
+func TestNodeForegroundSampledLag(t *testing.T) {
+	for _, tt := range []struct {
+		core, archive quepaxa.Slot
+		want          uint64
+	}{{9, 4, 5}, {4, 4, 0}, {3, 4, 0}} {
+		if got := nodeForegroundSampledLag(tt.core, tt.archive); got != tt.want {
+			t.Fatalf("core=%d archive=%d got=%d want=%d", tt.core, tt.archive, got, tt.want)
+		}
+	}
 }
 
 func TestNodeForegroundPreparationUsesFreshCanceledContexts(t *testing.T) {
