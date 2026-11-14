@@ -528,12 +528,23 @@ func (s *PeerServer) handle(ctx context.Context, certificateKey ed25519.PublicKe
 			accept = s.server.core.AcceptDecisionHint
 		}
 		err = accept(decision)
-		if errors.Is(err, quepaxa.ErrLeaderScheduleUnavailable) && !control && decision.Slot > 1 && s.server.core.Tip() < decision.Slot-1 && s.server.transport != nil {
+		if errors.Is(err, quepaxa.ErrLeaderScheduleUnavailable) && localtesthooks.Enabled {
+			localtesthooks.Hit(fmt.Sprintf("network:learned:phase=missing-schedule:node=%s:slot=%d", s.server.core.NodeID(), decision.Slot))
+		}
+		if errors.Is(err, quepaxa.ErrLeaderScheduleUnavailable) && !control && decision.Slot > 1 {
 			// A missing certified schedule is not permission to accept the
 			// proposal. Import only independently certified history, then
 			// repeat the full original decision validation.
-			if catchupErr, _ := s.server.catchUpLearnedPrefix(ctx, quepaxa.NodeID(request.SenderId), decision.Slot-1); catchupErr != nil {
-				return nil, catchupErr
+			if err := ctx.Err(); err != nil {
+				return nil, err
+			}
+			if s.server.core.Tip() < decision.Slot-1 {
+				if s.server.transport == nil {
+					return nil, err
+				}
+				if catchupErr, _ := s.server.catchUpLearnedPrefix(ctx, quepaxa.NodeID(request.SenderId), decision.Slot-1); catchupErr != nil {
+					return nil, catchupErr
+				}
 			}
 			if err := ctx.Err(); err != nil {
 				return nil, err

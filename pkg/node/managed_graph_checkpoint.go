@@ -282,52 +282,69 @@ func (n *Node) waitManagedAppendOnlyControl(ctx context.Context, binding *intern
 	return err
 }
 
+var errManagedBarrierTooShort = errors.New("certified managed barrier does not cover observed target")
+
 // A zero slot means no owned barrier was needed, not certificate evidence.
 func (n *Node) waitManagedAppendOnlyControlProof(ctx context.Context, binding *internalApplicationBinding) (quepaxa.Slot, error) {
 	if binding == nil || binding.core == nil || binding.core != n.core || n.server == nil || n.managedStartup == nil || !isManagedAppendOnlyProtocol(n.managedApplicationProtocol()) {
 		return 0, logManagedControlWaitFailure("binding", fmt.Errorf("managed append-only admission binding unavailable"))
 	}
-	if err := ctx.Err(); err != nil {
-		return 0, err
-	}
-	if binding.lifetime.Err() != nil || n.internalApplication.Load() != binding || !n.core.CanParticipateReadIndex() {
-		return 0, network.ErrNotReady
-	}
-	progress := n.core.RuntimeProgressSnapshot()
-	target := quepaxa.Slot(0)
-	if progress.RecorderTip > progress.CertifiedTip {
-		target = progress.RecorderTip
-	}
-	n.managedGraphControlMu.Lock()
-	if op := n.managedGraphControl; op != nil {
-		select {
-		case <-op.done:
-			n.managedGraphControl = nil
-		default:
-			if op.binding != binding || !managedGraphControlOwnBarrierMatches(op, op.hash) {
-				n.managedGraphControlMu.Unlock()
-				return 0, logManagedControlWaitFailure("binding", network.ErrNotReady)
-			}
-			n.managedGraphControlMu.Unlock()
-			return n.waitManagedAppendOnlyBarrierProof(ctx, target, op, op.done)
+	var required quepaxa.Slot
+	for {
+		if err := ctx.Err(); err != nil {
+			return 0, err
 		}
-	}
-	if target == 0 {
+		if binding.lifetime.Err() != nil || n.internalApplication.Load() != binding || !n.core.CanParticipateReadIndex() {
+			return 0, network.ErrNotReady
+		}
+		progress := n.core.RuntimeProgressSnapshot()
+		target := required
+		if required == 0 && progress.RecorderTip > progress.CertifiedTip {
+			target = progress.RecorderTip
+		}
+		n.managedGraphControlMu.Lock()
+		if op := n.managedGraphControl; op != nil {
+			select {
+			case <-op.done:
+				n.managedGraphControl = nil
+			default:
+				if op.binding != binding || !managedGraphControlOwnBarrierMatches(op, op.hash) {
+					n.managedGraphControlMu.Unlock()
+					return 0, logManagedControlWaitFailure("binding", network.ErrNotReady)
+				}
+				n.managedGraphControlMu.Unlock()
+				slot, err := n.waitManagedAppendOnlyBarrierProof(ctx, target, op, op.done)
+				if errors.Is(err, errManagedBarrierTooShort) {
+					required = target
+					localtesthooks.Hit("node:managed-control:short-before-retry")
+					continue
+				}
+				return slot, err
+			}
+		}
+		if target == 0 {
+			n.managedGraphControlMu.Unlock()
+			return 0, nil
+		}
+		var nonce [types.ReadBarrierNonceSize]byte
+		if _, err := rand.Read(nonce[:]); err != nil {
+			n.managedGraphControlMu.Unlock()
+			return 0, err
+		}
+		value := types.EncodeReadBarrier(nonce)
+		op := &managedGraphControlOperation{value: value, hash: sha256.Sum256(value), binding: binding, done: make(chan struct{})}
+		n.managedGraphControl = op
+		n.wg.Add(1) // Shutdown drains the caller binding borrower before Wait.
 		n.managedGraphControlMu.Unlock()
-		return 0, nil
+		go n.runManagedAppendOnlyBarrier(ctx, binding, op)
+		slot, err := n.waitManagedAppendOnlyBarrierProof(ctx, target, op, op.done)
+		if errors.Is(err, errManagedBarrierTooShort) {
+			required = target
+			localtesthooks.Hit("node:managed-control:short-before-retry")
+			continue
+		}
+		return slot, err
 	}
-	var nonce [types.ReadBarrierNonceSize]byte
-	if _, err := rand.Read(nonce[:]); err != nil {
-		n.managedGraphControlMu.Unlock()
-		return 0, err
-	}
-	value := types.EncodeReadBarrier(nonce)
-	op := &managedGraphControlOperation{value: value, hash: sha256.Sum256(value), binding: binding, done: make(chan struct{})}
-	n.managedGraphControl = op
-	n.wg.Add(1) // Shutdown drains the caller binding borrower before Wait.
-	n.managedGraphControlMu.Unlock()
-	go n.runManagedAppendOnlyBarrier(ctx, binding, op)
-	return n.waitManagedAppendOnlyBarrierProof(ctx, target, op, op.done)
 }
 
 func managedGraphControlOwnBarrierMatches(op *managedGraphControlOperation, hash quepaxa.ValueHash) bool {
@@ -434,12 +451,18 @@ func (n *Node) waitManagedAppendOnlyBarrierProof(ctx context.Context, target que
 	if op.binding == nil || op.binding != n.internalApplication.Load() || op.binding.core != n.core || op.binding.lifetime.Err() != nil {
 		return 0, network.ErrNotReady
 	}
-	if op.slot == 0 || op.slot < target {
+	if op.slot == 0 {
+		log.Printf("MANAGED_CONTROL_PROOF_REFUSED reason=zero_slot target=%d barrier_slot=0", target)
 		return 0, logManagedControlWaitFailure("waiter_slot", n.refuseManagedGraphAdmissionAtReason("observed_control_barrier_failed_or_short", target, n.core.RuntimeProgressSnapshot()))
 	}
 	decision, ok := n.core.CertifiedValue(op.slot)
 	if !ok || !managedGraphControlCertificateMatches(n.core, op, decision) {
+		log.Printf("MANAGED_CONTROL_PROOF_REFUSED reason=certificate_mismatch target=%d barrier_slot=%d certificate_present=%t", target, op.slot, ok)
 		return 0, logManagedControlWaitFailure("waiter_slot", n.refuseManagedGraphAdmissionAtReason("observed_control_certificate_mismatch", target, n.core.RuntimeProgressSnapshot()))
+	}
+	if op.slot < target {
+		log.Printf("MANAGED_CONTROL_PROOF_REFUSED reason=short_barrier target=%d barrier_slot=%d certificate_present=true", target, op.slot)
+		return 0, errors.Join(errManagedBarrierTooShort, n.refuseManagedGraphAdmissionAtReason("observed_control_barrier_failed_or_short", target, n.core.RuntimeProgressSnapshot()))
 	}
 	return op.slot, nil
 }

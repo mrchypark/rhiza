@@ -17,6 +17,17 @@ import (
 	"github.com/mrchypark/rhiza/pkg/quepaxa"
 )
 
+type catchupEnteredContext struct {
+	context.Context
+	entered chan struct{}
+	once    sync.Once
+}
+
+func (c *catchupEnteredContext) Done() <-chan struct{} {
+	c.once.Do(func() { close(c.entered) })
+	return c.Context.Done()
+}
+
 func TestLearnedPrefixRealControlAndLeaderScheduleSamePage(t *testing.T) {
 	cluster := newForegroundAPIPeers(t, t.TempDir(), true)
 	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
@@ -138,12 +149,30 @@ func TestLearnedPrefixRealControlAndLeaderScheduleSamePage(t *testing.T) {
 			if (mode != "sync-failure" && (core.Tip() < 5 || core.Tip() >= 120)) || (mode == "sync-failure" && core.Tip() != 120) {
 				t.Fatalf("not a partial page: tip=%d", core.Tip())
 			}
-			go func() { err, fatal := server.catchUpLearnedPrefix(ctx, "n1", 120); competitor <- outcome{err, fatal} }()
+			competitorCtx := &catchupEnteredContext{Context: ctx, entered: make(chan struct{})}
+			go func() {
+				err, fatal := server.catchUpLearnedPrefix(competitorCtx, "n1", 120)
+				competitor <- outcome{err, fatal}
+			}()
 			if mode != "sync-failure" {
+				select {
+				case <-competitorCtx.entered:
+				case <-ctx.Done():
+					t.Fatal("competing recovery did not enter")
+				}
 				select {
 				case v := <-competitor:
 					t.Fatalf("competing recovery completed before owned page: %+v", v)
 				default:
+				}
+			} else {
+				// Tip is already at the target: observing the result proves this
+				// competitor entered before the owner is released.
+				select {
+				case got := <-competitor:
+					competitor <- got
+				case <-ctx.Done():
+					t.Fatal("competing recovery did not return")
 				}
 			}
 			if mode == "cancel" {

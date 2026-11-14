@@ -338,6 +338,12 @@ jobs:
         run: |
           go test -tags rhiza_local_testhooks ./pkg/managedsql -run '^TestManagedExplicitLeave' -count=1 -timeout=60s
           go test -race -tags rhiza_local_testhooks ./pkg/managedsql -run '^TestManagedExplicitLeave' -count=1 -timeout=60s
+      - name: Managed shared barrier regressions
+        env:
+          CGO_ENABLED: 1
+        run: |
+          go test -tags rhiza_local_testhooks ./pkg/node -run '^(TestManagedKVSharedShortBarrierAndCancellation|TestManagedSharedBarrier(KeepsFirstShortTarget|TerminalAndMissingCertificateNeverSpawnSuccessor|RetirementDrainsBeforeReplacement|MismatchedCertificateNeverRetries|ShorterThanLiveRecorderGetsFreshProof))$' -count=1 -timeout=2m
+          go test -race -tags rhiza_local_testhooks ./pkg/node -run '^(TestManagedKVSharedShortBarrierAndCancellation|TestManagedSharedBarrier(KeepsFirstShortTarget|TerminalAndMissingCertificateNeverSpawnSuccessor|RetirementDrainsBeforeReplacement|MismatchedCertificateNeverRetries|ShorterThanLiveRecorderGetsFreshProof))$' -count=1 -timeout=2m
       - name: Managed checkpoint durability and retained reopen
         env:
           CGO_ENABLED: 1

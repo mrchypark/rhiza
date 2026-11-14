@@ -54,7 +54,7 @@ func TestLearnedRepairsMissingSchedule96To114(t *testing.T) {
 	if len(order) == 0 || actual.Proposal.ProposerID != order[0] {
 		t.Fatal("source decision does not match certified leader schedule")
 	}
-	for _, mode := range []string{"valid", "wrong-proposer", "invalid-certificate", "competing-sync-failure"} {
+	for _, mode := range []string{"valid", "wrong-proposer", "invalid-certificate", "missing-transport", "competing-sync-failure", "competing-valid", "competing-invalid", "competing-cancel"} {
 		t.Run(mode, func(t *testing.T) {
 			wal, err := qlog.Open(t.TempDir())
 			if err != nil {
@@ -83,7 +83,7 @@ func TestLearnedRepairsMissingSchedule96To114(t *testing.T) {
 			}
 			decision := actual
 			decision.Summaries = append([]quepaxa.Summary(nil), actual.Summaries...)
-			if mode == "wrong-proposer" {
+			if mode == "wrong-proposer" || mode == "competing-invalid" {
 				for _, member := range cluster.config.Members {
 					if member.ID != order[0] {
 						decision.Proposal.ProposerID = member.ID
@@ -101,6 +101,70 @@ func TestLearnedRepairsMissingSchedule96To114(t *testing.T) {
 				t.Fatal("bad certificate misclassified as missing schedule")
 			} else if mode != "invalid-certificate" && !errors.Is(err, quepaxa.ErrLeaderScheduleUnavailable) {
 				t.Fatalf("expected unavailable schedule before repair: %v", err)
+			}
+			if strings.HasPrefix(mode, "competing-") && mode != "competing-sync-failure" {
+				entered := make(chan struct{}, 1)
+				release := make(chan struct{})
+				var once sync.Once
+				defer once.Do(func() { close(release) })
+				restore := localtesthooks.Set(func(event string) {
+					if event == "network:learned:phase=missing-schedule:node=n2:slot=114" {
+						select {
+						case entered <- struct{}{}:
+						default:
+						}
+						<-release
+					}
+				})
+				defer restore()
+				work, stop := context.WithCancel(ctx)
+				defer stop()
+				request := cluster.transports[0].request(peerfb.OperationLearned)
+				request.Decision = decisionToWire(decision)
+				peer := &PeerServer{server: server}
+				response := make(chan error, 1)
+				go func() { _, err := peer.handle(work, cluster.config.Members[0].PublicKey[:], request); response <- err }()
+				select {
+				case <-entered:
+				case <-ctx.Done():
+					t.Fatal("handler did not encounter missing schedule")
+				}
+				if err, fatal := server.catchUpLearnedPrefix(ctx, "n1", 113); err != nil || fatal {
+					t.Fatalf("competing prefix failed: %v fatal=%t", err, fatal)
+				}
+				if core.Tip() != 113 {
+					t.Fatalf("competing prefix tip=%d", core.Tip())
+				}
+				if err := core.EnsureDurableThrough(ctx, 113); err != nil {
+					t.Fatalf("prefix not durable: %v", err)
+				}
+				if mode == "competing-valid" {
+					server.transport = nil // A completed competing prefix needs no transport.
+				}
+				if mode == "competing-cancel" {
+					stop()
+				}
+				once.Do(func() { close(release) })
+				select {
+				case err := <-response:
+					switch mode {
+					case "competing-valid":
+						if err != nil || mat.Tip() != 114 {
+							t.Fatalf("valid decision: %v applied=%d", err, mat.Tip())
+						}
+					case "competing-invalid":
+						if err == nil || !strings.Contains(err.Error(), "invalid QuePaxa fast-path decision") || core.IsDecided(114) {
+							t.Fatalf("wrong proposer: %v", err)
+						}
+					case "competing-cancel":
+						if !errors.Is(err, context.Canceled) || core.IsDecided(114) {
+							t.Fatalf("canceled decision: %v", err)
+						}
+					}
+				case <-ctx.Done():
+					t.Fatal("handler did not return")
+				}
+				return
 			}
 			if mode == "competing-sync-failure" {
 				entered, handlerStarted := make(chan struct{}, 1), make(chan struct{}, 1)
@@ -180,6 +244,9 @@ func TestLearnedRepairsMissingSchedule96To114(t *testing.T) {
 			request := cluster.transports[0].request(peerfb.OperationLearned)
 			request.Decision = decisionToWire(decision)
 			peer := &PeerServer{server: server}
+			if mode == "missing-transport" {
+				server.transport = nil
+			}
 			_, err = peer.handle(ctx, cluster.config.Members[0].PublicKey[:], request)
 			if mode == "valid" {
 				if err != nil {
@@ -200,6 +267,14 @@ func TestLearnedRepairsMissingSchedule96To114(t *testing.T) {
 				}
 				if mode == "invalid-certificate" && fetches.Load() != 0 {
 					t.Fatal("invalid certificate triggered prefix fetch")
+				}
+				if mode == "missing-transport" && (!errors.Is(err, quepaxa.ErrLeaderScheduleUnavailable) || core.Tip() != 96) {
+					t.Fatalf("missing transport did not refuse unfilled prefix: tip=%d err=%v", core.Tip(), err)
+				}
+				if mode == "wrong-proposer" {
+					if fetches.Load() == 0 || core.Tip() != 113 || !strings.Contains(err.Error(), "invalid QuePaxa fast-path decision") {
+						t.Fatalf("wrong proposer not rejected after prefix repair: fetches=%d tip=%d err=%v", fetches.Load(), core.Tip(), err)
+					}
 				}
 			}
 		})
