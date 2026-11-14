@@ -1959,7 +1959,7 @@ func (c *Core) record(ctx context.Context, request RecordRequest) (Summary, erro
 		}
 		if isCheckpoint {
 			candidate := ManagedCheckpointCandidate{Value: bytes.Clone(value), Hash: request.Proposal.Hash, Seal: seal, DecisionSlot: request.Slot, ConfigID: request.ConfigID}
-			if err := c.ValidateManagedCheckpointCandidate(ctx, candidate); err != nil {
+			if err := c.validateManagedCheckpointCandidate(ctx, &candidate); err != nil {
 				return Summary{}, err
 			}
 			managedCandidate = &candidate
@@ -2865,6 +2865,9 @@ func (c *Core) ensureDurableLocked(slot Slot) error {
 		c.markDecisionLoggedLocked(index)
 	}
 	c.mu.Unlock()
+	if localtesthooks.Enabled {
+		localtesthooks.Hit(fmt.Sprintf("core:ensure-durable:before-sync:node=%s:slot=%d", c.NodeID(), slot))
+	}
 	if err := c.commits.Sync(context.Background()); err != nil {
 		return err
 	}

@@ -35,11 +35,68 @@ type ManagedAppendOnlyBinding struct {
 // ManagedCheckpointCandidate carries the exact original QCKP and the slot at
 // which this Core is being asked to record it. Value is never re-encoded.
 type ManagedCheckpointCandidate struct {
-	Value        []byte
-	Hash         ValueHash
-	Seal         CheckpointSeal
-	DecisionSlot Slot
-	ConfigID     uint
+	Value              []byte
+	Hash               ValueHash
+	Seal               CheckpointSeal
+	DecisionSlot       Slot
+	ConfigID           uint
+	verifiedMembership *managedMembershipSnapshot
+}
+
+type managedMembershipSnapshot struct {
+	available         bool
+	history           MembershipRecord
+	floor, tip        Slot
+	membershipVersion uint64
+	unavailableReason string
+}
+
+// verifyManagedMembershipSnapshot validates both proof chains without holding
+// Core.mu, then retains the exact local proof for the locked drift check.
+func (c *Core) verifyManagedMembershipSnapshot(ctx context.Context, candidate *ManagedCheckpointCandidate) error {
+	if !c.reconfigEnabled {
+		return nil
+	}
+	if candidate.Seal.Membership == nil {
+		return fmt.Errorf("managed checkpoint lacks historical membership proof")
+	}
+	if _, err := c.checkpointMembershipForSeal(candidate.Seal); err != nil {
+		return err
+	}
+	c.mu.RLock()
+	local, localErr := c.checkpointMembershipAtLocked(candidate.Seal.Index)
+	initial := cloneCluster(*c.config)
+	floor, tip, membershipVersion := c.floor, c.tip, c.membershipVersion
+	cutRetained := floor <= candidate.Seal.Index && tip >= candidate.Seal.Index
+	c.mu.RUnlock()
+	if localErr != nil && cutRetained {
+		return fmt.Errorf("local checkpoint membership at retained cut is invalid: %w", localErr)
+	}
+	snapshot := &managedMembershipSnapshot{available: localErr == nil, floor: floor, tip: tip, membershipVersion: membershipVersion}
+	if localErr == nil {
+		snapshot.history = cloneMembershipRecord(local)
+		equal, err := EquivalentVerifiedMembershipHistories(ctx, initial, local, *candidate.Seal.Membership)
+		if err != nil {
+			return err
+		}
+		if !equal {
+			return fmt.Errorf("managed checkpoint membership differs from available local history")
+		}
+	} else {
+		snapshot.unavailableReason = localErr.Error()
+	}
+	candidate.verifiedMembership = snapshot
+	return nil
+}
+
+func managedMembershipSnapshotMatches(snapshot *managedMembershipSnapshot, local MembershipRecord, err error, floor, tip, cut Slot, membershipVersion uint64) bool {
+	if snapshot == nil {
+		return false
+	}
+	if !snapshot.available {
+		return err != nil && err.Error() == snapshot.unavailableReason && floor == snapshot.floor && tip == snapshot.tip && membershipVersion == snapshot.membershipVersion && !(floor <= cut && tip >= cut)
+	}
+	return err == nil && sameMembershipRecord(snapshot.history, local)
 }
 
 // ManagedCheckpointCandidateVerifier is fixed trusted startup code. A nil
@@ -131,6 +188,9 @@ func (c *Core) ValidateManagedCheckpointRoot(ctx context.Context, candidate Mana
 		return fmt.Errorf("managed checkpoint root identity is invalid")
 	}
 	candidate.Seal = cloneManagedCheckpointSeal(seal)
+	if err := c.verifyManagedMembershipSnapshot(ctx, &candidate); err != nil {
+		return err
+	}
 	if err := c.validateManagedCheckpointRootLocal(candidate); err != nil {
 		return err
 	}
@@ -195,7 +255,7 @@ func (c *Core) validateManagedCheckpointRootLocal(candidate ManagedCheckpointCan
 		if seal.Membership == nil {
 			return fmt.Errorf("managed checkpoint lacks historical membership proof")
 		}
-		if localMembership, err := c.checkpointMembershipAtLocked(seal.Index); err == nil && !sameMembershipRecord(localMembership, *seal.Membership) {
+		if localMembership, err := c.checkpointMembershipAtLocked(seal.Index); !managedMembershipSnapshotMatches(candidate.verifiedMembership, localMembership, err, c.floor, c.tip, seal.Index, c.membershipVersion) {
 			return fmt.Errorf("managed checkpoint membership differs from available local history")
 		}
 		if seal.ConfigID != c.clusterForSlotLocked(seal.Index+1).ConfigID {
@@ -224,6 +284,11 @@ func validateManagedDigest(name, value string) error {
 // ValidateManagedCheckpointCandidate verifies a checkpoint without preparing
 // or persisting it. The trusted verifier is called without Core locks held.
 func (c *Core) ValidateManagedCheckpointCandidate(ctx context.Context, candidate ManagedCheckpointCandidate) error {
+	return c.validateManagedCheckpointCandidate(ctx, &candidate)
+}
+
+func (c *Core) validateManagedCheckpointCandidate(ctx context.Context, candidatePtr *ManagedCheckpointCandidate) error {
+	candidate := *candidatePtr
 	if c.managedAppendOnly == nil || c.managedAppendOnly.Verify == nil {
 		return ErrManagedAppendOnlyUnavailable
 	}
@@ -247,6 +312,9 @@ func (c *Core) ValidateManagedCheckpointCandidate(ctx context.Context, candidate
 	if candidate.DecisionSlot <= seal.Index || candidate.ConfigID == 0 {
 		return fmt.Errorf("managed checkpoint candidate decision slot or config is invalid")
 	}
+	if err := c.verifyManagedMembershipSnapshot(ctx, &candidate); err != nil {
+		return err
+	}
 	if err := c.validateManagedCandidateLocal(candidate); err != nil {
 		return err
 	}
@@ -262,7 +330,11 @@ func (c *Core) ValidateManagedCheckpointCandidate(ctx context.Context, candidate
 	if err := ctx.Err(); err != nil {
 		return err
 	}
-	return c.validateManagedCandidateLocal(candidate)
+	if err := c.validateManagedCandidateLocal(candidate); err != nil {
+		return err
+	}
+	*candidatePtr = candidate
+	return nil
 }
 
 func cloneManagedCheckpointSeal(seal CheckpointSeal) CheckpointSeal {
@@ -311,12 +383,14 @@ func (c *Core) validateManagedCandidateLocalLocked(candidate ManagedCheckpointCa
 			return fmt.Errorf("managed checkpoint lacks historical membership proof")
 		}
 		if localMembership, err := c.checkpointMembershipAtLocked(seal.Index); err == nil {
-			if !sameMembershipRecord(localMembership, *seal.Membership) {
+			if !managedMembershipSnapshotMatches(candidate.verifiedMembership, localMembership, err, c.floor, c.tip, seal.Index, c.membershipVersion) {
 				return fmt.Errorf("managed checkpoint membership differs from available local history")
 			}
 			if seal.ConfigID != c.clusterForSlotLocked(seal.Index+1).ConfigID {
 				return fmt.Errorf("managed checkpoint cut config differs from available local history")
 			}
+		} else if !managedMembershipSnapshotMatches(candidate.verifiedMembership, MembershipRecord{}, err, c.floor, c.tip, seal.Index, c.membershipVersion) {
+			return fmt.Errorf("managed checkpoint membership changed during verification")
 		}
 		if c.reconfiguration != nil {
 			return fmt.Errorf("managed checkpoint decision is outside stable membership")

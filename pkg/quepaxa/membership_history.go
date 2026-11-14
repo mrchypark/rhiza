@@ -160,7 +160,27 @@ func (c *Core) checkpointMembershipAtLocked(through Slot) (MembershipRecord, err
 	if through == 0 {
 		return MembershipRecord{}, fmt.Errorf("checkpoint membership cut is zero")
 	}
-	record, err := c.membershipHistoryLocked(0)
+	// Build only the epochs whose terminal precedes the cut. Later accepted
+	// transitions may not yet be durable and cannot invalidate an older root.
+	end := 0
+	for end < len(c.configHistory) && c.configHistory[end].start <= through {
+		end++
+	}
+	if end == 0 {
+		return MembershipRecord{}, fmt.Errorf("membership history: no config history at cut")
+	}
+	var base *MembershipRecord
+	if c.baseMembership != nil {
+		copy := cloneMembershipRecord(*c.baseMembership)
+		keep := 0
+		for keep < len(copy.Transitions) && copy.Transitions[keep].Terminal.Slot < through {
+			keep++
+		}
+		copy.Transitions = copy.Transitions[:keep]
+		base = &copy
+	}
+	historical := &Core{configHistory: c.configHistory[:end], baseMembership: base, lastAbort: c.lastAbort, decided: c.decided, durable: c.durable}
+	record, err := historical.membershipHistoryLocked(0)
 	if err != nil {
 		return MembershipRecord{}, err
 	}
@@ -180,6 +200,9 @@ func (c *Core) checkpointMembershipAtLocked(through Slot) (MembershipRecord, err
 	if record.Abort != nil && record.Abort.Terminal.Slot <= through && record.Abort.Terminal.Slot > lastSuccess {
 		copy := cloneMembershipRecord(MembershipRecord{Abort: record.Abort}).Abort
 		abort = copy
+	}
+	if base != nil && base.Abort != nil && base.Abort.Terminal.Slot <= through && base.Abort.Terminal.Slot > lastSuccess && (abort == nil || abort.Terminal.Slot < base.Abort.Terminal.Slot) {
+		abort = cloneMembershipRecord(MembershipRecord{Abort: base.Abort}).Abort
 	}
 	for slot, decision := range c.decided {
 		if slot <= lastSuccess || slot > through || !c.durable[slot] {

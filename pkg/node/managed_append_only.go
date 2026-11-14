@@ -98,6 +98,8 @@ func (n *Node) managedStartupWALIdentity() string {
 	return state.identity.Nonce
 }
 
+var errManagedMembershipConflict = errors.New("managed checkpoint local membership conflict")
+
 func (n *Node) verifyManagedAppendOnlyCandidate(ctx context.Context, candidate quepaxa.ManagedCheckpointCandidate) error {
 	if n == nil || n.checkpoints == nil || n.archive == nil || n.managedStartup == nil || !isManagedAppendOnlyProtocol(n.managedStartup.Identity.ApplicationProtocol) {
 		return fmt.Errorf("managed append-only candidate verifier unavailable")
@@ -140,14 +142,16 @@ func (n *Node) verifyManagedAppendOnlyCandidate(ctx context.Context, candidate q
 		return fmt.Errorf("managed append-only candidate contents are invalid: %w", err)
 	}
 	if n.core != nil {
-		if err := n.verifyManagedAppendOnlyLocalHistory(candidate.Seal); err == nil {
+		if err := n.verifyManagedAppendOnlyLocalHistory(ctx, candidate.Seal); err == nil {
 			return ctx.Err()
+		} else if errors.Is(err, errManagedMembershipConflict) {
+			return err
 		}
 	}
 	return n.verifyManagedAppendOnlyArchiveHistory(ctx, candidate.Seal)
 }
 
-func (n *Node) verifyManagedAppendOnlyLocalHistory(seal quepaxa.CheckpointSeal) error {
+func (n *Node) verifyManagedAppendOnlyLocalHistory(ctx context.Context, seal quepaxa.CheckpointSeal) error {
 	core := n.core
 	if core == nil {
 		return fmt.Errorf("local Core history unavailable")
@@ -162,8 +166,21 @@ func (n *Node) verifyManagedAppendOnlyLocalHistory(seal quepaxa.CheckpointSeal) 
 	}
 	if n.config.EnableReconfiguration {
 		history, err := core.CheckpointMembership(seal.Index)
-		if err != nil || seal.Membership == nil || !reflect.DeepEqual(history, *seal.Membership) {
+		if err != nil || seal.Membership == nil {
 			return fmt.Errorf("local certified cut membership unavailable/mismatched: %w", err)
+		}
+		equal, err := quepaxa.EquivalentVerifiedMembershipHistories(ctx, *n.loadClusterConfig(), history, *seal.Membership)
+		if err != nil || !equal {
+			return errors.Join(errManagedMembershipConflict, err)
+		}
+		fresh, err := core.CheckpointMembership(seal.Index)
+		if err != nil || !reflect.DeepEqual(history, fresh) {
+			return errors.Join(errManagedMembershipConflict, err)
+		}
+		freshPrefix, ok := core.PrefixHash(seal.Index)
+		freshNext, freshFollowing, orderErr := core.CheckpointLeaderOrders(seal.Index)
+		if !ok || freshPrefix != prefix || core.ConfigIDForSlot(seal.Index+1) != seal.ConfigID || orderErr != nil || !reflect.DeepEqual(next, freshNext) || !reflect.DeepEqual(following, freshFollowing) {
+			return errors.Join(errManagedMembershipConflict, orderErr)
 		}
 	} else if seal.Membership != nil {
 		return fmt.Errorf("fixed-membership candidate carries an unexpected history proof")
@@ -245,8 +262,12 @@ func (n *Node) verifyManagedAppendOnlyArchiveHistory(ctx context.Context, seal q
 	}
 	if n.config.EnableReconfiguration {
 		history, historyErr := observer.CheckpointMembership(seal.Index)
-		if historyErr != nil || seal.Membership == nil || !reflect.DeepEqual(history, *seal.Membership) {
+		if historyErr != nil || seal.Membership == nil {
 			return errors.Join(fmt.Errorf("managed append-only certified archive membership differs"), historyErr)
+		}
+		equal, err := quepaxa.EquivalentVerifiedMembershipHistories(ctx, *n.loadClusterConfig(), history, *seal.Membership)
+		if err != nil || !equal {
+			return errors.Join(fmt.Errorf("managed append-only certified archive membership differs"), err)
 		}
 	} else if seal.Membership != nil {
 		return fmt.Errorf("fixed-membership archive candidate carries an unexpected history proof")

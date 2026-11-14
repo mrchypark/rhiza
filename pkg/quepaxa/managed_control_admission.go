@@ -41,11 +41,12 @@ const (
 // ManagedAppendOnlyControlProposal reports one validated F/A/P reference.
 // Its hash and proposer identity are descriptive, not authority to decide.
 type ManagedAppendOnlyControlProposal struct {
-	Role       ManagedAppendOnlyControlProposalRole
-	Kind       ManagedAppendOnlyControlKind
-	Priority   Priority
-	ProposerID NodeID
-	Hash       ValueHash
+	Role               ManagedAppendOnlyControlProposalRole
+	Kind               ManagedAppendOnlyControlKind
+	Priority           Priority
+	ProposerID         NodeID
+	Hash               ValueHash
+	verifiedMembership *managedMembershipSnapshot
 }
 
 // ManagedAppendOnlyControlObservation is a point-in-time, read-only
@@ -212,7 +213,7 @@ func (c *Core) ObserveManagedAppendOnlyControl(ctx context.Context) (ManagedAppe
 		if err := ctx.Err(); err != nil {
 			return ManagedAppendOnlyControlObservation{}, err
 		}
-		kind, err := c.validateManagedControlRef(ctx, snapshot, ref)
+		kind, membership, err := c.validateManagedControlRef(ctx, snapshot, ref)
 		if err != nil {
 			if ctxErr := ctx.Err(); ctxErr != nil {
 				return ManagedAppendOnlyControlObservation{}, ctxErr
@@ -221,7 +222,7 @@ func (c *Core) ObserveManagedAppendOnlyControl(ctx context.Context) (ManagedAppe
 		}
 		validated = append(validated, ManagedAppendOnlyControlProposal{
 			Role: ref.role, Kind: kind, Priority: ref.proposal.Priority,
-			ProposerID: ref.proposal.ProposerID, Hash: ref.proposal.Hash,
+			ProposerID: ref.proposal.ProposerID, Hash: ref.proposal.Hash, verifiedMembership: membership,
 		})
 	}
 	localtesthooks.Hit("core:managed-control:before-snapshot-recheck")
@@ -369,6 +370,10 @@ func (c *Core) recheckManagedControlSnapshot(before managedControlSnapshot, vali
 	}
 	diagnostic.freshKnown = true
 	if sameManagedControlSnapshotValues(before, after) {
+		if _, ok, cause := c.reclassifiedManagedControlObservationLocked(before, after, validated, true, true); !ok {
+			diagnostic.cause = cause
+			return ManagedAppendOnlyControlObservation{}, false, false, diagnostic, ErrManagedControlObservationUnavailable
+		}
 		return currentObservationFromSnapshotWithValidated(after, validated), false, false, diagnostic, nil
 	}
 	if c.managedControlPrefixAdvancedLocked(before) {
@@ -380,13 +385,13 @@ func (c *Core) recheckManagedControlSnapshot(before managedControlSnapshot, vali
 	diagnostic.refsCovered = managedControlRefsCovered(before, after, validated)
 	diagnostic.refsCoveredKnown = true
 	if after.step != before.step {
-		if observation, ok, cause := c.reclassifiedManagedControlObservationLocked(before, after, diagnostic.authoritySame, diagnostic.refsCovered); ok {
+		if observation, ok, cause := c.reclassifiedManagedControlObservationLocked(before, after, validated, diagnostic.authoritySame, diagnostic.refsCovered); ok {
 			return observation, true, false, diagnostic, nil
 		} else {
 			diagnostic.cause = cause
 		}
 	} else if sameStepAggregateCurrentAdvanced(before, after) {
-		if observation, ok, cause := c.reclassifiedManagedControlObservationLocked(before, after, diagnostic.authoritySame, diagnostic.refsCovered); ok {
+		if observation, ok, cause := c.reclassifiedManagedControlObservationLocked(before, after, validated, diagnostic.authoritySame, diagnostic.refsCovered); ok {
 			return observation, true, false, diagnostic, nil
 		} else {
 			diagnostic.cause = cause
@@ -490,7 +495,7 @@ func managedControlRefsCovered(before, current managedControlSnapshot, validated
 	return true
 }
 
-func (c *Core) reclassifiedManagedControlObservationLocked(before, current managedControlSnapshot, authoritySame, refsCovered bool) (ManagedAppendOnlyControlObservation, bool, string) {
+func (c *Core) reclassifiedManagedControlObservationLocked(before, current managedControlSnapshot, validated []ManagedAppendOnlyControlProposal, authoritySame, refsCovered bool) (ManagedAppendOnlyControlObservation, bool, string) {
 	if before.core != c || current.core != c || before.committed != current.committed || before.observed != current.observed || !authoritySame || current.step < before.step || !refsCovered {
 		return ManagedAppendOnlyControlObservation{}, false, managedControlSnapshotMismatchCause(before, current, authoritySame, refsCovered)
 	}
@@ -507,6 +512,12 @@ func (c *Core) reclassifiedManagedControlObservationLocked(before, current manag
 			kind = ManagedAppendOnlyCheckpointSeal
 			seal, _, _ := DecodeCheckpointSeal(ref.value)
 			candidate := ManagedCheckpointCandidate{Value: ref.value, Hash: ref.proposal.Hash, Seal: seal, DecisionSlot: current.observed, ConfigID: current.configID}
+			for _, v := range validated {
+				if v.Hash == ref.proposal.Hash {
+					candidate.verifiedMembership = v.verifiedMembership
+					break
+				}
+			}
 			if err := c.validateManagedCandidateLocalLocked(candidate); err != nil {
 				return ManagedAppendOnlyControlObservation{}, false, "qckp_local_guard"
 			}
@@ -522,32 +533,32 @@ func (c *Core) reclassifiedManagedControlObservationLocked(before, current manag
 	return sealManagedControlObservation(observation), true, ""
 }
 
-func (c *Core) validateManagedControlRef(ctx context.Context, snapshot managedControlSnapshot, ref managedControlRefSnapshot) (ManagedAppendOnlyControlKind, error) {
+func (c *Core) validateManagedControlRef(ctx context.Context, snapshot managedControlSnapshot, ref managedControlRefSnapshot) (ManagedAppendOnlyControlKind, *managedMembershipSnapshot, error) {
 	if err := ctx.Err(); err != nil {
-		return 0, err
+		return 0, nil, err
 	}
 	if sha256.Sum256(ref.value) != ref.proposal.Hash {
-		return 0, managedControlObservationRejected("reference_validation", fmt.Errorf("proposal value hash mismatch"))
+		return 0, nil, managedControlObservationRejected("reference_validation", fmt.Errorf("proposal value hash mismatch"))
 	}
 	if barrier, err := DecodeReadBarrier(ref.value); barrier {
 		if err != nil {
-			return 0, err
+			return 0, nil, err
 		}
-		return ManagedAppendOnlyReadBarrier, nil
+		return ManagedAppendOnlyReadBarrier, nil, nil
 	}
 	seal, checkpoint, err := DecodeCheckpointSeal(ref.value)
 	if err != nil || !checkpoint {
 		if err == nil {
 			err = fmt.Errorf("proposal is not a recognized managed control")
 		}
-		return 0, managedControlObservationRejected("reference_validation", err)
+		return 0, nil, managedControlObservationRejected("reference_validation", err)
 	}
 	if snapshot.config == nil || snapshot.config != c.managedAppendOnly {
-		return 0, managedControlObservationRejected("reference_validation", ErrManagedAppendOnlyUnavailable)
+		return 0, nil, managedControlObservationRejected("reference_validation", ErrManagedAppendOnlyUnavailable)
 	}
 	candidate := ManagedCheckpointCandidate{Value: ref.value, Hash: ref.proposal.Hash, Seal: seal, DecisionSlot: snapshot.observed, ConfigID: snapshot.configID}
-	if err := c.ValidateManagedCheckpointCandidate(ctx, candidate); err != nil {
-		return 0, managedControlObservationRejected("reference_validation", err)
+	if err := c.validateManagedCheckpointCandidate(ctx, &candidate); err != nil {
+		return 0, nil, managedControlObservationRejected("reference_validation", err)
 	}
-	return ManagedAppendOnlyCheckpointSeal, nil
+	return ManagedAppendOnlyCheckpointSeal, candidate.verifiedMembership, nil
 }

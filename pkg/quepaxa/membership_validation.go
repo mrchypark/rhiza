@@ -1,9 +1,47 @@
 package quepaxa
 
 import (
+	"context"
 	"crypto/sha256"
 	"fmt"
+	"slices"
 )
+
+// EquivalentVerifiedMembershipHistories compares decision identities only
+// after independently checking both complete proofs against trusted genesis.
+// It is not an equality test for serialized checkpoint or archive artifacts.
+func EquivalentVerifiedMembershipHistories(ctx context.Context, initial Cluster, left, right MembershipRecord) (bool, error) {
+	if err := ctx.Err(); err != nil {
+		return false, err
+	}
+	initial = cloneCluster(initial)
+	left, right = cloneMembershipRecord(left), cloneMembershipRecord(right)
+	if _, err := validateMembershipHistory(initial, left); err != nil {
+		return false, fmt.Errorf("left membership: %w", err)
+	}
+	if err := ctx.Err(); err != nil {
+		return false, err
+	}
+	if _, err := validateMembershipHistory(initial, right); err != nil {
+		return false, fmt.Errorf("right membership: %w", err)
+	}
+	if err := ctx.Err(); err != nil {
+		return false, err
+	}
+	if !sameCluster(left.Genesis, right.Genesis) || len(left.Transitions) != len(right.Transitions) || (left.Abort == nil) != (right.Abort == nil) {
+		return false, nil
+	}
+	equal := func(a, b ConfigTransition) bool {
+		return a.Freeze.Slot == b.Freeze.Slot && a.Freeze.Hash == b.Freeze.Hash && slices.Equal(a.Freeze.Value, b.Freeze.Value) &&
+			a.Terminal.Slot == b.Terminal.Slot && a.Terminal.Hash == b.Terminal.Hash && slices.Equal(a.Terminal.Value, b.Terminal.Value)
+	}
+	for i := range left.Transitions {
+		if !equal(left.Transitions[i], right.Transitions[i]) {
+			return false, nil
+		}
+	}
+	return left.Abort == nil || equal(*left.Abort, *right.Abort), nil
+}
 
 // validateMembershipHistory reconstructs configuration authority from an
 // explicitly trusted bootstrap configuration. It does not install a log floor
