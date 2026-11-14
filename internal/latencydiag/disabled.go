@@ -9,8 +9,12 @@ import (
 
 const Enabled = false
 
-func NextBatch() uint64                                              { return 0 }
-func TraceBatch(_ string, _, _ uint64, _ int, _ string, _ time.Time) {}
+func WithSync(ctx context.Context, _ uint64) context.Context { return ctx }
+func SyncID(_ context.Context) uint64                        { return 0 }
+
+func NextBatch() uint64                                                      { return 0 }
+func TraceBatch(_ string, _, _ uint64, _ int, _ string, _ time.Time)         {}
+func TraceSync(_ string, _, _ uint64, _ int, _ string, _ error, _ time.Time) {}
 
 func Start() time.Time                                               { return time.Time{} }
 func Observe(_ string, _ uint64, _ time.Time)                        {}

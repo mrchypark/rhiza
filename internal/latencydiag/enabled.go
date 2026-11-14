@@ -16,6 +16,12 @@ const Enabled = true
 const capacity = 256
 
 type slotKey struct{}
+type syncKey struct{}
+
+func WithSync(ctx context.Context, id uint64) context.Context {
+	return context.WithValue(ctx, syncKey{}, id)
+}
+func SyncID(ctx context.Context) uint64 { id, _ := ctx.Value(syncKey{}).(uint64); return id }
 
 func WithSlot(ctx context.Context, slot uint64) context.Context {
 	return context.WithValue(ctx, slotKey{}, slot)
@@ -121,6 +127,25 @@ func batchEvent(stage string, count int, err error, begin, end time.Time) event 
 }
 func ObservePeer(stage string, slot uint64, peer string, err error, start time.Time) {
 	observe(stage, slot, peer, err, start)
+}
+
+// TraceSync records every Sync stage; batch identifies a server-local request.
+// These high-volume events may be dropped by the bounded diagnostic ring.
+func TraceSync(stage string, batch, slot uint64, count int, peer string, err error, begin time.Time) {
+	start()
+	ring.add(syncEvent(stage, batch, slot, count, peer, err, begin))
+}
+
+func syncEvent(stage string, batch, slot uint64, count int, peer string, err error, begin time.Time) event {
+	e := event{stage: stage, batch: batch, slot: slot, count: count, start: begin, end: time.Now(), outcome: "ok"}
+	if err != nil {
+		e.outcome = "error"
+	}
+	if peer != "" {
+		sum := sha256.Sum256([]byte(peer))
+		copy(e.peer[:], sum[:8])
+	}
+	return e
 }
 func observe(stage string, slot uint64, peer string, err error, begin time.Time) {
 	end := time.Now()

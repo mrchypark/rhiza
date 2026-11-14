@@ -259,7 +259,7 @@ func (s *PeerServer) serveConnection(ctx context.Context, conn *quic.Conn) {
 				if latencydiag.Enabled {
 					latencydiag.Observe("peer_stream_schedule", 0, accepted)
 				}
-				s.serveStream(conn, stream)
+				s.serveStream(conn, stream, accepted)
 			}()
 		default:
 			stream.CancelRead(1)
@@ -268,7 +268,7 @@ func (s *PeerServer) serveConnection(ctx context.Context, conn *quic.Conn) {
 	}
 }
 
-func (s *PeerServer) serveStream(conn *quic.Conn, stream *quic.Stream) {
+func (s *PeerServer) serveStream(conn *quic.Conn, stream *quic.Stream, streamStart time.Time) {
 	defer stream.CancelRead(0)
 	_ = stream.SetDeadline(time.Now().Add(30 * time.Second))
 	response := &peerfb.ResponseT{}
@@ -277,7 +277,13 @@ func (s *PeerServer) serveStream(conn *quic.Conn, stream *quic.Stream) {
 	learned := false
 	var syncFrom uint64
 	var syncSender string
+	var syncID uint64
 	isSync := false
+	defer func() {
+		if localtesthooks.Enabled && isSync {
+			localtesthooks.Hit("network:sync:phase=stream-finished")
+		}
+	}()
 	data, err := readPeerFrame(stream)
 	s.diagnosticPhase("request-read", err)
 	if err == nil {
@@ -296,6 +302,11 @@ func (s *PeerServer) serveStream(conn *quic.Conn, stream *quic.Stream) {
 		if err == nil {
 			if request.Operation == peerfb.OperationSync {
 				isSync, syncFrom, syncSender = true, request.From, request.SenderId
+				if latencydiag.Enabled {
+					syncID = latencydiag.NextBatch()
+					// SenderId is decoded but not yet authorized by handle.
+					latencydiag.TraceSync("peer_sync_receive_untrusted", syncID, syncFrom, int(request.Limit), syncSender, nil, streamStart)
+				}
 			}
 			if request.Operation == peerfb.OperationLearned && request.Decision != nil {
 				learned = true
@@ -309,9 +320,13 @@ func (s *PeerServer) serveStream(conn *quic.Conn, stream *quic.Stream) {
 				_ = stream.SetDeadline(time.Now().Add(checkpointPrepareTimeout))
 			}
 			handleStart := latencydiag.Start()
-			response, err = s.handle(stream.Context(), peerCertificateKey(conn), request)
+			handleCtx := stream.Context()
 			if latencydiag.Enabled && isSync {
-				latencydiag.ObservePeer("peer_sync_handle", syncFrom, syncSender, err, handleStart)
+				handleCtx = latencydiag.WithSync(handleCtx, syncID)
+			}
+			response, err = s.handle(handleCtx, peerCertificateKey(conn), request)
+			if latencydiag.Enabled && isSync {
+				latencydiag.TraceSync("peer_sync_handle", syncID, syncFrom, int(request.Limit), syncSender, err, handleStart)
 			}
 			if learned && localtesthooks.Enabled {
 				message := ""
@@ -338,12 +353,15 @@ func (s *PeerServer) serveStream(conn *quic.Conn, stream *quic.Stream) {
 	encodeStart := latencydiag.Start()
 	encoded := encodePeerResponse(response)
 	if latencydiag.Enabled && isSync {
-		latencydiag.ObservePeer("peer_sync_encode", syncFrom, syncSender, err, encodeStart)
+		latencydiag.TraceSync("peer_sync_encode", syncID, syncFrom, 0, syncSender, err, encodeStart)
+	}
+	if localtesthooks.Enabled && isSync {
+		localtesthooks.Hit("network:sync:phase=before-response-write")
 	}
 	writeStart := latencydiag.Start()
 	writeErr := writePeerFrame(stream, encoded)
 	if latencydiag.Enabled && isSync {
-		latencydiag.ObservePeer("peer_sync_write", syncFrom, syncSender, writeErr, writeStart)
+		latencydiag.TraceSync("peer_sync_write", syncID, syncFrom, 0, syncSender, writeErr, writeStart)
 	}
 	s.diagnosticPhase("response-write", writeErr)
 	if writeErr != nil {
@@ -602,9 +620,9 @@ func (s *PeerServer) handle(ctx context.Context, certificateKey ed25519.PublicKe
 			localtesthooks.Hit(fmt.Sprintf("network:sync:phase=entered:node=%s:sender=%s:from=%d", s.server.core.NodeID(), request.SenderId, request.From))
 		}
 		fetchStart := latencydiag.Start()
-		decisions, tip, err := s.server.core.DecisionsFrom(quepaxa.Slot(request.From), int(request.Limit))
+		decisions, tip, err := syncDecisions(ctx, s.server.core, quepaxa.Slot(request.From), int(request.Limit))
 		if latencydiag.Enabled {
-			latencydiag.ObservePeer("peer_sync_fetch", request.From, request.SenderId, err, fetchStart)
+			latencydiag.TraceSync("peer_sync_fetch", latencydiag.SyncID(ctx), request.From, int(request.Limit), request.SenderId, err, fetchStart)
 		}
 		if err != nil {
 			return nil, err
@@ -631,7 +649,7 @@ func (s *PeerServer) handle(ctx context.Context, certificateKey ed25519.PublicKe
 		}
 		response.Decisions = wireDecisions[:fit]
 		if latencydiag.Enabled {
-			latencydiag.ObservePeer("peer_sync_prepare", request.From, request.SenderId, ctx.Err(), prepareStart)
+			latencydiag.TraceSync("peer_sync_prepare", latencydiag.SyncID(ctx), request.From, int(request.Limit), request.SenderId, ctx.Err(), prepareStart)
 		}
 		return response, nil
 	case peerfb.OperationReadIndex:

@@ -324,6 +324,12 @@ jobs:
         run: |
           go test -tags rhiza_latency_diag ./internal/latencydiag ./pkg/quepaxa -run '^(TestSlotAndBoundedSlowEvents|TestBatchEventReportsSyncFailure|TestBatchTraceLinksSlotsAndPhysicalSync|TestBatchTraceReportsActualRingOverflow|TestObserveErrorRecordsActualOutcome|TestTaggedGroupCommitCallsRealWALWithBatchID|TestTaggedRealWALTraceRecordsLinkSlotsAndBatches)$' -count=1 -timeout=60s
           go test -race -tags rhiza_latency_diag ./internal/latencydiag ./pkg/quepaxa -run '^(TestSlotAndBoundedSlowEvents|TestBatchEventReportsSyncFailure|TestBatchTraceLinksSlotsAndPhysicalSync|TestBatchTraceReportsActualRingOverflow|TestObserveErrorRecordsActualOutcome|TestTaggedGroupCommitCallsRealWALWithBatchID|TestTaggedRealWALTraceRecordsLinkSlotsAndBatches)$' -count=1 -timeout=60s
+      - name: Sync server diagnostic correlation
+        env:
+          CGO_ENABLED: 1
+        run: |
+          go test -tags 'rhiza_local_testhooks rhiza_latency_diag' ./internal/latencydiag ./pkg/network -run '^(TestSyncTraceIdentityAndBoundedLoss|TestSyncServerBoundaryCancellation|TestSyncDiagnosticConcurrentRequestCorrelation|TestSyncDiagnosticRejectsDroppedEvidence)$' -count=1 -timeout=60s
+          go test -race -tags 'rhiza_local_testhooks rhiza_latency_diag' ./internal/latencydiag ./pkg/network -run '^(TestSyncTraceIdentityAndBoundedLoss|TestSyncServerBoundaryCancellation|TestSyncDiagnosticConcurrentRequestCorrelation|TestSyncDiagnosticRejectsDroppedEvidence)$' -count=1 -timeout=60s
       - name: Managed Graph certified-progress admission and marker regressions
         env:
           CGO_ENABLED: 1

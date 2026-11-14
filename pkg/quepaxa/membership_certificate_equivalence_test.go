@@ -214,6 +214,56 @@ func TestTenVoterEquivalentMembershipCertificates(t *testing.T) {
 	lagger.decided[freezeSlot] = v
 	lagger.mu.Unlock()
 	lagger.managedAppendOnly.Verify = func(context.Context, ManagedCheckpointCandidate) error { return nil }
+	t.Run("post-validation pre-receipt membership drift", func(t *testing.T) {
+		var verified, boundary bool
+		lagger.mu.RLock()
+		_, hadRecorder := lagger.recorders[candidate.DecisionSlot]
+		_, hadDecision := lagger.decided[candidate.DecisionSlot]
+		lagger.mu.RUnlock()
+		if hadRecorder || hadDecision {
+			t.Fatal("fixture already has accepted slot state")
+		}
+		before, err := lagger.wal.Read()
+		if err != nil {
+			t.Fatal(err)
+		}
+		lagger.managedAppendOnly.Verify = func(context.Context, ManagedCheckpointCandidate) error { verified = true; return nil }
+		lagger.recordBeforeAppend = func() {
+			boundary = true
+			lagger.mu.Lock()
+			v := lagger.decided[freezeSlot]
+			v.Certificate = bytes.Clone(left.Transitions[0].Freeze.Certificate)
+			lagger.decided[freezeSlot] = v
+			lagger.mu.Unlock()
+		}
+		defer func() {
+			lagger.recordBeforeAppend = nil
+			lagger.managedAppendOnly.Verify = func(context.Context, ManagedCheckpointCandidate) error { return nil }
+			lagger.mu.Lock()
+			v := lagger.decided[freezeSlot]
+			v.Certificate = bytes.Clone(right.Transitions[0].Freeze.Certificate)
+			lagger.decided[freezeSlot] = v
+			lagger.mu.Unlock()
+		}()
+		summary, recordErr := lagger.Record(ctx, RecordRequest{Slot: candidate.DecisionSlot, Step: 4, ConfigID: target.ConfigID, Proposal: proposal})
+		if !verified || !boundary || recordErr == nil || recordErr.Error() != "managed checkpoint membership differs from available local history" || summary != (Summary{}) {
+			t.Fatalf("final boundary verified=%t reached=%t summary=%+v result=%v", verified, boundary, summary, recordErr)
+		}
+		after, err := lagger.wal.Read()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if countReceipts(before) != countReceipts(after) {
+			t.Fatal("final guard refusal wrote a receipt")
+		}
+		lagger.mu.RLock()
+		_, recorder := lagger.recorders[candidate.DecisionSlot]
+		_, decided := lagger.decided[candidate.DecisionSlot]
+		lagger.mu.RUnlock()
+		if recorder || decided {
+			t.Fatalf("final guard refusal installed state: recorder=%t decision=%t", recorder, decided)
+		}
+	})
 	if _, err := lagger.Record(ctx, RecordRequest{Slot: candidate.DecisionSlot, Step: 4, ConfigID: target.ConfigID, Proposal: proposal}); err != nil {
 		t.Fatalf("real Record rejected verified alternative proof: %v", err)
 	}

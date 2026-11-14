@@ -3818,7 +3818,7 @@ func (c *Core) DecisionsFrom(from Slot, limit int) ([]DecidedValue, Slot, error)
 	if limit <= 0 {
 		limit = 256
 	}
-	return c.decisionsFromBounded(from, limit, int(^uint(0)>>1))
+	return c.decisionsFromBounded(context.Background(), from, limit, int(^uint(0)>>1))
 }
 
 // DecisionsFromBounded returns a contiguous decision prefix bounded by both
@@ -3830,11 +3830,18 @@ func (c *Core) DecisionsFromBounded(from Slot, itemLimit, payloadByteLimit int) 
 	if itemLimit <= 0 || payloadByteLimit <= 0 {
 		return nil, 0, fmt.Errorf("decision item and payload limits must be positive")
 	}
-	return c.decisionsFromBounded(from, itemLimit, payloadByteLimit)
+	return c.decisionsFromBounded(context.Background(), from, itemLimit, payloadByteLimit)
 }
 
-func (c *Core) decisionsFromBounded(from Slot, itemLimit, payloadByteLimit int) ([]DecidedValue, Slot, error) {
+func (c *Core) decisionsFromBounded(ctx context.Context, from Slot, itemLimit, payloadByteLimit int) ([]DecidedValue, Slot, error) {
+	started := latencydiag.Start()
+	if localtesthooks.Enabled && latencydiag.SyncID(ctx) != 0 {
+		localtesthooks.Hit("core:sync:before-read-lock")
+	}
 	c.mu.RLock()
+	if latencydiag.Enabled && latencydiag.SyncID(ctx) != 0 {
+		latencydiag.TraceSync("peer_sync_core_lock", latencydiag.SyncID(ctx), uint64(from), itemLimit, "", nil, started)
+	}
 	defer c.mu.RUnlock()
 	if from <= c.floor {
 		return nil, c.tip, fmt.Errorf("%w: requested slot %d is at or below floor %d", ErrCompacted, from, c.floor)
