@@ -155,6 +155,10 @@ run_contract() {
         }
         next
       }
+      if (diagnostic ~ /^MANAGED_GRAPH_READINESS_REFUSED/) {
+        if (diagnostic ~ /^MANAGED_GRAPH_READINESS_REFUSED reason=(not_writable|callback_missing|callback_false|lifecycle_failed|material_missing)$/) emit(diagnostic)
+        next
+      }
       if (diagnostic ~ /^MANAGED_GRAPH_ADMISSION_FAILURE/) {
         if (diagnostic ~ /^MANAGED_GRAPH_ADMISSION_FAILURE route=(initial|admitted) stage=(runtime_pre|pre_control|read_index|owned_wait|wait_tip|replay|runtime_post|fixed_replay|authority) read_target_known=false cause=[a-z_]+$/) {
           split(diagnostic, admission_fields, " ")
@@ -508,6 +512,8 @@ if [ "${1-}" = --diagnostic-self-test ]; then
   done
   run_contract rust-restart sh -c 'printf "%s\n" \
     "2026/11/03 12:00:00 managed operation unavailable operation=graph_execute code=commit_unknown cause=canceled context_known=true slot=17 retry=1041" \
+    "MANAGED_GRAPH_READINESS_REFUSED reason=callback_false" \
+    "MANAGED_GRAPH_READINESS_REFUSED reason=callback_false secret-DO-NOT-RETAIN" \
     "MANAGED_KV_UNKNOWN stage=receipt_missing slot=156 cause=other" \
     "MANAGED_KV_UNKNOWN stage=receipt_missing slot=156 cause=other secret-DO-NOT-RETAIN" \
     "GRAPH_STEP_DIAGNOSTIC graph_step stage=graph_execute ordinal=2 code=commit_unknown context_known=true slot=0 retry=18446744073709551615" \
@@ -518,6 +524,7 @@ if [ "${1-}" = --diagnostic-self-test ]; then
     "FAIL: managed-ha-contract graph_step stage=sql_tuple ordinal=0 code=commit_unknown context_known=false slot=0 retry=0 secret-DO-NOT-RETAIN" \
     "GRAPH_STEP_DIAGNOSTIC graph_step stage=private ordinal=1 code=internal context_known=false slot=0 retry=0"'
   grep -Fx 'MANAGED_OPERATION_DIAGNOSTIC operation=graph_execute code=commit_unknown cause=canceled context_known=true slot=17 retry=1041' "$diag_dir/active.log" >/dev/null
+  grep -Fx 'MANAGED_GRAPH_READINESS_REFUSED reason=callback_false' "$diag_dir/active.log" >/dev/null
   grep -Fx 'MANAGED_KV_UNKNOWN stage=receipt_missing slot=156 cause=other' "$diag_dir/active.log" >/dev/null
   grep -Fx 'RUST_GRAPH_OPERATION_DIAGNOSTIC stage=graph_execute ordinal=2 code=commit_unknown context_known=true slot=0 retry=18446744073709551615' "$diag_dir/active.log" >/dev/null
   grep -Fx 'RUST_GRAPH_OPERATION_DIAGNOSTIC stage=sql_tuple ordinal=0 code=commit_unknown context_known=false slot=0 retry=0' "$diag_dir/active.log" >/dev/null

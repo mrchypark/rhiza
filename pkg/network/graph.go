@@ -149,7 +149,8 @@ func (s *Server) GraphExecute(ctx context.Context, command types.GraphCommand) (
 }
 
 func (s *Server) graphExecuteManaged(ctx context.Context, command types.GraphCommand) (GraphExecuteResponse, error) {
-	if !s.writable || !s.Ready() || s.material == nil {
+	if reason := s.managedGraphReadinessFailure(); reason != "" {
+		log.Printf("MANAGED_GRAPH_READINESS_REFUSED reason=%s", reason)
 		return GraphExecuteResponse{}, managedGraphExecuteFailure("network_readiness", ErrNotReady)
 	}
 	if err := ctx.Err(); err != nil {
@@ -209,6 +210,29 @@ func (s *Server) graphExecuteManaged(ctx context.Context, command types.GraphCom
 		return GraphExecuteResponse{}, managedGraphExecuteFailure("network_receipt_lookup", ErrRequestConflict)
 	}
 	return GraphExecuteResponse{MutationReceipt: receipt}, nil
+}
+
+// Evaluate readiness once: callbacks can change while a request is in flight.
+func (s *Server) managedGraphReadinessFailure() string {
+	if !s.writable {
+		return "not_writable"
+	}
+	if s.ready == nil {
+		return "callback_missing"
+	}
+	if !s.ready() {
+		return "callback_false"
+	}
+	s.proposeMu.Lock()
+	failed := s.lifecycleFailure != nil
+	s.proposeMu.Unlock()
+	if failed {
+		return "lifecycle_failed"
+	}
+	if s.material == nil {
+		return "material_missing"
+	}
+	return ""
 }
 
 func managedGraphExecuteFailure(stage string, err error) error {
