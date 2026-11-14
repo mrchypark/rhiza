@@ -79,12 +79,14 @@ func main() {
 	var workers sync.WaitGroup
 	ctx := context.Background()
 	var progress *faultProgress
+	var faultSamples []faultSample
 	var control *http.Server
 	if (*faultControlFile == "") != (*faultPID == 0) || (*faultControlFile == "") != (*faultStart == "") {
 		fmt.Fprintln(os.Stderr, "fault control file, fixed PID and start time must be supplied together")
 		os.Exit(2)
 	}
 	if *faultControlFile != "" {
+		faultSamples = make([]faultSample, *requests)
 		target, err := openFaultTarget(*faultPID, *faultStart, os.Getppid())
 		if err != nil {
 			fmt.Fprintln(os.Stderr, "cannot bind fault target:", err)
@@ -134,12 +136,15 @@ func main() {
 				begin := time.Now()
 				requestCtx := ctx
 				var finish func(time.Time)
+				var interval *requestInterval
 				if progress != nil {
-					requestCtx, finish = progress.traceRequest(ctx, id)
+					requestCtx, finish, interval = progress.traceRequestInterval(ctx, id)
 				}
 				status, sample, retryCount, requestErr := doRequest(requestCtx, client, method, *baseURL+*requestPath, payload, *commitUnknownRetries, *verifyInsert)
+				var completed time.Time
 				if finish != nil {
-					finish(time.Now()) // capture completion BEFORE the tracking lock
+					completed = time.Now()
+					finish(completed) // capture completion BEFORE the tracking lock
 				}
 				retries.Add(uint64(retryCount))
 				elapsed := time.Since(begin)
@@ -166,6 +171,13 @@ func main() {
 						statuses[status].Add(1)
 					}
 				} else {
+					if progress != nil {
+						sample := faultSample{start: begin, end: completed, measuredEnd: begin.Add(elapsed), retries: retryCount}
+						if sent := interval.sent.Load(); sent != nil {
+							sample.sent = *sent
+						}
+						faultSamples[id] = sample
+					}
 					latencyMu.Lock()
 					latencies = append(latencies, elapsed)
 					latencyMu.Unlock()
@@ -224,6 +236,7 @@ func main() {
 	}
 	if progress != nil {
 		window := progress.window()
+		window.summarizeSlowest(progress.epoch, progress.before, progress.after, progress.signalOK, faultSamples)
 		output.FaultWindow = &window
 	}
 	if *verifyInsert {
@@ -298,8 +311,7 @@ func validateInsertReceipt(payload string, body []byte) error {
 	return nil
 }
 
-// Only fault lanes enable this coordinator. Retain only the current requests
-// and one bounded fault snapshot, never the complete benchmark history.
+// Only fault lanes enable this coordinator. The client records bounded samples separately.
 type faultProgress struct {
 	mu            sync.Mutex
 	token         string
@@ -313,25 +325,72 @@ type faultProgress struct {
 	reason        string
 }
 
+type faultSample struct {
+	start, sent, end, measuredEnd time.Time
+	retries                       int
+}
+
 type requestInterval struct {
 	sent     atomic.Pointer[time.Time]
 	finished atomic.Pointer[time.Time]
 }
 
 type faultWindow struct {
-	Attempted         bool   `json:"attempted"`
-	SignalSucceeded   bool   `json:"signal_succeeded"`
-	Overlap           bool   `json:"overlap"`
-	Witnesses         int    `json:"witnesses"`
-	SnapshotRequests  int    `json:"snapshot_requests"`
-	SignalBeforeNS    int64  `json:"signal_before_ns"`
-	SignalAfterNS     int64  `json:"signal_after_ns"`
-	WitnessSentNS     int64  `json:"witness_sent_ns"`
-	WitnessFinishedNS int64  `json:"witness_finished_ns"`
-	Reason            string `json:"reason"`
+	Attempted             bool    `json:"attempted"`
+	SignalSucceeded       bool    `json:"signal_succeeded"`
+	Overlap               bool    `json:"overlap"`
+	Witnesses             int     `json:"witnesses"`
+	SnapshotRequests      int     `json:"snapshot_requests"`
+	SignalBeforeNS        int64   `json:"signal_before_ns"`
+	SignalAfterNS         int64   `json:"signal_after_ns"`
+	WitnessSentNS         int64   `json:"witness_sent_ns"`
+	WitnessFinishedNS     int64   `json:"witness_finished_ns"`
+	Reason                string  `json:"reason"`
+	SlowestStartNS        int64   `json:"slowest_start_ns"`
+	SlowestSentNS         *int64  `json:"slowest_sent_ns"`
+	SlowestEndNS          int64   `json:"slowest_end_ns"`
+	SlowestMeasuredEndNS  int64   `json:"slowest_measured_end_ns"`
+	SlowestOverlapsSignal bool    `json:"slowest_overlaps_signal"`
+	SlowestRetries        int     `json:"slowest_retries"`
+	PostSignalMaxMS       float64 `json:"post_signal_max_ms"`
+	PostSignalRequests    int     `json:"post_signal_requests"`
+}
+
+func (w *faultWindow) summarizeSlowest(epoch, before, after time.Time, signalOK bool, samples []faultSample) {
+	var slowest faultSample
+	for _, sample := range samples {
+		if sample.start.IsZero() {
+			continue
+		}
+		if slowest.start.IsZero() || sample.measuredEnd.Sub(sample.start) > slowest.measuredEnd.Sub(slowest.start) {
+			slowest = sample
+		}
+		if signalOK && !sample.start.Before(after) {
+			w.PostSignalRequests++
+			if ms := float64(sample.measuredEnd.Sub(sample.start)) / float64(time.Millisecond); ms > w.PostSignalMaxMS {
+				w.PostSignalMaxMS = ms
+			}
+		}
+	}
+	if slowest.start.IsZero() {
+		return
+	}
+	w.SlowestStartNS, w.SlowestEndNS = slowest.start.Sub(epoch).Nanoseconds(), slowest.end.Sub(epoch).Nanoseconds()
+	w.SlowestMeasuredEndNS = slowest.measuredEnd.Sub(epoch).Nanoseconds()
+	w.SlowestRetries = slowest.retries
+	if !slowest.sent.IsZero() {
+		sent := slowest.sent.Sub(epoch).Nanoseconds()
+		w.SlowestSentNS = &sent
+		w.SlowestOverlapsSignal = signalOK && coversFault(slowest.sent, slowest.end, before, after)
+	}
 }
 
 func (p *faultProgress) traceRequest(ctx context.Context, id int) (context.Context, func(time.Time)) {
+	ctx, finish, _ := p.traceRequestInterval(ctx, id)
+	return ctx, finish
+}
+
+func (p *faultProgress) traceRequestInterval(ctx context.Context, id int) (context.Context, func(time.Time), *requestInterval) {
 	interval := &requestInterval{}
 	p.mu.Lock()
 	p.active[id] = interval
@@ -347,7 +406,7 @@ func (p *faultProgress) traceRequest(ctx context.Context, id int) (context.Conte
 		p.mu.Lock()
 		delete(p.active, id)
 		p.mu.Unlock()
-	}
+	}, interval
 }
 
 func (p *faultProgress) inject() error {
