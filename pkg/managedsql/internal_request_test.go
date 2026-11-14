@@ -11,6 +11,7 @@ import (
 	"net/url"
 	"path/filepath"
 	"reflect"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -354,6 +355,24 @@ func TestInternalRequestNoArgUnknownOrAmbiguous(t *testing.T) {
 	}
 }
 
+func fixtureRequestHost(authorization string, count int) int {
+	for i := 0; i < count; i++ {
+		if strings.Contains(authorization, fmt.Sprintf("Credential=fixture-host-%d/", i)) {
+			return i
+		}
+	}
+	return -1
+}
+
+func TestFixtureRequestHostDiagnostic(t *testing.T) {
+	if got := fixtureRequestHost("AWS4-HMAC-SHA256 Credential=fixture-host-1/20260101/test", 3); got != 1 {
+		t.Fatalf("fixture owner=%d, want 1", got)
+	}
+	if got := fixtureRequestHost("AWS4-HMAC-SHA256 Credential=other/20260101/test", 3); got != -1 {
+		t.Fatalf("unknown owner=%d, want -1", got)
+	}
+}
+
 // This uses the real three-Host/Core/WAL/SQLite/S3-wire fixture. The transport
 // fault is Kubernetes-only, not a real-cloud or process-termination experiment.
 func openInternalRequestHosts(t *testing.T, outage *atomic.Bool, attempts *atomic.Int64, setup ...func(*sqlWireControl)) ([]Config, []*Host, *sqlStatusFixture) {
@@ -366,7 +385,24 @@ func openInternalRequestHosts(t *testing.T, outage *atomic.Bool, attempts *atomi
 		setup[0](fixture.source)
 	}
 	hosts := make([]*Host, len(configs))
+	var hostsMu sync.RWMutex
+	closing := make([]atomic.Bool, len(configs))
+	closed := make([]atomic.Bool, len(configs))
+	fixture.source.putReadDiagnostic = func(r *http.Request) {
+		// Only fixed fixture credential names are parsed; never log authorization.
+		hostIndex := fixtureRequestHost(r.Header.Get("Authorization"), len(configs))
+		if hostIndex < 0 {
+			t.Log("PUT read failure host=unknown node_lifetime=unavailable")
+			return
+		}
+		hostsMu.RLock()
+		host := hosts[hostIndex]
+		hostsMu.RUnlock()
+		admissionCanceled := host != nil && host.admissionLifetime.Err() != nil
+		t.Logf("PUT read failure host=%d host_close_started=%t host_close_finished=%t admission_canceled=%t request_canceled=%t node_lifetime=unavailable", hostIndex, closing[hostIndex].Load(), closed[hostIndex].Load(), admissionCanceled, r.Context().Err() != nil)
+	}
 	for i, config := range configs {
+		config.Runtime.ObjStoreAccessKey = fmt.Sprintf("fixture-host-%d", i)
 		kube := *config.Store.Kube
 		client := *kube.Client
 		base := client.Transport
@@ -381,7 +417,10 @@ func openInternalRequestHosts(t *testing.T, outage *atomic.Bool, attempts *atomi
 		config.Store = &operator.V1Alpha2StatusStore{Kube: &kube}
 		host, err := fixture.open(context.Background(), config)
 		if host != nil {
+			index := i
 			t.Cleanup(func() {
+				closing[index].Store(true)
+				defer closed[index].Store(true)
 				if err := host.Close(); err != nil {
 					t.Error(err)
 				}
@@ -390,7 +429,9 @@ func openInternalRequestHosts(t *testing.T, outage *atomic.Bool, attempts *atomi
 		if err != nil {
 			t.Fatal(err)
 		}
+		hostsMu.Lock()
 		hosts[i] = host
+		hostsMu.Unlock()
 	}
 	return configs, hosts, fixture
 }
