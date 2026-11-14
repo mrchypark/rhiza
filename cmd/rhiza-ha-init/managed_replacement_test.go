@@ -29,7 +29,7 @@ func TestManagedReplacementLoopReconcilesClosedRepairWithoutSQLReadiness(t *test
 		t.Fatal("locate managed replacement source")
 	}
 	fset := token.NewFileSet()
-	parsed, err := parser.ParseFile(fset, filepath.Join(filepath.Dir(file), "serve.go"), nil, 0)
+	parsed, err := parser.ParseFile(fset, filepath.Join(filepath.Dir(file), "../../pkg/managedbootstrap/replacement.go"), nil, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -39,11 +39,11 @@ func TestManagedReplacementLoopReconcilesClosedRepairWithoutSQLReadiness(t *test
 			functions[fn.Name.Name] = fn
 		}
 	}
-	loop, reconcile := functions["runManagedReplacementLoop"], functions["reconcileManagedReplacement"]
+	loop, reconcile := functions["RunReplacementLoop"], functions["reconcileReplacement"]
 	if loop == nil || reconcile == nil {
 		t.Fatal("managed replacement control path is missing")
 	}
-	if !callsSelector(loop.Body, "reconcileManagedReplacement") {
+	if !callsSelector(loop.Body, "reconcileReplacement") {
 		t.Fatal("background loop no longer invokes managed replacement reconciliation")
 	}
 	if !callsSelector(reconcile.Body, "ReconcileExternalReplicas") {

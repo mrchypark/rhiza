@@ -154,7 +154,7 @@ fi
 published_install_only=${RHIZA_MANAGED_PUBLISHED_INSTALL_ONLY-false}
 functional_scenario=${RHIZA_MANAGED_FUNCTIONAL_SCENARIO-}
 case "$functional_scenario" in
-  ''|scale-up|quorum|external-scale|external-high) ;;
+  ''|scale-up|quorum|external-scale|external-high|autoscale) ;;
   *) echo 'invalid RHIZA_MANAGED_FUNCTIONAL_SCENARIO' >&2; exit 1 ;;
 esac
 managed_install_mode_valid "$published_install_only" "${RHIZA_MANAGED_FIXTURE_CASE-internal}"
@@ -170,6 +170,8 @@ nonce=$(od -An -N6 -tx1 /dev/urandom | tr -d ' \n')
 cluster="ha-managed-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-$nonce"
 namespace=managed-bootstrap
 image="rhiza-managed:$GITHUB_SHA-$nonce"
+embedded_image="rhiza-embedded-example:$GITHUB_SHA-$nonce"
+embedded_built=0
 if [ "$published_install_only" = true ]; then
   image=ghcr.io/mrchypark/rhiza-operator@sha256:2f7752353aa8796a074cf8cf3d91102f206d30cc0628cfd5fff4fcd37e555f40
 fi
@@ -186,7 +188,7 @@ k() {
       return
       ;;
     *" apply --validate=strict -f $logs/requested-cluster.json "*)
-      case "$functional_scenario" in external-scale|external-high)
+      case "$functional_scenario" in external-scale|external-high|autoscale)
         managed_functional_external_opt_in "$logs/requested-cluster.json"
         ;;
       esac
@@ -348,6 +350,10 @@ cleanup() {
     docker image rm "$image" > "$logs/image-cleanup.txt" 2>&1 || result=1
     if docker image inspect "$image" >/dev/null 2>&1; then result=1; fi
   fi
+  if [ "$embedded_built" = 1 ]; then
+    docker image rm "$embedded_image" > "$logs/embedded-image-cleanup.txt" 2>&1 || result=1
+    if docker image inspect "$embedded_image" >/dev/null 2>&1; then result=1; fi
+  fi
   cleanup_managed_private || result=1
   printf '%s\n' "$result" > "$logs/driver.exit"
   exit "$result"
@@ -362,6 +368,11 @@ if [ "$published_install_only" = false ]; then
   built=1
   docker build -f "${RHIZA_MANAGED_TEST_DOCKERFILE:-Dockerfile.operator}" -t "$image" . > "$logs/build.txt" 2>&1
   kind load docker-image --name "$cluster" "$image" > "$logs/load.txt" 2>&1
+  if [ "$functional_scenario" = autoscale ]; then
+    docker build -f scripts/ha-embedded-autoscale.Dockerfile -t "$embedded_image" . > "$logs/embedded-build.txt" 2>&1
+    embedded_built=1
+    kind load docker-image --name "$cluster" "$embedded_image" > "$logs/embedded-load.txt" 2>&1
+  fi
 fi
 k create namespace "$namespace"
 chaos_namespace_uid=$(k get namespace "$namespace" -o jsonpath='{.metadata.uid}')
@@ -388,5 +399,10 @@ managed_container_fault() {
 . scripts/ha-managed-bootstrap-fixture.sh
 if [ -n "$functional_scenario" ]; then
   . scripts/ha-managed-scale-qualification.sh
+  if [ "$functional_scenario" = autoscale ]; then
+    . scripts/ha-embedded-autoscale-qualification.sh
+    RHIZA_AUTOSCALE_DISPOSABLE_NAMESPACE=$namespace
+    managed_autoscale_install
+  fi
 fi
 managed_fixture

@@ -624,9 +624,14 @@ managed_functional_external_high_sequence='3 4 5 6 7 8 9 10 9 8 7 6 5 4 3'
 
 managed_functional_external_opt_in() {
   mfeo_file=$1
-  case "$functional_scenario" in external-scale|external-high) ;; *) return 0 ;; esac
+  case "$functional_scenario" in external-scale|external-high|autoscale) ;; *) return 0 ;; esac
   jq -e '.spec | type=="object" and ((has("replicas")|not) or .replicas==3)' "$mfeo_file" >/dev/null || return 1
-  jq '.spec.replicas=3' "$mfeo_file" > "$mfeo_file.external-scale.tmp" || return 1
+  if [ "$functional_scenario" = autoscale ]; then
+    : "${embedded_image:?}"
+    jq --arg image "$embedded_image" '.spec.replicas=3 | .spec.workload.embedded=true | .spec.workload.podTemplate.spec.containers[0] |= (.image=$image | .command=["/usr/local/bin/embedded-example"] | .resources.requests.cpu="100m")' "$mfeo_file" > "$mfeo_file.external-scale.tmp" || return 1
+  else
+    jq '.spec.replicas=3' "$mfeo_file" > "$mfeo_file.external-scale.tmp" || return 1
+  fi
   mv "$mfeo_file.external-scale.tmp" "$mfeo_file"
 }
 
@@ -1160,6 +1165,7 @@ managed_functional_qualification() {
     quorum) managed_functional_quorum ;;
     external-scale) managed_functional_external_scale ;;
     external-high) managed_functional_external_high ;;
+    autoscale) managed_embedded_autoscale_qualification ;;
     *) return 2 ;;
   esac
 }

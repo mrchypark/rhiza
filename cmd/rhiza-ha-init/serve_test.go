@@ -24,6 +24,7 @@ import (
 	"github.com/mrchypark/rhiza/internal/peertest"
 	"github.com/mrchypark/rhiza/internal/sqlpolicy"
 	"github.com/mrchypark/rhiza/internal/types"
+	"github.com/mrchypark/rhiza/pkg/managedbootstrap"
 	"github.com/mrchypark/rhiza/pkg/managedsql"
 	"github.com/mrchypark/rhiza/pkg/network"
 	"github.com/mrchypark/rhiza/pkg/node"
@@ -438,6 +439,38 @@ func TestManagedHandlerCommittedWriteAndRecoveryDoNotReserveCR(t *testing.T) {
 	after, err := operator.LoadV1Alpha2Admission(context.Background(), cfg.Store, cfg.Ref)
 	if err != nil || before.ResourceVersion() != after.ResourceVersion() || !bytes.Equal(before.Evidence(), after.Evidence()) {
 		t.Fatal("ordinary HTTP write mutated CR authority", err)
+	}
+}
+
+func TestEmbeddedReadinessRequiresApplicationAndQuorum(t *testing.T) {
+	host, _, _, _, _ := managedHTTPQuorum(t)
+	var ready atomic.Bool
+	h, err := managedbootstrap.ManagedHandlerWithReadiness(host, "private-admin", func(context.Context) error {
+		if !ready.Load() {
+			return errors.New("application unavailable")
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	probe := func() int {
+		r := httptest.NewRequest(http.MethodGet, "/readyz", nil)
+		r.Header.Set("Authorization", "Bearer private-admin")
+		w := httptest.NewRecorder()
+		h.ServeHTTP(w, r)
+		return w.Code
+	}
+	if got := probe(); got != http.StatusServiceUnavailable {
+		t.Fatalf("application unavailable: %d", got)
+	}
+	ready.Store(true)
+	if got := probe(); got != http.StatusNoContent {
+		t.Fatalf("application ready: %d", got)
+	}
+	ready.Store(false)
+	if got := probe(); got != http.StatusServiceUnavailable {
+		t.Fatalf("application stopped: %d", got)
 	}
 }
 

@@ -29,6 +29,27 @@ the managed overlay replaces those dependencies with the profile Secret.
 
 ## Installing the managed reference host
 
+### Embedded SQL host
+
+Set `spec.workload.embedded: true` with one container and its explicit
+`command` and optional `args`. The application image must include
+`/usr/local/bin/rhiza-ha-init` for the operator's readiness probe. At startup
+the application must decode the mounted profile, construct an in-cluster client
+and call `managedbootstrap.OpenEmbedded` using its Pod and cluster identity,
+the mounted identity, bootstrap and repair handoff paths, and an application
+readiness callback. The returned Host is
+the application's SQL host. Serve its authenticated `Control` handler on
+`0.0.0.0:8080`; the operator and readiness probe rely on its private API.
+Wait for application initialization before serving that handler, and cancel the
+context and close the EmbeddedHost during shutdown. A running process alone
+must not indicate readiness: the control handler checks both Host.Ready and the
+application readiness callback on every probe.
+
+The workload can specify `resources.requests.cpu` and `memory`; CPU requests
+are required for HPA CPU utilization. The operator preserves the request in
+the generated application container. Treat the profile and private control
+endpoint as sensitive deployment inputs.
+
 CR-driven managed deployment is implemented, but installing the inert base
 alone is not the managed installation procedure. Use the public sibling
 [managed overlay](../operator-managed/) after preparing its prerequisites:

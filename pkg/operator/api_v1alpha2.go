@@ -42,6 +42,7 @@ type V1Alpha2ClusterSpec struct {
 // fields, including volumes, environment and init containers, are rejected.
 type V1Alpha2Workload struct {
 	PodTemplate V1Alpha2PodTemplate `json:"podTemplate"`
+	Embedded    bool                `json:"embedded,omitempty"`
 }
 type V1Alpha2PodTemplate struct {
 	Spec V1Alpha2PodSpec `json:"spec"`
@@ -50,8 +51,15 @@ type V1Alpha2PodSpec struct {
 	Containers []V1Alpha2Container `json:"containers"`
 }
 type V1Alpha2Container struct {
-	Name  string `json:"name"`
-	Image string `json:"image"`
+	Name      string             `json:"name"`
+	Image     string             `json:"image"`
+	Command   []string           `json:"command,omitempty"`
+	Args      []string           `json:"args,omitempty"`
+	Resources *V1Alpha2Resources `json:"resources,omitempty"`
+}
+
+type V1Alpha2Resources struct {
+	Requests map[string]string `json:"requests,omitempty"`
 }
 
 type V1Alpha2Recovery struct {
@@ -124,6 +132,35 @@ func ValidateV1Alpha2Cluster(c V1Alpha2Cluster) error {
 			return fmt.Errorf("invalid, duplicate, or reserved container name or image")
 		}
 		seen[container.Name] = true
+		if !c.Spec.Workload.Embedded && (len(container.Command) != 0 || len(container.Args) != 0) {
+			return fmt.Errorf("command and args require embedded mode")
+		}
+		if len(container.Command) > 64 || len(container.Args) > 64 {
+			return fmt.Errorf("too many command arguments")
+		}
+		for _, v := range container.Command {
+			if len(v) == 0 || utf8.RuneCountInString(v) > 4096 {
+				return fmt.Errorf("invalid command")
+			}
+		}
+		for _, v := range container.Args {
+			if utf8.RuneCountInString(v) > 4096 {
+				return fmt.Errorf("invalid argument")
+			}
+		}
+		if container.Resources != nil {
+			for k, v := range container.Resources.Requests {
+				if (k != "cpu" && k != "memory") || len(v) == 0 || len(v) > 64 {
+					return fmt.Errorf("invalid resource request")
+				}
+				if _, ok := managedQuantity(v); !ok {
+					return fmt.Errorf("invalid resource request quantity")
+				}
+			}
+		}
+	}
+	if c.Spec.Workload.Embedded && (len(containers) != 1 || len(containers[0].Command) == 0 || containers[0].Command[0] == "") {
+		return fmt.Errorf("embedded mode requires one container and an explicit command")
 	}
 	return nil
 }

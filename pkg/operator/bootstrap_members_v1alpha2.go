@@ -53,7 +53,7 @@ func V1Alpha2ManagedPodSpec(image, crUID string, containers []V1Alpha2Container,
 
 // V1Alpha2ManagedSQLPodSpec is the first managed reference profile, not an
 // arbitrary image adapter. A missing reference-host executable fails closed.
-func V1Alpha2ManagedSQLPodSpec(ref V1Alpha2ClusterRef, profile V1Alpha2RuntimeProfile, containers []V1Alpha2Container) (map[string]any, error) {
+func V1Alpha2ManagedSQLPodSpec(ref V1Alpha2ClusterRef, profile V1Alpha2RuntimeProfile, containers []V1Alpha2Container, embedded ...bool) (map[string]any, error) {
 	if len(containers) != 1 || !validV1Alpha2ProfileSecretName(profile.ProfileSecretName) {
 		return nil, fmt.Errorf("managed SQL requires one container and a valid profile Secret name")
 	}
@@ -65,8 +65,22 @@ func V1Alpha2ManagedSQLPodSpec(ref V1Alpha2ClusterRef, profile V1Alpha2RuntimePr
 	pod["serviceAccountName"] = V1Alpha2ManagedHostServiceAccount
 	pod["automountServiceAccountToken"] = true
 	main := pod["containers"].([]map[string]any)[0]
+	if containers[0].Resources != nil {
+		main["resources"] = containers[0].Resources
+	}
 	main["command"] = []string{"/usr/local/bin/rhiza-ha-init"}
 	main["args"] = []string{"serve-managed-sql", "--runtime-profile", V1Alpha2ManagedRuntimeProfilePath, "--identity-file", V1Alpha2BootstrapIdentityPath, "--handoff-file", V1Alpha2BootstrapHandoffPath, "--listen", "0.0.0.0:8080"}
+	if len(embedded) == 1 && embedded[0] {
+		if len(containers[0].Command) == 0 || containers[0].Command[0] == "" {
+			return nil, fmt.Errorf("embedded mode requires an explicit command")
+		}
+		main["command"] = containers[0].Command
+		if len(containers[0].Args) > 0 {
+			main["args"] = containers[0].Args
+		} else {
+			delete(main, "args")
+		}
+	}
 	main["readinessProbe"] = map[string]any{"exec": map[string]any{"command": []string{"/usr/local/bin/rhiza-ha-init", "check-ready", "--runtime-profile", V1Alpha2ManagedRuntimeProfilePath}}, "periodSeconds": 5, "timeoutSeconds": 2, "successThreshold": 1, "failureThreshold": 3}
 	main["env"] = append(append([]any{}, init[0]["env"].([]any)...), map[string]any{"name": "RHIZA_CLUSTER_UID", "value": ref.UID})
 	main["securityContext"] = map[string]any{"allowPrivilegeEscalation": false, "capabilities": map[string]any{"drop": []string{"ALL"}}}
@@ -223,7 +237,7 @@ func CollectV1Alpha2BootstrapMembers(ctx context.Context, kube *Kubernetes, ref 
 	var expectedMain map[string]any
 	var expectedProfileVolume json.RawMessage
 	if len(profiles) == 1 {
-		pod, err := V1Alpha2ManagedSQLPodSpec(ref, profiles[0], cluster.Spec.Workload.PodTemplate.Spec.Containers)
+		pod, err := V1Alpha2ManagedSQLPodSpec(ref, profiles[0], cluster.Spec.Workload.PodTemplate.Spec.Containers, cluster.Spec.Workload.Embedded)
 		if err != nil {
 			return nil, err
 		}
@@ -256,6 +270,7 @@ func CollectV1Alpha2BootstrapMembers(ctx context.Context, kube *Kubernetes, ref 
 				Command, Args, Env json.RawMessage
 				ReadinessProbe     json.RawMessage
 				LivenessProbe      json.RawMessage
+				Resources          json.RawMessage
 				VolumeMounts       []struct {
 					Name, MountPath string
 					ReadOnly        bool
@@ -446,6 +461,17 @@ func CollectV1Alpha2BootstrapMembers(ctx context.Context, kube *Kubernetes, ref 
 					if !sameJSON(raw, want) {
 						return nil, fmt.Errorf("invalid managed main contract")
 					}
+				}
+				wantResources := json.RawMessage(`{}`)
+				if expectedMain["resources"] != nil {
+					wantResources, _ = json.Marshal(expectedMain["resources"])
+				}
+				gotResources := c.Resources
+				if len(gotResources) == 0 || sameJSON(gotResources, json.RawMessage(`null`)) {
+					gotResources = json.RawMessage(`{}`)
+				}
+				if !managedResourceRequestsEqual(gotResources, wantResources) {
+					return nil, fmt.Errorf("invalid managed main resources")
 				}
 			}
 			data, projected, profileMounts := 0, 0, 0
