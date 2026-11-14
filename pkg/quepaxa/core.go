@@ -1440,10 +1440,10 @@ func (c *Core) releaseSlot(slot Slot) {
 	c.vacant[index] = slot
 }
 
-func (c *Core) runSlot(ctx context.Context, slot Slot, value []byte, allowLeaderFastPath bool) (Decision, error) {
+func (c *Core) runSlot(ctx context.Context, slot Slot, value []byte, allowLeaderFastPath bool) (_ Decision, retErr error) {
 	if latencydiag.Enabled {
 		diagnosticStart := latencydiag.Start()
-		defer latencydiag.Observe("consensus_slot", uint64(slot), diagnosticStart)
+		defer func() { latencydiag.ObserveError("consensus_slot", uint64(slot), retErr, diagnosticStart) }()
 	}
 	leaderOrder, err := c.LeaderOrder(slot)
 	if err != nil {
@@ -1622,10 +1622,12 @@ func maxPrior(summaries []Summary) *Proposal {
 	return best
 }
 
-func (c *Core) recordQuorum(ctx context.Context, requests map[NodeID]RecordRequest) ([]Summary, error) {
+func (c *Core) recordQuorum(ctx context.Context, requests map[NodeID]RecordRequest) (_ []Summary, retErr error) {
 	if latencydiag.Enabled {
 		diagnosticStart := latencydiag.Start()
-		defer latencydiag.Observe("record_quorum", uint64(nextRequestSlot(requests)), diagnosticStart)
+		defer func() {
+			latencydiag.ObserveError("record_quorum", uint64(nextRequestSlot(requests)), retErr, diagnosticStart)
+		}()
 	}
 	if c.localMode {
 		if len(requests) != 1 {
@@ -3608,6 +3610,9 @@ func (c *Core) acceptCertifiedValues(values []DecidedValue, durable bool) error 
 	}
 	if !durable || len(slots) == 0 {
 		return nil
+	}
+	if localtesthooks.Enabled {
+		localtesthooks.Hit("core:certified-values:before-sync:node=" + string(c.NodeID()))
 	}
 	if err := c.commits.Sync(context.Background()); err != nil {
 		return err

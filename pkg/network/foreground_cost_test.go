@@ -138,7 +138,7 @@ func foregroundLearnObservationSummary(peers *foregroundAPIPeers, observation *f
 	return event + ":observation_time_local_certified=" + strings.Join(snapshots, ",")
 }
 
-func newForegroundAPIPeers(t testing.TB, root string) *foregroundAPIPeers {
+func newForegroundAPIPeers(t testing.TB, root string, reconfiguration ...bool) *foregroundAPIPeers {
 	t.Helper()
 	clusterID := types.ClusterID("foreground-api")
 	ids := []quepaxa.NodeID{"n1", "n2", "n3"}
@@ -173,7 +173,7 @@ func newForegroundAPIPeers(t testing.TB, root string) *foregroundAPIPeers {
 			t.Fatal(err)
 		}
 		peers.wals = append(peers.wals, wal)
-		core, err := quepaxa.New(quepaxa.Config{NodeID: member.ID, Cluster: peers.config, WAL: wal, Transport: transport})
+		core, err := quepaxa.New(quepaxa.Config{NodeID: member.ID, Cluster: peers.config, WAL: wal, Transport: transport, EnableReconfiguration: len(reconfiguration) > 0 && reconfiguration[0]})
 		if err != nil {
 			_ = wal.Close()
 			t.Fatal(err)

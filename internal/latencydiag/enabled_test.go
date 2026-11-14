@@ -44,3 +44,22 @@ func TestBatchEventReportsSyncFailure(t *testing.T) {
 		}
 	}
 }
+
+func TestObserveErrorRecordsActualOutcome(t *testing.T) {
+	// Suppress the asynchronous writer so the captured events remain inspectable.
+	startWriter.Do(func() {})
+	ring.drain()
+	begin := time.Now().Add(-time.Second)
+	ObserveError("record_quorum", 1, context.Canceled, begin)
+	ObserveError("wal_shared_wait", 2, nil, begin)
+	ObservePeer("peer_record", 3, "peer", context.DeadlineExceeded, begin)
+	events, dropped := ring.drain()
+	if dropped != 0 || len(events) != 3 {
+		t.Fatalf("got %d events and %d dropped", len(events), dropped)
+	}
+	for i, want := range []string{"error", "ok", "error"} {
+		if events[i].outcome != want {
+			t.Fatalf("event %d outcome=%q, want %q", i, events[i].outcome, want)
+		}
+	}
+}

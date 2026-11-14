@@ -39,10 +39,10 @@ func (g *groupCommit) Sync(ctx context.Context) error {
 
 // syncBatch joins the pending batch before requesting an early flush. The
 // existing worker still serializes WAL Sync and publishes the shared result.
-func (g *groupCommit) syncBatch(ctx context.Context, immediate bool) error {
+func (g *groupCommit) syncBatch(ctx context.Context, immediate bool) (retErr error) {
 	if latencydiag.Enabled {
 		diagnosticStart := latencydiag.Start()
-		defer latencydiag.Observe("wal_shared_wait", latencydiag.Slot(ctx), diagnosticStart)
+		defer func() { latencydiag.ObserveError("wal_shared_wait", latencydiag.Slot(ctx), retErr, diagnosticStart) }()
 	}
 	g.mu.Lock()
 	if g.pending == nil {

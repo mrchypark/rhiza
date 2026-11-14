@@ -81,6 +81,9 @@ func start() {
 	})
 }
 func Observe(stage string, slot uint64, start time.Time) { observe(stage, slot, "", nil, start) }
+func ObserveError(stage string, slot uint64, err error, start time.Time) {
+	observe(stage, slot, "", err, start)
+}
 func ObserveBatch(stage string, count int, err error, begin time.Time) {
 	end := time.Now()
 	if end.Sub(begin) < 100*time.Millisecond {

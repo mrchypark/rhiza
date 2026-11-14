@@ -526,6 +526,28 @@ func (s *PeerServer) handle(ctx context.Context, certificateKey ed25519.PublicKe
 			}
 			return nil, err
 		}
+		if !control && decision.Slot > 1 && s.server.core.Tip() < decision.Slot-1 {
+			if localtesthooks.Enabled {
+				localtesthooks.Hit(fmt.Sprintf("network:learned:phase=prefix-catchup-start:node=%s:sender=%s:slot=%d", s.server.core.NodeID(), request.SenderId, decision.Slot))
+			}
+			if s.server.transport != nil {
+				// This is an opportunistic fast path. On source failure, retain
+				// the existing wait for another certified recovery source.
+				catchupErr, installFailed := s.server.catchUpLearnedPrefix(ctx, quepaxa.NodeID(request.SenderId), decision.Slot-1)
+				if installFailed {
+					if localtesthooks.Enabled {
+						localtesthooks.Hit(fmt.Sprintf("network:learned:phase=prefix-install-failed:node=%s:slot=%d:error=%q", s.server.core.NodeID(), decision.Slot, catchupErr.Error()))
+					}
+					return nil, catchupErr
+				}
+				if catchupErr != nil && localtesthooks.Enabled {
+					localtesthooks.Hit(fmt.Sprintf("network:learned:phase=prefix-catchup-failed:node=%s:sender=%s:slot=%d:error=%q", s.server.core.NodeID(), request.SenderId, decision.Slot, catchupErr.Error()))
+				}
+				if err := ctx.Err(); err != nil {
+					return nil, err
+				}
+			}
+		}
 		if localtesthooks.Enabled {
 			localtesthooks.Hit(fmt.Sprintf("network:learned:phase=accept-complete:node=%s:sender=%s:slot=%d", s.server.core.NodeID(), request.SenderId, decision.Slot))
 			localtesthooks.Hit(fmt.Sprintf("network:learned:phase=apply-start:node=%s:sender=%s:slot=%d", s.server.core.NodeID(), request.SenderId, decision.Slot))
@@ -544,6 +566,9 @@ func (s *PeerServer) handle(ctx context.Context, certificateKey ed25519.PublicKe
 		// Diagnostic events omit stages under the latency recorder's 100ms threshold.
 		if request.From == 0 || request.Limit == 0 || request.Limit > 128 {
 			return nil, fmt.Errorf("invalid decisions range")
+		}
+		if localtesthooks.Enabled {
+			localtesthooks.Hit(fmt.Sprintf("network:sync:phase=entered:node=%s:sender=%s:from=%d", s.server.core.NodeID(), request.SenderId, request.From))
 		}
 		fetchStart := latencydiag.Start()
 		decisions, tip, err := s.server.core.DecisionsFrom(quepaxa.Slot(request.From), int(request.Limit))

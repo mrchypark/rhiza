@@ -905,10 +905,12 @@ func (t *Transport) FetchFrozenTargetDecisions(ctx context.Context, source quepa
 	return result.Decisions, result.Tip, nil
 }
 
-func (t *Transport) SendRecord(ctx context.Context, to quepaxa.NodeID, request quepaxa.RecordRequest) (quepaxa.Summary, error) {
+func (t *Transport) SendRecord(ctx context.Context, to quepaxa.NodeID, request quepaxa.RecordRequest) (_ quepaxa.Summary, retErr error) {
 	if latencydiag.Enabled {
 		diagnosticStart := latencydiag.Start()
-		defer latencydiag.Observe("peer_record", uint64(request.Slot), diagnosticStart)
+		defer func() {
+			latencydiag.ObservePeer("peer_record", uint64(request.Slot), string(to), retErr, diagnosticStart)
+		}()
 	}
 	peer, closePeer, err := t.transportForSlotLease(request.Slot)
 	if err != nil {

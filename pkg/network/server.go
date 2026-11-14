@@ -1179,6 +1179,105 @@ func (s *Server) catchUpFrom(ctx context.Context, source quepaxa.NodeID, through
 	return s.catchUpFromTip(ctx, source, through, durable, s.core.Tip)
 }
 
+// Only the read-only page request races another repair. The handler retains
+// ownership of all certificate validation, installation, and WAL work.
+// The boolean reports an installation error, which must not be hidden by a
+// later advance of the local tip.
+func (s *Server) catchUpLearnedPrefix(ctx context.Context, source quepaxa.NodeID, through quepaxa.Slot) (error, bool) {
+	type pageResult struct {
+		page    DecisionsResponse
+		err     error
+		release func()
+	}
+	for s.core.Tip() < through {
+		from := s.core.Tip() + 1
+		workCtx, cancel := context.WithCancel(ctx)
+		fetched := make(chan pageResult, 1)
+		advanced := make(chan error, 1)
+		go func() {
+			unlock, err := s.lockCatchUp(workCtx, source)
+			if err != nil {
+				fetched <- pageResult{err: err}
+				return
+			}
+			select {
+			case s.syncLimit <- struct{}{}:
+			case <-workCtx.Done():
+				unlock()
+				fetched <- pageResult{err: workCtx.Err()}
+				return
+			}
+			var releaseOnce sync.Once
+			release := func() { releaseOnce.Do(func() { <-s.syncLimit; unlock() }) }
+			page, err := fetchDecisionsWithRetry(workCtx, s.transport.FetchDecisions, source, from)
+			fetched <- pageResult{page: page, err: err, release: release}
+		}()
+		go func() { advanced <- s.core.WaitTip(workCtx, through) }()
+		var result pageResult
+		select {
+		case result = <-fetched:
+			cancel()
+			<-advanced
+		case <-advanced:
+			cancel()
+			result = <-fetched
+		}
+		if result.release != nil {
+			defer result.release()
+		}
+		if result.err == nil && localtesthooks.Enabled {
+			localtesthooks.Hit(fmt.Sprintf("network:learned:prefix-page-fetched:node=%s:from=%d:through=%d", s.core.NodeID(), from, through))
+		}
+		if err := ctx.Err(); err != nil {
+			return err, false
+		}
+		if s.core.Tip() >= through {
+			return nil, false
+		}
+		if result.err != nil {
+			return result.err, false
+		}
+		if len(result.page.Decisions) == 0 || result.page.Decisions[0].Slot != from {
+			return fmt.Errorf("peer %s omitted decision slot %d", source, from), false
+		}
+		values := result.page.Decisions[:0]
+		for i, value := range result.page.Decisions {
+			if value.Slot != from+quepaxa.Slot(i) {
+				return fmt.Errorf("peer %s returned noncontiguous decisions", source), true
+			}
+			if value.Slot > through {
+				break
+			}
+			if value.Slot <= s.core.Tip() {
+				continue
+			}
+			if err := s.validateExecutionPolicy(value.Value); err != nil {
+				return err, true
+			}
+			values = append(values, value)
+		}
+		if len(values) != 0 {
+			if localtesthooks.Enabled {
+				localtesthooks.Hit(fmt.Sprintf("network:learned:prefix-before-install:node=%s:from=%d:through=%d", s.core.NodeID(), from, through))
+			}
+			if err := ctx.Err(); err != nil {
+				return err, false
+			}
+			if s.core.Tip() >= through {
+				return nil, false
+			}
+			if err := s.core.AcceptCertifiedValues(values); err != nil {
+				return err, true
+			}
+		}
+		if result.release != nil {
+			result.release()
+			result.release = nil
+		}
+	}
+	return nil, false
+}
+
 // The per-call reader keeps the fetch-range calculation independently testable
 // with a real Core advancing between observations; production reads Core.Tip.
 func (s *Server) catchUpFromTip(ctx context.Context, source quepaxa.NodeID, through quepaxa.Slot, durable bool, tip func() quepaxa.Slot) error {
