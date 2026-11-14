@@ -2,6 +2,7 @@ name: Performance
 
 on:
   pull_request:
+    types: [opened, synchronize, reopened, labeled]
     paths:
       - "**/*.go"
       - go.mod
@@ -46,12 +47,12 @@ permissions:
   contents: read
 
 concurrency:
-  group: performance-${{ github.event.pull_request.number || github.ref }}
+  group: performance-${{ github.event.action == 'labeled' && 'cost' || 'regular' }}-${{ github.event.pull_request.number || github.ref }}
   cancel-in-progress: true
 
 jobs:
   archive-head-allocation-profile:
-    if: ${{ !inputs.refresh_hiqlite_reference && !inputs.issue185_cost_evidence && (inputs.network_optimization == '' || inputs.network_optimization == 'none') }}
+    if: ${{ github.event.action != 'labeled' && !inputs.refresh_hiqlite_reference && !inputs.issue185_cost_evidence && (inputs.network_optimization == '' || inputs.network_optimization == 'none') }}
     runs-on: ubuntu-24.04
     timeout-minutes: 15
     env:
@@ -93,7 +94,7 @@ jobs:
           retention-days: 30
 
   paired-go-benchmarks:
-    if: ${{ !inputs.refresh_hiqlite_reference && !inputs.issue185_cost_evidence }}
+    if: ${{ github.event.action != 'labeled' && !inputs.refresh_hiqlite_reference && !inputs.issue185_cost_evidence }}
     runs-on: ubuntu-24.04
     timeout-minutes: 60
     env:
@@ -321,11 +322,13 @@ jobs:
           retention-days: 30
 
   issue185-cost-evidence:
-    if: ${{ inputs.issue185_cost_evidence }}
+    if: ${{ inputs.issue185_cost_evidence || (github.event.action == 'labeled' && github.event.label.name == 'cost-evidence') }}
     runs-on: macos-15
     timeout-minutes: 80
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
 
       - name: Initialize evidence directory
         run: mkdir -p "$RUNNER_TEMP/issue-185-cost-evidence/logs" "$RUNNER_TEMP/issue-185-cost-evidence/versity-raw"
