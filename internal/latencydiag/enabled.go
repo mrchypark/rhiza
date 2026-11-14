@@ -26,6 +26,7 @@ func Start() time.Time                { return time.Now() }
 type event struct {
 	stage, outcome string
 	slot           uint64
+	count          int
 	peer           [8]byte
 	start, end     time.Time
 }
@@ -73,13 +74,28 @@ func start() {
 					fmt.Fprintf(os.Stderr, "rhiza_latency dropped=%d\n", dropped)
 				}
 				for _, e := range events {
-					fmt.Fprintf(os.Stderr, "rhiza_latency stage=%s slot=%d peer=%x outcome=%s start_unix_ns=%d end_unix_ns=%d duration_ns=%d\n", e.stage, e.slot, e.peer, e.outcome, e.start.UnixNano(), e.end.UnixNano(), e.end.Sub(e.start).Nanoseconds())
+					fmt.Fprintf(os.Stderr, "rhiza_latency stage=%s slot=%d count=%d peer=%x outcome=%s start_unix_ns=%d end_unix_ns=%d duration_ns=%d\n", e.stage, e.slot, e.count, e.peer, e.outcome, e.start.UnixNano(), e.end.UnixNano(), e.end.Sub(e.start).Nanoseconds())
 				}
 			}
 		}()
 	})
 }
 func Observe(stage string, slot uint64, start time.Time) { observe(stage, slot, "", nil, start) }
+func ObserveBatch(stage string, count int, err error, begin time.Time) {
+	end := time.Now()
+	if end.Sub(begin) < 100*time.Millisecond {
+		return
+	}
+	start()
+	ring.add(batchEvent(stage, count, err, begin, end))
+}
+func batchEvent(stage string, count int, err error, begin, end time.Time) event {
+	outcome := "ok"
+	if err != nil {
+		outcome = "error"
+	}
+	return event{stage: stage, count: count, start: begin, end: end, outcome: outcome}
+}
 func ObservePeer(stage string, slot uint64, peer string, err error, start time.Time) {
 	observe(stage, slot, peer, err, start)
 }

@@ -11,7 +11,9 @@ import (
 	"path/filepath"
 	"sort"
 	"sync"
+	"time"
 
+	"github.com/mrchypark/rhiza/internal/latencydiag"
 	"github.com/mrchypark/rhiza/internal/localtesthooks"
 )
 
@@ -667,7 +669,14 @@ func (w *WAL) cleanupOldManifests(current string) error {
 
 // Append appends an entry to the WAL.
 func (w *WAL) Append(entry Entry) error {
+	var lockStart time.Time
+	if latencydiag.Enabled {
+		lockStart = latencydiag.Start()
+	}
 	w.mu.Lock()
+	if latencydiag.Enabled {
+		latencydiag.Observe("wal_append_lock_wait", 0, lockStart)
+	}
 	defer w.mu.Unlock()
 	if w.readOnly {
 		return fmt.Errorf("WAL inspection is read-only")
@@ -717,7 +726,14 @@ func (w *WAL) Append(entry Entry) error {
 // Sync flushes the current segment. Older segments are immutable and synced
 // before rollover.
 func (w *WAL) Sync() error {
+	var lockStart time.Time
+	if latencydiag.Enabled {
+		lockStart = latencydiag.Start()
+	}
 	w.mu.Lock()
+	if latencydiag.Enabled {
+		latencydiag.Observe("wal_sync_lock_wait", 0, lockStart)
+	}
 	defer w.mu.Unlock()
 	if w.readOnly {
 		return nil
@@ -731,7 +747,15 @@ func (w *WAL) Sync() error {
 	}
 	w.current.mu.Lock()
 	defer w.current.mu.Unlock()
-	if err := w.current.file.Sync(); err != nil {
+	var syncStart time.Time
+	if latencydiag.Enabled {
+		syncStart = latencydiag.Start()
+	}
+	err := w.current.file.Sync()
+	if latencydiag.Enabled {
+		latencydiag.ObservePeer("wal_file_sync", 0, "", err, syncStart)
+	}
+	if err != nil {
 		return err
 	}
 	w.dirty = false

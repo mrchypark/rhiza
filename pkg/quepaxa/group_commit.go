@@ -84,7 +84,7 @@ func (g *groupCommit) flush() {
 		diagnosticStart := latencydiag.Start()
 		batch.err = g.sync()
 		if latencydiag.Enabled {
-			latencydiag.Observe("wal_sync", 0, diagnosticStart)
+			latencydiag.ObserveBatch("wal_sync", batch.waiters, batch.err, diagnosticStart)
 		}
 		close(batch.done)
 		g.mu.Lock()

@@ -19,6 +19,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/mrchypark/rhiza/internal/latencydiag"
 	"github.com/mrchypark/rhiza/internal/localtesthooks"
 	"github.com/mrchypark/rhiza/internal/peertest"
 	"github.com/mrchypark/rhiza/internal/types"
@@ -250,9 +251,14 @@ func (s *PeerServer) serveConnection(ctx context.Context, conn *quic.Conn) {
 		}
 		select {
 		case s.streams <- struct{}{}:
+			// The operation is not decoded yet; this schedule event is not Sync-specific.
+			accepted := latencydiag.Start()
 			s.wg.Add(1)
 			go func() {
 				defer func() { <-s.streams; s.wg.Done() }()
+				if latencydiag.Enabled {
+					latencydiag.Observe("peer_stream_schedule", 0, accepted)
+				}
 				s.serveStream(conn, stream)
 			}()
 		default:
@@ -269,6 +275,9 @@ func (s *PeerServer) serveStream(conn *quic.Conn, stream *quic.Stream) {
 	var learnedSlot quepaxa.Slot
 	var learnedSender quepaxa.NodeID
 	learned := false
+	var syncFrom uint64
+	var syncSender string
+	isSync := false
 	data, err := readPeerFrame(stream)
 	s.diagnosticPhase("request-read", err)
 	if err == nil {
@@ -285,6 +294,9 @@ func (s *PeerServer) serveStream(conn *quic.Conn, stream *quic.Stream) {
 		request, err = decodePeerRequest(data)
 		s.diagnosticPhase("request-decode", err)
 		if err == nil {
+			if request.Operation == peerfb.OperationSync {
+				isSync, syncFrom, syncSender = true, request.From, request.SenderId
+			}
 			if request.Operation == peerfb.OperationLearned && request.Decision != nil {
 				learned = true
 				learnedSlot = quepaxa.Slot(request.Decision.Slot)
@@ -296,7 +308,11 @@ func (s *PeerServer) serveStream(conn *quic.Conn, stream *quic.Stream) {
 			if request.Operation == peerfb.OperationPrepareCheckpoint {
 				_ = stream.SetDeadline(time.Now().Add(checkpointPrepareTimeout))
 			}
+			handleStart := latencydiag.Start()
 			response, err = s.handle(stream.Context(), peerCertificateKey(conn), request)
+			if latencydiag.Enabled && isSync {
+				latencydiag.ObservePeer("peer_sync_handle", syncFrom, syncSender, err, handleStart)
+			}
 			if learned && localtesthooks.Enabled {
 				message := ""
 				if err != nil {
@@ -319,7 +335,16 @@ func (s *PeerServer) serveStream(conn *quic.Conn, stream *quic.Stream) {
 			response.ErrorCode = peerErrorConfigurationLag
 		}
 	}
-	writeErr := writePeerFrame(stream, encodePeerResponse(response))
+	encodeStart := latencydiag.Start()
+	encoded := encodePeerResponse(response)
+	if latencydiag.Enabled && isSync {
+		latencydiag.ObservePeer("peer_sync_encode", syncFrom, syncSender, err, encodeStart)
+	}
+	writeStart := latencydiag.Start()
+	writeErr := writePeerFrame(stream, encoded)
+	if latencydiag.Enabled && isSync {
+		latencydiag.ObservePeer("peer_sync_write", syncFrom, syncSender, writeErr, writeStart)
+	}
 	s.diagnosticPhase("response-write", writeErr)
 	if writeErr != nil {
 		stream.CancelWrite(1)
@@ -516,14 +541,20 @@ func (s *PeerServer) handle(ctx context.Context, certificateKey ed25519.PublicKe
 		}
 		return &peerfb.ResponseT{}, nil
 	case peerfb.OperationSync:
+		// Diagnostic events omit stages under the latency recorder's 100ms threshold.
 		if request.From == 0 || request.Limit == 0 || request.Limit > 128 {
 			return nil, fmt.Errorf("invalid decisions range")
 		}
+		fetchStart := latencydiag.Start()
 		decisions, tip, err := s.server.core.DecisionsFrom(quepaxa.Slot(request.From), int(request.Limit))
+		if latencydiag.Enabled {
+			latencydiag.ObservePeer("peer_sync_fetch", request.From, request.SenderId, err, fetchStart)
+		}
 		if err != nil {
 			return nil, err
 		}
 		response := &peerfb.ResponseT{ClusterId: string(s.server.cluster), ProposerId: string(s.server.core.NodeID()), ConfigId: request.ConfigId, Tip: uint64(tip)}
+		prepareStart := latencydiag.Start()
 		wireDecisions := make([]*peerfb.DecidedValueT, len(decisions))
 		for i := range decisions {
 			wireDecisions[i] = decidedToWire(decisions[i])
@@ -543,6 +574,9 @@ func (s *PeerServer) handle(ctx context.Context, certificateKey ed25519.PublicKe
 			return nil, fmt.Errorf("decision %d exceeds peer frame limit", decisions[0].Slot)
 		}
 		response.Decisions = wireDecisions[:fit]
+		if latencydiag.Enabled {
+			latencydiag.ObservePeer("peer_sync_prepare", request.From, request.SenderId, ctx.Err(), prepareStart)
+		}
 		return response, nil
 	case peerfb.OperationReadIndex:
 		if err := s.server.core.PrepareReadIndexParticipation(ctx); err != nil {

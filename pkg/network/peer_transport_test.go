@@ -223,6 +223,46 @@ func TestQUICFlatBuffersRecordRoundTrip(t *testing.T) {
 	defer replacement.Close()
 	member.PeerURL = "quic://" + replacement.Addr()
 	transport.members[member.ID] = member
+	decoded := make(chan struct{})
+	releaseSync := make(chan struct{})
+	var decodedOnce sync.Once
+	blockSync := func(phase string, err error) {
+		if phase == "request-decode" && err == nil {
+			decodedOnce.Do(func() { close(decoded); <-releaseSync })
+		}
+	}
+	replacement.diagnostic.Store(&blockSync)
+	inflightCtx, cancelInflight := context.WithCancel(ctx)
+	inflightResult := make(chan error, 1)
+	go func() {
+		_, err := transport.FetchDecisions(inflightCtx, member.ID, 1, 1)
+		inflightResult <- err
+	}()
+	select {
+	case <-decoded:
+	case <-callCtx.Done():
+		cancelInflight()
+		close(releaseSync)
+		t.Fatal("Sync did not reach server before deadline")
+	}
+	cancelInflight()
+	select {
+	case err := <-inflightResult:
+		if !errors.Is(err, context.Canceled) {
+			close(releaseSync)
+			t.Fatalf("in-flight canceled Sync: got %v", err)
+		}
+	case <-callCtx.Done():
+		close(releaseSync)
+		t.Fatal("in-flight Sync did not stop")
+	}
+	close(releaseSync)
+	replacement.diagnostic.Store(nil)
+	canceledSync, cancelSync := context.WithCancel(ctx)
+	cancelSync()
+	if _, err := transport.FetchDecisions(canceledSync, member.ID, 1, 1); !errors.Is(err, context.Canceled) {
+		t.Fatalf("canceled Sync: got %v, want context cancellation", err)
+	}
 	if _, err := transport.FetchDecisions(callCtx, member.ID, 1, 1); err != nil {
 		t.Fatalf("Sync after peer restart failed: %v", err)
 	}
