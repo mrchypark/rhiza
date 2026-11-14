@@ -50,6 +50,48 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  archive-head-allocation-profile:
+    if: ${{ !inputs.refresh_hiqlite_reference && !inputs.issue185_cost_evidence && (inputs.network_optimization == '' || inputs.network_optimization == 'none') }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    env:
+      CGO_ENABLED: 0
+      GOMAXPROCS: 2
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.candidate_ref || github.event.pull_request.head.sha || github.sha }}
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+          cache: true
+      - name: Profile large authenticated archive head readback
+        run: |
+          mkdir -p "$RUNNER_TEMP/archive-head-profile"
+          git rev-parse HEAD > "$RUNNER_TEMP/archive-head-profile/commit.txt"
+          go version > "$RUNNER_TEMP/archive-head-profile/go-version.txt"
+          go test ./pkg/recovery -run '^$' \
+            -bench '^BenchmarkArchiveHeadEvidenceStages$/^large-authenticated-history$/^stable-readback$' \
+            -benchtime=10x -count=1 -memprofilerate=1 \
+            -memprofile "$RUNNER_TEMP/archive-head-profile/allocs.pprof" \
+            -o "$RUNNER_TEMP/archive-head-profile/recovery.test" \
+            | tee "$RUNNER_TEMP/archive-head-profile/benchmark.txt"
+          grep -q '^BenchmarkArchiveHeadEvidenceStages/large-authenticated-history/stable-readback' \
+            "$RUNNER_TEMP/archive-head-profile/benchmark.txt"
+          printf '%s\n' 'The profile covers the whole test process, including benchmark fixture setup; benchmark.txt reports per-operation allocations.' > "$RUNNER_TEMP/archive-head-profile/README.txt"
+          go tool pprof -top -alloc_space "$RUNNER_TEMP/archive-head-profile/recovery.test" \
+            "$RUNNER_TEMP/archive-head-profile/allocs.pprof" > "$RUNNER_TEMP/archive-head-profile/alloc-space.txt"
+          go tool pprof -top -alloc_objects "$RUNNER_TEMP/archive-head-profile/recovery.test" \
+            "$RUNNER_TEMP/archive-head-profile/allocs.pprof" > "$RUNNER_TEMP/archive-head-profile/alloc-objects.txt"
+      - name: Upload archive head allocation profile
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: archive-head-allocation-profile-${{ github.run_id }}
+          path: ${{ runner.temp }}/archive-head-profile
+          if-no-files-found: error
+          retention-days: 30
+
   paired-go-benchmarks:
     if: ${{ !inputs.refresh_hiqlite_reference && !inputs.issue185_cost_evidence }}
     runs-on: ubuntu-24.04
