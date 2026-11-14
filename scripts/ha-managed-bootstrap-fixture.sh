@@ -16,10 +16,58 @@ managed_initial_ack_oracle() {
   fi
 }
 
+# Keep only fixed-shape restart evidence after checking the exact Pod UID.
+managed_capture_restart_failure() {
+  capture_pod=$1 capture_uid=$2
+  capture_raw="$private/restart-capture.raw"
+  capture_pod_state="$private/restart-capture-pod.json"
+  capture_out="$logs/restart-contract-diagnostic.txt"
+  if ! k -n "$namespace" logs "$capture_pod" -c sql --tail=200 --limit-bytes=65536 > "$capture_raw" 2>/dev/null; then
+    printf '%s\n' 'RESTART_CONTRACT_DIAGNOSTIC_UNAVAILABLE reason=log_read_failed' > "$capture_out"
+  elif ! k -n "$namespace" get pod "$capture_pod" -o json > "$capture_pod_state" 2>/dev/null ||
+    ! jq -e --arg uid "$capture_uid" --arg cluster "$uid" '.metadata.uid==$uid and .metadata.labels["rhiza.mrchypark.dev/cluster-uid"]==$cluster' "$capture_pod_state" >/dev/null; then
+    printf '%s\n' 'RESTART_CONTRACT_DIAGNOSTIC_UNAVAILABLE reason=pod_identity_unverified' > "$capture_out"
+  else
+    awk '
+      /^RESTART_CONTRACT_DIAGNOSTIC_BEGIN$/ { in_capture=1; found=1; print; next }
+      /^RESTART_CONTRACT_DIAGNOSTIC_END$/ { if(in_capture) print; in_capture=0; next }
+      in_capture && /^RESTART_CONTRACT_FAILURE stage=(go|rust|internal-profile|graph|graph-profile|graph-qualification)-restart code=[0-9][0-9]?[0-9]?$/ { print; next }
+      in_capture && /^GO_(CONTRACT|QUALIFICATION)_SOURCE [a-z_]+\.go:[0-9]+:$/ { print; next }
+      in_capture && /^MANAGED_KV_UNKNOWN stage=(batch|batch_propose|batch_apply|receipt_lookup|receipt_missing) slot=[0-9]+ cause=(other|deadline|canceled|durability_unavailable|quorum_unavailable|not_ready)$/ { print; next }
+      in_capture && /^MANAGED_GRAPH_READINESS_REFUSED reason=(not_writable|callback_missing|callback_false|lifecycle_failed|material_missing)$/ { print; next }
+      in_capture && /^MANAGED_GRAPH_EXECUTE_FAILURE stage=(host_initial_admission|node_binding|node_protocol|node_admission|node_application_start|network_readiness|network_context|network_prepare|network_decode|network_fingerprint|network_charge|network_admission|network_request_lock|network_receipt_lookup|network_receipt_durability|network_submit) cause=(canceled|deadline|not_ready|reconfiguration_drain|invalid_request|request_conflict|overloaded|durability_unavailable|commit_unknown|quorum_unavailable|other)$/ { print; next }
+      in_capture && /^MANAGED_OPERATION_DIAGNOSTIC operation=(execute|query|ready|request_status|recover_pending|recover_pending_detailed|kv_put|kv_delete|kv_cas|kv_get|graph_execute|graph_query|graph_reachable|graph_changes|graph_stream_read|graph_stream_offset|unsupported) code=(internal|commit_unknown|kv_recovery_required|kv_not_submitted|sql_recovery_required|sql_not_submitted|timeout|canceled|invalid_request|not_ready|quorum_unavailable|request_conflict|durability_unavailable|overloaded|unclassified) cause=(unclassified|deadline|canceled|quorum_unavailable|durability_unavailable|not_ready|overloaded|request_conflict) context_known=(true|false) slot=[0-9]+ retry=[0-9]+$/ { print; next }
+      END { if(!found) print "RESTART_CONTRACT_DIAGNOSTIC_UNAVAILABLE reason=marker_not_observed" }
+    ' "$capture_raw" > "$capture_out"
+  fi
+  rm -f "$capture_raw" "$capture_pod_state"
+}
+
+managed_capture_restart_once() {
+  [ "${restart_capture_attempted-0}" = 0 ] || return 0
+  restart_capture_attempted=1
+  managed_capture_restart_failure "$replacement_pod" "$replacement_uid" || :
+}
+
+managed_wait_restart_ready() {
+  restart_wait_limit=$1
+  attempt=0
+  until k -n "$namespace" get pod "$replacement_pod" -o json > "$logs/restarted-pod.json" &&
+    jq -e --arg uid "$replacement_uid" --argjson before "$restart_before" '.metadata.uid==$uid and any(.status.containerStatuses[]; .name=="sql" and .restartCount>$before and .ready==true) and ([.status.initContainerStatuses[]|select(.state.terminated.exitCode==0)]|length)==2' "$logs/restarted-pod.json" >/dev/null; do
+    attempt=$((attempt+1))
+    if [ "$attempt" -ge "$restart_wait_limit" ]; then
+      [ "${restart_capture_active-0}" != 1 ] || managed_capture_restart_once
+      return 1
+    fi
+    sleep 1
+  done
+  [ "${restart_capture_active-0}" != 1 ] || managed_capture_restart_once
+}
+
 managed_initial_oracle_self_test() (
   set -eu
   oracle_dir=$(mktemp -d)
-  trap 'rm -f "$oracle_dir/ack.json" "$oracle_dir/query.json" "$oracle_dir/pods.json" "$oracle_dir/error"; rmdir "$oracle_dir"' EXIT HUP INT TERM
+  trap 'rm -f "$oracle_dir/ack.json" "$oracle_dir/query.json" "$oracle_dir/pods.json" "$oracle_dir/error" "$oracle_dir/restart-capture.raw" "$oracle_dir/restart-capture-pod.json" "$oracle_dir/restart-contract-diagnostic.txt" "$oracle_dir/restarted-pod.json"; rmdir "$oracle_dir"' EXIT HUP INT TERM
   printf '%s\n' '{"status":"committed","slot":7,"retry_through_slot":99,"rows_affected":1}' > "$oracle_dir/ack.json"
   managed_initial_ack_oracle "$oracle_dir/ack.json" insert_ack || exit 1
   printf '%s\n' '{"status":"committed","slot":7,"retry_through_slot":99,"applied":false}' > "$oracle_dir/ack.json"
@@ -39,6 +87,35 @@ managed_initial_oracle_self_test() (
   printf '%s\n' '{"items":[{"status":{"containerStatuses":[{"restartCount":1}]}}]}' > "$oracle_dir/pods.json"
   if managed_bootstrap_check initial restart_zero "$oracle_dir/pods.json" 'all(.items[]; all(.status.containerStatuses[]; .restartCount==0))' 2> "$oracle_dir/error"; then exit 1; fi
   grep -Fx 'MANAGED_BOOTSTRAP_ORACLE_FAILURE phase=initial check=restart_zero artifact=pods.json' "$oracle_dir/error" || exit 1
+  private=$oracle_dir logs=$oracle_dir namespace=ns uid=cluster
+  capture_mode=ok
+  k() {
+    case "$3" in
+      logs)
+        [ "$capture_mode" != logfail ] || return 1
+        if [ "$capture_mode" != missing ]; then
+          printf '%s\n' 'RESTART_CONTRACT_DIAGNOSTIC_BEGIN' 'RESTART_CONTRACT_FAILURE stage=go-restart code=7' 'MANAGED_KV_UNKNOWN stage=receipt_lookup slot=156 cause=other' 'MANAGED_KV_UNKNOWN stage=receipt_lookup slot=156 cause=other secret-DO-NOT-RETAIN' 'RESTART_CONTRACT_DIAGNOSTIC_END'
+        fi ;;
+      get)
+        if [ "$capture_mode" = wronguid ]; then capture_test_uid=wrong; else capture_test_uid=poduid; fi
+        printf '{"metadata":{"uid":"%s","labels":{"rhiza.mrchypark.dev/cluster-uid":"cluster"}},"status":{"containerStatuses":[{"name":"sql","restartCount":0,"ready":false}],"initContainerStatuses":[]}}\n' "$capture_test_uid" ;;
+      *) return 1 ;;
+    esac
+  }
+  managed_capture_restart_failure pod poduid
+  grep -Fx 'MANAGED_KV_UNKNOWN stage=receipt_lookup slot=156 cause=other' "$oracle_dir/restart-contract-diagnostic.txt" >/dev/null || exit 1
+  if grep -F 'DO-NOT-RETAIN' "$oracle_dir/restart-contract-diagnostic.txt"; then exit 1; fi
+  for capture_mode in missing wronguid logfail; do
+    managed_capture_restart_failure pod poduid
+    case "$capture_mode" in missing) capture_reason=marker_not_observed ;; wronguid) capture_reason=pod_identity_unverified ;; logfail) capture_reason=log_read_failed ;; esac
+    grep -Fx "RESTART_CONTRACT_DIAGNOSTIC_UNAVAILABLE reason=$capture_reason" "$oracle_dir/restart-contract-diagnostic.txt" >/dev/null || exit 1
+  done
+  capture_mode=ok replacement_pod=pod replacement_uid=poduid restart_before=0 restart_capture_active=1 restart_capture_attempted=0
+  if managed_wait_restart_ready 1; then exit 1; fi
+  grep -Fx 'MANAGED_KV_UNKNOWN stage=receipt_lookup slot=156 cause=other' "$oracle_dir/restart-contract-diagnostic.txt" >/dev/null || exit 1
+  [ "$restart_capture_attempted" = 1 ] || exit 1
+  [ ! -e "$oracle_dir/restart-capture.raw" ] && [ ! -e "$oracle_dir/restart-capture-pod.json" ] || exit 1
+  rm -f "$oracle_dir/restart-contract-diagnostic.txt"
 )
 
 managed_preserve_first_pod_fault() (
@@ -645,12 +722,11 @@ fi
 k -n "$namespace" exec "$replacement_pod" -c sql -- sha256sum /var/lib/rhiza/repair.json /var/lib/rhiza/data/prepared-adoption.json /var/lib/rhiza/data/qlog/voter-identity.json > "$logs/restart-identity-before.txt"
 # The application handles TERM; kubelet restarts main without replacing the
 # Pod or rerunning its completed initContainers and keeps the same emptyDir.
+restart_capture_active=0 restart_capture_attempted=0
+[ "${RHIZA_MANAGED_TEST_DOCKERFILE-}" != Dockerfile.managed-ffi-contract ] || restart_capture_active=1
 managed_container_fault "$replacement_pod" "$replacement_uid"
-attempt=0
-until k -n "$namespace" get pod "$replacement_pod" -o json > "$logs/restarted-pod.json" &&
-  jq -e --arg uid "$replacement_uid" --argjson before "$restart_before" '.metadata.uid==$uid and any(.status.containerStatuses[]; .name=="sql" and .restartCount>$before and .ready==true) and ([.status.initContainerStatuses[]|select(.state.terminated.exitCode==0)]|length)==2' "$logs/restarted-pod.json" >/dev/null; do
-  attempt=$((attempt+1)); [ "$attempt" -lt 120 ] || exit 1; sleep 1
-done
+managed_wait_restart_ready 120 || return $?
+restart_capture_active=0
 if [ "${RHIZA_MANAGED_TEST_DOCKERFILE-}" = Dockerfile.managed-ffi-contract ]; then
   jq -e --argjson before "$restart_before" 'any(.status.containerStatuses[]; .name=="sql" and .restartCount==($before+1))' "$logs/restarted-pod.json" >/dev/null
   k -n "$namespace" logs "$replacement_pod" -c sql > "$logs/go-ffi-contract-restart.log"

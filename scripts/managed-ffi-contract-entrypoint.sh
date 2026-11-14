@@ -22,6 +22,36 @@ emit_first_contract() {
     printf '%s\n' 'FIRST_CONTRACT_DIAGNOSTIC_UNAVAILABLE' >&2
   fi
 }
+# Only bounded, fixed-shape diagnostic lines survive a same-Pod restart.
+emit_restart_failure() {
+  if [ -f "$diag_dir/restart-failure.log" ]; then
+    printf '%s\n' 'RESTART_CONTRACT_DIAGNOSTIC_BEGIN' >&2
+    sed -n '1,200p' "$diag_dir/restart-failure.log" >&2
+    printf '%s\n' 'RESTART_CONTRACT_DIAGNOSTIC_END' >&2
+  else
+    printf '%s\n' 'RESTART_CONTRACT_DIAGNOSTIC_UNAVAILABLE' >&2
+  fi
+}
+record_restart_failure() {
+  [ ! -e "$diag_dir/restart-failure.log" ] || return 0
+  case "$1" in go-restart|rust-restart|internal-profile-restart|graph-restart|graph-profile-restart|graph-qualification-restart) ;; *) return 1 ;; esac
+  case "$2" in ''|*[!0-9]*) return 1 ;; esac
+  (
+    umask 077
+    set -C
+    {
+      printf 'RESTART_CONTRACT_FAILURE stage=%s code=%.3s\n' "$1" "$2"
+      awk '
+        /^GO_(CONTRACT|QUALIFICATION)_SOURCE [a-z_]+\.go:[0-9]+:$/ {print; next}
+        /^MANAGED_KV_UNKNOWN stage=(batch|batch_propose|batch_apply|receipt_lookup|receipt_missing) slot=[0-9]+ cause=(other|deadline|canceled|durability_unavailable|quorum_unavailable|not_ready)$/ {print; next}
+        /^MANAGED_GRAPH_READINESS_REFUSED reason=(not_writable|callback_missing|callback_false|lifecycle_failed|material_missing)$/ {print; next}
+        /^MANAGED_GRAPH_EXECUTE_FAILURE stage=(host_initial_admission|node_binding|node_protocol|node_admission|node_application_start|network_readiness|network_context|network_prepare|network_decode|network_fingerprint|network_charge|network_admission|network_request_lock|network_receipt_lookup|network_receipt_durability|network_submit) cause=(canceled|deadline|not_ready|reconfiguration_drain|invalid_request|request_conflict|overloaded|durability_unavailable|commit_unknown|quorum_unavailable|other)$/ {print; next}
+        /^MANAGED_OPERATION_DIAGNOSTIC operation=(execute|query|ready|request_status|recover_pending|recover_pending_detailed|kv_put|kv_delete|kv_cas|kv_get|graph_execute|graph_query|graph_reachable|graph_changes|graph_stream_read|graph_stream_offset|unsupported) code=(internal|commit_unknown|kv_recovery_required|kv_not_submitted|sql_recovery_required|sql_not_submitted|timeout|canceled|invalid_request|not_ready|quorum_unavailable|request_conflict|durability_unavailable|overloaded|unclassified) cause=(unclassified|deadline|canceled|quorum_unavailable|durability_unavailable|not_ready|overloaded|request_conflict) context_known=(true|false) slot=[0-9]+ retry=[0-9]+$/ {print; next}
+      ' "$diag_dir/active.log" | head -n 100
+    } > "$diag_dir/restart-failure.log"
+  ) || return 1
+  sync
+}
 run_contract() {
   stage=$1
   shift
@@ -366,7 +396,11 @@ run_contract() {
   esac
   sync
   cat "$diag_dir/active.log"
-  if [ "$code" != 0 ]; then emit_first_contract; return "$code"; fi
+  if [ "$code" != 0 ]; then
+    case "$stage" in *-restart) record_restart_failure "$stage" "$code" || printf '%s\n' 'RESTART_CONTRACT_DIAGNOSTIC_UNAVAILABLE' >&2 ;; esac
+    emit_first_contract
+    return "$code"
+  fi
 }
 if [ "${1-}" = --diagnostic-self-test ]; then
   for profile in internal graph; do valid_fixture_profile "$profile"; done
@@ -374,7 +408,7 @@ if [ "${1-}" = --diagnostic-self-test ]; then
     if valid_fixture_profile "$profile"; then echo 'FAIL: retired fixture profile accepted' >&2; exit 1; fi
   done
   diag_test_dir=$(mktemp -d)
-  trap 'rm -f "$diag_test_dir/first.log" "$diag_test_dir/active.log" "$diag_test_dir/go-initial.exit" "$diag_test_dir/rust-initial.exit" "$diag_test_dir/rust-restart.exit" "$diag_test_dir/graph-profile-restart.exit" "$diag_test_dir/graph-qualification-restart.exit"; rmdir "$diag_test_dir"' EXIT HUP INT TERM
+  trap 'rm -f "$diag_test_dir/first.log" "$diag_test_dir/active.log" "$diag_test_dir/go-initial.exit" "$diag_test_dir/rust-initial.exit" "$diag_test_dir/rust-restart.exit" "$diag_test_dir/graph-profile-restart.exit" "$diag_test_dir/graph-qualification-restart.exit" "$diag_test_dir/restart-failure.log"; rmdir "$diag_test_dir"' EXIT HUP INT TERM
   diag_dir=$diag_test_dir
   : > "$diag_dir/first.log"
   if run_contract go-initial sh -c 'printf "%s\n" "private-profile-DO-NOT-RETAIN" "    managed_incluster_test.go:123: private-profile-DO-NOT-RETAIN" "2026/11/03 12:00:00 MANAGED_CHECKPOINT_SELECT_FAILURE reason=current_without_certified_qckp prepared_readonly_learner=true local_voter=false local_config=1"; exit 7'; then exit 1; else [ "$?" = 7 ]; fi
@@ -383,6 +417,15 @@ if [ "${1-}" = --diagnostic-self-test ]; then
   if grep -F 'DO-NOT-RETAIN' "$diag_dir/first.log"; then exit 1; fi
   before=$(cksum "$diag_dir/first.log")
   if run_contract rust-restart sh -c 'echo "FAIL: managed-ha-contract prior_ack_marker_missing"; exit 1'; then exit 1; fi
+  grep -Fx 'RESTART_CONTRACT_FAILURE stage=rust-restart code=1' "$diag_dir/restart-failure.log" >/dev/null
+  rm -f "$diag_dir/restart-failure.log"
+  if run_contract rust-restart sh -c 'printf "%s\n" "MANAGED_GRAPH_READINESS_REFUSED reason=callback_false" "MANAGED_GRAPH_READINESS_REFUSED reason=callback_false secret-DO-NOT-RETAIN"; exit 7'; then exit 1; else [ "$?" = 7 ]; fi
+  grep -Fx 'RESTART_CONTRACT_FAILURE stage=rust-restart code=7' "$diag_dir/restart-failure.log" >/dev/null
+  grep -Fx 'MANAGED_GRAPH_READINESS_REFUSED reason=callback_false' "$diag_dir/restart-failure.log" >/dev/null
+  printf '%s\n' 'MANAGED_GRAPH_READINESS_REFUSED reason=callback_false secret-DO-NOT-RETAIN' > "$diag_dir/active.log"
+  record_restart_failure rust-restart 2
+  grep -Fx 'RESTART_CONTRACT_FAILURE stage=rust-restart code=7' "$diag_dir/restart-failure.log" >/dev/null
+  if grep -F 'DO-NOT-RETAIN' "$diag_dir/restart-failure.log"; then exit 1; fi
   [ "$before" = "$(cksum "$diag_dir/first.log")" ]
   for reason in selection_unavailable local_seal_read current_read refreshed_local_seal_read current_without_certified_qckp current_ahead current_rank_conflict archive_load archive_sealed archive_tip_behind archive_base_ahead archive_base_invalid archive_decision_unavailable core_certificate_mismatch archive_certificate_invalid candidate_validation root_open root_state_policy_mismatch current_certificate_hash_mismatch prefix_refresh_unavailable prefix_archive_load prefix_unexpected_base prefix_page_incomplete prefix_decision_identity prefix_decision_policy prefix_certificate_accept prefix_anchor_invalid prefix_overlap_mismatch prefix_anchor_changed; do
     run_contract rust-restart sh -c 'printf "2026/11/03 12:00:00 MANAGED_CHECKPOINT_SELECT_FAILURE reason=%s prepared_readonly_learner=false local_voter=true local_config=3\n" "$1"' sh "$reason"
@@ -685,6 +728,7 @@ if [ "${1-}" = serve-managed-sql ]; then
     initial|verify)
       if [ -d "$diag_dir" ]; then
         [ "$mixed_mode" = verify ] || { emit_first_contract; exit 125; }
+        emit_restart_failure
         go_stage=go-restart rust_stage=rust-restart
       else
         mkdir -m 700 "$diag_dir"
