@@ -9,7 +9,7 @@ managed_autoscale_install() {
   k -n "$namespace" rollout status deployment/qualification-metrics-metrics-server --timeout=180s || return 1
   k wait --for=condition=Available apiservice/v1beta1.metrics.k8s.io --timeout=180s || return 1
   helm template qualification-keda keda --repo https://kedacore.github.io/charts --version 2.17.2 --include-crds --namespace "$namespace" > "$logs/autoscale-keda-manifest.yaml" || return 1
-  k apply -f "$logs/autoscale-keda-manifest.yaml" > "$logs/autoscale-keda-install.txt" || return 1
+  k apply --server-side -f "$logs/autoscale-keda-manifest.yaml" > "$logs/autoscale-keda-install.txt" || return 1
   k wait --for=condition=Established crd/scaledobjects.keda.sh --timeout=180s || return 1
   for mas_deployment in keda-operator keda-operator-metrics-apiserver keda-admission-webhooks; do
     k -n "$namespace" rollout status "deployment/$mas_deployment" --timeout=180s || return 1
