@@ -172,11 +172,19 @@ func main() {
 					}
 				} else {
 					if progress != nil {
-						sample := faultSample{start: begin, end: completed, measuredEnd: begin.Add(elapsed), retries: retryCount}
-						if sent := interval.sent.Load(); sent != nil {
-							sample.sent = *sent
+						faultSample := faultSample{start: begin, end: completed, measuredEnd: begin.Add(elapsed), retries: retryCount}
+						if *verifyInsert {
+							var receipt struct {
+								Slot uint64 `json:"slot"`
+							}
+							if json.Unmarshal(sample, &receipt) == nil {
+								faultSample.slot = receipt.Slot
+							}
 						}
-						faultSamples[id] = sample
+						if sent := interval.sent.Load(); sent != nil {
+							faultSample.sent = *sent
+						}
+						faultSamples[id] = faultSample
 					}
 					latencyMu.Lock()
 					latencies = append(latencies, elapsed)
@@ -328,6 +336,7 @@ type faultProgress struct {
 type faultSample struct {
 	start, sent, end, measuredEnd time.Time
 	retries                       int
+	slot                          uint64
 }
 
 type requestInterval struct {
@@ -336,6 +345,7 @@ type requestInterval struct {
 }
 
 type faultWindow struct {
+	EpochUnixNS           int64   `json:"epoch_unix_ns"`
 	Attempted             bool    `json:"attempted"`
 	SignalSucceeded       bool    `json:"signal_succeeded"`
 	Overlap               bool    `json:"overlap"`
@@ -352,11 +362,13 @@ type faultWindow struct {
 	SlowestMeasuredEndNS  int64   `json:"slowest_measured_end_ns"`
 	SlowestOverlapsSignal bool    `json:"slowest_overlaps_signal"`
 	SlowestRetries        int     `json:"slowest_retries"`
+	SlowestSlot           uint64  `json:"slowest_slot,omitempty"`
 	PostSignalMaxMS       float64 `json:"post_signal_max_ms"`
 	PostSignalRequests    int     `json:"post_signal_requests"`
 }
 
 func (w *faultWindow) summarizeSlowest(epoch, before, after time.Time, signalOK bool, samples []faultSample) {
+	w.EpochUnixNS = epoch.UnixNano()
 	var slowest faultSample
 	for _, sample := range samples {
 		if sample.start.IsZero() {
@@ -378,6 +390,7 @@ func (w *faultWindow) summarizeSlowest(epoch, before, after time.Time, signalOK 
 	w.SlowestStartNS, w.SlowestEndNS = slowest.start.Sub(epoch).Nanoseconds(), slowest.end.Sub(epoch).Nanoseconds()
 	w.SlowestMeasuredEndNS = slowest.measuredEnd.Sub(epoch).Nanoseconds()
 	w.SlowestRetries = slowest.retries
+	w.SlowestSlot = slowest.slot
 	if !slowest.sent.IsZero() {
 		sent := slowest.sent.Sub(epoch).Nanoseconds()
 		w.SlowestSentNS = &sent

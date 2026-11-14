@@ -4,6 +4,8 @@ import (
 	"context"
 	"sync"
 	"time"
+
+	"github.com/mrchypark/rhiza/internal/latencydiag"
 )
 
 const (
@@ -38,6 +40,10 @@ func (g *groupCommit) Sync(ctx context.Context) error {
 // syncBatch joins the pending batch before requesting an early flush. The
 // existing worker still serializes WAL Sync and publishes the shared result.
 func (g *groupCommit) syncBatch(ctx context.Context, immediate bool) error {
+	if latencydiag.Enabled {
+		diagnosticStart := latencydiag.Start()
+		defer latencydiag.Observe("wal_shared_wait", latencydiag.Slot(ctx), diagnosticStart)
+	}
 	g.mu.Lock()
 	if g.pending == nil {
 		g.pending = &commitBatch{done: make(chan struct{})}
@@ -75,7 +81,11 @@ func (g *groupCommit) flush() {
 		batch := g.pending
 		g.pending = nil
 		g.mu.Unlock()
+		diagnosticStart := latencydiag.Start()
 		batch.err = g.sync()
+		if latencydiag.Enabled {
+			latencydiag.Observe("wal_sync", 0, diagnosticStart)
+		}
 		close(batch.done)
 		g.mu.Lock()
 		if g.pending == nil {

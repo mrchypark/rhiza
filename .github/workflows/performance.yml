@@ -219,6 +219,7 @@ jobs:
           } >>"$GITHUB_STEP_SUMMARY"
 
       - name: Run Rhiza real-server reference
+        id: server_reference
         if: ${{ !inputs.network_optimization || inputs.network_optimization == 'none' }}
         env:
           RHIZA_SERVER_BENCH_REQUESTS: 100000
@@ -226,18 +227,23 @@ jobs:
         run: |
           git worktree add --detach "$RUNNER_TEMP/rhiza-server-candidate" "${{ steps.revisions.outputs.candidate_sha }}"
           git worktree add --detach "$RUNNER_TEMP/rhiza-server-base" "${{ steps.revisions.outputs.base_sha }}"
+          printf 'healthy\n' > "$RUNNER_TEMP/rhiza-performance/fault-diagnostic-lane.txt"
           benchmarks/run-server-reference.sh \
             "$RUNNER_TEMP/rhiza-server-candidate" \
             "$RUNNER_TEMP/rhiza-performance/rhiza-server.json"
+          printf 'n0 n1 async\n' > "$RUNNER_TEMP/rhiza-performance/fault-diagnostic-lane.txt"
           RHIZA_SERVER_BENCH_FAILED_NODE=n0 RHIZA_SERVER_BENCH_TARGET_NODE=n1 benchmarks/run-server-reference.sh \
             "$RUNNER_TEMP/rhiza-server-candidate" \
             "$RUNNER_TEMP/rhiza-performance/rhiza-server-n0-failed.json"
+          printf 'n1 n2 async\n' > "$RUNNER_TEMP/rhiza-performance/fault-diagnostic-lane.txt"
           RHIZA_SERVER_BENCH_FAILED_NODE=n1 RHIZA_SERVER_BENCH_TARGET_NODE=n2 benchmarks/run-server-reference.sh \
             "$RUNNER_TEMP/rhiza-server-candidate" \
             "$RUNNER_TEMP/rhiza-performance/rhiza-server-n1-failed.json"
+          printf 'n2 n0 async\n' > "$RUNNER_TEMP/rhiza-performance/fault-diagnostic-lane.txt"
           RHIZA_SERVER_BENCH_FAILED_NODE=n2 RHIZA_SERVER_BENCH_TARGET_NODE=n0 benchmarks/run-server-reference.sh \
             "$RUNNER_TEMP/rhiza-server-candidate" \
             "$RUNNER_TEMP/rhiza-performance/rhiza-server-n2-failed.json"
+          printf 'before-ack-healthy\n' > "$RUNNER_TEMP/rhiza-performance/fault-diagnostic-lane.txt"
           for sample in 1 2 3; do
             if (( sample % 2 )); then
               RHIZA_SERVER_BENCH_DURABILITY=before-ack RHIZA_SERVER_BENCH_REQUESTS=10000 benchmarks/run-server-reference.sh \
@@ -284,6 +290,33 @@ jobs:
             printf 'Base object-store HTTP request delta: `%s`.\n\n' "$before_ack_base_http"
             printf 'Candidate object-store delta from post-schema setup through final linearizable verification: `%s` HTTP requests, `%s` PUT requests. Full logical and HTTP method counters are retained in the JSON artifacts.\n' "$before_ack_candidate_http" "$before_ack_candidate_put"
           } >>"$GITHUB_STEP_SUMMARY"
+
+      # This separate tagged run never changes the uninstrumented gate result.
+      - name: Capture tagged fault diagnostics after reference failure
+        if: ${{ failure() && steps.server_reference.outcome == 'failure' }}
+        timeout-minutes: 15
+        env:
+          RHIZA_SERVER_BENCH_LATENCY_DIAGNOSTICS: 1
+          RHIZA_SERVER_BENCH_REQUESTS: 100000
+          RHIZA_SERVER_BENCH_CONCURRENCY: 16
+        run: |
+          lane_file="$RUNNER_TEMP/rhiza-performance/fault-diagnostic-lane.txt"
+          if [[ ! -f "$lane_file" ]]; then
+            printf 'not-run: failed lane unavailable\n' > "$RUNNER_TEMP/rhiza-performance/fault-diagnostic-status.txt"
+            exit 0
+          fi
+          lane=$(<"$lane_file")
+          case "$lane" in
+            'n0 n1 async') failed=n0; target=n1; durability=async ;;
+            'n1 n2 async') failed=n1; target=n2; durability=async ;;
+            'n2 n0 async') failed=n2; target=n0; durability=async ;;
+            *) printf 'not-run: reference failure is not a known fault lane (%s)\n' "$lane" > "$RUNNER_TEMP/rhiza-performance/fault-diagnostic-status.txt"; exit 0 ;;
+          esac
+          printf 'separate diagnostic; source lane=%s; killed-node ring events may be lost\n' "$lane" > "$RUNNER_TEMP/rhiza-performance/fault-diagnostic-status.txt"
+          export RHIZA_SERVER_BENCH_FAILED_NODE="$failed" RHIZA_SERVER_BENCH_TARGET_NODE="$target" RHIZA_SERVER_BENCH_DURABILITY="$durability"
+          benchmarks/run-server-reference.sh \
+            "$RUNNER_TEMP/rhiza-server-candidate" \
+            "$RUNNER_TEMP/rhiza-performance/rhiza-server-fault-diagnostic.json"
 
       - name: Record runner environment
         if: ${{ !inputs.network_optimization || inputs.network_optimization == 'none' }}

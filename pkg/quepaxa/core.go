@@ -12,6 +12,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/mrchypark/rhiza/internal/latencydiag"
 	"github.com/mrchypark/rhiza/internal/localtesthooks"
 	"github.com/mrchypark/rhiza/pkg/qlog"
 )
@@ -1440,6 +1441,10 @@ func (c *Core) releaseSlot(slot Slot) {
 }
 
 func (c *Core) runSlot(ctx context.Context, slot Slot, value []byte, allowLeaderFastPath bool) (Decision, error) {
+	if latencydiag.Enabled {
+		diagnosticStart := latencydiag.Start()
+		defer latencydiag.Observe("consensus_slot", uint64(slot), diagnosticStart)
+	}
 	leaderOrder, err := c.LeaderOrder(slot)
 	if err != nil {
 		return Decision{}, err
@@ -1618,6 +1623,10 @@ func maxPrior(summaries []Summary) *Proposal {
 }
 
 func (c *Core) recordQuorum(ctx context.Context, requests map[NodeID]RecordRequest) ([]Summary, error) {
+	if latencydiag.Enabled {
+		diagnosticStart := latencydiag.Start()
+		defer latencydiag.Observe("record_quorum", uint64(nextRequestSlot(requests)), diagnosticStart)
+	}
 	if c.localMode {
 		if len(requests) != 1 {
 			return nil, ErrQuorumUnavailable
@@ -1706,6 +1715,9 @@ func (c *Core) Record(ctx context.Context, request RecordRequest) (Summary, erro
 // localExecutionOwner; the slot lock then makes validation, staging, and the
 // receipt append one indivisible Local mutation.
 func (c *Core) recordLocalOwned(ctx context.Context, request RecordRequest) (Summary, error) {
+	if latencydiag.Enabled {
+		ctx = latencydiag.WithSlot(ctx, uint64(request.Slot))
+	}
 	if !c.localMode || c.observer || c.reconfigEnabled {
 		return Summary{}, ErrQuorumUnavailable
 	}
@@ -1830,6 +1842,9 @@ func (c *Core) recordLocalOwned(ctx context.Context, request RecordRequest) (Sum
 }
 
 func (c *Core) record(ctx context.Context, request RecordRequest) (Summary, error) {
+	if latencydiag.Enabled {
+		ctx = latencydiag.WithSlot(ctx, uint64(request.Slot))
+	}
 	if c.observer {
 		return Summary{}, ErrQuorumUnavailable
 	}

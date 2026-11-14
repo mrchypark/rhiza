@@ -29,12 +29,12 @@ func TestSlowestRequestFaultCorrelation(t *testing.T) {
 	before, after := epoch.Add(10*time.Millisecond), epoch.Add(11*time.Millisecond)
 	samples := []faultSample{
 		{start: epoch.Add(time.Millisecond), end: epoch.Add(3 * time.Millisecond), measuredEnd: epoch.Add(3 * time.Millisecond)},
-		{start: epoch.Add(9 * time.Millisecond), sent: epoch.Add(9 * time.Millisecond), end: epoch.Add(20 * time.Millisecond), measuredEnd: epoch.Add(21 * time.Millisecond), retries: 2},
+		{start: epoch.Add(9 * time.Millisecond), sent: epoch.Add(9 * time.Millisecond), end: epoch.Add(20 * time.Millisecond), measuredEnd: epoch.Add(21 * time.Millisecond), retries: 2, slot: 42},
 		{start: epoch.Add(30 * time.Millisecond), end: epoch.Add(31 * time.Millisecond), measuredEnd: epoch.Add(31 * time.Millisecond)},
 	}
 	w := faultWindow{}
 	w.summarizeSlowest(epoch, before, after, true, samples)
-	if w.SlowestStartNS != int64(9*time.Millisecond) || w.SlowestSentNS == nil || *w.SlowestSentNS != int64(9*time.Millisecond) || w.SlowestEndNS != int64(20*time.Millisecond) || w.SlowestMeasuredEndNS != int64(21*time.Millisecond) || !w.SlowestOverlapsSignal || w.SlowestRetries != 2 || w.PostSignalMaxMS != 1 || w.PostSignalRequests != 1 {
+	if w.EpochUnixNS != epoch.UnixNano() || w.SlowestStartNS != int64(9*time.Millisecond) || w.SlowestSentNS == nil || *w.SlowestSentNS != int64(9*time.Millisecond) || w.SlowestEndNS != int64(20*time.Millisecond) || w.SlowestMeasuredEndNS != int64(21*time.Millisecond) || !w.SlowestOverlapsSignal || w.SlowestRetries != 2 || w.SlowestSlot != 42 || w.PostSignalMaxMS != 1 || w.PostSignalRequests != 1 {
 		t.Fatalf("unexpected slowest request: %+v", w)
 	}
 	samples = append(samples, faultSample{start: epoch.Add(30 * time.Millisecond), end: epoch.Add(50 * time.Millisecond), measuredEnd: epoch.Add(50 * time.Millisecond)})
