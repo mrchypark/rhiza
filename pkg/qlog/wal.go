@@ -726,6 +726,10 @@ func (w *WAL) Append(entry Entry) error {
 // Sync flushes the current segment. Older segments are immutable and synced
 // before rollover.
 func (w *WAL) Sync() error {
+	return w.syncWithDiagnosticBatch(0)
+}
+
+func (w *WAL) syncWithDiagnosticBatch(batch uint64) error {
 	var lockStart time.Time
 	if latencydiag.Enabled {
 		lockStart = latencydiag.Start()
@@ -733,16 +737,28 @@ func (w *WAL) Sync() error {
 	w.mu.Lock()
 	if latencydiag.Enabled {
 		latencydiag.Observe("wal_sync_lock_wait", 0, lockStart)
+		if batch != 0 {
+			latencydiag.TraceBatch("wal_group_lock", batch, 0, 0, "ok", lockStart)
+		}
 	}
 	defer w.mu.Unlock()
 	if w.readOnly {
+		if latencydiag.Enabled && batch != 0 {
+			latencydiag.TraceBatch("wal_group_file_sync", batch, 0, 0, "skipped", time.Now())
+		}
 		return nil
 	}
 	if w.fatal != nil {
+		if latencydiag.Enabled && batch != 0 {
+			latencydiag.TraceBatch("wal_group_file_sync", batch, 0, 0, "error_before_sync", time.Now())
+		}
 		return w.fatal
 	}
 
 	if w.current == nil || !w.dirty {
+		if latencydiag.Enabled && batch != 0 {
+			latencydiag.TraceBatch("wal_group_file_sync", batch, 0, 0, "skipped", time.Now())
+		}
 		return nil
 	}
 	w.current.mu.Lock()
@@ -754,6 +770,13 @@ func (w *WAL) Sync() error {
 	err := w.current.file.Sync()
 	if latencydiag.Enabled {
 		latencydiag.ObservePeer("wal_file_sync", 0, "", err, syncStart)
+		if batch != 0 {
+			outcome := "ok"
+			if err != nil {
+				outcome = "error"
+			}
+			latencydiag.TraceBatch("wal_group_file_sync", batch, 0, 0, outcome, syncStart)
+		}
 	}
 	if err != nil {
 		return err

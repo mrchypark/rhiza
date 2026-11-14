@@ -17,6 +17,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/mrchypark/rhiza/internal/localtesthooks"
 	"github.com/mrchypark/rhiza/internal/sqlpolicy"
 	"github.com/mrchypark/rhiza/internal/types"
 	"github.com/mrchypark/rhiza/pkg/materializer"
@@ -376,6 +377,10 @@ func TestFixtureRequestHostDiagnostic(t *testing.T) {
 // This uses the real three-Host/Core/WAL/SQLite/S3-wire fixture. The transport
 // fault is Kubernetes-only, not a real-cloud or process-termination experiment.
 func openInternalRequestHosts(t *testing.T, outage *atomic.Bool, attempts *atomic.Int64, setup ...func(*sqlWireControl)) ([]Config, []*Host, *sqlStatusFixture) {
+	return openInternalRequestHostsObserved(t, outage, attempts, nil, nil, nil, setup...)
+}
+
+func openInternalRequestHostsObserved(t *testing.T, outage *atomic.Bool, attempts *atomic.Int64, started func(int), before func(int, context.Context), observe func(int, context.Context, error), setup ...func(*sqlWireControl)) ([]Config, []*Host, *sqlStatusFixture) {
 	t.Helper()
 	configs, fixture := sqlClusterForProtocol(t, sqlpolicy.ManagedRequestAppendOnlyApplicationProtocol)
 	if len(setup) > 1 {
@@ -415,7 +420,22 @@ func openInternalRequestHosts(t *testing.T, outage *atomic.Bool, attempts *atomi
 		})
 		kube.Client = &client
 		config.Store = &operator.V1Alpha2StatusStore{Kube: &kube}
-		host, err := fixture.open(context.Background(), config)
+		openCtx := context.Background()
+		if observe != nil || before != nil || started != nil {
+			index := i
+			var observer localtesthooks.PublicationAttemptObserver
+			if started != nil {
+				observer.Started = func() { started(index) }
+			}
+			if before != nil {
+				observer.Before = func(ctx context.Context) { before(index, ctx) }
+			}
+			if observe != nil {
+				observer.After = func(ctx context.Context, err error) { observe(index, ctx, err) }
+			}
+			openCtx = localtesthooks.WithPublicationAttempt(openCtx, observer)
+		}
+		host, err := fixture.open(openCtx, config)
 		if host != nil {
 			index := i
 			t.Cleanup(func() {
@@ -523,7 +543,8 @@ func TestInternalRequestHostOperationsWithoutKube(t *testing.T) {
 func TestInternalRequestFirstExecuteWithoutPrivateAdmissionOrReady(t *testing.T) {
 	var outage atomic.Bool
 	var attempts atomic.Int64
-	_, hosts, _ := openInternalRequestHosts(t, &outage, &attempts)
+	gate := newInternalPublisherGate()
+	_, hosts, _ := openInternalRequestHostsObserved(t, &outage, &attempts, gate.start, gate.before, gate.after)
 	ctx, cancel := context.WithTimeout(context.Background(), 25*time.Second)
 	defer cancel()
 	before := attempts.Load()
@@ -547,6 +568,12 @@ func TestInternalRequestFirstExecuteWithoutPrivateAdmissionOrReady(t *testing.T)
 	}
 	if attempts.Load() != 0 {
 		t.Fatal("post-admission local calls accessed Kubernetes")
+	}
+	if !gate.wasStarted(0) {
+		t.Fatal("admitted Host did not register its publisher")
+	}
+	if err := gate.quiesce(ctx); err != nil {
+		t.Fatal(err)
 	}
 }
 

@@ -9,6 +9,9 @@ import (
 
 const Enabled = false
 
+func NextBatch() uint64                                              { return 0 }
+func TraceBatch(_ string, _, _ uint64, _ int, _ string, _ time.Time) {}
+
 func Start() time.Time                                               { return time.Time{} }
 func Observe(_ string, _ uint64, _ time.Time)                        {}
 func ObserveError(_ string, _ uint64, _ error, _ time.Time)          {}

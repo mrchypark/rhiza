@@ -26,6 +26,7 @@ func Start() time.Time                { return time.Now() }
 type event struct {
 	stage, outcome string
 	slot           uint64
+	batch          uint64
 	count          int
 	peer           [8]byte
 	start, end     time.Time
@@ -39,6 +40,17 @@ type eventRing struct {
 
 var ring eventRing
 var startWriter sync.Once
+var nextBatch atomic.Uint64
+var flushMu sync.Mutex
+
+// Batch IDs are unique within a process lifetime; node log boundaries identify
+// the process. Slot zero means the caller did not provide a slot.
+func NextBatch() uint64 { return nextBatch.Add(1) }
+
+func TraceBatch(stage string, batch, slot uint64, count int, outcome string, begin time.Time) {
+	start()
+	ring.add(event{stage: stage, batch: batch, slot: slot, count: count, outcome: outcome, start: begin, end: time.Now()})
+}
 
 func (r *eventRing) add(e event) {
 	if !r.mu.TryLock() {
@@ -69,16 +81,24 @@ func start() {
 		go func() {
 			ticker := time.NewTicker(100 * time.Millisecond)
 			for range ticker.C {
-				events, dropped := ring.drain()
-				if dropped > 0 {
-					fmt.Fprintf(os.Stderr, "rhiza_latency dropped=%d\n", dropped)
-				}
-				for _, e := range events {
-					fmt.Fprintf(os.Stderr, "rhiza_latency stage=%s slot=%d count=%d peer=%x outcome=%s start_unix_ns=%d end_unix_ns=%d duration_ns=%d\n", e.stage, e.slot, e.count, e.peer, e.outcome, e.start.UnixNano(), e.end.UnixNano(), e.end.Sub(e.start).Nanoseconds())
-				}
+				Flush()
 			}
 		}()
 	})
+}
+
+// Flush synchronously emits currently buffered events. The tagged test uses it
+// to avoid relying on scheduler timing; abrupt termination can still lose data.
+func Flush() {
+	flushMu.Lock()
+	defer flushMu.Unlock()
+	events, dropped := ring.drain()
+	if dropped > 0 {
+		fmt.Fprintf(os.Stderr, "rhiza_latency dropped=%d\n", dropped)
+	}
+	for _, e := range events {
+		fmt.Fprintf(os.Stderr, "rhiza_latency stage=%s batch=%d slot=%d count=%d peer=%x outcome=%s start_unix_ns=%d end_unix_ns=%d duration_ns=%d\n", e.stage, e.batch, e.slot, e.count, e.peer, e.outcome, e.start.UnixNano(), e.end.UnixNano(), e.end.Sub(e.start).Nanoseconds())
+	}
 }
 func Observe(stage string, slot uint64, start time.Time) { observe(stage, slot, "", nil, start) }
 func ObserveError(stage string, slot uint64, err error, start time.Time) {

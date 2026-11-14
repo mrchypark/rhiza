@@ -540,6 +540,9 @@ func (n *Node) promoteManagedAppendOnlySeal(ctx context.Context, sealed quepaxa.
 }
 
 func (n *Node) startManagedAppendOnlyPublisher(ctx context.Context) {
+	if n.managedCheckpointAttempt.Started != nil {
+		n.managedCheckpointAttempt.Started()
+	}
 	interval := n.config.CheckpointInterval
 	if interval <= 0 {
 		interval = 15 * time.Minute
@@ -560,7 +563,17 @@ func (n *Node) startManagedAppendOnlyPublisher(ctx context.Context) {
 		var last time.Time
 		for {
 			if last.IsZero() || time.Since(last) >= interval || n.wal.Bytes() >= tail {
-				if err := n.publishManagedAppendOnlyCheckpoint(ctx); err != nil {
+				if n.managedCheckpointAttempt.Before != nil {
+					n.managedCheckpointAttempt.Before(ctx)
+					if ctx.Err() != nil {
+						return
+					}
+				}
+				err := n.publishManagedAppendOnlyCheckpoint(ctx)
+				if n.managedCheckpointAttempt.After != nil {
+					n.managedCheckpointAttempt.After(ctx, err)
+				}
+				if err != nil {
 					if ctx.Err() == nil {
 						log.Printf("managed append-only checkpoint publication deferred: %v", err)
 					}

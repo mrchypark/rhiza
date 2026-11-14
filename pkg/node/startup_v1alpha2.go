@@ -599,6 +599,7 @@ func (n *Node) OpenManaged(ctx context.Context, cfg ManagedStartupConfig) (resul
 	if n == nil || n.config == nil || n.config.Local || n.opened.Load() || n.preparedStartup != nil || n.managedStartup != nil || cfg.Checker == nil {
 		return fmt.Errorf("managed startup requires a new non-Local node and live checker")
 	}
+	n.managedCheckpointAttempt = localtesthooks.PublicationAttempt(ctx)
 	configCopy := CloneManagedRuntimeConfig(*n.config)
 	n.config = &configCopy
 	i := cfg.Identity

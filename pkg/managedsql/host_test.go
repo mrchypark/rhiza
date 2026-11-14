@@ -49,6 +49,7 @@ type sqlWireControl struct {
 	receiptPutReady         chan struct{}
 	receiptPutRelease       chan struct{}
 	putReady                chan string
+	putReadyOwner           chan int
 	putRelease              chan struct{}
 	putSuffix               string
 	putPrefix               string
@@ -185,6 +186,13 @@ func sqlWireStore(t *testing.T) (*httptest.Server, *sqlWireControl) {
 			}
 		}
 		if gatePut {
+			if control.putReadyOwner != nil {
+				select {
+				case control.putReadyOwner <- fixtureRequestHost(r.Header.Get("Authorization"), 3):
+				case <-r.Context().Done():
+					return
+				}
+			}
 			select {
 			case control.putReady <- r.URL.Path:
 			case <-control.putRelease:

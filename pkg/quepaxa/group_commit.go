@@ -14,7 +14,8 @@ const (
 )
 
 type groupCommit struct {
-	sync    func() error
+	sync func() error
+	groupCommitTrace
 	mu      sync.Mutex
 	pending *commitBatch
 	running bool
@@ -24,6 +25,7 @@ type groupCommit struct {
 }
 
 type commitBatch struct {
+	commitBatchTrace
 	done    chan struct{}
 	err     error
 	waiters int
@@ -40,15 +42,29 @@ func (g *groupCommit) Sync(ctx context.Context) error {
 // syncBatch joins the pending batch before requesting an early flush. The
 // existing worker still serializes WAL Sync and publishes the shared result.
 func (g *groupCommit) syncBatch(ctx context.Context, immediate bool) (retErr error) {
+	var traceStart time.Time
 	if latencydiag.Enabled {
 		diagnosticStart := latencydiag.Start()
+		traceStart = diagnosticStart
 		defer func() { latencydiag.ObserveError("wal_shared_wait", latencydiag.Slot(ctx), retErr, diagnosticStart) }()
 	}
 	g.mu.Lock()
 	if g.pending == nil {
 		g.pending = &commitBatch{done: make(chan struct{})}
+		if latencydiag.Enabled {
+			g.pending.initTrace()
+		}
 	}
 	batch := g.pending
+	if latencydiag.Enabled {
+		defer func() {
+			outcome := "ok"
+			if retErr != nil {
+				outcome = "error"
+			}
+			latencydiag.TraceBatch("wal_group_wait", batch.traceID(), latencydiag.Slot(ctx), 0, outcome, traceStart)
+		}()
+	}
 	batch.waiters++
 	if !g.running {
 		g.running = true
@@ -82,8 +98,17 @@ func (g *groupCommit) flush() {
 		g.pending = nil
 		g.mu.Unlock()
 		diagnosticStart := latencydiag.Start()
-		batch.err = g.sync()
 		if latencydiag.Enabled {
+			batch.err = g.syncForTrace(batch.traceID())
+		} else {
+			batch.err = g.sync()
+		}
+		if latencydiag.Enabled {
+			outcome := "ok"
+			if batch.err != nil {
+				outcome = "error"
+			}
+			latencydiag.TraceBatch("wal_group_sync", batch.traceID(), 0, batch.waiters, outcome, diagnosticStart)
 			latencydiag.ObserveBatch("wal_sync", batch.waiters, batch.err, diagnosticStart)
 		}
 		close(batch.done)

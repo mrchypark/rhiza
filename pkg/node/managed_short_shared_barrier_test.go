@@ -447,11 +447,16 @@ func TestManagedSharedBarrierMismatchedCertificateNeverRetries(t *testing.T) {
 	f := newManagedGraphAdmissionRaceFixture(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
+	recordFreshAdmissionControl(t, ctx, f, 9, freshAdmissionControlValue(202), false)
+	before := f.node.core.RuntimeProgressSnapshot()
+	if before.CertifiedTip != 8 || before.RecorderTip != 9 {
+		t.Fatalf("expected actual pending R9 over C8: %+v", before)
+	}
 	value := freshAdmissionControlValue(201)
 	done := make(chan struct{})
 	op := &managedGraphControlOperation{value: value, hash: sha256.Sum256(value), binding: f.node.internalApplication.Load(), done: done, slot: 8}
-	if _, ok := f.node.core.CertifiedValue(op.slot); !ok {
-		t.Fatal("fixture has no actual certified slot")
+	if cert, ok := f.node.core.CertifiedValue(op.slot); !ok || managedGraphControlCertificateMatches(f.node.core, op, cert) {
+		t.Fatal("fixture lacks an actual mismatched slot-8 certificate")
 	}
 	f.node.managedGraphControlMu.Lock()
 	f.node.managedGraphControl = op
@@ -464,6 +469,9 @@ func TestManagedSharedBarrierMismatchedCertificateNeverRetries(t *testing.T) {
 		}
 	})
 	defer restore()
+	var proposals atomic.Int32
+	restoreProposal := localtesthooks.SetProposalEntry(func([]byte) { proposals.Add(1) })
+	defer restoreProposal()
 	result := make(chan error, 1)
 	go func() { _, err := f.node.waitManagedAppendOnlyControlProof(ctx, op.binding); result <- err }()
 	select {
@@ -480,8 +488,9 @@ func TestManagedSharedBarrierMismatchedCertificateNeverRetries(t *testing.T) {
 	case <-ctx.Done():
 		t.Fatal("waiter did not finish")
 	}
-	if f.node.core.Tip() != 8 {
-		t.Fatalf("mismatch started a new proposal: tip=%d", f.node.core.Tip())
+	after := f.node.core.RuntimeProgressSnapshot()
+	if after.CertifiedTip != before.CertifiedTip || proposals.Load() != 0 {
+		t.Fatalf("mismatch started a new proposal: before=%+v after=%+v proposals=%d", before, after, proposals.Load())
 	}
 }
 

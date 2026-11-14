@@ -83,6 +83,7 @@ type Node struct {
 	managedAdmitted              atomic.Bool
 	managedInitiallyAdmitted     atomic.Bool
 	managedGraphPublisherStarted atomic.Bool
+	managedCheckpointAttempt     localtesthooks.PublicationAttemptObserver
 	managedGraphPublisherBinding atomic.Pointer[internalApplicationBinding]
 	managedGraphInitialRootDone  chan struct{}
 	managedGraphInitialRootOnce  sync.Once
