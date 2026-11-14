@@ -234,7 +234,11 @@ reject target-typo 'spec.target.typo' create --validate=strict --dry-run=server 
 cluster_json unknown 3 '' | sed 's/"containers":/"securityContext":{},"containers":/' > "$logs/security-context.json"
 reject security-context 'spec.workload.podTemplate.spec.securityContext' create --validate=strict --dry-run=server -f "$logs/security-context.json"
 cluster_json command 3 '' | sed 's/"image":"example.invalid\/app"/"image":"example.invalid\/app","command":["x"]/' > "$logs/command.json"
-reject command 'spec.workload.podTemplate.spec.containers[0].command' create --validate=strict --dry-run=server -f "$logs/command.json"
+reject command 'spec.workload' create --validate=strict --dry-run=server -f "$logs/command.json"
+sed 's/"workload":{"podTemplate"/"workload":{"embedded":true,"podTemplate"/' "$logs/command.json" > "$logs/embedded-command.json"
+ok embedded-command create --validate=strict --dry-run=server -f "$logs/embedded-command.json"
+cluster_json embedded-no-command 3 '' | sed 's/"workload":{"podTemplate"/"workload":{"embedded":true,"podTemplate"/' > "$logs/embedded-no-command.json"
+reject embedded-no-command 'spec.workload' create --validate=strict --dry-run=server -f "$logs/embedded-no-command.json"
 if k get --raw "/apis/rhiza.mrchypark.dev/v1alpha1" > "$logs/v1alpha1.txt" 2>&1; then
   echo 'unexpected v1alpha1 endpoint' >&2; exit 1
 fi
