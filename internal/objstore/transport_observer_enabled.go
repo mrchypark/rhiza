@@ -5,6 +5,7 @@ package objstore
 import (
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"net"
 	"net/http"
@@ -27,6 +28,7 @@ type S3TransportEvent struct {
 	StatusCode            int           `json:"status_code,omitempty"`
 	Outcome               string        `json:"outcome"`
 	ErrorClass            string        `json:"error_class,omitempty"`
+	ErrorType             string        `json:"error_type,omitempty"`
 	ResourceClass         string        `json:"resource_class,omitempty"`
 	ConditionalPresence   string        `json:"conditional_presence,omitempty"`
 	DeclaredContentLength int64         `json:"declared_content_length,omitempty"`
@@ -360,6 +362,7 @@ func (t *observedRoundTripper) RoundTrip(request *http.Request) (*http.Response,
 		}
 		base.Outcome = "round_trip_error"
 		base.ErrorClass = classifyTransportError(err)
+		base.ErrorType = safeErrorType(err)
 		probe.observe(t.observer, t.owner, phase, base.ErrorClass, false)
 		t.observer.record(base)
 		return response, err
@@ -385,10 +388,27 @@ func (t *observedRoundTripper) RoundTrip(request *http.Request) (*http.Response,
 			event.Elapsed = time.Since(started)
 			event.Outcome = outcome
 			event.ErrorClass = classifyTransportError(err)
+			event.ErrorType = safeErrorType(err)
 			t.observer.record(event)
 		}}
 	}
 	return response, nil
+}
+
+// safeErrorType records only a concrete type, never provider error text.
+func safeErrorType(err error) string {
+	for i := 0; i < 8; i++ {
+		next := errors.Unwrap(err)
+		if next == nil {
+			break
+		}
+		err = next
+	}
+	name := fmt.Sprintf("%T", err)
+	if len(name) > 128 {
+		return name[:128]
+	}
+	return name
 }
 
 func expectedHTTPControlOutcome(request *http.Request, status int) bool {

@@ -110,7 +110,20 @@ func TestNodeForegroundAPICostS3(t *testing.T) {
 	if scenario != "baseline" && scenario != "checkpoint-active" && scenario != "archive-cleanup-active" {
 		t.Fatalf("unsupported Node foreground cost scenario %q", scenario)
 	}
-	t.Logf("node_foreground_scenario=%s", scenario)
+	durability := types.ObjectStoreDurabilityBeforeAck
+	syncInterval := time.Hour
+	switch os.Getenv("RHIZA_NODE_FOREGROUND_DURABILITY") {
+	case "", "before-ack":
+	case "async":
+		if scenario != "baseline" {
+			t.Fatal("async measurement supports baseline only")
+		}
+		durability = types.ObjectStoreDurabilityAsync
+		syncInterval = 10 * time.Second
+	default:
+		t.Fatal("unsupported foreground durability")
+	}
+	t.Logf("node_foreground_scenario=%s durability=%s sync_interval=%s", scenario, durability, syncInterval)
 	testDeadline, ok := t.Deadline()
 	if !ok {
 		t.Fatal("test runner must supply the fixed seven-minute deadline")
@@ -257,7 +270,7 @@ func TestNodeForegroundAPICostS3(t *testing.T) {
 			ObjStorePrefix: prefix, ObjStoreRegion: region, ObjStoreInsecure: true,
 			ObjStoreGCGracePeriod: nodeForegroundGCGracePeriod,
 			ObjStoreAccessKey:     gateway.AccessKey, ObjStoreSecretKey: gateway.SecretKey,
-			ObjStoreSyncInterval: time.Hour, ObjStoreDurability: types.ObjectStoreDurabilityBeforeAck,
+			ObjStoreSyncInterval: syncInterval, ObjStoreDurability: durability,
 		}
 		node := New(config)
 		nodes = append(nodes, node)
@@ -3621,7 +3634,7 @@ func logNodeTransportObserver(t *testing.T, observer *objmetrics.S3TransportObse
 		t.Logf("node_s3_transport_error_count owner=%s phase=%s method=%s status_family=%s outcome=%s error_class=%s resource_class=%s conditional_presence=%s count=%d", aggregate.Owner, aggregate.Phase, aggregate.Method, aggregate.StatusFamily, aggregate.Outcome, aggregate.ErrorClass, aggregate.ResourceClass, aggregate.ConditionalPresence, aggregate.Count)
 	}
 	if first != nil {
-		t.Logf("node_s3_transport_first_failure sequence=%d owner=%s phase=%s method=%s status=%d outcome=%s error_class=%s resource_class=%s conditional_presence=%s declared_content_length=%d elapsed=%s", first.Sequence, first.Owner, first.Phase, first.Method, first.StatusCode, first.Outcome, first.ErrorClass, first.ResourceClass, first.ConditionalPresence, first.DeclaredContentLength, first.Elapsed)
+		t.Logf("node_s3_transport_first_failure sequence=%d owner=%s phase=%s method=%s status=%d outcome=%s error_class=%s error_type=%s resource_class=%s conditional_presence=%s declared_content_length=%d elapsed=%s", first.Sequence, first.Owner, first.Phase, first.Method, first.StatusCode, first.Outcome, first.ErrorClass, first.ErrorType, first.ResourceClass, first.ConditionalPresence, first.DeclaredContentLength, first.Elapsed)
 	}
 }
 

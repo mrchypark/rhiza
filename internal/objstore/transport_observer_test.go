@@ -421,6 +421,13 @@ func TestS3TransportObserverCountsRequestsByResourceAndCondition(t *testing.T) {
 	}
 }
 
+func TestS3TransportObserverErrorTypeOmitsErrorText(t *testing.T) {
+	err := fmt.Errorf("private-token: %w", io.ErrUnexpectedEOF)
+	if got := safeErrorType(err); got != "*errors.errorString" {
+		t.Fatalf("error type=%q", got)
+	}
+}
+
 func TestS3TransportObserverClassifiesConditionalPresence(t *testing.T) {
 	tests := []struct {
 		name        string

@@ -513,10 +513,14 @@ jobs:
             RHIZA_NODE_FOREGROUND_API_COST_SCENARIO=checkpoint-active \
             go test -count=1 -v -tags rhiza_local_testhooks -timeout=7m ./pkg/node \
             -run '^TestNodeForegroundAPICostS3$'
-          run_logged node-foreground-archive-cleanup-active-s3 env \
+          # HA archives are append-only and reject online GC. The independent
+          # archive-gc-s3 test above continues to measure the supported GC path.
+          printf '%s\n' 'HA foreground archive GC: unsupported (append-only archive); not a passing GC measurement' | tee "$evidence_dir/ha-foreground-gc-unsupported.txt"
+          run_logged node-foreground-async-s3 env \
             RHIZA_VERSITYGW_BIN="$RHIZA_VERSITYGW_BIN" \
             RHIZA_NODE_FOREGROUND_API_COST=1 \
-            RHIZA_NODE_FOREGROUND_API_COST_SCENARIO=archive-cleanup-active \
+            RHIZA_NODE_FOREGROUND_API_COST_SCENARIO=baseline \
+            RHIZA_NODE_FOREGROUND_DURABILITY=async \
             go test -count=1 -v -tags rhiza_local_testhooks -timeout=7m ./pkg/node \
             -run '^TestNodeForegroundAPICostS3$'
 
