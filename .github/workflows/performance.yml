@@ -566,6 +566,49 @@ jobs:
           if-no-files-found: error
           retention-days: 30
 
+  fault-latency-trials:
+    # Keep heavy experiments serialized even when an earlier gate fails.
+    needs: [paired-go-benchmarks, issue185-cost-evidence]
+    if: ${{ always() && !cancelled() && !inputs.refresh_hiqlite_reference && !inputs.issue185_cost_evidence && (inputs.network_optimization == '' || inputs.network_optimization == 'none') }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.candidate_ref || github.event.pull_request.head.sha || github.sha }}
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+          cache: true
+      - name: Run bounded n0 fault diagnostics
+        env:
+          RHIZA_SERVER_BENCH_LATENCY_DIAGNOSTICS: 1
+          RHIZA_SERVER_BENCH_FAILED_NODE: n0
+          RHIZA_SERVER_BENCH_TARGET_NODE: n1
+          RHIZA_SERVER_BENCH_DURABILITY: async
+          RHIZA_SERVER_BENCH_REQUESTS: 100000
+          RHIZA_SERVER_BENCH_CONCURRENCY: 16
+        run: |
+          mkdir -p "$RUNNER_TEMP/fault-latency-trials"
+          git rev-parse HEAD > "$RUNNER_TEMP/fault-latency-trials/commit.txt"
+          printf '%s\n' 'Tagged diagnostics are separate from the performance gate; killed-process buffered events may be lost and shared WAL events cannot be summed by slot.' > "$RUNNER_TEMP/fault-latency-trials/README.txt"
+          status=0
+          for trial in 1 2 3; do
+            rc=0
+            benchmarks/run-server-reference.sh "$GITHUB_WORKSPACE" "$RUNNER_TEMP/fault-latency-trials/trial-$trial.json" || rc=$?
+            printf '%s\n' "$rc" > "$RUNNER_TEMP/fault-latency-trials/trial-$trial.exit"
+            if [ "$rc" -ne 0 ]; then status=$rc; break; fi
+          done
+          exit "$status"
+      - name: Upload fault latency evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fault-latency-trials-${{ github.run_id }}
+          path: ${{ runner.temp }}/fault-latency-trials
+          if-no-files-found: error
+          retention-days: 30
+
   refresh-hiqlite-reference:
     if: ${{ inputs.refresh_hiqlite_reference }}
     runs-on: ubuntu-24.04

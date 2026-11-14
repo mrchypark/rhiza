@@ -105,12 +105,25 @@ case "$*" in *rev-parse*) printf '%040d\n' 1 ;; *grep*) exit 0 ;; *) exit 92 ;; 
 MOCK
 cat > "$scratch/bin/docker" <<'MOCK'
 #!/usr/bin/env bash
+if [[ ${MOCK_MODE:-} == cleanup-fail || ${MOCK_MODE:-} == client-fail-cleanup-fail ]]; then
+ case ${1:-} in rm) exit 44 ;; ps) printf 'owned-container\n'; exit 0 ;; esac
+fi
 exit 0
+MOCK
+cat > "$scratch/bin/timeout" <<'MOCK'
+#!/usr/bin/env bash
+if [[ ${MOCK_MODE:-} == docker-timeout ]]; then exit 124; fi
+[[ $1 == -k && $2 == 2s && $3 == 10s ]] || exit 99
+shift 3
+exec "$@"
 MOCK
 cat > "$scratch/node" <<'MOCK'
 #!/usr/bin/env bash
 printf '%s\n' "$$" >> "$MOCK_HOME/nodes"
-exec sleep 60
+if [[ ${MOCK_MODE:-} == node-timeout ]]; then trap '' TERM; else
+trap 'printf "node-shutdown-flushed\n"; if [[ ${MOCK_MODE:-} == node-shutdown-fail ]]; then exit 42; fi; exit 0' TERM
+fi
+while :; do sleep 0.05; done
 MOCK
 cat > "$scratch/bench" <<'MOCK'
 #!/usr/bin/env bash
@@ -137,6 +150,7 @@ if [[ -n $control ]]; then
  fi
 fi
 printf '{"requests":4,"successes":4,"errors":0,"max_ms":1,"receipt_oracle":"sql-insert-id-v1","fault_window":%s}\n' "$window"
+if [[ $MOCK_MODE == client-fail || $MOCK_MODE == client-fail-cleanup-fail ]]; then exit 23; fi
 MOCK
 cat > "$scratch/bin/curl" <<'MOCK'
 #!/usr/bin/env bash
@@ -145,7 +159,7 @@ for url in "$@"; do :; done
 case $url in
 */metrics/object-store) printf '{"puts":0}\n' ;;
 */fault)
- case $MOCK_MODE in before-first) exit 22 ;; signal-failure) exit 47 ;; esac
+ case $MOCK_MODE in before-first) exit 22 ;; signal-failure|signal-failure-stop-fail) exit 47 ;; esac
  kill -KILL "$(cat "$MOCK_HOME/fault.pid")"
  touch "$MOCK_HOME/release"
  printf '{"attempted":true,"signal_succeeded":true}\n' ;;
@@ -160,6 +174,11 @@ case ${1:-} in
 *) exec /bin/cat "$@" ;;
 esac
 MOCK
+cat > "$scratch/bin/cp" <<'MOCK'
+#!/usr/bin/env bash
+if [[ ${MOCK_MODE:-} == copy-fail && ${*: -1} == *-client-result.json ]]; then exit 46; fi
+exec /bin/cp "$@"
+MOCK
 cat > "$scratch/wait-env" <<'MOCK'
 # Simulate the three alternate visible statuses only after reaping the exact
 # mock target. The helper-only tests above exercise genuine wait statuses.
@@ -170,22 +189,29 @@ wait() {
  fi
  builtin wait "$@"
 }
+kill() {
+ if [[ ${MOCK_MODE:-} == signal-failure-stop-fail && ${1:-} == -KILL && -f $MOCK_HOME/bench.pid && ${2:-} == "$(<"$MOCK_HOME/bench.pid")" ]]; then return 77; fi
+ builtin kill "$@"
+}
 MOCK
 chmod +x "$scratch/bin/"* "$scratch/node" "$scratch/bench"
-for mode in normal shifted before-first after-last no-witness signal-failure wait-normal wait-crash wait-error; do
+for mode in normal ring shifted before-first after-last no-witness signal-failure signal-failure-stop-fail wait-normal wait-crash wait-error client-fail cleanup-fail client-fail-cleanup-fail copy-fail node-shutdown-fail node-timeout docker-timeout; do
  mkdir "$scratch/$mode"
  # Each run's stand-ins and process evidence remain in its own scratch scope.
  cp "$scratch/node" "$scratch/bench" "$scratch/$mode/"
  fault=n0
- [[ $mode != shifted ]] || fault=none
+ diagnostic=0
+ [[ $mode != ring ]] || diagnostic=1
+ [[ $mode != shifted && $mode != client-fail && $mode != cleanup-fail && $mode != client-fail-cleanup-fail && $mode != copy-fail && $mode != node-shutdown-fail && $mode != node-timeout && $mode != docker-timeout ]] || fault=none
  status=0
  BASH_ENV="$scratch/wait-env" MOCK_HOME="$scratch/$mode" MOCK_MODE="$mode" PATH="$scratch/bin:$PATH" TMPDIR="$scratch/$mode" \
- RHIZA_SERVER_BENCH_REQUESTS=4 RHIZA_SERVER_BENCH_CONCURRENCY=2 RHIZA_SERVER_BENCH_FAULT_AFTER=0 RHIZA_SERVER_BENCH_FAILED_NODE="$fault" \
+ RHIZA_SERVER_BENCH_LATENCY_DIAGNOSTICS="$diagnostic" RHIZA_SERVER_BENCH_REQUESTS=4 RHIZA_SERVER_BENCH_CONCURRENCY=2 RHIZA_SERVER_BENCH_FAULT_AFTER=0 RHIZA_SERVER_BENCH_FAILED_NODE="$fault" \
  bash "$here/run-server-reference.sh" "$scratch/base-server" "$scratch/$mode/result.json" >"$scratch/$mode/stdout" 2>"$scratch/$mode/stderr" || status=$?
- if [[ $mode == normal ]]; then
+ if [[ $mode == normal || $mode == ring ]]; then
   [[ $status == 0 ]]
   jq -e '.fault_overlap.overlap == true and .fault_exit_status == 137 and .receipt_oracle == "sql-insert-id-v1" and (.client_sha256 | length == 64)' "$scratch/$mode/result.json" >/dev/null
   grep -qx 'fault_exit_status=137' "$scratch/$mode/result-fault-metadata.txt"
+  if [[ $mode == ring ]]; then grep -qx 'survivor_buffered_events=possibly_lost' "$scratch/$mode/result-cleanup-status.txt"; fi
  else
   [[ $status != 0 ]]
   if [[ $mode == wait-* ]]; then
@@ -194,14 +220,62 @@ for mode in normal shifted before-first after-last no-witness signal-failure wai
    grep -qx "fault_exit_status=$raw" "$scratch/$mode/result-fault-metadata.txt"
    jq -e --argjson raw "$raw" '.qualification == "not_qualified" and .fault_exit_status == $raw' "$scratch/$mode/result.json" >/dev/null
   elif [[ $mode == signal-failure ]]; then [[ $status == 47 ]];
+  elif [[ $mode == signal-failure-stop-fail ]]; then
+   [[ $status == 47 ]]
+   grep -qx 'benchmark_stop_exit=1 unreaped=1' "$scratch/$mode/result-cleanup-status.txt"
+   grep -qx 'nodes=retained_client_alive' "$scratch/$mode/result-cleanup-status.txt"
+   grep -qx 'node_logs=possibly_incomplete' "$scratch/$mode/result-cleanup-status.txt"
+   grep -qx 'container=retained_node_alive' "$scratch/$mode/result-cleanup-status.txt"
+   grep -q 'benchmark client termination not verified:' "$scratch/$mode/stderr"
+   while IFS= read -r pid; do kill -KILL "$pid" 2>/dev/null || true; done < <(cat "$scratch/$mode/nodes" "$scratch/$mode/bench.pid")
+   sleep 0.2
+  elif [[ $mode == client-fail ]]; then
+   [[ $status == 23 ]]
+   jq -e '.requests == 4' "$scratch/$mode/result-client-result.json" >/dev/null
+   grep -qx 'client_result=preserved' "$scratch/$mode/result-cleanup-status.txt"
+  elif [[ $mode == cleanup-fail ]]; then
+   [[ $status == 1 ]]
+   grep -qx 'container=unverified remove_exit=44 inspect_exit=0' "$scratch/$mode/result-cleanup-status.txt"
+   grep -q 'benchmark container cleanup not verified:' "$scratch/$mode/stderr"
+   grep -q 'benchmark evidence retained:' "$scratch/$mode/stderr"
+  elif [[ $mode == client-fail-cleanup-fail ]]; then
+   [[ $status == 23 ]]
+   grep -qx 'container=unverified remove_exit=44 inspect_exit=0' "$scratch/$mode/result-cleanup-status.txt"
+   jq -e '.requests == 4' "$scratch/$mode/result-client-result.json" >/dev/null
+  elif [[ $mode == copy-fail ]]; then
+   [[ $status == 1 ]]
+   grep -qx 'client_result=copy_failed' "$scratch/$mode/result-cleanup-status.txt"
+   grep -q 'benchmark evidence retained:' "$scratch/$mode/stderr"
+  elif [[ $mode == node-shutdown-fail ]]; then
+   [[ $status == 1 ]]
+   grep -q 'wait_exit=42' "$scratch/$mode/result-cleanup-status.txt"
+   grep -q 'benchmark node shutdown failed:' "$scratch/$mode/stderr"
+  elif [[ $mode == node-timeout ]]; then
+   [[ $status == 1 ]]
+   grep -q 'timed_out=1' "$scratch/$mode/result-cleanup-status.txt"
+   grep -q 'benchmark evidence retained:' "$scratch/$mode/stderr"
+  elif [[ $mode == docker-timeout ]]; then
+   [[ $status == 1 ]]
+   grep -qx 'container=unverified remove_exit=124 inspect_exit=124' "$scratch/$mode/result-cleanup-status.txt"
+   grep -q 'benchmark evidence retained:' "$scratch/$mode/stderr"
   elif [[ $mode != shifted ]]; then grep -Eq 'fault (coordinator failed|interval not qualified)' "$scratch/$mode/stderr"; fi
  fi
+ for log in "$scratch/$mode"/result-node-*.log; do
+  [[ -f $log ]] || continue
+  # A SIGKILL target cannot flush; every surviving mock node must be copied after wait.
+  if ! grep -q 'node-shutdown-flushed' "$log"; then
+   [[ $mode != signal-failure-stop-fail ]] || continue
+   [[ $mode != node-timeout ]] || continue
+   [[ $fault != none && $log == *result-node-0.log ]] || { printf 'shutdown log missing: %s\n' "$log" >&2; exit 1; }
+  fi
+ done
+ if [[ $fault != none ]]; then grep -qx 'sigkill_buffered_events=possibly_lost' "$scratch/$mode/result-cleanup-status.txt"; fi
  grep -q -- '-verify-insert-receipt' "$scratch/$mode/bench.args"
- if [[ $mode != shifted ]]; then grep -q -- '-fault-start-time 123' "$scratch/$mode/bench.args"; fi
- grep -Fq "$scratch/base-server|build -o" "$scratch/$mode/builds"
+ if [[ $fault != none ]]; then grep -q -- '-fault-start-time 123' "$scratch/$mode/bench.args"; fi
+ if [[ $mode == ring ]]; then grep -Fq "$scratch/base-server|build -tags rhiza_latency_diag -o" "$scratch/$mode/builds"; else grep -Fq "$scratch/base-server|build -o" "$scratch/$mode/builds"; fi
  grep -Fq "$(cd "$here/.." && pwd)|build -o" "$scratch/$mode/builds"
  while IFS= read -r pid; do
   if kill -0 "$pid" 2>/dev/null; then printf 'mock owned process survived: %s\n' "$pid" >&2; exit 1; fi
  done < <(cat "$scratch/$mode/nodes" "$scratch/$mode/bench.pid")
 done
-printf 'server oracle helpers + nine complete mocked runner cases PASS\n'
+printf 'server oracle helpers + complete mocked runner cases PASS\n'

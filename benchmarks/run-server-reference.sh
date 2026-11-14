@@ -5,12 +5,27 @@ set -euo pipefail
 # The PID remains an owned, unwaited child until wait clears it. Only a running
 # shell job may be signalled; never signal a stale PID after an explicit wait.
 stop_benchmark_child() {
+	benchmark_unreaped=0
 	[[ -n ${bench_pid:-} ]] || return 0
+	local kill_status=0 wait_status=0 poll
 	if jobs -pr | grep -qx "$bench_pid"; then
-		kill -KILL "$bench_pid" 2>/dev/null || true
+		kill -KILL "$bench_pid" 2>/dev/null || kill_status=$?
 	fi
-	wait "$bench_pid" 2>/dev/null || true
+	for ((poll=0; poll<50; poll++)); do
+		jobs -pr | grep -qx "$bench_pid" || break
+		sleep 0.1
+	done
+	if jobs -pr | grep -qx "$bench_pid"; then
+		benchmark_unreaped=1
+		printf 'benchmark client termination not verified: pid=%s kill_exit=%s\n' "$bench_pid" "$kill_status" >&2
+		return 1
+	fi
+	wait "$bench_pid" 2>/dev/null || wait_status=$?
 	bench_pid=
+	if [[ $kill_status != 0 || ( $wait_status != 0 && $wait_status != 137 ) ]]; then
+		printf 'benchmark client shutdown failed: kill=%s wait=%s\n' "$kill_status" "$wait_status" >&2
+		return 1
+	fi
 }
 
 wait_benchmark_child() {
@@ -104,31 +119,116 @@ if [[ ! $max_fault_latency_ms =~ ^[1-9][0-9]*([.][0-9]+)?$ ]]; then
 fi
 
 run_dir=$(mktemp -d "${TMPDIR:-/tmp}/rhiza-server-bench.XXXXXX")
-container="rhiza-bench-s3-$$"
+container="rhiza-bench-s3-${run_dir##*.}"
+container_started=0
 bench_pid=
 cleanup() {
 	set +e
-	stop_benchmark_child
 	output_stem=$(basename "$output_file" .json)
-	for log in "$run_dir"/node-*.log; do
-		[[ -f $log ]] || continue
-		cp "$log" "$(dirname "$output_file")/$output_stem-$(basename "$log")"
-	done
-	if [[ -f $run_dir/fault-metadata.txt ]]; then
-		cp "$run_dir/fault-metadata.txt" "$(dirname "$output_file")/$output_stem-fault-metadata.txt"
+	cleanup_failed=0
+	retain_run_dir=0
+	nodes_alive=0
+	cleanup_status="$(dirname "$output_file")/$output_stem-cleanup-status.txt"
+	: > "$cleanup_status" || { cleanup_failed=1; retain_run_dir=1; }
+	benchmark_stop_status=0
+	stop_benchmark_child || benchmark_stop_status=$?
+	printf 'benchmark_stop_exit=%s unreaped=%s\n' "$benchmark_stop_status" "$benchmark_unreaped" >> "$cleanup_status" || { cleanup_failed=1; retain_run_dir=1; }
+	if [[ $benchmark_stop_status != 0 ]]; then cleanup_failed=1; retain_run_dir=1; fi
+	if [[ $benchmark_unreaped == 1 ]]; then
+		nodes_alive=1
+		printf 'nodes=retained_client_alive\n' >> "$cleanup_status" || :
+		printf 'node_logs=possibly_incomplete\n' >> "$cleanup_status" || :
 	fi
+	if [[ -f $run_dir/result.json ]]; then
+		if cp "$run_dir/result.json" "$(dirname "$output_file")/$output_stem-client-result.json"; then
+			printf 'client_result=preserved\n' >> "$cleanup_status" || cleanup_failed=1
+		else
+			printf 'client_result=copy_failed\n' >> "$cleanup_status" || :
+			cleanup_failed=1; retain_run_dir=1
+		fi
+	else
+		printf 'client_result=not_created\n' >> "$cleanup_status" || cleanup_failed=1
+	fi
+	# Reap owned nodes before copying logs; the diagnostic ring may still be unflushed.
 	for pid_file in "$run_dir"/node-*.pid; do
 		[[ -f $pid_file ]] || continue
+		[[ $benchmark_unreaped != 1 ]] || continue
 		pid=$(<"$pid_file")
-		if jobs -pr | grep -qx "$pid"; then kill "$pid" 2>/dev/null || true; fi
-		wait "$pid" 2>/dev/null || true
+		signal_status=0
+		if jobs -pr | grep -qx "$pid"; then kill "$pid" 2>/dev/null || signal_status=$?; fi
+		node_timed_out=0
+		for ((poll=0; poll<50; poll++)); do
+			jobs -pr | grep -qx "$pid" || break
+			sleep 0.1
+		done
+		if jobs -pr | grep -qx "$pid"; then
+			node_timed_out=1
+			kill -KILL "$pid" 2>/dev/null || :
+			for ((poll=0; poll<50; poll++)); do
+				jobs -pr | grep -qx "$pid" || break
+				sleep 0.1
+			done
+		fi
+		wait_status=0
+		if jobs -pr | grep -qx "$pid"; then wait_status=unreaped; nodes_alive=1; else wait "$pid" 2>/dev/null || wait_status=$?; fi
+		printf '%s signal_exit=%s wait_exit=%s timed_out=%s\n' "$(basename "$pid_file")" "$signal_status" "$wait_status" "$node_timed_out" >> "$cleanup_status" || { cleanup_failed=1; retain_run_dir=1; }
+		if [[ $signal_status != 0 || $node_timed_out != 0 || ( $wait_status != 0 && $wait_status != 143 ) ]]; then
+			printf 'benchmark node shutdown failed: %s signal=%s wait=%s timed_out=%s\n' "$(basename "$pid_file")" "$signal_status" "$wait_status" "$node_timed_out" >&2
+			cleanup_failed=1; retain_run_dir=1
+		fi
 	done
-	docker rm -f "$container" >/dev/null 2>&1 || true
-	case "$run_dir" in
-		"${TMPDIR:-/tmp}"/rhiza-server-bench.*) rm -rf -- "$run_dir" ;;
-	esac
+	if [[ ${RHIZA_SERVER_BENCH_LATENCY_DIAGNOSTICS:-0} == 1 ]]; then
+		printf 'survivor_buffered_events=possibly_lost\n' >> "$cleanup_status" || { cleanup_failed=1; retain_run_dir=1; }
+	fi
+	if [[ ${failed_node:-none} != none ]]; then
+		printf 'sigkill_buffered_events=possibly_lost\n' >> "$cleanup_status" || { cleanup_failed=1; retain_run_dir=1; }
+	fi
+	for log in "$run_dir"/node-*.log; do
+		[[ -f $log ]] || continue
+		if cp "$log" "$(dirname "$output_file")/$output_stem-$(basename "$log")"; then
+			printf '%s=preserved\n' "$(basename "$log")" >> "$cleanup_status" || cleanup_failed=1
+		else
+			printf '%s=copy_failed\n' "$(basename "$log")" >> "$cleanup_status" || :
+			cleanup_failed=1; retain_run_dir=1
+		fi
+	done
+	if [[ -f $run_dir/fault-metadata.txt ]]; then
+		if cp "$run_dir/fault-metadata.txt" "$(dirname "$output_file")/$output_stem-fault-metadata.txt"; then
+			printf 'fault_metadata=preserved\n' >> "$cleanup_status" || cleanup_failed=1
+		else
+			printf 'fault_metadata=copy_failed\n' >> "$cleanup_status" || :
+			cleanup_failed=1; retain_run_dir=1
+		fi
+	fi
+	if [[ $container_started == 1 && $nodes_alive == 1 ]]; then
+		printf 'container=retained_node_alive\n' >> "$cleanup_status" || :
+		printf 'benchmark container retained while owned node remains running: %s\n' "$container" >&2
+		cleanup_failed=1; retain_run_dir=1
+	elif [[ $container_started == 1 ]]; then
+		remove_status=0
+		timeout -k 2s 10s docker rm -f "$container" >/dev/null 2>&1 || remove_status=$?
+		remaining_status=0
+		remaining=$(timeout -k 2s 10s docker ps -a --filter "name=^/${container}$" --format '{{.ID}}' 2>/dev/null) || remaining_status=$?
+		if [[ $remaining_status == 0 && -z $remaining ]]; then
+			printf 'container=removed remove_exit=%s\n' "$remove_status" >> "$cleanup_status" || cleanup_failed=1
+		else
+			printf 'container=unverified remove_exit=%s inspect_exit=%s\n' "$remove_status" "$remaining_status" >> "$cleanup_status" || :
+			printf 'benchmark container cleanup not verified: %s\n' "$container" >&2
+			cleanup_failed=1; retain_run_dir=1
+		fi
+	else
+		printf 'container=not_started\n' >> "$cleanup_status" || cleanup_failed=1
+	fi
+	if [[ $retain_run_dir == 0 ]]; then
+		case "$run_dir" in
+			"${TMPDIR:-/tmp}"/rhiza-server-bench.*) rm -rf -- "$run_dir" || cleanup_failed=1 ;;
+		esac
+	else
+		printf 'benchmark evidence retained: %s\n' "$run_dir" >&2
+	fi
+	return "$cleanup_failed"
 }
-trap 'exit_status=$?; trap - EXIT; cleanup; exit "$exit_status"' EXIT
+trap 'exit_status=$?; trap - EXIT; cleanup || { [[ $exit_status != 0 ]] || exit_status=1; }; exit "$exit_status"' EXIT
 trap 'exit 130' INT
 trap 'exit 143' TERM
 
@@ -148,6 +248,7 @@ else
 fi
 
 mkdir -p "$run_dir/s3-data"
+container_started=1 # docker run can create the container before returning an error.
 docker run --rm -d --name "$container" -p "$s3_port:9000" --user "$(id -u):$(id -g)" \
 	-v "$run_dir/s3-data:/data" \
 	-e ROOT_ACCESS_KEY=rhiza-e2e -e ROOT_SECRET_KEY=rhiza-e2e-secret \
