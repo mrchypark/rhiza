@@ -4,10 +4,12 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strings"
 	"testing"
 
 	"github.com/mrchypark/rhiza/internal/sqlpolicy"
 	"github.com/mrchypark/rhiza/internal/types"
+	"github.com/ncruces/go-sqlite3"
 	"github.com/ncruces/go-sqlite3/driver"
 )
 
@@ -204,7 +206,8 @@ func TestRowIDPolicyPreservesPayloadsAndSchemaLifecycle(t *testing.T) {
 
 func TestRowIDPolicyLostSavepointFailsApply(t *testing.T) {
 	ctx := context.Background()
-	m, err := Open(t.TempDir()+"/state.db", 1)
+	path := t.TempDir() + "/state.db"
+	m, err := Open(path, 1)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -222,15 +225,26 @@ func TestRowIDPolicyLostSavepointFailsApply(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err = m.Apply(ctx, 3, v); err == nil {
-		t.Fatal("lost transaction accepted")
+	if err = m.Apply(ctx, 3, v); !errors.Is(err, ErrGraphCommitUnknown) || !errors.Is(err, sqlite3.ERROR) || !strings.Contains(err.Error(), "no such savepoint") || !strings.Contains(err.Error(), "rollback apply batch:") {
+		t.Fatalf("lost rollback outcome must fail closed: %v", err)
 	}
 	if m.Tip() != 2 {
 		t.Fatal("tip advanced")
 	}
-	if _, ok, e := m.MutationReceipt(ctx, types.MutationSQL, "lost-savepoint"); e != nil || ok {
-		t.Fatal("false receipt", ok, e)
+	if _, ok, e := m.MutationReceipt(ctx, types.MutationSQL, "lost-savepoint"); !errors.Is(e, ErrGraphCommitUnknown) || ok {
+		t.Fatal("uncertain transaction exposed receipt", ok, e)
 	}
+	if retryErr := m.Apply(ctx, 3, v); !errors.Is(retryErr, ErrGraphCommitUnknown) {
+		t.Fatalf("same-instance retry=%v", retryErr)
+	}
+	if err := m.Close(); err != nil {
+		t.Fatal(err)
+	}
+	m, err = Open(path, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer m.Close()
 	rows, err := m.QueryResult(ctx, "SELECT COUNT(*) FROM items", nil)
 	if err != nil || rows.Rows[0][0] != int64(0) {
 		t.Fatal(rows, err)

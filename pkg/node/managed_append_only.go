@@ -645,6 +645,9 @@ func (n *Node) publishManagedAppendOnlyCheckpoint(ctx context.Context) error {
 	if err := n.replayLocalDecisions(ctx); err != nil {
 		return err
 	}
+	if localtesthooks.Enabled {
+		localtesthooks.Hit("node:managed-checkpoint:replay-before-snapshot")
+	}
 	files, cut, cleanup, err := n.material.CheckpointFilesAt(ctx)
 	if err != nil {
 		return err
@@ -661,6 +664,9 @@ func (n *Node) publishManagedAppendOnlyCheckpoint(ctx context.Context) error {
 	}
 	if err := n.validateCheckpointFiles(ctx, actual, cut); err != nil {
 		return err
+	}
+	if localtesthooks.Enabled {
+		localtesthooks.Hit("node:managed-checkpoint:before-candidate")
 	}
 	root, err := n.checkpoints.CreateManagedAppendOnlyCandidate(ctx, sources, cut)
 	if err != nil {

@@ -348,6 +348,10 @@ jobs:
         run: |
           go test -tags rhiza_local_testhooks ./pkg/quepaxa ./pkg/node -run '^(TestTenVoterEquivalentMembershipCertificates|TestVerifiedMembershipEquivalentAbortProof|TestManagedMembershipUnavailableSnapshotRequiresExactState|TestHistoricalMembershipUsesCompactedAbortBeforeLaterAbort|TestManagedAppendOnlyNodeAlternativeMembershipProof)$' -count=1 -timeout=3m
           go test -race -tags rhiza_local_testhooks ./pkg/quepaxa ./pkg/node -run '^(TestTenVoterEquivalentMembershipCertificates|TestVerifiedMembershipEquivalentAbortProof|TestManagedMembershipUnavailableSnapshotRequiresExactState|TestHistoricalMembershipUsesCompactedAbortBeforeLaterAbort|TestManagedAppendOnlyNodeAlternativeMembershipProof)$' -count=1 -timeout=3m
+      - name: Managed Graph publisher snapshot interposition
+        run: |
+          go test -tags rhiza_local_testhooks ./pkg/node -run '^TestManagedGraphPublisherReplaySnapshotInterposition$' -count=1 -timeout=90s
+          go test -race -tags rhiza_local_testhooks ./pkg/node -run '^TestManagedGraphPublisherReplaySnapshotInterposition$' -count=1 -timeout=90s
       - name: Managed explicit voter leave
         env:
           CGO_ENABLED: 1

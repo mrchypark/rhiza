@@ -1244,8 +1244,30 @@ func (m *Materializer) ApplyBatch(ctx context.Context, decisions []quepaxa.Decid
 	if err != nil {
 		return fmt.Errorf("begin apply batch: %w", err)
 	}
+	oldTip, oldStateTip, oldHash := m.tip, m.stateTip, m.tipHash
+	oldRetention := m.sqlReceiptRetention
+	commitAttempted := false
 	defer func() {
-		_ = tx.Rollback()
+		rollbackErr := tx.Rollback()
+		if applyErr != nil {
+			m.sqlReceiptRetention = oldRetention
+			if !commitAttempted {
+				if rollbackErr != nil {
+					m.commitUnknown = true
+					if m.graph != nil {
+						m.graph.mu.Lock()
+						m.graph.poisonCommitOutcome()
+						m.graph.mu.Unlock()
+					}
+					applyErr = errors.Join(applyErr, ErrGraphCommitUnknown, fmt.Errorf("rollback apply batch: %w", rollbackErr))
+				} else if m.graph != nil {
+					m.graph.mu.Lock()
+					// Only a confirmed rollback permits discarding control-slot progress.
+					m.graph.tip = min(m.graph.tip, max(oldTip, m.graph.durableTip))
+					m.graph.mu.Unlock()
+				}
+			}
+		}
 		if errors.Is(applyErr, errSQLPolicyState) {
 			// Discard only after rollback releases the transaction's Conn lock.
 			// ErrBadConn from Raw while the transaction is active deadlocks Close.
@@ -1261,13 +1283,6 @@ func (m *Materializer) ApplyBatch(ctx context.Context, decisions []quepaxa.Decid
 	defer func() {
 		for _, statement := range statements {
 			statement.Close()
-		}
-	}()
-	oldTip, oldStateTip, oldHash := m.tip, m.stateTip, m.tipHash
-	oldRetention := m.sqlReceiptRetention
-	defer func() {
-		if applyErr != nil {
-			m.sqlReceiptRetention = oldRetention
 		}
 	}()
 	pending := make([]pendingNotification, 0)
@@ -1306,6 +1321,7 @@ func (m *Materializer) ApplyBatch(ctx context.Context, decisions []quepaxa.Decid
 		m.tip, m.stateTip, m.tipHash = oldTip, oldStateTip, oldHash
 		return err
 	}
+	commitAttempted = true
 	commitErr := tx.Commit()
 	if commitErr == nil && m.afterApplyCommitError != nil {
 		// Test seam: model a lost acknowledgement after SQLite committed.
@@ -1434,6 +1450,9 @@ func (m *Materializer) applyValueLocked(ctx context.Context, conn *sql.Conn, tx 
 	if m.managedProtocol == "" || graphProtocol(m.managedProtocol) {
 		if err := m.applyGraph(ctx, slot, value, graphCommands, graph, confirmedGraphThrough); err != nil {
 			return err
+		}
+		if !graph && localtesthooks.Enabled {
+			localtesthooks.Hit("materializer:control:before-sqlite")
 		}
 		if graph && graphProtocol(m.managedProtocol) {
 			if localtesthooks.Enabled {
